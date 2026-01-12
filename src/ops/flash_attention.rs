@@ -230,6 +230,10 @@ pub struct DeterministicConfig {
     pub fixed_tile_order: bool,
     /// Fixed random seed for reproducibility.
     pub seed: Option<u64>,
+    /// Disable GPU non-deterministic operations (use deterministic kernels).
+    pub no_gpu_nondeterminism: bool,
+    /// Enable verification of determinism (compare results of multiple runs).
+    pub verify_determinism: bool,
 }
 
 impl Default for DeterministicConfig {
@@ -238,6 +242,8 @@ impl Default for DeterministicConfig {
             enabled: false,
             fixed_tile_order: false,
             seed: None,
+            no_gpu_nondeterminism: false,
+            verify_determinism: false,
         }
     }
 }
@@ -249,6 +255,8 @@ impl DeterministicConfig {
             enabled: true,
             fixed_tile_order: true,
             seed: Some(42),
+            no_gpu_nondeterminism: true,
+            verify_determinism: cfg!(debug_assertions),
         }
     }
 
@@ -258,6 +266,8 @@ impl DeterministicConfig {
             enabled: false,
             fixed_tile_order: false,
             seed: None,
+            no_gpu_nondeterminism: false,
+            verify_determinism: false,
         }
     }
 
