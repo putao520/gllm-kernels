@@ -1,1 +1,0 @@
-window.SIDEBAR_ITEMS = {"derive":["Add","AddAssign","Binary","BitAnd","BitAndAssign","BitOr","BitOrAssign","BitXor","BitXorAssign","Display","Div","DivAssign","LowerExp","LowerHex","Mul","MulAssign","Neg","Not","Octal","Pointer","Rem","RemAssign","Shl","ShlAssign","Shr","ShrAssign","Sub","SubAssign","UpperExp","UpperHex"]};

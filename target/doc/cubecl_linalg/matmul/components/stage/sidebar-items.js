@@ -1,1 +1,0 @@
-window.SIDEBAR_ITEMS = {"enum":["TilingOrderConfig","TilingOrderConfigExpand"],"mod":["multi_buffer","single_buffer"],"struct":["ColMajorTiling","CommonStageInput","RowMajorTiling","Stage"],"trait":["ReaderFamily","StageConfig","StageMatmul","StageMatmulFamily","StageReader","StageWriter","TilingOrder"]};

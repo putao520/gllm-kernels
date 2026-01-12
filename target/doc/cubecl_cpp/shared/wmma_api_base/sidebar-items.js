@@ -1,1 +1,0 @@
-window.SIDEBAR_ITEMS = {"fn":["compile_fragment","compile_fragment_ident","compile_fragment_layout","compile_instruction"]};

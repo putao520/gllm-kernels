@@ -1,1 +1,0 @@
-window.SIDEBAR_ITEMS = {"struct":["BiLstm","BiLstmConfig","BiLstmRecord","BiLstmRecordItem","Lstm","LstmConfig","LstmRecord","LstmRecordItem","LstmState"]};

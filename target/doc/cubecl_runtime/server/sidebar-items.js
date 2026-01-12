@@ -1,1 +1,0 @@
-window.SIDEBAR_ITEMS = {"enum":["CubeCount"],"struct":["Binding","Handle"],"trait":["ComputeServer"]};

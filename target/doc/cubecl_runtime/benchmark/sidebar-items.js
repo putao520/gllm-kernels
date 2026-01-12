@@ -1,1 +1,0 @@
-window.SIDEBAR_ITEMS = {"enum":["TimestampsError","TimingMethod"],"fn":["run_benchmark"],"struct":["BenchmarkComputations","BenchmarkDurations","BenchmarkResult"],"trait":["Benchmark"],"type":["TimestampsResult"]};

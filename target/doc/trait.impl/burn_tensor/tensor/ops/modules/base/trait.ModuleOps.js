@@ -1,9 +1,0 @@
-(function() {
-    var implementors = Object.fromEntries([["burn_fusion",[["impl&lt;B: <a class=\"trait\" href=\"burn_fusion/trait.FusionBackend.html\" title=\"trait burn_fusion::FusionBackend\">FusionBackend</a>&gt; <a class=\"trait\" href=\"burn_tensor/tensor/ops/modules/base/trait.ModuleOps.html\" title=\"trait burn_tensor::tensor::ops::modules::base::ModuleOps\">ModuleOps</a>&lt;<a class=\"struct\" href=\"burn_fusion/struct.Fusion.html\" title=\"struct burn_fusion::Fusion\">Fusion</a>&lt;B&gt;&gt; for <a class=\"struct\" href=\"burn_fusion/struct.Fusion.html\" title=\"struct burn_fusion::Fusion\">Fusion</a>&lt;B&gt;"]]],["burn_jit",[["impl&lt;R, F, I, BT&gt; <a class=\"trait\" href=\"burn_tensor/tensor/ops/modules/base/trait.ModuleOps.html\" title=\"trait burn_tensor::tensor::ops::modules::base::ModuleOps\">ModuleOps</a>&lt;<a class=\"struct\" href=\"burn_jit/struct.JitBackend.html\" title=\"struct burn_jit::JitBackend\">JitBackend</a>&lt;R, F, I, BT&gt;&gt; for <a class=\"struct\" href=\"burn_jit/struct.JitBackend.html\" title=\"struct burn_jit::JitBackend\">JitBackend</a>&lt;R, F, I, BT&gt;<div class=\"where\">where\n    R: <a class=\"trait\" href=\"burn_jit/trait.JitRuntime.html\" title=\"trait burn_jit::JitRuntime\">JitRuntime</a>,\n    F: <a class=\"trait\" href=\"burn_jit/element/trait.FloatElement.html\" title=\"trait burn_jit::element::FloatElement\">FloatElement</a>,\n    I: <a class=\"trait\" href=\"burn_jit/element/trait.IntElement.html\" title=\"trait burn_jit::element::IntElement\">IntElement</a>,\n    BT: <a class=\"trait\" href=\"burn_jit/element/trait.BoolElement.html\" title=\"trait burn_jit::element::BoolElement\">BoolElement</a>,</div>"]]]]);
-    if (window.register_implementors) {
-        window.register_implementors(implementors);
-    } else {
-        window.pending_implementors = implementors;
-    }
-})()
-//{"start":57,"fragment_lengths":[573,1059]}

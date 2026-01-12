@@ -1,1 +1,0 @@
-window.SIDEBAR_ITEMS = {"struct":["BindingResource","BytesResource","BytesStorage","StorageHandle","StorageId","StorageUtilization"],"trait":["ComputeStorage"]};

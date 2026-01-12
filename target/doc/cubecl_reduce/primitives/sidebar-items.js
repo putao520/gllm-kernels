@@ -1,1 +1,0 @@
-window.SIDEBAR_ITEMS = {"fn":["reduce_slice","reduce_slice_plane","reduce_slice_shared","reduce_tree"],"mod":["reduce_slice","reduce_slice_plane","reduce_slice_shared","reduce_tree"],"struct":["ReduceRange","ReduceRangeExpand"]};

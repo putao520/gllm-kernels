@@ -1,4 +1,0 @@
-cargo:rustc-check-cfg=cfg(exclusive_memory_only)
-cargo:rerun-if-env-changed=CARGO_FEATURE_SPIRV
-cargo:rerun-if-env-changed=VULKAN_SDK
-cargo:rerun-if-env-changed=CARGO_CFG_TARGET_OS

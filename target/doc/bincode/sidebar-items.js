@@ -1,1 +1,0 @@
-window.SIDEBAR_ITEMS = {"fn":["borrow_decode_from_slice","borrow_decode_from_slice_with_context","decode_from_reader","decode_from_slice","decode_from_slice_with_context","encode_into_slice","encode_into_writer","encode_to_vec"],"macro":["impl_borrow_decode","impl_borrow_decode_with_context"],"mod":["config","de","enc","error","migration_guide","serde"]};

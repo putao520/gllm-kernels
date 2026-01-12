@@ -1,1 +1,0 @@
-window.SIDEBAR_ITEMS = {"fn":["profiler_start","profiler_stop"],"struct":["CudaDevice","CudaFunction","CudaSlice","CudaStream","CudaView","CudaViewMut","ExternalMemory","LaunchConfig","MappedBuffer","Profiler"],"trait":["DevicePtr","DevicePtrMut","DeviceRepr","DeviceSlice","LaunchAsync","ValidAsZeroBits"]};

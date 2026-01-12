@@ -1,9 +1,0 @@
-(function() {
-    var implementors = Object.fromEntries([["burn",[]],["burn_core",[]],["burn_tensor",[]]]);
-    if (window.register_implementors) {
-        window.register_implementors(implementors);
-    } else {
-        window.pending_implementors = implementors;
-    }
-})()
-//{"start":57,"fragment_lengths":[11,17,19]}

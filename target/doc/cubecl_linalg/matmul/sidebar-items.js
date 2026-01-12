@@ -1,1 +1,0 @@
-window.SIDEBAR_ITEMS = {"enum":["Strategy"],"fn":["launch","launch_ref"],"mod":["components","kernels"]};

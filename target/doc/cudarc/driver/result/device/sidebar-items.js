@@ -1,1 +1,0 @@
-window.SIDEBAR_ITEMS = {"fn":["get","get_attribute","get_count","get_name","total_mem"]};

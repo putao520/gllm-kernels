@@ -1,1 +1,0 @@
-window.SIDEBAR_ITEMS = {"enum":["MatmulAvailabilityError","MatmulInvalidProblem","MatmulLaunchError"],"mod":["matmul","simple","tiling2d"]};

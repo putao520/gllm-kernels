@@ -1,1 +1,0 @@
-window.SIDEBAR_ITEMS = {"enum":["StreamKind"],"fn":["attach_mem_async","create","destroy","null","synchronize","wait_event"]};

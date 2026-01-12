@@ -1,1 +1,0 @@
-window.SIDEBAR_ITEMS = {"enum":["CubeCountSettings","InputInfo","OutputInfo"],"fn":["bool_elem","calculate_num_elems_dyn_rank"],"struct":["Execution","InplaceMapping","KernelExpansion","KernelIntegrator","KernelSettings","Metadata","MetadataBuilder"],"trait":["Compiler","CompilerRepresentation"]};

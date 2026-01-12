@@ -1,1 +1,0 @@
-window.SIDEBAR_ITEMS = {"enum":["JitOptimization","JitOptimizationState"],"struct":["FusionJitRuntime","JitFusionHandle"]};

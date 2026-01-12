@@ -1,1 +1,0 @@
-window.SIDEBAR_ITEMS = {"attr":["cube","tune"],"derive":["AutotuneKey","CubeLaunch","CubeType"],"macro":["comment","comptime"]};

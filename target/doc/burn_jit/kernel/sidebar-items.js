@@ -1,1 +1,0 @@
-window.SIDEBAR_ITEMS = {"constant":["PLANE_DIM_APPROX"],"enum":["MaskFillStrategy","MaskWhereStrategy"],"fn":["bool_cast","cast","into_contiguous","mask_fill","mask_where"],"mod":["conv","interpolate","matmul","pool","prng","quantization","reduce"],"trait":["Kernel"]};

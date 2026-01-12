@@ -1,1 +1,0 @@
-window.SIDEBAR_ITEMS = {"fn":["calculate_bin_stats"],"struct":["BinStats"]};
