@@ -3,9 +3,10 @@ name = "gllm-kernels"
 version = "0.1.0"
 edition = "2021"
 authors = ["gllm contributors"]
-license = "MIT"
-description = "Low-level attention kernels for gllm"
-repository = "https://github.com/putao520/gllm"
+license = "Apache-2.0"
+description = "Low-level attention kernels for gllm with CUDA/ROCm support"
+repository = "https://github.com/putao520/gllm-kernels"
+homepage = "https://github.com/putao520/gllm-kernels"
 keywords = ["attention", "kernels", "burn", "gpu", "tensor"]
 categories = ["algorithms", "science"]
 
