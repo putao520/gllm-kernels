@@ -1,0 +1,1 @@
+window.SIDEBAR_ITEMS = {"enum":["IfElseExpand","IfElseExprExpand"],"fn":["break_expand","for_expand","if_else_expand","if_else_expr_expand","if_expand","loop_expand","range","range_stepped","return_expand","switch_expand","switch_expand_expr"],"mod":["range","range_stepped"],"struct":["RangeExpand","SteppedRangeExpand","SwitchExpand","SwitchExpandExpr"],"trait":["Iterable"]};

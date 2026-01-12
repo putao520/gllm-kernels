@@ -1,0 +1,1 @@
+window.SIDEBAR_ITEMS = {"enum":["MemoryConfiguration","PoolType"],"struct":["HardwareProperties","MemoryDeviceProperties","MemoryLock","MemoryManagement","MemoryPoolOptions","MemoryUsage"],"trait":["MemoryHandle"]};

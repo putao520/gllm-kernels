@@ -1,0 +1,1 @@
+window.SIDEBAR_ITEMS = {"attr":["cube"],"derive":["CubeLaunch","CubeType"],"enum":["CubeCount"],"macro":["comment","comptime"],"struct":["ComputeClient"],"trait":["CubeElement","Runtime"]};

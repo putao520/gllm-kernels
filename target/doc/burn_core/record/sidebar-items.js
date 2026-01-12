@@ -1,0 +1,1 @@
+window.SIDEBAR_ITEMS = {"derive":["Record"],"enum":["RecorderError"],"struct":["BinBytesRecorder","BurnMetadata","BurnRecord","BurnRecordNoItem","DoublePrecisionSettings","FullPrecisionSettings","HalfPrecisionSettings","ParamSerde"],"trait":["BytesRecorder","PrecisionSettings","Record","Recorder"],"type":["NoStdInferenceRecorder"]};

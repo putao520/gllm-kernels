@@ -1,0 +1,1 @@
+window.SIDEBAR_ITEMS = {"macro":["iter_par","iter_range_par","iter_slice_par","run_par"],"mod":["benchmark","future","id","parallel","rand","reader","stub"]};

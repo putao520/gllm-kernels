@@ -1,0 +1,1 @@
+window.SIDEBAR_ITEMS = {"macro":["constant"],"mod":["backend","config","grad_clipping","module","nn","prelude","record","tensor"],"type":["LearningRate"]};

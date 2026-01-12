@@ -1,0 +1,62 @@
+<!DOCTYPE html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1.0"><meta name="generator" content="rustdoc"><meta name="description" content="Safe abstractions over:"><title>cudarc - Rust</title><script>if(window.location.protocol!=="file:")document.head.insertAdjacentHTML("beforeend","SourceSerif4-Regular-6b053e98.ttf.woff2,FiraSans-Italic-81dc35de.woff2,FiraSans-Regular-0fe48ade.woff2,FiraSans-MediumItalic-ccf7e434.woff2,FiraSans-Medium-e1aa3f0a.woff2,SourceCodePro-Regular-8badfe75.ttf.woff2,SourceCodePro-Semibold-aa29a496.ttf.woff2".split(",").map(f=>`<link rel="preload" as="font" type="font/woff2"href="../static.files/${f}">`).join(""))</script><link rel="stylesheet" href="../static.files/normalize-9960930a.css"><link rel="stylesheet" href="../static.files/rustdoc-e56847b5.css"><meta name="rustdoc-vars" data-root-path="../" data-static-root-path="../static.files/" data-current-crate="cudarc" data-themes="" data-resource-suffix="" data-rustdoc-version="1.91.1 (ed61e7d7e 2025-11-07)" data-channel="1.91.1" data-search-js="search-e256b49e.js" data-stringdex-js="stringdex-c3e638e9.js" data-settings-js="settings-c38705f0.js" ><script src="../static.files/storage-e2aeef58.js"></script><script defer src="../crates.js"></script><script defer src="../static.files/main-6dc2a7f3.js"></script><noscript><link rel="stylesheet" href="../static.files/noscript-263c88ec.css"></noscript><link rel="alternate icon" type="image/png" href="../static.files/favicon-32x32-eab170b8.png"><link rel="icon" type="image/svg+xml" href="../static.files/favicon-044be391.svg"></head><body class="rustdoc mod crate"><!--[if lte IE 11]><div class="warning">This old browser is unsupported and will most likely display funky things.</div><![endif]--><rustdoc-topbar><h2><a href="#">Crate cudarc</a></h2></rustdoc-topbar><nav class="sidebar"><div class="sidebar-crate"><h2><a href="../cudarc/index.html">cudarc</a><span class="version">0.12.1</span></h2></div><div class="sidebar-elems"><ul class="block"><li><a id="all-types" href="all.html">All Items</a></li></ul><section id="rustdoc-toc"><h3><a href="#">Sections</a></h3><ul class="block top-toc"><li><a href="#crate-organization" title="crate organization">crate organization</a></li><li><a href="#core-concepts" title="Core Concepts">Core Concepts</a></li><li><a href="#combining-the-different-apis" title="Combining the different APIs">Combining the different APIs</a><ul><li><a href="#nvrtc" title="nvrtc">nvrtc</a></li><li><a href="#cublas" title="cublas">cublas</a></li><li><a href="#curand" title="curand">curand</a></li></ul></li><li><a href="#combining-saferesultsys" title="Combining safe/result/sys">Combining safe/result/sys</a></li></ul><h3><a href="#modules">Crate Items</a></h3><ul class="block"><li><a href="#modules" title="Modules">Modules</a></li></ul></section><div id="rustdoc-modnav"></div></div></nav><div class="sidebar-resizer" title="Drag to resize sidebar"></div><main><div class="width-limiter"><section id="main-content" class="content"><div class="main-heading"><h1>Crate <span>cudarc</span>&nbsp;<button id="copy-path" title="Copy item path to clipboard">Copy item path</button></h1><rustdoc-toolbar></rustdoc-toolbar><span class="sub-heading"><a class="src" href="../src/cudarc/lib.rs.html#1-134">Source</a> </span></div><details class="toggle top-doc" open><summary class="hideme"><span>Expand description</span></summary><div class="docblock"><p>Safe abstractions over:</p>
+<ol>
+<li><a href="https://docs.nvidia.com/cuda/cuda-driver-api/index.html">CUDA driver API</a></li>
+<li><a href="https://docs.nvidia.com/cuda/nvrtc/index.html">NVRTC API</a></li>
+<li><a href="https://docs.nvidia.com/cuda/curand/index.html">cuRAND API</a></li>
+<li><a href="https://docs.nvidia.com/cuda/cublas/index.html">cuBLAS API</a></li>
+</ol>
+<h2 id="crate-organization"><a class="doc-anchor" href="#crate-organization">§</a>crate organization</h2>
+<p>Each of the modules for the above is organized into three levels:</p>
+<ol>
+<li>A <code>safe</code> module which provides safe abstractions over the <code>result</code> module</li>
+<li>A <code>result</code> which is a thin wrapper around the <code>sys</code> module to ensure all functions return <a href="https://doc.rust-lang.org/1.91.1/core/result/enum.Result.html" title="enum core::result::Result">Result</a></li>
+<li>A <code>sys</code> module which contains the raw FFI bindings</li>
+</ol>
+<div><table><thead><tr><th>API</th><th>Safe</th><th>Result</th><th>Sys</th></tr></thead><tbody>
+<tr><td>driver</td><td><a href="driver/safe/index.html" title="mod cudarc::driver::safe">driver::safe</a></td><td><a href="driver/result/index.html" title="mod cudarc::driver::result">driver::result</a></td><td><a href="driver/sys/index.html" title="mod cudarc::driver::sys">driver::sys</a></td></tr>
+<tr><td>cublas</td><td>[cublas::safe]</td><td>[cublas::result]</td><td>[cublas::sys]</td></tr>
+<tr><td>cublaslt</td><td>[cublaslt::safe]</td><td>[cublaslt::result]</td><td>[cublaslt::sys]</td></tr>
+<tr><td>nvrtc</td><td><a href="nvrtc/safe/index.html" title="mod cudarc::nvrtc::safe">nvrtc::safe</a></td><td><a href="nvrtc/result/index.html" title="mod cudarc::nvrtc::result">nvrtc::result</a></td><td><a href="nvrtc/sys/index.html" title="mod cudarc::nvrtc::sys">nvrtc::sys</a></td></tr>
+<tr><td>curand</td><td>[curand::safe]</td><td>[curand::result]</td><td>[curand::sys]</td></tr>
+<tr><td>cudnn</td><td>-</td><td>[cudnn::result]</td><td>[cudnn::sys]</td></tr>
+</tbody></table>
+</div><h2 id="core-concepts"><a class="doc-anchor" href="#core-concepts">§</a>Core Concepts</h2>
+<p>At the core is the <a href="driver/index.html" title="mod cudarc::driver">driver</a> API, which exposes a bunch of structs, but the main ones are:</p>
+<ol>
+<li><a href="driver/safe/struct.CudaDevice.html" title="struct cudarc::driver::safe::CudaDevice"><code>driver::CudaDevice</code></a> is a handle to a specific device ordinal (e.g. 0, 1, 2, …)</li>
+<li><a href="driver/safe/struct.CudaSlice.html" title="struct cudarc::driver::safe::CudaSlice"><code>driver::CudaSlice&lt;T&gt;</code></a>, which represents a <a href="https://doc.rust-lang.org/1.91.1/alloc/vec/struct.Vec.html" title="struct alloc::vec::Vec"><code>Vec&lt;T&gt;</code></a> on the device, can be allocated
+using the aforementioned CudaDevice.</li>
+</ol>
+<p>Here is a table of similar concepts between CPU and Cuda:</p>
+<div><table><thead><tr><th>Concept</th><th>CPU</th><th>Cuda</th></tr></thead><tbody>
+<tr><td>Memory allocator</td><td><a href="https://doc.rust-lang.org/1.91.1/core/alloc/global/trait.GlobalAlloc.html" title="trait core::alloc::global::GlobalAlloc"><code>std::alloc::GlobalAlloc</code></a></td><td><a href="driver/safe/struct.CudaDevice.html" title="struct cudarc::driver::safe::CudaDevice"><code>driver::CudaDevice</code></a></td></tr>
+<tr><td>List of values on heap</td><td><a href="https://doc.rust-lang.org/1.91.1/alloc/vec/struct.Vec.html" title="struct alloc::vec::Vec"><code>Vec&lt;T&gt;</code></a></td><td><a href="driver/safe/struct.CudaSlice.html" title="struct cudarc::driver::safe::CudaSlice"><code>driver::CudaSlice&lt;T&gt;</code></a></td></tr>
+<tr><td>Slice</td><td><code>&amp;[T]</code></td><td><a href="driver/safe/struct.CudaView.html" title="struct cudarc::driver::safe::CudaView"><code>driver::CudaView&lt;T&gt;</code></a></td></tr>
+<tr><td>Mutable Slice</td><td><code>&amp;mut [T]</code></td><td><a href="driver/safe/struct.CudaViewMut.html" title="struct cudarc::driver::safe::CudaViewMut"><code>driver::CudaViewMut&lt;T&gt;</code></a></td></tr>
+<tr><td>Function</td><td><a href="https://doc.rust-lang.org/1.91.1/core/ops/function/trait.Fn.html" title="trait core::ops::function::Fn"><code>Fn</code></a></td><td><a href="driver/safe/struct.CudaFunction.html" title="struct cudarc::driver::safe::CudaFunction"><code>driver::CudaFunction</code></a></td></tr>
+<tr><td>Calling a function</td><td><code>my_function(a, b, c)</code></td><td><a href="driver/safe/trait.LaunchAsync.html#tymethod.launch" title="method cudarc::driver::safe::LaunchAsync::launch"><code>driver::LaunchAsync::launch()</code></a></td></tr>
+<tr><td>Thread</td><td><a href="https://doc.rust-lang.org/1.91.1/std/thread/struct.Thread.html" title="struct std::thread::Thread"><code>std::thread::Thread</code></a></td><td><a href="driver/safe/struct.CudaStream.html" title="struct cudarc::driver::safe::CudaStream"><code>driver::CudaStream</code></a></td></tr>
+</tbody></table>
+</div><h2 id="combining-the-different-apis"><a class="doc-anchor" href="#combining-the-different-apis">§</a>Combining the different APIs</h2>
+<p>All the highest level apis have been designed to work together.</p>
+<h3 id="nvrtc"><a class="doc-anchor" href="#nvrtc">§</a>nvrtc</h3>
+<p><a href="nvrtc/safe/fn.compile_ptx.html" title="fn cudarc::nvrtc::safe::compile_ptx"><code>nvrtc::compile_ptx()</code></a> outputs a <a href="nvrtc/safe/struct.Ptx.html" title="struct cudarc::nvrtc::safe::Ptx"><code>nvrtc::Ptx</code></a>, which can
+be loaded into a device with <a href="driver/safe/struct.CudaDevice.html#method.load_ptx" title="method cudarc::driver::safe::CudaDevice::load_ptx"><code>driver::CudaDevice::load_ptx()</code></a>.</p>
+<h3 id="cublas"><a class="doc-anchor" href="#cublas">§</a>cublas</h3>
+<p>[cublas::CudaBlas] can perform gemm operations using [<code>cublas::Gemm&lt;T&gt;</code>],
+and [<code>cublas::Gemv&lt;T&gt;</code>]. Both of these traits can generically accept memory
+allocated by the driver in the form of: <a href="driver/safe/struct.CudaSlice.html" title="struct cudarc::driver::safe::CudaSlice"><code>driver::CudaSlice&lt;T&gt;</code></a>,
+<a href="driver/safe/struct.CudaView.html" title="struct cudarc::driver::safe::CudaView"><code>driver::CudaView&lt;T&gt;</code></a>, and <a href="driver/safe/struct.CudaViewMut.html" title="struct cudarc::driver::safe::CudaViewMut"><code>driver::CudaViewMut&lt;T&gt;</code></a>.</p>
+<h3 id="curand"><a class="doc-anchor" href="#curand">§</a>curand</h3>
+<p>[curand::CudaRng] can fill a <a href="driver/safe/struct.CudaSlice.html" title="struct cudarc::driver::safe::CudaSlice"><code>driver::CudaSlice&lt;T&gt;</code></a> with random data, based on
+one of its available distributions.</p>
+<h2 id="combining-saferesultsys"><a class="doc-anchor" href="#combining-saferesultsys">§</a>Combining safe/result/sys</h2>
+<p>The result and sys levels are very inter-changeable for each API. However,
+the safe apis don’t necessarily allow you to mix in the result level. This
+is to encourage going through the safe API when possible.</p>
+<p><strong>If you need some functionality that isn’t present in the safe api, please
+open a ticket.</strong></p>
+</div></details><h2 id="modules" class="section-header">Modules<a href="#modules" class="anchor">§</a></h2><dl class="item-table"><dt><a class="mod" href="driver/index.html" title="mod cudarc::driver">driver</a></dt><dd>Wrappers around the <a href="https://docs.nvidia.com/cuda/cuda-driver-api/index.html">CUDA driver API</a>,
+in three levels. See crate documentation for description of each.</dd><dt><a class="mod" href="nvrtc/index.html" title="mod cudarc::nvrtc">nvrtc</a></dt><dd>Wrappers around the <a href="https://docs.nvidia.com/cuda/nvrtc/index.html">Nvidia Runtime Compilation (nvrtc) API</a>,
+in three levels. See crate documentation for description of each.</dd><dt><a class="mod" href="types/index.html" title="mod cudarc::types">types</a></dt><dd>Exposes <a href="types/trait.CudaTypeName.html" title="trait cudarc::types::CudaTypeName">CudaTypeName</a> which maps between rust type names
+and the corresponding cuda kernel type names.</dd></dl></section></div></main></body></html>

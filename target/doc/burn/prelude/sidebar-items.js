@@ -1,0 +1,1 @@
+window.SIDEBAR_ITEMS = {"derive":["Config","Module"],"struct":["Bool","Float","Int","Shape","Tensor","TensorData"],"trait":["Backend","Config","ElementConversion","Module"],"type":["Device"]};

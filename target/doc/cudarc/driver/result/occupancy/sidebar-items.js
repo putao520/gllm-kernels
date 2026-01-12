@@ -1,0 +1,1 @@
+window.SIDEBAR_ITEMS = {"fn":["available_dynamic_shared_mem_per_block","max_active_block_per_multiprocessor","max_active_block_per_multiprocessor_with_flags","max_potential_block_size","max_potential_block_size_with_flags"]};

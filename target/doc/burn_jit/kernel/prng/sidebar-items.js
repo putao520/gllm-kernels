@@ -1,0 +1,1 @@
+window.SIDEBAR_ITEMS = {"fn":["random_bernoulli","random_like_uniform","random_normal","random_uniform"],"mod":["tests_utils"]};

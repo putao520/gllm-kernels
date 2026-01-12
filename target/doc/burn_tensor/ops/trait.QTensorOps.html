@@ -1,0 +1,942 @@
+<!DOCTYPE html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1.0"><meta name="generator" content="rustdoc"><meta name="description" content="Quantized Tensor API for basic operations, see tensor for documentation on each function."><title>QTensorOps in burn_tensor::ops - Rust</title><script>if(window.location.protocol!=="file:")document.head.insertAdjacentHTML("beforeend","SourceSerif4-Regular-6b053e98.ttf.woff2,FiraSans-Italic-81dc35de.woff2,FiraSans-Regular-0fe48ade.woff2,FiraSans-MediumItalic-ccf7e434.woff2,FiraSans-Medium-e1aa3f0a.woff2,SourceCodePro-Regular-8badfe75.ttf.woff2,SourceCodePro-Semibold-aa29a496.ttf.woff2".split(",").map(f=>`<link rel="preload" as="font" type="font/woff2"href="../../static.files/${f}">`).join(""))</script><link rel="stylesheet" href="../../static.files/normalize-9960930a.css"><link rel="stylesheet" href="../../static.files/rustdoc-e56847b5.css"><meta name="rustdoc-vars" data-root-path="../../" data-static-root-path="../../static.files/" data-current-crate="burn_tensor" data-themes="" data-resource-suffix="" data-rustdoc-version="1.91.1 (ed61e7d7e 2025-11-07)" data-channel="1.91.1" data-search-js="search-e256b49e.js" data-stringdex-js="stringdex-c3e638e9.js" data-settings-js="settings-c38705f0.js" ><script src="../../static.files/storage-e2aeef58.js"></script><script defer src="sidebar-items.js"></script><script defer src="../../static.files/main-6dc2a7f3.js"></script><noscript><link rel="stylesheet" href="../../static.files/noscript-263c88ec.css"></noscript><link rel="alternate icon" type="image/png" href="../../static.files/favicon-32x32-eab170b8.png"><link rel="icon" type="image/svg+xml" href="../../static.files/favicon-044be391.svg"></head><body class="rustdoc trait"><!--[if lte IE 11]><div class="warning">This old browser is unsupported and will most likely display funky things.</div><![endif]--><rustdoc-topbar><h2><a href="#">QTensorOps</a></h2></rustdoc-topbar><nav class="sidebar"><div class="sidebar-crate"><h2><a href="../../burn_tensor/index.html">burn_<wbr>tensor</a><span class="version">0.16.1</span></h2></div><div class="sidebar-elems"><section id="rustdoc-toc"><h2 class="location"><a href="#">QTensor<wbr>Ops</a></h2><h3><a href="#required-methods">Required Methods</a></h3><ul class="block"><li><a href="#tymethod.dequantize" title="dequantize">dequantize</a></li><li><a href="#tymethod.q_device" title="q_device">q_device</a></li><li><a href="#tymethod.q_expand" title="q_expand">q_expand</a></li><li><a href="#tymethod.q_flip" title="q_flip">q_flip</a></li><li><a href="#tymethod.q_from_data" title="q_from_data">q_from_data</a></li><li><a href="#tymethod.q_into_data" title="q_into_data">q_into_data</a></li><li><a href="#tymethod.q_permute" title="q_permute">q_permute</a></li><li><a href="#tymethod.q_reshape" title="q_reshape">q_reshape</a></li><li><a href="#tymethod.q_select" title="q_select">q_select</a></li><li><a href="#tymethod.q_slice" title="q_slice">q_slice</a></li><li><a href="#tymethod.q_swap_dims" title="q_swap_dims">q_swap_dims</a></li><li><a href="#tymethod.q_to_device" title="q_to_device">q_to_device</a></li><li><a href="#tymethod.quantize" title="quantize">quantize</a></li></ul><h3><a href="#provided-methods">Provided Methods</a></h3><ul class="block"><li><a href="#method.q_abs" title="q_abs">q_abs</a></li><li><a href="#method.q_add" title="q_add">q_add</a></li><li><a href="#method.q_add_scalar" title="q_add_scalar">q_add_scalar</a></li><li><a href="#method.q_all" title="q_all">q_all</a></li><li><a href="#method.q_all_dim" title="q_all_dim">q_all_dim</a></li><li><a href="#method.q_any" title="q_any">q_any</a></li><li><a href="#method.q_any_dim" title="q_any_dim">q_any_dim</a></li><li><a href="#method.q_argmax" title="q_argmax">q_argmax</a></li><li><a href="#method.q_argmin" title="q_argmin">q_argmin</a></li><li><a href="#method.q_argsort" title="q_argsort">q_argsort</a></li><li><a href="#method.q_cat" title="q_cat">q_cat</a></li><li><a href="#method.q_chunk" title="q_chunk">q_chunk</a></li><li><a href="#method.q_clamp" title="q_clamp">q_clamp</a></li><li><a href="#method.q_clamp_max" title="q_clamp_max">q_clamp_max</a></li><li><a href="#method.q_clamp_min" title="q_clamp_min">q_clamp_min</a></li><li><a href="#method.q_cos" title="q_cos">q_cos</a></li><li><a href="#method.q_detach" title="q_detach">q_detach</a></li><li><a href="#method.q_div" title="q_div">q_div</a></li><li><a href="#method.q_div_scalar" title="q_div_scalar">q_div_scalar</a></li><li><a href="#method.q_erf" title="q_erf">q_erf</a></li><li><a href="#method.q_exp" title="q_exp">q_exp</a></li><li><a href="#method.q_gather" title="q_gather">q_gather</a></li><li><a href="#method.q_is_require_grad" title="q_is_require_grad">q_is_require_grad</a></li><li><a href="#method.q_log" title="q_log">q_log</a></li><li><a href="#method.q_log1p" title="q_log1p">q_log1p</a></li><li><a href="#method.q_mask_fill" title="q_mask_fill">q_mask_fill</a></li><li><a href="#method.q_mask_where" title="q_mask_where">q_mask_where</a></li><li><a href="#method.q_matmul" title="q_matmul">q_matmul</a></li><li><a href="#method.q_max" title="q_max">q_max</a></li><li><a href="#method.q_max_dim" title="q_max_dim">q_max_dim</a></li><li><a href="#method.q_max_dim_with_indices" title="q_max_dim_with_indices">q_max_dim_with_indices</a></li><li><a href="#method.q_mean" title="q_mean">q_mean</a></li><li><a href="#method.q_mean_dim" title="q_mean_dim">q_mean_dim</a></li><li><a href="#method.q_min" title="q_min">q_min</a></li><li><a href="#method.q_min_dim" title="q_min_dim">q_min_dim</a></li><li><a href="#method.q_min_dim_with_indices" title="q_min_dim_with_indices">q_min_dim_with_indices</a></li><li><a href="#method.q_mul" title="q_mul">q_mul</a></li><li><a href="#method.q_mul_scalar" title="q_mul_scalar">q_mul_scalar</a></li><li><a href="#method.q_narrow" title="q_narrow">q_narrow</a></li><li><a href="#method.q_neg" title="q_neg">q_neg</a></li><li><a href="#method.q_powf" title="q_powf">q_powf</a></li><li><a href="#method.q_powf_scalar" title="q_powf_scalar">q_powf_scalar</a></li><li><a href="#method.q_powi" title="q_powi">q_powi</a></li><li><a href="#method.q_powi_scalar" title="q_powi_scalar">q_powi_scalar</a></li><li><a href="#method.q_prod" title="q_prod">q_prod</a></li><li><a href="#method.q_prod_dim" title="q_prod_dim">q_prod_dim</a></li><li><a href="#method.q_recip" title="q_recip">q_recip</a></li><li><a href="#method.q_remainder" title="q_remainder">q_remainder</a></li><li><a href="#method.q_remainder_scalar" title="q_remainder_scalar">q_remainder_scalar</a></li><li><a href="#method.q_repeat_dim" title="q_repeat_dim">q_repeat_dim</a></li><li><a href="#method.q_scatter" title="q_scatter">q_scatter</a></li><li><a href="#method.q_select_assign" title="q_select_assign">q_select_assign</a></li><li><a href="#method.q_set_require_grad" title="q_set_require_grad">q_set_require_grad</a></li><li><a href="#method.q_sin" title="q_sin">q_sin</a></li><li><a href="#method.q_slice_assign" title="q_slice_assign">q_slice_assign</a></li><li><a href="#method.q_sort" title="q_sort">q_sort</a></li><li><a href="#method.q_sort_with_indices" title="q_sort_with_indices">q_sort_with_indices</a></li><li><a href="#method.q_split" title="q_split">q_split</a></li><li><a href="#method.q_split_with_sizes" title="q_split_with_sizes">q_split_with_sizes</a></li><li><a href="#method.q_sqrt" title="q_sqrt">q_sqrt</a></li><li><a href="#method.q_sub" title="q_sub">q_sub</a></li><li><a href="#method.q_sub_scalar" title="q_sub_scalar">q_sub_scalar</a></li><li><a href="#method.q_sum" title="q_sum">q_sum</a></li><li><a href="#method.q_sum_dim" title="q_sum_dim">q_sum_dim</a></li><li><a href="#method.q_tanh" title="q_tanh">q_tanh</a></li><li><a href="#method.q_transpose" title="q_transpose">q_transpose</a></li><li><a href="#method.quantize_dynamic" title="quantize_dynamic">quantize_dynamic</a></li></ul><h3><a href="#dyn-compatibility">Dyn Compatibility</a></h3><h3><a href="#implementors">Implementors</a></h3></section><div id="rustdoc-modnav"><h2><a href="index.html">In burn_<wbr>tensor::<wbr>ops</a></h2></div></div></nav><div class="sidebar-resizer" title="Drag to resize sidebar"></div><main><div class="width-limiter"><section id="main-content" class="content"><div class="main-heading"><div class="rustdoc-breadcrumbs"><a href="../index.html">burn_tensor</a>::<wbr><a href="index.html">ops</a></div><h1>Trait <span class="trait">QTensor<wbr>Ops</span>&nbsp;<button id="copy-path" title="Copy item path to clipboard">Copy item path</button></h1><rustdoc-toolbar></rustdoc-toolbar><span class="sub-heading"><a class="src" href="../../src/burn_tensor/tensor/ops/qtensor.rs.html#45-1397">Source</a> </span></div><pre class="rust item-decl"><code>pub trait QTensorOps&lt;B: <a class="trait" href="../backend/trait.Backend.html" title="trait burn_tensor::backend::Backend">Backend</a>&gt; {
+<details class="toggle type-contents-toggle"><summary class="hideme"><span>Show 80 methods</span></summary>    // Required methods
+    fn <a href="#tymethod.q_from_data" class="fn">q_from_data</a>(data: <a class="struct" href="../struct.TensorData.html" title="struct burn_tensor::TensorData">TensorData</a>, device: &amp;<a class="type" href="../type.Device.html" title="type burn_tensor::Device">Device</a>&lt;B&gt;) -&gt; <a class="type" href="type.QuantizedTensor.html" title="type burn_tensor::ops::QuantizedTensor">QuantizedTensor</a>&lt;B&gt;;
+<span class="item-spacer"></span>    fn <a href="#tymethod.quantize" class="fn">quantize</a>(
+        tensor: <a class="type" href="type.FloatTensor.html" title="type burn_tensor::ops::FloatTensor">FloatTensor</a>&lt;B&gt;,
+        scheme: &amp;<a class="enum" href="../quantization/enum.QuantizationScheme.html" title="enum burn_tensor::quantization::QuantizationScheme">QuantizationScheme</a>,
+        qparams: <a class="struct" href="../quantization/struct.QuantizationParametersPrimitive.html" title="struct burn_tensor::quantization::QuantizationParametersPrimitive">QuantizationParametersPrimitive</a>&lt;B&gt;,
+    ) -&gt; <a class="type" href="type.QuantizedTensor.html" title="type burn_tensor::ops::QuantizedTensor">QuantizedTensor</a>&lt;B&gt;;
+<span class="item-spacer"></span>    fn <a href="#tymethod.dequantize" class="fn">dequantize</a>(tensor: <a class="type" href="type.QuantizedTensor.html" title="type burn_tensor::ops::QuantizedTensor">QuantizedTensor</a>&lt;B&gt;) -&gt; <a class="type" href="type.FloatTensor.html" title="type burn_tensor::ops::FloatTensor">FloatTensor</a>&lt;B&gt;;
+<span class="item-spacer"></span>    fn <a href="#tymethod.q_device" class="fn">q_device</a>(tensor: &amp;<a class="type" href="type.QuantizedTensor.html" title="type burn_tensor::ops::QuantizedTensor">QuantizedTensor</a>&lt;B&gt;) -&gt; <a class="type" href="../type.Device.html" title="type burn_tensor::Device">Device</a>&lt;B&gt;;
+<span class="item-spacer"></span>    fn <a href="#tymethod.q_to_device" class="fn">q_to_device</a>(
+        tensor: <a class="type" href="type.QuantizedTensor.html" title="type burn_tensor::ops::QuantizedTensor">QuantizedTensor</a>&lt;B&gt;,
+        device: &amp;<a class="type" href="../type.Device.html" title="type burn_tensor::Device">Device</a>&lt;B&gt;,
+    ) -&gt; <a class="type" href="type.QuantizedTensor.html" title="type burn_tensor::ops::QuantizedTensor">QuantizedTensor</a>&lt;B&gt;;
+<span class="item-spacer"></span>    fn <a href="#tymethod.q_reshape" class="fn">q_reshape</a>(tensor: <a class="type" href="type.QuantizedTensor.html" title="type burn_tensor::ops::QuantizedTensor">QuantizedTensor</a>&lt;B&gt;, shape: <a class="struct" href="../struct.Shape.html" title="struct burn_tensor::Shape">Shape</a>) -&gt; <a class="type" href="type.QuantizedTensor.html" title="type burn_tensor::ops::QuantizedTensor">QuantizedTensor</a>&lt;B&gt;;
+<span class="item-spacer"></span>    fn <a href="#tymethod.q_into_data" class="fn">q_into_data</a>(
+        tensor: <a class="type" href="type.QuantizedTensor.html" title="type burn_tensor::ops::QuantizedTensor">QuantizedTensor</a>&lt;B&gt;,
+    ) -&gt; impl <a class="trait" href="https://doc.rust-lang.org/1.91.1/core/future/future/trait.Future.html" title="trait core::future::future::Future">Future</a>&lt;Output = <a class="struct" href="../struct.TensorData.html" title="struct burn_tensor::TensorData">TensorData</a>&gt; + 'static + <a class="trait" href="https://doc.rust-lang.org/1.91.1/core/marker/trait.Send.html" title="trait core::marker::Send">Send</a>;
+<span class="item-spacer"></span>    fn <a href="#tymethod.q_swap_dims" class="fn">q_swap_dims</a>(
+        tensor: <a class="type" href="type.QuantizedTensor.html" title="type burn_tensor::ops::QuantizedTensor">QuantizedTensor</a>&lt;B&gt;,
+        dim1: <a class="primitive" href="https://doc.rust-lang.org/1.91.1/std/primitive.usize.html">usize</a>,
+        dim2: <a class="primitive" href="https://doc.rust-lang.org/1.91.1/std/primitive.usize.html">usize</a>,
+    ) -&gt; <a class="type" href="type.QuantizedTensor.html" title="type burn_tensor::ops::QuantizedTensor">QuantizedTensor</a>&lt;B&gt;;
+<span class="item-spacer"></span>    fn <a href="#tymethod.q_permute" class="fn">q_permute</a>(
+        tensor: <a class="type" href="type.QuantizedTensor.html" title="type burn_tensor::ops::QuantizedTensor">QuantizedTensor</a>&lt;B&gt;,
+        axes: &amp;[<a class="primitive" href="https://doc.rust-lang.org/1.91.1/std/primitive.usize.html">usize</a>],
+    ) -&gt; <a class="type" href="type.QuantizedTensor.html" title="type burn_tensor::ops::QuantizedTensor">QuantizedTensor</a>&lt;B&gt;;
+<span class="item-spacer"></span>    fn <a href="#tymethod.q_flip" class="fn">q_flip</a>(tensor: <a class="type" href="type.QuantizedTensor.html" title="type burn_tensor::ops::QuantizedTensor">QuantizedTensor</a>&lt;B&gt;, axes: &amp;[<a class="primitive" href="https://doc.rust-lang.org/1.91.1/std/primitive.usize.html">usize</a>]) -&gt; <a class="type" href="type.QuantizedTensor.html" title="type burn_tensor::ops::QuantizedTensor">QuantizedTensor</a>&lt;B&gt;;
+<span class="item-spacer"></span>    fn <a href="#tymethod.q_select" class="fn">q_select</a>(
+        tensor: <a class="type" href="type.QuantizedTensor.html" title="type burn_tensor::ops::QuantizedTensor">QuantizedTensor</a>&lt;B&gt;,
+        dim: <a class="primitive" href="https://doc.rust-lang.org/1.91.1/std/primitive.usize.html">usize</a>,
+        indices: <a class="type" href="type.IntTensor.html" title="type burn_tensor::ops::IntTensor">IntTensor</a>&lt;B&gt;,
+    ) -&gt; <a class="type" href="type.QuantizedTensor.html" title="type burn_tensor::ops::QuantizedTensor">QuantizedTensor</a>&lt;B&gt;;
+<span class="item-spacer"></span>    fn <a href="#tymethod.q_slice" class="fn">q_slice</a>(
+        tensor: <a class="type" href="type.QuantizedTensor.html" title="type burn_tensor::ops::QuantizedTensor">QuantizedTensor</a>&lt;B&gt;,
+        ranges: &amp;[<a class="struct" href="https://doc.rust-lang.org/1.91.1/core/ops/range/struct.Range.html" title="struct core::ops::range::Range">Range</a>&lt;<a class="primitive" href="https://doc.rust-lang.org/1.91.1/std/primitive.usize.html">usize</a>&gt;],
+    ) -&gt; <a class="type" href="type.QuantizedTensor.html" title="type burn_tensor::ops::QuantizedTensor">QuantizedTensor</a>&lt;B&gt;;
+<span class="item-spacer"></span>    fn <a href="#tymethod.q_expand" class="fn">q_expand</a>(tensor: <a class="type" href="type.QuantizedTensor.html" title="type burn_tensor::ops::QuantizedTensor">QuantizedTensor</a>&lt;B&gt;, shape: <a class="struct" href="../struct.Shape.html" title="struct burn_tensor::Shape">Shape</a>) -&gt; <a class="type" href="type.QuantizedTensor.html" title="type burn_tensor::ops::QuantizedTensor">QuantizedTensor</a>&lt;B&gt;;
+
+    // Provided methods
+    fn <a href="#method.quantize_dynamic" class="fn">quantize_dynamic</a>(
+        tensor: <a class="type" href="type.FloatTensor.html" title="type burn_tensor::ops::FloatTensor">FloatTensor</a>&lt;B&gt;,
+        scheme: &amp;<a class="enum" href="../quantization/enum.QuantizationScheme.html" title="enum burn_tensor::quantization::QuantizationScheme">QuantizationScheme</a>,
+    ) -&gt; <a class="type" href="type.QuantizedTensor.html" title="type burn_tensor::ops::QuantizedTensor">QuantizedTensor</a>&lt;B&gt; { ... }
+<span class="item-spacer"></span>    fn <a href="#method.q_detach" class="fn">q_detach</a>(tensor: <a class="type" href="type.QuantizedTensor.html" title="type burn_tensor::ops::QuantizedTensor">QuantizedTensor</a>&lt;B&gt;) -&gt; <a class="type" href="type.QuantizedTensor.html" title="type burn_tensor::ops::QuantizedTensor">QuantizedTensor</a>&lt;B&gt; { ... }
+<span class="item-spacer"></span>    fn <a href="#method.q_set_require_grad" class="fn">q_set_require_grad</a>(
+        tensor: <a class="type" href="type.QuantizedTensor.html" title="type burn_tensor::ops::QuantizedTensor">QuantizedTensor</a>&lt;B&gt;,
+        _require_grad: <a class="primitive" href="https://doc.rust-lang.org/1.91.1/std/primitive.bool.html">bool</a>,
+    ) -&gt; <a class="type" href="type.QuantizedTensor.html" title="type burn_tensor::ops::QuantizedTensor">QuantizedTensor</a>&lt;B&gt; { ... }
+<span class="item-spacer"></span>    fn <a href="#method.q_is_require_grad" class="fn">q_is_require_grad</a>(_tensor: &amp;<a class="type" href="type.QuantizedTensor.html" title="type burn_tensor::ops::QuantizedTensor">QuantizedTensor</a>&lt;B&gt;) -&gt; <a class="primitive" href="https://doc.rust-lang.org/1.91.1/std/primitive.bool.html">bool</a> { ... }
+<span class="item-spacer"></span>    fn <a href="#method.q_repeat_dim" class="fn">q_repeat_dim</a>(
+        tensor: <a class="type" href="type.QuantizedTensor.html" title="type burn_tensor::ops::QuantizedTensor">QuantizedTensor</a>&lt;B&gt;,
+        dim: <a class="primitive" href="https://doc.rust-lang.org/1.91.1/std/primitive.usize.html">usize</a>,
+        times: <a class="primitive" href="https://doc.rust-lang.org/1.91.1/std/primitive.usize.html">usize</a>,
+    ) -&gt; <a class="type" href="type.QuantizedTensor.html" title="type burn_tensor::ops::QuantizedTensor">QuantizedTensor</a>&lt;B&gt; { ... }
+<span class="item-spacer"></span>    fn <a href="#method.q_add" class="fn">q_add</a>(
+        lhs: <a class="type" href="type.QuantizedTensor.html" title="type burn_tensor::ops::QuantizedTensor">QuantizedTensor</a>&lt;B&gt;,
+        rhs: <a class="type" href="type.QuantizedTensor.html" title="type burn_tensor::ops::QuantizedTensor">QuantizedTensor</a>&lt;B&gt;,
+    ) -&gt; <a class="type" href="type.QuantizedTensor.html" title="type burn_tensor::ops::QuantizedTensor">QuantizedTensor</a>&lt;B&gt; { ... }
+<span class="item-spacer"></span>    fn <a href="#method.q_add_scalar" class="fn">q_add_scalar</a>(
+        lhs: <a class="type" href="type.QuantizedTensor.html" title="type burn_tensor::ops::QuantizedTensor">QuantizedTensor</a>&lt;B&gt;,
+        rhs: <a class="type" href="type.FloatElem.html" title="type burn_tensor::ops::FloatElem">FloatElem</a>&lt;B&gt;,
+    ) -&gt; <a class="type" href="type.QuantizedTensor.html" title="type burn_tensor::ops::QuantizedTensor">QuantizedTensor</a>&lt;B&gt; { ... }
+<span class="item-spacer"></span>    fn <a href="#method.q_clamp_min" class="fn">q_clamp_min</a>(
+        tensor: <a class="type" href="type.QuantizedTensor.html" title="type burn_tensor::ops::QuantizedTensor">QuantizedTensor</a>&lt;B&gt;,
+        min: <a class="type" href="type.FloatElem.html" title="type burn_tensor::ops::FloatElem">FloatElem</a>&lt;B&gt;,
+    ) -&gt; <a class="type" href="type.QuantizedTensor.html" title="type burn_tensor::ops::QuantizedTensor">QuantizedTensor</a>&lt;B&gt; { ... }
+<span class="item-spacer"></span>    fn <a href="#method.q_clamp_max" class="fn">q_clamp_max</a>(
+        tensor: <a class="type" href="type.QuantizedTensor.html" title="type burn_tensor::ops::QuantizedTensor">QuantizedTensor</a>&lt;B&gt;,
+        max: <a class="type" href="type.FloatElem.html" title="type burn_tensor::ops::FloatElem">FloatElem</a>&lt;B&gt;,
+    ) -&gt; <a class="type" href="type.QuantizedTensor.html" title="type burn_tensor::ops::QuantizedTensor">QuantizedTensor</a>&lt;B&gt; { ... }
+<span class="item-spacer"></span>    fn <a href="#method.q_clamp" class="fn">q_clamp</a>(
+        tensor: <a class="type" href="type.QuantizedTensor.html" title="type burn_tensor::ops::QuantizedTensor">QuantizedTensor</a>&lt;B&gt;,
+        min: <a class="type" href="type.FloatElem.html" title="type burn_tensor::ops::FloatElem">FloatElem</a>&lt;B&gt;,
+        max: <a class="type" href="type.FloatElem.html" title="type burn_tensor::ops::FloatElem">FloatElem</a>&lt;B&gt;,
+    ) -&gt; <a class="type" href="type.QuantizedTensor.html" title="type burn_tensor::ops::QuantizedTensor">QuantizedTensor</a>&lt;B&gt; { ... }
+<span class="item-spacer"></span>    fn <a href="#method.q_sub" class="fn">q_sub</a>(
+        lhs: <a class="type" href="type.QuantizedTensor.html" title="type burn_tensor::ops::QuantizedTensor">QuantizedTensor</a>&lt;B&gt;,
+        rhs: <a class="type" href="type.QuantizedTensor.html" title="type burn_tensor::ops::QuantizedTensor">QuantizedTensor</a>&lt;B&gt;,
+    ) -&gt; <a class="type" href="type.QuantizedTensor.html" title="type burn_tensor::ops::QuantizedTensor">QuantizedTensor</a>&lt;B&gt; { ... }
+<span class="item-spacer"></span>    fn <a href="#method.q_sub_scalar" class="fn">q_sub_scalar</a>(
+        lhs: <a class="type" href="type.QuantizedTensor.html" title="type burn_tensor::ops::QuantizedTensor">QuantizedTensor</a>&lt;B&gt;,
+        rhs: <a class="type" href="type.FloatElem.html" title="type burn_tensor::ops::FloatElem">FloatElem</a>&lt;B&gt;,
+    ) -&gt; <a class="type" href="type.QuantizedTensor.html" title="type burn_tensor::ops::QuantizedTensor">QuantizedTensor</a>&lt;B&gt; { ... }
+<span class="item-spacer"></span>    fn <a href="#method.q_mul" class="fn">q_mul</a>(
+        lhs: <a class="type" href="type.QuantizedTensor.html" title="type burn_tensor::ops::QuantizedTensor">QuantizedTensor</a>&lt;B&gt;,
+        rhs: <a class="type" href="type.QuantizedTensor.html" title="type burn_tensor::ops::QuantizedTensor">QuantizedTensor</a>&lt;B&gt;,
+    ) -&gt; <a class="type" href="type.QuantizedTensor.html" title="type burn_tensor::ops::QuantizedTensor">QuantizedTensor</a>&lt;B&gt; { ... }
+<span class="item-spacer"></span>    fn <a href="#method.q_mul_scalar" class="fn">q_mul_scalar</a>(
+        lhs: <a class="type" href="type.QuantizedTensor.html" title="type burn_tensor::ops::QuantizedTensor">QuantizedTensor</a>&lt;B&gt;,
+        rhs: <a class="type" href="type.FloatElem.html" title="type burn_tensor::ops::FloatElem">FloatElem</a>&lt;B&gt;,
+    ) -&gt; <a class="type" href="type.QuantizedTensor.html" title="type burn_tensor::ops::QuantizedTensor">QuantizedTensor</a>&lt;B&gt; { ... }
+<span class="item-spacer"></span>    fn <a href="#method.q_div" class="fn">q_div</a>(
+        lhs: <a class="type" href="type.QuantizedTensor.html" title="type burn_tensor::ops::QuantizedTensor">QuantizedTensor</a>&lt;B&gt;,
+        rhs: <a class="type" href="type.QuantizedTensor.html" title="type burn_tensor::ops::QuantizedTensor">QuantizedTensor</a>&lt;B&gt;,
+    ) -&gt; <a class="type" href="type.QuantizedTensor.html" title="type burn_tensor::ops::QuantizedTensor">QuantizedTensor</a>&lt;B&gt; { ... }
+<span class="item-spacer"></span>    fn <a href="#method.q_div_scalar" class="fn">q_div_scalar</a>(
+        lhs: <a class="type" href="type.QuantizedTensor.html" title="type burn_tensor::ops::QuantizedTensor">QuantizedTensor</a>&lt;B&gt;,
+        rhs: <a class="type" href="type.FloatElem.html" title="type burn_tensor::ops::FloatElem">FloatElem</a>&lt;B&gt;,
+    ) -&gt; <a class="type" href="type.QuantizedTensor.html" title="type burn_tensor::ops::QuantizedTensor">QuantizedTensor</a>&lt;B&gt; { ... }
+<span class="item-spacer"></span>    fn <a href="#method.q_remainder" class="fn">q_remainder</a>(
+        lhs: <a class="type" href="type.QuantizedTensor.html" title="type burn_tensor::ops::QuantizedTensor">QuantizedTensor</a>&lt;B&gt;,
+        rhs: <a class="type" href="type.QuantizedTensor.html" title="type burn_tensor::ops::QuantizedTensor">QuantizedTensor</a>&lt;B&gt;,
+    ) -&gt; <a class="type" href="type.QuantizedTensor.html" title="type burn_tensor::ops::QuantizedTensor">QuantizedTensor</a>&lt;B&gt; { ... }
+<span class="item-spacer"></span>    fn <a href="#method.q_remainder_scalar" class="fn">q_remainder_scalar</a>(
+        lhs: <a class="type" href="type.QuantizedTensor.html" title="type burn_tensor::ops::QuantizedTensor">QuantizedTensor</a>&lt;B&gt;,
+        rhs: <a class="type" href="type.FloatElem.html" title="type burn_tensor::ops::FloatElem">FloatElem</a>&lt;B&gt;,
+    ) -&gt; <a class="type" href="type.QuantizedTensor.html" title="type burn_tensor::ops::QuantizedTensor">QuantizedTensor</a>&lt;B&gt; { ... }
+<span class="item-spacer"></span>    fn <a href="#method.q_matmul" class="fn">q_matmul</a>(
+        lhs: <a class="type" href="type.QuantizedTensor.html" title="type burn_tensor::ops::QuantizedTensor">QuantizedTensor</a>&lt;B&gt;,
+        rhs: <a class="type" href="type.QuantizedTensor.html" title="type burn_tensor::ops::QuantizedTensor">QuantizedTensor</a>&lt;B&gt;,
+    ) -&gt; <a class="type" href="type.QuantizedTensor.html" title="type burn_tensor::ops::QuantizedTensor">QuantizedTensor</a>&lt;B&gt; { ... }
+<span class="item-spacer"></span>    fn <a href="#method.q_neg" class="fn">q_neg</a>(tensor: <a class="type" href="type.QuantizedTensor.html" title="type burn_tensor::ops::QuantizedTensor">QuantizedTensor</a>&lt;B&gt;) -&gt; <a class="type" href="type.QuantizedTensor.html" title="type burn_tensor::ops::QuantizedTensor">QuantizedTensor</a>&lt;B&gt; { ... }
+<span class="item-spacer"></span>    fn <a href="#method.q_recip" class="fn">q_recip</a>(tensor: <a class="type" href="type.QuantizedTensor.html" title="type burn_tensor::ops::QuantizedTensor">QuantizedTensor</a>&lt;B&gt;) -&gt; <a class="type" href="type.QuantizedTensor.html" title="type burn_tensor::ops::QuantizedTensor">QuantizedTensor</a>&lt;B&gt; { ... }
+<span class="item-spacer"></span>    fn <a href="#method.q_transpose" class="fn">q_transpose</a>(tensor: <a class="type" href="type.QuantizedTensor.html" title="type burn_tensor::ops::QuantizedTensor">QuantizedTensor</a>&lt;B&gt;) -&gt; <a class="type" href="type.QuantizedTensor.html" title="type burn_tensor::ops::QuantizedTensor">QuantizedTensor</a>&lt;B&gt; { ... }
+<span class="item-spacer"></span>    fn <a href="#method.q_gather" class="fn">q_gather</a>(
+        dim: <a class="primitive" href="https://doc.rust-lang.org/1.91.1/std/primitive.usize.html">usize</a>,
+        tensor: <a class="type" href="type.QuantizedTensor.html" title="type burn_tensor::ops::QuantizedTensor">QuantizedTensor</a>&lt;B&gt;,
+        indices: <a class="type" href="type.IntTensor.html" title="type burn_tensor::ops::IntTensor">IntTensor</a>&lt;B&gt;,
+    ) -&gt; <a class="type" href="type.QuantizedTensor.html" title="type burn_tensor::ops::QuantizedTensor">QuantizedTensor</a>&lt;B&gt; { ... }
+<span class="item-spacer"></span>    fn <a href="#method.q_scatter" class="fn">q_scatter</a>(
+        dim: <a class="primitive" href="https://doc.rust-lang.org/1.91.1/std/primitive.usize.html">usize</a>,
+        tensor: <a class="type" href="type.QuantizedTensor.html" title="type burn_tensor::ops::QuantizedTensor">QuantizedTensor</a>&lt;B&gt;,
+        indices: <a class="type" href="type.IntTensor.html" title="type burn_tensor::ops::IntTensor">IntTensor</a>&lt;B&gt;,
+        value: <a class="type" href="type.QuantizedTensor.html" title="type burn_tensor::ops::QuantizedTensor">QuantizedTensor</a>&lt;B&gt;,
+    ) -&gt; <a class="type" href="type.QuantizedTensor.html" title="type burn_tensor::ops::QuantizedTensor">QuantizedTensor</a>&lt;B&gt; { ... }
+<span class="item-spacer"></span>    fn <a href="#method.q_select_assign" class="fn">q_select_assign</a>(
+        tensor: <a class="type" href="type.QuantizedTensor.html" title="type burn_tensor::ops::QuantizedTensor">QuantizedTensor</a>&lt;B&gt;,
+        dim: <a class="primitive" href="https://doc.rust-lang.org/1.91.1/std/primitive.usize.html">usize</a>,
+        indices: <a class="type" href="type.IntTensor.html" title="type burn_tensor::ops::IntTensor">IntTensor</a>&lt;B&gt;,
+        value: <a class="type" href="type.QuantizedTensor.html" title="type burn_tensor::ops::QuantizedTensor">QuantizedTensor</a>&lt;B&gt;,
+    ) -&gt; <a class="type" href="type.QuantizedTensor.html" title="type burn_tensor::ops::QuantizedTensor">QuantizedTensor</a>&lt;B&gt; { ... }
+<span class="item-spacer"></span>    fn <a href="#method.q_slice_assign" class="fn">q_slice_assign</a>(
+        tensor: <a class="type" href="type.QuantizedTensor.html" title="type burn_tensor::ops::QuantizedTensor">QuantizedTensor</a>&lt;B&gt;,
+        ranges: &amp;[<a class="struct" href="https://doc.rust-lang.org/1.91.1/core/ops/range/struct.Range.html" title="struct core::ops::range::Range">Range</a>&lt;<a class="primitive" href="https://doc.rust-lang.org/1.91.1/std/primitive.usize.html">usize</a>&gt;],
+        value: <a class="type" href="type.QuantizedTensor.html" title="type burn_tensor::ops::QuantizedTensor">QuantizedTensor</a>&lt;B&gt;,
+    ) -&gt; <a class="type" href="type.QuantizedTensor.html" title="type burn_tensor::ops::QuantizedTensor">QuantizedTensor</a>&lt;B&gt; { ... }
+<span class="item-spacer"></span>    fn <a href="#method.q_mask_where" class="fn">q_mask_where</a>(
+        tensor: <a class="type" href="type.QuantizedTensor.html" title="type burn_tensor::ops::QuantizedTensor">QuantizedTensor</a>&lt;B&gt;,
+        mask: <a class="type" href="type.BoolTensor.html" title="type burn_tensor::ops::BoolTensor">BoolTensor</a>&lt;B&gt;,
+        value: <a class="type" href="type.QuantizedTensor.html" title="type burn_tensor::ops::QuantizedTensor">QuantizedTensor</a>&lt;B&gt;,
+    ) -&gt; <a class="type" href="type.QuantizedTensor.html" title="type burn_tensor::ops::QuantizedTensor">QuantizedTensor</a>&lt;B&gt; { ... }
+<span class="item-spacer"></span>    fn <a href="#method.q_mask_fill" class="fn">q_mask_fill</a>(
+        tensor: <a class="type" href="type.QuantizedTensor.html" title="type burn_tensor::ops::QuantizedTensor">QuantizedTensor</a>&lt;B&gt;,
+        mask: <a class="type" href="type.BoolTensor.html" title="type burn_tensor::ops::BoolTensor">BoolTensor</a>&lt;B&gt;,
+        value: <a class="type" href="type.FloatElem.html" title="type burn_tensor::ops::FloatElem">FloatElem</a>&lt;B&gt;,
+    ) -&gt; <a class="type" href="type.QuantizedTensor.html" title="type burn_tensor::ops::QuantizedTensor">QuantizedTensor</a>&lt;B&gt; { ... }
+<span class="item-spacer"></span>    fn <a href="#method.q_sum" class="fn">q_sum</a>(tensor: <a class="type" href="type.QuantizedTensor.html" title="type burn_tensor::ops::QuantizedTensor">QuantizedTensor</a>&lt;B&gt;) -&gt; <a class="type" href="type.QuantizedTensor.html" title="type burn_tensor::ops::QuantizedTensor">QuantizedTensor</a>&lt;B&gt; { ... }
+<span class="item-spacer"></span>    fn <a href="#method.q_sum_dim" class="fn">q_sum_dim</a>(tensor: <a class="type" href="type.QuantizedTensor.html" title="type burn_tensor::ops::QuantizedTensor">QuantizedTensor</a>&lt;B&gt;, dim: <a class="primitive" href="https://doc.rust-lang.org/1.91.1/std/primitive.usize.html">usize</a>) -&gt; <a class="type" href="type.QuantizedTensor.html" title="type burn_tensor::ops::QuantizedTensor">QuantizedTensor</a>&lt;B&gt; { ... }
+<span class="item-spacer"></span>    fn <a href="#method.q_prod" class="fn">q_prod</a>(tensor: <a class="type" href="type.QuantizedTensor.html" title="type burn_tensor::ops::QuantizedTensor">QuantizedTensor</a>&lt;B&gt;) -&gt; <a class="type" href="type.QuantizedTensor.html" title="type burn_tensor::ops::QuantizedTensor">QuantizedTensor</a>&lt;B&gt; { ... }
+<span class="item-spacer"></span>    fn <a href="#method.q_prod_dim" class="fn">q_prod_dim</a>(tensor: <a class="type" href="type.QuantizedTensor.html" title="type burn_tensor::ops::QuantizedTensor">QuantizedTensor</a>&lt;B&gt;, dim: <a class="primitive" href="https://doc.rust-lang.org/1.91.1/std/primitive.usize.html">usize</a>) -&gt; <a class="type" href="type.QuantizedTensor.html" title="type burn_tensor::ops::QuantizedTensor">QuantizedTensor</a>&lt;B&gt; { ... }
+<span class="item-spacer"></span>    fn <a href="#method.q_mean" class="fn">q_mean</a>(tensor: <a class="type" href="type.QuantizedTensor.html" title="type burn_tensor::ops::QuantizedTensor">QuantizedTensor</a>&lt;B&gt;) -&gt; <a class="type" href="type.QuantizedTensor.html" title="type burn_tensor::ops::QuantizedTensor">QuantizedTensor</a>&lt;B&gt; { ... }
+<span class="item-spacer"></span>    fn <a href="#method.q_mean_dim" class="fn">q_mean_dim</a>(tensor: <a class="type" href="type.QuantizedTensor.html" title="type burn_tensor::ops::QuantizedTensor">QuantizedTensor</a>&lt;B&gt;, dim: <a class="primitive" href="https://doc.rust-lang.org/1.91.1/std/primitive.usize.html">usize</a>) -&gt; <a class="type" href="type.QuantizedTensor.html" title="type burn_tensor::ops::QuantizedTensor">QuantizedTensor</a>&lt;B&gt; { ... }
+<span class="item-spacer"></span>    fn <a href="#method.q_exp" class="fn">q_exp</a>(tensor: <a class="type" href="type.QuantizedTensor.html" title="type burn_tensor::ops::QuantizedTensor">QuantizedTensor</a>&lt;B&gt;) -&gt; <a class="type" href="type.QuantizedTensor.html" title="type burn_tensor::ops::QuantizedTensor">QuantizedTensor</a>&lt;B&gt; { ... }
+<span class="item-spacer"></span>    fn <a href="#method.q_log" class="fn">q_log</a>(tensor: <a class="type" href="type.QuantizedTensor.html" title="type burn_tensor::ops::QuantizedTensor">QuantizedTensor</a>&lt;B&gt;) -&gt; <a class="type" href="type.QuantizedTensor.html" title="type burn_tensor::ops::QuantizedTensor">QuantizedTensor</a>&lt;B&gt; { ... }
+<span class="item-spacer"></span>    fn <a href="#method.q_log1p" class="fn">q_log1p</a>(tensor: <a class="type" href="type.QuantizedTensor.html" title="type burn_tensor::ops::QuantizedTensor">QuantizedTensor</a>&lt;B&gt;) -&gt; <a class="type" href="type.QuantizedTensor.html" title="type burn_tensor::ops::QuantizedTensor">QuantizedTensor</a>&lt;B&gt; { ... }
+<span class="item-spacer"></span>    fn <a href="#method.q_powf" class="fn">q_powf</a>(
+        lhs: <a class="type" href="type.QuantizedTensor.html" title="type burn_tensor::ops::QuantizedTensor">QuantizedTensor</a>&lt;B&gt;,
+        rhs: <a class="type" href="type.QuantizedTensor.html" title="type burn_tensor::ops::QuantizedTensor">QuantizedTensor</a>&lt;B&gt;,
+    ) -&gt; <a class="type" href="type.QuantizedTensor.html" title="type burn_tensor::ops::QuantizedTensor">QuantizedTensor</a>&lt;B&gt; { ... }
+<span class="item-spacer"></span>    fn <a href="#method.q_powi" class="fn">q_powi</a>(lhs: <a class="type" href="type.QuantizedTensor.html" title="type burn_tensor::ops::QuantizedTensor">QuantizedTensor</a>&lt;B&gt;, rhs: <a class="type" href="type.IntTensor.html" title="type burn_tensor::ops::IntTensor">IntTensor</a>&lt;B&gt;) -&gt; <a class="type" href="type.QuantizedTensor.html" title="type burn_tensor::ops::QuantizedTensor">QuantizedTensor</a>&lt;B&gt; { ... }
+<span class="item-spacer"></span>    fn <a href="#method.q_powi_scalar" class="fn">q_powi_scalar</a>(
+        lhs: <a class="type" href="type.QuantizedTensor.html" title="type burn_tensor::ops::QuantizedTensor">QuantizedTensor</a>&lt;B&gt;,
+        rhs: <a class="type" href="type.IntElem.html" title="type burn_tensor::ops::IntElem">IntElem</a>&lt;B&gt;,
+    ) -&gt; <a class="type" href="type.QuantizedTensor.html" title="type burn_tensor::ops::QuantizedTensor">QuantizedTensor</a>&lt;B&gt; { ... }
+<span class="item-spacer"></span>    fn <a href="#method.q_powf_scalar" class="fn">q_powf_scalar</a>(
+        tensor: <a class="type" href="type.QuantizedTensor.html" title="type burn_tensor::ops::QuantizedTensor">QuantizedTensor</a>&lt;B&gt;,
+        value: <a class="primitive" href="https://doc.rust-lang.org/1.91.1/std/primitive.f32.html">f32</a>,
+    ) -&gt; <a class="type" href="type.QuantizedTensor.html" title="type burn_tensor::ops::QuantizedTensor">QuantizedTensor</a>&lt;B&gt; { ... }
+<span class="item-spacer"></span>    fn <a href="#method.q_sqrt" class="fn">q_sqrt</a>(tensor: <a class="type" href="type.QuantizedTensor.html" title="type burn_tensor::ops::QuantizedTensor">QuantizedTensor</a>&lt;B&gt;) -&gt; <a class="type" href="type.QuantizedTensor.html" title="type burn_tensor::ops::QuantizedTensor">QuantizedTensor</a>&lt;B&gt; { ... }
+<span class="item-spacer"></span>    fn <a href="#method.q_abs" class="fn">q_abs</a>(tensor: <a class="type" href="type.QuantizedTensor.html" title="type burn_tensor::ops::QuantizedTensor">QuantizedTensor</a>&lt;B&gt;) -&gt; <a class="type" href="type.QuantizedTensor.html" title="type burn_tensor::ops::QuantizedTensor">QuantizedTensor</a>&lt;B&gt; { ... }
+<span class="item-spacer"></span>    fn <a href="#method.q_cos" class="fn">q_cos</a>(tensor: <a class="type" href="type.QuantizedTensor.html" title="type burn_tensor::ops::QuantizedTensor">QuantizedTensor</a>&lt;B&gt;) -&gt; <a class="type" href="type.QuantizedTensor.html" title="type burn_tensor::ops::QuantizedTensor">QuantizedTensor</a>&lt;B&gt; { ... }
+<span class="item-spacer"></span>    fn <a href="#method.q_sin" class="fn">q_sin</a>(tensor: <a class="type" href="type.QuantizedTensor.html" title="type burn_tensor::ops::QuantizedTensor">QuantizedTensor</a>&lt;B&gt;) -&gt; <a class="type" href="type.QuantizedTensor.html" title="type burn_tensor::ops::QuantizedTensor">QuantizedTensor</a>&lt;B&gt; { ... }
+<span class="item-spacer"></span>    fn <a href="#method.q_tanh" class="fn">q_tanh</a>(tensor: <a class="type" href="type.QuantizedTensor.html" title="type burn_tensor::ops::QuantizedTensor">QuantizedTensor</a>&lt;B&gt;) -&gt; <a class="type" href="type.QuantizedTensor.html" title="type burn_tensor::ops::QuantizedTensor">QuantizedTensor</a>&lt;B&gt; { ... }
+<span class="item-spacer"></span>    fn <a href="#method.q_erf" class="fn">q_erf</a>(tensor: <a class="type" href="type.QuantizedTensor.html" title="type burn_tensor::ops::QuantizedTensor">QuantizedTensor</a>&lt;B&gt;) -&gt; <a class="type" href="type.QuantizedTensor.html" title="type burn_tensor::ops::QuantizedTensor">QuantizedTensor</a>&lt;B&gt; { ... }
+<span class="item-spacer"></span>    fn <a href="#method.q_cat" class="fn">q_cat</a>(tensors: <a class="struct" href="https://doc.rust-lang.org/1.91.1/alloc/vec/struct.Vec.html" title="struct alloc::vec::Vec">Vec</a>&lt;<a class="type" href="type.QuantizedTensor.html" title="type burn_tensor::ops::QuantizedTensor">QuantizedTensor</a>&lt;B&gt;&gt;, dim: <a class="primitive" href="https://doc.rust-lang.org/1.91.1/std/primitive.usize.html">usize</a>) -&gt; <a class="type" href="type.QuantizedTensor.html" title="type burn_tensor::ops::QuantizedTensor">QuantizedTensor</a>&lt;B&gt; { ... }
+<span class="item-spacer"></span>    fn <a href="#method.q_argmax" class="fn">q_argmax</a>(tensor: <a class="type" href="type.QuantizedTensor.html" title="type burn_tensor::ops::QuantizedTensor">QuantizedTensor</a>&lt;B&gt;, dim: <a class="primitive" href="https://doc.rust-lang.org/1.91.1/std/primitive.usize.html">usize</a>) -&gt; <a class="type" href="type.IntTensor.html" title="type burn_tensor::ops::IntTensor">IntTensor</a>&lt;B&gt; { ... }
+<span class="item-spacer"></span>    fn <a href="#method.q_argmin" class="fn">q_argmin</a>(tensor: <a class="type" href="type.QuantizedTensor.html" title="type burn_tensor::ops::QuantizedTensor">QuantizedTensor</a>&lt;B&gt;, dim: <a class="primitive" href="https://doc.rust-lang.org/1.91.1/std/primitive.usize.html">usize</a>) -&gt; <a class="type" href="type.IntTensor.html" title="type burn_tensor::ops::IntTensor">IntTensor</a>&lt;B&gt; { ... }
+<span class="item-spacer"></span>    fn <a href="#method.q_max" class="fn">q_max</a>(tensor: <a class="type" href="type.QuantizedTensor.html" title="type burn_tensor::ops::QuantizedTensor">QuantizedTensor</a>&lt;B&gt;) -&gt; <a class="type" href="type.QuantizedTensor.html" title="type burn_tensor::ops::QuantizedTensor">QuantizedTensor</a>&lt;B&gt; { ... }
+<span class="item-spacer"></span>    fn <a href="#method.q_max_dim" class="fn">q_max_dim</a>(tensor: <a class="type" href="type.QuantizedTensor.html" title="type burn_tensor::ops::QuantizedTensor">QuantizedTensor</a>&lt;B&gt;, dim: <a class="primitive" href="https://doc.rust-lang.org/1.91.1/std/primitive.usize.html">usize</a>) -&gt; <a class="type" href="type.QuantizedTensor.html" title="type burn_tensor::ops::QuantizedTensor">QuantizedTensor</a>&lt;B&gt; { ... }
+<span class="item-spacer"></span>    fn <a href="#method.q_max_dim_with_indices" class="fn">q_max_dim_with_indices</a>(
+        tensor: <a class="type" href="type.QuantizedTensor.html" title="type burn_tensor::ops::QuantizedTensor">QuantizedTensor</a>&lt;B&gt;,
+        dim: <a class="primitive" href="https://doc.rust-lang.org/1.91.1/std/primitive.usize.html">usize</a>,
+    ) -&gt; (<a class="type" href="type.QuantizedTensor.html" title="type burn_tensor::ops::QuantizedTensor">QuantizedTensor</a>&lt;B&gt;, <a class="type" href="type.IntTensor.html" title="type burn_tensor::ops::IntTensor">IntTensor</a>&lt;B&gt;) { ... }
+<span class="item-spacer"></span>    fn <a href="#method.q_min" class="fn">q_min</a>(tensor: <a class="type" href="type.QuantizedTensor.html" title="type burn_tensor::ops::QuantizedTensor">QuantizedTensor</a>&lt;B&gt;) -&gt; <a class="type" href="type.QuantizedTensor.html" title="type burn_tensor::ops::QuantizedTensor">QuantizedTensor</a>&lt;B&gt; { ... }
+<span class="item-spacer"></span>    fn <a href="#method.q_min_dim" class="fn">q_min_dim</a>(tensor: <a class="type" href="type.QuantizedTensor.html" title="type burn_tensor::ops::QuantizedTensor">QuantizedTensor</a>&lt;B&gt;, dim: <a class="primitive" href="https://doc.rust-lang.org/1.91.1/std/primitive.usize.html">usize</a>) -&gt; <a class="type" href="type.QuantizedTensor.html" title="type burn_tensor::ops::QuantizedTensor">QuantizedTensor</a>&lt;B&gt; { ... }
+<span class="item-spacer"></span>    fn <a href="#method.q_min_dim_with_indices" class="fn">q_min_dim_with_indices</a>(
+        tensor: <a class="type" href="type.QuantizedTensor.html" title="type burn_tensor::ops::QuantizedTensor">QuantizedTensor</a>&lt;B&gt;,
+        dim: <a class="primitive" href="https://doc.rust-lang.org/1.91.1/std/primitive.usize.html">usize</a>,
+    ) -&gt; (<a class="type" href="type.QuantizedTensor.html" title="type burn_tensor::ops::QuantizedTensor">QuantizedTensor</a>&lt;B&gt;, <a class="type" href="type.IntTensor.html" title="type burn_tensor::ops::IntTensor">IntTensor</a>&lt;B&gt;) { ... }
+<span class="item-spacer"></span>    fn <a href="#method.q_narrow" class="fn">q_narrow</a>(
+        tensor: <a class="type" href="type.QuantizedTensor.html" title="type burn_tensor::ops::QuantizedTensor">QuantizedTensor</a>&lt;B&gt;,
+        dim: <a class="primitive" href="https://doc.rust-lang.org/1.91.1/std/primitive.usize.html">usize</a>,
+        start: <a class="primitive" href="https://doc.rust-lang.org/1.91.1/std/primitive.usize.html">usize</a>,
+        length: <a class="primitive" href="https://doc.rust-lang.org/1.91.1/std/primitive.usize.html">usize</a>,
+    ) -&gt; <a class="type" href="type.QuantizedTensor.html" title="type burn_tensor::ops::QuantizedTensor">QuantizedTensor</a>&lt;B&gt; { ... }
+<span class="item-spacer"></span>    fn <a href="#method.q_chunk" class="fn">q_chunk</a>(
+        tensor: <a class="type" href="type.QuantizedTensor.html" title="type burn_tensor::ops::QuantizedTensor">QuantizedTensor</a>&lt;B&gt;,
+        chunks: <a class="primitive" href="https://doc.rust-lang.org/1.91.1/std/primitive.usize.html">usize</a>,
+        dim: <a class="primitive" href="https://doc.rust-lang.org/1.91.1/std/primitive.usize.html">usize</a>,
+    ) -&gt; <a class="struct" href="https://doc.rust-lang.org/1.91.1/alloc/vec/struct.Vec.html" title="struct alloc::vec::Vec">Vec</a>&lt;<a class="type" href="type.QuantizedTensor.html" title="type burn_tensor::ops::QuantizedTensor">QuantizedTensor</a>&lt;B&gt;&gt; <a href="#" class="tooltip" data-notable-ty="Vec&lt;QuantizedTensor&lt;B&gt;&gt;">ⓘ</a> { ... }
+<span class="item-spacer"></span>    fn <a href="#method.q_split" class="fn">q_split</a>(
+        tensor: <a class="type" href="type.QuantizedTensor.html" title="type burn_tensor::ops::QuantizedTensor">QuantizedTensor</a>&lt;B&gt;,
+        split_size: <a class="primitive" href="https://doc.rust-lang.org/1.91.1/std/primitive.usize.html">usize</a>,
+        dim: <a class="primitive" href="https://doc.rust-lang.org/1.91.1/std/primitive.usize.html">usize</a>,
+    ) -&gt; <a class="struct" href="https://doc.rust-lang.org/1.91.1/alloc/vec/struct.Vec.html" title="struct alloc::vec::Vec">Vec</a>&lt;<a class="type" href="type.QuantizedTensor.html" title="type burn_tensor::ops::QuantizedTensor">QuantizedTensor</a>&lt;B&gt;&gt; <a href="#" class="tooltip" data-notable-ty="Vec&lt;QuantizedTensor&lt;B&gt;&gt;">ⓘ</a> { ... }
+<span class="item-spacer"></span>    fn <a href="#method.q_split_with_sizes" class="fn">q_split_with_sizes</a>(
+        tensor: <a class="type" href="type.QuantizedTensor.html" title="type burn_tensor::ops::QuantizedTensor">QuantizedTensor</a>&lt;B&gt;,
+        split_sizes: <a class="struct" href="https://doc.rust-lang.org/1.91.1/alloc/vec/struct.Vec.html" title="struct alloc::vec::Vec">Vec</a>&lt;<a class="primitive" href="https://doc.rust-lang.org/1.91.1/std/primitive.usize.html">usize</a>&gt;,
+        dim: <a class="primitive" href="https://doc.rust-lang.org/1.91.1/std/primitive.usize.html">usize</a>,
+    ) -&gt; <a class="struct" href="https://doc.rust-lang.org/1.91.1/alloc/vec/struct.Vec.html" title="struct alloc::vec::Vec">Vec</a>&lt;<a class="type" href="type.QuantizedTensor.html" title="type burn_tensor::ops::QuantizedTensor">QuantizedTensor</a>&lt;B&gt;&gt; <a href="#" class="tooltip" data-notable-ty="Vec&lt;QuantizedTensor&lt;B&gt;&gt;">ⓘ</a> { ... }
+<span class="item-spacer"></span>    fn <a href="#method.q_any" class="fn">q_any</a>(tensor: <a class="type" href="type.QuantizedTensor.html" title="type burn_tensor::ops::QuantizedTensor">QuantizedTensor</a>&lt;B&gt;) -&gt; <a class="type" href="type.BoolTensor.html" title="type burn_tensor::ops::BoolTensor">BoolTensor</a>&lt;B&gt; { ... }
+<span class="item-spacer"></span>    fn <a href="#method.q_any_dim" class="fn">q_any_dim</a>(tensor: <a class="type" href="type.QuantizedTensor.html" title="type burn_tensor::ops::QuantizedTensor">QuantizedTensor</a>&lt;B&gt;, dim: <a class="primitive" href="https://doc.rust-lang.org/1.91.1/std/primitive.usize.html">usize</a>) -&gt; <a class="type" href="type.BoolTensor.html" title="type burn_tensor::ops::BoolTensor">BoolTensor</a>&lt;B&gt; { ... }
+<span class="item-spacer"></span>    fn <a href="#method.q_all" class="fn">q_all</a>(tensor: <a class="type" href="type.QuantizedTensor.html" title="type burn_tensor::ops::QuantizedTensor">QuantizedTensor</a>&lt;B&gt;) -&gt; <a class="type" href="type.BoolTensor.html" title="type burn_tensor::ops::BoolTensor">BoolTensor</a>&lt;B&gt; { ... }
+<span class="item-spacer"></span>    fn <a href="#method.q_all_dim" class="fn">q_all_dim</a>(tensor: <a class="type" href="type.QuantizedTensor.html" title="type burn_tensor::ops::QuantizedTensor">QuantizedTensor</a>&lt;B&gt;, dim: <a class="primitive" href="https://doc.rust-lang.org/1.91.1/std/primitive.usize.html">usize</a>) -&gt; <a class="type" href="type.BoolTensor.html" title="type burn_tensor::ops::BoolTensor">BoolTensor</a>&lt;B&gt; { ... }
+<span class="item-spacer"></span>    fn <a href="#method.q_sort" class="fn">q_sort</a>(
+        tensor: <a class="type" href="type.QuantizedTensor.html" title="type burn_tensor::ops::QuantizedTensor">QuantizedTensor</a>&lt;B&gt;,
+        dim: <a class="primitive" href="https://doc.rust-lang.org/1.91.1/std/primitive.usize.html">usize</a>,
+        descending: <a class="primitive" href="https://doc.rust-lang.org/1.91.1/std/primitive.bool.html">bool</a>,
+    ) -&gt; <a class="type" href="type.QuantizedTensor.html" title="type burn_tensor::ops::QuantizedTensor">QuantizedTensor</a>&lt;B&gt; { ... }
+<span class="item-spacer"></span>    fn <a href="#method.q_sort_with_indices" class="fn">q_sort_with_indices</a>(
+        tensor: <a class="type" href="type.QuantizedTensor.html" title="type burn_tensor::ops::QuantizedTensor">QuantizedTensor</a>&lt;B&gt;,
+        dim: <a class="primitive" href="https://doc.rust-lang.org/1.91.1/std/primitive.usize.html">usize</a>,
+        descending: <a class="primitive" href="https://doc.rust-lang.org/1.91.1/std/primitive.bool.html">bool</a>,
+    ) -&gt; (<a class="type" href="type.QuantizedTensor.html" title="type burn_tensor::ops::QuantizedTensor">QuantizedTensor</a>&lt;B&gt;, <a class="type" href="type.IntTensor.html" title="type burn_tensor::ops::IntTensor">IntTensor</a>&lt;B&gt;) { ... }
+<span class="item-spacer"></span>    fn <a href="#method.q_argsort" class="fn">q_argsort</a>(
+        tensor: <a class="type" href="type.QuantizedTensor.html" title="type burn_tensor::ops::QuantizedTensor">QuantizedTensor</a>&lt;B&gt;,
+        dim: <a class="primitive" href="https://doc.rust-lang.org/1.91.1/std/primitive.usize.html">usize</a>,
+        descending: <a class="primitive" href="https://doc.rust-lang.org/1.91.1/std/primitive.bool.html">bool</a>,
+    ) -&gt; <a class="type" href="type.IntTensor.html" title="type burn_tensor::ops::IntTensor">IntTensor</a>&lt;B&gt; { ... }
+</details>}</code></pre><details class="toggle top-doc" open><summary class="hideme"><span>Expand description</span></summary><div class="docblock"><p>Quantized Tensor API for basic operations, see <a href="../struct.Tensor.html" title="struct burn_tensor::Tensor">tensor</a>
+for documentation on each function.</p>
+</div></details><h2 id="required-methods" class="section-header">Required Methods<a href="#required-methods" class="anchor">§</a></h2><div class="methods"><details class="toggle method-toggle" open><summary><section id="tymethod.q_from_data" class="method"><a class="src rightside" href="../../src/burn_tensor/tensor/ops/qtensor.rs.html#56">Source</a><h4 class="code-header">fn <a href="#tymethod.q_from_data" class="fn">q_from_data</a>(data: <a class="struct" href="../struct.TensorData.html" title="struct burn_tensor::TensorData">TensorData</a>, device: &amp;<a class="type" href="../type.Device.html" title="type burn_tensor::Device">Device</a>&lt;B&gt;) -&gt; <a class="type" href="type.QuantizedTensor.html" title="type burn_tensor::ops::QuantizedTensor">QuantizedTensor</a>&lt;B&gt;</h4></section></summary><div class="docblock"><p>Creates a new tensor from the data structure.</p>
+<h5 id="arguments"><a class="doc-anchor" href="#arguments">§</a>Arguments</h5>
+<ul>
+<li><code>data</code> - The data structure.</li>
+<li><code>device</code> - The device to create the tensor on.</li>
+</ul>
+<h5 id="returns"><a class="doc-anchor" href="#returns">§</a>Returns</h5>
+<p>The tensor with the given data.</p>
+</div></details><details class="toggle method-toggle" open><summary><section id="tymethod.quantize" class="method"><a class="src rightside" href="../../src/burn_tensor/tensor/ops/qtensor.rs.html#59-63">Source</a><h4 class="code-header">fn <a href="#tymethod.quantize" class="fn">quantize</a>(
+    tensor: <a class="type" href="type.FloatTensor.html" title="type burn_tensor::ops::FloatTensor">FloatTensor</a>&lt;B&gt;,
+    scheme: &amp;<a class="enum" href="../quantization/enum.QuantizationScheme.html" title="enum burn_tensor::quantization::QuantizationScheme">QuantizationScheme</a>,
+    qparams: <a class="struct" href="../quantization/struct.QuantizationParametersPrimitive.html" title="struct burn_tensor::quantization::QuantizationParametersPrimitive">QuantizationParametersPrimitive</a>&lt;B&gt;,
+) -&gt; <a class="type" href="type.QuantizedTensor.html" title="type burn_tensor::ops::QuantizedTensor">QuantizedTensor</a>&lt;B&gt;</h4></section></summary><div class="docblock"><p>Convert the tensor to a lower precision data type based on the quantization scheme and parameters.</p>
+</div></details><details class="toggle method-toggle" open><summary><section id="tymethod.dequantize" class="method"><a class="src rightside" href="../../src/burn_tensor/tensor/ops/qtensor.rs.html#75">Source</a><h4 class="code-header">fn <a href="#tymethod.dequantize" class="fn">dequantize</a>(tensor: <a class="type" href="type.QuantizedTensor.html" title="type burn_tensor::ops::QuantizedTensor">QuantizedTensor</a>&lt;B&gt;) -&gt; <a class="type" href="type.FloatTensor.html" title="type burn_tensor::ops::FloatTensor">FloatTensor</a>&lt;B&gt;</h4></section></summary><div class="docblock"><p>Convert the tensor back to a higher precision data type.</p>
+</div></details><details class="toggle method-toggle" open><summary><section id="tymethod.q_device" class="method"><a class="src rightside" href="../../src/burn_tensor/tensor/ops/qtensor.rs.html#86">Source</a><h4 class="code-header">fn <a href="#tymethod.q_device" class="fn">q_device</a>(tensor: &amp;<a class="type" href="type.QuantizedTensor.html" title="type burn_tensor::ops::QuantizedTensor">QuantizedTensor</a>&lt;B&gt;) -&gt; <a class="type" href="../type.Device.html" title="type burn_tensor::Device">Device</a>&lt;B&gt;</h4></section></summary><div class="docblock"><p>Gets the device of the tensor.</p>
+<h5 id="arguments-1"><a class="doc-anchor" href="#arguments-1">§</a>Arguments</h5>
+<ul>
+<li><code>tensor</code> - The tensor.</li>
+</ul>
+<h5 id="returns-1"><a class="doc-anchor" href="#returns-1">§</a>Returns</h5>
+<p>The device of the tensor.</p>
+</div></details><details class="toggle method-toggle" open><summary><section id="tymethod.q_to_device" class="method"><a class="src rightside" href="../../src/burn_tensor/tensor/ops/qtensor.rs.html#98">Source</a><h4 class="code-header">fn <a href="#tymethod.q_to_device" class="fn">q_to_device</a>(
+    tensor: <a class="type" href="type.QuantizedTensor.html" title="type burn_tensor::ops::QuantizedTensor">QuantizedTensor</a>&lt;B&gt;,
+    device: &amp;<a class="type" href="../type.Device.html" title="type burn_tensor::Device">Device</a>&lt;B&gt;,
+) -&gt; <a class="type" href="type.QuantizedTensor.html" title="type burn_tensor::ops::QuantizedTensor">QuantizedTensor</a>&lt;B&gt;</h4></section></summary><div class="docblock"><p>Moves the tensor to the given device.</p>
+<h5 id="arguments-2"><a class="doc-anchor" href="#arguments-2">§</a>Arguments</h5>
+<ul>
+<li><code>tensor</code> - The tensor.</li>
+<li><code>device</code> - The device to move the tensor to.</li>
+</ul>
+<h5 id="returns-2"><a class="doc-anchor" href="#returns-2">§</a>Returns</h5>
+<p>The tensor on the given device.</p>
+</div></details><details class="toggle method-toggle" open><summary><section id="tymethod.q_reshape" class="method"><a class="src rightside" href="../../src/burn_tensor/tensor/ops/qtensor.rs.html#110">Source</a><h4 class="code-header">fn <a href="#tymethod.q_reshape" class="fn">q_reshape</a>(tensor: <a class="type" href="type.QuantizedTensor.html" title="type burn_tensor::ops::QuantizedTensor">QuantizedTensor</a>&lt;B&gt;, shape: <a class="struct" href="../struct.Shape.html" title="struct burn_tensor::Shape">Shape</a>) -&gt; <a class="type" href="type.QuantizedTensor.html" title="type burn_tensor::ops::QuantizedTensor">QuantizedTensor</a>&lt;B&gt;</h4></section></summary><div class="docblock"><p>Reshapes a tensor.</p>
+<h5 id="arguments-3"><a class="doc-anchor" href="#arguments-3">§</a>Arguments</h5>
+<ul>
+<li><code>tensor</code> - The tensor to reshape.</li>
+<li><code>shape</code> - The new shape of the tensor.</li>
+</ul>
+<h5 id="returns-3"><a class="doc-anchor" href="#returns-3">§</a>Returns</h5>
+<p>The tensor with the new shape.</p>
+</div></details><details class="toggle method-toggle" open><summary><section id="tymethod.q_into_data" class="method"><a class="src rightside" href="../../src/burn_tensor/tensor/ops/qtensor.rs.html#121-122">Source</a><h4 class="code-header">fn <a href="#tymethod.q_into_data" class="fn">q_into_data</a>(
+    tensor: <a class="type" href="type.QuantizedTensor.html" title="type burn_tensor::ops::QuantizedTensor">QuantizedTensor</a>&lt;B&gt;,
+) -&gt; impl <a class="trait" href="https://doc.rust-lang.org/1.91.1/core/future/future/trait.Future.html" title="trait core::future::future::Future">Future</a>&lt;Output = <a class="struct" href="../struct.TensorData.html" title="struct burn_tensor::TensorData">TensorData</a>&gt; + 'static + <a class="trait" href="https://doc.rust-lang.org/1.91.1/core/marker/trait.Send.html" title="trait core::marker::Send">Send</a></h4></section></summary><div class="docblock"><p>Converts the tensor to a data structure.</p>
+<h5 id="arguments-4"><a class="doc-anchor" href="#arguments-4">§</a>Arguments</h5>
+<ul>
+<li><code>tensor</code> - The tensor.</li>
+</ul>
+<h5 id="returns-4"><a class="doc-anchor" href="#returns-4">§</a>Returns</h5>
+<p>The data structure with the tensor’s data.</p>
+</div></details><details class="toggle method-toggle" open><summary><section id="tymethod.q_swap_dims" class="method"><a class="src rightside" href="../../src/burn_tensor/tensor/ops/qtensor.rs.html#467">Source</a><h4 class="code-header">fn <a href="#tymethod.q_swap_dims" class="fn">q_swap_dims</a>(
+    tensor: <a class="type" href="type.QuantizedTensor.html" title="type burn_tensor::ops::QuantizedTensor">QuantizedTensor</a>&lt;B&gt;,
+    dim1: <a class="primitive" href="https://doc.rust-lang.org/1.91.1/std/primitive.usize.html">usize</a>,
+    dim2: <a class="primitive" href="https://doc.rust-lang.org/1.91.1/std/primitive.usize.html">usize</a>,
+) -&gt; <a class="type" href="type.QuantizedTensor.html" title="type burn_tensor::ops::QuantizedTensor">QuantizedTensor</a>&lt;B&gt;</h4></section></summary><div class="docblock"><p>Swaps two dimensions of a tensor.</p>
+<h5 id="arguments-5"><a class="doc-anchor" href="#arguments-5">§</a>Arguments</h5>
+<ul>
+<li><code>tensor</code> - The tensor to swap the dimensions of.</li>
+<li><code>dim1</code> - The first dimension to swap.</li>
+<li><code>dim2</code> - The second dimension to swap.</li>
+</ul>
+<h5 id="returns-5"><a class="doc-anchor" href="#returns-5">§</a>Returns</h5>
+<p>The tensor with the dimensions swapped.</p>
+</div></details><details class="toggle method-toggle" open><summary><section id="tymethod.q_permute" class="method"><a class="src rightside" href="../../src/burn_tensor/tensor/ops/qtensor.rs.html#478">Source</a><h4 class="code-header">fn <a href="#tymethod.q_permute" class="fn">q_permute</a>(tensor: <a class="type" href="type.QuantizedTensor.html" title="type burn_tensor::ops::QuantizedTensor">QuantizedTensor</a>&lt;B&gt;, axes: &amp;[<a class="primitive" href="https://doc.rust-lang.org/1.91.1/std/primitive.usize.html">usize</a>]) -&gt; <a class="type" href="type.QuantizedTensor.html" title="type burn_tensor::ops::QuantizedTensor">QuantizedTensor</a>&lt;B&gt;</h4></section></summary><div class="docblock"><p>Permutes the dimensions of a tensor.</p>
+<h5 id="arguments-6"><a class="doc-anchor" href="#arguments-6">§</a>Arguments</h5>
+<ul>
+<li><code>tensor</code> - The tensor to permute the dimensions of.</li>
+<li><code>axes</code> - The new order of the dimensions.</li>
+</ul>
+<h5 id="returns-6"><a class="doc-anchor" href="#returns-6">§</a>Returns</h5>
+<p>The tensor with the dimensions permuted.</p>
+</div></details><details class="toggle method-toggle" open><summary><section id="tymethod.q_flip" class="method"><a class="src rightside" href="../../src/burn_tensor/tensor/ops/qtensor.rs.html#488">Source</a><h4 class="code-header">fn <a href="#tymethod.q_flip" class="fn">q_flip</a>(tensor: <a class="type" href="type.QuantizedTensor.html" title="type burn_tensor::ops::QuantizedTensor">QuantizedTensor</a>&lt;B&gt;, axes: &amp;[<a class="primitive" href="https://doc.rust-lang.org/1.91.1/std/primitive.usize.html">usize</a>]) -&gt; <a class="type" href="type.QuantizedTensor.html" title="type burn_tensor::ops::QuantizedTensor">QuantizedTensor</a>&lt;B&gt;</h4></section></summary><div class="docblock"><p>Reverse the order of elements in a tensor along the given axes.</p>
+<h5 id="arguments-7"><a class="doc-anchor" href="#arguments-7">§</a>Arguments</h5>
+<ul>
+<li><code>tensor</code> - The tensor to reverse.</li>
+<li><code>axes</code> - The axes to reverse.</li>
+</ul>
+<p>The tensor with the elements reversed.</p>
+</div></details><details class="toggle method-toggle" open><summary><section id="tymethod.q_select" class="method"><a class="src rightside" href="../../src/burn_tensor/tensor/ops/qtensor.rs.html#551-555">Source</a><h4 class="code-header">fn <a href="#tymethod.q_select" class="fn">q_select</a>(
+    tensor: <a class="type" href="type.QuantizedTensor.html" title="type burn_tensor::ops::QuantizedTensor">QuantizedTensor</a>&lt;B&gt;,
+    dim: <a class="primitive" href="https://doc.rust-lang.org/1.91.1/std/primitive.usize.html">usize</a>,
+    indices: <a class="type" href="type.IntTensor.html" title="type burn_tensor::ops::IntTensor">IntTensor</a>&lt;B&gt;,
+) -&gt; <a class="type" href="type.QuantizedTensor.html" title="type burn_tensor::ops::QuantizedTensor">QuantizedTensor</a>&lt;B&gt;</h4></section></summary><div class="docblock"><p>Select tensor elements along the given dimension corresponding for the given indices.</p>
+<h5 id="arguments-8"><a class="doc-anchor" href="#arguments-8">§</a>Arguments</h5>
+<ul>
+<li><code>tensor</code> - The tensor to select from.</li>
+<li><code>dim</code> - The dimension to select from.</li>
+<li><code>indices</code> - The indices to select.</li>
+</ul>
+<h5 id="returns-7"><a class="doc-anchor" href="#returns-7">§</a>Returns</h5>
+<p>The selected elements.</p>
+</div></details><details class="toggle method-toggle" open><summary><section id="tymethod.q_slice" class="method"><a class="src rightside" href="../../src/burn_tensor/tensor/ops/qtensor.rs.html#594">Source</a><h4 class="code-header">fn <a href="#tymethod.q_slice" class="fn">q_slice</a>(
+    tensor: <a class="type" href="type.QuantizedTensor.html" title="type burn_tensor::ops::QuantizedTensor">QuantizedTensor</a>&lt;B&gt;,
+    ranges: &amp;[<a class="struct" href="https://doc.rust-lang.org/1.91.1/core/ops/range/struct.Range.html" title="struct core::ops::range::Range">Range</a>&lt;<a class="primitive" href="https://doc.rust-lang.org/1.91.1/std/primitive.usize.html">usize</a>&gt;],
+) -&gt; <a class="type" href="type.QuantizedTensor.html" title="type burn_tensor::ops::QuantizedTensor">QuantizedTensor</a>&lt;B&gt;</h4></section></summary><div class="docblock"><p>Select tensor elements corresponding for the given ranges.</p>
+<h5 id="arguments-9"><a class="doc-anchor" href="#arguments-9">§</a>Arguments</h5>
+<ul>
+<li><code>tensor</code> - The tensor to select from.</li>
+<li><code>ranges</code> - The ranges to select.</li>
+</ul>
+<h5 id="returns-8"><a class="doc-anchor" href="#returns-8">§</a>Returns</h5>
+<p>The selected elements in a new tensor.</p>
+</div></details><details class="toggle method-toggle" open><summary><section id="tymethod.q_expand" class="method"><a class="src rightside" href="../../src/burn_tensor/tensor/ops/qtensor.rs.html#1327">Source</a><h4 class="code-header">fn <a href="#tymethod.q_expand" class="fn">q_expand</a>(tensor: <a class="type" href="type.QuantizedTensor.html" title="type burn_tensor::ops::QuantizedTensor">QuantizedTensor</a>&lt;B&gt;, shape: <a class="struct" href="../struct.Shape.html" title="struct burn_tensor::Shape">Shape</a>) -&gt; <a class="type" href="type.QuantizedTensor.html" title="type burn_tensor::ops::QuantizedTensor">QuantizedTensor</a>&lt;B&gt;</h4></section></summary><div class="docblock"><p>Broadcasts the <code>tensor</code> to the given <code>shape</code>.</p>
+</div></details></div><h2 id="provided-methods" class="section-header">Provided Methods<a href="#provided-methods" class="anchor">§</a></h2><div class="methods"><details class="toggle method-toggle" open><summary><section id="method.quantize_dynamic" class="method"><a class="src rightside" href="../../src/burn_tensor/tensor/ops/qtensor.rs.html#66-72">Source</a><h4 class="code-header">fn <a href="#method.quantize_dynamic" class="fn">quantize_dynamic</a>(
+    tensor: <a class="type" href="type.FloatTensor.html" title="type burn_tensor::ops::FloatTensor">FloatTensor</a>&lt;B&gt;,
+    scheme: &amp;<a class="enum" href="../quantization/enum.QuantizationScheme.html" title="enum burn_tensor::quantization::QuantizationScheme">QuantizationScheme</a>,
+) -&gt; <a class="type" href="type.QuantizedTensor.html" title="type burn_tensor::ops::QuantizedTensor">QuantizedTensor</a>&lt;B&gt;</h4></section></summary><div class="docblock"><p>Dynamically convert the tensor to a lower precision data type based on the quantization scheme.</p>
+</div></details><details class="toggle method-toggle" open><summary><section id="method.q_detach" class="method"><a class="src rightside" href="../../src/burn_tensor/tensor/ops/qtensor.rs.html#125-128">Source</a><h4 class="code-header">fn <a href="#method.q_detach" class="fn">q_detach</a>(tensor: <a class="type" href="type.QuantizedTensor.html" title="type burn_tensor::ops::QuantizedTensor">QuantizedTensor</a>&lt;B&gt;) -&gt; <a class="type" href="type.QuantizedTensor.html" title="type burn_tensor::ops::QuantizedTensor">QuantizedTensor</a>&lt;B&gt;</h4></section></summary><div class="docblock"><p>Detaches a tensor from the computation graph.</p>
+</div></details><details class="toggle method-toggle" open><summary><section id="method.q_set_require_grad" class="method"><a class="src rightside" href="../../src/burn_tensor/tensor/ops/qtensor.rs.html#131-134">Source</a><h4 class="code-header">fn <a href="#method.q_set_require_grad" class="fn">q_set_require_grad</a>(
+    tensor: <a class="type" href="type.QuantizedTensor.html" title="type burn_tensor::ops::QuantizedTensor">QuantizedTensor</a>&lt;B&gt;,
+    _require_grad: <a class="primitive" href="https://doc.rust-lang.org/1.91.1/std/primitive.bool.html">bool</a>,
+) -&gt; <a class="type" href="type.QuantizedTensor.html" title="type burn_tensor::ops::QuantizedTensor">QuantizedTensor</a>&lt;B&gt;</h4></section></summary><div class="docblock"><p>Sets the <code>require_grad</code> flag of a tensor.</p>
+</div></details><details class="toggle method-toggle" open><summary><section id="method.q_is_require_grad" class="method"><a class="src rightside" href="../../src/burn_tensor/tensor/ops/qtensor.rs.html#137-140">Source</a><h4 class="code-header">fn <a href="#method.q_is_require_grad" class="fn">q_is_require_grad</a>(_tensor: &amp;<a class="type" href="type.QuantizedTensor.html" title="type burn_tensor::ops::QuantizedTensor">QuantizedTensor</a>&lt;B&gt;) -&gt; <a class="primitive" href="https://doc.rust-lang.org/1.91.1/std/primitive.bool.html">bool</a></h4></section></summary><div class="docblock"><p>Returns the <code>require_grad</code> flag of a tensor.</p>
+</div></details><details class="toggle method-toggle" open><summary><section id="method.q_repeat_dim" class="method"><a class="src rightside" href="../../src/burn_tensor/tensor/ops/qtensor.rs.html#153-159">Source</a><h4 class="code-header">fn <a href="#method.q_repeat_dim" class="fn">q_repeat_dim</a>(
+    tensor: <a class="type" href="type.QuantizedTensor.html" title="type burn_tensor::ops::QuantizedTensor">QuantizedTensor</a>&lt;B&gt;,
+    dim: <a class="primitive" href="https://doc.rust-lang.org/1.91.1/std/primitive.usize.html">usize</a>,
+    times: <a class="primitive" href="https://doc.rust-lang.org/1.91.1/std/primitive.usize.html">usize</a>,
+) -&gt; <a class="type" href="type.QuantizedTensor.html" title="type burn_tensor::ops::QuantizedTensor">QuantizedTensor</a>&lt;B&gt;</h4></section></summary><div class="docblock"><p>Repeat the tensor along the given dimension.</p>
+<h5 id="arguments-10"><a class="doc-anchor" href="#arguments-10">§</a>Arguments</h5>
+<ul>
+<li><code>tensor</code> - The tensor.</li>
+<li><code>dim</code> - The dimension to repeat.</li>
+<li><code>times</code> - The number of times to repeat the dimension.</li>
+</ul>
+<h5 id="returns-9"><a class="doc-anchor" href="#returns-9">§</a>Returns</h5>
+<p>The tensor with the given dimension repeated.</p>
+</div></details><details class="toggle method-toggle" open><summary><section id="method.q_add" class="method"><a class="src rightside" href="../../src/burn_tensor/tensor/ops/qtensor.rs.html#171-178">Source</a><h4 class="code-header">fn <a href="#method.q_add" class="fn">q_add</a>(lhs: <a class="type" href="type.QuantizedTensor.html" title="type burn_tensor::ops::QuantizedTensor">QuantizedTensor</a>&lt;B&gt;, rhs: <a class="type" href="type.QuantizedTensor.html" title="type burn_tensor::ops::QuantizedTensor">QuantizedTensor</a>&lt;B&gt;) -&gt; <a class="type" href="type.QuantizedTensor.html" title="type burn_tensor::ops::QuantizedTensor">QuantizedTensor</a>&lt;B&gt;</h4></section></summary><div class="docblock"><p>Adds two tensors together.</p>
+<h5 id="arguments-11"><a class="doc-anchor" href="#arguments-11">§</a>Arguments</h5>
+<ul>
+<li><code>lhs</code> - The left hand side tensor.</li>
+<li><code>rhs</code> - The right hand side tensor.</li>
+</ul>
+<h5 id="returns-10"><a class="doc-anchor" href="#returns-10">§</a>Returns</h5>
+<p>The result of adding the two tensors together.</p>
+</div></details><details class="toggle method-toggle" open><summary><section id="method.q_add_scalar" class="method"><a class="src rightside" href="../../src/burn_tensor/tensor/ops/qtensor.rs.html#190-197">Source</a><h4 class="code-header">fn <a href="#method.q_add_scalar" class="fn">q_add_scalar</a>(
+    lhs: <a class="type" href="type.QuantizedTensor.html" title="type burn_tensor::ops::QuantizedTensor">QuantizedTensor</a>&lt;B&gt;,
+    rhs: <a class="type" href="type.FloatElem.html" title="type burn_tensor::ops::FloatElem">FloatElem</a>&lt;B&gt;,
+) -&gt; <a class="type" href="type.QuantizedTensor.html" title="type burn_tensor::ops::QuantizedTensor">QuantizedTensor</a>&lt;B&gt;</h4></section></summary><div class="docblock"><p>Adds a scalar to a tensor.</p>
+<h5 id="arguments-12"><a class="doc-anchor" href="#arguments-12">§</a>Arguments</h5>
+<ul>
+<li><code>lhs</code> - The left hand side tensor.</li>
+<li><code>rhs</code> - The right hand side scalar.</li>
+</ul>
+<h5 id="returns-11"><a class="doc-anchor" href="#returns-11">§</a>Returns</h5>
+<p>The result of adding the scalar to the tensor.</p>
+</div></details><details class="toggle method-toggle" open><summary><section id="method.q_clamp_min" class="method"><a class="src rightside" href="../../src/burn_tensor/tensor/ops/qtensor.rs.html#209-216">Source</a><h4 class="code-header">fn <a href="#method.q_clamp_min" class="fn">q_clamp_min</a>(
+    tensor: <a class="type" href="type.QuantizedTensor.html" title="type burn_tensor::ops::QuantizedTensor">QuantizedTensor</a>&lt;B&gt;,
+    min: <a class="type" href="type.FloatElem.html" title="type burn_tensor::ops::FloatElem">FloatElem</a>&lt;B&gt;,
+) -&gt; <a class="type" href="type.QuantizedTensor.html" title="type burn_tensor::ops::QuantizedTensor">QuantizedTensor</a>&lt;B&gt;</h4></section></summary><div class="docblock"><p>Clamps a tensor under a minimum value.</p>
+<h5 id="arguments-13"><a class="doc-anchor" href="#arguments-13">§</a>Arguments</h5>
+<ul>
+<li><code>tensor</code> - The tensor to clamp.</li>
+<li><code>min</code> - The minimum value.</li>
+</ul>
+<h5 id="returns-12"><a class="doc-anchor" href="#returns-12">§</a>Returns</h5>
+<p>The clamped tensor.</p>
+</div></details><details class="toggle method-toggle" open><summary><section id="method.q_clamp_max" class="method"><a class="src rightside" href="../../src/burn_tensor/tensor/ops/qtensor.rs.html#228-235">Source</a><h4 class="code-header">fn <a href="#method.q_clamp_max" class="fn">q_clamp_max</a>(
+    tensor: <a class="type" href="type.QuantizedTensor.html" title="type burn_tensor::ops::QuantizedTensor">QuantizedTensor</a>&lt;B&gt;,
+    max: <a class="type" href="type.FloatElem.html" title="type burn_tensor::ops::FloatElem">FloatElem</a>&lt;B&gt;,
+) -&gt; <a class="type" href="type.QuantizedTensor.html" title="type burn_tensor::ops::QuantizedTensor">QuantizedTensor</a>&lt;B&gt;</h4></section></summary><div class="docblock"><p>Clamps a tensor over a maximum value.</p>
+<h5 id="arguments-14"><a class="doc-anchor" href="#arguments-14">§</a>Arguments</h5>
+<ul>
+<li><code>tensor</code> - The tensor to clamp.</li>
+<li><code>max</code> - The maximum value.</li>
+</ul>
+<h5 id="returns-13"><a class="doc-anchor" href="#returns-13">§</a>Returns</h5>
+<p>The clamped tensor.</p>
+</div></details><details class="toggle method-toggle" open><summary><section id="method.q_clamp" class="method"><a class="src rightside" href="../../src/burn_tensor/tensor/ops/qtensor.rs.html#248-259">Source</a><h4 class="code-header">fn <a href="#method.q_clamp" class="fn">q_clamp</a>(
+    tensor: <a class="type" href="type.QuantizedTensor.html" title="type burn_tensor::ops::QuantizedTensor">QuantizedTensor</a>&lt;B&gt;,
+    min: <a class="type" href="type.FloatElem.html" title="type burn_tensor::ops::FloatElem">FloatElem</a>&lt;B&gt;,
+    max: <a class="type" href="type.FloatElem.html" title="type burn_tensor::ops::FloatElem">FloatElem</a>&lt;B&gt;,
+) -&gt; <a class="type" href="type.QuantizedTensor.html" title="type burn_tensor::ops::QuantizedTensor">QuantizedTensor</a>&lt;B&gt;</h4></section></summary><div class="docblock"><p>Clamps a tensor between a minimum and maximum value.</p>
+<h5 id="arguments-15"><a class="doc-anchor" href="#arguments-15">§</a>Arguments</h5>
+<ul>
+<li><code>tensor</code> - The tensor to clamp.</li>
+<li><code>min</code> - The minimum value.</li>
+<li><code>max</code> - The maximum value.</li>
+</ul>
+<h5 id="returns-14"><a class="doc-anchor" href="#returns-14">§</a>Returns</h5>
+<p>The clamped tensor.</p>
+</div></details><details class="toggle method-toggle" open><summary><section id="method.q_sub" class="method"><a class="src rightside" href="../../src/burn_tensor/tensor/ops/qtensor.rs.html#271-278">Source</a><h4 class="code-header">fn <a href="#method.q_sub" class="fn">q_sub</a>(lhs: <a class="type" href="type.QuantizedTensor.html" title="type burn_tensor::ops::QuantizedTensor">QuantizedTensor</a>&lt;B&gt;, rhs: <a class="type" href="type.QuantizedTensor.html" title="type burn_tensor::ops::QuantizedTensor">QuantizedTensor</a>&lt;B&gt;) -&gt; <a class="type" href="type.QuantizedTensor.html" title="type burn_tensor::ops::QuantizedTensor">QuantizedTensor</a>&lt;B&gt;</h4></section></summary><div class="docblock"><p>Subtracts two tensors.</p>
+<h5 id="arguments-16"><a class="doc-anchor" href="#arguments-16">§</a>Arguments</h5>
+<ul>
+<li><code>lhs</code> - The left hand side tensor.</li>
+<li><code>rhs</code> - The right hand side tensor.</li>
+</ul>
+<h5 id="returns-15"><a class="doc-anchor" href="#returns-15">§</a>Returns</h5>
+<p>The result of subtracting the two tensors.</p>
+</div></details><details class="toggle method-toggle" open><summary><section id="method.q_sub_scalar" class="method"><a class="src rightside" href="../../src/burn_tensor/tensor/ops/qtensor.rs.html#290-297">Source</a><h4 class="code-header">fn <a href="#method.q_sub_scalar" class="fn">q_sub_scalar</a>(
+    lhs: <a class="type" href="type.QuantizedTensor.html" title="type burn_tensor::ops::QuantizedTensor">QuantizedTensor</a>&lt;B&gt;,
+    rhs: <a class="type" href="type.FloatElem.html" title="type burn_tensor::ops::FloatElem">FloatElem</a>&lt;B&gt;,
+) -&gt; <a class="type" href="type.QuantizedTensor.html" title="type burn_tensor::ops::QuantizedTensor">QuantizedTensor</a>&lt;B&gt;</h4></section></summary><div class="docblock"><p>Subtracts a scalar from a tensor.</p>
+<h5 id="arguments-17"><a class="doc-anchor" href="#arguments-17">§</a>Arguments</h5>
+<ul>
+<li><code>lhs</code> - The left hand side tensor.</li>
+<li><code>rhs</code> - The right hand side scalar.</li>
+</ul>
+<h5 id="returns-16"><a class="doc-anchor" href="#returns-16">§</a>Returns</h5>
+<p>The result of subtracting the scalar from the tensor.</p>
+</div></details><details class="toggle method-toggle" open><summary><section id="method.q_mul" class="method"><a class="src rightside" href="../../src/burn_tensor/tensor/ops/qtensor.rs.html#300-307">Source</a><h4 class="code-header">fn <a href="#method.q_mul" class="fn">q_mul</a>(lhs: <a class="type" href="type.QuantizedTensor.html" title="type burn_tensor::ops::QuantizedTensor">QuantizedTensor</a>&lt;B&gt;, rhs: <a class="type" href="type.QuantizedTensor.html" title="type burn_tensor::ops::QuantizedTensor">QuantizedTensor</a>&lt;B&gt;) -&gt; <a class="type" href="type.QuantizedTensor.html" title="type burn_tensor::ops::QuantizedTensor">QuantizedTensor</a>&lt;B&gt;</h4></section></summary><div class="docblock"><p>Multiplies two tensors together element-wise.</p>
+</div></details><details class="toggle method-toggle" open><summary><section id="method.q_mul_scalar" class="method"><a class="src rightside" href="../../src/burn_tensor/tensor/ops/qtensor.rs.html#319-326">Source</a><h4 class="code-header">fn <a href="#method.q_mul_scalar" class="fn">q_mul_scalar</a>(
+    lhs: <a class="type" href="type.QuantizedTensor.html" title="type burn_tensor::ops::QuantizedTensor">QuantizedTensor</a>&lt;B&gt;,
+    rhs: <a class="type" href="type.FloatElem.html" title="type burn_tensor::ops::FloatElem">FloatElem</a>&lt;B&gt;,
+) -&gt; <a class="type" href="type.QuantizedTensor.html" title="type burn_tensor::ops::QuantizedTensor">QuantizedTensor</a>&lt;B&gt;</h4></section></summary><div class="docblock"><p>Multiplies a tensor by a scalar.</p>
+<h5 id="arguments-18"><a class="doc-anchor" href="#arguments-18">§</a>Arguments</h5>
+<ul>
+<li><code>lhs</code> - The left hand side tensor.</li>
+<li><code>rhs</code> - The right hand side scalar.</li>
+</ul>
+<h5 id="returns-17"><a class="doc-anchor" href="#returns-17">§</a>Returns</h5>
+<p>The result of multiplying the tensor by the scalar.</p>
+</div></details><details class="toggle method-toggle" open><summary><section id="method.q_div" class="method"><a class="src rightside" href="../../src/burn_tensor/tensor/ops/qtensor.rs.html#338-345">Source</a><h4 class="code-header">fn <a href="#method.q_div" class="fn">q_div</a>(lhs: <a class="type" href="type.QuantizedTensor.html" title="type burn_tensor::ops::QuantizedTensor">QuantizedTensor</a>&lt;B&gt;, rhs: <a class="type" href="type.QuantizedTensor.html" title="type burn_tensor::ops::QuantizedTensor">QuantizedTensor</a>&lt;B&gt;) -&gt; <a class="type" href="type.QuantizedTensor.html" title="type burn_tensor::ops::QuantizedTensor">QuantizedTensor</a>&lt;B&gt;</h4></section></summary><div class="docblock"><p>Divides two tensors element-wise.</p>
+<h5 id="arguments-19"><a class="doc-anchor" href="#arguments-19">§</a>Arguments</h5>
+<ul>
+<li><code>lhs</code> - The left hand side tensor.</li>
+<li><code>rhs</code> - The right hand side tensor.</li>
+</ul>
+<h5 id="returns-18"><a class="doc-anchor" href="#returns-18">§</a>Returns</h5>
+<p>The result of dividing the two tensors.</p>
+</div></details><details class="toggle method-toggle" open><summary><section id="method.q_div_scalar" class="method"><a class="src rightside" href="../../src/burn_tensor/tensor/ops/qtensor.rs.html#357-364">Source</a><h4 class="code-header">fn <a href="#method.q_div_scalar" class="fn">q_div_scalar</a>(
+    lhs: <a class="type" href="type.QuantizedTensor.html" title="type burn_tensor::ops::QuantizedTensor">QuantizedTensor</a>&lt;B&gt;,
+    rhs: <a class="type" href="type.FloatElem.html" title="type burn_tensor::ops::FloatElem">FloatElem</a>&lt;B&gt;,
+) -&gt; <a class="type" href="type.QuantizedTensor.html" title="type burn_tensor::ops::QuantizedTensor">QuantizedTensor</a>&lt;B&gt;</h4></section></summary><div class="docblock"><p>Divides a tensor by a scalar.</p>
+<h5 id="arguments-20"><a class="doc-anchor" href="#arguments-20">§</a>Arguments</h5>
+<ul>
+<li><code>lhs</code> - The left hand side tensor.</li>
+<li><code>rhs</code> - The right hand side scalar.</li>
+</ul>
+<h5 id="returns-19"><a class="doc-anchor" href="#returns-19">§</a>Returns</h5>
+<p>The result of dividing the tensor by the scalar.</p>
+</div></details><details class="toggle method-toggle" open><summary><section id="method.q_remainder" class="method"><a class="src rightside" href="../../src/burn_tensor/tensor/ops/qtensor.rs.html#376-383">Source</a><h4 class="code-header">fn <a href="#method.q_remainder" class="fn">q_remainder</a>(
+    lhs: <a class="type" href="type.QuantizedTensor.html" title="type burn_tensor::ops::QuantizedTensor">QuantizedTensor</a>&lt;B&gt;,
+    rhs: <a class="type" href="type.QuantizedTensor.html" title="type burn_tensor::ops::QuantizedTensor">QuantizedTensor</a>&lt;B&gt;,
+) -&gt; <a class="type" href="type.QuantizedTensor.html" title="type burn_tensor::ops::QuantizedTensor">QuantizedTensor</a>&lt;B&gt;</h4></section></summary><div class="docblock"><p>Computes the remainder of division between two tensors element-wise.</p>
+<h5 id="arguments-21"><a class="doc-anchor" href="#arguments-21">§</a>Arguments</h5>
+<ul>
+<li><code>lhs</code> - The left hand side tensor.</li>
+<li><code>rhs</code> - The right hand side tensor.</li>
+</ul>
+<h5 id="returns-20"><a class="doc-anchor" href="#returns-20">§</a>Returns</h5>
+<p>The element-wise remainder when dividing <code>lhs</code> by <code>rhs</code>.</p>
+</div></details><details class="toggle method-toggle" open><summary><section id="method.q_remainder_scalar" class="method"><a class="src rightside" href="../../src/burn_tensor/tensor/ops/qtensor.rs.html#394-401">Source</a><h4 class="code-header">fn <a href="#method.q_remainder_scalar" class="fn">q_remainder_scalar</a>(
+    lhs: <a class="type" href="type.QuantizedTensor.html" title="type burn_tensor::ops::QuantizedTensor">QuantizedTensor</a>&lt;B&gt;,
+    rhs: <a class="type" href="type.FloatElem.html" title="type burn_tensor::ops::FloatElem">FloatElem</a>&lt;B&gt;,
+) -&gt; <a class="type" href="type.QuantizedTensor.html" title="type burn_tensor::ops::QuantizedTensor">QuantizedTensor</a>&lt;B&gt;</h4></section></summary><div class="docblock"><p>Computes the modulus of a tensor given a scalar.</p>
+<h5 id="arguments-22"><a class="doc-anchor" href="#arguments-22">§</a>Arguments</h5>
+<ul>
+<li><code>lhs</code> - The left hand side tensor.</li>
+<li><code>rhs</code> - The right hand side scalar.</li>
+</ul>
+<h5 id="returns-21"><a class="doc-anchor" href="#returns-21">§</a>Returns</h5>
+<p>The result of applying the modulus of the scalar to the tensor.</p>
+</div></details><details class="toggle method-toggle" open><summary><section id="method.q_matmul" class="method"><a class="src rightside" href="../../src/burn_tensor/tensor/ops/qtensor.rs.html#413-420">Source</a><h4 class="code-header">fn <a href="#method.q_matmul" class="fn">q_matmul</a>(
+    lhs: <a class="type" href="type.QuantizedTensor.html" title="type burn_tensor::ops::QuantizedTensor">QuantizedTensor</a>&lt;B&gt;,
+    rhs: <a class="type" href="type.QuantizedTensor.html" title="type burn_tensor::ops::QuantizedTensor">QuantizedTensor</a>&lt;B&gt;,
+) -&gt; <a class="type" href="type.QuantizedTensor.html" title="type burn_tensor::ops::QuantizedTensor">QuantizedTensor</a>&lt;B&gt;</h4></section></summary><div class="docblock"><p>Multiplies two tensors together using matrix multiplication.</p>
+<h5 id="arguments-23"><a class="doc-anchor" href="#arguments-23">§</a>Arguments</h5>
+<ul>
+<li><code>lhs</code> - The left hand side tensor.</li>
+<li><code>rhs</code> - The right hand side tensor.</li>
+</ul>
+<h5 id="returns-22"><a class="doc-anchor" href="#returns-22">§</a>Returns</h5>
+<p>The result of multiplying the two tensors together using matrix multiplication.</p>
+</div></details><details class="toggle method-toggle" open><summary><section id="method.q_neg" class="method"><a class="src rightside" href="../../src/burn_tensor/tensor/ops/qtensor.rs.html#423-430">Source</a><h4 class="code-header">fn <a href="#method.q_neg" class="fn">q_neg</a>(tensor: <a class="type" href="type.QuantizedTensor.html" title="type burn_tensor::ops::QuantizedTensor">QuantizedTensor</a>&lt;B&gt;) -&gt; <a class="type" href="type.QuantizedTensor.html" title="type burn_tensor::ops::QuantizedTensor">QuantizedTensor</a>&lt;B&gt;</h4></section></summary><div class="docblock"><p>Negates a tensor element-wise.</p>
+</div></details><details class="toggle method-toggle" open><summary><section id="method.q_recip" class="method"><a class="src rightside" href="../../src/burn_tensor/tensor/ops/qtensor.rs.html#433-440">Source</a><h4 class="code-header">fn <a href="#method.q_recip" class="fn">q_recip</a>(tensor: <a class="type" href="type.QuantizedTensor.html" title="type burn_tensor::ops::QuantizedTensor">QuantizedTensor</a>&lt;B&gt;) -&gt; <a class="type" href="type.QuantizedTensor.html" title="type burn_tensor::ops::QuantizedTensor">QuantizedTensor</a>&lt;B&gt;</h4></section></summary><div class="docblock"><p>Calculates the reciprocals element-wise</p>
+</div></details><details class="toggle method-toggle" open><summary><section id="method.q_transpose" class="method"><a class="src rightside" href="../../src/burn_tensor/tensor/ops/qtensor.rs.html#451-454">Source</a><h4 class="code-header">fn <a href="#method.q_transpose" class="fn">q_transpose</a>(tensor: <a class="type" href="type.QuantizedTensor.html" title="type burn_tensor::ops::QuantizedTensor">QuantizedTensor</a>&lt;B&gt;) -&gt; <a class="type" href="type.QuantizedTensor.html" title="type burn_tensor::ops::QuantizedTensor">QuantizedTensor</a>&lt;B&gt;</h4></section></summary><div class="docblock"><p>Transposes a tensor.</p>
+<h5 id="arguments-24"><a class="doc-anchor" href="#arguments-24">§</a>Arguments</h5>
+<ul>
+<li><code>tensor</code> - The tensor to transpose.</li>
+</ul>
+<h5 id="returns-23"><a class="doc-anchor" href="#returns-23">§</a>Returns</h5>
+<p>The transposed tensor.</p>
+</div></details><details class="toggle method-toggle" open><summary><section id="method.q_gather" class="method"><a class="src rightside" href="../../src/burn_tensor/tensor/ops/qtensor.rs.html#501-512">Source</a><h4 class="code-header">fn <a href="#method.q_gather" class="fn">q_gather</a>(
+    dim: <a class="primitive" href="https://doc.rust-lang.org/1.91.1/std/primitive.usize.html">usize</a>,
+    tensor: <a class="type" href="type.QuantizedTensor.html" title="type burn_tensor::ops::QuantizedTensor">QuantizedTensor</a>&lt;B&gt;,
+    indices: <a class="type" href="type.IntTensor.html" title="type burn_tensor::ops::IntTensor">IntTensor</a>&lt;B&gt;,
+) -&gt; <a class="type" href="type.QuantizedTensor.html" title="type burn_tensor::ops::QuantizedTensor">QuantizedTensor</a>&lt;B&gt;</h4></section></summary><div class="docblock"><p>Gather elements from a tensor.</p>
+<h5 id="arguments-25"><a class="doc-anchor" href="#arguments-25">§</a>Arguments</h5>
+<ul>
+<li><code>dim</code> - The dimension to gather from.</li>
+<li><code>tensor</code> - The tensor to gather from.</li>
+<li><code>indices</code> - The indices to gather.</li>
+</ul>
+<h5 id="returns-24"><a class="doc-anchor" href="#returns-24">§</a>Returns</h5>
+<p>The gathered elements.</p>
+</div></details><details class="toggle method-toggle" open><summary><section id="method.q_scatter" class="method"><a class="src rightside" href="../../src/burn_tensor/tensor/ops/qtensor.rs.html#526-538">Source</a><h4 class="code-header">fn <a href="#method.q_scatter" class="fn">q_scatter</a>(
+    dim: <a class="primitive" href="https://doc.rust-lang.org/1.91.1/std/primitive.usize.html">usize</a>,
+    tensor: <a class="type" href="type.QuantizedTensor.html" title="type burn_tensor::ops::QuantizedTensor">QuantizedTensor</a>&lt;B&gt;,
+    indices: <a class="type" href="type.IntTensor.html" title="type burn_tensor::ops::IntTensor">IntTensor</a>&lt;B&gt;,
+    value: <a class="type" href="type.QuantizedTensor.html" title="type burn_tensor::ops::QuantizedTensor">QuantizedTensor</a>&lt;B&gt;,
+) -&gt; <a class="type" href="type.QuantizedTensor.html" title="type burn_tensor::ops::QuantizedTensor">QuantizedTensor</a>&lt;B&gt;</h4></section></summary><div class="docblock"><p>Scatter elements into a tensor.</p>
+<h5 id="arguments-26"><a class="doc-anchor" href="#arguments-26">§</a>Arguments</h5>
+<ul>
+<li><code>dim</code> - The dimension to scatter into.</li>
+<li><code>tensor</code> - The tensor to scatter into.</li>
+<li><code>indices</code> - The indices to scatter into.</li>
+<li><code>value</code> - The value to scatter.</li>
+</ul>
+<h5 id="returns-25"><a class="doc-anchor" href="#returns-25">§</a>Returns</h5>
+<p>The tensor with the scattered elements.</p>
+</div></details><details class="toggle method-toggle" open><summary><section id="method.q_select_assign" class="method"><a class="src rightside" href="../../src/burn_tensor/tensor/ops/qtensor.rs.html#570-582">Source</a><h4 class="code-header">fn <a href="#method.q_select_assign" class="fn">q_select_assign</a>(
+    tensor: <a class="type" href="type.QuantizedTensor.html" title="type burn_tensor::ops::QuantizedTensor">QuantizedTensor</a>&lt;B&gt;,
+    dim: <a class="primitive" href="https://doc.rust-lang.org/1.91.1/std/primitive.usize.html">usize</a>,
+    indices: <a class="type" href="type.IntTensor.html" title="type burn_tensor::ops::IntTensor">IntTensor</a>&lt;B&gt;,
+    value: <a class="type" href="type.QuantizedTensor.html" title="type burn_tensor::ops::QuantizedTensor">QuantizedTensor</a>&lt;B&gt;,
+) -&gt; <a class="type" href="type.QuantizedTensor.html" title="type burn_tensor::ops::QuantizedTensor">QuantizedTensor</a>&lt;B&gt;</h4></section></summary><div class="docblock"><p>Assign the selected elements along the given dimension corresponding for the given indices
+to the given value.</p>
+<h5 id="arguments-27"><a class="doc-anchor" href="#arguments-27">§</a>Arguments</h5>
+<ul>
+<li><code>tensor</code> - The tensor to select from.</li>
+<li><code>dim</code> - The dimension to select from.</li>
+<li><code>indices</code> - The indices to select.</li>
+<li><code>value</code> - The value to assign.</li>
+</ul>
+<h5 id="returns-26"><a class="doc-anchor" href="#returns-26">§</a>Returns</h5>
+<p>The tensor with the selected elements assigned to the given value.</p>
+</div></details><details class="toggle method-toggle" open><summary><section id="method.q_slice_assign" class="method"><a class="src rightside" href="../../src/burn_tensor/tensor/ops/qtensor.rs.html#607-618">Source</a><h4 class="code-header">fn <a href="#method.q_slice_assign" class="fn">q_slice_assign</a>(
+    tensor: <a class="type" href="type.QuantizedTensor.html" title="type burn_tensor::ops::QuantizedTensor">QuantizedTensor</a>&lt;B&gt;,
+    ranges: &amp;[<a class="struct" href="https://doc.rust-lang.org/1.91.1/core/ops/range/struct.Range.html" title="struct core::ops::range::Range">Range</a>&lt;<a class="primitive" href="https://doc.rust-lang.org/1.91.1/std/primitive.usize.html">usize</a>&gt;],
+    value: <a class="type" href="type.QuantizedTensor.html" title="type burn_tensor::ops::QuantizedTensor">QuantizedTensor</a>&lt;B&gt;,
+) -&gt; <a class="type" href="type.QuantizedTensor.html" title="type burn_tensor::ops::QuantizedTensor">QuantizedTensor</a>&lt;B&gt;</h4></section></summary><div class="docblock"><p>Assign the selected elements corresponding for the given ranges to the given value.</p>
+<h5 id="arguments-28"><a class="doc-anchor" href="#arguments-28">§</a>Arguments</h5>
+<ul>
+<li><code>tensor</code> - The tensor to select from.</li>
+<li><code>ranges</code> - The ranges to select.</li>
+<li><code>value</code> - The value to assign.</li>
+</ul>
+<h5 id="returns-27"><a class="doc-anchor" href="#returns-27">§</a>Returns</h5>
+<p>The tensor with the selected elements assigned to the given value.</p>
+</div></details><details class="toggle method-toggle" open><summary><section id="method.q_mask_where" class="method"><a class="src rightside" href="../../src/burn_tensor/tensor/ops/qtensor.rs.html#631-642">Source</a><h4 class="code-header">fn <a href="#method.q_mask_where" class="fn">q_mask_where</a>(
+    tensor: <a class="type" href="type.QuantizedTensor.html" title="type burn_tensor::ops::QuantizedTensor">QuantizedTensor</a>&lt;B&gt;,
+    mask: <a class="type" href="type.BoolTensor.html" title="type burn_tensor::ops::BoolTensor">BoolTensor</a>&lt;B&gt;,
+    value: <a class="type" href="type.QuantizedTensor.html" title="type burn_tensor::ops::QuantizedTensor">QuantizedTensor</a>&lt;B&gt;,
+) -&gt; <a class="type" href="type.QuantizedTensor.html" title="type burn_tensor::ops::QuantizedTensor">QuantizedTensor</a>&lt;B&gt;</h4></section></summary><div class="docblock"><p>Update the given tensor with the value tensor where the mask is true.</p>
+<h5 id="arguments-29"><a class="doc-anchor" href="#arguments-29">§</a>Arguments</h5>
+<ul>
+<li><code>tensor</code> - The tensor to select from.</li>
+<li><code>mask</code> - The boolean mask to select with.</li>
+<li><code>value</code> - The value to assign to the selected elements from the value tensor.</li>
+</ul>
+<h5 id="returns-28"><a class="doc-anchor" href="#returns-28">§</a>Returns</h5>
+<p>The tensor with the selected elements assigned to the given value.</p>
+</div></details><details class="toggle method-toggle" open><summary><section id="method.q_mask_fill" class="method"><a class="src rightside" href="../../src/burn_tensor/tensor/ops/qtensor.rs.html#655-665">Source</a><h4 class="code-header">fn <a href="#method.q_mask_fill" class="fn">q_mask_fill</a>(
+    tensor: <a class="type" href="type.QuantizedTensor.html" title="type burn_tensor::ops::QuantizedTensor">QuantizedTensor</a>&lt;B&gt;,
+    mask: <a class="type" href="type.BoolTensor.html" title="type burn_tensor::ops::BoolTensor">BoolTensor</a>&lt;B&gt;,
+    value: <a class="type" href="type.FloatElem.html" title="type burn_tensor::ops::FloatElem">FloatElem</a>&lt;B&gt;,
+) -&gt; <a class="type" href="type.QuantizedTensor.html" title="type burn_tensor::ops::QuantizedTensor">QuantizedTensor</a>&lt;B&gt;</h4></section></summary><div class="docblock"><p>Update the given tensor with the value where the mask is true.</p>
+<h5 id="arguments-30"><a class="doc-anchor" href="#arguments-30">§</a>Arguments</h5>
+<ul>
+<li><code>tensor</code> - The tensor to select from.</li>
+<li><code>mask</code> - The boolean mask to select with.</li>
+<li><code>value</code> - The value to assign to the selected elements.</li>
+</ul>
+<h5 id="returns-29"><a class="doc-anchor" href="#returns-29">§</a>Returns</h5>
+<p>The tensor with the selected elements assigned to the given value.</p>
+</div></details><details class="toggle method-toggle" open><summary><section id="method.q_sum" class="method"><a class="src rightside" href="../../src/burn_tensor/tensor/ops/qtensor.rs.html#676-682">Source</a><h4 class="code-header">fn <a href="#method.q_sum" class="fn">q_sum</a>(tensor: <a class="type" href="type.QuantizedTensor.html" title="type burn_tensor::ops::QuantizedTensor">QuantizedTensor</a>&lt;B&gt;) -&gt; <a class="type" href="type.QuantizedTensor.html" title="type burn_tensor::ops::QuantizedTensor">QuantizedTensor</a>&lt;B&gt;</h4></section></summary><div class="docblock"><p>Sum of all elements in a tensor.</p>
+<h5 id="arguments-31"><a class="doc-anchor" href="#arguments-31">§</a>Arguments</h5>
+<ul>
+<li><code>tensor</code> - The tensor to sum.</li>
+</ul>
+<h5 id="returns-30"><a class="doc-anchor" href="#returns-30">§</a>Returns</h5>
+<p>A scalar tensor with the sum of all elements in <code>tensor</code>.</p>
+</div></details><details class="toggle method-toggle" open><summary><section id="method.q_sum_dim" class="method"><a class="src rightside" href="../../src/burn_tensor/tensor/ops/qtensor.rs.html#694-700">Source</a><h4 class="code-header">fn <a href="#method.q_sum_dim" class="fn">q_sum_dim</a>(tensor: <a class="type" href="type.QuantizedTensor.html" title="type burn_tensor::ops::QuantizedTensor">QuantizedTensor</a>&lt;B&gt;, dim: <a class="primitive" href="https://doc.rust-lang.org/1.91.1/std/primitive.usize.html">usize</a>) -&gt; <a class="type" href="type.QuantizedTensor.html" title="type burn_tensor::ops::QuantizedTensor">QuantizedTensor</a>&lt;B&gt;</h4></section></summary><div class="docblock"><p>Sum of all elements in a tensor along a dimension.</p>
+<h5 id="arguments-32"><a class="doc-anchor" href="#arguments-32">§</a>Arguments</h5>
+<ul>
+<li><code>tensor</code> - The tensor to sum.</li>
+<li><code>dim</code> - The dimension along which to sum.</li>
+</ul>
+<h5 id="returns-31"><a class="doc-anchor" href="#returns-31">§</a>Returns</h5>
+<p>A tensor with the sum of all elements in <code>tensor</code> along <code>dim</code>.</p>
+</div></details><details class="toggle method-toggle" open><summary><section id="method.q_prod" class="method"><a class="src rightside" href="../../src/burn_tensor/tensor/ops/qtensor.rs.html#711-717">Source</a><h4 class="code-header">fn <a href="#method.q_prod" class="fn">q_prod</a>(tensor: <a class="type" href="type.QuantizedTensor.html" title="type burn_tensor::ops::QuantizedTensor">QuantizedTensor</a>&lt;B&gt;) -&gt; <a class="type" href="type.QuantizedTensor.html" title="type burn_tensor::ops::QuantizedTensor">QuantizedTensor</a>&lt;B&gt;</h4></section></summary><div class="docblock"><p>Product of all elements in a tensor.</p>
+<h5 id="arguments-33"><a class="doc-anchor" href="#arguments-33">§</a>Arguments</h5>
+<ul>
+<li><code>tensor</code> - The tensor to product.</li>
+</ul>
+<h5 id="returns-32"><a class="doc-anchor" href="#returns-32">§</a>Returns</h5>
+<p>A scalar tensor with the product of all elements in <code>tensor</code>.</p>
+</div></details><details class="toggle method-toggle" open><summary><section id="method.q_prod_dim" class="method"><a class="src rightside" href="../../src/burn_tensor/tensor/ops/qtensor.rs.html#728-734">Source</a><h4 class="code-header">fn <a href="#method.q_prod_dim" class="fn">q_prod_dim</a>(tensor: <a class="type" href="type.QuantizedTensor.html" title="type burn_tensor::ops::QuantizedTensor">QuantizedTensor</a>&lt;B&gt;, dim: <a class="primitive" href="https://doc.rust-lang.org/1.91.1/std/primitive.usize.html">usize</a>) -&gt; <a class="type" href="type.QuantizedTensor.html" title="type burn_tensor::ops::QuantizedTensor">QuantizedTensor</a>&lt;B&gt;</h4></section></summary><div class="docblock"><p>Product of all elements in a tensor along a dimension.</p>
+<h5 id="arguments-34"><a class="doc-anchor" href="#arguments-34">§</a>Arguments</h5>
+<ul>
+<li><code>tensor</code> - The tensor to product.</li>
+</ul>
+<h5 id="returns-33"><a class="doc-anchor" href="#returns-33">§</a>Returns</h5>
+<p>A tensor with the product of all elements in <code>tensor</code> along <code>dim</code>.</p>
+</div></details><details class="toggle method-toggle" open><summary><section id="method.q_mean" class="method"><a class="src rightside" href="../../src/burn_tensor/tensor/ops/qtensor.rs.html#745-751">Source</a><h4 class="code-header">fn <a href="#method.q_mean" class="fn">q_mean</a>(tensor: <a class="type" href="type.QuantizedTensor.html" title="type burn_tensor::ops::QuantizedTensor">QuantizedTensor</a>&lt;B&gt;) -&gt; <a class="type" href="type.QuantizedTensor.html" title="type burn_tensor::ops::QuantizedTensor">QuantizedTensor</a>&lt;B&gt;</h4></section></summary><div class="docblock"><p>Mean of all elements in a tensor.</p>
+<h5 id="arguments-35"><a class="doc-anchor" href="#arguments-35">§</a>Arguments</h5>
+<ul>
+<li><code>tensor</code> - The tensor to mean.</li>
+</ul>
+<h5 id="returns-34"><a class="doc-anchor" href="#returns-34">§</a>Returns</h5>
+<p>A scalar tensor with the mean of all elements in <code>tensor</code>.</p>
+</div></details><details class="toggle method-toggle" open><summary><section id="method.q_mean_dim" class="method"><a class="src rightside" href="../../src/burn_tensor/tensor/ops/qtensor.rs.html#763-769">Source</a><h4 class="code-header">fn <a href="#method.q_mean_dim" class="fn">q_mean_dim</a>(tensor: <a class="type" href="type.QuantizedTensor.html" title="type burn_tensor::ops::QuantizedTensor">QuantizedTensor</a>&lt;B&gt;, dim: <a class="primitive" href="https://doc.rust-lang.org/1.91.1/std/primitive.usize.html">usize</a>) -&gt; <a class="type" href="type.QuantizedTensor.html" title="type burn_tensor::ops::QuantizedTensor">QuantizedTensor</a>&lt;B&gt;</h4></section></summary><div class="docblock"><p>Mean of all elements in a tensor along a dimension.</p>
+<h5 id="arguments-36"><a class="doc-anchor" href="#arguments-36">§</a>Arguments</h5>
+<ul>
+<li><code>tensor</code> - The tensor to mean.</li>
+<li><code>dim</code> - The dimension along which to mean.</li>
+</ul>
+<h5 id="returns-35"><a class="doc-anchor" href="#returns-35">§</a>Returns</h5>
+<p>A tensor with the mean of all elements in <code>tensor</code> along <code>dim</code>.</p>
+</div></details><details class="toggle method-toggle" open><summary><section id="method.q_exp" class="method"><a class="src rightside" href="../../src/burn_tensor/tensor/ops/qtensor.rs.html#780-786">Source</a><h4 class="code-header">fn <a href="#method.q_exp" class="fn">q_exp</a>(tensor: <a class="type" href="type.QuantizedTensor.html" title="type burn_tensor::ops::QuantizedTensor">QuantizedTensor</a>&lt;B&gt;) -&gt; <a class="type" href="type.QuantizedTensor.html" title="type burn_tensor::ops::QuantizedTensor">QuantizedTensor</a>&lt;B&gt;</h4></section></summary><div class="docblock"><p>Returns a new tensor with exponential values.</p>
+<h5 id="arguments-37"><a class="doc-anchor" href="#arguments-37">§</a>Arguments</h5>
+<ul>
+<li><code>tensor</code> - The tensor to exponentiate.</li>
+</ul>
+<h5 id="returns-36"><a class="doc-anchor" href="#returns-36">§</a>Returns</h5>
+<p>A tensor with the same shape as <code>tensor</code> with exponential values.</p>
+</div></details><details class="toggle method-toggle" open><summary><section id="method.q_log" class="method"><a class="src rightside" href="../../src/burn_tensor/tensor/ops/qtensor.rs.html#797-803">Source</a><h4 class="code-header">fn <a href="#method.q_log" class="fn">q_log</a>(tensor: <a class="type" href="type.QuantizedTensor.html" title="type burn_tensor::ops::QuantizedTensor">QuantizedTensor</a>&lt;B&gt;) -&gt; <a class="type" href="type.QuantizedTensor.html" title="type burn_tensor::ops::QuantizedTensor">QuantizedTensor</a>&lt;B&gt;</h4></section></summary><div class="docblock"><p>Returns a new tensor with natural logarithm values.</p>
+<h5 id="arguments-38"><a class="doc-anchor" href="#arguments-38">§</a>Arguments</h5>
+<ul>
+<li><code>tensor</code> - The tensor to take the logarithm of.</li>
+</ul>
+<h5 id="returns-37"><a class="doc-anchor" href="#returns-37">§</a>Returns</h5>
+<p>A tensor with the same shape as <code>tensor</code> with natural logarithm values.</p>
+</div></details><details class="toggle method-toggle" open><summary><section id="method.q_log1p" class="method"><a class="src rightside" href="../../src/burn_tensor/tensor/ops/qtensor.rs.html#814-820">Source</a><h4 class="code-header">fn <a href="#method.q_log1p" class="fn">q_log1p</a>(tensor: <a class="type" href="type.QuantizedTensor.html" title="type burn_tensor::ops::QuantizedTensor">QuantizedTensor</a>&lt;B&gt;) -&gt; <a class="type" href="type.QuantizedTensor.html" title="type burn_tensor::ops::QuantizedTensor">QuantizedTensor</a>&lt;B&gt;</h4></section></summary><div class="docblock"><p>Returns a new tensor with logarithm values of (1 + Xi).</p>
+<h5 id="arguments-39"><a class="doc-anchor" href="#arguments-39">§</a>Arguments</h5>
+<ul>
+<li><code>tensor</code> - The tensor to take the logarithm of.</li>
+</ul>
+<h5 id="returns-38"><a class="doc-anchor" href="#returns-38">§</a>Returns</h5>
+<p>A tensor with the same shape as <code>tensor</code> with logarithm values of (1 + Xi).</p>
+</div></details><details class="toggle method-toggle" open><summary><section id="method.q_powf" class="method"><a class="src rightside" href="../../src/burn_tensor/tensor/ops/qtensor.rs.html#832-839">Source</a><h4 class="code-header">fn <a href="#method.q_powf" class="fn">q_powf</a>(
+    lhs: <a class="type" href="type.QuantizedTensor.html" title="type burn_tensor::ops::QuantizedTensor">QuantizedTensor</a>&lt;B&gt;,
+    rhs: <a class="type" href="type.QuantizedTensor.html" title="type burn_tensor::ops::QuantizedTensor">QuantizedTensor</a>&lt;B&gt;,
+) -&gt; <a class="type" href="type.QuantizedTensor.html" title="type burn_tensor::ops::QuantizedTensor">QuantizedTensor</a>&lt;B&gt;</h4></section></summary><div class="docblock"><p>Element-wise power with another tensor.</p>
+<h5 id="arguments-40"><a class="doc-anchor" href="#arguments-40">§</a>Arguments</h5>
+<ul>
+<li><code>lhs</code> - The left hand side tensor.</li>
+<li><code>rhs</code> - The right hand side tensor.</li>
+</ul>
+<h5 id="returns-39"><a class="doc-anchor" href="#returns-39">§</a>Returns</h5>
+<p>The elements of <code>lhs</code> raised to the power of the elements of <code>rhs</code>.</p>
+</div></details><details class="toggle method-toggle" open><summary><section id="method.q_powi" class="method"><a class="src rightside" href="../../src/burn_tensor/tensor/ops/qtensor.rs.html#851-857">Source</a><h4 class="code-header">fn <a href="#method.q_powi" class="fn">q_powi</a>(lhs: <a class="type" href="type.QuantizedTensor.html" title="type burn_tensor::ops::QuantizedTensor">QuantizedTensor</a>&lt;B&gt;, rhs: <a class="type" href="type.IntTensor.html" title="type burn_tensor::ops::IntTensor">IntTensor</a>&lt;B&gt;) -&gt; <a class="type" href="type.QuantizedTensor.html" title="type burn_tensor::ops::QuantizedTensor">QuantizedTensor</a>&lt;B&gt;</h4></section></summary><div class="docblock"><p>Element-wise power with an IntTensor.</p>
+<h5 id="arguments-41"><a class="doc-anchor" href="#arguments-41">§</a>Arguments</h5>
+<ul>
+<li><code>lhs</code> - The left hand side tensor.</li>
+<li><code>rhs</code> - The right hand side floatTensor.</li>
+</ul>
+<h5 id="returns-40"><a class="doc-anchor" href="#returns-40">§</a>Returns</h5>
+<p>The elements of <code>lhs</code> raised to the value of <code>rhs</code>. Result is an IntTensor.</p>
+</div></details><details class="toggle method-toggle" open><summary><section id="method.q_powi_scalar" class="method"><a class="src rightside" href="../../src/burn_tensor/tensor/ops/qtensor.rs.html#869-875">Source</a><h4 class="code-header">fn <a href="#method.q_powi_scalar" class="fn">q_powi_scalar</a>(lhs: <a class="type" href="type.QuantizedTensor.html" title="type burn_tensor::ops::QuantizedTensor">QuantizedTensor</a>&lt;B&gt;, rhs: <a class="type" href="type.IntElem.html" title="type burn_tensor::ops::IntElem">IntElem</a>&lt;B&gt;) -&gt; <a class="type" href="type.QuantizedTensor.html" title="type burn_tensor::ops::QuantizedTensor">QuantizedTensor</a>&lt;B&gt;</h4></section></summary><div class="docblock"><p>Element-wise power with an int scalar.</p>
+<h5 id="arguments-42"><a class="doc-anchor" href="#arguments-42">§</a>Arguments</h5>
+<ul>
+<li><code>lhs</code> - The left hand side tensor.</li>
+<li><code>rhs</code> - The right hand side scalar.</li>
+</ul>
+<h5 id="returns-41"><a class="doc-anchor" href="#returns-41">§</a>Returns</h5>
+<p>The elements of <code>lhs</code> raised to the value of <code>rhs</code>.</p>
+</div></details><details class="toggle method-toggle" open><summary><section id="method.q_powf_scalar" class="method"><a class="src rightside" href="../../src/burn_tensor/tensor/ops/qtensor.rs.html#887-893">Source</a><h4 class="code-header">fn <a href="#method.q_powf_scalar" class="fn">q_powf_scalar</a>(tensor: <a class="type" href="type.QuantizedTensor.html" title="type burn_tensor::ops::QuantizedTensor">QuantizedTensor</a>&lt;B&gt;, value: <a class="primitive" href="https://doc.rust-lang.org/1.91.1/std/primitive.f32.html">f32</a>) -&gt; <a class="type" href="type.QuantizedTensor.html" title="type burn_tensor::ops::QuantizedTensor">QuantizedTensor</a>&lt;B&gt;</h4></section></summary><div class="docblock"><p>Element-wise power with a float scalar.</p>
+<h5 id="arguments-43"><a class="doc-anchor" href="#arguments-43">§</a>Arguments</h5>
+<ul>
+<li><code>tensor</code> - The tensor to exponentiate.</li>
+<li><code>value</code> - The exponent.</li>
+</ul>
+<h5 id="returns-42"><a class="doc-anchor" href="#returns-42">§</a>Returns</h5>
+<p>A tensor with the same shape as <code>tensor</code> with values raised to the power of <code>value</code>.</p>
+</div></details><details class="toggle method-toggle" open><summary><section id="method.q_sqrt" class="method"><a class="src rightside" href="../../src/burn_tensor/tensor/ops/qtensor.rs.html#904-910">Source</a><h4 class="code-header">fn <a href="#method.q_sqrt" class="fn">q_sqrt</a>(tensor: <a class="type" href="type.QuantizedTensor.html" title="type burn_tensor::ops::QuantizedTensor">QuantizedTensor</a>&lt;B&gt;) -&gt; <a class="type" href="type.QuantizedTensor.html" title="type burn_tensor::ops::QuantizedTensor">QuantizedTensor</a>&lt;B&gt;</h4></section></summary><div class="docblock"><p>Returns a new tensor with square root values.</p>
+<h5 id="arguments-44"><a class="doc-anchor" href="#arguments-44">§</a>Arguments</h5>
+<ul>
+<li><code>tensor</code> - The tensor to take the square root of.</li>
+</ul>
+<h5 id="returns-43"><a class="doc-anchor" href="#returns-43">§</a>Returns</h5>
+<p>A tensor with the same shape as <code>tensor</code> with square root values.</p>
+</div></details><details class="toggle method-toggle" open><summary><section id="method.q_abs" class="method"><a class="src rightside" href="../../src/burn_tensor/tensor/ops/qtensor.rs.html#921-927">Source</a><h4 class="code-header">fn <a href="#method.q_abs" class="fn">q_abs</a>(tensor: <a class="type" href="type.QuantizedTensor.html" title="type burn_tensor::ops::QuantizedTensor">QuantizedTensor</a>&lt;B&gt;) -&gt; <a class="type" href="type.QuantizedTensor.html" title="type burn_tensor::ops::QuantizedTensor">QuantizedTensor</a>&lt;B&gt;</h4></section></summary><div class="docblock"><p>Returns a new tensor with absolute values.</p>
+<h5 id="arguments-45"><a class="doc-anchor" href="#arguments-45">§</a>Arguments</h5>
+<ul>
+<li><code>tensor</code> - The tensor to take absolute value of.</li>
+</ul>
+<h5 id="returns-44"><a class="doc-anchor" href="#returns-44">§</a>Returns</h5>
+<p>A tensor with the same shape as <code>tensor</code> with absolute values.</p>
+</div></details><details class="toggle method-toggle" open><summary><section id="method.q_cos" class="method"><a class="src rightside" href="../../src/burn_tensor/tensor/ops/qtensor.rs.html#938-944">Source</a><h4 class="code-header">fn <a href="#method.q_cos" class="fn">q_cos</a>(tensor: <a class="type" href="type.QuantizedTensor.html" title="type burn_tensor::ops::QuantizedTensor">QuantizedTensor</a>&lt;B&gt;) -&gt; <a class="type" href="type.QuantizedTensor.html" title="type burn_tensor::ops::QuantizedTensor">QuantizedTensor</a>&lt;B&gt;</h4></section></summary><div class="docblock"><p>Returns a new tensor with cosine values.</p>
+<h5 id="arguments-46"><a class="doc-anchor" href="#arguments-46">§</a>Arguments</h5>
+<ul>
+<li><code>tensor</code> - The tensor to take the cosine of.</li>
+</ul>
+<h5 id="returns-45"><a class="doc-anchor" href="#returns-45">§</a>Returns</h5>
+<p>A tensor with the same shape as <code>tensor</code> with cosine values.</p>
+</div></details><details class="toggle method-toggle" open><summary><section id="method.q_sin" class="method"><a class="src rightside" href="../../src/burn_tensor/tensor/ops/qtensor.rs.html#955-961">Source</a><h4 class="code-header">fn <a href="#method.q_sin" class="fn">q_sin</a>(tensor: <a class="type" href="type.QuantizedTensor.html" title="type burn_tensor::ops::QuantizedTensor">QuantizedTensor</a>&lt;B&gt;) -&gt; <a class="type" href="type.QuantizedTensor.html" title="type burn_tensor::ops::QuantizedTensor">QuantizedTensor</a>&lt;B&gt;</h4></section></summary><div class="docblock"><p>Returns a new tensor with sine values.</p>
+<h5 id="arguments-47"><a class="doc-anchor" href="#arguments-47">§</a>Arguments</h5>
+<ul>
+<li><code>tensor</code> - The tensor to take the sine of.</li>
+</ul>
+<h5 id="returns-46"><a class="doc-anchor" href="#returns-46">§</a>Returns</h5>
+<p>A tensor with the same shape as <code>tensor</code> with sine values.</p>
+</div></details><details class="toggle method-toggle" open><summary><section id="method.q_tanh" class="method"><a class="src rightside" href="../../src/burn_tensor/tensor/ops/qtensor.rs.html#972-978">Source</a><h4 class="code-header">fn <a href="#method.q_tanh" class="fn">q_tanh</a>(tensor: <a class="type" href="type.QuantizedTensor.html" title="type burn_tensor::ops::QuantizedTensor">QuantizedTensor</a>&lt;B&gt;) -&gt; <a class="type" href="type.QuantizedTensor.html" title="type burn_tensor::ops::QuantizedTensor">QuantizedTensor</a>&lt;B&gt;</h4></section></summary><div class="docblock"><p>Returns a new tensor with tangent values.</p>
+<h5 id="arguments-48"><a class="doc-anchor" href="#arguments-48">§</a>Arguments</h5>
+<ul>
+<li><code>tensor</code> - The tensor to take the tangent of.</li>
+</ul>
+<h5 id="returns-47"><a class="doc-anchor" href="#returns-47">§</a>Returns</h5>
+<p>A tensor with the same shape as <code>tensor</code> with tangent values.</p>
+</div></details><details class="toggle method-toggle" open><summary><section id="method.q_erf" class="method"><a class="src rightside" href="../../src/burn_tensor/tensor/ops/qtensor.rs.html#989-995">Source</a><h4 class="code-header">fn <a href="#method.q_erf" class="fn">q_erf</a>(tensor: <a class="type" href="type.QuantizedTensor.html" title="type burn_tensor::ops::QuantizedTensor">QuantizedTensor</a>&lt;B&gt;) -&gt; <a class="type" href="type.QuantizedTensor.html" title="type burn_tensor::ops::QuantizedTensor">QuantizedTensor</a>&lt;B&gt;</h4></section></summary><div class="docblock"><p>Returns a new tensor with the error function values.</p>
+<h5 id="arguments-49"><a class="doc-anchor" href="#arguments-49">§</a>Arguments</h5>
+<ul>
+<li><code>tensor</code> - The tensor to take the error function of.</li>
+</ul>
+<h5 id="returns-48"><a class="doc-anchor" href="#returns-48">§</a>Returns</h5>
+<p>A tensor with the same shape as <code>tensor</code> with error function values.</p>
+</div></details><details class="toggle method-toggle" open><summary><section id="method.q_cat" class="method"><a class="src rightside" href="../../src/burn_tensor/tensor/ops/qtensor.rs.html#1007-1019">Source</a><h4 class="code-header">fn <a href="#method.q_cat" class="fn">q_cat</a>(tensors: <a class="struct" href="https://doc.rust-lang.org/1.91.1/alloc/vec/struct.Vec.html" title="struct alloc::vec::Vec">Vec</a>&lt;<a class="type" href="type.QuantizedTensor.html" title="type burn_tensor::ops::QuantizedTensor">QuantizedTensor</a>&lt;B&gt;&gt;, dim: <a class="primitive" href="https://doc.rust-lang.org/1.91.1/std/primitive.usize.html">usize</a>) -&gt; <a class="type" href="type.QuantizedTensor.html" title="type burn_tensor::ops::QuantizedTensor">QuantizedTensor</a>&lt;B&gt;</h4></section></summary><div class="docblock"><p>Concatenates tensors along a dimension.</p>
+<h5 id="arguments-50"><a class="doc-anchor" href="#arguments-50">§</a>Arguments</h5>
+<ul>
+<li><code>tensors</code> - The tensors to concatenate.</li>
+<li><code>dim</code> - The dimension along which to concatenate.</li>
+</ul>
+<h5 id="returns-49"><a class="doc-anchor" href="#returns-49">§</a>Returns</h5>
+<p>A tensor with the concatenated tensors along <code>dim</code>.</p>
+</div></details><details class="toggle method-toggle" open><summary><section id="method.q_argmax" class="method"><a class="src rightside" href="../../src/burn_tensor/tensor/ops/qtensor.rs.html#1031-1035">Source</a><h4 class="code-header">fn <a href="#method.q_argmax" class="fn">q_argmax</a>(tensor: <a class="type" href="type.QuantizedTensor.html" title="type burn_tensor::ops::QuantizedTensor">QuantizedTensor</a>&lt;B&gt;, dim: <a class="primitive" href="https://doc.rust-lang.org/1.91.1/std/primitive.usize.html">usize</a>) -&gt; <a class="type" href="type.IntTensor.html" title="type burn_tensor::ops::IntTensor">IntTensor</a>&lt;B&gt;</h4></section></summary><div class="docblock"><p>Gets the indices of the maximum elements of a tensor along an axis.</p>
+<h5 id="arguments-51"><a class="doc-anchor" href="#arguments-51">§</a>Arguments</h5>
+<ul>
+<li><code>tensor</code> - The tensor to get the maximum elements of.</li>
+<li><code>dim</code> - The dimension along which to get the maximum elements.</li>
+</ul>
+<h5 id="returns-50"><a class="doc-anchor" href="#returns-50">§</a>Returns</h5>
+<p>A tensor with the indices of the maximum elements of <code>tensor</code> along <code>dim</code>.</p>
+</div></details><details class="toggle method-toggle" open><summary><section id="method.q_argmin" class="method"><a class="src rightside" href="../../src/burn_tensor/tensor/ops/qtensor.rs.html#1047-1051">Source</a><h4 class="code-header">fn <a href="#method.q_argmin" class="fn">q_argmin</a>(tensor: <a class="type" href="type.QuantizedTensor.html" title="type burn_tensor::ops::QuantizedTensor">QuantizedTensor</a>&lt;B&gt;, dim: <a class="primitive" href="https://doc.rust-lang.org/1.91.1/std/primitive.usize.html">usize</a>) -&gt; <a class="type" href="type.IntTensor.html" title="type burn_tensor::ops::IntTensor">IntTensor</a>&lt;B&gt;</h4></section></summary><div class="docblock"><p>Gets the indices of the minimum elements of a tensor along an axis.</p>
+<h5 id="arguments-52"><a class="doc-anchor" href="#arguments-52">§</a>Arguments</h5>
+<ul>
+<li><code>tensor</code> - The tensor to get the minimum elements of.</li>
+<li><code>dim</code> - The dimension along which to get the minimum elements.</li>
+</ul>
+<h5 id="returns-51"><a class="doc-anchor" href="#returns-51">§</a>Returns</h5>
+<p>A tensor with the indices of the minimum elements of <code>tensor</code> along <code>dim</code>.</p>
+</div></details><details class="toggle method-toggle" open><summary><section id="method.q_max" class="method"><a class="src rightside" href="../../src/burn_tensor/tensor/ops/qtensor.rs.html#1062-1067">Source</a><h4 class="code-header">fn <a href="#method.q_max" class="fn">q_max</a>(tensor: <a class="type" href="type.QuantizedTensor.html" title="type burn_tensor::ops::QuantizedTensor">QuantizedTensor</a>&lt;B&gt;) -&gt; <a class="type" href="type.QuantizedTensor.html" title="type burn_tensor::ops::QuantizedTensor">QuantizedTensor</a>&lt;B&gt;</h4></section></summary><div class="docblock"><p>Gets the maximum element of a tensor.</p>
+<h5 id="arguments-53"><a class="doc-anchor" href="#arguments-53">§</a>Arguments</h5>
+<ul>
+<li><code>tensor</code> - The tensor to get the maximum elements of.</li>
+</ul>
+<h5 id="returns-52"><a class="doc-anchor" href="#returns-52">§</a>Returns</h5>
+<p>A tensor with the maximum element of <code>tensor</code>.</p>
+</div></details><details class="toggle method-toggle" open><summary><section id="method.q_max_dim" class="method"><a class="src rightside" href="../../src/burn_tensor/tensor/ops/qtensor.rs.html#1079-1083">Source</a><h4 class="code-header">fn <a href="#method.q_max_dim" class="fn">q_max_dim</a>(tensor: <a class="type" href="type.QuantizedTensor.html" title="type burn_tensor::ops::QuantizedTensor">QuantizedTensor</a>&lt;B&gt;, dim: <a class="primitive" href="https://doc.rust-lang.org/1.91.1/std/primitive.usize.html">usize</a>) -&gt; <a class="type" href="type.QuantizedTensor.html" title="type burn_tensor::ops::QuantizedTensor">QuantizedTensor</a>&lt;B&gt;</h4></section></summary><div class="docblock"><p>Gets the maximum elements of a tensor along an axis.</p>
+<h5 id="arguments-54"><a class="doc-anchor" href="#arguments-54">§</a>Arguments</h5>
+<ul>
+<li><code>tensor</code> - The tensor to get the maximum elements of.</li>
+<li><code>dim</code> - The dimension along which to get the maximum elements.</li>
+</ul>
+<h5 id="returns-53"><a class="doc-anchor" href="#returns-53">§</a>Returns</h5>
+<p>A tensor with the maximum elements of <code>tensor</code> along <code>dim</code>.</p>
+</div></details><details class="toggle method-toggle" open><summary><section id="method.q_max_dim_with_indices" class="method"><a class="src rightside" href="../../src/burn_tensor/tensor/ops/qtensor.rs.html#1095-1103">Source</a><h4 class="code-header">fn <a href="#method.q_max_dim_with_indices" class="fn">q_max_dim_with_indices</a>(
+    tensor: <a class="type" href="type.QuantizedTensor.html" title="type burn_tensor::ops::QuantizedTensor">QuantizedTensor</a>&lt;B&gt;,
+    dim: <a class="primitive" href="https://doc.rust-lang.org/1.91.1/std/primitive.usize.html">usize</a>,
+) -&gt; (<a class="type" href="type.QuantizedTensor.html" title="type burn_tensor::ops::QuantizedTensor">QuantizedTensor</a>&lt;B&gt;, <a class="type" href="type.IntTensor.html" title="type burn_tensor::ops::IntTensor">IntTensor</a>&lt;B&gt;)</h4></section></summary><div class="docblock"><p>Gets the maximum elements of a tensor along an axis and their indices.</p>
+<h5 id="arguments-55"><a class="doc-anchor" href="#arguments-55">§</a>Arguments</h5>
+<ul>
+<li><code>tensor</code> - The tensor to get the maximum elements of.</li>
+<li><code>dim</code> - The dimension along which to get the maximum elements.</li>
+</ul>
+<h5 id="returns-54"><a class="doc-anchor" href="#returns-54">§</a>Returns</h5>
+<p>A tuple with the maximum elements of <code>tensor</code> along <code>dim</code> and their indices.</p>
+</div></details><details class="toggle method-toggle" open><summary><section id="method.q_min" class="method"><a class="src rightside" href="../../src/burn_tensor/tensor/ops/qtensor.rs.html#1114-1119">Source</a><h4 class="code-header">fn <a href="#method.q_min" class="fn">q_min</a>(tensor: <a class="type" href="type.QuantizedTensor.html" title="type burn_tensor::ops::QuantizedTensor">QuantizedTensor</a>&lt;B&gt;) -&gt; <a class="type" href="type.QuantizedTensor.html" title="type burn_tensor::ops::QuantizedTensor">QuantizedTensor</a>&lt;B&gt;</h4></section></summary><div class="docblock"><p>Gets the minimum element of a tensor.</p>
+<h5 id="arguments-56"><a class="doc-anchor" href="#arguments-56">§</a>Arguments</h5>
+<ul>
+<li><code>tensor</code> - The tensor to get the minimum elements of.</li>
+</ul>
+<h5 id="returns-55"><a class="doc-anchor" href="#returns-55">§</a>Returns</h5>
+<p>A tensor with the minimum element of <code>tensor</code>.</p>
+</div></details><details class="toggle method-toggle" open><summary><section id="method.q_min_dim" class="method"><a class="src rightside" href="../../src/burn_tensor/tensor/ops/qtensor.rs.html#1131-1135">Source</a><h4 class="code-header">fn <a href="#method.q_min_dim" class="fn">q_min_dim</a>(tensor: <a class="type" href="type.QuantizedTensor.html" title="type burn_tensor::ops::QuantizedTensor">QuantizedTensor</a>&lt;B&gt;, dim: <a class="primitive" href="https://doc.rust-lang.org/1.91.1/std/primitive.usize.html">usize</a>) -&gt; <a class="type" href="type.QuantizedTensor.html" title="type burn_tensor::ops::QuantizedTensor">QuantizedTensor</a>&lt;B&gt;</h4></section></summary><div class="docblock"><p>Gets the minimum elements of a tensor along an axis.</p>
+<h5 id="arguments-57"><a class="doc-anchor" href="#arguments-57">§</a>Arguments</h5>
+<ul>
+<li><code>tensor</code> - The tensor to get the minimum elements of.</li>
+<li><code>dim</code> - The dimension along which to get the minimum elements.</li>
+</ul>
+<h5 id="returns-56"><a class="doc-anchor" href="#returns-56">§</a>Returns</h5>
+<p>A tensor with the minimum elements of <code>tensor</code> along <code>dim</code>.</p>
+</div></details><details class="toggle method-toggle" open><summary><section id="method.q_min_dim_with_indices" class="method"><a class="src rightside" href="../../src/burn_tensor/tensor/ops/qtensor.rs.html#1147-1155">Source</a><h4 class="code-header">fn <a href="#method.q_min_dim_with_indices" class="fn">q_min_dim_with_indices</a>(
+    tensor: <a class="type" href="type.QuantizedTensor.html" title="type burn_tensor::ops::QuantizedTensor">QuantizedTensor</a>&lt;B&gt;,
+    dim: <a class="primitive" href="https://doc.rust-lang.org/1.91.1/std/primitive.usize.html">usize</a>,
+) -&gt; (<a class="type" href="type.QuantizedTensor.html" title="type burn_tensor::ops::QuantizedTensor">QuantizedTensor</a>&lt;B&gt;, <a class="type" href="type.IntTensor.html" title="type burn_tensor::ops::IntTensor">IntTensor</a>&lt;B&gt;)</h4></section></summary><div class="docblock"><p>Gets the minimum elements of a tensor along an axis and their indices.</p>
+<h5 id="arguments-58"><a class="doc-anchor" href="#arguments-58">§</a>Arguments</h5>
+<ul>
+<li><code>tensor</code> - The tensor to get the minimum elements of.</li>
+<li><code>dim</code> - The dimension along which to get the minimum elements.</li>
+</ul>
+<h5 id="returns-57"><a class="doc-anchor" href="#returns-57">§</a>Returns</h5>
+<p>A tuple with the minimum elements of <code>tensor</code> along <code>dim</code> and their indices.</p>
+</div></details><details class="toggle method-toggle" open><summary><section id="method.q_narrow" class="method"><a class="src rightside" href="../../src/burn_tensor/tensor/ops/qtensor.rs.html#1172-1183">Source</a><h4 class="code-header">fn <a href="#method.q_narrow" class="fn">q_narrow</a>(
+    tensor: <a class="type" href="type.QuantizedTensor.html" title="type burn_tensor::ops::QuantizedTensor">QuantizedTensor</a>&lt;B&gt;,
+    dim: <a class="primitive" href="https://doc.rust-lang.org/1.91.1/std/primitive.usize.html">usize</a>,
+    start: <a class="primitive" href="https://doc.rust-lang.org/1.91.1/std/primitive.usize.html">usize</a>,
+    length: <a class="primitive" href="https://doc.rust-lang.org/1.91.1/std/primitive.usize.html">usize</a>,
+) -&gt; <a class="type" href="type.QuantizedTensor.html" title="type burn_tensor::ops::QuantizedTensor">QuantizedTensor</a>&lt;B&gt;</h4></section></summary><div class="docblock"><p>Returns a new tensor with the given dimension narrowed to the given range.</p>
+<h5 id="arguments-59"><a class="doc-anchor" href="#arguments-59">§</a>Arguments</h5>
+<ul>
+<li><code>dim</code> - The dimension along which the tensor will be narrowed.</li>
+<li><code>start</code> - The starting point of the given range.</li>
+<li><code>length</code> - The ending point of the given range.</li>
+</ul>
+<h5 id="panics"><a class="doc-anchor" href="#panics">§</a>Panics</h5>
+<ul>
+<li>If the dimension is greater than the number of dimensions of the tensor.</li>
+<li>If the given range exceeds the number of elements on the given dimension.</li>
+</ul>
+<h5 id="returns-58"><a class="doc-anchor" href="#returns-58">§</a>Returns</h5>
+<p>A new tensor with the given dimension narrowed to the given range.</p>
+</div></details><details class="toggle method-toggle" open><summary><section id="method.q_chunk" class="method"><a class="src rightside" href="../../src/burn_tensor/tensor/ops/qtensor.rs.html#1196-1206">Source</a><h4 class="code-header">fn <a href="#method.q_chunk" class="fn">q_chunk</a>(
+    tensor: <a class="type" href="type.QuantizedTensor.html" title="type burn_tensor::ops::QuantizedTensor">QuantizedTensor</a>&lt;B&gt;,
+    chunks: <a class="primitive" href="https://doc.rust-lang.org/1.91.1/std/primitive.usize.html">usize</a>,
+    dim: <a class="primitive" href="https://doc.rust-lang.org/1.91.1/std/primitive.usize.html">usize</a>,
+) -&gt; <a class="struct" href="https://doc.rust-lang.org/1.91.1/alloc/vec/struct.Vec.html" title="struct alloc::vec::Vec">Vec</a>&lt;<a class="type" href="type.QuantizedTensor.html" title="type burn_tensor::ops::QuantizedTensor">QuantizedTensor</a>&lt;B&gt;&gt; <a href="#" class="tooltip" data-notable-ty="Vec&lt;QuantizedTensor&lt;B&gt;&gt;">ⓘ</a></h4></section></summary><div class="docblock"><p>Split the tensor along the given dimension into chunks.</p>
+<h5 id="arguments-60"><a class="doc-anchor" href="#arguments-60">§</a>Arguments</h5>
+<ul>
+<li><code>tensor</code> - The tensor.</li>
+<li><code>chunks</code> - The number of chunks to be produced.</li>
+<li><code>times</code> - The dimension along which the tensor will be split.</li>
+</ul>
+<h5 id="returns-59"><a class="doc-anchor" href="#returns-59">§</a>Returns</h5>
+<p>A vector of tensors.</p>
+</div></details><details class="toggle method-toggle" open><summary><section id="method.q_split" class="method"><a class="src rightside" href="../../src/burn_tensor/tensor/ops/qtensor.rs.html#1219-1233">Source</a><h4 class="code-header">fn <a href="#method.q_split" class="fn">q_split</a>(
+    tensor: <a class="type" href="type.QuantizedTensor.html" title="type burn_tensor::ops::QuantizedTensor">QuantizedTensor</a>&lt;B&gt;,
+    split_size: <a class="primitive" href="https://doc.rust-lang.org/1.91.1/std/primitive.usize.html">usize</a>,
+    dim: <a class="primitive" href="https://doc.rust-lang.org/1.91.1/std/primitive.usize.html">usize</a>,
+) -&gt; <a class="struct" href="https://doc.rust-lang.org/1.91.1/alloc/vec/struct.Vec.html" title="struct alloc::vec::Vec">Vec</a>&lt;<a class="type" href="type.QuantizedTensor.html" title="type burn_tensor::ops::QuantizedTensor">QuantizedTensor</a>&lt;B&gt;&gt; <a href="#" class="tooltip" data-notable-ty="Vec&lt;QuantizedTensor&lt;B&gt;&gt;">ⓘ</a></h4></section></summary><div class="docblock"><p>Split the tensor along the given dimension into chunks of <code>split_size</code>.</p>
+<h5 id="arguments-61"><a class="doc-anchor" href="#arguments-61">§</a>Arguments</h5>
+<ul>
+<li><code>tensor</code> - The tensor.</li>
+<li><code>split_size</code> - The size of a single chunk.</li>
+<li><code>times</code> - The dimension along which the tensor will be split.</li>
+</ul>
+<h5 id="returns-60"><a class="doc-anchor" href="#returns-60">§</a>Returns</h5>
+<p>A vector of tensors.</p>
+</div></details><details class="toggle method-toggle" open><summary><section id="method.q_split_with_sizes" class="method"><a class="src rightside" href="../../src/burn_tensor/tensor/ops/qtensor.rs.html#1247-1261">Source</a><h4 class="code-header">fn <a href="#method.q_split_with_sizes" class="fn">q_split_with_sizes</a>(
+    tensor: <a class="type" href="type.QuantizedTensor.html" title="type burn_tensor::ops::QuantizedTensor">QuantizedTensor</a>&lt;B&gt;,
+    split_sizes: <a class="struct" href="https://doc.rust-lang.org/1.91.1/alloc/vec/struct.Vec.html" title="struct alloc::vec::Vec">Vec</a>&lt;<a class="primitive" href="https://doc.rust-lang.org/1.91.1/std/primitive.usize.html">usize</a>&gt;,
+    dim: <a class="primitive" href="https://doc.rust-lang.org/1.91.1/std/primitive.usize.html">usize</a>,
+) -&gt; <a class="struct" href="https://doc.rust-lang.org/1.91.1/alloc/vec/struct.Vec.html" title="struct alloc::vec::Vec">Vec</a>&lt;<a class="type" href="type.QuantizedTensor.html" title="type burn_tensor::ops::QuantizedTensor">QuantizedTensor</a>&lt;B&gt;&gt; <a href="#" class="tooltip" data-notable-ty="Vec&lt;QuantizedTensor&lt;B&gt;&gt;">ⓘ</a></h4></section></summary><div class="docblock"><p>Split the tensor along the given dimension into chunks with sizes in
+<code>dim</code> according to <code>split_sizes</code>.</p>
+<h5 id="arguments-62"><a class="doc-anchor" href="#arguments-62">§</a>Arguments</h5>
+<ul>
+<li><code>tensor</code> - The tensor.</li>
+<li><code>split_sizes</code> - Vector of sizes for each chunk.</li>
+<li><code>times</code> - The dimension along which the tensor will be split.</li>
+</ul>
+<h5 id="returns-61"><a class="doc-anchor" href="#returns-61">§</a>Returns</h5>
+<p>A vector of tensors.</p>
+</div></details><details class="toggle method-toggle" open><summary><section id="method.q_any" class="method"><a class="src rightside" href="../../src/burn_tensor/tensor/ops/qtensor.rs.html#1272-1275">Source</a><h4 class="code-header">fn <a href="#method.q_any" class="fn">q_any</a>(tensor: <a class="type" href="type.QuantizedTensor.html" title="type burn_tensor::ops::QuantizedTensor">QuantizedTensor</a>&lt;B&gt;) -&gt; <a class="type" href="type.BoolTensor.html" title="type burn_tensor::ops::BoolTensor">BoolTensor</a>&lt;B&gt;</h4></section></summary><div class="docblock"><p>Tests if any element in the <code>tensor</code> evaluates to True.</p>
+<h5 id="arguments-63"><a class="doc-anchor" href="#arguments-63">§</a>Arguments</h5>
+<ul>
+<li><code>tensor</code> - The tensor to test.</li>
+</ul>
+<h5 id="returns-62"><a class="doc-anchor" href="#returns-62">§</a>Returns</h5>
+<p>A boolean tensor with a single element, True if any element in the tensor is True, False otherwise.</p>
+</div></details><details class="toggle method-toggle" open><summary><section id="method.q_any_dim" class="method"><a class="src rightside" href="../../src/burn_tensor/tensor/ops/qtensor.rs.html#1289-1292">Source</a><h4 class="code-header">fn <a href="#method.q_any_dim" class="fn">q_any_dim</a>(tensor: <a class="type" href="type.QuantizedTensor.html" title="type burn_tensor::ops::QuantizedTensor">QuantizedTensor</a>&lt;B&gt;, dim: <a class="primitive" href="https://doc.rust-lang.org/1.91.1/std/primitive.usize.html">usize</a>) -&gt; <a class="type" href="type.BoolTensor.html" title="type burn_tensor::ops::BoolTensor">BoolTensor</a>&lt;B&gt;</h4></section></summary><div class="docblock"><p>Tests if any element in the float <code>tensor</code> evaluates to True along a given dimension <code>dim</code>.</p>
+<h5 id="arguments-64"><a class="doc-anchor" href="#arguments-64">§</a>Arguments</h5>
+<ul>
+<li><code>tensor</code> - The tensor to test.</li>
+<li><code>dim</code> - The axis along which to test.</li>
+</ul>
+<h5 id="returns-63"><a class="doc-anchor" href="#returns-63">§</a>Returns</h5>
+<p>A boolean tensor <code>Tensor&lt;B, D, Bool&gt;</code> with the same size as input <code>tensor</code>, except in the <code>dim</code> axis
+where the size is 1. The elem in the <code>dim</code> axis is True if any element along this dim in the
+input evaluates to True, False otherwise.</p>
+</div></details><details class="toggle method-toggle" open><summary><section id="method.q_all" class="method"><a class="src rightside" href="../../src/burn_tensor/tensor/ops/qtensor.rs.html#1304-1307">Source</a><h4 class="code-header">fn <a href="#method.q_all" class="fn">q_all</a>(tensor: <a class="type" href="type.QuantizedTensor.html" title="type burn_tensor::ops::QuantizedTensor">QuantizedTensor</a>&lt;B&gt;) -&gt; <a class="type" href="type.BoolTensor.html" title="type burn_tensor::ops::BoolTensor">BoolTensor</a>&lt;B&gt;</h4></section></summary><div class="docblock"><p>Tests if all elements in the <code>tensor</code> evaluate to True.</p>
+<h5 id="arguments-65"><a class="doc-anchor" href="#arguments-65">§</a>Arguments</h5>
+<ul>
+<li><code>tensor</code> - The tensor to test.</li>
+</ul>
+<h5 id="returns-64"><a class="doc-anchor" href="#returns-64">§</a>Returns</h5>
+<p>A boolean tensor <code>Tensor&lt;B, 1, Bool&gt;</code> with a single element, True if all elements in the input tensor
+evaluate to True, False otherwise.</p>
+</div></details><details class="toggle method-toggle" open><summary><section id="method.q_all_dim" class="method"><a class="src rightside" href="../../src/burn_tensor/tensor/ops/qtensor.rs.html#1321-1324">Source</a><h4 class="code-header">fn <a href="#method.q_all_dim" class="fn">q_all_dim</a>(tensor: <a class="type" href="type.QuantizedTensor.html" title="type burn_tensor::ops::QuantizedTensor">QuantizedTensor</a>&lt;B&gt;, dim: <a class="primitive" href="https://doc.rust-lang.org/1.91.1/std/primitive.usize.html">usize</a>) -&gt; <a class="type" href="type.BoolTensor.html" title="type burn_tensor::ops::BoolTensor">BoolTensor</a>&lt;B&gt;</h4></section></summary><div class="docblock"><p>Tests if all elements in the <code>tensor</code> evaluate to True along a given dimension <code>dim</code>.</p>
+<h5 id="arguments-66"><a class="doc-anchor" href="#arguments-66">§</a>Arguments</h5>
+<ul>
+<li><code>tensor</code> - The tensor to test.</li>
+<li><code>dim</code> - The axis along which to test.</li>
+</ul>
+<h5 id="returns-65"><a class="doc-anchor" href="#returns-65">§</a>Returns</h5>
+<p>A boolean tensor <code>Tensor&lt;B, D, Bool&gt;</code> with the same size as input <code>tensor</code>, except in the <code>dim</code> axis
+where the size is 1. The elem in the <code>dim</code> axis is True if all elements along this dim in the input
+evaluates to True, False otherwise.</p>
+</div></details><details class="toggle method-toggle" open><summary><section id="method.q_sort" class="method"><a class="src rightside" href="../../src/burn_tensor/tensor/ops/qtensor.rs.html#1342-1349">Source</a><h4 class="code-header">fn <a href="#method.q_sort" class="fn">q_sort</a>(
+    tensor: <a class="type" href="type.QuantizedTensor.html" title="type burn_tensor::ops::QuantizedTensor">QuantizedTensor</a>&lt;B&gt;,
+    dim: <a class="primitive" href="https://doc.rust-lang.org/1.91.1/std/primitive.usize.html">usize</a>,
+    descending: <a class="primitive" href="https://doc.rust-lang.org/1.91.1/std/primitive.bool.html">bool</a>,
+) -&gt; <a class="type" href="type.QuantizedTensor.html" title="type burn_tensor::ops::QuantizedTensor">QuantizedTensor</a>&lt;B&gt;</h4></section></summary><div class="docblock"><p>Sort the elements of the input <code>tensor</code> by value in along a given dimension.</p>
+<p>This sort is unstable (i.e., may reorder equal elements).</p>
+<h5 id="arguments-67"><a class="doc-anchor" href="#arguments-67">§</a>Arguments</h5>
+<ul>
+<li><code>tensor</code> - The input tensor.</li>
+<li><code>dim</code> - The axis along which to sort.</li>
+<li><code>descending</code> - The sorting order.</li>
+</ul>
+<h5 id="returns-66"><a class="doc-anchor" href="#returns-66">§</a>Returns</h5>
+<p>A tensor with the same shape as the input tensor, where the elements are sorted by value.</p>
+</div></details><details class="toggle method-toggle" open><summary><section id="method.q_sort_with_indices" class="method"><a class="src rightside" href="../../src/burn_tensor/tensor/ops/qtensor.rs.html#1365-1377">Source</a><h4 class="code-header">fn <a href="#method.q_sort_with_indices" class="fn">q_sort_with_indices</a>(
+    tensor: <a class="type" href="type.QuantizedTensor.html" title="type burn_tensor::ops::QuantizedTensor">QuantizedTensor</a>&lt;B&gt;,
+    dim: <a class="primitive" href="https://doc.rust-lang.org/1.91.1/std/primitive.usize.html">usize</a>,
+    descending: <a class="primitive" href="https://doc.rust-lang.org/1.91.1/std/primitive.bool.html">bool</a>,
+) -&gt; (<a class="type" href="type.QuantizedTensor.html" title="type burn_tensor::ops::QuantizedTensor">QuantizedTensor</a>&lt;B&gt;, <a class="type" href="type.IntTensor.html" title="type burn_tensor::ops::IntTensor">IntTensor</a>&lt;B&gt;)</h4></section></summary><div class="docblock"><p>Sort the elements of the input <code>tensor</code> by value in along a given dimension.</p>
+<p>This sort is unstable (i.e., may reorder equal elements).</p>
+<h5 id="arguments-68"><a class="doc-anchor" href="#arguments-68">§</a>Arguments</h5>
+<ul>
+<li><code>tensor</code> - The input tensor.</li>
+<li><code>dim</code> - The axis along which to sort.</li>
+<li><code>descending</code> - The sorting order.</li>
+</ul>
+<h5 id="returns-67"><a class="doc-anchor" href="#returns-67">§</a>Returns</h5>
+<p>A tensor with the same shape as the input tensor and corresponding indices, where
+the elements are sorted by value and the indices map back to the original input tensor.</p>
+</div></details><details class="toggle method-toggle" open><summary><section id="method.q_argsort" class="method"><a class="src rightside" href="../../src/burn_tensor/tensor/ops/qtensor.rs.html#1392-1396">Source</a><h4 class="code-header">fn <a href="#method.q_argsort" class="fn">q_argsort</a>(
+    tensor: <a class="type" href="type.QuantizedTensor.html" title="type burn_tensor::ops::QuantizedTensor">QuantizedTensor</a>&lt;B&gt;,
+    dim: <a class="primitive" href="https://doc.rust-lang.org/1.91.1/std/primitive.usize.html">usize</a>,
+    descending: <a class="primitive" href="https://doc.rust-lang.org/1.91.1/std/primitive.bool.html">bool</a>,
+) -&gt; <a class="type" href="type.IntTensor.html" title="type burn_tensor::ops::IntTensor">IntTensor</a>&lt;B&gt;</h4></section></summary><div class="docblock"><p>Returns the indices that sort the elements of the input <code>tensor</code> by value along a given dimension.</p>
+<p>This sort is unstable (i.e., may reorder equal elements).</p>
+<h5 id="arguments-69"><a class="doc-anchor" href="#arguments-69">§</a>Arguments</h5>
+<ul>
+<li><code>tensor</code> - The input tensor.</li>
+<li><code>dim</code> - The axis along which to sort.</li>
+<li><code>descending</code> - The sorting order.</li>
+</ul>
+<h5 id="returns-68"><a class="doc-anchor" href="#returns-68">§</a>Returns</h5>
+<p>A tensor with the same shape as the input tensor the indices map back to the original input tensor.</p>
+</div></details></div><h2 id="dyn-compatibility" class="section-header">Dyn Compatibility<a href="#dyn-compatibility" class="anchor">§</a></h2><div class="dyn-compatibility-info"><p>This trait is <b>not</b> <a href="https://doc.rust-lang.org/1.91.1/reference/items/traits.html#dyn-compatibility">dyn compatible</a>.</p><p><i>In older versions of Rust, dyn compatibility was called "object safety", so this trait is not object safe.</i></p></div><h2 id="implementors" class="section-header">Implementors<a href="#implementors" class="anchor">§</a></h2><div id="implementors-list"></div><script src="../../trait.impl/burn_tensor/tensor/ops/qtensor/trait.QTensorOps.js" async></script><script type="text/json" id="notable-traits-data">{"Vec<QuantizedTensor<B>>":"<h3>Notable traits for <code><a class=\"struct\" href=\"https://doc.rust-lang.org/1.91.1/alloc/vec/struct.Vec.html\" title=\"struct alloc::vec::Vec\">Vec</a>&lt;<a class=\"primitive\" href=\"https://doc.rust-lang.org/1.91.1/std/primitive.u8.html\">u8</a>, A&gt;</code></h3><pre><code><div class=\"where\">impl&lt;A&gt; <a class=\"trait\" href=\"https://doc.rust-lang.org/1.91.1/std/io/trait.Write.html\" title=\"trait std::io::Write\">Write</a> for <a class=\"struct\" href=\"https://doc.rust-lang.org/1.91.1/alloc/vec/struct.Vec.html\" title=\"struct alloc::vec::Vec\">Vec</a>&lt;<a class=\"primitive\" href=\"https://doc.rust-lang.org/1.91.1/std/primitive.u8.html\">u8</a>, A&gt;<div class=\"where\">where\n    A: <a class=\"trait\" href=\"https://doc.rust-lang.org/1.91.1/core/alloc/trait.Allocator.html\" title=\"trait core::alloc::Allocator\">Allocator</a>,</div></div>"}</script></section></div></main></body></html>

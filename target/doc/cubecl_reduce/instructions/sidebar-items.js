@@ -1,0 +1,1 @@
+window.SIDEBAR_ITEMS = {"fn":["fuse_accumulator_inplace","reduce_inplace","reduce_shared_inplace"],"mod":["fuse_accumulator_inplace","reduce_inplace","reduce_shared_inplace"],"struct":["ArgAccumulator","ArgAccumulatorExpand","ArgMax","ArgMin","Mean","Prod","Sum"],"trait":["Reduce","ReduceInstruction","SharedAccumulator"]};

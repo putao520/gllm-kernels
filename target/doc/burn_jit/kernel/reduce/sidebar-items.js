@@ -1,0 +1,1 @@
+window.SIDEBAR_ITEMS = {"enum":["ReduceStrategy"],"fn":["autotune_reduce","init_reduce_output","reduce","reduce_dim"],"struct":["ArgMax","ArgMin","Mean","Prod","Reduce","ReduceAutotuneKey","ReduceOps","ReducePlane","ReduceShared","ReduceSharedPlane","Sum"]};

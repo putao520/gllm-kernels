@@ -1,0 +1,1 @@
+window.SIDEBAR_ITEMS = {"enum":["LineMode","ReduceError"],"fn":["reduce"],"mod":["instructions","primitives"],"struct":["ReduceStrategy"]};

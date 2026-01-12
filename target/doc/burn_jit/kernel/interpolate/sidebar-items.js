@@ -1,0 +1,1 @@
+window.SIDEBAR_ITEMS = {"fn":["interpolate","interpolate_backward"]};

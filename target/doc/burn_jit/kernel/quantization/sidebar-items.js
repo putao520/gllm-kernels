@@ -1,0 +1,1 @@
+window.SIDEBAR_ITEMS = {"fn":["dequantize","quantize"],"struct":["QParams","QParamsCompilationArg","QParamsExpand","QParamsLaunch"],"type":["QTensor"]};

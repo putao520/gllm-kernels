@@ -1,0 +1,1 @@
+window.SIDEBAR_ITEMS = {"enum":["MatrixLayout"],"fn":["index_offset_with_layout","into_contiguous","into_contiguous_prefetch","matrix_layout"],"mod":["index_offset_with_layout"],"struct":["Read","ReadWrite","TensorHandle","VirtualTensor","VirtualTensorExpand"],"trait":["VirtualTensorOperations","VirtualTensorOperationsExpand"]};

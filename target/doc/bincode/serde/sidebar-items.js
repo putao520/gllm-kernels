@@ -1,0 +1,1 @@
+window.SIDEBAR_ITEMS = {"enum":["DecodeError","EncodeError"],"fn":["borrow_decode_from_slice","decode_from_reader","decode_from_slice","encode_into_slice","encode_into_writer","encode_to_vec","seed_decode_from_slice"],"struct":["BorrowCompat","BorrowedSerdeDecoder","Compat","OwnedSerdeDecoder"]};

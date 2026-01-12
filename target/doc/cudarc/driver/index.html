@@ -1,0 +1,101 @@
+<!DOCTYPE html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1.0"><meta name="generator" content="rustdoc"><meta name="description" content="Wrappers around the CUDA driver API, in three levels. See crate documentation for description of each."><title>cudarc::driver - Rust</title><script>if(window.location.protocol!=="file:")document.head.insertAdjacentHTML("beforeend","SourceSerif4-Regular-6b053e98.ttf.woff2,FiraSans-Italic-81dc35de.woff2,FiraSans-Regular-0fe48ade.woff2,FiraSans-MediumItalic-ccf7e434.woff2,FiraSans-Medium-e1aa3f0a.woff2,SourceCodePro-Regular-8badfe75.ttf.woff2,SourceCodePro-Semibold-aa29a496.ttf.woff2".split(",").map(f=>`<link rel="preload" as="font" type="font/woff2"href="../../static.files/${f}">`).join(""))</script><link rel="stylesheet" href="../../static.files/normalize-9960930a.css"><link rel="stylesheet" href="../../static.files/rustdoc-e56847b5.css"><meta name="rustdoc-vars" data-root-path="../../" data-static-root-path="../../static.files/" data-current-crate="cudarc" data-themes="" data-resource-suffix="" data-rustdoc-version="1.91.1 (ed61e7d7e 2025-11-07)" data-channel="1.91.1" data-search-js="search-e256b49e.js" data-stringdex-js="stringdex-c3e638e9.js" data-settings-js="settings-c38705f0.js" ><script src="../../static.files/storage-e2aeef58.js"></script><script defer src="../sidebar-items.js"></script><script defer src="../../static.files/main-6dc2a7f3.js"></script><noscript><link rel="stylesheet" href="../../static.files/noscript-263c88ec.css"></noscript><link rel="alternate icon" type="image/png" href="../../static.files/favicon-32x32-eab170b8.png"><link rel="icon" type="image/svg+xml" href="../../static.files/favicon-044be391.svg"></head><body class="rustdoc mod"><!--[if lte IE 11]><div class="warning">This old browser is unsupported and will most likely display funky things.</div><![endif]--><rustdoc-topbar><h2><a href="#">Module driver</a></h2></rustdoc-topbar><nav class="sidebar"><div class="sidebar-crate"><h2><a href="../../cudarc/index.html">cudarc</a><span class="version">0.12.1</span></h2></div><div class="sidebar-elems"><section id="rustdoc-toc"><h2 class="location"><a href="#">Module driver</a></h2><h3><a href="#">Sections</a></h3><ul class="block top-toc"><li><a href="#safe-api-usage" title="safe api usage">safe api usage</a><ul><li><a href="#mutating-device-memory---cudafunction" title="Mutating device memory - CudaFunction">Mutating device memory - CudaFunction</a></li><li><a href="#sub-slices-of-cudaslice" title="Sub slices of CudaSlice">Sub slices of CudaSlice</a></li></ul></li><li><a href="#multi-threading" title="Multi threading">Multi threading</a></li><li><a href="#safety" title="Safety">Safety</a><ul><li><a href="#contextstream-lifetimes" title="Context/Stream lifetimes">Context/Stream lifetimes</a></li><li><a href="#device-data-lifetimes" title="Device Data lifetimes">Device Data lifetimes</a></li><li><a href="#host-and-device-data-lifetimes" title="Host and Device Data lifetimes">Host and Device Data lifetimes</a></li><li><a href="#single-stream-operations" title="Single stream operations">Single stream operations</a></li></ul></li></ul><h3><a href="#modules">Module Items</a></h3><ul class="block"><li><a href="#modules" title="Modules">Modules</a></li></ul></section><div id="rustdoc-modnav"><h2 class="in-crate"><a href="../index.html">In crate cudarc</a></h2></div></div></nav><div class="sidebar-resizer" title="Drag to resize sidebar"></div><main><div class="width-limiter"><section id="main-content" class="content"><div class="main-heading"><div class="rustdoc-breadcrumbs"><a href="../index.html">cudarc</a></div><h1>Module <span>driver</span>&nbsp;<button id="copy-path" title="Copy item path to clipboard">Copy item path</button></h1><rustdoc-toolbar></rustdoc-toolbar><span class="sub-heading"><a class="src" href="../../src/cudarc/driver/mod.rs.html#1-171">Source</a> </span></div><details class="toggle top-doc" open><summary class="hideme"><span>Expand description</span></summary><div class="docblock"><p>Wrappers around the <a href="https://docs.nvidia.com/cuda/cuda-driver-api/index.html">CUDA driver API</a>,
+in three levels. See crate documentation for description of each.</p>
+<h2 id="safe-api-usage"><a class="doc-anchor" href="#safe-api-usage">§</a>safe api usage</h2>
+<ol>
+<li>Instantiate a <a href="safe/struct.CudaDevice.html" title="struct cudarc::driver::safe::CudaDevice">CudaDevice</a>:</li>
+</ol>
+
+<div class="example-wrap"><pre class="rust rust-example-rendered"><code><span class="kw">let </span>device = CudaDevice::new(<span class="number">0</span>).unwrap();</code></pre></div>
+<ol start="2">
+<li>Allocate device memory with host data with <a href="safe/struct.CudaDevice.html#method.htod_copy" title="method cudarc::driver::safe::CudaDevice::htod_copy">CudaDevice::htod_copy()</a>, <a href="safe/struct.CudaDevice.html#method.alloc_zeros" title="method cudarc::driver::safe::CudaDevice::alloc_zeros">CudaDevice::alloc_zeros()</a>,
+or <a href="safe/struct.CudaDevice.html#method.htod_sync_copy" title="method cudarc::driver::safe::CudaDevice::htod_sync_copy">CudaDevice::htod_sync_copy()</a>.</li>
+</ol>
+<p>You can also copy data to CudaSlice using <a href="safe/struct.CudaDevice.html#method.htod_sync_copy_into" title="method cudarc::driver::safe::CudaDevice::htod_sync_copy_into">CudaDevice::htod_sync_copy_into()</a></p>
+
+<div class="example-wrap"><pre class="rust rust-example-rendered"><code><span class="kw">let </span>a_dev: CudaSlice&lt;f32&gt; = device.alloc_zeros(<span class="number">10</span>).unwrap();
+<span class="kw">let </span>b_dev: CudaSlice&lt;f32&gt; = device.htod_copy(<span class="macro">vec!</span>[<span class="number">0.0</span>; <span class="number">10</span>]).unwrap();
+<span class="kw">let </span>c_dev: CudaSlice&lt;f32&gt; = device.htod_sync_copy(<span class="kw-2">&amp;</span>[<span class="number">1.0</span>, <span class="number">2.0</span>, <span class="number">3.0</span>]).unwrap();</code></pre></div>
+<ol start="3">
+<li>Transfer to host memory with <a href="safe/struct.CudaDevice.html#method.sync_reclaim" title="method cudarc::driver::safe::CudaDevice::sync_reclaim">CudaDevice::sync_reclaim()</a>, <a href="safe/struct.CudaDevice.html#method.dtoh_sync_copy" title="method cudarc::driver::safe::CudaDevice::dtoh_sync_copy">CudaDevice::dtoh_sync_copy()</a>,
+or <a href="safe/struct.CudaDevice.html#method.dtoh_sync_copy_into" title="method cudarc::driver::safe::CudaDevice::dtoh_sync_copy_into">CudaDevice::dtoh_sync_copy_into()</a></li>
+</ol>
+
+<div class="example-wrap"><pre class="rust rust-example-rendered"><code><span class="kw">let </span>a_dev: CudaSlice&lt;f32&gt; = device.alloc_zeros(<span class="number">10</span>).unwrap();
+<span class="kw">let </span><span class="kw-2">mut </span>a_buf: [f32; <span class="number">10</span>] = [<span class="number">1.0</span>; <span class="number">10</span>];
+device.dtoh_sync_copy_into(<span class="kw-2">&amp;</span>a_dev, <span class="kw-2">&amp;mut </span>a_buf);
+<span class="macro">assert_eq!</span>(a_buf, [<span class="number">0.0</span>; <span class="number">10</span>]);
+<span class="kw">let </span>a_host: Vec&lt;f32&gt; = device.sync_reclaim(a_dev).unwrap();
+<span class="macro">assert_eq!</span>(<span class="kw-2">&amp;</span>a_host, <span class="kw-2">&amp;</span>[<span class="number">0.0</span>; <span class="number">10</span>]);</code></pre></div><h3 id="mutating-device-memory---cudafunction"><a class="doc-anchor" href="#mutating-device-memory---cudafunction">§</a>Mutating device memory - <a href="safe/struct.CudaFunction.html" title="struct cudarc::driver::safe::CudaFunction">CudaFunction</a></h3>
+<p>See <a href="safe/trait.LaunchAsync.html" title="trait cudarc::driver::safe::LaunchAsync">LaunchAsync</a> and <a href="safe/struct.CudaFunction.html" title="struct cudarc::driver::safe::CudaFunction">CudaFunction</a>.</p>
+<p>In order to mutate device data, you need to use cuda kernels.</p>
+<p>Loading kernels is done with <a href="safe/struct.CudaDevice.html#method.load_ptx" title="method cudarc::driver::safe::CudaDevice::load_ptx">CudaDevice::load_ptx()</a></p>
+
+<div class="example-wrap"><pre class="rust rust-example-rendered"><code><span class="kw">let </span>ptx = compile_ptx(<span class="string">"extern \"C\" __global__ void my_function(float *out) { }"</span>).unwrap();
+<span class="kw">let </span>device = CudaDevice::new(<span class="number">0</span>).unwrap();
+device.load_ptx(ptx, <span class="string">"module_name"</span>, <span class="kw-2">&amp;</span>[<span class="string">"my_function"</span>]).unwrap();</code></pre></div>
+<p>Retrieve the function using the registered module name &amp; actual function name:</p>
+
+<div class="example-wrap"><pre class="rust rust-example-rendered"><code><span class="kw">let </span>func: CudaFunction = device.get_func(<span class="string">"module_name"</span>, <span class="string">"my_function"</span>).unwrap();</code></pre></div>
+<p>Asynchronously execute the kernel:</p>
+
+<div class="example-wrap"><pre class="rust rust-example-rendered"><code><span class="kw">let </span><span class="kw-2">mut </span>a = device.alloc_zeros::&lt;f32&gt;(<span class="number">10</span>).unwrap();
+<span class="kw">let </span>cfg = LaunchConfig::for_num_elems(<span class="number">10</span>);
+<span class="kw">unsafe </span>{ func.launch(cfg, (<span class="kw-2">&amp;mut </span>a,)) }.unwrap();</code></pre></div>
+<p>Note: Launching kernels is <strong>extremely unsafe</strong>. See <a href="safe/trait.LaunchAsync.html" title="trait cudarc::driver::safe::LaunchAsync">LaunchAsync</a> for more info.</p>
+<h3 id="sub-slices-of-cudaslice"><a class="doc-anchor" href="#sub-slices-of-cudaslice">§</a>Sub slices of <a href="safe/struct.CudaSlice.html" title="struct cudarc::driver::safe::CudaSlice">CudaSlice</a></h3>
+<p>For some operations, it is necessary to only operate on a small part of a single <a href="safe/struct.CudaSlice.html" title="struct cudarc::driver::safe::CudaSlice">CudaSlice</a>.
+For example, the slice may represent a batch of items, and you want to run separate kernels
+on each of the items in the batch.</p>
+<p>Use <a href="safe/struct.CudaSlice.html#method.try_slice" title="method cudarc::driver::safe::CudaSlice::try_slice">CudaSlice::try_slice()</a> and <a href="safe/struct.CudaSlice.html#method.try_slice_mut" title="method cudarc::driver::safe::CudaSlice::try_slice_mut">CudaSlice::try_slice_mut()</a> for this. The returned
+views (<a href="safe/struct.CudaView.html" title="struct cudarc::driver::safe::CudaView">CudaView</a> and <a href="safe/struct.CudaViewMut.html" title="struct cudarc::driver::safe::CudaViewMut">CudaViewMut</a> hold references to the owning <a href="safe/struct.CudaSlice.html" title="struct cudarc::driver::safe::CudaSlice">CudaSlice</a>,
+so rust’s ownership system handles safety here.</p>
+<p>These view structs can be used with <a href="safe/struct.CudaFunction.html" title="struct cudarc::driver::safe::CudaFunction">CudaFunction</a>.</p>
+
+<div class="example-wrap"><pre class="rust rust-example-rendered"><code><span class="kw">let </span><span class="kw-2">mut </span>a: CudaSlice&lt;f32&gt; = device.alloc_zeros::&lt;f32&gt;(<span class="number">3 </span>* <span class="number">10</span>).unwrap();
+<span class="kw">for </span>i_batch <span class="kw">in </span><span class="number">0</span>..<span class="number">3 </span>{
+    <span class="kw">let </span><span class="kw-2">mut </span>a_sub_view: CudaViewMut&lt;f32&gt; = a.try_slice_mut(i_batch * <span class="number">10</span>..).unwrap();
+    <span class="kw">let </span>f: CudaFunction = device.get_func(<span class="string">"module_name"</span>, <span class="string">"my_function"</span>).unwrap();
+    <span class="kw">let </span>cfg = LaunchConfig::for_num_elems(<span class="number">10</span>);
+    <span class="kw">unsafe </span>{ f.launch(cfg, (<span class="kw-2">&amp;mut </span>a_sub_view,)) }.unwrap();
+}</code></pre></div><h5 id="a-note-on-implementation"><a class="doc-anchor" href="#a-note-on-implementation">§</a>A note on implementation</h5>
+<p>It would be possible to re-use <a href="safe/struct.CudaSlice.html" title="struct cudarc::driver::safe::CudaSlice">CudaSlice</a> itself for sub-slices, however that would involve adding
+another structure underneath the hood that is wrapped in an <a href="https://doc.rust-lang.org/1.91.1/alloc/sync/struct.Arc.html" title="struct alloc::sync::Arc">std::sync::Arc</a> to minimize data cloning.
+Overall it seemed more complex than the current implementation.</p>
+<h2 id="multi-threading"><a class="doc-anchor" href="#multi-threading">§</a>Multi threading</h2>
+<p>In order to use a <a href="safe/struct.CudaDevice.html" title="struct cudarc::driver::safe::CudaDevice">CudaDevice</a> on multiple threads, you must call <a href="safe/struct.CudaDevice.html#method.bind_to_thread" title="method cudarc::driver::safe::CudaDevice::bind_to_thread">CudaDevice::bind_to_thread</a> on
+each thread <strong>before you use the device</strong>.</p>
+<h2 id="safety"><a class="doc-anchor" href="#safety">§</a>Safety</h2>
+<p>There are a number of aspects to this, but at a high level this API utilizes <a href="https://doc.rust-lang.org/1.91.1/alloc/sync/struct.Arc.html" title="struct alloc::sync::Arc">std::sync::Arc</a> to
+control when <a href="safe/struct.CudaDevice.html" title="struct cudarc::driver::safe::CudaDevice">CudaDevice</a> can be dropped.</p>
+<h4 id="contextstream-lifetimes"><a class="doc-anchor" href="#contextstream-lifetimes">§</a>Context/Stream lifetimes</h4>
+<p>The first part of safety is ensuring that <a href="sys/type.CUcontext.html" title="type cudarc::driver::sys::CUcontext">crate::driver::sys::CUcontext</a>,
+<a href="sys/type.CUdevice.html" title="type cudarc::driver::sys::CUdevice">crate::driver::sys::CUdevice</a>, and <a href="sys/type.CUstream.html" title="type cudarc::driver::sys::CUstream">crate::driver::sys::CUstream</a> all
+live the required amount of time (i.e. device outlives context, which outlives stream).</p>
+<p>This is accomplished by putting all of them inside one struct, the <a href="safe/struct.CudaDevice.html" title="struct cudarc::driver::safe::CudaDevice">CudaDevice</a>. There are other ways,
+such as adding newtypes that carry lifetimes with them, but this approach was chosen to make working
+with device pointers easier.</p>
+<p>Additionally, <a href="safe/struct.CudaDevice.html" title="struct cudarc::driver::safe::CudaDevice">CudaDevice</a> implements <a href="https://doc.rust-lang.org/1.91.1/core/ops/drop/trait.Drop.html" title="trait core::ops::drop::Drop">Drop</a> as releasing all the data from the device in
+the expected way.</p>
+<h4 id="device-data-lifetimes"><a class="doc-anchor" href="#device-data-lifetimes">§</a>Device Data lifetimes</h4>
+<p>The next part of safety is ensuring that <a href="safe/struct.CudaSlice.html" title="struct cudarc::driver::safe::CudaSlice">CudaSlice</a> do not outlive
+the <a href="safe/struct.CudaDevice.html" title="struct cudarc::driver::safe::CudaDevice">CudaDevice</a>. For usability, each <a href="safe/struct.CudaSlice.html" title="struct cudarc::driver::safe::CudaSlice">CudaSlice</a> owns an <code>Arc&lt;CudaDevice&gt;</code>
+to ensure the device stays alive.</p>
+<p>Additionally we don’t want to double free any device pointers, so free is only
+called when the device pointer is dropped. Thanks rust!</p>
+<h4 id="host-and-device-data-lifetimes"><a class="doc-anchor" href="#host-and-device-data-lifetimes">§</a>Host and Device Data lifetimes</h4>
+<p>Each device allocation can be associated with a host allocation. We want to ensure
+that these have the same lifetimes <em>when copying data between them</em>.</p>
+<p>This is done via the various copy methods. Methods that don’t take ownership
+of the host data need to be executed synchronously, while the methods own the reference.
+Methods that do own the host data can be executed synchronously.</p>
+<h4 id="single-stream-operations"><a class="doc-anchor" href="#single-stream-operations">§</a>Single stream operations</h4>
+<p>The next part of safety is ensuring that all operations happen on a single stream.
+This ensures that data isn’t mutated by more than 1 stream at a time, and also
+ensures data isn’t used before allocated, or used after free.</p>
+<p>Another important aspect of this is ensuring that mutability in an async setting
+is sound, and something can’t be freed while it’s being used in a kernel.</p>
+<p>To this end every operation by default happens on the same stream.</p>
+<p>Multi stream is supported via <a href="safe/struct.CudaStream.html" title="struct cudarc::driver::safe::CudaStream">CudaStream</a>, however it automatically
+synchronizes with the main stream on creation &amp; on drop. It is still possible
+to be unsafe in a multi stream context though.</p>
+</div></details><h2 id="reexports" class="section-header">Re-exports<a href="#reexports" class="anchor">§</a></h2><dl class="item-table reexports"><dt><code>pub use <a class="mod" href="safe/index.html" title="mod cudarc::driver::safe">safe</a>::*;</code></dt></dl><h2 id="modules" class="section-header">Modules<a href="#modules" class="anchor">§</a></h2><dl class="item-table"><dt><a class="mod" href="result/index.html" title="mod cudarc::driver::result">result</a></dt><dd>A thin wrapper around <a href="sys/index.html" title="mod cudarc::driver::sys">sys</a>.</dd><dt><a class="mod" href="safe/index.html" title="mod cudarc::driver::safe">safe</a></dt><dd>Safe abstractions over <a href="result/index.html" title="mod cudarc::driver::result">crate::driver::result</a> provided by <a href="safe/struct.CudaSlice.html" title="struct cudarc::driver::safe::CudaSlice">CudaSlice</a>, <a href="safe/struct.CudaDevice.html" title="struct cudarc::driver::safe::CudaDevice">CudaDevice</a>, <a href="safe/struct.CudaStream.html" title="struct cudarc::driver::safe::CudaStream">CudaStream</a>, and more.</dd><dt><a class="mod" href="sys/index.html" title="mod cudarc::driver::sys">sys</a></dt></dl></section></div></main></body></html>
