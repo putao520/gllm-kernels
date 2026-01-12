@@ -1,6 +1,6 @@
 [package]
 name = "gllm-kernels"
-version = "0.1.1"
+version = "0.1.2"
 edition = "2021"
 authors = ["gllm contributors"]
 license = "Apache-2.0"
@@ -36,11 +36,11 @@ flash-attention-v3-block-quant = []
 # hip 等 burn 支持后再加
 
 [dependencies]
-burn = { version = "0.16", default-features = false }
-burn-ndarray = { version = "0.16", optional = true }
-burn-cuda = { version = "0.16", optional = true }
-burn-wgpu = { version = "0.16", optional = true }
-burn-fusion = { version = "0.16", optional = true }
+burn = { version = "0.20.0-pre.3", default-features = false }
+burn-ndarray = { version = "0.20.0-pre.3", optional = true }
+burn-cuda = { version = "0.20.0-pre.3", optional = true }
+burn-wgpu = { version = "0.20.0-pre.3", optional = true }
+burn-fusion = { version = "0.20.0-pre.3", optional = true }
 log = "0.4"
 crossbeam-channel = "0.5"
 cudarc = { version = "0.18", optional = true, default-features = false, features = ["std", "driver", "nvrtc", "f16", "cuda-12090", "dynamic-loading"] }

@@ -4,8 +4,7 @@ use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::sync::Mutex;
 
-use burn::tensor::quantization::{QuantizationScheme, QuantizationType};
-use burn::tensor::{DType, TensorData};
+use burn::tensor::{Bytes, DType, TensorData};
 
 use super::traits::{CommError, CommResult, Communicator};
 
@@ -23,10 +22,6 @@ const DTYPE_U16: u8 = 11;
 const DTYPE_U8: u8 = 12;
 const DTYPE_BOOL: u8 = 13;
 const DTYPE_QFLOAT: u8 = 14;
-
-const QSCHEME_PER_TENSOR_AFFINE: u8 = 1;
-const QSCHEME_PER_TENSOR_SYMMETRIC: u8 = 2;
-const QTYPE_QINT8: u8 = 1;
 
 /// TCP communicator for multi-node ring communication.
 pub struct TcpComm {
@@ -180,7 +175,7 @@ fn deserialize_tensor_data(buf: &[u8]) -> CommResult<TensorData> {
     let bytes_len = read_u64(buf, &mut pos)? as usize;
     let bytes = read_slice(buf, &mut pos, bytes_len)?.to_vec();
 
-    Ok(TensorData::from_bytes(bytes, shape, dtype))
+    Ok(TensorData::from_bytes(Bytes::from_bytes_vec(bytes), shape, dtype))
 }
 
 fn encode_dtype(buf: &mut Vec<u8>, dtype: DType) -> CommResult<()> {
@@ -198,9 +193,11 @@ fn encode_dtype(buf: &mut Vec<u8>, dtype: DType) -> CommResult<()> {
         DType::U16 => buf.push(DTYPE_U16),
         DType::U8 => buf.push(DTYPE_U8),
         DType::Bool => buf.push(DTYPE_BOOL),
-        DType::QFloat(scheme) => {
-            buf.push(DTYPE_QFLOAT);
-            encode_qscheme(buf, scheme)?;
+        // Quantized types not supported in TCP comm yet
+        _ => {
+            return Err(CommError::Serialization(
+                "Quantized types not supported in TCP comm".to_string(),
+            ));
         }
     }
 
@@ -223,60 +220,11 @@ fn decode_dtype(buf: &[u8], pos: &mut usize) -> CommResult<DType> {
         DTYPE_U16 => Ok(DType::U16),
         DTYPE_U8 => Ok(DType::U8),
         DTYPE_BOOL => Ok(DType::Bool),
-        DTYPE_QFLOAT => {
-            let scheme = decode_qscheme(buf, pos)?;
-            Ok(DType::QFloat(scheme))
-        }
+        DTYPE_QFLOAT => Err(CommError::Serialization(
+            "Quantized types not supported in TCP comm".to_string(),
+        )),
         _ => Err(CommError::Serialization(format!(
             "Unknown dtype tag {}",
-            tag
-        ))),
-    }
-}
-
-fn encode_qscheme(buf: &mut Vec<u8>, scheme: QuantizationScheme) -> CommResult<()> {
-    match scheme {
-        QuantizationScheme::PerTensorAffine(qtype) => {
-            buf.push(QSCHEME_PER_TENSOR_AFFINE);
-            encode_qtype(buf, qtype)?;
-        }
-        QuantizationScheme::PerTensorSymmetric(qtype) => {
-            buf.push(QSCHEME_PER_TENSOR_SYMMETRIC);
-            encode_qtype(buf, qtype)?;
-        }
-    }
-
-    Ok(())
-}
-
-fn decode_qscheme(buf: &[u8], pos: &mut usize) -> CommResult<QuantizationScheme> {
-    let tag = read_u8(buf, pos)?;
-    let qtype = decode_qtype(buf, pos)?;
-
-    match tag {
-        QSCHEME_PER_TENSOR_AFFINE => Ok(QuantizationScheme::PerTensorAffine(qtype)),
-        QSCHEME_PER_TENSOR_SYMMETRIC => Ok(QuantizationScheme::PerTensorSymmetric(qtype)),
-        _ => Err(CommError::Serialization(format!(
-            "Unknown quantization scheme tag {}",
-            tag
-        ))),
-    }
-}
-
-fn encode_qtype(buf: &mut Vec<u8>, qtype: QuantizationType) -> CommResult<()> {
-    match qtype {
-        QuantizationType::QInt8 => buf.push(QTYPE_QINT8),
-    }
-
-    Ok(())
-}
-
-fn decode_qtype(buf: &[u8], pos: &mut usize) -> CommResult<QuantizationType> {
-    let tag = read_u8(buf, pos)?;
-    match tag {
-        QTYPE_QINT8 => Ok(QuantizationType::QInt8),
-        _ => Err(CommError::Serialization(format!(
-            "Unknown quantization type tag {}",
             tag
         ))),
     }
