@@ -1,8 +1,901 @@
-use criterion::{criterion_group, criterion_main, Criterion};
+use std::mem::size_of;
+use std::time::Duration;
+#[cfg(all(feature = "cuda-kernel", feature = "cuda"))]
+use std::sync::Arc;
 
-fn attention_bench(c: &mut Criterion) {
-    c.bench_function("noop", |b| b.iter(|| 42u64));
+use burn::tensor::backend::Backend;
+use burn::tensor::{Distribution, Tensor};
+#[cfg(all(feature = "cuda-kernel", feature = "cuda"))]
+use burn::tensor::TensorData;
+use burn_ndarray::NdArray;
+use criterion::measurement::WallTime;
+use criterion::{black_box, criterion_group, criterion_main, BenchmarkGroup, Criterion, Throughput};
+#[cfg(all(feature = "cuda-kernel", feature = "cuda"))]
+use cudarc::driver::{CudaContext, CudaStream};
+use gllm_kernels::{
+    CompressionMethod, FlashAttention3, FlashAttention3Config, FlashAttentionConfig,
+    HierarchicalFlashAttention, HybridLayer, HybridStrategy, KVCacheCompressor, MambaBlock,
+    MambaConfig, MambaParameters, MultiHeadLatentAttention, PredictionConfig, PredictionHeadType,
+    SparseAttention, SparseAttentionConfig, SparsityPattern, SpeculativeDecoder, TreeConfig,
+    VerificationStrategy,
+};
+use gllm_kernels::ops::flash_attention::AttentionWorkspace;
+#[cfg(all(feature = "cuda-kernel", feature = "cuda"))]
+use gllm_kernels::FlashAttentionKernel;
+#[cfg(all(feature = "cuda-kernel", feature = "cuda"))]
+use burn_cuda::Cuda;
+
+type CpuBackend = NdArray<f32>;
+type CpuDevice = <CpuBackend as Backend>::Device;
+
+fn configure_group(group: &mut BenchmarkGroup<'_, WallTime>) {
+    group.sample_size(10);
+    group.warm_up_time(Duration::from_millis(500));
+    group.measurement_time(Duration::from_secs(2));
 }
 
-criterion_group!(benches, attention_bench);
+fn div_ceil(value: u64, divisor: u64) -> u64 {
+    if divisor == 0 {
+        return 0;
+    }
+    (value + divisor - 1) / divisor
+}
+
+fn kv_bytes(batch: usize, num_heads: usize, seq_len: usize, head_dim: usize) -> u64 {
+    let elements = batch as u64 * num_heads as u64 * seq_len as u64 * head_dim as u64;
+    elements * 2 * size_of::<f32>() as u64
+}
+
+fn low_rank_bytes(batch: usize, num_heads: usize, seq_len: usize, rank: usize) -> u64 {
+    let tokens = batch as u64 * num_heads as u64 * seq_len as u64;
+    let projected = tokens * rank as u64 * size_of::<f32>() as u64;
+    let indices = rank as u64 * size_of::<usize>() as u64;
+    (projected + indices) * 2
+}
+
+fn vq_bytes(
+    batch: usize,
+    num_heads: usize,
+    seq_len: usize,
+    head_dim: usize,
+    codebook_size: usize,
+    bits: u8,
+) -> u64 {
+    let tokens = batch as u64 * num_heads as u64 * seq_len as u64;
+    let codebook = codebook_size as u64 * head_dim as u64 * size_of::<f32>() as u64;
+    let codes = match bits {
+        4 => div_ceil(tokens, 2),
+        8 => tokens,
+        _ => div_ceil(tokens * bits as u64, 8),
+    };
+    (codebook + codes) * 2
+}
+
+fn hybrid_bytes(batch: usize, num_heads: usize, seq_len: usize, rank: usize, bits: u8) -> u64 {
+    let tokens = batch as u64 * num_heads as u64 * seq_len as u64;
+    let quantized = div_ceil(tokens * rank as u64 * bits as u64, 8);
+    let indices = rank as u64 * size_of::<usize>() as u64;
+    (quantized + indices) * 2
+}
+
+fn bytes_to_mb(bytes: u64) -> f64 {
+    bytes as f64 / (1024.0 * 1024.0)
+}
+
+fn report_compression(label: &str, before: u64, after: u64) {
+    let ratio = before as f64 / after as f64;
+    println!(
+        "{} memory: before={:.2}MB after={:.2}MB ratio={:.2}x",
+        label,
+        bytes_to_mb(before),
+        bytes_to_mb(after),
+        ratio
+    );
+}
+
+fn speculative_token_count(branch_factor: usize, depth: usize) -> u64 {
+    let mut total = 0u64;
+    let mut level = branch_factor as u64;
+    for _ in 0..depth {
+        total = total.saturating_add(level);
+        level = level.saturating_mul(branch_factor as u64);
+    }
+    total
+}
+
+fn bench_flash_attention_baseline(c: &mut Criterion) {
+    let mut group = c.benchmark_group("attention");
+    configure_group(&mut group);
+
+    let device = CpuDevice::default();
+    let attention = HierarchicalFlashAttention::default_config();
+    let num_heads = 8;
+    let head_dim = 64;
+    let seq_lens = [512usize, 1024, 2048, 4096];
+    let batches = [1usize, 4];
+
+    for &seq_len in &seq_lens {
+        for &batch in &batches {
+            let q = Tensor::<CpuBackend, 4>::random(
+                [batch, num_heads, seq_len, head_dim],
+                Distribution::Normal(0.0, 1.0),
+                &device,
+            );
+            let k = Tensor::<CpuBackend, 4>::random(
+                [batch, num_heads, seq_len, head_dim],
+                Distribution::Normal(0.0, 1.0),
+                &device,
+            );
+            let v = Tensor::<CpuBackend, 4>::random(
+                [batch, num_heads, seq_len, head_dim],
+                Distribution::Normal(0.0, 1.0),
+                &device,
+            );
+
+            let tokens = (batch * seq_len) as u64;
+            group.throughput(Throughput::Elements(tokens));
+            let id = format!("baseline_seq{}_b{}", seq_len, batch);
+            group.bench_function(id, |b| {
+                b.iter(|| {
+                    let output = attention.forward(q.clone(), k.clone(), v.clone(), false, 0);
+                    black_box(output);
+                })
+            });
+        }
+    }
+
+    group.finish();
+}
+
+fn bench_flash_attention_v3(c: &mut Criterion) {
+    let mut group = c.benchmark_group("attention");
+    configure_group(&mut group);
+
+    let device = CpuDevice::default();
+    let attention = FlashAttention3::new(
+        FlashAttentionConfig::default(),
+        FlashAttention3Config {
+            use_wgmma: true,
+            async_pipeline: true,
+            fp8_enabled: true,
+            block_quantization: true,
+        },
+    );
+    let num_heads = 8;
+    let head_dim = 64;
+    let seq_lens = [512usize, 1024, 2048, 4096];
+    let batches = [1usize, 4];
+
+    for &seq_len in &seq_lens {
+        for &batch in &batches {
+            let q = Tensor::<CpuBackend, 4>::random(
+                [batch, num_heads, seq_len, head_dim],
+                Distribution::Normal(0.0, 1.0),
+                &device,
+            );
+            let k = Tensor::<CpuBackend, 4>::random(
+                [batch, num_heads, seq_len, head_dim],
+                Distribution::Normal(0.0, 1.0),
+                &device,
+            );
+            let v = Tensor::<CpuBackend, 4>::random(
+                [batch, num_heads, seq_len, head_dim],
+                Distribution::Normal(0.0, 1.0),
+                &device,
+            );
+
+            let tokens = (batch * seq_len) as u64;
+            group.throughput(Throughput::Elements(tokens));
+            let id = format!("v3_seq{}_b{}", seq_len, batch);
+            group.bench_function(id, |b| {
+                b.iter(|| {
+                    let output = attention.forward(q.clone(), k.clone(), v.clone(), false, 0);
+                    black_box(output);
+                })
+            });
+        }
+    }
+
+    group.finish();
+}
+
+#[cfg(all(feature = "cuda-kernel", feature = "cuda"))]
+fn bench_flash_attention_cuda_kernel(c: &mut Criterion) {
+    let mut group = c.benchmark_group("attention_cuda");
+    configure_group(&mut group);
+
+    let cuda_ctx = match CudaContext::new(0) {
+        Ok(ctx) => ctx,
+        Err(_) => return,
+    };
+    let stream: Arc<CudaStream> = cuda_ctx.default_stream();
+    let kernel = match FlashAttentionKernel::new(&cuda_ctx) {
+        Ok(kernel) => kernel,
+        Err(_) => return,
+    };
+
+    let cpu_device = CpuDevice::default();
+    let batch = 1usize;
+    let num_heads = 8usize;
+    let seq_len = 512usize;
+    let head_dim = 64usize;
+    let dims = [batch, num_heads, seq_len, head_dim];
+
+    let q_cpu = Tensor::<CpuBackend, 4>::random(
+        dims,
+        Distribution::Normal(0.0, 1.0),
+        &cpu_device,
+    );
+    let k_cpu = Tensor::<CpuBackend, 4>::random(
+        dims,
+        Distribution::Normal(0.0, 1.0),
+        &cpu_device,
+    );
+    let v_cpu = Tensor::<CpuBackend, 4>::random(
+        dims,
+        Distribution::Normal(0.0, 1.0),
+        &cpu_device,
+    );
+
+    let q_host = q_cpu
+        .clone()
+        .into_data()
+        .into_vec::<f32>()
+        .expect("q host data");
+    let k_host = k_cpu
+        .clone()
+        .into_data()
+        .into_vec::<f32>()
+        .expect("k host data");
+    let v_host = v_cpu
+        .clone()
+        .into_data()
+        .into_vec::<f32>()
+        .expect("v host data");
+
+    let q_dev = stream.clone_htod(&q_host).expect("q copy");
+    let k_dev = stream.clone_htod(&k_host).expect("k copy");
+    let v_dev = stream.clone_htod(&v_host).expect("v copy");
+
+    let tokens = (batch * seq_len) as u64;
+    group.throughput(Throughput::Elements(tokens));
+
+    group.bench_function("cuda_kernel", |b| {
+        b.iter(|| {
+            let output = kernel
+                .forward_f32(
+                    &stream,
+                    &q_dev,
+                    &k_dev,
+                    &v_dev,
+                    batch,
+                    num_heads,
+                    seq_len,
+                    head_dim,
+                    false,
+                    1.0 / (head_dim as f32).sqrt(),
+                    0,
+                )
+                .expect("cuda kernel");
+            stream.synchronize().expect("cuda sync");
+            black_box(output);
+        })
+    });
+
+    let cuda_backend_device = <Cuda as Backend>::Device::default();
+    let q_cuda = Tensor::<Cuda, 4>::from_data(TensorData::new(q_host, dims), &cuda_backend_device);
+    let k_cuda = Tensor::<Cuda, 4>::from_data(TensorData::new(k_host, dims), &cuda_backend_device);
+    let v_cuda = Tensor::<Cuda, 4>::from_data(TensorData::new(v_host, dims), &cuda_backend_device);
+
+    let attention = HierarchicalFlashAttention::default_config();
+    group.bench_function("burn_cuda", |b| {
+        b.iter(|| {
+            let output = attention.forward(q_cuda.clone(), k_cuda.clone(), v_cuda.clone(), false, 0);
+            let _ = output.clone().into_data();
+            black_box(output);
+        })
+    });
+
+    group.finish();
+}
+
+#[cfg(not(all(feature = "cuda-kernel", feature = "cuda")))]
+fn bench_flash_attention_cuda_kernel(_c: &mut Criterion) {}
+
+fn bench_mla_compression(c: &mut Criterion) {
+    let mut group = c.benchmark_group("mla");
+    configure_group(&mut group);
+
+    let device = CpuDevice::default();
+    let batch = 1usize;
+    let num_heads = 8usize;
+    let seq_len = 1024usize;
+    let head_dim = 64usize;
+
+    let k = Tensor::<CpuBackend, 4>::random(
+        [batch, num_heads, seq_len, head_dim],
+        Distribution::Normal(0.0, 1.0),
+        &device,
+    );
+    let v = Tensor::<CpuBackend, 4>::random(
+        [batch, num_heads, seq_len, head_dim],
+        Distribution::Normal(0.0, 1.0),
+        &device,
+    );
+    let ratios = [8usize, 16];
+
+    for &ratio in &ratios {
+        let latent_dim = (head_dim / ratio).max(1);
+        let down_proj = Tensor::<CpuBackend, 2>::random(
+            [head_dim, latent_dim],
+            Distribution::Normal(0.0, 1.0),
+            &device,
+        );
+        let up_proj = Tensor::<CpuBackend, 2>::random(
+            [latent_dim, head_dim],
+            Distribution::Normal(0.0, 1.0),
+            &device,
+        );
+        let rope_key = Tensor::<CpuBackend, 2>::random(
+            [latent_dim, head_dim],
+            Distribution::Normal(0.0, 1.0),
+            &device,
+        );
+        let mla = MultiHeadLatentAttention::new(ratio, latent_dim, down_proj, up_proj, rope_key);
+
+        let input_bytes = kv_bytes(batch, num_heads, seq_len, head_dim);
+        let compressed_bytes = kv_bytes(batch, num_heads, seq_len, latent_dim);
+        report_compression(&format!("mla/ratio{}", ratio), input_bytes, compressed_bytes);
+
+        group.throughput(Throughput::Bytes(input_bytes));
+        let id = format!("compress_ratio{}", ratio);
+        group.bench_function(id, |b| {
+            b.iter(|| {
+                let (k_latent, v_latent) = mla.compress_kv(k.clone(), v.clone()).unwrap();
+                black_box(k_latent);
+                black_box(v_latent);
+            })
+        });
+
+        let (k_latent, v_latent) = mla.compress_kv(k.clone(), v.clone()).unwrap();
+        group.throughput(Throughput::Bytes(compressed_bytes));
+        let id = format!("decompress_ratio{}", ratio);
+        group.bench_function(id, |b| {
+            b.iter(|| {
+                let (k_full, v_full) =
+                    mla.decompress_kv(k_latent.clone(), v_latent.clone()).unwrap();
+                black_box(k_full);
+                black_box(v_full);
+            })
+        });
+    }
+
+    group.finish();
+}
+
+fn bench_sparse_attention(c: &mut Criterion) {
+    let mut group = c.benchmark_group("sparse");
+    configure_group(&mut group);
+
+    let device = CpuDevice::default();
+    let batch = 1usize;
+    let num_heads = 8usize;
+    let query_len = 128usize;
+    let kv_len = 4096usize;
+    let selected_counts = [256usize, 512, 1024, 2048];
+
+    let scores = Tensor::<CpuBackend, 4>::random(
+        [batch, num_heads, query_len, kv_len],
+        Distribution::Uniform(0.0, 1.0),
+        &device,
+    );
+
+    for &selected_kv_count in &selected_counts {
+        let config = SparseAttentionConfig {
+            selected_kv_count,
+            block_size: 128,
+            sparsity_pattern: SparsityPattern::Dynamic,
+        };
+        let sparse = SparseAttention::new(config);
+
+        let tokens = (batch * query_len) as u64;
+        group.throughput(Throughput::Elements(tokens));
+        let id = format!("select_kv{}", selected_kv_count);
+        group.bench_function(id, |b| {
+            b.iter(|| {
+                let selection = sparse.select_indices(scores.clone()).unwrap();
+                black_box(selection);
+            })
+        });
+
+        group.throughput(Throughput::Elements(tokens));
+        let id = format!("sparsify_kv{}", selected_kv_count);
+        group.bench_function(id, |b| {
+            b.iter(|| {
+                let (masked, selection) = sparse.sparsify_scores(scores.clone()).unwrap();
+                black_box(masked);
+                black_box(selection);
+            })
+        });
+    }
+
+    group.finish();
+}
+
+fn bench_kv_compression(c: &mut Criterion) {
+    let mut group = c.benchmark_group("kv_compression");
+    configure_group(&mut group);
+
+    let device = CpuDevice::default();
+    let batch = 1usize;
+    let num_heads = 8usize;
+    let seq_len = 1024usize;
+    let head_dim = 64usize;
+
+    let k = Tensor::<CpuBackend, 4>::random(
+        [batch, num_heads, seq_len, head_dim],
+        Distribution::Normal(0.0, 1.0),
+        &device,
+    );
+    let v = Tensor::<CpuBackend, 4>::random(
+        [batch, num_heads, seq_len, head_dim],
+        Distribution::Normal(0.0, 1.0),
+        &device,
+    );
+
+    let input_bytes = kv_bytes(batch, num_heads, seq_len, head_dim);
+
+    let low_rank = KVCacheCompressor::<CpuBackend>::new(CompressionMethod::LowRank { rank: 16 }, 8);
+    let low_rank_compressed_bytes = low_rank_bytes(batch, num_heads, seq_len, 16);
+    report_compression(
+        "kv/low_rank_rank16",
+        input_bytes,
+        low_rank_compressed_bytes,
+    );
+    group.throughput(Throughput::Bytes(input_bytes));
+    group.bench_function("low_rank_compress_rank16", |b| {
+        b.iter(|| {
+            let compressed = low_rank.compress_kv(k.clone(), v.clone()).unwrap();
+            black_box(compressed);
+        })
+    });
+    let low_rank_compressed = low_rank.compress_kv(k.clone(), v.clone()).unwrap();
+    group.throughput(Throughput::Bytes(low_rank_compressed_bytes));
+    group.bench_function("low_rank_decompress_rank16", |b| {
+        b.iter(|| {
+            let (k_full, v_full) = low_rank.decompress_kv(low_rank_compressed.clone()).unwrap();
+            black_box(k_full);
+            black_box(v_full);
+        })
+    });
+
+    let vq = KVCacheCompressor::<CpuBackend>::new(
+        CompressionMethod::VectorQuantization { codebook_size: 64 },
+        8,
+    );
+    let vq_compressed_bytes = vq_bytes(batch, num_heads, seq_len, head_dim, 64, 8);
+    report_compression("kv/vq_codebook64", input_bytes, vq_compressed_bytes);
+    group.throughput(Throughput::Bytes(input_bytes));
+    group.bench_function("vq_compress_cb64", |b| {
+        b.iter(|| {
+            let compressed = vq.compress_kv(k.clone(), v.clone()).unwrap();
+            black_box(compressed);
+        })
+    });
+    let vq_compressed = vq.compress_kv(k.clone(), v.clone()).unwrap();
+    group.throughput(Throughput::Bytes(vq_compressed_bytes));
+    group.bench_function("vq_decompress_cb64", |b| {
+        b.iter(|| {
+            let (k_full, v_full) = vq.decompress_kv(vq_compressed.clone()).unwrap();
+            black_box(k_full);
+            black_box(v_full);
+        })
+    });
+
+    let hybrid = KVCacheCompressor::<CpuBackend>::new(
+        CompressionMethod::Hybrid {
+            rank: 16,
+            quant_bits: 4,
+        },
+        8,
+    );
+    let hybrid_compressed_bytes = hybrid_bytes(batch, num_heads, seq_len, 16, 4);
+    report_compression(
+        "kv/hybrid_rank16_q4",
+        input_bytes,
+        hybrid_compressed_bytes,
+    );
+    group.throughput(Throughput::Bytes(input_bytes));
+    group.bench_function("hybrid_compress_rank16_q4", |b| {
+        b.iter(|| {
+            let compressed = hybrid.compress_kv(k.clone(), v.clone()).unwrap();
+            black_box(compressed);
+        })
+    });
+    let hybrid_compressed = hybrid.compress_kv(k.clone(), v.clone()).unwrap();
+    group.throughput(Throughput::Bytes(hybrid_compressed_bytes));
+    group.bench_function("hybrid_decompress_rank16_q4", |b| {
+        b.iter(|| {
+            let (k_full, v_full) = hybrid.decompress_kv(hybrid_compressed.clone()).unwrap();
+            black_box(k_full);
+            black_box(v_full);
+        })
+    });
+
+    group.finish();
+}
+
+fn bench_speculative_decoding(c: &mut Criterion) {
+    let mut group = c.benchmark_group("speculative");
+    configure_group(&mut group);
+
+    let device = CpuDevice::default();
+    let batch = 2usize;
+    let seq_len = 16usize;
+    let hidden_dim = 256usize;
+    let branch_factor = 4usize;
+    let cache_len = 16usize;
+    let depths = [2usize, 4, 8];
+
+    let hidden = Tensor::<CpuBackend, 3>::random(
+        [batch, seq_len, hidden_dim],
+        Distribution::Normal(0.0, 1.0),
+        &device,
+    );
+    let cache_tokens = Tensor::<CpuBackend, 2>::zeros([batch, cache_len], &device);
+
+    for &depth in &depths {
+        let prediction = PredictionConfig {
+            hidden_dim,
+            head_type: PredictionHeadType::Eagle { num_layers: 2 },
+        };
+        let tree = TreeConfig {
+            branch_factor,
+            depth,
+            verification: VerificationStrategy::Greedy,
+        };
+        let decoder = SpeculativeDecoder::<CpuBackend>::new(prediction, tree, 8);
+
+        let tokens = speculative_token_count(branch_factor, depth) * batch as u64;
+        group.throughput(Throughput::Elements(tokens));
+        let id = format!("speculate_depth{}", depth);
+        group.bench_function(id, |b| {
+            b.iter(|| {
+                let candidates = decoder.speculate(hidden.clone()).unwrap();
+                black_box(candidates);
+            })
+        });
+
+        let candidates = decoder.speculate(hidden.clone()).unwrap();
+        let target_logits = Tensor::<CpuBackend, 3>::random(
+            [batch, depth, hidden_dim],
+            Distribution::Normal(0.0, 1.0),
+            &device,
+        );
+        group.throughput(Throughput::Elements(tokens));
+        let id = format!("verify_depth{}", depth);
+        group.bench_function(id, |b| {
+            b.iter(|| {
+                let verification = decoder
+                    .verify(
+                        &candidates,
+                        target_logits.clone(),
+                        cache_tokens.clone(),
+                    )
+                    .unwrap();
+                black_box(verification);
+            })
+        });
+    }
+
+    group.finish();
+}
+
+fn bench_mamba(c: &mut Criterion) {
+    let mut group = c.benchmark_group("mamba");
+    configure_group(&mut group);
+
+    let device = CpuDevice::default();
+    let batch = 2usize;
+    let seq_len = 128usize;
+    let state_dims = [16usize, 64];
+
+    for &state_dim in &state_dims {
+        let input_dim = state_dim * 4;
+        let config = MambaConfig {
+            state_dim,
+            input_dim,
+            expand_ratio: 2,
+            selective: true,
+        };
+        let block = MambaBlock::<CpuBackend>::from_config(&config);
+
+        let expanded_dim = input_dim * config.expand_ratio;
+        let params = MambaParameters {
+            dt_proj: Tensor::<CpuBackend, 2>::random(
+                [expanded_dim, state_dim],
+                Distribution::Normal(0.0, 1.0),
+                &device,
+            ),
+            a: Tensor::<CpuBackend, 1>::random(
+                [state_dim],
+                Distribution::Normal(0.0, 1.0),
+                &device,
+            ),
+            b: Tensor::<CpuBackend, 2>::random(
+                [expanded_dim, state_dim],
+                Distribution::Normal(0.0, 1.0),
+                &device,
+            ),
+            c: Tensor::<CpuBackend, 2>::random(
+                [state_dim, expanded_dim],
+                Distribution::Normal(0.0, 1.0),
+                &device,
+            ),
+            d: Tensor::<CpuBackend, 1>::random(
+                [expanded_dim],
+                Distribution::Normal(0.0, 1.0),
+                &device,
+            ),
+        };
+
+        let input = Tensor::<CpuBackend, 3>::random(
+            [batch, seq_len, input_dim],
+            Distribution::Normal(0.0, 1.0),
+            &device,
+        );
+
+        let tokens = (batch * seq_len) as u64;
+        group.throughput(Throughput::Elements(tokens));
+        let id = format!("forward_state{}", state_dim);
+        group.bench_function(id, |b| {
+            b.iter(|| {
+                let (output, state) = block
+                    .forward(input.clone(), &params, None, config.selective)
+                    .unwrap();
+                black_box(output);
+                black_box(state);
+            })
+        });
+
+        let layer = HybridLayer::<CpuBackend>::new(
+            HybridStrategy::Parallel { mamba_weight: 0.35 },
+            0,
+        );
+        let attention = Tensor::<CpuBackend, 3>::random(
+            [batch, seq_len, input_dim],
+            Distribution::Normal(0.0, 1.0),
+            &device,
+        );
+        let mamba = Tensor::<CpuBackend, 3>::random(
+            [batch, seq_len, input_dim],
+            Distribution::Normal(0.0, 1.0),
+            &device,
+        );
+        group.throughput(Throughput::Elements(tokens));
+        let id = format!("blend_state{}", state_dim);
+        group.bench_function(id, |b| {
+            b.iter(|| {
+                let output = layer.combine(attention.clone(), mamba.clone()).unwrap();
+                black_box(output);
+            })
+        });
+    }
+
+    group.finish();
+}
+
+fn bench_e2e_pipeline(c: &mut Criterion) {
+    let mut group = c.benchmark_group("e2e");
+    configure_group(&mut group);
+
+    let device = CpuDevice::default();
+    let batch = 1usize;
+    let num_heads = 8usize;
+    let seq_len = 1024usize;
+    let head_dim = 64usize;
+    let tokens = (batch * seq_len) as u64;
+
+    let q = Tensor::<CpuBackend, 4>::random(
+        [batch, num_heads, seq_len, head_dim],
+        Distribution::Normal(0.0, 1.0),
+        &device,
+    );
+    let k = Tensor::<CpuBackend, 4>::random(
+        [batch, num_heads, seq_len, head_dim],
+        Distribution::Normal(0.0, 1.0),
+        &device,
+    );
+    let v = Tensor::<CpuBackend, 4>::random(
+        [batch, num_heads, seq_len, head_dim],
+        Distribution::Normal(0.0, 1.0),
+        &device,
+    );
+
+    let flash = HierarchicalFlashAttention::default_config();
+
+    let latent_dim = head_dim / 8;
+    let mla = MultiHeadLatentAttention::new(
+        8,
+        latent_dim,
+        Tensor::<CpuBackend, 2>::random(
+            [head_dim, latent_dim],
+            Distribution::Normal(0.0, 1.0),
+            &device,
+        ),
+        Tensor::<CpuBackend, 2>::random(
+            [latent_dim, head_dim],
+            Distribution::Normal(0.0, 1.0),
+            &device,
+        ),
+        Tensor::<CpuBackend, 2>::random(
+            [latent_dim, head_dim],
+            Distribution::Normal(0.0, 1.0),
+            &device,
+        ),
+    );
+    let sparse = SparseAttention::new(SparseAttentionConfig {
+        selected_kv_count: 512,
+        block_size: 128,
+        sparsity_pattern: SparsityPattern::Dynamic,
+    });
+
+    group.throughput(Throughput::Elements(tokens));
+    group.bench_function("flash_mla_sparse", |b| {
+        b.iter(|| {
+            let (k_latent, v_latent) = mla.compress_kv(k.clone(), v.clone()).unwrap();
+            let (k_full, v_full) = mla.decompress_kv(k_latent, v_latent).unwrap();
+            let k_for_scores = k_full.clone();
+            let output = flash.forward(q.clone(), k_full, v_full, false, 0);
+            let scores = q.clone().matmul(k_for_scores.transpose());
+            let (masked, selection) = sparse.sparsify_scores(scores).unwrap();
+            black_box(output);
+            black_box(masked);
+            black_box(selection);
+        })
+    });
+
+    let compressor = KVCacheCompressor::<CpuBackend>::new(
+        CompressionMethod::Hybrid {
+            rank: 16,
+            quant_bits: 4,
+        },
+        8,
+    );
+    group.throughput(Throughput::Elements(tokens));
+    group.bench_function("flash_kv_compression", |b| {
+        b.iter(|| {
+            let compressed = compressor.compress_kv(k.clone(), v.clone()).unwrap();
+            let (k_full, v_full) = compressor.decompress_kv(compressed).unwrap();
+            let output = flash.forward(q.clone(), k_full, v_full, false, 0);
+            black_box(output);
+        })
+    });
+
+    group.finish();
+}
+
+/// Benchmark comparing standard vs optimized forward pass
+fn bench_flash_attention_optimized(c: &mut Criterion) {
+    let mut group = c.benchmark_group("attention_optimization");
+    configure_group(&mut group);
+
+    let device = CpuDevice::default();
+    let num_heads = 8;
+    let head_dim = 64;
+
+    // Test different sequence lengths
+    let seq_lens = [256usize, 512, 1024, 2048];
+    let batch = 1usize;
+
+    for &seq_len in &seq_lens {
+        let attention = HierarchicalFlashAttention::new(FlashAttentionConfig {
+            block_q: 64,
+            block_kv: 16,
+            use_log_space: false,
+            ..Default::default()
+        });
+
+        let q = Tensor::<CpuBackend, 4>::random(
+            [batch, num_heads, seq_len, head_dim],
+            Distribution::Normal(0.0, 1.0),
+            &device,
+        );
+        let k = Tensor::<CpuBackend, 4>::random(
+            [batch, num_heads, seq_len, head_dim],
+            Distribution::Normal(0.0, 1.0),
+            &device,
+        );
+        let v = Tensor::<CpuBackend, 4>::random(
+            [batch, num_heads, seq_len, head_dim],
+            Distribution::Normal(0.0, 1.0),
+            &device,
+        );
+
+        let tokens = (batch * seq_len) as u64;
+        group.throughput(Throughput::Elements(tokens));
+
+        // Benchmark standard forward (uses cached masks internally)
+        let id = format!("standard_seq{}", seq_len);
+        group.bench_function(&id, |b| {
+            b.iter(|| {
+                let output = attention.forward(q.clone(), k.clone(), v.clone(), true, 0);
+                black_box(output);
+            })
+        });
+
+        // Benchmark optimized forward with workspace
+        let mut workspace = AttentionWorkspace::new();
+        let id = format!("workspace_seq{}", seq_len);
+        group.bench_function(&id, |b| {
+            b.iter(|| {
+                let output = attention.forward_with_workspace(
+                    q.clone(), k.clone(), v.clone(), true, 0, &mut workspace
+                );
+                black_box(output);
+            })
+        });
+    }
+
+    // Test mask cache effectiveness with repeated calls
+    let seq_len = 512usize;
+    let attention = HierarchicalFlashAttention::new(FlashAttentionConfig {
+        block_q: 64,
+        block_kv: 16,
+        use_log_space: false,
+        ..Default::default()
+    });
+
+    let q = Tensor::<CpuBackend, 4>::random(
+        [batch, num_heads, seq_len, head_dim],
+        Distribution::Normal(0.0, 1.0),
+        &device,
+    );
+    let k = Tensor::<CpuBackend, 4>::random(
+        [batch, num_heads, seq_len, head_dim],
+        Distribution::Normal(0.0, 1.0),
+        &device,
+    );
+    let v = Tensor::<CpuBackend, 4>::random(
+        [batch, num_heads, seq_len, head_dim],
+        Distribution::Normal(0.0, 1.0),
+        &device,
+    );
+
+    // Clear mask cache before cold run
+    HierarchicalFlashAttention::clear_mask_cache();
+
+    group.throughput(Throughput::Elements((batch * seq_len) as u64));
+    group.bench_function("mask_cache_cold", |b| {
+        b.iter(|| {
+            HierarchicalFlashAttention::clear_mask_cache();
+            let output = attention.forward(q.clone(), k.clone(), v.clone(), true, 0);
+            black_box(output);
+        })
+    });
+
+    // Warm cache (don't clear between iterations)
+    group.bench_function("mask_cache_warm", |b| {
+        b.iter(|| {
+            let output = attention.forward(q.clone(), k.clone(), v.clone(), true, 0);
+            black_box(output);
+        })
+    });
+
+    group.finish();
+}
+
+criterion_group!(
+    benches,
+    bench_flash_attention_optimized,
+    bench_flash_attention_baseline,
+    bench_flash_attention_v3,
+    bench_flash_attention_cuda_kernel,
+    bench_mla_compression,
+    bench_sparse_attention,
+    bench_kv_compression,
+    bench_speculative_decoding,
+    bench_mamba,
+    bench_e2e_pipeline
+);
 criterion_main!(benches);

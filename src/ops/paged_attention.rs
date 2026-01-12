@@ -8,6 +8,7 @@ use crate::ops::flash_attention::{FlashAttentionConfig, HierarchicalFlashAttenti
 pub const BLOCK_SIZE: usize = 16;
 
 /// Physical KV block that stores a fixed number of tokens.
+#[derive(Debug, Clone)]
 pub struct KVBlock<B: Backend> {
     /// Keys: [num_heads, BLOCK_SIZE, head_dim].
     pub keys: Tensor<B, 3>,
@@ -36,6 +37,7 @@ impl<B: Backend> KVBlock<B> {
 }
 
 /// Manages allocation and reuse of physical blocks.
+#[derive(Debug, Clone)]
 pub struct BlockManager<B: Backend> {
     free_blocks: Vec<usize>,
     blocks: Vec<Option<KVBlock<B>>>,
@@ -104,6 +106,7 @@ impl<B: Backend> BlockManager<B> {
 }
 
 /// Block table mapping logical blocks to physical blocks.
+#[derive(Debug, Clone)]
 pub struct BlockTable {
     /// block_table[logical_block_idx] = physical_block_id.
     block_table: Vec<usize>,
@@ -209,6 +212,7 @@ impl<'a, B: Backend> Iterator for KVBlockIterator<'a, B> {
 }
 
 /// Paged KV cache with dynamic block allocation.
+#[derive(Debug, Clone)]
 pub struct PagedKVCache<B: Backend> {
     block_manager: BlockManager<B>,
     page_tables: Vec<HashMap<usize, BlockTable>>,

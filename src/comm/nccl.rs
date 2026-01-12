@@ -1,100 +1,168 @@
-//! NCCL communication for high-performance GPU ring attention.
+//! NCCL communicator for high-performance multi-GPU communication.
 //!
-//! This module is only available when the `nccl` feature is enabled.
+//! Uses NVIDIA NCCL for efficient GPU-to-GPU data transfer.
 
-use super::traits::{CommError, CommResult, Communicator, TensorMessage};
+use std::sync::Arc;
 
-/// NCCL communicator configuration.
-#[derive(Clone, Debug)]
-pub struct NcclCommConfig {
-    /// Rank of this process.
-    pub rank: usize,
-    /// Total number of processes.
-    pub world_size: usize,
-    /// NCCL unique ID (shared across all ranks for initialization).
-    pub nccl_id: Option<Vec<u8>>,
-}
+use burn::tensor::TensorData;
+use cudarc::driver::{CudaDevice, CudaSlice};
+use cudarc::nccl::{group_end, group_start, Comm, Id, ReduceOp};
 
-impl NcclCommConfig {
-    pub fn new(rank: usize, world_size: usize) -> Self {
-        Self {
-            rank,
-            world_size,
-            nccl_id: None,
-        }
-    }
+use super::{CommError, CommResult, Communicator};
 
-    pub fn with_nccl_id(mut self, id: Vec<u8>) -> Self {
-        self.nccl_id = Some(id);
-        self
-    }
-}
-
-/// NCCL communicator for GPU-to-GPU ring communication.
-///
-/// Uses NVIDIA NCCL library for high-performance collective communication.
+/// NCCL Communicator for multi-GPU ring communication.
 pub struct NcclComm {
-    rank: usize,
+    /// NCCL communicator handle.
+    comm: Comm,
+    /// CUDA device.
+    device: Arc<CudaDevice>,
+    /// World size.
     world_size: usize,
-    // The actual NCCL comm handle would be stored here
-    // For now we use cudarc's NCCL bindings
-    #[cfg(feature = "nccl")]
-    _comm: cudarc::nccl::Comm,
+    /// Current rank.
+    rank: usize,
 }
+
+// SAFETY: NCCL library is designed to be thread-safe.
+// The Comm handle can be safely used across threads.
+unsafe impl Send for NcclComm {}
+unsafe impl Sync for NcclComm {}
 
 impl NcclComm {
     /// Create a new NCCL communicator.
     ///
-    /// # Arguments
-    /// * `config` - NCCL configuration including rank and world size
-    ///
-    /// # Returns
-    /// A new NCCL communicator or an error if initialization fails.
-    #[cfg(feature = "nccl")]
-    pub fn new(config: NcclCommConfig) -> CommResult<Self> {
-        use cudarc::driver::CudaDevice;
-        use cudarc::nccl::{Comm, Id};
+    /// For single-node multi-GPU, one process creates the ID and shares it.
+    /// For multi-node, the ID must be broadcast from rank 0 to all nodes.
+    pub fn new(id: Id, world_size: usize, rank: usize, device_id: usize) -> CommResult<Self> {
+        if world_size == 0 {
+            return Err(CommError::InvalidConfig(
+                "world_size must be > 0".to_string(),
+            ));
+        }
+        if rank >= world_size {
+            return Err(CommError::InvalidConfig(format!(
+                "rank {} >= world_size {}",
+                rank, world_size
+            )));
+        }
+        if world_size > i32::MAX as usize {
+            return Err(CommError::InvalidConfig(
+                "world_size exceeds NCCL limits".to_string(),
+            ));
+        }
 
-        let device = CudaDevice::new(config.rank).map_err(|e| {
-            CommError::ConnectionFailed(format!("Failed to create CUDA device: {}", e))
-        })?;
+        let device = CudaDevice::new(device_id)
+            .map_err(|e| CommError::ConnectionFailed(format!("CUDA device {}: {}", device_id, e)))?;
 
-        // Create or use provided NCCL ID
-        let nccl_id = if let Some(id_bytes) = config.nccl_id {
-            // Reconstruct ID from bytes (implementation depends on cudarc version)
-            Id::new().map_err(|e| {
-                CommError::ConnectionFailed(format!("Failed to create NCCL ID: {}", e))
-            })?
-        } else {
-            Id::new().map_err(|e| {
-                CommError::ConnectionFailed(format!("Failed to create NCCL ID: {}", e))
-            })?
-        };
-
-        let comm = Comm::from_rank(device, config.rank, config.world_size, nccl_id).map_err(|e| {
-            CommError::ConnectionFailed(format!("Failed to create NCCL communicator: {}", e))
-        })?;
+        let comm = Comm::from_rank(device.clone(), rank, world_size, id)
+            .map_err(|e| CommError::ConnectionFailed(format!("NCCL init: {:?}", e)))?;
 
         Ok(Self {
-            rank: config.rank,
-            world_size: config.world_size,
-            _comm: comm,
+            comm,
+            device,
+            world_size,
+            rank,
         })
     }
 
-    /// Create a new NCCL communicator (stub when feature is disabled).
-    #[cfg(not(feature = "nccl"))]
-    pub fn new(_config: NcclCommConfig) -> CommResult<Self> {
-        Err(CommError::InvalidConfig(
-            "NCCL feature is not enabled. Compile with --features nccl".to_string(),
-        ))
+    /// Create a unique NCCL ID (call on rank 0, then broadcast to others).
+    pub fn create_id() -> CommResult<Id> {
+        Id::new().map_err(|e| CommError::ConnectionFailed(format!("Create NCCL ID: {:?}", e)))
+    }
+
+    /// Get the underlying CUDA device.
+    pub fn device(&self) -> &Arc<CudaDevice> {
+        &self.device
+    }
+
+    fn peer_rank(&self, rank: usize) -> CommResult<i32> {
+        i32::try_from(rank).map_err(|_| {
+            CommError::InvalidConfig(format!("rank {} exceeds NCCL limits", rank))
+        })
+    }
+
+    /// Send f32 data to next rank using NCCL.
+    fn nccl_send(&self, data: &[f32]) -> CommResult<()> {
+        let next_rank = (self.rank + 1) % self.world_size;
+        let next_rank = self.peer_rank(next_rank)?;
+
+        let gpu_data = self
+            .device
+            .htod_sync_copy(data)
+            .map_err(|e| CommError::SendFailed(format!("H2D copy: {}", e)))?;
+
+        self.comm
+            .send(&gpu_data, next_rank)
+            .map_err(|e| CommError::SendFailed(format!("NCCL send: {:?}", e)))?;
+
+        Ok(())
+    }
+
+    /// Receive f32 data from previous rank using NCCL.
+    fn nccl_recv(&self, len: usize) -> CommResult<Vec<f32>> {
+        let prev_rank = (self.rank + self.world_size - 1) % self.world_size;
+        let prev_rank = self.peer_rank(prev_rank)?;
+
+        let mut gpu_buf: CudaSlice<f32> = self
+            .device
+            .alloc_zeros(len)
+            .map_err(|e| CommError::RecvFailed(format!("Alloc: {}", e)))?;
+
+        self.comm
+            .recv(&mut gpu_buf, prev_rank)
+            .map_err(|e| CommError::RecvFailed(format!("NCCL recv: {:?}", e)))?;
+
+        let data = self
+            .device
+            .dtoh_sync_copy(&gpu_buf)
+            .map_err(|e| CommError::RecvFailed(format!("D2H copy: {}", e)))?;
+
+        Ok(data)
+    }
+
+    /// Fused send and receive for ring pattern (more efficient).
+    fn nccl_send_recv(&self, send_data: &[f32]) -> CommResult<Vec<f32>> {
+        let next_rank = (self.rank + 1) % self.world_size;
+        let prev_rank = (self.rank + self.world_size - 1) % self.world_size;
+        let next_rank = self.peer_rank(next_rank)?;
+        let prev_rank = self.peer_rank(prev_rank)?;
+        let len = send_data.len();
+
+        let gpu_send = self
+            .device
+            .htod_sync_copy(send_data)
+            .map_err(|e| CommError::SendFailed(format!("H2D copy: {}", e)))?;
+
+        let mut gpu_recv: CudaSlice<f32> = self
+            .device
+            .alloc_zeros(len)
+            .map_err(|e| CommError::RecvFailed(format!("Alloc: {}", e)))?;
+
+        group_start().map_err(|e| CommError::SendFailed(format!("Group start: {:?}", e)))?;
+
+        self.comm
+            .send(&gpu_send, next_rank)
+            .map_err(|e| CommError::SendFailed(format!("NCCL send: {:?}", e)))?;
+
+        self.comm
+            .recv(&mut gpu_recv, prev_rank)
+            .map_err(|e| CommError::RecvFailed(format!("NCCL recv: {:?}", e)))?;
+
+        group_end().map_err(|e| CommError::SendFailed(format!("Group end: {:?}", e)))?;
+
+        self.device
+            .synchronize()
+            .map_err(|e| CommError::RecvFailed(format!("Sync: {}", e)))?;
+
+        let data = self
+            .device
+            .dtoh_sync_copy(&gpu_recv)
+            .map_err(|e| CommError::RecvFailed(format!("D2H copy: {}", e)))?;
+
+        Ok(data)
     }
 }
 
-#[cfg(feature = "nccl")]
 impl Communicator for NcclComm {
-    type Data = TensorMessage;
-
     fn rank(&self) -> usize {
         self.rank
     }
@@ -103,62 +171,52 @@ impl Communicator for NcclComm {
         self.world_size
     }
 
-    fn send(&self, _data: &Self::Data) -> CommResult<()> {
-        // NCCL send implementation would use ncclSend
-        // For ring attention, we typically use send_recv for efficiency
-        todo!("NCCL send not yet implemented - use send_recv for ring patterns")
+    fn send(&self, data: &TensorData) -> CommResult<()> {
+        let floats: Vec<f32> = data
+            .to_vec::<f32>()
+            .map_err(|e| CommError::Serialization(format!("{:?}", e)))?;
+        self.nccl_send(&floats)
     }
 
-    fn recv(&self) -> CommResult<Self::Data> {
-        // NCCL recv implementation would use ncclRecv
-        todo!("NCCL recv not yet implemented - use send_recv for ring patterns")
+    fn recv(&self) -> CommResult<TensorData> {
+        Err(CommError::RecvFailed(
+            "Use recv_with_size for NCCL".into(),
+        ))
     }
 
-    fn send_recv(&self, _send_data: &Self::Data) -> CommResult<Self::Data> {
-        // This would use ncclGroupStart/ncclSend/ncclRecv/ncclGroupEnd
-        // for true simultaneous send/recv
+    fn send_recv(&self, data: &TensorData) -> CommResult<TensorData> {
+        let floats: Vec<f32> = data
+            .to_vec::<f32>()
+            .map_err(|e| CommError::Serialization(format!("{:?}", e)))?;
+        let shape = data.shape.clone();
 
-        // Placeholder - actual implementation requires:
-        // 1. Allocate GPU buffer for send/recv
-        // 2. Copy data to GPU
-        // 3. ncclGroupStart()
-        // 4. ncclSend to next rank
-        // 5. ncclRecv from prev rank
-        // 6. ncclGroupEnd()
-        // 7. Synchronize and copy back
+        let recv_floats = self.nccl_send_recv(&floats)?;
 
-        todo!("NCCL send_recv implementation pending")
+        Ok(TensorData::new(recv_floats, shape))
     }
 
     fn barrier(&self) -> CommResult<()> {
-        // NCCL doesn't have an explicit barrier, but we can use allreduce
-        // with a dummy value to synchronize
-        todo!("NCCL barrier implementation pending")
-    }
-}
+        if self.world_size <= 1 {
+            return Ok(());
+        }
 
-/// Placeholder trait implementation when NCCL is not available.
-#[cfg(not(feature = "nccl"))]
-impl Communicator for NcclComm {
-    type Data = TensorMessage;
+        let send_buf: CudaSlice<f32> = self
+            .device
+            .alloc_zeros(1)
+            .map_err(|e| CommError::ConnectionFailed(format!("Alloc: {}", e)))?;
+        let mut recv_buf: CudaSlice<f32> = self
+            .device
+            .alloc_zeros(1)
+            .map_err(|e| CommError::ConnectionFailed(format!("Alloc: {}", e)))?;
 
-    fn rank(&self) -> usize {
-        0
-    }
+        self.comm
+            .all_reduce(&send_buf, &mut recv_buf, &ReduceOp::Sum)
+            .map_err(|e| CommError::ConnectionFailed(format!("Barrier: {:?}", e)))?;
 
-    fn world_size(&self) -> usize {
-        1
-    }
+        self.device
+            .synchronize()
+            .map_err(|e| CommError::ConnectionFailed(format!("Sync: {}", e)))?;
 
-    fn send(&self, _data: &Self::Data) -> CommResult<()> {
-        Err(CommError::InvalidConfig("NCCL not enabled".to_string()))
-    }
-
-    fn recv(&self) -> CommResult<Self::Data> {
-        Err(CommError::InvalidConfig("NCCL not enabled".to_string()))
-    }
-
-    fn barrier(&self) -> CommResult<()> {
-        Err(CommError::InvalidConfig("NCCL not enabled".to_string()))
+        Ok(())
     }
 }

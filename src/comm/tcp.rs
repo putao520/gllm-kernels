@@ -1,63 +1,51 @@
-//! TCP communication for multi-node distributed ring attention.
+//! TCP communication for multi-node ring attention.
 
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
-use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::sync::Mutex;
 
-use super::traits::{CommError, CommResult, Communicator, TensorMessage};
+use burn::tensor::quantization::{QuantizationScheme, QuantizationType};
+use burn::tensor::{DType, TensorData};
 
-/// TCP communicator configuration.
-#[derive(Clone, Debug)]
-pub struct TcpCommConfig {
-    /// List of all node addresses in the ring (host:port).
-    pub addresses: Vec<String>,
-    /// Rank of this node.
-    pub rank: usize,
-    /// Connection timeout in milliseconds.
-    pub timeout_ms: u64,
-}
+use super::traits::{CommError, CommResult, Communicator};
 
-impl TcpCommConfig {
-    pub fn new(addresses: Vec<String>, rank: usize) -> Self {
-        Self {
-            addresses,
-            rank,
-            timeout_ms: 30000,
-        }
-    }
+const DTYPE_F64: u8 = 1;
+const DTYPE_F32: u8 = 2;
+const DTYPE_F16: u8 = 3;
+const DTYPE_BF16: u8 = 4;
+const DTYPE_I64: u8 = 5;
+const DTYPE_I32: u8 = 6;
+const DTYPE_I16: u8 = 7;
+const DTYPE_I8: u8 = 8;
+const DTYPE_U64: u8 = 9;
+const DTYPE_U32: u8 = 10;
+const DTYPE_U16: u8 = 11;
+const DTYPE_U8: u8 = 12;
+const DTYPE_BOOL: u8 = 13;
+const DTYPE_QFLOAT: u8 = 14;
 
-    pub fn with_timeout(mut self, timeout_ms: u64) -> Self {
-        self.timeout_ms = timeout_ms;
-        self
-    }
-}
+const QSCHEME_PER_TENSOR_AFFINE: u8 = 1;
+const QSCHEME_PER_TENSOR_SYMMETRIC: u8 = 2;
+const QTYPE_QINT8: u8 = 1;
 
 /// TCP communicator for multi-node ring communication.
 pub struct TcpComm {
     rank: usize,
     world_size: usize,
-    /// Connection to send to next rank.
-    send_conn: Arc<Mutex<TcpStream>>,
-    /// Connection to receive from previous rank.
-    recv_conn: Arc<Mutex<TcpStream>>,
-    /// Listener for barrier synchronization.
-    barrier_listener: Arc<Mutex<TcpListener>>,
-    /// Addresses of all nodes.
-    addresses: Vec<String>,
+    send_stream: Mutex<TcpStream>,
+    recv_stream: Mutex<TcpStream>,
 }
 
 impl TcpComm {
-    /// Create a new TCP communicator.
-    ///
-    /// This will:
-    /// 1. Listen for incoming connection from previous rank
-    /// 2. Connect to next rank
-    /// 3. Set up barrier coordination
-    pub fn new(config: TcpCommConfig) -> CommResult<Self> {
-        let world_size = config.addresses.len();
-        let rank = config.rank;
+    /// Connect to peers in a ring topology.
+    pub fn connect(addresses: Vec<String>, rank: usize) -> CommResult<Self> {
+        if addresses.is_empty() {
+            return Err(CommError::InvalidConfig(
+                "addresses must not be empty".to_string(),
+            ));
+        }
 
+        let world_size = addresses.len();
         if rank >= world_size {
             return Err(CommError::InvalidConfig(format!(
                 "rank {} >= world_size {}",
@@ -65,146 +53,33 @@ impl TcpComm {
             )));
         }
 
-        let timeout = Duration::from_millis(config.timeout_ms);
-
-        // Parse our own address to get the port for listening
-        let my_addr = &config.addresses[rank];
-
-        // Listen for connection from previous rank
-        let listener = TcpListener::bind(my_addr).map_err(|e| {
-            CommError::ConnectionFailed(format!("Failed to bind to {}: {}", my_addr, e))
+        let bind_addr = &addresses[rank];
+        let listener = TcpListener::bind(bind_addr).map_err(|e| {
+            CommError::ConnectionFailed(format!("Failed to bind {}: {}", bind_addr, e))
         })?;
 
-        listener.set_nonblocking(false).ok();
-
-        // Connect to next rank
         let next_rank = (rank + 1) % world_size;
-        let next_addr = &config.addresses[next_rank];
-
-        // Retry connection with backoff
-        let send_conn = Self::connect_with_retry(next_addr, timeout)?;
-
-        // Accept connection from previous rank
-        let (recv_conn, _) = listener.accept().map_err(|e| {
-            CommError::ConnectionFailed(format!("Failed to accept connection: {}", e))
+        let next_addr = &addresses[next_rank];
+        let send_stream = TcpStream::connect(next_addr).map_err(|e| {
+            CommError::ConnectionFailed(format!("Failed to connect to {}: {}", next_addr, e))
         })?;
+        let _ = send_stream.set_nodelay(true);
 
-        // Create barrier listener on a different port
-        let barrier_port: u16 = my_addr
-            .split(':')
-            .last()
-            .and_then(|p| p.parse().ok())
-            .unwrap_or(9000)
-            + 1000;
-        let barrier_addr = format!(
-            "{}:{}",
-            my_addr.split(':').next().unwrap_or("0.0.0.0"),
-            barrier_port
-        );
-        let barrier_listener = TcpListener::bind(&barrier_addr).map_err(|e| {
-            CommError::ConnectionFailed(format!("Failed to bind barrier listener: {}", e))
+        let (recv_stream, _) = listener.accept().map_err(|e| {
+            CommError::ConnectionFailed(format!("Failed to accept on {}: {}", bind_addr, e))
         })?;
+        let _ = recv_stream.set_nodelay(true);
 
         Ok(Self {
             rank,
             world_size,
-            send_conn: Arc::new(Mutex::new(send_conn)),
-            recv_conn: Arc::new(Mutex::new(recv_conn)),
-            barrier_listener: Arc::new(Mutex::new(barrier_listener)),
-            addresses: config.addresses,
+            send_stream: Mutex::new(send_stream),
+            recv_stream: Mutex::new(recv_stream),
         })
-    }
-
-    fn connect_with_retry(addr: &str, timeout: Duration) -> CommResult<TcpStream> {
-        let start = std::time::Instant::now();
-        let mut last_error = None;
-
-        while start.elapsed() < timeout {
-            match TcpStream::connect(addr) {
-                Ok(stream) => {
-                    stream.set_nodelay(true).ok();
-                    return Ok(stream);
-                }
-                Err(e) => {
-                    last_error = Some(e);
-                    std::thread::sleep(Duration::from_millis(100));
-                }
-            }
-        }
-
-        Err(CommError::ConnectionFailed(format!(
-            "Failed to connect to {}: {:?}",
-            addr, last_error
-        )))
-    }
-
-    fn serialize_message(msg: &TensorMessage) -> Vec<u8> {
-        let mut buf = Vec::new();
-
-        // Write shape length and shape
-        let shape_len = msg.shape.len() as u32;
-        buf.extend_from_slice(&shape_len.to_le_bytes());
-        for &dim in &msg.shape {
-            buf.extend_from_slice(&(dim as u64).to_le_bytes());
-        }
-
-        // Write data length and data
-        let data_len = msg.data.len() as u64;
-        buf.extend_from_slice(&data_len.to_le_bytes());
-        for &val in &msg.data {
-            buf.extend_from_slice(&val.to_le_bytes());
-        }
-
-        buf
-    }
-
-    fn deserialize_message(buf: &[u8]) -> CommResult<TensorMessage> {
-        let mut pos = 0;
-
-        if buf.len() < 4 {
-            return Err(CommError::SerdeError("Buffer too small".to_string()));
-        }
-
-        // Read shape
-        let shape_len = u32::from_le_bytes(buf[pos..pos + 4].try_into().unwrap()) as usize;
-        pos += 4;
-
-        let mut shape = Vec::with_capacity(shape_len);
-        for _ in 0..shape_len {
-            if pos + 8 > buf.len() {
-                return Err(CommError::SerdeError("Buffer too small for shape".to_string()));
-            }
-            let dim = u64::from_le_bytes(buf[pos..pos + 8].try_into().unwrap()) as usize;
-            shape.push(dim);
-            pos += 8;
-        }
-
-        // Read data
-        if pos + 8 > buf.len() {
-            return Err(CommError::SerdeError(
-                "Buffer too small for data length".to_string(),
-            ));
-        }
-        let data_len = u64::from_le_bytes(buf[pos..pos + 8].try_into().unwrap()) as usize;
-        pos += 8;
-
-        let mut data = Vec::with_capacity(data_len);
-        for _ in 0..data_len {
-            if pos + 4 > buf.len() {
-                return Err(CommError::SerdeError("Buffer too small for data".to_string()));
-            }
-            let val = f32::from_le_bytes(buf[pos..pos + 4].try_into().unwrap());
-            data.push(val);
-            pos += 4;
-        }
-
-        Ok(TensorMessage::new(data, shape))
     }
 }
 
 impl Communicator for TcpComm {
-    type Data = TensorMessage;
-
     fn rank(&self) -> usize {
         self.rank
     }
@@ -213,107 +88,230 @@ impl Communicator for TcpComm {
         self.world_size
     }
 
-    fn send(&self, data: &Self::Data) -> CommResult<()> {
-        let buf = Self::serialize_message(data);
-        let len = buf.len() as u64;
+    fn send(&self, data: &TensorData) -> CommResult<()> {
+        let payload = serialize_tensor_data(data)?;
+        let len = payload.len() as u64;
 
-        let mut conn = self.send_conn.lock().map_err(|_| {
+        let mut stream = self.send_stream.lock().map_err(|_| {
             CommError::SendFailed("Failed to acquire send lock".to_string())
         })?;
 
-        // Send length prefix
-        conn.write_all(&len.to_le_bytes())
+        stream
+            .write_all(&len.to_le_bytes())
             .map_err(|e| CommError::SendFailed(format!("Failed to send length: {}", e)))?;
-
-        // Send data
-        conn.write_all(&buf)
-            .map_err(|e| CommError::SendFailed(format!("Failed to send data: {}", e)))?;
-
-        conn.flush()
+        stream
+            .write_all(&payload)
+            .map_err(|e| CommError::SendFailed(format!("Failed to send payload: {}", e)))?;
+        stream
+            .flush()
             .map_err(|e| CommError::SendFailed(format!("Failed to flush: {}", e)))?;
 
         Ok(())
     }
 
-    fn recv(&self) -> CommResult<Self::Data> {
-        let mut conn = self.recv_conn.lock().map_err(|_| {
+    fn recv(&self) -> CommResult<TensorData> {
+        let mut stream = self.recv_stream.lock().map_err(|_| {
             CommError::RecvFailed("Failed to acquire recv lock".to_string())
         })?;
 
-        // Read length prefix
         let mut len_buf = [0u8; 8];
-        conn.read_exact(&mut len_buf)
+        stream
+            .read_exact(&mut len_buf)
             .map_err(|e| CommError::RecvFailed(format!("Failed to read length: {}", e)))?;
         let len = u64::from_le_bytes(len_buf) as usize;
 
-        // Read data
         let mut buf = vec![0u8; len];
-        conn.read_exact(&mut buf)
-            .map_err(|e| CommError::RecvFailed(format!("Failed to read data: {}", e)))?;
+        stream
+            .read_exact(&mut buf)
+            .map_err(|e| CommError::RecvFailed(format!("Failed to read payload: {}", e)))?;
 
-        Self::deserialize_message(&buf)
+        deserialize_tensor_data(&buf)
     }
 
     fn barrier(&self) -> CommResult<()> {
-        // Simple barrier: each rank notifies all others and waits
-        // This is not the most efficient but works for correctness
-
-        let barrier_port_offset = 1000u16;
-
-        // Send barrier signal to all other ranks
-        for i in 0..self.world_size {
-            if i != self.rank {
-                let base_addr = &self.addresses[i];
-                let port: u16 = base_addr
-                    .split(':')
-                    .last()
-                    .and_then(|p| p.parse().ok())
-                    .unwrap_or(9000)
-                    + barrier_port_offset;
-                let addr = format!(
-                    "{}:{}",
-                    base_addr.split(':').next().unwrap_or("127.0.0.1"),
-                    port
-                );
-
-                if let Ok(mut stream) = TcpStream::connect(&addr) {
-                    let _ = stream.write_all(&[1u8]);
-                }
-            }
+        if self.world_size <= 1 {
+            return Ok(());
         }
 
-        // Wait for signals from all other ranks
-        let listener = self.barrier_listener.lock().map_err(|_| {
-            CommError::RecvFailed("Failed to acquire barrier lock".to_string())
-        })?;
+        let token = TensorData::new(Vec::<u8>::new(), [0]);
 
-        for _ in 0..(self.world_size - 1) {
-            let (mut stream, _) = listener
-                .accept()
-                .map_err(|e| CommError::RecvFailed(format!("Barrier accept failed: {}", e)))?;
-            let mut buf = [0u8; 1];
-            let _ = stream.read_exact(&mut buf);
+        if self.rank == 0 {
+            self.send(&token)?;
+            let _ = self.recv()?;
+            self.send(&token)?;
+            let _ = self.recv()?;
+        } else {
+            let _ = self.recv()?;
+            self.send(&token)?;
+            let _ = self.recv()?;
+            self.send(&token)?;
         }
 
         Ok(())
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use std::thread;
+fn serialize_tensor_data(data: &TensorData) -> CommResult<Vec<u8>> {
+    let mut buf = Vec::new();
+    encode_dtype(&mut buf, data.dtype)?;
 
-    #[test]
-    fn test_tcp_serialization() {
-        let msg = TensorMessage::new(vec![1.0, 2.0, 3.0, 4.0], vec![2, 2]);
-        let buf = TcpComm::serialize_message(&msg);
-        let decoded = TcpComm::deserialize_message(&buf).unwrap();
-
-        assert_eq!(decoded.shape, msg.shape);
-        assert_eq!(decoded.data, msg.data);
+    write_u32(&mut buf, data.shape.len() as u32);
+    for dim in &data.shape {
+        write_u64(&mut buf, *dim as u64);
     }
 
-    // Note: Full TCP ring tests require multiple processes or careful port management
-    // and are better suited for integration tests
+    let bytes = data.as_bytes();
+    write_u64(&mut buf, bytes.len() as u64);
+    buf.extend_from_slice(bytes);
+
+    Ok(buf)
+}
+
+fn deserialize_tensor_data(buf: &[u8]) -> CommResult<TensorData> {
+    let mut pos = 0usize;
+    let dtype = decode_dtype(buf, &mut pos)?;
+
+    let shape_len = read_u32(buf, &mut pos)? as usize;
+    let mut shape = Vec::with_capacity(shape_len);
+    for _ in 0..shape_len {
+        shape.push(read_u64(buf, &mut pos)? as usize);
+    }
+
+    let bytes_len = read_u64(buf, &mut pos)? as usize;
+    let bytes = read_slice(buf, &mut pos, bytes_len)?.to_vec();
+
+    Ok(TensorData::from_bytes(bytes, shape, dtype))
+}
+
+fn encode_dtype(buf: &mut Vec<u8>, dtype: DType) -> CommResult<()> {
+    match dtype {
+        DType::F64 => buf.push(DTYPE_F64),
+        DType::F32 => buf.push(DTYPE_F32),
+        DType::F16 => buf.push(DTYPE_F16),
+        DType::BF16 => buf.push(DTYPE_BF16),
+        DType::I64 => buf.push(DTYPE_I64),
+        DType::I32 => buf.push(DTYPE_I32),
+        DType::I16 => buf.push(DTYPE_I16),
+        DType::I8 => buf.push(DTYPE_I8),
+        DType::U64 => buf.push(DTYPE_U64),
+        DType::U32 => buf.push(DTYPE_U32),
+        DType::U16 => buf.push(DTYPE_U16),
+        DType::U8 => buf.push(DTYPE_U8),
+        DType::Bool => buf.push(DTYPE_BOOL),
+        DType::QFloat(scheme) => {
+            buf.push(DTYPE_QFLOAT);
+            encode_qscheme(buf, scheme)?;
+        }
+    }
+
+    Ok(())
+}
+
+fn decode_dtype(buf: &[u8], pos: &mut usize) -> CommResult<DType> {
+    let tag = read_u8(buf, pos)?;
+    match tag {
+        DTYPE_F64 => Ok(DType::F64),
+        DTYPE_F32 => Ok(DType::F32),
+        DTYPE_F16 => Ok(DType::F16),
+        DTYPE_BF16 => Ok(DType::BF16),
+        DTYPE_I64 => Ok(DType::I64),
+        DTYPE_I32 => Ok(DType::I32),
+        DTYPE_I16 => Ok(DType::I16),
+        DTYPE_I8 => Ok(DType::I8),
+        DTYPE_U64 => Ok(DType::U64),
+        DTYPE_U32 => Ok(DType::U32),
+        DTYPE_U16 => Ok(DType::U16),
+        DTYPE_U8 => Ok(DType::U8),
+        DTYPE_BOOL => Ok(DType::Bool),
+        DTYPE_QFLOAT => {
+            let scheme = decode_qscheme(buf, pos)?;
+            Ok(DType::QFloat(scheme))
+        }
+        _ => Err(CommError::Serialization(format!(
+            "Unknown dtype tag {}",
+            tag
+        ))),
+    }
+}
+
+fn encode_qscheme(buf: &mut Vec<u8>, scheme: QuantizationScheme) -> CommResult<()> {
+    match scheme {
+        QuantizationScheme::PerTensorAffine(qtype) => {
+            buf.push(QSCHEME_PER_TENSOR_AFFINE);
+            encode_qtype(buf, qtype)?;
+        }
+        QuantizationScheme::PerTensorSymmetric(qtype) => {
+            buf.push(QSCHEME_PER_TENSOR_SYMMETRIC);
+            encode_qtype(buf, qtype)?;
+        }
+    }
+
+    Ok(())
+}
+
+fn decode_qscheme(buf: &[u8], pos: &mut usize) -> CommResult<QuantizationScheme> {
+    let tag = read_u8(buf, pos)?;
+    let qtype = decode_qtype(buf, pos)?;
+
+    match tag {
+        QSCHEME_PER_TENSOR_AFFINE => Ok(QuantizationScheme::PerTensorAffine(qtype)),
+        QSCHEME_PER_TENSOR_SYMMETRIC => Ok(QuantizationScheme::PerTensorSymmetric(qtype)),
+        _ => Err(CommError::Serialization(format!(
+            "Unknown quantization scheme tag {}",
+            tag
+        ))),
+    }
+}
+
+fn encode_qtype(buf: &mut Vec<u8>, qtype: QuantizationType) -> CommResult<()> {
+    match qtype {
+        QuantizationType::QInt8 => buf.push(QTYPE_QINT8),
+    }
+
+    Ok(())
+}
+
+fn decode_qtype(buf: &[u8], pos: &mut usize) -> CommResult<QuantizationType> {
+    let tag = read_u8(buf, pos)?;
+    match tag {
+        QTYPE_QINT8 => Ok(QuantizationType::QInt8),
+        _ => Err(CommError::Serialization(format!(
+            "Unknown quantization type tag {}",
+            tag
+        ))),
+    }
+}
+
+fn write_u32(buf: &mut Vec<u8>, value: u32) {
+    buf.extend_from_slice(&value.to_le_bytes());
+}
+
+fn write_u64(buf: &mut Vec<u8>, value: u64) {
+    buf.extend_from_slice(&value.to_le_bytes());
+}
+
+fn read_u8(buf: &[u8], pos: &mut usize) -> CommResult<u8> {
+    let slice = read_slice(buf, pos, 1)?;
+    Ok(slice[0])
+}
+
+fn read_u32(buf: &[u8], pos: &mut usize) -> CommResult<u32> {
+    let slice = read_slice(buf, pos, 4)?;
+    Ok(u32::from_le_bytes(slice.try_into().unwrap()))
+}
+
+fn read_u64(buf: &[u8], pos: &mut usize) -> CommResult<u64> {
+    let slice = read_slice(buf, pos, 8)?;
+    Ok(u64::from_le_bytes(slice.try_into().unwrap()))
+}
+
+fn read_slice<'a>(buf: &'a [u8], pos: &mut usize, len: usize) -> CommResult<&'a [u8]> {
+    if *pos + len > buf.len() {
+        return Err(CommError::Serialization(
+            "Buffer too small for decode".to_string(),
+        ));
+    }
+    let slice = &buf[*pos..*pos + len];
+    *pos += len;
+    Ok(slice)
 }

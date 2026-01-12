@@ -1,18 +1,13 @@
-//! Communication backends for distributed computation.
-//!
-//! This module provides communication primitives for ring attention
-//! and other distributed operations. Three backends are available:
-//!
-//! - `SharedMemory`: For single-node multi-GPU using crossbeam channels
-//! - `Tcp`: For multi-node using TCP sockets
-//! - `Nccl`: For high-performance GPU communication (requires `nccl` feature)
+//! Communication backends for ring attention.
 
-mod nccl;
 mod shared_memory;
 mod tcp;
 mod traits;
+#[cfg(feature = "nccl")]
+mod nccl;
 
-pub use nccl::{NcclComm, NcclCommConfig};
-pub use shared_memory::{run_ring, SharedMemoryComm, SharedMemoryGroup};
-pub use tcp::{TcpComm, TcpCommConfig};
-pub use traits::{CommError, CommResult, Communicator, TensorMessage};
+pub use shared_memory::{SharedMemoryComm, SharedMemoryGroup};
+pub use tcp::TcpComm;
+pub use traits::{CommError, CommResult, Communicator};
+#[cfg(feature = "nccl")]
+pub use nccl::NcclComm;

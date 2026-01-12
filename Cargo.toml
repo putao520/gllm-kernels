@@ -19,7 +19,19 @@ cpu = ["burn-ndarray"]
 cuda = ["burn-cuda"]
 wgpu = ["burn-wgpu"]
 fusion = ["burn/fusion", "burn-fusion"]
-nccl = ["cudarc", "cuda"]
+nccl = ["cudarc/nccl", "cuda"]
+cuda-kernel = ["cudarc", "half"]
+rocm-kernel = ["half"]
+flash-attention-v3 = [
+    "flash-attention-v3-wgmma",
+    "flash-attention-v3-async",
+    "flash-attention-v3-fp8",
+    "flash-attention-v3-block-quant",
+]
+flash-attention-v3-wgmma = []
+flash-attention-v3-async = []
+flash-attention-v3-fp8 = []
+flash-attention-v3-block-quant = []
 # hip 等 burn 支持后再加
 
 [dependencies]
@@ -30,7 +42,8 @@ burn-wgpu = { version = "0.16", optional = true }
 burn-fusion = { version = "0.16", optional = true }
 log = "0.4"
 crossbeam-channel = "0.5"
-cudarc = { version = "0.12", optional = true, features = ["nccl"] }
+cudarc = { version = "0.18", optional = true, default-features = false, features = ["std", "driver", "nvrtc", "f16", "cuda-12090", "dynamic-loading"] }
+half = { version = "2.7", optional = true }
 
 [dev-dependencies]
 criterion = "0.5"

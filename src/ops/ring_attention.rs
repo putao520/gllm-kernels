@@ -4,8 +4,9 @@ use std::sync::Arc;
 
 use burn::tensor::backend::Backend;
 use burn::tensor::{Tensor, TensorData};
+use log::error;
 
-use crate::comm::{Communicator, TensorMessage};
+use crate::comm::Communicator;
 use crate::ops::flash_attention::HierarchicalFlashAttention;
 use crate::types::AttentionConfig;
 
@@ -303,7 +304,7 @@ impl RingAttention {
     ) -> Tensor<B, 4>
     where
         B: Backend,
-        C: Communicator<Data = TensorMessage> + 'static,
+        C: Communicator + 'static,
     {
         let device = q.device();
         let [batch_size, num_heads, query_len, head_dim] = q.dims();
@@ -528,35 +529,29 @@ impl RingAttention {
     ) -> (Tensor<B, 4>, Tensor<B, 4>)
     where
         B: Backend,
-        C: Communicator<Data = TensorMessage>,
+        C: Communicator,
     {
-        let k_shape: Vec<usize> = k.dims().to_vec();
-        let v_shape: Vec<usize> = v.dims().to_vec();
-
-        // Serialize K tensor
         let k_data = k.to_data();
-        let k_values: Vec<f32> = k_data.to_vec().unwrap();
-        let k_msg = TensorMessage::new(k_values, k_shape.clone());
-
-        // Serialize V tensor
         let v_data = v.to_data();
-        let v_values: Vec<f32> = v_data.to_vec().unwrap();
-        let v_msg = TensorMessage::new(v_values, v_shape.clone());
 
-        // Send K and V, receive new K and V
-        // We do this in two separate send_recv calls
-        let recv_k = comm.send_recv(&k_msg).expect("Failed to exchange K tensor");
-        let recv_v = comm.send_recv(&v_msg).expect("Failed to exchange V tensor");
+        let recv_k = match comm.send_recv(&k_data) {
+            Ok(data) => data,
+            Err(err) => {
+                error!("Ring attention K exchange failed: {}", err);
+                panic!("Ring attention K exchange failed: {}", err);
+            }
+        };
+        let recv_v = match comm.send_recv(&v_data) {
+            Ok(data) => data,
+            Err(err) => {
+                error!("Ring attention V exchange failed: {}", err);
+                panic!("Ring attention V exchange failed: {}", err);
+            }
+        };
 
         // Deserialize received tensors
-        let new_k = Tensor::<B, 4>::from_data(
-            TensorData::new(recv_k.data, recv_k.shape),
-            device,
-        );
-        let new_v = Tensor::<B, 4>::from_data(
-            TensorData::new(recv_v.data, recv_v.shape),
-            device,
-        );
+        let new_k = Tensor::<B, 4>::from_data(recv_k, device);
+        let new_v = Tensor::<B, 4>::from_data(recv_v, device);
 
         (new_k, new_v)
     }
