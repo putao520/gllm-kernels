@@ -6,6 +6,8 @@ pub mod comm;
 pub mod cuda_kernels;
 #[cfg(feature = "rocm-kernel")]
 pub mod hip_kernels;
+#[cfg(feature = "metal-kernel")]
+pub mod metal_kernels;
 pub mod device;
 pub mod ops;
 pub mod types;
@@ -18,6 +20,11 @@ pub use cuda_kernels::{FlashAttentionError, FlashAttentionKernel, OptimizedCudaA
 pub use hip_kernels::{
     FlashAttentionError as HipFlashAttentionError, FlashAttentionKernel as HipFlashAttentionKernel,
     OptimizedHipAttention,
+};
+#[cfg(feature = "metal-kernel")]
+pub use metal_kernels::{
+    FlashAttentionError as MetalFlashAttentionError,
+    FlashAttentionKernel as MetalFlashAttentionKernel,
 };
 pub use device::{default_device, DefaultDevice};
 pub use ops::flash_attention::{AttentionWorkspace, FlashAttentionConfig, FusedPagedAttention, HierarchicalFlashAttention};
