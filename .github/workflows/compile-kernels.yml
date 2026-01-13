@@ -1,0 +1,257 @@
+name: Compile GPU Kernels
+
+on:
+  push:
+    branches: [master, main]
+    paths:
+      - 'src/*/kernels/**'
+      - 'scripts/compile-kernels.sh'
+  pull_request:
+    paths:
+      - 'src/*/kernels/**'
+      - 'scripts/compile-kernels.sh'
+  workflow_dispatch:
+    inputs:
+      backend:
+        description: 'Backend to compile'
+        required: false
+        default: 'all'
+        type: choice
+        options:
+          - all
+          - cuda
+          - rocm
+          - metal
+
+jobs:
+  # ========================================
+  # CUDA Kernels 编译
+  # ========================================
+  compile-cuda:
+    name: Compile CUDA Kernels
+    runs-on: ubuntu-latest
+    if: github.event.inputs.backend == 'all' || github.event.inputs.backend == 'cuda' || github.event.inputs.backend == ''
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Install CUDA Toolkit
+        run: |
+          echo "Installing CUDA Toolkit 12.2..."
+          wget https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2004/x86_64/cuda-keyring_1.0-1_all.deb
+          sudo dpkg -i cuda-keyring_1.0-1_all.deb
+          sudo apt-get update
+          sudo apt-get install -y cuda-toolkit-12-2 cuda-nvrtc-12-2
+
+          # 设置环境变量
+          echo "CUDA_PATH=/usr/local/cuda-12.2" >> $GITHUB_ENV
+          echo "/usr/local/cuda-12.2/bin" >> $GITHUB_PATH
+
+      - name: Verify CUDA installation
+        run: |
+          nvcc --version
+          which nvcc
+
+      - name: Create cache directory
+        run: mkdir -p ~/.gsc/gllm/kernels
+
+      - name: Compile CUDA kernels
+        run: |
+          echo "Compiling CUDA kernels to PTX (intermediate representation)..."
+          bash scripts/compile-kernels.sh 2>&1 | grep -A 100 "CUDA"
+
+      - name: List compiled kernels
+        run: |
+          echo "Compiled CUDA kernels:"
+          find ~/.gsc/gllm/kernels/cuda -type f -name "*.ptx" | sort
+
+      - name: Get cache size
+        run: |
+          du -sh ~/.gsc/gllm/kernels/cuda
+
+      - name: Upload CUDA kernels
+        uses: actions/upload-artifact@v4
+        with:
+          name: kernels-cuda
+          path: ~/.gsc/gllm/kernels/cuda/
+          retention-days: 90
+
+  # ========================================
+  # ROCm Kernels 编译
+  # ========================================
+  compile-rocm:
+    name: Compile ROCm Kernels
+    runs-on: ubuntu-latest
+    if: github.event.inputs.backend == 'all' || github.event.inputs.backend == 'rocm' || github.event.inputs.backend == ''
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Install ROCm
+        uses: ROCm/rocm-ci-setup@v0.2.0
+        with:
+          rocm-version: '5.7'
+          gpu: ''
+
+      - name: Verify ROCm installation
+        run: |
+          hipcc --version
+          which hipcc
+
+      - name: Create cache directory
+        run: mkdir -p ~/.gsc/gllm/kernels
+
+      - name: Compile ROCm kernels
+        run: |
+          echo "Compiling ROCm kernels to HSACO (intermediate representation)..."
+          bash scripts/compile-kernels.sh 2>&1 | grep -A 100 "ROCm"
+
+      - name: List compiled kernels
+        run: |
+          echo "Compiled ROCm kernels:"
+          find ~/.gsc/gllm/kernels/rocm -type f -name "*.hsaco" | sort
+
+      - name: Get cache size
+        run: |
+          du -sh ~/.gsc/gllm/kernels/rocm
+
+      - name: Upload ROCm kernels
+        uses: actions/upload-artifact@v4
+        with:
+          name: kernels-rocm
+          path: ~/.gsc/gllm/kernels/rocm/
+          retention-days: 90
+
+  # ========================================
+  # Metal Kernels 编译
+  # ========================================
+  compile-metal:
+    name: Compile Metal Kernels
+    runs-on: macos-latest
+    if: github.event.inputs.backend == 'all' || github.event.inputs.backend == 'metal' || github.event.inputs.backend == ''
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Verify Metal tools
+        run: |
+          xcrun --sdk macosx --show-sdk-path
+          xcrun --sdk macosx metal --version
+
+      - name: Create cache directory
+        run: mkdir -p ~/.gsc/gllm/kernels
+
+      - name: Compile Metal kernels
+        run: |
+          echo "Compiling Metal kernels to metallib (intermediate representation)..."
+          bash scripts/compile-kernels.sh 2>&1 | grep -A 100 "Metal"
+
+      - name: List compiled kernels
+        run: |
+          echo "Compiled Metal kernels:"
+          find ~/.gsc/gllm/kernels/metal -type f -name "*.metallib" | sort
+
+      - name: Get cache size
+        run: |
+          du -sh ~/.gsc/gllm/kernels/metal
+
+      - name: Upload Metal kernels
+        uses: actions/upload-artifact@v4
+        with:
+          name: kernels-metal
+          path: ~/.gsc/gllm/kernels/metal/
+          retention-days: 90
+
+  # ========================================
+  # 打包所有 kernels
+  # ========================================
+  package-kernels:
+    name: Package All Kernels
+    needs: [compile-cuda, compile-rocm, compile-metal]
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: kernels/
+
+      - name: Reorganize kernels
+        run: |
+          mkdir -p gllm-kernels-prebuilt
+
+          # 合并所有 kernels
+          cp -r kernels/kernels-cuda/* gllm-kernels-prebuilt/ || true
+          cp -r kernels/kernels-rocm/* gllm-kernels-prebuilt/ || true
+          cp -r kernels/kernels-metal/* gllm-kernels-prebuilt/ || true
+
+          # 创建版本信息
+          cat > gllm-kernels-prebuilt/VERSION.txt << EOF
+          gllm-kernels Prebuilt Binaries
+          ===============================
+
+          Build Date: $(date -u +"%Y-%m-%d %H:%M:%S UTC")
+          Git Commit: ${{ github.sha }}
+          Git Ref: ${{ github.ref }}
+
+          Included Kernels:
+          EOF
+
+          find gllm-kernels-prebuilt -type f | sort >> gllm-kernels-prebuilt/VERSION.txt
+
+          # 统计
+          echo "" >> gllm-kernels-prebuilt/VERSION.txt
+          echo "Statistics:" >> gllm-kernels-prebuilt/VERSION.txt
+          echo "Total files: $(find gllm-kernels-prebuilt -type f | wc -l)" >> gllm-kernels-prebuilt/VERSION.txt
+          echo "Total size: $(du -sh gllm-kernels-prebuilt | cut -f1)" >> gllm-kernels-prebuilt/VERSION.txt
+
+      - name: Create tarball
+        run: |
+          tar czf gllm-kernels-prebuilt.tar.gz gllm-kernels-prebuilt/
+          echo "Created archive:"
+          ls -lh gllm-kernels-prebuilt.tar.gz
+
+      - name: Upload prebuilt package
+        uses: actions/upload-artifact@v4
+        with:
+          name: gllm-kernels-prebuilt
+          path: gllm-kernels-prebuilt.tar.gz
+          retention-days: 90
+
+      - name: Upload to release (if tagged)
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: gllm-kernels-prebuilt.tar.gz
+          generate_release_notes: true
+          body: |
+            ## gllm-kernels 预编译包
+
+            此包包含所有 GPU 后端的预编译 kernels（中间表示）。
+
+            ### 安装方法
+
+            \`\`\`bash
+            # 下载并解压
+            tar xzf gllm-kernels-prebuilt.tar.gz -C ~/
+
+            # 验证
+            ls ~/.gsc/gllm/kernels/
+            \`\`\`
+
+            ### 包含的后端
+
+            - ✅ CUDA (NVIDIA): PTX 文件
+            - ✅ ROCm (AMD): HSACO 文件
+            - ✅ Metal (Apple): metallib 文件
+
+            ### 支持的 GPU 架构
+
+            **CUDA**: sm_75, sm_86, sm_89, sm_90
+            **ROCm**: gfx1030, gfx1100
+            **Metal**: apple-m1, apple-m2, apple-m3
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
