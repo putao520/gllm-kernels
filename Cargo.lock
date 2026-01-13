@@ -2693,10 +2693,13 @@ dependencies = [
  "criterion",
  "crossbeam-channel",
  "cudarc 0.18.2",
+ "dirs 5.0.1",
  "half",
  "log",
  "metal 0.29.0",
  "objc",
+ "serde",
+ "serde_json",
 ]
 
 [[package]]
