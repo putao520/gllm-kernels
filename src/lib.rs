@@ -17,12 +17,18 @@ pub mod runtime_detection;
 pub mod backend_trait;
 pub mod backend_selector;
 pub mod kernel_cache;
+#[cfg(feature = "kernel-downloader")]
+pub mod kernel_downloader;
 
-pub use backend::{select_device, DefaultBackend};
+#[cfg(any(feature = "cpu", feature = "cuda", feature = "rocm", feature = "metal", feature = "wgpu"))]
+pub use backend::DefaultBackend;
+pub use backend::select_device;
 pub use runtime_detection::{
-    BackendType, BackendDetectionResult, detect_backend, redetect_backend,
+    BackendType, BackendDetectionResult, DeviceInfo, detect_backend, redetect_backend, ensure_kernels,
 };
 pub use kernel_cache::{
     kernel_cache_dir, kernel_cache_path, load_cached_kernel, save_kernel_to_cache,
     clear_kernel_cache, kernel_cache_size,
 };
+#[cfg(feature = "kernel-downloader")]
+pub use kernel_downloader::{KernelDownloader, KernelDownloadError};

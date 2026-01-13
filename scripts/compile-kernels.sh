@@ -170,7 +170,6 @@ compile_rocm_kernels() {
 
         # CDNA2 (Datacenter)
         ["gfx90a"]="MI200 (Aldebaran)"
-        ["gfx90a":"MI210 (Aldebaran)"
 
         # CDNA3 (Datacenter)
         ["gfx940"]="MI300 (CDNA 3)"
