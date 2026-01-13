@@ -68,7 +68,6 @@ log = "0.4"
 crossbeam-channel = "0.5"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-dirs = "5"
 cudarc = { version = "0.18", optional = true, default-features = false, features = ["std", "driver", "nvrtc", "f16", "cuda-12090", "dynamic-loading"] }
 half = { version = "2.7", optional = true }
 metal = { version = "0.29", optional = true }

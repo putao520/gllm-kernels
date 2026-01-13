@@ -121,11 +121,14 @@ fn validate_backend(backend_type: &BackendType) -> bool {
 
 /// Get cache file path.
 fn cache_file_path() -> PathBuf {
-    let cache_dir = dirs::cache_dir().unwrap_or_else(|| {
-        std::env::current_dir().unwrap().join(".cache")
-    });
+    let home_dir = std::env::var("HOME")
+        .or_else(|_| std::env::var("USERPROFILE"))
+        .unwrap_or_else(|_| ".".to_string());
 
-    cache_dir.join("gllm").join("backend.json")
+    PathBuf::from(home_dir)
+        .join(".gsc")
+        .join("gllm")
+        .join("backend.json")
 }
 
 /// Load cached detection result.
