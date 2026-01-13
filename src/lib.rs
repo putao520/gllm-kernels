@@ -12,6 +12,17 @@ pub mod device;
 pub mod ops;
 pub mod types;
 
+// Runtime backend detection
+pub use runtime_detection::{BackendType, detect_backend};
+pub use backend_selector::{init_backend_selector, get_backend_selector, force_backend};
+
+
+pub mod runtime_detection;
+pub mod backend_trait;
+pub mod backend_selector;
+
+
+
 pub use backend::{select_device, DefaultBackend};
 pub use comm::{CommError, CommResult, Communicator, SharedMemoryComm, SharedMemoryGroup, TcpComm};
 #[cfg(feature = "cuda-kernel")]

@@ -15,17 +15,35 @@ name = "gllm_kernels"
 path = "src/lib.rs"
 
 [features]
+# Fat binary: 包含所有后端（推荐）
 default = ["cpu"]
+fat-binary = ["cpu", "cuda", "wgpu"]
+
+# Platform-specific fat binaries
+fat-binary-linux = ["fat-binary", "rocm"]
+fat-binary-macos = ["fat-binary", "metal"]
+fat-binary-windows = ["fat-binary"]
+
+# 单独后端（高级用户/最小化二进制）
 cpu = ["burn-ndarray"]
 cuda = ["burn-cuda"]
 rocm = ["burn-rocm"]
 wgpu = ["burn-wgpu"]
 metal = ["burn-mlx"]
+
+# Fusion 支持
 fusion = ["burn/fusion", "burn-fusion"]
+
+# NCCL 多 GPU（CUDA 专用）
 nccl = ["cudarc/nccl", "cuda"]
+
+# 自定义 kernels
 cuda-kernel = ["cudarc", "half"]
 rocm-kernel = ["half"]
 metal-kernel = ["metal", "dep:metal", "dep:objc"]
+
+# 编译优化
+no-test = []
 flash-attention-v3 = [
     "flash-attention-v3-wgmma",
     "flash-attention-v3-async",

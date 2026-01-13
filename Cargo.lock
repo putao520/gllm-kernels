@@ -2681,7 +2681,7 @@ dependencies = [
 
 [[package]]
 name = "gllm-kernels"
-version = "0.1.3"
+version = "0.2.0"
 dependencies = [
  "burn 0.20.0-pre.6",
  "burn-cuda 0.20.0-pre.6",
