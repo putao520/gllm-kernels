@@ -7,12 +7,14 @@ use burn::tensor::{Tensor, TensorData};
 
 use crate::ops::flash_attention::{FlashAttentionConfig, HierarchicalFlashAttention};
 #[cfg(feature = "cuda-kernel")]
-use crate::cuda_kernels::FlashAttentionKernel;
+use crate::cuda_kernels::FlashAttentionKernel as CudaFlashAttentionKernel;
+#[cfg(feature = "wgpu-kernel")]
+use crate::wgpu_kernels::FlashAttentionKernel as WgpuFlashAttentionKernel;
 #[cfg(feature = "cuda-kernel")]
 use cudarc::driver::CudaContext;
-#[cfg(feature = "cuda-kernel")]
+#[cfg(any(feature = "cuda-kernel", feature = "wgpu-kernel"))]
 use half::f16;
-#[cfg(feature = "cuda-kernel")]
+#[cfg(any(feature = "cuda-kernel", feature = "wgpu-kernel"))]
 use std::any::TypeId;
 #[cfg(feature = "cuda-kernel")]
 use std::sync::Arc;
@@ -113,6 +115,17 @@ impl FlashAttention3 {
     where
         B::FloatElem: 'static,
     {
+        #[cfg(feature = "wgpu-kernel")]
+        {
+            if is_wgpu_backend::<B>() {
+                if let Some(output) =
+                    self.try_forward_wgpu_kernel(&q, &k, &v, causal, position_offset)
+                {
+                    return output;
+                }
+            }
+        }
+
         #[cfg(feature = "cuda-kernel")]
         {
             if is_cuda_backend::<B>() {
@@ -265,7 +278,7 @@ impl FlashAttention3 {
         };
 
         let stream = cuda_ctx.default_stream();
-        let kernel = match FlashAttentionKernel::new(&cuda_ctx) {
+        let kernel = match CudaFlashAttentionKernel::new(&cuda_ctx) {
             Ok(kernel) => kernel,
             Err(err) => {
                 log::warn!("CUDA kernel fallback: kernel load failed: {err}");
@@ -360,6 +373,99 @@ impl FlashAttention3 {
         None
     }
 
+    #[cfg(feature = "wgpu-kernel")]
+    fn try_forward_wgpu_kernel<B: Backend + 'static>(
+        &self,
+        q: &Tensor<B, 4>,
+        k: &Tensor<B, 4>,
+        v: &Tensor<B, 4>,
+        causal: bool,
+        position_offset: usize,
+    ) -> Option<Tensor<B, 4>>
+    where
+        B::FloatElem: 'static,
+    {
+        if causal || position_offset != 0 {
+            log::warn!("WGPU kernel fallback: causal/position_offset not supported");
+            return None;
+        }
+
+        let q_dims = q.dims();
+        if k.dims() != q_dims || v.dims() != q_dims {
+            log::warn!("WGPU kernel fallback: Q/K/V shape mismatch");
+            return None;
+        }
+
+        let [batch_size, num_heads, seq_len, head_dim] = q_dims;
+        let scale = 1.0 / (head_dim as f32).sqrt();
+        let block_size = self.base.config().block_kv as u32;
+        let device = q.device();
+
+        let elem_type = TypeId::of::<B::FloatElem>();
+        if elem_type == TypeId::of::<f32>() {
+            let kernel = match WgpuFlashAttentionKernel::create_default(false) {
+                Ok(kernel) => kernel,
+                Err(err) => {
+                    log::warn!("WGPU kernel fallback: device init failed: {err}");
+                    return None;
+                }
+            };
+
+            let q_host = q.clone().into_data().into_vec::<f32>().ok()?;
+            let k_host = k.clone().into_data().into_vec::<f32>().ok()?;
+            let v_host = v.clone().into_data().into_vec::<f32>().ok()?;
+
+            let output = kernel
+                .forward_f32(
+                    &q_host,
+                    &k_host,
+                    &v_host,
+                    batch_size,
+                    num_heads,
+                    seq_len,
+                    head_dim,
+                    Some(block_size),
+                    scale,
+                )
+                .ok()?;
+
+            return Some(Tensor::<B, 4>::from_data(TensorData::new(output, q_dims), &device));
+        }
+
+        if elem_type == TypeId::of::<f16>() {
+            let kernel = match WgpuFlashAttentionKernel::create_default(true) {
+                Ok(kernel) => kernel,
+                Err(err) => {
+                    log::warn!("WGPU kernel fallback: device init failed: {err}");
+                    return None;
+                }
+            };
+
+            let q_host = q.clone().into_data().into_vec::<f16>().ok()?;
+            let k_host = k.clone().into_data().into_vec::<f16>().ok()?;
+            let v_host = v.clone().into_data().into_vec::<f16>().ok()?;
+
+            let output = kernel
+                .forward_f16(
+                    &q_host,
+                    &k_host,
+                    &v_host,
+                    batch_size,
+                    num_heads,
+                    seq_len,
+                    head_dim,
+                    Some(block_size),
+                    scale,
+                )
+                .ok()?;
+
+            return Some(Tensor::<B, 4>::from_data(TensorData::new(output, q_dims), &device));
+        }
+
+        log::warn!("WGPU kernel fallback: unsupported dtype");
+        None
+    }
+
     fn quantize_fp8_blocked<B: Backend + 'static>(
         tensor: Tensor<B, 4>,
         block_size: usize,
@@ -428,6 +534,28 @@ fn is_cuda_backend<B: Backend + 'static>() -> bool {
         false
     }
     #[cfg(not(feature = "cuda"))]
+    {
+        false
+    }
+}
+
+#[cfg(feature = "wgpu-kernel")]
+fn is_wgpu_backend<B: Backend + 'static>() -> bool {
+    #[cfg(feature = "wgpu")]
+    {
+        let type_id = TypeId::of::<B>();
+        if type_id == TypeId::of::<burn_wgpu::Wgpu>() {
+            return true;
+        }
+        #[cfg(feature = "fusion")]
+        {
+            if type_id == TypeId::of::<burn_fusion::Fusion<burn_wgpu::Wgpu>>() {
+                return true;
+            }
+        }
+        false
+    }
+    #[cfg(not(feature = "wgpu"))]
     {
         false
     }

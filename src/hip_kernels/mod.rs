@@ -17,5 +17,7 @@
 //! - `GLLM_HIP_FLASH_ATTN_SOURCE`: Path to HIP source for runtime compilation
 
 pub mod flash_attn;
+pub mod paged_attn;
 
 pub use flash_attn::{FlashAttentionError, FlashAttentionKernel, OptimizedHipAttention};
+pub use paged_attn::{PagedAttentionError, PagedAttentionKernel};

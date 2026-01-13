@@ -1,8 +1,28 @@
 use burn::tensor::backend::Backend;
 use burn::tensor::Tensor;
+#[cfg(feature = "paged-kernel")]
+use burn::tensor::{Int, TensorData};
 use std::collections::HashMap;
 
 use crate::ops::flash_attention::{FlashAttentionConfig, HierarchicalFlashAttention};
+#[cfg(feature = "cuda-kernel")]
+use crate::cuda_kernels::PagedAttentionKernel as CudaPagedAttentionKernel;
+#[cfg(feature = "rocm-kernel")]
+use crate::hip_kernels::paged_attn::{HipBuffer, HipStreamWrapper};
+#[cfg(feature = "rocm-kernel")]
+use crate::hip_kernels::PagedAttentionKernel as HipPagedAttentionKernel;
+#[cfg(feature = "metal-kernel")]
+use crate::metal_kernels::PagedAttentionKernel as MetalPagedAttentionKernel;
+#[cfg(feature = "cuda-kernel")]
+use cudarc::driver::CudaContext;
+#[cfg(any(feature = "cuda-kernel", feature = "rocm-kernel", feature = "metal-kernel"))]
+use half::f16;
+#[cfg(feature = "metal-kernel")]
+use metal::Device;
+#[cfg(feature = "metal-kernel")]
+use std::mem;
+#[cfg(feature = "paged-kernel")]
+use std::any::{Any, TypeId};
 
 /// Tokens per physical block.
 pub const BLOCK_SIZE: usize = 16;
@@ -501,6 +521,72 @@ impl PagedAttention {
         let total_seq_len = cache.seq_len(layer, seq_id)?;
         let position_offset = total_seq_len.saturating_sub(new_seq_len);
 
+        #[cfg(feature = "paged-kernel")]
+        if causal && self.should_use_kernel::<B>() {
+            if let Some(output) = (|| {
+                let layer_tables = cache.page_tables.get(layer)?;
+                let page_table = layer_tables.get(&seq_id)?;
+                let kv_len = total_seq_len;
+                if kv_len == 0 {
+                    return None;
+                }
+
+                let block_ids = page_table.physical_blocks();
+                let mut table_data = Vec::with_capacity(kv_len);
+                for (block_idx, &block_id) in block_ids.iter().enumerate() {
+                    let start = block_idx * BLOCK_SIZE;
+                    if start >= kv_len {
+                        break;
+                    }
+                    let end = (start + BLOCK_SIZE).min(kv_len);
+                    for _ in start..end {
+                        table_data.push(block_id as i64);
+                    }
+                }
+                if table_data.len() != kv_len {
+                    log::warn!(
+                        "Paged kernel fallback: block table length mismatch ({} != {})",
+                        table_data.len(),
+                        kv_len
+                    );
+                    return None;
+                }
+
+                let block_tables = Tensor::<B, 2, Int>::from_data(
+                    TensorData::new(table_data, [batch, kv_len]),
+                    &query.device(),
+                );
+
+                let mut k_blocks = Vec::with_capacity(cache.block_manager.blocks.len());
+                let mut v_blocks = Vec::with_capacity(cache.block_manager.blocks.len());
+                for block in cache.block_manager.blocks.iter() {
+                    let block = block.as_ref()?;
+                    k_blocks.push(block.keys.clone().swap_dims(0, 1).unsqueeze_dim(0));
+                    v_blocks.push(block.values.clone().swap_dims(0, 1).unsqueeze_dim(0));
+                }
+                if k_blocks.is_empty() {
+                    log::warn!("Paged kernel fallback: no KV blocks available");
+                    return None;
+                }
+
+                let k_cache = Tensor::cat(k_blocks, 0);
+                let v_cache = Tensor::cat(v_blocks, 0);
+                let block_offsets = vec![position_offset];
+
+                self.try_paged_kernel(
+                    &query,
+                    &k_cache,
+                    &v_cache,
+                    &block_tables,
+                    &block_offsets,
+                    causal,
+                )
+            })() {
+                B::sync(&output.device());
+                return Ok(output);
+            }
+        }
+
         let (cached_k, cached_v) = cache.get_kv(layer, seq_id)?;
         let cached_seq_len = cached_k.dims()[1];
         let cached_k = cached_k.reshape([1, num_heads, cached_seq_len, head_dim]);
@@ -563,6 +649,670 @@ impl PagedAttention {
         );
         B::sync(&output.device());
         Ok(output)
+    }
+
+    #[cfg(feature = "paged-kernel")]
+    fn should_use_kernel<B: Backend + 'static>(&self) -> bool {
+        is_cuda_backend::<B>() || is_rocm_backend::<B>() || is_metal_backend::<B>()
+    }
+
+    #[cfg(feature = "paged-kernel")]
+    fn try_paged_kernel<B: Backend + 'static>(
+        &self,
+        q: &Tensor<B, 4>,
+        k_cache: &Tensor<B, 4>,
+        v_cache: &Tensor<B, 4>,
+        block_tables: &Tensor<B, 2, Int>,
+        block_offsets: &[usize],
+        causal: bool,
+    ) -> Option<Tensor<B, 4>>
+    where
+        B::FloatElem: 'static,
+    {
+        if !causal {
+            return None;
+        }
+
+        let q_dims = q.dims();
+        let [batch_size, num_heads, seq_len, head_dim] = q_dims;
+        if batch_size == 0 || num_heads == 0 || seq_len == 0 || head_dim == 0 {
+            return None;
+        }
+        if block_offsets.len() != batch_size {
+            log::warn!(
+                "Paged kernel fallback: block_offsets length {} != batch_size {}",
+                block_offsets.len(),
+                batch_size
+            );
+            return None;
+        }
+
+        let k_dims = k_cache.dims();
+        let v_dims = v_cache.dims();
+        if k_dims != v_dims {
+            log::warn!("Paged kernel fallback: K/V cache shape mismatch");
+            return None;
+        }
+
+        let [_, block_size, k_heads, k_dim] = k_dims;
+        if k_heads != num_heads || k_dim != head_dim {
+            log::warn!("Paged kernel fallback: cache head dims mismatch");
+            return None;
+        }
+
+        let kv_len = block_offsets[0].saturating_add(seq_len);
+        if block_offsets
+            .iter()
+            .any(|offset| offset.saturating_add(seq_len) != kv_len)
+        {
+            log::warn!("Paged kernel fallback: varying KV lengths across batch");
+            return None;
+        }
+        if block_tables.dims() != [batch_size, kv_len] {
+            log::warn!(
+                "Paged kernel fallback: block_tables dims {:?} != [{}, {}]",
+                block_tables.dims(),
+                batch_size,
+                kv_len
+            );
+            return None;
+        }
+
+        #[cfg(feature = "cuda-kernel")]
+        if is_cuda_backend::<B>() {
+            if let Some(output) = self.try_paged_cuda_kernel(
+                q,
+                k_cache,
+                v_cache,
+                block_tables,
+                block_offsets,
+                batch_size,
+                num_heads,
+                head_dim,
+                block_size,
+                seq_len,
+            ) {
+                return Some(output);
+            }
+        }
+
+        #[cfg(feature = "rocm-kernel")]
+        if is_rocm_backend::<B>() {
+            if let Some(output) = self.try_paged_rocm_kernel(
+                q,
+                k_cache,
+                v_cache,
+                block_tables,
+                block_offsets,
+                batch_size,
+                num_heads,
+                head_dim,
+                block_size,
+                seq_len,
+            ) {
+                return Some(output);
+            }
+        }
+
+        #[cfg(feature = "metal-kernel")]
+        if is_metal_backend::<B>() {
+            if let Some(output) = self.try_paged_metal_kernel(
+                q,
+                k_cache,
+                v_cache,
+                block_tables,
+                block_offsets,
+                batch_size,
+                num_heads,
+                head_dim,
+                block_size,
+                seq_len,
+            ) {
+                return Some(output);
+            }
+        }
+
+        None
+    }
+
+    #[cfg(feature = "cuda-kernel")]
+    fn try_paged_cuda_kernel<B: Backend + 'static>(
+        &self,
+        q: &Tensor<B, 4>,
+        k_cache: &Tensor<B, 4>,
+        v_cache: &Tensor<B, 4>,
+        block_tables: &Tensor<B, 2, Int>,
+        block_offsets: &[usize],
+        batch_size: usize,
+        num_heads: usize,
+        head_dim: usize,
+        block_size: usize,
+        seq_len: usize,
+    ) -> Option<Tensor<B, 4>>
+    where
+        B::FloatElem: 'static,
+    {
+        let device = q.device();
+        let cuda_index = {
+            #[cfg(feature = "cuda")]
+            {
+                let device_any = &device as &dyn Any;
+                if let Some(cuda_device) = device_any.downcast_ref::<burn_cuda::CudaDevice>() {
+                    cuda_device.index
+                } else {
+                    0
+                }
+            }
+            #[cfg(not(feature = "cuda"))]
+            {
+                0
+            }
+        };
+
+        let cuda_ctx = match CudaContext::new(cuda_index) {
+            Ok(ctx) => std::sync::Arc::new(ctx),
+            Err(err) => {
+                log::warn!("CUDA paged kernel fallback: device init failed: {err}");
+                return None;
+            }
+        };
+
+        let stream = cuda_ctx.default_stream();
+        let kernel = match CudaPagedAttentionKernel::new(&cuda_ctx) {
+            Ok(kernel) => kernel,
+            Err(err) => {
+                log::warn!("CUDA paged kernel fallback: kernel load failed: {err}");
+                return None;
+            }
+        };
+
+        let elem_type = TypeId::of::<B::FloatElem>();
+        if elem_type == TypeId::of::<f32>() {
+            let q_host = q.clone().into_data().into_vec::<f32>().ok()?;
+            let k_host = k_cache.clone().into_data().into_vec::<f32>().ok()?;
+            let v_host = v_cache.clone().into_data().into_vec::<f32>().ok()?;
+
+            let table_host = block_tables
+                .clone()
+                .into_data()
+                .into_vec::<i64>()
+                .ok()?;
+            let table_i32: Vec<i32> = table_host
+                .into_iter()
+                .map(|value| i32::try_from(value).ok())
+                .collect::<Option<Vec<_>>>()?;
+            let offsets_i32: Vec<i32> = block_offsets
+                .iter()
+                .map(|value| i32::try_from(*value).ok())
+                .collect::<Option<Vec<_>>>()?;
+
+            let q_dev = stream.clone_htod(&q_host).ok()?;
+            let k_dev = stream.clone_htod(&k_host).ok()?;
+            let v_dev = stream.clone_htod(&v_host).ok()?;
+            let table_dev = stream.clone_htod(&table_i32).ok()?;
+            let offsets_dev = stream.clone_htod(&offsets_i32).ok()?;
+
+            let output = kernel
+                .forward_f32(
+                    &stream,
+                    &q_dev,
+                    &k_dev,
+                    &v_dev,
+                    &table_dev,
+                    &offsets_dev,
+                    batch_size,
+                    num_heads,
+                    head_dim,
+                    block_size,
+                    seq_len,
+                )
+                .ok()?;
+
+            let out_host = stream.clone_dtoh(&output).ok()?;
+            return Some(Tensor::<B, 4>::from_data(
+                TensorData::new(out_host, q.dims()),
+                &device,
+            ));
+        }
+
+        if elem_type == TypeId::of::<f16>() {
+            let q_host = q.clone().into_data().into_vec::<f16>().ok()?;
+            let k_host = k_cache.clone().into_data().into_vec::<f16>().ok()?;
+            let v_host = v_cache.clone().into_data().into_vec::<f16>().ok()?;
+
+            let table_host = block_tables
+                .clone()
+                .into_data()
+                .into_vec::<i64>()
+                .ok()?;
+            let table_i32: Vec<i32> = table_host
+                .into_iter()
+                .map(|value| i32::try_from(value).ok())
+                .collect::<Option<Vec<_>>>()?;
+            let offsets_i32: Vec<i32> = block_offsets
+                .iter()
+                .map(|value| i32::try_from(*value).ok())
+                .collect::<Option<Vec<_>>>()?;
+
+            let q_dev = stream.clone_htod(&q_host).ok()?;
+            let k_dev = stream.clone_htod(&k_host).ok()?;
+            let v_dev = stream.clone_htod(&v_host).ok()?;
+            let table_dev = stream.clone_htod(&table_i32).ok()?;
+            let offsets_dev = stream.clone_htod(&offsets_i32).ok()?;
+
+            let output = kernel
+                .forward_f16(
+                    &stream,
+                    &q_dev,
+                    &k_dev,
+                    &v_dev,
+                    &table_dev,
+                    &offsets_dev,
+                    batch_size,
+                    num_heads,
+                    head_dim,
+                    block_size,
+                    seq_len,
+                )
+                .ok()?;
+
+            let out_host = stream.clone_dtoh(&output).ok()?;
+            return Some(Tensor::<B, 4>::from_data(
+                TensorData::new(out_host, q.dims()),
+                &device,
+            ));
+        }
+
+        log::warn!("CUDA paged kernel fallback: unsupported dtype");
+        None
+    }
+
+    #[cfg(feature = "rocm-kernel")]
+    fn try_paged_rocm_kernel<B: Backend + 'static>(
+        &self,
+        q: &Tensor<B, 4>,
+        k_cache: &Tensor<B, 4>,
+        v_cache: &Tensor<B, 4>,
+        block_tables: &Tensor<B, 2, Int>,
+        block_offsets: &[usize],
+        batch_size: usize,
+        num_heads: usize,
+        head_dim: usize,
+        block_size: usize,
+        seq_len: usize,
+    ) -> Option<Tensor<B, 4>>
+    where
+        B::FloatElem: 'static,
+    {
+        let device = q.device();
+        let rocm_index = {
+            #[cfg(feature = "rocm")]
+            {
+                let device_any = &device as &dyn Any;
+                if let Some(rocm_device) = device_any.downcast_ref::<burn_rocm::RocmDevice>() {
+                    rocm_device.index
+                } else {
+                    0
+                }
+            }
+            #[cfg(not(feature = "rocm"))]
+            {
+                0
+            }
+        };
+
+        let kernel = match HipPagedAttentionKernel::new(rocm_index as i32) {
+            Ok(kernel) => kernel,
+            Err(err) => {
+                log::warn!("ROCm paged kernel fallback: kernel load failed: {err}");
+                return None;
+            }
+        };
+
+        let stream = HipStreamWrapper::new().ok()?;
+
+        let elem_type = TypeId::of::<B::FloatElem>();
+        if elem_type == TypeId::of::<f32>() {
+            let q_host = q.clone().into_data().into_vec::<f32>().ok()?;
+            let k_host = k_cache.clone().into_data().into_vec::<f32>().ok()?;
+            let v_host = v_cache.clone().into_data().into_vec::<f32>().ok()?;
+
+            let table_host = block_tables
+                .clone()
+                .into_data()
+                .into_vec::<i64>()
+                .ok()?;
+            let table_i32: Vec<i32> = table_host
+                .into_iter()
+                .map(|value| i32::try_from(value).ok())
+                .collect::<Option<Vec<_>>>()?;
+            let offsets_i32: Vec<i32> = block_offsets
+                .iter()
+                .map(|value| i32::try_from(*value).ok())
+                .collect::<Option<Vec<_>>>()?;
+
+            let q_dev = HipBuffer::from_slice(&q_host).ok()?;
+            let k_dev = HipBuffer::from_slice(&k_host).ok()?;
+            let v_dev = HipBuffer::from_slice(&v_host).ok()?;
+            let table_dev = HipBuffer::from_slice(&table_i32).ok()?;
+            let offsets_dev = HipBuffer::from_slice(&offsets_i32).ok()?;
+
+            let output = kernel
+                .forward_f32(
+                    &stream,
+                    &q_dev,
+                    &k_dev,
+                    &v_dev,
+                    &table_dev,
+                    &offsets_dev,
+                    batch_size,
+                    num_heads,
+                    head_dim,
+                    block_size,
+                    seq_len,
+                )
+                .ok()?;
+            stream.synchronize().ok()?;
+
+            let out_host = output.to_vec().ok()?;
+            return Some(Tensor::<B, 4>::from_data(
+                TensorData::new(out_host, q.dims()),
+                &device,
+            ));
+        }
+
+        if elem_type == TypeId::of::<f16>() {
+            let q_host = q.clone().into_data().into_vec::<f16>().ok()?;
+            let k_host = k_cache.clone().into_data().into_vec::<f16>().ok()?;
+            let v_host = v_cache.clone().into_data().into_vec::<f16>().ok()?;
+
+            let table_host = block_tables
+                .clone()
+                .into_data()
+                .into_vec::<i64>()
+                .ok()?;
+            let table_i32: Vec<i32> = table_host
+                .into_iter()
+                .map(|value| i32::try_from(value).ok())
+                .collect::<Option<Vec<_>>>()?;
+            let offsets_i32: Vec<i32> = block_offsets
+                .iter()
+                .map(|value| i32::try_from(*value).ok())
+                .collect::<Option<Vec<_>>>()?;
+
+            let q_bits: Vec<u16> = q_host.iter().map(|v| v.to_bits()).collect();
+            let k_bits: Vec<u16> = k_host.iter().map(|v| v.to_bits()).collect();
+            let v_bits: Vec<u16> = v_host.iter().map(|v| v.to_bits()).collect();
+
+            let q_dev = HipBuffer::from_slice(&q_bits).ok()?;
+            let k_dev = HipBuffer::from_slice(&k_bits).ok()?;
+            let v_dev = HipBuffer::from_slice(&v_bits).ok()?;
+            let table_dev = HipBuffer::from_slice(&table_i32).ok()?;
+            let offsets_dev = HipBuffer::from_slice(&offsets_i32).ok()?;
+
+            let output = kernel
+                .forward_f16(
+                    &stream,
+                    &q_dev,
+                    &k_dev,
+                    &v_dev,
+                    &table_dev,
+                    &offsets_dev,
+                    batch_size,
+                    num_heads,
+                    head_dim,
+                    block_size,
+                    seq_len,
+                )
+                .ok()?;
+            stream.synchronize().ok()?;
+
+            let out_bits = output.to_vec().ok()?;
+            let out_host: Vec<f16> = out_bits.into_iter().map(f16::from_bits).collect();
+            return Some(Tensor::<B, 4>::from_data(
+                TensorData::new(out_host, q.dims()),
+                &device,
+            ));
+        }
+
+        log::warn!("ROCm paged kernel fallback: unsupported dtype");
+        None
+    }
+
+    #[cfg(feature = "metal-kernel")]
+    fn try_paged_metal_kernel<B: Backend + 'static>(
+        &self,
+        q: &Tensor<B, 4>,
+        k_cache: &Tensor<B, 4>,
+        v_cache: &Tensor<B, 4>,
+        block_tables: &Tensor<B, 2, Int>,
+        block_offsets: &[usize],
+        batch_size: usize,
+        num_heads: usize,
+        head_dim: usize,
+        block_size: usize,
+        seq_len: usize,
+    ) -> Option<Tensor<B, 4>>
+    where
+        B::FloatElem: 'static,
+    {
+        let device = q.device();
+        let metal_device = Device::system_default()?;
+        let kernel = MetalPagedAttentionKernel::new(&metal_device).ok()?;
+
+        let elem_type = TypeId::of::<B::FloatElem>();
+        if elem_type == TypeId::of::<f32>() {
+            let q_host = q.clone().into_data().into_vec::<f32>().ok()?;
+            let k_host = k_cache.clone().into_data().into_vec::<f32>().ok()?;
+            let v_host = v_cache.clone().into_data().into_vec::<f32>().ok()?;
+
+            let table_host = block_tables
+                .clone()
+                .into_data()
+                .into_vec::<i64>()
+                .ok()?;
+            let table_i32: Vec<i32> = table_host
+                .into_iter()
+                .map(|value| i32::try_from(value).ok())
+                .collect::<Option<Vec<_>>>()?;
+            let offsets_i32: Vec<i32> = block_offsets
+                .iter()
+                .map(|value| i32::try_from(*value).ok())
+                .collect::<Option<Vec<_>>>()?;
+
+            let q_buf = metal_device.new_buffer_with_data(
+                q_host.as_ptr() as *const _,
+                (q_host.len() * mem::size_of::<f32>()) as u64,
+                metal::MTLResourceOptions::StorageModeShared,
+            );
+            let k_buf = metal_device.new_buffer_with_data(
+                k_host.as_ptr() as *const _,
+                (k_host.len() * mem::size_of::<f32>()) as u64,
+                metal::MTLResourceOptions::StorageModeShared,
+            );
+            let v_buf = metal_device.new_buffer_with_data(
+                v_host.as_ptr() as *const _,
+                (v_host.len() * mem::size_of::<f32>()) as u64,
+                metal::MTLResourceOptions::StorageModeShared,
+            );
+            let table_buf = metal_device.new_buffer_with_data(
+                table_i32.as_ptr() as *const _,
+                (table_i32.len() * mem::size_of::<i32>()) as u64,
+                metal::MTLResourceOptions::StorageModeShared,
+            );
+            let offsets_buf = metal_device.new_buffer_with_data(
+                offsets_i32.as_ptr() as *const _,
+                (offsets_i32.len() * mem::size_of::<i32>()) as u64,
+                metal::MTLResourceOptions::StorageModeShared,
+            );
+
+            let output = kernel
+                .forward_f32(
+                    &q_buf,
+                    &k_buf,
+                    &v_buf,
+                    &table_buf,
+                    &offsets_buf,
+                    batch_size,
+                    num_heads,
+                    head_dim,
+                    block_size,
+                    seq_len,
+                )
+                .ok()?;
+
+            let out_len = batch_size * num_heads * seq_len * head_dim;
+            let out_ptr = output.contents() as *const f32;
+            let out_slice = unsafe { std::slice::from_raw_parts(out_ptr, out_len) };
+            let out_host = out_slice.to_vec();
+            return Some(Tensor::<B, 4>::from_data(
+                TensorData::new(out_host, q.dims()),
+                &device,
+            ));
+        }
+
+        if elem_type == TypeId::of::<f16>() {
+            let q_host = q.clone().into_data().into_vec::<f16>().ok()?;
+            let k_host = k_cache.clone().into_data().into_vec::<f16>().ok()?;
+            let v_host = v_cache.clone().into_data().into_vec::<f16>().ok()?;
+
+            let table_host = block_tables
+                .clone()
+                .into_data()
+                .into_vec::<i64>()
+                .ok()?;
+            let table_i32: Vec<i32> = table_host
+                .into_iter()
+                .map(|value| i32::try_from(value).ok())
+                .collect::<Option<Vec<_>>>()?;
+            let offsets_i32: Vec<i32> = block_offsets
+                .iter()
+                .map(|value| i32::try_from(*value).ok())
+                .collect::<Option<Vec<_>>>()?;
+
+            let q_bits: Vec<u16> = q_host.iter().map(|v| v.to_bits()).collect();
+            let k_bits: Vec<u16> = k_host.iter().map(|v| v.to_bits()).collect();
+            let v_bits: Vec<u16> = v_host.iter().map(|v| v.to_bits()).collect();
+
+            let q_buf = metal_device.new_buffer_with_data(
+                q_bits.as_ptr() as *const _,
+                (q_bits.len() * mem::size_of::<u16>()) as u64,
+                metal::MTLResourceOptions::StorageModeShared,
+            );
+            let k_buf = metal_device.new_buffer_with_data(
+                k_bits.as_ptr() as *const _,
+                (k_bits.len() * mem::size_of::<u16>()) as u64,
+                metal::MTLResourceOptions::StorageModeShared,
+            );
+            let v_buf = metal_device.new_buffer_with_data(
+                v_bits.as_ptr() as *const _,
+                (v_bits.len() * mem::size_of::<u16>()) as u64,
+                metal::MTLResourceOptions::StorageModeShared,
+            );
+            let table_buf = metal_device.new_buffer_with_data(
+                table_i32.as_ptr() as *const _,
+                (table_i32.len() * mem::size_of::<i32>()) as u64,
+                metal::MTLResourceOptions::StorageModeShared,
+            );
+            let offsets_buf = metal_device.new_buffer_with_data(
+                offsets_i32.as_ptr() as *const _,
+                (offsets_i32.len() * mem::size_of::<i32>()) as u64,
+                metal::MTLResourceOptions::StorageModeShared,
+            );
+
+            let output = kernel
+                .forward_f16(
+                    &q_buf,
+                    &k_buf,
+                    &v_buf,
+                    &table_buf,
+                    &offsets_buf,
+                    batch_size,
+                    num_heads,
+                    head_dim,
+                    block_size,
+                    seq_len,
+                )
+                .ok()?;
+
+            let out_len = batch_size * num_heads * seq_len * head_dim;
+            let out_ptr = output.contents() as *const u16;
+            let out_slice = unsafe { std::slice::from_raw_parts(out_ptr, out_len) };
+            let out_host: Vec<f16> = out_slice.iter().copied().map(f16::from_bits).collect();
+            return Some(Tensor::<B, 4>::from_data(
+                TensorData::new(out_host, q.dims()),
+                &device,
+            ));
+        }
+
+        log::warn!("Metal paged kernel fallback: unsupported dtype");
+        None
+    }
+}
+
+#[cfg(feature = "paged-kernel")]
+fn is_cuda_backend<B: Backend + 'static>() -> bool {
+    #[cfg(feature = "cuda")]
+    {
+        let type_id = TypeId::of::<B>();
+        if type_id == TypeId::of::<burn_cuda::Cuda>() {
+            return true;
+        }
+        #[cfg(feature = "fusion")]
+        {
+            if type_id == TypeId::of::<burn_fusion::Fusion<burn_cuda::Cuda>>() {
+                return true;
+            }
+        }
+        false
+    }
+    #[cfg(not(feature = "cuda"))]
+    {
+        false
+    }
+}
+
+#[cfg(feature = "paged-kernel")]
+fn is_rocm_backend<B: Backend + 'static>() -> bool {
+    #[cfg(feature = "rocm")]
+    {
+        let type_id = TypeId::of::<B>();
+        if type_id == TypeId::of::<burn_rocm::Rocm>() {
+            return true;
+        }
+        #[cfg(feature = "fusion")]
+        {
+            if type_id == TypeId::of::<burn_fusion::Fusion<burn_rocm::Rocm>>() {
+                return true;
+            }
+        }
+        false
+    }
+    #[cfg(not(feature = "rocm"))]
+    {
+        false
+    }
+}
+
+#[cfg(feature = "paged-kernel")]
+fn is_metal_backend<B: Backend + 'static>() -> bool {
+    #[cfg(feature = "metal")]
+    {
+        let type_id = TypeId::of::<B>();
+        if type_id == TypeId::of::<burn_mlx::Mlx>() {
+            return true;
+        }
+        #[cfg(feature = "fusion")]
+        {
+            if type_id == TypeId::of::<burn_fusion::Fusion<burn_mlx::Mlx>>() {
+                return true;
+            }
+        }
+        false
+    }
+    #[cfg(not(feature = "metal"))]
+    {
+        false
     }
 }
 

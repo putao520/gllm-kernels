@@ -30,6 +30,7 @@ cuda = ["burn-cuda"]
 rocm = ["burn-rocm"]
 wgpu = ["burn-wgpu"]
 metal = ["burn-mlx"]
+wgpu-kernel = ["wgpu", "dep:wgpu", "dep:pollster", "half"]
 
 # Fusion 支持
 fusion = ["burn/fusion", "burn-fusion"]
@@ -39,8 +40,12 @@ nccl = ["cudarc/nccl", "cuda"]
 
 # 自定义 kernels
 cuda-kernel = ["cudarc", "half"]
+fused-kernel = ["cuda-kernel"]
+mamba-kernel = ["cuda-kernel"]
+softmax-kernel = ["cuda-kernel"]
 rocm-kernel = ["half"]
 metal-kernel = ["metal", "dep:metal", "dep:objc"]
+paged-kernel = ["cuda-kernel", "rocm-kernel", "metal-kernel"]
 
 # 自动下载 kernels（默认禁用，按需启用）
 kernel-downloader = ["dep:ureq"]
@@ -76,6 +81,8 @@ cudarc = { version = "0.18", optional = true, default-features = false, features
 half = { version = "2.7", optional = true }
 metal = { version = "0.29", optional = true }
 objc = { version = "0.2", optional = true }
+wgpu = { version = "26.0", optional = true }
+pollster = { version = "0.4", optional = true }
 
 [dev-dependencies]
 criterion = "0.5"

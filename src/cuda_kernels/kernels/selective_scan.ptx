@@ -1,0 +1,2 @@
+// Placeholder PTX for selective scan.
+// Set GLLM_SELECTIVE_SCAN_PTX to a compiled PTX or enable NVRTC compilation.

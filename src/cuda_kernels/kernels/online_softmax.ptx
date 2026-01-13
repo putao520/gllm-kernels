@@ -1,0 +1,2 @@
+// Placeholder PTX for online softmax.
+// Set GLLM_ONLINE_SOFTMAX_PTX to a compiled PTX or enable NVRTC compilation.

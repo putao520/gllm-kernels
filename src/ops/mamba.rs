@@ -4,6 +4,12 @@ use std::marker::PhantomData;
 
 use burn::tensor::backend::Backend;
 use burn::tensor::{Tensor, TensorData};
+#[cfg(feature = "mamba-kernel")]
+use crate::cuda_kernels::SelectiveScanKernel as CudaSelectiveScanKernel;
+#[cfg(feature = "mamba-kernel")]
+use cudarc::driver::CudaContext;
+#[cfg(feature = "mamba-kernel")]
+use std::sync::Arc;
 
 /// Mamba block configuration for selective state space models.
 #[derive(Debug, Clone, Copy)]
@@ -19,6 +25,7 @@ pub struct MambaConfig {
 }
 
 /// Mamba block for selective state space modeling.
+#[derive(Debug, Clone)]
 pub struct MambaBlock<B: Backend> {
     /// State space dimension.
     state_dim: usize,
@@ -357,6 +364,9 @@ fn softplus(x: f32) -> f32 {
     }
 }
 
+const EXP_CLAMP_MIN: f32 = -50.0;
+const EXP_CLAMP_MAX: f32 = 20.0;
+
 fn clamp_weight(weight: f32) -> f32 {
     if weight < 0.0 {
         0.0
@@ -438,6 +448,287 @@ fn blend_adaptive<B: Backend>(
     ))
 }
 
+/// Forward selective scan using CUDA when available, falling back to CPU.
+pub fn selective_scan_forward<B: Backend + 'static>(
+    u: Tensor<B, 3>,
+    delta: Tensor<B, 3>,
+    a: Tensor<B, 2>,
+    b: Tensor<B, 3>,
+    c: Tensor<B, 3>,
+) -> Result<Tensor<B, 3>, &'static str> {
+    selective_scan_forward_with_kernel(u, delta, a, b, c, true)
+}
+
+/// Forward selective scan with explicit kernel toggle.
+pub fn selective_scan_forward_with_kernel<B: Backend + 'static>(
+    u: Tensor<B, 3>,
+    delta: Tensor<B, 3>,
+    a: Tensor<B, 2>,
+    b: Tensor<B, 3>,
+    c: Tensor<B, 3>,
+    use_kernel: bool,
+) -> Result<Tensor<B, 3>, &'static str> {
+    let [batch, seq_len, expanded_dim] = u.dims();
+    if delta.dims() != [batch, seq_len, expanded_dim] {
+        return Err("delta shape mismatch");
+    }
+    let [state_dim, a_expanded] = a.dims();
+    if a_expanded != expanded_dim {
+        return Err("A shape mismatch");
+    }
+    if b.dims() != [batch, seq_len, state_dim] {
+        return Err("B shape mismatch");
+    }
+    if c.dims() != [batch, seq_len, state_dim] {
+        return Err("C shape mismatch");
+    }
+
+    if use_kernel {
+        #[cfg(feature = "mamba-kernel")]
+        {
+            if is_cuda_backend::<B>() {
+                if let Some(output) = try_forward_cuda_kernel(&u, &delta, &a, &b, &c) {
+                    return Ok(output);
+                }
+            }
+        }
+    }
+
+    let device = u.device();
+    let u_data = u
+        .into_data()
+        .into_vec::<f32>()
+        .map_err(|_| "u conversion failed")?;
+    let delta_data = delta
+        .into_data()
+        .into_vec::<f32>()
+        .map_err(|_| "delta conversion failed")?;
+    let a_data = a
+        .into_data()
+        .into_vec::<f32>()
+        .map_err(|_| "A conversion failed")?;
+    let b_data = b
+        .into_data()
+        .into_vec::<f32>()
+        .map_err(|_| "B conversion failed")?;
+    let c_data = c
+        .into_data()
+        .into_vec::<f32>()
+        .map_err(|_| "C conversion failed")?;
+
+    let output = selective_scan_cpu(
+        &u_data,
+        &delta_data,
+        &a_data,
+        &b_data,
+        &c_data,
+        batch,
+        seq_len,
+        state_dim,
+        expanded_dim,
+    )?;
+
+    Ok(Tensor::from_data(
+        TensorData::new(output, [batch, seq_len, expanded_dim]),
+        &device,
+    ))
+}
+
+fn selective_scan_cpu(
+    u: &[f32],
+    delta: &[f32],
+    a: &[f32],
+    b: &[f32],
+    c: &[f32],
+    batch_size: usize,
+    seq_len: usize,
+    state_dim: usize,
+    expanded_dim: usize,
+) -> Result<Vec<f32>, &'static str> {
+    let expected_ud = batch_size
+        .checked_mul(seq_len)
+        .and_then(|value| value.checked_mul(expanded_dim))
+        .ok_or("u/delta length overflow")?;
+    let expected_a = state_dim
+        .checked_mul(expanded_dim)
+        .ok_or("A length overflow")?;
+    let expected_bc = batch_size
+        .checked_mul(seq_len)
+        .and_then(|value| value.checked_mul(state_dim))
+        .ok_or("B/C length overflow")?;
+
+    if u.len() != expected_ud || delta.len() != expected_ud {
+        return Err("u/delta length mismatch");
+    }
+    if a.len() != expected_a {
+        return Err("A length mismatch");
+    }
+    if b.len() != expected_bc || c.len() != expected_bc {
+        return Err("B/C length mismatch");
+    }
+
+    let mut output = vec![0.0f32; expected_ud];
+    let per_batch_ud = seq_len * expanded_dim;
+    let per_batch_bc = seq_len * state_dim;
+
+    for b_idx in 0..batch_size {
+        let base_ud = b_idx * per_batch_ud;
+        let base_bc = b_idx * per_batch_bc;
+        for d in 0..expanded_dim {
+            let mut state = vec![0.0f32; state_dim];
+            for t in 0..seq_len {
+                let ud_idx = base_ud + t * expanded_dim + d;
+                let dt = delta[ud_idx];
+                let u_val = u[ud_idx];
+                let input = dt * u_val;
+
+                let bc_offset = base_bc + t * state_dim;
+                let mut sum = 0.0f32;
+                for s in 0..state_dim {
+                    let a_val = a[s * expanded_dim + d];
+                    let decay_arg = (dt * a_val).clamp(EXP_CLAMP_MIN, EXP_CLAMP_MAX);
+                    let decay = decay_arg.exp();
+                    let x = state[s] * decay + b[bc_offset + s] * input;
+                    state[s] = x;
+                    sum += c[bc_offset + s] * x;
+                }
+                output[ud_idx] = sum;
+            }
+        }
+    }
+
+    Ok(output)
+}
+
+#[cfg(feature = "mamba-kernel")]
+fn try_forward_cuda_kernel<B: Backend + 'static>(
+    u: &Tensor<B, 3>,
+    delta: &Tensor<B, 3>,
+    a: &Tensor<B, 2>,
+    b: &Tensor<B, 3>,
+    c: &Tensor<B, 3>,
+) -> Option<Tensor<B, 3>>
+where
+    B::FloatElem: 'static,
+{
+    use std::any::{Any, TypeId};
+
+    let [batch, seq_len, expanded_dim] = u.dims();
+    let [state_dim, a_expanded] = a.dims();
+    if a_expanded != expanded_dim {
+        log::warn!("CUDA selective scan fallback: A shape mismatch");
+        return None;
+    }
+    if delta.dims() != [batch, seq_len, expanded_dim] {
+        log::warn!("CUDA selective scan fallback: delta shape mismatch");
+        return None;
+    }
+    if b.dims() != [batch, seq_len, state_dim] {
+        log::warn!("CUDA selective scan fallback: B shape mismatch");
+        return None;
+    }
+    if c.dims() != [batch, seq_len, state_dim] {
+        log::warn!("CUDA selective scan fallback: C shape mismatch");
+        return None;
+    }
+
+    let device = u.device();
+    let cuda_index = {
+        #[cfg(feature = "cuda")]
+        {
+            let device_any = &device as &dyn Any;
+            if let Some(cuda_device) = device_any.downcast_ref::<burn_cuda::CudaDevice>() {
+                cuda_device.index
+            } else {
+                0
+            }
+        }
+        #[cfg(not(feature = "cuda"))]
+        {
+            0
+        }
+    };
+
+    let cuda_ctx = match CudaContext::new(cuda_index) {
+        Ok(ctx) => Arc::new(ctx),
+        Err(err) => {
+            log::warn!("CUDA selective scan fallback: device init failed: {err}");
+            return None;
+        }
+    };
+    let stream = cuda_ctx.default_stream();
+    let kernel = match CudaSelectiveScanKernel::new(&cuda_ctx) {
+        Ok(kernel) => kernel,
+        Err(err) => {
+            log::warn!("CUDA selective scan fallback: kernel load failed: {err}");
+            return None;
+        }
+    };
+
+    let elem_type = TypeId::of::<B::FloatElem>();
+    if elem_type != TypeId::of::<f32>() {
+        log::warn!("CUDA selective scan fallback: unsupported dtype");
+        return None;
+    }
+
+    let u_host = u.clone().into_data().into_vec::<f32>().ok()?;
+    let delta_host = delta.clone().into_data().into_vec::<f32>().ok()?;
+    let a_host = a.clone().into_data().into_vec::<f32>().ok()?;
+    let b_host = b.clone().into_data().into_vec::<f32>().ok()?;
+    let c_host = c.clone().into_data().into_vec::<f32>().ok()?;
+
+    let u_dev = stream.clone_htod(&u_host).ok()?;
+    let delta_dev = stream.clone_htod(&delta_host).ok()?;
+    let a_dev = stream.clone_htod(&a_host).ok()?;
+    let b_dev = stream.clone_htod(&b_host).ok()?;
+    let c_dev = stream.clone_htod(&c_host).ok()?;
+
+    let output = kernel
+        .forward(
+            &stream,
+            &u_dev,
+            &delta_dev,
+            &a_dev,
+            &b_dev,
+            &c_dev,
+            batch,
+            seq_len,
+            state_dim,
+            expanded_dim,
+        )
+        .ok()?;
+
+    let out_host = stream.clone_dtoh(&output).ok()?;
+    Some(Tensor::<B, 3>::from_data(
+        TensorData::new(out_host, [batch, seq_len, expanded_dim]),
+        &device,
+    ))
+}
+
+#[cfg(feature = "mamba-kernel")]
+fn is_cuda_backend<B: Backend + 'static>() -> bool {
+    #[cfg(feature = "cuda")]
+    {
+        use std::any::TypeId;
+
+        let type_id = TypeId::of::<B>();
+        if type_id == TypeId::of::<burn_cuda::Cuda>() {
+            return true;
+        }
+        #[cfg(feature = "fusion")]
+        {
+            if type_id == TypeId::of::<burn_fusion::Fusion<burn_cuda::Cuda>>() {
+                return true;
+            }
+        }
+        false
+    }
+    #[cfg(not(feature = "cuda"))]
+    {
+        false
+    }
+}
+
 #[cfg(all(test, feature = "cpu"))]
 mod tests {
     use super::*;
@@ -490,5 +781,24 @@ mod tests {
             .expect("output data");
         assert!((data[0] - 2.0).abs() < 1e-4);
         assert!((data[1] - 2.5).abs() < 1e-4);
+    }
+
+    #[test]
+    fn test_selective_scan_shapes() {
+        let device = <NdArray<f32> as Backend>::Device::default();
+        let u = Tensor::from_data(
+            TensorData::new(vec![0.1, 0.2, 0.3, 0.4, 0.5, 0.6], [1, 2, 3]),
+            &device,
+        );
+        let delta = Tensor::from_data(
+            TensorData::new(vec![0.01, 0.02, 0.03, 0.04, 0.05, 0.06], [1, 2, 3]),
+            &device,
+        );
+        let a = Tensor::from_data(TensorData::new(vec![0.1; 6], [2, 3]), &device);
+        let b = Tensor::from_data(TensorData::new(vec![0.2; 4], [1, 2, 2]), &device);
+        let c = Tensor::from_data(TensorData::new(vec![0.3; 4], [1, 2, 2]), &device);
+
+        let output = selective_scan_forward(u, delta, a, b, c).expect("selective scan");
+        assert_eq!(output.dims(), [1, 2, 3]);
     }
 }

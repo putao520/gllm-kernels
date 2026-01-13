@@ -1,0 +1,5 @@
+// Placeholder PTX for fused QKV attention kernel.
+// Compile fused_qkv_attention.cu to PTX and replace this file for faster startup.
+//
+// Example:
+//   nvcc -ptx -arch=sm_70 fused_qkv_attention.cu -o fused_qkv_attention.ptx

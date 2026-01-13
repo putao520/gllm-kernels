@@ -1,0 +1,298 @@
+//! Metal paged attention kernels.
+//!
+//! Provides a paged attention kernel wrapper that mirrors CUDA/HIP entry points.
+
+use std::fmt;
+use std::mem;
+use std::os::raw::c_void;
+
+use metal::{
+    Buffer, CommandQueue, ComputePipelineState, Device, Library, MTLResourceOptions, MTLSize,
+};
+
+const KERNEL_F32: &str = "paged_attention_forward_f32";
+const KERNEL_F16: &str = "paged_attention_forward_f16";
+const MAX_HEAD_DIM: usize = 256;
+
+const KERNEL_SOURCE: &str = include_str!("kernels/paged_attention.metal");
+
+#[repr(C)]
+#[derive(Copy, Clone, Debug)]
+struct PagedAttentionParams {
+    batch_size: u32,
+    num_heads: u32,
+    head_dim: u32,
+    block_size: u32,
+    seq_len: u32,
+    _pad0: u32,
+    _pad1: u32,
+    _pad2: u32,
+}
+
+/// Errors surfaced by the Metal paged attention kernels.
+#[derive(Debug)]
+pub enum PagedAttentionError {
+    /// Metal framework error.
+    Metal(String),
+    /// Invalid launch or shape configuration.
+    InvalidConfig(String),
+    /// Missing kernel entry point.
+    KernelMissing(&'static str),
+}
+
+impl fmt::Display for PagedAttentionError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Metal(msg) => write!(f, "Metal error: {msg}"),
+            Self::InvalidConfig(msg) => write!(f, "Invalid config: {msg}"),
+            Self::KernelMissing(name) => write!(f, "Kernel not found: {name}"),
+        }
+    }
+}
+
+impl std::error::Error for PagedAttentionError {}
+
+/// Paged attention Metal kernel wrapper.
+pub struct PagedAttentionKernel {
+    device: Device,
+    command_queue: CommandQueue,
+    pipeline_f32: ComputePipelineState,
+    pipeline_f16: ComputePipelineState,
+}
+
+impl PagedAttentionKernel {
+    /// Load paged attention kernels on the given device.
+    pub fn new(device: &Device) -> Result<Self, PagedAttentionError> {
+        let library = load_library(device)?;
+        let pipeline_f32 = build_pipeline(device, &library, KERNEL_F32)?;
+        let pipeline_f16 = build_pipeline(device, &library, KERNEL_F16)?;
+        let command_queue = device.new_command_queue();
+
+        Ok(Self {
+            device: device.clone(),
+            command_queue,
+            pipeline_f32,
+            pipeline_f16,
+        })
+    }
+
+    /// Paged attention forward for f32 inputs.
+    pub fn forward_f32(
+        &self,
+        q: &Buffer,
+        k_cache: &Buffer,
+        v_cache: &Buffer,
+        block_tables: &Buffer,
+        block_offsets: &Buffer,
+        batch_size: usize,
+        num_heads: usize,
+        head_dim: usize,
+        block_size: usize,
+        seq_len: usize,
+    ) -> Result<Buffer, PagedAttentionError> {
+        self.forward_impl(
+            q,
+            k_cache,
+            v_cache,
+            block_tables,
+            block_offsets,
+            batch_size,
+            num_heads,
+            head_dim,
+            block_size,
+            seq_len,
+            &self.pipeline_f32,
+            mem::size_of::<f32>(),
+        )
+    }
+
+    /// Paged attention forward for f16 inputs.
+    pub fn forward_f16(
+        &self,
+        q: &Buffer,
+        k_cache: &Buffer,
+        v_cache: &Buffer,
+        block_tables: &Buffer,
+        block_offsets: &Buffer,
+        batch_size: usize,
+        num_heads: usize,
+        head_dim: usize,
+        block_size: usize,
+        seq_len: usize,
+    ) -> Result<Buffer, PagedAttentionError> {
+        self.forward_impl(
+            q,
+            k_cache,
+            v_cache,
+            block_tables,
+            block_offsets,
+            batch_size,
+            num_heads,
+            head_dim,
+            block_size,
+            seq_len,
+            &self.pipeline_f16,
+            mem::size_of::<u16>(),
+        )
+    }
+
+    fn forward_impl(
+        &self,
+        q: &Buffer,
+        k_cache: &Buffer,
+        v_cache: &Buffer,
+        block_tables: &Buffer,
+        block_offsets: &Buffer,
+        batch_size: usize,
+        num_heads: usize,
+        head_dim: usize,
+        block_size: usize,
+        seq_len: usize,
+        pipeline: &ComputePipelineState,
+        element_size: usize,
+    ) -> Result<Buffer, PagedAttentionError> {
+        let (params, total_queries, output_len) =
+            build_params(batch_size, num_heads, head_dim, block_size, seq_len)?;
+
+        let output_len_u64 = u64::try_from(output_len)
+            .map_err(|_| PagedAttentionError::InvalidConfig("output_len exceeds u64".into()))?;
+        let output_bytes = output_len_u64
+            .checked_mul(element_size as u64)
+            .ok_or_else(|| PagedAttentionError::InvalidConfig("output size overflow".into()))?;
+
+        validate_buffer(q, output_bytes, "q")?;
+        validate_buffer(k_cache, k_cache.length() as u64, "k_cache")?;
+        validate_buffer(v_cache, v_cache.length() as u64, "v_cache")?;
+        validate_buffer(block_offsets, (batch_size * mem::size_of::<i32>()) as u64, "block_offsets")?;
+        validate_buffer(block_tables, block_tables.length() as u64, "block_tables")?;
+
+        let output = self
+            .device
+            .new_buffer(output_bytes, MTLResourceOptions::StorageModeShared);
+
+        let command_buffer = self.command_queue.new_command_buffer();
+        let encoder = command_buffer.new_compute_command_encoder();
+        encoder.set_compute_pipeline_state(pipeline);
+        encoder.set_buffer(0, Some(q), 0);
+        encoder.set_buffer(1, Some(k_cache), 0);
+        encoder.set_buffer(2, Some(v_cache), 0);
+        encoder.set_buffer(3, Some(block_tables), 0);
+        encoder.set_buffer(4, Some(block_offsets), 0);
+        encoder.set_buffer(5, Some(&output), 0);
+
+        let params_size = mem::size_of::<PagedAttentionParams>() as u64;
+        encoder.set_bytes(6, params_size, &params as *const _ as *const c_void);
+
+        let threads_per_threadgroup = threads_per_threadgroup(pipeline);
+        let threads_per_grid = MTLSize::new(total_queries as u64, 1, 1);
+        encoder.dispatch_threads(threads_per_grid, threads_per_threadgroup);
+        encoder.end_encoding();
+
+        command_buffer.commit();
+        command_buffer.wait_until_completed();
+
+        Ok(output)
+    }
+}
+
+fn load_library(device: &Device) -> Result<Library, PagedAttentionError> {
+    let options = metal::CompileOptions::new();
+    device
+        .new_library_with_source(KERNEL_SOURCE, &options)
+        .map_err(PagedAttentionError::Metal)
+}
+
+fn build_pipeline(
+    device: &Device,
+    library: &Library,
+    name: &'static str,
+) -> Result<ComputePipelineState, PagedAttentionError> {
+    let function = library
+        .get_function(name, None)
+        .map_err(|_| PagedAttentionError::KernelMissing(name))?;
+    device
+        .new_compute_pipeline_state_with_function(&function)
+        .map_err(PagedAttentionError::Metal)
+}
+
+fn build_params(
+    batch_size: usize,
+    num_heads: usize,
+    head_dim: usize,
+    block_size: usize,
+    seq_len: usize,
+) -> Result<(PagedAttentionParams, usize, usize), PagedAttentionError> {
+    if batch_size == 0 || num_heads == 0 || seq_len == 0 || head_dim == 0 || block_size == 0 {
+        return Err(PagedAttentionError::InvalidConfig(
+            "Dimensions must be > 0".into(),
+        ));
+    }
+    if head_dim > MAX_HEAD_DIM {
+        return Err(PagedAttentionError::InvalidConfig(format!(
+            "head_dim {} exceeds MAX_HEAD_DIM {}",
+            head_dim, MAX_HEAD_DIM
+        )));
+    }
+
+    let batch_size_u32 = u32::try_from(batch_size)
+        .map_err(|_| PagedAttentionError::InvalidConfig("batch_size exceeds u32".into()))?;
+    let num_heads_u32 = u32::try_from(num_heads)
+        .map_err(|_| PagedAttentionError::InvalidConfig("num_heads exceeds u32".into()))?;
+    let head_dim_u32 = u32::try_from(head_dim)
+        .map_err(|_| PagedAttentionError::InvalidConfig("head_dim exceeds u32".into()))?;
+    let block_size_u32 = u32::try_from(block_size)
+        .map_err(|_| PagedAttentionError::InvalidConfig("block_size exceeds u32".into()))?;
+    let seq_len_u32 = u32::try_from(seq_len)
+        .map_err(|_| PagedAttentionError::InvalidConfig("seq_len exceeds u32".into()))?;
+
+    let total_queries = batch_size
+        .checked_mul(num_heads)
+        .and_then(|value| value.checked_mul(seq_len))
+        .ok_or_else(|| PagedAttentionError::InvalidConfig("num_queries overflow".into()))?;
+    if total_queries > u32::MAX as usize {
+        return Err(PagedAttentionError::InvalidConfig(
+            "num_queries exceeds u32".into(),
+        ));
+    }
+
+    let output_len = total_queries
+        .checked_mul(head_dim)
+        .ok_or_else(|| PagedAttentionError::InvalidConfig("output_len overflow".into()))?;
+
+    let params = PagedAttentionParams {
+        batch_size: batch_size_u32,
+        num_heads: num_heads_u32,
+        head_dim: head_dim_u32,
+        block_size: block_size_u32,
+        seq_len: seq_len_u32,
+        _pad0: 0,
+        _pad1: 0,
+        _pad2: 0,
+    };
+
+    Ok((params, total_queries, output_len))
+}
+
+fn validate_buffer(
+    buffer: &Buffer,
+    expected_bytes: u64,
+    name: &str,
+) -> Result<(), PagedAttentionError> {
+    if buffer.length() < expected_bytes {
+        return Err(PagedAttentionError::InvalidConfig(format!(
+            "{name} buffer too small: {} < {}",
+            buffer.length(),
+            expected_bytes
+        )));
+    }
+    Ok(())
+}
+
+fn threads_per_threadgroup(pipeline: &ComputePipelineState) -> MTLSize {
+    let max_threads = pipeline.max_total_threads_per_threadgroup() as u64;
+    let mut width = max_threads.min(256);
+    if width == 0 {
+        width = 1;
+    }
+    MTLSize::new(width, 1, 1)
+}

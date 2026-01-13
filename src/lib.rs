@@ -8,6 +8,8 @@ pub mod cuda_kernels;
 pub mod hip_kernels;
 #[cfg(feature = "metal-kernel")]
 pub mod metal_kernels;
+#[cfg(feature = "wgpu-kernel")]
+pub mod wgpu_kernels;
 pub mod device;
 pub mod ops;
 pub mod types;
@@ -32,3 +34,5 @@ pub use kernel_cache::{
 };
 #[cfg(feature = "kernel-downloader")]
 pub use kernel_downloader::{KernelDownloader, KernelDownloadError};
+#[cfg(feature = "wgpu-kernel")]
+pub use wgpu_kernels::FlashAttentionKernel;

@@ -99,9 +99,9 @@ impl KernelDownloader {
         device_info: &DeviceInfo,
     ) -> Result<(), KernelDownloadError> {
         let kernels = match backend {
-            BackendType::Cuda => vec!["flash_attention", "tiled_attention"],
-            BackendType::Rocm => vec!["flash_attention"],
-            BackendType::Metal => vec!["flash_attention"],
+            BackendType::Cuda => vec!["flash_attention", "tiled_attention", "paged_attention"],
+            BackendType::Rocm => vec!["flash_attention", "paged_attention"],
+            BackendType::Metal => vec!["flash_attention", "paged_attention"],
             _ => vec![],
         };
 
