@@ -2,7 +2,9 @@
 
 using namespace metal;
 
-constexpr uint MAX_HEAD_DIM = 256;
+// Metal requires constant address space for program-scope variables
+// Use macro for array size to ensure compile-time constant
+#define MAX_HEAD_DIM 256
 
 struct PagedAttentionParams {
     uint batch_size;
