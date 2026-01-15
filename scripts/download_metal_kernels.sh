@@ -115,9 +115,11 @@ fi
 
 # Download artifact
 echo "Downloading artifact: $ARTIFACT_NAME..."
-cd "$TEMP_DIR"
+# Stay in project root so gh can find the repository
+pushd "$PROJECT_ROOT" > /dev/null
 
 if ! gh run download "$RUN_ID" --name "$ARTIFACT_NAME" --dir "$TEMP_DIR"; then
+    popd > /dev/null
     echo "Error: Failed to download artifact."
     echo ""
     echo "This could mean:"
@@ -130,6 +132,7 @@ if ! gh run download "$RUN_ID" --name "$ARTIFACT_NAME" --dir "$TEMP_DIR"; then
     rm -rf "$TEMP_DIR"
     exit 1
 fi
+popd > /dev/null
 
 # List downloaded files
 echo ""
