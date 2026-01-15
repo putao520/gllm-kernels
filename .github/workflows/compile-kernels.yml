@@ -125,7 +125,7 @@ jobs:
           retention-days: 90
 
   # ========================================
-  # Metal Kernels 编译
+  # Metal Kernels 编译 (直接嵌入源码目录)
   # ========================================
   compile-metal:
     name: Compile Metal Kernels
@@ -141,24 +141,33 @@ jobs:
           xcrun --sdk macosx --show-sdk-path
           xcrun --sdk macosx metal --version
 
-      - name: Create cache directory
-        run: mkdir -p ~/.gsc/gllm/kernels
-
-      - name: Compile Metal kernels
+      - name: Compile Metal kernels to source directory
         run: |
-          echo "Compiling Metal kernels to metallib (intermediate representation)..."
-          bash scripts/compile-kernels.sh 2>&1 | grep -A 100 "Metal"
+          echo "Compiling Metal kernels to metallib (embedded in source)..."
+          # 使用专门的 Metal 编译脚本，输出到 src/metal_kernels/kernels/
+          bash scripts/compile_metal_kernels.sh
 
       - name: List compiled kernels
         run: |
-          echo "Compiled Metal kernels:"
-          find ~/.gsc/gllm/kernels/metal -type f -name "*.metallib" | sort
+          echo "Compiled Metal kernels (embedded in source):"
+          ls -la src/metal_kernels/kernels/*.metallib
+          echo ""
+          echo "File sizes:"
+          du -h src/metal_kernels/kernels/*.metallib
 
-      - name: Get cache size
+      - name: Upload Metal kernels (for embedding)
+        uses: actions/upload-artifact@v4
+        with:
+          name: metal-kernels-embedded
+          path: src/metal_kernels/kernels/*.metallib
+          retention-days: 90
+
+      - name: Also compile to cache for compatibility
         run: |
-          du -sh ~/.gsc/gllm/kernels/metal
+          mkdir -p ~/.gsc/gllm/kernels/metal
+          cp src/metal_kernels/kernels/*.metallib ~/.gsc/gllm/kernels/metal/ || true
 
-      - name: Upload Metal kernels
+      - name: Upload Metal kernels (cache format)
         uses: actions/upload-artifact@v4
         with:
           name: kernels-metal
