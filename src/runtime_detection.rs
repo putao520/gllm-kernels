@@ -1,5 +1,7 @@
 //! Runtime backend detection with caching and auto-recovery.
 
+use std::collections::hash_map::DefaultHasher;
+use std::hash::{Hash, Hasher};
 use std::path::PathBuf;
 use std::sync::OnceLock;
 
@@ -11,6 +13,217 @@ pub struct BackendDetectionResult {
     pub timestamp: i64,
     pub hostname: String,
     pub arch: Option<String>, // GPU 架构 (如 sm_86, gfx1030, apple-m1)
+}
+
+/// GPU capabilities for device detection and model selection.
+///
+/// This struct provides detailed information about the available GPU/compute device,
+/// including VRAM size, device name, and backend type.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct GpuCapabilities {
+    /// Device name (e.g., "NVIDIA GeForce RTX 4090", "Apple M2 Pro")
+    pub name: String,
+    /// Backend type (CUDA, ROCm, Metal, WGPU, CPU)
+    pub backend_type: BackendType,
+    /// GPU architecture (e.g., "sm_89", "gfx1100", "apple-m2")
+    pub arch: Option<String>,
+    /// Total VRAM in bytes (0 for CPU)
+    pub vram_bytes: u64,
+    /// Whether GPU is available and usable
+    pub gpu_available: bool,
+    /// Recommended batch size based on VRAM
+    pub recommended_batch_size: usize,
+    /// Backend name for display
+    pub backend_name: String,
+}
+
+/// Cached GPU capabilities (static singleton)
+static CACHED_GPU_CAPS: OnceLock<GpuCapabilities> = OnceLock::new();
+
+impl GpuCapabilities {
+    /// Detect GPU capabilities (cached after first call).
+    ///
+    /// This is the primary entry point for GPU detection.
+    /// Results are cached for the lifetime of the process.
+    pub fn detect() -> &'static GpuCapabilities {
+        CACHED_GPU_CAPS.get_or_init(|| Self::detect_impl())
+    }
+
+    /// Force fresh detection without using cache.
+    ///
+    /// Use this when you need to re-detect after hardware changes.
+    pub fn detect_fresh() -> GpuCapabilities {
+        Self::detect_impl()
+    }
+
+    /// Internal detection implementation.
+    fn detect_impl() -> GpuCapabilities {
+        let backend_type = detect_backend_impl();
+        let arch = detect_device_arch(backend_type);
+        let (name, vram_bytes) = detect_device_details(backend_type);
+        let gpu_available = !matches!(backend_type, BackendType::Cpu);
+
+        // Calculate recommended batch size based on VRAM
+        let recommended_batch_size = if vram_bytes >= 24 * 1024 * 1024 * 1024 {
+            64 // 24GB+ VRAM
+        } else if vram_bytes >= 12 * 1024 * 1024 * 1024 {
+            32 // 12GB+ VRAM
+        } else if vram_bytes >= 8 * 1024 * 1024 * 1024 {
+            16 // 8GB+ VRAM
+        } else if vram_bytes >= 4 * 1024 * 1024 * 1024 {
+            8 // 4GB+ VRAM
+        } else if gpu_available {
+            4 // GPU with limited VRAM
+        } else {
+            8 // CPU default
+        };
+
+        GpuCapabilities {
+            name,
+            backend_type,
+            arch,
+            vram_bytes,
+            gpu_available,
+            recommended_batch_size,
+            backend_name: backend_type.name().to_string(),
+        }
+    }
+
+    /// Get VRAM size in bytes.
+    pub fn vram_bytes(&self) -> u64 {
+        self.vram_bytes
+    }
+
+    /// Check if GPU is available and usable.
+    pub fn is_gpu_available(&self) -> bool {
+        self.gpu_available
+    }
+
+    /// Generate a unique fingerprint for this device configuration.
+    ///
+    /// Used for cache invalidation when hardware changes.
+    pub fn fingerprint(&self) -> String {
+        let mut hasher = DefaultHasher::new();
+        self.name.hash(&mut hasher);
+        self.backend_type.as_str().hash(&mut hasher);
+        self.arch.hash(&mut hasher);
+        self.vram_bytes.hash(&mut hasher);
+        format!("{:016x}", hasher.finish())
+    }
+}
+
+/// Detect device name and VRAM for the given backend.
+fn detect_device_details(backend_type: BackendType) -> (String, u64) {
+    match backend_type {
+        BackendType::Cuda => detect_cuda_details(),
+        BackendType::Rocm => detect_rocm_details(),
+        BackendType::Metal => detect_metal_details(),
+        BackendType::Wgpu => detect_wgpu_details(),
+        BackendType::Cpu => ("CPU".to_string(), 0),
+    }
+}
+
+/// Detect CUDA device details (runtime via cudarc dynamic loading).
+fn detect_cuda_details() -> (String, u64) {
+    use cudarc::driver::result;
+
+    if result::init().is_ok() {
+        if let Ok(dev) = result::device::get(0) {
+            let name = result::device::get_name(dev).unwrap_or_else(|_| "NVIDIA GPU".to_string());
+            let vram = unsafe { result::device::total_mem(dev).unwrap_or(0) as u64 };
+            return (name, vram);
+        }
+    }
+    ("NVIDIA GPU (not available)".to_string(), 0)
+}
+
+/// Detect ROCm device details (Linux only).
+#[cfg(target_os = "linux")]
+fn detect_rocm_details() -> (String, u64) {
+    // Try to read from sysfs
+    let name = std::fs::read_to_string("/sys/class/drm/card0/device/product_name")
+        .or_else(|_| std::fs::read_to_string("/sys/class/drm/card0/device/name"))
+        .unwrap_or_else(|_| "AMD GPU".to_string())
+        .trim()
+        .to_string();
+
+    // Try to get VRAM from sysfs
+    let vram = std::fs::read_to_string("/sys/class/drm/card0/device/mem_info_vram_total")
+        .ok()
+        .and_then(|s| s.trim().parse::<u64>().ok())
+        .unwrap_or(8 * 1024 * 1024 * 1024); // Default 8GB
+
+    (name, vram)
+}
+
+#[cfg(not(target_os = "linux"))]
+fn detect_rocm_details() -> (String, u64) {
+    ("ROCm (not available)".to_string(), 0)
+}
+
+/// Detect Metal device details (macOS only).
+#[cfg(target_os = "macos")]
+fn detect_metal_details() -> (String, u64) {
+    use metal::Device;
+
+    if let Some(device) = Device::system_default() {
+        let name = device.name().to_string();
+        // Metal doesn't expose VRAM directly, estimate based on device
+        let vram = if name.contains("M3 Max") || name.contains("M2 Ultra") {
+            128 * 1024 * 1024 * 1024 // 128GB unified memory
+        } else if name.contains("M3 Pro") || name.contains("M2 Max") {
+            64 * 1024 * 1024 * 1024 // 64GB
+        } else if name.contains("M2 Pro") || name.contains("M1 Max") {
+            32 * 1024 * 1024 * 1024 // 32GB
+        } else if name.contains("M2") || name.contains("M1 Pro") {
+            16 * 1024 * 1024 * 1024 // 16GB
+        } else {
+            8 * 1024 * 1024 * 1024 // 8GB default
+        };
+        return (name, vram);
+    }
+    ("Apple GPU".to_string(), 8 * 1024 * 1024 * 1024)
+}
+
+#[cfg(not(target_os = "macos"))]
+fn detect_metal_details() -> (String, u64) {
+    ("Metal (not available)".to_string(), 0)
+}
+
+/// Detect WGPU device details (cross-platform, always available).
+fn detect_wgpu_details() -> (String, u64) {
+    let instance = wgpu::Instance::new(&wgpu::InstanceDescriptor::default());
+
+    if let Ok(adapter) = pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
+        power_preference: wgpu::PowerPreference::HighPerformance,
+        ..Default::default()
+    })) {
+        let info = adapter.get_info();
+        let name = info.name.clone();
+
+        // Get memory limits
+        let limits = adapter.limits();
+        // WGPU doesn't expose total VRAM, use max buffer size as estimate
+        let vram = limits.max_buffer_size;
+
+        return (name, vram);
+    }
+    ("WGPU Device".to_string(), 4 * 1024 * 1024 * 1024) // Default 4GB
+}
+
+/// Internal backend detection (without caching).
+fn detect_backend_impl() -> BackendType {
+    if try_cuda() {
+        BackendType::Cuda
+    } else if try_rocm() {
+        BackendType::Rocm
+    } else if try_metal() {
+        BackendType::Metal
+    } else if try_wgpu() {
+        BackendType::Wgpu
+    } else {
+        BackendType::Cpu
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -203,24 +416,12 @@ fn save_cached_detection(result: &BackendDetectionResult) {
     }
 }
 
-/// Get device ID for a backend.
+/// Get device ID for a backend (runtime detection, no feature flags).
 fn get_device_id(backend_type: BackendType) -> Option<String> {
     match backend_type {
-        #[cfg(feature = "cuda")]
         BackendType::Cuda => Some("cuda:0".to_string()),
-        #[cfg(not(feature = "cuda"))]
-        BackendType::Cuda => None,
-
-        #[cfg(feature = "rocm")]
         BackendType::Rocm => Some("rocm:0".to_string()),
-        #[cfg(not(feature = "rocm"))]
-        BackendType::Rocm => None,
-
-        #[cfg(feature = "metal")]
         BackendType::Metal => Some("metal:default".to_string()),
-        #[cfg(not(feature = "metal"))]
-        BackendType::Metal => None,
-
         BackendType::Wgpu => Some("wgpu:default".to_string()),
         BackendType::Cpu => Some("cpu:default".to_string()),
     }
@@ -233,9 +434,9 @@ fn hostname() -> String {
     })
 }
 
-// Backend-specific detection functions
+// Backend-specific detection functions (runtime, no feature flags)
 
-#[cfg(feature = "cuda")]
+/// Try to initialize CUDA via cudarc's dynamic loading.
 fn try_cuda() -> bool {
     use cudarc::driver::result;
 
@@ -251,28 +452,25 @@ fn try_cuda() -> bool {
     }
 }
 
-#[cfg(not(feature = "cuda"))]
-fn try_cuda() -> bool {
-    false
-}
-
-#[cfg(all(feature = "rocm", target_os = "linux"))]
+/// Try to detect ROCm (AMD GPU) via /dev/kfd.
+#[cfg(target_os = "linux")]
 fn try_rocm() -> bool {
     if std::path::Path::new("/dev/kfd").exists() {
         log::info!("ROCm backend detected");
         true
     } else {
-        log::debug!("ROCm not available");
+        log::debug!("ROCm not available: /dev/kfd not found");
         false
     }
 }
 
-#[cfg(not(all(feature = "rocm", target_os = "linux")))]
+#[cfg(not(target_os = "linux"))]
 fn try_rocm() -> bool {
     false
 }
 
-#[cfg(all(feature = "metal", target_os = "macos"))]
+/// Try to detect Metal (macOS GPU).
+#[cfg(target_os = "macos")]
 fn try_metal() -> bool {
     use metal::Device;
 
@@ -285,44 +483,50 @@ fn try_metal() -> bool {
     }
 }
 
-#[cfg(not(all(feature = "metal", target_os = "macos")))]
+#[cfg(not(target_os = "macos"))]
 fn try_metal() -> bool {
     false
 }
 
-#[cfg(feature = "wgpu")]
+/// Try to detect WGPU (cross-platform GPU).
 fn try_wgpu() -> bool {
-    log::info!("WGPU backend available");
-    true
-}
+    let instance = wgpu::Instance::new(&wgpu::InstanceDescriptor::default());
+    let adapter = pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
+        power_preference: wgpu::PowerPreference::HighPerformance,
+        ..Default::default()
+    }));
 
-#[cfg(not(feature = "wgpu"))]
-fn try_wgpu() -> bool {
-    false
+    if adapter.is_ok() {
+        log::info!("WGPU backend available");
+        true
+    } else {
+        log::debug!("WGPU not available");
+        false
+    }
 }
 
 /// Detect device architecture for kernel selection.
 fn detect_device_arch(backend_type: BackendType) -> Option<String> {
     match backend_type {
-        #[cfg(feature = "cuda")]
         BackendType::Cuda => detect_cuda_arch(),
-        #[cfg(feature = "rocm")]
         BackendType::Rocm => detect_rocm_arch(),
-        #[cfg(feature = "metal")]
         BackendType::Metal => detect_metal_arch(),
-        _ => None,
+        BackendType::Wgpu => detect_wgpu_arch(),
+        BackendType::Cpu => None,
     }
 }
 
 /// Detect CUDA GPU architecture (compute capability).
-#[cfg(feature = "cuda")]
 fn detect_cuda_arch() -> Option<String> {
-    use cudarc::driver::result;
+    use cudarc::driver::{result, sys};
 
-    if let Ok(dev) = result::Device::get(0) {
-        // 获取计算能力
-        let major = dev.compute_capability_major().ok()?;
-        let minor = dev.compute_capability_minor().ok()?;
+    if let Ok(dev) = result::device::get(0) {
+        let major = unsafe {
+            result::device::get_attribute(dev, sys::CUdevice_attribute::CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MAJOR).ok()?
+        };
+        let minor = unsafe {
+            result::device::get_attribute(dev, sys::CUdevice_attribute::CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MINOR).ok()?
+        };
         Some(format!("sm_{}{}", major, minor))
     } else {
         None
@@ -330,22 +534,27 @@ fn detect_cuda_arch() -> Option<String> {
 }
 
 /// Detect AMD GPU architecture.
-#[cfg(feature = "rocm")]
+#[cfg(target_os = "linux")]
 fn detect_rocm_arch() -> Option<String> {
-    // 简化实现：读取 /sys/class/kfd/kfd/topology/... 中的信息
-    // 或者通过 rocm-smi 工具
-    // 这里返回一个通用的 RDNA2 架构作为示例
-    Some("gfx1030".to_string())
+    // Read from sysfs
+    std::fs::read_to_string("/sys/class/kfd/kfd/topology/nodes/0/name")
+        .ok()
+        .map(|s| s.trim().to_string())
+        .or_else(|| Some("gfx1030".to_string())) // Default RDNA2
+}
+
+#[cfg(not(target_os = "linux"))]
+fn detect_rocm_arch() -> Option<String> {
+    None
 }
 
 /// Detect Apple Silicon architecture.
-#[cfg(feature = "metal")]
+#[cfg(target_os = "macos")]
 fn detect_metal_arch() -> Option<String> {
     use metal::Device;
 
     if let Some(device) = Device::system_default() {
         let name = device.name();
-        // 根据 GPU 名称推断架构
         if name.contains("M1") {
             Some("apple-m1".to_string())
         } else if name.contains("M2") {
@@ -353,11 +562,28 @@ fn detect_metal_arch() -> Option<String> {
         } else if name.contains("M3") {
             Some("apple-m3".to_string())
         } else {
-            Some("apple-m1".to_string()) // 默认
+            Some("apple-m1".to_string())
         }
     } else {
         None
     }
+}
+
+#[cfg(not(target_os = "macos"))]
+fn detect_metal_arch() -> Option<String> {
+    None
+}
+
+/// Detect WGPU adapter architecture.
+fn detect_wgpu_arch() -> Option<String> {
+    let instance = wgpu::Instance::new(&wgpu::InstanceDescriptor::default());
+    let adapter = pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
+        power_preference: wgpu::PowerPreference::HighPerformance,
+        ..Default::default()
+    })).ok()?;
+
+    let info = adapter.get_info();
+    Some(format!("{:?}-{}", info.backend, info.device_type as u32))
 }
 
 /// Ensure kernels are downloaded and cached.
@@ -373,46 +599,20 @@ fn detect_metal_arch() -> Option<String> {
 /// use gllm_kernels::ensure_kernels;
 ///
 /// if let Err(e) = ensure_kernels() {
-///     eprintln!("Failed to download kernels: {}", e);
+///     eprintln!("Kernel verification failed: {}", e);
 /// }
 /// ```
+///
+/// Note: With Fat Binary architecture, all kernels are embedded at compile time.
+/// This function only verifies backend availability, no downloading is needed.
 pub fn ensure_kernels() -> Result<(), Box<dyn std::error::Error>> {
-    #[cfg(feature = "kernel-downloader")]
-    {
-        use crate::kernel_downloader::KernelDownloader;
-
-        let detection = CACHED_RESULT
-            .get()
-            .or_else(|| {
-                let result = perform_detection();
-                save_cached_detection(&result);
-                Some(result)
-            });
-
-        if let Some(info) = detection {
-            let downloader = KernelDownloader::new()?;
-
-            // 只为 GPU 后端下载 kernels
-            match info.backend_type {
-                BackendType::Cuda | BackendType::Rocm | BackendType::Metal => {
-                    if let Some(arch) = &info.arch {
-                        log::info!("Ensuring kernels for {} ({})", info.backend_type.name(), arch);
-                        downloader.download_all_kernels(&info.backend_type, &info.device_id.clone().map(|id| crate::runtime_detection::DeviceInfo {
-                            backend: info.backend_type,
-                            device_id: Some(id),
-                            arch: Some(arch.clone()),
-                        }).unwrap_or_else(|| crate::runtime_detection::DeviceInfo {
-                            backend: info.backend_type,
-                            device_id: None,
-                            arch: Some(arch.clone()),
-                        }))?;
-                    }
-                }
-                _ => {}
-            }
-        }
-    }
-
+    // Fat Binary 架构：所有 kernel 在编译时已嵌入
+    // 此函数仅验证后端可用性，无需下载
+    let detection = detect_backend();
+    log::info!(
+        "Backend detection: {} (kernels embedded at compile time)",
+        detection.name()
+    );
     Ok(())
 }
 

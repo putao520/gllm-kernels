@@ -4,3 +4,6 @@ Cargo.lock
 *.swo
 *~
 .DS_Store
+
+# SPEC documents (managed separately)
+SPEC/

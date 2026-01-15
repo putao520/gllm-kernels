@@ -786,17 +786,17 @@ mod tests {
     #[test]
     fn test_selective_scan_shapes() {
         let device = <NdArray<f32> as Backend>::Device::default();
-        let u = Tensor::from_data(
+        let u: Tensor<NdArray<f32>, 3> = Tensor::from_data(
             TensorData::new(vec![0.1, 0.2, 0.3, 0.4, 0.5, 0.6], [1, 2, 3]),
             &device,
         );
-        let delta = Tensor::from_data(
+        let delta: Tensor<NdArray<f32>, 3> = Tensor::from_data(
             TensorData::new(vec![0.01, 0.02, 0.03, 0.04, 0.05, 0.06], [1, 2, 3]),
             &device,
         );
-        let a = Tensor::from_data(TensorData::new(vec![0.1; 6], [2, 3]), &device);
-        let b = Tensor::from_data(TensorData::new(vec![0.2; 4], [1, 2, 2]), &device);
-        let c = Tensor::from_data(TensorData::new(vec![0.3; 4], [1, 2, 2]), &device);
+        let a: Tensor<NdArray<f32>, 2> = Tensor::from_data(TensorData::new(vec![0.1; 6], [2, 3]), &device);
+        let b: Tensor<NdArray<f32>, 3> = Tensor::from_data(TensorData::new(vec![0.2; 4], [1, 2, 2]), &device);
+        let c: Tensor<NdArray<f32>, 3> = Tensor::from_data(TensorData::new(vec![0.3; 4], [1, 2, 2]), &device);
 
         let output = selective_scan_forward(u, delta, a, b, c).expect("selective scan");
         assert_eq!(output.dims(), [1, 2, 3]);

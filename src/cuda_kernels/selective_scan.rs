@@ -7,13 +7,27 @@ use cudarc::driver::{
     CudaContext, CudaFunction, CudaModule, CudaSlice, CudaStream, DriverError, LaunchConfig,
     PushKernelArg,
 };
-use cudarc::nvrtc::Ptx;
+
+use crate::cuda_kernels::ptx_loader::{PtxCollection, PtxLoadError};
 
 const KERNEL_F32: &str = "selective_scan_fwd";
-const PRECOMPILED_PTX: &str = include_str!("kernels/selective_scan.ptx");
-const KERNEL_SOURCE: &str = include_str!("kernels/selective_scan.cu");
 const MIN_BLOCK: usize = 32;
 const MAX_BLOCK: usize = 256;
+
+/// CUDA source for runtime compilation.
+const KERNEL_SOURCE: &str = include_str!("kernels/selective_scan.cu");
+
+/// SM-aware PTX collection for selective scan kernel.
+static SELECTIVE_SCAN_PTX: PtxCollection = PtxCollection {
+    kernel_name: "selective_scan",
+    source: KERNEL_SOURCE,
+    ptx_versions: &[
+        // SM 61 (Pascal) - GTX 1060/1070/1080
+        (61, include_str!("kernels/selective_scan_sm61.ptx")),
+        // SM 80 (Ampere) - default for A100/RTX 30 series and higher
+        (80, include_str!("kernels/selective_scan.ptx")),
+    ],
+};
 
 /// Errors surfaced by the CUDA selective scan kernel.
 #[derive(Debug)]
@@ -24,6 +38,8 @@ pub enum SelectiveScanError {
     InvalidConfig(String),
     /// Missing kernel entry point.
     KernelMissing(&'static str),
+    /// PTX loading error.
+    PtxLoad(PtxLoadError),
 }
 
 impl fmt::Display for SelectiveScanError {
@@ -32,6 +48,7 @@ impl fmt::Display for SelectiveScanError {
             Self::Driver(err) => write!(f, "CUDA driver error: {err}"),
             Self::InvalidConfig(msg) => write!(f, "Invalid config: {msg}"),
             Self::KernelMissing(name) => write!(f, "Kernel not found: {name}"),
+            Self::PtxLoad(err) => write!(f, "PTX loading error: {err}"),
         }
     }
 }
@@ -44,6 +61,12 @@ impl From<DriverError> for SelectiveScanError {
     }
 }
 
+impl From<PtxLoadError> for SelectiveScanError {
+    fn from(err: PtxLoadError) -> Self {
+        Self::PtxLoad(err)
+    }
+}
+
 /// Selective scan CUDA kernel wrapper.
 pub struct SelectiveScanKernel {
     #[allow(dead_code)]
@@ -53,8 +76,12 @@ pub struct SelectiveScanKernel {
 
 impl SelectiveScanKernel {
     /// Load a selective scan kernel module on the given device.
+    ///
+    /// This method automatically selects the best PTX binary for the detected GPU:
+    /// - Uses precompiled PTX for matching SM version
+    /// - Falls back to NVRTC runtime compilation if needed
     pub fn new(ctx: &Arc<CudaContext>) -> Result<Self, SelectiveScanError> {
-        let ptx = load_ptx()?;
+        let ptx = SELECTIVE_SCAN_PTX.load(ctx)?;
         let module = ctx.load_module(ptx)?;
 
         let kernel_f32 = module
@@ -104,31 +131,6 @@ impl SelectiveScanKernel {
 
         Ok(output)
     }
-}
-
-fn load_ptx() -> Result<Ptx, SelectiveScanError> {
-    // Priority 1: Check if precompiled PTX is valid (not a placeholder)
-    if !PRECOMPILED_PTX.contains("Placeholder") {
-        log::debug!("Loading precompiled PTX from embedded data");
-        return Ok(Ptx::from_src(PRECOMPILED_PTX));
-    }
-
-    // Priority 2: Try runtime compilation with NVRTC
-    #[cfg(feature = "nvrtc")]
-    {
-        log::debug!("Compiling PTX from source at runtime");
-        use cudarc::nvrtc::compile_ptx;
-        return compile_ptx(KERNEL_SOURCE).map_err(|e| {
-            SelectiveScanError::InvalidConfig(format!("NVRTC compilation failed: {}", e))
-        });
-    }
-
-    #[cfg(not(feature = "nvrtc"))]
-    Err(SelectiveScanError::InvalidConfig(
-        "PTX is a placeholder. Either: \n\
-         1. Compile with: nvcc -ptx -arch=sm_61 selective_scan.cu -o selective_scan.ptx\n\
-         2. Enable 'nvrtc' feature and ensure CUDA toolkit is installed".into(),
-    ))
 }
 
 fn build_launch(

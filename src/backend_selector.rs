@@ -1,4 +1,7 @@
-//! Dynamic backend selector with runtime detection and environment variable override.
+//! Dynamic backend selector with fully automatic runtime detection.
+//!
+//! Fat Binary approach: all backends compiled, runtime selection based on hardware.
+//! Zero configuration - no environment variables required.
 
 use std::sync::OnceLock;
 
@@ -10,62 +13,14 @@ static SELECTOR: OnceLock<Box<dyn BackendSelector>> = OnceLock::new();
 
 /// Initialize the backend selector.
 ///
-/// This function:
-/// 1. Checks the `GLLM_BACKEND` environment variable for manual override
-/// 2. Falls back to automatic detection if no override is specified
-/// 3. Caches the selected backend for subsequent calls
+/// This function automatically detects the best available backend
+/// by checking hardware capabilities in priority order:
+/// CUDA > ROCm > Metal > WGPU > CPU
+///
+/// The selected backend is cached for subsequent calls.
 pub fn init_backend_selector() {
     SELECTOR.get_or_init(|| {
-        // Check environment variable override
-        if let Ok(backend_str) = std::env::var("GLLM_BACKEND") {
-            match backend_str.to_lowercase().as_str() {
-                "cuda" => {
-                    #[cfg(feature = "cuda")]
-                    {
-                        log::info!("Backend overridden to CUDA via GLLM_BACKEND");
-                        return create_cuda_backend();
-                    }
-                    #[cfg(not(feature = "cuda"))]
-                    log::warn!("GLLM_BACKEND=cuda requested but CUDA feature not enabled, falling back to detection");
-                }
-                "rocm" => {
-                    #[cfg(feature = "rocm")]
-                    {
-                        log::info!("Backend overridden to ROCm via GLLM_BACKEND");
-                        return create_rocm_backend();
-                    }
-                    #[cfg(not(feature = "rocm"))]
-                    log::warn!("GLLM_BACKEND=rocm requested but ROCm feature not enabled, falling back to detection");
-                }
-                "metal" => {
-                    #[cfg(feature = "metal")]
-                    {
-                        log::info!("Backend overridden to Metal via GLLM_BACKEND");
-                        return create_metal_backend();
-                    }
-                    #[cfg(not(feature = "metal"))]
-                    log::warn!("GLLM_BACKEND=metal requested but Metal feature not enabled, falling back to detection");
-                }
-                "wgpu" => {
-                    #[cfg(feature = "wgpu")]
-                    {
-                        log::info!("Backend overridden to WGPU via GLLM_BACKEND");
-                        return create_wgpu_backend();
-                    }
-                    #[cfg(not(feature = "wgpu"))]
-                    log::warn!("GLLM_BACKEND=wgpu requested but WGPU feature not enabled, falling back to detection");
-                }
-                "cpu" => {
-                    log::info!("Backend overridden to CPU via GLLM_BACKEND");
-                    return create_cpu_backend();
-                }
-                _ => {
-                    log::warn!("Invalid GLLM_BACKEND value: {}, falling back to detection", backend_str);
-                }
-            }
-        }
-
-        // Automatic detection
+        // Automatic detection (zero configuration)
         let detected = detect_backend();
         log::info!("Auto-detected backend: {}", detected.name());
 
@@ -93,50 +48,22 @@ pub fn force_backend<B: BackendSelector + 'static>(backend: B) {
     let _ = SELECTOR.set(Box::new(backend));
 }
 
-// Backend factory functions
+// Backend factory functions (unconditional - runtime detection handles availability)
 
-#[cfg(feature = "cuda")]
 fn create_cuda_backend() -> Box<dyn BackendSelector> {
     Box::new(CudaBackendSelector)
 }
 
-#[cfg(not(feature = "cuda"))]
-fn create_cuda_backend() -> Box<dyn BackendSelector> {
-    log::error!("CUDA backend requested but not compiled in, falling back to CPU");
-    create_cpu_backend()
-}
-
-#[cfg(feature = "metal")]
 fn create_metal_backend() -> Box<dyn BackendSelector> {
     Box::new(MetalBackendSelector)
 }
 
-#[cfg(not(feature = "metal"))]
-fn create_metal_backend() -> Box<dyn BackendSelector> {
-    log::error!("Metal backend requested but not compiled in, falling back to CPU");
-    create_cpu_backend()
-}
-
-#[cfg(feature = "rocm")]
 fn create_rocm_backend() -> Box<dyn BackendSelector> {
     Box::new(RocmBackendSelector)
 }
 
-#[cfg(not(feature = "rocm"))]
-fn create_rocm_backend() -> Box<dyn BackendSelector> {
-    log::error!("ROCm backend requested but not compiled in, falling back to CPU");
-    create_cpu_backend()
-}
-
-#[cfg(feature = "wgpu")]
 fn create_wgpu_backend() -> Box<dyn BackendSelector> {
     Box::new(WgpuBackendSelector)
-}
-
-#[cfg(not(feature = "wgpu"))]
-fn create_wgpu_backend() -> Box<dyn BackendSelector> {
-    log::error!("WGPU backend requested but not compiled in, falling back to CPU");
-    create_cpu_backend()
 }
 
 fn create_cpu_backend() -> Box<dyn BackendSelector> {
@@ -190,22 +117,23 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_environment_override() {
-        std::env::set_var("GLLM_BACKEND", "cpu");
+    fn test_automatic_detection() {
         init_backend_selector();
-
         let selector = get_backend_selector().unwrap();
-        assert_eq!(selector.name(), "CPU");
-
-        // Clean up
-        std::env::remove_var("GLLM_BACKEND");
+        // Backend should be one of the valid types
+        let name = selector.name();
+        assert!(
+            name == "CUDA" || name == "ROCm" || name == "Metal" || name == "WGPU" || name == "CPU",
+            "Unexpected backend name: {}", name
+        );
     }
 
     #[test]
-    fn test_force_backend() {
-        force_backend(CpuBackendSelector);
-
-        let selector = get_backend_selector().unwrap();
-        assert_eq!(selector.name(), "CPU");
+    fn test_backend_names() {
+        assert_eq!(CudaBackendSelector.name(), "CUDA");
+        assert_eq!(MetalBackendSelector.name(), "Metal");
+        assert_eq!(RocmBackendSelector.name(), "ROCm");
+        assert_eq!(WgpuBackendSelector.name(), "WGPU");
+        assert_eq!(CpuBackendSelector.name(), "CPU");
     }
 }

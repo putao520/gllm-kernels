@@ -10,7 +10,7 @@
 //!
 //! This is analogous to CUDA's driver API (libcuda.so) vs runtime API (libcudart.so).
 
-use std::ffi::{c_char, c_int, c_uint, c_void, CStr};
+use std::ffi::{c_char, c_int, c_void, CStr};
 use std::ptr;
 use std::sync::OnceLock;
 
@@ -499,8 +499,11 @@ pub fn find_gpu_agents() -> Result<Vec<GpuAgent>, String> {
             .unwrap_or_else(|_| "Unknown GPU".to_string());
 
         // Find memory regions
+        #[allow(unused_assignments)]
         let mut kernarg_region: HsaRegion = 0;
+        #[allow(unused_assignments)]
         let mut fine_grained_region: HsaRegion = 0;
+        #[allow(unused_assignments)]
         let mut coarse_grained_region: HsaRegion = 0;
 
         #[repr(C)]

@@ -311,6 +311,7 @@ struct QuantizedTensor {
     data: QuantizedData,
     shape: [usize; 3],
     scale: f32,
+    #[allow(dead_code)]
     bits: u8,
     outliers: Vec<(usize, f32)>,
 }

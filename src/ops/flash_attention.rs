@@ -777,7 +777,7 @@ impl HierarchicalFlashAttention {
         }
 
         let output = Tensor::cat(outputs, 2);
-        B::sync(&output.device());
+        let _ = B::sync(&output.device());
         output
     }
 

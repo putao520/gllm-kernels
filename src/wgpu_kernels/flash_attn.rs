@@ -130,7 +130,7 @@ impl FlashAttentionKernel {
                 force_fallback_adapter: false,
             },
         ))
-        .ok_or_else(|| FlashAttentionError::Wgpu("no compatible adapter found".into()))?;
+        .map_err(|e| FlashAttentionError::Wgpu(format!("no compatible adapter found: {e}")))?;
 
         let mut features = wgpu::Features::empty();
         if require_f16 {
@@ -152,7 +152,6 @@ impl FlashAttentionKernel {
                 memory_hints: wgpu::MemoryHints::default(),
                 trace: wgpu::Trace::Off,
             },
-            None,
         ))
         .map_err(|err| FlashAttentionError::Wgpu(format!("request_device failed: {err}")))?;
 
@@ -384,7 +383,7 @@ fn uniform_layout_entry(binding: u32) -> wgpu::BindGroupLayoutEntry {
     }
 }
 
-fn buffer_binding(binding: u32, buffer: &Buffer) -> wgpu::BindGroupEntry {
+fn buffer_binding(binding: u32, buffer: &Buffer) -> wgpu::BindGroupEntry<'_> {
     wgpu::BindGroupEntry {
         binding,
         resource: buffer.as_entire_binding(),
@@ -496,7 +495,7 @@ fn read_buffer_sync(device: &Device, buffer: &Buffer, size: u64) -> Result<Vec<u
     slice.map_async(wgpu::MapMode::Read, move |result| {
         let _ = sender.send(result);
     });
-    device.poll(wgpu::Maintain::Wait);
+    let _ = device.poll(wgpu::PollType::Wait);
     match receiver.recv() {
         Ok(Ok(())) => {}
         Ok(Err(err)) => {

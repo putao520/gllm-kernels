@@ -28,6 +28,7 @@ pub enum SparsityPattern {
 /// Selected indices for sparse attention.
 #[derive(Debug, Clone)]
 pub struct SparseSelection {
+    #[allow(dead_code)]
     batch: usize,
     num_heads: usize,
     query_len: usize,

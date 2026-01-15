@@ -1,55 +1,38 @@
+//! Backend type definitions for burn tensor operations.
+//!
+//! This module provides the DefaultBackend type alias. In the runtime-detection
+//! architecture, we always use NdArray as the default backend for type definitions,
+//! while actual kernel execution happens through KernelDispatcher which routes
+//! to the appropriate GPU backend at runtime.
+
 use burn::tensor::backend::Backend;
 
-/// CUDA backend (NVIDIA GPU)
-#[cfg(all(feature = "cuda", feature = "fusion"))]
-pub type DefaultBackend = burn_fusion::Fusion<burn_cuda::Cuda>;
-
-/// CUDA backend (NVIDIA GPU)
-#[cfg(all(feature = "cuda", not(feature = "fusion")))]
-pub type DefaultBackend = burn_cuda::Cuda;
-
-/// ROCm backend (AMD GPU)
-#[cfg(all(
-    feature = "rocm",
-    feature = "fusion",
-    not(feature = "cuda"),
-    not(feature = "wgpu")
-))]
-pub type DefaultBackend = burn_fusion::Fusion<burn_rocm::Rocm>;
-
-/// ROCm backend (AMD GPU)
-#[cfg(all(
-    feature = "rocm",
-    not(feature = "fusion"),
-    not(feature = "cuda"),
-    not(feature = "wgpu")
-))]
-pub type DefaultBackend = burn_rocm::Rocm;
-
-/// WGPU backend (WebGPU/Vulkan - cross-platform GPU)
-#[cfg(all(feature = "wgpu", not(feature = "cuda")))]
-pub type DefaultBackend = burn_wgpu::Wgpu;
-
-/// Metal backend (Apple Silicon GPU)
-#[cfg(all(
-    feature = "metal",
-    not(feature = "cuda"),
-    not(feature = "rocm"),
-    not(feature = "wgpu")
-))]
-pub type DefaultBackend = burn_mlx::Mlx;
-
-/// CPU backend (fallback)
-#[cfg(all(
-    feature = "cpu",
-    not(feature = "cuda"),
-    not(feature = "rocm"),
-    not(feature = "metal"),
-    not(feature = "wgpu")
-))]
+/// Default backend for burn tensor operations.
+///
+/// In the runtime-detection architecture, we use NdArray (CPU) as the default
+/// backend type. GPU acceleration is achieved through KernelDispatcher, which
+/// detects available backends at runtime and dispatches to:
+/// - CUDA (NVIDIA GPUs via cudarc dynamic loading)
+/// - ROCm (AMD GPUs on Linux)
+/// - Metal (Apple Silicon on macOS)
+/// - WGPU (Cross-platform WebGPU/Vulkan)
+///
+/// # Example
+///
+/// ```ignore
+/// use gllm_kernels::{DefaultBackend, KernelDispatcher};
+/// use burn::tensor::Tensor;
+///
+/// // Create tensors using the default backend
+/// let tensor: Tensor<DefaultBackend, 2> = Tensor::zeros([4, 4]);
+///
+/// // For optimized operations, use KernelDispatcher
+/// let dispatcher = KernelDispatcher::new();
+/// // dispatcher routes to GPU kernels if available
+/// ```
 pub type DefaultBackend = burn_ndarray::NdArray<f32>;
 
-/// Select the default device for a backend
+/// Select the default device for a backend.
 pub fn select_device<B: Backend>() -> B::Device {
     B::Device::default()
 }

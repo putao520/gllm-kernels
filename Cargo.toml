@@ -4,7 +4,7 @@ version = "0.2.0"
 edition = "2021"
 authors = ["gllm contributors"]
 license = "Apache-2.0"
-description = "Low-level attention kernels for gllm with CUDA/ROCm support"
+description = "Low-level attention kernels with runtime backend selection (CUDA/ROCm/Metal/WGPU/CPU)"
 repository = "https://github.com/putao520/gllm-kernels"
 homepage = "https://github.com/putao520/gllm-kernels"
 keywords = ["attention", "kernels", "burn", "gpu", "tensor"]
@@ -15,43 +15,25 @@ name = "gllm_kernels"
 path = "src/lib.rs"
 
 [features]
-# Fat binary: 包含所有后端（推荐）
-default = ["cpu"]
-fat-binary = ["cpu", "cuda", "wgpu"]
+# 默认：全后端支持，运行时动态选择
+default = ["full"]
 
-# Platform-specific fat binaries
-fat-binary-linux = ["fat-binary", "rocm"]
-fat-binary-macos = ["fat-binary", "metal"]
-fat-binary-windows = ["fat-binary"]
+# 完整版：所有后端 + 所有 kernel（Fat Binary，全部预编译嵌入）
+full = ["all-backends", "all-kernels"]
 
-# 单独后端（高级用户/最小化二进制）
-cpu = ["burn-ndarray"]
-cuda = ["burn-cuda"]
-rocm = ["burn-rocm"]
-wgpu = ["burn-wgpu"]
-metal = ["burn-mlx"]
-wgpu-kernel = ["wgpu", "dep:wgpu", "dep:pollster", "half"]
+# 所有后端（运行时检测，动态加载）
+all-backends = []
 
-# Fusion 支持
+# 所有自定义 kernel
+all-kernels = []
+
+# Fusion 支持（可选优化）
 fusion = ["burn/fusion", "burn-fusion"]
 
-# NCCL 多 GPU（CUDA 专用）
-nccl = ["cudarc/nccl", "cuda"]
+# NCCL 多 GPU（需要 CUDA 环境）
+nccl = ["cudarc/nccl"]
 
-# 自定义 kernels
-cuda-kernel = ["cudarc", "half"]
-fused-kernel = ["cuda-kernel"]
-mamba-kernel = ["cuda-kernel"]
-softmax-kernel = ["cuda-kernel"]
-rocm-kernel = ["half"]
-metal-kernel = ["metal", "dep:metal", "dep:objc"]
-paged-kernel = ["cuda-kernel", "rocm-kernel", "metal-kernel"]
-
-# 自动下载 kernels（默认禁用，按需启用）
-kernel-downloader = ["dep:ureq"]
-
-# 编译优化
-no-test = []
+# Flash Attention v3 优化（Hopper+）
 flash-attention-v3 = [
     "flash-attention-v3-wgmma",
     "flash-attention-v3-async",
@@ -62,27 +44,48 @@ flash-attention-v3-wgmma = []
 flash-attention-v3-async = []
 flash-attention-v3-fp8 = []
 flash-attention-v3-block-quant = []
-# hip 等 burn 支持后再加
+
+# 精简版（仅 CPU，用于测试/CI）
+minimal = []
+
+# Backend-specific kernel features (for conditional compilation)
+cpu = []
+cuda = []
+cuda-kernel = []
+rocm-kernel = []
+metal-kernel = []
+wgpu-kernel = []
+fused-kernel = []
+mamba-kernel = []
+paged-kernel = []
+softmax-kernel = []
 
 [dependencies]
+# Burn tensor library (always included)
 burn = { version = "0.20.0-pre.6", default-features = false }
-burn-ndarray = { version = "0.20.0-pre.6", optional = true }
-burn-cuda = { version = "0.20.0-pre.6", optional = true }
-burn-rocm = { version = "0.20.0-pre.6", optional = true }
-burn-wgpu = { version = "0.20.0-pre.6", optional = true }
-burn-mlx = { version = "0.1.2", optional = true }
+burn-ndarray = { version = "0.20.0-pre.6" }  # CPU 后端，始终编译
 burn-fusion = { version = "0.20.0-pre.6", optional = true }
+
+# CUDA 支持（动态加载，运行时检测）
+cudarc = { version = "0.18", default-features = false, features = ["std", "driver", "nvrtc", "f16", "cuda-12090", "dynamic-loading"] }
+
+# WGPU 支持（跨平台 GPU）
+wgpu = { version = "26.0" }
+pollster = { version = "0.4" }
+
+# 通用依赖
 log = "0.4"
 crossbeam-channel = "0.5"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-ureq = { version = "2.9", default-features = false, features = ["tls"], optional = true }
-cudarc = { version = "0.18", optional = true, default-features = false, features = ["std", "driver", "nvrtc", "f16", "cuda-12090", "dynamic-loading"] }
-half = { version = "2.7", optional = true }
-metal = { version = "0.29", optional = true }
-objc = { version = "0.2", optional = true }
-wgpu = { version = "26.0", optional = true }
-pollster = { version = "0.4", optional = true }
+half = "2.7"
+libloading = "0.8"  # 动态加载 HIP/ROCm 库
+memmap2 = "0.9"     # Engram: memory-mapped embedding tables
+
+# 平台特定（条件编译，非 feature flag）
+[target.'cfg(target_os = "macos")'.dependencies]
+metal = { version = "0.29" }
+objc = { version = "0.2" }
 
 [dev-dependencies]
 criterion = "0.5"

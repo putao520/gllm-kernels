@@ -3,22 +3,48 @@
 //! This module provides a naive, correctness-focused GPU kernel that mirrors
 //! flash-attention semantics. It favors clarity over performance and serves as
 //! an integration point for precompiled PTX.
+//!
+//! # SM-Aware PTX Loading
+//!
+//! This module automatically selects the best PTX binary for the detected GPU:
+//! - SM 61 (Pascal): GTX 1060/1070/1080
+//! - SM 75 (Turing): RTX 2060/2070/2080
+//! - SM 80 (Ampere): A100, RTX 30 series
+//! - SM 86 (Ampere): RTX 3060/3070/3080/3090
+//! - SM 89 (Ada): RTX 4060/4070/4080/4090
+//! - SM 90 (Hopper): H100, H200
+//!
+//! If no matching PTX is found, NVRTC runtime compilation is used as fallback.
 
 use std::fmt;
 use std::sync::Arc;
 
 use cudarc::driver::{CudaContext, CudaFunction, CudaModule, CudaSlice, CudaStream, LaunchConfig, DriverError, PushKernelArg};
-use cudarc::nvrtc::Ptx;
 use half::f16;
 
 use crate::types::AttentionConfig;
+use crate::cuda_kernels::ptx_loader::{PtxCollection, PtxLoadError};
 
 const KERNEL_F32: &str = "tiled_attention_forward_f32";
 const KERNEL_F16: &str = "tiled_attention_forward_f16";
 const MAX_HEAD_DIM: usize = 256;
 const DEFAULT_BLOCK: u32 = 128;
 
-const PRECOMPILED_PTX: &str = include_str!("kernels/tiled_attention.ptx");
+/// CUDA source for runtime compilation.
+const KERNEL_SOURCE: &str = include_str!("kernels/tiled_attention.cu");
+
+/// SM-aware PTX collection for tiled attention kernel.
+/// PTX compiled for a lower SM version is forward-compatible with higher SM GPUs.
+static TILED_ATTENTION_PTX: PtxCollection = PtxCollection {
+    kernel_name: "tiled_attention",
+    source: KERNEL_SOURCE,
+    ptx_versions: &[
+        // SM 61 (Pascal) - GTX 1060/1070/1080
+        (61, include_str!("kernels/tiled_attention_sm61.ptx")),
+        // SM 80 (Ampere) - default for A100/RTX 30 series and higher
+        (80, include_str!("kernels/tiled_attention.ptx")),
+    ],
+};
 
 /// Errors surfaced by the CUDA FlashAttention kernels.
 #[derive(Debug)]
@@ -29,6 +55,8 @@ pub enum FlashAttentionError {
     InvalidConfig(String),
     /// Missing kernel entry point.
     KernelMissing(&'static str),
+    /// PTX loading error.
+    PtxLoad(PtxLoadError),
 }
 
 impl fmt::Display for FlashAttentionError {
@@ -37,6 +65,7 @@ impl fmt::Display for FlashAttentionError {
             Self::Driver(err) => write!(f, "CUDA driver error: {err}"),
             Self::InvalidConfig(msg) => write!(f, "Invalid config: {msg}"),
             Self::KernelMissing(name) => write!(f, "Kernel not found: {name}"),
+            Self::PtxLoad(err) => write!(f, "PTX loading error: {err}"),
         }
     }
 }
@@ -46,6 +75,12 @@ impl std::error::Error for FlashAttentionError {}
 impl From<DriverError> for FlashAttentionError {
     fn from(err: DriverError) -> Self {
         Self::Driver(err)
+    }
+}
+
+impl From<PtxLoadError> for FlashAttentionError {
+    fn from(err: PtxLoadError) -> Self {
+        Self::PtxLoad(err)
     }
 }
 
@@ -59,8 +94,12 @@ pub struct FlashAttentionKernel {
 
 impl FlashAttentionKernel {
     /// Load a FlashAttention kernel module on the given device.
+    ///
+    /// This method automatically selects the best PTX binary for the detected GPU:
+    /// - Uses precompiled PTX for matching SM version
+    /// - Falls back to NVRTC runtime compilation if needed
     pub fn new(ctx: &Arc<CudaContext>) -> Result<Self, FlashAttentionError> {
-        let ptx = load_ptx()?;
+        let ptx = TILED_ATTENTION_PTX.load(ctx)?;
         let module = ctx.load_module(ptx)?;
 
         let kernel_f32 = module
@@ -312,34 +351,6 @@ impl OptimizedCudaAttention {
 
         Ok(output)
     }
-}
-
-/// CUDA source for runtime compilation.
-const KERNEL_SOURCE: &str = include_str!("kernels/tiled_attention.cu");
-
-fn load_ptx() -> Result<Ptx, FlashAttentionError> {
-    // Priority 1: Check if precompiled PTX is valid (not a placeholder)
-    if !PRECOMPILED_PTX.contains("Placeholder") {
-        log::debug!("Loading precompiled PTX from embedded data");
-        return Ok(Ptx::from_src(PRECOMPILED_PTX));
-    }
-
-    // Priority 2: Try runtime compilation with NVRTC
-    #[cfg(feature = "nvrtc")]
-    {
-        log::debug!("Compiling PTX from source at runtime");
-        use cudarc::nvrtc::compile_ptx;
-        return compile_ptx(KERNEL_SOURCE).map_err(|e| {
-            FlashAttentionError::InvalidConfig(format!("NVRTC compilation failed: {}", e))
-        });
-    }
-
-    #[cfg(not(feature = "nvrtc"))]
-    Err(FlashAttentionError::InvalidConfig(
-        "PTX is a placeholder. Either: \n\
-         1. Compile with: nvcc -ptx -arch=sm_61 tiled_attention.cu -o tiled_attention.ptx\n\
-         2. Enable 'nvrtc' feature and ensure CUDA toolkit is installed".into()
-    ))
 }
 
 fn build_launch(

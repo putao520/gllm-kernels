@@ -7,8 +7,9 @@ use cudarc::driver::{
     CudaContext, CudaFunction, CudaModule, CudaSlice, CudaStream, DriverError, LaunchConfig,
     PushKernelArg,
 };
-use cudarc::nvrtc::Ptx;
 use half::f16;
+
+use crate::cuda_kernels::ptx_loader::{PtxCollection, PtxLoadError};
 
 const KERNEL_F32: &str = "fused_qkv_attention_forward";
 const KERNEL_F16: &str = "fused_qkv_attention_forward_f16";
@@ -17,8 +18,20 @@ const DEFAULT_BLOCK: u32 = 128;
 const BLOCK_M: usize = 16;
 const BLOCK_N: usize = 16;
 
-const PRECOMPILED_PTX: &str = include_str!("kernels/fused_qkv_attention.ptx");
+/// CUDA source for runtime compilation.
 const KERNEL_SOURCE: &str = include_str!("kernels/fused_qkv_attention.cu");
+
+/// SM-aware PTX collection for fused QKV attention kernel.
+static FUSED_QKV_ATTENTION_PTX: PtxCollection = PtxCollection {
+    kernel_name: "fused_qkv_attention",
+    source: KERNEL_SOURCE,
+    ptx_versions: &[
+        // SM 61 (Pascal) - GTX 1060/1070/1080
+        (61, include_str!("kernels/fused_qkv_attention_sm61.ptx")),
+        // SM 80 (Ampere) - default for A100/RTX 30 series and higher
+        (80, include_str!("kernels/fused_qkv_attention.ptx")),
+    ],
+};
 
 /// Errors surfaced by the fused QKV attention kernel.
 #[derive(Debug)]
@@ -29,6 +42,8 @@ pub enum FusedQKVAttentionError {
     InvalidConfig(String),
     /// Missing kernel entry point.
     KernelMissing(&'static str),
+    /// PTX loading error.
+    PtxLoad(PtxLoadError),
 }
 
 impl fmt::Display for FusedQKVAttentionError {
@@ -37,6 +52,7 @@ impl fmt::Display for FusedQKVAttentionError {
             Self::Driver(err) => write!(f, "CUDA driver error: {err}"),
             Self::InvalidConfig(msg) => write!(f, "Invalid config: {msg}"),
             Self::KernelMissing(name) => write!(f, "Kernel not found: {name}"),
+            Self::PtxLoad(err) => write!(f, "PTX loading error: {err}"),
         }
     }
 }
@@ -46,6 +62,12 @@ impl std::error::Error for FusedQKVAttentionError {}
 impl From<DriverError> for FusedQKVAttentionError {
     fn from(err: DriverError) -> Self {
         Self::Driver(err)
+    }
+}
+
+impl From<PtxLoadError> for FusedQKVAttentionError {
+    fn from(err: PtxLoadError) -> Self {
+        Self::PtxLoad(err)
     }
 }
 
@@ -59,8 +81,12 @@ pub struct FusedQKVAttentionKernel {
 
 impl FusedQKVAttentionKernel {
     /// Load the fused attention kernel module on the given device.
+    ///
+    /// This method automatically selects the best PTX binary for the detected GPU:
+    /// - Uses precompiled PTX for matching SM version
+    /// - Falls back to NVRTC runtime compilation if needed
     pub fn new(ctx: &Arc<CudaContext>) -> Result<Self, FusedQKVAttentionError> {
-        let ptx = load_ptx()?;
+        let ptx = FUSED_QKV_ATTENTION_PTX.load(ctx)?;
         let module = ctx.load_module(ptx)?;
 
         let kernel_f32 = module
@@ -192,32 +218,6 @@ impl FusedQKVAttentionKernel {
 
         Ok(output)
     }
-}
-
-fn load_ptx() -> Result<Ptx, FusedQKVAttentionError> {
-    // Priority 1: Check if precompiled PTX is valid (not a placeholder)
-    if !PRECOMPILED_PTX.contains("Placeholder") {
-        log::debug!("Loading precompiled PTX from embedded data");
-        return Ok(Ptx::from_src(PRECOMPILED_PTX));
-    }
-
-    // Priority 2: Try runtime compilation with NVRTC
-    #[cfg(feature = "nvrtc")]
-    {
-        log::debug!("Compiling PTX from source at runtime");
-        use cudarc::nvrtc::compile_ptx;
-        return compile_ptx(KERNEL_SOURCE).map_err(|e| {
-            FusedQKVAttentionError::InvalidConfig(format!("NVRTC compilation failed: {}", e))
-        });
-    }
-
-    #[cfg(not(feature = "nvrtc"))]
-    Err(FusedQKVAttentionError::InvalidConfig(
-        "PTX is a placeholder. Either: \n\
-         1. Compile with: nvcc -ptx -arch=sm_61 fused_qkv_attention.cu -o fused_qkv_attention.ptx\n\
-         2. Enable 'nvrtc' feature and ensure CUDA toolkit is installed"
-            .into(),
-    ))
 }
 
 fn build_launch(

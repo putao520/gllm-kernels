@@ -22,38 +22,30 @@
 //! This module is fully automatic with no user configuration required.
 //! The kernel loader automatically loads embedded HSACO binaries.
 //!
-//! ## Recommended Usage
+//! ## Usage
 //!
-//! For new code, use the HSA-based implementation:
-//! - `hsa_flash_attn::HsaFlashAttentionKernel` - Only requires AMD GPU driver
-//! - `hsa_flash_attn::HsaBuffer` - HSA memory buffer
-//! - `hsa_flash_attn::HsaQueueWrapper` - HSA command queue
+//! - `HsaFlashAttentionKernel` - Flash attention kernel
+//! - `HsaPagedAttentionKernel` - Paged attention kernel
+//! - `HsaBuffer` - HSA memory buffer
+//! - `HsaQueueWrapper` - HSA command queue
 //!
-//! The HIP-based implementation (`flash_attn`) requires the full ROCm toolkit.
+//! Only requires AMD GPU driver, NOT the full ROCm toolkit.
 
 pub mod hsa_runtime;
-pub mod hip_runtime;
-pub mod flash_attn;
 pub mod hsa_flash_attn;
-pub mod paged_attn;
+pub mod hsa_paged_attn;
 
-// HSA Runtime (preferred - only needs AMD driver)
+// HSA Runtime
 pub use hsa_runtime::{get_hsa_lib, is_hsa_available, HsaLib, GpuAgent, find_gpu_agents};
 
-// HIP Runtime (fallback - needs ROCm)
-pub use hip_runtime::{get_hip_lib, is_hip_available, HipLib};
-
-// HSA-based kernels (preferred - only needs AMD driver)
+// HSA-based kernels
 pub use hsa_flash_attn::{
     HsaFlashAttentionError, HsaFlashAttentionKernel, HsaBuffer, HsaQueueWrapper,
     OptimizedHsaAttention,
 };
+pub use hsa_paged_attn::{HsaPagedAttentionError, HsaPagedAttentionKernel};
 
-// HIP-based kernels (legacy - needs ROCm)
-pub use flash_attn::{FlashAttentionError, FlashAttentionKernel, OptimizedHipAttention};
-pub use paged_attn::{PagedAttentionError, PagedAttentionKernel};
-
-/// Check if AMD GPU is available (HSA or HIP runtime).
+/// Check if AMD GPU is available (HSA runtime).
 pub fn is_amd_gpu_available() -> bool {
-    is_hsa_available() || is_hip_available()
+    is_hsa_available()
 }

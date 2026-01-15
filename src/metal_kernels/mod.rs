@@ -16,10 +16,12 @@
 //! This module is fully automatic with no user configuration required.
 //! The kernel loader automatically selects the best loading strategy.
 
+pub mod metallib_loader;
 pub mod metal_runtime;
 pub mod flash_attn;
 pub mod paged_attn;
 
+pub use metallib_loader::{MetallibCollection, MetallibLoadError};
 pub use metal_runtime::{
     get_metal_device, is_metal_available, MetalDeviceInfo, MetalError,
     MetalKernelExecutor, MetalKernelLoader,

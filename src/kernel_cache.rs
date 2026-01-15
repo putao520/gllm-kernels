@@ -25,8 +25,9 @@ pub fn kernel_cache_dir() -> PathBuf {
 ///
 /// # Example
 /// ```
+/// use gllm_kernels::kernel_cache_path;
 /// let path = kernel_cache_path("cuda", "flash_attention", "sm_86");
-/// // Returns: ~/.gsc/gllm/kernels/cuda/flash_attention/sm_86.ptx
+/// // Returns: ~/.gsc/gllm/kernels/cuda/flash_attention/sm_86.bin
 /// ```
 pub fn kernel_cache_path(backend: &str, kernel_name: &str, device_arch: &str) -> PathBuf {
     kernel_cache_dir()

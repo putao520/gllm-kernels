@@ -1,7 +1,5 @@
 //! FlashAttention-3 style optimizations with CUDA-aware fallback.
 
-use std::any::Any;
-
 use burn::tensor::backend::Backend;
 use burn::tensor::{Tensor, TensorData};
 

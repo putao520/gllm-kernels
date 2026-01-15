@@ -15,6 +15,8 @@ OUTPUT_DIR="$KERNEL_DIR"
 
 # Default SM architectures (2019-2026 full coverage)
 # ═══════════════════════════════════════════════════════════════════
+# Pascal (2016-2018)
+#   SM 61: GTX 1060/1070/1080/1080Ti, Titan X/Xp
 # Turing (2018-2019)
 #   SM 75: GTX 1650/1660, RTX 2060/2070/2080, Tesla T4
 # Ampere (2020-2021)
@@ -30,7 +32,7 @@ OUTPUT_DIR="$KERNEL_DIR"
 #   SM 101: Blackwell Thor, DIGITS
 #   SM 120: RTX 5070/5080/5090 (Blackwell consumer)
 # ═══════════════════════════════════════════════════════════════════
-SM_ARCHS="75 80 86 89 90"
+SM_ARCHS="61 75 80 86 89 90"
 
 # Blackwell architectures (requires CUDA 12.8+)
 SM_ARCHS_BLACKWELL="100 120"

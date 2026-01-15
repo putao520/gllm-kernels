@@ -595,7 +595,7 @@ impl PagedAttention {
         let output = self
             .attention
             .forward(query, cached_k, cached_v, causal, position_offset);
-        B::sync(&output.device());
+        let _ = B::sync(&output.device());
         Ok(output)
     }
 
@@ -647,7 +647,7 @@ impl PagedAttention {
             position_offset,
             total_seq_len,
         );
-        B::sync(&output.device());
+        let _ = B::sync(&output.device());
         Ok(output)
     }
 
