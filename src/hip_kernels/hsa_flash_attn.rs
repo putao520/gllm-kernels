@@ -1,7 +1,14 @@
-//! ROCm FlashAttention kernel wrapper via HSA Runtime.
+//! HSA Runtime FlashAttention kernel wrapper.
 //!
 //! This module provides FlashAttention-style kernels for AMD GPUs via HSA Runtime.
 //! Uses the low-level HSA driver API - only requires AMD GPU driver, NOT ROCm toolkit.
+//!
+//! ## Architecture
+//!
+//! ```text
+//! Compile time: HIP kernel source → HSACO binary (via hipcc/offline compiler)
+//! Runtime: HSA Runtime loads HSACO → GPU executes
+//! ```
 
 use std::ffi::{c_void, CString};
 use std::fmt;
@@ -9,8 +16,9 @@ use std::marker::PhantomData;
 use std::ptr;
 
 use super::hsa_runtime::{
-    find_gpu_agents, get_error_string, get_hsa_lib, GpuAgent, HsaCodeObjectReader,
-    HsaExecutable, HsaKernelDispatchPacket, HsaQueue, HsaRegion, HsaSignal, HSA_STATUS_SUCCESS,
+    find_gpu_agents, get_hsa_lib, get_error_string, GpuAgent, HsaCodeObjectReader,
+    HsaExecutable, HsaKernelDispatchPacket, HsaQueue, HsaRegion, HsaSignal,
+    HSA_STATUS_SUCCESS,
 };
 use crate::types::AttentionConfig;
 
@@ -18,7 +26,6 @@ const KERNEL_F32: &str = "tiled_attention_forward_f32";
 const KERNEL_F16: &str = "tiled_attention_forward_f16";
 const DEFAULT_BLOCK: u32 = 128;
 const MAX_HEAD_DIM: usize = 256;
-
 
 // HSA packet header constants
 const HSA_PACKET_TYPE_KERNEL_DISPATCH: u16 = 2;
@@ -34,12 +41,12 @@ const HSA_EXECUTABLE_SYMBOL_INFO_KERNEL_KERNARG_SEGMENT_SIZE: u32 = 23;
 const HSA_EXECUTABLE_SYMBOL_INFO_KERNEL_GROUP_SEGMENT_SIZE: u32 = 24;
 const HSA_EXECUTABLE_SYMBOL_INFO_KERNEL_PRIVATE_SEGMENT_SIZE: u32 = 25;
 
-// Embedded HSACO (precompiled kernel binary)
+// Embedded HSACO (placeholder - replace with actual compiled binary)
 const PRECOMPILED_HSACO: &[u8] = include_bytes!("kernels/flash_attention.hsaco");
 
 /// Errors from HSA FlashAttention kernels.
 #[derive(Debug)]
-pub enum FlashAttentionError {
+pub enum HsaFlashAttentionError {
     /// HSA runtime error.
     Hsa(i32, String),
     /// Invalid configuration.
@@ -54,11 +61,9 @@ pub enum FlashAttentionError {
     NoGpuFound,
     /// Memory allocation failed.
     AllocationFailed(String),
-    /// Unsupported operation for HSA runtime.
-    Unsupported(String),
 }
 
-impl fmt::Display for FlashAttentionError {
+impl fmt::Display for HsaFlashAttentionError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Hsa(code, msg) => write!(f, "HSA error {}: {}", code, msg),
@@ -68,52 +73,54 @@ impl fmt::Display for FlashAttentionError {
             Self::HsaNotAvailable(msg) => write!(f, "HSA not available: {}", msg),
             Self::NoGpuFound => write!(f, "No GPU agents found"),
             Self::AllocationFailed(msg) => write!(f, "Memory allocation failed: {}", msg),
-            Self::Unsupported(msg) => write!(f, "Unsupported: {}", msg),
         }
     }
 }
 
-impl std::error::Error for FlashAttentionError {}
+impl std::error::Error for HsaFlashAttentionError {}
 
-fn check_hsa(status: i32, context: &str) -> Result<(), FlashAttentionError> {
+fn check_hsa(status: i32, context: &str) -> Result<(), HsaFlashAttentionError> {
     if status == HSA_STATUS_SUCCESS {
         Ok(())
     } else {
         let msg = get_error_string(status);
-        Err(FlashAttentionError::Hsa(status, format!("{}: {}", context, msg)))
+        Err(HsaFlashAttentionError::Hsa(status, format!("{}: {}", context, msg)))
     }
 }
 
 /// HSA device memory buffer.
-pub struct HipBuffer<T> {
+pub struct HsaBuffer<T> {
     ptr: *mut c_void,
     len: usize,
     region: HsaRegion,
     _marker: PhantomData<T>,
 }
 
-impl<T> HipBuffer<T> {
-    /// Allocate zeroed device memory from the specified agent.
-    pub fn alloc_zeros(agent: &GpuAgent, len: usize) -> Result<Self, FlashAttentionError> {
+impl<T> HsaBuffer<T> {
+    /// Allocate zeroed device memory from the specified region.
+    pub fn alloc_zeros(agent: &GpuAgent, len: usize) -> Result<Self, HsaFlashAttentionError> {
         let lib = get_hsa_lib()
-            .map_err(|e| FlashAttentionError::HsaNotAvailable(e.to_string()))?;
+            .map_err(|e| HsaFlashAttentionError::HsaNotAvailable(e.to_string()))?;
 
-        let region = select_device_region(agent)?;
-        let size = len
-            .checked_mul(std::mem::size_of::<T>())
-            .ok_or_else(|| FlashAttentionError::InvalidConfig("allocation size overflow".into()))?;
+        // Prefer coarse-grained for device memory, fall back to fine-grained
+        let region = if agent.coarse_grained_region != 0 {
+            agent.coarse_grained_region
+        } else if agent.fine_grained_region != 0 {
+            agent.fine_grained_region
+        } else {
+            return Err(HsaFlashAttentionError::AllocationFailed(
+                "No suitable memory region found".to_string(),
+            ));
+        };
+
+        let size = len * std::mem::size_of::<T>();
         let mut ptr: *mut c_void = ptr::null_mut();
 
         unsafe {
             let status = (lib.hsa_memory_allocate)(region, size, &mut ptr);
             check_hsa(status, "hsa_memory_allocate")?;
 
-            if ptr.is_null() {
-                return Err(FlashAttentionError::AllocationFailed(
-                    "allocation returned null".into(),
-                ));
-            }
-
+            // Zero the memory
             ptr::write_bytes(ptr as *mut u8, 0, size);
         }
 
@@ -126,26 +133,27 @@ impl<T> HipBuffer<T> {
     }
 
     /// Copy from host slice to device.
-    pub fn from_slice(agent: &GpuAgent, data: &[T]) -> Result<Self, FlashAttentionError> {
+    pub fn from_slice(agent: &GpuAgent, data: &[T]) -> Result<Self, HsaFlashAttentionError> {
         let lib = get_hsa_lib()
-            .map_err(|e| FlashAttentionError::HsaNotAvailable(e.to_string()))?;
+            .map_err(|e| HsaFlashAttentionError::HsaNotAvailable(e.to_string()))?;
 
-        let region = select_device_region(agent)?;
-        let size = data
-            .len()
-            .checked_mul(std::mem::size_of::<T>())
-            .ok_or_else(|| FlashAttentionError::InvalidConfig("copy size overflow".into()))?;
+        // Prefer coarse-grained for device memory
+        let region = if agent.coarse_grained_region != 0 {
+            agent.coarse_grained_region
+        } else if agent.fine_grained_region != 0 {
+            agent.fine_grained_region
+        } else {
+            return Err(HsaFlashAttentionError::AllocationFailed(
+                "No suitable memory region found".to_string(),
+            ));
+        };
+
+        let size = data.len() * std::mem::size_of::<T>();
         let mut ptr: *mut c_void = ptr::null_mut();
 
         unsafe {
             let status = (lib.hsa_memory_allocate)(region, size, &mut ptr);
             check_hsa(status, "hsa_memory_allocate")?;
-
-            if ptr.is_null() {
-                return Err(FlashAttentionError::AllocationFailed(
-                    "allocation returned null".into(),
-                ));
-            }
 
             let status = (lib.hsa_memory_copy)(ptr, data.as_ptr() as *const c_void, size);
             check_hsa(status, "hsa_memory_copy")?;
@@ -160,18 +168,15 @@ impl<T> HipBuffer<T> {
     }
 
     /// Copy device memory to host vector.
-    pub fn to_vec(&self) -> Result<Vec<T>, FlashAttentionError>
+    pub fn to_vec(&self) -> Result<Vec<T>, HsaFlashAttentionError>
     where
         T: Default + Clone,
     {
         let lib = get_hsa_lib()
-            .map_err(|e| FlashAttentionError::HsaNotAvailable(e.to_string()))?;
+            .map_err(|e| HsaFlashAttentionError::HsaNotAvailable(e.to_string()))?;
 
-        let size = self
-            .len
-            .checked_mul(std::mem::size_of::<T>())
-            .ok_or_else(|| FlashAttentionError::InvalidConfig("copy size overflow".into()))?;
         let mut data = vec![T::default(); self.len];
+        let size = self.len * std::mem::size_of::<T>();
 
         unsafe {
             let status = (lib.hsa_memory_copy)(
@@ -201,7 +206,7 @@ impl<T> HipBuffer<T> {
     }
 }
 
-impl<T> Drop for HipBuffer<T> {
+impl<T> Drop for HsaBuffer<T> {
     fn drop(&mut self) {
         if !self.ptr.is_null() {
             if let Ok(lib) = get_hsa_lib() {
@@ -213,38 +218,27 @@ impl<T> Drop for HipBuffer<T> {
     }
 }
 
-fn select_device_region(agent: &GpuAgent) -> Result<HsaRegion, FlashAttentionError> {
-    if agent.coarse_grained_region != 0 {
-        Ok(agent.coarse_grained_region)
-    } else if agent.fine_grained_region != 0 {
-        Ok(agent.fine_grained_region)
-    } else {
-        Err(FlashAttentionError::AllocationFailed(
-            "No suitable memory region found".to_string(),
-        ))
-    }
-}
-
 /// HSA queue wrapper with signal management.
-pub struct HipStreamWrapper {
+pub struct HsaQueueWrapper {
     queue: HsaQueue,
     signal: HsaSignal,
 }
 
-impl HipStreamWrapper {
+impl HsaQueueWrapper {
     /// Create a new HSA queue for the given agent.
-    pub fn new(agent: &GpuAgent) -> Result<Self, FlashAttentionError> {
+    pub fn new(agent: &GpuAgent) -> Result<Self, HsaFlashAttentionError> {
         let lib = get_hsa_lib()
-            .map_err(|e| FlashAttentionError::HsaNotAvailable(e.to_string()))?;
+            .map_err(|e| HsaFlashAttentionError::HsaNotAvailable(e.to_string()))?;
 
+        // Create queue
         let mut queue: HsaQueue = ptr::null_mut();
-        let queue_size = 4096u32;
+        let queue_size = 4096u32; // Standard queue size
 
         unsafe {
             let status = (lib.hsa_queue_create)(
                 agent.handle,
                 queue_size,
-                0,
+                0, // HSA_QUEUE_TYPE_MULTI
                 ptr::null_mut(),
                 ptr::null_mut(),
                 u32::MAX,
@@ -254,12 +248,7 @@ impl HipStreamWrapper {
             check_hsa(status, "hsa_queue_create")?;
         }
 
-        if queue.is_null() {
-            return Err(FlashAttentionError::AllocationFailed(
-                "queue creation returned null".into(),
-            ));
-        }
-
+        // Create completion signal
         let mut signal: HsaSignal = 0;
         unsafe {
             let status = (lib.hsa_signal_create)(1, 0, ptr::null(), &mut signal);
@@ -270,16 +259,17 @@ impl HipStreamWrapper {
     }
 
     /// Wait for all operations to complete.
-    pub fn synchronize(&self) -> Result<(), FlashAttentionError> {
+    pub fn synchronize(&self) -> Result<(), HsaFlashAttentionError> {
         let lib = get_hsa_lib()
-            .map_err(|e| FlashAttentionError::HsaNotAvailable(e.to_string()))?;
+            .map_err(|e| HsaFlashAttentionError::HsaNotAvailable(e.to_string()))?;
 
         unsafe {
+            // Wait until signal becomes less than 1 (i.e., 0)
             (lib.hsa_signal_wait_acquire)(
                 self.signal,
-                HSA_SIGNAL_CONDITION_LT,
-                1,
-                u64::MAX,
+                HSA_SIGNAL_CONDITION_LT, // less than
+                1,                        // compare value
+                u64::MAX,                 // timeout (infinite)
                 HSA_WAIT_STATE_BLOCKED,
             );
         }
@@ -307,7 +297,7 @@ impl HipStreamWrapper {
     }
 }
 
-impl Drop for HipStreamWrapper {
+impl Drop for HsaQueueWrapper {
     fn drop(&mut self) {
         if let Ok(lib) = get_hsa_lib() {
             unsafe {
@@ -323,8 +313,11 @@ impl Drop for HipStreamWrapper {
 }
 
 // SAFETY: HSA queues are thread-safe for concurrent dispatch operations.
-unsafe impl Send for HipStreamWrapper {}
-unsafe impl Sync for HipStreamWrapper {}
+// The HSA programming model supports multi-threaded queue access with
+// proper synchronization via signals. The queue contains a raw pointer
+// (*mut c_void) but HSA guarantees thread-safe access to queue operations.
+unsafe impl Send for HsaQueueWrapper {}
+unsafe impl Sync for HsaQueueWrapper {}
 
 /// HSA kernel module loaded from HSACO.
 struct HsaKernelModule {
@@ -343,47 +336,34 @@ impl HsaKernelModule {
         agent: &GpuAgent,
         hsaco: &[u8],
         kernel_name: &str,
-    ) -> Result<Self, FlashAttentionError> {
+    ) -> Result<Self, HsaFlashAttentionError> {
         let lib = get_hsa_lib()
-            .map_err(|e| FlashAttentionError::HsaNotAvailable(e.to_string()))?;
+            .map_err(|e| HsaFlashAttentionError::HsaNotAvailable(e.to_string()))?;
 
+        // 1. Create code object reader from memory
         let mut reader: HsaCodeObjectReader = 0;
-        let mut executable: HsaExecutable = 0;
-
-        let cleanup = |reader: HsaCodeObjectReader, executable: HsaExecutable| unsafe {
-            if executable != 0 {
-                let _ = (lib.hsa_executable_destroy)(executable);
-            }
-            if reader != 0 {
-                let _ = (lib.hsa_code_object_reader_destroy)(reader);
-            }
-        };
-
         unsafe {
             let status = (lib.hsa_code_object_reader_create_from_memory)(
                 hsaco.as_ptr() as *const c_void,
                 hsaco.len(),
                 &mut reader,
             );
-            if let Err(err) = check_hsa(status, "hsa_code_object_reader_create_from_memory") {
-                cleanup(reader, executable);
-                return Err(err);
-            }
+            check_hsa(status, "hsa_code_object_reader_create_from_memory")?;
         }
 
+        // 2. Create executable
+        let mut executable: HsaExecutable = 0;
         unsafe {
             let status = (lib.hsa_executable_create_alt)(
-                1,
-                0,
+                1, // HSA_PROFILE_FULL
+                0, // HSA_DEFAULT_FLOAT_ROUNDING_MODE_DEFAULT
                 ptr::null(),
                 &mut executable,
             );
-            if let Err(err) = check_hsa(status, "hsa_executable_create_alt") {
-                cleanup(reader, executable);
-                return Err(err);
-            }
+            check_hsa(status, "hsa_executable_create_alt")?;
         }
 
+        // 3. Load code object to executable
         unsafe {
             let status = (lib.hsa_executable_load_agent_code_object)(
                 executable,
@@ -392,22 +372,18 @@ impl HsaKernelModule {
                 ptr::null(),
                 ptr::null_mut(),
             );
-            if let Err(err) = check_hsa(status, "hsa_executable_load_agent_code_object") {
-                cleanup(reader, executable);
-                return Err(err);
-            }
+            check_hsa(status, "hsa_executable_load_agent_code_object")?;
         }
 
+        // 4. Freeze executable
         unsafe {
             let status = (lib.hsa_executable_freeze)(executable, ptr::null());
-            if let Err(err) = check_hsa(status, "hsa_executable_freeze") {
-                cleanup(reader, executable);
-                return Err(err);
-            }
+            check_hsa(status, "hsa_executable_freeze")?;
         }
 
+        // 5. Get kernel symbol
         let kernel_name_c = CString::new(kernel_name)
-            .map_err(|_| FlashAttentionError::InvalidConfig("Invalid kernel name".into()))?;
+            .map_err(|_| HsaFlashAttentionError::InvalidConfig("Invalid kernel name".into()))?;
 
         let mut kernel_symbol: u64 = 0;
         unsafe {
@@ -417,15 +393,11 @@ impl HsaKernelModule {
                 &agent.handle,
                 &mut kernel_symbol,
             );
-            if let Err(err) = check_hsa(status, "hsa_executable_get_symbol_by_name") {
-                cleanup(reader, executable);
-                return Err(err);
-            }
+            check_hsa(status, "hsa_executable_get_symbol_by_name")?;
         }
 
         if kernel_symbol == 0 {
-            cleanup(reader, executable);
-            return Err(FlashAttentionError::KernelMissing(
+            return Err(HsaFlashAttentionError::KernelMissing(
                 if kernel_name.contains("f32") {
                     "tiled_attention_forward_f32"
                 } else {
@@ -434,6 +406,7 @@ impl HsaKernelModule {
             ));
         }
 
+        // 6. Get kernel object and metadata
         let mut kernel_object: u64 = 0;
         let mut kernarg_size: u32 = 0;
         let mut group_segment_size: u32 = 0;
@@ -445,40 +418,28 @@ impl HsaKernelModule {
                 HSA_EXECUTABLE_SYMBOL_INFO_KERNEL_OBJECT,
                 &mut kernel_object as *mut _ as *mut c_void,
             );
-            if let Err(err) = check_hsa(status, "get kernel_object") {
-                cleanup(reader, executable);
-                return Err(err);
-            }
+            check_hsa(status, "get kernel_object")?;
 
             let status = (lib.hsa_executable_symbol_get_info)(
                 kernel_symbol,
                 HSA_EXECUTABLE_SYMBOL_INFO_KERNEL_KERNARG_SEGMENT_SIZE,
                 &mut kernarg_size as *mut _ as *mut c_void,
             );
-            if let Err(err) = check_hsa(status, "get kernarg_size") {
-                cleanup(reader, executable);
-                return Err(err);
-            }
+            check_hsa(status, "get kernarg_size")?;
 
             let status = (lib.hsa_executable_symbol_get_info)(
                 kernel_symbol,
                 HSA_EXECUTABLE_SYMBOL_INFO_KERNEL_GROUP_SEGMENT_SIZE,
                 &mut group_segment_size as *mut _ as *mut c_void,
             );
-            if let Err(err) = check_hsa(status, "get group_segment_size") {
-                cleanup(reader, executable);
-                return Err(err);
-            }
+            check_hsa(status, "get group_segment_size")?;
 
             let status = (lib.hsa_executable_symbol_get_info)(
                 kernel_symbol,
                 HSA_EXECUTABLE_SYMBOL_INFO_KERNEL_PRIVATE_SEGMENT_SIZE,
                 &mut private_segment_size as *mut _ as *mut c_void,
             );
-            if let Err(err) = check_hsa(status, "get private_segment_size") {
-                cleanup(reader, executable);
-                return Err(err);
-            }
+            check_hsa(status, "get private_segment_size")?;
         }
 
         Ok(Self {
@@ -523,73 +484,31 @@ struct FlashAttentionArgs {
     position_offset: i32,
 }
 
-struct KernargBuffer {
-    ptr: *mut c_void,
-}
-
-impl KernargBuffer {
-    fn new(region: HsaRegion, size: usize) -> Result<Self, FlashAttentionError> {
-        let lib = get_hsa_lib()
-            .map_err(|e| FlashAttentionError::HsaNotAvailable(e.to_string()))?;
-        if region == 0 {
-            return Err(FlashAttentionError::AllocationFailed(
-                "kernarg region not available".into(),
-            ));
-        }
-        let mut ptr: *mut c_void = ptr::null_mut();
-
-        unsafe {
-            let status = (lib.hsa_memory_allocate)(region, size, &mut ptr);
-            check_hsa(status, "hsa_memory_allocate")?;
-
-            if ptr.is_null() {
-                return Err(FlashAttentionError::AllocationFailed(
-                    "kernarg allocation returned null".into(),
-                ));
-            }
-
-            ptr::write_bytes(ptr as *mut u8, 0, size);
-        }
-
-        Ok(Self { ptr })
-    }
-
-    fn as_ptr(&self) -> *mut c_void {
-        self.ptr
-    }
-}
-
-impl Drop for KernargBuffer {
-    fn drop(&mut self) {
-        if !self.ptr.is_null() {
-            if let Ok(lib) = get_hsa_lib() {
-                unsafe {
-                    let _ = (lib.hsa_memory_free)(self.ptr);
-                }
-            }
-        }
-    }
-}
-
 /// FlashAttention HSA kernel wrapper.
-pub struct FlashAttentionKernel {
+pub struct HsaFlashAttentionKernel {
     agent: GpuAgent,
     module_f32: HsaKernelModule,
     module_f16: HsaKernelModule,
 }
 
-impl FlashAttentionKernel {
+impl HsaFlashAttentionKernel {
     /// Initialize HSA runtime and load kernels.
-    pub fn new(device: i32) -> Result<Self, FlashAttentionError> {
+    pub fn new(device: i32) -> Result<Self, HsaFlashAttentionError> {
+        // Find GPU agents
         let agents = find_gpu_agents()
-            .map_err(|e| FlashAttentionError::HsaNotAvailable(e))?;
+            .map_err(|e| HsaFlashAttentionError::HsaNotAvailable(e))?;
 
         let agent = agents
             .get(device as usize)
             .cloned()
-            .ok_or(FlashAttentionError::NoGpuFound)?;
+            .ok_or(HsaFlashAttentionError::NoGpuFound)?;
 
-        let (module_f32, module_f16) = Self::load_modules(&agent)?;
+        // Try to load HSACO from environment variable or embedded binary
+        let hsaco = Self::load_hsaco()?;
+
+        // Load kernel modules
+        let module_f32 = HsaKernelModule::from_hsaco(&agent, &hsaco, KERNEL_F32)?;
+        let module_f16 = HsaKernelModule::from_hsaco(&agent, &hsaco, KERNEL_F16)?;
 
         Ok(Self {
             agent,
@@ -598,35 +517,16 @@ impl FlashAttentionKernel {
         })
     }
 
-    fn load_modules(
-        agent: &GpuAgent,
-    ) -> Result<(HsaKernelModule, HsaKernelModule), FlashAttentionError> {
+    fn load_hsaco() -> Result<Vec<u8>, HsaFlashAttentionError> {
         // Priority 1: Embedded precompiled HSACO
-        if !PRECOMPILED_HSACO.is_empty() {
+        if PRECOMPILED_HSACO.len() > 1 {
             log::debug!("Loading precompiled HSACO from embedded data");
-            match Self::modules_from_hsaco(agent, PRECOMPILED_HSACO) {
-                Ok(modules) => {
-                    log::info!("Loaded embedded HSACO successfully");
-                    return Ok(modules);
-                }
-                Err(err) => {
-                    log::error!("Failed to load embedded HSACO: {}", err);
-                }
-            }
+            return Ok(PRECOMPILED_HSACO.to_vec());
         }
 
-        Err(FlashAttentionError::ModuleLoadFailed(
+        Err(HsaFlashAttentionError::ModuleLoadFailed(
             "No HSACO binary available. Compile with hipcc and embed kernels.".into(),
         ))
-    }
-
-    fn modules_from_hsaco(
-        agent: &GpuAgent,
-        hsaco: &[u8],
-    ) -> Result<(HsaKernelModule, HsaKernelModule), FlashAttentionError> {
-        let module_f32 = HsaKernelModule::from_hsaco(agent, hsaco, KERNEL_F32)?;
-        let module_f16 = HsaKernelModule::from_hsaco(agent, hsaco, KERNEL_F16)?;
-        Ok((module_f32, module_f16))
     }
 
     /// Get the GPU agent.
@@ -637,10 +537,10 @@ impl FlashAttentionKernel {
     /// Forward pass for f32 inputs.
     pub fn forward_f32(
         &self,
-        stream: &HipStreamWrapper,
-        q: &HipBuffer<f32>,
-        k: &HipBuffer<f32>,
-        v: &HipBuffer<f32>,
+        queue: &HsaQueueWrapper,
+        q: &HsaBuffer<f32>,
+        k: &HsaBuffer<f32>,
+        v: &HsaBuffer<f32>,
         batch_size: usize,
         num_heads: usize,
         seq_len: usize,
@@ -648,9 +548,9 @@ impl FlashAttentionKernel {
         is_causal: bool,
         scale: f32,
         position_offset: usize,
-    ) -> Result<HipBuffer<f32>, FlashAttentionError> {
+    ) -> Result<HsaBuffer<f32>, HsaFlashAttentionError> {
         self.forward_f32_impl(
-            stream,
+            queue,
             q,
             k,
             v,
@@ -668,10 +568,10 @@ impl FlashAttentionKernel {
     /// Forward pass for f16 inputs.
     pub fn forward_f16(
         &self,
-        stream: &HipStreamWrapper,
-        q: &HipBuffer<u16>,
-        k: &HipBuffer<u16>,
-        v: &HipBuffer<u16>,
+        queue: &HsaQueueWrapper,
+        q: &HsaBuffer<u16>,
+        k: &HsaBuffer<u16>,
+        v: &HsaBuffer<u16>,
         batch_size: usize,
         num_heads: usize,
         seq_len: usize,
@@ -679,9 +579,9 @@ impl FlashAttentionKernel {
         is_causal: bool,
         scale: f32,
         position_offset: usize,
-    ) -> Result<HipBuffer<u16>, FlashAttentionError> {
+    ) -> Result<HsaBuffer<u16>, HsaFlashAttentionError> {
         self.forward_f16_impl(
-            stream,
+            queue,
             q,
             k,
             v,
@@ -698,10 +598,10 @@ impl FlashAttentionKernel {
 
     fn forward_f32_impl(
         &self,
-        stream: &HipStreamWrapper,
-        q: &HipBuffer<f32>,
-        k: &HipBuffer<f32>,
-        v: &HipBuffer<f32>,
+        queue: &HsaQueueWrapper,
+        q: &HsaBuffer<f32>,
+        k: &HsaBuffer<f32>,
+        v: &HsaBuffer<f32>,
         batch_size: usize,
         num_heads: usize,
         seq_len: usize,
@@ -710,23 +610,28 @@ impl FlashAttentionKernel {
         scale: f32,
         position_offset: usize,
         block_size: u32,
-    ) -> Result<HipBuffer<f32>, FlashAttentionError> {
+    ) -> Result<HsaBuffer<f32>, HsaFlashAttentionError> {
+        let lib = get_hsa_lib()
+            .map_err(|e| HsaFlashAttentionError::HsaNotAvailable(e.to_string()))?;
+
         let (output_len, grid_size, workgroup_size) =
             build_launch(batch_size, num_heads, seq_len, head_dim, block_size)?;
 
-        let output = HipBuffer::<f32>::alloc_zeros(&self.agent, output_len)?;
+        let output = HsaBuffer::<f32>::alloc_zeros(&self.agent, output_len)?;
 
+        // Allocate kernarg buffer
         let kernarg_size = self.module_f32.kernarg_size as usize;
-        let args_size = std::mem::size_of::<FlashAttentionArgs>();
-        if kernarg_size < args_size {
-            return Err(FlashAttentionError::InvalidConfig(
-                "kernarg segment too small".into(),
-            ));
-        }
-
-        let kernarg = KernargBuffer::new(self.agent.kernarg_region, kernarg_size)?;
+        let mut kernarg_ptr: *mut c_void = ptr::null_mut();
 
         unsafe {
+            let status = (lib.hsa_memory_allocate)(
+                self.agent.kernarg_region,
+                kernarg_size,
+                &mut kernarg_ptr,
+            );
+            check_hsa(status, "allocate kernarg")?;
+
+            // Fill kernel arguments
             let args = FlashAttentionArgs {
                 q_ptr: q.as_ptr(),
                 k_ptr: k.as_ptr(),
@@ -743,32 +648,40 @@ impl FlashAttentionKernel {
 
             ptr::copy_nonoverlapping(
                 &args as *const FlashAttentionArgs as *const u8,
-                kernarg.as_ptr() as *mut u8,
-                args_size,
+                kernarg_ptr as *mut u8,
+                std::mem::size_of::<FlashAttentionArgs>().min(kernarg_size),
             );
         }
 
-        stream.reset_signal();
+        // Reset signal
+        queue.reset_signal();
 
+        // Dispatch kernel
         self.dispatch_kernel(
-            stream,
+            queue,
             &self.module_f32,
-            kernarg.as_ptr(),
+            kernarg_ptr,
             grid_size,
             workgroup_size,
         )?;
 
-        stream.synchronize()?;
+        // Wait for completion
+        queue.synchronize()?;
+
+        // Free kernarg buffer
+        unsafe {
+            let _ = (lib.hsa_memory_free)(kernarg_ptr);
+        }
 
         Ok(output)
     }
 
     fn forward_f16_impl(
         &self,
-        stream: &HipStreamWrapper,
-        q: &HipBuffer<u16>,
-        k: &HipBuffer<u16>,
-        v: &HipBuffer<u16>,
+        queue: &HsaQueueWrapper,
+        q: &HsaBuffer<u16>,
+        k: &HsaBuffer<u16>,
+        v: &HsaBuffer<u16>,
         batch_size: usize,
         num_heads: usize,
         seq_len: usize,
@@ -777,23 +690,28 @@ impl FlashAttentionKernel {
         scale: f32,
         position_offset: usize,
         block_size: u32,
-    ) -> Result<HipBuffer<u16>, FlashAttentionError> {
+    ) -> Result<HsaBuffer<u16>, HsaFlashAttentionError> {
+        let lib = get_hsa_lib()
+            .map_err(|e| HsaFlashAttentionError::HsaNotAvailable(e.to_string()))?;
+
         let (output_len, grid_size, workgroup_size) =
             build_launch(batch_size, num_heads, seq_len, head_dim, block_size)?;
 
-        let output = HipBuffer::<u16>::alloc_zeros(&self.agent, output_len)?;
+        let output = HsaBuffer::<u16>::alloc_zeros(&self.agent, output_len)?;
 
+        // Allocate kernarg buffer
         let kernarg_size = self.module_f16.kernarg_size as usize;
-        let args_size = std::mem::size_of::<FlashAttentionArgs>();
-        if kernarg_size < args_size {
-            return Err(FlashAttentionError::InvalidConfig(
-                "kernarg segment too small".into(),
-            ));
-        }
-
-        let kernarg = KernargBuffer::new(self.agent.kernarg_region, kernarg_size)?;
+        let mut kernarg_ptr: *mut c_void = ptr::null_mut();
 
         unsafe {
+            let status = (lib.hsa_memory_allocate)(
+                self.agent.kernarg_region,
+                kernarg_size,
+                &mut kernarg_ptr,
+            );
+            check_hsa(status, "allocate kernarg")?;
+
+            // Fill kernel arguments
             let args = FlashAttentionArgs {
                 q_ptr: q.as_ptr(),
                 k_ptr: k.as_ptr(),
@@ -810,60 +728,67 @@ impl FlashAttentionKernel {
 
             ptr::copy_nonoverlapping(
                 &args as *const FlashAttentionArgs as *const u8,
-                kernarg.as_ptr() as *mut u8,
-                args_size,
+                kernarg_ptr as *mut u8,
+                std::mem::size_of::<FlashAttentionArgs>().min(kernarg_size),
             );
         }
 
-        stream.reset_signal();
+        // Reset signal
+        queue.reset_signal();
 
+        // Dispatch kernel
         self.dispatch_kernel(
-            stream,
+            queue,
             &self.module_f16,
-            kernarg.as_ptr(),
+            kernarg_ptr,
             grid_size,
             workgroup_size,
         )?;
 
-        stream.synchronize()?;
+        // Wait for completion
+        queue.synchronize()?;
+
+        // Free kernarg buffer
+        unsafe {
+            let _ = (lib.hsa_memory_free)(kernarg_ptr);
+        }
 
         Ok(output)
     }
 
     fn dispatch_kernel(
         &self,
-        stream: &HipStreamWrapper,
+        queue_wrapper: &HsaQueueWrapper,
         module: &HsaKernelModule,
         kernarg_ptr: *mut c_void,
         grid_size: u32,
         workgroup_size: u32,
-    ) -> Result<(), FlashAttentionError> {
+    ) -> Result<(), HsaFlashAttentionError> {
         let lib = get_hsa_lib()
-            .map_err(|e| FlashAttentionError::HsaNotAvailable(e.to_string()))?;
+            .map_err(|e| HsaFlashAttentionError::HsaNotAvailable(e.to_string()))?;
 
-        let queue = stream.queue();
-        let signal = stream.signal();
+        let queue = queue_wrapper.queue();
+        let signal = queue_wrapper.signal();
 
         unsafe {
+            // Get write index
             let write_index = (lib.hsa_queue_add_write_index_relaxed)(queue, 1);
 
-            let queue_base = *(queue as *const u64).add(5);
-            let queue_size = *(queue as *const u32).add(3);
-            if queue_base == 0 || queue_size == 0 {
-                return Err(FlashAttentionError::InvalidConfig(
-                    "invalid queue layout".into(),
-                ));
-            }
+            // Calculate packet address
+            // Queue base address is at offset 40 in the queue structure
+            let queue_base = *(queue as *const u64).add(5); // base_address
+            let queue_size = *(queue as *const u32).add(3); // size (mask + 1)
             let packet_index = (write_index & (queue_size as u64 - 1)) as usize;
             let packet_ptr = (queue_base as *mut HsaKernelDispatchPacket).add(packet_index);
 
+            // Build dispatch packet
             let header = (HSA_PACKET_TYPE_KERNEL_DISPATCH << 8)
                 | (HSA_FENCE_SCOPE_SYSTEM << 4)
                 | HSA_FENCE_SCOPE_SYSTEM;
 
             let packet = HsaKernelDispatchPacket {
                 header,
-                setup: 1,
+                setup: 1, // 1D dispatch
                 workgroup_size_x: workgroup_size as u16,
                 workgroup_size_y: 1,
                 workgroup_size_z: 1,
@@ -879,10 +804,12 @@ impl FlashAttentionKernel {
                 completion_signal: signal,
             };
 
+            // Write packet (atomically set header last)
             ptr::write_volatile(packet_ptr, packet);
 
+            // Ring doorbell
             (lib.hsa_signal_store_relaxed)(
-                *(queue as *const u64).add(4),
+                *(queue as *const u64).add(4), // doorbell_signal
                 write_index as i64,
             );
         }
@@ -892,16 +819,16 @@ impl FlashAttentionKernel {
 }
 
 /// Optimized HSA attention wrapper.
-pub struct OptimizedHipAttention {
+pub struct OptimizedHsaAttention {
     tile_size: u32,
-    kernel: FlashAttentionKernel,
+    kernel: HsaFlashAttentionKernel,
 }
 
-impl OptimizedHipAttention {
+impl OptimizedHsaAttention {
     /// Create a new optimized attention wrapper.
-    pub fn new(device: i32, tile_size: usize) -> Result<Self, FlashAttentionError> {
+    pub fn new(device: i32, tile_size: usize) -> Result<Self, HsaFlashAttentionError> {
         let tile_size = tile_size.clamp(1, 1024) as u32;
-        let kernel = FlashAttentionKernel::new(device)?;
+        let kernel = HsaFlashAttentionKernel::new(device)?;
         Ok(Self { tile_size, kernel })
     }
 
@@ -913,21 +840,21 @@ impl OptimizedHipAttention {
     /// Forward pass using tiled attention.
     pub fn forward_tiled(
         &self,
-        stream: &HipStreamWrapper,
-        q: &HipBuffer<f32>,
-        k: &HipBuffer<f32>,
-        v: &HipBuffer<f32>,
+        queue: &HsaQueueWrapper,
+        q: &HsaBuffer<f32>,
+        k: &HsaBuffer<f32>,
+        v: &HsaBuffer<f32>,
         config: &AttentionConfig,
         position_offset: usize,
-    ) -> Result<HipBuffer<f32>, FlashAttentionError> {
+    ) -> Result<HsaBuffer<f32>, HsaFlashAttentionError> {
         if config.query_len != config.kv_len {
-            return Err(FlashAttentionError::InvalidConfig(
+            return Err(HsaFlashAttentionError::InvalidConfig(
                 "query_len must match kv_len for the tiled kernel".into(),
             ));
         }
 
         self.kernel.forward_f32_impl(
-            stream,
+            queue,
             q,
             k,
             v,
@@ -949,14 +876,14 @@ fn build_launch(
     seq_len: usize,
     head_dim: usize,
     block_size: u32,
-) -> Result<(usize, u32, u32), FlashAttentionError> {
+) -> Result<(usize, u32, u32), HsaFlashAttentionError> {
     if batch_size == 0 || num_heads == 0 || seq_len == 0 || head_dim == 0 {
-        return Err(FlashAttentionError::InvalidConfig(
+        return Err(HsaFlashAttentionError::InvalidConfig(
             "Dimensions must be > 0".into(),
         ));
     }
     if head_dim > MAX_HEAD_DIM {
-        return Err(FlashAttentionError::InvalidConfig(format!(
+        return Err(HsaFlashAttentionError::InvalidConfig(format!(
             "head_dim {} exceeds MAX_HEAD_DIM {}",
             head_dim, MAX_HEAD_DIM
         )));
@@ -965,11 +892,11 @@ fn build_launch(
     let num_queries = batch_size
         .checked_mul(num_heads)
         .and_then(|value| value.checked_mul(seq_len))
-        .ok_or_else(|| FlashAttentionError::InvalidConfig("num_queries overflow".into()))?;
+        .ok_or_else(|| HsaFlashAttentionError::InvalidConfig("num_queries overflow".into()))?;
 
     let output_len = num_queries
         .checked_mul(head_dim)
-        .ok_or_else(|| FlashAttentionError::InvalidConfig("output_len overflow".into()))?;
+        .ok_or_else(|| HsaFlashAttentionError::InvalidConfig("output_len overflow".into()))?;
 
     let workgroup_size = block_size.clamp(1, 1024);
     let grid_size = ((num_queries + workgroup_size as usize - 1) / workgroup_size as usize) as u32;
@@ -978,17 +905,8 @@ fn build_launch(
 }
 
 /// Get available GPU agents count.
-pub fn get_device_count() -> Result<i32, FlashAttentionError> {
-    let agents = find_gpu_agents()
-        .map_err(|e| FlashAttentionError::HsaNotAvailable(e))?;
-    i32::try_from(agents.len()).map_err(|_| {
-        FlashAttentionError::InvalidConfig("device count exceeds i32".into())
-    })
-}
-
-/// Synchronize all devices (not supported in HSA runtime).
-pub fn device_synchronize() -> Result<(), FlashAttentionError> {
-    Err(FlashAttentionError::Unsupported(
-        "HSA runtime does not provide global device synchronize; use HipStreamWrapper".into(),
-    ))
+pub fn get_gpu_count() -> Result<usize, HsaFlashAttentionError> {
+    find_gpu_agents()
+        .map(|agents| agents.len())
+        .map_err(|e| HsaFlashAttentionError::HsaNotAvailable(e))
 }

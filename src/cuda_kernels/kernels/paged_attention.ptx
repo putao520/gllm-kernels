@@ -1,2 +1,2 @@
 // Placeholder PTX for paged attention.
-// Set GLLM_PAGED_ATTN_PTX to a compiled PTX or enable NVRTC compilation.
+// Compile with nvcc or enable NVRTC feature for runtime compilation.

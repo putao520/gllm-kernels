@@ -5,6 +5,7 @@ use std::sync::Arc;
 
 use cudarc::driver::{
     CudaContext, CudaFunction, CudaModule, CudaSlice, CudaStream, DriverError, LaunchConfig,
+    PushKernelArg,
 };
 use cudarc::nvrtc::Ptx;
 use half::f16;
@@ -194,16 +195,16 @@ impl FusedQKVAttentionKernel {
 }
 
 fn load_ptx() -> Result<Ptx, FusedQKVAttentionError> {
-    if let Ok(path) = std::env::var("GLLM_FUSED_QKV_ATTN_PTX") {
-        return Ok(Ptx::from_file(path));
-    }
-
+    // Priority 1: Check if precompiled PTX is valid (not a placeholder)
     if !PRECOMPILED_PTX.contains("Placeholder") {
+        log::debug!("Loading precompiled PTX from embedded data");
         return Ok(Ptx::from_src(PRECOMPILED_PTX));
     }
 
+    // Priority 2: Try runtime compilation with NVRTC
     #[cfg(feature = "nvrtc")]
     {
+        log::debug!("Compiling PTX from source at runtime");
         use cudarc::nvrtc::compile_ptx;
         return compile_ptx(KERNEL_SOURCE).map_err(|e| {
             FusedQKVAttentionError::InvalidConfig(format!("NVRTC compilation failed: {}", e))
@@ -214,8 +215,7 @@ fn load_ptx() -> Result<Ptx, FusedQKVAttentionError> {
     Err(FusedQKVAttentionError::InvalidConfig(
         "PTX is a placeholder. Either: \n\
          1. Compile with: nvcc -ptx -arch=sm_61 fused_qkv_attention.cu -o fused_qkv_attention.ptx\n\
-         2. Set GLLM_FUSED_QKV_ATTN_PTX=/path/to/compiled.ptx\n\
-         3. Enable 'nvrtc' feature and ensure CUDA toolkit is installed"
+         2. Enable 'nvrtc' feature and ensure CUDA toolkit is installed"
             .into(),
     ))
 }

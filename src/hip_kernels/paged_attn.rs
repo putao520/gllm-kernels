@@ -1,72 +1,17 @@
 //! HIP/ROCm paged attention kernel wrapper.
 //!
 //! Provides paged attention kernels for AMD GPUs via HIP runtime.
+//! Uses dynamic loading - no ROCm installation required at compile time.
 
 use std::ffi::CString;
 use std::fmt;
-use std::os::raw::{c_char, c_int, c_uint, c_void};
+use std::os::raw::{c_char, c_uint, c_void};
 use std::ptr;
 
-// HIP type definitions (FFI)
-type HipDevice = c_int;
-type HipStream = *mut c_void;
-type HipModule = *mut c_void;
-type HipFunction = *mut c_void;
-type HipDeviceptr = *mut c_void;
-type HipError = c_int;
-
-const HIP_SUCCESS: HipError = 0;
-
-// HIP FFI declarations
-#[link(name = "amdhip64")]
-extern "C" {
-    fn hipInit(flags: c_uint) -> HipError;
-    fn hipSetDevice(device: HipDevice) -> HipError;
-    fn hipGetDeviceCount(count: *mut c_int) -> HipError;
-
-    fn hipMalloc(ptr: *mut HipDeviceptr, size: usize) -> HipError;
-    fn hipFree(ptr: HipDeviceptr) -> HipError;
-    fn hipMemcpy(
-        dst: HipDeviceptr,
-        src: *const c_void,
-        size: usize,
-        kind: c_int,
-    ) -> HipError;
-    fn hipMemset(ptr: HipDeviceptr, value: c_int, size: usize) -> HipError;
-
-    fn hipModuleLoad(module: *mut HipModule, fname: *const c_char) -> HipError;
-    fn hipModuleLoadData(module: *mut HipModule, image: *const c_void) -> HipError;
-    fn hipModuleGetFunction(
-        func: *mut HipFunction,
-        module: HipModule,
-        name: *const c_char,
-    ) -> HipError;
-    fn hipModuleUnload(module: HipModule) -> HipError;
-
-    fn hipModuleLaunchKernel(
-        f: HipFunction,
-        grid_dim_x: c_uint,
-        grid_dim_y: c_uint,
-        grid_dim_z: c_uint,
-        block_dim_x: c_uint,
-        block_dim_y: c_uint,
-        block_dim_z: c_uint,
-        shared_mem_bytes: c_uint,
-        stream: HipStream,
-        kernel_params: *mut *mut c_void,
-        extra: *mut *mut c_void,
-    ) -> HipError;
-
-    fn hipStreamCreate(stream: *mut HipStream) -> HipError;
-    fn hipStreamDestroy(stream: HipStream) -> HipError;
-    fn hipStreamSynchronize(stream: HipStream) -> HipError;
-
-    fn hipGetErrorString(error: HipError) -> *const c_char;
-}
-
-// Memory copy kinds
-const HIP_MEMCPY_HOST_TO_DEVICE: c_int = 1;
-const HIP_MEMCPY_DEVICE_TO_HOST: c_int = 2;
+use super::hip_runtime::{
+    get_hip_lib, HipDeviceptr, HipError, HipFunction, HipModule, HipStream,
+    HIP_MEMCPY_DEVICE_TO_HOST, HIP_MEMCPY_HOST_TO_DEVICE, HIP_SUCCESS,
+};
 
 const KERNEL_F32: &str = "paged_attention_forward_f32\0";
 const KERNEL_F16: &str = "paged_attention_forward_f16\0";
@@ -87,6 +32,8 @@ pub enum PagedAttentionError {
     KernelMissing(&'static str),
     /// Module load failure.
     ModuleLoadFailed(String),
+    /// HIP library not available.
+    HipNotAvailable(String),
 }
 
 impl fmt::Display for PagedAttentionError {
@@ -96,6 +43,7 @@ impl fmt::Display for PagedAttentionError {
             Self::InvalidConfig(msg) => write!(f, "Invalid config: {}", msg),
             Self::KernelMissing(name) => write!(f, "Kernel not found: {}", name),
             Self::ModuleLoadFailed(msg) => write!(f, "Module load failed: {}", msg),
+            Self::HipNotAvailable(msg) => write!(f, "HIP not available: {}", msg),
         }
     }
 }
@@ -106,16 +54,7 @@ fn check_hip(result: HipError) -> Result<(), PagedAttentionError> {
     if result == HIP_SUCCESS {
         Ok(())
     } else {
-        let msg = unsafe {
-            let ptr = hipGetErrorString(result);
-            if ptr.is_null() {
-                "Unknown error".to_string()
-            } else {
-                std::ffi::CStr::from_ptr(ptr)
-                    .to_string_lossy()
-                    .into_owned()
-            }
-        };
+        let msg = super::hip_runtime::get_error_string(result);
         Err(PagedAttentionError::Hip(result, msg))
     }
 }
@@ -130,12 +69,15 @@ pub struct HipBuffer<T> {
 impl<T> HipBuffer<T> {
     /// Allocate zeroed device memory.
     pub fn alloc_zeros(len: usize) -> Result<Self, PagedAttentionError> {
+        let lib = get_hip_lib()
+            .map_err(|e| PagedAttentionError::HipNotAvailable(e.to_string()))?;
+
         let size = len * std::mem::size_of::<T>();
         let mut ptr: HipDeviceptr = ptr::null_mut();
 
         unsafe {
-            check_hip(hipMalloc(&mut ptr, size))?;
-            check_hip(hipMemset(ptr, 0, size))?;
+            check_hip((lib.hip_malloc)(&mut ptr, size))?;
+            check_hip((lib.hip_memset)(ptr, 0, size))?;
         }
 
         Ok(Self {
@@ -147,12 +89,15 @@ impl<T> HipBuffer<T> {
 
     /// Copy from host slice to device.
     pub fn from_slice(data: &[T]) -> Result<Self, PagedAttentionError> {
+        let lib = get_hip_lib()
+            .map_err(|e| PagedAttentionError::HipNotAvailable(e.to_string()))?;
+
         let size = data.len() * std::mem::size_of::<T>();
         let mut ptr: HipDeviceptr = ptr::null_mut();
 
         unsafe {
-            check_hip(hipMalloc(&mut ptr, size))?;
-            check_hip(hipMemcpy(
+            check_hip((lib.hip_malloc)(&mut ptr, size))?;
+            check_hip((lib.hip_memcpy)(
                 ptr,
                 data.as_ptr() as *const c_void,
                 size,
@@ -172,11 +117,14 @@ impl<T> HipBuffer<T> {
     where
         T: Default + Clone,
     {
+        let lib = get_hip_lib()
+            .map_err(|e| PagedAttentionError::HipNotAvailable(e.to_string()))?;
+
         let mut data = vec![T::default(); self.len];
         let size = self.len * std::mem::size_of::<T>();
 
         unsafe {
-            check_hip(hipMemcpy(
+            check_hip((lib.hip_memcpy)(
                 data.as_mut_ptr() as HipDeviceptr,
                 self.ptr as *const c_void,
                 size,
@@ -207,8 +155,10 @@ impl<T> HipBuffer<T> {
 impl<T> Drop for HipBuffer<T> {
     fn drop(&mut self) {
         if !self.ptr.is_null() {
-            unsafe {
-                let _ = hipFree(self.ptr);
+            if let Ok(lib) = get_hip_lib() {
+                unsafe {
+                    let _ = (lib.hip_free)(self.ptr);
+                }
             }
         }
     }
@@ -222,16 +172,21 @@ pub struct HipStreamWrapper {
 impl HipStreamWrapper {
     /// Create a new HIP stream.
     pub fn new() -> Result<Self, PagedAttentionError> {
+        let lib = get_hip_lib()
+            .map_err(|e| PagedAttentionError::HipNotAvailable(e.to_string()))?;
+
         let mut stream: HipStream = ptr::null_mut();
         unsafe {
-            check_hip(hipStreamCreate(&mut stream))?;
+            check_hip((lib.hip_stream_create)(&mut stream))?;
         }
         Ok(Self { stream })
     }
 
     /// Synchronize the stream.
     pub fn synchronize(&self) -> Result<(), PagedAttentionError> {
-        unsafe { check_hip(hipStreamSynchronize(self.stream)) }
+        let lib = get_hip_lib()
+            .map_err(|e| PagedAttentionError::HipNotAvailable(e.to_string()))?;
+        unsafe { check_hip((lib.hip_stream_synchronize)(self.stream)) }
     }
 
     /// Get raw stream.
@@ -243,8 +198,10 @@ impl HipStreamWrapper {
 impl Drop for HipStreamWrapper {
     fn drop(&mut self) {
         if !self.stream.is_null() {
-            unsafe {
-                let _ = hipStreamDestroy(self.stream);
+            if let Ok(lib) = get_hip_lib() {
+                unsafe {
+                    let _ = (lib.hip_stream_destroy)(self.stream);
+                }
             }
         }
     }
@@ -260,9 +217,12 @@ pub struct PagedAttentionKernel {
 impl PagedAttentionKernel {
     /// Initialize HIP runtime and load kernels.
     pub fn new(device: i32) -> Result<Self, PagedAttentionError> {
+        let lib = get_hip_lib()
+            .map_err(|e| PagedAttentionError::HipNotAvailable(e.to_string()))?;
+
         unsafe {
-            check_hip(hipInit(0))?;
-            check_hip(hipSetDevice(device))?;
+            check_hip((lib.hip_init)(0))?;
+            check_hip((lib.hip_set_device)(device))?;
         }
 
         let module = Self::load_module()?;
@@ -277,37 +237,35 @@ impl PagedAttentionKernel {
     }
 
     fn load_module() -> Result<HipModule, PagedAttentionError> {
-        if let Ok(path) = std::env::var("GLLM_HIP_PAGED_ATTN_HSACO") {
-            let c_path = CString::new(path.clone())
-                .map_err(|_| PagedAttentionError::ModuleLoadFailed("Invalid path".into()))?;
+        let lib = get_hip_lib()
+            .map_err(|e| PagedAttentionError::HipNotAvailable(e.to_string()))?;
 
-            let mut module: HipModule = ptr::null_mut();
-            unsafe {
-                check_hip(hipModuleLoad(&mut module, c_path.as_ptr()))?;
-            }
-            return Ok(module);
-        }
-
+        // Priority 1: Embedded precompiled HSACO
         if PRECOMPILED_HSACO.len() > 1 {
+            log::debug!("Loading precompiled HSACO from embedded data");
             let mut module: HipModule = ptr::null_mut();
             unsafe {
-                check_hip(hipModuleLoadData(
+                check_hip((lib.hip_module_load_data)(
                     &mut module,
                     PRECOMPILED_HSACO.as_ptr() as *const c_void,
                 ))?;
             }
+            log::info!("Loaded embedded HSACO successfully");
             return Ok(module);
         }
 
         Err(PagedAttentionError::ModuleLoadFailed(
-            "No HSACO binary available. Set GLLM_HIP_PAGED_ATTN_HSACO or compile kernels.".into(),
+            "No HSACO binary available. Compile with hipcc and embed kernels.".into(),
         ))
     }
 
     fn get_function(module: HipModule, name: &str) -> Result<HipFunction, PagedAttentionError> {
+        let lib = get_hip_lib()
+            .map_err(|e| PagedAttentionError::HipNotAvailable(e.to_string()))?;
+
         let mut func: HipFunction = ptr::null_mut();
         unsafe {
-            check_hip(hipModuleGetFunction(
+            check_hip((lib.hip_module_get_function)(
                 &mut func,
                 module,
                 name.as_ptr() as *const c_char,
@@ -404,6 +362,9 @@ impl PagedAttentionKernel {
         seq_len: usize,
         block_size: u32,
     ) -> Result<HipBuffer<f32>, PagedAttentionError> {
+        let lib = get_hip_lib()
+            .map_err(|e| PagedAttentionError::HipNotAvailable(e.to_string()))?;
+
         let (output_len, grid_dim) = build_launch(batch_size, num_heads, seq_len, head_dim, block_size)?;
         let output = HipBuffer::<f32>::alloc_zeros(output_len)?;
 
@@ -428,7 +389,7 @@ impl PagedAttentionKernel {
                 &seq_len_i32 as *const _ as *mut c_void,
             ];
 
-            check_hip(hipModuleLaunchKernel(
+            check_hip((lib.hip_module_launch_kernel)(
                 self.kernel_f32,
                 grid_dim,
                 1,
@@ -461,6 +422,9 @@ impl PagedAttentionKernel {
         seq_len: usize,
         block_size: u32,
     ) -> Result<HipBuffer<u16>, PagedAttentionError> {
+        let lib = get_hip_lib()
+            .map_err(|e| PagedAttentionError::HipNotAvailable(e.to_string()))?;
+
         let (output_len, grid_dim) = build_launch(batch_size, num_heads, seq_len, head_dim, block_size)?;
         let output = HipBuffer::<u16>::alloc_zeros(output_len)?;
 
@@ -485,7 +449,7 @@ impl PagedAttentionKernel {
                 &seq_len_i32 as *const _ as *mut c_void,
             ];
 
-            check_hip(hipModuleLaunchKernel(
+            check_hip((lib.hip_module_launch_kernel)(
                 self.kernel_f16,
                 grid_dim,
                 1,
@@ -501,6 +465,18 @@ impl PagedAttentionKernel {
         }
 
         Ok(output)
+    }
+}
+
+impl Drop for PagedAttentionKernel {
+    fn drop(&mut self) {
+        if !self.module.is_null() {
+            if let Ok(lib) = get_hip_lib() {
+                unsafe {
+                    let _ = (lib.hip_module_unload)(self.module);
+                }
+            }
+        }
     }
 }
 
@@ -542,10 +518,13 @@ fn build_launch(
 
 #[allow(dead_code)]
 pub fn get_device_count() -> Result<i32, PagedAttentionError> {
+    let lib = get_hip_lib()
+        .map_err(|e| PagedAttentionError::HipNotAvailable(e.to_string()))?;
+
     let mut count = 0;
     unsafe {
-        check_hip(hipInit(0))?;
-        check_hip(hipGetDeviceCount(&mut count))?;
+        check_hip((lib.hip_init)(0))?;
+        check_hip((lib.hip_get_device_count)(&mut count))?;
     }
     Ok(count)
 }

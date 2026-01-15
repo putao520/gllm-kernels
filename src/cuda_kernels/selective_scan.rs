@@ -5,6 +5,7 @@ use std::sync::Arc;
 
 use cudarc::driver::{
     CudaContext, CudaFunction, CudaModule, CudaSlice, CudaStream, DriverError, LaunchConfig,
+    PushKernelArg,
 };
 use cudarc::nvrtc::Ptx;
 
@@ -106,16 +107,16 @@ impl SelectiveScanKernel {
 }
 
 fn load_ptx() -> Result<Ptx, SelectiveScanError> {
-    if let Ok(path) = std::env::var("GLLM_SELECTIVE_SCAN_PTX") {
-        return Ok(Ptx::from_file(path));
-    }
-
+    // Priority 1: Check if precompiled PTX is valid (not a placeholder)
     if !PRECOMPILED_PTX.contains("Placeholder") {
+        log::debug!("Loading precompiled PTX from embedded data");
         return Ok(Ptx::from_src(PRECOMPILED_PTX));
     }
 
+    // Priority 2: Try runtime compilation with NVRTC
     #[cfg(feature = "nvrtc")]
     {
+        log::debug!("Compiling PTX from source at runtime");
         use cudarc::nvrtc::compile_ptx;
         return compile_ptx(KERNEL_SOURCE).map_err(|e| {
             SelectiveScanError::InvalidConfig(format!("NVRTC compilation failed: {}", e))
@@ -126,8 +127,7 @@ fn load_ptx() -> Result<Ptx, SelectiveScanError> {
     Err(SelectiveScanError::InvalidConfig(
         "PTX is a placeholder. Either: \n\
          1. Compile with: nvcc -ptx -arch=sm_61 selective_scan.cu -o selective_scan.ptx\n\
-         2. Set GLLM_SELECTIVE_SCAN_PTX=/path/to/compiled.ptx\n\
-         3. Enable 'nvrtc' feature and ensure CUDA toolkit is installed".into(),
+         2. Enable 'nvrtc' feature and ensure CUDA toolkit is installed".into(),
     ))
 }
 
