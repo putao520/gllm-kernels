@@ -18,13 +18,10 @@ const DEFAULT_BLOCK: u32 = 128;
 const BLOCK_M: usize = 16;
 const BLOCK_N: usize = 16;
 
-/// CUDA source for runtime compilation.
-const KERNEL_SOURCE: &str = include_str!("kernels/fused_qkv_attention.cu");
-
 /// SM-aware PTX collection for fused QKV attention kernel.
+/// 🚨 **Fat Binary Only**: All PTX precompiled and embedded, no runtime compilation.
 static FUSED_QKV_ATTENTION_PTX: PtxCollection = PtxCollection {
     kernel_name: "fused_qkv_attention",
-    source: KERNEL_SOURCE,
     ptx_versions: &[
         // SM 61 (Pascal) - GTX 1060/1070/1080
         (61, include_str!("kernels/fused_qkv_attention_sm61.ptx")),

@@ -14,7 +14,7 @@
 //! - SM 89 (Ada): RTX 4060/4070/4080/4090
 //! - SM 90 (Hopper): H100, H200
 //!
-//! If no matching PTX is found, NVRTC runtime compilation is used as fallback.
+//! 🚨 **Fat Binary Only**: NO runtime compilation fallback.
 
 use std::fmt;
 use std::sync::Arc;
@@ -32,14 +32,12 @@ const KERNEL_F32: &str = "tiled_attention_forward_f32";
 const KERNEL_F16: &str = "tiled_attention_forward_f16";
 const DEFAULT_BLOCK: u32 = 128;
 
-/// CUDA source for runtime compilation.
-const KERNEL_SOURCE: &str = include_str!("kernels/tiled_attention.cu");
-
 /// SM-aware PTX collection for tiled attention kernel.
 /// PTX compiled for a lower SM version is forward-compatible with higher SM GPUs.
+///
+/// 🚨 **Fat Binary Only**: All PTX precompiled and embedded, no runtime compilation.
 static TILED_ATTENTION_PTX: PtxCollection = PtxCollection {
     kernel_name: "tiled_attention",
-    source: KERNEL_SOURCE,
     ptx_versions: &[
         // SM 61 (Pascal) - GTX 1060/1070/1080
         (61, include_str!("kernels/tiled_attention_sm61.ptx")),
@@ -97,9 +95,8 @@ pub struct FlashAttentionKernel {
 impl FlashAttentionKernel {
     /// Load a FlashAttention kernel module on the given device.
     ///
-    /// This method automatically selects the best PTX binary for the detected GPU:
-    /// - Uses precompiled PTX for matching SM version
-    /// - Falls back to NVRTC runtime compilation if needed
+    /// This method automatically selects the best PTX binary for the detected GPU.
+    /// 🚨 **Fat Binary Only**: No runtime compilation fallback.
     pub fn new(ctx: &Arc<CudaContext>) -> Result<Self, FlashAttentionError> {
         let ptx = TILED_ATTENTION_PTX.load(ctx)?;
         let module = ctx.load_module(ptx)?;

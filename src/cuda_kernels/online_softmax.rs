@@ -11,13 +11,10 @@ const KERNEL_F32: &str = "online_softmax_forward";
 const MIN_BLOCK: usize = 32;
 const MAX_BLOCK: usize = 256;
 
-/// CUDA source for runtime compilation.
-const KERNEL_SOURCE: &str = include_str!("kernels/online_softmax.cu");
-
 /// SM-aware PTX collection for online softmax kernel.
+/// 🚨 **Fat Binary Only**: All PTX precompiled and embedded, no runtime compilation.
 static ONLINE_SOFTMAX_PTX: PtxCollection = PtxCollection {
     kernel_name: "online_softmax",
-    source: KERNEL_SOURCE,
     ptx_versions: &[
         // SM 61 (Pascal) - GTX 1060/1070/1080
         (61, include_str!("kernels/online_softmax_sm61.ptx")),

@@ -4,7 +4,14 @@
 //! It supports:
 //! - Multiple precompiled PTX versions for different SM architectures
 //! - Automatic SM detection and best-match selection
-//! - NVRTC fallback for runtime compilation
+//! - Fat Binary Only: NO runtime compilation fallback
+//!
+//! # Design Philosophy
+//!
+//! 🚨 **Fat Binary Only Architecture**:
+//! - All PTX must be precompiled and embedded at compile time
+//! - NO NVRTC runtime compilation
+//! - If no matching PTX is found, return error (not fallback to compilation)
 //!
 //! # Supported Architectures (2019-2026)
 //!
@@ -46,7 +53,7 @@ pub enum PtxLoadError {
     UnsupportedSm(u32),
     /// Failed to detect SM version.
     SmDetectionFailed(String),
-    /// No matching PTX found and NVRTC compilation failed.
+    /// No matching precompiled PTX found (Fat Binary Only - no runtime compilation).
     NoPtxAvailable(String),
     /// CUDA driver error.
     Driver(DriverError),
@@ -102,19 +109,24 @@ pub fn find_best_sm_match(gpu_sm: u32, available_sms: &[u32]) -> Option<u32> {
         .copied()
 }
 
-/// PTX source collection for a kernel.
+/// PTX collection for a kernel.
 /// Contains precompiled PTX for multiple SM versions.
+///
+/// 🚨 **Fat Binary Only**: No runtime compilation support.
+/// All PTX must be precompiled and embedded at compile time.
 pub struct PtxCollection {
     /// Kernel name for logging.
     pub kernel_name: &'static str,
-    /// CUDA source code for NVRTC fallback.
-    pub source: &'static str,
     /// Available PTX versions: (sm_version, ptx_content).
+    /// PTX compiled for a lower SM version is forward-compatible with higher SM GPUs.
     pub ptx_versions: &'static [(u32, &'static str)],
 }
 
 impl PtxCollection {
     /// Load the best matching PTX for the given CUDA context.
+    ///
+    /// 🚨 **Fat Binary Only**: This method only loads precompiled PTX.
+    /// If no matching PTX is found, it returns an error (NO runtime compilation).
     pub fn load(&self, ctx: &Arc<CudaContext>) -> Result<Ptx, PtxLoadError> {
         // Step 1: Detect GPU SM version
         let gpu_sm = detect_sm_version(ctx)?;
@@ -141,55 +153,26 @@ impl PtxCollection {
             }
         }
 
-        // Step 4: Fallback to NVRTC runtime compilation
-        log::info!(
-            "No precompiled PTX for {} (GPU sm_{}), trying NVRTC compilation",
-            self.kernel_name, gpu_sm
-        );
-
-        self.compile_with_nvrtc(gpu_sm)
-    }
-
-    /// Compile PTX at runtime using NVRTC.
-    fn compile_with_nvrtc(&self, target_sm: u32) -> Result<Ptx, PtxLoadError> {
-        use cudarc::nvrtc::{compile_ptx_with_opts, CompileOptions, CompileError};
-
-        // Build compile options with target SM
-        let mut options = CompileOptions::default();
-        options.use_fast_math = Some(true);
-        // Add architecture and default-device flags via options vec
-        options.options.push(format!("--gpu-architecture=compute_{}", target_sm));
-        options.options.push("-default-device".into());
-
-        log::debug!("NVRTC compiling {} for sm_{}", self.kernel_name, target_sm);
-
-        let ptx = compile_ptx_with_opts(self.source, options).map_err(|e| {
-            match e {
-                CompileError::CompileError { log, .. } => {
-                    let log_str = log.to_string_lossy();
-                    PtxLoadError::NoPtxAvailable(format!(
-                        "NVRTC compilation failed for {}: {}", self.kernel_name, log_str
-                    ))
-                }
-                _ => PtxLoadError::NoPtxAvailable(format!(
-                    "NVRTC compilation failed for {}: {:?}", self.kernel_name, e
-                ))
-            }
-        })?;
-
-        log::info!("Successfully compiled {} PTX via NVRTC for sm_{}", self.kernel_name, target_sm);
-        Ok(ptx)
+        // 🚨 Fat Binary Only: NO runtime compilation fallback
+        // Return error if no matching precompiled PTX is found
+        Err(PtxLoadError::NoPtxAvailable(format!(
+            "No precompiled PTX for {} kernel (GPU sm_{}). Available SM versions: {:?}. \
+             Fat Binary Only architecture: runtime compilation is disabled.",
+            self.kernel_name, gpu_sm, available_sms
+        )))
     }
 }
 
 /// Macro to define a PTX collection with embedded PTX files.
+///
+/// 🚨 **Fat Binary Only**: All PTX must be precompiled and embedded.
+/// NO runtime compilation support - source code parameter removed.
 ///
 /// Usage:
 /// ```ignore
 /// define_ptx_collection!(
 ///     TILED_ATTENTION_PTX,
 ///     "tiled_attention",
-///     include_str!("kernels/tiled_attention.cu"),
 ///     [
 ///         (61, include_str!("kernels/tiled_attention_sm61.ptx")),
 ///         (75, include_str!("kernels/tiled_attention_sm75.ptx")),
@@ -199,11 +182,10 @@ impl PtxCollection {
 /// ```
 #[macro_export]
 macro_rules! define_ptx_collection {
-    ($name:ident, $kernel_name:literal, $source:expr, [ $(($sm:expr, $ptx:expr)),* $(,)? ]) => {
+    ($name:ident, $kernel_name:literal, [ $(($sm:expr, $ptx:expr)),* $(,)? ]) => {
         pub static $name: $crate::cuda_kernels::ptx_loader::PtxCollection =
             $crate::cuda_kernels::ptx_loader::PtxCollection {
                 kernel_name: $kernel_name,
-                source: $source,
                 ptx_versions: &[ $(($sm, $ptx)),* ],
             };
     };

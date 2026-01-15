@@ -20,13 +20,10 @@ const KERNEL_F32: &str = "paged_attention_forward_f32";
 const KERNEL_F16: &str = "paged_attention_forward_f16";
 const DEFAULT_BLOCK: u32 = 128;
 
-/// CUDA source for runtime compilation.
-const KERNEL_SOURCE: &str = include_str!("kernels/paged_attention.cu");
-
 /// SM-aware PTX collection for paged attention kernel.
+/// 🚨 **Fat Binary Only**: All PTX precompiled and embedded, no runtime compilation.
 static PAGED_ATTENTION_PTX: PtxCollection = PtxCollection {
     kernel_name: "paged_attention",
-    source: KERNEL_SOURCE,
     ptx_versions: &[
         // SM 61 (Pascal) - GTX 1060/1070/1080
         (61, include_str!("kernels/paged_attention_sm61.ptx")),

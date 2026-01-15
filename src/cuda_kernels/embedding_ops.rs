@@ -9,7 +9,7 @@
 //! # SM-Aware PTX Loading
 //!
 //! This module automatically selects the best PTX binary for the detected GPU.
-//! If no matching PTX is found, NVRTC runtime compilation is used as fallback.
+//! 🚨 **Fat Binary Only**: NO runtime compilation fallback.
 
 use std::fmt;
 use std::sync::Arc;
@@ -32,16 +32,13 @@ const KERNEL_MATRYOSHKA_NORMALIZE: &str = "matryoshka_normalize";
 
 const BLOCK_SIZE: u32 = 256;
 
-/// CUDA source for NVRTC fallback.
-const KERNEL_SOURCE: &str = include_str!("kernels/embedding_ops.cu");
-
 /// SM-aware PTX collection for embedding kernels.
 /// PTX compiled for a lower SM version is forward-compatible with higher SM GPUs.
 ///
+/// 🚨 **Fat Binary Only**: All PTX precompiled and embedded, no runtime compilation.
 /// Precompile PTX with: ./scripts/compile_cuda_kernels.sh
 static EMBEDDING_OPS_PTX: PtxCollection = PtxCollection {
     kernel_name: "embedding_ops",
-    source: KERNEL_SOURCE,
     ptx_versions: &[
         // SM 61 (Pascal) - GTX 1060/1070/1080
         (61, include_str!("kernels/embedding_ops_sm61.ptx")),

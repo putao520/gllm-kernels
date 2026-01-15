@@ -14,13 +14,10 @@ const KERNEL_F32: &str = "selective_scan_fwd";
 const MIN_BLOCK: usize = 32;
 const MAX_BLOCK: usize = 256;
 
-/// CUDA source for runtime compilation.
-const KERNEL_SOURCE: &str = include_str!("kernels/selective_scan.cu");
-
 /// SM-aware PTX collection for selective scan kernel.
+/// 🚨 **Fat Binary Only**: All PTX precompiled and embedded, no runtime compilation.
 static SELECTIVE_SCAN_PTX: PtxCollection = PtxCollection {
     kernel_name: "selective_scan",
-    source: KERNEL_SOURCE,
     ptx_versions: &[
         // SM 61 (Pascal) - GTX 1060/1070/1080
         (61, include_str!("kernels/selective_scan_sm61.ptx")),
