@@ -1791,6 +1791,7 @@ dependencies = [
  "burn",
  "burn-fusion",
  "burn-ndarray",
+ "bytemuck",
  "criterion",
  "crossbeam-channel",
  "cudarc",

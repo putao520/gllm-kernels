@@ -34,6 +34,7 @@
 pub mod hsa_runtime;
 pub mod hsa_flash_attn;
 pub mod hsa_paged_attn;
+pub mod hsa_embedding_ops;
 
 // HSA Runtime
 pub use hsa_runtime::{get_hsa_lib, is_hsa_available, HsaLib, GpuAgent, find_gpu_agents};
@@ -44,6 +45,7 @@ pub use hsa_flash_attn::{
     OptimizedHsaAttention,
 };
 pub use hsa_paged_attn::{HsaPagedAttentionError, HsaPagedAttentionKernel};
+pub use hsa_embedding_ops::{HsaEmbeddingOpsError, HsaEmbeddingOpsKernel};
 
 /// Check if AMD GPU is available (HSA runtime).
 pub fn is_amd_gpu_available() -> bool {

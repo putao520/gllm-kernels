@@ -18,6 +18,7 @@
 
 pub mod metallib_loader;
 pub mod metal_runtime;
+pub mod embedding_ops;
 pub mod flash_attn;
 pub mod paged_attn;
 
@@ -26,5 +27,6 @@ pub use metal_runtime::{
     get_metal_device, is_metal_available, MetalDeviceInfo, MetalError,
     MetalKernelExecutor, MetalKernelLoader,
 };
+pub use embedding_ops::{EmbeddingOpsError as MetalEmbeddingOpsError, EmbeddingOpsKernel as MetalEmbeddingOpsKernel};
 pub use flash_attn::{FlashAttentionError, FlashAttentionKernel};
 pub use paged_attn::{PagedAttentionError, PagedAttentionKernel};

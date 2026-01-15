@@ -15,21 +15,28 @@ use std::sync::Arc;
 #[cfg(target_os = "linux")]
 use crate::hip_kernels::{
     find_gpu_agents, is_hsa_available, HsaBuffer, HsaFlashAttentionKernel,
-    HsaPagedAttentionKernel, HsaQueueWrapper,
+    HsaPagedAttentionKernel, HsaQueueWrapper, HsaEmbeddingOpsKernel,
 };
 
 use crate::cuda_kernels::{
     FlashAttentionKernel as CudaFlashAttentionKernel,
     PagedAttentionKernel as CudaPagedAttentionKernel,
+    CudaEmbeddingOpsKernel,
 };
 use crate::wgpu_kernels::{
     FlashAttentionKernel as WgpuFlashAttentionKernel,
     PagedAttentionKernel as WgpuPagedAttentionKernel,
+    EmbeddingOpsKernel as WgpuEmbeddingOpsKernel,
 };
+
+// Re-export rerank types for public API
+pub use crate::wgpu_kernels::{GpuRerankConfig, GpuRerankStageResult};
+
 #[cfg(target_os = "macos")]
 use crate::metal_kernels::{
     FlashAttentionKernel as MetalFlashAttentionKernel,
     PagedAttentionKernel as MetalPagedAttentionKernel,
+    MetalEmbeddingOpsKernel,
 };
 use cudarc::driver::{CudaContext, CudaStream};
 
@@ -42,6 +49,10 @@ static HSA_KERNEL: OnceLock<Option<HsaFlashAttentionKernel>> = OnceLock::new();
 /// Global HSA paged attention kernel instance (lazy initialized)
 #[cfg(target_os = "linux")]
 static HSA_PAGED_KERNEL: OnceLock<Option<HsaPagedAttentionKernel>> = OnceLock::new();
+
+/// Global HSA embedding ops kernel instance (lazy initialized)
+#[cfg(target_os = "linux")]
+static HSA_EMBEDDING_KERNEL: OnceLock<Option<HsaEmbeddingOpsKernel>> = OnceLock::new();
 
 /// Global HSA queue (lazy initialized)
 #[cfg(target_os = "linux")]
@@ -73,6 +84,22 @@ fn get_hsa_paged_kernel() -> Option<&'static HsaPagedAttentionKernel> {
             Ok(kernel) => Some(kernel),
             Err(e) => {
                 log::warn!("Failed to initialize HSA paged attention kernel: {}", e);
+                None
+            }
+        }
+    }).as_ref()
+}
+
+#[cfg(target_os = "linux")]
+fn get_hsa_embedding_kernel() -> Option<&'static HsaEmbeddingOpsKernel> {
+    HSA_EMBEDDING_KERNEL.get_or_init(|| {
+        if !is_hsa_available() {
+            return None;
+        }
+        match HsaEmbeddingOpsKernel::new(0) {
+            Ok(kernel) => Some(kernel),
+            Err(e) => {
+                log::warn!("Failed to initialize HSA embedding ops kernel: {}", e);
                 None
             }
         }
@@ -121,6 +148,9 @@ static CUDA_KERNEL: OnceLock<Option<CudaFlashAttentionKernel>> = OnceLock::new()
 /// Global CUDA paged attention kernel (lazy initialized)
 static CUDA_PAGED_KERNEL: OnceLock<Option<CudaPagedAttentionKernel>> = OnceLock::new();
 
+/// Global CUDA embedding ops kernel (lazy initialized)
+static CUDA_EMBEDDING_KERNEL: OnceLock<Option<CudaEmbeddingOpsKernel>> = OnceLock::new();
+
 fn get_cuda_context() -> Option<&'static Arc<CudaContext>> {
     CUDA_CONTEXT.get_or_init(|| {
         match CudaContext::new(0) {
@@ -168,6 +198,19 @@ fn get_cuda_paged_kernel() -> Option<&'static CudaPagedAttentionKernel> {
     }).as_ref()
 }
 
+fn get_cuda_embedding_kernel() -> Option<&'static CudaEmbeddingOpsKernel> {
+    CUDA_EMBEDDING_KERNEL.get_or_init(|| {
+        let ctx = get_cuda_context()?;
+        match CudaEmbeddingOpsKernel::new(ctx) {
+            Ok(kernel) => Some(kernel),
+            Err(e) => {
+                log::warn!("Failed to initialize CUDA embedding ops kernel: {}", e);
+                None
+            }
+        }
+    }).as_ref()
+}
+
 // =============================================================================
 // WGPU Lazy Initialization
 // =============================================================================
@@ -177,6 +220,9 @@ static WGPU_KERNEL: OnceLock<Option<WgpuFlashAttentionKernel>> = OnceLock::new()
 
 /// Global WGPU paged attention kernel (lazy initialized)
 static WGPU_PAGED_KERNEL: OnceLock<Option<WgpuPagedAttentionKernel>> = OnceLock::new();
+
+/// Global WGPU embedding ops kernel (lazy initialized)
+static WGPU_EMBEDDING_KERNEL: OnceLock<Option<WgpuEmbeddingOpsKernel>> = OnceLock::new();
 
 fn get_wgpu_kernel() -> Option<&'static WgpuFlashAttentionKernel> {
     WGPU_KERNEL.get_or_init(|| {
@@ -203,6 +249,18 @@ fn get_wgpu_paged_kernel() -> Option<&'static WgpuPagedAttentionKernel> {
     }).as_ref()
 }
 
+fn get_wgpu_embedding_kernel() -> Option<&'static WgpuEmbeddingOpsKernel> {
+    WGPU_EMBEDDING_KERNEL.get_or_init(|| {
+        match WgpuEmbeddingOpsKernel::create_default() {
+            Ok(kernel) => Some(kernel),
+            Err(e) => {
+                log::warn!("Failed to initialize WGPU embedding ops kernel: {}", e);
+                None
+            }
+        }
+    }).as_ref()
+}
+
 // =============================================================================
 // Metal Lazy Initialization (macOS only)
 // =============================================================================
@@ -212,6 +270,9 @@ static METAL_KERNEL: OnceLock<Option<MetalFlashAttentionKernel>> = OnceLock::new
 
 #[cfg(target_os = "macos")]
 static METAL_PAGED_KERNEL: OnceLock<Option<MetalPagedAttentionKernel>> = OnceLock::new();
+
+#[cfg(target_os = "macos")]
+static METAL_EMBEDDING_KERNEL: OnceLock<Option<MetalEmbeddingOpsKernel>> = OnceLock::new();
 
 #[cfg(target_os = "macos")]
 static METAL_DEVICE: OnceLock<Option<metal::Device>> = OnceLock::new();
@@ -245,6 +306,20 @@ fn get_metal_paged_kernel() -> Option<&'static MetalPagedAttentionKernel> {
             Ok(kernel) => Some(kernel),
             Err(e) => {
                 log::warn!("Failed to initialize Metal paged attention kernel: {}", e);
+                None
+            }
+        }
+    }).as_ref()
+}
+
+#[cfg(target_os = "macos")]
+fn get_metal_embedding_kernel() -> Option<&'static MetalEmbeddingOpsKernel> {
+    METAL_EMBEDDING_KERNEL.get_or_init(|| {
+        let device = get_metal_device()?;
+        match MetalEmbeddingOpsKernel::new(device) {
+            Ok(kernel) => Some(kernel),
+            Err(e) => {
+                log::warn!("Failed to initialize Metal embedding ops kernel: {}", e);
                 None
             }
         }
@@ -648,9 +723,83 @@ impl KernelDispatcher {
         scores: &mut [i32],
         config: crate::ops::embedding::BinaryIpConfig,
     ) {
-        // Use SIMD-optimized version (4-way unrolled popcount)
-        // GPU dispatch can be added when CUDA/Metal binary kernels are available
-        crate::ops::embedding::binary_ip_hamming_simd(queries, database, scores, &config);
+        // Reinterpret u64 as u32 pairs (GPU uses 32-bit packing)
+        let queries_u32: &[u32] = bytemuck::cast_slice(queries);
+        let database_u32: &[u32] = bytemuck::cast_slice(database);
+
+        match self.backend {
+            BackendType::Wgpu => {
+                if let Some(kernel) = get_wgpu_embedding_kernel() {
+                    match kernel.binary_ip_hamming(
+                        queries_u32,
+                        database_u32,
+                        config.dim,
+                        config.num_queries,
+                        config.num_vectors,
+                    ) {
+                        Ok(result) => {
+                            scores.copy_from_slice(&result);
+                            return;
+                        }
+                        Err(e) => {
+                            log::debug!("WGPU binary_ip_hamming failed: {}, falling back to CPU", e);
+                        }
+                    }
+                }
+                crate::ops::embedding::binary_ip_hamming_simd(queries, database, scores, &config);
+            }
+            BackendType::Cuda => {
+                if let (Some(kernel), Some(stream)) = (get_cuda_embedding_kernel(), get_cuda_stream()) {
+                    match cuda_binary_ip_hamming(
+                        kernel, stream, queries_u32, database_u32,
+                        config.dim, config.num_queries, config.num_vectors,
+                    ) {
+                        Ok(result) => {
+                            scores.copy_from_slice(&result);
+                            return;
+                        }
+                        Err(e) => {
+                            log::debug!("CUDA binary_ip_hamming failed: {}, falling back to CPU", e);
+                        }
+                    }
+                }
+                crate::ops::embedding::binary_ip_hamming_simd(queries, database, scores, &config);
+            }
+            #[cfg(target_os = "linux")]
+            BackendType::Rocm => {
+                if let (Some(kernel), Some(queue)) = (get_hsa_embedding_kernel(), get_hsa_queue()) {
+                    match rocm_binary_ip_hamming(
+                        kernel, queue, queries_u32, database_u32,
+                        config.dim, config.num_queries, config.num_vectors,
+                    ) {
+                        Ok(result) => {
+                            scores.copy_from_slice(&result);
+                            return;
+                        }
+                        Err(e) => {
+                            log::debug!("HSA binary_ip_hamming failed: {}, falling back to CPU", e);
+                        }
+                    }
+                }
+                crate::ops::embedding::binary_ip_hamming_simd(queries, database, scores, &config);
+            }
+            #[cfg(not(target_os = "linux"))]
+            BackendType::Rocm => {
+                crate::ops::embedding::binary_ip_hamming_simd(queries, database, scores, &config);
+            }
+            #[cfg(target_os = "macos")]
+            BackendType::Metal => {
+                // Metal requires GPU buffer allocation - fall back to CPU for now
+                crate::ops::embedding::binary_ip_hamming_simd(queries, database, scores, &config);
+            }
+            #[cfg(not(target_os = "macos"))]
+            BackendType::Metal => {
+                crate::ops::embedding::binary_ip_hamming_simd(queries, database, scores, &config);
+            }
+            BackendType::Cpu => {
+                crate::ops::embedding::binary_ip_hamming_simd(queries, database, scores, &config);
+            }
+        }
     }
 
     /// Asymmetric Binary Inner Product (f32 query vs binary database).
@@ -665,7 +814,79 @@ impl KernelDispatcher {
         scores: &mut [f32],
         config: crate::ops::embedding::BinaryIpConfig,
     ) {
-        crate::ops::embedding::binary_ip_asymmetric(queries, database, scores, &config);
+        match self.backend {
+            BackendType::Wgpu => {
+                // Reinterpret u64 as u32 pairs (GPU uses 32-bit packing)
+                let database_u32: &[u32] = bytemuck::cast_slice(database);
+
+                if let Some(kernel) = get_wgpu_embedding_kernel() {
+                    match kernel.binary_ip_asymmetric(
+                        queries,
+                        database_u32,
+                        config.dim,
+                        config.num_queries,
+                        config.num_vectors,
+                    ) {
+                        Ok(result) => {
+                            scores.copy_from_slice(&result);
+                            return;
+                        }
+                        Err(e) => {
+                            log::debug!("WGPU binary_ip_asymmetric failed: {}, falling back to CPU", e);
+                        }
+                    }
+                }
+                crate::ops::embedding::binary_ip_asymmetric(queries, database, scores, &config);
+            }
+            BackendType::Cuda => {
+                // Reinterpret u64 as u32 pairs (GPU uses 32-bit packing)
+                let database_u32: &[u32] = bytemuck::cast_slice(database);
+
+                if let (Some(kernel), Some(stream)) = (get_cuda_embedding_kernel(), get_cuda_stream()) {
+                    match cuda_binary_ip_asymmetric(
+                        kernel, stream, queries, database_u32,
+                        config.dim, config.num_queries, config.num_vectors,
+                    ) {
+                        Ok(result) => {
+                            scores.copy_from_slice(&result);
+                            return;
+                        }
+                        Err(e) => {
+                            log::debug!("CUDA binary_ip_asymmetric failed: {}, falling back to CPU", e);
+                        }
+                    }
+                }
+                crate::ops::embedding::binary_ip_asymmetric(queries, database, scores, &config);
+            }
+            #[cfg(target_os = "linux")]
+            BackendType::Rocm => {
+                // Reinterpret u64 as u32 pairs (GPU uses 32-bit packing)
+                let database_u32: &[u32] = bytemuck::cast_slice(database);
+
+                if let (Some(kernel), Some(queue)) = (get_hsa_embedding_kernel(), get_hsa_queue()) {
+                    match rocm_binary_ip_asymmetric(
+                        kernel, queue, queries, database_u32,
+                        config.dim, config.num_queries, config.num_vectors,
+                    ) {
+                        Ok(result) => {
+                            scores.copy_from_slice(&result);
+                            return;
+                        }
+                        Err(e) => {
+                            log::debug!("HSA binary_ip_asymmetric failed: {}, falling back to CPU", e);
+                        }
+                    }
+                }
+                crate::ops::embedding::binary_ip_asymmetric(queries, database, scores, &config);
+            }
+            #[cfg(not(target_os = "linux"))]
+            BackendType::Rocm => {
+                crate::ops::embedding::binary_ip_asymmetric(queries, database, scores, &config);
+            }
+            BackendType::Metal | BackendType::Cpu => {
+                crate::ops::embedding::binary_ip_asymmetric(queries, database, scores, &config);
+            }
+        }
     }
 
     /// Int8 Dot Product for vector similarity.
@@ -680,8 +901,83 @@ impl KernelDispatcher {
         scores: &mut [f32],
         config: crate::ops::embedding::Int8DotConfig,
     ) {
-        // Use unrolled version for better pipelining
-        crate::ops::embedding::int8_dot_product_unrolled(queries, database, scores, &config);
+        match self.backend {
+            BackendType::Wgpu => {
+                // Reinterpret i8 as u32 (packed i8x4)
+                let queries_u32: &[u32] = bytemuck::cast_slice(queries);
+                let database_u32: &[u32] = bytemuck::cast_slice(database);
+
+                if let Some(kernel) = get_wgpu_embedding_kernel() {
+                    match kernel.int8_dot_product(
+                        queries_u32,
+                        database_u32,
+                        config.dim,
+                        config.num_queries,
+                        config.num_vectors,
+                        config.scale,
+                    ) {
+                        Ok(result) => {
+                            scores.copy_from_slice(&result);
+                            return;
+                        }
+                        Err(e) => {
+                            log::debug!("WGPU int8_dot_product failed: {}, falling back to CPU", e);
+                        }
+                    }
+                }
+                crate::ops::embedding::int8_dot_product_unrolled(queries, database, scores, &config);
+            }
+            BackendType::Cuda => {
+                // Reinterpret i8 as u32 (packed i8x4)
+                let queries_u32: &[u32] = bytemuck::cast_slice(queries);
+                let database_u32: &[u32] = bytemuck::cast_slice(database);
+
+                if let (Some(kernel), Some(stream)) = (get_cuda_embedding_kernel(), get_cuda_stream()) {
+                    match cuda_int8_dot_product(
+                        kernel, stream, queries_u32, database_u32,
+                        config.dim, config.num_queries, config.num_vectors, config.scale,
+                    ) {
+                        Ok(result) => {
+                            scores.copy_from_slice(&result);
+                            return;
+                        }
+                        Err(e) => {
+                            log::debug!("CUDA int8_dot_product failed: {}, falling back to CPU", e);
+                        }
+                    }
+                }
+                crate::ops::embedding::int8_dot_product_unrolled(queries, database, scores, &config);
+            }
+            #[cfg(target_os = "linux")]
+            BackendType::Rocm => {
+                // Reinterpret i8 as u32 (packed i8x4)
+                let queries_u32: &[u32] = bytemuck::cast_slice(queries);
+                let database_u32: &[u32] = bytemuck::cast_slice(database);
+
+                if let (Some(kernel), Some(queue)) = (get_hsa_embedding_kernel(), get_hsa_queue()) {
+                    match rocm_int8_dot_product(
+                        kernel, queue, queries_u32, database_u32,
+                        config.dim, config.num_queries, config.num_vectors, config.scale,
+                    ) {
+                        Ok(result) => {
+                            scores.copy_from_slice(&result);
+                            return;
+                        }
+                        Err(e) => {
+                            log::debug!("HSA int8_dot_product failed: {}, falling back to CPU", e);
+                        }
+                    }
+                }
+                crate::ops::embedding::int8_dot_product_unrolled(queries, database, scores, &config);
+            }
+            #[cfg(not(target_os = "linux"))]
+            BackendType::Rocm => {
+                crate::ops::embedding::int8_dot_product_unrolled(queries, database, scores, &config);
+            }
+            BackendType::Metal | BackendType::Cpu => {
+                crate::ops::embedding::int8_dot_product_unrolled(queries, database, scores, &config);
+            }
+        }
     }
 
     /// Int4 Packed Dot Product for maximum memory efficiency.
@@ -695,12 +991,97 @@ impl KernelDispatcher {
         scores: &mut [f32],
         config: crate::ops::embedding::Int4PackedConfig,
     ) {
-        crate::ops::embedding::int4_packed_dot_product(queries, database, scores, &config);
+        match self.backend {
+            BackendType::Wgpu => {
+                // Reinterpret u8 as u32 (packed i4x8)
+                let queries_u32: &[u32] = bytemuck::cast_slice(queries);
+                let database_u32: &[u32] = bytemuck::cast_slice(database);
+
+                if let Some(kernel) = get_wgpu_embedding_kernel() {
+                    match kernel.int4_dot_product(
+                        queries_u32,
+                        database_u32,
+                        config.dim,
+                        config.num_queries,
+                        config.num_vectors,
+                        config.scale,
+                        config.zero_point as i32,
+                    ) {
+                        Ok(result) => {
+                            scores.copy_from_slice(&result);
+                            return;
+                        }
+                        Err(e) => {
+                            log::debug!("WGPU int4_dot_product failed: {}, falling back to CPU", e);
+                        }
+                    }
+                }
+                crate::ops::embedding::int4_packed_dot_product(queries, database, scores, &config);
+            }
+            BackendType::Cuda => {
+                // Reinterpret u8 as u32 (packed i4x8)
+                let queries_u32: &[u32] = bytemuck::cast_slice(queries);
+                let database_u32: &[u32] = bytemuck::cast_slice(database);
+
+                if let (Some(kernel), Some(stream)) = (get_cuda_embedding_kernel(), get_cuda_stream()) {
+                    match cuda_int4_dot_product(
+                        kernel, stream, queries_u32, database_u32,
+                        config.dim, config.num_queries, config.num_vectors,
+                        config.scale, config.zero_point as i32,
+                    ) {
+                        Ok(result) => {
+                            scores.copy_from_slice(&result);
+                            return;
+                        }
+                        Err(e) => {
+                            log::debug!("CUDA int4_dot_product failed: {}, falling back to CPU", e);
+                        }
+                    }
+                }
+                crate::ops::embedding::int4_packed_dot_product(queries, database, scores, &config);
+            }
+            #[cfg(target_os = "linux")]
+            BackendType::Rocm => {
+                // Reinterpret u8 as u32 (packed i4x8)
+                let queries_u32: &[u32] = bytemuck::cast_slice(queries);
+                let database_u32: &[u32] = bytemuck::cast_slice(database);
+
+                if let (Some(kernel), Some(queue)) = (get_hsa_embedding_kernel(), get_hsa_queue()) {
+                    match rocm_int4_dot_product(
+                        kernel, queue, queries_u32, database_u32,
+                        config.dim, config.num_queries, config.num_vectors,
+                        config.scale, config.zero_point as i32,
+                    ) {
+                        Ok(result) => {
+                            scores.copy_from_slice(&result);
+                            return;
+                        }
+                        Err(e) => {
+                            log::debug!("HSA int4_dot_product failed: {}, falling back to CPU", e);
+                        }
+                    }
+                }
+                crate::ops::embedding::int4_packed_dot_product(queries, database, scores, &config);
+            }
+            #[cfg(not(target_os = "linux"))]
+            BackendType::Rocm => {
+                crate::ops::embedding::int4_packed_dot_product(queries, database, scores, &config);
+            }
+            BackendType::Metal | BackendType::Cpu => {
+                crate::ops::embedding::int4_packed_dot_product(queries, database, scores, &config);
+            }
+        }
     }
 
     /// Matryoshka dimension truncation with optional normalization.
     ///
     /// Enables runtime dimension selection (e.g., 1024→256) for speed/accuracy tradeoff.
+    ///
+    /// **Performance Note**: This operation is ALWAYS executed on CPU regardless of
+    /// selected backend. The operation is essentially a memory copy (dimension truncation)
+    /// with optional L2 normalization. CPU execution avoids GPU kernel launch overhead
+    /// (~5-50μs) and PCIe data transfer overhead (~100-400μs roundtrip), making CPU
+    /// consistently 10-100x faster for this specific operation.
     #[inline(always)]
     pub fn matryoshka_truncate(
         &self,
@@ -708,7 +1089,172 @@ impl KernelDispatcher {
         output: &mut [f32],
         config: crate::ops::embedding::MatryoshkaConfig,
     ) {
+        // ALWAYS use CPU implementation - GPU overhead exceeds computation time
+        // for this simple memory-bound operation (dimension truncation + optional normalize)
         crate::ops::embedding::matryoshka_truncate(embeddings, output, &config);
+    }
+
+    /// GPU-accelerated three-stage rerank pipeline.
+    ///
+    /// Efficiently reduces candidate set through progressive refinement:
+    /// - Stage 1 (Binary): Hamming distance on binary embeddings (millions → binary_k)
+    /// - Stage 2 (Int8): Dot product on int8 embeddings (binary_k → int8_k)
+    /// - Stage 3: Returns final candidates for cross-encoder scoring
+    ///
+    /// **Backend Selection**:
+    /// - WGPU: Full GPU acceleration with Top-K selection kernels
+    /// - Others: Falls back to CPU implementation
+    ///
+    /// # Arguments
+    /// * `binary_query` - Binary query embedding (packed u32, dim/32 elements)
+    /// * `binary_database` - Binary database embeddings (packed u32, num_vectors * dim/32 elements)
+    /// * `int8_query` - Int8 query embedding (packed u32, dim/4 elements)
+    /// * `int8_database` - Int8 database embeddings (packed u32, num_vectors * dim/4 elements)
+    /// * `num_vectors` - Number of vectors in database
+    /// * `config` - Pipeline configuration (binary_k, int8_k, dim)
+    /// * `int8_scale` - Scale factor for int8 dequantization
+    ///
+    /// # Returns
+    /// `Ok(GpuRerankStageResult)` with final candidate indices and scores, or error message.
+    pub fn rerank_pipeline(
+        &self,
+        binary_query: &[u32],
+        binary_database: &[u32],
+        int8_query: &[u32],
+        int8_database: &[u32],
+        num_vectors: usize,
+        config: &GpuRerankConfig,
+        int8_scale: f32,
+    ) -> Result<GpuRerankStageResult, String> {
+        match self.backend {
+            BackendType::Cuda => {
+                if let (Some(kernel), Some(stream)) = (get_cuda_embedding_kernel(), get_cuda_stream()) {
+                    match cuda_rerank_pipeline(
+                        kernel, stream,
+                        binary_query, binary_database,
+                        int8_query, int8_database,
+                        num_vectors, config, int8_scale,
+                    ) {
+                        Ok(result) => return Ok(result),
+                        Err(e) => {
+                            log::debug!("CUDA rerank_pipeline failed: {}, falling back to CPU", e);
+                        }
+                    }
+                }
+                self.cpu_rerank_pipeline(
+                    binary_query, binary_database,
+                    int8_query, int8_database,
+                    num_vectors, config, int8_scale,
+                )
+            }
+            BackendType::Wgpu => {
+                if let Some(kernel) = get_wgpu_embedding_kernel() {
+                    kernel.rerank_pipeline(
+                        binary_query,
+                        binary_database,
+                        int8_query,
+                        int8_database,
+                        num_vectors,
+                        config,
+                        int8_scale,
+                    ).map_err(|e| format!("WGPU rerank_pipeline failed: {}", e))
+                } else {
+                    self.cpu_rerank_pipeline(
+                        binary_query, binary_database,
+                        int8_query, int8_database,
+                        num_vectors, config, int8_scale,
+                    )
+                }
+            }
+            // Other backends fall back to CPU implementation
+            _ => {
+                self.cpu_rerank_pipeline(
+                    binary_query, binary_database,
+                    int8_query, int8_database,
+                    num_vectors, config, int8_scale,
+                )
+            }
+        }
+    }
+
+    /// CPU fallback for rerank pipeline.
+    fn cpu_rerank_pipeline(
+        &self,
+        binary_query: &[u32],
+        binary_database: &[u32],
+        int8_query: &[u32],
+        int8_database: &[u32],
+        num_vectors: usize,
+        config: &GpuRerankConfig,
+        int8_scale: f32,
+    ) -> Result<GpuRerankStageResult, String> {
+        use crate::ops::embedding::{
+            binary_ip_hamming_simd, int8_dot_product_unrolled,
+            BinaryIpConfig, Int8DotConfig,
+        };
+
+        // Cast u32 slices to u64 for CPU binary operations
+        // CPU uses u64 (2x u32), GPU uses u32 packed
+        let binary_query_u64: &[u64] = bytemuck::cast_slice(binary_query);
+        let binary_database_u64: &[u64] = bytemuck::cast_slice(binary_database);
+
+        // Stage 1: Binary Hamming distance
+        let binary_config = BinaryIpConfig {
+            dim: config.dim,
+            num_queries: 1,
+            num_vectors,
+        };
+        let mut binary_scores = vec![0i32; num_vectors];
+        binary_ip_hamming_simd(binary_query_u64, binary_database_u64, &mut binary_scores, &binary_config);
+
+        // Top-K selection (ascending - lower hamming = better)
+        let mut indexed_scores: Vec<(usize, i32)> = binary_scores.iter().copied().enumerate().collect();
+        indexed_scores.sort_by_key(|(_, score)| *score);
+        indexed_scores.truncate(config.binary_k);
+
+        let stage1_indices: Vec<u32> = indexed_scores.iter().map(|(i, _)| *i as u32).collect();
+
+        // Stage 2: Int8 dot product on candidates
+        // CPU uses i8, GPU uses packed u32 (4x i8 per u32)
+        let int8_query_i8: &[i8] = bytemuck::cast_slice(int8_query);
+        let int8_database_i8: &[i8] = bytemuck::cast_slice(int8_database);
+
+        let int8_bytes_per_vec = config.dim;
+        let mut candidate_database = Vec::with_capacity(stage1_indices.len() * int8_bytes_per_vec);
+        for &idx in &stage1_indices {
+            let start = idx as usize * int8_bytes_per_vec;
+            let end = start + int8_bytes_per_vec;
+            if end <= int8_database_i8.len() {
+                candidate_database.extend_from_slice(&int8_database_i8[start..end]);
+            }
+        }
+
+        let int8_config = Int8DotConfig {
+            dim: config.dim,
+            num_queries: 1,
+            num_vectors: stage1_indices.len(),
+            scale: int8_scale,
+        };
+        let mut int8_scores = vec![0f32; stage1_indices.len()];
+        int8_dot_product_unrolled(int8_query_i8, &candidate_database, &mut int8_scores, &int8_config);
+
+        // Top-K selection (descending - higher score = better)
+        let mut indexed_int8: Vec<(usize, f32)> = int8_scores.iter().copied().enumerate().collect();
+        indexed_int8.sort_by(|(_, a), (_, b)| b.partial_cmp(a).unwrap_or(std::cmp::Ordering::Equal));
+        indexed_int8.truncate(config.int8_k);
+
+        // Map back to original indices
+        let final_indices: Vec<u32> = indexed_int8.iter()
+            .map(|(i, _)| stage1_indices[*i])
+            .collect();
+        let final_scores: Vec<f32> = indexed_int8.iter()
+            .map(|(_, s)| *s)
+            .collect();
+
+        Ok(GpuRerankStageResult {
+            indices: final_indices,
+            scores: final_scores,
+        })
     }
 }
 
@@ -1842,6 +2388,264 @@ fn metal_paged_attention<T: KernelFloat>(
             false
         }
     }
+}
+
+// =============================================================================
+// Embedding Ops GPU Dispatch Functions
+// =============================================================================
+
+/// ROCm/HSA binary IP Hamming dispatch.
+/// Returns Ok(scores) if GPU execution succeeded, Err to fallback to CPU.
+#[cfg(target_os = "linux")]
+fn rocm_binary_ip_hamming(
+    kernel: &HsaEmbeddingOpsKernel,
+    queue: &HsaQueueWrapper,
+    queries: &[u32],
+    database: &[u32],
+    dim: usize,
+    num_queries: usize,
+    num_vectors: usize,
+) -> Result<Vec<i32>, String> {
+    let agent = kernel.agent();
+
+    let q_buf = HsaBuffer::from_slice(agent, queries)
+        .map_err(|e| format!("Failed to allocate Q buffer: {}", e))?;
+    let db_buf = HsaBuffer::from_slice(agent, database)
+        .map_err(|e| format!("Failed to allocate DB buffer: {}", e))?;
+
+    let result = kernel.binary_ip_hamming(queue, &q_buf, &db_buf, dim, num_queries, num_vectors)
+        .map_err(|e| format!("HSA binary_ip_hamming failed: {}", e))?;
+
+    result.to_vec()
+        .map_err(|e| format!("Failed to copy result from GPU: {}", e))
+}
+
+/// ROCm/HSA binary IP asymmetric dispatch.
+#[cfg(target_os = "linux")]
+fn rocm_binary_ip_asymmetric(
+    kernel: &HsaEmbeddingOpsKernel,
+    queue: &HsaQueueWrapper,
+    queries: &[f32],
+    database: &[u32],
+    dim: usize,
+    num_queries: usize,
+    num_vectors: usize,
+) -> Result<Vec<f32>, String> {
+    let agent = kernel.agent();
+
+    let q_buf = HsaBuffer::from_slice(agent, queries)
+        .map_err(|e| format!("Failed to allocate Q buffer: {}", e))?;
+    let db_buf = HsaBuffer::from_slice(agent, database)
+        .map_err(|e| format!("Failed to allocate DB buffer: {}", e))?;
+
+    let result = kernel.binary_ip_asymmetric(queue, &q_buf, &db_buf, dim, num_queries, num_vectors)
+        .map_err(|e| format!("HSA binary_ip_asymmetric failed: {}", e))?;
+
+    result.to_vec()
+        .map_err(|e| format!("Failed to copy result from GPU: {}", e))
+}
+
+/// ROCm/HSA int8 dot product dispatch.
+#[cfg(target_os = "linux")]
+fn rocm_int8_dot_product(
+    kernel: &HsaEmbeddingOpsKernel,
+    queue: &HsaQueueWrapper,
+    queries: &[u32],
+    database: &[u32],
+    dim: usize,
+    num_queries: usize,
+    num_vectors: usize,
+    scale: f32,
+) -> Result<Vec<f32>, String> {
+    let agent = kernel.agent();
+
+    let q_buf = HsaBuffer::from_slice(agent, queries)
+        .map_err(|e| format!("Failed to allocate Q buffer: {}", e))?;
+    let db_buf = HsaBuffer::from_slice(agent, database)
+        .map_err(|e| format!("Failed to allocate DB buffer: {}", e))?;
+
+    let result = kernel.int8_dot_product(queue, &q_buf, &db_buf, dim, num_queries, num_vectors, scale)
+        .map_err(|e| format!("HSA int8_dot_product failed: {}", e))?;
+
+    result.to_vec()
+        .map_err(|e| format!("Failed to copy result from GPU: {}", e))
+}
+
+/// ROCm/HSA int4 dot product dispatch.
+#[cfg(target_os = "linux")]
+fn rocm_int4_dot_product(
+    kernel: &HsaEmbeddingOpsKernel,
+    queue: &HsaQueueWrapper,
+    queries: &[u32],
+    database: &[u32],
+    dim: usize,
+    num_queries: usize,
+    num_vectors: usize,
+    scale: f32,
+    zero_point: i32,
+) -> Result<Vec<f32>, String> {
+    let agent = kernel.agent();
+
+    let q_buf = HsaBuffer::from_slice(agent, queries)
+        .map_err(|e| format!("Failed to allocate Q buffer: {}", e))?;
+    let db_buf = HsaBuffer::from_slice(agent, database)
+        .map_err(|e| format!("Failed to allocate DB buffer: {}", e))?;
+
+    let result = kernel.int4_dot_product(queue, &q_buf, &db_buf, dim, num_queries, num_vectors, scale, zero_point)
+        .map_err(|e| format!("HSA int4_dot_product failed: {}", e))?;
+
+    result.to_vec()
+        .map_err(|e| format!("Failed to copy result from GPU: {}", e))
+}
+
+/// CUDA binary IP Hamming dispatch.
+fn cuda_binary_ip_hamming(
+    kernel: &CudaEmbeddingOpsKernel,
+    stream: &Arc<CudaStream>,
+    queries: &[u32],
+    database: &[u32],
+    dim: usize,
+    num_queries: usize,
+    num_vectors: usize,
+) -> Result<Vec<i32>, String> {
+    let q_buf = stream.clone_htod(queries)
+        .map_err(|e| format!("Failed to copy Q to GPU: {}", e))?;
+    let db_buf = stream.clone_htod(database)
+        .map_err(|e| format!("Failed to copy DB to GPU: {}", e))?;
+
+    let result = kernel.binary_ip_hamming(stream, &q_buf, &db_buf, dim, num_queries, num_vectors)
+        .map_err(|e| format!("CUDA binary_ip_hamming failed: {}", e))?;
+
+    stream.clone_dtoh(&result)
+        .map_err(|e| format!("Failed to copy result from GPU: {}", e))
+}
+
+/// CUDA binary IP asymmetric dispatch.
+fn cuda_binary_ip_asymmetric(
+    kernel: &CudaEmbeddingOpsKernel,
+    stream: &Arc<CudaStream>,
+    queries: &[f32],
+    database: &[u32],
+    dim: usize,
+    num_queries: usize,
+    num_vectors: usize,
+) -> Result<Vec<f32>, String> {
+    let q_buf = stream.clone_htod(queries)
+        .map_err(|e| format!("Failed to copy Q to GPU: {}", e))?;
+    let db_buf = stream.clone_htod(database)
+        .map_err(|e| format!("Failed to copy DB to GPU: {}", e))?;
+
+    let result = kernel.binary_ip_asymmetric(stream, &q_buf, &db_buf, dim, num_queries, num_vectors)
+        .map_err(|e| format!("CUDA binary_ip_asymmetric failed: {}", e))?;
+
+    stream.clone_dtoh(&result)
+        .map_err(|e| format!("Failed to copy result from GPU: {}", e))
+}
+
+/// CUDA int8 dot product dispatch.
+fn cuda_int8_dot_product(
+    kernel: &CudaEmbeddingOpsKernel,
+    stream: &Arc<CudaStream>,
+    queries: &[u32],
+    database: &[u32],
+    dim: usize,
+    num_queries: usize,
+    num_vectors: usize,
+    scale: f32,
+) -> Result<Vec<f32>, String> {
+    let q_buf = stream.clone_htod(queries)
+        .map_err(|e| format!("Failed to copy Q to GPU: {}", e))?;
+    let db_buf = stream.clone_htod(database)
+        .map_err(|e| format!("Failed to copy DB to GPU: {}", e))?;
+
+    let result = kernel.int8_dot_product(stream, &q_buf, &db_buf, dim, num_queries, num_vectors, scale)
+        .map_err(|e| format!("CUDA int8_dot_product failed: {}", e))?;
+
+    stream.clone_dtoh(&result)
+        .map_err(|e| format!("Failed to copy result from GPU: {}", e))
+}
+
+/// CUDA int4 dot product dispatch.
+fn cuda_int4_dot_product(
+    kernel: &CudaEmbeddingOpsKernel,
+    stream: &Arc<CudaStream>,
+    queries: &[u32],
+    database: &[u32],
+    dim: usize,
+    num_queries: usize,
+    num_vectors: usize,
+    scale: f32,
+    zero_point: i32,
+) -> Result<Vec<f32>, String> {
+    let q_buf = stream.clone_htod(queries)
+        .map_err(|e| format!("Failed to copy Q to GPU: {}", e))?;
+    let db_buf = stream.clone_htod(database)
+        .map_err(|e| format!("Failed to copy DB to GPU: {}", e))?;
+
+    let result = kernel.int4_dot_product(stream, &q_buf, &db_buf, dim, num_queries, num_vectors, scale, zero_point)
+        .map_err(|e| format!("CUDA int4_dot_product failed: {}", e))?;
+
+    stream.clone_dtoh(&result)
+        .map_err(|e| format!("Failed to copy result from GPU: {}", e))
+}
+
+/// CUDA rerank pipeline: Binary Hamming → Int8 Dot Product → Top-K
+fn cuda_rerank_pipeline(
+    kernel: &CudaEmbeddingOpsKernel,
+    stream: &Arc<CudaStream>,
+    binary_query: &[u32],
+    binary_database: &[u32],
+    int8_query: &[u32],
+    int8_database: &[u32],
+    num_vectors: usize,
+    config: &GpuRerankConfig,
+    int8_scale: f32,
+) -> Result<GpuRerankStageResult, String> {
+    // Stage 1: Binary Hamming distance on GPU
+    let binary_scores = cuda_binary_ip_hamming(
+        kernel, stream, binary_query, binary_database,
+        config.dim, 1, num_vectors,
+    )?;
+
+    // CPU Top-K selection (ascending - lower hamming = better)
+    let mut indexed_scores: Vec<(usize, i32)> = binary_scores.iter().copied().enumerate().collect();
+    indexed_scores.sort_by_key(|(_, score)| *score);
+    indexed_scores.truncate(config.binary_k);
+
+    let stage1_indices: Vec<u32> = indexed_scores.iter().map(|(i, _)| *i as u32).collect();
+
+    // Stage 2: Gather int8 candidates and compute on GPU
+    // int8 uses packed u32 (4x i8 per u32), so elements_per_vec = dim / 4
+    let int8_packed_per_vec = config.dim / 4;
+    let mut candidate_database = Vec::with_capacity(stage1_indices.len() * int8_packed_per_vec);
+    for &idx in &stage1_indices {
+        let start = idx as usize * int8_packed_per_vec;
+        let end = start + int8_packed_per_vec;
+        if end <= int8_database.len() {
+            candidate_database.extend_from_slice(&int8_database[start..end]);
+        }
+    }
+
+    // Int8 dot product on GPU
+    let int8_scores = cuda_int8_dot_product(
+        kernel, stream, int8_query, &candidate_database,
+        config.dim, 1, stage1_indices.len(), int8_scale,
+    )?;
+
+    // Final CPU Top-K selection (descending - higher score = better)
+    let mut final_indexed: Vec<(usize, f32)> = int8_scores.iter().copied().enumerate().collect();
+    final_indexed.sort_by(|(_, a), (_, b)| b.partial_cmp(a).unwrap_or(std::cmp::Ordering::Equal));
+    final_indexed.truncate(config.int8_k);
+
+    // Map back to original indices
+    let indices: Vec<u32> = final_indexed.iter()
+        .map(|(i, _)| stage1_indices[*i])
+        .collect();
+    let scores: Vec<f32> = final_indexed.iter()
+        .map(|(_, s)| *s)
+        .collect();
+
+    Ok(GpuRerankStageResult { indices, scores })
 }
 
 #[cfg(test)]

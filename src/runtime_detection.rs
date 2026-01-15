@@ -2,7 +2,6 @@
 
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
-use std::path::PathBuf;
 use std::sync::OnceLock;
 
 /// Backend detection result that can be cached.
@@ -265,52 +264,30 @@ pub struct DeviceInfo {
     pub arch: Option<String>, // GPU 架构标识
 }
 
-/// Cached detection result.
-static CACHED_RESULT: OnceLock<Option<BackendDetectionResult>> = OnceLock::new();
+/// Cached detection result (in-process only, no file persistence).
+static CACHED_RESULT: OnceLock<BackendDetectionResult> = OnceLock::new();
 
 /// Detect the best available backend.
 ///
 /// Priority: CUDA → ROCm → Metal → WGPU → CPU
 ///
-/// This function:
-/// 1. Checks cached result from previous detection
-/// 2. Validates the cached backend is still available
-/// 3. Re-detects if validation fails
+/// Detection is performed once per process and cached in memory.
+/// No file-based caching - always detects fresh on process start.
 pub fn detect_backend() -> BackendType {
     CACHED_RESULT
         .get_or_init(|| {
-            // Try to load cached result
-            if let Some(cached) = load_cached_detection() {
-                log::info!("Loaded cached backend: {}", cached.backend_type.name());
-
-                // Validate cached backend
-                if validate_backend(&cached.backend_type) {
-                    return Some(cached);
-                } else {
-                    log::warn!("Cached backend {} is no longer available, re-detecting", cached.backend_type.name());
-                }
-            }
-
-            // Perform fresh detection
             let result = perform_detection();
-            save_cached_detection(&result);
-            Some(result)
+            log::info!("Detected backend: {}", result.backend_type.name());
+            result
         })
-        .as_ref()
-        .map(|r| r.backend_type)
-        .unwrap_or(BackendType::Cpu)
+        .backend_type
 }
 
-/// Force re-detection and update cache.
+/// Force re-detection (note: OnceLock cannot be reset, returns current cached value).
+/// For true re-detection, restart the process.
 pub fn redetect_backend() -> BackendType {
-    let result = perform_detection();
-    save_cached_detection(&result);
-
-    // Update cached result
-    CACHED_RESULT.set(Some(result.clone())).ok();
-
-    log::info!("Re-detected backend: {}", result.backend_type.name());
-    result.backend_type
+    // OnceLock doesn't support reset, just return cached
+    detect_backend()
 }
 
 /// Perform actual backend detection with priority: CUDA → ROCm → Metal → WGPU → CPU
@@ -339,80 +316,6 @@ fn perform_detection() -> BackendDetectionResult {
             .unwrap()
             .as_secs() as i64,
         hostname: hostname(),
-    }
-}
-
-/// Validate that a detected backend is still available.
-fn validate_backend(backend_type: &BackendType) -> bool {
-    match backend_type {
-        BackendType::Cuda => try_cuda(),
-        BackendType::Rocm => try_rocm(),
-        BackendType::Metal => try_metal(),
-        BackendType::Wgpu => try_wgpu(),
-        BackendType::Cpu => true, // CPU always available
-    }
-}
-
-/// Get cache file path.
-fn cache_file_path() -> PathBuf {
-    let home_dir = std::env::var("HOME")
-        .or_else(|_| std::env::var("USERPROFILE"))
-        .unwrap_or_else(|_| ".".to_string());
-
-    PathBuf::from(home_dir)
-        .join(".gsc")
-        .join("gllm")
-        .join("backend.json")
-}
-
-/// Load cached detection result.
-fn load_cached_detection() -> Option<BackendDetectionResult> {
-    let cache_path = cache_file_path();
-
-    if !cache_path.exists() {
-        return None;
-    }
-
-    match std::fs::read_to_string(&cache_path) {
-        Ok(content) => {
-            match serde_json::from_str::<BackendDetectionResult>(&content) {
-                Ok(result) => {
-                    log::debug!("Loaded backend cache from: {:?}", cache_path);
-                    Some(result)
-                }
-                Err(e) => {
-                    log::warn!("Failed to parse backend cache: {}", e);
-                    None
-                }
-            }
-        }
-        Err(e) => {
-            log::warn!("Failed to read backend cache: {}", e);
-            None
-        }
-    }
-}
-
-/// Save detection result to cache.
-fn save_cached_detection(result: &BackendDetectionResult) {
-    let cache_path = cache_file_path();
-
-    // Ensure cache directory exists
-    if let Some(parent) = cache_path.parent() {
-        let _ = std::fs::create_dir_all(parent);
-    }
-
-    match serde_json::to_string_pretty(result) {
-        Ok(json) => {
-            if let Err(e) = std::fs::write(&cache_path, json) {
-                log::warn!("Failed to write backend cache: {}", e);
-            } else {
-                log::info!("Saved backend cache to: {:?}", cache_path);
-            }
-        }
-        Err(e) => {
-            log::warn!("Failed to serialize backend cache: {}", e);
-        }
     }
 }
 
@@ -628,9 +531,8 @@ mod tests {
 
     #[test]
     fn test_cache_persistence() {
-        // Clear cache
-        CACHED_RESULT.set(None).ok();
-
+        // OnceLock caches the result for the process lifetime
+        // Multiple calls should return the same backend
         let backend1 = detect_backend();
         let backend2 = detect_backend();
 

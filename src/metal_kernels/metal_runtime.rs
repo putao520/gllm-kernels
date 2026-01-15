@@ -8,13 +8,12 @@
 //! ```text
 //! Compile time: Metal shader source → metallib binary (via xcrun metallib) → embedded
 //! Runtime: Metal Framework loads embedded metallib → GPU executes
-//! Fallback: Runtime compilation from embedded source if metallib fails
 //! ```
 //!
-//! ## Zero Configuration
+//! ## Design Principle
 //!
-//! This module is fully automatic with no user configuration required.
-//! The kernel loader automatically selects the best loading strategy.
+//! metallib is Metal's intermediate format (like PTX for CUDA, HSACO for ROCm).
+//! All kernels should be precompiled to metallib - NO runtime compilation fallback.
 
 use std::sync::OnceLock;
 
@@ -158,7 +157,17 @@ impl MetalKernelLoader {
         Ok(Self { device, library })
     }
 
-    /// Compile from Metal shader source (fallback when metallib not available).
+    /// Compile from Metal shader source.
+    ///
+    /// # DEPRECATED
+    ///
+    /// This method exists only for development/debugging purposes.
+    /// Production code MUST use precompiled metallib via `from_bytes()`.
+    /// metallib is Metal's intermediate format - NO runtime compilation fallback.
+    #[deprecated(
+        since = "0.1.0",
+        note = "Use precompiled metallib via from_bytes() instead. Runtime compilation should not be used in production."
+    )]
     pub fn from_source(source: &str) -> Result<Self, MetalError> {
         let device = get_metal_device()
             .cloned()

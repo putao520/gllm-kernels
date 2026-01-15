@@ -1,22 +1,20 @@
-//! Metal metallib loader with automatic runtime compilation fallback.
+//! Metal metallib loader - Fat Binary approach.
 //!
-//! This module provides `MetallibCollection` for loading precompiled Metal libraries
-//! with automatic fallback to runtime compilation from source.
+//! This module provides `MetallibCollection` for loading precompiled Metal libraries.
+//! metallib is Metal's intermediate format (like PTX for CUDA, HSACO for ROCm).
 //!
 //! ## Architecture
 //!
 //! ```text
 //! Compile time: Metal shader source → metallib binary (via xcrun metallib) → embedded
 //! Runtime: Metal Framework loads embedded metallib → GPU executes
-//! Fallback: Runtime compilation from embedded source if metallib fails
 //! ```
 //!
-//! ## Zero Configuration
+//! ## Design Principle
 //!
-//! This module is fully automatic with no user configuration required.
-//! The kernel loader automatically selects the best loading strategy:
-//! 1. Precompiled metallib (fastest, production use)
-//! 2. Runtime compilation from source (fallback)
+//! metallib is already a platform-independent intermediate representation.
+//! NO runtime compilation fallback - if metallib fails to load, it's an error.
+//! This matches CUDA/ROCm behavior where PTX/HSACO are directly loaded.
 
 use std::fmt;
 
@@ -27,22 +25,19 @@ use metal::{Device, Library};
 pub enum MetallibLoadError {
     /// No Metal device available.
     DeviceNotAvailable,
-    /// Failed to load metallib from data.
+    /// Failed to load metallib from embedded data.
     LoadFailed(String),
-    /// Failed to compile from source.
-    CompileFailed(String),
-    /// No kernel available (both embedded and compile failed).
-    NoKernelAvailable(String),
+    /// No metallib data embedded.
+    NoMetallibEmbedded(String),
 }
 
 impl fmt::Display for MetallibLoadError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::DeviceNotAvailable => write!(f, "No Metal device available"),
-            Self::LoadFailed(msg) => write!(f, "Failed to load metallib: {}", msg),
-            Self::CompileFailed(msg) => write!(f, "Failed to compile Metal source: {}", msg),
-            Self::NoKernelAvailable(name) => {
-                write!(f, "No kernel available for '{}': embedded load and runtime compile both failed", name)
+            Self::LoadFailed(msg) => write!(f, "Failed to load embedded metallib: {}", msg),
+            Self::NoMetallibEmbedded(name) => {
+                write!(f, "No metallib embedded for kernel '{}'. Build with: xcrun metallib", name)
             }
         }
     }
@@ -50,10 +45,10 @@ impl fmt::Display for MetallibLoadError {
 
 impl std::error::Error for MetallibLoadError {}
 
-/// Collection of Metal shader data for automatic loading.
+/// Collection of precompiled Metal library data.
 ///
-/// This struct holds both precompiled metallib binary and source code,
-/// allowing automatic fallback from embedded metallib to runtime compilation.
+/// This struct holds precompiled metallib binary (Metal's intermediate format).
+/// NO source code or runtime compilation - metallib must be precompiled.
 ///
 /// # Example
 ///
@@ -61,27 +56,22 @@ impl std::error::Error for MetallibLoadError {}
 /// static FLASH_ATTENTION_METALLIB: MetallibCollection = MetallibCollection {
 ///     kernel_name: "flash_attention",
 ///     metallib_data: include_bytes!("kernels/flash_attention.metallib"),
-///     source: include_str!("kernels/flash_attention.metal"),
 /// };
 ///
 /// let library = FLASH_ATTENTION_METALLIB.load(&device)?;
 /// ```
 pub struct MetallibCollection {
-    /// Kernel name for logging purposes.
+    /// Kernel name for logging and error messages.
     pub kernel_name: &'static str,
     /// Precompiled metallib binary data (from `include_bytes!`).
     pub metallib_data: &'static [u8],
-    /// Metal shader source code for runtime compilation fallback.
-    pub source: &'static str,
 }
 
 impl MetallibCollection {
-    /// Load Metal library using zero-config automatic fallback.
+    /// Load Metal library from embedded metallib data.
     ///
-    /// # Loading Priority
-    ///
-    /// 1. **Embedded metallib** (fastest) - Load precompiled binary
-    /// 2. **Runtime compilation** (fallback) - Compile from source
+    /// metallib is Metal's intermediate format (like PTX/HSACO).
+    /// NO runtime compilation fallback - if metallib fails, returns error.
     ///
     /// # Arguments
     ///
@@ -90,44 +80,30 @@ impl MetallibCollection {
     /// # Returns
     ///
     /// A Metal Library containing the compiled kernels.
+    ///
+    /// # Errors
+    ///
+    /// - `NoMetallibEmbedded` - No metallib data was embedded
+    /// - `LoadFailed` - Metal framework failed to load the metallib
     pub fn load(&self, device: &Device) -> Result<Library, MetallibLoadError> {
-        // Priority 1: Try embedded precompiled metallib
-        if !self.metallib_data.is_empty() {
-            log::debug!("[{}] Trying to load embedded metallib ({} bytes)",
-                self.kernel_name, self.metallib_data.len());
-
-            match device.new_library_with_data(self.metallib_data) {
-                Ok(lib) => {
-                    log::info!("[{}] Loaded embedded metallib successfully", self.kernel_name);
-                    return Ok(lib);
-                }
-                Err(e) => {
-                    log::warn!("[{}] Failed to load embedded metallib: {}, trying runtime compile",
-                        self.kernel_name, e);
-                }
-            }
-        } else {
-            log::debug!("[{}] No embedded metallib, trying runtime compile", self.kernel_name);
+        if self.metallib_data.is_empty() {
+            log::error!("[{}] No metallib embedded. Build with: xcrun metallib", self.kernel_name);
+            return Err(MetallibLoadError::NoMetallibEmbedded(self.kernel_name.to_string()));
         }
 
-        // Priority 2: Runtime compilation from source
-        if !self.source.is_empty() {
-            log::debug!("[{}] Compiling Metal shader from source at runtime", self.kernel_name);
+        log::debug!("[{}] Loading embedded metallib ({} bytes)",
+            self.kernel_name, self.metallib_data.len());
 
-            let options = metal::CompileOptions::new();
-            match device.new_library_with_source(self.source, &options) {
-                Ok(lib) => {
-                    log::info!("[{}] Compiled from source successfully", self.kernel_name);
-                    return Ok(lib);
-                }
-                Err(e) => {
-                    log::error!("[{}] Runtime compilation failed: {}", self.kernel_name, e);
-                    return Err(MetallibLoadError::CompileFailed(e));
-                }
+        match device.new_library_with_data(self.metallib_data) {
+            Ok(lib) => {
+                log::info!("[{}] Loaded metallib successfully", self.kernel_name);
+                Ok(lib)
+            }
+            Err(e) => {
+                log::error!("[{}] Failed to load metallib: {}", self.kernel_name, e);
+                Err(MetallibLoadError::LoadFailed(e))
             }
         }
-
-        Err(MetallibLoadError::NoKernelAvailable(self.kernel_name.to_string()))
     }
 }
 
@@ -140,13 +116,12 @@ mod tests {
         let collection = MetallibCollection {
             kernel_name: "test",
             metallib_data: &[],
-            source: "",
         };
 
-        // Should fail with NoKernelAvailable when both are empty
+        // Should fail with NoMetallibEmbedded when metallib is empty
         if let Some(device) = Device::system_default() {
             let result = collection.load(&device);
-            assert!(result.is_err());
+            assert!(matches!(result, Err(MetallibLoadError::NoMetallibEmbedded(_))));
         }
     }
 }

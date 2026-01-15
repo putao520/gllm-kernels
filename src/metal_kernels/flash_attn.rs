@@ -3,15 +3,15 @@
 //! This module provides a naive, correctness-focused Metal kernel wrapper
 //! that mirrors the CUDA/HIP tiled attention entry points.
 //!
-//! ## Precompiled metallib Support
+//! ## Precompiled metallib (Required)
 //!
-//! For production use, precompile the shader using:
+//! metallib must be precompiled before use:
 //! ```bash
 //! ./scripts/compile_metal_kernels.sh
 //! ```
 //!
-//! The kernel loader will automatically use precompiled metallib if available,
-//! falling back to runtime compilation from source.
+//! metallib is Metal's intermediate format (like PTX/HSACO).
+//! NO runtime compilation fallback - metallib must be precompiled and embedded.
 
 use std::fmt;
 use std::mem;
@@ -20,16 +20,19 @@ use std::os::raw::c_void;
 use metal::{Buffer, CommandQueue, ComputePipelineState, Device, Library, MTLResourceOptions, MTLSize};
 
 use crate::metal_kernels::metallib_loader::{MetallibCollection, MetallibLoadError};
+use crate::validation::{
+    validate_attention_dims, validate_u32_bounds, compute_num_queries, compute_output_len,
+    to_u32, MAX_HEAD_DIM,
+};
 
 const KERNEL_F32: &str = "tiled_attention_forward_f32";
 const KERNEL_F16: &str = "tiled_attention_forward_f16";
-const MAX_HEAD_DIM: usize = 256;
 
 /// Metallib collection for flash attention kernel.
+/// metallib must be precompiled with: ./scripts/compile_metal_kernels.sh
 static FLASH_ATTENTION_METALLIB: MetallibCollection = MetallibCollection {
     kernel_name: "flash_attention",
     metallib_data: include_bytes!("kernels/flash_attention.metallib"),
-    source: include_str!("kernels/flash_attention.metal"),
 };
 
 #[repr(C)]
@@ -223,11 +226,9 @@ impl FlashAttentionKernel {
     }
 }
 
-/// Load Metal library using MetallibCollection with automatic fallback.
+/// Load Metal library from embedded metallib.
 ///
-/// Priority:
-/// 1. Embedded metallib - always tried first
-/// 2. Runtime compilation from source (automatic fallback)
+/// metallib is Metal's intermediate format - NO runtime compilation fallback.
 fn load_library(device: &Device) -> Result<Library, FlashAttentionError> {
     FLASH_ATTENTION_METALLIB.load(device).map_err(FlashAttentionError::from)
 }
@@ -254,43 +255,32 @@ fn build_params(
     scale: f32,
     position_offset: usize,
 ) -> Result<(AttentionParams, usize, usize), FlashAttentionError> {
-    if batch_size == 0 || num_heads == 0 || seq_len == 0 || head_dim == 0 {
-        return Err(FlashAttentionError::InvalidConfig(
-            "Dimensions must be > 0".into(),
-        ));
-    }
-    if head_dim > MAX_HEAD_DIM {
-        return Err(FlashAttentionError::InvalidConfig(format!(
-            "head_dim {} exceeds MAX_HEAD_DIM {}",
-            head_dim, MAX_HEAD_DIM
-        )));
-    }
+    validate_attention_dims(batch_size, num_heads, seq_len, head_dim)
+        .map_err(FlashAttentionError::InvalidConfig)?;
+    validate_u32_bounds(batch_size, num_heads, seq_len, head_dim)
+        .map_err(FlashAttentionError::InvalidConfig)?;
 
-    let batch_size_u32 = u32::try_from(batch_size)
-        .map_err(|_| FlashAttentionError::InvalidConfig("batch_size exceeds u32".into()))?;
-    let num_heads_u32 = u32::try_from(num_heads)
-        .map_err(|_| FlashAttentionError::InvalidConfig("num_heads exceeds u32".into()))?;
-    let seq_len_u32 = u32::try_from(seq_len)
-        .map_err(|_| FlashAttentionError::InvalidConfig("seq_len exceeds u32".into()))?;
-    let head_dim_u32 = u32::try_from(head_dim)
-        .map_err(|_| FlashAttentionError::InvalidConfig("head_dim exceeds u32".into()))?;
-    let position_offset_u32 = u32::try_from(position_offset).map_err(|_| {
-        FlashAttentionError::InvalidConfig("position_offset exceeds u32".into())
-    })?;
+    let batch_size_u32 = to_u32(batch_size, "batch_size")
+        .map_err(FlashAttentionError::InvalidConfig)?;
+    let num_heads_u32 = to_u32(num_heads, "num_heads")
+        .map_err(FlashAttentionError::InvalidConfig)?;
+    let seq_len_u32 = to_u32(seq_len, "seq_len")
+        .map_err(FlashAttentionError::InvalidConfig)?;
+    let head_dim_u32 = to_u32(head_dim, "head_dim")
+        .map_err(FlashAttentionError::InvalidConfig)?;
+    let position_offset_u32 = to_u32(position_offset, "position_offset")
+        .map_err(FlashAttentionError::InvalidConfig)?;
 
-    let total_queries = batch_size
-        .checked_mul(num_heads)
-        .and_then(|value| value.checked_mul(seq_len))
-        .ok_or_else(|| FlashAttentionError::InvalidConfig("num_queries overflow".into()))?;
+    let total_queries = compute_num_queries(batch_size, num_heads, seq_len)
+        .map_err(FlashAttentionError::InvalidConfig)?;
     if total_queries > u32::MAX as usize {
         return Err(FlashAttentionError::InvalidConfig(
             "num_queries exceeds u32".into(),
         ));
     }
 
-    let output_len = total_queries
-        .checked_mul(head_dim)
-        .ok_or_else(|| FlashAttentionError::InvalidConfig("output_len overflow".into()))?;
+    let output_len = compute_output_len(total_queries, head_dim)
+        .map_err(FlashAttentionError::InvalidConfig)?;
 
     let params = AttentionParams {
         batch_size: batch_size_u32,

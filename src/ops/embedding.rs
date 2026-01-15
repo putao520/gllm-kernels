@@ -297,7 +297,10 @@ pub fn quantize_to_int8(embeddings: &[f32], output: &mut [i8], scale: f32) {
 
 /// Int8 Dot Product (scalar implementation).
 ///
-/// Computes: score = sum(a[i] * b[i]) * scale
+/// Computes: score = sum(a[i] * b[i]) * scale²
+///
+/// The scale² is used because both query and database vectors are quantized
+/// with the same scale factor (symmetric quantization).
 ///
 /// # Arguments
 /// * `queries` - Int8 query vectors [num_queries, dim]
@@ -306,6 +309,7 @@ pub fn quantize_to_int8(embeddings: &[f32], output: &mut [i8], scale: f32) {
 /// * `config` - Configuration
 #[inline]
 pub fn int8_dot_product(queries: &[i8], database: &[i8], scores: &mut [f32], config: &Int8DotConfig) {
+    let scale_sq = config.scale * config.scale;
     for q_idx in 0..config.num_queries {
         let q_start = q_idx * config.dim;
 
@@ -317,12 +321,14 @@ pub fn int8_dot_product(queries: &[i8], database: &[i8], scores: &mut [f32], con
                 acc += queries[q_start + d] as i32 * database[v_start + d] as i32;
             }
 
-            scores[q_idx * config.num_vectors + v_idx] = acc as f32 * config.scale;
+            scores[q_idx * config.num_vectors + v_idx] = acc as f32 * scale_sq;
         }
     }
 }
 
 /// Int8 Dot Product with 4-way unrolling for better pipelining.
+///
+/// Uses scale² for symmetric quantization (both vectors quantized with same scale).
 #[inline]
 pub fn int8_dot_product_unrolled(
     queries: &[i8],
@@ -332,6 +338,7 @@ pub fn int8_dot_product_unrolled(
 ) {
     let unroll_chunks = config.dim / 4;
     let remainder = config.dim % 4;
+    let scale_sq = config.scale * config.scale;
 
     for q_idx in 0..config.num_queries {
         let q_start = q_idx * config.dim;
@@ -359,7 +366,7 @@ pub fn int8_dot_product_unrolled(
             }
 
             let total = acc0 + acc1 + acc2 + acc3 + acc_rem;
-            scores[q_idx * config.num_vectors + v_idx] = total as f32 * config.scale;
+            scores[q_idx * config.num_vectors + v_idx] = total as f32 * scale_sq;
         }
     }
 }
@@ -409,6 +416,8 @@ pub fn quantize_to_int4_packed(embeddings: &[f32], output: &mut [u8], scale: f32
 /// Int4 Packed Dot Product.
 ///
 /// Computes dot product between int4-packed vectors.
+/// Uses scale² because both query and database vectors are quantized
+/// with the same scale factor (symmetric quantization).
 ///
 /// # Arguments
 /// * `queries` - Packed int4 query vectors [num_queries, dim/2]
@@ -423,6 +432,7 @@ pub fn int4_packed_dot_product(
     config: &Int4PackedConfig,
 ) {
     let packed_dim = config.dim / 2;
+    let scale_sq = config.scale * config.scale;
 
     for q_idx in 0..config.num_queries {
         let q_start = q_idx * packed_dim;
@@ -438,7 +448,7 @@ pub fn int4_packed_dot_product(
                 acc += (q1 as i32 + config.zero_point as i32) * (v1 as i32 + config.zero_point as i32);
             }
 
-            scores[q_idx * config.num_vectors + v_idx] = acc as f32 * config.scale;
+            scores[q_idx * config.num_vectors + v_idx] = acc as f32 * scale_sq;
         }
     }
 }

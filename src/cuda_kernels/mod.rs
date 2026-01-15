@@ -15,6 +15,7 @@
 //!
 //! If no matching PTX is found, NVRTC runtime compilation is used as fallback.
 
+pub mod embedding_ops;
 pub mod ptx_loader;
 pub mod flash_attn;
 pub mod fused_attention;
@@ -24,6 +25,7 @@ pub mod selective_scan;
 
 pub use ptx_loader::{PtxCollection, PtxLoadError, detect_sm_version, find_best_sm_match};
 
+pub use embedding_ops::{EmbeddingOpsError as CudaEmbeddingOpsError, EmbeddingOpsKernel as CudaEmbeddingOpsKernel};
 pub use flash_attn::{FlashAttentionError, FlashAttentionKernel, OptimizedCudaAttention};
 pub use fused_attention::{FusedQKVAttentionError, FusedQKVAttentionKernel};
 pub use online_softmax::{OnlineSoftmaxError, OnlineSoftmaxKernel, OnlineSoftmaxOutput};

@@ -12,10 +12,12 @@ use cudarc::driver::{
 use half::f16;
 
 use crate::cuda_kernels::ptx_loader::{PtxCollection, PtxLoadError};
+use crate::validation::{
+    validate_attention_dims, validate_i32_bounds, compute_num_queries, compute_output_len,
+};
 
 const KERNEL_F32: &str = "paged_attention_forward_f32";
 const KERNEL_F16: &str = "paged_attention_forward_f16";
-const MAX_HEAD_DIM: usize = 256;
 const DEFAULT_BLOCK: u32 = 128;
 
 /// CUDA source for runtime compilation.
@@ -291,34 +293,15 @@ fn build_launch(
     head_dim: usize,
     block_size: u32,
 ) -> Result<(usize, LaunchConfig), PagedAttentionError> {
-    if batch_size == 0 || num_heads == 0 || seq_len == 0 || head_dim == 0 {
-        return Err(PagedAttentionError::InvalidConfig(
-            "Dimensions must be > 0".into(),
-        ));
-    }
-    if head_dim > MAX_HEAD_DIM {
-        return Err(PagedAttentionError::InvalidConfig(format!(
-            "head_dim {} exceeds MAX_HEAD_DIM {}",
-            head_dim, MAX_HEAD_DIM
-        )));
-    }
-    if batch_size > i32::MAX as usize
-        || num_heads > i32::MAX as usize
-        || seq_len > i32::MAX as usize
-        || head_dim > i32::MAX as usize
-    {
-        return Err(PagedAttentionError::InvalidConfig(
-            "Dimensions exceed i32::MAX".into(),
-        ));
-    }
+    validate_attention_dims(batch_size, num_heads, seq_len, head_dim)
+        .map_err(PagedAttentionError::InvalidConfig)?;
+    validate_i32_bounds(batch_size, num_heads, seq_len, head_dim)
+        .map_err(PagedAttentionError::InvalidConfig)?;
 
-    let num_queries = batch_size
-        .checked_mul(num_heads)
-        .and_then(|value| value.checked_mul(seq_len))
-        .ok_or_else(|| PagedAttentionError::InvalidConfig("num_queries overflow".into()))?;
-    let output_len = num_queries
-        .checked_mul(head_dim)
-        .ok_or_else(|| PagedAttentionError::InvalidConfig("output_len overflow".into()))?;
+    let num_queries = compute_num_queries(batch_size, num_heads, seq_len)
+        .map_err(PagedAttentionError::InvalidConfig)?;
+    let output_len = compute_output_len(num_queries, head_dim)
+        .map_err(PagedAttentionError::InvalidConfig)?;
 
     let block_dim = block_size.clamp(1, 1024) as usize;
     let grid_dim = (num_queries + block_dim - 1) / block_dim;

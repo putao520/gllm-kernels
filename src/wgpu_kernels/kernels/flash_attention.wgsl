@@ -18,35 +18,23 @@ struct AttentionParams {
 var<workgroup> k_tile: array<f32, BLOCK_K * MAX_HEAD_DIM>;
 var<workgroup> v_tile: array<f32, BLOCK_K * MAX_HEAD_DIM>;
 
-fn load_tile_f32(
-    local_id: u32,
-    tile_len: u32,
-    head_dim: u32,
-    base_offset: u32,
-    qkv: ptr<storage, array<f32>>,
-    tile: ptr<workgroup, array<f32, BLOCK_K * MAX_HEAD_DIM>>,
-) {
-    let elements = tile_len * head_dim;
-    var idx = local_id;
-    loop {
-        if (idx >= elements) {
-            break;
-        }
-        let tile_k = idx / head_dim;
-        let d = idx - tile_k * head_dim;
-        let pos = base_offset + tile_k * head_dim + d;
-        (*tile)[tile_k * MAX_HEAD_DIM + d] = (*qkv)[pos];
-        idx = idx + WORKGROUP_SIZE;
-    }
-}
+// ============================================================================
+// F32 Flash Attention
+// ============================================================================
 
-fn load_tile_f16(
+// Module-scope bindings for flash_attention_forward_f32
+@group(0) @binding(0) var<storage, read> fa_q_f32: array<f32>;
+@group(0) @binding(1) var<storage, read> fa_k_f32: array<f32>;
+@group(0) @binding(2) var<storage, read> fa_v_f32: array<f32>;
+@group(0) @binding(3) var<storage, read_write> fa_o_f32: array<f32>;
+@group(0) @binding(4) var<uniform> fa_params_f32: AttentionParams;
+
+fn load_tile_f32_impl(
     local_id: u32,
     tile_len: u32,
     head_dim: u32,
     base_offset: u32,
-    qkv: ptr<storage, array<f16>>,
-    tile: ptr<workgroup, array<f32, BLOCK_K * MAX_HEAD_DIM>>,
+    is_k: bool,
 ) {
     let elements = tile_len * head_dim;
     var idx = local_id;
@@ -57,7 +45,11 @@ fn load_tile_f16(
         let tile_k = idx / head_dim;
         let d = idx - tile_k * head_dim;
         let pos = base_offset + tile_k * head_dim + d;
-        (*tile)[tile_k * MAX_HEAD_DIM + d] = f32((*qkv)[pos]);
+        if (is_k) {
+            k_tile[tile_k * MAX_HEAD_DIM + d] = fa_k_f32[pos];
+        } else {
+            v_tile[tile_k * MAX_HEAD_DIM + d] = fa_v_f32[pos];
+        }
         idx = idx + WORKGROUP_SIZE;
     }
 }
@@ -66,33 +58,28 @@ fn load_tile_f16(
 fn flash_attention_forward_f32(
     @builtin(workgroup_id) group_id: vec3<u32>,
     @builtin(local_invocation_id) local_id: vec3<u32>,
-    @group(0) @binding(0) var<storage, read> q: array<f32>,
-    @group(0) @binding(1) var<storage, read> k: array<f32>,
-    @group(0) @binding(2) var<storage, read> v: array<f32>,
-    @group(0) @binding(3) var<storage, read_write> o: array<f32>,
-    @group(0) @binding(4) var<uniform> params: AttentionParams,
 ) {
-    if (params.seq_len == 0u || params.head_dim == 0u) {
+    if (fa_params_f32.seq_len == 0u || fa_params_f32.head_dim == 0u) {
         return;
     }
-    if (params.head_dim > MAX_HEAD_DIM) {
+    if (fa_params_f32.head_dim > MAX_HEAD_DIM) {
         return;
     }
 
     let q_index = group_id.x * WORKGROUP_SIZE + local_id.x;
-    if (q_index >= params.seq_len) {
+    if (q_index >= fa_params_f32.seq_len) {
         return;
     }
 
     let bh = group_id.y;
-    let batch = bh / params.num_heads;
-    if (batch >= params.batch_size) {
+    let batch = bh / fa_params_f32.num_heads;
+    if (batch >= fa_params_f32.batch_size) {
         return;
     }
-    let head = bh - batch * params.num_heads;
+    let head = bh - batch * fa_params_f32.num_heads;
 
-    let head_dim = params.head_dim;
-    let base = ((batch * params.num_heads + head) * params.seq_len + q_index) * head_dim;
+    let head_dim = fa_params_f32.head_dim;
+    let base = ((batch * fa_params_f32.num_heads + head) * fa_params_f32.seq_len + q_index) * head_dim;
 
     var q_local: array<f32, MAX_HEAD_DIM>;
     var o_local: array<f32, MAX_HEAD_DIM>;
@@ -103,7 +90,7 @@ fn flash_attention_forward_f32(
             break;
         }
         let idx = base + d;
-        q_local[d] = q[idx];
+        q_local[d] = fa_q_f32[idx];
         o_local[d] = 0.0;
         d = d + 1u;
     }
@@ -111,18 +98,18 @@ fn flash_attention_forward_f32(
     var m = -3.402823e38f;
     var l = 0.0f;
 
-    let tile_k = max(1u, min(params.block_size, BLOCK_K));
+    let tile_k = max(1u, min(fa_params_f32.block_size, BLOCK_K));
     var key_base = 0u;
     loop {
-        if (key_base >= params.seq_len) {
+        if (key_base >= fa_params_f32.seq_len) {
             break;
         }
-        let remaining = params.seq_len - key_base;
+        let remaining = fa_params_f32.seq_len - key_base;
         let tile_len = min(tile_k, remaining);
-        let k_base = ((batch * params.num_heads + head) * params.seq_len + key_base) * head_dim;
+        let k_base = ((batch * fa_params_f32.num_heads + head) * fa_params_f32.seq_len + key_base) * head_dim;
 
-        load_tile_f32(local_id.x, tile_len, head_dim, k_base, &k, &k_tile);
-        load_tile_f32(local_id.x, tile_len, head_dim, k_base, &v, &v_tile);
+        load_tile_f32_impl(local_id.x, tile_len, head_dim, k_base, true);
+        load_tile_f32_impl(local_id.x, tile_len, head_dim, k_base, false);
         workgroupBarrier();
 
         var tile_idx = 0u;
@@ -140,7 +127,7 @@ fn flash_attention_forward_f32(
                 dd = dd + 1u;
             }
 
-            let score = sum * params.scale;
+            let score = sum * fa_params_f32.scale;
             let m_new = max(m, score);
             let exp_m = exp(m - m_new);
             let exp_score = exp(score - m_new);
@@ -172,8 +159,44 @@ fn flash_attention_forward_f32(
         if (out_d >= head_dim) {
             break;
         }
-        o[base + out_d] = o_local[out_d] * inv_l;
+        fa_o_f32[base + out_d] = o_local[out_d] * inv_l;
         out_d = out_d + 1u;
+    }
+}
+
+// ============================================================================
+// F16 Flash Attention
+// ============================================================================
+
+// Module-scope bindings for flash_attention_forward_f16
+@group(0) @binding(0) var<storage, read> fa_q_f16: array<f16>;
+@group(0) @binding(1) var<storage, read> fa_k_f16: array<f16>;
+@group(0) @binding(2) var<storage, read> fa_v_f16: array<f16>;
+@group(0) @binding(3) var<storage, read_write> fa_o_f16: array<f16>;
+@group(0) @binding(4) var<uniform> fa_params_f16: AttentionParams;
+
+fn load_tile_f16_impl(
+    local_id: u32,
+    tile_len: u32,
+    head_dim: u32,
+    base_offset: u32,
+    is_k: bool,
+) {
+    let elements = tile_len * head_dim;
+    var idx = local_id;
+    loop {
+        if (idx >= elements) {
+            break;
+        }
+        let tile_k = idx / head_dim;
+        let d = idx - tile_k * head_dim;
+        let pos = base_offset + tile_k * head_dim + d;
+        if (is_k) {
+            k_tile[tile_k * MAX_HEAD_DIM + d] = f32(fa_k_f16[pos]);
+        } else {
+            v_tile[tile_k * MAX_HEAD_DIM + d] = f32(fa_v_f16[pos]);
+        }
+        idx = idx + WORKGROUP_SIZE;
     }
 }
 
@@ -181,33 +204,28 @@ fn flash_attention_forward_f32(
 fn flash_attention_forward_f16(
     @builtin(workgroup_id) group_id: vec3<u32>,
     @builtin(local_invocation_id) local_id: vec3<u32>,
-    @group(0) @binding(0) var<storage, read> q: array<f16>,
-    @group(0) @binding(1) var<storage, read> k: array<f16>,
-    @group(0) @binding(2) var<storage, read> v: array<f16>,
-    @group(0) @binding(3) var<storage, read_write> o: array<f16>,
-    @group(0) @binding(4) var<uniform> params: AttentionParams,
 ) {
-    if (params.seq_len == 0u || params.head_dim == 0u) {
+    if (fa_params_f16.seq_len == 0u || fa_params_f16.head_dim == 0u) {
         return;
     }
-    if (params.head_dim > MAX_HEAD_DIM) {
+    if (fa_params_f16.head_dim > MAX_HEAD_DIM) {
         return;
     }
 
     let q_index = group_id.x * WORKGROUP_SIZE + local_id.x;
-    if (q_index >= params.seq_len) {
+    if (q_index >= fa_params_f16.seq_len) {
         return;
     }
 
     let bh = group_id.y;
-    let batch = bh / params.num_heads;
-    if (batch >= params.batch_size) {
+    let batch = bh / fa_params_f16.num_heads;
+    if (batch >= fa_params_f16.batch_size) {
         return;
     }
-    let head = bh - batch * params.num_heads;
+    let head = bh - batch * fa_params_f16.num_heads;
 
-    let head_dim = params.head_dim;
-    let base = ((batch * params.num_heads + head) * params.seq_len + q_index) * head_dim;
+    let head_dim = fa_params_f16.head_dim;
+    let base = ((batch * fa_params_f16.num_heads + head) * fa_params_f16.seq_len + q_index) * head_dim;
 
     var q_local: array<f32, MAX_HEAD_DIM>;
     var o_local: array<f32, MAX_HEAD_DIM>;
@@ -218,7 +236,7 @@ fn flash_attention_forward_f16(
             break;
         }
         let idx = base + d;
-        q_local[d] = f32(q[idx]);
+        q_local[d] = f32(fa_q_f16[idx]);
         o_local[d] = 0.0;
         d = d + 1u;
     }
@@ -226,18 +244,18 @@ fn flash_attention_forward_f16(
     var m = -3.402823e38f;
     var l = 0.0f;
 
-    let tile_k = max(1u, min(params.block_size, BLOCK_K));
+    let tile_k = max(1u, min(fa_params_f16.block_size, BLOCK_K));
     var key_base = 0u;
     loop {
-        if (key_base >= params.seq_len) {
+        if (key_base >= fa_params_f16.seq_len) {
             break;
         }
-        let remaining = params.seq_len - key_base;
+        let remaining = fa_params_f16.seq_len - key_base;
         let tile_len = min(tile_k, remaining);
-        let k_base = ((batch * params.num_heads + head) * params.seq_len + key_base) * head_dim;
+        let k_base = ((batch * fa_params_f16.num_heads + head) * fa_params_f16.seq_len + key_base) * head_dim;
 
-        load_tile_f16(local_id.x, tile_len, head_dim, k_base, &k, &k_tile);
-        load_tile_f16(local_id.x, tile_len, head_dim, k_base, &v, &v_tile);
+        load_tile_f16_impl(local_id.x, tile_len, head_dim, k_base, true);
+        load_tile_f16_impl(local_id.x, tile_len, head_dim, k_base, false);
         workgroupBarrier();
 
         var tile_idx = 0u;
@@ -255,7 +273,7 @@ fn flash_attention_forward_f16(
                 dd = dd + 1u;
             }
 
-            let score = sum * params.scale;
+            let score = sum * fa_params_f16.scale;
             let m_new = max(m, score);
             let exp_m = exp(m - m_new);
             let exp_score = exp(score - m_new);
@@ -287,7 +305,7 @@ fn flash_attention_forward_f16(
         if (out_d >= head_dim) {
             break;
         }
-        o[base + out_d] = f16(o_local[out_d] * inv_l);
+        fa_o_f16[base + out_d] = f16(o_local[out_d] * inv_l);
         out_d = out_d + 1u;
     }
 }
