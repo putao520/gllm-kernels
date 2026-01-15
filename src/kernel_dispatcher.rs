@@ -625,6 +625,91 @@ impl KernelDispatcher {
         // All backends use the generic CPU implementation for now
         cpu_softmax(input, output, config);
     }
+
+    // =========================================================================
+    // Embedding Operations (Binary/Int8/Int4 quantization for vector search)
+    // =========================================================================
+
+    /// Binary Inner Product (Hamming distance) for vector similarity.
+    ///
+    /// Computes Hamming distance between binary-quantized vectors.
+    /// Lower score = more similar.
+    ///
+    /// # Arguments
+    /// * `queries` - Packed binary query vectors [num_queries, dim/64]
+    /// * `database` - Packed binary database vectors [num_vectors, dim/64]
+    /// * `scores` - Output Hamming distances [num_queries, num_vectors]
+    /// * `config` - Configuration with dim, num_queries, num_vectors
+    #[inline(always)]
+    pub fn binary_ip_hamming(
+        &self,
+        queries: &[u64],
+        database: &[u64],
+        scores: &mut [i32],
+        config: crate::ops::embedding::BinaryIpConfig,
+    ) {
+        // Use SIMD-optimized version (4-way unrolled popcount)
+        // GPU dispatch can be added when CUDA/Metal binary kernels are available
+        crate::ops::embedding::binary_ip_hamming_simd(queries, database, scores, &config);
+    }
+
+    /// Asymmetric Binary Inner Product (f32 query vs binary database).
+    ///
+    /// More accurate than symmetric binary, query stays at full precision.
+    /// Higher score = more similar.
+    #[inline(always)]
+    pub fn binary_ip_asymmetric(
+        &self,
+        queries: &[f32],
+        database: &[u64],
+        scores: &mut [f32],
+        config: crate::ops::embedding::BinaryIpConfig,
+    ) {
+        crate::ops::embedding::binary_ip_asymmetric(queries, database, scores, &config);
+    }
+
+    /// Int8 Dot Product for vector similarity.
+    ///
+    /// 4x throughput improvement over f32 with minimal accuracy loss.
+    /// Higher score = more similar.
+    #[inline(always)]
+    pub fn int8_dot_product(
+        &self,
+        queries: &[i8],
+        database: &[i8],
+        scores: &mut [f32],
+        config: crate::ops::embedding::Int8DotConfig,
+    ) {
+        // Use unrolled version for better pipelining
+        crate::ops::embedding::int8_dot_product_unrolled(queries, database, scores, &config);
+    }
+
+    /// Int4 Packed Dot Product for maximum memory efficiency.
+    ///
+    /// 8x memory bandwidth improvement, 2 values packed per byte.
+    #[inline(always)]
+    pub fn int4_packed_dot_product(
+        &self,
+        queries: &[u8],
+        database: &[u8],
+        scores: &mut [f32],
+        config: crate::ops::embedding::Int4PackedConfig,
+    ) {
+        crate::ops::embedding::int4_packed_dot_product(queries, database, scores, &config);
+    }
+
+    /// Matryoshka dimension truncation with optional normalization.
+    ///
+    /// Enables runtime dimension selection (e.g., 1024→256) for speed/accuracy tradeoff.
+    #[inline(always)]
+    pub fn matryoshka_truncate(
+        &self,
+        embeddings: &[f32],
+        output: &mut [f32],
+        config: crate::ops::embedding::MatryoshkaConfig,
+    ) {
+        crate::ops::embedding::matryoshka_truncate(embeddings, output, &config);
+    }
 }
 
 impl Default for KernelDispatcher {

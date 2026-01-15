@@ -17,6 +17,9 @@ pub mod engram;
 pub mod engram_hash;
 pub mod engram_lookup;
 
+// Embedding operations for vector search and rerank
+pub mod embedding;
+
 pub use ring_attention::{CommBackend, RingAttention, RingAttentionConfig};
 pub use engram::{Engram, EngramConfig, fuse_engram_attention, fuse_engram_attention_simd};
 pub use engram_hash::{EngramHasher, EngramHashConfig};

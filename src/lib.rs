@@ -62,3 +62,17 @@ pub use kernel_dispatcher::{
 pub use ops::engram::{Engram, EngramConfig, fuse_engram_attention, fuse_engram_attention_simd};
 pub use ops::engram_hash::{EngramHasher, EngramHashConfig};
 pub use ops::engram_lookup::{EngramEmbeddingTable, EngramLookupConfig, EngramModule, EngramError};
+
+// Embedding operations exports (Binary/Int8/Int4 quantization, Matryoshka, Rerank)
+pub use ops::embedding::{
+    // Binary Quantization
+    BinaryIpConfig, pack_binary_f32, binary_ip_hamming, binary_ip_hamming_simd, binary_ip_asymmetric,
+    // Int8 Quantization
+    Int8DotConfig, quantize_to_int8, int8_dot_product, int8_dot_product_unrolled,
+    // Int4 Packed Quantization
+    Int4PackedConfig, pack_int4, unpack_int4, quantize_to_int4_packed, int4_packed_dot_product,
+    // Matryoshka Dimension Truncation
+    MatryoshkaConfig, matryoshka_truncate, select_matryoshka_dim,
+    // Three-Stage Rerank Pipeline
+    RerankPipelineConfig, RerankResult, rerank_binary_stage, rerank_int8_stage,
+};
