@@ -12,11 +12,15 @@ use wgpu::{
     Queue,
 };
 
+use crate::validation::{
+    validate_attention_dims, validate_u32_bounds, compute_num_queries, compute_output_len,
+    to_u32,
+};
+
 const KERNEL_F32: &str = "flash_attention_forward_f32";
 const KERNEL_F16: &str = "flash_attention_forward_f16";
 const SHADER_SOURCE: &str = include_str!("kernels/flash_attention.wgsl");
 const WORKGROUP_SIZE: u32 = 128;
-const MAX_HEAD_DIM: usize = 256;
 const DEFAULT_BLOCK: u32 = 64;
 
 #[repr(C)]
@@ -398,27 +402,19 @@ fn build_params(
     block_size: Option<u32>,
     scale: f32,
 ) -> Result<AttentionParams, FlashAttentionError> {
-    if batch_size == 0 || num_heads == 0 || seq_len == 0 || head_dim == 0 {
-        return Err(FlashAttentionError::InvalidConfig(
-            "Dimensions must be > 0".into(),
-        ));
-    }
-    if head_dim > MAX_HEAD_DIM {
-        return Err(FlashAttentionError::InvalidConfig(format!(
-            "head_dim {} exceeds MAX_HEAD_DIM {}",
-            head_dim, MAX_HEAD_DIM
-        )));
-    }
+    validate_attention_dims(batch_size, num_heads, seq_len, head_dim)
+        .map_err(FlashAttentionError::InvalidConfig)?;
+    validate_u32_bounds(batch_size, num_heads, seq_len, head_dim)
+        .map_err(FlashAttentionError::InvalidConfig)?;
 
-    let batch_size_u32 = u32::try_from(batch_size).map_err(|_| {
-        FlashAttentionError::InvalidConfig("batch_size exceeds u32".into())
-    })?;
-    let num_heads_u32 = u32::try_from(num_heads)
-        .map_err(|_| FlashAttentionError::InvalidConfig("num_heads exceeds u32".into()))?;
-    let seq_len_u32 = u32::try_from(seq_len)
-        .map_err(|_| FlashAttentionError::InvalidConfig("seq_len exceeds u32".into()))?;
-    let head_dim_u32 = u32::try_from(head_dim)
-        .map_err(|_| FlashAttentionError::InvalidConfig("head_dim exceeds u32".into()))?;
+    let batch_size_u32 = to_u32(batch_size, "batch_size")
+        .map_err(FlashAttentionError::InvalidConfig)?;
+    let num_heads_u32 = to_u32(num_heads, "num_heads")
+        .map_err(FlashAttentionError::InvalidConfig)?;
+    let seq_len_u32 = to_u32(seq_len, "seq_len")
+        .map_err(FlashAttentionError::InvalidConfig)?;
+    let head_dim_u32 = to_u32(head_dim, "head_dim")
+        .map_err(FlashAttentionError::InvalidConfig)?;
 
     let block = block_size.unwrap_or(DEFAULT_BLOCK).max(1);
 
@@ -440,14 +436,10 @@ fn expected_elements(
     seq_len: usize,
     head_dim: usize,
 ) -> Result<usize, FlashAttentionError> {
-    let num_queries = batch_size
-        .checked_mul(num_heads)
-        .and_then(|value| value.checked_mul(seq_len))
-        .ok_or_else(|| FlashAttentionError::InvalidConfig("num_queries overflow".into()))?;
-
-    num_queries
-        .checked_mul(head_dim)
-        .ok_or_else(|| FlashAttentionError::InvalidConfig("output_len overflow".into()))
+    let num_queries = compute_num_queries(batch_size, num_heads, seq_len)
+        .map_err(FlashAttentionError::InvalidConfig)?;
+    compute_output_len(num_queries, head_dim)
+        .map_err(FlashAttentionError::InvalidConfig)
 }
 
 fn bytes_of<T: Copy>(value: &T) -> &[u8] {

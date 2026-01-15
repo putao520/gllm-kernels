@@ -2,15 +2,15 @@
 //!
 //! Provides a paged attention kernel wrapper that mirrors CUDA/HIP entry points.
 //!
-//! ## Precompiled metallib Support
+//! ## Precompiled metallib (Required)
 //!
-//! For production use, precompile the shader using:
+//! metallib must be precompiled before use:
 //! ```bash
 //! ./scripts/compile_metal_kernels.sh
 //! ```
 //!
-//! The kernel loader will automatically use precompiled metallib if available,
-//! falling back to runtime compilation from source.
+//! metallib is Metal's intermediate format (like PTX/HSACO).
+//! NO runtime compilation fallback - metallib must be precompiled and embedded.
 
 use std::fmt;
 use std::mem;
@@ -21,16 +21,18 @@ use metal::{
 };
 
 use crate::metal_kernels::metallib_loader::{MetallibCollection, MetallibLoadError};
+use crate::validation::{
+    validate_paged_attention_dims, compute_num_queries, compute_output_len, to_u32, MAX_HEAD_DIM,
+};
 
 const KERNEL_F32: &str = "paged_attention_forward_f32";
 const KERNEL_F16: &str = "paged_attention_forward_f16";
-const MAX_HEAD_DIM: usize = 256;
 
 /// Metallib collection for paged attention kernel.
+/// metallib must be precompiled with: ./scripts/compile_metal_kernels.sh
 static PAGED_ATTENTION_METALLIB: MetallibCollection = MetallibCollection {
     kernel_name: "paged_attention",
     metallib_data: include_bytes!("kernels/paged_attention.metallib"),
-    source: include_str!("kernels/paged_attention.metal"),
 };
 
 #[repr(C)]
@@ -221,11 +223,9 @@ impl PagedAttentionKernel {
     }
 }
 
-/// Load Metal library using MetallibCollection with automatic fallback.
+/// Load Metal library from embedded metallib.
 ///
-/// Priority:
-/// 1. Embedded metallib - always tried first
-/// 2. Runtime compilation from source (automatic fallback)
+/// metallib is Metal's intermediate format - NO runtime compilation fallback.
 fn load_library(device: &Device) -> Result<Library, PagedAttentionError> {
     PAGED_ATTENTION_METALLIB.load(device).map_err(PagedAttentionError::from)
 }
@@ -250,42 +250,30 @@ fn build_params(
     block_size: usize,
     seq_len: usize,
 ) -> Result<(PagedAttentionParams, usize, usize), PagedAttentionError> {
-    if batch_size == 0 || num_heads == 0 || seq_len == 0 || head_dim == 0 || block_size == 0 {
-        return Err(PagedAttentionError::InvalidConfig(
-            "Dimensions must be > 0".into(),
-        ));
-    }
-    if head_dim > MAX_HEAD_DIM {
-        return Err(PagedAttentionError::InvalidConfig(format!(
-            "head_dim {} exceeds MAX_HEAD_DIM {}",
-            head_dim, MAX_HEAD_DIM
-        )));
-    }
+    validate_paged_attention_dims(batch_size, num_heads, head_dim, block_size, seq_len)
+        .map_err(PagedAttentionError::InvalidConfig)?;
 
-    let batch_size_u32 = u32::try_from(batch_size)
-        .map_err(|_| PagedAttentionError::InvalidConfig("batch_size exceeds u32".into()))?;
-    let num_heads_u32 = u32::try_from(num_heads)
-        .map_err(|_| PagedAttentionError::InvalidConfig("num_heads exceeds u32".into()))?;
-    let head_dim_u32 = u32::try_from(head_dim)
-        .map_err(|_| PagedAttentionError::InvalidConfig("head_dim exceeds u32".into()))?;
-    let block_size_u32 = u32::try_from(block_size)
-        .map_err(|_| PagedAttentionError::InvalidConfig("block_size exceeds u32".into()))?;
-    let seq_len_u32 = u32::try_from(seq_len)
-        .map_err(|_| PagedAttentionError::InvalidConfig("seq_len exceeds u32".into()))?;
+    let batch_size_u32 = to_u32(batch_size, "batch_size")
+        .map_err(PagedAttentionError::InvalidConfig)?;
+    let num_heads_u32 = to_u32(num_heads, "num_heads")
+        .map_err(PagedAttentionError::InvalidConfig)?;
+    let head_dim_u32 = to_u32(head_dim, "head_dim")
+        .map_err(PagedAttentionError::InvalidConfig)?;
+    let block_size_u32 = to_u32(block_size, "block_size")
+        .map_err(PagedAttentionError::InvalidConfig)?;
+    let seq_len_u32 = to_u32(seq_len, "seq_len")
+        .map_err(PagedAttentionError::InvalidConfig)?;
 
-    let total_queries = batch_size
-        .checked_mul(num_heads)
-        .and_then(|value| value.checked_mul(seq_len))
-        .ok_or_else(|| PagedAttentionError::InvalidConfig("num_queries overflow".into()))?;
+    let total_queries = compute_num_queries(batch_size, num_heads, seq_len)
+        .map_err(PagedAttentionError::InvalidConfig)?;
     if total_queries > u32::MAX as usize {
         return Err(PagedAttentionError::InvalidConfig(
             "num_queries exceeds u32".into(),
         ));
     }
 
-    let output_len = total_queries
-        .checked_mul(head_dim)
-        .ok_or_else(|| PagedAttentionError::InvalidConfig("output_len overflow".into()))?;
+    let output_len = compute_output_len(total_queries, head_dim)
+        .map_err(PagedAttentionError::InvalidConfig)?;
 
     let params = PagedAttentionParams {
         batch_size: batch_size_u32,

@@ -19,6 +19,7 @@ pub mod comm;
 pub mod device;
 pub mod ops;
 pub mod types;
+pub mod validation;
 
 // GPU kernels - always compiled, runtime detection determines availability
 // CUDA kernels use cudarc's dynamic-loading feature
@@ -56,6 +57,7 @@ pub use wgpu_kernels::FlashAttentionKernel;
 // Zero-cost dispatcher exports
 pub use kernel_dispatcher::{
     KernelDispatcher, KernelFloat, FlashAttentionConfig, PagedAttentionConfig, SoftmaxConfig,
+    GpuRerankConfig, GpuRerankStageResult,
 };
 
 // Engram conditional memory exports

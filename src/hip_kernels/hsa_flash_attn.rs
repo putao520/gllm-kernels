@@ -21,11 +21,13 @@ use super::hsa_runtime::{
     HSA_STATUS_SUCCESS,
 };
 use crate::types::AttentionConfig;
+use crate::validation::{
+    validate_attention_dims, compute_num_queries, compute_output_len,
+};
 
 const KERNEL_F32: &str = "tiled_attention_forward_f32";
 const KERNEL_F16: &str = "tiled_attention_forward_f16";
 const DEFAULT_BLOCK: u32 = 128;
-const MAX_HEAD_DIM: usize = 256;
 
 // HSA packet header constants
 const HSA_PACKET_TYPE_KERNEL_DISPATCH: u16 = 2;
@@ -878,26 +880,13 @@ fn build_launch(
     head_dim: usize,
     block_size: u32,
 ) -> Result<(usize, u32, u32), HsaFlashAttentionError> {
-    if batch_size == 0 || num_heads == 0 || seq_len == 0 || head_dim == 0 {
-        return Err(HsaFlashAttentionError::InvalidConfig(
-            "Dimensions must be > 0".into(),
-        ));
-    }
-    if head_dim > MAX_HEAD_DIM {
-        return Err(HsaFlashAttentionError::InvalidConfig(format!(
-            "head_dim {} exceeds MAX_HEAD_DIM {}",
-            head_dim, MAX_HEAD_DIM
-        )));
-    }
+    validate_attention_dims(batch_size, num_heads, seq_len, head_dim)
+        .map_err(HsaFlashAttentionError::InvalidConfig)?;
 
-    let num_queries = batch_size
-        .checked_mul(num_heads)
-        .and_then(|value| value.checked_mul(seq_len))
-        .ok_or_else(|| HsaFlashAttentionError::InvalidConfig("num_queries overflow".into()))?;
-
-    let output_len = num_queries
-        .checked_mul(head_dim)
-        .ok_or_else(|| HsaFlashAttentionError::InvalidConfig("output_len overflow".into()))?;
+    let num_queries = compute_num_queries(batch_size, num_heads, seq_len)
+        .map_err(HsaFlashAttentionError::InvalidConfig)?;
+    let output_len = compute_output_len(num_queries, head_dim)
+        .map_err(HsaFlashAttentionError::InvalidConfig)?;
 
     let workgroup_size = block_size.clamp(1, 1024);
     let grid_size = ((num_queries + workgroup_size as usize - 1) / workgroup_size as usize) as u32;
