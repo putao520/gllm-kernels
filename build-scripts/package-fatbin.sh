@@ -22,8 +22,11 @@ ROCM_FILES=0
 METAL_FILES=0
 SPIRV_FILES=0
 
+# Enable nullglob to handle empty glob patterns
+shopt -s nullglob
+
 # Check CUDA
-for file in "$KERNELS_DIR"/cuda/*.fatbin "$KERNELS_DIR"/cuda/*.ptx 2>/dev/null; do
+for file in "$KERNELS_DIR"/cuda/*.fatbin "$KERNELS_DIR"/cuda/*.ptx; do
     if [[ -f "$file" ]]; then
         SIZE=$(du -h "$file" | cut -f1)
         echo "  CUDA: $(basename "$file") ($SIZE)"
@@ -32,7 +35,7 @@ for file in "$KERNELS_DIR"/cuda/*.fatbin "$KERNELS_DIR"/cuda/*.ptx 2>/dev/null; 
 done
 
 # Check ROCm
-for file in "$KERNELS_DIR"/rocm/*.hsaco 2>/dev/null; do
+for file in "$KERNELS_DIR"/rocm/*.hsaco; do
     if [[ -f "$file" ]]; then
         SIZE=$(du -h "$file" | cut -f1)
         echo "  ROCm: $(basename "$file") ($SIZE)"
@@ -41,7 +44,7 @@ for file in "$KERNELS_DIR"/rocm/*.hsaco 2>/dev/null; do
 done
 
 # Check Metal
-for file in "$KERNELS_DIR"/metal/*.metallib 2>/dev/null; do
+for file in "$KERNELS_DIR"/metal/*.metallib; do
     if [[ -f "$file" ]]; then
         SIZE=$(du -h "$file" | cut -f1)
         echo "  Metal: $(basename "$file") ($SIZE)"
@@ -50,13 +53,16 @@ for file in "$KERNELS_DIR"/metal/*.metallib 2>/dev/null; do
 done
 
 # Check SPIR-V
-for file in "$KERNELS_DIR"/spirv/*.spv "$KERNELS_DIR"/spirv/*.wgsl 2>/dev/null; do
+for file in "$KERNELS_DIR"/spirv/*.spv "$KERNELS_DIR"/spirv/*.wgsl; do
     if [[ -f "$file" ]]; then
         SIZE=$(du -h "$file" | cut -f1)
         echo "  SPIR-V: $(basename "$file") ($SIZE)"
         SPIRV_FILES=$((SPIRV_FILES + 1))
     fi
 done
+
+# Restore default glob behavior
+shopt -u nullglob
 
 TOTAL_FILES=$((CUDA_FILES + ROCM_FILES + METAL_FILES + SPIRV_FILES))
 echo ""
@@ -83,14 +89,14 @@ cat > "$MANIFEST" << EOF
       "kernels": ["embedding_ops", "flash_attention", "fused_qkv_attention", "online_softmax", "paged_attention", "selective_scan", "tiled_attention"]
     },
     "rocm": {
-      "files": ["gfx90a.hsaco", "gfx1100.hsaco", "gfx1201.hsaco"],
+      "file_pattern": "{kernel}_{arch}.hsaco",
       "architectures": {
         "gfx90a": "MI200 series (CDNA2)",
-        "gfx1100": "RDNA3 (RX 7000 series)",
-        "gfx1201": "RDNA4 (RX 8000 series)"
+        "gfx942": "MI300 series (CDNA3)",
+        "gfx1100": "RDNA3 (RX 7000 series)"
       },
-      "kernels_per_file": 11,
-      "kernels": ["chunked_prefill", "eagle3", "embedding_ops", "evic_press", "flash_attention", "flash_tree_attn", "int2_quantizer", "medusa", "paged_attention", "prompt_cache", "spec_ee"]
+      "kernels": ["chunked_prefill", "eagle3", "embedding_ops", "evic_press", "flash_attention", "flash_tree_attn", "int2_quantizer", "medusa", "paged_attention", "prompt_cache", "spec_ee"],
+      "note": "ROCm produces individual hsaco per kernel per arch (no fatbinary tool)"
     },
     "metal": {
       "files": ["universal.metallib"],
