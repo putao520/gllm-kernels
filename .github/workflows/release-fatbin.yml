@@ -50,9 +50,10 @@ jobs:
       - uses: actions/checkout@v4
 
       - name: Build ROCm kernels
+        shell: bash
         run: |
           chmod +x build-scripts/build-rocm.sh
-          ./build-scripts/build-rocm.sh
+          bash build-scripts/build-rocm.sh
 
       - name: List built kernels
         run: |
