@@ -2,15 +2,16 @@
 # ROCm/HIP Kernel Build Script (Single-File Library Architecture)
 # Target: Latest 3 architectures
 # Output: One hsaco per architecture containing ALL kernels
+# Strategy: Compile each kernel individually, then link with RDC
 # Requires: ROCm SDK 6.0+ in CI runner
 
 set -eo pipefail
-# Note: removed -u flag as it may cause issues with unset loop variables
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="$(dirname "$SCRIPT_DIR")"
 OUTPUT_DIR="${PROJECT_ROOT}/kernels/rocm"
 SRC_DIR="${PROJECT_ROOT}/src/hip_kernels/kernels"
+TMP_DIR="${PROJECT_ROOT}/build-tmp/rocm"
 
 # Target architectures (latest 3 generations)
 ROCM_ARCHS="gfx90a gfx1100 gfx1201"
@@ -30,20 +31,16 @@ fi
 
 hipcc --version 2>&1 | head -1 || true
 
-echo "Creating output directory: $OUTPUT_DIR"
 mkdir -p "$OUTPUT_DIR"
-echo "Output directory created"
-
-echo "Source directory: $SRC_DIR"
-ls -la "$SRC_DIR" || echo "Cannot list source directory"
+mkdir -p "$TMP_DIR"
 
 # Collect all source files
-SRC_FILES=""
+SRC_FILES=()
 FOUND_COUNT=0
 for kernel in $KERNELS; do
     SRC_FILE="$SRC_DIR/$kernel.hip"
     if [[ -f "$SRC_FILE" ]]; then
-        SRC_FILES="$SRC_FILES $SRC_FILE"
+        SRC_FILES+=("$SRC_FILE")
         FOUND_COUNT=$((FOUND_COUNT + 1))
         echo "  Found: $kernel.hip"
     else
@@ -59,23 +56,35 @@ fi
 echo ""
 echo "Building with $FOUND_COUNT kernels..."
 
-# Build hsaco for each architecture (containing all kernels)
+# Build hsaco for each architecture
+# Strategy: Compile each .hip to .hsaco individually (ROCm doesn't have fatbinary tool)
 for arch in $ROCM_ARCHS; do
     echo ""
-    echo "Building $arch.hsaco (all $FOUND_COUNT kernels)..."
-    hipcc \
-        --offload-arch=$arch \
-        -O3 \
-        -ffast-math \
-        --genco \
-        -o "$OUTPUT_DIR/$arch.hsaco" \
-        $SRC_FILES
+    echo "Building $arch hsaco files ($FOUND_COUNT kernels)..."
 
-    if [[ -f "$OUTPUT_DIR/$arch.hsaco" ]]; then
-        SIZE=$(du -h "$OUTPUT_DIR/$arch.hsaco" | cut -f1)
-        echo "  Created: $arch.hsaco ($SIZE)"
-    fi
+    HSACO_COUNT=0
+    for src in "${SRC_FILES[@]}"; do
+        kernel_name=$(basename "$src" .hip)
+        hsaco_file="$OUTPUT_DIR/${kernel_name}_${arch}.hsaco"
+
+        hipcc \
+            --offload-arch=$arch \
+            -O3 \
+            -ffast-math \
+            --genco \
+            -o "$hsaco_file" \
+            "$src"
+
+        if [[ -f "$hsaco_file" ]]; then
+            HSACO_COUNT=$((HSACO_COUNT + 1))
+        fi
+    done
+
+    echo "  Created $HSACO_COUNT hsaco files for $arch"
 done
+
+# Cleanup temp files
+rm -rf "$TMP_DIR"
 
 echo ""
 echo "=== ROCm Build Complete ==="
