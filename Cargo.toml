@@ -7,7 +7,7 @@ license = "Apache-2.0"
 description = "Low-level attention kernels with runtime backend selection (CUDA/ROCm/Metal/WGPU/CPU)"
 repository = "https://github.com/putao520/gllm-kernels"
 homepage = "https://github.com/putao520/gllm-kernels"
-keywords = ["attention", "kernels", "burn", "gpu", "tensor"]
+keywords = ["attention", "kernels", "llm", "gpu", "inference"]
 categories = ["algorithms", "science"]
 
 [lib]
@@ -27,8 +27,8 @@ all-backends = []
 # 所有自定义 kernel
 all-kernels = []
 
-# Fusion 支持（可选优化）
-fusion = ["burn/fusion", "burn-fusion"]
+# Fusion 支持（已移除 Burn 依赖，保留 feature 以兼容）
+fusion = []
 
 # NCCL 多 GPU（需要 CUDA 环境）
 nccl = ["cudarc/nccl"]
@@ -51,6 +51,12 @@ flash-attention-v3-block-quant = []
 # 精简版（仅 CPU，用于测试/CI）
 minimal = []
 
+# Fat Binary 预编译内核（嵌入 ~10MB）
+embedded-kernels = []
+
+# 运行时下载内核（首次使用时从 GitHub Release 下载）
+download-kernels = []
+
 # Backend-specific kernel features (for conditional compilation)
 cpu = []
 cuda = []
@@ -64,10 +70,7 @@ paged-kernel = []
 softmax-kernel = []
 
 [dependencies]
-# Burn tensor library (always included)
-burn = { version = "0.20.0-pre.6", default-features = false }
-burn-ndarray = { version = "0.20.0-pre.6" }  # CPU 后端，始终编译
-burn-fusion = { version = "0.20.0-pre.6", optional = true }
+# ADR-001: Burn 依赖已移除，统一使用 KernelDispatcher 零成本抽象
 
 # CUDA 支持（动态加载，运行时检测）
 cudarc = { version = "0.18", default-features = false, features = ["std", "driver", "nvrtc", "f16", "cuda-12090", "dynamic-loading"] }
@@ -85,6 +88,7 @@ half = "2.7"
 libloading = "0.8"  # 动态加载 HIP/ROCm 库
 memmap2 = "0.9"     # Engram: memory-mapped embedding tables
 bytemuck = { version = "1.24.0", features = ["derive"] }
+dirs = "5.0"        # Fat Binary: cache directory for downloaded kernels
 
 # 平台特定（条件编译，非 feature flag）
 [target.'cfg(target_os = "macos")'.dependencies]
@@ -97,3 +101,17 @@ criterion = "0.5"
 [[bench]]
 name = "attention_bench"
 harness = false
+
+# GPU/CPU comparison tests (REQ-VERIFY-001)
+[[test]]
+name = "flash_attention_comparison"
+path = "tests/gpu_cpu_comparison/flash_attention.rs"
+
+[[test]]
+name = "paged_attention_comparison"
+path = "tests/gpu_cpu_comparison/paged_attention.rs"
+
+# Numerical stability tests (REQ-VERIFY-002)
+[[test]]
+name = "log_softmax_stability"
+path = "tests/numerical/log_softmax_stability.rs"
