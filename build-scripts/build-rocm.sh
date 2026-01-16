@@ -4,7 +4,8 @@
 # Output: One hsaco per architecture containing ALL kernels
 # Requires: ROCm SDK 6.0+ in CI runner
 
-set -euo pipefail
+set -eo pipefail
+# Note: removed -u flag as it may cause issues with unset loop variables
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="$(dirname "$SCRIPT_DIR")"
@@ -27,9 +28,14 @@ if ! command -v hipcc &> /dev/null; then
     exit 1
 fi
 
-hipcc --version | head -1
+hipcc --version 2>&1 | head -1 || true
 
+echo "Creating output directory: $OUTPUT_DIR"
 mkdir -p "$OUTPUT_DIR"
+echo "Output directory created"
+
+echo "Source directory: $SRC_DIR"
+ls -la "$SRC_DIR" || echo "Cannot list source directory"
 
 # Collect all source files
 SRC_FILES=""
