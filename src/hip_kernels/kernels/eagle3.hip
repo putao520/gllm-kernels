@@ -8,6 +8,7 @@
 
 #include <hip/hip_runtime.h>
 #include <hip/hip_fp16.h>
+#include <cfloat>  // for FLT_MAX
 #include <float.h>
 #include <math.h>
 

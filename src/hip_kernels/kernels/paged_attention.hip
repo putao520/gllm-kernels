@@ -2,6 +2,7 @@
 // Implements online softmax accumulation with paged KV cache indexing.
 
 #include <hip/hip_fp16.h>
+#include <cfloat>  // for FLT_MAX
 #include <hip/hip_runtime.h>
 #include <float.h>
 #include <math.h>
