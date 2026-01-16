@@ -13,15 +13,18 @@ OUTPUT_DIR="${PROJECT_ROOT}/kernels/rocm"
 SRC_DIR="${PROJECT_ROOT}/src/hip_kernels/kernels"
 TMP_DIR="${PROJECT_ROOT}/build-tmp/rocm"
 
-# Target architectures (latest 3 generations)
-ROCM_ARCHS="gfx90a gfx1100 gfx1201"
+# Target architectures (latest 3 supported generations in ROCm 6.1)
+# gfx90a: MI200 series (Instinct)
+# gfx942: MI300 series (Instinct)
+# gfx1100: RDNA3 (Navi 31)
+ROCM_ARCHS="gfx90a gfx942 gfx1100"
 
 # All ROCm kernels to include in each hsaco
 KERNELS="chunked_prefill eagle3 embedding_ops evic_press flash_attention flash_tree_attn int2_quantizer medusa paged_attention prompt_cache spec_ee"
 
 echo "=== ROCm Fat Binary Build (Single-File Library) ==="
 echo "Output: $OUTPUT_DIR"
-echo "Architectures: gfx90a (MI200), gfx1100 (RDNA3), gfx1201 (RDNA4)"
+echo "Architectures: gfx90a (MI200), gfx942 (MI300), gfx1100 (RDNA3)"
 
 # Check hipcc
 if ! command -v hipcc &> /dev/null; then
