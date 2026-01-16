@@ -18,7 +18,7 @@ jobs:
   build-cuda:
     name: Build CUDA Kernels
     runs-on: ubuntu-latest
-    container: nvidia/cuda:12.4-devel-ubuntu22.04
+    container: nvidia/cuda:12.4.0-devel-ubuntu22.04
 
     steps:
       - uses: actions/checkout@v4
