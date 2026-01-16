@@ -1,0 +1,204 @@
+name: Build Fat Binary Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Version tag (e.g., v0.2.0)'
+        required: false
+        default: 'dev'
+
+jobs:
+  # ========================================
+  # CUDA Kernels (Latest 3 architectures + PTX)
+  # ========================================
+  build-cuda:
+    name: Build CUDA Kernels
+    runs-on: ubuntu-latest
+    container: nvidia/cuda:12.4-devel-ubuntu22.04
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build CUDA kernels
+        run: |
+          chmod +x build-scripts/build-cuda.sh
+          ./build-scripts/build-cuda.sh
+
+      - name: List built kernels
+        run: |
+          echo "=== Built CUDA Kernels ==="
+          find kernels/cuda -type f \( -name "*.cubin" -o -name "*.ptx" \) -exec ls -lh {} \;
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: cuda-kernels
+          path: kernels/cuda/
+
+  # ========================================
+  # ROCm Kernels (Latest 3 architectures)
+  # ========================================
+  build-rocm:
+    name: Build ROCm Kernels
+    runs-on: ubuntu-latest
+    container: rocm/dev-ubuntu-22.04:6.1
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build ROCm kernels
+        run: |
+          chmod +x build-scripts/build-rocm.sh
+          ./build-scripts/build-rocm.sh
+
+      - name: List built kernels
+        run: |
+          echo "=== Built ROCm Kernels ==="
+          find kernels/rocm -type f -name "*.hsaco" -exec ls -lh {} \;
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: rocm-kernels
+          path: kernels/rocm/
+
+  # ========================================
+  # Metal Kernels (Universal M1/M2/M3/M4)
+  # ========================================
+  build-metal:
+    name: Build Metal Kernels
+    runs-on: macos-14  # Apple Silicon runner
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build Metal kernels
+        run: |
+          chmod +x build-scripts/build-metal.sh
+          ./build-scripts/build-metal.sh
+
+      - name: List built kernels
+        run: |
+          echo "=== Built Metal Kernels ==="
+          find kernels/metal -type f -name "*.metallib" -exec ls -lh {} \;
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: metal-kernels
+          path: kernels/metal/
+
+  # ========================================
+  # SPIR-V Kernels (WebGPU/Vulkan fallback)
+  # ========================================
+  build-spirv:
+    name: Build SPIR-V Kernels
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust and naga-cli
+        run: |
+          curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
+          source $HOME/.cargo/env
+          cargo install naga-cli
+
+      - name: Build SPIR-V kernels
+        run: |
+          chmod +x build-scripts/build-spirv.sh
+          ./build-scripts/build-spirv.sh
+
+      - name: List built kernels
+        run: |
+          echo "=== Built SPIR-V Kernels ==="
+          find kernels/spirv -type f -name "*.spv" -exec ls -lh {} \; || true
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: spirv-kernels
+          path: kernels/spirv/
+          if-no-files-found: ignore
+
+  # ========================================
+  # Package and Release Fat Binary
+  # ========================================
+  package-release:
+    name: Package Fat Binary Release
+    needs: [build-cuda, build-rocm, build-metal, build-spirv]
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download all kernel artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: kernels/
+
+      - name: Reorganize kernel directories
+        run: |
+          # Move from artifact structure to expected structure
+          mkdir -p kernels-final
+          mv kernels/cuda-kernels/* kernels-final/cuda/ 2>/dev/null || mkdir -p kernels-final/cuda
+          mv kernels/rocm-kernels/* kernels-final/rocm/ 2>/dev/null || mkdir -p kernels-final/rocm
+          mv kernels/metal-kernels/* kernels-final/metal/ 2>/dev/null || mkdir -p kernels-final/metal
+          mv kernels/spirv-kernels/* kernels-final/spirv/ 2>/dev/null || mkdir -p kernels-final/spirv
+          rm -rf kernels
+          mv kernels-final kernels
+
+      - name: Package Fat Binary
+        run: |
+          chmod +x build-scripts/package-fatbin.sh
+          VERSION="${{ github.ref_name }}"
+          [[ "$VERSION" == "refs/heads/"* ]] && VERSION="${{ github.event.inputs.version || 'dev' }}"
+          ./build-scripts/package-fatbin.sh "$VERSION"
+
+      - name: Upload packaged Fat Binary
+        uses: actions/upload-artifact@v4
+        with:
+          name: gllm-kernels-fatbin
+          path: gllm-kernels-fatbin-*.tar.gz
+
+      - name: Create GitHub Release
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            gllm-kernels-fatbin-${{ github.ref_name }}.tar.gz
+          body: |
+            ## gllm-kernels ${{ github.ref_name }} - Fat Binary Release
+
+            Pre-compiled GPU kernels for all supported platforms.
+            **Users only need GPU drivers installed, no SDK required.**
+
+            ### Included Architectures
+
+            | Platform | Architectures | Fallback |
+            |----------|---------------|----------|
+            | **NVIDIA CUDA** | sm_86 (Ampere), sm_89 (Ada), sm_90 (Hopper) | PTX |
+            | **AMD ROCm** | gfx90a (MI200), gfx1100 (RDNA3), gfx1201 (RDNA4) | - |
+            | **Apple Metal** | Universal (M1/M2/M3/M4) | - |
+            | **SPIR-V** | WebGPU/Vulkan fallback | - |
+
+            ### Installation
+
+            The pre-compiled kernels are embedded in the crate. Just add to your `Cargo.toml`:
+
+            ```toml
+            [dependencies]
+            gllm-kernels = "${{ github.ref_name }}"
+            ```
+
+            ### Manual Download (Optional)
+
+            ```bash
+            # Download and extract to cache directory
+            curl -L -o kernels.tar.gz \
+              https://github.com/${{ github.repository }}/releases/download/${{ github.ref_name }}/gllm-kernels-fatbin-${{ github.ref_name }}.tar.gz
+            mkdir -p ~/.cache/gllm-kernels
+            tar xzf kernels.tar.gz -C ~/.cache/gllm-kernels
+            ```
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
