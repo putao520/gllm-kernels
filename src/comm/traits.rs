@@ -1,8 +1,10 @@
-//! Communication traits for distributed computation.
+//! Communication traits for distributed inference.
+//!
+//! Zero-cost abstraction: uses raw slices + shape arrays, no wrapper types.
 
 use std::fmt;
 
-use burn::tensor::TensorData;
+use crate::kernel_dispatcher::KernelFloat;
 
 /// Communication error types.
 #[derive(Debug)]
@@ -40,6 +42,8 @@ impl std::error::Error for CommError {}
 pub type CommResult<T> = Result<T, CommError>;
 
 /// Communicator trait for ring communication pattern.
+///
+/// Zero-cost design: operates directly on raw slices with shape metadata.
 pub trait Communicator: Send + Sync {
     /// Get the rank of this communicator.
     fn rank(&self) -> usize;
@@ -47,15 +51,51 @@ pub trait Communicator: Send + Sync {
     /// Get the total number of participants.
     fn world_size(&self) -> usize;
 
-    /// Send data to the next rank in the ring.
-    fn send(&self, data: &TensorData) -> CommResult<()>;
+    /// Send tensor data to the next rank in the ring.
+    ///
+    /// # Arguments
+    /// * `data` - Raw tensor data as bytes
+    /// * `shape` - Tensor shape
+    /// * `dtype` - Data type identifier (from KernelFloat::TYPE_ID)
+    fn send_raw(&self, data: &[u8], shape: &[usize], dtype: u8) -> CommResult<()>;
 
-    /// Receive data from the previous rank in the ring.
-    fn recv(&self) -> CommResult<TensorData>;
+    /// Receive tensor data from the previous rank in the ring.
+    ///
+    /// # Returns
+    /// Tuple of (data bytes, shape, dtype)
+    fn recv_raw(&self) -> CommResult<(Vec<u8>, Vec<usize>, u8)>;
+
+    /// Send typed tensor data (zero-cost generic dispatch).
+    #[inline(always)]
+    fn send<T: KernelFloat>(&self, data: &[T], shape: &[usize]) -> CommResult<()> {
+        let bytes = unsafe {
+            std::slice::from_raw_parts(data.as_ptr() as *const u8, data.len() * std::mem::size_of::<T>())
+        };
+        self.send_raw(bytes, shape, T::TYPE_ID.as_u8())
+    }
+
+    /// Receive typed tensor data (zero-cost generic dispatch).
+    #[inline(always)]
+    fn recv<T: KernelFloat>(&self) -> CommResult<(Vec<T>, Vec<usize>)> {
+        let (bytes, shape, dtype) = self.recv_raw()?;
+        if dtype != T::TYPE_ID.as_u8() {
+            return Err(CommError::Serialization(format!(
+                "dtype mismatch: expected {}, got {}",
+                T::TYPE_ID.as_u8(),
+                dtype
+            )));
+        }
+        let len = bytes.len() / std::mem::size_of::<T>();
+        let mut data = vec![T::zero(); len];
+        unsafe {
+            std::ptr::copy_nonoverlapping(bytes.as_ptr(), data.as_mut_ptr() as *mut u8, bytes.len());
+        }
+        Ok((data, shape))
+    }
 
     /// Send to next and receive from previous simultaneously.
-    fn send_recv(&self, send_data: &TensorData) -> CommResult<TensorData> {
-        self.send(send_data)?;
+    fn send_recv<T: KernelFloat>(&self, send_data: &[T], shape: &[usize]) -> CommResult<(Vec<T>, Vec<usize>)> {
+        self.send(send_data, shape)?;
         self.recv()
     }
 

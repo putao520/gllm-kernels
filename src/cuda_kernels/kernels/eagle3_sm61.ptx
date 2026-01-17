@@ -1,0 +1,14 @@
+//
+// Generated placeholder PTX for SM 6.1
+// TODO: Replace with actual compiled kernel
+//
+.version 6.0
+.target sm_61
+.address_size 64
+
+.visible .entry placeholder_kernel(
+    .param .u64 placeholder_param
+)
+{
+    ret;
+}

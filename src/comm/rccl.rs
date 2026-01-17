@@ -5,13 +5,14 @@
 //! librccl.so at runtime, requiring only the AMD GPU driver.
 //!
 //! RCCL API is intentionally compatible with NCCL for easy porting.
+//!
+//! Zero-cost abstraction: raw bytes + shape, no wrapper types.
 
 use std::ffi::{c_char, c_int, c_void};
 use std::fmt;
 use std::ptr;
 use std::sync::OnceLock;
 
-use burn::tensor::TensorData;
 use libloading::Library;
 
 use super::traits::{CommError, CommResult, Communicator};
@@ -671,31 +672,78 @@ impl Communicator for RcclCommunicator {
         self.world_size
     }
 
-    fn send(&self, data: &TensorData) -> CommResult<()> {
-        let floats: Vec<f32> = data
-            .to_vec::<f32>()
-            .map_err(|e| CommError::Serialization(format!("{:?}", e)))?;
-        self.rccl_send(&floats)
-            .map_err(|e| CommError::SendFailed(e.to_string()))
-    }
+    fn send_raw(&self, data: &[u8], shape: &[usize], dtype: u8) -> CommResult<()> {
+        // Protocol: send metadata first, then data
+        // Metadata: [ndim, shape..., dtype, data_len] as f32
 
-    fn recv(&self) -> CommResult<TensorData> {
-        Err(CommError::RecvFailed(
-            "Use recv_with_size for RCCL".into(),
-        ))
-    }
+        let ndim = shape.len();
+        let metadata_f32_len = 2 + ndim + 1; // ndim + shape + dtype + data_len
+        let mut metadata = Vec::with_capacity(metadata_f32_len);
 
-    fn send_recv(&self, data: &TensorData) -> CommResult<TensorData> {
-        let floats: Vec<f32> = data
-            .to_vec::<f32>()
-            .map_err(|e| CommError::Serialization(format!("{:?}", e)))?;
-        let shape = data.shape.clone();
+        metadata.push(ndim as f32);
+        for &dim in shape {
+            metadata.push(dim as f32);
+        }
+        metadata.push(dtype as f32);
+        metadata.push(data.len() as f32);
 
-        let recv_floats = self
-            .rccl_send_recv(&floats)
+        // Send metadata
+        self.rccl_send(&metadata)
             .map_err(|e| CommError::SendFailed(e.to_string()))?;
 
-        Ok(TensorData::new(recv_floats, shape))
+        // Convert bytes to f32 for RCCL transfer
+        // Pad to f32 alignment
+        let f32_len = (data.len() + 3) / 4;
+        let mut data_f32 = vec![0.0f32; f32_len];
+        unsafe {
+            std::ptr::copy_nonoverlapping(
+                data.as_ptr(),
+                data_f32.as_mut_ptr() as *mut u8,
+                data.len(),
+            );
+        }
+
+        // Send data
+        self.rccl_send(&data_f32)
+            .map_err(|e| CommError::SendFailed(e.to_string()))?;
+
+        Ok(())
+    }
+
+    fn recv_raw(&self) -> CommResult<(Vec<u8>, Vec<usize>, u8)> {
+        // First, receive metadata (ndim)
+        let ndim_vec = self.rccl_recv(1)
+            .map_err(|e| CommError::RecvFailed(e.to_string()))?;
+        let ndim = ndim_vec[0] as usize;
+
+        // Receive rest of metadata: shape + dtype + data_len
+        let rest_len = ndim + 2;
+        let rest = self.rccl_recv(rest_len)
+            .map_err(|e| CommError::RecvFailed(e.to_string()))?;
+
+        let mut shape = Vec::with_capacity(ndim);
+        for i in 0..ndim {
+            shape.push(rest[i] as usize);
+        }
+        let dtype = rest[ndim] as u8;
+        let data_len = rest[ndim + 1] as usize;
+
+        // Receive data
+        let f32_len = (data_len + 3) / 4;
+        let data_f32 = self.rccl_recv(f32_len)
+            .map_err(|e| CommError::RecvFailed(e.to_string()))?;
+
+        // Convert back to bytes
+        let mut data = vec![0u8; data_len];
+        unsafe {
+            std::ptr::copy_nonoverlapping(
+                data_f32.as_ptr() as *const u8,
+                data.as_mut_ptr(),
+                data_len,
+            );
+        }
+
+        Ok((data, shape, dtype))
     }
 
     fn barrier(&self) -> CommResult<()> {

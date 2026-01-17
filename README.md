@@ -123,12 +123,6 @@ nvcc -ptx -arch=sm_XX tiled_attention.cu -o tiled_attention.ptx
 
 Replace `sm_XX` with your GPU's compute capability (e.g., `sm_61` for GTX 1060, `sm_86` for RTX 3090).
 
-Or set the environment variable to use a custom PTX:
-
-```bash
-export GLLM_FLASH_ATTN_PTX=/path/to/your/compiled.ptx
-```
-
 ## License
 
 Apache-2.0

@@ -1,18 +1,10 @@
 //! Log-space softmax computation for numerical stability.
-
-use burn::tensor::activation::softmax as burn_softmax;
-use burn::tensor::backend::Backend;
-use burn::tensor::Tensor;
-#[cfg(feature = "softmax-kernel")]
-use burn::tensor::TensorData;
-#[cfg(feature = "softmax-kernel")]
-use crate::cuda_kernels::OnlineSoftmaxKernel;
-#[cfg(feature = "softmax-kernel")]
-use cudarc::driver::CudaContext;
-#[cfg(feature = "softmax-kernel")]
-use std::any::{Any, TypeId};
-#[cfg(feature = "softmax-kernel")]
-use std::sync::Arc;
+//!
+//! This module provides pure-Rust implementations for log-space softmax operations,
+//! optimized for numerical stability with 2M+ context lengths.
+//!
+//! For GPU-accelerated softmax, use `KernelDispatcher::softmax()` which provides
+//! zero-cost abstraction over CUDA/ROCm/Metal/WGPU backends.
 
 /// Compute log(exp(a) + exp(b)) in a numerically stable way.
 #[inline]
@@ -185,148 +177,8 @@ impl LogSpaceSoftmax {
     }
 }
 
-/// Tensor-based log-space operations for GPU computation.
-pub struct TensorLogOps;
-
-impl TensorLogOps {
-    /// Compute log(sum(exp(tensor))) along a dimension.
-    pub fn log_sum_exp<B: Backend, const D: usize>(tensor: Tensor<B, D>, dim: usize) -> Tensor<B, D> {
-        let max = tensor.clone().max_dim(dim);
-        let shifted = tensor - max.clone();
-        let sum_exp = shifted.exp().sum_dim(dim);
-        max + sum_exp.log()
-    }
-
-    /// Compute stable softmax in log-space.
-    pub fn log_softmax<B: Backend, const D: usize>(tensor: Tensor<B, D>, dim: usize) -> Tensor<B, D> {
-        let log_sum = Self::log_sum_exp(tensor.clone(), dim);
-        tensor - log_sum
-    }
-
-    /// Extract maximum and log-sum-exp from a tensor for online softmax.
-    pub fn extract_softmax_stats<B: Backend>(
-        tensor: Tensor<B, 4>,
-        dim: usize,
-    ) -> (Tensor<B, 4>, Tensor<B, 4>) {
-        let max = tensor.clone().max_dim(dim);
-        let shifted = tensor - max.clone();
-        let sum_exp = shifted.exp().sum_dim(dim);
-        let log_sum = sum_exp.log();
-        (max, log_sum)
-    }
-}
-
-/// Softmax wrapper that can use CUDA kernels when available.
-#[derive(Debug, Default, Clone)]
-pub struct OnlineSoftmax;
-
-impl OnlineSoftmax {
-    /// Compute softmax along the last dimension.
-    pub fn forward<B: Backend + 'static>(&self, logits: Tensor<B, 3>) -> Tensor<B, 3>
-    where
-        B::FloatElem: 'static,
-    {
-        #[cfg(feature = "softmax-kernel")]
-        if is_cuda_backend::<B>() {
-            if let Some(output) = self.try_softmax_kernel(&logits) {
-                return output;
-            }
-        }
-
-        burn_softmax(logits, 2)
-    }
-
-    #[cfg(feature = "softmax-kernel")]
-    fn try_softmax_kernel<B: Backend + 'static>(&self, logits: &Tensor<B, 3>) -> Option<Tensor<B, 3>>
-    where
-        B::FloatElem: 'static,
-    {
-        let dims = logits.dims();
-        if dims[1] != dims[2] {
-            log::warn!("CUDA softmax fallback: logits must be square on last dims");
-            return None;
-        }
-        let [batch_size, seq_len, _] = dims;
-        if batch_size == 0 || seq_len == 0 {
-            log::warn!("CUDA softmax fallback: empty logits");
-            return None;
-        }
-
-        let device = logits.device();
-        let cuda_index = {
-            #[cfg(feature = "cuda")]
-            {
-                let device_any = &device as &dyn Any;
-                if let Some(cuda_device) = device_any.downcast_ref::<burn_cuda::CudaDevice>() {
-                    cuda_device.index
-                } else {
-                    0
-                }
-            }
-            #[cfg(not(feature = "cuda"))]
-            {
-                0
-            }
-        };
-
-        let cuda_ctx = match CudaContext::new(cuda_index) {
-            Ok(ctx) => Arc::new(ctx),
-            Err(err) => {
-                log::warn!("CUDA softmax fallback: device init failed: {err}");
-                return None;
-            }
-        };
-        let stream = cuda_ctx.default_stream();
-        let kernel = match OnlineSoftmaxKernel::new(&cuda_ctx) {
-            Ok(kernel) => kernel,
-            Err(err) => {
-                log::warn!("CUDA softmax fallback: kernel load failed: {err}");
-                return None;
-            }
-        };
-
-        let elem_type = TypeId::of::<B::FloatElem>();
-        if elem_type != TypeId::of::<f32>() {
-            log::warn!("CUDA softmax fallback: unsupported dtype");
-            return None;
-        }
-
-        let logits_host = logits.clone().into_data().into_vec::<f32>().ok()?;
-        let logits_dev = stream.clone_htod(&logits_host).ok()?;
-
-        let output = kernel
-            .forward(&stream, &logits_dev, batch_size, 1, seq_len)
-            .ok()?;
-
-        let out_host = stream.clone_dtoh(&output.output).ok()?;
-        Some(Tensor::<B, 3>::from_data(
-            TensorData::new(out_host, dims),
-            &device,
-        ))
-    }
-}
-
-#[cfg(feature = "softmax-kernel")]
-fn is_cuda_backend<B: Backend + 'static>() -> bool {
-    #[cfg(feature = "cuda")]
-    {
-        let type_id = TypeId::of::<B>();
-        if type_id == TypeId::of::<burn_cuda::Cuda>() {
-            return true;
-        }
-        #[cfg(feature = "fusion")]
-        {
-            if type_id == TypeId::of::<burn_fusion::Fusion<burn_cuda::Cuda>>() {
-                return true;
-            }
-        }
-        false
-    }
-    #[cfg(not(feature = "cuda"))]
-    {
-        false
-    }
-}
+// NOTE: TensorLogOps and OnlineSoftmax (Burn-based wrappers) have been removed.
+// Use KernelDispatcher::softmax() for GPU-accelerated softmax computation.
 
 #[cfg(test)]
 mod tests {

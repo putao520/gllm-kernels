@@ -23,6 +23,16 @@ pub mod online_softmax;
 pub mod paged_attn;
 pub mod selective_scan;
 
+// Inference optimization kernels (REQ-OP-008 ~ REQ-OP-015)
+pub mod eagle3;
+pub mod spec_ee;
+pub mod flash_tree_attn;
+pub mod int2_quantizer;
+pub mod evic_press;
+pub mod medusa;
+pub mod prompt_cache;
+pub mod chunked_prefill;
+
 pub use ptx_loader::{PtxCollection, PtxLoadError, detect_sm_version, find_best_sm_match};
 
 pub use embedding_ops::{EmbeddingOpsError as CudaEmbeddingOpsError, EmbeddingOpsKernel as CudaEmbeddingOpsKernel};
@@ -31,3 +41,13 @@ pub use fused_attention::{FusedQKVAttentionError, FusedQKVAttentionKernel};
 pub use online_softmax::{OnlineSoftmaxError, OnlineSoftmaxKernel, OnlineSoftmaxOutput};
 pub use paged_attn::{PagedAttentionError, PagedAttentionKernel};
 pub use selective_scan::{SelectiveScanError, SelectiveScanKernel};
+
+// Inference optimization kernels exports
+pub use eagle3::{Eagle3Error, Eagle3Kernel, Eagle3CudaConfig as Eagle3Config};
+pub use spec_ee::{SpecEEError, SpecEEKernel, SpecEECudaConfig as SpecEEConfig};
+pub use flash_tree_attn::{FlashTreeAttnError, FlashTreeAttnKernel, FlashTreeAttnCudaConfig as FlashTreeAttnConfig};
+pub use int2_quantizer::{Int2QuantizerError, Int2QuantizerKernel, Int2QuantizerCudaConfig as Int2QuantizerConfig};
+pub use evic_press::{EvicPressError, EvicPressKernel, EvicPressCudaConfig as EvicPressConfig, CacheZone};
+pub use medusa::{MedusaError, MedusaKernel, MedusaCudaConfig as MedusaConfig};
+pub use prompt_cache::{PromptCacheError, PromptCacheKernel, PromptCacheCudaConfig as PromptCacheConfig};
+pub use chunked_prefill::{ChunkedPrefillError, ChunkedPrefillKernel, ChunkedPrefillCudaConfig as ChunkedPrefillConfig};

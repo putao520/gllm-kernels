@@ -11,8 +11,7 @@
 
 use std::marker::PhantomData;
 
-use burn::tensor::backend::Backend;
-use burn::tensor::{Tensor, TensorData};
+use crate::kernel_dispatcher::KernelFloat;
 
 /// INT2 quantization configuration.
 #[derive(Debug, Clone, Copy)]
@@ -26,6 +25,7 @@ pub struct Int2QuantConfig {
 }
 
 impl Default for Int2QuantConfig {
+    #[inline(always)]
     fn default() -> Self {
         Self {
             group_size: 128,
@@ -37,6 +37,7 @@ impl Default for Int2QuantConfig {
 
 impl Int2QuantConfig {
     /// Validate configuration.
+    #[inline(always)]
     pub fn validate(&self) -> Result<(), &'static str> {
         if self.group_size == 0 {
             return Err("group_size must be > 0");
@@ -59,6 +60,7 @@ pub struct Int2Quantizer {
 
 impl Int2Quantizer {
     /// Create a symmetric INT2 quantizer from max absolute value.
+    #[inline(always)]
     pub fn from_absmax(absmax: f32) -> Self {
         // For symmetric INT2: [-1.5, -0.5, 0.5, 1.5] * scale
         // Range covers [-1.5*scale, 1.5*scale]
@@ -70,13 +72,14 @@ impl Int2Quantizer {
     }
 
     /// Create a quantizer from data statistics.
+    #[inline(always)]
     pub fn from_data(data: &[f32]) -> Self {
         let absmax = data.iter().map(|&x| x.abs()).fold(0.0f32, f32::max);
         Self::from_absmax(absmax)
     }
 
     /// Quantize a single f32 value to INT2 (0-3).
-    #[inline]
+    #[inline(always)]
     pub fn quantize(&self, value: f32) -> u8 {
         // Map value to [-1.5, 1.5] range then to [0, 3]
         let normalized = value / self.scale;
@@ -88,7 +91,7 @@ impl Int2Quantizer {
     }
 
     /// Dequantize an INT2 value (0-3) to f32.
-    #[inline]
+    #[inline(always)]
     pub fn dequantize(&self, value: u8) -> f32 {
         // Map [0, 1, 2, 3] to [-1.5, -0.5, 0.5, 1.5] * scale
         let level = match value & 0x03 {
@@ -102,11 +105,13 @@ impl Int2Quantizer {
     }
 
     /// Quantize a slice of f32 values to INT2.
+    #[inline(always)]
     pub fn quantize_slice(&self, input: &[f32]) -> Vec<u8> {
         input.iter().map(|&v| self.quantize(v)).collect()
     }
 
     /// Dequantize a slice of INT2 values to f32.
+    #[inline(always)]
     pub fn dequantize_slice(&self, input: &[u8]) -> Vec<f32> {
         input.iter().map(|&v| self.dequantize(v)).collect()
     }
@@ -127,6 +132,7 @@ pub struct Int2PackedBuffer {
 
 impl Int2PackedBuffer {
     /// Create an empty buffer.
+    #[inline(always)]
     pub fn new(group_size: usize) -> Self {
         Self {
             data: Vec::new(),
@@ -137,6 +143,7 @@ impl Int2PackedBuffer {
     }
 
     /// Create from f32 data with group-wise quantization.
+    #[inline(always)]
     pub fn from_f32(input: &[f32], group_size: usize) -> Self {
         let num_elements = input.len();
         let num_groups = (num_elements + group_size - 1) / group_size;
@@ -176,6 +183,7 @@ impl Int2PackedBuffer {
     }
 
     /// Dequantize to f32.
+    #[inline(always)]
     pub fn to_f32(&self) -> Vec<f32> {
         let mut result = Vec::with_capacity(self.num_elements);
 
@@ -198,21 +206,25 @@ impl Int2PackedBuffer {
     }
 
     /// Get number of elements.
+    #[inline(always)]
     pub fn len(&self) -> usize {
         self.num_elements
     }
 
     /// Check if empty.
+    #[inline(always)]
     pub fn is_empty(&self) -> bool {
         self.num_elements == 0
     }
 
     /// Get packed data size in bytes.
+    #[inline(always)]
     pub fn packed_size(&self) -> usize {
         self.data.len()
     }
 
     /// Get compression ratio vs FP32.
+    #[inline(always)]
     pub fn compression_ratio_f32(&self) -> f32 {
         if self.num_elements == 0 {
             return 1.0;
@@ -223,6 +235,7 @@ impl Int2PackedBuffer {
     }
 
     /// Get compression ratio vs FP16.
+    #[inline(always)]
     pub fn compression_ratio_f16(&self) -> f32 {
         if self.num_elements == 0 {
             return 1.0;
@@ -233,29 +246,32 @@ impl Int2PackedBuffer {
     }
 
     /// Access raw packed data.
+    #[inline(always)]
     pub fn data(&self) -> &[u8] {
         &self.data
     }
 
     /// Access scale factors.
+    #[inline(always)]
     pub fn scales(&self) -> &[f32] {
         &self.scales
     }
 
     /// Get group size.
+    #[inline(always)]
     pub fn group_size(&self) -> usize {
         self.group_size
     }
 }
 
 /// Pack 4 INT2 values into a single byte.
-#[inline]
+#[inline(always)]
 pub fn pack_4_int2(a: u8, b: u8, c: u8, d: u8) -> u8 {
     ((a & 0x03) << 6) | ((b & 0x03) << 4) | ((c & 0x03) << 2) | (d & 0x03)
 }
 
 /// Unpack a byte into 4 INT2 values.
-#[inline]
+#[inline(always)]
 pub fn unpack_4_int2(byte: u8) -> (u8, u8, u8, u8) {
     (
         (byte >> 6) & 0x03,
@@ -265,90 +281,81 @@ pub fn unpack_4_int2(byte: u8) -> (u8, u8, u8, u8) {
     )
 }
 
-/// INT2 tensor wrapper for burn integration.
+/// INT2 tensor wrapper for raw slice integration.
 #[derive(Debug, Clone)]
-pub struct Int2Tensor<B: Backend> {
+pub struct Int2Tensor<T: KernelFloat> {
     /// Packed INT2 data.
     packed: Int2PackedBuffer,
     /// Original tensor shape.
-    shape: Vec<usize>,
-    /// Device reference.
-    device: B::Device,
+    shape: [usize; 3],
     /// Phantom marker.
-    _marker: PhantomData<B>,
+    _marker: PhantomData<T>,
 }
 
-impl<B: Backend> Int2Tensor<B> {
-    /// Create from a burn tensor.
-    pub fn from_tensor(tensor: Tensor<B, 3>, group_size: usize) -> Result<Self, &'static str> {
-        let shape: Vec<usize> = tensor.dims().to_vec();
-        let device = tensor.device();
+impl<T: KernelFloat> Int2Tensor<T> {
+    /// Create from a raw slice.
+    #[inline(always)]
+    pub fn from_slice(
+        data: &[T],
+        shape: [usize; 3],
+        group_size: usize,
+    ) -> Result<Self, &'static str> {
+        if group_size == 0 {
+            return Err("group_size must be > 0");
+        }
+        let expected_len = shape[0]
+            .checked_mul(shape[1])
+            .and_then(|v| v.checked_mul(shape[2]))
+            .ok_or("shape overflow")?;
+        if expected_len != data.len() {
+            return Err("data length does not match shape");
+        }
 
-        let data = tensor
-            .into_data()
-            .into_vec::<f32>()
-            .map_err(|_| "failed to convert tensor to f32")?;
+        let mut f32_data = Vec::with_capacity(data.len());
+        for &value in data {
+            f32_data.push(value.to_f32());
+        }
 
-        let packed = Int2PackedBuffer::from_f32(&data, group_size);
+        let packed = Int2PackedBuffer::from_f32(&f32_data, group_size);
 
         Ok(Self {
             packed,
             shape,
-            device,
             _marker: PhantomData,
         })
     }
 
-    /// Convert back to burn tensor.
-    pub fn to_tensor(&self) -> Result<Tensor<B, 3>, &'static str> {
-        if self.shape.len() != 3 {
-            return Err("expected 3D shape");
-        }
-
-        let data = self.packed.to_f32();
-        let shape = [self.shape[0], self.shape[1], self.shape[2]];
-
-        Ok(Tensor::from_data(
-            TensorData::new(data, shape),
-            &self.device,
-        ))
+    /// Dequantize back to a raw vector.
+    #[inline(always)]
+    pub fn to_vec(&self) -> Vec<T> {
+        self.packed
+            .to_f32()
+            .into_iter()
+            .map(T::from_f32)
+            .collect()
     }
 
     /// Get original shape.
-    pub fn shape(&self) -> &[usize] {
+    #[inline(always)]
+    pub fn shape(&self) -> &[usize; 3] {
         &self.shape
     }
 
     /// Get compression ratio vs FP16.
+    #[inline(always)]
     pub fn compression_ratio(&self) -> f32 {
         self.packed.compression_ratio_f16()
     }
 
     /// Get packed buffer reference.
+    #[inline(always)]
     pub fn packed(&self) -> &Int2PackedBuffer {
         &self.packed
     }
 }
 
-/// Batch INT2 quantization for multiple tensors.
-pub fn batch_quantize_int2<B: Backend>(
-    tensors: &[Tensor<B, 3>],
-    group_size: usize,
-) -> Result<Vec<Int2Tensor<B>>, &'static str> {
-    tensors
-        .iter()
-        .map(|t| Int2Tensor::from_tensor(t.clone(), group_size))
-        .collect()
-}
-
-/// Batch INT2 dequantization.
-pub fn batch_dequantize_int2<B: Backend>(
-    packed: &[Int2Tensor<B>],
-) -> Result<Vec<Tensor<B, 3>>, &'static str> {
-    packed.iter().map(|p| p.to_tensor()).collect()
-}
-
 /// Calculate mean squared error between original and quantized.
+#[inline(always)]
 pub fn quantization_mse(original: &[f32], quantized: &[f32]) -> f32 {
     if original.len() != quantized.len() || original.is_empty() {
         return 0.0;
@@ -364,6 +371,7 @@ pub fn quantization_mse(original: &[f32], quantized: &[f32]) -> f32 {
 }
 
 /// Calculate signal-to-quantization-noise ratio (SQNR) in dB.
+#[inline(always)]
 pub fn quantization_sqnr(original: &[f32], quantized: &[f32]) -> f32 {
     if original.len() != quantized.len() || original.is_empty() {
         return 0.0;
@@ -424,6 +432,30 @@ mod tests {
         // Check compression ratio (should be ~8x vs FP16)
         let ratio = packed.compression_ratio_f16();
         assert!(ratio > 4.0); // At least 4x compression
+    }
+
+    #[test]
+    fn test_int2_tensor_roundtrip() {
+        let shape = [2, 3, 4];
+        let data: Vec<f32> = (0..24).map(|i| (i as f32 - 12.0) / 10.0).collect();
+
+        let tensor = Int2Tensor::<f32>::from_slice(&data, shape, 4).unwrap();
+        assert_eq!(tensor.shape(), &shape);
+
+        let output = tensor.to_vec();
+        assert_eq!(output.len(), data.len());
+
+        let mse = quantization_mse(&data, &output);
+        assert!(mse.is_finite());
+    }
+
+    #[test]
+    fn test_int2_tensor_validation() {
+        let shape = [1, 2, 3];
+        let data = vec![0.0f32; 5];
+
+        assert!(Int2Tensor::<f32>::from_slice(&data, shape, 4).is_err());
+        assert!(Int2Tensor::<f32>::from_slice(&[], [0, 0, 0], 0).is_err());
     }
 
     #[test]

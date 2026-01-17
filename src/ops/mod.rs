@@ -1,16 +1,23 @@
-pub mod flash_attention;
-pub mod flash_attention_v3;
-pub mod fused_attention;
-pub mod kv_compression;
-pub mod mamba;
-pub mod mamba_v3;
-pub mod mla;
-pub mod paged_attention;
-pub mod ring_attention;
-pub mod speculative_decoding;
-pub mod sparse_attention;
+pub(crate) mod math;
+
+// Pure Rust numerical stability modules (no external dependencies)
 pub mod softmax;
 pub mod stable_accumulator;
+
+// Zero-cost NN layer operations (Phase 1 additions)
+pub mod linear;
+pub mod rms_norm;
+pub mod layer_norm;
+pub mod activations;
+
+// RoPE (Rotary Position Embedding) - pure Rust implementation
+pub mod rope;
+
+// Sampling operations - pure Rust implementation
+pub mod sampling;
+
+// MoE (Mixture-of-Experts) routing - pure Rust implementation
+pub mod moe_routing;
 
 // Engram conditional memory module (O(1) static knowledge lookup)
 pub mod engram;
@@ -21,6 +28,7 @@ pub mod engram_lookup;
 pub mod embedding;
 
 // 2025-2026 Inference Optimization Modules (REQ-OP-008 to REQ-OP-015)
+// All modules are Burn-free, using KernelFloat trait for zero-cost abstraction
 pub mod eagle3;          // REQ-OP-008: EAGLE-3 Adaptive Draft Length
 pub mod spec_ee;         // REQ-OP-009: SpecEE/LayerSkip Early Exit
 pub mod medusa;          // REQ-OP-013: Assisted Generation (Medusa Heads)
@@ -30,7 +38,10 @@ pub mod prompt_cache;    // REQ-OP-014: Prompt Caching / CacheBlend
 pub mod flash_tree_attn; // REQ-OP-010: DeFT/Talon Flash Tree-attention
 pub mod chunked_prefill; // REQ-OP-015: Chunked Prefill / POD-Attention
 
-pub use ring_attention::{CommBackend, RingAttention, RingAttentionConfig};
+// NOTE: Burn-based attention modules (flash_attention, paged_attention, ring_attention,
+// mamba, mla, etc.) have been removed per ADR-001.
+// Use `KernelDispatcher` for GPU-accelerated attention operations.
+
 pub use engram::{Engram, EngramConfig, fuse_engram_attention, fuse_engram_attention_simd};
 pub use engram_hash::{EngramHasher, EngramHashConfig};
 pub use engram_lookup::{EngramEmbeddingTable, EngramLookupConfig, EngramModule, EngramError};
@@ -80,4 +91,53 @@ pub use chunked_prefill::{
     BatchOutput, ChunkConfig, ChunkedPrefillScheduler, DecodeOutput, DecodeRequest,
     PODAttentionConfig, PrefillChunk, PrefillOutput, PrefillRequest, ScheduledBatch,
     SchedulerStats,
+};
+
+// RoPE exports
+pub use rope::{RoPEConfig, rope_precompute, rope_apply, rope_apply_inplace};
+
+// Sampling exports
+pub use sampling::{
+    SamplingConfig, TopKResult,
+    topk, apply_temperature, softmax_1d, apply_top_p, sample_tokens, argmax,
+};
+
+// MoE Routing exports
+pub use moe_routing::{
+    MoERoutingConfig, MoERoutingResult,
+    moe_route, compute_routing_logits, compute_expert_load, compute_load_balance_loss,
+};
+
+// Linear layer exports
+pub use linear::{
+    linear_forward, linear_forward_transposed, linear_forward_fused, add_bias,
+};
+
+// RMS Norm exports
+pub use rms_norm::{
+    rms_norm_forward, rms_norm_inplace, rms_norm_forward_with_bias, compute_rms,
+};
+
+// Layer Norm exports
+pub use layer_norm::{
+    layer_norm_forward, layer_norm_inplace, layer_norm_no_affine,
+    welford_mean_var, compute_mean, compute_variance,
+};
+
+// Activation function exports
+pub use activations::{
+    // SiLU/Swish
+    silu, silu_inplace, silu_mul_inplace,
+    // GELU
+    gelu, gelu_inplace, gelu_exact, gelu_exact_inplace,
+    // ReLU
+    relu, relu_inplace, leaky_relu, leaky_relu_inplace,
+    // Sigmoid
+    sigmoid, sigmoid_inplace, sigmoid_scalar,
+    // Tanh
+    tanh_activation, tanh_inplace, fast_tanh,
+    // Softplus
+    softplus, softplus_inplace, softplus_scalar,
+    // Element-wise ops
+    mul_inplace, add_inplace,
 };

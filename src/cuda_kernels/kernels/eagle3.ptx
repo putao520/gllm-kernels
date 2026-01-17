@@ -1,0 +1,14 @@
+//
+// Generated placeholder PTX
+// TODO: Replace with actual compiled kernel
+//
+.version 7.0
+.target sm_80
+.address_size 64
+
+.visible .entry placeholder_kernel(
+    .param .u64 placeholder_param
+)
+{
+    ret;
+}

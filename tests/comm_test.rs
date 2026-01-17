@@ -5,7 +5,6 @@ use std::sync::Arc;
 use std::thread;
 use std::time::Duration;
 
-use burn::tensor::TensorData;
 use gllm_kernels::comm::{Communicator, SharedMemoryGroup};
 
 #[test]
@@ -31,10 +30,10 @@ fn test_shared_memory_send_recv_ring() {
         .map(|comm| {
             thread::spawn(move || {
                 let rank = comm.rank();
-                let data = TensorData::new(vec![rank as f32], [1]);
-                let recv = comm.send_recv(&data).expect("send_recv");
-                let values = recv.to_vec::<f32>().expect("recv to vec");
-                (rank, values[0] as usize)
+                let data = vec![rank as f32];
+                let shape = vec![1usize];
+                let (recv_data, _recv_shape) = comm.send_recv(&data, &shape).expect("send_recv");
+                (rank, recv_data[0] as usize)
             })
         })
         .collect();

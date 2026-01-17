@@ -12,7 +12,7 @@
 use std::collections::VecDeque;
 use std::marker::PhantomData;
 
-use burn::tensor::backend::Backend;
+use crate::kernel_dispatcher::KernelFloat;
 
 use super::int2_quantizer::Int2PackedBuffer;
 
@@ -40,6 +40,7 @@ pub struct EvicPressConfig {
 }
 
 impl Default for EvicPressConfig {
+    #[inline(always)]
     fn default() -> Self {
         Self {
             max_cache_size: 4096,
@@ -57,6 +58,7 @@ impl Default for EvicPressConfig {
 
 impl EvicPressConfig {
     /// Validate configuration.
+    #[inline(always)]
     pub fn validate(&self) -> Result<(), &'static str> {
         if self.max_cache_size == 0 {
             return Err("max_cache_size must be > 0");
@@ -83,6 +85,7 @@ impl EvicPressConfig {
     }
 
     /// Cold zone capacity (remaining after hot + warm).
+    #[inline(always)]
     pub fn cold_zone_capacity(&self) -> usize {
         self.max_cache_size
             .saturating_sub(self.hot_zone_size)
@@ -109,6 +112,7 @@ pub struct TokenImportance {
 
 impl TokenImportance {
     /// Create a new token importance entry.
+    #[inline(always)]
     pub fn new(position: usize, is_sink: bool) -> Self {
         Self {
             position,
@@ -121,6 +125,7 @@ impl TokenImportance {
     }
 
     /// Update combined score with config weights.
+    #[inline(always)]
     pub fn update_combined(&mut self, config: &EvicPressConfig) {
         self.combined_score = config.attention_weight * self.attention_score
             + config.semantic_weight * self.semantic_importance;
@@ -142,9 +147,9 @@ pub enum StorageZone {
 
 /// KV entry in the progressive cache.
 #[derive(Debug, Clone)]
-pub enum KVEntry {
+pub enum KVEntry<T: KernelFloat> {
     /// Full precision (FP16/FP32).
-    Full { k: Vec<f32>, v: Vec<f32> },
+    Full { k: Vec<T>, v: Vec<T> },
     /// INT8 quantized.
     Int8 {
         k: Vec<i8>,
@@ -159,17 +164,21 @@ pub enum KVEntry {
     },
 }
 
-impl KVEntry {
+impl<T: KernelFloat> KVEntry<T> {
     /// Get approximate memory size in bytes.
+    #[inline(always)]
     pub fn memory_size(&self) -> usize {
         match self {
-            KVEntry::Full { k, v } => (k.len() + v.len()) * 4,
+            KVEntry::Full { k, v } => (k.len() + v.len()) * std::mem::size_of::<T>(),
             KVEntry::Int8 { k, v, .. } => k.len() + v.len() + 8,
-            KVEntry::Int2 { k, v } => k.packed_size() + v.packed_size() + k.scales().len() * 4 + v.scales().len() * 4,
+            KVEntry::Int2 { k, v } => {
+                k.packed_size() + v.packed_size() + k.scales().len() * 4 + v.scales().len() * 4
+            }
         }
     }
 
     /// Get head dimension (assumes k and v have same dim).
+    #[inline(always)]
     pub fn head_dim(&self) -> usize {
         match self {
             KVEntry::Full { k, .. } => k.len(),
@@ -181,28 +190,34 @@ impl KVEntry {
 
 /// Progressive KV cache with three-zone architecture.
 #[derive(Debug)]
-pub struct ProgressiveKVCache<B: Backend> {
+pub struct ProgressiveKVCache<T: KernelFloat> {
     /// Configuration.
     config: EvicPressConfig,
     /// Hot zone entries (FP16, most recent).
-    hot_zone: VecDeque<(TokenImportance, KVEntry)>,
+    hot_zone: VecDeque<(TokenImportance, KVEntry<T>)>,
     /// Warm zone entries (INT8).
-    warm_zone: VecDeque<(TokenImportance, KVEntry)>,
+    warm_zone: VecDeque<(TokenImportance, KVEntry<T>)>,
     /// Cold zone entries (INT2).
-    cold_zone: VecDeque<(TokenImportance, KVEntry)>,
+    cold_zone: VecDeque<(TokenImportance, KVEntry<T>)>,
     /// Total tokens (including evicted for tracking).
     total_tokens: usize,
-    /// Number of heads.
+    /// Number of heads (used for future multi-head KV operations).
+    #[allow(dead_code)]
     num_heads: usize,
     /// Head dimension.
     head_dim: usize,
     /// Phantom marker.
-    _marker: PhantomData<B>,
+    _marker: PhantomData<T>,
 }
 
-impl<B: Backend> ProgressiveKVCache<B> {
+impl<T: KernelFloat> ProgressiveKVCache<T> {
     /// Create a new progressive KV cache.
-    pub fn new(config: EvicPressConfig, num_heads: usize, head_dim: usize) -> Result<Self, &'static str> {
+    #[inline(always)]
+    pub fn new(
+        config: EvicPressConfig,
+        num_heads: usize,
+        head_dim: usize,
+    ) -> Result<Self, &'static str> {
         config.validate()?;
 
         Ok(Self {
@@ -218,27 +233,32 @@ impl<B: Backend> ProgressiveKVCache<B> {
     }
 
     /// Get configuration.
+    #[inline(always)]
     pub fn config(&self) -> &EvicPressConfig {
         &self.config
     }
 
     /// Get total number of cached tokens.
+    #[inline(always)]
     pub fn len(&self) -> usize {
         self.hot_zone.len() + self.warm_zone.len() + self.cold_zone.len()
     }
 
     /// Check if cache is empty.
+    #[inline(always)]
     pub fn is_empty(&self) -> bool {
         self.len() == 0
     }
 
     /// Get current utilization ratio.
+    #[inline(always)]
     pub fn utilization(&self) -> f32 {
         self.len() as f32 / self.config.max_cache_size as f32
     }
 
     /// Append new KV pair.
-    pub fn append(&mut self, k: &[f32], v: &[f32], is_sink: bool) -> Result<(), &'static str> {
+    #[inline(always)]
+    pub fn append(&mut self, k: &[T], v: &[T], is_sink: bool) -> Result<(), &'static str> {
         if k.len() != self.head_dim || v.len() != self.head_dim {
             return Err("k/v dimension mismatch");
         }
@@ -262,10 +282,11 @@ impl<B: Backend> ProgressiveKVCache<B> {
     }
 
     /// Append multiple KV pairs.
+    #[inline(always)]
     pub fn append_batch(
         &mut self,
-        k: &[f32],
-        v: &[f32],
+        k: &[T],
+        v: &[T],
         num_tokens: usize,
         num_sinks: usize,
     ) -> Result<(), &'static str> {
@@ -285,6 +306,7 @@ impl<B: Backend> ProgressiveKVCache<B> {
     }
 
     /// Update attention scores for importance tracking.
+    #[inline(always)]
     pub fn update_attention_scores(&mut self, scores: &[f32]) {
         // Decay existing scores
         let decay = self.config.importance_decay;
@@ -309,6 +331,7 @@ impl<B: Backend> ProgressiveKVCache<B> {
         self.recalculate_importance();
     }
 
+    #[inline(always)]
     fn update_token_attention(&mut self, global_idx: usize, score: f32) {
         let hot_len = self.hot_zone.len();
         let warm_len = self.warm_zone.len();
@@ -330,6 +353,7 @@ impl<B: Backend> ProgressiveKVCache<B> {
         }
     }
 
+    #[inline(always)]
     fn recalculate_importance(&mut self) {
         for (importance, _) in self.hot_zone.iter_mut() {
             importance.update_combined(&self.config);
@@ -343,6 +367,7 @@ impl<B: Backend> ProgressiveKVCache<B> {
     }
 
     /// Manage zone transitions and eviction.
+    #[inline(always)]
     fn manage_zones(&mut self) -> Result<(), &'static str> {
         // Move from hot to warm if hot zone is full
         while self.hot_zone.len() > self.config.hot_zone_size {
@@ -381,22 +406,29 @@ impl<B: Backend> ProgressiveKVCache<B> {
     }
 
     /// Quantize entry from FP to INT8.
-    fn quantize_to_int8(&self, entry: KVEntry) -> Result<KVEntry, &'static str> {
+    #[inline(always)]
+    fn quantize_to_int8(&self, entry: KVEntry<T>) -> Result<KVEntry<T>, &'static str> {
         match entry {
             KVEntry::Full { k, v } => {
-                let k_absmax = k.iter().map(|&x| x.abs()).fold(0.0f32, f32::max);
-                let v_absmax = v.iter().map(|&x| x.abs()).fold(0.0f32, f32::max);
+                let k_absmax = k
+                    .iter()
+                    .map(|&x| x.to_f32().abs())
+                    .fold(0.0f32, f32::max);
+                let v_absmax = v
+                    .iter()
+                    .map(|&x| x.to_f32().abs())
+                    .fold(0.0f32, f32::max);
 
                 let k_scale = if k_absmax > 0.0 { k_absmax / 127.0 } else { 1.0 };
                 let v_scale = if v_absmax > 0.0 { v_absmax / 127.0 } else { 1.0 };
 
                 let k_int8: Vec<i8> = k
                     .iter()
-                    .map(|&x| (x / k_scale).round().clamp(-127.0, 127.0) as i8)
+                    .map(|&x| (x.to_f32() / k_scale).round().clamp(-127.0, 127.0) as i8)
                     .collect();
                 let v_int8: Vec<i8> = v
                     .iter()
-                    .map(|&x| (x / v_scale).round().clamp(-127.0, 127.0) as i8)
+                    .map(|&x| (x.to_f32() / v_scale).round().clamp(-127.0, 127.0) as i8)
                     .collect();
 
                 Ok(KVEntry::Int8 {
@@ -411,9 +443,14 @@ impl<B: Backend> ProgressiveKVCache<B> {
     }
 
     /// Quantize entry to INT2.
-    fn quantize_to_int2(&self, entry: KVEntry) -> Result<KVEntry, &'static str> {
+    #[inline(always)]
+    fn quantize_to_int2(&self, entry: KVEntry<T>) -> Result<KVEntry<T>, &'static str> {
         let (k_f32, v_f32) = match entry {
-            KVEntry::Full { k, v } => (k, v),
+            KVEntry::Full { k, v } => {
+                let k_f32: Vec<f32> = k.iter().map(|&x| x.to_f32()).collect();
+                let v_f32: Vec<f32> = v.iter().map(|&x| x.to_f32()).collect();
+                (k_f32, v_f32)
+            }
             KVEntry::Int8 {
                 k,
                 v,
@@ -437,6 +474,7 @@ impl<B: Backend> ProgressiveKVCache<B> {
     }
 
     /// Evict the token with lowest importance (excluding sinks).
+    #[inline(always)]
     fn evict_lowest_importance(&mut self) -> Result<(), &'static str> {
         // Find lowest importance in cold zone (non-sink)
         let mut lowest_idx = None;
@@ -474,7 +512,8 @@ impl<B: Backend> ProgressiveKVCache<B> {
     }
 
     /// Get all KV pairs as contiguous tensors (for attention).
-    pub fn get_all_kv(&self) -> Result<(Vec<f32>, Vec<f32>), &'static str> {
+    #[inline(always)]
+    pub fn get_all_kv(&self) -> Result<(Vec<T>, Vec<T>), &'static str> {
         let total = self.len();
         let mut all_k = Vec::with_capacity(total * self.head_dim);
         let mut all_v = Vec::with_capacity(total * self.head_dim);
@@ -503,7 +542,8 @@ impl<B: Backend> ProgressiveKVCache<B> {
         Ok((all_k, all_v))
     }
 
-    fn dequantize_entry(&self, entry: &KVEntry) -> Result<(Vec<f32>, Vec<f32>), &'static str> {
+    #[inline(always)]
+    fn dequantize_entry(&self, entry: &KVEntry<T>) -> Result<(Vec<T>, Vec<T>), &'static str> {
         match entry {
             KVEntry::Full { k, v } => Ok((k.clone(), v.clone())),
             KVEntry::Int8 {
@@ -512,15 +552,26 @@ impl<B: Backend> ProgressiveKVCache<B> {
                 k_scale,
                 v_scale,
             } => {
-                let k_f32: Vec<f32> = k.iter().map(|&x| x as f32 * k_scale).collect();
-                let v_f32: Vec<f32> = v.iter().map(|&x| x as f32 * v_scale).collect();
+                let k_f32: Vec<T> = k
+                    .iter()
+                    .map(|&x| T::from_f32(x as f32 * k_scale))
+                    .collect();
+                let v_f32: Vec<T> = v
+                    .iter()
+                    .map(|&x| T::from_f32(x as f32 * v_scale))
+                    .collect();
                 Ok((k_f32, v_f32))
             }
-            KVEntry::Int2 { k, v } => Ok((k.to_f32(), v.to_f32())),
+            KVEntry::Int2 { k, v } => {
+                let k_vec: Vec<T> = k.to_f32().into_iter().map(T::from_f32).collect();
+                let v_vec: Vec<T> = v.to_f32().into_iter().map(T::from_f32).collect();
+                Ok((k_vec, v_vec))
+            }
         }
     }
 
     /// Get memory usage statistics.
+    #[inline(always)]
     pub fn memory_stats(&self) -> MemoryStats {
         let hot_bytes: usize = self.hot_zone.iter().map(|(_, e)| e.memory_size()).sum();
         let warm_bytes: usize = self.warm_zone.iter().map(|(_, e)| e.memory_size()).sum();
@@ -546,6 +597,7 @@ impl<B: Backend> ProgressiveKVCache<B> {
     }
 
     /// Clear the cache.
+    #[inline(always)]
     pub fn clear(&mut self) {
         self.hot_zone.clear();
         self.warm_zone.clear();
@@ -589,6 +641,7 @@ pub enum EvicPressDecision {
 }
 
 /// Make EvicPress decision based on cache state and importance.
+#[inline(always)]
 pub fn make_evicpress_decision(
     utilization: f32,
     importance: &TokenImportance,
@@ -668,21 +721,23 @@ mod tests {
             max_cache_size: 100,
             hot_zone_size: 10,
             warm_zone_size: 20,
+            min_keep_tokens: 8,
             ..Default::default()
         };
 
-        let mut cache = ProgressiveKVCache::<burn_ndarray::NdArray<f32>>::new(config, 8, 64).unwrap();
+        let mut cache = ProgressiveKVCache::<f32>::new(config, 8, 64).unwrap();
 
-        // Append some tokens
+        // Append tokens without sink tokens first (so they can be moved to warm zone)
         for i in 0..30 {
             let k = vec![i as f32; 64];
             let v = vec![i as f32; 64];
-            let is_sink = i < 4;
+            let is_sink = false; // No sink tokens to allow zone transitions
             cache.append(&k, &v, is_sink).unwrap();
         }
 
         assert_eq!(cache.len(), 30);
         assert!(!cache.hot_zone.is_empty());
+        // With 30 tokens and hot_zone_size=10, warm_zone should have tokens
         assert!(!cache.warm_zone.is_empty());
     }
 
@@ -692,10 +747,11 @@ mod tests {
             max_cache_size: 50,
             hot_zone_size: 5,
             warm_zone_size: 10,
+            min_keep_tokens: 4,
             ..Default::default()
         };
 
-        let mut cache = ProgressiveKVCache::<burn_ndarray::NdArray<f32>>::new(config, 1, 16).unwrap();
+        let mut cache = ProgressiveKVCache::<f32>::new(config, 1, 16).unwrap();
 
         // Fill beyond hot zone
         for i in 0..20 {
@@ -724,10 +780,11 @@ mod tests {
             max_cache_size: 100,
             hot_zone_size: 20,
             warm_zone_size: 30,
+            min_keep_tokens: 8,
             ..Default::default()
         };
 
-        let mut cache = ProgressiveKVCache::<burn_ndarray::NdArray<f32>>::new(config, 1, 64).unwrap();
+        let mut cache = ProgressiveKVCache::<f32>::new(config, 1, 64).unwrap();
 
         for i in 0..60 {
             let k = vec![i as f32; 64];

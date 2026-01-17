@@ -2,9 +2,9 @@
 //!
 //! This module provides Kahan summation and hierarchical accumulation to maintain
 //! precision when accumulating millions of floating-point values.
-
-use burn::tensor::backend::Backend;
-use burn::tensor::Tensor;
+//!
+//! All implementations are pure Rust with no external dependencies.
+//! For GPU-accelerated versions, use `KernelDispatcher` methods.
 
 /// Kahan compensated summation for high-precision accumulation.
 ///
@@ -408,14 +408,8 @@ impl<T: Default> StableRowState<T> {
     }
 }
 
-impl<B: Backend, const D: usize> StableRowState<Tensor<B, D>> {
-    pub fn zeros(config: AccumulatorConfig, shape: [usize; D], device: &B::Device) -> Self {
-        Self {
-            softmax: StableAccumulator::new(config),
-            output: Tensor::zeros(shape, device),
-        }
-    }
-}
+// NOTE: Burn-based `StableRowState<Tensor<B, D>>` wrapper has been removed.
+// Use `KernelDispatcher` methods for GPU-accelerated attention computation.
 
 /// Backward-compatible alias.
 pub type OutputAccumulator<T> = StableRowState<T>;

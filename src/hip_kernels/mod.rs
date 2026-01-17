@@ -36,6 +36,16 @@ pub mod hsa_flash_attn;
 pub mod hsa_paged_attn;
 pub mod hsa_embedding_ops;
 
+// Inference optimization kernels (REQ-OP-008 ~ REQ-OP-015)
+pub mod hsa_eagle3;
+pub mod hsa_spec_ee;
+pub mod hsa_flash_tree_attn;
+pub mod hsa_int2_quantizer;
+pub mod hsa_evic_press;
+pub mod hsa_medusa;
+pub mod hsa_prompt_cache;
+pub mod hsa_chunked_prefill;
+
 // HSA Runtime
 pub use hsa_runtime::{get_hsa_lib, is_hsa_available, HsaLib, GpuAgent, find_gpu_agents};
 
@@ -46,6 +56,16 @@ pub use hsa_flash_attn::{
 };
 pub use hsa_paged_attn::{HsaPagedAttentionError, HsaPagedAttentionKernel};
 pub use hsa_embedding_ops::{HsaEmbeddingOpsError, HsaEmbeddingOpsKernel};
+
+// Inference optimization kernels exports
+pub use hsa_eagle3::{HsaEagle3Error, HsaEagle3Kernel, HsaEagle3Config};
+pub use hsa_spec_ee::{HsaSpecEEError, HsaSpecEEKernel, HsaSpecEEConfig};
+pub use hsa_flash_tree_attn::{HsaFlashTreeAttnError, HsaFlashTreeAttnKernel, HsaFlashTreeAttnConfig};
+pub use hsa_int2_quantizer::{HsaInt2QuantizerError, HsaInt2QuantizerKernel, HsaInt2QuantizerConfig};
+pub use hsa_evic_press::{HsaEvicPressError, HsaEvicPressKernel, HsaEvicPressConfig, CacheZone};
+pub use hsa_medusa::{HsaMedusaError, HsaMedusaKernel, HsaMedusaConfig};
+pub use hsa_prompt_cache::{HsaPromptCacheError, HsaPromptCacheKernel, HsaPromptCacheConfig};
+pub use hsa_chunked_prefill::{HsaChunkedPrefillError, HsaChunkedPrefillKernel, HsaChunkedPrefillConfig};
 
 /// Check if AMD GPU is available (HSA runtime).
 pub fn is_amd_gpu_available() -> bool {
