@@ -54,10 +54,10 @@ var<workgroup> v_tile_tree: array<f32, BLOCK_K * MAX_HEAD_DIM>;
 // ============================================================================
 // Builds attention mask from parent indices (j can attend to i iff is_ancestor(i,j))
 // Input: parent_indices[tree_size] (-1 for root)
-// Output: tree_mask[tree_size, tree_size] (1.0 if can attend, 0.0 otherwise)
+// Output: tree_mask[tree_size, tree_size] (1 if can attend, 0 otherwise)
 
 @group(0) @binding(0) var<storage, read> mask_parents_f32: array<i32>;
-@group(0) @binding(1) var<storage, read_write> mask_output_f32: array<f32>;
+@group(0) @binding(1) var<storage, read_write> mask_output_i32: array<i32>;
 @group(0) @binding(2) var<uniform> mask_params_f32: TreeMaskParams;
 
 fn is_ancestor(i: u32, j: u32, parents: ptr<storage, array<i32>, read>, num_nodes: u32) -> bool {
@@ -97,9 +97,9 @@ fn tree_attn_build_mask_f32(
 
     // j can attend to i if i is an ancestor of j
     if (is_ancestor(i, j, &mask_parents_f32, mask_params_f32.num_nodes)) {
-        mask_output_f32[idx] = 1.0;
+        mask_output_i32[idx] = 1;
     } else {
-        mask_output_f32[idx] = 0.0;
+        mask_output_i32[idx] = 0;
     }
 }
 
@@ -114,7 +114,7 @@ fn tree_attn_build_mask_f32(
 @group(0) @binding(0) var<storage, read> tree_q_f32: array<f32>;
 @group(0) @binding(1) var<storage, read> tree_k_f32: array<f32>;
 @group(0) @binding(2) var<storage, read> tree_v_f32: array<f32>;
-@group(0) @binding(3) var<storage, read> tree_mask_f32: array<f32>;
+@group(0) @binding(3) var<storage, read> tree_mask_i32: array<i32>;
 @group(0) @binding(4) var<storage, read_write> tree_o_f32: array<f32>;
 @group(0) @binding(5) var<uniform> tree_params_f32: TreeAttnParams;
 
@@ -238,9 +238,9 @@ fn tree_attn_forward_f32(
             let key_idx = key_base + t;
             // Check tree mask: can q_index attend to key_idx?
             let mask_idx = q_index * tree_params_f32.tree_size + key_idx;
-            let mask_val = tree_mask_f32[mask_idx];
+            let mask_val = tree_mask_i32[mask_idx];
 
-            if (mask_val > 0.5) {
+            if (mask_val != 0) {
                 var sum = 0.0f;
                 for (var d: u32 = 0u; d < head_dim; d = d + 1u) {
                     sum += q_local[d] * k_tile_tree[t * MAX_HEAD_DIM + d];
@@ -342,7 +342,7 @@ fn tree_attn_verify_f32(
 @group(0) @binding(0) var<storage, read> tree_q_f16: array<f16>;
 @group(0) @binding(1) var<storage, read> tree_k_f16: array<f16>;
 @group(0) @binding(2) var<storage, read> tree_v_f16: array<f16>;
-@group(0) @binding(3) var<storage, read> tree_mask_f16: array<f32>;
+@group(0) @binding(3) var<storage, read> tree_mask_i32_f16: array<i32>;
 @group(0) @binding(4) var<storage, read_write> tree_o_f16: array<f16>;
 @group(0) @binding(5) var<uniform> tree_params_f16: TreeAttnParams;
 
@@ -462,9 +462,9 @@ fn tree_attn_forward_f16(
         for (var t: u32 = 0u; t < tile_len; t = t + 1u) {
             let key_idx = key_base + t;
             let mask_idx = q_index * tree_params_f16.tree_size + key_idx;
-            let mask_val = tree_mask_f16[mask_idx];
+            let mask_val = tree_mask_i32_f16[mask_idx];
 
-            if (mask_val > 0.5) {
+            if (mask_val != 0) {
                 var sum = 0.0f;
                 for (var d: u32 = 0u; d < head_dim; d = d + 1u) {
                     sum += q_local[d] * k_tile_tree[t * MAX_HEAD_DIM + d];

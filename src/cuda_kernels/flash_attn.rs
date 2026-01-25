@@ -22,7 +22,7 @@ use std::sync::Arc;
 use cudarc::driver::{CudaContext, CudaFunction, CudaModule, CudaSlice, CudaStream, LaunchConfig, DriverError, PushKernelArg};
 use half::f16;
 
-use crate::types::AttentionConfig;
+use crate::types::FlashAttentionConfig;
 use crate::cuda_kernels::ptx_loader::{PtxCollection, PtxLoadError};
 use crate::validation::{
     validate_attention_dims, validate_i32_bounds, compute_num_queries, compute_output_len,
@@ -324,15 +324,16 @@ impl OptimizedCudaAttention {
         q: &CudaSlice<f32>,
         k: &CudaSlice<f32>,
         v: &CudaSlice<f32>,
-        config: &AttentionConfig,
+        config: &FlashAttentionConfig,
         position_offset: usize,
     ) -> Result<CudaSlice<f32>, FlashAttentionError> {
-        if config.query_len != config.kv_len {
+        if config.seq_len_q != config.seq_len_kv {
             return Err(FlashAttentionError::InvalidConfig(
                 "query_len must match kv_len for the tiled kernel".into(),
             ));
         }
 
+        let scale = config.scale.unwrap_or_else(|| 1.0 / (config.head_dim as f32).sqrt());
         let output = self.kernel.forward_f32_with_block(
             stream,
             q,
@@ -340,10 +341,10 @@ impl OptimizedCudaAttention {
             v,
             config.batch_size,
             config.num_heads,
-            config.query_len,
+            config.seq_len_q,
             config.head_dim,
             config.causal,
-            config.scale,
+            scale,
             position_offset,
             self.tile_size,
         )?;

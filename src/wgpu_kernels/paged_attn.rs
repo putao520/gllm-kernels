@@ -4,4 +4,4 @@ mod kernel;
 mod dispatch;
 mod utils;
 
-pub use kernel::{PagedAttentionError, PagedAttentionKernel};
+pub use kernel::{PagedAttentionError, PagedAttentionKernel, PagedAttentionParams};

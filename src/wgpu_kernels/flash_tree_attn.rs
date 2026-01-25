@@ -165,6 +165,12 @@ impl FlashTreeAttn {
             .await
             .map_err(|e| format!("Failed to create device: {}", e))?;
 
+        Self::from_device(device, queue)
+    }
+
+    fn from_device(device: wgpu::Device, queue: wgpu::Queue) -> Result<Self, String> {
+        let has_f16 = device.features().contains(wgpu::Features::SHADER_F16);
+
         let shader_module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("FlashTreeAttn Shader"),
             source: wgpu::ShaderSource::Wgsl(Cow::Borrowed(SHADER_SOURCE)),
@@ -357,7 +363,7 @@ impl FlashTreeAttn {
                             },
                             count: None,
                         },
-                        // tree_mask (input f32)
+                        // tree_mask (input i32)
                         wgpu::BindGroupLayoutEntry {
                             binding: 3,
                             visibility: wgpu::ShaderStages::COMPUTE,
@@ -519,6 +525,11 @@ impl FlashTreeAttn {
         })
     }
 
+    /// Create with an existing device/queue.
+    pub fn new_with_device(device: wgpu::Device, queue: wgpu::Queue) -> Result<Self, String> {
+        Self::from_device(device, queue)
+    }
+
     /// Create synchronously using pollster
     pub fn new_sync() -> Result<Self, String> {
         pollster::block_on(Self::new())
@@ -536,7 +547,7 @@ impl FlashTreeAttn {
     ///
     /// # Returns
     /// * Tree mask [num_nodes, num_nodes] where mask[j,i]=1 if i is ancestor of j
-    pub fn build_mask(&self, parent_indices: &[i32]) -> Vec<f32> {
+    pub fn build_mask(&self, parent_indices: &[i32]) -> Vec<i32> {
         let num_nodes = parent_indices.len() as u32;
         let total_mask = (num_nodes * num_nodes) as usize;
 
@@ -553,7 +564,7 @@ impl FlashTreeAttn {
 
         let mask_buffer = self.device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("Tree Mask Buffer"),
-            size: (total_mask * std::mem::size_of::<f32>()) as u64,
+            size: (total_mask * std::mem::size_of::<i32>()) as u64,
             usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
             mapped_at_creation: false,
         });
@@ -608,7 +619,7 @@ impl FlashTreeAttn {
         // Read back results
         let staging_buffer = self.device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("Mask Staging Buffer"),
-            size: (total_mask * std::mem::size_of::<f32>()) as u64,
+            size: (total_mask * std::mem::size_of::<i32>()) as u64,
             usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
             mapped_at_creation: false,
         });
@@ -618,7 +629,7 @@ impl FlashTreeAttn {
             0,
             &staging_buffer,
             0,
-            (total_mask * std::mem::size_of::<f32>()) as u64,
+            (total_mask * std::mem::size_of::<i32>()) as u64,
         );
 
         self.queue.submit(Some(encoder.finish()));
@@ -633,7 +644,7 @@ impl FlashTreeAttn {
         receiver.recv().unwrap().unwrap();
 
         let data = buffer_slice.get_mapped_range();
-        let result: Vec<f32> = bytemuck::cast_slice(&data).to_vec();
+        let result: Vec<i32> = bytemuck::cast_slice(&data).to_vec();
         drop(data);
         staging_buffer.unmap();
 
@@ -646,7 +657,7 @@ impl FlashTreeAttn {
     /// * `q` - Query tensor [batch, tree_size, num_heads, head_dim]
     /// * `k` - Key tensor [batch, prompt_len+tree_size, num_heads, head_dim]
     /// * `v` - Value tensor [batch, prompt_len+tree_size, num_heads, head_dim]
-    /// * `tree_mask` - Tree attention mask [tree_size, tree_size]
+    /// * `tree_mask` - Tree attention mask [tree_size, tree_size] as i32
     /// * `params` - Attention parameters
     ///
     /// # Returns
@@ -656,7 +667,7 @@ impl FlashTreeAttn {
         q: &[f32],
         k: &[f32],
         v: &[f32],
-        tree_mask: &[f32],
+        tree_mask: &[i32],
         params: &TreeAttnParams,
     ) -> Vec<f32> {
         let output_size = (params.batch_size
@@ -806,7 +817,7 @@ impl FlashTreeAttn {
     /// * `q` - Query tensor [batch, tree_size, num_heads, head_dim] as f16 bytes
     /// * `k` - Key tensor [batch, prompt_len+tree_size, num_heads, head_dim] as f16 bytes
     /// * `v` - Value tensor [batch, prompt_len+tree_size, num_heads, head_dim] as f16 bytes
-    /// * `tree_mask` - Tree attention mask [tree_size, tree_size] as f32
+    /// * `tree_mask` - Tree attention mask [tree_size, tree_size] as i32
     /// * `params` - Attention parameters
     ///
     /// # Returns
@@ -816,7 +827,7 @@ impl FlashTreeAttn {
         q: &[u8],
         k: &[u8],
         v: &[u8],
-        tree_mask: &[f32],
+        tree_mask: &[i32],
         params: &TreeAttnParams,
     ) -> Result<Vec<u8>, String> {
         let pipeline = self
@@ -961,6 +972,93 @@ impl FlashTreeAttn {
         staging_buffer.unmap();
 
         Ok(result)
+    }
+
+    /// GPU-pure tree attention forward (no readback/upload).
+    pub fn forward_gpu_pure(
+        &self,
+        q: &wgpu::Buffer,
+        k: &wgpu::Buffer,
+        v: &wgpu::Buffer,
+        tree_mask: &wgpu::Buffer,
+        output: &wgpu::Buffer,
+        params: TreeAttnParams,
+        use_f16: bool,
+    ) -> Result<(), String> {
+        let (pipeline, layout) = if use_f16 {
+            let pipeline = self
+                .forward_pipeline_f16
+                .as_ref()
+                .ok_or("F16 not supported")?;
+            let layout = self
+                .forward_bind_group_layout_f16
+                .as_ref()
+                .ok_or("F16 not supported")?;
+            (pipeline, layout)
+        } else {
+            (&self.forward_pipeline_f32, &self.forward_bind_group_layout_f32)
+        };
+
+        let params_buffer = self
+            .device
+            .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: Some("Tree Attn Params Buffer"),
+                contents: bytemuck::bytes_of(&params),
+                usage: wgpu::BufferUsages::UNIFORM,
+            });
+
+        let bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("Tree Attn Bind Group GPU Pure"),
+            layout,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: q.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: k.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: v.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 3,
+                    resource: tree_mask.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 4,
+                    resource: output.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 5,
+                    resource: params_buffer.as_entire_binding(),
+                },
+            ],
+        });
+
+        let mut encoder = self
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("Tree Attn Encoder GPU Pure"),
+            });
+
+        {
+            let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                label: Some("Tree Attn Pass GPU Pure"),
+                timestamp_writes: None,
+            });
+            pass.set_pipeline(pipeline);
+            pass.set_bind_group(0, &bind_group, &[]);
+
+            let workgroups_x = (params.tree_size + WORKGROUP_SIZE - 1) / WORKGROUP_SIZE;
+            let workgroups_y = params.batch_size * params.num_heads;
+            pass.dispatch_workgroups(workgroups_x, workgroups_y, 1);
+        }
+
+        self.queue.submit(Some(encoder.finish()));
+        Ok(())
     }
 
     /// Verify draft tokens against ground truth

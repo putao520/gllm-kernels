@@ -31,7 +31,7 @@ pub mod moe_routing_gpu;
 
 // Re-exports - Core attention
 pub use flash_attn::{FlashAttentionError, FlashAttentionKernel};
-pub use paged_attn::{PagedAttentionError, PagedAttentionKernel};
+pub use paged_attn::{PagedAttentionError, PagedAttentionKernel, PagedAttentionParams};
 pub use flash_tree_attn::{
     TreeAttnParams, VerifyParams, TreeMaskParams, VerifyResult, FlashTreeAttn,
 };

@@ -20,7 +20,7 @@ use super::hsa_runtime::{
     HsaExecutable, HsaKernelDispatchPacket, HsaQueue, HsaRegion, HsaSignal,
     HSA_STATUS_SUCCESS,
 };
-use crate::types::AttentionConfig;
+use crate::types::FlashAttentionConfig;
 use crate::validation::{
     validate_attention_dims, compute_num_queries, compute_output_len,
 };
@@ -847,15 +847,16 @@ impl OptimizedHsaAttention {
         q: &HsaBuffer<f32>,
         k: &HsaBuffer<f32>,
         v: &HsaBuffer<f32>,
-        config: &AttentionConfig,
+        config: &FlashAttentionConfig,
         position_offset: usize,
     ) -> Result<HsaBuffer<f32>, HsaFlashAttentionError> {
-        if config.query_len != config.kv_len {
+        if config.seq_len_q != config.seq_len_kv {
             return Err(HsaFlashAttentionError::InvalidConfig(
                 "query_len must match kv_len for the tiled kernel".into(),
             ));
         }
 
+        let scale = config.scale.unwrap_or_else(|| 1.0 / (config.head_dim as f32).sqrt());
         self.kernel.forward_f32_impl(
             queue,
             q,
@@ -863,10 +864,10 @@ impl OptimizedHsaAttention {
             v,
             config.batch_size,
             config.num_heads,
-            config.query_len,
+            config.seq_len_q,
             config.head_dim,
             config.causal,
-            config.scale,
+            scale,
             position_offset,
             self.tile_size,
         )

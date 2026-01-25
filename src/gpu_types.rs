@@ -49,6 +49,8 @@ pub enum TensorDtype {
     F32,
     F16,
     U32,
+    I32,
+    U64,
     I8,
 }
 
@@ -82,6 +84,8 @@ impl GpuTensor {
             TensorDtype::F32 => 4,
             TensorDtype::F16 => 2,
             TensorDtype::U32 => 4,
+            TensorDtype::I32 => 4,
+            TensorDtype::U64 => 8,
             TensorDtype::I8 => 1,
         };
         let num_elements: usize = shape.iter().product();
@@ -100,6 +104,8 @@ impl GpuTensor {
             TensorDtype::F32 => 4,
             TensorDtype::F16 => 2,
             TensorDtype::U32 => 4,
+            TensorDtype::I32 => 4,
+            TensorDtype::U64 => 8,
             TensorDtype::I8 => 1,
         };
         let size = shape.iter().product::<usize>() * element_size;

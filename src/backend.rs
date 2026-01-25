@@ -81,6 +81,7 @@ use crate::metal_kernels::{
 use crate::wgpu_kernels::{
     FlashAttentionKernel as WgpuFlashAttentionKernel,
     PagedAttentionKernel as WgpuPagedAttentionKernel,
+    PagedAttentionParams as WgpuPagedAttentionParams,
     EmbeddingOpsKernel as WgpuEmbeddingOpsKernel,
     Eagle3Kernel as WgpuEagle3Kernel,
     SpecEEKernel as WgpuSpecEEKernel,
@@ -138,6 +139,18 @@ pub trait Backend: Send + Sync {
     /// Paged attention for KV cache with virtual memory.
     fn paged_attention<T: KernelFloat>(&self, q: &[T], k_cache: &[T], v_cache: &[T], page_table: &[u32], seq_lens: &[u32], output: &mut [T], config: PagedAttentionConfig);
 
+    /// Paged attention GPU-pure: operates directly on GPU tensors without readback.
+    fn paged_attention_gpu_pure(
+        &self,
+        query: &GpuTensor,
+        k_cache: &GpuTensor,
+        v_cache: &GpuTensor,
+        block_tables: &GpuTensor,
+        block_offsets: &GpuTensor,
+        output: &mut GpuTensor,
+        config: PagedAttentionConfig,
+    ) -> Result<(), String>;
+
     /// Softmax with numerical stability.
     fn softmax<T: KernelFloat>(&self, input: &[T], output: &mut [T], config: SoftmaxConfig);
 
@@ -183,6 +196,12 @@ pub trait Backend: Send + Sync {
 
     /// Read GPU u32 tensor back to host (type-safe).
     fn readback_u32(&self, gpu: &GpuTensor, host: &mut [u32]) -> Result<(), String>;
+
+    /// Read GPU i32 tensor back to host (type-safe).
+    fn readback_i32(&self, gpu: &GpuTensor, host: &mut [i32]) -> Result<(), String>;
+
+    /// Read GPU u64 tensor back to host (type-safe).
+    fn readback_u64(&self, gpu: &GpuTensor, host: &mut [u64]) -> Result<(), String>;
 
     /// Upload host data to GPU tensor (generic).
     fn upload<T: KernelFloat>(&self, host: &[T], gpu: &mut GpuTensor) -> Result<(), String>;
@@ -243,6 +262,17 @@ pub trait Backend: Send + Sync {
 
     /// Flash tree attention for speculative decoding.
     fn flash_tree_attention<T: KernelFloat>(&self, query: &[T], key: &[T], value: &[T], tree_mask: &[i32], output: &mut [T], config: &FlashTreeAttentionConfig) -> bool;
+
+    /// Flash tree attention GPU-pure: operates directly on GPU tensors without readback.
+    fn flash_tree_attention_gpu_pure(
+        &self,
+        query: &GpuTensor,
+        key: &GpuTensor,
+        value: &GpuTensor,
+        tree_mask: &GpuTensor,
+        output: &mut GpuTensor,
+        config: FlashTreeAttentionConfig,
+    ) -> Result<(), String>;
 
     /// Medusa forward pass.
     fn medusa_forward<T: KernelFloat>(&self, head_logits: &[T], config: &MedusaConfig) -> Option<MedusaForwardResult>;
@@ -371,6 +401,28 @@ impl DispatchedBackend {
             Self::Rocm(b) => b.paged_attention(q, k_cache, v_cache, page_table, seq_lens, output, config),
 #[cfg(target_os = "macos")]
             Self::Metal(b) => b.paged_attention(q, k_cache, v_cache, page_table, seq_lens, output, config),
+        }
+    }
+
+    /// Paged attention GPU-pure: operates directly on GPU tensors without readback.
+    #[inline(always)]
+    pub fn paged_attention_gpu_pure(
+        &self,
+        query: &GpuTensor,
+        k_cache: &GpuTensor,
+        v_cache: &GpuTensor,
+        block_tables: &GpuTensor,
+        block_offsets: &GpuTensor,
+        output: &mut GpuTensor,
+        config: PagedAttentionConfig,
+    ) -> Result<(), String> {
+        match self {
+            Self::Cpu(b) => b.paged_attention_gpu_pure(query, k_cache, v_cache, block_tables, block_offsets, output, config),
+            Self::Wgpu(b) => b.paged_attention_gpu_pure(query, k_cache, v_cache, block_tables, block_offsets, output, config),
+            Self::Cuda(b) => b.paged_attention_gpu_pure(query, k_cache, v_cache, block_tables, block_offsets, output, config),
+            Self::Rocm(b) => b.paged_attention_gpu_pure(query, k_cache, v_cache, block_tables, block_offsets, output, config),
+#[cfg(target_os = "macos")]
+            Self::Metal(b) => b.paged_attention_gpu_pure(query, k_cache, v_cache, block_tables, block_offsets, output, config),
         }
     }
 
@@ -543,6 +595,32 @@ impl DispatchedBackend {
         }
     }
 
+    /// Read GPU i32 tensor back to host (type-safe).
+    #[inline(always)]
+    pub fn readback_i32(&self, gpu: &GpuTensor, host: &mut [i32]) -> Result<(), String> {
+        match self {
+            Self::Cpu(b) => b.readback_i32(gpu, host),
+            Self::Wgpu(b) => b.readback_i32(gpu, host),
+            Self::Cuda(b) => b.readback_i32(gpu, host),
+            Self::Rocm(b) => b.readback_i32(gpu, host),
+#[cfg(target_os = "macos")]
+            Self::Metal(b) => b.readback_i32(gpu, host),
+        }
+    }
+
+    /// Read GPU u64 tensor back to host (type-safe).
+    #[inline(always)]
+    pub fn readback_u64(&self, gpu: &GpuTensor, host: &mut [u64]) -> Result<(), String> {
+        match self {
+            Self::Cpu(b) => b.readback_u64(gpu, host),
+            Self::Wgpu(b) => b.readback_u64(gpu, host),
+            Self::Cuda(b) => b.readback_u64(gpu, host),
+            Self::Rocm(b) => b.readback_u64(gpu, host),
+#[cfg(target_os = "macos")]
+            Self::Metal(b) => b.readback_u64(gpu, host),
+        }
+    }
+
     #[inline(always)]
     pub fn upload<T: KernelFloat>(&self, host: &[T], gpu: &mut GpuTensor) -> Result<(), String> {
         match self {
@@ -692,6 +770,27 @@ impl DispatchedBackend {
             Self::Rocm(b) => b.flash_tree_attention(query, key, value, tree_mask, output, config),
 #[cfg(target_os = "macos")]
             Self::Metal(b) => b.flash_tree_attention(query, key, value, tree_mask, output, config),
+        }
+    }
+
+    /// Flash tree attention GPU-pure: operates directly on GPU tensors without readback.
+    #[inline(always)]
+    pub fn flash_tree_attention_gpu_pure(
+        &self,
+        query: &GpuTensor,
+        key: &GpuTensor,
+        value: &GpuTensor,
+        tree_mask: &GpuTensor,
+        output: &mut GpuTensor,
+        config: FlashTreeAttentionConfig,
+    ) -> Result<(), String> {
+        match self {
+            Self::Cpu(b) => b.flash_tree_attention_gpu_pure(query, key, value, tree_mask, output, config),
+            Self::Wgpu(b) => b.flash_tree_attention_gpu_pure(query, key, value, tree_mask, output, config),
+            Self::Cuda(b) => b.flash_tree_attention_gpu_pure(query, key, value, tree_mask, output, config),
+            Self::Rocm(b) => b.flash_tree_attention_gpu_pure(query, key, value, tree_mask, output, config),
+#[cfg(target_os = "macos")]
+            Self::Metal(b) => b.flash_tree_attention_gpu_pure(query, key, value, tree_mask, output, config),
         }
     }
 
@@ -1252,6 +1351,19 @@ impl Backend for CpuBackend {
         ops::paged_attn::paged_attention(q, k_cache, v_cache, page_table, seq_lens, output, config);
     }
 
+    fn paged_attention_gpu_pure(
+        &self,
+        _: &GpuTensor,
+        _: &GpuTensor,
+        _: &GpuTensor,
+        _: &GpuTensor,
+        _: &GpuTensor,
+        _: &mut GpuTensor,
+        _: PagedAttentionConfig,
+    ) -> Result<(), String> {
+        Err("CPU paged_attention_gpu_pure not implemented".into())
+    }
+
     #[inline(always)]
     fn softmax<T: KernelFloat>(&self, input: &[T], output: &mut [T], config: SoftmaxConfig) {
         ops::softmax::softmax(input, output, config);
@@ -1408,6 +1520,52 @@ impl Backend for CpuBackend {
         Err("CPU readback_u32 not implemented".into())
     }
 
+    fn readback_i32(&self, gpu: &GpuTensor, host: &mut [i32]) -> Result<(), String> {
+        if gpu.dtype != TensorDtype::I32 {
+            return Err("CPU readback_i32 requires i32 tensor".into());
+        }
+        match &gpu.buffer {
+            GpuBuffer::Cpu(buf) => {
+                let src = unsafe {
+                    std::slice::from_raw_parts(
+                        buf.as_ptr() as *const i32,
+                        buf.len() / std::mem::size_of::<i32>(),
+                    )
+                };
+                if src.len() >= host.len() {
+                    host.copy_from_slice(&src[..host.len()]);
+                    Ok(())
+                } else {
+                    Err("CPU readback_i32: insufficient data".into())
+                }
+            }
+            _ => Err("CPU readback_i32: not a CPU buffer".into()),
+        }
+    }
+
+    fn readback_u64(&self, gpu: &GpuTensor, host: &mut [u64]) -> Result<(), String> {
+        if gpu.dtype != TensorDtype::U64 {
+            return Err("CPU readback_u64 requires u64 tensor".into());
+        }
+        match &gpu.buffer {
+            GpuBuffer::Cpu(buf) => {
+                let src = unsafe {
+                    std::slice::from_raw_parts(
+                        buf.as_ptr() as *const u64,
+                        buf.len() / std::mem::size_of::<u64>(),
+                    )
+                };
+                if src.len() >= host.len() {
+                    host.copy_from_slice(&src[..host.len()]);
+                    Ok(())
+                } else {
+                    Err("CPU readback_u64: insufficient data".into())
+                }
+            }
+            _ => Err("CPU readback_u64: not a CPU buffer".into()),
+        }
+    }
+
     fn upload<T: KernelFloat>(&self, host: &[T], gpu: &mut GpuTensor) -> Result<(), String> {
         match &gpu.buffer {
             GpuBuffer::Cpu(buf) => {
@@ -1453,6 +1611,18 @@ impl Backend for CpuBackend {
     fn flash_tree_attention<T: KernelFloat>(&self, q: &[T], k: &[T], v: &[T], m: &[i32], o: &mut [T], config: &FlashTreeAttentionConfig) -> bool {
         ops::flash_tree_attn::flash_tree_attention(q, k, v, m, o, config);
         true
+    }
+
+    fn flash_tree_attention_gpu_pure(
+        &self,
+        _: &GpuTensor,
+        _: &GpuTensor,
+        _: &GpuTensor,
+        _: &GpuTensor,
+        _: &mut GpuTensor,
+        _: FlashTreeAttentionConfig,
+    ) -> Result<(), String> {
+        Err("CPU flash_tree_attention_gpu_pure not implemented".into())
     }
 
     fn medusa_forward<T: KernelFloat>(&self, hl: &[T], config: &MedusaConfig) -> Option<MedusaForwardResult> {
@@ -1800,6 +1970,80 @@ impl Backend for WgpuBackend {
         }
     }
 
+    fn paged_attention_gpu_pure(
+        &self,
+        query: &GpuTensor,
+        k_cache: &GpuTensor,
+        v_cache: &GpuTensor,
+        block_tables: &GpuTensor,
+        block_offsets: &GpuTensor,
+        output: &mut GpuTensor,
+        config: PagedAttentionConfig,
+    ) -> Result<(), String> {
+        let ctx = get_wgpu_context()
+            .ok_or("WGPU context unavailable for paged_attention_gpu_pure")?;
+
+        // Extract native wgpu::Buffer from GpuTensor (NO readback!)
+        let q_buf = match &query.buffer {
+            GpuBuffer::Wgpu(b) => b,
+            _ => return Err("WGPU paged_attention_gpu_pure: query not WGPU buffer".into()),
+        };
+        let k_buf = match &k_cache.buffer {
+            GpuBuffer::Wgpu(b) => b,
+            _ => return Err("WGPU paged_attention_gpu_pure: k_cache not WGPU buffer".into()),
+        };
+        let v_buf = match &v_cache.buffer {
+            GpuBuffer::Wgpu(b) => b,
+            _ => return Err("WGPU paged_attention_gpu_pure: v_cache not WGPU buffer".into()),
+        };
+        let bt_buf = match &block_tables.buffer {
+            GpuBuffer::Wgpu(b) => b,
+            _ => return Err("WGPU paged_attention_gpu_pure: block_tables not WGPU buffer".into()),
+        };
+        let bo_buf = match &block_offsets.buffer {
+            GpuBuffer::Wgpu(b) => b,
+            _ => return Err("WGPU paged_attention_gpu_pure: block_offsets not WGPU buffer".into()),
+        };
+        let out_buf = match &output.buffer {
+            GpuBuffer::Wgpu(b) => b,
+            _ => return Err("WGPU paged_attention_gpu_pure: output not WGPU buffer".into()),
+        };
+
+        // Initialize paged attention kernel (lazy)
+        static PAGED_ATTN_GPU_PURE: OnceLock<Option<WgpuPagedAttentionKernel>> = OnceLock::new();
+        let kernel = PAGED_ATTN_GPU_PURE.get_or_init(|| {
+            let ctx = get_wgpu_context()?;
+            WgpuPagedAttentionKernel::new(&ctx.device, &ctx.queue).ok()
+        }).as_ref().ok_or("WGPU PagedAttention kernel init failed")?;
+
+        // Derive batch_size from block_offsets shape (num_elements - 1 = batch_size)
+        let batch_size = (block_offsets.size_in_bytes / std::mem::size_of::<i32>()).saturating_sub(1);
+        // Derive seq_len from query shape: query is [batch_size, seq_len, num_heads, head_dim]
+        let num_heads = config.num_kv_heads;
+        let head_dim = config.head_dim;
+        let total_q_elements = query.size_in_bytes / std::mem::size_of::<f32>();
+        let seq_len = if batch_size > 0 && num_heads > 0 && head_dim > 0 {
+            total_q_elements / (batch_size * num_heads * head_dim)
+        } else {
+            1
+        };
+
+        let params = WgpuPagedAttentionParams {
+            batch_size: batch_size as u32,
+            num_heads: num_heads as u32,
+            head_dim: head_dim as u32,
+            block_size: config.block_size as u32,
+            seq_len: seq_len as u32,
+            _pad0: 0,
+            _pad1: 0,
+            _pad2: 0,
+        };
+
+        let use_f16 = query.dtype == TensorDtype::F16;
+        kernel.forward_gpu_pure(q_buf, k_buf, v_buf, bt_buf, bo_buf, out_buf, params, use_f16)
+            .map_err(|e| format!("WGPU paged_attention_gpu_pure failed: {}", e))
+    }
+
     #[inline(always)]
     fn softmax<T: KernelFloat>(&self, input: &[T], output: &mut [T], config: SoftmaxConfig) {
         // Softmax uses ops implementation (compute-bound, not memory-bound)
@@ -2058,6 +2302,94 @@ impl Backend for WgpuBackend {
         }
     }
 
+    fn readback_i32(&self, gpu: &GpuTensor, host: &mut [i32]) -> Result<(), String> {
+        if gpu.dtype != TensorDtype::I32 {
+            return Err("WGPU readback_i32 requires i32 tensor".into());
+        }
+        let src = match &gpu.buffer {
+            GpuBuffer::Wgpu(buf) => buf,
+            _ => return Err("WGPU readback_i32: not WGPU buffer".into()),
+        };
+        let ctx = get_wgpu_context().ok_or("WGPU not init")?;
+        let size = host.len() * std::mem::size_of::<i32>();
+        if gpu.size_in_bytes < size {
+            return Err(format!(
+                "WGPU readback_i32: buffer bytes {} < required {}",
+                gpu.size_in_bytes,
+                size
+            ));
+        }
+        let staging = ctx.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("Staging I32"),
+            size: size as u64,
+            usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        let mut enc = ctx.device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None });
+        enc.copy_buffer_to_buffer(src, 0, &staging, 0, size as u64);
+        ctx.queue.submit(Some(enc.finish()));
+
+        let slice = staging.slice(..);
+        let (tx, rx) = std::sync::mpsc::channel();
+        slice.map_async(wgpu::MapMode::Read, move |v| tx.send(v).unwrap());
+        ctx.device.poll(wgpu::PollType::Wait);
+
+        if let Ok(Ok(_)) = rx.recv() {
+            let view = slice.get_mapped_range();
+            let data = unsafe { std::slice::from_raw_parts(view.as_ptr() as *const i32, host.len()) };
+            host.copy_from_slice(data);
+            drop(view);
+            staging.unmap();
+            Ok(())
+        } else {
+            Err("Map async failed".into())
+        }
+    }
+
+    fn readback_u64(&self, gpu: &GpuTensor, host: &mut [u64]) -> Result<(), String> {
+        if gpu.dtype != TensorDtype::U64 {
+            return Err("WGPU readback_u64 requires u64 tensor".into());
+        }
+        let src = match &gpu.buffer {
+            GpuBuffer::Wgpu(buf) => buf,
+            _ => return Err("WGPU readback_u64: not WGPU buffer".into()),
+        };
+        let ctx = get_wgpu_context().ok_or("WGPU not init")?;
+        let size = host.len() * std::mem::size_of::<u64>();
+        if gpu.size_in_bytes < size {
+            return Err(format!(
+                "WGPU readback_u64: buffer bytes {} < required {}",
+                gpu.size_in_bytes,
+                size
+            ));
+        }
+        let staging = ctx.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("Staging U64"),
+            size: size as u64,
+            usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        let mut enc = ctx.device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None });
+        enc.copy_buffer_to_buffer(src, 0, &staging, 0, size as u64);
+        ctx.queue.submit(Some(enc.finish()));
+
+        let slice = staging.slice(..);
+        let (tx, rx) = std::sync::mpsc::channel();
+        slice.map_async(wgpu::MapMode::Read, move |v| tx.send(v).unwrap());
+        ctx.device.poll(wgpu::PollType::Wait);
+
+        if let Ok(Ok(_)) = rx.recv() {
+            let view = slice.get_mapped_range();
+            let data = unsafe { std::slice::from_raw_parts(view.as_ptr() as *const u64, host.len()) };
+            host.copy_from_slice(data);
+            drop(view);
+            staging.unmap();
+            Ok(())
+        } else {
+            Err("Map async failed".into())
+        }
+    }
+
     fn upload<T: KernelFloat>(&self, host: &[T], gpu: &mut GpuTensor) -> Result<(), String> {
         if let GpuBuffer::Wgpu(dst) = &gpu.buffer {
             let ctx = get_wgpu_context().ok_or("WGPU not init")?;
@@ -2203,7 +2535,8 @@ impl Backend for WgpuBackend {
 
     fn flash_tree_attention<T: KernelFloat>(&self, q: &[T], k: &[T], v: &[T], m: &[i32], o: &mut [T], config: &FlashTreeAttentionConfig) -> bool {
         let kernel = match WGPU_FLASH_TREE_KERNEL.get_or_init(|| {
-            WgpuFlashTreeAttn::new_sync().ok()
+            let ctx = get_wgpu_context()?;
+            WgpuFlashTreeAttn::new_with_device(ctx.device.clone(), ctx.queue.clone()).ok()
         }) {
             Some(k) => k,
             None => return CpuBackend.flash_tree_attention(q, k, v, m, o, config),
@@ -2211,7 +2544,6 @@ impl Backend for WgpuBackend {
 
         match T::TYPE_ID {
             FloatType::F32 => {
-                let tree_mask_f32: Vec<f32> = m.iter().map(|&x| x as f32).collect();
                 let params = crate::wgpu_kernels::flash_tree_attn::TreeAttnParams::new(
                     config.batch_size as u32,
                     config.num_heads as u32,
@@ -2220,13 +2552,84 @@ impl Backend for WgpuBackend {
                     config.head_dim as u32,
                     config.scale.unwrap_or(1.0 / (config.head_dim as f32).sqrt()),
                 );
-                let result = kernel.forward_f32(cast_slice(q), cast_slice(k), cast_slice(v), &tree_mask_f32, &params);
+                let result = kernel.forward_f32(cast_slice(q), cast_slice(k), cast_slice(v), m, &params);
                 let out_slice = cast_slice_mut::<T, f32>(o);
                 out_slice.copy_from_slice(&result);
                 true
             }
             _ => CpuBackend.flash_tree_attention(q, k, v, m, o, config),
         }
+    }
+
+    fn flash_tree_attention_gpu_pure(
+        &self,
+        query: &GpuTensor,
+        key: &GpuTensor,
+        value: &GpuTensor,
+        tree_mask: &GpuTensor,
+        output: &mut GpuTensor,
+        config: FlashTreeAttentionConfig,
+    ) -> Result<(), String> {
+        get_wgpu_context()
+            .ok_or("WGPU context unavailable for flash_tree_attention_gpu_pure")?;
+
+        if tree_mask.dtype != TensorDtype::I32 {
+            return Err("WGPU flash_tree_attention_gpu_pure: tree_mask must be i32 tensor".into());
+        }
+
+        let use_f16 = match query.dtype {
+            TensorDtype::F16 => true,
+            TensorDtype::F32 => false,
+            _ => return Err("WGPU flash_tree_attention_gpu_pure: query must be f16 or f32 tensor".into()),
+        };
+        if key.dtype != query.dtype || value.dtype != query.dtype || output.dtype != query.dtype {
+            return Err("WGPU flash_tree_attention_gpu_pure: q/k/v/output dtype mismatch".into());
+        }
+
+        let q_buf = match &query.buffer {
+            GpuBuffer::Wgpu(b) => b,
+            _ => return Err("WGPU flash_tree_attention_gpu_pure: query not WGPU buffer".into()),
+        };
+        let k_buf = match &key.buffer {
+            GpuBuffer::Wgpu(b) => b,
+            _ => return Err("WGPU flash_tree_attention_gpu_pure: key not WGPU buffer".into()),
+        };
+        let v_buf = match &value.buffer {
+            GpuBuffer::Wgpu(b) => b,
+            _ => return Err("WGPU flash_tree_attention_gpu_pure: value not WGPU buffer".into()),
+        };
+        let mask_buf = match &tree_mask.buffer {
+            GpuBuffer::Wgpu(b) => b,
+            _ => return Err("WGPU flash_tree_attention_gpu_pure: tree_mask not WGPU buffer".into()),
+        };
+        let out_buf = match &output.buffer {
+            GpuBuffer::Wgpu(b) => b,
+            _ => return Err("WGPU flash_tree_attention_gpu_pure: output not WGPU buffer".into()),
+        };
+
+        let kernel = WGPU_FLASH_TREE_KERNEL
+            .get_or_init(|| {
+                let ctx = get_wgpu_context()?;
+                WgpuFlashTreeAttn::new_with_device(ctx.device.clone(), ctx.queue.clone()).ok()
+            })
+            .as_ref()
+            .ok_or("WGPU flash_tree kernel init failed")?;
+        if use_f16 && !kernel.has_f16_support() {
+            return Err("WGPU flash_tree_attention_gpu_pure: device does not support f16".into());
+        }
+
+        let params = TreeAttnParams::new(
+            config.batch_size as u32,
+            config.num_heads as u32,
+            config.prefix_len as u32,
+            config.tree_size as u32,
+            config.head_dim as u32,
+            config.scale.unwrap_or(1.0 / (config.head_dim as f32).sqrt()),
+        );
+
+        kernel
+            .forward_gpu_pure(q_buf, k_buf, v_buf, mask_buf, out_buf, params, use_f16)
+            .map_err(|e| format!("WGPU flash_tree_attention_gpu_pure failed: {}", e))
     }
 
     fn medusa_forward<T: KernelFloat>(&self, hl: &[T], config: &MedusaConfig) -> Option<MedusaForwardResult> {
@@ -3731,6 +4134,19 @@ impl Backend for CudaBackend {
         CudaBackend::paged_attention(self, q, k_cache, v_cache, page_table, seq_lens, output, config);
     }
 
+    fn paged_attention_gpu_pure(
+        &self,
+        _query: &GpuTensor,
+        _k_cache: &GpuTensor,
+        _v_cache: &GpuTensor,
+        _block_tables: &GpuTensor,
+        _block_offsets: &GpuTensor,
+        _output: &mut GpuTensor,
+        _config: PagedAttentionConfig,
+    ) -> Result<(), String> {
+        Err("CUDA paged_attention_gpu_pure not yet implemented - requires custom CUDA kernel".into())
+    }
+
     #[inline(always)]
     fn softmax<T: KernelFloat>(&self, input: &[T], output: &mut [T], config: SoftmaxConfig) {
         // Delegate to inherent method
@@ -3804,6 +4220,50 @@ impl Backend for CudaBackend {
         Err("CUDA readback_u32 not implemented".into())
     }
 
+    fn readback_i32(&self, gpu: &GpuTensor, host: &mut [i32]) -> Result<(), String> {
+        if gpu.dtype != TensorDtype::I32 {
+            return Err("CUDA readback_i32 requires i32 tensor".into());
+        }
+        let stream = get_cuda_stream().ok_or("CUDA stream unavailable")?;
+        let buf = match &gpu.buffer {
+            GpuBuffer::Cuda(buf) => buf,
+            _ => return Err("CUDA readback_i32 buffer mismatch".into()),
+        };
+        let required_bytes = host.len() * std::mem::size_of::<i32>();
+        if gpu.size_in_bytes < required_bytes {
+            return Err("CUDA readback_i32 length mismatch".into());
+        }
+        let bytes = cuda_download(stream, buf.as_ref())?;
+        let values: &[i32] = bytemuck::cast_slice(&bytes);
+        if values.len() < host.len() {
+            return Err("CUDA readback_i32 length mismatch".into());
+        }
+        host.copy_from_slice(&values[..host.len()]);
+        Ok(())
+    }
+
+    fn readback_u64(&self, gpu: &GpuTensor, host: &mut [u64]) -> Result<(), String> {
+        if gpu.dtype != TensorDtype::U64 {
+            return Err("CUDA readback_u64 requires u64 tensor".into());
+        }
+        let stream = get_cuda_stream().ok_or("CUDA stream unavailable")?;
+        let buf = match &gpu.buffer {
+            GpuBuffer::Cuda(buf) => buf,
+            _ => return Err("CUDA readback_u64 buffer mismatch".into()),
+        };
+        let required_bytes = host.len() * std::mem::size_of::<u64>();
+        if gpu.size_in_bytes < required_bytes {
+            return Err("CUDA readback_u64 length mismatch".into());
+        }
+        let bytes = cuda_download(stream, buf.as_ref())?;
+        let values: &[u64] = bytemuck::cast_slice(&bytes);
+        if values.len() < host.len() {
+            return Err("CUDA readback_u64 length mismatch".into());
+        }
+        host.copy_from_slice(&values[..host.len()]);
+        Ok(())
+    }
+
     fn upload<T: KernelFloat>(&self, host: &[T], gpu: &mut GpuTensor) -> Result<(), String> {
         let expected_bytes = host.len() * std::mem::size_of::<T>();
         if gpu.size_in_bytes != expected_bytes {
@@ -3833,6 +4293,18 @@ impl Backend for CudaBackend {
     #[inline(always)]
     fn flash_tree_attention<T: KernelFloat>(&self, query: &[T], key: &[T], value: &[T], tree_mask: &[i32], output: &mut [T], config: &FlashTreeAttentionConfig) -> bool {
         CudaBackend::flash_tree_attention(self, query, key, value, tree_mask, output, config)
+    }
+
+    fn flash_tree_attention_gpu_pure(
+        &self,
+        _query: &GpuTensor,
+        _key: &GpuTensor,
+        _value: &GpuTensor,
+        _tree_mask: &GpuTensor,
+        _output: &mut GpuTensor,
+        _config: FlashTreeAttentionConfig,
+    ) -> Result<(), String> {
+        Err("CUDA flash_tree_attention_gpu_pure not yet implemented - requires custom CUDA kernel".into())
     }
 
     #[inline(always)]
@@ -4288,6 +4760,48 @@ impl RocmBackend {
         Err("ROCm readback_u32 not implemented".into())
     }
 
+    fn readback_i32(&self, gpu: &GpuTensor, host: &mut [i32]) -> Result<(), String> {
+        if gpu.dtype != TensorDtype::I32 {
+            return Err("ROCm readback_i32 requires i32 tensor".into());
+        }
+        let buffer = match &gpu.buffer {
+            GpuBuffer::Rocm(buf) => buf,
+            _ => return Err("ROCm readback_i32 buffer mismatch".into()),
+        };
+        let required_bytes = host.len() * std::mem::size_of::<i32>();
+        if gpu.size_in_bytes < required_bytes {
+            return Err("ROCm readback_i32 length mismatch".into());
+        }
+        let bytes = hsa_download(buffer)?;
+        let values: &[i32] = bytemuck::cast_slice(&bytes);
+        if values.len() < host.len() {
+            return Err("ROCm readback_i32 length mismatch".into());
+        }
+        host.copy_from_slice(&values[..host.len()]);
+        Ok(())
+    }
+
+    fn readback_u64(&self, gpu: &GpuTensor, host: &mut [u64]) -> Result<(), String> {
+        if gpu.dtype != TensorDtype::U64 {
+            return Err("ROCm readback_u64 requires u64 tensor".into());
+        }
+        let buffer = match &gpu.buffer {
+            GpuBuffer::Rocm(buf) => buf,
+            _ => return Err("ROCm readback_u64 buffer mismatch".into()),
+        };
+        let required_bytes = host.len() * std::mem::size_of::<u64>();
+        if gpu.size_in_bytes < required_bytes {
+            return Err("ROCm readback_u64 length mismatch".into());
+        }
+        let bytes = hsa_download(buffer)?;
+        let values: &[u64] = bytemuck::cast_slice(&bytes);
+        if values.len() < host.len() {
+            return Err("ROCm readback_u64 length mismatch".into());
+        }
+        host.copy_from_slice(&values[..host.len()]);
+        Ok(())
+    }
+
     #[inline(always)]
     fn upload<T: KernelFloat>(&self, host: &[T], gpu: &mut GpuTensor) -> Result<(), String> {
         let element_size = match T::TYPE_ID {
@@ -4574,6 +5088,19 @@ impl Backend for RocmBackend {
         RocmBackend::paged_attention(self, q, k_cache, v_cache, page_table, seq_lens, output, config);
     }
 
+    fn paged_attention_gpu_pure(
+        &self,
+        _query: &GpuTensor,
+        _k_cache: &GpuTensor,
+        _v_cache: &GpuTensor,
+        _block_tables: &GpuTensor,
+        _block_offsets: &GpuTensor,
+        _output: &mut GpuTensor,
+        _config: PagedAttentionConfig,
+    ) -> Result<(), String> {
+        Err("ROCm paged_attention_gpu_pure not yet implemented - requires custom HIP kernel".into())
+    }
+
     #[inline(always)]
     fn softmax<T: KernelFloat>(&self, input: &[T], output: &mut [T], config: SoftmaxConfig) {
         // Delegate to inherent method
@@ -4671,6 +5198,18 @@ impl Backend for RocmBackend {
     #[inline(always)]
     fn flash_tree_attention<T: KernelFloat>(&self, query: &[T], key: &[T], value: &[T], tree_mask: &[i32], output: &mut [T], config: &FlashTreeAttentionConfig) -> bool {
         RocmBackend::flash_tree_attention(self, query, key, value, tree_mask, output, config)
+    }
+
+    fn flash_tree_attention_gpu_pure(
+        &self,
+        _query: &GpuTensor,
+        _key: &GpuTensor,
+        _value: &GpuTensor,
+        _tree_mask: &GpuTensor,
+        _output: &mut GpuTensor,
+        _config: FlashTreeAttentionConfig,
+    ) -> Result<(), String> {
+        Err("ROCm flash_tree_attention_gpu_pure not yet implemented - requires custom HIP kernel".into())
     }
 
     #[inline(always)]
@@ -5399,6 +5938,19 @@ impl Backend for MetalBackend {
         }
     }
 
+    fn paged_attention_gpu_pure(
+        &self,
+        _query: &GpuTensor,
+        _k_cache: &GpuTensor,
+        _v_cache: &GpuTensor,
+        _block_tables: &GpuTensor,
+        _block_offsets: &GpuTensor,
+        _output: &mut GpuTensor,
+        _config: PagedAttentionConfig,
+    ) -> Result<(), String> {
+        Err("Metal paged_attention_gpu_pure not yet implemented - requires compute shader".into())
+    }
+
     #[inline(always)]
     fn softmax<T: KernelFloat>(&self, input: &[T], output: &mut [T], config: SoftmaxConfig) {
         match T::TYPE_ID {
@@ -5457,6 +6009,38 @@ impl Backend for MetalBackend {
         Err("Metal readback_u32 not implemented".into())
     }
 
+    fn readback_i32(&self, gpu: &GpuTensor, host: &mut [i32]) -> Result<(), String> {
+        if gpu.dtype != TensorDtype::I32 {
+            return Err("Metal readback_i32 requires i32 tensor".into());
+        }
+        let buffer = match &gpu.buffer {
+            GpuBuffer::Metal(buf) => buf,
+            _ => return Err("Metal readback_i32 buffer mismatch".into()),
+        };
+        let data = metal_download::<i32>(buffer, host.len())?;
+        if data.len() != host.len() {
+            return Err("Metal readback_i32 length mismatch".into());
+        }
+        host.copy_from_slice(&data);
+        Ok(())
+    }
+
+    fn readback_u64(&self, gpu: &GpuTensor, host: &mut [u64]) -> Result<(), String> {
+        if gpu.dtype != TensorDtype::U64 {
+            return Err("Metal readback_u64 requires u64 tensor".into());
+        }
+        let buffer = match &gpu.buffer {
+            GpuBuffer::Metal(buf) => buf,
+            _ => return Err("Metal readback_u64 buffer mismatch".into()),
+        };
+        let data = metal_download::<u64>(buffer, host.len())?;
+        if data.len() != host.len() {
+            return Err("Metal readback_u64 length mismatch".into());
+        }
+        host.copy_from_slice(&data);
+        Ok(())
+    }
+
     fn upload<T: KernelFloat>(&self, host: &[T], gpu: &mut GpuTensor) -> Result<(), String> {
         let expected_bytes = host.len() * std::mem::size_of::<T>();
         if gpu.size_in_bytes != expected_bytes {
@@ -5513,6 +6097,18 @@ impl Backend for MetalBackend {
             ),
             _ => CpuBackend.flash_tree_attention(query, key, value, tree_mask, output, config),
         }
+    }
+
+    fn flash_tree_attention_gpu_pure(
+        &self,
+        _query: &GpuTensor,
+        _key: &GpuTensor,
+        _value: &GpuTensor,
+        _tree_mask: &GpuTensor,
+        _output: &mut GpuTensor,
+        _config: FlashTreeAttentionConfig,
+    ) -> Result<(), String> {
+        Err("Metal flash_tree_attention_gpu_pure not yet implemented - requires compute shader".into())
     }
 
     fn medusa_forward<T: KernelFloat>(&self, head_logits: &[T], config: &MedusaConfig) -> Option<MedusaForwardResult> {

@@ -16,15 +16,15 @@ pub(super) const MAX_HEAD_DIM: usize = 256;
 
 #[repr(C)]
 #[derive(Copy, Clone, Debug)]
-pub(super) struct PagedAttentionParams {
-    pub(super) batch_size: u32,
-    pub(super) num_heads: u32,
-    pub(super) head_dim: u32,
-    pub(super) block_size: u32,
-    pub(super) seq_len: u32,
-    pub(super) _pad0: u32,
-    pub(super) _pad1: u32,
-    pub(super) _pad2: u32,
+pub struct PagedAttentionParams {
+    pub batch_size: u32,
+    pub num_heads: u32,
+    pub head_dim: u32,
+    pub block_size: u32,
+    pub seq_len: u32,
+    pub _pad0: u32,
+    pub _pad1: u32,
+    pub _pad2: u32,
 }
 
 /// Errors surfaced by the WGPU paged attention kernels.

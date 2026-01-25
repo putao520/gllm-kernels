@@ -51,7 +51,7 @@ use crate::wgpu_kernels::{
 };
 
 // Re-export rerank types for public API
-pub use crate::wgpu_kernels::{GpuRerankConfig, GpuRerankStageResult};
+pub use crate::wgpu_kernels::embedding_ops::{GpuRerankConfig, GpuRerankStageResult};
 
 #[cfg(target_os = "macos")]
 use crate::metal_kernels::{
@@ -5840,11 +5840,6 @@ fn wgpu_flash_tree_attention<T: KernelFloat>(
         ctx_len,
         config.head_dim,
     );
-    let mask_f32: Vec<f32> = tree_mask
-        .iter()
-        .map(|&v| if v != 0 { 1.0 } else { 0.0 })
-        .collect();
-
     let scale = config.scale.unwrap_or(1.0 / (config.head_dim as f32).sqrt());
     let params = crate::wgpu_kernels::flash_tree_attn::TreeAttnParams::new(
         config.batch_size as u32,
@@ -5854,7 +5849,7 @@ fn wgpu_flash_tree_attention<T: KernelFloat>(
         config.head_dim as u32,
         scale,
     );
-    let out = kernel.forward_f32(&q_reordered, &k_reordered, &v_reordered, &mask_f32, &params);
+    let out = kernel.forward_f32(&q_reordered, &k_reordered, &v_reordered, tree_mask, &params);
     let out_reordered = reorder_blhd_to_bhld(
         &out,
         config.batch_size,

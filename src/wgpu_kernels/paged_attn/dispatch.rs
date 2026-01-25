@@ -232,4 +232,64 @@ impl PagedAttentionKernel {
         pass.set_bind_group(0, bind_group, &[]);
         pass.dispatch_workgroups(workgroups_x, workgroups_y, 1);
     }
+
+    /// GPU-pure paged attention forward - works directly with GPU buffers.
+    /// No readback/upload - result stays in GPU memory.
+    pub fn forward_gpu_pure(
+        &self,
+        query: &wgpu::Buffer,
+        k_cache: &wgpu::Buffer,
+        v_cache: &wgpu::Buffer,
+        block_tables: &wgpu::Buffer,
+        block_offsets: &wgpu::Buffer,
+        output: &wgpu::Buffer,
+        params: PagedAttentionParams,
+        use_f16: bool,
+    ) -> Result<(), PagedAttentionError> {
+        let pipeline = if use_f16 {
+            self.pipeline_f16.as_ref().ok_or_else(|| {
+                PagedAttentionError::Unsupported("device does not support f16 kernels".into())
+            })?
+        } else {
+            &self.pipeline_f32
+        };
+
+        // Create params buffer
+        let params_buffer = self.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("paged_attention_params_gpu_pure"),
+            contents: bytes_of(&params),
+            usage: wgpu::BufferUsages::UNIFORM,
+        });
+
+        // Create bind group with existing buffers
+        let bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("paged_attention_bind_group_gpu_pure"),
+            layout: &self.bind_group_layout,
+            entries: &[
+                buffer_binding(0, query),
+                buffer_binding(1, k_cache),
+                buffer_binding(2, v_cache),
+                buffer_binding(3, block_tables),
+                buffer_binding(4, block_offsets),
+                buffer_binding(5, output),
+                buffer_binding(6, &params_buffer),
+            ],
+        });
+
+        let mut encoder = self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+            label: Some("paged_attention_encoder_gpu_pure"),
+        });
+
+        self.encode_pass(
+            &mut encoder,
+            pipeline,
+            &bind_group,
+            params.seq_len,
+            params.batch_size,
+            params.num_heads,
+        );
+
+        self.queue.submit(std::iter::once(encoder.finish()));
+        Ok(())
+    }
 }
