@@ -216,32 +216,6 @@ pub trait Backend: Send + Sync {
         config: MoERoutingGpuConfig,
     ) -> Result<(), String>;
 
-    /// Fused MoE forward: single kernel launch for all experts.
-    ///
-    /// This is the high-level operator that replaces multiple fine-grained calls.
-    /// Computes: output = sum(weight[k] * FFN(input, expert[k])) for selected experts
-    ///
-    /// # Arguments
-    /// * `input` - Input tensor [num_tokens, hidden_size]
-    /// * `expert_indices` - Selected expert indices [num_tokens * top_k]
-    /// * `expert_weights` - Routing weights [num_tokens * top_k]
-    /// * `all_gate_weights` - All experts' gate weights [num_experts, intermediate, hidden]
-    /// * `all_up_weights` - All experts' up weights [num_experts, intermediate, hidden]
-    /// * `all_down_weights` - All experts' down weights [num_experts, hidden, intermediate]
-    /// * `output` - Output tensor [num_tokens, hidden_size] (accumulated)
-    /// * `config` - MoE configuration
-    fn moe_forward_gpu(
-        &self,
-        input: &GpuTensor,
-        expert_indices: &[u32],
-        expert_weights: &[f32],
-        all_gate_weights: &GpuTensor,
-        all_up_weights: &GpuTensor,
-        all_down_weights: &GpuTensor,
-        output: &mut GpuTensor,
-        config: MoEForwardConfig,
-    ) -> Result<(), String>;
-
     /// Fused MoE forward with routing tensors already on GPU.
     ///
     /// This is the pure GPU path required by ARCH-MOE-001/002.
@@ -659,28 +633,6 @@ impl DispatchedBackend {
             Self::Rocm(b) => b.moe_route_gpu(hidden_states, gate_weights, expert_indices_out, expert_weights_out, config),
 #[cfg(target_os = "macos")]
             Self::Metal(b) => b.moe_route_gpu(hidden_states, gate_weights, expert_indices_out, expert_weights_out, config),
-        }
-    }
-
-    #[inline(always)]
-    pub fn moe_forward_gpu(
-        &self,
-        input: &GpuTensor,
-        expert_indices: &[u32],
-        expert_weights: &[f32],
-        all_gate_weights: &GpuTensor,
-        all_up_weights: &GpuTensor,
-        all_down_weights: &GpuTensor,
-        output: &mut GpuTensor,
-        config: MoEForwardConfig,
-    ) -> Result<(), String> {
-        match self {
-            Self::Cpu(b) => b.moe_forward_gpu(input, expert_indices, expert_weights, all_gate_weights, all_up_weights, all_down_weights, output, config),
-            Self::Wgpu(b) => b.moe_forward_gpu(input, expert_indices, expert_weights, all_gate_weights, all_up_weights, all_down_weights, output, config),
-            Self::Cuda(b) => b.moe_forward_gpu(input, expert_indices, expert_weights, all_gate_weights, all_up_weights, all_down_weights, output, config),
-            Self::Rocm(b) => b.moe_forward_gpu(input, expert_indices, expert_weights, all_gate_weights, all_up_weights, all_down_weights, output, config),
-#[cfg(target_os = "macos")]
-            Self::Metal(b) => b.moe_forward_gpu(input, expert_indices, expert_weights, all_gate_weights, all_up_weights, all_down_weights, output, config),
         }
     }
 
@@ -1682,116 +1634,6 @@ impl Backend for CpuBackend {
         _: MoERoutingGpuConfig,
     ) -> Result<(), String> {
         Err("CPU backend does not support GPU MoE routing".into())
-    }
-
-    fn moe_forward_gpu(
-        &self,
-        input: &GpuTensor,
-        expert_indices: &[u32],
-        expert_weights: &[f32],
-        all_gate_weights: &GpuTensor,
-        all_up_weights: &GpuTensor,
-        all_down_weights: &GpuTensor,
-        output: &mut GpuTensor,
-        config: MoEForwardConfig,
-    ) -> Result<(), String> {
-        // CPU fallback implementation
-        let input_data = match &input.buffer {
-            GpuBuffer::Cpu(buf) => bytemuck::try_cast_slice::<u8, f32>(buf.as_ref())
-                .map_err(|_| "CPU moe_forward_gpu input alignment error".to_string())?,
-            _ => return Err("CPU backend: moe_forward_gpu requires CPU buffer".into()),
-        };
-        let gate_weights = match &all_gate_weights.buffer {
-            GpuBuffer::Cpu(buf) => bytemuck::try_cast_slice::<u8, f32>(buf.as_ref())
-                .map_err(|_| "CPU moe_forward_gpu gate_weights alignment error".to_string())?,
-            _ => return Err("CPU backend: moe_forward_gpu requires CPU buffer".into()),
-        };
-        let up_weights = match &all_up_weights.buffer {
-            GpuBuffer::Cpu(buf) => bytemuck::try_cast_slice::<u8, f32>(buf.as_ref())
-                .map_err(|_| "CPU moe_forward_gpu up_weights alignment error".to_string())?,
-            _ => return Err("CPU backend: moe_forward_gpu requires CPU buffer".into()),
-        };
-        let down_weights = match &all_down_weights.buffer {
-            GpuBuffer::Cpu(buf) => bytemuck::try_cast_slice::<u8, f32>(buf.as_ref())
-                .map_err(|_| "CPU moe_forward_gpu down_weights alignment error".to_string())?,
-            _ => return Err("CPU backend: moe_forward_gpu requires CPU buffer".into()),
-        };
-
-        let output_data = match &mut output.buffer {
-            GpuBuffer::Cpu(buf) => {
-                let data = Arc::make_mut(buf);
-                bytemuck::try_cast_slice_mut::<u8, f32>(data)
-                    .map_err(|_| "CPU moe_forward_gpu output alignment error".to_string())?
-            }
-            _ => return Err("CPU backend: moe_forward_gpu requires CPU buffer".into()),
-        };
-
-        let hidden = config.hidden_size;
-        let intermediate = config.intermediate_size;
-
-        // Scratch space for intermediate computations
-        let mut gate_out = vec![0.0f32; intermediate];
-        let mut up_out = vec![0.0f32; intermediate];
-
-        // Zero output
-        output_data.fill(0.0);
-
-        // For each token
-        for token in 0..config.num_tokens {
-            let token_input = &input_data[token * hidden..(token + 1) * hidden];
-            let token_output = &mut output_data[token * hidden..(token + 1) * hidden];
-
-            // For each selected expert
-            for k in 0..config.top_k {
-                let routing_idx = token * config.top_k + k;
-                let expert_idx = expert_indices[routing_idx] as usize;
-                let weight = expert_weights[routing_idx];
-
-                if expert_idx >= config.num_experts || weight == 0.0 {
-                    continue;
-                }
-
-                // Expert weight offsets
-                let gate_offset = expert_idx * intermediate * hidden;
-                let up_offset = expert_idx * intermediate * hidden;
-                let down_offset = expert_idx * hidden * intermediate;
-
-                // Gate projection: gate_out = input @ gate_weights[expert]
-                for i in 0..intermediate {
-                    let mut sum = 0.0f32;
-                    for j in 0..hidden {
-                        sum += token_input[j] * gate_weights[gate_offset + i * hidden + j];
-                    }
-                    gate_out[i] = sum;
-                }
-
-                // Up projection: up_out = input @ up_weights[expert]
-                for i in 0..intermediate {
-                    let mut sum = 0.0f32;
-                    for j in 0..hidden {
-                        sum += token_input[j] * up_weights[up_offset + i * hidden + j];
-                    }
-                    up_out[i] = sum;
-                }
-
-                // SiLU(gate) * up
-                for i in 0..intermediate {
-                    let x = gate_out[i];
-                    gate_out[i] = (x / (1.0 + (-x).exp())) * up_out[i];
-                }
-
-                // Down projection with weighted accumulation
-                for i in 0..hidden {
-                    let mut sum = 0.0f32;
-                    for j in 0..intermediate {
-                        sum += gate_out[j] * down_weights[down_offset + i * intermediate + j];
-                    }
-                    token_output[i] += weight * sum;
-                }
-            }
-        }
-
-        Ok(())
     }
 
     fn moe_forward_gpu_pure(
@@ -2905,95 +2747,6 @@ impl Backend for WgpuBackend {
         }).as_ref().ok_or("WGPU MoE routing kernel init failed")?;
 
         kernel.forward(params, hidden_buf, gate_buf, indices_buf, weights_buf);
-        Ok(())
-    }
-
-    fn moe_forward_gpu(
-        &self,
-        input: &GpuTensor,
-        expert_indices: &[u32],
-        expert_weights: &[f32],
-        all_gate_weights: &GpuTensor,
-        all_up_weights: &GpuTensor,
-        all_down_weights: &GpuTensor,
-        output: &mut GpuTensor,
-        config: MoEForwardConfig,
-    ) -> Result<(), String> {
-        let ctx = get_wgpu_context()
-            .ok_or("WGPU context unavailable for moe_forward_gpu")?;
-
-        let in_buf = match &input.buffer {
-            GpuBuffer::Wgpu(b) => b,
-            _ => return Err("WGPU moe_forward_gpu: input not WGPU buffer".into()),
-        };
-        let gate_buf = match &all_gate_weights.buffer {
-            GpuBuffer::Wgpu(b) => b,
-            _ => return Err("WGPU moe_forward_gpu: gate_weights not WGPU buffer".into()),
-        };
-        let up_buf = match &all_up_weights.buffer {
-            GpuBuffer::Wgpu(b) => b,
-            _ => return Err("WGPU moe_forward_gpu: up_weights not WGPU buffer".into()),
-        };
-        let down_buf = match &all_down_weights.buffer {
-            GpuBuffer::Wgpu(b) => b,
-            _ => return Err("WGPU moe_forward_gpu: down_weights not WGPU buffer".into()),
-        };
-        let out_buf = match &output.buffer {
-            GpuBuffer::Wgpu(b) => b,
-            _ => return Err("WGPU moe_forward_gpu: output not WGPU buffer".into()),
-        };
-
-        // Upload routing info to GPU
-        let indices_buf = ctx.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-            label: Some("MoE Expert Indices"),
-            contents: bytemuck::cast_slice(expert_indices),
-            usage: wgpu::BufferUsages::STORAGE,
-        });
-        let weights_buf = ctx.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-            label: Some("MoE Expert Weights"),
-            contents: bytemuck::cast_slice(expert_weights),
-            usage: wgpu::BufferUsages::STORAGE,
-        });
-
-        // Scratch space for intermediate computations
-        let scratch_size = config.num_tokens * config.top_k * config.intermediate_size * 2 * 4;
-        let scratch_buf = ctx.device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("MoE FFN Scratch"),
-            size: scratch_size as u64,
-            usage: wgpu::BufferUsages::STORAGE,
-            mapped_at_creation: false,
-        });
-
-        // Initialize MoE FFN kernel (lazy)
-        static MOE_FFN: OnceLock<Option<WgpuMoeFfn>> = OnceLock::new();
-        let moe_kernel = MOE_FFN.get_or_init(|| {
-            let ctx = get_wgpu_context()?;
-            Some(WgpuMoeFfn::new(ctx.device.clone(), ctx.queue.clone()))
-        }).as_ref().ok_or("WGPU MoE FFN kernel init failed")?;
-
-        let params = MoEFfnParams {
-            hidden_size: config.hidden_size as u32,
-            intermediate_size: config.intermediate_size as u32,
-            num_tokens: config.num_tokens as u32,
-            top_k: config.top_k as u32,
-            num_experts: config.num_experts as u32,
-            _padding0: 0,
-            _padding1: 0,
-            _padding2: 0,
-        };
-
-        moe_kernel.forward(
-            in_buf,
-            &indices_buf,
-            &weights_buf,
-            gate_buf,
-            up_buf,
-            down_buf,
-            out_buf,
-            &scratch_buf,
-            params,
-        );
-
         Ok(())
     }
 
@@ -4219,21 +3972,6 @@ impl Backend for CudaBackend {
         Err("CUDA moe_route_gpu not yet implemented - requires custom CUDA kernel".into())
     }
 
-    fn moe_forward_gpu(
-        &self,
-        _input: &GpuTensor,
-        _expert_indices: &[u32],
-        _expert_weights: &[f32],
-        _all_gate_weights: &GpuTensor,
-        _all_up_weights: &GpuTensor,
-        _all_down_weights: &GpuTensor,
-        _output: &mut GpuTensor,
-        _config: MoEForwardConfig,
-    ) -> Result<(), String> {
-        // TODO: Implement CUDA fused MoE kernel
-        Err("CUDA moe_forward_gpu not yet implemented - requires custom CUDA kernel".into())
-    }
-
     fn moe_forward_gpu_pure(
         &self,
         _input: &GpuTensor,
@@ -5038,21 +4776,6 @@ impl Backend for RocmBackend {
         _config: MoERoutingGpuConfig,
     ) -> Result<(), String> {
         Err("ROCm moe_route_gpu not yet implemented - requires custom HIP kernel".into())
-    }
-
-    fn moe_forward_gpu(
-        &self,
-        _input: &GpuTensor,
-        _expert_indices: &[u32],
-        _expert_weights: &[f32],
-        _all_gate_weights: &GpuTensor,
-        _all_up_weights: &GpuTensor,
-        _all_down_weights: &GpuTensor,
-        _output: &mut GpuTensor,
-        _config: MoEForwardConfig,
-    ) -> Result<(), String> {
-        // TODO: Implement ROCm fused MoE kernel
-        Err("ROCm moe_forward_gpu not yet implemented - requires custom HIP kernel".into())
     }
 
     fn moe_forward_gpu_pure(
@@ -5929,21 +5652,6 @@ impl Backend for MetalBackend {
         _config: MoERoutingGpuConfig,
     ) -> Result<(), String> {
         Err("Metal moe_route_gpu not yet implemented - requires compute shader".into())
-    }
-
-    fn moe_forward_gpu(
-        &self,
-        _input: &GpuTensor,
-        _expert_indices: &[u32],
-        _expert_weights: &[f32],
-        _all_gate_weights: &GpuTensor,
-        _all_up_weights: &GpuTensor,
-        _all_down_weights: &GpuTensor,
-        _output: &mut GpuTensor,
-        _config: MoEForwardConfig,
-    ) -> Result<(), String> {
-        // TODO: Implement Metal fused MoE kernel
-        Err("Metal moe_forward_gpu not yet implemented - requires compute shader".into())
     }
 
     fn moe_forward_gpu_pure(
