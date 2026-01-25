@@ -23,6 +23,11 @@ pub mod int2_quantizer;
 
 // Utility kernels
 pub mod embedding_ops;
+pub mod linear;
+pub mod rms_norm;
+pub mod tensor_ops;
+pub mod moe_ffn;
+pub mod moe_routing_gpu;
 
 // Re-exports - Core attention
 pub use flash_attn::{FlashAttentionError, FlashAttentionKernel};
@@ -63,4 +68,10 @@ pub use int2_quantizer::{
 };
 
 // Re-exports - Utility
-pub use embedding_ops::{EmbeddingOpsError, EmbeddingOpsKernel, GpuRerankConfig, GpuRerankStageResult};
+pub use embedding_ops::{EmbeddingOpsError, EmbeddingOpsKernel};
+// Note: GpuRerankConfig and GpuRerankStageResult are exported from crate::types
+pub use linear::{LinearError, LinearParams, WgpuLinear};
+pub use rms_norm::{RmsNormError, RmsNormParams, WgpuRmsNorm};
+pub use tensor_ops::{TensorOpsParams, WgpuTensorOps};
+pub use moe_ffn::{MoEFfnParams, WgpuMoeFfn};
+pub use moe_routing_gpu::{MoERoutingGpuParams, WgpuMoERouting};
