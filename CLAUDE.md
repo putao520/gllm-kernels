@@ -61,6 +61,76 @@ match T::TYPE_ID {  // T::TYPE_ID 是 const
 
 **WGSL 说明**：WGSL 是 WebGPU 的中间表示（IR），虽然 wgpu 会将其转换为原生格式，但这是"中间态到原生码的加载"（类似 PTX 到 GPU 机器码），不是"源码编译"。
 
+### 简化后端架构（ARCH-BACKEND-001 🚨 重构铁律）
+
+**Backend = 硬件算法工具库，就这么简单**。
+
+**当前问题**（必须重构）：
+```
+❌ 当前：DispatchedBackend enum + 每个方法都 match 分发
+         → 6000+ 行代码，46 个 match，过度复杂
+
+backend.rs:
+pub enum DispatchedBackend { Cpu, Wgpu, Cuda, Rocm, Metal }
+impl DispatchedBackend {
+    fn flash_attention(&self, ...) {
+        match self {  // 每个方法都重复这个！
+            Self::Cpu(b) => b.flash_attention(...),
+            Self::Wgpu(b) => b.flash_attention(...),
+            Self::Cuda(b) => b.flash_attention(...),
+            // ...
+        }
+    }
+    // 46 个这样的 match 分发函数！
+}
+```
+
+**正确架构**：
+```rust
+// 1. Backend trait - 十几个应用级算子
+pub trait Backend: Send + Sync {
+    fn flash_attention(&self, ...);
+    fn paged_attention(&self, ...);
+    fn moe_forward(&self, ...);
+    fn rms_norm(&self, ...);
+    // 就这些，不需要更多
+}
+
+// 2. 每个后端各自实现 - 分离的文件
+// wgpu_backend.rs
+impl Backend for WgpuBackend { ... }
+
+// cuda_backend.rs
+impl Backend for CudaBackend { ... }
+
+// cpu_backend.rs
+impl Backend for CpuBackend { ... }
+
+// 3. 启动时选一次，直接用
+pub fn auto_select_backend() -> Arc<dyn Backend> {
+    if cuda_available() { return Arc::new(CudaBackend::new()); }
+    if rocm_available() { return Arc::new(RocmBackend::new()); }
+    if metal_available() { return Arc::new(MetalBackend::new()); }
+    if wgpu_available() { return Arc::new(WgpuBackend::new()); }
+    Arc::new(CpuBackend::new())
+}
+
+// 4. 使用 - 一次动态分发，完事
+let backend = auto_select_backend();
+backend.flash_attention(...);  // 直接调用，没有中间层
+```
+
+**重构目标**：
+- [ ] 删除 `DispatchedBackend` enum 和所有 match 分发
+- [ ] Backend trait 只保留 ~15 个核心应用级算子
+- [ ] 每个后端在独立文件：`wgpu_backend.rs`, `cuda_backend.rs`, `cpu_backend.rs`
+- [ ] `auto_select_backend()` 返回 `Arc<dyn Backend>`
+- [ ] 目标：backend.rs 从 6000+ 行降到 < 500 行
+
+**关于 `dyn Trait`**：
+- ❌ 热路径内部禁止（每次 matmul 都 vtable = 开销）
+- ✅ 启动时选一次后端完全可以（一次 vtable 查找，忽略不计）
+
 ### 零配置原则
 
 - 用户不需要配置任何东西

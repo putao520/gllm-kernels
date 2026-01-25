@@ -7,3 +7,5 @@ Cargo.lock
 
 # SPEC documents (managed separately)
 SPEC/
+error_log.txt
+errors.txt
