@@ -35,8 +35,17 @@ pub mod wgpu_kernels;
 
 // Runtime backend detection
 pub mod runtime_detection;
+pub mod backend;
 pub mod backend_trait;
-pub mod backend_selector;
+mod backend_core;
+mod backend_core_attention;
+mod backend_core_sampling;
+mod backend_core_moe;
+pub mod cpu_backend;
+pub mod wgpu_backend;
+pub mod cuda_backend;
+pub mod rocm_backend;
+pub mod metal_backend;
 pub mod kernel_cache;
 
 // Zero-cost kernel dispatcher

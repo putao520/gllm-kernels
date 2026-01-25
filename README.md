@@ -98,10 +98,7 @@ gllm-kernels
 │   ├── flash_attention.rs      # HierarchicalFlashAttention
 │   ├── flash_attention_v3.rs   # Advanced attention variants
 │   ├── paged_attention.rs      # KV cache paging
-│   ├── ring_attention.rs       # Distributed attention
 │   ├── sparse_attention.rs     # Sparse patterns
-│   ├── mla.rs                  # Multi-head Latent Attention
-│   ├── mamba.rs                # State space models
 │   └── kv_compression.rs       # KV cache compression
 ├── cuda_kernels/
 │   ├── flash_attn.rs           # CUDA kernel bindings

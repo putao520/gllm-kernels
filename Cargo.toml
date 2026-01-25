@@ -65,7 +65,6 @@ rocm-kernel = []
 metal-kernel = []
 wgpu-kernel = []
 fused-kernel = []
-mamba-kernel = []
 paged-kernel = []
 softmax-kernel = []
 

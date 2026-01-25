@@ -23,11 +23,9 @@ use gllm_kernels::ops::flash_attention::{
 use gllm_kernels::ops::flash_attention_v3::{FlashAttention3, FlashAttention3Config};
 use gllm_kernels::ops::kv_compression::{CompressionMethod, KVCacheCompressor};
 use gllm_kernels::ops::sparse_attention::{SparseAttention, SparseAttentionConfig, SparsityPattern};
-use gllm_kernels::ops::mla::MultiHeadLatentAttention;
 use gllm_kernels::ops::speculative_decoding::{
     PredictionConfig, PredictionHeadType, SpeculativeDecoder, TreeConfig, VerificationStrategy,
 };
-use gllm_kernels::ops::mamba::{HybridLayer, HybridStrategy, MambaBlock, MambaConfig, MambaParameters};
 #[cfg(all(feature = "cuda-kernel", feature = "cuda"))]
 use gllm_kernels::FlashAttentionKernel;
 #[cfg(all(feature = "cuda-kernel", feature = "cuda"))]
@@ -310,77 +308,6 @@ fn bench_flash_attention_cuda_kernel(c: &mut Criterion) {
 #[cfg(not(all(feature = "cuda-kernel", feature = "cuda")))]
 fn bench_flash_attention_cuda_kernel(_c: &mut Criterion) {}
 
-fn bench_mla_compression(c: &mut Criterion) {
-    let mut group = c.benchmark_group("mla");
-    configure_group(&mut group);
-
-    let device = CpuDevice::default();
-    let batch = 1usize;
-    let num_heads = 8usize;
-    let seq_len = 1024usize;
-    let head_dim = 64usize;
-
-    let k = Tensor::<CpuBackend, 4>::random(
-        [batch, num_heads, seq_len, head_dim],
-        Distribution::Normal(0.0, 1.0),
-        &device,
-    );
-    let v = Tensor::<CpuBackend, 4>::random(
-        [batch, num_heads, seq_len, head_dim],
-        Distribution::Normal(0.0, 1.0),
-        &device,
-    );
-    let ratios = [8usize, 16];
-
-    for &ratio in &ratios {
-        let latent_dim = (head_dim / ratio).max(1);
-        let down_proj = Tensor::<CpuBackend, 2>::random(
-            [head_dim, latent_dim],
-            Distribution::Normal(0.0, 1.0),
-            &device,
-        );
-        let up_proj = Tensor::<CpuBackend, 2>::random(
-            [latent_dim, head_dim],
-            Distribution::Normal(0.0, 1.0),
-            &device,
-        );
-        let rope_key = Tensor::<CpuBackend, 2>::random(
-            [latent_dim, head_dim],
-            Distribution::Normal(0.0, 1.0),
-            &device,
-        );
-        let mla = MultiHeadLatentAttention::new(ratio, latent_dim, down_proj, up_proj, rope_key);
-
-        let input_bytes = kv_bytes(batch, num_heads, seq_len, head_dim);
-        let compressed_bytes = kv_bytes(batch, num_heads, seq_len, latent_dim);
-        report_compression(&format!("mla/ratio{}", ratio), input_bytes, compressed_bytes);
-
-        group.throughput(Throughput::Bytes(input_bytes));
-        let id = format!("compress_ratio{}", ratio);
-        group.bench_function(id, |b| {
-            b.iter(|| {
-                let (k_latent, v_latent) = mla.compress_kv(k.clone(), v.clone()).unwrap();
-                black_box(k_latent);
-                black_box(v_latent);
-            })
-        });
-
-        let (k_latent, v_latent) = mla.compress_kv(k.clone(), v.clone()).unwrap();
-        group.throughput(Throughput::Bytes(compressed_bytes));
-        let id = format!("decompress_ratio{}", ratio);
-        group.bench_function(id, |b| {
-            b.iter(|| {
-                let (k_full, v_full) =
-                    mla.decompress_kv(k_latent.clone(), v_latent.clone()).unwrap();
-                black_box(k_full);
-                black_box(v_full);
-            })
-        });
-    }
-
-    group.finish();
-}
-
 fn bench_sparse_attention(c: &mut Criterion) {
     let mut group = c.benchmark_group("sparse");
     configure_group(&mut group);
@@ -599,100 +526,6 @@ fn bench_speculative_decoding(c: &mut Criterion) {
     group.finish();
 }
 
-fn bench_mamba(c: &mut Criterion) {
-    let mut group = c.benchmark_group("mamba");
-    configure_group(&mut group);
-
-    let device = CpuDevice::default();
-    let batch = 2usize;
-    let seq_len = 128usize;
-    let state_dims = [16usize, 64];
-
-    for &state_dim in &state_dims {
-        let input_dim = state_dim * 4;
-        let config = MambaConfig {
-            state_dim,
-            input_dim,
-            expand_ratio: 2,
-            selective: true,
-        };
-        let block = MambaBlock::<CpuBackend>::from_config(&config);
-
-        let expanded_dim = input_dim * config.expand_ratio;
-        let params = MambaParameters {
-            dt_proj: Tensor::<CpuBackend, 2>::random(
-                [expanded_dim, state_dim],
-                Distribution::Normal(0.0, 1.0),
-                &device,
-            ),
-            a: Tensor::<CpuBackend, 1>::random(
-                [state_dim],
-                Distribution::Normal(0.0, 1.0),
-                &device,
-            ),
-            b: Tensor::<CpuBackend, 2>::random(
-                [expanded_dim, state_dim],
-                Distribution::Normal(0.0, 1.0),
-                &device,
-            ),
-            c: Tensor::<CpuBackend, 2>::random(
-                [state_dim, expanded_dim],
-                Distribution::Normal(0.0, 1.0),
-                &device,
-            ),
-            d: Tensor::<CpuBackend, 1>::random(
-                [expanded_dim],
-                Distribution::Normal(0.0, 1.0),
-                &device,
-            ),
-        };
-
-        let input = Tensor::<CpuBackend, 3>::random(
-            [batch, seq_len, input_dim],
-            Distribution::Normal(0.0, 1.0),
-            &device,
-        );
-
-        let tokens = (batch * seq_len) as u64;
-        group.throughput(Throughput::Elements(tokens));
-        let id = format!("forward_state{}", state_dim);
-        group.bench_function(id, |b| {
-            b.iter(|| {
-                let (output, state) = block
-                    .forward(input.clone(), &params, None, config.selective)
-                    .unwrap();
-                black_box(output);
-                black_box(state);
-            })
-        });
-
-        let layer = HybridLayer::<CpuBackend>::new(
-            HybridStrategy::Parallel { mamba_weight: 0.35 },
-            0,
-        );
-        let attention = Tensor::<CpuBackend, 3>::random(
-            [batch, seq_len, input_dim],
-            Distribution::Normal(0.0, 1.0),
-            &device,
-        );
-        let mamba = Tensor::<CpuBackend, 3>::random(
-            [batch, seq_len, input_dim],
-            Distribution::Normal(0.0, 1.0),
-            &device,
-        );
-        group.throughput(Throughput::Elements(tokens));
-        let id = format!("blend_state{}", state_dim);
-        group.bench_function(id, |b| {
-            b.iter(|| {
-                let output = layer.combine(attention.clone(), mamba.clone()).unwrap();
-                black_box(output);
-            })
-        });
-    }
-
-    group.finish();
-}
-
 fn bench_e2e_pipeline(c: &mut Criterion) {
     let mut group = c.benchmark_group("e2e");
     configure_group(&mut group);
@@ -721,47 +554,6 @@ fn bench_e2e_pipeline(c: &mut Criterion) {
     );
 
     let flash = HierarchicalFlashAttention::default_config();
-
-    let latent_dim = head_dim / 8;
-    let mla = MultiHeadLatentAttention::new(
-        8,
-        latent_dim,
-        Tensor::<CpuBackend, 2>::random(
-            [head_dim, latent_dim],
-            Distribution::Normal(0.0, 1.0),
-            &device,
-        ),
-        Tensor::<CpuBackend, 2>::random(
-            [latent_dim, head_dim],
-            Distribution::Normal(0.0, 1.0),
-            &device,
-        ),
-        Tensor::<CpuBackend, 2>::random(
-            [latent_dim, head_dim],
-            Distribution::Normal(0.0, 1.0),
-            &device,
-        ),
-    );
-    let sparse = SparseAttention::new(SparseAttentionConfig {
-        selected_kv_count: 512,
-        block_size: 128,
-        sparsity_pattern: SparsityPattern::Dynamic,
-    });
-
-    group.throughput(Throughput::Elements(tokens));
-    group.bench_function("flash_mla_sparse", |b| {
-        b.iter(|| {
-            let (k_latent, v_latent) = mla.compress_kv(k.clone(), v.clone()).unwrap();
-            let (k_full, v_full) = mla.decompress_kv(k_latent, v_latent).unwrap();
-            let k_for_scores = k_full.clone();
-            let output = flash.forward(q.clone(), k_full, v_full, false, 0);
-            let scores = q.clone().matmul(k_for_scores.transpose());
-            let (masked, selection) = sparse.sparsify_scores(scores).unwrap();
-            black_box(output);
-            black_box(masked);
-            black_box(selection);
-        })
-    });
 
     let compressor = KVCacheCompressor::<CpuBackend>::new(
         CompressionMethod::Hybrid {
@@ -1106,11 +898,9 @@ criterion_group!(
     bench_flash_attention_baseline,
     bench_flash_attention_v3,
     bench_flash_attention_cuda_kernel,
-    bench_mla_compression,
     bench_sparse_attention,
     bench_kv_compression,
     bench_speculative_decoding,
-    bench_mamba,
     bench_e2e_pipeline
 );
 criterion_main!(benches);
