@@ -181,6 +181,9 @@ pub trait Backend: Send + Sync {
     /// Read GPU tensor back to host (generic).
     fn readback<T: KernelFloat>(&self, gpu: &GpuTensor, host: &mut [T]) -> Result<(), String>;
 
+    /// Read GPU u32 tensor back to host (type-safe).
+    fn readback_u32(&self, gpu: &GpuTensor, host: &mut [u32]) -> Result<(), String>;
+
     /// Upload host data to GPU tensor (generic).
     fn upload<T: KernelFloat>(&self, host: &[T], gpu: &mut GpuTensor) -> Result<(), String>;
 
@@ -232,6 +235,21 @@ pub trait Backend: Send + Sync {
         input: &GpuTensor,
         expert_indices: &[u32],
         expert_weights: &[f32],
+        all_gate_weights: &GpuTensor,
+        all_up_weights: &GpuTensor,
+        all_down_weights: &GpuTensor,
+        output: &mut GpuTensor,
+        config: MoEForwardConfig,
+    ) -> Result<(), String>;
+
+    /// Fused MoE forward with routing tensors already on GPU.
+    ///
+    /// This is the pure GPU path required by ARCH-MOE-001/002.
+    fn moe_forward_gpu_pure(
+        &self,
+        input: &GpuTensor,
+        expert_indices: &GpuTensor,
+        expert_weights: &GpuTensor,
         all_gate_weights: &GpuTensor,
         all_up_weights: &GpuTensor,
         all_down_weights: &GpuTensor,
@@ -538,6 +556,19 @@ impl DispatchedBackend {
         }
     }
 
+    /// Read GPU u32 tensor back to host (type-safe).
+    #[inline(always)]
+    pub fn readback_u32(&self, gpu: &GpuTensor, host: &mut [u32]) -> Result<(), String> {
+        match self {
+            Self::Cpu(b) => b.readback_u32(gpu, host),
+            Self::Wgpu(b) => b.readback_u32(gpu, host),
+            Self::Cuda(b) => b.readback_u32(gpu, host),
+            Self::Rocm(b) => b.readback_u32(gpu, host),
+#[cfg(target_os = "macos")]
+            Self::Metal(b) => b.readback_u32(gpu, host),
+        }
+    }
+
     #[inline(always)]
     pub fn upload<T: KernelFloat>(&self, host: &[T], gpu: &mut GpuTensor) -> Result<(), String> {
         match self {
@@ -650,6 +681,29 @@ impl DispatchedBackend {
             Self::Rocm(b) => b.moe_forward_gpu(input, expert_indices, expert_weights, all_gate_weights, all_up_weights, all_down_weights, output, config),
 #[cfg(target_os = "macos")]
             Self::Metal(b) => b.moe_forward_gpu(input, expert_indices, expert_weights, all_gate_weights, all_up_weights, all_down_weights, output, config),
+        }
+    }
+
+    /// Fused MoE forward with routing tensors on GPU.
+    #[inline(always)]
+    pub fn moe_forward_gpu_pure(
+        &self,
+        input: &GpuTensor,
+        expert_indices: &GpuTensor,
+        expert_weights: &GpuTensor,
+        all_gate_weights: &GpuTensor,
+        all_up_weights: &GpuTensor,
+        all_down_weights: &GpuTensor,
+        output: &mut GpuTensor,
+        config: MoEForwardConfig,
+    ) -> Result<(), String> {
+        match self {
+            Self::Cpu(b) => b.moe_forward_gpu_pure(input, expert_indices, expert_weights, all_gate_weights, all_up_weights, all_down_weights, output, config),
+            Self::Wgpu(b) => b.moe_forward_gpu_pure(input, expert_indices, expert_weights, all_gate_weights, all_up_weights, all_down_weights, output, config),
+            Self::Cuda(b) => b.moe_forward_gpu_pure(input, expert_indices, expert_weights, all_gate_weights, all_up_weights, all_down_weights, output, config),
+            Self::Rocm(b) => b.moe_forward_gpu_pure(input, expert_indices, expert_weights, all_gate_weights, all_up_weights, all_down_weights, output, config),
+#[cfg(target_os = "macos")]
+            Self::Metal(b) => b.moe_forward_gpu_pure(input, expert_indices, expert_weights, all_gate_weights, all_up_weights, all_down_weights, output, config),
         }
     }
 
@@ -1398,6 +1452,10 @@ impl Backend for CpuBackend {
         }
     }
 
+    fn readback_u32(&self, _: &GpuTensor, _: &mut [u32]) -> Result<(), String> {
+        Err("CPU readback_u32 not implemented".into())
+    }
+
     fn upload<T: KernelFloat>(&self, host: &[T], gpu: &mut GpuTensor) -> Result<(), String> {
         match &gpu.buffer {
             GpuBuffer::Cpu(buf) => {
@@ -1734,6 +1792,20 @@ impl Backend for CpuBackend {
         }
 
         Ok(())
+    }
+
+    fn moe_forward_gpu_pure(
+        &self,
+        _: &GpuTensor,
+        _: &GpuTensor,
+        _: &GpuTensor,
+        _: &GpuTensor,
+        _: &GpuTensor,
+        _: &GpuTensor,
+        _: &mut GpuTensor,
+        _: MoEForwardConfig,
+    ) -> Result<(), String> {
+        Err("CPU moe_forward_gpu_pure not implemented".into())
     }
 
     // =========================================================================
@@ -2097,6 +2169,50 @@ impl Backend for WgpuBackend {
             }
         } else {
             Err("Not WGPU buffer".into())
+        }
+    }
+
+    fn readback_u32(&self, gpu: &GpuTensor, host: &mut [u32]) -> Result<(), String> {
+        if gpu.dtype != TensorDtype::U32 {
+            return Err("WGPU readback_u32 requires u32 tensor".into());
+        }
+        let src = match &gpu.buffer {
+            GpuBuffer::Wgpu(buf) => buf,
+            _ => return Err("WGPU readback_u32: not WGPU buffer".into()),
+        };
+        let ctx = get_wgpu_context().ok_or("WGPU not init")?;
+        let size = host.len() * std::mem::size_of::<u32>();
+        if gpu.size_in_bytes < size {
+            return Err(format!(
+                "WGPU readback_u32: buffer bytes {} < required {}",
+                gpu.size_in_bytes,
+                size
+            ));
+        }
+        let staging = ctx.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("Staging U32"),
+            size: size as u64,
+            usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        let mut enc = ctx.device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None });
+        enc.copy_buffer_to_buffer(src, 0, &staging, 0, size as u64);
+        ctx.queue.submit(Some(enc.finish()));
+
+        let slice = staging.slice(..);
+        let (tx, rx) = std::sync::mpsc::channel();
+        slice.map_async(wgpu::MapMode::Read, move |v| tx.send(v).unwrap());
+        ctx.device.poll(wgpu::PollType::Wait);
+
+        if let Ok(Ok(_)) = rx.recv() {
+            let view = slice.get_mapped_range();
+            let data = unsafe { std::slice::from_raw_parts(view.as_ptr() as *const u32, host.len()) };
+            host.copy_from_slice(data);
+            drop(view);
+            staging.unmap();
+            Ok(())
+        } else {
+            Err("Map async failed".into())
         }
     }
 
@@ -2881,6 +2997,116 @@ impl Backend for WgpuBackend {
         Ok(())
     }
 
+    fn moe_forward_gpu_pure(
+        &self,
+        input: &GpuTensor,
+        expert_indices: &GpuTensor,
+        expert_weights: &GpuTensor,
+        all_gate_weights: &GpuTensor,
+        all_up_weights: &GpuTensor,
+        all_down_weights: &GpuTensor,
+        output: &mut GpuTensor,
+        config: MoEForwardConfig,
+    ) -> Result<(), String> {
+        let ctx = get_wgpu_context()
+            .ok_or("WGPU context unavailable for moe_forward_gpu_pure")?;
+
+        if expert_indices.dtype != TensorDtype::U32 {
+            return Err("WGPU moe_forward_gpu_pure: expert_indices must be u32 tensor".into());
+        }
+        if expert_weights.dtype != TensorDtype::F32 {
+            return Err("WGPU moe_forward_gpu_pure: expert_weights must be f32 tensor".into());
+        }
+
+        let in_buf = match &input.buffer {
+            GpuBuffer::Wgpu(b) => b,
+            _ => return Err("WGPU moe_forward_gpu_pure: input not WGPU buffer".into()),
+        };
+        let indices_buf = match &expert_indices.buffer {
+            GpuBuffer::Wgpu(b) => b,
+            _ => return Err("WGPU moe_forward_gpu_pure: expert_indices not WGPU buffer".into()),
+        };
+        let weights_buf = match &expert_weights.buffer {
+            GpuBuffer::Wgpu(b) => b,
+            _ => return Err("WGPU moe_forward_gpu_pure: expert_weights not WGPU buffer".into()),
+        };
+        let gate_buf = match &all_gate_weights.buffer {
+            GpuBuffer::Wgpu(b) => b,
+            _ => return Err("WGPU moe_forward_gpu_pure: gate_weights not WGPU buffer".into()),
+        };
+        let up_buf = match &all_up_weights.buffer {
+            GpuBuffer::Wgpu(b) => b,
+            _ => return Err("WGPU moe_forward_gpu_pure: up_weights not WGPU buffer".into()),
+        };
+        let down_buf = match &all_down_weights.buffer {
+            GpuBuffer::Wgpu(b) => b,
+            _ => return Err("WGPU moe_forward_gpu_pure: down_weights not WGPU buffer".into()),
+        };
+        let out_buf = match &output.buffer {
+            GpuBuffer::Wgpu(b) => b,
+            _ => return Err("WGPU moe_forward_gpu_pure: output not WGPU buffer".into()),
+        };
+
+        let expected_routing = config.num_tokens * config.top_k;
+        let expected_index_bytes = expected_routing * std::mem::size_of::<u32>();
+        let expected_weight_bytes = expected_routing * std::mem::size_of::<f32>();
+        if expert_indices.size_in_bytes < expected_index_bytes {
+            return Err(format!(
+                "WGPU moe_forward_gpu_pure: expert_indices bytes {} < expected {}",
+                expert_indices.size_in_bytes,
+                expected_index_bytes
+            ));
+        }
+        if expert_weights.size_in_bytes < expected_weight_bytes {
+            return Err(format!(
+                "WGPU moe_forward_gpu_pure: expert_weights bytes {} < expected {}",
+                expert_weights.size_in_bytes,
+                expected_weight_bytes
+            ));
+        }
+
+        // Scratch space for intermediate computations
+        let scratch_size = config.num_tokens * config.top_k * config.intermediate_size * 2 * 4;
+        let scratch_buf = ctx.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("MoE FFN Scratch"),
+            size: scratch_size as u64,
+            usage: wgpu::BufferUsages::STORAGE,
+            mapped_at_creation: false,
+        });
+
+        // Initialize MoE FFN kernel (lazy)
+        static MOE_FFN: OnceLock<Option<WgpuMoeFfn>> = OnceLock::new();
+        let moe_kernel = MOE_FFN.get_or_init(|| {
+            let ctx = get_wgpu_context()?;
+            Some(WgpuMoeFfn::new(ctx.device.clone(), ctx.queue.clone()))
+        }).as_ref().ok_or("WGPU MoE FFN kernel init failed")?;
+
+        let params = MoEFfnParams {
+            hidden_size: config.hidden_size as u32,
+            intermediate_size: config.intermediate_size as u32,
+            num_tokens: config.num_tokens as u32,
+            top_k: config.top_k as u32,
+            num_experts: config.num_experts as u32,
+            _padding0: 0,
+            _padding1: 0,
+            _padding2: 0,
+        };
+
+        moe_kernel.forward(
+            in_buf,
+            indices_buf,
+            weights_buf,
+            gate_buf,
+            up_buf,
+            down_buf,
+            out_buf,
+            &scratch_buf,
+            params,
+        );
+
+        Ok(())
+    }
+
     fn backend_type(&self) -> BackendType { BackendType::Wgpu }
 }
 
@@ -3078,6 +3304,10 @@ impl CudaBackend {
             }
         }
         Ok(())
+    }
+
+    fn readback_u32(&self, _: &GpuTensor, _: &mut [u32]) -> Result<(), String> {
+        Err("CUDA readback_u32 not implemented".into())
     }
 
     #[inline(always)]
@@ -3817,6 +4047,10 @@ impl Backend for CudaBackend {
         Ok(())
     }
 
+    fn readback_u32(&self, _: &GpuTensor, _: &mut [u32]) -> Result<(), String> {
+        Err("CUDA readback_u32 not implemented".into())
+    }
+
     fn upload<T: KernelFloat>(&self, host: &[T], gpu: &mut GpuTensor) -> Result<(), String> {
         let expected_bytes = host.len() * std::mem::size_of::<T>();
         if gpu.size_in_bytes != expected_bytes {
@@ -3998,6 +4232,20 @@ impl Backend for CudaBackend {
     ) -> Result<(), String> {
         // TODO: Implement CUDA fused MoE kernel
         Err("CUDA moe_forward_gpu not yet implemented - requires custom CUDA kernel".into())
+    }
+
+    fn moe_forward_gpu_pure(
+        &self,
+        _input: &GpuTensor,
+        _expert_indices: &GpuTensor,
+        _expert_weights: &GpuTensor,
+        _all_gate_weights: &GpuTensor,
+        _all_up_weights: &GpuTensor,
+        _all_down_weights: &GpuTensor,
+        _output: &mut GpuTensor,
+        _config: MoEForwardConfig,
+    ) -> Result<(), String> {
+        Err("CUDA moe_forward_gpu_pure not yet implemented - requires custom CUDA kernel".into())
     }
 
     fn backend_type(&self) -> BackendType {
@@ -4296,6 +4544,10 @@ impl RocmBackend {
         } else {
             Err("Not ROCm buffer".into())
         }
+    }
+
+    fn readback_u32(&self, _: &GpuTensor, _: &mut [u32]) -> Result<(), String> {
+        Err("ROCm readback_u32 not implemented".into())
     }
 
     #[inline(always)]
@@ -4647,6 +4899,10 @@ impl Backend for RocmBackend {
         Ok(())
     }
 
+    fn readback_u32(&self, _: &GpuTensor, _: &mut [u32]) -> Result<(), String> {
+        Err("ROCm readback_u32 not implemented".into())
+    }
+
     fn upload<T: KernelFloat>(&self, host: &[T], gpu: &mut GpuTensor) -> Result<(), String> {
         let expected_bytes = host.len() * std::mem::size_of::<T>();
         if gpu.size_in_bytes != expected_bytes {
@@ -4797,6 +5053,20 @@ impl Backend for RocmBackend {
     ) -> Result<(), String> {
         // TODO: Implement ROCm fused MoE kernel
         Err("ROCm moe_forward_gpu not yet implemented - requires custom HIP kernel".into())
+    }
+
+    fn moe_forward_gpu_pure(
+        &self,
+        _input: &GpuTensor,
+        _expert_indices: &GpuTensor,
+        _expert_weights: &GpuTensor,
+        _all_gate_weights: &GpuTensor,
+        _all_up_weights: &GpuTensor,
+        _all_down_weights: &GpuTensor,
+        _output: &mut GpuTensor,
+        _config: MoEForwardConfig,
+    ) -> Result<(), String> {
+        Err("ROCm moe_forward_gpu_pure not yet implemented - requires custom HIP kernel".into())
     }
 
     fn backend_type(&self) -> BackendType {
@@ -5460,6 +5730,10 @@ impl Backend for MetalBackend {
         Ok(())
     }
 
+    fn readback_u32(&self, _: &GpuTensor, _: &mut [u32]) -> Result<(), String> {
+        Err("Metal readback_u32 not implemented".into())
+    }
+
     fn upload<T: KernelFloat>(&self, host: &[T], gpu: &mut GpuTensor) -> Result<(), String> {
         let expected_bytes = host.len() * std::mem::size_of::<T>();
         if gpu.size_in_bytes != expected_bytes {
@@ -5670,6 +5944,20 @@ impl Backend for MetalBackend {
     ) -> Result<(), String> {
         // TODO: Implement Metal fused MoE kernel
         Err("Metal moe_forward_gpu not yet implemented - requires compute shader".into())
+    }
+
+    fn moe_forward_gpu_pure(
+        &self,
+        _input: &GpuTensor,
+        _expert_indices: &GpuTensor,
+        _expert_weights: &GpuTensor,
+        _all_gate_weights: &GpuTensor,
+        _all_up_weights: &GpuTensor,
+        _all_down_weights: &GpuTensor,
+        _output: &mut GpuTensor,
+        _config: MoEForwardConfig,
+    ) -> Result<(), String> {
+        Err("Metal moe_forward_gpu_pure not yet implemented - requires compute shader".into())
     }
 
     fn backend_type(&self) -> BackendType {
