@@ -1,6 +1,7 @@
 use crate::backend_match::{
-    match_float1, match_float1_mut, match_float1_out, match_float2_out, match_float2_out2,
-    match_float3_out,
+    apply_f32_binary_out, apply_f32_inplace_weight, apply_f32_unary_inplace, apply_f32_unary_out,
+    match_float1, match_float1_mut, match_float1_mut_weight, match_float1_out,
+    match_float2_out, match_float2_out2, match_float3_out,
 };
 use crate::backend_trait::{Backend, TensorSlice, TensorSliceMut};
 use crate::kernel_types::{
@@ -400,6 +401,107 @@ impl Backend for CpuBackend {
                     seq_len,
                     config,
                 )
+            },
+        )
+    }
+
+    fn rms_norm(
+        &self,
+        input: TensorSlice<'_>,
+        weight: TensorSlice<'_>,
+        output: TensorSliceMut<'_>,
+        batch: usize,
+        hidden: usize,
+        eps: f32,
+    ) -> Result<(), String> {
+        match_float2_out(
+            "rms_norm",
+            input,
+            weight,
+            output,
+            |input, weight, output| {
+                crate::ops::rms_norm::rms_norm_forward(input, weight, output, batch, hidden, eps);
+            },
+            |input, weight, output| {
+                apply_f32_binary_out(input, weight, output, |input, weight, output| {
+                    crate::ops::rms_norm::rms_norm_forward(input, weight, output, batch, hidden, eps);
+                });
+            },
+            |input, weight, output| {
+                apply_f32_binary_out(input, weight, output, |input, weight, output| {
+                    crate::ops::rms_norm::rms_norm_forward(input, weight, output, batch, hidden, eps);
+                });
+            },
+        )
+    }
+
+    fn rms_norm_inplace(
+        &self,
+        data: TensorSliceMut<'_>,
+        weight: TensorSlice<'_>,
+        batch: usize,
+        hidden: usize,
+        eps: f32,
+    ) -> Result<(), String> {
+        match_float1_mut_weight(
+            "rms_norm_inplace",
+            data,
+            weight,
+            |data, weight| {
+                crate::ops::rms_norm::rms_norm_inplace(data, weight, batch, hidden, eps);
+            },
+            |data, weight| {
+                apply_f32_inplace_weight(data, weight, |data, weight| {
+                    crate::ops::rms_norm::rms_norm_inplace(data, weight, batch, hidden, eps);
+                });
+            },
+            |data, weight| {
+                apply_f32_inplace_weight(data, weight, |data, weight| {
+                    crate::ops::rms_norm::rms_norm_inplace(data, weight, batch, hidden, eps);
+                });
+            },
+        )
+    }
+
+    fn silu_inplace(
+        &self,
+        data: TensorSliceMut<'_>,
+    ) -> Result<(), String> {
+        match_float1_mut(
+            data,
+            |data| crate::ops::activations::silu_inplace(data),
+            |data| {
+                apply_f32_unary_inplace(data, |data| {
+                    crate::ops::activations::silu_inplace(data);
+                });
+            },
+            |data| {
+                apply_f32_unary_inplace(data, |data| {
+                    crate::ops::activations::silu_inplace(data);
+                });
+            },
+        )
+    }
+
+    fn silu(
+        &self,
+        input: TensorSlice<'_>,
+        output: TensorSliceMut<'_>,
+    ) -> Result<(), String> {
+        match_float1_out(
+            "silu",
+            input,
+            output,
+            |input, output| crate::ops::activations::silu(input, output),
+            |input, output| {
+                apply_f32_unary_out(input, output, |input, output| {
+                    crate::ops::activations::silu(input, output);
+                });
+            },
+            |input, output| {
+                apply_f32_unary_out(input, output, |input, output| {
+                    crate::ops::activations::silu(input, output);
+                });
             },
         )
     }

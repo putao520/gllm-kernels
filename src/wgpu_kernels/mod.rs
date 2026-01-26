@@ -25,6 +25,7 @@ pub mod int2_quantizer;
 pub mod embedding_ops;
 pub mod linear;
 pub mod rms_norm;
+pub mod silu;
 pub mod tensor_ops;
 pub mod moe_ffn;
 pub mod moe_routing_gpu;
@@ -72,6 +73,7 @@ pub use embedding_ops::{EmbeddingOpsError, EmbeddingOpsKernel};
 // Note: GpuRerankConfig and GpuRerankStageResult are exported from crate::types
 pub use linear::{LinearError, LinearParams, WgpuLinear};
 pub use rms_norm::{RmsNormError, RmsNormParams, WgpuRmsNorm};
+pub use silu::{SiluError, SiluParams, WgpuSilu};
 pub use tensor_ops::{TensorOpsParams, WgpuTensorOps};
 pub use moe_ffn::{MoEFfnParams, WgpuMoeFfn};
 pub use moe_routing_gpu::{MoERoutingGpuParams, WgpuMoERouting};

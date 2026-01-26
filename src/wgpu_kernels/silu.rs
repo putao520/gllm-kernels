@@ -1,32 +1,30 @@
 use wgpu::util::DeviceExt;
 
 #[derive(Debug)]
-pub enum RmsNormError {
+pub enum SiluError {
     Wgpu(String),
 }
 
-impl std::fmt::Display for RmsNormError {
+impl std::fmt::Display for SiluError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            RmsNormError::Wgpu(msg) => write!(f, "WGPU error: {}", msg),
+            SiluError::Wgpu(msg) => write!(f, "WGPU error: {}", msg),
         }
     }
 }
 
-impl std::error::Error for RmsNormError {}
+impl std::error::Error for SiluError {}
 
 #[repr(C)]
 #[derive(Copy, Clone, Debug, bytemuck::Pod, bytemuck::Zeroable)]
-pub struct RmsNormParams {
-    pub rows: u32,
-    pub hidden: u32,
+pub struct SiluParams {
+    pub len: u32,
     pub _pad0: u32,
     pub _pad1: u32,
-    pub eps: f32,
-    pub _pad2: [f32; 3],
+    pub _pad2: u32,
 }
 
-pub struct WgpuRmsNorm {
+pub struct WgpuSilu {
     device: wgpu::Device,
     queue: wgpu::Queue,
     pipeline: wgpu::ComputePipeline,
@@ -35,16 +33,16 @@ pub struct WgpuRmsNorm {
     bind_group_layout_inplace: wgpu::BindGroupLayout,
 }
 
-impl WgpuRmsNorm {
+impl WgpuSilu {
     pub fn new(device: wgpu::Device, queue: wgpu::Queue) -> Self {
-        let shader_src = include_str!("kernels/rms_norm.wgsl");
+        let shader_src = include_str!("kernels/silu.wgsl");
         let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
-            label: Some("RMSNorm Shader"),
+            label: Some("SiLU Shader"),
             source: wgpu::ShaderSource::Wgsl(shader_src.into()),
         });
 
         let bind_group_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-            label: Some("RMSNorm Bind Group Layout"),
+            label: Some("SiLU Bind Group Layout"),
             entries: &[
                 wgpu::BindGroupLayoutEntry {
                     binding: 0,
@@ -68,16 +66,6 @@ impl WgpuRmsNorm {
                 },
                 wgpu::BindGroupLayoutEntry {
                     binding: 2,
-                    visibility: wgpu::ShaderStages::COMPUTE,
-                    ty: wgpu::BindingType::Buffer {
-                        ty: wgpu::BufferBindingType::Storage { read_only: true },
-                        has_dynamic_offset: false,
-                        min_binding_size: None,
-                    },
-                    count: None,
-                },
-                wgpu::BindGroupLayoutEntry {
-                    binding: 3,
                     visibility: wgpu::ShaderStages::COMPUTE,
                     ty: wgpu::BindingType::Buffer {
                         ty: wgpu::BufferBindingType::Storage { read_only: false },
@@ -90,7 +78,7 @@ impl WgpuRmsNorm {
         });
 
         let bind_group_layout_inplace = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-            label: Some("RMSNorm Bind Group Layout (Inplace)"),
+            label: Some("SiLU Bind Group Layout (Inplace)"),
             entries: &[
                 wgpu::BindGroupLayoutEntry {
                     binding: 0,
@@ -112,45 +100,35 @@ impl WgpuRmsNorm {
                     },
                     count: None,
                 },
-                wgpu::BindGroupLayoutEntry {
-                    binding: 2,
-                    visibility: wgpu::ShaderStages::COMPUTE,
-                    ty: wgpu::BindingType::Buffer {
-                        ty: wgpu::BufferBindingType::Storage { read_only: true },
-                        has_dynamic_offset: false,
-                        min_binding_size: None,
-                    },
-                    count: None,
-                },
             ],
         });
 
         let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-            label: Some("RMSNorm Pipeline Layout"),
+            label: Some("SiLU Pipeline Layout"),
             bind_group_layouts: &[&bind_group_layout],
             push_constant_ranges: &[],
         });
 
         let pipeline_layout_inplace = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-            label: Some("RMSNorm Pipeline Layout (Inplace)"),
+            label: Some("SiLU Pipeline Layout (Inplace)"),
             bind_group_layouts: &[&bind_group_layout_inplace],
             push_constant_ranges: &[],
         });
 
         let pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
-            label: Some("RMSNorm Pipeline"),
+            label: Some("SiLU Pipeline"),
             layout: Some(&pipeline_layout),
             module: &shader,
-            entry_point: Some("rms_norm_main"),
+            entry_point: Some("silu_main"),
             cache: None,
             compilation_options: wgpu::PipelineCompilationOptions::default(),
         });
 
         let pipeline_inplace = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
-            label: Some("RMSNorm Pipeline (Inplace)"),
+            label: Some("SiLU Pipeline (Inplace)"),
             layout: Some(&pipeline_layout_inplace),
             module: &shader,
-            entry_point: Some("rms_norm_inplace_main"),
+            entry_point: Some("silu_inplace_main"),
             cache: None,
             compilation_options: wgpu::PipelineCompilationOptions::default(),
         });
@@ -173,30 +151,69 @@ impl WgpuRmsNorm {
         &self.queue
     }
 
-    pub fn forward(
-        &self,
-        params: RmsNormParams,
-        input: &wgpu::Buffer,
-        weight: &wgpu::Buffer,
-        output: &wgpu::Buffer,
-    ) {
-        if params.rows == 0 || params.hidden == 0 {
+    pub fn forward_inplace(&self, params: SiluParams, data: &wgpu::Buffer) {
+        if params.len == 0 {
             return;
         }
 
-        let param_buf = self.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-            label: Some("RMSNorm Params"),
+        let params_buf = self.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("SiLU Params (Inplace)"),
             contents: bytemuck::bytes_of(&params),
             usage: wgpu::BufferUsages::UNIFORM,
         });
 
         let bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("RMSNorm Bind Group"),
+            label: Some("SiLU Bind Group (Inplace)"),
+            layout: &self.bind_group_layout_inplace,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: params_buf.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: data.as_entire_binding(),
+                },
+            ],
+        });
+
+        let mut encoder = self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+            label: Some("SiLU Encoder (Inplace)"),
+        });
+
+        {
+            let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                label: Some("SiLU Pass (Inplace)"),
+                timestamp_writes: None,
+            });
+            pass.set_pipeline(&self.pipeline_inplace);
+            pass.set_bind_group(0, &bind_group, &[]);
+            let workgroups = (params.len + 255) / 256;
+            pass.dispatch_workgroups(workgroups, 1, 1);
+        }
+
+        self.queue.submit(Some(encoder.finish()));
+        let _ = self.device.poll(wgpu::PollType::Wait);
+    }
+
+    pub fn forward(&self, params: SiluParams, input: &wgpu::Buffer, output: &wgpu::Buffer) {
+        if params.len == 0 {
+            return;
+        }
+
+        let params_buf = self.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("SiLU Params"),
+            contents: bytemuck::bytes_of(&params),
+            usage: wgpu::BufferUsages::UNIFORM,
+        });
+
+        let bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("SiLU Bind Group"),
             layout: &self.bind_group_layout,
             entries: &[
                 wgpu::BindGroupEntry {
                     binding: 0,
-                    resource: param_buf.as_entire_binding(),
+                    resource: params_buf.as_entire_binding(),
                 },
                 wgpu::BindGroupEntry {
                     binding: 1,
@@ -204,80 +221,24 @@ impl WgpuRmsNorm {
                 },
                 wgpu::BindGroupEntry {
                     binding: 2,
-                    resource: weight.as_entire_binding(),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 3,
                     resource: output.as_entire_binding(),
                 },
             ],
         });
 
         let mut encoder = self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
-            label: Some("RMSNorm Encoder"),
+            label: Some("SiLU Encoder"),
         });
 
         {
             let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
-                label: Some("RMSNorm Pass"),
+                label: Some("SiLU Pass"),
                 timestamp_writes: None,
             });
             pass.set_pipeline(&self.pipeline);
             pass.set_bind_group(0, &bind_group, &[]);
-            pass.dispatch_workgroups(params.rows, 1, 1);
-        }
-
-        self.queue.submit(Some(encoder.finish()));
-        let _ = self.device.poll(wgpu::PollType::Wait);
-    }
-
-    pub fn forward_inplace(
-        &self,
-        params: RmsNormParams,
-        data: &wgpu::Buffer,
-        weight: &wgpu::Buffer,
-    ) {
-        if params.rows == 0 || params.hidden == 0 {
-            return;
-        }
-
-        let param_buf = self.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-            label: Some("RMSNorm Params (Inplace)"),
-            contents: bytemuck::bytes_of(&params),
-            usage: wgpu::BufferUsages::UNIFORM,
-        });
-
-        let bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("RMSNorm Bind Group (Inplace)"),
-            layout: &self.bind_group_layout_inplace,
-            entries: &[
-                wgpu::BindGroupEntry {
-                    binding: 0,
-                    resource: param_buf.as_entire_binding(),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 1,
-                    resource: data.as_entire_binding(),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 2,
-                    resource: weight.as_entire_binding(),
-                },
-            ],
-        });
-
-        let mut encoder = self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
-            label: Some("RMSNorm Encoder (Inplace)"),
-        });
-
-        {
-            let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
-                label: Some("RMSNorm Pass (Inplace)"),
-                timestamp_writes: None,
-            });
-            pass.set_pipeline(&self.pipeline_inplace);
-            pass.set_bind_group(0, &bind_group, &[]);
-            pass.dispatch_workgroups(params.rows, 1, 1);
+            let workgroups = (params.len + 255) / 256;
+            pass.dispatch_workgroups(workgroups, 1, 1);
         }
 
         self.queue.submit(Some(encoder.finish()));

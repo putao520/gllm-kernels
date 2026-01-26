@@ -137,22 +137,19 @@ backend.flash_attention(...);  // 直接调用，没有中间层
 | `auto_select_backend()` | 无 | 返回 `Arc<dyn Backend>` | ✅ |
 | Backend trait 方法数 | 52 个 | 15 个 | ✅ |
 
-**阶段2 待完成** ⚠️：消除 KernelDispatcher 中间层
+**阶段2 已完成** ✅ (2026-01-26) [commit: cd922e30]
 
-**当前问题**：
-```
-Backend trait
-    ↓ 委托
-BackendCore
-    ↓ 委托
-KernelDispatcher（7,646 行）
-    ↓ match self.backend 分发（每个算子内部）
-cuda_kernels / wgpu_kernels / metal_kernels / ops
-```
+**删除的文件**：
+- `kernel_dispatcher.rs` (7,646 行)
+- `backend_core.rs`, `backend_core_attention.rs`
+- `backend_core_sampling.rs`, `backend_core_moe.rs`
 
-KernelDispatcher 内部仍有大量 `match self.backend` 分发，这违反了"启动时选一次"原则。
+**新增的文件**：
+- `kernel_types.rs`: KernelFloat trait + Config/Result 结构体
+- `backend_match.rs`: dtype 匹配辅助函数
+- `ops/matmul.rs`: CPU matmul 实现
 
-**正确架构**（阶段2目标）：
+**最终架构**：
 ```
 Backend trait
     ↓ 直接实现
@@ -164,17 +161,17 @@ RocmBackend  → 直接调用 hip_kernels/
 ```
 
 **阶段2 任务清单**：
-- [ ] 提取 KernelDispatcher 中的 CPU 实现到 `CpuBackend`
-- [ ] 提取 CUDA 分发逻辑到 `CudaBackend`
-- [ ] 提取 WGPU 分发逻辑到 `WgpuBackend`
-- [ ] 提取 Metal 分发逻辑到 `MetalBackend`
-- [ ] 提取 ROCm 分发逻辑到 `RocmBackend`
-- [ ] 删除 KernelDispatcher 或将其降级为纯测试工具
-- [ ] 删除 BackendCore 中间层
+- [x] 提取 KernelDispatcher 中的 CPU 实现到 `CpuBackend`
+- [x] 提取 CUDA 分发逻辑到 `CudaBackend`
+- [x] 提取 WGPU 分发逻辑到 `WgpuBackend`
+- [x] 提取 Metal 分发逻辑到 `MetalBackend`
+- [x] 提取 ROCm 分发逻辑到 `RocmBackend`
+- [x] 删除 KernelDispatcher
+- [x] 删除 BackendCore 中间层
 
 #### 算子实现状态矩阵（KernelDispatcher 内部）
 
-**说明**：以下矩阵记录 KernelDispatcher 内部各算子在不同后端的实现状态。阶段2完成后，这些实现将迁移到各独立 Backend 文件中。
+**说明**：以下矩阵记录各 Backend 的算子实现状态（阶段2完成后，已迁移到各独立 Backend 文件）。
 
 ##### Backend trait 核心算子（15个）
 

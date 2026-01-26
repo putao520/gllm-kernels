@@ -81,9 +81,9 @@ impl RmsNormKernel {
     pub fn forward(
         &self,
         stream: &Arc<CudaStream>,
-        input: &CudaSlice<u8>,
-        weight: &CudaSlice<u8>,
-        output: &CudaSlice<u8>,
+        input: &CudaSlice<f32>,
+        weight: &CudaSlice<f32>,
+        output: &mut CudaSlice<f32>,
         rows: usize,
         hidden: usize,
         eps: f32,

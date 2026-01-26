@@ -1,8 +1,10 @@
+use std::mem;
 use std::sync::OnceLock;
 
 use crate::backend_match::{
-    match_float1, match_float1_mut, match_float1_out, match_float2_out, match_float2_out2,
-    match_float3_out,
+    apply_f32_binary_out, apply_f32_inplace_weight, apply_f32_unary_inplace, apply_f32_unary_out,
+    match_float1, match_float1_mut, match_float1_mut_weight, match_float1_out,
+    match_float2_out, match_float2_out2, match_float3_out,
 };
 use crate::backend_trait::{Backend, TensorSlice, TensorSliceMut};
 use crate::kernel_types::{
@@ -15,12 +17,65 @@ use crate::runtime_detection::BackendType;
 use crate::wgpu_kernels::{
     FlashAttentionKernel as WgpuFlashAttentionKernel,
     PagedAttentionKernel as WgpuPagedAttentionKernel,
+    RmsNormParams, WgpuRmsNorm,
+    SiluParams, WgpuSilu,
 };
+use wgpu::util::DeviceExt;
 
+struct WgpuDeviceQueue {
+    device: wgpu::Device,
+    queue: wgpu::Queue,
+}
+
+/// Global WGPU device/queue (lazy initialized).
+static WGPU_DEVICE_QUEUE: OnceLock<Option<WgpuDeviceQueue>> = OnceLock::new();
 /// Global WGPU flash attention kernel (lazy initialized).
 static WGPU_FLASH_KERNEL: OnceLock<Option<WgpuFlashAttentionKernel>> = OnceLock::new();
 /// Global WGPU paged attention kernel (lazy initialized).
 static WGPU_PAGED_KERNEL: OnceLock<Option<WgpuPagedAttentionKernel>> = OnceLock::new();
+/// Global WGPU RMSNorm kernel (lazy initialized).
+static WGPU_RMSNORM_KERNEL: OnceLock<Option<WgpuRmsNorm>> = OnceLock::new();
+/// Global WGPU SiLU kernel (lazy initialized).
+static WGPU_SILU_KERNEL: OnceLock<Option<WgpuSilu>> = OnceLock::new();
+
+fn get_wgpu_device_queue() -> Option<&'static WgpuDeviceQueue> {
+    WGPU_DEVICE_QUEUE
+        .get_or_init(|| {
+            let instance = wgpu::Instance::default();
+            let adapter = match pollster::block_on(instance.request_adapter(
+                &wgpu::RequestAdapterOptions {
+                    power_preference: wgpu::PowerPreference::HighPerformance,
+                    compatible_surface: None,
+                    force_fallback_adapter: false,
+                },
+            )) {
+                Ok(adapter) => adapter,
+                Err(e) => {
+                    log::warn!("Failed to request WGPU adapter: {}", e);
+                    return None;
+                }
+            };
+
+            let (device, queue) = match pollster::block_on(adapter.request_device(
+                &wgpu::DeviceDescriptor {
+                    label: Some("gllm-wgpu-utils"),
+                    required_features: wgpu::Features::empty(),
+                    required_limits: wgpu::Limits::default(),
+                    memory_hints: wgpu::MemoryHints::default(),
+                    trace: wgpu::Trace::Off,
+                },
+            )) {
+                Ok(result) => result,
+                Err(e) => {
+                    log::warn!("Failed to request WGPU device: {}", e);
+                    return None;
+                }
+            };
+
+            Some(WgpuDeviceQueue { device, queue })
+        })
+        .as_ref()
+}
 
 fn get_wgpu_flash_kernel() -> Option<&'static WgpuFlashAttentionKernel> {
     WGPU_FLASH_KERNEL
@@ -46,6 +101,30 @@ fn get_wgpu_paged_kernel() -> Option<&'static WgpuPagedAttentionKernel> {
                     None
                 }
             }
+        })
+        .as_ref()
+}
+
+fn get_wgpu_rmsnorm_kernel() -> Option<&'static WgpuRmsNorm> {
+    WGPU_RMSNORM_KERNEL
+        .get_or_init(|| {
+            let device_queue = get_wgpu_device_queue()?;
+            Some(WgpuRmsNorm::new(
+                device_queue.device.clone(),
+                device_queue.queue.clone(),
+            ))
+        })
+        .as_ref()
+}
+
+fn get_wgpu_silu_kernel() -> Option<&'static WgpuSilu> {
+    WGPU_SILU_KERNEL
+        .get_or_init(|| {
+            let device_queue = get_wgpu_device_queue()?;
+            Some(WgpuSilu::new(
+                device_queue.device.clone(),
+                device_queue.queue.clone(),
+            ))
         })
         .as_ref()
 }
@@ -147,6 +226,304 @@ fn wgpu_paged_attention<T: KernelFloat>(
             false
         }
     }
+}
+
+fn readback_f32(
+    device: &wgpu::Device,
+    queue: &wgpu::Queue,
+    buffer: &wgpu::Buffer,
+    len: usize,
+    label: &'static str,
+) -> Result<Vec<f32>, String> {
+    if len == 0 {
+        return Ok(Vec::new());
+    }
+
+    let size_bytes = len
+        .checked_mul(mem::size_of::<f32>())
+        .ok_or_else(|| format!("{label}: readback size overflow"))?
+        as wgpu::BufferAddress;
+
+    let staging = device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some(label),
+        size: size_bytes,
+        usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
+        mapped_at_creation: false,
+    });
+
+    let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+        label: Some("wgpu_readback_encoder"),
+    });
+    encoder.copy_buffer_to_buffer(buffer, 0, &staging, 0, size_bytes);
+    queue.submit(Some(encoder.finish()));
+
+    let slice = staging.slice(..);
+    let (sender, receiver) = std::sync::mpsc::channel();
+    slice.map_async(wgpu::MapMode::Read, move |result| {
+        let _ = sender.send(result);
+    });
+
+    let _ = device.poll(wgpu::PollType::Wait);
+    let map_result = receiver
+        .recv()
+        .map_err(|_| format!("{label}: map_async channel closed"))?;
+    map_result.map_err(|err| format!("{label}: map_async failed: {err}"))?;
+
+    let data = slice.get_mapped_range();
+    let values: &[f32] = bytemuck::cast_slice(&data);
+    if values.len() < len {
+        return Err(format!("{label}: readback length mismatch"));
+    }
+
+    let mut output = vec![0.0f32; len];
+    output.copy_from_slice(&values[..len]);
+    drop(data);
+    staging.unmap();
+    Ok(output)
+}
+
+fn wgpu_rms_norm<T: KernelFloat>(
+    kernel: &WgpuRmsNorm,
+    input: &[T],
+    weight: &[T],
+    output: &mut [T],
+    batch: usize,
+    hidden: usize,
+    eps: f32,
+) -> bool {
+    if input.len() != batch.saturating_mul(hidden)
+        || output.len() != batch.saturating_mul(hidden)
+        || weight.len() != hidden
+    {
+        log::debug!("WGPU rms_norm dispatch skipped: length mismatch");
+        return false;
+    }
+
+    let rows = match u32::try_from(batch) {
+        Ok(v) => v,
+        Err(_) => return false,
+    };
+    let hidden_u32 = match u32::try_from(hidden) {
+        Ok(v) => v,
+        Err(_) => return false,
+    };
+
+    let device = kernel.device();
+    let queue = kernel.queue();
+
+    let input_f32: Vec<f32> = input.iter().map(|v| v.to_f32()).collect();
+    let weight_f32: Vec<f32> = weight.iter().map(|v| v.to_f32()).collect();
+
+    let input_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+        label: Some("rms_norm_input"),
+        contents: bytemuck::cast_slice(&input_f32),
+        usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+    });
+    let weight_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+        label: Some("rms_norm_weight"),
+        contents: bytemuck::cast_slice(&weight_f32),
+        usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+    });
+
+    let output_bytes = match output.len().checked_mul(mem::size_of::<f32>()) {
+        Some(bytes) => bytes as wgpu::BufferAddress,
+        None => return false,
+    };
+    let output_buf = device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some("rms_norm_output"),
+        size: output_bytes,
+        usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
+        mapped_at_creation: false,
+    });
+
+    let params = RmsNormParams {
+        rows,
+        hidden: hidden_u32,
+        _pad0: 0,
+        _pad1: 0,
+        eps,
+        _pad2: [0.0; 3],
+    };
+
+    kernel.forward(params, &input_buf, &weight_buf, &output_buf);
+    let output_f32 = match readback_f32(device, queue, &output_buf, output.len(), "rms_norm_readback") {
+        Ok(values) => values,
+        Err(err) => {
+            log::debug!("WGPU rms_norm readback failed: {}", err);
+            return false;
+        }
+    };
+
+    for (dst, val) in output.iter_mut().zip(output_f32.iter()) {
+        *dst = T::from_f32(*val);
+    }
+    true
+}
+
+fn wgpu_rms_norm_inplace<T: KernelFloat>(
+    kernel: &WgpuRmsNorm,
+    data: &mut [T],
+    weight: &[T],
+    batch: usize,
+    hidden: usize,
+    eps: f32,
+) -> bool {
+    if data.len() != batch.saturating_mul(hidden) || weight.len() != hidden {
+        log::debug!("WGPU rms_norm_inplace dispatch skipped: length mismatch");
+        return false;
+    }
+
+    let rows = match u32::try_from(batch) {
+        Ok(v) => v,
+        Err(_) => return false,
+    };
+    let hidden_u32 = match u32::try_from(hidden) {
+        Ok(v) => v,
+        Err(_) => return false,
+    };
+
+    let device = kernel.device();
+    let queue = kernel.queue();
+
+    let data_f32: Vec<f32> = data.iter().map(|v| v.to_f32()).collect();
+    let weight_f32: Vec<f32> = weight.iter().map(|v| v.to_f32()).collect();
+
+    let data_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+        label: Some("rms_norm_data"),
+        contents: bytemuck::cast_slice(&data_f32),
+        usage: wgpu::BufferUsages::STORAGE
+            | wgpu::BufferUsages::COPY_DST
+            | wgpu::BufferUsages::COPY_SRC,
+    });
+    let weight_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+        label: Some("rms_norm_weight_inplace"),
+        contents: bytemuck::cast_slice(&weight_f32),
+        usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+    });
+
+    let params = RmsNormParams {
+        rows,
+        hidden: hidden_u32,
+        _pad0: 0,
+        _pad1: 0,
+        eps,
+        _pad2: [0.0; 3],
+    };
+
+    kernel.forward_inplace(params, &data_buf, &weight_buf);
+    let output_f32 = match readback_f32(device, queue, &data_buf, data.len(), "rms_norm_inplace_readback") {
+        Ok(values) => values,
+        Err(err) => {
+            log::debug!("WGPU rms_norm_inplace readback failed: {}", err);
+            return false;
+        }
+    };
+
+    for (dst, val) in data.iter_mut().zip(output_f32.iter()) {
+        *dst = T::from_f32(*val);
+    }
+    true
+}
+
+fn wgpu_silu<T: KernelFloat>(
+    kernel: &WgpuSilu,
+    input: &[T],
+    output: &mut [T],
+) -> bool {
+    if input.len() != output.len() {
+        log::debug!("WGPU silu dispatch skipped: length mismatch");
+        return false;
+    }
+
+    let len = match u32::try_from(input.len()) {
+        Ok(v) => v,
+        Err(_) => return false,
+    };
+
+    let device = kernel.device();
+    let queue = kernel.queue();
+
+    let input_f32: Vec<f32> = input.iter().map(|v| v.to_f32()).collect();
+    let input_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+        label: Some("silu_input"),
+        contents: bytemuck::cast_slice(&input_f32),
+        usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+    });
+
+    let output_bytes = match output.len().checked_mul(mem::size_of::<f32>()) {
+        Some(bytes) => bytes as wgpu::BufferAddress,
+        None => return false,
+    };
+    let output_buf = device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some("silu_output"),
+        size: output_bytes,
+        usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
+        mapped_at_creation: false,
+    });
+
+    let params = SiluParams {
+        len,
+        _pad0: 0,
+        _pad1: 0,
+        _pad2: 0,
+    };
+
+    kernel.forward(params, &input_buf, &output_buf);
+    let output_f32 = match readback_f32(device, queue, &output_buf, output.len(), "silu_readback") {
+        Ok(values) => values,
+        Err(err) => {
+            log::debug!("WGPU silu readback failed: {}", err);
+            return false;
+        }
+    };
+
+    for (dst, val) in output.iter_mut().zip(output_f32.iter()) {
+        *dst = T::from_f32(*val);
+    }
+    true
+}
+
+fn wgpu_silu_inplace<T: KernelFloat>(
+    kernel: &WgpuSilu,
+    data: &mut [T],
+) -> bool {
+    let len = match u32::try_from(data.len()) {
+        Ok(v) => v,
+        Err(_) => return false,
+    };
+
+    let device = kernel.device();
+    let queue = kernel.queue();
+
+    let data_f32: Vec<f32> = data.iter().map(|v| v.to_f32()).collect();
+    let data_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+        label: Some("silu_data"),
+        contents: bytemuck::cast_slice(&data_f32),
+        usage: wgpu::BufferUsages::STORAGE
+            | wgpu::BufferUsages::COPY_DST
+            | wgpu::BufferUsages::COPY_SRC,
+    });
+
+    let params = SiluParams {
+        len,
+        _pad0: 0,
+        _pad1: 0,
+        _pad2: 0,
+    };
+
+    kernel.forward_inplace(params, &data_buf);
+    let output_f32 = match readback_f32(device, queue, &data_buf, data.len(), "silu_inplace_readback") {
+        Ok(values) => values,
+        Err(err) => {
+            log::debug!("WGPU silu_inplace readback failed: {}", err);
+            return false;
+        }
+    };
+
+    for (dst, val) in data.iter_mut().zip(output_f32.iter()) {
+        *dst = T::from_f32(*val);
+    }
+    true
 }
 
 pub struct WgpuBackend {}
@@ -579,6 +956,183 @@ impl Backend for WgpuBackend {
                     seq_len,
                     config,
                 )
+            },
+        )
+    }
+
+    fn rms_norm(
+        &self,
+        input: TensorSlice<'_>,
+        weight: TensorSlice<'_>,
+        output: TensorSliceMut<'_>,
+        batch: usize,
+        hidden: usize,
+        eps: f32,
+    ) -> Result<(), String> {
+        match_float2_out(
+            "rms_norm",
+            input,
+            weight,
+            output,
+            |input, weight, output| {
+                if let Some(kernel) = get_wgpu_rmsnorm_kernel() {
+                    if wgpu_rms_norm(kernel, input, weight, output, batch, hidden, eps) {
+                        return;
+                    }
+                    log::debug!("WGPU rms_norm dispatch failed, falling back to CPU");
+                }
+                crate::ops::rms_norm::rms_norm_forward(input, weight, output, batch, hidden, eps);
+            },
+            |input, weight, output| {
+                if let Some(kernel) = get_wgpu_rmsnorm_kernel() {
+                    if wgpu_rms_norm(kernel, input, weight, output, batch, hidden, eps) {
+                        return;
+                    }
+                    log::debug!("WGPU rms_norm dispatch failed, falling back to CPU");
+                }
+                apply_f32_binary_out(input, weight, output, |input, weight, output| {
+                    crate::ops::rms_norm::rms_norm_forward(input, weight, output, batch, hidden, eps);
+                });
+            },
+            |input, weight, output| {
+                if let Some(kernel) = get_wgpu_rmsnorm_kernel() {
+                    if wgpu_rms_norm(kernel, input, weight, output, batch, hidden, eps) {
+                        return;
+                    }
+                    log::debug!("WGPU rms_norm dispatch failed, falling back to CPU");
+                }
+                apply_f32_binary_out(input, weight, output, |input, weight, output| {
+                    crate::ops::rms_norm::rms_norm_forward(input, weight, output, batch, hidden, eps);
+                });
+            },
+        )
+    }
+
+    fn rms_norm_inplace(
+        &self,
+        data: TensorSliceMut<'_>,
+        weight: TensorSlice<'_>,
+        batch: usize,
+        hidden: usize,
+        eps: f32,
+    ) -> Result<(), String> {
+        match_float1_mut_weight(
+            "rms_norm_inplace",
+            data,
+            weight,
+            |data, weight| {
+                if let Some(kernel) = get_wgpu_rmsnorm_kernel() {
+                    if wgpu_rms_norm_inplace(kernel, data, weight, batch, hidden, eps) {
+                        return;
+                    }
+                    log::debug!("WGPU rms_norm_inplace dispatch failed, falling back to CPU");
+                }
+                crate::ops::rms_norm::rms_norm_inplace(data, weight, batch, hidden, eps);
+            },
+            |data, weight| {
+                if let Some(kernel) = get_wgpu_rmsnorm_kernel() {
+                    if wgpu_rms_norm_inplace(kernel, data, weight, batch, hidden, eps) {
+                        return;
+                    }
+                    log::debug!("WGPU rms_norm_inplace dispatch failed, falling back to CPU");
+                }
+                apply_f32_inplace_weight(data, weight, |data, weight| {
+                    crate::ops::rms_norm::rms_norm_inplace(data, weight, batch, hidden, eps);
+                });
+            },
+            |data, weight| {
+                if let Some(kernel) = get_wgpu_rmsnorm_kernel() {
+                    if wgpu_rms_norm_inplace(kernel, data, weight, batch, hidden, eps) {
+                        return;
+                    }
+                    log::debug!("WGPU rms_norm_inplace dispatch failed, falling back to CPU");
+                }
+                apply_f32_inplace_weight(data, weight, |data, weight| {
+                    crate::ops::rms_norm::rms_norm_inplace(data, weight, batch, hidden, eps);
+                });
+            },
+        )
+    }
+
+    fn silu_inplace(
+        &self,
+        data: TensorSliceMut<'_>,
+    ) -> Result<(), String> {
+        match_float1_mut(
+            data,
+            |data| {
+                if let Some(kernel) = get_wgpu_silu_kernel() {
+                    if wgpu_silu_inplace(kernel, data) {
+                        return;
+                    }
+                    log::debug!("WGPU silu_inplace dispatch failed, falling back to CPU");
+                }
+                crate::ops::activations::silu_inplace(data);
+            },
+            |data| {
+                if let Some(kernel) = get_wgpu_silu_kernel() {
+                    if wgpu_silu_inplace(kernel, data) {
+                        return;
+                    }
+                    log::debug!("WGPU silu_inplace dispatch failed, falling back to CPU");
+                }
+                apply_f32_unary_inplace(data, |data| {
+                    crate::ops::activations::silu_inplace(data);
+                });
+            },
+            |data| {
+                if let Some(kernel) = get_wgpu_silu_kernel() {
+                    if wgpu_silu_inplace(kernel, data) {
+                        return;
+                    }
+                    log::debug!("WGPU silu_inplace dispatch failed, falling back to CPU");
+                }
+                apply_f32_unary_inplace(data, |data| {
+                    crate::ops::activations::silu_inplace(data);
+                });
+            },
+        )
+    }
+
+    fn silu(
+        &self,
+        input: TensorSlice<'_>,
+        output: TensorSliceMut<'_>,
+    ) -> Result<(), String> {
+        match_float1_out(
+            "silu",
+            input,
+            output,
+            |input, output| {
+                if let Some(kernel) = get_wgpu_silu_kernel() {
+                    if wgpu_silu(kernel, input, output) {
+                        return;
+                    }
+                    log::debug!("WGPU silu dispatch failed, falling back to CPU");
+                }
+                crate::ops::activations::silu(input, output);
+            },
+            |input, output| {
+                if let Some(kernel) = get_wgpu_silu_kernel() {
+                    if wgpu_silu(kernel, input, output) {
+                        return;
+                    }
+                    log::debug!("WGPU silu dispatch failed, falling back to CPU");
+                }
+                apply_f32_unary_out(input, output, |input, output| {
+                    crate::ops::activations::silu(input, output);
+                });
+            },
+            |input, output| {
+                if let Some(kernel) = get_wgpu_silu_kernel() {
+                    if wgpu_silu(kernel, input, output) {
+                        return;
+                    }
+                    log::debug!("WGPU silu dispatch failed, falling back to CPU");
+                }
+                apply_f32_unary_out(input, output, |input, output| {
+                    crate::ops::activations::silu(input, output);
+                });
             },
         )
     }

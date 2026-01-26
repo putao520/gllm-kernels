@@ -136,6 +136,36 @@ pub trait Backend: Send + Sync {
         config: &MoERoutingConfig,
     ) -> Result<Vec<f32>, String>;
 
+    fn rms_norm(
+        &self,
+        input: TensorSlice<'_>,
+        weight: TensorSlice<'_>,
+        output: TensorSliceMut<'_>,
+        batch: usize,
+        hidden: usize,
+        eps: f32,
+    ) -> Result<(), String>;
+
+    fn rms_norm_inplace(
+        &self,
+        data: TensorSliceMut<'_>,
+        weight: TensorSlice<'_>,
+        batch: usize,
+        hidden: usize,
+        eps: f32,
+    ) -> Result<(), String>;
+
+    fn silu_inplace(
+        &self,
+        data: TensorSliceMut<'_>,
+    ) -> Result<(), String>;
+
+    fn silu(
+        &self,
+        input: TensorSlice<'_>,
+        output: TensorSliceMut<'_>,
+    ) -> Result<(), String>;
+
     fn add_bias(
         &self,
         output: TensorSliceMut<'_>,

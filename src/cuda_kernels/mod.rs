@@ -21,7 +21,10 @@ pub mod flash_attn;
 pub mod fused_attention;
 pub mod online_softmax;
 pub mod paged_attn;
+pub mod rms_norm;
 pub mod selective_scan;
+pub mod silu;
+pub mod linear;
 
 // Inference optimization kernels (REQ-OP-008 ~ REQ-OP-015)
 pub mod eagle3;
@@ -40,7 +43,10 @@ pub use flash_attn::{FlashAttentionError, FlashAttentionKernel, OptimizedCudaAtt
 pub use fused_attention::{FusedQKVAttentionError, FusedQKVAttentionKernel};
 pub use online_softmax::{OnlineSoftmaxError, OnlineSoftmaxKernel, OnlineSoftmaxOutput};
 pub use paged_attn::{PagedAttentionError, PagedAttentionKernel};
+pub use rms_norm::{RmsNormError, RmsNormKernel};
 pub use selective_scan::{SelectiveScanError, SelectiveScanKernel};
+pub use silu::{CudaSilu, SiluError};
+pub use linear::CudaLinear;
 
 // Inference optimization kernels exports
 pub use eagle3::{Eagle3Error, Eagle3Kernel, Eagle3CudaConfig as Eagle3Config};

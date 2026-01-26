@@ -3,13 +3,16 @@ use std::sync::{Arc, OnceLock};
 use cudarc::driver::{CudaContext, CudaStream};
 
 use crate::backend_match::{
-    match_float1, match_float1_mut, match_float1_out, match_float2_out, match_float2_out2,
-    match_float3_out,
+    apply_f32_binary_out, apply_f32_inplace_weight, apply_f32_unary_inplace, apply_f32_unary_out,
+    match_float1, match_float1_mut, match_float1_mut_weight, match_float1_out,
+    match_float2_out, match_float2_out2, match_float3_out,
 };
 use crate::backend_trait::{Backend, TensorSlice, TensorSliceMut};
 use crate::cuda_kernels::{
     FlashAttentionKernel as CudaFlashAttentionKernel,
     PagedAttentionKernel as CudaPagedAttentionKernel,
+    RmsNormKernel,
+    CudaSilu,
 };
 use crate::kernel_types::{
     FlashAttentionConfig, KernelFloat, MatmulConfig, PagedAttentionConfig, SoftmaxConfig,
@@ -27,6 +30,10 @@ static CUDA_STREAM: OnceLock<Option<Arc<CudaStream>>> = OnceLock::new();
 static CUDA_FLASH_KERNEL: OnceLock<Option<CudaFlashAttentionKernel>> = OnceLock::new();
 /// Global CUDA paged attention kernel (lazy initialized).
 static CUDA_PAGED_KERNEL: OnceLock<Option<CudaPagedAttentionKernel>> = OnceLock::new();
+/// Global CUDA RMSNorm kernel (lazy initialized).
+static CUDA_RMSNORM_KERNEL: OnceLock<Option<RmsNormKernel>> = OnceLock::new();
+/// Global CUDA SiLU kernel (lazy initialized).
+static CUDA_SILU_KERNEL: OnceLock<Option<CudaSilu>> = OnceLock::new();
 
 fn get_cuda_context() -> Option<&'static Arc<CudaContext>> {
     CUDA_CONTEXT
@@ -74,6 +81,36 @@ fn get_cuda_paged_kernel() -> Option<&'static CudaPagedAttentionKernel> {
                 Ok(kernel) => Some(kernel),
                 Err(e) => {
                     log::warn!("Failed to initialize CUDA paged attention kernel: {}", e);
+                    None
+                }
+            }
+        })
+        .as_ref()
+}
+
+fn get_cuda_rmsnorm_kernel() -> Option<&'static RmsNormKernel> {
+    CUDA_RMSNORM_KERNEL
+        .get_or_init(|| {
+            let ctx = get_cuda_context()?;
+            match RmsNormKernel::new(ctx) {
+                Ok(kernel) => Some(kernel),
+                Err(e) => {
+                    log::warn!("Failed to initialize CUDA RMSNorm kernel: {}", e);
+                    None
+                }
+            }
+        })
+        .as_ref()
+}
+
+fn get_cuda_silu_kernel() -> Option<&'static CudaSilu> {
+    CUDA_SILU_KERNEL
+        .get_or_init(|| {
+            let ctx = get_cuda_context()?;
+            match CudaSilu::new(ctx) {
+                Ok(kernel) => Some(kernel),
+                Err(e) => {
+                    log::warn!("Failed to initialize CUDA SiLU kernel: {}", e);
                     None
                 }
             }
@@ -253,6 +290,218 @@ fn cuda_paged_attention<T: KernelFloat>(
             false
         }
     }
+}
+
+/// CUDA RMSNorm dispatch.
+/// Returns true if GPU execution succeeded, false to fallback to CPU.
+fn cuda_rms_norm<T: KernelFloat>(
+    kernel: &RmsNormKernel,
+    stream: &Arc<CudaStream>,
+    input: &[T],
+    weight: &[T],
+    output: &mut [T],
+    batch: usize,
+    hidden: usize,
+    eps: f32,
+) -> bool {
+    let expected = batch.saturating_mul(hidden);
+    if input.len() != expected || output.len() != expected || weight.len() != hidden {
+        log::debug!("CUDA rms_norm dispatch skipped: length mismatch");
+        return false;
+    }
+
+    let input_f32: Vec<f32> = input.iter().map(|v| v.to_f32()).collect();
+    let weight_f32: Vec<f32> = weight.iter().map(|v| v.to_f32()).collect();
+
+    let input_buf = match stream.clone_htod(&input_f32) {
+        Ok(buf) => buf,
+        Err(e) => {
+            log::debug!("Failed to copy rms_norm input to GPU: {}", e);
+            return false;
+        }
+    };
+    let weight_buf = match stream.clone_htod(&weight_f32) {
+        Ok(buf) => buf,
+        Err(e) => {
+            log::debug!("Failed to copy rms_norm weight to GPU: {}", e);
+            return false;
+        }
+    };
+    let mut output_buf = match stream.alloc_zeros(output.len()) {
+        Ok(buf) => buf,
+        Err(e) => {
+            log::debug!("Failed to allocate rms_norm output on GPU: {}", e);
+            return false;
+        }
+    };
+
+    if let Err(e) = kernel.forward(stream, &input_buf, &weight_buf, &mut output_buf, batch, hidden, eps) {
+        log::debug!("CUDA rms_norm kernel execution failed: {}", e);
+        return false;
+    }
+
+    let output_f32 = match stream.clone_dtoh(&output_buf) {
+        Ok(out_data) => out_data,
+        Err(e) => {
+            log::debug!("Failed to copy rms_norm output from GPU: {}", e);
+            return false;
+        }
+    };
+
+    for (dst, val) in output.iter_mut().zip(output_f32.iter()) {
+        *dst = T::from_f32(*val);
+    }
+
+    true
+}
+
+/// CUDA RMSNorm inplace dispatch.
+/// Returns true if GPU execution succeeded, false to fallback to CPU.
+fn cuda_rms_norm_inplace<T: KernelFloat>(
+    kernel: &RmsNormKernel,
+    stream: &Arc<CudaStream>,
+    data: &mut [T],
+    weight: &[T],
+    batch: usize,
+    hidden: usize,
+    eps: f32,
+) -> bool {
+    let expected = batch.saturating_mul(hidden);
+    if data.len() != expected || weight.len() != hidden {
+        log::debug!("CUDA rms_norm_inplace dispatch skipped: length mismatch");
+        return false;
+    }
+
+    let data_f32: Vec<f32> = data.iter().map(|v| v.to_f32()).collect();
+    let weight_f32: Vec<f32> = weight.iter().map(|v| v.to_f32()).collect();
+
+    let data_buf = match stream.clone_htod(&data_f32) {
+        Ok(buf) => buf,
+        Err(e) => {
+            log::debug!("Failed to copy rms_norm data to GPU: {}", e);
+            return false;
+        }
+    };
+    let weight_buf = match stream.clone_htod(&weight_f32) {
+        Ok(buf) => buf,
+        Err(e) => {
+            log::debug!("Failed to copy rms_norm weight to GPU: {}", e);
+            return false;
+        }
+    };
+    let mut output_buf = match stream.alloc_zeros(data.len()) {
+        Ok(buf) => buf,
+        Err(e) => {
+            log::debug!("Failed to allocate rms_norm output on GPU: {}", e);
+            return false;
+        }
+    };
+
+    if let Err(e) = kernel.forward(stream, &data_buf, &weight_buf, &mut output_buf, batch, hidden, eps) {
+        log::debug!("CUDA rms_norm kernel execution failed: {}", e);
+        return false;
+    }
+
+    let output_f32 = match stream.clone_dtoh(&output_buf) {
+        Ok(out_data) => out_data,
+        Err(e) => {
+            log::debug!("Failed to copy rms_norm output from GPU: {}", e);
+            return false;
+        }
+    };
+
+    for (dst, val) in data.iter_mut().zip(output_f32.iter()) {
+        *dst = T::from_f32(*val);
+    }
+
+    true
+}
+
+/// CUDA SiLU dispatch.
+/// Returns true if GPU execution succeeded, false to fallback to CPU.
+fn cuda_silu<T: KernelFloat>(
+    kernel: &CudaSilu,
+    stream: &Arc<CudaStream>,
+    input: &[T],
+    output: &mut [T],
+) -> bool {
+    if input.len() != output.len() {
+        log::debug!("CUDA silu dispatch skipped: length mismatch");
+        return false;
+    }
+
+    let input_f32: Vec<f32> = input.iter().map(|v| v.to_f32()).collect();
+
+    let input_buf = match stream.clone_htod(&input_f32) {
+        Ok(buf) => buf,
+        Err(e) => {
+            log::debug!("Failed to copy silu input to GPU: {}", e);
+            return false;
+        }
+    };
+    let mut output_buf = match stream.alloc_zeros(output.len()) {
+        Ok(buf) => buf,
+        Err(e) => {
+            log::debug!("Failed to allocate silu output on GPU: {}", e);
+            return false;
+        }
+    };
+
+    if let Err(e) = kernel.forward(stream, &input_buf, &mut output_buf, output.len()) {
+        log::debug!("CUDA silu kernel execution failed: {}", e);
+        return false;
+    }
+
+    let output_f32 = match stream.clone_dtoh(&output_buf) {
+        Ok(out_data) => out_data,
+        Err(e) => {
+            log::debug!("Failed to copy silu output from GPU: {}", e);
+            return false;
+        }
+    };
+
+    for (dst, val) in output.iter_mut().zip(output_f32.iter()) {
+        *dst = T::from_f32(*val);
+    }
+
+    true
+}
+
+/// CUDA SiLU inplace dispatch.
+/// Returns true if GPU execution succeeded, false to fallback to CPU.
+fn cuda_silu_inplace<T: KernelFloat>(
+    kernel: &CudaSilu,
+    stream: &Arc<CudaStream>,
+    data: &mut [T],
+) -> bool {
+    let data_f32: Vec<f32> = data.iter().map(|v| v.to_f32()).collect();
+
+    let mut data_buf = match stream.clone_htod(&data_f32) {
+        Ok(buf) => buf,
+        Err(e) => {
+            log::debug!("Failed to copy silu data to GPU: {}", e);
+            return false;
+        }
+    };
+
+    if let Err(e) = kernel.forward_inplace(stream, &mut data_buf, data.len()) {
+        log::debug!("CUDA silu inplace kernel execution failed: {}", e);
+        return false;
+    }
+
+    let output_f32 = match stream.clone_dtoh(&data_buf) {
+        Ok(out_data) => out_data,
+        Err(e) => {
+            log::debug!("Failed to copy silu inplace output from GPU: {}", e);
+            return false;
+        }
+    };
+
+    for (dst, val) in data.iter_mut().zip(output_f32.iter()) {
+        *dst = T::from_f32(*val);
+    }
+
+    true
 }
 
 pub struct CudaBackend {}
@@ -685,6 +934,183 @@ impl Backend for CudaBackend {
                     seq_len,
                     config,
                 )
+            },
+        )
+    }
+
+    fn rms_norm(
+        &self,
+        input: TensorSlice<'_>,
+        weight: TensorSlice<'_>,
+        output: TensorSliceMut<'_>,
+        batch: usize,
+        hidden: usize,
+        eps: f32,
+    ) -> Result<(), String> {
+        match_float2_out(
+            "rms_norm",
+            input,
+            weight,
+            output,
+            |input, weight, output| {
+                if let (Some(kernel), Some(stream)) = (get_cuda_rmsnorm_kernel(), get_cuda_stream()) {
+                    if cuda_rms_norm(kernel, stream, input, weight, output, batch, hidden, eps) {
+                        return;
+                    }
+                    log::debug!("CUDA rms_norm dispatch failed, falling back to CPU");
+                }
+                crate::ops::rms_norm::rms_norm_forward(input, weight, output, batch, hidden, eps);
+            },
+            |input, weight, output| {
+                if let (Some(kernel), Some(stream)) = (get_cuda_rmsnorm_kernel(), get_cuda_stream()) {
+                    if cuda_rms_norm(kernel, stream, input, weight, output, batch, hidden, eps) {
+                        return;
+                    }
+                    log::debug!("CUDA rms_norm dispatch failed, falling back to CPU");
+                }
+                apply_f32_binary_out(input, weight, output, |input, weight, output| {
+                    crate::ops::rms_norm::rms_norm_forward(input, weight, output, batch, hidden, eps);
+                });
+            },
+            |input, weight, output| {
+                if let (Some(kernel), Some(stream)) = (get_cuda_rmsnorm_kernel(), get_cuda_stream()) {
+                    if cuda_rms_norm(kernel, stream, input, weight, output, batch, hidden, eps) {
+                        return;
+                    }
+                    log::debug!("CUDA rms_norm dispatch failed, falling back to CPU");
+                }
+                apply_f32_binary_out(input, weight, output, |input, weight, output| {
+                    crate::ops::rms_norm::rms_norm_forward(input, weight, output, batch, hidden, eps);
+                });
+            },
+        )
+    }
+
+    fn rms_norm_inplace(
+        &self,
+        data: TensorSliceMut<'_>,
+        weight: TensorSlice<'_>,
+        batch: usize,
+        hidden: usize,
+        eps: f32,
+    ) -> Result<(), String> {
+        match_float1_mut_weight(
+            "rms_norm_inplace",
+            data,
+            weight,
+            |data, weight| {
+                if let (Some(kernel), Some(stream)) = (get_cuda_rmsnorm_kernel(), get_cuda_stream()) {
+                    if cuda_rms_norm_inplace(kernel, stream, data, weight, batch, hidden, eps) {
+                        return;
+                    }
+                    log::debug!("CUDA rms_norm_inplace dispatch failed, falling back to CPU");
+                }
+                crate::ops::rms_norm::rms_norm_inplace(data, weight, batch, hidden, eps);
+            },
+            |data, weight| {
+                if let (Some(kernel), Some(stream)) = (get_cuda_rmsnorm_kernel(), get_cuda_stream()) {
+                    if cuda_rms_norm_inplace(kernel, stream, data, weight, batch, hidden, eps) {
+                        return;
+                    }
+                    log::debug!("CUDA rms_norm_inplace dispatch failed, falling back to CPU");
+                }
+                apply_f32_inplace_weight(data, weight, |data, weight| {
+                    crate::ops::rms_norm::rms_norm_inplace(data, weight, batch, hidden, eps);
+                });
+            },
+            |data, weight| {
+                if let (Some(kernel), Some(stream)) = (get_cuda_rmsnorm_kernel(), get_cuda_stream()) {
+                    if cuda_rms_norm_inplace(kernel, stream, data, weight, batch, hidden, eps) {
+                        return;
+                    }
+                    log::debug!("CUDA rms_norm_inplace dispatch failed, falling back to CPU");
+                }
+                apply_f32_inplace_weight(data, weight, |data, weight| {
+                    crate::ops::rms_norm::rms_norm_inplace(data, weight, batch, hidden, eps);
+                });
+            },
+        )
+    }
+
+    fn silu_inplace(
+        &self,
+        data: TensorSliceMut<'_>,
+    ) -> Result<(), String> {
+        match_float1_mut(
+            data,
+            |data| {
+                if let (Some(kernel), Some(stream)) = (get_cuda_silu_kernel(), get_cuda_stream()) {
+                    if cuda_silu_inplace(kernel, stream, data) {
+                        return;
+                    }
+                    log::debug!("CUDA silu_inplace dispatch failed, falling back to CPU");
+                }
+                crate::ops::activations::silu_inplace(data);
+            },
+            |data| {
+                if let (Some(kernel), Some(stream)) = (get_cuda_silu_kernel(), get_cuda_stream()) {
+                    if cuda_silu_inplace(kernel, stream, data) {
+                        return;
+                    }
+                    log::debug!("CUDA silu_inplace dispatch failed, falling back to CPU");
+                }
+                apply_f32_unary_inplace(data, |data| {
+                    crate::ops::activations::silu_inplace(data);
+                });
+            },
+            |data| {
+                if let (Some(kernel), Some(stream)) = (get_cuda_silu_kernel(), get_cuda_stream()) {
+                    if cuda_silu_inplace(kernel, stream, data) {
+                        return;
+                    }
+                    log::debug!("CUDA silu_inplace dispatch failed, falling back to CPU");
+                }
+                apply_f32_unary_inplace(data, |data| {
+                    crate::ops::activations::silu_inplace(data);
+                });
+            },
+        )
+    }
+
+    fn silu(
+        &self,
+        input: TensorSlice<'_>,
+        output: TensorSliceMut<'_>,
+    ) -> Result<(), String> {
+        match_float1_out(
+            "silu",
+            input,
+            output,
+            |input, output| {
+                if let (Some(kernel), Some(stream)) = (get_cuda_silu_kernel(), get_cuda_stream()) {
+                    if cuda_silu(kernel, stream, input, output) {
+                        return;
+                    }
+                    log::debug!("CUDA silu dispatch failed, falling back to CPU");
+                }
+                crate::ops::activations::silu(input, output);
+            },
+            |input, output| {
+                if let (Some(kernel), Some(stream)) = (get_cuda_silu_kernel(), get_cuda_stream()) {
+                    if cuda_silu(kernel, stream, input, output) {
+                        return;
+                    }
+                    log::debug!("CUDA silu dispatch failed, falling back to CPU");
+                }
+                apply_f32_unary_out(input, output, |input, output| {
+                    crate::ops::activations::silu(input, output);
+                });
+            },
+            |input, output| {
+                if let (Some(kernel), Some(stream)) = (get_cuda_silu_kernel(), get_cuda_stream()) {
+                    if cuda_silu(kernel, stream, input, output) {
+                        return;
+                    }
+                    log::debug!("CUDA silu dispatch failed, falling back to CPU");
+                }
+                apply_f32_unary_out(input, output, |input, output| {
+                    crate::ops::activations::silu(input, output);
+                });
             },
         )
     }

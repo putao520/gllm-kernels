@@ -1,32 +1,46 @@
-use cudarc::driver::{CudaContext, CudaFunction, CudaSlice, DeviceRepr, DeviceSlice, LaunchConfig, PushKernelArg};
-use cudarc::nvrtc::Ptx;
+use cudarc::driver::{CudaContext, CudaFunction, CudaModule, CudaSlice, LaunchConfig, PushKernelArg};
 use std::sync::Arc;
-use crate::gpu_types::{GpuTensor, GpuBuffer, TensorDtype};
+use crate::cuda_kernels::ptx_loader::PtxCollection;
 use crate::wgpu_kernels::LinearParams;
 
-// Embedded CUDA source
-const LINEAR_PTX_SRC: &str = include_str!("kernels/linear.cu");
+const KERNEL_FORWARD: &str = "linear_forward_kernel";
+const KERNEL_FUSED_GATE_UP_SILU: &str = "fused_gate_up_silu_kernel";
+
+/// SM-aware PTX collection for Linear kernel.
+/// 🚨 **Fat Binary Only**: All PTX precompiled and embedded, no runtime compilation.
+static LINEAR_PTX: PtxCollection = PtxCollection {
+    kernel_name: "linear",
+    ptx_versions: &[
+        (61, include_str!("kernels/linear_sm61.ptx")),
+        (80, include_str!("kernels/linear.ptx")),
+    ],
+};
 
 pub struct CudaLinear {
+    #[allow(dead_code)]
+    module: Arc<CudaModule>,
     func: CudaFunction,
     fused_func: CudaFunction,
 }
 
 impl CudaLinear {
     pub fn new(ctx: &Arc<CudaContext>) -> Result<Self, String> {
-        // Compile PTX using NVRTC
-        let ptx = Ptx::from_src(LINEAR_PTX_SRC);
-        // Load module via context
-        let module = ctx.load_module(ptx)
-            .map_err(|e| format!("Failed to load PTX module: {:?}", e))?;
-        
-        let func = module.load_function("linear_forward_kernel")
-            .map_err(|e| format!("Failed to find kernel function: {:?}", e))?;
+        let ptx = LINEAR_PTX
+            .load(ctx)
+            .map_err(|e| format!("Failed to load linear PTX: {e}"))?;
+        let module = ctx
+            .load_module(ptx)
+            .map_err(|e| format!("Failed to load linear PTX module: {:?}", e))?;
 
-        let fused_func = module.load_function("fused_gate_up_silu_kernel")
-            .map_err(|e| format!("Failed to find fused kernel function: {:?}", e))?;
-            
-        Ok(Self { func, fused_func })
+        let func = module
+            .load_function(KERNEL_FORWARD)
+            .map_err(|_| format!("Failed to find kernel function: {KERNEL_FORWARD}"))?;
+
+        let fused_func = module
+            .load_function(KERNEL_FUSED_GATE_UP_SILU)
+            .map_err(|_| format!("Failed to find kernel function: {KERNEL_FUSED_GATE_UP_SILU}"))?;
+
+        Ok(Self { module, func, fused_func })
     }
 
     pub fn forward(
@@ -38,8 +52,6 @@ impl CudaLinear {
         bias: Option<&CudaSlice<u8>>,
         output: &CudaSlice<u8>,
     ) -> Result<(), String> {
-        use cudarc::driver::PushKernelArg;
-
         let has_bias = if bias.is_some() { 1 } else { 0 };
         let cfg = LaunchConfig::for_num_elems(params.out_features);
         
