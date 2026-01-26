@@ -504,6 +504,7 @@ fn cuda_silu_inplace<T: KernelFloat>(
     true
 }
 
+#[derive(Clone, Copy)]
 pub struct CudaBackend {}
 
 impl CudaBackend {

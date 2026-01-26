@@ -229,6 +229,7 @@ fn metal_paged_attention<T: KernelFloat>(
     }
 }
 
+#[derive(Clone, Copy)]
 pub struct MetalBackend {}
 
 impl MetalBackend {

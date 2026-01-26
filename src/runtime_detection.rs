@@ -340,7 +340,7 @@ fn hostname() -> String {
 // Backend-specific detection functions (runtime, no feature flags)
 
 /// Try to initialize CUDA via cudarc's dynamic loading.
-fn try_cuda() -> bool {
+pub(crate) fn try_cuda() -> bool {
     use cudarc::driver::result;
 
     match result::init() {
@@ -357,7 +357,7 @@ fn try_cuda() -> bool {
 
 /// Try to detect ROCm (AMD GPU) via /dev/kfd.
 #[cfg(target_os = "linux")]
-fn try_rocm() -> bool {
+pub(crate) fn try_rocm() -> bool {
     if std::path::Path::new("/dev/kfd").exists() {
         log::info!("ROCm backend detected");
         true
@@ -368,13 +368,13 @@ fn try_rocm() -> bool {
 }
 
 #[cfg(not(target_os = "linux"))]
-fn try_rocm() -> bool {
+pub(crate) fn try_rocm() -> bool {
     false
 }
 
 /// Try to detect Metal (macOS GPU).
 #[cfg(target_os = "macos")]
-fn try_metal() -> bool {
+pub(crate) fn try_metal() -> bool {
     use metal::Device;
 
     if Device::system_default().is_some() {
@@ -387,12 +387,12 @@ fn try_metal() -> bool {
 }
 
 #[cfg(not(target_os = "macos"))]
-fn try_metal() -> bool {
+pub(crate) fn try_metal() -> bool {
     false
 }
 
 /// Try to detect WGPU (cross-platform GPU).
-fn try_wgpu() -> bool {
+pub(crate) fn try_wgpu() -> bool {
     let instance = wgpu::Instance::new(&wgpu::InstanceDescriptor::default());
     let adapter = pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
         power_preference: wgpu::PowerPreference::HighPerformance,

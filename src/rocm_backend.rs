@@ -272,6 +272,7 @@ fn rocm_paged_attention<T: KernelFloat>(
     }
 }
 
+#[derive(Clone, Copy)]
 pub struct RocmBackend {}
 
 impl RocmBackend {

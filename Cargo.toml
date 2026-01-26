@@ -22,7 +22,7 @@ default = ["full"]
 full = ["all-backends", "all-kernels"]
 
 # 所有后端（运行时检测，动态加载）
-all-backends = []
+all-backends = ["cuda", "rocm", "metal", "wgpu"]
 
 # 所有自定义 kernel
 all-kernels = []
@@ -60,6 +60,9 @@ download-kernels = []
 # Backend-specific kernel features (for conditional compilation)
 cpu = []
 cuda = []
+rocm = []
+metal = []
+wgpu = []
 cuda-kernel = []
 rocm-kernel = []
 metal-kernel = []

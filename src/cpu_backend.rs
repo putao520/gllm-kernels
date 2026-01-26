@@ -12,8 +12,8 @@ use crate::ops::rope::RoPEConfig;
 use crate::ops::sampling::{SamplingConfig, TopKResult};
 use crate::runtime_detection::BackendType;
 
-pub struct CpuBackend {
-}
+#[derive(Clone, Copy)]
+pub struct CpuBackend {}
 
 impl CpuBackend {
     pub fn new() -> Self {

@@ -736,6 +736,7 @@ fn wgpu_silu_inplace<T: KernelFloat>(
     true
 }
 
+#[derive(Clone, Copy)]
 pub struct WgpuBackend {}
 
 impl WgpuBackend {
