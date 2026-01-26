@@ -25,6 +25,7 @@ pub mod quantized;
 // Utility kernels
 pub mod embedding_ops;
 pub mod linear;
+pub mod matmul;
 pub mod rms_norm;
 pub mod silu;
 pub mod tensor_ops;
@@ -74,6 +75,7 @@ pub use quantized::{Q4DequantParams, AwqDequantParams, QuantizedDequantError, Wg
 pub use embedding_ops::{EmbeddingOpsError, EmbeddingOpsKernel};
 // Note: GpuRerankConfig and GpuRerankStageResult are exported from crate::types
 pub use linear::{LinearError, LinearParams, WgpuLinear};
+pub use matmul::{MatmulError, MatmulParams, WgpuMatmul};
 pub use rms_norm::{RmsNormError, RmsNormParams, WgpuRmsNorm};
 pub use silu::{SiluError, SiluParams, WgpuSilu};
 pub use tensor_ops::{TensorOpsParams, WgpuTensorOps};

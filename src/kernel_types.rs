@@ -559,7 +559,7 @@ pub struct ChunkedPrefillResult<T: KernelFloat> {
 
 /// Matrix multiplication configuration.
 ///
-/// Supports C = A * B^T (transposed B is common for weight matrices).
+/// Supports C = alpha * A * B + beta * C, with optional transposed storage for A/B.
 #[derive(Clone, Debug)]
 pub struct MatmulConfig {
     /// M dimension (rows of A, rows of C)
@@ -568,6 +568,8 @@ pub struct MatmulConfig {
     pub k: usize,
     /// N dimension (cols of B^T = cols of B, cols of C)
     pub n: usize,
+    /// Whether A is stored transposed (A is [K, M])
+    pub transpose_a: bool,
     /// Whether B is stored transposed (common for weight matrices)
     pub transpose_b: bool,
     /// Alpha scalar multiplier (C = alpha * A * B + beta * C)
@@ -582,6 +584,7 @@ impl Default for MatmulConfig {
             m: 1,
             k: 1,
             n: 1,
+            transpose_a: false,
             transpose_b: false,
             alpha: 1.0,
             beta: 0.0,

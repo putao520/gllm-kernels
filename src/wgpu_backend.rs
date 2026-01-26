@@ -20,6 +20,7 @@ use crate::wgpu_kernels::{
     FlashAttentionKernel as WgpuFlashAttentionKernel,
     PagedAttentionKernel as WgpuPagedAttentionKernel,
     WgpuQuantizedDequantizer,
+    MatmulParams, WgpuMatmul,
     RmsNormParams, WgpuRmsNorm,
     SiluParams, WgpuSilu,
 };
@@ -36,6 +37,8 @@ static WGPU_DEVICE_QUEUE: OnceLock<Option<WgpuDeviceQueue>> = OnceLock::new();
 static WGPU_FLASH_KERNEL: OnceLock<Option<WgpuFlashAttentionKernel>> = OnceLock::new();
 /// Global WGPU paged attention kernel (lazy initialized).
 static WGPU_PAGED_KERNEL: OnceLock<Option<WgpuPagedAttentionKernel>> = OnceLock::new();
+/// Global WGPU matmul kernel (lazy initialized).
+static WGPU_MATMUL_KERNEL: OnceLock<Option<WgpuMatmul>> = OnceLock::new();
 /// Global WGPU RMSNorm kernel (lazy initialized).
 static WGPU_RMSNORM_KERNEL: OnceLock<Option<WgpuRmsNorm>> = OnceLock::new();
 /// Global WGPU SiLU kernel (lazy initialized).
@@ -305,6 +308,18 @@ fn get_wgpu_paged_kernel() -> Option<&'static WgpuPagedAttentionKernel> {
         .as_ref()
 }
 
+fn get_wgpu_matmul_kernel() -> Option<&'static WgpuMatmul> {
+    WGPU_MATMUL_KERNEL
+        .get_or_init(|| {
+            let device_queue = get_wgpu_device_queue()?;
+            Some(WgpuMatmul::new(
+                device_queue.device.clone(),
+                device_queue.queue.clone(),
+            ))
+        })
+        .as_ref()
+}
+
 fn get_wgpu_rmsnorm_kernel() -> Option<&'static WgpuRmsNorm> {
     WGPU_RMSNORM_KERNEL
         .get_or_init(|| {
@@ -438,6 +453,104 @@ fn wgpu_paged_attention<T: KernelFloat>(
             false
         }
     }
+}
+
+fn wgpu_matmul(
+    kernel: &WgpuMatmul,
+    a: &[f32],
+    b: &[f32],
+    c: &mut [f32],
+    config: &MatmulConfig,
+) -> bool {
+    let m = config.m;
+    let k = config.k;
+    let n = config.n;
+
+    let a_len = match m.checked_mul(k) {
+        Some(len) => len,
+        None => {
+            log::debug!("WGPU matmul dispatch skipped: A size overflow");
+            return false;
+        }
+    };
+    let b_len = match k.checked_mul(n) {
+        Some(len) => len,
+        None => {
+            log::debug!("WGPU matmul dispatch skipped: B size overflow");
+            return false;
+        }
+    };
+    let c_len = match m.checked_mul(n) {
+        Some(len) => len,
+        None => {
+            log::debug!("WGPU matmul dispatch skipped: C size overflow");
+            return false;
+        }
+    };
+
+    if a.len() != a_len || b.len() != b_len || c.len() != c_len {
+        log::debug!("WGPU matmul dispatch skipped: length mismatch");
+        return false;
+    }
+
+    let m_u32 = match u32::try_from(m) {
+        Ok(v) => v,
+        Err(_) => return false,
+    };
+    let n_u32 = match u32::try_from(n) {
+        Ok(v) => v,
+        Err(_) => return false,
+    };
+    let k_u32 = match u32::try_from(k) {
+        Ok(v) => v,
+        Err(_) => return false,
+    };
+
+    let params = MatmulParams {
+        m: m_u32,
+        n: n_u32,
+        k: k_u32,
+        trans_a: u32::from(config.transpose_a),
+        trans_b: u32::from(config.transpose_b),
+        _pad0: [0; 3],
+        alpha: config.alpha,
+        beta: config.beta,
+        _pad1: [0.0; 2],
+    };
+
+    let device = kernel.device();
+    let queue = kernel.queue();
+
+    let a_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+        label: Some("matmul_a"),
+        contents: bytemuck::cast_slice(a),
+        usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+    });
+    let b_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+        label: Some("matmul_b"),
+        contents: bytemuck::cast_slice(b),
+        usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+    });
+    let c_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+        label: Some("matmul_c"),
+        contents: bytemuck::cast_slice(c),
+        usage: wgpu::BufferUsages::STORAGE
+            | wgpu::BufferUsages::COPY_DST
+            | wgpu::BufferUsages::COPY_SRC,
+    });
+
+    kernel.forward(params, &a_buf, &b_buf, &c_buf);
+
+    let output_f32 = match readback_f32(device, queue, &c_buf, c.len(), "matmul_readback") {
+        Ok(values) => values,
+        Err(err) => {
+            log::debug!("WGPU matmul readback failed: {}", err);
+            return false;
+        }
+    };
+
+    c.copy_from_slice(&output_f32);
+    true
 }
 
 fn readback_f32(
@@ -909,7 +1022,15 @@ impl Backend for WgpuBackend {
             a,
             b,
             c,
-            |a, b, c| crate::ops::matmul::cpu_matmul(a, b, c, config.clone()),
+            |a, b, c| {
+                if let Some(kernel) = get_wgpu_matmul_kernel() {
+                    if wgpu_matmul(kernel, a, b, c, &config) {
+                        return;
+                    }
+                    log::debug!("WGPU matmul dispatch failed, falling back to CPU");
+                }
+                crate::ops::matmul::cpu_matmul(a, b, c, config.clone());
+            },
             |a, b, c| crate::ops::matmul::cpu_matmul(a, b, c, config.clone()),
             |a, b, c| crate::ops::matmul::cpu_matmul(a, b, c, config.clone()),
         )
