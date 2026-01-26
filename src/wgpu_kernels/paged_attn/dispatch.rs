@@ -127,40 +127,68 @@ impl PagedAttentionKernel {
             return Ok(Vec::new());
         }
 
-        let q_buffer = self.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-            label: Some("paged_attention_q"),
-            contents: q_bytes,
-            usage: BufferUsages::STORAGE | BufferUsages::COPY_DST,
-        });
-        let k_buffer = self.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-            label: Some("paged_attention_k_cache"),
-            contents: k_bytes,
-            usage: BufferUsages::STORAGE | BufferUsages::COPY_DST,
-        });
-        let v_buffer = self.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-            label: Some("paged_attention_v_cache"),
-            contents: v_bytes,
-            usage: BufferUsages::STORAGE | BufferUsages::COPY_DST,
-        });
-        let block_tables = self.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-            label: Some("paged_attention_block_tables"),
-            contents: block_tables_bytes,
-            usage: BufferUsages::STORAGE | BufferUsages::COPY_DST,
-        });
-        let block_offsets = self.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-            label: Some("paged_attention_block_offsets"),
-            contents: block_offsets_bytes,
-            usage: BufferUsages::STORAGE | BufferUsages::COPY_DST,
-        });
-
         let padded_bytes = align_up(output_bytes, max_align());
-        let output_buffer = self.device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("paged_attention_output"),
-            size: padded_bytes,
-            usage: BufferUsages::STORAGE | BufferUsages::COPY_SRC,
-            mapped_at_creation: false,
-        });
+        let q_size = q_bytes.len() as u64;
+        let k_size = k_bytes.len() as u64;
+        let v_size = v_bytes.len() as u64;
+        let bt_size = block_tables_bytes.len() as u64;
+        let bo_size = block_offsets_bytes.len() as u64;
 
+        // P0-MEM-3: Get buffers from pool
+        let (q_buffer, k_buffer, v_buffer, block_tables, block_offsets, output_buffer, readback) = {
+            let mut pool = self.buffer_pool.lock().map_err(|_| {
+                PagedAttentionError::Wgpu("buffer pool lock poisoned".into())
+            })?;
+
+            let q_buf = pool.get_storage(
+                &self.device,
+                q_size,
+                BufferUsages::STORAGE | BufferUsages::COPY_DST,
+                "paged_attention_q",
+            );
+            let k_buf = pool.get_storage(
+                &self.device,
+                k_size,
+                BufferUsages::STORAGE | BufferUsages::COPY_DST,
+                "paged_attention_k_cache",
+            );
+            let v_buf = pool.get_storage(
+                &self.device,
+                v_size,
+                BufferUsages::STORAGE | BufferUsages::COPY_DST,
+                "paged_attention_v_cache",
+            );
+            let bt_buf = pool.get_storage(
+                &self.device,
+                bt_size,
+                BufferUsages::STORAGE | BufferUsages::COPY_DST,
+                "paged_attention_block_tables",
+            );
+            let bo_buf = pool.get_storage(
+                &self.device,
+                bo_size,
+                BufferUsages::STORAGE | BufferUsages::COPY_DST,
+                "paged_attention_block_offsets",
+            );
+            let out_buf = pool.get_storage(
+                &self.device,
+                padded_bytes,
+                BufferUsages::STORAGE | BufferUsages::COPY_SRC,
+                "paged_attention_output",
+            );
+            let rb_buf = pool.get_staging(&self.device, padded_bytes, "paged_attention_readback");
+
+            (q_buf, k_buf, v_buf, bt_buf, bo_buf, out_buf, rb_buf)
+        };
+
+        // Upload data to buffers
+        self.queue.write_buffer(&q_buffer, 0, q_bytes);
+        self.queue.write_buffer(&k_buffer, 0, k_bytes);
+        self.queue.write_buffer(&v_buffer, 0, v_bytes);
+        self.queue.write_buffer(&block_tables, 0, block_tables_bytes);
+        self.queue.write_buffer(&block_offsets, 0, block_offsets_bytes);
+
+        // Params buffer (small, not pooled)
         let params_buffer = self.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("paged_attention_params"),
             contents: bytes_of(&params),
@@ -196,17 +224,22 @@ impl PagedAttentionKernel {
             params.num_heads,
         );
 
-        let readback = self.device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("paged_attention_readback"),
-            size: padded_bytes,
-            usage: BufferUsages::MAP_READ | BufferUsages::COPY_DST,
-            mapped_at_creation: false,
-        });
-
         encoder.copy_buffer_to_buffer(&output_buffer, 0, &readback, 0, padded_bytes);
         self.queue.submit(Some(encoder.finish()));
 
         let data = read_buffer_sync(&self.device, &readback, padded_bytes)?;
+
+        // P0-MEM-3: Release buffers back to pool
+        if let Ok(mut pool) = self.buffer_pool.lock() {
+            pool.release_storage(q_buffer, q_size);
+            pool.release_storage(k_buffer, k_size);
+            pool.release_storage(v_buffer, v_size);
+            pool.release_storage(block_tables, bt_size);
+            pool.release_storage(block_offsets, bo_size);
+            pool.release_storage(output_buffer, padded_bytes);
+            pool.release_staging(readback, padded_bytes);
+        }
+
         let mut output = data;
         output.truncate(output_bytes as usize);
         Ok(output)

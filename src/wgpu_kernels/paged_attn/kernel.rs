@@ -1,8 +1,9 @@
 //! WGPU paged attention kernels using WGSL.
 
 use std::borrow::Cow;
+use std::collections::HashMap;
 use std::fmt;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use wgpu::{BindGroupLayout, ComputePipeline, Device, Queue};
 
@@ -50,6 +51,132 @@ impl fmt::Display for PagedAttentionError {
 
 impl std::error::Error for PagedAttentionError {}
 
+/// Buffer pool configuration for PagedAttention (P0-MEM-3).
+const PA_POOL_MAX_PER_BUCKET: usize = 4;
+const PA_POOL_MAX_BYTES: usize = 256 * 1024 * 1024; // 256 MB
+
+/// Size bucket for buffer pooling (rounded to power of 2).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+struct SizeBucket(u64);
+
+impl SizeBucket {
+    fn from_size(size: u64) -> Self {
+        let min_size = 256u64;
+        let bucket = size.max(min_size).next_power_of_two();
+        SizeBucket(bucket)
+    }
+
+    fn size(&self) -> u64 {
+        self.0
+    }
+}
+
+/// Buffer pool for PagedAttention dispatch (P0-MEM-3).
+pub(super) struct DispatchBufferPool {
+    storage_buckets: HashMap<SizeBucket, Vec<wgpu::Buffer>>,
+    staging_buckets: HashMap<SizeBucket, Vec<wgpu::Buffer>>,
+    total_bytes: usize,
+}
+
+impl DispatchBufferPool {
+    fn new() -> Self {
+        Self {
+            storage_buckets: HashMap::new(),
+            staging_buckets: HashMap::new(),
+            total_bytes: 0,
+        }
+    }
+
+    /// Get or create a storage buffer.
+    pub fn get_storage(
+        &mut self,
+        device: &Device,
+        size: u64,
+        usage: wgpu::BufferUsages,
+        label: &'static str,
+    ) -> wgpu::Buffer {
+        let bucket = SizeBucket::from_size(size);
+
+        if let Some(buffers) = self.storage_buckets.get_mut(&bucket) {
+            if let Some(buffer) = buffers.pop() {
+                self.total_bytes = self.total_bytes.saturating_sub(bucket.size() as usize);
+                log::trace!("DispatchBufferPool: reused storage buffer size={}", bucket.size());
+                return buffer;
+            }
+        }
+
+        log::trace!("DispatchBufferPool: created storage buffer size={} label={}", bucket.size(), label);
+        device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some(label),
+            size: bucket.size(),
+            usage,
+            mapped_at_creation: false,
+        })
+    }
+
+    /// Get or create a staging buffer for readback.
+    pub fn get_staging(
+        &mut self,
+        device: &Device,
+        size: u64,
+        label: &'static str,
+    ) -> wgpu::Buffer {
+        let bucket = SizeBucket::from_size(size);
+
+        if let Some(buffers) = self.staging_buckets.get_mut(&bucket) {
+            if let Some(buffer) = buffers.pop() {
+                self.total_bytes = self.total_bytes.saturating_sub(bucket.size() as usize);
+                log::trace!("DispatchBufferPool: reused staging buffer size={}", bucket.size());
+                return buffer;
+            }
+        }
+
+        log::trace!("DispatchBufferPool: created staging buffer size={} label={}", bucket.size(), label);
+        device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some(label),
+            size: bucket.size(),
+            usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        })
+    }
+
+    /// Release a storage buffer back to pool.
+    pub fn release_storage(&mut self, buffer: wgpu::Buffer, original_size: u64) {
+        let bucket = SizeBucket::from_size(original_size);
+        let bucket_size = bucket.size() as usize;
+
+        if self.total_bytes + bucket_size > PA_POOL_MAX_BYTES {
+            return;
+        }
+
+        let buffers = self.storage_buckets.entry(bucket).or_insert_with(Vec::new);
+        if buffers.len() >= PA_POOL_MAX_PER_BUCKET {
+            return;
+        }
+
+        buffers.push(buffer);
+        self.total_bytes += bucket_size;
+    }
+
+    /// Release a staging buffer back to pool.
+    pub fn release_staging(&mut self, buffer: wgpu::Buffer, original_size: u64) {
+        let bucket = SizeBucket::from_size(original_size);
+        let bucket_size = bucket.size() as usize;
+
+        if self.total_bytes + bucket_size > PA_POOL_MAX_BYTES / 4 {
+            return;
+        }
+
+        let buffers = self.staging_buckets.entry(bucket).or_insert_with(Vec::new);
+        if buffers.len() >= PA_POOL_MAX_PER_BUCKET {
+            return;
+        }
+
+        buffers.push(buffer);
+        self.total_bytes += bucket_size;
+    }
+}
+
 /// Paged attention WGPU kernel wrapper.
 pub struct PagedAttentionKernel {
     pub(super) device: Arc<Device>,
@@ -57,6 +184,8 @@ pub struct PagedAttentionKernel {
     pub(super) bind_group_layout: BindGroupLayout,
     pub(super) pipeline_f32: ComputePipeline,
     pub(super) pipeline_f16: Option<ComputePipeline>,
+    /// Buffer pool for dispatch operations (P0-MEM-3).
+    pub(super) buffer_pool: Mutex<DispatchBufferPool>,
 }
 
 impl PagedAttentionKernel {
@@ -114,6 +243,7 @@ impl PagedAttentionKernel {
             bind_group_layout,
             pipeline_f32,
             pipeline_f16,
+            buffer_pool: Mutex::new(DispatchBufferPool::new()),
         })
     }
 

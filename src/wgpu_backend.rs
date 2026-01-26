@@ -1,5 +1,7 @@
+use std::collections::HashMap;
 use std::mem;
-use std::sync::OnceLock;
+use std::sync::{Mutex, OnceLock};
+use std::time::{Duration, Instant};
 
 use crate::backend_match::{
     apply_f32_binary_out, apply_f32_inplace_weight, apply_f32_unary_inplace, apply_f32_unary_out,
@@ -37,6 +39,201 @@ static WGPU_PAGED_KERNEL: OnceLock<Option<WgpuPagedAttentionKernel>> = OnceLock:
 static WGPU_RMSNORM_KERNEL: OnceLock<Option<WgpuRmsNorm>> = OnceLock::new();
 /// Global WGPU SiLU kernel (lazy initialized).
 static WGPU_SILU_KERNEL: OnceLock<Option<WgpuSilu>> = OnceLock::new();
+
+/// Global buffer pool for GPU buffer reuse (P0-MEM-1).
+static BUFFER_POOL: OnceLock<Mutex<BufferPool>> = OnceLock::new();
+
+/// Global staging buffer pool for readback reuse (P0-MEM-2).
+static STAGING_POOL: OnceLock<Mutex<StagingBufferPool>> = OnceLock::new();
+
+/// Buffer pool configuration constants.
+const MAX_POOL_SIZE_PER_BUCKET: usize = 8;
+const MAX_TOTAL_POOL_BYTES: usize = 512 * 1024 * 1024; // 512 MB
+const BUFFER_EXPIRY_SECS: u64 = 60;
+
+/// Size bucket for buffer pooling (rounded to power of 2).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+struct BufferSizeBucket(u64);
+
+impl BufferSizeBucket {
+    /// Round up to next power of 2, minimum 256 bytes.
+    fn from_size(size: u64) -> Self {
+        let min_size = 256u64;
+        let size = size.max(min_size);
+        let bucket = size.next_power_of_two();
+        BufferSizeBucket(bucket)
+    }
+
+    fn size(&self) -> u64 {
+        self.0
+    }
+}
+
+/// Cached buffer entry with timestamp.
+struct PooledBuffer {
+    buffer: wgpu::Buffer,
+    last_used: Instant,
+}
+
+/// Buffer pool for GPU buffer reuse (P0-MEM-1).
+struct BufferPool {
+    /// Buckets of buffers grouped by size.
+    storage_buckets: HashMap<BufferSizeBucket, Vec<PooledBuffer>>,
+    /// Current total bytes in pool.
+    total_bytes: usize,
+}
+
+impl BufferPool {
+    fn new() -> Self {
+        Self {
+            storage_buckets: HashMap::new(),
+            total_bytes: 0,
+        }
+    }
+
+    /// Get or create a storage buffer with the given size and usage.
+    fn get_or_create(
+        &mut self,
+        device: &wgpu::Device,
+        size: u64,
+        usage: wgpu::BufferUsages,
+        label: &'static str,
+    ) -> wgpu::Buffer {
+        let bucket = BufferSizeBucket::from_size(size);
+
+        // Try to get from pool
+        if let Some(buffers) = self.storage_buckets.get_mut(&bucket) {
+            if let Some(entry) = buffers.pop() {
+                self.total_bytes = self.total_bytes.saturating_sub(bucket.size() as usize);
+                log::trace!("BufferPool: reused buffer size={} label={}", bucket.size(), label);
+                return entry.buffer;
+            }
+        }
+
+        // Create new buffer
+        log::trace!("BufferPool: created new buffer size={} label={}", bucket.size(), label);
+        device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some(label),
+            size: bucket.size(),
+            usage,
+            mapped_at_creation: false,
+        })
+    }
+
+    /// Release a buffer back to the pool.
+    fn release(&mut self, buffer: wgpu::Buffer, original_size: u64) {
+        let bucket = BufferSizeBucket::from_size(original_size);
+        let bucket_size = bucket.size() as usize;
+
+        // Check pool limits
+        if self.total_bytes + bucket_size > MAX_TOTAL_POOL_BYTES {
+            log::trace!("BufferPool: dropping buffer (pool full)");
+            return; // Drop buffer instead of pooling
+        }
+
+        let buffers = self.storage_buckets.entry(bucket).or_insert_with(Vec::new);
+        if buffers.len() >= MAX_POOL_SIZE_PER_BUCKET {
+            log::trace!("BufferPool: dropping buffer (bucket full)");
+            return; // Drop buffer instead of pooling
+        }
+
+        buffers.push(PooledBuffer {
+            buffer,
+            last_used: Instant::now(),
+        });
+        self.total_bytes += bucket_size;
+    }
+
+    /// Cleanup expired buffers.
+    fn cleanup_expired(&mut self) {
+        let expiry = Duration::from_secs(BUFFER_EXPIRY_SECS);
+        let now = Instant::now();
+
+        for (bucket, buffers) in self.storage_buckets.iter_mut() {
+            let before_len = buffers.len();
+            buffers.retain(|entry| now.duration_since(entry.last_used) < expiry);
+            let removed = before_len - buffers.len();
+            if removed > 0 {
+                self.total_bytes = self.total_bytes.saturating_sub(removed * bucket.size() as usize);
+            }
+        }
+    }
+}
+
+/// Staging buffer pool for readback operations (P0-MEM-2).
+/// Uses size buckets to store reusable staging buffers.
+struct StagingBufferPool {
+    /// Buckets of staging buffers grouped by size.
+    buckets: HashMap<BufferSizeBucket, Vec<wgpu::Buffer>>,
+    /// Current total bytes in pool.
+    total_bytes: usize,
+}
+
+impl StagingBufferPool {
+    fn new() -> Self {
+        Self {
+            buckets: HashMap::new(),
+            total_bytes: 0,
+        }
+    }
+
+    /// Get or create a staging buffer of at least the given size.
+    fn get_or_create(
+        &mut self,
+        device: &wgpu::Device,
+        min_size: u64,
+        label: &'static str,
+    ) -> wgpu::Buffer {
+        let bucket = BufferSizeBucket::from_size(min_size);
+
+        // Try to get from pool
+        if let Some(buffers) = self.buckets.get_mut(&bucket) {
+            if let Some(buffer) = buffers.pop() {
+                self.total_bytes = self.total_bytes.saturating_sub(bucket.size() as usize);
+                log::trace!("StagingBufferPool: reused buffer size={} label={}", bucket.size(), label);
+                return buffer;
+            }
+        }
+
+        // Create new buffer
+        log::trace!("StagingBufferPool: created new buffer size={} label={}", bucket.size(), label);
+        device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some(label),
+            size: bucket.size(),
+            usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        })
+    }
+
+    /// Release a staging buffer back to the pool.
+    fn release(&mut self, buffer: wgpu::Buffer, original_size: u64) {
+        let bucket = BufferSizeBucket::from_size(original_size);
+        let bucket_size = bucket.size() as usize;
+
+        // Check pool limits (use same limits as BufferPool)
+        if self.total_bytes + bucket_size > MAX_TOTAL_POOL_BYTES / 4 {
+            log::trace!("StagingBufferPool: dropping buffer (pool full)");
+            return;
+        }
+
+        let buffers = self.buckets.entry(bucket).or_insert_with(Vec::new);
+        if buffers.len() >= MAX_POOL_SIZE_PER_BUCKET {
+            log::trace!("StagingBufferPool: dropping buffer (bucket full)");
+            return;
+        }
+
+        buffers.push(buffer);
+        self.total_bytes += bucket_size;
+    }
+}
+
+fn get_buffer_pool() -> &'static Mutex<BufferPool> {
+    BUFFER_POOL.get_or_init(|| Mutex::new(BufferPool::new()))
+}
+
+fn get_staging_pool() -> &'static Mutex<StagingBufferPool> {
+    STAGING_POOL.get_or_init(|| Mutex::new(StagingBufferPool::new()))
+}
 
 fn get_wgpu_device_queue() -> Option<&'static WgpuDeviceQueue> {
     WGPU_DEVICE_QUEUE
@@ -244,12 +441,13 @@ fn readback_f32(
         .ok_or_else(|| format!("{label}: readback size overflow"))?
         as wgpu::BufferAddress;
 
-    let staging = device.create_buffer(&wgpu::BufferDescriptor {
-        label: Some(label),
-        size: size_bytes,
-        usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
-        mapped_at_creation: false,
-    });
+    // P0-MEM-2: Get staging buffer from pool
+    let staging = {
+        let mut pool = get_staging_pool()
+            .lock()
+            .map_err(|_| format!("{label}: staging pool lock poisoned"))?;
+        pool.get_or_create(device, size_bytes, label)
+    };
 
     let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
         label: Some("wgpu_readback_encoder"),
@@ -272,6 +470,12 @@ fn readback_f32(
     let data = slice.get_mapped_range();
     let values: &[f32] = bytemuck::cast_slice(&data);
     if values.len() < len {
+        // P0-MEM-2: Release staging buffer back to pool on error
+        drop(data);
+        staging.unmap();
+        if let Ok(mut pool) = get_staging_pool().lock() {
+            pool.release(staging, size_bytes);
+        }
         return Err(format!("{label}: readback length mismatch"));
     }
 
@@ -279,6 +483,12 @@ fn readback_f32(
     output.copy_from_slice(&values[..len]);
     drop(data);
     staging.unmap();
+
+    // P0-MEM-2: Release staging buffer back to pool
+    if let Ok(mut pool) = get_staging_pool().lock() {
+        pool.release(staging, size_bytes);
+    }
+
     Ok(output)
 }
 
