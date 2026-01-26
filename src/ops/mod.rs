@@ -119,7 +119,7 @@ pub use linear::{
 
 // Quantized matmul exports
 pub use quantized::{
-    q4_matmul_cpu, q8_matmul_cpu, awq_matmul_cpu,
+    q4_dequantize_cpu, q4_matmul_cpu, q8_matmul_cpu, awq_dequantize_cpu, awq_matmul_cpu,
 };
 
 // RMS Norm exports

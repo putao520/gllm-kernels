@@ -158,6 +158,28 @@ impl Backend for CpuBackend {
         crate::ops::quantized::q8_matmul_cpu(input, q_weight, scales, m, n, k)
     }
 
+    fn q4_dequantize(
+        &self,
+        q_weight: &[u8],
+        scales: &[half::f16],
+        n: usize,
+        k: usize,
+    ) -> Result<Vec<f32>, String> {
+        crate::ops::quantized::q4_dequantize_cpu(q_weight, scales, n, k)
+    }
+
+    fn awq_dequantize(
+        &self,
+        qweight: &[u32],
+        qzeros: &[u32],
+        scales: &[half::f16],
+        n: usize,
+        k: usize,
+        group_size: usize,
+    ) -> Result<Vec<f32>, String> {
+        crate::ops::quantized::awq_dequantize_cpu(qweight, qzeros, scales, n, k, group_size)
+    }
+
     fn awq_matmul(
         &self,
         input: &[f32],

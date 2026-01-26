@@ -116,6 +116,28 @@ impl Backend for BackendImpl {
         dispatch_backend!(self, q8_matmul, input, q_weight, scales, m, n, k)
     }
 
+    fn q4_dequantize(
+        &self,
+        q_weight: &[u8],
+        scales: &[half::f16],
+        n: usize,
+        k: usize,
+    ) -> Result<Vec<f32>, String> {
+        dispatch_backend!(self, q4_dequantize, q_weight, scales, n, k)
+    }
+
+    fn awq_dequantize(
+        &self,
+        qweight: &[u32],
+        qzeros: &[u32],
+        scales: &[half::f16],
+        n: usize,
+        k: usize,
+        group_size: usize,
+    ) -> Result<Vec<f32>, String> {
+        dispatch_backend!(self, awq_dequantize, qweight, qzeros, scales, n, k, group_size)
+    }
+
     fn awq_matmul(
         &self,
         input: &[f32],

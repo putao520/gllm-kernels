@@ -11,6 +11,7 @@ use crate::backend_trait::{Backend, TensorSlice, TensorSliceMut};
 use crate::cuda_kernels::{
     FlashAttentionKernel as CudaFlashAttentionKernel,
     PagedAttentionKernel as CudaPagedAttentionKernel,
+    QuantizedDequantKernel,
     RmsNormKernel,
     CudaSilu,
 };
@@ -34,6 +35,8 @@ static CUDA_PAGED_KERNEL: OnceLock<Option<CudaPagedAttentionKernel>> = OnceLock:
 static CUDA_RMSNORM_KERNEL: OnceLock<Option<RmsNormKernel>> = OnceLock::new();
 /// Global CUDA SiLU kernel (lazy initialized).
 static CUDA_SILU_KERNEL: OnceLock<Option<CudaSilu>> = OnceLock::new();
+/// Global CUDA quantized dequantization kernel (lazy initialized).
+static CUDA_QUANTIZED_KERNEL: OnceLock<Option<QuantizedDequantKernel>> = OnceLock::new();
 
 fn get_cuda_context() -> Option<&'static Arc<CudaContext>> {
     CUDA_CONTEXT
@@ -111,6 +114,21 @@ fn get_cuda_silu_kernel() -> Option<&'static CudaSilu> {
                 Ok(kernel) => Some(kernel),
                 Err(e) => {
                     log::warn!("Failed to initialize CUDA SiLU kernel: {}", e);
+                    None
+                }
+            }
+        })
+        .as_ref()
+}
+
+fn get_cuda_quantized_kernel() -> Option<&'static QuantizedDequantKernel> {
+    CUDA_QUANTIZED_KERNEL
+        .get_or_init(|| {
+            let ctx = get_cuda_context()?;
+            match QuantizedDequantKernel::new(ctx) {
+                Ok(kernel) => Some(kernel),
+                Err(e) => {
+                    log::warn!("Failed to initialize CUDA quantized dequant kernel: {}", e);
                     None
                 }
             }
@@ -504,6 +522,140 @@ fn cuda_silu_inplace<T: KernelFloat>(
     true
 }
 
+fn checked_mul(a: usize, b: usize, name: &str) -> Result<usize, String> {
+    a.checked_mul(b).ok_or_else(|| format!("{name} overflow"))
+}
+
+fn cuda_q4_dequantize(
+    kernel: &QuantizedDequantKernel,
+    stream: &Arc<CudaStream>,
+    q_weight: &[u8],
+    scales: &[half::f16],
+    n: usize,
+    k: usize,
+) -> Result<Vec<f32>, String> {
+    if n == 0 || k == 0 {
+        return Err("Dimensions must be > 0".into());
+    }
+    if k % 32 != 0 {
+        return Err("k must be multiple of 32 for Q4".into());
+    }
+    let blocks = k / 32;
+    let num_blocks = checked_mul(n, blocks, "q4 blocks")?;
+    if num_blocks > i32::MAX as usize {
+        return Err("q4 blocks exceed addressable range".into());
+    }
+    let expected_q_weight = checked_mul(num_blocks, 16, "q4 weights")?;
+    if q_weight.len() != expected_q_weight {
+        return Err(format!(
+            "q_weight length mismatch: expected {expected_q_weight}, got {}",
+            q_weight.len()
+        ));
+    }
+    if scales.len() != num_blocks {
+        return Err(format!(
+            "scales length mismatch: expected {num_blocks}, got {}",
+            scales.len()
+        ));
+    }
+    if num_blocks
+        .checked_mul(32)
+        .ok_or_else(|| "output overflow".to_string())?
+        > u32::MAX as usize
+    {
+        return Err("output exceeds addressable range".into());
+    }
+
+    let q_weight_buf = stream.clone_htod(q_weight).map_err(|e| {
+        format!("CUDA Q4 dequantize upload failed: {e}")
+    })?;
+    let scales_buf = stream.clone_htod(scales).map_err(|e| {
+        format!("CUDA Q4 dequantize scales upload failed: {e}")
+    })?;
+    let output_buf = kernel
+        .dequantize_q4(stream, &q_weight_buf, &scales_buf, num_blocks)
+        .map_err(|e| format!("CUDA Q4 dequantize failed: {e}"))?;
+    stream
+        .clone_dtoh(&output_buf)
+        .map_err(|e| format!("CUDA Q4 dequantize readback failed: {e}"))
+}
+
+fn cuda_awq_dequantize(
+    kernel: &QuantizedDequantKernel,
+    stream: &Arc<CudaStream>,
+    qweight: &[u32],
+    qzeros: &[u32],
+    scales: &[half::f16],
+    n: usize,
+    k: usize,
+    group_size: usize,
+) -> Result<Vec<f32>, String> {
+    if n == 0 || k == 0 {
+        return Err("Dimensions must be > 0".into());
+    }
+    if group_size == 0 {
+        return Err("group_size must be > 0".into());
+    }
+    if n % 8 != 0 {
+        return Err("n must be multiple of 8 for AWQ packing".into());
+    }
+    if k % group_size != 0 {
+        return Err("k must be multiple of group_size for AWQ".into());
+    }
+    let groups = k / group_size;
+    if groups > i32::MAX as usize {
+        return Err("group count exceeds addressable range".into());
+    }
+    let packed_out = n / 8;
+    let expected_qweight = checked_mul(packed_out, k, "qweight")?;
+    let expected_qzeros = checked_mul(packed_out, groups, "qzeros")?;
+    let expected_scales = checked_mul(n, groups, "scales")?;
+    if qweight.len() != expected_qweight {
+        return Err(format!(
+            "qweight length mismatch: expected {expected_qweight}, got {}",
+            qweight.len()
+        ));
+    }
+    if qzeros.len() != expected_qzeros {
+        return Err(format!(
+            "qzeros length mismatch: expected {expected_qzeros}, got {}",
+            qzeros.len()
+        ));
+    }
+    if scales.len() != expected_scales {
+        return Err(format!(
+            "scales length mismatch: expected {expected_scales}, got {}",
+            scales.len()
+        ));
+    }
+    if n > i32::MAX as usize || k > i32::MAX as usize || group_size > i32::MAX as usize {
+        return Err("dimensions exceed addressable range".into());
+    }
+    if n
+        .checked_mul(k)
+        .ok_or_else(|| "output overflow".to_string())?
+        > u32::MAX as usize
+    {
+        return Err("output exceeds addressable range".into());
+    }
+
+    let qweight_buf = stream.clone_htod(qweight).map_err(|e| {
+        format!("CUDA AWQ dequantize upload failed: {e}")
+    })?;
+    let qzeros_buf = stream.clone_htod(qzeros).map_err(|e| {
+        format!("CUDA AWQ dequantize zeros upload failed: {e}")
+    })?;
+    let scales_buf = stream.clone_htod(scales).map_err(|e| {
+        format!("CUDA AWQ dequantize scales upload failed: {e}")
+    })?;
+    let output_buf = kernel
+        .dequantize_awq(stream, &qweight_buf, &qzeros_buf, &scales_buf, n, k, group_size)
+        .map_err(|e| format!("CUDA AWQ dequantize failed: {e}"))?;
+    stream
+        .clone_dtoh(&output_buf)
+        .map_err(|e| format!("CUDA AWQ dequantize readback failed: {e}"))
+}
+
 #[derive(Clone, Copy)]
 pub struct CudaBackend {}
 
@@ -690,6 +842,44 @@ impl Backend for CudaBackend {
         k: usize,
     ) -> Result<Vec<f32>, String> {
         crate::ops::quantized::q8_matmul_cpu(input, q_weight, scales, m, n, k)
+    }
+
+    fn q4_dequantize(
+        &self,
+        q_weight: &[u8],
+        scales: &[half::f16],
+        n: usize,
+        k: usize,
+    ) -> Result<Vec<f32>, String> {
+        if let (Some(kernel), Some(stream)) = (get_cuda_quantized_kernel(), get_cuda_stream()) {
+            match cuda_q4_dequantize(kernel, stream, q_weight, scales, n, k) {
+                Ok(output) => return Ok(output),
+                Err(err) => {
+                    log::debug!("CUDA q4 dequantize failed, falling back to CPU: {err}");
+                }
+            }
+        }
+        crate::ops::quantized::q4_dequantize_cpu(q_weight, scales, n, k)
+    }
+
+    fn awq_dequantize(
+        &self,
+        qweight: &[u32],
+        qzeros: &[u32],
+        scales: &[half::f16],
+        n: usize,
+        k: usize,
+        group_size: usize,
+    ) -> Result<Vec<f32>, String> {
+        if let (Some(kernel), Some(stream)) = (get_cuda_quantized_kernel(), get_cuda_stream()) {
+            match cuda_awq_dequantize(kernel, stream, qweight, qzeros, scales, n, k, group_size) {
+                Ok(output) => return Ok(output),
+                Err(err) => {
+                    log::debug!("CUDA AWQ dequantize failed, falling back to CPU: {err}");
+                }
+            }
+        }
+        crate::ops::quantized::awq_dequantize_cpu(qweight, qzeros, scales, n, k, group_size)
     }
 
     fn awq_matmul(

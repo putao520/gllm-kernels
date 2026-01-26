@@ -76,6 +76,26 @@ pub trait Backend: Send + Sync {
         k: usize,
     ) -> Result<Vec<f32>, String>;
 
+    /// Q4_0 dequantization (packed INT4 -> F32).
+    fn q4_dequantize(
+        &self,
+        q_weight: &[u8],
+        scales: &[half::f16],
+        n: usize,
+        k: usize,
+    ) -> Result<Vec<f32>, String>;
+
+    /// AWQ INT4 dequantization (packed INT4 -> F32).
+    fn awq_dequantize(
+        &self,
+        qweight: &[u32],
+        qzeros: &[u32],
+        scales: &[half::f16],
+        n: usize,
+        k: usize,
+        group_size: usize,
+    ) -> Result<Vec<f32>, String>;
+
     /// AWQ INT4 quantized matrix multiplication.
     fn awq_matmul(
         &self,

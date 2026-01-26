@@ -126,7 +126,7 @@ pub use ops::linear::{
 };
 
 // Quantized matmul exports
-pub use ops::quantized::{q4_matmul_cpu, q8_matmul_cpu, awq_matmul_cpu};
+pub use ops::quantized::{q4_dequantize_cpu, q4_matmul_cpu, q8_matmul_cpu, awq_dequantize_cpu, awq_matmul_cpu};
 
 // Zero-cost RMS Norm exports
 pub use ops::rms_norm::{

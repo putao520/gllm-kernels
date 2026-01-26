@@ -19,6 +19,7 @@ use crate::runtime_detection::BackendType;
 use crate::wgpu_kernels::{
     FlashAttentionKernel as WgpuFlashAttentionKernel,
     PagedAttentionKernel as WgpuPagedAttentionKernel,
+    WgpuQuantizedDequantizer,
     RmsNormParams, WgpuRmsNorm,
     SiluParams, WgpuSilu,
 };
@@ -39,6 +40,8 @@ static WGPU_PAGED_KERNEL: OnceLock<Option<WgpuPagedAttentionKernel>> = OnceLock:
 static WGPU_RMSNORM_KERNEL: OnceLock<Option<WgpuRmsNorm>> = OnceLock::new();
 /// Global WGPU SiLU kernel (lazy initialized).
 static WGPU_SILU_KERNEL: OnceLock<Option<WgpuSilu>> = OnceLock::new();
+/// Global WGPU quantized dequantization kernel (lazy initialized).
+static WGPU_QUANTIZED_KERNEL: OnceLock<Option<WgpuQuantizedDequantizer>> = OnceLock::new();
 
 /// Global buffer pool for GPU buffer reuse (P0-MEM-1).
 static BUFFER_POOL: OnceLock<Mutex<BufferPool>> = OnceLock::new();
@@ -319,6 +322,18 @@ fn get_wgpu_silu_kernel() -> Option<&'static WgpuSilu> {
         .get_or_init(|| {
             let device_queue = get_wgpu_device_queue()?;
             Some(WgpuSilu::new(
+                device_queue.device.clone(),
+                device_queue.queue.clone(),
+            ))
+        })
+        .as_ref()
+}
+
+fn get_wgpu_quantized_kernel() -> Option<&'static WgpuQuantizedDequantizer> {
+    WGPU_QUANTIZED_KERNEL
+        .get_or_init(|| {
+            let device_queue = get_wgpu_device_queue()?;
+            Some(WgpuQuantizedDequantizer::new(
                 device_queue.device.clone(),
                 device_queue.queue.clone(),
             ))
@@ -922,6 +937,44 @@ impl Backend for WgpuBackend {
         k: usize,
     ) -> Result<Vec<f32>, String> {
         crate::ops::quantized::q8_matmul_cpu(input, q_weight, scales, m, n, k)
+    }
+
+    fn q4_dequantize(
+        &self,
+        q_weight: &[u8],
+        scales: &[half::f16],
+        n: usize,
+        k: usize,
+    ) -> Result<Vec<f32>, String> {
+        if let Some(kernel) = get_wgpu_quantized_kernel() {
+            match kernel.dequantize_q4(q_weight, scales, n, k) {
+                Ok(output) => return Ok(output),
+                Err(err) => {
+                    log::debug!("WGPU q4 dequantize failed, falling back to CPU: {err}");
+                }
+            }
+        }
+        crate::ops::quantized::q4_dequantize_cpu(q_weight, scales, n, k)
+    }
+
+    fn awq_dequantize(
+        &self,
+        qweight: &[u32],
+        qzeros: &[u32],
+        scales: &[half::f16],
+        n: usize,
+        k: usize,
+        group_size: usize,
+    ) -> Result<Vec<f32>, String> {
+        if let Some(kernel) = get_wgpu_quantized_kernel() {
+            match kernel.dequantize_awq(qweight, qzeros, scales, n, k, group_size) {
+                Ok(output) => return Ok(output),
+                Err(err) => {
+                    log::debug!("WGPU AWQ dequantize failed, falling back to CPU: {err}");
+                }
+            }
+        }
+        crate::ops::quantized::awq_dequantize_cpu(qweight, qzeros, scales, n, k, group_size)
     }
 
     fn awq_matmul(

@@ -20,6 +20,7 @@ pub mod evic_press;
 
 // Quantization kernels
 pub mod int2_quantizer;
+pub mod quantized;
 
 // Utility kernels
 pub mod embedding_ops;
@@ -67,6 +68,7 @@ pub use int2_quantizer::{
     QuantizeParams, PackParams,
     WgpuInt2Quantizer,
 };
+pub use quantized::{Q4DequantParams, AwqDequantParams, QuantizedDequantError, WgpuQuantizedDequantizer};
 
 // Re-exports - Utility
 pub use embedding_ops::{EmbeddingOpsError, EmbeddingOpsKernel};
