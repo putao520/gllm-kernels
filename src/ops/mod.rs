@@ -7,6 +7,7 @@ pub mod stable_accumulator;
 pub mod attention;
 pub mod paged_attn;
 pub mod matmul;
+pub mod quantized;
 
 // Zero-cost NN layer operations (Phase 1 additions)
 pub mod linear;
@@ -114,6 +115,11 @@ pub use moe_routing::{
 // Linear layer exports
 pub use linear::{
     linear_forward, linear_forward_transposed, linear_forward_fused, add_bias,
+};
+
+// Quantized matmul exports
+pub use quantized::{
+    q4_matmul_cpu, q8_matmul_cpu, awq_matmul_cpu,
 };
 
 // RMS Norm exports

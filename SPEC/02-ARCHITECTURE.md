@@ -12,9 +12,9 @@ gllm-kernels 采用**运行时后端选择 + 零成本抽象 + Fat Binary**架�
 
 | 原则 | 说明 | 理由 |
 |------|------|------|
-| **只做应用级算子** | 只实现 FlashAttention、PagedAttention、RMSNorm 等 LLM 专用算子 | 底层通用算子（matmul、softmax）由硬件库（cuBLAS、MPS）更高效 |
-| **不做底层通用算子** | ❌ 禁止实现通用 matmul、gemm、conv2d 等 | 自己实现性能必然差于硬件厂商优化 |
-| **CPU 是兜底后端** | CPU 实现仅作 fallback，不是性能目标 | GPU 才是主战场，CPU 只保证可用性 |
+| **Backend = 算子调度中心** | 所有算子通过 Backend trait 统一调度，每个后端各自实现完整算子集 | 统一架构，GPU 优先，CPU 自动回退 |
+| **自主实现全部算子** | 包括 linear/matmul 等核心算子，我们的直接实现性能更优 | 避免外部库依赖，直接 GPU/CPU 实现可完全控制优化 |
+| **GPU 优先 + CPU 回退** | 每个算子优先使用 GPU kernel，失败时自动回退 CPU | OnceLock 懒加载 GPU kernel，失败静默回退 |
 | **全流程单后端** | GPU 任务全程 GPU，CPU 任务全程 CPU，禁止混合 | GPU↔CPU 数据传输开销极大，会抵消计算加速 |
 
 **全流程单后端原则详解**：
@@ -269,45 +269,50 @@ src/
 
 ---
 
-### ARCH-SCOPE-001: 算子实现范围（🚨 铁律）
+### ARCH-SCOPE-001: Backend 算子体系（🚨 核心架构）
 
-**我们只实现 LLM 推理专用的应用级算子，不实现底层通用算子。**
+**所有算子通过 Backend trait 统一调度，每个后端各自实现完整算子集。**
 
-#### ✅ 实现的算子（应用级，LLM 专用）
+#### 设计原则
 
-| 算子 | 用途 | 说明 |
+1. **Backend = 硬件算子调度中心**：18 个核心方法覆盖 LLM 推理全流程
+2. **自主实现全部算子**：包括 linear_forward/matmul，直接 GPU/CPU 实现性能更优
+3. **GPU 优先 + CPU 自动回退**：OnceLock 懒加载 GPU kernel，失败静默回退
+4. **每个后端独立完整**：WGPU/CUDA/ROCm/Metal/CPU 各自实现，无依赖
+
+#### Backend trait 算子清单（18 个方法）
+
+| # | 算子方法 | 用途 | GPU 支持 |
+|---|----------|------|----------|
+| 1 | `flash_attention()` | Flash Attention 计算 | ✅ WGPU/CUDA/ROCm/Metal |
+| 2 | `paged_attention()` | 分页注意力（KV Cache） | ✅ WGPU/CUDA/ROCm/Metal |
+| 3 | `softmax()` | Softmax 归一化 | ✅ WGPU |
+| 4 | `matmul()` | 矩阵乘法 | ✅ WGPU |
+| 5 | `rope_precompute()` | RoPE 位置编码预计算 | CPU |
+| 6 | `rope_apply()` | RoPE 应用 | CPU |
+| 7 | `rope_apply_inplace()` | RoPE 原地应用 | CPU |
+| 8 | `topk()` | Top-K 采样 | CPU |
+| 9 | `apply_temperature()` | 温度缩放 | CPU |
+| 10 | `sample_tokens()` | Token 采样 | CPU |
+| 11 | `argmax()` | 贪心解码 | CPU |
+| 12 | `moe_route()` | MoE 稀疏路由 | ✅ WGPU |
+| 13 | `compute_routing_logits()` | MoE 路由 logits | CPU |
+| 14 | `rms_norm()` | RMS 归一化 | ✅ WGPU |
+| 15 | `rms_norm_inplace()` | RMS 归一化（原地） | ✅ WGPU |
+| 16 | `silu()` | SiLU 激活 | ✅ WGPU |
+| 17 | `silu_inplace()` | SiLU 激活（原地） | ✅ WGPU |
+| 18 | `add_bias()` | 偏置添加 | CPU |
+
+#### 独立函数（非 Backend trait）
+
+除 Backend trait 外，`gllm-kernels` 还提供以下高性能独立函数：
+
+| 函数 | 用途 | 实现 |
 |------|------|------|
-| flash_attention | Transformer 注意力 | FlashAttention-2/3 算法 |
-| paged_attention | KV Cache 分页 | vLLM PagedAttention |
-| flash_tree_attention | 树结构注意力 | 推测解码用 |
-| moe_forward | MoE 专家前向 | Mixtral/DeepSeek 等 |
-| rms_norm | RMS 归一化 | LLaMA 等模型 |
-| layer_norm | Layer 归一化 | GPT/BERT 等模型 |
-| rope | 旋转位置编码 | 大多数现代 LLM |
-| silu/gelu | 激活函数 | LLM 常用激活 |
-| sampling | Top-K/Top-P 采样 | 文本生成 |
-
-#### ❌ 不实现的算子（底层通用）
-
-| 算子 | 原因 |
-|------|------|
-| matmul / gemm | cuBLAS / MPS / BLAS 已极致优化，自己写必然更慢 |
-| conv2d / pooling | 图像算子，与 LLM 无关 |
-| batch_norm | CV 用，LLM 用 RMSNorm/LayerNorm |
-| 通用 softmax | 已融合到 FlashAttention 内部 |
-| transpose / reshape | 零成本视图操作，不需要 kernel |
-
-#### 设计理由
-
-```
-❌ 错误思路：
-"我们来实现一个高性能 matmul kernel"
-→ NVIDIA 花了 20 年优化 cuBLAS，你不可能超越
-
-✅ 正确思路：
-"我们实现 FlashAttention，内部调用 cuBLAS matmul"
-→ 算法创新 + 复用硬件库 = 最佳性能
-```
+| `linear_forward()` | 线性层前向 | GPU 优先，自主实现性能更优 |
+| `layer_norm_forward()` | LayerNorm | GPU/CPU |
+| `gelu_inplace()` | GELU 激活 | GPU/CPU |
+| `embedding_forward()` | Embedding 查表 | GPU/CPU |
 
 #### 废弃的算子
 

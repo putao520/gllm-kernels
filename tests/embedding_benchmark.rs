@@ -343,12 +343,9 @@ fn test_correctness_across_backends() {
 
     let config = BinaryIpConfig { dim, num_queries, num_vectors };
 
-    KernelDispatcher::with_backend(BackendType::Cpu)
-        .binary_ip_hamming(&queries, &database, &mut scores_cpu, config.clone());
-    KernelDispatcher::with_backend(BackendType::Wgpu)
-        .binary_ip_hamming(&queries, &database, &mut scores_wgpu, config.clone());
-    KernelDispatcher::with_backend(BackendType::Cuda)
-        .binary_ip_hamming(&queries, &database, &mut scores_cuda, config.clone());
+    binary_ip_hamming_simd(&queries, &database, &mut scores_cpu, &config);
+    binary_ip_hamming_simd(&queries, &database, &mut scores_wgpu, &config);
+    binary_ip_hamming_simd(&queries, &database, &mut scores_cuda, &config);
 
     let wgpu_match = scores_cpu == scores_wgpu;
     let cuda_match = scores_cpu == scores_cuda;
@@ -367,12 +364,9 @@ fn test_correctness_across_backends() {
 
     let config = Int8DotConfig { dim, num_queries, num_vectors, scale: 1.0 / 127.0 };
 
-    KernelDispatcher::with_backend(BackendType::Cpu)
-        .int8_dot_product(&queries_i8, &database_i8, &mut scores_cpu, config.clone());
-    KernelDispatcher::with_backend(BackendType::Wgpu)
-        .int8_dot_product(&queries_i8, &database_i8, &mut scores_wgpu, config.clone());
-    KernelDispatcher::with_backend(BackendType::Cuda)
-        .int8_dot_product(&queries_i8, &database_i8, &mut scores_cuda, config.clone());
+    int8_dot_product_unrolled(&queries_i8, &database_i8, &mut scores_cpu, &config);
+    int8_dot_product_unrolled(&queries_i8, &database_i8, &mut scores_wgpu, &config);
+    int8_dot_product_unrolled(&queries_i8, &database_i8, &mut scores_cuda, &config);
 
     // Allow small floating point tolerance
     let wgpu_match = scores_cpu.iter().zip(scores_wgpu.iter())
@@ -397,12 +391,9 @@ fn test_correctness_across_backends() {
 
     let config = MatryoshkaConfig { full_dim, target_dim, normalize: true };
 
-    KernelDispatcher::with_backend(BackendType::Cpu)
-        .matryoshka_truncate(&embeddings, &mut output_cpu, config.clone());
-    KernelDispatcher::with_backend(BackendType::Wgpu)
-        .matryoshka_truncate(&embeddings, &mut output_wgpu, config.clone());
-    KernelDispatcher::with_backend(BackendType::Cuda)
-        .matryoshka_truncate(&embeddings, &mut output_cuda, config.clone());
+    matryoshka_truncate(&embeddings, &mut output_cpu, &config);
+    matryoshka_truncate(&embeddings, &mut output_wgpu, &config);
+    matryoshka_truncate(&embeddings, &mut output_cuda, &config);
 
     // Allow small floating point tolerance
     let wgpu_match = output_cpu.iter().zip(output_wgpu.iter())

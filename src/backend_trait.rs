@@ -54,6 +54,41 @@ pub trait Backend: Send + Sync {
         config: MatmulConfig,
     ) -> Result<(), String>;
 
+    /// Q4_0/Q4_K quantized matrix multiplication.
+    fn q4_matmul(
+        &self,
+        input: &[f32],
+        q_weight: &[u8],
+        scales: &[half::f16],
+        m: usize,
+        n: usize,
+        k: usize,
+    ) -> Result<Vec<f32>, String>;
+
+    /// Q8_0 quantized matrix multiplication.
+    fn q8_matmul(
+        &self,
+        input: &[f32],
+        q_weight: &[i8],
+        scales: &[half::f16],
+        m: usize,
+        n: usize,
+        k: usize,
+    ) -> Result<Vec<f32>, String>;
+
+    /// AWQ INT4 quantized matrix multiplication.
+    fn awq_matmul(
+        &self,
+        input: &[f32],
+        qweight: &[u32],
+        qzeros: &[u32],
+        scales: &[half::f16],
+        m: usize,
+        n: usize,
+        k: usize,
+        group_size: usize,
+    ) -> Result<Vec<f32>, String>;
+
     fn rope_precompute(
         &self,
         cos_out: &mut [f32],

@@ -37,8 +37,8 @@ fn main() {
 
     // Runtime detection
     println!("\n4. Runtime backend detection:");
-    let dispatcher = gllm_kernels::KernelDispatcher::new();
-    println!("   Selected: {:?}", dispatcher.backend());
+    let detected = gllm_kernels::detect_backend();
+    println!("   Selected: {:?}", detected);
 
     // Also test detect_backend directly
     println!("\n5. Direct detect_backend call:");

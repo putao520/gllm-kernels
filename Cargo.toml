@@ -69,7 +69,7 @@ paged-kernel = []
 softmax-kernel = []
 
 [dependencies]
-# ADR-001: Burn 依赖已移除，统一使用 KernelDispatcher 零成本抽象
+# ADR-001: Burn 依赖已移除，统一使用 Backend trait + 原始切片 API
 
 # CUDA 支持（动态加载，运行时检测）
 cudarc = { version = "0.18", default-features = false, features = ["std", "driver", "nvrtc", "f16", "cuda-12090", "dynamic-loading"] }

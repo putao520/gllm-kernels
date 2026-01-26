@@ -19,6 +19,7 @@
 pub mod comm;
 pub mod kernel_types;
 pub mod ops;
+pub mod quantized;
 pub mod types;
 pub mod validation;
 pub mod weights;
@@ -98,6 +99,9 @@ pub use ops::embedding::{
     RerankPipelineConfig, RerankResult, rerank_binary_stage, rerank_int8_stage,
 };
 
+// Quantized weight container exports
+pub use quantized::{AwqWeight, Q4_0Block, Q8_0Block};
+
 // RoPE (Rotary Position Embedding) exports
 pub use ops::rope::{RoPEConfig, rope_precompute, rope_apply, rope_apply_inplace};
 
@@ -120,6 +124,9 @@ pub use weights::{WeightMatrix, WeightVector, Weight3D, Weight4D};
 pub use ops::linear::{
     linear_forward, linear_forward_transposed, linear_forward_fused, add_bias,
 };
+
+// Quantized matmul exports
+pub use ops::quantized::{q4_matmul_cpu, q8_matmul_cpu, awq_matmul_cpu};
 
 // Zero-cost RMS Norm exports
 pub use ops::rms_norm::{

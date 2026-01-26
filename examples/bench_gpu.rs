@@ -2,7 +2,8 @@
 //! 
 //! Verifies which backend is active and benchmarks GPU performance.
 
-use gllm_kernels::{KernelDispatcher, FlashAttentionConfig, BackendType, current_simd_path};
+use gllm_kernels::backend::{auto_select_backend, TensorSlice, TensorSliceMut};
+use gllm_kernels::{FlashAttentionConfig, BackendType, current_simd_path};
 use std::time::Instant;
 
 fn main() {
@@ -14,14 +15,14 @@ fn main() {
     std::env::set_var("RUST_LOG", "debug");
     env_logger::init();
     
-    let dispatcher = KernelDispatcher::new();
-    let backend = dispatcher.backend();
+    let backend = auto_select_backend();
+    let backend_type = gllm_kernels::detect_backend();
     
-    println!("Active Backend: {:?}", backend);
+    println!("Active Backend: {:?}", backend_type);
     println!("CPU SIMD Path: {}", current_simd_path());
     println!();
     
-    match backend {
+    match backend_type {
         BackendType::Cuda => println!("✅ CUDA backend active"),
         BackendType::Rocm => println!("✅ ROCm/HSA backend active"),
         BackendType::Wgpu => println!("✅ WGPU backend active"),
@@ -64,21 +65,37 @@ fn main() {
         
         // Warmup
         for _ in 0..20 {
-            dispatcher.flash_attention(&q, &k, &v, &mut output, config.clone());
+            backend
+                .flash_attention(
+                    TensorSlice::F32(&q),
+                    TensorSlice::F32(&k),
+                    TensorSlice::F32(&v),
+                    TensorSliceMut::F32(&mut output),
+                    config.clone(),
+                )
+                .expect("flash_attention failed");
         }
         
         // Benchmark
         let iterations = 500;
         let start = Instant::now();
         for _ in 0..iterations {
-            dispatcher.flash_attention(&q, &k, &v, &mut output, config.clone());
+            backend
+                .flash_attention(
+                    TensorSlice::F32(&q),
+                    TensorSlice::F32(&k),
+                    TensorSlice::F32(&v),
+                    TensorSliceMut::F32(&mut output),
+                    config.clone(),
+                )
+                .expect("flash_attention failed");
         }
         let elapsed = start.elapsed();
         
         let avg_us = elapsed.as_micros() as f64 / iterations as f64;
         let tps = 1_000_000.0 / avg_us;
         
-        println!("  Backend: {:?}", backend);
+        println!("  Backend: {:?}", backend_type);
         println!("  Avg latency: {:.1} µs", avg_us);
         println!("  Throughput: {:.1} tokens/s", tps);
         println!();

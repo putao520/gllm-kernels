@@ -3,7 +3,8 @@
 //! Benchmarks the optimized decode path vs. general path.
 
 use std::time::Instant;
-use gllm_kernels::{KernelDispatcher, FlashAttentionConfig, current_simd_path};
+use gllm_kernels::backend::{auto_select_backend, TensorSlice, TensorSliceMut};
+use gllm_kernels::{FlashAttentionConfig, current_simd_path};
 
 fn main() {
     println!("================================================");
@@ -12,7 +13,7 @@ fn main() {
     println!("SIMD Path: {}", current_simd_path());
     println!();
     
-    let dispatcher = KernelDispatcher::new();
+    let backend = auto_select_backend();
     
     // SmolLM2-135M attention dimensions
     let test_cases = vec![
@@ -48,14 +49,30 @@ fn main() {
         
         // Warmup
         for _ in 0..20 {
-            dispatcher.flash_attention(&q, &k, &v, &mut output, config.clone());
+            backend
+                .flash_attention(
+                    TensorSlice::F32(&q),
+                    TensorSlice::F32(&k),
+                    TensorSlice::F32(&v),
+                    TensorSliceMut::F32(&mut output),
+                    config.clone(),
+                )
+                .expect("flash_attention failed");
         }
         
         // Benchmark
         let iterations = 1000;
         let start = Instant::now();
         for _ in 0..iterations {
-            dispatcher.flash_attention(&q, &k, &v, &mut output, config.clone());
+            backend
+                .flash_attention(
+                    TensorSlice::F32(&q),
+                    TensorSlice::F32(&k),
+                    TensorSlice::F32(&v),
+                    TensorSliceMut::F32(&mut output),
+                    config.clone(),
+                )
+                .expect("flash_attention failed");
         }
         let elapsed = start.elapsed();
         

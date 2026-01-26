@@ -667,6 +667,53 @@ impl Backend for CudaBackend {
         )
     }
 
+    fn q4_matmul(
+        &self,
+        input: &[f32],
+        q_weight: &[u8],
+        scales: &[half::f16],
+        m: usize,
+        n: usize,
+        k: usize,
+    ) -> Result<Vec<f32>, String> {
+        crate::ops::quantized::q4_matmul_cpu(input, q_weight, scales, m, n, k)
+    }
+
+    fn q8_matmul(
+        &self,
+        input: &[f32],
+        q_weight: &[i8],
+        scales: &[half::f16],
+        m: usize,
+        n: usize,
+        k: usize,
+    ) -> Result<Vec<f32>, String> {
+        crate::ops::quantized::q8_matmul_cpu(input, q_weight, scales, m, n, k)
+    }
+
+    fn awq_matmul(
+        &self,
+        input: &[f32],
+        qweight: &[u32],
+        qzeros: &[u32],
+        scales: &[half::f16],
+        m: usize,
+        n: usize,
+        k: usize,
+        group_size: usize,
+    ) -> Result<Vec<f32>, String> {
+        crate::ops::quantized::awq_matmul_cpu(
+            input,
+            qweight,
+            qzeros,
+            scales,
+            m,
+            n,
+            k,
+            group_size,
+        )
+    }
+
     fn rope_precompute(
         &self,
         cos_out: &mut [f32],

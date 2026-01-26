@@ -12,10 +12,8 @@ use criterion::measurement::WallTime;
 use criterion::{black_box, criterion_group, criterion_main, BenchmarkGroup, Criterion, Throughput};
 #[cfg(all(feature = "cuda-kernel", feature = "cuda"))]
 use cudarc::driver::{CudaContext, CudaStream};
-// Zero-cost dispatcher (new API)
-use gllm_kernels::{
-    KernelDispatcher, FlashAttentionConfig as DispatcherFlashConfig,
-};
+use gllm_kernels::backend::{auto_select_backend, Backend as GllmBackend, TensorSlice, TensorSliceMut};
+use gllm_kernels::FlashAttentionConfig as KernelFlashAttentionConfig;
 // Old ops types (from ops module)
 use gllm_kernels::ops::flash_attention::{
     AttentionWorkspace, FlashAttentionConfig, HierarchicalFlashAttention,
@@ -685,10 +683,9 @@ fn bench_flash_attention_optimized(c: &mut Criterion) {
     group.finish();
 }
 
-/// Benchmark verifying zero-cost abstraction of KernelDispatcher.
-/// Compares dispatcher call vs direct function to verify no overhead.
-fn bench_kernel_dispatcher_zero_cost(c: &mut Criterion) {
-    let mut group = c.benchmark_group("zero_cost_dispatcher");
+/// Benchmark verifying backend call overhead.
+fn bench_backend_zero_cost(c: &mut Criterion) {
+    let mut group = c.benchmark_group("zero_cost_backend");
     configure_group(&mut group);
 
     // Test parameters
@@ -697,8 +694,8 @@ fn bench_kernel_dispatcher_zero_cost(c: &mut Criterion) {
     let head_dim = 64usize;
     let seq_lens = [128usize, 256, 512, 1024];
 
-    let dispatcher = KernelDispatcher::new();
-    println!("KernelDispatcher backend: {:?}", dispatcher.backend());
+    let backend = auto_select_backend();
+    println!("Backend: {:?}", backend.backend_type());
 
     for &seq_len in &seq_lens {
         // Prepare data
@@ -708,7 +705,7 @@ fn bench_kernel_dispatcher_zero_cost(c: &mut Criterion) {
         let v: Vec<f32> = (0..size).map(|i| (i as f32 * 0.003).sin()).collect();
         let mut output = vec![0.0f32; size];
 
-        let config = DispatcherFlashConfig {
+        let config = KernelFlashAttentionConfig {
             batch_size: batch,
             num_heads,
             seq_len_q: seq_len,
@@ -723,17 +720,18 @@ fn bench_kernel_dispatcher_zero_cost(c: &mut Criterion) {
         let tokens = (batch * seq_len) as u64;
         group.throughput(Throughput::Elements(tokens));
 
-        // Benchmark dispatcher call
-        let id = format!("dispatcher_seq{}", seq_len);
+        let id = format!("backend_seq{}", seq_len);
         group.bench_function(&id, |b| {
             b.iter(|| {
-                dispatcher.flash_attention(
-                    black_box(&q),
-                    black_box(&k),
-                    black_box(&v),
-                    black_box(&mut output),
-                    config.clone(),
-                );
+                backend
+                    .flash_attention(
+                        TensorSlice::F32(black_box(&q)),
+                        TensorSlice::F32(black_box(&k)),
+                        TensorSlice::F32(black_box(&v)),
+                        TensorSliceMut::F32(black_box(&mut output)),
+                        config.clone(),
+                    )
+                    .expect("backend flash_attention failed");
                 black_box(&output);
             })
         });
@@ -743,7 +741,7 @@ fn bench_kernel_dispatcher_zero_cost(c: &mut Criterion) {
 }
 
 /// Benchmark f16 vs f32 performance to verify generic overhead.
-fn bench_kernel_dispatcher_f16_f32(c: &mut Criterion) {
+fn bench_backend_f16_f32(c: &mut Criterion) {
     let mut group = c.benchmark_group("f16_vs_f32");
     configure_group(&mut group);
 
@@ -753,7 +751,7 @@ fn bench_kernel_dispatcher_f16_f32(c: &mut Criterion) {
     let head_dim = 64usize;
     let size = batch * num_heads * seq_len * head_dim;
 
-    let dispatcher = KernelDispatcher::new();
+    let backend = auto_select_backend();
 
     // f32 data
     let q_f32: Vec<f32> = (0..size).map(|i| (i as f32 * 0.001).sin()).collect();
@@ -767,7 +765,7 @@ fn bench_kernel_dispatcher_f16_f32(c: &mut Criterion) {
     let v_f16: Vec<half::f16> = v_f32.iter().map(|&x| half::f16::from_f32(x)).collect();
     let mut output_f16 = vec![half::f16::ZERO; size];
 
-    let config = DispatcherFlashConfig {
+    let config = KernelFlashAttentionConfig {
         batch_size: batch,
         num_heads,
         seq_len_q: seq_len,
@@ -785,13 +783,15 @@ fn bench_kernel_dispatcher_f16_f32(c: &mut Criterion) {
     // f32 benchmark
     group.bench_function("flash_attn_f32", |b| {
         b.iter(|| {
-            dispatcher.flash_attention(
-                black_box(&q_f32),
-                black_box(&k_f32),
-                black_box(&v_f32),
-                black_box(&mut output_f32),
-                config.clone(),
-            );
+            backend
+                .flash_attention(
+                    TensorSlice::F32(black_box(&q_f32)),
+                    TensorSlice::F32(black_box(&k_f32)),
+                    TensorSlice::F32(black_box(&v_f32)),
+                    TensorSliceMut::F32(black_box(&mut output_f32)),
+                    config.clone(),
+                )
+                .expect("backend flash_attention f32 failed");
             black_box(&output_f32);
         })
     });
@@ -799,13 +799,15 @@ fn bench_kernel_dispatcher_f16_f32(c: &mut Criterion) {
     // f16 benchmark
     group.bench_function("flash_attn_f16", |b| {
         b.iter(|| {
-            dispatcher.flash_attention(
-                black_box(&q_f16),
-                black_box(&k_f16),
-                black_box(&v_f16),
-                black_box(&mut output_f16),
-                config.clone(),
-            );
+            backend
+                .flash_attention(
+                    TensorSlice::F16(black_box(&q_f16)),
+                    TensorSlice::F16(black_box(&k_f16)),
+                    TensorSlice::F16(black_box(&v_f16)),
+                    TensorSliceMut::F16(black_box(&mut output_f16)),
+                    config.clone(),
+                )
+                .expect("backend flash_attention f16 failed");
             black_box(&output_f16);
         })
     });
@@ -814,7 +816,7 @@ fn bench_kernel_dispatcher_f16_f32(c: &mut Criterion) {
 }
 
 /// Benchmark long context (2M tokens) numerical stability.
-fn bench_kernel_dispatcher_stability(c: &mut Criterion) {
+fn bench_backend_stability(c: &mut Criterion) {
     let mut group = c.benchmark_group("numerical_stability");
     configure_group(&mut group);
 
@@ -823,7 +825,7 @@ fn bench_kernel_dispatcher_stability(c: &mut Criterion) {
     let head_dim = 64usize;
     let seq_len = 512usize; // Use smaller seq for benchmark speed
 
-    let dispatcher = KernelDispatcher::new();
+    let backend = auto_select_backend();
     let size = batch * num_heads * seq_len * head_dim;
 
     let q: Vec<f32> = (0..size).map(|i| (i as f32 * 0.001).sin()).collect();
@@ -835,7 +837,7 @@ fn bench_kernel_dispatcher_stability(c: &mut Criterion) {
     group.throughput(Throughput::Elements(tokens));
 
     // Standard mode (fast)
-    let config_fast = DispatcherFlashConfig {
+    let config_fast = KernelFlashAttentionConfig {
         batch_size: batch,
         num_heads,
         seq_len_q: seq_len,
@@ -849,19 +851,21 @@ fn bench_kernel_dispatcher_stability(c: &mut Criterion) {
 
     group.bench_function("standard_softmax", |b| {
         b.iter(|| {
-            dispatcher.flash_attention(
-                black_box(&q),
-                black_box(&k),
-                black_box(&v),
-                black_box(&mut output),
-                config_fast.clone(),
-            );
+            backend
+                .flash_attention(
+                    TensorSlice::F32(black_box(&q)),
+                    TensorSlice::F32(black_box(&k)),
+                    TensorSlice::F32(black_box(&v)),
+                    TensorSliceMut::F32(black_box(&mut output)),
+                    config_fast.clone(),
+                )
+                .expect("backend flash_attention fast failed");
             black_box(&output);
         })
     });
 
     // Stable mode (log-space + Kahan)
-    let config_stable = DispatcherFlashConfig {
+    let config_stable = KernelFlashAttentionConfig {
         batch_size: batch,
         num_heads,
         seq_len_q: seq_len,
@@ -875,13 +879,15 @@ fn bench_kernel_dispatcher_stability(c: &mut Criterion) {
 
     group.bench_function("stable_log_kahan", |b| {
         b.iter(|| {
-            dispatcher.flash_attention(
-                black_box(&q),
-                black_box(&k),
-                black_box(&v),
-                black_box(&mut output),
-                config_stable.clone(),
-            );
+            backend
+                .flash_attention(
+                    TensorSlice::F32(black_box(&q)),
+                    TensorSlice::F32(black_box(&k)),
+                    TensorSlice::F32(black_box(&v)),
+                    TensorSliceMut::F32(black_box(&mut output)),
+                    config_stable.clone(),
+                )
+                .expect("backend flash_attention stable failed");
             black_box(&output);
         })
     });
@@ -891,9 +897,9 @@ fn bench_kernel_dispatcher_stability(c: &mut Criterion) {
 
 criterion_group!(
     benches,
-    bench_kernel_dispatcher_zero_cost,
-    bench_kernel_dispatcher_f16_f32,
-    bench_kernel_dispatcher_stability,
+    bench_backend_zero_cost,
+    bench_backend_f16_f32,
+    bench_backend_stability,
     bench_flash_attention_optimized,
     bench_flash_attention_baseline,
     bench_flash_attention_v3,

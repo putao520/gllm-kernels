@@ -1,14 +1,40 @@
 //! Rerank Pipeline Multi-Backend Performance Test
 //! Tests all available backends: CUDA > ROCm > Metal > WGPU > CPU
 
-use gllm_kernels::{KernelDispatcher, GpuRerankConfig};
+use gllm_kernels::ops::embedding::{\n    binary_ip_hamming_simd, int8_dot_product_unrolled, rerank_binary_stage, rerank_int8_stage,\n    RerankResult,\n};
+use gllm_kernels::GpuRerankConfig;
 use std::time::Instant;
+
+fn rerank_pipeline_cpu(
+    binary_query: &[u64],
+    binary_database: &[u64],
+    int8_query: &[i8],
+    int8_database: &[i8],
+    num_vectors: usize,
+    config: &GpuRerankConfig,
+    scale: f32,
+) -> RerankResult {
+    let binary = rerank_binary_stage(
+        binary_query,
+        binary_database,
+        num_vectors,
+        config.dim,
+        config.binary_k,
+    );
+    rerank_int8_stage(
+        int8_query,
+        int8_database,
+        &binary.indices,
+        config.dim,
+        scale,
+        config.int8_k,
+    )
+}
 
 fn main() {
     println!("=== Multi-Backend Rerank Pipeline Performance Test ===\n");
     
-    let dispatcher = KernelDispatcher::new();
-    println!("🎯 Selected Backend: {:?}", dispatcher.backend());
+    println!("🎯 Selected Backend: {:?}", gllm_kernels::detect_backend());
     println!("   (Priority: CUDA > ROCm > Metal > WGPU > CPU)\n");
     
     // Test configurations
@@ -23,30 +49,33 @@ fn main() {
     for (num_vectors, dim, binary_k, int8_k, label) in configs {
         println!("--- {} (dim={}) ---", label, dim);
         
-        let binary_elements_per_vec = dim / 32;
-        let int8_elements_per_vec = dim / 4;
+        let binary_elements_per_vec = dim / 64;
         
         // Generate test data
-        let binary_query: Vec<u32> = (0..binary_elements_per_vec)
-            .map(|i| 0xAAAA_5555u32.wrapping_add(i as u32))
+        let binary_query: Vec<u64> = (0..binary_elements_per_vec)
+            .map(|i| 0xAAAA_5555_AAAA_5555u64.wrapping_add(i as u64))
             .collect();
-        let int8_query: Vec<u32> = (0..int8_elements_per_vec)
-            .map(|i| 0x7F7F_7F7Fu32.wrapping_sub(i as u32))
+        let int8_query: Vec<i8> = (0..dim)
+            .map(|i| ((i % 256) as i8).wrapping_sub(64))
             .collect();
-        let binary_database: Vec<u32> = (0..num_vectors * binary_elements_per_vec)
-            .map(|i| (i as u32).wrapping_mul(0x9E3779B9))
+        let binary_database: Vec<u64> = (0..num_vectors * binary_elements_per_vec)
+            .map(|i| (i as u64).wrapping_mul(0x9E3779B9_7F4A7C15u64))
             .collect();
-        let int8_database: Vec<u32> = (0..num_vectors * int8_elements_per_vec)
-            .map(|i| (i as u32).wrapping_mul(0x85EBCA6B))
+        let int8_database: Vec<i8> = (0..num_vectors * dim)
+            .map(|i| ((i * 7 % 256) as i8).wrapping_sub(64))
             .collect();
         
         let config = GpuRerankConfig { binary_k, int8_k, dim };
         
         // Warmup
-        let _ = dispatcher.rerank_pipeline(
-            &binary_query, &binary_database,
-            &int8_query, &int8_database,
-            num_vectors, &config, 0.01,
+        let _ = rerank_pipeline_cpu(
+            &binary_query,
+            &binary_database,
+            &int8_query,
+            &int8_database,
+            num_vectors,
+            &config,
+            0.01,
         );
         
         // Benchmark
@@ -54,10 +83,14 @@ fn main() {
         let start = Instant::now();
         
         for _ in 0..iterations {
-            let result = dispatcher.rerank_pipeline(
-                &binary_query, &binary_database,
-                &int8_query, &int8_database,
-                num_vectors, &config, 0.01,
+            let result = rerank_pipeline_cpu(
+                &binary_query,
+                &binary_database,
+                &int8_query,
+                &int8_database,
+                num_vectors,
+                &config,
+                0.01,
             );
             std::hint::black_box(&result);
         }
@@ -94,9 +127,7 @@ fn main() {
     
     let start = Instant::now();
     for _ in 0..5 {
-        dispatcher.binary_ip_hamming(
-            &binary_query_u64, &binary_database_u64, &mut binary_scores, binary_config.clone()
-        );
+        binary_ip_hamming_simd(&binary_query_u64, &binary_database_u64, &mut binary_scores, &binary_config);
         std::hint::black_box(&binary_scores);
     }
     let binary_time = start.elapsed().as_secs_f64() * 1000.0 / 5.0;
@@ -116,9 +147,7 @@ fn main() {
     
     let start = Instant::now();
     for _ in 0..5 {
-        dispatcher.int8_dot_product(
-            &int8_query_i8, &int8_database_i8, &mut int8_scores, int8_config.clone()
-        );
+        int8_dot_product_unrolled(&int8_query_i8, &int8_database_i8, &mut int8_scores, &int8_config);
         std::hint::black_box(&int8_scores);
     }
     let int8_time = start.elapsed().as_secs_f64() * 1000.0 / 5.0;
@@ -127,27 +156,31 @@ fn main() {
     
     // Summary
     println!("\n=== Performance Summary ===");
-    println!("Backend: {:?}", dispatcher.backend());
+    println!("Backend: {:?}", gllm_kernels::detect_backend());
     println!("Binary Hamming: {:.1}M vec/s", num_vectors as f64 / binary_time / 1000.0);
     println!("Int8 Dot Product: {:.1}M vec/s", num_vectors as f64 / int8_time / 1000.0);
     
     // Verify full pipeline output
     println!("\n=== Output Verification (1M vectors) ===");
     let config = GpuRerankConfig { binary_k: 10000, int8_k: 100, dim };
-    let binary_query: Vec<u32> = (0..dim/32).map(|i| 0xAAAAu32.wrapping_add(i as u32)).collect();
-    let int8_query: Vec<u32> = (0..dim/4).map(|i| 0x7F7F7F7Fu32.wrapping_sub(i as u32)).collect();
-    let binary_database: Vec<u32> = (0..1_000_000 * dim / 32)
-        .map(|i| (i as u32).wrapping_mul(0x9E3779B9))
+    let binary_query: Vec<u64> = (0..dim / 64).map(|i| 0xAAAA_5555_AAAA_5555u64.wrapping_add(i as u64)).collect();
+    let int8_query: Vec<i8> = (0..dim).map(|i| ((i % 256) as i8).wrapping_sub(64)).collect();
+    let binary_database: Vec<u64> = (0..1_000_000 * dim / 64)
+        .map(|i| (i as u64).wrapping_mul(0x9E3779B9_7F4A7C15u64))
         .collect();
-    let int8_database: Vec<u32> = (0..1_000_000 * dim / 4)
-        .map(|i| (i as u32).wrapping_mul(0x85EBCA6B))
+    let int8_database: Vec<i8> = (0..1_000_000 * dim)
+        .map(|i| ((i * 7 % 256) as i8).wrapping_sub(64))
         .collect();
     
     let start = Instant::now();
-    let result = dispatcher.rerank_pipeline(
-        &binary_query, &binary_database,
-        &int8_query, &int8_database,
-        1_000_000, &config, 0.01,
+    let result = rerank_pipeline_cpu(
+        &binary_query,
+        &binary_database,
+        &int8_query,
+        &int8_database,
+        1_000_000,
+        &config,
+        0.01,
     );
     let pipeline_time = start.elapsed();
     

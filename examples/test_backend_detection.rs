@@ -1,6 +1,6 @@
 //! Backend Detection Test
 
-use gllm_kernels::KernelDispatcher;
+use gllm_kernels::detect_backend;
 
 fn main() {
     println!("=== Backend Detection Analysis ===\n");
@@ -14,8 +14,7 @@ fn main() {
     
     // Check runtime detection
     println!("\nRuntime detection result:");
-    let dispatcher = KernelDispatcher::new();
-    println!("  Selected: {:?}", dispatcher.backend());
+    println!("  Selected: {:?}", detect_backend());
     
     // Force WGPU test
     println!("\n=== Direct WGPU Test ===");

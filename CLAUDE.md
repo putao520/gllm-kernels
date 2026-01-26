@@ -155,6 +155,31 @@ backend.flash_attention(...);  // 直接调用，没有中间层
 | WGPU | `src/wgpu_kernels/shaders/*.wgsl` | `src/wgpu_kernels/` | ✅ 必须 |
 | CPU | `src/cpu_kernels/` | 纯 Rust 实现 | ✅ 必须（参考实现） |
 
+### 后端实现优先级（🚨 开发顺序铁律）
+
+**新算子开发必须按以下顺序实现**：
+
+| 优先级 | 后端 | 理由 | 开发环境要求 |
+|--------|------|------|-------------|
+| P0 | CPU | 参考实现，验证算法正确性 | 无特殊要求 |
+| P1 | WGPU | 跨平台，覆盖最广 | 任意 Vulkan/Metal/DX12 GPU |
+| P2 | CUDA | 高性能，NVIDIA 专用 | NVIDIA GPU + Driver |
+| P3 | Metal | macOS/iOS 优化 | Apple Silicon |
+| P4 | ROCm | AMD GPU | AMD GPU + ROCm Driver |
+
+**开发流程**：
+```
+1. CPU 实现 → 单元测试验证算法
+2. WGPU 实现 → 跨平台 GPU 加速
+3. CUDA 实现（可选）→ NVIDIA 高性能
+4. Metal/ROCm（按需）→ 平台专用优化
+```
+
+**禁止的行为**：
+- ❌ 只实现 CUDA 不实现 WGPU（违反跨平台原则）
+- ❌ 跳过 CPU 参考实现（无法验证正确性）
+- ❌ 某后端使用 TODO/stub 占位提交
+
 **算子实现检查清单**：
 - [ ] CUDA PTX kernel 已实现并嵌入
 - [ ] ROCm HSACO kernel 已实现并嵌入（通过 HSA Runtime 加载）
@@ -177,6 +202,39 @@ backend.flash_attention(...);  // 直接调用，没有中间层
           │ PTX     │ HSACO   │ metallib│ WGSL    │ Rust   │
           └─────────┴─────────┴─────────┴─────────┴────────┘
 ```
+
+### Backend trait 当前方法清单（18 个）
+
+> 📌 SSOT: 详见 `SPEC/02-ARCHITECTURE.md` ARCH-SCOPE-001
+
+| # | 方法 | 用途 | GPU 实现状态 |
+|---|------|------|-------------|
+| 1 | `flash_attention()` | Flash Attention | ✅ 全后端 |
+| 2 | `paged_attention()` | PagedKV Attention | ✅ 全后端 |
+| 3 | `softmax()` | Softmax | ✅ 全后端 |
+| 4 | `matmul()` | 矩阵乘法 | ✅ 全后端 |
+| 5 | `rope_precompute()` | RoPE 预计算 | ✅ 全后端 |
+| 6 | `rope_apply()` | RoPE 应用 | ✅ 全后端 |
+| 7 | `rope_apply_inplace()` | RoPE 原地应用 | ✅ WGPU |
+| 8 | `topk()` | Top-K 采样 | CPU only |
+| 9 | `apply_temperature()` | 温度缩放 | CPU only |
+| 10 | `sample_tokens()` | Token 采样 | CPU only |
+| 11 | `argmax()` | 贪婪解码 | CPU only |
+| 12 | `moe_route()` | MoE 路由 | CPU only |
+| 13 | `compute_routing_logits()` | 路由 logits | CPU only |
+| 14 | `rms_norm()` | RMS 归一化 | ✅ WGPU |
+| 15 | `rms_norm_inplace()` | RMS 归一化（原地） | ✅ WGPU |
+| 16 | `silu()` | SiLU 激活 | ✅ WGPU |
+| 17 | `silu_inplace()` | SiLU 激活（原地） | ✅ WGPU |
+| 18 | `add_bias()` | 偏置添加 | CPU only |
+
+### 待实现需求（性能优化）
+
+| 需求 ID | 描述 | 架构设计 | 状态 |
+|---------|------|----------|------|
+| REQ-QUANT-001 | 原生量化推理 Kernel | ARCH-ADR-011 | 🔲 待设计 |
+
+---
 
 ## 目录结构
 
@@ -312,21 +370,21 @@ let count: u32 = config.max_candidates as u32;
 
 **规则**：配置结构体的数值类型应该统一，避免隐式转换。
 
-### 删除 Burn，统一到 kernel_dispatcher（ADR-001 🚨 铁律）
+### 删除 Burn，统一到 Backend + ops（ADR-001 🚨 铁律）
 
-**问题**：Burn Tensor 效率低，ops/ 论文算法无法使用 GPU 加速
+**问题**：Burn Tensor 效率低，ops/ 论文算法无法直接走多后端
 
-**🚨 重要**：ops/ 包含论文优化算法（EAGLE-3、Medusa、FlashAttention），**必须迁移而非删除**！
+**🚨 重要**：ops/ 包含论文优化算法（EAGLE-3、Medusa、FlashAttention），**必须保留并作为 CPU 参考实现**！
 
-**决策**：迁移 ops/ 论文算法到 kernel_dispatcher，去除 Burn 依赖
+**决策**：保留 ops/ 论文算法作为 CPU 参考实现，由各 Backend 直接调用；去除 Burn 依赖
 
 ```
-迁移（保留论文优化）：
-📦 ops/eagle3.rs (NeurIPS'25)     → kernel_dispatcher
-📦 ops/medusa.rs (ICML'24)        → kernel_dispatcher
-📦 ops/flash_attention.rs         → kernel_dispatcher（分层块+MaskCache）
-📦 ops/softmax.rs                 → kernel_dispatcher（Log-space+Kahan）
-📦 ops/paged_attention.rs         → kernel_dispatcher（多级层级+CoW）
+保留（CPU 参考实现，Backend 直接调用）：
+📦 ops/eagle3.rs (NeurIPS'25)
+📦 ops/medusa.rs (ICML'24)
+📦 ops/flash_attention.rs         （分层块+MaskCache）
+📦 ops/softmax.rs                 （Log-space+Kahan）
+📦 ops/paged_attention.rs         （多级层级+CoW）
 
 保留（已是纯 Rust，无需迁移）：
 ✅ ops/engram*.rs, embedding.rs, stable_accumulator.rs
@@ -334,12 +392,12 @@ let count: u32 = config.max_candidates as u32;
 
 **迁移模式**：`Tensor<B, D>` → `&[T]` 原始切片（保留算法逻辑）
 
-**唯一 API**：`KernelDispatcher`（原始切片 `&[T]` + GPU 加速 + 论文算法）
+**唯一 API**：`Backend` + `backend::auto_select_backend()`（原始切片 `&[T]` + GPU 加速 + 论文算法）
 
 **零成本要求**：
 - `#[inline(always)]` 强制内联
 - 原始切片，无 Tensor 抽象
-- enum + match 派发，无 vtable
+- 启动时选择后端一次（允许一次 vtable）
 - `T::TYPE_ID` const 分支消除
 
 ### 统一泛型算子 API（ARCH-API-001）
