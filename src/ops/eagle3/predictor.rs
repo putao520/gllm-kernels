@@ -1,4 +1,4 @@
-use crate::kernel_dispatcher::KernelFloat;
+use crate::kernel_types::KernelFloat;
 use crate::ops::math;
 
 /// Confidence predictor for acceptance probability estimation.

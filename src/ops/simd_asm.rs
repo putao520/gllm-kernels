@@ -241,30 +241,16 @@ pub unsafe fn dot_neon(a: *const f32, b: *const f32, len: usize) -> f32 {
 }
 
 // ============================================================================
-// Generic Fallback (using wide crate)
+// Generic Fallback (scalar)
 // ============================================================================
 
-use wide::f32x8;
-
-/// Generic SIMD dot product using the `wide` crate.
+/// Scalar dot product fallback.
 #[inline(always)]
-pub fn dot_wide(a: *const f32, b: *const f32, len: usize) -> f32 {
-    let simd_len = len / 8 * 8;
-    let mut acc = f32x8::ZERO;
-    
-    for i in (0..simd_len).step_by(8) {
-        let av = f32x8::from(unsafe { *(a.add(i) as *const [f32; 8]) });
-        let bv = f32x8::from(unsafe { *(b.add(i) as *const [f32; 8]) });
-        acc += av * bv;
-    }
-    
-    let arr: [f32; 8] = acc.into();
-    let mut sum = arr[0] + arr[1] + arr[2] + arr[3] + arr[4] + arr[5] + arr[6] + arr[7];
-    
-    for i in simd_len..len {
+pub fn dot_scalar(a: *const f32, b: *const f32, len: usize) -> f32 {
+    let mut sum = 0.0f32;
+    for i in 0..len {
         sum += unsafe { *a.add(i) * *b.add(i) };
     }
-    
     sum
 }
 // ============================================================================
@@ -278,7 +264,6 @@ pub enum SimdPath {
     Avx2Fma,
     Avx2,
     Neon,
-    Wide,
     Scalar,
 }
 
@@ -289,7 +274,6 @@ impl std::fmt::Display for SimdPath {
             SimdPath::Avx2Fma => write!(f, "AVX2+FMA (32 floats/iter)"),
             SimdPath::Avx2 => write!(f, "AVX2 (32 floats/iter)"),
             SimdPath::Neon => write!(f, "NEON (16 floats/iter)"),
-            SimdPath::Wide => write!(f, "wide crate (8 floats/iter)"),
             SimdPath::Scalar => write!(f, "Scalar fallback"),
         }
     }
@@ -315,7 +299,7 @@ pub fn current_simd_path() -> SimdPath {
         all(target_arch = "x86_64", target_feature = "avx512f"),
         target_arch = "aarch64"
     )))]
-    { return SimdPath::Wide; }
+    { return SimdPath::Scalar; }
 }
 
 // ============================================================================
@@ -323,7 +307,7 @@ pub fn current_simd_path() -> SimdPath {
 // ============================================================================
 
 /// Dispatch to the best available dot product implementation.
-/// Priority: AVX-512 > AVX2+FMA > AVX2 > NEON > wide fallback
+/// Priority: AVX-512 > AVX2+FMA > AVX2 > NEON > scalar fallback
 #[inline(always)]
 pub fn simd_dot_product(a: *const f32, b: *const f32, len: usize) -> f32 {
     // AVX-512: Best for large vectors (hidden >= 4096)
@@ -353,7 +337,7 @@ pub fn simd_dot_product(a: *const f32, b: *const f32, len: usize) -> f32 {
         target_arch = "aarch64"
     )))]
     {
-        return dot_wide(a, b, len);
+        return dot_scalar(a, b, len);
     }
 }
 
@@ -419,17 +403,12 @@ pub fn gemv_parallel(
     out_features: usize,
     in_features: usize,
 ) {
-    use rayon::prelude::*;
-    
     debug_assert_eq!(input.len(), in_features);
     debug_assert_eq!(weight.len(), out_features * in_features);
     debug_assert_eq!(output.len(), out_features);
-    
-    output.par_iter_mut().enumerate().for_each(|(i, out)| {
-        let w_start = i * in_features;
-        let w_row = &weight[w_start..w_start + in_features];
-        *out = simd_dot_product(input.as_ptr(), w_row.as_ptr(), in_features);
-    });
+
+    // Rayon removed; fall back to the single-threaded path.
+    gemv_single(input, weight, output, out_features, in_features);
 }
 
 /// Size-specialized GEMV dispatcher.

@@ -4,7 +4,7 @@
 //! precision when accumulating millions of floating-point values.
 //!
 //! All implementations are pure Rust with no external dependencies.
-//! For GPU-accelerated versions, use `KernelDispatcher` methods.
+//! For GPU-accelerated versions, use Backend implementations.
 
 /// Kahan compensated summation for high-precision accumulation.
 ///
@@ -409,7 +409,7 @@ impl<T: Default> StableRowState<T> {
 }
 
 // NOTE: Burn-based `StableRowState<Tensor<B, D>>` wrapper has been removed.
-// Use `KernelDispatcher` methods for GPU-accelerated attention computation.
+// Use Backend implementations for GPU-accelerated attention computation.
 
 /// Backward-compatible alias.
 pub type OutputAccumulator<T> = StableRowState<T>;

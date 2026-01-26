@@ -1,6 +1,6 @@
 //! Paged Attention CPU reference implementation.
 
-use crate::kernel_dispatcher::KernelFloat;
+use crate::kernel_types::KernelFloat;
 use crate::types::PagedAttentionConfig;
 use crate::ops::stable_accumulator::{AccumulatorConfig, KahanAccumulator, StableAccumulator};
 
@@ -229,5 +229,79 @@ pub fn build_paged_layout<T: KernelFloat>(
         page_size,
         num_blocks,
         scale: 1.0 / (head_dim as f32).sqrt(),
+    })
+}
+
+pub(crate) struct PagedGpuInputs {
+    pub(crate) layout: PagedAttentionLayout,
+    pub(crate) q_f32: Vec<f32>,
+    pub(crate) k_f32: Vec<f32>,
+    pub(crate) v_f32: Vec<f32>,
+    pub(crate) block_tables: Vec<i32>,
+    pub(crate) block_offsets: Vec<i32>,
+}
+
+pub(crate) fn build_paged_gpu_inputs<T: KernelFloat>(
+    q: &[T],
+    k_cache: &[T],
+    v_cache: &[T],
+    page_table: &[u32],
+    seq_lens: &[u32],
+    output_len: usize,
+    config: &PagedAttentionConfig,
+) -> Option<PagedGpuInputs> {
+    let layout = build_paged_layout(q, k_cache, v_cache, page_table, seq_lens, output_len, config)?;
+    let kv_len = seq_lens[0] as usize;
+    if seq_lens.iter().any(|&len| len as usize != kv_len) {
+        log::debug!("Paged attention: GPU kernels require uniform seq_lens");
+        return None;
+    }
+    if kv_len != layout.max_kv_len {
+        log::debug!("Paged attention: GPU kernels require packed page_table");
+        return None;
+    }
+    if kv_len < layout.seq_len {
+        log::warn!("Paged attention: kv_len shorter than seq_len");
+        return None;
+    }
+    let offset = kv_len - layout.seq_len;
+    let offset_i32 = match i32::try_from(offset) {
+        Ok(value) => value,
+        Err(_) => {
+            log::warn!("Paged attention: block offset exceeds i32");
+            return None;
+        }
+    };
+    let block_offsets = vec![offset_i32; layout.batch_size];
+
+    let max_block_id = page_table.iter().copied().max().unwrap_or(0) as usize;
+    if max_block_id >= layout.num_blocks {
+        log::warn!("Paged attention: page_table references invalid block id");
+        return None;
+    }
+
+    let block_tables: Vec<i32> = match page_table
+        .iter()
+        .map(|&value| i32::try_from(value).ok())
+        .collect::<Option<Vec<_>>>()
+    {
+        Some(values) => values,
+        None => {
+            log::warn!("Paged attention: page_table value exceeds i32");
+            return None;
+        }
+    };
+
+    let q_f32: Vec<f32> = q.iter().map(|x| x.to_f32()).collect();
+    let k_f32: Vec<f32> = k_cache.iter().map(|x| x.to_f32()).collect();
+    let v_f32: Vec<f32> = v_cache.iter().map(|x| x.to_f32()).collect();
+
+    Some(PagedGpuInputs {
+        layout,
+        q_f32,
+        k_f32,
+        v_f32,
+        block_tables,
+        block_offsets,
     })
 }

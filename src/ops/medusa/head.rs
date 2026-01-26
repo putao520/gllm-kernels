@@ -1,4 +1,4 @@
-use crate::kernel_dispatcher::KernelFloat;
+use crate::kernel_types::KernelFloat;
 
 /// A single Medusa head for predicting tokens at a specific offset.
 #[derive(Debug, Clone)]

@@ -2,10 +2,11 @@
 //!
 //! Run with: cargo test --test embedding_benchmark -- --nocapture
 
-use gllm_kernels::kernel_dispatcher::KernelDispatcher;
 use gllm_kernels::BackendType;
 use gllm_kernels::ops::embedding::{
     BinaryIpConfig, Int4PackedConfig, Int8DotConfig, MatryoshkaConfig,
+    binary_ip_asymmetric, binary_ip_hamming_simd, int4_packed_dot_product,
+    int8_dot_product_unrolled, matryoshka_truncate,
 };
 use std::time::Instant;
 
@@ -89,7 +90,7 @@ fn generate_matryoshka_data(
 }
 
 fn bench_binary_ip_hamming(backend: BackendType, dim: usize, num_queries: usize, num_vectors: usize) -> f64 {
-    let dispatcher = KernelDispatcher::with_backend(backend);
+    let _ = backend;
     let (queries, database, mut scores) = generate_test_data(dim, num_queries, num_vectors);
     let config = BinaryIpConfig {
         dim,
@@ -99,20 +100,20 @@ fn bench_binary_ip_hamming(backend: BackendType, dim: usize, num_queries: usize,
 
     // Warmup
     for _ in 0..WARMUP_ITERS {
-        dispatcher.binary_ip_hamming(&queries, &database, &mut scores, config.clone());
+        binary_ip_hamming_simd(&queries, &database, &mut scores, &config);
     }
 
     // Benchmark
     let start = Instant::now();
     for _ in 0..BENCH_ITERS {
-        dispatcher.binary_ip_hamming(&queries, &database, &mut scores, config.clone());
+        binary_ip_hamming_simd(&queries, &database, &mut scores, &config);
     }
     let elapsed = start.elapsed();
     elapsed.as_secs_f64() / BENCH_ITERS as f64 * 1000.0 // ms
 }
 
 fn bench_binary_ip_asymmetric(backend: BackendType, dim: usize, num_queries: usize, num_vectors: usize) -> f64 {
-    let dispatcher = KernelDispatcher::with_backend(backend);
+    let _ = backend;
     let (queries, database, mut scores) = generate_asymmetric_data(dim, num_queries, num_vectors);
     let config = BinaryIpConfig {
         dim,
@@ -122,20 +123,20 @@ fn bench_binary_ip_asymmetric(backend: BackendType, dim: usize, num_queries: usi
 
     // Warmup
     for _ in 0..WARMUP_ITERS {
-        dispatcher.binary_ip_asymmetric(&queries, &database, &mut scores, config.clone());
+        binary_ip_asymmetric(&queries, &database, &mut scores, &config);
     }
 
     // Benchmark
     let start = Instant::now();
     for _ in 0..BENCH_ITERS {
-        dispatcher.binary_ip_asymmetric(&queries, &database, &mut scores, config.clone());
+        binary_ip_asymmetric(&queries, &database, &mut scores, &config);
     }
     let elapsed = start.elapsed();
     elapsed.as_secs_f64() / BENCH_ITERS as f64 * 1000.0 // ms
 }
 
 fn bench_int8_dot_product(backend: BackendType, dim: usize, num_queries: usize, num_vectors: usize) -> f64 {
-    let dispatcher = KernelDispatcher::with_backend(backend);
+    let _ = backend;
     let (queries, database, mut scores) = generate_int8_data(dim, num_queries, num_vectors);
     let config = Int8DotConfig {
         dim,
@@ -146,20 +147,20 @@ fn bench_int8_dot_product(backend: BackendType, dim: usize, num_queries: usize, 
 
     // Warmup
     for _ in 0..WARMUP_ITERS {
-        dispatcher.int8_dot_product(&queries, &database, &mut scores, config.clone());
+        int8_dot_product_unrolled(&queries, &database, &mut scores, &config);
     }
 
     // Benchmark
     let start = Instant::now();
     for _ in 0..BENCH_ITERS {
-        dispatcher.int8_dot_product(&queries, &database, &mut scores, config.clone());
+        int8_dot_product_unrolled(&queries, &database, &mut scores, &config);
     }
     let elapsed = start.elapsed();
     elapsed.as_secs_f64() / BENCH_ITERS as f64 * 1000.0 // ms
 }
 
 fn bench_int4_dot_product(backend: BackendType, dim: usize, num_queries: usize, num_vectors: usize) -> f64 {
-    let dispatcher = KernelDispatcher::with_backend(backend);
+    let _ = backend;
     let (queries, database, mut scores) = generate_int4_data(dim, num_queries, num_vectors);
     let config = Int4PackedConfig {
         dim,
@@ -171,20 +172,20 @@ fn bench_int4_dot_product(backend: BackendType, dim: usize, num_queries: usize, 
 
     // Warmup
     for _ in 0..WARMUP_ITERS {
-        dispatcher.int4_packed_dot_product(&queries, &database, &mut scores, config.clone());
+        int4_packed_dot_product(&queries, &database, &mut scores, &config);
     }
 
     // Benchmark
     let start = Instant::now();
     for _ in 0..BENCH_ITERS {
-        dispatcher.int4_packed_dot_product(&queries, &database, &mut scores, config.clone());
+        int4_packed_dot_product(&queries, &database, &mut scores, &config);
     }
     let elapsed = start.elapsed();
     elapsed.as_secs_f64() / BENCH_ITERS as f64 * 1000.0 // ms
 }
 
 fn bench_matryoshka_truncate(backend: BackendType, full_dim: usize, target_dim: usize, num_vectors: usize) -> f64 {
-    let dispatcher = KernelDispatcher::with_backend(backend);
+    let _ = backend;
     let (embeddings, mut output) = generate_matryoshka_data(full_dim, target_dim, num_vectors);
     let config = MatryoshkaConfig {
         full_dim,
@@ -194,13 +195,13 @@ fn bench_matryoshka_truncate(backend: BackendType, full_dim: usize, target_dim: 
 
     // Warmup
     for _ in 0..WARMUP_ITERS {
-        dispatcher.matryoshka_truncate(&embeddings, &mut output, config.clone());
+        matryoshka_truncate(&embeddings, &mut output, &config);
     }
 
     // Benchmark
     let start = Instant::now();
     for _ in 0..BENCH_ITERS {
-        dispatcher.matryoshka_truncate(&embeddings, &mut output, config.clone());
+        matryoshka_truncate(&embeddings, &mut output, &config);
     }
     let elapsed = start.elapsed();
     elapsed.as_secs_f64() / BENCH_ITERS as f64 * 1000.0 // ms

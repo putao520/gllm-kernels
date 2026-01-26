@@ -3,8 +3,10 @@
 //! This module provides pure-Rust implementations for log-space softmax operations,
 //! optimized for numerical stability with 2M+ context lengths.
 //!
-//! For GPU-accelerated softmax, use `KernelDispatcher::softmax()` which provides
-//! zero-cost abstraction over CUDA/ROCm/Metal/WGPU backends.
+//! For GPU-accelerated softmax, use the selected Backend implementation.
+
+use crate::kernel_types::{KernelFloat, SoftmaxConfig};
+use crate::ops::stable_accumulator::{AccumulatorConfig, StableAccumulator};
 
 /// Compute log(exp(a) + exp(b)) in a numerically stable way.
 #[inline]
@@ -60,6 +62,45 @@ pub fn log_sum_exp_kahan(values: &[f64]) -> f64 {
     }
 
     max + sum.value().ln()
+}
+
+/// CPU reference implementation of Softmax (generic).
+#[inline(always)]
+pub fn softmax<T: KernelFloat>(input: &[T], output: &mut [T], config: SoftmaxConfig) {
+    if input.is_empty() {
+        return;
+    }
+
+    let acc_config = if config.use_log_space || config.use_kahan {
+        AccumulatorConfig::max_precision()
+    } else {
+        AccumulatorConfig::short_context()
+    };
+
+    let mut max_val = f64::NEG_INFINITY;
+    for &x in input {
+        max_val = max_val.max(x.to_f32() as f64);
+    }
+
+    if config.use_log_space || config.use_kahan {
+        let mut stable = StableAccumulator::new(acc_config);
+        let sum_exp: f64 = input.iter().map(|&x| ((x.to_f32() as f64) - max_val).exp()).sum();
+        stable.update(max_val, sum_exp);
+
+        let m = stable.max();
+        let l = stable.sum();
+
+        for (i, &x) in input.iter().enumerate() {
+            let prob = if l > 0.0 { (((x.to_f32() as f64) - m).exp() / l) as f32 } else { 0.0 };
+            output[i] = T::from_f32(prob);
+        }
+    } else {
+        let max_f32 = input.iter().map(|x| x.to_f32()).fold(f32::NEG_INFINITY, f32::max);
+        let sum: f32 = input.iter().map(|x| (x.to_f32() - max_f32).exp()).sum();
+        for (i, &x) in input.iter().enumerate() {
+            output[i] = T::from_f32((x.to_f32() - max_f32).exp() / sum);
+        }
+    }
 }
 
 /// Log-space softmax accumulator for online computation.
@@ -178,7 +219,7 @@ impl LogSpaceSoftmax {
 }
 
 // NOTE: TensorLogOps and OnlineSoftmax (Burn-based wrappers) have been removed.
-// Use KernelDispatcher::softmax() for GPU-accelerated softmax computation.
+// Use a Backend implementation for GPU-accelerated softmax computation.
 
 #[cfg(test)]
 mod tests {

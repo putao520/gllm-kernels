@@ -1,4 +1,4 @@
-use crate::kernel_dispatcher::{
+use crate::kernel_types::{
     FlashAttentionConfig, MatmulConfig, PagedAttentionConfig, SoftmaxConfig,
 };
 use crate::ops::moe_routing::{MoERoutingConfig, MoERoutingResult};

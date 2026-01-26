@@ -11,7 +11,7 @@
 
 use std::marker::PhantomData;
 
-use crate::kernel_dispatcher::KernelFloat;
+use crate::kernel_types::KernelFloat;
 
 /// INT2 quantization configuration.
 #[derive(Debug, Clone, Copy)]

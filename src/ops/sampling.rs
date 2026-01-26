@@ -5,7 +5,7 @@
 //!
 //! These are GPU-acceleratable operations commonly used in LLM inference.
 
-use crate::kernel_dispatcher::KernelFloat;
+use crate::kernel_types::KernelFloat;
 
 /// Configuration for sampling operations.
 #[derive(Debug, Clone)]

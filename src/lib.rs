@@ -9,13 +9,15 @@
 //! # Quick Start
 //!
 //! ```ignore
-//! use gllm_kernels::{KernelDispatcher, FlashAttentionConfig};
+//! use gllm_kernels::backend::{auto_select_backend, TensorSlice, TensorSliceMut};
+//! use gllm_kernels::FlashAttentionConfig;
 //!
-//! let dispatcher = KernelDispatcher::new(); // Auto-detect backend
-//! dispatcher.flash_attention(q, k, v, &mut output, config);
+//! let backend = auto_select_backend();
+//! backend.flash_attention(q, k, v, output, FlashAttentionConfig::default());
 //! ```
 
 pub mod comm;
+pub mod kernel_types;
 pub mod ops;
 pub mod types;
 pub mod validation;
@@ -37,19 +39,13 @@ pub mod wgpu_kernels;
 pub mod runtime_detection;
 pub mod backend;
 pub mod backend_trait;
-mod backend_core;
-mod backend_core_attention;
-mod backend_core_sampling;
-mod backend_core_moe;
+mod backend_match;
 pub mod cpu_backend;
 pub mod wgpu_backend;
 pub mod cuda_backend;
 pub mod rocm_backend;
 pub mod metal_backend;
 pub mod kernel_cache;
-
-// Zero-cost kernel dispatcher
-pub mod kernel_dispatcher;
 
 // Fat Binary: embedded pre-compiled kernels
 pub mod embedded_kernels;
@@ -64,9 +60,10 @@ pub use kernel_cache::{
 };
 pub use wgpu_kernels::FlashAttentionKernel;
 
-// Zero-cost dispatcher exports
-pub use kernel_dispatcher::{
-    KernelDispatcher, KernelFloat, FlashAttentionConfig, PagedAttentionConfig, SoftmaxConfig,
+// Kernel types exports (ARCH-BACKEND-001: types extracted to kernel_types)
+pub use kernel_types::{
+    FloatType, KernelFloat,
+    FlashAttentionConfig, PagedAttentionConfig, SoftmaxConfig,
     Eagle3Config, Eagle3DraftResult, Eagle3VerifyConfig, Eagle3VerifyResult,
     SpecEEConfig, SpecEEForwardResult,
     FlashTreeAttentionConfig,
@@ -76,9 +73,11 @@ pub use kernel_dispatcher::{
     MedusaConfig, MedusaForwardResult, MedusaVerifyConfig, MedusaVerifyResult,
     PromptCacheLookupConfig, PromptCacheLookupResult, PromptCacheBlendConfig,
     ChunkedPrefillConfig, ChunkedPrefillResult,
-    GpuRerankConfig, GpuRerankStageResult,
     MatmulConfig,
 };
+
+// GPU-specific rerank types (WGPU only)
+pub use wgpu_kernels::embedding_ops::{GpuRerankConfig, GpuRerankStageResult};
 
 // Engram conditional memory exports
 pub use ops::engram::{Engram, EngramConfig, fuse_engram_attention, fuse_engram_attention_simd};

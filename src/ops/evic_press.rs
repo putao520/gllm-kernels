@@ -12,7 +12,7 @@
 use std::collections::VecDeque;
 use std::marker::PhantomData;
 
-use crate::kernel_dispatcher::KernelFloat;
+use crate::kernel_types::KernelFloat;
 
 use super::int2_quantizer::Int2PackedBuffer;
 

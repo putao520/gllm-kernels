@@ -7,7 +7,7 @@
 //!
 //! Reference: Switch Transformers, Mixtral, DeepSeek-MoE
 
-use crate::kernel_dispatcher::KernelFloat;
+use crate::kernel_types::KernelFloat;
 
 /// Configuration for MoE routing operations.
 #[derive(Debug, Clone)]

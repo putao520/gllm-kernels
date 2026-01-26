@@ -9,7 +9,31 @@
 //! - FP16: rtol=1e-3, atol=1e-4
 //! - BF16: rtol=1e-2, atol=1e-3
 
-use gllm_kernels::{BackendType, KernelDispatcher, PagedAttentionConfig};
+use gllm_kernels::backend::{Backend, TensorSlice, TensorSliceMut};
+use gllm_kernels::{BackendType, CudaBackend, CpuBackend, PagedAttentionConfig};
+
+fn run_paged_attention<B: Backend>(
+    backend: &B,
+    q: &[f32],
+    k_cache: &[f32],
+    v_cache: &[f32],
+    page_table: &[u32],
+    seq_lens: &[u32],
+    output: &mut [f32],
+    config: PagedAttentionConfig,
+) {
+    backend
+        .paged_attention(
+            TensorSlice::F32(q),
+            TensorSlice::F32(k_cache),
+            TensorSlice::F32(v_cache),
+            page_table,
+            seq_lens,
+            TensorSliceMut::F32(output),
+            config,
+        )
+        .expect("paged_attention failed");
+}
 
 /// Helper to generate deterministic random-like test data.
 fn generate_test_data(size: usize, seed: u64) -> Vec<f32> {
@@ -79,7 +103,7 @@ fn assert_no_nan_inf(data: &[f32], context: &str) {
 /// Test Paged Attention CPU reference implementation produces valid output.
 #[test]
 fn test_paged_attention_cpu_basic() {
-    let dispatcher = KernelDispatcher::with_backend(BackendType::Cpu);
+    let dispatcher = CpuBackend::new();
 
     // Small test case
     let num_seqs = 2;
@@ -117,7 +141,16 @@ fn test_paged_attention_cpu_basic() {
         use_kahan_accumulator: true,
     };
 
-    dispatcher.paged_attention(&q, &k_cache, &v_cache, &page_table, &seq_lens, &mut output, config);
+    run_paged_attention(
+        &dispatcher,
+        &q,
+        &k_cache,
+        &v_cache,
+        &page_table,
+        &seq_lens,
+        &mut output,
+        config,
+    );
 
     // Verify no NaN/Inf
     assert_no_nan_inf(&output, "CPU basic output");
@@ -134,7 +167,7 @@ fn test_paged_attention_cpu_basic() {
 /// Test Paged Attention CPU consistency.
 #[test]
 fn test_paged_attention_cpu_consistency() {
-    let dispatcher = KernelDispatcher::with_backend(BackendType::Cpu);
+    let dispatcher = CpuBackend::new();
 
     let num_seqs = 4;
     let num_heads = 8;
@@ -167,7 +200,8 @@ fn test_paged_attention_cpu_consistency() {
     let mut output1 = vec![0.0f32; q_size];
     let mut output2 = vec![0.0f32; q_size];
 
-    dispatcher.paged_attention(
+    run_paged_attention(
+        &dispatcher,
         &q,
         &k_cache,
         &v_cache,
@@ -176,7 +210,8 @@ fn test_paged_attention_cpu_consistency() {
         &mut output1,
         config.clone(),
     );
-    dispatcher.paged_attention(
+    run_paged_attention(
+        &dispatcher,
         &q,
         &k_cache,
         &v_cache,
@@ -196,7 +231,7 @@ fn test_paged_attention_cpu_consistency() {
 /// Test Paged Attention with different sequence lengths.
 #[test]
 fn test_paged_attention_variable_seq_lengths() {
-    let dispatcher = KernelDispatcher::with_backend(BackendType::Cpu);
+    let dispatcher = CpuBackend::new();
 
     let num_seqs = 3;
     let num_heads = 4;
@@ -232,7 +267,8 @@ fn test_paged_attention_variable_seq_lengths() {
         use_kahan_accumulator: true,
     };
 
-    dispatcher.paged_attention(
+    run_paged_attention(
+        &dispatcher,
         &q,
         &k_cache,
         &v_cache,
@@ -257,8 +293,8 @@ fn test_paged_attention_cuda_vs_cpu_fp32() {
         return;
     }
 
-    let cpu_dispatcher = KernelDispatcher::with_backend(BackendType::Cpu);
-    let cuda_dispatcher = KernelDispatcher::with_backend(BackendType::Cuda);
+    let cpu_dispatcher = CpuBackend::new();
+    let cuda_dispatcher = CudaBackend::new();
 
     let num_seqs = 4;
     let num_heads = 8;
@@ -289,7 +325,8 @@ fn test_paged_attention_cuda_vs_cpu_fp32() {
 
     // CPU reference (Ground Truth)
     let mut cpu_output = vec![0.0f32; q_size];
-    cpu_dispatcher.paged_attention(
+    run_paged_attention(
+        &cpu_dispatcher,
         &q,
         &k_cache,
         &v_cache,
@@ -301,7 +338,8 @@ fn test_paged_attention_cuda_vs_cpu_fp32() {
 
     // CUDA GPU
     let mut cuda_output = vec![0.0f32; q_size];
-    cuda_dispatcher.paged_attention(
+    run_paged_attention(
+        &cuda_dispatcher,
         &q,
         &k_cache,
         &v_cache,
@@ -324,7 +362,7 @@ fn test_paged_attention_cuda_vs_cpu_fp32() {
 /// Test Paged Attention stability options.
 #[test]
 fn test_paged_attention_stability_options() {
-    let dispatcher = KernelDispatcher::with_backend(BackendType::Cpu);
+    let dispatcher = CpuBackend::new();
 
     let num_seqs = 2;
     let num_heads = 4;
@@ -372,7 +410,8 @@ fn test_paged_attention_stability_options() {
     let mut output_stable = vec![0.0f32; q_size];
     let mut output_basic = vec![0.0f32; q_size];
 
-    dispatcher.paged_attention(
+    run_paged_attention(
+        &dispatcher,
         &q,
         &k_cache,
         &v_cache,
@@ -381,7 +420,8 @@ fn test_paged_attention_stability_options() {
         &mut output_stable,
         config_stable,
     );
-    dispatcher.paged_attention(
+    run_paged_attention(
+        &dispatcher,
         &q,
         &k_cache,
         &v_cache,
@@ -400,7 +440,7 @@ fn test_paged_attention_stability_options() {
 /// num_kv_heads < num_heads
 #[test]
 fn test_paged_attention_gqa() {
-    let dispatcher = KernelDispatcher::with_backend(BackendType::Cpu);
+    let dispatcher = CpuBackend::new();
 
     let num_seqs = 2;
     let num_heads = 8;       // Query heads
@@ -434,7 +474,8 @@ fn test_paged_attention_gqa() {
         use_kahan_accumulator: true,
     };
 
-    dispatcher.paged_attention(
+    run_paged_attention(
+        &dispatcher,
         &q,
         &k_cache,
         &v_cache,
@@ -450,7 +491,7 @@ fn test_paged_attention_gqa() {
 /// Test Paged Attention with single sequence.
 #[test]
 fn test_paged_attention_single_seq() {
-    let dispatcher = KernelDispatcher::with_backend(BackendType::Cpu);
+    let dispatcher = CpuBackend::new();
 
     let num_seqs = 1;
     let num_heads = 4;
@@ -481,7 +522,8 @@ fn test_paged_attention_single_seq() {
         use_kahan_accumulator: true,
     };
 
-    dispatcher.paged_attention(
+    run_paged_attention(
+        &dispatcher,
         &q,
         &k_cache,
         &v_cache,

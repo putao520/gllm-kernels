@@ -1,6 +1,6 @@
 use std::marker::PhantomData;
 
-use crate::kernel_dispatcher::KernelFloat;
+use crate::kernel_types::KernelFloat;
 
 use super::cache::NgramCache;
 use super::config::AssistedGenerationConfig;

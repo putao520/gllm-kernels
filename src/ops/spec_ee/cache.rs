@@ -1,4 +1,4 @@
-use crate::kernel_dispatcher::KernelFloat;
+use crate::kernel_types::KernelFloat;
 
 /// Cached 3D activation buffer.
 #[derive(Debug, Clone)]

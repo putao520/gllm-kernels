@@ -1,4 +1,4 @@
-use crate::kernel_dispatcher::KernelFloat;
+use crate::kernel_types::KernelFloat;
 
 #[inline(always)]
 pub(crate) fn sigmoid(x: f32) -> f32 {

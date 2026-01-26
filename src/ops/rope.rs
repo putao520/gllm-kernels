@@ -7,7 +7,7 @@
 //!
 //! Reference: https://arxiv.org/abs/2104.09864
 
-use crate::kernel_dispatcher::KernelFloat;
+use crate::kernel_types::KernelFloat;
 
 /// Configuration for RoPE operations.
 #[derive(Debug, Clone)]

@@ -1,11 +1,9 @@
 //! Flash Attention CPU reference implementation.
 
-use crate::kernel_dispatcher::KernelFloat;
+use crate::kernel_types::{FloatType, KernelFloat};
 use crate::types::FlashAttentionConfig;
 use crate::ops::stable_accumulator::{StableAccumulator, AccumulatorConfig};
 use crate::ops::simd_asm::simd_dot_product;
-use wide::f32x8;
-use rayon::prelude::*;
 
 /// CPU reference implementation of Flash Attention.
 pub fn flash_attention<T: KernelFloat>(
@@ -33,18 +31,33 @@ pub fn flash_attention<T: KernelFloat>(
     };
 
     let chunk_size = seq_q * head_dim;
-    let num_tasks = (output.len() / chunk_size).max(1);
-    let use_parallel = num_tasks > 1 && heads > 1;
+    output.chunks_exact_mut(chunk_size).enumerate().for_each(|(idx, out_chunk)| {
+        process_head_attention(idx, out_chunk, heads, seq_q, seq_kv, head_dim, q, k, v, scale, &acc_config, config.causal);
+    });
+}
 
-    if use_parallel {
-        output.par_chunks_exact_mut(chunk_size).enumerate().for_each(|(idx, out_chunk)| {
-            process_head_attention(idx, out_chunk, heads, seq_q, seq_kv, head_dim, q, k, v, scale, &acc_config, config.causal);
-        });
-    } else {
-        output.chunks_exact_mut(chunk_size).enumerate().for_each(|(idx, out_chunk)| {
-            process_head_attention(idx, out_chunk, heads, seq_q, seq_kv, head_dim, q, k, v, scale, &acc_config, config.causal);
-        });
-    }
+#[inline(always)]
+pub fn cpu_flash_attention<T: KernelFloat>(
+    q: &[T],
+    k: &[T],
+    v: &[T],
+    output: &mut [T],
+    config: FlashAttentionConfig,
+) {
+    flash_attention(q, k, v, output, config);
+}
+
+#[inline(always)]
+pub fn cpu_paged_attention<T: KernelFloat>(
+    q: &[T],
+    k_cache: &[T],
+    v_cache: &[T],
+    page_table: &[u32],
+    seq_lens: &[u32],
+    output: &mut [T],
+    config: crate::types::PagedAttentionConfig,
+) {
+    crate::ops::paged_attn::paged_attention(q, k_cache, v_cache, page_table, seq_lens, output, config);
 }
 
 /// Ultra-fast decode path (seq_q=1).
@@ -71,11 +84,7 @@ pub fn flash_attention_decode<T: KernelFloat>(
             let k_offset = h * seq_kv * head_dim + j * head_dim;
             let k_row = &k[k_offset..k_offset + head_dim];
             
-            let score = simd_dot_product(
-                q_row.as_ptr() as *const f32,
-                k_row.as_ptr() as *const f32,
-                head_dim,
-            ) * scale;
+            let score = dot_product(q_row, k_row) * scale;
             
             max_score = max_score.max(score);
         }
@@ -86,11 +95,7 @@ pub fn flash_attention_decode<T: KernelFloat>(
             let v_offset = h * seq_kv * head_dim + j * head_dim;
             let v_row = &v[v_offset..v_offset + head_dim];
             
-            let score = simd_dot_product(
-                q_row.as_ptr() as *const f32,
-                k_row.as_ptr() as *const f32,
-                head_dim,
-            ) * scale;
+            let score = dot_product(q_row, k_row) * scale;
             
             let exp_score = (score - max_score).exp();
             sum_exp += exp_score;
@@ -140,20 +145,7 @@ fn process_head_attention<T: KernelFloat>(
             let k_base = b * heads * seq_kv * head_dim + h * seq_kv * head_dim + j * head_dim;
             let k_row = &k[k_base..k_base + head_dim];
             
-            let simd_len = head_dim / 8 * 8;
-            let mut acc_v = f32x8::ZERO;
-            for d in (0..simd_len).step_by(8) {
-                let qv = f32x8::from(unsafe { *(q_row.as_ptr().add(d) as *const [f32; 8]) });
-                let kv = f32x8::from(unsafe { *(k_row.as_ptr().add(d) as *const [f32; 8]) });
-                acc_v += qv * kv;
-            }
-            let arr: [f32; 8] = acc_v.into();
-            let mut score = arr.iter().sum::<f32>();
-            for d in simd_len..head_dim {
-                score += q_row[d].to_f32() * k_row[d].to_f32();
-            }
-
-            score *= scale;
+            let score = dot_product(q_row, k_row) * scale;
             block_max = block_max.max(score);
             scores[j] = score;
         }
@@ -176,16 +168,7 @@ fn process_head_attention<T: KernelFloat>(
             let v_base = b * heads * seq_kv * head_dim + h * seq_kv * head_dim + j * head_dim;
             let v_row = &v[v_base..v_base + head_dim];
             
-            let wv = f32x8::splat(attn_weight);
-            let simd_len = head_dim / 8 * 8;
-            for d in (0..simd_len).step_by(8) {
-                let vv = f32x8::from(unsafe { *(v_row.as_ptr().add(d) as *const [f32; 8]) });
-                let mut cur_v = f32x8::from(unsafe { *(weighted_sum.as_ptr().add(d) as *const [f32; 8]) });
-                cur_v += wv * vv;
-                let arr: [f32; 8] = cur_v.into();
-                weighted_sum[d..d + 8].copy_from_slice(&arr);
-            }
-            for d in simd_len..head_dim {
+            for d in 0..head_dim {
                 weighted_sum[d] += attn_weight * v_row[d].to_f32();
             }
         }
@@ -193,5 +176,17 @@ fn process_head_attention<T: KernelFloat>(
         for d in 0..head_dim {
             out_row[d] = T::from_f32(weighted_sum[d]);
         }
+    }
+}
+
+#[inline(always)]
+fn dot_product<T: KernelFloat>(a: &[T], b: &[T]) -> f32 {
+    debug_assert_eq!(a.len(), b.len());
+    match T::TYPE_ID {
+        FloatType::F32 => {
+            // T is f32 in this monomorphized branch.
+            simd_dot_product(a.as_ptr() as *const f32, b.as_ptr() as *const f32, a.len())
+        }
+        _ => a.iter().zip(b.iter()).map(|(x, y)| x.to_f32() * y.to_f32()).sum(),
     }
 }

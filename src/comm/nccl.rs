@@ -9,7 +9,7 @@ use cudarc::driver::{CudaDevice, CudaSlice};
 use cudarc::nccl::{group_end, group_start, Comm, Id, ReduceOp};
 
 use super::traits::{CommError, CommResult, Communicator};
-use crate::kernel_dispatcher::KernelFloat;
+use crate::kernel_types::KernelFloat;
 
 /// NCCL Communicator for multi-GPU ring communication.
 pub struct NcclComm {

@@ -1,8 +1,12 @@
 pub(crate) mod math;
+pub(crate) mod simd_asm;
 
 // Pure Rust numerical stability modules (no external dependencies)
 pub mod softmax;
 pub mod stable_accumulator;
+pub mod attention;
+pub mod paged_attn;
+pub mod matmul;
 
 // Zero-cost NN layer operations (Phase 1 additions)
 pub mod linear;
@@ -38,9 +42,8 @@ pub mod prompt_cache;    // REQ-OP-014: Prompt Caching / CacheBlend
 pub mod flash_tree_attn; // REQ-OP-010: DeFT/Talon Flash Tree-attention
 pub mod chunked_prefill; // REQ-OP-015: Chunked Prefill / POD-Attention
 
-// NOTE: Burn-based attention modules (flash_attention, paged_attention, ring_attention,
-// mamba, mla, etc.) have been removed per ADR-001.
-// Use `KernelDispatcher` for GPU-accelerated attention operations.
+// NOTE: Burn-based attention modules (ring_attention, mamba, mla, etc.) have been removed per ADR-001.
+// Use Backend implementations for GPU-accelerated attention operations.
 
 pub use engram::{Engram, EngramConfig, fuse_engram_attention, fuse_engram_attention_simd};
 pub use engram_hash::{EngramHasher, EngramHashConfig};

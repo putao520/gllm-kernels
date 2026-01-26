@@ -21,6 +21,8 @@
 //! linear_forward(&input, &weight, None, &mut output, 2, 2, 2);
 //! ```
 
+use crate::kernel_types::KernelFloat;
+
 /// Linear forward pass: output = input @ weight^T + bias
 ///
 /// Weight is stored as `[out_features, in_features]` (row-major), so we compute
@@ -156,14 +158,14 @@ pub fn linear_forward_transposed(
 /// * `batch` - Batch size
 /// * `features` - Number of features
 #[inline(always)]
-pub fn add_bias(output: &mut [f32], bias: &[f32], batch: usize, features: usize) {
+pub fn add_bias<T: KernelFloat>(output: &mut [T], bias: &[T], batch: usize, features: usize) {
     debug_assert_eq!(output.len(), batch * features);
     debug_assert_eq!(bias.len(), features);
 
     for b in 0..batch {
         let row = &mut output[b * features..(b + 1) * features];
         for (o, b_val) in row.iter_mut().zip(bias.iter()) {
-            *o += b_val;
+            *o = T::from_f32(o.to_f32() + b_val.to_f32());
         }
     }
 }

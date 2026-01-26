@@ -9,7 +9,27 @@
 //! - FP16: rtol=1e-3, atol=1e-4
 //! - BF16: rtol=1e-2, atol=1e-3
 
-use gllm_kernels::{BackendType, FlashAttentionConfig, KernelDispatcher};
+use gllm_kernels::backend::{Backend, TensorSlice, TensorSliceMut};
+use gllm_kernels::{BackendType, CudaBackend, CpuBackend, FlashAttentionConfig};
+
+fn run_flash_attention<B: Backend>(
+    backend: &B,
+    q: &[f32],
+    k: &[f32],
+    v: &[f32],
+    output: &mut [f32],
+    config: FlashAttentionConfig,
+) {
+    backend
+        .flash_attention(
+            TensorSlice::F32(q),
+            TensorSlice::F32(k),
+            TensorSlice::F32(v),
+            TensorSliceMut::F32(output),
+            config,
+        )
+        .expect("flash_attention failed");
+}
 
 /// Helper to generate deterministic random-like test data.
 fn generate_test_data(size: usize, seed: u64) -> Vec<f32> {
@@ -67,7 +87,7 @@ fn assert_no_nan_inf(data: &[f32], context: &str) {
 /// Test Flash Attention CPU reference implementation produces valid output.
 #[test]
 fn test_flash_attention_cpu_basic() {
-    let dispatcher = KernelDispatcher::with_backend(BackendType::Cpu);
+    let dispatcher = CpuBackend::new();
 
     // Small test case: batch=1, heads=2, seq_len=4, head_dim=8
     let batch = 1;
@@ -93,7 +113,7 @@ fn test_flash_attention_cpu_basic() {
         ..Default::default()
     };
 
-    dispatcher.flash_attention(&q, &k, &v, &mut output, config);
+    run_flash_attention(&dispatcher, &q, &k, &v, &mut output, config);
 
     // Verify no NaN/Inf
     assert_no_nan_inf(&output, "CPU basic output");
@@ -110,7 +130,7 @@ fn test_flash_attention_cpu_basic() {
 /// Test Flash Attention CPU vs CPU consistency (sanity check).
 #[test]
 fn test_flash_attention_cpu_consistency() {
-    let dispatcher = KernelDispatcher::with_backend(BackendType::Cpu);
+    let dispatcher = CpuBackend::new();
 
     let batch = 2;
     let heads = 4;
@@ -138,8 +158,8 @@ fn test_flash_attention_cpu_consistency() {
     let mut output1 = vec![0.0f32; total_size];
     let mut output2 = vec![0.0f32; total_size];
 
-    dispatcher.flash_attention(&q, &k, &v, &mut output1, config.clone());
-    dispatcher.flash_attention(&q, &k, &v, &mut output2, config);
+    run_flash_attention(&dispatcher, &q, &k, &v, &mut output1, config.clone());
+    run_flash_attention(&dispatcher, &q, &k, &v, &mut output2, config);
 
     // Exact equality for deterministic CPU implementation
     assert_eq!(output1, output2, "CPU implementation should be deterministic");
@@ -149,7 +169,7 @@ fn test_flash_attention_cpu_consistency() {
 /// Configuration: batch=2, heads=8, seq_len=1024, head_dim=64
 #[test]
 fn test_flash_attention_spec_config() {
-    let dispatcher = KernelDispatcher::with_backend(BackendType::Cpu);
+    let dispatcher = CpuBackend::new();
 
     // SPEC/06-TESTING-STRATEGY.md configuration
     let batch = 2;
@@ -175,7 +195,7 @@ fn test_flash_attention_spec_config() {
         ..Default::default()
     };
 
-    dispatcher.flash_attention(&q, &k, &v, &mut output, config);
+    run_flash_attention(&dispatcher, &q, &k, &v, &mut output, config);
 
     assert_no_nan_inf(&output, "SPEC config output");
 }
@@ -194,8 +214,8 @@ fn test_flash_attention_cuda_vs_cpu_fp32() {
         return;
     }
 
-    let cpu_dispatcher = KernelDispatcher::with_backend(BackendType::Cpu);
-    let cuda_dispatcher = KernelDispatcher::with_backend(BackendType::Cuda);
+    let cpu_dispatcher = CpuBackend::new();
+    let cuda_dispatcher = CudaBackend::new();
 
     // SPEC configuration
     let batch = 2;
@@ -222,11 +242,11 @@ fn test_flash_attention_cuda_vs_cpu_fp32() {
 
     // CPU reference (Ground Truth)
     let mut cpu_output = vec![0.0f32; total_size];
-    cpu_dispatcher.flash_attention(&q, &k, &v, &mut cpu_output, config.clone());
+    run_flash_attention(&cpu_dispatcher, &q, &k, &v, &mut cpu_output, config.clone());
 
     // CUDA GPU
     let mut cuda_output = vec![0.0f32; total_size];
-    cuda_dispatcher.flash_attention(&q, &k, &v, &mut cuda_output, config);
+    run_flash_attention(&cuda_dispatcher, &q, &k, &v, &mut cuda_output, config);
 
     // FP32 precision: rtol=1e-5, atol=1e-6
     assert_close_f32(
@@ -241,7 +261,7 @@ fn test_flash_attention_cuda_vs_cpu_fp32() {
 /// Test Flash Attention with causal masking.
 #[test]
 fn test_flash_attention_causal_mask() {
-    let dispatcher = KernelDispatcher::with_backend(BackendType::Cpu);
+    let dispatcher = CpuBackend::new();
 
     let batch = 1;
     let heads = 2;
@@ -275,8 +295,8 @@ fn test_flash_attention_causal_mask() {
     let mut output_causal = vec![0.0f32; total_size];
     let mut output_no_causal = vec![0.0f32; total_size];
 
-    dispatcher.flash_attention(&q, &k, &v, &mut output_causal, config_causal);
-    dispatcher.flash_attention(&q, &k, &v, &mut output_no_causal, config_no_causal);
+    run_flash_attention(&dispatcher, &q, &k, &v, &mut output_causal, config_causal);
+    run_flash_attention(&dispatcher, &q, &k, &v, &mut output_no_causal, config_no_causal);
 
     // Results should be different
     assert_ne!(
@@ -292,7 +312,7 @@ fn test_flash_attention_causal_mask() {
 /// Test Flash Attention numerical stability options.
 #[test]
 fn test_flash_attention_stability_options() {
-    let dispatcher = KernelDispatcher::with_backend(BackendType::Cpu);
+    let dispatcher = CpuBackend::new();
 
     let batch = 1;
     let heads = 4;
@@ -336,8 +356,8 @@ fn test_flash_attention_stability_options() {
     let mut output_stable = vec![0.0f32; total_size];
     let mut output_basic = vec![0.0f32; total_size];
 
-    dispatcher.flash_attention(&q, &k, &v, &mut output_stable, config_stable);
-    dispatcher.flash_attention(&q, &k, &v, &mut output_basic, config_basic);
+    run_flash_attention(&dispatcher, &q, &k, &v, &mut output_stable, config_stable);
+    run_flash_attention(&dispatcher, &q, &k, &v, &mut output_basic, config_basic);
 
     // Both should produce valid output (no NaN/Inf)
     assert_no_nan_inf(&output_stable, "Stable config output");

@@ -1,24 +1,4 @@
 use crate::backend_trait::{TensorSlice, TensorSliceMut};
-use crate::kernel_dispatcher::KernelDispatcher;
-use crate::runtime_detection::BackendType;
-
-pub(crate) struct BackendCore {
-    pub(crate) dispatcher: KernelDispatcher,
-    backend_type: BackendType,
-}
-
-impl BackendCore {
-    pub(crate) fn new(backend_type: BackendType) -> Self {
-        Self {
-            dispatcher: KernelDispatcher::with_backend(backend_type),
-            backend_type,
-        }
-    }
-
-    pub(crate) fn backend_type(&self) -> BackendType {
-        self.backend_type
-    }
-}
 
 pub(crate) fn match_float1<R>(
     input: TensorSlice<'_>,

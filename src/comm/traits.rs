@@ -4,7 +4,7 @@
 
 use std::fmt;
 
-use crate::kernel_dispatcher::KernelFloat;
+use crate::kernel_types::KernelFloat;
 
 /// Communication error types.
 #[derive(Debug)]

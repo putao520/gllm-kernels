@@ -124,16 +124,29 @@ impl GpuTensor {
     }
 
     /// Create a temporary tensor from a host slice, using the pool if possible.
-    pub fn from_slice_temp<T: DeviceRepr + crate::types::KernelFloat>(
+    pub fn from_slice_temp<T: DeviceRepr + crate::kernel_types::KernelFloat>(
         data: &[T],
         shape: Vec<usize>,
         dtype: TensorDtype,
         backend: BackendType,
     ) -> Result<Self, String> {
-        let mut tensor = Self::new_temp(shape, dtype, backend)?;
-        let dispatcher = crate::KernelDispatcher::new();
-        dispatcher.upload_to_tensor(data, &mut tensor)?;
-        Ok(tensor)
+        if backend != BackendType::Cpu {
+            return Err(format!(
+                "from_slice_temp only supports CPU backend for now (got {backend:?})"
+            ));
+        }
+        let bytes = unsafe {
+            std::slice::from_raw_parts(
+                data.as_ptr() as *const u8,
+                data.len() * std::mem::size_of::<T>(),
+            )
+        };
+        Ok(Self::new(
+            GpuBuffer::Cpu(Arc::new(bytes.to_vec())),
+            shape,
+            dtype,
+            backend,
+        ))
     }
 
     /// Return the tensor's buffer to the pool.
@@ -177,15 +190,19 @@ impl GpuKVCache {
     ) -> Result<Self, String> {
         let element_size = 4; // Assume f32 for now
         let layer_bytes = batch_size * num_heads * max_len * head_dim * element_size;
+
+        if backend != BackendType::Cpu {
+            return Err(format!(
+                "GpuKVCache currently supports CPU buffers only (got {backend:?})"
+            ));
+        }
         
         let mut keys = Vec::with_capacity(num_layers);
         let mut values = Vec::with_capacity(num_layers);
         
-        // Using dispatcher to allocate persistent buffers
-        let dispatcher = crate::KernelDispatcher::new();
         for _ in 0..num_layers {
-            keys.push(dispatcher.allocate_raw_buffer(layer_bytes)?);
-            values.push(dispatcher.allocate_raw_buffer(layer_bytes)?);
+            keys.push(GpuBuffer::Cpu(Arc::new(vec![0u8; layer_bytes])));
+            values.push(GpuBuffer::Cpu(Arc::new(vec![0u8; layer_bytes])));
         }
 
         Ok(Self {
@@ -207,8 +224,30 @@ impl GpuKVCache {
         new_k: &GpuTensor,
         new_v: &GpuTensor,
     ) -> Result<(), String> {
-        let dispatcher = crate::KernelDispatcher::new();
-        dispatcher.update_kv_cache_gpu(self, layer_idx, new_k, new_v)
+        if self.backend != BackendType::Cpu {
+            return Err(format!(
+                "GpuKVCache update only supports CPU buffers (got {:?})",
+                self.backend
+            ));
+        }
+        if layer_idx >= self.num_layers {
+            return Err(format!(
+                "layer_idx out of range: {} (num_layers={})",
+                layer_idx, self.num_layers
+            ));
+        }
+        let expected_bytes = self.batch_size * self.num_heads * self.max_len * self.head_dim * 4;
+        if new_k.size_in_bytes != expected_bytes || new_v.size_in_bytes != expected_bytes {
+            return Err("KV cache update size mismatch".to_string());
+        }
+        match (&new_k.buffer, &new_v.buffer) {
+            (GpuBuffer::Cpu(k_buf), GpuBuffer::Cpu(v_buf)) => {
+                self.keys[layer_idx] = GpuBuffer::Cpu(k_buf.clone());
+                self.values[layer_idx] = GpuBuffer::Cpu(v_buf.clone());
+                Ok(())
+            }
+            _ => Err("GpuKVCache update expects CPU buffers".to_string()),
+        }
     }
 
     pub fn layer_keys(&self, layer: usize) -> &GpuBuffer {
