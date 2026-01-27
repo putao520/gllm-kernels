@@ -17,6 +17,9 @@ use crate::runtime_detection::BackendType;
 use std::sync::OnceLock;
 
 #[cfg(target_os = "linux")]
+use crate::kernel_types::FloatType;
+
+#[cfg(target_os = "linux")]
 use crate::hip_kernels::{
     find_gpu_agents, is_hsa_available, GpuAgent, HsaBuffer, HsaFlashAttentionKernel,
     HsaPagedAttentionKernel, HsaQueueWrapper,
@@ -458,51 +461,103 @@ fn rocm_softmax<T: KernelFloat>(
 ) -> bool {
     use std::ffi::c_void;
 
-    let input_f32: Vec<f32> = input.iter().map(|x| x.to_f32()).collect();
+    if kernel.has_f16() && T::TYPE_ID == FloatType::F16 {
+        let input_f16: &[half::f16] = unsafe {
+            std::slice::from_raw_parts(input.as_ptr() as *const half::f16, input.len())
+        };
+        let output_f16: &mut [half::f16] = unsafe {
+            std::slice::from_raw_parts_mut(output.as_mut_ptr() as *mut half::f16, output.len())
+        };
 
-    let input_buf = match HsaBuffer::from_slice(agent, &input_f32) {
-        Ok(buf) => buf,
-        Err(e) => {
-            log::debug!("Failed to allocate input buffer: {}", e);
-            return false;
-        }
-    };
-
-    let output_f32 = vec![0.0f32; output.len()];
-    let mut output_buf = match HsaBuffer::from_slice(agent, &output_f32) {
-        Ok(buf) => buf,
-        Err(e) => {
-            log::debug!("Failed to allocate output buffer: {}", e);
-            return false;
-        }
-    };
-
-    let result = kernel.softmax_f32(
-        queue,
-        input_buf.as_ptr() as *const c_void,
-        output_buf.as_mut_ptr() as *mut c_void,
-        num_rows,
-        row_size,
-    );
-
-    match result {
-        Ok(()) => match output_buf.to_vec() {
-            Ok(out_data) => {
-                for (i, val) in out_data.into_iter().enumerate() {
-                    if i < output.len() {
-                        output[i] = T::from_f32(val);
-                    }
-                }
-                true
-            }
+        let input_buf = match HsaBuffer::from_slice(agent, input_f16) {
+            Ok(buf) => buf,
             Err(e) => {
-                log::debug!("Failed to copy output from GPU: {}", e);
+                log::debug!("Failed to allocate f16 input buffer: {}", e);
+                return false;
+            }
+        };
+
+        let output_init = vec![half::f16::ZERO; output.len()];
+        let mut output_buf = match HsaBuffer::from_slice(agent, &output_init) {
+            Ok(buf) => buf,
+            Err(e) => {
+                log::debug!("Failed to allocate f16 output buffer: {}", e);
+                return false;
+            }
+        };
+
+        let result = kernel.softmax_f16(
+            queue,
+            input_buf.as_ptr() as *const c_void,
+            output_buf.as_mut_ptr() as *mut c_void,
+            num_rows,
+            row_size,
+        );
+
+        match result {
+            Ok(()) => match output_buf.to_vec() {
+                Ok(out_data) => {
+                    let copy_len = output_f16.len().min(out_data.len());
+                    output_f16[..copy_len].copy_from_slice(&out_data[..copy_len]);
+                    true
+                }
+                Err(e) => {
+                    log::debug!("Failed to copy f16 softmax output from GPU: {}", e);
+                    false
+                }
+            },
+            Err(e) => {
+                log::debug!("HSA f16 softmax execution failed: {}", e);
                 false
             }
-        },
-        Err(e) => {
-            log::debug!("HSA softmax execution failed: {}", e);
-            false
+        }
+    } else {
+        let input_f32: Vec<f32> = input.iter().map(|x| x.to_f32()).collect();
+
+        let input_buf = match HsaBuffer::from_slice(agent, &input_f32) {
+            Ok(buf) => buf,
+            Err(e) => {
+                log::debug!("Failed to allocate input buffer: {}", e);
+                return false;
+            }
+        };
+
+        let output_f32 = vec![0.0f32; output.len()];
+        let mut output_buf = match HsaBuffer::from_slice(agent, &output_f32) {
+            Ok(buf) => buf,
+            Err(e) => {
+                log::debug!("Failed to allocate output buffer: {}", e);
+                return false;
+            }
+        };
+
+        let result = kernel.softmax_f32(
+            queue,
+            input_buf.as_ptr() as *const c_void,
+            output_buf.as_mut_ptr() as *mut c_void,
+            num_rows,
+            row_size,
+        );
+
+        match result {
+            Ok(()) => match output_buf.to_vec() {
+                Ok(out_data) => {
+                    for (i, val) in out_data.into_iter().enumerate() {
+                        if i < output.len() {
+                            output[i] = T::from_f32(val);
+                        }
+                    }
+                    true
+                }
+                Err(e) => {
+                    log::debug!("Failed to copy output from GPU: {}", e);
+                    false
+                }
+            },
+            Err(e) => {
+                log::debug!("HSA softmax execution failed: {}", e);
+                false
+            }
         }
     }
 }
@@ -1046,72 +1101,189 @@ fn rocm_rope_apply<T: KernelFloat>(
 ) -> bool {
     use std::ffi::c_void;
 
-    let q_f32: Vec<f32> = q.iter().map(|x| x.to_f32()).collect();
-    let k_f32: Vec<f32> = k.iter().map(|x| x.to_f32()).collect();
-
-    let q_buf = match HsaBuffer::from_slice(agent, &q_f32) {
-        Ok(buf) => buf,
-        Err(_) => return false,
-    };
-    let k_buf = match HsaBuffer::from_slice(agent, &k_f32) {
-        Ok(buf) => buf,
-        Err(_) => return false,
-    };
     let cos_buf = match HsaBuffer::from_slice(agent, cos_cache) {
         Ok(buf) => buf,
-        Err(_) => return false,
+        Err(e) => {
+            log::debug!("Failed to allocate cos cache buffer: {}", e);
+            return false;
+        }
     };
     let sin_buf = match HsaBuffer::from_slice(agent, sin_cache) {
         Ok(buf) => buf,
-        Err(_) => return false,
+        Err(e) => {
+            log::debug!("Failed to allocate sin cache buffer: {}", e);
+            return false;
+        }
     };
 
-    let q_out_f32 = vec![0.0f32; q_out.len()];
-    let mut q_out_buf = match HsaBuffer::from_slice(agent, &q_out_f32) {
-        Ok(buf) => buf,
-        Err(_) => return false,
-    };
-    let k_out_f32 = vec![0.0f32; k_out.len()];
-    let mut k_out_buf = match HsaBuffer::from_slice(agent, &k_out_f32) {
-        Ok(buf) => buf,
-        Err(_) => return false,
-    };
+    if kernel.has_f16() && T::TYPE_ID == FloatType::F16 {
+        let q_f16: &[half::f16] = unsafe {
+            std::slice::from_raw_parts(q.as_ptr() as *const half::f16, q.len())
+        };
+        let k_f16: &[half::f16] = unsafe {
+            std::slice::from_raw_parts(k.as_ptr() as *const half::f16, k.len())
+        };
+        let q_out_f16: &mut [half::f16] = unsafe {
+            std::slice::from_raw_parts_mut(q_out.as_mut_ptr() as *mut half::f16, q_out.len())
+        };
+        let k_out_f16: &mut [half::f16] = unsafe {
+            std::slice::from_raw_parts_mut(k_out.as_mut_ptr() as *mut half::f16, k_out.len())
+        };
 
-    let result = kernel.rope_apply_f32(
-        queue,
-        q_buf.as_ptr() as *const c_void,
-        k_buf.as_ptr() as *const c_void,
-        cos_buf.as_ptr() as *const c_void,
-        sin_buf.as_ptr() as *const c_void,
-        q_out_buf.as_mut_ptr() as *mut c_void,
-        k_out_buf.as_mut_ptr() as *mut c_void,
-        batch_size,
-        seq_len,
-        num_q_heads,
-        num_kv_heads,
-        head_dim,
-        position_offset,
-    );
+        let q_buf = match HsaBuffer::from_slice(agent, q_f16) {
+            Ok(buf) => buf,
+            Err(e) => {
+                log::debug!("Failed to allocate f16 Q buffer: {}", e);
+                return false;
+            }
+        };
+        let k_buf = match HsaBuffer::from_slice(agent, k_f16) {
+            Ok(buf) => buf,
+            Err(e) => {
+                log::debug!("Failed to allocate f16 K buffer: {}", e);
+                return false;
+            }
+        };
 
-    match result {
-        Ok(()) => {
-            if let (Ok(q_data), Ok(k_data)) = (q_out_buf.to_vec(), k_out_buf.to_vec()) {
-                for (i, val) in q_data.into_iter().enumerate() {
-                    if i < q_out.len() {
-                        q_out[i] = T::from_f32(val);
+        let q_out_init = vec![half::f16::ZERO; q_out.len()];
+        let mut q_out_buf = match HsaBuffer::from_slice(agent, &q_out_init) {
+            Ok(buf) => buf,
+            Err(e) => {
+                log::debug!("Failed to allocate f16 Q_out buffer: {}", e);
+                return false;
+            }
+        };
+        let k_out_init = vec![half::f16::ZERO; k_out.len()];
+        let mut k_out_buf = match HsaBuffer::from_slice(agent, &k_out_init) {
+            Ok(buf) => buf,
+            Err(e) => {
+                log::debug!("Failed to allocate f16 K_out buffer: {}", e);
+                return false;
+            }
+        };
+
+        let result = kernel.rope_apply_f16(
+            queue,
+            q_buf.as_ptr() as *const c_void,
+            k_buf.as_ptr() as *const c_void,
+            cos_buf.as_ptr() as *const c_void,
+            sin_buf.as_ptr() as *const c_void,
+            q_out_buf.as_mut_ptr() as *mut c_void,
+            k_out_buf.as_mut_ptr() as *mut c_void,
+            batch_size,
+            seq_len,
+            num_q_heads,
+            num_kv_heads,
+            head_dim,
+            position_offset,
+        );
+
+        match result {
+            Ok(()) => {
+                match (q_out_buf.to_vec(), k_out_buf.to_vec()) {
+                    (Ok(q_data), Ok(k_data)) => {
+                        let q_copy_len = q_out_f16.len().min(q_data.len());
+                        q_out_f16[..q_copy_len].copy_from_slice(&q_data[..q_copy_len]);
+                        let k_copy_len = k_out_f16.len().min(k_data.len());
+                        k_out_f16[..k_copy_len].copy_from_slice(&k_data[..k_copy_len]);
+                        true
+                    }
+                    (Err(e), _) => {
+                        log::debug!("Failed to copy f16 RoPE Q output from GPU: {}", e);
+                        false
+                    }
+                    (_, Err(e)) => {
+                        log::debug!("Failed to copy f16 RoPE K output from GPU: {}", e);
+                        false
                     }
                 }
-                for (i, val) in k_data.into_iter().enumerate() {
-                    if i < k_out.len() {
-                        k_out[i] = T::from_f32(val);
-                    }
-                }
-                true
-            } else {
+            }
+            Err(e) => {
+                log::debug!("HSA f16 RoPE apply failed: {}", e);
                 false
             }
-        },
-        Err(_) => false,
+        }
+    } else {
+        let q_f32: Vec<f32> = q.iter().map(|x| x.to_f32()).collect();
+        let k_f32: Vec<f32> = k.iter().map(|x| x.to_f32()).collect();
+
+        let q_buf = match HsaBuffer::from_slice(agent, &q_f32) {
+            Ok(buf) => buf,
+            Err(e) => {
+                log::debug!("Failed to allocate Q buffer: {}", e);
+                return false;
+            }
+        };
+        let k_buf = match HsaBuffer::from_slice(agent, &k_f32) {
+            Ok(buf) => buf,
+            Err(e) => {
+                log::debug!("Failed to allocate K buffer: {}", e);
+                return false;
+            }
+        };
+
+        let q_out_f32 = vec![0.0f32; q_out.len()];
+        let mut q_out_buf = match HsaBuffer::from_slice(agent, &q_out_f32) {
+            Ok(buf) => buf,
+            Err(e) => {
+                log::debug!("Failed to allocate Q_out buffer: {}", e);
+                return false;
+            }
+        };
+        let k_out_f32 = vec![0.0f32; k_out.len()];
+        let mut k_out_buf = match HsaBuffer::from_slice(agent, &k_out_f32) {
+            Ok(buf) => buf,
+            Err(e) => {
+                log::debug!("Failed to allocate K_out buffer: {}", e);
+                return false;
+            }
+        };
+
+        let result = kernel.rope_apply_f32(
+            queue,
+            q_buf.as_ptr() as *const c_void,
+            k_buf.as_ptr() as *const c_void,
+            cos_buf.as_ptr() as *const c_void,
+            sin_buf.as_ptr() as *const c_void,
+            q_out_buf.as_mut_ptr() as *mut c_void,
+            k_out_buf.as_mut_ptr() as *mut c_void,
+            batch_size,
+            seq_len,
+            num_q_heads,
+            num_kv_heads,
+            head_dim,
+            position_offset,
+        );
+
+        match result {
+            Ok(()) => match (q_out_buf.to_vec(), k_out_buf.to_vec()) {
+                (Ok(q_data), Ok(k_data)) => {
+                    for (i, val) in q_data.into_iter().enumerate() {
+                        if i < q_out.len() {
+                            q_out[i] = T::from_f32(val);
+                        }
+                    }
+                    for (i, val) in k_data.into_iter().enumerate() {
+                        if i < k_out.len() {
+                            k_out[i] = T::from_f32(val);
+                        }
+                    }
+                    true
+                }
+                (Err(e), _) => {
+                    log::debug!("Failed to copy RoPE Q output from GPU: {}", e);
+                    false
+                }
+                (_, Err(e)) => {
+                    log::debug!("Failed to copy RoPE K output from GPU: {}", e);
+                    false
+                }
+            },
+            Err(e) => {
+                log::debug!("HSA RoPE apply failed: {}", e);
+                false
+            }
+        }
     }
 }
 
