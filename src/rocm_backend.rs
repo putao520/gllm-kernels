@@ -1186,6 +1186,51 @@ fn rocm_argmax<T: KernelFloat>(
 ) -> Option<Vec<u32>> {
     use std::ffi::c_void;
 
+    if kernel.has_f16() && T::TYPE_ID == FloatType::F16 {
+        let logits_f16: &[half::f16] = unsafe {
+            std::slice::from_raw_parts(logits.as_ptr() as *const half::f16, logits.len())
+        };
+
+        let logits_buf = match HsaBuffer::from_slice(agent, logits_f16) {
+            Ok(buf) => buf,
+            Err(e) => {
+                log::debug!("Failed to allocate f16 logits buffer: {}", e);
+                return None;
+            }
+        };
+
+        let indices = vec![0u32; batch_size];
+        let mut indices_buf = match HsaBuffer::from_slice(agent, &indices) {
+            Ok(buf) => buf,
+            Err(e) => {
+                log::debug!("Failed to allocate indices buffer: {}", e);
+                return None;
+            }
+        };
+
+        let result = kernel.argmax_f16(
+            queue,
+            logits_buf.as_ptr() as *const c_void,
+            indices_buf.as_mut_ptr() as *mut c_void,
+            batch_size,
+            vocab_size,
+        );
+
+        return match result {
+            Ok(()) => match indices_buf.to_vec() {
+                Ok(out_data) => Some(out_data),
+                Err(e) => {
+                    log::debug!("Failed to copy indices from GPU: {}", e);
+                    None
+                }
+            },
+            Err(e) => {
+                log::debug!("HSA argmax f16 execution failed: {}", e);
+                None
+            }
+        };
+    }
+
     let logits_f32: Vec<f32> = logits.iter().map(|x| x.to_f32()).collect();
 
     let logits_buf = match HsaBuffer::from_slice(agent, &logits_f32) {
@@ -1243,6 +1288,76 @@ fn rocm_topk<T: KernelFloat>(
 
     if !kernel.has_topk() {
         return None;
+    }
+
+    if kernel.has_f16() && T::TYPE_ID == FloatType::F16 {
+        let logits_f16: &[half::f16] = unsafe {
+            std::slice::from_raw_parts(logits.as_ptr() as *const half::f16, logits.len())
+        };
+
+        let logits_buf = match HsaBuffer::from_slice(agent, logits_f16) {
+            Ok(buf) => buf,
+            Err(e) => {
+                log::debug!("Failed to allocate f16 logits buffer: {}", e);
+                return None;
+            }
+        };
+
+        let indices = vec![0u32; batch_size * k];
+        let mut indices_buf = match HsaBuffer::from_slice(agent, &indices) {
+            Ok(buf) => buf,
+            Err(e) => {
+                log::debug!("Failed to allocate indices buffer: {}", e);
+                return None;
+            }
+        };
+
+        // TopK values are accumulated as f32 even for f16 logits.
+        let values = vec![0.0f32; batch_size * k];
+        let mut values_buf = match HsaBuffer::from_slice(agent, &values) {
+            Ok(buf) => buf,
+            Err(e) => {
+                log::debug!("Failed to allocate values buffer: {}", e);
+                return None;
+            }
+        };
+
+        let result = kernel.topk_f16(
+            queue,
+            logits_buf.as_ptr() as *const c_void,
+            indices_buf.as_mut_ptr() as *mut c_void,
+            values_buf.as_mut_ptr() as *mut c_void,
+            batch_size,
+            vocab_size,
+            k,
+        );
+
+        return match result {
+            Ok(()) => {
+                let out_indices = match indices_buf.to_vec() {
+                    Ok(data) => data,
+                    Err(e) => {
+                        log::debug!("Failed to copy indices from GPU: {}", e);
+                        return None;
+                    }
+                };
+                let out_values = match values_buf.to_vec() {
+                    Ok(data) => data,
+                    Err(e) => {
+                        log::debug!("Failed to copy values from GPU: {}", e);
+                        return None;
+                    }
+                };
+                Some(TopKResult {
+                    indices: out_indices,
+                    values: out_values,
+                })
+            }
+            Err(e) => {
+                log::debug!("HSA topk f16 execution failed: {}", e);
+                None
+            }
+        };
     }
 
     let logits_f32: Vec<f32> = logits.iter().map(|x| x.to_f32()).collect();
@@ -1303,7 +1418,7 @@ fn rocm_topk<T: KernelFloat>(
                 indices: out_indices,
                 values: out_values,
             })
-        },
+        }
         Err(e) => {
             log::debug!("HSA topk execution failed: {}", e);
             None
