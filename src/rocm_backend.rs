@@ -282,69 +282,204 @@ fn rocm_flash_attention<T: KernelFloat>(
 ) -> bool {
     let agent = kernel.agent();
 
-    let q_f32: Vec<f32> = q.iter().map(|x| x.to_f32()).collect();
-    let k_f32: Vec<f32> = k.iter().map(|x| x.to_f32()).collect();
-    let v_f32: Vec<f32> = v.iter().map(|x| x.to_f32()).collect();
-
-    let q_buf = match HsaBuffer::from_slice(agent, &q_f32) {
-        Ok(buf) => buf,
-        Err(e) => {
-            log::debug!("Failed to allocate Q buffer: {}", e);
-            return false;
-        }
-    };
-    let k_buf = match HsaBuffer::from_slice(agent, &k_f32) {
-        Ok(buf) => buf,
-        Err(e) => {
-            log::debug!("Failed to allocate K buffer: {}", e);
-            return false;
-        }
-    };
-    let v_buf = match HsaBuffer::from_slice(agent, &v_f32) {
-        Ok(buf) => buf,
-        Err(e) => {
-            log::debug!("Failed to allocate V buffer: {}", e);
-            return false;
-        }
-    };
-
     let scale = config.scale.unwrap_or(1.0 / (config.head_dim as f32).sqrt());
     let seq_len = config.seq_len_q;
 
-    let result = kernel.forward_f32(
-        queue,
-        &q_buf,
-        &k_buf,
-        &v_buf,
-        config.batch_size,
-        config.num_heads,
-        seq_len,
-        config.head_dim,
-        config.causal,
-        scale,
-        0,
-    );
+    if T::TYPE_ID == FloatType::F16 {
+        let q_bits: &[u16] = unsafe {
+            std::slice::from_raw_parts(q.as_ptr() as *const u16, q.len())
+        };
+        let k_bits: &[u16] = unsafe {
+            std::slice::from_raw_parts(k.as_ptr() as *const u16, k.len())
+        };
+        let v_bits: &[u16] = unsafe {
+            std::slice::from_raw_parts(v.as_ptr() as *const u16, v.len())
+        };
+        let output_bits: &mut [u16] = unsafe {
+            std::slice::from_raw_parts_mut(output.as_mut_ptr() as *mut u16, output.len())
+        };
 
-    match result {
-        Ok(out_buf) => match out_buf.to_vec() {
-            Ok(out_data) => {
-                for (i, val) in out_data.into_iter().enumerate() {
-                    if i < output.len() {
-                        output[i] = T::from_f32(val);
-                    }
-                }
-                true
-            }
+        let q_buf = match HsaBuffer::from_slice(agent, q_bits) {
+            Ok(buf) => buf,
             Err(e) => {
-                log::debug!("Failed to copy output from GPU: {}", e);
+                log::debug!("Failed to allocate f16 Q buffer: {}", e);
+                return false;
+            }
+        };
+        let k_buf = match HsaBuffer::from_slice(agent, k_bits) {
+            Ok(buf) => buf,
+            Err(e) => {
+                log::debug!("Failed to allocate f16 K buffer: {}", e);
+                return false;
+            }
+        };
+        let v_buf = match HsaBuffer::from_slice(agent, v_bits) {
+            Ok(buf) => buf,
+            Err(e) => {
+                log::debug!("Failed to allocate f16 V buffer: {}", e);
+                return false;
+            }
+        };
+
+        let result = kernel.forward_f16(
+            queue,
+            &q_buf,
+            &k_buf,
+            &v_buf,
+            config.batch_size,
+            config.num_heads,
+            seq_len,
+            config.head_dim,
+            config.causal,
+            scale,
+            0,
+        );
+
+        match result {
+            Ok(out_buf) => match out_buf.to_vec() {
+                Ok(out_data) => {
+                    let copy_len = output_bits.len().min(out_data.len());
+                    output_bits[..copy_len].copy_from_slice(&out_data[..copy_len]);
+                    true
+                }
+                Err(e) => {
+                    log::debug!("Failed to copy f16 output from GPU: {}", e);
+                    false
+                }
+            },
+            Err(e) => {
+                log::debug!("HSA f16 kernel execution failed: {}", e);
                 false
             }
-        },
-        Err(e) => {
-            log::debug!("HSA kernel execution failed: {}", e);
-            false
+        }
+    } else {
+        let q_f32: Vec<f32> = q.iter().map(|x| x.to_f32()).collect();
+        let k_f32: Vec<f32> = k.iter().map(|x| x.to_f32()).collect();
+        let v_f32: Vec<f32> = v.iter().map(|x| x.to_f32()).collect();
+
+        let q_buf = match HsaBuffer::from_slice(agent, &q_f32) {
+            Ok(buf) => buf,
+            Err(e) => {
+                log::debug!("Failed to allocate Q buffer: {}", e);
+                return false;
+            }
+        };
+        let k_buf = match HsaBuffer::from_slice(agent, &k_f32) {
+            Ok(buf) => buf,
+            Err(e) => {
+                log::debug!("Failed to allocate K buffer: {}", e);
+                return false;
+            }
+        };
+        let v_buf = match HsaBuffer::from_slice(agent, &v_f32) {
+            Ok(buf) => buf,
+            Err(e) => {
+                log::debug!("Failed to allocate V buffer: {}", e);
+                return false;
+            }
+        };
+
+        let result = kernel.forward_f32(
+            queue,
+            &q_buf,
+            &k_buf,
+            &v_buf,
+            config.batch_size,
+            config.num_heads,
+            seq_len,
+            config.head_dim,
+            config.causal,
+            scale,
+            0,
+        );
+
+        match result {
+            Ok(out_buf) => match out_buf.to_vec() {
+                Ok(out_data) => {
+                    for (i, val) in out_data.into_iter().enumerate() {
+                        if i < output.len() {
+                            output[i] = T::from_f32(val);
+                        }
+                    }
+                    true
+                }
+                Err(e) => {
+                    log::debug!("Failed to copy output from GPU: {}", e);
+                    false
+                }
+            },
+            Err(e) => {
+                log::debug!("HSA kernel execution failed: {}", e);
+                false
+            }
         }
     }
+}
+
+/// Build paged attention layout and block metadata without dtype conversion.
+#[cfg(target_os = "linux")]
+fn rocm_build_paged_metadata<T: KernelFloat>(
+    q: &[T],
+    k_cache: &[T],
+    v_cache: &[T],
+    page_table: &[u32],
+    seq_lens: &[u32],
+    output_len: usize,
+    config: &PagedAttentionConfig,
+) -> Option<(crate::ops::paged_attn::PagedAttentionLayout, Vec<i32>, Vec<i32>)> {
+    let layout = crate::ops::paged_attn::build_paged_layout(
+        q,
+        k_cache,
+        v_cache,
+        page_table,
+        seq_lens,
+        output_len,
+        config,
+    )?;
+
+    let kv_len = seq_lens[0] as usize;
+    if seq_lens.iter().any(|&len| len as usize != kv_len) {
+        log::debug!("Paged attention: GPU kernels require uniform seq_lens");
+        return None;
+    }
+    if kv_len != layout.max_kv_len {
+        log::debug!("Paged attention: GPU kernels require packed page_table");
+        return None;
+    }
+    if kv_len < layout.seq_len {
+        log::warn!("Paged attention: kv_len shorter than seq_len");
+        return None;
+    }
+
+    let offset = kv_len - layout.seq_len;
+    let offset_i32 = match i32::try_from(offset) {
+        Ok(value) => value,
+        Err(_) => {
+            log::warn!("Paged attention: block offset exceeds i32");
+            return None;
+        }
+    };
+    let block_offsets = vec![offset_i32; layout.batch_size];
+
+    let max_block_id = page_table.iter().copied().max().unwrap_or(0) as usize;
+    if max_block_id >= layout.num_blocks {
+        log::warn!("Paged attention: page_table references invalid block id");
+        return None;
+    }
+
+    let block_tables: Vec<i32> = match page_table
+        .iter()
+        .map(|&value| i32::try_from(value).ok())
+        .collect::<Option<Vec<_>>>()
+    {
+        Some(values) => values,
+        None => {
+            log::warn!("Paged attention: page_table value exceeds i32");
+            return None;
+        }
+    };
+
+    Some((layout, block_tables, block_offsets))
 }
 
 /// ROCm/HSA paged attention dispatch.
@@ -361,89 +496,185 @@ fn rocm_paged_attention<T: KernelFloat>(
     output: &mut [T],
     config: &PagedAttentionConfig,
 ) -> bool {
-    let inputs = match crate::ops::paged_attn::build_paged_gpu_inputs(
-        q,
-        k_cache,
-        v_cache,
-        page_table,
-        seq_lens,
-        output.len(),
-        config,
-    ) {
-        Some(inputs) => inputs,
-        None => return false,
-    };
-
     let agent = kernel.agent();
 
-    let q_buf = match HsaBuffer::from_slice(agent, &inputs.q_f32) {
-        Ok(buf) => buf,
-        Err(e) => {
-            log::debug!("Failed to allocate Q buffer: {}", e);
-            return false;
-        }
-    };
-    let k_buf = match HsaBuffer::from_slice(agent, &inputs.k_f32) {
-        Ok(buf) => buf,
-        Err(e) => {
-            log::debug!("Failed to allocate K buffer: {}", e);
-            return false;
-        }
-    };
-    let v_buf = match HsaBuffer::from_slice(agent, &inputs.v_f32) {
-        Ok(buf) => buf,
-        Err(e) => {
-            log::debug!("Failed to allocate V buffer: {}", e);
-            return false;
-        }
-    };
-    let table_buf = match HsaBuffer::from_slice(agent, &inputs.block_tables) {
-        Ok(buf) => buf,
-        Err(e) => {
-            log::debug!("Failed to allocate block_tables buffer: {}", e);
-            return false;
-        }
-    };
-    let offsets_buf = match HsaBuffer::from_slice(agent, &inputs.block_offsets) {
-        Ok(buf) => buf,
-        Err(e) => {
-            log::debug!("Failed to allocate block_offsets buffer: {}", e);
-            return false;
-        }
-    };
+    if T::TYPE_ID == FloatType::F16 {
+        let (layout, block_tables, block_offsets) = match rocm_build_paged_metadata(
+            q,
+            k_cache,
+            v_cache,
+            page_table,
+            seq_lens,
+            output.len(),
+            config,
+        ) {
+            Some(values) => values,
+            None => return false,
+        };
 
-    let result = kernel.forward_f32(
-        queue,
-        &q_buf,
-        &k_buf,
-        &v_buf,
-        &table_buf,
-        &offsets_buf,
-        inputs.layout.batch_size,
-        inputs.layout.num_heads,
-        inputs.layout.head_dim,
-        inputs.layout.page_size,
-        inputs.layout.seq_len,
-    );
+        let q_bits: &[u16] = unsafe {
+            std::slice::from_raw_parts(q.as_ptr() as *const u16, q.len())
+        };
+        let k_bits: &[u16] = unsafe {
+            std::slice::from_raw_parts(k_cache.as_ptr() as *const u16, k_cache.len())
+        };
+        let v_bits: &[u16] = unsafe {
+            std::slice::from_raw_parts(v_cache.as_ptr() as *const u16, v_cache.len())
+        };
+        let output_bits: &mut [u16] = unsafe {
+            std::slice::from_raw_parts_mut(output.as_mut_ptr() as *mut u16, output.len())
+        };
 
-    match result {
-        Ok(out_buf) => match out_buf.to_vec() {
-            Ok(out_data) => {
-                for (i, value) in out_data.into_iter().enumerate() {
-                    if i < output.len() {
-                        output[i] = T::from_f32(value);
-                    }
-                }
-                true
-            }
+        let q_buf = match HsaBuffer::from_slice(agent, q_bits) {
+            Ok(buf) => buf,
             Err(e) => {
-                log::debug!("Failed to copy output from GPU: {}", e);
+                log::debug!("Failed to allocate f16 Q buffer: {}", e);
+                return false;
+            }
+        };
+        let k_buf = match HsaBuffer::from_slice(agent, k_bits) {
+            Ok(buf) => buf,
+            Err(e) => {
+                log::debug!("Failed to allocate f16 K buffer: {}", e);
+                return false;
+            }
+        };
+        let v_buf = match HsaBuffer::from_slice(agent, v_bits) {
+            Ok(buf) => buf,
+            Err(e) => {
+                log::debug!("Failed to allocate f16 V buffer: {}", e);
+                return false;
+            }
+        };
+        let table_buf = match HsaBuffer::from_slice(agent, &block_tables) {
+            Ok(buf) => buf,
+            Err(e) => {
+                log::debug!("Failed to allocate block_tables buffer: {}", e);
+                return false;
+            }
+        };
+        let offsets_buf = match HsaBuffer::from_slice(agent, &block_offsets) {
+            Ok(buf) => buf,
+            Err(e) => {
+                log::debug!("Failed to allocate block_offsets buffer: {}", e);
+                return false;
+            }
+        };
+
+        let result = kernel.forward_f16(
+            queue,
+            &q_buf,
+            &k_buf,
+            &v_buf,
+            &table_buf,
+            &offsets_buf,
+            layout.batch_size,
+            layout.num_heads,
+            layout.head_dim,
+            layout.page_size,
+            layout.seq_len,
+        );
+
+        match result {
+            Ok(out_buf) => match out_buf.to_vec() {
+                Ok(out_data) => {
+                    let copy_len = output_bits.len().min(out_data.len());
+                    output_bits[..copy_len].copy_from_slice(&out_data[..copy_len]);
+                    true
+                }
+                Err(e) => {
+                    log::debug!("Failed to copy f16 output from GPU: {}", e);
+                    false
+                }
+            },
+            Err(e) => {
+                log::debug!("HSA f16 paged kernel execution failed: {}", e);
                 false
             }
-        },
-        Err(e) => {
-            log::debug!("HSA paged kernel execution failed: {}", e);
-            false
+        }
+    } else {
+        let inputs = match crate::ops::paged_attn::build_paged_gpu_inputs(
+            q,
+            k_cache,
+            v_cache,
+            page_table,
+            seq_lens,
+            output.len(),
+            config,
+        ) {
+            Some(inputs) => inputs,
+            None => return false,
+        };
+
+        let q_buf = match HsaBuffer::from_slice(agent, &inputs.q_f32) {
+            Ok(buf) => buf,
+            Err(e) => {
+                log::debug!("Failed to allocate Q buffer: {}", e);
+                return false;
+            }
+        };
+        let k_buf = match HsaBuffer::from_slice(agent, &inputs.k_f32) {
+            Ok(buf) => buf,
+            Err(e) => {
+                log::debug!("Failed to allocate K buffer: {}", e);
+                return false;
+            }
+        };
+        let v_buf = match HsaBuffer::from_slice(agent, &inputs.v_f32) {
+            Ok(buf) => buf,
+            Err(e) => {
+                log::debug!("Failed to allocate V buffer: {}", e);
+                return false;
+            }
+        };
+        let table_buf = match HsaBuffer::from_slice(agent, &inputs.block_tables) {
+            Ok(buf) => buf,
+            Err(e) => {
+                log::debug!("Failed to allocate block_tables buffer: {}", e);
+                return false;
+            }
+        };
+        let offsets_buf = match HsaBuffer::from_slice(agent, &inputs.block_offsets) {
+            Ok(buf) => buf,
+            Err(e) => {
+                log::debug!("Failed to allocate block_offsets buffer: {}", e);
+                return false;
+            }
+        };
+
+        let result = kernel.forward_f32(
+            queue,
+            &q_buf,
+            &k_buf,
+            &v_buf,
+            &table_buf,
+            &offsets_buf,
+            inputs.layout.batch_size,
+            inputs.layout.num_heads,
+            inputs.layout.head_dim,
+            inputs.layout.page_size,
+            inputs.layout.seq_len,
+        );
+
+        match result {
+            Ok(out_buf) => match out_buf.to_vec() {
+                Ok(out_data) => {
+                    for (i, value) in out_data.into_iter().enumerate() {
+                        if i < output.len() {
+                            output[i] = T::from_f32(value);
+                        }
+                    }
+                    true
+                }
+                Err(e) => {
+                    log::debug!("Failed to copy output from GPU: {}", e);
+                    false
+                }
+            },
+            Err(e) => {
+                log::debug!("HSA paged kernel execution failed: {}", e);
+                false
+            }
         }
     }
 }
