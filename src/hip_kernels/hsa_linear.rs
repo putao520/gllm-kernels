@@ -1,13 +1,12 @@
 use std::ffi::{c_void, CString};
 use std::ptr;
-use std::sync::Arc;
 
 use super::hsa_runtime::{
     get_hsa_lib, get_error_string, GpuAgent, HsaCodeObjectReader,
     HsaExecutable, HSA_STATUS_SUCCESS,
 };
-use super::hsa_flash_attn::{HsaBuffer, HsaQueueWrapper, HsaFlashAttentionError};
-use crate::wgpu_kernels::LinearParams;
+use super::hsa_flash_attn::{HsaQueueWrapper, HsaFlashAttentionError};
+use crate::kernel_types::LinearParams;
 
 const KERNEL_NAME: &str = "linear_forward_kernel";
 const PRECOMPILED_HSACO: &[u8] = include_bytes!("kernels/linear.hsaco");
@@ -273,3 +272,6 @@ impl Drop for HsaLinear {
         }
     }
 }
+
+/// Backward-compatible alias that matches the kernel naming convention used by other modules.
+pub type HsaLinearKernel = HsaLinear;

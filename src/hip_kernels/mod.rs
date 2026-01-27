@@ -36,6 +36,16 @@ pub mod hsa_flash_attn;
 pub mod hsa_paged_attn;
 pub mod hsa_embedding_ops;
 
+// Core operator kernels
+pub mod hsa_softmax;
+pub mod hsa_sampling;
+pub mod hsa_moe_route;
+pub mod hsa_rope;
+pub mod hsa_quantized;
+pub mod hsa_rms_norm;
+pub mod hsa_linear;
+pub mod hsa_silu;
+
 // Inference optimization kernels (REQ-OP-008 ~ REQ-OP-015)
 pub mod hsa_eagle3;
 pub mod hsa_spec_ee;
@@ -56,6 +66,16 @@ pub use hsa_flash_attn::{
 };
 pub use hsa_paged_attn::{HsaPagedAttentionError, HsaPagedAttentionKernel};
 pub use hsa_embedding_ops::{HsaEmbeddingOpsError, HsaEmbeddingOpsKernel};
+
+// Core operator kernel exports
+pub use hsa_softmax::{HsaSoftmaxError, HsaSoftmaxKernel};
+pub use hsa_sampling::{HsaSamplingError, HsaSamplingKernel};
+pub use hsa_moe_route::{HsaMoeRouteError, HsaMoeRouteKernel};
+pub use hsa_rope::{HsaRoPEError, HsaRoPEKernel};
+pub use hsa_quantized::{HsaQuantizedError, HsaQuantizedKernel};
+pub use hsa_rms_norm::HsaRmsNormKernel;
+pub use hsa_linear::HsaLinearKernel;
+pub use hsa_silu::HsaSiluKernel;
 
 // Inference optimization kernels exports
 pub use hsa_eagle3::{HsaEagle3Error, HsaEagle3Kernel, HsaEagle3Config};
