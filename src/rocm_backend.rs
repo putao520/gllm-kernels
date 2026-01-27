@@ -1650,51 +1650,105 @@ fn rocm_rope_apply_inplace<T: KernelFloat>(
 ) -> bool {
     use std::ffi::c_void;
 
-    if !kernel.has_inplace() {
-        return false;
-    }
-
-    let x_f32: Vec<f32> = x.iter().map(|v| v.to_f32()).collect();
-
-    let mut x_buf = match HsaBuffer::from_slice(agent, &x_f32) {
-        Ok(buf) => buf,
-        Err(_) => return false,
-    };
     let cos_buf = match HsaBuffer::from_slice(agent, cos_cache) {
         Ok(buf) => buf,
-        Err(_) => return false,
+        Err(e) => {
+            log::debug!("Failed to allocate cos cache buffer: {}", e);
+            return false;
+        }
     };
     let sin_buf = match HsaBuffer::from_slice(agent, sin_cache) {
         Ok(buf) => buf,
-        Err(_) => return false,
+        Err(e) => {
+            log::debug!("Failed to allocate sin cache buffer: {}", e);
+            return false;
+        }
     };
 
-    let result = kernel.rope_apply_inplace_f32(
-        queue,
-        x_buf.as_mut_ptr() as *mut c_void,
-        cos_buf.as_ptr() as *const c_void,
-        sin_buf.as_ptr() as *const c_void,
-        batch_size,
-        seq_len,
-        num_heads,
-        head_dim,
-        position_offset,
-    );
+    if kernel.has_inplace_f16() && T::TYPE_ID == FloatType::F16 {
+        let x_f16: &mut [half::f16] = unsafe {
+            std::slice::from_raw_parts_mut(x.as_mut_ptr() as *mut half::f16, x.len())
+        };
 
-    match result {
-        Ok(()) => {
-            if let Ok(out_data) = x_buf.to_vec() {
-                for (i, val) in out_data.into_iter().enumerate() {
-                    if i < x.len() {
-                        x[i] = T::from_f32(val);
-                    }
+        let mut x_buf = match HsaBuffer::from_slice(agent, &*x_f16) {
+            Ok(buf) => buf,
+            Err(e) => {
+                log::debug!("Failed to allocate f16 inplace RoPE buffer: {}", e);
+                return false;
+            }
+        };
+
+        let result = kernel.rope_apply_inplace_f16(
+            queue,
+            x_buf.as_mut_ptr() as *mut c_void,
+            cos_buf.as_ptr() as *const c_void,
+            sin_buf.as_ptr() as *const c_void,
+            batch_size,
+            seq_len,
+            num_heads,
+            head_dim,
+            position_offset,
+        );
+
+        match result {
+            Ok(()) => match x_buf.to_vec() {
+                Ok(out_data) => {
+                    let copy_len = x_f16.len().min(out_data.len());
+                    x_f16[..copy_len].copy_from_slice(&out_data[..copy_len]);
+                    true
                 }
-                true
-            } else {
+                Err(e) => {
+                    log::debug!("Failed to copy f16 inplace RoPE output from GPU: {}", e);
+                    false
+                }
+            },
+            Err(e) => {
+                log::debug!("HSA f16 inplace RoPE apply failed: {}", e);
                 false
             }
-        },
-        Err(_) => false,
+        }
+    } else {
+        if !kernel.has_inplace() {
+            return false;
+        }
+
+        let x_f32: Vec<f32> = x.iter().map(|v| v.to_f32()).collect();
+
+        let mut x_buf = match HsaBuffer::from_slice(agent, &x_f32) {
+            Ok(buf) => buf,
+            Err(e) => {
+                log::debug!("Failed to allocate inplace RoPE buffer: {}", e);
+                return false;
+            }
+        };
+
+        let result = kernel.rope_apply_inplace_f32(
+            queue,
+            x_buf.as_mut_ptr() as *mut c_void,
+            cos_buf.as_ptr() as *const c_void,
+            sin_buf.as_ptr() as *const c_void,
+            batch_size,
+            seq_len,
+            num_heads,
+            head_dim,
+            position_offset,
+        );
+
+        match result {
+            Ok(()) => {
+                if let Ok(out_data) = x_buf.to_vec() {
+                    for (i, val) in out_data.into_iter().enumerate() {
+                        if i < x.len() {
+                            x[i] = T::from_f32(val);
+                        }
+                    }
+                    true
+                } else {
+                    false
+                }
+            }
+            Err(_) => false,
+        }
     }
 }
 
@@ -1721,11 +1775,6 @@ fn rocm_q4_matmul(
         Ok(buf) => buf,
         Err(_) => return None,
     };
-    let scales_f32: Vec<f32> = scales.iter().map(|s| s.to_f32()).collect();
-    let scales_buf = match HsaBuffer::from_slice(agent, &scales_f32) {
-        Ok(buf) => buf,
-        Err(_) => return None,
-    };
 
     let output = vec![0.0f32; m * n];
     let mut output_buf = match HsaBuffer::from_slice(agent, &output) {
@@ -1733,18 +1782,44 @@ fn rocm_q4_matmul(
         Err(_) => return None,
     };
 
-    // For symmetric quantization, zeros are not needed (pass null)
-    // Group size 32 is typical for Q4 block-based quantization
-    let result = kernel.q4_matmul_f32(
-        queue,
-        input_buf.as_ptr() as *const c_void,
-        weight_buf.as_ptr() as *const c_void,
-        scales_buf.as_ptr() as *const c_void,
-        std::ptr::null(), // zeros_ptr - symmetric quantization
-        output_buf.as_mut_ptr() as *mut c_void,
-        m, k, n,
-        32, // group_size
-    );
+    // For symmetric quantization, zeros are not needed (pass null).
+    // Group size 32 is typical for Q4 block-based quantization.
+    let result = if kernel.has_f16() {
+        let scales_buf = match HsaBuffer::from_slice(agent, scales) {
+            Ok(buf) => buf,
+            Err(_) => return None,
+        };
+        kernel.q4_matmul_f16(
+            queue,
+            input_buf.as_ptr() as *const c_void,
+            weight_buf.as_ptr() as *const c_void,
+            scales_buf.as_ptr() as *const c_void,
+            std::ptr::null(),
+            output_buf.as_mut_ptr() as *mut c_void,
+            m,
+            k,
+            n,
+            32,
+        )
+    } else {
+        let scales_f32: Vec<f32> = scales.iter().map(|s| s.to_f32()).collect();
+        let scales_buf = match HsaBuffer::from_slice(agent, &scales_f32) {
+            Ok(buf) => buf,
+            Err(_) => return None,
+        };
+        kernel.q4_matmul_f32(
+            queue,
+            input_buf.as_ptr() as *const c_void,
+            weight_buf.as_ptr() as *const c_void,
+            scales_buf.as_ptr() as *const c_void,
+            std::ptr::null(),
+            output_buf.as_mut_ptr() as *mut c_void,
+            m,
+            k,
+            n,
+            32,
+        )
+    };
 
     match result {
         Ok(()) => output_buf.to_vec().ok(),
@@ -1781,11 +1856,6 @@ fn rocm_q8_matmul(
         Ok(buf) => buf,
         Err(_) => return None,
     };
-    let scales_f32: Vec<f32> = scales.iter().map(|s| s.to_f32()).collect();
-    let scales_buf = match HsaBuffer::from_slice(agent, &scales_f32) {
-        Ok(buf) => buf,
-        Err(_) => return None,
-    };
 
     let output = vec![0.0f32; m * n];
     let mut output_buf = match HsaBuffer::from_slice(agent, &output) {
@@ -1793,18 +1863,44 @@ fn rocm_q8_matmul(
         Err(_) => return None,
     };
 
-    // For symmetric quantization, zeros are not needed (pass null)
-    // Group size 32 is typical for Q8 block-based quantization
-    let result = kernel.q8_matmul_f32(
-        queue,
-        input_buf.as_ptr() as *const c_void,
-        weight_buf.as_ptr() as *const c_void,
-        scales_buf.as_ptr() as *const c_void,
-        std::ptr::null(), // zeros_ptr - symmetric quantization
-        output_buf.as_mut_ptr() as *mut c_void,
-        m, k, n,
-        32, // group_size
-    );
+    // For symmetric quantization, zeros are not needed (pass null).
+    // Group size 32 is typical for Q8 block-based quantization.
+    let result = if kernel.has_f16() {
+        let scales_buf = match HsaBuffer::from_slice(agent, scales) {
+            Ok(buf) => buf,
+            Err(_) => return None,
+        };
+        kernel.q8_matmul_f16(
+            queue,
+            input_buf.as_ptr() as *const c_void,
+            weight_buf.as_ptr() as *const c_void,
+            scales_buf.as_ptr() as *const c_void,
+            std::ptr::null(),
+            output_buf.as_mut_ptr() as *mut c_void,
+            m,
+            k,
+            n,
+            32,
+        )
+    } else {
+        let scales_f32: Vec<f32> = scales.iter().map(|s| s.to_f32()).collect();
+        let scales_buf = match HsaBuffer::from_slice(agent, &scales_f32) {
+            Ok(buf) => buf,
+            Err(_) => return None,
+        };
+        kernel.q8_matmul_f32(
+            queue,
+            input_buf.as_ptr() as *const c_void,
+            weight_buf.as_ptr() as *const c_void,
+            scales_buf.as_ptr() as *const c_void,
+            std::ptr::null(),
+            output_buf.as_mut_ptr() as *mut c_void,
+            m,
+            k,
+            n,
+            32,
+        )
+    };
 
     match result {
         Ok(()) => output_buf.to_vec().ok(),
@@ -2127,11 +2223,6 @@ fn rocm_awq_matmul(
         Ok(buf) => buf,
         Err(_) => return None,
     };
-    let scales_f32: Vec<f32> = scales.iter().map(|s| s.to_f32()).collect();
-    let scales_buf = match HsaBuffer::from_slice(agent, &scales_f32) {
-        Ok(buf) => buf,
-        Err(_) => return None,
-    };
 
     let output = vec![0.0f32; m * n];
     let mut output_buf = match HsaBuffer::from_slice(agent, &output) {
@@ -2142,14 +2233,40 @@ fn rocm_awq_matmul(
     // Note: AWQ kernel takes scales but not separate zeros
     // (zeros are packed with weights in AWQ format)
     let _ = &zeros_buf; // Keep allocation but unused in current kernel
-    let result = kernel.awq_matmul_f32(
-        queue,
-        input_buf.as_ptr() as *const c_void,
-        weight_buf.as_ptr() as *const c_void,
-        scales_buf.as_ptr() as *const c_void,
-        output_buf.as_mut_ptr() as *mut c_void,
-        m, k, n, group_size,
-    );
+    let result = if kernel.has_f16() {
+        let scales_buf = match HsaBuffer::from_slice(agent, scales) {
+            Ok(buf) => buf,
+            Err(_) => return None,
+        };
+        kernel.awq_matmul_f16(
+            queue,
+            input_buf.as_ptr() as *const c_void,
+            weight_buf.as_ptr() as *const c_void,
+            scales_buf.as_ptr() as *const c_void,
+            output_buf.as_mut_ptr() as *mut c_void,
+            m,
+            k,
+            n,
+            group_size,
+        )
+    } else {
+        let scales_f32: Vec<f32> = scales.iter().map(|s| s.to_f32()).collect();
+        let scales_buf = match HsaBuffer::from_slice(agent, &scales_f32) {
+            Ok(buf) => buf,
+            Err(_) => return None,
+        };
+        kernel.awq_matmul_f32(
+            queue,
+            input_buf.as_ptr() as *const c_void,
+            weight_buf.as_ptr() as *const c_void,
+            scales_buf.as_ptr() as *const c_void,
+            output_buf.as_mut_ptr() as *mut c_void,
+            m,
+            k,
+            n,
+            group_size,
+        )
+    };
 
     match result {
         Ok(()) => output_buf.to_vec().ok(),
@@ -2171,13 +2288,8 @@ fn rocm_moe_route<T: KernelFloat>(
 ) -> Option<MoERoutingResult> {
     use std::ffi::c_void;
 
-    let hidden_f32: Vec<f32> = hidden_states.iter().map(|x| x.to_f32()).collect();
     let num_tokens = batch_size * seq_len;
 
-    let hidden_buf = match HsaBuffer::from_slice(agent, &hidden_f32) {
-        Ok(buf) => buf,
-        Err(_) => return None,
-    };
     let gate_buf = match HsaBuffer::from_slice(agent, gate_weights) {
         Ok(buf) => buf,
         Err(_) => return None,
@@ -2195,31 +2307,83 @@ fn rocm_moe_route<T: KernelFloat>(
         Err(_) => return None,
     };
 
-    let result = kernel.moe_route_f32(
-        queue,
-        hidden_buf.as_ptr() as *const c_void,
-        gate_buf.as_ptr() as *const c_void,
-        indices_buf.as_mut_ptr() as *mut c_void,
-        weights_buf.as_mut_ptr() as *mut c_void,
-        num_tokens,
-        config.hidden_size,
-        config.num_experts,
-        config.num_experts_per_tok,
-    );
+    if kernel.has_f16() && T::TYPE_ID == FloatType::F16 {
+        let hidden_f16: &[half::f16] = unsafe {
+            std::slice::from_raw_parts(
+                hidden_states.as_ptr() as *const half::f16,
+                hidden_states.len(),
+            )
+        };
+        let hidden_buf = match HsaBuffer::from_slice(agent, hidden_f16) {
+            Ok(buf) => buf,
+            Err(e) => {
+                log::debug!("Failed to allocate f16 MoE hidden buffer: {e}");
+                return None;
+            }
+        };
 
-    match result {
-        Ok(()) => {
-            let out_indices = indices_buf.to_vec().ok()?;
-            let out_weights = weights_buf.to_vec().ok()?;
+        let result = kernel.moe_route_f16(
+            queue,
+            hidden_buf.as_ptr() as *const c_void,
+            gate_buf.as_ptr() as *const c_void,
+            indices_buf.as_mut_ptr() as *mut c_void,
+            weights_buf.as_mut_ptr() as *mut c_void,
+            num_tokens,
+            config.hidden_size,
+            config.num_experts,
+            config.num_experts_per_tok,
+        );
 
-            Some(MoERoutingResult {
-                expert_indices: out_indices,
-                expert_weights: out_weights,
-                num_tokens,
-                top_k: config.num_experts_per_tok,
-            })
-        },
-        Err(_) => None,
+        match result {
+            Ok(()) => {
+                let out_indices = indices_buf.to_vec().ok()?;
+                let out_weights = weights_buf.to_vec().ok()?;
+
+                Some(MoERoutingResult {
+                    expert_indices: out_indices,
+                    expert_weights: out_weights,
+                    num_tokens,
+                    top_k: config.num_experts_per_tok,
+                })
+            }
+            Err(e) => {
+                log::debug!("ROCm moe_route f16 kernel execution failed: {e}");
+                None
+            }
+        }
+    } else {
+        let hidden_f32: Vec<f32> = hidden_states.iter().map(|x| x.to_f32()).collect();
+        let hidden_buf = match HsaBuffer::from_slice(agent, &hidden_f32) {
+            Ok(buf) => buf,
+            Err(_) => return None,
+        };
+
+        let result = kernel.moe_route_f32(
+            queue,
+            hidden_buf.as_ptr() as *const c_void,
+            gate_buf.as_ptr() as *const c_void,
+            indices_buf.as_mut_ptr() as *mut c_void,
+            weights_buf.as_mut_ptr() as *mut c_void,
+            num_tokens,
+            config.hidden_size,
+            config.num_experts,
+            config.num_experts_per_tok,
+        );
+
+        match result {
+            Ok(()) => {
+                let out_indices = indices_buf.to_vec().ok()?;
+                let out_weights = weights_buf.to_vec().ok()?;
+
+                Some(MoERoutingResult {
+                    expert_indices: out_indices,
+                    expert_weights: out_weights,
+                    num_tokens,
+                    top_k: config.num_experts_per_tok,
+                })
+            }
+            Err(_) => None,
+        }
     }
 }
 

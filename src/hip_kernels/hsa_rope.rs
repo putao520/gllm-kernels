@@ -482,6 +482,91 @@ impl HsaRoPEKernel {
         Ok(())
     }
 
+    /// Apply RoPE in-place to a single tensor (f16).
+    pub fn rope_apply_inplace_f16(
+        &self,
+        queue: &HsaQueueWrapper,
+        x_ptr: *mut c_void,
+        cos_cache_ptr: *const c_void,
+        sin_cache_ptr: *const c_void,
+        batch_size: usize,
+        seq_len: usize,
+        num_heads: usize,
+        head_dim: usize,
+        position_offset: usize,
+    ) -> Result<(), HsaRoPEError> {
+        if self.rope_inplace_f16_kernel == 0 {
+            return Err(HsaRoPEError::HsaError(
+                "Inplace RoPE f16 kernel not available".to_string(),
+            ));
+        }
+
+        let lib = get_hsa_lib().map_err(|e| HsaRoPEError::HsaError(e.to_string()))?;
+
+        let mut kernarg_ptr: *mut c_void = ptr::null_mut();
+        unsafe {
+            (lib.hsa_memory_allocate)(
+                self.agent.kernarg_region,
+                self.inplace_kernarg_size as usize,
+                &mut kernarg_ptr,
+            );
+
+            let args = RoPEInplaceArgs {
+                x_ptr,
+                cos_cache_ptr,
+                sin_cache_ptr,
+                batch_size: batch_size as i32,
+                seq_len: seq_len as i32,
+                num_heads: num_heads as i32,
+                head_dim: head_dim as i32,
+                position_offset: position_offset as i32,
+            };
+
+            ptr::copy_nonoverlapping(&args, kernarg_ptr as *mut RoPEInplaceArgs, 1);
+        }
+
+        let half_head_dim = head_dim / 2;
+        let total_elements = batch_size * seq_len * num_heads * half_head_dim;
+        let num_blocks = (total_elements + 255) / 256;
+
+        unsafe {
+            queue.reset_signal();
+            let write_index = (lib.hsa_queue_add_write_index_relaxed)(queue.queue(), 1);
+            let packet_ptr =
+                (queue.queue() as *mut u8).add((write_index % 4096) as usize * 64)
+                    as *mut HsaKernelDispatchPacket;
+
+            let packet = HsaKernelDispatchPacket {
+                header: (1 << 0) | (2 << 9) | (2 << 11),
+                setup: 1 << 0,
+                workgroup_size_x: 256,
+                workgroup_size_y: 1,
+                workgroup_size_z: 1,
+                reserved0: 0,
+                grid_size_x: (num_blocks * 256) as u32,
+                grid_size_y: 1,
+                grid_size_z: 1,
+                private_segment_size: 0,
+                group_segment_size: 0,
+                kernel_object: self.rope_inplace_f16_kernel,
+                kernarg_address: kernarg_ptr,
+                reserved2: 0,
+                completion_signal: queue.signal(),
+            };
+
+            ptr::write_volatile(packet_ptr, packet);
+            (lib.hsa_queue_store_write_index_relaxed)(queue.queue(), write_index + 1);
+            (lib.hsa_signal_store_relaxed)(queue.signal(), 1);
+
+            queue
+                .synchronize()
+                .map_err(|e: HsaFlashAttentionError| HsaRoPEError::HsaError(e.to_string()))?;
+            (lib.hsa_memory_free)(kernarg_ptr);
+        }
+
+        Ok(())
+    }
+
     /// Check if f16 kernels are available.
     pub fn has_f16(&self) -> bool {
         self.rope_apply_f16_kernel != 0
@@ -490,6 +575,11 @@ impl HsaRoPEKernel {
     /// Check if inplace kernels are available.
     pub fn has_inplace(&self) -> bool {
         self.rope_inplace_f32_kernel != 0
+    }
+
+    /// Check if inplace f16 kernel is available.
+    pub fn has_inplace_f16(&self) -> bool {
+        self.rope_inplace_f16_kernel != 0
     }
 }
 

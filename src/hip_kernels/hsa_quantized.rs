@@ -407,6 +407,91 @@ impl HsaQuantizedKernel {
         Ok(())
     }
 
+    /// Execute Q4 matmul with FP16 input/scales: input [M, K] x weight_q4 [K, N] -> output [M, N]
+    pub fn q4_matmul_f16(
+        &self,
+        queue: &HsaQueueWrapper,
+        input_ptr: *const c_void,
+        weight_ptr: *const c_void,
+        scales_ptr: *const c_void,
+        zeros_ptr: *const c_void,
+        output_ptr: *mut c_void,
+        m: usize,
+        k: usize,
+        n: usize,
+        group_size: usize,
+    ) -> Result<(), HsaQuantizedError> {
+        if self.q4_matmul_f16_kernel == 0 {
+            return Err(HsaQuantizedError::HsaError(
+                "Q4 matmul f16 kernel not available".to_string(),
+            ));
+        }
+
+        let lib = get_hsa_lib().map_err(|e| HsaQuantizedError::HsaError(e.to_string()))?;
+
+        let mut kernarg_ptr: *mut c_void = ptr::null_mut();
+        unsafe {
+            (lib.hsa_memory_allocate)(
+                self.agent.kernarg_region,
+                self.q4_kernarg_size as usize,
+                &mut kernarg_ptr,
+            );
+
+            let args = Q4MatmulArgs {
+                input_ptr,
+                weight_ptr,
+                scales_ptr,
+                zeros_ptr,
+                output_ptr,
+                m: m as i32,
+                k: k as i32,
+                n: n as i32,
+                group_size: group_size as i32,
+            };
+
+            ptr::copy_nonoverlapping(&args, kernarg_ptr as *mut Q4MatmulArgs, 1);
+        }
+
+        let grid_x = ((n + 255) / 256) * 256;
+
+        unsafe {
+            queue.reset_signal();
+            let write_index = (lib.hsa_queue_add_write_index_relaxed)(queue.queue(), 1);
+            let packet_ptr = (queue.queue() as *mut u8)
+                .add((write_index % 4096) as usize * 64)
+                as *mut HsaKernelDispatchPacket;
+
+            let packet = HsaKernelDispatchPacket {
+                header: (1 << 0) | (2 << 9) | (2 << 11),
+                setup: 2 << 0, // 2 dimensions
+                workgroup_size_x: 256,
+                workgroup_size_y: 1,
+                workgroup_size_z: 1,
+                reserved0: 0,
+                grid_size_x: grid_x as u32,
+                grid_size_y: m as u32,
+                grid_size_z: 1,
+                private_segment_size: 0,
+                group_segment_size: 0,
+                kernel_object: self.q4_matmul_f16_kernel,
+                kernarg_address: kernarg_ptr,
+                reserved2: 0,
+                completion_signal: queue.signal(),
+            };
+
+            ptr::write_volatile(packet_ptr, packet);
+            (lib.hsa_queue_store_write_index_relaxed)(queue.queue(), write_index + 1);
+            (lib.hsa_signal_store_relaxed)(queue.signal(), 1);
+
+            queue.synchronize().map_err(|e: HsaFlashAttentionError| {
+                HsaQuantizedError::HsaError(e.to_string())
+            })?;
+            (lib.hsa_memory_free)(kernarg_ptr);
+        }
+
+        Ok(())
+    }
+
     /// Execute Q8 matmul: input [M, K] x weight_q8 [K, N] -> output [M, N]
     pub fn q8_matmul_f32(
         &self,
@@ -492,6 +577,91 @@ impl HsaQuantizedKernel {
         Ok(())
     }
 
+    /// Execute Q8 matmul with FP16 input/scales: input [M, K] x weight_q8 [K, N] -> output [M, N]
+    pub fn q8_matmul_f16(
+        &self,
+        queue: &HsaQueueWrapper,
+        input_ptr: *const c_void,
+        weight_ptr: *const c_void,
+        scales_ptr: *const c_void,
+        zeros_ptr: *const c_void,
+        output_ptr: *mut c_void,
+        m: usize,
+        k: usize,
+        n: usize,
+        group_size: usize,
+    ) -> Result<(), HsaQuantizedError> {
+        if self.q8_matmul_f16_kernel == 0 {
+            return Err(HsaQuantizedError::HsaError(
+                "Q8 matmul f16 kernel not available".to_string(),
+            ));
+        }
+
+        let lib = get_hsa_lib().map_err(|e| HsaQuantizedError::HsaError(e.to_string()))?;
+
+        let mut kernarg_ptr: *mut c_void = ptr::null_mut();
+        unsafe {
+            (lib.hsa_memory_allocate)(
+                self.agent.kernarg_region,
+                self.q8_kernarg_size as usize,
+                &mut kernarg_ptr,
+            );
+
+            let args = Q8MatmulArgs {
+                input_ptr,
+                weight_ptr,
+                scales_ptr,
+                zeros_ptr,
+                output_ptr,
+                m: m as i32,
+                k: k as i32,
+                n: n as i32,
+                group_size: group_size as i32,
+            };
+
+            ptr::copy_nonoverlapping(&args, kernarg_ptr as *mut Q8MatmulArgs, 1);
+        }
+
+        let grid_x = ((n + 255) / 256) * 256;
+
+        unsafe {
+            queue.reset_signal();
+            let write_index = (lib.hsa_queue_add_write_index_relaxed)(queue.queue(), 1);
+            let packet_ptr = (queue.queue() as *mut u8)
+                .add((write_index % 4096) as usize * 64)
+                as *mut HsaKernelDispatchPacket;
+
+            let packet = HsaKernelDispatchPacket {
+                header: (1 << 0) | (2 << 9) | (2 << 11),
+                setup: 2 << 0,
+                workgroup_size_x: 256,
+                workgroup_size_y: 1,
+                workgroup_size_z: 1,
+                reserved0: 0,
+                grid_size_x: grid_x as u32,
+                grid_size_y: m as u32,
+                grid_size_z: 1,
+                private_segment_size: 0,
+                group_segment_size: 0,
+                kernel_object: self.q8_matmul_f16_kernel,
+                kernarg_address: kernarg_ptr,
+                reserved2: 0,
+                completion_signal: queue.signal(),
+            };
+
+            ptr::write_volatile(packet_ptr, packet);
+            (lib.hsa_queue_store_write_index_relaxed)(queue.queue(), write_index + 1);
+            (lib.hsa_signal_store_relaxed)(queue.signal(), 1);
+
+            queue.synchronize().map_err(|e: HsaFlashAttentionError| {
+                HsaQuantizedError::HsaError(e.to_string())
+            })?;
+            (lib.hsa_memory_free)(kernarg_ptr);
+        }
+
+        Ok(())
+    }
+
     /// Execute AWQ matmul: input [M, K] x weight_awq [K, N] -> output [M, N]
     pub fn awq_matmul_f32(
         &self,
@@ -569,6 +739,89 @@ impl HsaQuantizedKernel {
             queue.synchronize().map_err(|e: HsaFlashAttentionError|
                 HsaQuantizedError::HsaError(e.to_string())
             )?;
+            (lib.hsa_memory_free)(kernarg_ptr);
+        }
+
+        Ok(())
+    }
+
+    /// Execute AWQ matmul with FP16 input/scales: input [M, K] x weight_awq [K, N] -> output [M, N]
+    pub fn awq_matmul_f16(
+        &self,
+        queue: &HsaQueueWrapper,
+        input_ptr: *const c_void,
+        weight_ptr: *const c_void,
+        scales_ptr: *const c_void,
+        output_ptr: *mut c_void,
+        m: usize,
+        k: usize,
+        n: usize,
+        group_size: usize,
+    ) -> Result<(), HsaQuantizedError> {
+        if self.awq_matmul_f16_kernel == 0 {
+            return Err(HsaQuantizedError::HsaError(
+                "AWQ matmul f16 kernel not available".to_string(),
+            ));
+        }
+
+        let lib = get_hsa_lib().map_err(|e| HsaQuantizedError::HsaError(e.to_string()))?;
+
+        let mut kernarg_ptr: *mut c_void = ptr::null_mut();
+        unsafe {
+            (lib.hsa_memory_allocate)(
+                self.agent.kernarg_region,
+                self.awq_kernarg_size as usize,
+                &mut kernarg_ptr,
+            );
+
+            let args = AwqMatmulArgs {
+                input_ptr,
+                weight_ptr,
+                scales_ptr,
+                output_ptr,
+                m: m as i32,
+                k: k as i32,
+                n: n as i32,
+                group_size: group_size as i32,
+            };
+
+            ptr::copy_nonoverlapping(&args, kernarg_ptr as *mut AwqMatmulArgs, 1);
+        }
+
+        let grid_x = ((n + 255) / 256) * 256;
+
+        unsafe {
+            queue.reset_signal();
+            let write_index = (lib.hsa_queue_add_write_index_relaxed)(queue.queue(), 1);
+            let packet_ptr = (queue.queue() as *mut u8)
+                .add((write_index % 4096) as usize * 64)
+                as *mut HsaKernelDispatchPacket;
+
+            let packet = HsaKernelDispatchPacket {
+                header: (1 << 0) | (2 << 9) | (2 << 11),
+                setup: 2 << 0,
+                workgroup_size_x: 256,
+                workgroup_size_y: 1,
+                workgroup_size_z: 1,
+                reserved0: 0,
+                grid_size_x: grid_x as u32,
+                grid_size_y: m as u32,
+                grid_size_z: 1,
+                private_segment_size: 0,
+                group_segment_size: 0,
+                kernel_object: self.awq_matmul_f16_kernel,
+                kernarg_address: kernarg_ptr,
+                reserved2: 0,
+                completion_signal: queue.signal(),
+            };
+
+            ptr::write_volatile(packet_ptr, packet);
+            (lib.hsa_queue_store_write_index_relaxed)(queue.queue(), write_index + 1);
+            (lib.hsa_signal_store_relaxed)(queue.signal(), 1);
+
+            queue.synchronize().map_err(|e: HsaFlashAttentionError| {
+                HsaQuantizedError::HsaError(e.to_string())
+            })?;
             (lib.hsa_memory_free)(kernarg_ptr);
         }
 
