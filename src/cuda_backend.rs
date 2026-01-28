@@ -8,6 +8,7 @@ use crate::cuda_kernels::{
     PagedAttentionKernel as CudaPagedAttentionKernel,
     QuantizedDequantKernel,
     RmsNormKernel,
+    CudaRoPEKernel,
     CudaSilu,
     CudaLinear,
     CudaElementwiseKernel,
@@ -41,6 +42,8 @@ static CUDA_FLASH_KERNEL: OnceLock<Option<CudaFlashAttentionKernel>> = OnceLock:
 static CUDA_PAGED_KERNEL: OnceLock<Option<CudaPagedAttentionKernel>> = OnceLock::new();
 /// Global CUDA RMSNorm kernel (lazy initialized).
 static CUDA_RMSNORM_KERNEL: OnceLock<Option<RmsNormKernel>> = OnceLock::new();
+/// Global CUDA RoPE kernel (lazy initialized).
+static CUDA_ROPE_KERNEL: OnceLock<Option<CudaRoPEKernel>> = OnceLock::new();
 /// Global CUDA SiLU kernel (lazy initialized).
 static CUDA_SILU_KERNEL: OnceLock<Option<CudaSilu>> = OnceLock::new();
 /// Global CUDA quantized dequantization kernel (lazy initialized).
@@ -113,6 +116,21 @@ fn get_cuda_rmsnorm_kernel() -> Option<&'static RmsNormKernel> {
                 Ok(kernel) => Some(kernel),
                 Err(e) => {
                     log::warn!("Failed to initialize CUDA RMSNorm kernel: {}", e);
+                    None
+                }
+            }
+        })
+        .as_ref()
+}
+
+fn get_cuda_rope_kernel() -> Option<&'static CudaRoPEKernel> {
+    CUDA_ROPE_KERNEL
+        .get_or_init(|| {
+            let ctx = get_cuda_context()?;
+            match CudaRoPEKernel::new(ctx) {
+                Ok(kernel) => Some(kernel),
+                Err(e) => {
+                    log::warn!("Failed to initialize CUDA RoPE kernel: {}", e);
                     None
                 }
             }
@@ -1087,6 +1105,8 @@ impl Backend for CudaBackend {
                     },
                     up_weight: upload_f32_to_cuda(stream, layer.up_weight, vec![layer.up_weight.len()])?,
                     down_weight: upload_f32_to_cuda(stream, layer.down_weight, vec![layer.down_weight.len()])?,
+                    cos_cache: None,
+                    sin_cache: None,
                 })
             })
             .collect();
@@ -1279,19 +1299,11 @@ impl Backend for CudaBackend {
         kv_cache: Option<&mut KVCacheGpu>,
         config: &TransformerLayerConfigGpu,
     ) -> Result<(), String> {
-        if kv_cache.is_some() {
-            return Err("transformer_layer_gpu: KV cache update is not implemented for CUDA".into());
-        }
-
         if hidden.dtype != TensorDtype::F32 {
             return Err("transformer_layer_gpu: hidden must be F32 tensor".into());
         }
         if hidden.shape.len() < 2 {
             return Err("transformer_layer_gpu: hidden must be at least 2D".into());
-        }
-
-        if config.num_q_heads != config.num_kv_heads {
-            return Err("transformer_layer_gpu: GQA/MQA not supported for CUDA kernel path".into());
         }
 
         let stream = get_cuda_stream()
@@ -1300,6 +1312,8 @@ impl Backend for CudaBackend {
             .ok_or("CUDA RMSNorm kernel not available")?;
         let linear_kernel = get_cuda_linear_kernel()
             .ok_or("CUDA linear kernel not available")?;
+        let rope_kernel = get_cuda_rope_kernel()
+            .ok_or("CUDA RoPE kernel not available")?;
         let silu_kernel = get_cuda_silu_kernel()
             .ok_or("CUDA SiLU kernel not available")?;
         let flash_kernel = get_cuda_flash_kernel()
@@ -1474,6 +1488,77 @@ impl Backend for CudaBackend {
             )?;
         }
 
+        // Apply RoPE to Q and K (in-place, layout: [batch, seq, heads, head_dim])
+        let (cos_cache, sin_cache) = match (layer_weights.cos_cache.as_ref(), layer_weights.sin_cache.as_ref()) {
+            (Some(cos), Some(sin)) => (cos, sin),
+            _ => return Err("transformer_layer_gpu: RoPE cache missing (cos/sin)".into()),
+        };
+        if cos_cache.dtype != TensorDtype::F32 || sin_cache.dtype != TensorDtype::F32 {
+            return Err("transformer_layer_gpu: RoPE cache must be F32 tensor".into());
+        }
+        let GpuBuffer::Cuda(cos_cache_slice) = &cos_cache.buffer else {
+            return Err("transformer_layer_gpu: cos_cache must be CUDA buffer".into());
+        };
+        let GpuBuffer::Cuda(sin_cache_slice) = &sin_cache.buffer else {
+            return Err("transformer_layer_gpu: sin_cache must be CUDA buffer".into());
+        };
+        if config.head_dim % 2 != 0 {
+            return Err("transformer_layer_gpu: head_dim must be even for RoPE".into());
+        }
+        let pos_end = config.position
+            .checked_add(seq)
+            .ok_or("transformer_layer_gpu: RoPE position overflow")?;
+        let needed = pos_end
+            .checked_mul(config.head_dim / 2)
+            .ok_or("transformer_layer_gpu: RoPE cache size overflow")?;
+        let cos_len = cos_cache.size_in_bytes / std::mem::size_of::<f32>();
+        let sin_len = sin_cache.size_in_bytes / std::mem::size_of::<f32>();
+        if cos_len < needed || sin_len < needed {
+            return Err("transformer_layer_gpu: RoPE cache length is insufficient".into());
+        }
+        let cos_view = unsafe {
+            cos_cache_slice
+                .transmute::<f32>(cos_len)
+                .ok_or("transformer_layer_gpu: failed to transmute cos_cache")?
+        };
+        let sin_view = unsafe {
+            sin_cache_slice
+                .transmute::<f32>(sin_len)
+                .ok_or("transformer_layer_gpu: failed to transmute sin_cache")?
+        };
+        {
+            let mut q_view = q_linear.as_view_mut();
+            rope_kernel
+                .apply_inplace_f32(
+                    stream,
+                    &mut q_view,
+                    &cos_view,
+                    &sin_view,
+                    batch,
+                    seq,
+                    config.num_q_heads,
+                    config.head_dim,
+                    config.position,
+                )
+                .map_err(|e| format!("transformer_layer_gpu RoPE q error: {}", e))?;
+        }
+        {
+            let mut k_view = k_linear.as_view_mut();
+            rope_kernel
+                .apply_inplace_f32(
+                    stream,
+                    &mut k_view,
+                    &cos_view,
+                    &sin_view,
+                    batch,
+                    seq,
+                    config.num_kv_heads,
+                    config.head_dim,
+                    config.position,
+                )
+                .map_err(|e| format!("transformer_layer_gpu RoPE k error: {}", e))?;
+        }
+
         // Permute to [batch, heads, seq, head_dim]
         let mut q_perm: cudarc::driver::CudaSlice<f32> = stream
             .alloc_zeros(q_elements)
@@ -1531,13 +1616,171 @@ impl Backend for CudaBackend {
                 .map_err(|e| format!("transformer_layer_gpu permute v error: {}", e))?;
         }
 
+        // KV cache update (GPU-to-GPU copy)
+        if let Some(kv_cache) = kv_cache {
+            if kv_cache.num_kv_heads != config.num_kv_heads || kv_cache.head_dim != config.head_dim {
+                return Err("transformer_layer_gpu: KV cache shape mismatch".into());
+            }
+            if kv_cache.num_layers != 1 {
+                return Err("transformer_layer_gpu: KV cache must be per-layer (num_layers == 1)".into());
+            }
+            let pos_end = config.position
+                .checked_add(seq)
+                .ok_or("transformer_layer_gpu: KV cache position overflow")?;
+            if pos_end > kv_cache.max_len {
+                return Err("transformer_layer_gpu: KV cache position exceeds max_len".into());
+            }
+            if kv_cache.k_cache.dtype != TensorDtype::F32 || kv_cache.v_cache.dtype != TensorDtype::F32 {
+                return Err("transformer_layer_gpu: KV cache must be F32 tensors".into());
+            }
+            let GpuBuffer::Cuda(k_cache_arc) = &mut kv_cache.k_cache.buffer else {
+                return Err("transformer_layer_gpu: KV cache k must be CUDA buffer".into());
+            };
+            let GpuBuffer::Cuda(v_cache_arc) = &mut kv_cache.v_cache.buffer else {
+                return Err("transformer_layer_gpu: KV cache v must be CUDA buffer".into());
+            };
+            let k_cache_slice = Arc::get_mut(k_cache_arc)
+                .ok_or("transformer_layer_gpu: KV cache k buffer is shared")?;
+            let v_cache_slice = Arc::get_mut(v_cache_arc)
+                .ok_or("transformer_layer_gpu: KV cache v buffer is shared")?;
+            let k_cache_elems = kv_cache.k_cache.size_in_bytes / std::mem::size_of::<f32>();
+            let v_cache_elems = kv_cache.v_cache.size_in_bytes / std::mem::size_of::<f32>();
+            let mut k_cache_view = unsafe {
+                k_cache_slice
+                    .transmute_mut::<f32>(k_cache_elems)
+                    .ok_or("transformer_layer_gpu: failed to transmute KV k cache")?
+            };
+            let mut v_cache_view = unsafe {
+                v_cache_slice
+                    .transmute_mut::<f32>(v_cache_elems)
+                    .ok_or("transformer_layer_gpu: failed to transmute KV v cache")?
+            };
+            let k_src_view = k_perm.as_view();
+            let v_src_view = v_perm.as_view();
+            let copy_len = seq
+                .checked_mul(config.head_dim)
+                .ok_or("transformer_layer_gpu: KV copy len overflow")?;
+
+            for b in 0..batch {
+                for h in 0..config.num_kv_heads {
+                    let src_start = (b * config.num_kv_heads + h)
+                        .checked_mul(seq)
+                        .and_then(|v| v.checked_mul(config.head_dim))
+                        .ok_or("transformer_layer_gpu: KV src offset overflow")?;
+                    let src_end = src_start + copy_len;
+                    let src_k = k_src_view
+                        .try_slice(src_start..src_end)
+                        .ok_or("transformer_layer_gpu: KV k src slice OOB")?;
+                    let src_v = v_src_view
+                        .try_slice(src_start..src_end)
+                        .ok_or("transformer_layer_gpu: KV v src slice OOB")?;
+
+                    let dst_start = (b * config.num_kv_heads + h)
+                        .checked_mul(kv_cache.max_len)
+                        .and_then(|v| v.checked_add(config.position))
+                        .and_then(|v| v.checked_mul(config.head_dim))
+                        .ok_or("transformer_layer_gpu: KV dst offset overflow")?;
+                    let dst_end = dst_start + copy_len;
+                    let mut dst_k = k_cache_view
+                        .try_slice_mut(dst_start..dst_end)
+                        .ok_or("transformer_layer_gpu: KV k dst slice OOB")?;
+                    let mut dst_v = v_cache_view
+                        .try_slice_mut(dst_start..dst_end)
+                        .ok_or("transformer_layer_gpu: KV v dst slice OOB")?;
+
+                    stream
+                        .memcpy_dtod(&src_k, &mut dst_k)
+                        .map_err(|e| format!("transformer_layer_gpu KV k copy error: {}", e))?;
+                    stream
+                        .memcpy_dtod(&src_v, &mut dst_v)
+                        .map_err(|e| format!("transformer_layer_gpu KV v copy error: {}", e))?;
+                }
+            }
+
+            kv_cache.seq_len = pos_end;
+        }
+
+        // Expand K/V heads for GQA/MQA if needed
+        let k_attn: &cudarc::driver::CudaSlice<f32>;
+        let v_attn: &cudarc::driver::CudaSlice<f32>;
+        let mut k_gqa: Option<cudarc::driver::CudaSlice<f32>> = None;
+        let mut v_gqa: Option<cudarc::driver::CudaSlice<f32>> = None;
+        if config.num_q_heads == config.num_kv_heads {
+            k_attn = &k_perm;
+            v_attn = &v_perm;
+        } else {
+            if config.num_q_heads % config.num_kv_heads != 0 {
+                return Err("transformer_layer_gpu: num_q_heads must be multiple of num_kv_heads".into());
+            }
+            let heads_per_kv = config.num_q_heads / config.num_kv_heads;
+            let gqa_elements = total_tokens
+                .checked_mul(config.num_q_heads)
+                .and_then(|v| v.checked_mul(config.head_dim))
+                .ok_or("transformer_layer_gpu: gqa elements overflow")?;
+            let mut k_buf: cudarc::driver::CudaSlice<f32> = stream
+                .alloc_zeros(gqa_elements)
+                .map_err(|e| format!("transformer_layer_gpu: alloc k_gqa failed: {}", e))?;
+            let mut v_buf: cudarc::driver::CudaSlice<f32> = stream
+                .alloc_zeros(gqa_elements)
+                .map_err(|e| format!("transformer_layer_gpu: alloc v_gqa failed: {}", e))?;
+
+            let k_src_view = k_perm.as_view();
+            let v_src_view = v_perm.as_view();
+            let copy_len = seq
+                .checked_mul(config.head_dim)
+                .ok_or("transformer_layer_gpu: gqa copy len overflow")?;
+
+            for b in 0..batch {
+                for kv_h in 0..config.num_kv_heads {
+                    let src_start = (b * config.num_kv_heads + kv_h)
+                        .checked_mul(seq)
+                        .and_then(|v| v.checked_mul(config.head_dim))
+                        .ok_or("transformer_layer_gpu: gqa src offset overflow")?;
+                    let src_end = src_start + copy_len;
+                    let src_k = k_src_view
+                        .try_slice(src_start..src_end)
+                        .ok_or("transformer_layer_gpu: gqa k src slice OOB")?;
+                    let src_v = v_src_view
+                        .try_slice(src_start..src_end)
+                        .ok_or("transformer_layer_gpu: gqa v src slice OOB")?;
+
+                    for rep in 0..heads_per_kv {
+                        let q_h = kv_h * heads_per_kv + rep;
+                        let dst_start = (b * config.num_q_heads + q_h)
+                            .checked_mul(seq)
+                            .and_then(|v| v.checked_mul(config.head_dim))
+                            .ok_or("transformer_layer_gpu: gqa dst offset overflow")?;
+                        let dst_end = dst_start + copy_len;
+                        let mut dst_k = k_buf
+                            .try_slice_mut(dst_start..dst_end)
+                            .ok_or("transformer_layer_gpu: gqa k dst slice OOB")?;
+                        let mut dst_v = v_buf
+                            .try_slice_mut(dst_start..dst_end)
+                            .ok_or("transformer_layer_gpu: gqa v dst slice OOB")?;
+
+                        stream
+                            .memcpy_dtod(&src_k, &mut dst_k)
+                            .map_err(|e| format!("transformer_layer_gpu gqa k copy error: {}", e))?;
+                        stream
+                            .memcpy_dtod(&src_v, &mut dst_v)
+                            .map_err(|e| format!("transformer_layer_gpu gqa v copy error: {}", e))?;
+                    }
+                }
+            }
+
+            k_gqa = Some(k_buf);
+            v_gqa = Some(v_buf);
+            k_attn = k_gqa.as_ref().ok_or("transformer_layer_gpu: gqa k missing")?;
+            v_attn = v_gqa.as_ref().ok_or("transformer_layer_gpu: gqa v missing")?;
+        }
+
         let scale = 1.0f32 / (config.head_dim as f32).sqrt();
         let attn_out = flash_kernel
             .forward_f32(
                 stream,
                 &q_perm,
-                &k_perm,
-                &v_perm,
+                k_attn,
+                v_attn,
                 batch,
                 config.num_q_heads,
                 seq,
@@ -2270,6 +2513,8 @@ impl Backend for CudaBackend {
                 gate_weight: layer.gate_weight.map(|g| upload_f32(&stream, g, vec![g.len()])).transpose()?,
                 up_weight: upload_f32(&stream, layer.up_weight, vec![layer.up_weight.len()])?,
                 down_weight: upload_f32(&stream, layer.down_weight, vec![layer.down_weight.len()])?,
+                cos_cache: None,
+                sin_cache: None,
             })
         }).collect();
 
@@ -2346,6 +2591,8 @@ impl Backend for CudaBackend {
                 gate_weight: layer.gate_weight.map(|g| upload_f32(&stream, g, vec![g.len()])).transpose()?,
                 up_weight: upload_f32(&stream, layer.up_weight, vec![layer.up_weight.len()])?,
                 down_weight: upload_f32(&stream, layer.down_weight, vec![layer.down_weight.len()])?,
+                cos_cache: Some(cos_cache_gpu.clone()),
+                sin_cache: Some(sin_cache_gpu.clone()),
             })
         }).collect();
 

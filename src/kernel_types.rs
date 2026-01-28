@@ -124,8 +124,10 @@ pub struct FlashAttentionConfig {
     pub dropout_prob: f32,
     /// Optional scale factor (default: 1/sqrt(head_dim)).
     pub scale: Option<f32>,
-    /// Number of attention heads.
+    /// Number of query attention heads.
     pub num_heads: usize,
+    /// Number of key/value heads (for GQA/MQA). If 0, defaults to num_heads.
+    pub num_kv_heads: usize,
     /// Dimension per head.
     pub head_dim: usize,
     /// Sequence length for query.
@@ -147,6 +149,7 @@ impl Default for FlashAttentionConfig {
             dropout_prob: 0.0,
             scale: None,
             num_heads: 1,
+            num_kv_heads: 0, // 0 means same as num_heads
             head_dim: 64,
             seq_len_q: 1,
             seq_len_kv: 1,
@@ -194,6 +197,10 @@ pub struct SoftmaxConfig {
     pub use_kahan: bool,
     /// Axis along which to compute softmax.
     pub axis: i32,
+    /// Number of rows (batches) for GPU dispatch. If 0, auto-calculated as 1.
+    pub num_rows: usize,
+    /// Size of each row (softmax dimension). If 0, auto-calculated as input.len() / num_rows.
+    pub row_size: usize,
 }
 
 impl Default for SoftmaxConfig {
@@ -202,6 +209,41 @@ impl Default for SoftmaxConfig {
             use_log_space: true,
             use_kahan: true,
             axis: -1,
+            num_rows: 0,
+            row_size: 0,
+        }
+    }
+}
+
+impl SoftmaxConfig {
+    /// Create config with explicit dimensions for GPU dispatch.
+    pub fn with_dims(num_rows: usize, row_size: usize) -> Self {
+        Self {
+            num_rows,
+            row_size,
+            ..Default::default()
+        }
+    }
+
+    /// Get effective num_rows (1 if not specified).
+    pub fn effective_num_rows(&self, total_len: usize) -> usize {
+        if self.num_rows > 0 {
+            self.num_rows
+        } else if self.row_size > 0 && total_len > 0 {
+            total_len / self.row_size
+        } else {
+            1
+        }
+    }
+
+    /// Get effective row_size (total length if not specified).
+    pub fn effective_row_size(&self, total_len: usize) -> usize {
+        if self.row_size > 0 {
+            self.row_size
+        } else if self.num_rows > 0 && total_len > 0 {
+            total_len / self.num_rows
+        } else {
+            total_len
         }
     }
 }
@@ -588,6 +630,747 @@ impl Default for MatmulConfig {
             transpose_b: false,
             alpha: 1.0,
             beta: 0.0,
+        }
+    }
+}
+
+/// Linear layer kernel parameters.
+#[repr(C)]
+#[derive(Copy, Clone, Debug, Default, bytemuck::Pod, bytemuck::Zeroable)]
+pub struct LinearParams {
+    pub in_features: u32,
+    pub out_features: u32,
+    pub has_bias: u32,
+    pub padding: u32,
+}
+
+// ============================================================================
+// L2 Block-Level Operator Configurations (ARCH-GRANULARITY-001)
+// ============================================================================
+
+/// Activation function type for FFN blocks.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum Activation {
+    /// SiLU/Swish activation (used in LLaMA, Mistral)
+    #[default]
+    SiLU,
+    /// GELU activation (used in BERT, GPT)
+    GELU,
+    /// GELU with exact erf computation
+    GELUExact,
+    /// ReLU activation
+    ReLU,
+    /// No activation (identity)
+    None,
+}
+
+/// Engram fusion hook configuration.
+/// Defines how Engram conditional memory integrates with attention.
+#[derive(Clone, Debug, Default)]
+pub struct EngramHook {
+    /// Whether to enable Engram fusion
+    pub enabled: bool,
+    /// Scaling factor for Engram output
+    pub scale: f32,
+    /// Bucket index for hash lookup (set by engram_lookup)
+    pub bucket_indices: Vec<u64>,
+}
+
+/// Configuration for complete attention block (L2 block-level).
+///
+/// Fuses: QKV projection + RoPE + Softmax + Output projection
+/// with optional Engram integration point.
+#[derive(Clone, Debug)]
+pub struct AttentionBlockConfig {
+    /// Batch size
+    pub batch_size: usize,
+    /// Sequence length
+    pub seq_len: usize,
+    /// Number of query attention heads
+    pub num_q_heads: usize,
+    /// Number of key/value heads (for GQA/MQA)
+    pub num_kv_heads: usize,
+    /// Dimension per head
+    pub head_dim: usize,
+    /// Hidden dimension (num_q_heads * head_dim)
+    pub hidden_size: usize,
+    /// Whether to apply causal mask
+    pub causal: bool,
+    /// Whether to use RoPE position encoding
+    pub use_rope: bool,
+    /// RoPE theta parameter (default: 10000.0)
+    pub rope_theta: f32,
+    /// Position offset for RoPE (for incremental decoding)
+    pub position_offset: usize,
+    /// Optional scale factor (default: 1/sqrt(head_dim))
+    pub scale: Option<f32>,
+    /// RMS norm epsilon
+    pub rms_norm_eps: f32,
+    /// Optional Engram fusion hook
+    pub engram_hook: Option<EngramHook>,
+    /// Use flash attention algorithm
+    pub use_flash_attention: bool,
+    /// Dropout probability (0.0 = no dropout)
+    pub dropout_prob: f32,
+}
+
+impl Default for AttentionBlockConfig {
+    fn default() -> Self {
+        Self {
+            batch_size: 1,
+            seq_len: 1,
+            num_q_heads: 32,
+            num_kv_heads: 32,
+            head_dim: 128,
+            hidden_size: 4096,
+            causal: true,
+            use_rope: true,
+            rope_theta: 10000.0,
+            position_offset: 0,
+            scale: None,
+            rms_norm_eps: 1e-5,
+            engram_hook: None,
+            use_flash_attention: true,
+            dropout_prob: 0.0,
+        }
+    }
+}
+
+/// Configuration for complete FFN block (L2 block-level).
+///
+/// Fuses: Gate projection + Up projection + Activation + Down projection
+/// Supports both LLaMA-style (Gate*Up) and GPT-style (single Up) FFN.
+#[derive(Clone, Debug)]
+pub struct FFNBlockConfig {
+    /// Batch size
+    pub batch_size: usize,
+    /// Sequence length
+    pub seq_len: usize,
+    /// Hidden dimension (input/output size)
+    pub hidden_size: usize,
+    /// Intermediate dimension (FFN expansion)
+    pub intermediate_size: usize,
+    /// Activation function type
+    pub activation: Activation,
+    /// Whether FFN uses gate projection (LLaMA-style)
+    pub use_gate: bool,
+    /// Whether to apply bias in linear layers
+    pub use_bias: bool,
+    /// RMS norm epsilon (for pre-norm)
+    pub rms_norm_eps: f32,
+}
+
+impl Default for FFNBlockConfig {
+    fn default() -> Self {
+        Self {
+            batch_size: 1,
+            seq_len: 1,
+            hidden_size: 4096,
+            intermediate_size: 11008,
+            activation: Activation::SiLU,
+            use_gate: true,
+            use_bias: false,
+            rms_norm_eps: 1e-5,
+        }
+    }
+}
+
+/// Configuration for embedding layer (L2 block-level).
+///
+/// Handles: Token lookup + optional position encoding
+#[derive(Clone, Debug)]
+pub struct EmbeddingConfig {
+    /// Vocabulary size
+    pub vocab_size: usize,
+    /// Embedding/hidden dimension
+    pub hidden_size: usize,
+    /// Maximum sequence length (for position embeddings)
+    pub max_seq_len: usize,
+    /// Whether to add position embeddings
+    pub add_position_embedding: bool,
+    /// Padding token ID (for masking)
+    pub padding_idx: Option<u32>,
+}
+
+impl Default for EmbeddingConfig {
+    fn default() -> Self {
+        Self {
+            vocab_size: 32000,
+            hidden_size: 4096,
+            max_seq_len: 4096,
+            add_position_embedding: false,
+            padding_idx: None,
+        }
+    }
+}
+
+/// Configuration for language model head (L2 block-level).
+///
+/// Handles: Hidden state -> Vocabulary logits projection
+#[derive(Clone, Debug)]
+pub struct LMHeadConfig {
+    /// Vocabulary size
+    pub vocab_size: usize,
+    /// Hidden dimension
+    pub hidden_size: usize,
+    /// Batch size
+    pub batch_size: usize,
+    /// Sequence length (usually 1 for generation)
+    pub seq_len: usize,
+    /// Whether to tie weights with input embedding
+    pub tie_word_embeddings: bool,
+    /// RMS norm epsilon (for final norm)
+    pub rms_norm_eps: f32,
+}
+
+impl Default for LMHeadConfig {
+    fn default() -> Self {
+        Self {
+            vocab_size: 32000,
+            hidden_size: 4096,
+            batch_size: 1,
+            seq_len: 1,
+            tie_word_embeddings: true,
+            rms_norm_eps: 1e-5,
+        }
+    }
+}
+
+/// Configuration for KV cache update (L2 block-level).
+#[derive(Clone, Debug)]
+pub struct KVCacheUpdateConfig {
+    /// Batch size
+    pub batch_size: usize,
+    /// Number of KV heads
+    pub num_kv_heads: usize,
+    /// Dimension per head
+    pub head_dim: usize,
+    /// Maximum cache length
+    pub max_cache_len: usize,
+    /// Current position in sequence
+    pub position: usize,
+    /// Number of new tokens to add
+    pub num_new_tokens: usize,
+}
+
+impl Default for KVCacheUpdateConfig {
+    fn default() -> Self {
+        Self {
+            batch_size: 1,
+            num_kv_heads: 32,
+            head_dim: 128,
+            max_cache_len: 4096,
+            position: 0,
+            num_new_tokens: 1,
+        }
+    }
+}
+
+/// Configuration for mean pooling (L2 block-level).
+///
+/// Used for embedding model output aggregation.
+#[derive(Clone, Debug)]
+pub struct MeanPoolingConfig {
+    /// Batch size
+    pub batch_size: usize,
+    /// Sequence length
+    pub seq_len: usize,
+    /// Hidden dimension
+    pub hidden_size: usize,
+    /// Optional attention mask (for variable length sequences)
+    pub use_attention_mask: bool,
+}
+
+impl Default for MeanPoolingConfig {
+    fn default() -> Self {
+        Self {
+            batch_size: 1,
+            seq_len: 512,
+            hidden_size: 768,
+            use_attention_mask: true,
+        }
+    }
+}
+
+/// Configuration for CLS token pooling (L2 block-level).
+///
+/// Used for reranker and classification models.
+#[derive(Clone, Debug)]
+pub struct ClsPoolingConfig {
+    /// Batch size
+    pub batch_size: usize,
+    /// Hidden dimension
+    pub hidden_size: usize,
+    /// Position of CLS token (usually 0)
+    pub cls_position: usize,
+}
+
+impl Default for ClsPoolingConfig {
+    fn default() -> Self {
+        Self {
+            batch_size: 1,
+            hidden_size: 768,
+            cls_position: 0,
+        }
+    }
+}
+
+/// Configuration for L2 normalization (L2 block-level).
+///
+/// Used for embedding normalization before similarity computation.
+#[derive(Clone, Debug)]
+pub struct NormalizeConfig {
+    /// Batch size
+    pub batch_size: usize,
+    /// Feature dimension to normalize
+    pub dim: usize,
+    /// Small epsilon for numerical stability
+    pub eps: f32,
+}
+
+impl Default for NormalizeConfig {
+    fn default() -> Self {
+        Self {
+            batch_size: 1,
+            dim: 768,
+            eps: 1e-12,
+        }
+    }
+}
+
+/// Quantization format for dequantization.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum QuantFormat {
+    /// 4-bit quantization (llama.cpp Q4_0)
+    #[default]
+    Q4_0,
+    /// 4-bit quantization with K-quants
+    Q4_K,
+    /// 8-bit quantization
+    Q8_0,
+    /// AWQ 4-bit quantization
+    AWQ,
+}
+
+/// Configuration for dequantization (L2 block-level).
+#[derive(Clone, Debug)]
+pub struct DequantizeConfig {
+    /// Quantization format
+    pub format: QuantFormat,
+    /// Number of rows (output features)
+    pub n: usize,
+    /// Number of columns (input features)
+    pub k: usize,
+    /// Group size for grouped quantization
+    pub group_size: usize,
+}
+
+impl Default for DequantizeConfig {
+    fn default() -> Self {
+        Self {
+            format: QuantFormat::Q4_0,
+            n: 1,
+            k: 1,
+            group_size: 128,
+        }
+    }
+}
+
+/// Configuration for Engram-Attention fusion (L2 block-level).
+///
+/// Merges standard attention output with Engram lookup results.
+#[derive(Clone, Debug)]
+pub struct EngramFuseConfig {
+    /// Batch size
+    pub batch_size: usize,
+    /// Sequence length
+    pub seq_len: usize,
+    /// Hidden dimension
+    pub hidden_size: usize,
+    /// Scaling factor for Engram output
+    pub engram_scale: f32,
+    /// Scaling factor for attention output
+    pub attention_scale: f32,
+}
+
+impl Default for EngramFuseConfig {
+    fn default() -> Self {
+        Self {
+            batch_size: 1,
+            seq_len: 1,
+            hidden_size: 4096,
+            engram_scale: 1.0,
+            attention_scale: 1.0,
+        }
+    }
+}
+
+// ============================================================================
+// High-Level Inference API Types (ARCH-ADR-003)
+// ============================================================================
+
+/// Transformer layer weights for high-level forward API.
+#[derive(Clone, Debug)]
+pub struct TransformerLayerWeights<'a> {
+    /// Input RMS norm weights [hidden_size]
+    pub input_norm: &'a [f32],
+    /// Query projection weights [num_q_heads * head_dim, hidden_size]
+    pub q_weight: &'a [f32],
+    /// Key projection weights [num_kv_heads * head_dim, hidden_size]
+    pub k_weight: &'a [f32],
+    /// Value projection weights [num_kv_heads * head_dim, hidden_size]
+    pub v_weight: &'a [f32],
+    /// Output projection weights [hidden_size, num_q_heads * head_dim]
+    pub o_weight: &'a [f32],
+    /// Post-attention RMS norm weights [hidden_size]
+    pub post_attn_norm: &'a [f32],
+    /// Gate projection weights (LLaMA-style) [intermediate_size, hidden_size]
+    pub gate_weight: Option<&'a [f32]>,
+    /// Up projection weights [intermediate_size, hidden_size]
+    pub up_weight: &'a [f32],
+    /// Down projection weights [hidden_size, intermediate_size]
+    pub down_weight: &'a [f32],
+}
+
+/// GPU-resident transformer layer weights for zero-copy forward (ARCH-GPU-001).
+///
+/// Unlike `TransformerLayerWeights` which holds CPU slices, this holds GPU tensors
+/// that are uploaded once at model load time and reused for all forward passes.
+#[derive(Clone, Debug)]
+pub struct TransformerLayerWeightsGpu {
+    /// Input RMS norm weights [hidden_size]
+    pub input_norm: crate::gpu_types::GpuTensor,
+    /// Query projection weights [num_q_heads * head_dim, hidden_size]
+    pub q_weight: crate::gpu_types::GpuTensor,
+    /// Key projection weights [num_kv_heads * head_dim, hidden_size]
+    pub k_weight: crate::gpu_types::GpuTensor,
+    /// Value projection weights [num_kv_heads * head_dim, hidden_size]
+    pub v_weight: crate::gpu_types::GpuTensor,
+    /// Output projection weights [hidden_size, num_q_heads * head_dim]
+    pub o_weight: crate::gpu_types::GpuTensor,
+    /// Post-attention RMS norm weights [hidden_size]
+    pub post_attn_norm: crate::gpu_types::GpuTensor,
+    /// Gate projection weights (LLaMA-style) [intermediate_size, hidden_size]
+    pub gate_weight: Option<crate::gpu_types::GpuTensor>,
+    /// Up projection weights [intermediate_size, hidden_size]
+    pub up_weight: crate::gpu_types::GpuTensor,
+    /// Down projection weights [hidden_size, intermediate_size]
+    pub down_weight: crate::gpu_types::GpuTensor,
+    /// Optional RoPE cosine cache [max_seq_len, head_dim/2] (shared across layers)
+    pub cos_cache: Option<crate::gpu_types::GpuTensor>,
+    /// Optional RoPE sine cache [max_seq_len, head_dim/2] (shared across layers)
+    pub sin_cache: Option<crate::gpu_types::GpuTensor>,
+}
+
+/// GPU-resident embedding model weights for zero-copy forward (ARCH-GPU-001).
+#[derive(Clone, Debug)]
+pub struct EmbeddingModelWeightsGpu {
+    /// Token embedding weights [vocab_size, hidden_size]
+    pub embedding: crate::gpu_types::GpuTensor,
+    /// Transformer layer weights
+    pub layers: Vec<TransformerLayerWeightsGpu>,
+    /// Final layer norm weights [hidden_size]
+    pub final_norm: crate::gpu_types::GpuTensor,
+}
+
+/// GPU-resident reranker model weights for zero-copy forward (ARCH-ADR-010).
+#[derive(Clone, Debug)]
+pub struct RerankerModelWeightsGpu {
+    /// Token embedding weights [vocab_size, hidden_size]
+    pub embedding: crate::gpu_types::GpuTensor,
+    /// Transformer layer weights
+    pub layers: Vec<TransformerLayerWeightsGpu>,
+    /// Final layer norm weights [hidden_size]
+    pub final_norm: crate::gpu_types::GpuTensor,
+    /// Classifier weights [num_classes, hidden_size] (usually [1, hidden_size] for reranking)
+    pub classifier_weight: crate::gpu_types::GpuTensor,
+    /// Classifier bias [num_classes] (optional)
+    pub classifier_bias: Option<crate::gpu_types::GpuTensor>,
+}
+
+/// GPU-resident generator/LLM model weights for zero-copy forward (ARCH-ADR-010).
+#[derive(Clone, Debug)]
+pub struct GeneratorModelWeightsGpu {
+    /// Token embedding weights [vocab_size, hidden_size]
+    pub embedding: crate::gpu_types::GpuTensor,
+    /// Transformer layer weights
+    pub layers: Vec<TransformerLayerWeightsGpu>,
+    /// Final layer norm weights [hidden_size]
+    pub final_norm: crate::gpu_types::GpuTensor,
+    /// LM head weights [vocab_size, hidden_size]
+    pub lm_head: crate::gpu_types::GpuTensor,
+    /// RoPE cosine cache [max_seq_len, head_dim/2]
+    pub cos_cache: crate::gpu_types::GpuTensor,
+    /// RoPE sine cache [max_seq_len, head_dim/2]
+    pub sin_cache: crate::gpu_types::GpuTensor,
+}
+
+/// GPU-resident KV cache for generator models (ARCH-ADR-010: GPU 常驻).
+#[derive(Clone, Debug)]
+pub struct KVCacheGpu {
+    /// Key cache [num_layers, batch, num_kv_heads, max_len, head_dim]
+    pub k_cache: crate::gpu_types::GpuTensor,
+    /// Value cache [num_layers, batch, num_kv_heads, max_len, head_dim]
+    pub v_cache: crate::gpu_types::GpuTensor,
+    /// Current sequence length (position)
+    pub seq_len: usize,
+    /// Maximum cache length
+    pub max_len: usize,
+    /// Number of layers
+    pub num_layers: usize,
+    /// Number of KV heads
+    pub num_kv_heads: usize,
+    /// Head dimension
+    pub head_dim: usize,
+}
+
+/// Configuration for GPU-native transformer layer forward (ARCH-ADR-010).
+#[derive(Clone, Debug)]
+pub struct TransformerLayerConfigGpu {
+    pub batch_size: usize,
+    pub seq_len: usize,
+    pub hidden_size: usize,
+    pub num_q_heads: usize,
+    pub num_kv_heads: usize,
+    pub head_dim: usize,
+    pub intermediate_size: usize,
+    pub rms_norm_eps: f32,
+    /// Current position in KV cache
+    pub position: usize,
+    /// Whether to use SiLU (true) or GELU (false) activation
+    pub use_silu: bool,
+}
+
+/// Single expert FFN weights for MoE.
+#[derive(Clone, Debug)]
+pub struct ExpertWeights<'a> {
+    /// Gate projection [intermediate_size, hidden_size]
+    pub gate: &'a [f32],
+    /// Up projection [intermediate_size, hidden_size]
+    pub up: &'a [f32],
+    /// Down projection [hidden_size, intermediate_size]
+    pub down: &'a [f32],
+}
+
+/// MoE Transformer layer weights for high-level forward API.
+#[derive(Clone, Debug)]
+pub struct MoETransformerLayerWeights<'a> {
+    /// Input RMS norm weights [hidden_size]
+    pub input_norm: &'a [f32],
+    /// Query projection weights [num_q_heads * head_dim, hidden_size]
+    pub q_weight: &'a [f32],
+    /// Key projection weights [num_kv_heads * head_dim, hidden_size]
+    pub k_weight: &'a [f32],
+    /// Value projection weights [num_kv_heads * head_dim, hidden_size]
+    pub v_weight: &'a [f32],
+    /// Output projection weights [hidden_size, num_q_heads * head_dim]
+    pub o_weight: &'a [f32],
+    /// Post-attention RMS norm weights [hidden_size]
+    pub post_attn_norm: &'a [f32],
+    /// Router gate weights [num_experts, hidden_size]
+    pub router_weight: &'a [f32],
+    /// Expert FFN weights
+    pub experts: Vec<ExpertWeights<'a>>,
+    /// Number of experts to activate per token
+    pub num_experts_per_tok: usize,
+}
+
+/// KV cache state for generation.
+#[derive(Debug)]
+pub struct KVCacheState<'a> {
+    /// Key cache [num_layers, batch, num_kv_heads, max_len, head_dim]
+    pub k_cache: &'a mut [f32],
+    /// Value cache [num_layers, batch, num_kv_heads, max_len, head_dim]
+    pub v_cache: &'a mut [f32],
+    /// Current sequence length (position)
+    pub seq_len: usize,
+    /// Maximum cache length
+    pub max_len: usize,
+}
+
+/// Configuration for generator forward (dense model).
+#[derive(Clone, Debug)]
+pub struct GeneratorForwardConfig {
+    pub batch_size: usize,
+    pub seq_len: usize,
+    pub hidden_size: usize,
+    pub num_layers: usize,
+    pub num_q_heads: usize,
+    pub num_kv_heads: usize,
+    pub head_dim: usize,
+    pub intermediate_size: usize,
+    pub vocab_size: usize,
+    /// Maximum sequence length for KV cache allocation
+    pub max_seq_len: usize,
+    pub rms_norm_eps: f32,
+    pub rope_theta: f32,
+    pub use_rope: bool,
+    pub activation: Activation,
+    pub position_offset: usize,
+}
+
+impl Default for GeneratorForwardConfig {
+    fn default() -> Self {
+        Self {
+            batch_size: 1,
+            seq_len: 1,
+            hidden_size: 4096,
+            num_layers: 32,
+            num_q_heads: 32,
+            num_kv_heads: 8,
+            head_dim: 128,
+            intermediate_size: 14336,
+            vocab_size: 32000,
+            max_seq_len: 4096,
+            rms_norm_eps: 1e-5,
+            rope_theta: 10000.0,
+            use_rope: true,
+            activation: Activation::SiLU,
+            position_offset: 0,
+        }
+    }
+}
+
+/// Configuration for MoE generator forward.
+#[derive(Clone, Debug)]
+pub struct MoEGeneratorForwardConfig {
+    pub batch_size: usize,
+    pub seq_len: usize,
+    pub hidden_size: usize,
+    pub num_layers: usize,
+    pub num_q_heads: usize,
+    pub num_kv_heads: usize,
+    pub head_dim: usize,
+    pub intermediate_size: usize,
+    pub vocab_size: usize,
+    pub num_experts: usize,
+    pub num_experts_per_tok: usize,
+    /// Maximum sequence length for KV cache allocation
+    pub max_seq_len: usize,
+    pub rms_norm_eps: f32,
+    pub rope_theta: f32,
+    pub use_rope: bool,
+    pub activation: Activation,
+    pub position_offset: usize,
+}
+
+impl Default for MoEGeneratorForwardConfig {
+    fn default() -> Self {
+        Self {
+            batch_size: 1,
+            seq_len: 1,
+            hidden_size: 4096,
+            num_layers: 32,
+            num_q_heads: 32,
+            num_kv_heads: 8,
+            head_dim: 128,
+            intermediate_size: 14336,
+            vocab_size: 32000,
+            num_experts: 8,
+            num_experts_per_tok: 2,
+            max_seq_len: 4096,
+            rms_norm_eps: 1e-5,
+            rope_theta: 10000.0,
+            use_rope: true,
+            activation: Activation::SiLU,
+            position_offset: 0,
+        }
+    }
+}
+
+/// Architecture type for embedding models.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum EmbeddingArchType {
+    /// Decoder-style (Qwen3, LLaMA): Pre-LN + RMSNorm + RoPE + SwiGLU
+    #[default]
+    Decoder,
+    /// BERT-style: Post-LN + LayerNorm + AbsolutePos + GELU FFN
+    Bert,
+}
+
+pub struct EmbeddingForwardConfig {
+    pub batch_size: usize,
+    pub seq_len: usize,
+    pub hidden_size: usize,
+    pub num_layers: usize,
+    pub num_q_heads: usize,
+    pub num_kv_heads: usize,
+    pub head_dim: usize,
+    pub intermediate_size: usize,
+    pub vocab_size: usize,
+    pub rms_norm_eps: f32,
+    pub activation: Activation,
+    /// Pooling type: "mean", "cls", or "last"
+    pub pooling: PoolingType,
+    /// Whether to normalize output embeddings
+    pub normalize: bool,
+    /// Architecture type (BERT vs Decoder)
+    pub arch_type: EmbeddingArchType,
+    /// Max position embeddings (for BERT absolute position encoding)
+    pub max_position_embeddings: usize,
+}
+
+/// Pooling type for embedding models.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum PoolingType {
+    #[default]
+    Mean,
+    Cls,
+    Last,
+}
+
+impl Default for EmbeddingForwardConfig {
+    fn default() -> Self {
+        Self {
+            batch_size: 1,
+            seq_len: 512,
+            hidden_size: 768,
+            num_layers: 12,
+            num_q_heads: 12,
+            num_kv_heads: 12,
+            head_dim: 64,
+            intermediate_size: 3072,
+            vocab_size: 30522,
+            rms_norm_eps: 1e-5,
+            activation: Activation::GELU,
+            pooling: PoolingType::Mean,
+            normalize: true,
+            arch_type: EmbeddingArchType::default(),
+            max_position_embeddings: 512,
+        }
+    }
+}
+
+/// Configuration for rerank forward.
+#[derive(Clone, Debug)]
+pub struct RerankForwardConfig {
+    pub batch_size: usize,
+    pub seq_len: usize,
+    pub hidden_size: usize,
+    pub num_layers: usize,
+    pub num_q_heads: usize,
+    pub num_kv_heads: usize,
+    pub head_dim: usize,
+    pub intermediate_size: usize,
+    pub vocab_size: usize,
+    pub rms_norm_eps: f32,
+    pub activation: Activation,
+}
+
+impl Default for RerankForwardConfig {
+    fn default() -> Self {
+        Self {
+            batch_size: 1,
+            seq_len: 512,
+            hidden_size: 768,
+            num_layers: 12,
+            num_q_heads: 12,
+            num_kv_heads: 12,
+            head_dim: 64,
+            intermediate_size: 3072,
+            vocab_size: 30522,
+            rms_norm_eps: 1e-5,
+            activation: Activation::GELU,
         }
     }
 }
