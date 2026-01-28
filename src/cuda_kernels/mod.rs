@@ -25,6 +25,11 @@ pub mod rms_norm;
 pub mod selective_scan;
 pub mod silu;
 pub mod linear;
+pub mod elementwise;
+pub mod pooling;
+pub mod rope;
+pub mod sampling;
+pub mod moe_route;
 
 // Inference optimization kernels (REQ-OP-008 ~ REQ-OP-015)
 pub mod eagle3;
@@ -48,6 +53,11 @@ pub use rms_norm::{RmsNormError, RmsNormKernel};
 pub use selective_scan::{SelectiveScanError, SelectiveScanKernel};
 pub use silu::{CudaSilu, SiluError};
 pub use linear::CudaLinear;
+pub use elementwise::{CudaElementwiseKernel, ElementwiseError};
+pub use pooling::{CudaPoolingKernel, PoolingError};
+pub use rope::{CudaRoPEKernel, RoPEKernelError};
+pub use sampling::{CudaSamplingKernel, SamplingKernelError};
+pub use moe_route::{CudaMoeRouteKernel, MoeRouteKernelError, CudaMoeRouteResult};
 
 // Inference optimization kernels exports
 pub use eagle3::{Eagle3Error, Eagle3Kernel, Eagle3CudaConfig as Eagle3Config};

@@ -2,25 +2,33 @@ use std::sync::{Arc, OnceLock};
 
 use cudarc::driver::{CudaContext, CudaStream};
 
-use crate::backend_match::{
-    apply_f32_binary_out, apply_f32_inplace_weight, apply_f32_unary_inplace, apply_f32_unary_out,
-    match_float1, match_float1_mut, match_float1_mut_weight, match_float1_out,
-    match_float2_out, match_float2_out2, match_float3_out,
-};
-use crate::backend_trait::{Backend, TensorSlice, TensorSliceMut};
+use crate::backend_trait::Backend;
 use crate::cuda_kernels::{
     FlashAttentionKernel as CudaFlashAttentionKernel,
     PagedAttentionKernel as CudaPagedAttentionKernel,
     QuantizedDequantKernel,
     RmsNormKernel,
     CudaSilu,
+    CudaLinear,
+    CudaElementwiseKernel,
+    CudaPoolingKernel,
 };
 use crate::kernel_types::{
-    FlashAttentionConfig, KernelFloat, MatmulConfig, PagedAttentionConfig, SoftmaxConfig,
+    AttentionBlockConfig, FFNBlockConfig, EmbeddingConfig, LMHeadConfig,
+    KVCacheUpdateConfig, MeanPoolingConfig, ClsPoolingConfig, NormalizeConfig,
+    DequantizeConfig, EngramFuseConfig, FlashAttentionConfig,
+    KernelFloat, PagedAttentionConfig, MatmulConfig, LinearParams,
+    // L3 High-level inference configs (ARCH-ADR-003)
+    TransformerLayerWeights, MoETransformerLayerWeights, KVCacheState,
+    GeneratorForwardConfig, MoEGeneratorForwardConfig, EmbeddingForwardConfig,
+    RerankForwardConfig,
+    // GPU-pure weights (ARCH-GPU-001 / ARCH-ADR-010)
+    EmbeddingModelWeightsGpu, TransformerLayerWeightsGpu,
+    RerankerModelWeightsGpu, GeneratorModelWeightsGpu, KVCacheGpu,
+    TransformerLayerConfigGpu,
 };
-use crate::ops::moe_routing::{MoERoutingConfig, MoERoutingResult};
-use crate::ops::rope::RoPEConfig;
-use crate::ops::sampling::{SamplingConfig, TopKResult};
+use crate::gpu_types::{GpuBuffer, GpuTensor, TensorDtype};
+use crate::ops::sampling::SamplingConfig;
 use crate::runtime_detection::BackendType;
 
 /// Global CUDA context (lazy initialized).
@@ -37,6 +45,12 @@ static CUDA_RMSNORM_KERNEL: OnceLock<Option<RmsNormKernel>> = OnceLock::new();
 static CUDA_SILU_KERNEL: OnceLock<Option<CudaSilu>> = OnceLock::new();
 /// Global CUDA quantized dequantization kernel (lazy initialized).
 static CUDA_QUANTIZED_KERNEL: OnceLock<Option<QuantizedDequantKernel>> = OnceLock::new();
+/// Global CUDA linear kernel (lazy initialized).
+static CUDA_LINEAR_KERNEL: OnceLock<Option<CudaLinear>> = OnceLock::new();
+/// Global CUDA elementwise kernel (lazy initialized).
+static CUDA_ELEMENTWISE_KERNEL: OnceLock<Option<CudaElementwiseKernel>> = OnceLock::new();
+/// Global CUDA pooling kernel (lazy initialized).
+static CUDA_POOLING_KERNEL: OnceLock<Option<CudaPoolingKernel>> = OnceLock::new();
 
 fn get_cuda_context() -> Option<&'static Arc<CudaContext>> {
     CUDA_CONTEXT
@@ -129,6 +143,51 @@ fn get_cuda_quantized_kernel() -> Option<&'static QuantizedDequantKernel> {
                 Ok(kernel) => Some(kernel),
                 Err(e) => {
                     log::warn!("Failed to initialize CUDA quantized dequant kernel: {}", e);
+                    None
+                }
+            }
+        })
+        .as_ref()
+}
+
+fn get_cuda_linear_kernel() -> Option<&'static CudaLinear> {
+    CUDA_LINEAR_KERNEL
+        .get_or_init(|| {
+            let ctx = get_cuda_context()?;
+            match CudaLinear::new(ctx) {
+                Ok(kernel) => Some(kernel),
+                Err(e) => {
+                    log::warn!("Failed to initialize CUDA linear kernel: {}", e);
+                    None
+                }
+            }
+        })
+        .as_ref()
+}
+
+fn get_cuda_elementwise_kernel() -> Option<&'static CudaElementwiseKernel> {
+    CUDA_ELEMENTWISE_KERNEL
+        .get_or_init(|| {
+            let ctx = get_cuda_context()?;
+            match CudaElementwiseKernel::new(ctx) {
+                Ok(kernel) => Some(kernel),
+                Err(e) => {
+                    log::warn!("Failed to initialize CUDA elementwise kernel: {}", e);
+                    None
+                }
+            }
+        })
+        .as_ref()
+}
+
+fn get_cuda_pooling_kernel() -> Option<&'static CudaPoolingKernel> {
+    CUDA_POOLING_KERNEL
+        .get_or_init(|| {
+            let ctx = get_cuda_context()?;
+            match CudaPoolingKernel::new(ctx) {
+                Ok(kernel) => Some(kernel),
+                Err(e) => {
+                    log::warn!("Failed to initialize CUDA pooling kernel: {}", e);
                     None
                 }
             }
@@ -672,705 +731,1727 @@ impl Default for CudaBackend {
 }
 
 impl Backend for CudaBackend {
-    fn flash_attention(
-        &self,
-        q: TensorSlice<'_>,
-        k: TensorSlice<'_>,
-        v: TensorSlice<'_>,
-        output: TensorSliceMut<'_>,
-        config: FlashAttentionConfig,
-    ) -> Result<(), String> {
-        match_float3_out(
-            "flash_attention",
-            q,
-            k,
-            v,
-            output,
-            |q, k, v, out| {
-                if let (Some(kernel), Some(stream)) = (get_cuda_flash_kernel(), get_cuda_stream()) {
-                    if cuda_flash_attention(kernel, stream, q, k, v, out, &config) {
-                        return;
-                    }
-                    log::debug!("CUDA kernel dispatch failed, falling back to CPU");
-                }
-                crate::ops::attention::cpu_flash_attention(q, k, v, out, config.clone());
-            },
-            |q, k, v, out| {
-                if let (Some(kernel), Some(stream)) = (get_cuda_flash_kernel(), get_cuda_stream()) {
-                    if cuda_flash_attention(kernel, stream, q, k, v, out, &config) {
-                        return;
-                    }
-                    log::debug!("CUDA kernel dispatch failed, falling back to CPU");
-                }
-                crate::ops::attention::cpu_flash_attention(q, k, v, out, config.clone());
-            },
-            |q, k, v, out| {
-                if let (Some(kernel), Some(stream)) = (get_cuda_flash_kernel(), get_cuda_stream()) {
-                    if cuda_flash_attention(kernel, stream, q, k, v, out, &config) {
-                        return;
-                    }
-                    log::debug!("CUDA kernel dispatch failed, falling back to CPU");
-                }
-                crate::ops::attention::cpu_flash_attention(q, k, v, out, config.clone());
-            },
-        )
-    }
+    // =========================================================================
+    // L2 Block-Level Operators (ARCH-GRANULARITY-001)
+    // Fused GPU pipeline: data stays on GPU throughout entire L2 operation
+    // Only one upload (CPU→GPU) at start and one download (GPU→CPU) at end
+    // =========================================================================
 
-    fn paged_attention(
+    fn attention_block(
         &self,
-        q: TensorSlice<'_>,
-        k_cache: TensorSlice<'_>,
-        v_cache: TensorSlice<'_>,
-        page_table: &[u32],
-        seq_lens: &[u32],
-        output: TensorSliceMut<'_>,
-        config: PagedAttentionConfig,
-    ) -> Result<(), String> {
-        match_float3_out(
-            "paged_attention",
-            q,
-            k_cache,
-            v_cache,
-            output,
-            |q, k, v, out| {
-                if let (Some(kernel), Some(stream)) = (get_cuda_paged_kernel(), get_cuda_stream()) {
-                    if cuda_paged_attention(kernel, stream, q, k, v, page_table, seq_lens, out, &config) {
-                        return;
-                    }
-                    log::debug!("CUDA paged attention dispatch failed, falling back to CPU");
-                }
-                crate::ops::attention::cpu_paged_attention(
-                    q,
-                    k,
-                    v,
-                    page_table,
-                    seq_lens,
-                    out,
-                    config.clone(),
-                );
-            },
-            |q, k, v, out| {
-                if let (Some(kernel), Some(stream)) = (get_cuda_paged_kernel(), get_cuda_stream()) {
-                    if cuda_paged_attention(kernel, stream, q, k, v, page_table, seq_lens, out, &config) {
-                        return;
-                    }
-                    log::debug!("CUDA paged attention dispatch failed, falling back to CPU");
-                }
-                crate::ops::attention::cpu_paged_attention(
-                    q,
-                    k,
-                    v,
-                    page_table,
-                    seq_lens,
-                    out,
-                    config.clone(),
-                );
-            },
-            |q, k, v, out| {
-                if let (Some(kernel), Some(stream)) = (get_cuda_paged_kernel(), get_cuda_stream()) {
-                    if cuda_paged_attention(kernel, stream, q, k, v, page_table, seq_lens, out, &config) {
-                        return;
-                    }
-                    log::debug!("CUDA paged attention dispatch failed, falling back to CPU");
-                }
-                crate::ops::attention::cpu_paged_attention(
-                    q,
-                    k,
-                    v,
-                    page_table,
-                    seq_lens,
-                    out,
-                    config.clone(),
-                );
-            },
-        )
-    }
-
-    fn softmax(
-        &self,
-        input: TensorSlice<'_>,
-        output: TensorSliceMut<'_>,
-        config: SoftmaxConfig,
-    ) -> Result<(), String> {
-        match_float1_out(
-            "softmax",
-            input,
-            output,
-            |input, out| crate::ops::softmax::softmax(input, out, config.clone()),
-            |input, out| crate::ops::softmax::softmax(input, out, config.clone()),
-            |input, out| crate::ops::softmax::softmax(input, out, config.clone()),
-        )
-    }
-
-    fn matmul(
-        &self,
-        a: TensorSlice<'_>,
-        b: TensorSlice<'_>,
-        c: TensorSliceMut<'_>,
-        config: MatmulConfig,
-    ) -> Result<(), String> {
-        match_float2_out(
-            "matmul",
-            a,
-            b,
-            c,
-            |a, b, c| crate::ops::matmul::cpu_matmul(a, b, c, config.clone()),
-            |a, b, c| crate::ops::matmul::cpu_matmul(a, b, c, config.clone()),
-            |a, b, c| crate::ops::matmul::cpu_matmul(a, b, c, config.clone()),
-        )
-    }
-
-    fn q4_matmul(
-        &self,
-        input: &[f32],
-        q_weight: &[u8],
-        scales: &[half::f16],
-        m: usize,
-        n: usize,
-        k: usize,
-    ) -> Result<Vec<f32>, String> {
-        crate::ops::quantized::q4_matmul_cpu(input, q_weight, scales, m, n, k)
-    }
-
-    fn q8_matmul(
-        &self,
-        input: &[f32],
-        q_weight: &[i8],
-        scales: &[half::f16],
-        m: usize,
-        n: usize,
-        k: usize,
-    ) -> Result<Vec<f32>, String> {
-        crate::ops::quantized::q8_matmul_cpu(input, q_weight, scales, m, n, k)
-    }
-
-    fn q4_dequantize(
-        &self,
-        q_weight: &[u8],
-        scales: &[half::f16],
-        n: usize,
-        k: usize,
-    ) -> Result<Vec<f32>, String> {
-        if let (Some(kernel), Some(stream)) = (get_cuda_quantized_kernel(), get_cuda_stream()) {
-            match cuda_q4_dequantize(kernel, stream, q_weight, scales, n, k) {
-                Ok(output) => return Ok(output),
-                Err(err) => {
-                    log::debug!("CUDA q4 dequantize failed, falling back to CPU: {err}");
-                }
-            }
-        }
-        crate::ops::quantized::q4_dequantize_cpu(q_weight, scales, n, k)
-    }
-
-    fn awq_dequantize(
-        &self,
-        qweight: &[u32],
-        qzeros: &[u32],
-        scales: &[half::f16],
-        n: usize,
-        k: usize,
-        group_size: usize,
-    ) -> Result<Vec<f32>, String> {
-        if let (Some(kernel), Some(stream)) = (get_cuda_quantized_kernel(), get_cuda_stream()) {
-            match cuda_awq_dequantize(kernel, stream, qweight, qzeros, scales, n, k, group_size) {
-                Ok(output) => return Ok(output),
-                Err(err) => {
-                    log::debug!("CUDA AWQ dequantize failed, falling back to CPU: {err}");
-                }
-            }
-        }
-        crate::ops::quantized::awq_dequantize_cpu(qweight, qzeros, scales, n, k, group_size)
-    }
-
-    fn awq_matmul(
-        &self,
-        input: &[f32],
-        qweight: &[u32],
-        qzeros: &[u32],
-        scales: &[half::f16],
-        m: usize,
-        n: usize,
-        k: usize,
-        group_size: usize,
-    ) -> Result<Vec<f32>, String> {
-        crate::ops::quantized::awq_matmul_cpu(
-            input,
-            qweight,
-            qzeros,
-            scales,
-            m,
-            n,
-            k,
-            group_size,
-        )
-    }
-
-    fn rope_precompute(
-        &self,
-        cos_out: &mut [f32],
-        sin_out: &mut [f32],
-        config: RoPEConfig,
-    ) -> Result<(), String> {
-        crate::ops::rope::rope_precompute(cos_out, sin_out, &config);
-        Ok(())
-    }
-
-    fn rope_apply(
-        &self,
-        q: TensorSlice<'_>,
-        k: TensorSlice<'_>,
+        hidden: &[f32],
+        q_weight: &[f32],
+        k_weight: &[f32],
+        v_weight: &[f32],
+        o_weight: &[f32],
+        norm_weight: &[f32],
         cos_cache: &[f32],
         sin_cache: &[f32],
-        q_out: TensorSliceMut<'_>,
-        k_out: TensorSliceMut<'_>,
-        batch_size: usize,
-        seq_len: usize,
-        num_q_heads: usize,
-        num_kv_heads: usize,
-        head_dim: usize,
-        position_offset: usize,
+        _kv_cache_k: Option<&mut [f32]>,
+        _kv_cache_v: Option<&mut [f32]>,
+        config: &AttentionBlockConfig,
+    ) -> Result<Vec<f32>, String> {
+        // NOTE: This is a CPU API (accepts &[f32] host slices).
+        // Per ARCH-ADR-010, GPU optimization should happen at higher level
+        // (generator_forward_gpu_pure) with GpuTensor inputs.
+        // Block-level CPU API should use CPU backend directly.
+        crate::cpu_backend::CpuBackend::new().attention_block(
+            hidden, q_weight, k_weight, v_weight, o_weight,
+            norm_weight, cos_cache, sin_cache, _kv_cache_k, _kv_cache_v, config,
+        )
+    }
+
+    fn ffn_block(
+        &self,
+        hidden: &[f32],
+        gate_weight: Option<&[f32]>,
+        up_weight: &[f32],
+        down_weight: &[f32],
+        norm_weight: &[f32],
+        config: &FFNBlockConfig,
+    ) -> Result<Vec<f32>, String> {
+        // NOTE: This is a CPU API (accepts &[f32] host slices).
+        // Per ARCH-ADR-010, GPU optimization should happen at higher level
+        // (generator_forward_gpu_pure) with GpuTensor inputs.
+        // Block-level CPU API should use CPU backend directly.
+        crate::cpu_backend::CpuBackend::new().ffn_block(
+            hidden, gate_weight, up_weight, down_weight, norm_weight, config,
+        )
+    }
+
+    fn embedding(
+        &self,
+        tokens: &[u32],
+        embed_weight: &[f32],
+        position_weight: Option<&[f32]>,
+        config: &EmbeddingConfig,
+    ) -> Result<Vec<f32>, String> {
+        // Embedding is efficient on CPU (simple lookup), no GPU benefit
+        crate::cpu_backend::CpuBackend::new().embedding(
+            tokens, embed_weight, position_weight, config,
+        )
+    }
+
+    fn lm_head(
+        &self,
+        hidden: &[f32],
+        lm_weight: &[f32],
+        norm_weight: &[f32],
+        config: &LMHeadConfig,
+    ) -> Result<Vec<f32>, String> {
+        // NOTE: This is a CPU API (accepts &[f32] host slices).
+        // Per ARCH-ADR-010, GPU optimization should happen at higher level
+        // (generator_forward_gpu_pure) with GpuTensor inputs.
+        // Block-level CPU API should use CPU backend directly.
+        crate::cpu_backend::CpuBackend::new().lm_head(hidden, lm_weight, norm_weight, config)
+    }
+
+    fn engram_lookup(
+        &self,
+        tokens: &[u32],
+        engram_table: &[f32],
+        hidden_size: usize,
+        ngram_size: usize,
+        num_buckets: usize,
+    ) -> Result<(Vec<f32>, Vec<u64>), String> {
+        // Engram lookup is always CPU (DRAM-based hash table)
+        crate::cpu_backend::CpuBackend::new().engram_lookup(
+            tokens, engram_table, hidden_size, ngram_size, num_buckets,
+        )
+    }
+
+    fn engram_fuse(
+        &self,
+        attention_output: &[f32],
+        engram_output: &[f32],
+        config: &EngramFuseConfig,
+    ) -> Result<Vec<f32>, String> {
+        // Simple element-wise fusion, CPU is efficient
+        crate::cpu_backend::CpuBackend::new().engram_fuse(attention_output, engram_output, config)
+    }
+
+    fn kv_cache_update(
+        &self,
+        k_cache: &mut [f32],
+        v_cache: &mut [f32],
+        new_k: &[f32],
+        new_v: &[f32],
+        config: &KVCacheUpdateConfig,
     ) -> Result<(), String> {
-        match_float2_out2(
-            "rope_apply",
-            q,
-            k,
-            q_out,
-            k_out,
-            |q, k, q_out, k_out| {
-                crate::ops::rope::rope_apply(
-                    q,
-                    k,
-                    cos_cache,
-                    sin_cache,
-                    q_out,
-                    k_out,
-                    batch_size,
-                    seq_len,
-                    num_q_heads,
-                    num_kv_heads,
-                    head_dim,
-                    position_offset,
-                );
-            },
-            |q, k, q_out, k_out| {
-                crate::ops::rope::rope_apply(
-                    q,
-                    k,
-                    cos_cache,
-                    sin_cache,
-                    q_out,
-                    k_out,
-                    batch_size,
-                    seq_len,
-                    num_q_heads,
-                    num_kv_heads,
-                    head_dim,
-                    position_offset,
-                );
-            },
-            |q, k, q_out, k_out| {
-                crate::ops::rope::rope_apply(
-                    q,
-                    k,
-                    cos_cache,
-                    sin_cache,
-                    q_out,
-                    k_out,
-                    batch_size,
-                    seq_len,
-                    num_q_heads,
-                    num_kv_heads,
-                    head_dim,
-                    position_offset,
-                );
-            },
-        )
+        // KV cache update is memory-bound, CPU efficient
+        crate::cpu_backend::CpuBackend::new().kv_cache_update(k_cache, v_cache, new_k, new_v, config)
     }
 
-    fn rope_apply_inplace(
+    fn sample(
         &self,
-        x: TensorSliceMut<'_>,
-        cos_cache: &[f32],
-        sin_cache: &[f32],
-        batch_size: usize,
-        seq_len: usize,
-        num_heads: usize,
-        head_dim: usize,
-        position_offset: usize,
-    ) -> Result<(), String> {
-        match_float1_mut(
-            x,
-            |x| {
-                crate::ops::rope::rope_apply_inplace(
-                    x,
-                    cos_cache,
-                    sin_cache,
-                    batch_size,
-                    seq_len,
-                    num_heads,
-                    head_dim,
-                    position_offset,
-                );
-            },
-            |x| {
-                crate::ops::rope::rope_apply_inplace(
-                    x,
-                    cos_cache,
-                    sin_cache,
-                    batch_size,
-                    seq_len,
-                    num_heads,
-                    head_dim,
-                    position_offset,
-                );
-            },
-            |x| {
-                crate::ops::rope::rope_apply_inplace(
-                    x,
-                    cos_cache,
-                    sin_cache,
-                    batch_size,
-                    seq_len,
-                    num_heads,
-                    head_dim,
-                    position_offset,
-                );
-            },
-        )
-    }
-
-    fn topk(
-        &self,
-        logits: TensorSlice<'_>,
-        k: usize,
-        batch_size: usize,
-        vocab_size: usize,
-    ) -> Result<TopKResult, String> {
-        match_float1(
-            logits,
-            |logits| crate::ops::sampling::topk(logits, k, batch_size, vocab_size),
-            |logits| crate::ops::sampling::topk(logits, k, batch_size, vocab_size),
-            |logits| crate::ops::sampling::topk(logits, k, batch_size, vocab_size),
-        )
-    }
-
-    fn apply_temperature(
-        &self,
-        logits: TensorSliceMut<'_>,
-        temperature: f32,
-    ) -> Result<(), String> {
-        match_float1_mut(
-            logits,
-            |logits| crate::ops::sampling::apply_temperature(logits, temperature),
-            |logits| crate::ops::sampling::apply_temperature(logits, temperature),
-            |logits| crate::ops::sampling::apply_temperature(logits, temperature),
-        )
-    }
-
-    fn sample_tokens(
-        &self,
-        logits: TensorSlice<'_>,
-        batch_size: usize,
+        logits: &[f32],
         vocab_size: usize,
         config: &SamplingConfig,
     ) -> Result<Vec<u32>, String> {
-        match_float1(
-            logits,
-            |logits| crate::ops::sampling::sample_tokens(logits, batch_size, vocab_size, config),
-            |logits| crate::ops::sampling::sample_tokens(logits, batch_size, vocab_size, config),
-            |logits| crate::ops::sampling::sample_tokens(logits, batch_size, vocab_size, config),
-        )
+        // Sampling requires RNG, always CPU
+        crate::cpu_backend::CpuBackend::new().sample(logits, vocab_size, config)
     }
 
-    fn argmax(
+    fn mean_pooling(
         &self,
-        logits: TensorSlice<'_>,
-        batch_size: usize,
-        vocab_size: usize,
-    ) -> Result<Vec<u32>, String> {
-        match_float1(
-            logits,
-            |logits| crate::ops::sampling::argmax(logits, batch_size, vocab_size),
-            |logits| crate::ops::sampling::argmax(logits, batch_size, vocab_size),
-            |logits| crate::ops::sampling::argmax(logits, batch_size, vocab_size),
-        )
-    }
-
-    fn moe_route(
-        &self,
-        hidden_states: TensorSlice<'_>,
-        gate_weights: &[f32],
-        batch_size: usize,
-        seq_len: usize,
-        config: &MoERoutingConfig,
-    ) -> Result<MoERoutingResult, String> {
-        match_float1(
-            hidden_states,
-            |hidden_states| {
-                crate::ops::moe_routing::moe_route(
-                    hidden_states,
-                    gate_weights,
-                    batch_size,
-                    seq_len,
-                    config,
-                )
-            },
-            |hidden_states| {
-                crate::ops::moe_routing::moe_route(
-                    hidden_states,
-                    gate_weights,
-                    batch_size,
-                    seq_len,
-                    config,
-                )
-            },
-            |hidden_states| {
-                crate::ops::moe_routing::moe_route(
-                    hidden_states,
-                    gate_weights,
-                    batch_size,
-                    seq_len,
-                    config,
-                )
-            },
-        )
-    }
-
-    fn compute_routing_logits(
-        &self,
-        hidden_states: TensorSlice<'_>,
-        gate_weights: &[f32],
-        batch_size: usize,
-        seq_len: usize,
-        config: &MoERoutingConfig,
+        hidden: &[f32],
+        attention_mask: Option<&[f32]>,
+        config: &MeanPoolingConfig,
     ) -> Result<Vec<f32>, String> {
-        match_float1(
-            hidden_states,
-            |hidden_states| {
-                crate::ops::moe_routing::compute_routing_logits(
-                    hidden_states,
-                    gate_weights,
-                    batch_size,
-                    seq_len,
-                    config,
-                )
-            },
-            |hidden_states| {
-                crate::ops::moe_routing::compute_routing_logits(
-                    hidden_states,
-                    gate_weights,
-                    batch_size,
-                    seq_len,
-                    config,
-                )
-            },
-            |hidden_states| {
-                crate::ops::moe_routing::compute_routing_logits(
-                    hidden_states,
-                    gate_weights,
-                    batch_size,
-                    seq_len,
-                    config,
-                )
-            },
-        )
+        // Simple reduction, CPU efficient for typical batch sizes
+        crate::cpu_backend::CpuBackend::new().mean_pooling(hidden, attention_mask, config)
     }
 
-    fn rms_norm(
+    fn cls_pooling(
         &self,
-        input: TensorSlice<'_>,
-        weight: TensorSlice<'_>,
-        output: TensorSliceMut<'_>,
-        batch: usize,
-        hidden: usize,
-        eps: f32,
-    ) -> Result<(), String> {
-        match_float2_out(
-            "rms_norm",
-            input,
-            weight,
-            output,
-            |input, weight, output| {
-                if let (Some(kernel), Some(stream)) = (get_cuda_rmsnorm_kernel(), get_cuda_stream()) {
-                    if cuda_rms_norm(kernel, stream, input, weight, output, batch, hidden, eps) {
-                        return;
-                    }
-                    log::debug!("CUDA rms_norm dispatch failed, falling back to CPU");
-                }
-                crate::ops::rms_norm::rms_norm_forward(input, weight, output, batch, hidden, eps);
-            },
-            |input, weight, output| {
-                if let (Some(kernel), Some(stream)) = (get_cuda_rmsnorm_kernel(), get_cuda_stream()) {
-                    if cuda_rms_norm(kernel, stream, input, weight, output, batch, hidden, eps) {
-                        return;
-                    }
-                    log::debug!("CUDA rms_norm dispatch failed, falling back to CPU");
-                }
-                apply_f32_binary_out(input, weight, output, |input, weight, output| {
-                    crate::ops::rms_norm::rms_norm_forward(input, weight, output, batch, hidden, eps);
-                });
-            },
-            |input, weight, output| {
-                if let (Some(kernel), Some(stream)) = (get_cuda_rmsnorm_kernel(), get_cuda_stream()) {
-                    if cuda_rms_norm(kernel, stream, input, weight, output, batch, hidden, eps) {
-                        return;
-                    }
-                    log::debug!("CUDA rms_norm dispatch failed, falling back to CPU");
-                }
-                apply_f32_binary_out(input, weight, output, |input, weight, output| {
-                    crate::ops::rms_norm::rms_norm_forward(input, weight, output, batch, hidden, eps);
-                });
-            },
-        )
+        hidden: &[f32],
+        config: &ClsPoolingConfig,
+    ) -> Result<Vec<f32>, String> {
+        // CLS extraction is just memory copy
+        crate::cpu_backend::CpuBackend::new().cls_pooling(hidden, config)
     }
 
-    fn rms_norm_inplace(
+    fn normalize(
         &self,
-        data: TensorSliceMut<'_>,
-        weight: TensorSlice<'_>,
-        batch: usize,
-        hidden: usize,
-        eps: f32,
-    ) -> Result<(), String> {
-        match_float1_mut_weight(
-            "rms_norm_inplace",
-            data,
-            weight,
-            |data, weight| {
-                if let (Some(kernel), Some(stream)) = (get_cuda_rmsnorm_kernel(), get_cuda_stream()) {
-                    if cuda_rms_norm_inplace(kernel, stream, data, weight, batch, hidden, eps) {
-                        return;
-                    }
-                    log::debug!("CUDA rms_norm_inplace dispatch failed, falling back to CPU");
-                }
-                crate::ops::rms_norm::rms_norm_inplace(data, weight, batch, hidden, eps);
-            },
-            |data, weight| {
-                if let (Some(kernel), Some(stream)) = (get_cuda_rmsnorm_kernel(), get_cuda_stream()) {
-                    if cuda_rms_norm_inplace(kernel, stream, data, weight, batch, hidden, eps) {
-                        return;
-                    }
-                    log::debug!("CUDA rms_norm_inplace dispatch failed, falling back to CPU");
-                }
-                apply_f32_inplace_weight(data, weight, |data, weight| {
-                    crate::ops::rms_norm::rms_norm_inplace(data, weight, batch, hidden, eps);
-                });
-            },
-            |data, weight| {
-                if let (Some(kernel), Some(stream)) = (get_cuda_rmsnorm_kernel(), get_cuda_stream()) {
-                    if cuda_rms_norm_inplace(kernel, stream, data, weight, batch, hidden, eps) {
-                        return;
-                    }
-                    log::debug!("CUDA rms_norm_inplace dispatch failed, falling back to CPU");
-                }
-                apply_f32_inplace_weight(data, weight, |data, weight| {
-                    crate::ops::rms_norm::rms_norm_inplace(data, weight, batch, hidden, eps);
-                });
-            },
-        )
+        input: &[f32],
+        config: &NormalizeConfig,
+    ) -> Result<Vec<f32>, String> {
+        // L2 normalization, CPU efficient for embedding vectors
+        crate::cpu_backend::CpuBackend::new().normalize(input, config)
     }
 
-    fn silu_inplace(
+    fn dequantize(
         &self,
-        data: TensorSliceMut<'_>,
-    ) -> Result<(), String> {
-        match_float1_mut(
-            data,
-            |data| {
-                if let (Some(kernel), Some(stream)) = (get_cuda_silu_kernel(), get_cuda_stream()) {
-                    if cuda_silu_inplace(kernel, stream, data) {
-                        return;
+        quantized: &[u8],
+        scales: &[half::f16],
+        zeros: Option<&[u32]>,
+        config: &DequantizeConfig,
+    ) -> Result<Vec<f32>, String> {
+        // Try GPU dequantization for large tensors
+        if let (Some(kernel), Some(stream)) = (get_cuda_quantized_kernel(), get_cuda_stream()) {
+            let total_elements = config.n * config.k;
+            // Use GPU for large tensors (> 1M elements)
+            if total_elements > 1_000_000 {
+                // Upload quantized data
+                if let Ok(quant_buf) = stream.clone_htod(quantized) {
+                    let scales_f32: Vec<f32> = scales.iter().map(|s| s.to_f32()).collect();
+                    if let Ok(scales_buf) = stream.clone_htod(&scales_f32) {
+                        if let Ok(mut output_buf) = stream.alloc_zeros::<f32>(total_elements) {
+                            // Call GPU dequantize kernel based on format
+                            let success = match config.format {
+                                crate::kernel_types::QuantFormat::Q4_0 |
+                                crate::kernel_types::QuantFormat::Q4_K => {
+                                    // Convert scales from f32 back to f16 for kernel
+                                    let scales_f16: Vec<half::f16> = scales.to_vec();
+                                    if let Ok(scales_f16_buf) = stream.clone_htod(&scales_f16) {
+                                        let num_blocks = (config.n * config.k) / 32;
+                                        kernel.dequantize_q4(stream, &quant_buf, &scales_f16_buf, num_blocks).is_ok()
+                                    } else { false }
+                                }
+                                crate::kernel_types::QuantFormat::AWQ => {
+                                    if let Some(z) = zeros {
+                                        // AWQ uses u32 qweight and qzeros
+                                        let qweight: Vec<u32> = quantized.chunks(4).map(|chunk| {
+                                            u32::from_le_bytes([chunk[0], chunk.get(1).copied().unwrap_or(0),
+                                                               chunk.get(2).copied().unwrap_or(0), chunk.get(3).copied().unwrap_or(0)])
+                                        }).collect();
+                                        if let Ok(qweight_buf) = stream.clone_htod(&qweight) {
+                                            if let Ok(qzeros_buf) = stream.clone_htod(z) {
+                                                let scales_f16: Vec<half::f16> = scales.to_vec();
+                                                if let Ok(scales_f16_buf) = stream.clone_htod(&scales_f16) {
+                                                    kernel.dequantize_awq(stream, &qweight_buf, &qzeros_buf, &scales_f16_buf, config.n, config.k, config.group_size).is_ok()
+                                                } else { false }
+                                            } else { false }
+                                        } else { false }
+                                    } else { false }
+                                }
+                                _ => false,
+                            };
+                            if success {
+                                if let Ok(result) = stream.clone_dtoh(&output_buf) {
+                                    return Ok(result);
+                                }
+                            }
+                        }
                     }
-                    log::debug!("CUDA silu_inplace dispatch failed, falling back to CPU");
                 }
-                crate::ops::activations::silu_inplace(data);
-            },
-            |data| {
-                if let (Some(kernel), Some(stream)) = (get_cuda_silu_kernel(), get_cuda_stream()) {
-                    if cuda_silu_inplace(kernel, stream, data) {
-                        return;
-                    }
-                    log::debug!("CUDA silu_inplace dispatch failed, falling back to CPU");
-                }
-                apply_f32_unary_inplace(data, |data| {
-                    crate::ops::activations::silu_inplace(data);
-                });
-            },
-            |data| {
-                if let (Some(kernel), Some(stream)) = (get_cuda_silu_kernel(), get_cuda_stream()) {
-                    if cuda_silu_inplace(kernel, stream, data) {
-                        return;
-                    }
-                    log::debug!("CUDA silu_inplace dispatch failed, falling back to CPU");
-                }
-                apply_f32_unary_inplace(data, |data| {
-                    crate::ops::activations::silu_inplace(data);
-                });
-            },
-        )
-    }
+                log::debug!("CUDA dequantize failed, falling back to CPU");
+            }
+        }
 
-    fn silu(
-        &self,
-        input: TensorSlice<'_>,
-        output: TensorSliceMut<'_>,
-    ) -> Result<(), String> {
-        match_float1_out(
-            "silu",
-            input,
-            output,
-            |input, output| {
-                if let (Some(kernel), Some(stream)) = (get_cuda_silu_kernel(), get_cuda_stream()) {
-                    if cuda_silu(kernel, stream, input, output) {
-                        return;
-                    }
-                    log::debug!("CUDA silu dispatch failed, falling back to CPU");
-                }
-                crate::ops::activations::silu(input, output);
-            },
-            |input, output| {
-                if let (Some(kernel), Some(stream)) = (get_cuda_silu_kernel(), get_cuda_stream()) {
-                    if cuda_silu(kernel, stream, input, output) {
-                        return;
-                    }
-                    log::debug!("CUDA silu dispatch failed, falling back to CPU");
-                }
-                apply_f32_unary_out(input, output, |input, output| {
-                    crate::ops::activations::silu(input, output);
-                });
-            },
-            |input, output| {
-                if let (Some(kernel), Some(stream)) = (get_cuda_silu_kernel(), get_cuda_stream()) {
-                    if cuda_silu(kernel, stream, input, output) {
-                        return;
-                    }
-                    log::debug!("CUDA silu dispatch failed, falling back to CPU");
-                }
-                apply_f32_unary_out(input, output, |input, output| {
-                    crate::ops::activations::silu(input, output);
-                });
-            },
-        )
-    }
-
-    fn add_bias(
-        &self,
-        output: TensorSliceMut<'_>,
-        bias: TensorSlice<'_>,
-        batch: usize,
-        features: usize,
-    ) -> Result<(), String> {
-        match_float1_out(
-            "add_bias",
-            bias,
-            output,
-            |bias, output| crate::ops::linear::add_bias(output, bias, batch, features),
-            |bias, output| crate::ops::linear::add_bias(output, bias, batch, features),
-            |bias, output| crate::ops::linear::add_bias(output, bias, batch, features),
-        )
+        // CPU fallback
+        crate::cpu_backend::CpuBackend::new().dequantize(quantized, scales, zeros, config)
     }
 
     fn backend_type(&self) -> BackendType {
         BackendType::Cuda
     }
+
+    // =========================================================================
+    // L3 High-Level Inference API (ARCH-ADR-003)
+    // CPU fallback for now; GPU-optimized versions can be added later
+    // =========================================================================
+
+    fn generator_forward(
+        &self,
+        tokens: &[u32],
+        embed_weight: &[f32],
+        layers: &[TransformerLayerWeights<'_>],
+        final_norm: &[f32],
+        lm_head_weight: &[f32],
+        cos_cache: &[f32],
+        sin_cache: &[f32],
+        kv_cache: &mut KVCacheState<'_>,
+        config: &GeneratorForwardConfig,
+    ) -> Result<Vec<f32>, String> {
+        // TODO: Implement CUDA-optimized generator forward
+        // For now, delegate to CPU implementation
+        crate::cpu_backend::CpuBackend::new().generator_forward(
+            tokens, embed_weight, layers, final_norm, lm_head_weight,
+            cos_cache, sin_cache, kv_cache, config,
+        )
+    }
+
+    fn moe_generator_forward(
+        &self,
+        tokens: &[u32],
+        embed_weight: &[f32],
+        layers: &[MoETransformerLayerWeights<'_>],
+        final_norm: &[f32],
+        lm_head_weight: &[f32],
+        cos_cache: &[f32],
+        sin_cache: &[f32],
+        kv_cache: &mut KVCacheState<'_>,
+        config: &MoEGeneratorForwardConfig,
+    ) -> Result<Vec<f32>, String> {
+        // TODO: Implement CUDA-optimized MoE generator forward
+        crate::cpu_backend::CpuBackend::new().moe_generator_forward(
+            tokens, embed_weight, layers, final_norm, lm_head_weight,
+            cos_cache, sin_cache, kv_cache, config,
+        )
+    }
+
+    fn embedding_forward(
+        &self,
+        tokens: &[u32],
+        embed_weight: &[f32],
+        layers: &[TransformerLayerWeights<'_>],
+        final_norm: Option<&[f32]>,
+        config: &EmbeddingForwardConfig,
+    ) -> Result<Vec<f32>, String> {
+        // TODO: Implement CUDA-optimized embedding forward
+        crate::cpu_backend::CpuBackend::new().embedding_forward(
+            tokens, embed_weight, layers, final_norm, config,
+        )
+    }
+
+    fn rerank_forward(
+        &self,
+        tokens: &[u32],
+        embed_weight: &[f32],
+        layers: &[TransformerLayerWeights<'_>],
+        final_norm: &[f32],
+        score_weight: &[f32],
+        config: &RerankForwardConfig,
+    ) -> Result<Vec<f32>, String> {
+        // TODO: Implement CUDA-optimized rerank forward
+        crate::cpu_backend::CpuBackend::new().rerank_forward(
+            tokens, embed_weight, layers, final_norm, score_weight, config,
+        )
+    }
+
+    // =========================================================================
+    // GPU-pure methods (ARCH-GPU-001)
+    // Upload weights to GPU ONCE at load time, reuse for all forward passes.
+    // NO repeated GPU<->CPU transfers during inference.
+    // =========================================================================
+
+    fn upload_embedding_weights(
+        &self,
+        embed_weight: &[f32],
+        layers: &[TransformerLayerWeights<'_>],
+        final_norm: Option<&[f32]>,
+        _config: &EmbeddingForwardConfig,
+    ) -> Result<EmbeddingModelWeightsGpu, String> {
+        let stream = get_cuda_stream()
+            .ok_or("CUDA stream not available")?;
+
+        // Helper to upload f32 slice to CUDA GPU memory
+        // Returns GpuTensor with CUDA buffer
+        fn upload_f32_to_cuda(
+            stream: &Arc<CudaStream>,
+            data: &[f32],
+            shape: Vec<usize>,
+        ) -> Result<GpuTensor, String> {
+            if data.is_empty() {
+                // Empty tensor - use CPU buffer
+                return Ok(GpuTensor::new(
+                    GpuBuffer::Cpu(Arc::new(Vec::new())),
+                    shape,
+                    TensorDtype::F32,
+                    BackendType::Cuda,
+                ));
+            }
+
+            // Convert f32 slice to u8 slice (safe, no allocation)
+            let bytes: &[u8] = bytemuck::cast_slice(data);
+
+            // Upload bytes to CUDA GPU
+            let cuda_slice = stream.clone_htod(bytes)
+                .map_err(|e| format!("CUDA upload failed: {}", e))?;
+
+            Ok(GpuTensor::new(
+                GpuBuffer::Cuda(Arc::new(cuda_slice)),
+                shape,
+                TensorDtype::F32,
+                BackendType::Cuda,
+            ))
+        }
+
+        // Upload embedding weights to GPU
+        let embedding = upload_f32_to_cuda(stream, embed_weight, vec![embed_weight.len()])?;
+
+        // Upload all layer weights to GPU
+        let gpu_layers: Result<Vec<TransformerLayerWeightsGpu>, String> = layers.iter()
+            .map(|layer| {
+                Ok(TransformerLayerWeightsGpu {
+                    input_norm: upload_f32_to_cuda(stream, layer.input_norm, vec![layer.input_norm.len()])?,
+                    q_weight: upload_f32_to_cuda(stream, layer.q_weight, vec![layer.q_weight.len()])?,
+                    k_weight: upload_f32_to_cuda(stream, layer.k_weight, vec![layer.k_weight.len()])?,
+                    v_weight: upload_f32_to_cuda(stream, layer.v_weight, vec![layer.v_weight.len()])?,
+                    o_weight: upload_f32_to_cuda(stream, layer.o_weight, vec![layer.o_weight.len()])?,
+                    post_attn_norm: upload_f32_to_cuda(stream, layer.post_attn_norm, vec![layer.post_attn_norm.len()])?,
+                    gate_weight: match layer.gate_weight {
+                        Some(g) => Some(upload_f32_to_cuda(stream, g, vec![g.len()])?),
+                        None => None,
+                    },
+                    up_weight: upload_f32_to_cuda(stream, layer.up_weight, vec![layer.up_weight.len()])?,
+                    down_weight: upload_f32_to_cuda(stream, layer.down_weight, vec![layer.down_weight.len()])?,
+                })
+            })
+            .collect();
+        let gpu_layers = gpu_layers?;
+
+        // Upload final norm to GPU
+        let final_norm_data = final_norm.unwrap_or(&[]);
+        let final_norm_gpu = upload_f32_to_cuda(stream, final_norm_data, vec![final_norm_data.len()])?;
+
+        Ok(EmbeddingModelWeightsGpu {
+            embedding,
+            layers: gpu_layers,
+            final_norm: final_norm_gpu,
+        })
+    }
+
+    fn embedding_forward_gpu_pure(
+        &self,
+        tokens: &[u32],
+        weights: &EmbeddingModelWeightsGpu,
+        config: &EmbeddingForwardConfig,
+    ) -> Result<Vec<f32>, String> {
+        let stream = get_cuda_stream()
+            .ok_or("CUDA stream not available")?;
+
+        // Helper to download f32 data from CUDA GPU memory
+        fn download_f32_from_cuda(
+            stream: &Arc<CudaStream>,
+            tensor: &GpuTensor,
+        ) -> Result<Vec<f32>, String> {
+            match &tensor.buffer {
+                GpuBuffer::Cuda(cuda_slice) => {
+                    // Download bytes from GPU
+                    let bytes: Vec<u8> = stream.clone_dtoh(cuda_slice.as_ref())
+                        .map_err(|e| format!("CUDA download failed: {}", e))?;
+
+                    // Convert bytes to f32 (safe copy)
+                    let f32_data: Vec<f32> = bytemuck::cast_slice(&bytes).to_vec();
+                    Ok(f32_data)
+                }
+                GpuBuffer::Cpu(bytes) => {
+                    // CPU buffer fallback (for empty tensors)
+                    if bytes.is_empty() {
+                        return Ok(Vec::new());
+                    }
+                    let f32_data: Vec<f32> = bytemuck::cast_slice(bytes.as_slice()).to_vec();
+                    Ok(f32_data)
+                }
+                #[allow(unreachable_patterns)]
+                _ => Err("Unexpected GPU buffer type for CUDA backend".to_string()),
+            }
+        }
+
+        // Download weights from GPU (only once per forward pass)
+        // TODO: Implement true GPU-native forward using CUDA kernels to avoid this download
+        let embed_weight = download_f32_from_cuda(stream, &weights.embedding)?;
+        let final_norm = download_f32_from_cuda(stream, &weights.final_norm)?;
+        let final_norm_opt = if final_norm.is_empty() { None } else { Some(final_norm.as_slice()) };
+
+        let layer_weights: Result<Vec<(Vec<f32>, Vec<f32>, Vec<f32>, Vec<f32>, Vec<f32>, Vec<f32>, Option<Vec<f32>>, Vec<f32>, Vec<f32>)>, String> =
+            weights.layers.iter()
+                .map(|layer| {
+                    Ok((
+                        download_f32_from_cuda(stream, &layer.input_norm)?,
+                        download_f32_from_cuda(stream, &layer.q_weight)?,
+                        download_f32_from_cuda(stream, &layer.k_weight)?,
+                        download_f32_from_cuda(stream, &layer.v_weight)?,
+                        download_f32_from_cuda(stream, &layer.o_weight)?,
+                        download_f32_from_cuda(stream, &layer.post_attn_norm)?,
+                        layer.gate_weight.as_ref().map(|g| download_f32_from_cuda(stream, g)).transpose()?,
+                        download_f32_from_cuda(stream, &layer.up_weight)?,
+                        download_f32_from_cuda(stream, &layer.down_weight)?,
+                    ))
+                })
+                .collect();
+        let layer_data = layer_weights?;
+
+        let layers: Vec<TransformerLayerWeights<'_>> = layer_data.iter()
+            .map(|(input_norm, q, k, v, o, post_norm, gate, up, down)| {
+                TransformerLayerWeights {
+                    input_norm: input_norm.as_slice(),
+                    q_weight: q.as_slice(),
+                    k_weight: k.as_slice(),
+                    v_weight: v.as_slice(),
+                    o_weight: o.as_slice(),
+                    post_attn_norm: post_norm.as_slice(),
+                    gate_weight: gate.as_ref().map(|g| g.as_slice()),
+                    up_weight: up.as_slice(),
+                    down_weight: down.as_slice(),
+                }
+            })
+            .collect();
+
+        // Call existing embedding_forward
+        // Note: This still downloads from GPU for computation. True GPU-native forward
+        // will be implemented when CUDA embedding/attention/FFN kernels are integrated.
+        self.embedding_forward(tokens, &embed_weight, &layers, final_norm_opt, config)
+    }
+
+    // =========================================================================
+    // GPU-Native Kernel Methods (ARCH-ADR-010)
+    // CUDA backend: True GPU-resident computation
+    //
+    // IMPORTANT: These methods MUST keep all data on GPU throughout computation.
+    // Pattern: GpuTensor in → CUDA kernel dispatch → GpuTensor out
+    // FORBIDDEN: download → CPU compute → upload (violates ARCH-GPU-001-B)
+    // =========================================================================
+
+    fn embedding_lookup_gpu(
+        &self,
+        tokens: &GpuTensor,
+        embed_weight: &GpuTensor,
+        output: &mut GpuTensor,
+    ) -> Result<(), String> {
+        let stream = get_cuda_stream()
+            .ok_or("CUDA stream not available")?;
+        let kernel = get_cuda_pooling_kernel()
+            .ok_or("CUDA pooling kernel not available")?;
+
+        if tokens.dtype != TensorDtype::U32 {
+            return Err("embedding_lookup_gpu: tokens must be U32 tensor".into());
+        }
+        if embed_weight.dtype != TensorDtype::F32 {
+            return Err("embedding_lookup_gpu: embed_weight must be F32 tensor".into());
+        }
+        if embed_weight.shape.len() < 2 {
+            return Err("embedding_lookup_gpu: embed_weight must be 2D [vocab, hidden]".into());
+        }
+
+        let num_tokens: usize = tokens.shape.iter().product();
+        let hidden_dim = *embed_weight.shape.last().unwrap();
+        let embed_elements: usize = embed_weight.shape.iter().product();
+        let output_elements = num_tokens
+            .checked_mul(hidden_dim)
+            .ok_or("embedding_lookup_gpu: output size overflow")?;
+
+        let GpuBuffer::Cuda(tokens_slice) = &tokens.buffer else {
+            return Err("embedding_lookup_gpu: tokens must be CUDA buffer".into());
+        };
+        let GpuBuffer::Cuda(embed_slice) = &embed_weight.buffer else {
+            return Err("embedding_lookup_gpu: embed_weight must be CUDA buffer".into());
+        };
+
+        let token_view = unsafe {
+            tokens_slice
+                .transmute::<u32>(num_tokens)
+                .ok_or("embedding_lookup_gpu: failed to transmute tokens to u32 view")?
+        };
+        let table_view = unsafe {
+            embed_slice
+                .transmute::<f32>(embed_elements)
+                .ok_or("embedding_lookup_gpu: failed to transmute embedding to f32 view")?
+        };
+
+        let output_bytes = output_elements * std::mem::size_of::<f32>();
+        let mut output_slice: cudarc::driver::CudaSlice<u8> = stream
+            .alloc_zeros(output_bytes)
+            .map_err(|e| format!("embedding_lookup_gpu: alloc failed: {}", e))?;
+        let mut output_view = unsafe {
+            output_slice
+                .transmute_mut::<f32>(output_elements)
+                .ok_or("embedding_lookup_gpu: failed to transmute output to f32 view")?
+        };
+
+        kernel.embedding_gather_view(
+            stream,
+            &token_view,
+            &table_view,
+            &mut output_view,
+            num_tokens,
+            hidden_dim,
+        )
+        .map_err(|e| format!("embedding_lookup_gpu kernel error: {}", e))?;
+
+        let mut out_shape = tokens.shape.clone();
+        out_shape.push(hidden_dim);
+        output.buffer = GpuBuffer::Cuda(Arc::new(output_slice));
+        output.shape = out_shape;
+        output.dtype = TensorDtype::F32;
+        output.size_in_bytes = output_bytes;
+        output.backend = BackendType::Cuda;
+
+        Ok(())
+    }
+
+    fn transformer_layer_gpu(
+        &self,
+        hidden: &mut GpuTensor,
+        layer_weights: &TransformerLayerWeightsGpu,
+        kv_cache: Option<&mut KVCacheGpu>,
+        config: &TransformerLayerConfigGpu,
+    ) -> Result<(), String> {
+        if kv_cache.is_some() {
+            return Err("transformer_layer_gpu: KV cache update is not implemented for CUDA".into());
+        }
+
+        if hidden.dtype != TensorDtype::F32 {
+            return Err("transformer_layer_gpu: hidden must be F32 tensor".into());
+        }
+        if hidden.shape.len() < 2 {
+            return Err("transformer_layer_gpu: hidden must be at least 2D".into());
+        }
+
+        if config.num_q_heads != config.num_kv_heads {
+            return Err("transformer_layer_gpu: GQA/MQA not supported for CUDA kernel path".into());
+        }
+
+        let stream = get_cuda_stream()
+            .ok_or("CUDA stream not available")?;
+        let rms_kernel = get_cuda_rmsnorm_kernel()
+            .ok_or("CUDA RMSNorm kernel not available")?;
+        let linear_kernel = get_cuda_linear_kernel()
+            .ok_or("CUDA linear kernel not available")?;
+        let silu_kernel = get_cuda_silu_kernel()
+            .ok_or("CUDA SiLU kernel not available")?;
+        let flash_kernel = get_cuda_flash_kernel()
+            .ok_or("CUDA flash attention kernel not available")?;
+        let elem_kernel = get_cuda_elementwise_kernel()
+            .ok_or("CUDA elementwise kernel not available")?;
+
+        let batch = config.batch_size;
+        let seq = config.seq_len;
+        let hidden_dim = config.hidden_size;
+        let total_tokens = batch
+            .checked_mul(seq)
+            .ok_or("transformer_layer_gpu: batch*seq overflow")?;
+
+        let hidden_elements: usize = hidden.shape.iter().product();
+        let expected_hidden = total_tokens
+            .checked_mul(hidden_dim)
+            .ok_or("transformer_layer_gpu: hidden size overflow")?;
+        if hidden_elements != expected_hidden {
+            return Err(format!(
+                "transformer_layer_gpu: hidden shape mismatch (got {}, expected {})",
+                hidden_elements, expected_hidden
+            ));
+        }
+
+        let q_out = config.num_q_heads
+            .checked_mul(config.head_dim)
+            .ok_or("transformer_layer_gpu: q_out overflow")?;
+        let kv_out = config.num_kv_heads
+            .checked_mul(config.head_dim)
+            .ok_or("transformer_layer_gpu: kv_out overflow")?;
+
+        // Extract hidden buffer
+        let GpuBuffer::Cuda(hidden_slice) = &hidden.buffer else {
+            return Err("transformer_layer_gpu: hidden must be CUDA buffer".into());
+        };
+        let hidden_view = unsafe {
+            hidden_slice
+                .transmute::<f32>(hidden_elements)
+                .ok_or("transformer_layer_gpu: failed to transmute hidden to f32 view")?
+        };
+
+        // Load norm weights
+        let GpuBuffer::Cuda(input_norm_slice) = &layer_weights.input_norm.buffer else {
+            return Err("transformer_layer_gpu: input_norm must be CUDA buffer".into());
+        };
+        let input_norm_view = unsafe {
+            input_norm_slice
+                .transmute::<f32>(hidden_dim)
+                .ok_or("transformer_layer_gpu: failed to transmute input_norm to f32 view")?
+        };
+
+        let mut normed: cudarc::driver::CudaSlice<f32> = stream
+            .alloc_zeros(hidden_elements)
+            .map_err(|e| format!("transformer_layer_gpu: alloc normed failed: {}", e))?;
+        {
+            let mut normed_view = normed.as_view_mut();
+            rms_kernel
+                .forward_view(
+                    stream,
+                    &hidden_view,
+                    &input_norm_view,
+                    &mut normed_view,
+                    total_tokens,
+                    hidden_dim,
+                    config.rms_norm_eps,
+                )
+                .map_err(|e| format!("transformer_layer_gpu rms_norm error: {}", e))?;
+        }
+
+        // QKV projections
+        let q_weight_elems = q_out
+            .checked_mul(hidden_dim)
+            .ok_or("transformer_layer_gpu: q_weight size overflow")?;
+        let kv_weight_elems = kv_out
+            .checked_mul(hidden_dim)
+            .ok_or("transformer_layer_gpu: kv_weight size overflow")?;
+
+        let GpuBuffer::Cuda(q_weight_slice) = &layer_weights.q_weight.buffer else {
+            return Err("transformer_layer_gpu: q_weight must be CUDA buffer".into());
+        };
+        let GpuBuffer::Cuda(k_weight_slice) = &layer_weights.k_weight.buffer else {
+            return Err("transformer_layer_gpu: k_weight must be CUDA buffer".into());
+        };
+        let GpuBuffer::Cuda(v_weight_slice) = &layer_weights.v_weight.buffer else {
+            return Err("transformer_layer_gpu: v_weight must be CUDA buffer".into());
+        };
+
+        let q_weight_view = unsafe {
+            q_weight_slice
+                .transmute::<f32>(q_weight_elems)
+                .ok_or("transformer_layer_gpu: failed to transmute q_weight")?
+        };
+        let k_weight_view = unsafe {
+            k_weight_slice
+                .transmute::<f32>(kv_weight_elems)
+                .ok_or("transformer_layer_gpu: failed to transmute k_weight")?
+        };
+        let v_weight_view = unsafe {
+            v_weight_slice
+                .transmute::<f32>(kv_weight_elems)
+                .ok_or("transformer_layer_gpu: failed to transmute v_weight")?
+        };
+
+        let q_elements = total_tokens
+            .checked_mul(q_out)
+            .ok_or("transformer_layer_gpu: q_elements overflow")?;
+        let kv_elements = total_tokens
+            .checked_mul(kv_out)
+            .ok_or("transformer_layer_gpu: kv_elements overflow")?;
+
+        let mut q_linear: cudarc::driver::CudaSlice<f32> = stream
+            .alloc_zeros(q_elements)
+            .map_err(|e| format!("transformer_layer_gpu: alloc q_linear failed: {}", e))?;
+        let mut k_linear: cudarc::driver::CudaSlice<f32> = stream
+            .alloc_zeros(kv_elements)
+            .map_err(|e| format!("transformer_layer_gpu: alloc k_linear failed: {}", e))?;
+        let mut v_linear: cudarc::driver::CudaSlice<f32> = stream
+            .alloc_zeros(kv_elements)
+            .map_err(|e| format!("transformer_layer_gpu: alloc v_linear failed: {}", e))?;
+
+        let params_q = LinearParams {
+            in_features: hidden_dim as u32,
+            out_features: q_out as u32,
+            has_bias: 0,
+            padding: 0,
+        };
+        let params_kv = LinearParams {
+            in_features: hidden_dim as u32,
+            out_features: kv_out as u32,
+            has_bias: 0,
+            padding: 0,
+        };
+
+        {
+            let normed_view = normed.as_view();
+            let mut q_out_view = q_linear.as_view_mut();
+            linear_kernel.forward_view(
+                stream,
+                params_q,
+                &normed_view,
+                &q_weight_view,
+                None,
+                &mut q_out_view,
+                total_tokens,
+            )?;
+        }
+        {
+            let normed_view = normed.as_view();
+            let mut k_out_view = k_linear.as_view_mut();
+            linear_kernel.forward_view(
+                stream,
+                params_kv,
+                &normed_view,
+                &k_weight_view,
+                None,
+                &mut k_out_view,
+                total_tokens,
+            )?;
+        }
+        {
+            let normed_view = normed.as_view();
+            let mut v_out_view = v_linear.as_view_mut();
+            linear_kernel.forward_view(
+                stream,
+                params_kv,
+                &normed_view,
+                &v_weight_view,
+                None,
+                &mut v_out_view,
+                total_tokens,
+            )?;
+        }
+
+        // Permute to [batch, heads, seq, head_dim]
+        let mut q_perm: cudarc::driver::CudaSlice<f32> = stream
+            .alloc_zeros(q_elements)
+            .map_err(|e| format!("transformer_layer_gpu: alloc q_perm failed: {}", e))?;
+        let mut k_perm: cudarc::driver::CudaSlice<f32> = stream
+            .alloc_zeros(kv_elements)
+            .map_err(|e| format!("transformer_layer_gpu: alloc k_perm failed: {}", e))?;
+        let mut v_perm: cudarc::driver::CudaSlice<f32> = stream
+            .alloc_zeros(kv_elements)
+            .map_err(|e| format!("transformer_layer_gpu: alloc v_perm failed: {}", e))?;
+
+        {
+            let q_in = q_linear.as_view();
+            let mut q_out_view = q_perm.as_view_mut();
+            elem_kernel
+                .permute_qkv_view(
+                    stream,
+                    &q_in,
+                    &mut q_out_view,
+                    batch,
+                    seq,
+                    config.num_q_heads,
+                    config.head_dim,
+                )
+                .map_err(|e| format!("transformer_layer_gpu permute q error: {}", e))?;
+        }
+        {
+            let k_in = k_linear.as_view();
+            let mut k_out_view = k_perm.as_view_mut();
+            elem_kernel
+                .permute_qkv_view(
+                    stream,
+                    &k_in,
+                    &mut k_out_view,
+                    batch,
+                    seq,
+                    config.num_kv_heads,
+                    config.head_dim,
+                )
+                .map_err(|e| format!("transformer_layer_gpu permute k error: {}", e))?;
+        }
+        {
+            let v_in = v_linear.as_view();
+            let mut v_out_view = v_perm.as_view_mut();
+            elem_kernel
+                .permute_qkv_view(
+                    stream,
+                    &v_in,
+                    &mut v_out_view,
+                    batch,
+                    seq,
+                    config.num_kv_heads,
+                    config.head_dim,
+                )
+                .map_err(|e| format!("transformer_layer_gpu permute v error: {}", e))?;
+        }
+
+        let scale = 1.0f32 / (config.head_dim as f32).sqrt();
+        let attn_out = flash_kernel
+            .forward_f32(
+                stream,
+                &q_perm,
+                &k_perm,
+                &v_perm,
+                batch,
+                config.num_q_heads,
+                seq,
+                config.head_dim,
+                true,
+                scale,
+                config.position,
+            )
+            .map_err(|e| format!("transformer_layer_gpu flash attention error: {}", e))?;
+
+        let mut attn_back: cudarc::driver::CudaSlice<f32> = stream
+            .alloc_zeros(q_elements)
+            .map_err(|e| format!("transformer_layer_gpu: alloc attn_back failed: {}", e))?;
+        {
+            let attn_in = attn_out.as_view();
+            let mut attn_out_view = attn_back.as_view_mut();
+            elem_kernel
+                .permute_qkv_back_view(
+                    stream,
+                    &attn_in,
+                    &mut attn_out_view,
+                    batch,
+                    seq,
+                    config.num_q_heads,
+                    config.head_dim,
+                )
+                .map_err(|e| format!("transformer_layer_gpu permute back error: {}", e))?;
+        }
+
+        let o_weight_elems = hidden_dim
+            .checked_mul(q_out)
+            .ok_or("transformer_layer_gpu: o_weight size overflow")?;
+        let GpuBuffer::Cuda(o_weight_slice) = &layer_weights.o_weight.buffer else {
+            return Err("transformer_layer_gpu: o_weight must be CUDA buffer".into());
+        };
+        let o_weight_view = unsafe {
+            o_weight_slice
+                .transmute::<f32>(o_weight_elems)
+                .ok_or("transformer_layer_gpu: failed to transmute o_weight")?
+        };
+
+        let mut attn_proj: cudarc::driver::CudaSlice<f32> = stream
+            .alloc_zeros(hidden_elements)
+            .map_err(|e| format!("transformer_layer_gpu: alloc attn_proj failed: {}", e))?;
+        {
+            let attn_in = attn_back.as_view();
+            let mut attn_out_view = attn_proj.as_view_mut();
+            let params_o = LinearParams {
+                in_features: q_out as u32,
+                out_features: hidden_dim as u32,
+                has_bias: 0,
+                padding: 0,
+            };
+            linear_kernel.forward_view(
+                stream,
+                params_o,
+                &attn_in,
+                &o_weight_view,
+                None,
+                &mut attn_out_view,
+                total_tokens,
+            )?;
+        }
+
+        // Residual add: hidden + attn_proj
+        let mut attn_residual: cudarc::driver::CudaSlice<u8> = stream
+            .alloc_zeros(hidden_elements * std::mem::size_of::<f32>())
+            .map_err(|e| format!("transformer_layer_gpu: alloc attn_residual failed: {}", e))?;
+        {
+            let hidden_in = hidden_view;
+            let attn_in = attn_proj.as_view();
+            let mut out_view = unsafe {
+                attn_residual
+                    .transmute_mut::<f32>(hidden_elements)
+                    .ok_or("transformer_layer_gpu: failed to transmute attn_residual")?
+            };
+            elem_kernel
+                .add_view(stream, &hidden_in, &attn_in, &mut out_view, hidden_elements)
+                .map_err(|e| format!("transformer_layer_gpu residual add error: {}", e))?;
+        }
+
+        hidden.buffer = GpuBuffer::Cuda(Arc::new(attn_residual));
+        hidden.dtype = TensorDtype::F32;
+        hidden.size_in_bytes = hidden_elements * std::mem::size_of::<f32>();
+        hidden.backend = BackendType::Cuda;
+
+        // Post-attention RMSNorm
+        let GpuBuffer::Cuda(post_norm_slice) = &layer_weights.post_attn_norm.buffer else {
+            return Err("transformer_layer_gpu: post_attn_norm must be CUDA buffer".into());
+        };
+        let post_norm_view = unsafe {
+            post_norm_slice
+                .transmute::<f32>(hidden_dim)
+                .ok_or("transformer_layer_gpu: failed to transmute post_attn_norm")?
+        };
+
+        let GpuBuffer::Cuda(hidden_slice) = &hidden.buffer else {
+            return Err("transformer_layer_gpu: hidden must be CUDA buffer after residual".into());
+        };
+        let hidden_view = unsafe {
+            hidden_slice
+                .transmute::<f32>(hidden_elements)
+                .ok_or("transformer_layer_gpu: failed to transmute hidden for post norm")?
+        };
+
+        let mut post_normed: cudarc::driver::CudaSlice<f32> = stream
+            .alloc_zeros(hidden_elements)
+            .map_err(|e| format!("transformer_layer_gpu: alloc post_normed failed: {}", e))?;
+        {
+            let mut post_normed_view = post_normed.as_view_mut();
+            rms_kernel
+                .forward_view(
+                    stream,
+                    &hidden_view,
+                    &post_norm_view,
+                    &mut post_normed_view,
+                    total_tokens,
+                    hidden_dim,
+                    config.rms_norm_eps,
+                )
+                .map_err(|e| format!("transformer_layer_gpu post rms_norm error: {}", e))?;
+        }
+
+        // FFN: gate * silu(up) or up + activation
+        let inter_size = config.intermediate_size;
+        let inter_elements = total_tokens
+            .checked_mul(inter_size)
+            .ok_or("transformer_layer_gpu: inter size overflow")?;
+
+        let mut ffn_intermediate: cudarc::driver::CudaSlice<f32> = stream
+            .alloc_zeros(inter_elements)
+            .map_err(|e| format!("transformer_layer_gpu: alloc ffn intermediate failed: {}", e))?;
+
+        if let Some(gate_weight) = layer_weights.gate_weight.as_ref() {
+            let GpuBuffer::Cuda(gate_slice) = &gate_weight.buffer else {
+                return Err("transformer_layer_gpu: gate_weight must be CUDA buffer".into());
+            };
+            let gate_elems = inter_size
+                .checked_mul(hidden_dim)
+                .ok_or("transformer_layer_gpu: gate_weight size overflow")?;
+            let gate_view = unsafe {
+                gate_slice
+                    .transmute::<f32>(gate_elems)
+                    .ok_or("transformer_layer_gpu: failed to transmute gate_weight")?
+            };
+
+            let GpuBuffer::Cuda(up_slice) = &layer_weights.up_weight.buffer else {
+                return Err("transformer_layer_gpu: up_weight must be CUDA buffer".into());
+            };
+            let up_elems = inter_size
+                .checked_mul(hidden_dim)
+                .ok_or("transformer_layer_gpu: up_weight size overflow")?;
+            let up_view = unsafe {
+                up_slice
+                    .transmute::<f32>(up_elems)
+                    .ok_or("transformer_layer_gpu: failed to transmute up_weight")?
+            };
+
+            let params_ffn = LinearParams {
+                in_features: hidden_dim as u32,
+                out_features: inter_size as u32,
+                has_bias: 0,
+                padding: 0,
+            };
+            let mut out_view = ffn_intermediate.as_view_mut();
+            linear_kernel.fused_gate_up_silu_view(
+                stream,
+                params_ffn,
+                &post_normed.as_view(),
+                &gate_view,
+                &up_view,
+                &mut out_view,
+                total_tokens,
+            )?;
+        } else {
+            let GpuBuffer::Cuda(up_slice) = &layer_weights.up_weight.buffer else {
+                return Err("transformer_layer_gpu: up_weight must be CUDA buffer".into());
+            };
+            let up_elems = inter_size
+                .checked_mul(hidden_dim)
+                .ok_or("transformer_layer_gpu: up_weight size overflow")?;
+            let up_view = unsafe {
+                up_slice
+                    .transmute::<f32>(up_elems)
+                    .ok_or("transformer_layer_gpu: failed to transmute up_weight")?
+            };
+
+            let params_up = LinearParams {
+                in_features: hidden_dim as u32,
+                out_features: inter_size as u32,
+                has_bias: 0,
+                padding: 0,
+            };
+            {
+                let mut out_view = ffn_intermediate.as_view_mut();
+                linear_kernel.forward_view(
+                    stream,
+                    params_up,
+                    &post_normed.as_view(),
+                    &up_view,
+                    None,
+                    &mut out_view,
+                    total_tokens,
+                )?;
+            }
+
+            if config.use_silu {
+                silu_kernel
+                    .forward_inplace(stream, &mut ffn_intermediate, inter_elements)
+                    .map_err(|e| format!("transformer_layer_gpu silu error: {}", e))?;
+            } else {
+                return Err("transformer_layer_gpu: GELU activation not supported for CUDA".into());
+            }
+        }
+
+        let GpuBuffer::Cuda(down_slice) = &layer_weights.down_weight.buffer else {
+            return Err("transformer_layer_gpu: down_weight must be CUDA buffer".into());
+        };
+        let down_elems = hidden_dim
+            .checked_mul(inter_size)
+            .ok_or("transformer_layer_gpu: down_weight size overflow")?;
+        let down_view = unsafe {
+            down_slice
+                .transmute::<f32>(down_elems)
+                .ok_or("transformer_layer_gpu: failed to transmute down_weight")?
+        };
+
+        let mut ffn_out: cudarc::driver::CudaSlice<f32> = stream
+            .alloc_zeros(hidden_elements)
+            .map_err(|e| format!("transformer_layer_gpu: alloc ffn_out failed: {}", e))?;
+        {
+            let mut out_view = ffn_out.as_view_mut();
+            let params_down = LinearParams {
+                in_features: inter_size as u32,
+                out_features: hidden_dim as u32,
+                has_bias: 0,
+                padding: 0,
+            };
+            linear_kernel.forward_view(
+                stream,
+                params_down,
+                &ffn_intermediate.as_view(),
+                &down_view,
+                None,
+                &mut out_view,
+                total_tokens,
+            )?;
+        }
+
+        // Residual add: hidden + ffn_out
+        let GpuBuffer::Cuda(hidden_slice) = &hidden.buffer else {
+            return Err("transformer_layer_gpu: hidden must be CUDA buffer before ffn residual".into());
+        };
+        let hidden_view = unsafe {
+            hidden_slice
+                .transmute::<f32>(hidden_elements)
+                .ok_or("transformer_layer_gpu: failed to transmute hidden for ffn residual")?
+        };
+
+        let mut ffn_residual: cudarc::driver::CudaSlice<u8> = stream
+            .alloc_zeros(hidden_elements * std::mem::size_of::<f32>())
+            .map_err(|e| format!("transformer_layer_gpu: alloc ffn_residual failed: {}", e))?;
+        {
+            let ffn_in = ffn_out.as_view();
+            let mut out_view = unsafe {
+                ffn_residual
+                    .transmute_mut::<f32>(hidden_elements)
+                    .ok_or("transformer_layer_gpu: failed to transmute ffn_residual")?
+            };
+            elem_kernel
+                .add_view(stream, &hidden_view, &ffn_in, &mut out_view, hidden_elements)
+                .map_err(|e| format!("transformer_layer_gpu ffn residual add error: {}", e))?;
+        }
+
+        hidden.buffer = GpuBuffer::Cuda(Arc::new(ffn_residual));
+        hidden.dtype = TensorDtype::F32;
+        hidden.size_in_bytes = hidden_elements * std::mem::size_of::<f32>();
+        hidden.backend = BackendType::Cuda;
+
+        Ok(())
+    }
+
+    fn rms_norm_gpu(
+        &self,
+        hidden: &mut GpuTensor,
+        weight: &GpuTensor,
+        eps: f32,
+    ) -> Result<(), String> {
+        // GPU-native RMSNorm using CUDA kernel (ARCH-GPU-001)
+        // Pattern: All computation stays on GPU, no CPU roundtrip
+
+        let stream = get_cuda_stream()
+            .ok_or("CUDA stream not available")?;
+        let kernel = get_cuda_rmsnorm_kernel()
+            .ok_or("CUDA RMSNorm kernel not available")?;
+
+        // Validate shapes
+        if hidden.shape.len() < 2 {
+            return Err("rms_norm_gpu: hidden must be at least 2D (batch × hidden_dim)".into());
+        }
+        let hidden_dim = *hidden.shape.last().unwrap();
+        let rows: usize = hidden.shape.iter().take(hidden.shape.len() - 1).product();
+        let num_elements = rows * hidden_dim;
+
+        // Extract CUDA slices and transmute to f32 views
+        let GpuBuffer::Cuda(input_slice) = &hidden.buffer else {
+            return Err("rms_norm_gpu: hidden must be CUDA buffer".into());
+        };
+        let GpuBuffer::Cuda(weight_slice) = &weight.buffer else {
+            return Err("rms_norm_gpu: weight must be CUDA buffer".into());
+        };
+
+        // Create typed views from u8 slices (zero-copy reinterpretation)
+        let input_view = unsafe {
+            input_slice.transmute::<f32>(num_elements)
+                .ok_or("rms_norm_gpu: failed to transmute input to f32 view")?
+        };
+        let weight_view = unsafe {
+            weight_slice.transmute::<f32>(hidden_dim)
+                .ok_or("rms_norm_gpu: failed to transmute weight to f32 view")?
+        };
+
+        // Allocate output buffer on GPU (same size as input)
+        let output_bytes = num_elements * std::mem::size_of::<f32>();
+        let mut output_slice: cudarc::driver::CudaSlice<u8> = stream
+            .alloc_zeros(output_bytes)
+            .map_err(|e| format!("rms_norm_gpu: failed to allocate output: {}", e))?;
+
+        // Create mutable output view
+        let mut output_view = unsafe {
+            output_slice.transmute_mut::<f32>(num_elements)
+                .ok_or("rms_norm_gpu: failed to transmute output to f32 view")?
+        };
+
+        // Execute kernel: all data stays on GPU
+        kernel.forward_view(stream, &input_view, &weight_view, &mut output_view, rows, hidden_dim, eps)
+            .map_err(|e| format!("rms_norm_gpu kernel error: {}", e))?;
+
+        // Replace hidden's buffer with the output (swap, not copy)
+        hidden.buffer = GpuBuffer::Cuda(Arc::new(output_slice));
+
+        Ok(())
+    }
+
+    fn mean_pooling_gpu(
+        &self,
+        hidden: &GpuTensor,
+        attention_mask: &GpuTensor,
+        output: &mut GpuTensor,
+    ) -> Result<(), String> {
+        let stream = get_cuda_stream()
+            .ok_or("CUDA stream not available")?;
+        let kernel = get_cuda_pooling_kernel()
+            .ok_or("CUDA pooling kernel not available")?;
+
+        if hidden.dtype != TensorDtype::F32 {
+            return Err("mean_pooling_gpu: hidden must be F32 tensor".into());
+        }
+        if attention_mask.dtype != TensorDtype::F32 {
+            return Err("mean_pooling_gpu: attention_mask must be F32 tensor".into());
+        }
+        if hidden.shape.len() < 2 {
+            return Err("mean_pooling_gpu: hidden must be at least 2D".into());
+        }
+
+        let batch = hidden.shape[0];
+        let seq = if hidden.shape.len() > 2 { hidden.shape[1] } else { 1 };
+        let hidden_dim = *hidden.shape.last().unwrap();
+        let hidden_elements: usize = hidden.shape.iter().product();
+        let expected_hidden = batch
+            .checked_mul(seq)
+            .and_then(|v| v.checked_mul(hidden_dim))
+            .ok_or("mean_pooling_gpu: hidden size overflow")?;
+        if hidden_elements != expected_hidden {
+            return Err("mean_pooling_gpu: hidden shape mismatch".into());
+        }
+
+        let mask_elements: usize = attention_mask.shape.iter().product();
+        let expected_mask = batch
+            .checked_mul(seq)
+            .ok_or("mean_pooling_gpu: mask size overflow")?;
+        if mask_elements != expected_mask {
+            return Err("mean_pooling_gpu: attention_mask shape mismatch".into());
+        }
+
+        let GpuBuffer::Cuda(hidden_slice) = &hidden.buffer else {
+            return Err("mean_pooling_gpu: hidden must be CUDA buffer".into());
+        };
+        let GpuBuffer::Cuda(mask_slice) = &attention_mask.buffer else {
+            return Err("mean_pooling_gpu: attention_mask must be CUDA buffer".into());
+        };
+
+        let hidden_view = unsafe {
+            hidden_slice
+                .transmute::<f32>(hidden_elements)
+                .ok_or("mean_pooling_gpu: failed to transmute hidden")?
+        };
+        let mask_view = unsafe {
+            mask_slice
+                .transmute::<f32>(mask_elements)
+                .ok_or("mean_pooling_gpu: failed to transmute mask")?
+        };
+
+        let output_elements = batch
+            .checked_mul(hidden_dim)
+            .ok_or("mean_pooling_gpu: output size overflow")?;
+        let output_bytes = output_elements * std::mem::size_of::<f32>();
+        let mut output_slice: cudarc::driver::CudaSlice<u8> = stream
+            .alloc_zeros(output_bytes)
+            .map_err(|e| format!("mean_pooling_gpu: alloc failed: {}", e))?;
+        let mut output_view = unsafe {
+            output_slice
+                .transmute_mut::<f32>(output_elements)
+                .ok_or("mean_pooling_gpu: failed to transmute output")?
+        };
+
+        kernel
+            .mean_pooling_view(
+                stream,
+                &hidden_view,
+                Some(&mask_view),
+                &mut output_view,
+                batch,
+                seq,
+                hidden_dim,
+            )
+            .map_err(|e| format!("mean_pooling_gpu kernel error: {}", e))?;
+
+        output.buffer = GpuBuffer::Cuda(Arc::new(output_slice));
+        output.shape = vec![batch, hidden_dim];
+        output.dtype = TensorDtype::F32;
+        output.size_in_bytes = output_bytes;
+        output.backend = BackendType::Cuda;
+
+        Ok(())
+    }
+
+    fn normalize_gpu(
+        &self,
+        embeddings: &mut GpuTensor,
+    ) -> Result<(), String> {
+        let stream = get_cuda_stream()
+            .ok_or("CUDA stream not available")?;
+        let kernel = get_cuda_pooling_kernel()
+            .ok_or("CUDA pooling kernel not available")?;
+
+        if embeddings.dtype != TensorDtype::F32 {
+            return Err("normalize_gpu: embeddings must be F32 tensor".into());
+        }
+        if embeddings.shape.is_empty() {
+            return Ok(());
+        }
+
+        let hidden_dim = *embeddings.shape.last().unwrap();
+        if hidden_dim == 0 {
+            return Ok(());
+        }
+
+        let total_elements: usize = embeddings.shape.iter().product();
+        let batch = total_elements / hidden_dim;
+
+        let GpuBuffer::Cuda(emb_slice) = &embeddings.buffer else {
+            return Err("normalize_gpu: embeddings must be CUDA buffer".into());
+        };
+
+        let mut out_slice: cudarc::driver::CudaSlice<u8> = stream
+            .clone_dtod(emb_slice.as_ref())
+            .map_err(|e| format!("normalize_gpu: dtod copy failed: {}", e))?;
+        let mut emb_view = unsafe {
+            out_slice
+                .transmute_mut::<f32>(total_elements)
+                .ok_or("normalize_gpu: failed to transmute embeddings")?
+        };
+
+        let eps = 1e-12f32;
+        kernel
+            .l2_normalize_view(stream, &mut emb_view, batch, hidden_dim, eps)
+            .map_err(|e| format!("normalize_gpu kernel error: {}", e))?;
+
+        embeddings.buffer = GpuBuffer::Cuda(Arc::new(out_slice));
+        embeddings.dtype = TensorDtype::F32;
+        embeddings.size_in_bytes = total_elements * std::mem::size_of::<f32>();
+        embeddings.backend = BackendType::Cuda;
+
+        Ok(())
+    }
+
+    fn cls_pooling_gpu(
+        &self,
+        hidden: &GpuTensor,
+        output: &mut GpuTensor,
+    ) -> Result<(), String> {
+        let stream = get_cuda_stream()
+            .ok_or("CUDA stream not available")?;
+        let kernel = get_cuda_pooling_kernel()
+            .ok_or("CUDA pooling kernel not available")?;
+
+        if hidden.dtype != TensorDtype::F32 {
+            return Err("cls_pooling_gpu: hidden must be F32 tensor".into());
+        }
+        if hidden.shape.len() < 2 {
+            return Err("cls_pooling_gpu: hidden must be at least 2D".into());
+        }
+
+        let batch = hidden.shape[0];
+        let seq = if hidden.shape.len() > 2 { hidden.shape[1] } else { 1 };
+        let hidden_dim = *hidden.shape.last().unwrap();
+        let hidden_elements: usize = hidden.shape.iter().product();
+        let expected_hidden = batch
+            .checked_mul(seq)
+            .and_then(|v| v.checked_mul(hidden_dim))
+            .ok_or("cls_pooling_gpu: hidden size overflow")?;
+        if hidden_elements != expected_hidden {
+            return Err("cls_pooling_gpu: hidden shape mismatch".into());
+        }
+
+        let GpuBuffer::Cuda(hidden_slice) = &hidden.buffer else {
+            return Err("cls_pooling_gpu: hidden must be CUDA buffer".into());
+        };
+        let hidden_view = unsafe {
+            hidden_slice
+                .transmute::<f32>(hidden_elements)
+                .ok_or("cls_pooling_gpu: failed to transmute hidden")?
+        };
+
+        let output_elements = batch
+            .checked_mul(hidden_dim)
+            .ok_or("cls_pooling_gpu: output size overflow")?;
+        let output_bytes = output_elements * std::mem::size_of::<f32>();
+        let mut output_slice: cudarc::driver::CudaSlice<u8> = stream
+            .alloc_zeros(output_bytes)
+            .map_err(|e| format!("cls_pooling_gpu: alloc failed: {}", e))?;
+        let mut output_view = unsafe {
+            output_slice
+                .transmute_mut::<f32>(output_elements)
+                .ok_or("cls_pooling_gpu: failed to transmute output")?
+        };
+
+        kernel
+            .cls_extract_view(
+                stream,
+                &hidden_view,
+                &mut output_view,
+                batch,
+                seq,
+                hidden_dim,
+                0,
+            )
+            .map_err(|e| format!("cls_pooling_gpu kernel error: {}", e))?;
+
+        output.buffer = GpuBuffer::Cuda(Arc::new(output_slice));
+        output.shape = vec![batch, hidden_dim];
+        output.dtype = TensorDtype::F32;
+        output.size_in_bytes = output_bytes;
+        output.backend = BackendType::Cuda;
+
+        Ok(())
+    }
+
+    fn classifier_gpu(
+        &self,
+        hidden: &GpuTensor,
+        weight: &GpuTensor,
+        bias: Option<&GpuTensor>,
+        output: &mut GpuTensor,
+    ) -> Result<(), String> {
+        let stream = get_cuda_stream()
+            .ok_or("CUDA stream not available")?;
+        let kernel = get_cuda_linear_kernel()
+            .ok_or("CUDA linear kernel not available")?;
+
+        // hidden shape: [batch, hidden_dim] or [batch, seq_len, hidden_dim]
+        // weight shape: [out_dim, hidden_dim]
+        // output shape: [batch, out_dim] or [batch, seq_len, out_dim]
+        if hidden.shape.is_empty() || weight.shape.len() != 2 {
+            return Err("classifier_gpu: invalid tensor shapes".into());
+        }
+
+        let hidden_dim = *hidden.shape.last().unwrap();
+        let out_dim = weight.shape[0];
+        let weight_hidden_dim = weight.shape[1];
+
+        if hidden_dim != weight_hidden_dim {
+            return Err(format!(
+                "classifier_gpu: hidden_dim mismatch: hidden={}, weight={}",
+                hidden_dim, weight_hidden_dim
+            ));
+        }
+
+        // Compute batch_size (product of all dimensions except last)
+        let batch_size: usize = hidden.shape.iter().take(hidden.shape.len() - 1).product();
+        let hidden_elements = batch_size * hidden_dim;
+        let weight_elements = out_dim * hidden_dim;
+        let output_elements = batch_size * out_dim;
+
+        // Extract CUDA buffers
+        let GpuBuffer::Cuda(hidden_slice) = &hidden.buffer else {
+            return Err("classifier_gpu: hidden must be CUDA buffer".into());
+        };
+        let GpuBuffer::Cuda(weight_slice) = &weight.buffer else {
+            return Err("classifier_gpu: weight must be CUDA buffer".into());
+        };
+
+        // Transmute to f32 views
+        let hidden_view = unsafe {
+            hidden_slice.transmute::<f32>(hidden_elements)
+                .ok_or("classifier_gpu: failed to transmute hidden to f32 view")?
+        };
+        let weight_view = unsafe {
+            weight_slice.transmute::<f32>(weight_elements)
+                .ok_or("classifier_gpu: failed to transmute weight to f32 view")?
+        };
+
+        // Handle optional bias
+        let bias_view = if let Some(bias_tensor) = bias {
+            let GpuBuffer::Cuda(bias_slice) = &bias_tensor.buffer else {
+                return Err("classifier_gpu: bias must be CUDA buffer".into());
+            };
+            let bias_elements = bias_tensor.shape.iter().product::<usize>();
+            Some(unsafe {
+                bias_slice.transmute::<f32>(bias_elements)
+                    .ok_or("classifier_gpu: failed to transmute bias to f32 view")?
+            })
+        } else {
+            None
+        };
+
+        // Allocate output buffer on GPU
+        let output_bytes = output_elements * std::mem::size_of::<f32>();
+        let mut output_slice: cudarc::driver::CudaSlice<u8> = stream
+            .alloc_zeros(output_bytes)
+            .map_err(|e| format!("classifier_gpu: failed to allocate output: {}", e))?;
+
+        let mut output_view = unsafe {
+            output_slice.transmute_mut::<f32>(output_elements)
+                .ok_or("classifier_gpu: failed to transmute output to f32 view")?
+        };
+
+        // Setup linear params
+        let params = LinearParams {
+            in_features: hidden_dim as u32,
+            out_features: out_dim as u32,
+            has_bias: if bias.is_some() { 1 } else { 0 },
+            padding: 0,
+        };
+
+        // Call linear kernel
+        kernel.forward_view(
+            stream,
+            params,
+            &hidden_view,
+            &weight_view,
+            bias_view.as_ref(),
+            &mut output_view,
+            batch_size,
+        ).map_err(|e| format!("classifier_gpu kernel error: {}", e))?;
+
+        // Update output tensor buffer
+        output.buffer = GpuBuffer::Cuda(Arc::new(output_slice));
+        output.shape = if hidden.shape.len() > 1 {
+            let mut shape = hidden.shape[..hidden.shape.len()-1].to_vec();
+            shape.push(out_dim);
+            shape
+        } else {
+            vec![out_dim]
+        };
+        output.dtype = TensorDtype::F32;
+
+        Ok(())
+    }
+
+    fn lm_head_gpu(
+        &self,
+        hidden: &GpuTensor,
+        weight: &GpuTensor,
+        output: &mut GpuTensor,
+    ) -> Result<(), String> {
+        self.classifier_gpu(hidden, weight, None, output)
+    }
+
+    // =========================================================================
+    // GPU-Native High-Level Forward Methods (ARCH-ADR-010)
+    // =========================================================================
+
+    fn upload_reranker_weights(
+        &self,
+        embed_weight: &[f32],
+        layers: &[TransformerLayerWeights<'_>],
+        final_norm: &[f32],
+        classifier_weight: &[f32],
+        classifier_bias: Option<&[f32]>,
+        config: &RerankForwardConfig,
+    ) -> Result<RerankerModelWeightsGpu, String> {
+        let stream = get_cuda_stream().ok_or("CUDA stream not available")?;
+
+        // Helper to upload f32 slice to GPU
+        fn upload_f32(stream: &Arc<CudaStream>, data: &[f32], shape: Vec<usize>) -> Result<GpuTensor, String> {
+            let bytes: &[u8] = bytemuck::cast_slice(data);
+            let buf = stream.clone_htod(bytes).map_err(|e| e.to_string())?;
+            Ok(GpuTensor {
+                buffer: GpuBuffer::Cuda(Arc::new(buf)),
+                shape,
+                dtype: TensorDtype::F32,
+                size_in_bytes: bytes.len(),
+                backend: BackendType::Cuda,
+            })
+        }
+
+        let hidden_dim = config.hidden_size;
+        let vocab_size = embed_weight.len() / hidden_dim;
+
+        let embedding = upload_f32(&stream, embed_weight, vec![vocab_size, hidden_dim])?;
+        let final_norm_gpu = upload_f32(&stream, final_norm, vec![hidden_dim])?;
+
+        let num_classes = classifier_weight.len() / hidden_dim;
+        let classifier_weight_gpu = upload_f32(&stream, classifier_weight, vec![num_classes, hidden_dim])?;
+        let classifier_bias_gpu = classifier_bias
+            .map(|b| upload_f32(&stream, b, vec![num_classes]))
+            .transpose()?;
+
+        // Convert layers
+        let gpu_layers: Result<Vec<TransformerLayerWeightsGpu>, String> = layers.iter().map(|layer| {
+            Ok(TransformerLayerWeightsGpu {
+                input_norm: upload_f32(&stream, layer.input_norm, vec![hidden_dim])?,
+                q_weight: upload_f32(&stream, layer.q_weight, vec![layer.q_weight.len()])?,
+                k_weight: upload_f32(&stream, layer.k_weight, vec![layer.k_weight.len()])?,
+                v_weight: upload_f32(&stream, layer.v_weight, vec![layer.v_weight.len()])?,
+                o_weight: upload_f32(&stream, layer.o_weight, vec![layer.o_weight.len()])?,
+                post_attn_norm: upload_f32(&stream, layer.post_attn_norm, vec![hidden_dim])?,
+                gate_weight: layer.gate_weight.map(|g| upload_f32(&stream, g, vec![g.len()])).transpose()?,
+                up_weight: upload_f32(&stream, layer.up_weight, vec![layer.up_weight.len()])?,
+                down_weight: upload_f32(&stream, layer.down_weight, vec![layer.down_weight.len()])?,
+            })
+        }).collect();
+
+        Ok(RerankerModelWeightsGpu {
+            embedding,
+            layers: gpu_layers?,
+            final_norm: final_norm_gpu,
+            classifier_weight: classifier_weight_gpu,
+            classifier_bias: classifier_bias_gpu,
+        })
+    }
+
+    fn rerank_forward_gpu_pure(
+        &self,
+        _tokens: &[u32],
+        _weights: &RerankerModelWeightsGpu,
+        _config: &RerankForwardConfig,
+    ) -> Result<Vec<f32>, String> {
+        // TODO: Implement true GPU-native reranker forward
+        // Correct pattern:
+        //   1. Upload tokens to GPU once (tokens_gpu = clone_htod(tokens))
+        //   2. embedding_lookup_gpu(tokens_gpu, weights.embedding, hidden_gpu)
+        //   3. for layer in layers: transformer_layer_gpu(hidden_gpu, layer, ...)
+        //   4. rms_norm_gpu(hidden_gpu, weights.final_norm)
+        //   5. mean_pooling_gpu(hidden_gpu, mask_gpu, pooled_gpu)
+        //   6. classifier_gpu(pooled_gpu, weights.classifier, scores_gpu)
+        //   7. readback scores_gpu to host only at the end
+        //
+        // FORBIDDEN: Download all weights to CPU and call CPU forward
+        Err("CUDA rerank_forward_gpu_pure: requires native CUDA kernel pipeline (not yet implemented)".into())
+    }
+
+    fn upload_generator_weights(
+        &self,
+        embed_weight: &[f32],
+        layers: &[TransformerLayerWeights<'_>],
+        final_norm: &[f32],
+        lm_head: &[f32],
+        cos_cache: &[f32],
+        sin_cache: &[f32],
+        config: &GeneratorForwardConfig,
+    ) -> Result<GeneratorModelWeightsGpu, String> {
+        let stream = get_cuda_stream().ok_or("CUDA stream not available")?;
+
+        fn upload_f32(stream: &Arc<CudaStream>, data: &[f32], shape: Vec<usize>) -> Result<GpuTensor, String> {
+            let bytes: &[u8] = bytemuck::cast_slice(data);
+            let buf = stream.clone_htod(bytes).map_err(|e| e.to_string())?;
+            Ok(GpuTensor {
+                buffer: GpuBuffer::Cuda(Arc::new(buf)),
+                shape,
+                dtype: TensorDtype::F32,
+                size_in_bytes: bytes.len(),
+                backend: BackendType::Cuda,
+            })
+        }
+
+        let hidden_dim = config.hidden_size;
+        let vocab_size = embed_weight.len() / hidden_dim;
+
+        let embedding = upload_f32(&stream, embed_weight, vec![vocab_size, hidden_dim])?;
+        let final_norm_gpu = upload_f32(&stream, final_norm, vec![hidden_dim])?;
+        let lm_head_gpu = upload_f32(&stream, lm_head, vec![vocab_size, hidden_dim])?;
+        let cos_cache_gpu = upload_f32(&stream, cos_cache, vec![cos_cache.len()])?;
+        let sin_cache_gpu = upload_f32(&stream, sin_cache, vec![sin_cache.len()])?;
+
+        let gpu_layers: Result<Vec<TransformerLayerWeightsGpu>, String> = layers.iter().map(|layer| {
+            Ok(TransformerLayerWeightsGpu {
+                input_norm: upload_f32(&stream, layer.input_norm, vec![hidden_dim])?,
+                q_weight: upload_f32(&stream, layer.q_weight, vec![layer.q_weight.len()])?,
+                k_weight: upload_f32(&stream, layer.k_weight, vec![layer.k_weight.len()])?,
+                v_weight: upload_f32(&stream, layer.v_weight, vec![layer.v_weight.len()])?,
+                o_weight: upload_f32(&stream, layer.o_weight, vec![layer.o_weight.len()])?,
+                post_attn_norm: upload_f32(&stream, layer.post_attn_norm, vec![hidden_dim])?,
+                gate_weight: layer.gate_weight.map(|g| upload_f32(&stream, g, vec![g.len()])).transpose()?,
+                up_weight: upload_f32(&stream, layer.up_weight, vec![layer.up_weight.len()])?,
+                down_weight: upload_f32(&stream, layer.down_weight, vec![layer.down_weight.len()])?,
+            })
+        }).collect();
+
+        Ok(GeneratorModelWeightsGpu {
+            embedding,
+            layers: gpu_layers?,
+            final_norm: final_norm_gpu,
+            lm_head: lm_head_gpu,
+            cos_cache: cos_cache_gpu,
+            sin_cache: sin_cache_gpu,
+        })
+    }
+
+    fn alloc_kv_cache_gpu(
+        &self,
+        num_layers: usize,
+        batch_size: usize,
+        num_kv_heads: usize,
+        max_len: usize,
+        head_dim: usize,
+    ) -> Result<KVCacheGpu, String> {
+        let stream = get_cuda_stream().ok_or("CUDA stream not available")?;
+
+        let cache_size = num_layers * batch_size * num_kv_heads * max_len * head_dim;
+        let size_in_bytes = cache_size * std::mem::size_of::<f32>();
+        let zeros_bytes = vec![0u8; size_in_bytes];
+
+        let k_buf = stream.clone_htod(&zeros_bytes).map_err(|e| e.to_string())?;
+        let v_buf = stream.clone_htod(&zeros_bytes).map_err(|e| e.to_string())?;
+
+        let k_cache = GpuTensor {
+            buffer: GpuBuffer::Cuda(Arc::new(k_buf)),
+            shape: vec![num_layers, batch_size, num_kv_heads, max_len, head_dim],
+            dtype: TensorDtype::F32,
+            size_in_bytes,
+            backend: BackendType::Cuda,
+        };
+        let v_cache = GpuTensor {
+            buffer: GpuBuffer::Cuda(Arc::new(v_buf)),
+            shape: vec![num_layers, batch_size, num_kv_heads, max_len, head_dim],
+            dtype: TensorDtype::F32,
+            size_in_bytes,
+            backend: BackendType::Cuda,
+        };
+
+        Ok(KVCacheGpu {
+            k_cache,
+            v_cache,
+            seq_len: 0,
+            max_len,
+            num_layers,
+            num_kv_heads,
+            head_dim,
+        })
+    }
+
+    fn generator_forward_gpu_pure(
+        &self,
+        _tokens: &[u32],
+        _weights: &GeneratorModelWeightsGpu,
+        _kv_cache: &mut KVCacheGpu,
+        _config: &GeneratorForwardConfig,
+    ) -> Result<Vec<f32>, String> {
+        // TODO: Implement true GPU-native generator forward
+        // Correct pattern:
+        //   1. Upload tokens to GPU once (tokens_gpu = clone_htod(tokens))
+        //   2. embedding_lookup_gpu(tokens_gpu, weights.embedding, hidden_gpu)
+        //   3. for layer in layers:
+        //        transformer_layer_gpu(hidden_gpu, layer, kv_cache_gpu, ...)
+        //        // KV cache updates happen in-place on GPU
+        //   4. rms_norm_gpu(hidden_gpu, weights.final_norm)
+        //   5. lm_head_gpu(hidden_gpu, weights.lm_head, logits_gpu)
+        //   6. readback logits_gpu to host only at the end
+        //
+        // FORBIDDEN: Download all weights/KV cache to CPU and call CPU forward
+        Err("CUDA generator_forward_gpu_pure: requires native CUDA kernel pipeline (not yet implemented)".into())
+    }
 }
+
+// =========================================================================
+// CUDA Kernel Helper Functions (Internal)
+// NOTE: Real GPU kernels need to be implemented here.
+// These should use cuBLAS, cuDNN, or custom CUDA PTX kernels.
+// =========================================================================
+
+// TODO: When implementing real CUDA kernels, add functions like:
+//
+// fn cuda_gemm(
+//     cublas_handle: &CublasHandle,
+//     a: &CudaSlice<f32>, // GPU pointer
+//     b: &CudaSlice<f32>, // GPU pointer
+//     c: &mut CudaSlice<f32>, // GPU pointer
+//     m: usize, n: usize, k: usize,
+// ) -> Result<(), String>
+//
+// fn cuda_rms_norm(
+//     stream: &CudaStream,
+//     input: &CudaSlice<f32>,  // GPU pointer
+//     weight: &CudaSlice<f32>, // GPU pointer
+//     output: &mut CudaSlice<f32>, // GPU pointer
+//     hidden_dim: usize,
+//     eps: f32,
+// ) -> Result<(), String>
+//
+// These functions MUST:
+// - Take GPU pointers directly (no host data)
+// - Launch CUDA kernels
+// - Keep all intermediate results on GPU
+// - Never call clone_dtoh/clone_htod internally
