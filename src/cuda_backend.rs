@@ -2529,22 +2529,162 @@ impl Backend for CudaBackend {
 
     fn rerank_forward_gpu_pure(
         &self,
-        _tokens: &[u32],
-        _weights: &RerankerModelWeightsGpu,
-        _config: &RerankForwardConfig,
+        tokens: &[u32],
+        weights: &RerankerModelWeightsGpu,
+        config: &RerankForwardConfig,
     ) -> Result<Vec<f32>, String> {
-        // TODO: Implement true GPU-native reranker forward
-        // Correct pattern:
-        //   1. Upload tokens to GPU once (tokens_gpu = clone_htod(tokens))
-        //   2. embedding_lookup_gpu(tokens_gpu, weights.embedding, hidden_gpu)
-        //   3. for layer in layers: transformer_layer_gpu(hidden_gpu, layer, ...)
-        //   4. rms_norm_gpu(hidden_gpu, weights.final_norm)
-        //   5. mean_pooling_gpu(hidden_gpu, mask_gpu, pooled_gpu)
-        //   6. classifier_gpu(pooled_gpu, weights.classifier, scores_gpu)
-        //   7. readback scores_gpu to host only at the end
-        //
-        // FORBIDDEN: Download all weights to CPU and call CPU forward
-        Err("CUDA rerank_forward_gpu_pure: requires native CUDA kernel pipeline (not yet implemented)".into())
+        let stream = get_cuda_stream()
+            .ok_or("CUDA stream not available")?;
+
+        let expected_tokens = config
+            .batch_size
+            .checked_mul(config.seq_len)
+            .ok_or("CUDA rerank_forward_gpu_pure: token size overflow")?;
+        if tokens.len() != expected_tokens {
+            return Err(format!(
+                "CUDA rerank_forward_gpu_pure: token length mismatch (got {}, expected {})",
+                tokens.len(),
+                expected_tokens
+            ));
+        }
+
+        // Upload tokens to GPU (U32)
+        let token_bytes: &[u8] = bytemuck::cast_slice(tokens);
+        let token_buf = stream
+            .clone_htod(token_bytes)
+            .map_err(|e| format!("CUDA token upload failed: {}", e))?;
+        let tokens_gpu = GpuTensor::new(
+            GpuBuffer::Cuda(Arc::new(token_buf)),
+            vec![config.batch_size, config.seq_len],
+            TensorDtype::U32,
+            BackendType::Cuda,
+        );
+
+        // Embedding lookup
+        let mut hidden = GpuTensor {
+            buffer: GpuBuffer::Cpu(Arc::new(Vec::new())),
+            shape: Vec::new(),
+            dtype: TensorDtype::F32,
+            size_in_bytes: 0,
+            backend: BackendType::Cuda,
+        };
+        self.embedding_lookup_gpu(&tokens_gpu, &weights.embedding, &mut hidden)?;
+
+        // Prepare identity RoPE cache if missing (cos=1, sin=0) to keep Q/K unchanged
+        let mut identity_rope: Option<(GpuTensor, GpuTensor)> = None;
+            if config.head_dim % 2 != 0 {
+                return Err("CUDA rerank_forward_gpu_pure: head_dim must be even for RoPE".into());
+            }
+        if weights.layers.iter().any(|layer| layer.cos_cache.is_none() || layer.sin_cache.is_none()) {
+            let rope_len = config
+                .seq_len
+                .checked_mul(config.head_dim / 2)
+                .ok_or("CUDA rerank_forward_gpu_pure: RoPE cache size overflow")?;
+            let cos = vec![1.0f32; rope_len];
+            let sin = vec![0.0f32; rope_len];
+            let cos_bytes: &[u8] = bytemuck::cast_slice(&cos);
+            let sin_bytes: &[u8] = bytemuck::cast_slice(&sin);
+            let cos_buf = stream
+                .clone_htod(cos_bytes)
+                .map_err(|e| format!("CUDA RoPE cos upload failed: {}", e))?;
+            let sin_buf = stream
+                .clone_htod(sin_bytes)
+                .map_err(|e| format!("CUDA RoPE sin upload failed: {}", e))?;
+            let cos_gpu = GpuTensor {
+                buffer: GpuBuffer::Cuda(Arc::new(cos_buf)),
+                shape: vec![rope_len],
+                dtype: TensorDtype::F32,
+                size_in_bytes: cos_bytes.len(),
+                backend: BackendType::Cuda,
+            };
+            let sin_gpu = GpuTensor {
+                buffer: GpuBuffer::Cuda(Arc::new(sin_buf)),
+                shape: vec![rope_len],
+                dtype: TensorDtype::F32,
+                size_in_bytes: sin_bytes.len(),
+                backend: BackendType::Cuda,
+            };
+            identity_rope = Some((cos_gpu, sin_gpu));
+        }
+
+        let use_silu = matches!(config.activation, crate::kernel_types::Activation::SiLU);
+        let layer_cfg = TransformerLayerConfigGpu {
+            batch_size: config.batch_size,
+            seq_len: config.seq_len,
+            hidden_size: config.hidden_size,
+            num_q_heads: config.num_q_heads,
+            num_kv_heads: config.num_kv_heads,
+            head_dim: config.head_dim,
+            intermediate_size: config.intermediate_size,
+            rms_norm_eps: config.rms_norm_eps,
+            position: 0,
+            use_silu,
+        };
+
+        for layer in weights.layers.iter() {
+            let mut layer_weights = layer.clone();
+            if layer_weights.cos_cache.is_none() || layer_weights.sin_cache.is_none() {
+                if let Some((cos_gpu, sin_gpu)) = identity_rope.as_ref() {
+                    layer_weights.cos_cache = Some(cos_gpu.clone());
+                    layer_weights.sin_cache = Some(sin_gpu.clone());
+                }
+            }
+            self.transformer_layer_gpu(&mut hidden, &layer_weights, None, &layer_cfg)?;
+        }
+
+        // Final RMS norm
+        self.rms_norm_gpu(&mut hidden, &weights.final_norm, config.rms_norm_eps)?;
+
+        // Mean pooling (no attention mask provided, so use all-ones mask)
+        let mask = vec![1.0f32; expected_tokens];
+        let mask_bytes: &[u8] = bytemuck::cast_slice(&mask);
+        let mask_buf = stream
+            .clone_htod(mask_bytes)
+            .map_err(|e| format!("CUDA mask upload failed: {}", e))?;
+        let mask_gpu = GpuTensor {
+            buffer: GpuBuffer::Cuda(Arc::new(mask_buf)),
+            shape: vec![config.batch_size, config.seq_len],
+            dtype: TensorDtype::F32,
+            size_in_bytes: mask_bytes.len(),
+            backend: BackendType::Cuda,
+        };
+
+        let mut pooled = GpuTensor {
+            buffer: GpuBuffer::Cpu(Arc::new(Vec::new())),
+            shape: Vec::new(),
+            dtype: TensorDtype::F32,
+            size_in_bytes: 0,
+            backend: BackendType::Cuda,
+        };
+        self.mean_pooling_gpu(&hidden, &mask_gpu, &mut pooled)?;
+
+        // Classifier head
+        let mut scores_gpu = GpuTensor {
+            buffer: GpuBuffer::Cpu(Arc::new(Vec::new())),
+            shape: Vec::new(),
+            dtype: TensorDtype::F32,
+            size_in_bytes: 0,
+            backend: BackendType::Cuda,
+        };
+        self.classifier_gpu(
+            &pooled,
+            &weights.classifier_weight,
+            weights.classifier_bias.as_ref(),
+            &mut scores_gpu,
+        )?;
+
+        // Download scores to host
+        match &scores_gpu.buffer {
+            GpuBuffer::Cuda(cuda_slice) => {
+                let bytes: Vec<u8> = stream
+                    .clone_dtoh(cuda_slice.as_ref())
+                    .map_err(|e| format!("CUDA scores download failed: {}", e))?;
+                Ok(bytemuck::cast_slice(&bytes).to_vec())
+            }
+            GpuBuffer::Cpu(bytes) => Ok(bytemuck::cast_slice(bytes.as_slice()).to_vec()),
+            #[allow(unreachable_patterns)]
+            _ => Err("Unexpected GPU buffer type for CUDA backend".into()),
+        }
     }
 
     fn upload_generator_weights(
@@ -2651,24 +2791,258 @@ impl Backend for CudaBackend {
 
     fn generator_forward_gpu_pure(
         &self,
-        _tokens: &[u32],
-        _weights: &GeneratorModelWeightsGpu,
-        _kv_cache: &mut KVCacheGpu,
-        _config: &GeneratorForwardConfig,
+        tokens: &[u32],
+        weights: &GeneratorModelWeightsGpu,
+        kv_cache: &mut KVCacheGpu,
+        config: &GeneratorForwardConfig,
     ) -> Result<Vec<f32>, String> {
-        // TODO: Implement true GPU-native generator forward
-        // Correct pattern:
-        //   1. Upload tokens to GPU once (tokens_gpu = clone_htod(tokens))
-        //   2. embedding_lookup_gpu(tokens_gpu, weights.embedding, hidden_gpu)
-        //   3. for layer in layers:
-        //        transformer_layer_gpu(hidden_gpu, layer, kv_cache_gpu, ...)
-        //        // KV cache updates happen in-place on GPU
-        //   4. rms_norm_gpu(hidden_gpu, weights.final_norm)
-        //   5. lm_head_gpu(hidden_gpu, weights.lm_head, logits_gpu)
-        //   6. readback logits_gpu to host only at the end
-        //
-        // FORBIDDEN: Download all weights/KV cache to CPU and call CPU forward
-        Err("CUDA generator_forward_gpu_pure: requires native CUDA kernel pipeline (not yet implemented)".into())
+        let stream = get_cuda_stream()
+            .ok_or("CUDA stream not available")?;
+
+        let expected_tokens = config
+            .batch_size
+            .checked_mul(config.seq_len)
+            .ok_or("CUDA generator_forward_gpu_pure: token size overflow")?;
+        if tokens.len() != expected_tokens {
+            return Err(format!(
+                "CUDA generator_forward_gpu_pure: token length mismatch (got {}, expected {})",
+                tokens.len(),
+                expected_tokens
+            ));
+        }
+
+        if kv_cache.num_layers != weights.layers.len() {
+            return Err(format!(
+                "CUDA generator_forward_gpu_pure: KV cache layers mismatch (cache={}, weights={})",
+                kv_cache.num_layers,
+                weights.layers.len()
+            ));
+        }
+        if kv_cache.num_kv_heads != config.num_kv_heads || kv_cache.head_dim != config.head_dim {
+            return Err("CUDA generator_forward_gpu_pure: KV cache shape mismatch".into());
+        }
+
+        let layer_elems = config
+            .batch_size
+            .checked_mul(config.num_kv_heads)
+            .and_then(|v| v.checked_mul(kv_cache.max_len))
+            .and_then(|v| v.checked_mul(config.head_dim))
+            .ok_or("CUDA generator_forward_gpu_pure: KV cache size overflow")?;
+        let expected_cache_elems = layer_elems
+            .checked_mul(kv_cache.num_layers)
+            .ok_or("CUDA generator_forward_gpu_pure: KV cache total size overflow")?;
+
+        let cache_elems = kv_cache.k_cache.size_in_bytes / std::mem::size_of::<f32>();
+        if cache_elems != expected_cache_elems {
+            return Err("CUDA generator_forward_gpu_pure: KV cache buffer size mismatch".into());
+        }
+
+        // Upload tokens to GPU (U32)
+        let token_bytes: &[u8] = bytemuck::cast_slice(tokens);
+        let token_buf = stream
+            .clone_htod(token_bytes)
+            .map_err(|e| format!("CUDA token upload failed: {}", e))?;
+        let tokens_gpu = GpuTensor::new(
+            GpuBuffer::Cuda(Arc::new(token_buf)),
+            vec![config.batch_size, config.seq_len],
+            TensorDtype::U32,
+            BackendType::Cuda,
+        );
+
+        // Embedding lookup
+        let mut hidden = GpuTensor {
+            buffer: GpuBuffer::Cpu(Arc::new(Vec::new())),
+            shape: Vec::new(),
+            dtype: TensorDtype::F32,
+            size_in_bytes: 0,
+            backend: BackendType::Cuda,
+        };
+        self.embedding_lookup_gpu(&tokens_gpu, &weights.embedding, &mut hidden)?;
+
+        let use_silu = matches!(config.activation, crate::kernel_types::Activation::SiLU);
+        let layer_cfg = TransformerLayerConfigGpu {
+            batch_size: config.batch_size,
+            seq_len: config.seq_len,
+            hidden_size: config.hidden_size,
+            num_q_heads: config.num_q_heads,
+            num_kv_heads: config.num_kv_heads,
+            head_dim: config.head_dim,
+            intermediate_size: config.intermediate_size,
+            rms_norm_eps: config.rms_norm_eps,
+            position: kv_cache.seq_len,
+            use_silu,
+        };
+
+        for (layer_idx, layer) in weights.layers.iter().enumerate() {
+            // Extract per-layer KV cache into a temporary GPU buffer
+            let (layer_k_buf, layer_v_buf) = {
+                let GpuBuffer::Cuda(k_cache_slice) = &kv_cache.k_cache.buffer else {
+                    return Err("CUDA generator_forward_gpu_pure: KV cache k must be CUDA buffer".into());
+                };
+                let GpuBuffer::Cuda(v_cache_slice) = &kv_cache.v_cache.buffer else {
+                    return Err("CUDA generator_forward_gpu_pure: KV cache v must be CUDA buffer".into());
+                };
+                let total_elems = expected_cache_elems;
+                let k_view = unsafe {
+                    k_cache_slice
+                        .transmute::<f32>(total_elems)
+                        .ok_or("CUDA generator_forward_gpu_pure: failed to transmute KV k cache")?
+                };
+                let v_view = unsafe {
+                    v_cache_slice
+                        .transmute::<f32>(total_elems)
+                        .ok_or("CUDA generator_forward_gpu_pure: failed to transmute KV v cache")?
+                };
+                let start = layer_idx
+                    .checked_mul(layer_elems)
+                    .ok_or("CUDA generator_forward_gpu_pure: KV layer offset overflow")?;
+                let end = start + layer_elems;
+                let k_src = k_view
+                    .try_slice(start..end)
+                    .ok_or("CUDA generator_forward_gpu_pure: KV k slice OOB")?;
+                let v_src = v_view
+                    .try_slice(start..end)
+                    .ok_or("CUDA generator_forward_gpu_pure: KV v slice OOB")?;
+
+                let mut k_buf: cudarc::driver::CudaSlice<u8> = stream
+                    .alloc_zeros(layer_elems * std::mem::size_of::<f32>())
+                    .map_err(|e| format!("CUDA generator_forward_gpu_pure: KV k alloc failed: {}", e))?;
+                let mut v_buf: cudarc::driver::CudaSlice<u8> = stream
+                    .alloc_zeros(layer_elems * std::mem::size_of::<f32>())
+                    .map_err(|e| format!("CUDA generator_forward_gpu_pure: KV v alloc failed: {}", e))?;
+                let mut k_dst = unsafe {
+                    k_buf
+                        .transmute_mut::<f32>(layer_elems)
+                        .ok_or("CUDA generator_forward_gpu_pure: failed to transmute KV k layer")?
+                };
+                let mut v_dst = unsafe {
+                    v_buf
+                        .transmute_mut::<f32>(layer_elems)
+                        .ok_or("CUDA generator_forward_gpu_pure: failed to transmute KV v layer")?
+                };
+                stream
+                    .memcpy_dtod(&k_src, &mut k_dst)
+                    .map_err(|e| format!("CUDA generator_forward_gpu_pure: KV k dtod failed: {}", e))?;
+                stream
+                    .memcpy_dtod(&v_src, &mut v_dst)
+                    .map_err(|e| format!("CUDA generator_forward_gpu_pure: KV v dtod failed: {}", e))?;
+                (k_buf, v_buf)
+            };
+
+            let mut layer_kv = KVCacheGpu {
+                k_cache: GpuTensor {
+                    buffer: GpuBuffer::Cuda(Arc::new(layer_k_buf)),
+                    shape: vec![1, config.batch_size, config.num_kv_heads, kv_cache.max_len, config.head_dim],
+                    dtype: TensorDtype::F32,
+                    size_in_bytes: layer_elems * std::mem::size_of::<f32>(),
+                    backend: BackendType::Cuda,
+                },
+                v_cache: GpuTensor {
+                    buffer: GpuBuffer::Cuda(Arc::new(layer_v_buf)),
+                    shape: vec![1, config.batch_size, config.num_kv_heads, kv_cache.max_len, config.head_dim],
+                    dtype: TensorDtype::F32,
+                    size_in_bytes: layer_elems * std::mem::size_of::<f32>(),
+                    backend: BackendType::Cuda,
+                },
+                seq_len: kv_cache.seq_len,
+                max_len: kv_cache.max_len,
+                num_layers: 1,
+                num_kv_heads: kv_cache.num_kv_heads,
+                head_dim: kv_cache.head_dim,
+            };
+
+            self.transformer_layer_gpu(&mut hidden, layer, Some(&mut layer_kv), &layer_cfg)?;
+
+            // Copy per-layer KV cache back into the global cache
+            {
+                let GpuBuffer::Cuda(k_cache_arc) = &mut kv_cache.k_cache.buffer else {
+                    return Err("CUDA generator_forward_gpu_pure: KV cache k must be CUDA buffer".into());
+                };
+                let GpuBuffer::Cuda(v_cache_arc) = &mut kv_cache.v_cache.buffer else {
+                    return Err("CUDA generator_forward_gpu_pure: KV cache v must be CUDA buffer".into());
+                };
+                let k_cache_slice = Arc::get_mut(k_cache_arc)
+                    .ok_or("CUDA generator_forward_gpu_pure: KV cache k buffer is shared")?;
+                let v_cache_slice = Arc::get_mut(v_cache_arc)
+                    .ok_or("CUDA generator_forward_gpu_pure: KV cache v buffer is shared")?;
+                let mut k_view = unsafe {
+                    k_cache_slice
+                        .transmute_mut::<f32>(expected_cache_elems)
+                        .ok_or("CUDA generator_forward_gpu_pure: failed to transmute KV k cache")?
+                };
+                let mut v_view = unsafe {
+                    v_cache_slice
+                        .transmute_mut::<f32>(expected_cache_elems)
+                        .ok_or("CUDA generator_forward_gpu_pure: failed to transmute KV v cache")?
+                };
+                let start = layer_idx
+                    .checked_mul(layer_elems)
+                    .ok_or("CUDA generator_forward_gpu_pure: KV layer offset overflow")?;
+                let end = start + layer_elems;
+                let mut k_dst = k_view
+                    .try_slice_mut(start..end)
+                    .ok_or("CUDA generator_forward_gpu_pure: KV k dst slice OOB")?;
+                let mut v_dst = v_view
+                    .try_slice_mut(start..end)
+                    .ok_or("CUDA generator_forward_gpu_pure: KV v dst slice OOB")?;
+
+                let GpuBuffer::Cuda(layer_k_buf) = &layer_kv.k_cache.buffer else {
+                    return Err("CUDA generator_forward_gpu_pure: layer KV k must be CUDA buffer".into());
+                };
+                let GpuBuffer::Cuda(layer_v_buf) = &layer_kv.v_cache.buffer else {
+                    return Err("CUDA generator_forward_gpu_pure: layer KV v must be CUDA buffer".into());
+                };
+                let k_src = unsafe {
+                    layer_k_buf
+                        .transmute::<f32>(layer_elems)
+                        .ok_or("CUDA generator_forward_gpu_pure: failed to transmute layer KV k")?
+                };
+                let v_src = unsafe {
+                    layer_v_buf
+                        .transmute::<f32>(layer_elems)
+                        .ok_or("CUDA generator_forward_gpu_pure: failed to transmute layer KV v")?
+                };
+
+                stream
+                    .memcpy_dtod(&k_src, &mut k_dst)
+                    .map_err(|e| format!("CUDA generator_forward_gpu_pure: KV k writeback failed: {}", e))?;
+                stream
+                    .memcpy_dtod(&v_src, &mut v_dst)
+                    .map_err(|e| format!("CUDA generator_forward_gpu_pure: KV v writeback failed: {}", e))?;
+            }
+        }
+
+        let pos_end = kv_cache
+            .seq_len
+            .checked_add(config.seq_len)
+            .ok_or("CUDA generator_forward_gpu_pure: KV cache position overflow")?;
+        kv_cache.seq_len = pos_end;
+
+        // Final RMS norm
+        self.rms_norm_gpu(&mut hidden, &weights.final_norm, config.rms_norm_eps)?;
+
+        // LM head
+        let mut logits_gpu = GpuTensor {
+            buffer: GpuBuffer::Cpu(Arc::new(Vec::new())),
+            shape: Vec::new(),
+            dtype: TensorDtype::F32,
+            size_in_bytes: 0,
+            backend: BackendType::Cuda,
+        };
+        self.lm_head_gpu(&hidden, &weights.lm_head, &mut logits_gpu)?;
+
+        // Download logits to host
+        match &logits_gpu.buffer {
+            GpuBuffer::Cuda(cuda_slice) => {
+                let bytes: Vec<u8> = stream
+                    .clone_dtoh(cuda_slice.as_ref())
+                    .map_err(|e| format!("CUDA logits download failed: {}", e))?;
+                Ok(bytemuck::cast_slice(&bytes).to_vec())
+            }
+            GpuBuffer::Cpu(bytes) => Ok(bytemuck::cast_slice(bytes.as_slice()).to_vec()),
+            #[allow(unreachable_patterns)]
+            _ => Err("Unexpected GPU buffer type for CUDA backend".into()),
+        }
     }
 }
 
