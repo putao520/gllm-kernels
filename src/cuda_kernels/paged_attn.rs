@@ -11,7 +11,7 @@ use cudarc::driver::{
 };
 use half::f16;
 
-use crate::cuda_kernels::ptx_loader::{PtxCollection, PtxLoadError};
+use crate::cuda_kernels::binary_loader::{PtxCollection, PtxLoadError};
 use crate::validation::{
     validate_attention_dims, validate_i32_bounds, compute_num_queries, compute_output_len,
 };
@@ -24,6 +24,7 @@ const DEFAULT_BLOCK: u32 = 128;
 /// 🚨 **Fat Binary Only**: All PTX precompiled and embedded, no runtime compilation.
 static PAGED_ATTENTION_PTX: PtxCollection = PtxCollection {
     kernel_name: "paged_attention",
+    cubin_versions: &[],
     ptx_versions: &[
         // SM 61 (Pascal) - GTX 1060/1070/1080
         (61, include_str!("kernels/paged_attention_sm61.ptx")),
@@ -111,6 +112,7 @@ impl PagedAttentionKernel {
         v_cache: &CudaSlice<f16>,
         block_tables: &CudaSlice<i32>,
         block_offsets: &CudaSlice<i32>,
+        logical_positions: &CudaSlice<i32>,
         batch_size: usize,
         num_heads: usize,
         head_dim: usize,
@@ -124,6 +126,7 @@ impl PagedAttentionKernel {
             v_cache,
             block_tables,
             block_offsets,
+            logical_positions,
             batch_size,
             num_heads,
             head_dim,
@@ -141,6 +144,7 @@ impl PagedAttentionKernel {
         v_cache: &CudaSlice<f32>,
         block_tables: &CudaSlice<i32>,
         block_offsets: &CudaSlice<i32>,
+        logical_positions: &CudaSlice<i32>,
         batch_size: usize,
         num_heads: usize,
         head_dim: usize,
@@ -154,6 +158,7 @@ impl PagedAttentionKernel {
             v_cache,
             block_tables,
             block_offsets,
+            logical_positions,
             batch_size,
             num_heads,
             head_dim,
@@ -172,6 +177,7 @@ impl PagedAttentionKernel {
         v_cache: &CudaSlice<f16>,
         block_tables: &CudaSlice<i32>,
         block_offsets: &CudaSlice<i32>,
+        logical_positions: &CudaSlice<i32>,
         batch_size: usize,
         num_heads: usize,
         head_dim: usize,
@@ -185,6 +191,7 @@ impl PagedAttentionKernel {
             v_cache,
             block_tables,
             block_offsets,
+            logical_positions,
             batch_size,
             num_heads,
             head_dim,
@@ -202,6 +209,7 @@ impl PagedAttentionKernel {
         v_cache: &CudaSlice<f32>,
         block_tables: &CudaSlice<i32>,
         block_offsets: &CudaSlice<i32>,
+        _logical_positions: &CudaSlice<i32>,
         batch_size: usize,
         num_heads: usize,
         head_dim: usize,
@@ -246,6 +254,7 @@ impl PagedAttentionKernel {
         v_cache: &CudaSlice<f16>,
         block_tables: &CudaSlice<i32>,
         block_offsets: &CudaSlice<i32>,
+        _logical_positions: &CudaSlice<i32>,
         batch_size: usize,
         num_heads: usize,
         head_dim: usize,

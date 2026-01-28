@@ -8,7 +8,7 @@ use cudarc::driver::{
     LaunchConfig, PushKernelArg,
 };
 
-use crate::cuda_kernels::ptx_loader::{PtxCollection, PtxLoadError};
+use crate::cuda_kernels::binary_loader::{PtxCollection, PtxLoadError};
 
 const KERNEL_EMBEDDING_GATHER_F32: &str = "embedding_gather_f32";
 const KERNEL_MEAN_POOLING_F32: &str = "mean_pooling_f32";
@@ -19,6 +19,7 @@ const KERNEL_CLS_EXTRACT_F32: &str = "cls_extract_f32";
 /// 🚨 **Fat Binary Only**: All PTX precompiled and embedded, no runtime compilation.
 static POOLING_PTX: PtxCollection = PtxCollection {
     kernel_name: "pooling",
+    cubin_versions: &[],
     ptx_versions: &[
         (61, include_str!("kernels/pooling_sm61.ptx")),
         (80, include_str!("kernels/pooling.ptx")),

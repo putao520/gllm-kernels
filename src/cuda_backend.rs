@@ -1,6 +1,7 @@
-use std::sync::{Arc, OnceLock};
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex, OnceLock};
 
-use cudarc::driver::{CudaContext, CudaStream};
+use cudarc::driver::{CudaContext, CudaSlice, CudaStream};
 
 use crate::backend_trait::Backend;
 use crate::cuda_kernels::{
@@ -54,6 +55,36 @@ static CUDA_LINEAR_KERNEL: OnceLock<Option<CudaLinear>> = OnceLock::new();
 static CUDA_ELEMENTWISE_KERNEL: OnceLock<Option<CudaElementwiseKernel>> = OnceLock::new();
 /// Global CUDA pooling kernel (lazy initialized).
 static CUDA_POOLING_KERNEL: OnceLock<Option<CudaPoolingKernel>> = OnceLock::new();
+/// Global CUDA swap block registry (ARCH-MEM-TIERING).
+static CUDA_SWAP_REGISTRY: OnceLock<Mutex<HashMap<u64, CudaSlice<u8>>>> = OnceLock::new();
+/// Global NCCL dynamic library (ARCH-DRIVER-ONLY, optional).
+#[cfg(feature = "nccl")]
+static CUDA_NCCL_LIBRARY: OnceLock<Option<libloading::Library>> = OnceLock::new();
+
+fn swap_registry() -> &'static Mutex<HashMap<u64, CudaSlice<u8>>> {
+    CUDA_SWAP_REGISTRY.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+#[cfg(feature = "nccl")]
+fn init_nccl() -> bool {
+    let lib = CUDA_NCCL_LIBRARY.get_or_init(|| {
+        let candidates = ["libnccl.so", "libnccl.so.2", "libnccl.so.1"];
+        for name in candidates {
+            if let Ok(lib) = unsafe { libloading::Library::new(name) } {
+                log::info!("Loaded NCCL library: {}", name);
+                return Some(lib);
+            }
+        }
+        log::warn!("NCCL library not found; multi-GPU disabled");
+        None
+    });
+    lib.is_some()
+}
+
+#[cfg(not(feature = "nccl"))]
+fn init_nccl() -> bool {
+    false
+}
 
 fn get_cuda_context() -> Option<&'static Arc<CudaContext>> {
     CUDA_CONTEXT
@@ -350,6 +381,13 @@ fn cuda_paged_attention<T: KernelFloat>(
             return false;
         }
     };
+    let logical_positions_buf = match stream.clone_htod(&inputs.logical_positions) {
+        Ok(buf) => buf,
+        Err(e) => {
+            log::debug!("Failed to copy logical_positions to GPU: {}", e);
+            return false;
+        }
+    };
 
     let result = kernel.forward_f32(
         stream,
@@ -358,6 +396,7 @@ fn cuda_paged_attention<T: KernelFloat>(
         &v_buf,
         &table_buf,
         &offsets_buf,
+        &logical_positions_buf,
         inputs.layout.batch_size,
         inputs.layout.num_heads,
         inputs.layout.head_dim,
@@ -738,7 +777,24 @@ pub struct CudaBackend {}
 
 impl CudaBackend {
     pub fn new() -> Self {
+        let _ = init_nccl();
         Self {}
+    }
+
+    pub(crate) fn register_swap_block(&self, block_id: u64, buffer: CudaSlice<u8>) -> Result<(), String> {
+        let mut registry = swap_registry()
+            .lock()
+            .map_err(|_| "CUDA swap registry poisoned".to_string())?;
+        if registry.contains_key(&block_id) {
+            return Err(format!("CUDA swap registry already contains block {}", block_id));
+        }
+        registry.insert(block_id, buffer);
+        Ok(())
+    }
+
+    pub(crate) fn unregister_swap_block(&self, block_id: u64) -> Option<CudaSlice<u8>> {
+        let mut registry = swap_registry().lock().ok()?;
+        registry.remove(&block_id)
     }
 }
 
@@ -963,6 +1019,46 @@ impl Backend for CudaBackend {
 
     fn backend_type(&self) -> BackendType {
         BackendType::Cuda
+    }
+
+    fn swap_out(&self, block_id: u64, cpu_buffer: &mut [u8]) -> Result<(), String> {
+        let stream = get_cuda_stream().ok_or("CUDA stream not available")?;
+        let mut registry = swap_registry()
+            .lock()
+            .map_err(|_| "CUDA swap registry poisoned".to_string())?;
+        let block = registry
+            .get_mut(&block_id)
+            .ok_or_else(|| format!("CUDA swap_out: unknown block {}", block_id))?;
+        if cpu_buffer.len() != block.len() {
+            return Err(format!(
+                "CUDA swap_out: cpu_buffer size mismatch (got {}, expected {})",
+                cpu_buffer.len(),
+                block.len()
+            ));
+        }
+        stream
+            .memcpy_dtoh(block, cpu_buffer)
+            .map_err(|e| format!("CUDA swap_out dtoh failed: {}", e))
+    }
+
+    fn swap_in(&self, cpu_buffer: &[u8], block_id: u64) -> Result<(), String> {
+        let stream = get_cuda_stream().ok_or("CUDA stream not available")?;
+        let mut registry = swap_registry()
+            .lock()
+            .map_err(|_| "CUDA swap registry poisoned".to_string())?;
+        let block = registry
+            .get_mut(&block_id)
+            .ok_or_else(|| format!("CUDA swap_in: unknown block {}", block_id))?;
+        if cpu_buffer.len() != block.len() {
+            return Err(format!(
+                "CUDA swap_in: cpu_buffer size mismatch (got {}, expected {})",
+                cpu_buffer.len(),
+                block.len()
+            ));
+        }
+        stream
+            .memcpy_htod(cpu_buffer, block)
+            .map_err(|e| format!("CUDA swap_in htod failed: {}", e))
     }
 
     // =========================================================================

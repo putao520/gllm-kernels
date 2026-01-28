@@ -4,7 +4,7 @@ version = "0.2.0"
 edition = "2021"
 authors = ["gllm contributors"]
 license = "Apache-2.0"
-description = "Low-level attention kernels with runtime backend selection (CUDA/ROCm/Metal/WGPU/CPU)"
+description = "Low-level attention kernels with runtime backend selection (CUDA/ROCm/Metal/CPU)"
 repository = "https://github.com/putao520/gllm-kernels"
 homepage = "https://github.com/putao520/gllm-kernels"
 keywords = ["attention", "kernels", "llm", "gpu", "inference"]
@@ -15,20 +15,12 @@ name = "gllm_kernels"
 path = "src/lib.rs"
 
 [features]
-# 默认：全后端支持，运行时动态选择
-default = ["full"]
-
-# 完整版：所有后端 + 所有 kernel（Fat Binary，全部预编译嵌入）
-full = ["all-backends", "all-kernels"]
-
-# 所有后端（运行时检测，动态加载）
-all-backends = ["cuda", "rocm", "metal", "wgpu"]
+# 默认：Fat Binary 架构，基于 OS 平台自动选择后端（ARCH-ADR-002）
+# 用户无需（也禁止）手动选择 cuda/rocm/metal feature
+default = []
 
 # 所有自定义 kernel
 all-kernels = []
-
-# Fusion 支持（已移除 Burn 依赖，保留 feature 以兼容）
-fusion = []
 
 # NCCL 多 GPU（需要 CUDA 环境）
 nccl = ["cudarc/nccl"]
@@ -57,16 +49,10 @@ embedded-kernels = []
 # 运行时下载内核（首次使用时从 GitHub Release 下载）
 download-kernels = []
 
-# Backend-specific kernel features (for conditional compilation)
-cpu = []
-cuda = []
-rocm = []
-metal = []
-wgpu = []
+# Kernel-specific features (内部使用，不暴露给用户)
 cuda-kernel = []
 rocm-kernel = []
 metal-kernel = []
-wgpu-kernel = []
 fused-kernel = []
 paged-kernel = []
 softmax-kernel = []
@@ -76,10 +62,6 @@ softmax-kernel = []
 
 # CUDA 支持（动态加载，运行时检测）
 cudarc = { version = "0.18", default-features = false, features = ["std", "driver", "nvrtc", "f16", "cuda-12090", "dynamic-loading"] }
-
-# WGPU 支持（跨平台 GPU）
-wgpu = { version = "26.0" }
-pollster = { version = "0.4" }
 
 # 通用依赖
 log = "0.4"
