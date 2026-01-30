@@ -534,6 +534,19 @@ impl Backend for CpuBackend {
     }
 
     // =========================================================================
+    // Memory Tiering Primitives (ARCH-MEM-TIERING)
+    // CPU backend does not support memory tiering
+    // =========================================================================
+
+    fn swap_out(&self, _block_id: u64, _cpu_buffer: &mut [u8]) -> Result<(), String> {
+        Err("CpuBackend does not support memory tiering swap_out".to_string())
+    }
+
+    fn swap_in(&self, _cpu_buffer: &[u8], _block_id: u64) -> Result<(), String> {
+        Err("CpuBackend does not support memory tiering swap_in".to_string())
+    }
+
+    // =========================================================================
     // L3 High-Level Inference API (ARCH-ADR-003)
     // =========================================================================
 
@@ -548,7 +561,7 @@ impl Backend for CpuBackend {
         sin_cache: &[f32],
         kv_cache: &mut KVCacheState<'_>,
         config: &GeneratorForwardConfig,
-    ) -> Result<Vec<f32>, String> {
+    ) -> Result<crate::kernel_types::LogitsTensor, String> {
         let seq_len = tokens.len();
         let hidden_size = config.hidden_size;
         let num_q_heads = config.num_q_heads;
@@ -654,7 +667,7 @@ impl Backend for CpuBackend {
             tie_word_embeddings: false,
             rms_norm_eps: config.rms_norm_eps,
         };
-        self.lm_head(&last_hidden, lm_head_weight, final_norm, &lm_config)
+        Ok(crate::kernel_types::LogitsTensor::Cpu(self.lm_head(&last_hidden, lm_head_weight, final_norm, &lm_config)?))
     }
 
     fn moe_generator_forward(
@@ -668,7 +681,7 @@ impl Backend for CpuBackend {
         sin_cache: &[f32],
         kv_cache: &mut KVCacheState<'_>,
         config: &MoEGeneratorForwardConfig,
-    ) -> Result<Vec<f32>, String> {
+    ) -> Result<crate::kernel_types::LogitsTensor, String> {
         let seq_len = tokens.len();
         let hidden_size = config.hidden_size;
         let num_q_heads = config.num_q_heads;
@@ -805,7 +818,7 @@ impl Backend for CpuBackend {
             tie_word_embeddings: false,
             rms_norm_eps: config.rms_norm_eps,
         };
-        self.lm_head(&last_hidden, lm_head_weight, final_norm, &lm_config)
+        Ok(crate::kernel_types::LogitsTensor::Cpu(self.lm_head(&last_hidden, lm_head_weight, final_norm, &lm_config)?))
     }
 
     fn embedding_forward(
@@ -1736,7 +1749,7 @@ impl Backend for CpuBackend {
         weights: &GeneratorModelWeightsGpu,
         kv_cache: &mut KVCacheGpu,
         config: &GeneratorForwardConfig,
-    ) -> Result<Vec<f32>, String> {
+    ) -> Result<crate::kernel_types::LogitsTensor, String> {
         // Helper to extract f32 slice from CPU-backed GpuTensor
         fn gpu_tensor_to_f32(tensor: &GpuTensor) -> Result<&[f32], String> {
             match &tensor.buffer {
