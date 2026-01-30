@@ -28,6 +28,8 @@ use crate::kernel_types::{
     EmbeddingModelWeightsGpu, TransformerLayerWeightsGpu,
     RerankerModelWeightsGpu, GeneratorModelWeightsGpu, KVCacheGpu,
     TransformerLayerConfigGpu,
+    MoEGeneratorModelWeightsGpu, MoETransformerLayerWeightsGpu, ExpertWeightsGpu,
+    LogitsTensor,
 };
 use crate::gpu_types::{GpuBuffer, GpuTensor, TensorDtype};
 use crate::ops::sampling::SamplingConfig;
@@ -1077,7 +1079,7 @@ impl Backend for CudaBackend {
         sin_cache: &[f32],
         kv_cache: &mut KVCacheState<'_>,
         config: &GeneratorForwardConfig,
-    ) -> Result<Vec<f32>, String> {
+    ) -> Result<LogitsTensor, String> {
         // TODO: Implement CUDA-optimized generator forward
         // For now, delegate to CPU implementation
         crate::cpu_backend::CpuBackend::new().generator_forward(
@@ -1097,7 +1099,7 @@ impl Backend for CudaBackend {
         sin_cache: &[f32],
         kv_cache: &mut KVCacheState<'_>,
         config: &MoEGeneratorForwardConfig,
-    ) -> Result<Vec<f32>, String> {
+    ) -> Result<LogitsTensor, String> {
         // TODO: Implement CUDA-optimized MoE generator forward
         crate::cpu_backend::CpuBackend::new().moe_generator_forward(
             tokens, embed_weight, layers, final_norm, lm_head_weight,
@@ -1228,78 +1230,187 @@ impl Backend for CudaBackend {
         let stream = get_cuda_stream()
             .ok_or("CUDA stream not available")?;
 
-        // Helper to download f32 data from CUDA GPU memory
-        fn download_f32_from_cuda(
-            stream: &Arc<CudaStream>,
-            tensor: &GpuTensor,
-        ) -> Result<Vec<f32>, String> {
-            match &tensor.buffer {
-                GpuBuffer::Cuda(cuda_slice) => {
-                    // Download bytes from GPU
-                    let bytes: Vec<u8> = stream.clone_dtoh(cuda_slice.as_ref())
-                        .map_err(|e| format!("CUDA download failed: {}", e))?;
+        let expected_tokens = config
+            .batch_size
+            .checked_mul(config.seq_len)
+            .ok_or("CUDA embedding_forward_gpu_pure: token size overflow")?;
+        if tokens.len() != expected_tokens {
+            return Err(format!(
+                "CUDA embedding_forward_gpu_pure: token length mismatch (got {}, expected {})",
+                tokens.len(),
+                expected_tokens
+            ));
+        }
 
-                    // Convert bytes to f32 (safe copy)
-                    let f32_data: Vec<f32> = bytemuck::cast_slice(&bytes).to_vec();
-                    Ok(f32_data)
+        // Upload tokens to GPU (U32)
+        let token_bytes: &[u8] = bytemuck::cast_slice(tokens);
+        let token_buf = stream
+            .clone_htod(token_bytes)
+            .map_err(|e| format!("CUDA token upload failed: {}", e))?;
+        let tokens_gpu = GpuTensor::new(
+            GpuBuffer::Cuda(Arc::new(token_buf)),
+            vec![config.batch_size, config.seq_len],
+            TensorDtype::U32,
+            BackendType::Cuda,
+        );
+
+        // Embedding lookup
+        let mut hidden = GpuTensor {
+            buffer: GpuBuffer::Cpu(Arc::new(Vec::new())),
+            shape: Vec::new(),
+            dtype: TensorDtype::F32,
+            size_in_bytes: 0,
+            backend: BackendType::Cuda,
+        };
+        self.embedding_lookup_gpu(&tokens_gpu, &weights.embedding, &mut hidden)?;
+
+        // Prepare identity RoPE cache if missing (cos=1, sin=0) to keep Q/K unchanged
+        let mut identity_rope: Option<(GpuTensor, GpuTensor)> = None;
+        if weights.layers.iter().any(|layer| layer.cos_cache.is_none() || layer.sin_cache.is_none()) {
+            if config.head_dim % 2 != 0 {
+                return Err("CUDA embedding_forward_gpu_pure: head_dim must be even for RoPE".into());
+            }
+            let rope_len = config
+                .seq_len
+                .checked_mul(config.head_dim / 2)
+                .ok_or("CUDA embedding_forward_gpu_pure: RoPE cache size overflow")?;
+            let cos = vec![1.0f32; rope_len];
+            let sin = vec![0.0f32; rope_len];
+            let cos_bytes: &[u8] = bytemuck::cast_slice(&cos);
+            let sin_bytes: &[u8] = bytemuck::cast_slice(&sin);
+            let cos_buf = stream
+                .clone_htod(cos_bytes)
+                .map_err(|e| format!("CUDA RoPE cos upload failed: {}", e))?;
+            let sin_buf = stream
+                .clone_htod(sin_bytes)
+                .map_err(|e| format!("CUDA RoPE sin upload failed: {}", e))?;
+            let cos_gpu = GpuTensor {
+                buffer: GpuBuffer::Cuda(Arc::new(cos_buf)),
+                shape: vec![rope_len],
+                dtype: TensorDtype::F32,
+                size_in_bytes: cos_bytes.len(),
+                backend: BackendType::Cuda,
+            };
+            let sin_gpu = GpuTensor {
+                buffer: GpuBuffer::Cuda(Arc::new(sin_buf)),
+                shape: vec![rope_len],
+                dtype: TensorDtype::F32,
+                size_in_bytes: sin_bytes.len(),
+                backend: BackendType::Cuda,
+            };
+            identity_rope = Some((cos_gpu, sin_gpu));
+        }
+
+        let use_silu = matches!(config.activation, crate::kernel_types::Activation::SiLU);
+        let layer_cfg = TransformerLayerConfigGpu {
+            batch_size: config.batch_size,
+            seq_len: config.seq_len,
+            hidden_size: config.hidden_size,
+            num_q_heads: config.num_q_heads,
+            num_kv_heads: config.num_kv_heads,
+            head_dim: config.head_dim,
+            intermediate_size: config.intermediate_size,
+            rms_norm_eps: config.rms_norm_eps,
+            position: 0,
+            use_silu,
+        };
+
+        for layer in weights.layers.iter() {
+            let mut layer_weights = layer.clone();
+            if layer_weights.cos_cache.is_none() || layer_weights.sin_cache.is_none() {
+                if let Some((cos_gpu, sin_gpu)) = identity_rope.as_ref() {
+                    layer_weights.cos_cache = Some(cos_gpu.clone());
+                    layer_weights.sin_cache = Some(sin_gpu.clone());
                 }
-                GpuBuffer::Cpu(bytes) => {
-                    // CPU buffer fallback (for empty tensors)
-                    if bytes.is_empty() {
-                        return Ok(Vec::new());
+            }
+            self.transformer_layer_gpu(&mut hidden, &layer_weights, None, &layer_cfg)?;
+        }
+
+        // Final RMS norm
+        self.rms_norm_gpu(&mut hidden, &weights.final_norm, config.rms_norm_eps)?;
+
+        // Pooling (mean or cls)
+        let mut pooled = GpuTensor {
+            buffer: GpuBuffer::Cpu(Arc::new(Vec::new())),
+            shape: Vec::new(),
+            dtype: TensorDtype::F32,
+            size_in_bytes: 0,
+            backend: BackendType::Cuda,
+        };
+
+        match config.pooling {
+            crate::kernel_types::PoolingType::Mean => {
+                // Mean pooling: use all-ones mask (all tokens are valid)
+                let mask = vec![1.0f32; expected_tokens];
+                let mask_bytes: &[u8] = bytemuck::cast_slice(&mask);
+                let mask_buf = stream
+                    .clone_htod(mask_bytes)
+                    .map_err(|e| format!("CUDA mask upload failed: {}", e))?;
+                let mask_gpu = GpuTensor {
+                    buffer: GpuBuffer::Cuda(Arc::new(mask_buf)),
+                    shape: vec![config.batch_size, config.seq_len],
+                    dtype: TensorDtype::F32,
+                    size_in_bytes: mask_bytes.len(),
+                    backend: BackendType::Cuda,
+                };
+                self.mean_pooling_gpu(&hidden, &mask_gpu, &mut pooled)?;
+            }
+            crate::kernel_types::PoolingType::Cls => {
+                // CLS pooling: take the first token representation
+                self.cls_pooling_gpu(&hidden, &mut pooled)?;
+            }
+            crate::kernel_types::PoolingType::Last => {
+                // Last token pooling: take the last token representation
+                // For now, fall back to CPU implementation
+                // TODO: Implement GPU last-token pooling kernel
+                let hidden_bytes = match &hidden.buffer {
+                    GpuBuffer::Cuda(cuda_slice) => {
+                        stream.clone_dtoh(cuda_slice.as_ref())
+                            .map_err(|e| format!("CUDA hidden download failed: {}", e))?
                     }
-                    let f32_data: Vec<f32> = bytemuck::cast_slice(bytes.as_slice()).to_vec();
-                    Ok(f32_data)
+                    GpuBuffer::Cpu(bytes) => (**bytes).clone(),
+                    #[allow(unreachable_patterns)]
+                    _ => return Err("Unexpected GPU buffer type".into()),
+                };
+                let hidden_data: Vec<f32> = bytemuck::cast_slice(&hidden_bytes).to_vec();
+
+                // Extract last token for each batch
+                let batch_size = config.batch_size;
+                let seq_len = config.seq_len;
+                let hidden_dim = config.hidden_size;
+                let mut last_token_data = Vec::with_capacity(batch_size * hidden_dim);
+                for batch in 0..batch_size {
+                    let last_idx = (batch + 1) * seq_len - 1;
+                    let start = last_idx * hidden_dim;
+                    let end = start + hidden_dim;
+                    last_token_data.extend_from_slice(&hidden_data[start..end]);
                 }
-                #[allow(unreachable_patterns)]
-                _ => Err("Unexpected GPU buffer type for CUDA backend".to_string()),
+
+                // Upload last token data to GPU
+                let last_bytes: &[u8] = bytemuck::cast_slice(&last_token_data);
+                let last_buf = stream
+                    .clone_htod(last_bytes)
+                    .map_err(|e| format!("CUDA last token upload failed: {}", e))?;
+                pooled.buffer = GpuBuffer::Cuda(Arc::new(last_buf));
+                pooled.shape = vec![batch_size, hidden_dim];
+                pooled.size_in_bytes = last_bytes.len();
+                pooled.dtype = TensorDtype::F32;
+                pooled.backend = BackendType::Cuda;
             }
         }
 
-        // Download weights from GPU (only once per forward pass)
-        // TODO: Implement true GPU-native forward using CUDA kernels to avoid this download
-        let embed_weight = download_f32_from_cuda(stream, &weights.embedding)?;
-        let final_norm = download_f32_from_cuda(stream, &weights.final_norm)?;
-        let final_norm_opt = if final_norm.is_empty() { None } else { Some(final_norm.as_slice()) };
-
-        let layer_weights: Result<Vec<(Vec<f32>, Vec<f32>, Vec<f32>, Vec<f32>, Vec<f32>, Vec<f32>, Option<Vec<f32>>, Vec<f32>, Vec<f32>)>, String> =
-            weights.layers.iter()
-                .map(|layer| {
-                    Ok((
-                        download_f32_from_cuda(stream, &layer.input_norm)?,
-                        download_f32_from_cuda(stream, &layer.q_weight)?,
-                        download_f32_from_cuda(stream, &layer.k_weight)?,
-                        download_f32_from_cuda(stream, &layer.v_weight)?,
-                        download_f32_from_cuda(stream, &layer.o_weight)?,
-                        download_f32_from_cuda(stream, &layer.post_attn_norm)?,
-                        layer.gate_weight.as_ref().map(|g| download_f32_from_cuda(stream, g)).transpose()?,
-                        download_f32_from_cuda(stream, &layer.up_weight)?,
-                        download_f32_from_cuda(stream, &layer.down_weight)?,
-                    ))
-                })
-                .collect();
-        let layer_data = layer_weights?;
-
-        let layers: Vec<TransformerLayerWeights<'_>> = layer_data.iter()
-            .map(|(input_norm, q, k, v, o, post_norm, gate, up, down)| {
-                TransformerLayerWeights {
-                    input_norm: input_norm.as_slice(),
-                    q_weight: q.as_slice(),
-                    k_weight: k.as_slice(),
-                    v_weight: v.as_slice(),
-                    o_weight: o.as_slice(),
-                    post_attn_norm: post_norm.as_slice(),
-                    gate_weight: gate.as_ref().map(|g| g.as_slice()),
-                    up_weight: up.as_slice(),
-                    down_weight: down.as_slice(),
-                }
-            })
-            .collect();
-
-        // Call existing embedding_forward
-        // Note: This still downloads from GPU for computation. True GPU-native forward
-        // will be implemented when CUDA embedding/attention/FFN kernels are integrated.
-        self.embedding_forward(tokens, &embed_weight, &layers, final_norm_opt, config)
+        // Download embeddings to host
+        match &pooled.buffer {
+            GpuBuffer::Cuda(cuda_slice) => {
+                let bytes: Vec<u8> = stream
+                    .clone_dtoh(cuda_slice.as_ref())
+                    .map_err(|e| format!("CUDA embeddings download failed: {}", e))?;
+                Ok(bytemuck::cast_slice(&bytes).to_vec())
+            }
+            GpuBuffer::Cpu(bytes) => Ok(bytemuck::cast_slice(bytes.as_slice()).to_vec()),
+            #[allow(unreachable_patterns)]
+            _ => Err("Unexpected GPU buffer type for CUDA backend".into()),
+        }
     }
 
     // =========================================================================
@@ -2891,7 +3002,7 @@ impl Backend for CudaBackend {
         weights: &GeneratorModelWeightsGpu,
         kv_cache: &mut KVCacheGpu,
         config: &GeneratorForwardConfig,
-    ) -> Result<Vec<f32>, String> {
+    ) -> Result<LogitsTensor, String> {
         let stream = get_cuda_stream()
             .ok_or("CUDA stream not available")?;
 
@@ -3127,18 +3238,123 @@ impl Backend for CudaBackend {
         };
         self.lm_head_gpu(&hidden, &weights.lm_head, &mut logits_gpu)?;
 
-        // Download logits to host
-        match &logits_gpu.buffer {
-            GpuBuffer::Cuda(cuda_slice) => {
-                let bytes: Vec<u8> = stream
-                    .clone_dtoh(cuda_slice.as_ref())
-                    .map_err(|e| format!("CUDA logits download failed: {}", e))?;
-                Ok(bytemuck::cast_slice(&bytes).to_vec())
-            }
-            GpuBuffer::Cpu(bytes) => Ok(bytemuck::cast_slice(bytes.as_slice()).to_vec()),
-            #[allow(unreachable_patterns)]
-            _ => Err("Unexpected GPU buffer type for CUDA backend".into()),
+        // Return GPU-resident logits for zero-copy sampling (ARCH-PERF-001)
+        Ok(LogitsTensor::Gpu(logits_gpu))
+    }
+
+    // =========================================================================
+    // MoE GPU-Native Methods (ARCH-GPU-001)
+    // =========================================================================
+
+    fn upload_moe_generator_weights(
+        &self,
+        embed_weight: &[f32],
+        layers: &[MoETransformerLayerWeights<'_>],
+        final_norm: &[f32],
+        lm_head: &[f32],
+        cos_cache: &[f32],
+        sin_cache: &[f32],
+        config: &MoEGeneratorForwardConfig,
+    ) -> Result<MoEGeneratorModelWeightsGpu, String> {
+        let stream = get_cuda_stream().ok_or("CUDA stream not available")?;
+
+        fn upload_f32(stream: &Arc<CudaStream>, data: &[f32], shape: Vec<usize>) -> Result<GpuTensor, String> {
+            let bytes: &[u8] = bytemuck::cast_slice(data);
+            let buf = stream.clone_htod(bytes).map_err(|e| e.to_string())?;
+            Ok(GpuTensor {
+                buffer: GpuBuffer::Cuda(Arc::new(buf)),
+                shape,
+                dtype: TensorDtype::F32,
+                size_in_bytes: bytes.len(),
+                backend: BackendType::Cuda,
+            })
         }
+
+        let hidden_dim = config.hidden_size;
+        let intermediate_size = config.intermediate_size;
+        let vocab_size = embed_weight.len() / hidden_dim;
+        let num_experts = config.num_experts;
+
+        let embedding = upload_f32(&stream, embed_weight, vec![vocab_size, hidden_dim])?;
+        let final_norm_gpu = upload_f32(&stream, final_norm, vec![hidden_dim])?;
+        let lm_head_gpu = upload_f32(&stream, lm_head, vec![vocab_size, hidden_dim])?;
+        let cos_cache_gpu = upload_f32(&stream, cos_cache, vec![cos_cache.len()])?;
+        let sin_cache_gpu = upload_f32(&stream, sin_cache, vec![sin_cache.len()])?;
+
+        let gpu_layers: Result<Vec<MoETransformerLayerWeightsGpu>, String> = layers.iter().enumerate().map(|(layer_idx, layer)| {
+            // Upload attention weights
+            let input_norm = upload_f32(&stream, layer.input_norm, vec![hidden_dim])?;
+            let q_weight = upload_f32(&stream, layer.q_weight, vec![layer.q_weight.len()])?;
+            let k_weight = upload_f32(&stream, layer.k_weight, vec![layer.k_weight.len()])?;
+            let v_weight = upload_f32(&stream, layer.v_weight, vec![layer.v_weight.len()])?;
+            let o_weight = upload_f32(&stream, layer.o_weight, vec![layer.o_weight.len()])?;
+            let post_attn_norm = upload_f32(&stream, layer.post_attn_norm, vec![hidden_dim])?;
+
+            // Upload router weights: [hidden_dim, num_experts] (transposed from [num_experts, hidden_dim])
+            // The CPU weights are [num_experts, hidden_dim], need to transpose for GPU matmul
+            let router_weight = upload_f32(&stream, layer.router_weight, vec![hidden_dim, num_experts])?;
+
+            // Upload expert weights
+            let experts: Result<Vec<ExpertWeightsGpu>, String> = layer.experts.iter().map(|expert| {
+                Ok(ExpertWeightsGpu {
+                    gate: upload_f32(&stream, expert.gate, vec![intermediate_size, hidden_dim])?,
+                    up: upload_f32(&stream, expert.up, vec![intermediate_size, hidden_dim])?,
+                    down: upload_f32(&stream, expert.down, vec![hidden_dim, intermediate_size])?,
+                })
+            }).collect();
+
+            Ok(MoETransformerLayerWeightsGpu {
+                input_norm,
+                q_weight,
+                k_weight,
+                v_weight,
+                o_weight,
+                post_attn_norm,
+                router_weight,
+                experts: experts?,
+                num_experts_per_tok: layer.num_experts_per_tok,
+                num_experts,
+                cos_cache: Some(cos_cache_gpu.clone()),
+                sin_cache: Some(sin_cache_gpu.clone()),
+            })
+        }).collect();
+
+        Ok(MoEGeneratorModelWeightsGpu {
+            embedding,
+            layers: gpu_layers?,
+            final_norm: final_norm_gpu,
+            lm_head: lm_head_gpu,
+            cos_cache: cos_cache_gpu,
+            sin_cache: sin_cache_gpu,
+        })
+    }
+
+    fn moe_generator_forward_gpu_pure(
+        &self,
+        _tokens: &[u32],
+        _weights: &MoEGeneratorModelWeightsGpu,
+        _kv_cache: &mut KVCacheGpu,
+        _config: &MoEGeneratorForwardConfig,
+    ) -> Result<LogitsTensor, String> {
+        // MoE GPU forward implementation requires:
+        // 1. MoE routing kernel integration (CudaMoeRouteKernel exists)
+        // 2. Expert FFN kernels (per-expert gated feed-forward)
+        // 3. Aggregation kernel (weighted sum of expert outputs)
+        // 4. Attention reuse from existing transformer_layer_gpu
+        //
+        // The pipeline per layer:
+        //   hidden = rms_norm(hidden)
+        //   hidden = attention(hidden) + residual
+        //   hidden = rms_norm(hidden)
+        //   hidden = moe_ffn(hidden) + residual
+        //                ↓
+        //           router_weights = softmax(hidden @ router_weight)
+        //           selected_experts = topk(router_weights, k=num_experts_per_tok)
+        //           expert_outs = [expert_i(hidden) for i in selected_experts]
+        //           moe_out = sum(router_weights[i] * expert_outs[i])
+        //
+        // Estimated effort: 3-5 days for full GPU implementation
+        Err("CUDA MoE GPU forward: CPU fallback (full GPU implementation requires MoE routing kernel integration, expert FFN kernels, aggregation kernel - estimated 3-5 days)".to_string())
     }
 }
 

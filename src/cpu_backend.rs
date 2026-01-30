@@ -749,9 +749,9 @@ impl Backend for CpuBackend {
             }
 
             // MoE FFN: route tokens to experts and combine outputs
-            // Apply post_attn_norm first
+            // Apply post_attn_norm first (normalize each token independently)
             let mut normed = vec![0.0f32; hidden.len()];
-            crate::ops::rms_norm::rms_norm_forward(&hidden, layer.post_attn_norm, &mut normed, 1, hidden_size, config.rms_norm_eps);
+            crate::ops::rms_norm::rms_norm_forward(&hidden, layer.post_attn_norm, &mut normed, seq_len, hidden_size, config.rms_norm_eps);
 
             // Route and compute MoE
             let moe_config = crate::MoERoutingConfig {
@@ -763,6 +763,9 @@ impl Backend for CpuBackend {
 
             // Process each token through its assigned experts
             let mut moe_output = vec![0.0f32; seq_len * hidden_size];
+            // Use moe_intermediate_size for expert FFN (typically smaller than intermediate_size)
+            let expert_intermediate_size = config.moe_intermediate_size.unwrap_or(intermediate_size);
+
             for token_idx in 0..seq_len {
                 let token_input = &normed[token_idx * hidden_size..(token_idx + 1) * hidden_size];
                 let mut token_output = vec![0.0f32; hidden_size];
@@ -776,11 +779,11 @@ impl Backend for CpuBackend {
                     if expert_idx < config.num_experts {
                         let expert = &layer.experts[expert_idx];
                         // Gate projection
-                        let mut gate_out = vec![0.0f32; intermediate_size];
-                        crate::linear_forward(token_input, expert.gate, None, &mut gate_out, 1, hidden_size, intermediate_size);
+                        let mut gate_out = vec![0.0f32; expert_intermediate_size];
+                        crate::linear_forward(token_input, expert.gate, None, &mut gate_out, 1, hidden_size, expert_intermediate_size);
                         // Up projection
-                        let mut up = vec![0.0f32; intermediate_size];
-                        crate::linear_forward(token_input, expert.up, None, &mut up, 1, hidden_size, intermediate_size);
+                        let mut up = vec![0.0f32; expert_intermediate_size];
+                        crate::linear_forward(token_input, expert.up, None, &mut up, 1, hidden_size, expert_intermediate_size);
                         // SiLU + element-wise multiply
                         crate::silu_inplace(&mut gate_out);
                         for (g, u) in gate_out.iter_mut().zip(up.iter()) {
@@ -788,7 +791,7 @@ impl Backend for CpuBackend {
                         }
                         // Down projection
                         let mut expert_out = vec![0.0f32; hidden_size];
-                        crate::linear_forward(&gate_out, expert.down, None, &mut expert_out, 1, intermediate_size, hidden_size);
+                        crate::linear_forward(&gate_out, expert.down, None, &mut expert_out, 1, expert_intermediate_size, hidden_size);
                         // Weighted sum
                         for (o, e) in token_output.iter_mut().zip(expert_out.iter()) {
                             *o += weight * e;

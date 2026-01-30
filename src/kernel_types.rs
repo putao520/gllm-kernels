@@ -1124,6 +1124,67 @@ pub struct KVCacheGpu {
     pub head_dim: usize,
 }
 
+// ============================================================================
+// MoE GPU Weights (ARCH-GPU-001)
+// ============================================================================
+
+/// GPU-resident single expert FFN weights for MoE.
+#[derive(Clone, Debug)]
+pub struct ExpertWeightsGpu {
+    /// Gate projection [intermediate_size, hidden_size]
+    pub gate: crate::gpu_types::GpuTensor,
+    /// Up projection [intermediate_size, hidden_size]
+    pub up: crate::gpu_types::GpuTensor,
+    /// Down projection [hidden_size, intermediate_size]
+    pub down: crate::gpu_types::GpuTensor,
+}
+
+/// GPU-resident MoE Transformer layer weights for zero-copy forward.
+#[derive(Clone, Debug)]
+pub struct MoETransformerLayerWeightsGpu {
+    /// Input RMS norm weights [hidden_size]
+    pub input_norm: crate::gpu_types::GpuTensor,
+    /// Query projection weights [num_q_heads * head_dim, hidden_size]
+    pub q_weight: crate::gpu_types::GpuTensor,
+    /// Key projection weights [num_kv_heads * head_dim, hidden_size]
+    pub k_weight: crate::gpu_types::GpuTensor,
+    /// Value projection weights [num_kv_heads * head_dim, hidden_size]
+    pub v_weight: crate::gpu_types::GpuTensor,
+    /// Output projection weights [hidden_size, num_q_heads * head_dim]
+    pub o_weight: crate::gpu_types::GpuTensor,
+    /// Post-attention RMS norm weights [hidden_size]
+    pub post_attn_norm: crate::gpu_types::GpuTensor,
+    /// Router gate weights [hidden_size, num_experts] (transposed for GPU matmul)
+    pub router_weight: crate::gpu_types::GpuTensor,
+    /// Expert FFN weights
+    pub experts: Vec<ExpertWeightsGpu>,
+    /// Number of experts to activate per token
+    pub num_experts_per_tok: usize,
+    /// Number of experts total
+    pub num_experts: usize,
+    /// Optional RoPE cosine cache [max_seq_len, head_dim/2]
+    pub cos_cache: Option<crate::gpu_types::GpuTensor>,
+    /// Optional RoPE sine cache [max_seq_len, head_dim/2]
+    pub sin_cache: Option<crate::gpu_types::GpuTensor>,
+}
+
+/// GPU-resident MoE generator model weights for zero-copy forward.
+#[derive(Clone, Debug)]
+pub struct MoEGeneratorModelWeightsGpu {
+    /// Token embedding weights [vocab_size, hidden_size]
+    pub embedding: crate::gpu_types::GpuTensor,
+    /// MoE Transformer layer weights
+    pub layers: Vec<MoETransformerLayerWeightsGpu>,
+    /// Final layer norm weights [hidden_size]
+    pub final_norm: crate::gpu_types::GpuTensor,
+    /// LM head weights [vocab_size, hidden_size]
+    pub lm_head: crate::gpu_types::GpuTensor,
+    /// RoPE cosine cache [max_seq_len, head_dim/2]
+    pub cos_cache: crate::gpu_types::GpuTensor,
+    /// RoPE sine cache [max_seq_len, head_dim/2]
+    pub sin_cache: crate::gpu_types::GpuTensor,
+}
+
 /// Configuration for GPU-native transformer layer forward (ARCH-ADR-010).
 #[derive(Clone, Debug)]
 pub struct TransformerLayerConfigGpu {
@@ -1207,6 +1268,7 @@ pub struct GeneratorForwardConfig {
     pub use_rope: bool,
     pub activation: Activation,
     pub position_offset: usize,
+    pub final_logit_softcapping: Option<f32>,
 }
 
 impl Default for GeneratorForwardConfig {
@@ -1227,6 +1289,7 @@ impl Default for GeneratorForwardConfig {
             use_rope: true,
             activation: Activation::SiLU,
             position_offset: 0,
+            final_logit_softcapping: None,
         }
     }
 }
@@ -1242,6 +1305,8 @@ pub struct MoEGeneratorForwardConfig {
     pub num_kv_heads: usize,
     pub head_dim: usize,
     pub intermediate_size: usize,
+    /// Expert FFN intermediate size (for MoE models, typically smaller than intermediate_size)
+    pub moe_intermediate_size: Option<usize>,
     pub vocab_size: usize,
     pub num_experts: usize,
     pub num_experts_per_tok: usize,
@@ -1265,6 +1330,7 @@ impl Default for MoEGeneratorForwardConfig {
             num_kv_heads: 8,
             head_dim: 128,
             intermediate_size: 14336,
+            moe_intermediate_size: None,
             vocab_size: 32000,
             num_experts: 8,
             num_experts_per_tok: 2,
@@ -1337,6 +1403,70 @@ impl Default for EmbeddingForwardConfig {
             normalize: true,
             arch_type: EmbeddingArchType::default(),
             max_position_embeddings: 512,
+        }
+    }
+}
+
+// ============================================================================
+// GPU-Native Logits for Zero-Copy Sampling (ARCH-PERF-001)
+// ============================================================================
+
+/// Logits tensor that can reside on CPU or GPU.
+///
+/// This abstraction enables zero-copy sampling by keeping logits on GPU
+/// and only transferring the sampled token ID(s) back to CPU.
+///
+/// For a 32k vocabulary, this reduces per-token transfer from 128KB to 4 bytes.
+#[derive(Clone, Debug)]
+pub enum LogitsTensor {
+    /// CPU-resident logits (Vec<f32>)
+    Cpu(Vec<f32>),
+    /// GPU-resident logits (GpuTensor)
+    Gpu(crate::gpu_types::GpuTensor),
+}
+
+impl LogitsTensor {
+    /// Create CPU logits from a Vec.
+    pub fn from_cpu(data: Vec<f32>) -> Self {
+        LogitsTensor::Cpu(data)
+    }
+
+    /// Create GPU logits from a GpuTensor.
+    pub fn from_gpu(tensor: crate::gpu_types::GpuTensor) -> Self {
+        LogitsTensor::Gpu(tensor)
+    }
+
+    /// Check if logits are on GPU.
+    pub fn is_gpu(&self) -> bool {
+        matches!(self, LogitsTensor::Gpu(_))
+    }
+
+    /// Check if logits are on CPU.
+    pub fn is_cpu(&self) -> bool {
+        matches!(self, LogitsTensor::Cpu(_))
+    }
+
+    /// Get CPU data if available (returns None for GPU tensors).
+    pub fn as_cpu(&self) -> Option<&[f32]> {
+        match self {
+            LogitsTensor::Cpu(data) => Some(data),
+            LogitsTensor::Gpu(_) => None,
+        }
+    }
+
+    /// Get GPU tensor if available (returns None for CPU tensors).
+    pub fn as_gpu(&self) -> Option<&crate::gpu_types::GpuTensor> {
+        match self {
+            LogitsTensor::Cpu(_) => None,
+            LogitsTensor::Gpu(tensor) => Some(tensor),
+        }
+    }
+
+    /// Get the vocabulary size (number of logits).
+    pub fn vocab_size(&self) -> usize {
+        match self {
+            LogitsTensor::Cpu(data) => data.len(),
+            LogitsTensor::Gpu(tensor) => tensor.shape.iter().product(),
         }
     }
 }

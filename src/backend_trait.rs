@@ -12,6 +12,9 @@ use crate::kernel_types::{
     // GPU-native types (ARCH-ADR-010: complete zero-copy inference)
     RerankerModelWeightsGpu, GeneratorModelWeightsGpu, KVCacheGpu,
     TransformerLayerWeightsGpu, TransformerLayerConfigGpu,
+    MoEGeneratorModelWeightsGpu,
+    // Zero-copy logits (ARCH-PERF-001)
+    LogitsTensor,
 };
 use crate::gpu_types::GpuTensor;
 use crate::ops::sampling::SamplingConfig;
@@ -361,7 +364,7 @@ pub trait Backend: Send + Sync {
         sin_cache: &[f32],
         kv_cache: &mut KVCacheState<'_>,
         config: &GeneratorForwardConfig,
-    ) -> Result<Vec<f32>, String>;
+    ) -> Result<LogitsTensor, String>;
 
     /// Complete MoE generator forward pass (L3 high-level).
     ///
@@ -392,7 +395,7 @@ pub trait Backend: Send + Sync {
         sin_cache: &[f32],
         kv_cache: &mut KVCacheState<'_>,
         config: &MoEGeneratorForwardConfig,
-    ) -> Result<Vec<f32>, String>;
+    ) -> Result<LogitsTensor, String>;
 
     /// Complete embedding model forward pass (L3 high-level).
     ///
@@ -624,7 +627,37 @@ pub trait Backend: Send + Sync {
         num_kv_heads: usize,
         max_len: usize,
         head_dim: usize,
-    ) -> Result<KVCacheGpu, String>;
+    ) -> Result<KVCacheGpu, String> {
+        // Default implementation: fall back to CPU
+        Err("KV cache GPU allocation not implemented for this backend".to_string())
+    }
+
+    /// Upload MoE generator/LLM model weights to GPU (ARCH-ADR-010).
+    fn upload_moe_generator_weights(
+        &self,
+        embed_weight: &[f32],
+        layers: &[MoETransformerLayerWeights<'_>],
+        final_norm: &[f32],
+        lm_head: &[f32],
+        cos_cache: &[f32],
+        sin_cache: &[f32],
+        config: &MoEGeneratorForwardConfig,
+    ) -> Result<MoEGeneratorModelWeightsGpu, String> {
+        // Default implementation: fall back to CPU
+        Err("MoE weight upload not implemented for this backend".to_string())
+    }
+
+    /// GPU-pure MoE generator forward pass (ARCH-ADR-010: zero-copy).
+    fn moe_generator_forward_gpu_pure(
+        &self,
+        tokens: &[u32],
+        weights: &MoEGeneratorModelWeightsGpu,
+        kv_cache: &mut KVCacheGpu,
+        config: &MoEGeneratorForwardConfig,
+    ) -> Result<LogitsTensor, String> {
+        // Default implementation: fall back to CPU
+        Err("MoE GPU forward not implemented for this backend".to_string())
+    }
 
     /// GPU-pure generator forward pass (ARCH-ADR-010: zero-copy).
     ///
@@ -636,5 +669,48 @@ pub trait Backend: Send + Sync {
         weights: &GeneratorModelWeightsGpu,
         kv_cache: &mut KVCacheGpu,
         config: &GeneratorForwardConfig,
-    ) -> Result<Vec<f32>, String>;
+    ) -> Result<LogitsTensor, String>;
+
+    // =========================================================================
+    // Zero-Copy Sampling API (ARCH-PERF-001)
+    // =========================================================================
+
+    /// GPU-pure generator forward that keeps logits on GPU (ARCH-PERF-001).
+    ///
+    /// Returns LogitsTensor which may remain on GPU, avoiding the expensive
+    /// GPU→CPU transfer of full vocabulary logits (128KB+ per token).
+    ///
+    /// Use with `sample_from_tensor` for complete zero-copy generation.
+    fn generator_forward_gpu_pure_logits(
+        &self,
+        tokens: &[u32],
+        weights: &GeneratorModelWeightsGpu,
+        kv_cache: &mut KVCacheGpu,
+        config: &GeneratorForwardConfig,
+    ) -> Result<LogitsTensor, String> {
+        // Default implementation: redirect to generator_forward_gpu_pure
+        self.generator_forward_gpu_pure(tokens, weights, kv_cache, config)
+    }
+
+    /// Sample from LogitsTensor (CPU or GPU) (ARCH-PERF-001).
+    ///
+    /// For GPU tensors, this uses GPU-accelerated sampling:
+    /// - Greedy (temp=0): GPU argmax kernel → 1 u32 transfer
+    /// - Sampling: GPU top-k (k=64) → 64 candidates transfer → CPU sampling
+    ///
+    /// This reduces per-token transfer by >99.8% (32k floats → 64 floats).
+    fn sample_from_tensor(
+        &self,
+        logits: &LogitsTensor,
+        vocab_size: usize,
+        config: &SamplingConfig,
+    ) -> Result<Vec<u32>, String> {
+        // Default implementation: extract CPU data and use regular sample
+        match logits {
+            LogitsTensor::Cpu(data) => self.sample(data, vocab_size, config),
+            LogitsTensor::Gpu(_) => {
+                Err("GPU sampling not implemented for this backend".to_string())
+            }
+        }
+    }
 }
