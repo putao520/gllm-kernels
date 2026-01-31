@@ -108,16 +108,65 @@ impl Backend for CpuBackend {
         }
 
         // 4. Update KV cache if provided
-        if let (Some(k_cache), Some(v_cache)) = (kv_cache_k, kv_cache_v) {
-            let cache_offset = config.position_offset * num_kv_heads * head_dim;
-            let new_len = seq_len * num_kv_heads * head_dim;
-            for b in 0..batch {
-                let src_start = b * new_len;
-                let dst_start = b * k_cache.len() / batch + cache_offset;
-                k_cache[dst_start..dst_start + new_len].copy_from_slice(&k[src_start..src_start + new_len]);
-                v_cache[dst_start..dst_start + new_len].copy_from_slice(&v[src_start..src_start + new_len]);
+        // Also determine what K,V to use for attention computation
+        let (k_for_attn, v_for_attn, seq_len_kv) = if config.position_offset > 0 && seq_len == 1 {
+            // Decode mode: concatenate cached K,V with current K,V
+            if let (Some(k_cache), Some(v_cache)) = (kv_cache_k.as_ref(), kv_cache_v.as_ref()) {
+                let cached_len = config.position_offset * num_kv_heads * head_dim;
+                let current_len = seq_len * num_kv_heads * head_dim;
+                let total_len = cached_len + current_len;
+
+                let mut k_combined = vec![0.0f32; total_len];
+                let mut v_combined = vec![0.0f32; total_len];
+
+                // Copy cached K,V
+                k_combined[..cached_len].copy_from_slice(&k_cache[..cached_len]);
+                v_combined[..cached_len].copy_from_slice(&v_cache[..cached_len]);
+
+                // Copy current K,V
+                k_combined[cached_len..].copy_from_slice(&k[..current_len]);
+                v_combined[cached_len..].copy_from_slice(&v[..current_len]);
+
+                // Update KV cache with current K,V
+                if let (Some(k_cache_mut), Some(v_cache_mut)) = (kv_cache_k, kv_cache_v) {
+                    let cache_offset = config.position_offset * num_kv_heads * head_dim;
+                    for b in 0..batch {
+                        let src_start = b * current_len;
+                        let dst_start = b * k_cache_mut.len() / batch + cache_offset;
+                        k_cache_mut[dst_start..dst_start + current_len].copy_from_slice(&k[src_start..src_start + current_len]);
+                        v_cache_mut[dst_start..dst_start + current_len].copy_from_slice(&v[src_start..src_start + current_len]);
+                    }
+                }
+
+                (k_combined, v_combined, config.position_offset + seq_len)
+            } else {
+                // No cache available, use current K,V only
+                if let (Some(k_cache), Some(v_cache)) = (kv_cache_k, kv_cache_v) {
+                    let cache_offset = config.position_offset * num_kv_heads * head_dim;
+                    let new_len = seq_len * num_kv_heads * head_dim;
+                    for b in 0..batch {
+                        let src_start = b * new_len;
+                        let dst_start = b * k_cache.len() / batch + cache_offset;
+                        k_cache[dst_start..dst_start + new_len].copy_from_slice(&k[src_start..src_start + new_len]);
+                        v_cache[dst_start..dst_start + new_len].copy_from_slice(&v[src_start..src_start + new_len]);
+                    }
+                }
+                (k.to_vec(), v.to_vec(), seq_len)
             }
-        }
+        } else {
+            // Prefill mode: use current K,V
+            if let (Some(k_cache), Some(v_cache)) = (kv_cache_k, kv_cache_v) {
+                let cache_offset = config.position_offset * num_kv_heads * head_dim;
+                let new_len = seq_len * num_kv_heads * head_dim;
+                for b in 0..batch {
+                    let src_start = b * new_len;
+                    let dst_start = b * k_cache.len() / batch + cache_offset;
+                    k_cache[dst_start..dst_start + new_len].copy_from_slice(&k[src_start..src_start + new_len]);
+                    v_cache[dst_start..dst_start + new_len].copy_from_slice(&v[src_start..src_start + new_len]);
+                }
+            }
+            (k.to_vec(), v.to_vec(), seq_len)
+        };
 
         // 5. Flash attention
         let flash_config = FlashAttentionConfig {
@@ -126,7 +175,7 @@ impl Backend for CpuBackend {
             num_kv_heads,
             head_dim,
             seq_len_q: seq_len,
-            seq_len_kv: seq_len,
+            seq_len_kv: seq_len_kv,
             causal: config.causal,
             scale: config.scale,
             dropout_prob: config.dropout_prob,
@@ -134,7 +183,7 @@ impl Backend for CpuBackend {
         };
 
         let mut attn_out = vec![0.0f32; batch * seq_len * q_dim];
-        crate::ops::attention::cpu_flash_attention(&q, &k, &v, &mut attn_out, flash_config);
+        crate::ops::attention::cpu_flash_attention(&q, &k_for_attn, &v_for_attn, &mut attn_out, flash_config);
 
         // 6. Output projection
         let mut output = vec![0.0f32; batch * seq_len * hidden_size];
@@ -143,11 +192,233 @@ impl Backend for CpuBackend {
             batch * seq_len, q_dim, hidden_size,
         );
 
-        // 7. Residual connection
-        for (out, inp) in output.iter_mut().zip(hidden.iter()) {
-            *out += inp;
+        // NOTE: Residual connection is applied by the caller, not here
+        Ok(output)
+    }
+
+    fn attention_block_with_qk_norm(
+        &self,
+        hidden: &[f32],
+        q_weight: &[f32],
+        k_weight: &[f32],
+        v_weight: &[f32],
+        o_weight: &[f32],
+        norm_weight: &[f32],
+        q_norm: Option<&[f32]>,
+        k_norm: Option<&[f32]>,
+        cos_cache: &[f32],
+        sin_cache: &[f32],
+        kv_cache_k: Option<&mut [f32]>,
+        kv_cache_v: Option<&mut [f32]>,
+        config: &AttentionBlockConfig,
+    ) -> Result<Vec<f32>, String> {
+        let batch = config.batch_size;
+        let seq_len = config.seq_len;
+        let hidden_size = config.hidden_size;
+        let num_q_heads = config.num_q_heads;
+        let num_kv_heads = config.num_kv_heads;
+        let head_dim = config.head_dim;
+
+        // 1. RMS Norm on input
+        let mut normed = vec![0.0f32; batch * seq_len * hidden_size];
+        crate::ops::rms_norm::rms_norm_forward(
+            hidden,
+            norm_weight,
+            &mut normed,
+            batch * seq_len,
+            hidden_size,
+            config.rms_norm_eps,
+        );
+
+        // 2. QKV projections
+        let q_dim = num_q_heads * head_dim;
+        let kv_dim = num_kv_heads * head_dim;
+
+        let mut q = vec![0.0f32; batch * seq_len * q_dim];
+        let mut k = vec![0.0f32; batch * seq_len * kv_dim];
+        let mut v = vec![0.0f32; batch * seq_len * kv_dim];
+
+        crate::ops::linear::linear_forward(
+            &normed, q_weight, None, &mut q,
+            batch * seq_len, hidden_size, q_dim,
+        );
+        crate::ops::linear::linear_forward(
+            &normed, k_weight, None, &mut k,
+            batch * seq_len, hidden_size, kv_dim,
+        );
+        crate::ops::linear::linear_forward(
+            &normed, v_weight, None, &mut v,
+            batch * seq_len, hidden_size, kv_dim,
+        );
+
+        // 3. Apply QK normalization if weights are provided (Qwen3-style)
+        // QK norm is applied per-head to the projected Q and K vectors
+        // Qwen3 uses a reduced dimension for QK norm: q_norm/k_norm have size [num_kv_heads * (head_dim / 8)]
+        // For Qwen3-0.6B: 128 = 8 * 16, where 16 = 128 / 8
+        if let Some(q_norm_w) = q_norm {
+            // Each KV head gets (q_norm_w.len() / num_kv_heads) elements
+            let norm_per_kv_head = q_norm_w.len() / num_kv_heads;
+
+            // Apply RMS norm to Q - map Q heads to KV heads
+            for t in 0..(batch * seq_len) {
+                for kv_h in 0..num_kv_heads {
+                    // Each KV head corresponds to (num_q_heads / num_kv_heads) Q heads
+                    let norm_w_start = kv_h * norm_per_kv_head;
+                    let norm_w_end = norm_w_start + norm_per_kv_head;
+                    let norm_w = &q_norm_w[norm_w_start..norm_w_end];
+
+                    // Apply to all Q heads that map to this KV head
+                    for h_offset in 0..(num_q_heads / num_kv_heads) {
+                        let h = kv_h * (num_q_heads / num_kv_heads) + h_offset;
+                        let head_start = t * q_dim + h * head_dim;
+
+                        // Compute RMS norm for this head
+                        let mut sum_sq = 0.0f32;
+                        for i in 0..head_dim {
+                            sum_sq += q[head_start + i] * q[head_start + i];
+                        }
+                        let rms = (sum_sq / head_dim as f32 + config.rms_norm_eps).sqrt();
+
+                        // Apply norm weights to the first norm_per_kv_head elements
+                        for (i, &norm_val) in norm_w.iter().enumerate() {
+                            if i < head_dim {
+                                q[head_start + i] = (q[head_start + i] / rms) * norm_val;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        if let Some(k_norm_w) = k_norm {
+            // Each KV head gets (k_norm_w.len() / num_kv_heads) elements
+            let norm_per_kv_head = k_norm_w.len() / num_kv_heads;
+
+            // Apply RMS norm to K per-head
+            for t in 0..(batch * seq_len) {
+                for h in 0..num_kv_heads {
+                    let head_start = t * kv_dim + h * head_dim;
+                    let norm_w_start = h * norm_per_kv_head;
+                    let norm_w_end = norm_w_start + norm_per_kv_head;
+                    let norm_w = &k_norm_w[norm_w_start..norm_w_end];
+
+                    // Compute RMS norm for this head
+                    let mut sum_sq = 0.0f32;
+                    for i in 0..head_dim {
+                        sum_sq += k[head_start + i] * k[head_start + i];
+                    }
+                    let rms = (sum_sq / head_dim as f32 + config.rms_norm_eps).sqrt();
+
+                    // Apply norm weights to the first norm_per_kv_head elements
+                    for (i, &norm_val) in norm_w.iter().enumerate() {
+                        if i < head_dim {
+                            k[head_start + i] = (k[head_start + i] / rms) * norm_val;
+                        }
+                    }
+                }
+            }
         }
 
+        // 4. Apply RoPE if enabled
+        if config.use_rope {
+            let mut q_rope = vec![0.0f32; q.len()];
+            let mut k_rope = vec![0.0f32; k.len()];
+            crate::ops::rope::rope_apply(
+                &q, &k,
+                cos_cache, sin_cache,
+                &mut q_rope, &mut k_rope,
+                batch, seq_len, num_q_heads, num_kv_heads, head_dim,
+                config.position_offset,
+            );
+            q = q_rope;
+            k = k_rope;
+        }
+
+        // 5. Update KV cache if provided
+        // Also determine what K,V to use for attention computation
+        let (k_for_attn, v_for_attn, seq_len_kv) = if config.position_offset > 0 && seq_len == 1 {
+            // Decode mode: concatenate cached K,V with current K,V
+            if let (Some(k_cache), Some(v_cache)) = (kv_cache_k.as_ref(), kv_cache_v.as_ref()) {
+                let cached_len = config.position_offset * num_kv_heads * head_dim;
+                let current_len = seq_len * num_kv_heads * head_dim;
+                let total_len = cached_len + current_len;
+
+                let mut k_combined = vec![0.0f32; total_len];
+                let mut v_combined = vec![0.0f32; total_len];
+
+                // Copy cached K,V
+                k_combined[..cached_len].copy_from_slice(&k_cache[..cached_len]);
+                v_combined[..cached_len].copy_from_slice(&v_cache[..cached_len]);
+
+                // Copy current K,V
+                k_combined[cached_len..].copy_from_slice(&k[..current_len]);
+                v_combined[cached_len..].copy_from_slice(&v[..current_len]);
+
+                // Update KV cache with current K,V
+                if let (Some(k_cache_mut), Some(v_cache_mut)) = (kv_cache_k, kv_cache_v) {
+                    let cache_offset = config.position_offset * num_kv_heads * head_dim;
+                    for b in 0..batch {
+                        let src_start = b * current_len;
+                        let dst_start = b * k_cache_mut.len() / batch + cache_offset;
+                        k_cache_mut[dst_start..dst_start + current_len].copy_from_slice(&k[src_start..src_start + current_len]);
+                        v_cache_mut[dst_start..dst_start + current_len].copy_from_slice(&v[src_start..src_start + current_len]);
+                    }
+                }
+
+                (k_combined, v_combined, config.position_offset + seq_len)
+            } else {
+                // No cache available, use current K,V only
+                if let (Some(k_cache), Some(v_cache)) = (kv_cache_k, kv_cache_v) {
+                    let cache_offset = config.position_offset * num_kv_heads * head_dim;
+                    let new_len = seq_len * num_kv_heads * head_dim;
+                    for b in 0..batch {
+                        let src_start = b * new_len;
+                        let dst_start = b * k_cache.len() / batch + cache_offset;
+                        k_cache[dst_start..dst_start + new_len].copy_from_slice(&k[src_start..src_start + new_len]);
+                        v_cache[dst_start..dst_start + new_len].copy_from_slice(&v[src_start..src_start + new_len]);
+                    }
+                }
+                (k.to_vec(), v.to_vec(), seq_len)
+            }
+        } else {
+            // Prefill mode: use current K,V
+            if let (Some(k_cache), Some(v_cache)) = (kv_cache_k, kv_cache_v) {
+                let cache_offset = config.position_offset * num_kv_heads * head_dim;
+                let new_len = seq_len * num_kv_heads * head_dim;
+                for b in 0..batch {
+                    let src_start = b * new_len;
+                    let dst_start = b * k_cache.len() / batch + cache_offset;
+                    k_cache[dst_start..dst_start + new_len].copy_from_slice(&k[src_start..src_start + new_len]);
+                    v_cache[dst_start..dst_start + new_len].copy_from_slice(&v[src_start..src_start + new_len]);
+                }
+            }
+            (k.to_vec(), v.to_vec(), seq_len)
+        };
+
+        // 6. Flash attention
+        let flash_config = FlashAttentionConfig {
+            batch_size: batch,
+            num_heads: num_q_heads,
+            num_kv_heads,
+            head_dim,
+            seq_len_q: seq_len,
+            seq_len_kv: seq_len_kv,
+            causal: config.causal,
+            scale: config.scale,
+            dropout_prob: config.dropout_prob,
+            ..Default::default()
+        };
+
+        let mut attn_out = vec![0.0f32; batch * seq_len * q_dim];
+        crate::ops::attention::cpu_flash_attention(&q, &k_for_attn, &v_for_attn, &mut attn_out, flash_config);
+
+        // 7. Output projection
+        let mut output = vec![0.0f32; batch * seq_len * hidden_size];
+        crate::ops::linear::linear_forward(
+            &attn_out, o_weight, None, &mut output,
+            batch * seq_len, q_dim, hidden_size,
+        );
+
+        // NOTE: Residual connection is applied by the caller, not here
         Ok(output)
     }
 
@@ -229,11 +500,7 @@ impl Backend for CpuBackend {
             batch * seq_len, intermediate_size, hidden_size,
         );
 
-        // 5. Residual connection
-        for (out, inp) in output.iter_mut().zip(hidden.iter()) {
-            *out += inp;
-        }
-
+        // NOTE: Residual connection is applied by the caller, not here
         Ok(output)
     }
 
@@ -609,19 +876,37 @@ impl Backend for CpuBackend {
                 use_flash_attention: true,
                 dropout_prob: 0.0,
             };
-            let attn_output = self.attention_block(
-                &hidden,
-                layer.q_weight,
-                layer.k_weight,
-                layer.v_weight,
-                layer.o_weight,
-                layer.input_norm,
-                cos_cache,
-                sin_cache,
-                k_cache_slice,
-                v_cache_slice,
-                &attn_config,
-            )?;
+            let attn_output = if layer.q_norm.is_some() || layer.k_norm.is_some() {
+                self.attention_block_with_qk_norm(
+                    &hidden,
+                    layer.q_weight,
+                    layer.k_weight,
+                    layer.v_weight,
+                    layer.o_weight,
+                    layer.input_norm,
+                    layer.q_norm,
+                    layer.k_norm,
+                    cos_cache,
+                    sin_cache,
+                    k_cache_slice,
+                    v_cache_slice,
+                    &attn_config,
+                )?
+            } else {
+                self.attention_block(
+                    &hidden,
+                    layer.q_weight,
+                    layer.k_weight,
+                    layer.v_weight,
+                    layer.o_weight,
+                    layer.input_norm,
+                    cos_cache,
+                    sin_cache,
+                    k_cache_slice,
+                    v_cache_slice,
+                    &attn_config,
+                )?
+            };
 
             // Residual connection
             for (h, a) in hidden.iter_mut().zip(attn_output.iter()) {
@@ -729,19 +1014,37 @@ impl Backend for CpuBackend {
                 use_flash_attention: true,
                 dropout_prob: 0.0,
             };
-            let attn_output = self.attention_block(
-                &hidden,
-                layer.q_weight,
-                layer.k_weight,
-                layer.v_weight,
-                layer.o_weight,
-                layer.input_norm,
-                cos_cache,
-                sin_cache,
-                k_cache_slice,
-                v_cache_slice,
-                &attn_config,
-            )?;
+            let attn_output = if layer.q_norm.is_some() || layer.k_norm.is_some() {
+                self.attention_block_with_qk_norm(
+                    &hidden,
+                    layer.q_weight,
+                    layer.k_weight,
+                    layer.v_weight,
+                    layer.o_weight,
+                    layer.input_norm,
+                    layer.q_norm,
+                    layer.k_norm,
+                    cos_cache,
+                    sin_cache,
+                    k_cache_slice,
+                    v_cache_slice,
+                    &attn_config,
+                )?
+            } else {
+                self.attention_block(
+                    &hidden,
+                    layer.q_weight,
+                    layer.k_weight,
+                    layer.v_weight,
+                    layer.o_weight,
+                    layer.input_norm,
+                    cos_cache,
+                    sin_cache,
+                    k_cache_slice,
+                    v_cache_slice,
+                    &attn_config,
+                )?
+            };
 
             // Residual connection
             for (h, a) in hidden.iter_mut().zip(attn_output.iter()) {
@@ -1109,6 +1412,8 @@ impl Backend for CpuBackend {
                 gate_weight: layer.gate_weight.map(|g| f32_to_gpu_tensor(g, vec![g.len()])),
                 up_weight: f32_to_gpu_tensor(layer.up_weight, vec![layer.up_weight.len()]),
                 down_weight: f32_to_gpu_tensor(layer.down_weight, vec![layer.down_weight.len()]),
+                q_norm: layer.q_norm.as_ref().map(|w| f32_to_gpu_tensor(w, vec![w.len()])),
+                k_norm: layer.k_norm.as_ref().map(|w| f32_to_gpu_tensor(w, vec![w.len()])),
                 cos_cache: None,
                 sin_cache: None,
             }
@@ -1167,6 +1472,14 @@ impl Backend for CpuBackend {
                     },
                     up_weight: gpu_tensor_to_f32(&layer.up_weight)?,
                     down_weight: gpu_tensor_to_f32(&layer.down_weight)?,
+                    q_norm: match &layer.q_norm {
+                        Some(w) => Some(gpu_tensor_to_f32(w)?),
+                        None => None,
+                    },
+                    k_norm: match &layer.k_norm {
+                        Some(w) => Some(gpu_tensor_to_f32(w)?),
+                        None => None,
+                    },
                 })
             })
             .collect();
@@ -1589,6 +1902,8 @@ impl Backend for CpuBackend {
                 gate_weight: layer.gate_weight.map(|g| f32_to_gpu_tensor(g, vec![g.len()])),
                 up_weight: f32_to_gpu_tensor(layer.up_weight, vec![layer.up_weight.len()]),
                 down_weight: f32_to_gpu_tensor(layer.down_weight, vec![layer.down_weight.len()]),
+                q_norm: layer.q_norm.as_ref().map(|w| f32_to_gpu_tensor(w, vec![w.len()])),
+                k_norm: layer.k_norm.as_ref().map(|w| f32_to_gpu_tensor(w, vec![w.len()])),
                 cos_cache: None,
                 sin_cache: None,
             }
@@ -1635,6 +1950,8 @@ impl Backend for CpuBackend {
                     gate_weight: layer.gate_weight.as_ref().map(|g| gpu_tensor_to_f32(g)).transpose()?,
                     up_weight: gpu_tensor_to_f32(&layer.up_weight)?,
                     down_weight: gpu_tensor_to_f32(&layer.down_weight)?,
+                    q_norm: layer.q_norm.as_ref().map(|w| gpu_tensor_to_f32(w)).transpose()?,
+                    k_norm: layer.k_norm.as_ref().map(|w| gpu_tensor_to_f32(w)).transpose()?,
                 })
             })
             .collect();
@@ -1694,6 +2011,8 @@ impl Backend for CpuBackend {
                 gate_weight: layer.gate_weight.map(|g| f32_to_gpu_tensor(g, vec![g.len()])),
                 up_weight: f32_to_gpu_tensor(layer.up_weight, vec![layer.up_weight.len()]),
                 down_weight: f32_to_gpu_tensor(layer.down_weight, vec![layer.down_weight.len()]),
+                q_norm: layer.q_norm.as_ref().map(|w| f32_to_gpu_tensor(w, vec![w.len()])),
+                k_norm: layer.k_norm.as_ref().map(|w| f32_to_gpu_tensor(w, vec![w.len()])),
                 cos_cache: Some(cos_cache_gpu.clone()),
                 sin_cache: Some(sin_cache_gpu.clone()),
             }
@@ -1780,6 +2099,8 @@ impl Backend for CpuBackend {
                     gate_weight: layer.gate_weight.as_ref().map(|g| gpu_tensor_to_f32(g)).transpose()?,
                     up_weight: gpu_tensor_to_f32(&layer.up_weight)?,
                     down_weight: gpu_tensor_to_f32(&layer.down_weight)?,
+                    q_norm: layer.q_norm.as_ref().map(|w| gpu_tensor_to_f32(w)).transpose()?,
+                    k_norm: layer.k_norm.as_ref().map(|w| gpu_tensor_to_f32(w)).transpose()?,
                 })
             })
             .collect();

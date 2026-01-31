@@ -14,13 +14,14 @@ pub fn flash_attention<T: KernelFloat>(
     config: FlashAttentionConfig,
 ) {
     let scale = config.scale.unwrap_or(1.0 / (config.head_dim as f32).sqrt());
-    let heads = config.num_heads;
+    let num_q_heads = config.num_heads;
+    let num_kv_heads = if config.num_kv_heads == 0 { num_q_heads } else { config.num_kv_heads };
     let seq_q = config.seq_len_q;
     let seq_kv = config.seq_len_kv;
     let head_dim = config.head_dim;
 
     if seq_q == 1 {
-        flash_attention_decode(q, k, v, output, heads, seq_kv, head_dim, scale);
+        flash_attention_decode_gqa(q, k, v, output, num_q_heads, num_kv_heads, seq_kv, head_dim, scale);
         return;
     }
 
@@ -30,10 +31,26 @@ pub fn flash_attention<T: KernelFloat>(
         AccumulatorConfig::short_context()
     };
 
-    let chunk_size = seq_q * head_dim;
-    output.chunks_exact_mut(chunk_size).enumerate().for_each(|(idx, out_chunk)| {
-        process_head_attention(idx, out_chunk, heads, seq_q, seq_kv, head_dim, q, k, v, scale, &acc_config, config.causal);
-    });
+    // Sequential processing for CPU reference implementation to allow random access to output buffer
+    // (Token-First layout means head data is not contiguous)
+    let total_heads = config.batch_size * num_q_heads;
+    for idx in 0..total_heads {
+        process_head_attention_gqa(
+            idx,
+            output,
+            num_q_heads,
+            num_kv_heads,
+            seq_q,
+            seq_kv,
+            head_dim,
+            q,
+            k,
+            v,
+            scale,
+            &acc_config,
+            config.causal
+        );
+    }
 }
 
 #[inline(always)]
@@ -60,7 +77,70 @@ pub fn cpu_paged_attention<T: KernelFloat>(
     crate::ops::paged_attn::paged_attention(q, k_cache, v_cache, page_table, seq_lens, output, config);
 }
 
-/// Ultra-fast decode path (seq_q=1).
+/// Ultra-fast decode path (seq_q=1) with GQA support.
+pub fn flash_attention_decode_gqa<T: KernelFloat>(
+    q: &[T],
+    k: &[T],
+    v: &[T],
+    output: &mut [T],
+    num_q_heads: usize,
+    num_kv_heads: usize,
+    seq_kv: usize,
+    head_dim: usize,
+    scale: f32,
+) {
+    let heads_per_kv = num_q_heads / num_kv_heads;
+
+    for h in 0..num_q_heads {
+        let kv_head = h / heads_per_kv;  // GQA: map q head to kv head
+        let q_offset = h * head_dim;
+        let q_row = &q[q_offset..q_offset + head_dim];
+
+        let mut max_score = f32::NEG_INFINITY;
+        let mut sum_exp = 0.0f32;
+        let mut acc = [0.0f32; 256];
+        let hd = head_dim.min(256);
+
+        for j in 0..seq_kv {
+            // Token-First layout: [seq_kv, num_kv_heads, head_dim]
+            // stride for seq is (num_kv_heads * head_dim)
+            let k_offset = j * (num_kv_heads * head_dim) + kv_head * head_dim;
+            let k_row = &k[k_offset..k_offset + head_dim];
+
+            let score = dot_product(q_row, k_row) * scale;
+
+            max_score = max_score.max(score);
+        }
+
+        for j in 0..seq_kv {
+            // Token-First layout: [seq_kv, num_kv_heads, head_dim]
+            let k_offset = j * (num_kv_heads * head_dim) + kv_head * head_dim;
+            let k_row = &k[k_offset..k_offset + head_dim];
+            let v_offset = j * (num_kv_heads * head_dim) + kv_head * head_dim;
+            let v_row = &v[v_offset..v_offset + head_dim];
+
+            let score = dot_product(q_row, k_row) * scale;
+
+            let exp_score = (score - max_score).exp();
+            sum_exp += exp_score;
+
+            for d in 0..hd {
+                acc[d] += exp_score * v_row[d].to_f32();
+            }
+        }
+
+        let out_offset = h * head_dim;
+        let out_row = &mut output[out_offset..out_offset + head_dim];
+        let inv_sum = if sum_exp > 0.0 { 1.0 / sum_exp } else { 0.0 };
+
+        for d in 0..head_dim {
+            out_row[d] = T::from_f32(acc[d] * inv_sum);
+        }
+    }
+}
+
+/// Ultra-fast decode path (seq_q=1) - legacy API.
+#[inline(always)]
 pub fn flash_attention_decode<T: KernelFloat>(
     q: &[T],
     k: &[T],
@@ -71,54 +151,14 @@ pub fn flash_attention_decode<T: KernelFloat>(
     head_dim: usize,
     scale: f32,
 ) {
-    for h in 0..num_heads {
-        let q_offset = h * head_dim;
-        let q_row = &q[q_offset..q_offset + head_dim];
-        
-        let mut max_score = f32::NEG_INFINITY;
-        let mut sum_exp = 0.0f32;
-        let mut acc = [0.0f32; 256];
-        let hd = head_dim.min(256);
-        
-        for j in 0..seq_kv {
-            let k_offset = h * seq_kv * head_dim + j * head_dim;
-            let k_row = &k[k_offset..k_offset + head_dim];
-            
-            let score = dot_product(q_row, k_row) * scale;
-            
-            max_score = max_score.max(score);
-        }
-        
-        for j in 0..seq_kv {
-            let k_offset = h * seq_kv * head_dim + j * head_dim;
-            let k_row = &k[k_offset..k_offset + head_dim];
-            let v_offset = h * seq_kv * head_dim + j * head_dim;
-            let v_row = &v[v_offset..v_offset + head_dim];
-            
-            let score = dot_product(q_row, k_row) * scale;
-            
-            let exp_score = (score - max_score).exp();
-            sum_exp += exp_score;
-            
-            for d in 0..hd {
-                acc[d] += exp_score * v_row[d].to_f32();
-            }
-        }
-        
-        let out_offset = h * head_dim;
-        let out_row = &mut output[out_offset..out_offset + head_dim];
-        let inv_sum = if sum_exp > 0.0 { 1.0 / sum_exp } else { 0.0 };
-        
-        for d in 0..head_dim {
-            out_row[d] = T::from_f32(acc[d] * inv_sum);
-        }
-    }
+    flash_attention_decode_gqa(q, k, v, output, num_heads, num_heads, seq_kv, head_dim, scale);
 }
 
-fn process_head_attention<T: KernelFloat>(
+fn process_head_attention_gqa<T: KernelFloat>(
     idx: usize,
-    out_chunk: &mut [T],
-    heads: usize,
+    output: &mut [T],
+    num_q_heads: usize,
+    num_kv_heads: usize,
     seq_q: usize,
     seq_kv: usize,
     head_dim: usize,
@@ -129,8 +169,18 @@ fn process_head_attention<T: KernelFloat>(
     acc_config: &AccumulatorConfig,
     causal: bool,
 ) {
-    let b = idx / heads;
-    let h = idx % heads;
+    let b = idx / num_q_heads;
+    let h = idx % num_q_heads;
+    let heads_per_kv = num_q_heads / num_kv_heads;
+    let kv_head = h / heads_per_kv;  // GQA: map q head to kv head
+
+    // Strides for Token-First layout: [batch, seq, heads, dim]
+    let stride_q = num_q_heads * head_dim;
+    let stride_kv = num_kv_heads * head_dim;
+
+    // Batch offsets
+    let batch_offset_q = b * seq_q * stride_q;
+    let batch_offset_kv = b * seq_kv * stride_kv;
 
     for i in 0..seq_q {
         let mut stable = StableAccumulator::new(acc_config.clone());
@@ -138,13 +188,15 @@ fn process_head_attention<T: KernelFloat>(
         let mut scores = vec![0.0f32; max_j.min(seq_kv)];
         let mut block_max = -f32::INFINITY;
 
-        let q_base = b * heads * seq_q * head_dim + h * seq_q * head_dim + i * head_dim;
-        let q_row = &q[q_base..q_base + head_dim];
+        // Token-First Q access: [b, i, h, :]
+        let q_offset = batch_offset_q + i * stride_q + h * head_dim;
+        let q_row = &q[q_offset..q_offset + head_dim];
 
         for j in 0..max_j.min(seq_kv) {
-            let k_base = b * heads * seq_kv * head_dim + h * seq_kv * head_dim + j * head_dim;
-            let k_row = &k[k_base..k_base + head_dim];
-            
+            // Token-First K access: [b, j, kv_h, :]
+            let k_offset = batch_offset_kv + j * stride_kv + kv_head * head_dim;
+            let k_row = &k[k_offset..k_offset + head_dim];
+
             let score = dot_product(q_row, k_row) * scale;
             block_max = block_max.max(score);
             scores[j] = score;
@@ -158,23 +210,25 @@ fn process_head_attention<T: KernelFloat>(
         let m = stable.max();
         let l = stable.sum();
 
-        let out_row = &mut out_chunk[i * head_dim..(i + 1) * head_dim];
-        let mut weighted_sum = [0.0f32; 256];
+        let mut weighted_sum = vec![0.0f32; head_dim];
 
         for (j, &score) in scores.iter().enumerate() {
             let attn_weight = if l > 0.0 { (((score as f64) - m).exp() / l) as f32 } else { 0.0 };
             if attn_weight == 0.0 { continue; }
-            
-            let v_base = b * heads * seq_kv * head_dim + h * seq_kv * head_dim + j * head_dim;
-            let v_row = &v[v_base..v_base + head_dim];
-            
+
+            // Token-First V access: [b, j, kv_h, :]
+            let v_offset = batch_offset_kv + j * stride_kv + kv_head * head_dim;
+            let v_row = &v[v_offset..v_offset + head_dim];
+
             for d in 0..head_dim {
                 weighted_sum[d] += attn_weight * v_row[d].to_f32();
             }
         }
 
+        // Token-First Output access: [b, i, h, :]
+        let out_offset = batch_offset_q + i * stride_q + h * head_dim;
         for d in 0..head_dim {
-            out_row[d] = T::from_f32(weighted_sum[d]);
+            output[out_offset + d] = T::from_f32(weighted_sum[d]);
         }
     }
 }
