@@ -1,386 +1,229 @@
-//! CUDA FlashAttention-style kernels using cudarc 0.18.
-//!
-//! This module provides a naive, correctness-focused GPU kernel that mirrors
-//! flash-attention semantics. It favors clarity over performance and serves as
-//! an integration point for precompiled PTX.
-//!
-//! # SM-Aware PTX Loading
-//!
-//! This module automatically selects the best PTX binary for the detected GPU:
-//! - SM 61 (Pascal): GTX 1060/1070/1080
-//! - SM 75 (Turing): RTX 2060/2070/2080
-//! - SM 80 (Ampere): A100, RTX 30 series
-//! - SM 86 (Ampere): RTX 3060/3070/3080/3090
-//! - SM 89 (Ada): RTX 4060/4070/4080/4090
-//! - SM 90 (Hopper): H100, H200
-//!
-//! 🚨 **Fat Binary Only**: NO runtime compilation fallback.
-
-use std::fmt;
-use std::sync::Arc;
-
-use cudarc::driver::{CudaContext, CudaFunction, CudaModule, CudaSlice, CudaStream, LaunchConfig, DriverError, PushKernelArg};
-use half::f16;
-
-use crate::types::FlashAttentionConfig;
-use crate::cuda_kernels::ptx_loader::{PtxCollection, PtxLoadError};
-use crate::validation::{
-    validate_attention_dims, validate_i32_bounds, compute_num_queries, compute_output_len,
+use cudarc::driver::{
+    sys, CudaSlice, CudaStream, DevicePtr, DevicePtrMut, DeviceRepr, LaunchConfig,
 };
 
-const KERNEL_F32: &str = "tiled_attention_forward_f32";
-const KERNEL_F16: &str = "tiled_attention_forward_f16";
-const DEFAULT_BLOCK: u32 = 128;
+use crate::backend_trait::BackendResult;
+use crate::cuda_kernels::{load_function, KernelLaunch};
 
-/// SM-aware PTX collection for tiled attention kernel.
-/// PTX compiled for a lower SM version is forward-compatible with higher SM GPUs.
-///
-/// 🚨 **Fat Binary Only**: All PTX precompiled and embedded, no runtime compilation.
-static TILED_ATTENTION_PTX: PtxCollection = PtxCollection {
-    kernel_name: "tiled_attention",
-    ptx_versions: &[
-        // SM 61 (Pascal) - GTX 1060/1070/1080
-        (61, include_str!("kernels/tiled_attention_sm61.ptx")),
-        // SM 80 (Ampere) - default for A100/RTX 30 series and higher
-        (80, include_str!("kernels/tiled_attention.ptx")),
-    ],
-};
+pub const FLASH_ATTN_KERNEL_NAME: &str = "flash_attention";
+pub const FLASH_ATTN_PAGED_KERNEL_NAME: &str = "flash_attention_paged";
 
-/// Errors surfaced by the CUDA FlashAttention kernels.
-#[derive(Debug)]
-pub enum FlashAttentionError {
-    /// CUDA driver error.
-    Driver(DriverError),
-    /// Invalid launch or shape configuration.
-    InvalidConfig(String),
-    /// Missing kernel entry point.
-    KernelMissing(&'static str),
-    /// PTX loading error.
-    PtxLoad(PtxLoadError),
+#[repr(C)]
+#[derive(Debug, Clone, Copy)]
+pub struct FlashAttnConfig {
+    pub batch: u32,
+    pub num_heads: u32,
+    pub head_dim: u32,
+    pub q_seq_len: u32,
+    pub kv_seq_len: u32,
+    pub q_stride: u32,
+    pub kv_stride: u32,
+    pub o_stride: u32,
+    pub causal: u32,
+    pub scale: f32,
+    pub q_pos_offset: u32,
 }
 
-impl fmt::Display for FlashAttentionError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::Driver(err) => write!(f, "CUDA driver error: {err}"),
-            Self::InvalidConfig(msg) => write!(f, "Invalid config: {msg}"),
-            Self::KernelMissing(name) => write!(f, "Kernel not found: {name}"),
-            Self::PtxLoad(err) => write!(f, "PTX loading error: {err}"),
-        }
-    }
+unsafe impl DeviceRepr for FlashAttnConfig {}
+
+#[repr(C)]
+#[derive(Debug, Clone, Copy)]
+pub struct FlashAttnPagedConfig {
+    pub batch: u32,
+    pub num_heads: u32,
+    pub head_dim: u32,
+    pub q_seq_len: u32,
+    pub kv_seq_len: u32,
+    pub q_stride: u32,
+    pub kv_stride: u32,
+    pub o_stride: u32,
+    pub causal: u32,
+    pub scale: f32,
+    pub q_pos_offset: u32,
+    pub page_size: u32,
+    pub pages_per_layer: u32,
 }
 
-impl std::error::Error for FlashAttentionError {}
+unsafe impl DeviceRepr for FlashAttnPagedConfig {}
 
-impl From<DriverError> for FlashAttentionError {
-    fn from(err: DriverError) -> Self {
-        Self::Driver(err)
-    }
+#[derive(Debug, Clone, Copy)]
+pub struct FlashAttnKernel {
+    func: sys::CUfunction,
 }
 
-impl From<PtxLoadError> for FlashAttentionError {
-    fn from(err: PtxLoadError) -> Self {
-        Self::PtxLoad(err)
-    }
-}
+unsafe impl Send for FlashAttnKernel {}
+unsafe impl Sync for FlashAttnKernel {}
 
-/// FlashAttention CUDA kernel wrapper.
-pub struct FlashAttentionKernel {
-    #[allow(dead_code)]
-    module: Arc<CudaModule>,
-    kernel_f32: CudaFunction,
-    kernel_f16: CudaFunction,
-}
-
-impl FlashAttentionKernel {
-    /// Load a FlashAttention kernel module on the given device.
-    ///
-    /// This method automatically selects the best PTX binary for the detected GPU.
-    /// 🚨 **Fat Binary Only**: No runtime compilation fallback.
-    pub fn new(ctx: &Arc<CudaContext>) -> Result<Self, FlashAttentionError> {
-        let ptx = TILED_ATTENTION_PTX.load(ctx)?;
-        let module = ctx.load_module(ptx)?;
-
-        let kernel_f32 = module
-            .load_function(KERNEL_F32)
-            .map_err(|_| FlashAttentionError::KernelMissing(KERNEL_F32))?;
-        let kernel_f16 = module
-            .load_function(KERNEL_F16)
-            .map_err(|_| FlashAttentionError::KernelMissing(KERNEL_F16))?;
-
+impl FlashAttnKernel {
+    pub(crate) fn load(module: sys::CUmodule) -> BackendResult<Self> {
         Ok(Self {
-            module,
-            kernel_f32,
-            kernel_f16,
+            func: load_function(module, FLASH_ATTN_KERNEL_NAME)?,
         })
     }
 
-    /// FlashAttention forward for f16 inputs.
-    pub fn forward(
+    pub fn launch<
+        T: DeviceRepr,
+        Q: DevicePtr<T>,
+        K: DevicePtr<T>,
+        V: DevicePtr<T>,
+        O: DevicePtrMut<T>,
+    >(
         &self,
-        stream: &Arc<CudaStream>,
-        q: &CudaSlice<f16>,
-        k: &CudaSlice<f16>,
-        v: &CudaSlice<f16>,
-        batch_size: usize,
-        num_heads: usize,
-        seq_len: usize,
-        head_dim: usize,
-        is_causal: bool,
-        scale: f32,
-        position_offset: usize,
-    ) -> Result<CudaSlice<f16>, FlashAttentionError> {
-        self.forward_f16(
+        stream: &CudaStream,
+        config: LaunchConfig,
+        q: &Q,
+        k: &K,
+        v: &V,
+        output: &mut O,
+        alibi_slopes: Option<&CudaSlice<f32>>,
+        params: &FlashAttnConfig,
+    ) -> BackendResult<()> {
+        self.launch_with_lse::<T, Q, K, V, O, CudaSlice<f32>>(
             stream,
+            config,
             q,
             k,
             v,
-            batch_size,
-            num_heads,
-            seq_len,
-            head_dim,
-            is_causal,
-            scale,
-            position_offset,
+            output,
+            None,
+            alibi_slopes,
+            params,
         )
     }
 
-    /// FlashAttention forward for f32 inputs.
-    pub fn forward_f32(
+    pub fn launch_with_lse<
+        T: DeviceRepr,
+        Q: DevicePtr<T>,
+        K: DevicePtr<T>,
+        V: DevicePtr<T>,
+        O: DevicePtrMut<T>,
+        L: DevicePtrMut<f32>,
+    >(
         &self,
-        stream: &Arc<CudaStream>,
-        q: &CudaSlice<f32>,
-        k: &CudaSlice<f32>,
-        v: &CudaSlice<f32>,
-        batch_size: usize,
-        num_heads: usize,
-        seq_len: usize,
-        head_dim: usize,
-        is_causal: bool,
-        scale: f32,
-        position_offset: usize,
-    ) -> Result<CudaSlice<f32>, FlashAttentionError> {
-        self.forward_f32_with_block(
-            stream,
-            q,
-            k,
-            v,
-            batch_size,
-            num_heads,
-            seq_len,
-            head_dim,
-            is_causal,
-            scale,
-            position_offset,
-            DEFAULT_BLOCK,
-        )
-    }
+        stream: &CudaStream,
+        config: LaunchConfig,
+        q: &Q,
+        k: &K,
+        v: &V,
+        output: &mut O,
+        lse: Option<&mut L>,
+        alibi_slopes: Option<&CudaSlice<f32>>,
+        params: &FlashAttnConfig,
+    ) -> BackendResult<()> {
+        let mut launch = KernelLaunch::new(self.func, stream, config, 7);
+        launch
+            .arg_device(q)
+            .arg_device(k)
+            .arg_device(v)
+            .arg_device_mut(output);
 
-    /// FlashAttention forward for f16 inputs.
-    pub fn forward_f16(
-        &self,
-        stream: &Arc<CudaStream>,
-        q: &CudaSlice<f16>,
-        k: &CudaSlice<f16>,
-        v: &CudaSlice<f16>,
-        batch_size: usize,
-        num_heads: usize,
-        seq_len: usize,
-        head_dim: usize,
-        is_causal: bool,
-        scale: f32,
-        position_offset: usize,
-    ) -> Result<CudaSlice<f16>, FlashAttentionError> {
-        self.forward_f16_with_block(
-            stream,
-            q,
-            k,
-            v,
-            batch_size,
-            num_heads,
-            seq_len,
-            head_dim,
-            is_causal,
-            scale,
-            position_offset,
-            DEFAULT_BLOCK,
-        )
-    }
-
-    fn forward_f32_with_block(
-        &self,
-        stream: &Arc<CudaStream>,
-        q: &CudaSlice<f32>,
-        k: &CudaSlice<f32>,
-        v: &CudaSlice<f32>,
-        batch_size: usize,
-        num_heads: usize,
-        seq_len: usize,
-        head_dim: usize,
-        is_causal: bool,
-        scale: f32,
-        position_offset: usize,
-        block_size: u32,
-    ) -> Result<CudaSlice<f32>, FlashAttentionError> {
-        let (output_len, cfg) = build_launch(batch_size, num_heads, seq_len, head_dim, block_size)?;
-
-        let mut output: CudaSlice<f32> = stream.alloc_zeros(output_len)?;
-        let is_causal_i32 = if is_causal { 1i32 } else { 0i32 };
-        let position_offset_i32 = i32::try_from(position_offset)
-            .map_err(|_| FlashAttentionError::InvalidConfig("position_offset too large".into()))?;
-
-        let batch_size_i32 = batch_size as i32;
-        let num_heads_i32 = num_heads as i32;
-        let seq_len_i32 = seq_len as i32;
-        let head_dim_i32 = head_dim as i32;
-
-        unsafe {
-            let mut builder = stream.launch_builder(&self.kernel_f32);
-            builder.arg(q);
-            builder.arg(k);
-            builder.arg(v);
-            builder.arg(&mut output);
-            builder.arg(&batch_size_i32);
-            builder.arg(&num_heads_i32);
-            builder.arg(&seq_len_i32);
-            builder.arg(&head_dim_i32);
-            builder.arg(&scale);
-            builder.arg(&is_causal_i32);
-            builder.arg(&position_offset_i32);
-            builder.launch(cfg)?;
+        match lse {
+            Some(buf) => {
+                launch.arg_device_mut(buf);
+            }
+            None => {
+                launch.arg_device_ptr(0);
+            }
         }
 
-        Ok(output)
-    }
-
-    fn forward_f16_with_block(
-        &self,
-        stream: &Arc<CudaStream>,
-        q: &CudaSlice<f16>,
-        k: &CudaSlice<f16>,
-        v: &CudaSlice<f16>,
-        batch_size: usize,
-        num_heads: usize,
-        seq_len: usize,
-        head_dim: usize,
-        is_causal: bool,
-        scale: f32,
-        position_offset: usize,
-        block_size: u32,
-    ) -> Result<CudaSlice<f16>, FlashAttentionError> {
-        let (output_len, cfg) = build_launch(batch_size, num_heads, seq_len, head_dim, block_size)?;
-
-        let mut output: CudaSlice<f16> = stream.alloc_zeros(output_len)?;
-        let is_causal_i32 = if is_causal { 1i32 } else { 0i32 };
-        let position_offset_i32 = i32::try_from(position_offset)
-            .map_err(|_| FlashAttentionError::InvalidConfig("position_offset too large".into()))?;
-
-        let batch_size_i32 = batch_size as i32;
-        let num_heads_i32 = num_heads as i32;
-        let seq_len_i32 = seq_len as i32;
-        let head_dim_i32 = head_dim as i32;
-
-        unsafe {
-            let mut builder = stream.launch_builder(&self.kernel_f16);
-            builder.arg(q);
-            builder.arg(k);
-            builder.arg(v);
-            builder.arg(&mut output);
-            builder.arg(&batch_size_i32);
-            builder.arg(&num_heads_i32);
-            builder.arg(&seq_len_i32);
-            builder.arg(&head_dim_i32);
-            builder.arg(&scale);
-            builder.arg(&is_causal_i32);
-            builder.arg(&position_offset_i32);
-            builder.launch(cfg)?;
+        match alibi_slopes {
+            Some(slopes) => {
+                launch.arg_device(slopes);
+            }
+            None => {
+                launch.arg_device_ptr(0);
+            }
         }
 
-        Ok(output)
+        launch.arg_scalar(params);
+        unsafe { launch.launch() }
     }
 }
 
-/// CUDA attention wrapper that uses a naive tiled kernel.
-pub struct OptimizedCudaAttention {
-    tile_size: u32,
-    kernel: FlashAttentionKernel,
+#[derive(Debug, Clone, Copy)]
+pub struct FlashAttnPagedKernel {
+    func: sys::CUfunction,
 }
 
-impl OptimizedCudaAttention {
-    /// Create a tiled CUDA attention wrapper for f32 inputs.
-    pub fn new(ctx: &Arc<CudaContext>, tile_size: usize) -> Result<Self, FlashAttentionError> {
-        let tile_size = tile_size.clamp(1, 1024) as u32;
-        let kernel = FlashAttentionKernel::new(ctx)?;
+unsafe impl Send for FlashAttnPagedKernel {}
+unsafe impl Sync for FlashAttnPagedKernel {}
+
+impl FlashAttnPagedKernel {
+    pub(crate) fn load(module: sys::CUmodule) -> BackendResult<Self> {
         Ok(Self {
-            tile_size,
-            kernel,
+            func: load_function(module, FLASH_ATTN_PAGED_KERNEL_NAME)?,
         })
     }
 
-    /// Forward pass using the tiled attention kernel.
-    pub fn forward_tiled(
+    pub fn launch<
+        T: DeviceRepr,
+        Q: DevicePtr<T>,
+        P: DevicePtr<u64>,
+        O: DevicePtrMut<T>,
+    >(
         &self,
-        stream: &Arc<CudaStream>,
-        q: &CudaSlice<f32>,
-        k: &CudaSlice<f32>,
-        v: &CudaSlice<f32>,
-        config: &FlashAttentionConfig,
-        position_offset: usize,
-    ) -> Result<CudaSlice<f32>, FlashAttentionError> {
-        if config.seq_len_q != config.seq_len_kv {
-            return Err(FlashAttentionError::InvalidConfig(
-                "query_len must match kv_len for the tiled kernel".into(),
-            ));
+        stream: &CudaStream,
+        config: LaunchConfig,
+        q: &Q,
+        page_table: &P,
+        output: &mut O,
+        alibi_slopes: Option<&CudaSlice<f32>>,
+        params: &FlashAttnPagedConfig,
+    ) -> BackendResult<()> {
+        self.launch_with_lse::<T, Q, P, O, CudaSlice<f32>>(
+            stream,
+            config,
+            q,
+            page_table,
+            output,
+            None,
+            alibi_slopes,
+            params,
+        )
+    }
+
+    pub fn launch_with_lse<
+        T: DeviceRepr,
+        Q: DevicePtr<T>,
+        P: DevicePtr<u64>,
+        O: DevicePtrMut<T>,
+        L: DevicePtrMut<f32>,
+    >(
+        &self,
+        stream: &CudaStream,
+        config: LaunchConfig,
+        q: &Q,
+        page_table: &P,
+        output: &mut O,
+        lse: Option<&mut L>,
+        alibi_slopes: Option<&CudaSlice<f32>>,
+        params: &FlashAttnPagedConfig,
+    ) -> BackendResult<()> {
+        let mut launch = KernelLaunch::new(self.func, stream, config, 6);
+        launch
+            .arg_device(q)
+            .arg_device(page_table)
+            .arg_device_mut(output);
+
+        match lse {
+            Some(buf) => {
+                launch.arg_device_mut(buf);
+            }
+            None => {
+                launch.arg_device_ptr(0);
+            }
         }
 
-        let scale = config.scale.unwrap_or_else(|| 1.0 / (config.head_dim as f32).sqrt());
-        let output = self.kernel.forward_f32_with_block(
-            stream,
-            q,
-            k,
-            v,
-            config.batch_size,
-            config.num_heads,
-            config.seq_len_q,
-            config.head_dim,
-            config.causal,
-            scale,
-            position_offset,
-            self.tile_size,
-        )?;
+        match alibi_slopes {
+            Some(slopes) => {
+                launch.arg_device(slopes);
+            }
+            None => {
+                launch.arg_device_ptr(0);
+            }
+        }
 
-        Ok(output)
+        launch.arg_scalar(params);
+        unsafe { launch.launch() }
     }
-}
-
-fn build_launch(
-    batch_size: usize,
-    num_heads: usize,
-    seq_len: usize,
-    head_dim: usize,
-    block_size: u32,
-) -> Result<(usize, LaunchConfig), FlashAttentionError> {
-    validate_attention_dims(batch_size, num_heads, seq_len, head_dim)
-        .map_err(FlashAttentionError::InvalidConfig)?;
-    validate_i32_bounds(batch_size, num_heads, seq_len, head_dim)
-        .map_err(FlashAttentionError::InvalidConfig)?;
-
-    let num_queries = compute_num_queries(batch_size, num_heads, seq_len)
-        .map_err(FlashAttentionError::InvalidConfig)?;
-    let output_len = compute_output_len(num_queries, head_dim)
-        .map_err(FlashAttentionError::InvalidConfig)?;
-
-    let block_dim = block_size.clamp(1, 1024) as usize;
-    let grid_dim = (num_queries + block_dim - 1) / block_dim;
-    let grid_dim = u32::try_from(grid_dim).map_err(|_| {
-        FlashAttentionError::InvalidConfig("grid_dim exceeds u32::MAX".into())
-    })?;
-
-    let cfg = LaunchConfig {
-        grid_dim: (grid_dim, 1, 1),
-        block_dim: (block_dim as u32, 1, 1),
-        shared_mem_bytes: 0,
-    };
-
-    Ok((output_len, cfg))
 }

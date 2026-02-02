@@ -1,125 +1,92 @@
 # gllm-kernels
 
-Low-level attention kernels for [gllm](https://github.com/putao520/gllm) with CUDA/ROCm support.
+**Core Calculation Backend for [gllm](https://github.com/putao520/gllm).**
+
+Provides **L3 GPU-Pure** inference primitives using direct Driver APIs (CUDA/Metal/ROCm) without external runtime dependencies.
 
 [![Crates.io](https://img.shields.io/crates/v/gllm-kernels.svg)](https://crates.io/crates/gllm-kernels)
 [![Documentation](https://docs.rs/gllm-kernels/badge.svg)](https://docs.rs/gllm-kernels)
 [![License](https://img.shields.io/crates/l/gllm-kernels.svg)](LICENSE)
 
-## Features
+## Architecture: Driver API & AOT
 
-- **FlashAttention**: Memory-efficient attention with O(N) memory complexity
-- **Hierarchical Attention**: Multi-level attention for ultra-long contexts (2M+ tokens)
-- **CUDA Kernels**: Native CUDA implementation with PTX for NVIDIA GPUs
-- **ROCm/HIP Kernels**: AMD GPU support (experimental)
-- **Multiple Backends**: CPU (ndarray), CUDA, WebGPU via Burn
+Unlike traditional bindings that rely on `libcudart` or `nvcc` at runtime, **gllm-kernels** uses a strictly **Ahead-of-Time (AOT)** and **Driver API** approach:
 
-## Performance
+| Feature | Implementation | Benefit |
+|---------|----------------|---------|
+| **Execution** | **Driver API** (`libcuda.so`, `libhsa.so`) | Zero runtime dependency (no CUDA Toolkit required). |
+| **Compilation** | **AOT Only** (CUBIN/HSACO) | 100ms startup time, no JIT compilation overhead. |
+| **Memory** | **L3 GPU-Pure** | Inputs & Outputs are GPU-resident (no PCIe traffic during generation). |
+| **Dispatch** | **Static Dispatch** | Rust traits determine backend at compile/link time. |
 
-| Implementation | Time (seq=512) | vs burn_cuda |
-|----------------|----------------|--------------|
-| **cuda_kernel** | 21.27ms | **37% faster** |
-| burn_cuda | 33.83ms | baseline |
+## Supported Backends
+
+The system automatically detects available hardware at runtime:
+
+1.  **CUDA** (NVIDIA):
+    -   Target: `libcuda.so` / `nvcuda.dll`
+    -   Kernels: Precompiled `.cubin` for `sm_80` (A100), `sm_86` (RTX 30), `sm_89` (RTX 40), `sm_90` (H100).
+    -   *Legacy GPUs (Pascal/Volta) are NOT supported.*
+2.  **CPU** (Fallback):
+    -   Target: Pure Rust (`faer`)
+    -   Kernels: AVX-512 / NEON SIMD implementations.
+3.  **Metal** (Apple Silicon) - *Planned*
+4.  **ROCm** (AMD) - *Planned*
 
 ## Installation
 
-Add to your `Cargo.toml`:
-
 ```toml
 [dependencies]
-gllm-kernels = "0.1"
+gllm-kernels = "0.2"
 ```
 
-### Feature Flags
+## Usage (L3 GPU-Pure API)
 
-| Feature | Description | Default |
-|---------|-------------|---------|
-| `cpu` | CPU backend via burn-ndarray | Yes |
-| `cuda` | CUDA backend via burn-cuda | No |
-| `cuda-kernel` | Native CUDA kernels (requires CUDA toolkit) | No |
-| `wgpu` | WebGPU backend | No |
-| `rocm-kernel` | ROCm/HIP kernels (experimental) | No |
-
-## Usage
-
-### Basic FlashAttention
+This crate provides low-level primitives. Most users should use the high-level `gllm` crate.
 
 ```rust
-use gllm_kernels::ops::flash_attention::{
-    HierarchicalFlashAttention, AttentionConfig
-};
+use gllm_kernels::backend::{Backend, CudaBackend};
 
-// Create attention module
-let attention = HierarchicalFlashAttention::new(
-    num_heads,
-    head_dim,
-    AttentionConfig::default(),
-);
+fn main() -> Result<(), Box<dyn std::error::Error>> {
+    // 1. Initialize Backend (Auto-detects GPU)
+    let backend = CudaBackend::new(0)?; // Device 0
 
-// Forward pass
-let output = attention.forward(q, k, v, mask)?;
+    // 2. Upload Weights (Once)
+    let weights = backend.upload_generator_weights(&cpu_weights)?;
+
+    // 3. Allocate KV Cache (GPU Resident)
+    let mut kv_cache = backend.alloc_kv_cache(128, &config)?;
+
+    // 4. Zero-Copy Forward (Loop)
+    // Only Token IDs (4 bytes) transfer over PCIe
+    let logits_handle = backend.generator_forward_gpu_pure(
+        &[token_id],
+        &topology,
+        &weights,
+        &mut kv_cache,
+        &forward_config
+    )?;
+
+    // 5. Sample on GPU
+    let next_token = backend.sample_from_tensor(&logits_handle, ...)?;
+
+    Ok(())
+}
 ```
 
-### CUDA Kernel (Native)
+## Developer Guide: Recompiling Kernels
 
-```rust
-use gllm_kernels::cuda_kernels::FlashAttentionKernel;
-use cudarc::driver::CudaContext;
-use std::sync::Arc;
-
-let ctx = Arc::new(CudaContext::new(0)?);
-let kernel = FlashAttentionKernel::new(&ctx)?;
-
-let output = kernel.forward(
-    &stream, &q, &k, &v,
-    batch_size, num_heads, seq_len, head_dim,
-    is_causal, scale, position_offset,
-)?;
-```
-
-### Deterministic Mode
-
-For reproducible results in ultra-long context scenarios:
-
-```rust
-use gllm_kernels::ops::flash_attention::DeterministicConfig;
-
-let config = AttentionConfig {
-    determinism: DeterministicConfig::strict(),
-    ..Default::default()
-};
-```
-
-## Architecture
-
-```
-gllm-kernels
-├── ops/
-│   ├── flash_attention.rs      # HierarchicalFlashAttention
-│   ├── flash_attention_v3.rs   # Advanced attention variants
-│   ├── paged_attention.rs      # KV cache paging
-│   ├── sparse_attention.rs     # Sparse patterns
-│   └── kv_compression.rs       # KV cache compression
-├── cuda_kernels/
-│   ├── flash_attn.rs           # CUDA kernel bindings
-│   └── kernels/
-│       ├── tiled_attention.cu  # CUDA source
-│       └── tiled_attention.ptx # Compiled PTX (sm_61)
-├── hip_kernels/                # ROCm/HIP (experimental)
-└── comm/                       # Distributed communication
-```
-
-## Building CUDA Kernels
-
-If you need to recompile PTX for a different GPU architecture:
+Users do **not** need to compile kernels. Only developers modifying `src/cuda_kernels/kernels/kernels.cu`
+need to run:
 
 ```bash
-cd src/cuda_kernels/kernels
-nvcc -ptx -arch=sm_XX tiled_attention.cu -o tiled_attention.ptx
+# Requires CUDA Toolkit (nvcc) or Docker with NVIDIA Container Toolkit
+./scripts/compile_kernels.sh cuda
 ```
 
-Replace `sm_XX` with your GPU's compute capability (e.g., `sm_61` for GTX 1060, `sm_86` for RTX 3090).
+This generates `src/cuda_kernels/kernels/kernels_sm80.cubin` (and sm_86/89/90) which are embedded into
+the Rust binary.
 
 ## License
 
-Apache-2.0
+MIT

@@ -1,118 +1,51 @@
-//! CUDA RMSNorm kernel wrapper.
+use cudarc::driver::{sys, CudaSlice, CudaStream, DeviceRepr, LaunchConfig};
 
-use std::fmt;
-use std::sync::Arc;
+use crate::backend_trait::BackendResult;
+use crate::cuda_kernels::{load_function, KernelLaunch};
 
-use cudarc::driver::{CudaContext, CudaFunction, CudaModule, CudaSlice, CudaStream, DriverError, LaunchConfig, PushKernelArg};
+pub const RMS_NORM_KERNEL_NAME: &str = "rms_norm";
 
-use crate::cuda_kernels::ptx_loader::{PtxCollection, PtxLoadError};
-
-const KERNEL_F32: &str = "rms_norm_f32";
-
-/// SM-aware PTX collection for RMSNorm kernel.
-/// 🚨 **Fat Binary Only**: All PTX precompiled and embedded, no runtime compilation.
-static RMS_NORM_PTX: PtxCollection = PtxCollection {
-    kernel_name: "rms_norm",
-    ptx_versions: &[
-        (61, include_str!("kernels/rms_norm_sm61.ptx")),
-        (80, include_str!("kernels/rms_norm.ptx")),
-    ],
-};
-
-/// Errors surfaced by the CUDA RMSNorm kernel.
-#[derive(Debug)]
-pub enum RmsNormError {
-    /// CUDA driver error.
-    Driver(DriverError),
-    /// Invalid launch or shape configuration.
-    InvalidConfig(String),
-    /// Missing kernel entry point.
-    KernelMissing(&'static str),
-    /// PTX loading error.
-    PtxLoad(PtxLoadError),
+#[repr(C)]
+#[derive(Debug, Clone, Copy)]
+pub struct RmsNormConfig {
+    pub hidden_size: u32,
+    pub stride: u32,
+    pub eps: f32,
+    pub seq_len: u32,
 }
 
-impl fmt::Display for RmsNormError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::Driver(err) => write!(f, "CUDA driver error: {err}"),
-            Self::InvalidConfig(msg) => write!(f, "Invalid config: {msg}"),
-            Self::KernelMissing(name) => write!(f, "Kernel not found: {name}"),
-            Self::PtxLoad(err) => write!(f, "PTX loading error: {err}"),
-        }
-    }
-}
+unsafe impl DeviceRepr for RmsNormConfig {}
 
-impl std::error::Error for RmsNormError {}
-
-impl From<DriverError> for RmsNormError {
-    fn from(err: DriverError) -> Self {
-        Self::Driver(err)
-    }
-}
-
-impl From<PtxLoadError> for RmsNormError {
-    fn from(err: PtxLoadError) -> Self {
-        Self::PtxLoad(err)
-    }
-}
-
-/// RMSNorm CUDA kernel wrapper.
+#[derive(Debug, Clone, Copy)]
 pub struct RmsNormKernel {
-    #[allow(dead_code)]
-    module: Arc<CudaModule>,
-    kernel_f32: CudaFunction,
+    func: sys::CUfunction,
 }
+
+unsafe impl Send for RmsNormKernel {}
+unsafe impl Sync for RmsNormKernel {}
 
 impl RmsNormKernel {
-    /// Load an RMSNorm kernel module on the given device.
-    pub fn new(ctx: &Arc<CudaContext>) -> Result<Self, RmsNormError> {
-        let ptx = RMS_NORM_PTX.load(ctx)?;
-        let module = ctx.load_module(ptx)?;
-
-        let kernel_f32 = module
-            .load_function(KERNEL_F32)
-            .map_err(|_| RmsNormError::KernelMissing(KERNEL_F32))?;
-
-        Ok(Self { module, kernel_f32 })
+    pub(crate) fn load(module: sys::CUmodule) -> BackendResult<Self> {
+        Ok(Self {
+            func: load_function(module, RMS_NORM_KERNEL_NAME)?,
+        })
     }
 
-    /// RMSNorm forward for f32 inputs.
-    pub fn forward(
+    pub fn launch<T: DeviceRepr>(
         &self,
-        stream: &Arc<CudaStream>,
-        input: &CudaSlice<f32>,
-        weight: &CudaSlice<f32>,
-        output: &mut CudaSlice<f32>,
-        rows: usize,
-        hidden: usize,
-        eps: f32,
-    ) -> Result<(), RmsNormError> {
-        if rows == 0 || hidden == 0 {
-            return Ok(());
-        }
-
-        let rows_u32 = u32::try_from(rows)
-            .map_err(|_| RmsNormError::InvalidConfig("rows exceeds u32".into()))?;
-        let hidden_i32 = i32::try_from(hidden)
-            .map_err(|_| RmsNormError::InvalidConfig("hidden exceeds i32".into()))?;
-        let rows_i32 = i32::try_from(rows)
-            .map_err(|_| RmsNormError::InvalidConfig("rows exceeds i32".into()))?;
-
-        let cfg = LaunchConfig::for_num_elems(rows_u32);
-
-        unsafe {
-            let mut builder = stream.launch_builder(&self.kernel_f32);
-            builder.arg(input);
-            builder.arg(weight);
-            builder.arg(output);
-            builder.arg(&hidden_i32);
-            builder.arg(&rows_i32);
-            builder.arg(&eps);
-            builder.launch(cfg)
-        }
-        .map_err(|err| RmsNormError::Driver(err))?;
-
-        Ok(())
+        stream: &CudaStream,
+        config: LaunchConfig,
+        input: &CudaSlice<T>,
+        weight: &CudaSlice<T>,
+        output: &mut CudaSlice<T>,
+        params: &RmsNormConfig,
+    ) -> BackendResult<()> {
+        let mut launch = KernelLaunch::new(self.func, stream, config, 4);
+        launch
+            .arg_device(input)
+            .arg_device(weight)
+            .arg_device_mut(output)
+            .arg_scalar(params);
+        unsafe { launch.launch() }
     }
 }

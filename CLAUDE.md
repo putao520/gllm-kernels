@@ -1,410 +1,71 @@
 # gllm-kernels
 
-Low-level GPU attention kernels with runtime backend selection.
+**High-Performance Compute Backend** - The computational engine for `gllm`.
 
-## SPEC 位置
+> **🚨 TABULA RASA (2026-02)**: This project has been reset. All legacy code has been removed to enforce strict architectural compliance.
 
-- `./SPEC/`
+## SPEC Location
+- `./SPEC/` (Single Source of Truth)
 
-## 核心架构约束（🚨 FROZEN - 铁律）
+## Technology Stack (Strict)
 
-### 零成本抽象铁律（ARCH-API-001 🚨 最高优先级）
+| Component | Technology | Constraint |
+|-----------|------------|------------|
+| **Language** | Rust (2021) | **Pure Rust Only** (No C/C++ build scripts) |
+| **GPU API** | CUDA Driver API | Via `cudarc` (No Runtime API `libcudart.so`) |
+| **CPU SIMD** | `faer` + `simba` | Runtime detection (AVX2/AVX-512/NEON) |
+| **Kernel Dist** | AOT Binary | Embed `.cubin` (sm_80/86/89/90). **No PTX/JIT**. |
 
-**所有实现必须是零成本的，违反即拒绝合并**。
+## Core Architecture (FROZEN)
 
-| 零成本机制 | 说明 |
-|------------|------|
-| 泛型单态化 | `<T: Float>` 编译时展开，无运行时开销 |
-| const 分支消除 | `T::TYPE_ID` 是 const，match 分支被编译器优化掉 |
-| `#[inline(always)]` | 强制内联，无函数调用开销 |
-| 原始切片 | `&[T]` 无任何抽象层 |
+### 1. Quantization Kernel Template (ARCH-QUANT-TEMPLATE)
+**Unified Template Implementation**:
+- **CUDA Kernels**: Use C++ templates `template<int BITS>` for quantized matmul
+- **Code Reuse**: Single implementation covers 1/2/4/8-bit quantization
+- **Zero Runtime Overhead**: Template instantiation at compile time
+- **Rust Dispatch**: Enum matching calls appropriate template instance
+- **Violation**: Implementing separate kernels for each bit width is forbidden
 
-**禁止的模式**：
+### 2. L3 GPU-Pure Architecture (ARCH-GPU-PURE)
+**Zero-Copy Generation Loop**:
+- **Weights**: Uploaded once to GPU memory.
+- **KV Cache**: Permanently resident on GPU.
+- **Logits**: Generated and sampled on GPU.
+- **Data Transfer**: Only 8 bytes/step (TokenID in -> TokenID out).
+- **Violation**: Any `Vec<f32>` transfer during generation loop is a critical bug.
 
-| 禁止 | 原因 |
-|------|------|
-| ❌ `dyn Trait` | vtable = 运行时开销 |
-| ❌ `Box<dyn Trait>` | 堆分配 + vtable |
-| ❌ 运行时类型判断 | `if type == f32` = 分支开销 |
-| ❌ `Tensor<B, D>` (Burn) | 抽象层 = 运行时开销 |
-| ❌ `_f32`/`_f16` 后缀 | 代码重复，应用泛型 |
+### 3. High-Performance CPU Backend
+**NOT just a fallback**:
+- Must implement runtime ISA detection (AVX2 vs AVX-512 vs NEON).
+- Uses `faer` for BLAS-equivalent performance in pure Rust.
+- **Violation**: Linking against `OpenBLAS`, `MKL`, or `Accelerate`.
 
-**正确做法**：
+### 4. Build & Distribution
+- **No `build.rs` compilation**: No `cc` crate, no `nvcc` invocation at build time for Rust code.
+- **Pre-compiled Kernels**: `.cubin` files are checked into the repo (`src/cuda_kernels/kernels/`).
+- **Template Instantiation**: Each sm_XX arch gets templates instantiated for BITS=1,2,4,8.
 
-```rust
-// ✅ 纯泛型 - 编译时单态化 = 零成本
-pub fn flash_attention<T: Float>(q: &[T], k: &[T], v: &[T], out: &mut [T], ...) -> Result<(), Error>;
-
-// ✅ const 分支 - 编译器完全消除
-match T::TYPE_ID {  // T::TYPE_ID 是 const
-    FloatType::F32 => ...,  // 编译时只保留对应分支
-}
-```
-
-### Fat Binary Only（ARCH-LOAD-001）
-
-**所有后端都必须使用预编译中间态嵌入，绝对禁止运行时编译**：
-
-| 后端 | 中间态格式 | 嵌入方式 | 运行时编译 |
-|------|-----------|----------|-----------|
-| CUDA | PTX | `include_bytes!` | ❌ 禁止 |
-| ROCm | HSACO | `include_bytes!` | ❌ 禁止 |
-| Metal | metallib | `include_bytes!` | ❌ 禁止 |
-| WGPU | WGSL | `include_str!` | ❌ 禁止 |
-
-**禁止的行为**：
-- ❌ NVRTC 运行时编译 PTX
-- ❌ hipcc 运行时编译 HSACO
-- ❌ Metal 源码运行时编译
-- ❌ 任何形式的运行时编译回退
-- ❌ 环境变量配置（如 `GLLM_KERNEL_PATH`）
-
-**WGSL 说明**：WGSL 是 WebGPU 的中间表示（IR），虽然 wgpu 会将其转换为原生格式，但这是"中间态到原生码的加载"（类似 PTX 到 GPU 机器码），不是"源码编译"。
-
-### 简化后端架构（ARCH-BACKEND-001 🚨 重构铁律）
-
-**Backend = 硬件算法工具库，就这么简单**。
-
-**当前问题**（必须重构）：
-```
-❌ 当前：DispatchedBackend enum + 每个方法都 match 分发
-         → 6000+ 行代码，46 个 match，过度复杂
-
-backend.rs:
-pub enum DispatchedBackend { Cpu, Wgpu, Cuda, Rocm, Metal }
-impl DispatchedBackend {
-    fn flash_attention(&self, ...) {
-        match self {  // 每个方法都重复这个！
-            Self::Cpu(b) => b.flash_attention(...),
-            Self::Wgpu(b) => b.flash_attention(...),
-            Self::Cuda(b) => b.flash_attention(...),
-            // ...
-        }
-    }
-    // 46 个这样的 match 分发函数！
-}
-```
-
-**正确架构**：
-```rust
-// 1. Backend trait - 十几个应用级算子
-pub trait Backend: Send + Sync {
-    fn flash_attention(&self, ...);
-    fn paged_attention(&self, ...);
-    fn moe_forward(&self, ...);
-    fn rms_norm(&self, ...);
-    // 就这些，不需要更多
-}
-
-// 2. 每个后端各自实现 - 分离的文件
-// wgpu_backend.rs
-impl Backend for WgpuBackend { ... }
-
-// cuda_backend.rs
-impl Backend for CudaBackend { ... }
-
-// cpu_backend.rs
-impl Backend for CpuBackend { ... }
-
-// 3. 启动时选一次，直接用
-pub fn auto_select_backend() -> Arc<dyn Backend> {
-    if cuda_available() { return Arc::new(CudaBackend::new()); }
-    if rocm_available() { return Arc::new(RocmBackend::new()); }
-    if metal_available() { return Arc::new(MetalBackend::new()); }
-    if wgpu_available() { return Arc::new(WgpuBackend::new()); }
-    Arc::new(CpuBackend::new())
-}
-
-// 4. 使用 - 一次动态分发，完事
-let backend = auto_select_backend();
-backend.flash_attention(...);  // 直接调用，没有中间层
-```
-
-**重构目标**：
-- [ ] 删除 `DispatchedBackend` enum 和所有 match 分发
-- [ ] Backend trait 只保留 ~15 个核心应用级算子
-- [ ] 每个后端在独立文件：`wgpu_backend.rs`, `cuda_backend.rs`, `cpu_backend.rs`
-- [ ] `auto_select_backend()` 返回 `Arc<dyn Backend>`
-- [ ] 目标：backend.rs 从 6000+ 行降到 < 500 行
-
-**关于 `dyn Trait`**：
-- ❌ 热路径内部禁止（每次 matmul 都 vtable = 开销）
-- ✅ 启动时选一次后端完全可以（一次 vtable 查找，忽略不计）
-
-### 零配置原则
-
-- 用户不需要配置任何东西
-- 自动检测硬件，自动选择后端
-- 检测顺序：CUDA > ROCm > Metal > WGPU > CPU
-
-### Driver API Only
-
-- CUDA: 只依赖 `libcuda.so`（CUDA Driver API）
-- ROCm: 只依赖 `libhsa-runtime64.so`（HSA Runtime）
-- 无需安装完整 CUDA Toolkit 或 ROCm SDK
-
-### 全后端实现铁律（🚨 FROZEN）
-
-**任何算子/算法都必须提供所有支持后端的完整实现**：
-
-| 后端 | 实现路径 | Loader 模块 | 必须实现 |
-|------|----------|-------------|----------|
-| CUDA | `src/cuda_kernels/kernels/*.ptx` | `src/cuda_kernels/ptx_loader.rs` | ✅ 必须 |
-| ROCm | `src/hip_kernels/kernels/*.hsaco` | `src/hip_kernels/hsa_runtime.rs` | ✅ 必须 |
-| Metal | `src/metal_kernels/kernels/*.metallib` | `src/metal_kernels/metallib_loader.rs` | ✅ 必须 |
-| WGPU | `src/wgpu_kernels/shaders/*.wgsl` | `src/wgpu_kernels/` | ✅ 必须 |
-| CPU | `src/cpu_kernels/` | 纯 Rust 实现 | ✅ 必须（参考实现） |
-
-### 后端实现优先级（🚨 开发顺序铁律）
-
-**新算子开发必须按以下顺序实现**：
-
-| 优先级 | 后端 | 理由 | 开发环境要求 |
-|--------|------|------|-------------|
-| P0 | CPU | 参考实现，验证算法正确性 | 无特殊要求 |
-| P1 | WGPU | 跨平台，覆盖最广 | 任意 Vulkan/Metal/DX12 GPU |
-| P2 | CUDA | 高性能，NVIDIA 专用 | NVIDIA GPU + Driver |
-| P3 | Metal | macOS/iOS 优化 | Apple Silicon |
-| P4 | ROCm | AMD GPU | AMD GPU + ROCm Driver |
-
-**开发流程**：
-```
-1. CPU 实现 → 单元测试验证算法
-2. WGPU 实现 → 跨平台 GPU 加速
-3. CUDA 实现（可选）→ NVIDIA 高性能
-4. Metal/ROCm（按需）→ 平台专用优化
-```
-
-**禁止的行为**：
-- ❌ 只实现 CUDA 不实现 WGPU（违反跨平台原则）
-- ❌ 跳过 CPU 参考实现（无法验证正确性）
-- ❌ 某后端使用 TODO/stub 占位提交
-
-**算子实现检查清单**：
-- [ ] CUDA PTX kernel 已实现并嵌入
-- [ ] ROCm HSACO kernel 已实现并嵌入（通过 HSA Runtime 加载）
-- [ ] Metal metallib 已实现并嵌入（通过 metal-rs 加载）
-- [ ] WGPU WGSL shader 已实现并嵌入
-- [ ] CPU 纯 Rust 参考实现已完成
-
-**禁止的行为**：
-- ❌ 只实现部分后端（如只有 CUDA 没有 Metal）
-- ❌ 某后端使用 stub/TODO 占位
-- ❌ 后端之间行为不一致
-- ❌ 跳过 CPU 参考实现
-
-**统一调度接口**（`src/ops/*.rs`）：
-```
-算子调用 → BackendSelector → 运行时检测 → 调用对应后端
-                              ↓
-          ┌─────────┬─────────┬─────────┬─────────┬────────┐
-          │ CUDA    │ ROCm    │ Metal   │ WGPU    │ CPU    │
-          │ PTX     │ HSACO   │ metallib│ WGSL    │ Rust   │
-          └─────────┴─────────┴─────────┴─────────┴────────┘
-```
-
-### Backend trait 当前方法清单（18 个）
-
-> 📌 SSOT: 详见 `SPEC/02-ARCHITECTURE.md` ARCH-SCOPE-001
-
-| # | 方法 | 用途 | GPU 实现状态 |
-|---|------|------|-------------|
-| 1 | `flash_attention()` | Flash Attention | ✅ 全后端 |
-| 2 | `paged_attention()` | PagedKV Attention | ✅ 全后端 |
-| 3 | `softmax()` | Softmax | ✅ 全后端 |
-| 4 | `matmul()` | 矩阵乘法 | ✅ 全后端 |
-| 5 | `rope_precompute()` | RoPE 预计算 | ✅ 全后端 |
-| 6 | `rope_apply()` | RoPE 应用 | ✅ 全后端 |
-| 7 | `rope_apply_inplace()` | RoPE 原地应用 | ✅ WGPU |
-| 8 | `topk()` | Top-K 采样 | CPU only |
-| 9 | `apply_temperature()` | 温度缩放 | CPU only |
-| 10 | `sample_tokens()` | Token 采样 | CPU only |
-| 11 | `argmax()` | 贪婪解码 | CPU only |
-| 12 | `moe_route()` | MoE 路由 | CPU only |
-| 13 | `compute_routing_logits()` | 路由 logits | CPU only |
-| 14 | `rms_norm()` | RMS 归一化 | ✅ WGPU |
-| 15 | `rms_norm_inplace()` | RMS 归一化（原地） | ✅ WGPU |
-| 16 | `silu()` | SiLU 激活 | ✅ WGPU |
-| 17 | `silu_inplace()` | SiLU 激活（原地） | ✅ WGPU |
-| 18 | `add_bias()` | 偏置添加 | CPU only |
-
-### 待实现需求（性能优化）
-
-| 需求 ID | 描述 | 架构设计 | 状态 |
-|---------|------|----------|------|
-| REQ-QUANT-001 | 原生量化推理 Kernel | ARCH-ADR-011 | 🔲 待设计 |
-
----
-
-## 目录结构
+## Directory Structure
 
 ```
 src/
-├── cuda_kernels/      # CUDA PTX + Driver API
-│   ├── ptx_loader.rs  # SM-aware PTX 加载（无 NVRTC）
-│   └── kernels/*.ptx  # 预编译 PTX
-├── hip_kernels/       # HSA Runtime + HSACO
-│   ├── hsa_runtime.rs # HSA 动态加载
-│   └── kernels/*.hsaco
-├── metal_kernels/     # Metal Framework + metallib
-│   ├── metallib_loader.rs
-│   └── kernels/*.metallib
-├── wgpu_kernels/      # wgpu + WGSL
-│   └── shaders/*.wgsl
-└── cpu_kernels/       # 纯 Rust 参考实现
+├── lib.rs              # Entry point
+├── backend_trait.rs    # Backend trait definition (L3 API)
+├── cpu_backend.rs      # CPU implementation (SIMD dispatch)
+├── cuda_backend.rs     # CUDA implementation (Driver API)
+├── ops/                # Reference implementations (Pure Rust)
+│   └── mod.rs
+├── cpu_kernels/        # Optimized CPU kernels (faer/SIMD)
+│   └── mod.rs
+└── cuda_kernels/       # CUDA kernel wrappers & CUBIN loader
+    ├── mod.rs
+    └── kernels/        # *.cubin files (Git tracked, sm_80/86/89/90)
 ```
 
-## 编译 Kernels
+## Common Commands
 
 ```bash
-# CUDA PTX（需要 CUDA Toolkit）
-./scripts/compile_cuda_kernels.sh
-
-# ROCm HSACO（需要 ROCm）
-./scripts/compile_hip_kernels.sh
-
-# Metal metallib（需要 Xcode）
-./scripts/compile_metal_kernels.sh
+cargo check
+cargo test
+# Benchmarks will be added later
 ```
-
-## 常用命令
-
-```bash
-cargo check                    # 语法检查
-cargo test                     # 运行测试
-cargo test --test integration  # 集成测试
-cargo bench                    # 性能基准
-```
-
----
-
-## 开发经验教训（🚨 常见陷阱）
-
-### WGPU API 版本兼容性
-
-**问题**：wgpu 版本更新导致 API 变化
-
-| 错误 | 原因 | 修复 |
-|------|------|------|
-| `wgpu::Maintain::Wait` 未定义 | wgpu 0.19+ API 变更 | 改为 `wgpu::PollType::Wait` |
-| `request_adapter` 返回 Option | wgpu 0.20+ 返回 Result | 使用 `.map_err()` 而非 `.ok_or()` |
-| `DeviceDescriptor` 缺少字段 | wgpu 0.20+ 新增 `trace` 字段 | 添加 `trace: wgpu::Trace::Off` |
-
-**预防**：升级 wgpu 版本时必须检查 CHANGELOG，特别关注 Breaking Changes。
-
-### HSA Runtime Rust 生命周期
-
-**问题**：ROCm HSA kernel 初始化时的 borrow checker 错误
-
-```rust
-// ❌ 错误：agent 被移动后又被借用
-let agent = agents.into_iter().next().unwrap();
-let module = HsaKernelModule::from_hsaco(&agent, ...); // 借用 agent
-Ok(Self {
-    agent,  // 移动 agent - 错误！
-    module,
-})
-
-// ✅ 正确：先计算所有需要借用的值，再移动
-let agent = agents.into_iter().next().unwrap();
-let module = HsaKernelModule::from_hsaco(&agent, ...);
-let queue = create_queue(&agent, ...);  // 所有借用在这里完成
-// 现在安全移动
-Ok(Self { agent, queue, module })
-```
-
-**规则**：结构体包含 `agent` 和从 `agent` 派生的字段时，所有派生操作必须在 `agent` 移动到结构体之前完成。
-
-### kernel_name 生命周期
-
-**问题**：`&str.leak()` 无效，`&'static str` 要求
-
-```rust
-// ❌ 错误：leak() 不能用于 &str
-fn from_hsaco(kernel_name: &str) {
-    let name = kernel_name.leak();  // 编译错误
-}
-
-// ✅ 正确：直接使用 &'static str
-const KERNEL_NAME: &str = "flash_attention_f32";
-
-fn from_hsaco(kernel_name: &'static str) {
-    // 直接使用，无需 leak
-}
-```
-
-**规则**：HSA kernel 名称必须是 `&'static str`（编译时常量），不能是运行时创建的字符串。
-
-### Fat Binary 占位文件
-
-**问题**：`include_bytes!` 引用的文件必须存在
-
-**解决**：为尚未编译的 kernel 创建最小有效占位文件：
-
-```bash
-# PTX 占位（最小有效 PTX）
-echo '.version 7.0
-.target sm_80
-.address_size 64' > kernel.ptx
-
-# HSACO 占位（最小 ELF header）
-echo -ne '\x7fELF...' > kernel.hsaco
-
-# metallib 占位（Apple metallib magic）
-echo -ne 'MTLB...' > kernel.metallib
-```
-
-### 类型一致性
-
-**问题**：`usize` vs `u32` 混用
-
-```rust
-// ❌ 错误
-let count: u32 = config.max_candidates;  // max_candidates 是 usize
-
-// ✅ 正确
-let count = config.max_candidates;  // 保持 usize
-// 或显式转换
-let count: u32 = config.max_candidates as u32;
-```
-
-**规则**：配置结构体的数值类型应该统一，避免隐式转换。
-
-### 删除 Burn，统一到 Backend + ops（ADR-001 🚨 铁律）
-
-**问题**：Burn Tensor 效率低，ops/ 论文算法无法直接走多后端
-
-**🚨 重要**：ops/ 包含论文优化算法（EAGLE-3、Medusa、FlashAttention），**必须保留并作为 CPU 参考实现**！
-
-**决策**：保留 ops/ 论文算法作为 CPU 参考实现，由各 Backend 直接调用；去除 Burn 依赖
-
-```
-保留（CPU 参考实现，Backend 直接调用）：
-📦 ops/eagle3.rs (NeurIPS'25)
-📦 ops/medusa.rs (ICML'24)
-📦 ops/flash_attention.rs         （分层块+MaskCache）
-📦 ops/softmax.rs                 （Log-space+Kahan）
-📦 ops/paged_attention.rs         （多级层级+CoW）
-
-保留（已是纯 Rust，无需迁移）：
-✅ ops/engram*.rs, embedding.rs, stable_accumulator.rs
-```
-
-**迁移模式**：`Tensor<B, D>` → `&[T]` 原始切片（保留算法逻辑）
-
-**唯一 API**：`Backend` + `backend::auto_select_backend()`（原始切片 `&[T]` + GPU 加速 + 论文算法）
-
-**零成本要求**：
-- `#[inline(always)]` 强制内联
-- 原始切片，无 Tensor 抽象
-- 启动时选择后端一次（允许一次 vtable）
-- `T::TYPE_ID` const 分支消除
-
-### 统一泛型算子 API（ARCH-API-001）
-
-> 详见顶部「零成本抽象铁律」章节。
-
-**核心要点**：
-- 纯泛型 `<T: Float>`，编译时单态化
-- `T::TYPE_ID` 是 const，分支被编译器消除
-- 最终代码：`flash_attention::<f32>()` 直接调用 f32 kernel，零开销

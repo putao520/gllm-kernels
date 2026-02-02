@@ -1,101 +1,34 @@
 [package]
 name = "gllm-kernels"
-version = "0.2.0"
+version = "0.3.0"
 edition = "2021"
+description = "High-performance GPU/CPU inference kernels for LLMs"
 authors = ["gllm contributors"]
 license = "Apache-2.0"
-description = "Low-level attention kernels with runtime backend selection (CUDA/ROCm/Metal/CPU)"
-repository = "https://github.com/putao520/gllm-kernels"
-homepage = "https://github.com/putao520/gllm-kernels"
-keywords = ["attention", "kernels", "llm", "gpu", "inference"]
-categories = ["algorithms", "science"]
-
-[lib]
-name = "gllm_kernels"
-path = "src/lib.rs"
 
 [features]
-# 默认：Fat Binary 架构，基于 OS 平台自动选择后端（ARCH-ADR-002）
-# 用户无需（也禁止）手动选择 cuda/rocm/metal feature
 default = []
-
-# 所有自定义 kernel
-all-kernels = []
-
-# NCCL 多 GPU（需要 CUDA 环境）
-nccl = ["cudarc/nccl"]
-
-# RCCL 多 GPU（需要 ROCm 环境）
-rccl = []
-
-# Flash Attention v3 优化（Hopper+）
-flash-attention-v3 = [
-    "flash-attention-v3-wgmma",
-    "flash-attention-v3-async",
-    "flash-attention-v3-fp8",
-    "flash-attention-v3-block-quant",
-]
-flash-attention-v3-wgmma = []
-flash-attention-v3-async = []
-flash-attention-v3-fp8 = []
-flash-attention-v3-block-quant = []
-
-# 精简版（仅 CPU，用于测试/CI）
-minimal = []
-
-# Fat Binary 预编译内核（嵌入 ~10MB）
-embedded-kernels = []
-
-# 运行时下载内核（首次使用时从 GitHub Release 下载）
-download-kernels = []
-
-# Kernel-specific features (内部使用，不暴露给用户)
-cuda-kernel = []
-rocm-kernel = []
-metal-kernel = []
-fused-kernel = []
-paged-kernel = []
-softmax-kernel = []
+# Placeholder for future NCCL support (multi-GPU communication)
+nccl = []
 
 [dependencies]
-# ADR-001: Burn 依赖已移除，统一使用 Backend trait + 原始切片 API
+# --- Core Compute ---
+# GPU: Safe wrapper for CUDA Driver API (no runtime/nvrtc)
+cudarc = { version = "0.18", default-features = false, features = ["driver", "dynamic-loading", "cuda-12060"] }
 
-# CUDA 支持（动态加载，运行时检测）
-cudarc = { version = "0.18", default-features = false, features = ["std", "driver", "nvrtc", "f16", "cuda-12090", "dynamic-loading"] }
+# CPU: Pure Rust SIMD Linear Algebra (AVX2/AVX-512/NEON)
+faer = "0.21"
 
-# 通用依赖
+# Data Types
+half = { version = "2.3", features = ["bytemuck", "num-traits", "serde"] }
+bytemuck = { version = "1.14", features = ["derive", "min_const_generics"] }
+
+# --- Utilities ---
+thiserror = "1.0"
 log = "0.4"
-crossbeam-channel = "0.5"
-serde = { version = "1", features = ["derive"] }
-serde_json = "1"
-half = "2.7"
-libloading = "0.8"  # 动态加载 HIP/ROCm 库
-memmap2 = "0.9"     # Engram: memory-mapped embedding tables
-bytemuck = { version = "1.24.0", features = ["derive"] }
-dirs = "5.0"        # Fat Binary: cache directory for downloaded kernels
-
-# 平台特定（条件编译，非 feature flag）
-[target.'cfg(target_os = "macos")'.dependencies]
-metal = { version = "0.29" }
-objc = { version = "0.2" }
+rayon = "1.8"       # CPU parallelization
+once_cell = "1.19"  # Global singleton
 
 [dev-dependencies]
 criterion = "0.5"
-
-[[bench]]
-name = "attention_bench"
-harness = false
-
-# GPU/CPU comparison tests (REQ-VERIFY-001)
-[[test]]
-name = "flash_attention_comparison"
-path = "tests/gpu_cpu_comparison/flash_attention.rs"
-
-[[test]]
-name = "paged_attention_comparison"
-path = "tests/gpu_cpu_comparison/paged_attention.rs"
-
-# Numerical stability tests (REQ-VERIFY-002)
-[[test]]
-name = "log_softmax_stability"
-path = "tests/numerical/log_softmax_stability.rs"
+tokio = { version = "1.36", features = ["full"] }

@@ -1,30 +1,1492 @@
-use crate::backend_trait::Backend;
-use crate::kernel_types::{
-    FlashAttentionConfig,
-    // L2 Block-level configs
-    AttentionBlockConfig, FFNBlockConfig, EmbeddingConfig, LMHeadConfig,
-    KVCacheUpdateConfig, MeanPoolingConfig, ClsPoolingConfig, NormalizeConfig,
-    DequantizeConfig, EngramFuseConfig, QuantFormat, Activation,
-    // L3 High-level inference configs (ARCH-ADR-003)
-    TransformerLayerWeights, MoETransformerLayerWeights, KVCacheState,
-    GeneratorForwardConfig, MoEGeneratorForwardConfig, EmbeddingForwardConfig,
-    RerankForwardConfig, PoolingType,
-    // GPU-pure weights (ARCH-GPU-001 / ARCH-ADR-010)
-    EmbeddingModelWeightsGpu, TransformerLayerWeightsGpu,
-    RerankerModelWeightsGpu, GeneratorModelWeightsGpu, KVCacheGpu,
-    TransformerLayerConfigGpu,
-};
-use crate::gpu_types::{GpuBuffer, GpuTensor, TensorDtype};
-use crate::ops::sampling::SamplingConfig;
-use crate::runtime_detection::BackendType;
-use std::sync::Arc;
+use std::sync::Mutex;
+use std::time::{SystemTime, UNIX_EPOCH};
+use std::fmt;
 
-#[derive(Clone, Copy)]
-pub struct CpuBackend {}
+use cudarc::driver::DeviceRepr;
+
+use crate::backend_trait::{
+    AttentionTopology, Backend, BackendError, BackendResult, KvCacheHandle, LogitsTensor,
+    TensorLookup,
+};
+use crate::cpu_kernels;
+use crate::kernel_types::{
+    alibi_slopes, GeneratorForwardConfig, KvCacheConfig, PositionEncoding, SamplingConfig,
+};
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct WorkspaceConfig {
+    max_seq_len: usize,
+    hidden_size: usize,
+    num_heads: usize,
+    num_kv_heads: usize,
+    head_dim: usize,
+    ffn_dim: usize,
+    vocab_size: usize,
+    position_encoding: PositionEncoding,
+    rope_theta: f32,
+    rope_scale: f32,
+    rope_interleaved: bool,
+    rope_precompute: bool,
+}
+
+struct CpuWorkspace {
+    config: WorkspaceConfig,
+    token_ids: Vec<u32>,
+    positions: Vec<i32>,
+    hidden: Vec<f32>,
+    norm: Vec<f32>,
+    qkv: Vec<f32>,
+    attn_out: Vec<f32>,
+    ffn_gate: Vec<f32>,
+    ffn_up: Vec<f32>,
+    ffn_act: Vec<f32>,
+    ffn_out: Vec<f32>,
+    last_hidden: Vec<f32>,
+    rope_cache: Option<cpu_kernels::RopeCache>,
+    alibi_slopes: Option<Vec<f32>>,
+}
+
+impl CpuWorkspace {
+    fn allocate(config: WorkspaceConfig) -> BackendResult<Self> {
+        let hidden_len = config
+            .max_seq_len
+            .checked_mul(config.hidden_size)
+            .ok_or_else(|| BackendError::InvalidConfig("hidden buffer size overflow".into()))?;
+        let qkv_stride = config
+            .num_heads
+            .checked_mul(config.head_dim)
+            .and_then(|q| q.checked_add(2 * config.num_kv_heads * config.head_dim))
+            .ok_or_else(|| BackendError::InvalidConfig("qkv stride overflow".into()))?;
+        let qkv_len = config
+            .max_seq_len
+            .checked_mul(qkv_stride)
+            .ok_or_else(|| BackendError::InvalidConfig("qkv buffer size overflow".into()))?;
+        let ffn_len = config
+            .max_seq_len
+            .checked_mul(config.ffn_dim)
+            .ok_or_else(|| BackendError::InvalidConfig("ffn buffer size overflow".into()))?;
+        let rope_cache =
+            if config.position_encoding == PositionEncoding::Rope && config.rope_precompute {
+                Some(cpu_kernels::RopeCache::new(
+                    config.max_seq_len,
+                    config.head_dim,
+                    config.rope_theta,
+                    config.rope_scale,
+                ))
+            } else {
+                None
+            };
+        let alibi_slopes = if config.position_encoding == PositionEncoding::Alibi {
+            Some(alibi_slopes(config.num_heads))
+        } else {
+            None
+        };
+
+        Ok(Self {
+            config,
+            token_ids: vec![0u32; config.max_seq_len],
+            positions: vec![0i32; config.max_seq_len],
+            hidden: vec![0f32; hidden_len],
+            norm: vec![0f32; hidden_len],
+            qkv: vec![0f32; qkv_len],
+            attn_out: vec![0f32; hidden_len],
+            ffn_gate: vec![0f32; ffn_len],
+            ffn_up: vec![0f32; ffn_len],
+            ffn_act: vec![0f32; ffn_len],
+            ffn_out: vec![0f32; hidden_len],
+            last_hidden: vec![0f32; config.hidden_size],
+            rope_cache,
+            alibi_slopes,
+        })
+    }
+}
+
+struct KvCacheEntry {
+    storage: KvCacheStorage,
+    config: KvCacheConfig,
+    used: usize,
+}
+
+enum KvCacheStorage {
+    Contiguous(Vec<f32>),
+    Paged {
+        pages: Vec<Vec<f32>>,
+        page_size: usize,
+        pages_per_layer: usize,
+    },
+}
+
+impl KvCacheEntry {
+    fn is_paged(&self) -> bool {
+        matches!(self.storage, KvCacheStorage::Paged { .. })
+    }
+
+    fn page_size(&self) -> usize {
+        match self.storage {
+            KvCacheStorage::Paged { page_size, .. } => page_size,
+            KvCacheStorage::Contiguous(_) => self.config.max_seq_len,
+        }
+    }
+
+    fn pages_per_layer(&self) -> usize {
+        match self.storage {
+            KvCacheStorage::Paged {
+                pages_per_layer, ..
+            } => pages_per_layer,
+            KvCacheStorage::Contiguous(_) => 1,
+        }
+    }
+}
+
+enum QkvLayerPlan {
+    Direct {
+        weight: String,
+        bias: Option<String>,
+    },
+    Fused {
+        weight: Vec<f32>,
+        bias: Option<Vec<f32>>,
+    },
+}
+
+struct QkvPlan {
+    layers: Vec<QkvLayerPlan>,
+}
+
+const EMBEDDING_WEIGHT_NAMES: &[&str] = &[
+    "model.embed_tokens.weight",
+    "tok_embeddings.weight",
+    "transformer.wte.weight",
+    "model.tok_embeddings.weight",
+    "embeddings.word_embeddings.weight",
+    "model.embeddings.word_embeddings.weight",
+];
+
+const FINAL_NORM_NAMES: &[&str] = &[
+    "model.norm.weight",
+    "transformer.ln_f.weight",
+    "norm.weight",
+    "model.final_layernorm.weight",
+    "encoder.layer_norm.weight",
+];
+
+const LM_HEAD_NAMES: &[&str] = &[
+    "lm_head.weight",
+    "model.lm_head.weight",
+    "embed_out.weight",
+    "model.embed_out.weight",
+    "transformer.lm_head.weight",
+];
+
+const SCORE_HEAD_NAMES: &[&str] = &[
+    "score.weight",
+    "model.score.weight",
+    "classifier.weight",
+    "model.classifier.weight",
+    "rerank_head.weight",
+    "ranker.weight",
+];
+
+const ATTN_NORM_PATTERNS: &[&str] = &[
+    "model.layers.{layer}.input_layernorm.weight",
+    "model.layers.{layer}.attention_norm.weight",
+    "model.layers.{layer}.attn_norm.weight",
+    "transformer.h.{layer}.ln_1.weight",
+    "model.layers.{layer}.ln1.weight",
+    "layers.{layer}.input_layernorm.weight",
+];
+
+const FFN_NORM_PATTERNS: &[&str] = &[
+    "model.layers.{layer}.post_attention_layernorm.weight",
+    "model.layers.{layer}.ffn_norm.weight",
+    "model.layers.{layer}.mlp_norm.weight",
+    "transformer.h.{layer}.ln_2.weight",
+    "model.layers.{layer}.ln2.weight",
+    "layers.{layer}.post_attention_layernorm.weight",
+];
+
+const Q_PROJ_PATTERNS: &[&str] = &[
+    "model.layers.{layer}.self_attn.q_proj.weight",
+    "model.layers.{layer}.attention.q_proj.weight",
+    "transformer.h.{layer}.attn.q_proj.weight",
+    "layers.{layer}.self_attn.q_proj.weight",
+];
+
+const K_PROJ_PATTERNS: &[&str] = &[
+    "model.layers.{layer}.self_attn.k_proj.weight",
+    "model.layers.{layer}.attention.k_proj.weight",
+    "transformer.h.{layer}.attn.k_proj.weight",
+    "layers.{layer}.self_attn.k_proj.weight",
+];
+
+const V_PROJ_PATTERNS: &[&str] = &[
+    "model.layers.{layer}.self_attn.v_proj.weight",
+    "model.layers.{layer}.attention.v_proj.weight",
+    "transformer.h.{layer}.attn.v_proj.weight",
+    "layers.{layer}.self_attn.v_proj.weight",
+];
+
+const O_PROJ_PATTERNS: &[&str] = &[
+    "model.layers.{layer}.self_attn.o_proj.weight",
+    "model.layers.{layer}.self_attn.out_proj.weight",
+    "model.layers.{layer}.attention.o_proj.weight",
+    "transformer.h.{layer}.attn.c_proj.weight",
+    "transformer.h.{layer}.attn.out_proj.weight",
+];
+
+const GATE_PROJ_PATTERNS: &[&str] = &[
+    "model.layers.{layer}.mlp.gate_proj.weight",
+    "model.layers.{layer}.mlp.w1.weight",
+    "model.layers.{layer}.mlp.gate.weight",
+    "transformer.h.{layer}.mlp.gate_proj.weight",
+];
+
+const UP_PROJ_PATTERNS: &[&str] = &[
+    "model.layers.{layer}.mlp.up_proj.weight",
+    "model.layers.{layer}.mlp.w3.weight",
+    "model.layers.{layer}.mlp.up.weight",
+    "transformer.h.{layer}.mlp.up_proj.weight",
+];
+
+const DOWN_PROJ_PATTERNS: &[&str] = &[
+    "model.layers.{layer}.mlp.down_proj.weight",
+    "model.layers.{layer}.mlp.w2.weight",
+    "model.layers.{layer}.mlp.down.weight",
+    "transformer.h.{layer}.mlp.c_proj.weight",
+];
+
+const QKV_FUSED_PATTERNS: &[&str] = &[
+    "model.layers.{layer}.self_attn.qkv_proj.weight",
+    "model.layers.{layer}.self_attn.W_pack.weight",
+    "model.layers.{layer}.self_attn.qkv.weight",
+    "model.layers.{layer}.self_attn.in_proj_weight",
+    "transformer.h.{layer}.attn.c_attn.weight",
+];
+
+const FAST_PATH_MAX_LAYERS: usize = 8;
+const FAST_PATH_MAX_HIDDEN: usize = 2048;
+const FAST_PATH_MAX_FFN: usize = 8192;
+
+fn layer_candidates(patterns: &[&str], layer: usize) -> Vec<String> {
+    let layer = layer.to_string();
+    patterns
+        .iter()
+        .map(|pattern| pattern.replace("{layer}", &layer))
+        .collect()
+}
+
+fn embedding_candidates() -> Vec<String> {
+    EMBEDDING_WEIGHT_NAMES
+        .iter()
+        .map(|name| (*name).to_string())
+        .collect()
+}
+
+fn final_norm_candidates() -> Vec<String> {
+    FINAL_NORM_NAMES
+        .iter()
+        .map(|name| (*name).to_string())
+        .collect()
+}
+
+fn lm_head_candidates() -> Vec<String> {
+    LM_HEAD_NAMES
+        .iter()
+        .map(|name| (*name).to_string())
+        .collect()
+}
+
+fn score_head_candidates() -> Vec<String> {
+    SCORE_HEAD_NAMES
+        .iter()
+        .map(|name| (*name).to_string())
+        .collect()
+}
+
+fn find_tensor_name(
+    weights: &dyn TensorLookup<CpuBackend>,
+    candidates: &[String],
+) -> Option<String> {
+    for name in candidates {
+        if weights.tensor_f32(name).is_some() {
+            return Some(name.clone());
+        }
+    }
+    None
+}
+
+fn bias_candidates(weight_name: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    if weight_name.ends_with("in_proj_weight") {
+        out.push(weight_name.replace("in_proj_weight", "in_proj_bias"));
+    }
+    if weight_name.ends_with(".weight") {
+        out.push(weight_name.replace(".weight", ".bias"));
+    } else if weight_name.ends_with("weight") {
+        out.push(weight_name.replacen("weight", "bias", 1));
+    }
+    out
+}
+
+pub struct CpuBackend {
+    kv_caches: Mutex<Vec<KvCacheEntry>>,
+    workspace: Mutex<Option<CpuWorkspace>>,
+    qkv_plan: Mutex<Option<QkvPlan>>,
+    logits: Mutex<Vec<Vec<f32>>>,
+    rng_state: Mutex<u64>,
+}
+
+impl fmt::Debug for CpuBackend {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("CpuBackend")
+            .finish()
+    }
+}
 
 impl CpuBackend {
     pub fn new() -> Self {
-        Self {}
+        let seed = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|v| v.as_nanos() as u64)
+            .unwrap_or(0x1234_5678_9abc_def0);
+        Self {
+            kv_caches: Mutex::new(Vec::new()),
+            workspace: Mutex::new(None),
+            qkv_plan: Mutex::new(None),
+            logits: Mutex::new(Vec::new()),
+            rng_state: Mutex::new(seed.max(1)),
+        }
+    }
+
+    pub fn int8_mm(
+        &self,
+        input: &[f32],
+        weight: &[i8],
+        scale: f32,
+        output: &mut [f32],
+        m: usize,
+        n: usize,
+        k: usize,
+    ) -> BackendResult<()> {
+        cpu_kernels::matmul_int8(input, weight, scale, output, m, n, k)
+    }
+
+    pub fn int4_mm(
+        &self,
+        input: &[f32],
+        weight_packed: &[u8],
+        scale: f32,
+        output: &mut [f32],
+        m: usize,
+        n: usize,
+        k: usize,
+    ) -> BackendResult<()> {
+        cpu_kernels::matmul_int4(input, weight_packed, scale, output, m, n, k)
+    }
+
+    pub fn int2_mm(
+        &self,
+        input: &[f32],
+        weight_packed: &[u8],
+        scale: f32,
+        output: &mut [f32],
+        m: usize,
+        n: usize,
+        k: usize,
+    ) -> BackendResult<()> {
+        cpu_kernels::matmul_int2(input, weight_packed, scale, output, m, n, k)
+    }
+
+    pub fn int1_mm(
+        &self,
+        input: &[f32],
+        weight_packed: &[u8],
+        scale: f32,
+        output: &mut [f32],
+        m: usize,
+        n: usize,
+        k: usize,
+    ) -> BackendResult<()> {
+        cpu_kernels::matmul_int1(input, weight_packed, scale, output, m, n, k)
+    }
+
+    fn hidden_size(config: &GeneratorForwardConfig) -> BackendResult<usize> {
+        let hidden = config
+            .num_heads
+            .checked_mul(config.head_dim)
+            .ok_or_else(|| BackendError::InvalidConfig("hidden size overflow".into()))?;
+        Ok(hidden)
+    }
+
+    fn resolve_weight_name(
+        weights: &dyn TensorLookup<Self>,
+        candidates: &[String],
+    ) -> BackendResult<String> {
+        for name in candidates {
+            if weights.tensor_f32(name).is_some() {
+                return Ok(name.clone());
+            }
+        }
+        Err(BackendError::MissingTensor(candidates.join(", ")))
+    }
+
+    fn resolve_weight<'a>(
+        weights: &'a dyn TensorLookup<Self>,
+        name: &str,
+    ) -> BackendResult<&'a Vec<f32>> {
+        weights
+            .tensor_f32(name)
+            .ok_or_else(|| BackendError::MissingTensor(name.to_string()))
+    }
+
+    fn resolve_bias<'a>(
+        weights: &'a dyn TensorLookup<Self>,
+        weight_name: &str,
+    ) -> Option<&'a Vec<f32>> {
+        for candidate in bias_candidates(weight_name) {
+            if let Some(bias) = weights.tensor_f32(&candidate) {
+                return Some(bias);
+            }
+        }
+        None
+    }
+
+    fn resolve_weight_and_bias<'a>(
+        weights: &'a dyn TensorLookup<Self>,
+        candidates: &[String],
+    ) -> BackendResult<(&'a Vec<f32>, Option<&'a Vec<f32>>)> {
+        let name = Self::resolve_weight_name(weights, candidates)?;
+        let weight = Self::resolve_weight(weights, &name)?;
+        let bias = Self::resolve_bias(weights, &name);
+        Ok((weight, bias))
+    }
+
+    fn resolve_shape(
+        weights: &dyn TensorLookup<Self>,
+        candidates: &[String],
+    ) -> BackendResult<Vec<usize>> {
+        let name = Self::resolve_weight_name(weights, candidates)?;
+        let shape = weights
+            .tensor_shape(&name)
+            .ok_or_else(|| BackendError::MissingTensor(name.clone()))?;
+        Ok(shape.to_vec())
+    }
+
+    fn deduce_out_dim(shape: &[usize], in_dim: usize) -> BackendResult<usize> {
+        if shape.len() != 2 {
+            return Err(BackendError::InvalidConfig(format!(
+                "expected 2D weight shape, got {shape:?}"
+            )));
+        }
+        if shape[1] == in_dim {
+            Ok(shape[0])
+        } else if shape[0] == in_dim {
+            Ok(shape[1])
+        } else {
+            Err(BackendError::InvalidConfig(format!(
+                "weight shape {shape:?} not compatible with input dim {in_dim}"
+            )))
+        }
+    }
+
+    fn ensure_workspace(
+        &self,
+        weights: &dyn TensorLookup<Self>,
+        config: &GeneratorForwardConfig,
+    ) -> BackendResult<()> {
+        let mut workspace = self.workspace.lock().expect("workspace lock poisoned");
+        if let Some(existing) = workspace.as_ref() {
+            if existing.config.max_seq_len != config.max_seq_len
+                || existing.config.hidden_size != Self::hidden_size(config)?
+                || existing.config.num_heads != config.num_heads
+                || existing.config.num_kv_heads != config.num_kv_heads
+                || existing.config.head_dim != config.head_dim
+                || existing.config.vocab_size != config.vocab_size
+                || existing.config.position_encoding != config.position_encoding
+                || existing.config.rope_theta != config.rope_theta
+                || existing.config.rope_scale != config.rope_scale
+                || existing.config.rope_interleaved != config.rope_interleaved
+                || existing.config.rope_precompute != config.rope_precompute
+            {
+                return Err(BackendError::InvalidConfig(
+                    "workspace config mismatch".into(),
+                ));
+            }
+            return Ok(());
+        }
+
+        let hidden_size = Self::hidden_size(config)?;
+        let ffn_shape = Self::resolve_shape(weights, &layer_candidates(GATE_PROJ_PATTERNS, 0))?;
+        let ffn_dim = Self::deduce_out_dim(&ffn_shape, hidden_size)?;
+        let ws_config = WorkspaceConfig {
+            max_seq_len: config.max_seq_len,
+            hidden_size,
+            num_heads: config.num_heads,
+            num_kv_heads: config.num_kv_heads,
+            head_dim: config.head_dim,
+            ffn_dim,
+            vocab_size: config.vocab_size,
+            position_encoding: config.position_encoding,
+            rope_theta: config.rope_theta,
+            rope_scale: config.rope_scale,
+            rope_interleaved: config.rope_interleaved,
+            rope_precompute: config.rope_precompute,
+        };
+        *workspace = Some(CpuWorkspace::allocate(ws_config)?);
+        Ok(())
+    }
+
+    fn ensure_qkv_plan(
+        &self,
+        weights: &dyn TensorLookup<Self>,
+        config: &GeneratorForwardConfig,
+        hidden_size: usize,
+    ) -> BackendResult<()> {
+        let mut plan_guard = self.qkv_plan.lock().expect("qkv plan lock poisoned");
+        if plan_guard.is_some() {
+            return Ok(());
+        }
+        let mut layers = Vec::with_capacity(config.num_layers);
+        for layer in 0..config.num_layers {
+            let fused_candidates = layer_candidates(QKV_FUSED_PATTERNS, layer);
+            if let Some(fused_name) = find_tensor_name(weights, &fused_candidates) {
+                let bias = bias_candidates(&fused_name)
+                    .into_iter()
+                    .find(|name| weights.tensor_f32(name).is_some());
+                layers.push(QkvLayerPlan::Direct {
+                    weight: fused_name,
+                    bias,
+                });
+                continue;
+            }
+
+            let q_name =
+                Self::resolve_weight_name(weights, &layer_candidates(Q_PROJ_PATTERNS, layer))?;
+            let k_name =
+                Self::resolve_weight_name(weights, &layer_candidates(K_PROJ_PATTERNS, layer))?;
+            let v_name =
+                Self::resolve_weight_name(weights, &layer_candidates(V_PROJ_PATTERNS, layer))?;
+
+            let q_weight = Self::resolve_weight(weights, &q_name)?;
+            let k_weight = Self::resolve_weight(weights, &k_name)?;
+            let v_weight = Self::resolve_weight(weights, &v_name)?;
+
+            let q_shape = weights
+                .tensor_shape(&q_name)
+                .ok_or_else(|| BackendError::MissingTensor(q_name.clone()))?;
+            let k_shape = weights
+                .tensor_shape(&k_name)
+                .ok_or_else(|| BackendError::MissingTensor(k_name.clone()))?;
+            let v_shape = weights
+                .tensor_shape(&v_name)
+                .ok_or_else(|| BackendError::MissingTensor(v_name.clone()))?;
+
+            let q_out = Self::deduce_out_dim(q_shape, hidden_size)?;
+            let k_out = Self::deduce_out_dim(k_shape, hidden_size)?;
+            let v_out = Self::deduce_out_dim(v_shape, hidden_size)?;
+
+            let expected_kv = config.num_kv_heads * config.head_dim;
+            if q_out != hidden_size || k_out != expected_kv || v_out != expected_kv {
+                return Err(BackendError::InvalidConfig(
+                    "qkv projection dims mismatch".into(),
+                ));
+            }
+
+            let fused_out = q_out + k_out + v_out;
+            let fused_len = fused_out
+                .checked_mul(hidden_size)
+                .ok_or_else(|| BackendError::InvalidConfig("fused qkv size overflow".into()))?;
+            let mut fused = vec![0f32; fused_len];
+
+            let q_len = q_out * hidden_size;
+            let k_len = k_out * hidden_size;
+            let v_len = v_out * hidden_size;
+            if q_weight.len() < q_len || k_weight.len() < k_len || v_weight.len() < v_len {
+                return Err(BackendError::InvalidConfig(
+                    "qkv weight size mismatch".into(),
+                ));
+            }
+            fused[..q_len].copy_from_slice(&q_weight[..q_len]);
+            fused[q_len..q_len + k_len].copy_from_slice(&k_weight[..k_len]);
+            fused[q_len + k_len..q_len + k_len + v_len].copy_from_slice(&v_weight[..v_len]);
+
+            let bias_present = Self::resolve_bias(weights, &q_name)
+                .or_else(|| Self::resolve_bias(weights, &k_name))
+                .or_else(|| Self::resolve_bias(weights, &v_name))
+                .is_some();
+
+            let fused_bias = if bias_present {
+                let mut bias_buf = vec![0f32; fused_out];
+                if let Some(q_bias) = Self::resolve_bias(weights, &q_name) {
+                    if q_bias.len() < q_out {
+                        return Err(BackendError::InvalidConfig("q bias size mismatch".into()));
+                    }
+                    bias_buf[..q_out].copy_from_slice(&q_bias[..q_out]);
+                }
+                if let Some(k_bias) = Self::resolve_bias(weights, &k_name) {
+                    if k_bias.len() < k_out {
+                        return Err(BackendError::InvalidConfig("k bias size mismatch".into()));
+                    }
+                    bias_buf[q_out..q_out + k_out].copy_from_slice(&k_bias[..k_out]);
+                }
+                if let Some(v_bias) = Self::resolve_bias(weights, &v_name) {
+                    if v_bias.len() < v_out {
+                        return Err(BackendError::InvalidConfig("v bias size mismatch".into()));
+                    }
+                    bias_buf[q_out + k_out..q_out + k_out + v_out]
+                        .copy_from_slice(&v_bias[..v_out]);
+                }
+                Some(bias_buf)
+            } else {
+                None
+            };
+
+            layers.push(QkvLayerPlan::Fused {
+                weight: fused,
+                bias: fused_bias,
+            });
+        }
+        *plan_guard = Some(QkvPlan { layers });
+        Ok(())
+    }
+
+    fn use_fast_path(
+        &self,
+        weights: &dyn TensorLookup<Self>,
+        config: &GeneratorForwardConfig,
+        seq_len: usize,
+    ) -> BackendResult<bool> {
+        if seq_len != 1 {
+            return Ok(false);
+        }
+        let hidden_size = Self::hidden_size(config)?;
+        let ffn_shape = Self::resolve_shape(weights, &layer_candidates(GATE_PROJ_PATTERNS, 0))?;
+        let ffn_dim = Self::deduce_out_dim(&ffn_shape, hidden_size)?;
+        Ok(config.num_layers <= FAST_PATH_MAX_LAYERS
+            && hidden_size <= FAST_PATH_MAX_HIDDEN
+            && ffn_dim <= FAST_PATH_MAX_FFN)
+    }
+
+    fn forward_hidden_fast(
+        &self,
+        tokens: &[u32],
+        topology: &AttentionTopology,
+        weights: &dyn TensorLookup<Self>,
+        mut kv_cache: Option<&mut KvCacheEntry>,
+        config: &GeneratorForwardConfig,
+    ) -> BackendResult<Vec<f32>> {
+        if tokens.is_empty() {
+            return Err(BackendError::InvalidConfig("empty tokens".into()));
+        }
+        if tokens.len() > config.max_seq_len {
+            return Err(BackendError::InvalidConfig(
+                "tokens exceed max_seq_len".into(),
+            ));
+        }
+        if topology.is_tree() {
+            return Err(BackendError::Unimplemented(
+                "cpu backend does not support tree topology",
+            ));
+        }
+
+        let hidden_size = Self::hidden_size(config)?;
+        if config.num_kv_heads == 0 || config.num_heads == 0 || config.head_dim == 0 {
+            return Err(BackendError::InvalidConfig("invalid head config".into()));
+        }
+
+        let ffn_shape = Self::resolve_shape(weights, &layer_candidates(GATE_PROJ_PATTERNS, 0))?;
+        let ffn_dim = Self::deduce_out_dim(&ffn_shape, hidden_size)?;
+        self.ensure_qkv_plan(weights, config, hidden_size)?;
+
+        let seq_len = tokens.len();
+        let mut kv_start = 0usize;
+        if let Some(cache) = kv_cache.as_deref_mut() {
+            if cache.config.num_layers != config.num_layers
+                || cache.config.num_heads != config.num_kv_heads
+                || cache.config.head_dim != config.head_dim
+            {
+                return Err(BackendError::InvalidKvCache(
+                    "kv cache config mismatch".into(),
+                ));
+            }
+            if cache.config.dtype_size != std::mem::size_of::<f32>() {
+                return Err(BackendError::InvalidKvCache(
+                    "cpu kv cache expects f32 dtype".into(),
+                ));
+            }
+            if seq_len > 1 && cache.used != 0 {
+                cache.used = 0;
+            }
+            if seq_len > cache.config.max_seq_len.saturating_sub(cache.used) {
+                return Err(BackendError::InvalidKvCache("kv cache exhausted".into()));
+            }
+            kv_start = cache.used;
+        }
+
+        let mut positions = vec![0i32; seq_len];
+        for i in 0..seq_len {
+            positions[i] = (kv_start + i) as i32;
+        }
+
+        let embed_name = Self::resolve_weight_name(weights, &embedding_candidates())?;
+        let embed_weight = Self::resolve_weight(weights, &embed_name)?;
+        let embed_shape = weights
+            .tensor_shape(&embed_name)
+            .ok_or_else(|| BackendError::MissingTensor(embed_name.clone()))?;
+        if embed_shape.len() != 2 || embed_shape[1] != hidden_size {
+            return Err(BackendError::InvalidConfig(
+                "embedding weight shape mismatch".into(),
+            ));
+        }
+
+        let mut hidden = vec![0f32; seq_len * hidden_size];
+        let mut norm = vec![0f32; seq_len * hidden_size];
+        let mut attn_out = vec![0f32; seq_len * hidden_size];
+        let mut ffn_out = vec![0f32; seq_len * hidden_size];
+
+        let q_out = hidden_size;
+        let kv_out = config.num_kv_heads * config.head_dim;
+        let qkv_stride = q_out + 2 * kv_out;
+        let mut qkv = vec![0f32; seq_len * qkv_stride];
+
+        let mut ffn_gate = vec![0f32; seq_len * ffn_dim];
+        let mut ffn_up = vec![0f32; seq_len * ffn_dim];
+        let mut ffn_act = vec![0f32; seq_len * ffn_dim];
+
+        cpu_kernels::embedding_lookup(
+            tokens,
+            embed_weight,
+            &mut hidden[..seq_len * hidden_size],
+            config.vocab_size,
+            hidden_size,
+        )?;
+
+        let rope_cache = if config.position_encoding == PositionEncoding::Rope
+            && config.rope_precompute
+        {
+            Some(cpu_kernels::RopeCache::new(
+                seq_len,
+                config.head_dim,
+                config.rope_theta,
+                config.rope_scale,
+            ))
+        } else {
+            None
+        };
+        let alibi_slopes = if config.position_encoding == PositionEncoding::Alibi {
+            Some(alibi_slopes(config.num_heads))
+        } else {
+            None
+        };
+
+        let qkv_plan_guard = self.qkv_plan.lock().expect("qkv plan lock poisoned");
+        let qkv_plan = qkv_plan_guard
+            .as_ref()
+            .ok_or_else(|| BackendError::InvalidConfig("qkv plan missing".into()))?;
+
+        let positions_ref = &positions[..seq_len];
+        let rotary_dim = if config.position_encoding == PositionEncoding::Rope {
+            config.head_dim
+        } else {
+            0
+        };
+        let rope_cache_ref = rope_cache.as_ref();
+
+        let q_len = seq_len * q_out;
+        let kv_len = seq_len * kv_out;
+
+        for layer in 0..config.num_layers {
+            let (attn_norm, _) = Self::resolve_weight_and_bias(
+                weights,
+                &layer_candidates(ATTN_NORM_PATTERNS, layer),
+            )?;
+            let (ffn_norm, _) = Self::resolve_weight_and_bias(
+                weights,
+                &layer_candidates(FFN_NORM_PATTERNS, layer),
+            )?;
+
+            cpu_kernels::rms_norm(
+                &hidden[..seq_len * hidden_size],
+                attn_norm,
+                &mut norm[..seq_len * hidden_size],
+                seq_len,
+                hidden_size,
+                1e-5,
+            )?;
+
+            let (qkv_weight, qkv_bias) = match &qkv_plan.layers[layer] {
+                QkvLayerPlan::Direct { weight, bias } => {
+                    let weight = Self::resolve_weight(weights, weight)?;
+                    let bias = bias.as_ref().and_then(|name| weights.tensor_f32(name));
+                    (weight.as_slice(), bias.map(|b| b.as_slice()))
+                }
+                QkvLayerPlan::Fused { weight, bias } => {
+                    (weight.as_slice(), bias.as_ref().map(|b| b.as_slice()))
+                }
+            };
+
+            cpu_kernels::fused_qkv_rope(
+                &norm[..seq_len * hidden_size],
+                qkv_weight,
+                qkv_bias,
+                &mut qkv[..seq_len * qkv_stride],
+                seq_len,
+                hidden_size,
+                config.num_heads,
+                config.num_kv_heads,
+                config.head_dim,
+                rotary_dim,
+                config.rope_theta,
+                config.rope_scale,
+                config.rope_interleaved,
+                rope_cache_ref,
+                positions_ref,
+            )?;
+
+            if let Some(cache) = kv_cache.as_deref_mut() {
+                let qkv_slice = &qkv[..seq_len * qkv_stride];
+                let k_src = &qkv_slice[q_len..q_len + kv_len];
+                let v_src = &qkv_slice[q_len + kv_len..q_len + 2 * kv_len];
+
+                if cache.is_paged() {
+                    let page_size = cache.page_size();
+                    let pages_per_layer = cache.pages_per_layer();
+                    let page_len = page_size * kv_out * 2;
+                    let KvCacheStorage::Paged { pages, .. } = &mut cache.storage else {
+                        return Err(BackendError::InvalidKvCache(
+                            "expected paged kv cache".into(),
+                        ));
+                    };
+                    if pages.len() < config.num_layers * pages_per_layer {
+                        return Err(BackendError::InvalidKvCache(
+                            "paged kv cache size mismatch".into(),
+                        ));
+                    }
+
+                    let mut remaining = seq_len;
+                    let mut src_token = 0usize;
+                    let mut global = kv_start;
+                    while remaining > 0 {
+                        let page = global / page_size;
+                        let offset = global - page * page_size;
+                        let take = remaining.min(page_size - offset);
+                        let page_index = layer * pages_per_layer + page;
+                        let page_buf = pages
+                            .get_mut(page_index)
+                            .ok_or_else(|| BackendError::InvalidKvCache("page index".into()))?;
+                        if page_buf.len() != page_len {
+                            return Err(BackendError::InvalidKvCache(
+                                "paged kv cache page size mismatch".into(),
+                            ));
+                        }
+
+                        let src_offset = src_token * kv_out;
+                        let src_len = take * kv_out;
+                        let k_dst = offset * kv_out;
+                        let v_dst = page_size * kv_out + offset * kv_out;
+                        page_buf[k_dst..k_dst + src_len]
+                            .copy_from_slice(&k_src[src_offset..src_offset + src_len]);
+                        page_buf[v_dst..v_dst + src_len]
+                            .copy_from_slice(&v_src[src_offset..src_offset + src_len]);
+
+                        remaining -= take;
+                        src_token += take;
+                        global += take;
+                    }
+
+                    let kv_seq_len = kv_start + seq_len;
+                    let q_view = &qkv[..q_len];
+                    let layer_start = layer * pages_per_layer;
+                    let layer_end = layer_start + pages_per_layer;
+                    let layer_pages = &pages[layer_start..layer_end];
+                    cpu_kernels::flash_attention_paged(
+                        q_view,
+                        layer_pages,
+                        page_size,
+                        &mut attn_out[..seq_len * hidden_size],
+                        seq_len,
+                        kv_seq_len,
+                        config.num_heads,
+                        config.num_kv_heads,
+                        config.head_dim,
+                        true,
+                        1.0 / (config.head_dim as f32).sqrt(),
+                        alibi_slopes.as_deref(),
+                        kv_start,
+                    )?;
+                } else {
+                    let KvCacheStorage::Contiguous(buffer) = &mut cache.storage else {
+                        return Err(BackendError::InvalidKvCache(
+                            "expected contiguous kv cache".into(),
+                        ));
+                    };
+                    let layer_stride = cache.config.max_seq_len * kv_out * 2;
+                    let layer_base = layer * layer_stride;
+                    let k_dst_offset = layer_base + kv_start * kv_out;
+                    let v_dst_offset =
+                        layer_base + cache.config.max_seq_len * kv_out + kv_start * kv_out;
+
+                    buffer[k_dst_offset..k_dst_offset + kv_len].copy_from_slice(k_src);
+                    buffer[v_dst_offset..v_dst_offset + kv_len].copy_from_slice(v_src);
+
+                    let kv_seq_len = kv_start + seq_len;
+                    let k_cache_view = &buffer[..kv_seq_len * kv_out];
+                    let v_cache_view = &buffer[cache.config.max_seq_len * kv_out
+                        ..cache.config.max_seq_len * kv_out + kv_seq_len * kv_out];
+                    let q_view = &qkv[..q_len];
+
+                    cpu_kernels::flash_attention(
+                        q_view,
+                        k_cache_view,
+                        v_cache_view,
+                        &mut attn_out[..seq_len * hidden_size],
+                        seq_len,
+                        kv_seq_len,
+                        config.num_heads,
+                        config.num_kv_heads,
+                        config.head_dim,
+                        true,
+                        1.0 / (config.head_dim as f32).sqrt(),
+                        alibi_slopes.as_deref(),
+                        kv_start,
+                    )?;
+                }
+            } else {
+                let q_view = &qkv[..q_len];
+                let k_view = &qkv[q_len..q_len + kv_len];
+                let v_view = &qkv[q_len + kv_len..q_len + 2 * kv_len];
+                cpu_kernels::flash_attention(
+                    q_view,
+                    k_view,
+                    v_view,
+                    &mut attn_out[..seq_len * hidden_size],
+                    seq_len,
+                    seq_len,
+                    config.num_heads,
+                    config.num_kv_heads,
+                    config.head_dim,
+                    true,
+                    1.0 / (config.head_dim as f32).sqrt(),
+                    alibi_slopes.as_deref(),
+                    0,
+                )?;
+            }
+
+            let (o_proj, o_bias) =
+                Self::resolve_weight_and_bias(weights, &layer_candidates(O_PROJ_PATTERNS, layer))?;
+            cpu_kernels::linear(
+                &attn_out[..seq_len * hidden_size],
+                o_proj,
+                o_bias.map(|b| b.as_slice()),
+                &mut norm[..seq_len * hidden_size],
+                seq_len,
+                hidden_size,
+                hidden_size,
+            )?;
+            cpu_kernels::add(
+                &hidden[..seq_len * hidden_size],
+                &norm[..seq_len * hidden_size],
+                &mut attn_out[..seq_len * hidden_size],
+            )?;
+            hidden[..seq_len * hidden_size].copy_from_slice(&attn_out[..seq_len * hidden_size]);
+
+            cpu_kernels::rms_norm(
+                &hidden[..seq_len * hidden_size],
+                ffn_norm,
+                &mut norm[..seq_len * hidden_size],
+                seq_len,
+                hidden_size,
+                1e-5,
+            )?;
+
+            let (gate_proj, gate_bias) = Self::resolve_weight_and_bias(
+                weights,
+                &layer_candidates(GATE_PROJ_PATTERNS, layer),
+            )?;
+            let (up_proj, up_bias) =
+                Self::resolve_weight_and_bias(weights, &layer_candidates(UP_PROJ_PATTERNS, layer))?;
+            let (down_proj, down_bias) = Self::resolve_weight_and_bias(
+                weights,
+                &layer_candidates(DOWN_PROJ_PATTERNS, layer),
+            )?;
+
+            cpu_kernels::linear(
+                &norm[..seq_len * hidden_size],
+                gate_proj,
+                gate_bias.map(|b| b.as_slice()),
+                &mut ffn_gate[..seq_len * ffn_dim],
+                seq_len,
+                ffn_dim,
+                hidden_size,
+            )?;
+            cpu_kernels::linear(
+                &norm[..seq_len * hidden_size],
+                up_proj,
+                up_bias.map(|b| b.as_slice()),
+                &mut ffn_up[..seq_len * ffn_dim],
+                seq_len,
+                ffn_dim,
+                hidden_size,
+            )?;
+            cpu_kernels::fused_gate_up_silu(
+                &ffn_gate[..seq_len * ffn_dim],
+                &ffn_up[..seq_len * ffn_dim],
+                &mut ffn_act[..seq_len * ffn_dim],
+            )?;
+            cpu_kernels::linear(
+                &ffn_act[..seq_len * ffn_dim],
+                down_proj,
+                down_bias.map(|b| b.as_slice()),
+                &mut ffn_out[..seq_len * hidden_size],
+                seq_len,
+                hidden_size,
+                ffn_dim,
+            )?;
+            cpu_kernels::add(
+                &hidden[..seq_len * hidden_size],
+                &ffn_out[..seq_len * hidden_size],
+                &mut attn_out[..seq_len * hidden_size],
+            )?;
+            hidden[..seq_len * hidden_size].copy_from_slice(&attn_out[..seq_len * hidden_size]);
+        }
+
+        let final_norm_name = Self::resolve_weight_name(weights, &final_norm_candidates())?;
+        let final_norm = Self::resolve_weight(weights, &final_norm_name)?;
+        cpu_kernels::rms_norm(
+            &hidden[..seq_len * hidden_size],
+            final_norm,
+            &mut norm[..seq_len * hidden_size],
+            seq_len,
+            hidden_size,
+            1e-5,
+        )?;
+
+        let last_offset = (seq_len - 1) * hidden_size;
+        let last_hidden = norm[last_offset..last_offset + hidden_size].to_vec();
+
+        if let Some(cache) = kv_cache.as_deref_mut() {
+            cache.used = kv_start + seq_len;
+        }
+
+        Ok(last_hidden)
+    }
+
+    fn ensure_logits_buffer(&self, vocab_size: usize) -> BackendResult<usize> {
+        let mut logits = self.logits.lock().expect("logits lock poisoned");
+        if logits.is_empty() {
+            logits.push(vec![0f32; vocab_size]);
+        }
+        if logits[0].len() != vocab_size {
+            return Err(BackendError::InvalidConfig(
+                "logits buffer size mismatch".into(),
+            ));
+        }
+        Ok(0)
+    }
+
+    fn forward_hidden(
+        &self,
+        tokens: &[u32],
+        topology: &AttentionTopology,
+        weights: &dyn TensorLookup<Self>,
+        mut kv_cache: Option<&mut KvCacheEntry>,
+        config: &GeneratorForwardConfig,
+    ) -> BackendResult<usize> {
+        if tokens.is_empty() {
+            return Err(BackendError::InvalidConfig("empty tokens".into()));
+        }
+        if tokens.len() > config.max_seq_len {
+            return Err(BackendError::InvalidConfig(
+                "tokens exceed max_seq_len".into(),
+            ));
+        }
+        if topology.is_tree() {
+            return Err(BackendError::Unimplemented(
+                "cpu backend does not support tree topology",
+            ));
+        }
+
+        let hidden_size = Self::hidden_size(config)?;
+        if config.num_kv_heads == 0 || config.num_heads == 0 || config.head_dim == 0 {
+            return Err(BackendError::InvalidConfig("invalid head config".into()));
+        }
+
+        self.ensure_workspace(weights, config)?;
+        self.ensure_qkv_plan(weights, config, hidden_size)?;
+
+        let mut workspace_guard = self.workspace.lock().expect("workspace lock poisoned");
+        let workspace = workspace_guard
+            .as_mut()
+            .ok_or_else(|| BackendError::InvalidConfig("workspace missing".into()))?;
+        let ws_config = workspace.config;
+        if ws_config.hidden_size != hidden_size {
+            return Err(BackendError::InvalidConfig("hidden size mismatch".into()));
+        }
+
+        let seq_len = tokens.len();
+        let mut kv_start = 0usize;
+        if let Some(cache) = kv_cache.as_deref_mut() {
+            if cache.config.num_layers != config.num_layers
+                || cache.config.num_heads != config.num_kv_heads
+                || cache.config.head_dim != config.head_dim
+            {
+                return Err(BackendError::InvalidKvCache(
+                    "kv cache config mismatch".into(),
+                ));
+            }
+            if cache.config.dtype_size != std::mem::size_of::<f32>() {
+                return Err(BackendError::InvalidKvCache(
+                    "cpu kv cache expects f32 dtype".into(),
+                ));
+            }
+            if seq_len > 1 && cache.used != 0 {
+                cache.used = 0;
+            }
+            if seq_len > cache.config.max_seq_len.saturating_sub(cache.used) {
+                return Err(BackendError::InvalidKvCache("kv cache exhausted".into()));
+            }
+            kv_start = cache.used;
+        }
+
+        workspace.token_ids[..seq_len].copy_from_slice(tokens);
+        for i in 0..seq_len {
+            workspace.positions[i] = (kv_start + i) as i32;
+        }
+
+        let embed_name = Self::resolve_weight_name(weights, &embedding_candidates())?;
+        let embed_weight = Self::resolve_weight(weights, &embed_name)?;
+        let embed_shape = weights
+            .tensor_shape(&embed_name)
+            .ok_or_else(|| BackendError::MissingTensor(embed_name.clone()))?;
+        if embed_shape.len() != 2 || embed_shape[1] != hidden_size {
+            return Err(BackendError::InvalidConfig(
+                "embedding weight shape mismatch".into(),
+            ));
+        }
+        cpu_kernels::embedding_lookup(
+            tokens,
+            embed_weight,
+            &mut workspace.hidden[..seq_len * hidden_size],
+            config.vocab_size,
+            hidden_size,
+        )?;
+
+        let qkv_plan_guard = self.qkv_plan.lock().expect("qkv plan lock poisoned");
+        let qkv_plan = qkv_plan_guard
+            .as_ref()
+            .ok_or_else(|| BackendError::InvalidConfig("qkv plan missing".into()))?;
+
+        let q_out = hidden_size;
+        let kv_out = config.num_kv_heads * config.head_dim;
+        let q_len = seq_len * q_out;
+        let kv_len = seq_len * kv_out;
+        let qkv_stride = q_out + 2 * kv_out;
+        let positions = &workspace.positions[..seq_len];
+        let rotary_dim = if config.position_encoding == PositionEncoding::Rope {
+            config.head_dim
+        } else {
+            0
+        };
+        let rope_cache =
+            if config.position_encoding == PositionEncoding::Rope && config.rope_precompute {
+                workspace.rope_cache.as_ref()
+            } else {
+                None
+            };
+
+        for layer in 0..config.num_layers {
+            let (attn_norm, _) = Self::resolve_weight_and_bias(
+                weights,
+                &layer_candidates(ATTN_NORM_PATTERNS, layer),
+            )?;
+            let (ffn_norm, _) = Self::resolve_weight_and_bias(
+                weights,
+                &layer_candidates(FFN_NORM_PATTERNS, layer),
+            )?;
+
+            cpu_kernels::rms_norm(
+                &workspace.hidden[..seq_len * hidden_size],
+                attn_norm,
+                &mut workspace.norm[..seq_len * hidden_size],
+                seq_len,
+                hidden_size,
+                1e-5,
+            )?;
+
+            let (qkv_weight, qkv_bias) = match &qkv_plan.layers[layer] {
+                QkvLayerPlan::Direct { weight, bias } => {
+                    let weight = Self::resolve_weight(weights, weight)?;
+                    let bias = bias.as_ref().and_then(|name| weights.tensor_f32(name));
+                    (weight.as_slice(), bias.map(|b| b.as_slice()))
+                }
+                QkvLayerPlan::Fused { weight, bias } => {
+                    (weight.as_slice(), bias.as_ref().map(|b| b.as_slice()))
+                }
+            };
+
+            cpu_kernels::fused_qkv_rope(
+                &workspace.norm[..seq_len * hidden_size],
+                qkv_weight,
+                qkv_bias,
+                &mut workspace.qkv[..seq_len * qkv_stride],
+                seq_len,
+                hidden_size,
+                config.num_heads,
+                config.num_kv_heads,
+                config.head_dim,
+                rotary_dim,
+                config.rope_theta,
+                config.rope_scale,
+                config.rope_interleaved,
+                rope_cache,
+                positions,
+            )?;
+
+            if let Some(cache) = kv_cache.as_deref_mut() {
+                let qkv_slice = &workspace.qkv[..seq_len * qkv_stride];
+                let k_src = &qkv_slice[q_len..q_len + kv_len];
+                let v_src = &qkv_slice[q_len + kv_len..q_len + 2 * kv_len];
+
+                if cache.is_paged() {
+                    let page_size = cache.page_size();
+                    let pages_per_layer = cache.pages_per_layer();
+                    let page_len = page_size * kv_out * 2;
+                    let KvCacheStorage::Paged { pages, .. } = &mut cache.storage else {
+                        return Err(BackendError::InvalidKvCache(
+                            "expected paged kv cache".into(),
+                        ));
+                    };
+                    if pages.len() < (config.num_layers * pages_per_layer) {
+                        return Err(BackendError::InvalidKvCache(
+                            "paged kv cache size mismatch".into(),
+                        ));
+                    }
+
+                    let mut remaining = seq_len;
+                    let mut src_token = 0usize;
+                    let mut global = kv_start;
+                    while remaining > 0 {
+                        let page = global / page_size;
+                        let offset = global - page * page_size;
+                        let take = remaining.min(page_size - offset);
+                        let page_index = layer * pages_per_layer + page;
+                        let page_buf = pages
+                            .get_mut(page_index)
+                            .ok_or_else(|| BackendError::InvalidKvCache("page index".into()))?;
+                        if page_buf.len() != page_len {
+                            return Err(BackendError::InvalidKvCache(
+                                "paged kv cache page size mismatch".into(),
+                            ));
+                        }
+
+                        let src_offset = src_token * kv_out;
+                        let src_len = take * kv_out;
+                        let k_dst = offset * kv_out;
+                        let v_dst = page_size * kv_out + offset * kv_out;
+                        page_buf[k_dst..k_dst + src_len]
+                            .copy_from_slice(&k_src[src_offset..src_offset + src_len]);
+                        page_buf[v_dst..v_dst + src_len]
+                            .copy_from_slice(&v_src[src_offset..src_offset + src_len]);
+
+                        remaining -= take;
+                        src_token += take;
+                        global += take;
+                    }
+
+                    let kv_seq_len = kv_start + seq_len;
+                    let q_view = &workspace.qkv[..q_len];
+                    let layer_start = layer * pages_per_layer;
+                    let layer_end = layer_start + pages_per_layer;
+                    let layer_pages = &pages[layer_start..layer_end];
+                    cpu_kernels::flash_attention_paged(
+                        q_view,
+                        layer_pages,
+                        page_size,
+                        &mut workspace.attn_out[..seq_len * hidden_size],
+                        seq_len,
+                        kv_seq_len,
+                        config.num_heads,
+                        config.num_kv_heads,
+                        config.head_dim,
+                        true,
+                        1.0 / (config.head_dim as f32).sqrt(),
+                        workspace.alibi_slopes.as_deref(),
+                        kv_start,
+                    )?;
+                } else {
+                    let KvCacheStorage::Contiguous(buffer) = &mut cache.storage else {
+                        return Err(BackendError::InvalidKvCache(
+                            "expected contiguous kv cache".into(),
+                        ));
+                    };
+                    let layer_stride = cache.config.max_seq_len * kv_out * 2;
+                    let layer_base = layer * layer_stride;
+                    let k_dst_offset = layer_base + kv_start * kv_out;
+                    let v_dst_offset =
+                        layer_base + cache.config.max_seq_len * kv_out + kv_start * kv_out;
+
+                    buffer[k_dst_offset..k_dst_offset + kv_len].copy_from_slice(k_src);
+                    buffer[v_dst_offset..v_dst_offset + kv_len].copy_from_slice(v_src);
+
+                    let kv_seq_len = kv_start + seq_len;
+                    let k_cache_view = &buffer[..kv_seq_len * kv_out];
+                    let v_cache_view = &buffer[cache.config.max_seq_len * kv_out
+                        ..cache.config.max_seq_len * kv_out + kv_seq_len * kv_out];
+                    let q_view = &workspace.qkv[..q_len];
+
+                    cpu_kernels::flash_attention(
+                        q_view,
+                        k_cache_view,
+                        v_cache_view,
+                        &mut workspace.attn_out[..seq_len * hidden_size],
+                        seq_len,
+                        kv_seq_len,
+                        config.num_heads,
+                        config.num_kv_heads,
+                        config.head_dim,
+                        true,
+                        1.0 / (config.head_dim as f32).sqrt(),
+                        workspace.alibi_slopes.as_deref(),
+                        kv_start,
+                    )?;
+                }
+            } else {
+                let q_view = &workspace.qkv[..q_len];
+                let k_view = &workspace.qkv[q_len..q_len + kv_len];
+                let v_view = &workspace.qkv[q_len + kv_len..q_len + 2 * kv_len];
+                cpu_kernels::flash_attention(
+                    q_view,
+                    k_view,
+                    v_view,
+                    &mut workspace.attn_out[..seq_len * hidden_size],
+                    seq_len,
+                    seq_len,
+                    config.num_heads,
+                    config.num_kv_heads,
+                    config.head_dim,
+                    true,
+                    1.0 / (config.head_dim as f32).sqrt(),
+                    workspace.alibi_slopes.as_deref(),
+                    0,
+                )?;
+            }
+
+            let (o_proj, o_bias) =
+                Self::resolve_weight_and_bias(weights, &layer_candidates(O_PROJ_PATTERNS, layer))?;
+            cpu_kernels::linear(
+                &workspace.attn_out[..seq_len * hidden_size],
+                o_proj,
+                o_bias.map(|b| b.as_slice()),
+                &mut workspace.norm[..seq_len * hidden_size],
+                seq_len,
+                hidden_size,
+                hidden_size,
+            )?;
+            cpu_kernels::add(
+                &workspace.hidden[..seq_len * hidden_size],
+                &workspace.norm[..seq_len * hidden_size],
+                &mut workspace.attn_out[..seq_len * hidden_size],
+            )?;
+            workspace.hidden[..seq_len * hidden_size]
+                .copy_from_slice(&workspace.attn_out[..seq_len * hidden_size]);
+
+            cpu_kernels::rms_norm(
+                &workspace.hidden[..seq_len * hidden_size],
+                ffn_norm,
+                &mut workspace.norm[..seq_len * hidden_size],
+                seq_len,
+                hidden_size,
+                1e-5,
+            )?;
+
+            let (gate_proj, gate_bias) = Self::resolve_weight_and_bias(
+                weights,
+                &layer_candidates(GATE_PROJ_PATTERNS, layer),
+            )?;
+            let (up_proj, up_bias) =
+                Self::resolve_weight_and_bias(weights, &layer_candidates(UP_PROJ_PATTERNS, layer))?;
+            let (down_proj, down_bias) = Self::resolve_weight_and_bias(
+                weights,
+                &layer_candidates(DOWN_PROJ_PATTERNS, layer),
+            )?;
+
+            let ffn_dim = ws_config.ffn_dim;
+            cpu_kernels::linear(
+                &workspace.norm[..seq_len * hidden_size],
+                gate_proj,
+                gate_bias.map(|b| b.as_slice()),
+                &mut workspace.ffn_gate[..seq_len * ffn_dim],
+                seq_len,
+                ffn_dim,
+                hidden_size,
+            )?;
+            cpu_kernels::linear(
+                &workspace.norm[..seq_len * hidden_size],
+                up_proj,
+                up_bias.map(|b| b.as_slice()),
+                &mut workspace.ffn_up[..seq_len * ffn_dim],
+                seq_len,
+                ffn_dim,
+                hidden_size,
+            )?;
+            cpu_kernels::fused_gate_up_silu(
+                &workspace.ffn_gate[..seq_len * ffn_dim],
+                &workspace.ffn_up[..seq_len * ffn_dim],
+                &mut workspace.ffn_act[..seq_len * ffn_dim],
+            )?;
+            cpu_kernels::linear(
+                &workspace.ffn_act[..seq_len * ffn_dim],
+                down_proj,
+                down_bias.map(|b| b.as_slice()),
+                &mut workspace.ffn_out[..seq_len * hidden_size],
+                seq_len,
+                hidden_size,
+                ffn_dim,
+            )?;
+            cpu_kernels::add(
+                &workspace.hidden[..seq_len * hidden_size],
+                &workspace.ffn_out[..seq_len * hidden_size],
+                &mut workspace.attn_out[..seq_len * hidden_size],
+            )?;
+            workspace.hidden[..seq_len * hidden_size]
+                .copy_from_slice(&workspace.attn_out[..seq_len * hidden_size]);
+        }
+
+        let final_norm_name = Self::resolve_weight_name(weights, &final_norm_candidates())?;
+        let final_norm = Self::resolve_weight(weights, &final_norm_name)?;
+        cpu_kernels::rms_norm(
+            &workspace.hidden[..seq_len * hidden_size],
+            final_norm,
+            &mut workspace.norm[..seq_len * hidden_size],
+            seq_len,
+            hidden_size,
+            1e-5,
+        )?;
+
+        let last_offset = (seq_len - 1) * hidden_size;
+        workspace
+            .last_hidden
+            .copy_from_slice(&workspace.norm[last_offset..last_offset + hidden_size]);
+
+        if let Some(cache) = kv_cache.as_deref_mut() {
+            cache.used = kv_start + seq_len;
+        }
+
+        Ok(hidden_size)
+    }
+
+    fn next_random(&self) -> f32 {
+        let mut state = self.rng_state.lock().expect("rng lock poisoned");
+        let mut x = *state;
+        if x == 0 {
+            x = 0x9e37_79b9_7f4a_7c15;
+        }
+        x ^= x << 13;
+        x ^= x >> 7;
+        x ^= x << 17;
+        *state = x;
+        let v = (x as u32).wrapping_add(1) as f32;
+        v * 2.3283064e-10
     }
 }
 
@@ -35,2112 +1497,337 @@ impl Default for CpuBackend {
 }
 
 impl Backend for CpuBackend {
-    // =========================================================================
-    // L2 Block-Level Operators (ARCH-GRANULARITY-001)
-    // =========================================================================
+    type Tensor<T> = Vec<T>;
 
-    fn attention_block(
-        &self,
-        hidden: &[f32],
-        q_weight: &[f32],
-        k_weight: &[f32],
-        v_weight: &[f32],
-        o_weight: &[f32],
-        norm_weight: &[f32],
-        cos_cache: &[f32],
-        sin_cache: &[f32],
-        kv_cache_k: Option<&mut [f32]>,
-        kv_cache_v: Option<&mut [f32]>,
-        config: &AttentionBlockConfig,
-    ) -> Result<Vec<f32>, String> {
-        let batch = config.batch_size;
-        let seq_len = config.seq_len;
-        let hidden_size = config.hidden_size;
-        let num_q_heads = config.num_q_heads;
-        let num_kv_heads = config.num_kv_heads;
-        let head_dim = config.head_dim;
+    fn upload_weights<T: DeviceRepr + Clone>(&self, data: &[T]) -> BackendResult<Self::Tensor<T>> {
+        Ok(data.to_vec())
+    }
 
-        // 1. RMS Norm on input
-        let mut normed = vec![0.0f32; batch * seq_len * hidden_size];
-        crate::ops::rms_norm::rms_norm_forward(
-            hidden,
-            norm_weight,
-            &mut normed,
-            batch * seq_len,
-            hidden_size,
-            config.rms_norm_eps,
-        );
-
-        // 2. QKV projections
-        let q_dim = num_q_heads * head_dim;
-        let kv_dim = num_kv_heads * head_dim;
-
-        let mut q = vec![0.0f32; batch * seq_len * q_dim];
-        let mut k = vec![0.0f32; batch * seq_len * kv_dim];
-        let mut v = vec![0.0f32; batch * seq_len * kv_dim];
-
-        crate::ops::linear::linear_forward(
-            &normed, q_weight, None, &mut q,
-            batch * seq_len, hidden_size, q_dim,
-        );
-        crate::ops::linear::linear_forward(
-            &normed, k_weight, None, &mut k,
-            batch * seq_len, hidden_size, kv_dim,
-        );
-        crate::ops::linear::linear_forward(
-            &normed, v_weight, None, &mut v,
-            batch * seq_len, hidden_size, kv_dim,
-        );
-
-        // 3. Apply RoPE if enabled
-        if config.use_rope {
-            let mut q_rope = vec![0.0f32; q.len()];
-            let mut k_rope = vec![0.0f32; k.len()];
-            crate::ops::rope::rope_apply(
-                &q, &k,
-                cos_cache, sin_cache,
-                &mut q_rope, &mut k_rope,
-                batch, seq_len, num_q_heads, num_kv_heads, head_dim,
-                config.position_offset,
-            );
-            q = q_rope;
-            k = k_rope;
+    fn alloc_kv_cache(&self, config: &KvCacheConfig) -> BackendResult<KvCacheHandle> {
+        if config.dtype_size != std::mem::size_of::<f32>() {
+            return Err(BackendError::InvalidKvCache(
+                "cpu kv cache expects f32 dtype".into(),
+            ));
         }
-
-        // 4. Update KV cache if provided
-        // Also determine what K,V to use for attention computation
-        let (k_for_attn, v_for_attn, seq_len_kv) = if config.position_offset > 0 && seq_len == 1 {
-            // Decode mode: concatenate cached K,V with current K,V
-            if let (Some(k_cache), Some(v_cache)) = (kv_cache_k.as_ref(), kv_cache_v.as_ref()) {
-                let cached_len = config.position_offset * num_kv_heads * head_dim;
-                let current_len = seq_len * num_kv_heads * head_dim;
-                let total_len = cached_len + current_len;
-
-                let mut k_combined = vec![0.0f32; total_len];
-                let mut v_combined = vec![0.0f32; total_len];
-
-                // Copy cached K,V
-                k_combined[..cached_len].copy_from_slice(&k_cache[..cached_len]);
-                v_combined[..cached_len].copy_from_slice(&v_cache[..cached_len]);
-
-                // Copy current K,V
-                k_combined[cached_len..].copy_from_slice(&k[..current_len]);
-                v_combined[cached_len..].copy_from_slice(&v[..current_len]);
-
-                // Update KV cache with current K,V
-                if let (Some(k_cache_mut), Some(v_cache_mut)) = (kv_cache_k, kv_cache_v) {
-                    let cache_offset = config.position_offset * num_kv_heads * head_dim;
-                    for b in 0..batch {
-                        let src_start = b * current_len;
-                        let dst_start = b * k_cache_mut.len() / batch + cache_offset;
-                        k_cache_mut[dst_start..dst_start + current_len].copy_from_slice(&k[src_start..src_start + current_len]);
-                        v_cache_mut[dst_start..dst_start + current_len].copy_from_slice(&v[src_start..src_start + current_len]);
-                    }
-                }
-
-                (k_combined, v_combined, config.position_offset + seq_len)
-            } else {
-                // No cache available, use current K,V only
-                if let (Some(k_cache), Some(v_cache)) = (kv_cache_k, kv_cache_v) {
-                    let cache_offset = config.position_offset * num_kv_heads * head_dim;
-                    let new_len = seq_len * num_kv_heads * head_dim;
-                    for b in 0..batch {
-                        let src_start = b * new_len;
-                        let dst_start = b * k_cache.len() / batch + cache_offset;
-                        k_cache[dst_start..dst_start + new_len].copy_from_slice(&k[src_start..src_start + new_len]);
-                        v_cache[dst_start..dst_start + new_len].copy_from_slice(&v[src_start..src_start + new_len]);
-                    }
-                }
-                (k.to_vec(), v.to_vec(), seq_len)
+        let kv_stride = config
+            .num_heads
+            .checked_mul(config.head_dim)
+            .ok_or_else(|| BackendError::InvalidKvCache("kv stride overflow".into()))?;
+        if kv_stride == 0 || config.max_seq_len == 0 || config.num_layers == 0 {
+            return Err(BackendError::InvalidKvCache(
+                "kv cache size must be > 0".into(),
+            ));
+        }
+        let page_size = config.effective_page_size();
+        let pages_per_layer = config
+            .pages_per_layer()
+            .ok_or_else(|| BackendError::InvalidKvCache("page size overflow".into()))?;
+        let storage = if config.is_paged() {
+            let page_len = page_size
+                .checked_mul(kv_stride)
+                .and_then(|v| v.checked_mul(2))
+                .ok_or_else(|| BackendError::InvalidKvCache("page size overflow".into()))?;
+            let total_pages = config
+                .num_layers
+                .checked_mul(pages_per_layer)
+                .ok_or_else(|| BackendError::InvalidKvCache("page count overflow".into()))?;
+            let mut pages = Vec::with_capacity(total_pages);
+            for _ in 0..total_pages {
+                pages.push(vec![0f32; page_len]);
+            }
+            KvCacheStorage::Paged {
+                pages,
+                page_size,
+                pages_per_layer,
             }
         } else {
-            // Prefill mode: use current K,V
-            if let (Some(k_cache), Some(v_cache)) = (kv_cache_k, kv_cache_v) {
-                let cache_offset = config.position_offset * num_kv_heads * head_dim;
-                let new_len = seq_len * num_kv_heads * head_dim;
-                for b in 0..batch {
-                    let src_start = b * new_len;
-                    let dst_start = b * k_cache.len() / batch + cache_offset;
-                    k_cache[dst_start..dst_start + new_len].copy_from_slice(&k[src_start..src_start + new_len]);
-                    v_cache[dst_start..dst_start + new_len].copy_from_slice(&v[src_start..src_start + new_len]);
-                }
-            }
-            (k.to_vec(), v.to_vec(), seq_len)
+            let elements = config
+                .num_layers
+                .checked_mul(2)
+                .and_then(|v| v.checked_mul(config.max_seq_len))
+                .and_then(|v| v.checked_mul(kv_stride))
+                .ok_or_else(|| BackendError::InvalidKvCache("size overflow".into()))?;
+            KvCacheStorage::Contiguous(vec![0f32; elements])
         };
-
-        // 5. Flash attention
-        let flash_config = FlashAttentionConfig {
-            batch_size: batch,
-            num_heads: num_q_heads,
-            num_kv_heads,
-            head_dim,
-            seq_len_q: seq_len,
-            seq_len_kv: seq_len_kv,
-            causal: config.causal,
-            scale: config.scale,
-            dropout_prob: config.dropout_prob,
-            ..Default::default()
-        };
-
-        let mut attn_out = vec![0.0f32; batch * seq_len * q_dim];
-        crate::ops::attention::cpu_flash_attention(&q, &k_for_attn, &v_for_attn, &mut attn_out, flash_config);
-
-        // 6. Output projection
-        let mut output = vec![0.0f32; batch * seq_len * hidden_size];
-        crate::ops::linear::linear_forward(
-            &attn_out, o_weight, None, &mut output,
-            batch * seq_len, q_dim, hidden_size,
-        );
-
-        // NOTE: Residual connection is applied by the caller, not here
-        Ok(output)
-    }
-
-    fn attention_block_with_qk_norm(
-        &self,
-        hidden: &[f32],
-        q_weight: &[f32],
-        k_weight: &[f32],
-        v_weight: &[f32],
-        o_weight: &[f32],
-        norm_weight: &[f32],
-        q_norm: Option<&[f32]>,
-        k_norm: Option<&[f32]>,
-        cos_cache: &[f32],
-        sin_cache: &[f32],
-        kv_cache_k: Option<&mut [f32]>,
-        kv_cache_v: Option<&mut [f32]>,
-        config: &AttentionBlockConfig,
-    ) -> Result<Vec<f32>, String> {
-        let batch = config.batch_size;
-        let seq_len = config.seq_len;
-        let hidden_size = config.hidden_size;
-        let num_q_heads = config.num_q_heads;
-        let num_kv_heads = config.num_kv_heads;
-        let head_dim = config.head_dim;
-
-        // 1. RMS Norm on input
-        let mut normed = vec![0.0f32; batch * seq_len * hidden_size];
-        crate::ops::rms_norm::rms_norm_forward(
-            hidden,
-            norm_weight,
-            &mut normed,
-            batch * seq_len,
-            hidden_size,
-            config.rms_norm_eps,
-        );
-
-        // 2. QKV projections
-        let q_dim = num_q_heads * head_dim;
-        let kv_dim = num_kv_heads * head_dim;
-
-        let mut q = vec![0.0f32; batch * seq_len * q_dim];
-        let mut k = vec![0.0f32; batch * seq_len * kv_dim];
-        let mut v = vec![0.0f32; batch * seq_len * kv_dim];
-
-        crate::ops::linear::linear_forward(
-            &normed, q_weight, None, &mut q,
-            batch * seq_len, hidden_size, q_dim,
-        );
-        crate::ops::linear::linear_forward(
-            &normed, k_weight, None, &mut k,
-            batch * seq_len, hidden_size, kv_dim,
-        );
-        crate::ops::linear::linear_forward(
-            &normed, v_weight, None, &mut v,
-            batch * seq_len, hidden_size, kv_dim,
-        );
-
-        // 3. Apply QK normalization if weights are provided (Qwen3-style)
-        // QK norm is applied per-head to the projected Q and K vectors
-        // Qwen3 uses a reduced dimension for QK norm: q_norm/k_norm have size [num_kv_heads * (head_dim / 8)]
-        // For Qwen3-0.6B: 128 = 8 * 16, where 16 = 128 / 8
-        if let Some(q_norm_w) = q_norm {
-            // Each KV head gets (q_norm_w.len() / num_kv_heads) elements
-            let norm_per_kv_head = q_norm_w.len() / num_kv_heads;
-
-            // Apply RMS norm to Q - map Q heads to KV heads
-            for t in 0..(batch * seq_len) {
-                for kv_h in 0..num_kv_heads {
-                    // Each KV head corresponds to (num_q_heads / num_kv_heads) Q heads
-                    let norm_w_start = kv_h * norm_per_kv_head;
-                    let norm_w_end = norm_w_start + norm_per_kv_head;
-                    let norm_w = &q_norm_w[norm_w_start..norm_w_end];
-
-                    // Apply to all Q heads that map to this KV head
-                    for h_offset in 0..(num_q_heads / num_kv_heads) {
-                        let h = kv_h * (num_q_heads / num_kv_heads) + h_offset;
-                        let head_start = t * q_dim + h * head_dim;
-
-                        // Compute RMS norm for this head
-                        let mut sum_sq = 0.0f32;
-                        for i in 0..head_dim {
-                            sum_sq += q[head_start + i] * q[head_start + i];
-                        }
-                        let rms = (sum_sq / head_dim as f32 + config.rms_norm_eps).sqrt();
-
-                        // Apply norm weights to the first norm_per_kv_head elements
-                        for (i, &norm_val) in norm_w.iter().enumerate() {
-                            if i < head_dim {
-                                q[head_start + i] = (q[head_start + i] / rms) * norm_val;
-                            }
-                        }
-                    }
-                }
-            }
-        }
-        if let Some(k_norm_w) = k_norm {
-            // Each KV head gets (k_norm_w.len() / num_kv_heads) elements
-            let norm_per_kv_head = k_norm_w.len() / num_kv_heads;
-
-            // Apply RMS norm to K per-head
-            for t in 0..(batch * seq_len) {
-                for h in 0..num_kv_heads {
-                    let head_start = t * kv_dim + h * head_dim;
-                    let norm_w_start = h * norm_per_kv_head;
-                    let norm_w_end = norm_w_start + norm_per_kv_head;
-                    let norm_w = &k_norm_w[norm_w_start..norm_w_end];
-
-                    // Compute RMS norm for this head
-                    let mut sum_sq = 0.0f32;
-                    for i in 0..head_dim {
-                        sum_sq += k[head_start + i] * k[head_start + i];
-                    }
-                    let rms = (sum_sq / head_dim as f32 + config.rms_norm_eps).sqrt();
-
-                    // Apply norm weights to the first norm_per_kv_head elements
-                    for (i, &norm_val) in norm_w.iter().enumerate() {
-                        if i < head_dim {
-                            k[head_start + i] = (k[head_start + i] / rms) * norm_val;
-                        }
-                    }
-                }
-            }
-        }
-
-        // 4. Apply RoPE if enabled
-        if config.use_rope {
-            let mut q_rope = vec![0.0f32; q.len()];
-            let mut k_rope = vec![0.0f32; k.len()];
-            crate::ops::rope::rope_apply(
-                &q, &k,
-                cos_cache, sin_cache,
-                &mut q_rope, &mut k_rope,
-                batch, seq_len, num_q_heads, num_kv_heads, head_dim,
-                config.position_offset,
-            );
-            q = q_rope;
-            k = k_rope;
-        }
-
-        // 5. Update KV cache if provided
-        // Also determine what K,V to use for attention computation
-        let (k_for_attn, v_for_attn, seq_len_kv) = if config.position_offset > 0 && seq_len == 1 {
-            // Decode mode: concatenate cached K,V with current K,V
-            if let (Some(k_cache), Some(v_cache)) = (kv_cache_k.as_ref(), kv_cache_v.as_ref()) {
-                let cached_len = config.position_offset * num_kv_heads * head_dim;
-                let current_len = seq_len * num_kv_heads * head_dim;
-                let total_len = cached_len + current_len;
-
-                let mut k_combined = vec![0.0f32; total_len];
-                let mut v_combined = vec![0.0f32; total_len];
-
-                // Copy cached K,V
-                k_combined[..cached_len].copy_from_slice(&k_cache[..cached_len]);
-                v_combined[..cached_len].copy_from_slice(&v_cache[..cached_len]);
-
-                // Copy current K,V
-                k_combined[cached_len..].copy_from_slice(&k[..current_len]);
-                v_combined[cached_len..].copy_from_slice(&v[..current_len]);
-
-                // Update KV cache with current K,V
-                if let (Some(k_cache_mut), Some(v_cache_mut)) = (kv_cache_k, kv_cache_v) {
-                    let cache_offset = config.position_offset * num_kv_heads * head_dim;
-                    for b in 0..batch {
-                        let src_start = b * current_len;
-                        let dst_start = b * k_cache_mut.len() / batch + cache_offset;
-                        k_cache_mut[dst_start..dst_start + current_len].copy_from_slice(&k[src_start..src_start + current_len]);
-                        v_cache_mut[dst_start..dst_start + current_len].copy_from_slice(&v[src_start..src_start + current_len]);
-                    }
-                }
-
-                (k_combined, v_combined, config.position_offset + seq_len)
-            } else {
-                // No cache available, use current K,V only
-                if let (Some(k_cache), Some(v_cache)) = (kv_cache_k, kv_cache_v) {
-                    let cache_offset = config.position_offset * num_kv_heads * head_dim;
-                    let new_len = seq_len * num_kv_heads * head_dim;
-                    for b in 0..batch {
-                        let src_start = b * new_len;
-                        let dst_start = b * k_cache.len() / batch + cache_offset;
-                        k_cache[dst_start..dst_start + new_len].copy_from_slice(&k[src_start..src_start + new_len]);
-                        v_cache[dst_start..dst_start + new_len].copy_from_slice(&v[src_start..src_start + new_len]);
-                    }
-                }
-                (k.to_vec(), v.to_vec(), seq_len)
-            }
-        } else {
-            // Prefill mode: use current K,V
-            if let (Some(k_cache), Some(v_cache)) = (kv_cache_k, kv_cache_v) {
-                let cache_offset = config.position_offset * num_kv_heads * head_dim;
-                let new_len = seq_len * num_kv_heads * head_dim;
-                for b in 0..batch {
-                    let src_start = b * new_len;
-                    let dst_start = b * k_cache.len() / batch + cache_offset;
-                    k_cache[dst_start..dst_start + new_len].copy_from_slice(&k[src_start..src_start + new_len]);
-                    v_cache[dst_start..dst_start + new_len].copy_from_slice(&v[src_start..src_start + new_len]);
-                }
-            }
-            (k.to_vec(), v.to_vec(), seq_len)
-        };
-
-        // 6. Flash attention
-        let flash_config = FlashAttentionConfig {
-            batch_size: batch,
-            num_heads: num_q_heads,
-            num_kv_heads,
-            head_dim,
-            seq_len_q: seq_len,
-            seq_len_kv: seq_len_kv,
-            causal: config.causal,
-            scale: config.scale,
-            dropout_prob: config.dropout_prob,
-            ..Default::default()
-        };
-
-        let mut attn_out = vec![0.0f32; batch * seq_len * q_dim];
-        crate::ops::attention::cpu_flash_attention(&q, &k_for_attn, &v_for_attn, &mut attn_out, flash_config);
-
-        // 7. Output projection
-        let mut output = vec![0.0f32; batch * seq_len * hidden_size];
-        crate::ops::linear::linear_forward(
-            &attn_out, o_weight, None, &mut output,
-            batch * seq_len, q_dim, hidden_size,
-        );
-
-        // NOTE: Residual connection is applied by the caller, not here
-        Ok(output)
-    }
-
-    fn ffn_block(
-        &self,
-        hidden: &[f32],
-        gate_weight: Option<&[f32]>,
-        up_weight: &[f32],
-        down_weight: &[f32],
-        norm_weight: &[f32],
-        config: &FFNBlockConfig,
-    ) -> Result<Vec<f32>, String> {
-        let batch = config.batch_size;
-        let seq_len = config.seq_len;
-        let hidden_size = config.hidden_size;
-        let intermediate_size = config.intermediate_size;
-
-        // 1. RMS Norm
-        let mut normed = vec![0.0f32; batch * seq_len * hidden_size];
-        crate::ops::rms_norm::rms_norm_forward(
-            hidden,
-            norm_weight,
-            &mut normed,
-            batch * seq_len,
-            hidden_size,
-            config.rms_norm_eps,
-        );
-
-        // 2. Up projection
-        let mut up_out = vec![0.0f32; batch * seq_len * intermediate_size];
-        crate::ops::linear::linear_forward(
-            &normed, up_weight, None, &mut up_out,
-            batch * seq_len, hidden_size, intermediate_size,
-        );
-
-        // 3. Gate projection and activation (LLaMA-style)
-        if config.use_gate {
-            if let Some(gate_w) = gate_weight {
-                let mut gate_out = vec![0.0f32; batch * seq_len * intermediate_size];
-                crate::ops::linear::linear_forward(
-                    &normed, gate_w, None, &mut gate_out,
-                    batch * seq_len, hidden_size, intermediate_size,
-                );
-
-                // Apply activation to gate and multiply with up
-                match config.activation {
-                    Activation::SiLU => {
-                        crate::ops::activations::silu_mul_inplace(&mut gate_out, &up_out);
-                    }
-                    Activation::GELU | Activation::GELUExact => {
-                        crate::ops::activations::gelu_inplace(&mut gate_out);
-                        crate::ops::activations::mul_inplace(&mut gate_out, &up_out);
-                    }
-                    Activation::ReLU => {
-                        crate::ops::activations::relu_inplace(&mut gate_out);
-                        crate::ops::activations::mul_inplace(&mut gate_out, &up_out);
-                    }
-                    Activation::None => {
-                        crate::ops::activations::mul_inplace(&mut gate_out, &up_out);
-                    }
-                }
-                up_out = gate_out;
-            }
-        } else {
-            // GPT-style: just activation on up projection
-            match config.activation {
-                Activation::SiLU => crate::ops::activations::silu_inplace(&mut up_out),
-                Activation::GELU => crate::ops::activations::gelu_inplace(&mut up_out),
-                Activation::GELUExact => crate::ops::activations::gelu_exact_inplace(&mut up_out),
-                Activation::ReLU => crate::ops::activations::relu_inplace(&mut up_out),
-                Activation::None => {}
-            }
-        }
-
-        // 4. Down projection
-        let mut output = vec![0.0f32; batch * seq_len * hidden_size];
-        crate::ops::linear::linear_forward(
-            &up_out, down_weight, None, &mut output,
-            batch * seq_len, intermediate_size, hidden_size,
-        );
-
-        // NOTE: Residual connection is applied by the caller, not here
-        Ok(output)
-    }
-
-    fn embedding(
-        &self,
-        tokens: &[u32],
-        embed_weight: &[f32],
-        position_weight: Option<&[f32]>,
-        config: &EmbeddingConfig,
-    ) -> Result<Vec<f32>, String> {
-        let num_tokens = tokens.len();
-        let hidden_size = config.hidden_size;
-
-        let mut output = vec![0.0f32; num_tokens * hidden_size];
-
-        // Token embedding lookup
-        for (i, &token) in tokens.iter().enumerate() {
-            let token_idx = token as usize;
-            if token_idx >= config.vocab_size {
-                return Err(format!("Token {} out of vocabulary range {}", token_idx, config.vocab_size));
-            }
-            let src_start = token_idx * hidden_size;
-            let dst_start = i * hidden_size;
-            output[dst_start..dst_start + hidden_size]
-                .copy_from_slice(&embed_weight[src_start..src_start + hidden_size]);
-        }
-
-        // Add position embeddings if provided
-        if config.add_position_embedding {
-            if let Some(pos_weight) = position_weight {
-                for (i, out_chunk) in output.chunks_mut(hidden_size).enumerate() {
-                    let pos = i % config.max_seq_len;
-                    let pos_start = pos * hidden_size;
-                    for (j, val) in out_chunk.iter_mut().enumerate() {
-                        *val += pos_weight[pos_start + j];
-                    }
-                }
-            }
-        }
-
-        Ok(output)
-    }
-
-    fn lm_head(
-        &self,
-        hidden: &[f32],
-        lm_weight: &[f32],
-        norm_weight: &[f32],
-        config: &LMHeadConfig,
-    ) -> Result<Vec<f32>, String> {
-        let batch = config.batch_size;
-        let seq_len = config.seq_len;
-        let hidden_size = config.hidden_size;
-        let vocab_size = config.vocab_size;
-
-        // 1. Final RMS norm
-        let mut normed = vec![0.0f32; batch * seq_len * hidden_size];
-        crate::ops::rms_norm::rms_norm_forward(
-            hidden,
-            norm_weight,
-            &mut normed,
-            batch * seq_len,
-            hidden_size,
-            config.rms_norm_eps,
-        );
-
-        // 2. Project to vocabulary
-        let mut logits = vec![0.0f32; batch * seq_len * vocab_size];
-        crate::ops::linear::linear_forward(
-            &normed, lm_weight, None, &mut logits,
-            batch * seq_len, hidden_size, vocab_size,
-        );
-
-        Ok(logits)
-    }
-
-    fn engram_lookup(
-        &self,
-        tokens: &[u32],
-        engram_table: &[f32],
-        hidden_size: usize,
-        ngram_size: usize,
-        num_buckets: usize,
-    ) -> Result<(Vec<f32>, Vec<u64>), String> {
-        let num_tokens = tokens.len();
-        let mut embeddings = vec![0.0f32; num_tokens * hidden_size];
-        let mut bucket_indices = vec![0u64; num_tokens];
-
-        // Use Engram hash function for lookup
-        let hasher = crate::ops::engram_hash::EngramHasher::new(crate::ops::engram_hash::EngramHashConfig {
-            ngram_size,
-            num_buckets,
-            ..Default::default()
+        let mut caches = self.kv_caches.lock().expect("kv cache lock poisoned");
+        caches.push(KvCacheEntry {
+            storage,
+            config: *config,
+            used: 0,
         });
-
-        for i in 0..num_tokens {
-            let start = i.saturating_sub(ngram_size - 1);
-            let ngram: Vec<u32> = tokens[start..=i].to_vec();
-            let bucket = hasher.hash_ngram(&ngram);
-            bucket_indices[i] = bucket;
-
-            let bucket_idx = (bucket as usize) % num_buckets;
-            if bucket_idx * hidden_size + hidden_size <= engram_table.len() {
-                let src_start = bucket_idx * hidden_size;
-                let dst_start = i * hidden_size;
-                embeddings[dst_start..dst_start + hidden_size]
-                    .copy_from_slice(&engram_table[src_start..src_start + hidden_size]);
-            }
-        }
-
-        Ok((embeddings, bucket_indices))
-    }
-
-    fn engram_fuse(
-        &self,
-        attention_output: &[f32],
-        engram_output: &[f32],
-        config: &EngramFuseConfig,
-    ) -> Result<Vec<f32>, String> {
-        if attention_output.len() != engram_output.len() {
-            return Err("Attention and Engram outputs must have same shape".to_string());
-        }
-
-        let mut output = vec![0.0f32; attention_output.len()];
-        for i in 0..output.len() {
-            output[i] = config.attention_scale * attention_output[i]
-                + config.engram_scale * engram_output[i];
-        }
-
-        Ok(output)
-    }
-
-    fn kv_cache_update(
-        &self,
-        k_cache: &mut [f32],
-        v_cache: &mut [f32],
-        new_k: &[f32],
-        new_v: &[f32],
-        config: &KVCacheUpdateConfig,
-    ) -> Result<(), String> {
-        let batch = config.batch_size;
-        let num_kv_heads = config.num_kv_heads;
-        let head_dim = config.head_dim;
-        let num_new = config.num_new_tokens;
-        let pos = config.position;
-
-        let stride_per_batch = config.max_cache_len * num_kv_heads * head_dim;
-        let new_stride = num_new * num_kv_heads * head_dim;
-
-        for b in 0..batch {
-            let cache_offset = b * stride_per_batch + pos * num_kv_heads * head_dim;
-            let new_offset = b * new_stride;
-
-            k_cache[cache_offset..cache_offset + new_stride]
-                .copy_from_slice(&new_k[new_offset..new_offset + new_stride]);
-            v_cache[cache_offset..cache_offset + new_stride]
-                .copy_from_slice(&new_v[new_offset..new_offset + new_stride]);
-        }
-
-        Ok(())
-    }
-
-    fn sample(
-        &self,
-        logits: &[f32],
-        vocab_size: usize,
-        config: &SamplingConfig,
-    ) -> Result<Vec<u32>, String> {
-        let batch_size = logits.len() / vocab_size;
-        Ok(crate::ops::sampling::sample_tokens(logits, batch_size, vocab_size, config))
-    }
-
-    fn mean_pooling(
-        &self,
-        hidden: &[f32],
-        attention_mask: Option<&[f32]>,
-        config: &MeanPoolingConfig,
-    ) -> Result<Vec<f32>, String> {
-        let batch = config.batch_size;
-        let seq_len = config.seq_len;
-        let hidden_size = config.hidden_size;
-
-        let mut output = vec![0.0f32; batch * hidden_size];
-
-        for b in 0..batch {
-            let mut sum = vec![0.0f32; hidden_size];
-            let mut count = 0.0f32;
-
-            for s in 0..seq_len {
-                let mask_val = if let Some(mask) = attention_mask {
-                    mask[b * seq_len + s]
-                } else {
-                    1.0
-                };
-
-                if mask_val > 0.0 {
-                    let idx = (b * seq_len + s) * hidden_size;
-                    for h in 0..hidden_size {
-                        sum[h] += hidden[idx + h] * mask_val;
-                    }
-                    count += mask_val;
-                }
-            }
-
-            if count > 0.0 {
-                let out_idx = b * hidden_size;
-                for h in 0..hidden_size {
-                    output[out_idx + h] = sum[h] / count;
-                }
-            }
-        }
-
-        Ok(output)
-    }
-
-    fn cls_pooling(
-        &self,
-        hidden: &[f32],
-        config: &ClsPoolingConfig,
-    ) -> Result<Vec<f32>, String> {
-        let batch = config.batch_size;
-        let hidden_size = config.hidden_size;
-        let cls_pos = config.cls_position;
-
-        let seq_len = hidden.len() / (batch * hidden_size);
-        let mut output = vec![0.0f32; batch * hidden_size];
-
-        for b in 0..batch {
-            let src_idx = (b * seq_len + cls_pos) * hidden_size;
-            let dst_idx = b * hidden_size;
-            output[dst_idx..dst_idx + hidden_size]
-                .copy_from_slice(&hidden[src_idx..src_idx + hidden_size]);
-        }
-
-        Ok(output)
-    }
-
-    fn normalize(
-        &self,
-        input: &[f32],
-        config: &NormalizeConfig,
-    ) -> Result<Vec<f32>, String> {
-        let batch = config.batch_size;
-        let dim = config.dim;
-
-        let mut output = vec![0.0f32; batch * dim];
-
-        for b in 0..batch {
-            let start = b * dim;
-            let end = start + dim;
-
-            // Compute L2 norm
-            let mut norm_sq = 0.0f32;
-            for &val in &input[start..end] {
-                norm_sq += val * val;
-            }
-            let norm = (norm_sq + config.eps).sqrt();
-
-            // Normalize
-            for (i, &val) in input[start..end].iter().enumerate() {
-                output[start + i] = val / norm;
-            }
-        }
-
-        Ok(output)
-    }
-
-    fn dequantize(
-        &self,
-        quantized: &[u8],
-        scales: &[half::f16],
-        zeros: Option<&[u32]>,
-        config: &DequantizeConfig,
-    ) -> Result<Vec<f32>, String> {
-        match config.format {
-            QuantFormat::Q4_0 | QuantFormat::Q4_K => {
-                crate::ops::quantized::q4_dequantize_cpu(quantized, scales, config.n, config.k)
-            }
-            QuantFormat::Q8_0 => {
-                // Q8 uses i8, need to reinterpret
-                let q_weight: &[i8] = bytemuck::cast_slice(quantized);
-                // For Q8, we can use the matmul with identity to get dequantized
-                let identity = vec![1.0f32; config.k];
-                crate::ops::quantized::q8_matmul_cpu(&identity, q_weight, scales, 1, config.n, config.k)
-            }
-            QuantFormat::AWQ => {
-                let qweight: &[u32] = bytemuck::cast_slice(quantized);
-                let qzeros = zeros.ok_or("AWQ requires zero points")?;
-                crate::ops::quantized::awq_dequantize_cpu(
-                    qweight, qzeros, scales, config.n, config.k, config.group_size,
-                )
-            }
-        }
-    }
-
-    fn backend_type(&self) -> BackendType {
-        BackendType::Cpu
-    }
-
-    // =========================================================================
-    // Memory Tiering Primitives (ARCH-MEM-TIERING)
-    // CPU backend does not support memory tiering
-    // =========================================================================
-
-    fn swap_out(&self, _block_id: u64, _cpu_buffer: &mut [u8]) -> Result<(), String> {
-        Err("CpuBackend does not support memory tiering swap_out".to_string())
-    }
-
-    fn swap_in(&self, _cpu_buffer: &[u8], _block_id: u64) -> Result<(), String> {
-        Err("CpuBackend does not support memory tiering swap_in".to_string())
-    }
-
-    // =========================================================================
-    // L3 High-Level Inference API (ARCH-ADR-003)
-    // =========================================================================
-
-    fn generator_forward(
-        &self,
-        tokens: &[u32],
-        embed_weight: &[f32],
-        layers: &[TransformerLayerWeights<'_>],
-        final_norm: &[f32],
-        lm_head_weight: &[f32],
-        cos_cache: &[f32],
-        sin_cache: &[f32],
-        kv_cache: &mut KVCacheState<'_>,
-        config: &GeneratorForwardConfig,
-    ) -> Result<crate::kernel_types::LogitsTensor, String> {
-        let seq_len = tokens.len();
-        let hidden_size = config.hidden_size;
-        let num_q_heads = config.num_q_heads;
-        let num_kv_heads = config.num_kv_heads;
-        let head_dim = config.head_dim;
-        let intermediate_size = config.intermediate_size;
-
-        // 1. Embedding lookup
-        let embed_config = EmbeddingConfig {
-            vocab_size: config.vocab_size,
-            hidden_size,
-            max_seq_len: config.max_seq_len,
-            add_position_embedding: false,
-            padding_idx: None,
-        };
-        let mut hidden = self.embedding(tokens, embed_weight, None, &embed_config)?;
-
-        // 2. Process each layer
-        for (layer_idx, layer) in layers.iter().enumerate() {
-            // Get mutable references to KV cache for this layer
-            let (k_cache_slice, v_cache_slice) = {
-                let cache_offset = layer_idx * num_kv_heads * config.max_seq_len * head_dim;
-                let cache_size = num_kv_heads * config.max_seq_len * head_dim;
-                (
-                    Some(&mut kv_cache.k_cache[cache_offset..cache_offset + cache_size]),
-                    Some(&mut kv_cache.v_cache[cache_offset..cache_offset + cache_size]),
-                )
-            };
-
-            // Attention block
-            let attn_config = AttentionBlockConfig {
-                batch_size: 1,
-                seq_len,
-                hidden_size,
-                num_q_heads,
-                num_kv_heads,
-                head_dim,
-                causal: true,
-                use_rope: config.use_rope,
-                rope_theta: config.rope_theta,
-                position_offset: kv_cache.seq_len,
-                scale: None,
-                rms_norm_eps: config.rms_norm_eps,
-                engram_hook: None,
-                use_flash_attention: true,
-                dropout_prob: 0.0,
-            };
-            let attn_output = if layer.q_norm.is_some() || layer.k_norm.is_some() {
-                self.attention_block_with_qk_norm(
-                    &hidden,
-                    layer.q_weight,
-                    layer.k_weight,
-                    layer.v_weight,
-                    layer.o_weight,
-                    layer.input_norm,
-                    layer.q_norm,
-                    layer.k_norm,
-                    cos_cache,
-                    sin_cache,
-                    k_cache_slice,
-                    v_cache_slice,
-                    &attn_config,
-                )?
-            } else {
-                self.attention_block(
-                    &hidden,
-                    layer.q_weight,
-                    layer.k_weight,
-                    layer.v_weight,
-                    layer.o_weight,
-                    layer.input_norm,
-                    cos_cache,
-                    sin_cache,
-                    k_cache_slice,
-                    v_cache_slice,
-                    &attn_config,
-                )?
-            };
-
-            // Residual connection
-            for (h, a) in hidden.iter_mut().zip(attn_output.iter()) {
-                *h += a;
-            }
-
-            // FFN block
-            let ffn_config = FFNBlockConfig {
-                batch_size: 1,
-                seq_len,
-                hidden_size,
-                intermediate_size,
-                activation: config.activation,
-                use_gate: true,
-                use_bias: false,
-                rms_norm_eps: config.rms_norm_eps,
-            };
-            let ffn_output = self.ffn_block(
-                &hidden,
-                layer.gate_weight,
-                layer.up_weight,
-                layer.down_weight,
-                layer.post_attn_norm,
-                &ffn_config,
-            )?;
-
-            // Residual connection
-            for (h, f) in hidden.iter_mut().zip(ffn_output.iter()) {
-                *h += f;
-            }
-        }
-
-        // Update KV cache sequence length
-        kv_cache.seq_len += seq_len;
-
-        // 3. Final norm + LM head (only last token)
-        let last_hidden = hidden[(seq_len - 1) * hidden_size..].to_vec();
-        let lm_config = LMHeadConfig {
-            vocab_size: config.vocab_size,
-            hidden_size,
-            batch_size: 1,
-            seq_len: 1,
-            tie_word_embeddings: false,
-            rms_norm_eps: config.rms_norm_eps,
-        };
-        Ok(crate::kernel_types::LogitsTensor::Cpu(self.lm_head(&last_hidden, lm_head_weight, final_norm, &lm_config)?))
-    }
-
-    fn moe_generator_forward(
-        &self,
-        tokens: &[u32],
-        embed_weight: &[f32],
-        layers: &[MoETransformerLayerWeights<'_>],
-        final_norm: &[f32],
-        lm_head_weight: &[f32],
-        cos_cache: &[f32],
-        sin_cache: &[f32],
-        kv_cache: &mut KVCacheState<'_>,
-        config: &MoEGeneratorForwardConfig,
-    ) -> Result<crate::kernel_types::LogitsTensor, String> {
-        let seq_len = tokens.len();
-        let hidden_size = config.hidden_size;
-        let num_q_heads = config.num_q_heads;
-        let num_kv_heads = config.num_kv_heads;
-        let head_dim = config.head_dim;
-        let intermediate_size = config.intermediate_size;
-
-        // 1. Embedding lookup
-        let embed_config = EmbeddingConfig {
-            vocab_size: config.vocab_size,
-            hidden_size,
-            max_seq_len: config.max_seq_len,
-            add_position_embedding: false,
-            padding_idx: None,
-        };
-        let mut hidden = self.embedding(tokens, embed_weight, None, &embed_config)?;
-
-        // 2. Process each layer
-        for (layer_idx, layer) in layers.iter().enumerate() {
-            // Get mutable references to KV cache for this layer
-            let (k_cache_slice, v_cache_slice) = {
-                let cache_offset = layer_idx * num_kv_heads * config.max_seq_len * head_dim;
-                let cache_size = num_kv_heads * config.max_seq_len * head_dim;
-                (
-                    Some(&mut kv_cache.k_cache[cache_offset..cache_offset + cache_size]),
-                    Some(&mut kv_cache.v_cache[cache_offset..cache_offset + cache_size]),
-                )
-            };
-
-            // Attention block
-            let attn_config = AttentionBlockConfig {
-                batch_size: 1,
-                seq_len,
-                hidden_size,
-                num_q_heads,
-                num_kv_heads,
-                head_dim,
-                causal: true,
-                use_rope: config.use_rope,
-                rope_theta: config.rope_theta,
-                position_offset: kv_cache.seq_len,
-                scale: None,
-                rms_norm_eps: config.rms_norm_eps,
-                engram_hook: None,
-                use_flash_attention: true,
-                dropout_prob: 0.0,
-            };
-            let attn_output = if layer.q_norm.is_some() || layer.k_norm.is_some() {
-                self.attention_block_with_qk_norm(
-                    &hidden,
-                    layer.q_weight,
-                    layer.k_weight,
-                    layer.v_weight,
-                    layer.o_weight,
-                    layer.input_norm,
-                    layer.q_norm,
-                    layer.k_norm,
-                    cos_cache,
-                    sin_cache,
-                    k_cache_slice,
-                    v_cache_slice,
-                    &attn_config,
-                )?
-            } else {
-                self.attention_block(
-                    &hidden,
-                    layer.q_weight,
-                    layer.k_weight,
-                    layer.v_weight,
-                    layer.o_weight,
-                    layer.input_norm,
-                    cos_cache,
-                    sin_cache,
-                    k_cache_slice,
-                    v_cache_slice,
-                    &attn_config,
-                )?
-            };
-
-            // Residual connection
-            for (h, a) in hidden.iter_mut().zip(attn_output.iter()) {
-                *h += a;
-            }
-
-            // MoE FFN: route tokens to experts and combine outputs
-            // Apply post_attn_norm first (normalize each token independently)
-            let mut normed = vec![0.0f32; hidden.len()];
-            crate::ops::rms_norm::rms_norm_forward(&hidden, layer.post_attn_norm, &mut normed, seq_len, hidden_size, config.rms_norm_eps);
-
-            // Route and compute MoE
-            let moe_config = crate::MoERoutingConfig {
-                num_experts: config.num_experts,
-                num_experts_per_tok: config.num_experts_per_tok,
-                hidden_size,
-            };
-            let routing = crate::moe_route(&normed, layer.router_weight, 1, seq_len, &moe_config);
-
-            // Process each token through its assigned experts
-            let mut moe_output = vec![0.0f32; seq_len * hidden_size];
-            // Use moe_intermediate_size for expert FFN (typically smaller than intermediate_size)
-            let expert_intermediate_size = config.moe_intermediate_size.unwrap_or(intermediate_size);
-
-            for token_idx in 0..seq_len {
-                let token_input = &normed[token_idx * hidden_size..(token_idx + 1) * hidden_size];
-                let mut token_output = vec![0.0f32; hidden_size];
-                let route_base = token_idx * config.num_experts_per_tok;
-
-                for k in 0..config.num_experts_per_tok {
-                    let route_idx = route_base + k;
-                    let expert_idx = routing.expert_indices[route_idx] as usize;
-                    let weight = routing.expert_weights[route_idx];
-
-                    if expert_idx < config.num_experts {
-                        let expert = &layer.experts[expert_idx];
-                        // Gate projection
-                        let mut gate_out = vec![0.0f32; expert_intermediate_size];
-                        crate::linear_forward(token_input, expert.gate, None, &mut gate_out, 1, hidden_size, expert_intermediate_size);
-                        // Up projection
-                        let mut up = vec![0.0f32; expert_intermediate_size];
-                        crate::linear_forward(token_input, expert.up, None, &mut up, 1, hidden_size, expert_intermediate_size);
-                        // SiLU + element-wise multiply
-                        crate::silu_inplace(&mut gate_out);
-                        for (g, u) in gate_out.iter_mut().zip(up.iter()) {
-                            *g *= u;
-                        }
-                        // Down projection
-                        let mut expert_out = vec![0.0f32; hidden_size];
-                        crate::linear_forward(&gate_out, expert.down, None, &mut expert_out, 1, expert_intermediate_size, hidden_size);
-                        // Weighted sum
-                        for (o, e) in token_output.iter_mut().zip(expert_out.iter()) {
-                            *o += weight * e;
-                        }
-                    }
-                }
-                moe_output[token_idx * hidden_size..(token_idx + 1) * hidden_size]
-                    .copy_from_slice(&token_output);
-            }
-
-            // Residual connection
-            for (h, m) in hidden.iter_mut().zip(moe_output.iter()) {
-                *h += m;
-            }
-        }
-
-        // Update KV cache sequence length
-        kv_cache.seq_len += seq_len;
-
-        // 3. Final norm + LM head (only last token)
-        let last_hidden = hidden[(seq_len - 1) * hidden_size..].to_vec();
-        let lm_config = LMHeadConfig {
-            vocab_size: config.vocab_size,
-            hidden_size,
-            batch_size: 1,
-            seq_len: 1,
-            tie_word_embeddings: false,
-            rms_norm_eps: config.rms_norm_eps,
-        };
-        Ok(crate::kernel_types::LogitsTensor::Cpu(self.lm_head(&last_hidden, lm_head_weight, final_norm, &lm_config)?))
-    }
-
-    fn embedding_forward(
-        &self,
-        tokens: &[u32],
-        embed_weight: &[f32],
-        layers: &[TransformerLayerWeights<'_>],
-        final_norm: Option<&[f32]>,
-        config: &EmbeddingForwardConfig,
-    ) -> Result<Vec<f32>, String> {
-        let batch_size = config.batch_size;
-        let seq_len = config.seq_len;
-        let hidden_size = config.hidden_size;
-        let num_q_heads = config.num_q_heads;
-        let num_kv_heads = config.num_kv_heads;
-        let head_dim = config.head_dim;
-        let intermediate_size = config.intermediate_size;
-
-        // 1. Embedding lookup
-        let embed_config = EmbeddingConfig {
-            vocab_size: config.vocab_size,
-            hidden_size,
-            max_seq_len: seq_len,
-            add_position_embedding: false,
-            padding_idx: None,
-        };
-        let mut hidden = self.embedding(tokens, embed_weight, None, &embed_config)?;
-
-        // 2. Process each layer (no KV cache for embedding models)
-        for layer in layers.iter() {
-            // Attention block (bidirectional, no KV cache)
-            let attn_config = AttentionBlockConfig {
-                batch_size,
-                seq_len,
-                hidden_size,
-                num_q_heads,
-                num_kv_heads,
-                head_dim,
-                position_offset: 0,
-                causal: false,  // Bidirectional for embedding models
-                use_rope: false,  // No RoPE for BERT-style
-                rope_theta: 10000.0,
-                scale: None,
-                rms_norm_eps: config.rms_norm_eps,
-                engram_hook: None,
-                use_flash_attention: true,
-                dropout_prob: 0.0,
-            };
-            let attn_output = self.attention_block(
-                &hidden,
-                layer.q_weight,
-                layer.k_weight,
-                layer.v_weight,
-                layer.o_weight,
-                layer.input_norm,
-                &[],  // No RoPE for BERT-style
-                &[],
-                None, None,  // No KV cache
-                &attn_config,
-            )?;
-
-            // Residual connection
-            for (h, a) in hidden.iter_mut().zip(attn_output.iter()) {
-                *h += a;
-            }
-
-            // FFN block
-            let ffn_config = FFNBlockConfig {
-                batch_size,
-                seq_len,
-                hidden_size,
-                intermediate_size,
-                activation: config.activation,
-                use_gate: false,  // BERT-style typically doesn't use gate
-                use_bias: true,
-                rms_norm_eps: config.rms_norm_eps,
-            };
-            let ffn_output = self.ffn_block(
-                &hidden,
-                layer.gate_weight,
-                layer.up_weight,
-                layer.down_weight,
-                layer.post_attn_norm,
-                &ffn_config,
-            )?;
-
-            // Residual connection
-            for (h, f) in hidden.iter_mut().zip(ffn_output.iter()) {
-                *h += f;
-            }
-        }
-
-        // 3. Optional final norm
-        if let Some(norm_weight) = final_norm {
-            let mut normalized = vec![0.0f32; hidden.len()];
-            crate::ops::rms_norm::rms_norm_forward(&hidden, norm_weight, &mut normalized, batch_size * seq_len, hidden_size, config.rms_norm_eps);
-            hidden = normalized;
-        }
-
-        // 4. Pooling
-        let pooled = match config.pooling {
-            PoolingType::Mean => {
-                let pool_config = MeanPoolingConfig {
-                    batch_size,
-                    seq_len,
-                    hidden_size,
-                    use_attention_mask: false,
-                };
-                self.mean_pooling(&hidden, None, &pool_config)?
-            }
-            PoolingType::Cls => {
-                let pool_config = ClsPoolingConfig {
-                    batch_size,
-                    hidden_size,
-                    cls_position: 0,
-                };
-                self.cls_pooling(&hidden, &pool_config)?
-            }
-            PoolingType::Last => {
-                // Get the last token of each sequence in the batch
-                let mut result = Vec::with_capacity(batch_size * hidden_size);
-                for b in 0..batch_size {
-                    let last_pos = (b * seq_len + seq_len - 1) * hidden_size;
-                    result.extend_from_slice(&hidden[last_pos..last_pos + hidden_size]);
-                }
-                result
-            }
-        };
-
-        // 5. L2 normalize if requested
-        if config.normalize {
-            let norm_config = NormalizeConfig {
-                batch_size,
-                dim: hidden_size,
-                eps: 1e-12,
-            };
-            self.normalize(&pooled, &norm_config)
-        } else {
-            Ok(pooled)
-        }
-    }
-
-    fn rerank_forward(
-        &self,
-        tokens: &[u32],
-        embed_weight: &[f32],
-        layers: &[TransformerLayerWeights<'_>],
-        final_norm: &[f32],
-        score_weight: &[f32],
-        config: &RerankForwardConfig,
-    ) -> Result<Vec<f32>, String> {
-        let batch_size = config.batch_size;
-        let seq_len = config.seq_len;
-        let hidden_size = config.hidden_size;
-        let num_q_heads = config.num_q_heads;
-        let num_kv_heads = config.num_kv_heads;
-        let head_dim = config.head_dim;
-        let intermediate_size = config.intermediate_size;
-
-        // 1. Embedding lookup
-        let embed_config = EmbeddingConfig {
-            vocab_size: config.vocab_size,
-            hidden_size,
-            max_seq_len: seq_len,
-            add_position_embedding: false,
-            padding_idx: None,
-        };
-        let mut hidden = self.embedding(tokens, embed_weight, None, &embed_config)?;
-
-        // 2. Process each layer (bidirectional, no KV cache)
-        for layer in layers.iter() {
-            let attn_config = AttentionBlockConfig {
-                batch_size,
-                seq_len,
-                hidden_size,
-                num_q_heads,
-                num_kv_heads,
-                head_dim,
-                position_offset: 0,
-                causal: false,  // Bidirectional for reranker
-                use_rope: false,  // No RoPE for BERT-style
-                rope_theta: 10000.0,
-                scale: None,
-                rms_norm_eps: config.rms_norm_eps,
-                engram_hook: None,
-                use_flash_attention: true,
-                dropout_prob: 0.0,
-            };
-            let attn_output = self.attention_block(
-                &hidden,
-                layer.q_weight,
-                layer.k_weight,
-                layer.v_weight,
-                layer.o_weight,
-                layer.input_norm,
-                &[],  // No RoPE for BERT-style
-                &[],
-                None, None,
-                &attn_config,
-            )?;
-
-            for (h, a) in hidden.iter_mut().zip(attn_output.iter()) {
-                *h += a;
-            }
-
-            let ffn_config = FFNBlockConfig {
-                batch_size,
-                seq_len,
-                hidden_size,
-                intermediate_size,
-                activation: config.activation,
-                use_gate: false,  // BERT-style typically doesn't use gate
-                use_bias: true,
-                rms_norm_eps: config.rms_norm_eps,
-            };
-            let ffn_output = self.ffn_block(
-                &hidden,
-                layer.gate_weight,
-                layer.up_weight,
-                layer.down_weight,
-                layer.post_attn_norm,
-                &ffn_config,
-            )?;
-
-            for (h, f) in hidden.iter_mut().zip(ffn_output.iter()) {
-                *h += f;
-            }
-        }
-
-        // 3. Final norm
-        let mut normalized = vec![0.0f32; hidden.len()];
-        crate::ops::rms_norm::rms_norm_forward(&hidden, final_norm, &mut normalized, batch_size * seq_len, hidden_size, config.rms_norm_eps);
-        hidden = normalized;
-
-        // 4. CLS pooling (first token of each sequence)
-        let cls_pooling_config = ClsPoolingConfig {
-            batch_size,
-            hidden_size,
-            cls_position: 0,
-        };
-        let cls_output = self.cls_pooling(&hidden, &cls_pooling_config)?;
-
-        // 5. Score head (linear projection to scalar for each batch)
-        let mut scores = vec![0.0f32; batch_size];
-        crate::linear_forward(&cls_output, score_weight, None, &mut scores, batch_size, hidden_size, 1);
-
-        Ok(scores)
-    }
-
-    // =========================================================================
-    // GPU-pure methods (ARCH-GPU-001)
-    // For CPU backend, these use the Cpu variant of GpuBuffer.
-    // =========================================================================
-
-    fn upload_embedding_weights(
-        &self,
-        embed_weight: &[f32],
-        layers: &[TransformerLayerWeights<'_>],
-        final_norm: Option<&[f32]>,
-        _config: &EmbeddingForwardConfig,
-    ) -> Result<EmbeddingModelWeightsGpu, String> {
-        // Helper to create a CPU-backed GpuTensor from f32 slice
-        fn f32_to_gpu_tensor(data: &[f32], shape: Vec<usize>) -> GpuTensor {
-            let bytes: Vec<u8> = data.iter().flat_map(|v| v.to_le_bytes()).collect();
-            GpuTensor::new(
-                GpuBuffer::Cpu(Arc::new(bytes)),
-                shape,
-                TensorDtype::F32,
-                BackendType::Cpu,
-            )
-        }
-
-        // Upload embedding weights
-        let embedding = f32_to_gpu_tensor(embed_weight, vec![embed_weight.len()]);
-
-        // Upload layer weights
-        let gpu_layers: Vec<TransformerLayerWeightsGpu> = layers.iter().map(|layer| {
-            TransformerLayerWeightsGpu {
-                input_norm: f32_to_gpu_tensor(layer.input_norm, vec![layer.input_norm.len()]),
-                q_weight: f32_to_gpu_tensor(layer.q_weight, vec![layer.q_weight.len()]),
-                k_weight: f32_to_gpu_tensor(layer.k_weight, vec![layer.k_weight.len()]),
-                v_weight: f32_to_gpu_tensor(layer.v_weight, vec![layer.v_weight.len()]),
-                o_weight: f32_to_gpu_tensor(layer.o_weight, vec![layer.o_weight.len()]),
-                post_attn_norm: f32_to_gpu_tensor(layer.post_attn_norm, vec![layer.post_attn_norm.len()]),
-                gate_weight: layer.gate_weight.map(|g| f32_to_gpu_tensor(g, vec![g.len()])),
-                up_weight: f32_to_gpu_tensor(layer.up_weight, vec![layer.up_weight.len()]),
-                down_weight: f32_to_gpu_tensor(layer.down_weight, vec![layer.down_weight.len()]),
-                q_norm: layer.q_norm.as_ref().map(|w| f32_to_gpu_tensor(w, vec![w.len()])),
-                k_norm: layer.k_norm.as_ref().map(|w| f32_to_gpu_tensor(w, vec![w.len()])),
-                cos_cache: None,
-                sin_cache: None,
-            }
-        }).collect();
-
-        // Upload final norm
-        let final_norm_gpu = match final_norm {
-            Some(norm) => f32_to_gpu_tensor(norm, vec![norm.len()]),
-            None => f32_to_gpu_tensor(&[], vec![0]),
-        };
-
-        Ok(EmbeddingModelWeightsGpu {
-            embedding,
-            layers: gpu_layers,
-            final_norm: final_norm_gpu,
-        })
-    }
-
-    fn embedding_forward_gpu_pure(
-        &self,
-        tokens: &[u32],
-        weights: &EmbeddingModelWeightsGpu,
-        config: &EmbeddingForwardConfig,
-    ) -> Result<Vec<f32>, String> {
-        // Helper to extract f32 slice from CPU-backed GpuTensor
-        fn gpu_tensor_to_f32(tensor: &GpuTensor) -> Result<&[f32], String> {
-            match &tensor.buffer {
-                GpuBuffer::Cpu(bytes) => {
-                    let ptr = bytes.as_ptr() as *const f32;
-                    let len = bytes.len() / 4;
-                    Ok(unsafe { std::slice::from_raw_parts(ptr, len) })
-                }
-                #[allow(unreachable_patterns)]
-                _ => Err("Expected CPU-backed GpuTensor".to_string()),
-            }
-        }
-
-        // Extract weights from GpuTensor
-        let embed_weight = gpu_tensor_to_f32(&weights.embedding)?;
-        let final_norm = gpu_tensor_to_f32(&weights.final_norm)?;
-        let final_norm_opt = if final_norm.is_empty() { None } else { Some(final_norm) };
-
-        // Extract layer weights
-        let layer_weights: Result<Vec<TransformerLayerWeights<'_>>, String> = weights.layers.iter()
-            .map(|layer| {
-                Ok(TransformerLayerWeights {
-                    input_norm: gpu_tensor_to_f32(&layer.input_norm)?,
-                    q_weight: gpu_tensor_to_f32(&layer.q_weight)?,
-                    k_weight: gpu_tensor_to_f32(&layer.k_weight)?,
-                    v_weight: gpu_tensor_to_f32(&layer.v_weight)?,
-                    o_weight: gpu_tensor_to_f32(&layer.o_weight)?,
-                    post_attn_norm: gpu_tensor_to_f32(&layer.post_attn_norm)?,
-                    gate_weight: match &layer.gate_weight {
-                        Some(g) => Some(gpu_tensor_to_f32(g)?),
-                        None => None,
-                    },
-                    up_weight: gpu_tensor_to_f32(&layer.up_weight)?,
-                    down_weight: gpu_tensor_to_f32(&layer.down_weight)?,
-                    q_norm: match &layer.q_norm {
-                        Some(w) => Some(gpu_tensor_to_f32(w)?),
-                        None => None,
-                    },
-                    k_norm: match &layer.k_norm {
-                        Some(w) => Some(gpu_tensor_to_f32(w)?),
-                        None => None,
-                    },
-                })
-            })
-            .collect();
-        let layers = layer_weights?;
-
-        // Call existing embedding_forward
-        self.embedding_forward(tokens, embed_weight, &layers, final_norm_opt, config)
-    }
-
-    // =========================================================================
-    // GPU-Native Kernel Methods (ARCH-ADR-010)
-    // CPU backend implements these using CPU-backed GpuBuffer::Cpu
-    // =========================================================================
-
-    fn embedding_lookup_gpu(
-        &self,
-        tokens: &GpuTensor,
-        embed_weight: &GpuTensor,
-        output: &mut GpuTensor,
-    ) -> Result<(), String> {
-        // Extract data from CPU-backed tensors
-        let token_bytes = match &tokens.buffer {
-            GpuBuffer::Cpu(b) => b,
-            _ => return Err("CpuBackend: expected CPU-backed tensor for tokens".into()),
-        };
-        let embed_bytes = match &embed_weight.buffer {
-            GpuBuffer::Cpu(b) => b,
-            _ => return Err("CpuBackend: expected CPU-backed tensor for embed_weight".into()),
-        };
-
-        let token_ids: &[u32] = bytemuck::cast_slice(token_bytes);
-        let embed_data: &[f32] = bytemuck::cast_slice(embed_bytes);
-
-        // embed_weight shape: [vocab_size, hidden_dim]
-        let hidden_dim = embed_weight.shape.last().copied().unwrap_or(0);
-
-        // Perform gather: output[i] = embed_data[token_ids[i] * hidden_dim..]
-        let mut result = Vec::with_capacity(token_ids.len() * hidden_dim);
-        for &tid in token_ids {
-            let start = (tid as usize) * hidden_dim;
-            let end = start + hidden_dim;
-            if end <= embed_data.len() {
-                result.extend_from_slice(&embed_data[start..end]);
-            } else {
-                return Err(format!("Token ID {} out of bounds", tid));
-            }
-        }
-
-        // Write result to output
-        output.buffer = GpuBuffer::Cpu(bytemuck::cast_slice(&result).to_vec().into());
-        Ok(())
-    }
-
-    fn transformer_layer_gpu(
-        &self,
-        hidden: &mut GpuTensor,
-        layer_weights: &TransformerLayerWeightsGpu,
-        kv_cache: Option<&mut KVCacheGpu>,
-        config: &TransformerLayerConfigGpu,
-    ) -> Result<(), String> {
-        // Helper to extract f32 slice from CPU-backed GpuTensor
-        fn gpu_tensor_to_f32(tensor: &GpuTensor) -> Result<&[f32], String> {
-            match &tensor.buffer {
-                GpuBuffer::Cpu(bytes) => Ok(bytemuck::cast_slice(bytes)),
-                _ => Err("CpuBackend: expected CPU-backed tensor".into()),
-            }
-        }
-
-        let hidden_data: Vec<f32> = match &hidden.buffer {
-            GpuBuffer::Cpu(bytes) => bytemuck::cast_slice(bytes).to_vec(),
-            _ => return Err("CpuBackend: expected CPU-backed tensor for hidden".into()),
-        };
-
-        let cos_cache = layer_weights
-            .cos_cache
-            .as_ref()
-            .map(|c| gpu_tensor_to_f32(c))
-            .transpose()?;
-        let sin_cache = layer_weights
-            .sin_cache
-            .as_ref()
-            .map(|s| gpu_tensor_to_f32(s))
-            .transpose()?;
-
-        // Build config for existing attention_block
-        let attn_config = AttentionBlockConfig {
-            batch_size: config.batch_size,
-            seq_len: config.seq_len,
-            hidden_size: config.hidden_size,
-            num_q_heads: config.num_q_heads,
-            num_kv_heads: config.num_kv_heads,
-            head_dim: config.head_dim,
-            position_offset: config.position,
-            rms_norm_eps: config.rms_norm_eps,
-            use_rope: true,
-            causal: true,
-            ..Default::default()
-        };
-
-        // Extract KV cache if provided
-        let (mut kv_k, mut kv_v) = if let Some(kv) = kv_cache.as_ref() {
-            let k_data: Vec<f32> = match &kv.k_cache.buffer {
-                GpuBuffer::Cpu(bytes) => bytemuck::cast_slice(bytes).to_vec(),
-                _ => return Err("CpuBackend: expected CPU-backed KV cache".into()),
-            };
-            let v_data: Vec<f32> = match &kv.v_cache.buffer {
-                GpuBuffer::Cpu(bytes) => bytemuck::cast_slice(bytes).to_vec(),
-                _ => return Err("CpuBackend: expected CPU-backed KV cache".into()),
-            };
-            (k_data, v_data)
-        } else {
-            (vec![], vec![])
-        };
-
-        let kv_k_opt = if kv_k.is_empty() { None } else { Some(kv_k.as_mut_slice()) };
-        let kv_v_opt = if kv_v.is_empty() { None } else { Some(kv_v.as_mut_slice()) };
-
-        // Run attention block
-        let attn_out = self.attention_block(
-            &hidden_data,
-            gpu_tensor_to_f32(&layer_weights.q_weight)?,
-            gpu_tensor_to_f32(&layer_weights.k_weight)?,
-            gpu_tensor_to_f32(&layer_weights.v_weight)?,
-            gpu_tensor_to_f32(&layer_weights.o_weight)?,
-            gpu_tensor_to_f32(&layer_weights.input_norm)?,
-            cos_cache.unwrap_or(&[]),
-            sin_cache.unwrap_or(&[]),
-            kv_k_opt,
-            kv_v_opt,
-            &attn_config,
-        )?;
-
-        // Build FFN config
-        let ffn_config = FFNBlockConfig {
-            batch_size: config.batch_size,
-            seq_len: config.seq_len,
-            hidden_size: config.hidden_size,
-            intermediate_size: config.intermediate_size,
-            activation: if config.use_silu { Activation::SiLU } else { Activation::GELU },
-            use_gate: layer_weights.gate_weight.is_some(),
-            use_bias: false,
-            rms_norm_eps: config.rms_norm_eps,
-        };
-
-        // Run FFN block
-        let gate_weight = layer_weights.gate_weight.as_ref().map(|g| gpu_tensor_to_f32(g)).transpose()?;
-        let ffn_out = self.ffn_block(
-            &attn_out,
-            gate_weight,
-            gpu_tensor_to_f32(&layer_weights.up_weight)?,
-            gpu_tensor_to_f32(&layer_weights.down_weight)?,
-            gpu_tensor_to_f32(&layer_weights.post_attn_norm)?,
-            &ffn_config,
-        )?;
-
-        // Update hidden
-        hidden.buffer = GpuBuffer::Cpu(bytemuck::cast_slice(&ffn_out).to_vec().into());
-
-        // Update KV cache if provided
-        if let Some(kv) = kv_cache {
-            if !kv_k.is_empty() {
-                kv.k_cache.buffer = GpuBuffer::Cpu(bytemuck::cast_slice(&kv_k).to_vec().into());
-            }
-            if !kv_v.is_empty() {
-                kv.v_cache.buffer = GpuBuffer::Cpu(bytemuck::cast_slice(&kv_v).to_vec().into());
-            }
-            kv.seq_len = config.position + config.seq_len;
-        }
-
-        Ok(())
-    }
-
-    fn rms_norm_gpu(
-        &self,
-        hidden: &mut GpuTensor,
-        weight: &GpuTensor,
-        eps: f32,
-    ) -> Result<(), String> {
-        let hidden_data: Vec<f32> = match &hidden.buffer {
-            GpuBuffer::Cpu(bytes) => bytemuck::cast_slice(bytes).to_vec(),
-            _ => return Err("CpuBackend: expected CPU-backed tensor".into()),
-        };
-        let weight_data: &[f32] = match &weight.buffer {
-            GpuBuffer::Cpu(bytes) => bytemuck::cast_slice(bytes),
-            _ => return Err("CpuBackend: expected CPU-backed tensor".into()),
-        };
-
-        let hidden_dim = weight_data.len();
-        let num_tokens = hidden_data.len() / hidden_dim;
-
-        let mut result = vec![0.0f32; hidden_data.len()];
-        for i in 0..num_tokens {
-            let start = i * hidden_dim;
-            let slice = &hidden_data[start..start + hidden_dim];
-
-            // Compute RMS
-            let sum_sq: f32 = slice.iter().map(|x| x * x).sum();
-            let rms = (sum_sq / hidden_dim as f32 + eps).sqrt();
-
-            // Normalize and scale
-            for j in 0..hidden_dim {
-                result[start + j] = (slice[j] / rms) * weight_data[j];
-            }
-        }
-
-        hidden.buffer = GpuBuffer::Cpu(bytemuck::cast_slice(&result).to_vec().into());
-        Ok(())
-    }
-
-    fn mean_pooling_gpu(
-        &self,
-        hidden: &GpuTensor,
-        attention_mask: &GpuTensor,
-        output: &mut GpuTensor,
-    ) -> Result<(), String> {
-        let hidden_data: &[f32] = match &hidden.buffer {
-            GpuBuffer::Cpu(bytes) => bytemuck::cast_slice(bytes),
-            _ => return Err("CpuBackend: expected CPU-backed tensor".into()),
-        };
-        let mask_data: &[f32] = match &attention_mask.buffer {
-            GpuBuffer::Cpu(bytes) => bytemuck::cast_slice(bytes),
-            _ => return Err("CpuBackend: expected CPU-backed tensor".into()),
-        };
-
-        // hidden: [batch, seq_len, hidden_dim]
-        // mask: [batch, seq_len]
-        let batch_size = hidden.shape.first().copied().unwrap_or(1);
-        let seq_len = hidden.shape.get(1).copied().unwrap_or(1);
-        let hidden_dim = hidden.shape.last().copied().unwrap_or(0);
-
-        let mut result = vec![0.0f32; batch_size * hidden_dim];
-
-        for b in 0..batch_size {
-            let mut sum = vec![0.0f32; hidden_dim];
-            let mut count = 0.0f32;
-
-            for s in 0..seq_len {
-                let mask_val = mask_data[b * seq_len + s];
-                if mask_val > 0.0 {
-                    let offset = b * seq_len * hidden_dim + s * hidden_dim;
-                    for d in 0..hidden_dim {
-                        sum[d] += hidden_data[offset + d] * mask_val;
-                    }
-                    count += mask_val;
-                }
-            }
-
-            if count > 0.0 {
-                for d in 0..hidden_dim {
-                    result[b * hidden_dim + d] = sum[d] / count;
-                }
-            }
-        }
-
-        output.buffer = GpuBuffer::Cpu(bytemuck::cast_slice(&result).to_vec().into());
-        Ok(())
-    }
-
-    fn normalize_gpu(
-        &self,
-        embeddings: &mut GpuTensor,
-    ) -> Result<(), String> {
-        let data: Vec<f32> = match &embeddings.buffer {
-            GpuBuffer::Cpu(bytes) => bytemuck::cast_slice(bytes).to_vec(),
-            _ => return Err("CpuBackend: expected CPU-backed tensor".into()),
-        };
-
-        let hidden_dim = embeddings.shape.last().copied().unwrap_or(0);
-        let batch_size = data.len() / hidden_dim;
-
-        let mut result = vec![0.0f32; data.len()];
-
-        for b in 0..batch_size {
-            let start = b * hidden_dim;
-            let slice = &data[start..start + hidden_dim];
-
-            // Compute L2 norm
-            let norm: f32 = slice.iter().map(|x| x * x).sum::<f32>().sqrt();
-
-            // Normalize
-            if norm > 1e-12 {
-                for d in 0..hidden_dim {
-                    result[start + d] = slice[d] / norm;
-                }
-            }
-        }
-
-        embeddings.buffer = GpuBuffer::Cpu(bytemuck::cast_slice(&result).to_vec().into());
-        Ok(())
-    }
-
-    fn cls_pooling_gpu(
-        &self,
-        hidden: &GpuTensor,
-        output: &mut GpuTensor,
-    ) -> Result<(), String> {
-        let hidden_data: &[f32] = match &hidden.buffer {
-            GpuBuffer::Cpu(bytes) => bytemuck::cast_slice(bytes),
-            _ => return Err("CpuBackend: expected CPU-backed tensor".into()),
-        };
-
-        // hidden: [batch, seq_len, hidden_dim]
-        let batch_size = hidden.shape.first().copied().unwrap_or(1);
-        let seq_len = hidden.shape.get(1).copied().unwrap_or(1);
-        let hidden_dim = hidden.shape.last().copied().unwrap_or(0);
-
-        // Extract first token for each batch
-        let mut result = Vec::with_capacity(batch_size * hidden_dim);
-        for b in 0..batch_size {
-            let offset = b * seq_len * hidden_dim;
-            result.extend_from_slice(&hidden_data[offset..offset + hidden_dim]);
-        }
-
-        output.buffer = GpuBuffer::Cpu(bytemuck::cast_slice(&result).to_vec().into());
-        Ok(())
-    }
-
-    fn classifier_gpu(
-        &self,
-        hidden: &GpuTensor,
-        weight: &GpuTensor,
-        bias: Option<&GpuTensor>,
-        output: &mut GpuTensor,
-    ) -> Result<(), String> {
-        let hidden_data: &[f32] = match &hidden.buffer {
-            GpuBuffer::Cpu(bytes) => bytemuck::cast_slice(bytes),
-            _ => return Err("CpuBackend: expected CPU-backed tensor".into()),
-        };
-        let weight_data: &[f32] = match &weight.buffer {
-            GpuBuffer::Cpu(bytes) => bytemuck::cast_slice(bytes),
-            _ => return Err("CpuBackend: expected CPU-backed tensor".into()),
-        };
-        let bias_data: Option<&[f32]> = bias.map(|b| match &b.buffer {
-            GpuBuffer::Cpu(bytes) => bytemuck::cast_slice(bytes),
-            _ => &[] as &[f32],
-        });
-
-        // hidden: [batch, hidden_dim]
-        // weight: [num_classes, hidden_dim]
-        let batch_size = hidden.shape.first().copied().unwrap_or(1);
-        let hidden_dim = hidden.shape.last().copied().unwrap_or(0);
-        let num_classes = weight.shape.first().copied().unwrap_or(0);
-
-        let mut result = vec![0.0f32; batch_size * num_classes];
-
-        // Linear: output = hidden @ weight.T + bias
-        for b in 0..batch_size {
-            for c in 0..num_classes {
-                let mut sum = 0.0f32;
-                for d in 0..hidden_dim {
-                    sum += hidden_data[b * hidden_dim + d] * weight_data[c * hidden_dim + d];
-                }
-                if let Some(bd) = bias_data {
-                    if c < bd.len() {
-                        sum += bd[c];
-                    }
-                }
-                result[b * num_classes + c] = sum;
-            }
-        }
-
-        output.buffer = GpuBuffer::Cpu(bytemuck::cast_slice(&result).to_vec().into());
-        Ok(())
-    }
-
-    fn lm_head_gpu(
-        &self,
-        hidden: &GpuTensor,
-        weight: &GpuTensor,
-        output: &mut GpuTensor,
-    ) -> Result<(), String> {
-        // LM head is just a linear layer without bias
-        self.classifier_gpu(hidden, weight, None, output)
-    }
-
-    // =========================================================================
-    // GPU-Native High-Level Forward Methods (ARCH-ADR-010)
-    // =========================================================================
-
-    fn upload_reranker_weights(
-        &self,
-        embed_weight: &[f32],
-        layers: &[TransformerLayerWeights<'_>],
-        final_norm: &[f32],
-        classifier_weight: &[f32],
-        classifier_bias: Option<&[f32]>,
-        config: &RerankForwardConfig,
-    ) -> Result<RerankerModelWeightsGpu, String> {
-        // Helper to create CPU-backed GpuTensor
-        fn f32_to_gpu_tensor(data: &[f32], shape: Vec<usize>) -> GpuTensor {
-            let size_in_bytes = data.len() * std::mem::size_of::<f32>();
-            GpuTensor {
-                buffer: GpuBuffer::Cpu(bytemuck::cast_slice(data).to_vec().into()),
-                shape,
-                dtype: TensorDtype::F32,
-                size_in_bytes,
-                backend: BackendType::Cpu,
-            }
-        }
-
-        let hidden_dim = config.hidden_size;
-        let vocab_size = embed_weight.len() / hidden_dim;
-
-        let embedding = f32_to_gpu_tensor(embed_weight, vec![vocab_size, hidden_dim]);
-        let final_norm_gpu = f32_to_gpu_tensor(final_norm, vec![hidden_dim]);
-
-        let num_classes = classifier_weight.len() / hidden_dim;
-        let classifier_weight_gpu = f32_to_gpu_tensor(classifier_weight, vec![num_classes, hidden_dim]);
-        let classifier_bias_gpu = classifier_bias.map(|b| f32_to_gpu_tensor(b, vec![num_classes]));
-
-        // Convert layers
-        let gpu_layers: Vec<TransformerLayerWeightsGpu> = layers.iter().map(|layer| {
-            TransformerLayerWeightsGpu {
-                input_norm: f32_to_gpu_tensor(layer.input_norm, vec![hidden_dim]),
-                q_weight: f32_to_gpu_tensor(layer.q_weight, vec![layer.q_weight.len()]),
-                k_weight: f32_to_gpu_tensor(layer.k_weight, vec![layer.k_weight.len()]),
-                v_weight: f32_to_gpu_tensor(layer.v_weight, vec![layer.v_weight.len()]),
-                o_weight: f32_to_gpu_tensor(layer.o_weight, vec![layer.o_weight.len()]),
-                post_attn_norm: f32_to_gpu_tensor(layer.post_attn_norm, vec![hidden_dim]),
-                gate_weight: layer.gate_weight.map(|g| f32_to_gpu_tensor(g, vec![g.len()])),
-                up_weight: f32_to_gpu_tensor(layer.up_weight, vec![layer.up_weight.len()]),
-                down_weight: f32_to_gpu_tensor(layer.down_weight, vec![layer.down_weight.len()]),
-                q_norm: layer.q_norm.as_ref().map(|w| f32_to_gpu_tensor(w, vec![w.len()])),
-                k_norm: layer.k_norm.as_ref().map(|w| f32_to_gpu_tensor(w, vec![w.len()])),
-                cos_cache: None,
-                sin_cache: None,
-            }
-        }).collect();
-
-        Ok(RerankerModelWeightsGpu {
-            embedding,
-            layers: gpu_layers,
-            final_norm: final_norm_gpu,
-            classifier_weight: classifier_weight_gpu,
-            classifier_bias: classifier_bias_gpu,
-        })
-    }
-
-    fn rerank_forward_gpu_pure(
-        &self,
-        tokens: &[u32],
-        weights: &RerankerModelWeightsGpu,
-        config: &RerankForwardConfig,
-    ) -> Result<Vec<f32>, String> {
-        // Helper to extract f32 slice from CPU-backed GpuTensor
-        fn gpu_tensor_to_f32(tensor: &GpuTensor) -> Result<&[f32], String> {
-            match &tensor.buffer {
-                GpuBuffer::Cpu(bytes) => Ok(bytemuck::cast_slice(bytes)),
-                _ => Err("CpuBackend: expected CPU-backed tensor".into()),
-            }
-        }
-
-        // Convert GPU weights back to slices for existing rerank_forward
-        let embed_weight = gpu_tensor_to_f32(&weights.embedding)?;
-        let final_norm = gpu_tensor_to_f32(&weights.final_norm)?;
-        let classifier_weight = gpu_tensor_to_f32(&weights.classifier_weight)?;
-        let classifier_bias = weights.classifier_bias.as_ref().map(|b| gpu_tensor_to_f32(b)).transpose()?;
-
-        let layer_weights: Result<Vec<TransformerLayerWeights<'_>>, String> = weights.layers.iter()
-            .map(|layer| {
-                Ok(TransformerLayerWeights {
-                    input_norm: gpu_tensor_to_f32(&layer.input_norm)?,
-                    q_weight: gpu_tensor_to_f32(&layer.q_weight)?,
-                    k_weight: gpu_tensor_to_f32(&layer.k_weight)?,
-                    v_weight: gpu_tensor_to_f32(&layer.v_weight)?,
-                    o_weight: gpu_tensor_to_f32(&layer.o_weight)?,
-                    post_attn_norm: gpu_tensor_to_f32(&layer.post_attn_norm)?,
-                    gate_weight: layer.gate_weight.as_ref().map(|g| gpu_tensor_to_f32(g)).transpose()?,
-                    up_weight: gpu_tensor_to_f32(&layer.up_weight)?,
-                    down_weight: gpu_tensor_to_f32(&layer.down_weight)?,
-                    q_norm: layer.q_norm.as_ref().map(|w| gpu_tensor_to_f32(w)).transpose()?,
-                    k_norm: layer.k_norm.as_ref().map(|w| gpu_tensor_to_f32(w)).transpose()?,
-                })
-            })
-            .collect();
-        let layers = layer_weights?;
-
-        // Call existing rerank_forward (classifier_bias handled separately if needed)
-        self.rerank_forward(
-            tokens,
-            embed_weight,
-            &layers,
-            final_norm,
-            classifier_weight,
-            config,
-        )
-    }
-
-    fn upload_generator_weights(
-        &self,
-        embed_weight: &[f32],
-        layers: &[TransformerLayerWeights<'_>],
-        final_norm: &[f32],
-        lm_head: &[f32],
-        cos_cache: &[f32],
-        sin_cache: &[f32],
-        config: &GeneratorForwardConfig,
-    ) -> Result<GeneratorModelWeightsGpu, String> {
-        // Helper to create CPU-backed GpuTensor
-        fn f32_to_gpu_tensor(data: &[f32], shape: Vec<usize>) -> GpuTensor {
-            let size_in_bytes = data.len() * std::mem::size_of::<f32>();
-            GpuTensor {
-                buffer: GpuBuffer::Cpu(bytemuck::cast_slice(data).to_vec().into()),
-                shape,
-                dtype: TensorDtype::F32,
-                size_in_bytes,
-                backend: BackendType::Cpu,
-            }
-        }
-
-        let hidden_dim = config.hidden_size;
-        let vocab_size = embed_weight.len() / hidden_dim;
-
-        let embedding = f32_to_gpu_tensor(embed_weight, vec![vocab_size, hidden_dim]);
-        let final_norm_gpu = f32_to_gpu_tensor(final_norm, vec![hidden_dim]);
-        let lm_head_gpu = f32_to_gpu_tensor(lm_head, vec![vocab_size, hidden_dim]);
-        let cos_cache_gpu = f32_to_gpu_tensor(cos_cache, vec![cos_cache.len()]);
-        let sin_cache_gpu = f32_to_gpu_tensor(sin_cache, vec![sin_cache.len()]);
-
-        // Convert layers
-        let gpu_layers: Vec<TransformerLayerWeightsGpu> = layers.iter().map(|layer| {
-            TransformerLayerWeightsGpu {
-                input_norm: f32_to_gpu_tensor(layer.input_norm, vec![hidden_dim]),
-                q_weight: f32_to_gpu_tensor(layer.q_weight, vec![layer.q_weight.len()]),
-                k_weight: f32_to_gpu_tensor(layer.k_weight, vec![layer.k_weight.len()]),
-                v_weight: f32_to_gpu_tensor(layer.v_weight, vec![layer.v_weight.len()]),
-                o_weight: f32_to_gpu_tensor(layer.o_weight, vec![layer.o_weight.len()]),
-                post_attn_norm: f32_to_gpu_tensor(layer.post_attn_norm, vec![hidden_dim]),
-                gate_weight: layer.gate_weight.map(|g| f32_to_gpu_tensor(g, vec![g.len()])),
-                up_weight: f32_to_gpu_tensor(layer.up_weight, vec![layer.up_weight.len()]),
-                down_weight: f32_to_gpu_tensor(layer.down_weight, vec![layer.down_weight.len()]),
-                q_norm: layer.q_norm.as_ref().map(|w| f32_to_gpu_tensor(w, vec![w.len()])),
-                k_norm: layer.k_norm.as_ref().map(|w| f32_to_gpu_tensor(w, vec![w.len()])),
-                cos_cache: Some(cos_cache_gpu.clone()),
-                sin_cache: Some(sin_cache_gpu.clone()),
-            }
-        }).collect();
-
-        Ok(GeneratorModelWeightsGpu {
-            embedding,
-            layers: gpu_layers,
-            final_norm: final_norm_gpu,
-            lm_head: lm_head_gpu,
-            cos_cache: cos_cache_gpu,
-            sin_cache: sin_cache_gpu,
-        })
-    }
-
-    fn alloc_kv_cache_gpu(
-        &self,
-        num_layers: usize,
-        batch_size: usize,
-        num_kv_heads: usize,
-        max_len: usize,
-        head_dim: usize,
-    ) -> Result<KVCacheGpu, String> {
-        // Allocate CPU-backed KV cache
-        let cache_size = num_layers * batch_size * num_kv_heads * max_len * head_dim;
-        let size_in_bytes = cache_size * std::mem::size_of::<f32>();
-        let k_cache = GpuTensor {
-            buffer: GpuBuffer::Cpu(vec![0u8; size_in_bytes].into()),
-            shape: vec![num_layers, batch_size, num_kv_heads, max_len, head_dim],
-            dtype: TensorDtype::F32,
-            size_in_bytes,
-            backend: BackendType::Cpu,
-        };
-        let v_cache = GpuTensor {
-            buffer: GpuBuffer::Cpu(vec![0u8; size_in_bytes].into()),
-            shape: vec![num_layers, batch_size, num_kv_heads, max_len, head_dim],
-            dtype: TensorDtype::F32,
-            size_in_bytes,
-            backend: BackendType::Cpu,
-        };
-
-        Ok(KVCacheGpu {
-            k_cache,
-            v_cache,
-            seq_len: 0,
-            max_len,
-            num_layers,
-            num_kv_heads,
-            head_dim,
-        })
+        Ok(KvCacheHandle::new(caches.len() - 1))
     }
 
     fn generator_forward_gpu_pure(
         &self,
         tokens: &[u32],
-        weights: &GeneratorModelWeightsGpu,
-        kv_cache: &mut KVCacheGpu,
+        topology: &AttentionTopology,
+        weights: &dyn TensorLookup<Self>,
+        kv_cache: &mut KvCacheHandle,
         config: &GeneratorForwardConfig,
-    ) -> Result<crate::kernel_types::LogitsTensor, String> {
-        // Helper to extract f32 slice from CPU-backed GpuTensor
-        fn gpu_tensor_to_f32(tensor: &GpuTensor) -> Result<&[f32], String> {
-            match &tensor.buffer {
-                GpuBuffer::Cpu(bytes) => Ok(bytemuck::cast_slice(bytes)),
-                _ => Err("CpuBackend: expected CPU-backed tensor".into()),
+    ) -> BackendResult<LogitsTensor> {
+        let mut caches = self.kv_caches.lock().expect("kv cache lock poisoned");
+        let cache = caches
+            .get_mut(kv_cache.0)
+            .ok_or_else(|| BackendError::InvalidHandle("kv cache handle".into()))?;
+
+        if self.use_fast_path(weights, config, tokens.len())? {
+            let last_hidden =
+                self.forward_hidden_fast(tokens, topology, weights, Some(cache), config)?;
+            let hidden_size = last_hidden.len();
+            let logits_idx = self.ensure_logits_buffer(config.vocab_size)?;
+            let mut logits_guard = self.logits.lock().expect("logits lock poisoned");
+            let logits_buf = logits_guard
+                .get_mut(logits_idx)
+                .ok_or_else(|| BackendError::InvalidHandle("logits handle".into()))?;
+
+            let lm_head_name = Self::resolve_weight_name(weights, &lm_head_candidates())
+                .or_else(|_| Self::resolve_weight_name(weights, &embedding_candidates()))?;
+            let lm_head = Self::resolve_weight(weights, &lm_head_name)?;
+            let lm_bias = Self::resolve_bias(weights, &lm_head_name);
+
+            cpu_kernels::linear(
+                &last_hidden,
+                lm_head,
+                lm_bias.map(|b| b.as_slice()),
+                logits_buf,
+                1,
+                config.vocab_size,
+                hidden_size,
+            )?;
+            return Ok(LogitsTensor::new(logits_idx));
+        }
+
+        let hidden_size = self.forward_hidden(tokens, topology, weights, Some(cache), config)?;
+        let logits_idx = self.ensure_logits_buffer(config.vocab_size)?;
+
+        let mut logits_guard = self.logits.lock().expect("logits lock poisoned");
+        let logits_buf = logits_guard
+            .get_mut(logits_idx)
+            .ok_or_else(|| BackendError::InvalidHandle("logits handle".into()))?;
+
+        let lm_head_name = Self::resolve_weight_name(weights, &lm_head_candidates())
+            .or_else(|_| Self::resolve_weight_name(weights, &embedding_candidates()))?;
+        let lm_head = Self::resolve_weight(weights, &lm_head_name)?;
+        let lm_bias = Self::resolve_bias(weights, &lm_head_name);
+
+        let workspace_guard = self.workspace.lock().expect("workspace lock poisoned");
+        let workspace = workspace_guard
+            .as_ref()
+            .ok_or_else(|| BackendError::InvalidConfig("workspace missing".into()))?;
+        cpu_kernels::linear(
+            &workspace.last_hidden,
+            lm_head,
+            lm_bias.map(|b| b.as_slice()),
+            logits_buf,
+            1,
+            config.vocab_size,
+            hidden_size,
+        )?;
+
+        Ok(LogitsTensor::new(logits_idx))
+    }
+
+    fn sample_from_tensor(
+        &self,
+        logits: &LogitsTensor,
+        _topology: &AttentionTopology,
+        vocab_size: usize,
+        config: &SamplingConfig,
+    ) -> BackendResult<Vec<u32>> {
+        let logits_guard = self.logits.lock().expect("logits lock poisoned");
+        let logits_buf = logits_guard
+            .get(logits.0)
+            .ok_or_else(|| BackendError::InvalidHandle("logits handle".into()))?;
+
+        if logits_buf.len() != vocab_size {
+            return Err(BackendError::InvalidConfig(
+                "logits buffer size mismatch".into(),
+            ));
+        }
+        if vocab_size == 0 {
+            return Ok(vec![0]);
+        }
+
+        let temp = if config.temperature.is_finite() && config.temperature > 0.0 {
+            config.temperature
+        } else {
+            1.0
+        };
+        let top_p = if config.top_p.is_finite() && config.top_p > 0.0 && config.top_p <= 1.0 {
+            config.top_p
+        } else {
+            1.0
+        };
+        let mut top_k = config.top_k;
+        if top_k == 0 {
+            if top_p >= 1.0 {
+                let mut best_idx = 0usize;
+                let mut best_val = logits_buf[0];
+                for (i, &val) in logits_buf.iter().enumerate().skip(1) {
+                    if val > best_val {
+                        best_val = val;
+                        best_idx = i;
+                    }
+                }
+                return Ok(vec![best_idx as u32]);
+            }
+            top_k = vocab_size;
+        }
+        if top_k == 1 && top_p >= 1.0 {
+            let mut best_idx = 0usize;
+            let mut best_val = logits_buf[0];
+            for (i, &val) in logits_buf.iter().enumerate().skip(1) {
+                if val > best_val {
+                    best_val = val;
+                    best_idx = i;
+                }
+            }
+            return Ok(vec![best_idx as u32]);
+        }
+        if top_k > vocab_size {
+            top_k = vocab_size;
+        }
+
+        let mut candidates: Vec<(usize, f32)> = logits_buf
+            .iter()
+            .enumerate()
+            .map(|(i, &val)| (i, val / temp))
+            .collect();
+        candidates.sort_by(|a, b| b.1.total_cmp(&a.1));
+        if top_k < candidates.len() {
+            candidates.truncate(top_k);
+        }
+
+        let max_val = candidates[0].1;
+        let mut exp_vals = Vec::with_capacity(candidates.len());
+        let mut sum = 0.0f32;
+        for &(_, val) in &candidates {
+            let e = (val - max_val).exp();
+            exp_vals.push(e);
+            sum += e;
+        }
+        if sum == 0.0 {
+            return Ok(vec![candidates[0].0 as u32]);
+        }
+
+        let mut cutoff = candidates.len();
+        if top_p < 1.0 {
+            let mut acc = 0.0f32;
+            for (idx, &e) in exp_vals.iter().enumerate() {
+                acc += e;
+                if acc / sum >= top_p {
+                    cutoff = idx + 1;
+                    break;
+                }
             }
         }
 
-        // Convert GPU weights back to slices for existing generator_forward
-        let embed_weight = gpu_tensor_to_f32(&weights.embedding)?;
-        let final_norm = gpu_tensor_to_f32(&weights.final_norm)?;
-        let lm_head = gpu_tensor_to_f32(&weights.lm_head)?;
-        let cos_cache = gpu_tensor_to_f32(&weights.cos_cache)?;
-        let sin_cache = gpu_tensor_to_f32(&weights.sin_cache)?;
+        let mut subset_sum = 0.0f32;
+        for &e in exp_vals.iter().take(cutoff) {
+            subset_sum += e;
+        }
+        if subset_sum == 0.0 {
+            return Ok(vec![candidates[0].0 as u32]);
+        }
+        let r = self.next_random() * subset_sum;
+        let mut acc = 0.0f32;
+        let mut chosen = candidates[0].0;
+        for i in 0..cutoff {
+            acc += exp_vals[i];
+            if r <= acc {
+                chosen = candidates[i].0;
+                break;
+            }
+        }
+        Ok(vec![chosen as u32])
+    }
 
-        let layer_weights: Result<Vec<TransformerLayerWeights<'_>>, String> = weights.layers.iter()
-            .map(|layer| {
-                Ok(TransformerLayerWeights {
-                    input_norm: gpu_tensor_to_f32(&layer.input_norm)?,
-                    q_weight: gpu_tensor_to_f32(&layer.q_weight)?,
-                    k_weight: gpu_tensor_to_f32(&layer.k_weight)?,
-                    v_weight: gpu_tensor_to_f32(&layer.v_weight)?,
-                    o_weight: gpu_tensor_to_f32(&layer.o_weight)?,
-                    post_attn_norm: gpu_tensor_to_f32(&layer.post_attn_norm)?,
-                    gate_weight: layer.gate_weight.as_ref().map(|g| gpu_tensor_to_f32(g)).transpose()?,
-                    up_weight: gpu_tensor_to_f32(&layer.up_weight)?,
-                    down_weight: gpu_tensor_to_f32(&layer.down_weight)?,
-                    q_norm: layer.q_norm.as_ref().map(|w| gpu_tensor_to_f32(w)).transpose()?,
-                    k_norm: layer.k_norm.as_ref().map(|w| gpu_tensor_to_f32(w)).transpose()?,
-                })
-            })
-            .collect();
-        let layers = layer_weights?;
+    fn embedding_forward_gpu_pure(
+        &self,
+        tokens: &[u32],
+        topology: &AttentionTopology,
+        weights: &dyn TensorLookup<Self>,
+        config: &GeneratorForwardConfig,
+    ) -> BackendResult<Vec<f32>> {
+        if self.use_fast_path(weights, config, tokens.len())? {
+            return self.forward_hidden_fast(tokens, topology, weights, None, config);
+        }
+        let hidden_size = self.forward_hidden(tokens, topology, weights, None, config)?;
+        let workspace_guard = self.workspace.lock().expect("workspace lock poisoned");
+        let workspace = workspace_guard
+            .as_ref()
+            .ok_or_else(|| BackendError::InvalidConfig("workspace missing".into()))?;
+        Ok(workspace.last_hidden[..hidden_size].to_vec())
+    }
 
-        // Extract KV cache slices
-        let mut k_cache_data: Vec<f32> = match &kv_cache.k_cache.buffer {
-            GpuBuffer::Cpu(bytes) => bytemuck::cast_slice(bytes).to_vec(),
-            _ => return Err("CpuBackend: expected CPU-backed KV cache".into()),
-        };
-        let mut v_cache_data: Vec<f32> = match &kv_cache.v_cache.buffer {
-            GpuBuffer::Cpu(bytes) => bytemuck::cast_slice(bytes).to_vec(),
-            _ => return Err("CpuBackend: expected CPU-backed KV cache".into()),
-        };
+    fn rerank_forward_gpu_pure(
+        &self,
+        tokens: &[u32],
+        topology: &AttentionTopology,
+        weights: &dyn TensorLookup<Self>,
+        config: &GeneratorForwardConfig,
+    ) -> BackendResult<Vec<f32>> {
+        if self.use_fast_path(weights, config, tokens.len())? {
+            let last_hidden = self.forward_hidden_fast(tokens, topology, weights, None, config)?;
+            let hidden_size = last_hidden.len();
 
-        let mut kv_state = KVCacheState {
-            k_cache: k_cache_data.as_mut_slice(),
-            v_cache: v_cache_data.as_mut_slice(),
-            seq_len: kv_cache.seq_len,
-            max_len: kv_cache.max_len,
-        };
+            let score_name = find_tensor_name(weights, &score_head_candidates());
+            if let Some(score_name) = score_name {
+                let score_weight = Self::resolve_weight(weights, &score_name)?;
+                let score_shape = weights
+                    .tensor_shape(&score_name)
+                    .ok_or_else(|| BackendError::MissingTensor(score_name.clone()))?;
+                let out_dim = Self::deduce_out_dim(score_shape, hidden_size)?;
+                let score_bias = Self::resolve_bias(weights, &score_name);
 
-        // Call existing generator_forward
-        let result = self.generator_forward(
-            tokens,
-            embed_weight,
-            &layers,
-            final_norm,
-            lm_head,
-            cos_cache,
-            sin_cache,
-            &mut kv_state,
-            config,
-        )?;
+                let mut output = vec![0f32; out_dim];
+                cpu_kernels::linear(
+                    &last_hidden,
+                    score_weight,
+                    score_bias.map(|b| b.as_slice()),
+                    &mut output,
+                    1,
+                    out_dim,
+                    hidden_size,
+                )?;
+                return Ok(output);
+            }
+            return Ok(last_hidden);
+        }
 
-        // Update KV cache
-        kv_cache.seq_len = kv_state.seq_len;
-        kv_cache.k_cache.buffer = GpuBuffer::Cpu(bytemuck::cast_slice(&k_cache_data).to_vec().into());
-        kv_cache.v_cache.buffer = GpuBuffer::Cpu(bytemuck::cast_slice(&v_cache_data).to_vec().into());
+        let hidden_size = self.forward_hidden(tokens, topology, weights, None, config)?;
 
-        Ok(result)
+        let score_name = find_tensor_name(weights, &score_head_candidates());
+        if let Some(score_name) = score_name {
+            let score_weight = Self::resolve_weight(weights, &score_name)?;
+            let score_shape = weights
+                .tensor_shape(&score_name)
+                .ok_or_else(|| BackendError::MissingTensor(score_name.clone()))?;
+            let out_dim = Self::deduce_out_dim(score_shape, hidden_size)?;
+            let score_bias = Self::resolve_bias(weights, &score_name);
+
+            let workspace_guard = self.workspace.lock().expect("workspace lock poisoned");
+            let workspace = workspace_guard
+                .as_ref()
+                .ok_or_else(|| BackendError::InvalidConfig("workspace missing".into()))?;
+            let mut output = vec![0f32; out_dim];
+            cpu_kernels::linear(
+                &workspace.last_hidden,
+                score_weight,
+                score_bias.map(|b| b.as_slice()),
+                &mut output,
+                1,
+                out_dim,
+                hidden_size,
+            )?;
+            Ok(output)
+        } else {
+            let workspace_guard = self.workspace.lock().expect("workspace lock poisoned");
+            let workspace = workspace_guard
+                .as_ref()
+                .ok_or_else(|| BackendError::InvalidConfig("workspace missing".into()))?;
+            Ok(workspace.last_hidden[..hidden_size].to_vec())
+        }
     }
 }

@@ -1,3390 +1,1931 @@
-use std::collections::HashMap;
-use std::sync::{Arc, Mutex, OnceLock};
+use std::fmt;
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
-use cudarc::driver::{CudaContext, CudaSlice, CudaStream};
+use cudarc::driver::{
+    result, sys, CudaContext, CudaSlice, CudaStream, DevicePtr, DeviceRepr, LaunchConfig,
+};
 
-use crate::backend_trait::Backend;
+use crate::backend_trait::{
+    AttentionTopology, Backend, BackendError, BackendResult, KvCacheHandle, LogitsTensor,
+    TensorLookup,
+};
 use crate::cuda_kernels::{
-    FlashAttentionKernel as CudaFlashAttentionKernel,
-    PagedAttentionKernel as CudaPagedAttentionKernel,
-    QuantizedDequantKernel,
-    RmsNormKernel,
-    CudaRoPEKernel,
-    CudaSilu,
-    CudaLinear,
-    CudaElementwiseKernel,
-    CudaPoolingKernel,
+    cubin_for, AddConfig, CudaKernels, EmbeddingConfig, FlashAttnConfig,
+    FlashAttnPagedConfig, FusedQkvRopeConfig, LinearConfig, QuantizedBits, QuantizedConfig,
+    RmsNormConfig, RopeConfig, SamplingKernelConfig, SiluConfig, SmVersion, SwiGluConfig,
 };
+use crate::gpu_types::GpuBuffer;
 use crate::kernel_types::{
-    AttentionBlockConfig, FFNBlockConfig, EmbeddingConfig, LMHeadConfig,
-    KVCacheUpdateConfig, MeanPoolingConfig, ClsPoolingConfig, NormalizeConfig,
-    DequantizeConfig, EngramFuseConfig, FlashAttentionConfig,
-    KernelFloat, PagedAttentionConfig, MatmulConfig, LinearParams,
-    // L3 High-level inference configs (ARCH-ADR-003)
-    TransformerLayerWeights, MoETransformerLayerWeights, KVCacheState,
-    GeneratorForwardConfig, MoEGeneratorForwardConfig, EmbeddingForwardConfig,
-    RerankForwardConfig,
-    // GPU-pure weights (ARCH-GPU-001 / ARCH-ADR-010)
-    EmbeddingModelWeightsGpu, TransformerLayerWeightsGpu,
-    RerankerModelWeightsGpu, GeneratorModelWeightsGpu, KVCacheGpu,
-    TransformerLayerConfigGpu,
-    MoEGeneratorModelWeightsGpu, MoETransformerLayerWeightsGpu, ExpertWeightsGpu,
-    LogitsTensor,
+    alibi_slopes, precompute_rope_tables, GeneratorForwardConfig, KvCacheConfig, PositionEncoding,
+    SamplingConfig,
 };
-use crate::gpu_types::{GpuBuffer, GpuTensor, TensorDtype};
-use crate::ops::sampling::SamplingConfig;
-use crate::runtime_detection::BackendType;
 
-/// Global CUDA context (lazy initialized).
-static CUDA_CONTEXT: OnceLock<Option<Arc<CudaContext>>> = OnceLock::new();
-/// Global CUDA stream (lazy initialized).
-static CUDA_STREAM: OnceLock<Option<Arc<CudaStream>>> = OnceLock::new();
-/// Global CUDA flash attention kernel (lazy initialized).
-static CUDA_FLASH_KERNEL: OnceLock<Option<CudaFlashAttentionKernel>> = OnceLock::new();
-/// Global CUDA paged attention kernel (lazy initialized).
-static CUDA_PAGED_KERNEL: OnceLock<Option<CudaPagedAttentionKernel>> = OnceLock::new();
-/// Global CUDA RMSNorm kernel (lazy initialized).
-static CUDA_RMSNORM_KERNEL: OnceLock<Option<RmsNormKernel>> = OnceLock::new();
-/// Global CUDA RoPE kernel (lazy initialized).
-static CUDA_ROPE_KERNEL: OnceLock<Option<CudaRoPEKernel>> = OnceLock::new();
-/// Global CUDA SiLU kernel (lazy initialized).
-static CUDA_SILU_KERNEL: OnceLock<Option<CudaSilu>> = OnceLock::new();
-/// Global CUDA quantized dequantization kernel (lazy initialized).
-static CUDA_QUANTIZED_KERNEL: OnceLock<Option<QuantizedDequantKernel>> = OnceLock::new();
-/// Global CUDA linear kernel (lazy initialized).
-static CUDA_LINEAR_KERNEL: OnceLock<Option<CudaLinear>> = OnceLock::new();
-/// Global CUDA elementwise kernel (lazy initialized).
-static CUDA_ELEMENTWISE_KERNEL: OnceLock<Option<CudaElementwiseKernel>> = OnceLock::new();
-/// Global CUDA pooling kernel (lazy initialized).
-static CUDA_POOLING_KERNEL: OnceLock<Option<CudaPoolingKernel>> = OnceLock::new();
-/// Global CUDA swap block registry (ARCH-MEM-TIERING).
-static CUDA_SWAP_REGISTRY: OnceLock<Mutex<HashMap<u64, CudaSlice<u8>>>> = OnceLock::new();
-/// Global NCCL dynamic library (ARCH-DRIVER-ONLY, optional).
-#[cfg(feature = "nccl")]
-static CUDA_NCCL_LIBRARY: OnceLock<Option<libloading::Library>> = OnceLock::new();
-
-fn swap_registry() -> &'static Mutex<HashMap<u64, CudaSlice<u8>>> {
-    CUDA_SWAP_REGISTRY.get_or_init(|| Mutex::new(HashMap::new()))
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct WorkspaceConfig {
+    max_seq_len: usize,
+    hidden_size: usize,
+    num_heads: usize,
+    num_kv_heads: usize,
+    head_dim: usize,
+    ffn_dim: usize,
+    vocab_size: usize,
+    position_encoding: PositionEncoding,
+    rope_theta: f32,
+    rope_scale: f32,
+    rope_interleaved: bool,
+    rope_precompute: bool,
 }
 
-#[cfg(feature = "nccl")]
-fn init_nccl() -> bool {
-    let lib = CUDA_NCCL_LIBRARY.get_or_init(|| {
-        let candidates = ["libnccl.so", "libnccl.so.2", "libnccl.so.1"];
-        for name in candidates {
-            if let Ok(lib) = unsafe { libloading::Library::new(name) } {
-                log::info!("Loaded NCCL library: {}", name);
-                return Some(lib);
-            }
-        }
-        log::warn!("NCCL library not found; multi-GPU disabled");
-        None
-    });
-    lib.is_some()
+#[derive(Debug, Clone, Copy)]
+pub struct PerfMetrics {
+    pub host_to_device_bytes: u64,
+    pub device_to_host_bytes: u64,
+    pub tokens_processed: u64,
+    pub elapsed: Duration,
+    pub last_forward: Duration,
+    pub last_sample: Duration,
 }
 
-#[cfg(not(feature = "nccl"))]
-fn init_nccl() -> bool {
-    false
-}
-
-fn get_cuda_context() -> Option<&'static Arc<CudaContext>> {
-    CUDA_CONTEXT
-        .get_or_init(|| {
-            match CudaContext::new(0) {
-                Ok(ctx) => Some(ctx),
-                Err(e) => {
-                    log::warn!("Failed to create CUDA context: {}", e);
-                    None
-                }
-            }
-        })
-        .as_ref()
-}
-
-fn get_cuda_stream() -> Option<&'static Arc<CudaStream>> {
-    CUDA_STREAM
-        .get_or_init(|| {
-            let ctx = get_cuda_context()?;
-            Some(ctx.default_stream())
-        })
-        .as_ref()
-}
-
-fn get_cuda_flash_kernel() -> Option<&'static CudaFlashAttentionKernel> {
-    CUDA_FLASH_KERNEL
-        .get_or_init(|| {
-            let ctx = get_cuda_context()?;
-            match CudaFlashAttentionKernel::new(ctx) {
-                Ok(kernel) => Some(kernel),
-                Err(e) => {
-                    log::warn!("Failed to initialize CUDA flash attention kernel: {}", e);
-                    None
-                }
-            }
-        })
-        .as_ref()
-}
-
-fn get_cuda_paged_kernel() -> Option<&'static CudaPagedAttentionKernel> {
-    CUDA_PAGED_KERNEL
-        .get_or_init(|| {
-            let ctx = get_cuda_context()?;
-            match CudaPagedAttentionKernel::new(ctx) {
-                Ok(kernel) => Some(kernel),
-                Err(e) => {
-                    log::warn!("Failed to initialize CUDA paged attention kernel: {}", e);
-                    None
-                }
-            }
-        })
-        .as_ref()
-}
-
-fn get_cuda_rmsnorm_kernel() -> Option<&'static RmsNormKernel> {
-    CUDA_RMSNORM_KERNEL
-        .get_or_init(|| {
-            let ctx = get_cuda_context()?;
-            match RmsNormKernel::new(ctx) {
-                Ok(kernel) => Some(kernel),
-                Err(e) => {
-                    log::warn!("Failed to initialize CUDA RMSNorm kernel: {}", e);
-                    None
-                }
-            }
-        })
-        .as_ref()
-}
-
-fn get_cuda_rope_kernel() -> Option<&'static CudaRoPEKernel> {
-    CUDA_ROPE_KERNEL
-        .get_or_init(|| {
-            let ctx = get_cuda_context()?;
-            match CudaRoPEKernel::new(ctx) {
-                Ok(kernel) => Some(kernel),
-                Err(e) => {
-                    log::warn!("Failed to initialize CUDA RoPE kernel: {}", e);
-                    None
-                }
-            }
-        })
-        .as_ref()
-}
-
-fn get_cuda_silu_kernel() -> Option<&'static CudaSilu> {
-    CUDA_SILU_KERNEL
-        .get_or_init(|| {
-            let ctx = get_cuda_context()?;
-            match CudaSilu::new(ctx) {
-                Ok(kernel) => Some(kernel),
-                Err(e) => {
-                    log::warn!("Failed to initialize CUDA SiLU kernel: {}", e);
-                    None
-                }
-            }
-        })
-        .as_ref()
-}
-
-fn get_cuda_quantized_kernel() -> Option<&'static QuantizedDequantKernel> {
-    CUDA_QUANTIZED_KERNEL
-        .get_or_init(|| {
-            let ctx = get_cuda_context()?;
-            match QuantizedDequantKernel::new(ctx) {
-                Ok(kernel) => Some(kernel),
-                Err(e) => {
-                    log::warn!("Failed to initialize CUDA quantized dequant kernel: {}", e);
-                    None
-                }
-            }
-        })
-        .as_ref()
-}
-
-fn get_cuda_linear_kernel() -> Option<&'static CudaLinear> {
-    CUDA_LINEAR_KERNEL
-        .get_or_init(|| {
-            let ctx = get_cuda_context()?;
-            match CudaLinear::new(ctx) {
-                Ok(kernel) => Some(kernel),
-                Err(e) => {
-                    log::warn!("Failed to initialize CUDA linear kernel: {}", e);
-                    None
-                }
-            }
-        })
-        .as_ref()
-}
-
-fn get_cuda_elementwise_kernel() -> Option<&'static CudaElementwiseKernel> {
-    CUDA_ELEMENTWISE_KERNEL
-        .get_or_init(|| {
-            let ctx = get_cuda_context()?;
-            match CudaElementwiseKernel::new(ctx) {
-                Ok(kernel) => Some(kernel),
-                Err(e) => {
-                    log::warn!("Failed to initialize CUDA elementwise kernel: {}", e);
-                    None
-                }
-            }
-        })
-        .as_ref()
-}
-
-fn get_cuda_pooling_kernel() -> Option<&'static CudaPoolingKernel> {
-    CUDA_POOLING_KERNEL
-        .get_or_init(|| {
-            let ctx = get_cuda_context()?;
-            match CudaPoolingKernel::new(ctx) {
-                Ok(kernel) => Some(kernel),
-                Err(e) => {
-                    log::warn!("Failed to initialize CUDA pooling kernel: {}", e);
-                    None
-                }
-            }
-        })
-        .as_ref()
-}
-
-/// CUDA flash attention dispatch.
-/// Returns true if GPU execution succeeded, false to fallback to CPU.
-fn cuda_flash_attention<T: KernelFloat>(
-    kernel: &CudaFlashAttentionKernel,
-    stream: &Arc<CudaStream>,
-    q: &[T],
-    k: &[T],
-    v: &[T],
-    output: &mut [T],
-    config: &FlashAttentionConfig,
-) -> bool {
-    let q_f32: Vec<f32> = q.iter().map(|x| x.to_f32()).collect();
-    let k_f32: Vec<f32> = k.iter().map(|x| x.to_f32()).collect();
-    let v_f32: Vec<f32> = v.iter().map(|x| x.to_f32()).collect();
-
-    let q_buf = match stream.clone_htod(&q_f32) {
-        Ok(buf) => buf,
-        Err(e) => {
-            log::debug!("Failed to copy Q to GPU: {}", e);
-            return false;
-        }
-    };
-    let k_buf = match stream.clone_htod(&k_f32) {
-        Ok(buf) => buf,
-        Err(e) => {
-            log::debug!("Failed to copy K to GPU: {}", e);
-            return false;
-        }
-    };
-    let v_buf = match stream.clone_htod(&v_f32) {
-        Ok(buf) => buf,
-        Err(e) => {
-            log::debug!("Failed to copy V to GPU: {}", e);
-            return false;
-        }
-    };
-
-    let scale = config.scale.unwrap_or(1.0 / (config.head_dim as f32).sqrt());
-    let seq_len = config.seq_len_q;
-
-    let result = kernel.forward_f32(
-        stream,
-        &q_buf,
-        &k_buf,
-        &v_buf,
-        config.batch_size,
-        config.num_heads,
-        seq_len,
-        config.head_dim,
-        config.causal,
-        scale,
-        0,
-    );
-
-    match result {
-        Ok(out_buf) => match stream.clone_dtoh(&out_buf) {
-            Ok(out_data) => {
-                for (i, val) in out_data.into_iter().enumerate() {
-                    if i < output.len() {
-                        output[i] = T::from_f32(val);
-                    }
-                }
-                true
-            }
-            Err(e) => {
-                log::debug!("Failed to copy output from GPU: {}", e);
-                false
-            }
-        },
-        Err(e) => {
-            log::debug!("CUDA kernel execution failed: {}", e);
-            false
+impl PerfMetrics {
+    pub fn tps(&self) -> f64 {
+        let secs = self.elapsed.as_secs_f64();
+        if secs > 0.0 {
+            self.tokens_processed as f64 / secs
+        } else {
+            0.0
         }
     }
 }
 
-/// CUDA paged attention dispatch.
-/// Returns true if GPU execution succeeded, false to fallback to CPU.
-fn cuda_paged_attention<T: KernelFloat>(
-    kernel: &CudaPagedAttentionKernel,
-    stream: &Arc<CudaStream>,
-    q: &[T],
-    k_cache: &[T],
-    v_cache: &[T],
-    page_table: &[u32],
-    seq_lens: &[u32],
-    output: &mut [T],
-    config: &PagedAttentionConfig,
-) -> bool {
-    let inputs = match crate::ops::paged_attn::build_paged_gpu_inputs(
-        q,
-        k_cache,
-        v_cache,
-        page_table,
-        seq_lens,
-        output.len(),
-        config,
-    ) {
-        Some(inputs) => inputs,
-        None => return false,
-    };
+struct PerfState {
+    start: Instant,
+    host_to_device_bytes: u64,
+    device_to_host_bytes: u64,
+    tokens_processed: u64,
+    last_forward: Duration,
+    last_sample: Duration,
+}
 
-    let q_buf = match stream.clone_htod(&inputs.q_f32) {
-        Ok(buf) => buf,
-        Err(e) => {
-            log::debug!("Failed to copy Q to GPU: {}", e);
-            return false;
+impl PerfState {
+    fn new() -> Self {
+        Self {
+            start: Instant::now(),
+            host_to_device_bytes: 0,
+            device_to_host_bytes: 0,
+            tokens_processed: 0,
+            last_forward: Duration::from_secs(0),
+            last_sample: Duration::from_secs(0),
         }
-    };
-    let k_buf = match stream.clone_htod(&inputs.k_f32) {
-        Ok(buf) => buf,
-        Err(e) => {
-            log::debug!("Failed to copy K to GPU: {}", e);
-            return false;
-        }
-    };
-    let v_buf = match stream.clone_htod(&inputs.v_f32) {
-        Ok(buf) => buf,
-        Err(e) => {
-            log::debug!("Failed to copy V to GPU: {}", e);
-            return false;
-        }
-    };
-    let table_buf = match stream.clone_htod(&inputs.block_tables) {
-        Ok(buf) => buf,
-        Err(e) => {
-            log::debug!("Failed to copy block_tables to GPU: {}", e);
-            return false;
-        }
-    };
-    let offsets_buf = match stream.clone_htod(&inputs.block_offsets) {
-        Ok(buf) => buf,
-        Err(e) => {
-            log::debug!("Failed to copy block_offsets to GPU: {}", e);
-            return false;
-        }
-    };
-    let logical_positions_buf = match stream.clone_htod(&inputs.logical_positions) {
-        Ok(buf) => buf,
-        Err(e) => {
-            log::debug!("Failed to copy logical_positions to GPU: {}", e);
-            return false;
-        }
-    };
+    }
 
-    let result = kernel.forward_f32(
-        stream,
-        &q_buf,
-        &k_buf,
-        &v_buf,
-        &table_buf,
-        &offsets_buf,
-        &logical_positions_buf,
-        inputs.layout.batch_size,
-        inputs.layout.num_heads,
-        inputs.layout.head_dim,
-        inputs.layout.page_size,
-        inputs.layout.seq_len,
-    );
-
-    match result {
-        Ok(out_buf) => match stream.clone_dtoh(&out_buf) {
-            Ok(out_data) => {
-                for (i, value) in out_data.into_iter().enumerate() {
-                    if i < output.len() {
-                        output[i] = T::from_f32(value);
-                    }
-                }
-                true
-            }
-            Err(e) => {
-                log::debug!("Failed to copy output from GPU: {}", e);
-                false
-            }
-        },
-        Err(e) => {
-            log::debug!("CUDA paged kernel execution failed: {}", e);
-            false
+    fn snapshot(&self) -> PerfMetrics {
+        PerfMetrics {
+            host_to_device_bytes: self.host_to_device_bytes,
+            device_to_host_bytes: self.device_to_host_bytes,
+            tokens_processed: self.tokens_processed,
+            elapsed: self.start.elapsed(),
+            last_forward: self.last_forward,
+            last_sample: self.last_sample,
         }
+    }
+
+    fn reset(&mut self) {
+        self.start = Instant::now();
+        self.host_to_device_bytes = 0;
+        self.device_to_host_bytes = 0;
+        self.tokens_processed = 0;
+        self.last_forward = Duration::from_secs(0);
+        self.last_sample = Duration::from_secs(0);
     }
 }
 
-/// CUDA RMSNorm dispatch.
-/// Returns true if GPU execution succeeded, false to fallback to CPU.
-fn cuda_rms_norm<T: KernelFloat>(
-    kernel: &RmsNormKernel,
-    stream: &Arc<CudaStream>,
-    input: &[T],
-    weight: &[T],
-    output: &mut [T],
-    batch: usize,
-    hidden: usize,
-    eps: f32,
-) -> bool {
-    let expected = batch.saturating_mul(hidden);
-    if input.len() != expected || output.len() != expected || weight.len() != hidden {
-        log::debug!("CUDA rms_norm dispatch skipped: length mismatch");
-        return false;
-    }
-
-    let input_f32: Vec<f32> = input.iter().map(|v| v.to_f32()).collect();
-    let weight_f32: Vec<f32> = weight.iter().map(|v| v.to_f32()).collect();
-
-    let input_buf = match stream.clone_htod(&input_f32) {
-        Ok(buf) => buf,
-        Err(e) => {
-            log::debug!("Failed to copy rms_norm input to GPU: {}", e);
-            return false;
-        }
-    };
-    let weight_buf = match stream.clone_htod(&weight_f32) {
-        Ok(buf) => buf,
-        Err(e) => {
-            log::debug!("Failed to copy rms_norm weight to GPU: {}", e);
-            return false;
-        }
-    };
-    let mut output_buf = match stream.alloc_zeros(output.len()) {
-        Ok(buf) => buf,
-        Err(e) => {
-            log::debug!("Failed to allocate rms_norm output on GPU: {}", e);
-            return false;
-        }
-    };
-
-    if let Err(e) = kernel.forward(stream, &input_buf, &weight_buf, &mut output_buf, batch, hidden, eps) {
-        log::debug!("CUDA rms_norm kernel execution failed: {}", e);
-        return false;
-    }
-
-    let output_f32 = match stream.clone_dtoh(&output_buf) {
-        Ok(out_data) => out_data,
-        Err(e) => {
-            log::debug!("Failed to copy rms_norm output from GPU: {}", e);
-            return false;
-        }
-    };
-
-    for (dst, val) in output.iter_mut().zip(output_f32.iter()) {
-        *dst = T::from_f32(*val);
-    }
-
-    true
+struct LayerWorkspace {
+    config: WorkspaceConfig,
+    token_ids: CudaSlice<u32>,
+    linear_positions: CudaSlice<i32>,
+    positions: GpuBuffer<i32>,
+    hidden: GpuBuffer<f32>,
+    norm: GpuBuffer<f32>,
+    qkv: GpuBuffer<f32>,
+    attn_out: GpuBuffer<f32>,
+    ffn_gate: GpuBuffer<f32>,
+    ffn_up: GpuBuffer<f32>,
+    ffn_act: GpuBuffer<f32>,
+    ffn_out: GpuBuffer<f32>,
+    last_hidden: GpuBuffer<f32>,
+    rope_cos: Option<GpuBuffer<f32>>,
+    rope_sin: Option<GpuBuffer<f32>>,
+    alibi_slopes: Option<GpuBuffer<f32>>,
 }
 
-/// CUDA RMSNorm inplace dispatch.
-/// Returns true if GPU execution succeeded, false to fallback to CPU.
-fn cuda_rms_norm_inplace<T: KernelFloat>(
-    kernel: &RmsNormKernel,
-    stream: &Arc<CudaStream>,
-    data: &mut [T],
-    weight: &[T],
-    batch: usize,
-    hidden: usize,
-    eps: f32,
-) -> bool {
-    let expected = batch.saturating_mul(hidden);
-    if data.len() != expected || weight.len() != hidden {
-        log::debug!("CUDA rms_norm_inplace dispatch skipped: length mismatch");
-        return false;
-    }
+impl LayerWorkspace {
+    fn allocate(stream: &Arc<CudaStream>, config: WorkspaceConfig) -> BackendResult<Self> {
+        let hidden_len = config
+            .max_seq_len
+            .checked_mul(config.hidden_size)
+            .ok_or_else(|| BackendError::InvalidConfig("hidden buffer size overflow".into()))?;
+        let qkv_dim = config
+            .num_heads
+            .checked_mul(config.head_dim)
+            .and_then(|q| q.checked_add(2 * config.num_kv_heads * config.head_dim))
+            .ok_or_else(|| BackendError::InvalidConfig("qkv dimension overflow".into()))?;
+        let qkv_len = config
+            .max_seq_len
+            .checked_mul(qkv_dim)
+            .ok_or_else(|| BackendError::InvalidConfig("qkv buffer size overflow".into()))?;
+        let ffn_len = config
+            .max_seq_len
+            .checked_mul(config.ffn_dim)
+            .ok_or_else(|| BackendError::InvalidConfig("ffn buffer size overflow".into()))?;
 
-    let data_f32: Vec<f32> = data.iter().map(|v| v.to_f32()).collect();
-    let weight_f32: Vec<f32> = weight.iter().map(|v| v.to_f32()).collect();
-
-    let data_buf = match stream.clone_htod(&data_f32) {
-        Ok(buf) => buf,
-        Err(e) => {
-            log::debug!("Failed to copy rms_norm data to GPU: {}", e);
-            return false;
-        }
-    };
-    let weight_buf = match stream.clone_htod(&weight_f32) {
-        Ok(buf) => buf,
-        Err(e) => {
-            log::debug!("Failed to copy rms_norm weight to GPU: {}", e);
-            return false;
-        }
-    };
-    let mut output_buf = match stream.alloc_zeros(data.len()) {
-        Ok(buf) => buf,
-        Err(e) => {
-            log::debug!("Failed to allocate rms_norm output on GPU: {}", e);
-            return false;
-        }
-    };
-
-    if let Err(e) = kernel.forward(stream, &data_buf, &weight_buf, &mut output_buf, batch, hidden, eps) {
-        log::debug!("CUDA rms_norm kernel execution failed: {}", e);
-        return false;
-    }
-
-    let output_f32 = match stream.clone_dtoh(&output_buf) {
-        Ok(out_data) => out_data,
-        Err(e) => {
-            log::debug!("Failed to copy rms_norm output from GPU: {}", e);
-            return false;
-        }
-    };
-
-    for (dst, val) in data.iter_mut().zip(output_f32.iter()) {
-        *dst = T::from_f32(*val);
-    }
-
-    true
-}
-
-/// CUDA SiLU dispatch.
-/// Returns true if GPU execution succeeded, false to fallback to CPU.
-fn cuda_silu<T: KernelFloat>(
-    kernel: &CudaSilu,
-    stream: &Arc<CudaStream>,
-    input: &[T],
-    output: &mut [T],
-) -> bool {
-    if input.len() != output.len() {
-        log::debug!("CUDA silu dispatch skipped: length mismatch");
-        return false;
-    }
-
-    let input_f32: Vec<f32> = input.iter().map(|v| v.to_f32()).collect();
-
-    let input_buf = match stream.clone_htod(&input_f32) {
-        Ok(buf) => buf,
-        Err(e) => {
-            log::debug!("Failed to copy silu input to GPU: {}", e);
-            return false;
-        }
-    };
-    let mut output_buf = match stream.alloc_zeros(output.len()) {
-        Ok(buf) => buf,
-        Err(e) => {
-            log::debug!("Failed to allocate silu output on GPU: {}", e);
-            return false;
-        }
-    };
-
-    if let Err(e) = kernel.forward(stream, &input_buf, &mut output_buf, output.len()) {
-        log::debug!("CUDA silu kernel execution failed: {}", e);
-        return false;
-    }
-
-    let output_f32 = match stream.clone_dtoh(&output_buf) {
-        Ok(out_data) => out_data,
-        Err(e) => {
-            log::debug!("Failed to copy silu output from GPU: {}", e);
-            return false;
-        }
-    };
-
-    for (dst, val) in output.iter_mut().zip(output_f32.iter()) {
-        *dst = T::from_f32(*val);
-    }
-
-    true
-}
-
-/// CUDA SiLU inplace dispatch.
-/// Returns true if GPU execution succeeded, false to fallback to CPU.
-fn cuda_silu_inplace<T: KernelFloat>(
-    kernel: &CudaSilu,
-    stream: &Arc<CudaStream>,
-    data: &mut [T],
-) -> bool {
-    let data_f32: Vec<f32> = data.iter().map(|v| v.to_f32()).collect();
-
-    let mut data_buf = match stream.clone_htod(&data_f32) {
-        Ok(buf) => buf,
-        Err(e) => {
-            log::debug!("Failed to copy silu data to GPU: {}", e);
-            return false;
-        }
-    };
-
-    if let Err(e) = kernel.forward_inplace(stream, &mut data_buf, data.len()) {
-        log::debug!("CUDA silu inplace kernel execution failed: {}", e);
-        return false;
-    }
-
-    let output_f32 = match stream.clone_dtoh(&data_buf) {
-        Ok(out_data) => out_data,
-        Err(e) => {
-            log::debug!("Failed to copy silu inplace output from GPU: {}", e);
-            return false;
-        }
-    };
-
-    for (dst, val) in data.iter_mut().zip(output_f32.iter()) {
-        *dst = T::from_f32(*val);
-    }
-
-    true
-}
-
-fn checked_mul(a: usize, b: usize, name: &str) -> Result<usize, String> {
-    a.checked_mul(b).ok_or_else(|| format!("{name} overflow"))
-}
-
-fn cuda_q4_dequantize(
-    kernel: &QuantizedDequantKernel,
-    stream: &Arc<CudaStream>,
-    q_weight: &[u8],
-    scales: &[half::f16],
-    n: usize,
-    k: usize,
-) -> Result<Vec<f32>, String> {
-    if n == 0 || k == 0 {
-        return Err("Dimensions must be > 0".into());
-    }
-    if k % 32 != 0 {
-        return Err("k must be multiple of 32 for Q4".into());
-    }
-    let blocks = k / 32;
-    let num_blocks = checked_mul(n, blocks, "q4 blocks")?;
-    if num_blocks > i32::MAX as usize {
-        return Err("q4 blocks exceed addressable range".into());
-    }
-    let expected_q_weight = checked_mul(num_blocks, 16, "q4 weights")?;
-    if q_weight.len() != expected_q_weight {
-        return Err(format!(
-            "q_weight length mismatch: expected {expected_q_weight}, got {}",
-            q_weight.len()
-        ));
-    }
-    if scales.len() != num_blocks {
-        return Err(format!(
-            "scales length mismatch: expected {num_blocks}, got {}",
-            scales.len()
-        ));
-    }
-    if num_blocks
-        .checked_mul(32)
-        .ok_or_else(|| "output overflow".to_string())?
-        > u32::MAX as usize
-    {
-        return Err("output exceeds addressable range".into());
-    }
-
-    let q_weight_buf = stream.clone_htod(q_weight).map_err(|e| {
-        format!("CUDA Q4 dequantize upload failed: {e}")
-    })?;
-    let scales_buf = stream.clone_htod(scales).map_err(|e| {
-        format!("CUDA Q4 dequantize scales upload failed: {e}")
-    })?;
-    let output_buf = kernel
-        .dequantize_q4(stream, &q_weight_buf, &scales_buf, num_blocks)
-        .map_err(|e| format!("CUDA Q4 dequantize failed: {e}"))?;
-    stream
-        .clone_dtoh(&output_buf)
-        .map_err(|e| format!("CUDA Q4 dequantize readback failed: {e}"))
-}
-
-fn cuda_awq_dequantize(
-    kernel: &QuantizedDequantKernel,
-    stream: &Arc<CudaStream>,
-    qweight: &[u32],
-    qzeros: &[u32],
-    scales: &[half::f16],
-    n: usize,
-    k: usize,
-    group_size: usize,
-) -> Result<Vec<f32>, String> {
-    if n == 0 || k == 0 {
-        return Err("Dimensions must be > 0".into());
-    }
-    if group_size == 0 {
-        return Err("group_size must be > 0".into());
-    }
-    if n % 8 != 0 {
-        return Err("n must be multiple of 8 for AWQ packing".into());
-    }
-    if k % group_size != 0 {
-        return Err("k must be multiple of group_size for AWQ".into());
-    }
-    let groups = k / group_size;
-    if groups > i32::MAX as usize {
-        return Err("group count exceeds addressable range".into());
-    }
-    let packed_out = n / 8;
-    let expected_qweight = checked_mul(packed_out, k, "qweight")?;
-    let expected_qzeros = checked_mul(packed_out, groups, "qzeros")?;
-    let expected_scales = checked_mul(n, groups, "scales")?;
-    if qweight.len() != expected_qweight {
-        return Err(format!(
-            "qweight length mismatch: expected {expected_qweight}, got {}",
-            qweight.len()
-        ));
-    }
-    if qzeros.len() != expected_qzeros {
-        return Err(format!(
-            "qzeros length mismatch: expected {expected_qzeros}, got {}",
-            qzeros.len()
-        ));
-    }
-    if scales.len() != expected_scales {
-        return Err(format!(
-            "scales length mismatch: expected {expected_scales}, got {}",
-            scales.len()
-        ));
-    }
-    if n > i32::MAX as usize || k > i32::MAX as usize || group_size > i32::MAX as usize {
-        return Err("dimensions exceed addressable range".into());
-    }
-    if n
-        .checked_mul(k)
-        .ok_or_else(|| "output overflow".to_string())?
-        > u32::MAX as usize
-    {
-        return Err("output exceeds addressable range".into());
-    }
-
-    let qweight_buf = stream.clone_htod(qweight).map_err(|e| {
-        format!("CUDA AWQ dequantize upload failed: {e}")
-    })?;
-    let qzeros_buf = stream.clone_htod(qzeros).map_err(|e| {
-        format!("CUDA AWQ dequantize zeros upload failed: {e}")
-    })?;
-    let scales_buf = stream.clone_htod(scales).map_err(|e| {
-        format!("CUDA AWQ dequantize scales upload failed: {e}")
-    })?;
-    let output_buf = kernel
-        .dequantize_awq(stream, &qweight_buf, &qzeros_buf, &scales_buf, n, k, group_size)
-        .map_err(|e| format!("CUDA AWQ dequantize failed: {e}"))?;
-    stream
-        .clone_dtoh(&output_buf)
-        .map_err(|e| format!("CUDA AWQ dequantize readback failed: {e}"))
-}
-
-#[derive(Clone, Copy)]
-pub struct CudaBackend {}
-
-impl CudaBackend {
-    pub fn new() -> Self {
-        let _ = init_nccl();
-        Self {}
-    }
-
-    pub(crate) fn register_swap_block(&self, block_id: u64, buffer: CudaSlice<u8>) -> Result<(), String> {
-        let mut registry = swap_registry()
-            .lock()
-            .map_err(|_| "CUDA swap registry poisoned".to_string())?;
-        if registry.contains_key(&block_id) {
-            return Err(format!("CUDA swap registry already contains block {}", block_id));
-        }
-        registry.insert(block_id, buffer);
-        Ok(())
-    }
-
-    pub(crate) fn unregister_swap_block(&self, block_id: u64) -> Option<CudaSlice<u8>> {
-        let mut registry = swap_registry().lock().ok()?;
-        registry.remove(&block_id)
-    }
-}
-
-impl Default for CudaBackend {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-impl Backend for CudaBackend {
-    // =========================================================================
-    // L2 Block-Level Operators (ARCH-GRANULARITY-001)
-    // Fused GPU pipeline: data stays on GPU throughout entire L2 operation
-    // Only one upload (CPU→GPU) at start and one download (GPU→CPU) at end
-    // =========================================================================
-
-    fn attention_block(
-        &self,
-        hidden: &[f32],
-        q_weight: &[f32],
-        k_weight: &[f32],
-        v_weight: &[f32],
-        o_weight: &[f32],
-        norm_weight: &[f32],
-        cos_cache: &[f32],
-        sin_cache: &[f32],
-        _kv_cache_k: Option<&mut [f32]>,
-        _kv_cache_v: Option<&mut [f32]>,
-        config: &AttentionBlockConfig,
-    ) -> Result<Vec<f32>, String> {
-        // NOTE: This is a CPU API (accepts &[f32] host slices).
-        // Per ARCH-ADR-010, GPU optimization should happen at higher level
-        // (generator_forward_gpu_pure) with GpuTensor inputs.
-        // Block-level CPU API should use CPU backend directly.
-        crate::cpu_backend::CpuBackend::new().attention_block(
-            hidden, q_weight, k_weight, v_weight, o_weight,
-            norm_weight, cos_cache, sin_cache, _kv_cache_k, _kv_cache_v, config,
-        )
-    }
-
-    fn ffn_block(
-        &self,
-        hidden: &[f32],
-        gate_weight: Option<&[f32]>,
-        up_weight: &[f32],
-        down_weight: &[f32],
-        norm_weight: &[f32],
-        config: &FFNBlockConfig,
-    ) -> Result<Vec<f32>, String> {
-        // NOTE: This is a CPU API (accepts &[f32] host slices).
-        // Per ARCH-ADR-010, GPU optimization should happen at higher level
-        // (generator_forward_gpu_pure) with GpuTensor inputs.
-        // Block-level CPU API should use CPU backend directly.
-        crate::cpu_backend::CpuBackend::new().ffn_block(
-            hidden, gate_weight, up_weight, down_weight, norm_weight, config,
-        )
-    }
-
-    fn embedding(
-        &self,
-        tokens: &[u32],
-        embed_weight: &[f32],
-        position_weight: Option<&[f32]>,
-        config: &EmbeddingConfig,
-    ) -> Result<Vec<f32>, String> {
-        // Embedding is efficient on CPU (simple lookup), no GPU benefit
-        crate::cpu_backend::CpuBackend::new().embedding(
-            tokens, embed_weight, position_weight, config,
-        )
-    }
-
-    fn lm_head(
-        &self,
-        hidden: &[f32],
-        lm_weight: &[f32],
-        norm_weight: &[f32],
-        config: &LMHeadConfig,
-    ) -> Result<Vec<f32>, String> {
-        // NOTE: This is a CPU API (accepts &[f32] host slices).
-        // Per ARCH-ADR-010, GPU optimization should happen at higher level
-        // (generator_forward_gpu_pure) with GpuTensor inputs.
-        // Block-level CPU API should use CPU backend directly.
-        crate::cpu_backend::CpuBackend::new().lm_head(hidden, lm_weight, norm_weight, config)
-    }
-
-    fn engram_lookup(
-        &self,
-        tokens: &[u32],
-        engram_table: &[f32],
-        hidden_size: usize,
-        ngram_size: usize,
-        num_buckets: usize,
-    ) -> Result<(Vec<f32>, Vec<u64>), String> {
-        // Engram lookup is always CPU (DRAM-based hash table)
-        crate::cpu_backend::CpuBackend::new().engram_lookup(
-            tokens, engram_table, hidden_size, ngram_size, num_buckets,
-        )
-    }
-
-    fn engram_fuse(
-        &self,
-        attention_output: &[f32],
-        engram_output: &[f32],
-        config: &EngramFuseConfig,
-    ) -> Result<Vec<f32>, String> {
-        // Simple element-wise fusion, CPU is efficient
-        crate::cpu_backend::CpuBackend::new().engram_fuse(attention_output, engram_output, config)
-    }
-
-    fn kv_cache_update(
-        &self,
-        k_cache: &mut [f32],
-        v_cache: &mut [f32],
-        new_k: &[f32],
-        new_v: &[f32],
-        config: &KVCacheUpdateConfig,
-    ) -> Result<(), String> {
-        // KV cache update is memory-bound, CPU efficient
-        crate::cpu_backend::CpuBackend::new().kv_cache_update(k_cache, v_cache, new_k, new_v, config)
-    }
-
-    fn sample(
-        &self,
-        logits: &[f32],
-        vocab_size: usize,
-        config: &SamplingConfig,
-    ) -> Result<Vec<u32>, String> {
-        // Sampling requires RNG, always CPU
-        crate::cpu_backend::CpuBackend::new().sample(logits, vocab_size, config)
-    }
-
-    fn mean_pooling(
-        &self,
-        hidden: &[f32],
-        attention_mask: Option<&[f32]>,
-        config: &MeanPoolingConfig,
-    ) -> Result<Vec<f32>, String> {
-        // Simple reduction, CPU efficient for typical batch sizes
-        crate::cpu_backend::CpuBackend::new().mean_pooling(hidden, attention_mask, config)
-    }
-
-    fn cls_pooling(
-        &self,
-        hidden: &[f32],
-        config: &ClsPoolingConfig,
-    ) -> Result<Vec<f32>, String> {
-        // CLS extraction is just memory copy
-        crate::cpu_backend::CpuBackend::new().cls_pooling(hidden, config)
-    }
-
-    fn normalize(
-        &self,
-        input: &[f32],
-        config: &NormalizeConfig,
-    ) -> Result<Vec<f32>, String> {
-        // L2 normalization, CPU efficient for embedding vectors
-        crate::cpu_backend::CpuBackend::new().normalize(input, config)
-    }
-
-    fn dequantize(
-        &self,
-        quantized: &[u8],
-        scales: &[half::f16],
-        zeros: Option<&[u32]>,
-        config: &DequantizeConfig,
-    ) -> Result<Vec<f32>, String> {
-        // Try GPU dequantization for large tensors
-        if let (Some(kernel), Some(stream)) = (get_cuda_quantized_kernel(), get_cuda_stream()) {
-            let total_elements = config.n * config.k;
-            // Use GPU for large tensors (> 1M elements)
-            if total_elements > 1_000_000 {
-                // Upload quantized data
-                if let Ok(quant_buf) = stream.clone_htod(quantized) {
-                    let scales_f32: Vec<f32> = scales.iter().map(|s| s.to_f32()).collect();
-                    if let Ok(scales_buf) = stream.clone_htod(&scales_f32) {
-                        if let Ok(mut output_buf) = stream.alloc_zeros::<f32>(total_elements) {
-                            // Call GPU dequantize kernel based on format
-                            let success = match config.format {
-                                crate::kernel_types::QuantFormat::Q4_0 |
-                                crate::kernel_types::QuantFormat::Q4_K => {
-                                    // Convert scales from f32 back to f16 for kernel
-                                    let scales_f16: Vec<half::f16> = scales.to_vec();
-                                    if let Ok(scales_f16_buf) = stream.clone_htod(&scales_f16) {
-                                        let num_blocks = (config.n * config.k) / 32;
-                                        kernel.dequantize_q4(stream, &quant_buf, &scales_f16_buf, num_blocks).is_ok()
-                                    } else { false }
-                                }
-                                crate::kernel_types::QuantFormat::AWQ => {
-                                    if let Some(z) = zeros {
-                                        // AWQ uses u32 qweight and qzeros
-                                        let qweight: Vec<u32> = quantized.chunks(4).map(|chunk| {
-                                            u32::from_le_bytes([chunk[0], chunk.get(1).copied().unwrap_or(0),
-                                                               chunk.get(2).copied().unwrap_or(0), chunk.get(3).copied().unwrap_or(0)])
-                                        }).collect();
-                                        if let Ok(qweight_buf) = stream.clone_htod(&qweight) {
-                                            if let Ok(qzeros_buf) = stream.clone_htod(z) {
-                                                let scales_f16: Vec<half::f16> = scales.to_vec();
-                                                if let Ok(scales_f16_buf) = stream.clone_htod(&scales_f16) {
-                                                    kernel.dequantize_awq(stream, &qweight_buf, &qzeros_buf, &scales_f16_buf, config.n, config.k, config.group_size).is_ok()
-                                                } else { false }
-                                            } else { false }
-                                        } else { false }
-                                    } else { false }
-                                }
-                                _ => false,
-                            };
-                            if success {
-                                if let Ok(result) = stream.clone_dtoh(&output_buf) {
-                                    return Ok(result);
-                                }
-                            }
-                        }
-                    }
-                }
-                log::debug!("CUDA dequantize failed, falling back to CPU");
-            }
-        }
-
-        // CPU fallback
-        crate::cpu_backend::CpuBackend::new().dequantize(quantized, scales, zeros, config)
-    }
-
-    fn backend_type(&self) -> BackendType {
-        BackendType::Cuda
-    }
-
-    fn swap_out(&self, block_id: u64, cpu_buffer: &mut [u8]) -> Result<(), String> {
-        let stream = get_cuda_stream().ok_or("CUDA stream not available")?;
-        let mut registry = swap_registry()
-            .lock()
-            .map_err(|_| "CUDA swap registry poisoned".to_string())?;
-        let block = registry
-            .get_mut(&block_id)
-            .ok_or_else(|| format!("CUDA swap_out: unknown block {}", block_id))?;
-        if cpu_buffer.len() != block.len() {
-            return Err(format!(
-                "CUDA swap_out: cpu_buffer size mismatch (got {}, expected {})",
-                cpu_buffer.len(),
-                block.len()
-            ));
-        }
-        stream
-            .memcpy_dtoh(block, cpu_buffer)
-            .map_err(|e| format!("CUDA swap_out dtoh failed: {}", e))
-    }
-
-    fn swap_in(&self, cpu_buffer: &[u8], block_id: u64) -> Result<(), String> {
-        let stream = get_cuda_stream().ok_or("CUDA stream not available")?;
-        let mut registry = swap_registry()
-            .lock()
-            .map_err(|_| "CUDA swap registry poisoned".to_string())?;
-        let block = registry
-            .get_mut(&block_id)
-            .ok_or_else(|| format!("CUDA swap_in: unknown block {}", block_id))?;
-        if cpu_buffer.len() != block.len() {
-            return Err(format!(
-                "CUDA swap_in: cpu_buffer size mismatch (got {}, expected {})",
-                cpu_buffer.len(),
-                block.len()
-            ));
-        }
-        stream
-            .memcpy_htod(cpu_buffer, block)
-            .map_err(|e| format!("CUDA swap_in htod failed: {}", e))
-    }
-
-    // =========================================================================
-    // L3 High-Level Inference API (ARCH-ADR-003)
-    // CPU fallback for now; GPU-optimized versions can be added later
-    // =========================================================================
-
-    fn generator_forward(
-        &self,
-        tokens: &[u32],
-        embed_weight: &[f32],
-        layers: &[TransformerLayerWeights<'_>],
-        final_norm: &[f32],
-        lm_head_weight: &[f32],
-        cos_cache: &[f32],
-        sin_cache: &[f32],
-        kv_cache: &mut KVCacheState<'_>,
-        config: &GeneratorForwardConfig,
-    ) -> Result<LogitsTensor, String> {
-        // TODO: Implement CUDA-optimized generator forward
-        // For now, delegate to CPU implementation
-        crate::cpu_backend::CpuBackend::new().generator_forward(
-            tokens, embed_weight, layers, final_norm, lm_head_weight,
-            cos_cache, sin_cache, kv_cache, config,
-        )
-    }
-
-    fn moe_generator_forward(
-        &self,
-        tokens: &[u32],
-        embed_weight: &[f32],
-        layers: &[MoETransformerLayerWeights<'_>],
-        final_norm: &[f32],
-        lm_head_weight: &[f32],
-        cos_cache: &[f32],
-        sin_cache: &[f32],
-        kv_cache: &mut KVCacheState<'_>,
-        config: &MoEGeneratorForwardConfig,
-    ) -> Result<LogitsTensor, String> {
-        // TODO: Implement CUDA-optimized MoE generator forward
-        crate::cpu_backend::CpuBackend::new().moe_generator_forward(
-            tokens, embed_weight, layers, final_norm, lm_head_weight,
-            cos_cache, sin_cache, kv_cache, config,
-        )
-    }
-
-    fn embedding_forward(
-        &self,
-        tokens: &[u32],
-        embed_weight: &[f32],
-        layers: &[TransformerLayerWeights<'_>],
-        final_norm: Option<&[f32]>,
-        config: &EmbeddingForwardConfig,
-    ) -> Result<Vec<f32>, String> {
-        // TODO: Implement CUDA-optimized embedding forward
-        crate::cpu_backend::CpuBackend::new().embedding_forward(
-            tokens, embed_weight, layers, final_norm, config,
-        )
-    }
-
-    fn rerank_forward(
-        &self,
-        tokens: &[u32],
-        embed_weight: &[f32],
-        layers: &[TransformerLayerWeights<'_>],
-        final_norm: &[f32],
-        score_weight: &[f32],
-        config: &RerankForwardConfig,
-    ) -> Result<Vec<f32>, String> {
-        // TODO: Implement CUDA-optimized rerank forward
-        crate::cpu_backend::CpuBackend::new().rerank_forward(
-            tokens, embed_weight, layers, final_norm, score_weight, config,
-        )
-    }
-
-    // =========================================================================
-    // GPU-pure methods (ARCH-GPU-001)
-    // Upload weights to GPU ONCE at load time, reuse for all forward passes.
-    // NO repeated GPU<->CPU transfers during inference.
-    // =========================================================================
-
-    fn upload_embedding_weights(
-        &self,
-        embed_weight: &[f32],
-        layers: &[TransformerLayerWeights<'_>],
-        final_norm: Option<&[f32]>,
-        _config: &EmbeddingForwardConfig,
-    ) -> Result<EmbeddingModelWeightsGpu, String> {
-        let stream = get_cuda_stream()
-            .ok_or("CUDA stream not available")?;
-
-        // Helper to upload f32 slice to CUDA GPU memory
-        // Returns GpuTensor with CUDA buffer
-        fn upload_f32_to_cuda(
-            stream: &Arc<CudaStream>,
-            data: &[f32],
-            shape: Vec<usize>,
-        ) -> Result<GpuTensor, String> {
-            if data.is_empty() {
-                // Empty tensor - use CPU buffer
-                return Ok(GpuTensor::new(
-                    GpuBuffer::Cpu(Arc::new(Vec::new())),
-                    shape,
-                    TensorDtype::F32,
-                    BackendType::Cuda,
+        let token_ids = stream.alloc_zeros::<u32>(config.max_seq_len)?;
+        let linear_positions = if config.max_seq_len == 0 {
+            stream.alloc_zeros::<i32>(0)?
+        } else {
+            if config.max_seq_len > i32::MAX as usize {
+                return Err(BackendError::InvalidConfig(
+                    "max_seq_len exceeds i32 range".into(),
                 ));
             }
-
-            // Convert f32 slice to u8 slice (safe, no allocation)
-            let bytes: &[u8] = bytemuck::cast_slice(data);
-
-            // Upload bytes to CUDA GPU
-            let cuda_slice = stream.clone_htod(bytes)
-                .map_err(|e| format!("CUDA upload failed: {}", e))?;
-
-            Ok(GpuTensor::new(
-                GpuBuffer::Cuda(Arc::new(cuda_slice)),
-                shape,
-                TensorDtype::F32,
-                BackendType::Cuda,
-            ))
-        }
-
-        // Upload embedding weights to GPU
-        let embedding = upload_f32_to_cuda(stream, embed_weight, vec![embed_weight.len()])?;
-
-        // Upload all layer weights to GPU
-        let gpu_layers: Result<Vec<TransformerLayerWeightsGpu>, String> = layers.iter()
-            .map(|layer| {
-                Ok(TransformerLayerWeightsGpu {
-                    input_norm: upload_f32_to_cuda(stream, layer.input_norm, vec![layer.input_norm.len()])?,
-                    q_weight: upload_f32_to_cuda(stream, layer.q_weight, vec![layer.q_weight.len()])?,
-                    k_weight: upload_f32_to_cuda(stream, layer.k_weight, vec![layer.k_weight.len()])?,
-                    v_weight: upload_f32_to_cuda(stream, layer.v_weight, vec![layer.v_weight.len()])?,
-                    o_weight: upload_f32_to_cuda(stream, layer.o_weight, vec![layer.o_weight.len()])?,
-                    post_attn_norm: upload_f32_to_cuda(stream, layer.post_attn_norm, vec![layer.post_attn_norm.len()])?,
-                    gate_weight: match layer.gate_weight {
-                        Some(g) => Some(upload_f32_to_cuda(stream, g, vec![g.len()])?),
-                        None => None,
-                    },
-                    up_weight: upload_f32_to_cuda(stream, layer.up_weight, vec![layer.up_weight.len()])?,
-                    down_weight: upload_f32_to_cuda(stream, layer.down_weight, vec![layer.down_weight.len()])?,
-                    cos_cache: None,
-                    sin_cache: None,
-                })
-            })
-            .collect();
-        let gpu_layers = gpu_layers?;
-
-        // Upload final norm to GPU
-        let final_norm_data = final_norm.unwrap_or(&[]);
-        let final_norm_gpu = upload_f32_to_cuda(stream, final_norm_data, vec![final_norm_data.len()])?;
-
-        Ok(EmbeddingModelWeightsGpu {
-            embedding,
-            layers: gpu_layers,
-            final_norm: final_norm_gpu,
-        })
-    }
-
-    fn embedding_forward_gpu_pure(
-        &self,
-        tokens: &[u32],
-        weights: &EmbeddingModelWeightsGpu,
-        config: &EmbeddingForwardConfig,
-    ) -> Result<Vec<f32>, String> {
-        let stream = get_cuda_stream()
-            .ok_or("CUDA stream not available")?;
-
-        let expected_tokens = config
-            .batch_size
-            .checked_mul(config.seq_len)
-            .ok_or("CUDA embedding_forward_gpu_pure: token size overflow")?;
-        if tokens.len() != expected_tokens {
-            return Err(format!(
-                "CUDA embedding_forward_gpu_pure: token length mismatch (got {}, expected {})",
-                tokens.len(),
-                expected_tokens
-            ));
-        }
-
-        // Upload tokens to GPU (U32)
-        let token_bytes: &[u8] = bytemuck::cast_slice(tokens);
-        let token_buf = stream
-            .clone_htod(token_bytes)
-            .map_err(|e| format!("CUDA token upload failed: {}", e))?;
-        let tokens_gpu = GpuTensor::new(
-            GpuBuffer::Cuda(Arc::new(token_buf)),
-            vec![config.batch_size, config.seq_len],
-            TensorDtype::U32,
-            BackendType::Cuda,
-        );
-
-        // Embedding lookup
-        let mut hidden = GpuTensor {
-            buffer: GpuBuffer::Cpu(Arc::new(Vec::new())),
-            shape: Vec::new(),
-            dtype: TensorDtype::F32,
-            size_in_bytes: 0,
-            backend: BackendType::Cuda,
-        };
-        self.embedding_lookup_gpu(&tokens_gpu, &weights.embedding, &mut hidden)?;
-
-        // Prepare identity RoPE cache if missing (cos=1, sin=0) to keep Q/K unchanged
-        let mut identity_rope: Option<(GpuTensor, GpuTensor)> = None;
-        if weights.layers.iter().any(|layer| layer.cos_cache.is_none() || layer.sin_cache.is_none()) {
-            if config.head_dim % 2 != 0 {
-                return Err("CUDA embedding_forward_gpu_pure: head_dim must be even for RoPE".into());
+            let mut host_positions = Vec::with_capacity(config.max_seq_len);
+            for idx in 0..config.max_seq_len {
+                host_positions.push(idx as i32);
             }
-            let rope_len = config
-                .seq_len
-                .checked_mul(config.head_dim / 2)
-                .ok_or("CUDA embedding_forward_gpu_pure: RoPE cache size overflow")?;
-            let cos = vec![1.0f32; rope_len];
-            let sin = vec![0.0f32; rope_len];
-            let cos_bytes: &[u8] = bytemuck::cast_slice(&cos);
-            let sin_bytes: &[u8] = bytemuck::cast_slice(&sin);
-            let cos_buf = stream
-                .clone_htod(cos_bytes)
-                .map_err(|e| format!("CUDA RoPE cos upload failed: {}", e))?;
-            let sin_buf = stream
-                .clone_htod(sin_bytes)
-                .map_err(|e| format!("CUDA RoPE sin upload failed: {}", e))?;
-            let cos_gpu = GpuTensor {
-                buffer: GpuBuffer::Cuda(Arc::new(cos_buf)),
-                shape: vec![rope_len],
-                dtype: TensorDtype::F32,
-                size_in_bytes: cos_bytes.len(),
-                backend: BackendType::Cuda,
-            };
-            let sin_gpu = GpuTensor {
-                buffer: GpuBuffer::Cuda(Arc::new(sin_buf)),
-                shape: vec![rope_len],
-                dtype: TensorDtype::F32,
-                size_in_bytes: sin_bytes.len(),
-                backend: BackendType::Cuda,
-            };
-            identity_rope = Some((cos_gpu, sin_gpu));
-        }
-
-        let use_silu = matches!(config.activation, crate::kernel_types::Activation::SiLU);
-        let layer_cfg = TransformerLayerConfigGpu {
-            batch_size: config.batch_size,
-            seq_len: config.seq_len,
-            hidden_size: config.hidden_size,
-            num_q_heads: config.num_q_heads,
-            num_kv_heads: config.num_kv_heads,
-            head_dim: config.head_dim,
-            intermediate_size: config.intermediate_size,
-            rms_norm_eps: config.rms_norm_eps,
-            position: 0,
-            use_silu,
+            stream.clone_htod(&host_positions)?
         };
-
-        for layer in weights.layers.iter() {
-            let mut layer_weights = layer.clone();
-            if layer_weights.cos_cache.is_none() || layer_weights.sin_cache.is_none() {
-                if let Some((cos_gpu, sin_gpu)) = identity_rope.as_ref() {
-                    layer_weights.cos_cache = Some(cos_gpu.clone());
-                    layer_weights.sin_cache = Some(sin_gpu.clone());
-                }
-            }
-            self.transformer_layer_gpu(&mut hidden, &layer_weights, None, &layer_cfg)?;
-        }
-
-        // Final RMS norm
-        self.rms_norm_gpu(&mut hidden, &weights.final_norm, config.rms_norm_eps)?;
-
-        // Pooling (mean or cls)
-        let mut pooled = GpuTensor {
-            buffer: GpuBuffer::Cpu(Arc::new(Vec::new())),
-            shape: Vec::new(),
-            dtype: TensorDtype::F32,
-            size_in_bytes: 0,
-            backend: BackendType::Cuda,
-        };
-
-        match config.pooling {
-            crate::kernel_types::PoolingType::Mean => {
-                // Mean pooling: use all-ones mask (all tokens are valid)
-                let mask = vec![1.0f32; expected_tokens];
-                let mask_bytes: &[u8] = bytemuck::cast_slice(&mask);
-                let mask_buf = stream
-                    .clone_htod(mask_bytes)
-                    .map_err(|e| format!("CUDA mask upload failed: {}", e))?;
-                let mask_gpu = GpuTensor {
-                    buffer: GpuBuffer::Cuda(Arc::new(mask_buf)),
-                    shape: vec![config.batch_size, config.seq_len],
-                    dtype: TensorDtype::F32,
-                    size_in_bytes: mask_bytes.len(),
-                    backend: BackendType::Cuda,
-                };
-                self.mean_pooling_gpu(&hidden, &mask_gpu, &mut pooled)?;
-            }
-            crate::kernel_types::PoolingType::Cls => {
-                // CLS pooling: take the first token representation
-                self.cls_pooling_gpu(&hidden, &mut pooled)?;
-            }
-            crate::kernel_types::PoolingType::Last => {
-                // Last token pooling: take the last token representation
-                // For now, fall back to CPU implementation
-                // TODO: Implement GPU last-token pooling kernel
-                let hidden_bytes = match &hidden.buffer {
-                    GpuBuffer::Cuda(cuda_slice) => {
-                        stream.clone_dtoh(cuda_slice.as_ref())
-                            .map_err(|e| format!("CUDA hidden download failed: {}", e))?
-                    }
-                    GpuBuffer::Cpu(bytes) => (**bytes).clone(),
-                    #[allow(unreachable_patterns)]
-                    _ => return Err("Unexpected GPU buffer type".into()),
-                };
-                let hidden_data: Vec<f32> = bytemuck::cast_slice(&hidden_bytes).to_vec();
-
-                // Extract last token for each batch
-                let batch_size = config.batch_size;
-                let seq_len = config.seq_len;
-                let hidden_dim = config.hidden_size;
-                let mut last_token_data = Vec::with_capacity(batch_size * hidden_dim);
-                for batch in 0..batch_size {
-                    let last_idx = (batch + 1) * seq_len - 1;
-                    let start = last_idx * hidden_dim;
-                    let end = start + hidden_dim;
-                    last_token_data.extend_from_slice(&hidden_data[start..end]);
-                }
-
-                // Upload last token data to GPU
-                let last_bytes: &[u8] = bytemuck::cast_slice(&last_token_data);
-                let last_buf = stream
-                    .clone_htod(last_bytes)
-                    .map_err(|e| format!("CUDA last token upload failed: {}", e))?;
-                pooled.buffer = GpuBuffer::Cuda(Arc::new(last_buf));
-                pooled.shape = vec![batch_size, hidden_dim];
-                pooled.size_in_bytes = last_bytes.len();
-                pooled.dtype = TensorDtype::F32;
-                pooled.backend = BackendType::Cuda;
-            }
-        }
-
-        // Download embeddings to host
-        match &pooled.buffer {
-            GpuBuffer::Cuda(cuda_slice) => {
-                let bytes: Vec<u8> = stream
-                    .clone_dtoh(cuda_slice.as_ref())
-                    .map_err(|e| format!("CUDA embeddings download failed: {}", e))?;
-                Ok(bytemuck::cast_slice(&bytes).to_vec())
-            }
-            GpuBuffer::Cpu(bytes) => Ok(bytemuck::cast_slice(bytes.as_slice()).to_vec()),
-            #[allow(unreachable_patterns)]
-            _ => Err("Unexpected GPU buffer type for CUDA backend".into()),
-        }
-    }
-
-    // =========================================================================
-    // GPU-Native Kernel Methods (ARCH-ADR-010)
-    // CUDA backend: True GPU-resident computation
-    //
-    // IMPORTANT: These methods MUST keep all data on GPU throughout computation.
-    // Pattern: GpuTensor in → CUDA kernel dispatch → GpuTensor out
-    // FORBIDDEN: download → CPU compute → upload (violates ARCH-GPU-001-B)
-    // =========================================================================
-
-    fn embedding_lookup_gpu(
-        &self,
-        tokens: &GpuTensor,
-        embed_weight: &GpuTensor,
-        output: &mut GpuTensor,
-    ) -> Result<(), String> {
-        let stream = get_cuda_stream()
-            .ok_or("CUDA stream not available")?;
-        let kernel = get_cuda_pooling_kernel()
-            .ok_or("CUDA pooling kernel not available")?;
-
-        if tokens.dtype != TensorDtype::U32 {
-            return Err("embedding_lookup_gpu: tokens must be U32 tensor".into());
-        }
-        if embed_weight.dtype != TensorDtype::F32 {
-            return Err("embedding_lookup_gpu: embed_weight must be F32 tensor".into());
-        }
-        if embed_weight.shape.len() < 2 {
-            return Err("embedding_lookup_gpu: embed_weight must be 2D [vocab, hidden]".into());
-        }
-
-        let num_tokens: usize = tokens.shape.iter().product();
-        let hidden_dim = *embed_weight.shape.last().unwrap();
-        let embed_elements: usize = embed_weight.shape.iter().product();
-        let output_elements = num_tokens
-            .checked_mul(hidden_dim)
-            .ok_or("embedding_lookup_gpu: output size overflow")?;
-
-        let GpuBuffer::Cuda(tokens_slice) = &tokens.buffer else {
-            return Err("embedding_lookup_gpu: tokens must be CUDA buffer".into());
-        };
-        let GpuBuffer::Cuda(embed_slice) = &embed_weight.buffer else {
-            return Err("embedding_lookup_gpu: embed_weight must be CUDA buffer".into());
-        };
-
-        let token_view = unsafe {
-            tokens_slice
-                .transmute::<u32>(num_tokens)
-                .ok_or("embedding_lookup_gpu: failed to transmute tokens to u32 view")?
-        };
-        let table_view = unsafe {
-            embed_slice
-                .transmute::<f32>(embed_elements)
-                .ok_or("embedding_lookup_gpu: failed to transmute embedding to f32 view")?
-        };
-
-        let output_bytes = output_elements * std::mem::size_of::<f32>();
-        let mut output_slice: cudarc::driver::CudaSlice<u8> = stream
-            .alloc_zeros(output_bytes)
-            .map_err(|e| format!("embedding_lookup_gpu: alloc failed: {}", e))?;
-        let mut output_view = unsafe {
-            output_slice
-                .transmute_mut::<f32>(output_elements)
-                .ok_or("embedding_lookup_gpu: failed to transmute output to f32 view")?
-        };
-
-        kernel.embedding_gather_view(
-            stream,
-            &token_view,
-            &table_view,
-            &mut output_view,
-            num_tokens,
-            hidden_dim,
-        )
-        .map_err(|e| format!("embedding_lookup_gpu kernel error: {}", e))?;
-
-        let mut out_shape = tokens.shape.clone();
-        out_shape.push(hidden_dim);
-        output.buffer = GpuBuffer::Cuda(Arc::new(output_slice));
-        output.shape = out_shape;
-        output.dtype = TensorDtype::F32;
-        output.size_in_bytes = output_bytes;
-        output.backend = BackendType::Cuda;
-
-        Ok(())
-    }
-
-    fn transformer_layer_gpu(
-        &self,
-        hidden: &mut GpuTensor,
-        layer_weights: &TransformerLayerWeightsGpu,
-        kv_cache: Option<&mut KVCacheGpu>,
-        config: &TransformerLayerConfigGpu,
-    ) -> Result<(), String> {
-        if hidden.dtype != TensorDtype::F32 {
-            return Err("transformer_layer_gpu: hidden must be F32 tensor".into());
-        }
-        if hidden.shape.len() < 2 {
-            return Err("transformer_layer_gpu: hidden must be at least 2D".into());
-        }
-
-        let stream = get_cuda_stream()
-            .ok_or("CUDA stream not available")?;
-        let rms_kernel = get_cuda_rmsnorm_kernel()
-            .ok_or("CUDA RMSNorm kernel not available")?;
-        let linear_kernel = get_cuda_linear_kernel()
-            .ok_or("CUDA linear kernel not available")?;
-        let rope_kernel = get_cuda_rope_kernel()
-            .ok_or("CUDA RoPE kernel not available")?;
-        let silu_kernel = get_cuda_silu_kernel()
-            .ok_or("CUDA SiLU kernel not available")?;
-        let flash_kernel = get_cuda_flash_kernel()
-            .ok_or("CUDA flash attention kernel not available")?;
-        let elem_kernel = get_cuda_elementwise_kernel()
-            .ok_or("CUDA elementwise kernel not available")?;
-
-        let batch = config.batch_size;
-        let seq = config.seq_len;
-        let hidden_dim = config.hidden_size;
-        let total_tokens = batch
-            .checked_mul(seq)
-            .ok_or("transformer_layer_gpu: batch*seq overflow")?;
-
-        let hidden_elements: usize = hidden.shape.iter().product();
-        let expected_hidden = total_tokens
-            .checked_mul(hidden_dim)
-            .ok_or("transformer_layer_gpu: hidden size overflow")?;
-        if hidden_elements != expected_hidden {
-            return Err(format!(
-                "transformer_layer_gpu: hidden shape mismatch (got {}, expected {})",
-                hidden_elements, expected_hidden
-            ));
-        }
-
-        let q_out = config.num_q_heads
-            .checked_mul(config.head_dim)
-            .ok_or("transformer_layer_gpu: q_out overflow")?;
-        let kv_out = config.num_kv_heads
-            .checked_mul(config.head_dim)
-            .ok_or("transformer_layer_gpu: kv_out overflow")?;
-
-        // Extract hidden buffer
-        let GpuBuffer::Cuda(hidden_slice) = &hidden.buffer else {
-            return Err("transformer_layer_gpu: hidden must be CUDA buffer".into());
-        };
-        let hidden_view = unsafe {
-            hidden_slice
-                .transmute::<f32>(hidden_elements)
-                .ok_or("transformer_layer_gpu: failed to transmute hidden to f32 view")?
-        };
-
-        // Load norm weights
-        let GpuBuffer::Cuda(input_norm_slice) = &layer_weights.input_norm.buffer else {
-            return Err("transformer_layer_gpu: input_norm must be CUDA buffer".into());
-        };
-        let input_norm_view = unsafe {
-            input_norm_slice
-                .transmute::<f32>(hidden_dim)
-                .ok_or("transformer_layer_gpu: failed to transmute input_norm to f32 view")?
-        };
-
-        let mut normed: cudarc::driver::CudaSlice<f32> = stream
-            .alloc_zeros(hidden_elements)
-            .map_err(|e| format!("transformer_layer_gpu: alloc normed failed: {}", e))?;
+        let positions = GpuBuffer::new(stream.alloc_zeros::<i32>(config.max_seq_len)?);
+        let hidden = GpuBuffer::new(stream.alloc_zeros::<f32>(hidden_len)?);
+        let norm = GpuBuffer::new(stream.alloc_zeros::<f32>(hidden_len)?);
+        let qkv = GpuBuffer::new(stream.alloc_zeros::<f32>(qkv_len)?);
+        let attn_out = GpuBuffer::new(stream.alloc_zeros::<f32>(hidden_len)?);
+        let ffn_gate = GpuBuffer::new(stream.alloc_zeros::<f32>(ffn_len)?);
+        let ffn_up = GpuBuffer::new(stream.alloc_zeros::<f32>(ffn_len)?);
+        let ffn_act = GpuBuffer::new(stream.alloc_zeros::<f32>(ffn_len)?);
+        let ffn_out = GpuBuffer::new(stream.alloc_zeros::<f32>(hidden_len)?);
+        let last_hidden = GpuBuffer::new(stream.alloc_zeros::<f32>(config.hidden_size)?);
+        let rope_cos = if config.position_encoding == PositionEncoding::Rope
+            && config.rope_precompute
+            && config.head_dim / 2 > 0
         {
-            let mut normed_view = normed.as_view_mut();
-            rms_kernel
-                .forward_view(
-                    stream,
-                    &hidden_view,
-                    &input_norm_view,
-                    &mut normed_view,
-                    total_tokens,
-                    hidden_dim,
-                    config.rms_norm_eps,
-                )
-                .map_err(|e| format!("transformer_layer_gpu rms_norm error: {}", e))?;
-        }
-
-        // QKV projections
-        let q_weight_elems = q_out
-            .checked_mul(hidden_dim)
-            .ok_or("transformer_layer_gpu: q_weight size overflow")?;
-        let kv_weight_elems = kv_out
-            .checked_mul(hidden_dim)
-            .ok_or("transformer_layer_gpu: kv_weight size overflow")?;
-
-        let GpuBuffer::Cuda(q_weight_slice) = &layer_weights.q_weight.buffer else {
-            return Err("transformer_layer_gpu: q_weight must be CUDA buffer".into());
-        };
-        let GpuBuffer::Cuda(k_weight_slice) = &layer_weights.k_weight.buffer else {
-            return Err("transformer_layer_gpu: k_weight must be CUDA buffer".into());
-        };
-        let GpuBuffer::Cuda(v_weight_slice) = &layer_weights.v_weight.buffer else {
-            return Err("transformer_layer_gpu: v_weight must be CUDA buffer".into());
-        };
-
-        let q_weight_view = unsafe {
-            q_weight_slice
-                .transmute::<f32>(q_weight_elems)
-                .ok_or("transformer_layer_gpu: failed to transmute q_weight")?
-        };
-        let k_weight_view = unsafe {
-            k_weight_slice
-                .transmute::<f32>(kv_weight_elems)
-                .ok_or("transformer_layer_gpu: failed to transmute k_weight")?
-        };
-        let v_weight_view = unsafe {
-            v_weight_slice
-                .transmute::<f32>(kv_weight_elems)
-                .ok_or("transformer_layer_gpu: failed to transmute v_weight")?
-        };
-
-        let q_elements = total_tokens
-            .checked_mul(q_out)
-            .ok_or("transformer_layer_gpu: q_elements overflow")?;
-        let kv_elements = total_tokens
-            .checked_mul(kv_out)
-            .ok_or("transformer_layer_gpu: kv_elements overflow")?;
-
-        let mut q_linear: cudarc::driver::CudaSlice<f32> = stream
-            .alloc_zeros(q_elements)
-            .map_err(|e| format!("transformer_layer_gpu: alloc q_linear failed: {}", e))?;
-        let mut k_linear: cudarc::driver::CudaSlice<f32> = stream
-            .alloc_zeros(kv_elements)
-            .map_err(|e| format!("transformer_layer_gpu: alloc k_linear failed: {}", e))?;
-        let mut v_linear: cudarc::driver::CudaSlice<f32> = stream
-            .alloc_zeros(kv_elements)
-            .map_err(|e| format!("transformer_layer_gpu: alloc v_linear failed: {}", e))?;
-
-        let params_q = LinearParams {
-            in_features: hidden_dim as u32,
-            out_features: q_out as u32,
-            has_bias: 0,
-            padding: 0,
-        };
-        let params_kv = LinearParams {
-            in_features: hidden_dim as u32,
-            out_features: kv_out as u32,
-            has_bias: 0,
-            padding: 0,
-        };
-
-        {
-            let normed_view = normed.as_view();
-            let mut q_out_view = q_linear.as_view_mut();
-            linear_kernel.forward_view(
-                stream,
-                params_q,
-                &normed_view,
-                &q_weight_view,
-                None,
-                &mut q_out_view,
-                total_tokens,
-            )?;
-        }
-        {
-            let normed_view = normed.as_view();
-            let mut k_out_view = k_linear.as_view_mut();
-            linear_kernel.forward_view(
-                stream,
-                params_kv,
-                &normed_view,
-                &k_weight_view,
-                None,
-                &mut k_out_view,
-                total_tokens,
-            )?;
-        }
-        {
-            let normed_view = normed.as_view();
-            let mut v_out_view = v_linear.as_view_mut();
-            linear_kernel.forward_view(
-                stream,
-                params_kv,
-                &normed_view,
-                &v_weight_view,
-                None,
-                &mut v_out_view,
-                total_tokens,
-            )?;
-        }
-
-        // Apply RoPE to Q and K (in-place, layout: [batch, seq, heads, head_dim])
-        let (cos_cache, sin_cache) = match (layer_weights.cos_cache.as_ref(), layer_weights.sin_cache.as_ref()) {
-            (Some(cos), Some(sin)) => (cos, sin),
-            _ => return Err("transformer_layer_gpu: RoPE cache missing (cos/sin)".into()),
-        };
-        if cos_cache.dtype != TensorDtype::F32 || sin_cache.dtype != TensorDtype::F32 {
-            return Err("transformer_layer_gpu: RoPE cache must be F32 tensor".into());
-        }
-        let GpuBuffer::Cuda(cos_cache_slice) = &cos_cache.buffer else {
-            return Err("transformer_layer_gpu: cos_cache must be CUDA buffer".into());
-        };
-        let GpuBuffer::Cuda(sin_cache_slice) = &sin_cache.buffer else {
-            return Err("transformer_layer_gpu: sin_cache must be CUDA buffer".into());
-        };
-        if config.head_dim % 2 != 0 {
-            return Err("transformer_layer_gpu: head_dim must be even for RoPE".into());
-        }
-        let pos_end = config.position
-            .checked_add(seq)
-            .ok_or("transformer_layer_gpu: RoPE position overflow")?;
-        let needed = pos_end
-            .checked_mul(config.head_dim / 2)
-            .ok_or("transformer_layer_gpu: RoPE cache size overflow")?;
-        let cos_len = cos_cache.size_in_bytes / std::mem::size_of::<f32>();
-        let sin_len = sin_cache.size_in_bytes / std::mem::size_of::<f32>();
-        if cos_len < needed || sin_len < needed {
-            return Err("transformer_layer_gpu: RoPE cache length is insufficient".into());
-        }
-        let cos_view = unsafe {
-            cos_cache_slice
-                .transmute::<f32>(cos_len)
-                .ok_or("transformer_layer_gpu: failed to transmute cos_cache")?
-        };
-        let sin_view = unsafe {
-            sin_cache_slice
-                .transmute::<f32>(sin_len)
-                .ok_or("transformer_layer_gpu: failed to transmute sin_cache")?
-        };
-        {
-            let mut q_view = q_linear.as_view_mut();
-            rope_kernel
-                .apply_inplace_f32(
-                    stream,
-                    &mut q_view,
-                    &cos_view,
-                    &sin_view,
-                    batch,
-                    seq,
-                    config.num_q_heads,
-                    config.head_dim,
-                    config.position,
-                )
-                .map_err(|e| format!("transformer_layer_gpu RoPE q error: {}", e))?;
-        }
-        {
-            let mut k_view = k_linear.as_view_mut();
-            rope_kernel
-                .apply_inplace_f32(
-                    stream,
-                    &mut k_view,
-                    &cos_view,
-                    &sin_view,
-                    batch,
-                    seq,
-                    config.num_kv_heads,
-                    config.head_dim,
-                    config.position,
-                )
-                .map_err(|e| format!("transformer_layer_gpu RoPE k error: {}", e))?;
-        }
-
-        // Permute to [batch, heads, seq, head_dim]
-        let mut q_perm: cudarc::driver::CudaSlice<f32> = stream
-            .alloc_zeros(q_elements)
-            .map_err(|e| format!("transformer_layer_gpu: alloc q_perm failed: {}", e))?;
-        let mut k_perm: cudarc::driver::CudaSlice<f32> = stream
-            .alloc_zeros(kv_elements)
-            .map_err(|e| format!("transformer_layer_gpu: alloc k_perm failed: {}", e))?;
-        let mut v_perm: cudarc::driver::CudaSlice<f32> = stream
-            .alloc_zeros(kv_elements)
-            .map_err(|e| format!("transformer_layer_gpu: alloc v_perm failed: {}", e))?;
-
-        {
-            let q_in = q_linear.as_view();
-            let mut q_out_view = q_perm.as_view_mut();
-            elem_kernel
-                .permute_qkv_view(
-                    stream,
-                    &q_in,
-                    &mut q_out_view,
-                    batch,
-                    seq,
-                    config.num_q_heads,
-                    config.head_dim,
-                )
-                .map_err(|e| format!("transformer_layer_gpu permute q error: {}", e))?;
-        }
-        {
-            let k_in = k_linear.as_view();
-            let mut k_out_view = k_perm.as_view_mut();
-            elem_kernel
-                .permute_qkv_view(
-                    stream,
-                    &k_in,
-                    &mut k_out_view,
-                    batch,
-                    seq,
-                    config.num_kv_heads,
-                    config.head_dim,
-                )
-                .map_err(|e| format!("transformer_layer_gpu permute k error: {}", e))?;
-        }
-        {
-            let v_in = v_linear.as_view();
-            let mut v_out_view = v_perm.as_view_mut();
-            elem_kernel
-                .permute_qkv_view(
-                    stream,
-                    &v_in,
-                    &mut v_out_view,
-                    batch,
-                    seq,
-                    config.num_kv_heads,
-                    config.head_dim,
-                )
-                .map_err(|e| format!("transformer_layer_gpu permute v error: {}", e))?;
-        }
-
-        // KV cache update (GPU-to-GPU copy)
-        if let Some(kv_cache) = kv_cache {
-            if kv_cache.num_kv_heads != config.num_kv_heads || kv_cache.head_dim != config.head_dim {
-                return Err("transformer_layer_gpu: KV cache shape mismatch".into());
-            }
-            if kv_cache.num_layers != 1 {
-                return Err("transformer_layer_gpu: KV cache must be per-layer (num_layers == 1)".into());
-            }
-            let pos_end = config.position
-                .checked_add(seq)
-                .ok_or("transformer_layer_gpu: KV cache position overflow")?;
-            if pos_end > kv_cache.max_len {
-                return Err("transformer_layer_gpu: KV cache position exceeds max_len".into());
-            }
-            if kv_cache.k_cache.dtype != TensorDtype::F32 || kv_cache.v_cache.dtype != TensorDtype::F32 {
-                return Err("transformer_layer_gpu: KV cache must be F32 tensors".into());
-            }
-            let GpuBuffer::Cuda(k_cache_arc) = &mut kv_cache.k_cache.buffer else {
-                return Err("transformer_layer_gpu: KV cache k must be CUDA buffer".into());
-            };
-            let GpuBuffer::Cuda(v_cache_arc) = &mut kv_cache.v_cache.buffer else {
-                return Err("transformer_layer_gpu: KV cache v must be CUDA buffer".into());
-            };
-            let k_cache_slice = Arc::get_mut(k_cache_arc)
-                .ok_or("transformer_layer_gpu: KV cache k buffer is shared")?;
-            let v_cache_slice = Arc::get_mut(v_cache_arc)
-                .ok_or("transformer_layer_gpu: KV cache v buffer is shared")?;
-            let k_cache_elems = kv_cache.k_cache.size_in_bytes / std::mem::size_of::<f32>();
-            let v_cache_elems = kv_cache.v_cache.size_in_bytes / std::mem::size_of::<f32>();
-            let mut k_cache_view = unsafe {
-                k_cache_slice
-                    .transmute_mut::<f32>(k_cache_elems)
-                    .ok_or("transformer_layer_gpu: failed to transmute KV k cache")?
-            };
-            let mut v_cache_view = unsafe {
-                v_cache_slice
-                    .transmute_mut::<f32>(v_cache_elems)
-                    .ok_or("transformer_layer_gpu: failed to transmute KV v cache")?
-            };
-            let k_src_view = k_perm.as_view();
-            let v_src_view = v_perm.as_view();
-            let copy_len = seq
-                .checked_mul(config.head_dim)
-                .ok_or("transformer_layer_gpu: KV copy len overflow")?;
-
-            for b in 0..batch {
-                for h in 0..config.num_kv_heads {
-                    let src_start = (b * config.num_kv_heads + h)
-                        .checked_mul(seq)
-                        .and_then(|v| v.checked_mul(config.head_dim))
-                        .ok_or("transformer_layer_gpu: KV src offset overflow")?;
-                    let src_end = src_start + copy_len;
-                    let src_k = k_src_view
-                        .try_slice(src_start..src_end)
-                        .ok_or("transformer_layer_gpu: KV k src slice OOB")?;
-                    let src_v = v_src_view
-                        .try_slice(src_start..src_end)
-                        .ok_or("transformer_layer_gpu: KV v src slice OOB")?;
-
-                    let dst_start = (b * config.num_kv_heads + h)
-                        .checked_mul(kv_cache.max_len)
-                        .and_then(|v| v.checked_add(config.position))
-                        .and_then(|v| v.checked_mul(config.head_dim))
-                        .ok_or("transformer_layer_gpu: KV dst offset overflow")?;
-                    let dst_end = dst_start + copy_len;
-                    let mut dst_k = k_cache_view
-                        .try_slice_mut(dst_start..dst_end)
-                        .ok_or("transformer_layer_gpu: KV k dst slice OOB")?;
-                    let mut dst_v = v_cache_view
-                        .try_slice_mut(dst_start..dst_end)
-                        .ok_or("transformer_layer_gpu: KV v dst slice OOB")?;
-
-                    stream
-                        .memcpy_dtod(&src_k, &mut dst_k)
-                        .map_err(|e| format!("transformer_layer_gpu KV k copy error: {}", e))?;
-                    stream
-                        .memcpy_dtod(&src_v, &mut dst_v)
-                        .map_err(|e| format!("transformer_layer_gpu KV v copy error: {}", e))?;
-                }
-            }
-
-            kv_cache.seq_len = pos_end;
-        }
-
-        // Expand K/V heads for GQA/MQA if needed
-        let k_attn: &cudarc::driver::CudaSlice<f32>;
-        let v_attn: &cudarc::driver::CudaSlice<f32>;
-        let mut k_gqa: Option<cudarc::driver::CudaSlice<f32>> = None;
-        let mut v_gqa: Option<cudarc::driver::CudaSlice<f32>> = None;
-        if config.num_q_heads == config.num_kv_heads {
-            k_attn = &k_perm;
-            v_attn = &v_perm;
-        } else {
-            if config.num_q_heads % config.num_kv_heads != 0 {
-                return Err("transformer_layer_gpu: num_q_heads must be multiple of num_kv_heads".into());
-            }
-            let heads_per_kv = config.num_q_heads / config.num_kv_heads;
-            let gqa_elements = total_tokens
-                .checked_mul(config.num_q_heads)
-                .and_then(|v| v.checked_mul(config.head_dim))
-                .ok_or("transformer_layer_gpu: gqa elements overflow")?;
-            let mut k_buf: cudarc::driver::CudaSlice<f32> = stream
-                .alloc_zeros(gqa_elements)
-                .map_err(|e| format!("transformer_layer_gpu: alloc k_gqa failed: {}", e))?;
-            let mut v_buf: cudarc::driver::CudaSlice<f32> = stream
-                .alloc_zeros(gqa_elements)
-                .map_err(|e| format!("transformer_layer_gpu: alloc v_gqa failed: {}", e))?;
-
-            let k_src_view = k_perm.as_view();
-            let v_src_view = v_perm.as_view();
-            let copy_len = seq
-                .checked_mul(config.head_dim)
-                .ok_or("transformer_layer_gpu: gqa copy len overflow")?;
-
-            for b in 0..batch {
-                for kv_h in 0..config.num_kv_heads {
-                    let src_start = (b * config.num_kv_heads + kv_h)
-                        .checked_mul(seq)
-                        .and_then(|v| v.checked_mul(config.head_dim))
-                        .ok_or("transformer_layer_gpu: gqa src offset overflow")?;
-                    let src_end = src_start + copy_len;
-                    let src_k = k_src_view
-                        .try_slice(src_start..src_end)
-                        .ok_or("transformer_layer_gpu: gqa k src slice OOB")?;
-                    let src_v = v_src_view
-                        .try_slice(src_start..src_end)
-                        .ok_or("transformer_layer_gpu: gqa v src slice OOB")?;
-
-                    for rep in 0..heads_per_kv {
-                        let q_h = kv_h * heads_per_kv + rep;
-                        let dst_start = (b * config.num_q_heads + q_h)
-                            .checked_mul(seq)
-                            .and_then(|v| v.checked_mul(config.head_dim))
-                            .ok_or("transformer_layer_gpu: gqa dst offset overflow")?;
-                        let dst_end = dst_start + copy_len;
-                        let mut dst_k = k_buf
-                            .try_slice_mut(dst_start..dst_end)
-                            .ok_or("transformer_layer_gpu: gqa k dst slice OOB")?;
-                        let mut dst_v = v_buf
-                            .try_slice_mut(dst_start..dst_end)
-                            .ok_or("transformer_layer_gpu: gqa v dst slice OOB")?;
-
-                        stream
-                            .memcpy_dtod(&src_k, &mut dst_k)
-                            .map_err(|e| format!("transformer_layer_gpu gqa k copy error: {}", e))?;
-                        stream
-                            .memcpy_dtod(&src_v, &mut dst_v)
-                            .map_err(|e| format!("transformer_layer_gpu gqa v copy error: {}", e))?;
-                    }
-                }
-            }
-
-            k_gqa = Some(k_buf);
-            v_gqa = Some(v_buf);
-            k_attn = k_gqa.as_ref().ok_or("transformer_layer_gpu: gqa k missing")?;
-            v_attn = v_gqa.as_ref().ok_or("transformer_layer_gpu: gqa v missing")?;
-        }
-
-        let scale = 1.0f32 / (config.head_dim as f32).sqrt();
-        let attn_out = flash_kernel
-            .forward_f32(
-                stream,
-                &q_perm,
-                k_attn,
-                v_attn,
-                batch,
-                config.num_q_heads,
-                seq,
+            let (cos, sin) = precompute_rope_tables(
+                config.max_seq_len,
                 config.head_dim,
-                true,
-                scale,
-                config.position,
-            )
-            .map_err(|e| format!("transformer_layer_gpu flash attention error: {}", e))?;
-
-        let mut attn_back: cudarc::driver::CudaSlice<f32> = stream
-            .alloc_zeros(q_elements)
-            .map_err(|e| format!("transformer_layer_gpu: alloc attn_back failed: {}", e))?;
-        {
-            let attn_in = attn_out.as_view();
-            let mut attn_out_view = attn_back.as_view_mut();
-            elem_kernel
-                .permute_qkv_back_view(
-                    stream,
-                    &attn_in,
-                    &mut attn_out_view,
-                    batch,
-                    seq,
-                    config.num_q_heads,
-                    config.head_dim,
-                )
-                .map_err(|e| format!("transformer_layer_gpu permute back error: {}", e))?;
-        }
-
-        let o_weight_elems = hidden_dim
-            .checked_mul(q_out)
-            .ok_or("transformer_layer_gpu: o_weight size overflow")?;
-        let GpuBuffer::Cuda(o_weight_slice) = &layer_weights.o_weight.buffer else {
-            return Err("transformer_layer_gpu: o_weight must be CUDA buffer".into());
-        };
-        let o_weight_view = unsafe {
-            o_weight_slice
-                .transmute::<f32>(o_weight_elems)
-                .ok_or("transformer_layer_gpu: failed to transmute o_weight")?
-        };
-
-        let mut attn_proj: cudarc::driver::CudaSlice<f32> = stream
-            .alloc_zeros(hidden_elements)
-            .map_err(|e| format!("transformer_layer_gpu: alloc attn_proj failed: {}", e))?;
-        {
-            let attn_in = attn_back.as_view();
-            let mut attn_out_view = attn_proj.as_view_mut();
-            let params_o = LinearParams {
-                in_features: q_out as u32,
-                out_features: hidden_dim as u32,
-                has_bias: 0,
-                padding: 0,
-            };
-            linear_kernel.forward_view(
-                stream,
-                params_o,
-                &attn_in,
-                &o_weight_view,
-                None,
-                &mut attn_out_view,
-                total_tokens,
-            )?;
-        }
-
-        // Residual add: hidden + attn_proj
-        let mut attn_residual: cudarc::driver::CudaSlice<u8> = stream
-            .alloc_zeros(hidden_elements * std::mem::size_of::<f32>())
-            .map_err(|e| format!("transformer_layer_gpu: alloc attn_residual failed: {}", e))?;
-        {
-            let hidden_in = hidden_view;
-            let attn_in = attn_proj.as_view();
-            let mut out_view = unsafe {
-                attn_residual
-                    .transmute_mut::<f32>(hidden_elements)
-                    .ok_or("transformer_layer_gpu: failed to transmute attn_residual")?
-            };
-            elem_kernel
-                .add_view(stream, &hidden_in, &attn_in, &mut out_view, hidden_elements)
-                .map_err(|e| format!("transformer_layer_gpu residual add error: {}", e))?;
-        }
-
-        hidden.buffer = GpuBuffer::Cuda(Arc::new(attn_residual));
-        hidden.dtype = TensorDtype::F32;
-        hidden.size_in_bytes = hidden_elements * std::mem::size_of::<f32>();
-        hidden.backend = BackendType::Cuda;
-
-        // Post-attention RMSNorm
-        let GpuBuffer::Cuda(post_norm_slice) = &layer_weights.post_attn_norm.buffer else {
-            return Err("transformer_layer_gpu: post_attn_norm must be CUDA buffer".into());
-        };
-        let post_norm_view = unsafe {
-            post_norm_slice
-                .transmute::<f32>(hidden_dim)
-                .ok_or("transformer_layer_gpu: failed to transmute post_attn_norm")?
-        };
-
-        let GpuBuffer::Cuda(hidden_slice) = &hidden.buffer else {
-            return Err("transformer_layer_gpu: hidden must be CUDA buffer after residual".into());
-        };
-        let hidden_view = unsafe {
-            hidden_slice
-                .transmute::<f32>(hidden_elements)
-                .ok_or("transformer_layer_gpu: failed to transmute hidden for post norm")?
-        };
-
-        let mut post_normed: cudarc::driver::CudaSlice<f32> = stream
-            .alloc_zeros(hidden_elements)
-            .map_err(|e| format!("transformer_layer_gpu: alloc post_normed failed: {}", e))?;
-        {
-            let mut post_normed_view = post_normed.as_view_mut();
-            rms_kernel
-                .forward_view(
-                    stream,
-                    &hidden_view,
-                    &post_norm_view,
-                    &mut post_normed_view,
-                    total_tokens,
-                    hidden_dim,
-                    config.rms_norm_eps,
-                )
-                .map_err(|e| format!("transformer_layer_gpu post rms_norm error: {}", e))?;
-        }
-
-        // FFN: gate * silu(up) or up + activation
-        let inter_size = config.intermediate_size;
-        let inter_elements = total_tokens
-            .checked_mul(inter_size)
-            .ok_or("transformer_layer_gpu: inter size overflow")?;
-
-        let mut ffn_intermediate: cudarc::driver::CudaSlice<f32> = stream
-            .alloc_zeros(inter_elements)
-            .map_err(|e| format!("transformer_layer_gpu: alloc ffn intermediate failed: {}", e))?;
-
-        if let Some(gate_weight) = layer_weights.gate_weight.as_ref() {
-            let GpuBuffer::Cuda(gate_slice) = &gate_weight.buffer else {
-                return Err("transformer_layer_gpu: gate_weight must be CUDA buffer".into());
-            };
-            let gate_elems = inter_size
-                .checked_mul(hidden_dim)
-                .ok_or("transformer_layer_gpu: gate_weight size overflow")?;
-            let gate_view = unsafe {
-                gate_slice
-                    .transmute::<f32>(gate_elems)
-                    .ok_or("transformer_layer_gpu: failed to transmute gate_weight")?
-            };
-
-            let GpuBuffer::Cuda(up_slice) = &layer_weights.up_weight.buffer else {
-                return Err("transformer_layer_gpu: up_weight must be CUDA buffer".into());
-            };
-            let up_elems = inter_size
-                .checked_mul(hidden_dim)
-                .ok_or("transformer_layer_gpu: up_weight size overflow")?;
-            let up_view = unsafe {
-                up_slice
-                    .transmute::<f32>(up_elems)
-                    .ok_or("transformer_layer_gpu: failed to transmute up_weight")?
-            };
-
-            let params_ffn = LinearParams {
-                in_features: hidden_dim as u32,
-                out_features: inter_size as u32,
-                has_bias: 0,
-                padding: 0,
-            };
-            let mut out_view = ffn_intermediate.as_view_mut();
-            linear_kernel.fused_gate_up_silu_view(
-                stream,
-                params_ffn,
-                &post_normed.as_view(),
-                &gate_view,
-                &up_view,
-                &mut out_view,
-                total_tokens,
-            )?;
+                config.rope_theta,
+                config.rope_scale,
+            );
+            let cos_dev = GpuBuffer::new(stream.clone_htod(&cos)?);
+            let sin_dev = GpuBuffer::new(stream.clone_htod(&sin)?);
+            Some((cos_dev, sin_dev))
         } else {
-            let GpuBuffer::Cuda(up_slice) = &layer_weights.up_weight.buffer else {
-                return Err("transformer_layer_gpu: up_weight must be CUDA buffer".into());
-            };
-            let up_elems = inter_size
-                .checked_mul(hidden_dim)
-                .ok_or("transformer_layer_gpu: up_weight size overflow")?;
-            let up_view = unsafe {
-                up_slice
-                    .transmute::<f32>(up_elems)
-                    .ok_or("transformer_layer_gpu: failed to transmute up_weight")?
-            };
-
-            let params_up = LinearParams {
-                in_features: hidden_dim as u32,
-                out_features: inter_size as u32,
-                has_bias: 0,
-                padding: 0,
-            };
-            {
-                let mut out_view = ffn_intermediate.as_view_mut();
-                linear_kernel.forward_view(
-                    stream,
-                    params_up,
-                    &post_normed.as_view(),
-                    &up_view,
-                    None,
-                    &mut out_view,
-                    total_tokens,
-                )?;
-            }
-
-            if config.use_silu {
-                silu_kernel
-                    .forward_inplace(stream, &mut ffn_intermediate, inter_elements)
-                    .map_err(|e| format!("transformer_layer_gpu silu error: {}", e))?;
+            None
+        };
+        let (rope_cos, rope_sin) = match rope_cos {
+            Some((cos, sin)) => (Some(cos), Some(sin)),
+            None => (None, None),
+        };
+        let alibi_slopes = if config.position_encoding == PositionEncoding::Alibi {
+            let slopes = alibi_slopes(config.num_heads);
+            if slopes.is_empty() {
+                None
             } else {
-                return Err("transformer_layer_gpu: GELU activation not supported for CUDA".into());
+                Some(GpuBuffer::new(stream.clone_htod(&slopes)?))
             }
-        }
-
-        let GpuBuffer::Cuda(down_slice) = &layer_weights.down_weight.buffer else {
-            return Err("transformer_layer_gpu: down_weight must be CUDA buffer".into());
-        };
-        let down_elems = hidden_dim
-            .checked_mul(inter_size)
-            .ok_or("transformer_layer_gpu: down_weight size overflow")?;
-        let down_view = unsafe {
-            down_slice
-                .transmute::<f32>(down_elems)
-                .ok_or("transformer_layer_gpu: failed to transmute down_weight")?
-        };
-
-        let mut ffn_out: cudarc::driver::CudaSlice<f32> = stream
-            .alloc_zeros(hidden_elements)
-            .map_err(|e| format!("transformer_layer_gpu: alloc ffn_out failed: {}", e))?;
-        {
-            let mut out_view = ffn_out.as_view_mut();
-            let params_down = LinearParams {
-                in_features: inter_size as u32,
-                out_features: hidden_dim as u32,
-                has_bias: 0,
-                padding: 0,
-            };
-            linear_kernel.forward_view(
-                stream,
-                params_down,
-                &ffn_intermediate.as_view(),
-                &down_view,
-                None,
-                &mut out_view,
-                total_tokens,
-            )?;
-        }
-
-        // Residual add: hidden + ffn_out
-        let GpuBuffer::Cuda(hidden_slice) = &hidden.buffer else {
-            return Err("transformer_layer_gpu: hidden must be CUDA buffer before ffn residual".into());
-        };
-        let hidden_view = unsafe {
-            hidden_slice
-                .transmute::<f32>(hidden_elements)
-                .ok_or("transformer_layer_gpu: failed to transmute hidden for ffn residual")?
-        };
-
-        let mut ffn_residual: cudarc::driver::CudaSlice<u8> = stream
-            .alloc_zeros(hidden_elements * std::mem::size_of::<f32>())
-            .map_err(|e| format!("transformer_layer_gpu: alloc ffn_residual failed: {}", e))?;
-        {
-            let ffn_in = ffn_out.as_view();
-            let mut out_view = unsafe {
-                ffn_residual
-                    .transmute_mut::<f32>(hidden_elements)
-                    .ok_or("transformer_layer_gpu: failed to transmute ffn_residual")?
-            };
-            elem_kernel
-                .add_view(stream, &hidden_view, &ffn_in, &mut out_view, hidden_elements)
-                .map_err(|e| format!("transformer_layer_gpu ffn residual add error: {}", e))?;
-        }
-
-        hidden.buffer = GpuBuffer::Cuda(Arc::new(ffn_residual));
-        hidden.dtype = TensorDtype::F32;
-        hidden.size_in_bytes = hidden_elements * std::mem::size_of::<f32>();
-        hidden.backend = BackendType::Cuda;
-
-        Ok(())
-    }
-
-    fn rms_norm_gpu(
-        &self,
-        hidden: &mut GpuTensor,
-        weight: &GpuTensor,
-        eps: f32,
-    ) -> Result<(), String> {
-        // GPU-native RMSNorm using CUDA kernel (ARCH-GPU-001)
-        // Pattern: All computation stays on GPU, no CPU roundtrip
-
-        let stream = get_cuda_stream()
-            .ok_or("CUDA stream not available")?;
-        let kernel = get_cuda_rmsnorm_kernel()
-            .ok_or("CUDA RMSNorm kernel not available")?;
-
-        // Validate shapes
-        if hidden.shape.len() < 2 {
-            return Err("rms_norm_gpu: hidden must be at least 2D (batch × hidden_dim)".into());
-        }
-        let hidden_dim = *hidden.shape.last().unwrap();
-        let rows: usize = hidden.shape.iter().take(hidden.shape.len() - 1).product();
-        let num_elements = rows * hidden_dim;
-
-        // Extract CUDA slices and transmute to f32 views
-        let GpuBuffer::Cuda(input_slice) = &hidden.buffer else {
-            return Err("rms_norm_gpu: hidden must be CUDA buffer".into());
-        };
-        let GpuBuffer::Cuda(weight_slice) = &weight.buffer else {
-            return Err("rms_norm_gpu: weight must be CUDA buffer".into());
-        };
-
-        // Create typed views from u8 slices (zero-copy reinterpretation)
-        let input_view = unsafe {
-            input_slice.transmute::<f32>(num_elements)
-                .ok_or("rms_norm_gpu: failed to transmute input to f32 view")?
-        };
-        let weight_view = unsafe {
-            weight_slice.transmute::<f32>(hidden_dim)
-                .ok_or("rms_norm_gpu: failed to transmute weight to f32 view")?
-        };
-
-        // Allocate output buffer on GPU (same size as input)
-        let output_bytes = num_elements * std::mem::size_of::<f32>();
-        let mut output_slice: cudarc::driver::CudaSlice<u8> = stream
-            .alloc_zeros(output_bytes)
-            .map_err(|e| format!("rms_norm_gpu: failed to allocate output: {}", e))?;
-
-        // Create mutable output view
-        let mut output_view = unsafe {
-            output_slice.transmute_mut::<f32>(num_elements)
-                .ok_or("rms_norm_gpu: failed to transmute output to f32 view")?
-        };
-
-        // Execute kernel: all data stays on GPU
-        kernel.forward_view(stream, &input_view, &weight_view, &mut output_view, rows, hidden_dim, eps)
-            .map_err(|e| format!("rms_norm_gpu kernel error: {}", e))?;
-
-        // Replace hidden's buffer with the output (swap, not copy)
-        hidden.buffer = GpuBuffer::Cuda(Arc::new(output_slice));
-
-        Ok(())
-    }
-
-    fn mean_pooling_gpu(
-        &self,
-        hidden: &GpuTensor,
-        attention_mask: &GpuTensor,
-        output: &mut GpuTensor,
-    ) -> Result<(), String> {
-        let stream = get_cuda_stream()
-            .ok_or("CUDA stream not available")?;
-        let kernel = get_cuda_pooling_kernel()
-            .ok_or("CUDA pooling kernel not available")?;
-
-        if hidden.dtype != TensorDtype::F32 {
-            return Err("mean_pooling_gpu: hidden must be F32 tensor".into());
-        }
-        if attention_mask.dtype != TensorDtype::F32 {
-            return Err("mean_pooling_gpu: attention_mask must be F32 tensor".into());
-        }
-        if hidden.shape.len() < 2 {
-            return Err("mean_pooling_gpu: hidden must be at least 2D".into());
-        }
-
-        let batch = hidden.shape[0];
-        let seq = if hidden.shape.len() > 2 { hidden.shape[1] } else { 1 };
-        let hidden_dim = *hidden.shape.last().unwrap();
-        let hidden_elements: usize = hidden.shape.iter().product();
-        let expected_hidden = batch
-            .checked_mul(seq)
-            .and_then(|v| v.checked_mul(hidden_dim))
-            .ok_or("mean_pooling_gpu: hidden size overflow")?;
-        if hidden_elements != expected_hidden {
-            return Err("mean_pooling_gpu: hidden shape mismatch".into());
-        }
-
-        let mask_elements: usize = attention_mask.shape.iter().product();
-        let expected_mask = batch
-            .checked_mul(seq)
-            .ok_or("mean_pooling_gpu: mask size overflow")?;
-        if mask_elements != expected_mask {
-            return Err("mean_pooling_gpu: attention_mask shape mismatch".into());
-        }
-
-        let GpuBuffer::Cuda(hidden_slice) = &hidden.buffer else {
-            return Err("mean_pooling_gpu: hidden must be CUDA buffer".into());
-        };
-        let GpuBuffer::Cuda(mask_slice) = &attention_mask.buffer else {
-            return Err("mean_pooling_gpu: attention_mask must be CUDA buffer".into());
-        };
-
-        let hidden_view = unsafe {
-            hidden_slice
-                .transmute::<f32>(hidden_elements)
-                .ok_or("mean_pooling_gpu: failed to transmute hidden")?
-        };
-        let mask_view = unsafe {
-            mask_slice
-                .transmute::<f32>(mask_elements)
-                .ok_or("mean_pooling_gpu: failed to transmute mask")?
-        };
-
-        let output_elements = batch
-            .checked_mul(hidden_dim)
-            .ok_or("mean_pooling_gpu: output size overflow")?;
-        let output_bytes = output_elements * std::mem::size_of::<f32>();
-        let mut output_slice: cudarc::driver::CudaSlice<u8> = stream
-            .alloc_zeros(output_bytes)
-            .map_err(|e| format!("mean_pooling_gpu: alloc failed: {}", e))?;
-        let mut output_view = unsafe {
-            output_slice
-                .transmute_mut::<f32>(output_elements)
-                .ok_or("mean_pooling_gpu: failed to transmute output")?
-        };
-
-        kernel
-            .mean_pooling_view(
-                stream,
-                &hidden_view,
-                Some(&mask_view),
-                &mut output_view,
-                batch,
-                seq,
-                hidden_dim,
-            )
-            .map_err(|e| format!("mean_pooling_gpu kernel error: {}", e))?;
-
-        output.buffer = GpuBuffer::Cuda(Arc::new(output_slice));
-        output.shape = vec![batch, hidden_dim];
-        output.dtype = TensorDtype::F32;
-        output.size_in_bytes = output_bytes;
-        output.backend = BackendType::Cuda;
-
-        Ok(())
-    }
-
-    fn normalize_gpu(
-        &self,
-        embeddings: &mut GpuTensor,
-    ) -> Result<(), String> {
-        let stream = get_cuda_stream()
-            .ok_or("CUDA stream not available")?;
-        let kernel = get_cuda_pooling_kernel()
-            .ok_or("CUDA pooling kernel not available")?;
-
-        if embeddings.dtype != TensorDtype::F32 {
-            return Err("normalize_gpu: embeddings must be F32 tensor".into());
-        }
-        if embeddings.shape.is_empty() {
-            return Ok(());
-        }
-
-        let hidden_dim = *embeddings.shape.last().unwrap();
-        if hidden_dim == 0 {
-            return Ok(());
-        }
-
-        let total_elements: usize = embeddings.shape.iter().product();
-        let batch = total_elements / hidden_dim;
-
-        let GpuBuffer::Cuda(emb_slice) = &embeddings.buffer else {
-            return Err("normalize_gpu: embeddings must be CUDA buffer".into());
-        };
-
-        let mut out_slice: cudarc::driver::CudaSlice<u8> = stream
-            .clone_dtod(emb_slice.as_ref())
-            .map_err(|e| format!("normalize_gpu: dtod copy failed: {}", e))?;
-        let mut emb_view = unsafe {
-            out_slice
-                .transmute_mut::<f32>(total_elements)
-                .ok_or("normalize_gpu: failed to transmute embeddings")?
-        };
-
-        let eps = 1e-12f32;
-        kernel
-            .l2_normalize_view(stream, &mut emb_view, batch, hidden_dim, eps)
-            .map_err(|e| format!("normalize_gpu kernel error: {}", e))?;
-
-        embeddings.buffer = GpuBuffer::Cuda(Arc::new(out_slice));
-        embeddings.dtype = TensorDtype::F32;
-        embeddings.size_in_bytes = total_elements * std::mem::size_of::<f32>();
-        embeddings.backend = BackendType::Cuda;
-
-        Ok(())
-    }
-
-    fn cls_pooling_gpu(
-        &self,
-        hidden: &GpuTensor,
-        output: &mut GpuTensor,
-    ) -> Result<(), String> {
-        let stream = get_cuda_stream()
-            .ok_or("CUDA stream not available")?;
-        let kernel = get_cuda_pooling_kernel()
-            .ok_or("CUDA pooling kernel not available")?;
-
-        if hidden.dtype != TensorDtype::F32 {
-            return Err("cls_pooling_gpu: hidden must be F32 tensor".into());
-        }
-        if hidden.shape.len() < 2 {
-            return Err("cls_pooling_gpu: hidden must be at least 2D".into());
-        }
-
-        let batch = hidden.shape[0];
-        let seq = if hidden.shape.len() > 2 { hidden.shape[1] } else { 1 };
-        let hidden_dim = *hidden.shape.last().unwrap();
-        let hidden_elements: usize = hidden.shape.iter().product();
-        let expected_hidden = batch
-            .checked_mul(seq)
-            .and_then(|v| v.checked_mul(hidden_dim))
-            .ok_or("cls_pooling_gpu: hidden size overflow")?;
-        if hidden_elements != expected_hidden {
-            return Err("cls_pooling_gpu: hidden shape mismatch".into());
-        }
-
-        let GpuBuffer::Cuda(hidden_slice) = &hidden.buffer else {
-            return Err("cls_pooling_gpu: hidden must be CUDA buffer".into());
-        };
-        let hidden_view = unsafe {
-            hidden_slice
-                .transmute::<f32>(hidden_elements)
-                .ok_or("cls_pooling_gpu: failed to transmute hidden")?
-        };
-
-        let output_elements = batch
-            .checked_mul(hidden_dim)
-            .ok_or("cls_pooling_gpu: output size overflow")?;
-        let output_bytes = output_elements * std::mem::size_of::<f32>();
-        let mut output_slice: cudarc::driver::CudaSlice<u8> = stream
-            .alloc_zeros(output_bytes)
-            .map_err(|e| format!("cls_pooling_gpu: alloc failed: {}", e))?;
-        let mut output_view = unsafe {
-            output_slice
-                .transmute_mut::<f32>(output_elements)
-                .ok_or("cls_pooling_gpu: failed to transmute output")?
-        };
-
-        kernel
-            .cls_extract_view(
-                stream,
-                &hidden_view,
-                &mut output_view,
-                batch,
-                seq,
-                hidden_dim,
-                0,
-            )
-            .map_err(|e| format!("cls_pooling_gpu kernel error: {}", e))?;
-
-        output.buffer = GpuBuffer::Cuda(Arc::new(output_slice));
-        output.shape = vec![batch, hidden_dim];
-        output.dtype = TensorDtype::F32;
-        output.size_in_bytes = output_bytes;
-        output.backend = BackendType::Cuda;
-
-        Ok(())
-    }
-
-    fn classifier_gpu(
-        &self,
-        hidden: &GpuTensor,
-        weight: &GpuTensor,
-        bias: Option<&GpuTensor>,
-        output: &mut GpuTensor,
-    ) -> Result<(), String> {
-        let stream = get_cuda_stream()
-            .ok_or("CUDA stream not available")?;
-        let kernel = get_cuda_linear_kernel()
-            .ok_or("CUDA linear kernel not available")?;
-
-        // hidden shape: [batch, hidden_dim] or [batch, seq_len, hidden_dim]
-        // weight shape: [out_dim, hidden_dim]
-        // output shape: [batch, out_dim] or [batch, seq_len, out_dim]
-        if hidden.shape.is_empty() || weight.shape.len() != 2 {
-            return Err("classifier_gpu: invalid tensor shapes".into());
-        }
-
-        let hidden_dim = *hidden.shape.last().unwrap();
-        let out_dim = weight.shape[0];
-        let weight_hidden_dim = weight.shape[1];
-
-        if hidden_dim != weight_hidden_dim {
-            return Err(format!(
-                "classifier_gpu: hidden_dim mismatch: hidden={}, weight={}",
-                hidden_dim, weight_hidden_dim
-            ));
-        }
-
-        // Compute batch_size (product of all dimensions except last)
-        let batch_size: usize = hidden.shape.iter().take(hidden.shape.len() - 1).product();
-        let hidden_elements = batch_size * hidden_dim;
-        let weight_elements = out_dim * hidden_dim;
-        let output_elements = batch_size * out_dim;
-
-        // Extract CUDA buffers
-        let GpuBuffer::Cuda(hidden_slice) = &hidden.buffer else {
-            return Err("classifier_gpu: hidden must be CUDA buffer".into());
-        };
-        let GpuBuffer::Cuda(weight_slice) = &weight.buffer else {
-            return Err("classifier_gpu: weight must be CUDA buffer".into());
-        };
-
-        // Transmute to f32 views
-        let hidden_view = unsafe {
-            hidden_slice.transmute::<f32>(hidden_elements)
-                .ok_or("classifier_gpu: failed to transmute hidden to f32 view")?
-        };
-        let weight_view = unsafe {
-            weight_slice.transmute::<f32>(weight_elements)
-                .ok_or("classifier_gpu: failed to transmute weight to f32 view")?
-        };
-
-        // Handle optional bias
-        let bias_view = if let Some(bias_tensor) = bias {
-            let GpuBuffer::Cuda(bias_slice) = &bias_tensor.buffer else {
-                return Err("classifier_gpu: bias must be CUDA buffer".into());
-            };
-            let bias_elements = bias_tensor.shape.iter().product::<usize>();
-            Some(unsafe {
-                bias_slice.transmute::<f32>(bias_elements)
-                    .ok_or("classifier_gpu: failed to transmute bias to f32 view")?
-            })
         } else {
             None
         };
 
-        // Allocate output buffer on GPU
-        let output_bytes = output_elements * std::mem::size_of::<f32>();
-        let mut output_slice: cudarc::driver::CudaSlice<u8> = stream
-            .alloc_zeros(output_bytes)
-            .map_err(|e| format!("classifier_gpu: failed to allocate output: {}", e))?;
+        Ok(Self {
+            config,
+            token_ids,
+            linear_positions,
+            positions,
+            hidden,
+            norm,
+            qkv,
+            attn_out,
+            ffn_gate,
+            ffn_up,
+            ffn_act,
+            ffn_out,
+            last_hidden,
+            rope_cos,
+            rope_sin,
+            alibi_slopes,
+        })
+    }
+}
 
-        let mut output_view = unsafe {
-            output_slice.transmute_mut::<f32>(output_elements)
-                .ok_or("classifier_gpu: failed to transmute output to f32 view")?
+struct KvCacheEntry {
+    storage: KvCacheStorage,
+    config: KvCacheConfig,
+    used: usize,
+}
+
+enum KvCacheStorage {
+    Contiguous(CudaSlice<f32>),
+    Paged {
+        pages: Vec<CudaSlice<f32>>,
+        page_ptrs: CudaSlice<u64>,
+        page_size: usize,
+        pages_per_layer: usize,
+    },
+}
+
+impl KvCacheEntry {
+    fn is_paged(&self) -> bool {
+        matches!(self.storage, KvCacheStorage::Paged { .. })
+    }
+
+    fn page_size(&self) -> usize {
+        match self.storage {
+            KvCacheStorage::Paged { page_size, .. } => page_size,
+            KvCacheStorage::Contiguous(_) => self.config.max_seq_len,
+        }
+    }
+
+    fn pages_per_layer(&self) -> usize {
+        match self.storage {
+            KvCacheStorage::Paged {
+                pages_per_layer, ..
+            } => pages_per_layer,
+            KvCacheStorage::Contiguous(_) => 1,
+        }
+    }
+}
+
+enum QkvLayerPlan {
+    Direct {
+        weight: String,
+        bias: Option<String>,
+    },
+    Fused {
+        weight: GpuBuffer<f32>,
+        bias: Option<GpuBuffer<f32>>,
+    },
+}
+
+struct QkvPlan {
+    layers: Vec<QkvLayerPlan>,
+}
+
+const EMBEDDING_WEIGHT_NAMES: &[&str] = &[
+    "model.embed_tokens.weight",
+    "tok_embeddings.weight",
+    "transformer.wte.weight",
+    "model.tok_embeddings.weight",
+    "embeddings.word_embeddings.weight",
+    "model.embeddings.word_embeddings.weight",
+];
+
+const FINAL_NORM_NAMES: &[&str] = &[
+    "model.norm.weight",
+    "transformer.ln_f.weight",
+    "norm.weight",
+    "model.final_layernorm.weight",
+    "encoder.layer_norm.weight",
+];
+
+const LM_HEAD_NAMES: &[&str] = &[
+    "lm_head.weight",
+    "model.lm_head.weight",
+    "embed_out.weight",
+    "model.embed_out.weight",
+    "transformer.lm_head.weight",
+];
+
+const SCORE_HEAD_NAMES: &[&str] = &[
+    "score.weight",
+    "model.score.weight",
+    "classifier.weight",
+    "model.classifier.weight",
+    "rerank_head.weight",
+    "ranker.weight",
+];
+
+const ATTN_NORM_PATTERNS: &[&str] = &[
+    "model.layers.{layer}.input_layernorm.weight",
+    "model.layers.{layer}.attention_norm.weight",
+    "model.layers.{layer}.attn_norm.weight",
+    "transformer.h.{layer}.ln_1.weight",
+    "model.layers.{layer}.ln1.weight",
+    "layers.{layer}.input_layernorm.weight",
+];
+
+const FFN_NORM_PATTERNS: &[&str] = &[
+    "model.layers.{layer}.post_attention_layernorm.weight",
+    "model.layers.{layer}.ffn_norm.weight",
+    "model.layers.{layer}.mlp_norm.weight",
+    "transformer.h.{layer}.ln_2.weight",
+    "model.layers.{layer}.ln2.weight",
+    "layers.{layer}.post_attention_layernorm.weight",
+];
+
+const Q_PROJ_PATTERNS: &[&str] = &[
+    "model.layers.{layer}.self_attn.q_proj.weight",
+    "model.layers.{layer}.attention.q_proj.weight",
+    "transformer.h.{layer}.attn.q_proj.weight",
+    "layers.{layer}.self_attn.q_proj.weight",
+];
+
+const K_PROJ_PATTERNS: &[&str] = &[
+    "model.layers.{layer}.self_attn.k_proj.weight",
+    "model.layers.{layer}.attention.k_proj.weight",
+    "transformer.h.{layer}.attn.k_proj.weight",
+    "layers.{layer}.self_attn.k_proj.weight",
+];
+
+const V_PROJ_PATTERNS: &[&str] = &[
+    "model.layers.{layer}.self_attn.v_proj.weight",
+    "model.layers.{layer}.attention.v_proj.weight",
+    "transformer.h.{layer}.attn.v_proj.weight",
+    "layers.{layer}.self_attn.v_proj.weight",
+];
+
+const O_PROJ_PATTERNS: &[&str] = &[
+    "model.layers.{layer}.self_attn.o_proj.weight",
+    "model.layers.{layer}.self_attn.out_proj.weight",
+    "model.layers.{layer}.attention.o_proj.weight",
+    "transformer.h.{layer}.attn.c_proj.weight",
+    "transformer.h.{layer}.attn.out_proj.weight",
+];
+
+const GATE_PROJ_PATTERNS: &[&str] = &[
+    "model.layers.{layer}.mlp.gate_proj.weight",
+    "model.layers.{layer}.mlp.w1.weight",
+    "model.layers.{layer}.mlp.gate.weight",
+    "transformer.h.{layer}.mlp.gate_proj.weight",
+];
+
+const UP_PROJ_PATTERNS: &[&str] = &[
+    "model.layers.{layer}.mlp.up_proj.weight",
+    "model.layers.{layer}.mlp.w3.weight",
+    "model.layers.{layer}.mlp.up.weight",
+    "transformer.h.{layer}.mlp.up_proj.weight",
+];
+
+const DOWN_PROJ_PATTERNS: &[&str] = &[
+    "model.layers.{layer}.mlp.down_proj.weight",
+    "model.layers.{layer}.mlp.w2.weight",
+    "model.layers.{layer}.mlp.down.weight",
+    "transformer.h.{layer}.mlp.c_proj.weight",
+];
+
+const QKV_FUSED_PATTERNS: &[&str] = &[
+    "model.layers.{layer}.self_attn.qkv_proj.weight",
+    "model.layers.{layer}.self_attn.W_pack.weight",
+    "model.layers.{layer}.self_attn.qkv.weight",
+    "model.layers.{layer}.self_attn.in_proj_weight",
+    "transformer.h.{layer}.attn.c_attn.weight",
+];
+
+fn layer_candidates(patterns: &[&str], layer: usize) -> Vec<String> {
+    let layer = layer.to_string();
+    patterns
+        .iter()
+        .map(|pattern| pattern.replace("{layer}", &layer))
+        .collect()
+}
+
+fn embedding_candidates() -> Vec<String> {
+    EMBEDDING_WEIGHT_NAMES
+        .iter()
+        .map(|name| (*name).to_string())
+        .collect()
+}
+
+fn final_norm_candidates() -> Vec<String> {
+    FINAL_NORM_NAMES
+        .iter()
+        .map(|name| (*name).to_string())
+        .collect()
+}
+
+fn lm_head_candidates() -> Vec<String> {
+    LM_HEAD_NAMES
+        .iter()
+        .map(|name| (*name).to_string())
+        .collect()
+}
+
+fn score_head_candidates() -> Vec<String> {
+    SCORE_HEAD_NAMES
+        .iter()
+        .map(|name| (*name).to_string())
+        .collect()
+}
+
+fn find_tensor_name(
+    weights: &dyn TensorLookup<CudaBackend>,
+    candidates: &[String],
+) -> Option<String> {
+    for name in candidates {
+        if weights.tensor_f32(name).is_some() {
+            return Some(name.clone());
+        }
+    }
+    None
+}
+
+fn bias_candidates(weight_name: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    if weight_name.ends_with("in_proj_weight") {
+        out.push(weight_name.replace("in_proj_weight", "in_proj_bias"));
+    }
+    if weight_name.ends_with(".weight") {
+        out.push(weight_name.replace(".weight", ".bias"));
+    } else if weight_name.ends_with("weight") {
+        out.push(weight_name.replacen("weight", "bias", 1));
+    }
+    out
+}
+
+pub struct CudaBackend {
+    ctx: Arc<CudaContext>,
+    stream: Arc<CudaStream>,
+    _module: CudaModuleHandle,
+    sm: SmVersion,
+    kernels: CudaKernels,
+    kv_caches: Mutex<Vec<KvCacheEntry>>,
+    workspace: Mutex<Option<LayerWorkspace>>,
+    qkv_plan: Mutex<Option<QkvPlan>>,
+    logits: Mutex<Vec<CudaSlice<f32>>>,
+    sampling: Mutex<Option<CudaSlice<u32>>>,
+    perf: Mutex<PerfState>,
+}
+
+struct CudaModuleHandle {
+    module: sys::CUmodule,
+    ctx: Arc<CudaContext>,
+}
+
+unsafe impl Send for CudaModuleHandle {}
+unsafe impl Sync for CudaModuleHandle {}
+
+impl Drop for CudaModuleHandle {
+    fn drop(&mut self) {
+        let _ = self.ctx.bind_to_thread();
+        unsafe {
+            let _ = result::module::unload(self.module);
+        }
+    }
+}
+
+impl fmt::Debug for CudaBackend {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("CudaBackend")
+            .field("sm", &self.sm)
+            .finish()
+    }
+}
+
+impl CudaBackend {
+    pub fn new(device_ordinal: usize) -> BackendResult<Self> {
+        let device_count = CudaContext::device_count()?;
+        if device_count <= 0 {
+            return Err(BackendError::InvalidConfig(
+                "no CUDA devices detected".into(),
+            ));
+        }
+        if device_ordinal >= device_count as usize {
+            return Err(BackendError::InvalidConfig(format!(
+                "cuda device ordinal {device_ordinal} out of range (device_count={device_count})",
+            )));
+        }
+
+        let ctx = CudaContext::new(device_ordinal)?;
+        let (major, minor) = ctx.compute_capability()?;
+        let sm = SmVersion::from_compute_capability(major, minor)
+            .ok_or(BackendError::UnsupportedSm { major, minor })?;
+        let cubin = cubin_for(sm);
+        if cubin.is_empty() {
+            return Err(BackendError::InvalidCubin(sm.as_str()));
+        }
+        ctx.bind_to_thread()?;
+        let module = unsafe { result::module::load_data(cubin.as_ptr() as *const _) }?;
+        let kernels = CudaKernels::load(module)?;
+        let stream = ctx.default_stream();
+        let module_handle = CudaModuleHandle {
+            module,
+            ctx: ctx.clone(),
         };
-
-        // Setup linear params
-        let params = LinearParams {
-            in_features: hidden_dim as u32,
-            out_features: out_dim as u32,
-            has_bias: if bias.is_some() { 1 } else { 0 },
-            padding: 0,
-        };
-
-        // Call linear kernel
-        kernel.forward_view(
+        Ok(Self {
+            ctx,
             stream,
+            _module: module_handle,
+            sm,
+            kernels,
+            kv_caches: Mutex::new(Vec::new()),
+            workspace: Mutex::new(None),
+            qkv_plan: Mutex::new(None),
+            logits: Mutex::new(Vec::new()),
+            sampling: Mutex::new(None),
+            perf: Mutex::new(PerfState::new()),
+        })
+    }
+
+    pub fn device_count() -> BackendResult<i32> {
+        Ok(CudaContext::device_count()?)
+    }
+
+    pub fn sm_version(&self) -> SmVersion {
+        self.sm
+    }
+
+    pub fn context(&self) -> &Arc<CudaContext> {
+        &self.ctx
+    }
+
+    pub fn stream(&self) -> &Arc<CudaStream> {
+        &self.stream
+    }
+
+    pub fn kernels(&self) -> &CudaKernels {
+        &self.kernels
+    }
+
+    pub fn perf_metrics(&self) -> PerfMetrics {
+        let perf = self.perf.lock().expect("perf lock poisoned");
+        perf.snapshot()
+    }
+
+    pub fn reset_perf_metrics(&self) {
+        let mut perf = self.perf.lock().expect("perf lock poisoned");
+        perf.reset();
+    }
+
+    fn record_htod(&self, bytes: usize) {
+        let mut perf = self.perf.lock().expect("perf lock poisoned");
+        perf.host_to_device_bytes = perf.host_to_device_bytes.saturating_add(bytes as u64);
+    }
+
+    fn record_dtoh(&self, bytes: usize) {
+        let mut perf = self.perf.lock().expect("perf lock poisoned");
+        perf.device_to_host_bytes = perf.device_to_host_bytes.saturating_add(bytes as u64);
+    }
+
+    fn record_tokens(&self, tokens: usize) {
+        let mut perf = self.perf.lock().expect("perf lock poisoned");
+        perf.tokens_processed = perf.tokens_processed.saturating_add(tokens as u64);
+    }
+
+    fn record_forward_time(&self, dur: Duration) {
+        let mut perf = self.perf.lock().expect("perf lock poisoned");
+        perf.last_forward = dur;
+    }
+
+    fn record_sample_time(&self, dur: Duration) {
+        let mut perf = self.perf.lock().expect("perf lock poisoned");
+        perf.last_sample = dur;
+    }
+
+    pub fn flash_attn<T: DeviceRepr>(
+        &self,
+        launch: LaunchConfig,
+        params: &FlashAttnConfig,
+        q: &GpuBuffer<T>,
+        k: &GpuBuffer<T>,
+        v: &GpuBuffer<T>,
+        output: &mut GpuBuffer<T>,
+    ) -> BackendResult<()> {
+        self.kernels.flash_attn.launch(
+            self.stream.as_ref(),
+            launch,
+            q.as_inner(),
+            k.as_inner(),
+            v.as_inner(),
+            output.as_inner_mut(),
+            None,
             params,
-            &hidden_view,
-            &weight_view,
-            bias_view.as_ref(),
-            &mut output_view,
-            batch_size,
-        ).map_err(|e| format!("classifier_gpu kernel error: {}", e))?;
+        )
+    }
 
-        // Update output tensor buffer
-        output.buffer = GpuBuffer::Cuda(Arc::new(output_slice));
-        output.shape = if hidden.shape.len() > 1 {
-            let mut shape = hidden.shape[..hidden.shape.len()-1].to_vec();
-            shape.push(out_dim);
-            shape
-        } else {
-            vec![out_dim]
+    pub fn rope<T: DeviceRepr>(
+        &self,
+        launch: LaunchConfig,
+        params: &RopeConfig,
+        q: &mut GpuBuffer<T>,
+        k: &mut GpuBuffer<T>,
+        positions: Option<&GpuBuffer<i32>>,
+        cos_table: Option<&GpuBuffer<f32>>,
+        sin_table: Option<&GpuBuffer<f32>>,
+    ) -> BackendResult<()> {
+        let positions = positions.map(GpuBuffer::as_inner);
+        let cos_table = cos_table.map(GpuBuffer::as_inner);
+        let sin_table = sin_table.map(GpuBuffer::as_inner);
+        self.kernels.rope.launch(
+            self.stream.as_ref(),
+            launch,
+            q.as_inner_mut(),
+            k.as_inner_mut(),
+            positions,
+            cos_table,
+            sin_table,
+            params,
+        )
+    }
+
+    pub fn fused_qkv_rope<T: DeviceRepr>(
+        &self,
+        launch: LaunchConfig,
+        params: &FusedQkvRopeConfig,
+        input: &GpuBuffer<T>,
+        qkv_weight: &GpuBuffer<T>,
+        qkv_bias: Option<&GpuBuffer<T>>,
+        qkv_out: &mut GpuBuffer<T>,
+        positions: Option<&GpuBuffer<i32>>,
+        cos_table: Option<&GpuBuffer<f32>>,
+        sin_table: Option<&GpuBuffer<f32>>,
+    ) -> BackendResult<()> {
+        let qkv_bias = qkv_bias.map(GpuBuffer::as_inner);
+        let positions = positions.map(GpuBuffer::as_inner);
+        let cos_table = cos_table.map(GpuBuffer::as_inner);
+        let sin_table = sin_table.map(GpuBuffer::as_inner);
+        self.kernels.fused_qkv_rope.launch(
+            self.stream.as_ref(),
+            launch,
+            input.as_inner(),
+            qkv_weight.as_inner(),
+            qkv_bias,
+            qkv_out.as_inner_mut(),
+            positions,
+            cos_table,
+            sin_table,
+            params,
+        )
+    }
+
+    pub fn rms_norm<T: DeviceRepr>(
+        &self,
+        launch: LaunchConfig,
+        params: &RmsNormConfig,
+        input: &GpuBuffer<T>,
+        weight: &GpuBuffer<T>,
+        output: &mut GpuBuffer<T>,
+    ) -> BackendResult<()> {
+        self.kernels.rms_norm.launch(
+            self.stream.as_ref(),
+            launch,
+            input.as_inner(),
+            weight.as_inner(),
+            output.as_inner_mut(),
+            params,
+        )
+    }
+
+    pub fn silu<T: DeviceRepr>(
+        &self,
+        launch: LaunchConfig,
+        params: &SiluConfig,
+        input: &GpuBuffer<T>,
+        output: &mut GpuBuffer<T>,
+    ) -> BackendResult<()> {
+        self.kernels.silu.launch(
+            self.stream.as_ref(),
+            launch,
+            input.as_inner(),
+            output.as_inner_mut(),
+            params,
+        )
+    }
+
+    pub fn swiglu<T: DeviceRepr>(
+        &self,
+        launch: LaunchConfig,
+        params: &SwiGluConfig,
+        gate: &GpuBuffer<T>,
+        up: &GpuBuffer<T>,
+        output: &mut GpuBuffer<T>,
+    ) -> BackendResult<()> {
+        self.kernels.swiglu.launch(
+            self.stream.as_ref(),
+            launch,
+            gate.as_inner(),
+            up.as_inner(),
+            output.as_inner_mut(),
+            params,
+        )
+    }
+
+    pub fn fused_gate_up_silu<T: DeviceRepr>(
+        &self,
+        launch: LaunchConfig,
+        params: &SwiGluConfig,
+        gate: &GpuBuffer<T>,
+        up: &GpuBuffer<T>,
+        output: &mut GpuBuffer<T>,
+    ) -> BackendResult<()> {
+        self.swiglu(launch, params, gate, up, output)
+    }
+
+    pub fn quantized_mm<W: DeviceRepr>(
+        &self,
+        bits: QuantizedBits,
+        launch: LaunchConfig,
+        params: &QuantizedConfig,
+        input: &GpuBuffer<f32>,
+        weight: &GpuBuffer<W>,
+        output: &mut GpuBuffer<f32>,
+    ) -> BackendResult<()> {
+        let kernel = match bits {
+            QuantizedBits::Int1 => self
+                .kernels
+                .quantized_mm
+                .int1
+                .ok_or(BackendError::Unimplemented("quantized_mm<1> kernel"))?,
+            QuantizedBits::Int2 => self
+                .kernels
+                .quantized_mm
+                .int2
+                .ok_or(BackendError::Unimplemented("quantized_mm<2> kernel"))?,
+            QuantizedBits::Int4 => self
+                .kernels
+                .quantized_mm
+                .int4
+                .ok_or(BackendError::Unimplemented("quantized_mm<4> kernel"))?,
+            QuantizedBits::Int8 => self
+                .kernels
+                .quantized_mm
+                .int8
+                .ok_or(BackendError::Unimplemented("quantized_mm<8> kernel"))?,
         };
-        output.dtype = TensorDtype::F32;
+        kernel.launch(
+            self.stream.as_ref(),
+            launch,
+            input.as_inner(),
+            weight.as_inner(),
+            output.as_inner_mut(),
+            params,
+        )
+    }
 
+    pub fn int8_mm(
+        &self,
+        launch: LaunchConfig,
+        params: &QuantizedConfig,
+        input: &GpuBuffer<f32>,
+        weight: &GpuBuffer<i8>,
+        output: &mut GpuBuffer<f32>,
+    ) -> BackendResult<()> {
+        self.quantized_mm(
+            QuantizedBits::Int8,
+            launch,
+            params,
+            input,
+            weight,
+            output,
+        )
+    }
+
+    pub fn int4_mm(
+        &self,
+        launch: LaunchConfig,
+        params: &QuantizedConfig,
+        input: &GpuBuffer<f32>,
+        weight: &GpuBuffer<u8>,
+        output: &mut GpuBuffer<f32>,
+    ) -> BackendResult<()> {
+        self.quantized_mm(
+            QuantizedBits::Int4,
+            launch,
+            params,
+            input,
+            weight,
+            output,
+        )
+    }
+
+    pub fn int2_mm(
+        &self,
+        launch: LaunchConfig,
+        params: &QuantizedConfig,
+        input: &GpuBuffer<f32>,
+        weight: &GpuBuffer<u8>,
+        output: &mut GpuBuffer<f32>,
+    ) -> BackendResult<()> {
+        self.quantized_mm(
+            QuantizedBits::Int2,
+            launch,
+            params,
+            input,
+            weight,
+            output,
+        )
+    }
+
+    pub fn int1_mm(
+        &self,
+        launch: LaunchConfig,
+        params: &QuantizedConfig,
+        input: &GpuBuffer<f32>,
+        weight: &GpuBuffer<u8>,
+        output: &mut GpuBuffer<f32>,
+    ) -> BackendResult<()> {
+        self.quantized_mm(
+            QuantizedBits::Int1,
+            launch,
+            params,
+            input,
+            weight,
+            output,
+        )
+    }
+
+    fn hidden_size(config: &GeneratorForwardConfig) -> BackendResult<usize> {
+        let hidden = config
+            .num_heads
+            .checked_mul(config.head_dim)
+            .ok_or_else(|| BackendError::InvalidConfig("hidden size overflow".into()))?;
+        Ok(hidden)
+    }
+
+    fn resolve_weight_name(
+        weights: &dyn TensorLookup<Self>,
+        candidates: &[String],
+    ) -> BackendResult<String> {
+        for name in candidates {
+            if weights.tensor_f32(name).is_some() {
+                return Ok(name.clone());
+            }
+        }
+        Err(BackendError::MissingTensor(candidates.join(", ")))
+    }
+
+    fn resolve_weight<'a>(
+        weights: &'a dyn TensorLookup<Self>,
+        name: &str,
+    ) -> BackendResult<&'a GpuBuffer<f32>> {
+        weights
+            .tensor_f32(name)
+            .ok_or_else(|| BackendError::MissingTensor(name.to_string()))
+    }
+
+    fn resolve_bias<'a>(
+        weights: &'a dyn TensorLookup<Self>,
+        weight_name: &str,
+    ) -> Option<&'a GpuBuffer<f32>> {
+        for candidate in bias_candidates(weight_name) {
+            if let Some(bias) = weights.tensor_f32(&candidate) {
+                return Some(bias);
+            }
+        }
+        None
+    }
+
+    fn resolve_weight_and_bias<'a>(
+        weights: &'a dyn TensorLookup<Self>,
+        candidates: &[String],
+    ) -> BackendResult<(&'a GpuBuffer<f32>, Option<&'a GpuBuffer<f32>>)> {
+        let name = Self::resolve_weight_name(weights, candidates)?;
+        let weight = Self::resolve_weight(weights, &name)?;
+        let bias = Self::resolve_bias(weights, &name);
+        Ok((weight, bias))
+    }
+
+    fn resolve_shape(
+        weights: &dyn TensorLookup<Self>,
+        candidates: &[String],
+    ) -> BackendResult<Vec<usize>> {
+        let name = Self::resolve_weight_name(weights, candidates)?;
+        let shape = weights
+            .tensor_shape(&name)
+            .ok_or_else(|| BackendError::MissingTensor(name.clone()))?;
+        Ok(shape.to_vec())
+    }
+
+    fn deduce_out_dim(shape: &[usize], in_dim: usize) -> BackendResult<usize> {
+        if shape.len() != 2 {
+            return Err(BackendError::InvalidConfig(format!(
+                "expected 2D weight shape, got {shape:?}"
+            )));
+        }
+        if shape[1] == in_dim {
+            Ok(shape[0])
+        } else if shape[0] == in_dim {
+            Ok(shape[1])
+        } else {
+            Err(BackendError::InvalidConfig(format!(
+                "weight shape {shape:?} not compatible with input dim {in_dim}"
+            )))
+        }
+    }
+
+    fn ensure_workspace(
+        &self,
+        weights: &dyn TensorLookup<Self>,
+        config: &GeneratorForwardConfig,
+    ) -> BackendResult<()> {
+        let mut workspace = self.workspace.lock().expect("workspace lock poisoned");
+        if let Some(existing) = workspace.as_ref() {
+            if existing.config.max_seq_len != config.max_seq_len
+                || existing.config.hidden_size != Self::hidden_size(config)?
+                || existing.config.num_heads != config.num_heads
+                || existing.config.num_kv_heads != config.num_kv_heads
+                || existing.config.head_dim != config.head_dim
+                || existing.config.vocab_size != config.vocab_size
+                || existing.config.position_encoding != config.position_encoding
+                || existing.config.rope_theta != config.rope_theta
+                || existing.config.rope_scale != config.rope_scale
+                || existing.config.rope_interleaved != config.rope_interleaved
+                || existing.config.rope_precompute != config.rope_precompute
+            {
+                return Err(BackendError::InvalidConfig(
+                    "workspace config mismatch".into(),
+                ));
+            }
+            return Ok(());
+        }
+
+        let hidden_size = Self::hidden_size(config)?;
+        let ffn_shape = Self::resolve_shape(weights, &layer_candidates(GATE_PROJ_PATTERNS, 0))?;
+        let ffn_dim = Self::deduce_out_dim(&ffn_shape, hidden_size)?;
+        let ws_config = WorkspaceConfig {
+            max_seq_len: config.max_seq_len,
+            hidden_size,
+            num_heads: config.num_heads,
+            num_kv_heads: config.num_kv_heads,
+            head_dim: config.head_dim,
+            ffn_dim,
+            vocab_size: config.vocab_size,
+            position_encoding: config.position_encoding,
+            rope_theta: config.rope_theta,
+            rope_scale: config.rope_scale,
+            rope_interleaved: config.rope_interleaved,
+            rope_precompute: config.rope_precompute,
+        };
+
+        *workspace = Some(LayerWorkspace::allocate(&self.stream, ws_config)?);
         Ok(())
     }
 
-    fn lm_head_gpu(
+    fn ensure_qkv_plan(
         &self,
-        hidden: &GpuTensor,
-        weight: &GpuTensor,
-        output: &mut GpuTensor,
-    ) -> Result<(), String> {
-        self.classifier_gpu(hidden, weight, None, output)
-    }
-
-    // =========================================================================
-    // GPU-Native High-Level Forward Methods (ARCH-ADR-010)
-    // =========================================================================
-
-    fn upload_reranker_weights(
-        &self,
-        embed_weight: &[f32],
-        layers: &[TransformerLayerWeights<'_>],
-        final_norm: &[f32],
-        classifier_weight: &[f32],
-        classifier_bias: Option<&[f32]>,
-        config: &RerankForwardConfig,
-    ) -> Result<RerankerModelWeightsGpu, String> {
-        let stream = get_cuda_stream().ok_or("CUDA stream not available")?;
-
-        // Helper to upload f32 slice to GPU
-        fn upload_f32(stream: &Arc<CudaStream>, data: &[f32], shape: Vec<usize>) -> Result<GpuTensor, String> {
-            let bytes: &[u8] = bytemuck::cast_slice(data);
-            let buf = stream.clone_htod(bytes).map_err(|e| e.to_string())?;
-            Ok(GpuTensor {
-                buffer: GpuBuffer::Cuda(Arc::new(buf)),
-                shape,
-                dtype: TensorDtype::F32,
-                size_in_bytes: bytes.len(),
-                backend: BackendType::Cuda,
-            })
+        weights: &dyn TensorLookup<Self>,
+        config: &GeneratorForwardConfig,
+        hidden_size: usize,
+    ) -> BackendResult<()> {
+        let mut plan_guard = self.qkv_plan.lock().expect("qkv plan lock poisoned");
+        if plan_guard.is_some() {
+            return Ok(());
         }
 
-        let hidden_dim = config.hidden_size;
-        let vocab_size = embed_weight.len() / hidden_dim;
+        let mut layers = Vec::with_capacity(config.num_layers);
+        for layer in 0..config.num_layers {
+            let fused_candidates = layer_candidates(QKV_FUSED_PATTERNS, layer);
+            if let Some(fused_name) = find_tensor_name(weights, &fused_candidates) {
+                let bias = bias_candidates(&fused_name)
+                    .into_iter()
+                    .find(|name| weights.tensor_f32(name).is_some());
+                layers.push(QkvLayerPlan::Direct {
+                    weight: fused_name,
+                    bias,
+                });
+                continue;
+            }
 
-        let embedding = upload_f32(&stream, embed_weight, vec![vocab_size, hidden_dim])?;
-        let final_norm_gpu = upload_f32(&stream, final_norm, vec![hidden_dim])?;
+            let q_name =
+                Self::resolve_weight_name(weights, &layer_candidates(Q_PROJ_PATTERNS, layer))?;
+            let k_name =
+                Self::resolve_weight_name(weights, &layer_candidates(K_PROJ_PATTERNS, layer))?;
+            let v_name =
+                Self::resolve_weight_name(weights, &layer_candidates(V_PROJ_PATTERNS, layer))?;
 
-        let num_classes = classifier_weight.len() / hidden_dim;
-        let classifier_weight_gpu = upload_f32(&stream, classifier_weight, vec![num_classes, hidden_dim])?;
-        let classifier_bias_gpu = classifier_bias
-            .map(|b| upload_f32(&stream, b, vec![num_classes]))
-            .transpose()?;
+            let q_weight = Self::resolve_weight(weights, &q_name)?;
+            let k_weight = Self::resolve_weight(weights, &k_name)?;
+            let v_weight = Self::resolve_weight(weights, &v_name)?;
 
-        // Convert layers
-        let gpu_layers: Result<Vec<TransformerLayerWeightsGpu>, String> = layers.iter().map(|layer| {
-            Ok(TransformerLayerWeightsGpu {
-                input_norm: upload_f32(&stream, layer.input_norm, vec![hidden_dim])?,
-                q_weight: upload_f32(&stream, layer.q_weight, vec![layer.q_weight.len()])?,
-                k_weight: upload_f32(&stream, layer.k_weight, vec![layer.k_weight.len()])?,
-                v_weight: upload_f32(&stream, layer.v_weight, vec![layer.v_weight.len()])?,
-                o_weight: upload_f32(&stream, layer.o_weight, vec![layer.o_weight.len()])?,
-                post_attn_norm: upload_f32(&stream, layer.post_attn_norm, vec![hidden_dim])?,
-                gate_weight: layer.gate_weight.map(|g| upload_f32(&stream, g, vec![g.len()])).transpose()?,
-                up_weight: upload_f32(&stream, layer.up_weight, vec![layer.up_weight.len()])?,
-                down_weight: upload_f32(&stream, layer.down_weight, vec![layer.down_weight.len()])?,
-                cos_cache: None,
-                sin_cache: None,
-            })
-        }).collect();
+            let q_shape = weights
+                .tensor_shape(&q_name)
+                .ok_or_else(|| BackendError::MissingTensor(q_name.clone()))?;
+            let k_shape = weights
+                .tensor_shape(&k_name)
+                .ok_or_else(|| BackendError::MissingTensor(k_name.clone()))?;
+            let v_shape = weights
+                .tensor_shape(&v_name)
+                .ok_or_else(|| BackendError::MissingTensor(v_name.clone()))?;
 
-        Ok(RerankerModelWeightsGpu {
-            embedding,
-            layers: gpu_layers?,
-            final_norm: final_norm_gpu,
-            classifier_weight: classifier_weight_gpu,
-            classifier_bias: classifier_bias_gpu,
-        })
+            let q_out = Self::deduce_out_dim(q_shape, hidden_size)?;
+            let k_out = Self::deduce_out_dim(k_shape, hidden_size)?;
+            let v_out = Self::deduce_out_dim(v_shape, hidden_size)?;
+
+            let expected_kv = config.num_kv_heads * config.head_dim;
+            if q_out != hidden_size || k_out != expected_kv || v_out != expected_kv {
+                return Err(BackendError::InvalidConfig(
+                    "qkv projection dims mismatch".into(),
+                ));
+            }
+
+            let in_dim = hidden_size;
+            let fused_out = q_out + k_out + v_out;
+            let fused_len = fused_out
+                .checked_mul(in_dim)
+                .ok_or_else(|| BackendError::InvalidConfig("fused qkv size overflow".into()))?;
+            let mut fused = GpuBuffer::new(self.stream.alloc_zeros::<f32>(fused_len)?);
+
+            let q_len = q_out * in_dim;
+            let k_len = k_out * in_dim;
+            let v_len = v_out * in_dim;
+
+            let mut q_dst = fused.as_inner_mut().slice_mut(0..q_len);
+            self.stream.memcpy_dtod(q_weight.as_inner(), &mut q_dst)?;
+            let mut k_dst = fused.as_inner_mut().slice_mut(q_len..q_len + k_len);
+            self.stream.memcpy_dtod(k_weight.as_inner(), &mut k_dst)?;
+            let mut v_dst = fused
+                .as_inner_mut()
+                .slice_mut(q_len + k_len..q_len + k_len + v_len);
+            self.stream.memcpy_dtod(v_weight.as_inner(), &mut v_dst)?;
+
+            let bias_present = Self::resolve_bias(weights, &q_name)
+                .or_else(|| Self::resolve_bias(weights, &k_name))
+                .or_else(|| Self::resolve_bias(weights, &v_name))
+                .is_some();
+
+            let fused_bias = if bias_present {
+                let mut bias_buf = GpuBuffer::new(self.stream.alloc_zeros::<f32>(fused_out)?);
+                if let Some(q_bias) = Self::resolve_bias(weights, &q_name) {
+                    let mut dst = bias_buf.as_inner_mut().slice_mut(0..q_out);
+                    self.stream.memcpy_dtod(q_bias.as_inner(), &mut dst)?;
+                }
+                if let Some(k_bias) = Self::resolve_bias(weights, &k_name) {
+                    let mut dst = bias_buf.as_inner_mut().slice_mut(q_out..q_out + k_out);
+                    self.stream.memcpy_dtod(k_bias.as_inner(), &mut dst)?;
+                }
+                if let Some(v_bias) = Self::resolve_bias(weights, &v_name) {
+                    let mut dst = bias_buf
+                        .as_inner_mut()
+                        .slice_mut(q_out + k_out..q_out + k_out + v_out);
+                    self.stream.memcpy_dtod(v_bias.as_inner(), &mut dst)?;
+                }
+                Some(bias_buf)
+            } else {
+                None
+            };
+
+            layers.push(QkvLayerPlan::Fused {
+                weight: fused,
+                bias: fused_bias,
+            });
+        }
+
+        *plan_guard = Some(QkvPlan { layers });
+        Ok(())
     }
 
-    fn rerank_forward_gpu_pure(
-        &self,
-        tokens: &[u32],
-        weights: &RerankerModelWeightsGpu,
-        config: &RerankForwardConfig,
-    ) -> Result<Vec<f32>, String> {
-        let stream = get_cuda_stream()
-            .ok_or("CUDA stream not available")?;
-
-        let expected_tokens = config
-            .batch_size
-            .checked_mul(config.seq_len)
-            .ok_or("CUDA rerank_forward_gpu_pure: token size overflow")?;
-        if tokens.len() != expected_tokens {
-            return Err(format!(
-                "CUDA rerank_forward_gpu_pure: token length mismatch (got {}, expected {})",
-                tokens.len(),
-                expected_tokens
+    fn ensure_logits_buffer(&self, vocab_size: usize) -> BackendResult<usize> {
+        let mut logits = self.logits.lock().expect("logits lock poisoned");
+        if logits.is_empty() {
+            logits.push(self.stream.alloc_zeros::<f32>(vocab_size)?);
+        }
+        if logits[0].len() != vocab_size {
+            return Err(BackendError::InvalidConfig(
+                "logits buffer size mismatch".into(),
             ));
         }
+        Ok(0)
+    }
 
-        // Upload tokens to GPU (U32)
-        let token_bytes: &[u8] = bytemuck::cast_slice(tokens);
-        let token_buf = stream
-            .clone_htod(token_bytes)
-            .map_err(|e| format!("CUDA token upload failed: {}", e))?;
-        let tokens_gpu = GpuTensor::new(
-            GpuBuffer::Cuda(Arc::new(token_buf)),
-            vec![config.batch_size, config.seq_len],
-            TensorDtype::U32,
-            BackendType::Cuda,
-        );
+    fn forward_hidden(
+        &self,
+        tokens: &[u32],
+        topology: &AttentionTopology,
+        weights: &dyn TensorLookup<Self>,
+        mut kv_cache: Option<&mut KvCacheEntry>,
+        config: &GeneratorForwardConfig,
+    ) -> BackendResult<usize> {
+        if tokens.is_empty() {
+            return Err(BackendError::InvalidConfig("empty tokens".into()));
+        }
+        if tokens.len() > config.max_seq_len {
+            return Err(BackendError::InvalidConfig(
+                "tokens exceed max_seq_len".into(),
+            ));
+        }
+        let is_tree = topology.is_tree();
 
-        // Embedding lookup
-        let mut hidden = GpuTensor {
-            buffer: GpuBuffer::Cpu(Arc::new(Vec::new())),
-            shape: Vec::new(),
-            dtype: TensorDtype::F32,
-            size_in_bytes: 0,
-            backend: BackendType::Cuda,
-        };
-        self.embedding_lookup_gpu(&tokens_gpu, &weights.embedding, &mut hidden)?;
-
-        // Prepare identity RoPE cache if missing (cos=1, sin=0) to keep Q/K unchanged
-        let mut identity_rope: Option<(GpuTensor, GpuTensor)> = None;
-            if config.head_dim % 2 != 0 {
-                return Err("CUDA rerank_forward_gpu_pure: head_dim must be even for RoPE".into());
-            }
-        if weights.layers.iter().any(|layer| layer.cos_cache.is_none() || layer.sin_cache.is_none()) {
-            let rope_len = config
-                .seq_len
-                .checked_mul(config.head_dim / 2)
-                .ok_or("CUDA rerank_forward_gpu_pure: RoPE cache size overflow")?;
-            let cos = vec![1.0f32; rope_len];
-            let sin = vec![0.0f32; rope_len];
-            let cos_bytes: &[u8] = bytemuck::cast_slice(&cos);
-            let sin_bytes: &[u8] = bytemuck::cast_slice(&sin);
-            let cos_buf = stream
-                .clone_htod(cos_bytes)
-                .map_err(|e| format!("CUDA RoPE cos upload failed: {}", e))?;
-            let sin_buf = stream
-                .clone_htod(sin_bytes)
-                .map_err(|e| format!("CUDA RoPE sin upload failed: {}", e))?;
-            let cos_gpu = GpuTensor {
-                buffer: GpuBuffer::Cuda(Arc::new(cos_buf)),
-                shape: vec![rope_len],
-                dtype: TensorDtype::F32,
-                size_in_bytes: cos_bytes.len(),
-                backend: BackendType::Cuda,
-            };
-            let sin_gpu = GpuTensor {
-                buffer: GpuBuffer::Cuda(Arc::new(sin_buf)),
-                shape: vec![rope_len],
-                dtype: TensorDtype::F32,
-                size_in_bytes: sin_bytes.len(),
-                backend: BackendType::Cuda,
-            };
-            identity_rope = Some((cos_gpu, sin_gpu));
+        let hidden_size = Self::hidden_size(config)?;
+        if config.num_kv_heads == 0 || config.num_heads == 0 || config.head_dim == 0 {
+            return Err(BackendError::InvalidConfig("invalid head config".into()));
         }
 
-        let use_silu = matches!(config.activation, crate::kernel_types::Activation::SiLU);
-        let layer_cfg = TransformerLayerConfigGpu {
-            batch_size: config.batch_size,
-            seq_len: config.seq_len,
-            hidden_size: config.hidden_size,
-            num_q_heads: config.num_q_heads,
-            num_kv_heads: config.num_kv_heads,
-            head_dim: config.head_dim,
-            intermediate_size: config.intermediate_size,
-            rms_norm_eps: config.rms_norm_eps,
-            position: 0,
-            use_silu,
-        };
+        let embedding_kernel = &self.kernels.embedding;
+        let linear_kernel = &self.kernels.linear;
+        let add_kernel = &self.kernels.add;
 
-        for layer in weights.layers.iter() {
-            let mut layer_weights = layer.clone();
-            if layer_weights.cos_cache.is_none() || layer_weights.sin_cache.is_none() {
-                if let Some((cos_gpu, sin_gpu)) = identity_rope.as_ref() {
-                    layer_weights.cos_cache = Some(cos_gpu.clone());
-                    layer_weights.sin_cache = Some(sin_gpu.clone());
-                }
-            }
-            self.transformer_layer_gpu(&mut hidden, &layer_weights, None, &layer_cfg)?;
+        self.ensure_workspace(weights, config)?;
+        self.ensure_qkv_plan(weights, config, hidden_size)?;
+
+        let mut workspace_guard = self.workspace.lock().expect("workspace lock poisoned");
+        let workspace = workspace_guard
+            .as_mut()
+            .expect("workspace should be allocated");
+        let ws_config = workspace.config;
+
+        if ws_config.hidden_size != hidden_size {
+            return Err(BackendError::InvalidConfig("hidden size mismatch".into()));
         }
 
-        // Final RMS norm
-        self.rms_norm_gpu(&mut hidden, &weights.final_norm, config.rms_norm_eps)?;
+        let seq_len = tokens.len();
+        let mut kv_start = 0usize;
+        if let Some(cache) = kv_cache.as_deref_mut() {
+            if cache.config.num_layers != config.num_layers
+                || cache.config.num_heads != config.num_kv_heads
+                || cache.config.head_dim != config.head_dim
+            {
+                return Err(BackendError::InvalidKvCache(
+                    "kv cache config mismatch".into(),
+                ));
+            }
+            if seq_len > 1 && cache.used != 0 {
+                cache.used = 0;
+            }
+            if seq_len > cache.config.max_seq_len.saturating_sub(cache.used) {
+                return Err(BackendError::InvalidKvCache("kv cache exhausted".into()));
+            }
+            kv_start = cache.used;
+        }
+        if kv_cache.is_some() {
+            self.record_tokens(seq_len);
+            self.record_htod(seq_len * std::mem::size_of::<u32>());
+        }
+        let mut token_view = workspace.token_ids.slice_mut(0..seq_len);
+        self.stream.memcpy_htod(tokens, &mut token_view)?;
 
-        // Mean pooling (no attention mask provided, so use all-ones mask)
-        let mask = vec![1.0f32; expected_tokens];
-        let mask_bytes: &[u8] = bytemuck::cast_slice(&mask);
-        let mask_buf = stream
-            .clone_htod(mask_bytes)
-            .map_err(|e| format!("CUDA mask upload failed: {}", e))?;
-        let mask_gpu = GpuTensor {
-            buffer: GpuBuffer::Cuda(Arc::new(mask_buf)),
-            shape: vec![config.batch_size, config.seq_len],
-            dtype: TensorDtype::F32,
-            size_in_bytes: mask_bytes.len(),
-            backend: BackendType::Cuda,
-        };
+        if let Some(tree) = topology.tree_structure.as_ref() {
+            if tree.len() < seq_len {
+                return Err(BackendError::InvalidConfig(
+                    "tree topology length mismatch".into(),
+                ));
+            }
+            let src = tree.slice(0..seq_len);
+            let mut dst = workspace.positions.as_inner_mut().slice_mut(0..seq_len);
+            self.stream.memcpy_dtod(&src, &mut dst)?;
+        } else {
+            let end = kv_start
+                .checked_add(seq_len)
+                .ok_or_else(|| BackendError::InvalidConfig("positions range overflow".into()))?;
+            if end > workspace.config.max_seq_len {
+                return Err(BackendError::InvalidConfig(
+                    "positions range exceeds workspace".into(),
+                ));
+            }
+            let src = workspace.linear_positions.slice(kv_start..end);
+            let mut dst = workspace.positions.as_inner_mut().slice_mut(0..seq_len);
+            self.stream.memcpy_dtod(&src, &mut dst)?;
+        }
 
-        let mut pooled = GpuTensor {
-            buffer: GpuBuffer::Cpu(Arc::new(Vec::new())),
-            shape: Vec::new(),
-            dtype: TensorDtype::F32,
-            size_in_bytes: 0,
-            backend: BackendType::Cuda,
+        let embed_weight = Self::resolve_weight(
+            weights,
+            &Self::resolve_weight_name(weights, &embedding_candidates())?,
+        )?;
+        let emb_cfg = EmbeddingConfig {
+            vocab_size: config.vocab_size as u32,
+            hidden_size: hidden_size as u32,
+            seq_len: seq_len as u32,
+            stride: hidden_size as u32,
         };
-        self.mean_pooling_gpu(&hidden, &mask_gpu, &mut pooled)?;
-
-        // Classifier head
-        let mut scores_gpu = GpuTensor {
-            buffer: GpuBuffer::Cpu(Arc::new(Vec::new())),
-            shape: Vec::new(),
-            dtype: TensorDtype::F32,
-            size_in_bytes: 0,
-            backend: BackendType::Cuda,
-        };
-        self.classifier_gpu(
-            &pooled,
-            &weights.classifier_weight,
-            weights.classifier_bias.as_ref(),
-            &mut scores_gpu,
+        let emb_launch = LaunchConfig::for_num_elems((seq_len * hidden_size) as u32);
+        embedding_kernel.launch(
+            self.stream.as_ref(),
+            emb_launch,
+            &workspace.token_ids,
+            embed_weight.as_inner(),
+            workspace.hidden.as_inner_mut(),
+            &emb_cfg,
         )?;
 
-        // Download scores to host
-        match &scores_gpu.buffer {
-            GpuBuffer::Cuda(cuda_slice) => {
-                let bytes: Vec<u8> = stream
-                    .clone_dtoh(cuda_slice.as_ref())
-                    .map_err(|e| format!("CUDA scores download failed: {}", e))?;
-                Ok(bytemuck::cast_slice(&bytes).to_vec())
+        let qkv_plan_guard = self.qkv_plan.lock().expect("qkv plan lock poisoned");
+        let qkv_plan = qkv_plan_guard
+            .as_ref()
+            .expect("qkv plan should be allocated");
+
+        let q_out = hidden_size;
+        let kv_out = config.num_kv_heads * config.head_dim;
+        let q_len = seq_len * q_out;
+        let kv_len = seq_len * kv_out;
+        let qkv_stride = q_out + 2 * kv_out;
+        let rotary_dim = if config.position_encoding == PositionEncoding::Rope {
+            config.head_dim
+        } else {
+            0
+        };
+        let rope_cos =
+            if config.position_encoding == PositionEncoding::Rope && config.rope_precompute {
+                workspace.rope_cos.as_ref()
+            } else {
+                None
+            };
+        let rope_sin =
+            if config.position_encoding == PositionEncoding::Rope && config.rope_precompute {
+                workspace.rope_sin.as_ref()
+            } else {
+                None
+            };
+
+        for layer in 0..config.num_layers {
+            let (attn_norm, _) = Self::resolve_weight_and_bias(
+                weights,
+                &layer_candidates(ATTN_NORM_PATTERNS, layer),
+            )?;
+            let (ffn_norm, _) = Self::resolve_weight_and_bias(
+                weights,
+                &layer_candidates(FFN_NORM_PATTERNS, layer),
+            )?;
+
+            let rms_cfg = RmsNormConfig {
+                hidden_size: hidden_size as u32,
+                stride: hidden_size as u32,
+                eps: 1e-5,
+                seq_len: seq_len as u32,
+            };
+            let rms_launch = LaunchConfig::for_num_elems(seq_len as u32);
+            self.rms_norm(
+                rms_launch,
+                &rms_cfg,
+                &workspace.hidden,
+                attn_norm,
+                &mut workspace.norm,
+            )?;
+
+            let (qkv_weight, qkv_bias) = match &qkv_plan.layers[layer] {
+                QkvLayerPlan::Direct { weight, bias } => {
+                    let weight = Self::resolve_weight(weights, weight)?;
+                    let bias = bias.as_ref().and_then(|name| weights.tensor_f32(name));
+                    (weight, bias)
+                }
+                QkvLayerPlan::Fused { weight, bias } => (weight, bias.as_ref()),
+            };
+
+            let qkv_cfg = FusedQkvRopeConfig {
+                batch: 1,
+                seq_len: seq_len as u32,
+                num_heads: config.num_heads as u32,
+                head_dim: config.head_dim as u32,
+                rotary_dim: rotary_dim as u32,
+                input_stride: hidden_size as u32,
+                qkv_stride: qkv_stride as u32,
+                base: config.rope_theta,
+                scale: config.rope_scale,
+                interleaved: if config.rope_interleaved { 1 } else { 0 },
+                precompute_max_seq_len: config.max_seq_len as u32,
+            };
+            let qkv_launch = LaunchConfig::for_num_elems((seq_len * hidden_size) as u32);
+            self.fused_qkv_rope(
+                qkv_launch,
+                &qkv_cfg,
+                &workspace.norm,
+                qkv_weight,
+                qkv_bias,
+                &mut workspace.qkv,
+                Some(&workspace.positions),
+                rope_cos,
+                rope_sin,
+            )?;
+
+            if let Some(cache) = kv_cache.as_deref_mut() {
+                let qkv_slice = workspace.qkv.as_inner();
+                let k_src = qkv_slice.slice(q_len..q_len + kv_len);
+                let v_src = qkv_slice.slice(q_len + kv_len..q_len + 2 * kv_len);
+
+                if cache.is_paged() {
+                    let page_size = cache.page_size();
+                    let pages_per_layer = cache.pages_per_layer();
+                    let page_len = page_size * kv_out * 2;
+                    let KvCacheStorage::Paged {
+                        pages, page_ptrs, ..
+                    } = &mut cache.storage
+                    else {
+                        return Err(BackendError::InvalidKvCache(
+                            "expected paged kv cache".into(),
+                        ));
+                    };
+                    if pages.len() < config.num_layers * pages_per_layer {
+                        return Err(BackendError::InvalidKvCache(
+                            "paged kv cache size mismatch".into(),
+                        ));
+                    }
+
+                    let mut remaining = seq_len;
+                    let mut src_token = 0usize;
+                    let mut global = kv_start;
+                    while remaining > 0 {
+                        let page = global / page_size;
+                        let offset = global - page * page_size;
+                        let take = remaining.min(page_size - offset);
+                        let page_index = layer * pages_per_layer + page;
+                        let page_buf = pages
+                            .get_mut(page_index)
+                            .ok_or_else(|| BackendError::InvalidKvCache("page index".into()))?;
+                        if page_buf.len() != page_len {
+                            return Err(BackendError::InvalidKvCache(
+                                "paged kv cache page size mismatch".into(),
+                            ));
+                        }
+
+                        let src_offset = src_token * kv_out;
+                        let src_len = take * kv_out;
+                        let k_dst = offset * kv_out;
+                        let v_dst = page_size * kv_out + offset * kv_out;
+                        let k_seg = k_src.slice(src_offset..src_offset + src_len);
+                        let v_seg = v_src.slice(src_offset..src_offset + src_len);
+                        {
+                            let mut k_dst_view = page_buf.slice_mut(k_dst..k_dst + src_len);
+                            self.stream.memcpy_dtod(&k_seg, &mut k_dst_view)?;
+                        }
+                        {
+                            let mut v_dst_view = page_buf.slice_mut(v_dst..v_dst + src_len);
+                            self.stream.memcpy_dtod(&v_seg, &mut v_dst_view)?;
+                        }
+
+                        remaining -= take;
+                        src_token += take;
+                        global += take;
+                    }
+
+                    let kv_seq_len = kv_start + seq_len;
+                    let q_view = workspace.qkv.as_inner().slice(0..q_len);
+                    let table_start = layer * pages_per_layer;
+                    let table_end = table_start + pages_per_layer;
+                    let page_table = page_ptrs.slice(table_start..table_end);
+                    let attn_cfg = FlashAttnPagedConfig {
+                        batch: 1,
+                        num_heads: config.num_heads as u32,
+                        head_dim: config.head_dim as u32,
+                        q_seq_len: seq_len as u32,
+                        kv_seq_len: kv_seq_len as u32,
+                        q_stride: q_out as u32,
+                        kv_stride: kv_out as u32,
+                        o_stride: q_out as u32,
+                        causal: if is_tree { 0 } else { 1 },
+                        scale: 1.0 / (config.head_dim as f32).sqrt(),
+                        q_pos_offset: kv_start as u32,
+                        page_size: page_size as u32,
+                        pages_per_layer: pages_per_layer as u32,
+                    };
+                    let attn_launch =
+                        LaunchConfig::for_num_elems((seq_len * config.num_heads) as u32);
+                    self.kernels.flash_attn_paged.launch(
+                        self.stream.as_ref(),
+                        attn_launch,
+                        &q_view,
+                        &page_table,
+                        workspace.attn_out.as_inner_mut(),
+                        workspace.alibi_slopes.as_ref().map(GpuBuffer::as_inner),
+                        &attn_cfg,
+                    )?;
+                } else {
+                    let KvCacheStorage::Contiguous(buffer) = &mut cache.storage else {
+                        return Err(BackendError::InvalidKvCache(
+                            "expected contiguous kv cache".into(),
+                        ));
+                    };
+                    let layer_stride = cache.config.max_seq_len * kv_out * 2;
+                    let layer_base = layer * layer_stride;
+                    let k_dst_offset = layer_base + kv_start * kv_out;
+                    let v_dst_offset =
+                        layer_base + cache.config.max_seq_len * kv_out + kv_start * kv_out;
+
+                    {
+                        let mut k_dst = buffer.slice_mut(k_dst_offset..k_dst_offset + kv_len);
+                        self.stream.memcpy_dtod(&k_src, &mut k_dst)?;
+                    }
+                    {
+                        let mut v_dst = buffer.slice_mut(v_dst_offset..v_dst_offset + kv_len);
+                        self.stream.memcpy_dtod(&v_src, &mut v_dst)?;
+                    }
+
+                    let kv_seq_len = kv_start + seq_len;
+                    let k_cache_view = buffer.slice(0..kv_seq_len * kv_out);
+                    let v_cache_view = buffer.slice(
+                        cache.config.max_seq_len * kv_out
+                            ..cache.config.max_seq_len * kv_out + kv_seq_len * kv_out,
+                    );
+
+                    let q_view = workspace.qkv.as_inner().slice(0..q_len);
+
+                    let attn_cfg = FlashAttnConfig {
+                        batch: 1,
+                        num_heads: config.num_heads as u32,
+                        head_dim: config.head_dim as u32,
+                        q_seq_len: seq_len as u32,
+                        kv_seq_len: kv_seq_len as u32,
+                        q_stride: q_out as u32,
+                        kv_stride: kv_out as u32,
+                        o_stride: q_out as u32,
+                        causal: if is_tree { 0 } else { 1 },
+                        scale: 1.0 / (config.head_dim as f32).sqrt(),
+                        q_pos_offset: kv_start as u32,
+                    };
+                    let attn_launch =
+                        LaunchConfig::for_num_elems((seq_len * config.num_heads) as u32);
+                    self.kernels.flash_attn.launch(
+                        self.stream.as_ref(),
+                        attn_launch,
+                        &q_view,
+                        &k_cache_view,
+                        &v_cache_view,
+                        workspace.attn_out.as_inner_mut(),
+                        workspace.alibi_slopes.as_ref().map(GpuBuffer::as_inner),
+                        &attn_cfg,
+                    )?;
+                }
+            } else {
+                let q_view = workspace.qkv.as_inner().slice(0..q_len);
+                let k_view = workspace.qkv.as_inner().slice(q_len..q_len + kv_len);
+                let v_view = workspace
+                    .qkv
+                    .as_inner()
+                    .slice(q_len + kv_len..q_len + 2 * kv_len);
+
+                let attn_cfg = FlashAttnConfig {
+                    batch: 1,
+                    num_heads: config.num_heads as u32,
+                    head_dim: config.head_dim as u32,
+                    q_seq_len: seq_len as u32,
+                    kv_seq_len: seq_len as u32,
+                    q_stride: q_out as u32,
+                    kv_stride: kv_out as u32,
+                    o_stride: q_out as u32,
+                    causal: if is_tree { 0 } else { 1 },
+                    scale: 1.0 / (config.head_dim as f32).sqrt(),
+                    q_pos_offset: 0,
+                };
+                let attn_launch = LaunchConfig::for_num_elems((seq_len * config.num_heads) as u32);
+                self.kernels.flash_attn.launch(
+                    self.stream.as_ref(),
+                    attn_launch,
+                    &q_view,
+                    &k_view,
+                    &v_view,
+                    workspace.attn_out.as_inner_mut(),
+                    workspace.alibi_slopes.as_ref().map(GpuBuffer::as_inner),
+                    &attn_cfg,
+                )?;
             }
-            GpuBuffer::Cpu(bytes) => Ok(bytemuck::cast_slice(bytes.as_slice()).to_vec()),
-            #[allow(unreachable_patterns)]
-            _ => Err("Unexpected GPU buffer type for CUDA backend".into()),
+
+            let (o_proj, o_bias) =
+                Self::resolve_weight_and_bias(weights, &layer_candidates(O_PROJ_PATTERNS, layer))?;
+            let out_cfg = LinearConfig {
+                m: seq_len as u32,
+                n: hidden_size as u32,
+                k: hidden_size as u32,
+                input_stride: hidden_size as u32,
+                weight_stride: hidden_size as u32,
+                output_stride: hidden_size as u32,
+                use_bias: if o_bias.is_some() { 1 } else { 0 },
+            };
+            let out_launch = LaunchConfig::for_num_elems((seq_len * hidden_size) as u32);
+            linear_kernel.launch(
+                self.stream.as_ref(),
+                out_launch,
+                workspace.attn_out.as_inner(),
+                o_proj.as_inner(),
+                o_bias.map(GpuBuffer::as_inner),
+                workspace.norm.as_inner_mut(),
+                &out_cfg,
+            )?;
+
+            let add_cfg = AddConfig {
+                numel: (seq_len * hidden_size) as u32,
+            };
+            let add_launch = LaunchConfig::for_num_elems(add_cfg.numel);
+            add_kernel.launch(
+                self.stream.as_ref(),
+                add_launch,
+                workspace.hidden.as_inner(),
+                workspace.norm.as_inner(),
+                workspace.attn_out.as_inner_mut(),
+                &add_cfg,
+            )?;
+            let src = workspace
+                .attn_out
+                .as_inner()
+                .slice(0..seq_len * hidden_size);
+            let mut dst = workspace
+                .hidden
+                .as_inner_mut()
+                .slice_mut(0..seq_len * hidden_size);
+            self.stream.memcpy_dtod(&src, &mut dst)?;
+
+            self.rms_norm(
+                rms_launch,
+                &rms_cfg,
+                &workspace.hidden,
+                ffn_norm,
+                &mut workspace.norm,
+            )?;
+
+            let (gate_proj, gate_bias) = Self::resolve_weight_and_bias(
+                weights,
+                &layer_candidates(GATE_PROJ_PATTERNS, layer),
+            )?;
+            let (up_proj, up_bias) =
+                Self::resolve_weight_and_bias(weights, &layer_candidates(UP_PROJ_PATTERNS, layer))?;
+            let (down_proj, down_bias) = Self::resolve_weight_and_bias(
+                weights,
+                &layer_candidates(DOWN_PROJ_PATTERNS, layer),
+            )?;
+
+            let ffn_dim = ws_config.ffn_dim;
+            let gate_cfg = LinearConfig {
+                m: seq_len as u32,
+                n: ffn_dim as u32,
+                k: hidden_size as u32,
+                input_stride: hidden_size as u32,
+                weight_stride: hidden_size as u32,
+                output_stride: ffn_dim as u32,
+                use_bias: if gate_bias.is_some() { 1 } else { 0 },
+            };
+            let gate_launch = LaunchConfig::for_num_elems((seq_len * ffn_dim) as u32);
+            linear_kernel.launch(
+                self.stream.as_ref(),
+                gate_launch,
+                workspace.norm.as_inner(),
+                gate_proj.as_inner(),
+                gate_bias.map(GpuBuffer::as_inner),
+                workspace.ffn_gate.as_inner_mut(),
+                &gate_cfg,
+            )?;
+
+            let up_cfg = LinearConfig {
+                m: seq_len as u32,
+                n: ffn_dim as u32,
+                k: hidden_size as u32,
+                input_stride: hidden_size as u32,
+                weight_stride: hidden_size as u32,
+                output_stride: ffn_dim as u32,
+                use_bias: if up_bias.is_some() { 1 } else { 0 },
+            };
+            linear_kernel.launch(
+                self.stream.as_ref(),
+                gate_launch,
+                workspace.norm.as_inner(),
+                up_proj.as_inner(),
+                up_bias.map(GpuBuffer::as_inner),
+                workspace.ffn_up.as_inner_mut(),
+                &up_cfg,
+            )?;
+
+            let swiglu_cfg = SwiGluConfig {
+                numel: (seq_len * ffn_dim) as u32,
+            };
+            let swiglu_launch = LaunchConfig::for_num_elems(swiglu_cfg.numel);
+            self.fused_gate_up_silu(
+                swiglu_launch,
+                &swiglu_cfg,
+                &workspace.ffn_gate,
+                &workspace.ffn_up,
+                &mut workspace.ffn_act,
+            )?;
+
+            let down_cfg = LinearConfig {
+                m: seq_len as u32,
+                n: hidden_size as u32,
+                k: ffn_dim as u32,
+                input_stride: ffn_dim as u32,
+                weight_stride: ffn_dim as u32,
+                output_stride: hidden_size as u32,
+                use_bias: if down_bias.is_some() { 1 } else { 0 },
+            };
+            let down_launch = LaunchConfig::for_num_elems((seq_len * hidden_size) as u32);
+            linear_kernel.launch(
+                self.stream.as_ref(),
+                down_launch,
+                workspace.ffn_act.as_inner(),
+                down_proj.as_inner(),
+                down_bias.map(GpuBuffer::as_inner),
+                workspace.ffn_out.as_inner_mut(),
+                &down_cfg,
+            )?;
+
+            add_kernel.launch(
+                self.stream.as_ref(),
+                add_launch,
+                workspace.hidden.as_inner(),
+                workspace.ffn_out.as_inner(),
+                workspace.attn_out.as_inner_mut(),
+                &add_cfg,
+            )?;
+            let src = workspace
+                .attn_out
+                .as_inner()
+                .slice(0..seq_len * hidden_size);
+            let mut dst = workspace
+                .hidden
+                .as_inner_mut()
+                .slice_mut(0..seq_len * hidden_size);
+            self.stream.memcpy_dtod(&src, &mut dst)?;
         }
+
+        if let Some(cache) = kv_cache.as_deref_mut() {
+            cache.used = kv_start + seq_len;
+        }
+
+        let final_norm_name = Self::resolve_weight_name(weights, &final_norm_candidates())?;
+        let final_norm = Self::resolve_weight(weights, &final_norm_name)?;
+        let final_rms_cfg = RmsNormConfig {
+            hidden_size: hidden_size as u32,
+            stride: hidden_size as u32,
+            eps: 1e-5,
+            seq_len: seq_len as u32,
+        };
+        let final_launch = LaunchConfig::for_num_elems(seq_len as u32);
+        self.rms_norm(
+            final_launch,
+            &final_rms_cfg,
+            &workspace.hidden,
+            final_norm,
+            &mut workspace.norm,
+        )?;
+
+        let last_offset = (seq_len - 1) * hidden_size;
+        let last_src = workspace
+            .norm
+            .as_inner()
+            .slice(last_offset..last_offset + hidden_size);
+        let mut last_dst = workspace
+            .last_hidden
+            .as_inner_mut()
+            .slice_mut(0..hidden_size);
+        self.stream.memcpy_dtod(&last_src, &mut last_dst)?;
+
+        Ok(hidden_size)
+    }
+}
+
+impl Backend for CudaBackend {
+    type Tensor<T> = GpuBuffer<T>;
+
+    fn upload_weights<T: DeviceRepr + Clone>(&self, data: &[T]) -> BackendResult<Self::Tensor<T>> {
+        let slice = self.stream.clone_htod(data)?;
+        Ok(GpuBuffer::new(slice))
     }
 
-    fn upload_generator_weights(
-        &self,
-        embed_weight: &[f32],
-        layers: &[TransformerLayerWeights<'_>],
-        final_norm: &[f32],
-        lm_head: &[f32],
-        cos_cache: &[f32],
-        sin_cache: &[f32],
-        config: &GeneratorForwardConfig,
-    ) -> Result<GeneratorModelWeightsGpu, String> {
-        let stream = get_cuda_stream().ok_or("CUDA stream not available")?;
-
-        fn upload_f32(stream: &Arc<CudaStream>, data: &[f32], shape: Vec<usize>) -> Result<GpuTensor, String> {
-            let bytes: &[u8] = bytemuck::cast_slice(data);
-            let buf = stream.clone_htod(bytes).map_err(|e| e.to_string())?;
-            Ok(GpuTensor {
-                buffer: GpuBuffer::Cuda(Arc::new(buf)),
-                shape,
-                dtype: TensorDtype::F32,
-                size_in_bytes: bytes.len(),
-                backend: BackendType::Cuda,
-            })
+    fn alloc_kv_cache(&self, config: &KvCacheConfig) -> BackendResult<KvCacheHandle> {
+        if config.dtype_size != std::mem::size_of::<f32>() {
+            return Err(BackendError::InvalidKvCache(
+                "cuda kv cache expects f32 dtype".into(),
+            ));
         }
-
-        let hidden_dim = config.hidden_size;
-        let vocab_size = embed_weight.len() / hidden_dim;
-
-        let embedding = upload_f32(&stream, embed_weight, vec![vocab_size, hidden_dim])?;
-        let final_norm_gpu = upload_f32(&stream, final_norm, vec![hidden_dim])?;
-        let lm_head_gpu = upload_f32(&stream, lm_head, vec![vocab_size, hidden_dim])?;
-        let cos_cache_gpu = upload_f32(&stream, cos_cache, vec![cos_cache.len()])?;
-        let sin_cache_gpu = upload_f32(&stream, sin_cache, vec![sin_cache.len()])?;
-
-        let gpu_layers: Result<Vec<TransformerLayerWeightsGpu>, String> = layers.iter().map(|layer| {
-            Ok(TransformerLayerWeightsGpu {
-                input_norm: upload_f32(&stream, layer.input_norm, vec![hidden_dim])?,
-                q_weight: upload_f32(&stream, layer.q_weight, vec![layer.q_weight.len()])?,
-                k_weight: upload_f32(&stream, layer.k_weight, vec![layer.k_weight.len()])?,
-                v_weight: upload_f32(&stream, layer.v_weight, vec![layer.v_weight.len()])?,
-                o_weight: upload_f32(&stream, layer.o_weight, vec![layer.o_weight.len()])?,
-                post_attn_norm: upload_f32(&stream, layer.post_attn_norm, vec![hidden_dim])?,
-                gate_weight: layer.gate_weight.map(|g| upload_f32(&stream, g, vec![g.len()])).transpose()?,
-                up_weight: upload_f32(&stream, layer.up_weight, vec![layer.up_weight.len()])?,
-                down_weight: upload_f32(&stream, layer.down_weight, vec![layer.down_weight.len()])?,
-                cos_cache: Some(cos_cache_gpu.clone()),
-                sin_cache: Some(sin_cache_gpu.clone()),
-            })
-        }).collect();
-
-        Ok(GeneratorModelWeightsGpu {
-            embedding,
-            layers: gpu_layers?,
-            final_norm: final_norm_gpu,
-            lm_head: lm_head_gpu,
-            cos_cache: cos_cache_gpu,
-            sin_cache: sin_cache_gpu,
-        })
-    }
-
-    fn alloc_kv_cache_gpu(
-        &self,
-        num_layers: usize,
-        batch_size: usize,
-        num_kv_heads: usize,
-        max_len: usize,
-        head_dim: usize,
-    ) -> Result<KVCacheGpu, String> {
-        let stream = get_cuda_stream().ok_or("CUDA stream not available")?;
-
-        let cache_size = num_layers * batch_size * num_kv_heads * max_len * head_dim;
-        let size_in_bytes = cache_size * std::mem::size_of::<f32>();
-        let zeros_bytes = vec![0u8; size_in_bytes];
-
-        let k_buf = stream.clone_htod(&zeros_bytes).map_err(|e| e.to_string())?;
-        let v_buf = stream.clone_htod(&zeros_bytes).map_err(|e| e.to_string())?;
-
-        let k_cache = GpuTensor {
-            buffer: GpuBuffer::Cuda(Arc::new(k_buf)),
-            shape: vec![num_layers, batch_size, num_kv_heads, max_len, head_dim],
-            dtype: TensorDtype::F32,
-            size_in_bytes,
-            backend: BackendType::Cuda,
+        let kv_stride = config
+            .num_heads
+            .checked_mul(config.head_dim)
+            .ok_or_else(|| BackendError::InvalidKvCache("kv stride overflow".into()))?;
+        if kv_stride == 0 || config.max_seq_len == 0 || config.num_layers == 0 {
+            return Err(BackendError::InvalidKvCache(
+                "kv cache size must be > 0".into(),
+            ));
+        }
+        let page_size = config.effective_page_size();
+        let pages_per_layer = config
+            .pages_per_layer()
+            .ok_or_else(|| BackendError::InvalidKvCache("page size overflow".into()))?;
+        let storage = if config.is_paged() {
+            let page_len = page_size
+                .checked_mul(kv_stride)
+                .and_then(|v| v.checked_mul(2))
+                .ok_or_else(|| BackendError::InvalidKvCache("page size overflow".into()))?;
+            let total_pages = config
+                .num_layers
+                .checked_mul(pages_per_layer)
+                .ok_or_else(|| BackendError::InvalidKvCache("page count overflow".into()))?;
+            let mut pages = Vec::with_capacity(total_pages);
+            let mut host_ptrs = Vec::with_capacity(total_pages);
+            for _ in 0..total_pages {
+                let page = self.stream.alloc_zeros::<f32>(page_len)?;
+                let (ptr, sync) = page.device_ptr(self.stream.as_ref());
+                host_ptrs.push(ptr as u64);
+                drop(sync);
+                pages.push(page);
+            }
+            let page_ptrs = self.stream.clone_htod(&host_ptrs)?;
+            KvCacheStorage::Paged {
+                pages,
+                page_ptrs,
+                page_size,
+                pages_per_layer,
+            }
+        } else {
+            let elements = config
+                .num_layers
+                .checked_mul(2)
+                .and_then(|v| v.checked_mul(config.max_seq_len))
+                .and_then(|v| v.checked_mul(kv_stride))
+                .ok_or_else(|| BackendError::InvalidKvCache("size overflow".into()))?;
+            let slice = self.stream.alloc_zeros::<f32>(elements)?;
+            KvCacheStorage::Contiguous(slice)
         };
-        let v_cache = GpuTensor {
-            buffer: GpuBuffer::Cuda(Arc::new(v_buf)),
-            shape: vec![num_layers, batch_size, num_kv_heads, max_len, head_dim],
-            dtype: TensorDtype::F32,
-            size_in_bytes,
-            backend: BackendType::Cuda,
-        };
-
-        Ok(KVCacheGpu {
-            k_cache,
-            v_cache,
-            seq_len: 0,
-            max_len,
-            num_layers,
-            num_kv_heads,
-            head_dim,
-        })
+        let mut caches = self.kv_caches.lock().expect("kv cache lock poisoned");
+        caches.push(KvCacheEntry {
+            storage,
+            config: *config,
+            used: 0,
+        });
+        Ok(KvCacheHandle::new(caches.len() - 1))
     }
 
     fn generator_forward_gpu_pure(
         &self,
         tokens: &[u32],
-        weights: &GeneratorModelWeightsGpu,
-        kv_cache: &mut KVCacheGpu,
+        topology: &AttentionTopology,
+        weights: &dyn TensorLookup<Self>,
+        kv_cache: &mut KvCacheHandle,
         config: &GeneratorForwardConfig,
-    ) -> Result<LogitsTensor, String> {
-        let stream = get_cuda_stream()
-            .ok_or("CUDA stream not available")?;
+    ) -> BackendResult<LogitsTensor> {
+        let start = Instant::now();
+        let mut caches = self.kv_caches.lock().expect("kv cache lock poisoned");
+        let cache = caches
+            .get_mut(kv_cache.0)
+            .ok_or_else(|| BackendError::InvalidHandle("kv cache handle".into()))?;
 
-        let expected_tokens = config
-            .batch_size
-            .checked_mul(config.seq_len)
-            .ok_or("CUDA generator_forward_gpu_pure: token size overflow")?;
-        if tokens.len() != expected_tokens {
-            return Err(format!(
-                "CUDA generator_forward_gpu_pure: token length mismatch (got {}, expected {})",
-                tokens.len(),
-                expected_tokens
+        let hidden_size = self.forward_hidden(tokens, topology, weights, Some(cache), config)?;
+        let logits_idx = self.ensure_logits_buffer(config.vocab_size)?;
+
+        let linear_kernel = &self.kernels.linear;
+
+        let mut logits_guard = self.logits.lock().expect("logits lock poisoned");
+        let logits_buf = logits_guard
+            .get_mut(logits_idx)
+            .ok_or_else(|| BackendError::InvalidHandle("logits handle".into()))?;
+
+        let lm_head_name = Self::resolve_weight_name(weights, &lm_head_candidates())
+            .or_else(|_| Self::resolve_weight_name(weights, &embedding_candidates()))?;
+        let lm_head = Self::resolve_weight(weights, &lm_head_name)?;
+        let lm_bias = Self::resolve_bias(weights, &lm_head_name);
+
+        let workspace_guard = self.workspace.lock().expect("workspace lock poisoned");
+        let workspace = workspace_guard
+            .as_ref()
+            .ok_or_else(|| BackendError::InvalidConfig("workspace missing".into()))?;
+
+        let lm_cfg = LinearConfig {
+            m: 1,
+            n: config.vocab_size as u32,
+            k: hidden_size as u32,
+            input_stride: hidden_size as u32,
+            weight_stride: hidden_size as u32,
+            output_stride: config.vocab_size as u32,
+            use_bias: if lm_bias.is_some() { 1 } else { 0 },
+        };
+        let lm_launch = LaunchConfig::for_num_elems(config.vocab_size as u32);
+        linear_kernel.launch(
+            self.stream.as_ref(),
+            lm_launch,
+            workspace.last_hidden.as_inner(),
+            lm_head.as_inner(),
+            lm_bias.map(GpuBuffer::as_inner),
+            logits_buf,
+            &lm_cfg,
+        )?;
+
+        self.record_forward_time(start.elapsed());
+        Ok(LogitsTensor::new(logits_idx))
+    }
+
+    fn sample_from_tensor(
+        &self,
+        logits: &LogitsTensor,
+        _topology: &AttentionTopology,
+        vocab_size: usize,
+        config: &SamplingConfig,
+    ) -> BackendResult<Vec<u32>> {
+        let start = Instant::now();
+        let sampling_kernel = &self.kernels.sampling;
+        let logits_guard = self.logits.lock().expect("logits lock poisoned");
+        let logits_buf = logits_guard
+            .get(logits.0)
+            .ok_or_else(|| BackendError::InvalidHandle("logits handle".into()))?;
+
+        if logits_buf.len() != vocab_size {
+            return Err(BackendError::InvalidConfig(
+                "logits buffer size mismatch".into(),
             ));
         }
 
-        if kv_cache.num_layers != weights.layers.len() {
-            return Err(format!(
-                "CUDA generator_forward_gpu_pure: KV cache layers mismatch (cache={}, weights={})",
-                kv_cache.num_layers,
-                weights.layers.len()
-            ));
+        let mut sampling_guard = self.sampling.lock().expect("sampling lock poisoned");
+        if sampling_guard.is_none() {
+            *sampling_guard = Some(self.stream.alloc_zeros::<u32>(1)?);
         }
-        if kv_cache.num_kv_heads != config.num_kv_heads || kv_cache.head_dim != config.head_dim {
-            return Err("CUDA generator_forward_gpu_pure: KV cache shape mismatch".into());
-        }
+        let out_buf = sampling_guard
+            .as_mut()
+            .expect("sampling buffer should exist");
 
-        let layer_elems = config
-            .batch_size
-            .checked_mul(config.num_kv_heads)
-            .and_then(|v| v.checked_mul(kv_cache.max_len))
-            .and_then(|v| v.checked_mul(config.head_dim))
-            .ok_or("CUDA generator_forward_gpu_pure: KV cache size overflow")?;
-        let expected_cache_elems = layer_elems
-            .checked_mul(kv_cache.num_layers)
-            .ok_or("CUDA generator_forward_gpu_pure: KV cache total size overflow")?;
-
-        let cache_elems = kv_cache.k_cache.size_in_bytes / std::mem::size_of::<f32>();
-        if cache_elems != expected_cache_elems {
-            return Err("CUDA generator_forward_gpu_pure: KV cache buffer size mismatch".into());
-        }
-
-        // Upload tokens to GPU (U32)
-        let token_bytes: &[u8] = bytemuck::cast_slice(tokens);
-        let token_buf = stream
-            .clone_htod(token_bytes)
-            .map_err(|e| format!("CUDA token upload failed: {}", e))?;
-        let tokens_gpu = GpuTensor::new(
-            GpuBuffer::Cuda(Arc::new(token_buf)),
-            vec![config.batch_size, config.seq_len],
-            TensorDtype::U32,
-            BackendType::Cuda,
-        );
-
-        // Embedding lookup
-        let mut hidden = GpuTensor {
-            buffer: GpuBuffer::Cpu(Arc::new(Vec::new())),
-            shape: Vec::new(),
-            dtype: TensorDtype::F32,
-            size_in_bytes: 0,
-            backend: BackendType::Cuda,
+        let temp = if config.temperature.is_finite() && config.temperature > 0.0 {
+            config.temperature
+        } else {
+            1.0
         };
-        self.embedding_lookup_gpu(&tokens_gpu, &weights.embedding, &mut hidden)?;
-
-        let use_silu = matches!(config.activation, crate::kernel_types::Activation::SiLU);
-        let layer_cfg = TransformerLayerConfigGpu {
-            batch_size: config.batch_size,
-            seq_len: config.seq_len,
-            hidden_size: config.hidden_size,
-            num_q_heads: config.num_q_heads,
-            num_kv_heads: config.num_kv_heads,
-            head_dim: config.head_dim,
-            intermediate_size: config.intermediate_size,
-            rms_norm_eps: config.rms_norm_eps,
-            position: kv_cache.seq_len,
-            use_silu,
+        let top_p = if config.top_p.is_finite() && config.top_p > 0.0 && config.top_p <= 1.0 {
+            config.top_p
+        } else {
+            1.0
         };
 
-        for (layer_idx, layer) in weights.layers.iter().enumerate() {
-            // Extract per-layer KV cache into a temporary GPU buffer
-            let (layer_k_buf, layer_v_buf) = {
-                let GpuBuffer::Cuda(k_cache_slice) = &kv_cache.k_cache.buffer else {
-                    return Err("CUDA generator_forward_gpu_pure: KV cache k must be CUDA buffer".into());
-                };
-                let GpuBuffer::Cuda(v_cache_slice) = &kv_cache.v_cache.buffer else {
-                    return Err("CUDA generator_forward_gpu_pure: KV cache v must be CUDA buffer".into());
-                };
-                let total_elems = expected_cache_elems;
-                let k_view = unsafe {
-                    k_cache_slice
-                        .transmute::<f32>(total_elems)
-                        .ok_or("CUDA generator_forward_gpu_pure: failed to transmute KV k cache")?
-                };
-                let v_view = unsafe {
-                    v_cache_slice
-                        .transmute::<f32>(total_elems)
-                        .ok_or("CUDA generator_forward_gpu_pure: failed to transmute KV v cache")?
-                };
-                let start = layer_idx
-                    .checked_mul(layer_elems)
-                    .ok_or("CUDA generator_forward_gpu_pure: KV layer offset overflow")?;
-                let end = start + layer_elems;
-                let k_src = k_view
-                    .try_slice(start..end)
-                    .ok_or("CUDA generator_forward_gpu_pure: KV k slice OOB")?;
-                let v_src = v_view
-                    .try_slice(start..end)
-                    .ok_or("CUDA generator_forward_gpu_pure: KV v slice OOB")?;
-
-                let mut k_buf: cudarc::driver::CudaSlice<u8> = stream
-                    .alloc_zeros(layer_elems * std::mem::size_of::<f32>())
-                    .map_err(|e| format!("CUDA generator_forward_gpu_pure: KV k alloc failed: {}", e))?;
-                let mut v_buf: cudarc::driver::CudaSlice<u8> = stream
-                    .alloc_zeros(layer_elems * std::mem::size_of::<f32>())
-                    .map_err(|e| format!("CUDA generator_forward_gpu_pure: KV v alloc failed: {}", e))?;
-                let mut k_dst = unsafe {
-                    k_buf
-                        .transmute_mut::<f32>(layer_elems)
-                        .ok_or("CUDA generator_forward_gpu_pure: failed to transmute KV k layer")?
-                };
-                let mut v_dst = unsafe {
-                    v_buf
-                        .transmute_mut::<f32>(layer_elems)
-                        .ok_or("CUDA generator_forward_gpu_pure: failed to transmute KV v layer")?
-                };
-                stream
-                    .memcpy_dtod(&k_src, &mut k_dst)
-                    .map_err(|e| format!("CUDA generator_forward_gpu_pure: KV k dtod failed: {}", e))?;
-                stream
-                    .memcpy_dtod(&v_src, &mut v_dst)
-                    .map_err(|e| format!("CUDA generator_forward_gpu_pure: KV v dtod failed: {}", e))?;
-                (k_buf, v_buf)
-            };
-
-            let mut layer_kv = KVCacheGpu {
-                k_cache: GpuTensor {
-                    buffer: GpuBuffer::Cuda(Arc::new(layer_k_buf)),
-                    shape: vec![1, config.batch_size, config.num_kv_heads, kv_cache.max_len, config.head_dim],
-                    dtype: TensorDtype::F32,
-                    size_in_bytes: layer_elems * std::mem::size_of::<f32>(),
-                    backend: BackendType::Cuda,
-                },
-                v_cache: GpuTensor {
-                    buffer: GpuBuffer::Cuda(Arc::new(layer_v_buf)),
-                    shape: vec![1, config.batch_size, config.num_kv_heads, kv_cache.max_len, config.head_dim],
-                    dtype: TensorDtype::F32,
-                    size_in_bytes: layer_elems * std::mem::size_of::<f32>(),
-                    backend: BackendType::Cuda,
-                },
-                seq_len: kv_cache.seq_len,
-                max_len: kv_cache.max_len,
-                num_layers: 1,
-                num_kv_heads: kv_cache.num_kv_heads,
-                head_dim: kv_cache.head_dim,
-            };
-
-            self.transformer_layer_gpu(&mut hidden, layer, Some(&mut layer_kv), &layer_cfg)?;
-
-            // Copy per-layer KV cache back into the global cache
-            {
-                let GpuBuffer::Cuda(k_cache_arc) = &mut kv_cache.k_cache.buffer else {
-                    return Err("CUDA generator_forward_gpu_pure: KV cache k must be CUDA buffer".into());
-                };
-                let GpuBuffer::Cuda(v_cache_arc) = &mut kv_cache.v_cache.buffer else {
-                    return Err("CUDA generator_forward_gpu_pure: KV cache v must be CUDA buffer".into());
-                };
-                let k_cache_slice = Arc::get_mut(k_cache_arc)
-                    .ok_or("CUDA generator_forward_gpu_pure: KV cache k buffer is shared")?;
-                let v_cache_slice = Arc::get_mut(v_cache_arc)
-                    .ok_or("CUDA generator_forward_gpu_pure: KV cache v buffer is shared")?;
-                let mut k_view = unsafe {
-                    k_cache_slice
-                        .transmute_mut::<f32>(expected_cache_elems)
-                        .ok_or("CUDA generator_forward_gpu_pure: failed to transmute KV k cache")?
-                };
-                let mut v_view = unsafe {
-                    v_cache_slice
-                        .transmute_mut::<f32>(expected_cache_elems)
-                        .ok_or("CUDA generator_forward_gpu_pure: failed to transmute KV v cache")?
-                };
-                let start = layer_idx
-                    .checked_mul(layer_elems)
-                    .ok_or("CUDA generator_forward_gpu_pure: KV layer offset overflow")?;
-                let end = start + layer_elems;
-                let mut k_dst = k_view
-                    .try_slice_mut(start..end)
-                    .ok_or("CUDA generator_forward_gpu_pure: KV k dst slice OOB")?;
-                let mut v_dst = v_view
-                    .try_slice_mut(start..end)
-                    .ok_or("CUDA generator_forward_gpu_pure: KV v dst slice OOB")?;
-
-                let GpuBuffer::Cuda(layer_k_buf) = &layer_kv.k_cache.buffer else {
-                    return Err("CUDA generator_forward_gpu_pure: layer KV k must be CUDA buffer".into());
-                };
-                let GpuBuffer::Cuda(layer_v_buf) = &layer_kv.v_cache.buffer else {
-                    return Err("CUDA generator_forward_gpu_pure: layer KV v must be CUDA buffer".into());
-                };
-                let k_src = unsafe {
-                    layer_k_buf
-                        .transmute::<f32>(layer_elems)
-                        .ok_or("CUDA generator_forward_gpu_pure: failed to transmute layer KV k")?
-                };
-                let v_src = unsafe {
-                    layer_v_buf
-                        .transmute::<f32>(layer_elems)
-                        .ok_or("CUDA generator_forward_gpu_pure: failed to transmute layer KV v")?
-                };
-
-                stream
-                    .memcpy_dtod(&k_src, &mut k_dst)
-                    .map_err(|e| format!("CUDA generator_forward_gpu_pure: KV k writeback failed: {}", e))?;
-                stream
-                    .memcpy_dtod(&v_src, &mut v_dst)
-                    .map_err(|e| format!("CUDA generator_forward_gpu_pure: KV v writeback failed: {}", e))?;
-            }
-        }
-
-        let pos_end = kv_cache
-            .seq_len
-            .checked_add(config.seq_len)
-            .ok_or("CUDA generator_forward_gpu_pure: KV cache position overflow")?;
-        kv_cache.seq_len = pos_end;
-
-        // Final RMS norm
-        self.rms_norm_gpu(&mut hidden, &weights.final_norm, config.rms_norm_eps)?;
-
-        // LM head
-        let mut logits_gpu = GpuTensor {
-            buffer: GpuBuffer::Cpu(Arc::new(Vec::new())),
-            shape: Vec::new(),
-            dtype: TensorDtype::F32,
-            size_in_bytes: 0,
-            backend: BackendType::Cuda,
+        let params = SamplingKernelConfig {
+            vocab_size: vocab_size as u32,
+            top_k: config.top_k as u32,
+            top_p,
+            temperature: temp,
+            stride: vocab_size as u32,
+            batch: 1,
         };
-        self.lm_head_gpu(&hidden, &weights.lm_head, &mut logits_gpu)?;
+        let launch = LaunchConfig::for_num_elems(1);
+        sampling_kernel.launch(self.stream.as_ref(), launch, logits_buf, out_buf, &params)?;
 
-        // Return GPU-resident logits for zero-copy sampling (ARCH-PERF-001)
-        Ok(LogitsTensor::Gpu(logits_gpu))
+        let mut host = vec![0u32; 1];
+        self.stream.memcpy_dtoh(out_buf, &mut host)?;
+        self.record_dtoh(std::mem::size_of::<u32>());
+        self.record_sample_time(start.elapsed());
+        Ok(host)
     }
 
-    // =========================================================================
-    // MoE GPU-Native Methods (ARCH-GPU-001)
-    // =========================================================================
-
-    fn upload_moe_generator_weights(
+    fn embedding_forward_gpu_pure(
         &self,
-        embed_weight: &[f32],
-        layers: &[MoETransformerLayerWeights<'_>],
-        final_norm: &[f32],
-        lm_head: &[f32],
-        cos_cache: &[f32],
-        sin_cache: &[f32],
-        config: &MoEGeneratorForwardConfig,
-    ) -> Result<MoEGeneratorModelWeightsGpu, String> {
-        let stream = get_cuda_stream().ok_or("CUDA stream not available")?;
+        tokens: &[u32],
+        topology: &AttentionTopology,
+        weights: &dyn TensorLookup<Self>,
+        config: &GeneratorForwardConfig,
+    ) -> BackendResult<Vec<f32>> {
+        let hidden_size = self.forward_hidden(tokens, topology, weights, None, config)?;
 
-        fn upload_f32(stream: &Arc<CudaStream>, data: &[f32], shape: Vec<usize>) -> Result<GpuTensor, String> {
-            let bytes: &[u8] = bytemuck::cast_slice(data);
-            let buf = stream.clone_htod(bytes).map_err(|e| e.to_string())?;
-            Ok(GpuTensor {
-                buffer: GpuBuffer::Cuda(Arc::new(buf)),
-                shape,
-                dtype: TensorDtype::F32,
-                size_in_bytes: bytes.len(),
-                backend: BackendType::Cuda,
-            })
-        }
+        let workspace_guard = self.workspace.lock().expect("workspace lock poisoned");
+        let workspace = workspace_guard
+            .as_ref()
+            .ok_or_else(|| BackendError::InvalidConfig("workspace missing".into()))?;
 
-        let hidden_dim = config.hidden_size;
-        let intermediate_size = config.intermediate_size;
-        let vocab_size = embed_weight.len() / hidden_dim;
-        let num_experts = config.num_experts;
-
-        let embedding = upload_f32(&stream, embed_weight, vec![vocab_size, hidden_dim])?;
-        let final_norm_gpu = upload_f32(&stream, final_norm, vec![hidden_dim])?;
-        let lm_head_gpu = upload_f32(&stream, lm_head, vec![vocab_size, hidden_dim])?;
-        let cos_cache_gpu = upload_f32(&stream, cos_cache, vec![cos_cache.len()])?;
-        let sin_cache_gpu = upload_f32(&stream, sin_cache, vec![sin_cache.len()])?;
-
-        let gpu_layers: Result<Vec<MoETransformerLayerWeightsGpu>, String> = layers.iter().enumerate().map(|(layer_idx, layer)| {
-            // Upload attention weights
-            let input_norm = upload_f32(&stream, layer.input_norm, vec![hidden_dim])?;
-            let q_weight = upload_f32(&stream, layer.q_weight, vec![layer.q_weight.len()])?;
-            let k_weight = upload_f32(&stream, layer.k_weight, vec![layer.k_weight.len()])?;
-            let v_weight = upload_f32(&stream, layer.v_weight, vec![layer.v_weight.len()])?;
-            let o_weight = upload_f32(&stream, layer.o_weight, vec![layer.o_weight.len()])?;
-            let post_attn_norm = upload_f32(&stream, layer.post_attn_norm, vec![hidden_dim])?;
-
-            // Upload router weights: [hidden_dim, num_experts] (transposed from [num_experts, hidden_dim])
-            // The CPU weights are [num_experts, hidden_dim], need to transpose for GPU matmul
-            let router_weight = upload_f32(&stream, layer.router_weight, vec![hidden_dim, num_experts])?;
-
-            // Upload expert weights
-            let experts: Result<Vec<ExpertWeightsGpu>, String> = layer.experts.iter().map(|expert| {
-                Ok(ExpertWeightsGpu {
-                    gate: upload_f32(&stream, expert.gate, vec![intermediate_size, hidden_dim])?,
-                    up: upload_f32(&stream, expert.up, vec![intermediate_size, hidden_dim])?,
-                    down: upload_f32(&stream, expert.down, vec![hidden_dim, intermediate_size])?,
-                })
-            }).collect();
-
-            Ok(MoETransformerLayerWeightsGpu {
-                input_norm,
-                q_weight,
-                k_weight,
-                v_weight,
-                o_weight,
-                post_attn_norm,
-                router_weight,
-                experts: experts?,
-                num_experts_per_tok: layer.num_experts_per_tok,
-                num_experts,
-                cos_cache: Some(cos_cache_gpu.clone()),
-                sin_cache: Some(sin_cache_gpu.clone()),
-            })
-        }).collect();
-
-        Ok(MoEGeneratorModelWeightsGpu {
-            embedding,
-            layers: gpu_layers?,
-            final_norm: final_norm_gpu,
-            lm_head: lm_head_gpu,
-            cos_cache: cos_cache_gpu,
-            sin_cache: sin_cache_gpu,
-        })
+        let mut host = vec![0f32; hidden_size];
+        self.stream
+            .memcpy_dtoh(workspace.last_hidden.as_inner(), &mut host)?;
+        self.record_dtoh(host.len() * std::mem::size_of::<f32>());
+        Ok(host)
     }
 
-    fn moe_generator_forward_gpu_pure(
+    fn rerank_forward_gpu_pure(
         &self,
-        _tokens: &[u32],
-        _weights: &MoEGeneratorModelWeightsGpu,
-        _kv_cache: &mut KVCacheGpu,
-        _config: &MoEGeneratorForwardConfig,
-    ) -> Result<LogitsTensor, String> {
-        // MoE GPU forward implementation requires:
-        // 1. MoE routing kernel integration (CudaMoeRouteKernel exists)
-        // 2. Expert FFN kernels (per-expert gated feed-forward)
-        // 3. Aggregation kernel (weighted sum of expert outputs)
-        // 4. Attention reuse from existing transformer_layer_gpu
-        //
-        // The pipeline per layer:
-        //   hidden = rms_norm(hidden)
-        //   hidden = attention(hidden) + residual
-        //   hidden = rms_norm(hidden)
-        //   hidden = moe_ffn(hidden) + residual
-        //                ↓
-        //           router_weights = softmax(hidden @ router_weight)
-        //           selected_experts = topk(router_weights, k=num_experts_per_tok)
-        //           expert_outs = [expert_i(hidden) for i in selected_experts]
-        //           moe_out = sum(router_weights[i] * expert_outs[i])
-        //
-        // Estimated effort: 3-5 days for full GPU implementation
-        Err("CUDA MoE GPU forward: CPU fallback (full GPU implementation requires MoE routing kernel integration, expert FFN kernels, aggregation kernel - estimated 3-5 days)".to_string())
+        tokens: &[u32],
+        topology: &AttentionTopology,
+        weights: &dyn TensorLookup<Self>,
+        config: &GeneratorForwardConfig,
+    ) -> BackendResult<Vec<f32>> {
+        let hidden_size = self.forward_hidden(tokens, topology, weights, None, config)?;
+
+        let score_name = find_tensor_name(weights, &score_head_candidates());
+        if let Some(score_name) = score_name {
+            let score_weight = Self::resolve_weight(weights, &score_name)?;
+            let score_shape = weights
+                .tensor_shape(&score_name)
+                .ok_or_else(|| BackendError::MissingTensor(score_name.clone()))?;
+            let out_dim = Self::deduce_out_dim(score_shape, hidden_size)?;
+            let score_bias = Self::resolve_bias(weights, &score_name);
+
+            let logits_idx = self.ensure_logits_buffer(config.vocab_size)?;
+            let mut logits_guard = self.logits.lock().expect("logits lock poisoned");
+            let logits_buf = logits_guard
+                .get_mut(logits_idx)
+                .ok_or_else(|| BackendError::InvalidHandle("logits handle".into()))?;
+
+            let workspace_guard = self.workspace.lock().expect("workspace lock poisoned");
+            let workspace = workspace_guard
+                .as_ref()
+                .ok_or_else(|| BackendError::InvalidConfig("workspace missing".into()))?;
+
+            let linear_kernel = &self.kernels.linear;
+
+            let mut out_view = logits_buf.slice_mut(0..out_dim);
+            let cfg = LinearConfig {
+                m: 1,
+                n: out_dim as u32,
+                k: hidden_size as u32,
+                input_stride: hidden_size as u32,
+                weight_stride: hidden_size as u32,
+                output_stride: out_dim as u32,
+                use_bias: if score_bias.is_some() { 1 } else { 0 },
+            };
+            let launch = LaunchConfig::for_num_elems(out_dim as u32);
+            linear_kernel.launch(
+                self.stream.as_ref(),
+                launch,
+                workspace.last_hidden.as_inner(),
+                score_weight.as_inner(),
+                score_bias.map(GpuBuffer::as_inner),
+                &mut out_view,
+                &cfg,
+            )?;
+
+            let mut host = vec![0f32; out_dim];
+            let out_read = out_view.as_view();
+            self.stream.memcpy_dtoh(&out_read, &mut host)?;
+            self.record_dtoh(host.len() * std::mem::size_of::<f32>());
+            Ok(host)
+        } else {
+            let workspace_guard = self.workspace.lock().expect("workspace lock poisoned");
+            let workspace = workspace_guard
+                .as_ref()
+                .ok_or_else(|| BackendError::InvalidConfig("workspace missing".into()))?;
+            let mut host = vec![0f32; hidden_size];
+            self.stream
+                .memcpy_dtoh(workspace.last_hidden.as_inner(), &mut host)?;
+            self.record_dtoh(host.len() * std::mem::size_of::<f32>());
+            Ok(host)
+        }
     }
 }
-
-// =========================================================================
-// CUDA Kernel Helper Functions (Internal)
-// NOTE: Real GPU kernels need to be implemented here.
-// These should use cuBLAS, cuDNN, or custom CUDA PTX kernels.
-// =========================================================================
-
-// TODO: When implementing real CUDA kernels, add functions like:
-//
-// fn cuda_gemm(
-//     cublas_handle: &CublasHandle,
-//     a: &CudaSlice<f32>, // GPU pointer
-//     b: &CudaSlice<f32>, // GPU pointer
-//     c: &mut CudaSlice<f32>, // GPU pointer
-//     m: usize, n: usize, k: usize,
-// ) -> Result<(), String>
-//
-// fn cuda_rms_norm(
-//     stream: &CudaStream,
-//     input: &CudaSlice<f32>,  // GPU pointer
-//     weight: &CudaSlice<f32>, // GPU pointer
-//     output: &mut CudaSlice<f32>, // GPU pointer
-//     hidden_dim: usize,
-//     eps: f32,
-// ) -> Result<(), String>
-//
-// These functions MUST:
-// - Take GPU pointers directly (no host data)
-// - Launch CUDA kernels
-// - Keep all intermediate results on GPU
-// - Never call clone_dtoh/clone_htod internally

@@ -1,122 +1,76 @@
-use cudarc::driver::{CudaContext, CudaFunction, CudaModule, CudaSlice, LaunchConfig, PushKernelArg};
-use std::sync::Arc;
-use crate::cuda_kernels::ptx_loader::PtxCollection;
-use crate::wgpu_kernels::LinearParams;
+use cudarc::driver::{sys, CudaStream, DevicePtr, DevicePtrMut, DeviceRepr, LaunchConfig};
 
-const KERNEL_FORWARD: &str = "linear_forward_kernel";
-const KERNEL_FUSED_GATE_UP_SILU: &str = "fused_gate_up_silu_kernel";
+use crate::backend_trait::{BackendError, BackendResult};
+use crate::cuda_kernels::{load_function, KernelLaunch};
 
-/// SM-aware PTX collection for Linear kernel.
-/// 🚨 **Fat Binary Only**: All PTX precompiled and embedded, no runtime compilation.
-static LINEAR_PTX: PtxCollection = PtxCollection {
-    kernel_name: "linear",
-    ptx_versions: &[
-        (61, include_str!("kernels/linear_sm61.ptx")),
-        (80, include_str!("kernels/linear.ptx")),
-    ],
-};
+pub const LINEAR_KERNEL_NAMES: &[&str] = &["linear", "gemm", "matmul"];
 
-pub struct CudaLinear {
-    #[allow(dead_code)]
-    module: Arc<CudaModule>,
-    func: CudaFunction,
-    fused_func: CudaFunction,
+#[repr(C)]
+#[derive(Debug, Clone, Copy)]
+pub struct LinearConfig {
+    pub m: u32,
+    pub n: u32,
+    pub k: u32,
+    pub input_stride: u32,
+    pub weight_stride: u32,
+    pub output_stride: u32,
+    pub use_bias: u32,
 }
 
-impl CudaLinear {
-    pub fn new(ctx: &Arc<CudaContext>) -> Result<Self, String> {
-        let ptx = LINEAR_PTX
-            .load(ctx)
-            .map_err(|e| format!("Failed to load linear PTX: {e}"))?;
-        let module = ctx
-            .load_module(ptx)
-            .map_err(|e| format!("Failed to load linear PTX module: {:?}", e))?;
+unsafe impl DeviceRepr for LinearConfig {}
 
-        let func = module
-            .load_function(KERNEL_FORWARD)
-            .map_err(|_| format!("Failed to find kernel function: {KERNEL_FORWARD}"))?;
+#[derive(Debug, Clone, Copy)]
+pub struct LinearKernel {
+    func: sys::CUfunction,
+}
 
-        let fused_func = module
-            .load_function(KERNEL_FUSED_GATE_UP_SILU)
-            .map_err(|_| format!("Failed to find kernel function: {KERNEL_FUSED_GATE_UP_SILU}"))?;
+unsafe impl Send for LinearKernel {}
+unsafe impl Sync for LinearKernel {}
 
-        Ok(Self { module, func, fused_func })
+impl LinearKernel {
+    pub(crate) fn load(module: sys::CUmodule) -> BackendResult<Self> {
+        let mut last_err = None;
+        for name in LINEAR_KERNEL_NAMES {
+            match load_function(module, name) {
+                Ok(func) => return Ok(Self { func }),
+                Err(err) => last_err = Some(err),
+            }
+        }
+        Err(last_err.unwrap_or_else(|| BackendError::Cuda("missing linear kernel".into())))
     }
 
-    pub fn forward(
+    pub fn launch<
+        T: DeviceRepr,
+        I: DevicePtr<T>,
+        W: DevicePtr<T>,
+        B: DevicePtr<T>,
+        O: DevicePtrMut<T>,
+    >(
         &self,
-        stream: &cudarc::driver::CudaStream,
-        params: LinearParams,
-        input: &CudaSlice<u8>,
-        weight: &CudaSlice<u8>,
-        bias: Option<&CudaSlice<u8>>,
-        output: &CudaSlice<u8>,
-    ) -> Result<(), String> {
-        let has_bias = if bias.is_some() { 1 } else { 0 };
-        let cfg = LaunchConfig::for_num_elems(params.out_features);
-        
-        // Prepare scalars
-        let in_features_i32 = params.in_features as i32;
-        let out_features_i32 = params.out_features as i32;
-        let has_bias_i32 = has_bias as i32;
+        stream: &CudaStream,
+        config: LaunchConfig,
+        input: &I,
+        weight: &W,
+        bias: Option<&B>,
+        output: &mut O,
+        params: &LinearConfig,
+    ) -> BackendResult<()> {
+        let mut launch = KernelLaunch::new(self.func, stream, config, 5);
+        launch
+            .arg_device(input)
+            .arg_device(weight)
+            .arg_device_mut(output);
 
-        unsafe {
-            let mut builder = stream.launch_builder(&self.func);
-            builder.arg(input);
-            builder.arg(weight);
-            // Handle optional bias
-            match bias {
-                Some(b) => builder.arg(b),
-                None => builder.arg(&0u64), // Null pointer
-            };
+        match bias {
+            Some(bias) => {
+                launch.arg_device(bias);
+            }
+            None => {
+                launch.arg_device_ptr(0);
+            }
+        }
 
-            builder.arg(output);
-            builder.arg(&in_features_i32);
-            builder.arg(&out_features_i32);
-            builder.arg(&has_bias_i32);
-            
-            builder.launch(cfg)
-        }.map_err(|e| format!("Kernel launch failed: {:?}", e))?;
-
-        Ok(())
-    }
-
-    pub fn fused_gate_up_silu(
-        &self,
-        stream: &cudarc::driver::CudaStream,
-        params: LinearParams,
-        input: &CudaSlice<u8>,
-        weight_gate: &CudaSlice<u8>,
-        weight_up: &CudaSlice<u8>,
-        output: &CudaSlice<u8>,
-        batch_size: usize,
-    ) -> Result<(), String> {
-        // Grid: [out_features, batch_size]
-        let cfg = LaunchConfig {
-            grid_dim: (
-                (params.out_features as u32 + 255) / 256,
-                batch_size as u32,
-                1
-            ),
-            block_dim: (256, 1, 1),
-            shared_mem_bytes: 0,
-        };
-
-        let in_features_i32 = params.in_features as i32;
-        let out_features_i32 = params.out_features as i32;
-
-        unsafe {
-            let mut builder = stream.launch_builder(&self.fused_func);
-            builder.arg(input);
-            builder.arg(weight_gate);
-            builder.arg(weight_up);
-            builder.arg(output);
-            builder.arg(&in_features_i32);
-            builder.arg(&out_features_i32);
-            
-            builder.launch(cfg)
-        }.map_err(|e| format!("Fused kernel launch failed: {:?}", e))?;
-
-        Ok(())
+        launch.arg_scalar(params);
+        unsafe { launch.launch() }
     }
 }
