@@ -8,13 +8,15 @@ pub mod gpu_types;
 pub mod kernel_types;
 pub mod ops;
 pub mod quantization;
+pub mod swap_manager;
 
 pub use backend::{auto_select_backend, BackendKind};
 pub use backend_trait::{
-    AttentionTopology, Backend, BackendError, BackendResult, KvCacheHandle, LogitsHandle,
-    LogitsTensor, TensorLookup,
+    AttentionTopology, Backend, BackendError, BackendResult, BatchInput, KvCacheHandle,
+    LogitsHandle, LogitsTensor, SequenceInput, TensorLookup,
 };
 pub use cpu_backend::CpuBackend;
 pub use cuda_backend::{CudaBackend, PerfMetrics};
-pub use kernel_types::{DType, GeneratorForwardConfig, PackedBits, PositionEncoding, SamplingConfig};
+pub use kernel_types::{DType, GeneratorForwardConfig, PackedBits, PositionEncoding, SamplingConfig, SwapConfig};
 pub use quantization::{Block, BlockwiseMatrix, PackedU8};
+pub use swap_manager::{SwapManager, SwapStats};

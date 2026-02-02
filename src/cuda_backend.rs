@@ -7,8 +7,8 @@ use cudarc::driver::{
 };
 
 use crate::backend_trait::{
-    AttentionTopology, Backend, BackendError, BackendResult, KvCacheHandle, LogitsTensor,
-    TensorLookup,
+    AttentionTopology, Backend, BackendError, BackendResult, BatchInput, KvCacheHandle,
+    LogitsTensor, TensorLookup,
 };
 use crate::cuda_kernels::{
     cubin_for, AddConfig, CudaKernels, EmbeddingConfig, FlashAttnConfig,
@@ -20,6 +20,7 @@ use crate::kernel_types::{
     alibi_slopes, precompute_rope_tables, GeneratorForwardConfig, KvCacheConfig, PositionEncoding,
     SamplingConfig,
 };
+use crate::swap_manager::SwapManager;
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 struct WorkspaceConfig {
@@ -447,6 +448,7 @@ pub struct CudaBackend {
     sm: SmVersion,
     kernels: CudaKernels,
     kv_caches: Mutex<Vec<KvCacheEntry>>,
+    swap_managers: Mutex<Vec<Option<SwapManager>>>,
     workspace: Mutex<Option<LayerWorkspace>>,
     qkv_plan: Mutex<Option<QkvPlan>>,
     logits: Mutex<Vec<CudaSlice<f32>>>,
@@ -516,6 +518,7 @@ impl CudaBackend {
             sm,
             kernels,
             kv_caches: Mutex::new(Vec::new()),
+            swap_managers: Mutex::new(Vec::new()),
             workspace: Mutex::new(None),
             qkv_plan: Mutex::new(None),
             logits: Mutex::new(Vec::new()),
@@ -1072,16 +1075,130 @@ impl CudaBackend {
     }
 
     fn ensure_logits_buffer(&self, vocab_size: usize) -> BackendResult<usize> {
+        self.ensure_logits_buffer_at(vocab_size, 0)?;
+        Ok(0)
+    }
+
+    fn ensure_logits_buffer_at(&self, vocab_size: usize, index: usize) -> BackendResult<()> {
         let mut logits = self.logits.lock().expect("logits lock poisoned");
-        if logits.is_empty() {
+        while logits.len() <= index {
             logits.push(self.stream.alloc_zeros::<f32>(vocab_size)?);
         }
-        if logits[0].len() != vocab_size {
+        if logits[index].len() != vocab_size {
             return Err(BackendError::InvalidConfig(
                 "logits buffer size mismatch".into(),
             ));
         }
-        Ok(0)
+        Ok(())
+    }
+
+    fn validate_sequence_position(
+        cache: &KvCacheEntry,
+        seq_len: usize,
+        position: usize,
+    ) -> BackendResult<()> {
+        if position > cache.config.max_seq_len {
+            return Err(BackendError::InvalidConfig(
+                "sequence position exceeds max_seq_len".into(),
+            ));
+        }
+        if seq_len > 1 {
+            if position != 0 {
+                return Err(BackendError::InvalidConfig(
+                    "prefill position must be 0".into(),
+                ));
+            }
+            if cache.used != 0 {
+                return Err(BackendError::InvalidKvCache(
+                    "kv cache not empty for prefill".into(),
+                ));
+            }
+        } else if position != cache.used {
+            return Err(BackendError::InvalidKvCache(
+                "sequence position mismatch".into(),
+            ));
+        }
+        Ok(())
+    }
+
+    fn swap_out_pages_with_manager(
+        &self,
+        cache: &mut KvCacheEntry,
+        manager: &mut SwapManager,
+        page_indices: &[usize],
+    ) -> BackendResult<()> {
+        let KvCacheStorage::Paged { pages, .. } = &mut cache.storage else {
+            return Err(BackendError::InvalidKvCache("cache is not paged".into()));
+        };
+
+        let prepared = manager.prepare_swap_out(page_indices)?;
+        for &page_idx in &prepared {
+            if page_idx >= pages.len() {
+                continue;
+            }
+            let gpu_page = &pages[page_idx];
+            let mut host_data = vec![0.0f32; gpu_page.len()];
+            let gpu_src = gpu_page.slice(0..gpu_page.len());
+            self.stream.memcpy_dtoh(&gpu_src, &mut host_data)?;
+            manager.complete_swap_out(page_idx, host_data)?;
+        }
+        Ok(())
+    }
+
+    fn auto_swap_out_if_needed(
+        &self,
+        cache: &mut KvCacheEntry,
+        manager: &mut SwapManager,
+    ) -> BackendResult<()> {
+        let Some(cfg) = cache.config.swap_config else {
+            return Ok(());
+        };
+        if !cfg.enable_swap || !cache.is_paged() {
+            return Ok(());
+        }
+        let pressure = self.get_memory_pressure()?;
+        if !pressure.is_finite() {
+            return Err(BackendError::InvalidConfig(
+                "memory pressure is not finite".into(),
+            ));
+        }
+        if pressure < cfg.swap_threshold {
+            return Ok(());
+        }
+        let count = cfg.lru_granularity.max(1);
+        let victims = manager.select_victim_pages(count);
+        let prepared = manager.prepare_swap_out(&victims)?;
+        if prepared.is_empty() {
+            return Ok(());
+        }
+        self.swap_out_pages_with_manager(cache, manager, &prepared)?;
+        Ok(())
+    }
+
+    fn mark_kv_pages_accessed(
+        cache: &KvCacheEntry,
+        manager: &mut SwapManager,
+    ) -> BackendResult<()> {
+        if !cache.is_paged() {
+            return Ok(());
+        }
+        let kv_end = cache.used;
+        if kv_end == 0 {
+            return Ok(());
+        }
+        let page_size = cache.page_size();
+        if page_size == 0 {
+            return Ok(());
+        }
+        let pages_per_layer = cache.pages_per_layer();
+        let pages_used = (kv_end + page_size - 1) / page_size;
+        for layer in 0..cache.config.num_layers {
+            let base = layer * pages_per_layer;
+            for page in 0..pages_used {
+                manager.mark_accessed(base + page)?;
+            }
+        }
+        Ok(())
     }
 
     fn forward_hidden(
@@ -1650,6 +1767,96 @@ impl CudaBackend {
 
         Ok(hidden_size)
     }
+
+    fn forward_logits_with_index(
+        &self,
+        tokens: &[u32],
+        topology: &AttentionTopology,
+        weights: &dyn TensorLookup<Self>,
+        kv_cache: &mut KvCacheHandle,
+        config: &GeneratorForwardConfig,
+        logits_idx: usize,
+        expected_position: Option<usize>,
+    ) -> BackendResult<LogitsTensor> {
+        let start = Instant::now();
+        if tokens.is_empty() {
+            return Err(BackendError::InvalidConfig("empty tokens".into()));
+        }
+
+        let mut caches = self.kv_caches.lock().expect("kv cache lock poisoned");
+        let cache = caches
+            .get_mut(kv_cache.0)
+            .ok_or_else(|| BackendError::InvalidHandle("kv cache handle".into()))?;
+
+        if let Some(position) = expected_position {
+            Self::validate_sequence_position(cache, tokens.len(), position)?;
+        }
+
+        {
+            let mut managers = self.swap_managers.lock().expect("swap managers lock poisoned");
+            if let Some(manager) = managers
+                .get_mut(kv_cache.0)
+                .and_then(|entry| entry.as_mut())
+            {
+                self.auto_swap_out_if_needed(cache, manager)?;
+            }
+        }
+
+        let hidden_size = self.forward_hidden(tokens, topology, weights, Some(cache), config)?;
+
+        if cache.is_paged() {
+            let mut managers = self.swap_managers.lock().expect("swap managers lock poisoned");
+            if let Some(manager) = managers
+                .get_mut(kv_cache.0)
+                .and_then(|entry| entry.as_mut())
+            {
+                Self::mark_kv_pages_accessed(cache, manager)?;
+            }
+        }
+
+        drop(caches);
+
+        self.ensure_logits_buffer_at(config.vocab_size, logits_idx)?;
+        let linear_kernel = &self.kernels.linear;
+
+        let mut logits_guard = self.logits.lock().expect("logits lock poisoned");
+        let logits_buf = logits_guard
+            .get_mut(logits_idx)
+            .ok_or_else(|| BackendError::InvalidHandle("logits handle".into()))?;
+
+        let lm_head_name = Self::resolve_weight_name(weights, &lm_head_candidates())
+            .or_else(|_| Self::resolve_weight_name(weights, &embedding_candidates()))?;
+        let lm_head = Self::resolve_weight(weights, &lm_head_name)?;
+        let lm_bias = Self::resolve_bias(weights, &lm_head_name);
+
+        let workspace_guard = self.workspace.lock().expect("workspace lock poisoned");
+        let workspace = workspace_guard
+            .as_ref()
+            .ok_or_else(|| BackendError::InvalidConfig("workspace missing".into()))?;
+
+        let lm_cfg = LinearConfig {
+            m: 1,
+            n: config.vocab_size as u32,
+            k: hidden_size as u32,
+            input_stride: hidden_size as u32,
+            weight_stride: hidden_size as u32,
+            output_stride: config.vocab_size as u32,
+            use_bias: if lm_bias.is_some() { 1 } else { 0 },
+        };
+        let lm_launch = LaunchConfig::for_num_elems(config.vocab_size as u32);
+        linear_kernel.launch(
+            self.stream.as_ref(),
+            lm_launch,
+            workspace.last_hidden.as_inner(),
+            lm_head.as_inner(),
+            lm_bias.map(GpuBuffer::as_inner),
+            logits_buf,
+            &lm_cfg,
+        )?;
+
+        self.record_forward_time(start.elapsed());
+        Ok(LogitsTensor::new(logits_idx))
+    }
 }
 
 impl Backend for CudaBackend {
@@ -1714,13 +1921,135 @@ impl Backend for CudaBackend {
             let slice = self.stream.alloc_zeros::<f32>(elements)?;
             KvCacheStorage::Contiguous(slice)
         };
+
+        // 初始化 SwapManager (如果配置了)
+        let swap_manager = config.swap_config.map(|cfg| {
+            let total_pages = if config.is_paged() {
+                config.num_layers * pages_per_layer
+            } else {
+                0
+            };
+            if total_pages > 0 && cfg.enable_swap {
+                Some(SwapManager::new(total_pages, cfg))
+            } else {
+                None
+            }
+        }).flatten();
+
         let mut caches = self.kv_caches.lock().expect("kv cache lock poisoned");
+        let mut managers = self.swap_managers.lock().expect("swap managers lock poisoned");
         caches.push(KvCacheEntry {
             storage,
             config: *config,
             used: 0,
         });
+        managers.push(swap_manager);
         Ok(KvCacheHandle::new(caches.len() - 1))
+    }
+
+    fn swap_out_pages(
+        &self,
+        kv_cache: &mut KvCacheHandle,
+        page_indices: &[usize],
+    ) -> BackendResult<()> {
+        let mut caches = self.kv_caches.lock().expect("kv cache lock poisoned");
+        let mut managers = self.swap_managers.lock().expect("swap managers lock poisoned");
+
+        let cache = caches
+            .get_mut(kv_cache.0)
+            .ok_or_else(|| BackendError::InvalidHandle("kv cache handle".into()))?;
+
+        let manager = managers
+            .get_mut(kv_cache.0)
+            .ok_or_else(|| BackendError::InvalidHandle("swap manager handle".into()))?;
+
+        let Some(manager) = manager.as_mut() else {
+            return Err(BackendError::Unimplemented("swap not configured for this cache"));
+        };
+
+        self.swap_out_pages_with_manager(cache, manager, page_indices)
+    }
+
+    fn swap_in_pages(
+        &self,
+        kv_cache: &mut KvCacheHandle,
+        page_indices: &[usize],
+    ) -> BackendResult<()> {
+        let mut caches = self.kv_caches.lock().expect("kv cache lock poisoned");
+        let mut managers = self.swap_managers.lock().expect("swap managers lock poisoned");
+
+        let cache = caches
+            .get_mut(kv_cache.0)
+            .ok_or_else(|| BackendError::InvalidHandle("kv cache handle".into()))?;
+
+        let manager = managers
+            .get_mut(kv_cache.0)
+            .ok_or_else(|| BackendError::InvalidHandle("swap manager handle".into()))?;
+
+        let Some(manager) = manager.as_mut() else {
+            return Err(BackendError::Unimplemented("swap not configured for this cache"));
+        };
+
+        let KvCacheStorage::Paged { pages, .. } = &mut cache.storage else {
+            return Err(BackendError::InvalidKvCache("cache is not paged".into()));
+        };
+
+        // 执行 swap-in
+        for &page_idx in page_indices {
+            if page_idx >= pages.len() {
+                continue;
+            }
+
+            let gpu_page = &mut pages[page_idx];
+
+            // 从 SwapManager 获取 CPU 数据
+            let Some(host_data) = manager.get_swapped_data(page_idx) else {
+                continue;
+            };
+
+            let copy_len = host_data.len().min(gpu_page.len());
+            let mut dst = gpu_page.slice_mut(0..copy_len);
+            self.stream.memcpy_htod(&host_data[0..copy_len], &mut dst)?;
+
+            // 完成换入
+            manager.complete_swap_in(page_idx)?;
+        }
+
+        Ok(())
+    }
+
+    fn get_memory_pressure(&self) -> BackendResult<f32> {
+        self.ctx.bind_to_thread()?;
+        let (free, total) = result::mem_get_info()?;
+        if total == 0 {
+            return Ok(0.0);
+        }
+        let used = total.saturating_sub(free);
+        let pressure = (used as f64) / (total as f64);
+        let pressure = pressure.clamp(0.0, 1.0) as f32;
+        Ok(pressure)
+    }
+
+    fn get_page_states(
+        &self,
+        kv_cache: &KvCacheHandle,
+    ) -> BackendResult<Vec<(usize, crate::kernel_types::PageState)>> {
+        let managers = self.swap_managers.lock().expect("swap managers lock poisoned");
+        let manager = managers
+            .get(kv_cache.0)
+            .ok_or_else(|| BackendError::InvalidHandle("swap manager handle".into()))?;
+
+        if let Some(manager) = manager.as_ref() {
+            let mut states = Vec::new();
+            for idx in 0..manager.stats().total_pages {
+                if let Some(state) = manager.get_page_state(idx) {
+                    states.push((idx, state));
+                }
+            }
+            Ok(states)
+        } else {
+            Ok(Vec::new())
+        }
     }
 
     fn generator_forward_gpu_pure(
@@ -1731,54 +2060,50 @@ impl Backend for CudaBackend {
         kv_cache: &mut KvCacheHandle,
         config: &GeneratorForwardConfig,
     ) -> BackendResult<LogitsTensor> {
-        let start = Instant::now();
-        let mut caches = self.kv_caches.lock().expect("kv cache lock poisoned");
-        let cache = caches
-            .get_mut(kv_cache.0)
-            .ok_or_else(|| BackendError::InvalidHandle("kv cache handle".into()))?;
+        self.forward_logits_with_index(tokens, topology, weights, kv_cache, config, 0, None)
+    }
 
-        let hidden_size = self.forward_hidden(tokens, topology, weights, Some(cache), config)?;
-        let logits_idx = self.ensure_logits_buffer(config.vocab_size)?;
+    fn batch_forward_gpu_pure(
+        &self,
+        batch: &BatchInput,
+        topology: &AttentionTopology,
+        weights: &dyn TensorLookup<Self>,
+        kv_caches: &mut [KvCacheHandle],
+        config: &GeneratorForwardConfig,
+    ) -> BackendResult<Vec<LogitsTensor>> {
+        if batch.sequences.is_empty() {
+            return Err(BackendError::InvalidConfig("empty batch".into()));
+        }
+        if batch.sequences.len() != kv_caches.len() {
+            return Err(BackendError::InvalidConfig(
+                "batch size and kv cache count mismatch".into(),
+            ));
+        }
 
-        let linear_kernel = &self.kernels.linear;
-
-        let mut logits_guard = self.logits.lock().expect("logits lock poisoned");
-        let logits_buf = logits_guard
-            .get_mut(logits_idx)
-            .ok_or_else(|| BackendError::InvalidHandle("logits handle".into()))?;
-
-        let lm_head_name = Self::resolve_weight_name(weights, &lm_head_candidates())
-            .or_else(|_| Self::resolve_weight_name(weights, &embedding_candidates()))?;
-        let lm_head = Self::resolve_weight(weights, &lm_head_name)?;
-        let lm_bias = Self::resolve_bias(weights, &lm_head_name);
-
-        let workspace_guard = self.workspace.lock().expect("workspace lock poisoned");
-        let workspace = workspace_guard
-            .as_ref()
-            .ok_or_else(|| BackendError::InvalidConfig("workspace missing".into()))?;
-
-        let lm_cfg = LinearConfig {
-            m: 1,
-            n: config.vocab_size as u32,
-            k: hidden_size as u32,
-            input_stride: hidden_size as u32,
-            weight_stride: hidden_size as u32,
-            output_stride: config.vocab_size as u32,
-            use_bias: if lm_bias.is_some() { 1 } else { 0 },
-        };
-        let lm_launch = LaunchConfig::for_num_elems(config.vocab_size as u32);
-        linear_kernel.launch(
-            self.stream.as_ref(),
-            lm_launch,
-            workspace.last_hidden.as_inner(),
-            lm_head.as_inner(),
-            lm_bias.map(GpuBuffer::as_inner),
-            logits_buf,
-            &lm_cfg,
-        )?;
-
-        self.record_forward_time(start.elapsed());
-        Ok(LogitsTensor::new(logits_idx))
+        let mut outputs = Vec::with_capacity(batch.sequences.len());
+        for (idx, (sequence, cache)) in batch
+            .sequences
+            .iter()
+            .zip(kv_caches.iter_mut())
+            .enumerate()
+        {
+            if sequence.tokens.is_empty() {
+                return Err(BackendError::InvalidConfig(
+                    "empty sequence tokens".into(),
+                ));
+            }
+            let logits = self.forward_logits_with_index(
+                &sequence.tokens,
+                topology,
+                weights,
+                cache,
+                config,
+                idx,
+                Some(sequence.position),
+            )?;
+            outputs.push(logits);
+        }
+        Ok(outputs)
     }
 
     fn sample_from_tensor(

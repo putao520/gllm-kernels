@@ -95,7 +95,42 @@ impl DType {
     }
 }
 
+/// 页面状态枚举 (用于 Swap-in/Swap-out)
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PageState {
+    /// 在 GPU 内存中且正在使用
+    Active,
+    /// 在 GPU 内存中但未使用 (可换出)
+    Standby,
+    /// 已换出到 CPU 内存
+    Swapped,
+}
+
+/// Swap 配置
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct SwapConfig {
+    /// 是否启用 swap
+    pub enable_swap: bool,
+    /// CPU 保留内存 (MB)
+    pub cpu_reserve_mb: usize,
+    /// GPU 使用率阈值 (0.0-1.0)，超过此值时触发 swap-out
+    pub swap_threshold: f32,
+    /// LRU 粒度 (页数)
+    pub lru_granularity: usize,
+}
+
+impl Default for SwapConfig {
+    fn default() -> Self {
+        Self {
+            enable_swap: true,
+            cpu_reserve_mb: 512,
+            swap_threshold: 0.85,
+            lru_granularity: 4,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub struct KvCacheConfig {
     pub num_layers: usize,
     pub num_heads: usize,
@@ -103,6 +138,8 @@ pub struct KvCacheConfig {
     pub max_seq_len: usize,
     pub dtype_size: usize,
     pub page_size: usize,
+    /// Swap 配置 (可选)
+    pub swap_config: Option<SwapConfig>,
 }
 
 impl KvCacheConfig {

@@ -77,11 +77,53 @@ impl AttentionTopology {
     }
 }
 
+#[derive(Debug, Clone)]
+pub struct BatchInput {
+    pub sequences: Vec<SequenceInput>,
+}
+
+#[derive(Debug, Clone)]
+pub struct SequenceInput {
+    pub tokens: Vec<u32>,
+    pub position: usize,
+}
+
 pub trait Backend: Send + Sync {
     type Tensor<T>;
 
     fn upload_weights<T: DeviceRepr + Clone>(&self, data: &[T]) -> BackendResult<Self::Tensor<T>>;
     fn alloc_kv_cache(&self, config: &KvCacheConfig) -> BackendResult<KvCacheHandle>;
+
+    /// Swap-out: 将 KV cache 页面从 GPU 搬运到 CPU
+    fn swap_out_pages(
+        &self,
+        _kv_cache: &mut KvCacheHandle,
+        _page_indices: &[usize],
+    ) -> BackendResult<()> {
+        Err(BackendError::Unimplemented("swap_out_pages"))
+    }
+
+    /// Swap-in: 将 KV cache 页面从 CPU 搬运回 GPU
+    fn swap_in_pages(
+        &self,
+        _kv_cache: &mut KvCacheHandle,
+        _page_indices: &[usize],
+    ) -> BackendResult<()> {
+        Err(BackendError::Unimplemented("swap_in_pages"))
+    }
+
+    /// 获取当前内存压力 (0.0-1.0)
+    fn get_memory_pressure(&self) -> BackendResult<f32> {
+        Ok(0.0)
+    }
+
+    /// 获取页面状态 (用于调试和监控)
+    fn get_page_states(
+        &self,
+        _kv_cache: &KvCacheHandle,
+    ) -> BackendResult<Vec<(usize, crate::kernel_types::PageState)>> {
+        Ok(Vec::new())
+    }
 
     fn generator_forward_gpu_pure(
         &self,
@@ -92,6 +134,17 @@ pub trait Backend: Send + Sync {
         _config: &GeneratorForwardConfig,
     ) -> BackendResult<LogitsTensor> {
         Err(BackendError::Unimplemented("generator_forward_gpu_pure"))
+    }
+
+    fn batch_forward_gpu_pure(
+        &self,
+        _batch: &BatchInput,
+        _topology: &AttentionTopology,
+        _weights: &dyn TensorLookup<Self>,
+        _kv_caches: &mut [KvCacheHandle],
+        _config: &GeneratorForwardConfig,
+    ) -> BackendResult<Vec<LogitsTensor>> {
+        Err(BackendError::Unimplemented("batch_forward_gpu_pure"))
     }
 
     fn sample_from_tensor(
