@@ -24,6 +24,8 @@ pub enum BackendError {
     InvalidConfig(String),
     #[error("invalid handle: {0}")]
     InvalidHandle(String),
+    #[error("out of memory: {0}")]
+    OutOfMemory(String),
     #[error("unimplemented backend feature: {0}")]
     Unimplemented(&'static str),
 }

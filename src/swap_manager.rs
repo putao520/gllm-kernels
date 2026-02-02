@@ -105,7 +105,6 @@ pub struct SwapManager {
     /// 全局 IRR 计数
     current_recency: usize,
     /// Swap 配置
-    #[allow(dead_code)]
     config: SwapConfig,
     /// Warm 保护时长
     warmup_duration: Duration,
@@ -150,6 +149,11 @@ impl SwapManager {
 
     fn meta_mut(&mut self, page_index: PageId) -> Option<&mut PageMetadata> {
         self.metadata.get_mut(page_index)
+    }
+
+    /// 获取配置的页大小 (bytes)
+    pub fn page_size_bytes(&self) -> usize {
+        self.config.page_size_bytes.max(1)
     }
 
     fn touch_lru(&mut self, page_index: PageId) {
@@ -225,6 +229,55 @@ impl SwapManager {
         self.touch_lru(page_index);
 
         Ok(())
+    }
+
+    /// 计算内存压力 (0.0 - 1.0)
+    pub fn calculate_memory_pressure(&self, current_usage: usize, total_memory: usize) -> f32 {
+        if total_memory == 0 {
+            return 1.0;
+        }
+        let pressure = current_usage as f32 / total_memory as f32;
+        pressure.clamp(0.0, 1.0)
+    }
+
+    /// 判断是否需要触发 swap-out
+    pub fn needs_swap_out(
+        &self,
+        current_usage: usize,
+        total_memory: usize,
+        required_bytes: usize,
+    ) -> bool {
+        let pressure = self.calculate_memory_pressure(current_usage, total_memory);
+        let threshold = self.config.swap_threshold;
+        pressure >= threshold || current_usage.saturating_add(required_bytes) > total_memory
+    }
+
+    /// 检查内存压力并自动选择可换出的页面
+    pub fn check_and_auto_swap(
+        &mut self,
+        current_usage: usize,
+        total_memory: usize,
+        required_bytes: usize,
+    ) -> BackendResult<usize> {
+        if !self.needs_swap_out(current_usage, total_memory, required_bytes) {
+            return Ok(0);
+        }
+
+        let page_size = self.page_size_bytes();
+        let pages_needed = (required_bytes + page_size - 1) / page_size;
+        let victims = self.select_victim_pages(pages_needed.max(1));
+
+        if victims.is_empty() {
+            return Err(BackendError::OutOfMemory(
+                "No swappable pages available (all pages are Warm/Protected)".into(),
+            ));
+        }
+
+        for &page_idx in &victims {
+            self.set_page_state(page_idx, PageState::Standby)?;
+        }
+
+        Ok(victims.len())
     }
 
     fn is_in_protected_period_meta(
@@ -540,5 +593,63 @@ mod tests {
         assert_eq!(stats.warm_pages, 0);
         assert_eq!(stats.protected_pages, 0);
         assert_eq!(stats.swapped_pages, 0);
+    }
+
+    #[test]
+    fn test_calculate_memory_pressure() {
+        let manager = SwapManager::new(1, SwapConfig::default());
+        assert_eq!(manager.calculate_memory_pressure(0, 100), 0.0);
+        assert!((manager.calculate_memory_pressure(50, 100) - 0.5).abs() < 1e-6);
+        assert_eq!(manager.calculate_memory_pressure(1, 0), 1.0);
+    }
+
+    #[test]
+    fn test_needs_swap_out() {
+        let manager = SwapManager::new(1, SwapConfig::default());
+        let total = 1_000usize;
+        // Below threshold and enough memory
+        assert!(!manager.needs_swap_out(500, total, 100));
+        // Pressure exceeds threshold
+        assert!(manager.needs_swap_out(900, total, 0));
+        // Not exceeding threshold but allocation would overflow
+        assert!(manager.needs_swap_out(800, total, 300));
+    }
+
+    #[test]
+    fn test_check_and_auto_swap_marks_victims() {
+        let config = SwapConfig::default();
+        let mut manager = SwapManager::new(4, config);
+
+        // Protect page 1
+        for _ in 0..config.lru_granularity + 1 {
+            manager.mark_accessed(1).unwrap();
+        }
+        // Warm-protect page 0
+        manager.complete_swap_in(0).unwrap();
+
+        let standby_before = manager.stats().standby_pages;
+        let swapped = manager
+            .check_and_auto_swap(900, 1000, 2048)
+            .expect("should select victims");
+        assert_eq!(swapped, 1);
+
+        let stats = manager.stats();
+        assert_eq!(stats.standby_pages, standby_before + 1);
+        assert_eq!(manager.get_page_state(0), Some(PageState::Warm));
+        assert_eq!(manager.get_page_state(1), Some(PageState::Protected));
+    }
+
+    #[test]
+    fn test_check_and_auto_swap_no_victim_error() {
+        let config = SwapConfig::default();
+        let mut manager = SwapManager::new(2, config);
+
+        manager.set_page_state(0, PageState::Protected).unwrap();
+        manager.set_page_state(1, PageState::Protected).unwrap();
+
+        let err = manager
+            .check_and_auto_swap(900, 1000, 2048)
+            .expect_err("should fail without swappable pages");
+        assert!(matches!(err, BackendError::OutOfMemory(_)));
     }
 }

@@ -4,6 +4,7 @@ use std::time::{Duration, Instant};
 
 use cudarc::driver::{
     result, sys, CudaContext, CudaSlice, CudaStream, DevicePtr, DeviceRepr, LaunchConfig,
+    ValidAsZeroBits,
 };
 
 use crate::backend_trait::{
@@ -121,7 +122,7 @@ struct LayerWorkspace {
 }
 
 impl LayerWorkspace {
-    fn allocate(stream: &Arc<CudaStream>, config: WorkspaceConfig) -> BackendResult<Self> {
+    fn allocate(backend: &CudaBackend, config: WorkspaceConfig) -> BackendResult<Self> {
         let hidden_len = config
             .max_seq_len
             .checked_mul(config.hidden_size)
@@ -140,9 +141,9 @@ impl LayerWorkspace {
             .checked_mul(config.ffn_dim)
             .ok_or_else(|| BackendError::InvalidConfig("ffn buffer size overflow".into()))?;
 
-        let token_ids = stream.alloc_zeros::<u32>(config.max_seq_len)?;
+        let token_ids = backend.alloc_zeros_with_swap::<u32>(config.max_seq_len)?;
         let linear_positions = if config.max_seq_len == 0 {
-            stream.alloc_zeros::<i32>(0)?
+            backend.alloc_zeros_with_swap::<i32>(0)?
         } else {
             if config.max_seq_len > i32::MAX as usize {
                 return Err(BackendError::InvalidConfig(
@@ -153,18 +154,18 @@ impl LayerWorkspace {
             for idx in 0..config.max_seq_len {
                 host_positions.push(idx as i32);
             }
-            stream.clone_htod(&host_positions)?
+            backend.clone_htod_with_swap(&host_positions)?
         };
-        let positions = GpuBuffer::new(stream.alloc_zeros::<i32>(config.max_seq_len)?);
-        let hidden = GpuBuffer::new(stream.alloc_zeros::<f32>(hidden_len)?);
-        let norm = GpuBuffer::new(stream.alloc_zeros::<f32>(hidden_len)?);
-        let qkv = GpuBuffer::new(stream.alloc_zeros::<f32>(qkv_len)?);
-        let attn_out = GpuBuffer::new(stream.alloc_zeros::<f32>(hidden_len)?);
-        let ffn_gate = GpuBuffer::new(stream.alloc_zeros::<f32>(ffn_len)?);
-        let ffn_up = GpuBuffer::new(stream.alloc_zeros::<f32>(ffn_len)?);
-        let ffn_act = GpuBuffer::new(stream.alloc_zeros::<f32>(ffn_len)?);
-        let ffn_out = GpuBuffer::new(stream.alloc_zeros::<f32>(hidden_len)?);
-        let last_hidden = GpuBuffer::new(stream.alloc_zeros::<f32>(config.hidden_size)?);
+        let positions = GpuBuffer::new(backend.alloc_zeros_with_swap::<i32>(config.max_seq_len)?);
+        let hidden = GpuBuffer::new(backend.alloc_zeros_with_swap::<f32>(hidden_len)?);
+        let norm = GpuBuffer::new(backend.alloc_zeros_with_swap::<f32>(hidden_len)?);
+        let qkv = GpuBuffer::new(backend.alloc_zeros_with_swap::<f32>(qkv_len)?);
+        let attn_out = GpuBuffer::new(backend.alloc_zeros_with_swap::<f32>(hidden_len)?);
+        let ffn_gate = GpuBuffer::new(backend.alloc_zeros_with_swap::<f32>(ffn_len)?);
+        let ffn_up = GpuBuffer::new(backend.alloc_zeros_with_swap::<f32>(ffn_len)?);
+        let ffn_act = GpuBuffer::new(backend.alloc_zeros_with_swap::<f32>(ffn_len)?);
+        let ffn_out = GpuBuffer::new(backend.alloc_zeros_with_swap::<f32>(hidden_len)?);
+        let last_hidden = GpuBuffer::new(backend.alloc_zeros_with_swap::<f32>(config.hidden_size)?);
         let rope_cos = if config.position_encoding == PositionEncoding::Rope
             && config.rope_precompute
             && config.head_dim / 2 > 0
@@ -175,8 +176,8 @@ impl LayerWorkspace {
                 config.rope_theta,
                 config.rope_scale,
             );
-            let cos_dev = GpuBuffer::new(stream.clone_htod(&cos)?);
-            let sin_dev = GpuBuffer::new(stream.clone_htod(&sin)?);
+            let cos_dev = GpuBuffer::new(backend.clone_htod_with_swap(&cos)?);
+            let sin_dev = GpuBuffer::new(backend.clone_htod_with_swap(&sin)?);
             Some((cos_dev, sin_dev))
         } else {
             None
@@ -190,7 +191,7 @@ impl LayerWorkspace {
             if slopes.is_empty() {
                 None
             } else {
-                Some(GpuBuffer::new(stream.clone_htod(&slopes)?))
+                Some(GpuBuffer::new(backend.clone_htod_with_swap(&slopes)?))
             }
         } else {
             None
@@ -251,6 +252,17 @@ impl KvCacheEntry {
                 pages_per_layer, ..
             } => pages_per_layer,
             KvCacheStorage::Contiguous(_) => 1,
+        }
+    }
+
+    fn page_bytes(&self) -> Option<usize> {
+        match self.storage {
+            KvCacheStorage::Paged { page_size, .. } => {
+                let stride = self.config.kv_stride()?;
+                let elems = page_size.checked_mul(stride)?.checked_mul(2)?;
+                elems.checked_mul(self.config.dtype_size)
+            }
+            KvCacheStorage::Contiguous(_) => None,
         }
     }
 }
@@ -578,6 +590,101 @@ impl CudaBackend {
     fn record_sample_time(&self, dur: Duration) {
         let mut perf = self.perf.lock().expect("perf lock poisoned");
         perf.last_sample = dur;
+    }
+
+    fn device_memory_info(&self) -> BackendResult<(usize, usize)> {
+        self.ctx.bind_to_thread()?;
+        let (free, total) = result::mem_get_info()?;
+        let used = total.saturating_sub(free);
+        Ok((used as usize, total as usize))
+    }
+
+    fn ensure_memory_for_allocation(&self, required_bytes: usize) -> BackendResult<()> {
+        if required_bytes == 0 {
+            return Ok(());
+        }
+
+        let (mut current_usage, mut total_memory) = self.device_memory_info()?;
+        if current_usage.saturating_add(required_bytes) <= total_memory {
+            return Ok(());
+        }
+
+        let mut caches = self.kv_caches.lock().expect("kv cache lock poisoned");
+        let mut managers = self
+            .swap_managers
+            .lock()
+            .expect("swap managers lock poisoned");
+
+        for (cache, manager_opt) in caches.iter_mut().zip(managers.iter_mut()) {
+            let Some(manager) = manager_opt.as_mut() else {
+                continue;
+            };
+            if !cache.is_paged() {
+                continue;
+            }
+
+            let page_bytes = cache.page_bytes().ok_or_else(|| {
+                BackendError::InvalidKvCache("kv stride overflow when computing page bytes".into())
+            })?;
+
+            let marked =
+                manager.check_and_auto_swap(current_usage, total_memory, required_bytes)?;
+            if marked == 0 {
+                continue;
+            }
+
+            let gap_bytes = current_usage
+                .saturating_add(required_bytes)
+                .saturating_sub(total_memory);
+            let gap_bytes = gap_bytes.max(required_bytes); // ensure we free at least requested size
+            let pages_needed = (gap_bytes + page_bytes - 1) / page_bytes;
+            let victims = manager.select_victim_pages(pages_needed.max(1));
+            if victims.is_empty() {
+                continue;
+            }
+            let prepared = manager.prepare_swap_out(&victims)?;
+            if prepared.is_empty() {
+                continue;
+            }
+            self.swap_out_pages_with_manager(cache, manager, &prepared)?;
+
+            let (used, total) = self.device_memory_info()?;
+            current_usage = used;
+            total_memory = total;
+            if current_usage.saturating_add(required_bytes) <= total_memory {
+                return Ok(());
+            }
+        }
+
+        if current_usage.saturating_add(required_bytes) > total_memory {
+            return Err(BackendError::OutOfMemory(
+                "unable to free enough memory via swap".into(),
+            ));
+        }
+        Ok(())
+    }
+
+    fn alloc_zeros_with_swap<T: DeviceRepr + Default + Copy + ValidAsZeroBits>(
+        &self,
+        len: usize,
+    ) -> BackendResult<CudaSlice<T>> {
+        let bytes = len
+            .checked_mul(std::mem::size_of::<T>())
+            .ok_or_else(|| BackendError::InvalidConfig("allocation size overflow".into()))?;
+        self.ensure_memory_for_allocation(bytes)?;
+        Ok(self.stream.alloc_zeros::<T>(len)?)
+    }
+
+    fn clone_htod_with_swap<T: DeviceRepr + Clone>(
+        &self,
+        data: &[T],
+    ) -> BackendResult<CudaSlice<T>> {
+        let bytes = data
+            .len()
+            .checked_mul(std::mem::size_of::<T>())
+            .ok_or_else(|| BackendError::InvalidConfig("allocation size overflow".into()))?;
+        self.ensure_memory_for_allocation(bytes)?;
+        Ok(self.stream.clone_htod(data)?)
     }
 
     pub fn flash_attn<T: DeviceRepr>(
@@ -927,7 +1034,7 @@ impl CudaBackend {
             rope_precompute: config.rope_precompute,
         };
 
-        *workspace = Some(LayerWorkspace::allocate(&self.stream, ws_config)?);
+        *workspace = Some(LayerWorkspace::allocate(self, ws_config)?);
         Ok(())
     }
 
@@ -993,7 +1100,7 @@ impl CudaBackend {
             let fused_len = fused_out
                 .checked_mul(in_dim)
                 .ok_or_else(|| BackendError::InvalidConfig("fused qkv size overflow".into()))?;
-            let mut fused = GpuBuffer::new(self.stream.alloc_zeros::<f32>(fused_len)?);
+            let mut fused = GpuBuffer::new(self.alloc_zeros_with_swap::<f32>(fused_len)?);
 
             let q_len = q_out * in_dim;
             let k_len = k_out * in_dim;
@@ -1014,7 +1121,7 @@ impl CudaBackend {
                 .is_some();
 
             let fused_bias = if bias_present {
-                let mut bias_buf = GpuBuffer::new(self.stream.alloc_zeros::<f32>(fused_out)?);
+                let mut bias_buf = GpuBuffer::new(self.alloc_zeros_with_swap::<f32>(fused_out)?);
                 if let Some(q_bias) = Self::resolve_bias(weights, &q_name) {
                     let mut dst = bias_buf.as_inner_mut().slice_mut(0..q_out);
                     self.stream.memcpy_dtod(q_bias.as_inner(), &mut dst)?;
@@ -1052,7 +1159,7 @@ impl CudaBackend {
     fn ensure_logits_buffer_at(&self, vocab_size: usize, index: usize) -> BackendResult<()> {
         let mut logits = self.logits.lock().expect("logits lock poisoned");
         while logits.len() <= index {
-            logits.push(self.stream.alloc_zeros::<f32>(vocab_size)?);
+            logits.push(self.alloc_zeros_with_swap::<f32>(vocab_size)?);
         }
         if logits[index].len() != vocab_size {
             return Err(BackendError::InvalidConfig(
@@ -1126,20 +1233,26 @@ impl CudaBackend {
         if !cfg.enable_swap || !cache.is_paged() {
             return Ok(());
         }
-        let pressure = self.get_memory_pressure()?;
-        if !pressure.is_finite() {
-            return Err(BackendError::InvalidConfig(
-                "memory pressure is not finite".into(),
-            ));
-        }
-        if pressure < cfg.swap_threshold {
+        let page_bytes = cache.page_bytes().ok_or_else(|| {
+            BackendError::InvalidKvCache("kv stride overflow when computing page bytes".into())
+        })?;
+        let required_bytes = cfg
+            .lru_granularity
+            .max(1)
+            .checked_mul(page_bytes)
+            .ok_or_else(|| BackendError::InvalidConfig("swap granularity overflow".into()))?;
+        let (current_usage, total_memory) = self.device_memory_info()?;
+        let marked = manager.check_and_auto_swap(current_usage, total_memory, required_bytes)?;
+        if marked == 0 {
             return Ok(());
         }
-        let count = cfg.lru_granularity.max(1);
-        let victims = manager.select_victim_pages(count);
+        let pages_needed = (required_bytes + page_bytes - 1) / page_bytes;
+        let victims = manager.select_victim_pages(pages_needed.max(1));
         let prepared = manager.prepare_swap_out(&victims)?;
         if prepared.is_empty() {
-            return Ok(());
+            return Err(BackendError::OutOfMemory(
+                "No swappable pages available (all pages are Warm/Protected)".into(),
+            ));
         }
         self.swap_out_pages_with_manager(cache, manager, &prepared)?;
         Ok(())
@@ -1839,7 +1952,7 @@ impl Backend for CudaBackend {
     type Tensor<T> = GpuBuffer<T>;
 
     fn upload_weights<T: DeviceRepr + Clone>(&self, data: &[T]) -> BackendResult<Self::Tensor<T>> {
-        let slice = self.stream.clone_htod(data)?;
+        let slice = self.clone_htod_with_swap(data)?;
         Ok(GpuBuffer::new(slice))
     }
 
@@ -1862,11 +1975,16 @@ impl Backend for CudaBackend {
         let pages_per_layer = config
             .pages_per_layer()
             .ok_or_else(|| BackendError::InvalidKvCache("page size overflow".into()))?;
+        let mut page_bytes_for_swap = None;
         let storage = if config.is_paged() {
             let page_len = page_size
                 .checked_mul(kv_stride)
                 .and_then(|v| v.checked_mul(2))
                 .ok_or_else(|| BackendError::InvalidKvCache("page size overflow".into()))?;
+            let page_bytes = page_len
+                .checked_mul(std::mem::size_of::<f32>())
+                .ok_or_else(|| BackendError::InvalidKvCache("page size overflow".into()))?;
+            page_bytes_for_swap = Some(page_bytes);
             let total_pages = config
                 .num_layers
                 .checked_mul(pages_per_layer)
@@ -1874,13 +1992,13 @@ impl Backend for CudaBackend {
             let mut pages = Vec::with_capacity(total_pages);
             let mut host_ptrs = Vec::with_capacity(total_pages);
             for _ in 0..total_pages {
-                let page = self.stream.alloc_zeros::<f32>(page_len)?;
+                let page = self.alloc_zeros_with_swap::<f32>(page_len)?;
                 let (ptr, sync) = page.device_ptr(self.stream.as_ref());
                 host_ptrs.push(ptr as u64);
                 drop(sync);
                 pages.push(page);
             }
-            let page_ptrs = self.stream.clone_htod(&host_ptrs)?;
+            let page_ptrs = self.clone_htod_with_swap(&host_ptrs)?;
             KvCacheStorage::Paged {
                 pages,
                 page_ptrs,
@@ -1894,7 +2012,7 @@ impl Backend for CudaBackend {
                 .and_then(|v| v.checked_mul(config.max_seq_len))
                 .and_then(|v| v.checked_mul(kv_stride))
                 .ok_or_else(|| BackendError::InvalidKvCache("size overflow".into()))?;
-            let slice = self.stream.alloc_zeros::<f32>(elements)?;
+            let slice = self.alloc_zeros_with_swap::<f32>(elements)?;
             KvCacheStorage::Contiguous(slice)
         };
 
@@ -1908,6 +2026,10 @@ impl Backend for CudaBackend {
                     0
                 };
                 if total_pages > 0 && cfg.enable_swap {
+                    let mut cfg = cfg;
+                    if let Some(bytes) = page_bytes_for_swap {
+                        cfg.page_size_bytes = bytes;
+                    }
                     Some(SwapManager::new(total_pages, cfg))
                 } else {
                     None
@@ -2114,7 +2236,7 @@ impl Backend for CudaBackend {
 
         let mut sampling_guard = self.sampling.lock().expect("sampling lock poisoned");
         if sampling_guard.is_none() {
-            *sampling_guard = Some(self.stream.alloc_zeros::<u32>(1)?);
+            *sampling_guard = Some(self.alloc_zeros_with_swap::<u32>(1)?);
         }
         let out_buf = sampling_guard
             .as_mut()

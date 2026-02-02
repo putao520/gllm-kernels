@@ -146,6 +146,8 @@ pub struct SwapConfig {
     pub swap_threshold: f32,
     /// LRU 粒度 (页数)
     pub lru_granularity: usize,
+    /// 单页大小 (bytes)，用于估算需要释放的页数
+    pub page_size_bytes: usize,
 }
 
 impl Default for SwapConfig {
@@ -155,6 +157,7 @@ impl Default for SwapConfig {
             cpu_reserve_mb: 512,
             swap_threshold: 0.85,
             lru_granularity: 4,
+            page_size_bytes: 4096,
         }
     }
 }
