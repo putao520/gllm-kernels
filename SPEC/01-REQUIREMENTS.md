@@ -75,8 +75,8 @@
 | **REQ-SCHED-K007** | Chunked Prefill 后端支持 | 支持 Chunked Prefill 调度的后端接口 | 1. `batch_forward_gpu_pure()` 支持不同序列不同位置<br>2. 支持部分 KV Cache 复用<br>3. **AOT CUBIN 兼容** (无需新 Kernel) | 🟢 已实现 (2026-02-02) [commit: 085bbf8] |
 | **REQ-SCHED-K008** | SwiftKV 后端支持 | 支持 KV Cache 蒸馏和压缩 | 1. SwapManager 支持蒸馏模式 (`distill_kv_pages`)<br>2. 支持跨层 KV 相似度计算 (`compute_kv_similarity`)<br>3. CPU 端蒸馏算法实现<br>4. **AOT CUBIN 兼容** (蒸馏在 CPU 端执行) | 🟢 已实现 (2026-02-02) [commit: 085bbf8] |
 | **REQ-SCHED-K009** | LMCache 后端支持 | 支持跨请求 KV Cache 共享 | 1. GPU ↔ CPU DMA 复制接口<br>2. KV Cache 序列化/反序列化<br>3. 支持 Redis/LocalDisk 后端<br>4. **AOT CUBIN 兼容** (使用现有 Memcpy Kernel) | 🟢 已实现 (2026-02-02) [commit: 085bbf8] |
-| **REQ-SCHED-K010** | KV Handle 复用 | 缓存命中时复用已有 KV handle | 1. `get_cached_kv_handle()` 接口返回已有 handle<br>2. 支持部分 prefix 匹配<br>3. 跳过 embedding + attention + ffn 计算<br>4. **AOT CUBIN 兼容** | 🔵 待实现 |
-| **REQ-SCHED-K011** | CPU 端 KV 蒸馏 | 真实 CPU 端蒸馏算法 | 1. 滑动窗口 KV 聚合算法<br>2. 余弦相似度计算<br>3. 蒸馏比可配置 (2/4/8)<br>4. **AOT CUBIN 兼容** (纯 CPU 执行) | 🔵 待实现 |
+| **REQ-SCHED-K010** | KV Handle 复用 | 缓存命中时复用已有 KV handle | 1. `get_cached_kv_handle()` 接口返回已有 handle<br>2. 支持部分 prefix 匹配<br>3. 跳过 embedding + attention + ffn 计算<br>4. **AOT CUBIN 兼容** | 🟢 已实现 (2026-02-02) [commit: 0772fb1] |
+| **REQ-SCHED-K011** | CPU 端 KV 蒸馏 | 真实 CPU 端蒸馏算法 | 1. 滑动窗口 KV 聚合算法<br>2. 余弦相似度计算<br>3. 蒸馏比可配置 (2/4/8)<br>4. **AOT CUBIN 兼容** (纯 CPU 执行) | 🟢 已实现 (2026-02-02) [commit: 0772fb1] |
 
 ### 后端性能需求 (REQ-PERF-K)
 
