@@ -1,4 +1,9 @@
+use std::time::Instant;
+
 use half::{bf16, f16};
+
+pub type PageId = usize;
+pub type RequestId = usize;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PackedBits {
@@ -104,6 +109,30 @@ pub enum PageState {
     Standby,
     /// 已换出到 CPU 内存
     Swapped,
+    /// 刚换入 GPU，处于保护期，不可换出
+    Warm,
+    /// 工作集保护状态，不可换出
+    Protected,
+}
+
+/// 页面元数据，供调度器做优先级计算
+#[derive(Debug, Clone)]
+pub struct PageMetadata {
+    pub page_id: PageId,
+    pub sequence_id: Option<RequestId>,
+    pub state: PageState,
+    /// Inter-Reference Recency (LIRS)
+    pub recency: usize,
+    /// 是否属于 LIR 集合
+    pub is_lir: bool,
+    /// 最近一次 swap-in 的时间
+    pub swap_in_time: Option<Instant>,
+    /// Warm 保护期结束时间
+    pub warm_until: Option<Instant>,
+    /// 访问计数（用于热点检测）
+    pub access_count: usize,
+    /// 最近一次访问时间
+    pub last_access: Instant,
 }
 
 /// Swap 配置

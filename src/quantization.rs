@@ -117,7 +117,9 @@ fn packed_storage_bytes(values: usize, bits: u8) -> BackendResult<usize> {
 fn values_per_byte(bits: u8) -> BackendResult<usize> {
     match bits {
         1 | 2 | 4 | 8 => Ok(8 / bits as usize),
-        _ => Err(BackendError::InvalidConfig("unsupported packed bits".into())),
+        _ => Err(BackendError::InvalidConfig(
+            "unsupported packed bits".into(),
+        )),
     }
 }
 
@@ -233,12 +235,20 @@ pub fn quantize_blockwise<const N: usize>(
                     max_abs = v;
                 }
             }
-            let scale = if max_abs > 0.0 { max_abs / max_q_f } else { 1.0 };
+            let scale = if max_abs > 0.0 {
+                max_abs / max_q_f
+            } else {
+                1.0
+            };
             let inv_scale = 1.0 / scale;
             let mut data = [0u8; N];
             for t in 0..block_values {
                 let idx = block_start + t;
-                let v = if idx < row_base + cols { input[idx] } else { 0.0 };
+                let v = if idx < row_base + cols {
+                    input[idx]
+                } else {
+                    0.0
+                };
                 let mut q = (v * inv_scale).round() as i32;
                 if q < min_q as i32 {
                     q = min_q as i32;
@@ -327,8 +337,7 @@ pub fn dequantize_blockwise<const N: usize>(
             let block = matrix.blocks[row * blocks_per_row + block_idx];
             let scale = block.scale.to_f32();
             let block_start = row_base + block_idx * matrix.block_values;
-            let valid = (matrix.cols - block_idx * matrix.block_values)
-                .min(matrix.block_values);
+            let valid = (matrix.cols - block_idx * matrix.block_values).min(matrix.block_values);
             for t in 0..valid {
                 let q = unpack_value(matrix.bits, t, &block.data)?;
                 output[block_start + t] = q as f32 * scale;
@@ -625,9 +634,7 @@ mod tests {
     fn blockwise_int4_roundtrip() {
         let rows = 2;
         let cols = 9;
-        let input: Vec<f32> = (0..rows * cols)
-            .map(|i| (i as f32 - 10.0) * 0.25)
-            .collect();
+        let input: Vec<f32> = (0..rows * cols).map(|i| (i as f32 - 10.0) * 0.25).collect();
         let matrix = quantize_blockwise_int4::<16>(&input, rows, cols).unwrap();
         let mut output = vec![0f32; rows * cols];
         dequantize_blockwise_int4(&matrix, &mut output).unwrap();
@@ -644,9 +651,7 @@ mod tests {
         let input: Vec<f32> = (0..input_rows * cols)
             .map(|i| (i as f32 - 5.0) * 0.1)
             .collect();
-        let weight: Vec<f32> = (0..rows * cols)
-            .map(|i| (i as f32 * 0.2) - 1.5)
-            .collect();
+        let weight: Vec<f32> = (0..rows * cols).map(|i| (i as f32 * 0.2) - 1.5).collect();
         let matrix = quantize_blockwise_int4::<16>(&weight, rows, cols).unwrap();
 
         let mut dequant = vec![0f32; rows * cols];
@@ -680,9 +685,7 @@ mod tests {
             let input: Vec<f32> = (0..input_rows * cols)
                 .map(|i| (i as f32 - 4.0) * 0.2)
                 .collect();
-            let weight: Vec<f32> = (0..rows * cols)
-                .map(|i| (i as f32 * 0.15) - 1.0)
-                .collect();
+            let weight: Vec<f32> = (0..rows * cols).map(|i| (i as f32 * 0.15) - 1.0).collect();
             let matrix = quantize_blockwise::<N>(&weight, rows, cols, bits).unwrap();
 
             let mut dequant = vec![0f32; rows * cols];

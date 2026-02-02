@@ -155,12 +155,7 @@ impl FlashAttnPagedKernel {
         })
     }
 
-    pub fn launch<
-        T: DeviceRepr,
-        Q: DevicePtr<T>,
-        P: DevicePtr<u64>,
-        O: DevicePtrMut<T>,
-    >(
+    pub fn launch<T: DeviceRepr, Q: DevicePtr<T>, P: DevicePtr<u64>, O: DevicePtrMut<T>>(
         &self,
         stream: &CudaStream,
         config: LaunchConfig,

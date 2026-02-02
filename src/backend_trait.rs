@@ -1,4 +1,6 @@
-use crate::kernel_types::{GeneratorForwardConfig, KvCacheConfig, SamplingConfig};
+use crate::kernel_types::{
+    GeneratorForwardConfig, KvCacheConfig, PageId, PageState, SamplingConfig,
+};
 use cudarc::driver::CudaSlice;
 use cudarc::driver::DeviceRepr;
 use cudarc::driver::DriverError;
@@ -121,7 +123,7 @@ pub trait Backend: Send + Sync {
     fn get_page_states(
         &self,
         _kv_cache: &KvCacheHandle,
-    ) -> BackendResult<Vec<(usize, crate::kernel_types::PageState)>> {
+    ) -> BackendResult<Vec<(PageId, PageState)>> {
         Ok(Vec::new())
     }
 

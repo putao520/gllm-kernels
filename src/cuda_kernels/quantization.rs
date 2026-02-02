@@ -3,14 +3,10 @@ use cudarc::driver::{sys, CudaStream, DevicePtr, DevicePtrMut, DeviceRepr, Launc
 use crate::backend_trait::BackendResult;
 use crate::cuda_kernels::{load_function, KernelLaunch};
 
-pub const QUANTIZED_MM_KERNEL_NAME_INT1: &str =
-    "_Z12quantized_mmILi1EEvPKfPKhPf15QuantizedConfig";
-pub const QUANTIZED_MM_KERNEL_NAME_INT2: &str =
-    "_Z12quantized_mmILi2EEvPKfPKhPf15QuantizedConfig";
-pub const QUANTIZED_MM_KERNEL_NAME_INT4: &str =
-    "_Z12quantized_mmILi4EEvPKfPKhPf15QuantizedConfig";
-pub const QUANTIZED_MM_KERNEL_NAME_INT8: &str =
-    "_Z12quantized_mmILi8EEvPKfPKhPf15QuantizedConfig";
+pub const QUANTIZED_MM_KERNEL_NAME_INT1: &str = "_Z12quantized_mmILi1EEvPKfPKhPf15QuantizedConfig";
+pub const QUANTIZED_MM_KERNEL_NAME_INT2: &str = "_Z12quantized_mmILi2EEvPKfPKhPf15QuantizedConfig";
+pub const QUANTIZED_MM_KERNEL_NAME_INT4: &str = "_Z12quantized_mmILi4EEvPKfPKhPf15QuantizedConfig";
+pub const QUANTIZED_MM_KERNEL_NAME_INT8: &str = "_Z12quantized_mmILi8EEvPKfPKhPf15QuantizedConfig";
 
 #[repr(C)]
 #[derive(Debug, Clone, Copy)]

@@ -11,14 +11,14 @@ use crate::backend_trait::{
     LogitsTensor, TensorLookup,
 };
 use crate::cuda_kernels::{
-    cubin_for, AddConfig, CudaKernels, EmbeddingConfig, FlashAttnConfig,
-    FlashAttnPagedConfig, FusedQkvRopeConfig, LinearConfig, QuantizedBits, QuantizedConfig,
-    RmsNormConfig, RopeConfig, SamplingKernelConfig, SiluConfig, SmVersion, SwiGluConfig,
+    cubin_for, AddConfig, CudaKernels, EmbeddingConfig, FlashAttnConfig, FlashAttnPagedConfig,
+    FusedQkvRopeConfig, LinearConfig, QuantizedBits, QuantizedConfig, RmsNormConfig, RopeConfig,
+    SamplingKernelConfig, SiluConfig, SmVersion, SwiGluConfig,
 };
 use crate::gpu_types::GpuBuffer;
 use crate::kernel_types::{
-    alibi_slopes, precompute_rope_tables, GeneratorForwardConfig, KvCacheConfig, PositionEncoding,
-    SamplingConfig,
+    alibi_slopes, precompute_rope_tables, GeneratorForwardConfig, KvCacheConfig, PageId, PageState,
+    PositionEncoding, SamplingConfig,
 };
 use crate::swap_manager::SwapManager;
 
@@ -475,9 +475,7 @@ impl Drop for CudaModuleHandle {
 
 impl fmt::Debug for CudaBackend {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("CudaBackend")
-            .field("sm", &self.sm)
-            .finish()
+        f.debug_struct("CudaBackend").field("sm", &self.sm).finish()
     }
 }
 
@@ -770,14 +768,7 @@ impl CudaBackend {
         weight: &GpuBuffer<i8>,
         output: &mut GpuBuffer<f32>,
     ) -> BackendResult<()> {
-        self.quantized_mm(
-            QuantizedBits::Int8,
-            launch,
-            params,
-            input,
-            weight,
-            output,
-        )
+        self.quantized_mm(QuantizedBits::Int8, launch, params, input, weight, output)
     }
 
     pub fn int4_mm(
@@ -788,14 +779,7 @@ impl CudaBackend {
         weight: &GpuBuffer<u8>,
         output: &mut GpuBuffer<f32>,
     ) -> BackendResult<()> {
-        self.quantized_mm(
-            QuantizedBits::Int4,
-            launch,
-            params,
-            input,
-            weight,
-            output,
-        )
+        self.quantized_mm(QuantizedBits::Int4, launch, params, input, weight, output)
     }
 
     pub fn int2_mm(
@@ -806,14 +790,7 @@ impl CudaBackend {
         weight: &GpuBuffer<u8>,
         output: &mut GpuBuffer<f32>,
     ) -> BackendResult<()> {
-        self.quantized_mm(
-            QuantizedBits::Int2,
-            launch,
-            params,
-            input,
-            weight,
-            output,
-        )
+        self.quantized_mm(QuantizedBits::Int2, launch, params, input, weight, output)
     }
 
     pub fn int1_mm(
@@ -824,14 +801,7 @@ impl CudaBackend {
         weight: &GpuBuffer<u8>,
         output: &mut GpuBuffer<f32>,
     ) -> BackendResult<()> {
-        self.quantized_mm(
-            QuantizedBits::Int1,
-            launch,
-            params,
-            input,
-            weight,
-            output,
-        )
+        self.quantized_mm(QuantizedBits::Int1, launch, params, input, weight, output)
     }
 
     fn hidden_size(config: &GeneratorForwardConfig) -> BackendResult<usize> {
@@ -1793,7 +1763,10 @@ impl CudaBackend {
         }
 
         {
-            let mut managers = self.swap_managers.lock().expect("swap managers lock poisoned");
+            let mut managers = self
+                .swap_managers
+                .lock()
+                .expect("swap managers lock poisoned");
             if let Some(manager) = managers
                 .get_mut(kv_cache.0)
                 .and_then(|entry| entry.as_mut())
@@ -1805,7 +1778,10 @@ impl CudaBackend {
         let hidden_size = self.forward_hidden(tokens, topology, weights, Some(cache), config)?;
 
         if cache.is_paged() {
-            let mut managers = self.swap_managers.lock().expect("swap managers lock poisoned");
+            let mut managers = self
+                .swap_managers
+                .lock()
+                .expect("swap managers lock poisoned");
             if let Some(manager) = managers
                 .get_mut(kv_cache.0)
                 .and_then(|entry| entry.as_mut())
@@ -1923,21 +1899,27 @@ impl Backend for CudaBackend {
         };
 
         // 初始化 SwapManager (如果配置了)
-        let swap_manager = config.swap_config.map(|cfg| {
-            let total_pages = if config.is_paged() {
-                config.num_layers * pages_per_layer
-            } else {
-                0
-            };
-            if total_pages > 0 && cfg.enable_swap {
-                Some(SwapManager::new(total_pages, cfg))
-            } else {
-                None
-            }
-        }).flatten();
+        let swap_manager = config
+            .swap_config
+            .map(|cfg| {
+                let total_pages = if config.is_paged() {
+                    config.num_layers * pages_per_layer
+                } else {
+                    0
+                };
+                if total_pages > 0 && cfg.enable_swap {
+                    Some(SwapManager::new(total_pages, cfg))
+                } else {
+                    None
+                }
+            })
+            .flatten();
 
         let mut caches = self.kv_caches.lock().expect("kv cache lock poisoned");
-        let mut managers = self.swap_managers.lock().expect("swap managers lock poisoned");
+        let mut managers = self
+            .swap_managers
+            .lock()
+            .expect("swap managers lock poisoned");
         caches.push(KvCacheEntry {
             storage,
             config: *config,
@@ -1953,7 +1935,10 @@ impl Backend for CudaBackend {
         page_indices: &[usize],
     ) -> BackendResult<()> {
         let mut caches = self.kv_caches.lock().expect("kv cache lock poisoned");
-        let mut managers = self.swap_managers.lock().expect("swap managers lock poisoned");
+        let mut managers = self
+            .swap_managers
+            .lock()
+            .expect("swap managers lock poisoned");
 
         let cache = caches
             .get_mut(kv_cache.0)
@@ -1964,7 +1949,9 @@ impl Backend for CudaBackend {
             .ok_or_else(|| BackendError::InvalidHandle("swap manager handle".into()))?;
 
         let Some(manager) = manager.as_mut() else {
-            return Err(BackendError::Unimplemented("swap not configured for this cache"));
+            return Err(BackendError::Unimplemented(
+                "swap not configured for this cache",
+            ));
         };
 
         self.swap_out_pages_with_manager(cache, manager, page_indices)
@@ -1976,7 +1963,10 @@ impl Backend for CudaBackend {
         page_indices: &[usize],
     ) -> BackendResult<()> {
         let mut caches = self.kv_caches.lock().expect("kv cache lock poisoned");
-        let mut managers = self.swap_managers.lock().expect("swap managers lock poisoned");
+        let mut managers = self
+            .swap_managers
+            .lock()
+            .expect("swap managers lock poisoned");
 
         let cache = caches
             .get_mut(kv_cache.0)
@@ -1987,7 +1977,9 @@ impl Backend for CudaBackend {
             .ok_or_else(|| BackendError::InvalidHandle("swap manager handle".into()))?;
 
         let Some(manager) = manager.as_mut() else {
-            return Err(BackendError::Unimplemented("swap not configured for this cache"));
+            return Err(BackendError::Unimplemented(
+                "swap not configured for this cache",
+            ));
         };
 
         let KvCacheStorage::Paged { pages, .. } = &mut cache.storage else {
@@ -2030,11 +2022,11 @@ impl Backend for CudaBackend {
         Ok(pressure)
     }
 
-    fn get_page_states(
-        &self,
-        kv_cache: &KvCacheHandle,
-    ) -> BackendResult<Vec<(usize, crate::kernel_types::PageState)>> {
-        let managers = self.swap_managers.lock().expect("swap managers lock poisoned");
+    fn get_page_states(&self, kv_cache: &KvCacheHandle) -> BackendResult<Vec<(PageId, PageState)>> {
+        let managers = self
+            .swap_managers
+            .lock()
+            .expect("swap managers lock poisoned");
         let manager = managers
             .get(kv_cache.0)
             .ok_or_else(|| BackendError::InvalidHandle("swap manager handle".into()))?;
@@ -2081,16 +2073,10 @@ impl Backend for CudaBackend {
         }
 
         let mut outputs = Vec::with_capacity(batch.sequences.len());
-        for (idx, (sequence, cache)) in batch
-            .sequences
-            .iter()
-            .zip(kv_caches.iter_mut())
-            .enumerate()
+        for (idx, (sequence, cache)) in batch.sequences.iter().zip(kv_caches.iter_mut()).enumerate()
         {
             if sequence.tokens.is_empty() {
-                return Err(BackendError::InvalidConfig(
-                    "empty sequence tokens".into(),
-                ));
+                return Err(BackendError::InvalidConfig("empty sequence tokens".into()));
             }
             let logits = self.forward_logits_with_index(
                 &sequence.tokens,

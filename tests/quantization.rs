@@ -23,9 +23,7 @@ fn blockwise_int2_matmul_matches_dequantized() {
     let input: Vec<f32> = (0..input_rows * cols)
         .map(|i| (i as f32 - 3.0) * 0.25)
         .collect();
-    let weight: Vec<f32> = (0..rows * cols)
-        .map(|i| (i as f32 * 0.2) - 1.0)
-        .collect();
+    let weight: Vec<f32> = (0..rows * cols).map(|i| (i as f32 * 0.2) - 1.0).collect();
 
     let matrix = quantize_blockwise_int2::<16>(&weight, rows, cols).unwrap();
     let mut dequant = vec![0f32; rows * cols];

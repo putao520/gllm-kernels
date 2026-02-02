@@ -1,6 +1,6 @@
+use std::fmt;
 use std::sync::Mutex;
 use std::time::{SystemTime, UNIX_EPOCH};
-use std::fmt;
 
 use cudarc::driver::DeviceRepr;
 
@@ -338,8 +338,7 @@ pub struct CpuBackend {
 
 impl fmt::Debug for CpuBackend {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("CpuBackend")
-            .finish()
+        f.debug_struct("CpuBackend").finish()
     }
 }
 
@@ -761,18 +760,17 @@ impl CpuBackend {
             hidden_size,
         )?;
 
-        let rope_cache = if config.position_encoding == PositionEncoding::Rope
-            && config.rope_precompute
-        {
-            Some(cpu_kernels::RopeCache::new(
-                seq_len,
-                config.head_dim,
-                config.rope_theta,
-                config.rope_scale,
-            ))
-        } else {
-            None
-        };
+        let rope_cache =
+            if config.position_encoding == PositionEncoding::Rope && config.rope_precompute {
+                Some(cpu_kernels::RopeCache::new(
+                    seq_len,
+                    config.head_dim,
+                    config.rope_theta,
+                    config.rope_scale,
+                ))
+            } else {
+                None
+            };
         let alibi_slopes = if config.position_encoding == PositionEncoding::Alibi {
             Some(alibi_slopes(config.num_heads))
         } else {

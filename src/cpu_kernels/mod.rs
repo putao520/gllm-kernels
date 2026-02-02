@@ -305,7 +305,11 @@ fn quant_bounds(bits: u8) -> (i8, i8, f32) {
 fn encode_signed(bits: u8, value: i8) -> u8 {
     match bits {
         1 => {
-            if value >= 0 { 1 } else { 0 }
+            if value >= 0 {
+                1
+            } else {
+                0
+            }
         }
         2 => (value as i8 as u8) & 0x03,
         _ => 0,
@@ -314,10 +318,20 @@ fn encode_signed(bits: u8, value: i8) -> u8 {
 
 fn decode_signed(bits: u8, raw: u8) -> i8 {
     match bits {
-        1 => if raw & 0x01 != 0 { 1 } else { -1 },
+        1 => {
+            if raw & 0x01 != 0 {
+                1
+            } else {
+                -1
+            }
+        }
         2 => {
             let value = (raw & 0x03) as i8;
-            if value & 0x02 != 0 { value - 4 } else { value }
+            if value & 0x02 != 0 {
+                value - 4
+            } else {
+                value
+            }
         }
         _ => 0,
     }
@@ -1210,8 +1224,7 @@ pub fn flash_attention_paged(
     let q_stride = num_heads.saturating_mul(head_dim);
     let kv_stride = num_kv_heads.saturating_mul(head_dim);
     let o_stride = q_stride;
-    if q.len() < seq_len.saturating_mul(q_stride)
-        || output.len() < seq_len.saturating_mul(o_stride)
+    if q.len() < seq_len.saturating_mul(q_stride) || output.len() < seq_len.saturating_mul(o_stride)
     {
         return Err(BackendError::InvalidConfig(
             "flash attention buffer size mismatch".into(),
@@ -1284,8 +1297,7 @@ pub fn flash_attention_paged(
                     BackendError::InvalidConfig("paged attention page out of range".into())
                 })?;
                 let k_offset = offset * kv_stride + kv_head * head_dim;
-                let v_offset =
-                    page_size * kv_stride + offset * kv_stride + kv_head * head_dim;
+                let v_offset = page_size * kv_stride + offset * kv_stride + kv_head * head_dim;
                 let k_vec = &page_buf[k_offset..k_offset + head_dim];
                 let v_vec = &page_buf[v_offset..v_offset + head_dim];
                 let mut score = 0.0f32;
@@ -1613,8 +1625,7 @@ mod tests {
         let page_len = page_size * kv_stride * 2;
         let mut pages = vec![vec![0.0f32; page_len]; 2];
         pages[0][0..page_size * kv_stride].copy_from_slice(&k[0..page_size * kv_stride]);
-        pages[0][page_size * kv_stride..page_len]
-            .copy_from_slice(&v[0..page_size * kv_stride]);
+        pages[0][page_size * kv_stride..page_len].copy_from_slice(&v[0..page_size * kv_stride]);
         let k_tail = &k[page_size * kv_stride..kv_seq_len * kv_stride];
         let v_tail = &v[page_size * kv_stride..kv_seq_len * kv_stride];
         pages[1][0..k_tail.len()].copy_from_slice(k_tail);
