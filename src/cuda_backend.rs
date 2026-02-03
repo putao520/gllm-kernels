@@ -289,6 +289,7 @@ const EMBEDDING_WEIGHT_NAMES: &[&str] = &[
     "model.tok_embeddings.weight",
     "embeddings.word_embeddings.weight",
     "model.embeddings.word_embeddings.weight",
+    "roberta.embeddings.word_embeddings.weight",
 ];
 
 const FINAL_NORM_NAMES: &[&str] = &[
@@ -297,6 +298,9 @@ const FINAL_NORM_NAMES: &[&str] = &[
     "norm.weight",
     "model.final_layernorm.weight",
     "encoder.layer_norm.weight",
+    // BERT fallback: embeddings.LayerNorm (semantically input norm, used as fallback)
+    "embeddings.LayerNorm.weight",
+    "roberta.embeddings.LayerNorm.weight",
 ];
 
 const LM_HEAD_NAMES: &[&str] = &[
@@ -323,6 +327,9 @@ const ATTN_NORM_PATTERNS: &[&str] = &[
     "transformer.h.{layer}.ln_1.weight",
     "model.layers.{layer}.ln1.weight",
     "layers.{layer}.input_layernorm.weight",
+    // BERT/XLM-RoBERTa: post-attention norm (semantically different but structurally works)
+    "encoder.layer.{layer}.attention.output.LayerNorm.weight",
+    "roberta.encoder.layer.{layer}.attention.output.LayerNorm.weight",
 ];
 
 const FFN_NORM_PATTERNS: &[&str] = &[
@@ -332,6 +339,9 @@ const FFN_NORM_PATTERNS: &[&str] = &[
     "transformer.h.{layer}.ln_2.weight",
     "model.layers.{layer}.ln2.weight",
     "layers.{layer}.post_attention_layernorm.weight",
+    // BERT/XLM-RoBERTa: post-ffn norm (semantically different but structurally works)
+    "encoder.layer.{layer}.output.LayerNorm.weight",
+    "roberta.encoder.layer.{layer}.output.LayerNorm.weight",
 ];
 
 const Q_PROJ_PATTERNS: &[&str] = &[
@@ -339,6 +349,9 @@ const Q_PROJ_PATTERNS: &[&str] = &[
     "model.layers.{layer}.attention.q_proj.weight",
     "transformer.h.{layer}.attn.q_proj.weight",
     "layers.{layer}.self_attn.q_proj.weight",
+    // BERT/XLM-RoBERTa format
+    "encoder.layer.{layer}.attention.self.query.weight",
+    "roberta.encoder.layer.{layer}.attention.self.query.weight",
 ];
 
 const K_PROJ_PATTERNS: &[&str] = &[
@@ -346,6 +359,9 @@ const K_PROJ_PATTERNS: &[&str] = &[
     "model.layers.{layer}.attention.k_proj.weight",
     "transformer.h.{layer}.attn.k_proj.weight",
     "layers.{layer}.self_attn.k_proj.weight",
+    // BERT/XLM-RoBERTa format
+    "encoder.layer.{layer}.attention.self.key.weight",
+    "roberta.encoder.layer.{layer}.attention.self.key.weight",
 ];
 
 const V_PROJ_PATTERNS: &[&str] = &[
@@ -353,6 +369,9 @@ const V_PROJ_PATTERNS: &[&str] = &[
     "model.layers.{layer}.attention.v_proj.weight",
     "transformer.h.{layer}.attn.v_proj.weight",
     "layers.{layer}.self_attn.v_proj.weight",
+    // BERT/XLM-RoBERTa format
+    "encoder.layer.{layer}.attention.self.value.weight",
+    "roberta.encoder.layer.{layer}.attention.self.value.weight",
 ];
 
 const O_PROJ_PATTERNS: &[&str] = &[
@@ -361,6 +380,9 @@ const O_PROJ_PATTERNS: &[&str] = &[
     "model.layers.{layer}.attention.o_proj.weight",
     "transformer.h.{layer}.attn.c_proj.weight",
     "transformer.h.{layer}.attn.out_proj.weight",
+    // BERT/XLM-RoBERTa format
+    "encoder.layer.{layer}.attention.output.dense.weight",
+    "roberta.encoder.layer.{layer}.attention.output.dense.weight",
 ];
 
 const GATE_PROJ_PATTERNS: &[&str] = &[
@@ -368,6 +390,9 @@ const GATE_PROJ_PATTERNS: &[&str] = &[
     "model.layers.{layer}.mlp.w1.weight",
     "model.layers.{layer}.mlp.gate.weight",
     "transformer.h.{layer}.mlp.gate_proj.weight",
+    // BERT/XLM-RoBERTa format (intermediate.dense = gate_proj)
+    "encoder.layer.{layer}.intermediate.dense.weight",
+    "roberta.encoder.layer.{layer}.intermediate.dense.weight",
 ];
 
 const UP_PROJ_PATTERNS: &[&str] = &[
@@ -375,6 +400,9 @@ const UP_PROJ_PATTERNS: &[&str] = &[
     "model.layers.{layer}.mlp.w3.weight",
     "model.layers.{layer}.mlp.up.weight",
     "transformer.h.{layer}.mlp.up_proj.weight",
+    // BERT/XLM-RoBERTa: intermediate.dense serves as both gate and up (no gating)
+    "encoder.layer.{layer}.intermediate.dense.weight",
+    "roberta.encoder.layer.{layer}.intermediate.dense.weight",
 ];
 
 const DOWN_PROJ_PATTERNS: &[&str] = &[
@@ -382,6 +410,9 @@ const DOWN_PROJ_PATTERNS: &[&str] = &[
     "model.layers.{layer}.mlp.w2.weight",
     "model.layers.{layer}.mlp.down.weight",
     "transformer.h.{layer}.mlp.c_proj.weight",
+    // BERT/XLM-RoBERTa format (output.dense = down_proj)
+    "encoder.layer.{layer}.output.dense.weight",
+    "roberta.encoder.layer.{layer}.output.dense.weight",
 ];
 
 const QKV_FUSED_PATTERNS: &[&str] = &[
