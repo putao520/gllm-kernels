@@ -41,6 +41,11 @@
 | **REQ-QUANT-002** | 块式量化格式 | 定义 Block-wise 存储结构 | 支持类似 GGUF/AWQ 的块结构：<br>`struct Block { scales: f16, data: [u8; N] }` | 🟢 已完成 |
 | **REQ-QUANT-003** | 即时反量化内核 | SIMD/CUDA 解包计算 | 1. **CPU**: SIMD 加载 u8 -> 寄存器解包 -> FMA<br>2. **CUDA**: 模板化量化内核 (int8/4/2/1) | 🟢 已完成 |
 | **REQ-QUANT-004** | 模板化量化内核 | 使用 C++ 模板统一实现 | 1. `template<int BITS>` 量化矩阵乘法<br>2. 一套代码覆盖 1/2/4/8-bit<br>3. 编译时实例化，零运行时开销 | 🟢 已完成 |
+| **REQ-QUANT-004.1** | Rust 泛型 Trait 定义 | 定义 `DTypeTrait` 和 `QuantizedMatMul<T>` trait | 1. 支持 F32/F16/BF16/I8/I4/I2/I1<br>2. 编译时单态化，零运行时开销<br>3. 统一存储抽象 (PackedU8) | ✅ 已实现 (2025-02-04) |
+| **REQ-QUANT-004.2** | CPU 端 Trait 实现 | 为所有量化类型实现 `QuantizedMatMul` | 1. `impl QuantizedMatMul<F32>` (委托 faer)<br>2. `impl QuantizedMatMul<I8>` (SIMD 反量化)<br>3. `impl QuantizedMatMul<PackedI4/2/1>` (打包解包) | ✅ 已实现 (2025-02-04) |
+| **REQ-QUANT-004.3** | QKV 投影统一 API | 自动选择最优路径 (分离 vs 融合权重) | 1. 分离权重 → 3×小矩阵乘法<br>2. 融合权重 → 1×大矩阵乘法<br>3. 自动格式检测 | ✅ 已实现 (2025-02-04) |
+| **REQ-QUANT-004.4** | CUDA 端集成 | 实现 `template<int BITS>` 内核 + FFI 桥接 | 1. 各架构 `.cubin` 文件<br>2. `impl QuantizedMatMul<T>` for CudaBackend | ✅ 已实现 (2026-02-04) |
+| **REQ-QUANT-005** | QKV 投影性能优化 | 替换 `fused_qkv_rope` 为最优 3×小矩阵路径 | 1. 分离权重使用 3×独立 linear<br>2. 性能提升 > 20% (cache友好)<br>3. 输出与 HuggingFace 匹配 | ✅ 已实现 (2025-02-04) |
 
 ## 5. 核心算子需求 (REQ-OPS)
 

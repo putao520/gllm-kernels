@@ -9,6 +9,8 @@ use crate::backend_trait::{
     TensorLookup,
 };
 use crate::cpu_kernels;
+use crate::cpu_kernels::traits::{F32Type, QkvWeightFormat};
+use crate::cpu_kernels::qkv_projection_rope_generic;
 use crate::kernel_types::{
     alibi_slopes, GeneratorForwardConfig, KvCacheConfig, PositionEncoding, SamplingConfig,
 };
@@ -160,12 +162,28 @@ impl KvCacheEntry {
     }
 }
 
+/// QKV layer plan - supports both separated and fused weight formats.
+///
+/// - `DirectFused`: Single fused weight tensor (e.g., qkv_proj.weight)
+/// - `Separated`: Three independent Q/K/V weight tensors (optimal: 3× small matmul)
+/// - `PreFused`: Pre-fused Q/K/V weights (legacy format for backward compatibility)
 enum QkvLayerPlan {
-    Direct {
+    /// Direct reference to fused weight tensor (not loaded yet)
+    DirectFused {
         weight: String,
         bias: Option<String>,
     },
-    Fused {
+    /// Separated Q/K/V weights (optimal performance path)
+    Separated {
+        q_weight: String,
+        k_weight: String,
+        v_weight: String,
+        q_bias: Option<String>,
+        k_bias: Option<String>,
+        v_bias: Option<String>,
+    },
+    /// Pre-fused Q/K/V weights (legacy, for models without separated weights)
+    PreFused {
         weight: Vec<f32>,
         bias: Option<Vec<f32>>,
     },
@@ -482,6 +500,30 @@ impl CpuBackend {
         Err(BackendError::MissingTensor(candidates.join(", ")))
     }
 
+    fn resolve_weight_name_opt(
+        weights: &dyn TensorLookup<Self>,
+        candidates: &[String],
+    ) -> Option<String> {
+        for name in candidates {
+            if weights.tensor_f32(name).is_some() {
+                return Some(name.clone());
+            }
+        }
+        None
+    }
+
+    fn resolve_bias_name_opt(
+        weights: &dyn TensorLookup<Self>,
+        weight_name: &str,
+    ) -> Option<String> {
+        for candidate in bias_candidates(weight_name) {
+            if weights.tensor_f32(&candidate).is_some() {
+                return Some(candidate);
+            }
+        }
+        None
+    }
+
     fn resolve_weight<'a>(
         weights: &'a dyn TensorLookup<Self>,
         name: &str,
@@ -600,24 +642,67 @@ impl CpuBackend {
         }
         let mut layers = Vec::with_capacity(config.num_layers);
         for layer in 0..config.num_layers {
+            // Priority 1: Try separated Q/K/V weights (optimal path: 3× small matmul)
+            let q_result = Self::resolve_weight_name_opt(weights, &layer_candidates(Q_PROJ_PATTERNS, layer));
+            let k_result = Self::resolve_weight_name_opt(weights, &layer_candidates(K_PROJ_PATTERNS, layer));
+            let v_result = Self::resolve_weight_name_opt(weights, &layer_candidates(V_PROJ_PATTERNS, layer));
+
+            if let (Some(q_name), Some(k_name), Some(v_name)) = (q_result, k_result, v_result) {
+                // All three separated weights exist - use optimal separated path
+                let q_bias = Self::resolve_bias_name_opt(weights, &q_name);
+                let k_bias = Self::resolve_bias_name_opt(weights, &k_name);
+                let v_bias = Self::resolve_bias_name_opt(weights, &v_name);
+
+                // Validate dimensions
+                let q_shape = weights
+                    .tensor_shape(&q_name)
+                    .ok_or_else(|| BackendError::MissingTensor(q_name.clone()))?;
+                let k_shape = weights
+                    .tensor_shape(&k_name)
+                    .ok_or_else(|| BackendError::MissingTensor(k_name.clone()))?;
+                let v_shape = weights
+                    .tensor_shape(&v_name)
+                    .ok_or_else(|| BackendError::MissingTensor(v_name.clone()))?;
+
+                let q_out = Self::deduce_out_dim(q_shape, hidden_size)?;
+                let k_out = Self::deduce_out_dim(k_shape, hidden_size)?;
+                let v_out = Self::deduce_out_dim(v_shape, hidden_size)?;
+
+                let expected_kv = config.num_kv_heads * config.head_dim;
+                if q_out != hidden_size || k_out != expected_kv || v_out != expected_kv {
+                    return Err(BackendError::InvalidConfig(
+                        "qkv projection dims mismatch".into(),
+                    ));
+                }
+
+                layers.push(QkvLayerPlan::Separated {
+                    q_weight: q_name,
+                    k_weight: k_name,
+                    v_weight: v_name,
+                    q_bias,
+                    k_bias,
+                    v_bias,
+                });
+                continue;
+            }
+
+            // Priority 2: Try fused weight (single QKV tensor)
             let fused_candidates = layer_candidates(QKV_FUSED_PATTERNS, layer);
             if let Some(fused_name) = find_tensor_name(weights, &fused_candidates) {
                 let bias = bias_candidates(&fused_name)
                     .into_iter()
                     .find(|name| weights.tensor_f32(name).is_some());
-                layers.push(QkvLayerPlan::Direct {
+                layers.push(QkvLayerPlan::DirectFused {
                     weight: fused_name,
                     bias,
                 });
                 continue;
             }
 
-            let q_name =
-                Self::resolve_weight_name(weights, &layer_candidates(Q_PROJ_PATTERNS, layer))?;
-            let k_name =
-                Self::resolve_weight_name(weights, &layer_candidates(K_PROJ_PATTERNS, layer))?;
-            let v_name =
-                Self::resolve_weight_name(weights, &layer_candidates(V_PROJ_PATTERNS, layer))?;
+            // Priority 3: Fall back to manual fusion (should not reach here with valid models)
+            let q_name = Self::resolve_weight_name(weights, &layer_candidates(Q_PROJ_PATTERNS, layer))?;
+            let k_name = Self::resolve_weight_name(weights, &layer_candidates(K_PROJ_PATTERNS, layer))?;
+            let v_name = Self::resolve_weight_name(weights, &layer_candidates(V_PROJ_PATTERNS, layer))?;
 
             let q_weight = Self::resolve_weight(weights, &q_name)?;
             let k_weight = Self::resolve_weight(weights, &k_name)?;
@@ -693,7 +778,7 @@ impl CpuBackend {
                 None
             };
 
-            layers.push(QkvLayerPlan::Fused {
+            layers.push(QkvLayerPlan::PreFused {
                 weight: fused,
                 bias: fused_bias,
             });
@@ -865,34 +950,121 @@ impl CpuBackend {
                 1e-5,
             )?;
 
-            let (qkv_weight, qkv_bias) = match &qkv_plan.layers[layer] {
-                QkvLayerPlan::Direct { weight, bias } => {
-                    let weight = Self::resolve_weight(weights, weight)?;
-                    let bias = bias.as_ref().and_then(|name| weights.tensor_f32(name));
-                    (weight.as_slice(), bias.map(|b| b.as_slice()))
-                }
-                QkvLayerPlan::Fused { weight, bias } => {
-                    (weight.as_slice(), bias.as_ref().map(|b| b.as_slice()))
-                }
-            };
+            // QKV projection using generic API (supports separated and fused weights)
+            match &qkv_plan.layers[layer] {
+                QkvLayerPlan::Separated { q_weight, k_weight, v_weight, q_bias, k_bias, v_bias } => {
+                    // Optimal path: 3 independent small matrix multiplications
+                    let q_w = Self::resolve_weight(weights, q_weight)?;
+                    let k_w = Self::resolve_weight(weights, k_weight)?;
+                    let v_w = Self::resolve_weight(weights, v_weight)?;
 
-            cpu_kernels::fused_qkv_rope(
-                &norm[..seq_len * hidden_size],
-                qkv_weight,
-                qkv_bias,
-                &mut qkv[..seq_len * qkv_stride],
-                seq_len,
-                hidden_size,
-                config.num_heads,
-                config.num_kv_heads,
-                config.head_dim,
-                rotary_dim,
-                config.rope_theta,
-                config.rope_scale,
-                config.rope_interleaved,
-                rope_cache_ref,
-                positions_ref,
-            )?;
+                    let q_b = q_bias.as_ref().and_then(|name| weights.tensor_f32(name));
+                    let k_b = k_bias.as_ref().and_then(|name| weights.tensor_f32(name));
+                    let v_b = v_bias.as_ref().and_then(|name| weights.tensor_f32(name));
+
+                    // Allocate head-major output buffers for separated Q, K, V
+                    let mut q_buf = vec![0f32; seq_len * q_out];
+                    let mut k_buf = vec![0f32; seq_len * kv_out];
+                    let mut v_buf = vec![0f32; seq_len * kv_out];
+
+                    let weights: QkvWeightFormat<'_, F32Type> = QkvWeightFormat::Separated {
+                        q_weight: q_w,
+                        k_weight: k_w,
+                        v_weight: v_w,
+                        q_scales: None,
+                        k_scales: None,
+                        v_scales: None,
+                    };
+
+                    qkv_projection_rope_generic::<F32Type>(
+                        &norm[..seq_len * hidden_size],
+                        &weights,
+                        q_b.map(|b| b.as_slice()),
+                        k_b.map(|b| b.as_slice()),
+                        v_b.map(|b| b.as_slice()),
+                        &mut q_buf,
+                        &mut k_buf,
+                        &mut v_buf,
+                        seq_len,
+                        hidden_size,
+                        config.num_heads,
+                        config.num_kv_heads,
+                        config.head_dim,
+                        rotary_dim,
+                        config.rope_theta,
+                        config.rope_scale,
+                        config.rope_interleaved,
+                        positions_ref,
+                    )?;
+
+                    // Copy to legacy qkv buffer format for backward compatibility
+                    qkv[..q_len].copy_from_slice(&q_buf);
+                    qkv[q_len..q_len + kv_len].copy_from_slice(&k_buf);
+                    qkv[q_len + kv_len..q_len + 2 * kv_len].copy_from_slice(&v_buf);
+                }
+                QkvLayerPlan::DirectFused { weight, bias } => {
+                    // Fused weight: split and do 3 independent linear calls
+                    let w = Self::resolve_weight(weights, weight)?;
+                    let b = bias.as_ref().and_then(|name| weights.tensor_f32(name));
+
+                    let weights: QkvWeightFormat<'_, F32Type> = QkvWeightFormat::Fused {
+                        qkv_weight: w,
+                        scales: None,
+                    };
+
+                    // Allocate head-major output buffers for separated Q, K, V
+                    let mut q_buf = vec![0f32; seq_len * q_out];
+                    let mut k_buf = vec![0f32; seq_len * kv_out];
+                    let mut v_buf = vec![0f32; seq_len * kv_out];
+
+                    qkv_projection_rope_generic::<F32Type>(
+                        &norm[..seq_len * hidden_size],
+                        &weights,
+                        b.map(|b| b.as_slice()),
+                        None,
+                        None,
+                        &mut q_buf,
+                        &mut k_buf,
+                        &mut v_buf,
+                        seq_len,
+                        hidden_size,
+                        config.num_heads,
+                        config.num_kv_heads,
+                        config.head_dim,
+                        rotary_dim,
+                        config.rope_theta,
+                        config.rope_scale,
+                        config.rope_interleaved,
+                        positions_ref,
+                    )?;
+
+                    // Copy to legacy qkv buffer format for backward compatibility
+                    qkv[..q_len].copy_from_slice(&q_buf);
+                    qkv[q_len..q_len + kv_len].copy_from_slice(&k_buf);
+                    qkv[q_len + kv_len..q_len + 2 * kv_len].copy_from_slice(&v_buf);
+                }
+                QkvLayerPlan::PreFused { weight, bias } => {
+                    // Legacy pre-fused weights: use old fused_qkv_rope for backward compatibility
+                    let b = bias.as_ref().map(|b| b.as_slice());
+                    cpu_kernels::fused_qkv_rope(
+                        &norm[..seq_len * hidden_size],
+                        weight,
+                        b,
+                        &mut qkv[..seq_len * qkv_stride],
+                        seq_len,
+                        hidden_size,
+                        config.num_heads,
+                        config.num_kv_heads,
+                        config.head_dim,
+                        rotary_dim,
+                        config.rope_theta,
+                        config.rope_scale,
+                        config.rope_interleaved,
+                        rope_cache_ref,
+                        positions_ref,
+                    )?;
+                }
+            }
 
             if let Some(cache) = kv_cache.as_deref_mut() {
                 let qkv_slice = &qkv[..seq_len * qkv_stride];
@@ -1264,34 +1436,121 @@ impl CpuBackend {
                 1e-5,
             )?;
 
-            let (qkv_weight, qkv_bias) = match &qkv_plan.layers[layer] {
-                QkvLayerPlan::Direct { weight, bias } => {
-                    let weight = Self::resolve_weight(weights, weight)?;
-                    let bias = bias.as_ref().and_then(|name| weights.tensor_f32(name));
-                    (weight.as_slice(), bias.map(|b| b.as_slice()))
-                }
-                QkvLayerPlan::Fused { weight, bias } => {
-                    (weight.as_slice(), bias.as_ref().map(|b| b.as_slice()))
-                }
-            };
+            // QKV projection using generic API (supports separated and fused weights)
+            match &qkv_plan.layers[layer] {
+                QkvLayerPlan::Separated { q_weight, k_weight, v_weight, q_bias, k_bias, v_bias } => {
+                    // Optimal path: 3 independent small matrix multiplications
+                    let q_w = Self::resolve_weight(weights, q_weight)?;
+                    let k_w = Self::resolve_weight(weights, k_weight)?;
+                    let v_w = Self::resolve_weight(weights, v_weight)?;
 
-            cpu_kernels::fused_qkv_rope(
-                &workspace.norm[..seq_len * hidden_size],
-                qkv_weight,
-                qkv_bias,
-                &mut workspace.qkv[..seq_len * qkv_stride],
-                seq_len,
-                hidden_size,
-                config.num_heads,
-                config.num_kv_heads,
-                config.head_dim,
-                rotary_dim,
-                config.rope_theta,
-                config.rope_scale,
-                config.rope_interleaved,
-                rope_cache,
-                positions,
-            )?;
+                    let q_b = q_bias.as_ref().and_then(|name| weights.tensor_f32(name));
+                    let k_b = k_bias.as_ref().and_then(|name| weights.tensor_f32(name));
+                    let v_b = v_bias.as_ref().and_then(|name| weights.tensor_f32(name));
+
+                    // Allocate head-major output buffers for separated Q, K, V
+                    let mut q_buf = vec![0f32; seq_len * q_out];
+                    let mut k_buf = vec![0f32; seq_len * kv_out];
+                    let mut v_buf = vec![0f32; seq_len * kv_out];
+
+                    let weights: QkvWeightFormat<'_, F32Type> = QkvWeightFormat::Separated {
+                        q_weight: q_w,
+                        k_weight: k_w,
+                        v_weight: v_w,
+                        q_scales: None,
+                        k_scales: None,
+                        v_scales: None,
+                    };
+
+                    qkv_projection_rope_generic::<F32Type>(
+                        &workspace.norm[..seq_len * hidden_size],
+                        &weights,
+                        q_b.map(|b| b.as_slice()),
+                        k_b.map(|b| b.as_slice()),
+                        v_b.map(|b| b.as_slice()),
+                        &mut q_buf,
+                        &mut k_buf,
+                        &mut v_buf,
+                        seq_len,
+                        hidden_size,
+                        config.num_heads,
+                        config.num_kv_heads,
+                        config.head_dim,
+                        rotary_dim,
+                        config.rope_theta,
+                        config.rope_scale,
+                        config.rope_interleaved,
+                        positions,
+                    )?;
+
+                    // Copy to legacy qkv buffer format for backward compatibility
+                    workspace.qkv[..q_len].copy_from_slice(&q_buf);
+                    workspace.qkv[q_len..q_len + kv_len].copy_from_slice(&k_buf);
+                    workspace.qkv[q_len + kv_len..q_len + 2 * kv_len].copy_from_slice(&v_buf);
+                }
+                QkvLayerPlan::DirectFused { weight, bias } => {
+                    // Fused weight: split and do 3 independent linear calls
+                    let w = Self::resolve_weight(weights, weight)?;
+                    let b = bias.as_ref().and_then(|name| weights.tensor_f32(name));
+
+                    let weights: QkvWeightFormat<'_, F32Type> = QkvWeightFormat::Fused {
+                        qkv_weight: w,
+                        scales: None,
+                    };
+
+                    // Allocate head-major output buffers for separated Q, K, V
+                    let mut q_buf = vec![0f32; seq_len * q_out];
+                    let mut k_buf = vec![0f32; seq_len * kv_out];
+                    let mut v_buf = vec![0f32; seq_len * kv_out];
+
+                    qkv_projection_rope_generic::<F32Type>(
+                        &workspace.norm[..seq_len * hidden_size],
+                        &weights,
+                        b.map(|b| b.as_slice()),
+                        None,
+                        None,
+                        &mut q_buf,
+                        &mut k_buf,
+                        &mut v_buf,
+                        seq_len,
+                        hidden_size,
+                        config.num_heads,
+                        config.num_kv_heads,
+                        config.head_dim,
+                        rotary_dim,
+                        config.rope_theta,
+                        config.rope_scale,
+                        config.rope_interleaved,
+                        positions,
+                    )?;
+
+                    // Copy to legacy qkv buffer format for backward compatibility
+                    workspace.qkv[..q_len].copy_from_slice(&q_buf);
+                    workspace.qkv[q_len..q_len + kv_len].copy_from_slice(&k_buf);
+                    workspace.qkv[q_len + kv_len..q_len + 2 * kv_len].copy_from_slice(&v_buf);
+                }
+                QkvLayerPlan::PreFused { weight, bias } => {
+                    // Legacy pre-fused weights: use old fused_qkv_rope for backward compatibility
+                    let b = bias.as_ref().map(|b| b.as_slice());
+                    cpu_kernels::fused_qkv_rope(
+                        &workspace.norm[..seq_len * hidden_size],
+                        weight,
+                        b,
+                        &mut workspace.qkv[..seq_len * qkv_stride],
+                        seq_len,
+                        hidden_size,
+                        config.num_heads,
+                        config.num_kv_heads,
+                        config.head_dim,
+                        rotary_dim,
+                        config.rope_theta,
+                        config.rope_scale,
+                        config.rope_interleaved,
+                        rope_cache,
+                        positions,
+                    )?;
+                }
+            }
 
             if let Some(cache) = kv_cache.as_deref_mut() {
                 let qkv_slice = &workspace.qkv[..seq_len * qkv_stride];
