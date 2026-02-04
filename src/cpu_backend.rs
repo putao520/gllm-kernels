@@ -35,7 +35,12 @@ struct CpuWorkspace {
     positions: Vec<i32>,
     hidden: Vec<f32>,
     norm: Vec<f32>,
+    // Combined QKV buffer (for backward compatibility with fused_qkv_rope)
     qkv: Vec<f32>,
+    // Separated Q, K, V buffers in head-major format (for new separated kernels)
+    q: Vec<f32>,
+    k: Vec<f32>,
+    v: Vec<f32>,
     attn_out: Vec<f32>,
     ffn_gate: Vec<f32>,
     ffn_up: Vec<f32>,
@@ -82,6 +87,20 @@ impl CpuWorkspace {
             None
         };
 
+        let q_out = config
+            .num_heads
+            .checked_mul(config.head_dim)
+            .ok_or_else(|| BackendError::InvalidConfig("q_out overflow".into()))?;
+        let kv_out = config.num_kv_heads * config.head_dim;
+        let q_len = config
+            .max_seq_len
+            .checked_mul(q_out)
+            .ok_or_else(|| BackendError::InvalidConfig("q buffer overflow".into()))?;
+        let kv_len = config
+            .max_seq_len
+            .checked_mul(kv_out)
+            .ok_or_else(|| BackendError::InvalidConfig("kv buffer overflow".into()))?;
+
         Ok(Self {
             config,
             token_ids: vec![0u32; config.max_seq_len],
@@ -89,6 +108,9 @@ impl CpuWorkspace {
             hidden: vec![0f32; hidden_len],
             norm: vec![0f32; hidden_len],
             qkv: vec![0f32; qkv_len],
+            q: vec![0f32; q_len],
+            k: vec![0f32; kv_len],
+            v: vec![0f32; kv_len],
             attn_out: vec![0f32; hidden_len],
             ffn_gate: vec![0f32; ffn_len],
             ffn_up: vec![0f32; ffn_len],

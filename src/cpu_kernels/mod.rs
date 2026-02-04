@@ -950,7 +950,7 @@ pub fn fused_gate_up_silu(gate: &[f32], up: &[f32], output: &mut [f32]) -> Backe
         ));
     }
     for i in 0..gate.len() {
-        output[i] = gate[i] * silu(up[i]);
+        output[i] = silu(gate[i]) * up[i];  // SwiGLU: SiLU(gate) * up
     }
     Ok(())
 }
@@ -1102,6 +1102,200 @@ pub fn fused_qkv_rope(
         rope_interleaved,
         rope_cache,
     )
+}
+
+/// Separated QKV projection with RoPE.
+/// Unlike fused_qkv_rope, this outputs Q, K, V to separate buffers,
+/// each in head-major format: [seq_len * num_heads * head_dim] for Q,
+/// [seq_len * num_kv_heads * head_dim] for K and V.
+pub fn qkv_rope_separated(
+    input: &[f32],
+    weight: &[f32],
+    bias: Option<&[f32]>,
+    q_output: &mut [f32],
+    k_output: &mut [f32],
+    v_output: &mut [f32],
+    seq_len: usize,
+    hidden_size: usize,
+    num_heads: usize,
+    num_kv_heads: usize,
+    head_dim: usize,
+    rotary_dim: usize,
+    rope_theta: f32,
+    rope_scale: f32,
+    rope_interleaved: bool,
+    rope_cache: Option<&RopeCache>,
+    positions: &[i32],
+) -> BackendResult<()> {
+    let q_out = num_heads
+        .checked_mul(head_dim)
+        .ok_or_else(|| BackendError::InvalidConfig("q_out overflow".into()))?;
+    let kv_out = num_kv_heads
+        .checked_mul(head_dim)
+        .ok_or_else(|| BackendError::InvalidConfig("kv_out overflow".into()))?;
+
+    // Project to Q, K, V separately
+    // Weights are stored as [output_dim, input_dim] in row-major format
+    // linear() expects: input [m, k], weight [n, k], output [m, n]
+    // Q weight: [q_out, hidden_size], output: [seq_len, q_out]
+    linear(
+        input,
+        &weight[..q_out * hidden_size],
+        bias,
+        q_output,
+        seq_len,
+        q_out,
+        hidden_size,
+    )?;
+    // K weight: [kv_out, hidden_size], output: [seq_len, kv_out]
+    linear(
+        input,
+        &weight[q_out * hidden_size..q_out * hidden_size + kv_out * hidden_size],
+        bias,
+        k_output,
+        seq_len,
+        kv_out,
+        hidden_size,
+    )?;
+    // V weight: [kv_out, hidden_size], output: [seq_len, kv_out]
+    linear(
+        input,
+        &weight[q_out * hidden_size + kv_out * hidden_size..],
+        bias,
+        v_output,
+        seq_len,
+        kv_out,
+        hidden_size,
+    )?;
+
+    // Apply RoPE to separated Q and K buffers
+    apply_rope_separated(
+        q_output,
+        k_output,
+        positions,
+        seq_len,
+        num_heads,
+        num_kv_heads,
+        head_dim,
+        rotary_dim,
+        rope_theta,
+        rope_scale,
+        rope_interleaved,
+        rope_cache,
+    )
+}
+
+/// Apply RoPE to separated Q and K buffers (head-major format).
+pub fn apply_rope_separated(
+    q: &mut [f32],
+    k: &mut [f32],
+    positions: &[i32],
+    seq_len: usize,
+    num_heads: usize,
+    num_kv_heads: usize,
+    head_dim: usize,
+    rotary_dim: usize,
+    rope_theta: f32,
+    rope_scale: f32,
+    _rope_interleaved: bool,
+    rope_cache: Option<&RopeCache>,
+) -> BackendResult<()> {
+    if rotary_dim == 0 || rotary_dim > head_dim {
+        return Ok(());
+    }
+
+    if positions.len() < seq_len {
+        return Err(BackendError::InvalidConfig(
+            "positions array too short".into(),
+        ));
+    }
+
+    let half = rotary_dim / 2;
+
+    for pos_idx in 0..seq_len {
+        let pos = positions[pos_idx];
+        let pos_usize = if pos < 0 { 0 } else { pos as usize };
+
+        // Apply RoPE to Q (all heads)
+        for head in 0..num_heads {
+            let q_base = pos_idx * num_heads * head_dim + head * head_dim;
+            let q_slice = &mut q[q_base..q_base + rotary_dim];
+
+            if let Some(cache) = rope_cache.as_ref() {
+                for pair_idx in 0..half {
+                    if let Some((cos, sin)) = cache.lookup(pos_usize, pair_idx) {
+                        let i0 = pair_idx;
+                        let i1 = half + pair_idx;
+                        let q0 = q_slice[i0];
+                        let q1 = q_slice[i1];
+                        q_slice[i0] = q0 * cos - q1 * sin;
+                        q_slice[i1] = q0 * sin + q1 * cos;
+                    }
+                }
+            } else {
+                for dim in 0..half {
+                    let idx0 = dim;
+                    let idx1 = half + dim;
+                    let freq = pos as f32 / rope_theta.powf(2.0 * dim as f32 / rotary_dim as f32);
+
+                    let (cos_val, sin_val) = if pos == 0 {
+                        (1.0f32, 0.0f32)
+                    } else {
+                        (
+                            (freq * 2.0 * std::f32::consts::PI).cos(),
+                            (freq * 2.0 * std::f32::consts::PI).sin(),
+                        )
+                    };
+
+                    let q0 = q_slice[idx0];
+                    let q1 = q_slice[idx1];
+                    q_slice[idx0] = q0 * cos_val - q1 * sin_val;
+                    q_slice[idx1] = q0 * sin_val + q1 * cos_val;
+                }
+            }
+        }
+
+        // Apply RoPE to K (KV heads only)
+        for kv_head in 0..num_kv_heads {
+            let k_base = pos_idx * num_kv_heads * head_dim + kv_head * head_dim;
+            let k_slice = &mut k[k_base..k_base + rotary_dim];
+
+            if let Some(cache) = rope_cache.as_ref() {
+                for pair_idx in 0..half {
+                    if let Some((cos, sin)) = cache.lookup(pos_usize, pair_idx) {
+                        let i0 = pair_idx;
+                        let i1 = half + pair_idx;
+                        let k0 = k_slice[i0];
+                        let k1 = k_slice[i1];
+                        k_slice[i0] = k0 * cos - k1 * sin;
+                        k_slice[i1] = k0 * sin + k1 * cos;
+                    }
+                }
+            } else {
+                for dim in 0..half {
+                    let idx0 = dim;
+                    let idx1 = half + dim;
+                    let freq = pos as f32 / rope_theta.powf(2.0 * dim as f32 / rotary_dim as f32);
+
+                    let (cos_val, sin_val) = if pos == 0 {
+                        (1.0f32, 0.0f32)
+                    } else {
+                        (
+                            (freq * 2.0 * std::f32::consts::PI).cos(),
+                            (freq * 2.0 * std::f32::consts::PI).sin(),
+                        )
+                    };
+
+                    let k0 = k_slice[idx0];
+                    let k1 = k_slice[idx1];
+                    k_slice[idx0] = k0 * cos_val - k1 * sin_val;
+                    k_slice[idx1] = k0 * sin_val + k1 * cos_val;
+                }
+            }
+        }
+    }
+
+    Ok(())
 }
 
 pub fn flash_attention(
@@ -1351,8 +1545,11 @@ mod tests {
         let up = vec![0.5f32, -1.0];
         let mut output = vec![0.0f32; 2];
         fused_gate_up_silu(&gate, &up, &mut output).unwrap();
-        let expected0 = gate[0] * (up[0] / (1.0 + (-up[0]).exp()));
-        let expected1 = gate[1] * (up[1] / (1.0 + (-up[1]).exp()));
+        // SwiGLU: SiLU(gate) * up, where SiLU(x) = x / (1 + exp(-x))
+        let silu_gate0 = gate[0] / (1.0 + (-gate[0]).exp());
+        let silu_gate1 = gate[1] / (1.0 + (-gate[1]).exp());
+        let expected0 = silu_gate0 * up[0];
+        let expected1 = silu_gate1 * up[1];
         assert!((output[0] - expected0).abs() < 1e-6);
         assert!((output[1] - expected1).abs() < 1e-6);
     }

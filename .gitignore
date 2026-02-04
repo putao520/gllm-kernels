@@ -9,3 +9,4 @@ Cargo.lock
 SPEC/
 error_log.txt
 errors.txt
+/docs/
