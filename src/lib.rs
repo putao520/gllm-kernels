@@ -21,5 +21,9 @@ pub use kernel_types::{
     DType, GeneratorForwardConfig, PackedBits, PageMetadata, PageState, PositionEncoding,
     SamplingConfig, SwapConfig,
 };
-pub use quantization::{Block, BlockwiseMatrix, PackedU8};
+pub use quantization::{
+    dequantize_q4_0, dequantize_q5_k, dequantize_q8_0, Block, BlockwiseMatrix, PackedU8,
+    Q4_0Block, Q4_0Matrix, Q4_0_BLOCK_BYTES, Q5_KBlock, Q5_KMatrix, Q8_0Block, Q8_0Matrix,
+    Q8_0_BLOCK_BYTES, QK4_0, QK8_0, QuantizedType,
+};
 pub use swap_manager::{SwapManager, SwapStats};
