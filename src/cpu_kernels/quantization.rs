@@ -11,7 +11,7 @@
 //! - **Zero overhead**: Generic calls are monomorphized at compile time
 
 use crate::backend_trait::BackendError;
-use crate::cpu_kernels::traits::{DTypeTrait, F16Type, F32Type, BF16Type, I8Type, PackedI1Type, PackedI2Type, PackedI4Type};
+use crate::cpu_kernels::traits::{DTypeTrait, F32Type, I8Type, PackedI1Type, PackedI2Type, PackedI4Type};
 use faer::linalg::matmul::matmul;
 use faer::{Accum, MatMut, MatRef, Par};
 use half::f16;
@@ -115,7 +115,7 @@ fn linear_no_scale<T: DTypeTrait>(
             // For F16/BF16, convert to f32 first (could be optimized with SIMD)
             if T::BITS == 16 {
                 let mut weight_f32 = vec![0.0f32; weight.len()];
-                for (i, &w) in weight.iter().enumerate() {
+                for (i, &_w) in weight.iter().enumerate() {
                     // Convert from F16/BF16 to f32 based on type
                     if T::BITS == 16 && !T::IS_PACKED {
                         // This branch handles F16/BF16
@@ -201,7 +201,7 @@ fn linear_quantized<T: DTypeTrait>(
         for j in 0..n {
             let mut sum = 0.0f32;
             let scale = scales.get(j).copied().unwrap_or_else(|| half::f16::from_f32(1.0));
-            let scale_f32 = scale.to_f32();
+            let _scale_f32 = scale.to_f32();
 
             for kk in 0..k {
                 let w_storage = if T::IS_PACKED {
@@ -325,11 +325,6 @@ pub mod i1_impl {
 }
 
 // Re-export modules
-pub use f32_impl::*;
-pub use i1_impl::*;
-pub use i2_impl::*;
-pub use i4_impl::*;
-pub use i8_impl::*;
 
 #[cfg(test)]
 mod tests {

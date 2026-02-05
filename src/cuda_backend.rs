@@ -1701,7 +1701,7 @@ impl CudaBackend {
         let kv_out = config.num_kv_heads * config.head_dim;
         let q_len = seq_len * q_out;
         let kv_len = seq_len * kv_out;
-        let qkv_stride = q_out + 2 * kv_out;
+        let _qkv_stride = q_out + 2 * kv_out;
         let rotary_dim = if config.position_encoding == PositionEncoding::Rope {
             config.head_dim
         } else {

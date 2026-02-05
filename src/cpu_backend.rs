@@ -40,8 +40,11 @@ struct CpuWorkspace {
     // Combined QKV buffer (for backward compatibility with fused_qkv_rope)
     qkv: Vec<f32>,
     // Separated Q, K, V buffers in head-major format (for new separated kernels)
+    #[allow(dead_code)]
     q: Vec<f32>,
+    #[allow(dead_code)]
     k: Vec<f32>,
+    #[allow(dead_code)]
     v: Vec<f32>,
     attn_out: Vec<f32>,
     ffn_gate: Vec<f32>,

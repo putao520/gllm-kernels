@@ -1389,7 +1389,7 @@ pub fn apply_rope_separated(
     head_dim: usize,
     rotary_dim: usize,
     rope_theta: f32,
-    rope_scale: f32,
+    _rope_scale: f32,
     _rope_interleaved: bool,
     rope_cache: Option<&RopeCache>,
 ) -> BackendResult<()> {

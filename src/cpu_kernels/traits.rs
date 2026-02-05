@@ -19,8 +19,6 @@ pub use half::{bf16, f16};
 /// Each type implements `DTypeTrait` with compile-time constants
 /// for bit width, packing behavior, and storage type.
 pub mod types {
-    use half::{bf16, f16};
-
     // F32 marker type
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
     pub struct F32Type;
