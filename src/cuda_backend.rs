@@ -684,22 +684,15 @@ impl CudaBackend {
                 continue;
             }
 
-            let page_bytes = cache.page_bytes().ok_or_else(|| {
-                BackendError::InvalidKvCache("kv stride overflow when computing page bytes".into())
-            })?;
-
-            let marked =
-                manager.check_and_auto_swap(current_usage, total_memory, required_bytes)?;
-            if marked == 0 {
-                continue;
-            }
-
             let gap_bytes = current_usage
                 .saturating_add(required_bytes)
                 .saturating_sub(total_memory);
-            let gap_bytes = gap_bytes.max(required_bytes); // ensure we free at least requested size
-            let pages_needed = (gap_bytes + page_bytes - 1) / page_bytes;
-            let victims = manager.select_victim_pages(pages_needed.max(1));
+            let bytes_to_free = gap_bytes.max(required_bytes);
+            let victims = manager.check_and_auto_swap(
+                current_usage,
+                total_memory,
+                bytes_to_free,
+            )?;
             if victims.is_empty() {
                 continue;
             }
@@ -1549,12 +1542,11 @@ impl CudaBackend {
             .checked_mul(page_bytes)
             .ok_or_else(|| BackendError::InvalidConfig("swap granularity overflow".into()))?;
         let (current_usage, total_memory) = self.device_memory_info()?;
-        let marked = manager.check_and_auto_swap(current_usage, total_memory, required_bytes)?;
-        if marked == 0 {
+        let victims =
+            manager.check_and_auto_swap(current_usage, total_memory, required_bytes)?;
+        if victims.is_empty() {
             return Ok(());
         }
-        let pages_needed = (required_bytes + page_bytes - 1) / page_bytes;
-        let victims = manager.select_victim_pages(pages_needed.max(1));
         let prepared = manager.prepare_swap_out(&victims)?;
         if prepared.is_empty() {
             return Err(BackendError::OutOfMemory(

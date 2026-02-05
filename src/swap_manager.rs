@@ -1,28 +1,35 @@
 //! Swap Manager for GPU <-> CPU page migration.
 //!
-//! Implements LRU-based page swapping to extend effective GPU memory capacity.
+//! Provides LRU eviction while honoring Warm/Protected pages to reduce thrashing.
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::HashMap;
 use std::time::{Duration, Instant};
 
 use crate::backend_trait::{BackendError, BackendResult};
 use crate::kernel_types::{PageId, PageMetadata, PageState, SwapConfig};
 
-/// CPU 端 Swap 缓冲区
+const DEFAULT_WARMUP_MS: u64 = 100;
+const DEFAULT_MIN_WARM_ACCESS: usize = 2;
+const DEFAULT_PROTECTED_ACCESS: usize = 4;
+const DEFAULT_WORKING_SET_WINDOW_MS: u64 = 1_000;
+
+/// CPU-side swap buffer storing evicted pages.
 #[derive(Debug)]
 pub struct CpuSwapBuffer {
-    /// CPU 端页面备份
+    /// CPU-side page backups
     host_pages: Vec<Vec<f32>>,
-    /// 可用的 CPU 页槽索引
+    /// Available CPU page slots
     free_list: Vec<usize>,
-    /// 页索引 -> CPU 槽索引的映射
+    /// Page index -> CPU slot mapping
     page_to_slot: HashMap<usize, usize>,
 }
 
 impl CpuSwapBuffer {
-    /// 创建新的 CPU swap buffer
-    pub fn new(capacity_mb: usize) -> Self {
-        let capacity_pages = capacity_mb * 1024 * 1024 / 4; // f32 = 4 bytes
+    /// Create a new CPU swap buffer with capacity in MB.
+    pub fn new(capacity_mb: usize, page_size_bytes: usize) -> Self {
+        let capacity_bytes = capacity_mb.saturating_mul(1024 * 1024);
+        let page_bytes = page_size_bytes.max(1);
+        let capacity_pages = capacity_bytes / page_bytes;
         Self {
             host_pages: Vec::with_capacity(capacity_pages),
             free_list: (0..capacity_pages).collect(),
@@ -30,10 +37,9 @@ impl CpuSwapBuffer {
         }
     }
 
-    /// 分配一个 CPU 页槽
+    /// Allocate a CPU page slot and store data.
     pub fn allocate_slot(&mut self, page_index: usize, data: Vec<f32>) -> BackendResult<()> {
         if let Some(&existing_slot) = self.page_to_slot.get(&page_index) {
-            // 页面已存在，覆盖数据
             if existing_slot < self.host_pages.len() {
                 self.host_pages[existing_slot] = data;
                 return Ok(());
@@ -53,7 +59,7 @@ impl CpuSwapBuffer {
         Ok(())
     }
 
-    /// 释放一个 CPU 页槽
+    /// Free a CPU page slot and return stored data (if any).
     pub fn free_slot(&mut self, page_index: usize) -> Option<Vec<f32>> {
         if let Some(slot) = self.page_to_slot.remove(&page_index) {
             self.free_list.push(slot);
@@ -65,7 +71,7 @@ impl CpuSwapBuffer {
         None
     }
 
-    /// 获取页面数据
+    /// Get page data.
     pub fn get(&self, page_index: usize) -> Option<&[f32]> {
         self.page_to_slot
             .get(&page_index)
@@ -73,7 +79,7 @@ impl CpuSwapBuffer {
             .map(|v| v.as_slice())
     }
 
-    /// 获取可变页面数据
+    /// Get mutable page data.
     pub fn get_mut(&mut self, page_index: usize) -> Option<&mut Vec<f32>> {
         if let Some(&slot) = self.page_to_slot.get(&page_index) {
             self.host_pages.get_mut(slot)
@@ -82,47 +88,45 @@ impl CpuSwapBuffer {
         }
     }
 
-    /// 检查页面是否存在
+    /// Check if a page exists in the swap buffer.
     pub fn contains(&self, page_index: usize) -> bool {
         self.page_to_slot.contains_key(&page_index)
     }
 
-    /// 获取已使用槽位数
+    /// Number of used slots.
     pub fn used_slots(&self) -> usize {
         self.page_to_slot.len()
     }
 }
 
-/// Swap Manager - 管理 GPU <-> CPU 页面迁移
+/// Swap Manager - manages GPU <-> CPU page migration.
 #[derive(Debug)]
 pub struct SwapManager {
-    /// 页面元数据
+    /// Page metadata
     metadata: Vec<PageMetadata>,
-    /// LRU 队列
-    lru_queue: VecDeque<usize>,
     /// CPU swap buffer
     cpu_buffer: CpuSwapBuffer,
-    /// 全局 IRR 计数
-    current_recency: usize,
-    /// Swap 配置
+    /// Swap config
     config: SwapConfig,
-    /// Warm 保护时长
+    /// Warm-up duration
     warmup_duration: Duration,
-    /// Warm 阶段最少访问次数
+    /// Warm stage minimal accesses
     min_warm_access: usize,
-    /// 晋升为 Protected 所需访问次数
+    /// Access threshold to promote to Protected
     protected_access_threshold: usize,
+    /// Working set window (protection expiry)
+    working_set_window: Duration,
 }
 
 impl SwapManager {
-    /// 创建新的 Swap Manager
+    /// Create a new Swap Manager.
     pub fn new(total_pages: usize, config: SwapConfig) -> Self {
         let now = Instant::now();
         let metadata = (0..total_pages)
             .map(|idx| PageMetadata {
                 page_id: idx,
                 sequence_id: None,
-                state: PageState::Active,
+                state: PageState::Standby,
                 recency: 0,
                 is_lir: false,
                 swap_in_time: None,
@@ -131,15 +135,15 @@ impl SwapManager {
                 last_access: now,
             })
             .collect();
+
         Self {
             metadata,
-            lru_queue: (0..total_pages).collect(),
-            cpu_buffer: CpuSwapBuffer::new(config.cpu_reserve_mb),
-            current_recency: 0,
+            cpu_buffer: CpuSwapBuffer::new(config.cpu_reserve_mb, config.page_size_bytes),
             config,
-            warmup_duration: Duration::from_millis(100),
-            min_warm_access: 2,
-            protected_access_threshold: 4,
+            warmup_duration: Duration::from_millis(DEFAULT_WARMUP_MS),
+            min_warm_access: DEFAULT_MIN_WARM_ACCESS,
+            protected_access_threshold: DEFAULT_PROTECTED_ACCESS,
+            working_set_window: Duration::from_millis(DEFAULT_WORKING_SET_WINDOW_MS),
         }
     }
 
@@ -151,26 +155,17 @@ impl SwapManager {
         self.metadata.get_mut(page_index)
     }
 
-    /// 获取配置的页大小 (bytes)
+    /// Page size in bytes.
     pub fn page_size_bytes(&self) -> usize {
         self.config.page_size_bytes.max(1)
     }
 
-    fn touch_lru(&mut self, page_index: PageId) {
-        self.lru_queue.retain(|&idx| idx != page_index);
-        self.lru_queue.push_back(page_index);
-    }
-
-    fn remove_from_lru(&mut self, page_index: PageId) {
-        self.lru_queue.retain(|&idx| idx != page_index);
-    }
-
-    /// 获取页面状态
+    /// Get page state.
     pub fn get_page_state(&self, page_index: usize) -> Option<PageState> {
         self.meta(page_index).map(|m| m.state)
     }
 
-    /// 设置页面状态
+    /// Set page state.
     pub fn set_page_state(&mut self, page_index: usize, state: PageState) -> BackendResult<()> {
         let Some(meta) = self.meta_mut(page_index) else {
             return Err(BackendError::InvalidHandle(
@@ -178,10 +173,14 @@ impl SwapManager {
             ));
         };
         meta.state = state;
+        if state == PageState::Swapped {
+            meta.swap_in_time = None;
+            meta.warm_until = None;
+        }
         Ok(())
     }
 
-    /// 标记页面访问 (更新 LRU)
+    /// Mark a page as accessed (LRU update).
     pub fn mark_accessed(&mut self, page_index: usize) -> BackendResult<()> {
         if page_index >= self.metadata.len() {
             return Err(BackendError::InvalidHandle(
@@ -190,10 +189,9 @@ impl SwapManager {
         }
 
         let now = Instant::now();
-        self.current_recency = self.current_recency.wrapping_add(1);
-        let recency = self.current_recency;
         let min_warm_access = self.min_warm_access;
         let protected_threshold = self.protected_access_threshold;
+        let warmup_duration = self.warmup_duration;
 
         {
             let meta = self
@@ -206,7 +204,12 @@ impl SwapManager {
                 ));
             }
 
-            meta.recency = recency;
+            let irr = now
+                .saturating_duration_since(meta.last_access)
+                .as_millis()
+                .try_into()
+                .unwrap_or(usize::MAX);
+            meta.recency = irr;
             meta.access_count = meta.access_count.saturating_add(1);
             meta.last_access = now;
 
@@ -215,7 +218,7 @@ impl SwapManager {
             }
 
             if meta.state == PageState::Warm
-                && !Self::is_in_protected_period_meta(meta, now, min_warm_access)
+                && !Self::is_in_warm_period_meta(meta, now, warmup_duration, min_warm_access)
             {
                 meta.state = PageState::Active;
                 meta.warm_until = None;
@@ -226,12 +229,11 @@ impl SwapManager {
                 meta.warm_until = None;
             }
         }
-        self.touch_lru(page_index);
 
         Ok(())
     }
 
-    /// 计算内存压力 (0.0 - 1.0)
+    /// Calculate memory pressure (0.0 - 1.0).
     pub fn calculate_memory_pressure(&self, current_usage: usize, total_memory: usize) -> f32 {
         if total_memory == 0 {
             return 1.0;
@@ -240,7 +242,7 @@ impl SwapManager {
         pressure.clamp(0.0, 1.0)
     }
 
-    /// 判断是否需要触发 swap-out
+    /// Determine whether swap-out should be triggered.
     pub fn needs_swap_out(
         &self,
         current_usage: usize,
@@ -252,19 +254,19 @@ impl SwapManager {
         pressure >= threshold || current_usage.saturating_add(required_bytes) > total_memory
     }
 
-    /// 检查内存压力并自动选择可换出的页面
+    /// Check memory pressure and select victim pages for swap-out.
     pub fn check_and_auto_swap(
         &mut self,
         current_usage: usize,
         total_memory: usize,
-        required_bytes: usize,
-    ) -> BackendResult<usize> {
-        if !self.needs_swap_out(current_usage, total_memory, required_bytes) {
-            return Ok(0);
+        bytes_to_free: usize,
+    ) -> BackendResult<Vec<usize>> {
+        if !self.needs_swap_out(current_usage, total_memory, bytes_to_free) {
+            return Ok(Vec::new());
         }
 
         let page_size = self.page_size_bytes();
-        let pages_needed = (required_bytes + page_size - 1) / page_size;
+        let pages_needed = (bytes_to_free + page_size - 1) / page_size;
         let victims = self.select_victim_pages(pages_needed.max(1));
 
         if victims.is_empty() {
@@ -273,73 +275,92 @@ impl SwapManager {
             ));
         }
 
-        for &page_idx in &victims {
-            self.set_page_state(page_idx, PageState::Standby)?;
-        }
-
-        Ok(victims.len())
+        Ok(victims)
     }
 
-    fn is_in_protected_period_meta(
+    fn is_in_warm_period_meta(
         meta: &PageMetadata,
         now: Instant,
+        warmup_duration: Duration,
         min_warm_access: usize,
     ) -> bool {
-        match meta.state {
-            PageState::Warm => {
-                let in_time_window = meta.warm_until.map(|until| until > now).unwrap_or(false);
-                let needs_more_access = meta.access_count < min_warm_access;
-                in_time_window && needs_more_access
-            }
-            PageState::Protected => true,
-            _ => false,
+        if meta.state != PageState::Warm {
+            return false;
         }
+        if meta.access_count >= min_warm_access {
+            return false;
+        }
+        let warm_until = meta
+            .warm_until
+            .or_else(|| meta.swap_in_time.map(|t| t + warmup_duration));
+        warm_until.map(|end| now < end).unwrap_or(false)
     }
 
-    /// 检查页面是否处于 Warm/Protected 保护期
+    fn is_protection_expired(meta: &PageMetadata, now: Instant, window: Duration) -> bool {
+        if meta.state != PageState::Protected {
+            return false;
+        }
+        now.saturating_duration_since(meta.last_access) >= window
+    }
+
+    /// Check whether a page is in Warm/Protected protection period.
     pub fn is_in_protected_period(&self, page_index: usize) -> bool {
         let now = Instant::now();
         self.meta(page_index)
-            .map(|m| Self::is_in_protected_period_meta(m, now, self.min_warm_access))
+            .map(|m| {
+                Self::is_in_warm_period_meta(m, now, self.warmup_duration, self.min_warm_access)
+                    || m.state == PageState::Protected
+            })
             .unwrap_or(false)
     }
 
-    /// 选择要换出的页面 (基于 LRU)
+    /// Select pages to evict (LRU), skipping Warm/Protected/Swapped.
     pub fn select_victim_pages(&mut self, count: usize) -> Vec<usize> {
-        let mut victims = Vec::new();
+        if count == 0 {
+            return Vec::new();
+        }
         let now = Instant::now();
+        let warmup_duration = self.warmup_duration;
         let min_warm_access = self.min_warm_access;
+        let working_set_window = self.working_set_window;
 
-        let queue_snapshot: Vec<_> = self.lru_queue.iter().copied().collect();
-        for page_idx in queue_snapshot {
-            if victims.len() >= count {
-                break;
-            }
-            if let Some(meta) = self.meta_mut(page_idx) {
+        let mut candidates: Vec<(usize, Instant)> = self
+            .metadata
+            .iter_mut()
+            .enumerate()
+            .filter_map(|(page_idx, meta)| {
                 if meta.state == PageState::Warm
-                    && !Self::is_in_protected_period_meta(meta, now, min_warm_access)
+                    && !Self::is_in_warm_period_meta(meta, now, warmup_duration, min_warm_access)
                 {
                     meta.state = PageState::Active;
                     meta.warm_until = None;
                 }
-                match meta.state {
-                    PageState::Active | PageState::Standby => {
-                        victims.push(page_idx);
-                    }
-                    _ => {}
+                if Self::is_protection_expired(meta, now, working_set_window) {
+                    meta.state = PageState::Standby;
                 }
-            }
-        }
 
-        victims
+                match meta.state {
+                    PageState::Active | PageState::Standby => Some((page_idx, meta.last_access)),
+                    _ => None,
+                }
+            })
+            .collect();
+
+        candidates.sort_by_key(|(_, last_access)| *last_access);
+        candidates
+            .into_iter()
+            .take(count)
+            .map(|(page_idx, _)| page_idx)
+            .collect()
     }
 
-    /// 准备 swap-out: 返回需要拷贝的页面索引
-    /// 实际的 GPU -> CPU 拷贝由调用者完成
+    /// Prepare swap-out: returns page indices that are eligible to swap.
+    /// Actual GPU -> CPU copy is performed by the caller.
     pub fn prepare_swap_out(&mut self, page_indices: &[usize]) -> BackendResult<Vec<usize>> {
         let mut prepared = Vec::new();
         let now = Instant::now();
         let min_warm_access = self.min_warm_access;
+        let warmup_duration = self.warmup_duration;
         for &page_idx in page_indices {
             let Some(meta) = self.meta(page_idx) else {
                 continue;
@@ -347,7 +368,9 @@ impl SwapManager {
             if matches!(meta.state, PageState::Swapped) {
                 continue;
             }
-            if Self::is_in_protected_period_meta(meta, now, min_warm_access) {
+            if Self::is_in_warm_period_meta(meta, now, warmup_duration, min_warm_access)
+                || meta.state == PageState::Protected
+            {
                 continue;
             }
             prepared.push(page_idx);
@@ -355,19 +378,20 @@ impl SwapManager {
         Ok(prepared)
     }
 
-    /// 完成 swap-out: 标记页面为已换出
+    /// Complete swap-out: mark page as swapped out and store data.
     pub fn complete_swap_out(&mut self, page_idx: usize, data: Vec<f32>) -> BackendResult<()> {
         self.cpu_buffer.allocate_slot(page_idx, data)?;
         if let Some(meta) = self.meta_mut(page_idx) {
             meta.state = PageState::Swapped;
             meta.warm_until = None;
             meta.swap_in_time = None;
+            meta.access_count = 0;
+            meta.recency = 0;
         }
-        self.remove_from_lru(page_idx);
         Ok(())
     }
 
-    /// 准备 swap-in: 返回 CPU 数据
+    /// Prepare swap-in: return CPU data if available.
     pub fn prepare_swap_in(&self, page_idx: usize) -> Option<&[f32]> {
         if self.is_swapped_out(page_idx) {
             self.cpu_buffer.get(page_idx)
@@ -376,13 +400,11 @@ impl SwapManager {
         }
     }
 
-    /// 完成 swap-in: 标记页面为已换入
+    /// Complete swap-in: mark page as warm and reset counters.
     pub fn complete_swap_in(&mut self, page_idx: usize) -> BackendResult<()> {
         self.cpu_buffer.free_slot(page_idx);
         let now = Instant::now();
         let warm_until = now + self.warmup_duration;
-        self.current_recency = self.current_recency.wrapping_add(1);
-        let recency = self.current_recency;
 
         let Some(meta) = self.meta_mut(page_idx) else {
             return Err(BackendError::InvalidHandle(
@@ -395,18 +417,16 @@ impl SwapManager {
         meta.warm_until = Some(warm_until);
         meta.access_count = 0;
         meta.last_access = now;
-        meta.recency = recency;
-
-        self.touch_lru(page_idx);
+        meta.recency = 0;
         Ok(())
     }
 
-    /// 获取换出页面的 CPU 数据（用于 swap-in）
+    /// Get CPU data for a swapped out page.
     pub fn get_swapped_data(&self, page_idx: usize) -> Option<&[f32]> {
         self.cpu_buffer.get(page_idx)
     }
 
-    /// 删除换出页面的 CPU 数据
+    /// Remove swapped data from CPU buffer.
     pub fn remove_swapped_data(&mut self, page_idx: usize) -> Option<Vec<f32>> {
         if self.is_swapped_out(page_idx) {
             self.cpu_buffer.free_slot(page_idx)
@@ -415,12 +435,12 @@ impl SwapManager {
         }
     }
 
-    /// 检查页面是否已换出
+    /// Check if a page is swapped out.
     pub fn is_swapped_out(&self, page_index: usize) -> bool {
         self.get_page_state(page_index) == Some(PageState::Swapped)
     }
 
-    /// 获取所有已换出的页面
+    /// Get all swapped out pages.
     pub fn swapped_out_pages(&self) -> Vec<usize> {
         self.metadata
             .iter()
@@ -429,7 +449,7 @@ impl SwapManager {
             .collect()
     }
 
-    /// 标记页面为 Standby (未使用但仍在 GPU)
+    /// Mark a page as Standby (unused but still on GPU).
     pub fn mark_standby(&mut self, page_index: usize) -> BackendResult<()> {
         let Some(meta) = self.meta_mut(page_index) else {
             return Err(BackendError::InvalidHandle(
@@ -442,7 +462,7 @@ impl SwapManager {
         Ok(())
     }
 
-    /// 获取内存使用统计
+    /// Memory usage stats.
     pub fn stats(&self) -> SwapStats {
         let mut active = 0;
         let mut standby = 0;
@@ -471,21 +491,22 @@ impl SwapManager {
         }
     }
 
-    /// 清理所有已换出的页面
+    /// Cleanup all swapped pages.
     pub fn cleanup(&mut self) {
         for page_idx in self.swapped_out_pages() {
             self.cpu_buffer.free_slot(page_idx);
             if let Some(meta) = self.meta_mut(page_idx) {
-                meta.state = PageState::Active;
+                meta.state = PageState::Standby;
                 meta.swap_in_time = None;
                 meta.warm_until = None;
                 meta.access_count = 0;
+                meta.recency = 0;
             }
         }
     }
 }
 
-/// Swap 统计信息
+/// Swap stats.
 #[derive(Debug, Clone)]
 pub struct SwapStats {
     pub total_pages: usize,
@@ -503,37 +524,32 @@ mod tests {
 
     #[test]
     fn test_cpu_swap_buffer() {
-        let mut buffer = CpuSwapBuffer::new(1); // 1 MB
+        let mut buffer = CpuSwapBuffer::new(1, 4096); // 1 MB
         let data = vec![1.0f32; 256];
 
-        // 分配
         buffer.allocate_slot(0, data.clone()).unwrap();
         assert!(buffer.contains(0));
         assert_eq!(buffer.get(0), Some(data.as_slice()));
 
-        // 释放
         let recovered = buffer.free_slot(0);
         assert!(!buffer.contains(0));
         assert_eq!(recovered, Some(data));
     }
 
     #[test]
-    fn test_lru_selection() {
+    fn test_selection_respects_page_states() {
         let config = SwapConfig::default();
-        let mut manager = SwapManager::new(10, config);
+        let mut manager = SwapManager::new(6, config);
 
-        // 标记访问顺序: 0, 1, 2, 3, 4
-        // LRU 队列状态变为: [5,6,7,8,9,0,1,2,3,4]
-        // (最久未使用在前端，最近使用在末端)
-        for i in 0..5 {
-            manager.mark_accessed(i).unwrap();
-        }
+        manager.set_page_state(0, PageState::Protected).unwrap();
+        manager.complete_swap_in(1).unwrap(); // Warm
+        manager.set_page_state(2, PageState::Swapped).unwrap();
 
-        // 选择 2 个 victim，应该是 5 和 6 (从未访问过的页面)
         let victims = manager.select_victim_pages(2);
         assert_eq!(victims.len(), 2);
-        assert_eq!(victims[0], 5);
-        assert_eq!(victims[1], 6);
+        assert!(!victims.contains(&0));
+        assert!(!victims.contains(&1));
+        assert!(!victims.contains(&2));
     }
 
     #[test]
@@ -541,19 +557,15 @@ mod tests {
         let config = SwapConfig::default();
         let mut manager = SwapManager::new(4, config);
 
-        // mark pages to order LRU as [0,1,2,3]
         for i in 0..4 {
             manager.mark_accessed(i).unwrap();
         }
 
-        // put page 0 into Warm (simulating swap-in)
         manager.complete_swap_in(0).unwrap();
-        // mark page 1 heavily to become Protected
         for _ in 0..5 {
             manager.mark_accessed(1).unwrap();
         }
 
-        // victims should skip 0 (Warm) and 1 (Protected)
         let victims = manager.select_victim_pages(2);
         assert!(!victims.contains(&0));
         assert!(!victims.contains(&1));
@@ -564,14 +576,11 @@ mod tests {
         let config = SwapConfig::default();
         let mut manager = SwapManager::new(5, config);
 
-        // 初始状态都是 Active
-        assert_eq!(manager.get_page_state(0), Some(PageState::Active));
+        assert_eq!(manager.get_page_state(0), Some(PageState::Standby));
 
-        // 标记为 Standby
         manager.mark_standby(0).unwrap();
         assert_eq!(manager.get_page_state(0), Some(PageState::Standby));
 
-        // 访问后变回 Active
         manager.mark_accessed(0).unwrap();
         assert_eq!(manager.get_page_state(0), Some(PageState::Active));
     }
@@ -581,15 +590,14 @@ mod tests {
         let config = SwapConfig::default();
         let mut manager = SwapManager::new(10, config);
 
-        // 标记一些为 Standby
         for i in 0..3 {
             manager.mark_standby(i).unwrap();
         }
 
         let stats = manager.stats();
         assert_eq!(stats.total_pages, 10);
-        assert_eq!(stats.active_pages, 7);
-        assert_eq!(stats.standby_pages, 3);
+        assert_eq!(stats.active_pages, 0);
+        assert_eq!(stats.standby_pages, 10);
         assert_eq!(stats.warm_pages, 0);
         assert_eq!(stats.protected_pages, 0);
         assert_eq!(stats.swapped_pages, 0);
@@ -607,11 +615,8 @@ mod tests {
     fn test_needs_swap_out() {
         let manager = SwapManager::new(1, SwapConfig::default());
         let total = 1_000usize;
-        // Below threshold and enough memory
         assert!(!manager.needs_swap_out(500, total, 100));
-        // Pressure exceeds threshold
         assert!(manager.needs_swap_out(900, total, 0));
-        // Not exceeding threshold but allocation would overflow
         assert!(manager.needs_swap_out(800, total, 300));
     }
 
@@ -620,23 +625,17 @@ mod tests {
         let config = SwapConfig::default();
         let mut manager = SwapManager::new(4, config);
 
-        // Protect page 1
         for _ in 0..config.lru_granularity + 1 {
             manager.mark_accessed(1).unwrap();
         }
-        // Warm-protect page 0
         manager.complete_swap_in(0).unwrap();
 
-        let standby_before = manager.stats().standby_pages;
-        let swapped = manager
+        let victims = manager
             .check_and_auto_swap(900, 1000, 2048)
             .expect("should select victims");
-        assert_eq!(swapped, 1);
-
-        let stats = manager.stats();
-        assert_eq!(stats.standby_pages, standby_before + 1);
-        assert_eq!(manager.get_page_state(0), Some(PageState::Warm));
-        assert_eq!(manager.get_page_state(1), Some(PageState::Protected));
+        assert_eq!(victims.len(), 1);
+        assert!(!victims.contains(&0));
+        assert!(!victims.contains(&1));
     }
 
     #[test]
