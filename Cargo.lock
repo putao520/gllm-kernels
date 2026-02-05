@@ -543,6 +543,7 @@ dependencies = [
  "cudarc",
  "faer",
  "half",
+ "libm",
  "log",
  "once_cell",
  "rayon",

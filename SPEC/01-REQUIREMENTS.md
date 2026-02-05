@@ -56,6 +56,7 @@
 | **REQ-OPS-003** | RMSNorm | Root Mean Square Normalization | 支持 epsilon 配置 | 🟢 已完成 |
 | **REQ-OPS-004** | SiLU/SwiGLU | 激活函数 | 融合实现 (Gate+Up+SiLU+Mul) | 🟢 已完成 |
 | **REQ-OPS-005** | Sampling | GPU 端采样 | 支持 Argmax, Top-K, Top-P, Temperature | 🟢 已完成 |
+| **REQ-ONNX-FALLBACK** | ONNX 兜底原子算子 | 补齐 ONNX 兜底路径的基础算子 | 1. Standard LayerNormalization<br>2. GELU 激活<br>3. 独立 Softmax<br>4. ElementWise (Mul/Div/Sub)<br>5. **仅用于无法融合时的 fallback** | 🟢 已完成 |
 
 ## 6. 性能指标需求 (REQ-PERF)
 

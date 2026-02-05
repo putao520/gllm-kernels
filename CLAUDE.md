@@ -45,6 +45,10 @@
 - **Pre-compiled Kernels**: `.cubin` files are checked into the repo (`src/cuda_kernels/kernels/`).
 - **Template Instantiation**: Each sm_XX arch gets templates instantiated for BITS=1,2,4,8.
 
+### 5. Fused-First Architecture / 融合优先原则
+- **Constraint**: 调度/执行层必须优先选择融合算子 (Fused Kernels)。仅在无法匹配融合模式时，才降级使用原子算子 (Atomic Kernels)。
+- **Constraint**: ONNX Loader 必须实现 Graph Pattern Matching，将子图映射为 Fused Kernels，严禁 naive 的 1:1 翻译。
+
 ## Directory Structure
 
 ```
