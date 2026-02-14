@@ -79,11 +79,9 @@ macro_rules! define_element_wise_ops {
 
              // Handle remainder for scalar fallback or small arrays
             while i < len {
-                let val = a[i];
-                let one = <$elem as Element>::ONE;
-                let neg_val = <$elem as Element>::ZERO - val;
-                let sigmoid = one / (one + neg_val.exp());
-                out[i] = val * sigmoid;
+                let val_f = a[i].to_f32();
+                let sigmoid = 1.0f32 / (1.0f32 + (-val_f).exp());
+                out[i] = <$elem as Element>::from_f32(val_f * sigmoid);
                 i += 1;
             }
         }
@@ -192,9 +190,9 @@ macro_rules! define_blas1_ops {
                 i += LANES;
             }
             #[allow(unused_unsafe)]
-            let mut result = unsafe { $crate::simd_primitive!($isa, $elem, reduce_sum, acc) };
-            while i < len { result += a[i]; i += 1; }
-            result
+            let mut result: f32 = unsafe { $crate::simd_primitive!($isa, $elem, reduce_sum, acc) };
+            while i < len { result += a[i].to_f32(); i += 1; }
+            <$elem as Element>::from_f32(result)
         }
 
         /// max_val: returns maximum element
@@ -205,7 +203,7 @@ macro_rules! define_blas1_ops {
             assert!(len > 0);
             let mut i = 0;
             #[allow(unused_unsafe)]
-            let mut acc = unsafe { $crate::simd_primitive!($isa, $elem, splat, <$elem>::NEG_INFINITY) };
+            let mut acc = unsafe { $crate::simd_primitive!($isa, $elem, splat, <$elem as Element>::from_f32(f32::NEG_INFINITY)) };
             while i + LANES <= len {
                 #[allow(unused_unsafe)]
                 unsafe {
@@ -215,9 +213,9 @@ macro_rules! define_blas1_ops {
                 i += LANES;
             }
             #[allow(unused_unsafe)]
-            let mut result = unsafe { $crate::simd_primitive!($isa, $elem, reduce_max, acc) };
-            while i < len { result = result.max(a[i]); i += 1; }
-            result
+            let mut result: f32 = unsafe { $crate::simd_primitive!($isa, $elem, reduce_max, acc) };
+            while i < len { let v = a[i].to_f32(); if v > result { result = v; } i += 1; }
+            <$elem as Element>::from_f32(result)
         }
 
         /// sum_squares: returns sum of x[i]^2
@@ -237,9 +235,9 @@ macro_rules! define_blas1_ops {
                 i += LANES;
             }
             #[allow(unused_unsafe)]
-            let mut result = unsafe { $crate::simd_primitive!($isa, $elem, reduce_sum, acc) };
-            while i < len { result += a[i] * a[i]; i += 1; }
-            result
+            let mut result: f32 = unsafe { $crate::simd_primitive!($isa, $elem, reduce_sum, acc) };
+            while i < len { let v = a[i].to_f32(); result += v * v; i += 1; }
+            <$elem as Element>::from_f32(result)
         }
     };
 }
@@ -266,7 +264,7 @@ macro_rules! define_activation_ops {
                 }
                 i += LANES;
             }
-            while i < len { out[i] = a[i].max(<$elem as Element>::ZERO); i += 1; }
+            while i < len { out[i] = <$elem as Element>::max(a[i], <$elem as Element>::ZERO); i += 1; }
         }
 
         /// gelu: out[i] = 0.5 * x * (1 + tanh(sqrt(2/pi) * (x + 0.044715 * x^3)))
@@ -276,19 +274,15 @@ macro_rules! define_activation_ops {
             let len = a.len();
             assert!(out.len() == len);
 
-            // Constants for GELU tanh approximation
-            let sqrt_2_over_pi: $elem = 0.7978845608;
-            let coeff: $elem = 0.044715;
-
             let mut i = 0;
             while i + LANES <= len {
                 #[allow(unused_unsafe)]
                 unsafe {
                     let vx = $crate::simd_primitive!($isa, $elem, load, a.as_ptr().add(i));
-                    let half = $crate::simd_primitive!($isa, $elem, splat, 0.5 as $elem);
+                    let half = $crate::simd_primitive!($isa, $elem, splat, <$elem as Element>::from_f32(0.5));
                     let one = $crate::simd_primitive!($isa, $elem, splat, <$elem as Element>::ONE);
-                    let vc = $crate::simd_primitive!($isa, $elem, splat, coeff);
-                    let vs = $crate::simd_primitive!($isa, $elem, splat, sqrt_2_over_pi);
+                    let vc = $crate::simd_primitive!($isa, $elem, splat, <$elem as Element>::from_f32(0.044715));
+                    let vs = $crate::simd_primitive!($isa, $elem, splat, <$elem as Element>::from_f32(0.7978845608));
 
                     // x^3
                     let x2 = $crate::simd_primitive!($isa, $elem, mul, vx, vx);
@@ -298,7 +292,7 @@ macro_rules! define_activation_ops {
                     // sqrt(2/pi) * inner
                     let scaled = $crate::simd_primitive!($isa, $elem, mul, vs, inner);
                     // tanh via (exp(2x)-1)/(exp(2x)+1)
-                    let two = $crate::simd_primitive!($isa, $elem, splat, 2.0 as $elem);
+                    let two = $crate::simd_primitive!($isa, $elem, splat, <$elem as Element>::from_f32(2.0));
                     let two_x = $crate::simd_primitive!($isa, $elem, mul, two, scaled);
                     let exp_2x = $crate::simd_primitive!($isa, $elem, exp, two_x);
                     let num = $crate::simd_primitive!($isa, $elem, sub, exp_2x, one);
@@ -312,12 +306,13 @@ macro_rules! define_activation_ops {
                 }
                 i += LANES;
             }
-            // Scalar remainder
+            // Scalar remainder (f32 arithmetic)
             while i < len {
-                let x = a[i];
-                let inner = sqrt_2_over_pi * (x + coeff * x * x * x);
-                let tanh_val = ((2.0 as $elem * inner).exp() - <$elem as Element>::ONE) / ((2.0 as $elem * inner).exp() + <$elem as Element>::ONE);
-                out[i] = 0.5 as $elem * x * (<$elem as Element>::ONE + tanh_val);
+                let x = a[i].to_f32();
+                let inner = 0.7978845608f32 * (x + 0.044715f32 * x * x * x);
+                let e2x = (2.0f32 * inner).exp();
+                let tanh_val = (e2x - 1.0f32) / (e2x + 1.0f32);
+                out[i] = <$elem as Element>::from_f32(0.5f32 * x * (1.0f32 + tanh_val));
                 i += 1;
             }
         }
@@ -334,7 +329,7 @@ macro_rules! define_activation_ops {
                 unsafe {
                     let vx = $crate::simd_primitive!($isa, $elem, load, a.as_ptr().add(i));
                     let one = $crate::simd_primitive!($isa, $elem, splat, <$elem as Element>::ONE);
-                    let two = $crate::simd_primitive!($isa, $elem, splat, 2.0 as $elem);
+                    let two = $crate::simd_primitive!($isa, $elem, splat, <$elem as Element>::from_f32(2.0));
                     let two_x = $crate::simd_primitive!($isa, $elem, mul, two, vx);
                     let exp_2x = $crate::simd_primitive!($isa, $elem, exp, two_x);
                     let num = $crate::simd_primitive!($isa, $elem, sub, exp_2x, one);
@@ -345,9 +340,9 @@ macro_rules! define_activation_ops {
                 i += LANES;
             }
             while i < len {
-                let x = a[i];
-                let e2x = (2.0 as $elem * x).exp();
-                out[i] = (e2x - <$elem as Element>::ONE) / (e2x + <$elem as Element>::ONE);
+                let x = a[i].to_f32();
+                let e2x = (2.0f32 * x).exp();
+                out[i] = <$elem as Element>::from_f32((e2x - 1.0f32) / (e2x + 1.0f32));
                 i += 1;
             }
         }
@@ -368,7 +363,7 @@ macro_rules! define_activation_ops {
                 }
                 i += LANES;
             }
-            while i < len { out[i] = a[i].exp(); i += 1; }
+            while i < len { out[i] = <$elem as Element>::from_f32(a[i].to_f32().exp()); i += 1; }
         }
 
         /// softmax: out = softmax(a) = exp(a - max(a)) / sum(exp(a - max(a)))
@@ -382,7 +377,7 @@ macro_rules! define_activation_ops {
             // Pass 1: find max for numerical stability
             let mut i = 0;
             #[allow(unused_unsafe)]
-            let mut max_acc = unsafe { $crate::simd_primitive!($isa, $elem, splat, <$elem>::NEG_INFINITY) };
+            let mut max_acc = unsafe { $crate::simd_primitive!($isa, $elem, splat, <$elem as Element>::from_f32(f32::NEG_INFINITY)) };
             while i + LANES <= len {
                 #[allow(unused_unsafe)]
                 unsafe {
@@ -392,13 +387,13 @@ macro_rules! define_activation_ops {
                 i += LANES;
             }
             #[allow(unused_unsafe)]
-            let mut max_val = unsafe { $crate::simd_primitive!($isa, $elem, reduce_max, max_acc) };
-            while i < len { max_val = max_val.max(a[i]); i += 1; }
+            let mut max_val: f32 = unsafe { $crate::simd_primitive!($isa, $elem, reduce_max, max_acc) };
+            while i < len { let v = a[i].to_f32(); if v > max_val { max_val = v; } i += 1; }
 
             // Pass 2: exp(x - max) and accumulate sum
             i = 0;
             #[allow(unused_unsafe)]
-            let vmax = unsafe { $crate::simd_primitive!($isa, $elem, splat, max_val) };
+            let vmax = unsafe { $crate::simd_primitive!($isa, $elem, splat, <$elem as Element>::from_f32(max_val)) };
             #[allow(unused_unsafe)]
             let mut sum_acc = unsafe { $crate::simd_primitive!($isa, $elem, zero) };
             while i + LANES <= len {
@@ -413,19 +408,19 @@ macro_rules! define_activation_ops {
                 i += LANES;
             }
             #[allow(unused_unsafe)]
-            let mut sum_val = unsafe { $crate::simd_primitive!($isa, $elem, reduce_sum, sum_acc) };
+            let mut sum_val: f32 = unsafe { $crate::simd_primitive!($isa, $elem, reduce_sum, sum_acc) };
             while i < len {
-                let e = (a[i] - max_val).exp();
-                out[i] = e;
+                let e = (a[i].to_f32() - max_val).exp();
+                out[i] = <$elem as Element>::from_f32(e);
                 sum_val += e;
                 i += 1;
             }
 
             // Pass 3: divide by sum
             i = 0;
-            let inv_sum = <$elem as Element>::ONE / sum_val;
+            let inv_sum = 1.0f32 / sum_val;
             #[allow(unused_unsafe)]
-            let vinv = unsafe { $crate::simd_primitive!($isa, $elem, splat, inv_sum) };
+            let vinv = unsafe { $crate::simd_primitive!($isa, $elem, splat, <$elem as Element>::from_f32(inv_sum)) };
             while i + LANES <= len {
                 #[allow(unused_unsafe)]
                 unsafe {
@@ -435,7 +430,7 @@ macro_rules! define_activation_ops {
                 }
                 i += LANES;
             }
-            while i < len { out[i] *= inv_sum; i += 1; }
+            while i < len { out[i] = <$elem as Element>::from_f32(out[i].to_f32() * inv_sum); i += 1; }
         }
     };
 }
@@ -465,11 +460,13 @@ macro_rules! define_norm_ops {
                 i += LANES;
             }
             #[allow(unused_unsafe)]
-            let mut ss = unsafe { $crate::simd_primitive!($isa, $elem, reduce_sum, ss_acc) };
-            while i < len { ss += a[i] * a[i]; i += 1; }
+            let mut ss: f32 = unsafe { $crate::simd_primitive!($isa, $elem, reduce_sum, ss_acc) };
+            while i < len { let v = a[i].to_f32(); ss += v * v; i += 1; }
 
             // rms = 1/sqrt(mean + eps)
-            let inv_rms = <$elem as Element>::ONE / (ss / (len as $elem) + eps).sqrt();
+            let eps_f = eps.to_f32();
+            let inv_rms_f = 1.0f32 / (ss / (len as f32) + eps_f).sqrt();
+            let inv_rms = <$elem as Element>::from_f32(inv_rms_f);
 
             // Pass 2: normalize and scale
             i = 0;
@@ -487,7 +484,7 @@ macro_rules! define_norm_ops {
                 i += LANES;
             }
             while i < len {
-                out[i] = a[i] * inv_rms * weight[i];
+                out[i] = <$elem as Element>::from_f32(a[i].to_f32() * inv_rms_f * weight[i].to_f32());
                 i += 1;
             }
         }
@@ -498,7 +495,7 @@ macro_rules! define_norm_ops {
             const LANES: usize = $crate::simd_primitive!($isa, $elem, lanes);
             let len = a.len();
             assert!(weight.len() == len && bias.len() == len && out.len() == len);
-            let n = len as $elem;
+            let n = len as f32;
 
             // Pass 1: mean
             let mut i = 0;
@@ -513,9 +510,10 @@ macro_rules! define_norm_ops {
                 i += LANES;
             }
             #[allow(unused_unsafe)]
-            let mut sum_val = unsafe { $crate::simd_primitive!($isa, $elem, reduce_sum, sum_acc) };
-            while i < len { sum_val += a[i]; i += 1; }
-            let mean = sum_val / n;
+            let mut sum_val: f32 = unsafe { $crate::simd_primitive!($isa, $elem, reduce_sum, sum_acc) };
+            while i < len { sum_val += a[i].to_f32(); i += 1; }
+            let mean_f = sum_val / n;
+            let mean = <$elem as Element>::from_f32(mean_f);
 
             // Pass 2: variance
             i = 0;
@@ -533,9 +531,11 @@ macro_rules! define_norm_ops {
                 i += LANES;
             }
             #[allow(unused_unsafe)]
-            let mut var_val = unsafe { $crate::simd_primitive!($isa, $elem, reduce_sum, var_acc) };
-            while i < len { let d = a[i] - mean; var_val += d * d; i += 1; }
-            let inv_std = <$elem as Element>::ONE / (var_val / n + eps).sqrt();
+            let mut var_val: f32 = unsafe { $crate::simd_primitive!($isa, $elem, reduce_sum, var_acc) };
+            while i < len { let d = a[i].to_f32() - mean_f; var_val += d * d; i += 1; }
+            let eps_f = eps.to_f32();
+            let inv_std_f = 1.0f32 / (var_val / n + eps_f).sqrt();
+            let inv_std = <$elem as Element>::from_f32(inv_std_f);
 
             // Pass 3: normalize, scale, bias
             i = 0;
@@ -555,7 +555,9 @@ macro_rules! define_norm_ops {
                 i += LANES;
             }
             while i < len {
-                out[i] = (a[i] - mean) * inv_std * weight[i] + bias[i];
+                out[i] = <$elem as Element>::from_f32(
+                    (a[i].to_f32() - mean_f) * inv_std_f * weight[i].to_f32() + bias[i].to_f32()
+                );
                 i += 1;
             }
         }
@@ -625,9 +627,9 @@ macro_rules! define_gemv_op {
                     i += LANES;
                 }
                 #[allow(unused_unsafe)]
-                let mut dot = unsafe { $crate::simd_primitive!($isa, $elem, reduce_sum, acc) };
-                while i < k { dot += row_ptr[i] * x[i]; i += 1; }
-                y[row] += dot;
+                let mut dot: f32 = unsafe { $crate::simd_primitive!($isa, $elem, reduce_sum, acc) };
+                while i < k { dot += row_ptr[i].to_f32() * x[i].to_f32(); i += 1; }
+                y[row] = <$elem as Element>::from_f32(y[row].to_f32() + dot);
             }
         }
     };
@@ -638,6 +640,191 @@ macro_rules! define_gemv_op {
 /// Defines Matrix Multiplication (GEMM)
 #[macro_export]
 macro_rules! define_matmul_op {
+    // NEON f16: 8×12 microkernel with f32 arithmetic (convert on load/store)
+    (neon, f16) => {
+        #[inline(always)]
+        pub fn matmul(a: &[f16], b: &[f16], c: &mut [f16], m_size: usize, n_size: usize, k_size: usize) {
+            assert!(a.len() >= m_size * k_size);
+            assert!(b.len() >= n_size * k_size);
+            assert!(c.len() >= m_size * n_size);
+
+            const TILE_M: usize = 8;
+            const TILE_N: usize = 12; // 3 × 4 f32 lanes
+
+            // Pack B into f32 column strips of width TILE_N
+            let n_strips = (n_size + TILE_N - 1) / TILE_N;
+            let packed_b_size = n_strips * k_size * TILE_N;
+            let mut packed_b = vec![0.0f32; packed_b_size];
+
+            for i in 0..n_strips {
+                let n_start = i * TILE_N;
+                let actual_n = if n_start + TILE_N <= n_size { TILE_N } else { n_size - n_start };
+                for k in 0..k_size {
+                    let dst_off = i * k_size * TILE_N + k * TILE_N;
+                    for x in 0..actual_n {
+                        packed_b[dst_off + x] = b[k * n_size + n_start + x].to_f32();
+                    }
+                }
+            }
+
+            let mut m = 0;
+            while m + TILE_M <= m_size {
+                let mut n = 0;
+                let mut strip_idx = 0;
+                while n + TILE_N <= n_size {
+                    // 24 f32 accumulators
+                    let mut acc = [[0.0f32; TILE_N]; TILE_M];
+                    let b_base = strip_idx * k_size * TILE_N;
+                    for k in 0..k_size {
+                        let b_off = b_base + k * TILE_N;
+                        for row in 0..TILE_M {
+                            let a_val = a[(m + row) * k_size + k].to_f32();
+                            for col in 0..TILE_N {
+                                acc[row][col] = a_val.mul_add(packed_b[b_off + col], acc[row][col]);
+                            }
+                        }
+                    }
+                    for row in 0..TILE_M {
+                        for col in 0..TILE_N {
+                            c[(m + row) * n_size + n + col] = f16::from_f32(acc[row][col]);
+                        }
+                    }
+                    n += TILE_N;
+                    strip_idx += 1;
+                }
+                while n < n_size {
+                    for i in 0..TILE_M {
+                        let mut sum = 0.0f32;
+                        for k in 0..k_size {
+                            sum += a[(m + i) * k_size + k].to_f32() * b[k * n_size + n].to_f32();
+                        }
+                        c[(m + i) * n_size + n] = f16::from_f32(sum);
+                    }
+                    n += 1;
+                }
+                m += TILE_M;
+            }
+            while m < m_size {
+                for n in 0..n_size {
+                    let mut sum = 0.0f32;
+                    for k in 0..k_size {
+                        sum += a[m * k_size + k].to_f32() * b[k * n_size + n].to_f32();
+                    }
+                    c[m * n_size + n] = f16::from_f32(sum);
+                }
+                m += 1;
+            }
+        }
+    };
+    // NEON bf16: 8×12 microkernel with f32 arithmetic (convert on load/store)
+    (neon, bf16) => {
+        #[inline(always)]
+        pub fn matmul(a: &[bf16], b: &[bf16], c: &mut [bf16], m_size: usize, n_size: usize, k_size: usize) {
+            assert!(a.len() >= m_size * k_size);
+            assert!(b.len() >= n_size * k_size);
+            assert!(c.len() >= m_size * n_size);
+
+            const TILE_M: usize = 8;
+            const TILE_N: usize = 12;
+
+            let n_strips = (n_size + TILE_N - 1) / TILE_N;
+            let packed_b_size = n_strips * k_size * TILE_N;
+            let mut packed_b = vec![0.0f32; packed_b_size];
+
+            for i in 0..n_strips {
+                let n_start = i * TILE_N;
+                let actual_n = if n_start + TILE_N <= n_size { TILE_N } else { n_size - n_start };
+                for k in 0..k_size {
+                    let dst_off = i * k_size * TILE_N + k * TILE_N;
+                    for x in 0..actual_n {
+                        packed_b[dst_off + x] = b[k * n_size + n_start + x].to_f32();
+                    }
+                }
+            }
+
+            let mut m = 0;
+            while m + TILE_M <= m_size {
+                let mut n = 0;
+                let mut strip_idx = 0;
+                while n + TILE_N <= n_size {
+                    let mut acc = [[0.0f32; TILE_N]; TILE_M];
+                    let b_base = strip_idx * k_size * TILE_N;
+                    for k in 0..k_size {
+                        let b_off = b_base + k * TILE_N;
+                        for row in 0..TILE_M {
+                            let a_val = a[(m + row) * k_size + k].to_f32();
+                            for col in 0..TILE_N {
+                                acc[row][col] = a_val.mul_add(packed_b[b_off + col], acc[row][col]);
+                            }
+                        }
+                    }
+                    for row in 0..TILE_M {
+                        for col in 0..TILE_N {
+                            c[(m + row) * n_size + n + col] = bf16::from_f32(acc[row][col]);
+                        }
+                    }
+                    n += TILE_N;
+                    strip_idx += 1;
+                }
+                while n < n_size {
+                    for i in 0..TILE_M {
+                        let mut sum = 0.0f32;
+                        for k in 0..k_size {
+                            sum += a[(m + i) * k_size + k].to_f32() * b[k * n_size + n].to_f32();
+                        }
+                        c[(m + i) * n_size + n] = bf16::from_f32(sum);
+                    }
+                    n += 1;
+                }
+                m += TILE_M;
+            }
+            while m < m_size {
+                for n in 0..n_size {
+                    let mut sum = 0.0f32;
+                    for k in 0..k_size {
+                        sum += a[m * k_size + k].to_f32() * b[k * n_size + n].to_f32();
+                    }
+                    c[m * n_size + n] = bf16::from_f32(sum);
+                }
+                m += 1;
+            }
+        }
+    };
+    // f16/bf16 on any ISA: use scalar Element-based GEMM (SIMD load/store handled by simd_primitive)
+    ($isa:ident, f16) => {
+        #[inline(always)]
+        pub fn matmul(a: &[f16], b: &[f16], c: &mut [f16], m_size: usize, n_size: usize, k_size: usize) {
+            assert!(a.len() >= m_size * k_size);
+            assert!(b.len() >= n_size * k_size);
+            assert!(c.len() >= m_size * n_size);
+            for m in 0..m_size {
+                for n in 0..n_size {
+                    let mut sum = 0.0f32;
+                    for k in 0..k_size {
+                        sum += a[m * k_size + k].to_f32() * b[k * n_size + n].to_f32();
+                    }
+                    c[m * n_size + n] = <f16 as Element>::from_f32(sum);
+                }
+            }
+        }
+    };
+    ($isa:ident, bf16) => {
+        #[inline(always)]
+        pub fn matmul(a: &[bf16], b: &[bf16], c: &mut [bf16], m_size: usize, n_size: usize, k_size: usize) {
+            assert!(a.len() >= m_size * k_size);
+            assert!(b.len() >= n_size * k_size);
+            assert!(c.len() >= m_size * n_size);
+            for m in 0..m_size {
+                for n in 0..n_size {
+                    let mut sum = 0.0f32;
+                    for k in 0..k_size {
+                        sum += a[m * k_size + k].to_f32() * b[k * n_size + n].to_f32();
+                    }
+                    c[m * n_size + n] = <bf16 as Element>::from_f32(sum);
+                }
+            }
+        }
+    };
     (avx512, $elem:ident) => {
         // AVX-512 Optimized Implementation: 14×32 microkernel
         // 28 zmm accumulator registers (14 rows × 2 vectors of 16 lanes)
@@ -687,39 +874,38 @@ macro_rules! define_matmul_op {
                 let mut strip_idx = 0;
                 while n + TILE_N <= n_size {
                     unsafe {
-                        use std::arch::x86_64::*;
                         // 28 accumulators: 14 rows × 2 vectors
-                        let mut c_0_0 = _mm512_setzero_ps(); let mut c_0_1 = _mm512_setzero_ps();
-                        let mut c_1_0 = _mm512_setzero_ps(); let mut c_1_1 = _mm512_setzero_ps();
-                        let mut c_2_0 = _mm512_setzero_ps(); let mut c_2_1 = _mm512_setzero_ps();
-                        let mut c_3_0 = _mm512_setzero_ps(); let mut c_3_1 = _mm512_setzero_ps();
-                        let mut c_4_0 = _mm512_setzero_ps(); let mut c_4_1 = _mm512_setzero_ps();
-                        let mut c_5_0 = _mm512_setzero_ps(); let mut c_5_1 = _mm512_setzero_ps();
-                        let mut c_6_0 = _mm512_setzero_ps(); let mut c_6_1 = _mm512_setzero_ps();
-                        let mut c_7_0 = _mm512_setzero_ps(); let mut c_7_1 = _mm512_setzero_ps();
-                        let mut c_8_0 = _mm512_setzero_ps(); let mut c_8_1 = _mm512_setzero_ps();
-                        let mut c_9_0 = _mm512_setzero_ps(); let mut c_9_1 = _mm512_setzero_ps();
-                        let mut c_10_0 = _mm512_setzero_ps(); let mut c_10_1 = _mm512_setzero_ps();
-                        let mut c_11_0 = _mm512_setzero_ps(); let mut c_11_1 = _mm512_setzero_ps();
-                        let mut c_12_0 = _mm512_setzero_ps(); let mut c_12_1 = _mm512_setzero_ps();
-                        let mut c_13_0 = _mm512_setzero_ps(); let mut c_13_1 = _mm512_setzero_ps();
+                        let mut c_0_0 = $crate::simd_primitive!(avx512, $elem, zero); let mut c_0_1 = $crate::simd_primitive!(avx512, $elem, zero);
+                        let mut c_1_0 = $crate::simd_primitive!(avx512, $elem, zero); let mut c_1_1 = $crate::simd_primitive!(avx512, $elem, zero);
+                        let mut c_2_0 = $crate::simd_primitive!(avx512, $elem, zero); let mut c_2_1 = $crate::simd_primitive!(avx512, $elem, zero);
+                        let mut c_3_0 = $crate::simd_primitive!(avx512, $elem, zero); let mut c_3_1 = $crate::simd_primitive!(avx512, $elem, zero);
+                        let mut c_4_0 = $crate::simd_primitive!(avx512, $elem, zero); let mut c_4_1 = $crate::simd_primitive!(avx512, $elem, zero);
+                        let mut c_5_0 = $crate::simd_primitive!(avx512, $elem, zero); let mut c_5_1 = $crate::simd_primitive!(avx512, $elem, zero);
+                        let mut c_6_0 = $crate::simd_primitive!(avx512, $elem, zero); let mut c_6_1 = $crate::simd_primitive!(avx512, $elem, zero);
+                        let mut c_7_0 = $crate::simd_primitive!(avx512, $elem, zero); let mut c_7_1 = $crate::simd_primitive!(avx512, $elem, zero);
+                        let mut c_8_0 = $crate::simd_primitive!(avx512, $elem, zero); let mut c_8_1 = $crate::simd_primitive!(avx512, $elem, zero);
+                        let mut c_9_0 = $crate::simd_primitive!(avx512, $elem, zero); let mut c_9_1 = $crate::simd_primitive!(avx512, $elem, zero);
+                        let mut c_10_0 = $crate::simd_primitive!(avx512, $elem, zero); let mut c_10_1 = $crate::simd_primitive!(avx512, $elem, zero);
+                        let mut c_11_0 = $crate::simd_primitive!(avx512, $elem, zero); let mut c_11_1 = $crate::simd_primitive!(avx512, $elem, zero);
+                        let mut c_12_0 = $crate::simd_primitive!(avx512, $elem, zero); let mut c_12_1 = $crate::simd_primitive!(avx512, $elem, zero);
+                        let mut c_13_0 = $crate::simd_primitive!(avx512, $elem, zero); let mut c_13_1 = $crate::simd_primitive!(avx512, $elem, zero);
 
                         let mut b_ptr = packed_b.as_ptr().add(strip_idx * k_size * TILE_N);
 
                         for _k in 0..k_size {
                             // Load 2 vectors from packed B
-                            let vb_0 = _mm512_loadu_ps(b_ptr);
-                            let vb_1 = _mm512_loadu_ps(b_ptr.add(LANES));
+                            let vb_0 = $crate::simd_primitive!(avx512, $elem, loadu, b_ptr);
+                            let vb_1 = $crate::simd_primitive!(avx512, $elem, loadu, b_ptr.add(LANES));
 
                             // Software prefetch 512B ahead
-                            _mm_prefetch(b_ptr.add(TILE_N * 8) as *const i8, _MM_HINT_T0);
+                            $crate::simd_primitive!(avx512, $elem, prefetch, b_ptr.add(TILE_N * 8) as *const i8, 0);
 
                             // Broadcast A values and FMA for each of 14 rows
                             macro_rules! fma_row {
                                 ($row:expr, $c0:ident, $c1:ident) => {
-                                    let va = _mm512_set1_ps(*a.as_ptr().add((m + $row) * k_size + _k));
-                                    $c0 = _mm512_fmadd_ps(va, vb_0, $c0);
-                                    $c1 = _mm512_fmadd_ps(va, vb_1, $c1);
+                                    let va = $crate::simd_primitive!(avx512, $elem, splat, *a.as_ptr().add((m + $row) * k_size + _k));
+                                    $c0 = $crate::simd_primitive!(avx512, $elem, fma, va, vb_0, $c0);
+                                    $c1 = $crate::simd_primitive!(avx512, $elem, fma, va, vb_1, $c1);
                                 };
                             }
                             fma_row!(0, c_0_0, c_0_1);
@@ -743,8 +929,8 @@ macro_rules! define_matmul_op {
                         // Store results
                         macro_rules! store_row {
                             ($row:expr, $c0:expr, $c1:expr) => {
-                                _mm512_storeu_ps(c.as_mut_ptr().add((m + $row) * n_size + n), $c0);
-                                _mm512_storeu_ps(c.as_mut_ptr().add((m + $row) * n_size + n + LANES), $c1);
+                                $crate::simd_primitive!(avx512, $elem, storeu, c.as_mut_ptr().add((m + $row) * n_size + n), $c0);
+                                $crate::simd_primitive!(avx512, $elem, storeu, c.as_mut_ptr().add((m + $row) * n_size + n + LANES), $c1);
                             };
                         }
                         store_row!(0, c_0_0, c_0_1);
@@ -1012,12 +1198,181 @@ macro_rules! define_matmul_op {
         }
     };
 
+    (neon, $elem:ident) => {
+        // NEON Optimized Implementation: 8×12 microkernel
+        // 24 float32x4_t accumulators (8 rows × 3 vectors of 4 lanes)
+        // Register budget: 24 acc + 3 B-vec + 1 A-broadcast + 4 temp = 32 (full NEON file)
+        #[inline(always)]
+        pub fn matmul(a: &[$elem], b: &[$elem], c: &mut [$elem], m_size: usize, n_size: usize, k_size: usize) {
+            const TILE_M: usize = 8;
+            const LANES: usize = $crate::simd_primitive!(neon, $elem, lanes);
+            const TILE_N_VECS: usize = 3;
+            const TILE_N: usize = TILE_N_VECS * LANES; // 12 for f32
+
+            assert!(a.len() >= m_size * k_size);
+            assert!(b.len() >= n_size * k_size);
+            assert!(c.len() >= m_size * n_size);
+
+            // Pack B into column strips of width TILE_N
+            let n_strips = (n_size + TILE_N - 1) / TILE_N;
+            let packed_b_size = n_strips * k_size * TILE_N;
+            let mut packed_b: Vec<$elem> = vec![<$elem as Element>::ZERO; packed_b_size];
+
+            for i in 0..n_strips {
+                let n_start = i * TILE_N;
+                if n_start + TILE_N <= n_size {
+                    for k in 0..k_size {
+                        let src_off = k * n_size + n_start;
+                        let dst_off = i * k_size * TILE_N + k * TILE_N;
+                        packed_b[dst_off..dst_off + TILE_N].copy_from_slice(&b[src_off..src_off + TILE_N]);
+                    }
+                } else {
+                    let actual_n = n_size - n_start;
+                    for k in 0..k_size {
+                        let src_off = k * n_size + n_start;
+                        let dst_off = i * k_size * TILE_N + k * TILE_N;
+                        packed_b[dst_off..dst_off + actual_n].copy_from_slice(&b[src_off..src_off + actual_n]);
+                    }
+                }
+            }
+
+            // Main tiled loop
+            let mut m = 0;
+            while m + TILE_M <= m_size {
+                let mut n = 0;
+                let mut strip_idx = 0;
+
+                while n + TILE_N <= n_size {
+                    #[allow(unused_unsafe)]
+                    unsafe {
+                        // 24 accumulators: 8 rows × 3 vectors
+                        let mut c_0_0 = $crate::simd_primitive!(neon, $elem, zero);
+                        let mut c_0_1 = $crate::simd_primitive!(neon, $elem, zero);
+                        let mut c_0_2 = $crate::simd_primitive!(neon, $elem, zero);
+                        let mut c_1_0 = $crate::simd_primitive!(neon, $elem, zero);
+                        let mut c_1_1 = $crate::simd_primitive!(neon, $elem, zero);
+                        let mut c_1_2 = $crate::simd_primitive!(neon, $elem, zero);
+                        let mut c_2_0 = $crate::simd_primitive!(neon, $elem, zero);
+                        let mut c_2_1 = $crate::simd_primitive!(neon, $elem, zero);
+                        let mut c_2_2 = $crate::simd_primitive!(neon, $elem, zero);
+                        let mut c_3_0 = $crate::simd_primitive!(neon, $elem, zero);
+                        let mut c_3_1 = $crate::simd_primitive!(neon, $elem, zero);
+                        let mut c_3_2 = $crate::simd_primitive!(neon, $elem, zero);
+                        let mut c_4_0 = $crate::simd_primitive!(neon, $elem, zero);
+                        let mut c_4_1 = $crate::simd_primitive!(neon, $elem, zero);
+                        let mut c_4_2 = $crate::simd_primitive!(neon, $elem, zero);
+                        let mut c_5_0 = $crate::simd_primitive!(neon, $elem, zero);
+                        let mut c_5_1 = $crate::simd_primitive!(neon, $elem, zero);
+                        let mut c_5_2 = $crate::simd_primitive!(neon, $elem, zero);
+                        let mut c_6_0 = $crate::simd_primitive!(neon, $elem, zero);
+                        let mut c_6_1 = $crate::simd_primitive!(neon, $elem, zero);
+                        let mut c_6_2 = $crate::simd_primitive!(neon, $elem, zero);
+                        let mut c_7_0 = $crate::simd_primitive!(neon, $elem, zero);
+                        let mut c_7_1 = $crate::simd_primitive!(neon, $elem, zero);
+                        let mut c_7_2 = $crate::simd_primitive!(neon, $elem, zero);
+
+                        let mut b_ptr = packed_b.as_ptr().add(strip_idx * k_size * TILE_N);
+
+                        // A row pointers
+                        let mut a_ptr_0 = a.as_ptr().add((m + 0) * k_size);
+                        let mut a_ptr_1 = a.as_ptr().add((m + 1) * k_size);
+                        let mut a_ptr_2 = a.as_ptr().add((m + 2) * k_size);
+                        let mut a_ptr_3 = a.as_ptr().add((m + 3) * k_size);
+                        let mut a_ptr_4 = a.as_ptr().add((m + 4) * k_size);
+                        let mut a_ptr_5 = a.as_ptr().add((m + 5) * k_size);
+                        let mut a_ptr_6 = a.as_ptr().add((m + 6) * k_size);
+                        let mut a_ptr_7 = a.as_ptr().add((m + 7) * k_size);
+
+                        for _k in 0..k_size {
+                            // Load 3 B vectors from packed buffer
+                            let vb_0 = $crate::simd_primitive!(neon, $elem, loadu, b_ptr);
+                            let vb_1 = $crate::simd_primitive!(neon, $elem, loadu, b_ptr.add(LANES));
+                            let vb_2 = $crate::simd_primitive!(neon, $elem, loadu, b_ptr.add(LANES * 2));
+
+                            // 8 rows × 3 FMA each
+                            macro_rules! fma_row {
+                                ($a_ptr:ident, $c0:ident, $c1:ident, $c2:ident) => {
+                                    let va = $crate::simd_primitive!(neon, $elem, splat, *$a_ptr);
+                                    $c0 = $crate::simd_primitive!(neon, $elem, fma, va, vb_0, $c0);
+                                    $c1 = $crate::simd_primitive!(neon, $elem, fma, va, vb_1, $c1);
+                                    $c2 = $crate::simd_primitive!(neon, $elem, fma, va, vb_2, $c2);
+                                };
+                            }
+                            fma_row!(a_ptr_0, c_0_0, c_0_1, c_0_2);
+                            fma_row!(a_ptr_1, c_1_0, c_1_1, c_1_2);
+                            fma_row!(a_ptr_2, c_2_0, c_2_1, c_2_2);
+                            fma_row!(a_ptr_3, c_3_0, c_3_1, c_3_2);
+                            fma_row!(a_ptr_4, c_4_0, c_4_1, c_4_2);
+                            fma_row!(a_ptr_5, c_5_0, c_5_1, c_5_2);
+                            fma_row!(a_ptr_6, c_6_0, c_6_1, c_6_2);
+                            fma_row!(a_ptr_7, c_7_0, c_7_1, c_7_2);
+
+                            b_ptr = b_ptr.add(TILE_N);
+                            a_ptr_0 = a_ptr_0.add(1);
+                            a_ptr_1 = a_ptr_1.add(1);
+                            a_ptr_2 = a_ptr_2.add(1);
+                            a_ptr_3 = a_ptr_3.add(1);
+                            a_ptr_4 = a_ptr_4.add(1);
+                            a_ptr_5 = a_ptr_5.add(1);
+                            a_ptr_6 = a_ptr_6.add(1);
+                            a_ptr_7 = a_ptr_7.add(1);
+                        }
+
+                        // Store 24 results
+                        macro_rules! store_row {
+                            ($row:expr, $c0:expr, $c1:expr, $c2:expr) => {
+                                $crate::simd_primitive!(neon, $elem, storeu, c.as_mut_ptr().add((m + $row) * n_size + n), $c0);
+                                $crate::simd_primitive!(neon, $elem, storeu, c.as_mut_ptr().add((m + $row) * n_size + n + LANES), $c1);
+                                $crate::simd_primitive!(neon, $elem, storeu, c.as_mut_ptr().add((m + $row) * n_size + n + LANES * 2), $c2);
+                            };
+                        }
+                        store_row!(0, c_0_0, c_0_1, c_0_2);
+                        store_row!(1, c_1_0, c_1_1, c_1_2);
+                        store_row!(2, c_2_0, c_2_1, c_2_2);
+                        store_row!(3, c_3_0, c_3_1, c_3_2);
+                        store_row!(4, c_4_0, c_4_1, c_4_2);
+                        store_row!(5, c_5_0, c_5_1, c_5_2);
+                        store_row!(6, c_6_0, c_6_1, c_6_2);
+                        store_row!(7, c_7_0, c_7_1, c_7_2);
+                    }
+                    n += TILE_N;
+                    strip_idx += 1;
+                }
+
+                // Remainder N (scalar)
+                while n < n_size {
+                    for i in 0..TILE_M {
+                        let mut sum: $elem = <$elem as Element>::ZERO;
+                        for k in 0..k_size {
+                            sum = a[(m + i) * k_size + k].mul_add(b[k * n_size + n], sum);
+                        }
+                        c[(m + i) * n_size + n] = sum;
+                    }
+                    n += 1;
+                }
+                m += TILE_M;
+            }
+
+            // Remainder M (scalar)
+            while m < m_size {
+                for n in 0..n_size {
+                    let mut sum: $elem = <$elem as Element>::ZERO;
+                    for k in 0..k_size {
+                        sum = a[m * k_size + k].mul_add(b[k * n_size + n], sum);
+                    }
+                    c[m * n_size + n] = sum;
+                }
+                m += 1;
+            }
+        }
+    };
+
     ($isa:ident, $elem:ident) => {
         // Default / Scalar Implementation
         #[inline(always)]
         pub fn matmul(a: &[$elem], b: &[$elem], c: &mut [$elem], m_size: usize, n_size: usize, k_size: usize) {
              assert!(a.len() >= m_size * k_size);
-            assert!(b.len() >= n_size * k_size); 
+            assert!(b.len() >= n_size * k_size);
             assert!(c.len() >= m_size * n_size);
 
             for m in 0..m_size {
@@ -1026,9 +1381,224 @@ macro_rules! define_matmul_op {
                     for k in 0..k_size {
                         let val_a = a[m * k_size + k];
                         let val_b = b[k * n_size + n];
-                        sum = val_a.mul_add(val_b, sum); 
+                        sum = val_a.mul_add(val_b, sum);
                     }
                     c[m * n_size + n] = sum;
+                }
+            }
+        }
+    };
+}
+
+/// Defines Flash Attention operations (flash_attention, flash_attention_paged)
+///
+/// All internal computation is done in f32 space regardless of $elem type.
+/// For f32: zero-copy via as_f32_slice(). For f16/bf16: one-time conversion.
+/// SIMD operations use simd_primitive!($isa, f32, ...) for the hot loops.
+#[macro_export]
+macro_rules! define_flash_attention_ops {
+    ($isa:ident, $elem:ident) => {
+        /// Dot product of two f32 slices, using simd_primitive! for SIMD ops.
+        /// Double-accumulator for better ILP.
+        #[inline(always)]
+        fn attn_dot_f32(a: *const f32, b: *const f32, len: usize) -> f32 {
+            const LANES: usize = $crate::simd_primitive!($isa, f32, lanes);
+            let mut d = 0usize;
+            #[allow(unused_unsafe)]
+            let mut acc0 = unsafe { $crate::simd_primitive!($isa, f32, zero) };
+            #[allow(unused_unsafe)]
+            let mut acc1 = unsafe { $crate::simd_primitive!($isa, f32, zero) };
+            while d + LANES * 2 <= len {
+                #[allow(unused_unsafe)]
+                unsafe {
+                    let va0 = $crate::simd_primitive!($isa, f32, load, a.add(d));
+                    let vb0 = $crate::simd_primitive!($isa, f32, load, b.add(d));
+                    acc0 = $crate::simd_primitive!($isa, f32, fma, va0, vb0, acc0);
+                    let va1 = $crate::simd_primitive!($isa, f32, load, a.add(d + LANES));
+                    let vb1 = $crate::simd_primitive!($isa, f32, load, b.add(d + LANES));
+                    acc1 = $crate::simd_primitive!($isa, f32, fma, va1, vb1, acc1);
+                }
+                d += LANES * 2;
+            }
+            if d + LANES <= len {
+                #[allow(unused_unsafe)]
+                unsafe {
+                    let va = $crate::simd_primitive!($isa, f32, load, a.add(d));
+                    let vb = $crate::simd_primitive!($isa, f32, load, b.add(d));
+                    acc0 = $crate::simd_primitive!($isa, f32, fma, va, vb, acc0);
+                }
+                d += LANES;
+            }
+            #[allow(unused_unsafe)]
+            let combined = unsafe { $crate::simd_primitive!($isa, f32, add, acc0, acc1) };
+            #[allow(unused_unsafe)]
+            let mut sum: f32 = unsafe { $crate::simd_primitive!($isa, f32, reduce_sum, combined) };
+            while d < len { unsafe { sum += *a.add(d) * *b.add(d); } d += 1; }
+            sum
+        }
+
+        /// FMA accumulate: acc[0..len] += alpha * src[0..len], using simd_primitive!.
+        /// Double-width unrolling for better throughput.
+        #[inline(always)]
+        fn attn_fma_f32(acc: *mut f32, src: *const f32, alpha: f32, len: usize) {
+            const LANES: usize = $crate::simd_primitive!($isa, f32, lanes);
+            #[allow(unused_unsafe)]
+            let va = unsafe { $crate::simd_primitive!($isa, f32, splat, alpha) };
+            let mut d = 0usize;
+            while d + LANES * 2 <= len {
+                #[allow(unused_unsafe)]
+                unsafe {
+                    let cur0 = $crate::simd_primitive!($isa, f32, load, acc.add(d));
+                    let vs0 = $crate::simd_primitive!($isa, f32, load, src.add(d));
+                    let res0 = $crate::simd_primitive!($isa, f32, fma, va, vs0, cur0);
+                    $crate::simd_primitive!($isa, f32, store, acc.add(d), res0);
+                    let cur1 = $crate::simd_primitive!($isa, f32, load, acc.add(d + LANES));
+                    let vs1 = $crate::simd_primitive!($isa, f32, load, src.add(d + LANES));
+                    let res1 = $crate::simd_primitive!($isa, f32, fma, va, vs1, cur1);
+                    $crate::simd_primitive!($isa, f32, store, acc.add(d + LANES), res1);
+                }
+                d += LANES * 2;
+            }
+            if d + LANES <= len {
+                #[allow(unused_unsafe)]
+                unsafe {
+                    let cur = $crate::simd_primitive!($isa, f32, load, acc.add(d));
+                    let vs = $crate::simd_primitive!($isa, f32, load, src.add(d));
+                    let res = $crate::simd_primitive!($isa, f32, fma, va, vs, cur);
+                    $crate::simd_primitive!($isa, f32, store, acc.add(d), res);
+                }
+                d += LANES;
+            }
+            while d < len { unsafe { *acc.add(d) += alpha * *src.add(d); } d += 1; }
+        }
+
+        /// Standard multi-head attention with optional causal masking.
+        /// All computation in f32 space; input/output converted from/to $elem.
+        #[inline(always)]
+        pub fn flash_attention(
+            q: &[$elem], k: &[$elem], v: &[$elem], output: &mut [$elem],
+            seq_len: usize, num_heads: usize, head_dim: usize,
+            scale: f32, causal: bool,
+        ) {
+            let mut scores = vec![0.0f32; seq_len];
+            let mut acc = vec![0.0f32; head_dim];
+
+            let owned_q: Vec<f32>;
+            let owned_k: Vec<f32>;
+            let owned_v: Vec<f32>;
+            let q_f32: &[f32] = if let Some(f) = <$elem as Element>::as_f32_slice(q) { f }
+                else { owned_q = q.iter().map(|v| v.to_f32()).collect(); &owned_q };
+            let k_f32: &[f32] = if let Some(f) = <$elem as Element>::as_f32_slice(k) { f }
+                else { owned_k = k.iter().map(|v| v.to_f32()).collect(); &owned_k };
+            let v_f32: &[f32] = if let Some(f) = <$elem as Element>::as_f32_slice(v) { f }
+                else { owned_v = v.iter().map(|v| v.to_f32()).collect(); &owned_v };
+
+            for h in 0..num_heads {
+                for i in 0..seq_len {
+                    let q_off = h * seq_len * head_dim + i * head_dim;
+                    let o_off = q_off;
+                    let max_j = if causal { i + 1 } else { seq_len };
+                    let mut max_val = f32::NEG_INFINITY;
+
+                    let q_ptr = unsafe { q_f32.as_ptr().add(q_off) };
+                    for j in 0..max_j {
+                        let k_off = h * seq_len * head_dim + j * head_dim;
+                        let s = attn_dot_f32(q_ptr, unsafe { k_f32.as_ptr().add(k_off) }, head_dim) * scale;
+                        if s > max_val { max_val = s; }
+                        scores[j] = s;
+                    }
+
+                    let mut sum_exp = 0.0f32;
+                    for j in 0..max_j {
+                        scores[j] = (scores[j] - max_val).exp();
+                        sum_exp += scores[j];
+                    }
+                    let inv_sum = 1.0 / sum_exp;
+
+                    acc[..head_dim].fill(0.0);
+                    for j in 0..max_j {
+                        let v_off = h * seq_len * head_dim + j * head_dim;
+                        attn_fma_f32(acc.as_mut_ptr(), unsafe { v_f32.as_ptr().add(v_off) }, scores[j] * inv_sum, head_dim);
+                    }
+
+                    if let Some(of) = <$elem as Element>::as_f32_slice_mut(output) {
+                        of[o_off..o_off + head_dim].copy_from_slice(&acc[..head_dim]);
+                    } else {
+                        for d in 0..head_dim {
+                            output[o_off + d] = <$elem as Element>::from_f32(acc[d]);
+                        }
+                    }
+                }
+            }
+        }
+
+        /// Paged KV-cache attention with GQA support.
+        /// All computation in f32 space; input/output converted from/to $elem.
+        #[inline(always)]
+        pub fn flash_attention_paged(
+            q: &[$elem], k_cache: &[$elem], v_cache: &[$elem],
+            page_table: &[usize], output: &mut [$elem],
+            seq_len: usize, cache_len: usize,
+            num_heads: usize, num_kv_heads: usize, head_dim: usize,
+            page_size: usize, scale: f32,
+        ) {
+            let heads_per_kv = num_heads / num_kv_heads;
+            let pages_per_kv = (cache_len + page_size - 1) / page_size;
+
+            let mut scores = vec![0.0f32; cache_len];
+            let mut acc = vec![0.0f32; head_dim];
+
+            let owned_q: Vec<f32>;
+            let owned_k: Vec<f32>;
+            let owned_v: Vec<f32>;
+            let q_f32: &[f32] = if let Some(f) = <$elem as Element>::as_f32_slice(q) { f }
+                else { owned_q = q.iter().map(|v| v.to_f32()).collect(); &owned_q };
+            let k_f32: &[f32] = if let Some(f) = <$elem as Element>::as_f32_slice(k_cache) { f }
+                else { owned_k = k_cache.iter().map(|v| v.to_f32()).collect(); &owned_k };
+            let v_f32: &[f32] = if let Some(f) = <$elem as Element>::as_f32_slice(v_cache) { f }
+                else { owned_v = v_cache.iter().map(|v| v.to_f32()).collect(); &owned_v };
+
+            for h in 0..num_heads {
+                let kv_h = h / heads_per_kv;
+                for i in 0..seq_len {
+                    let q_off = h * seq_len * head_dim + i * head_dim;
+                    let o_off = q_off;
+                    let mut max_val = f32::NEG_INFINITY;
+
+                    let q_ptr = unsafe { q_f32.as_ptr().add(q_off) };
+                    for j in 0..cache_len {
+                        let page_idx = j / page_size;
+                        let page_off = j % page_size;
+                        let phys_page = page_table[kv_h * pages_per_kv + page_idx];
+                        let k_off = phys_page * page_size * head_dim + page_off * head_dim;
+                        let s = attn_dot_f32(q_ptr, unsafe { k_f32.as_ptr().add(k_off) }, head_dim) * scale;
+                        if s > max_val { max_val = s; }
+                        scores[j] = s;
+                    }
+
+                    let mut sum_exp = 0.0f32;
+                    for j in 0..cache_len {
+                        scores[j] = (scores[j] - max_val).exp();
+                        sum_exp += scores[j];
+                    }
+                    let inv_sum = 1.0 / sum_exp;
+
+                    acc[..head_dim].fill(0.0);
+                    for j in 0..cache_len {
+                        let page_idx = j / page_size;
+                        let page_off = j % page_size;
+                        let phys_page = page_table[kv_h * pages_per_kv + page_idx];
+                        let v_off = phys_page * page_size * head_dim + page_off * head_dim;
+                        attn_fma_f32(acc.as_mut_ptr(), unsafe { v_f32.as_ptr().add(v_off) }, scores[j] * inv_sum, head_dim);
+                    }
+
+                    if let Some(of) = <$elem as Element>::as_f32_slice_mut(output) {
+                        of[o_off..o_off + head_dim].copy_from_slice(&acc[..head_dim]);
+                    } else {
+                        for d in 0..head_dim {
+                            output[o_off + d] = <$elem as Element>::from_f32(acc[d]);
+                        }
+                    }
                 }
             }
         }

@@ -205,6 +205,105 @@ macro_rules! simd_primitive {
 
     (avx512, f32, prefetch, $p:expr, $dist:expr) => { std::arch::x86_64::_mm_prefetch($p as *const i8, std::arch::x86_64::_MM_HINT_T0) };
 
+    // --- AVX-512 f16 (F16C via 256-bit halves, compute in f32) ---
+    (avx512, f16, lanes) => { 16 };
+    (avx512, f16, num_regs) => { 32 };
+    (avx512, f16, zero) => { std::arch::x86_64::_mm512_setzero_ps() };
+    (avx512, f16, splat, $v:expr) => { { std::arch::x86_64::_mm512_set1_ps($v.to_f32()) } };
+    (avx512, f16, load, $p:expr) => {
+        {
+            // Load 16 f16 as two 128-bit chunks, convert each to 256-bit f32, combine to 512-bit
+            let lo = std::arch::x86_64::_mm256_cvtph_ps(
+                std::arch::x86_64::_mm_loadu_si128($p as *const std::arch::x86_64::__m128i)
+            );
+            let hi = std::arch::x86_64::_mm256_cvtph_ps(
+                std::arch::x86_64::_mm_loadu_si128(($p as *const std::arch::x86_64::__m128i).add(1))
+            );
+            let mut result = std::arch::x86_64::_mm512_castps256_ps512(lo);
+            result = std::arch::x86_64::_mm512_insertf32x8(result, hi, 1);
+            result
+        }
+    };
+    (avx512, f16, store, $p:expr, $v:expr) => {
+        {
+            let lo = std::arch::x86_64::_mm512_castps512_ps256($v);
+            let hi = std::arch::x86_64::_mm512_extractf32x8_ps($v, 1);
+            let lo_h = std::arch::x86_64::_mm256_cvtps_ph(lo, std::arch::x86_64::_MM_FROUND_TO_NEAREST_INT);
+            let hi_h = std::arch::x86_64::_mm256_cvtps_ph(hi, std::arch::x86_64::_MM_FROUND_TO_NEAREST_INT);
+            std::arch::x86_64::_mm_storeu_si128($p as *mut std::arch::x86_64::__m128i, lo_h);
+            std::arch::x86_64::_mm_storeu_si128(($p as *mut std::arch::x86_64::__m128i).add(1), hi_h);
+        }
+    };
+    (avx512, f16, optimal_tile_m) => { 14 };
+    (avx512, f16, optimal_tile_n_vecs) => { 2 };
+    (avx512, f16, prefetch_distance) => { 512 };
+    (avx512, f16, has_native_fp16) => { false };
+    (avx512, f16, has_native_bf16) => { false };
+    (avx512, f16, loadu, $p:expr) => { $crate::simd_primitive!(avx512, f16, load, $p) };
+    (avx512, f16, storeu, $p:expr, $v:expr) => { $crate::simd_primitive!(avx512, f16, store, $p, $v) };
+    (avx512, f16, add, $a:expr, $b:expr) => { std::arch::x86_64::_mm512_add_ps($a, $b) };
+    (avx512, f16, sub, $a:expr, $b:expr) => { std::arch::x86_64::_mm512_sub_ps($a, $b) };
+    (avx512, f16, mul, $a:expr, $b:expr) => { std::arch::x86_64::_mm512_mul_ps($a, $b) };
+    (avx512, f16, div, $a:expr, $b:expr) => { std::arch::x86_64::_mm512_div_ps($a, $b) };
+    (avx512, f16, fma, $a:expr, $b:expr, $c:expr) => { std::arch::x86_64::_mm512_fmadd_ps($a, $b, $c) };
+    (avx512, f16, neg, $a:expr) => { std::arch::x86_64::_mm512_sub_ps(std::arch::x86_64::_mm512_setzero_ps(), $a) };
+    (avx512, f16, max, $a:expr, $b:expr) => { std::arch::x86_64::_mm512_max_ps($a, $b) };
+    (avx512, f16, min, $a:expr, $b:expr) => { std::arch::x86_64::_mm512_min_ps($a, $b) };
+    (avx512, f16, reduce_sum, $v:expr) => { std::arch::x86_64::_mm512_reduce_add_ps($v) };
+    (avx512, f16, reduce_max, $v:expr) => { std::arch::x86_64::_mm512_reduce_max_ps($v) };
+    (avx512, f16, abs, $a:expr) => { std::arch::x86_64::_mm512_abs_ps($a) };
+    (avx512, f16, sqrt, $a:expr) => { std::arch::x86_64::_mm512_sqrt_ps($a) };
+    (avx512, f16, rsqrt, $a:expr) => { std::arch::x86_64::_mm512_rsqrt14_ps($a) };
+    (avx512, f16, recip, $a:expr) => { std::arch::x86_64::_mm512_rcp14_ps($a) };
+    (avx512, f16, exp, $a:expr) => { $crate::simd_primitive!(avx512, f32, exp, $a) };
+    (avx512, f16, prefetch, $p:expr, $dist:expr) => { std::arch::x86_64::_mm_prefetch($p as *const i8, std::arch::x86_64::_MM_HINT_T0) };
+
+    // --- AVX-512 bf16 (bit-shift conversion, compute in f32) ---
+    (avx512, bf16, lanes) => { 16 };
+    (avx512, bf16, num_regs) => { 32 };
+    (avx512, bf16, zero) => { std::arch::x86_64::_mm512_setzero_ps() };
+    (avx512, bf16, splat, $v:expr) => { { std::arch::x86_64::_mm512_set1_ps($v.to_f32()) } };
+    (avx512, bf16, load, $p:expr) => {
+        {
+            // Load 16 bf16 (256-bit), zero-extend to 16 u32 (512-bit), shift left 16
+            let v256 = std::arch::x86_64::_mm256_loadu_si256($p as *const std::arch::x86_64::__m256i);
+            let v512 = std::arch::x86_64::_mm512_cvtepu16_epi32(v256);
+            let shifted = std::arch::x86_64::_mm512_slli_epi32(v512, 16);
+            std::arch::x86_64::_mm512_castsi512_ps(shifted)
+        }
+    };
+    (avx512, bf16, store, $p:expr, $v:expr) => {
+        {
+            let vi = std::arch::x86_64::_mm512_castps_si512($v);
+            let shifted = std::arch::x86_64::_mm512_srli_epi32(vi, 16);
+            let packed = std::arch::x86_64::_mm512_cvtepi32_epi16(shifted);
+            std::arch::x86_64::_mm256_storeu_si256($p as *mut std::arch::x86_64::__m256i, packed);
+        }
+    };
+    (avx512, bf16, optimal_tile_m) => { 14 };
+    (avx512, bf16, optimal_tile_n_vecs) => { 2 };
+    (avx512, bf16, prefetch_distance) => { 512 };
+    (avx512, bf16, has_native_fp16) => { false };
+    (avx512, bf16, has_native_bf16) => { false };
+    (avx512, bf16, loadu, $p:expr) => { $crate::simd_primitive!(avx512, bf16, load, $p) };
+    (avx512, bf16, storeu, $p:expr, $v:expr) => { $crate::simd_primitive!(avx512, bf16, store, $p, $v) };
+    (avx512, bf16, add, $a:expr, $b:expr) => { std::arch::x86_64::_mm512_add_ps($a, $b) };
+    (avx512, bf16, sub, $a:expr, $b:expr) => { std::arch::x86_64::_mm512_sub_ps($a, $b) };
+    (avx512, bf16, mul, $a:expr, $b:expr) => { std::arch::x86_64::_mm512_mul_ps($a, $b) };
+    (avx512, bf16, div, $a:expr, $b:expr) => { std::arch::x86_64::_mm512_div_ps($a, $b) };
+    (avx512, bf16, fma, $a:expr, $b:expr, $c:expr) => { std::arch::x86_64::_mm512_fmadd_ps($a, $b, $c) };
+    (avx512, bf16, neg, $a:expr) => { std::arch::x86_64::_mm512_sub_ps(std::arch::x86_64::_mm512_setzero_ps(), $a) };
+    (avx512, bf16, max, $a:expr, $b:expr) => { std::arch::x86_64::_mm512_max_ps($a, $b) };
+    (avx512, bf16, min, $a:expr, $b:expr) => { std::arch::x86_64::_mm512_min_ps($a, $b) };
+    (avx512, bf16, reduce_sum, $v:expr) => { std::arch::x86_64::_mm512_reduce_add_ps($v) };
+    (avx512, bf16, reduce_max, $v:expr) => { std::arch::x86_64::_mm512_reduce_max_ps($v) };
+    (avx512, bf16, abs, $a:expr) => { std::arch::x86_64::_mm512_abs_ps($a) };
+    (avx512, bf16, sqrt, $a:expr) => { std::arch::x86_64::_mm512_sqrt_ps($a) };
+    (avx512, bf16, rsqrt, $a:expr) => { std::arch::x86_64::_mm512_rsqrt14_ps($a) };
+    (avx512, bf16, recip, $a:expr) => { std::arch::x86_64::_mm512_rcp14_ps($a) };
+    (avx512, bf16, exp, $a:expr) => { $crate::simd_primitive!(avx512, f32, exp, $a) };
+    (avx512, bf16, prefetch, $p:expr, $dist:expr) => { std::arch::x86_64::_mm_prefetch($p as *const i8, std::arch::x86_64::_MM_HINT_T0) };
+
 
     // ========================================================================
     // NEON Implementation (aarch64)
@@ -213,7 +312,7 @@ macro_rules! simd_primitive {
     // --- f32 Architecture Constants ---
     (neon, f32, num_regs) => { 32 };
     (neon, f32, optimal_tile_m) => { 8 }; // TBD
-    (neon, f32, optimal_tile_n_vecs) => { 2 };
+    (neon, f32, optimal_tile_n_vecs) => { 3 };
     (neon, f32, prefetch_distance) => { 0 }; // manual prefetch often tricky
     (neon, f32, has_native_fp16) => { true }; // ARMv8.2+ usually
     (neon, f32, has_native_bf16) => { false }; // Check target feature
@@ -250,6 +349,94 @@ macro_rules! simd_primitive {
 
     (neon, f32, prefetch, $p:expr, $dist:expr) => { };
 
+    // --- NEON f16 (ARMv8.2 native FP16 when available, else convert) ---
+    (neon, f16, lanes) => { 4 };
+    (neon, f16, num_regs) => { 32 };
+    (neon, f16, zero) => { unsafe { std::arch::aarch64::vdupq_n_f32(0.0) } };
+    (neon, f16, splat, $v:expr) => { { use crate::traits::Element as _; unsafe { std::arch::aarch64::vdupq_n_f32($v.to_f32()) } } };
+    // Load 4 f16 → 4 f32 via vcvt
+    (neon, f16, load, $p:expr) => {
+        unsafe {
+            let h = std::arch::aarch64::vld1_f16($p as *const std::arch::aarch64::float16_t);
+            std::arch::aarch64::vcvt_f32_f16(h)
+        }
+    };
+    (neon, f16, store, $p:expr, $v:expr) => {
+        unsafe {
+            let h = std::arch::aarch64::vcvt_f16_f32($v);
+            std::arch::aarch64::vst1_f16($p as *mut std::arch::aarch64::float16_t, h);
+        }
+    };
+    (neon, f16, optimal_tile_m) => { 8 };
+    (neon, f16, optimal_tile_n_vecs) => { 3 };
+    (neon, f16, prefetch_distance) => { 0 };
+    (neon, f16, has_native_fp16) => { true };
+    (neon, f16, has_native_bf16) => { false };
+    (neon, f16, loadu, $p:expr) => { $crate::simd_primitive!(neon, f16, load, $p) };
+    (neon, f16, storeu, $p:expr, $v:expr) => { $crate::simd_primitive!(neon, f16, store, $p, $v) };
+    (neon, f16, add, $a:expr, $b:expr) => { unsafe { std::arch::aarch64::vaddq_f32($a, $b) } };
+    (neon, f16, sub, $a:expr, $b:expr) => { unsafe { std::arch::aarch64::vsubq_f32($a, $b) } };
+    (neon, f16, mul, $a:expr, $b:expr) => { unsafe { std::arch::aarch64::vmulq_f32($a, $b) } };
+    (neon, f16, div, $a:expr, $b:expr) => { unsafe { std::arch::aarch64::vdivq_f32($a, $b) } };
+    (neon, f16, fma, $a:expr, $b:expr, $c:expr) => { unsafe { std::arch::aarch64::vfmaq_f32($c, $a, $b) } };
+    (neon, f16, neg, $a:expr) => { unsafe { std::arch::aarch64::vnegq_f32($a) } };
+    (neon, f16, max, $a:expr, $b:expr) => { unsafe { std::arch::aarch64::vmaxq_f32($a, $b) } };
+    (neon, f16, min, $a:expr, $b:expr) => { unsafe { std::arch::aarch64::vminq_f32($a, $b) } };
+    (neon, f16, reduce_sum, $v:expr) => { unsafe { std::arch::aarch64::vaddvq_f32($v) } };
+    (neon, f16, reduce_max, $v:expr) => { unsafe { std::arch::aarch64::vmaxvq_f32($v) } };
+    (neon, f16, abs, $a:expr) => { unsafe { std::arch::aarch64::vabsq_f32($a) } };
+    (neon, f16, sqrt, $a:expr) => { unsafe { std::arch::aarch64::vsqrtq_f32($a) } };
+    (neon, f16, rsqrt, $a:expr) => { unsafe { std::arch::aarch64::vrsqrteq_f32($a) } };
+    (neon, f16, recip, $a:expr) => { unsafe { std::arch::aarch64::vrecpeq_f32($a) } };
+    (neon, f16, exp, $a:expr) => { $crate::cpu_kernels::neon::math::exp_ps($a) };
+    (neon, f16, prefetch, $p:expr, $dist:expr) => { };
+
+    // --- NEON bf16 (convert via bit-shift) ---
+    (neon, bf16, lanes) => { 4 };
+    (neon, bf16, num_regs) => { 32 };
+    (neon, bf16, zero) => { unsafe { std::arch::aarch64::vdupq_n_f32(0.0) } };
+    (neon, bf16, splat, $v:expr) => { { use crate::traits::Element as _; unsafe { std::arch::aarch64::vdupq_n_f32($v.to_f32()) } } };
+    (neon, bf16, load, $p:expr) => {
+        unsafe {
+            // Load 4 u16, zero-extend to 4 u32, shift left 16, reinterpret as f32
+            let v = std::arch::aarch64::vld1_u16($p as *const u16);
+            let v32 = std::arch::aarch64::vmovl_u16(v);
+            let shifted = std::arch::aarch64::vshlq_n_u32(v32, 16);
+            std::arch::aarch64::vreinterpretq_f32_u32(shifted)
+        }
+    };
+    (neon, bf16, store, $p:expr, $v:expr) => {
+        unsafe {
+            let vi = std::arch::aarch64::vreinterpretq_u32_f32($v);
+            let shifted = std::arch::aarch64::vshrq_n_u32(vi, 16);
+            let narrow = std::arch::aarch64::vmovn_u32(shifted);
+            std::arch::aarch64::vst1_u16($p as *mut u16, narrow);
+        }
+    };
+    (neon, bf16, optimal_tile_m) => { 8 };
+    (neon, bf16, optimal_tile_n_vecs) => { 3 };
+    (neon, bf16, prefetch_distance) => { 0 };
+    (neon, bf16, has_native_fp16) => { false };
+    (neon, bf16, has_native_bf16) => { false };
+    (neon, bf16, loadu, $p:expr) => { $crate::simd_primitive!(neon, bf16, load, $p) };
+    (neon, bf16, storeu, $p:expr, $v:expr) => { $crate::simd_primitive!(neon, bf16, store, $p, $v) };
+    (neon, bf16, add, $a:expr, $b:expr) => { unsafe { std::arch::aarch64::vaddq_f32($a, $b) } };
+    (neon, bf16, sub, $a:expr, $b:expr) => { unsafe { std::arch::aarch64::vsubq_f32($a, $b) } };
+    (neon, bf16, mul, $a:expr, $b:expr) => { unsafe { std::arch::aarch64::vmulq_f32($a, $b) } };
+    (neon, bf16, div, $a:expr, $b:expr) => { unsafe { std::arch::aarch64::vdivq_f32($a, $b) } };
+    (neon, bf16, fma, $a:expr, $b:expr, $c:expr) => { unsafe { std::arch::aarch64::vfmaq_f32($c, $a, $b) } };
+    (neon, bf16, neg, $a:expr) => { unsafe { std::arch::aarch64::vnegq_f32($a) } };
+    (neon, bf16, max, $a:expr, $b:expr) => { unsafe { std::arch::aarch64::vmaxq_f32($a, $b) } };
+    (neon, bf16, min, $a:expr, $b:expr) => { unsafe { std::arch::aarch64::vminq_f32($a, $b) } };
+    (neon, bf16, reduce_sum, $v:expr) => { unsafe { std::arch::aarch64::vaddvq_f32($v) } };
+    (neon, bf16, reduce_max, $v:expr) => { unsafe { std::arch::aarch64::vmaxvq_f32($v) } };
+    (neon, bf16, abs, $a:expr) => { unsafe { std::arch::aarch64::vabsq_f32($a) } };
+    (neon, bf16, sqrt, $a:expr) => { unsafe { std::arch::aarch64::vsqrtq_f32($a) } };
+    (neon, bf16, rsqrt, $a:expr) => { unsafe { std::arch::aarch64::vrsqrteq_f32($a) } };
+    (neon, bf16, recip, $a:expr) => { unsafe { std::arch::aarch64::vrecpeq_f32($a) } };
+    (neon, bf16, exp, $a:expr) => { $crate::cpu_kernels::neon::math::exp_ps($a) };
+    (neon, bf16, prefetch, $p:expr, $dist:expr) => { };
+
     // --- Integer Primitives (NEON) ---
     // using int32x4_t / uint32x4_t
     (neon, i32, zero) => { unsafe { std::arch::aarch64::vdupq_n_s32(0) } };
@@ -273,5 +460,167 @@ macro_rules! simd_primitive {
     // Shuffle: vqtbl1q_u8 (lookup table)
     (neon, i8, shuffle, $tbl:expr, $idx:expr) => { unsafe { std::arch::aarch64::vqtbl1q_u8($tbl, $idx) } };
 
+    // ========================================================================
+    // f16 Support (compute in f32, load/store with conversion)
+    // ========================================================================
+
+    // --- Scalar f16 (convert to f32 for all compute) ---
+    (scalar, f16, lanes) => { 1 };
+    (scalar, f16, num_regs) => { usize::MAX };
+    (scalar, f16, optimal_tile_m) => { 1 };
+    (scalar, f16, optimal_tile_n_vecs) => { 1 };
+    (scalar, f16, prefetch_distance) => { 0 };
+    (scalar, f16, has_native_fp16) => { false };
+    (scalar, f16, has_native_bf16) => { false };
+    (scalar, f16, zero) => { 0.0f32 };
+    (scalar, f16, splat, $v:expr) => { { $v.to_f32() } };
+    (scalar, f16, load, $p:expr) => { unsafe { (*$p).to_f32() } };
+    (scalar, f16, loadu, $p:expr) => { unsafe { (*$p).to_f32() } };
+    (scalar, f16, store, $p:expr, $v:expr) => { unsafe { *$p = half::f16::from_f32($v) } };
+    (scalar, f16, storeu, $p:expr, $v:expr) => { unsafe { *$p = half::f16::from_f32($v) } };
+    (scalar, f16, add, $a:expr, $b:expr) => { $a + $b };
+    (scalar, f16, sub, $a:expr, $b:expr) => { $a - $b };
+    (scalar, f16, mul, $a:expr, $b:expr) => { $a * $b };
+    (scalar, f16, div, $a:expr, $b:expr) => { $a / $b };
+    (scalar, f16, fma, $a:expr, $b:expr, $c:expr) => { $c + $a * $b };
+    (scalar, f16, neg, $a:expr) => { -$a };
+    (scalar, f16, max, $a:expr, $b:expr) => { $a.max($b) };
+    (scalar, f16, min, $a:expr, $b:expr) => { $a.min($b) };
+    (scalar, f16, reduce_sum, $v:expr) => { $v };
+    (scalar, f16, reduce_max, $v:expr) => { $v };
+    (scalar, f16, abs, $a:expr) => { $a.abs() };
+    (scalar, f16, exp, $a:expr) => { $a.exp() };
+    (scalar, f16, recip, $a:expr) => { 1.0 / $a };
+    (scalar, f16, sqrt, $a:expr) => { $a.sqrt() };
+    (scalar, f16, rsqrt, $a:expr) => { 1.0 / $a.sqrt() };
+    (scalar, f16, prefetch, $p:expr, $dist:expr) => { };
+
+    // --- AVX2 f16 (F16C: load f16→f32, compute f32, store f32→f16) ---
+    (avx2, f16, lanes) => { 8 };
+    (avx2, f16, num_regs) => { 16 };
+    (avx2, f16, optimal_tile_m) => { 6 };
+    (avx2, f16, optimal_tile_n_vecs) => { 2 };
+    (avx2, f16, prefetch_distance) => { 256 };
+    (avx2, f16, has_native_fp16) => { false };
+    (avx2, f16, has_native_bf16) => { false };
+    (avx2, f16, zero) => { std::arch::x86_64::_mm256_setzero_ps() };
+    (avx2, f16, splat, $v:expr) => { { std::arch::x86_64::_mm256_set1_ps($v.to_f32()) } };
+    // F16C: load 8 f16 (128-bit) → 8 f32 (256-bit)
+    (avx2, f16, load, $p:expr) => {
+        std::arch::x86_64::_mm256_cvtph_ps(
+            std::arch::x86_64::_mm_loadu_si128($p as *const std::arch::x86_64::__m128i)
+        )
+    };
+    (avx2, f16, loadu, $p:expr) => { $crate::simd_primitive!(avx2, f16, load, $p) };
+    // F16C: store 8 f32 (256-bit) → 8 f16 (128-bit)
+    (avx2, f16, store, $p:expr, $v:expr) => {
+        std::arch::x86_64::_mm_storeu_si128(
+            $p as *mut std::arch::x86_64::__m128i,
+            std::arch::x86_64::_mm256_cvtps_ph($v, std::arch::x86_64::_MM_FROUND_TO_NEAREST_INT)
+        )
+    };
+    (avx2, f16, storeu, $p:expr, $v:expr) => { $crate::simd_primitive!(avx2, f16, store, $p, $v) };
+    // All compute ops are f32 (same as avx2 f32)
+    (avx2, f16, add, $a:expr, $b:expr) => { std::arch::x86_64::_mm256_add_ps($a, $b) };
+    (avx2, f16, sub, $a:expr, $b:expr) => { std::arch::x86_64::_mm256_sub_ps($a, $b) };
+    (avx2, f16, mul, $a:expr, $b:expr) => { std::arch::x86_64::_mm256_mul_ps($a, $b) };
+    (avx2, f16, div, $a:expr, $b:expr) => { std::arch::x86_64::_mm256_div_ps($a, $b) };
+    (avx2, f16, fma, $a:expr, $b:expr, $c:expr) => { std::arch::x86_64::_mm256_fmadd_ps($a, $b, $c) };
+    (avx2, f16, neg, $a:expr) => { std::arch::x86_64::_mm256_sub_ps(std::arch::x86_64::_mm256_setzero_ps(), $a) };
+    (avx2, f16, max, $a:expr, $b:expr) => { std::arch::x86_64::_mm256_max_ps($a, $b) };
+    (avx2, f16, min, $a:expr, $b:expr) => { std::arch::x86_64::_mm256_min_ps($a, $b) };
+    (avx2, f16, reduce_sum, $v:expr) => { $crate::simd_primitive!(avx2, f32, reduce_sum, $v) };
+    (avx2, f16, reduce_max, $v:expr) => { $crate::simd_primitive!(avx2, f32, reduce_max, $v) };
+    (avx2, f16, abs, $a:expr) => { std::arch::x86_64::_mm256_andnot_ps(std::arch::x86_64::_mm256_set1_ps(-0.0), $a) };
+    (avx2, f16, exp, $a:expr) => { $crate::cpu_kernels::avx2::math::avx2_exp_f32($a) };
+    (avx2, f16, sqrt, $a:expr) => { std::arch::x86_64::_mm256_sqrt_ps($a) };
+    (avx2, f16, rsqrt, $a:expr) => { std::arch::x86_64::_mm256_rsqrt_ps($a) };
+    (avx2, f16, recip, $a:expr) => { std::arch::x86_64::_mm256_rcp_ps($a) };
+    (avx2, f16, prefetch, $p:expr, $dist:expr) => { std::arch::x86_64::_mm_prefetch($p as *const i8, std::arch::x86_64::_MM_HINT_T0) };
+
+    // ========================================================================
+    // bf16 Support (compute in f32, load/store with bit-shift conversion)
+    // ========================================================================
+
+    // --- Scalar bf16 ---
+    (scalar, bf16, lanes) => { 1 };
+    (scalar, bf16, num_regs) => { usize::MAX };
+    (scalar, bf16, optimal_tile_m) => { 1 };
+    (scalar, bf16, optimal_tile_n_vecs) => { 1 };
+    (scalar, bf16, prefetch_distance) => { 0 };
+    (scalar, bf16, has_native_fp16) => { false };
+    (scalar, bf16, has_native_bf16) => { false };
+    (scalar, bf16, zero) => { 0.0f32 };
+    (scalar, bf16, splat, $v:expr) => { { $v.to_f32() } };
+    (scalar, bf16, load, $p:expr) => { unsafe { (*$p).to_f32() } };
+    (scalar, bf16, loadu, $p:expr) => { unsafe { (*$p).to_f32() } };
+    (scalar, bf16, store, $p:expr, $v:expr) => { unsafe { *$p = half::bf16::from_f32($v) } };
+    (scalar, bf16, storeu, $p:expr, $v:expr) => { unsafe { *$p = half::bf16::from_f32($v) } };
+    (scalar, bf16, add, $a:expr, $b:expr) => { $a + $b };
+    (scalar, bf16, sub, $a:expr, $b:expr) => { $a - $b };
+    (scalar, bf16, mul, $a:expr, $b:expr) => { $a * $b };
+    (scalar, bf16, div, $a:expr, $b:expr) => { $a / $b };
+    (scalar, bf16, fma, $a:expr, $b:expr, $c:expr) => { $c + $a * $b };
+    (scalar, bf16, neg, $a:expr) => { -$a };
+    (scalar, bf16, max, $a:expr, $b:expr) => { $a.max($b) };
+    (scalar, bf16, min, $a:expr, $b:expr) => { $a.min($b) };
+    (scalar, bf16, reduce_sum, $v:expr) => { $v };
+    (scalar, bf16, reduce_max, $v:expr) => { $v };
+    (scalar, bf16, abs, $a:expr) => { $a.abs() };
+    (scalar, bf16, exp, $a:expr) => { $a.exp() };
+    (scalar, bf16, recip, $a:expr) => { 1.0 / $a };
+    (scalar, bf16, sqrt, $a:expr) => { $a.sqrt() };
+    (scalar, bf16, rsqrt, $a:expr) => { 1.0 / $a.sqrt() };
+    (scalar, bf16, prefetch, $p:expr, $dist:expr) => { };
+
+    // --- AVX2 bf16 (bit-shift conversion: load bf16→f32, compute f32, store f32→bf16) ---
+    (avx2, bf16, lanes) => { 8 };
+    (avx2, bf16, num_regs) => { 16 };
+    (avx2, bf16, optimal_tile_m) => { 6 };
+    (avx2, bf16, optimal_tile_n_vecs) => { 2 };
+    (avx2, bf16, prefetch_distance) => { 256 };
+    (avx2, bf16, has_native_fp16) => { false };
+    (avx2, bf16, has_native_bf16) => { false };
+    (avx2, bf16, zero) => { std::arch::x86_64::_mm256_setzero_ps() };
+    (avx2, bf16, splat, $v:expr) => { { std::arch::x86_64::_mm256_set1_ps($v.to_f32()) } };
+    // bf16→f32: load 8 u16, zero-extend to 8 u32, shift left 16 → reinterpret as f32
+    (avx2, bf16, load, $p:expr) => {
+        {
+            let v128 = std::arch::x86_64::_mm_loadu_si128($p as *const std::arch::x86_64::__m128i);
+            let v256 = std::arch::x86_64::_mm256_cvtepu16_epi32(v128);
+            let shifted = std::arch::x86_64::_mm256_slli_epi32(v256, 16);
+            std::arch::x86_64::_mm256_castsi256_ps(shifted)
+        }
+    };
+    (avx2, bf16, loadu, $p:expr) => { $crate::simd_primitive!(avx2, bf16, load, $p) };
+    // f32→bf16: truncate (shift right 16), pack to 8 u16, store 128-bit
+    (avx2, bf16, store, $p:expr, $v:expr) => {
+        {
+            let vi = std::arch::x86_64::_mm256_castps_si256($v);
+            let shifted = std::arch::x86_64::_mm256_srli_epi32(vi, 16);
+            let lo = std::arch::x86_64::_mm256_castsi256_si128(shifted);
+            let hi = std::arch::x86_64::_mm256_extracti128_si256(shifted, 1);
+            let packed = std::arch::x86_64::_mm_packus_epi32(lo, hi);
+            std::arch::x86_64::_mm_storeu_si128($p as *mut std::arch::x86_64::__m128i, packed)
+        }
+    };
+    (avx2, bf16, storeu, $p:expr, $v:expr) => { $crate::simd_primitive!(avx2, bf16, store, $p, $v) };
+    // All compute ops are f32 (same as avx2 f32)
+    (avx2, bf16, add, $a:expr, $b:expr) => { std::arch::x86_64::_mm256_add_ps($a, $b) };
+    (avx2, bf16, sub, $a:expr, $b:expr) => { std::arch::x86_64::_mm256_sub_ps($a, $b) };
+    (avx2, bf16, mul, $a:expr, $b:expr) => { std::arch::x86_64::_mm256_mul_ps($a, $b) };
+    (avx2, bf16, div, $a:expr, $b:expr) => { std::arch::x86_64::_mm256_div_ps($a, $b) };
+    (avx2, bf16, fma, $a:expr, $b:expr, $c:expr) => { std::arch::x86_64::_mm256_fmadd_ps($a, $b, $c) };
+    (avx2, bf16, neg, $a:expr) => { std::arch::x86_64::_mm256_sub_ps(std::arch::x86_64::_mm256_setzero_ps(), $a) };
+    (avx2, bf16, max, $a:expr, $b:expr) => { std::arch::x86_64::_mm256_max_ps($a, $b) };
+    (avx2, bf16, min, $a:expr, $b:expr) => { std::arch::x86_64::_mm256_min_ps($a, $b) };
+    (avx2, bf16, reduce_sum, $v:expr) => { $crate::simd_primitive!(avx2, f32, reduce_sum, $v) };
+    (avx2, bf16, reduce_max, $v:expr) => { $crate::simd_primitive!(avx2, f32, reduce_max, $v) };
+    (avx2, bf16, abs, $a:expr) => { std::arch::x86_64::_mm256_andnot_ps(std::arch::x86_64::_mm256_set1_ps(-0.0), $a) };
+    (avx2, bf16, exp, $a:expr) => { $crate::cpu_kernels::avx2::math::avx2_exp_f32($a) };
+    (avx2, bf16, sqrt, $a:expr) => { std::arch::x86_64::_mm256_sqrt_ps($a) };
+    (avx2, bf16, rsqrt, $a:expr) => { std::arch::x86_64::_mm256_rsqrt_ps($a) };
+    (avx2, bf16, recip, $a:expr) => { std::arch::x86_64::_mm256_rcp_ps($a) };
+    (avx2, bf16, prefetch, $p:expr, $dist:expr) => { std::arch::x86_64::_mm_prefetch($p as *const i8, std::arch::x86_64::_MM_HINT_T0) };
 
 }

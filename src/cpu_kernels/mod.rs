@@ -1,3 +1,39 @@
+//! # CPU Kernel Macro Architecture
+//!
+//! 4-layer macro system for ISA-dispatched SIMD kernels:
+//!
+//! ## Layer 1: `simd_primitive!` (src/macros/simd_primitive.rs)
+//! Maps abstract ops to hardware intrinsics: `simd_primitive!(avx2, f32, add, a, b)`.
+//! Covers scalar/avx2/avx512/neon × f32/f16/bf16.
+//!
+//! ## Layer 2: `operator_templates` (src/macros/operator_templates.rs)
+//! Generic operator bodies parameterized by ISA+Element:
+//! `define_element_wise_ops!`, `define_blas1_ops!`, `define_norm_ops!`, etc.
+//!
+//! ## Layer 3: `quant_primitive!` (src/macros/quant_primitive.rs)
+//! Quantization decode/dot primitives: `quant_primitive!(neon, q4_k, decode, blk, dst)`.
+//! Each `(isa, format, op)` tuple is a separate macro branch.
+//!
+//! ## Layer 4: `expand_isa_impls!` (src/macros/expand.rs)
+//! Generates per-ISA modules: `expand_isa_impls!(avx2_f32, avx2, f32)`.
+//!
+//! ## Dispatch macros (this file)
+//! Runtime ISA selection via `get_isa_level()`:
+//!
+//! | Macro | Signature | Used by |
+//! |---|---|---|
+//! | `define_quant_dot_k!` | `(name, qfmt, BlockTy)` | K-quant dot (Q2-Q8_K) |
+//! | `define_quant_dot_iq!` | `(name, qfmt, BlockTy)` | IQ dot (avx2+scalar only) |
+//! | `define_quant_decode_k!` | `(name, qfmt, BlockTy)` | K-quant decode |
+//! | `define_quant_decode_scalar!` | `(name, qfmt, BlockTy)` | IQ decode (scalar only) |
+//! | `dispatch_binary_op!` | `(fn, op_name)` | vec add/sub/mul/div |
+//! | `dispatch_unary_op!` | `(fn, op_name)` | neg/abs/recip |
+//! | `dispatch_reduce_op!` | `(fn, op_name)` | sum/max/min |
+//! | `dispatch_with_scalar!` | `(fn, op_name)` | scalar_add/mul |
+//! | `dispatch_with_eps!` | `(fn, op_name)` | rms_norm/layer_norm |
+//! | `dispatch_rope!` | `(fn, op_name)` | rope |
+//! | `dispatch_scale!` | `(fn, op_name)` | vec_scale |
+
 use crate::traits::{Element, Kernels};
 use std::marker::PhantomData;
 use std::sync::OnceLock;
@@ -37,6 +73,16 @@ fn detect_isa_features() -> IsaLevel {
     IsaLevel::Scalar
 }
 
+
+/// Convert any Element slice to f32 vec (for quantization paths that need f32 input)
+#[inline]
+fn elem_to_f32_vec<E: Element>(src: &[E]) -> Vec<f32> {
+    if let Some(f) = E::as_f32_slice(src) {
+        return f.to_vec();
+    }
+    src.iter().map(|v| v.to_f32()).collect()
+}
+
 pub struct CpuKernels<E: Element> {
     _phantom: PhantomData<E>,
 }
@@ -45,120 +91,126 @@ impl<E: Element> CpuKernels<E> {
     pub fn new() -> Self {
         Self { _phantom: PhantomData }
     }
+}
 
-    // ========================================================================
-    // Private helper methods: dot_* quantization primitives
-    // These are called by public Kernels trait methods
-    // ========================================================================
+// ============================================================================
+// Quant dispatch macros — eliminate repetitive ISA match boilerplate
+// ============================================================================
 
-    fn dot_q4_k(&self, block: &[u8], other: &[f32]) -> f32 {
-        let block_ptr = block.as_ptr() as *const crate::quant::BlockQ4K;
-        let other_ptr = other.as_ptr();
-        match get_isa_level() {
-            #[cfg(target_arch = "x86_64")]
-            IsaLevel::Avx512 => {
-                crate::quant_primitive!(avx2, q4_k, dot, block_ptr, other_ptr)
-            }
-            #[cfg(target_arch = "x86_64")]
-            IsaLevel::Avx2 => {
-                crate::quant_primitive!(avx2, q4_k, dot, block_ptr, other_ptr)
-            }
-            _ => {
-                crate::quant_primitive!(scalar, q4_k, dot, block_ptr, other_ptr)
+/// Generate a dot_$fn_name function with ISA dispatch.
+/// Pattern: avx512 + avx2 + scalar (K-Quant formats)
+macro_rules! define_quant_dot_k {
+    ($fn_name:ident, $qfmt:ident, $block_ty:ident) => {
+        fn $fn_name(&self, block: &[u8], other: &[f32]) -> f32 {
+            let blk = block.as_ptr() as *const crate::quant::$block_ty;
+            let src = other.as_ptr();
+            match get_isa_level() {
+                #[cfg(target_arch = "x86_64")]
+                IsaLevel::Avx512 => { crate::quant_primitive!(avx512, $qfmt, dot, blk, src) }
+                #[cfg(target_arch = "x86_64")]
+                IsaLevel::Avx2 => { crate::quant_primitive!(avx2, $qfmt, dot, blk, src) }
+                #[cfg(target_arch = "aarch64")]
+                IsaLevel::Neon => { crate::quant_primitive!(neon, $qfmt, dot, blk, src) }
+                _ => { crate::quant_primitive!(scalar, $qfmt, dot, blk, src) }
             }
         }
-    }
+    };
+}
 
-    fn dot_q8_k(&self, block: &[u8], other: &[f32]) -> f32 {
-        let block_ptr = block.as_ptr() as *const crate::quant::BlockQ8K;
-        let other_ptr = other.as_ptr();
-        crate::quant_primitive!(scalar, q8_k, dot, block_ptr, other_ptr)
-    }
+/// Generate a dot_$fn_name function: avx2 + scalar (IQ formats, avx512 falls through to avx2)
+macro_rules! define_quant_dot_iq {
+    ($fn_name:ident, $qfmt:ident, $block_ty:ident) => {
+        fn $fn_name(&self, block: &[u8], other: &[f32]) -> f32 {
+            let blk = block.as_ptr() as *const crate::quant::$block_ty;
+            let src = other.as_ptr();
+            match get_isa_level() {
+                #[cfg(target_arch = "x86_64")]
+                IsaLevel::Avx512 | IsaLevel::Avx2 => { crate::quant_primitive!(avx2, $qfmt, dot, blk, src) }
+                #[cfg(target_arch = "aarch64")]
+                IsaLevel::Neon => { crate::quant_primitive!(neon, $qfmt, dot, blk, src) }
+                _ => { crate::quant_primitive!(scalar, $qfmt, dot, blk, src) }
+            }
+        }
+    };
+}
 
-    fn dot_q2_k(&self, block: &[u8], other: &[f32]) -> f32 {
-        let block_ptr = block.as_ptr() as *const crate::quant::BlockQ2K;
-        let other_ptr = other.as_ptr();
-        crate::quant_primitive!(scalar, q2_k, dot, block_ptr, other_ptr)
-    }
+/// Generate a dequant_$fn_name function with ISA dispatch (avx512 + avx2 + scalar)
+macro_rules! define_quant_decode_k {
+    ($fn_name:ident, $qfmt:ident, $block_ty:ident) => {
+        fn $fn_name(&self, block: &[u8], out: &mut [f32]) {
+            let blk = block.as_ptr() as *const crate::quant::$block_ty;
+            let dst = out.as_mut_ptr();
+            match get_isa_level() {
+                #[cfg(target_arch = "x86_64")]
+                IsaLevel::Avx512 => { crate::quant_primitive!(avx512, $qfmt, decode, blk, dst); }
+                #[cfg(target_arch = "x86_64")]
+                IsaLevel::Avx2 => { crate::quant_primitive!(avx2, $qfmt, decode, blk, dst); }
+                #[cfg(target_arch = "aarch64")]
+                IsaLevel::Neon => { crate::quant_primitive!(neon, $qfmt, decode, blk, dst); }
+                _ => { crate::quant_primitive!(scalar, $qfmt, decode, blk, dst); }
+            }
+        }
+    };
+}
 
-    fn dot_q3_k(&self, block: &[u8], other: &[f32]) -> f32 {
-        let block_ptr = block.as_ptr() as *const crate::quant::BlockQ3K;
-        let other_ptr = other.as_ptr();
-        crate::quant_primitive!(scalar, q3_k, dot, block_ptr, other_ptr)
-    }
+/// Generate a scalar-only dequant function
+macro_rules! define_quant_decode_scalar {
+    ($fn_name:ident, $qfmt:ident, $block_ty:ident) => {
+        fn $fn_name(&self, block: &[u8], out: &mut [f32]) {
+            let blk = block.as_ptr() as *const crate::quant::$block_ty;
+            let dst = out.as_mut_ptr();
+            crate::quant_primitive!(scalar, $qfmt, decode, blk, dst);
+        }
+    };
+}
 
-    fn dot_q5_k(&self, block: &[u8], other: &[f32]) -> f32 {
-        let block_ptr = block.as_ptr() as *const crate::quant::BlockQ5K;
-        let other_ptr = other.as_ptr();
-        crate::quant_primitive!(scalar, q5_k, dot, block_ptr, other_ptr)
-    }
+/// Generate a dequant function: avx512 + neon + scalar (no avx2 decode)
+macro_rules! define_quant_decode_avx512 {
+    ($fn_name:ident, $qfmt:ident, $block_ty:ident) => {
+        fn $fn_name(&self, block: &[u8], out: &mut [f32]) {
+            let blk = block.as_ptr() as *const crate::quant::$block_ty;
+            let dst = out.as_mut_ptr();
+            match get_isa_level() {
+                #[cfg(target_arch = "x86_64")]
+                IsaLevel::Avx512 => { crate::quant_primitive!(avx512, $qfmt, decode, blk, dst); }
+                #[cfg(target_arch = "aarch64")]
+                IsaLevel::Neon => { crate::quant_primitive!(neon, $qfmt, decode, blk, dst); }
+                _ => { crate::quant_primitive!(scalar, $qfmt, decode, blk, dst); }
+            }
+        }
+    };
+}
 
-    fn dot_q6_k(&self, block: &[u8], other: &[f32]) -> f32 {
-        let block_ptr = block.as_ptr() as *const crate::quant::BlockQ6K;
-        let other_ptr = other.as_ptr();
-        crate::quant_primitive!(scalar, q6_k, dot, block_ptr, other_ptr)
-    }
+// ============================================================================
+// Private helper methods on CpuKernels
+// ============================================================================
 
-    fn dot_iq1_s(&self, block: &[u8], other: &[f32]) -> f32 {
-        let blk = block.as_ptr() as *const crate::quant::BlockIQ1S;
-        let src = other.as_ptr();
-        crate::quant_primitive!(scalar, iq1_s, dot, blk, src)
-    }
+impl<E: Element> CpuKernels<E> {
+    // K-Quant dot: avx512 + avx2 + scalar
+    define_quant_dot_k!(dot_q4_k, q4_k, BlockQ4K);
+    define_quant_dot_k!(dot_q8_k, q8_k, BlockQ8K);
+    define_quant_dot_k!(dot_q2_k, q2_k, BlockQ2K);
+    define_quant_dot_k!(dot_q3_k, q3_k, BlockQ3K);
+    define_quant_dot_k!(dot_q5_k, q5_k, BlockQ5K);
+    define_quant_dot_k!(dot_q6_k, q6_k, BlockQ6K);
 
-    fn dot_iq1_m(&self, block: &[u8], other: &[f32]) -> f32 {
-        let blk = block.as_ptr() as *const crate::quant::BlockIQ1M;
-        let src = other.as_ptr();
-        crate::quant_primitive!(scalar, iq1_m, dot, blk, src)
-    }
+    // IQ dot: avx2 + scalar (avx512 falls through to avx2)
+    define_quant_dot_iq!(dot_iq1_s, iq1_s, BlockIQ1S);
+    define_quant_dot_iq!(dot_iq1_m, iq1_m, BlockIQ1M);
+    define_quant_dot_iq!(dot_iq2_xxs, iq2_xxs, BlockIQ2XXS);
+    define_quant_dot_iq!(dot_iq2_xs, iq2_xs, BlockIQ2XS);
+    define_quant_dot_iq!(dot_iq2_s, iq2_s, BlockIQ2S);
+    define_quant_dot_iq!(dot_iq3_xxs, iq3_xxs, BlockIQ3XXS);
+    define_quant_dot_iq!(dot_iq3_s, iq3_s, BlockIQ3S);
+    define_quant_dot_iq!(dot_iq4_nl, iq4_nl, BlockIQ4NL);
+    define_quant_dot_iq!(dot_iq4_xs, iq4_xs, BlockIQ4XS);
 
-    fn dot_iq2_xxs(&self, block: &[u8], other: &[f32]) -> f32 {
-        let blk = block.as_ptr() as *const crate::quant::BlockIQ2XXS;
-        let src = other.as_ptr();
-        crate::quant_primitive!(scalar, iq2_xxs, dot, blk, src)
-    }
-
-    fn dot_iq2_xs(&self, block: &[u8], other: &[f32]) -> f32 {
-        let blk = block.as_ptr() as *const crate::quant::BlockIQ2XS;
-        let src = other.as_ptr();
-        crate::quant_primitive!(scalar, iq2_xs, dot, blk, src)
-    }
-
-    fn dot_iq2_s(&self, block: &[u8], other: &[f32]) -> f32 {
-        let blk = block.as_ptr() as *const crate::quant::BlockIQ2S;
-        let src = other.as_ptr();
-        crate::quant_primitive!(scalar, iq2_s, dot, blk, src)
-    }
-
-    fn dot_iq3_xxs(&self, block: &[u8], other: &[f32]) -> f32 {
-        let blk = block.as_ptr() as *const crate::quant::BlockIQ3XXS;
-        let src = other.as_ptr();
-        crate::quant_primitive!(scalar, iq3_xxs, dot, blk, src)
-    }
-
-    fn dot_iq3_s(&self, block: &[u8], other: &[f32]) -> f32 {
-        let blk = block.as_ptr() as *const crate::quant::BlockIQ3S;
-        let src = other.as_ptr();
-        crate::quant_primitive!(scalar, iq3_s, dot, blk, src)
-    }
-
-    fn dot_iq4_nl(&self, block: &[u8], other: &[f32]) -> f32 {
-        let blk = block.as_ptr() as *const crate::quant::BlockIQ4NL;
-        let src = other.as_ptr();
-        crate::quant_primitive!(scalar, iq4_nl, dot, blk, src)
-    }
-
-    fn dot_iq4_xs(&self, block: &[u8], other: &[f32]) -> f32 {
-        let blk = block.as_ptr() as *const crate::quant::BlockIQ4XS;
-        let src = other.as_ptr();
-        crate::quant_primitive!(scalar, iq4_xs, dot, blk, src)
-    }
-
+    // Scalar-only dot
     fn dot_awq4(&self, block: &[u8], other: &[f32]) -> f32 {
         let blk = block.as_ptr() as *const crate::quant::BlockAWQ4;
         let src = other.as_ptr();
         crate::quant_primitive!(scalar, awq4, dot, blk, src)
     }
-
     fn dot_gptq4(&self, block: &[u8], other: &[f32]) -> f32 {
         let blk = block.as_ptr() as *const crate::quant::BlockGPTQ4;
         let src = other.as_ptr();
@@ -177,7 +229,14 @@ impl<E: Element> CpuKernels<E> {
         dot_fn: fn(&Self, &[u8], &[f32]) -> f32,
     ) {
         let blocks_per_row = k / BLOCK_SIZE;
-        let in_f32: Vec<f32> = input.iter().map(|v| v.to_f32()).collect();
+        // Zero-copy for f32, single allocation for f16/bf16
+        let owned_f32: Vec<f32>;
+        let in_f32: &[f32] = if let Some(f) = E::as_f32_slice(input) {
+            f
+        } else {
+            owned_f32 = input.iter().map(|v| v.to_f32()).collect();
+            &owned_f32
+        };
         for i in 0..m {
             let mut sum = 0.0f32;
             for b in 0..blocks_per_row {
@@ -197,14 +256,19 @@ impl<E: Element> CpuKernels<E> {
         dot_fn: fn(&Self, &[u8], &[f32]) -> f32,
     ) {
         let blocks_per_row = k / BLOCK_SIZE;
-        for i in 0..m {
-            for j in 0..n {
-                let in_f32: Vec<f32> = (0..k).map(|p| input[p * n + j].to_f32()).collect();
+        // Pre-allocate column buffer once, reuse across all j iterations
+        let mut in_f32_col = vec![0.0f32; k];
+        for j in 0..n {
+            // Extract column j from input (stride access: input[p * n + j])
+            for p in 0..k {
+                in_f32_col[p] = input[p * n + j].to_f32();
+            }
+            for i in 0..m {
                 let mut sum = 0.0f32;
                 for b in 0..blocks_per_row {
                     let off = i * blocks_per_row * BLOCK_BYTES + b * BLOCK_BYTES;
                     let blk = &weight_blocks[off..off + BLOCK_BYTES];
-                    let in_slice = &in_f32[b * BLOCK_SIZE..(b + 1) * BLOCK_SIZE];
+                    let in_slice = &in_f32_col[b * BLOCK_SIZE..(b + 1) * BLOCK_SIZE];
                     sum += dot_fn(self, blk, in_slice);
                 }
                 output[i * n + j] = E::from_f32(sum);
@@ -223,160 +287,380 @@ pub mod avx512;
 pub mod neon;
 
 // ============================================================================
-// Dispatch macros: use Element::as_f32_slice for zero-cost type dispatch
-// (No TypeId — compile-time monomorphization via Element trait methods)
+// Dispatch macros: use ELEM_ID for zero-cost type dispatch
+// ELEM_ID is a compile-time constant, so dead branches are eliminated.
+// For f16/bf16, we transmute slices and call the native f16/bf16 ISA modules
+// which handle load/store conversion internally via simd_primitive.
 // ============================================================================
+
+/// Transmute a &[E] to &[$target] when E::ELEM_ID matches.
+/// Safety: caller must ensure E is actually $target (checked via ELEM_ID).
+macro_rules! as_typed_slice {
+    ($slice:expr, $target:ty) => {
+        unsafe { std::slice::from_raw_parts($slice.as_ptr() as *const $target, $slice.len()) }
+    };
+}
+
+macro_rules! as_typed_slice_mut {
+    ($slice:expr, $target:ty) => {
+        unsafe { std::slice::from_raw_parts_mut($slice.as_mut_ptr() as *mut $target, $slice.len()) }
+    };
+}
 
 macro_rules! dispatch_binary_op {
     ($a:expr, $b:expr, $out:expr, $op:ident) => {
-        match get_isa_level() {
+        match (get_isa_level(), E::ELEM_ID) {
             #[cfg(target_arch = "x86_64")]
-            IsaLevel::Avx512 => {
-                if let (Some(af), Some(bf), Some(of)) = (
-                    E::as_f32_slice($a), E::as_f32_slice($b), E::as_f32_slice_mut($out)
-                ) {
-                    avx512::avx512_f32::$op(af, bf, of);
-                } else {
-                    let ac: Vec<f32> = $a.iter().map(|v| v.to_f32()).collect();
-                    let bc: Vec<f32> = $b.iter().map(|v| v.to_f32()).collect();
-                    let mut oc = vec![0.0f32; $out.len()];
-                    avx512::avx512_f32::$op(&ac, &bc, &mut oc);
-                    for (o, v) in $out.iter_mut().zip(oc.iter()) { *o = E::from_f32(*v); }
-                }
-            }
+            (IsaLevel::Avx512, 0) => avx512::avx512_f32::$op(as_typed_slice!($a, f32), as_typed_slice!($b, f32), as_typed_slice_mut!($out, f32)),
             #[cfg(target_arch = "x86_64")]
-            IsaLevel::Avx2 => {
-                if let (Some(af), Some(bf), Some(of)) = (
-                    E::as_f32_slice($a), E::as_f32_slice($b), E::as_f32_slice_mut($out)
-                ) {
-                    avx2::avx2_f32::$op(af, bf, of);
-                } else {
-                    let ac: Vec<f32> = $a.iter().map(|v| v.to_f32()).collect();
-                    let bc: Vec<f32> = $b.iter().map(|v| v.to_f32()).collect();
-                    let mut oc = vec![0.0f32; $out.len()];
-                    avx2::avx2_f32::$op(&ac, &bc, &mut oc);
-                    for (o, v) in $out.iter_mut().zip(oc.iter()) { *o = E::from_f32(*v); }
-                }
-            }
+            (IsaLevel::Avx512, 1) => avx512::avx512_f16::$op(as_typed_slice!($a, half::f16), as_typed_slice!($b, half::f16), as_typed_slice_mut!($out, half::f16)),
+            #[cfg(target_arch = "x86_64")]
+            (IsaLevel::Avx512, 2) => avx512::avx512_bf16::$op(as_typed_slice!($a, half::bf16), as_typed_slice!($b, half::bf16), as_typed_slice_mut!($out, half::bf16)),
+            #[cfg(target_arch = "x86_64")]
+            (IsaLevel::Avx2, 0) => avx2::avx2_f32::$op(as_typed_slice!($a, f32), as_typed_slice!($b, f32), as_typed_slice_mut!($out, f32)),
+            #[cfg(target_arch = "x86_64")]
+            (IsaLevel::Avx2, 1) => avx2::avx2_f16::$op(as_typed_slice!($a, half::f16), as_typed_slice!($b, half::f16), as_typed_slice_mut!($out, half::f16)),
+            #[cfg(target_arch = "x86_64")]
+            (IsaLevel::Avx2, 2) => avx2::avx2_bf16::$op(as_typed_slice!($a, half::bf16), as_typed_slice!($b, half::bf16), as_typed_slice_mut!($out, half::bf16)),
             #[cfg(target_arch = "aarch64")]
-            IsaLevel::Neon => {
-                if let (Some(af), Some(bf), Some(of)) = (
-                    E::as_f32_slice($a), E::as_f32_slice($b), E::as_f32_slice_mut($out)
-                ) {
-                    neon::neon_f32::$op(af, bf, of);
-                } else {
-                    let ac: Vec<f32> = $a.iter().map(|v| v.to_f32()).collect();
-                    let bc: Vec<f32> = $b.iter().map(|v| v.to_f32()).collect();
-                    let mut oc = vec![0.0f32; $out.len()];
-                    neon::neon_f32::$op(&ac, &bc, &mut oc);
-                    for (o, v) in $out.iter_mut().zip(oc.iter()) { *o = E::from_f32(*v); }
-                }
-            }
-            _ => {
-                if let (Some(af), Some(bf), Some(of)) = (
-                    E::as_f32_slice($a), E::as_f32_slice($b), E::as_f32_slice_mut($out)
-                ) {
-                    scalar::scalar_f32::$op(af, bf, of);
-                } else {
-                    let ac: Vec<f32> = $a.iter().map(|v| v.to_f32()).collect();
-                    let bc: Vec<f32> = $b.iter().map(|v| v.to_f32()).collect();
-                    let mut oc = vec![0.0f32; $out.len()];
-                    scalar::scalar_f32::$op(&ac, &bc, &mut oc);
-                    for (o, v) in $out.iter_mut().zip(oc.iter()) { *o = E::from_f32(*v); }
-                }
-            }
+            (IsaLevel::Neon, 0) => neon::neon_f32::$op(as_typed_slice!($a, f32), as_typed_slice!($b, f32), as_typed_slice_mut!($out, f32)),
+            #[cfg(target_arch = "aarch64")]
+            (IsaLevel::Neon, 1) => neon::neon_f16::$op(as_typed_slice!($a, half::f16), as_typed_slice!($b, half::f16), as_typed_slice_mut!($out, half::f16)),
+            #[cfg(target_arch = "aarch64")]
+            (IsaLevel::Neon, 2) => neon::neon_bf16::$op(as_typed_slice!($a, half::bf16), as_typed_slice!($b, half::bf16), as_typed_slice_mut!($out, half::bf16)),
+            (_, 0) => scalar::scalar_f32::$op(as_typed_slice!($a, f32), as_typed_slice!($b, f32), as_typed_slice_mut!($out, f32)),
+            (_, 1) => scalar::scalar_f16::$op(as_typed_slice!($a, half::f16), as_typed_slice!($b, half::f16), as_typed_slice_mut!($out, half::f16)),
+            (_, 2) => scalar::scalar_bf16::$op(as_typed_slice!($a, half::bf16), as_typed_slice!($b, half::bf16), as_typed_slice_mut!($out, half::bf16)),
+            _ => unreachable!(),
         }
     };
 }
 
 macro_rules! dispatch_unary_op {
     ($a:expr, $out:expr, $op:ident) => {
-        match get_isa_level() {
+        match (get_isa_level(), E::ELEM_ID) {
             #[cfg(target_arch = "x86_64")]
-            IsaLevel::Avx512 => {
-                if let (Some(af), Some(of)) = (E::as_f32_slice($a), E::as_f32_slice_mut($out)) {
-                    avx512::avx512_f32::$op(af, of);
-                } else {
-                    let ac: Vec<f32> = $a.iter().map(|v| v.to_f32()).collect();
-                    let mut oc = vec![0.0f32; $out.len()];
-                    avx512::avx512_f32::$op(&ac, &mut oc);
-                    for (o, v) in $out.iter_mut().zip(oc.iter()) { *o = E::from_f32(*v); }
-                }
-            }
+            (IsaLevel::Avx512, 0) => avx512::avx512_f32::$op(as_typed_slice!($a, f32), as_typed_slice_mut!($out, f32)),
             #[cfg(target_arch = "x86_64")]
-            IsaLevel::Avx2 => {
-                if let (Some(af), Some(of)) = (E::as_f32_slice($a), E::as_f32_slice_mut($out)) {
-                    avx2::avx2_f32::$op(af, of);
-                } else {
-                    let ac: Vec<f32> = $a.iter().map(|v| v.to_f32()).collect();
-                    let mut oc = vec![0.0f32; $out.len()];
-                    avx2::avx2_f32::$op(&ac, &mut oc);
-                    for (o, v) in $out.iter_mut().zip(oc.iter()) { *o = E::from_f32(*v); }
-                }
-            }
+            (IsaLevel::Avx512, 1) => avx512::avx512_f16::$op(as_typed_slice!($a, half::f16), as_typed_slice_mut!($out, half::f16)),
+            #[cfg(target_arch = "x86_64")]
+            (IsaLevel::Avx512, 2) => avx512::avx512_bf16::$op(as_typed_slice!($a, half::bf16), as_typed_slice_mut!($out, half::bf16)),
+            #[cfg(target_arch = "x86_64")]
+            (IsaLevel::Avx2, 0) => avx2::avx2_f32::$op(as_typed_slice!($a, f32), as_typed_slice_mut!($out, f32)),
+            #[cfg(target_arch = "x86_64")]
+            (IsaLevel::Avx2, 1) => avx2::avx2_f16::$op(as_typed_slice!($a, half::f16), as_typed_slice_mut!($out, half::f16)),
+            #[cfg(target_arch = "x86_64")]
+            (IsaLevel::Avx2, 2) => avx2::avx2_bf16::$op(as_typed_slice!($a, half::bf16), as_typed_slice_mut!($out, half::bf16)),
             #[cfg(target_arch = "aarch64")]
-            IsaLevel::Neon => {
-                if let (Some(af), Some(of)) = (E::as_f32_slice($a), E::as_f32_slice_mut($out)) {
-                    neon::neon_f32::$op(af, of);
-                } else {
-                    let ac: Vec<f32> = $a.iter().map(|v| v.to_f32()).collect();
-                    let mut oc = vec![0.0f32; $out.len()];
-                    neon::neon_f32::$op(&ac, &mut oc);
-                    for (o, v) in $out.iter_mut().zip(oc.iter()) { *o = E::from_f32(*v); }
-                }
-            }
-            _ => {
-                if let (Some(af), Some(of)) = (E::as_f32_slice($a), E::as_f32_slice_mut($out)) {
-                    scalar::scalar_f32::$op(af, of);
-                } else {
-                    let ac: Vec<f32> = $a.iter().map(|v| v.to_f32()).collect();
-                    let mut oc = vec![0.0f32; $out.len()];
-                    scalar::scalar_f32::$op(&ac, &mut oc);
-                    for (o, v) in $out.iter_mut().zip(oc.iter()) { *o = E::from_f32(*v); }
-                }
-            }
+            (IsaLevel::Neon, 0) => neon::neon_f32::$op(as_typed_slice!($a, f32), as_typed_slice_mut!($out, f32)),
+            #[cfg(target_arch = "aarch64")]
+            (IsaLevel::Neon, 1) => neon::neon_f16::$op(as_typed_slice!($a, half::f16), as_typed_slice_mut!($out, half::f16)),
+            #[cfg(target_arch = "aarch64")]
+            (IsaLevel::Neon, 2) => neon::neon_bf16::$op(as_typed_slice!($a, half::bf16), as_typed_slice_mut!($out, half::bf16)),
+            (_, 0) => scalar::scalar_f32::$op(as_typed_slice!($a, f32), as_typed_slice_mut!($out, f32)),
+            (_, 1) => scalar::scalar_f16::$op(as_typed_slice!($a, half::f16), as_typed_slice_mut!($out, half::f16)),
+            (_, 2) => scalar::scalar_bf16::$op(as_typed_slice!($a, half::bf16), as_typed_slice_mut!($out, half::bf16)),
+            _ => unreachable!(),
         }
     };
 }
 
 macro_rules! dispatch_reduce_op {
     ($a:expr, $op:ident) => {
-        match get_isa_level() {
+        match (get_isa_level(), E::ELEM_ID) {
             #[cfg(target_arch = "x86_64")]
-            IsaLevel::Avx512 => {
-                if let Some(af) = E::as_f32_slice($a) {
-                    avx512::avx512_f32::$op(af)
-                } else {
-                    let ac: Vec<f32> = $a.iter().map(|v| v.to_f32()).collect();
-                    avx512::avx512_f32::$op(&ac)
-                }
-            }
+            (IsaLevel::Avx512, 0) => avx512::avx512_f32::$op(as_typed_slice!($a, f32)).to_f32(),
             #[cfg(target_arch = "x86_64")]
-            IsaLevel::Avx2 => {
-                if let Some(af) = E::as_f32_slice($a) {
-                    avx2::avx2_f32::$op(af)
-                } else {
-                    let ac: Vec<f32> = $a.iter().map(|v| v.to_f32()).collect();
-                    avx2::avx2_f32::$op(&ac)
-                }
-            }
+            (IsaLevel::Avx512, 1) => avx512::avx512_f16::$op(as_typed_slice!($a, half::f16)).to_f32(),
+            #[cfg(target_arch = "x86_64")]
+            (IsaLevel::Avx512, 2) => avx512::avx512_bf16::$op(as_typed_slice!($a, half::bf16)).to_f32(),
+            #[cfg(target_arch = "x86_64")]
+            (IsaLevel::Avx2, 0) => avx2::avx2_f32::$op(as_typed_slice!($a, f32)).to_f32(),
+            #[cfg(target_arch = "x86_64")]
+            (IsaLevel::Avx2, 1) => avx2::avx2_f16::$op(as_typed_slice!($a, half::f16)).to_f32(),
+            #[cfg(target_arch = "x86_64")]
+            (IsaLevel::Avx2, 2) => avx2::avx2_bf16::$op(as_typed_slice!($a, half::bf16)).to_f32(),
             #[cfg(target_arch = "aarch64")]
-            IsaLevel::Neon => {
-                if let Some(af) = E::as_f32_slice($a) {
-                    neon::neon_f32::$op(af)
-                } else {
-                    let ac: Vec<f32> = $a.iter().map(|v| v.to_f32()).collect();
-                    neon::neon_f32::$op(&ac)
-                }
-            }
-            _ => {
-                if let Some(af) = E::as_f32_slice($a) {
-                    scalar::scalar_f32::$op(af)
-                } else {
-                    let ac: Vec<f32> = $a.iter().map(|v| v.to_f32()).collect();
-                    scalar::scalar_f32::$op(&ac)
-                }
-            }
+            (IsaLevel::Neon, 0) => neon::neon_f32::$op(as_typed_slice!($a, f32)).to_f32(),
+            #[cfg(target_arch = "aarch64")]
+            (IsaLevel::Neon, 1) => neon::neon_f16::$op(as_typed_slice!($a, half::f16)).to_f32(),
+            #[cfg(target_arch = "aarch64")]
+            (IsaLevel::Neon, 2) => neon::neon_bf16::$op(as_typed_slice!($a, half::bf16)).to_f32(),
+            (_, 0) => scalar::scalar_f32::$op(as_typed_slice!($a, f32)).to_f32(),
+            (_, 1) => scalar::scalar_f16::$op(as_typed_slice!($a, half::f16)).to_f32(),
+            (_, 2) => scalar::scalar_bf16::$op(as_typed_slice!($a, half::bf16)).to_f32(),
+            _ => unreachable!(),
+        }
+    };
+}
+
+/// Dispatch with scalar parameter conversion (for axpy, etc.)
+/// Usage: dispatch_with_scalar!(op_name, scalar_f32_value, x_slice, y_mut_slice)
+macro_rules! dispatch_with_scalar {
+    ($op:ident, $scalar:expr, $x:expr, $y:expr) => {
+        match (get_isa_level(), E::ELEM_ID) {
+            #[cfg(target_arch = "x86_64")]
+            (IsaLevel::Avx512, 0) => avx512::avx512_f32::$op($scalar, as_typed_slice!($x, f32), as_typed_slice_mut!($y, f32)),
+            #[cfg(target_arch = "x86_64")]
+            (IsaLevel::Avx512, 1) => avx512::avx512_f16::$op(half::f16::from_f32($scalar), as_typed_slice!($x, half::f16), as_typed_slice_mut!($y, half::f16)),
+            #[cfg(target_arch = "x86_64")]
+            (IsaLevel::Avx512, 2) => avx512::avx512_bf16::$op(half::bf16::from_f32($scalar), as_typed_slice!($x, half::bf16), as_typed_slice_mut!($y, half::bf16)),
+            #[cfg(target_arch = "x86_64")]
+            (IsaLevel::Avx2, 0) => avx2::avx2_f32::$op($scalar, as_typed_slice!($x, f32), as_typed_slice_mut!($y, f32)),
+            #[cfg(target_arch = "x86_64")]
+            (IsaLevel::Avx2, 1) => avx2::avx2_f16::$op(half::f16::from_f32($scalar), as_typed_slice!($x, half::f16), as_typed_slice_mut!($y, half::f16)),
+            #[cfg(target_arch = "x86_64")]
+            (IsaLevel::Avx2, 2) => avx2::avx2_bf16::$op(half::bf16::from_f32($scalar), as_typed_slice!($x, half::bf16), as_typed_slice_mut!($y, half::bf16)),
+            #[cfg(target_arch = "aarch64")]
+            (IsaLevel::Neon, 0) => neon::neon_f32::$op($scalar, as_typed_slice!($x, f32), as_typed_slice_mut!($y, f32)),
+            #[cfg(target_arch = "aarch64")]
+            (IsaLevel::Neon, 1) => neon::neon_f16::$op(half::f16::from_f32($scalar), as_typed_slice!($x, half::f16), as_typed_slice_mut!($y, half::f16)),
+            #[cfg(target_arch = "aarch64")]
+            (IsaLevel::Neon, 2) => neon::neon_bf16::$op(half::bf16::from_f32($scalar), as_typed_slice!($x, half::bf16), as_typed_slice_mut!($y, half::bf16)),
+            (_, 0) => scalar::scalar_f32::$op($scalar, as_typed_slice!($x, f32), as_typed_slice_mut!($y, f32)),
+            (_, 1) => scalar::scalar_f16::$op(half::f16::from_f32($scalar), as_typed_slice!($x, half::f16), as_typed_slice_mut!($y, half::f16)),
+            (_, 2) => scalar::scalar_bf16::$op(half::bf16::from_f32($scalar), as_typed_slice!($x, half::bf16), as_typed_slice_mut!($y, half::bf16)),
+            _ => unreachable!(),
+        }
+    };
+}
+
+/// Dispatch for norm ops with eps parameter (rms_norm, layer_norm).
+/// eps is f32 for f32 path, converted via from_f32 for f16/bf16.
+/// 2-slice + out + eps variant (rms_norm)
+macro_rules! dispatch_with_eps {
+    ($op:ident, $x:expr, $w:expr, $out:expr, $eps:expr) => {
+        match (get_isa_level(), E::ELEM_ID) {
+            #[cfg(target_arch = "x86_64")]
+            (IsaLevel::Avx512, 0) => avx512::avx512_f32::$op(as_typed_slice!($x, f32), as_typed_slice!($w, f32), as_typed_slice_mut!($out, f32), $eps),
+            #[cfg(target_arch = "x86_64")]
+            (IsaLevel::Avx512, 1) => avx512::avx512_f16::$op(as_typed_slice!($x, half::f16), as_typed_slice!($w, half::f16), as_typed_slice_mut!($out, half::f16), half::f16::from_f32($eps)),
+            #[cfg(target_arch = "x86_64")]
+            (IsaLevel::Avx512, 2) => avx512::avx512_bf16::$op(as_typed_slice!($x, half::bf16), as_typed_slice!($w, half::bf16), as_typed_slice_mut!($out, half::bf16), half::bf16::from_f32($eps)),
+            #[cfg(target_arch = "x86_64")]
+            (IsaLevel::Avx2, 0) => avx2::avx2_f32::$op(as_typed_slice!($x, f32), as_typed_slice!($w, f32), as_typed_slice_mut!($out, f32), $eps),
+            #[cfg(target_arch = "x86_64")]
+            (IsaLevel::Avx2, 1) => avx2::avx2_f16::$op(as_typed_slice!($x, half::f16), as_typed_slice!($w, half::f16), as_typed_slice_mut!($out, half::f16), half::f16::from_f32($eps)),
+            #[cfg(target_arch = "x86_64")]
+            (IsaLevel::Avx2, 2) => avx2::avx2_bf16::$op(as_typed_slice!($x, half::bf16), as_typed_slice!($w, half::bf16), as_typed_slice_mut!($out, half::bf16), half::bf16::from_f32($eps)),
+            #[cfg(target_arch = "aarch64")]
+            (IsaLevel::Neon, 0) => neon::neon_f32::$op(as_typed_slice!($x, f32), as_typed_slice!($w, f32), as_typed_slice_mut!($out, f32), $eps),
+            #[cfg(target_arch = "aarch64")]
+            (IsaLevel::Neon, 1) => neon::neon_f16::$op(as_typed_slice!($x, half::f16), as_typed_slice!($w, half::f16), as_typed_slice_mut!($out, half::f16), half::f16::from_f32($eps)),
+            #[cfg(target_arch = "aarch64")]
+            (IsaLevel::Neon, 2) => neon::neon_bf16::$op(as_typed_slice!($x, half::bf16), as_typed_slice!($w, half::bf16), as_typed_slice_mut!($out, half::bf16), half::bf16::from_f32($eps)),
+            (_, 0) => scalar::scalar_f32::$op(as_typed_slice!($x, f32), as_typed_slice!($w, f32), as_typed_slice_mut!($out, f32), $eps),
+            (_, 1) => scalar::scalar_f16::$op(as_typed_slice!($x, half::f16), as_typed_slice!($w, half::f16), as_typed_slice_mut!($out, half::f16), half::f16::from_f32($eps)),
+            (_, 2) => scalar::scalar_bf16::$op(as_typed_slice!($x, half::bf16), as_typed_slice!($w, half::bf16), as_typed_slice_mut!($out, half::bf16), half::bf16::from_f32($eps)),
+            _ => unreachable!(),
+        }
+    };
+    // 3-slice + out + eps variant (layer_norm: x, gamma, beta, out, eps)
+    ($op:ident, $x:expr, $g:expr, $b:expr, $out:expr, $eps:expr) => {
+        match (get_isa_level(), E::ELEM_ID) {
+            #[cfg(target_arch = "x86_64")]
+            (IsaLevel::Avx512, 0) => avx512::avx512_f32::$op(as_typed_slice!($x, f32), as_typed_slice!($g, f32), as_typed_slice!($b, f32), as_typed_slice_mut!($out, f32), $eps),
+            #[cfg(target_arch = "x86_64")]
+            (IsaLevel::Avx512, 1) => avx512::avx512_f16::$op(as_typed_slice!($x, half::f16), as_typed_slice!($g, half::f16), as_typed_slice!($b, half::f16), as_typed_slice_mut!($out, half::f16), half::f16::from_f32($eps)),
+            #[cfg(target_arch = "x86_64")]
+            (IsaLevel::Avx512, 2) => avx512::avx512_bf16::$op(as_typed_slice!($x, half::bf16), as_typed_slice!($g, half::bf16), as_typed_slice!($b, half::bf16), as_typed_slice_mut!($out, half::bf16), half::bf16::from_f32($eps)),
+            #[cfg(target_arch = "x86_64")]
+            (IsaLevel::Avx2, 0) => avx2::avx2_f32::$op(as_typed_slice!($x, f32), as_typed_slice!($g, f32), as_typed_slice!($b, f32), as_typed_slice_mut!($out, f32), $eps),
+            #[cfg(target_arch = "x86_64")]
+            (IsaLevel::Avx2, 1) => avx2::avx2_f16::$op(as_typed_slice!($x, half::f16), as_typed_slice!($g, half::f16), as_typed_slice!($b, half::f16), as_typed_slice_mut!($out, half::f16), half::f16::from_f32($eps)),
+            #[cfg(target_arch = "x86_64")]
+            (IsaLevel::Avx2, 2) => avx2::avx2_bf16::$op(as_typed_slice!($x, half::bf16), as_typed_slice!($g, half::bf16), as_typed_slice!($b, half::bf16), as_typed_slice_mut!($out, half::bf16), half::bf16::from_f32($eps)),
+            #[cfg(target_arch = "aarch64")]
+            (IsaLevel::Neon, 0) => neon::neon_f32::$op(as_typed_slice!($x, f32), as_typed_slice!($g, f32), as_typed_slice!($b, f32), as_typed_slice_mut!($out, f32), $eps),
+            #[cfg(target_arch = "aarch64")]
+            (IsaLevel::Neon, 1) => neon::neon_f16::$op(as_typed_slice!($x, half::f16), as_typed_slice!($g, half::f16), as_typed_slice!($b, half::f16), as_typed_slice_mut!($out, half::f16), half::f16::from_f32($eps)),
+            #[cfg(target_arch = "aarch64")]
+            (IsaLevel::Neon, 2) => neon::neon_bf16::$op(as_typed_slice!($x, half::bf16), as_typed_slice!($g, half::bf16), as_typed_slice!($b, half::bf16), as_typed_slice_mut!($out, half::bf16), half::bf16::from_f32($eps)),
+            (_, 0) => scalar::scalar_f32::$op(as_typed_slice!($x, f32), as_typed_slice!($g, f32), as_typed_slice!($b, f32), as_typed_slice_mut!($out, f32), $eps),
+            (_, 1) => scalar::scalar_f16::$op(as_typed_slice!($x, half::f16), as_typed_slice!($g, half::f16), as_typed_slice!($b, half::f16), as_typed_slice_mut!($out, half::f16), half::f16::from_f32($eps)),
+            (_, 2) => scalar::scalar_bf16::$op(as_typed_slice!($x, half::bf16), as_typed_slice!($g, half::bf16), as_typed_slice!($b, half::bf16), as_typed_slice_mut!($out, half::bf16), half::bf16::from_f32($eps)),
+            _ => unreachable!(),
+        }
+    };
+}
+
+/// Dispatch for operations with extra usize parameters (gemv, gemm, etc.)
+/// Usage: dispatch_with_dims!(gemv, a, x, y, m, n)
+macro_rules! dispatch_with_dims {
+    // For gemv: 3 slices + 2 dims
+    ($op:ident, $a:expr, $x:expr, $y:expr, $m:expr, $n:expr) => {
+        match (get_isa_level(), E::ELEM_ID) {
+            #[cfg(target_arch = "x86_64")]
+            (IsaLevel::Avx512, 0) => avx512::avx512_f32::$op(as_typed_slice!($a, f32), as_typed_slice!($x, f32), as_typed_slice_mut!($y, f32), $m, $n),
+            #[cfg(target_arch = "x86_64")]
+            (IsaLevel::Avx512, 1) => avx512::avx512_f16::$op(as_typed_slice!($a, half::f16), as_typed_slice!($x, half::f16), as_typed_slice_mut!($y, half::f16), $m, $n),
+            #[cfg(target_arch = "x86_64")]
+            (IsaLevel::Avx512, 2) => avx512::avx512_bf16::$op(as_typed_slice!($a, half::bf16), as_typed_slice!($x, half::bf16), as_typed_slice_mut!($y, half::bf16), $m, $n),
+            #[cfg(target_arch = "x86_64")]
+            (IsaLevel::Avx2, 0) => avx2::avx2_f32::$op(as_typed_slice!($a, f32), as_typed_slice!($x, f32), as_typed_slice_mut!($y, f32), $m, $n),
+            #[cfg(target_arch = "x86_64")]
+            (IsaLevel::Avx2, 1) => avx2::avx2_f16::$op(as_typed_slice!($a, half::f16), as_typed_slice!($x, half::f16), as_typed_slice_mut!($y, half::f16), $m, $n),
+            #[cfg(target_arch = "x86_64")]
+            (IsaLevel::Avx2, 2) => avx2::avx2_bf16::$op(as_typed_slice!($a, half::bf16), as_typed_slice!($x, half::bf16), as_typed_slice_mut!($y, half::bf16), $m, $n),
+            #[cfg(target_arch = "aarch64")]
+            (IsaLevel::Neon, 0) => neon::neon_f32::$op(as_typed_slice!($a, f32), as_typed_slice!($x, f32), as_typed_slice_mut!($y, f32), $m, $n),
+            #[cfg(target_arch = "aarch64")]
+            (IsaLevel::Neon, 1) => neon::neon_f16::$op(as_typed_slice!($a, half::f16), as_typed_slice!($x, half::f16), as_typed_slice_mut!($y, half::f16), $m, $n),
+            #[cfg(target_arch = "aarch64")]
+            (IsaLevel::Neon, 2) => neon::neon_bf16::$op(as_typed_slice!($a, half::bf16), as_typed_slice!($x, half::bf16), as_typed_slice_mut!($y, half::bf16), $m, $n),
+            (_, 0) => scalar::scalar_f32::$op(as_typed_slice!($a, f32), as_typed_slice!($x, f32), as_typed_slice_mut!($y, f32), $m, $n),
+            (_, 1) => scalar::scalar_f16::$op(as_typed_slice!($a, half::f16), as_typed_slice!($x, half::f16), as_typed_slice_mut!($y, half::f16), $m, $n),
+            (_, 2) => scalar::scalar_bf16::$op(as_typed_slice!($a, half::bf16), as_typed_slice!($x, half::bf16), as_typed_slice_mut!($y, half::bf16), $m, $n),
+            _ => unreachable!(),
+        }
+    };
+    // For gemm: 3 slices + 3 dims
+    ($op:ident, $a:expr, $b:expr, $c:expr, $m:expr, $n:expr, $k:expr) => {
+        match (get_isa_level(), E::ELEM_ID) {
+            #[cfg(target_arch = "x86_64")]
+            (IsaLevel::Avx512, 0) => avx512::avx512_f32::$op(as_typed_slice!($a, f32), as_typed_slice!($b, f32), as_typed_slice_mut!($c, f32), $m, $n, $k),
+            #[cfg(target_arch = "x86_64")]
+            (IsaLevel::Avx512, 1) => avx512::avx512_f16::$op(as_typed_slice!($a, half::f16), as_typed_slice!($b, half::f16), as_typed_slice_mut!($c, half::f16), $m, $n, $k),
+            #[cfg(target_arch = "x86_64")]
+            (IsaLevel::Avx512, 2) => avx512::avx512_bf16::$op(as_typed_slice!($a, half::bf16), as_typed_slice!($b, half::bf16), as_typed_slice_mut!($c, half::bf16), $m, $n, $k),
+            #[cfg(target_arch = "x86_64")]
+            (IsaLevel::Avx2, 0) => avx2::avx2_f32::$op(as_typed_slice!($a, f32), as_typed_slice!($b, f32), as_typed_slice_mut!($c, f32), $m, $n, $k),
+            #[cfg(target_arch = "x86_64")]
+            (IsaLevel::Avx2, 1) => avx2::avx2_f16::$op(as_typed_slice!($a, half::f16), as_typed_slice!($b, half::f16), as_typed_slice_mut!($c, half::f16), $m, $n, $k),
+            #[cfg(target_arch = "x86_64")]
+            (IsaLevel::Avx2, 2) => avx2::avx2_bf16::$op(as_typed_slice!($a, half::bf16), as_typed_slice!($b, half::bf16), as_typed_slice_mut!($c, half::bf16), $m, $n, $k),
+            #[cfg(target_arch = "aarch64")]
+            (IsaLevel::Neon, 0) => neon::neon_f32::$op(as_typed_slice!($a, f32), as_typed_slice!($b, f32), as_typed_slice_mut!($c, f32), $m, $n, $k),
+            #[cfg(target_arch = "aarch64")]
+            (IsaLevel::Neon, 1) => neon::neon_f16::$op(as_typed_slice!($a, half::f16), as_typed_slice!($b, half::f16), as_typed_slice_mut!($c, half::f16), $m, $n, $k),
+            #[cfg(target_arch = "aarch64")]
+            (IsaLevel::Neon, 2) => neon::neon_bf16::$op(as_typed_slice!($a, half::bf16), as_typed_slice!($b, half::bf16), as_typed_slice_mut!($c, half::bf16), $m, $n, $k),
+            (_, 0) => scalar::scalar_f32::$op(as_typed_slice!($a, f32), as_typed_slice!($b, f32), as_typed_slice_mut!($c, f32), $m, $n, $k),
+            (_, 1) => scalar::scalar_f16::$op(as_typed_slice!($a, half::f16), as_typed_slice!($b, half::f16), as_typed_slice_mut!($c, half::f16), $m, $n, $k),
+            (_, 2) => scalar::scalar_bf16::$op(as_typed_slice!($a, half::bf16), as_typed_slice!($b, half::bf16), as_typed_slice_mut!($c, half::bf16), $m, $n, $k),
+            _ => unreachable!(),
+        }
+    };
+}
+
+/// Dispatch for rope: 1 mut slice + 2 read slices + usize
+macro_rules! dispatch_rope {
+    ($op:ident, $qk:expr, $cos:expr, $sin:expr, $hd:expr) => {
+        match (get_isa_level(), E::ELEM_ID) {
+            #[cfg(target_arch = "x86_64")]
+            (IsaLevel::Avx512, 0) => avx512::avx512_f32::$op(as_typed_slice_mut!($qk, f32), as_typed_slice!($cos, f32), as_typed_slice!($sin, f32), $hd),
+            #[cfg(target_arch = "x86_64")]
+            (IsaLevel::Avx512, 1) => avx512::avx512_f16::$op(as_typed_slice_mut!($qk, half::f16), as_typed_slice!($cos, half::f16), as_typed_slice!($sin, half::f16), $hd),
+            #[cfg(target_arch = "x86_64")]
+            (IsaLevel::Avx512, 2) => avx512::avx512_bf16::$op(as_typed_slice_mut!($qk, half::bf16), as_typed_slice!($cos, half::bf16), as_typed_slice!($sin, half::bf16), $hd),
+            #[cfg(target_arch = "x86_64")]
+            (IsaLevel::Avx2, 0) => avx2::avx2_f32::$op(as_typed_slice_mut!($qk, f32), as_typed_slice!($cos, f32), as_typed_slice!($sin, f32), $hd),
+            #[cfg(target_arch = "x86_64")]
+            (IsaLevel::Avx2, 1) => avx2::avx2_f16::$op(as_typed_slice_mut!($qk, half::f16), as_typed_slice!($cos, half::f16), as_typed_slice!($sin, half::f16), $hd),
+            #[cfg(target_arch = "x86_64")]
+            (IsaLevel::Avx2, 2) => avx2::avx2_bf16::$op(as_typed_slice_mut!($qk, half::bf16), as_typed_slice!($cos, half::bf16), as_typed_slice!($sin, half::bf16), $hd),
+            #[cfg(target_arch = "aarch64")]
+            (IsaLevel::Neon, 0) => neon::neon_f32::$op(as_typed_slice_mut!($qk, f32), as_typed_slice!($cos, f32), as_typed_slice!($sin, f32), $hd),
+            #[cfg(target_arch = "aarch64")]
+            (IsaLevel::Neon, 1) => neon::neon_f16::$op(as_typed_slice_mut!($qk, half::f16), as_typed_slice!($cos, half::f16), as_typed_slice!($sin, half::f16), $hd),
+            #[cfg(target_arch = "aarch64")]
+            (IsaLevel::Neon, 2) => neon::neon_bf16::$op(as_typed_slice_mut!($qk, half::bf16), as_typed_slice!($cos, half::bf16), as_typed_slice!($sin, half::bf16), $hd),
+            (_, 0) => scalar::scalar_f32::$op(as_typed_slice_mut!($qk, f32), as_typed_slice!($cos, f32), as_typed_slice!($sin, f32), $hd),
+            (_, 1) => scalar::scalar_f16::$op(as_typed_slice_mut!($qk, half::f16), as_typed_slice!($cos, half::f16), as_typed_slice!($sin, half::f16), $hd),
+            (_, 2) => scalar::scalar_bf16::$op(as_typed_slice_mut!($qk, half::bf16), as_typed_slice!($cos, half::bf16), as_typed_slice!($sin, half::bf16), $hd),
+            _ => unreachable!(),
+        }
+    };
+}
+
+/// Dispatch for in-place scale: read slice + f32 scalar + mut out, then copy back
+macro_rules! dispatch_scale {
+    ($op:ident, $x:expr, $sf:expr, $tmp:expr) => {
+        match (get_isa_level(), E::ELEM_ID) {
+            #[cfg(target_arch = "x86_64")]
+            (IsaLevel::Avx512, 0) => avx512::avx512_f32::$op(as_typed_slice!($x, f32), $sf, as_typed_slice_mut!($tmp, f32)),
+            #[cfg(target_arch = "x86_64")]
+            (IsaLevel::Avx512, 1) => avx512::avx512_f16::$op(as_typed_slice!($x, half::f16), half::f16::from_f32($sf), as_typed_slice_mut!($tmp, half::f16)),
+            #[cfg(target_arch = "x86_64")]
+            (IsaLevel::Avx512, 2) => avx512::avx512_bf16::$op(as_typed_slice!($x, half::bf16), half::bf16::from_f32($sf), as_typed_slice_mut!($tmp, half::bf16)),
+            #[cfg(target_arch = "x86_64")]
+            (IsaLevel::Avx2, 0) => avx2::avx2_f32::$op(as_typed_slice!($x, f32), $sf, as_typed_slice_mut!($tmp, f32)),
+            #[cfg(target_arch = "x86_64")]
+            (IsaLevel::Avx2, 1) => avx2::avx2_f16::$op(as_typed_slice!($x, half::f16), half::f16::from_f32($sf), as_typed_slice_mut!($tmp, half::f16)),
+            #[cfg(target_arch = "x86_64")]
+            (IsaLevel::Avx2, 2) => avx2::avx2_bf16::$op(as_typed_slice!($x, half::bf16), half::bf16::from_f32($sf), as_typed_slice_mut!($tmp, half::bf16)),
+            #[cfg(target_arch = "aarch64")]
+            (IsaLevel::Neon, 0) => neon::neon_f32::$op(as_typed_slice!($x, f32), $sf, as_typed_slice_mut!($tmp, f32)),
+            #[cfg(target_arch = "aarch64")]
+            (IsaLevel::Neon, 1) => neon::neon_f16::$op(as_typed_slice!($x, half::f16), half::f16::from_f32($sf), as_typed_slice_mut!($tmp, half::f16)),
+            #[cfg(target_arch = "aarch64")]
+            (IsaLevel::Neon, 2) => neon::neon_bf16::$op(as_typed_slice!($x, half::bf16), half::bf16::from_f32($sf), as_typed_slice_mut!($tmp, half::bf16)),
+            (_, 0) => scalar::scalar_f32::$op(as_typed_slice!($x, f32), $sf, as_typed_slice_mut!($tmp, f32)),
+            (_, 1) => scalar::scalar_f16::$op(as_typed_slice!($x, half::f16), half::f16::from_f32($sf), as_typed_slice_mut!($tmp, half::f16)),
+            (_, 2) => scalar::scalar_bf16::$op(as_typed_slice!($x, half::bf16), half::bf16::from_f32($sf), as_typed_slice_mut!($tmp, half::bf16)),
+            _ => unreachable!(),
+        }
+    };
+}
+
+// ============================================================================
+// Flash Attention dispatch macros
+// ============================================================================
+
+macro_rules! dispatch_flash_attention {
+    ($q:expr, $k:expr, $v:expr, $out:expr, $seq_len:expr, $num_heads:expr, $head_dim:expr, $scale:expr, $causal:expr) => {
+        match (get_isa_level(), E::ELEM_ID) {
+            #[cfg(target_arch = "x86_64")]
+            (IsaLevel::Avx512, 0) => avx512::avx512_f32::flash_attention(as_typed_slice!($q, f32), as_typed_slice!($k, f32), as_typed_slice!($v, f32), as_typed_slice_mut!($out, f32), $seq_len, $num_heads, $head_dim, $scale, $causal),
+            #[cfg(target_arch = "x86_64")]
+            (IsaLevel::Avx512, 1) => avx512::avx512_f16::flash_attention(as_typed_slice!($q, half::f16), as_typed_slice!($k, half::f16), as_typed_slice!($v, half::f16), as_typed_slice_mut!($out, half::f16), $seq_len, $num_heads, $head_dim, $scale, $causal),
+            #[cfg(target_arch = "x86_64")]
+            (IsaLevel::Avx512, 2) => avx512::avx512_bf16::flash_attention(as_typed_slice!($q, half::bf16), as_typed_slice!($k, half::bf16), as_typed_slice!($v, half::bf16), as_typed_slice_mut!($out, half::bf16), $seq_len, $num_heads, $head_dim, $scale, $causal),
+            #[cfg(target_arch = "x86_64")]
+            (IsaLevel::Avx2, 0) => avx2::avx2_f32::flash_attention(as_typed_slice!($q, f32), as_typed_slice!($k, f32), as_typed_slice!($v, f32), as_typed_slice_mut!($out, f32), $seq_len, $num_heads, $head_dim, $scale, $causal),
+            #[cfg(target_arch = "x86_64")]
+            (IsaLevel::Avx2, 1) => avx2::avx2_f16::flash_attention(as_typed_slice!($q, half::f16), as_typed_slice!($k, half::f16), as_typed_slice!($v, half::f16), as_typed_slice_mut!($out, half::f16), $seq_len, $num_heads, $head_dim, $scale, $causal),
+            #[cfg(target_arch = "x86_64")]
+            (IsaLevel::Avx2, 2) => avx2::avx2_bf16::flash_attention(as_typed_slice!($q, half::bf16), as_typed_slice!($k, half::bf16), as_typed_slice!($v, half::bf16), as_typed_slice_mut!($out, half::bf16), $seq_len, $num_heads, $head_dim, $scale, $causal),
+            #[cfg(target_arch = "aarch64")]
+            (IsaLevel::Neon, 0) => neon::neon_f32::flash_attention(as_typed_slice!($q, f32), as_typed_slice!($k, f32), as_typed_slice!($v, f32), as_typed_slice_mut!($out, f32), $seq_len, $num_heads, $head_dim, $scale, $causal),
+            #[cfg(target_arch = "aarch64")]
+            (IsaLevel::Neon, 1) => neon::neon_f16::flash_attention(as_typed_slice!($q, half::f16), as_typed_slice!($k, half::f16), as_typed_slice!($v, half::f16), as_typed_slice_mut!($out, half::f16), $seq_len, $num_heads, $head_dim, $scale, $causal),
+            #[cfg(target_arch = "aarch64")]
+            (IsaLevel::Neon, 2) => neon::neon_bf16::flash_attention(as_typed_slice!($q, half::bf16), as_typed_slice!($k, half::bf16), as_typed_slice!($v, half::bf16), as_typed_slice_mut!($out, half::bf16), $seq_len, $num_heads, $head_dim, $scale, $causal),
+            (_, 0) => scalar::scalar_f32::flash_attention(as_typed_slice!($q, f32), as_typed_slice!($k, f32), as_typed_slice!($v, f32), as_typed_slice_mut!($out, f32), $seq_len, $num_heads, $head_dim, $scale, $causal),
+            (_, 1) => scalar::scalar_f16::flash_attention(as_typed_slice!($q, half::f16), as_typed_slice!($k, half::f16), as_typed_slice!($v, half::f16), as_typed_slice_mut!($out, half::f16), $seq_len, $num_heads, $head_dim, $scale, $causal),
+            (_, 2) => scalar::scalar_bf16::flash_attention(as_typed_slice!($q, half::bf16), as_typed_slice!($k, half::bf16), as_typed_slice!($v, half::bf16), as_typed_slice_mut!($out, half::bf16), $seq_len, $num_heads, $head_dim, $scale, $causal),
+            _ => unreachable!(),
+        }
+    };
+}
+
+macro_rules! dispatch_flash_attention_paged {
+    ($q:expr, $kc:expr, $vc:expr, $pt:expr, $out:expr, $sl:expr, $cl:expr, $nh:expr, $nkv:expr, $hd:expr, $ps:expr, $sc:expr) => {
+        match (get_isa_level(), E::ELEM_ID) {
+            #[cfg(target_arch = "x86_64")]
+            (IsaLevel::Avx512, 0) => avx512::avx512_f32::flash_attention_paged(as_typed_slice!($q, f32), as_typed_slice!($kc, f32), as_typed_slice!($vc, f32), $pt, as_typed_slice_mut!($out, f32), $sl, $cl, $nh, $nkv, $hd, $ps, $sc),
+            #[cfg(target_arch = "x86_64")]
+            (IsaLevel::Avx512, 1) => avx512::avx512_f16::flash_attention_paged(as_typed_slice!($q, half::f16), as_typed_slice!($kc, half::f16), as_typed_slice!($vc, half::f16), $pt, as_typed_slice_mut!($out, half::f16), $sl, $cl, $nh, $nkv, $hd, $ps, $sc),
+            #[cfg(target_arch = "x86_64")]
+            (IsaLevel::Avx512, 2) => avx512::avx512_bf16::flash_attention_paged(as_typed_slice!($q, half::bf16), as_typed_slice!($kc, half::bf16), as_typed_slice!($vc, half::bf16), $pt, as_typed_slice_mut!($out, half::bf16), $sl, $cl, $nh, $nkv, $hd, $ps, $sc),
+            #[cfg(target_arch = "x86_64")]
+            (IsaLevel::Avx2, 0) => avx2::avx2_f32::flash_attention_paged(as_typed_slice!($q, f32), as_typed_slice!($kc, f32), as_typed_slice!($vc, f32), $pt, as_typed_slice_mut!($out, f32), $sl, $cl, $nh, $nkv, $hd, $ps, $sc),
+            #[cfg(target_arch = "x86_64")]
+            (IsaLevel::Avx2, 1) => avx2::avx2_f16::flash_attention_paged(as_typed_slice!($q, half::f16), as_typed_slice!($kc, half::f16), as_typed_slice!($vc, half::f16), $pt, as_typed_slice_mut!($out, half::f16), $sl, $cl, $nh, $nkv, $hd, $ps, $sc),
+            #[cfg(target_arch = "x86_64")]
+            (IsaLevel::Avx2, 2) => avx2::avx2_bf16::flash_attention_paged(as_typed_slice!($q, half::bf16), as_typed_slice!($kc, half::bf16), as_typed_slice!($vc, half::bf16), $pt, as_typed_slice_mut!($out, half::bf16), $sl, $cl, $nh, $nkv, $hd, $ps, $sc),
+            #[cfg(target_arch = "aarch64")]
+            (IsaLevel::Neon, 0) => neon::neon_f32::flash_attention_paged(as_typed_slice!($q, f32), as_typed_slice!($kc, f32), as_typed_slice!($vc, f32), $pt, as_typed_slice_mut!($out, f32), $sl, $cl, $nh, $nkv, $hd, $ps, $sc),
+            #[cfg(target_arch = "aarch64")]
+            (IsaLevel::Neon, 1) => neon::neon_f16::flash_attention_paged(as_typed_slice!($q, half::f16), as_typed_slice!($kc, half::f16), as_typed_slice!($vc, half::f16), $pt, as_typed_slice_mut!($out, half::f16), $sl, $cl, $nh, $nkv, $hd, $ps, $sc),
+            #[cfg(target_arch = "aarch64")]
+            (IsaLevel::Neon, 2) => neon::neon_bf16::flash_attention_paged(as_typed_slice!($q, half::bf16), as_typed_slice!($kc, half::bf16), as_typed_slice!($vc, half::bf16), $pt, as_typed_slice_mut!($out, half::bf16), $sl, $cl, $nh, $nkv, $hd, $ps, $sc),
+            (_, 0) => scalar::scalar_f32::flash_attention_paged(as_typed_slice!($q, f32), as_typed_slice!($kc, f32), as_typed_slice!($vc, f32), $pt, as_typed_slice_mut!($out, f32), $sl, $cl, $nh, $nkv, $hd, $ps, $sc),
+            (_, 1) => scalar::scalar_f16::flash_attention_paged(as_typed_slice!($q, half::f16), as_typed_slice!($kc, half::f16), as_typed_slice!($vc, half::f16), $pt, as_typed_slice_mut!($out, half::f16), $sl, $cl, $nh, $nkv, $hd, $ps, $sc),
+            (_, 2) => scalar::scalar_bf16::flash_attention_paged(as_typed_slice!($q, half::bf16), as_typed_slice!($kc, half::bf16), as_typed_slice!($vc, half::bf16), $pt, as_typed_slice_mut!($out, half::bf16), $sl, $cl, $nh, $nkv, $hd, $ps, $sc),
+            _ => unreachable!(),
         }
     };
 }
@@ -401,95 +685,15 @@ impl<E: Element> Kernels<E> for CpuKernels<E> {
     }
 
     fn vec_scale(&self, x: &mut [E], s: E) {
-        match get_isa_level() {
-            #[cfg(target_arch = "x86_64")]
-            IsaLevel::Avx512 => {
-                if let (Some(xf), Some(sf)) = (E::as_f32_slice_mut(x), E::as_f32_ref(&s)) {
-                    let mut out = vec![0.0f32; xf.len()];
-                    avx512::avx512_f32::scale(xf, *sf, &mut out);
-                    xf.copy_from_slice(&out);
-                } else {
-                    let sf = s.to_f32();
-                    let xc: Vec<f32> = x.iter().map(|v| v.to_f32()).collect();
-                    let mut out = vec![0.0f32; xc.len()];
-                    avx512::avx512_f32::scale(&xc, sf, &mut out);
-                    for (xv, ov) in x.iter_mut().zip(out.iter()) { *xv = E::from_f32(*ov); }
-                }
-            }
-            #[cfg(target_arch = "x86_64")]
-            IsaLevel::Avx2 => {
-                if let (Some(xf), Some(sf)) = (E::as_f32_slice_mut(x), E::as_f32_ref(&s)) {
-                    let mut out = vec![0.0f32; xf.len()];
-                    avx2::avx2_f32::scale(xf, *sf, &mut out);
-                    xf.copy_from_slice(&out);
-                } else {
-                    let sf = s.to_f32();
-                    let xc: Vec<f32> = x.iter().map(|v| v.to_f32()).collect();
-                    let mut out = vec![0.0f32; xc.len()];
-                    avx2::avx2_f32::scale(&xc, sf, &mut out);
-                    for (xv, ov) in x.iter_mut().zip(out.iter()) { *xv = E::from_f32(*ov); }
-                }
-            }
-            _ => {
-                if let (Some(xf), Some(sf)) = (E::as_f32_slice_mut(x), E::as_f32_ref(&s)) {
-                    let mut out = vec![0.0f32; xf.len()];
-                    scalar::scalar_f32::scale(xf, *sf, &mut out);
-                    xf.copy_from_slice(&out);
-                } else {
-                    let sf = s.to_f32();
-                    let xc: Vec<f32> = x.iter().map(|v| v.to_f32()).collect();
-                    let mut out = vec![0.0f32; xc.len()];
-                    scalar::scalar_f32::scale(&xc, sf, &mut out);
-                    for (xv, ov) in x.iter_mut().zip(out.iter()) { *xv = E::from_f32(*ov); }
-                }
-            }
-        }
+        let mut tmp = vec![E::ZERO; x.len()];
+        let sf = s.to_f32();
+        dispatch_scale!(scale, x, sf, &mut tmp);
+        x.copy_from_slice(&tmp);
     }
 
     fn vec_axpy(&self, y: &mut [E], a: E, x: &[E]) {
-        match get_isa_level() {
-            #[cfg(target_arch = "x86_64")]
-            IsaLevel::Avx512 => {
-                if let (Some(yf), Some(xf), Some(af)) = (
-                    E::as_f32_slice_mut(y), E::as_f32_slice(x), E::as_f32_ref(&a)
-                ) {
-                    avx512::avx512_f32::axpy(*af, xf, yf);
-                } else {
-                    let af = a.to_f32();
-                    let xc: Vec<f32> = x.iter().map(|v| v.to_f32()).collect();
-                    let mut yc: Vec<f32> = y.iter().map(|v| v.to_f32()).collect();
-                    avx512::avx512_f32::axpy(af, &xc, &mut yc);
-                    for (yv, ov) in y.iter_mut().zip(yc.iter()) { *yv = E::from_f32(*ov); }
-                }
-            }
-            #[cfg(target_arch = "x86_64")]
-            IsaLevel::Avx2 => {
-                if let (Some(yf), Some(xf), Some(af)) = (
-                    E::as_f32_slice_mut(y), E::as_f32_slice(x), E::as_f32_ref(&a)
-                ) {
-                    avx2::avx2_f32::axpy(*af, xf, yf);
-                } else {
-                    let af = a.to_f32();
-                    let xc: Vec<f32> = x.iter().map(|v| v.to_f32()).collect();
-                    let mut yc: Vec<f32> = y.iter().map(|v| v.to_f32()).collect();
-                    avx2::avx2_f32::axpy(af, &xc, &mut yc);
-                    for (yv, ov) in y.iter_mut().zip(yc.iter()) { *yv = E::from_f32(*ov); }
-                }
-            }
-            _ => {
-                if let (Some(yf), Some(xf), Some(af)) = (
-                    E::as_f32_slice_mut(y), E::as_f32_slice(x), E::as_f32_ref(&a)
-                ) {
-                    scalar::scalar_f32::axpy(*af, xf, yf);
-                } else {
-                    let af = a.to_f32();
-                    let xc: Vec<f32> = x.iter().map(|v| v.to_f32()).collect();
-                    let mut yc: Vec<f32> = y.iter().map(|v| v.to_f32()).collect();
-                    scalar::scalar_f32::axpy(af, &xc, &mut yc);
-                    for (yv, ov) in y.iter_mut().zip(yc.iter()) { *yv = E::from_f32(*ov); }
-                }
-            }
-        }
+        let af = a.to_f32();
+        dispatch_with_scalar!(axpy, af, x, y);
     }
 
     fn vec_sum(&self, x: &[E]) -> E { E::from_f32(dispatch_reduce_op!(x, sum)) }
@@ -498,109 +702,11 @@ impl<E: Element> Kernels<E> for CpuKernels<E> {
 
     // BLAS-2/3
     fn gemv(&self, a: &[E], x: &[E], y: &mut [E], m: usize, n: usize) {
-        match get_isa_level() {
-            #[cfg(target_arch = "x86_64")]
-            IsaLevel::Avx512 => {
-                if let (Some(af), Some(xf), Some(yf)) = (
-                    E::as_f32_slice(a), E::as_f32_slice(x), E::as_f32_slice_mut(y)
-                ) {
-                    avx512::avx512_f32::gemv(af, xf, yf, m, n);
-                } else {
-                    let ac: Vec<f32> = a.iter().map(|v| v.to_f32()).collect();
-                    let xc: Vec<f32> = x.iter().map(|v| v.to_f32()).collect();
-                    let mut yc: Vec<f32> = y.iter().map(|v| v.to_f32()).collect();
-                    avx512::avx512_f32::gemv(&ac, &xc, &mut yc, m, n);
-                    for (yv, ov) in y.iter_mut().zip(yc.iter()) { *yv = E::from_f32(*ov); }
-                }
-            }
-            #[cfg(target_arch = "x86_64")]
-            IsaLevel::Avx2 => {
-                if let (Some(af), Some(xf), Some(yf)) = (
-                    E::as_f32_slice(a), E::as_f32_slice(x), E::as_f32_slice_mut(y)
-                ) {
-                    avx2::avx2_f32::gemv(af, xf, yf, m, n);
-                } else {
-                    let ac: Vec<f32> = a.iter().map(|v| v.to_f32()).collect();
-                    let xc: Vec<f32> = x.iter().map(|v| v.to_f32()).collect();
-                    let mut yc: Vec<f32> = y.iter().map(|v| v.to_f32()).collect();
-                    avx2::avx2_f32::gemv(&ac, &xc, &mut yc, m, n);
-                    for (yv, ov) in y.iter_mut().zip(yc.iter()) { *yv = E::from_f32(*ov); }
-                }
-            }
-            _ => {
-                if let (Some(af), Some(xf), Some(yf)) = (
-                    E::as_f32_slice(a), E::as_f32_slice(x), E::as_f32_slice_mut(y)
-                ) {
-                    scalar::scalar_f32::gemv(af, xf, yf, m, n);
-                } else {
-                    let ac: Vec<f32> = a.iter().map(|v| v.to_f32()).collect();
-                    let xc: Vec<f32> = x.iter().map(|v| v.to_f32()).collect();
-                    let mut yc: Vec<f32> = y.iter().map(|v| v.to_f32()).collect();
-                    scalar::scalar_f32::gemv(&ac, &xc, &mut yc, m, n);
-                    for (yv, ov) in y.iter_mut().zip(yc.iter()) { *yv = E::from_f32(*ov); }
-                }
-            }
-        }
+        dispatch_with_dims!(gemv, a, x, y, m, n);
     }
 
     fn gemm(&self, a: &[E], b: &[E], c: &mut [E], m: usize, n: usize, k: usize) {
-        match get_isa_level() {
-            #[cfg(target_arch = "x86_64")]
-            IsaLevel::Avx512 => {
-                if let (Some(af), Some(bf), Some(cf)) = (
-                    E::as_f32_slice(a), E::as_f32_slice(b), E::as_f32_slice_mut(c)
-                ) {
-                    avx512::avx512_f32::matmul(af, bf, cf, m, n, k);
-                } else {
-                    let ac: Vec<f32> = a.iter().map(|v| v.to_f32()).collect();
-                    let bc: Vec<f32> = b.iter().map(|v| v.to_f32()).collect();
-                    let mut cc = vec![0.0f32; c.len()];
-                    avx512::avx512_f32::matmul(&ac, &bc, &mut cc, m, n, k);
-                    for (cv, ov) in c.iter_mut().zip(cc.iter()) { *cv = E::from_f32(*ov); }
-                }
-            }
-            #[cfg(target_arch = "x86_64")]
-            IsaLevel::Avx2 => {
-                if let (Some(af), Some(bf), Some(cf)) = (
-                    E::as_f32_slice(a), E::as_f32_slice(b), E::as_f32_slice_mut(c)
-                ) {
-                    avx2::avx2_f32::matmul(af, bf, cf, m, n, k);
-                } else {
-                    let ac: Vec<f32> = a.iter().map(|v| v.to_f32()).collect();
-                    let bc: Vec<f32> = b.iter().map(|v| v.to_f32()).collect();
-                    let mut cc = vec![0.0f32; c.len()];
-                    avx2::avx2_f32::matmul(&ac, &bc, &mut cc, m, n, k);
-                    for (cv, ov) in c.iter_mut().zip(cc.iter()) { *cv = E::from_f32(*ov); }
-                }
-            }
-            #[cfg(target_arch = "aarch64")]
-            IsaLevel::Neon => {
-                if let (Some(af), Some(bf), Some(cf)) = (
-                    E::as_f32_slice(a), E::as_f32_slice(b), E::as_f32_slice_mut(c)
-                ) {
-                    neon::neon_f32::matmul(af, bf, cf, m, n, k);
-                } else {
-                    let ac: Vec<f32> = a.iter().map(|v| v.to_f32()).collect();
-                    let bc: Vec<f32> = b.iter().map(|v| v.to_f32()).collect();
-                    let mut cc = vec![0.0f32; c.len()];
-                    neon::neon_f32::matmul(&ac, &bc, &mut cc, m, n, k);
-                    for (cv, ov) in c.iter_mut().zip(cc.iter()) { *cv = E::from_f32(*ov); }
-                }
-            }
-            _ => {
-                if let (Some(af), Some(bf), Some(cf)) = (
-                    E::as_f32_slice(a), E::as_f32_slice(b), E::as_f32_slice_mut(c)
-                ) {
-                    scalar::scalar_f32::matmul(af, bf, cf, m, n, k);
-                } else {
-                    let ac: Vec<f32> = a.iter().map(|v| v.to_f32()).collect();
-                    let bc: Vec<f32> = b.iter().map(|v| v.to_f32()).collect();
-                    let mut cc = vec![0.0f32; c.len()];
-                    scalar::scalar_f32::matmul(&ac, &bc, &mut cc, m, n, k);
-                    for (cv, ov) in c.iter_mut().zip(cc.iter()) { *cv = E::from_f32(*ov); }
-                }
-            }
-        }
+        dispatch_with_dims!(matmul, a, b, c, m, n, k);
     }
 
     fn gemm_bias(&self, a: &[E], b: &[E], bias: &[E], c: &mut [E], m: usize, n: usize, k: usize) {
@@ -629,208 +735,39 @@ impl<E: Element> Kernels<E> for CpuKernels<E> {
 
     // Normalization
     fn rms_norm(&self, x: &[E], weight: &[E], out: &mut [E], eps: f32) {
-        match get_isa_level() {
-            #[cfg(target_arch = "x86_64")]
-            IsaLevel::Avx512 => {
-                if let (Some(xf), Some(wf), Some(of)) = (
-                    E::as_f32_slice(x), E::as_f32_slice(weight), E::as_f32_slice_mut(out)
-                ) {
-                    avx512::avx512_f32::rms_norm(xf, wf, of, eps);
-                } else {
-                    let xc: Vec<f32> = x.iter().map(|v| v.to_f32()).collect();
-                    let wc: Vec<f32> = weight.iter().map(|v| v.to_f32()).collect();
-                    let mut oc = vec![0.0f32; out.len()];
-                    avx512::avx512_f32::rms_norm(&xc, &wc, &mut oc, eps);
-                    for (o, v) in out.iter_mut().zip(oc.iter()) { *o = E::from_f32(*v); }
-                }
-            }
-            #[cfg(target_arch = "x86_64")]
-            IsaLevel::Avx2 => {
-                if let (Some(xf), Some(wf), Some(of)) = (
-                    E::as_f32_slice(x), E::as_f32_slice(weight), E::as_f32_slice_mut(out)
-                ) {
-                    avx2::avx2_f32::rms_norm(xf, wf, of, eps);
-                } else {
-                    let xc: Vec<f32> = x.iter().map(|v| v.to_f32()).collect();
-                    let wc: Vec<f32> = weight.iter().map(|v| v.to_f32()).collect();
-                    let mut oc = vec![0.0f32; out.len()];
-                    avx2::avx2_f32::rms_norm(&xc, &wc, &mut oc, eps);
-                    for (o, v) in out.iter_mut().zip(oc.iter()) { *o = E::from_f32(*v); }
-                }
-            }
-            _ => {
-                if let (Some(xf), Some(wf), Some(of)) = (
-                    E::as_f32_slice(x), E::as_f32_slice(weight), E::as_f32_slice_mut(out)
-                ) {
-                    scalar::scalar_f32::rms_norm(xf, wf, of, eps);
-                } else {
-                    let xc: Vec<f32> = x.iter().map(|v| v.to_f32()).collect();
-                    let wc: Vec<f32> = weight.iter().map(|v| v.to_f32()).collect();
-                    let mut oc = vec![0.0f32; out.len()];
-                    scalar::scalar_f32::rms_norm(&xc, &wc, &mut oc, eps);
-                    for (o, v) in out.iter_mut().zip(oc.iter()) { *o = E::from_f32(*v); }
-                }
-            }
-        }
+        dispatch_with_eps!(rms_norm, x, weight, out, eps);
     }
 
     fn layer_norm(&self, x: &[E], gamma: &[E], beta: &[E], out: &mut [E], eps: f32) {
-        match get_isa_level() {
-            #[cfg(target_arch = "x86_64")]
-            IsaLevel::Avx512 => {
-                if let (Some(xf), Some(gf), Some(bf), Some(of)) = (
-                    E::as_f32_slice(x), E::as_f32_slice(gamma), E::as_f32_slice(beta), E::as_f32_slice_mut(out)
-                ) {
-                    avx512::avx512_f32::layer_norm(xf, gf, bf, of, eps);
-                } else {
-                    let xc: Vec<f32> = x.iter().map(|v| v.to_f32()).collect();
-                    let gc: Vec<f32> = gamma.iter().map(|v| v.to_f32()).collect();
-                    let bc: Vec<f32> = beta.iter().map(|v| v.to_f32()).collect();
-                    let mut oc = vec![0.0f32; out.len()];
-                    avx512::avx512_f32::layer_norm(&xc, &gc, &bc, &mut oc, eps);
-                    for (o, v) in out.iter_mut().zip(oc.iter()) { *o = E::from_f32(*v); }
-                }
-            }
-            #[cfg(target_arch = "x86_64")]
-            IsaLevel::Avx2 => {
-                if let (Some(xf), Some(gf), Some(bf), Some(of)) = (
-                    E::as_f32_slice(x), E::as_f32_slice(gamma), E::as_f32_slice(beta), E::as_f32_slice_mut(out)
-                ) {
-                    avx2::avx2_f32::layer_norm(xf, gf, bf, of, eps);
-                } else {
-                    let xc: Vec<f32> = x.iter().map(|v| v.to_f32()).collect();
-                    let gc: Vec<f32> = gamma.iter().map(|v| v.to_f32()).collect();
-                    let bc: Vec<f32> = beta.iter().map(|v| v.to_f32()).collect();
-                    let mut oc = vec![0.0f32; out.len()];
-                    avx2::avx2_f32::layer_norm(&xc, &gc, &bc, &mut oc, eps);
-                    for (o, v) in out.iter_mut().zip(oc.iter()) { *o = E::from_f32(*v); }
-                }
-            }
-            _ => {
-                if let (Some(xf), Some(gf), Some(bf), Some(of)) = (
-                    E::as_f32_slice(x), E::as_f32_slice(gamma), E::as_f32_slice(beta), E::as_f32_slice_mut(out)
-                ) {
-                    scalar::scalar_f32::layer_norm(xf, gf, bf, of, eps);
-                } else {
-                    let xc: Vec<f32> = x.iter().map(|v| v.to_f32()).collect();
-                    let gc: Vec<f32> = gamma.iter().map(|v| v.to_f32()).collect();
-                    let bc: Vec<f32> = beta.iter().map(|v| v.to_f32()).collect();
-                    let mut oc = vec![0.0f32; out.len()];
-                    scalar::scalar_f32::layer_norm(&xc, &gc, &bc, &mut oc, eps);
-                    for (o, v) in out.iter_mut().zip(oc.iter()) { *o = E::from_f32(*v); }
-                }
-            }
-        }
+        dispatch_with_eps!(layer_norm, x, gamma, beta, out, eps);
     }
 
     // Positional
     fn rope(&self, qk: &mut [E], cos: &[E], sin: &[E], head_dim: usize, _interleaved: bool) {
-        match get_isa_level() {
-            #[cfg(target_arch = "x86_64")]
-            IsaLevel::Avx512 => {
-                if let (Some(qf), Some(cf), Some(sf)) = (
-                    E::as_f32_slice_mut(qk), E::as_f32_slice(cos), E::as_f32_slice(sin)
-                ) {
-                    avx512::avx512_f32::rope(qf, cf, sf, head_dim);
-                } else {
-                    let mut qc: Vec<f32> = qk.iter().map(|v| v.to_f32()).collect();
-                    let cc: Vec<f32> = cos.iter().map(|v| v.to_f32()).collect();
-                    let sc: Vec<f32> = sin.iter().map(|v| v.to_f32()).collect();
-                    avx512::avx512_f32::rope(&mut qc, &cc, &sc, head_dim);
-                    for (q, v) in qk.iter_mut().zip(qc.iter()) { *q = E::from_f32(*v); }
-                }
-            }
-            #[cfg(target_arch = "x86_64")]
-            IsaLevel::Avx2 => {
-                if let (Some(qf), Some(cf), Some(sf)) = (
-                    E::as_f32_slice_mut(qk), E::as_f32_slice(cos), E::as_f32_slice(sin)
-                ) {
-                    avx2::avx2_f32::rope(qf, cf, sf, head_dim);
-                } else {
-                    let mut qc: Vec<f32> = qk.iter().map(|v| v.to_f32()).collect();
-                    let cc: Vec<f32> = cos.iter().map(|v| v.to_f32()).collect();
-                    let sc: Vec<f32> = sin.iter().map(|v| v.to_f32()).collect();
-                    avx2::avx2_f32::rope(&mut qc, &cc, &sc, head_dim);
-                    for (q, v) in qk.iter_mut().zip(qc.iter()) { *q = E::from_f32(*v); }
-                }
-            }
-            _ => {
-                if let (Some(qf), Some(cf), Some(sf)) = (
-                    E::as_f32_slice_mut(qk), E::as_f32_slice(cos), E::as_f32_slice(sin)
-                ) {
-                    scalar::scalar_f32::rope(qf, cf, sf, head_dim);
-                } else {
-                    let mut qc: Vec<f32> = qk.iter().map(|v| v.to_f32()).collect();
-                    let cc: Vec<f32> = cos.iter().map(|v| v.to_f32()).collect();
-                    let sc: Vec<f32> = sin.iter().map(|v| v.to_f32()).collect();
-                    scalar::scalar_f32::rope(&mut qc, &cc, &sc, head_dim);
-                    for (q, v) in qk.iter_mut().zip(qc.iter()) { *q = E::from_f32(*v); }
-                }
-            }
-        }
+        dispatch_rope!(rope, qk, cos, sin, head_dim);
     }
 
     // Embedding
     fn embedding_lookup(&self, ids: &[u32], table: &[E], output: &mut [E], _vocab_size: usize, hidden_size: usize) {
-        if let (Some(tf), Some(of)) = (E::as_f32_slice(table), E::as_f32_slice_mut(output)) {
-            scalar::scalar_f32::embedding_lookup(tf, ids, of, hidden_size);
-        } else {
-            let tc: Vec<f32> = table.iter().map(|v| v.to_f32()).collect();
-            let mut oc = vec![0.0f32; output.len()];
-            scalar::scalar_f32::embedding_lookup(&tc, ids, &mut oc, hidden_size);
-            for (o, v) in output.iter_mut().zip(oc.iter()) { *o = E::from_f32(*v); }
+        match E::ELEM_ID {
+            0 => scalar::scalar_f32::embedding_lookup(as_typed_slice!(table, f32), ids, as_typed_slice_mut!(output, f32), hidden_size),
+            1 => scalar::scalar_f16::embedding_lookup(as_typed_slice!(table, half::f16), ids, as_typed_slice_mut!(output, half::f16), hidden_size),
+            2 => scalar::scalar_bf16::embedding_lookup(as_typed_slice!(table, half::bf16), ids, as_typed_slice_mut!(output, half::bf16), hidden_size),
+            _ => unreachable!(),
         }
     }
 
     // Sampling
     // Quantization
-    fn dequant_q4_k(&self, block: &[u8], out: &mut [f32]) {
-        let block_ptr = block.as_ptr() as *const crate::quant::BlockQ4K;
-        let out_ptr = out.as_mut_ptr();
-        match get_isa_level() {
-            #[cfg(target_arch = "x86_64")]
-            IsaLevel::Avx512 => {
-                crate::quant_primitive!(avx2, q4_k, decode, block_ptr, out_ptr);
-            }
-            #[cfg(target_arch = "x86_64")]
-            IsaLevel::Avx2 => {
-                crate::quant_primitive!(avx2, q4_k, decode, block_ptr, out_ptr);
-            }
-            _ => {
-                crate::quant_primitive!(scalar, q4_k, decode, block_ptr, out_ptr);
-            }
-        }
-    }
+    // K-Quant decode: avx512 + avx2 + scalar
+    define_quant_decode_k!(dequant_q4_k, q4_k, BlockQ4K);
+    define_quant_decode_k!(dequant_q3_k, q3_k, BlockQ3K);
+    define_quant_decode_k!(dequant_q5_k, q5_k, BlockQ5K);
+    define_quant_decode_k!(dequant_q6_k, q6_k, BlockQ6K);
 
-    fn dequant_q8_k(&self, block: &[u8], out: &mut [f32]) {
-        let block_ptr = block.as_ptr() as *const crate::quant::BlockQ8K;
-        let out_ptr = out.as_mut_ptr();
-        crate::quant_primitive!(scalar, q8_k, decode, block_ptr, out_ptr);
-    }
-
-    fn dequant_q2_k(&self, block: &[u8], out: &mut [f32]) {
-        let block_ptr = block.as_ptr() as *const crate::quant::BlockQ2K;
-        let out_ptr = out.as_mut_ptr();
-        crate::quant_primitive!(scalar, q2_k, decode, block_ptr, out_ptr);
-    }
-
-    fn dequant_q3_k(&self, block: &[u8], out: &mut [f32]) {
-        let block_ptr = block.as_ptr() as *const crate::quant::BlockQ3K;
-        let out_ptr = out.as_mut_ptr();
-        crate::quant_primitive!(scalar, q3_k, decode, block_ptr, out_ptr);
-    }
-
-    fn dequant_q5_k(&self, block: &[u8], out: &mut [f32]) {
-        let block_ptr = block.as_ptr() as *const crate::quant::BlockQ5K;
-        let out_ptr = out.as_mut_ptr();
-        crate::quant_primitive!(scalar, q5_k, decode, block_ptr, out_ptr);
-    }
-
-    fn dequant_q6_k(&self, block: &[u8], out: &mut [f32]) {
-        let block_ptr = block.as_ptr() as *const crate::quant::BlockQ6K;
-        let out_ptr = out.as_mut_ptr();
-        crate::quant_primitive!(scalar, q6_k, decode, block_ptr, out_ptr);
-    }
+    // Q2_K/Q8_K decode: avx512 + scalar (no avx2 decode branch)
+    define_quant_decode_avx512!(dequant_q2_k, q2_k, BlockQ2K);
+    define_quant_decode_avx512!(dequant_q8_k, q8_k, BlockQ8K);
 
     // Quantized GEMV/GEMM
     fn gemv_q4(&self, weight: &[u8], input: &[E], scale: f32, n: usize) -> E {
@@ -845,7 +782,7 @@ impl<E: Element> Kernels<E> for CpuKernels<E> {
             }
             E::from_f32(sum * scale)
         } else {
-            let in_f32: Vec<f32> = input.iter().map(|v| v.to_f32()).collect();
+            let in_f32 = elem_to_f32_vec(input);
             let mut sum = 0.0f32;
             for b in 0..blocks {
                 let blk_slice = &weight[b * block_size..(b + 1) * block_size];
@@ -868,7 +805,7 @@ impl<E: Element> Kernels<E> for CpuKernels<E> {
             }
             E::from_f32(sum * scale)
         } else {
-            let in_f32: Vec<f32> = input.iter().map(|v| v.to_f32()).collect();
+            let in_f32 = elem_to_f32_vec(input);
             let mut sum = 0.0f32;
             for b in 0..blocks {
                 let blk_slice = &w_u8[b * block_size..(b + 1) * block_size];
@@ -1007,51 +944,16 @@ impl<E: Element> Kernels<E> for CpuKernels<E> {
     // IQ Dequantization (ISA-dispatched via crate::quant_primitive!)
     // ========================================================================
 
-    fn dequant_iq1_s(&self, block: &[u8], out: &mut [f32]) {
-        let blk = block.as_ptr() as *const crate::quant::BlockIQ1S;
-        let dst = out.as_mut_ptr();
-        crate::quant_primitive!(scalar, iq1_s, decode, blk, dst);
-    }
-    fn dequant_iq1_m(&self, block: &[u8], out: &mut [f32]) {
-        let blk = block.as_ptr() as *const crate::quant::BlockIQ1M;
-        let dst = out.as_mut_ptr();
-        crate::quant_primitive!(scalar, iq1_m, decode, blk, dst);
-    }
-    fn dequant_iq2_xxs(&self, block: &[u8], out: &mut [f32]) {
-        let blk = block.as_ptr() as *const crate::quant::BlockIQ2XXS;
-        let dst = out.as_mut_ptr();
-        crate::quant_primitive!(scalar, iq2_xxs, decode, blk, dst);
-    }
-    fn dequant_iq2_xs(&self, block: &[u8], out: &mut [f32]) {
-        let blk = block.as_ptr() as *const crate::quant::BlockIQ2XS;
-        let dst = out.as_mut_ptr();
-        crate::quant_primitive!(scalar, iq2_xs, decode, blk, dst);
-    }
-    fn dequant_iq2_s(&self, block: &[u8], out: &mut [f32]) {
-        let blk = block.as_ptr() as *const crate::quant::BlockIQ2S;
-        let dst = out.as_mut_ptr();
-        crate::quant_primitive!(scalar, iq2_s, decode, blk, dst);
-    }
-    fn dequant_iq3_xxs(&self, block: &[u8], out: &mut [f32]) {
-        let blk = block.as_ptr() as *const crate::quant::BlockIQ3XXS;
-        let dst = out.as_mut_ptr();
-        crate::quant_primitive!(scalar, iq3_xxs, decode, blk, dst);
-    }
-    fn dequant_iq3_s(&self, block: &[u8], out: &mut [f32]) {
-        let blk = block.as_ptr() as *const crate::quant::BlockIQ3S;
-        let dst = out.as_mut_ptr();
-        crate::quant_primitive!(scalar, iq3_s, decode, blk, dst);
-    }
-    fn dequant_iq4_nl(&self, block: &[u8], out: &mut [f32]) {
-        let blk = block.as_ptr() as *const crate::quant::BlockIQ4NL;
-        let dst = out.as_mut_ptr();
-        crate::quant_primitive!(scalar, iq4_nl, decode, blk, dst);
-    }
-    fn dequant_iq4_xs(&self, block: &[u8], out: &mut [f32]) {
-        let blk = block.as_ptr() as *const crate::quant::BlockIQ4XS;
-        let dst = out.as_mut_ptr();
-        crate::quant_primitive!(scalar, iq4_xs, decode, blk, dst);
-    }
+    // IQ scalar-only decode
+    define_quant_decode_scalar!(dequant_iq1_s, iq1_s, BlockIQ1S);
+    define_quant_decode_scalar!(dequant_iq1_m, iq1_m, BlockIQ1M);
+    define_quant_decode_scalar!(dequant_iq2_xxs, iq2_xxs, BlockIQ2XXS);
+    define_quant_decode_scalar!(dequant_iq2_xs, iq2_xs, BlockIQ2XS);
+    define_quant_decode_scalar!(dequant_iq2_s, iq2_s, BlockIQ2S);
+    define_quant_decode_scalar!(dequant_iq3_xxs, iq3_xxs, BlockIQ3XXS);
+    define_quant_decode_scalar!(dequant_iq3_s, iq3_s, BlockIQ3S);
+    define_quant_decode_scalar!(dequant_iq4_nl, iq4_nl, BlockIQ4NL);
+    define_quant_decode_scalar!(dequant_iq4_xs, iq4_xs, BlockIQ4XS);
 
     // ========================================================================
     // AWQ/GPTQ/Squeeze Dequantization + Dot
@@ -1187,42 +1089,7 @@ impl<E: Element> Kernels<E> for CpuKernels<E> {
         seq_len: usize, num_heads: usize, head_dim: usize,
         scale: f32, causal: bool,
     ) {
-        for h in 0..num_heads {
-            for i in 0..seq_len {
-                let q_off = h * seq_len * head_dim + i * head_dim;
-                let o_off = q_off;
-                let max_j = if causal { i + 1 } else { seq_len };
-                let mut max_val = f32::NEG_INFINITY;
-                let mut scores = Vec::with_capacity(max_j);
-                for j in 0..max_j {
-                    let k_off = h * seq_len * head_dim + j * head_dim;
-                    let mut dot = 0.0f32;
-                    for d in 0..head_dim {
-                        dot += q[q_off + d].to_f32() * k[k_off + d].to_f32();
-                    }
-                    let s = dot * scale;
-                    if s > max_val { max_val = s; }
-                    scores.push(s);
-                }
-                let mut sum_exp = 0.0f32;
-                for s in scores.iter_mut() {
-                    *s = (*s - max_val).exp();
-                    sum_exp += *s;
-                }
-                let inv_sum = 1.0 / sum_exp;
-                let mut acc = vec![0.0f32; head_dim];
-                for (j, &w) in scores.iter().enumerate() {
-                    let v_off = h * seq_len * head_dim + j * head_dim;
-                    let a = w * inv_sum;
-                    for d in 0..head_dim {
-                        acc[d] += a * v[v_off + d].to_f32();
-                    }
-                }
-                for d in 0..head_dim {
-                    output[o_off + d] = E::from_f32(acc[d]);
-                }
-            }
-        }
+        dispatch_flash_attention!(q, k, v, output, seq_len, num_heads, head_dim, scale, causal);
     }
 
     fn flash_attention_paged(
@@ -1232,51 +1099,7 @@ impl<E: Element> Kernels<E> for CpuKernels<E> {
         num_heads: usize, num_kv_heads: usize, head_dim: usize,
         page_size: usize, scale: f32,
     ) {
-        let heads_per_kv = num_heads / num_kv_heads;
-        let num_pages = (cache_len + page_size - 1) / page_size;
-        let _ = num_pages;
-        for h in 0..num_heads {
-            let kv_h = h / heads_per_kv;
-            for i in 0..seq_len {
-                let q_off = h * seq_len * head_dim + i * head_dim;
-                let o_off = q_off;
-                let mut max_val = f32::NEG_INFINITY;
-                let mut scores = Vec::with_capacity(cache_len);
-                for j in 0..cache_len {
-                    let page_idx = j / page_size;
-                    let page_off = j % page_size;
-                    let phys_page = page_table[kv_h * ((cache_len + page_size - 1) / page_size) + page_idx];
-                    let k_off = phys_page * page_size * head_dim + page_off * head_dim;
-                    let mut dot = 0.0f32;
-                    for d in 0..head_dim {
-                        dot += q[q_off + d].to_f32() * k_cache[k_off + d].to_f32();
-                    }
-                    let s = dot * scale;
-                    if s > max_val { max_val = s; }
-                    scores.push(s);
-                }
-                let mut sum_exp = 0.0f32;
-                for s in scores.iter_mut() {
-                    *s = (*s - max_val).exp();
-                    sum_exp += *s;
-                }
-                let inv_sum = 1.0 / sum_exp;
-                let mut acc = vec![0.0f32; head_dim];
-                for (j, &w) in scores.iter().enumerate() {
-                    let page_idx = j / page_size;
-                    let page_off = j % page_size;
-                    let phys_page = page_table[kv_h * ((cache_len + page_size - 1) / page_size) + page_idx];
-                    let v_off = phys_page * page_size * head_dim + page_off * head_dim;
-                    let a = w * inv_sum;
-                    for d in 0..head_dim {
-                        acc[d] += a * v_cache[v_off + d].to_f32();
-                    }
-                }
-                for d in 0..head_dim {
-                    output[o_off + d] = E::from_f32(acc[d]);
-                }
-            }
-        }
+        dispatch_flash_attention_paged!(q, k_cache, v_cache, page_table, output, seq_len, cache_len, num_heads, num_kv_heads, head_dim, page_size, scale);
     }
 
     fn fused_ffn_rmsnorm(
@@ -1452,13 +1275,13 @@ impl<E: Element> Kernels<E> for CpuKernels<E> {
         // AWQ4: group_size=128, dequantized[i] = (nibble - zeros[group]) * scales[group]
         let group_size = 128usize;
         let num_groups_per_row = k / group_size;
-        for i in 0..m {
-            for j in 0..n {
-                let in_f32: Vec<f32> = (0..k).map(|p| input[p * n + j].to_f32()).collect();
+        // Pre-allocate column buffer once
+        let mut in_f32_col = vec![0.0f32; k];
+        for j in 0..n {
+            for p in 0..k { in_f32_col[p] = input[p * n + j].to_f32(); }
+            for i in 0..m {
                 let mut sum = 0.0f32;
-                // Process weight row i, element by element
                 let row_offset = i * k;
-                // Weight is packed as 4-bit nibbles: 2 values per byte
                 for idx in 0..k {
                     let byte_pos = row_offset / 2 + idx / 2;
                     let nibble = if idx % 2 == 0 {
@@ -1469,7 +1292,7 @@ impl<E: Element> Kernels<E> for CpuKernels<E> {
                     let group = (i * num_groups_per_row) + idx / group_size;
                     let zero = if group < zeros.len() { zeros[group] as f32 } else { 8.0 };
                     let scale = if group < scales.len() { scales[group].to_f32() } else { 1.0 };
-                    sum += (nibble - zero) * scale * in_f32[idx];
+                    sum += (nibble - zero) * scale * in_f32_col[idx];
                 }
                 output[i * n + j] = E::from_f32(sum);
             }
@@ -1482,9 +1305,10 @@ impl<E: Element> Kernels<E> for CpuKernels<E> {
         m: usize, n: usize, k: usize,
     ) {
         // GPTQ4: dequantized[i] = (nibble - 8) * scales[g_idx[i]]
-        for i in 0..m {
-            for j in 0..n {
-                let in_f32: Vec<f32> = (0..k).map(|p| input[p * n + j].to_f32()).collect();
+        let mut in_f32_col = vec![0.0f32; k];
+        for j in 0..n {
+            for p in 0..k { in_f32_col[p] = input[p * n + j].to_f32(); }
+            for i in 0..m {
                 let mut sum = 0.0f32;
                 let row_offset = i * k;
                 for idx in 0..k {
@@ -1496,7 +1320,7 @@ impl<E: Element> Kernels<E> for CpuKernels<E> {
                     };
                     let group = if idx < g_idx.len() { g_idx[idx] as usize } else { 0 };
                     let scale = if group < scales.len() { scales[group].to_f32() } else { 1.0 };
-                    sum += (nibble - 8.0) * scale * in_f32[idx];
+                    sum += (nibble - 8.0) * scale * in_f32_col[idx];
                 }
                 output[i * n + j] = E::from_f32(sum);
             }
@@ -1510,15 +1334,16 @@ impl<E: Element> Kernels<E> for CpuKernels<E> {
         let block_size = 256usize;
         let block_bytes = 130usize;
         let blocks_per_row = k / block_size;
-        for i in 0..m {
-            for j in 0..n {
-                let in_f32: Vec<f32> = (0..k).map(|p| input[p * n + j].to_f32()).collect();
+        let mut in_f32_col = vec![0.0f32; k];
+        for j in 0..n {
+            for p in 0..k { in_f32_col[p] = input[p * n + j].to_f32(); }
+            for i in 0..m {
                 let mut sum = 0.0f32;
                 for b in 0..blocks_per_row {
                     let off = i * blocks_per_row * block_bytes + b * block_bytes;
                     let blk = &weight_blocks[off..off + block_bytes];
                     let blk_ptr = blk.as_ptr() as *const crate::quant::BlockSqueeze;
-                    let src = in_f32[b * block_size..(b + 1) * block_size].as_ptr();
+                    let src = in_f32_col[b * block_size..(b + 1) * block_size].as_ptr();
                     sum += crate::quant_primitive!(scalar, squeeze, dot, blk_ptr, src);
                 }
                 output[i * n + j] = E::from_f32(sum);

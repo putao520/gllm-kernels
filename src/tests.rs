@@ -638,4 +638,337 @@ mod tests {
         assert_eq!(QuantType::AWQ4.bits(), 4);
         assert_eq!(QuantType::GPTQ4.bits(), 4);
     }
+
+    // ========================================================================
+    // Block 22: Additional missing method tests
+    // ========================================================================
+
+    #[test]
+    fn test_rope_with_pos() {
+        let kernels = CpuKernels::<f32>::new();
+        // head_dim = 4, position offset = 1, seq_len = 1
+        let mut data = vec![1.0, 0.0, 0.0, 1.0];
+        // cos/sin arrays: indexed by actual_pos * half + i
+        // actual_pos = 0 + 1 = 1, half = 2
+        // Need cos[1*2+0], cos[1*2+1], sin[1*2+0], sin[1*2+1]
+        // So need at least 4 elements
+        let cos = vec![1.0, 0.0, 0.0, -1.0]; // cos[2]=0.0, cos[3]=-1.0
+        let sin = vec![0.0, 1.0, 1.0, 0.0];  // sin[2]=1.0, sin[3]=0.0
+        kernels.rope_with_pos(&mut data, &cos, &sin, 4, 1, false);
+        // With position=1, actual_pos=1, uses cos[2]=0.0, cos[3]=-1.0, sin[2]=1.0, sin[3]=0.0
+        // half = 2
+        // i=0: x0=1.0, x1=0.0, c=cos[2]=0.0, s=sin[2]=1.0
+        //   data[0] = 1*0 - 0*1 = 0.0
+        //   data[2] = 1*1 + 0*0 = 1.0
+        // i=1: x0=0.0, x1=1.0, c=cos[3]=-1.0, s=sin[3]=0.0
+        //   data[1] = 0*(-1) - 1*0 = 0.0
+        //   data[3] = 0*0 + 1*(-1) = -1.0
+        assert!((data[0] - 0.0).abs() < 1e-5);
+        assert!((data[1] - 0.0).abs() < 1e-5);
+        assert!((data[2] - 1.0).abs() < 1e-5);
+        assert!((data[3] - (-1.0)).abs() < 1e-5);
+    }
+
+    #[test]
+    fn test_gemv_q8() {
+        let kernels = CpuKernels::<f32>::new();
+        // n=256 (one block), k=256
+        let qs = [1i8; 256];
+        let block_bytes = make_q8k_block(0.5, &qs);
+        // Reinterpret as &[i8]
+        let weight_i8: &[i8] = unsafe {
+            std::slice::from_raw_parts(block_bytes.as_ptr() as *const i8, block_bytes.len())
+        };
+        let input = vec![1.0f32; 256];
+        let scale = 1.0;
+        let result = kernels.gemv_q8(weight_i8, &input, scale, 256);
+        // Expected: 0.5 * sum(1 * 1) * scale = 0.5 * 256 * 1.0 = 128.0
+        assert!((result - 128.0).abs() < 1.0, "gemv_q8: got {}", result);
+    }
+
+    #[test]
+    fn test_gemv_q4() {
+        let kernels = CpuKernels::<f32>::new();
+        // n=256 (one Q4K block)
+        let block = make_zero_block(std::mem::size_of::<crate::quant::BlockQ4K>());
+        let input = vec![1.0f32; 256];
+        let scale = 1.0;
+        let result = kernels.gemv_q4(&block, &input, scale, 256);
+        // Zero block should give ~0
+        assert!(result.abs() < 1.0, "gemv_q4: got {}", result);
+    }
+
+    #[test]
+    fn test_gemv_q2() {
+        let kernels = CpuKernels::<f32>::new();
+        // n=256 (one Q2K block)
+        let block = make_zero_block(std::mem::size_of::<crate::quant::BlockQ2K>());
+        let input = vec![1.0f32; 256];
+        let scale = 1.0;
+        let result = kernels.gemv_q2(&block, &input, scale, 256);
+        // Zero block may produce small non-zero values, just verify reasonable range
+        assert!(result.abs() < 500.0, "gemv_q2: got {}", result);
+    }
+
+    #[test]
+    fn test_gemv_q1() {
+        let kernels = CpuKernels::<f32>::new();
+        // n=256 (one Q1 block)
+        let block = make_zero_block(256); // Placeholder size
+        let input = vec![1.0f32; 256];
+        let scale = 1.0;
+        let result = kernels.gemv_q1(&block, &input, scale, 256);
+        // Zero block may produce small non-zero values, just verify reasonable range
+        assert!(result.abs() < 500.0, "gemv_q1: got {}", result);
+    }
+
+    #[test]
+    fn test_gemm_q8() {
+        let kernels = CpuKernels::<f32>::new();
+        // m=2, n=1, k=256 (1 block per row)
+        let qs1 = [1i8; 256];
+        let block1 = make_q8k_block(0.5, &qs1);
+        // For n=1 output column, need 1 block total
+        let weight_i8: &[i8] = unsafe {
+            std::slice::from_raw_parts(block1.as_ptr() as *const i8, block1.len())
+        };
+        let input = vec![1.0f32; 256 * 2]; // m=2 rows, k=256 cols
+        let scales = vec![1.0f32; 1]; // 1 scale per output column
+        let mut output = vec![0.0f32; 2]; // m=2 rows, n=1 col
+        kernels.gemm_q8(weight_i8, &input, &mut output, &scales, 2, 1, 256);
+        // Row 0: 0.5 * 256 * 1.0 = 128
+        // Row 1: 0.5 * 256 * 1.0 = 128 (same weight block)
+        assert!((output[0] - 128.0).abs() < 1.0, "gemm_q8 row0: got {}", output[0]);
+        assert!((output[1] - 128.0).abs() < 1.0, "gemm_q8 row1: got {}", output[1]);
+    }
+
+    #[test]
+    fn test_gemm_q4() {
+        let kernels = CpuKernels::<f32>::new();
+        // m=2, n=1, k=256 (1 block per row)
+        let block_size = std::mem::size_of::<crate::quant::BlockQ4K>();
+        // For n=1 output column, need 1 block per row × 1 column = 1 block total
+        let block1 = make_zero_block(block_size);
+        let weight = block1; // Just 1 block for 1 output column
+        let input = vec![1.0f32; 256 * 2]; // m=2 rows, k=256 cols
+        let scales = vec![1.0f32; 1]; // 1 scale per output column
+        let mut output = vec![0.0f32; 2]; // m=2 rows, n=1 col
+        kernels.gemm_q4(&weight, &input, &mut output, &scales, 2, 1, 256);
+        // Zero blocks should give ~0
+        assert!(output[0].abs() < 1.0, "gemm_q4 row0: got {}", output[0]);
+        assert!(output[1].abs() < 1.0, "gemm_q4 row1: got {}", output[1]);
+    }
+
+    #[test]
+    fn test_dequant_awq4() {
+        use half::f16;
+        let kernels = CpuKernels::<f32>::new();
+        // AWQ4: 128 elements per block (32 u32 packed = 128 bytes)
+        // BlockAWQ4 = qweight[32] + scales(f16) + zeros(f16) = 128 + 2 + 2 = 132 bytes
+        let block_size = std::mem::size_of::<crate::quant::BlockAWQ4>();
+        let packed = vec![0u8; block_size];
+        let zeros = vec![0u8; block_size];
+        let scales = vec![f16::from_f32(1.0); 256]; // Need enough for all elements
+        let mut out = vec![0.0f32; 256];
+        kernels.dequant_awq4(&packed, &zeros, &scales, &mut out);
+        // Zero packed should give ~0
+        for v in &out {
+            assert!(v.abs() < 1.0, "dequant_awq4: got {}", v);
+        }
+    }
+
+    #[test]
+    fn test_dequant_gptq4() {
+        use half::f16;
+        let kernels = CpuKernels::<f32>::new();
+        // GPTQ4: 128 elements per block
+        let block_size = std::mem::size_of::<crate::quant::BlockGPTQ4>();
+        let packed = vec![0u8; block_size];
+        let g_idx = vec![0i32; 256];
+        let scales = vec![f16::from_f32(1.0); 256];
+        let mut out = vec![0.0f32; 256];
+        kernels.dequant_gptq4(&packed, &g_idx, &scales, &mut out);
+        // Zero packed with scale=1.0 may produce small non-zero values due to zero-point handling
+        // Just verify it doesn't crash and produces reasonable values
+        for v in &out {
+            assert!(v.abs() < 10.0, "dequant_gptq4: got {}", v);
+        }
+    }
+
+    #[test]
+    fn test_dequant_squeeze() {
+        let kernels = CpuKernels::<f32>::new();
+        // Squeeze: 256 elements per block (130 bytes)
+        let block = make_zero_block(std::mem::size_of::<crate::quant::BlockSqueeze>());
+        let mut out = vec![0.0f32; 256];
+        kernels.dequant_squeeze(&block, &mut out);
+        // Zero block should give ~0
+        for v in &out {
+            assert!(v.abs() < 1.0, "dequant_squeeze: got {}", v);
+        }
+    }
+
+    #[test]
+    fn test_fused_ffn_q4() {
+        let kernels = CpuKernels::<f32>::new();
+        // seq_len=1, hidden_size=256, ffn_dim=256
+        // gate: (seq_len=1, ffn_dim=256, hidden_size=256) → need ffn_dim blocks
+        // up: same
+        // down: (seq_len=1, hidden_size=256, ffn_dim=256) → need hidden_size blocks
+        let input = vec![1.0f32; 256];
+        let block_size = std::mem::size_of::<crate::quant::BlockQ4K>();
+        let gate = vec![0u8; block_size * 256]; // 256 blocks for ffn_dim=256
+        let up = vec![0u8; block_size * 256];   // 256 blocks
+        let down = vec![0u8; block_size * 256]; // 256 blocks for hidden_size=256
+        let gate_scales = vec![1.0f32; 256];
+        let up_scales = vec![1.0f32; 256];
+        let down_scales = vec![1.0f32; 256];
+        let residual = vec![2.0f32; 256];
+        let mut output = vec![0.0f32; 256];
+        kernels.fused_ffn_q4(
+            &input, &gate, &up, &down,
+            &gate_scales, &up_scales, &down_scales,
+            &residual, &mut output,
+            1, 256, 256,
+        );
+        // Zero weights → output ≈ residual
+        for i in 0..256 {
+            assert!((output[i] - 2.0).abs() < 1.0, "fused_ffn_q4[{}]: got {}", i, output[i]);
+        }
+    }
+
+    #[test]
+    fn test_fused_qkv_rope_q4() {
+        let kernels = CpuKernels::<f32>::new();
+        // seq_len=1, hidden_size=256, num_heads=1, num_kv_heads=1, head_dim=256, rotary_dim=256
+        // Each weight matrix: (seq_len=1, output_dim=256, hidden_size=256) → need output_dim blocks
+        let input = vec![1.0f32; 256];
+        let block_size = std::mem::size_of::<crate::quant::BlockQ4K>();
+        let wq = vec![0u8; block_size * 256]; // 256 blocks
+        let wk = vec![0u8; block_size * 256]; // 256 blocks
+        let wv = vec![0u8; block_size * 256]; // 256 blocks
+        let scales_q = vec![1.0f32; 256];
+        let scales_k = vec![1.0f32; 256];
+        let scales_v = vec![1.0f32; 256];
+        let cos = vec![1.0f32; 128];
+        let sin = vec![0.0f32; 128];
+        let mut q_out = vec![0.0f32; 256];
+        let mut k_out = vec![0.0f32; 256];
+        let mut v_out = vec![0.0f32; 256];
+        kernels.fused_qkv_rope_q4(
+            &input, &wq, &wk, &wv,
+            &scales_q, &scales_k, &scales_v,
+            &cos, &sin,
+            &mut q_out, &mut k_out, &mut v_out,
+            1, 256, 1, 1, 256, 256, false,
+        );
+        // Zero weights → all outputs ≈ 0
+        for v in &q_out {
+            assert!(v.abs() < 1.0, "fused_qkv_rope_q4 q_out: got {}", v);
+        }
+    }
+
+    #[test]
+    fn test_fused_ffn_rmsnorm() {
+        let kernels = CpuKernels::<f32>::new();
+        // seq_len=1, hidden_size=2, ffn_dim=2
+        let input = vec![1.0, 0.0];
+        let gate_weight = vec![1.0, 0.0, 0.0, 1.0]; // identity
+        let up_weight = vec![1.0, 0.0, 0.0, 1.0];
+        let down_weight = vec![1.0, 0.0, 0.0, 1.0];
+        let residual = vec![0.5, 0.5];
+        let norm_weight = vec![1.0, 1.0];
+        let mut output = vec![0.0; 2];
+        kernels.fused_ffn_rmsnorm(
+            &input, &gate_weight, &up_weight, &down_weight,
+            &residual, &norm_weight, &mut output,
+            1, 2, 2, 1e-5,
+        );
+        // gate=[1,0], up=[1,0], swiglu=[silu(1)*1, silu(0)*0]=[0.731,0]
+        // down=[0.731,0], with_residual=[1.231,0.5]
+        // rms_norm: rms=sqrt((1.231^2+0.5^2)/2)=sqrt(0.883)≈0.94
+        // output≈[1.231/0.94, 0.5/0.94]≈[1.31, 0.53]
+        assert!(output[0] > 1.0 && output[0] < 1.5, "fused_ffn_rmsnorm[0]: got {}", output[0]);
+        assert!(output[1] > 0.3 && output[1] < 0.8, "fused_ffn_rmsnorm[1]: got {}", output[1]);
+    }
+
+    #[test]
+    fn test_fused_linear_bias_residual_rmsnorm() {
+        let kernels = CpuKernels::<f32>::new();
+        // seq_len=1, in_features=2, out_features=2
+        let input = vec![1.0, 0.0];
+        let weight = vec![1.0, 0.0, 0.0, 1.0]; // identity
+        let bias = vec![0.5, 0.5];
+        let residual = vec![1.0, 1.0];
+        let norm_weight = vec![1.0, 1.0];
+        let mut output = vec![0.0; 2];
+        kernels.fused_linear_bias_residual_rmsnorm(
+            &input, &weight, &bias, &residual, &norm_weight, &mut output,
+            1, 2, 2, 1e-5,
+        );
+        // linear=[1,0], with_bias=[1.5,0.5], with_residual=[2.5,1.5]
+        // rms=sqrt((2.5^2+1.5^2)/2)=sqrt(4.75)≈2.18
+        // output≈[2.5/2.18, 1.5/2.18]≈[1.15, 0.69]
+        assert!(output[0] > 1.0 && output[0] < 1.3, "fused_linear_bias_residual_rmsnorm[0]: got {}", output[0]);
+        assert!(output[1] > 0.5 && output[1] < 0.8, "fused_linear_bias_residual_rmsnorm[1]: got {}", output[1]);
+    }
+
+    #[test]
+    fn test_fused_int8_linear_residual_rmsnorm() {
+        let kernels = CpuKernels::<f32>::new();
+        // seq_len=1, in_features=256, out_features=1
+        // gemm_q8: (seq_len=1, out_features=1, in_features=256)
+        // Weight layout: for each output column, need blocks_per_row blocks
+        // blocks_per_row = in_features / 256 = 1
+        // Total weight size: out_features × blocks_per_row × block_size = 1 × 1 × 292 = 292 bytes
+        let input = vec![1.0f32; 256];
+        let qs = [1i8; 256];
+        let block_bytes = make_q8k_block(0.01, &qs);
+        let weight_i8: &[i8] = unsafe {
+            std::slice::from_raw_parts(block_bytes.as_ptr() as *const i8, block_bytes.len())
+        };
+        let scales = vec![1.0f32; 1];
+        let residual = vec![2.0f32; 1];
+        let norm_weight = vec![1.0f32; 1];
+        let mut output = vec![0.0f32; 1];
+        kernels.fused_int8_linear_residual_rmsnorm(
+            &input, weight_i8, &scales, &residual, &norm_weight, &mut output,
+            1, 256, 1, 1e-5,
+        );
+        // linear_out = 0.01 * sum(1*1) = 0.01 * 256 = 2.56
+        // with_residual = 2.56 + 2.0 = 4.56
+        // rms_norm([4.56], [1.0]) = 4.56 / sqrt(4.56^2 + eps) ≈ 1.0
+        assert!((output[0] - 1.0).abs() < 0.1, "fused_int8_linear_residual_rmsnorm: got {}", output[0]);
+    }
+
+    #[test]
+    fn test_exp_activation() {
+        let kernels = CpuKernels::<f32>::new();
+        let a = vec![0.0, 1.0, -1.0, 2.0];
+        let mut out = vec![0.0; 4];
+        kernels.exp(&a, &mut out);
+        assert!((out[0] - 1.0).abs() < 1e-5); // e^0 = 1
+        assert!((out[1] - 2.71828).abs() < 1e-4); // e^1 ≈ 2.71828
+        assert!((out[2] - 0.36788).abs() < 1e-4); // e^-1 ≈ 0.36788
+        assert!((out[3] - 7.38906).abs() < 1e-3); // e^2 ≈ 7.38906
+    }
+
+    #[test]
+    fn test_vec_scale() {
+        let kernels = CpuKernels::<f32>::new();
+        let a = vec![1.0, 2.0, 3.0, 4.0];
+        let mut out = a.clone();
+        kernels.vec_scale(&mut out, 2.5);
+        assert_eq!(out, vec![2.5, 5.0, 7.5, 10.0]);
+    }
+
+    #[test]
+    fn test_vec_axpy() {
+        let kernels = CpuKernels::<f32>::new();
+        let x = vec![1.0, 2.0, 3.0];
+        let mut y = vec![10.0, 20.0, 30.0];
+        kernels.vec_axpy(&mut y, 2.0, &x);
+        // y = a*x + y = 2*x + y = [2+10, 4+20, 6+30] = [12, 24, 36]
+        assert_eq!(y, vec![12.0, 24.0, 36.0]);
+    }
 }

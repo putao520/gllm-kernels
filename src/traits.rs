@@ -24,6 +24,8 @@ pub trait Element:
 {
     const ZERO: Self;
     const ONE: Self;
+    /// Element type discriminant: 0=f32, 1=f16, 2=bf16
+    const ELEM_ID: u8;
 
     fn from_f32(v: f32) -> Self;
     fn to_f32(self) -> f32;
@@ -63,6 +65,7 @@ pub trait Element:
 impl Element for f32 {
     const ZERO: Self = 0.0;
     const ONE: Self = 1.0;
+    const ELEM_ID: u8 = 0;
 
     #[inline(always)] fn from_f32(v: f32) -> Self { v }
     #[inline(always)] fn to_f32(self) -> f32 { self }
@@ -96,6 +99,7 @@ impl Element for f32 {
 impl Element for f16 {
     const ZERO: Self = f16::ZERO;
     const ONE: Self = f16::ONE;
+    const ELEM_ID: u8 = 1;
 
     #[inline(always)] fn from_f32(v: f32) -> Self { f16::from_f32(v) }
     #[inline(always)] fn to_f32(self) -> f32 { f16::to_f32(self) }
@@ -126,6 +130,7 @@ impl Element for f16 {
 impl Element for bf16 {
     const ZERO: Self = bf16::ZERO;
     const ONE: Self = bf16::ONE;
+    const ELEM_ID: u8 = 2;
 
     #[inline(always)] fn from_f32(v: f32) -> Self { bf16::from_f32(v) }
     #[inline(always)] fn to_f32(self) -> f32 { bf16::to_f32(self) }
