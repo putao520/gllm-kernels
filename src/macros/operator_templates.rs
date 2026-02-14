@@ -640,191 +640,6 @@ macro_rules! define_gemv_op {
 /// Defines Matrix Multiplication (GEMM)
 #[macro_export]
 macro_rules! define_matmul_op {
-    // NEON f16: 8×12 microkernel with f32 arithmetic (convert on load/store)
-    (neon, f16) => {
-        #[inline(always)]
-        pub fn matmul(a: &[f16], b: &[f16], c: &mut [f16], m_size: usize, n_size: usize, k_size: usize) {
-            assert!(a.len() >= m_size * k_size);
-            assert!(b.len() >= n_size * k_size);
-            assert!(c.len() >= m_size * n_size);
-
-            const TILE_M: usize = 8;
-            const TILE_N: usize = 12; // 3 × 4 f32 lanes
-
-            // Pack B into f32 column strips of width TILE_N
-            let n_strips = (n_size + TILE_N - 1) / TILE_N;
-            let packed_b_size = n_strips * k_size * TILE_N;
-            let mut packed_b = vec![0.0f32; packed_b_size];
-
-            for i in 0..n_strips {
-                let n_start = i * TILE_N;
-                let actual_n = if n_start + TILE_N <= n_size { TILE_N } else { n_size - n_start };
-                for k in 0..k_size {
-                    let dst_off = i * k_size * TILE_N + k * TILE_N;
-                    for x in 0..actual_n {
-                        packed_b[dst_off + x] = b[k * n_size + n_start + x].to_f32();
-                    }
-                }
-            }
-
-            let mut m = 0;
-            while m + TILE_M <= m_size {
-                let mut n = 0;
-                let mut strip_idx = 0;
-                while n + TILE_N <= n_size {
-                    // 24 f32 accumulators
-                    let mut acc = [[0.0f32; TILE_N]; TILE_M];
-                    let b_base = strip_idx * k_size * TILE_N;
-                    for k in 0..k_size {
-                        let b_off = b_base + k * TILE_N;
-                        for row in 0..TILE_M {
-                            let a_val = a[(m + row) * k_size + k].to_f32();
-                            for col in 0..TILE_N {
-                                acc[row][col] = a_val.mul_add(packed_b[b_off + col], acc[row][col]);
-                            }
-                        }
-                    }
-                    for row in 0..TILE_M {
-                        for col in 0..TILE_N {
-                            c[(m + row) * n_size + n + col] = f16::from_f32(acc[row][col]);
-                        }
-                    }
-                    n += TILE_N;
-                    strip_idx += 1;
-                }
-                while n < n_size {
-                    for i in 0..TILE_M {
-                        let mut sum = 0.0f32;
-                        for k in 0..k_size {
-                            sum += a[(m + i) * k_size + k].to_f32() * b[k * n_size + n].to_f32();
-                        }
-                        c[(m + i) * n_size + n] = f16::from_f32(sum);
-                    }
-                    n += 1;
-                }
-                m += TILE_M;
-            }
-            while m < m_size {
-                for n in 0..n_size {
-                    let mut sum = 0.0f32;
-                    for k in 0..k_size {
-                        sum += a[m * k_size + k].to_f32() * b[k * n_size + n].to_f32();
-                    }
-                    c[m * n_size + n] = f16::from_f32(sum);
-                }
-                m += 1;
-            }
-        }
-    };
-    // NEON bf16: 8×12 microkernel with f32 arithmetic (convert on load/store)
-    (neon, bf16) => {
-        #[inline(always)]
-        pub fn matmul(a: &[bf16], b: &[bf16], c: &mut [bf16], m_size: usize, n_size: usize, k_size: usize) {
-            assert!(a.len() >= m_size * k_size);
-            assert!(b.len() >= n_size * k_size);
-            assert!(c.len() >= m_size * n_size);
-
-            const TILE_M: usize = 8;
-            const TILE_N: usize = 12;
-
-            let n_strips = (n_size + TILE_N - 1) / TILE_N;
-            let packed_b_size = n_strips * k_size * TILE_N;
-            let mut packed_b = vec![0.0f32; packed_b_size];
-
-            for i in 0..n_strips {
-                let n_start = i * TILE_N;
-                let actual_n = if n_start + TILE_N <= n_size { TILE_N } else { n_size - n_start };
-                for k in 0..k_size {
-                    let dst_off = i * k_size * TILE_N + k * TILE_N;
-                    for x in 0..actual_n {
-                        packed_b[dst_off + x] = b[k * n_size + n_start + x].to_f32();
-                    }
-                }
-            }
-
-            let mut m = 0;
-            while m + TILE_M <= m_size {
-                let mut n = 0;
-                let mut strip_idx = 0;
-                while n + TILE_N <= n_size {
-                    let mut acc = [[0.0f32; TILE_N]; TILE_M];
-                    let b_base = strip_idx * k_size * TILE_N;
-                    for k in 0..k_size {
-                        let b_off = b_base + k * TILE_N;
-                        for row in 0..TILE_M {
-                            let a_val = a[(m + row) * k_size + k].to_f32();
-                            for col in 0..TILE_N {
-                                acc[row][col] = a_val.mul_add(packed_b[b_off + col], acc[row][col]);
-                            }
-                        }
-                    }
-                    for row in 0..TILE_M {
-                        for col in 0..TILE_N {
-                            c[(m + row) * n_size + n + col] = bf16::from_f32(acc[row][col]);
-                        }
-                    }
-                    n += TILE_N;
-                    strip_idx += 1;
-                }
-                while n < n_size {
-                    for i in 0..TILE_M {
-                        let mut sum = 0.0f32;
-                        for k in 0..k_size {
-                            sum += a[(m + i) * k_size + k].to_f32() * b[k * n_size + n].to_f32();
-                        }
-                        c[(m + i) * n_size + n] = bf16::from_f32(sum);
-                    }
-                    n += 1;
-                }
-                m += TILE_M;
-            }
-            while m < m_size {
-                for n in 0..n_size {
-                    let mut sum = 0.0f32;
-                    for k in 0..k_size {
-                        sum += a[m * k_size + k].to_f32() * b[k * n_size + n].to_f32();
-                    }
-                    c[m * n_size + n] = bf16::from_f32(sum);
-                }
-                m += 1;
-            }
-        }
-    };
-    // f16/bf16 on any ISA: use scalar Element-based GEMM (SIMD load/store handled by simd_primitive)
-    ($isa:ident, f16) => {
-        #[inline(always)]
-        pub fn matmul(a: &[f16], b: &[f16], c: &mut [f16], m_size: usize, n_size: usize, k_size: usize) {
-            assert!(a.len() >= m_size * k_size);
-            assert!(b.len() >= n_size * k_size);
-            assert!(c.len() >= m_size * n_size);
-            for m in 0..m_size {
-                for n in 0..n_size {
-                    let mut sum = 0.0f32;
-                    for k in 0..k_size {
-                        sum += a[m * k_size + k].to_f32() * b[k * n_size + n].to_f32();
-                    }
-                    c[m * n_size + n] = <f16 as Element>::from_f32(sum);
-                }
-            }
-        }
-    };
-    ($isa:ident, bf16) => {
-        #[inline(always)]
-        pub fn matmul(a: &[bf16], b: &[bf16], c: &mut [bf16], m_size: usize, n_size: usize, k_size: usize) {
-            assert!(a.len() >= m_size * k_size);
-            assert!(b.len() >= n_size * k_size);
-            assert!(c.len() >= m_size * n_size);
-            for m in 0..m_size {
-                for n in 0..n_size {
-                    let mut sum = 0.0f32;
-                    for k in 0..k_size {
-                        sum += a[m * k_size + k].to_f32() * b[k * n_size + n].to_f32();
-                    }
-                    c[m * n_size + n] = <bf16 as Element>::from_f32(sum);
-                }
-            }
-        }
-    };
     (avx512, $elem:ident) => {
         // AVX-512 Optimized Implementation: 14×32 microkernel
         // 28 zmm accumulator registers (14 rows × 2 vectors of 16 lanes)
@@ -956,7 +771,7 @@ macro_rules! define_matmul_op {
                     for i in 0..TILE_M {
                         let mut sum: $elem = <$elem as Element>::ZERO;
                         for k in 0..k_size {
-                            sum = a[(m + i) * k_size + k].mul_add(b[k * n_size + n], sum);
+                            sum = <$elem as Element>::mul_add(sum, a[(m + i) * k_size + k], b[k * n_size + n]);
                         }
                         c[(m + i) * n_size + n] = sum;
                     }
@@ -969,7 +784,7 @@ macro_rules! define_matmul_op {
                 for n in 0..n_size {
                     let mut sum: $elem = <$elem as Element>::ZERO;
                     for k in 0..k_size {
-                        sum = a[m * k_size + k].mul_add(b[k * n_size + n], sum);
+                        sum = <$elem as Element>::mul_add(sum, a[m * k_size + k], b[k * n_size + n]);
                     }
                     c[m * n_size + n] = sum;
                 }
@@ -1164,7 +979,7 @@ macro_rules! define_matmul_op {
                         for k in 0..k_size {
                             let val_a = a[(m + i) * k_size + k];
                             let val_b = b[k * n_size + n];
-                            sum = val_a.mul_add(val_b, sum);
+                            sum = <$elem as Element>::mul_add(sum, val_a, val_b);
                         }
                         c[(m + i) * n_size + n] = sum;
                     }
@@ -1181,7 +996,7 @@ macro_rules! define_matmul_op {
                     for k in 0..k_size {
                         let val_a = a[m * k_size + k];
                         let val_b = b[k * n_size + n];
-                        sum = val_a.mul_add(val_b, sum);
+                        sum = <$elem as Element>::mul_add(sum, val_a, val_b);
                     }
                     c[m * n_size + n] = sum;
                 }
@@ -1344,7 +1159,7 @@ macro_rules! define_matmul_op {
                     for i in 0..TILE_M {
                         let mut sum: $elem = <$elem as Element>::ZERO;
                         for k in 0..k_size {
-                            sum = a[(m + i) * k_size + k].mul_add(b[k * n_size + n], sum);
+                            sum = <$elem as Element>::mul_add(sum, a[(m + i) * k_size + k], b[k * n_size + n]);
                         }
                         c[(m + i) * n_size + n] = sum;
                     }
@@ -1358,7 +1173,7 @@ macro_rules! define_matmul_op {
                 for n in 0..n_size {
                     let mut sum: $elem = <$elem as Element>::ZERO;
                     for k in 0..k_size {
-                        sum = a[m * k_size + k].mul_add(b[k * n_size + n], sum);
+                        sum = <$elem as Element>::mul_add(sum, a[m * k_size + k], b[k * n_size + n]);
                     }
                     c[m * n_size + n] = sum;
                 }
@@ -1381,7 +1196,7 @@ macro_rules! define_matmul_op {
                     for k in 0..k_size {
                         let val_a = a[m * k_size + k];
                         let val_b = b[k * n_size + n];
-                        sum = val_a.mul_add(val_b, sum);
+                        sum = <$elem as Element>::mul_add(sum, val_a, val_b);
                     }
                     c[m * n_size + n] = sum;
                 }

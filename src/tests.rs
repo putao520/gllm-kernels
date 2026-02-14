@@ -412,6 +412,414 @@ mod tests {
     }
 
     // ========================================================================
+    // Block 15b: f16/bf16 activation & normalization tests
+    // ========================================================================
+
+    // --- f16 activations ---
+
+    #[test]
+    fn test_f16_relu() {
+        use half::f16;
+        let kernels = CpuKernels::<f16>::new();
+        let a: Vec<f16> = [-2.0, -1.0, 0.0, 1.0, 2.0].iter().map(|&x| f16::from_f32(x)).collect();
+        let mut out = vec![f16::ZERO; 5];
+        kernels.relu(&a, &mut out);
+        let got: Vec<f32> = out.iter().map(|x| x.to_f32()).collect();
+        assert_eq!(got, vec![0.0, 0.0, 0.0, 1.0, 2.0]);
+    }
+
+    #[test]
+    fn test_f16_gelu() {
+        use half::f16;
+        let kernels = CpuKernels::<f16>::new();
+        let a: Vec<f16> = [0.0, 1.0, -1.0].iter().map(|&x| f16::from_f32(x)).collect();
+        let mut out = vec![f16::ZERO; 3];
+        kernels.gelu(&a, &mut out);
+        assert!(out[0].to_f32().abs() < 0.01);
+        assert!((out[1].to_f32() - 0.8412).abs() < 0.02);
+        assert!((out[2].to_f32() - (-0.1588)).abs() < 0.02);
+    }
+
+    #[test]
+    fn test_f16_tanh() {
+        use half::f16;
+        let kernels = CpuKernels::<f16>::new();
+        let a: Vec<f16> = [0.0, 1.0, -1.0].iter().map(|&x| f16::from_f32(x)).collect();
+        let mut out = vec![f16::ZERO; 3];
+        kernels.tanh(&a, &mut out);
+        assert!(out[0].to_f32().abs() < 0.01);
+        assert!((out[1].to_f32() - 0.7616).abs() < 0.01);
+        assert!((out[2].to_f32() - (-0.7616)).abs() < 0.01);
+    }
+
+    #[test]
+    fn test_f16_softmax() {
+        use half::f16;
+        let kernels = CpuKernels::<f16>::new();
+        let a: Vec<f16> = [1.0, 2.0, 3.0].iter().map(|&x| f16::from_f32(x)).collect();
+        let mut out = vec![f16::ZERO; 3];
+        kernels.softmax(&a, &mut out);
+        let sum: f32 = out.iter().map(|x| x.to_f32()).sum();
+        assert!((sum - 1.0).abs() < 0.01);
+        assert!(out[2].to_f32() > out[1].to_f32() && out[1].to_f32() > out[0].to_f32());
+    }
+
+    #[test]
+    fn test_f16_exp() {
+        use half::f16;
+        let kernels = CpuKernels::<f16>::new();
+        let a: Vec<f16> = [0.0, 1.0, -1.0].iter().map(|&x| f16::from_f32(x)).collect();
+        let mut out = vec![f16::ZERO; 3];
+        kernels.exp(&a, &mut out);
+        assert!((out[0].to_f32() - 1.0).abs() < 0.01);
+        assert!((out[1].to_f32() - std::f32::consts::E).abs() < 0.02);
+        assert!((out[2].to_f32() - 1.0 / std::f32::consts::E).abs() < 0.01);
+    }
+
+    #[test]
+    fn test_f16_swiglu() {
+        use half::f16;
+        let kernels = CpuKernels::<f16>::new();
+        let gate: Vec<f16> = [1.0, -1.0].iter().map(|&x| f16::from_f32(x)).collect();
+        let up: Vec<f16> = [2.0, 3.0].iter().map(|&x| f16::from_f32(x)).collect();
+        let mut out = vec![f16::ZERO; 2];
+        kernels.swiglu(&gate, &up, &mut out);
+        assert!((out[0].to_f32() - 1.462).abs() < 0.02);
+        assert!((out[1].to_f32() - (-0.807)).abs() < 0.02);
+    }
+
+    // --- f16 normalization ---
+
+    #[test]
+    fn test_f16_rms_norm() {
+        use half::f16;
+        let kernels = CpuKernels::<f16>::new();
+        let x: Vec<f16> = [1.0, 2.0, 3.0, 4.0].iter().map(|&x| f16::from_f32(x)).collect();
+        let w: Vec<f16> = [1.0, 1.0, 1.0, 1.0].iter().map(|&x| f16::from_f32(x)).collect();
+        let mut out = vec![f16::ZERO; 4];
+        kernels.rms_norm(&x, &w, &mut out, 1e-5);
+        let rms = (30.0f32 / 4.0 + 1e-5).sqrt();
+        let expected_0 = 1.0 / rms;
+        assert!((out[0].to_f32() - expected_0).abs() < 0.01);
+    }
+
+    #[test]
+    fn test_f16_layer_norm() {
+        use half::f16;
+        let kernels = CpuKernels::<f16>::new();
+        let x: Vec<f16> = [1.0, 2.0, 3.0, 4.0].iter().map(|&x| f16::from_f32(x)).collect();
+        let w: Vec<f16> = [1.0, 1.0, 1.0, 1.0].iter().map(|&x| f16::from_f32(x)).collect();
+        let b: Vec<f16> = [0.0, 0.0, 0.0, 0.0].iter().map(|&x| f16::from_f32(x)).collect();
+        let mut out = vec![f16::ZERO; 4];
+        kernels.layer_norm(&x, &w, &b, &mut out, 1e-5);
+        let mean = 2.5f32;
+        let var = 1.25f32;
+        let std = (var + 1e-5).sqrt();
+        let expected_0 = (1.0 - mean) / std;
+        assert!((out[0].to_f32() - expected_0).abs() < 0.02);
+        let sum: f32 = out.iter().map(|x| x.to_f32()).sum();
+        assert!(sum.abs() < 0.05);
+    }
+
+    // --- bf16 activations ---
+
+    #[test]
+    fn test_bf16_relu() {
+        use half::bf16;
+        let kernels = CpuKernels::<bf16>::new();
+        let a: Vec<bf16> = [-2.0, -1.0, 0.0, 1.0, 2.0].iter().map(|&x| bf16::from_f32(x)).collect();
+        let mut out = vec![bf16::ZERO; 5];
+        kernels.relu(&a, &mut out);
+        let got: Vec<f32> = out.iter().map(|x| x.to_f32()).collect();
+        assert_eq!(got, vec![0.0, 0.0, 0.0, 1.0, 2.0]);
+    }
+
+    #[test]
+    fn test_bf16_silu() {
+        use half::bf16;
+        let kernels = CpuKernels::<bf16>::new();
+        let a: Vec<bf16> = [0.0, 1.0, -1.0].iter().map(|&x| bf16::from_f32(x)).collect();
+        let mut out = vec![bf16::ZERO; 3];
+        kernels.silu(&a, &mut out);
+        assert!(out[0].to_f32().abs() < 0.01);
+        assert!((out[1].to_f32() - 0.7311).abs() < 0.02);
+        assert!((out[2].to_f32() - (-0.2689)).abs() < 0.02);
+    }
+
+    #[test]
+    fn test_bf16_gelu() {
+        use half::bf16;
+        let kernels = CpuKernels::<bf16>::new();
+        let a: Vec<bf16> = [0.0, 1.0, -1.0].iter().map(|&x| bf16::from_f32(x)).collect();
+        let mut out = vec![bf16::ZERO; 3];
+        kernels.gelu(&a, &mut out);
+        assert!(out[0].to_f32().abs() < 0.02);
+        assert!((out[1].to_f32() - 0.8412).abs() < 0.03);
+        assert!((out[2].to_f32() - (-0.1588)).abs() < 0.03);
+    }
+
+    #[test]
+    fn test_bf16_tanh() {
+        use half::bf16;
+        let kernels = CpuKernels::<bf16>::new();
+        let a: Vec<bf16> = [0.0, 1.0, -1.0].iter().map(|&x| bf16::from_f32(x)).collect();
+        let mut out = vec![bf16::ZERO; 3];
+        kernels.tanh(&a, &mut out);
+        assert!(out[0].to_f32().abs() < 0.01);
+        assert!((out[1].to_f32() - 0.7616).abs() < 0.02);
+        assert!((out[2].to_f32() - (-0.7616)).abs() < 0.02);
+    }
+
+    #[test]
+    fn test_bf16_softmax() {
+        use half::bf16;
+        let kernels = CpuKernels::<bf16>::new();
+        let a: Vec<bf16> = [1.0, 2.0, 3.0].iter().map(|&x| bf16::from_f32(x)).collect();
+        let mut out = vec![bf16::ZERO; 3];
+        kernels.softmax(&a, &mut out);
+        let sum: f32 = out.iter().map(|x| x.to_f32()).sum();
+        assert!((sum - 1.0).abs() < 0.05);
+        assert!(out[2].to_f32() > out[1].to_f32() && out[1].to_f32() > out[0].to_f32());
+    }
+
+    #[test]
+    fn test_bf16_exp() {
+        use half::bf16;
+        let kernels = CpuKernels::<bf16>::new();
+        let a: Vec<bf16> = [0.0, 1.0, -1.0].iter().map(|&x| bf16::from_f32(x)).collect();
+        let mut out = vec![bf16::ZERO; 3];
+        kernels.exp(&a, &mut out);
+        assert!((out[0].to_f32() - 1.0).abs() < 0.02);
+        assert!((out[1].to_f32() - std::f32::consts::E).abs() < 0.05);
+        assert!((out[2].to_f32() - 1.0 / std::f32::consts::E).abs() < 0.02);
+    }
+
+    #[test]
+    fn test_bf16_swiglu() {
+        use half::bf16;
+        let kernels = CpuKernels::<bf16>::new();
+        let gate: Vec<bf16> = [1.0, -1.0].iter().map(|&x| bf16::from_f32(x)).collect();
+        let up: Vec<bf16> = [2.0, 3.0].iter().map(|&x| bf16::from_f32(x)).collect();
+        let mut out = vec![bf16::ZERO; 2];
+        kernels.swiglu(&gate, &up, &mut out);
+        assert!((out[0].to_f32() - 1.462).abs() < 0.05);
+        assert!((out[1].to_f32() - (-0.807)).abs() < 0.05);
+    }
+
+    // --- bf16 normalization ---
+
+    #[test]
+    fn test_bf16_rms_norm() {
+        use half::bf16;
+        let kernels = CpuKernels::<bf16>::new();
+        let x: Vec<bf16> = [1.0, 2.0, 3.0, 4.0].iter().map(|&x| bf16::from_f32(x)).collect();
+        let w: Vec<bf16> = [1.0, 1.0, 1.0, 1.0].iter().map(|&x| bf16::from_f32(x)).collect();
+        let mut out = vec![bf16::ZERO; 4];
+        kernels.rms_norm(&x, &w, &mut out, 1e-5);
+        let rms = (30.0f32 / 4.0 + 1e-5).sqrt();
+        let expected_0 = 1.0 / rms;
+        assert!((out[0].to_f32() - expected_0).abs() < 0.02);
+    }
+
+    #[test]
+    fn test_bf16_layer_norm() {
+        use half::bf16;
+        let kernels = CpuKernels::<bf16>::new();
+        let x: Vec<bf16> = [1.0, 2.0, 3.0, 4.0].iter().map(|&x| bf16::from_f32(x)).collect();
+        let w: Vec<bf16> = [1.0, 1.0, 1.0, 1.0].iter().map(|&x| bf16::from_f32(x)).collect();
+        let b: Vec<bf16> = [0.0, 0.0, 0.0, 0.0].iter().map(|&x| bf16::from_f32(x)).collect();
+        let mut out = vec![bf16::ZERO; 4];
+        kernels.layer_norm(&x, &w, &b, &mut out, 1e-5);
+        let mean = 2.5f32;
+        let var = 1.25f32;
+        let std = (var + 1e-5).sqrt();
+        let expected_0 = (1.0 - mean) / std;
+        assert!((out[0].to_f32() - expected_0).abs() < 0.05);
+        let sum: f32 = out.iter().map(|x| x.to_f32()).sum();
+        assert!(sum.abs() < 0.1);
+    }
+
+    // ========================================================================
+    // Block 15c: f16/bf16 GEMM systematic size coverage
+    // ========================================================================
+
+    /// Helper: reference matmul in f64 for verification
+    fn reference_matmul(a: &[f64], b: &[f64], m: usize, n: usize, k: usize) -> Vec<f64> {
+        let mut c = vec![0.0f64; m * n];
+        for i in 0..m {
+            for j in 0..n {
+                let mut sum = 0.0f64;
+                for l in 0..k {
+                    sum += a[i * k + l] * b[l * n + j];
+                }
+                c[i * n + j] = sum;
+            }
+        }
+        c
+    }
+
+    /// Helper: run gemm for f16 at given dimensions with patterned data and verify against f64 reference
+    fn check_f16_gemm(m: usize, n: usize, k: usize) {
+        use half::f16;
+        let kernels = CpuKernels::<f16>::new();
+
+        // Patterned data: a[i] = ((i % 7) as f32 - 3.0) * 0.5, b[i] = ((i % 5) as f32 - 2.0) * 0.25
+        let a_f64: Vec<f64> = (0..m * k).map(|i| ((i % 7) as f64 - 3.0) * 0.5).collect();
+        let b_f64: Vec<f64> = (0..k * n).map(|i| ((i % 5) as f64 - 2.0) * 0.25).collect();
+        let ref_c = reference_matmul(&a_f64, &b_f64, m, n, k);
+
+        let a_f16: Vec<f16> = a_f64.iter().map(|&x| f16::from_f64(x)).collect();
+        let b_f16: Vec<f16> = b_f64.iter().map(|&x| f16::from_f64(x)).collect();
+        let mut c_f16 = vec![f16::ZERO; m * n];
+        kernels.gemm(&a_f16, &b_f16, &mut c_f16, m, n, k);
+
+        for idx in 0..m * n {
+            let got = c_f16[idx].to_f64();
+            let expected = ref_c[idx];
+            let tol = expected.abs() * 0.05 + 0.1; // 5% relative + 0.1 absolute (f16 has limited precision)
+            assert!(
+                (got - expected).abs() < tol,
+                "f16 gemm {}x{}x{}: c[{}] = {}, expected {} (tol {})",
+                m, n, k, idx, got, expected, tol
+            );
+        }
+    }
+
+    /// Helper: run gemm for bf16 at given dimensions with patterned data and verify against f64 reference
+    fn check_bf16_gemm(m: usize, n: usize, k: usize) {
+        use half::bf16;
+        let kernels = CpuKernels::<bf16>::new();
+
+        let a_f64: Vec<f64> = (0..m * k).map(|i| ((i % 7) as f64 - 3.0) * 0.5).collect();
+        let b_f64: Vec<f64> = (0..k * n).map(|i| ((i % 5) as f64 - 2.0) * 0.25).collect();
+        let ref_c = reference_matmul(&a_f64, &b_f64, m, n, k);
+
+        let a_bf16: Vec<bf16> = a_f64.iter().map(|&x| bf16::from_f64(x)).collect();
+        let b_bf16: Vec<bf16> = b_f64.iter().map(|&x| bf16::from_f64(x)).collect();
+        let mut c_bf16 = vec![bf16::ZERO; m * n];
+        kernels.gemm(&a_bf16, &b_bf16, &mut c_bf16, m, n, k);
+
+        for idx in 0..m * n {
+            let got = c_bf16[idx].to_f64();
+            let expected = ref_c[idx];
+            let tol = expected.abs() * 0.05 + 0.2; // bf16 has even less precision than f16
+            assert!(
+                (got - expected).abs() < tol,
+                "bf16 gemm {}x{}x{}: c[{}] = {}, expected {} (tol {})",
+                m, n, k, idx, got, expected, tol
+            );
+        }
+    }
+
+    // --- f16 GEMM size tests ---
+
+    #[test]
+    fn test_f16_gemm_1x1x1() { check_f16_gemm(1, 1, 1); }
+
+    #[test]
+    fn test_f16_gemm_1x8x4() { check_f16_gemm(1, 8, 4); }
+
+    #[test]
+    fn test_f16_gemm_8x1x4() { check_f16_gemm(8, 1, 4); }
+
+    #[test]
+    fn test_f16_gemm_2x3x5() { check_f16_gemm(2, 3, 5); }
+
+    #[test]
+    fn test_f16_gemm_3x7x11() { check_f16_gemm(3, 7, 11); }
+
+    #[test]
+    fn test_f16_gemm_7x9x5() { check_f16_gemm(7, 9, 5); } // M=TILE_M+1, N=8+1
+
+    #[test]
+    fn test_f16_gemm_6x16x8() { check_f16_gemm(6, 16, 8); } // Exact AVX2 tile
+
+    #[test]
+    fn test_f16_gemm_7x17x9() { check_f16_gemm(7, 17, 9); } // AVX2 remainder both M and N
+
+    #[test]
+    fn test_f16_gemm_13x19x23() { check_f16_gemm(13, 19, 23); } // All primes
+
+    #[test]
+    fn test_f16_gemm_14x32x16() { check_f16_gemm(14, 32, 16); } // Exact AVX-512 tile
+
+    #[test]
+    fn test_f16_gemm_15x33x17() { check_f16_gemm(15, 33, 17); } // AVX-512 remainder both M and N
+
+    #[test]
+    fn test_f16_gemm_32x32x32() { check_f16_gemm(32, 32, 32); } // Multi-tile
+
+    // --- bf16 GEMM size tests ---
+
+    #[test]
+    fn test_bf16_gemm_1x1x1() { check_bf16_gemm(1, 1, 1); }
+
+    #[test]
+    fn test_bf16_gemm_1x8x4() { check_bf16_gemm(1, 8, 4); }
+
+    #[test]
+    fn test_bf16_gemm_8x1x4() { check_bf16_gemm(8, 1, 4); }
+
+    #[test]
+    fn test_bf16_gemm_2x3x5() { check_bf16_gemm(2, 3, 5); }
+
+    #[test]
+    fn test_bf16_gemm_3x7x11() { check_bf16_gemm(3, 7, 11); }
+
+    #[test]
+    fn test_bf16_gemm_7x9x5() { check_bf16_gemm(7, 9, 5); }
+
+    #[test]
+    fn test_bf16_gemm_6x16x8() { check_bf16_gemm(6, 16, 8); }
+
+    #[test]
+    fn test_bf16_gemm_7x17x9() { check_bf16_gemm(7, 17, 9); }
+
+    #[test]
+    fn test_bf16_gemm_13x19x23() { check_bf16_gemm(13, 19, 23); }
+
+    #[test]
+    fn test_bf16_gemm_14x32x16() { check_bf16_gemm(14, 32, 16); }
+
+    #[test]
+    fn test_bf16_gemm_15x33x17() { check_bf16_gemm(15, 33, 17); }
+
+    #[test]
+    fn test_bf16_gemm_32x32x32() { check_bf16_gemm(32, 32, 32); }
+
+    // --- f32 GEMM additional size tests (same sizes for cross-type validation) ---
+
+    #[test]
+    fn test_f32_gemm_1x1x1() {
+        let kernels = CpuKernels::<f32>::new();
+        let a = vec![2.5f32];
+        let b = vec![3.0f32];
+        let mut c = vec![0.0f32];
+        kernels.gemm(&a, &b, &mut c, 1, 1, 1);
+        assert!((c[0] - 7.5).abs() < 1e-5);
+    }
+
+    #[test]
+    fn test_f32_gemm_7x17x9() {
+        let kernels = CpuKernels::<f32>::new();
+        let a = vec![1.0f32; 7 * 9];
+        let b = vec![1.0f32; 9 * 17];
+        let mut c = vec![0.0f32; 7 * 17];
+        kernels.gemm(&a, &b, &mut c, 7, 17, 9);
+        assert!(c.iter().all(|&x| (x - 9.0).abs() < 1e-5));
+    }
+
+    #[test]
+    fn test_f32_gemm_13x19x23() {
+        let kernels = CpuKernels::<f32>::new();
+        let a = vec![1.0f32; 13 * 23];
+        let b = vec![1.0f32; 23 * 19];
+        let mut c = vec![0.0f32; 13 * 19];
+        kernels.gemm(&a, &b, &mut c, 13, 19, 23);
+        assert!(c.iter().all(|&x| (x - 23.0).abs() < 1e-4));
+    }
+
+    // ========================================================================
     // Block 16: K-Quant dequant tests (Q2_K, Q3_K, Q5_K, Q6_K)
     // ========================================================================
 
