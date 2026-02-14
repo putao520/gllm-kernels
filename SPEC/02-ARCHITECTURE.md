@@ -287,14 +287,15 @@ struct LayerWorkspace {
    pub fn matmul<E: Element>(a: &[E], b: &[E], c: &mut [E], m: usize, n: usize, k: usize)
    ```
 
-2. **SIMD 特化层** (f32/f64)：
+2. **SIMD 特化层**（所有支持精度：f32/f16/bf16）：
    - 运行时 ISA 检测 (AVX2 vs AVX-512 vs NEON)
    - Cache-aware 分块 (Tiling)
    - 寄存器阻塞 (Register Blocking)
+   - f16: F16C 转换 load/store + f32 SIMD 计算；bf16: bit-shift 转换 + f32 SIMD 计算
 
-3. **标量回退层** (其他类型)：
-   - 泛型标量实现
-   - 保证正确性
+3. **Scalar 兜底层**（仅限无 SIMD 硬件）：
+   - 泛型标量实现，保证正确性
+   - **禁止在有 SIMD 能力的硬件上降级到 Scalar 路径**
 
 **分块常量**：
 ```rust

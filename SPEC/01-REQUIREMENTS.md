@@ -26,7 +26,7 @@
 | ID | 需求标题 | 描述 | 验收标准 | 状态 |
 |----|----------|------|----------|------|
 | **REQ-CPU-001** | SIMD/AVX 加速 | 充分利用 CPU 向量化指令 | 核心算子覆盖 AVX2 (x86) 和 NEON (ARM) | 🟢 已完成 |
-| **REQ-CPU-002** | 自研泛型内核 | **自研实现，禁止外部 BLAS 依赖** | 1. 泛型签名 `fn xxx<E: Element>(...)`<br>2. SIMD 特化路径 (f32/f64)<br>3. 标量回退路径 (其他类型)<br>4. **禁止 faer/OpenBLAS/MKL/Accelerate** | 🟢 已完成 |
+| **REQ-CPU-002** | 自研泛型内核 | **自研实现，禁止外部 BLAS 依赖** | 1. 泛型签名 `fn xxx<E: Element>(...)`<br>2. **所有支持精度（f32/f16/bf16）均必须有 SIMD 特化路径**<br>3. Scalar 仅作为无 SIMD 硬件的最后兜底，禁止在有 SIMD 能力的硬件上降级到 Scalar<br>4. **禁止 faer/OpenBLAS/MKL/Accelerate** | 🟢 已完成 |
 | **REQ-CPU-003** | CPU 融合算子 | CPU 端也必须实现算子融合 | 减少内存带宽压力，提升 L2 Cache 命中率 | 🟢 已完成 |
 | **REQ-CPU-004** | 小模型快路径 | 小模型/Batch=1 绕过复杂调度 | 直接在 CPU 上执行完整推理，零开销 | 🟢 已完成 |
 

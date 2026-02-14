@@ -711,6 +711,114 @@ mod tests {
         }
     }
 
+    /// Helper: run gemm for f32 at given dimensions with patterned data and verify against f64 reference
+    fn check_f32_gemm(m: usize, n: usize, k: usize) {
+        let kernels = CpuKernels::<f32>::new();
+
+        let a_f64: Vec<f64> = (0..m * k).map(|i| ((i % 7) as f64 - 3.0) * 0.5).collect();
+        let b_f64: Vec<f64> = (0..k * n).map(|i| ((i % 5) as f64 - 2.0) * 0.25).collect();
+        let ref_c = reference_matmul(&a_f64, &b_f64, m, n, k);
+
+        let a_f32: Vec<f32> = a_f64.iter().map(|&x| x as f32).collect();
+        let b_f32: Vec<f32> = b_f64.iter().map(|&x| x as f32).collect();
+        let mut c_f32 = vec![0.0f32; m * n];
+        kernels.gemm(&a_f32, &b_f32, &mut c_f32, m, n, k);
+
+        for idx in 0..m * n {
+            let got = c_f32[idx] as f64;
+            let expected = ref_c[idx];
+            let tol = expected.abs() * 1e-5 + 1e-4;
+            assert!(
+                (got - expected).abs() < tol,
+                "f32 gemm {}x{}x{}: c[{}] = {}, expected {} (tol {})",
+                m, n, k, idx, got, expected, tol
+            );
+        }
+    }
+
+    // ========================================================================
+    // Block 15d: GEMM tile-boundary remainder path tests
+    // ========================================================================
+    //
+    // Systematically test M-remainder, N-remainder, both-remainder paths
+    // for each ISA's tile dimensions. K=17 (prime) for all tests.
+    //
+    // AVX-512: TILE_M=14, TILE_N=32
+    // AVX2:    TILE_M=6,  TILE_N=16
+    // NEON:    TILE_M=8,  TILE_N=12
+
+    // --- f32 GEMM remainder: AVX-512 tile (14×32) ---
+    #[test] fn test_f32_gemm_avx512_exact()    { check_f32_gemm(14, 32, 17); }
+    #[test] fn test_f32_gemm_avx512_m_rem()    { check_f32_gemm(15, 32, 17); }
+    #[test] fn test_f32_gemm_avx512_n_rem()    { check_f32_gemm(14, 33, 17); }
+    #[test] fn test_f32_gemm_avx512_both_rem() { check_f32_gemm(15, 33, 17); }
+    #[test] fn test_f32_gemm_avx512_max_rem()  { check_f32_gemm(27, 63, 17); }
+    #[test] fn test_f32_gemm_avx512_sub_tile() { check_f32_gemm(13, 31, 17); }
+
+    // --- f32 GEMM remainder: AVX2 tile (6×16) ---
+    #[test] fn test_f32_gemm_avx2_exact()    { check_f32_gemm(6, 16, 17); }
+    #[test] fn test_f32_gemm_avx2_m_rem()    { check_f32_gemm(7, 16, 17); }
+    #[test] fn test_f32_gemm_avx2_n_rem()    { check_f32_gemm(6, 17, 17); }
+    #[test] fn test_f32_gemm_avx2_both_rem() { check_f32_gemm(7, 17, 17); }
+    #[test] fn test_f32_gemm_avx2_max_rem()  { check_f32_gemm(11, 31, 17); }
+    #[test] fn test_f32_gemm_avx2_sub_tile() { check_f32_gemm(5, 15, 17); }
+
+    // --- f32 GEMM remainder: NEON tile (8×12) ---
+    #[test] fn test_f32_gemm_neon_exact()    { check_f32_gemm(8, 12, 17); }
+    #[test] fn test_f32_gemm_neon_m_rem()    { check_f32_gemm(9, 12, 17); }
+    #[test] fn test_f32_gemm_neon_n_rem()    { check_f32_gemm(8, 13, 17); }
+    #[test] fn test_f32_gemm_neon_both_rem() { check_f32_gemm(9, 13, 17); }
+    #[test] fn test_f32_gemm_neon_max_rem()  { check_f32_gemm(15, 23, 17); }
+    #[test] fn test_f32_gemm_neon_sub_tile() { check_f32_gemm(7, 11, 17); }
+
+    // --- f16 GEMM remainder: AVX-512 tile (14×32) ---
+    #[test] fn test_f16_gemm_avx512_exact()    { check_f16_gemm(14, 32, 17); }
+    #[test] fn test_f16_gemm_avx512_m_rem()    { check_f16_gemm(15, 32, 17); }
+    #[test] fn test_f16_gemm_avx512_n_rem()    { check_f16_gemm(14, 33, 17); }
+    #[test] fn test_f16_gemm_avx512_both_rem() { check_f16_gemm(15, 33, 17); }
+    #[test] fn test_f16_gemm_avx512_max_rem()  { check_f16_gemm(27, 63, 17); }
+    #[test] fn test_f16_gemm_avx512_sub_tile() { check_f16_gemm(13, 31, 17); }
+
+    // --- f16 GEMM remainder: AVX2 tile (6×16) ---
+    #[test] fn test_f16_gemm_avx2_exact()    { check_f16_gemm(6, 16, 17); }
+    #[test] fn test_f16_gemm_avx2_m_rem()    { check_f16_gemm(7, 16, 17); }
+    #[test] fn test_f16_gemm_avx2_n_rem()    { check_f16_gemm(6, 17, 17); }
+    #[test] fn test_f16_gemm_avx2_both_rem() { check_f16_gemm(7, 17, 17); }
+    #[test] fn test_f16_gemm_avx2_max_rem()  { check_f16_gemm(11, 31, 17); }
+    #[test] fn test_f16_gemm_avx2_sub_tile() { check_f16_gemm(5, 15, 17); }
+
+    // --- f16 GEMM remainder: NEON tile (8×12) ---
+    #[test] fn test_f16_gemm_neon_exact()    { check_f16_gemm(8, 12, 17); }
+    #[test] fn test_f16_gemm_neon_m_rem()    { check_f16_gemm(9, 12, 17); }
+    #[test] fn test_f16_gemm_neon_n_rem()    { check_f16_gemm(8, 13, 17); }
+    #[test] fn test_f16_gemm_neon_both_rem() { check_f16_gemm(9, 13, 17); }
+    #[test] fn test_f16_gemm_neon_max_rem()  { check_f16_gemm(15, 23, 17); }
+    #[test] fn test_f16_gemm_neon_sub_tile() { check_f16_gemm(7, 11, 17); }
+
+    // --- bf16 GEMM remainder: AVX-512 tile (14×32) ---
+    #[test] fn test_bf16_gemm_avx512_exact()    { check_bf16_gemm(14, 32, 17); }
+    #[test] fn test_bf16_gemm_avx512_m_rem()    { check_bf16_gemm(15, 32, 17); }
+    #[test] fn test_bf16_gemm_avx512_n_rem()    { check_bf16_gemm(14, 33, 17); }
+    #[test] fn test_bf16_gemm_avx512_both_rem() { check_bf16_gemm(15, 33, 17); }
+    #[test] fn test_bf16_gemm_avx512_max_rem()  { check_bf16_gemm(27, 63, 17); }
+    #[test] fn test_bf16_gemm_avx512_sub_tile() { check_bf16_gemm(13, 31, 17); }
+
+    // --- bf16 GEMM remainder: AVX2 tile (6×16) ---
+    #[test] fn test_bf16_gemm_avx2_exact()    { check_bf16_gemm(6, 16, 17); }
+    #[test] fn test_bf16_gemm_avx2_m_rem()    { check_bf16_gemm(7, 16, 17); }
+    #[test] fn test_bf16_gemm_avx2_n_rem()    { check_bf16_gemm(6, 17, 17); }
+    #[test] fn test_bf16_gemm_avx2_both_rem() { check_bf16_gemm(7, 17, 17); }
+    #[test] fn test_bf16_gemm_avx2_max_rem()  { check_bf16_gemm(11, 31, 17); }
+    #[test] fn test_bf16_gemm_avx2_sub_tile() { check_bf16_gemm(5, 15, 17); }
+
+    // --- bf16 GEMM remainder: NEON tile (8×12) ---
+    #[test] fn test_bf16_gemm_neon_exact()    { check_bf16_gemm(8, 12, 17); }
+    #[test] fn test_bf16_gemm_neon_m_rem()    { check_bf16_gemm(9, 12, 17); }
+    #[test] fn test_bf16_gemm_neon_n_rem()    { check_bf16_gemm(8, 13, 17); }
+    #[test] fn test_bf16_gemm_neon_both_rem() { check_bf16_gemm(9, 13, 17); }
+    #[test] fn test_bf16_gemm_neon_max_rem()  { check_bf16_gemm(15, 23, 17); }
+    #[test] fn test_bf16_gemm_neon_sub_tile() { check_bf16_gemm(7, 11, 17); }
+
     // --- f16 GEMM size tests ---
 
     #[test]

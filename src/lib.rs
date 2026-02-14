@@ -28,6 +28,8 @@ pub mod tests;
 #[cfg(test)]
 mod tests_quant;
 #[cfg(test)]
+mod tests_simd;
+#[cfg(test)]
 mod check_isa;
 
 pub use traits::{Element, Backend, Kernels};

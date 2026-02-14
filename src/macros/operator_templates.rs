@@ -239,6 +239,54 @@ macro_rules! define_blas1_ops {
             while i < len { let v = a[i].to_f32(); result += v * v; i += 1; }
             <$elem as Element>::from_f32(result)
         }
+
+        /// dot: returns dot product of a and b (single pass FMA + reduce)
+        #[inline(always)]
+        pub fn dot(a: &[$elem], b: &[$elem]) -> $elem {
+            const LANES: usize = $crate::simd_primitive!($isa, $elem, lanes);
+            let len = a.len();
+            debug_assert_eq!(len, b.len());
+            let mut i = 0;
+            #[allow(unused_unsafe)]
+            let mut acc = unsafe { $crate::simd_primitive!($isa, $elem, zero) };
+            while i + LANES <= len {
+                #[allow(unused_unsafe)]
+                unsafe {
+                    let va = $crate::simd_primitive!($isa, $elem, load, a.as_ptr().add(i));
+                    let vb = $crate::simd_primitive!($isa, $elem, load, b.as_ptr().add(i));
+                    acc = $crate::simd_primitive!($isa, $elem, fma, va, vb, acc);
+                }
+                i += LANES;
+            }
+            #[allow(unused_unsafe)]
+            let mut result: f32 = unsafe { $crate::simd_primitive!($isa, $elem, reduce_sum, acc) };
+            while i < len { result += a[i].to_f32() * b[i].to_f32(); i += 1; }
+            <$elem as Element>::from_f32(result)
+        }
+
+        /// bias_rows: c[row] += bias for each row (fused SIMD, single dispatch)
+        /// c: [m, n] row-major, bias: [n]
+        #[inline(always)]
+        pub fn bias_rows(c: &mut [$elem], bias: &[$elem], m: usize, n: usize) {
+            const LANES: usize = $crate::simd_primitive!($isa, $elem, lanes);
+            debug_assert_eq!(c.len(), m * n);
+            debug_assert_eq!(bias.len(), n);
+            for row in 0..m {
+                let off = row * n;
+                let mut j = 0;
+                while j + LANES <= n {
+                    #[allow(unused_unsafe)]
+                    unsafe {
+                        let vc = $crate::simd_primitive!($isa, $elem, load, c.as_ptr().add(off + j));
+                        let vb = $crate::simd_primitive!($isa, $elem, load, bias.as_ptr().add(j));
+                        let res = $crate::simd_primitive!($isa, $elem, add, vc, vb);
+                        $crate::simd_primitive!($isa, $elem, store, c.as_mut_ptr().add(off + j), res);
+                    }
+                    j += LANES;
+                }
+                while j < n { c[off + j] = c[off + j] + bias[j]; j += 1; }
+            }
+        }
     };
 }
 
@@ -432,6 +480,40 @@ macro_rules! define_activation_ops {
             }
             while i < len { out[i] = <$elem as Element>::from_f32(out[i].to_f32() * inv_sum); i += 1; }
         }
+
+        /// swiglu: out[i] = silu(gate[i]) * up[i] (single pass fusion)
+        #[inline(always)]
+        pub fn swiglu(gate: &[$elem], up: &[$elem], out: &mut [$elem]) {
+            const LANES: usize = $crate::simd_primitive!($isa, $elem, lanes);
+            let len = gate.len();
+            debug_assert_eq!(up.len(), len);
+            debug_assert_eq!(out.len(), len);
+
+            let mut i = 0;
+            while i + LANES <= len {
+                #[allow(unused_unsafe)]
+                unsafe {
+                    let vg = $crate::simd_primitive!($isa, $elem, load, gate.as_ptr().add(i));
+                    let vu = $crate::simd_primitive!($isa, $elem, load, up.as_ptr().add(i));
+                    let one = $crate::simd_primitive!($isa, $elem, splat, <$elem as Element>::ONE);
+                    let neg_g = $crate::simd_primitive!($isa, $elem, neg, vg);
+                    let exp_neg = $crate::simd_primitive!($isa, $elem, exp, neg_g);
+                    let denom = $crate::simd_primitive!($isa, $elem, add, one, exp_neg);
+                    let sigmoid = $crate::simd_primitive!($isa, $elem, div, one, denom);
+                    // silu(gate) * up = gate * sigmoid(gate) * up
+                    let silu = $crate::simd_primitive!($isa, $elem, mul, vg, sigmoid);
+                    let res = $crate::simd_primitive!($isa, $elem, mul, silu, vu);
+                    $crate::simd_primitive!($isa, $elem, store, out.as_mut_ptr().add(i), res);
+                }
+                i += LANES;
+            }
+            while i < len {
+                let g = gate[i].to_f32();
+                let sigmoid = 1.0f32 / (1.0f32 + (-g).exp());
+                out[i] = <$elem as Element>::from_f32(g * sigmoid * up[i].to_f32());
+                i += 1;
+            }
+        }
     };
 }
 
@@ -564,28 +646,94 @@ macro_rules! define_norm_ops {
     };
 }
 
-/// Defines RoPE and Embedding operations  
+/// Defines RoPE and Embedding operations
 #[macro_export]
 macro_rules! define_position_ops {
     ($isa:ident, $elem:ident) => {
-        /// rope: Apply Rotary Positional Embeddings
-        /// q/k are [seq_len, head_dim], cos_sin is [seq_len, head_dim] interleaved cos/sin
-        /// For each pair (q[2i], q[2i+1]), apply complex rotation:
-        ///   q[2i]'   = q[2i] * cos - q[2i+1] * sin
-        ///   q[2i+1]' = q[2i] * sin + q[2i+1] * cos
+        /// rope: Apply Rotary Positional Embeddings (SIMD optimized)
+        /// data: [seq_len, head_dim], cos: [seq_len, half], sin: [seq_len, half]
+        /// For each position, the first half and second half form complex pairs:
+        ///   data[i]'        = data[i] * cos[i] - data[i+half] * sin[i]
+        ///   data[i+half]'   = data[i] * sin[i] + data[i+half] * cos[i]
         #[inline(always)]
         pub fn rope(data: &mut [$elem], cos: &[$elem], sin: &[$elem], head_dim: usize) {
+            const LANES: usize = $crate::simd_primitive!($isa, $elem, lanes);
             let half = head_dim / 2;
             let seq_len = data.len() / head_dim;
             for pos in 0..seq_len {
                 let base = pos * head_dim;
-                for i in 0..half {
-                    let x0 = data[base + i];
-                    let x1 = data[base + i + half];
-                    let c = cos[pos * half + i];
-                    let s = sin[pos * half + i];
-                    data[base + i]        = x0 * c - x1 * s;
-                    data[base + i + half] = x0 * s + x1 * c;
+                let cs_base = pos * half;
+                let mut i = 0;
+                // SIMD main loop over the half dimension
+                while i + LANES <= half {
+                    #[allow(unused_unsafe)]
+                    unsafe {
+                        let vx0 = $crate::simd_primitive!($isa, $elem, load, data.as_ptr().add(base + i));
+                        let vx1 = $crate::simd_primitive!($isa, $elem, load, data.as_ptr().add(base + i + half));
+                        let vc  = $crate::simd_primitive!($isa, $elem, load, cos.as_ptr().add(cs_base + i));
+                        let vs  = $crate::simd_primitive!($isa, $elem, load, sin.as_ptr().add(cs_base + i));
+                        // x0' = x0 * cos - x1 * sin
+                        let t0 = $crate::simd_primitive!($isa, $elem, mul, vx0, vc);
+                        let t1 = $crate::simd_primitive!($isa, $elem, mul, vx1, vs);
+                        let r0 = $crate::simd_primitive!($isa, $elem, sub, t0, t1);
+                        // x1' = x0 * sin + x1 * cos  (= fma(x1, cos, x0*sin))
+                        let t2 = $crate::simd_primitive!($isa, $elem, mul, vx0, vs);
+                        let r1 = $crate::simd_primitive!($isa, $elem, fma, vx1, vc, t2);
+                        $crate::simd_primitive!($isa, $elem, store, data.as_mut_ptr().add(base + i), r0);
+                        $crate::simd_primitive!($isa, $elem, store, data.as_mut_ptr().add(base + i + half), r1);
+                    }
+                    i += LANES;
+                }
+                // Scalar remainder
+                while i < half {
+                    let x0 = data[base + i].to_f32();
+                    let x1 = data[base + i + half].to_f32();
+                    let c = cos[cs_base + i].to_f32();
+                    let s = sin[cs_base + i].to_f32();
+                    data[base + i]        = <$elem as Element>::from_f32(x0 * c - x1 * s);
+                    data[base + i + half] = <$elem as Element>::from_f32(x0 * s + x1 * c);
+                    i += 1;
+                }
+            }
+        }
+
+        /// rope_with_pos: RoPE with explicit position offset (SIMD optimized)
+        /// Same as rope but cos/sin are indexed by (pos + position) instead of pos.
+        #[inline(always)]
+        pub fn rope_with_pos(data: &mut [$elem], cos: &[$elem], sin: &[$elem], head_dim: usize, position: usize) {
+            const LANES: usize = $crate::simd_primitive!($isa, $elem, lanes);
+            let half = head_dim / 2;
+            let seq_len = data.len() / head_dim;
+            for pos in 0..seq_len {
+                let base = pos * head_dim;
+                let actual_pos = pos + position;
+                let cs_base = actual_pos * half;
+                let mut i = 0;
+                while i + LANES <= half {
+                    #[allow(unused_unsafe)]
+                    unsafe {
+                        let vx0 = $crate::simd_primitive!($isa, $elem, load, data.as_ptr().add(base + i));
+                        let vx1 = $crate::simd_primitive!($isa, $elem, load, data.as_ptr().add(base + i + half));
+                        let vc  = $crate::simd_primitive!($isa, $elem, load, cos.as_ptr().add(cs_base + i));
+                        let vs  = $crate::simd_primitive!($isa, $elem, load, sin.as_ptr().add(cs_base + i));
+                        let t0 = $crate::simd_primitive!($isa, $elem, mul, vx0, vc);
+                        let t1 = $crate::simd_primitive!($isa, $elem, mul, vx1, vs);
+                        let r0 = $crate::simd_primitive!($isa, $elem, sub, t0, t1);
+                        let t2 = $crate::simd_primitive!($isa, $elem, mul, vx0, vs);
+                        let r1 = $crate::simd_primitive!($isa, $elem, fma, vx1, vc, t2);
+                        $crate::simd_primitive!($isa, $elem, store, data.as_mut_ptr().add(base + i), r0);
+                        $crate::simd_primitive!($isa, $elem, store, data.as_mut_ptr().add(base + i + half), r1);
+                    }
+                    i += LANES;
+                }
+                while i < half {
+                    let x0 = data[base + i].to_f32();
+                    let x1 = data[base + i + half].to_f32();
+                    let c = cos[cs_base + i].to_f32();
+                    let s = sin[cs_base + i].to_f32();
+                    data[base + i]        = <$elem as Element>::from_f32(x0 * c - x1 * s);
+                    data[base + i + half] = <$elem as Element>::from_f32(x0 * s + x1 * c);
+                    i += 1;
                 }
             }
         }

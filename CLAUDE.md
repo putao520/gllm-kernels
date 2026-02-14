@@ -288,7 +288,7 @@ src/
 │
 ├── cpu_kernels/            # CPU 后端实现
 │   ├── mod.rs              # CpuKernels 结构 + ISA 检测
-│   ├── scalar/             # Scalar 回退实现
+│   ├── scalar/             # Scalar 兜底（仅限无 SIMD 硬件）
 │   ├── avx2/               # AVX2 优化实现
 │   ├── avx512/             # AVX-512 优化实现
 │   └── neon/               # NEON 优化实现

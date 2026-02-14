@@ -125,7 +125,9 @@ macro_rules! define_quant_dot_iq {
             let src = other.as_ptr();
             match get_isa_level() {
                 #[cfg(target_arch = "x86_64")]
-                IsaLevel::Avx512 | IsaLevel::Avx2 => { crate::quant_primitive!(avx2, $qfmt, dot, blk, src) }
+                IsaLevel::Avx512 => { crate::quant_primitive!(avx512, $qfmt, dot, blk, src) }
+                #[cfg(target_arch = "x86_64")]
+                IsaLevel::Avx2 => { crate::quant_primitive!(avx2, $qfmt, dot, blk, src) }
                 #[cfg(target_arch = "aarch64")]
                 IsaLevel::Neon => { crate::quant_primitive!(neon, $qfmt, dot, blk, src) }
                 _ => { crate::quant_primitive!(scalar, $qfmt, dot, blk, src) }
@@ -181,6 +183,82 @@ macro_rules! define_quant_decode_avx512 {
     };
 }
 
+/// Generate a dequant function: avx512 + avx2 + neon + scalar (IQ1-IQ3 decode, full ISA coverage)
+macro_rules! define_quant_decode_iq {
+    ($fn_name:ident, $qfmt:ident, $block_ty:ident) => {
+        fn $fn_name(&self, block: &[u8], out: &mut [f32]) {
+            let blk = block.as_ptr() as *const crate::quant::$block_ty;
+            let dst = out.as_mut_ptr();
+            match get_isa_level() {
+                #[cfg(target_arch = "x86_64")]
+                IsaLevel::Avx512 => { crate::quant_primitive!(avx512, $qfmt, decode, blk, dst); }
+                #[cfg(target_arch = "x86_64")]
+                IsaLevel::Avx2 => { crate::quant_primitive!(avx2, $qfmt, decode, blk, dst); }
+                #[cfg(target_arch = "aarch64")]
+                IsaLevel::Neon => { crate::quant_primitive!(neon, $qfmt, decode, blk, dst); }
+                _ => { crate::quant_primitive!(scalar, $qfmt, decode, blk, dst); }
+            }
+        }
+    };
+}
+
+/// Generate a dot function: avx512 + avx2 + neon + scalar (IQ4 formats with full ISA coverage)
+macro_rules! define_quant_dot_iq4 {
+    ($fn_name:ident, $qfmt:ident, $block_ty:ident) => {
+        fn $fn_name(&self, block: &[u8], other: &[f32]) -> f32 {
+            let blk = block.as_ptr() as *const crate::quant::$block_ty;
+            let src = other.as_ptr();
+            match get_isa_level() {
+                #[cfg(target_arch = "x86_64")]
+                IsaLevel::Avx512 => { crate::quant_primitive!(avx512, $qfmt, dot, blk, src) }
+                #[cfg(target_arch = "x86_64")]
+                IsaLevel::Avx2 => { crate::quant_primitive!(avx2, $qfmt, dot, blk, src) }
+                #[cfg(target_arch = "aarch64")]
+                IsaLevel::Neon => { crate::quant_primitive!(neon, $qfmt, dot, blk, src) }
+                _ => { crate::quant_primitive!(scalar, $qfmt, dot, blk, src) }
+            }
+        }
+    };
+}
+
+/// Generate a dequant function: avx512 + avx2 + scalar (IQ4 decode with full x86 coverage)
+macro_rules! define_quant_decode_iq4 {
+    ($fn_name:ident, $qfmt:ident, $block_ty:ident) => {
+        fn $fn_name(&self, block: &[u8], out: &mut [f32]) {
+            let blk = block.as_ptr() as *const crate::quant::$block_ty;
+            let dst = out.as_mut_ptr();
+            match get_isa_level() {
+                #[cfg(target_arch = "x86_64")]
+                IsaLevel::Avx512 => { crate::quant_primitive!(avx512, $qfmt, decode, blk, dst); }
+                #[cfg(target_arch = "x86_64")]
+                IsaLevel::Avx2 => { crate::quant_primitive!(avx2, $qfmt, decode, blk, dst); }
+                #[cfg(target_arch = "aarch64")]
+                IsaLevel::Neon => { crate::quant_primitive!(neon, $qfmt, decode, blk, dst); }
+                _ => { crate::quant_primitive!(scalar, $qfmt, decode, blk, dst); }
+            }
+        }
+    };
+}
+
+/// Generate a dot function: avx512 + avx2 + neon + scalar (commercial formats AWQ4/GPTQ4)
+macro_rules! define_quant_dot_commercial {
+    ($fn_name:ident, $qfmt:ident, $block_ty:ident) => {
+        fn $fn_name(&self, block: &[u8], other: &[f32]) -> f32 {
+            let blk = block.as_ptr() as *const crate::quant::$block_ty;
+            let src = other.as_ptr();
+            match get_isa_level() {
+                #[cfg(target_arch = "x86_64")]
+                IsaLevel::Avx512 => { crate::quant_primitive!(avx512, $qfmt, dot, blk, src) }
+                #[cfg(target_arch = "x86_64")]
+                IsaLevel::Avx2 => { crate::quant_primitive!(avx2, $qfmt, dot, blk, src) }
+                #[cfg(target_arch = "aarch64")]
+                IsaLevel::Neon => { crate::quant_primitive!(neon, $qfmt, dot, blk, src) }
+                _ => { crate::quant_primitive!(scalar, $qfmt, dot, blk, src) }
+            }
+        }
+    };
+}
+
 // ============================================================================
 // Private helper methods on CpuKernels
 // ============================================================================
@@ -202,19 +280,27 @@ impl<E: Element> CpuKernels<E> {
     define_quant_dot_iq!(dot_iq2_s, iq2_s, BlockIQ2S);
     define_quant_dot_iq!(dot_iq3_xxs, iq3_xxs, BlockIQ3XXS);
     define_quant_dot_iq!(dot_iq3_s, iq3_s, BlockIQ3S);
-    define_quant_dot_iq!(dot_iq4_nl, iq4_nl, BlockIQ4NL);
-    define_quant_dot_iq!(dot_iq4_xs, iq4_xs, BlockIQ4XS);
 
-    // Scalar-only dot
-    fn dot_awq4(&self, block: &[u8], other: &[f32]) -> f32 {
-        let blk = block.as_ptr() as *const crate::quant::BlockAWQ4;
-        let src = other.as_ptr();
-        crate::quant_primitive!(scalar, awq4, dot, blk, src)
-    }
-    fn dot_gptq4(&self, block: &[u8], other: &[f32]) -> f32 {
-        let blk = block.as_ptr() as *const crate::quant::BlockGPTQ4;
-        let src = other.as_ptr();
-        crate::quant_primitive!(scalar, gptq4, dot, blk, src)
+    // IQ4 dot: avx512 + avx2 + neon + scalar (full ISA coverage)
+    define_quant_dot_iq4!(dot_iq4_nl, iq4_nl, BlockIQ4NL);
+    define_quant_dot_iq4!(dot_iq4_xs, iq4_xs, BlockIQ4XS);
+
+    // Commercial dot: avx512 + avx2 + neon + scalar
+    define_quant_dot_commercial!(dot_awq4, awq4, BlockAWQ4);
+    define_quant_dot_commercial!(dot_gptq4, gptq4, BlockGPTQ4);
+    define_quant_dot_commercial!(dot_squeeze, squeeze, BlockSqueeze);
+
+    /// SIMD-dispatched f32 dot product (used by AWQ/GPTQ matmul after dequant).
+    fn dot_f32(&self, a: &[f32], b: &[f32]) -> f32 {
+        match get_isa_level() {
+            #[cfg(target_arch = "x86_64")]
+            IsaLevel::Avx512 => avx512::avx512_f32::dot(a, b).to_f32(),
+            #[cfg(target_arch = "x86_64")]
+            IsaLevel::Avx2 => avx2::avx2_f32::dot(a, b).to_f32(),
+            #[cfg(target_arch = "aarch64")]
+            IsaLevel::Neon => neon::neon_f32::dot(a, b).to_f32(),
+            _ => scalar::scalar_f32::dot(a, b).to_f32(),
+        }
     }
 
     // ========================================================================
@@ -389,6 +475,36 @@ macro_rules! dispatch_reduce_op {
             (_, 0) => scalar::scalar_f32::$op(as_typed_slice!($a, f32)).to_f32(),
             (_, 1) => scalar::scalar_f16::$op(as_typed_slice!($a, half::f16)).to_f32(),
             (_, 2) => scalar::scalar_bf16::$op(as_typed_slice!($a, half::bf16)).to_f32(),
+            _ => unreachable!(),
+        }
+    };
+}
+
+/// Dispatch for dot product: 2 read slices → scalar (single pass FMA + reduce)
+macro_rules! dispatch_dot_op {
+    ($a:expr, $b:expr, $op:ident) => {
+        match (get_isa_level(), E::ELEM_ID) {
+            #[cfg(target_arch = "x86_64")]
+            (IsaLevel::Avx512, 0) => avx512::avx512_f32::$op(as_typed_slice!($a, f32), as_typed_slice!($b, f32)).to_f32(),
+            #[cfg(target_arch = "x86_64")]
+            (IsaLevel::Avx512, 1) => avx512::avx512_f16::$op(as_typed_slice!($a, half::f16), as_typed_slice!($b, half::f16)).to_f32(),
+            #[cfg(target_arch = "x86_64")]
+            (IsaLevel::Avx512, 2) => avx512::avx512_bf16::$op(as_typed_slice!($a, half::bf16), as_typed_slice!($b, half::bf16)).to_f32(),
+            #[cfg(target_arch = "x86_64")]
+            (IsaLevel::Avx2, 0) => avx2::avx2_f32::$op(as_typed_slice!($a, f32), as_typed_slice!($b, f32)).to_f32(),
+            #[cfg(target_arch = "x86_64")]
+            (IsaLevel::Avx2, 1) => avx2::avx2_f16::$op(as_typed_slice!($a, half::f16), as_typed_slice!($b, half::f16)).to_f32(),
+            #[cfg(target_arch = "x86_64")]
+            (IsaLevel::Avx2, 2) => avx2::avx2_bf16::$op(as_typed_slice!($a, half::bf16), as_typed_slice!($b, half::bf16)).to_f32(),
+            #[cfg(target_arch = "aarch64")]
+            (IsaLevel::Neon, 0) => neon::neon_f32::$op(as_typed_slice!($a, f32), as_typed_slice!($b, f32)).to_f32(),
+            #[cfg(target_arch = "aarch64")]
+            (IsaLevel::Neon, 1) => neon::neon_f16::$op(as_typed_slice!($a, half::f16), as_typed_slice!($b, half::f16)).to_f32(),
+            #[cfg(target_arch = "aarch64")]
+            (IsaLevel::Neon, 2) => neon::neon_bf16::$op(as_typed_slice!($a, half::bf16), as_typed_slice!($b, half::bf16)).to_f32(),
+            (_, 0) => scalar::scalar_f32::$op(as_typed_slice!($a, f32), as_typed_slice!($b, f32)).to_f32(),
+            (_, 1) => scalar::scalar_f16::$op(as_typed_slice!($a, half::f16), as_typed_slice!($b, half::f16)).to_f32(),
+            (_, 2) => scalar::scalar_bf16::$op(as_typed_slice!($a, half::bf16), as_typed_slice!($b, half::bf16)).to_f32(),
             _ => unreachable!(),
         }
     };
@@ -573,6 +689,36 @@ macro_rules! dispatch_rope {
     };
 }
 
+/// Dispatch for rope_with_pos: 1 mut slice + 2 read slices + usize + usize
+macro_rules! dispatch_rope_with_pos {
+    ($op:ident, $qk:expr, $cos:expr, $sin:expr, $hd:expr, $pos:expr) => {
+        match (get_isa_level(), E::ELEM_ID) {
+            #[cfg(target_arch = "x86_64")]
+            (IsaLevel::Avx512, 0) => avx512::avx512_f32::$op(as_typed_slice_mut!($qk, f32), as_typed_slice!($cos, f32), as_typed_slice!($sin, f32), $hd, $pos),
+            #[cfg(target_arch = "x86_64")]
+            (IsaLevel::Avx512, 1) => avx512::avx512_f16::$op(as_typed_slice_mut!($qk, half::f16), as_typed_slice!($cos, half::f16), as_typed_slice!($sin, half::f16), $hd, $pos),
+            #[cfg(target_arch = "x86_64")]
+            (IsaLevel::Avx512, 2) => avx512::avx512_bf16::$op(as_typed_slice_mut!($qk, half::bf16), as_typed_slice!($cos, half::bf16), as_typed_slice!($sin, half::bf16), $hd, $pos),
+            #[cfg(target_arch = "x86_64")]
+            (IsaLevel::Avx2, 0) => avx2::avx2_f32::$op(as_typed_slice_mut!($qk, f32), as_typed_slice!($cos, f32), as_typed_slice!($sin, f32), $hd, $pos),
+            #[cfg(target_arch = "x86_64")]
+            (IsaLevel::Avx2, 1) => avx2::avx2_f16::$op(as_typed_slice_mut!($qk, half::f16), as_typed_slice!($cos, half::f16), as_typed_slice!($sin, half::f16), $hd, $pos),
+            #[cfg(target_arch = "x86_64")]
+            (IsaLevel::Avx2, 2) => avx2::avx2_bf16::$op(as_typed_slice_mut!($qk, half::bf16), as_typed_slice!($cos, half::bf16), as_typed_slice!($sin, half::bf16), $hd, $pos),
+            #[cfg(target_arch = "aarch64")]
+            (IsaLevel::Neon, 0) => neon::neon_f32::$op(as_typed_slice_mut!($qk, f32), as_typed_slice!($cos, f32), as_typed_slice!($sin, f32), $hd, $pos),
+            #[cfg(target_arch = "aarch64")]
+            (IsaLevel::Neon, 1) => neon::neon_f16::$op(as_typed_slice_mut!($qk, half::f16), as_typed_slice!($cos, half::f16), as_typed_slice!($sin, half::f16), $hd, $pos),
+            #[cfg(target_arch = "aarch64")]
+            (IsaLevel::Neon, 2) => neon::neon_bf16::$op(as_typed_slice_mut!($qk, half::bf16), as_typed_slice!($cos, half::bf16), as_typed_slice!($sin, half::bf16), $hd, $pos),
+            (_, 0) => scalar::scalar_f32::$op(as_typed_slice_mut!($qk, f32), as_typed_slice!($cos, f32), as_typed_slice!($sin, f32), $hd, $pos),
+            (_, 1) => scalar::scalar_f16::$op(as_typed_slice_mut!($qk, half::f16), as_typed_slice!($cos, half::f16), as_typed_slice!($sin, half::f16), $hd, $pos),
+            (_, 2) => scalar::scalar_bf16::$op(as_typed_slice_mut!($qk, half::bf16), as_typed_slice!($cos, half::bf16), as_typed_slice!($sin, half::bf16), $hd, $pos),
+            _ => unreachable!(),
+        }
+    };
+}
+
 /// Dispatch for in-place scale: read slice + f32 scalar + mut out, then copy back
 macro_rules! dispatch_scale {
     ($op:ident, $x:expr, $sf:expr, $tmp:expr) => {
@@ -598,6 +744,66 @@ macro_rules! dispatch_scale {
             (_, 0) => scalar::scalar_f32::$op(as_typed_slice!($x, f32), $sf, as_typed_slice_mut!($tmp, f32)),
             (_, 1) => scalar::scalar_f16::$op(as_typed_slice!($x, half::f16), half::f16::from_f32($sf), as_typed_slice_mut!($tmp, half::f16)),
             (_, 2) => scalar::scalar_bf16::$op(as_typed_slice!($x, half::bf16), half::bf16::from_f32($sf), as_typed_slice_mut!($tmp, half::bf16)),
+            _ => unreachable!(),
+        }
+    };
+}
+
+/// Dispatch for bias_rows: 1 mut slice + 1 read slice + 2 dims
+macro_rules! dispatch_bias_rows {
+    ($op:ident, $c:expr, $bias:expr, $m:expr, $n:expr) => {
+        match (get_isa_level(), E::ELEM_ID) {
+            #[cfg(target_arch = "x86_64")]
+            (IsaLevel::Avx512, 0) => avx512::avx512_f32::$op(as_typed_slice_mut!($c, f32), as_typed_slice!($bias, f32), $m, $n),
+            #[cfg(target_arch = "x86_64")]
+            (IsaLevel::Avx512, 1) => avx512::avx512_f16::$op(as_typed_slice_mut!($c, half::f16), as_typed_slice!($bias, half::f16), $m, $n),
+            #[cfg(target_arch = "x86_64")]
+            (IsaLevel::Avx512, 2) => avx512::avx512_bf16::$op(as_typed_slice_mut!($c, half::bf16), as_typed_slice!($bias, half::bf16), $m, $n),
+            #[cfg(target_arch = "x86_64")]
+            (IsaLevel::Avx2, 0) => avx2::avx2_f32::$op(as_typed_slice_mut!($c, f32), as_typed_slice!($bias, f32), $m, $n),
+            #[cfg(target_arch = "x86_64")]
+            (IsaLevel::Avx2, 1) => avx2::avx2_f16::$op(as_typed_slice_mut!($c, half::f16), as_typed_slice!($bias, half::f16), $m, $n),
+            #[cfg(target_arch = "x86_64")]
+            (IsaLevel::Avx2, 2) => avx2::avx2_bf16::$op(as_typed_slice_mut!($c, half::bf16), as_typed_slice!($bias, half::bf16), $m, $n),
+            #[cfg(target_arch = "aarch64")]
+            (IsaLevel::Neon, 0) => neon::neon_f32::$op(as_typed_slice_mut!($c, f32), as_typed_slice!($bias, f32), $m, $n),
+            #[cfg(target_arch = "aarch64")]
+            (IsaLevel::Neon, 1) => neon::neon_f16::$op(as_typed_slice_mut!($c, half::f16), as_typed_slice!($bias, half::f16), $m, $n),
+            #[cfg(target_arch = "aarch64")]
+            (IsaLevel::Neon, 2) => neon::neon_bf16::$op(as_typed_slice_mut!($c, half::bf16), as_typed_slice!($bias, half::bf16), $m, $n),
+            (_, 0) => scalar::scalar_f32::$op(as_typed_slice_mut!($c, f32), as_typed_slice!($bias, f32), $m, $n),
+            (_, 1) => scalar::scalar_f16::$op(as_typed_slice_mut!($c, half::f16), as_typed_slice!($bias, half::f16), $m, $n),
+            (_, 2) => scalar::scalar_bf16::$op(as_typed_slice_mut!($c, half::bf16), as_typed_slice!($bias, half::bf16), $m, $n),
+            _ => unreachable!(),
+        }
+    };
+}
+
+/// Dispatch for embedding_lookup: table(read) + ids(&[u32]) + out(mut) + dim
+macro_rules! dispatch_embedding {
+    ($op:ident, $table:expr, $ids:expr, $out:expr, $dim:expr) => {
+        match (get_isa_level(), E::ELEM_ID) {
+            #[cfg(target_arch = "x86_64")]
+            (IsaLevel::Avx512, 0) => avx512::avx512_f32::$op(as_typed_slice!($table, f32), $ids, as_typed_slice_mut!($out, f32), $dim),
+            #[cfg(target_arch = "x86_64")]
+            (IsaLevel::Avx512, 1) => avx512::avx512_f16::$op(as_typed_slice!($table, half::f16), $ids, as_typed_slice_mut!($out, half::f16), $dim),
+            #[cfg(target_arch = "x86_64")]
+            (IsaLevel::Avx512, 2) => avx512::avx512_bf16::$op(as_typed_slice!($table, half::bf16), $ids, as_typed_slice_mut!($out, half::bf16), $dim),
+            #[cfg(target_arch = "x86_64")]
+            (IsaLevel::Avx2, 0) => avx2::avx2_f32::$op(as_typed_slice!($table, f32), $ids, as_typed_slice_mut!($out, f32), $dim),
+            #[cfg(target_arch = "x86_64")]
+            (IsaLevel::Avx2, 1) => avx2::avx2_f16::$op(as_typed_slice!($table, half::f16), $ids, as_typed_slice_mut!($out, half::f16), $dim),
+            #[cfg(target_arch = "x86_64")]
+            (IsaLevel::Avx2, 2) => avx2::avx2_bf16::$op(as_typed_slice!($table, half::bf16), $ids, as_typed_slice_mut!($out, half::bf16), $dim),
+            #[cfg(target_arch = "aarch64")]
+            (IsaLevel::Neon, 0) => neon::neon_f32::$op(as_typed_slice!($table, f32), $ids, as_typed_slice_mut!($out, f32), $dim),
+            #[cfg(target_arch = "aarch64")]
+            (IsaLevel::Neon, 1) => neon::neon_f16::$op(as_typed_slice!($table, half::f16), $ids, as_typed_slice_mut!($out, half::f16), $dim),
+            #[cfg(target_arch = "aarch64")]
+            (IsaLevel::Neon, 2) => neon::neon_bf16::$op(as_typed_slice!($table, half::bf16), $ids, as_typed_slice_mut!($out, half::bf16), $dim),
+            (_, 0) => scalar::scalar_f32::$op(as_typed_slice!($table, f32), $ids, as_typed_slice_mut!($out, f32), $dim),
+            (_, 1) => scalar::scalar_f16::$op(as_typed_slice!($table, half::f16), $ids, as_typed_slice_mut!($out, half::f16), $dim),
+            (_, 2) => scalar::scalar_bf16::$op(as_typed_slice!($table, half::bf16), $ids, as_typed_slice_mut!($out, half::bf16), $dim),
             _ => unreachable!(),
         }
     };
@@ -677,11 +883,7 @@ impl<E: Element> Kernels<E> for CpuKernels<E> {
     fn vec_mul(&self, a: &[E], b: &[E], out: &mut [E]) { dispatch_binary_op!(a, b, out, mul); }
 
     fn vec_dot(&self, a: &[E], b: &[E]) -> E {
-        let len = a.len();
-        assert!(b.len() == len);
-        let mut tmp = vec![E::ZERO; len];
-        self.vec_mul(a, b, &mut tmp);
-        self.vec_sum(&tmp)
+        E::from_f32(dispatch_dot_op!(a, b, dot))
     }
 
     fn vec_scale(&self, x: &mut [E], s: E) {
@@ -712,10 +914,7 @@ impl<E: Element> Kernels<E> for CpuKernels<E> {
     fn gemm_bias(&self, a: &[E], b: &[E], bias: &[E], c: &mut [E], m: usize, n: usize, k: usize) {
         self.gemm(a, b, c, m, n, k);
         assert!(c.len() == m * n && bias.len() == n);
-        for i in 0..m {
-            let row = &mut c[i*n..(i+1)*n];
-            self.vec_axpy(row, E::ONE, bias);
-        }
+        dispatch_bias_rows!(bias_rows, c, bias, m, n);
     }
 
     // Activations
@@ -727,10 +926,7 @@ impl<E: Element> Kernels<E> for CpuKernels<E> {
     fn softmax(&self, x: &[E], out: &mut [E]) { dispatch_unary_op!(x, out, softmax); }
 
     fn swiglu(&self, gate: &[E], up: &[E], out: &mut [E]) {
-        let len = gate.len();
-        let mut silu_out = vec![E::ZERO; len];
-        self.silu(gate, &mut silu_out);
-        self.vec_mul(&silu_out, up, out);
+        dispatch_binary_op!(gate, up, out, swiglu);
     }
 
     // Normalization
@@ -749,12 +945,7 @@ impl<E: Element> Kernels<E> for CpuKernels<E> {
 
     // Embedding
     fn embedding_lookup(&self, ids: &[u32], table: &[E], output: &mut [E], _vocab_size: usize, hidden_size: usize) {
-        match E::ELEM_ID {
-            0 => scalar::scalar_f32::embedding_lookup(as_typed_slice!(table, f32), ids, as_typed_slice_mut!(output, f32), hidden_size),
-            1 => scalar::scalar_f16::embedding_lookup(as_typed_slice!(table, half::f16), ids, as_typed_slice_mut!(output, half::f16), hidden_size),
-            2 => scalar::scalar_bf16::embedding_lookup(as_typed_slice!(table, half::bf16), ids, as_typed_slice_mut!(output, half::bf16), hidden_size),
-            _ => unreachable!(),
-        }
+        dispatch_embedding!(embedding_lookup, table, ids, output, hidden_size);
     }
 
     // Sampling
@@ -935,64 +1126,102 @@ impl<E: Element> Kernels<E> for CpuKernels<E> {
         self.swiglu(&gate_out, &up_out, &mut intermediate);
         let mut down_out = vec![E::ZERO; seq_len * hidden_size];
         self.gemm_q4(down, &intermediate, &mut down_out, down_scales, seq_len, hidden_size, ffn_dim);
-        for i in 0..seq_len * hidden_size {
-            output[i] = E::from_f32(down_out[i].to_f32() + residual[i].to_f32());
-        }
+        self.vec_add(&down_out, residual, output);
     }
 
     // ========================================================================
     // IQ Dequantization (ISA-dispatched via crate::quant_primitive!)
     // ========================================================================
 
-    // IQ scalar-only decode
-    define_quant_decode_scalar!(dequant_iq1_s, iq1_s, BlockIQ1S);
-    define_quant_decode_scalar!(dequant_iq1_m, iq1_m, BlockIQ1M);
-    define_quant_decode_scalar!(dequant_iq2_xxs, iq2_xxs, BlockIQ2XXS);
-    define_quant_decode_scalar!(dequant_iq2_xs, iq2_xs, BlockIQ2XS);
-    define_quant_decode_scalar!(dequant_iq2_s, iq2_s, BlockIQ2S);
-    define_quant_decode_scalar!(dequant_iq3_xxs, iq3_xxs, BlockIQ3XXS);
-    define_quant_decode_scalar!(dequant_iq3_s, iq3_s, BlockIQ3S);
-    define_quant_decode_scalar!(dequant_iq4_nl, iq4_nl, BlockIQ4NL);
-    define_quant_decode_scalar!(dequant_iq4_xs, iq4_xs, BlockIQ4XS);
+    // IQ decode: avx2 + scalar (avx512 falls through to avx2)
+    define_quant_decode_iq!(dequant_iq1_s, iq1_s, BlockIQ1S);
+    define_quant_decode_iq!(dequant_iq1_m, iq1_m, BlockIQ1M);
+    define_quant_decode_iq!(dequant_iq2_xxs, iq2_xxs, BlockIQ2XXS);
+    define_quant_decode_iq!(dequant_iq2_xs, iq2_xs, BlockIQ2XS);
+    define_quant_decode_iq!(dequant_iq2_s, iq2_s, BlockIQ2S);
+    define_quant_decode_iq!(dequant_iq3_xxs, iq3_xxs, BlockIQ3XXS);
+    define_quant_decode_iq!(dequant_iq3_s, iq3_s, BlockIQ3S);
+
+    // IQ4 decode: avx512 + avx2 + scalar (full x86 coverage)
+    define_quant_decode_iq4!(dequant_iq4_nl, iq4_nl, BlockIQ4NL);
+    define_quant_decode_iq4!(dequant_iq4_xs, iq4_xs, BlockIQ4XS);
 
     // ========================================================================
     // AWQ/GPTQ/Squeeze Dequantization + Dot
     // ========================================================================
 
     fn dequant_awq4(&self, packed: &[u8], zeros: &[u8], scales: &[half::f16], out: &mut [f32]) {
-        // AWQ4: group_size=128, dequantized[i] = (nibble - zeros[group]) * scales[group]
         let blk = unsafe { &*(packed.as_ptr() as *const crate::quant::BlockAWQ4) };
-        let group_size = 128usize;
-        for w in 0..32 {
-            let word = blk.qweight[w];
-            for nib in 0..8 {
-                let idx = w * 8 + nib;
-                let group = idx / group_size;
-                let q = ((word >> (nib * 4)) & 0xF) as f32;
-                let zero = if group < zeros.len() { zeros[group] as f32 } else { 8.0 };
-                let scale = if group < scales.len() { scales[group].to_f32() } else { blk.scales.to_f32() };
-                out[idx] = (q - zero) * scale;
+        if zeros.is_empty() && scales.is_empty() {
+            // Block-level scale only — use ISA-dispatched SIMD decode
+            let blk_ptr = blk as *const crate::quant::BlockAWQ4;
+            let dst = out.as_mut_ptr();
+            match get_isa_level() {
+                #[cfg(target_arch = "x86_64")]
+                IsaLevel::Avx512 => { crate::quant_primitive!(avx512, awq4, decode, blk_ptr, dst); }
+                #[cfg(target_arch = "x86_64")]
+                IsaLevel::Avx2 => { crate::quant_primitive!(avx2, awq4, decode, blk_ptr, dst); }
+                #[cfg(target_arch = "aarch64")]
+                IsaLevel::Neon => { crate::quant_primitive!(neon, awq4, decode, blk_ptr, dst); }
+                _ => { crate::quant_primitive!(scalar, awq4, decode, blk_ptr, dst); }
+            }
+        } else {
+            // Per-group zeros/scales — scalar path
+            let group_size = 128usize;
+            for w in 0..32 {
+                let word = blk.qweight[w];
+                for nib in 0..8 {
+                    let idx = w * 8 + nib;
+                    let group = idx / group_size;
+                    let q = ((word >> (nib * 4)) & 0xF) as f32;
+                    let zero = if group < zeros.len() { zeros[group] as f32 } else { 8.0 };
+                    let scale = if group < scales.len() { scales[group].to_f32() } else { blk.scales.to_f32() };
+                    out[idx] = (q - zero) * scale;
+                }
             }
         }
     }
     fn dequant_gptq4(&self, packed: &[u8], g_idx: &[i32], scales: &[half::f16], out: &mut [f32]) {
-        // GPTQ4: dequantized[i] = (nibble - 8) * scales[g_idx[i]]
         let blk = unsafe { &*(packed.as_ptr() as *const crate::quant::BlockGPTQ4) };
-        for w in 0..32 {
-            let word = blk.qweight[w];
-            for nib in 0..8 {
-                let idx = w * 8 + nib;
-                let q = ((word >> (nib * 4)) & 0xF) as f32;
-                let group = if idx < g_idx.len() { g_idx[idx] as usize } else { 0 };
-                let scale = if group < scales.len() { scales[group].to_f32() } else { blk.scales.to_f32() };
-                out[idx] = (q - 8.0) * scale;
+        if g_idx.is_empty() && scales.is_empty() {
+            // Block-level scale only — use ISA-dispatched SIMD decode
+            let blk_ptr = blk as *const crate::quant::BlockGPTQ4;
+            let dst = out.as_mut_ptr();
+            match get_isa_level() {
+                #[cfg(target_arch = "x86_64")]
+                IsaLevel::Avx512 => { crate::quant_primitive!(avx512, gptq4, decode, blk_ptr, dst); }
+                #[cfg(target_arch = "x86_64")]
+                IsaLevel::Avx2 => { crate::quant_primitive!(avx2, gptq4, decode, blk_ptr, dst); }
+                #[cfg(target_arch = "aarch64")]
+                IsaLevel::Neon => { crate::quant_primitive!(neon, gptq4, decode, blk_ptr, dst); }
+                _ => { crate::quant_primitive!(scalar, gptq4, decode, blk_ptr, dst); }
+            }
+        } else {
+            // Per-element g_idx — scalar path
+            for w in 0..32 {
+                let word = blk.qweight[w];
+                for nib in 0..8 {
+                    let idx = w * 8 + nib;
+                    let q = ((word >> (nib * 4)) & 0xF) as f32;
+                    let group = if idx < g_idx.len() { g_idx[idx] as usize } else { 0 };
+                    let scale = if group < scales.len() { scales[group].to_f32() } else { blk.scales.to_f32() };
+                    out[idx] = (q - 8.0) * scale;
+                }
             }
         }
     }
     fn dequant_squeeze(&self, block: &[u8], out: &mut [f32]) {
         let blk = block.as_ptr() as *const crate::quant::BlockSqueeze;
         let dst = out.as_mut_ptr();
-        crate::quant_primitive!(scalar, squeeze, decode, blk, dst);
+        match get_isa_level() {
+            #[cfg(target_arch = "x86_64")]
+            IsaLevel::Avx512 => { crate::quant_primitive!(avx512, squeeze, decode, blk, dst); }
+            #[cfg(target_arch = "x86_64")]
+            IsaLevel::Avx2 => { crate::quant_primitive!(avx2, squeeze, decode, blk, dst); }
+            #[cfg(target_arch = "aarch64")]
+            IsaLevel::Neon => { crate::quant_primitive!(neon, squeeze, decode, blk, dst); }
+            _ => { crate::quant_primitive!(scalar, squeeze, decode, blk, dst); }
+        }
     }
 
     // ========================================================================
@@ -1000,20 +1229,7 @@ impl<E: Element> Kernels<E> for CpuKernels<E> {
     // ========================================================================
 
     fn rope_with_pos(&self, qk: &mut [E], cos: &[E], sin: &[E], head_dim: usize, position: usize, _interleaved: bool) {
-        let half = head_dim / 2;
-        let seq_len = qk.len() / head_dim;
-        for pos in 0..seq_len {
-            let actual_pos = pos + position;
-            let base = pos * head_dim;
-            for i in 0..half {
-                let x0 = qk[base + i];
-                let x1 = qk[base + i + half];
-                let c = cos[actual_pos * half + i];
-                let s = sin[actual_pos * half + i];
-                qk[base + i] = E::from_f32(x0.to_f32() * c.to_f32() - x1.to_f32() * s.to_f32());
-                qk[base + i + half] = E::from_f32(x0.to_f32() * s.to_f32() + x1.to_f32() * c.to_f32());
-            }
-        }
+        dispatch_rope_with_pos!(rope_with_pos, qk, cos, sin, head_dim, position);
     }
 
     // ========================================================================
@@ -1021,26 +1237,31 @@ impl<E: Element> Kernels<E> for CpuKernels<E> {
     // ========================================================================
 
     fn gemv_q2(&self, weight: &[u8], input: &[E], scale: f32, n: usize) -> E {
-        let mut sum = 0.0f32;
+        // Dequantize 2-bit weights into f32 buffer, then SIMD dot
+        let mut dequant = vec![0.0f32; n];
         for i in 0..n {
             let byte_idx = i / 4;
             let shift = (i % 4) * 2;
             let q = ((weight[byte_idx] >> shift) & 0x03) as f32;
-            sum += (scale * (q - 1.5)) * input[i].to_f32();
+            dequant[i] = scale * (q - 1.5);
         }
-        E::from_f32(sum)
+        let mut in_f32 = vec![0.0f32; n];
+        for i in 0..n { in_f32[i] = input[i].to_f32(); }
+        E::from_f32(self.dot_f32(&dequant, &in_f32))
     }
 
     fn gemv_q1(&self, weight: &[u8], input: &[E], scale: f32, n: usize) -> E {
-        let mut sum = 0.0f32;
+        // Dequantize 1-bit weights into f32 buffer, then SIMD dot
+        let mut dequant = vec![0.0f32; n];
         for i in 0..n {
             let byte_idx = i / 8;
             let bit_idx = i % 8;
             let q = (weight[byte_idx] >> bit_idx) & 1;
-            let val = if q == 0 { -1.0f32 } else { 1.0f32 };
-            sum += (scale * val) * input[i].to_f32();
+            dequant[i] = if q == 0 { -scale } else { scale };
         }
-        E::from_f32(sum)
+        let mut in_f32 = vec![0.0f32; n];
+        for i in 0..n { in_f32[i] = input[i].to_f32(); }
+        E::from_f32(self.dot_f32(&dequant, &in_f32))
     }
 
     // ========================================================================
@@ -1061,9 +1282,7 @@ impl<E: Element> Kernels<E> for CpuKernels<E> {
         self.swiglu(&gate_out, &up_out, &mut intermediate);
         let mut down_out = vec![E::ZERO; seq_len * hidden_size];
         self.gemm(&intermediate, down_weight, &mut down_out, seq_len, hidden_size, ffn_dim);
-        for i in 0..output.len() {
-            output[i] = E::from_f32(down_out[i].to_f32() + residual[i].to_f32());
-        }
+        self.vec_add(&down_out, residual, output);
     }
 
     fn fused_linear_residual_rmsnorm(
@@ -1074,9 +1293,7 @@ impl<E: Element> Kernels<E> for CpuKernels<E> {
         let mut linear_out = vec![E::ZERO; seq_len * out_features];
         self.gemm(input, weight, &mut linear_out, seq_len, out_features, in_features);
         let mut with_residual = vec![E::ZERO; seq_len * out_features];
-        for i in 0..with_residual.len() {
-            with_residual[i] = E::from_f32(linear_out[i].to_f32() + residual[i].to_f32());
-        }
+        self.vec_add(&linear_out, residual, &mut with_residual);
         for s in 0..seq_len {
             let row = &with_residual[s * out_features..(s + 1) * out_features];
             let out_row = &mut output[s * out_features..(s + 1) * out_features];
@@ -1123,14 +1340,9 @@ impl<E: Element> Kernels<E> for CpuKernels<E> {
         seq_len: usize, in_features: usize, out_features: usize, eps: f32,
     ) {
         let mut linear_out = vec![E::ZERO; seq_len * out_features];
-        self.gemm(input, weight, &mut linear_out, seq_len, out_features, in_features);
+        self.gemm_bias(input, weight, bias, &mut linear_out, seq_len, out_features, in_features);
         let mut with_residual = vec![E::ZERO; seq_len * out_features];
-        for i in 0..with_residual.len() {
-            let s = i / out_features;
-            let j = i % out_features;
-            let _ = s;
-            with_residual[i] = E::from_f32(linear_out[i].to_f32() + bias[j].to_f32() + residual[i].to_f32());
-        }
+        self.vec_add(&linear_out, residual, &mut with_residual);
         for s in 0..seq_len {
             let row = &with_residual[s * out_features..(s + 1) * out_features];
             let out_row = &mut output[s * out_features..(s + 1) * out_features];
@@ -1186,7 +1398,7 @@ impl<E: Element> Kernels<E> for CpuKernels<E> {
             QuantType::IQ4XS => self.fused_dequant_gemv_inner::<136, 256>(weight_blocks, input, output, m, k, Self::dot_iq4_xs),
             QuantType::AWQ4 => self.fused_dequant_gemv_inner::<72, 128>(weight_blocks, input, output, m, k, Self::dot_awq4),
             QuantType::GPTQ4 => self.fused_dequant_gemv_inner::<72, 128>(weight_blocks, input, output, m, k, Self::dot_gptq4),
-            _ => unimplemented!("unsupported quant type for fused_dequant_gemv"),
+            QuantType::Squeeze => self.fused_dequant_gemv_inner::<130, 256>(weight_blocks, input, output, m, k, Self::dot_squeeze),
         }
     }
 
@@ -1198,9 +1410,7 @@ impl<E: Element> Kernels<E> for CpuKernels<E> {
         let mut linear_out = vec![E::ZERO; seq_len * out_features];
         self.gemm_q8(weight, input, &mut linear_out, scales, seq_len, out_features, in_features);
         let mut with_residual = vec![E::ZERO; seq_len * out_features];
-        for i in 0..with_residual.len() {
-            with_residual[i] = E::from_f32(linear_out[i].to_f32() + residual[i].to_f32());
-        }
+        self.vec_add(&linear_out, residual, &mut with_residual);
         for s in 0..seq_len {
             let row = &with_residual[s * out_features..(s + 1) * out_features];
             let out_row = &mut output[s * out_features..(s + 1) * out_features];
@@ -1216,9 +1426,7 @@ impl<E: Element> Kernels<E> for CpuKernels<E> {
         let mut linear_out = vec![E::ZERO; seq_len * out_features];
         self.gemm_q4(weight, input, &mut linear_out, scales, seq_len, out_features, in_features);
         let mut with_residual = vec![E::ZERO; seq_len * out_features];
-        for i in 0..with_residual.len() {
-            with_residual[i] = E::from_f32(linear_out[i].to_f32() + residual[i].to_f32());
-        }
+        self.vec_add(&linear_out, residual, &mut with_residual);
         for s in 0..seq_len {
             let row = &with_residual[s * out_features..(s + 1) * out_features];
             let out_row = &mut output[s * out_features..(s + 1) * out_features];
@@ -1272,15 +1480,15 @@ impl<E: Element> Kernels<E> for CpuKernels<E> {
         input: &[E], output: &mut [E],
         m: usize, n: usize, k: usize,
     ) {
-        // AWQ4: group_size=128, dequantized[i] = (nibble - zeros[group]) * scales[group]
+        // AWQ4: dequant row → f32 buffer, then SIMD dot with input column
         let group_size = 128usize;
         let num_groups_per_row = k / group_size;
-        // Pre-allocate column buffer once
         let mut in_f32_col = vec![0.0f32; k];
+        let mut dequant_row = vec![0.0f32; k];
         for j in 0..n {
             for p in 0..k { in_f32_col[p] = input[p * n + j].to_f32(); }
             for i in 0..m {
-                let mut sum = 0.0f32;
+                // Dequantize row i
                 let row_offset = i * k;
                 for idx in 0..k {
                     let byte_pos = row_offset / 2 + idx / 2;
@@ -1292,9 +1500,10 @@ impl<E: Element> Kernels<E> for CpuKernels<E> {
                     let group = (i * num_groups_per_row) + idx / group_size;
                     let zero = if group < zeros.len() { zeros[group] as f32 } else { 8.0 };
                     let scale = if group < scales.len() { scales[group].to_f32() } else { 1.0 };
-                    sum += (nibble - zero) * scale * in_f32_col[idx];
+                    dequant_row[idx] = (nibble - zero) * scale;
                 }
-                output[i * n + j] = E::from_f32(sum);
+                // SIMD dot product
+                output[i * n + j] = E::from_f32(self.dot_f32(&dequant_row, &in_f32_col));
             }
         }
     }
@@ -1304,12 +1513,12 @@ impl<E: Element> Kernels<E> for CpuKernels<E> {
         input: &[E], output: &mut [E],
         m: usize, n: usize, k: usize,
     ) {
-        // GPTQ4: dequantized[i] = (nibble - 8) * scales[g_idx[i]]
+        // GPTQ4: dequant row → f32 buffer, then SIMD dot with input column
         let mut in_f32_col = vec![0.0f32; k];
+        let mut dequant_row = vec![0.0f32; k];
         for j in 0..n {
             for p in 0..k { in_f32_col[p] = input[p * n + j].to_f32(); }
             for i in 0..m {
-                let mut sum = 0.0f32;
                 let row_offset = i * k;
                 for idx in 0..k {
                     let byte_pos = row_offset / 2 + idx / 2;
@@ -1320,9 +1529,9 @@ impl<E: Element> Kernels<E> for CpuKernels<E> {
                     };
                     let group = if idx < g_idx.len() { g_idx[idx] as usize } else { 0 };
                     let scale = if group < scales.len() { scales[group].to_f32() } else { 1.0 };
-                    sum += (nibble - 8.0) * scale * in_f32_col[idx];
+                    dequant_row[idx] = (nibble - 8.0) * scale;
                 }
-                output[i * n + j] = E::from_f32(sum);
+                output[i * n + j] = E::from_f32(self.dot_f32(&dequant_row, &in_f32_col));
             }
         }
     }
@@ -1344,7 +1553,15 @@ impl<E: Element> Kernels<E> for CpuKernels<E> {
                     let blk = &weight_blocks[off..off + block_bytes];
                     let blk_ptr = blk.as_ptr() as *const crate::quant::BlockSqueeze;
                     let src = in_f32_col[b * block_size..(b + 1) * block_size].as_ptr();
-                    sum += crate::quant_primitive!(scalar, squeeze, dot, blk_ptr, src);
+                    sum += match get_isa_level() {
+                        #[cfg(target_arch = "x86_64")]
+                        IsaLevel::Avx512 => crate::quant_primitive!(avx512, squeeze, dot, blk_ptr, src),
+                        #[cfg(target_arch = "x86_64")]
+                        IsaLevel::Avx2 => crate::quant_primitive!(avx2, squeeze, dot, blk_ptr, src),
+                        #[cfg(target_arch = "aarch64")]
+                        IsaLevel::Neon => crate::quant_primitive!(neon, squeeze, dot, blk_ptr, src),
+                        _ => crate::quant_primitive!(scalar, squeeze, dot, blk_ptr, src),
+                    };
                 }
                 output[i * n + j] = E::from_f32(sum);
             }
