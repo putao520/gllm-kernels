@@ -975,7 +975,7 @@ macro_rules! define_matmul_op {
             thread_local! { static WS: std::cell::Cell<Vec<$elem>> = std::cell::Cell::new(Vec::new()); }
             let mut packed_b = WS.with(|c| c.take());
             if packed_b.capacity() < total_packed { packed_b.reserve(total_packed - packed_b.len()); }
-            unsafe { packed_b.set_len(total_packed); std::ptr::write_bytes(packed_b.as_mut_ptr(), 0, total_packed); }
+            unsafe { packed_b.set_len(total_packed); }
 
             {
                 let mut k_start = 0usize;
@@ -1001,8 +1001,6 @@ macro_rules! define_matmul_op {
                 }
             }
 
-            // Zero C matrix — accumulation across chunks
-            for i in 0..c.len().min(m_size * n_size) { c[i] = <$elem as Element>::ZERO; }
             let c_ptr = c.as_mut_ptr();
 
             // Main loop: chunk → m → n (B stays hot in L1/L2)
@@ -1017,27 +1015,32 @@ macro_rules! define_matmul_op {
                     let mut strip_idx = 0;
                     while n + TILE_N <= n_size {
                         unsafe {
-                            // Load C tile from memory (accumulate across chunks)
-                            macro_rules! load_row {
-                                ($row:expr) => {(
-                                    $crate::simd_primitive!(avx512, $elem, loadu, c_ptr.add((m + $row) * n_size + n)),
-                                    $crate::simd_primitive!(avx512, $elem, loadu, c_ptr.add((m + $row) * n_size + n + LANES)),
-                                )};
+                            // Init C tile: zero on first chunk, load from memory on subsequent chunks
+                            macro_rules! init_row {
+                                ($row:expr) => {
+                                    if chunk == 0 {(
+                                        $crate::simd_primitive!(avx512, $elem, zero),
+                                        $crate::simd_primitive!(avx512, $elem, zero),
+                                    )} else {(
+                                        $crate::simd_primitive!(avx512, $elem, loadu, c_ptr.add((m + $row) * n_size + n)),
+                                        $crate::simd_primitive!(avx512, $elem, loadu, c_ptr.add((m + $row) * n_size + n + LANES)),
+                                    )}
+                                };
                             }
-                            let (mut c_0_0, mut c_0_1) = load_row!(0);
-                            let (mut c_1_0, mut c_1_1) = load_row!(1);
-                            let (mut c_2_0, mut c_2_1) = load_row!(2);
-                            let (mut c_3_0, mut c_3_1) = load_row!(3);
-                            let (mut c_4_0, mut c_4_1) = load_row!(4);
-                            let (mut c_5_0, mut c_5_1) = load_row!(5);
-                            let (mut c_6_0, mut c_6_1) = load_row!(6);
-                            let (mut c_7_0, mut c_7_1) = load_row!(7);
-                            let (mut c_8_0, mut c_8_1) = load_row!(8);
-                            let (mut c_9_0, mut c_9_1) = load_row!(9);
-                            let (mut c_10_0, mut c_10_1) = load_row!(10);
-                            let (mut c_11_0, mut c_11_1) = load_row!(11);
-                            let (mut c_12_0, mut c_12_1) = load_row!(12);
-                            let (mut c_13_0, mut c_13_1) = load_row!(13);
+                            let (mut c_0_0, mut c_0_1) = init_row!(0);
+                            let (mut c_1_0, mut c_1_1) = init_row!(1);
+                            let (mut c_2_0, mut c_2_1) = init_row!(2);
+                            let (mut c_3_0, mut c_3_1) = init_row!(3);
+                            let (mut c_4_0, mut c_4_1) = init_row!(4);
+                            let (mut c_5_0, mut c_5_1) = init_row!(5);
+                            let (mut c_6_0, mut c_6_1) = init_row!(6);
+                            let (mut c_7_0, mut c_7_1) = init_row!(7);
+                            let (mut c_8_0, mut c_8_1) = init_row!(8);
+                            let (mut c_9_0, mut c_9_1) = init_row!(9);
+                            let (mut c_10_0, mut c_10_1) = init_row!(10);
+                            let (mut c_11_0, mut c_11_1) = init_row!(11);
+                            let (mut c_12_0, mut c_12_1) = init_row!(12);
+                            let (mut c_13_0, mut c_13_1) = init_row!(13);
 
                             macro_rules! fma_row {
                                 ($a_base:expr, $vb0:ident, $vb1:ident, $row:expr, $c0:ident, $c1:ident) => {
@@ -1151,15 +1154,38 @@ macro_rules! define_matmul_op {
                     c[m * n_size + n] = sum;
                 }
             }
-            // Remainder M (scalar) — rows not covered by TILE_M
+            // Remainder M (SIMD 1×TILE_N) — rows not covered by TILE_M, using packed_b
             let m_main = (m_size / TILE_M) * TILE_M;
             for m in m_main..m_size {
-                for n in 0..n_main {
-                    let mut sum = <$elem as Element>::ZERO;
-                    for k in 0..k_size {
-                        sum = <$elem as Element>::mul_add(sum, a[m * k_size + k], b[k * n_size + n]);
+                let mut n = 0usize;
+                let mut strip_idx = 0usize;
+                while n + TILE_N <= n_size {
+                    unsafe {
+                        let mut c0 = $crate::simd_primitive!(avx512, $elem, zero);
+                        let mut c1 = $crate::simd_primitive!(avx512, $elem, zero);
+                        let mut a_col = a.as_ptr().add(m * k_size);
+                        let mut k_start = 0usize;
+                        let mut ci = 0usize;
+                        while k_start < k_size {
+                            let kc = KC.min(k_size - k_start);
+                            let mut b_ptr = packed_b.as_ptr().add(ci * chunk_size + strip_idx * KC * TILE_N);
+                            for _ki in 0..kc {
+                                let va = $crate::simd_primitive!(avx512, $elem, splat, *a_col);
+                                let vb0 = $crate::simd_primitive!(avx512, $elem, loadu, b_ptr);
+                                let vb1 = $crate::simd_primitive!(avx512, $elem, loadu, b_ptr.add(LANES));
+                                c0 = $crate::simd_primitive!(avx512, $elem, fma, va, vb0, c0);
+                                c1 = $crate::simd_primitive!(avx512, $elem, fma, va, vb1, c1);
+                                a_col = a_col.add(1);
+                                b_ptr = b_ptr.add(TILE_N);
+                            }
+                            k_start += kc; ci += 1;
+                            a_col = a.as_ptr().add(m * k_size + k_start);
+                        }
+                        $crate::simd_primitive!(avx512, $elem, storeu, c_ptr.add(m * n_size + n), c0);
+                        $crate::simd_primitive!(avx512, $elem, storeu, c_ptr.add(m * n_size + n + LANES), c1);
                     }
-                    c[m * n_size + n] = sum;
+                    n += TILE_N;
+                    strip_idx += 1;
                 }
             }
             WS.with(|c| c.set(packed_b));
@@ -1193,7 +1219,7 @@ macro_rules! define_matmul_op {
             thread_local! { static WS: std::cell::Cell<Vec<$elem>> = std::cell::Cell::new(Vec::new()); }
             let mut packed_b = WS.with(|c| c.take());
             if packed_b.capacity() < total_packed { packed_b.reserve(total_packed - packed_b.len()); }
-            unsafe { packed_b.set_len(total_packed); std::ptr::write_bytes(packed_b.as_mut_ptr(), 0, total_packed); }
+            unsafe { packed_b.set_len(total_packed); }
 
             {
                 let mut k_start = 0usize;
@@ -1371,15 +1397,39 @@ macro_rules! define_matmul_op {
                     c[m * n_size + n] = sum;
                 }
             }
-            // Remainder M (scalar) — rows not covered by TILE_M
+            // Remainder M (SIMD 1×TILE_N with bias) — rows not covered by TILE_M, using packed_b
             let m_main = (m_size / TILE_M) * TILE_M;
             for m in m_main..m_size {
-                for n in 0..n_main {
-                    let mut sum = bias[n];
-                    for k in 0..k_size {
-                        sum = <$elem as Element>::mul_add(sum, a[m * k_size + k], b[k * n_size + n]);
+                let mut n = 0usize;
+                let mut strip_idx = 0usize;
+                while n + TILE_N <= n_size {
+                    unsafe {
+                        let bias_ptr = bias.as_ptr().add(n);
+                        let mut c0 = $crate::simd_primitive!(avx512, $elem, loadu, bias_ptr);
+                        let mut c1 = $crate::simd_primitive!(avx512, $elem, loadu, bias_ptr.add(LANES));
+                        let mut a_col = a.as_ptr().add(m * k_size);
+                        let mut k_start = 0usize;
+                        let mut ci = 0usize;
+                        while k_start < k_size {
+                            let kc = KC.min(k_size - k_start);
+                            let mut b_ptr = packed_b.as_ptr().add(ci * chunk_size + strip_idx * KC * TILE_N);
+                            for _ki in 0..kc {
+                                let va = $crate::simd_primitive!(avx512, $elem, splat, *a_col);
+                                let vb0 = $crate::simd_primitive!(avx512, $elem, loadu, b_ptr);
+                                let vb1 = $crate::simd_primitive!(avx512, $elem, loadu, b_ptr.add(LANES));
+                                c0 = $crate::simd_primitive!(avx512, $elem, fma, va, vb0, c0);
+                                c1 = $crate::simd_primitive!(avx512, $elem, fma, va, vb1, c1);
+                                a_col = a_col.add(1);
+                                b_ptr = b_ptr.add(TILE_N);
+                            }
+                            k_start += kc; ci += 1;
+                            a_col = a.as_ptr().add(m * k_size + k_start);
+                        }
+                        $crate::simd_primitive!(avx512, $elem, storeu, c_ptr.add(m * n_size + n), c0);
+                        $crate::simd_primitive!(avx512, $elem, storeu, c_ptr.add(m * n_size + n + LANES), c1);
                     }
-                    c[m * n_size + n] = sum;
+                    n += TILE_N;
+                    strip_idx += 1;
                 }
             }
             WS.with(|c| c.set(packed_b));
@@ -1447,8 +1497,6 @@ macro_rules! define_matmul_op {
             let n_strips = (n_size + TILE_N - 1) / TILE_N;
             let chunk_size = n_strips * KC * TILE_N;
 
-            // Zero C matrix — accumulation across chunks
-            for i in 0..c.len().min(m_size * n_size) { c[i] = <$elem as Element>::ZERO; }
             let c_ptr = c.as_mut_ptr();
 
             // Main loop: chunk → m → n (B stays hot in L1/L2)
@@ -1463,27 +1511,32 @@ macro_rules! define_matmul_op {
                     let mut strip_idx = 0;
                     while n + TILE_N <= n_size {
                         unsafe {
-                            // Load C tile from memory (accumulate across chunks)
-                            macro_rules! load_row {
-                                ($row:expr) => {(
-                                    $crate::simd_primitive!(avx512, $elem, loadu, c_ptr.add((m + $row) * n_size + n)),
-                                    $crate::simd_primitive!(avx512, $elem, loadu, c_ptr.add((m + $row) * n_size + n + LANES)),
-                                )};
+                            // Init C tile: zero on first chunk, load from memory on subsequent chunks
+                            macro_rules! init_row {
+                                ($row:expr) => {
+                                    if chunk == 0 {(
+                                        $crate::simd_primitive!(avx512, $elem, zero),
+                                        $crate::simd_primitive!(avx512, $elem, zero),
+                                    )} else {(
+                                        $crate::simd_primitive!(avx512, $elem, loadu, c_ptr.add((m + $row) * n_size + n)),
+                                        $crate::simd_primitive!(avx512, $elem, loadu, c_ptr.add((m + $row) * n_size + n + LANES)),
+                                    )}
+                                };
                             }
-                            let (mut c_0_0, mut c_0_1) = load_row!(0);
-                            let (mut c_1_0, mut c_1_1) = load_row!(1);
-                            let (mut c_2_0, mut c_2_1) = load_row!(2);
-                            let (mut c_3_0, mut c_3_1) = load_row!(3);
-                            let (mut c_4_0, mut c_4_1) = load_row!(4);
-                            let (mut c_5_0, mut c_5_1) = load_row!(5);
-                            let (mut c_6_0, mut c_6_1) = load_row!(6);
-                            let (mut c_7_0, mut c_7_1) = load_row!(7);
-                            let (mut c_8_0, mut c_8_1) = load_row!(8);
-                            let (mut c_9_0, mut c_9_1) = load_row!(9);
-                            let (mut c_10_0, mut c_10_1) = load_row!(10);
-                            let (mut c_11_0, mut c_11_1) = load_row!(11);
-                            let (mut c_12_0, mut c_12_1) = load_row!(12);
-                            let (mut c_13_0, mut c_13_1) = load_row!(13);
+                            let (mut c_0_0, mut c_0_1) = init_row!(0);
+                            let (mut c_1_0, mut c_1_1) = init_row!(1);
+                            let (mut c_2_0, mut c_2_1) = init_row!(2);
+                            let (mut c_3_0, mut c_3_1) = init_row!(3);
+                            let (mut c_4_0, mut c_4_1) = init_row!(4);
+                            let (mut c_5_0, mut c_5_1) = init_row!(5);
+                            let (mut c_6_0, mut c_6_1) = init_row!(6);
+                            let (mut c_7_0, mut c_7_1) = init_row!(7);
+                            let (mut c_8_0, mut c_8_1) = init_row!(8);
+                            let (mut c_9_0, mut c_9_1) = init_row!(9);
+                            let (mut c_10_0, mut c_10_1) = init_row!(10);
+                            let (mut c_11_0, mut c_11_1) = init_row!(11);
+                            let (mut c_12_0, mut c_12_1) = init_row!(12);
+                            let (mut c_13_0, mut c_13_1) = init_row!(13);
 
                             macro_rules! fma_row {
                                 ($a_base:expr, $vb0:ident, $vb1:ident, $row:expr, $c0:ident, $c1:ident) => {
@@ -1591,23 +1644,52 @@ macro_rules! define_matmul_op {
             for m in 0..m_size {
                 for n in n_main..n_size {
                     let mut sum = <$elem as Element>::ZERO;
-                    for k in 0..k_size {
-                        let chunk_idx = k / KC; let k_in_chunk = k % KC;
-                        sum = <$elem as Element>::mul_add(sum, a[m * k_size + k], packed_b[chunk_idx * chunk_size + (n / TILE_N) * KC * TILE_N + k_in_chunk * TILE_N + (n % TILE_N)]);
-                    }
+                    let strip_off = (n / TILE_N) * KC * TILE_N;
+                    let n_off = n % TILE_N;
+                    { let mut k = 0usize; let mut ci = 0usize;
+                    while k < k_size {
+                        let kc = KC.min(k_size - k);
+                        let base = ci * chunk_size + strip_off;
+                        for ki in 0..kc {
+                            sum = <$elem as Element>::mul_add(sum, a[m * k_size + k + ki], packed_b[base + ki * TILE_N + n_off]);
+                        }
+                        k += kc; ci += 1;
+                    }}
                     c[m * n_size + n] = sum;
                 }
             }
-            // Remainder M (scalar) — rows not covered by TILE_M
+            // Remainder M (SIMD 1×TILE_N) — rows not covered by TILE_M
             let m_main = (m_size / TILE_M) * TILE_M;
             for m in m_main..m_size {
-                for n in 0..n_main {
-                    let mut sum = <$elem as Element>::ZERO;
-                    for k in 0..k_size {
-                        let chunk_idx = k / KC; let k_in_chunk = k % KC;
-                        sum = <$elem as Element>::mul_add(sum, a[m * k_size + k], packed_b[chunk_idx * chunk_size + (n / TILE_N) * KC * TILE_N + k_in_chunk * TILE_N + (n % TILE_N)]);
+                let mut n = 0usize;
+                let mut strip_idx = 0usize;
+                while n + TILE_N <= n_size {
+                    unsafe {
+                        let mut c0 = $crate::simd_primitive!(avx512, $elem, zero);
+                        let mut c1 = $crate::simd_primitive!(avx512, $elem, zero);
+                        let mut a_col = a.as_ptr().add(m * k_size);
+                        let mut k_start = 0usize;
+                        let mut ci = 0usize;
+                        while k_start < k_size {
+                            let kc = KC.min(k_size - k_start);
+                            let mut b_ptr = packed_b.as_ptr().add(ci * chunk_size + strip_idx * KC * TILE_N);
+                            for _ki in 0..kc {
+                                let va = $crate::simd_primitive!(avx512, $elem, splat, *a_col);
+                                let vb0 = $crate::simd_primitive!(avx512, $elem, loadu, b_ptr);
+                                let vb1 = $crate::simd_primitive!(avx512, $elem, loadu, b_ptr.add(LANES));
+                                c0 = $crate::simd_primitive!(avx512, $elem, fma, va, vb0, c0);
+                                c1 = $crate::simd_primitive!(avx512, $elem, fma, va, vb1, c1);
+                                a_col = a_col.add(1);
+                                b_ptr = b_ptr.add(TILE_N);
+                            }
+                            k_start += kc; ci += 1;
+                            a_col = a.as_ptr().add(m * k_size + k_start);
+                        }
+                        $crate::simd_primitive!(avx512, $elem, storeu, c_ptr.add(m * n_size + n), c0);
+                        $crate::simd_primitive!(avx512, $elem, storeu, c_ptr.add(m * n_size + n + LANES), c1);
                     }
-                    c[m * n_size + n] = sum;
+                    n += TILE_N;
+                    strip_idx += 1;
                 }
             }
         }
@@ -1779,23 +1861,53 @@ macro_rules! define_matmul_op {
             for m in 0..m_size {
                 for n in n_main..n_size {
                     let mut sum = bias[n];
-                    for k in 0..k_size {
-                        let chunk_idx = k / KC; let k_in_chunk = k % KC;
-                        sum = <$elem as Element>::mul_add(sum, a[m * k_size + k], packed_b[chunk_idx * chunk_size + (n / TILE_N) * KC * TILE_N + k_in_chunk * TILE_N + (n % TILE_N)]);
-                    }
+                    let strip_off = (n / TILE_N) * KC * TILE_N;
+                    let n_off = n % TILE_N;
+                    { let mut k = 0usize; let mut ci = 0usize;
+                    while k < k_size {
+                        let kc = KC.min(k_size - k);
+                        let base = ci * chunk_size + strip_off;
+                        for ki in 0..kc {
+                            sum = <$elem as Element>::mul_add(sum, a[m * k_size + k + ki], packed_b[base + ki * TILE_N + n_off]);
+                        }
+                        k += kc; ci += 1;
+                    }}
                     c[m * n_size + n] = sum;
                 }
             }
-            // Remainder M (scalar) — rows not covered by TILE_M
+            // Remainder M (SIMD 1×TILE_N with bias) — rows not covered by TILE_M
             let m_main = (m_size / TILE_M) * TILE_M;
             for m in m_main..m_size {
-                for n in 0..n_main {
-                    let mut sum = bias[n];
-                    for k in 0..k_size {
-                        let chunk_idx = k / KC; let k_in_chunk = k % KC;
-                        sum = <$elem as Element>::mul_add(sum, a[m * k_size + k], packed_b[chunk_idx * chunk_size + (n / TILE_N) * KC * TILE_N + k_in_chunk * TILE_N + (n % TILE_N)]);
+                let mut n = 0usize;
+                let mut strip_idx = 0usize;
+                while n + TILE_N <= n_size {
+                    unsafe {
+                        let bias_ptr = bias.as_ptr().add(n);
+                        let mut c0 = $crate::simd_primitive!(avx512, $elem, loadu, bias_ptr);
+                        let mut c1 = $crate::simd_primitive!(avx512, $elem, loadu, bias_ptr.add(LANES));
+                        let mut a_col = a.as_ptr().add(m * k_size);
+                        let mut k_start = 0usize;
+                        let mut ci = 0usize;
+                        while k_start < k_size {
+                            let kc = KC.min(k_size - k_start);
+                            let mut b_ptr = packed_b.as_ptr().add(ci * chunk_size + strip_idx * KC * TILE_N);
+                            for _ki in 0..kc {
+                                let va = $crate::simd_primitive!(avx512, $elem, splat, *a_col);
+                                let vb0 = $crate::simd_primitive!(avx512, $elem, loadu, b_ptr);
+                                let vb1 = $crate::simd_primitive!(avx512, $elem, loadu, b_ptr.add(LANES));
+                                c0 = $crate::simd_primitive!(avx512, $elem, fma, va, vb0, c0);
+                                c1 = $crate::simd_primitive!(avx512, $elem, fma, va, vb1, c1);
+                                a_col = a_col.add(1);
+                                b_ptr = b_ptr.add(TILE_N);
+                            }
+                            k_start += kc; ci += 1;
+                            a_col = a.as_ptr().add(m * k_size + k_start);
+                        }
+                        $crate::simd_primitive!(avx512, $elem, storeu, c_ptr.add(m * n_size + n), c0);
+                        $crate::simd_primitive!(avx512, $elem, storeu, c_ptr.add(m * n_size + n + LANES), c1);
                     }
-                    c[m * n_size + n] = sum;
+                    n += TILE_N;
+                    strip_idx += 1;
                 }
             }
         }
@@ -1830,7 +1942,7 @@ macro_rules! define_matmul_op {
             thread_local! { static WS: std::cell::Cell<Vec<$elem>> = std::cell::Cell::new(Vec::new()); }
             let mut packed_b = WS.with(|c| c.take());
             if packed_b.capacity() < total_packed { packed_b.reserve(total_packed - packed_b.len()); }
-            unsafe { packed_b.set_len(total_packed); std::ptr::write_bytes(packed_b.as_mut_ptr(), 0, total_packed); }
+            unsafe { packed_b.set_len(total_packed); }
 
             {
                 let mut k_start = 0usize;
@@ -1856,9 +1968,6 @@ macro_rules! define_matmul_op {
                 }
             }
 
-            // Zero C matrix — accumulation across chunks
-            for i in 0..c.len().min(m_size * n_size) { c[i] = <$elem as Element>::ZERO; }
-
             // Main loop: chunk → m → n (B stays hot in L1/L2)
             let c_ptr = c.as_mut_ptr();
             let mut k_start = 0usize;
@@ -1872,19 +1981,24 @@ macro_rules! define_matmul_op {
                     let mut strip_idx = 0;
                     while n + TILE_N <= n_size {
                         unsafe {
-                            // Load C tile from memory (accumulate across chunks)
-                            macro_rules! load_row {
-                                ($row:expr) => {(
-                                    $crate::simd_primitive!(avx2, $elem, loadu, c_ptr.add((m + $row) * n_size + n)),
-                                    $crate::simd_primitive!(avx2, $elem, loadu, c_ptr.add((m + $row) * n_size + n + LANES)),
-                                )};
+                            // Init C tile: zero on first chunk, load from memory on subsequent chunks
+                            macro_rules! init_row {
+                                ($row:expr) => {
+                                    if chunk == 0 {(
+                                        $crate::simd_primitive!(avx2, $elem, zero),
+                                        $crate::simd_primitive!(avx2, $elem, zero),
+                                    )} else {(
+                                        $crate::simd_primitive!(avx2, $elem, loadu, c_ptr.add((m + $row) * n_size + n)),
+                                        $crate::simd_primitive!(avx2, $elem, loadu, c_ptr.add((m + $row) * n_size + n + LANES)),
+                                    )}
+                                };
                             }
-                            let (mut c_0_0, mut c_0_1) = load_row!(0);
-                            let (mut c_1_0, mut c_1_1) = load_row!(1);
-                            let (mut c_2_0, mut c_2_1) = load_row!(2);
-                            let (mut c_3_0, mut c_3_1) = load_row!(3);
-                            let (mut c_4_0, mut c_4_1) = load_row!(4);
-                            let (mut c_5_0, mut c_5_1) = load_row!(5);
+                            let (mut c_0_0, mut c_0_1) = init_row!(0);
+                            let (mut c_1_0, mut c_1_1) = init_row!(1);
+                            let (mut c_2_0, mut c_2_1) = init_row!(2);
+                            let (mut c_3_0, mut c_3_1) = init_row!(3);
+                            let (mut c_4_0, mut c_4_1) = init_row!(4);
+                            let (mut c_5_0, mut c_5_1) = init_row!(5);
 
                             macro_rules! fma_row {
                                 ($a_base:expr, $vb0:ident, $vb1:ident, $row:expr, $c0:ident, $c1:ident) => {
@@ -1987,15 +2101,38 @@ macro_rules! define_matmul_op {
                     c[m * n_size + n] = sum;
                 }
             }
-            // Remainder M (scalar) — rows not covered by TILE_M
+            // Remainder M (SIMD 1×TILE_N) — rows not covered by TILE_M, using packed_b
             let m_main = (m_size / TILE_M) * TILE_M;
             for m in m_main..m_size {
-                for n in 0..n_main {
-                    let mut sum = <$elem as Element>::ZERO;
-                    for k in 0..k_size {
-                        sum = <$elem as Element>::mul_add(sum, a[m * k_size + k], b[k * n_size + n]);
+                let mut n = 0usize;
+                let mut strip_idx = 0usize;
+                while n + TILE_N <= n_size {
+                    unsafe {
+                        let mut c0 = $crate::simd_primitive!(avx2, $elem, zero);
+                        let mut c1 = $crate::simd_primitive!(avx2, $elem, zero);
+                        let mut a_col = a.as_ptr().add(m * k_size);
+                        let mut k_start = 0usize;
+                        let mut ci = 0usize;
+                        while k_start < k_size {
+                            let kc = KC.min(k_size - k_start);
+                            let mut b_ptr = packed_b.as_ptr().add(ci * chunk_size + strip_idx * KC * TILE_N);
+                            for _ki in 0..kc {
+                                let va = $crate::simd_primitive!(avx2, $elem, splat, *a_col);
+                                let vb0 = $crate::simd_primitive!(avx2, $elem, loadu, b_ptr);
+                                let vb1 = $crate::simd_primitive!(avx2, $elem, loadu, b_ptr.add(LANES));
+                                c0 = $crate::simd_primitive!(avx2, $elem, fma, va, vb0, c0);
+                                c1 = $crate::simd_primitive!(avx2, $elem, fma, va, vb1, c1);
+                                a_col = a_col.add(1);
+                                b_ptr = b_ptr.add(TILE_N);
+                            }
+                            k_start += kc; ci += 1;
+                            a_col = a.as_ptr().add(m * k_size + k_start);
+                        }
+                        $crate::simd_primitive!(avx2, $elem, storeu, c_ptr.add(m * n_size + n), c0);
+                        $crate::simd_primitive!(avx2, $elem, storeu, c_ptr.add(m * n_size + n + LANES), c1);
                     }
-                    c[m * n_size + n] = sum;
+                    n += TILE_N;
+                    strip_idx += 1;
                 }
             }
             WS.with(|c| c.set(packed_b));
@@ -2028,7 +2165,7 @@ macro_rules! define_matmul_op {
             thread_local! { static WS: std::cell::Cell<Vec<$elem>> = std::cell::Cell::new(Vec::new()); }
             let mut packed_b = WS.with(|c| c.take());
             if packed_b.capacity() < total_packed { packed_b.reserve(total_packed - packed_b.len()); }
-            unsafe { packed_b.set_len(total_packed); std::ptr::write_bytes(packed_b.as_mut_ptr(), 0, total_packed); }
+            unsafe { packed_b.set_len(total_packed); }
 
             {
                 let mut k_start = 0usize;
@@ -2185,15 +2322,39 @@ macro_rules! define_matmul_op {
                     c[m * n_size + n] = sum;
                 }
             }
-            // Remainder M (scalar with bias) — only columns already handled by SIMD
+            // Remainder M (SIMD 1×TILE_N with bias) — rows not covered by TILE_M, using packed_b
             let m_main = (m_size / TILE_M) * TILE_M;
             for m in m_main..m_size {
-                for n in 0..n_main {
-                    let mut sum = bias[n];
-                    for k in 0..k_size {
-                        sum = <$elem as Element>::mul_add(sum, a[m * k_size + k], b[k * n_size + n]);
+                let mut n = 0usize;
+                let mut strip_idx = 0usize;
+                while n + TILE_N <= n_size {
+                    unsafe {
+                        let bias_ptr = bias.as_ptr().add(n);
+                        let mut c0 = $crate::simd_primitive!(avx2, $elem, loadu, bias_ptr);
+                        let mut c1 = $crate::simd_primitive!(avx2, $elem, loadu, bias_ptr.add(LANES));
+                        let mut a_col = a.as_ptr().add(m * k_size);
+                        let mut k_start = 0usize;
+                        let mut ci = 0usize;
+                        while k_start < k_size {
+                            let kc = KC.min(k_size - k_start);
+                            let mut b_ptr = packed_b.as_ptr().add(ci * chunk_size + strip_idx * KC * TILE_N);
+                            for _ki in 0..kc {
+                                let va = $crate::simd_primitive!(avx2, $elem, splat, *a_col);
+                                let vb0 = $crate::simd_primitive!(avx2, $elem, loadu, b_ptr);
+                                let vb1 = $crate::simd_primitive!(avx2, $elem, loadu, b_ptr.add(LANES));
+                                c0 = $crate::simd_primitive!(avx2, $elem, fma, va, vb0, c0);
+                                c1 = $crate::simd_primitive!(avx2, $elem, fma, va, vb1, c1);
+                                a_col = a_col.add(1);
+                                b_ptr = b_ptr.add(TILE_N);
+                            }
+                            k_start += kc; ci += 1;
+                            a_col = a.as_ptr().add(m * k_size + k_start);
+                        }
+                        $crate::simd_primitive!(avx2, $elem, storeu, c_ptr.add(m * n_size + n), c0);
+                        $crate::simd_primitive!(avx2, $elem, storeu, c_ptr.add(m * n_size + n + LANES), c1);
                     }
-                    c[m * n_size + n] = sum;
+                    n += TILE_N;
+                    strip_idx += 1;
                 }
             }
             WS.with(|c| c.set(packed_b));
@@ -2256,8 +2417,6 @@ macro_rules! define_matmul_op {
             let n_strips = (n_size + TILE_N - 1) / TILE_N;
             let chunk_size = n_strips * KC * TILE_N;
 
-            // Zero C matrix — accumulation across chunks
-            for i in 0..c.len().min(m_size * n_size) { c[i] = <$elem as Element>::ZERO; }
             let c_ptr = c.as_mut_ptr();
 
             // Main loop: chunk → m → n (B stays hot in L1/L2)
@@ -2272,19 +2431,24 @@ macro_rules! define_matmul_op {
                     let mut strip_idx = 0;
                     while n + TILE_N <= n_size {
                         unsafe {
-                            // Load C tile from memory (accumulate across chunks)
-                            macro_rules! load_row {
-                                ($row:expr) => {(
-                                    $crate::simd_primitive!(avx2, $elem, loadu, c_ptr.add((m + $row) * n_size + n)),
-                                    $crate::simd_primitive!(avx2, $elem, loadu, c_ptr.add((m + $row) * n_size + n + LANES)),
-                                )};
+                            // Init C tile: zero on first chunk, load from memory on subsequent chunks
+                            macro_rules! init_row {
+                                ($row:expr) => {
+                                    if chunk == 0 {(
+                                        $crate::simd_primitive!(avx2, $elem, zero),
+                                        $crate::simd_primitive!(avx2, $elem, zero),
+                                    )} else {(
+                                        $crate::simd_primitive!(avx2, $elem, loadu, c_ptr.add((m + $row) * n_size + n)),
+                                        $crate::simd_primitive!(avx2, $elem, loadu, c_ptr.add((m + $row) * n_size + n + LANES)),
+                                    )}
+                                };
                             }
-                            let (mut c_0_0, mut c_0_1) = load_row!(0);
-                            let (mut c_1_0, mut c_1_1) = load_row!(1);
-                            let (mut c_2_0, mut c_2_1) = load_row!(2);
-                            let (mut c_3_0, mut c_3_1) = load_row!(3);
-                            let (mut c_4_0, mut c_4_1) = load_row!(4);
-                            let (mut c_5_0, mut c_5_1) = load_row!(5);
+                            let (mut c_0_0, mut c_0_1) = init_row!(0);
+                            let (mut c_1_0, mut c_1_1) = init_row!(1);
+                            let (mut c_2_0, mut c_2_1) = init_row!(2);
+                            let (mut c_3_0, mut c_3_1) = init_row!(3);
+                            let (mut c_4_0, mut c_4_1) = init_row!(4);
+                            let (mut c_5_0, mut c_5_1) = init_row!(5);
 
                             macro_rules! fma_row {
                                 ($a_base:expr, $vb0:ident, $vb1:ident, $row:expr, $c0:ident, $c1:ident) => {
@@ -2380,23 +2544,52 @@ macro_rules! define_matmul_op {
             for m in 0..m_size {
                 for n in n_main..n_size {
                     let mut sum = <$elem as Element>::ZERO;
-                    for k in 0..k_size {
-                        let chunk_idx = k / KC; let k_in_chunk = k % KC;
-                        sum = <$elem as Element>::mul_add(sum, a[m * k_size + k], packed_b[chunk_idx * chunk_size + (n / TILE_N) * KC * TILE_N + k_in_chunk * TILE_N + (n % TILE_N)]);
-                    }
+                    let strip_off = (n / TILE_N) * KC * TILE_N;
+                    let n_off = n % TILE_N;
+                    { let mut k = 0usize; let mut ci = 0usize;
+                    while k < k_size {
+                        let kc = KC.min(k_size - k);
+                        let base = ci * chunk_size + strip_off;
+                        for ki in 0..kc {
+                            sum = <$elem as Element>::mul_add(sum, a[m * k_size + k + ki], packed_b[base + ki * TILE_N + n_off]);
+                        }
+                        k += kc; ci += 1;
+                    }}
                     c[m * n_size + n] = sum;
                 }
             }
-            // Remainder M (scalar) — rows not covered by TILE_M
+            // Remainder M (SIMD 1×TILE_N) — rows not covered by TILE_M
             let m_main = (m_size / TILE_M) * TILE_M;
             for m in m_main..m_size {
-                for n in 0..n_main {
-                    let mut sum = <$elem as Element>::ZERO;
-                    for k in 0..k_size {
-                        let chunk_idx = k / KC; let k_in_chunk = k % KC;
-                        sum = <$elem as Element>::mul_add(sum, a[m * k_size + k], packed_b[chunk_idx * chunk_size + (n / TILE_N) * KC * TILE_N + k_in_chunk * TILE_N + (n % TILE_N)]);
+                let mut n = 0usize;
+                let mut strip_idx = 0usize;
+                while n + TILE_N <= n_size {
+                    unsafe {
+                        let mut c0 = $crate::simd_primitive!(avx2, $elem, zero);
+                        let mut c1 = $crate::simd_primitive!(avx2, $elem, zero);
+                        let mut a_col = a.as_ptr().add(m * k_size);
+                        let mut k_start = 0usize;
+                        let mut ci = 0usize;
+                        while k_start < k_size {
+                            let kc = KC.min(k_size - k_start);
+                            let mut b_ptr = packed_b.as_ptr().add(ci * chunk_size + strip_idx * KC * TILE_N);
+                            for _ki in 0..kc {
+                                let va = $crate::simd_primitive!(avx2, $elem, splat, *a_col);
+                                let vb0 = $crate::simd_primitive!(avx2, $elem, loadu, b_ptr);
+                                let vb1 = $crate::simd_primitive!(avx2, $elem, loadu, b_ptr.add(LANES));
+                                c0 = $crate::simd_primitive!(avx2, $elem, fma, va, vb0, c0);
+                                c1 = $crate::simd_primitive!(avx2, $elem, fma, va, vb1, c1);
+                                a_col = a_col.add(1);
+                                b_ptr = b_ptr.add(TILE_N);
+                            }
+                            k_start += kc; ci += 1;
+                            a_col = a.as_ptr().add(m * k_size + k_start);
+                        }
+                        $crate::simd_primitive!(avx2, $elem, storeu, c_ptr.add(m * n_size + n), c0);
+                        $crate::simd_primitive!(avx2, $elem, storeu, c_ptr.add(m * n_size + n + LANES), c1);
                     }
-                    c[m * n_size + n] = sum;
+                    n += TILE_N;
+                    strip_idx += 1;
                 }
             }
         }
@@ -2547,23 +2740,53 @@ macro_rules! define_matmul_op {
             for m in 0..m_size {
                 for n in n_main..n_size {
                     let mut sum = bias[n];
-                    for k in 0..k_size {
-                        let chunk_idx = k / KC; let k_in_chunk = k % KC;
-                        sum = <$elem as Element>::mul_add(sum, a[m * k_size + k], packed_b[chunk_idx * chunk_size + (n / TILE_N) * KC * TILE_N + k_in_chunk * TILE_N + (n % TILE_N)]);
-                    }
+                    let strip_off = (n / TILE_N) * KC * TILE_N;
+                    let n_off = n % TILE_N;
+                    { let mut k = 0usize; let mut ci = 0usize;
+                    while k < k_size {
+                        let kc = KC.min(k_size - k);
+                        let base = ci * chunk_size + strip_off;
+                        for ki in 0..kc {
+                            sum = <$elem as Element>::mul_add(sum, a[m * k_size + k + ki], packed_b[base + ki * TILE_N + n_off]);
+                        }
+                        k += kc; ci += 1;
+                    }}
                     c[m * n_size + n] = sum;
                 }
             }
-            // Remainder M (scalar) — rows not covered by TILE_M
+            // Remainder M (SIMD 1×TILE_N with bias) — rows not covered by TILE_M
             let m_main = (m_size / TILE_M) * TILE_M;
             for m in m_main..m_size {
-                for n in 0..n_main {
-                    let mut sum = bias[n];
-                    for k in 0..k_size {
-                        let chunk_idx = k / KC; let k_in_chunk = k % KC;
-                        sum = <$elem as Element>::mul_add(sum, a[m * k_size + k], packed_b[chunk_idx * chunk_size + (n / TILE_N) * KC * TILE_N + k_in_chunk * TILE_N + (n % TILE_N)]);
+                let mut n = 0usize;
+                let mut strip_idx = 0usize;
+                while n + TILE_N <= n_size {
+                    unsafe {
+                        let bias_ptr = bias.as_ptr().add(n);
+                        let mut c0 = $crate::simd_primitive!(avx2, $elem, loadu, bias_ptr);
+                        let mut c1 = $crate::simd_primitive!(avx2, $elem, loadu, bias_ptr.add(LANES));
+                        let mut a_col = a.as_ptr().add(m * k_size);
+                        let mut k_start = 0usize;
+                        let mut ci = 0usize;
+                        while k_start < k_size {
+                            let kc = KC.min(k_size - k_start);
+                            let mut b_ptr = packed_b.as_ptr().add(ci * chunk_size + strip_idx * KC * TILE_N);
+                            for _ki in 0..kc {
+                                let va = $crate::simd_primitive!(avx2, $elem, splat, *a_col);
+                                let vb0 = $crate::simd_primitive!(avx2, $elem, loadu, b_ptr);
+                                let vb1 = $crate::simd_primitive!(avx2, $elem, loadu, b_ptr.add(LANES));
+                                c0 = $crate::simd_primitive!(avx2, $elem, fma, va, vb0, c0);
+                                c1 = $crate::simd_primitive!(avx2, $elem, fma, va, vb1, c1);
+                                a_col = a_col.add(1);
+                                b_ptr = b_ptr.add(TILE_N);
+                            }
+                            k_start += kc; ci += 1;
+                            a_col = a.as_ptr().add(m * k_size + k_start);
+                        }
+                        $crate::simd_primitive!(avx2, $elem, storeu, c_ptr.add(m * n_size + n), c0);
+                        $crate::simd_primitive!(avx2, $elem, storeu, c_ptr.add(m * n_size + n + LANES), c1);
                     }
-                    c[m * n_size + n] = sum;
+                    n += TILE_N;
+                    strip_idx += 1;
                 }
             }
         }
@@ -3196,10 +3419,17 @@ macro_rules! define_matmul_op {
                 while n < n_size {
                     for i in 0..TILE_M {
                         let mut sum = <$elem as Element>::ZERO;
-                        for k in 0..k_size {
-                            let ci = k / KC; let ki = k % KC;
-                            sum = <$elem as Element>::mul_add(sum, a[(m + i) * k_size + k], packed_b[ci * chunk_size + (n / TILE_N) * KC * TILE_N + ki * TILE_N + (n % TILE_N)]);
-                        }
+                        let strip_off = (n / TILE_N) * KC * TILE_N;
+                        let n_off = n % TILE_N;
+                        { let mut k = 0usize; let mut ci = 0usize;
+                        while k < k_size {
+                            let kc = KC.min(k_size - k);
+                            let base = ci * chunk_size + strip_off;
+                            for ki in 0..kc {
+                                sum = <$elem as Element>::mul_add(sum, a[(m + i) * k_size + k + ki], packed_b[base + ki * TILE_N + n_off]);
+                            }
+                            k += kc; ci += 1;
+                        }}
                         c[(m + i) * n_size + n] = sum;
                     }
                     n += 1;
@@ -3211,10 +3441,17 @@ macro_rules! define_matmul_op {
             while m < m_size {
                 for n in 0..n_size {
                     let mut sum = <$elem as Element>::ZERO;
-                    for k in 0..k_size {
-                        let ci = k / KC; let ki = k % KC;
-                        sum = <$elem as Element>::mul_add(sum, a[m * k_size + k], packed_b[ci * chunk_size + (n / TILE_N) * KC * TILE_N + ki * TILE_N + (n % TILE_N)]);
-                    }
+                    let strip_off = (n / TILE_N) * KC * TILE_N;
+                    let n_off = n % TILE_N;
+                    { let mut k = 0usize; let mut ci = 0usize;
+                    while k < k_size {
+                        let kc = KC.min(k_size - k);
+                        let base = ci * chunk_size + strip_off;
+                        for ki in 0..kc {
+                            sum = <$elem as Element>::mul_add(sum, a[m * k_size + k + ki], packed_b[base + ki * TILE_N + n_off]);
+                        }
+                        k += kc; ci += 1;
+                    }}
                     c[m * n_size + n] = sum;
                 }
                 m += 1;
@@ -3384,10 +3621,17 @@ macro_rules! define_matmul_op {
                 while n < n_size {
                     for i in 0..TILE_M {
                         let mut sum = bias[n];
-                        for k in 0..k_size {
-                            let ci = k / KC; let ki = k % KC;
-                            sum = <$elem as Element>::mul_add(sum, a[(m + i) * k_size + k], packed_b[ci * chunk_size + (n / TILE_N) * KC * TILE_N + ki * TILE_N + (n % TILE_N)]);
-                        }
+                        let strip_off = (n / TILE_N) * KC * TILE_N;
+                        let n_off = n % TILE_N;
+                        { let mut k = 0usize; let mut ci = 0usize;
+                        while k < k_size {
+                            let kc = KC.min(k_size - k);
+                            let base = ci * chunk_size + strip_off;
+                            for ki in 0..kc {
+                                sum = <$elem as Element>::mul_add(sum, a[(m + i) * k_size + k + ki], packed_b[base + ki * TILE_N + n_off]);
+                            }
+                            k += kc; ci += 1;
+                        }}
                         c[(m + i) * n_size + n] = sum;
                     }
                     n += 1;
@@ -3399,10 +3643,17 @@ macro_rules! define_matmul_op {
             while m < m_size {
                 for n in 0..n_size {
                     let mut sum = bias[n];
-                    for k in 0..k_size {
-                        let ci = k / KC; let ki = k % KC;
-                        sum = <$elem as Element>::mul_add(sum, a[m * k_size + k], packed_b[ci * chunk_size + (n / TILE_N) * KC * TILE_N + ki * TILE_N + (n % TILE_N)]);
-                    }
+                    let strip_off = (n / TILE_N) * KC * TILE_N;
+                    let n_off = n % TILE_N;
+                    { let mut k = 0usize; let mut ci = 0usize;
+                    while k < k_size {
+                        let kc = KC.min(k_size - k);
+                        let base = ci * chunk_size + strip_off;
+                        for ki in 0..kc {
+                            sum = <$elem as Element>::mul_add(sum, a[m * k_size + k + ki], packed_b[base + ki * TILE_N + n_off]);
+                        }
+                        k += kc; ci += 1;
+                    }}
                     c[m * n_size + n] = sum;
                 }
                 m += 1;
