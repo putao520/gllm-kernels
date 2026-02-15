@@ -210,6 +210,15 @@ pub trait Kernels<E: Element>: Send + Sync {
     fn gemm_bias(&self, _a: &[E], _b: &[E], _bias: &[E], _c: &mut [E], _m: usize, _n: usize, _k: usize) {
         unimplemented!("gemm_bias")
     }
+    fn pack_b(&self, _b: &[E], _n: usize, _k: usize) -> Vec<E> {
+        unimplemented!("pack_b")
+    }
+    fn gemm_prepacked(&self, _a: &[E], _packed_b: &[E], _c: &mut [E], _m: usize, _n: usize, _k: usize) {
+        unimplemented!("gemm_prepacked")
+    }
+    fn gemm_bias_prepacked(&self, _a: &[E], _packed_b: &[E], _bias: &[E], _c: &mut [E], _m: usize, _n: usize, _k: usize) {
+        unimplemented!("gemm_bias_prepacked")
+    }
 
     // ======================================================================
     // Activation functions

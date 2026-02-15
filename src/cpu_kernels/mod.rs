@@ -309,11 +309,12 @@ impl<E: Element> CpuKernels<E> {
     // ========================================================================
 
     #[inline(always)]
-    fn fused_dequant_gemv_inner<const BLOCK_BYTES: usize, const BLOCK_SIZE: usize>(
+    #[inline(always)]
+    fn fused_dequant_gemv_inner<const BLOCK_BYTES: usize, const BLOCK_SIZE: usize, F>(
         &self, weight_blocks: &[u8], input: &[E], output: &mut [E],
         m: usize, k: usize,
-        dot_fn: fn(&Self, &[u8], &[f32]) -> f32,
-    ) {
+        dot_fn: F,
+    ) where F: Fn(&Self, &[u8], &[f32]) -> f32 {
         let blocks_per_row = k / BLOCK_SIZE;
         // Zero-copy for f32, single allocation for f16/bf16
         let owned_f32: Vec<f32>;
@@ -336,11 +337,11 @@ impl<E: Element> CpuKernels<E> {
     }
 
     #[inline(always)]
-    fn quant_matmul_inner<const BLOCK_BYTES: usize, const BLOCK_SIZE: usize>(
+    fn quant_matmul_inner<const BLOCK_BYTES: usize, const BLOCK_SIZE: usize, F>(
         &self, weight_blocks: &[u8], input: &[E], output: &mut [E],
         m: usize, n: usize, k: usize,
-        dot_fn: fn(&Self, &[u8], &[f32]) -> f32,
-    ) {
+        dot_fn: F,
+    ) where F: Fn(&Self, &[u8], &[f32]) -> f32 {
         let blocks_per_row = k / BLOCK_SIZE;
         // Pre-allocate column buffer once, reuse across all j iterations
         let mut in_f32_col = vec![0.0f32; k];
@@ -750,6 +751,7 @@ macro_rules! dispatch_scale {
 }
 
 /// Dispatch for bias_rows: 1 mut slice + 1 read slice + 2 dims
+#[allow(unused_macros)]
 macro_rules! dispatch_bias_rows {
     ($op:ident, $c:expr, $bias:expr, $m:expr, $n:expr) => {
         match (get_isa_level(), E::ELEM_ID) {
@@ -774,6 +776,80 @@ macro_rules! dispatch_bias_rows {
             (_, 0) => scalar::scalar_f32::$op(as_typed_slice_mut!($c, f32), as_typed_slice!($bias, f32), $m, $n),
             (_, 1) => scalar::scalar_f16::$op(as_typed_slice_mut!($c, half::f16), as_typed_slice!($bias, half::f16), $m, $n),
             (_, 2) => scalar::scalar_bf16::$op(as_typed_slice_mut!($c, half::bf16), as_typed_slice!($bias, half::bf16), $m, $n),
+            _ => unreachable!(),
+        }
+    };
+}
+
+/// Dispatch for matmul_bias: 3 read slices + 1 mut slice + 3 dims (fused C = A*B + bias)
+macro_rules! dispatch_matmul_bias {
+    ($op:ident, $a:expr, $b:expr, $bias:expr, $c:expr, $m:expr, $n:expr, $k:expr) => {
+        match (get_isa_level(), E::ELEM_ID) {
+            #[cfg(target_arch = "x86_64")]
+            (IsaLevel::Avx512, 0) => avx512::avx512_f32::$op(as_typed_slice!($a, f32), as_typed_slice!($b, f32), as_typed_slice!($bias, f32), as_typed_slice_mut!($c, f32), $m, $n, $k),
+            #[cfg(target_arch = "x86_64")]
+            (IsaLevel::Avx512, 1) => avx512::avx512_f16::$op(as_typed_slice!($a, half::f16), as_typed_slice!($b, half::f16), as_typed_slice!($bias, half::f16), as_typed_slice_mut!($c, half::f16), $m, $n, $k),
+            #[cfg(target_arch = "x86_64")]
+            (IsaLevel::Avx512, 2) => avx512::avx512_bf16::$op(as_typed_slice!($a, half::bf16), as_typed_slice!($b, half::bf16), as_typed_slice!($bias, half::bf16), as_typed_slice_mut!($c, half::bf16), $m, $n, $k),
+            #[cfg(target_arch = "x86_64")]
+            (IsaLevel::Avx2, 0) => avx2::avx2_f32::$op(as_typed_slice!($a, f32), as_typed_slice!($b, f32), as_typed_slice!($bias, f32), as_typed_slice_mut!($c, f32), $m, $n, $k),
+            #[cfg(target_arch = "x86_64")]
+            (IsaLevel::Avx2, 1) => avx2::avx2_f16::$op(as_typed_slice!($a, half::f16), as_typed_slice!($b, half::f16), as_typed_slice!($bias, half::f16), as_typed_slice_mut!($c, half::f16), $m, $n, $k),
+            #[cfg(target_arch = "x86_64")]
+            (IsaLevel::Avx2, 2) => avx2::avx2_bf16::$op(as_typed_slice!($a, half::bf16), as_typed_slice!($b, half::bf16), as_typed_slice!($bias, half::bf16), as_typed_slice_mut!($c, half::bf16), $m, $n, $k),
+            #[cfg(target_arch = "aarch64")]
+            (IsaLevel::Neon, 0) => neon::neon_f32::$op(as_typed_slice!($a, f32), as_typed_slice!($b, f32), as_typed_slice!($bias, f32), as_typed_slice_mut!($c, f32), $m, $n, $k),
+            #[cfg(target_arch = "aarch64")]
+            (IsaLevel::Neon, 1) => neon::neon_f16::$op(as_typed_slice!($a, half::f16), as_typed_slice!($b, half::f16), as_typed_slice!($bias, half::f16), as_typed_slice_mut!($c, half::f16), $m, $n, $k),
+            #[cfg(target_arch = "aarch64")]
+            (IsaLevel::Neon, 2) => neon::neon_bf16::$op(as_typed_slice!($a, half::bf16), as_typed_slice!($b, half::bf16), as_typed_slice!($bias, half::bf16), as_typed_slice_mut!($c, half::bf16), $m, $n, $k),
+            (_, 0) => scalar::scalar_f32::$op(as_typed_slice!($a, f32), as_typed_slice!($b, f32), as_typed_slice!($bias, f32), as_typed_slice_mut!($c, f32), $m, $n, $k),
+            (_, 1) => scalar::scalar_f16::$op(as_typed_slice!($a, half::f16), as_typed_slice!($b, half::f16), as_typed_slice!($bias, half::f16), as_typed_slice_mut!($c, half::f16), $m, $n, $k),
+            (_, 2) => scalar::scalar_bf16::$op(as_typed_slice!($a, half::bf16), as_typed_slice!($b, half::bf16), as_typed_slice!($bias, half::bf16), as_typed_slice_mut!($c, half::bf16), $m, $n, $k),
+            _ => unreachable!(),
+        }
+    };
+}
+
+/// Transmute Vec<$concrete> to Vec<E> (same size/alignment guaranteed by Element trait).
+macro_rules! transmute_vec {
+    ($vec:expr, $concrete:ty) => {
+        unsafe {
+            let mut v = $vec;
+            let ptr = v.as_mut_ptr() as *mut E;
+            let len = v.len();
+            let cap = v.capacity();
+            std::mem::forget(v);
+            Vec::from_raw_parts(ptr, len, cap)
+        }
+    };
+}
+
+/// Dispatch for pack_b: returns Vec<E>
+macro_rules! dispatch_pack_b {
+    ($op:ident, $b:expr, $n:expr, $k:expr) => {
+        match (get_isa_level(), E::ELEM_ID) {
+            #[cfg(target_arch = "x86_64")]
+            (IsaLevel::Avx512, 0) => transmute_vec!(avx512::avx512_f32::$op(as_typed_slice!($b, f32), $n, $k), f32),
+            #[cfg(target_arch = "x86_64")]
+            (IsaLevel::Avx512, 1) => transmute_vec!(avx512::avx512_f16::$op(as_typed_slice!($b, half::f16), $n, $k), half::f16),
+            #[cfg(target_arch = "x86_64")]
+            (IsaLevel::Avx512, 2) => transmute_vec!(avx512::avx512_bf16::$op(as_typed_slice!($b, half::bf16), $n, $k), half::bf16),
+            #[cfg(target_arch = "x86_64")]
+            (IsaLevel::Avx2, 0) => transmute_vec!(avx2::avx2_f32::$op(as_typed_slice!($b, f32), $n, $k), f32),
+            #[cfg(target_arch = "x86_64")]
+            (IsaLevel::Avx2, 1) => transmute_vec!(avx2::avx2_f16::$op(as_typed_slice!($b, half::f16), $n, $k), half::f16),
+            #[cfg(target_arch = "x86_64")]
+            (IsaLevel::Avx2, 2) => transmute_vec!(avx2::avx2_bf16::$op(as_typed_slice!($b, half::bf16), $n, $k), half::bf16),
+            #[cfg(target_arch = "aarch64")]
+            (IsaLevel::Neon, 0) => transmute_vec!(neon::neon_f32::$op(as_typed_slice!($b, f32), $n, $k), f32),
+            #[cfg(target_arch = "aarch64")]
+            (IsaLevel::Neon, 1) => transmute_vec!(neon::neon_f16::$op(as_typed_slice!($b, half::f16), $n, $k), half::f16),
+            #[cfg(target_arch = "aarch64")]
+            (IsaLevel::Neon, 2) => transmute_vec!(neon::neon_bf16::$op(as_typed_slice!($b, half::bf16), $n, $k), half::bf16),
+            (_, 0) => transmute_vec!(scalar::scalar_f32::$op(as_typed_slice!($b, f32), $n, $k), f32),
+            (_, 1) => transmute_vec!(scalar::scalar_f16::$op(as_typed_slice!($b, half::f16), $n, $k), half::f16),
+            (_, 2) => transmute_vec!(scalar::scalar_bf16::$op(as_typed_slice!($b, half::bf16), $n, $k), half::bf16),
             _ => unreachable!(),
         }
     };
@@ -887,10 +963,11 @@ impl<E: Element> Kernels<E> for CpuKernels<E> {
     }
 
     fn vec_scale(&self, x: &mut [E], s: E) {
-        let mut tmp = vec![E::ZERO; x.len()];
+        // SAFETY: scale reads a[i] then writes out[i] per lane — no cross-lane
+        // dependency, so aliasing the same buffer is safe and avoids a heap alloc.
+        let alias: &[E] = unsafe { std::slice::from_raw_parts(x.as_ptr(), x.len()) };
         let sf = s.to_f32();
-        dispatch_scale!(scale, x, sf, &mut tmp);
-        x.copy_from_slice(&tmp);
+        dispatch_scale!(scale, alias, sf, x);
     }
 
     fn vec_axpy(&self, y: &mut [E], a: E, x: &[E]) {
@@ -912,9 +989,20 @@ impl<E: Element> Kernels<E> for CpuKernels<E> {
     }
 
     fn gemm_bias(&self, a: &[E], b: &[E], bias: &[E], c: &mut [E], m: usize, n: usize, k: usize) {
-        self.gemm(a, b, c, m, n, k);
         assert!(c.len() == m * n && bias.len() == n);
-        dispatch_bias_rows!(bias_rows, c, bias, m, n);
+        dispatch_matmul_bias!(matmul_bias, a, b, bias, c, m, n, k);
+    }
+
+    fn pack_b(&self, b: &[E], n: usize, k: usize) -> Vec<E> {
+        dispatch_pack_b!(pack_b, b, n, k)
+    }
+
+    fn gemm_prepacked(&self, a: &[E], packed_b: &[E], c: &mut [E], m: usize, n: usize, k: usize) {
+        dispatch_with_dims!(matmul_prepacked, a, packed_b, c, m, n, k);
+    }
+
+    fn gemm_bias_prepacked(&self, a: &[E], packed_b: &[E], bias: &[E], c: &mut [E], m: usize, n: usize, k: usize) {
+        dispatch_matmul_bias!(matmul_bias_prepacked, a, packed_b, bias, c, m, n, k);
     }
 
     // Activations
@@ -1381,24 +1469,24 @@ impl<E: Element> Kernels<E> for CpuKernels<E> {
         use crate::quant::QuantType;
         // Match once at entry, dispatch to format-specific loop (no match in hot path)
         match quant_type {
-            QuantType::Q2K => self.fused_dequant_gemv_inner::<84, 256>(weight_blocks, input, output, m, k, Self::dot_q2_k),
-            QuantType::Q3K => self.fused_dequant_gemv_inner::<110, 256>(weight_blocks, input, output, m, k, Self::dot_q3_k),
-            QuantType::Q4K => self.fused_dequant_gemv_inner::<144, 256>(weight_blocks, input, output, m, k, Self::dot_q4_k),
-            QuantType::Q5K => self.fused_dequant_gemv_inner::<176, 256>(weight_blocks, input, output, m, k, Self::dot_q5_k),
-            QuantType::Q6K => self.fused_dequant_gemv_inner::<210, 256>(weight_blocks, input, output, m, k, Self::dot_q6_k),
-            QuantType::Q8K => self.fused_dequant_gemv_inner::<292, 256>(weight_blocks, input, output, m, k, Self::dot_q8_k),
-            QuantType::IQ1S => self.fused_dequant_gemv_inner::<50, 256>(weight_blocks, input, output, m, k, Self::dot_iq1_s),
-            QuantType::IQ1M => self.fused_dequant_gemv_inner::<56, 256>(weight_blocks, input, output, m, k, Self::dot_iq1_m),
-            QuantType::IQ2XXS => self.fused_dequant_gemv_inner::<66, 256>(weight_blocks, input, output, m, k, Self::dot_iq2_xxs),
-            QuantType::IQ2XS => self.fused_dequant_gemv_inner::<74, 256>(weight_blocks, input, output, m, k, Self::dot_iq2_xs),
-            QuantType::IQ2S => self.fused_dequant_gemv_inner::<82, 256>(weight_blocks, input, output, m, k, Self::dot_iq2_s),
-            QuantType::IQ3XXS => self.fused_dequant_gemv_inner::<98, 256>(weight_blocks, input, output, m, k, Self::dot_iq3_xxs),
-            QuantType::IQ3S => self.fused_dequant_gemv_inner::<110, 256>(weight_blocks, input, output, m, k, Self::dot_iq3_s),
-            QuantType::IQ4NL => self.fused_dequant_gemv_inner::<18, 32>(weight_blocks, input, output, m, k, Self::dot_iq4_nl),
-            QuantType::IQ4XS => self.fused_dequant_gemv_inner::<136, 256>(weight_blocks, input, output, m, k, Self::dot_iq4_xs),
-            QuantType::AWQ4 => self.fused_dequant_gemv_inner::<72, 128>(weight_blocks, input, output, m, k, Self::dot_awq4),
-            QuantType::GPTQ4 => self.fused_dequant_gemv_inner::<72, 128>(weight_blocks, input, output, m, k, Self::dot_gptq4),
-            QuantType::Squeeze => self.fused_dequant_gemv_inner::<130, 256>(weight_blocks, input, output, m, k, Self::dot_squeeze),
+            QuantType::Q2K => self.fused_dequant_gemv_inner::<84, 256, _>(weight_blocks, input, output, m, k, Self::dot_q2_k),
+            QuantType::Q3K => self.fused_dequant_gemv_inner::<110, 256, _>(weight_blocks, input, output, m, k, Self::dot_q3_k),
+            QuantType::Q4K => self.fused_dequant_gemv_inner::<144, 256, _>(weight_blocks, input, output, m, k, Self::dot_q4_k),
+            QuantType::Q5K => self.fused_dequant_gemv_inner::<176, 256, _>(weight_blocks, input, output, m, k, Self::dot_q5_k),
+            QuantType::Q6K => self.fused_dequant_gemv_inner::<210, 256, _>(weight_blocks, input, output, m, k, Self::dot_q6_k),
+            QuantType::Q8K => self.fused_dequant_gemv_inner::<292, 256, _>(weight_blocks, input, output, m, k, Self::dot_q8_k),
+            QuantType::IQ1S => self.fused_dequant_gemv_inner::<50, 256, _>(weight_blocks, input, output, m, k, Self::dot_iq1_s),
+            QuantType::IQ1M => self.fused_dequant_gemv_inner::<56, 256, _>(weight_blocks, input, output, m, k, Self::dot_iq1_m),
+            QuantType::IQ2XXS => self.fused_dequant_gemv_inner::<66, 256, _>(weight_blocks, input, output, m, k, Self::dot_iq2_xxs),
+            QuantType::IQ2XS => self.fused_dequant_gemv_inner::<74, 256, _>(weight_blocks, input, output, m, k, Self::dot_iq2_xs),
+            QuantType::IQ2S => self.fused_dequant_gemv_inner::<82, 256, _>(weight_blocks, input, output, m, k, Self::dot_iq2_s),
+            QuantType::IQ3XXS => self.fused_dequant_gemv_inner::<98, 256, _>(weight_blocks, input, output, m, k, Self::dot_iq3_xxs),
+            QuantType::IQ3S => self.fused_dequant_gemv_inner::<110, 256, _>(weight_blocks, input, output, m, k, Self::dot_iq3_s),
+            QuantType::IQ4NL => self.fused_dequant_gemv_inner::<18, 32, _>(weight_blocks, input, output, m, k, Self::dot_iq4_nl),
+            QuantType::IQ4XS => self.fused_dequant_gemv_inner::<136, 256, _>(weight_blocks, input, output, m, k, Self::dot_iq4_xs),
+            QuantType::AWQ4 => self.fused_dequant_gemv_inner::<72, 128, _>(weight_blocks, input, output, m, k, Self::dot_awq4),
+            QuantType::GPTQ4 => self.fused_dequant_gemv_inner::<72, 128, _>(weight_blocks, input, output, m, k, Self::dot_gptq4),
+            QuantType::Squeeze => self.fused_dequant_gemv_inner::<130, 256, _>(weight_blocks, input, output, m, k, Self::dot_squeeze),
         }
     }
 
@@ -1445,12 +1533,12 @@ impl<E: Element> Kernels<E> for CpuKernels<E> {
         use crate::quant::QuantType;
         // Match once at entry, dispatch to format-specific loop (no match in hot path)
         match quant_type {
-            QuantType::Q2K => self.quant_matmul_inner::<84, 256>(weight_blocks, input, output, m, n, k, Self::dot_q2_k),
-            QuantType::Q3K => self.quant_matmul_inner::<110, 256>(weight_blocks, input, output, m, n, k, Self::dot_q3_k),
-            QuantType::Q4K => self.quant_matmul_inner::<144, 256>(weight_blocks, input, output, m, n, k, Self::dot_q4_k),
-            QuantType::Q5K => self.quant_matmul_inner::<176, 256>(weight_blocks, input, output, m, n, k, Self::dot_q5_k),
-            QuantType::Q6K => self.quant_matmul_inner::<210, 256>(weight_blocks, input, output, m, n, k, Self::dot_q6_k),
-            QuantType::Q8K => self.quant_matmul_inner::<292, 256>(weight_blocks, input, output, m, n, k, Self::dot_q8_k),
+            QuantType::Q2K => self.quant_matmul_inner::<84, 256, _>(weight_blocks, input, output, m, n, k, Self::dot_q2_k),
+            QuantType::Q3K => self.quant_matmul_inner::<110, 256, _>(weight_blocks, input, output, m, n, k, Self::dot_q3_k),
+            QuantType::Q4K => self.quant_matmul_inner::<144, 256, _>(weight_blocks, input, output, m, n, k, Self::dot_q4_k),
+            QuantType::Q5K => self.quant_matmul_inner::<176, 256, _>(weight_blocks, input, output, m, n, k, Self::dot_q5_k),
+            QuantType::Q6K => self.quant_matmul_inner::<210, 256, _>(weight_blocks, input, output, m, n, k, Self::dot_q6_k),
+            QuantType::Q8K => self.quant_matmul_inner::<292, 256, _>(weight_blocks, input, output, m, n, k, Self::dot_q8_k),
             _ => unimplemented!("unsupported quant type for kquant_matmul"),
         }
     }
@@ -1462,15 +1550,15 @@ impl<E: Element> Kernels<E> for CpuKernels<E> {
         use crate::quant::QuantType;
         // Match once at entry, dispatch to format-specific loop (no match in hot path)
         match quant_type {
-            QuantType::IQ1S => self.quant_matmul_inner::<50, 256>(weight_blocks, input, output, m, n, k, Self::dot_iq1_s),
-            QuantType::IQ1M => self.quant_matmul_inner::<56, 256>(weight_blocks, input, output, m, n, k, Self::dot_iq1_m),
-            QuantType::IQ2XXS => self.quant_matmul_inner::<66, 256>(weight_blocks, input, output, m, n, k, Self::dot_iq2_xxs),
-            QuantType::IQ2XS => self.quant_matmul_inner::<74, 256>(weight_blocks, input, output, m, n, k, Self::dot_iq2_xs),
-            QuantType::IQ2S => self.quant_matmul_inner::<82, 256>(weight_blocks, input, output, m, n, k, Self::dot_iq2_s),
-            QuantType::IQ3XXS => self.quant_matmul_inner::<98, 256>(weight_blocks, input, output, m, n, k, Self::dot_iq3_xxs),
-            QuantType::IQ3S => self.quant_matmul_inner::<110, 256>(weight_blocks, input, output, m, n, k, Self::dot_iq3_s),
-            QuantType::IQ4NL => self.quant_matmul_inner::<18, 32>(weight_blocks, input, output, m, n, k, Self::dot_iq4_nl),
-            QuantType::IQ4XS => self.quant_matmul_inner::<136, 256>(weight_blocks, input, output, m, n, k, Self::dot_iq4_xs),
+            QuantType::IQ1S => self.quant_matmul_inner::<50, 256, _>(weight_blocks, input, output, m, n, k, Self::dot_iq1_s),
+            QuantType::IQ1M => self.quant_matmul_inner::<56, 256, _>(weight_blocks, input, output, m, n, k, Self::dot_iq1_m),
+            QuantType::IQ2XXS => self.quant_matmul_inner::<66, 256, _>(weight_blocks, input, output, m, n, k, Self::dot_iq2_xxs),
+            QuantType::IQ2XS => self.quant_matmul_inner::<74, 256, _>(weight_blocks, input, output, m, n, k, Self::dot_iq2_xs),
+            QuantType::IQ2S => self.quant_matmul_inner::<82, 256, _>(weight_blocks, input, output, m, n, k, Self::dot_iq2_s),
+            QuantType::IQ3XXS => self.quant_matmul_inner::<98, 256, _>(weight_blocks, input, output, m, n, k, Self::dot_iq3_xxs),
+            QuantType::IQ3S => self.quant_matmul_inner::<110, 256, _>(weight_blocks, input, output, m, n, k, Self::dot_iq3_s),
+            QuantType::IQ4NL => self.quant_matmul_inner::<18, 32, _>(weight_blocks, input, output, m, n, k, Self::dot_iq4_nl),
+            QuantType::IQ4XS => self.quant_matmul_inner::<136, 256, _>(weight_blocks, input, output, m, n, k, Self::dot_iq4_xs),
             _ => unimplemented!("unsupported quant type for iq_matmul"),
         }
     }

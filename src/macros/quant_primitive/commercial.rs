@@ -93,7 +93,7 @@ macro_rules! quant_primitive_commercial {
                     let hi = if byte_idx + 1 < qs.len() { qs[byte_idx + 1] << (8 - bit_idx) } else { 0 };
                     (lo | hi) & 0x07
                 };
-                unsafe { *out_ptr.add(i) = d * (q as f32 - 4.0); }
+                unsafe { *out_ptr.add(i) = (q as f32).mul_add(d, -d * 4.0); }
             }
         }
     };
@@ -116,7 +116,7 @@ macro_rules! quant_primitive_commercial {
                     let hi = if byte_idx + 1 < qs.len() { qs[byte_idx + 1] << (8 - bit_idx) } else { 0 };
                     (lo | hi) & 0x07
                 };
-                unsafe { sum += (d * (q as f32 - 4.0)) * *other.add(i); }
+                unsafe { sum += (q as f32).mul_add(d, -d * 4.0) * *other.add(i); }
             }
             sum
         }
@@ -386,7 +386,7 @@ macro_rules! quant_primitive_commercial {
                 let block = &*$block_ptr;
                 let d: f32 = block.scales.to_f32();
                 let vd = $crate::simd_primitive!(avx2, f32, splat, d);
-                let v_offset = $crate::simd_primitive!(avx2, f32, splat, 8.0);
+                let v_neg_d_offset = $crate::simd_primitive!(avx2, f32, splat, -d * 8.0);
                 let qw = &block.qweight;
                 let out_ptr = $out_ptr;
 
@@ -406,8 +406,7 @@ macro_rules! quant_primitive_commercial {
                     ];
                     let vq = $crate::simd_primitive!(avx2, f32, load, nibbles.as_ptr());
                     // d * (q - 8.0)
-                    let res = $crate::simd_primitive!(avx2, f32, mul, vd,
-                        $crate::simd_primitive!(avx2, f32, sub, vq, v_offset));
+                    let res = $crate::simd_primitive!(avx2, f32, fma, vd, vq, v_neg_d_offset);
                     $crate::simd_primitive!(avx2, f32, store, out_ptr.add(w * 8), res);
                 }
             }
@@ -424,7 +423,7 @@ macro_rules! quant_primitive_commercial {
                 let block = &*$block_ptr;
                 let d: f32 = block.scales.to_f32();
                 let vd = $crate::simd_primitive!(avx2, f32, splat, d);
-                let v_offset = $crate::simd_primitive!(avx2, f32, splat, 8.0);
+                let v_neg_d_offset = $crate::simd_primitive!(avx2, f32, splat, -d * 8.0);
                 let qw = &block.qweight;
                 let other = $other_ptr;
                 let mut acc = $crate::simd_primitive!(avx2, f32, zero);
@@ -443,8 +442,7 @@ macro_rules! quant_primitive_commercial {
                     ];
                     let vq = $crate::simd_primitive!(avx2, f32, load, nibbles.as_ptr());
                     // dequant = d * (q - 8.0)
-                    let dq = $crate::simd_primitive!(avx2, f32, mul, vd,
-                        $crate::simd_primitive!(avx2, f32, sub, vq, v_offset));
+                    let dq = $crate::simd_primitive!(avx2, f32, fma, vd, vq, v_neg_d_offset);
                     let vo = $crate::simd_primitive!(avx2, f32, load, other.add(w * 8));
                     // acc += dq * vo
                     acc = $crate::simd_primitive!(avx2, f32, fma, dq, vo, acc);
@@ -468,7 +466,7 @@ macro_rules! quant_primitive_commercial {
                 let d: f32 = block.scales.to_f32();
                 let zero = (block.zeros & 0xF) as f32;
                 let vd = $crate::simd_primitive!(avx2, f32, splat, d);
-                let v_zero = $crate::simd_primitive!(avx2, f32, splat, zero);
+                let v_neg_d_zero = $crate::simd_primitive!(avx2, f32, splat, -d * zero);
                 let qw = &block.qweight;
                 let out_ptr = $out_ptr;
 
@@ -486,8 +484,7 @@ macro_rules! quant_primitive_commercial {
                     ];
                     let vq = $crate::simd_primitive!(avx2, f32, load, nibbles.as_ptr());
                     // d * (q - zero)
-                    let res = $crate::simd_primitive!(avx2, f32, mul, vd,
-                        $crate::simd_primitive!(avx2, f32, sub, vq, v_zero));
+                    let res = $crate::simd_primitive!(avx2, f32, fma, vd, vq, v_neg_d_zero);
                     $crate::simd_primitive!(avx2, f32, store, out_ptr.add(w * 8), res);
                 }
             }
@@ -505,7 +502,7 @@ macro_rules! quant_primitive_commercial {
                 let d: f32 = block.scales.to_f32();
                 let zero = (block.zeros & 0xF) as f32;
                 let vd = $crate::simd_primitive!(avx2, f32, splat, d);
-                let v_zero = $crate::simd_primitive!(avx2, f32, splat, zero);
+                let v_neg_d_zero = $crate::simd_primitive!(avx2, f32, splat, -d * zero);
                 let qw = &block.qweight;
                 let other = $other_ptr;
                 let mut acc = $crate::simd_primitive!(avx2, f32, zero);
@@ -523,8 +520,7 @@ macro_rules! quant_primitive_commercial {
                         ((word >> 28) & 0xF) as f32,
                     ];
                     let vq = $crate::simd_primitive!(avx2, f32, load, nibbles.as_ptr());
-                    let dq = $crate::simd_primitive!(avx2, f32, mul, vd,
-                        $crate::simd_primitive!(avx2, f32, sub, vq, v_zero));
+                    let dq = $crate::simd_primitive!(avx2, f32, fma, vd, vq, v_neg_d_zero);
                     let vo = $crate::simd_primitive!(avx2, f32, load, other.add(w * 8));
                     acc = $crate::simd_primitive!(avx2, f32, fma, dq, vo, acc);
                 }
@@ -549,7 +545,7 @@ macro_rules! quant_primitive_commercial {
                 let block = &*$block_ptr;
                 let d: f32 = block.scales.to_f32();
                 let vd = $crate::simd_primitive!(avx512, f32, splat, d);
-                let v_offset = $crate::simd_primitive!(avx512, f32, splat, 8.0);
+                let v_neg_d_offset = $crate::simd_primitive!(avx512, f32, splat, -d * 8.0);
                 let qw = &block.qweight;
                 let out_ptr = $out_ptr;
 
@@ -568,8 +564,7 @@ macro_rules! quant_primitive_commercial {
                         ((w1 >> 24) & 0xF) as f32, ((w1 >> 28) & 0xF) as f32,
                     ];
                     let vq = $crate::simd_primitive!(avx512, f32, load, nibbles.as_ptr());
-                    let res = $crate::simd_primitive!(avx512, f32, mul, vd,
-                        $crate::simd_primitive!(avx512, f32, sub, vq, v_offset));
+                    let res = $crate::simd_primitive!(avx512, f32, fma, vd, vq, v_neg_d_offset);
                     $crate::simd_primitive!(avx512, f32, store, out_ptr.add(pair * 16), res);
                 }
             }
@@ -586,7 +581,7 @@ macro_rules! quant_primitive_commercial {
                 let block = &*$block_ptr;
                 let d: f32 = block.scales.to_f32();
                 let vd = $crate::simd_primitive!(avx512, f32, splat, d);
-                let v_offset = $crate::simd_primitive!(avx512, f32, splat, 8.0);
+                let v_neg_d_offset = $crate::simd_primitive!(avx512, f32, splat, -d * 8.0);
                 let qw = &block.qweight;
                 let other = $other_ptr;
                 let mut acc = $crate::simd_primitive!(avx512, f32, zero);
@@ -605,8 +600,7 @@ macro_rules! quant_primitive_commercial {
                         ((w1 >> 24) & 0xF) as f32, ((w1 >> 28) & 0xF) as f32,
                     ];
                     let vq = $crate::simd_primitive!(avx512, f32, load, nibbles.as_ptr());
-                    let dq = $crate::simd_primitive!(avx512, f32, mul, vd,
-                        $crate::simd_primitive!(avx512, f32, sub, vq, v_offset));
+                    let dq = $crate::simd_primitive!(avx512, f32, fma, vd, vq, v_neg_d_offset);
                     let vo = $crate::simd_primitive!(avx512, f32, load, other.add(pair * 16));
                     acc = $crate::simd_primitive!(avx512, f32, fma, dq, vo, acc);
                 }
@@ -628,7 +622,7 @@ macro_rules! quant_primitive_commercial {
                 let d: f32 = block.scales.to_f32();
                 let zero = (block.zeros & 0xF) as f32;
                 let vd = $crate::simd_primitive!(avx512, f32, splat, d);
-                let v_zero = $crate::simd_primitive!(avx512, f32, splat, zero);
+                let v_neg_d_zero = $crate::simd_primitive!(avx512, f32, splat, -d * zero);
                 let qw = &block.qweight;
                 let out_ptr = $out_ptr;
 
@@ -646,8 +640,7 @@ macro_rules! quant_primitive_commercial {
                         ((w1 >> 24) & 0xF) as f32, ((w1 >> 28) & 0xF) as f32,
                     ];
                     let vq = $crate::simd_primitive!(avx512, f32, load, nibbles.as_ptr());
-                    let res = $crate::simd_primitive!(avx512, f32, mul, vd,
-                        $crate::simd_primitive!(avx512, f32, sub, vq, v_zero));
+                    let res = $crate::simd_primitive!(avx512, f32, fma, vd, vq, v_neg_d_zero);
                     $crate::simd_primitive!(avx512, f32, store, out_ptr.add(pair * 16), res);
                 }
             }
@@ -665,7 +658,7 @@ macro_rules! quant_primitive_commercial {
                 let d: f32 = block.scales.to_f32();
                 let zero = (block.zeros & 0xF) as f32;
                 let vd = $crate::simd_primitive!(avx512, f32, splat, d);
-                let v_zero = $crate::simd_primitive!(avx512, f32, splat, zero);
+                let v_neg_d_zero = $crate::simd_primitive!(avx512, f32, splat, -d * zero);
                 let qw = &block.qweight;
                 let other = $other_ptr;
                 let mut acc = $crate::simd_primitive!(avx512, f32, zero);
@@ -684,8 +677,7 @@ macro_rules! quant_primitive_commercial {
                         ((w1 >> 24) & 0xF) as f32, ((w1 >> 28) & 0xF) as f32,
                     ];
                     let vq = $crate::simd_primitive!(avx512, f32, load, nibbles.as_ptr());
-                    let dq = $crate::simd_primitive!(avx512, f32, mul, vd,
-                        $crate::simd_primitive!(avx512, f32, sub, vq, v_zero));
+                    let dq = $crate::simd_primitive!(avx512, f32, fma, vd, vq, v_neg_d_zero);
                     let vo = $crate::simd_primitive!(avx512, f32, load, other.add(pair * 16));
                     acc = $crate::simd_primitive!(avx512, f32, fma, dq, vo, acc);
                 }
@@ -710,7 +702,7 @@ macro_rules! quant_primitive_commercial {
                 let block = &*$block_ptr;
                 let d: f32 = block.scales.to_f32();
                 let vd = $crate::simd_primitive!(neon, f32, splat, d);
-                let v_offset = $crate::simd_primitive!(neon, f32, splat, 8.0);
+                let v_neg_d_offset = $crate::simd_primitive!(neon, f32, splat, -d * 8.0);
                 let qw = &block.qweight;
                 let out_ptr = $out_ptr;
 
@@ -728,10 +720,8 @@ macro_rules! quant_primitive_commercial {
                     ];
                     let vq0 = $crate::simd_primitive!(neon, f32, load, nibbles.as_ptr());
                     let vq1 = $crate::simd_primitive!(neon, f32, load, nibbles.as_ptr().add(4));
-                    let res0 = $crate::simd_primitive!(neon, f32, mul, vd,
-                        $crate::simd_primitive!(neon, f32, sub, vq0, v_offset));
-                    let res1 = $crate::simd_primitive!(neon, f32, mul, vd,
-                        $crate::simd_primitive!(neon, f32, sub, vq1, v_offset));
+                    let res0 = $crate::simd_primitive!(neon, f32, fma, vd, vq0, v_neg_d_offset);
+                    let res1 = $crate::simd_primitive!(neon, f32, fma, vd, vq1, v_neg_d_offset);
                     $crate::simd_primitive!(neon, f32, store, out_ptr.add(w * 8), res0);
                     $crate::simd_primitive!(neon, f32, store, out_ptr.add(w * 8 + 4), res1);
                 }
@@ -749,7 +739,7 @@ macro_rules! quant_primitive_commercial {
                 let block = &*$block_ptr;
                 let d: f32 = block.scales.to_f32();
                 let vd = $crate::simd_primitive!(neon, f32, splat, d);
-                let v_offset = $crate::simd_primitive!(neon, f32, splat, 8.0);
+                let v_neg_d_offset = $crate::simd_primitive!(neon, f32, splat, -d * 8.0);
                 let qw = &block.qweight;
                 let other = $other_ptr;
                 let mut acc0 = $crate::simd_primitive!(neon, f32, zero);
@@ -769,10 +759,8 @@ macro_rules! quant_primitive_commercial {
                     ];
                     let vq0 = $crate::simd_primitive!(neon, f32, load, nibbles.as_ptr());
                     let vq1 = $crate::simd_primitive!(neon, f32, load, nibbles.as_ptr().add(4));
-                    let dq0 = $crate::simd_primitive!(neon, f32, mul, vd,
-                        $crate::simd_primitive!(neon, f32, sub, vq0, v_offset));
-                    let dq1 = $crate::simd_primitive!(neon, f32, mul, vd,
-                        $crate::simd_primitive!(neon, f32, sub, vq1, v_offset));
+                    let dq0 = $crate::simd_primitive!(neon, f32, fma, vd, vq0, v_neg_d_offset);
+                    let dq1 = $crate::simd_primitive!(neon, f32, fma, vd, vq1, v_neg_d_offset);
                     let vo0 = $crate::simd_primitive!(neon, f32, load, other.add(w * 8));
                     let vo1 = $crate::simd_primitive!(neon, f32, load, other.add(w * 8 + 4));
                     acc0 = $crate::simd_primitive!(neon, f32, fma, dq0, vo0, acc0);
@@ -797,7 +785,7 @@ macro_rules! quant_primitive_commercial {
                 let d: f32 = block.scales.to_f32();
                 let zero = (block.zeros & 0xF) as f32;
                 let vd = $crate::simd_primitive!(neon, f32, splat, d);
-                let v_zero = $crate::simd_primitive!(neon, f32, splat, zero);
+                let v_neg_d_zero = $crate::simd_primitive!(neon, f32, splat, -d * zero);
                 let qw = &block.qweight;
                 let out_ptr = $out_ptr;
 
@@ -815,10 +803,8 @@ macro_rules! quant_primitive_commercial {
                     ];
                     let vq0 = $crate::simd_primitive!(neon, f32, load, nibbles.as_ptr());
                     let vq1 = $crate::simd_primitive!(neon, f32, load, nibbles.as_ptr().add(4));
-                    let res0 = $crate::simd_primitive!(neon, f32, mul, vd,
-                        $crate::simd_primitive!(neon, f32, sub, vq0, v_zero));
-                    let res1 = $crate::simd_primitive!(neon, f32, mul, vd,
-                        $crate::simd_primitive!(neon, f32, sub, vq1, v_zero));
+                    let res0 = $crate::simd_primitive!(neon, f32, fma, vd, vq0, v_neg_d_zero);
+                    let res1 = $crate::simd_primitive!(neon, f32, fma, vd, vq1, v_neg_d_zero);
                     $crate::simd_primitive!(neon, f32, store, out_ptr.add(w * 8), res0);
                     $crate::simd_primitive!(neon, f32, store, out_ptr.add(w * 8 + 4), res1);
                 }
@@ -837,7 +823,7 @@ macro_rules! quant_primitive_commercial {
                 let d: f32 = block.scales.to_f32();
                 let zero = (block.zeros & 0xF) as f32;
                 let vd = $crate::simd_primitive!(neon, f32, splat, d);
-                let v_zero = $crate::simd_primitive!(neon, f32, splat, zero);
+                let v_neg_d_zero = $crate::simd_primitive!(neon, f32, splat, -d * zero);
                 let qw = &block.qweight;
                 let other = $other_ptr;
                 let mut acc0 = $crate::simd_primitive!(neon, f32, zero);
@@ -857,10 +843,8 @@ macro_rules! quant_primitive_commercial {
                     ];
                     let vq0 = $crate::simd_primitive!(neon, f32, load, nibbles.as_ptr());
                     let vq1 = $crate::simd_primitive!(neon, f32, load, nibbles.as_ptr().add(4));
-                    let dq0 = $crate::simd_primitive!(neon, f32, mul, vd,
-                        $crate::simd_primitive!(neon, f32, sub, vq0, v_zero));
-                    let dq1 = $crate::simd_primitive!(neon, f32, mul, vd,
-                        $crate::simd_primitive!(neon, f32, sub, vq1, v_zero));
+                    let dq0 = $crate::simd_primitive!(neon, f32, fma, vd, vq0, v_neg_d_zero);
+                    let dq1 = $crate::simd_primitive!(neon, f32, fma, vd, vq1, v_neg_d_zero);
                     let vo0 = $crate::simd_primitive!(neon, f32, load, other.add(w * 8));
                     let vo1 = $crate::simd_primitive!(neon, f32, load, other.add(w * 8 + 4));
                     acc0 = $crate::simd_primitive!(neon, f32, fma, dq0, vo0, acc0);

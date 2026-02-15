@@ -36,6 +36,7 @@ macro_rules! simd_primitive {
     (scalar, f32, mul, $a:expr, $b:expr) => { $a * $b };
     (scalar, f32, div, $a:expr, $b:expr) => { $a / $b };
     (scalar, f32, fma, $a:expr, $b:expr, $c:expr) => { $c + $a * $b };
+    (scalar, f32, fnmadd, $a:expr, $b:expr, $c:expr) => { $c - $a * $b };
     (scalar, f32, neg, $a:expr) => { -$a };
     (scalar, f32, max, $a:expr, $b:expr) => { $a.max($b) };
     (scalar, f32, min, $a:expr, $b:expr) => { $a.min($b) };
@@ -89,6 +90,7 @@ macro_rules! simd_primitive {
     (avx2, f32, mul, $a:expr, $b:expr) => { std::arch::x86_64::_mm256_mul_ps($a, $b) };
     (avx2, f32, div, $a:expr, $b:expr) => { std::arch::x86_64::_mm256_div_ps($a, $b) };
     (avx2, f32, fma, $a:expr, $b:expr, $c:expr) => { std::arch::x86_64::_mm256_fmadd_ps($a, $b, $c) };
+    (avx2, f32, fnmadd, $a:expr, $b:expr, $c:expr) => { std::arch::x86_64::_mm256_fnmadd_ps($a, $b, $c) };
     (avx2, f32, neg, $a:expr) => { std::arch::x86_64::_mm256_sub_ps(std::arch::x86_64::_mm256_setzero_ps(), $a) }; // 0 - a
     (avx2, f32, max, $a:expr, $b:expr) => { std::arch::x86_64::_mm256_max_ps($a, $b) };
     (avx2, f32, min, $a:expr, $b:expr) => { std::arch::x86_64::_mm256_min_ps($a, $b) };
@@ -107,8 +109,28 @@ macro_rules! simd_primitive {
     
     // Exp, Recip, Sqrt etc.
     (avx2, f32, sqrt, $a:expr) => { std::arch::x86_64::_mm256_sqrt_ps($a) };
-    (avx2, f32, rsqrt, $a:expr) => { std::arch::x86_64::_mm256_rsqrt_ps($a) };
-    (avx2, f32, recip, $a:expr) => { std::arch::x86_64::_mm256_rcp_ps($a) };
+    // rsqrt with one Newton-Raphson refinement: ~23-bit accuracy
+    (avx2, f32, rsqrt, $a:expr) => {
+        {
+            use std::arch::x86_64::*;
+            let r = _mm256_rsqrt_ps($a);
+            let half = _mm256_set1_ps(0.5);
+            let three = _mm256_set1_ps(3.0);
+            let ar = _mm256_mul_ps($a, r);
+            // r * 0.5 * (3 - a * r * r)
+            _mm256_mul_ps(_mm256_mul_ps(r, half), _mm256_fnmadd_ps(ar, r, three))
+        }
+    };
+    // recip with one Newton-Raphson refinement: ~23-bit accuracy
+    (avx2, f32, recip, $a:expr) => {
+        {
+            use std::arch::x86_64::*;
+            let r = _mm256_rcp_ps($a);
+            let two = _mm256_set1_ps(2.0);
+            // r * (2 - a * r)
+            _mm256_mul_ps(r, _mm256_fnmadd_ps($a, r, two))
+        }
+    };
     // EXP
     (avx2, f32, exp, $a:expr) => { $crate::cpu_kernels::avx2::math::avx2_exp_f32($a) };
 
@@ -176,6 +198,7 @@ macro_rules! simd_primitive {
     (avx512, f32, mul, $a:expr, $b:expr) => { std::arch::x86_64::_mm512_mul_ps($a, $b) };
     (avx512, f32, div, $a:expr, $b:expr) => { std::arch::x86_64::_mm512_div_ps($a, $b) };
     (avx512, f32, fma, $a:expr, $b:expr, $c:expr) => { std::arch::x86_64::_mm512_fmadd_ps($a, $b, $c) };
+    (avx512, f32, fnmadd, $a:expr, $b:expr, $c:expr) => { std::arch::x86_64::_mm512_fnmadd_ps($a, $b, $c) };
     (avx512, f32, neg, $a:expr) => { std::arch::x86_64::_mm512_sub_ps(std::arch::x86_64::_mm512_setzero_ps(), $a) };
     (avx512, f32, max, $a:expr, $b:expr) => { std::arch::x86_64::_mm512_max_ps($a, $b) };
     (avx512, f32, min, $a:expr, $b:expr) => { std::arch::x86_64::_mm512_min_ps($a, $b) };
@@ -187,20 +210,30 @@ macro_rules! simd_primitive {
 
     (avx512, f32, abs, $a:expr) => { std::arch::x86_64::_mm512_abs_ps($a) };
     (avx512, f32, sqrt, $a:expr) => { std::arch::x86_64::_mm512_sqrt_ps($a) };
-    (avx512, f32, rsqrt, $a:expr) => { std::arch::x86_64::_mm512_rsqrt14_ps($a) };
-    (avx512, f32, recip, $a:expr) => { std::arch::x86_64::_mm512_rcp14_ps($a) };
-
-    // EXP: use AVX2 exp on lower/upper halves (no native 512-bit exp)
-    (avx512, f32, exp, $a:expr) => {
+    // rsqrt with one Newton-Raphson refinement: ~23-bit accuracy
+    (avx512, f32, rsqrt, $a:expr) => {
         {
-            let lo = std::arch::x86_64::_mm512_castps512_ps256($a);
-            let hi = std::arch::x86_64::_mm512_extractf32x8_ps($a, 1);
-            let exp_lo = $crate::cpu_kernels::avx2::math::avx2_exp_f32(lo);
-            let exp_hi = $crate::cpu_kernels::avx2::math::avx2_exp_f32(hi);
-            let mut result = std::arch::x86_64::_mm512_castps256_ps512(exp_lo);
-            result = std::arch::x86_64::_mm512_insertf32x8(result, exp_hi, 1);
-            result
+            use std::arch::x86_64::*;
+            let r = _mm512_rsqrt14_ps($a);
+            let half = _mm512_set1_ps(0.5);
+            let three = _mm512_set1_ps(3.0);
+            let ar = _mm512_mul_ps($a, r);
+            _mm512_mul_ps(_mm512_mul_ps(r, half), _mm512_fnmadd_ps(ar, r, three))
         }
+    };
+    // recip with one Newton-Raphson refinement: ~23-bit accuracy
+    (avx512, f32, recip, $a:expr) => {
+        {
+            use std::arch::x86_64::*;
+            let r = _mm512_rcp14_ps($a);
+            let two = _mm512_set1_ps(2.0);
+            _mm512_mul_ps(r, _mm512_fnmadd_ps($a, r, two))
+        }
+    };
+
+    // EXP: native AVX-512 polynomial approximation
+    (avx512, f32, exp, $a:expr) => {
+        $crate::cpu_kernels::avx512::math::avx512_exp_f32($a)
     };
 
     (avx512, f32, prefetch, $p:expr, $dist:expr) => { std::arch::x86_64::_mm_prefetch($p as *const i8, std::arch::x86_64::_MM_HINT_T0) };
@@ -246,6 +279,7 @@ macro_rules! simd_primitive {
     (avx512, f16, mul, $a:expr, $b:expr) => { std::arch::x86_64::_mm512_mul_ps($a, $b) };
     (avx512, f16, div, $a:expr, $b:expr) => { std::arch::x86_64::_mm512_div_ps($a, $b) };
     (avx512, f16, fma, $a:expr, $b:expr, $c:expr) => { std::arch::x86_64::_mm512_fmadd_ps($a, $b, $c) };
+    (avx512, f16, fnmadd, $a:expr, $b:expr, $c:expr) => { std::arch::x86_64::_mm512_fnmadd_ps($a, $b, $c) };
     (avx512, f16, neg, $a:expr) => { std::arch::x86_64::_mm512_sub_ps(std::arch::x86_64::_mm512_setzero_ps(), $a) };
     (avx512, f16, max, $a:expr, $b:expr) => { std::arch::x86_64::_mm512_max_ps($a, $b) };
     (avx512, f16, min, $a:expr, $b:expr) => { std::arch::x86_64::_mm512_min_ps($a, $b) };
@@ -253,8 +287,8 @@ macro_rules! simd_primitive {
     (avx512, f16, reduce_max, $v:expr) => { std::arch::x86_64::_mm512_reduce_max_ps($v) };
     (avx512, f16, abs, $a:expr) => { std::arch::x86_64::_mm512_abs_ps($a) };
     (avx512, f16, sqrt, $a:expr) => { std::arch::x86_64::_mm512_sqrt_ps($a) };
-    (avx512, f16, rsqrt, $a:expr) => { std::arch::x86_64::_mm512_rsqrt14_ps($a) };
-    (avx512, f16, recip, $a:expr) => { std::arch::x86_64::_mm512_rcp14_ps($a) };
+    (avx512, f16, rsqrt, $a:expr) => { $crate::simd_primitive!(avx512, f32, rsqrt, $a) };
+    (avx512, f16, recip, $a:expr) => { $crate::simd_primitive!(avx512, f32, recip, $a) };
     (avx512, f16, exp, $a:expr) => { $crate::simd_primitive!(avx512, f32, exp, $a) };
     (avx512, f16, prefetch, $p:expr, $dist:expr) => { std::arch::x86_64::_mm_prefetch($p as *const i8, std::arch::x86_64::_MM_HINT_T0) };
 
@@ -292,6 +326,7 @@ macro_rules! simd_primitive {
     (avx512, bf16, mul, $a:expr, $b:expr) => { std::arch::x86_64::_mm512_mul_ps($a, $b) };
     (avx512, bf16, div, $a:expr, $b:expr) => { std::arch::x86_64::_mm512_div_ps($a, $b) };
     (avx512, bf16, fma, $a:expr, $b:expr, $c:expr) => { std::arch::x86_64::_mm512_fmadd_ps($a, $b, $c) };
+    (avx512, bf16, fnmadd, $a:expr, $b:expr, $c:expr) => { std::arch::x86_64::_mm512_fnmadd_ps($a, $b, $c) };
     (avx512, bf16, neg, $a:expr) => { std::arch::x86_64::_mm512_sub_ps(std::arch::x86_64::_mm512_setzero_ps(), $a) };
     (avx512, bf16, max, $a:expr, $b:expr) => { std::arch::x86_64::_mm512_max_ps($a, $b) };
     (avx512, bf16, min, $a:expr, $b:expr) => { std::arch::x86_64::_mm512_min_ps($a, $b) };
@@ -299,8 +334,8 @@ macro_rules! simd_primitive {
     (avx512, bf16, reduce_max, $v:expr) => { std::arch::x86_64::_mm512_reduce_max_ps($v) };
     (avx512, bf16, abs, $a:expr) => { std::arch::x86_64::_mm512_abs_ps($a) };
     (avx512, bf16, sqrt, $a:expr) => { std::arch::x86_64::_mm512_sqrt_ps($a) };
-    (avx512, bf16, rsqrt, $a:expr) => { std::arch::x86_64::_mm512_rsqrt14_ps($a) };
-    (avx512, bf16, recip, $a:expr) => { std::arch::x86_64::_mm512_rcp14_ps($a) };
+    (avx512, bf16, rsqrt, $a:expr) => { $crate::simd_primitive!(avx512, f32, rsqrt, $a) };
+    (avx512, bf16, recip, $a:expr) => { $crate::simd_primitive!(avx512, f32, recip, $a) };
     (avx512, bf16, exp, $a:expr) => { $crate::simd_primitive!(avx512, f32, exp, $a) };
     (avx512, bf16, prefetch, $p:expr, $dist:expr) => { std::arch::x86_64::_mm_prefetch($p as *const i8, std::arch::x86_64::_MM_HINT_T0) };
 
@@ -330,6 +365,7 @@ macro_rules! simd_primitive {
     (neon, f32, mul, $a:expr, $b:expr) => { unsafe { std::arch::aarch64::vmulq_f32($a, $b) } };
     (neon, f32, div, $a:expr, $b:expr) => { unsafe { std::arch::aarch64::vdivq_f32($a, $b) } };
     (neon, f32, fma, $a:expr, $b:expr, $c:expr) => { unsafe { std::arch::aarch64::vfmaq_f32($c, $a, $b) } }; // c + a * b
+    (neon, f32, fnmadd, $a:expr, $b:expr, $c:expr) => { unsafe { std::arch::aarch64::vfmsq_f32($c, $a, $b) } }; // c - a * b
     (neon, f32, neg, $a:expr) => { unsafe { std::arch::aarch64::vnegq_f32($a) } };
     (neon, f32, max, $a:expr, $b:expr) => { unsafe { std::arch::aarch64::vmaxq_f32($a, $b) } };
     (neon, f32, min, $a:expr, $b:expr) => { unsafe { std::arch::aarch64::vminq_f32($a, $b) } };
@@ -341,8 +377,24 @@ macro_rules! simd_primitive {
     
     // Ops
     (neon, f32, sqrt, $a:expr) => { unsafe { std::arch::aarch64::vsqrtq_f32($a) } };
-    (neon, f32, rsqrt, $a:expr) => { unsafe { std::arch::aarch64::vrsqrteq_f32($a) } }; // Estimate?
-    (neon, f32, recip, $a:expr) => { unsafe { std::arch::aarch64::vrecpeq_f32($a) } }; // Estimate?
+    // rsqrt with one Newton-Raphson step via vrsqrtsq_f32
+    (neon, f32, rsqrt, $a:expr) => {
+        unsafe {
+            let r = std::arch::aarch64::vrsqrteq_f32($a);
+            // vrsqrtsq_f32(a, r*r) computes (3 - a * r * r) / 2
+            let step = std::arch::aarch64::vrsqrtsq_f32($a, std::arch::aarch64::vmulq_f32(r, r));
+            std::arch::aarch64::vmulq_f32(r, step)
+        }
+    };
+    // recip with one Newton-Raphson step via vrecpsq_f32
+    (neon, f32, recip, $a:expr) => {
+        unsafe {
+            let r = std::arch::aarch64::vrecpeq_f32($a);
+            // vrecpsq_f32(a, r) computes (2 - a * r)
+            let step = std::arch::aarch64::vrecpsq_f32($a, r);
+            std::arch::aarch64::vmulq_f32(r, step)
+        }
+    };
     
     // EXP
     (neon, f32, exp, $a:expr) => { $crate::cpu_kernels::neon::math::exp_ps($a) };
@@ -379,6 +431,7 @@ macro_rules! simd_primitive {
     (neon, f16, mul, $a:expr, $b:expr) => { unsafe { std::arch::aarch64::vmulq_f32($a, $b) } };
     (neon, f16, div, $a:expr, $b:expr) => { unsafe { std::arch::aarch64::vdivq_f32($a, $b) } };
     (neon, f16, fma, $a:expr, $b:expr, $c:expr) => { unsafe { std::arch::aarch64::vfmaq_f32($c, $a, $b) } };
+    (neon, f16, fnmadd, $a:expr, $b:expr, $c:expr) => { unsafe { std::arch::aarch64::vfmsq_f32($c, $a, $b) } };
     (neon, f16, neg, $a:expr) => { unsafe { std::arch::aarch64::vnegq_f32($a) } };
     (neon, f16, max, $a:expr, $b:expr) => { unsafe { std::arch::aarch64::vmaxq_f32($a, $b) } };
     (neon, f16, min, $a:expr, $b:expr) => { unsafe { std::arch::aarch64::vminq_f32($a, $b) } };
@@ -386,8 +439,8 @@ macro_rules! simd_primitive {
     (neon, f16, reduce_max, $v:expr) => { unsafe { std::arch::aarch64::vmaxvq_f32($v) } };
     (neon, f16, abs, $a:expr) => { unsafe { std::arch::aarch64::vabsq_f32($a) } };
     (neon, f16, sqrt, $a:expr) => { unsafe { std::arch::aarch64::vsqrtq_f32($a) } };
-    (neon, f16, rsqrt, $a:expr) => { unsafe { std::arch::aarch64::vrsqrteq_f32($a) } };
-    (neon, f16, recip, $a:expr) => { unsafe { std::arch::aarch64::vrecpeq_f32($a) } };
+    (neon, f16, rsqrt, $a:expr) => { $crate::simd_primitive!(neon, f32, rsqrt, $a) };
+    (neon, f16, recip, $a:expr) => { $crate::simd_primitive!(neon, f32, recip, $a) };
     (neon, f16, exp, $a:expr) => { $crate::cpu_kernels::neon::math::exp_ps($a) };
     (neon, f16, prefetch, $p:expr, $dist:expr) => { };
 
@@ -425,6 +478,7 @@ macro_rules! simd_primitive {
     (neon, bf16, mul, $a:expr, $b:expr) => { unsafe { std::arch::aarch64::vmulq_f32($a, $b) } };
     (neon, bf16, div, $a:expr, $b:expr) => { unsafe { std::arch::aarch64::vdivq_f32($a, $b) } };
     (neon, bf16, fma, $a:expr, $b:expr, $c:expr) => { unsafe { std::arch::aarch64::vfmaq_f32($c, $a, $b) } };
+    (neon, bf16, fnmadd, $a:expr, $b:expr, $c:expr) => { unsafe { std::arch::aarch64::vfmsq_f32($c, $a, $b) } };
     (neon, bf16, neg, $a:expr) => { unsafe { std::arch::aarch64::vnegq_f32($a) } };
     (neon, bf16, max, $a:expr, $b:expr) => { unsafe { std::arch::aarch64::vmaxq_f32($a, $b) } };
     (neon, bf16, min, $a:expr, $b:expr) => { unsafe { std::arch::aarch64::vminq_f32($a, $b) } };
@@ -432,8 +486,8 @@ macro_rules! simd_primitive {
     (neon, bf16, reduce_max, $v:expr) => { unsafe { std::arch::aarch64::vmaxvq_f32($v) } };
     (neon, bf16, abs, $a:expr) => { unsafe { std::arch::aarch64::vabsq_f32($a) } };
     (neon, bf16, sqrt, $a:expr) => { unsafe { std::arch::aarch64::vsqrtq_f32($a) } };
-    (neon, bf16, rsqrt, $a:expr) => { unsafe { std::arch::aarch64::vrsqrteq_f32($a) } };
-    (neon, bf16, recip, $a:expr) => { unsafe { std::arch::aarch64::vrecpeq_f32($a) } };
+    (neon, bf16, rsqrt, $a:expr) => { $crate::simd_primitive!(neon, f32, rsqrt, $a) };
+    (neon, bf16, recip, $a:expr) => { $crate::simd_primitive!(neon, f32, recip, $a) };
     (neon, bf16, exp, $a:expr) => { $crate::cpu_kernels::neon::math::exp_ps($a) };
     (neon, bf16, prefetch, $p:expr, $dist:expr) => { };
 
@@ -483,6 +537,7 @@ macro_rules! simd_primitive {
     (scalar, f16, mul, $a:expr, $b:expr) => { $a * $b };
     (scalar, f16, div, $a:expr, $b:expr) => { $a / $b };
     (scalar, f16, fma, $a:expr, $b:expr, $c:expr) => { $c + $a * $b };
+    (scalar, f16, fnmadd, $a:expr, $b:expr, $c:expr) => { $c - $a * $b };
     (scalar, f16, neg, $a:expr) => { -$a };
     (scalar, f16, max, $a:expr, $b:expr) => { $a.max($b) };
     (scalar, f16, min, $a:expr, $b:expr) => { $a.min($b) };
@@ -526,6 +581,7 @@ macro_rules! simd_primitive {
     (avx2, f16, mul, $a:expr, $b:expr) => { std::arch::x86_64::_mm256_mul_ps($a, $b) };
     (avx2, f16, div, $a:expr, $b:expr) => { std::arch::x86_64::_mm256_div_ps($a, $b) };
     (avx2, f16, fma, $a:expr, $b:expr, $c:expr) => { std::arch::x86_64::_mm256_fmadd_ps($a, $b, $c) };
+    (avx2, f16, fnmadd, $a:expr, $b:expr, $c:expr) => { std::arch::x86_64::_mm256_fnmadd_ps($a, $b, $c) };
     (avx2, f16, neg, $a:expr) => { std::arch::x86_64::_mm256_sub_ps(std::arch::x86_64::_mm256_setzero_ps(), $a) };
     (avx2, f16, max, $a:expr, $b:expr) => { std::arch::x86_64::_mm256_max_ps($a, $b) };
     (avx2, f16, min, $a:expr, $b:expr) => { std::arch::x86_64::_mm256_min_ps($a, $b) };
@@ -534,8 +590,8 @@ macro_rules! simd_primitive {
     (avx2, f16, abs, $a:expr) => { std::arch::x86_64::_mm256_andnot_ps(std::arch::x86_64::_mm256_set1_ps(-0.0), $a) };
     (avx2, f16, exp, $a:expr) => { $crate::cpu_kernels::avx2::math::avx2_exp_f32($a) };
     (avx2, f16, sqrt, $a:expr) => { std::arch::x86_64::_mm256_sqrt_ps($a) };
-    (avx2, f16, rsqrt, $a:expr) => { std::arch::x86_64::_mm256_rsqrt_ps($a) };
-    (avx2, f16, recip, $a:expr) => { std::arch::x86_64::_mm256_rcp_ps($a) };
+    (avx2, f16, rsqrt, $a:expr) => { $crate::simd_primitive!(avx2, f32, rsqrt, $a) };
+    (avx2, f16, recip, $a:expr) => { $crate::simd_primitive!(avx2, f32, recip, $a) };
     (avx2, f16, prefetch, $p:expr, $dist:expr) => { std::arch::x86_64::_mm_prefetch($p as *const i8, std::arch::x86_64::_MM_HINT_T0) };
 
     // ========================================================================
@@ -561,6 +617,7 @@ macro_rules! simd_primitive {
     (scalar, bf16, mul, $a:expr, $b:expr) => { $a * $b };
     (scalar, bf16, div, $a:expr, $b:expr) => { $a / $b };
     (scalar, bf16, fma, $a:expr, $b:expr, $c:expr) => { $c + $a * $b };
+    (scalar, bf16, fnmadd, $a:expr, $b:expr, $c:expr) => { $c - $a * $b };
     (scalar, bf16, neg, $a:expr) => { -$a };
     (scalar, bf16, max, $a:expr, $b:expr) => { $a.max($b) };
     (scalar, bf16, min, $a:expr, $b:expr) => { $a.min($b) };
@@ -611,6 +668,7 @@ macro_rules! simd_primitive {
     (avx2, bf16, mul, $a:expr, $b:expr) => { std::arch::x86_64::_mm256_mul_ps($a, $b) };
     (avx2, bf16, div, $a:expr, $b:expr) => { std::arch::x86_64::_mm256_div_ps($a, $b) };
     (avx2, bf16, fma, $a:expr, $b:expr, $c:expr) => { std::arch::x86_64::_mm256_fmadd_ps($a, $b, $c) };
+    (avx2, bf16, fnmadd, $a:expr, $b:expr, $c:expr) => { std::arch::x86_64::_mm256_fnmadd_ps($a, $b, $c) };
     (avx2, bf16, neg, $a:expr) => { std::arch::x86_64::_mm256_sub_ps(std::arch::x86_64::_mm256_setzero_ps(), $a) };
     (avx2, bf16, max, $a:expr, $b:expr) => { std::arch::x86_64::_mm256_max_ps($a, $b) };
     (avx2, bf16, min, $a:expr, $b:expr) => { std::arch::x86_64::_mm256_min_ps($a, $b) };
@@ -619,8 +677,8 @@ macro_rules! simd_primitive {
     (avx2, bf16, abs, $a:expr) => { std::arch::x86_64::_mm256_andnot_ps(std::arch::x86_64::_mm256_set1_ps(-0.0), $a) };
     (avx2, bf16, exp, $a:expr) => { $crate::cpu_kernels::avx2::math::avx2_exp_f32($a) };
     (avx2, bf16, sqrt, $a:expr) => { std::arch::x86_64::_mm256_sqrt_ps($a) };
-    (avx2, bf16, rsqrt, $a:expr) => { std::arch::x86_64::_mm256_rsqrt_ps($a) };
-    (avx2, bf16, recip, $a:expr) => { std::arch::x86_64::_mm256_rcp_ps($a) };
+    (avx2, bf16, rsqrt, $a:expr) => { $crate::simd_primitive!(avx2, f32, rsqrt, $a) };
+    (avx2, bf16, recip, $a:expr) => { $crate::simd_primitive!(avx2, f32, recip, $a) };
     (avx2, bf16, prefetch, $p:expr, $dist:expr) => { std::arch::x86_64::_mm_prefetch($p as *const i8, std::arch::x86_64::_MM_HINT_T0) };
 
 }

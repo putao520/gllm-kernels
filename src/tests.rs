@@ -48,6 +48,57 @@ mod tests {
         assert_eq!(c, vec![58.0, 64.0, 139.0, 154.0]);
     }
 
+    #[test]
+    fn test_prepacked_matmul_f32() {
+        let kernels = CpuKernels::<f32>::new();
+        let (m, n, k) = (2, 2, 3);
+        let a = vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0];
+        let b = vec![7.0, 8.0, 9.0, 10.0, 11.0, 12.0];
+
+        let packed_b = kernels.pack_b(&b, n, k);
+        let mut c = vec![0.0; m * n];
+        kernels.gemm_prepacked(&a, &packed_b, &mut c, m, n, k);
+        assert_eq!(c, vec![58.0, 64.0, 139.0, 154.0]);
+    }
+
+    #[test]
+    fn test_prepacked_matmul_bias_f32() {
+        let kernels = CpuKernels::<f32>::new();
+        let (m, n, k) = (2, 2, 3);
+        let a = vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0];
+        let b = vec![7.0, 8.0, 9.0, 10.0, 11.0, 12.0];
+        let bias = vec![100.0, 200.0];
+
+        let packed_b = kernels.pack_b(&b, n, k);
+        let mut c = vec![0.0; m * n];
+        kernels.gemm_bias_prepacked(&a, &packed_b, &bias, &mut c, m, n, k);
+        assert_eq!(c, vec![158.0, 264.0, 239.0, 354.0]);
+    }
+
+    #[test]
+    fn test_prepacked_matmul_larger_f32() {
+        let kernels = CpuKernels::<f32>::new();
+        let (m, n, k) = (4, 8, 16);
+        let a: Vec<f32> = (0..m * k).map(|i| (i as f32) * 0.1).collect();
+        let b: Vec<f32> = (0..k * n).map(|i| (i as f32) * 0.05).collect();
+
+        // Reference: regular matmul
+        let mut c_ref = vec![0.0f32; m * n];
+        kernels.gemm(&a, &b, &mut c_ref, m, n, k);
+
+        // Prepacked matmul
+        let packed_b = kernels.pack_b(&b, n, k);
+        let mut c_packed = vec![0.0f32; m * n];
+        kernels.gemm_prepacked(&a, &packed_b, &mut c_packed, m, n, k);
+
+        for i in 0..m * n {
+            assert!(
+                (c_ref[i] - c_packed[i]).abs() < 1e-4,
+                "mismatch at {}: ref={}, packed={}", i, c_ref[i], c_packed[i]
+            );
+        }
+    }
+
     // ========================================================================
     // Block 1: BLAS-1 tests
     // ========================================================================
