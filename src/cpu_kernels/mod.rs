@@ -811,6 +811,41 @@ macro_rules! dispatch_matmul_bias {
     };
 }
 
+macro_rules! dispatch_matmul_bias_act {
+    ($op:ident, $a:expr, $b:expr, $bias:expr, $c:expr, $m:expr, $n:expr, $k:expr, $act:expr) => {{
+        let act = $act;
+        if matches!(act, crate::Activation::None) {
+            dispatch_matmul_bias!(matmul_bias, $a, $b, $bias, $c, $m, $n, $k);
+            return;
+        }
+        match (get_isa_level(), E::ELEM_ID) {
+            #[cfg(target_arch = "x86_64")]
+            (IsaLevel::Avx512, 0) => avx512::avx512_f32::$op(as_typed_slice!($a, f32), as_typed_slice!($b, f32), as_typed_slice!($bias, f32), as_typed_slice_mut!($c, f32), $m, $n, $k, act),
+            #[cfg(target_arch = "x86_64")]
+            (IsaLevel::Avx512, 1) => avx512::avx512_f16::$op(as_typed_slice!($a, half::f16), as_typed_slice!($b, half::f16), as_typed_slice!($bias, half::f16), as_typed_slice_mut!($c, half::f16), $m, $n, $k, act),
+            #[cfg(target_arch = "x86_64")]
+            (IsaLevel::Avx512, 2) => avx512::avx512_bf16::$op(as_typed_slice!($a, half::bf16), as_typed_slice!($b, half::bf16), as_typed_slice!($bias, half::bf16), as_typed_slice_mut!($c, half::bf16), $m, $n, $k, act),
+            #[cfg(target_arch = "x86_64")]
+            (IsaLevel::Avx2, 0) => avx2::avx2_f32::$op(as_typed_slice!($a, f32), as_typed_slice!($b, f32), as_typed_slice!($bias, f32), as_typed_slice_mut!($c, f32), $m, $n, $k, act),
+            #[cfg(target_arch = "x86_64")]
+            (IsaLevel::Avx2, 1) => avx2::avx2_f16::$op(as_typed_slice!($a, half::f16), as_typed_slice!($b, half::f16), as_typed_slice!($bias, half::f16), as_typed_slice_mut!($c, half::f16), $m, $n, $k, act),
+            #[cfg(target_arch = "x86_64")]
+            (IsaLevel::Avx2, 2) => avx2::avx2_bf16::$op(as_typed_slice!($a, half::bf16), as_typed_slice!($b, half::bf16), as_typed_slice!($bias, half::bf16), as_typed_slice_mut!($c, half::bf16), $m, $n, $k, act),
+            // Fallback: matmul_bias + scalar activation in-place
+            _ => {
+                dispatch_matmul_bias!(matmul_bias, $a, $b, $bias, $c, $m, $n, $k);
+                let len = $m * $n;
+                match act {
+                    crate::Activation::Relu => { for i in 0..len { if $c[i].to_f32() < 0.0 { $c[i] = E::ZERO; } } },
+                    crate::Activation::Silu => { for i in 0..len { let v = $c[i].to_f32(); $c[i] = E::from_f32(v / (1.0 + (-v).exp())); } },
+                    crate::Activation::Gelu => { for i in 0..len { let x = $c[i].to_f32(); let inner = 0.7978845608f32 * (x + 0.044715f32 * x * x * x); $c[i] = E::from_f32(0.5 * x * (1.0 + inner.tanh())); } },
+                    _ => {},
+                }
+            },
+        }
+    }};
+}
+
 /// Transmute Vec<$concrete> to Vec<E> (same size/alignment guaranteed by Element trait).
 macro_rules! transmute_vec {
     ($vec:expr, $concrete:ty) => {
@@ -991,6 +1026,11 @@ impl<E: Element> Kernels<E> for CpuKernels<E> {
     fn gemm_bias(&self, a: &[E], b: &[E], bias: &[E], c: &mut [E], m: usize, n: usize, k: usize) {
         assert!(c.len() == m * n && bias.len() == n);
         dispatch_matmul_bias!(matmul_bias, a, b, bias, c, m, n, k);
+    }
+
+    fn gemm_bias_act(&self, a: &[E], b: &[E], bias: &[E], c: &mut [E], m: usize, n: usize, k: usize, act: crate::Activation) {
+        assert!(c.len() == m * n && bias.len() == n);
+        dispatch_matmul_bias_act!(matmul_bias_act, a, b, bias, c, m, n, k, act);
     }
 
     fn pack_b(&self, b: &[E], n: usize, k: usize) -> Vec<E> {

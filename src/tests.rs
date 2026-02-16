@@ -979,6 +979,34 @@ mod tests {
     }
 
     // ========================================================================
+    // Block 15e: No-pack vs packed path boundary tests
+    // ========================================================================
+    //
+    // Threshold is 4*TM: AVX-512=56, AVX2=24, NEON=32.
+    // Test at boundary, below, and above to exercise both paths.
+
+    // f32: large M forces packed path (M=64 > 56 for AVX-512, > 24 for AVX2)
+    #[test] fn test_f32_gemm_large_m_packed()  { check_f32_gemm(64, 64, 33); }
+    #[test] fn test_f32_gemm_large_m_n_rem()   { check_f32_gemm(64, 65, 33); }
+    // f32: M=1 (token-gen) — always no-pack
+    #[test] fn test_f32_gemm_m1_wide()         { check_f32_gemm(1, 128, 64); }
+    #[test] fn test_f32_gemm_m1_n_rem()        { check_f32_gemm(1, 129, 64); }
+    // f32: M=4 (small batch) — no-pack
+    #[test] fn test_f32_gemm_m4_wide()         { check_f32_gemm(4, 128, 64); }
+
+    // f16: large M forces packed path
+    #[test] fn test_f16_gemm_large_m_packed()  { check_f16_gemm(64, 64, 33); }
+    #[test] fn test_f16_gemm_large_m_n_rem()   { check_f16_gemm(64, 65, 33); }
+    #[test] fn test_f16_gemm_m1_wide()         { check_f16_gemm(1, 128, 64); }
+    #[test] fn test_f16_gemm_m4_wide()         { check_f16_gemm(4, 128, 64); }
+
+    // bf16: large M forces packed path
+    #[test] fn test_bf16_gemm_large_m_packed() { check_bf16_gemm(64, 64, 33); }
+    #[test] fn test_bf16_gemm_large_m_n_rem()  { check_bf16_gemm(64, 65, 33); }
+    #[test] fn test_bf16_gemm_m1_wide()        { check_bf16_gemm(1, 128, 64); }
+    #[test] fn test_bf16_gemm_m4_wide()        { check_bf16_gemm(4, 128, 64); }
+
+    // ========================================================================
     // Block 16: K-Quant dequant tests (Q2_K, Q3_K, Q5_K, Q6_K)
     // ========================================================================
 

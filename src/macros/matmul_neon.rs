@@ -8,17 +8,26 @@ macro_rules! define_matmul_neon {
         const TM_: usize = 8;
         const LANES_: usize = $crate::simd_primitive!(neon, $elem, lanes);
         const TN_: usize = 3 * LANES_;
-        const KC_: usize = 256;
+
+        /// Cached blocking parameters for this NEON backend.
+        #[inline(always)]
+        fn _blocking() -> $crate::cache_params::BlockingParams {
+            static BP: std::sync::OnceLock<$crate::cache_params::BlockingParams> = std::sync::OnceLock::new();
+            *BP.get_or_init(|| $crate::cache_params::blocking_params(
+                TM_, 3, LANES_, std::mem::size_of::<$elem>(),
+            ))
+        }
 
         pub fn pack_b(b: &[$elem], n_size: usize, k_size: usize) -> Vec<$elem> {
+            let kc_max = _blocking().kc;
             assert!(b.len() >= k_size * n_size);
             let n_strips = (n_size + TN_ - 1) / TN_;
-            let n_chunks = (k_size + KC_ - 1) / KC_;
-            let cs = n_strips * KC_ * TN_;
+            let n_chunks = (k_size + kc_max - 1) / kc_max;
+            let cs = n_strips * kc_max * TN_;
             let mut packed = vec![<$elem as Element>::ZERO; n_chunks * cs];
             let mut ks = 0usize; let mut ch = 0usize;
             while ks < k_size {
-                let kc = KC_.min(k_size - ks);
+                let kc = kc_max.min(k_size - ks);
                 let base = ch * cs;
                 for (i, ns) in (0..n_size).step_by(TN_).enumerate() {
                     let an = TN_.min(n_size - ns);
@@ -26,26 +35,268 @@ macro_rules! define_matmul_neon {
                         unsafe {
                             std::ptr::copy_nonoverlapping(
                                 b.as_ptr().add((ks + k) * n_size + ns),
-                                packed.as_mut_ptr().add(base + i * KC_ * TN_ + k * TN_),
+                                packed.as_mut_ptr().add(base + i * kc_max * TN_ + k * TN_),
                                 an,
                             );
                         }
                     }
                 }
-                ks += KC_; ch += 1;
+                ks += kc_max; ch += 1;
             }
             packed
         }
 
+        // ── Small-M no-pack path: read B directly from row-major layout ──
+        #[inline(always)]
+        fn neon_matmul_nopack(a: &[$elem], b: &[$elem], c: &mut [$elem],
+                              m_size: usize, n_size: usize, k_size: usize) {
+            assert!(a.len() >= m_size * k_size);
+            assert!(b.len() >= k_size * n_size);
+            assert!(c.len() >= m_size * n_size);
+
+            let ap = a.as_ptr();
+            let bp = b.as_ptr();
+            let cp = c.as_mut_ptr();
+
+            let mut m = 0usize;
+            while m + TM_ <= m_size {
+                let mut n = 0usize;
+                while n + TN_ <= n_size {
+                    #[allow(unused_unsafe)]
+                    unsafe { paste::paste! {
+                        $(
+                            let mut [<c_ $R _0>] = $crate::simd_primitive!(neon, $elem, zero);
+                            let mut [<c_ $R _1>] = $crate::simd_primitive!(neon, $elem, zero);
+                            let mut [<c_ $R _2>] = $crate::simd_primitive!(neon, $elem, zero);
+                        )+
+                        for k in 0..k_size {
+                            let vb0 = $crate::simd_primitive!(neon, $elem, loadu, bp.add(k * n_size + n));
+                            let vb1 = $crate::simd_primitive!(neon, $elem, loadu, bp.add(k * n_size + n + LANES_));
+                            let vb2 = $crate::simd_primitive!(neon, $elem, loadu, bp.add(k * n_size + n + LANES_ * 2));
+                            $(
+                                let va = $crate::simd_primitive!(neon, $elem, splat, *ap.add((m + $R) * k_size + k));
+                                [<c_ $R _0>] = $crate::simd_primitive!(neon, $elem, fma, va, vb0, [<c_ $R _0>]);
+                                [<c_ $R _1>] = $crate::simd_primitive!(neon, $elem, fma, va, vb1, [<c_ $R _1>]);
+                                [<c_ $R _2>] = $crate::simd_primitive!(neon, $elem, fma, va, vb2, [<c_ $R _2>]);
+                            )+
+                        }
+                        $($crate::simd_primitive!(neon, $elem, storeu, cp.add((m + $R) * n_size + n), [<c_ $R _0>]);
+                          $crate::simd_primitive!(neon, $elem, storeu, cp.add((m + $R) * n_size + n + LANES_), [<c_ $R _1>]);
+                          $crate::simd_primitive!(neon, $elem, storeu, cp.add((m + $R) * n_size + n + LANES_ * 2), [<c_ $R _2>]);)+
+                    }}
+                    n += TN_;
+                }
+                // N-remainder: LANES-wide
+                while n + LANES_ <= n_size {
+                    #[allow(unused_unsafe)]
+                    unsafe { paste::paste! {
+                        $(
+                            let mut [<c_ $R>] = $crate::simd_primitive!(neon, $elem, zero);
+                        )+
+                        for k in 0..k_size {
+                            let vb = $crate::simd_primitive!(neon, $elem, loadu, bp.add(k * n_size + n));
+                            $(
+                                let va = $crate::simd_primitive!(neon, $elem, splat, *ap.add((m + $R) * k_size + k));
+                                [<c_ $R>] = $crate::simd_primitive!(neon, $elem, fma, va, vb, [<c_ $R>]);
+                            )+
+                        }
+                        $($crate::simd_primitive!(neon, $elem, storeu, cp.add((m + $R) * n_size + n), [<c_ $R>]);)+
+                    }}
+                    n += LANES_;
+                }
+                // N-remainder: scalar
+                while n < n_size {
+                    $(
+                    {
+                        let mut s = <$elem as Element>::ZERO;
+                        for k in 0..k_size { s = <$elem as Element>::mul_add(s, a[(m + $R) * k_size + k], b[k * n_size + n]); }
+                        c[(m + $R) * n_size + n] = s;
+                    }
+                    )+
+                    n += 1;
+                }
+                m += TM_;
+            }
+            // M-remainder
+            while m < m_size {
+                let mut n = 0usize;
+                while n + TN_ <= n_size {
+                    #[allow(unused_unsafe)]
+                    unsafe {
+                        let mut c0 = $crate::simd_primitive!(neon, $elem, zero);
+                        let mut c1 = $crate::simd_primitive!(neon, $elem, zero);
+                        let mut c2 = $crate::simd_primitive!(neon, $elem, zero);
+                        for k in 0..k_size {
+                            let va = $crate::simd_primitive!(neon, $elem, splat, *ap.add(m * k_size + k));
+                            let vb0 = $crate::simd_primitive!(neon, $elem, loadu, bp.add(k * n_size + n));
+                            let vb1 = $crate::simd_primitive!(neon, $elem, loadu, bp.add(k * n_size + n + LANES_));
+                            let vb2 = $crate::simd_primitive!(neon, $elem, loadu, bp.add(k * n_size + n + LANES_ * 2));
+                            c0 = $crate::simd_primitive!(neon, $elem, fma, va, vb0, c0);
+                            c1 = $crate::simd_primitive!(neon, $elem, fma, va, vb1, c1);
+                            c2 = $crate::simd_primitive!(neon, $elem, fma, va, vb2, c2);
+                        }
+                        $crate::simd_primitive!(neon, $elem, storeu, cp.add(m * n_size + n), c0);
+                        $crate::simd_primitive!(neon, $elem, storeu, cp.add(m * n_size + n + LANES_), c1);
+                        $crate::simd_primitive!(neon, $elem, storeu, cp.add(m * n_size + n + LANES_ * 2), c2);
+                    }
+                    n += TN_;
+                }
+                while n + LANES_ <= n_size {
+                    #[allow(unused_unsafe)]
+                    unsafe {
+                        let mut acc = $crate::simd_primitive!(neon, $elem, zero);
+                        for k in 0..k_size {
+                            let va = $crate::simd_primitive!(neon, $elem, splat, *ap.add(m * k_size + k));
+                            let vb = $crate::simd_primitive!(neon, $elem, loadu, bp.add(k * n_size + n));
+                            acc = $crate::simd_primitive!(neon, $elem, fma, va, vb, acc);
+                        }
+                        $crate::simd_primitive!(neon, $elem, storeu, cp.add(m * n_size + n), acc);
+                    }
+                    n += LANES_;
+                }
+                while n < n_size {
+                    let mut s = <$elem as Element>::ZERO;
+                    for k in 0..k_size { s = <$elem as Element>::mul_add(s, a[m * k_size + k], b[k * n_size + n]); }
+                    c[m * n_size + n] = s;
+                    n += 1;
+                }
+                m += 1;
+            }
+        }
+
+        // ── Small-M no-pack path with bias ──
+        #[inline(always)]
+        fn neon_matmul_bias_nopack(a: &[$elem], b: &[$elem], bias: &[$elem], c: &mut [$elem],
+                                    m_size: usize, n_size: usize, k_size: usize) {
+            assert!(a.len() >= m_size * k_size);
+            assert!(b.len() >= k_size * n_size);
+            assert!(c.len() >= m_size * n_size);
+            assert!(bias.len() >= n_size);
+
+            let ap = a.as_ptr();
+            let bp = b.as_ptr();
+            let cp = c.as_mut_ptr();
+            let biasp = bias.as_ptr();
+
+            let mut m = 0usize;
+            while m + TM_ <= m_size {
+                let mut n = 0usize;
+                while n + TN_ <= n_size {
+                    #[allow(unused_unsafe)]
+                    unsafe { paste::paste! {
+                        $(
+                            let mut [<c_ $R _0>] = $crate::simd_primitive!(neon, $elem, loadu, biasp.add(n));
+                            let mut [<c_ $R _1>] = $crate::simd_primitive!(neon, $elem, loadu, biasp.add(n + LANES_));
+                            let mut [<c_ $R _2>] = $crate::simd_primitive!(neon, $elem, loadu, biasp.add(n + LANES_ * 2));
+                        )+
+                        for k in 0..k_size {
+                            let vb0 = $crate::simd_primitive!(neon, $elem, loadu, bp.add(k * n_size + n));
+                            let vb1 = $crate::simd_primitive!(neon, $elem, loadu, bp.add(k * n_size + n + LANES_));
+                            let vb2 = $crate::simd_primitive!(neon, $elem, loadu, bp.add(k * n_size + n + LANES_ * 2));
+                            $(
+                                let va = $crate::simd_primitive!(neon, $elem, splat, *ap.add((m + $R) * k_size + k));
+                                [<c_ $R _0>] = $crate::simd_primitive!(neon, $elem, fma, va, vb0, [<c_ $R _0>]);
+                                [<c_ $R _1>] = $crate::simd_primitive!(neon, $elem, fma, va, vb1, [<c_ $R _1>]);
+                                [<c_ $R _2>] = $crate::simd_primitive!(neon, $elem, fma, va, vb2, [<c_ $R _2>]);
+                            )+
+                        }
+                        $($crate::simd_primitive!(neon, $elem, storeu, cp.add((m + $R) * n_size + n), [<c_ $R _0>]);
+                          $crate::simd_primitive!(neon, $elem, storeu, cp.add((m + $R) * n_size + n + LANES_), [<c_ $R _1>]);
+                          $crate::simd_primitive!(neon, $elem, storeu, cp.add((m + $R) * n_size + n + LANES_ * 2), [<c_ $R _2>]);)+
+                    }}
+                    n += TN_;
+                }
+                while n + LANES_ <= n_size {
+                    #[allow(unused_unsafe)]
+                    unsafe { paste::paste! {
+                        $(
+                            let mut [<c_ $R>] = $crate::simd_primitive!(neon, $elem, loadu, biasp.add(n));
+                        )+
+                        for k in 0..k_size {
+                            let vb = $crate::simd_primitive!(neon, $elem, loadu, bp.add(k * n_size + n));
+                            $(
+                                let va = $crate::simd_primitive!(neon, $elem, splat, *ap.add((m + $R) * k_size + k));
+                                [<c_ $R>] = $crate::simd_primitive!(neon, $elem, fma, va, vb, [<c_ $R>]);
+                            )+
+                        }
+                        $($crate::simd_primitive!(neon, $elem, storeu, cp.add((m + $R) * n_size + n), [<c_ $R>]);)+
+                    }}
+                    n += LANES_;
+                }
+                while n < n_size {
+                    $(
+                    {
+                        let mut s = bias[n];
+                        for k in 0..k_size { s = <$elem as Element>::mul_add(s, a[(m + $R) * k_size + k], b[k * n_size + n]); }
+                        c[(m + $R) * n_size + n] = s;
+                    }
+                    )+
+                    n += 1;
+                }
+                m += TM_;
+            }
+            while m < m_size {
+                let mut n = 0usize;
+                while n + TN_ <= n_size {
+                    #[allow(unused_unsafe)]
+                    unsafe {
+                        let mut c0 = $crate::simd_primitive!(neon, $elem, loadu, biasp.add(n));
+                        let mut c1 = $crate::simd_primitive!(neon, $elem, loadu, biasp.add(n + LANES_));
+                        let mut c2 = $crate::simd_primitive!(neon, $elem, loadu, biasp.add(n + LANES_ * 2));
+                        for k in 0..k_size {
+                            let va = $crate::simd_primitive!(neon, $elem, splat, *ap.add(m * k_size + k));
+                            let vb0 = $crate::simd_primitive!(neon, $elem, loadu, bp.add(k * n_size + n));
+                            let vb1 = $crate::simd_primitive!(neon, $elem, loadu, bp.add(k * n_size + n + LANES_));
+                            let vb2 = $crate::simd_primitive!(neon, $elem, loadu, bp.add(k * n_size + n + LANES_ * 2));
+                            c0 = $crate::simd_primitive!(neon, $elem, fma, va, vb0, c0);
+                            c1 = $crate::simd_primitive!(neon, $elem, fma, va, vb1, c1);
+                            c2 = $crate::simd_primitive!(neon, $elem, fma, va, vb2, c2);
+                        }
+                        $crate::simd_primitive!(neon, $elem, storeu, cp.add(m * n_size + n), c0);
+                        $crate::simd_primitive!(neon, $elem, storeu, cp.add(m * n_size + n + LANES_), c1);
+                        $crate::simd_primitive!(neon, $elem, storeu, cp.add(m * n_size + n + LANES_ * 2), c2);
+                    }
+                    n += TN_;
+                }
+                while n + LANES_ <= n_size {
+                    #[allow(unused_unsafe)]
+                    unsafe {
+                        let mut acc = $crate::simd_primitive!(neon, $elem, loadu, biasp.add(n));
+                        for k in 0..k_size {
+                            let va = $crate::simd_primitive!(neon, $elem, splat, *ap.add(m * k_size + k));
+                            let vb = $crate::simd_primitive!(neon, $elem, loadu, bp.add(k * n_size + n));
+                            acc = $crate::simd_primitive!(neon, $elem, fma, va, vb, acc);
+                        }
+                        $crate::simd_primitive!(neon, $elem, storeu, cp.add(m * n_size + n), acc);
+                    }
+                    n += LANES_;
+                }
+                while n < n_size {
+                    let mut s = bias[n];
+                    for k in 0..k_size { s = <$elem as Element>::mul_add(s, a[m * k_size + k], b[k * n_size + n]); }
+                    c[m * n_size + n] = s;
+                    n += 1;
+                }
+                m += 1;
+            }
+        }
+
+        const SMALL_M_THRESHOLD_: usize = 4 * TM_;
+
         #[inline(always)]
         pub fn matmul(a: &[$elem], b: &[$elem], c: &mut [$elem], m_size: usize, n_size: usize, k_size: usize) {
+            let kc_max = _blocking().kc;
+            if m_size <= SMALL_M_THRESHOLD_ {
+                neon_matmul_nopack(a, b, c, m_size, n_size, k_size);
+                return;
+            }
             assert!(a.len() >= m_size * k_size);
             assert!(b.len() >= n_size * k_size);
             assert!(c.len() >= m_size * n_size);
 
             let n_strips = (n_size + TN_ - 1) / TN_;
-            let n_chunks = (k_size + KC_ - 1) / KC_;
-            let cs = n_strips * KC_ * TN_;
+            let n_chunks = (k_size + kc_max - 1) / kc_max;
+            let cs = n_strips * kc_max * TN_;
             let tp = n_chunks * cs;
 
             thread_local! { static WS: std::cell::Cell<Vec<$elem>> = std::cell::Cell::new(Vec::new()); }
@@ -54,24 +305,24 @@ macro_rules! define_matmul_neon {
             {
                 let mut ks = 0usize; let mut ch = 0usize;
                 while ks < k_size {
-                    let kc = KC_.min(k_size - ks);
+                    let kc = kc_max.min(k_size - ks);
                     let base = ch * cs;
                     for i in 0..n_strips {
                         let ns = i * TN_;
                         let an = TN_.min(n_size.saturating_sub(ns));
                         for k in 0..kc {
-                            let d = base + i * KC_ * TN_ + k * TN_;
+                            let d = base + i * kc_max * TN_ + k * TN_;
                             unsafe { std::ptr::copy_nonoverlapping(b.as_ptr().add((ks+k)*n_size+ns), pb.as_mut_ptr().add(d), an); }
                         }
                     }
-                    ks += KC_; ch += 1;
+                    ks += kc_max; ch += 1;
                 }
             }
 
             let cp = c.as_mut_ptr();
             let mut ks = 0usize; let mut ch = 0usize;
             while ks < k_size {
-                let kc = KC_.min(k_size - ks);
+                let kc = kc_max.min(k_size - ks);
                 let mut m = 0;
                 while m + TM_ <= m_size {
                     let mut n = 0; let mut si = 0;
@@ -90,7 +341,7 @@ macro_rules! define_matmul_neon {
                             )};
                             )+
                             let mut ac = a.as_ptr().add(m*k_size+ks);
-                            let mut bp = pb.as_ptr().add(ch*cs+si*KC_*TN_);
+                            let mut bp = pb.as_ptr().add(ch*cs+si*kc_max*TN_);
                             // Prefetch C output tile into L1 before K-loop
                             $($crate::simd_primitive!(neon, $elem, prefetch, cp.add((m+$R)*n_size+n) as *const u8, 0);)+
                             let mut _k = 0usize;
@@ -193,7 +444,7 @@ macro_rules! define_matmul_neon {
                     }
                     m += TM_;
                 }
-                ks += KC_; ch += 1;
+                ks += kc_max; ch += 1;
             }
             // Remainder N
             let nm = (n_size / TN_) * TN_;
@@ -236,8 +487,8 @@ macro_rules! define_matmul_neon {
                         let mut ac = a.as_ptr().add(m*k_size);
                         let mut ks2 = 0usize; let mut ci = 0usize;
                         while ks2 < k_size {
-                            let kc = KC_.min(k_size-ks2);
-                            let mut bpp = pb.as_ptr().add(ci*cs+si*KC_*TN_);
+                            let kc = kc_max.min(k_size-ks2);
+                            let mut bpp = pb.as_ptr().add(ci*cs+si*kc_max*TN_);
                             for _ in 0..kc {
                                 let va = $crate::simd_primitive!(neon, $elem, splat, *ac);
                                 let v0 = $crate::simd_primitive!(neon, $elem, loadu, bpp);
@@ -263,14 +514,19 @@ macro_rules! define_matmul_neon {
         // ── matmul_bias: C = A * B + bias ──────────────────────────────
         #[inline(always)]
         pub fn matmul_bias(a: &[$elem], b: &[$elem], bias: &[$elem], c: &mut [$elem], m_size: usize, n_size: usize, k_size: usize) {
+            let kc_max = _blocking().kc;
+            if m_size <= SMALL_M_THRESHOLD_ {
+                neon_matmul_bias_nopack(a, b, bias, c, m_size, n_size, k_size);
+                return;
+            }
             assert!(a.len() >= m_size * k_size);
             assert!(b.len() >= n_size * k_size);
             assert!(c.len() >= m_size * n_size);
             assert!(bias.len() >= n_size);
 
             let n_strips = (n_size + TN_ - 1) / TN_;
-            let n_chunks = (k_size + KC_ - 1) / KC_;
-            let cs = n_strips * KC_ * TN_;
+            let n_chunks = (k_size + kc_max - 1) / kc_max;
+            let cs = n_strips * kc_max * TN_;
             let tp = n_chunks * cs;
 
             thread_local! { static WS2: std::cell::Cell<Vec<$elem>> = std::cell::Cell::new(Vec::new()); }
@@ -279,17 +535,17 @@ macro_rules! define_matmul_neon {
             {
                 let mut ks = 0usize; let mut ch = 0usize;
                 while ks < k_size {
-                    let kc = KC_.min(k_size - ks);
+                    let kc = kc_max.min(k_size - ks);
                     let base = ch * cs;
                     for i in 0..n_strips {
                         let ns = i * TN_;
                         let an = TN_.min(n_size.saturating_sub(ns));
                         for k in 0..kc {
-                            let d = base + i * KC_ * TN_ + k * TN_;
+                            let d = base + i * kc_max * TN_ + k * TN_;
                             unsafe { std::ptr::copy_nonoverlapping(b.as_ptr().add((ks+k)*n_size+ns), pb.as_mut_ptr().add(d), an); }
                         }
                     }
-                    ks += KC_; ch += 1;
+                    ks += kc_max; ch += 1;
                 }
             }
 
@@ -301,7 +557,7 @@ macro_rules! define_matmul_neon {
 
             let mut ks = 0usize; let mut ch = 0usize;
             while ks < k_size {
-                let kc = KC_.min(k_size - ks);
+                let kc = kc_max.min(k_size - ks);
                 let mut m = 0;
                 while m + TM_ <= m_size {
                     let mut n = 0; let mut si = 0;
@@ -316,7 +572,7 @@ macro_rules! define_matmul_neon {
                             );
                             )+
                             let mut ac = a.as_ptr().add(m*k_size+ks);
-                            let mut bp = pb.as_ptr().add(ch*cs+si*KC_*TN_);
+                            let mut bp = pb.as_ptr().add(ch*cs+si*kc_max*TN_);
                             let mut _k = 0usize;
                             let ku = kc & !7;
                             while _k < ku {
@@ -417,7 +673,7 @@ macro_rules! define_matmul_neon {
                     }
                     m += TM_;
                 }
-                ks += KC_; ch += 1;
+                ks += kc_max; ch += 1;
             }
             // Remainder N with bias
             let nm = (n_size / TN_) * TN_;
@@ -461,8 +717,8 @@ macro_rules! define_matmul_neon {
                         let mut ac = a.as_ptr().add(m*k_size);
                         let mut ks2 = 0usize; let mut ci = 0usize;
                         while ks2 < k_size {
-                            let kc = KC_.min(k_size-ks2);
-                            let mut bpp = pb.as_ptr().add(ci*cs+si*KC_*TN_);
+                            let kc = kc_max.min(k_size-ks2);
+                            let mut bpp = pb.as_ptr().add(ci*cs+si*kc_max*TN_);
                             for _ in 0..kc {
                                 let va = $crate::simd_primitive!(neon, $elem, splat, *ac);
                                 let v0 = $crate::simd_primitive!(neon, $elem, loadu, bpp);
@@ -488,16 +744,17 @@ macro_rules! define_matmul_neon {
         // ── matmul_prepacked: C = A * packed_B ─────────────────────────
         #[inline(always)]
         pub fn matmul_prepacked(a: &[$elem], pb: &[$elem], c: &mut [$elem], m_size: usize, n_size: usize, k_size: usize) {
+            let kc_max = _blocking().kc;
             assert!(a.len() >= m_size * k_size);
             assert!(c.len() >= m_size * n_size);
 
             let n_strips = (n_size + TN_ - 1) / TN_;
-            let cs = n_strips * KC_ * TN_;
+            let cs = n_strips * kc_max * TN_;
             let cp = c.as_mut_ptr();
 
             let mut ks = 0usize; let mut ch = 0usize;
             while ks < k_size {
-                let kc = KC_.min(k_size - ks);
+                let kc = kc_max.min(k_size - ks);
                 let mut m = 0;
                 while m + TM_ <= m_size {
                     let mut n = 0; let mut si = 0;
@@ -516,7 +773,7 @@ macro_rules! define_matmul_neon {
                             )};
                             )+
                             let mut ac = a.as_ptr().add(m*k_size+ks);
-                            let mut bp = pb.as_ptr().add(ch*cs+si*KC_*TN_);
+                            let mut bp = pb.as_ptr().add(ch*cs+si*kc_max*TN_);
                             // Prefetch C output tile into L1 before K-loop
                             $($crate::simd_primitive!(neon, $elem, prefetch, cp.add((m+$R)*n_size+n) as *const u8, 0);)+
                             let mut _k = 0usize;
@@ -619,7 +876,7 @@ macro_rules! define_matmul_neon {
                     }
                     m += TM_;
                 }
-                ks += KC_; ch += 1;
+                ks += kc_max; ch += 1;
             }
             // Remainder N
             let nm = (n_size / TN_) * TN_;
@@ -635,8 +892,8 @@ macro_rules! define_matmul_neon {
                             let mut ac = a.as_ptr().add(m*k_size);
                             let mut ks2 = 0usize; let mut ci = 0usize;
                             while ks2 < k_size {
-                                let kc = KC_.min(k_size-ks2);
-                                let mut bpp = pb.as_ptr().add(ci*cs+ls*KC_*TN_+nos);
+                                let kc = kc_max.min(k_size-ks2);
+                                let mut bpp = pb.as_ptr().add(ci*cs+ls*kc_max*TN_+nos);
                                 for _ in 0..kc {
                                     let va = $crate::simd_primitive!(neon, $elem, splat, *ac);
                                     let vb = $crate::simd_primitive!(neon, $elem, loadu, bpp);
@@ -655,8 +912,8 @@ macro_rules! define_matmul_neon {
                         let mut s = <$elem as Element>::ZERO;
                         let mut k = 0usize; let mut ci = 0usize;
                         while k < k_size {
-                            let kc = KC_.min(k_size-k);
-                            let base = ci*cs+ls*KC_*TN_;
+                            let kc = kc_max.min(k_size-k);
+                            let base = ci*cs+ls*kc_max*TN_;
                             for ki in 0..kc { s = <$elem as Element>::mul_add(s, a[m*k_size+k+ki], pb[base+ki*TN_+no]); }
                             k += kc; ci += 1;
                         }
@@ -677,8 +934,8 @@ macro_rules! define_matmul_neon {
                         let mut ac = a.as_ptr().add(m*k_size);
                         let mut ks2 = 0usize; let mut ci = 0usize;
                         while ks2 < k_size {
-                            let kc = KC_.min(k_size-ks2);
-                            let mut bpp = pb.as_ptr().add(ci*cs+si*KC_*TN_);
+                            let kc = kc_max.min(k_size-ks2);
+                            let mut bpp = pb.as_ptr().add(ci*cs+si*kc_max*TN_);
                             for _ in 0..kc {
                                 let va = $crate::simd_primitive!(neon, $elem, splat, *ac);
                                 let v0 = $crate::simd_primitive!(neon, $elem, loadu, bpp);
@@ -703,12 +960,13 @@ macro_rules! define_matmul_neon {
         // ── matmul_bias_prepacked: C = A * packed_B + bias ─────────────
         #[inline(always)]
         pub fn matmul_bias_prepacked(a: &[$elem], pb: &[$elem], bias: &[$elem], c: &mut [$elem], m_size: usize, n_size: usize, k_size: usize) {
+            let kc_max = _blocking().kc;
             assert!(a.len() >= m_size * k_size);
             assert!(c.len() >= m_size * n_size);
             assert!(bias.len() >= n_size);
 
             let n_strips = (n_size + TN_ - 1) / TN_;
-            let cs = n_strips * KC_ * TN_;
+            let cs = n_strips * kc_max * TN_;
             let cp = c.as_mut_ptr();
 
             // Init C with bias
@@ -718,7 +976,7 @@ macro_rules! define_matmul_neon {
 
             let mut ks = 0usize; let mut ch = 0usize;
             while ks < k_size {
-                let kc = KC_.min(k_size - ks);
+                let kc = kc_max.min(k_size - ks);
                 let mut m = 0;
                 while m + TM_ <= m_size {
                     let mut n = 0; let mut si = 0;
@@ -733,7 +991,7 @@ macro_rules! define_matmul_neon {
                             );
                             )+
                             let mut ac = a.as_ptr().add(m*k_size+ks);
-                            let mut bptr = pb.as_ptr().add(ch*cs+si*KC_*TN_);
+                            let mut bptr = pb.as_ptr().add(ch*cs+si*kc_max*TN_);
                             let mut _k = 0usize;
                             let ku = kc & !7;
                             while _k < ku {
@@ -834,7 +1092,7 @@ macro_rules! define_matmul_neon {
                     }
                     m += TM_;
                 }
-                ks += KC_; ch += 1;
+                ks += kc_max; ch += 1;
             }
             // Remainder M with bias
             let mm = (m_size / TM_) * TM_;
@@ -850,8 +1108,8 @@ macro_rules! define_matmul_neon {
                         let mut ac = a.as_ptr().add(m*k_size);
                         let mut ks2 = 0usize; let mut ci = 0usize;
                         while ks2 < k_size {
-                            let kc = KC_.min(k_size-ks2);
-                            let mut bpp = pb.as_ptr().add(ci*cs+si*KC_*TN_);
+                            let kc = kc_max.min(k_size-ks2);
+                            let mut bpp = pb.as_ptr().add(ci*cs+si*kc_max*TN_);
                             for _ in 0..kc {
                                 let va = $crate::simd_primitive!(neon, $elem, splat, *ac);
                                 let v0 = $crate::simd_primitive!(neon, $elem, loadu, bpp);

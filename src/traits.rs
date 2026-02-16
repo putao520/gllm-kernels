@@ -2,6 +2,15 @@ use std::fmt::Debug;
 use half::{f16, bf16};
 use crate::quant::QuantType;
 
+/// Activation function selector for fused GEMM+activation epilogue.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Activation {
+    None,
+    Relu,
+    Silu,
+    Gelu,
+}
+
 /// Represents a device-specific representation of a tensor or buffer.
 pub trait DeviceRepr: Debug + Clone + Send + Sync + 'static {}
 
@@ -209,6 +218,33 @@ pub trait Kernels<E: Element>: Send + Sync {
     fn gemm(&self, a: &[E], b: &[E], c: &mut [E], m: usize, n: usize, k: usize); // required
     fn gemm_bias(&self, _a: &[E], _b: &[E], _bias: &[E], _c: &mut [E], _m: usize, _n: usize, _k: usize) {
         unimplemented!("gemm_bias")
+    }
+    /// Fused GEMM+bias+activation: C = act(A*B + bias)
+    /// Activation is applied in-register before writeback, avoiding an extra C read/write pass.
+    fn gemm_bias_act(&self, a: &[E], b: &[E], bias: &[E], c: &mut [E], m: usize, n: usize, k: usize, act: Activation) {
+        // Default: unfused fallback — compute gemm_bias, then apply activation in-place
+        self.gemm_bias(a, b, bias, c, m, n, k);
+        match act {
+            Activation::None => {},
+            _ => {
+                let len = m * n;
+                for i in 0..len {
+                    c[i] = match act {
+                        Activation::Relu => E::max(c[i], E::ZERO),
+                        Activation::Silu => {
+                            let v = c[i].to_f32();
+                            E::from_f32(v / (1.0 + (-v).exp()))
+                        },
+                        Activation::Gelu => {
+                            let x = c[i].to_f32();
+                            let inner = 0.7978845608f32 * (x + 0.044715f32 * x * x * x);
+                            E::from_f32(0.5 * x * (1.0 + inner.tanh()))
+                        },
+                        Activation::None => unreachable!(),
+                    };
+                }
+            }
+        }
     }
     fn pack_b(&self, _b: &[E], _n: usize, _k: usize) -> Vec<E> {
         unimplemented!("pack_b")

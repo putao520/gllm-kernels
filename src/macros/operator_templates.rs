@@ -952,6 +952,69 @@ macro_rules! define_gemv_op {
 /// MC (M-dimension cache block) values chosen for L2 residency: MC * KC * sizeof(elem) ~ L2/2.
 #[macro_export]
 macro_rules! define_matmul_op {
+    // ── AVX-512 BF16: runtime dispatch to native vdpbf16ps when available ──
+    (avx512, bf16) => {
+        // Fallback: generic bf16→f32 + FMA path (always available on avx512f)
+        mod _bf16_generic {
+            use crate::traits::Element;
+            #[allow(unused_imports)]
+            use half::bf16;
+            $crate::define_matmul_x86!(avx512, bf16, 14, 16, 2, 480, "avx512f");
+        }
+        // Native: vdpbf16ps path (requires avx512bf16 at runtime)
+        mod _bf16_native {
+            $crate::define_matmul_x86_bf16_native!();
+        }
+
+        pub fn pack_b(b: &[bf16], n_size: usize, k_size: usize) -> Vec<bf16> {
+            if is_x86_feature_detected!("avx512bf16") {
+                _bf16_native::pack_b(b, n_size, k_size)
+            } else {
+                _bf16_generic::pack_b(b, n_size, k_size)
+            }
+        }
+
+        pub fn matmul(a: &[bf16], b: &[bf16], c: &mut [bf16], m_size: usize, n_size: usize, k_size: usize) {
+            if is_x86_feature_detected!("avx512bf16") {
+                _bf16_native::matmul(a, b, c, m_size, n_size, k_size)
+            } else {
+                _bf16_generic::matmul(a, b, c, m_size, n_size, k_size)
+            }
+        }
+
+        pub fn matmul_bias(a: &[bf16], b: &[bf16], bias: &[bf16], c: &mut [bf16], m_size: usize, n_size: usize, k_size: usize) {
+            if is_x86_feature_detected!("avx512bf16") {
+                _bf16_native::matmul_bias(a, b, bias, c, m_size, n_size, k_size)
+            } else {
+                _bf16_generic::matmul_bias(a, b, bias, c, m_size, n_size, k_size)
+            }
+        }
+
+        pub fn matmul_prepacked(a: &[bf16], packed_b: &[bf16], c: &mut [bf16], m_size: usize, n_size: usize, k_size: usize) {
+            if is_x86_feature_detected!("avx512bf16") {
+                _bf16_native::matmul_prepacked(a, packed_b, c, m_size, n_size, k_size)
+            } else {
+                _bf16_generic::matmul_prepacked(a, packed_b, c, m_size, n_size, k_size)
+            }
+        }
+
+        pub fn matmul_bias_prepacked(a: &[bf16], packed_b: &[bf16], bias: &[bf16], c: &mut [bf16], m_size: usize, n_size: usize, k_size: usize) {
+            if is_x86_feature_detected!("avx512bf16") {
+                _bf16_native::matmul_bias_prepacked(a, packed_b, bias, c, m_size, n_size, k_size)
+            } else {
+                _bf16_generic::matmul_bias_prepacked(a, packed_b, bias, c, m_size, n_size, k_size)
+            }
+        }
+
+        pub fn matmul_bias_act(a: &[bf16], b: &[bf16], bias: &[bf16], c: &mut [bf16], m_size: usize, n_size: usize, k_size: usize, act: $crate::Activation) {
+            if is_x86_feature_detected!("avx512bf16") {
+                _bf16_native::matmul_bias_act(a, b, bias, c, m_size, n_size, k_size, act)
+            } else {
+                _bf16_generic::matmul_bias_act(a, b, bias, c, m_size, n_size, k_size, act)
+            }
+        }
+    };
+    // ── AVX-512 generic (f32, f16) ──
     (avx512, $elem:ident) => {
         $crate::define_matmul_x86!(avx512, $elem, 14, 16, 2, 480, "avx512f");
     };

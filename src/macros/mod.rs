@@ -7,9 +7,13 @@
 //! 4. expand_all! (Batch Expansion)
 
 #[macro_use]
+pub mod gemm_epilogue;
+#[macro_use]
 pub mod simd_primitive;
 #[macro_use]
 pub mod matmul_x86;
+#[macro_use]
+pub mod matmul_x86_bf16;
 #[macro_use]
 pub mod matmul_neon;
 #[macro_use]
