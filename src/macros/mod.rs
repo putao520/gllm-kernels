@@ -9,6 +9,10 @@
 #[macro_use]
 pub mod simd_primitive;
 #[macro_use]
+pub mod matmul_x86;
+#[macro_use]
+pub mod matmul_neon;
+#[macro_use]
 pub mod operator_templates;
 #[macro_use]
 pub mod expand;
