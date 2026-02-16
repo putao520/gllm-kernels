@@ -13,6 +13,9 @@ fn benchmark_gemm_f32(c: &mut Criterion) {
         // Transformer-like shapes: (tokens, hidden, hidden)
         (128, 4096, 4096),
         (1, 4096, 4096),
+        // N-unaligned: exercises N-remainder paths (N not multiple of TILE_N)
+        (256, 253, 256),   // n_rem=1 (NEON), 13 (AVX2), 29 (AVX-512)
+        (128, 4099, 4096), // n_rem=3 (NEON), 3 (AVX2), 3 (AVX-512)
     ];
 
     let kernels = CpuKernels::<f32>::new();
