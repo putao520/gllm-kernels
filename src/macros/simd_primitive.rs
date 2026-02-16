@@ -339,6 +339,45 @@ macro_rules! simd_primitive {
     (avx512, bf16, exp, $a:expr) => { $crate::simd_primitive!(avx512, f32, exp, $a) };
     (avx512, bf16, prefetch, $p:expr, $dist:expr) => { std::arch::x86_64::_mm_prefetch($p as *const i8, std::arch::x86_64::_MM_HINT_T0) };
 
+    // --- AVX-512 BF16 native dot-product (avx512bf16 extension) ---
+    // vdpbf16ps: src += a(bf16_pairs) * b(bf16_pairs), 2 bf16 MACs per 32-bit lane
+    // Requires: avx512bf16 target feature (Cooper Lake / Sapphire Rapids+)
+    // Usage: accumulator is __m512 (f32), operands are __m512bh (packed bf16 pairs)
+    // The caller must load raw bf16 data as __m512bh (not convert to f32).
+    //
+    // Primitive entries for future specialized bf16 GEMM microkernel:
+    //   simd_primitive!(avx512, bf16, dpbf16ps, acc, a_bh, b_bh)
+    //   simd_primitive!(avx512, bf16, load_raw, ptr)  -- load 32 bf16 as __m512bh
+    //
+    // These are NOT used by the current define_matmul_x86! macro because:
+    // 1. dpbf16ps processes PAIRS of bf16 values per 32-bit lane (2x throughput)
+    // 2. The K-loop must advance by 2 per iteration, not 1
+    // 3. Input layout must be interleaved bf16 pairs, not scalar-broadcast
+    // 4. A dedicated matmul_bf16_native! macro is needed
+    //
+    // When implementing, the microkernel structure would be:
+    //   for k in (0..K).step_by(2) {
+    //       let a_pair: __m512bh = load_bf16_pair(A, row, k);  // broadcast 2 bf16 from A
+    //       let b_pair: __m512bh = load_raw(B_packed, k*TN);   // 32 bf16 from packed B
+    //       acc = _mm512_dpbf16_ps(acc, a_pair, b_pair);
+    //   }
+
+    // --- AVX-512 VNNI INT8 dot-product (avx512vnni extension) ---
+    // vpdpbusd: src += a(u8x4) * b(i8x4), 4 u8*i8 MACs per 32-bit lane
+    // Requires: avx512vnni target feature (Cascade Lake+)
+    // Usage: all operands are __m512i, accumulator is i32 lanes
+    //
+    // Primitive entries for future specialized INT8 GEMM microkernel:
+    //   simd_primitive!(avx512, i8, dpbusd, acc, a_u8, b_i8)
+    //   simd_primitive!(avx512, i8, load_i512, ptr)
+    //
+    // These are NOT used by the current define_matmul_x86! macro because:
+    // 1. dpbusd processes 4 u8*i8 products per 32-bit lane (4x throughput vs f32)
+    // 2. Requires quantized (u8/i8) input data, not float
+    // 3. K-loop advances by 4 per iteration
+    // 4. Accumulator is i32, needs post-loop dequantization to f32
+    // 5. A dedicated matmul_int8_vnni! macro is needed
+
 
     // ========================================================================
     // NEON Implementation (aarch64)
@@ -348,7 +387,7 @@ macro_rules! simd_primitive {
     (neon, f32, num_regs) => { 32 };
     (neon, f32, optimal_tile_m) => { 8 }; // TBD
     (neon, f32, optimal_tile_n_vecs) => { 3 };
-    (neon, f32, prefetch_distance) => { 0 }; // manual prefetch often tricky
+    (neon, f32, prefetch_distance) => { 128 };
     (neon, f32, has_native_fp16) => { true }; // ARMv8.2+ usually
     (neon, f32, has_native_bf16) => { false }; // Check target feature
 
@@ -399,7 +438,9 @@ macro_rules! simd_primitive {
     // EXP
     (neon, f32, exp, $a:expr) => { $crate::cpu_kernels::neon::math::exp_ps($a) };
 
-    (neon, f32, prefetch, $p:expr, $dist:expr) => { };
+    (neon, f32, prefetch, $p:expr, $dist:expr) => {
+        unsafe { core::arch::asm!("prfm pldl1keep, [{addr}]", addr = in(reg) ($p as *const u8).add($dist), options(nostack, preserves_flags)) }
+    };
 
     // --- NEON f16 (ARMv8.2 native FP16 when available, else convert) ---
     (neon, f16, lanes) => { 4 };
@@ -421,7 +462,7 @@ macro_rules! simd_primitive {
     };
     (neon, f16, optimal_tile_m) => { 8 };
     (neon, f16, optimal_tile_n_vecs) => { 3 };
-    (neon, f16, prefetch_distance) => { 0 };
+    (neon, f16, prefetch_distance) => { 128 };
     (neon, f16, has_native_fp16) => { true };
     (neon, f16, has_native_bf16) => { false };
     (neon, f16, loadu, $p:expr) => { $crate::simd_primitive!(neon, f16, load, $p) };
@@ -442,7 +483,9 @@ macro_rules! simd_primitive {
     (neon, f16, rsqrt, $a:expr) => { $crate::simd_primitive!(neon, f32, rsqrt, $a) };
     (neon, f16, recip, $a:expr) => { $crate::simd_primitive!(neon, f32, recip, $a) };
     (neon, f16, exp, $a:expr) => { $crate::cpu_kernels::neon::math::exp_ps($a) };
-    (neon, f16, prefetch, $p:expr, $dist:expr) => { };
+    (neon, f16, prefetch, $p:expr, $dist:expr) => {
+        unsafe { core::arch::asm!("prfm pldl1keep, [{addr}]", addr = in(reg) ($p as *const u8).add($dist), options(nostack, preserves_flags)) }
+    };
 
     // --- NEON bf16 (convert via bit-shift) ---
     (neon, bf16, lanes) => { 4 };
@@ -468,7 +511,7 @@ macro_rules! simd_primitive {
     };
     (neon, bf16, optimal_tile_m) => { 8 };
     (neon, bf16, optimal_tile_n_vecs) => { 3 };
-    (neon, bf16, prefetch_distance) => { 0 };
+    (neon, bf16, prefetch_distance) => { 128 };
     (neon, bf16, has_native_fp16) => { false };
     (neon, bf16, has_native_bf16) => { false };
     (neon, bf16, loadu, $p:expr) => { $crate::simd_primitive!(neon, bf16, load, $p) };
@@ -489,7 +532,9 @@ macro_rules! simd_primitive {
     (neon, bf16, rsqrt, $a:expr) => { $crate::simd_primitive!(neon, f32, rsqrt, $a) };
     (neon, bf16, recip, $a:expr) => { $crate::simd_primitive!(neon, f32, recip, $a) };
     (neon, bf16, exp, $a:expr) => { $crate::cpu_kernels::neon::math::exp_ps($a) };
-    (neon, bf16, prefetch, $p:expr, $dist:expr) => { };
+    (neon, bf16, prefetch, $p:expr, $dist:expr) => {
+        unsafe { core::arch::asm!("prfm pldl1keep, [{addr}]", addr = in(reg) ($p as *const u8).add($dist), options(nostack, preserves_flags)) }
+    };
 
     // --- Integer Primitives (NEON) ---
     // using int32x4_t / uint32x4_t

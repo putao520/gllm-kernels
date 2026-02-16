@@ -91,9 +91,14 @@ macro_rules! define_matmul_neon {
                             )+
                             let mut ac = a.as_ptr().add(m*k_size+ks);
                             let mut bp = pb.as_ptr().add(ch*cs+si*KC_*TN_);
+                            // Prefetch C output tile into L1 before K-loop
+                            $($crate::simd_primitive!(neon, $elem, prefetch, cp.add((m+$R)*n_size+n) as *const u8, 0);)+
                             let mut _k = 0usize;
                             let ku = kc & !7;
                             while _k < ku {
+                                // Prefetch B ahead + A rows ~128 bytes ahead
+                                $crate::simd_primitive!(neon, $elem, prefetch, bp.add(TN_*16) as *const u8, 0);
+                                $($crate::simd_primitive!(neon, $elem, prefetch, ac.add(k_size*$R + 32) as *const u8, 0);)+
                                 let vb0_0 = $crate::simd_primitive!(neon, $elem, loadu, bp);
                                 let vb0_1 = $crate::simd_primitive!(neon, $elem, loadu, bp.add(LANES_));
                                 let vb0_2 = $crate::simd_primitive!(neon, $elem, loadu, bp.add(LANES_*2));
@@ -315,6 +320,9 @@ macro_rules! define_matmul_neon {
                             let mut _k = 0usize;
                             let ku = kc & !7;
                             while _k < ku {
+                                // Prefetch B ahead + A rows ~128 bytes ahead
+                                $crate::simd_primitive!(neon, $elem, prefetch, bp.add(TN_*16) as *const u8, 0);
+                                $($crate::simd_primitive!(neon, $elem, prefetch, ac.add(k_size*$R + 32) as *const u8, 0);)+
                                 let vb0_0 = $crate::simd_primitive!(neon, $elem, loadu, bp);
                                 let vb0_1 = $crate::simd_primitive!(neon, $elem, loadu, bp.add(LANES_));
                                 let vb0_2 = $crate::simd_primitive!(neon, $elem, loadu, bp.add(LANES_*2));
@@ -509,9 +517,14 @@ macro_rules! define_matmul_neon {
                             )+
                             let mut ac = a.as_ptr().add(m*k_size+ks);
                             let mut bp = pb.as_ptr().add(ch*cs+si*KC_*TN_);
+                            // Prefetch C output tile into L1 before K-loop
+                            $($crate::simd_primitive!(neon, $elem, prefetch, cp.add((m+$R)*n_size+n) as *const u8, 0);)+
                             let mut _k = 0usize;
                             let ku = kc & !7;
                             while _k < ku {
+                                // Prefetch B ahead + A rows ~128 bytes ahead
+                                $crate::simd_primitive!(neon, $elem, prefetch, bp.add(TN_*16) as *const u8, 0);
+                                $($crate::simd_primitive!(neon, $elem, prefetch, ac.add(k_size*$R + 32) as *const u8, 0);)+
                                 let vb0_0 = $crate::simd_primitive!(neon, $elem, loadu, bp);
                                 let vb0_1 = $crate::simd_primitive!(neon, $elem, loadu, bp.add(LANES_));
                                 let vb0_2 = $crate::simd_primitive!(neon, $elem, loadu, bp.add(LANES_*2));
@@ -724,6 +737,9 @@ macro_rules! define_matmul_neon {
                             let mut _k = 0usize;
                             let ku = kc & !7;
                             while _k < ku {
+                                // Prefetch B ahead + A rows ~128 bytes ahead
+                                $crate::simd_primitive!(neon, $elem, prefetch, bptr.add(TN_*16) as *const u8, 0);
+                                $($crate::simd_primitive!(neon, $elem, prefetch, ac.add(k_size*$R + 32) as *const u8, 0);)+
                                 let vb0_0 = $crate::simd_primitive!(neon, $elem, loadu, bptr);
                                 let vb0_1 = $crate::simd_primitive!(neon, $elem, loadu, bptr.add(LANES_));
                                 let vb0_2 = $crate::simd_primitive!(neon, $elem, loadu, bptr.add(LANES_*2));

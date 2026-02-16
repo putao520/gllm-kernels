@@ -3,16 +3,16 @@
 /// Uses paste::paste! for identifier concatenation (c_0_0, c_1_0, etc.)
 #[macro_export]
 macro_rules! define_matmul_x86 {
-    ($isa:ident, $elem:ident, 14, $LANES:literal, $NV:literal, $($feat:literal),+) => {
-        $crate::define_matmul_x86!(@body $isa, $elem, 14, $LANES, $NV, [$($feat),+],
+    ($isa:ident, $elem:ident, 14, $LANES:literal, $NV:literal, $MC:literal, $($feat:literal),+) => {
+        $crate::define_matmul_x86!(@body $isa, $elem, 14, $LANES, $NV, $MC, [$($feat),+],
             [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13]);
     };
-    ($isa:ident, $elem:ident, 6, $LANES:literal, $NV:literal, $($feat:literal),+) => {
-        $crate::define_matmul_x86!(@body $isa, $elem, 6, $LANES, $NV, [$($feat),+],
+    ($isa:ident, $elem:ident, 6, $LANES:literal, $NV:literal, $MC:literal, $($feat:literal),+) => {
+        $crate::define_matmul_x86!(@body $isa, $elem, 6, $LANES, $NV, $MC, [$($feat),+],
             [0, 1, 2, 3, 4, 5]);
     };
 
-    (@body $isa:ident, $elem:ident, $TM:literal, $LANES:literal, $NV:literal,
+    (@body $isa:ident, $elem:ident, $TM:literal, $LANES:literal, $NV:literal, $MC:literal,
      [$($feat:literal),+], [$($R:literal),+]) => {
         // ── pack_b (public) ────────────────────────────────────────────
         pub fn pack_b(b: &[$elem], n_size: usize, k_size: usize) -> Vec<$elem> {
@@ -83,11 +83,15 @@ macro_rules! define_matmul_x86 {
             }
 
             let cp = c.as_mut_ptr();
+            const MC: usize = $MC;
             let mut ks = 0usize; let mut ch = 0usize;
             while ks < k_size {
                 let kc = KC.min(k_size - ks);
-                let mut m = 0;
-                while m + TM <= m_size {
+                let mut m_block = 0usize;
+                while m_block < m_size {
+                let m_end = (m_block + MC).min(m_size);
+                let mut m = m_block;
+                while m + TM <= m_end {
                     let mut n = 0; let mut si = 0;
                     while n + TN <= n_size {
                         unsafe { paste::paste! {
@@ -103,10 +107,15 @@ macro_rules! define_matmul_x86 {
                             )+
                             let mut ac = a.as_ptr().add(m*k_size+ks);
                             let mut bp = pb.as_ptr().add(ch*cs+si*KC*TN);
+                            // Prefetch C output tile into L1 before K-loop
+                            $($crate::simd_primitive!($isa, $elem, prefetch, cp.add((m+$R)*n_size+n) as *const i8, 0);)+
                             let mut _k = 0usize;
                             let ku = kc & !7;
                             while _k < ku {
+                                // Prefetch B ahead
                                 $crate::simd_primitive!($isa, $elem, prefetch, bp.add(TN*16) as *const i8, 0);
+                                // Prefetch A rows ~256 bytes ahead (once per 8-iter block)
+                                $($crate::simd_primitive!($isa, $elem, prefetch, ac.add(k_size*$R + 64) as *const i8, 0);)+
                                 let vb0_0 = $crate::simd_primitive!($isa, $elem, loadu, bp);
                                 let vb0_1 = $crate::simd_primitive!($isa, $elem, loadu, bp.add($LANES));
                                 $(
@@ -183,6 +192,8 @@ macro_rules! define_matmul_x86 {
                     }
                     m += TM;
                 }
+                m_block = m_end;
+                } // MC block
                 ks += KC; ch += 1;
             }
             // Remainder N
@@ -289,11 +300,15 @@ macro_rules! define_matmul_x86 {
                 unsafe { std::ptr::copy_nonoverlapping(bias.as_ptr(), cp.add(m * n_size), n_size); }
             }
 
+            const MC: usize = $MC;
             let mut ks = 0usize; let mut ch = 0usize;
             while ks < k_size {
                 let kc = KC.min(k_size - ks);
-                let mut m = 0;
-                while m + TM <= m_size {
+                let mut m_block = 0usize;
+                while m_block < m_size {
+                let m_end = (m_block + MC).min(m_size);
+                let mut m = m_block;
+                while m + TM <= m_end {
                     let mut n = 0; let mut si = 0;
                     while n + TN <= n_size {
                         unsafe { paste::paste! {
@@ -309,7 +324,10 @@ macro_rules! define_matmul_x86 {
                             let mut _k = 0usize;
                             let ku = kc & !7;
                             while _k < ku {
+                                // Prefetch B ahead
                                 $crate::simd_primitive!($isa, $elem, prefetch, bp.add(TN*16) as *const i8, 0);
+                                // Prefetch A rows ~256 bytes ahead (once per 8-iter block)
+                                $($crate::simd_primitive!($isa, $elem, prefetch, ac.add(k_size*$R + 64) as *const i8, 0);)+
                                 let vb0_0 = $crate::simd_primitive!($isa, $elem, loadu, bp);
                                 let vb0_1 = $crate::simd_primitive!($isa, $elem, loadu, bp.add($LANES));
                                 $(
@@ -385,6 +403,8 @@ macro_rules! define_matmul_x86 {
                     }
                     m += TM;
                 }
+                m_block = m_end;
+                } // MC block
                 ks += KC; ch += 1;
             }
             // Remainder N with bias
@@ -462,11 +482,15 @@ macro_rules! define_matmul_x86 {
             let cs = n_strips * KC * TN;
             let cp = c.as_mut_ptr();
 
+            const MC: usize = $MC;
             let mut ks = 0usize; let mut ch = 0usize;
             while ks < k_size {
                 let kc = KC.min(k_size - ks);
-                let mut m = 0;
-                while m + TM <= m_size {
+                let mut m_block = 0usize;
+                while m_block < m_size {
+                let m_end = (m_block + MC).min(m_size);
+                let mut m = m_block;
+                while m + TM <= m_end {
                     let mut n = 0; let mut si = 0;
                     while n + TN <= n_size {
                         unsafe { paste::paste! {
@@ -481,10 +505,15 @@ macro_rules! define_matmul_x86 {
                             )+
                             let mut ac = a.as_ptr().add(m*k_size+ks);
                             let mut bp = pb.as_ptr().add(ch*cs+si*KC*TN);
+                            // Prefetch C output tile into L1 before K-loop
+                            $($crate::simd_primitive!($isa, $elem, prefetch, cp.add((m+$R)*n_size+n) as *const i8, 0);)+
                             let mut _k = 0usize;
                             let ku = kc & !7;
                             while _k < ku {
+                                // Prefetch B ahead
                                 $crate::simd_primitive!($isa, $elem, prefetch, bp.add(TN*16) as *const i8, 0);
+                                // Prefetch A rows ~256 bytes ahead (once per 8-iter block)
+                                $($crate::simd_primitive!($isa, $elem, prefetch, ac.add(k_size*$R + 64) as *const i8, 0);)+
                                 let vb0_0 = $crate::simd_primitive!($isa, $elem, loadu, bp);
                                 let vb0_1 = $crate::simd_primitive!($isa, $elem, loadu, bp.add($LANES));
                                 $(
@@ -560,6 +589,8 @@ macro_rules! define_matmul_x86 {
                     }
                     m += TM;
                 }
+                m_block = m_end;
+                } // MC block
                 ks += KC; ch += 1;
             }
             // Remainder N
@@ -656,11 +687,15 @@ macro_rules! define_matmul_x86 {
                 unsafe { std::ptr::copy_nonoverlapping(bias.as_ptr(), cp.add(m * n_size), n_size); }
             }
 
+            const MC: usize = $MC;
             let mut ks = 0usize; let mut ch = 0usize;
             while ks < k_size {
                 let kc = KC.min(k_size - ks);
-                let mut m = 0;
-                while m + TM <= m_size {
+                let mut m_block = 0usize;
+                while m_block < m_size {
+                let m_end = (m_block + MC).min(m_size);
+                let mut m = m_block;
+                while m + TM <= m_end {
                     let mut n = 0; let mut si = 0;
                     while n + TN <= n_size {
                         unsafe { paste::paste! {
@@ -675,7 +710,10 @@ macro_rules! define_matmul_x86 {
                             let mut _k = 0usize;
                             let ku = kc & !7;
                             while _k < ku {
+                                // Prefetch B ahead
                                 $crate::simd_primitive!($isa, $elem, prefetch, bp.add(TN*16) as *const i8, 0);
+                                // Prefetch A rows ~256 bytes ahead (once per 8-iter block)
+                                $($crate::simd_primitive!($isa, $elem, prefetch, ac.add(k_size*$R + 64) as *const i8, 0);)+
                                 let vb0_0 = $crate::simd_primitive!($isa, $elem, loadu, bp);
                                 let vb0_1 = $crate::simd_primitive!($isa, $elem, loadu, bp.add($LANES));
                                 $(
@@ -751,6 +789,8 @@ macro_rules! define_matmul_x86 {
                     }
                     m += TM;
                 }
+                m_block = m_end;
+                } // MC block
                 ks += KC; ch += 1;
             }
             // Remainder N with bias

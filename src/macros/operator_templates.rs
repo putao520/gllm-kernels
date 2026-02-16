@@ -949,13 +949,14 @@ macro_rules! define_gemv_op {
 
 /// Defines Matrix Multiplication (GEMM) — thin dispatcher.
 /// Routes to `define_matmul_x86!` (AVX-512 / AVX2), `define_matmul_neon!`, or scalar fallback.
+/// MC (M-dimension cache block) values chosen for L2 residency: MC * KC * sizeof(elem) ~ L2/2.
 #[macro_export]
 macro_rules! define_matmul_op {
     (avx512, $elem:ident) => {
-        $crate::define_matmul_x86!(avx512, $elem, 14, 16, 2, "avx512f");
+        $crate::define_matmul_x86!(avx512, $elem, 14, 16, 2, 480, "avx512f");
     };
     (avx2, $elem:ident) => {
-        $crate::define_matmul_x86!(avx2, $elem, 6, 8, 2, "avx2", "fma");
+        $crate::define_matmul_x86!(avx2, $elem, 6, 8, 2, 168, "avx2", "fma");
     };
     (neon, $elem:ident) => {
         $crate::define_matmul_neon!($elem);
