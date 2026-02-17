@@ -54,6 +54,66 @@ macro_rules! apply_act {
     }};
 }
 
+/// Runtime dispatch variant of `apply_act!` — accepts an `Activation` enum value
+/// instead of a compile-time token. Uses precise `div` for silu (not approximate `recip`)
+/// to match the numerical behavior of INT8/AMX dequantization kernels.
+#[macro_export]
+macro_rules! apply_act_runtime {
+    ($isa:ident, $elem:ident, $v:expr, $act:expr) => {
+        match $act {
+            $crate::Activation::None => $v,
+            $crate::Activation::Relu => {
+                let vz = $crate::simd_primitive!($isa, $elem, zero);
+                $crate::simd_primitive!($isa, $elem, max, $v, vz)
+            }
+            $crate::Activation::Silu => {
+                // x * sigmoid(x) = x / (1 + exp(-x))  — precise div, not recip
+                let neg_v = $crate::simd_primitive!($isa, $elem, neg, $v);
+                let exp_neg = $crate::simd_primitive!($isa, $elem, exp, neg_v);
+                let one = $crate::simd_primitive!($isa, $elem, splat, 1.0f32);
+                let denom = $crate::simd_primitive!($isa, $elem, add, one, exp_neg);
+                $crate::simd_primitive!($isa, $elem, div, $v, denom)
+            }
+            $crate::Activation::Gelu => {
+                // 0.5 * x * (1 + tanh(sqrt(2/pi) * (x + 0.044715 * x^3)))
+                let half = $crate::simd_primitive!($isa, $elem, splat, 0.5f32);
+                let one = $crate::simd_primitive!($isa, $elem, splat, 1.0f32);
+                let vc = $crate::simd_primitive!($isa, $elem, splat, 0.044715f32);
+                let vs = $crate::simd_primitive!($isa, $elem, splat, 0.7978845608f32);
+                let two = $crate::simd_primitive!($isa, $elem, splat, 2.0f32);
+                let x2 = $crate::simd_primitive!($isa, $elem, mul, $v, $v);
+                let x3 = $crate::simd_primitive!($isa, $elem, mul, x2, $v);
+                let inner = $crate::simd_primitive!($isa, $elem, fma, vc, x3, $v);
+                let scaled = $crate::simd_primitive!($isa, $elem, mul, vs, inner);
+                let two_x = $crate::simd_primitive!($isa, $elem, mul, two, scaled);
+                let exp_2x = $crate::simd_primitive!($isa, $elem, exp, two_x);
+                let num = $crate::simd_primitive!($isa, $elem, sub, exp_2x, one);
+                let den = $crate::simd_primitive!($isa, $elem, add, exp_2x, one);
+                let tanh_val = $crate::simd_primitive!($isa, $elem, div, num, den);
+                let one_plus_tanh = $crate::simd_primitive!($isa, $elem, add, one, tanh_val);
+                let half_x = $crate::simd_primitive!($isa, $elem, mul, half, $v);
+                $crate::simd_primitive!($isa, $elem, mul, half_x, one_plus_tanh)
+            }
+        }
+    };
+}
+
+/// Runtime dispatch scalar activation. Accepts an `Activation` enum value.
+#[macro_export]
+macro_rules! apply_act_scalar_runtime {
+    ($v:expr, $act:expr) => {
+        match $act {
+            $crate::Activation::None => $v,
+            $crate::Activation::Relu => if $v < 0.0 { 0.0 } else { $v },
+            $crate::Activation::Silu => $v / (1.0 + (-$v).exp()),
+            $crate::Activation::Gelu => {
+                let inner = 0.7978845608f32 * ($v + 0.044715f32 * $v * $v * $v);
+                0.5 * $v * (1.0 + inner.tanh())
+            }
+        }
+    };
+}
+
 /// Apply activation to a scalar value. Used in remainder loops.
 #[macro_export]
 macro_rules! apply_act_scalar {

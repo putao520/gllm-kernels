@@ -373,39 +373,7 @@ macro_rules! define_matmul_x86_int8 {
                         vf = _mm512_add_ps(vf, vb);
                     }
                     // Fused activation (fully vectorized)
-                    vf = match activation {
-                        $crate::Activation::None => vf,
-                        $crate::Activation::Relu => _mm512_max_ps(vf, _mm512_setzero_ps()),
-                        $crate::Activation::Silu => {
-                            // x * sigmoid(x) = x / (1 + exp(-x))
-                            let neg_v = _mm512_sub_ps(_mm512_setzero_ps(), vf);
-                            let exp_neg = $crate::cpu_kernels::avx512::math::avx512_exp_f32(neg_v);
-                            let one = _mm512_set1_ps(1.0);
-                            let denom = _mm512_add_ps(one, exp_neg);
-                            let sigmoid = _mm512_div_ps(one, denom);
-                            _mm512_mul_ps(vf, sigmoid)
-                        }
-                        $crate::Activation::Gelu => {
-                            // 0.5 * x * (1 + tanh(sqrt(2/pi) * (x + 0.044715 * x^3)))
-                            let half = _mm512_set1_ps(0.5);
-                            let one = _mm512_set1_ps(1.0);
-                            let coeff = _mm512_set1_ps(0.044715);
-                            let sqrt2pi = _mm512_set1_ps(0.7978845608);
-                            let two = _mm512_set1_ps(2.0);
-                            let x2 = _mm512_mul_ps(vf, vf);
-                            let x3 = _mm512_mul_ps(x2, vf);
-                            let inner = _mm512_fmadd_ps(coeff, x3, vf);
-                            let scaled = _mm512_mul_ps(sqrt2pi, inner);
-                            let two_x = _mm512_mul_ps(two, scaled);
-                            let exp_2x = $crate::cpu_kernels::avx512::math::avx512_exp_f32(two_x);
-                            let num = _mm512_sub_ps(exp_2x, one);
-                            let den = _mm512_add_ps(exp_2x, one);
-                            let tanh_val = _mm512_div_ps(num, den);
-                            let one_plus_tanh = _mm512_add_ps(one, tanh_val);
-                            let half_x = _mm512_mul_ps(half, vf);
-                            _mm512_mul_ps(half_x, one_plus_tanh)
-                        }
-                    };
+                    vf = $crate::apply_act_runtime!(avx512, f32, vf, activation);
                     _mm512_storeu_ps(dst.add(idx), vf);
                     j += 16;
                 }
@@ -414,15 +382,7 @@ macro_rules! define_matmul_x86_int8 {
                     let idx = i * n + j;
                     let mut val = c_i32[idx] as f32 * scale_a * scale_b;
                     if let Some(b) = bias { val += b[j]; }
-                    val = match activation {
-                        $crate::Activation::None => val,
-                        $crate::Activation::Relu => val.max(0.0),
-                        $crate::Activation::Gelu => {
-                            let inner = 0.7978845608f32 * (val + 0.044715f32 * val * val * val);
-                            0.5 * val * (1.0 + inner.tanh())
-                        }
-                        $crate::Activation::Silu => val / (1.0 + (-val).exp()),
-                    };
+                    val = $crate::apply_act_scalar_runtime!(val, activation);
                     c_f32[idx] = val;
                     j += 1;
                 }

@@ -271,6 +271,8 @@ macro_rules! define_matmul_x86_amx_bf16 {
             }
         }
 
+        $crate::define_bf16_helpers!();
+
         /// Convert f32 buffer to bf16 output using AVX-512.
         #[target_feature(enable = "avx512f,avx512bw")]
         unsafe fn convert_f32_to_bf16(src: &[f32], dst: &mut [half::bf16]) {
@@ -278,10 +280,7 @@ macro_rules! define_matmul_x86_amx_bf16 {
             let mut i = 0usize;
             while i + 16 <= len {
                 let v = _mm512_loadu_ps(src.as_ptr().add(i));
-                let vi = _mm512_castps_si512(v);
-                let shifted = _mm512_srli_epi32(vi, 16);
-                let packed = _mm512_cvtepi32_epi16(shifted);
-                _mm256_storeu_si256(dst.as_mut_ptr().add(i) as *mut __m256i, packed);
+                store_f32_as_bf16(dst.as_mut_ptr().add(i), v);
                 i += 16;
             }
             while i < len {
@@ -299,18 +298,9 @@ macro_rules! define_matmul_x86_amx_bf16 {
                 let mut n = 0usize;
                 while n + 16 <= n_size {
                     let v = _mm512_loadu_ps(src.as_ptr().add(row_off + n));
-                    // Load bias bf16 → f32
-                    let bp = bias.as_ptr().add(n) as *const u8;
-                    let b16 = _mm256_loadu_si256(bp as *const __m256i);
-                    let b32 = _mm512_cvtepu16_epi32(b16);
-                    let bshift = _mm512_slli_epi32(b32, 16);
-                    let bfloat = _mm512_castsi512_ps(bshift);
+                    let bfloat = load_bf16_as_f32(bias.as_ptr().add(n));
                     let sum = _mm512_add_ps(v, bfloat);
-                    // Convert f32 → bf16
-                    let vi = _mm512_castps_si512(sum);
-                    let shifted = _mm512_srli_epi32(vi, 16);
-                    let packed = _mm512_cvtepi32_epi16(shifted);
-                    _mm256_storeu_si256(dst.as_mut_ptr().add(row_off + n) as *mut __m256i, packed);
+                    store_f32_as_bf16(dst.as_mut_ptr().add(row_off + n), sum);
                     n += 16;
                 }
                 while n < n_size {
@@ -325,70 +315,21 @@ macro_rules! define_matmul_x86_amx_bf16 {
         #[target_feature(enable = "avx512f,avx512bw")]
         unsafe fn convert_f32_to_bf16_bias_act(src: &[f32], bias: &[half::bf16], dst: &mut [half::bf16],
                                                 m_size: usize, n_size: usize, act: $crate::Activation) {
-            let zero_v = _mm512_setzero_ps();
-            let half_v = _mm512_set1_ps(0.5f32);
-            let one_v = _mm512_set1_ps(1.0f32);
-            let coeff_v = _mm512_set1_ps(0.7978845608f32);
-            let cubic_v = _mm512_set1_ps(0.044715f32);
             for m in 0..m_size {
                 let row_off = m * n_size;
                 let mut n = 0usize;
                 while n + 16 <= n_size {
                     let v = _mm512_loadu_ps(src.as_ptr().add(row_off + n));
-                    // Load bias bf16 → f32
-                    let bp = bias.as_ptr().add(n) as *const u8;
-                    let b16 = _mm256_loadu_si256(bp as *const __m256i);
-                    let b32 = _mm512_cvtepu16_epi32(b16);
-                    let bshift = _mm512_slli_epi32(b32, 16);
-                    let bfloat = _mm512_castsi512_ps(bshift);
-                    let mut x = _mm512_add_ps(v, bfloat);
-                    // Apply activation
-                    match act {
-                        $crate::Activation::Relu => {
-                            x = _mm512_max_ps(x, zero_v);
-                        }
-                        $crate::Activation::Silu => {
-                            // silu(x) = x / (1 + exp(-x)) = x * sigmoid(x)
-                            let neg_x = _mm512_sub_ps(zero_v, x);
-                            let exp_neg = $crate::cpu_kernels::avx512::math::avx512_exp_f32(neg_x);
-                            let denom = _mm512_add_ps(one_v, exp_neg);
-                            x = _mm512_div_ps(x, denom);
-                        }
-                        $crate::Activation::Gelu => {
-                            // gelu(x) = 0.5 * x * (1 + tanh(0.7978845608 * (x + 0.044715 * x^3)))
-                            let x3 = _mm512_mul_ps(_mm512_mul_ps(x, x), x);
-                            let inner = _mm512_fmadd_ps(cubic_v, x3, x);
-                            let scaled = _mm512_mul_ps(coeff_v, inner);
-                            // tanh(a) = (exp(2a)-1)/(exp(2a)+1)
-                            let two_a = _mm512_add_ps(scaled, scaled);
-                            let exp_2a = $crate::cpu_kernels::avx512::math::avx512_exp_f32(two_a);
-                            let num = _mm512_sub_ps(exp_2a, one_v);
-                            let den = _mm512_add_ps(exp_2a, one_v);
-                            let tanh_v = _mm512_div_ps(num, den);
-                            let inner2 = _mm512_add_ps(one_v, tanh_v);
-                            x = _mm512_mul_ps(_mm512_mul_ps(half_v, x), inner2);
-                        }
-                        _ => {}
-                    }
-                    // Convert f32 → bf16
-                    let vi = _mm512_castps_si512(x);
-                    let shifted = _mm512_srli_epi32(vi, 16);
-                    let packed = _mm512_cvtepi32_epi16(shifted);
-                    _mm256_storeu_si256(dst.as_mut_ptr().add(row_off + n) as *mut __m256i, packed);
+                    let bfloat = load_bf16_as_f32(bias.as_ptr().add(n));
+                    let x = _mm512_add_ps(v, bfloat);
+                    let x = $crate::apply_act_runtime!(avx512, f32, x, act);
+                    store_f32_as_bf16(dst.as_mut_ptr().add(row_off + n), x);
                     n += 16;
                 }
                 // Scalar tail
                 while n < n_size {
                     let mut x = src[row_off + n] + bias[n].to_f32();
-                    match act {
-                        $crate::Activation::Relu => { if x < 0.0 { x = 0.0; } }
-                        $crate::Activation::Silu => { x = x / (1.0 + (-x).exp()); }
-                        $crate::Activation::Gelu => {
-                            let inner = 0.7978845608f32 * (x + 0.044715f32 * x * x * x);
-                            x = 0.5 * x * (1.0 + inner.tanh());
-                        }
-                        _ => {}
-                    }
+                    x = $crate::apply_act_scalar_runtime!(x, act);
                     dst[row_off + n] = half::bf16::from_f32(x);
                     n += 1;
                 }

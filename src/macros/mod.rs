@@ -11,6 +11,8 @@ pub mod gemm_epilogue;
 #[macro_use]
 pub mod simd_primitive;
 #[macro_use]
+pub mod math_templates;
+#[macro_use]
 pub mod matmul_x86;
 #[macro_use]
 pub mod matmul_x86_bf16;

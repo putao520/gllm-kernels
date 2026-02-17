@@ -56,12 +56,18 @@ macro_rules! simd_primitive {
     // --- Integer Primitives (Scalar Fallback) ---
     (scalar, i32, splat, $v:expr) => { $v };
     (scalar, i32, load, $p:expr) => { unsafe { *($p as *const i32) } };
+    (scalar, i32, add, $a:expr, $b:expr) => { $a.wrapping_add($b) };
     (scalar, i32, and, $a:expr, $b:expr) => { $a & $b };
     (scalar, i32, or, $a:expr, $b:expr) => { $a | $b };
     (scalar, i32, xor, $a:expr, $b:expr) => { $a ^ $b };
     (scalar, i32, shl, $a:expr, $shift:expr) => { $a << $shift };
+    (scalar, i32, shl_23, $a:expr) => { $a << 23 };
     (scalar, i32, shr, $a:expr, $shift:expr) => { $a >> $shift }; // arithmetic shift
     (scalar, i32, cast_f32, $a:expr) => { $a as f32 };
+    (scalar, i32, cast_bits_f32, $a:expr) => { f32::from_bits($a as u32) };
+    (scalar, f32, round_nearest, $a:expr) => { $a.round() };
+    (scalar, f32, cvt_to_i32, $a:expr) => { $a as i32 };
+    (scalar, f32, cvt_from_i32, $a:expr) => { $a as f32 };
     // Shuffle: scalar shuffle is identity or specific index? 
     // Usually shuffle is typically used for rearranging bytes.
     // For scalar, we might need a custom implementation if operating on bytes, but scalar mode 
@@ -189,14 +195,20 @@ macro_rules! simd_primitive {
     (avx2, i32, load, $p:expr) => { std::arch::x86_64::_mm256_loadu_si256($p as *const std::arch::x86_64::__m256i) };
     (avx2, i32, store, $p:expr, $v:expr) => { std::arch::x86_64::_mm256_storeu_si256($p as *mut std::arch::x86_64::__m256i, $v) };
     
+    (avx2, i32, add, $a:expr, $b:expr) => { std::arch::x86_64::_mm256_add_epi32($a, $b) };
     (avx2, i32, and, $a:expr, $b:expr) => { std::arch::x86_64::_mm256_and_si256($a, $b) };
     (avx2, i32, or, $a:expr, $b:expr) => { std::arch::x86_64::_mm256_or_si256($a, $b) };
     (avx2, i32, xor, $a:expr, $b:expr) => { std::arch::x86_64::_mm256_xor_si256($a, $b) };
     (avx2, i32, shl, $a:expr, $shift:expr) => { std::arch::x86_64::_mm256_slli_epi32($a, $shift) };
+    (avx2, i32, shl_23, $a:expr) => { std::arch::x86_64::_mm256_slli_epi32($a, 23) };
     (avx2, i32, shr, $a:expr, $shift:expr) => { std::arch::x86_64::_mm256_srai_epi32($a, $shift) }; // arithmetic right shift
     (avx2, i32, shr_u, $a:expr, $shift:expr) => { std::arch::x86_64::_mm256_srli_epi32($a, $shift) }; // logical right shift
 
     (avx2, i32, cast_f32, $a:expr) => { std::arch::x86_64::_mm256_cvtepi32_ps($a) };
+    (avx2, i32, cast_bits_f32, $a:expr) => { std::arch::x86_64::_mm256_castsi256_ps($a) };
+    (avx2, f32, round_nearest, $a:expr) => { std::arch::x86_64::_mm256_round_ps($a, std::arch::x86_64::_MM_FROUND_TO_NEAREST_INT | std::arch::x86_64::_MM_FROUND_NO_EXC) };
+    (avx2, f32, cvt_to_i32, $a:expr) => { std::arch::x86_64::_mm256_cvtps_epi32($a) };
+    (avx2, f32, cvt_from_i32, $a:expr) => { std::arch::x86_64::_mm256_cvtepi32_ps($a) };
     
     // Shuffle bytes (pshufb) - operates on 128-bit memory lanes!
     // _mm256_shuffle_epi8
@@ -509,6 +521,20 @@ macro_rules! simd_primitive {
     // 5. A dedicated matmul_int8_vnni! macro is needed
 
 
+    // --- AVX-512 Integer Primitives ---
+    (avx512, i32, zero) => { std::arch::x86_64::_mm512_setzero_si512() };
+    (avx512, i32, splat, $v:expr) => { std::arch::x86_64::_mm512_set1_epi32($v) };
+    (avx512, i32, add, $a:expr, $b:expr) => { std::arch::x86_64::_mm512_add_epi32($a, $b) };
+    (avx512, i32, shl, $a:expr, $shift:expr) => { std::arch::x86_64::_mm512_slli_epi32($a, $shift) };
+    (avx512, i32, shl_23, $a:expr) => { std::arch::x86_64::_mm512_slli_epi32($a, 23) };
+    (avx512, i32, shr, $a:expr, $shift:expr) => { std::arch::x86_64::_mm512_srai_epi32($a, $shift) };
+    (avx512, i32, cast_f32, $a:expr) => { std::arch::x86_64::_mm512_cvtepi32_ps($a) };
+    (avx512, i32, cast_bits_f32, $a:expr) => { std::arch::x86_64::_mm512_castsi512_ps($a) };
+    (avx512, f32, round_nearest, $a:expr) => { std::arch::x86_64::_mm512_roundscale_ps($a, std::arch::x86_64::_MM_FROUND_TO_NEAREST_INT | std::arch::x86_64::_MM_FROUND_NO_EXC) };
+    (avx512, f32, cvt_to_i32, $a:expr) => { std::arch::x86_64::_mm512_cvtps_epi32($a) };
+    (avx512, f32, cvt_from_i32, $a:expr) => { std::arch::x86_64::_mm512_cvtepi32_ps($a) };
+
+
     // ========================================================================
     // NEON Implementation (aarch64)
     // ========================================================================
@@ -744,6 +770,7 @@ macro_rules! simd_primitive {
     (neon, i32, and, $a:expr, $b:expr) => { unsafe { std::arch::aarch64::vandq_s32($a, $b) } };
     (neon, i32, or, $a:expr, $b:expr) => { unsafe { std::arch::aarch64::vorrq_s32($a, $b) } };
     (neon, i32, xor, $a:expr, $b:expr) => { unsafe { std::arch::aarch64::veorq_s32($a, $b) } };
+    (neon, i32, add, $a:expr, $b:expr) => { unsafe { std::arch::aarch64::vaddq_s32($a, $b) } };
     (neon, i32, shl, $a:expr, $shift:expr) => { unsafe { std::arch::aarch64::shlq_n_s32($a, $shift) } }; // Wait, intrinsics for immediate shift are tricky with rust macros
     // Better use vshlq_n_s32 if shift is const, or vshlq_s32 if variable.
     // Assuming immediate:
@@ -751,8 +778,13 @@ macro_rules! simd_primitive {
     // Actually vshlq_n_s32 expects constant. If $shift is expr, it might fail.
     // Use dynamic shift: vshlq_s32(a, vdupq_n_s32(shift))
     (neon, i32, shl_dyn, $a:expr, $shift:expr) => { unsafe { std::arch::aarch64::vshlq_s32($a, std::arch::aarch64::vdupq_n_s32($shift)) } };
-    
+    (neon, i32, shl_23, $a:expr) => { unsafe { std::arch::aarch64::vshlq_n_s32::<23>($a) } };
+
     (neon, i32, cast_f32, $a:expr) => { unsafe { std::arch::aarch64::vcvtq_f32_s32($a) } };
+    (neon, i32, cast_bits_f32, $a:expr) => { unsafe { std::arch::aarch64::vreinterpretq_f32_s32($a) } };
+    (neon, f32, round_nearest, $a:expr) => { unsafe { std::arch::aarch64::vrndnq_f32($a) } };
+    (neon, f32, cvt_to_i32, $a:expr) => { unsafe { std::arch::aarch64::vcvtq_s32_f32($a) } };
+    (neon, f32, cvt_from_i32, $a:expr) => { unsafe { std::arch::aarch64::vcvtq_f32_s32($a) } };
     
     // Shuffle: vqtbl1q_u8 (lookup table)
     (neon, i8, shuffle, $tbl:expr, $idx:expr) => { unsafe { std::arch::aarch64::vqtbl1q_u8($tbl, $idx) } };

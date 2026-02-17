@@ -54,23 +54,7 @@ macro_rules! define_matmul_x86_bf16_native {
             std::mem::transmute(v)
         }
 
-        /// Store f32 accumulator as 16 bf16 values (truncation).
-        #[inline(always)]
-        unsafe fn store_f32_as_bf16(ptr: *mut half::bf16, v: __m512) {
-            let vi = _mm512_castps_si512(v);
-            let shifted = _mm512_srli_epi32(vi, 16);
-            let packed = _mm512_cvtepi32_epi16(shifted);
-            _mm256_storeu_si256(ptr as *mut __m256i, packed);
-        }
-
-        /// Load 16 bf16 as f32 (for reading partial C accumulator).
-        #[inline(always)]
-        unsafe fn load_bf16_as_f32(ptr: *const half::bf16) -> __m512 {
-            let v256 = _mm256_loadu_si256(ptr as *const __m256i);
-            let v512 = _mm512_cvtepu16_epi32(v256);
-            let shifted = _mm512_slli_epi32(v512, 16);
-            _mm512_castsi512_ps(shifted)
-        }
+        $crate::define_bf16_helpers!();
 
         // ── pack_b (K-interleaved pairs for vdpbf16ps) ───────────────
         // Layout: [chunk][strip][kc_pairs][BK_STRIDE]
