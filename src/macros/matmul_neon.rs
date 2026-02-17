@@ -573,6 +573,8 @@ macro_rules! define_matmul_neon {
                             )+
                             let mut ac = a.as_ptr().add(m*k_size+ks);
                             let mut bp = pb.as_ptr().add(ch*cs+si*kc_max*TN_);
+                            // Prefetch C output tile into L1 before K-loop
+                            $($crate::simd_primitive!(neon, $elem, prefetch, cp.add((m+$R)*n_size+n) as *const u8, 0);)+
                             let mut _k = 0usize;
                             let ku = kc & !7;
                             while _k < ku {
@@ -992,6 +994,8 @@ macro_rules! define_matmul_neon {
                             )+
                             let mut ac = a.as_ptr().add(m*k_size+ks);
                             let mut bptr = pb.as_ptr().add(ch*cs+si*kc_max*TN_);
+                            // Prefetch C output tile into L1 before K-loop
+                            $($crate::simd_primitive!(neon, $elem, prefetch, cp.add((m+$R)*n_size+n) as *const u8, 0);)+
                             let mut _k = 0usize;
                             let ku = kc & !7;
                             while _k < ku {

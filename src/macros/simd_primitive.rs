@@ -48,6 +48,10 @@ macro_rules! simd_primitive {
     (scalar, f32, sqrt, $a:expr) => { $a.sqrt() };
     (scalar, f32, rsqrt, $a:expr) => { 1.0 / $a.sqrt() };
     (scalar, f32, prefetch, $p:expr, $dist:expr) => { };
+    (scalar, f32, prefetch_t1, $p:expr) => { };
+    (scalar, f32, prefetch_nta, $p:expr) => { };
+    // Scalar stream: just a regular store
+    (scalar, f32, stream, $p:expr, $v:expr) => { unsafe { *$p = $v } };
 
     // --- Integer Primitives (Scalar Fallback) ---
     (scalar, i32, splat, $v:expr) => { $v };
@@ -151,9 +155,34 @@ macro_rules! simd_primitive {
     };
     (avx2, f32, abs, $a:expr) => { std::arch::x86_64::_mm256_andnot_ps(std::arch::x86_64::_mm256_set1_ps(-0.0), $a) };
 
+    // Non-temporal (streaming) store: bypasses cache, useful for write-only data
+    (avx2, f32, stream, $p:expr, $v:expr) => {
+        std::arch::x86_64::_mm256_stream_ps($p, $v)
+    };
     (avx2, f32, prefetch, $p:expr, $dist:expr) => { std::arch::x86_64::_mm_prefetch($p as *const i8, std::arch::x86_64::_MM_HINT_T0) };
-
-    // --- Integer Primitives (AVX2) ---
+    (avx2, f32, prefetch_t1, $p:expr) => { std::arch::x86_64::_mm_prefetch($p as *const i8, std::arch::x86_64::_MM_HINT_T1) };
+    (avx2, f32, prefetch_nta, $p:expr) => { std::arch::x86_64::_mm_prefetch($p as *const i8, std::arch::x86_64::_MM_HINT_NTA) };
+    // Masked load: load `count` f32 elements (0..8), rest are zero
+    (avx2, f32, maskload, $p:expr, $count:expr) => {
+        {
+            use std::arch::x86_64::*;
+            // Build mask: lane i gets -1 (0xFFFFFFFF) if i < count, else 0
+            let idx = _mm256_set_epi32(7, 6, 5, 4, 3, 2, 1, 0);
+            let thresh = _mm256_set1_epi32($count as i32);
+            let mask = _mm256_cmpgt_epi32(thresh, idx); // mask[i] = (count > i) ? -1 : 0
+            _mm256_maskload_ps($p, mask)
+        }
+    };
+    // Masked store: store `count` f32 elements (0..8)
+    (avx2, f32, maskstore, $p:expr, $v:expr, $count:expr) => {
+        {
+            use std::arch::x86_64::*;
+            let idx = _mm256_set_epi32(7, 6, 5, 4, 3, 2, 1, 0);
+            let thresh = _mm256_set1_epi32($count as i32);
+            let mask = _mm256_cmpgt_epi32(thresh, idx);
+            _mm256_maskstore_ps($p, mask, $v);
+        }
+    };
     // Note: We use __m256i for integer vectors.
     (avx2, i32, zero) => { std::arch::x86_64::_mm256_setzero_si256() };
     (avx2, i32, splat, $v:expr) => { std::arch::x86_64::_mm256_set1_epi32($v) };
@@ -193,6 +222,26 @@ macro_rules! simd_primitive {
     (avx512, f32, loadu, $p:expr) => { std::arch::x86_64::_mm512_loadu_ps($p) };
     (avx512, f32, store, $p:expr, $v:expr) => { std::arch::x86_64::_mm512_storeu_ps($p, $v) };
     (avx512, f32, storeu, $p:expr, $v:expr) => { std::arch::x86_64::_mm512_storeu_ps($p, $v) };
+    // Masked load: load `count` elements (0..16), rest are zero
+    (avx512, f32, maskload, $p:expr, $count:expr) => {
+        {
+            use std::arch::x86_64::*;
+            let mask: __mmask16 = (1u32.wrapping_shl($count as u32) - 1) as __mmask16;
+            _mm512_maskz_loadu_ps(mask, $p)
+        }
+    };
+    // Masked store: store `count` elements (0..16)
+    (avx512, f32, maskstore, $p:expr, $v:expr, $count:expr) => {
+        {
+            use std::arch::x86_64::*;
+            let mask: __mmask16 = (1u32.wrapping_shl($count as u32) - 1) as __mmask16;
+            _mm512_mask_storeu_ps($p, mask, $v);
+        }
+    };
+    // Non-temporal (streaming) store: bypasses cache, useful for write-only data
+    (avx512, f32, stream, $p:expr, $v:expr) => {
+        std::arch::x86_64::_mm512_stream_ps($p, $v)
+    };
     (avx512, f32, add, $a:expr, $b:expr) => { std::arch::x86_64::_mm512_add_ps($a, $b) };
     (avx512, f32, sub, $a:expr, $b:expr) => { std::arch::x86_64::_mm512_sub_ps($a, $b) };
     (avx512, f32, mul, $a:expr, $b:expr) => { std::arch::x86_64::_mm512_mul_ps($a, $b) };
@@ -237,6 +286,8 @@ macro_rules! simd_primitive {
     };
 
     (avx512, f32, prefetch, $p:expr, $dist:expr) => { std::arch::x86_64::_mm_prefetch($p as *const i8, std::arch::x86_64::_MM_HINT_T0) };
+    (avx512, f32, prefetch_t1, $p:expr) => { std::arch::x86_64::_mm_prefetch($p as *const i8, std::arch::x86_64::_MM_HINT_T1) };
+    (avx512, f32, prefetch_nta, $p:expr) => { std::arch::x86_64::_mm_prefetch($p as *const i8, std::arch::x86_64::_MM_HINT_NTA) };
 
     // --- AVX-512 f16 (F16C via 256-bit halves, compute in f32) ---
     (avx512, f16, lanes) => { 16 };
@@ -291,6 +342,50 @@ macro_rules! simd_primitive {
     (avx512, f16, recip, $a:expr) => { $crate::simd_primitive!(avx512, f32, recip, $a) };
     (avx512, f16, exp, $a:expr) => { $crate::simd_primitive!(avx512, f32, exp, $a) };
     (avx512, f16, prefetch, $p:expr, $dist:expr) => { std::arch::x86_64::_mm_prefetch($p as *const i8, std::arch::x86_64::_MM_HINT_T0) };
+    (avx512, f16, prefetch_t1, $p:expr) => { std::arch::x86_64::_mm_prefetch($p as *const i8, std::arch::x86_64::_MM_HINT_T1) };
+    (avx512, f16, prefetch_nta, $p:expr) => { std::arch::x86_64::_mm_prefetch($p as *const i8, std::arch::x86_64::_MM_HINT_NTA) };
+    // Non-temporal store for f16: convert f32→f16 then stream 256-bit
+    (avx512, f16, stream, $p:expr, $v:expr) => {
+        {
+            let lo = std::arch::x86_64::_mm512_castps512_ps256($v);
+            let hi = std::arch::x86_64::_mm512_extractf32x8_ps($v, 1);
+            let lo_h = std::arch::x86_64::_mm256_cvtps_ph(lo, std::arch::x86_64::_MM_FROUND_TO_NEAREST_INT);
+            let hi_h = std::arch::x86_64::_mm256_cvtps_ph(hi, std::arch::x86_64::_MM_FROUND_TO_NEAREST_INT);
+            std::arch::x86_64::_mm_stream_si128($p as *mut std::arch::x86_64::__m128i, lo_h);
+            std::arch::x86_64::_mm_stream_si128(($p as *mut std::arch::x86_64::__m128i).add(1), hi_h);
+        }
+    };
+    // Masked load: load `count` f16 elements (0..16), convert to f32, rest are zero
+    (avx512, f16, maskload, $p:expr, $count:expr) => {
+        {
+            use std::arch::x86_64::*;
+            let mask: __mmask16 = (1u32.wrapping_shl($count as u32) - 1) as __mmask16;
+            // Masked load 16-bit integers, zero-extend to 32-bit, then F16C convert
+            let raw = _mm256_maskz_loadu_epi16(mask, $p as *const i16);
+            // Convert __m256i (8×f16 in low 128 + 8×f16 in high 128) via two F16C calls
+            let lo128 = _mm256_castsi256_si128(raw);
+            let hi128 = _mm256_extracti128_si256(raw, 1);
+            let lo_f32 = _mm256_cvtph_ps(lo128);
+            let hi_f32 = _mm256_cvtph_ps(hi128);
+            // Combine into __m512
+            let combined = _mm512_castps256_ps512(lo_f32);
+            _mm512_insertf32x8(combined, hi_f32, 1)
+        }
+    };
+    // Masked store: store `count` f16 elements (0..16) from f32 vector
+    (avx512, f16, maskstore, $p:expr, $v:expr, $count:expr) => {
+        {
+            use std::arch::x86_64::*;
+            let mask: __mmask16 = (1u32.wrapping_shl($count as u32) - 1) as __mmask16;
+            let lo = _mm512_castps512_ps256($v);
+            let hi = _mm512_extractf32x8_ps($v, 1);
+            let lo_h = _mm256_cvtps_ph(lo, _MM_FROUND_TO_NEAREST_INT);
+            let hi_h = _mm256_cvtps_ph(hi, _MM_FROUND_TO_NEAREST_INT);
+            // Pack two __m128i into __m256i
+            let packed = _mm256_inserti128_si256(_mm256_castsi128_si256(lo_h), hi_h, 1);
+            _mm256_mask_storeu_epi16($p as *mut i16, mask, packed);
+        }
+    };
 
     // --- AVX-512 bf16 (bit-shift conversion, compute in f32) ---
     (avx512, bf16, lanes) => { 16 };
@@ -338,6 +433,41 @@ macro_rules! simd_primitive {
     (avx512, bf16, recip, $a:expr) => { $crate::simd_primitive!(avx512, f32, recip, $a) };
     (avx512, bf16, exp, $a:expr) => { $crate::simd_primitive!(avx512, f32, exp, $a) };
     (avx512, bf16, prefetch, $p:expr, $dist:expr) => { std::arch::x86_64::_mm_prefetch($p as *const i8, std::arch::x86_64::_MM_HINT_T0) };
+    (avx512, bf16, prefetch_t1, $p:expr) => { std::arch::x86_64::_mm_prefetch($p as *const i8, std::arch::x86_64::_MM_HINT_T1) };
+    (avx512, bf16, prefetch_nta, $p:expr) => { std::arch::x86_64::_mm_prefetch($p as *const i8, std::arch::x86_64::_MM_HINT_NTA) };
+    // Non-temporal store for bf16: convert f32→bf16 then stream 256-bit
+    (avx512, bf16, stream, $p:expr, $v:expr) => {
+        {
+            let vi = std::arch::x86_64::_mm512_castps_si512($v);
+            let shifted = std::arch::x86_64::_mm512_srli_epi32(vi, 16);
+            let packed = std::arch::x86_64::_mm512_cvtepi32_epi16(shifted);
+            std::arch::x86_64::_mm256_stream_si256($p as *mut std::arch::x86_64::__m256i, packed);
+        }
+    };
+    // Masked load: load `count` bf16 elements (0..16), convert to f32, rest are zero
+    (avx512, bf16, maskload, $p:expr, $count:expr) => {
+        {
+            use std::arch::x86_64::*;
+            let mask: __mmask16 = (1u32.wrapping_shl($count as u32) - 1) as __mmask16;
+            // Masked load 16-bit bf16 values as integers
+            let raw = _mm256_maskz_loadu_epi16(mask, $p as *const i16);
+            let v512 = _mm512_cvtepu16_epi32(raw);
+            let shifted = _mm512_slli_epi32(v512, 16);
+            _mm512_castsi512_ps(shifted)
+        }
+    };
+    // Masked store: store `count` bf16 elements (0..16) from f32 vector
+    (avx512, bf16, maskstore, $p:expr, $v:expr, $count:expr) => {
+        {
+            use std::arch::x86_64::*;
+            let mask: __mmask16 = (1u32.wrapping_shl($count as u32) - 1) as __mmask16;
+            // f32→bf16: shift right 16 (truncate), pack 32→16
+            let vi = _mm512_castps_si512($v);
+            let shifted = _mm512_srli_epi32(vi, 16);
+            let packed = _mm512_cvtepi32_epi16(shifted);
+            _mm256_mask_storeu_epi16($p as *mut i16, mask, packed);
+        }
+    };
 
     // --- AVX-512 BF16 native dot-product (avx512bf16 extension) ---
     // vdpbf16ps: src += a(bf16_pairs) * b(bf16_pairs), 2 bf16 MACs per 32-bit lane
@@ -441,6 +571,26 @@ macro_rules! simd_primitive {
     (neon, f32, prefetch, $p:expr, $dist:expr) => {
         unsafe { core::arch::asm!("prfm pldl1keep, [{addr}]", addr = in(reg) ($p as *const u8).add($dist), options(nostack, preserves_flags)) }
     };
+    (neon, f32, prefetch_t1, $p:expr) => {
+        unsafe { core::arch::asm!("prfm pldl2keep, [{addr}]", addr = in(reg) ($p as *const u8), options(nostack, preserves_flags)) }
+    };
+    (neon, f32, prefetch_nta, $p:expr) => {
+        unsafe { core::arch::asm!("prfm pldl1strm, [{addr}]", addr = in(reg) ($p as *const u8), options(nostack, preserves_flags)) }
+    };
+    // NEON non-temporal store: use STNP (store non-temporal pair) for 128-bit
+    (neon, f32, stream, $p:expr, $v:expr) => {
+        unsafe {
+            let ptr = $p as *mut u8;
+            let pair: [u64; 2] = std::mem::transmute($v);
+            core::arch::asm!(
+                "stnp {lo}, {hi}, [{ptr}]",
+                lo = in(reg) pair[0],
+                hi = in(reg) pair[1],
+                ptr = in(reg) ptr,
+                options(nostack, preserves_flags),
+            );
+        }
+    };
 
     // --- NEON f16 (ARMv8.2 native FP16 when available, else convert) ---
     (neon, f16, lanes) => { 4 };
@@ -485,6 +635,29 @@ macro_rules! simd_primitive {
     (neon, f16, exp, $a:expr) => { $crate::cpu_kernels::neon::math::exp_ps($a) };
     (neon, f16, prefetch, $p:expr, $dist:expr) => {
         unsafe { core::arch::asm!("prfm pldl1keep, [{addr}]", addr = in(reg) ($p as *const u8).add($dist), options(nostack, preserves_flags)) }
+    };
+    (neon, f16, prefetch_t1, $p:expr) => {
+        unsafe { core::arch::asm!("prfm pldl2keep, [{addr}]", addr = in(reg) ($p as *const u8), options(nostack, preserves_flags)) }
+    };
+    (neon, f16, prefetch_nta, $p:expr) => {
+        unsafe { core::arch::asm!("prfm pldl1strm, [{addr}]", addr = in(reg) ($p as *const u8), options(nostack, preserves_flags)) }
+    };
+    // NEON f16 non-temporal store: convert f32→f16 then STNP 64-bit
+    (neon, f16, stream, $p:expr, $v:expr) => {
+        unsafe {
+            let h = std::arch::aarch64::vcvt_f16_f32($v);
+            let ptr = $p as *mut u8;
+            let bits: u64 = std::mem::transmute(h);
+            let lo = bits as u32;
+            let hi = (bits >> 32) as u32;
+            core::arch::asm!(
+                "stnp {lo:w}, {hi:w}, [{ptr}]",
+                lo = in(reg) lo,
+                hi = in(reg) hi,
+                ptr = in(reg) ptr,
+                options(nostack, preserves_flags),
+            );
+        }
     };
 
     // --- NEON bf16 (convert via bit-shift) ---
@@ -534,6 +707,31 @@ macro_rules! simd_primitive {
     (neon, bf16, exp, $a:expr) => { $crate::cpu_kernels::neon::math::exp_ps($a) };
     (neon, bf16, prefetch, $p:expr, $dist:expr) => {
         unsafe { core::arch::asm!("prfm pldl1keep, [{addr}]", addr = in(reg) ($p as *const u8).add($dist), options(nostack, preserves_flags)) }
+    };
+    (neon, bf16, prefetch_t1, $p:expr) => {
+        unsafe { core::arch::asm!("prfm pldl2keep, [{addr}]", addr = in(reg) ($p as *const u8), options(nostack, preserves_flags)) }
+    };
+    (neon, bf16, prefetch_nta, $p:expr) => {
+        unsafe { core::arch::asm!("prfm pldl1strm, [{addr}]", addr = in(reg) ($p as *const u8), options(nostack, preserves_flags)) }
+    };
+    // NEON bf16 non-temporal store: convert f32→bf16 then STNP 64-bit
+    (neon, bf16, stream, $p:expr, $v:expr) => {
+        unsafe {
+            let vi = std::arch::aarch64::vreinterpretq_u32_f32($v);
+            let shifted = std::arch::aarch64::vshrq_n_u32(vi, 16);
+            let narrow = std::arch::aarch64::vmovn_u32(shifted);
+            let ptr = $p as *mut u8;
+            let bits: u64 = std::mem::transmute(narrow);
+            let lo = bits as u32;
+            let hi = (bits >> 32) as u32;
+            core::arch::asm!(
+                "stnp {lo:w}, {hi:w}, [{ptr}]",
+                lo = in(reg) lo,
+                hi = in(reg) hi,
+                ptr = in(reg) ptr,
+                options(nostack, preserves_flags),
+            );
+        }
     };
 
     // --- Integer Primitives (NEON) ---
@@ -594,6 +792,9 @@ macro_rules! simd_primitive {
     (scalar, f16, sqrt, $a:expr) => { $a.sqrt() };
     (scalar, f16, rsqrt, $a:expr) => { 1.0 / $a.sqrt() };
     (scalar, f16, prefetch, $p:expr, $dist:expr) => { };
+    (scalar, f16, prefetch_t1, $p:expr) => { };
+    (scalar, f16, prefetch_nta, $p:expr) => { };
+    (scalar, f16, stream, $p:expr, $v:expr) => { unsafe { *$p = half::f16::from_f32($v) } };
 
     // --- AVX2 f16 (F16C: load f16→f32, compute f32, store f32→f16) ---
     (avx2, f16, lanes) => { 8 };
@@ -638,6 +839,46 @@ macro_rules! simd_primitive {
     (avx2, f16, rsqrt, $a:expr) => { $crate::simd_primitive!(avx2, f32, rsqrt, $a) };
     (avx2, f16, recip, $a:expr) => { $crate::simd_primitive!(avx2, f32, recip, $a) };
     (avx2, f16, prefetch, $p:expr, $dist:expr) => { std::arch::x86_64::_mm_prefetch($p as *const i8, std::arch::x86_64::_MM_HINT_T0) };
+    (avx2, f16, prefetch_t1, $p:expr) => { std::arch::x86_64::_mm_prefetch($p as *const i8, std::arch::x86_64::_MM_HINT_T1) };
+    (avx2, f16, prefetch_nta, $p:expr) => { std::arch::x86_64::_mm_prefetch($p as *const i8, std::arch::x86_64::_MM_HINT_NTA) };
+    // Non-temporal store for f16: convert f32→f16 then stream 128-bit
+    (avx2, f16, stream, $p:expr, $v:expr) => {
+        {
+            let h = std::arch::x86_64::_mm256_cvtps_ph($v, std::arch::x86_64::_MM_FROUND_TO_NEAREST_INT);
+            std::arch::x86_64::_mm_stream_si128($p as *mut std::arch::x86_64::__m128i, h);
+        }
+    };
+    // Masked load: load `count` f16 elements (0..8), convert to f32, rest are zero
+    (avx2, f16, maskload, $p:expr, $count:expr) => {
+        {
+            use std::arch::x86_64::*;
+            // Build 32-bit mask for maskload_ps (sign bit selects)
+            let idx = _mm256_set_epi32(7, 6, 5, 4, 3, 2, 1, 0);
+            let thresh = _mm256_set1_epi32($count as i32);
+            let mask32 = _mm256_cmpgt_epi32(thresh, idx);
+            // Load 8 f32 via maskload, then we need f16 approach:
+            // Load all 8 f16 (128-bit), convert to f32, then zero masked lanes
+            let raw = _mm_loadu_si128($p as *const __m128i);
+            let converted = _mm256_cvtph_ps(raw);
+            // Zero out lanes beyond count using the mask
+            _mm256_and_ps(converted, _mm256_castsi256_ps(mask32))
+        }
+    };
+    // Masked store: store `count` f16 elements (0..8) from f32 vector
+    (avx2, f16, maskstore, $p:expr, $v:expr, $count:expr) => {
+        {
+            use std::arch::x86_64::*;
+            // Convert f32→f16
+            let h = _mm256_cvtps_ph($v, _MM_FROUND_TO_NEAREST_INT);
+            // Scalar store only the valid lanes
+            let mut tmp = [0u16; 8];
+            _mm_storeu_si128(tmp.as_mut_ptr() as *mut __m128i, h);
+            let dst = $p as *mut u16;
+            for i in 0..($count as usize) {
+                *dst.add(i) = tmp[i];
+            }
+        }
+    };
 
     // ========================================================================
     // bf16 Support (compute in f32, load/store with bit-shift conversion)
@@ -674,6 +915,9 @@ macro_rules! simd_primitive {
     (scalar, bf16, sqrt, $a:expr) => { $a.sqrt() };
     (scalar, bf16, rsqrt, $a:expr) => { 1.0 / $a.sqrt() };
     (scalar, bf16, prefetch, $p:expr, $dist:expr) => { };
+    (scalar, bf16, prefetch_t1, $p:expr) => { };
+    (scalar, bf16, prefetch_nta, $p:expr) => { };
+    (scalar, bf16, stream, $p:expr, $v:expr) => { unsafe { *$p = half::bf16::from_f32($v) } };
 
     // --- AVX2 bf16 (bit-shift conversion: load bf16→f32, compute f32, store f32→bf16) ---
     (avx2, bf16, lanes) => { 8 };
@@ -725,5 +969,53 @@ macro_rules! simd_primitive {
     (avx2, bf16, rsqrt, $a:expr) => { $crate::simd_primitive!(avx2, f32, rsqrt, $a) };
     (avx2, bf16, recip, $a:expr) => { $crate::simd_primitive!(avx2, f32, recip, $a) };
     (avx2, bf16, prefetch, $p:expr, $dist:expr) => { std::arch::x86_64::_mm_prefetch($p as *const i8, std::arch::x86_64::_MM_HINT_T0) };
+    (avx2, bf16, prefetch_t1, $p:expr) => { std::arch::x86_64::_mm_prefetch($p as *const i8, std::arch::x86_64::_MM_HINT_T1) };
+    (avx2, bf16, prefetch_nta, $p:expr) => { std::arch::x86_64::_mm_prefetch($p as *const i8, std::arch::x86_64::_MM_HINT_NTA) };
+    // Non-temporal store for bf16: convert f32→bf16 then stream 128-bit
+    (avx2, bf16, stream, $p:expr, $v:expr) => {
+        {
+            let vi = std::arch::x86_64::_mm256_castps_si256($v);
+            let shifted = std::arch::x86_64::_mm256_srli_epi32(vi, 16);
+            let lo = std::arch::x86_64::_mm256_castsi256_si128(shifted);
+            let hi = std::arch::x86_64::_mm256_extracti128_si256(shifted, 1);
+            let packed = std::arch::x86_64::_mm_packus_epi32(lo, hi);
+            std::arch::x86_64::_mm_stream_si128($p as *mut std::arch::x86_64::__m128i, packed);
+        }
+    };
+    // Masked load: load `count` bf16 elements (0..8), convert to f32, rest are zero
+    (avx2, bf16, maskload, $p:expr, $count:expr) => {
+        {
+            use std::arch::x86_64::*;
+            let idx = _mm256_set_epi32(7, 6, 5, 4, 3, 2, 1, 0);
+            let thresh = _mm256_set1_epi32($count as i32);
+            let mask32 = _mm256_cmpgt_epi32(thresh, idx);
+            // Load 8 bf16 (128-bit), zero-extend to 8 u32 (256-bit), shift left 16
+            let raw = _mm_loadu_si128($p as *const __m128i);
+            let extended = _mm256_cvtepu16_epi32(raw);
+            let shifted = _mm256_slli_epi32(extended, 16);
+            let as_f32 = _mm256_castsi256_ps(shifted);
+            // Zero out lanes beyond count
+            _mm256_and_ps(as_f32, _mm256_castsi256_ps(mask32))
+        }
+    };
+    // Masked store: store `count` bf16 elements (0..8) from f32 vector
+    (avx2, bf16, maskstore, $p:expr, $v:expr, $count:expr) => {
+        {
+            use std::arch::x86_64::*;
+            // f32→bf16: shift right 16, pack to u16
+            let vi = _mm256_castps_si256($v);
+            let shifted = _mm256_srli_epi32(vi, 16);
+            let lo = _mm256_castsi256_si128(shifted);
+            let hi = _mm256_extracti128_si256(shifted, 1);
+            let packed = _mm_packus_epi32(lo, hi);
+            // Scalar store only the valid lanes
+            let mut tmp = [0u16; 8];
+            _mm_storeu_si128(tmp.as_mut_ptr() as *mut __m128i, packed);
+            let dst = $p as *mut u16;
+            for i in 0..($count as usize) {
+                *dst.add(i) = tmp[i];
+            }
+        }
+    };
 
 }

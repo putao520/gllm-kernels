@@ -24,7 +24,84 @@ macro_rules! define_matmul_x86 {
         }
 
         // ── pack_b (public) ────────────────────────────────────────────
+        // SIMD-optimized: uses vector load/NT-store for full strips, L2 prefetch for next row.
+        // NT stores bypass cache for write-once packed data (read later in GEMM).
         pub fn pack_b(b: &[$elem], n_size: usize, k_size: usize) -> Vec<$elem> {
+            #[target_feature($(enable = $feat),+)]
+            unsafe fn pack_b_simd(b: &[$elem], n_size: usize, k_size: usize, packed: &mut [$elem]) {
+                const TN: usize = $NV * $LANES;
+                const LANES: usize = $LANES;
+                let kc_max = _blocking().kc;
+                let n_strips = (n_size + TN - 1) / TN;
+                let cs = n_strips * kc_max * TN;
+                let bp = b.as_ptr();
+                let pp = packed.as_mut_ptr();
+                // Check if packed buffer is SIMD-aligned for NT stores
+                let align = std::mem::size_of::<$elem>() * LANES; // 64B for AVX-512 f32, 32B for AVX2 f32
+                let nt_ok = (pp as usize) % align == 0;
+                let mut ks = 0usize;
+                let mut ch = 0usize;
+                while ks < k_size {
+                    let kc = kc_max.min(k_size - ks);
+                    let base = ch * cs;
+                    for i in 0..n_strips {
+                        let ns = i * TN;
+                        let an = TN.min(n_size.saturating_sub(ns));
+                        if an == TN && nt_ok {
+                            // Full strip + aligned: SIMD load / NT-store (NV vectors per row)
+                            for k in 0..kc {
+                                let src = bp.add((ks + k) * n_size + ns);
+                                let dst = pp.add(base + i * kc_max * TN + k * TN);
+                                if k + 4 < kc {
+                                    $crate::simd_primitive!($isa, $elem, prefetch,
+                                        bp.add((ks + k + 4) * n_size + ns) as *const i8, 0);
+                                }
+                                let v0 = $crate::simd_primitive!($isa, $elem, loadu, src);
+                                $crate::simd_primitive!($isa, $elem, stream, dst, v0);
+                                let v1 = $crate::simd_primitive!($isa, $elem, loadu, src.add(LANES));
+                                $crate::simd_primitive!($isa, $elem, stream, dst.add(LANES), v1);
+                            }
+                        } else if an == TN {
+                            // Full strip but unaligned: regular SIMD store
+                            for k in 0..kc {
+                                let src = bp.add((ks + k) * n_size + ns);
+                                let dst = pp.add(base + i * kc_max * TN + k * TN);
+                                if k + 4 < kc {
+                                    $crate::simd_primitive!($isa, $elem, prefetch,
+                                        bp.add((ks + k + 4) * n_size + ns) as *const i8, 0);
+                                }
+                                let v0 = $crate::simd_primitive!($isa, $elem, loadu, src);
+                                $crate::simd_primitive!($isa, $elem, storeu, dst, v0);
+                                let v1 = $crate::simd_primitive!($isa, $elem, loadu, src.add(LANES));
+                                $crate::simd_primitive!($isa, $elem, storeu, dst.add(LANES), v1);
+                            }
+                        } else {
+                            // Partial strip (tail): SIMD for LANES-aligned portion, scalar remainder
+                            for k in 0..kc {
+                                let src = bp.add((ks + k) * n_size + ns);
+                                let dst = pp.add(base + i * kc_max * TN + k * TN);
+                                let mut j = 0usize;
+                                while j + LANES <= an {
+                                    let v = $crate::simd_primitive!($isa, $elem, loadu, src.add(j));
+                                    $crate::simd_primitive!($isa, $elem, storeu, dst.add(j), v);
+                                    j += LANES;
+                                }
+                                // Masked SIMD tail
+                                let rem = an - j;
+                                if rem > 0 {
+                                    let v = $crate::simd_primitive!($isa, $elem, maskload, src.add(j), rem);
+                                    $crate::simd_primitive!($isa, $elem, maskstore, dst.add(j), v, rem);
+                                }
+                            }
+                        }
+                    }
+                    ks += kc_max; ch += 1;
+                }
+                // Fence: ensure all NT stores are globally visible before returning
+                #[cfg(target_arch = "x86_64")]
+                std::arch::x86_64::_mm_sfence();
+            }
+
             const TN: usize = $NV * $LANES;
             let kc_max = _blocking().kc;
             assert!(b.len() >= k_size * n_size);
@@ -32,25 +109,7 @@ macro_rules! define_matmul_x86 {
             let n_chunks = (k_size + kc_max - 1) / kc_max;
             let cs = n_strips * kc_max * TN;
             let mut packed = vec![<$elem as Element>::ZERO; n_chunks * cs];
-            let mut ks = 0usize;
-            let mut ch = 0usize;
-            while ks < k_size {
-                let kc = kc_max.min(k_size - ks);
-                let base = ch * cs;
-                for (i, ns) in (0..n_size).step_by(TN).enumerate() {
-                    let an = TN.min(n_size - ns);
-                    for k in 0..kc {
-                        unsafe {
-                            std::ptr::copy_nonoverlapping(
-                                b.as_ptr().add((ks + k) * n_size + ns),
-                                packed.as_mut_ptr().add(base + i * kc_max * TN + k * TN),
-                                an,
-                            );
-                        }
-                    }
-                }
-                ks += kc_max; ch += 1;
-            }
+            unsafe { pack_b_simd(b, n_size, k_size, &mut packed); }
             packed
         }
 
@@ -75,6 +134,8 @@ macro_rules! define_matmul_x86 {
             if pb.capacity() < tp { pb.reserve(tp - pb.len()); }
             unsafe { pb.set_len(tp); }
             {
+                let bp = b.as_ptr();
+                let pp = pb.as_mut_ptr();
                 let mut ks = 0usize; let mut ch = 0usize;
                 while ks < k_size {
                     let kc = kc_max.min(k_size - ks);
@@ -82,9 +143,31 @@ macro_rules! define_matmul_x86 {
                     for i in 0..n_strips {
                         let ns = i * TN;
                         let an = TN.min(n_size.saturating_sub(ns));
-                        for k in 0..kc {
-                            let d = base + i * kc_max * TN + k * TN;
-                            std::ptr::copy_nonoverlapping(b.as_ptr().add((ks+k)*n_size+ns), pb.as_mut_ptr().add(d), an);
+                        if an == TN {
+                            for k in 0..kc {
+                                let src = bp.add((ks + k) * n_size + ns);
+                                let dst = pp.add(base + i * kc_max * TN + k * TN);
+                                if k + 4 < kc {
+                                    $crate::simd_primitive!($isa, $elem, prefetch,
+                                        bp.add((ks + k + 4) * n_size + ns) as *const i8, 0);
+                                }
+                                let v0 = $crate::simd_primitive!($isa, $elem, loadu, src);
+                                $crate::simd_primitive!($isa, $elem, storeu, dst, v0);
+                                let v1 = $crate::simd_primitive!($isa, $elem, loadu, src.add($LANES));
+                                $crate::simd_primitive!($isa, $elem, storeu, dst.add($LANES), v1);
+                            }
+                        } else {
+                            for k in 0..kc {
+                                let src = bp.add((ks + k) * n_size + ns);
+                                let dst = pp.add(base + i * kc_max * TN + k * TN);
+                                let mut j = 0usize;
+                                while j + $LANES <= an {
+                                    let v = $crate::simd_primitive!($isa, $elem, loadu, src.add(j));
+                                    $crate::simd_primitive!($isa, $elem, storeu, dst.add(j), v);
+                                    j += $LANES;
+                                }
+                                while j < an { *dst.add(j) = *src.add(j); j += 1; }
+                            }
                         }
                     }
                     ks += kc_max; ch += 1;
@@ -92,15 +175,40 @@ macro_rules! define_matmul_x86 {
             }
 
             let cp = c.as_mut_ptr();
+            // NT store for C: only when aligned AND matrix large enough to exceed L2
+            let c_align = std::mem::size_of::<$elem>() * $LANES;
+            let c_bytes = m_size * n_size * std::mem::size_of::<$elem>();
+            let c_nt_ok = (cp as usize) % c_align == 0
+                && (n_size * std::mem::size_of::<$elem>()) % c_align == 0
+                && c_bytes > 512 * 1024; // skip NT for small C that fits in L2
+            let _ = c_nt_ok; // suppress unused warning in non-prepacked paths
             let mc_max = _blocking().mc;
+            // A-pack workspace: mc_max * kc_max elements, contiguous [TM-block][kc]
+            thread_local! { static WS_A: std::cell::Cell<Vec<$elem>> = std::cell::Cell::new(Vec::new()); }
+            let mut pa = WS_A.with(|c| c.take());
+            let pa_cap = mc_max * kc_max;
+            if pa.capacity() < pa_cap { pa.reserve(pa_cap - pa.len()); }
+            unsafe { pa.set_len(pa_cap); }
             let mut ks = 0usize; let mut ch = 0usize;
             while ks < k_size {
                 let kc = kc_max.min(k_size - ks);
                 let mut m_block = 0usize;
                 while m_block < m_size {
                 let m_end = (m_block + mc_max).min(m_size);
+                let mc = m_end - m_block;
+                // Pack A[m_block..m_end, ks..ks+kc] → pa[row][0..kc] contiguous
+                {
+                    let ap = a.as_ptr();
+                    let pp = pa.as_mut_ptr();
+                    for mi in 0..mc {
+                        let src = ap.add((m_block + mi) * k_size + ks);
+                        let dst = pp.add(mi * kc);
+                        std::ptr::copy_nonoverlapping(src, dst, kc);
+                    }
+                }
                 let mut m = m_block;
                 while m + TM <= m_end {
+                    let pa_row = (m - m_block) * kc; // offset into packed A for this TM block
                     let mut n = 0; let mut si = 0;
                     while n + TN <= n_size {
                         unsafe { paste::paste! {
@@ -114,88 +222,95 @@ macro_rules! define_matmul_x86 {
                                     $crate::simd_primitive!($isa, $elem, loadu, cp.add((m+$R)*n_size+n+$LANES)),
                                 )};
                             )+
-                            let mut ac = a.as_ptr().add(m*k_size+ks);
+                            let mut pac = pa.as_ptr().add(pa_row);
                             let mut bp = pb.as_ptr().add(ch*cs+si*kc_max*TN);
                             // Prefetch C output tile into L1 before K-loop
                             $($crate::simd_primitive!($isa, $elem, prefetch, cp.add((m+$R)*n_size+n) as *const i8, 0);)+
                             let mut _k = 0usize;
                             let ku = kc & !7;
                             while _k < ku {
-                                // Prefetch B ahead
+                                // Prefetch B panel ahead into L1 (hot, reused across M rows)
                                 $crate::simd_primitive!($isa, $elem, prefetch, bp.add(TN*16) as *const i8, 0);
-                                // Prefetch A rows ~256 bytes ahead (once per 8-iter block)
-                                $($crate::simd_primitive!($isa, $elem, prefetch, ac.add(k_size*$R + 64) as *const i8, 0);)+
+                                // Prefetch A panel ahead with NTA hint (streamed, don't pollute L1)
+                                $crate::simd_primitive!($isa, $elem, prefetch_nta, pac.add(8) as *const i8);
                                 let vb0_0 = $crate::simd_primitive!($isa, $elem, loadu, bp);
                                 let vb0_1 = $crate::simd_primitive!($isa, $elem, loadu, bp.add($LANES));
                                 $(
-                                        let va = $crate::simd_primitive!($isa, $elem, splat, *ac.add(k_size*$R));
+                                        let va = $crate::simd_primitive!($isa, $elem, splat, *pac.add(kc*$R));
                                         [<c_ $R _0>] = $crate::simd_primitive!($isa, $elem, fma, va, vb0_0, [<c_ $R _0>]);
                                         [<c_ $R _1>] = $crate::simd_primitive!($isa, $elem, fma, va, vb0_1, [<c_ $R _1>]);
-                                )+; ac = ac.add(1);
+                                )+; pac = pac.add(1);
                                 let vb1_0 = $crate::simd_primitive!($isa, $elem, loadu, bp.add(TN));
                                 let vb1_1 = $crate::simd_primitive!($isa, $elem, loadu, bp.add(TN+$LANES));
                                 $(
-                                        let va = $crate::simd_primitive!($isa, $elem, splat, *ac.add(k_size*$R));
+                                        let va = $crate::simd_primitive!($isa, $elem, splat, *pac.add(kc*$R));
                                         [<c_ $R _0>] = $crate::simd_primitive!($isa, $elem, fma, va, vb1_0, [<c_ $R _0>]);
                                         [<c_ $R _1>] = $crate::simd_primitive!($isa, $elem, fma, va, vb1_1, [<c_ $R _1>]);
-                                )+; ac = ac.add(1);
+                                )+; pac = pac.add(1);
                                 let vb2_0 = $crate::simd_primitive!($isa, $elem, loadu, bp.add(TN*2));
                                 let vb2_1 = $crate::simd_primitive!($isa, $elem, loadu, bp.add(TN*2+$LANES));
                                 $(
-                                        let va = $crate::simd_primitive!($isa, $elem, splat, *ac.add(k_size*$R));
+                                        let va = $crate::simd_primitive!($isa, $elem, splat, *pac.add(kc*$R));
                                         [<c_ $R _0>] = $crate::simd_primitive!($isa, $elem, fma, va, vb2_0, [<c_ $R _0>]);
                                         [<c_ $R _1>] = $crate::simd_primitive!($isa, $elem, fma, va, vb2_1, [<c_ $R _1>]);
-                                )+; ac = ac.add(1);
+                                )+; pac = pac.add(1);
                                 let vb3_0 = $crate::simd_primitive!($isa, $elem, loadu, bp.add(TN*3));
                                 let vb3_1 = $crate::simd_primitive!($isa, $elem, loadu, bp.add(TN*3+$LANES));
                                 $(
-                                        let va = $crate::simd_primitive!($isa, $elem, splat, *ac.add(k_size*$R));
+                                        let va = $crate::simd_primitive!($isa, $elem, splat, *pac.add(kc*$R));
                                         [<c_ $R _0>] = $crate::simd_primitive!($isa, $elem, fma, va, vb3_0, [<c_ $R _0>]);
                                         [<c_ $R _1>] = $crate::simd_primitive!($isa, $elem, fma, va, vb3_1, [<c_ $R _1>]);
-                                )+; ac = ac.add(1);
+                                )+; pac = pac.add(1);
+                                // Second B prefetch for latter half of 8-iter block
+                                $crate::simd_primitive!($isa, $elem, prefetch, bp.add(TN*20) as *const i8, 0);
                                 let vb4_0 = $crate::simd_primitive!($isa, $elem, loadu, bp.add(TN*4));
                                 let vb4_1 = $crate::simd_primitive!($isa, $elem, loadu, bp.add(TN*4+$LANES));
                                 $(
-                                        let va = $crate::simd_primitive!($isa, $elem, splat, *ac.add(k_size*$R));
+                                        let va = $crate::simd_primitive!($isa, $elem, splat, *pac.add(kc*$R));
                                         [<c_ $R _0>] = $crate::simd_primitive!($isa, $elem, fma, va, vb4_0, [<c_ $R _0>]);
                                         [<c_ $R _1>] = $crate::simd_primitive!($isa, $elem, fma, va, vb4_1, [<c_ $R _1>]);
-                                )+; ac = ac.add(1);
+                                )+; pac = pac.add(1);
                                 let vb5_0 = $crate::simd_primitive!($isa, $elem, loadu, bp.add(TN*5));
                                 let vb5_1 = $crate::simd_primitive!($isa, $elem, loadu, bp.add(TN*5+$LANES));
                                 $(
-                                        let va = $crate::simd_primitive!($isa, $elem, splat, *ac.add(k_size*$R));
+                                        let va = $crate::simd_primitive!($isa, $elem, splat, *pac.add(kc*$R));
                                         [<c_ $R _0>] = $crate::simd_primitive!($isa, $elem, fma, va, vb5_0, [<c_ $R _0>]);
                                         [<c_ $R _1>] = $crate::simd_primitive!($isa, $elem, fma, va, vb5_1, [<c_ $R _1>]);
-                                )+; ac = ac.add(1);
+                                )+; pac = pac.add(1);
                                 let vb6_0 = $crate::simd_primitive!($isa, $elem, loadu, bp.add(TN*6));
                                 let vb6_1 = $crate::simd_primitive!($isa, $elem, loadu, bp.add(TN*6+$LANES));
                                 $(
-                                        let va = $crate::simd_primitive!($isa, $elem, splat, *ac.add(k_size*$R));
+                                        let va = $crate::simd_primitive!($isa, $elem, splat, *pac.add(kc*$R));
                                         [<c_ $R _0>] = $crate::simd_primitive!($isa, $elem, fma, va, vb6_0, [<c_ $R _0>]);
                                         [<c_ $R _1>] = $crate::simd_primitive!($isa, $elem, fma, va, vb6_1, [<c_ $R _1>]);
-                                )+; ac = ac.add(1);
+                                )+; pac = pac.add(1);
                                 let vb7_0 = $crate::simd_primitive!($isa, $elem, loadu, bp.add(TN*7));
                                 let vb7_1 = $crate::simd_primitive!($isa, $elem, loadu, bp.add(TN*7+$LANES));
                                 $(
-                                        let va = $crate::simd_primitive!($isa, $elem, splat, *ac.add(k_size*$R));
+                                        let va = $crate::simd_primitive!($isa, $elem, splat, *pac.add(kc*$R));
                                         [<c_ $R _0>] = $crate::simd_primitive!($isa, $elem, fma, va, vb7_0, [<c_ $R _0>]);
                                         [<c_ $R _1>] = $crate::simd_primitive!($isa, $elem, fma, va, vb7_1, [<c_ $R _1>]);
-                                )+; ac = ac.add(1);
+                                )+; pac = pac.add(1);
                                 bp = bp.add(TN*8); _k += 8;
                             }
                             while _k < kc {
                                 let vb_0 = $crate::simd_primitive!($isa, $elem, loadu, bp);
                                 let vb_1 = $crate::simd_primitive!($isa, $elem, loadu, bp.add($LANES));
                                 $(
-                                        let va = $crate::simd_primitive!($isa, $elem, splat, *ac.add(k_size*$R));
+                                        let va = $crate::simd_primitive!($isa, $elem, splat, *pac.add(kc*$R));
                                         [<c_ $R _0>] = $crate::simd_primitive!($isa, $elem, fma, va, vb_0, [<c_ $R _0>]);
                                         [<c_ $R _1>] = $crate::simd_primitive!($isa, $elem, fma, va, vb_1, [<c_ $R _1>]);
-                                )+; ac = ac.add(1);
+                                )+; pac = pac.add(1);
                                 bp = bp.add(TN); _k += 1;
                             }
-                            // Store
-                            $($crate::simd_primitive!($isa, $elem, storeu, cp.add((m+$R)*n_size+n), [<c_ $R _0>]);
-                              $crate::simd_primitive!($isa, $elem, storeu, cp.add((m+$R)*n_size+n+$LANES), [<c_ $R _1>]);)+
+                            // Store — use NT store on first KC chunk (pure write) when aligned
+                            if ch == 0 && c_nt_ok {
+                                $($crate::simd_primitive!($isa, $elem, stream, cp.add((m+$R)*n_size+n), [<c_ $R _0>]);
+                                  $crate::simd_primitive!($isa, $elem, stream, cp.add((m+$R)*n_size+n+$LANES), [<c_ $R _1>]);)+
+                            } else {
+                                $($crate::simd_primitive!($isa, $elem, storeu, cp.add((m+$R)*n_size+n), [<c_ $R _0>]);
+                                  $crate::simd_primitive!($isa, $elem, storeu, cp.add((m+$R)*n_size+n+$LANES), [<c_ $R _1>]);)+
+                            }
                         }}
                         n += TN; si += 1;
                     }
@@ -205,7 +320,10 @@ macro_rules! define_matmul_x86 {
                 } // MC block
                 ks += kc_max; ch += 1;
             }
-            // Remainder N
+            // Fence after NT stores to ensure visibility before subsequent reads
+            if c_nt_ok { std::arch::x86_64::_mm_sfence(); }
+            WS_A.with(|c| c.set(pa));
+            // Remainder N — use masked SIMD for partial vectors
             let nm = (n_size / TN) * TN;
             if nm < n_size {
                 let mut n = nm;
@@ -222,12 +340,19 @@ macro_rules! define_matmul_x86 {
                     }}
                     n += $LANES;
                 }
-                for m in 0..m_size {
-                    for nn in n..n_size {
-                        let mut s = <$elem as Element>::ZERO;
-                        for k in 0..k_size { s = <$elem as Element>::mul_add(s, a[m*k_size+k], b[k*n_size+nn]); }
-                        c[m*n_size+nn] = s;
-                    }
+                // Masked SIMD tail for remaining N columns
+                let rem = n_size - n;
+                if rem > 0 {
+                    for m in 0..m_size { unsafe {
+                        let mut acc = $crate::simd_primitive!($isa, $elem, zero);
+                        let ar = a.as_ptr().add(m * k_size);
+                        for k in 0..k_size {
+                            let va = $crate::simd_primitive!($isa, $elem, splat, *ar.add(k));
+                            let vb = $crate::simd_primitive!($isa, $elem, maskload, b.as_ptr().add(k*n_size+n), rem);
+                            acc = $crate::simd_primitive!($isa, $elem, fma, va, vb, acc);
+                        }
+                        $crate::simd_primitive!($isa, $elem, maskstore, c.as_mut_ptr().add(m*n_size+n), acc, rem);
+                    }}
                 }
             }
             // Remainder M
@@ -276,18 +401,28 @@ macro_rules! define_matmul_x86 {
             let bp = b.as_ptr();
             let cp = c.as_mut_ptr();
 
+            let kc_max = _blocking().kc;
+            let mut ks = 0usize;
+            let mut ch = 0u32; // KC chunk index
+
+            while ks < k_size {
+                let kc = (k_size - ks).min(kc_max);
+
             // ── Main TM×TN tiles ──
             let mut m = 0usize;
             while m + TM <= m_size {
                 let mut n = 0usize;
                 while n + TN <= n_size {
                     paste::paste! {
-                        // Zero accumulators
+                        // Init accumulators: zero on first chunk, load C on subsequent
                         $(
-                            let mut [<c_ $R _0>] = $crate::simd_primitive!($isa, $elem, zero);
-                            let mut [<c_ $R _1>] = $crate::simd_primitive!($isa, $elem, zero);
+                            let mut [<c_ $R _0>] = if ch == 0 { $crate::simd_primitive!($isa, $elem, zero) }
+                                else { $crate::simd_primitive!($isa, $elem, loadu, cp.add((m + $R) * n_size + n)) };
+                            let mut [<c_ $R _1>] = if ch == 0 { $crate::simd_primitive!($isa, $elem, zero) }
+                                else { $crate::simd_primitive!($isa, $elem, loadu, cp.add((m + $R) * n_size + n + $LANES)) };
                         )+
-                        for k in 0..k_size {
+                        for ki in 0..kc {
+                            let k = ks + ki;
                             // Load B[k, n..n+TN] directly (strided)
                             let vb0 = $crate::simd_primitive!($isa, $elem, loadu, bp.add(k * n_size + n));
                             let vb1 = $crate::simd_primitive!($isa, $elem, loadu, bp.add(k * n_size + n + $LANES));
@@ -306,8 +441,10 @@ macro_rules! define_matmul_x86 {
                 // N-remainder: LANES-wide
                 while n + $LANES <= n_size {
                     $(
-                        let mut acc = $crate::simd_primitive!($isa, $elem, zero);
-                        for k in 0..k_size {
+                        let mut acc = if ch == 0 { $crate::simd_primitive!($isa, $elem, zero) }
+                            else { $crate::simd_primitive!($isa, $elem, loadu, cp.add((m + $R) * n_size + n)) };
+                        for ki in 0..kc {
+                            let k = ks + ki;
                             let va = $crate::simd_primitive!($isa, $elem, splat, *ap.add((m + $R) * k_size + k));
                             let vb = $crate::simd_primitive!($isa, $elem, loadu, bp.add(k * n_size + n));
                             acc = $crate::simd_primitive!($isa, $elem, fma, va, vb, acc);
@@ -316,16 +453,24 @@ macro_rules! define_matmul_x86 {
                     )+
                     n += $LANES;
                 }
-                // N-remainder: scalar
-                while n < n_size {
-                    $(
-                    {
-                        let mut s = <$elem as Element>::ZERO;
-                        for k in 0..k_size { s = <$elem as Element>::mul_add(s, a[(m + $R) * k_size + k], b[k * n_size + n]); }
-                        c[(m + $R) * n_size + n] = s;
-                    }
-                    )+
-                    n += 1;
+                // N-remainder: masked SIMD
+                {
+                    let rem = n_size - n;
+                    if rem > 0 { unsafe {
+                        $(
+                        {
+                            let mut acc = if ch == 0 { $crate::simd_primitive!($isa, $elem, zero) }
+                                else { $crate::simd_primitive!($isa, $elem, maskload, cp.add((m + $R) * n_size + n), rem) };
+                            for ki in 0..kc {
+                                let k = ks + ki;
+                                let va = $crate::simd_primitive!($isa, $elem, splat, *ap.add((m + $R) * k_size + k));
+                                let vb = $crate::simd_primitive!($isa, $elem, maskload, bp.add(k * n_size + n), rem);
+                                acc = $crate::simd_primitive!($isa, $elem, fma, va, vb, acc);
+                            }
+                            $crate::simd_primitive!($isa, $elem, maskstore, cp.add((m + $R) * n_size + n), acc, rem);
+                        }
+                        )+
+                    }}
                 }
                 m += TM;
             }
@@ -333,9 +478,12 @@ macro_rules! define_matmul_x86 {
             while m < m_size {
                 let mut n = 0usize;
                 while n + TN <= n_size {
-                    let mut c0 = $crate::simd_primitive!($isa, $elem, zero);
-                    let mut c1 = $crate::simd_primitive!($isa, $elem, zero);
-                    for k in 0..k_size {
+                    let mut c0 = if ch == 0 { $crate::simd_primitive!($isa, $elem, zero) }
+                        else { $crate::simd_primitive!($isa, $elem, loadu, cp.add(m * n_size + n)) };
+                    let mut c1 = if ch == 0 { $crate::simd_primitive!($isa, $elem, zero) }
+                        else { $crate::simd_primitive!($isa, $elem, loadu, cp.add(m * n_size + n + $LANES)) };
+                    for ki in 0..kc {
+                        let k = ks + ki;
                         let va = $crate::simd_primitive!($isa, $elem, splat, *ap.add(m * k_size + k));
                         let vb0 = $crate::simd_primitive!($isa, $elem, loadu, bp.add(k * n_size + n));
                         let vb1 = $crate::simd_primitive!($isa, $elem, loadu, bp.add(k * n_size + n + $LANES));
@@ -347,8 +495,10 @@ macro_rules! define_matmul_x86 {
                     n += TN;
                 }
                 while n + $LANES <= n_size {
-                    let mut acc = $crate::simd_primitive!($isa, $elem, zero);
-                    for k in 0..k_size {
+                    let mut acc = if ch == 0 { $crate::simd_primitive!($isa, $elem, zero) }
+                        else { $crate::simd_primitive!($isa, $elem, loadu, cp.add(m * n_size + n)) };
+                    for ki in 0..kc {
+                        let k = ks + ki;
                         let va = $crate::simd_primitive!($isa, $elem, splat, *ap.add(m * k_size + k));
                         let vb = $crate::simd_primitive!($isa, $elem, loadu, bp.add(k * n_size + n));
                         acc = $crate::simd_primitive!($isa, $elem, fma, va, vb, acc);
@@ -356,14 +506,25 @@ macro_rules! define_matmul_x86 {
                     $crate::simd_primitive!($isa, $elem, storeu, cp.add(m * n_size + n), acc);
                     n += $LANES;
                 }
-                while n < n_size {
-                    let mut s = <$elem as Element>::ZERO;
-                    for k in 0..k_size { s = <$elem as Element>::mul_add(s, a[m * k_size + k], b[k * n_size + n]); }
-                    c[m * n_size + n] = s;
-                    n += 1;
+                {
+                    let rem = n_size - n;
+                    if rem > 0 {
+                        let mut acc = if ch == 0 { $crate::simd_primitive!($isa, $elem, zero) }
+                            else { $crate::simd_primitive!($isa, $elem, maskload, cp.add(m * n_size + n), rem) };
+                        for ki in 0..kc {
+                            let k = ks + ki;
+                            let va = $crate::simd_primitive!($isa, $elem, splat, *ap.add(m * k_size + k));
+                            let vb = $crate::simd_primitive!($isa, $elem, maskload, bp.add(k * n_size + n), rem);
+                            acc = $crate::simd_primitive!($isa, $elem, fma, va, vb, acc);
+                        }
+                        $crate::simd_primitive!($isa, $elem, maskstore, cp.add(m * n_size + n), acc, rem);
+                    }
                 }
                 m += 1;
             }
+
+            ks += kc; ch += 1;
+            } // KC loop
         }
 
         // ── Small-M no-pack path with bias ──
@@ -382,17 +543,27 @@ macro_rules! define_matmul_x86 {
             let cp = c.as_mut_ptr();
             let biasp = bias.as_ptr();
 
+            let kc_max = _blocking().kc;
+            let mut ks = 0usize;
+            let mut ch = 0u32;
+
+            while ks < k_size {
+                let kc = (k_size - ks).min(kc_max);
+
             let mut m = 0usize;
             while m + TM <= m_size {
                 let mut n = 0usize;
                 while n + TN <= n_size {
                     paste::paste! {
-                        // Init accumulators with bias
+                        // Init: bias on first chunk, load C on subsequent
                         $(
-                            let mut [<c_ $R _0>] = $crate::simd_primitive!($isa, $elem, loadu, biasp.add(n));
-                            let mut [<c_ $R _1>] = $crate::simd_primitive!($isa, $elem, loadu, biasp.add(n + $LANES));
+                            let mut [<c_ $R _0>] = if ch == 0 { $crate::simd_primitive!($isa, $elem, loadu, biasp.add(n)) }
+                                else { $crate::simd_primitive!($isa, $elem, loadu, cp.add((m + $R) * n_size + n)) };
+                            let mut [<c_ $R _1>] = if ch == 0 { $crate::simd_primitive!($isa, $elem, loadu, biasp.add(n + $LANES)) }
+                                else { $crate::simd_primitive!($isa, $elem, loadu, cp.add((m + $R) * n_size + n + $LANES)) };
                         )+
-                        for k in 0..k_size {
+                        for ki in 0..kc {
+                            let k = ks + ki;
                             let vb0 = $crate::simd_primitive!($isa, $elem, loadu, bp.add(k * n_size + n));
                             let vb1 = $crate::simd_primitive!($isa, $elem, loadu, bp.add(k * n_size + n + $LANES));
                             $(
@@ -408,8 +579,10 @@ macro_rules! define_matmul_x86 {
                 }
                 while n + $LANES <= n_size {
                     $(
-                        let mut acc = $crate::simd_primitive!($isa, $elem, loadu, biasp.add(n));
-                        for k in 0..k_size {
+                        let mut acc = if ch == 0 { $crate::simd_primitive!($isa, $elem, loadu, biasp.add(n)) }
+                            else { $crate::simd_primitive!($isa, $elem, loadu, cp.add((m + $R) * n_size + n)) };
+                        for ki in 0..kc {
+                            let k = ks + ki;
                             let va = $crate::simd_primitive!($isa, $elem, splat, *ap.add((m + $R) * k_size + k));
                             let vb = $crate::simd_primitive!($isa, $elem, loadu, bp.add(k * n_size + n));
                             acc = $crate::simd_primitive!($isa, $elem, fma, va, vb, acc);
@@ -418,24 +591,35 @@ macro_rules! define_matmul_x86 {
                     )+
                     n += $LANES;
                 }
-                while n < n_size {
-                    $(
-                    {
-                        let mut s = bias[n];
-                        for k in 0..k_size { s = <$elem as Element>::mul_add(s, a[(m + $R) * k_size + k], b[k * n_size + n]); }
-                        c[(m + $R) * n_size + n] = s;
-                    }
-                    )+
-                    n += 1;
+                {
+                    let rem = n_size - n;
+                    if rem > 0 { unsafe {
+                        $(
+                        {
+                            let mut acc = if ch == 0 { $crate::simd_primitive!($isa, $elem, maskload, biasp.add(n), rem) }
+                                else { $crate::simd_primitive!($isa, $elem, maskload, cp.add((m + $R) * n_size + n), rem) };
+                            for ki in 0..kc {
+                                let k = ks + ki;
+                                let va = $crate::simd_primitive!($isa, $elem, splat, *ap.add((m + $R) * k_size + k));
+                                let vb = $crate::simd_primitive!($isa, $elem, maskload, bp.add(k * n_size + n), rem);
+                                acc = $crate::simd_primitive!($isa, $elem, fma, va, vb, acc);
+                            }
+                            $crate::simd_primitive!($isa, $elem, maskstore, cp.add((m + $R) * n_size + n), acc, rem);
+                        }
+                        )+
+                    }}
                 }
                 m += TM;
             }
             while m < m_size {
                 let mut n = 0usize;
                 while n + TN <= n_size {
-                    let mut c0 = $crate::simd_primitive!($isa, $elem, loadu, biasp.add(n));
-                    let mut c1 = $crate::simd_primitive!($isa, $elem, loadu, biasp.add(n + $LANES));
-                    for k in 0..k_size {
+                    let mut c0 = if ch == 0 { $crate::simd_primitive!($isa, $elem, loadu, biasp.add(n)) }
+                        else { $crate::simd_primitive!($isa, $elem, loadu, cp.add(m * n_size + n)) };
+                    let mut c1 = if ch == 0 { $crate::simd_primitive!($isa, $elem, loadu, biasp.add(n + $LANES)) }
+                        else { $crate::simd_primitive!($isa, $elem, loadu, cp.add(m * n_size + n + $LANES)) };
+                    for ki in 0..kc {
+                        let k = ks + ki;
                         let va = $crate::simd_primitive!($isa, $elem, splat, *ap.add(m * k_size + k));
                         let vb0 = $crate::simd_primitive!($isa, $elem, loadu, bp.add(k * n_size + n));
                         let vb1 = $crate::simd_primitive!($isa, $elem, loadu, bp.add(k * n_size + n + $LANES));
@@ -447,8 +631,10 @@ macro_rules! define_matmul_x86 {
                     n += TN;
                 }
                 while n + $LANES <= n_size {
-                    let mut acc = $crate::simd_primitive!($isa, $elem, loadu, biasp.add(n));
-                    for k in 0..k_size {
+                    let mut acc = if ch == 0 { $crate::simd_primitive!($isa, $elem, loadu, biasp.add(n)) }
+                        else { $crate::simd_primitive!($isa, $elem, loadu, cp.add(m * n_size + n)) };
+                    for ki in 0..kc {
+                        let k = ks + ki;
                         let va = $crate::simd_primitive!($isa, $elem, splat, *ap.add(m * k_size + k));
                         let vb = $crate::simd_primitive!($isa, $elem, loadu, bp.add(k * n_size + n));
                         acc = $crate::simd_primitive!($isa, $elem, fma, va, vb, acc);
@@ -456,14 +642,25 @@ macro_rules! define_matmul_x86 {
                     $crate::simd_primitive!($isa, $elem, storeu, cp.add(m * n_size + n), acc);
                     n += $LANES;
                 }
-                while n < n_size {
-                    let mut s = bias[n];
-                    for k in 0..k_size { s = <$elem as Element>::mul_add(s, a[m * k_size + k], b[k * n_size + n]); }
-                    c[m * n_size + n] = s;
-                    n += 1;
+                {
+                    let rem = n_size - n;
+                    if rem > 0 {
+                        let mut acc = if ch == 0 { $crate::simd_primitive!($isa, $elem, maskload, biasp.add(n), rem) }
+                            else { $crate::simd_primitive!($isa, $elem, maskload, cp.add(m * n_size + n), rem) };
+                        for ki in 0..kc {
+                            let k = ks + ki;
+                            let va = $crate::simd_primitive!($isa, $elem, splat, *ap.add(m * k_size + k));
+                            let vb = $crate::simd_primitive!($isa, $elem, maskload, bp.add(k * n_size + n), rem);
+                            acc = $crate::simd_primitive!($isa, $elem, fma, va, vb, acc);
+                        }
+                        $crate::simd_primitive!($isa, $elem, maskstore, cp.add(m * n_size + n), acc, rem);
+                    }
                 }
                 m += 1;
             }
+
+            ks += kc; ch += 1;
+            } // KC loop
         }
 
         /// Threshold: skip B-packing when M ≤ 4*TM (e.g. 56 for AVX-512, 24 for AVX2).
@@ -500,6 +697,8 @@ macro_rules! define_matmul_x86 {
             if pb.capacity() < tp { pb.reserve(tp - pb.len()); }
             unsafe { pb.set_len(tp); }
             {
+                let bptr = b.as_ptr();
+                let pp = pb.as_mut_ptr();
                 let mut ks = 0usize; let mut ch = 0usize;
                 while ks < k_size {
                     let kc = kc_max.min(k_size - ks);
@@ -507,9 +706,31 @@ macro_rules! define_matmul_x86 {
                     for i in 0..n_strips {
                         let ns = i * TN;
                         let an = TN.min(n_size.saturating_sub(ns));
-                        for k in 0..kc {
-                            let d = base + i * kc_max * TN + k * TN;
-                            std::ptr::copy_nonoverlapping(b.as_ptr().add((ks+k)*n_size+ns), pb.as_mut_ptr().add(d), an);
+                        if an == TN {
+                            for k in 0..kc {
+                                let src = bptr.add((ks + k) * n_size + ns);
+                                let dst = pp.add(base + i * kc_max * TN + k * TN);
+                                if k + 4 < kc {
+                                    $crate::simd_primitive!($isa, $elem, prefetch,
+                                        bptr.add((ks + k + 4) * n_size + ns) as *const i8, 0);
+                                }
+                                let v0 = $crate::simd_primitive!($isa, $elem, loadu, src);
+                                $crate::simd_primitive!($isa, $elem, storeu, dst, v0);
+                                let v1 = $crate::simd_primitive!($isa, $elem, loadu, src.add($LANES));
+                                $crate::simd_primitive!($isa, $elem, storeu, dst.add($LANES), v1);
+                            }
+                        } else {
+                            for k in 0..kc {
+                                let src = bptr.add((ks + k) * n_size + ns);
+                                let dst = pp.add(base + i * kc_max * TN + k * TN);
+                                let mut j = 0usize;
+                                while j + $LANES <= an {
+                                    let v = $crate::simd_primitive!($isa, $elem, loadu, src.add(j));
+                                    $crate::simd_primitive!($isa, $elem, storeu, dst.add(j), v);
+                                    j += $LANES;
+                                }
+                                while j < an { *dst.add(j) = *src.add(j); j += 1; }
+                            }
                         }
                     }
                     ks += kc_max; ch += 1;
@@ -523,14 +744,31 @@ macro_rules! define_matmul_x86 {
             }
 
             let mc_max = _blocking().mc;
+            thread_local! { static WS_A2: std::cell::Cell<Vec<$elem>> = std::cell::Cell::new(Vec::new()); }
+            let mut pa = WS_A2.with(|c| c.take());
+            let pa_cap = mc_max * kc_max;
+            if pa.capacity() < pa_cap { pa.reserve(pa_cap - pa.len()); }
+            unsafe { pa.set_len(pa_cap); }
             let mut ks = 0usize; let mut ch = 0usize;
             while ks < k_size {
                 let kc = kc_max.min(k_size - ks);
                 let mut m_block = 0usize;
                 while m_block < m_size {
                 let m_end = (m_block + mc_max).min(m_size);
+                let mc = m_end - m_block;
+                // Pack A[m_block..m_end, ks..ks+kc] → pa contiguous
+                {
+                    let ap = a.as_ptr();
+                    let pp = pa.as_mut_ptr();
+                    for mi in 0..mc {
+                        let src = ap.add((m_block + mi) * k_size + ks);
+                        let dst = pp.add(mi * kc);
+                        std::ptr::copy_nonoverlapping(src, dst, kc);
+                    }
+                }
                 let mut m = m_block;
                 while m + TM <= m_end {
+                    let pa_row = (m - m_block) * kc;
                     let mut n = 0; let mut si = 0;
                     while n + TN <= n_size {
                         unsafe { paste::paste! {
@@ -541,81 +779,85 @@ macro_rules! define_matmul_x86 {
                                     $crate::simd_primitive!($isa, $elem, loadu, cp.add((m+$R)*n_size+n+$LANES)),
                                 );
                             )+
-                            let mut ac = a.as_ptr().add(m*k_size+ks);
+                            let mut pac = pa.as_ptr().add(pa_row);
                             let mut bp = pb.as_ptr().add(ch*cs+si*kc_max*TN);
+                            // Prefetch C output tile into L1 before K-loop
+                            $($crate::simd_primitive!($isa, $elem, prefetch, cp.add((m+$R)*n_size+n) as *const i8, 0);)+
                             let mut _k = 0usize;
                             let ku = kc & !7;
                             while _k < ku {
-                                // Prefetch B ahead
+                                // Prefetch B panel ahead into L1 (hot, reused across M rows)
                                 $crate::simd_primitive!($isa, $elem, prefetch, bp.add(TN*16) as *const i8, 0);
-                                // Prefetch A rows ~256 bytes ahead (once per 8-iter block)
-                                $($crate::simd_primitive!($isa, $elem, prefetch, ac.add(k_size*$R + 64) as *const i8, 0);)+
+                                // Prefetch A panel ahead with NTA hint (streamed, don't pollute L1)
+                                $crate::simd_primitive!($isa, $elem, prefetch_nta, pac.add(8) as *const i8);
                                 let vb0_0 = $crate::simd_primitive!($isa, $elem, loadu, bp);
                                 let vb0_1 = $crate::simd_primitive!($isa, $elem, loadu, bp.add($LANES));
                                 $(
-                                        let va = $crate::simd_primitive!($isa, $elem, splat, *ac.add(k_size*$R));
+                                        let va = $crate::simd_primitive!($isa, $elem, splat, *pac.add(kc*$R));
                                         [<c_ $R _0>] = $crate::simd_primitive!($isa, $elem, fma, va, vb0_0, [<c_ $R _0>]);
                                         [<c_ $R _1>] = $crate::simd_primitive!($isa, $elem, fma, va, vb0_1, [<c_ $R _1>]);
-                                )+; ac = ac.add(1);
+                                )+; pac = pac.add(1);
                                 let vb1_0 = $crate::simd_primitive!($isa, $elem, loadu, bp.add(TN));
                                 let vb1_1 = $crate::simd_primitive!($isa, $elem, loadu, bp.add(TN+$LANES));
                                 $(
-                                        let va = $crate::simd_primitive!($isa, $elem, splat, *ac.add(k_size*$R));
+                                        let va = $crate::simd_primitive!($isa, $elem, splat, *pac.add(kc*$R));
                                         [<c_ $R _0>] = $crate::simd_primitive!($isa, $elem, fma, va, vb1_0, [<c_ $R _0>]);
                                         [<c_ $R _1>] = $crate::simd_primitive!($isa, $elem, fma, va, vb1_1, [<c_ $R _1>]);
-                                )+; ac = ac.add(1);
+                                )+; pac = pac.add(1);
                                 let vb2_0 = $crate::simd_primitive!($isa, $elem, loadu, bp.add(TN*2));
                                 let vb2_1 = $crate::simd_primitive!($isa, $elem, loadu, bp.add(TN*2+$LANES));
                                 $(
-                                        let va = $crate::simd_primitive!($isa, $elem, splat, *ac.add(k_size*$R));
+                                        let va = $crate::simd_primitive!($isa, $elem, splat, *pac.add(kc*$R));
                                         [<c_ $R _0>] = $crate::simd_primitive!($isa, $elem, fma, va, vb2_0, [<c_ $R _0>]);
                                         [<c_ $R _1>] = $crate::simd_primitive!($isa, $elem, fma, va, vb2_1, [<c_ $R _1>]);
-                                )+; ac = ac.add(1);
+                                )+; pac = pac.add(1);
                                 let vb3_0 = $crate::simd_primitive!($isa, $elem, loadu, bp.add(TN*3));
                                 let vb3_1 = $crate::simd_primitive!($isa, $elem, loadu, bp.add(TN*3+$LANES));
                                 $(
-                                        let va = $crate::simd_primitive!($isa, $elem, splat, *ac.add(k_size*$R));
+                                        let va = $crate::simd_primitive!($isa, $elem, splat, *pac.add(kc*$R));
                                         [<c_ $R _0>] = $crate::simd_primitive!($isa, $elem, fma, va, vb3_0, [<c_ $R _0>]);
                                         [<c_ $R _1>] = $crate::simd_primitive!($isa, $elem, fma, va, vb3_1, [<c_ $R _1>]);
-                                )+; ac = ac.add(1);
+                                )+; pac = pac.add(1);
+                                // Second B prefetch for latter half of 8-iter block
+                                $crate::simd_primitive!($isa, $elem, prefetch, bp.add(TN*20) as *const i8, 0);
                                 let vb4_0 = $crate::simd_primitive!($isa, $elem, loadu, bp.add(TN*4));
                                 let vb4_1 = $crate::simd_primitive!($isa, $elem, loadu, bp.add(TN*4+$LANES));
                                 $(
-                                        let va = $crate::simd_primitive!($isa, $elem, splat, *ac.add(k_size*$R));
+                                        let va = $crate::simd_primitive!($isa, $elem, splat, *pac.add(kc*$R));
                                         [<c_ $R _0>] = $crate::simd_primitive!($isa, $elem, fma, va, vb4_0, [<c_ $R _0>]);
                                         [<c_ $R _1>] = $crate::simd_primitive!($isa, $elem, fma, va, vb4_1, [<c_ $R _1>]);
-                                )+; ac = ac.add(1);
+                                )+; pac = pac.add(1);
                                 let vb5_0 = $crate::simd_primitive!($isa, $elem, loadu, bp.add(TN*5));
                                 let vb5_1 = $crate::simd_primitive!($isa, $elem, loadu, bp.add(TN*5+$LANES));
                                 $(
-                                        let va = $crate::simd_primitive!($isa, $elem, splat, *ac.add(k_size*$R));
+                                        let va = $crate::simd_primitive!($isa, $elem, splat, *pac.add(kc*$R));
                                         [<c_ $R _0>] = $crate::simd_primitive!($isa, $elem, fma, va, vb5_0, [<c_ $R _0>]);
                                         [<c_ $R _1>] = $crate::simd_primitive!($isa, $elem, fma, va, vb5_1, [<c_ $R _1>]);
-                                )+; ac = ac.add(1);
+                                )+; pac = pac.add(1);
                                 let vb6_0 = $crate::simd_primitive!($isa, $elem, loadu, bp.add(TN*6));
                                 let vb6_1 = $crate::simd_primitive!($isa, $elem, loadu, bp.add(TN*6+$LANES));
                                 $(
-                                        let va = $crate::simd_primitive!($isa, $elem, splat, *ac.add(k_size*$R));
+                                        let va = $crate::simd_primitive!($isa, $elem, splat, *pac.add(kc*$R));
                                         [<c_ $R _0>] = $crate::simd_primitive!($isa, $elem, fma, va, vb6_0, [<c_ $R _0>]);
                                         [<c_ $R _1>] = $crate::simd_primitive!($isa, $elem, fma, va, vb6_1, [<c_ $R _1>]);
-                                )+; ac = ac.add(1);
+                                )+; pac = pac.add(1);
                                 let vb7_0 = $crate::simd_primitive!($isa, $elem, loadu, bp.add(TN*7));
                                 let vb7_1 = $crate::simd_primitive!($isa, $elem, loadu, bp.add(TN*7+$LANES));
                                 $(
-                                        let va = $crate::simd_primitive!($isa, $elem, splat, *ac.add(k_size*$R));
+                                        let va = $crate::simd_primitive!($isa, $elem, splat, *pac.add(kc*$R));
                                         [<c_ $R _0>] = $crate::simd_primitive!($isa, $elem, fma, va, vb7_0, [<c_ $R _0>]);
                                         [<c_ $R _1>] = $crate::simd_primitive!($isa, $elem, fma, va, vb7_1, [<c_ $R _1>]);
-                                )+; ac = ac.add(1);
+                                )+; pac = pac.add(1);
                                 bp = bp.add(TN*8); _k += 8;
                             }
                             while _k < kc {
                                 let vb_0 = $crate::simd_primitive!($isa, $elem, loadu, bp);
                                 let vb_1 = $crate::simd_primitive!($isa, $elem, loadu, bp.add($LANES));
                                 $(
-                                        let va = $crate::simd_primitive!($isa, $elem, splat, *ac.add(k_size*$R));
+                                        let va = $crate::simd_primitive!($isa, $elem, splat, *pac.add(kc*$R));
                                         [<c_ $R _0>] = $crate::simd_primitive!($isa, $elem, fma, va, vb_0, [<c_ $R _0>]);
                                         [<c_ $R _1>] = $crate::simd_primitive!($isa, $elem, fma, va, vb_1, [<c_ $R _1>]);
-                                )+; ac = ac.add(1);
+                                )+; pac = pac.add(1);
                                 bp = bp.add(TN); _k += 1;
                             }
                             $($crate::simd_primitive!($isa, $elem, storeu, cp.add((m+$R)*n_size+n), [<c_ $R _0>]);
@@ -629,6 +871,7 @@ macro_rules! define_matmul_x86 {
                 } // MC block
                 ks += kc_max; ch += 1;
             }
+            WS_A2.with(|c| c.set(pa));
             // Remainder N with bias
             let nm = (n_size / TN) * TN;
             if nm < n_size {
@@ -707,16 +950,35 @@ macro_rules! define_matmul_x86 {
             let n_strips = (n_size + TN - 1) / TN;
             let cs = n_strips * kc_max * TN;
             let cp = c.as_mut_ptr();
+            let c_align = std::mem::size_of::<$elem>() * $LANES;
+            let c_nt_ok = (cp as usize) % c_align == 0 && (n_size * std::mem::size_of::<$elem>()) % c_align == 0;
+            let _ = c_nt_ok; // suppress unused warning in non-prepacked paths
 
             let mc_max = _blocking().mc;
+            thread_local! { static WS_A3: std::cell::Cell<Vec<$elem>> = std::cell::Cell::new(Vec::new()); }
+            let mut pa = WS_A3.with(|c| c.take());
+            let pa_cap = mc_max * kc_max;
+            if pa.capacity() < pa_cap { pa.reserve(pa_cap - pa.len()); }
+            unsafe { pa.set_len(pa_cap); }
             let mut ks = 0usize; let mut ch = 0usize;
             while ks < k_size {
                 let kc = kc_max.min(k_size - ks);
                 let mut m_block = 0usize;
                 while m_block < m_size {
                 let m_end = (m_block + mc_max).min(m_size);
+                let mc = m_end - m_block;
+                {
+                    let ap = a.as_ptr();
+                    let pp = pa.as_mut_ptr();
+                    for mi in 0..mc {
+                        let src = ap.add((m_block + mi) * k_size + ks);
+                        let dst = pp.add(mi * kc);
+                        std::ptr::copy_nonoverlapping(src, dst, kc);
+                    }
+                }
                 let mut m = m_block;
                 while m + TM <= m_end {
+                    let pa_row = (m - m_block) * kc;
                     let mut n = 0; let mut si = 0;
                     while n + TN <= n_size {
                         unsafe { paste::paste! {
@@ -729,87 +991,91 @@ macro_rules! define_matmul_x86 {
                                     $crate::simd_primitive!($isa, $elem, loadu, cp.add((m+$R)*n_size+n+$LANES)),
                                 )};
                             )+
-                            let mut ac = a.as_ptr().add(m*k_size+ks);
+                            let mut pac = pa.as_ptr().add(pa_row);
                             let mut bp = pb.as_ptr().add(ch*cs+si*kc_max*TN);
-                            // Prefetch C output tile into L1 before K-loop
                             $($crate::simd_primitive!($isa, $elem, prefetch, cp.add((m+$R)*n_size+n) as *const i8, 0);)+
                             let mut _k = 0usize;
                             let ku = kc & !7;
                             while _k < ku {
-                                // Prefetch B ahead
+                                // Prefetch B panel ahead into L1; A panel with NTA (streamed)
                                 $crate::simd_primitive!($isa, $elem, prefetch, bp.add(TN*16) as *const i8, 0);
-                                // Prefetch A rows ~256 bytes ahead (once per 8-iter block)
-                                $($crate::simd_primitive!($isa, $elem, prefetch, ac.add(k_size*$R + 64) as *const i8, 0);)+
+                                $crate::simd_primitive!($isa, $elem, prefetch_nta, pac.add(8) as *const i8);
                                 let vb0_0 = $crate::simd_primitive!($isa, $elem, loadu, bp);
                                 let vb0_1 = $crate::simd_primitive!($isa, $elem, loadu, bp.add($LANES));
                                 $(
-                                        let va = $crate::simd_primitive!($isa, $elem, splat, *ac.add(k_size*$R));
+                                        let va = $crate::simd_primitive!($isa, $elem, splat, *pac.add(kc*$R));
                                         [<c_ $R _0>] = $crate::simd_primitive!($isa, $elem, fma, va, vb0_0, [<c_ $R _0>]);
                                         [<c_ $R _1>] = $crate::simd_primitive!($isa, $elem, fma, va, vb0_1, [<c_ $R _1>]);
-                                )+; ac = ac.add(1);
+                                )+; pac = pac.add(1);
                                 let vb1_0 = $crate::simd_primitive!($isa, $elem, loadu, bp.add(TN));
                                 let vb1_1 = $crate::simd_primitive!($isa, $elem, loadu, bp.add(TN+$LANES));
                                 $(
-                                        let va = $crate::simd_primitive!($isa, $elem, splat, *ac.add(k_size*$R));
+                                        let va = $crate::simd_primitive!($isa, $elem, splat, *pac.add(kc*$R));
                                         [<c_ $R _0>] = $crate::simd_primitive!($isa, $elem, fma, va, vb1_0, [<c_ $R _0>]);
                                         [<c_ $R _1>] = $crate::simd_primitive!($isa, $elem, fma, va, vb1_1, [<c_ $R _1>]);
-                                )+; ac = ac.add(1);
+                                )+; pac = pac.add(1);
                                 let vb2_0 = $crate::simd_primitive!($isa, $elem, loadu, bp.add(TN*2));
                                 let vb2_1 = $crate::simd_primitive!($isa, $elem, loadu, bp.add(TN*2+$LANES));
                                 $(
-                                        let va = $crate::simd_primitive!($isa, $elem, splat, *ac.add(k_size*$R));
+                                        let va = $crate::simd_primitive!($isa, $elem, splat, *pac.add(kc*$R));
                                         [<c_ $R _0>] = $crate::simd_primitive!($isa, $elem, fma, va, vb2_0, [<c_ $R _0>]);
                                         [<c_ $R _1>] = $crate::simd_primitive!($isa, $elem, fma, va, vb2_1, [<c_ $R _1>]);
-                                )+; ac = ac.add(1);
+                                )+; pac = pac.add(1);
                                 let vb3_0 = $crate::simd_primitive!($isa, $elem, loadu, bp.add(TN*3));
                                 let vb3_1 = $crate::simd_primitive!($isa, $elem, loadu, bp.add(TN*3+$LANES));
                                 $(
-                                        let va = $crate::simd_primitive!($isa, $elem, splat, *ac.add(k_size*$R));
+                                        let va = $crate::simd_primitive!($isa, $elem, splat, *pac.add(kc*$R));
                                         [<c_ $R _0>] = $crate::simd_primitive!($isa, $elem, fma, va, vb3_0, [<c_ $R _0>]);
                                         [<c_ $R _1>] = $crate::simd_primitive!($isa, $elem, fma, va, vb3_1, [<c_ $R _1>]);
-                                )+; ac = ac.add(1);
+                                )+; pac = pac.add(1);
                                 let vb4_0 = $crate::simd_primitive!($isa, $elem, loadu, bp.add(TN*4));
                                 let vb4_1 = $crate::simd_primitive!($isa, $elem, loadu, bp.add(TN*4+$LANES));
                                 $(
-                                        let va = $crate::simd_primitive!($isa, $elem, splat, *ac.add(k_size*$R));
+                                        let va = $crate::simd_primitive!($isa, $elem, splat, *pac.add(kc*$R));
                                         [<c_ $R _0>] = $crate::simd_primitive!($isa, $elem, fma, va, vb4_0, [<c_ $R _0>]);
                                         [<c_ $R _1>] = $crate::simd_primitive!($isa, $elem, fma, va, vb4_1, [<c_ $R _1>]);
-                                )+; ac = ac.add(1);
+                                )+; pac = pac.add(1);
                                 let vb5_0 = $crate::simd_primitive!($isa, $elem, loadu, bp.add(TN*5));
                                 let vb5_1 = $crate::simd_primitive!($isa, $elem, loadu, bp.add(TN*5+$LANES));
                                 $(
-                                        let va = $crate::simd_primitive!($isa, $elem, splat, *ac.add(k_size*$R));
+                                        let va = $crate::simd_primitive!($isa, $elem, splat, *pac.add(kc*$R));
                                         [<c_ $R _0>] = $crate::simd_primitive!($isa, $elem, fma, va, vb5_0, [<c_ $R _0>]);
                                         [<c_ $R _1>] = $crate::simd_primitive!($isa, $elem, fma, va, vb5_1, [<c_ $R _1>]);
-                                )+; ac = ac.add(1);
+                                )+; pac = pac.add(1);
                                 let vb6_0 = $crate::simd_primitive!($isa, $elem, loadu, bp.add(TN*6));
                                 let vb6_1 = $crate::simd_primitive!($isa, $elem, loadu, bp.add(TN*6+$LANES));
                                 $(
-                                        let va = $crate::simd_primitive!($isa, $elem, splat, *ac.add(k_size*$R));
+                                        let va = $crate::simd_primitive!($isa, $elem, splat, *pac.add(kc*$R));
                                         [<c_ $R _0>] = $crate::simd_primitive!($isa, $elem, fma, va, vb6_0, [<c_ $R _0>]);
                                         [<c_ $R _1>] = $crate::simd_primitive!($isa, $elem, fma, va, vb6_1, [<c_ $R _1>]);
-                                )+; ac = ac.add(1);
+                                )+; pac = pac.add(1);
                                 let vb7_0 = $crate::simd_primitive!($isa, $elem, loadu, bp.add(TN*7));
                                 let vb7_1 = $crate::simd_primitive!($isa, $elem, loadu, bp.add(TN*7+$LANES));
                                 $(
-                                        let va = $crate::simd_primitive!($isa, $elem, splat, *ac.add(k_size*$R));
+                                        let va = $crate::simd_primitive!($isa, $elem, splat, *pac.add(kc*$R));
                                         [<c_ $R _0>] = $crate::simd_primitive!($isa, $elem, fma, va, vb7_0, [<c_ $R _0>]);
                                         [<c_ $R _1>] = $crate::simd_primitive!($isa, $elem, fma, va, vb7_1, [<c_ $R _1>]);
-                                )+; ac = ac.add(1);
+                                )+; pac = pac.add(1);
                                 bp = bp.add(TN*8); _k += 8;
                             }
                             while _k < kc {
                                 let vb_0 = $crate::simd_primitive!($isa, $elem, loadu, bp);
                                 let vb_1 = $crate::simd_primitive!($isa, $elem, loadu, bp.add($LANES));
                                 $(
-                                        let va = $crate::simd_primitive!($isa, $elem, splat, *ac.add(k_size*$R));
+                                        let va = $crate::simd_primitive!($isa, $elem, splat, *pac.add(kc*$R));
                                         [<c_ $R _0>] = $crate::simd_primitive!($isa, $elem, fma, va, vb_0, [<c_ $R _0>]);
                                         [<c_ $R _1>] = $crate::simd_primitive!($isa, $elem, fma, va, vb_1, [<c_ $R _1>]);
-                                )+; ac = ac.add(1);
+                                )+; pac = pac.add(1);
                                 bp = bp.add(TN); _k += 1;
                             }
-                            $($crate::simd_primitive!($isa, $elem, storeu, cp.add((m+$R)*n_size+n), [<c_ $R _0>]);
-                              $crate::simd_primitive!($isa, $elem, storeu, cp.add((m+$R)*n_size+n+$LANES), [<c_ $R _1>]);)+
+                            // Store — use NT store on first KC chunk (pure write) when aligned
+                            if ch == 0 && c_nt_ok {
+                                $($crate::simd_primitive!($isa, $elem, stream, cp.add((m+$R)*n_size+n), [<c_ $R _0>]);
+                                  $crate::simd_primitive!($isa, $elem, stream, cp.add((m+$R)*n_size+n+$LANES), [<c_ $R _1>]);)+
+                            } else {
+                                $($crate::simd_primitive!($isa, $elem, storeu, cp.add((m+$R)*n_size+n), [<c_ $R _0>]);
+                                  $crate::simd_primitive!($isa, $elem, storeu, cp.add((m+$R)*n_size+n+$LANES), [<c_ $R _1>]);)+
+                            }
                         }}
                         n += TN; si += 1;
                     }
@@ -819,6 +1085,8 @@ macro_rules! define_matmul_x86 {
                 } // MC block
                 ks += kc_max; ch += 1;
             }
+            if c_nt_ok { std::arch::x86_64::_mm_sfence(); }
+            WS_A3.with(|c| c.set(pa));
             // Remainder N
             let nm = (n_size / TN) * TN;
             if nm < n_size {
@@ -914,14 +1182,30 @@ macro_rules! define_matmul_x86 {
             }
 
             let mc_max = _blocking().mc;
+            thread_local! { static WS_A4: std::cell::Cell<Vec<$elem>> = std::cell::Cell::new(Vec::new()); }
+            let mut pa = WS_A4.with(|c| c.take());
+            let pa_cap = mc_max * kc_max;
+            if pa.capacity() < pa_cap { pa.reserve(pa_cap - pa.len()); }
+            unsafe { pa.set_len(pa_cap); }
             let mut ks = 0usize; let mut ch = 0usize;
             while ks < k_size {
                 let kc = kc_max.min(k_size - ks);
                 let mut m_block = 0usize;
                 while m_block < m_size {
                 let m_end = (m_block + mc_max).min(m_size);
+                let mc = m_end - m_block;
+                {
+                    let ap = a.as_ptr();
+                    let pp = pa.as_mut_ptr();
+                    for mi in 0..mc {
+                        let src = ap.add((m_block + mi) * k_size + ks);
+                        let dst = pp.add(mi * kc);
+                        std::ptr::copy_nonoverlapping(src, dst, kc);
+                    }
+                }
                 let mut m = m_block;
                 while m + TM <= m_end {
+                    let pa_row = (m - m_block) * kc;
                     let mut n = 0; let mut si = 0;
                     while n + TN <= n_size {
                         unsafe { paste::paste! {
@@ -931,81 +1215,82 @@ macro_rules! define_matmul_x86 {
                                     $crate::simd_primitive!($isa, $elem, loadu, cp.add((m+$R)*n_size+n+$LANES)),
                                 );
                             )+
-                            let mut ac = a.as_ptr().add(m*k_size+ks);
+                            let mut pac = pa.as_ptr().add(pa_row);
                             let mut bp = pb.as_ptr().add(ch*cs+si*kc_max*TN);
+                            // Prefetch C output tile into L1 before K-loop
+                            $($crate::simd_primitive!($isa, $elem, prefetch, cp.add((m+$R)*n_size+n) as *const i8, 0);)+
                             let mut _k = 0usize;
                             let ku = kc & !7;
                             while _k < ku {
-                                // Prefetch B ahead
+                                // Prefetch B panel ahead into L1; A panel with NTA (streamed)
                                 $crate::simd_primitive!($isa, $elem, prefetch, bp.add(TN*16) as *const i8, 0);
-                                // Prefetch A rows ~256 bytes ahead (once per 8-iter block)
-                                $($crate::simd_primitive!($isa, $elem, prefetch, ac.add(k_size*$R + 64) as *const i8, 0);)+
+                                $crate::simd_primitive!($isa, $elem, prefetch_nta, pac.add(8) as *const i8);
                                 let vb0_0 = $crate::simd_primitive!($isa, $elem, loadu, bp);
                                 let vb0_1 = $crate::simd_primitive!($isa, $elem, loadu, bp.add($LANES));
                                 $(
-                                        let va = $crate::simd_primitive!($isa, $elem, splat, *ac.add(k_size*$R));
+                                        let va = $crate::simd_primitive!($isa, $elem, splat, *pac.add(kc*$R));
                                         [<c_ $R _0>] = $crate::simd_primitive!($isa, $elem, fma, va, vb0_0, [<c_ $R _0>]);
                                         [<c_ $R _1>] = $crate::simd_primitive!($isa, $elem, fma, va, vb0_1, [<c_ $R _1>]);
-                                )+; ac = ac.add(1);
+                                )+; pac = pac.add(1);
                                 let vb1_0 = $crate::simd_primitive!($isa, $elem, loadu, bp.add(TN));
                                 let vb1_1 = $crate::simd_primitive!($isa, $elem, loadu, bp.add(TN+$LANES));
                                 $(
-                                        let va = $crate::simd_primitive!($isa, $elem, splat, *ac.add(k_size*$R));
+                                        let va = $crate::simd_primitive!($isa, $elem, splat, *pac.add(kc*$R));
                                         [<c_ $R _0>] = $crate::simd_primitive!($isa, $elem, fma, va, vb1_0, [<c_ $R _0>]);
                                         [<c_ $R _1>] = $crate::simd_primitive!($isa, $elem, fma, va, vb1_1, [<c_ $R _1>]);
-                                )+; ac = ac.add(1);
+                                )+; pac = pac.add(1);
                                 let vb2_0 = $crate::simd_primitive!($isa, $elem, loadu, bp.add(TN*2));
                                 let vb2_1 = $crate::simd_primitive!($isa, $elem, loadu, bp.add(TN*2+$LANES));
                                 $(
-                                        let va = $crate::simd_primitive!($isa, $elem, splat, *ac.add(k_size*$R));
+                                        let va = $crate::simd_primitive!($isa, $elem, splat, *pac.add(kc*$R));
                                         [<c_ $R _0>] = $crate::simd_primitive!($isa, $elem, fma, va, vb2_0, [<c_ $R _0>]);
                                         [<c_ $R _1>] = $crate::simd_primitive!($isa, $elem, fma, va, vb2_1, [<c_ $R _1>]);
-                                )+; ac = ac.add(1);
+                                )+; pac = pac.add(1);
                                 let vb3_0 = $crate::simd_primitive!($isa, $elem, loadu, bp.add(TN*3));
                                 let vb3_1 = $crate::simd_primitive!($isa, $elem, loadu, bp.add(TN*3+$LANES));
                                 $(
-                                        let va = $crate::simd_primitive!($isa, $elem, splat, *ac.add(k_size*$R));
+                                        let va = $crate::simd_primitive!($isa, $elem, splat, *pac.add(kc*$R));
                                         [<c_ $R _0>] = $crate::simd_primitive!($isa, $elem, fma, va, vb3_0, [<c_ $R _0>]);
                                         [<c_ $R _1>] = $crate::simd_primitive!($isa, $elem, fma, va, vb3_1, [<c_ $R _1>]);
-                                )+; ac = ac.add(1);
+                                )+; pac = pac.add(1);
                                 let vb4_0 = $crate::simd_primitive!($isa, $elem, loadu, bp.add(TN*4));
                                 let vb4_1 = $crate::simd_primitive!($isa, $elem, loadu, bp.add(TN*4+$LANES));
                                 $(
-                                        let va = $crate::simd_primitive!($isa, $elem, splat, *ac.add(k_size*$R));
+                                        let va = $crate::simd_primitive!($isa, $elem, splat, *pac.add(kc*$R));
                                         [<c_ $R _0>] = $crate::simd_primitive!($isa, $elem, fma, va, vb4_0, [<c_ $R _0>]);
                                         [<c_ $R _1>] = $crate::simd_primitive!($isa, $elem, fma, va, vb4_1, [<c_ $R _1>]);
-                                )+; ac = ac.add(1);
+                                )+; pac = pac.add(1);
                                 let vb5_0 = $crate::simd_primitive!($isa, $elem, loadu, bp.add(TN*5));
                                 let vb5_1 = $crate::simd_primitive!($isa, $elem, loadu, bp.add(TN*5+$LANES));
                                 $(
-                                        let va = $crate::simd_primitive!($isa, $elem, splat, *ac.add(k_size*$R));
+                                        let va = $crate::simd_primitive!($isa, $elem, splat, *pac.add(kc*$R));
                                         [<c_ $R _0>] = $crate::simd_primitive!($isa, $elem, fma, va, vb5_0, [<c_ $R _0>]);
                                         [<c_ $R _1>] = $crate::simd_primitive!($isa, $elem, fma, va, vb5_1, [<c_ $R _1>]);
-                                )+; ac = ac.add(1);
+                                )+; pac = pac.add(1);
                                 let vb6_0 = $crate::simd_primitive!($isa, $elem, loadu, bp.add(TN*6));
                                 let vb6_1 = $crate::simd_primitive!($isa, $elem, loadu, bp.add(TN*6+$LANES));
                                 $(
-                                        let va = $crate::simd_primitive!($isa, $elem, splat, *ac.add(k_size*$R));
+                                        let va = $crate::simd_primitive!($isa, $elem, splat, *pac.add(kc*$R));
                                         [<c_ $R _0>] = $crate::simd_primitive!($isa, $elem, fma, va, vb6_0, [<c_ $R _0>]);
                                         [<c_ $R _1>] = $crate::simd_primitive!($isa, $elem, fma, va, vb6_1, [<c_ $R _1>]);
-                                )+; ac = ac.add(1);
+                                )+; pac = pac.add(1);
                                 let vb7_0 = $crate::simd_primitive!($isa, $elem, loadu, bp.add(TN*7));
                                 let vb7_1 = $crate::simd_primitive!($isa, $elem, loadu, bp.add(TN*7+$LANES));
                                 $(
-                                        let va = $crate::simd_primitive!($isa, $elem, splat, *ac.add(k_size*$R));
+                                        let va = $crate::simd_primitive!($isa, $elem, splat, *pac.add(kc*$R));
                                         [<c_ $R _0>] = $crate::simd_primitive!($isa, $elem, fma, va, vb7_0, [<c_ $R _0>]);
                                         [<c_ $R _1>] = $crate::simd_primitive!($isa, $elem, fma, va, vb7_1, [<c_ $R _1>]);
-                                )+; ac = ac.add(1);
+                                )+; pac = pac.add(1);
                                 bp = bp.add(TN*8); _k += 8;
                             }
                             while _k < kc {
                                 let vb_0 = $crate::simd_primitive!($isa, $elem, loadu, bp);
                                 let vb_1 = $crate::simd_primitive!($isa, $elem, loadu, bp.add($LANES));
                                 $(
-                                        let va = $crate::simd_primitive!($isa, $elem, splat, *ac.add(k_size*$R));
+                                        let va = $crate::simd_primitive!($isa, $elem, splat, *pac.add(kc*$R));
                                         [<c_ $R _0>] = $crate::simd_primitive!($isa, $elem, fma, va, vb_0, [<c_ $R _0>]);
                                         [<c_ $R _1>] = $crate::simd_primitive!($isa, $elem, fma, va, vb_1, [<c_ $R _1>]);
-                                )+; ac = ac.add(1);
+                                )+; pac = pac.add(1);
                                 bp = bp.add(TN); _k += 1;
                             }
                             $($crate::simd_primitive!($isa, $elem, storeu, cp.add((m+$R)*n_size+n), [<c_ $R _0>]);
@@ -1019,6 +1304,7 @@ macro_rules! define_matmul_x86 {
                 } // MC block
                 ks += kc_max; ch += 1;
             }
+            WS_A4.with(|c| c.set(pa));
             // Remainder N with bias
             let nm = (n_size / TN) * TN;
             if nm < n_size {
@@ -1173,19 +1459,26 @@ macro_rules! define_matmul_x86 {
                     )+
                     n += $LANES;
                 }
-                while n < n_size {
-                    $(
-                    {
-                        let mut s = bias[n];
-                        for k in 0..k_size { s = <$elem as Element>::mul_add(s, a[(m + $R) * k_size + k], b[k * n_size + n]); }
-                        c[(m + $R) * n_size + n] = match ACT {
-                            0 => <$elem as Element>::max(s, <$elem as Element>::ZERO),
-                            1 => { let v = s.to_f32(); <$elem as Element>::from_f32(v / (1.0 + (-v).exp())) },
-                            _ => { let x = s.to_f32(); let inner = 0.7978845608f32 * (x + 0.044715f32 * x * x * x); <$elem as Element>::from_f32(0.5 * x * (1.0 + inner.tanh())) },
-                        };
-                    }
-                    )+
-                    n += 1;
+                {
+                    let rem = n_size - n;
+                    if rem > 0 { unsafe {
+                        $(
+                        {
+                            let mut acc = $crate::simd_primitive!($isa, $elem, maskload, biasp.add(n), rem);
+                            for k in 0..k_size {
+                                let va = $crate::simd_primitive!($isa, $elem, splat, *ap.add((m + $R) * k_size + k));
+                                let vb = $crate::simd_primitive!($isa, $elem, maskload, bp.add(k * n_size + n), rem);
+                                acc = $crate::simd_primitive!($isa, $elem, fma, va, vb, acc);
+                            }
+                            let r = match ACT {
+                                0 => $crate::apply_act!($isa, $elem, acc, relu),
+                                1 => $crate::apply_act!($isa, $elem, acc, silu),
+                                _ => $crate::apply_act!($isa, $elem, acc, gelu),
+                            };
+                            $crate::simd_primitive!($isa, $elem, maskstore, cp.add((m + $R) * n_size + n), r, rem);
+                        }
+                        )+
+                    }}
                 }
                 m += TM;
             }
@@ -1234,15 +1527,22 @@ macro_rules! define_matmul_x86 {
                     }
                     n += $LANES;
                 }
-                while n < n_size {
-                    let mut s = bias[n];
-                    for k in 0..k_size { s = <$elem as Element>::mul_add(s, a[m * k_size + k], b[k * n_size + n]); }
-                    c[m * n_size + n] = match ACT {
-                        0 => <$elem as Element>::max(s, <$elem as Element>::ZERO),
-                        1 => { let v = s.to_f32(); <$elem as Element>::from_f32(v / (1.0 + (-v).exp())) },
-                        _ => { let x = s.to_f32(); let inner = 0.7978845608f32 * (x + 0.044715f32 * x * x * x); <$elem as Element>::from_f32(0.5 * x * (1.0 + inner.tanh())) },
-                    };
-                    n += 1;
+                {
+                    let rem = n_size - n;
+                    if rem > 0 {
+                        let mut acc = $crate::simd_primitive!($isa, $elem, maskload, biasp.add(n), rem);
+                        for k in 0..k_size {
+                            let va = $crate::simd_primitive!($isa, $elem, splat, *ap.add(m * k_size + k));
+                            let vb = $crate::simd_primitive!($isa, $elem, maskload, bp.add(k * n_size + n), rem);
+                            acc = $crate::simd_primitive!($isa, $elem, fma, va, vb, acc);
+                        }
+                        let r = match ACT {
+                            0 => $crate::apply_act!($isa, $elem, acc, relu),
+                            1 => $crate::apply_act!($isa, $elem, acc, silu),
+                            _ => $crate::apply_act!($isa, $elem, acc, gelu),
+                        };
+                        $crate::simd_primitive!($isa, $elem, maskstore, cp.add(m * n_size + n), r, rem);
+                    }
                 }
                 m += 1;
             }

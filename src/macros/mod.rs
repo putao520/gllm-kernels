@@ -15,6 +15,8 @@ pub mod matmul_x86;
 #[macro_use]
 pub mod matmul_x86_bf16;
 #[macro_use]
+pub mod matmul_x86_int8;
+#[macro_use]
 pub mod matmul_neon;
 #[macro_use]
 pub mod operator_templates;
@@ -22,3 +24,7 @@ pub mod operator_templates;
 pub mod expand;
 #[macro_use]
 pub mod quant_primitive;
+#[macro_use]
+pub mod matmul_x86_amx;
+#[macro_use]
+pub mod matmul_x86_amx_int8;

@@ -125,13 +125,18 @@ pub fn l2_size() -> usize {
 
 /// Compute optimal KC given microkernel geometry and element size.
 ///
-/// Constraint: (TM + NV*LANES) * KC * elem_bytes ≤ L1D * 0.75
+/// The B panel (NV*LANES × KC) must stay resident in L1D for the microkernel
+/// inner loop. A panel rows are streamed one at a time, so only the B panel
+/// dominates the L1D footprint.
+///
+/// Constraint: NV * LANES * KC * elem_bytes ≤ L1D * 0.80
+/// (20% headroom for A streaming + C accumulators in registers)
 /// KC is rounded down to a multiple of 8 (for unrolled inner loops) and clamped to [64, 512].
-pub fn compute_kc(tm: usize, nv: usize, lanes: usize, elem_bytes: usize) -> usize {
+pub fn compute_kc(_tm: usize, nv: usize, lanes: usize, elem_bytes: usize) -> usize {
     let (l1d, _) = cache_sizes();
     let tn = nv * lanes;
-    let budget = (l1d * 3) / 4; // 75% of L1D
-    let kc_raw = budget / ((tm + tn) * elem_bytes);
+    let budget = (l1d * 4) / 5; // 80% of L1D for B panel
+    let kc_raw = budget / (tn * elem_bytes);
     // Round down to multiple of 8, clamp to [64, 512]
     let kc = (kc_raw & !7).max(64).min(512);
     kc
@@ -180,9 +185,9 @@ mod tests {
         // KC should be reasonable
         assert!(p.kc >= 64 && p.kc <= 512);
         assert!(p.mc >= 14);
-        // Working set check: (14+32)*KC*4 should fit 75% of L1D
-        let ws = (14 + 32) * p.kc * 4;
-        assert!(ws <= l1d_size() * 3 / 4 + 512, "Working set {ws} exceeds L1D budget");
+        // B panel must fit 80% of L1D: NV*LANES*KC*elem_bytes
+        let b_panel = 32 * p.kc * 4;
+        assert!(b_panel <= l1d_size() * 4 / 5 + 512, "B panel {b_panel} exceeds L1D budget");
     }
 
     #[test]

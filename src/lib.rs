@@ -1,3 +1,4 @@
+#![feature(x86_amx_intrinsics)]
 #![allow(
     clippy::too_many_arguments,
     clippy::crate_in_macro_def,
@@ -31,6 +32,8 @@ pub mod tests;
 mod tests_quant;
 #[cfg(test)]
 mod tests_simd;
+#[cfg(test)]
+mod tests_int8;
 #[cfg(test)]
 mod check_isa;
 
