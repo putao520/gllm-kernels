@@ -201,6 +201,7 @@ dependencies = [
  "half",
  "paste",
  "rand",
+ "rayon",
 ]
 
 [[package]]

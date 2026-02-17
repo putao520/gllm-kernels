@@ -179,12 +179,12 @@ mod tests {
 
     #[test]
     fn test_avx512_f32_params() {
-        // AVX-512 f32: TM=14, NV=2, LANES=16, elem=4 bytes
-        let p = blocking_params(14, 2, 16, 4);
+        // AVX-512 f32: TM=16, NV=2, LANES=16, elem=4 bytes
+        let p = blocking_params(16, 2, 16, 4);
         eprintln!("AVX-512 f32: KC={}, MC={}", p.kc, p.mc);
         // KC should be reasonable
         assert!(p.kc >= 64 && p.kc <= 512);
-        assert!(p.mc >= 14);
+        assert!(p.mc >= 16);
         // B panel must fit 80% of L1D: NV*LANES*KC*elem_bytes
         let b_panel = 32 * p.kc * 4;
         assert!(b_panel <= l1d_size() * 4 / 5 + 512, "B panel {b_panel} exceeds L1D budget");
@@ -201,10 +201,10 @@ mod tests {
 
     #[test]
     fn test_avx512_bf16_params() {
-        // AVX-512 bf16: TM=14, NV=2, LANES=16, elem=2 bytes
-        let p = blocking_params(14, 2, 16, 2);
+        // AVX-512 bf16: TM=16, NV=2, LANES=16, elem=2 bytes
+        let p = blocking_params(16, 2, 16, 2);
         eprintln!("AVX-512 bf16: KC={}, MC={}", p.kc, p.mc);
         assert!(p.kc >= 64 && p.kc <= 512);
-        assert!(p.mc >= 14);
+        assert!(p.mc >= 16);
     }
 }
