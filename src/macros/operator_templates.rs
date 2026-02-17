@@ -1116,17 +1116,21 @@ macro_rules! define_gemv_op {
         /// 4-row processing to amortize x vector loads + 2 accumulators per row for ILP.
         #[inline(always)]
         pub fn gemv(a: &[$elem], x: &[$elem], y: &mut [$elem], m: usize, k: usize) {
-            const LANES: usize = $crate::simd_primitive!($isa, $elem, lanes);
             assert!(a.len() >= m * k && x.len() >= k && y.len() >= m);
 
-            let mut row = 0;
+        /// Serial gemv core: y[row_start..row_end] += A[row_start..row_end, :] * x
+        #[inline(always)]
+        fn gemv_serial(a: &[$elem], x: &[$elem], y: &mut [$elem], row_start: usize, row_end: usize, k: usize) {
+            const LANES: usize = $crate::simd_primitive!($isa, $elem, lanes);
+            let m = row_end - row_start;
+            let mut row = 0usize;
 
             // ── 4-row block: each x load shared across 4 rows ──
             while row + 4 <= m {
-                let r0 = unsafe { a.as_ptr().add(row * k) };
-                let r1 = unsafe { a.as_ptr().add((row + 1) * k) };
-                let r2 = unsafe { a.as_ptr().add((row + 2) * k) };
-                let r3 = unsafe { a.as_ptr().add((row + 3) * k) };
+                let r0 = unsafe { a.as_ptr().add((row_start + row) * k) };
+                let r1 = unsafe { a.as_ptr().add((row_start + row + 1) * k) };
+                let r2 = unsafe { a.as_ptr().add((row_start + row + 2) * k) };
+                let r3 = unsafe { a.as_ptr().add((row_start + row + 3) * k) };
 
                 let mut i = 0;
                 #[allow(unused_unsafe)]
@@ -1195,18 +1199,18 @@ macro_rules! define_gemv_op {
                         d2 += (*r2.add(j)).to_f32() * xv;
                         d3 += (*r3.add(j)).to_f32() * xv;
                     }
-                    y[row]     = <$elem as Element>::from_f32(y[row].to_f32() + d0);
-                    y[row + 1] = <$elem as Element>::from_f32(y[row + 1].to_f32() + d1);
-                    y[row + 2] = <$elem as Element>::from_f32(y[row + 2].to_f32() + d2);
-                    y[row + 3] = <$elem as Element>::from_f32(y[row + 3].to_f32() + d3);
+                    y[row_start + row]     = <$elem as Element>::from_f32(y[row_start + row].to_f32() + d0);
+                    y[row_start + row + 1] = <$elem as Element>::from_f32(y[row_start + row + 1].to_f32() + d1);
+                    y[row_start + row + 2] = <$elem as Element>::from_f32(y[row_start + row + 2].to_f32() + d2);
+                    y[row_start + row + 3] = <$elem as Element>::from_f32(y[row_start + row + 3].to_f32() + d3);
                 }
                 row += 4;
             }
 
             // ── 2-row remainder ──
             if row + 2 <= m {
-                let r0 = unsafe { a.as_ptr().add(row * k) };
-                let r1 = unsafe { a.as_ptr().add((row + 1) * k) };
+                let r0 = unsafe { a.as_ptr().add((row_start + row) * k) };
+                let r1 = unsafe { a.as_ptr().add((row_start + row + 1) * k) };
                 let mut i = 0;
                 #[allow(unused_unsafe)]
                 let (mut a0, mut a1, mut b0, mut b1) = unsafe { (
@@ -1254,15 +1258,15 @@ macro_rules! define_gemv_op {
                         d0 += (*r0.add(j)).to_f32() * xv;
                         d1 += (*r1.add(j)).to_f32() * xv;
                     }
-                    y[row]     = <$elem as Element>::from_f32(y[row].to_f32() + d0);
-                    y[row + 1] = <$elem as Element>::from_f32(y[row + 1].to_f32() + d1);
+                    y[row_start + row]     = <$elem as Element>::from_f32(y[row_start + row].to_f32() + d0);
+                    y[row_start + row + 1] = <$elem as Element>::from_f32(y[row_start + row + 1].to_f32() + d1);
                 }
                 row += 2;
             }
 
             // ── 1-row remainder ──
             if row < m {
-                let rp = unsafe { a.as_ptr().add(row * k) };
+                let rp = unsafe { a.as_ptr().add((row_start + row) * k) };
                 let mut i = 0;
                 #[allow(unused_unsafe)]
                 let (mut a0, mut b0) = unsafe { (
@@ -1298,8 +1302,40 @@ macro_rules! define_gemv_op {
                     let s = $crate::simd_primitive!($isa, $elem, add, a0, b0);
                     let mut dot: f32 = $crate::simd_primitive!($isa, $elem, reduce_sum, s);
                     for j in i..k { dot += (*rp.add(j)).to_f32() * x[j].to_f32(); }
-                    y[row] = <$elem as Element>::from_f32(y[row].to_f32() + dot);
+                    y[row_start + row] = <$elem as Element>::from_f32(y[row_start + row].to_f32() + dot);
                 }
+            }
+        } // end gemv_serial
+
+            // Parallel threshold: M * K > 256K elements (~1MB for f32)
+            const PAR_THRESHOLD: usize = 256 * 1024;
+            let nthreads = rayon::current_num_threads().max(1);
+            if m >= 8 && m * k >= PAR_THRESHOLD && nthreads > 1 {
+                // Round chunk to multiple of 4 for alignment with 4-row blocks
+                let chunk = ((m + nthreads - 1) / nthreads + 3) & !3;
+                let a_ptr = a.as_ptr() as usize;
+                let x_ptr = x.as_ptr() as usize;
+                let y_ptr = y.as_mut_ptr() as usize;
+                let a_len = a.len();
+                let x_len = x.len();
+                let y_len = y.len();
+                rayon::scope(|s| {
+                    let mut start = 0usize;
+                    while start < m {
+                        let end = (start + chunk).min(m);
+                        let rs = start;
+                        let re = end;
+                        s.spawn(move |_| {
+                            let a_sl = unsafe { std::slice::from_raw_parts(a_ptr as *const $elem, a_len) };
+                            let x_sl = unsafe { std::slice::from_raw_parts(x_ptr as *const $elem, x_len) };
+                            let y_sl = unsafe { std::slice::from_raw_parts_mut(y_ptr as *mut $elem, y_len) };
+                            gemv_serial(a_sl, x_sl, y_sl, rs, re, k);
+                        });
+                        start = end;
+                    }
+                });
+            } else {
+                gemv_serial(a, x, y, 0, m, k);
             }
         }
     };

@@ -190,7 +190,19 @@ macro_rules! define_matmul_x86 {
                 && (n_size * std::mem::size_of::<$elem>()) % c_align == 0
                 && c_bytes > 512 * 1024; // skip NT for small C that fits in L2
             let _ = c_nt_ok; // suppress unused warning in non-prepacked paths
-            let mc_max = _blocking().mc;
+            let mc_base = _blocking().mc;
+            // Adaptive MC: reduce MC to increase parallelism when M is moderate
+            let mc_max = {
+                let nthreads = rayon::current_num_threads().max(1);
+                let blocks_base = (m_size + mc_base - 1) / mc_base;
+                if blocks_base < nthreads && m_size >= TM * 2 {
+                    // Shrink MC so we get at least nthreads blocks, rounded down to TM
+                    let mc_small = ((m_size + nthreads - 1) / nthreads) / TM * TM;
+                    mc_small.max(TM)
+                } else {
+                    mc_base
+                }
+            };
             let mut ks = 0usize; let mut ch = 0usize;
             while ks < k_size {
                 let kc = kc_max.min(k_size - ks);
@@ -352,36 +364,51 @@ macro_rules! define_matmul_x86 {
             }
             // Fence after NT stores to ensure visibility before subsequent reads
             if c_nt_ok { std::arch::x86_64::_mm_sfence(); }
-            // Remainder N — use masked SIMD for partial vectors
+            // Remainder N — read from packed B (last strip, zero-padded to TN)
             let nm = (n_size / TN) * TN;
             if nm < n_size {
-                let mut n = nm;
-                while n + $LANES <= n_size {
+                let nr = n_size - nm;
+                let ls = nm / TN; // last strip index
+                // Process LANES-wide chunks from packed B
+                let mut nos = 0usize;
+                while nos + $LANES <= nr {
                     for m in 0..m_size { unsafe {
                         let mut acc = $crate::simd_primitive!($isa, $elem, zero);
-                        let ar = a.as_ptr().add(m*k_size);
-                        for k in 0..k_size {
-                            let va = $crate::simd_primitive!($isa, $elem, splat, *ar.add(k));
-                            let vb = $crate::simd_primitive!($isa, $elem, loadu, b.as_ptr().add(k*n_size+n));
-                            acc = $crate::simd_primitive!($isa, $elem, fma, va, vb, acc);
+                        let mut ac = a.as_ptr().add(m * k_size);
+                        let mut ks2 = 0usize; let mut ci = 0usize;
+                        while ks2 < k_size {
+                            let kc = kc_max.min(k_size - ks2);
+                            let mut bpp = pb.as_ptr().add(ci * cs + ls * kc_max * TN + nos);
+                            for _ in 0..kc {
+                                let va = $crate::simd_primitive!($isa, $elem, splat, *ac);
+                                let vb = $crate::simd_primitive!($isa, $elem, loadu, bpp);
+                                acc = $crate::simd_primitive!($isa, $elem, fma, va, vb, acc);
+                                ac = ac.add(1); bpp = bpp.add(TN);
+                            }
+                            ks2 += kc; ci += 1; ac = a.as_ptr().add(m * k_size + ks2);
                         }
-                        $crate::simd_primitive!($isa, $elem, storeu, c.as_mut_ptr().add(m*n_size+n), acc);
+                        $crate::simd_primitive!($isa, $elem, storeu, cp.add(m * n_size + nm + nos), acc);
                     }}
-                    n += $LANES;
+                    nos += $LANES;
                 }
-                // Masked SIMD tail for remaining N columns
-                let rem = n_size - n;
-                if rem > 0 {
-                    for m in 0..m_size { unsafe {
-                        let mut acc = $crate::simd_primitive!($isa, $elem, zero);
-                        let ar = a.as_ptr().add(m * k_size);
-                        for k in 0..k_size {
-                            let va = $crate::simd_primitive!($isa, $elem, splat, *ar.add(k));
-                            let vb = $crate::simd_primitive!($isa, $elem, maskload, b.as_ptr().add(k*n_size+n), rem);
-                            acc = $crate::simd_primitive!($isa, $elem, fma, va, vb, acc);
+                // Scalar tail for remaining < LANES columns
+                let sr = nr - nos;
+                if sr > 0 {
+                    for m in 0..m_size {
+                        for no in nos..nr {
+                            let mut s = <$elem as Element>::ZERO;
+                            let mut k2 = 0usize; let mut ci = 0usize;
+                            while k2 < k_size {
+                                let kc = kc_max.min(k_size - k2);
+                                let base = ci * cs + ls * kc_max * TN;
+                                for ki in 0..kc {
+                                    s = <$elem as Element>::mul_add(s, a[m * k_size + k2 + ki], pb[base + ki * TN + no]);
+                                }
+                                k2 += kc; ci += 1;
+                            }
+                            c[m * n_size + nm + no] = s;
                         }
-                        $crate::simd_primitive!($isa, $elem, maskstore, c.as_mut_ptr().add(m*n_size+n), acc, rem);
-                    }}
+                    }
                 }
             }
             // Remainder M
@@ -927,7 +954,17 @@ macro_rules! define_matmul_x86 {
                 unsafe { std::ptr::copy_nonoverlapping(bias.as_ptr(), cp.add(m * n_size), n_size); }
             }
 
-            let mc_max = _blocking().mc;
+            let mc_base_b = _blocking().mc;
+            let mc_max = {
+                let nthreads = rayon::current_num_threads().max(1);
+                let blocks_base = (m_size + mc_base_b - 1) / mc_base_b;
+                if blocks_base < nthreads && m_size >= TM * 2 {
+                    let mc_small = ((m_size + nthreads - 1) / nthreads) / TM * TM;
+                    mc_small.max(TM)
+                } else {
+                    mc_base_b
+                }
+            };
             let mut ks = 0usize; let mut ch = 0usize;
             while ks < k_size {
                 let kc = kc_max.min(k_size - ks);
@@ -1067,28 +1104,43 @@ macro_rules! define_matmul_x86 {
                 }
                 ks += kc_max; ch += 1;
             }
-            // Remainder N with bias
+            // Remainder N with bias — read from packed B (last strip)
             let nm = (n_size / TN) * TN;
             if nm < n_size {
-                let mut n = nm;
-                while n + $LANES <= n_size {
+                let nr = n_size - nm;
+                let ls = nm / TN;
+                let mut nos = 0usize;
+                while nos + $LANES <= nr {
                     for m in 0..m_size { unsafe {
-                        let mut acc = $crate::simd_primitive!($isa, $elem, loadu, bias.as_ptr().add(n));
-                        let ar = a.as_ptr().add(m*k_size);
-                        for k in 0..k_size {
-                            let va = $crate::simd_primitive!($isa, $elem, splat, *ar.add(k));
-                            let vb = $crate::simd_primitive!($isa, $elem, loadu, b.as_ptr().add(k*n_size+n));
-                            acc = $crate::simd_primitive!($isa, $elem, fma, va, vb, acc);
+                        let mut acc = $crate::simd_primitive!($isa, $elem, loadu, bias.as_ptr().add(nm + nos));
+                        let mut ac = a.as_ptr().add(m * k_size);
+                        let mut ks2 = 0usize; let mut ci = 0usize;
+                        while ks2 < k_size {
+                            let kc = kc_max.min(k_size - ks2);
+                            let mut bpp = pb.as_ptr().add(ci * cs + ls * kc_max * TN + nos);
+                            for _ in 0..kc {
+                                let va = $crate::simd_primitive!($isa, $elem, splat, *ac);
+                                let vb = $crate::simd_primitive!($isa, $elem, loadu, bpp);
+                                acc = $crate::simd_primitive!($isa, $elem, fma, va, vb, acc);
+                                ac = ac.add(1); bpp = bpp.add(TN);
+                            }
+                            ks2 += kc; ci += 1; ac = a.as_ptr().add(m * k_size + ks2);
                         }
-                        $crate::simd_primitive!($isa, $elem, storeu, c.as_mut_ptr().add(m*n_size+n), acc);
+                        $crate::simd_primitive!($isa, $elem, storeu, c.as_mut_ptr().add(m * n_size + nm + nos), acc);
                     }}
-                    n += $LANES;
+                    nos += $LANES;
                 }
                 for m in 0..m_size {
-                    for nn in n..n_size {
-                        let mut s = bias[nn];
-                        for k in 0..k_size { s = <$elem as Element>::mul_add(s, a[m*k_size+k], b[k*n_size+nn]); }
-                        c[m*n_size+nn] = s;
+                    for no in nos..nr {
+                        let mut s = bias[nm + no];
+                        let mut k2 = 0usize; let mut ci = 0usize;
+                        while k2 < k_size {
+                            let kc = kc_max.min(k_size - k2);
+                            let base = ci * cs + ls * kc_max * TN;
+                            for ki in 0..kc { s = <$elem as Element>::mul_add(s, a[m * k_size + k2 + ki], pb[base + ki * TN + no]); }
+                            k2 += kc; ci += 1;
+                        }
+                        c[m * n_size + nm + no] = s;
                     }
                 }
             }
@@ -1149,7 +1201,17 @@ macro_rules! define_matmul_x86 {
             let c_nt_ok = (cp as usize) % c_align == 0 && (n_size * std::mem::size_of::<$elem>()) % c_align == 0;
             let _ = c_nt_ok; // suppress unused warning in non-prepacked paths
 
-            let mc_max = _blocking().mc;
+            let mc_base_p = _blocking().mc;
+            let mc_max = {
+                let nthreads = rayon::current_num_threads().max(1);
+                let blocks_base = (m_size + mc_base_p - 1) / mc_base_p;
+                if blocks_base < nthreads && m_size >= TM * 2 {
+                    let mc_small = ((m_size + nthreads - 1) / nthreads) / TM * TM;
+                    mc_small.max(TM)
+                } else {
+                    mc_base_p
+                }
+            };
             let mut ks = 0usize; let mut ch = 0usize;
             while ks < k_size {
                 let kc = kc_max.min(k_size - ks);
@@ -1391,7 +1453,17 @@ macro_rules! define_matmul_x86 {
                 unsafe { std::ptr::copy_nonoverlapping(bias.as_ptr(), cp.add(m * n_size), n_size); }
             }
 
-            let mc_max = _blocking().mc;
+            let mc_base_bp = _blocking().mc;
+            let mc_max = {
+                let nthreads = rayon::current_num_threads().max(1);
+                let blocks_base = (m_size + mc_base_bp - 1) / mc_base_bp;
+                if blocks_base < nthreads && m_size >= TM * 2 {
+                    let mc_small = ((m_size + nthreads - 1) / nthreads) / TM * TM;
+                    mc_small.max(TM)
+                } else {
+                    mc_base_bp
+                }
+            };
             let mut ks = 0usize; let mut ch = 0usize;
             while ks < k_size {
                 let kc = kc_max.min(k_size - ks);
