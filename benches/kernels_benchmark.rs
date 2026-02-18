@@ -149,6 +149,76 @@ fn bench_rope(c: &mut Criterion) {
     group.finish();
 }
 
+// ============================================================
+// Quantized dot Q8_K (single block + multi-block)
+// ============================================================
+fn bench_quant_dot_q8k(c: &mut Criterion) {
+    let kernels = CpuKernels::<f32>::new();
+    let mut group = c.benchmark_group("quant_dot_q8k");
+    group.sample_size(100);
+
+    // Build realistic Q8K blocks with random i8 weights
+    let mut rng = rand::thread_rng();
+
+    for &n in &[256, 4096, 8192] {
+        let blocks = n / 256;
+        let block_bytes = 292; // Q8_K block size
+        let mut weight = vec![0u8; blocks * block_bytes];
+        // Fill with realistic data: d=0.1, random i8 qs
+        for b in 0..blocks {
+            let base = b * block_bytes;
+            // d field (f32 at offset 0)
+            let d: f32 = 0.1;
+            weight[base..base+4].copy_from_slice(&d.to_le_bytes());
+            // qs field (256 i8 at offset 4)
+            for j in 0..256 {
+                weight[base + 4 + j] = rng.gen::<u8>();
+            }
+        }
+        let x = rand_vec(n);
+
+        group.throughput(Throughput::Elements(n as u64));
+        group.bench_function(format!("gemv_q8_{n}"), |bench| {
+            bench.iter(|| {
+                let w_i8 = unsafe { std::slice::from_raw_parts(weight.as_ptr() as *const i8, weight.len()) };
+                black_box(kernels.gemv_q8(
+                    black_box(w_i8), black_box(&x), 1.0, n,
+                ));
+            })
+        });
+    }
+
+    // kquant_matmul benchmark: m=1, n=1, k=4096 (typical GEMV through matmul path)
+    {
+        let k = 4096;
+        let blocks = k / 256;
+        let block_bytes = 292;
+        let mut weight = vec![0u8; blocks * block_bytes];
+        for b in 0..blocks {
+            let base = b * block_bytes;
+            let d: f32 = 0.05;
+            weight[base..base+4].copy_from_slice(&d.to_le_bytes());
+            for j in 0..256 {
+                weight[base + 4 + j] = rng.gen::<u8>();
+            }
+        }
+        let input = rand_vec(k);
+        let mut output = vec![0.0f32; 1];
+
+        group.throughput(Throughput::Elements(k as u64));
+        group.bench_function("kquant_matmul_1x1x4096", |bench| {
+            bench.iter(|| {
+                kernels.kquant_matmul(
+                    black_box(&weight), black_box(&input), black_box(&mut output),
+                    gllm_kernels::quant::QuantType::Q8K, 1, 1, k,
+                );
+            })
+        });
+    }
+
+    group.finish();
+}
+
 criterion_group!(
     benches,
     bench_gemm,
@@ -157,6 +227,7 @@ criterion_group!(
     bench_rms_norm,
     bench_softmax,
     bench_quant_gemv,
+    bench_quant_dot_q8k,
     bench_rope,
 );
 criterion_main!(benches);

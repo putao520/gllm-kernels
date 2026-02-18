@@ -1,4 +1,6 @@
 #![feature(x86_amx_intrinsics)]
+#![feature(stdarch_x86_avx512_f16)]
+#![feature(f16)]
 #![allow(
     clippy::too_many_arguments,
     clippy::crate_in_macro_def,

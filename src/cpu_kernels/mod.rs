@@ -960,9 +960,9 @@ impl<E: Element> Kernels<E> for CpuKernels<E> {
     define_quant_decode_k!(dequant_q5_k, q5_k, BlockQ5K);
     define_quant_decode_k!(dequant_q6_k, q6_k, BlockQ6K);
 
-    // Q2_K/Q8_K decode: avx512 + scalar (no avx2 decode branch)
-    define_quant_decode_avx512!(dequant_q2_k, q2_k, BlockQ2K);
-    define_quant_decode_avx512!(dequant_q8_k, q8_k, BlockQ8K);
+    // Q2_K/Q8_K decode: avx512 + avx2 + neon + scalar (full ISA coverage)
+    define_quant_decode_k!(dequant_q2_k, q2_k, BlockQ2K);
+    define_quant_decode_k!(dequant_q8_k, q8_k, BlockQ8K);
 
     // Quantized GEMV/GEMM
     fn gemv_q4(&self, weight: &[u8], input: &[E], scale: f32, n: usize) -> E {

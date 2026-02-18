@@ -329,4 +329,74 @@ mod tests {
         let v = avx2_dot!(gptq4, BlockGPTQ4, &block, &other);
         assert_dot_close(s, v, "gptq4 dot", 1e-2);
     }
+
+    // ========================================================================
+    // Q4_K: AVX2 dot product correctness (zero block + non-trivial block)
+    // ========================================================================
+
+    #[test]
+    #[cfg(target_arch = "x86_64")]
+    fn test_simd_q4k_dot_zero() {
+        use crate::quant::BlockQ4K;
+        let mut block: BlockQ4K = unsafe { std::mem::zeroed() };
+        block.d = half::f16::from_f32(1.0);
+        let other = ramp_f32(256);
+        let s = scalar_dot!(q4_k, BlockQ4K, &block, &other);
+        let v = avx2_dot!(q4_k, BlockQ4K, &block, &other);
+        assert_dot_close(s, v, "q4_k dot (zero block)", 1e-2);
+    }
+
+    #[test]
+    #[cfg(target_arch = "x86_64")]
+    fn test_simd_q4k_dot_nonzero() {
+        use crate::quant::BlockQ4K;
+        // Build a block with non-trivial nibble patterns
+        let mut block: BlockQ4K = unsafe { std::mem::zeroed() };
+        block.d = half::f16::from_f32(0.5);
+        // Fill qs with a ramp pattern: byte i = (i & 0xF) | ((i*3 & 0xF) << 4)
+        for i in 0..128 {
+            let lo = (i & 0x0F) as u8;
+            let hi = ((i * 3) & 0x0F) as u8;
+            block.qs[i] = lo | (hi << 4);
+        }
+        let other: Vec<f32> = (0..256).map(|i| ((i as f32) - 128.0) / 64.0).collect();
+        let s = scalar_dot!(q4_k, BlockQ4K, &block, &other);
+        let v = avx2_dot!(q4_k, BlockQ4K, &block, &other);
+        assert_dot_close(s, v, "q4_k dot (nonzero)", 1e-1);
+    }
+
+    #[test]
+    #[cfg(target_arch = "x86_64")]
+    fn test_simd_q4k_dot_random_pattern() {
+        use crate::quant::BlockQ4K;
+        // Pseudo-random pattern to stress all nibble values
+        let mut block: BlockQ4K = unsafe { std::mem::zeroed() };
+        block.d = half::f16::from_f32(0.125);
+        let mut seed: u32 = 42;
+        for i in 0..128 {
+            seed = seed.wrapping_mul(1103515245).wrapping_add(12345);
+            block.qs[i] = (seed >> 16) as u8;
+        }
+        let other: Vec<f32> = (0..256).map(|i| {
+            let x = (i as f32) * 0.01;
+            (x * 2.7).sin()
+        }).collect();
+        let s = scalar_dot!(q4_k, BlockQ4K, &block, &other);
+        let v = avx2_dot!(q4_k, BlockQ4K, &block, &other);
+        assert_dot_close(s, v, "q4_k dot (random)", 1e-1);
+    }
+
+    #[test]
+    #[cfg(target_arch = "x86_64")]
+    fn test_simd_q4k_decode() {
+        use crate::quant::BlockQ4K;
+        let mut block: BlockQ4K = unsafe { std::mem::zeroed() };
+        block.d = half::f16::from_f32(1.0);
+        for i in 0..128 {
+            block.qs[i] = ((i & 0xF) | (((i + 5) & 0xF) << 4)) as u8;
+        }
+        let scalar = scalar_decode!(q4_k, BlockQ4K, &block, 256);
+        let simd = avx2_decode!(q4_k, BlockQ4K, &block, 256);
+        assert_close(&scalar, &simd, "q4_k decode", 1e-4);
+    }
 }

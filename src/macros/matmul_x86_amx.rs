@@ -368,17 +368,16 @@ macro_rules! define_matmul_x86_amx_bf16 {
             packed
         }
 
-        /// Core GEMM into f32 buffer (no conversion). Returns the f32 buffer.
-        fn matmul_to_f32(a: &[half::bf16], b: &[half::bf16],
-                         m_size: usize, n_size: usize, k_size: usize) -> Vec<f32> {
+        /// Core GEMM into f32 buffer using pre-packed B. Returns the f32 buffer.
+        /// `b_orig` is needed for N-tail scalar fallback (columns beyond last full TILE_N strip).
+        fn matmul_to_f32_inner(a: &[half::bf16], packed_b: &[half::bf16], b_orig: Option<&[half::bf16]>,
+                               m_size: usize, n_size: usize, k_size: usize) -> Vec<f32> {
             assert!(a.len() >= m_size * k_size);
-            assert!(b.len() >= k_size * n_size);
             if m_size == 0 || n_size == 0 || k_size == 0 { return vec![0.0f32; m_size * n_size]; }
 
             let mut c_f32 = vec![0.0f32; m_size * n_size];
             let n_full_strips = n_size / TILE_N;
-
-            let packed_b = pack_b(b, n_size, k_size);
+            let n_strips = (n_size + TILE_N - 1) / TILE_N;
 
             let mut ks = 0usize;
             let mut k_chunk_idx = 0usize;
@@ -394,15 +393,17 @@ macro_rules! define_matmul_x86_amx_bf16 {
                         unsafe {
                             microkernel_16x32(
                                 a.as_ptr().add(m * k_size + ks),
-                                packed_b.as_ptr().add(k_chunk_idx * ((n_size + TILE_N - 1) / TILE_N) * 16 * 64 + si * 16 * 64),
+                                packed_b.as_ptr().add(k_chunk_idx * n_strips * 16 * 64 + si * 16 * 64),
                                 c_f32.as_mut_ptr().add(m * n_size + n),
                                 k_iters, k_size, n_size, first_chunk,
                             );
                         }
                     }
                     if n_full_strips * TILE_N < n_size {
-                        edge_n_scalar(a, b, &mut c_f32, m, m + TILE_M,
-                                      n_full_strips * TILE_N, n_size, ks, kc, k_size, first_chunk);
+                        if let Some(b) = b_orig {
+                            edge_n_scalar(a, b, &mut c_f32, m, m + TILE_M,
+                                          n_full_strips * TILE_N, n_size, ks, kc, k_size, first_chunk);
+                        }
                     }
                     m += TILE_M;
                 }
@@ -415,15 +416,17 @@ macro_rules! define_matmul_x86_amx_bf16 {
                             edge_m_kernel(
                                 m_rem,
                                 a.as_ptr().add(m * k_size + ks),
-                                packed_b.as_ptr().add(k_chunk_idx * ((n_size + TILE_N - 1) / TILE_N) * 16 * 64 + si * 16 * 64),
+                                packed_b.as_ptr().add(k_chunk_idx * n_strips * 16 * 64 + si * 16 * 64),
                                 c_f32.as_mut_ptr().add(m * n_size + n),
                                 k_iters, k_size, n_size, first_chunk,
                             );
                         }
                     }
                     if n_full_strips * TILE_N < n_size {
-                        edge_n_scalar(a, b, &mut c_f32, m, m_size,
-                                      n_full_strips * TILE_N, n_size, ks, kc, k_size, first_chunk);
+                        if let Some(b) = b_orig {
+                            edge_n_scalar(a, b, &mut c_f32, m, m_size,
+                                          n_full_strips * TILE_N, n_size, ks, kc, k_size, first_chunk);
+                        }
                     }
                 }
 
@@ -431,6 +434,59 @@ macro_rules! define_matmul_x86_amx_bf16 {
                 k_chunk_idx += 1;
             }
             c_f32
+        }
+
+        /// Core GEMM into f32 buffer (packs B internally). Returns the f32 buffer.
+        fn matmul_to_f32(a: &[half::bf16], b: &[half::bf16],
+                         m_size: usize, n_size: usize, k_size: usize) -> Vec<f32> {
+            assert!(b.len() >= k_size * n_size);
+            let packed_b = pack_b(b, n_size, k_size);
+            matmul_to_f32_inner(a, &packed_b, Some(b), m_size, n_size, k_size)
+        }
+
+        /// Core GEMM into f32 buffer using pre-packed B. Returns the f32 buffer.
+        /// N-tail (columns beyond last full TILE_N strip) is handled via scalar
+        /// extraction from packed layout.
+        fn matmul_to_f32_prepacked(a: &[half::bf16], packed_b: &[half::bf16],
+                                    m_size: usize, n_size: usize, k_size: usize) -> Vec<f32> {
+            // For N-tail we need unpacked B. If N is a multiple of TILE_N, no tail exists.
+            if n_size % TILE_N == 0 {
+                matmul_to_f32_inner(a, packed_b, None, m_size, n_size, k_size)
+            } else {
+                // Unpack the tail strip from packed_b for scalar fallback.
+                // This is rare (only when N is not a multiple of 32) and not on the hot path.
+                let n_strips = (n_size + TILE_N - 1) / TILE_N;
+                let k_pairs = (k_size + 1) / 2;
+                let last_strip = n_strips - 1;
+                let n_start = last_strip * TILE_N;
+                let n_tail = n_size - n_start;
+                // Reconstruct a minimal unpacked B for the scalar edge
+                let mut b_unpacked = vec![half::bf16::ZERO; k_size * n_size];
+                // Unpack all strips to get correct B values
+                for ns in 0..n_strips {
+                    let ns_start = ns * TILE_N;
+                    let ns_end = (ns_start + TILE_N).min(n_size);
+                    let strip_base = ns * TILE_N * k_pairs * 2;
+                    for kp in 0..k_pairs {
+                        let k0 = kp * 2;
+                        let k1 = k0 + 1;
+                        let pair_base = strip_base + kp * TILE_N * 2;
+                        for n in ns_start..ns_end {
+                            let local_n = n - ns_start;
+                            let src_idx = pair_base + local_n * 2;
+                            if src_idx < packed_b.len() {
+                                if k0 < k_size {
+                                    b_unpacked[k0 * n_size + n] = packed_b[src_idx];
+                                }
+                                if k1 < k_size && src_idx + 1 < packed_b.len() {
+                                    b_unpacked[k1 * n_size + n] = packed_b[src_idx + 1];
+                                }
+                            }
+                        }
+                    }
+                }
+                matmul_to_f32_inner(a, packed_b, Some(&b_unpacked), m_size, n_size, k_size)
+            }
         }
 
         /// Main AMX BF16 matmul: C[m,n] = A[m,k] * B[k,n]
@@ -444,11 +500,9 @@ macro_rules! define_matmul_x86_amx_bf16 {
 
         pub fn matmul_prepacked(a: &[half::bf16], packed_b: &[half::bf16], c: &mut [half::bf16],
                                 m_size: usize, n_size: usize, k_size: usize) {
-            // TODO: optimize to use pre-packed B directly
-            let mut b_unpacked = vec![half::bf16::ZERO; k_size * n_size];
-            matmul(a, &b_unpacked, c, m_size, n_size, k_size);
-            let _ = packed_b;
-            let _ = &mut b_unpacked;
+            assert!(c.len() >= m_size * n_size);
+            let c_f32 = matmul_to_f32_prepacked(a, packed_b, m_size, n_size, k_size);
+            unsafe { convert_f32_to_bf16(&c_f32, c); }
         }
 
         pub fn matmul_bias(a: &[half::bf16], b: &[half::bf16], bias: &[half::bf16],
@@ -460,17 +514,9 @@ macro_rules! define_matmul_x86_amx_bf16 {
 
         pub fn matmul_bias_prepacked(a: &[half::bf16], packed_b: &[half::bf16], bias: &[half::bf16],
                                      c: &mut [half::bf16], m_size: usize, n_size: usize, k_size: usize) {
-            matmul_prepacked(a, packed_b, c, m_size, n_size, k_size);
-            // Apply bias in a vectorized pass
-            for m in 0..m_size {
-                let row_off = m * n_size;
-                let mut n = 0usize;
-                while n < n_size {
-                    let val = c[row_off + n].to_f32() + bias[n].to_f32();
-                    c[row_off + n] = half::bf16::from_f32(val);
-                    n += 1;
-                }
-            }
+            assert!(c.len() >= m_size * n_size);
+            let c_f32 = matmul_to_f32_prepacked(a, packed_b, m_size, n_size, k_size);
+            unsafe { convert_f32_to_bf16_bias(&c_f32, bias, c, m_size, n_size); }
         }
 
         pub fn matmul_bias_act(a: &[half::bf16], b: &[half::bf16], bias: &[half::bf16],

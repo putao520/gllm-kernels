@@ -128,6 +128,11 @@ fn cache_sizes() -> (usize, usize, usize) {
     *CACHE_SIZES.get_or_init(detect_cache_sizes)
 }
 
+/// Public accessor for cache sizes, used by autotuning hw_info.
+pub fn detect_cache_sizes_pub() -> (usize, usize, usize) {
+    cache_sizes()
+}
+
 /// Returns the detected L1D size in bytes.
 pub fn l1d_size() -> usize {
     cache_sizes().0

@@ -189,6 +189,7 @@ version = "0.1.0"
 dependencies = [
  "criterion",
  "half",
+ "libc",
  "paste",
  "rand",
  "rayon",

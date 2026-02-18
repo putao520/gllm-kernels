@@ -98,3 +98,22 @@ macro_rules! define_bf16_helpers {
         }
     };
 }
+
+/// Helper functions for AVX-512 FP16 native GEMM microkernel.
+/// Provides load/store conversions between half::f16 memory and __m512h registers.
+#[macro_export]
+macro_rules! define_f16_helpers {
+    () => {
+        /// Store 16 f32 values as 16 f16 (via F16C conversion).
+        #[inline(always)]
+        unsafe fn store_f32_as_f16(ptr: *mut half::f16, v: std::arch::x86_64::__m512) {
+            $crate::simd_primitive!(avx512, f16, store, ptr, v);
+        }
+
+        /// Load 16 f16 values as f32 (via F16C conversion).
+        #[inline(always)]
+        unsafe fn load_f16_as_f32(ptr: *const half::f16) -> std::arch::x86_64::__m512 {
+            $crate::simd_primitive!(avx512, f16, load, ptr)
+        }
+    };
+}

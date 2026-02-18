@@ -797,14 +797,15 @@ macro_rules! define_norm_ops {
     ($isa:ident, $elem:ident) => {
         /// rms_norm: out[i] = (a[i] / rms) * weight[i]
         /// where rms = sqrt(mean(a^2) + eps)
-        /// Pass 1 uses 4 accumulators for ILP. Pass 2 fuses inv_rms * weight.
+        /// Pass 1: 4-accumulator FMA sum-of-squares with prefetch.
+        /// Pass 2: 4-way unrolled fused inv_rms*weight*a with prefetch.
         #[inline(always)]
         pub fn rms_norm(a: &[$elem], weight: &[$elem], out: &mut [$elem], eps: $elem) {
             const LANES: usize = $crate::simd_primitive!($isa, $elem, lanes);
             let len = a.len();
             assert!(weight.len() == len && out.len() == len);
 
-            // Pass 1: sum of squares (4 accumulators for ILP)
+            // Pass 1: sum of squares (4 accumulators for ILP + prefetch)
             let mut i = 0;
             #[allow(unused_unsafe)]
             let mut ss0 = unsafe { $crate::simd_primitive!($isa, $elem, zero) };
@@ -817,6 +818,9 @@ macro_rules! define_norm_ops {
             while i + LANES * 4 <= len {
                 #[allow(unused_unsafe)]
                 unsafe {
+                    // Prefetch a[] 4 chunks ahead for pass 1, weight[] for pass 2
+                    $crate::simd_primitive!($isa, $elem, prefetch, a.as_ptr().add(i + LANES * 8) as *const i8, 0);
+                    $crate::simd_primitive!($isa, $elem, prefetch, weight.as_ptr().add(i) as *const i8, 0);
                     let v0 = $crate::simd_primitive!($isa, $elem, load, a.as_ptr().add(i));
                     let v1 = $crate::simd_primitive!($isa, $elem, load, a.as_ptr().add(i + LANES));
                     let v2 = $crate::simd_primitive!($isa, $elem, load, a.as_ptr().add(i + LANES * 2));
@@ -828,7 +832,6 @@ macro_rules! define_norm_ops {
                 }
                 i += LANES * 4;
             }
-            // Drain remaining full vectors
             while i + LANES <= len {
                 #[allow(unused_unsafe)]
                 unsafe {
@@ -837,7 +840,6 @@ macro_rules! define_norm_ops {
                 }
                 i += LANES;
             }
-            // Merge: (ss0+ss1) + (ss2+ss3)
             #[allow(unused_unsafe)]
             let s01 = unsafe { $crate::simd_primitive!($isa, $elem, add, ss0, ss1) };
             #[allow(unused_unsafe)]
@@ -848,15 +850,43 @@ macro_rules! define_norm_ops {
             let mut ss: f32 = unsafe { $crate::simd_primitive!($isa, $elem, reduce_sum, merged) };
             while i < len { let v = a[i].to_f32(); ss += v * v; i += 1; }
 
-            // rms = 1/sqrt(mean + eps)
             let eps_f = eps.to_f32();
             let inv_rms_f = 1.0f32 / (ss / (len as f32) + eps_f).sqrt();
             let inv_rms = <$elem as Element>::from_f32(inv_rms_f);
 
-            // Pass 2: normalize and scale (fuse inv_rms * weight)
+            // Pass 2: normalize and scale — 4-way unrolled fused (inv_rms * weight) * a
             i = 0;
             #[allow(unused_unsafe)]
             let v_inv = unsafe { $crate::simd_primitive!($isa, $elem, splat, inv_rms) };
+            while i + LANES * 4 <= len {
+                #[allow(unused_unsafe)]
+                unsafe {
+                    // Prefetch a[], weight[], out[] 4 chunks ahead
+                    $crate::simd_primitive!($isa, $elem, prefetch, a.as_ptr().add(i + LANES * 8) as *const i8, 0);
+                    $crate::simd_primitive!($isa, $elem, prefetch, weight.as_ptr().add(i + LANES * 8) as *const i8, 0);
+                    let vw0 = $crate::simd_primitive!($isa, $elem, load, weight.as_ptr().add(i));
+                    let vw1 = $crate::simd_primitive!($isa, $elem, load, weight.as_ptr().add(i + LANES));
+                    let vw2 = $crate::simd_primitive!($isa, $elem, load, weight.as_ptr().add(i + LANES * 2));
+                    let vw3 = $crate::simd_primitive!($isa, $elem, load, weight.as_ptr().add(i + LANES * 3));
+                    let vs0 = $crate::simd_primitive!($isa, $elem, mul, v_inv, vw0);
+                    let vs1 = $crate::simd_primitive!($isa, $elem, mul, v_inv, vw1);
+                    let vs2 = $crate::simd_primitive!($isa, $elem, mul, v_inv, vw2);
+                    let vs3 = $crate::simd_primitive!($isa, $elem, mul, v_inv, vw3);
+                    let va0 = $crate::simd_primitive!($isa, $elem, load, a.as_ptr().add(i));
+                    let va1 = $crate::simd_primitive!($isa, $elem, load, a.as_ptr().add(i + LANES));
+                    let va2 = $crate::simd_primitive!($isa, $elem, load, a.as_ptr().add(i + LANES * 2));
+                    let va3 = $crate::simd_primitive!($isa, $elem, load, a.as_ptr().add(i + LANES * 3));
+                    let r0 = $crate::simd_primitive!($isa, $elem, mul, va0, vs0);
+                    let r1 = $crate::simd_primitive!($isa, $elem, mul, va1, vs1);
+                    let r2 = $crate::simd_primitive!($isa, $elem, mul, va2, vs2);
+                    let r3 = $crate::simd_primitive!($isa, $elem, mul, va3, vs3);
+                    $crate::simd_primitive!($isa, $elem, store, out.as_mut_ptr().add(i), r0);
+                    $crate::simd_primitive!($isa, $elem, store, out.as_mut_ptr().add(i + LANES), r1);
+                    $crate::simd_primitive!($isa, $elem, store, out.as_mut_ptr().add(i + LANES * 2), r2);
+                    $crate::simd_primitive!($isa, $elem, store, out.as_mut_ptr().add(i + LANES * 3), r3);
+                }
+                i += LANES * 4;
+            }
             while i + LANES <= len {
                 #[allow(unused_unsafe)]
                 unsafe {
@@ -875,8 +905,8 @@ macro_rules! define_norm_ops {
         }
 
         /// layer_norm: out[i] = ((a[i] - mean) / sqrt(var + eps)) * weight[i] + bias[i]
-        /// 2-pass: fused sum + sum_of_squares, then normalize+scale+bias.
-        /// Uses var = E[x²] - E[x]² formula (f32 accumulation for numerical stability).
+        /// 2-pass: fused sum + sum_of_squares (4-accumulator ILP), then normalize+scale+bias (4-way unrolled).
+        /// Uses var = E[x^2] - E[x]^2 formula (f32 accumulation for numerical stability).
         #[inline(always)]
         pub fn layer_norm(a: &[$elem], weight: &[$elem], bias: &[$elem], out: &mut [$elem], eps: $elem) {
             const LANES: usize = $crate::simd_primitive!($isa, $elem, lanes);
@@ -884,25 +914,71 @@ macro_rules! define_norm_ops {
             assert!(weight.len() == len && bias.len() == len && out.len() == len);
             let n = len as f32;
 
-            // Pass 1 (fused): sum and sum-of-squares in a single traversal
+            // Pass 1 (fused): sum and sum-of-squares — 4 accumulators each for ILP
             let mut i = 0;
             #[allow(unused_unsafe)]
-            let mut sum_acc = unsafe { $crate::simd_primitive!($isa, $elem, zero) };
+            let mut sum0 = unsafe { $crate::simd_primitive!($isa, $elem, zero) };
             #[allow(unused_unsafe)]
-            let mut sq_acc = unsafe { $crate::simd_primitive!($isa, $elem, zero) };
+            let mut sum1 = unsafe { $crate::simd_primitive!($isa, $elem, zero) };
+            #[allow(unused_unsafe)]
+            let mut sum2 = unsafe { $crate::simd_primitive!($isa, $elem, zero) };
+            #[allow(unused_unsafe)]
+            let mut sum3 = unsafe { $crate::simd_primitive!($isa, $elem, zero) };
+            #[allow(unused_unsafe)]
+            let mut sq0 = unsafe { $crate::simd_primitive!($isa, $elem, zero) };
+            #[allow(unused_unsafe)]
+            let mut sq1 = unsafe { $crate::simd_primitive!($isa, $elem, zero) };
+            #[allow(unused_unsafe)]
+            let mut sq2 = unsafe { $crate::simd_primitive!($isa, $elem, zero) };
+            #[allow(unused_unsafe)]
+            let mut sq3 = unsafe { $crate::simd_primitive!($isa, $elem, zero) };
+            while i + LANES * 4 <= len {
+                #[allow(unused_unsafe)]
+                unsafe {
+                    $crate::simd_primitive!($isa, $elem, prefetch, a.as_ptr().add(i + LANES * 8) as *const i8, 0);
+                    $crate::simd_primitive!($isa, $elem, prefetch, weight.as_ptr().add(i) as *const i8, 0);
+                    let v0 = $crate::simd_primitive!($isa, $elem, load, a.as_ptr().add(i));
+                    let v1 = $crate::simd_primitive!($isa, $elem, load, a.as_ptr().add(i + LANES));
+                    let v2 = $crate::simd_primitive!($isa, $elem, load, a.as_ptr().add(i + LANES * 2));
+                    let v3 = $crate::simd_primitive!($isa, $elem, load, a.as_ptr().add(i + LANES * 3));
+                    sum0 = $crate::simd_primitive!($isa, $elem, add, sum0, v0);
+                    sum1 = $crate::simd_primitive!($isa, $elem, add, sum1, v1);
+                    sum2 = $crate::simd_primitive!($isa, $elem, add, sum2, v2);
+                    sum3 = $crate::simd_primitive!($isa, $elem, add, sum3, v3);
+                    sq0 = $crate::simd_primitive!($isa, $elem, fma, v0, v0, sq0);
+                    sq1 = $crate::simd_primitive!($isa, $elem, fma, v1, v1, sq1);
+                    sq2 = $crate::simd_primitive!($isa, $elem, fma, v2, v2, sq2);
+                    sq3 = $crate::simd_primitive!($isa, $elem, fma, v3, v3, sq3);
+                }
+                i += LANES * 4;
+            }
             while i + LANES <= len {
                 #[allow(unused_unsafe)]
                 unsafe {
                     let va = $crate::simd_primitive!($isa, $elem, load, a.as_ptr().add(i));
-                    sum_acc = $crate::simd_primitive!($isa, $elem, add, sum_acc, va);
-                    sq_acc = $crate::simd_primitive!($isa, $elem, fma, va, va, sq_acc);
+                    sum0 = $crate::simd_primitive!($isa, $elem, add, sum0, va);
+                    sq0 = $crate::simd_primitive!($isa, $elem, fma, va, va, sq0);
                 }
                 i += LANES;
             }
+            // Merge sum accumulators
             #[allow(unused_unsafe)]
-            let mut sum_val: f32 = unsafe { $crate::simd_primitive!($isa, $elem, reduce_sum, sum_acc) };
+            let sum_01 = unsafe { $crate::simd_primitive!($isa, $elem, add, sum0, sum1) };
             #[allow(unused_unsafe)]
-            let mut sq_val: f32 = unsafe { $crate::simd_primitive!($isa, $elem, reduce_sum, sq_acc) };
+            let sum_23 = unsafe { $crate::simd_primitive!($isa, $elem, add, sum2, sum3) };
+            #[allow(unused_unsafe)]
+            let sum_merged = unsafe { $crate::simd_primitive!($isa, $elem, add, sum_01, sum_23) };
+            #[allow(unused_unsafe)]
+            let mut sum_val: f32 = unsafe { $crate::simd_primitive!($isa, $elem, reduce_sum, sum_merged) };
+            // Merge sq accumulators
+            #[allow(unused_unsafe)]
+            let sq_01 = unsafe { $crate::simd_primitive!($isa, $elem, add, sq0, sq1) };
+            #[allow(unused_unsafe)]
+            let sq_23 = unsafe { $crate::simd_primitive!($isa, $elem, add, sq2, sq3) };
+            #[allow(unused_unsafe)]
+            let sq_merged = unsafe { $crate::simd_primitive!($isa, $elem, add, sq_01, sq_23) };
+            #[allow(unused_unsafe)]
+            let mut sq_val: f32 = unsafe { $crate::simd_primitive!($isa, $elem, reduce_sum, sq_merged) };
             while i < len {
                 let v = a[i].to_f32();
                 sum_val += v;
@@ -911,19 +987,55 @@ macro_rules! define_norm_ops {
             }
 
             let mean_f = sum_val / n;
-            // var = E[x²] - E[x]² = (sum_sq / n) - mean²
             let var_f = sq_val / n - mean_f * mean_f;
             let eps_f = eps.to_f32();
             let inv_std_f = 1.0f32 / (var_f + eps_f).sqrt();
             let mean = <$elem as Element>::from_f32(mean_f);
             let inv_std = <$elem as Element>::from_f32(inv_std_f);
 
-            // Pass 2: normalize, scale, bias
+            // Pass 2: normalize, scale, bias — 4-way unrolled with prefetch
             i = 0;
             #[allow(unused_unsafe)]
             let vmean = unsafe { $crate::simd_primitive!($isa, $elem, splat, mean) };
             #[allow(unused_unsafe)]
             let vinv = unsafe { $crate::simd_primitive!($isa, $elem, splat, inv_std) };
+            while i + LANES * 4 <= len {
+                #[allow(unused_unsafe)]
+                unsafe {
+                    $crate::simd_primitive!($isa, $elem, prefetch, a.as_ptr().add(i + LANES * 8) as *const i8, 0);
+                    $crate::simd_primitive!($isa, $elem, prefetch, weight.as_ptr().add(i + LANES * 8) as *const i8, 0);
+                    $crate::simd_primitive!($isa, $elem, prefetch, bias.as_ptr().add(i + LANES * 8) as *const i8, 0);
+                    let va0 = $crate::simd_primitive!($isa, $elem, load, a.as_ptr().add(i));
+                    let va1 = $crate::simd_primitive!($isa, $elem, load, a.as_ptr().add(i + LANES));
+                    let va2 = $crate::simd_primitive!($isa, $elem, load, a.as_ptr().add(i + LANES * 2));
+                    let va3 = $crate::simd_primitive!($isa, $elem, load, a.as_ptr().add(i + LANES * 3));
+                    let vw0 = $crate::simd_primitive!($isa, $elem, load, weight.as_ptr().add(i));
+                    let vw1 = $crate::simd_primitive!($isa, $elem, load, weight.as_ptr().add(i + LANES));
+                    let vw2 = $crate::simd_primitive!($isa, $elem, load, weight.as_ptr().add(i + LANES * 2));
+                    let vw3 = $crate::simd_primitive!($isa, $elem, load, weight.as_ptr().add(i + LANES * 3));
+                    let vb0 = $crate::simd_primitive!($isa, $elem, load, bias.as_ptr().add(i));
+                    let vb1 = $crate::simd_primitive!($isa, $elem, load, bias.as_ptr().add(i + LANES));
+                    let vb2 = $crate::simd_primitive!($isa, $elem, load, bias.as_ptr().add(i + LANES * 2));
+                    let vb3 = $crate::simd_primitive!($isa, $elem, load, bias.as_ptr().add(i + LANES * 3));
+                    let d0 = $crate::simd_primitive!($isa, $elem, sub, va0, vmean);
+                    let d1 = $crate::simd_primitive!($isa, $elem, sub, va1, vmean);
+                    let d2 = $crate::simd_primitive!($isa, $elem, sub, va2, vmean);
+                    let d3 = $crate::simd_primitive!($isa, $elem, sub, va3, vmean);
+                    let n0 = $crate::simd_primitive!($isa, $elem, mul, d0, vinv);
+                    let n1 = $crate::simd_primitive!($isa, $elem, mul, d1, vinv);
+                    let n2 = $crate::simd_primitive!($isa, $elem, mul, d2, vinv);
+                    let n3 = $crate::simd_primitive!($isa, $elem, mul, d3, vinv);
+                    let r0 = $crate::simd_primitive!($isa, $elem, fma, n0, vw0, vb0);
+                    let r1 = $crate::simd_primitive!($isa, $elem, fma, n1, vw1, vb1);
+                    let r2 = $crate::simd_primitive!($isa, $elem, fma, n2, vw2, vb2);
+                    let r3 = $crate::simd_primitive!($isa, $elem, fma, n3, vw3, vb3);
+                    $crate::simd_primitive!($isa, $elem, store, out.as_mut_ptr().add(i), r0);
+                    $crate::simd_primitive!($isa, $elem, store, out.as_mut_ptr().add(i + LANES), r1);
+                    $crate::simd_primitive!($isa, $elem, store, out.as_mut_ptr().add(i + LANES * 2), r2);
+                    $crate::simd_primitive!($isa, $elem, store, out.as_mut_ptr().add(i + LANES * 3), r3);
+                }
+                i += LANES * 4;
+            }
             while i + LANES <= len {
                 #[allow(unused_unsafe)]
                 unsafe {
