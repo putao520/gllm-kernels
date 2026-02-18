@@ -901,6 +901,16 @@ impl<E: Element> Kernels<E> for CpuKernels<E> {
     }
 
     fn gemm(&self, a: &[E], b: &[E], c: &mut [E], m: usize, n: usize, k: usize) {
+        // NEON f32: route to hand-written asm microkernel for peak performance
+        #[cfg(target_arch = "aarch64")]
+        if E::ELEM_ID == 0 {
+            // ELEM_ID 0 = f32
+            let a_f32 = unsafe { std::slice::from_raw_parts(a.as_ptr() as *const f32, a.len()) };
+            let b_f32 = unsafe { std::slice::from_raw_parts(b.as_ptr() as *const f32, b.len()) };
+            let c_f32 = unsafe { std::slice::from_raw_parts_mut(c.as_mut_ptr() as *mut f32, c.len()) };
+            crate::asm::aarch64::gemm_asm_f32(a_f32, b_f32, c_f32, m, n, k);
+            return;
+        }
         dispatch_with_dims!(matmul, a, b, c, m, n, k);
     }
 
