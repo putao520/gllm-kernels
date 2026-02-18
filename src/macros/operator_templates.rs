@@ -567,13 +567,11 @@ macro_rules! define_activation_ops {
         }
 
         /// softmax: out = softmax(a) = exp(a - max(a)) / sum(exp(a - max(a)))
-        /// 3-pass algorithm optimized for throughput:
+        /// 3-pass algorithm: exp computed once, stored to out, then scaled.
         ///   Pass 1: pure SIMD max (4-accumulator, zero exp calls)
-        ///   Pass 2: exp(x - max) + accumulate sum (4-accumulator, 1 exp/chunk)
-        ///   Pass 3: multiply by 1/sum
-        /// The 2-pass online algorithm requires 2 exp calls per chunk (correction + shifted).
-        /// This 3-pass trades one extra traversal (cheap: max is ALU-only) for halving exp calls.
-        /// In-place safe (a == out is ok).
+        ///   Pass 2: exp(x - max) → store to out + accumulate sum (4-accumulator)
+        ///   Pass 3: out[i] *= 1/sum (cheap mul, no exp)
+        /// In-place safe (a == out is ok, pass 2 reads a before writing out).
         #[inline(always)]
         pub fn softmax(a: &[$elem], out: &mut [$elem]) {
             const LANES: usize = $crate::simd_primitive!($isa, $elem, lanes);
@@ -603,7 +601,6 @@ macro_rules! define_activation_ops {
                 }
                 i += LANES * 4;
             }
-            // Drain remaining full vectors
             while i + LANES <= len {
                 #[allow(unused_unsafe)]
                 unsafe {
@@ -612,7 +609,6 @@ macro_rules! define_activation_ops {
                 }
                 i += LANES;
             }
-            // Merge 4 accumulators: (vmax0|vmax1) | (vmax2|vmax3)
             #[allow(unused_unsafe)]
             let m01 = unsafe { $crate::simd_primitive!($isa, $elem, max, vmax0, vmax1) };
             #[allow(unused_unsafe)]
@@ -621,14 +617,14 @@ macro_rules! define_activation_ops {
             let merged_max = unsafe { $crate::simd_primitive!($isa, $elem, max, m01, m23) };
             #[allow(unused_unsafe)]
             let mut max_val: f32 = unsafe { $crate::simd_primitive!($isa, $elem, reduce_max, merged_max) };
-            // Scalar tail for max
             while i < len {
                 let v = a[i].to_f32();
                 if v > max_val { max_val = v; }
                 i += 1;
             }
 
-            // ── Pass 2: exp(x - max) + accumulate sum (4-accumulator for ILP) ──
+            // ── Pass 2: exp(x - max) → store to out + accumulate sum ──
+            // This computes exp ONCE and stores the result, avoiding recomputation in pass 3.
             i = 0;
             #[allow(unused_unsafe)]
             let vmax_splat = unsafe { $crate::simd_primitive!($isa, $elem, splat, <$elem as Element>::from_f32(max_val)) };
@@ -655,6 +651,11 @@ macro_rules! define_activation_ops {
                     let e1 = $crate::simd_primitive!($isa, $elem, exp, s1);
                     let e2 = $crate::simd_primitive!($isa, $elem, exp, s2);
                     let e3 = $crate::simd_primitive!($isa, $elem, exp, s3);
+                    // Store exp results to out (avoids recomputing in pass 3)
+                    $crate::simd_primitive!($isa, $elem, store, out.as_mut_ptr().add(i), e0);
+                    $crate::simd_primitive!($isa, $elem, store, out.as_mut_ptr().add(i + LANES), e1);
+                    $crate::simd_primitive!($isa, $elem, store, out.as_mut_ptr().add(i + LANES * 2), e2);
+                    $crate::simd_primitive!($isa, $elem, store, out.as_mut_ptr().add(i + LANES * 3), e3);
                     vsum0 = $crate::simd_primitive!($isa, $elem, add, vsum0, e0);
                     vsum1 = $crate::simd_primitive!($isa, $elem, add, vsum1, e1);
                     vsum2 = $crate::simd_primitive!($isa, $elem, add, vsum2, e2);
@@ -662,18 +663,17 @@ macro_rules! define_activation_ops {
                 }
                 i += LANES * 4;
             }
-            // Drain remaining full vectors
             while i + LANES <= len {
                 #[allow(unused_unsafe)]
                 unsafe {
                     let va = $crate::simd_primitive!($isa, $elem, load, a.as_ptr().add(i));
                     let shifted = $crate::simd_primitive!($isa, $elem, sub, va, vmax_splat);
                     let e = $crate::simd_primitive!($isa, $elem, exp, shifted);
+                    $crate::simd_primitive!($isa, $elem, store, out.as_mut_ptr().add(i), e);
                     vsum0 = $crate::simd_primitive!($isa, $elem, add, vsum0, e);
                 }
                 i += LANES;
             }
-            // Merge 4 sum accumulators
             #[allow(unused_unsafe)]
             let s01 = unsafe { $crate::simd_primitive!($isa, $elem, add, vsum0, vsum1) };
             #[allow(unused_unsafe)]
@@ -682,31 +682,47 @@ macro_rules! define_activation_ops {
             let merged_sum = unsafe { $crate::simd_primitive!($isa, $elem, add, s01, s23) };
             #[allow(unused_unsafe)]
             let mut sum_exp: f32 = unsafe { $crate::simd_primitive!($isa, $elem, reduce_sum, merged_sum) };
-            // Scalar tail for sum
             while i < len {
-                sum_exp += (a[i].to_f32() - max_val).exp();
+                let e = (a[i].to_f32() - max_val).exp();
+                out[i] = <$elem as Element>::from_f32(e);
+                sum_exp += e;
                 i += 1;
             }
 
-            // ── Pass 3: multiply by 1/sum ──
+            // ── Pass 3: out[i] *= 1/sum (cheap mul only, no exp) ──
             i = 0;
             let inv_sum = 1.0f32 / sum_exp;
             #[allow(unused_unsafe)]
             let vinv = unsafe { $crate::simd_primitive!($isa, $elem, splat, <$elem as Element>::from_f32(inv_sum)) };
+            while i + LANES * 4 <= len {
+                #[allow(unused_unsafe)]
+                unsafe {
+                    let e0 = $crate::simd_primitive!($isa, $elem, load, out.as_ptr().add(i));
+                    let e1 = $crate::simd_primitive!($isa, $elem, load, out.as_ptr().add(i + LANES));
+                    let e2 = $crate::simd_primitive!($isa, $elem, load, out.as_ptr().add(i + LANES * 2));
+                    let e3 = $crate::simd_primitive!($isa, $elem, load, out.as_ptr().add(i + LANES * 3));
+                    let r0 = $crate::simd_primitive!($isa, $elem, mul, e0, vinv);
+                    let r1 = $crate::simd_primitive!($isa, $elem, mul, e1, vinv);
+                    let r2 = $crate::simd_primitive!($isa, $elem, mul, e2, vinv);
+                    let r3 = $crate::simd_primitive!($isa, $elem, mul, e3, vinv);
+                    $crate::simd_primitive!($isa, $elem, store, out.as_mut_ptr().add(i), r0);
+                    $crate::simd_primitive!($isa, $elem, store, out.as_mut_ptr().add(i + LANES), r1);
+                    $crate::simd_primitive!($isa, $elem, store, out.as_mut_ptr().add(i + LANES * 2), r2);
+                    $crate::simd_primitive!($isa, $elem, store, out.as_mut_ptr().add(i + LANES * 3), r3);
+                }
+                i += LANES * 4;
+            }
             while i + LANES <= len {
                 #[allow(unused_unsafe)]
                 unsafe {
-                    let va = $crate::simd_primitive!($isa, $elem, load, a.as_ptr().add(i));
-                    let shifted = $crate::simd_primitive!($isa, $elem, sub, va, vmax_splat);
-                    let e = $crate::simd_primitive!($isa, $elem, exp, shifted);
+                    let e = $crate::simd_primitive!($isa, $elem, load, out.as_ptr().add(i));
                     let res = $crate::simd_primitive!($isa, $elem, mul, e, vinv);
                     $crate::simd_primitive!($isa, $elem, store, out.as_mut_ptr().add(i), res);
                 }
                 i += LANES;
             }
             while i < len {
-                let e = (a[i].to_f32() - max_val).exp();
-                out[i] = <$elem as Element>::from_f32(e * inv_sum);
+                out[i] = <$elem as Element>::from_f32(out[i].to_f32() * inv_sum);
                 i += 1;
             }
         }
@@ -940,33 +956,64 @@ macro_rules! define_position_ops {
         /// For each position, the first half and second half form complex pairs:
         ///   data[i]'        = data[i] * cos[i] - data[i+half] * sin[i]
         ///   data[i+half]'   = data[i] * sin[i] + data[i+half] * cos[i]
+        ///
+        /// Optimized: 2-way unrolled SIMD inner loop, prefetch 2 positions ahead.
         #[inline(always)]
         pub fn rope(data: &mut [$elem], cos: &[$elem], sin: &[$elem], head_dim: usize) {
             const LANES: usize = $crate::simd_primitive!($isa, $elem, lanes);
             let half = head_dim / 2;
             let seq_len = data.len() / head_dim;
-            let elem_size = std::mem::size_of::<$elem>();
-            let elems_per_cl = 64 / elem_size;
+
             for pos in 0..seq_len {
                 let base = pos * head_dim;
                 let cs_base = pos * half;
 
-                // Prefetch next position's cos/sin
-                if pos + 1 < seq_len {
-                    #[allow(unused_variables)]
-                    let next_cs_base = (pos + 1) * half;
-                    let mut cl = 0;
-                    while cl * elems_per_cl < half {
-                        #[allow(unused_unsafe)]
-                        unsafe {
-                            $crate::simd_primitive!($isa, $elem, prefetch, cos.as_ptr().add(next_cs_base + cl * elems_per_cl) as *const i8, 0);
-                            $crate::simd_primitive!($isa, $elem, prefetch, sin.as_ptr().add(next_cs_base + cl * elems_per_cl) as *const i8, 0);
-                        }
-                        cl += 1;
+                // Prefetch 2 positions ahead — gives HW prefetcher time to stream
+                // Only prefetch start of each region; sequential access within region
+                // is handled by HW prefetcher.
+                if pos + 2 < seq_len {
+                    let nb = (pos + 2) * head_dim;
+                    let nc = (pos + 2) * half;
+                    #[allow(unused_unsafe)]
+                    unsafe {
+                        $crate::simd_primitive!($isa, $elem, prefetch, data.as_ptr().add(nb) as *const i8, 0);
+                        $crate::simd_primitive!($isa, $elem, prefetch, data.as_ptr().add(nb + half) as *const i8, 0);
+                        $crate::simd_primitive!($isa, $elem, prefetch, cos.as_ptr().add(nc) as *const i8, 0);
+                        $crate::simd_primitive!($isa, $elem, prefetch, sin.as_ptr().add(nc) as *const i8, 0);
                     }
                 }
+
                 let mut i = 0;
-                // SIMD main loop over the half dimension
+                // 2-way unrolled SIMD main loop: process 2*LANES per iteration
+                while i + LANES * 2 <= half {
+                    #[allow(unused_unsafe)]
+                    unsafe {
+                        let vx0a = $crate::simd_primitive!($isa, $elem, load, data.as_ptr().add(base + i));
+                        let vx0b = $crate::simd_primitive!($isa, $elem, load, data.as_ptr().add(base + i + LANES));
+                        let vx1a = $crate::simd_primitive!($isa, $elem, load, data.as_ptr().add(base + i + half));
+                        let vx1b = $crate::simd_primitive!($isa, $elem, load, data.as_ptr().add(base + i + half + LANES));
+                        let vca  = $crate::simd_primitive!($isa, $elem, load, cos.as_ptr().add(cs_base + i));
+                        let vcb  = $crate::simd_primitive!($isa, $elem, load, cos.as_ptr().add(cs_base + i + LANES));
+                        let vsa  = $crate::simd_primitive!($isa, $elem, load, sin.as_ptr().add(cs_base + i));
+                        let vsb  = $crate::simd_primitive!($isa, $elem, load, sin.as_ptr().add(cs_base + i + LANES));
+                        // x0' = x0 * cos - x1 * sin
+                        let t0a = $crate::simd_primitive!($isa, $elem, mul, vx0a, vca);
+                        let t0b = $crate::simd_primitive!($isa, $elem, mul, vx0b, vcb);
+                        let r0a = $crate::simd_primitive!($isa, $elem, fnmadd, vx1a, vsa, t0a);
+                        let r0b = $crate::simd_primitive!($isa, $elem, fnmadd, vx1b, vsb, t0b);
+                        // x1' = x0 * sin + x1 * cos
+                        let t2a = $crate::simd_primitive!($isa, $elem, mul, vx0a, vsa);
+                        let t2b = $crate::simd_primitive!($isa, $elem, mul, vx0b, vsb);
+                        let r1a = $crate::simd_primitive!($isa, $elem, fma, vx1a, vca, t2a);
+                        let r1b = $crate::simd_primitive!($isa, $elem, fma, vx1b, vcb, t2b);
+                        $crate::simd_primitive!($isa, $elem, store, data.as_mut_ptr().add(base + i), r0a);
+                        $crate::simd_primitive!($isa, $elem, store, data.as_mut_ptr().add(base + i + LANES), r0b);
+                        $crate::simd_primitive!($isa, $elem, store, data.as_mut_ptr().add(base + i + half), r1a);
+                        $crate::simd_primitive!($isa, $elem, store, data.as_mut_ptr().add(base + i + half + LANES), r1b);
+                    }
+                    i += LANES * 2;
+                }
+                // Single-vector remainder
                 while i + LANES <= half {
                     #[allow(unused_unsafe)]
                     unsafe {
@@ -974,10 +1021,8 @@ macro_rules! define_position_ops {
                         let vx1 = $crate::simd_primitive!($isa, $elem, load, data.as_ptr().add(base + i + half));
                         let vc  = $crate::simd_primitive!($isa, $elem, load, cos.as_ptr().add(cs_base + i));
                         let vs  = $crate::simd_primitive!($isa, $elem, load, sin.as_ptr().add(cs_base + i));
-                        // x0' = x0 * cos - x1 * sin  →  fnmadd(x1, sin, x0*cos)
                         let t0 = $crate::simd_primitive!($isa, $elem, mul, vx0, vc);
                         let r0 = $crate::simd_primitive!($isa, $elem, fnmadd, vx1, vs, t0);
-                        // x1' = x0 * sin + x1 * cos  →  fma(x1, cos, x0*sin)
                         let t2 = $crate::simd_primitive!($isa, $elem, mul, vx0, vs);
                         let r1 = $crate::simd_primitive!($isa, $elem, fma, vx1, vc, t2);
                         $crate::simd_primitive!($isa, $elem, store, data.as_mut_ptr().add(base + i), r0);
@@ -1005,29 +1050,53 @@ macro_rules! define_position_ops {
             const LANES: usize = $crate::simd_primitive!($isa, $elem, lanes);
             let half = head_dim / 2;
             let seq_len = data.len() / head_dim;
-            let elem_size = std::mem::size_of::<$elem>();
-            let elems_per_cl = 64 / elem_size;
+
             for pos in 0..seq_len {
                 let base = pos * head_dim;
                 let actual_pos = pos + position;
                 let cs_base = actual_pos * half;
 
-                // Prefetch next position's cos/sin
-                if pos + 1 < seq_len {
-                    #[allow(unused_variables)]
-                    let next_cs_base = (pos + 1 + position) * half;
-                    let mut cl = 0;
-                    while cl * elems_per_cl < half {
-                        #[allow(unused_unsafe)]
-                        unsafe {
-                            $crate::simd_primitive!($isa, $elem, prefetch, cos.as_ptr().add(next_cs_base + cl * elems_per_cl) as *const i8, 0);
-                            $crate::simd_primitive!($isa, $elem, prefetch, sin.as_ptr().add(next_cs_base + cl * elems_per_cl) as *const i8, 0);
-                        }
-                        cl += 1;
+                // Prefetch 2 positions ahead
+                if pos + 2 < seq_len {
+                    let nb = (pos + 2) * head_dim;
+                    let nc = (pos + 2 + position) * half;
+                    #[allow(unused_unsafe)]
+                    unsafe {
+                        $crate::simd_primitive!($isa, $elem, prefetch, data.as_ptr().add(nb) as *const i8, 0);
+                        $crate::simd_primitive!($isa, $elem, prefetch, data.as_ptr().add(nb + half) as *const i8, 0);
+                        $crate::simd_primitive!($isa, $elem, prefetch, cos.as_ptr().add(nc) as *const i8, 0);
+                        $crate::simd_primitive!($isa, $elem, prefetch, sin.as_ptr().add(nc) as *const i8, 0);
                     }
                 }
 
                 let mut i = 0;
+                // 2-way unrolled SIMD main loop
+                while i + LANES * 2 <= half {
+                    #[allow(unused_unsafe)]
+                    unsafe {
+                        let vx0a = $crate::simd_primitive!($isa, $elem, load, data.as_ptr().add(base + i));
+                        let vx0b = $crate::simd_primitive!($isa, $elem, load, data.as_ptr().add(base + i + LANES));
+                        let vx1a = $crate::simd_primitive!($isa, $elem, load, data.as_ptr().add(base + i + half));
+                        let vx1b = $crate::simd_primitive!($isa, $elem, load, data.as_ptr().add(base + i + half + LANES));
+                        let vca  = $crate::simd_primitive!($isa, $elem, load, cos.as_ptr().add(cs_base + i));
+                        let vcb  = $crate::simd_primitive!($isa, $elem, load, cos.as_ptr().add(cs_base + i + LANES));
+                        let vsa  = $crate::simd_primitive!($isa, $elem, load, sin.as_ptr().add(cs_base + i));
+                        let vsb  = $crate::simd_primitive!($isa, $elem, load, sin.as_ptr().add(cs_base + i + LANES));
+                        let t0a = $crate::simd_primitive!($isa, $elem, mul, vx0a, vca);
+                        let t0b = $crate::simd_primitive!($isa, $elem, mul, vx0b, vcb);
+                        let r0a = $crate::simd_primitive!($isa, $elem, fnmadd, vx1a, vsa, t0a);
+                        let r0b = $crate::simd_primitive!($isa, $elem, fnmadd, vx1b, vsb, t0b);
+                        let t2a = $crate::simd_primitive!($isa, $elem, mul, vx0a, vsa);
+                        let t2b = $crate::simd_primitive!($isa, $elem, mul, vx0b, vsb);
+                        let r1a = $crate::simd_primitive!($isa, $elem, fma, vx1a, vca, t2a);
+                        let r1b = $crate::simd_primitive!($isa, $elem, fma, vx1b, vcb, t2b);
+                        $crate::simd_primitive!($isa, $elem, store, data.as_mut_ptr().add(base + i), r0a);
+                        $crate::simd_primitive!($isa, $elem, store, data.as_mut_ptr().add(base + i + LANES), r0b);
+                        $crate::simd_primitive!($isa, $elem, store, data.as_mut_ptr().add(base + i + half), r1a);
+                        $crate::simd_primitive!($isa, $elem, store, data.as_mut_ptr().add(base + i + half + LANES), r1b);
+                    }
+                    i += LANES * 2;
+                }
                 while i + LANES <= half {
                     #[allow(unused_unsafe)]
                     unsafe {
@@ -1052,56 +1121,6 @@ macro_rules! define_position_ops {
                     data[base + i]        = <$elem as Element>::from_f32(x0 * c - x1 * s);
                     data[base + i + half] = <$elem as Element>::from_f32(x0 * s + x1 * c);
                     i += 1;
-                }
-            }
-        }
-
-        /// embedding_lookup: out = embedding_table[token_ids]
-        /// table: [vocab_size, dim], ids: [seq_len], out: [seq_len, dim]
-        /// Software prefetch: while copying row i, prefetch row i+1 to hide DRAM latency.
-        #[inline(always)]
-        pub fn embedding_lookup(table: &[$elem], ids: &[u32], out: &mut [$elem], dim: usize) {
-            const LANES: usize = $crate::simd_primitive!($isa, $elem, lanes);
-            let n = ids.len();
-            // Prefetch distance in cache lines (64 bytes each)
-            let elem_size = std::mem::size_of::<$elem>();
-            let elems_per_cl = 64 / elem_size; // elements per cache line
-
-            for i in 0..n {
-                let id = ids[i] as usize;
-                let src = &table[id * dim..(id + 1) * dim];
-                let dst = &mut out[i * dim..(i + 1) * dim];
-
-                // Prefetch next row while copying current
-                if i + 1 < n {
-                    let next_id = ids[i + 1] as usize;
-                    #[allow(unused_variables)]
-                    let next_base = table.as_ptr() as usize + next_id * dim * elem_size;
-                    // Prefetch multiple cache lines covering the row
-                    let mut cl = 0;
-                    while cl * elems_per_cl < dim {
-                        #[allow(unused_unsafe)]
-                        unsafe {
-                            $crate::simd_primitive!($isa, $elem, prefetch, (next_base + cl * 64) as *const i8, 0);
-                        }
-                        cl += 1;
-                    }
-                }
-
-                // SIMD copy for the current row
-                let mut j = 0;
-                while j + LANES <= dim {
-                    #[allow(unused_unsafe)]
-                    unsafe {
-                        let v = $crate::simd_primitive!($isa, $elem, load, src.as_ptr().add(j));
-                        $crate::simd_primitive!($isa, $elem, store, dst.as_mut_ptr().add(j), v);
-                    }
-                    j += LANES;
-                }
-                // Scalar remainder
-                while j < dim {
-                    dst[j] = src[j];
-                    j += 1;
                 }
             }
         }
@@ -1508,347 +1527,6 @@ macro_rules! define_matmul_op {
                         sum = <$elem as Element>::mul_add(sum, a[m * k_size + k], packed_b[k * n_size + n]);
                     }
                     c[m * n_size + n] = sum + bias[n];
-                }
-            }
-        }
-    };
-}
-///
-/// All internal computation is done in f32 space regardless of $elem type.
-/// For f32: zero-copy via as_f32_slice(). For f16/bf16: one-time conversion.
-/// SIMD operations use simd_primitive!($isa, f32, ...) for the hot loops.
-#[macro_export]
-macro_rules! define_flash_attention_ops {
-    ($isa:ident, $elem:ident) => {
-        /// Dot product of two f32 slices, using simd_primitive! for SIMD ops.
-        /// Double-accumulator for better ILP.
-        #[inline(always)]
-        fn attn_dot_f32(a: *const f32, b: *const f32, len: usize) -> f32 {
-            const LANES: usize = $crate::simd_primitive!($isa, f32, lanes);
-            let mut d = 0usize;
-            #[allow(unused_unsafe)]
-            let mut acc0 = unsafe { $crate::simd_primitive!($isa, f32, zero) };
-            #[allow(unused_unsafe)]
-            let mut acc1 = unsafe { $crate::simd_primitive!($isa, f32, zero) };
-            while d + LANES * 2 <= len {
-                #[allow(unused_unsafe)]
-                unsafe {
-                    let va0 = $crate::simd_primitive!($isa, f32, load, a.add(d));
-                    let vb0 = $crate::simd_primitive!($isa, f32, load, b.add(d));
-                    acc0 = $crate::simd_primitive!($isa, f32, fma, va0, vb0, acc0);
-                    let va1 = $crate::simd_primitive!($isa, f32, load, a.add(d + LANES));
-                    let vb1 = $crate::simd_primitive!($isa, f32, load, b.add(d + LANES));
-                    acc1 = $crate::simd_primitive!($isa, f32, fma, va1, vb1, acc1);
-                }
-                d += LANES * 2;
-            }
-            if d + LANES <= len {
-                #[allow(unused_unsafe)]
-                unsafe {
-                    let va = $crate::simd_primitive!($isa, f32, load, a.add(d));
-                    let vb = $crate::simd_primitive!($isa, f32, load, b.add(d));
-                    acc0 = $crate::simd_primitive!($isa, f32, fma, va, vb, acc0);
-                }
-                d += LANES;
-            }
-            #[allow(unused_unsafe)]
-            let combined = unsafe { $crate::simd_primitive!($isa, f32, add, acc0, acc1) };
-            #[allow(unused_unsafe)]
-            let mut sum: f32 = unsafe { $crate::simd_primitive!($isa, f32, reduce_sum, combined) };
-            while d < len { unsafe { sum += *a.add(d) * *b.add(d); } d += 1; }
-            sum
-        }
-
-        /// FMA accumulate: acc[0..len] += alpha * src[0..len], using simd_primitive!.
-        /// Double-width unrolling for better throughput.
-        #[inline(always)]
-        fn attn_fma_f32(acc: *mut f32, src: *const f32, alpha: f32, len: usize) {
-            const LANES: usize = $crate::simd_primitive!($isa, f32, lanes);
-            #[allow(unused_unsafe)]
-            let va = unsafe { $crate::simd_primitive!($isa, f32, splat, alpha) };
-            let mut d = 0usize;
-            while d + LANES * 2 <= len {
-                #[allow(unused_unsafe)]
-                unsafe {
-                    let cur0 = $crate::simd_primitive!($isa, f32, load, acc.add(d));
-                    let vs0 = $crate::simd_primitive!($isa, f32, load, src.add(d));
-                    let res0 = $crate::simd_primitive!($isa, f32, fma, va, vs0, cur0);
-                    $crate::simd_primitive!($isa, f32, store, acc.add(d), res0);
-                    let cur1 = $crate::simd_primitive!($isa, f32, load, acc.add(d + LANES));
-                    let vs1 = $crate::simd_primitive!($isa, f32, load, src.add(d + LANES));
-                    let res1 = $crate::simd_primitive!($isa, f32, fma, va, vs1, cur1);
-                    $crate::simd_primitive!($isa, f32, store, acc.add(d + LANES), res1);
-                }
-                d += LANES * 2;
-            }
-            if d + LANES <= len {
-                #[allow(unused_unsafe)]
-                unsafe {
-                    let cur = $crate::simd_primitive!($isa, f32, load, acc.add(d));
-                    let vs = $crate::simd_primitive!($isa, f32, load, src.add(d));
-                    let res = $crate::simd_primitive!($isa, f32, fma, va, vs, cur);
-                    $crate::simd_primitive!($isa, f32, store, acc.add(d), res);
-                }
-                d += LANES;
-            }
-            while d < len { unsafe { *acc.add(d) += alpha * *src.add(d); } d += 1; }
-        }
-
-        /// SIMD scale: acc[0..len] *= scale
-        #[inline(always)]
-        fn attn_scale_f32(acc: *mut f32, scale: f32, len: usize) {
-            const LANES: usize = $crate::simd_primitive!($isa, f32, lanes);
-            #[allow(unused_unsafe)]
-            let vs = unsafe { $crate::simd_primitive!($isa, f32, splat, scale) };
-            let mut d = 0usize;
-            while d + LANES <= len {
-                #[allow(unused_unsafe)]
-                unsafe {
-                    let cur = $crate::simd_primitive!($isa, f32, load, acc.add(d));
-                    let res = $crate::simd_primitive!($isa, f32, mul, cur, vs);
-                    $crate::simd_primitive!($isa, f32, store, acc.add(d), res);
-                }
-                d += LANES;
-            }
-            while d < len { unsafe { *acc.add(d) *= scale; } d += 1; }
-        }
-
-        /// Standard multi-head attention with optional causal masking.
-        /// Online softmax: single pass over K/V, no scores buffer.
-        /// Maintains running (max, sum_exp, acc) and rescales on new max.
-        #[inline(always)]
-        pub fn flash_attention(
-            q: &[$elem], k: &[$elem], v: &[$elem], output: &mut [$elem],
-            seq_len: usize, num_heads: usize, head_dim: usize,
-            scale: f32, causal: bool,
-        ) {
-            let mut acc = vec![0.0f32; head_dim];
-
-            // For f32 elements we use zero-copy slices; for f16/bf16 we convert
-            // only the head_dim-sized vector we need into a reusable buffer,
-            // avoiding a full-tensor upfront allocation.
-            let is_f32 = <$elem as Element>::as_f32_slice(q).is_some();
-            let mut q_buf = vec![0.0f32; if is_f32 { 0 } else { head_dim }];
-            let mut k_buf = vec![0.0f32; if is_f32 { 0 } else { head_dim }];
-            let mut v_buf = vec![0.0f32; if is_f32 { 0 } else { head_dim }];
-
-            #[inline(always)]
-            fn convert_slice<E: Element>(src: &[E], buf: &mut [f32], off: usize, len: usize) -> *const f32 {
-                if let Some(f) = E::as_f32_slice(src) {
-                    unsafe { f.as_ptr().add(off) }
-                } else {
-                    for d in 0..len {
-                        unsafe { *buf.get_unchecked_mut(d) = src.get_unchecked(off + d).to_f32(); }
-                    }
-                    buf.as_ptr()
-                }
-            }
-
-            for h in 0..num_heads {
-                for i in 0..seq_len {
-                    let q_off = h * seq_len * head_dim + i * head_dim;
-                    let o_off = q_off;
-                    let max_j = if causal { i + 1 } else { seq_len };
-
-                    let q_ptr = convert_slice(q, &mut q_buf, q_off, head_dim);
-                    let mut running_max = f32::NEG_INFINITY;
-                    let mut running_sum = 0.0f32;
-                    acc[..head_dim].fill(0.0);
-
-                    for j in 0..max_j {
-                        let kv_off = h * seq_len * head_dim + j * head_dim;
-
-                        let k_ptr = convert_slice(k, &mut k_buf, kv_off, head_dim);
-
-                        // Prefetch next K/V source data
-                        if j + 1 < max_j {
-                            let next_off = kv_off + head_dim;
-                            if is_f32 {
-                                if let Some(kf) = <$elem as Element>::as_f32_slice(k) {
-                                    let next_k = unsafe { kf.as_ptr().add(next_off) };
-                                    let next_v = unsafe { <$elem as Element>::as_f32_slice(v).unwrap_unchecked().as_ptr().add(next_off) };
-                                    #[cfg(target_arch = "x86_64")]
-                                    unsafe {
-                                        std::arch::x86_64::_mm_prefetch(next_k as *const i8, std::arch::x86_64::_MM_HINT_T0);
-                                        std::arch::x86_64::_mm_prefetch(next_v as *const i8, std::arch::x86_64::_MM_HINT_T0);
-                                    }
-                                    #[cfg(target_arch = "aarch64")]
-                                    unsafe {
-                                        std::arch::aarch64::_prefetch(next_k as *const i8, 0, 3);
-                                        std::arch::aarch64::_prefetch(next_v as *const i8, 0, 3);
-                                    }
-                                }
-                            } else {
-                                // For f16/bf16, prefetch the source element data
-                                let next_k_src = unsafe { k.as_ptr().add(next_off) };
-                                let next_v_src = unsafe { v.as_ptr().add(next_off) };
-                                #[cfg(target_arch = "x86_64")]
-                                unsafe {
-                                    std::arch::x86_64::_mm_prefetch(next_k_src as *const i8, std::arch::x86_64::_MM_HINT_T0);
-                                    std::arch::x86_64::_mm_prefetch(next_v_src as *const i8, std::arch::x86_64::_MM_HINT_T0);
-                                }
-                                #[cfg(target_arch = "aarch64")]
-                                unsafe {
-                                    std::arch::aarch64::_prefetch(next_k_src as *const i8, 0, 3);
-                                    std::arch::aarch64::_prefetch(next_v_src as *const i8, 0, 3);
-                                }
-                            }
-                        }
-
-                        let s = attn_dot_f32(q_ptr, k_ptr, head_dim) * scale;
-
-                        if s > running_max {
-                            // Rescale existing accumulator and sum
-                            let correction = (running_max - s).exp();
-                            attn_scale_f32(acc.as_mut_ptr(), correction, head_dim);
-                            running_sum *= correction;
-                            running_max = s;
-                        }
-
-                        let w = (s - running_max).exp();
-                        running_sum += w;
-
-                        let v_ptr = convert_slice(v, &mut v_buf, kv_off, head_dim);
-                        attn_fma_f32(acc.as_mut_ptr(), v_ptr, w, head_dim);
-                    }
-
-                    // Normalize: acc /= running_sum
-                    let inv_sum = 1.0 / running_sum;
-                    attn_scale_f32(acc.as_mut_ptr(), inv_sum, head_dim);
-
-                    if let Some(of) = <$elem as Element>::as_f32_slice_mut(output) {
-                        unsafe {
-                            std::ptr::copy_nonoverlapping(acc.as_ptr(), of.as_mut_ptr().add(o_off), head_dim);
-                        }
-                    } else {
-                        for d in 0..head_dim {
-                            unsafe {
-                                *output.get_unchecked_mut(o_off + d) = <$elem as Element>::from_f32(*acc.get_unchecked(d));
-                            }
-                        }
-                    }
-                }
-            }
-        }
-
-        /// Paged KV-cache attention with GQA support.
-        /// Online softmax: single pass, no scores buffer.
-        #[inline(always)]
-        pub fn flash_attention_paged(
-            q: &[$elem], k_cache: &[$elem], v_cache: &[$elem],
-            page_table: &[usize], output: &mut [$elem],
-            seq_len: usize, cache_len: usize,
-            num_heads: usize, num_kv_heads: usize, head_dim: usize,
-            page_size: usize, scale: f32,
-        ) {
-            let heads_per_kv = num_heads / num_kv_heads;
-            let pages_per_kv = (cache_len + page_size - 1) / page_size;
-
-            let mut acc = vec![0.0f32; head_dim];
-
-            let is_f32 = <$elem as Element>::as_f32_slice(q).is_some();
-            let mut q_buf = vec![0.0f32; if is_f32 { 0 } else { head_dim }];
-            let mut k_buf = vec![0.0f32; if is_f32 { 0 } else { head_dim }];
-            let mut v_buf = vec![0.0f32; if is_f32 { 0 } else { head_dim }];
-
-            #[inline(always)]
-            fn convert_slice<E: Element>(src: &[E], buf: &mut [f32], off: usize, len: usize) -> *const f32 {
-                if let Some(f) = E::as_f32_slice(src) {
-                    unsafe { f.as_ptr().add(off) }
-                } else {
-                    for d in 0..len {
-                        unsafe { *buf.get_unchecked_mut(d) = src.get_unchecked(off + d).to_f32(); }
-                    }
-                    buf.as_ptr()
-                }
-            }
-
-            for h in 0..num_heads {
-                let kv_h = h / heads_per_kv;
-                for i in 0..seq_len {
-                    let q_off = h * seq_len * head_dim + i * head_dim;
-                    let o_off = q_off;
-
-                    let q_ptr = convert_slice(q, &mut q_buf, q_off, head_dim);
-                    let mut running_max = f32::NEG_INFINITY;
-                    let mut running_sum = 0.0f32;
-                    acc[..head_dim].fill(0.0);
-
-                    for j in 0..cache_len {
-                        let page_idx = j / page_size;
-                        let page_off = j % page_size;
-                        let phys_page = unsafe { *page_table.get_unchecked(kv_h * pages_per_kv + page_idx) };
-                        let kv_off = phys_page * page_size * head_dim + page_off * head_dim;
-
-                        let k_ptr = convert_slice(k_cache, &mut k_buf, kv_off, head_dim);
-
-                        // Prefetch next K/V source data
-                        if j + 1 < cache_len {
-                            let np_idx = (j + 1) / page_size;
-                            let np_off = (j + 1) % page_size;
-                            let np_phys = unsafe { *page_table.get_unchecked(kv_h * pages_per_kv + np_idx) };
-                            let next_off = np_phys * page_size * head_dim + np_off * head_dim;
-                            if is_f32 {
-                                if let Some(kf) = <$elem as Element>::as_f32_slice(k_cache) {
-                                    let next_k = unsafe { kf.as_ptr().add(next_off) };
-                                    let next_v = unsafe { <$elem as Element>::as_f32_slice(v_cache).unwrap_unchecked().as_ptr().add(next_off) };
-                                    #[cfg(target_arch = "x86_64")]
-                                    unsafe {
-                                        std::arch::x86_64::_mm_prefetch(next_k as *const i8, std::arch::x86_64::_MM_HINT_T0);
-                                        std::arch::x86_64::_mm_prefetch(next_v as *const i8, std::arch::x86_64::_MM_HINT_T0);
-                                    }
-                                    #[cfg(target_arch = "aarch64")]
-                                    unsafe {
-                                        std::arch::aarch64::_prefetch(next_k as *const i8, 0, 3);
-                                        std::arch::aarch64::_prefetch(next_v as *const i8, 0, 3);
-                                    }
-                                }
-                            } else {
-                                let next_k_src = unsafe { k_cache.as_ptr().add(next_off) };
-                                let next_v_src = unsafe { v_cache.as_ptr().add(next_off) };
-                                #[cfg(target_arch = "x86_64")]
-                                unsafe {
-                                    std::arch::x86_64::_mm_prefetch(next_k_src as *const i8, std::arch::x86_64::_MM_HINT_T0);
-                                    std::arch::x86_64::_mm_prefetch(next_v_src as *const i8, std::arch::x86_64::_MM_HINT_T0);
-                                }
-                                #[cfg(target_arch = "aarch64")]
-                                unsafe {
-                                    std::arch::aarch64::_prefetch(next_k_src as *const i8, 0, 3);
-                                    std::arch::aarch64::_prefetch(next_v_src as *const i8, 0, 3);
-                                }
-                            }
-                        }
-
-                        let s = attn_dot_f32(q_ptr, k_ptr, head_dim) * scale;
-
-                        if s > running_max {
-                            let correction = (running_max - s).exp();
-                            attn_scale_f32(acc.as_mut_ptr(), correction, head_dim);
-                            running_sum *= correction;
-                            running_max = s;
-                        }
-
-                        let w = (s - running_max).exp();
-                        running_sum += w;
-
-                        let v_ptr = convert_slice(v_cache, &mut v_buf, kv_off, head_dim);
-                        attn_fma_f32(acc.as_mut_ptr(), v_ptr, w, head_dim);
-                    }
-
-                    let inv_sum = 1.0 / running_sum;
-                    attn_scale_f32(acc.as_mut_ptr(), inv_sum, head_dim);
-
-                    if let Some(of) = <$elem as Element>::as_f32_slice_mut(output) {
-                        unsafe {
-                            std::ptr::copy_nonoverlapping(acc.as_ptr(), of.as_mut_ptr().add(o_off), head_dim);
-                        }
-                    } else {
-                        for d in 0..head_dim {
-                            unsafe {
-                                *output.get_unchecked_mut(o_off + d) = <$elem as Element>::from_f32(*acc.get_unchecked(d));
-                            }
-                        }
-                    }
                 }
             }
         }

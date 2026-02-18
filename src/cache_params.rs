@@ -145,30 +145,35 @@ pub fn l3_size() -> usize {
 
 /// Compute optimal KC given microkernel geometry and element size.
 ///
-/// The B panel (NV*LANES × KC) must stay resident in L1D for the microkernel
-/// inner loop. A panel rows are streamed one at a time, so only the B panel
-/// dominates the L1D footprint.
+/// The microkernel inner loop streams through one TN-wide column of packed B
+/// (TN * KC * elem_bytes). The B strip must stay resident in L1D.
+/// A elements are streamed (broadcast once per TN FMAs) and don't need L1 residency.
+/// C accumulators live in SIMD registers.
 ///
-/// Constraint: NV * LANES * KC * elem_bytes ≤ L1D * 0.80
-/// (20% headroom for A streaming + C accumulators in registers)
-/// KC is rounded down to a multiple of 8 (for unrolled inner loops) and clamped to [64, 512].
+/// Constraint: TN * KC * elem_bytes ≤ L1D
+/// (B strip fills L1D; A streaming + HW prefetch handles the rest)
+/// KC is rounded down to a multiple of 8 (for unrolled inner loops) and clamped to [64, 768].
 pub fn compute_kc(_tm: usize, nv: usize, lanes: usize, elem_bytes: usize) -> usize {
     let (l1d, _, _) = cache_sizes();
     let tn = nv * lanes;
-    let budget = (l1d * 4) / 5; // 80% of L1D for B panel
+    let budget = l1d; // Full L1D for B panel strip (A is streamed, C in registers)
     let kc_raw = budget / (tn * elem_bytes);
-    // Round down to multiple of 8, clamp to [64, 512]
-    let kc = (kc_raw & !7).max(64).min(512);
+    // Round down to multiple of 8, clamp to [64, 768]
+    let kc = (kc_raw & !7).max(64).min(768);
     kc
 }
 
 /// Compute optimal MC given KC, TM, and element size.
 ///
-/// Constraint: MC * KC * elem_bytes ≤ L2 * 0.50
+/// Each thread packs its own A panel (MC × KC) which must fit in L2.
+/// Using 80% of L2 leaves room for B panel strips and C tile writes
+/// that also transit through L2.
+///
+/// Constraint: MC * KC * elem_bytes ≤ L2 * 0.80
 /// MC is rounded down to a multiple of TM and clamped to [TM, 960].
 pub fn compute_mc(kc: usize, tm: usize, elem_bytes: usize) -> usize {
     let (_, l2, _) = cache_sizes();
-    let budget = l2 / 2; // 50% of L2
+    let budget = (l2 * 4) / 5; // 80% of L2 for A panel
     let mc_raw = budget / (kc * elem_bytes);
     // Round down to multiple of TM, clamp
     let mc = (mc_raw / tm * tm).max(tm).min(960);
@@ -177,11 +182,15 @@ pub fn compute_mc(kc: usize, tm: usize, elem_bytes: usize) -> usize {
 
 /// Compute optimal NC given KC, TN, and element size.
 ///
-/// Constraint: NC * KC * elem_bytes ≤ L3 * 0.60
+/// The packed B panel (KC × NC) is shared by all cores via L3.
+/// Under multi-core contention, effective L3 capacity per core drops,
+/// so we use a conservative 40% of L3 to avoid thrashing.
+///
+/// Constraint: NC * KC * elem_bytes ≤ L3 * 0.40
 /// NC is rounded down to a multiple of TN and clamped to [TN, 8192].
 pub fn compute_nc(kc: usize, tn: usize, elem_bytes: usize) -> usize {
     let (_, _, l3) = cache_sizes();
-    let budget = (l3 * 3) / 5; // 60% of L3 for B panel
+    let budget = (l3 * 2) / 5; // 40% of L3 for shared B panel
     let nc_raw = budget / (kc * elem_bytes);
     // Round down to multiple of TN, clamp to [TN, 8192]
     let nc = (nc_raw / tn * tn).max(tn).min(8192);
@@ -297,12 +306,12 @@ mod tests {
         let p = blocking_params(16, 2, 16, 4);
         eprintln!("AVX-512 f32: KC={}, MC={}, NC={}", p.kc, p.mc, p.nc);
         // KC should be reasonable
-        assert!(p.kc >= 64 && p.kc <= 512);
+        assert!(p.kc >= 64 && p.kc <= 768);
         assert!(p.mc >= 16);
         assert!(p.nc >= 32); // at least TN
-        // B panel must fit 80% of L1D: NV*LANES*KC*elem_bytes
+        // B panel strip must fit in L1D: TN*KC*elem_bytes <= L1D
         let b_panel = 32 * p.kc * 4;
-        assert!(b_panel <= l1d_size() * 4 / 5 + 512, "B panel {b_panel} exceeds L1D budget");
+        assert!(b_panel <= l1d_size() + 512, "B panel {b_panel} exceeds L1D");
     }
 
     #[test]
@@ -310,7 +319,7 @@ mod tests {
         // AVX2 f32: TM=6, NV=2, LANES=8, elem=4 bytes
         let p = blocking_params(6, 2, 8, 4);
         eprintln!("AVX2 f32: KC={}, MC={}, NC={}", p.kc, p.mc, p.nc);
-        assert!(p.kc >= 64 && p.kc <= 512);
+        assert!(p.kc >= 64 && p.kc <= 768);
         assert!(p.mc >= 6);
         assert!(p.nc >= 16); // at least TN
     }
@@ -320,7 +329,7 @@ mod tests {
         // AVX-512 bf16: TM=16, NV=2, LANES=16, elem=2 bytes
         let p = blocking_params(16, 2, 16, 2);
         eprintln!("AVX-512 bf16: KC={}, MC={}, NC={}", p.kc, p.mc, p.nc);
-        assert!(p.kc >= 64 && p.kc <= 512);
+        assert!(p.kc >= 64 && p.kc <= 768);
         assert!(p.mc >= 16);
         assert!(p.nc >= 32);
     }

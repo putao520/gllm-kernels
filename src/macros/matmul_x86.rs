@@ -146,17 +146,14 @@ macro_rules! define_matmul_x86 {
             unsafe { pb.set_len(tp); }
 
             let cp = c.as_mut_ptr();
-            let c_align = std::mem::size_of::<$elem>() * $LANES;
-            let c_bytes = m_size * n_size * std::mem::size_of::<$elem>();
-            let c_nt_ok = c_bytes >= 512 * 1024
-                && (cp as usize) % c_align == 0
-                && (n_size * std::mem::size_of::<$elem>()) % c_align == 0;
             let mc_base = _blocking().mc;
+            let nthreads = rayon::current_num_threads().max(1);
             let mc_max = {
-                let nthreads = rayon::current_num_threads().max(1);
                 let blocks_base = (m_size + mc_base - 1) / mc_base;
-                if blocks_base < nthreads && m_size >= TM * 2 {
-                    let mc_small = ((m_size + nthreads - 1) / nthreads) / TM * TM;
+                // Ensure at least 3x oversubscription for load balancing
+                let target_blocks = nthreads * 3;
+                if blocks_base < target_blocks && m_size >= TM * 2 {
+                    let mc_small = ((m_size + target_blocks - 1) / target_blocks) / TM * TM;
                     mc_small.max(TM)
                 } else {
                     mc_base
@@ -176,13 +173,15 @@ macro_rules! define_matmul_x86 {
                 let nc_strips = nc / TN; // always exact since both nc and ns are TN-aligned
                 let cs_local = nc_strips * kc_max * TN;
 
-                    // Pack B for columns [ns, ns+nc) this KC strip
+                    // Pack B for columns [ns, ns+nc) this KC strip — parallel across strips
                     {
-                        let bptr = b.as_ptr();
-                        let pp = pb.as_mut_ptr();
-                        for i in 0..nc_strips {
+                        let bptr_addr = b.as_ptr() as usize;
+                        let pp_addr = pb.as_mut_ptr() as usize;
+                        let pack_strip = |i: usize| {
+                            let bptr = bptr_addr as *const $elem;
+                            let pp = pp_addr as *mut $elem;
                             let col = ns + i * TN;
-                            for k in 0..kc {
+                            unsafe { for k in 0..kc {
                                 let src = bptr.add((ks + k) * n_size + col);
                                 let dst = pp.add(i * kc_max * TN + k * TN);
                                 if k + 4 < kc {
@@ -193,7 +192,13 @@ macro_rules! define_matmul_x86 {
                                 $crate::simd_primitive!($isa, $elem, storeu, dst, v0);
                                 let v1 = $crate::simd_primitive!($isa, $elem, loadu, src.add($LANES));
                                 $crate::simd_primitive!($isa, $elem, storeu, dst.add($LANES), v1);
-                            }
+                            }}
+                        };
+                        if nc_strips >= 4 && nthreads > 1 {
+                            use rayon::prelude::*;
+                            (0..nc_strips).into_par_iter().for_each(|i| pack_strip(i));
+                        } else {
+                            for i in 0..nc_strips { pack_strip(i); }
                         }
                     }
 
@@ -323,13 +328,8 @@ macro_rules! define_matmul_x86 {
                                         )+; pac = pac.add(TM);
                                         bp = bp.add(TN); _k += 1;
                                     }
-                                    if ch == 0 && c_nt_ok {
-                                        $($crate::simd_primitive!($isa, $elem, stream, cp.add((m+$R)*n_size+n), [<c_ $R _0>]);
-                                          $crate::simd_primitive!($isa, $elem, stream, cp.add((m+$R)*n_size+n+$LANES), [<c_ $R _1>]);)+
-                                    } else {
-                                        $($crate::simd_primitive!($isa, $elem, storeu, cp.add((m+$R)*n_size+n), [<c_ $R _0>]);
-                                          $crate::simd_primitive!($isa, $elem, storeu, cp.add((m+$R)*n_size+n+$LANES), [<c_ $R _1>]);)+
-                                    }
+                                    $($crate::simd_primitive!($isa, $elem, storeu, cp.add((m+$R)*n_size+n), [<c_ $R _0>]);
+                                      $crate::simd_primitive!($isa, $elem, storeu, cp.add((m+$R)*n_size+n+$LANES), [<c_ $R _1>]);)+
                                 }}
                                 si += 1;
                             }
@@ -337,17 +337,16 @@ macro_rules! define_matmul_x86 {
                         }
                         WS_A.with(|c| c.set(pa));
                     };
-                    if num_blocks >= 2 {
+                    if num_blocks >= 2 && nthreads > 1 {
                         use rayon::prelude::*;
                         (0..num_blocks).into_par_iter().for_each(|bi| mc_body(bi));
                     } else {
-                        mc_body(0);
+                        for bi in 0..num_blocks { mc_body(bi); }
                     }
                     ns += nc;
                 } // NC inner loop
                 ks += kc_max; ch += 1;
             } // KC outer loop
-            if c_nt_ok { std::arch::x86_64::_mm_sfence(); }
 
             // ── N-remainder: columns [n_full, n_size) — KC-blocked ──
             if n_full < n_size {
@@ -968,11 +967,13 @@ macro_rules! define_matmul_x86 {
             unsafe { pb.set_len(tp); }
 
             let mc_base_b = _blocking().mc;
+            let nthreads = rayon::current_num_threads().max(1);
             let mc_max = {
-                let nthreads = rayon::current_num_threads().max(1);
                 let blocks_base = (m_size + mc_base_b - 1) / mc_base_b;
-                if blocks_base < nthreads && m_size >= TM * 2 {
-                    let mc_small = ((m_size + nthreads - 1) / nthreads) / TM * TM;
+                // Ensure at least 3x oversubscription for load balancing
+                let target_blocks = nthreads * 3;
+                if blocks_base < target_blocks && m_size >= TM * 2 {
+                    let mc_small = ((m_size + target_blocks - 1) / target_blocks) / TM * TM;
                     mc_small.max(TM)
                 } else {
                     mc_base_b
@@ -992,13 +993,15 @@ macro_rules! define_matmul_x86 {
                 let nc_strips = nc / TN;
                 let cs_local = nc_strips * kc_max * TN;
 
-                    // Pack B for columns [ns, ns+nc)
+                    // Pack B for columns [ns, ns+nc) — parallel across strips
                     {
-                        let bptr = b.as_ptr();
-                        let pp = pb.as_mut_ptr();
-                        for i in 0..nc_strips {
+                        let bptr_addr = b.as_ptr() as usize;
+                        let pp_addr = pb.as_mut_ptr() as usize;
+                        let pack_strip = |i: usize| {
+                            let bptr = bptr_addr as *const $elem;
+                            let pp = pp_addr as *mut $elem;
                             let col = ns + i * TN;
-                            for k in 0..kc {
+                            unsafe { for k in 0..kc {
                                 let src = bptr.add((ks + k) * n_size + col);
                                 let dst = pp.add(i * kc_max * TN + k * TN);
                                 if k + 4 < kc {
@@ -1009,7 +1012,13 @@ macro_rules! define_matmul_x86 {
                                 $crate::simd_primitive!($isa, $elem, storeu, dst, v0);
                                 let v1 = $crate::simd_primitive!($isa, $elem, loadu, src.add($LANES));
                                 $crate::simd_primitive!($isa, $elem, storeu, dst.add($LANES), v1);
-                            }
+                            }}
+                        };
+                        if nc_strips >= 4 && nthreads > 1 {
+                            use rayon::prelude::*;
+                            (0..nc_strips).into_par_iter().for_each(|i| pack_strip(i));
+                        } else {
+                            for i in 0..nc_strips { pack_strip(i); }
                         }
                     }
 
@@ -1146,11 +1155,11 @@ macro_rules! define_matmul_x86 {
                         }
                         WS_A2.with(|c| c.set(pa));
                     };
-                    if num_blocks >= 2 {
+                    if num_blocks >= 2 && nthreads > 1 {
                         use rayon::prelude::*;
                         (0..num_blocks).into_par_iter().for_each(|bi| mc_body(bi));
                     } else {
-                        mc_body(0);
+                        for bi in 0..num_blocks { mc_body(bi); }
                     }
                     ns += nc;
                 } // NC inner loop
@@ -1245,16 +1254,14 @@ macro_rules! define_matmul_x86 {
             let n_strips = (n_size + TN - 1) / TN;
             let cs = n_strips * kc_max * TN; // chunk stride for FULL N (packed layout)
             let cp = c.as_mut_ptr();
-            let c_align = std::mem::size_of::<$elem>() * $LANES;
-            let c_nt_ok = (cp as usize) % c_align == 0 && (n_size * std::mem::size_of::<$elem>()) % c_align == 0;
-            let _ = c_nt_ok;
-
             let mc_base_p = _blocking().mc;
+            let nthreads = rayon::current_num_threads().max(1);
             let mc_max = {
-                let nthreads = rayon::current_num_threads().max(1);
                 let blocks_base = (m_size + mc_base_p - 1) / mc_base_p;
-                if blocks_base < nthreads && m_size >= TM * 2 {
-                    let mc_small = ((m_size + nthreads - 1) / nthreads) / TM * TM;
+                // Ensure at least 3x oversubscription for load balancing
+                let target_blocks = nthreads * 3;
+                if blocks_base < target_blocks && m_size >= TM * 2 {
+                    let mc_small = ((m_size + target_blocks - 1) / target_blocks) / TM * TM;
                     mc_small.max(TM)
                 } else {
                     mc_base_p
@@ -1399,13 +1406,8 @@ macro_rules! define_matmul_x86 {
                                         )+; pac = pac.add(TM);
                                         bp = bp.add(TN); _k += 1;
                                     }
-                                    if ch == 0 && c_nt_ok {
-                                        $($crate::simd_primitive!($isa, $elem, stream, cp.add((m+$R)*n_size+n), [<c_ $R _0>]);
-                                          $crate::simd_primitive!($isa, $elem, stream, cp.add((m+$R)*n_size+n+$LANES), [<c_ $R _1>]);)+
-                                    } else {
-                                        $($crate::simd_primitive!($isa, $elem, storeu, cp.add((m+$R)*n_size+n), [<c_ $R _0>]);
-                                          $crate::simd_primitive!($isa, $elem, storeu, cp.add((m+$R)*n_size+n+$LANES), [<c_ $R _1>]);)+
-                                    }
+                                    $($crate::simd_primitive!($isa, $elem, storeu, cp.add((m+$R)*n_size+n), [<c_ $R _0>]);
+                                      $crate::simd_primitive!($isa, $elem, storeu, cp.add((m+$R)*n_size+n+$LANES), [<c_ $R _1>]);)+
                                 }}
                                 si_local += 1;
                             }
@@ -1413,17 +1415,16 @@ macro_rules! define_matmul_x86 {
                         }
                         WS_A3.with(|c| c.set(pa));
                     };
-                    if num_blocks >= 2 {
+                    if num_blocks >= 2 && nthreads > 1 {
                         use rayon::prelude::*;
                         (0..num_blocks).into_par_iter().for_each(|bi| mc_body(bi));
                     } else {
-                        mc_body(0);
+                        for bi in 0..num_blocks { mc_body(bi); }
                     }
                     strip_start += nc_strips;
                 } // NC inner loop
                 ks += kc_max; ch += 1;
             } // KC outer loop
-            if c_nt_ok { std::arch::x86_64::_mm_sfence(); }
 
             // ── N-remainder: columns [n_full, n_size) — read from packed B ──
             let nm = (n_size / TN) * TN;
@@ -1522,11 +1523,13 @@ macro_rules! define_matmul_x86 {
             }
 
             let mc_base_bp = _blocking().mc;
+            let nthreads = rayon::current_num_threads().max(1);
             let mc_max = {
-                let nthreads = rayon::current_num_threads().max(1);
                 let blocks_base = (m_size + mc_base_bp - 1) / mc_base_bp;
-                if blocks_base < nthreads && m_size >= TM * 2 {
-                    let mc_small = ((m_size + nthreads - 1) / nthreads) / TM * TM;
+                // Ensure at least 3x oversubscription for load balancing
+                let target_blocks = nthreads * 3;
+                if blocks_base < target_blocks && m_size >= TM * 2 {
+                    let mc_small = ((m_size + target_blocks - 1) / target_blocks) / TM * TM;
                     mc_small.max(TM)
                 } else {
                     mc_base_bp
@@ -1679,11 +1682,11 @@ macro_rules! define_matmul_x86 {
                         }
                         WS_A4.with(|c| c.set(pa));
                     };
-                    if num_blocks >= 2 {
+                    if num_blocks >= 2 && nthreads > 1 {
                         use rayon::prelude::*;
                         (0..num_blocks).into_par_iter().for_each(|bi| mc_body(bi));
                     } else {
-                        mc_body(0);
+                        for bi in 0..num_blocks { mc_body(bi); }
                     }
                     strip_start += nc_strips;
                 } // NC inner loop

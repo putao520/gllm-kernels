@@ -20,8 +20,6 @@ pub use traits::Activation;
 pub mod cache_params;
 pub mod macros;
 pub mod cpu_kernels;
-pub mod cuda_kernels;
-pub mod cuda_backend;
 pub mod backend;
 pub mod quant;
 pub mod codebooks;

@@ -173,7 +173,7 @@ impl Element for bf16 {
 
 /// Abstract computation backend.
 ///
-/// Connects a specific device backend (CPU, CUDA) with its kernel implementation.
+/// Connects a specific device backend (CPU) with its kernel implementation.
 pub trait Backend: Send + Sync + 'static {
     const NAME: &'static str;
 
@@ -292,18 +292,6 @@ pub trait Kernels<E: Element>: Send + Sync {
     }
 
     // ======================================================================
-    // Embedding lookup
-    // ======================================================================
-
-    fn embedding_lookup(&self, _ids: &[u32], _table: &[E], _output: &mut [E], _vocab_size: usize, _hidden_size: usize) {
-        unimplemented!("embedding_lookup")
-    }
-
-    // ======================================================================
-    // Attention
-    // ======================================================================
-
-    // ======================================================================
     // Dequantization (output fixed f32)
     // ======================================================================
 
@@ -361,130 +349,6 @@ pub trait Kernels<E: Element>: Send + Sync {
     fn dequant_iq4_xs(&self, _block: &[u8], _out: &mut [f32]) { unimplemented!("dequant_iq4_xs") }
 
     // ======================================================================
-    // Fused operators (SPEC §2.3)
-    // ======================================================================
-
-    fn fused_qkv_rope(
-        &self, _input: &[E], _wq: &[E], _wk: &[E], _wv: &[E],
-        _cos: &[E], _sin: &[E],
-        _q_out: &mut [E], _k_out: &mut [E], _v_out: &mut [E],
-        _seq_len: usize, _hidden_size: usize,
-        _num_heads: usize, _num_kv_heads: usize, _head_dim: usize,
-        _rotary_dim: usize, _interleaved: bool,
-    ) {
-        unimplemented!("fused_qkv_rope")
-    }
-
-    fn fused_gate_up_swiglu(
-        &self, _input: &[E], _gate_weight: &[E], _up_weight: &[E], _output: &mut [E],
-        _seq_len: usize, _hidden_size: usize, _ffn_dim: usize,
-    ) {
-        unimplemented!("fused_gate_up_swiglu")
-    }
-
-    fn fused_ffn(
-        &self, _input: &[E],
-        _gate_weight: &[E], _up_weight: &[E], _down_weight: &[E],
-        _residual: &[E], _output: &mut [E],
-        _seq_len: usize, _hidden_size: usize, _ffn_dim: usize,
-    ) {
-        unimplemented!("fused_ffn")
-    }
-
-    fn fused_linear_residual_rmsnorm(
-        &self, _input: &[E], _weight: &[E],
-        _residual: &[E], _norm_weight: &[E], _output: &mut [E],
-        _seq_len: usize, _in_features: usize, _out_features: usize, _eps: f32,
-    ) {
-        unimplemented!("fused_linear_residual_rmsnorm")
-    }
-
-    fn flash_attention(
-        &self, _q: &[E], _k: &[E], _v: &[E], _output: &mut [E],
-        _seq_len: usize, _num_heads: usize, _head_dim: usize,
-        _scale: f32, _causal: bool,
-    ) {
-        unimplemented!("flash_attention")
-    }
-
-    fn flash_attention_paged(
-        &self, _q: &[E], _k_cache: &[E], _v_cache: &[E],
-        _page_table: &[usize], _output: &mut [E],
-        _seq_len: usize, _cache_len: usize,
-        _num_heads: usize, _num_kv_heads: usize, _head_dim: usize,
-        _page_size: usize, _scale: f32,
-    ) {
-        unimplemented!("flash_attention_paged")
-    }
-
-    fn fused_ffn_rmsnorm(
-        &self, _input: &[E],
-        _gate_weight: &[E], _up_weight: &[E], _down_weight: &[E],
-        _residual: &[E], _norm_weight: &[E], _output: &mut [E],
-        _seq_len: usize, _hidden_size: usize, _ffn_dim: usize, _eps: f32,
-    ) {
-        unimplemented!("fused_ffn_rmsnorm")
-    }
-
-    fn fused_linear_bias_residual_rmsnorm(
-        &self, _input: &[E], _weight: &[E], _bias: &[E],
-        _residual: &[E], _norm_weight: &[E], _output: &mut [E],
-        _seq_len: usize, _in_features: usize, _out_features: usize, _eps: f32,
-    ) {
-        unimplemented!("fused_linear_bias_residual_rmsnorm")
-    }
-
-    // ======================================================================
-    // Quantized fused operators (SPEC §2.3)
-    // ======================================================================
-
-    fn fused_qkv_rope_q4(
-        &self, _input: &[E],
-        _wq: &[u8], _wk: &[u8], _wv: &[u8],
-        _scales_q: &[f32], _scales_k: &[f32], _scales_v: &[f32],
-        _cos: &[E], _sin: &[E],
-        _q_out: &mut [E], _k_out: &mut [E], _v_out: &mut [E],
-        _seq_len: usize, _hidden_size: usize,
-        _num_heads: usize, _num_kv_heads: usize, _head_dim: usize,
-        _rotary_dim: usize, _interleaved: bool,
-    ) {
-        unimplemented!("fused_qkv_rope_q4")
-    }
-
-    fn fused_ffn_q4(
-        &self, _input: &[E],
-        _gate: &[u8], _up: &[u8], _down: &[u8],
-        _gate_scales: &[f32], _up_scales: &[f32], _down_scales: &[f32],
-        _residual: &[E], _output: &mut [E],
-        _seq_len: usize, _hidden_size: usize, _ffn_dim: usize,
-    ) {
-        unimplemented!("fused_ffn_q4")
-    }
-
-    fn fused_dequant_gemv(
-        &self, _weight_blocks: &[u8], _input: &[E], _output: &mut [E],
-        _quant_type: QuantType, _m: usize, _n: usize, _k: usize,
-    ) {
-        unimplemented!("fused_dequant_gemv")
-    }
-
-    fn fused_int8_linear_residual_rmsnorm(
-        &self, _input: &[E], _weight: &[i8], _scales: &[f32],
-        _residual: &[E], _norm_weight: &[E], _output: &mut [E],
-        _seq_len: usize, _in_features: usize, _out_features: usize, _eps: f32,
-    ) {
-        unimplemented!("fused_int8_linear_residual_rmsnorm")
-    }
-
-    fn fused_int4_linear_residual_rmsnorm(
-        &self, _input: &[E], _weight: &[u8], _scales: &[f32],
-        _residual: &[E], _norm_weight: &[E], _output: &mut [E],
-        _seq_len: usize, _in_features: usize, _out_features: usize, _eps: f32,
-    ) {
-        unimplemented!("fused_int4_linear_residual_rmsnorm")
-    }
-
-    // ======================================================================
     // Quantized format-specific matmul (SPEC §2.3)
     // ======================================================================
 
@@ -525,40 +389,4 @@ pub trait Kernels<E: Element>: Send + Sync {
         unimplemented!("squeeze_matmul")
     }
 
-    fn fused_iq1_s_matmul(
-        &self, _weight_blocks: &[u8], _input: &[E], _output: &mut [E],
-        _m: usize, _n: usize, _k: usize,
-    ) {
-        unimplemented!("fused_iq1_s_matmul")
-    }
-
-    fn fused_iq2_xxs_matmul(
-        &self, _weight_blocks: &[u8], _input: &[E], _output: &mut [E],
-        _m: usize, _n: usize, _k: usize,
-    ) {
-        unimplemented!("fused_iq2_xxs_matmul")
-    }
-
-    fn fused_awq4_matmul(
-        &self, _weight: &[u8], _zeros: &[u8], _scales: &[f16],
-        _input: &[E], _output: &mut [E],
-        _m: usize, _n: usize, _k: usize,
-    ) {
-        unimplemented!("fused_awq4_matmul")
-    }
-
-    fn fused_gptq4_matmul(
-        &self, _weight: &[u8], _g_idx: &[i32], _scales: &[f16],
-        _input: &[E], _output: &mut [E],
-        _m: usize, _n: usize, _k: usize,
-    ) {
-        unimplemented!("fused_gptq4_matmul")
-    }
-
-    fn fused_squeeze_matmul(
-        &self, _weight_blocks: &[u8], _input: &[E], _output: &mut [E],
-        _m: usize, _n: usize, _k: usize,
-    ) {
-        unimplemented!("fused_squeeze_matmul")
-    }
 }

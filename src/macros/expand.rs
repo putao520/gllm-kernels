@@ -21,7 +21,7 @@ macro_rules! expand_isa_impls {
             crate::define_position_ops!($isa, $elem);
             crate::define_gemv_op!($isa, $elem);
             crate::define_matmul_op!($isa, $elem);
-            crate::define_flash_attention_ops!($isa, $elem);
+
         }
     };
 }

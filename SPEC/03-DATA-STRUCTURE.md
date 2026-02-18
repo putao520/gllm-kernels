@@ -1,54 +1,33 @@
 # gllm-kernels 数据结构与算子架构
 
 > **📌 SSOT**: 本文档定义 gllm-kernels 的核心数据结构、算子清单、分发架构。
+> 本库定位为**纯 CPU 算子库**，目标是逼近硬件理论峰值性能。
 
 ---
 
-## 1. 三层树状分发架构（ARCH-DISPATCH）🚨 铁律
+## 1. 两层零成本分发架构（ARCH-DISPATCH）🚨 铁律
 
 ### 1.1 架构总览
 
 ```
 ┌─────────────────────────────────────────────────────────────────────────────┐
-│  Layer 1: Backend Device (后端设备) - 运行时用户指定                         │
+│  Layer 1: ISA (启动时一次检测)                                               │
 ├─────────────────────────────────────────────────────────────────────────────┤
 │                                                                             │
-│                              Backend                                        │
-│                                 │                                           │
-│              ┌──────────────────┼──────────────────┐                        │
-│              ▼                  ▼                  ▼                        │
-│         CpuBackend         CudaBackend      Metal/ROCm (规划中)             │
-│              │                  │                                           │
-│              ▼                  ▼                                           │
-│   L1.5 CPU架构(编译时)    (直接泛型)                                         │
-│    ├─ x86_64                                                                │
-│    ├─ ARM                                                                   │
-│    └─ AppleSilicon                                                          │
-│              │                                                              │
-│              ▼                                                              │
-│         Layer 2                                                             │
-│                                                                             │
-└─────────────────────────────────────────────────────────────────────────────┘
-                                 │
-                                 ▼
-┌─────────────────────────────────────────────────────────────────────────────┐
-│  Layer 2: ISA (仅 CPU，启动时一次检测)                                       │
-├─────────────────────────────────────────────────────────────────────────────┤
-│                                                                             │
-│                            CpuBackend                                       │
+│                            CpuKernels                                       │
 │                                │                                            │
 │          ┌─────────────┬───────┴───────┬─────────────┐                      │
 │          ▼             ▼               ▼             ▼                      │
 │       Scalar         AVX2          AVX-512         NEON                     │
 │          │             │               │             │                      │
 │          ▼             ▼               ▼             ▼                      │
-│      Layer 3       Layer 3         Layer 3       Layer 3                    │
+│      Layer 2       Layer 2         Layer 2       Layer 2                    │
 │                                                                             │
 └─────────────────────────────────────────────────────────────────────────────┘
-                                 │
-                                 ▼
+                                │
+                                ▼
 ┌─────────────────────────────────────────────────────────────────────────────┐
-│  Layer 3: Precision (精度，编译时泛型单态化)                                  │
+│  Layer 2: Precision (精度，编译时泛型单态化)                                  │
 ├─────────────────────────────────────────────────────────────────────────────┤
 │                                                                             │
 │                         impl<E: Element>                                    │
@@ -65,9 +44,8 @@
 
 | 层级 | 分发时机 | 机制 | 开销 |
 |------|----------|------|------|
-| **Layer 1** | 用户指定 | 编译时泛型 `B: Backend` | 零 |
-| **Layer 2** | 程序启动时一次 | `OnceLock` + ISA 检测 | 启动时一次 |
-| **Layer 3** | 编译时 | Rust 单态化 (monomorphization) | 零 |
+| **Layer 1** | 程序启动时一次 | `OnceLock` + ISA 检测 | 启动时一次 |
+| **Layer 2** | 编译时 | Rust 单态化 (monomorphization) | 零 |
 
 **关键**：ISA 检测只在程序启动时发生一次，之后整棵算子树都是静态确定的。
 
@@ -88,6 +66,8 @@ pub trait Element: Copy + Send + Sync + Default + 'static {
     const ZERO: Self;
     /// 乘法单位元
     const ONE: Self;
+    /// 类型判别：0=f32, 1=f16, 2=bf16
+    const ELEM_ID: u8;
 
     /// 从 f32 转换（解量化后的标准格式）
     fn from_f32(v: f32) -> Self;
@@ -98,10 +78,10 @@ pub trait Element: Copy + Send + Sync + Default + 'static {
     fn mul_add(self, a: Self, b: Self) -> Self;
 
     /// 基础算术
-    fn add(self, other: Self) -> Self;
-    fn sub(self, other: Self) -> Self;
-    fn mul(self, other: Self) -> Self;
-    fn div(self, other: Self) -> Self;
+    fn elem_add(self, other: Self) -> Self;
+    fn elem_sub(self, other: Self) -> Self;
+    fn elem_mul(self, other: Self) -> Self;
+    fn elem_div(self, other: Self) -> Self;
     fn neg(self) -> Self;
 
     /// 比较
@@ -112,34 +92,65 @@ pub trait Element: Copy + Send + Sync + Default + 'static {
     fn sqrt(self) -> Self;
     fn exp(self) -> Self;
     fn recip(self) -> Self;  // 1/x
+    fn abs(self) -> Self;
+    fn tanh(self) -> Self;
+
+    /// 零成本 f32 切片转换（仅 Self=f32 时返回 Some）
+    fn as_f32_slice(s: &[Self]) -> Option<&[f32]>;
+    fn as_f32_slice_mut(s: &mut [Self]) -> Option<&mut [f32]>;
+    fn as_f32_ref(v: &Self) -> Option<&f32>;
 }
 ```
 
-### 2.2 Backend Trait（DATA-BACKEND）
+### 2.2 CpuKernels 结构（DATA-CPU-KERNELS）
 
 ```rust
-/// 后端设备 Trait
-pub trait Backend: Send + Sync + 'static {
-    const NAME: &'static str;
-
-    /// 关联的内核实现类型
-    type Kernels<E: Element>: Kernels<E>;
-
-    /// 初始化后端，返回内核实例
-    fn init<E: Element>() -> Self::Kernels<E>;
+/// CPU 内核（包含 ISA 分发）
+///
+/// 本库唯一的后端实现。不存在 Backend trait 抽象层。
+pub struct CpuKernels<E: Element> {
+    inner: &'static dyn IsaKernels<E>,  // 启动时选择的 ISA 实现
 }
 
-// 后端实现
-pub struct CpuBackend;           // ✅ 实现中 (内部按 target_arch 分发)
-pub struct CudaBackend;          // ✅ 实现中
-pub struct MetalBackend;         // 📋 规划中
-pub struct RocmBackend;          // 📋 规划中
+impl<E: Element> CpuKernels<E> {
+    /// 检测最优 ISA 并初始化（程序启动时调用一次）
+    pub fn new() -> Self {
+        static DETECTED: OnceLock<IsaLevel> = OnceLock::new();
+        let isa = DETECTED.get_or_init(|| {
+            #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+            {
+                if is_x86_feature_detected!("avx512f") { return IsaLevel::Avx512; }
+                if is_x86_feature_detected!("avx2") { return IsaLevel::Avx2; }
+            }
+            #[cfg(target_arch = "aarch64")]
+            { return IsaLevel::Neon; }
+            IsaLevel::Scalar
+        });
+
+        let inner: &'static dyn IsaKernels<E> = match isa {
+            IsaLevel::Avx512 => &Avx512Impl::<E>,
+            IsaLevel::Avx2 => &Avx2Impl::<E>,
+            IsaLevel::Neon => &NeonImpl::<E>,
+            IsaLevel::Scalar => &ScalarImpl::<E>,
+        };
+        Self { inner }
+    }
+}
+
+/// ISA 类型枚举（仅用于 OnceLock 存储）
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum IsaLevel {
+    Scalar,
+    Avx2,
+    Avx512,
+    Neon,
+}
 ```
 
 ### 2.3 Kernels Trait（DATA-KERNELS）🚨 核心
 
 ```rust
-/// 内核算子接口 - 所有后端/ISA 实现此 Trait
+/// 内核算子接口 - 所有 ISA 实现此 Trait
 ///
 /// E 是精度泛型，编译时单态化
 pub trait Kernels<E: Element>: Send + Sync {
@@ -162,7 +173,15 @@ pub trait Kernels<E: Element>: Send + Sync {
     // ========================================================================
     fn gemv(&self, a: &[E], x: &[E], y: &mut [E], m: usize, n: usize);
     fn gemm(&self, a: &[E], b: &[E], c: &mut [E], m: usize, n: usize, k: usize);
-    fn gemm_bias(&self, a: &[E], b: &[E], bias: &[E], c: &mut [E], m: usize, n: usize, k: usize);
+    fn gemm_bias(&self, a: &[E], b: &[E], bias: &[E], c: &mut [E],
+                 m: usize, n: usize, k: usize);
+    fn gemm_bias_act(&self, a: &[E], b: &[E], bias: &[E], c: &mut [E],
+                     m: usize, n: usize, k: usize, act: Activation);
+    fn pack_b(&self, b: &[E], n: usize, k: usize) -> Vec<E>;
+    fn gemm_prepacked(&self, a: &[E], packed_b: &[E], c: &mut [E],
+                      m: usize, n: usize, k: usize);
+    fn gemm_bias_prepacked(&self, a: &[E], packed_b: &[E], bias: &[E],
+                           c: &mut [E], m: usize, n: usize, k: usize);
 
     // ========================================================================
     // 激活函数
@@ -184,13 +203,10 @@ pub trait Kernels<E: Element>: Send + Sync {
     // ========================================================================
     // 位置编码
     // ========================================================================
-    fn rope(&self, qk: &mut [E], cos: &[E], sin: &[E], head_dim: usize, interleaved: bool);
-    fn rope_with_pos(&self, qk: &mut [E], cos: &[E], sin: &[E], head_dim: usize, position: usize, interleaved: bool);
-
-    // ========================================================================
-    // 查表
-    // ========================================================================
-    fn embedding_lookup(&self, ids: &[u32], table: &[E], output: &mut [E], vocab_size: usize, hidden_size: usize);
+    fn rope(&self, qk: &mut [E], cos: &[E], sin: &[E],
+            head_dim: usize, interleaved: bool);
+    fn rope_with_pos(&self, qk: &mut [E], cos: &[E], sin: &[E],
+                     head_dim: usize, position: usize, interleaved: bool);
 
     // ========================================================================
     // 解量化 (输出固定 f32)
@@ -215,8 +231,10 @@ pub trait Kernels<E: Element>: Send + Sync {
     fn dequant_iq4_xs(&self, block: &[u8], out: &mut [f32]);
 
     // 商业格式
-    fn dequant_awq4(&self, packed: &[u8], zeros: &[u8], scales: &[half::f16], out: &mut [f32]);
-    fn dequant_gptq4(&self, packed: &[u8], g_idx: &[i32], scales: &[half::f16], out: &mut [f32]);
+    fn dequant_awq4(&self, packed: &[u8], zeros: &[u8],
+                    scales: &[half::f16], out: &mut [f32]);
+    fn dequant_gptq4(&self, packed: &[u8], g_idx: &[i32],
+                     scales: &[half::f16], out: &mut [f32]);
     fn dequant_squeeze(&self, block: &[u8], out: &mut [f32]);
 
     // ========================================================================
@@ -227,184 +245,24 @@ pub trait Kernels<E: Element>: Send + Sync {
     fn gemv_q2(&self, weight: &[u8], input: &[E], scale: f32, n: usize) -> E;
     fn gemv_q1(&self, weight: &[u8], input: &[E], scale: f32, n: usize) -> E;
 
-    fn gemm_q8(&self, weight: &[i8], input: &[E], output: &mut [E], scales: &[f32], m: usize, n: usize, k: usize);
-    fn gemm_q4(&self, weight: &[u8], input: &[E], output: &mut [E], scales: &[f32], m: usize, n: usize, k: usize);
-
-    // ========================================================================
-    // 融合算子
-    // ========================================================================
-    fn fused_qkv_rope(
-        &self,
-        input: &[E], wq: &[E], wk: &[E], wv: &[E],
-        cos: &[E], sin: &[E],
-        q_out: &mut [E], k_out: &mut [E], v_out: &mut [E],
-        seq_len: usize, hidden_size: usize,
-        num_heads: usize, num_kv_heads: usize, head_dim: usize,
-        rotary_dim: usize, interleaved: bool,
-    );
-
-    fn fused_gate_up_swiglu(
-        &self,
-        input: &[E], gate_weight: &[E], up_weight: &[E], output: &mut [E],
-        seq_len: usize, hidden_size: usize, ffn_dim: usize,
-    );
-
-    fn fused_ffn(
-        &self,
-        input: &[E],
-        gate_weight: &[E], up_weight: &[E], down_weight: &[E],
-        residual: &[E], output: &mut [E],
-        seq_len: usize, hidden_size: usize, ffn_dim: usize,
-    );
-
-    fn fused_linear_residual_rmsnorm(
-        &self,
-        input: &[E], weight: &[E],
-        residual: &[E], norm_weight: &[E], output: &mut [E],
-        seq_len: usize, in_features: usize, out_features: usize, eps: f32,
-    );
-
-    fn flash_attention(
-        &self,
-        q: &[E], k: &[E], v: &[E], output: &mut [E],
-        seq_len: usize, num_heads: usize, head_dim: usize,
-        scale: f32, causal: bool,
-    );
-
-    fn flash_attention_paged(
-        &self,
-        q: &[E], k_cache: &[E], v_cache: &[E],
-        page_table: &[usize], output: &mut [E],
-        seq_len: usize, cache_len: usize,
-        num_heads: usize, num_kv_heads: usize, head_dim: usize,
-        page_size: usize, scale: f32,
-    );
-
-    fn fused_ffn_rmsnorm(
-        &self,
-        input: &[E],
-        gate_weight: &[E], up_weight: &[E], down_weight: &[E],
-        residual: &[E], norm_weight: &[E], output: &mut [E],
-        seq_len: usize, hidden_size: usize, ffn_dim: usize, eps: f32,
-    );
-
-    fn fused_linear_bias_residual_rmsnorm(
-        &self,
-        input: &[E], weight: &[E], bias: &[E],
-        residual: &[E], norm_weight: &[E], output: &mut [E],
-        seq_len: usize, in_features: usize, out_features: usize, eps: f32,
-    );
-
-    // ========================================================================
-    // 量化融合算子
-    // ========================================================================
-    fn fused_qkv_rope_q4(
-        &self,
-        input: &[E],
-        wq: &[u8], wk: &[u8], wv: &[u8],
-        scales_q: &[f32], scales_k: &[f32], scales_v: &[f32],
-        cos: &[E], sin: &[E],
-        q_out: &mut [E], k_out: &mut [E], v_out: &mut [E],
-        seq_len: usize, hidden_size: usize,
-        num_heads: usize, num_kv_heads: usize, head_dim: usize,
-        rotary_dim: usize, interleaved: bool,
-    );
-
-    fn fused_ffn_q4(
-        &self,
-        input: &[E],
-        gate: &[u8], up: &[u8], down: &[u8],
-        gate_scales: &[f32], up_scales: &[f32], down_scales: &[f32],
-        residual: &[E], output: &mut [E],
-        seq_len: usize, hidden_size: usize, ffn_dim: usize,
-    );
-
-    fn fused_dequant_gemv(
-        &self,
-        weight_blocks: &[u8], input: &[E], output: &mut [E],
-        quant_type: QuantType, m: usize, n: usize, k: usize,
-    );
-
-    fn fused_int8_linear_residual_rmsnorm(
-        &self,
-        input: &[E], weight: &[i8], scales: &[f32],
-        residual: &[E], norm_weight: &[E], output: &mut [E],
-        seq_len: usize, in_features: usize, out_features: usize, eps: f32,
-    );
-
-    fn fused_int4_linear_residual_rmsnorm(
-        &self,
-        input: &[E], weight: &[u8], scales: &[f32],
-        residual: &[E], norm_weight: &[E], output: &mut [E],
-        seq_len: usize, in_features: usize, out_features: usize, eps: f32,
-    );
+    fn gemm_q8(&self, weight: &[i8], input: &[E], output: &mut [E],
+               scales: &[f32], m: usize, n: usize, k: usize);
+    fn gemm_q4(&self, weight: &[u8], input: &[E], output: &mut [E],
+               scales: &[f32], m: usize, n: usize, k: usize);
 
     // ========================================================================
     // 量化格式专用 Matmul
     // ========================================================================
-    fn kquant_matmul(
-        &self,
-        weight_blocks: &[u8], input: &[E], output: &mut [E],
-        quant_type: QuantType, m: usize, n: usize, k: usize,
-    );
-
-    fn iq_matmul(
-        &self,
-        weight_blocks: &[u8], input: &[E], output: &mut [E],
-        quant_type: QuantType, m: usize, n: usize, k: usize,
-    );
-
-    fn awq_matmul(
-        &self,
-        weight: &[u8], zeros: &[u8], scales: &[half::f16],
-        input: &[E], output: &mut [E],
-        m: usize, n: usize, k: usize,
-    );
-
-    fn gptq_matmul(
-        &self,
-        weight: &[u8], g_idx: &[i32], scales: &[half::f16],
-        input: &[E], output: &mut [E],
-        m: usize, n: usize, k: usize,
-    );
-
-    fn squeeze_matmul(
-        &self,
-        weight_blocks: &[u8], input: &[E], output: &mut [E],
-        m: usize, n: usize, k: usize,
-    );
-
-    fn fused_iq1_s_matmul(
-        &self,
-        weight_blocks: &[u8], input: &[E], output: &mut [E],
-        m: usize, n: usize, k: usize,
-    );
-
-    fn fused_iq2_xxs_matmul(
-        &self,
-        weight_blocks: &[u8], input: &[E], output: &mut [E],
-        m: usize, n: usize, k: usize,
-    );
-
-    fn fused_awq4_matmul(
-        &self,
-        weight: &[u8], zeros: &[u8], scales: &[half::f16],
-        input: &[E], output: &mut [E],
-        m: usize, n: usize, k: usize,
-    );
-
-    fn fused_gptq4_matmul(
-        &self,
-        weight: &[u8], g_idx: &[i32], scales: &[half::f16],
-        input: &[E], output: &mut [E],
-        m: usize, n: usize, k: usize,
-    );
-
-    fn fused_squeeze_matmul(
-        &self,
-        weight_blocks: &[u8], input: &[E], output: &mut [E],
-        m: usize, n: usize, k: usize,
-    );
+    fn kquant_matmul(&self, weight_blocks: &[u8], input: &[E], output: &mut [E],
+                     quant_type: QuantType, m: usize, n: usize, k: usize);
+    fn iq_matmul(&self, weight_blocks: &[u8], input: &[E], output: &mut [E],
+                 quant_type: QuantType, m: usize, n: usize, k: usize);
+    fn awq_matmul(&self, weight: &[u8], zeros: &[u8], scales: &[half::f16],
+                  input: &[E], output: &mut [E], m: usize, n: usize, k: usize);
+    fn gptq_matmul(&self, weight: &[u8], g_idx: &[i32], scales: &[half::f16],
+                   input: &[E], output: &mut [E], m: usize, n: usize, k: usize);
+    fn squeeze_matmul(&self, weight_blocks: &[u8], input: &[E], output: &mut [E],
+                      m: usize, n: usize, k: usize);
 }
 ```
 
@@ -415,45 +273,6 @@ pub trait Kernels<E: Element>: Send + Sync {
 ### 3.1 ISA 内核结构
 
 ```rust
-/// CPU 内核（包含 ISA 分发）
-pub struct CpuKernels<E: Element> {
-    inner: &'static dyn IsaKernels<E>,  // 启动时选择的 ISA 实现
-}
-
-impl<E: Element> CpuKernels<E> {
-    /// 检测最优 ISA 并初始化（程序启动时调用一次）
-    pub fn detect_best() -> Self {
-        static DETECTED: OnceLock<IsaType> = OnceLock::new();
-        let isa = DETECTED.get_or_init(|| {
-            #[cfg(target_arch = "x86_64")]
-            {
-                if is_avx512_supported() { return IsaType::Avx512; }
-                if is_avx2_supported() { return IsaType::Avx2; }
-            }
-            #[cfg(target_arch = "aarch64")]
-            { return IsaType::Neon; }
-            IsaType::Scalar
-        });
-
-        let inner: &'static dyn IsaKernels<E> = match isa {
-            IsaType::Avx512 => &Avx512Impl::<E>,
-            IsaType::Avx2 => &Avx2Impl::<E>,
-            IsaType::Neon => &NeonImpl::<E>,
-            IsaType::Scalar => &ScalarImpl::<E>,
-        };
-        Self { inner }
-    }
-}
-
-/// ISA 类型枚举（仅用于 OnceLock 存储）
-#[derive(Clone, Copy)]
-enum IsaType {
-    Scalar,
-    Avx2,
-    Avx512,
-    Neon,
-}
-
 /// ISA 级内核 Trait（内部使用，与 Kernels<E> 方法一致）
 trait IsaKernels<E: Element>: Send + Sync + 'static {
     // ... 与 Kernels<E> 相同的方法签名
@@ -488,11 +307,10 @@ impl<E: Element> IsaKernels<E> for NeonImpl<E> { ... }
 | 类别 | 算子 | 数量 |
 |------|------|------|
 | **向量运算** | vec_dot, vec_add, vec_sub, vec_mul, vec_scale, vec_axpy, vec_sum, vec_max, vec_sum_squares | 9 |
-| **矩阵运算** | gemv, gemm, gemm_bias | 3 |
+| **矩阵运算** | gemv, gemm, gemm_bias, gemm_bias_act, pack_b, gemm_prepacked, gemm_bias_prepacked | 7 |
 | **激活函数** | silu, gelu, relu, tanh, swiglu, softmax, exp | 7 |
 | **归一化** | rms_norm, layer_norm | 2 |
 | **位置编码** | rope, rope_with_pos | 2 |
-| **查表** | embedding_lookup | 1 |
 
 ### 4.2 解量化算子
 
@@ -528,46 +346,59 @@ impl<E: Element> IsaKernels<E> for NeonImpl<E> { ... }
 | gemm_q8 | INT8 | E: f32/f16/bf16 |
 | gemm_q4 | INT4 packed | E: f32/f16/bf16 |
 
----
+### 4.4 量化格式专用 Matmul
 
-## 5. 融合算子清单（DATA-FUSED）
-
-### 5.1 Transformer 核心融合
-
-| 融合算子 | 组成 | 收益 |
-|----------|------|------|
-| `fused_qkv_rope` | QKV 投影 + RoPE | 省 3 次 K/V 遍历 |
-| `fused_gate_up_swiglu` | Gate 投影 + Up 投影 + SwiGLU | 省中间激活存储 |
-| `fused_ffn` | Gate/Up + SwiGLU + Down + Residual | FFN 单次遍历 |
-| `fused_ffn_rmsnorm` | FFN + RMSNorm 融合 | 省一次遍历 |
-| `fused_linear_residual_rmsnorm` | Linear + Residual + RMSNorm | 后处理融合 |
-| `fused_linear_bias_residual_rmsnorm` | Linear + Bias + Residual + RMSNorm | 带 bias 版本 |
-| `flash_attention` | QK^T + Softmax + V | O(1) 额外内存 |
-| `flash_attention_paged` | 分页 KV Cache 的 Flash Attention | 支持长序列 |
-
-### 5.2 量化融合
-
-| 融合算子 | 组成 | 收益 |
-|----------|------|------|
-| `fused_qkv_rope_q4` | INT4 QKV 投影 + RoPE | 省解量化中间 f32 |
-| `fused_ffn_q4` | INT4 FFN 全流程 | 省解量化中间 f32 |
-| `fused_int8_linear_residual_rmsnorm` | INT8 Linear + Residual + RMSNorm | INT8 量化版本 |
-| `fused_int4_linear_residual_rmsnorm` | INT4 Linear + Residual + RMSNorm | INT4 量化版本 |
-
-### 5.3 量化格式专用 Matmul
-
-| 融合算子 | 量化格式 | 说明 |
-|----------|----------|------|
+| 算子 | 量化格式 | 说明 |
+|------|----------|------|
 | `kquant_matmul<E>` | Q2_K ~ Q8_K | K-Quant 系列融合解量化+matmul |
 | `iq_matmul<E>` | IQ1_S ~ IQ4_XS | IQ 系列融合解量化+matmul |
 | `awq_matmul<E>` | AWQ4 | AWQ 融合解量化+matmul |
 | `gptq_matmul<E>` | GPTQ4 | GPTQ 融合解量化+matmul |
 | `squeeze_matmul<E>` | SqueezeLLM | SqueezeLLM 融合解量化+matmul |
-| `fused_iq1_s_matmul<E>` | IQ1_S | IQ1_S 专用融合 matmul |
-| `fused_iq2_xxs_matmul<E>` | IQ2_XXS | IQ2_XXS 专用融合 matmul |
-| `fused_awq4_matmul<E>` | AWQ4 | AWQ4 专用融合 matmul |
-| `fused_gptq4_matmul<E>` | GPTQ4 | GPTQ4 专用融合 matmul |
-| `fused_squeeze_matmul<E>` | SqueezeLLM | SqueezeLLM 专用融合 matmul |
+
+---
+
+## 5. 性能目标（PERF-TARGETS）🚨 铁律
+
+### 5.1 性能达标基准
+
+| 算子类别 | 瓶颈类型 | 目标 | 参考基准 |
+|----------|----------|------|----------|
+| **GEMM (compute-bound)** | 计算密集 | ≥ 85% 理论 FLOPS 峰值 | MKL/OpenBLAS 同规模 |
+| **GEMV (memory-bound)** | 内存带宽 | ≥ 90% 带宽峰值 | STREAM benchmark |
+| **激活/归一化 (memory-bound)** | 内存带宽 | ≥ 90% 带宽峰值 | 单次遍历理论值 |
+| **量化 GEMV/GEMM** | 混合瓶颈 | ≥ 85% 瓶颈极限 | llama.cpp 同格式 |
+| **解量化** | 内存带宽 | ≥ 90% 带宽峰值 | 理论解码吞吐 |
+
+### 5.2 性能分析方法论
+
+```
+算子瓶颈判定：
+  Arithmetic Intensity (AI) = FLOPs / Bytes
+
+  AI > Machine Balance → Compute-bound → 目标: FLOPS 利用率
+  AI < Machine Balance → Memory-bound  → 目标: 带宽利用率
+
+  Machine Balance = Peak FLOPS / Peak Bandwidth
+  典型值：
+    AVX2 (Zen4):    ~8 FLOP/Byte
+    AVX-512 (SPR):  ~12 FLOP/Byte
+    NEON (M2):      ~6 FLOP/Byte
+```
+
+### 5.3 GEMM 性能公式
+
+```
+理论峰值 GFLOPS = 频率(GHz) × SIMD宽度 × 2(FMA) × 核心数
+
+效率 = 实测 GFLOPS / 理论峰值 GFLOPS
+
+影响效率的因素：
+  1. 微内核寄存器利用率（累加器占比）
+  2. Cache 分块命中率（L1/L2/L3 三级）
+  3. 尾部处理开销（M/N/K 非 tile 倍数）
+  4. 多线程负载均衡
+```
 
 ---
 
@@ -637,50 +468,30 @@ impl QuantType {
 ## 7. 完整展开树（DATA-TREE）
 
 ```
-Backend (用户指定)
+CpuKernels
 │
-├─► CpuBackend
-│   │
-│   ├─► [L1.5 CPU架构] (编译时 #[cfg] 分支，对用户透明)
-│   │
-│   ├─► x86_64 (#[cfg(target_arch = "x86_64")])
-│   │   └─► ISA (运行时检测)
-│   │       ├─► Scalar   → 兜底（仅限无 SIMD 硬件）
-│   │       ├─► AVX2     → 256-bit SIMD
-│   │       ├─► AVX-512  → 512-bit SIMD
-│   │       └─► VNNI     → INT8 点积加速
-│   │
-│   ├─► ARM (#[cfg(target_arch = "aarch64")])
-│   │   └─► ISA (运行时检测)
-│   │       ├─► NEON     → 128-bit SIMD (基线)
-│   │       ├─► dotprod  → INT8 点积
-│   │       └─► SVE      → 可变宽度 SIMD
-│   │
-│   └─► AppleSilicon (#[cfg(target_os = "macos", target_arch = "aarch64")])
-│       └─► ISA (运行时检测)
-│           ├─► NEON     → 128-bit SIMD (基线)
-│           └─► AMX      → Apple Matrix Extensions
+├─► x86_64 (#[cfg(target_arch = "x86_64")])
+│   └─► ISA (运行时检测)
+│       ├─► Scalar   → 兜底（仅限无 SIMD 硬件）
+│       ├─► AVX2     → 256-bit SIMD
+│       │   └─► 手写汇编微内核: GEMM, 量化 GEMV/GEMM
+│       ├─► AVX-512  → 512-bit SIMD
+│       │   └─► 手写汇编微内核: GEMM, 量化 GEMV/GEMM
+│       └─► VNNI     → INT8 点积加速
+│
+├─► ARM (#[cfg(target_arch = "aarch64")])
+│   └─► ISA (运行时检测)
+│       ├─► NEON     → 128-bit SIMD (基线)
+│       │   └─► 手写汇编微内核: GEMM, 量化 GEMV/GEMM
+│       ├─► dotprod  → INT8 点积
+│       └─► SVE      → 可变宽度 SIMD (规划中)
 │
 │   每个 ISA 实现：
 │   └─► impl<E: Element>
 │       ├── E = f32  (编译时展开)
 │       ├── E = f16  (编译时展开)
 │       └── E = bf16 (编译时展开)
-│       └── [71 个算子]
-│
-├─► CudaBackend
-│   └─► CudaKernels<E>
-│       ├── impl<E: Element> for CudaKernels<E>
-│       │   ├── E = f32
-│       │   ├── E = f16
-│       │   └── E = bf16
-│       └── [CUDA kernel 调用]
-│
-├─► MetalBackend (📋 规划中)
-│   └─► [Apple GPU shader 调用]
-│
-└─► RocmBackend (📋 规划中)
-    └─► [AMD GPU HIP kernel 调用]
+│       └── [45 个算子模板]
 ```
 
 ---
@@ -689,20 +500,19 @@ Backend (用户指定)
 
 ### 8.1 设计原则
 
-**问题**：后端 × ISA × 精度 × 量化格式 的组合爆炸
+**问题**：ISA × 精度 × 量化格式 的组合爆炸
 
 ```
-CPU 后端最坏情况：
-- 架构: x86_64, ARM, AppleSilicon = 3
-- ISA:  Scalar, AVX2, AVX-512, NEON, AMX, ... ≈ 8
+CPU 最坏情况：
+- ISA:  Scalar, AVX2, AVX-512, NEON, VNNI, ... ≈ 6
 - 精度: f32, f16, bf16 = 3
 - 量化: 18 种格式
-- 算子: 71 个
+- 算子: 45 个模板
 
-暴力实现: 8 × 3 × 71 = 1,704+ 函数（不含量化组合）
+暴力实现: 6 × 3 × 45 = 810+ 函数（不含量化组合）
 ```
 
-**解法**：宏驱动代码生成，零性能妥协
+**解法**：宏驱动代码生成 + 手写汇编微内核覆写，零性能妥协
 
 ```
 ┌─────────────────────────────────────────────────────────────────┐
@@ -724,11 +534,17 @@ CPU 后端最坏情况：
                               │
                               ▼
 ┌─────────────────────────────────────────────────────────────────┐
-│  批量展开                                                       │
+│  quant_primitive! / decode_block!                               │
+│  ─────────────────────────────────────────────────────────────  │
+│  量化特化原语（位解包/码本查表/On-the-fly 解量化）              │
+└─────────────────────────────────────────────────────────────────┘
+                              │
+                              ▼
+┌─────────────────────────────────────────────────────────────────┐
+│  批量展开 + 汇编覆写                                            │
 │  ─────────────────────────────────────────────────────────────  │
 │  mod avx2_f32  { define_vec_dot!(avx2, f32);  ... }            │
-│  mod avx2_f16  { define_vec_dot!(avx2, f16);  ... }            │
-│  mod neon_f32  { define_vec_dot!(neon, f32);  ... }            │
+│  mod avx2_f32  { pub fn gemm_ukernel() { global_asm!(...) } }  │
 │  ...                                                            │
 └─────────────────────────────────────────────────────────────────┘
 ```
@@ -773,10 +589,10 @@ CPU 后端最坏情况：
                               └───────────┘                        │
                                                     ┌──────────────┴──────────────┐
                                                     │ 输出是 f32                   │ 输出是 E (激活)
-                                                    │ (纯解量化)                   │ (融合计算)
+                                                    │ (纯解量化)                   │ (量化计算)
                                                     ▼                             ▼
                                               ┌───────────┐               ┌───────────┐
-                                              │  表 B     │               │  表 C/D   │
+                                              │  表 B     │               │  表 C     │
                                               │ 解量化算子 │               │ 量化计算   │
                                               └───────────┘               └───────────┘
 ```
@@ -789,39 +605,34 @@ CPU 后端最坏情况：
 | **表 A** | `&[E]` | `&[E]` | `&mut [E]` | `fn gemv(w: &[E], x: &[E], y: &mut [E], ...)` |
 | **表 B** | `&[u8]` | - | `&mut [f32]` | `fn dequant_q4_k(block: &[u8], out: &mut [f32])` |
 | **表 C** | `&[u8]`/`&[i8]` | `&[E]` | `E` 或 `&mut [E]` | `fn gemv_q4(w: &[u8], x: &[E], scale: f32) -> E` |
-| **表 D** | `&[u8]` | `&[E]` | `&mut [E]` | `fn fused_ffn_q4(x: &[E], gate: &[u8], ..., out: &mut [E])` |
 
 #### 快速判断口诀
 
 ```
-1. 看签名有没有 &[u8] 或 &[i8] 作为权重 → 有则是量化相关（表 B/C/D）
+1. 看签名有没有 &[u8] 或 &[i8] 作为权重 → 有则是量化相关（表 B/C）
 2. 量化相关中，输出是 &mut [f32] 固定 → 表 B（纯解量化）
-3. 量化相关中，输出是 &mut [E] 泛型 → 表 C/D（量化计算/融合）
-4. 表 C vs 表 D：单一操作 vs 多步融合
-5. 其余全是表 A（纯浮点）
+3. 量化相关中，输出是 &mut [E] 泛型 → 表 C（量化计算）
+4. 其余全是表 A（纯浮点）
 ```
 
 ---
 
 ### 8.3 算子分类表（MACRO-OPS-TABLE）
 
-#### 表 A：纯浮点算子（32 个）
+#### 表 A：纯浮点算子（27 个）
 
 > 输入/输出都是激活值（或浮点权重），只需 ISA × 精度 展开
 
 | 类别 | 算子 | 展开维度 | 组合数 |
 |------|------|----------|--------|
-| **向量运算** | vec_dot, vec_add, vec_sub, vec_mul, vec_scale, vec_axpy, vec_sum, vec_max, vec_sum_squares | ISA × 精度 | 9×8×3=216 |
-| **矩阵运算** | gemv, gemm, gemm_bias | ISA × 精度 | 3×8×3=72 |
-| **激活函数** | silu, gelu, relu, tanh, swiglu, softmax, exp | ISA × 精度 | 7×8×3=168 |
-| **归一化** | rms_norm, layer_norm | ISA × 精度 | 2×8×3=48 |
-| **位置编码** | rope, rope_with_pos | ISA × 精度 | 2×8×3=48 |
-| **查表** | embedding_lookup | ISA × 精度 | 1×8×3=24 |
-| **Attention** | flash_attention, flash_attention_paged | ISA × 精度 | 2×8×3=48 |
-| **融合(FP权重)** | fused_qkv_rope, fused_gate_up_swiglu, fused_ffn, fused_ffn_rmsnorm, fused_linear_residual_rmsnorm, fused_linear_bias_residual_rmsnorm | ISA × 精度 | 6×8×3=144 |
-| **小计** | | | **~768** |
+| **向量运算** | vec_dot, vec_add, vec_sub, vec_mul, vec_scale, vec_axpy, vec_sum, vec_max, vec_sum_squares | ISA × 精度 | 9×6×3=162 |
+| **矩阵运算** | gemv, gemm, gemm_bias, gemm_bias_act, pack_b, gemm_prepacked, gemm_bias_prepacked | ISA × 精度 | 7×6×3=126 |
+| **激活函数** | silu, gelu, relu, tanh, swiglu, softmax, exp | ISA × 精度 | 7×6×3=126 |
+| **归一化** | rms_norm, layer_norm | ISA × 精度 | 2×6×3=36 |
+| **位置编码** | rope, rope_with_pos | ISA × 精度 | 2×6×3=36 |
+| **小计** | | | **~486** |
 
-**宏策略**：`define_xxx!(isa, elem)` 模板，一次定义 50 个模板，批量展开
+**宏策略**：`define_xxx!(isa, elem)` 模板，一次定义 27 个模板，批量展开
 
 #### 表 B：解量化算子（18 个）
 
@@ -829,25 +640,23 @@ CPU 后端最坏情况：
 
 | 格式 | 算子 | 展开维度 | 组合数 |
 |------|------|----------|--------|
-| **K-Quant** | dequant_q2_k, dequant_q3_k, dequant_q4_k, dequant_q5_k, dequant_q6_k, dequant_q8_k | ISA | 6×8=48 |
-| **IQ 系列** | dequant_iq1_s, dequant_iq1_m, dequant_iq2_xxs, dequant_iq2_xs, dequant_iq2_s, dequant_iq3_xxs, dequant_iq3_s, dequant_iq4_nl, dequant_iq4_xs | ISA | 9×8=72 |
-| **商业格式** | dequant_awq4, dequant_gptq4, dequant_squeeze | ISA | 3×8=24 |
-| **小计** | | | **~144** |
+| **K-Quant** | dequant_q2_k, dequant_q3_k, dequant_q4_k, dequant_q5_k, dequant_q6_k, dequant_q8_k | ISA | 6×6=36 |
+| **IQ 系列** | dequant_iq1_s, dequant_iq1_m, dequant_iq2_xxs, dequant_iq2_xs, dequant_iq2_s, dequant_iq3_xxs, dequant_iq3_s, dequant_iq4_nl, dequant_iq4_xs | ISA | 9×6=54 |
+| **商业格式** | dequant_awq4, dequant_gptq4, dequant_squeeze | ISA | 3×6=18 |
+| **小计** | | | **~108** |
 
 **宏策略**：`decode_block!(quant_fmt, block, out)` 解码逻辑独立，SIMD 存储共用
 
-#### 表 C：量化 GEMV/GEMM 算子（6 + 10 = 16 个）
+#### 表 C：量化计算算子（11 个）
 
 > 权重是量化格式，输入是浮点，需要 ISA × 输入精度 × 量化格式 展开
 
 | 类别 | 算子 | 展开维度 | 组合数 |
 |------|------|----------|--------|
-| **通用量化 GEMV** | gemv_q8, gemv_q4, gemv_q2, gemv_q1 | ISA × 精度 | 4×8×3=96 |
-| **通用量化 GEMM** | gemm_q8, gemm_q4 | ISA × 精度 | 2×8×3=48 |
-| **格式专用 Matmul** | kquant_matmul, iq_matmul, awq_matmul, gptq_matmul, squeeze_matmul | ISA × 精度 × 格式子集 | ~120 |
-| **IQ 专用融合** | fused_iq1_s_matmul, fused_iq2_xxs_matmul | ISA × 精度 | 2×8×3=48 |
-| **商业格式融合** | fused_awq4_matmul, fused_gptq4_matmul, fused_squeeze_matmul | ISA × 精度 | 3×8×3=72 |
-| **小计** | | | **~384** |
+| **通用量化 GEMV** | gemv_q8, gemv_q4, gemv_q2, gemv_q1 | ISA × 精度 | 4×6×3=72 |
+| **通用量化 GEMM** | gemm_q8, gemm_q4 | ISA × 精度 | 2×6×3=36 |
+| **格式专用 Matmul** | kquant_matmul, iq_matmul, awq_matmul, gptq_matmul, squeeze_matmul | ISA × 精度 × 格式子集 | ~90 |
+| **小计** | | | **~198** |
 
 **宏策略**：
 ```rust
@@ -858,24 +667,11 @@ macro_rules! define_quant_gemv {
 }
 ```
 
-#### 表 D：量化融合算子（7 个）
+### 8.4 量化宏详细设计（MACRO-QUANT-DESIGN）🚨 核心
 
-> 完整的量化推理流程融合
+> 量化算子的宏化是整个架构最复杂的部分，需要处理 **18 种格式 × 6 ISA × 3 精度** 的组合。
 
-| 算子 | 展开维度 | 组合数 |
-|------|----------|--------|
-| fused_qkv_rope_q4 | ISA × 精度 | 8×3=24 |
-| fused_ffn_q4 | ISA × 精度 | 8×3=24 |
-| fused_dequant_gemv | ISA × 精度 × 格式 | 8×3×18=432 |
-| fused_int8_linear_residual_rmsnorm | ISA × 精度 | 8×3=24 |
-| fused_int4_linear_residual_rmsnorm | ISA × 精度 | 8×3=24 |
-| **小计** | | **~528** |
-
-### 8.3 量化宏详细设计（MACRO-QUANT-DESIGN）🚨 核心
-
-> 量化算子的宏化是整个架构最复杂的部分，需要处理 **18 种格式 × 8 ISA × 3 精度** 的组合。
-
-#### 8.3.1 量化原语表（quant_primitive!）
+#### 8.4.1 量化原语表（quant_primitive!）
 
 ```rust
 /// 量化专用原语 - 与 simd_primitive! 配合使用
@@ -966,7 +762,7 @@ macro_rules! quant_primitive {
 }
 ```
 
-#### 8.3.2 块解码宏（decode_block!）
+#### 8.4.2 块解码宏（decode_block!）
 
 ```rust
 /// 块解码宏 - 每种量化格式的解码逻辑
@@ -976,88 +772,26 @@ macro_rules! quant_primitive {
 ///
 /// 关键：解码逻辑与 ISA 无关，只有存储操作用 simd_primitive!
 macro_rules! decode_block {
-    // ========================================================================
-    // K-Quant 系列（GGUF 标准格式）
-    // ========================================================================
-
-    // Q4_K: 256 元素块，144 字节
-    (q4_k, $isa:ident, $block:expr, $out:expr) => {{
-        let d = f16::from_le_bytes([$block[0], $block[1]]).to_f32();
-        let dmin = f16::from_le_bytes([$block[2], $block[3]]).to_f32();
-        let scales = &$block[4..16];
-        let qs = &$block[16..144];
-
-        for j in 0..32 {
-            let scale_idx = j / 4;
-            let sc = (scales[scale_idx] & 0x3F) as f32;
-            let m = (scales[scale_idx + 6] & 0x3F) as f32;
-
-            for i in 0..8 {
-                let idx = j * 8 + i;
-                let q = quant_primitive!(scalar, unpack_int4, qs[idx / 2], idx);
-                $out[idx] = d * sc * (q as f32) - dmin * m;
-            }
-        }
-    }};
-
-    // Q8_K: 256 元素块，292 字节
-    (q8_k, $isa:ident, $block:expr, $out:expr) => {{
-        let d = f32::from_le_bytes([$block[0], $block[1], $block[2], $block[3]]);
-        let qs = &$block[4..260];
-        for i in 0..256 {
-            $out[i] = d * (qs[i] as i8 as f32);
-        }
-    }};
-
+    // K-Quant 系列
+    (q4_k, $isa:ident, $block:expr, $out:expr) => {{ /* 144 bytes */ }};
+    (q8_k, $isa:ident, $block:expr, $out:expr) => {{ /* 292 bytes */ }};
     (q2_k, $isa:ident, $block:expr, $out:expr) => {{ /* 84 bytes */ }};
     (q3_k, $isa:ident, $block:expr, $out:expr) => {{ /* 110 bytes */ }};
     (q5_k, $isa:ident, $block:expr, $out:expr) => {{ /* 176 bytes */ }};
     (q6_k, $isa:ident, $block:expr, $out:expr) => {{ /* 210 bytes */ }};
 
-    // ========================================================================
-    // IQ 系列（超低比特码本量化）
-    // ========================================================================
+    // IQ 系列
+    (iq1_s, $isa:ident, $block:expr, $out:expr) => {{ /* IQ1_S_GRID 查表 */ }};
+    (iq4_nl, $isa:ident, $block:expr, $out:expr) => {{ /* IQ4_NL_GRID 查表 */ }};
+    // ... 其他 IQ 格式
 
-    (iq1_s, $isa:ident, $block:expr, $out:expr) => {{
-        let d = f16::from_le_bytes([$block[0], $block[1]]).to_f32();
-        // 使用 IQ1_S_GRID 查表
-    }};
-
-    (iq4_nl, $isa:ident, $block:expr, $out:expr) => {{
-        let d = f16::from_le_bytes([$block[0], $block[1]]).to_f32();
-        let qs = &$block[2..18];
-        for i in 0..32 {
-            let q = quant_primitive!(scalar, unpack_int4, qs[i / 2], i);
-            $out[i] = d * quant_primitive!(any, iq4_nl_lookup, q);
-        }
-    }};
-
-    // ========================================================================
-    // 商业格式（AWQ / GPTQ）
-    // ========================================================================
-
-    (awq4, $isa:ident, $packed:expr, $zeros:expr, $scales:expr, $out:expr, $group_idx:expr) => {{
-        let scale = $scales[$group_idx].to_f32();
-        let zero = quant_primitive!(scalar, unpack_int4, $zeros[$group_idx / 2], $group_idx) as f32;
-        for i in 0..128 {
-            let idx = $group_idx * 128 + i;
-            let q = quant_primitive!(scalar, unpack_int4, $packed[idx / 2], idx);
-            $out[i] = quant_primitive!(scalar, f32, apply_scale, q, scale, zero);
-        }
-    }};
-
-    (gptq4, $isa:ident, $packed:expr, $g_idx:expr, $scales:expr, $out:expr) => {{
-        for i in 0..128 {
-            let group = $g_idx[i] as usize;
-            let scale = $scales[group].to_f32();
-            let q = quant_primitive!(scalar, unpack_int4, $packed[i / 2], i);
-            $out[i] = (q as f32) * scale;
-        }
-    }};
+    // 商业格式
+    (awq4, $isa:ident, $packed:expr, $zeros:expr, $scales:expr, $out:expr, $group_idx:expr) => {{ /* ... */ }};
+    (gptq4, $isa:ident, $packed:expr, $g_idx:expr, $scales:expr, $out:expr) => {{ /* ... */ }};
 }
 ```
 
-#### 8.3.3 量化 GEMV 模板（define_quant_gemv!）
+#### 8.4.3 量化 GEMV 模板（define_quant_gemv!）
 
 ```rust
 /// 量化 GEMV 模板 - 融合解量化 + 矩阵向量乘法
@@ -1106,7 +840,7 @@ macro_rules! define_quant_gemv {
 }
 ```
 
-#### 8.3.4 量化格式常量表（QUANT-CONST-TABLE）
+#### 8.4.4 量化格式常量表（QUANT-CONST-TABLE）
 
 ```rust
 macro_rules! block_bytes {
@@ -1127,7 +861,7 @@ macro_rules! block_size {
 }
 ```
 
-#### 8.3.5 批量展开量化算子
+#### 8.4.5 批量展开量化算子
 
 ```rust
 macro_rules! expand_all_quant_formats {
@@ -1166,7 +900,7 @@ macro_rules! expand_quant_kernels {
 }
 ```
 
-#### 8.3.6 IQ 码本常量
+#### 8.4.6 IQ 码本常量
 
 ```rust
 // IQ4_NL: 16 个非线性量化值（llama.cpp 标准）
@@ -1180,11 +914,11 @@ pub static IQ1_S_GRID: [f32; 2048] = [ /* ... */ ];
 pub static IQ2_XXS_GRID: [[f32; 8]; 256] = [ /* ... */ ];
 ```
 
-### 8.4 simd_primitive! 完整映射表（MACRO-PRIMITIVE-COMPLETE）🚨 核心维护点
+### 8.5 simd_primitive! 完整映射表（MACRO-PRIMITIVE-COMPLETE）🚨 核心维护点
 
 > **AI CODER 注意**：这是整个宏架构的核心！添加新 ISA 只需扩展此表。
 
-#### 8.4.1 操作清单（每个 ISA × 精度 组合必须实现）
+#### 8.5.1 操作清单（每个 ISA × 精度 组合必须实现）
 
 **A. 计算操作（22 个）**
 
@@ -1193,8 +927,11 @@ pub static IQ2_XXS_GRID: [[f32; 8]; 256] = [ /* ... */ ];
 | `lanes` | `() -> usize` | SIMD 向量宽度（编译时常量） |
 | `zero` | `() -> Vec` | 零向量 |
 | `splat` | `(val) -> Vec` | 标量广播到所有通道 |
-| `load` | `(ptr) -> Vec` | 从内存加载（可能非对齐） |
-| `store` | `(ptr, vec)` | 存储到内存（可能非对齐） |
+| `load` / `loadu` | `(ptr) -> Vec` | 从内存加载（对齐/非对齐） |
+| `store` / `storeu` | `(ptr, vec)` | 存储到内存（对齐/非对齐） |
+| `stream` | `(ptr, vec)` | NT 存储（绕过 Cache） |
+| `maskload` | `(ptr, count) -> Vec` | 带掩码加载（尾部处理） |
+| `maskstore` | `(ptr, count, vec)` | 带掩码存储（尾部处理） |
 | `load_cvt` | `(ptr) -> Vec<f32>` | 加载 f16/bf16 并转换为 f32 |
 | `store_cvt` | `(ptr, vec)` | 将 f32 转换并存储为 f16/bf16 |
 | `add` | `(a, b) -> Vec` | 向量加法 |
@@ -1230,486 +967,6 @@ pub static IQ2_XXS_GRID: [[f32; 8]; 256] = [ /* ... */ ];
 
 **设计意图**：`define_gemm!($isa, $elem)` 内部通过 `simd_primitive!($isa, $elem, optimal_tile_m)` 获取最优分块因子，使得 AVX2 展开为 6×16 微内核、AVX-512 展开为 14×32 微内核——**循环结构本身随 ISA 变化**，而非只替换指令。
 
-#### 8.4.2 完整映射表实现
-
-```rust
-/// simd_primitive! 宏 - ISA 抽象的核心
-///
-/// 设计原则：
-/// 1. 每个 (ISA, 精度, 操作) 三元组映射到一个 intrinsic
-/// 2. 算子模板只使用此宏，对 ISA 完全透明
-/// 3. 添加新 ISA 只需扩展此表，所有算子自动获得支持
-macro_rules! simd_primitive {
-    // ========================================================================
-    // Scalar 兜底（仅限无 SIMD 硬件，禁止在有 SIMD 能力的硬件上使用）
-    // ========================================================================
-
-    // --- f32 架构常量 ---
-    (scalar, f32, num_regs) => { usize::MAX };         // 标量无寄存器压力
-    (scalar, f32, optimal_tile_m) => { 1 };
-    (scalar, f32, optimal_tile_n_vecs) => { 1 };
-    (scalar, f32, prefetch_distance) => { 0 };          // 标量不做预取
-    (scalar, f32, has_native_fp16) => { false };
-    (scalar, f32, has_native_bf16) => { false };
-
-    // --- f32 计算操作 ---
-    (scalar, f32, lanes) => { 1 };
-    (scalar, f32, zero) => { 0.0f32 };
-    (scalar, f32, splat, $v:expr) => { $v };
-    (scalar, f32, load, $p:expr) => { unsafe { *$p } };
-    (scalar, f32, store, $p:expr, $v:expr) => { unsafe { *$p = $v } };
-    (scalar, f32, add, $a:expr, $b:expr) => { $a + $b };
-    (scalar, f32, sub, $a:expr, $b:expr) => { $a - $b };
-    (scalar, f32, mul, $a:expr, $b:expr) => { $a * $b };
-    (scalar, f32, div, $a:expr, $b:expr) => { $a / $b };
-    (scalar, f32, fma, $a:expr, $b:expr, $c:expr) => { $c + $a * $b };
-    (scalar, f32, neg, $a:expr) => { -$a };
-    (scalar, f32, max, $a:expr, $b:expr) => { $a.max($b) };
-    (scalar, f32, min, $a:expr, $b:expr) => { $a.min($b) };
-    (scalar, f32, reduce_sum, $v:expr) => { $v };
-    (scalar, f32, reduce_max, $v:expr) => { $v };
-    (scalar, f32, exp, $a:expr) => { $a.exp() };
-    (scalar, f32, recip, $a:expr) => { 1.0 / $a };
-    (scalar, f32, sqrt, $a:expr) => { $a.sqrt() };
-    (scalar, f32, rsqrt, $a:expr) => { 1.0 / $a.sqrt() };
-    (scalar, f32, prefetch, $p:expr, $dist:expr) => { /* no-op */ };
-
-    // --- f16 (软件转换) ---
-    (scalar, f16, lanes) => { 1 };
-    (scalar, f16, load_cvt, $p:expr) => { unsafe { (*$p).to_f32() } };
-    (scalar, f16, store_cvt, $p:expr, $v:expr) => { unsafe { *$p = f16::from_f32($v) } };
-    // f16 的算术操作转换为 f32 计算
-
-    // --- bf16 (软件转换) ---
-    (scalar, bf16, lanes) => { 1 };
-    (scalar, bf16, load_cvt, $p:expr) => { unsafe { (*$p).to_f32() } };
-    (scalar, bf16, store_cvt, $p:expr, $v:expr) => { unsafe { *$p = bf16::from_f32($v) } };
-
-    // ========================================================================
-    // AVX2 (x86_64, 256-bit, 8×f32)
-    // ========================================================================
-
-    // --- f32 架构常量 ---
-    (avx2, f32, num_regs) => { 16 };              // ymm0-ymm15
-    (avx2, f32, optimal_tile_m) => { 6 };          // 6行 × 2列 = 12累加器, 留4临时
-    (avx2, f32, optimal_tile_n_vecs) => { 2 };     // 2个ymm = 16列
-    (avx2, f32, prefetch_distance) => { 256 };     // 256B = 4 cache lines
-    (avx2, f32, has_native_fp16) => { false };     // F16C仅做转换，非原生运算
-    (avx2, f32, has_native_bf16) => { false };
-
-    // --- f32 计算操作 ---
-    (avx2, f32, lanes) => { 8 };
-    (avx2, f32, zero) => { _mm256_setzero_ps() };
-    (avx2, f32, splat, $v:expr) => { _mm256_set1_ps($v) };
-    (avx2, f32, load, $p:expr) => { _mm256_loadu_ps($p) };
-    (avx2, f32, store, $p:expr, $v:expr) => { _mm256_storeu_ps($p, $v) };
-    (avx2, f32, add, $a:expr, $b:expr) => { _mm256_add_ps($a, $b) };
-    (avx2, f32, sub, $a:expr, $b:expr) => { _mm256_sub_ps($a, $b) };
-    (avx2, f32, mul, $a:expr, $b:expr) => { _mm256_mul_ps($a, $b) };
-    (avx2, f32, div, $a:expr, $b:expr) => { _mm256_div_ps($a, $b) };
-    (avx2, f32, fma, $a:expr, $b:expr, $c:expr) => { _mm256_fmadd_ps($a, $b, $c) };
-    (avx2, f32, neg, $a:expr) => { _mm256_xor_ps($a, _mm256_set1_ps(-0.0)) };
-    (avx2, f32, max, $a:expr, $b:expr) => { _mm256_max_ps($a, $b) };
-    (avx2, f32, min, $a:expr, $b:expr) => { _mm256_min_ps($a, $b) };
-    (avx2, f32, reduce_sum, $v:expr) => { avx2_hsum_ps($v) };  // 辅助函数
-    (avx2, f32, reduce_max, $v:expr) => { avx2_hmax_ps($v) };  // 辅助函数
-    (avx2, f32, exp, $a:expr) => { avx2_exp_ps($a) };  // 多项式近似
-    (avx2, f32, recip, $a:expr) => { _mm256_rcp_ps($a) };
-    (avx2, f32, sqrt, $a:expr) => { _mm256_sqrt_ps($a) };
-    (avx2, f32, rsqrt, $a:expr) => { _mm256_rsqrt_ps($a) };
-    (avx2, f32, prefetch, $p:expr, $dist:expr) => { _mm_prefetch($p as *const i8, _MM_HINT_T0) };
-
-    // --- f16 (F16C 转换) ---
-    (avx2, f16, lanes) => { 8 };  // 一次处理 8 个 f16
-    (avx2, f16, load_cvt, $p:expr) => {
-        _mm256_cvtph_ps(_mm_loadu_si128($p as *const __m128i))
-    };
-    (avx2, f16, store_cvt, $p:expr, $v:expr) => {
-        _mm_storeu_si128($p as *mut __m128i, _mm256_cvtps_ph($v, _MM_FROUND_TO_NEAREST_INT))
-    };
-
-    // --- bf16 (位转换) ---
-    (avx2, bf16, lanes) => { 8 };
-    (avx2, bf16, load_cvt, $p:expr) => {
-        // bf16 左移 16 位变成 f32
-        let raw = _mm_loadu_si128($p as *const __m128i);
-        let expanded = _mm256_cvtepu16_epi32(raw);
-        let shifted = _mm256_slli_epi32(expanded, 16);
-        _mm256_castsi256_ps(shifted)
-    };
-    (avx2, bf16, store_cvt, $p:expr, $v:expr) => {
-        // f32 右移 16 位变成 bf16
-        let as_int = _mm256_castps_si256($v);
-        let shifted = _mm256_srli_epi32(as_int, 16);
-        let packed = _mm256_packus_epi32(shifted, shifted);
-        let lo = _mm256_castsi256_si128(packed);
-        _mm_storeu_si128($p as *mut __m128i, lo)
-    };
-
-    // ========================================================================
-    // AVX-512 (x86_64, 512-bit, 16×f32)
-    // ========================================================================
-
-    // --- f32 架构常量 ---
-    (avx512, f32, num_regs) => { 32 };             // zmm0-zmm31
-    (avx512, f32, optimal_tile_m) => { 14 };       // 14行 × 2列 = 28累加器, 留4临时
-    (avx512, f32, optimal_tile_n_vecs) => { 2 };   // 2个zmm = 32列
-    (avx512, f32, prefetch_distance) => { 512 };   // 512B = 8 cache lines
-    (avx512, f32, has_native_fp16) => { /* runtime: is_x86_feature_detected!("avx512fp16") */ };
-    (avx512, f32, has_native_bf16) => { /* runtime: is_x86_feature_detected!("avx512bf16") */ };
-
-    // --- f32 计算操作 ---
-    (avx512, f32, lanes) => { 16 };
-    (avx512, f32, zero) => { _mm512_setzero_ps() };
-    (avx512, f32, splat, $v:expr) => { _mm512_set1_ps($v) };
-    (avx512, f32, load, $p:expr) => { _mm512_loadu_ps($p) };
-    (avx512, f32, store, $p:expr, $v:expr) => { _mm512_storeu_ps($p, $v) };
-    (avx512, f32, add, $a:expr, $b:expr) => { _mm512_add_ps($a, $b) };
-    (avx512, f32, sub, $a:expr, $b:expr) => { _mm512_sub_ps($a, $b) };
-    (avx512, f32, mul, $a:expr, $b:expr) => { _mm512_mul_ps($a, $b) };
-    (avx512, f32, div, $a:expr, $b:expr) => { _mm512_div_ps($a, $b) };
-    (avx512, f32, fma, $a:expr, $b:expr, $c:expr) => { _mm512_fmadd_ps($a, $b, $c) };
-    (avx512, f32, neg, $a:expr) => { _mm512_xor_ps($a, _mm512_set1_ps(-0.0)) };
-    (avx512, f32, max, $a:expr, $b:expr) => { _mm512_max_ps($a, $b) };
-    (avx512, f32, min, $a:expr, $b:expr) => { _mm512_min_ps($a, $b) };
-    (avx512, f32, reduce_sum, $v:expr) => { _mm512_reduce_add_ps($v) };
-    (avx512, f32, reduce_max, $v:expr) => { _mm512_reduce_max_ps($v) };
-    (avx512, f32, exp, $a:expr) => { avx512_exp_ps($a) };
-    (avx512, f32, recip, $a:expr) => { _mm512_rcp14_ps($a) };
-    (avx512, f32, sqrt, $a:expr) => { _mm512_sqrt_ps($a) };
-    (avx512, f32, rsqrt, $a:expr) => { _mm512_rsqrt14_ps($a) };
-    (avx512, f32, prefetch, $p:expr, $dist:expr) => { _mm_prefetch($p as *const i8, _MM_HINT_T0) };
-
-    // --- f16 (AVX512-FP16 或回退到 F16C) ---
-    (avx512, f16, lanes) => { 16 };
-    (avx512, f16, load_cvt, $p:expr) => {
-        _mm512_cvtph_ps(_mm256_loadu_si256($p as *const __m256i))
-    };
-    (avx512, f16, store_cvt, $p:expr, $v:expr) => {
-        _mm256_storeu_si256($p as *mut __m256i,
-            _mm512_cvtps_ph($v, _MM_FROUND_TO_NEAREST_INT))
-    };
-
-    // ========================================================================
-    // NEON (ARM, 128-bit, 4×f32)
-    // ========================================================================
-
-    // --- f32 架构常量 ---
-    (neon, f32, num_regs) => { 32 };              // v0-v31
-    (neon, f32, optimal_tile_m) => { 8 };          // 8行 × 3列 = 24累加器, 留8临时
-    (neon, f32, optimal_tile_n_vecs) => { 3 };     // 3个vq = 12列
-    (neon, f32, prefetch_distance) => { 128 };     // 128B = 2 cache lines
-    (neon, f32, has_native_fp16) => { true };       // NEON FP16 原生支持
-    (neon, f32, has_native_bf16) => { false };
-    (neon, f32, has_dot_prod) => { /* runtime: is_aarch64_feature_detected!("dotprod") */ };
-
-    // --- f32 计算操作 ---
-    (neon, f32, lanes) => { 4 };
-    (neon, f32, zero) => { vdupq_n_f32(0.0) };
-    (neon, f32, splat, $v:expr) => { vdupq_n_f32($v) };
-    (neon, f32, load, $p:expr) => { vld1q_f32($p) };
-    (neon, f32, store, $p:expr, $v:expr) => { vst1q_f32($p, $v) };
-    (neon, f32, add, $a:expr, $b:expr) => { vaddq_f32($a, $b) };
-    (neon, f32, sub, $a:expr, $b:expr) => { vsubq_f32($a, $b) };
-    (neon, f32, mul, $a:expr, $b:expr) => { vmulq_f32($a, $b) };
-    (neon, f32, div, $a:expr, $b:expr) => { vdivq_f32($a, $b) };
-    (neon, f32, fma, $a:expr, $b:expr, $c:expr) => { vfmaq_f32($c, $a, $b) };
-    (neon, f32, neg, $a:expr) => { vnegq_f32($a) };
-    (neon, f32, max, $a:expr, $b:expr) => { vmaxq_f32($a, $b) };
-    (neon, f32, min, $a:expr, $b:expr) => { vminq_f32($a, $b) };
-    (neon, f32, reduce_sum, $v:expr) => { vaddvq_f32($v) };
-    (neon, f32, reduce_max, $v:expr) => { vmaxvq_f32($v) };
-    (neon, f32, exp, $a:expr) => { neon_exp_f32($a) };  // 多项式近似
-    (neon, f32, recip, $a:expr) => { vrecpeq_f32($a) };
-    (neon, f32, sqrt, $a:expr) => { vsqrtq_f32($a) };
-    (neon, f32, rsqrt, $a:expr) => { vrsqrteq_f32($a) };
-    (neon, f32, prefetch, $p:expr, $dist:expr) => { __pld($p as *const u8) };
-
-    // --- f16 (NEON FP16 原生支持) ---
-    (neon, f16, lanes) => { 8 };  // float16x8_t
-    (neon, f16, load_cvt, $p:expr) => {
-        vcvt_f32_f16(vld1_f16($p))  // 4 个 f16 → 4 个 f32
-    };
-    (neon, f16, store_cvt, $p:expr, $v:expr) => {
-        vst1_f16($p, vcvt_f16_f32($v))
-    };
-}
-
-/// SIMD 宽度常量宏
-macro_rules! simd_lanes {
-    (scalar, $elem:ty) => { 1 };
-    (avx2, f32) => { 8 };
-    (avx2, f16) => { 8 };
-    (avx2, bf16) => { 8 };
-    (avx512, f32) => { 16 };
-    (avx512, f16) => { 16 };
-    (avx512, bf16) => { 16 };
-    (neon, f32) => { 4 };
-    (neon, f16) => { 8 };
-}
-
-/// SIMD 对齐要求宏
-macro_rules! simd_align {
-    (scalar, $elem:ty) => { 1 };
-    (avx2, $elem:ty) => { 32 };
-    (avx512, $elem:ty) => { 64 };
-    (neon, $elem:ty) => { 16 };
-}
-```
-
-#### 8.4.3 辅助函数（reduce 操作）
-
-```rust
-/// AVX2 水平求和（没有原生指令，需要手动实现）
-#[inline(always)]
-unsafe fn avx2_hsum_ps(v: __m256) -> f32 {
-    let hi = _mm256_extractf128_ps(v, 1);
-    let lo = _mm256_castps256_ps128(v);
-    let sum128 = _mm_add_ps(hi, lo);
-    let hi64 = _mm_movehl_ps(sum128, sum128);
-    let sum64 = _mm_add_ps(sum128, hi64);
-    let hi32 = _mm_shuffle_ps(sum64, sum64, 1);
-    _mm_cvtss_f32(_mm_add_ss(sum64, hi32))
-}
-
-/// AVX2 水平最大
-#[inline(always)]
-unsafe fn avx2_hmax_ps(v: __m256) -> f32 {
-    let hi = _mm256_extractf128_ps(v, 1);
-    let lo = _mm256_castps256_ps128(v);
-    let max128 = _mm_max_ps(hi, lo);
-    let hi64 = _mm_movehl_ps(max128, max128);
-    let max64 = _mm_max_ps(max128, hi64);
-    let hi32 = _mm_shuffle_ps(max64, max64, 1);
-    _mm_cvtss_f32(_mm_max_ss(max64, hi32))
-}
-
-/// AVX2 指数函数（7 阶多项式近似）
-#[inline(always)]
-unsafe fn avx2_exp_ps(x: __m256) -> __m256 {
-    // Cephes 风格的 exp 近似
-    // 精度：|error| < 2e-7 for x ∈ [-88, 88]
-    let c1 = _mm256_set1_ps(1.0);
-    let c2 = _mm256_set1_ps(0.5);
-    let c3 = _mm256_set1_ps(0.166666666666666019037);
-    let c4 = _mm256_set1_ps(0.0416666666665409524128);
-    let c5 = _mm256_set1_ps(0.00833333333332249791693);
-    // ... 完整实现
-    c1 // 占位符
-}
-
-/// NEON 指数函数
-#[inline(always)]
-unsafe fn neon_exp_f32(x: float32x4_t) -> float32x4_t {
-    // 类似的多项式近似
-    vdupq_n_f32(1.0) // 占位符
-}
-```
-
-### 8.5 后端统一架构（UNIFIED-BACKEND-MACRO）🚨 跨后端复用
-
-> 宏策略不仅适用于 CPU，也可统一 CPU + CUDA 的分发逻辑。
-
-#### 8.5.1 统一架构总览
-
-```
-┌─────────────────────────────────────────────────────────────────────────────┐
-│                         宏驱动统一后端架构                                   │
-├─────────────────────────────────────────────────────────────────────────────┤
-│                                                                             │
-│  Layer 0: Kernels Trait 签名（宏生成，CPU/CUDA 共享）                       │
-│  ────────────────────────────────────────────────────────────────────────   │
-│  define_kernels_trait!() → 生成 71 个算子签名                               │
-│                                                                             │
-│                              │                                              │
-│              ┌───────────────┴───────────────┐                              │
-│              ▼                               ▼                              │
-│                                                                             │
-│  Layer 1: CPU 实现                    Layer 1: CUDA 实现                    │
-│  ──────────────────                   ────────────────────                  │
-│  simd_primitive!(isa, elem, op)       cubin_dispatch!(arch, quant_fmt)      │
-│         │                                    │                              │
-│         ▼                                    ▼                              │
-│  Rust SIMD intrinsics                 FFI → .cubin entry point              │
-│                                                                             │
-│                                                                             │
-│  Layer 2: 分发逻辑（宏生成）                                                │
-│  ──────────────────────────                                                 │
-│  match quant_type {                                                         │
-│      Q4K => kernels.dequant_q4_k(...),                                      │
-│      Q8K => kernels.dequant_q8_k(...),                                      │
-│      ...                                                                    │
-│  }                                                                          │
-│                                                                             │
-└─────────────────────────────────────────────────────────────────────────────┘
-```
-
-#### 8.5.2 Kernels Trait 签名生成宏
-
-```rust
-/// 统一 Kernels Trait 签名（CPU + CUDA 共享）
-macro_rules! define_kernels_trait {
-    () => {
-        pub trait Kernels<E: Element>: Send + Sync {
-            // ================================================================
-            // 表 A：纯浮点算子（32 个）
-            // ================================================================
-            define_table_a_signatures!();
-
-            // ================================================================
-            // 表 B：解量化算子（18 个，输出固定 f32）
-            // ================================================================
-            fn dequant_q2_k(&self, block: &[u8], out: &mut [f32]);
-            fn dequant_q3_k(&self, block: &[u8], out: &mut [f32]);
-            fn dequant_q4_k(&self, block: &[u8], out: &mut [f32]);
-            fn dequant_q5_k(&self, block: &[u8], out: &mut [f32]);
-            fn dequant_q6_k(&self, block: &[u8], out: &mut [f32]);
-            fn dequant_q8_k(&self, block: &[u8], out: &mut [f32]);
-            fn dequant_iq1_s(&self, block: &[u8], out: &mut [f32]);
-            fn dequant_iq1_m(&self, block: &[u8], out: &mut [f32]);
-            fn dequant_iq2_xxs(&self, block: &[u8], out: &mut [f32]);
-            fn dequant_iq2_xs(&self, block: &[u8], out: &mut [f32]);
-            fn dequant_iq2_s(&self, block: &[u8], out: &mut [f32]);
-            fn dequant_iq3_xxs(&self, block: &[u8], out: &mut [f32]);
-            fn dequant_iq3_s(&self, block: &[u8], out: &mut [f32]);
-            fn dequant_iq4_nl(&self, block: &[u8], out: &mut [f32]);
-            fn dequant_iq4_xs(&self, block: &[u8], out: &mut [f32]);
-            fn dequant_awq4(&self, packed: &[u8], zeros: &[u8], scales: &[f16], out: &mut [f32]);
-            fn dequant_gptq4(&self, packed: &[u8], g_idx: &[i32], scales: &[f16], out: &mut [f32]);
-            fn dequant_squeeze(&self, block: &[u8], out: &mut [f32]);
-
-            // ================================================================
-            // 表 C：量化计算算子（16 个）
-            // ================================================================
-            fn kquant_matmul(&self, weight: &[u8], input: &[E], output: &mut [E],
-                            quant_type: QuantType, m: usize, n: usize, k: usize);
-            fn iq_matmul(&self, weight: &[u8], input: &[E], output: &mut [E],
-                        quant_type: QuantType, m: usize, n: usize, k: usize);
-            fn awq_matmul(&self, weight: &[u8], zeros: &[u8], scales: &[f16],
-                         input: &[E], output: &mut [E], m: usize, n: usize, k: usize);
-            fn gptq_matmul(&self, weight: &[u8], g_idx: &[i32], scales: &[f16],
-                          input: &[E], output: &mut [E], m: usize, n: usize, k: usize);
-            // ... 其他量化 matmul
-
-            // ================================================================
-            // 表 D：量化融合算子（5 个）
-            // ================================================================
-            fn fused_qkv_rope_q4(&self, /* ... */);
-            fn fused_ffn_q4(&self, /* ... */);
-            fn fused_dequant_gemv(&self, weight: &[u8], input: &[E], output: &mut [E],
-                                  quant_type: QuantType, m: usize, n: usize, k: usize);
-        }
-    };
-}
-
-/// 表 A 签名生成宏
-macro_rules! define_table_a_signatures {
-    () => {
-        // 向量运算
-        fn vec_dot(&self, a: &[E], b: &[E]) -> E;
-        fn vec_add(&self, a: &[E], b: &[E], out: &mut [E]);
-        fn vec_sub(&self, a: &[E], b: &[E], out: &mut [E]);
-        fn vec_mul(&self, a: &[E], b: &[E], out: &mut [E]);
-        fn vec_scale(&self, x: &mut [E], s: E);
-        fn vec_axpy(&self, y: &mut [E], a: E, x: &[E]);
-        fn vec_sum(&self, x: &[E]) -> E;
-        fn vec_max(&self, x: &[E]) -> E;
-        fn vec_sum_squares(&self, x: &[E]) -> E;
-
-        // 矩阵运算
-        fn gemv(&self, a: &[E], x: &[E], y: &mut [E], m: usize, n: usize);
-        fn gemm(&self, a: &[E], b: &[E], c: &mut [E], m: usize, n: usize, k: usize);
-
-        // 激活函数
-        fn silu(&self, x: &[E], out: &mut [E]);
-        fn gelu(&self, x: &[E], out: &mut [E]);
-        fn relu(&self, x: &[E], out: &mut [E]);
-        fn swiglu(&self, gate: &[E], up: &[E], out: &mut [E]);
-        fn softmax(&self, x: &[E], out: &mut [E]);
-
-        // 归一化
-        fn rms_norm(&self, x: &[E], weight: &[E], out: &mut [E], eps: f32);
-        fn layer_norm(&self, x: &[E], gamma: &[E], beta: &[E], out: &mut [E], eps: f32);
-
-        // 位置编码
-        fn rope(&self, qk: &mut [E], cos: &[E], sin: &[E], head_dim: usize, interleaved: bool);
-
-        // Attention
-        fn flash_attention(&self, q: &[E], k: &[E], v: &[E], out: &mut [E],
-                          seq_len: usize, num_heads: usize, head_dim: usize, scale: f32, causal: bool);
-    };
-}
-```
-
-#### 8.5.3 CUDA FFI 分发宏
-
-```rust
-/// CUDA 后端：宏生成 FFI 调用包装
-macro_rules! impl_cuda_kernels {
-    () => {
-        impl<E: Element> Kernels<E> for CudaBackend {
-            // 表 B：解量化（分发到对应 sm_XX cubin）
-            fn dequant_q4_k(&self, block: &CudaSlice<u8>, out: &mut CudaSlice<f32>) {
-                unsafe {
-                    match self.sm_arch {
-                        80 => cubin_sm80::dequant_q4_k(block.ptr(), out.ptr(), block.len()),
-                        86 => cubin_sm86::dequant_q4_k(block.ptr(), out.ptr(), block.len()),
-                        89 => cubin_sm89::dequant_q4_k(block.ptr(), out.ptr(), block.len()),
-                        90 => cubin_sm90::dequant_q4_k(block.ptr(), out.ptr(), block.len()),
-                        _ => panic!("Unsupported SM arch"),
-                    }
-                }
-            }
-
-            // 表 C/D：量化 matmul（使用 C++ 模板实例化）
-            fn kquant_matmul(&self, weight: &CudaSlice<u8>, input: &CudaSlice<E>,
-                            output: &mut CudaSlice<E>, quant_type: QuantType,
-                            m: usize, n: usize, k: usize) {
-                unsafe {
-                    // C++ 模板：template<int BITS> void quant_gemm(...)
-                    // 编译时已实例化 BITS=1,2,3,4,5,6,8
-                    match quant_type.bits() {
-                        4 => cubin_quant_gemm_4bit(self.sm_arch, ...),
-                        8 => cubin_quant_gemm_8bit(self.sm_arch, ...),
-                        _ => panic!("Unsupported quant bits"),
-                    }
-                }
-            }
-        }
-    };
-}
-```
-
-#### 8.5.4 分发逻辑生成宏
-
-```rust
-/// 量化类型分发宏（CPU/CUDA 共享）
-macro_rules! dispatch_quant_type {
-    ($kernels:expr, $quant_type:expr, $method:ident, $($args:expr),*) => {
-        match $quant_type {
-            QuantType::Q2K => $kernels.dequant_q2_k($($args),*),
-            QuantType::Q3K => $kernels.dequant_q3_k($($args),*),
-            QuantType::Q4K => $kernels.dequant_q4_k($($args),*),
-            QuantType::Q5K => $kernels.dequant_q5_k($($args),*),
-            QuantType::Q6K => $kernels.dequant_q6_k($($args),*),
-            QuantType::Q8K => $kernels.dequant_q8_k($($args),*),
-            QuantType::IQ1S => $kernels.dequant_iq1_s($($args),*),
-            QuantType::IQ1M => $kernels.dequant_iq1_m($($args),*),
-            QuantType::IQ2XXS => $kernels.dequant_iq2_xxs($($args),*),
-            QuantType::IQ2XS => $kernels.dequant_iq2_xs($($args),*),
-            QuantType::IQ2S => $kernels.dequant_iq2_s($($args),*),
-            QuantType::IQ3XXS => $kernels.dequant_iq3_xxs($($args),*),
-            QuantType::IQ3S => $kernels.dequant_iq3_s($($args),*),
-            QuantType::IQ4NL => $kernels.dequant_iq4_nl($($args),*),
-            QuantType::IQ4XS => $kernels.dequant_iq4_xs($($args),*),
-            QuantType::AWQ4 => panic!("AWQ4 需要额外参数"),
-            QuantType::GPTQ4 => panic!("GPTQ4 需要额外参数"),
-            QuantType::Squeeze => $kernels.dequant_squeeze($($args),*),
-        }
-    };
-}
-```
-
 ### 8.6 ISA × 精度 支持矩阵
 
 | ISA | f32 | f16 | bf16 | 说明 |
@@ -1719,128 +976,322 @@ macro_rules! dispatch_quant_type {
 | **AVX-512** | ✅ 原生 | ⚡ AVX512-FP16 | ⚡ AVX512-BF16 | 需运行时检测扩展 |
 | **VNNI** | - | - | - | INT8 点积加速 |
 | **NEON** | ✅ 原生 | ⚡ FP16 原生 | ✅ 位转换 | ARM 基线 |
-| **SVE** | ✅ 原生 | ⚡ FP16 原生 | ⚡ BF16 原生 | ARM 服务器 |
-| **AMX** | - | - | ⚡ 原生 | Apple Silicon 矩阵加速 |
+| **SVE** | ✅ 原生 | ⚡ FP16 原生 | ⚡ BF16 原生 | ARM 服务器（规划中） |
 
 **图例**：✅ 必须实现 | ⚡ 硬件原生支持 | - 不适用
 
-### 8.7 后端量化格式支持策略
+---
 
-| 后端 | 支持格式 | 策略 |
-|------|----------|------|
-| **CPU** | **全部 18 种** | 软件解码，兜底后端 |
-| **CUDA** | Q4_K, Q8_K, AWQ4, GPTQ4 | Tensor Core 友好 |
-| **Metal** | Q4_K, Q8_K | Apple GPU 常见 |
-| **ROCm** | Q4_K, Q8_K, GPTQ4 | AMD 常见格式 |
+## 9. 手写汇编微内核架构（ARCH-ASM-UKERNEL）🚨 性能核心
 
-### 8.8 AI CODER 维护指南
+### 9.1 设计原则
 
-#### 添加新 ISA
+**为什么必须手写汇编**：
 
-1. 在 `simd_primitive!` 宏中添加该 ISA 的所有操作映射
-2. 定义 `simd_lanes!(new_isa, elem)` 常量
-3. 所有算子自动通过宏展开获得新 ISA 支持
+编译器（LLVM）在以下场景无法生成最优代码：
+1. **寄存器分配**：GEMM 微内核需要精确控制累加器寄存器，编译器的寄存器分配器无法保证零溢出
+2. **指令调度**：FMA 流水线延迟隐藏需要精确的指令交错，编译器的调度器不够激进
+3. **预取插入**：软件预取的位置和距离需要根据微架构精确调整
+4. **量化解包**：位操作序列有特定的最优指令选择，编译器可能选择次优路径
+
+**强制规则**：
+- GEMM 微内核（内层循环）：**必须手写汇编**
+- 量化 GEMV/GEMM 的内层点积：**必须手写汇编**
+- 其他算子（激活/归一化/BLAS-1）：宏生成 intrinsic 即可，编译器能处理好
+
+### 9.2 汇编微内核接口约定（ASM-UKERNEL-ABI）
+
+#### 9.2.1 Rust 集成方式
 
 ```rust
-// 示例：添加 SVE 支持
-macro_rules! simd_primitive {
-    // ... 现有规则 ...
+// 方式 1: global_asm! — 完整汇编文件嵌入（推荐用于大型微内核）
+use std::arch::global_asm;
 
-    // SVE f32
-    (sve, f32, zero) => { svdup_f32(0.0) };
-    (sve, f32, load, $p:expr) => { svld1_f32(svptrue_b32(), $p) };
-    (sve, f32, fma, $a:expr, $b:expr, $c:expr) => { svmla_f32_x(svptrue_b32(), $c, $a, $b) };
-    // ...
+global_asm!(
+    include_str!("asm/avx2_f32_gemm_6x16.S"),
+    options(att_syntax)  // 或 intel_syntax
+);
+
+extern "C" {
+    /// AVX2 f32 GEMM 6x16 微内核
+    /// 计算 C[6×16] += A[6×k] * B[k×16]，k 步迭代
+    fn gk_gemm_avx2_f32_6x16(
+        k: usize,
+        a: *const f32,       // A 面板指针，行主序，lda = k
+        b: *const f32,       // B 面板指针，已 pack 为列主序 [k][16]
+        c: *mut f32,         // C 输出指针，行主序，ldc = n
+        ldc: usize,          // C 的列步长（字节或元素数，按约定）
+        alpha: f32,          // 缩放因子（通常 1.0）
+    );
 }
 
-macro_rules! simd_lanes {
-    (sve, f32) => { svcntw() };  // SVE 运行时确定宽度
+// 方式 2: naked_fn — 小型微内核（Rust nightly）
+#[naked]
+#[target_feature(enable = "avx2,fma")]
+unsafe extern "C" fn gk_gemm_avx2_f32_6x16(
+    k: usize, a: *const f32, b: *const f32,
+    c: *mut f32, ldc: usize, alpha: f32,
+) {
+    core::arch::asm!(
+        // ... 汇编指令 ...
+        options(noreturn)
+    );
 }
 ```
 
-#### 添加新精度
+#### 9.2.2 命名约定
 
-1. 实现 `Element` trait
-2. 在 `simd_primitive!` 中为每个 ISA 添加该精度的操作
-3. 批量展开时包含新精度
+```
+gk_{op}_{isa}_{elem}_{tile}
 
-#### 添加新量化格式
+gk_       — gllm-kernels 前缀
+{op}      — 操作名: gemm, gemv, qdot (量化点积)
+{isa}     — ISA: avx2, avx512, neon
+{elem}    — 精度: f32, f16, bf16, i8
+{tile}    — 微内核尺寸: 6x16, 14x32, 8x12
 
-1. 在 `decode_block!` 宏中添加解码规则
-2. 定义块大小常量
-3. 使用 `define_quant_gemv!` 生成 GEMV 实现
-4. 添加 `dequant_xxx` 函数
-
-```rust
-// 示例：添加新量化格式 Q3_S
-macro_rules! decode_block {
-    (q3_s, $block:expr, $out:expr) => {{
-        // Q3_S 特定解码逻辑
-    }};
-}
-
-const Q3_S_BLOCK_SIZE: usize = 256;
-const Q3_S_BLOCK_BYTES: usize = 104;
-
-// 自动获得所有 ISA × 精度 的 GEMV 实现
-mod avx2_f32_q3s { define_quant_gemv!(avx2, f32, q3_s, 256); }
-mod avx2_f16_q3s { define_quant_gemv!(avx2, f16, q3_s, 256); }
-// ...
+示例：
+  gk_gemm_avx2_f32_6x16      — AVX2 f32 GEMM 6行×16列微内核
+  gk_gemm_avx512_f32_14x32   — AVX-512 f32 GEMM 14行×32列微内核
+  gk_gemm_neon_f32_8x12      — NEON f32 GEMM 8行×12列微内核
+  gk_qdot_avx2_q4k_f32       — AVX2 Q4_K 量化点积（输入 f32）
+  gk_qdot_avx512_q8k_f32     — AVX-512 Q8_K 量化点积
 ```
 
-#### 添加新算子
+#### 9.2.3 调用约定
 
-1. 判断算子类别（表 A/B/C/D）
-2. 编写 `define_xxx!` 模板宏，使用 `simd_primitive!` 原语
-3. 批量展开
+所有汇编微内核使用 **C ABI** (`extern "C"`)，参数传递遵循平台 ABI：
+
+| 平台 | 整数/指针参数 | 浮点参数 | 返回值 |
+|------|--------------|----------|--------|
+| **x86_64 SysV** | rdi, rsi, rdx, rcx, r8, r9 | xmm0-xmm7 | rax / xmm0 |
+| **aarch64** | x0-x7 | v0-v7 (标量部分) | x0 / v0 |
+
+**寄存器使用约定**（x86_64 GEMM 微内核）：
+
+```
+被调用者保存（callee-saved）：rbx, rbp, r12-r15
+  → 微内核如果使用这些寄存器，必须 push/pop
+
+调用者保存（caller-saved）：rax, rcx, rdx, rsi, rdi, r8-r11
+  → 微内核可以自由使用
+
+SIMD 寄存器：
+  AVX2:    ymm0-ymm15 全部 caller-saved
+  AVX-512: zmm0-zmm31 全部 caller-saved
+  → 微内核可以自由使用所有 SIMD 寄存器
+```
+
+### 9.3 GEMM 汇编微内核设计
+
+#### 9.3.1 微内核尺寸选择
+
+| ISA | 寄存器数 | SIMD 宽度 | 微内核 (TM×TN) | 累加器数 | 临时寄存器 |
+|-----|----------|-----------|----------------|----------|------------|
+| **AVX2** | 16 ymm | 8×f32 | 6×16 (6×2vec) | 12 | 4 (A广播+B加载+预取) |
+| **AVX-512** | 32 zmm | 16×f32 | 14×32 (14×2vec) | 28 | 4 |
+| **NEON** | 32 v-reg | 4×f32 | 8×12 (8×3vec) | 24 | 8 |
+
+**选择原则**：
+```
+累加器数 = TM × (TN / LANES) = TM × NV
+临时寄存器 ≥ 3（1个A广播 + NV个B加载）
+总寄存器 = 累加器 + 临时 ≤ 可用寄存器数
+
+最大化 TM × TN 以提高计算/访存比
+```
+
+#### 9.3.2 AVX2 f32 6×16 微内核伪代码
+
+```asm
+; gk_gemm_avx2_f32_6x16
+; 输入: k(rdi), a(rsi), b(rdx), c(rcx), ldc(r8), alpha(xmm0)
+;
+; 寄存器分配:
+;   ymm0-ymm11:  6×2 = 12 个累加器 (c_i_j)
+;   ymm12:       A 元素广播
+;   ymm13-ymm14: B 列向量加载
+;   ymm15:       临时/预取
+
+    ; 初始化 12 个累加器为零
+    vxorps ymm0, ymm0, ymm0    ; c_0_0
+    vxorps ymm1, ymm1, ymm1    ; c_0_1
+    ; ... ymm2-ymm11
+
+    ; K 循环
+.Lk_loop:
+    ; 加载 B 的两个向量 (16 个 f32)
+    vmovups ymm13, [rdx]        ; B[k][0:8]
+    vmovups ymm14, [rdx + 32]   ; B[k][8:16]
+
+    ; 预取下一个 B 面板
+    prefetcht0 [rdx + 256]
+
+    ; 对 A 的每一行广播并 FMA
+    vbroadcastss ymm12, [rsi]           ; A[0][k]
+    vfmadd231ps  ymm0, ymm12, ymm13    ; c_0_0 += A[0][k] * B[k][0:8]
+    vfmadd231ps  ymm1, ymm12, ymm14    ; c_0_1 += A[0][k] * B[k][8:16]
+
+    vbroadcastss ymm12, [rsi + 4]       ; A[1][k]
+    vfmadd231ps  ymm2, ymm12, ymm13
+    vfmadd231ps  ymm3, ymm12, ymm14
+
+    ; ... A[2]-A[5] 同理 (ymm4-ymm11)
+
+    ; 步进
+    add rsi, 24        ; A 面板: 6 个 f32 = 24 bytes
+    add rdx, 64        ; B 面板: 16 个 f32 = 64 bytes
+    dec rdi
+    jnz .Lk_loop
+
+    ; 写回 C（可选 alpha 缩放）
+    ; vmovups [rcx], ymm0
+    ; vmovups [rcx + 32], ymm1
+    ; ... 按 ldc 步进写回 6 行
+    ret
+```
+
+#### 9.3.3 宏生成的外层循环 + 汇编微内核
 
 ```rust
-// 示例：添加 gelu_tanh 算子（表 A 类）
-macro_rules! define_gelu_tanh {
-    ($isa:ident, $elem:ty) => {
-        #[inline(always)]
-        pub fn gelu_tanh(x: &[$elem], out: &mut [$elem]) {
-            const LANES: usize = simd_lanes!($isa, $elem);
-            // 使用 simd_primitive! 实现
+/// GEMM 外层循环（宏生成）调用汇编微内核（手写）
+///
+/// 三层分块: MC × KC × NC
+///   MC: A 面板行数（适配 L2 Cache）
+///   KC: 公共维度分块（适配 L1 Cache）
+///   NC: B 面板列数（适配 L3 Cache）
+macro_rules! define_gemm_driver {
+    ($isa:ident, $elem:ty, $TM:literal, $TN:literal, $ukernel:path) => {
+        pub fn gemm(
+            a: &[$elem], b: &[$elem], c: &mut [$elem],
+            m: usize, n: usize, k: usize,
+        ) {
+            let bp = blocking_params($TM, $TN / simd_primitive!($isa, $elem, lanes),
+                                     simd_primitive!($isa, $elem, lanes),
+                                     std::mem::size_of::<$elem>());
+
+            // Pack B into column-panel layout [KC][NC]
+            let packed_b = pack_b(b, n, k, bp.kc, $TN);
+
+            // MC loop (over rows of A)
+            for mc_start in (0..m).step_by(bp.mc) {
+                let mc = bp.mc.min(m - mc_start);
+
+                // KC loop (over common dimension)
+                for kc_start in (0..k).step_by(bp.kc) {
+                    let kc = bp.kc.min(k - kc_start);
+
+                    // Pack A panel [MC][KC]
+                    let packed_a = pack_a(&a, m, k, mc_start, kc_start, mc, kc, $TM);
+
+                    // NC loop (over columns of B) → TM×TN 微内核
+                    for nc_start in (0..n).step_by($TN) {
+                        let nc = $TN.min(n - nc_start);
+
+                        // TM loop (over micro-rows)
+                        for mr in (0..mc).step_by($TM) {
+                            let tm = $TM.min(mc - mr);
+                            if tm == $TM && nc == $TN {
+                                // 完整微内核：调用手写汇编
+                                unsafe {
+                                    $ukernel(
+                                        kc,
+                                        packed_a[mr * kc..].as_ptr(),
+                                        packed_b[nc_start * kc..].as_ptr(),
+                                        c[(mc_start + mr) * n + nc_start..].as_mut_ptr(),
+                                        n,  // ldc
+                                        1.0,
+                                    );
+                                }
+                            } else {
+                                // 尾部处理：标量或 masked SIMD
+                                gemm_tail(/* ... */);
+                            }
+                        }
+                    }
+                }
+            }
         }
     };
 }
-
-// 批量展开
-mod avx2_f32  { define_gelu_tanh!(avx2, f32);  }
-mod avx2_f16  { define_gelu_tanh!(avx2, f16);  }
-mod neon_f32  { define_gelu_tanh!(neon, f32);  }
-// ...
 ```
 
-#### 性能调优某个 ISA × 精度 组合
+### 9.4 量化汇编微内核设计
 
-宏生成的代码是基线实现。对于热点路径，可以覆写：
+#### 9.4.1 量化点积微内核
+
+量化 GEMV/GEMM 的核心是**融合解量化+点积**，在寄存器内完成解包→FMA，不写回中间 f32 矩阵。
 
 ```rust
-mod avx512_f32 {
-    // 宏生成的基线
-    define_gemm!(avx512, f32);
-
-    // 手写覆写（更激进的优化）
-    #[inline(always)]
-    pub fn gemm_optimized(a: &[f32], b: &[f32], c: &mut [f32], m: usize, n: usize, k: usize) {
-        // 手写 AVX-512 GEMM，使用寄存器分块、预取等
-    }
+extern "C" {
+    /// AVX2 Q4_K 量化点积
+    /// 计算 sum(dequant(weight_block) * input_f32)
+    /// 一次处理一个 256 元素块
+    fn gk_qdot_avx2_q4k_f32(
+        block: *const u8,     // Q4_K 块指针 (144 bytes)
+        input: *const f32,    // f32 输入向量 (256 elements)
+        block_count: usize,   // 块数量
+    ) -> f32;                 // 点积结果
 }
 ```
 
-### 8.9 AI CODER 维护检查清单（MAINTENANCE-CHECKLIST）🚨 必读
+#### 9.4.2 量化微内核与宏的协作
 
-> **每次修改宏系统前必须阅读此清单**
+```
+宏生成的外层循环（行遍历、块遍历、输出累加）
+    │
+    └─► 内层调用汇编微内核（单块解量化+点积）
+        │
+        ├─ gk_qdot_avx2_q4k_f32   — Q4_K 格式
+        ├─ gk_qdot_avx2_q8k_f32   — Q8_K 格式
+        ├─ gk_qdot_avx2_iq4nl_f32 — IQ4_NL 格式
+        └─ ...
 
-#### 8.9.1 添加新 ISA 检查清单
+每种量化格式 × 每种 ISA = 一个专用汇编微内核
+宏负责：行循环、块索引计算、输出写回
+汇编负责：单块内的解包+FMA 流水线
+```
+
+### 9.5 汇编文件组织
+
+```
+src/
+├── asm/                          # 手写汇编微内核
+│   ├── x86_64/
+│   │   ├── avx2_f32_gemm_6x16.S
+│   │   ├── avx512_f32_gemm_14x32.S
+│   │   ├── avx2_qdot_q4k.S
+│   │   ├── avx2_qdot_q8k.S
+│   │   ├── avx512_qdot_q4k.S
+│   │   └── ...
+│   └── aarch64/
+│       ├── neon_f32_gemm_8x12.S
+│       ├── neon_qdot_q4k.S
+│       └── ...
+```
+
+### 9.6 汇编覆写规则
+
+| 算子 | 宏生成基线 | 汇编覆写 | 覆写条件 |
+|------|-----------|----------|----------|
+| **GEMM 微内核** | `define_matmul_x86!` | **强制覆写** | 始终使用汇编 |
+| **量化 GEMV 点积** | `define_quant_gemv!` | **强制覆写** | 始终使用汇编 |
+| **量化 GEMM 点积** | `define_quant_gemm!` | **强制覆写** | 始终使用汇编 |
+| BLAS-1 (vec_dot 等) | `define_blas1_ops!` | 可选覆写 | 基准测试证明 >10% 提升 |
+| 激活函数 | `define_element_wise_ops!` | 不覆写 | 编译器足够好 |
+| 归一化 | `define_norm_ops!` | 不覆写 | 内存带宽瓶颈 |
+
+---
+
+## 10. AI CODER 维护指南
+
+### 10.1 添加新 ISA
 
 ```
 □ 步骤 1：扩展 simd_primitive! 表
-  ├─ 添加所有 21 个操作的映射（见 §8.4.1 操作清单）
+  ├─ 添加所有 22+ 个操作的映射（见 §8.5.1 操作清单）
   ├─ 每个操作必须有对应的 intrinsic 或软件实现
-  └─ 验证：grep -c "(new_isa, f32," 应该 >= 21
+  └─ 验证：grep -c "(new_isa, f32," 应该 >= 22
 
 □ 步骤 2：扩展 simd_lanes! 宏
   ├─ 添加 (new_isa, f32), (new_isa, f16), (new_isa, bf16) 三条规则
@@ -1853,15 +1304,21 @@ mod avx512_f32 {
   ├─ 添加 #[cfg(target_arch = "xxx")] mod new_isa { ... }
   └─ 验证：所有算子自动获得新 ISA 支持
 
-□ 步骤 5：更新 §8.6 ISA × 精度 支持矩阵
+□ 步骤 5：编写汇编微内核
+  ├─ GEMM 微内核（必须）
+  ├─ 量化点积微内核（必须）
+  └─ 放置于 src/asm/{arch}/ 目录
+
+□ 步骤 6：更新 §8.6 ISA × 精度 支持矩阵
   └─ 添加新行，标注支持的精度和硬件特性
 
-□ 步骤 6：测试
+□ 步骤 7：测试
   ├─ cargo test --features new_isa
-  └─ 基准测试验证性能
+  ├─ 正确性：与 scalar 实现对比
+  └─ 性能：基准测试验证达标（§5 性能目标）
 ```
 
-#### 8.9.2 添加新量化格式检查清单
+### 10.2 添加新量化格式
 
 ```
 □ 步骤 1：定义格式常量
@@ -1879,27 +1336,30 @@ mod avx512_f32 {
   ├─ 在 Kernels trait 中添加 fn dequant_new_fmt(...)
   └─ 在各 ISA 实现中调用 decode_block!(new_fmt, ...)
 
-□ 步骤 4：生成量化 GEMV
+□ 步骤 4：编写汇编量化点积微内核
+  ├─ 每个 ISA 一个专用微内核
+  └─ 放置于 src/asm/{arch}/
+
+□ 步骤 5：生成量化 GEMV
   ├─ expand_all_quant_formats! 中添加 mod new_fmt { ... }
   └─ 验证：所有 ISA × 精度 组合自动生成
 
-□ 步骤 5：更新 dispatch_quant_type! 宏
+□ 步骤 6：更新 dispatch_quant_type! 宏
   └─ 添加 QuantType::NewFmt => kernels.dequant_new_fmt(...)
 
-□ 步骤 6：测试
+□ 步骤 7：测试
   ├─ 单元测试：decode 正确性
   ├─ 集成测试：GEMV 输出与参考一致
-  └─ 性能测试：与 llama.cpp 对比
+  └─ 性能测试：与 llama.cpp 对比，达标 §5 目标
 ```
 
-#### 8.9.3 添加新算子检查清单
+### 10.3 添加新算子
 
 ```
 □ 步骤 1：判断算子类别
   ├─ 签名无量化权重 → 表 A（纯浮点）
   ├─ 输出固定 f32 → 表 B（解量化）
-  ├─ 量化权重 + 泛型输出 → 表 C（量化计算）
-  └─ 多步融合 + 量化 → 表 D（量化融合）
+  └─ 量化权重 + 泛型输出 → 表 C（量化计算）
 
 □ 步骤 2：编写算子模板宏
   ├─ 命名：define_xxx!(isa, elem)
@@ -1912,23 +1372,28 @@ mod avx512_f32 {
   └─ 验证：编译通过
 
 □ 步骤 4：添加到 Kernels trait
-  ├─ 在 define_table_X_signatures! 中添加签名
-  └─ 在各后端实现中添加调用
+  └─ 在各 ISA 实现中添加调用
 
-□ 步骤 5：更新 §9.1 算子统计表
+□ 步骤 5：判断是否需要汇编覆写
+  ├─ 计算密集型（GEMM 类）→ 必须汇编
+  ├─ 内存带宽瓶颈 → 不需要
+  └─ 基准测试决定
+
+□ 步骤 6：更新 §11 算子统计表
   └─ 更新对应类别数量
 
-□ 步骤 6：测试
+□ 步骤 7：测试
   ├─ 正确性测试（与标量/参考实现对比）
-  └─ 性能测试（各 ISA 加速比）
+  └─ 性能测试（各 ISA 加速比，对照 §5 目标）
 ```
 
-#### 8.9.4 常见错误检查
+### 10.4 常见错误检查
 
 ```
 ❌ 错误 1：直接使用 intrinsic 而不是 simd_primitive!
    → 导致新 ISA 无法自动支持
    → 检查：grep -r "_mm256\|_mm512\|vaddq" src/cpu_kernels/*.rs
+   → 例外：手写汇编微内核（src/asm/）不受此限制
 
 ❌ 错误 2：忘记尾部处理
    → 数组长度非 LANES 倍数时结果错误
@@ -1945,49 +1410,60 @@ mod avx512_f32 {
 ❌ 错误 5：f16/bf16 直接计算而不转换
    → Rust 没有 f16 原生算术
    → 检查：f16 操作必须经过 load_cvt/store_cvt
+
+❌ 错误 6：GEMM/量化 GEMV 使用宏生成而非汇编
+   → 性能无法达标
+   → 检查：GEMM 和量化 GEMV 的内层循环必须调用 gk_* 汇编函数
 ```
 
-#### 8.9.5 性能验证基准
+### 10.5 性能验证基准
 
-| 操作 | 期望加速比（vs Scalar） | 备注 |
-|------|------------------------|------|
-| vec_dot (f32) | AVX2: 6-8×, AVX512: 12-14× | SIMD 宽度 |
-| gemv (f32) | AVX2: 5-7×, AVX512: 10-12× | 内存带宽限制 |
-| rms_norm | AVX2: 4-6×, AVX512: 8-10× | 两次遍历 |
-| softmax | AVX2: 3-5× | exp 近似开销 |
-| dequant_q4_k | AVX2: 3-4× | 解码开销 |
-| quant_gemv | AVX2: 2-3× | 解码 + 计算平衡 |
+| 操作 | 期望加速比（vs Scalar） | 性能目标 | 备注 |
+|------|------------------------|----------|------|
+| GEMM (f32, large) | AVX2: 6-8×, AVX512: 12-16× | ≥ 85% 峰值 FLOPS | 汇编微内核 |
+| GEMV (f32) | AVX2: 5-7×, AVX512: 10-12× | ≥ 90% 带宽峰值 | 内存带宽瓶颈 |
+| vec_dot (f32) | AVX2: 6-8×, AVX512: 12-14× | ≥ 90% 带宽峰值 | SIMD 宽度 |
+| rms_norm | AVX2: 4-6×, AVX512: 8-10× | ≥ 90% 带宽峰值 | 两次遍历 |
+| softmax | AVX2: 3-5× | ≥ 85% 带宽峰值 | exp 近似开销 |
+| dequant_q4_k | AVX2: 3-4× | ≥ 90% 带宽峰值 | 解码开销 |
+| quant_gemv (q4) | AVX2: 4-6×, AVX512: 8-12× | ≥ 85% 瓶颈极限 | 汇编微内核 |
+| quant_gemm (q4) | AVX2: 5-7×, AVX512: 10-14× | ≥ 85% 瓶颈极限 | 汇编微内核 |
 
 ---
 
-## 9. 算子统计
+## 11. 算子统计
 
-### 9.1 算子模板数（需维护）
+### 11.1 算子模板数（需维护）
 
 | 类别 | 数量 | 宏策略 |
 |------|------|--------|
 | 向量运算 | 9 | 表 A |
-| 矩阵运算 | 3 | 表 A |
+| 矩阵运算 | 7 | 表 A（外层宏 + 汇编微内核） |
 | 激活函数 | 7 | 表 A |
 | 归一化 | 2 | 表 A |
 | 位置编码 | 2 | 表 A |
-| 查表 | 1 | 表 A |
-| Attention | 2 | 表 A |
-| 融合算子（FP 权重） | 6 | 表 A |
 | 解量化 | 18 | 表 B |
-| 量化 GEMV/GEMM | 6 | 表 C |
-| 量化格式专用 Matmul | 10 | 表 C |
-| 融合算子（量化权重） | 5 | 表 D |
-| **模板总计** | **71** | |
+| 量化 GEMV/GEMM | 6 | 表 C（外层宏 + 汇编微内核） |
+| 量化格式专用 Matmul | 5 | 表 C（外层宏 + 汇编微内核） |
+| **模板总计** | **56** | |
 
-### 9.2 宏展开后实现数（自动生成）
+### 11.2 宏展开后实现数（自动生成）
 
 | 类别 | 展开公式 | 实现数 |
 |------|----------|--------|
-| 表 A 纯浮点 | 32 算子 × 8 ISA × 3 精度 | ~768 |
-| 表 B 解量化 | 18 格式 × 8 ISA | ~144 |
-| 表 C 量化计算 | 16 算子 × 8 ISA × 3 精度 | ~384 |
-| 表 D 量化融合 | 5 算子 × 8 ISA × 3 精度 + 特殊 | ~528 |
-| **展开总计** | | **~1,824** |
+| 表 A 纯浮点 | 27 算子 × 6 ISA × 3 精度 | ~486 |
+| 表 B 解量化 | 18 格式 × 6 ISA | ~108 |
+| 表 C 量化计算 | 11 算子 × 6 ISA × 3 精度 | ~198 |
+| **展开总计** | | **~792** |
 
-> 注：实际数量取决于后端支持矩阵，CPU 全覆盖，GPU 选择性支持
+### 11.3 手写汇编微内核数
+
+| 类别 | 每 ISA 数量 | ISA 数 | 总计 |
+|------|------------|--------|------|
+| GEMM 微内核 (f32) | 1 | 4 | 4 |
+| GEMM 微内核 (f16/bf16) | 2 | 4 | 8 |
+| 量化点积 (每格式) | 18 | 4 | 72 |
+| **汇编总计** | | | **~84** |
+
+> 注：实际汇编数量取决于格式合并策略。同位宽格式（如 Q4_K/IQ4_NL/IQ4_XS）可共享解包逻辑，
+> 只在 scale/zero 处理上分支，减少实际汇编文件数。
