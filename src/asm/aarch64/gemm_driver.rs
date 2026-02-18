@@ -277,3 +277,148 @@ pub fn gemm_bias_asm_f32(
         }
     }
 }
+
+#[cfg(test)]
+#[cfg(target_arch = "aarch64")]
+mod tests {
+    use super::*;
+
+    /// Naive reference GEMM for correctness checking.
+    fn gemm_ref(a: &[f32], b: &[f32], c: &mut [f32], m: usize, n: usize, k: usize) {
+        for i in 0..m {
+            for j in 0..n {
+                let mut sum = 0.0f32;
+                for p in 0..k {
+                    sum += a[i * k + p] * b[p * n + j];
+                }
+                c[i * n + j] = sum;
+            }
+        }
+    }
+
+    fn check_close(a: &[f32], b: &[f32], tol: f32, label: &str) {
+        assert_eq!(a.len(), b.len(), "{label}: length mismatch");
+        for (i, (&x, &y)) in a.iter().zip(b.iter()).enumerate() {
+            let diff = (x - y).abs();
+            let scale = x.abs().max(y.abs()).max(1.0);
+            assert!(
+                diff / scale < tol,
+                "{label}[{i}]: asm={x}, ref={y}, diff={diff}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_asm_gemm_exact_tile() {
+        // Exact MR x NR tile: 8x12 with k=16
+        let (m, n, k) = (8, 12, 16);
+        let a: Vec<f32> = (0..m * k).map(|i| (i as f32) * 0.01).collect();
+        let b: Vec<f32> = (0..k * n).map(|i| (i as f32) * 0.02).collect();
+
+        let mut c_asm = vec![0.0f32; m * n];
+        let mut c_ref = vec![0.0f32; m * n];
+
+        gemm_asm_f32(&a, &b, &mut c_asm, m, n, k);
+        gemm_ref(&a, &b, &mut c_ref, m, n, k);
+
+        check_close(&c_asm, &c_ref, 1e-4, "exact_tile");
+    }
+
+    #[test]
+    fn test_asm_gemm_multi_tile() {
+        // Multiple tiles: 32x48 with k=64
+        let (m, n, k) = (32, 48, 64);
+        let a: Vec<f32> = (0..m * k).map(|i| ((i % 97) as f32 - 48.0) * 0.01).collect();
+        let b: Vec<f32> = (0..k * n).map(|i| ((i % 83) as f32 - 41.0) * 0.02).collect();
+
+        let mut c_asm = vec![0.0f32; m * n];
+        let mut c_ref = vec![0.0f32; m * n];
+
+        gemm_asm_f32(&a, &b, &mut c_asm, m, n, k);
+        gemm_ref(&a, &b, &mut c_ref, m, n, k);
+
+        check_close(&c_asm, &c_ref, 1e-4, "multi_tile");
+    }
+
+    #[test]
+    fn test_asm_gemm_non_aligned() {
+        // Non-aligned dimensions: m=7, n=11, k=13
+        // Tests edge-tile handling with zero-padding
+        let (m, n, k) = (7, 11, 13);
+        let a: Vec<f32> = (0..m * k).map(|i| (i as f32) * 0.03).collect();
+        let b: Vec<f32> = (0..k * n).map(|i| (i as f32) * 0.04).collect();
+
+        // Allocate C with padding for edge tiles (MR x NR overshoot)
+        let m_padded = ((m + MR - 1) / MR) * MR;
+        let n_padded = ((n + NR - 1) / NR) * NR;
+        let mut c_asm = vec![0.0f32; m_padded * n_padded.max(n)];
+        let mut c_ref = vec![0.0f32; m * n];
+
+        // Note: for non-aligned dims, the asm driver writes to padded C.
+        // We only check the valid m x n region.
+        gemm_asm_f32(&a, &b, &mut c_asm, m, n, k);
+        gemm_ref(&a, &b, &mut c_ref, m, n, k);
+
+        for i in 0..m {
+            for j in 0..n {
+                let asm_val = c_asm[i * n + j];
+                let ref_val = c_ref[i * n + j];
+                let diff = (asm_val - ref_val).abs();
+                let scale = asm_val.abs().max(ref_val.abs()).max(1.0);
+                assert!(
+                    diff / scale < 1e-4,
+                    "non_aligned[{i},{j}]: asm={asm_val}, ref={ref_val}, diff={diff}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn test_asm_gemm_identity() {
+        // A = I (identity), C should equal B
+        let n = 12;
+        let k = 12;
+        let m = 8;
+        let mut a = vec![0.0f32; m * k];
+        for i in 0..m.min(k) {
+            a[i * k + i] = 1.0;
+        }
+        let b: Vec<f32> = (0..k * n).map(|i| (i as f32) * 0.1).collect();
+        let mut c = vec![0.0f32; m * n];
+
+        gemm_asm_f32(&a, &b, &mut c, m, n, k);
+
+        for i in 0..m {
+            for j in 0..n {
+                let expected = b[i * n + j]; // since A is identity for first m rows
+                assert!(
+                    (c[i * n + j] - expected).abs() < 1e-5,
+                    "identity[{i},{j}]: got={}, expected={expected}", c[i * n + j]
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn test_asm_gemm_bias() {
+        let (m, n, k) = (8, 12, 16);
+        let a: Vec<f32> = (0..m * k).map(|i| (i as f32) * 0.01).collect();
+        let b: Vec<f32> = (0..k * n).map(|i| (i as f32) * 0.02).collect();
+        let bias: Vec<f32> = (0..n).map(|i| (i as f32) * 0.5).collect();
+
+        let mut c_asm = vec![0.0f32; m * n];
+        let mut c_ref = vec![0.0f32; m * n];
+
+        gemm_bias_asm_f32(&a, &b, &bias, &mut c_asm, m, n, k);
+
+        // Reference: naive gemm + bias
+        gemm_ref(&a, &b, &mut c_ref, m, n, k);
+        for i in 0..m {
+            for j in 0..n {
+                c_ref[i * n + j] += bias[j];
+            }
+        }
+
+        check_close(&c_asm, &c_ref, 1e-4, "bias");
+    }
+}
