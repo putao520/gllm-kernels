@@ -13,8 +13,6 @@
 use crate::asm::aarch64::{MR, NR, gemm_kernel_8x12_f32};
 #[cfg(target_arch = "aarch64")]
 use crate::cache_params;
-#[cfg(target_arch = "aarch64")]
-use crate::traits::Element;
 
 /// Pack a panel of A (mc x kc) into column-major MR-wide strips.
 ///
