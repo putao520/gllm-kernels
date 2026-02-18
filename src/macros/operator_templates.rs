@@ -1459,7 +1459,6 @@ macro_rules! define_gemv_op {
                                 $crate::numa::on_node(node_id, || {
                                     let a_sl = unsafe { std::slice::from_raw_parts(a_ptr as *const $elem, a_len) };
                                     let x_sl = unsafe { std::slice::from_raw_parts(x_ptr as *const $elem, x_len) };
-                                    let y_sl = unsafe { std::slice::from_raw_parts_mut(y_ptr as *mut $elem, y_len) };
                                     // Within this node, further parallelize across node-local threads
                                     let node_m = m_end - m_start;
                                     let node_threads = rayon::current_num_threads().max(1);
@@ -1472,12 +1471,14 @@ macro_rules! define_gemv_op {
                                                 let rs = start;
                                                 let re = end;
                                                 s.spawn(move |_| {
+                                                    let y_sl = unsafe { std::slice::from_raw_parts_mut(y_ptr as *mut $elem, y_len) };
                                                     gemv_serial(a_sl, x_sl, y_sl, rs, re, k);
                                                 });
                                                 start = end;
                                             }
                                         });
                                     } else {
+                                        let y_sl = unsafe { std::slice::from_raw_parts_mut(y_ptr as *mut $elem, y_len) };
                                         gemv_serial(a_sl, x_sl, y_sl, m_start, m_end, k);
                                     }
                                 });

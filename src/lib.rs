@@ -26,6 +26,7 @@ pub mod cpu_kernels;
 pub mod backend;
 pub mod quant;
 pub mod codebooks;
+pub mod asm;
 pub mod profiling;
 pub mod autotuning;
 

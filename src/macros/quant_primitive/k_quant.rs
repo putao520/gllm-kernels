@@ -620,6 +620,7 @@ macro_rules! quant_primitive_kquant {
     //   Eliminates 4 dequant FMAs per iteration (was: fma(vd, nibble, -d*8)).
     // 4 independent accumulators break the FMA dependency chain
     //   (original: 4 dependent FMAs on 1 acc = 20c latency-bound per iter).
+    // 2x unrolled loop for better OoO scheduling.
     // -----------------------------------------------------------------------
     (avx2, q4_k, dot, $block_ptr:expr, $other_ptr:expr) => {
         unsafe {
@@ -633,68 +634,91 @@ macro_rules! quant_primitive_kquant {
                 let other_ptr = $other_ptr;
                 let mask = _mm_set1_epi8(0x0F);
 
-                // 4 independent accumulators for nib*other (breaks FMA dep chain)
+                // 4 independent accumulators for nib*other
                 let mut acc0 = _mm256_setzero_ps();
                 let mut acc1 = _mm256_setzero_ps();
                 let mut acc2 = _mm256_setzero_ps();
                 let mut acc3 = _mm256_setzero_ps();
-                // Accumulator for sum(other) -- the offset term
-                let mut acc_oth = _mm256_setzero_ps();
+                // 2 independent accumulators for sum(other)
+                let mut acc_oth0 = _mm256_setzero_ps();
+                let mut acc_oth1 = _mm256_setzero_ps();
 
+                // 2x unrolled: 4 iterations processing 2x16 bytes = 64 elements each
                 let mut i = 0usize;
                 while i < 8 {
-                    let v128 = _mm_loadu_si128(qs_ptr.add(i * 16) as *const _);
-                    let low_bytes  = _mm_and_si128(v128, mask);
-                    let high_bytes = _mm_and_si128(_mm_srli_epi16(v128, 4), mask);
+                    // --- First half (i) ---
+                    let v_a = _mm_loadu_si128(qs_ptr.add(i * 16) as *const _);
+                    let lo_a  = _mm_and_si128(v_a, mask);
+                    let hi_a = _mm_and_si128(_mm_srli_epi16(v_a, 4), mask);
 
-                    // Convert nibbles to f32 (raw 0-15 values, no dequant)
-                    let f_l_0 = _mm256_cvtepi32_ps(_mm256_cvtepu8_epi32(low_bytes));
-                    let f_l_1 = _mm256_cvtepi32_ps(_mm256_cvtepu8_epi32(
-                        _mm_srli_si128(low_bytes, 8),
-                    ));
-                    let f_h_0 = _mm256_cvtepi32_ps(_mm256_cvtepu8_epi32(high_bytes));
-                    let f_h_1 = _mm256_cvtepi32_ps(_mm256_cvtepu8_epi32(
-                        _mm_srli_si128(high_bytes, 8),
-                    ));
+                    let fl0a = _mm256_cvtepi32_ps(_mm256_cvtepu8_epi32(lo_a));
+                    let fl1a = _mm256_cvtepi32_ps(_mm256_cvtepu8_epi32(_mm_srli_si128(lo_a, 8)));
+                    let fh0a = _mm256_cvtepi32_ps(_mm256_cvtepu8_epi32(hi_a));
+                    let fh1a = _mm256_cvtepi32_ps(_mm256_cvtepu8_epi32(_mm_srli_si128(hi_a, 8)));
 
-                    // Interleave low/high to match other[] memory order
-                    let out_0 = _mm256_unpacklo_ps(f_l_0, f_h_0);
-                    let out_1 = _mm256_unpackhi_ps(f_l_0, f_h_0);
-                    let final_0 = _mm256_permute2f128_ps(out_0, out_1, 0x20);
-                    let final_1 = _mm256_permute2f128_ps(out_0, out_1, 0x31);
+                    let t0a = _mm256_unpacklo_ps(fl0a, fh0a);
+                    let t1a = _mm256_unpackhi_ps(fl0a, fh0a);
+                    let n0a = _mm256_permute2f128_ps(t0a, t1a, 0x20);
+                    let n1a = _mm256_permute2f128_ps(t0a, t1a, 0x31);
+                    let t2a = _mm256_unpacklo_ps(fl1a, fh1a);
+                    let t3a = _mm256_unpackhi_ps(fl1a, fh1a);
+                    let n2a = _mm256_permute2f128_ps(t2a, t3a, 0x20);
+                    let n3a = _mm256_permute2f128_ps(t2a, t3a, 0x31);
 
-                    let out_2 = _mm256_unpacklo_ps(f_l_1, f_h_1);
-                    let out_3 = _mm256_unpackhi_ps(f_l_1, f_h_1);
-                    let final_2 = _mm256_permute2f128_ps(out_2, out_3, 0x20);
-                    let final_3 = _mm256_permute2f128_ps(out_2, out_3, 0x31);
+                    let o0a = _mm256_loadu_ps(other_ptr.add(i * 32));
+                    let o1a = _mm256_loadu_ps(other_ptr.add(i * 32 + 8));
+                    let o2a = _mm256_loadu_ps(other_ptr.add(i * 32 + 16));
+                    let o3a = _mm256_loadu_ps(other_ptr.add(i * 32 + 24));
 
-                    // Load other
-                    let other_0 = _mm256_loadu_ps(other_ptr.add(i * 32));
-                    let other_1 = _mm256_loadu_ps(other_ptr.add(i * 32 + 8));
-                    let other_2 = _mm256_loadu_ps(other_ptr.add(i * 32 + 16));
-                    let other_3 = _mm256_loadu_ps(other_ptr.add(i * 32 + 24));
+                    acc0 = _mm256_fmadd_ps(n0a, o0a, acc0);
+                    acc1 = _mm256_fmadd_ps(n1a, o1a, acc1);
+                    acc2 = _mm256_fmadd_ps(n2a, o2a, acc2);
+                    acc3 = _mm256_fmadd_ps(n3a, o3a, acc3);
 
-                    // Accumulate nib * other into 4 independent accumulators
-                    acc0 = _mm256_fmadd_ps(final_0, other_0, acc0);
-                    acc1 = _mm256_fmadd_ps(final_1, other_1, acc1);
-                    acc2 = _mm256_fmadd_ps(final_2, other_2, acc2);
-                    acc3 = _mm256_fmadd_ps(final_3, other_3, acc3);
+                    acc_oth0 = _mm256_add_ps(acc_oth0,
+                        _mm256_add_ps(_mm256_add_ps(o0a, o1a), _mm256_add_ps(o2a, o3a)));
 
-                    // Accumulate sum(other) for offset term
-                    let oth_pair = _mm256_add_ps(
-                        _mm256_add_ps(other_0, other_1),
-                        _mm256_add_ps(other_2, other_3),
-                    );
-                    acc_oth = _mm256_add_ps(acc_oth, oth_pair);
+                    // --- Second half (i+1) ---
+                    let v_b = _mm_loadu_si128(qs_ptr.add((i + 1) * 16) as *const _);
+                    let lo_b  = _mm_and_si128(v_b, mask);
+                    let hi_b = _mm_and_si128(_mm_srli_epi16(v_b, 4), mask);
 
-                    i += 1;
+                    let fl0b = _mm256_cvtepi32_ps(_mm256_cvtepu8_epi32(lo_b));
+                    let fl1b = _mm256_cvtepi32_ps(_mm256_cvtepu8_epi32(_mm_srli_si128(lo_b, 8)));
+                    let fh0b = _mm256_cvtepi32_ps(_mm256_cvtepu8_epi32(hi_b));
+                    let fh1b = _mm256_cvtepi32_ps(_mm256_cvtepu8_epi32(_mm_srli_si128(hi_b, 8)));
+
+                    let t0b = _mm256_unpacklo_ps(fl0b, fh0b);
+                    let t1b = _mm256_unpackhi_ps(fl0b, fh0b);
+                    let n0b = _mm256_permute2f128_ps(t0b, t1b, 0x20);
+                    let n1b = _mm256_permute2f128_ps(t0b, t1b, 0x31);
+                    let t2b = _mm256_unpacklo_ps(fl1b, fh1b);
+                    let t3b = _mm256_unpackhi_ps(fl1b, fh1b);
+                    let n2b = _mm256_permute2f128_ps(t2b, t3b, 0x20);
+                    let n3b = _mm256_permute2f128_ps(t2b, t3b, 0x31);
+
+                    let o0b = _mm256_loadu_ps(other_ptr.add((i + 1) * 32));
+                    let o1b = _mm256_loadu_ps(other_ptr.add((i + 1) * 32 + 8));
+                    let o2b = _mm256_loadu_ps(other_ptr.add((i + 1) * 32 + 16));
+                    let o3b = _mm256_loadu_ps(other_ptr.add((i + 1) * 32 + 24));
+
+                    acc0 = _mm256_fmadd_ps(n0b, o0b, acc0);
+                    acc1 = _mm256_fmadd_ps(n1b, o1b, acc1);
+                    acc2 = _mm256_fmadd_ps(n2b, o2b, acc2);
+                    acc3 = _mm256_fmadd_ps(n3b, o3b, acc3);
+
+                    acc_oth1 = _mm256_add_ps(acc_oth1,
+                        _mm256_add_ps(_mm256_add_ps(o0b, o1b), _mm256_add_ps(o2b, o3b)));
+
+                    i += 2;
                 }
 
-                // Merge 4 nib*other accumulators
+                // Merge accumulators
                 let acc_nib = _mm256_add_ps(
                     _mm256_add_ps(acc0, acc1),
                     _mm256_add_ps(acc2, acc3),
                 );
+                let acc_oth = _mm256_add_ps(acc_oth0, acc_oth1);
 
                 let nib_sum = $crate::simd_primitive!(avx2, f32, reduce_sum, acc_nib);
                 let oth_sum = $crate::simd_primitive!(avx2, f32, reduce_sum, acc_oth);
