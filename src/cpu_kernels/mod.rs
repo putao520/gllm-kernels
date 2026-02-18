@@ -43,6 +43,9 @@ pub enum IsaLevel {
     Scalar,
     Avx2,
     Avx512,
+    /// AVX-512 with native FP16 support (Sapphire Rapids+).
+    /// 32 x f16 per register, native FMA/add/mul — 2x throughput vs F16C conversion path.
+    Avx512Fp16,
     Neon,
 }
 
@@ -54,7 +57,9 @@ pub fn get_isa_level() -> IsaLevel {
 
 #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
 fn detect_isa_features() -> IsaLevel {
-    if is_x86_feature_detected!("avx512f") {
+    if is_x86_feature_detected!("avx512fp16") {
+        IsaLevel::Avx512Fp16
+    } else if is_x86_feature_detected!("avx512f") {
         IsaLevel::Avx512
     } else if is_x86_feature_detected!("avx2") {
         IsaLevel::Avx2
@@ -106,7 +111,7 @@ macro_rules! define_quant_dot_k {
             let src = other.as_ptr();
             match get_isa_level() {
                 #[cfg(target_arch = "x86_64")]
-                IsaLevel::Avx512 => { crate::quant_primitive!(avx512, $qfmt, dot, blk, src) }
+                IsaLevel::Avx512 | IsaLevel::Avx512Fp16 => { crate::quant_primitive!(avx512, $qfmt, dot, blk, src) }
                 #[cfg(target_arch = "x86_64")]
                 IsaLevel::Avx2 => { crate::quant_primitive!(avx2, $qfmt, dot, blk, src) }
                 #[cfg(target_arch = "aarch64")]
@@ -125,7 +130,7 @@ macro_rules! define_quant_dot_iq {
             let src = other.as_ptr();
             match get_isa_level() {
                 #[cfg(target_arch = "x86_64")]
-                IsaLevel::Avx512 => { crate::quant_primitive!(avx512, $qfmt, dot, blk, src) }
+                IsaLevel::Avx512 | IsaLevel::Avx512Fp16 => { crate::quant_primitive!(avx512, $qfmt, dot, blk, src) }
                 #[cfg(target_arch = "x86_64")]
                 IsaLevel::Avx2 => { crate::quant_primitive!(avx2, $qfmt, dot, blk, src) }
                 #[cfg(target_arch = "aarch64")]
@@ -144,7 +149,7 @@ macro_rules! define_quant_decode_k {
             let dst = out.as_mut_ptr();
             match get_isa_level() {
                 #[cfg(target_arch = "x86_64")]
-                IsaLevel::Avx512 => { crate::quant_primitive!(avx512, $qfmt, decode, blk, dst); }
+                IsaLevel::Avx512 | IsaLevel::Avx512Fp16 => { crate::quant_primitive!(avx512, $qfmt, decode, blk, dst); }
                 #[cfg(target_arch = "x86_64")]
                 IsaLevel::Avx2 => { crate::quant_primitive!(avx2, $qfmt, decode, blk, dst); }
                 #[cfg(target_arch = "aarch64")]
@@ -174,7 +179,7 @@ macro_rules! define_quant_decode_avx512 {
             let dst = out.as_mut_ptr();
             match get_isa_level() {
                 #[cfg(target_arch = "x86_64")]
-                IsaLevel::Avx512 => { crate::quant_primitive!(avx512, $qfmt, decode, blk, dst); }
+                IsaLevel::Avx512 | IsaLevel::Avx512Fp16 => { crate::quant_primitive!(avx512, $qfmt, decode, blk, dst); }
                 #[cfg(target_arch = "aarch64")]
                 IsaLevel::Neon => { crate::quant_primitive!(neon, $qfmt, decode, blk, dst); }
                 _ => { crate::quant_primitive!(scalar, $qfmt, decode, blk, dst); }
@@ -191,7 +196,7 @@ macro_rules! define_quant_decode_iq {
             let dst = out.as_mut_ptr();
             match get_isa_level() {
                 #[cfg(target_arch = "x86_64")]
-                IsaLevel::Avx512 => { crate::quant_primitive!(avx512, $qfmt, decode, blk, dst); }
+                IsaLevel::Avx512 | IsaLevel::Avx512Fp16 => { crate::quant_primitive!(avx512, $qfmt, decode, blk, dst); }
                 #[cfg(target_arch = "x86_64")]
                 IsaLevel::Avx2 => { crate::quant_primitive!(avx2, $qfmt, decode, blk, dst); }
                 #[cfg(target_arch = "aarch64")]
@@ -210,7 +215,7 @@ macro_rules! define_quant_dot_iq4 {
             let src = other.as_ptr();
             match get_isa_level() {
                 #[cfg(target_arch = "x86_64")]
-                IsaLevel::Avx512 => { crate::quant_primitive!(avx512, $qfmt, dot, blk, src) }
+                IsaLevel::Avx512 | IsaLevel::Avx512Fp16 => { crate::quant_primitive!(avx512, $qfmt, dot, blk, src) }
                 #[cfg(target_arch = "x86_64")]
                 IsaLevel::Avx2 => { crate::quant_primitive!(avx2, $qfmt, dot, blk, src) }
                 #[cfg(target_arch = "aarch64")]
@@ -229,7 +234,7 @@ macro_rules! define_quant_decode_iq4 {
             let dst = out.as_mut_ptr();
             match get_isa_level() {
                 #[cfg(target_arch = "x86_64")]
-                IsaLevel::Avx512 => { crate::quant_primitive!(avx512, $qfmt, decode, blk, dst); }
+                IsaLevel::Avx512 | IsaLevel::Avx512Fp16 => { crate::quant_primitive!(avx512, $qfmt, decode, blk, dst); }
                 #[cfg(target_arch = "x86_64")]
                 IsaLevel::Avx2 => { crate::quant_primitive!(avx2, $qfmt, decode, blk, dst); }
                 #[cfg(target_arch = "aarch64")]
@@ -248,7 +253,7 @@ macro_rules! define_quant_dot_commercial {
             let src = other.as_ptr();
             match get_isa_level() {
                 #[cfg(target_arch = "x86_64")]
-                IsaLevel::Avx512 => { crate::quant_primitive!(avx512, $qfmt, dot, blk, src) }
+                IsaLevel::Avx512 | IsaLevel::Avx512Fp16 => { crate::quant_primitive!(avx512, $qfmt, dot, blk, src) }
                 #[cfg(target_arch = "x86_64")]
                 IsaLevel::Avx2 => { crate::quant_primitive!(avx2, $qfmt, dot, blk, src) }
                 #[cfg(target_arch = "aarch64")]
@@ -294,7 +299,7 @@ impl<E: Element> CpuKernels<E> {
     fn dot_f32(&self, a: &[f32], b: &[f32]) -> f32 {
         match get_isa_level() {
             #[cfg(target_arch = "x86_64")]
-            IsaLevel::Avx512 => avx512::avx512_f32::dot(a, b).to_f32(),
+            IsaLevel::Avx512 | IsaLevel::Avx512Fp16 => avx512::avx512_f32::dot(a, b).to_f32(),
             #[cfg(target_arch = "x86_64")]
             IsaLevel::Avx2 => avx2::avx2_f32::dot(a, b).to_f32(),
             #[cfg(target_arch = "aarch64")]
@@ -370,11 +375,13 @@ macro_rules! dispatch_binary_op {
     ($a:expr, $b:expr, $out:expr, $op:ident) => {
         match (get_isa_level(), E::ELEM_ID) {
             #[cfg(target_arch = "x86_64")]
-            (IsaLevel::Avx512, 0) => avx512::avx512_f32::$op(as_typed_slice!($a, f32), as_typed_slice!($b, f32), as_typed_slice_mut!($out, f32)),
+            (IsaLevel::Avx512Fp16, 1) => avx512::avx512fp16_f16::$op(as_typed_slice!($a, half::f16), as_typed_slice!($b, half::f16), as_typed_slice_mut!($out, half::f16)),
+            #[cfg(target_arch = "x86_64")]
+            (IsaLevel::Avx512 | IsaLevel::Avx512Fp16, 0) => avx512::avx512_f32::$op(as_typed_slice!($a, f32), as_typed_slice!($b, f32), as_typed_slice_mut!($out, f32)),
             #[cfg(target_arch = "x86_64")]
             (IsaLevel::Avx512, 1) => avx512::avx512_f16::$op(as_typed_slice!($a, half::f16), as_typed_slice!($b, half::f16), as_typed_slice_mut!($out, half::f16)),
             #[cfg(target_arch = "x86_64")]
-            (IsaLevel::Avx512, 2) => avx512::avx512_bf16::$op(as_typed_slice!($a, half::bf16), as_typed_slice!($b, half::bf16), as_typed_slice_mut!($out, half::bf16)),
+            (IsaLevel::Avx512 | IsaLevel::Avx512Fp16, 2) => avx512::avx512_bf16::$op(as_typed_slice!($a, half::bf16), as_typed_slice!($b, half::bf16), as_typed_slice_mut!($out, half::bf16)),
             #[cfg(target_arch = "x86_64")]
             (IsaLevel::Avx2, 0) => avx2::avx2_f32::$op(as_typed_slice!($a, f32), as_typed_slice!($b, f32), as_typed_slice_mut!($out, f32)),
             #[cfg(target_arch = "x86_64")]
@@ -399,11 +406,13 @@ macro_rules! dispatch_unary_op {
     ($a:expr, $out:expr, $op:ident) => {
         match (get_isa_level(), E::ELEM_ID) {
             #[cfg(target_arch = "x86_64")]
-            (IsaLevel::Avx512, 0) => avx512::avx512_f32::$op(as_typed_slice!($a, f32), as_typed_slice_mut!($out, f32)),
+            (IsaLevel::Avx512Fp16, 1) => avx512::avx512fp16_f16::$op(as_typed_slice!($a, half::f16), as_typed_slice_mut!($out, half::f16)),
+            #[cfg(target_arch = "x86_64")]
+            (IsaLevel::Avx512 | IsaLevel::Avx512Fp16, 0) => avx512::avx512_f32::$op(as_typed_slice!($a, f32), as_typed_slice_mut!($out, f32)),
             #[cfg(target_arch = "x86_64")]
             (IsaLevel::Avx512, 1) => avx512::avx512_f16::$op(as_typed_slice!($a, half::f16), as_typed_slice_mut!($out, half::f16)),
             #[cfg(target_arch = "x86_64")]
-            (IsaLevel::Avx512, 2) => avx512::avx512_bf16::$op(as_typed_slice!($a, half::bf16), as_typed_slice_mut!($out, half::bf16)),
+            (IsaLevel::Avx512 | IsaLevel::Avx512Fp16, 2) => avx512::avx512_bf16::$op(as_typed_slice!($a, half::bf16), as_typed_slice_mut!($out, half::bf16)),
             #[cfg(target_arch = "x86_64")]
             (IsaLevel::Avx2, 0) => avx2::avx2_f32::$op(as_typed_slice!($a, f32), as_typed_slice_mut!($out, f32)),
             #[cfg(target_arch = "x86_64")]
@@ -428,11 +437,13 @@ macro_rules! dispatch_reduce_op {
     ($a:expr, $op:ident) => {
         match (get_isa_level(), E::ELEM_ID) {
             #[cfg(target_arch = "x86_64")]
-            (IsaLevel::Avx512, 0) => avx512::avx512_f32::$op(as_typed_slice!($a, f32)).to_f32(),
+            (IsaLevel::Avx512Fp16, 1) => avx512::avx512fp16_f16::$op(as_typed_slice!($a, half::f16)).to_f32(),
+            #[cfg(target_arch = "x86_64")]
+            (IsaLevel::Avx512 | IsaLevel::Avx512Fp16, 0) => avx512::avx512_f32::$op(as_typed_slice!($a, f32)).to_f32(),
             #[cfg(target_arch = "x86_64")]
             (IsaLevel::Avx512, 1) => avx512::avx512_f16::$op(as_typed_slice!($a, half::f16)).to_f32(),
             #[cfg(target_arch = "x86_64")]
-            (IsaLevel::Avx512, 2) => avx512::avx512_bf16::$op(as_typed_slice!($a, half::bf16)).to_f32(),
+            (IsaLevel::Avx512 | IsaLevel::Avx512Fp16, 2) => avx512::avx512_bf16::$op(as_typed_slice!($a, half::bf16)).to_f32(),
             #[cfg(target_arch = "x86_64")]
             (IsaLevel::Avx2, 0) => avx2::avx2_f32::$op(as_typed_slice!($a, f32)).to_f32(),
             #[cfg(target_arch = "x86_64")]
@@ -458,11 +469,13 @@ macro_rules! dispatch_dot_op {
     ($a:expr, $b:expr, $op:ident) => {
         match (get_isa_level(), E::ELEM_ID) {
             #[cfg(target_arch = "x86_64")]
-            (IsaLevel::Avx512, 0) => avx512::avx512_f32::$op(as_typed_slice!($a, f32), as_typed_slice!($b, f32)).to_f32(),
+            (IsaLevel::Avx512Fp16, 1) => avx512::avx512fp16_f16::$op(as_typed_slice!($a, half::f16), as_typed_slice!($b, half::f16)).to_f32(),
+            #[cfg(target_arch = "x86_64")]
+            (IsaLevel::Avx512 | IsaLevel::Avx512Fp16, 0) => avx512::avx512_f32::$op(as_typed_slice!($a, f32), as_typed_slice!($b, f32)).to_f32(),
             #[cfg(target_arch = "x86_64")]
             (IsaLevel::Avx512, 1) => avx512::avx512_f16::$op(as_typed_slice!($a, half::f16), as_typed_slice!($b, half::f16)).to_f32(),
             #[cfg(target_arch = "x86_64")]
-            (IsaLevel::Avx512, 2) => avx512::avx512_bf16::$op(as_typed_slice!($a, half::bf16), as_typed_slice!($b, half::bf16)).to_f32(),
+            (IsaLevel::Avx512 | IsaLevel::Avx512Fp16, 2) => avx512::avx512_bf16::$op(as_typed_slice!($a, half::bf16), as_typed_slice!($b, half::bf16)).to_f32(),
             #[cfg(target_arch = "x86_64")]
             (IsaLevel::Avx2, 0) => avx2::avx2_f32::$op(as_typed_slice!($a, f32), as_typed_slice!($b, f32)).to_f32(),
             #[cfg(target_arch = "x86_64")]
@@ -489,11 +502,13 @@ macro_rules! dispatch_with_scalar {
     ($op:ident, $scalar:expr, $x:expr, $y:expr) => {
         match (get_isa_level(), E::ELEM_ID) {
             #[cfg(target_arch = "x86_64")]
-            (IsaLevel::Avx512, 0) => avx512::avx512_f32::$op($scalar, as_typed_slice!($x, f32), as_typed_slice_mut!($y, f32)),
+            (IsaLevel::Avx512Fp16, 1) => avx512::avx512fp16_f16::$op(half::f16::from_f32($scalar), as_typed_slice!($x, half::f16), as_typed_slice_mut!($y, half::f16)),
+            #[cfg(target_arch = "x86_64")]
+            (IsaLevel::Avx512 | IsaLevel::Avx512Fp16, 0) => avx512::avx512_f32::$op($scalar, as_typed_slice!($x, f32), as_typed_slice_mut!($y, f32)),
             #[cfg(target_arch = "x86_64")]
             (IsaLevel::Avx512, 1) => avx512::avx512_f16::$op(half::f16::from_f32($scalar), as_typed_slice!($x, half::f16), as_typed_slice_mut!($y, half::f16)),
             #[cfg(target_arch = "x86_64")]
-            (IsaLevel::Avx512, 2) => avx512::avx512_bf16::$op(half::bf16::from_f32($scalar), as_typed_slice!($x, half::bf16), as_typed_slice_mut!($y, half::bf16)),
+            (IsaLevel::Avx512 | IsaLevel::Avx512Fp16, 2) => avx512::avx512_bf16::$op(half::bf16::from_f32($scalar), as_typed_slice!($x, half::bf16), as_typed_slice_mut!($y, half::bf16)),
             #[cfg(target_arch = "x86_64")]
             (IsaLevel::Avx2, 0) => avx2::avx2_f32::$op($scalar, as_typed_slice!($x, f32), as_typed_slice_mut!($y, f32)),
             #[cfg(target_arch = "x86_64")]
@@ -521,11 +536,13 @@ macro_rules! dispatch_with_eps {
     ($op:ident, $x:expr, $w:expr, $out:expr, $eps:expr) => {
         match (get_isa_level(), E::ELEM_ID) {
             #[cfg(target_arch = "x86_64")]
-            (IsaLevel::Avx512, 0) => avx512::avx512_f32::$op(as_typed_slice!($x, f32), as_typed_slice!($w, f32), as_typed_slice_mut!($out, f32), $eps),
+            (IsaLevel::Avx512Fp16, 1) => avx512::avx512fp16_f16::$op(as_typed_slice!($x, half::f16), as_typed_slice!($w, half::f16), as_typed_slice_mut!($out, half::f16), half::f16::from_f32($eps)),
+            #[cfg(target_arch = "x86_64")]
+            (IsaLevel::Avx512 | IsaLevel::Avx512Fp16, 0) => avx512::avx512_f32::$op(as_typed_slice!($x, f32), as_typed_slice!($w, f32), as_typed_slice_mut!($out, f32), $eps),
             #[cfg(target_arch = "x86_64")]
             (IsaLevel::Avx512, 1) => avx512::avx512_f16::$op(as_typed_slice!($x, half::f16), as_typed_slice!($w, half::f16), as_typed_slice_mut!($out, half::f16), half::f16::from_f32($eps)),
             #[cfg(target_arch = "x86_64")]
-            (IsaLevel::Avx512, 2) => avx512::avx512_bf16::$op(as_typed_slice!($x, half::bf16), as_typed_slice!($w, half::bf16), as_typed_slice_mut!($out, half::bf16), half::bf16::from_f32($eps)),
+            (IsaLevel::Avx512 | IsaLevel::Avx512Fp16, 2) => avx512::avx512_bf16::$op(as_typed_slice!($x, half::bf16), as_typed_slice!($w, half::bf16), as_typed_slice_mut!($out, half::bf16), half::bf16::from_f32($eps)),
             #[cfg(target_arch = "x86_64")]
             (IsaLevel::Avx2, 0) => avx2::avx2_f32::$op(as_typed_slice!($x, f32), as_typed_slice!($w, f32), as_typed_slice_mut!($out, f32), $eps),
             #[cfg(target_arch = "x86_64")]
@@ -548,11 +565,13 @@ macro_rules! dispatch_with_eps {
     ($op:ident, $x:expr, $g:expr, $b:expr, $out:expr, $eps:expr) => {
         match (get_isa_level(), E::ELEM_ID) {
             #[cfg(target_arch = "x86_64")]
-            (IsaLevel::Avx512, 0) => avx512::avx512_f32::$op(as_typed_slice!($x, f32), as_typed_slice!($g, f32), as_typed_slice!($b, f32), as_typed_slice_mut!($out, f32), $eps),
+            (IsaLevel::Avx512Fp16, 1) => avx512::avx512fp16_f16::$op(as_typed_slice!($x, half::f16), as_typed_slice!($g, half::f16), as_typed_slice!($b, half::f16), as_typed_slice_mut!($out, half::f16), half::f16::from_f32($eps)),
+            #[cfg(target_arch = "x86_64")]
+            (IsaLevel::Avx512 | IsaLevel::Avx512Fp16, 0) => avx512::avx512_f32::$op(as_typed_slice!($x, f32), as_typed_slice!($g, f32), as_typed_slice!($b, f32), as_typed_slice_mut!($out, f32), $eps),
             #[cfg(target_arch = "x86_64")]
             (IsaLevel::Avx512, 1) => avx512::avx512_f16::$op(as_typed_slice!($x, half::f16), as_typed_slice!($g, half::f16), as_typed_slice!($b, half::f16), as_typed_slice_mut!($out, half::f16), half::f16::from_f32($eps)),
             #[cfg(target_arch = "x86_64")]
-            (IsaLevel::Avx512, 2) => avx512::avx512_bf16::$op(as_typed_slice!($x, half::bf16), as_typed_slice!($g, half::bf16), as_typed_slice!($b, half::bf16), as_typed_slice_mut!($out, half::bf16), half::bf16::from_f32($eps)),
+            (IsaLevel::Avx512 | IsaLevel::Avx512Fp16, 2) => avx512::avx512_bf16::$op(as_typed_slice!($x, half::bf16), as_typed_slice!($g, half::bf16), as_typed_slice!($b, half::bf16), as_typed_slice_mut!($out, half::bf16), half::bf16::from_f32($eps)),
             #[cfg(target_arch = "x86_64")]
             (IsaLevel::Avx2, 0) => avx2::avx2_f32::$op(as_typed_slice!($x, f32), as_typed_slice!($g, f32), as_typed_slice!($b, f32), as_typed_slice_mut!($out, f32), $eps),
             #[cfg(target_arch = "x86_64")]
@@ -580,11 +599,13 @@ macro_rules! dispatch_with_dims {
     ($op:ident, $a:expr, $x:expr, $y:expr, $m:expr, $n:expr) => {
         match (get_isa_level(), E::ELEM_ID) {
             #[cfg(target_arch = "x86_64")]
-            (IsaLevel::Avx512, 0) => avx512::avx512_f32::$op(as_typed_slice!($a, f32), as_typed_slice!($x, f32), as_typed_slice_mut!($y, f32), $m, $n),
+            (IsaLevel::Avx512Fp16, 1) => avx512::avx512fp16_f16::$op(as_typed_slice!($a, half::f16), as_typed_slice!($x, half::f16), as_typed_slice_mut!($y, half::f16), $m, $n),
+            #[cfg(target_arch = "x86_64")]
+            (IsaLevel::Avx512 | IsaLevel::Avx512Fp16, 0) => avx512::avx512_f32::$op(as_typed_slice!($a, f32), as_typed_slice!($x, f32), as_typed_slice_mut!($y, f32), $m, $n),
             #[cfg(target_arch = "x86_64")]
             (IsaLevel::Avx512, 1) => avx512::avx512_f16::$op(as_typed_slice!($a, half::f16), as_typed_slice!($x, half::f16), as_typed_slice_mut!($y, half::f16), $m, $n),
             #[cfg(target_arch = "x86_64")]
-            (IsaLevel::Avx512, 2) => avx512::avx512_bf16::$op(as_typed_slice!($a, half::bf16), as_typed_slice!($x, half::bf16), as_typed_slice_mut!($y, half::bf16), $m, $n),
+            (IsaLevel::Avx512 | IsaLevel::Avx512Fp16, 2) => avx512::avx512_bf16::$op(as_typed_slice!($a, half::bf16), as_typed_slice!($x, half::bf16), as_typed_slice_mut!($y, half::bf16), $m, $n),
             #[cfg(target_arch = "x86_64")]
             (IsaLevel::Avx2, 0) => avx2::avx2_f32::$op(as_typed_slice!($a, f32), as_typed_slice!($x, f32), as_typed_slice_mut!($y, f32), $m, $n),
             #[cfg(target_arch = "x86_64")]
@@ -607,11 +628,13 @@ macro_rules! dispatch_with_dims {
     ($op:ident, $a:expr, $b:expr, $c:expr, $m:expr, $n:expr, $k:expr) => {
         match (get_isa_level(), E::ELEM_ID) {
             #[cfg(target_arch = "x86_64")]
-            (IsaLevel::Avx512, 0) => avx512::avx512_f32::$op(as_typed_slice!($a, f32), as_typed_slice!($b, f32), as_typed_slice_mut!($c, f32), $m, $n, $k),
+            (IsaLevel::Avx512Fp16, 1) => avx512::avx512fp16_f16::$op(as_typed_slice!($a, half::f16), as_typed_slice!($b, half::f16), as_typed_slice_mut!($c, half::f16), $m, $n, $k),
+            #[cfg(target_arch = "x86_64")]
+            (IsaLevel::Avx512 | IsaLevel::Avx512Fp16, 0) => avx512::avx512_f32::$op(as_typed_slice!($a, f32), as_typed_slice!($b, f32), as_typed_slice_mut!($c, f32), $m, $n, $k),
             #[cfg(target_arch = "x86_64")]
             (IsaLevel::Avx512, 1) => avx512::avx512_f16::$op(as_typed_slice!($a, half::f16), as_typed_slice!($b, half::f16), as_typed_slice_mut!($c, half::f16), $m, $n, $k),
             #[cfg(target_arch = "x86_64")]
-            (IsaLevel::Avx512, 2) => avx512::avx512_bf16::$op(as_typed_slice!($a, half::bf16), as_typed_slice!($b, half::bf16), as_typed_slice_mut!($c, half::bf16), $m, $n, $k),
+            (IsaLevel::Avx512 | IsaLevel::Avx512Fp16, 2) => avx512::avx512_bf16::$op(as_typed_slice!($a, half::bf16), as_typed_slice!($b, half::bf16), as_typed_slice_mut!($c, half::bf16), $m, $n, $k),
             #[cfg(target_arch = "x86_64")]
             (IsaLevel::Avx2, 0) => avx2::avx2_f32::$op(as_typed_slice!($a, f32), as_typed_slice!($b, f32), as_typed_slice_mut!($c, f32), $m, $n, $k),
             #[cfg(target_arch = "x86_64")]
@@ -637,11 +660,13 @@ macro_rules! dispatch_rope {
     ($op:ident, $qk:expr, $cos:expr, $sin:expr, $hd:expr) => {
         match (get_isa_level(), E::ELEM_ID) {
             #[cfg(target_arch = "x86_64")]
-            (IsaLevel::Avx512, 0) => avx512::avx512_f32::$op(as_typed_slice_mut!($qk, f32), as_typed_slice!($cos, f32), as_typed_slice!($sin, f32), $hd),
+            (IsaLevel::Avx512Fp16, 1) => avx512::avx512fp16_f16::$op(as_typed_slice_mut!($qk, half::f16), as_typed_slice!($cos, half::f16), as_typed_slice!($sin, half::f16), $hd),
+            #[cfg(target_arch = "x86_64")]
+            (IsaLevel::Avx512 | IsaLevel::Avx512Fp16, 0) => avx512::avx512_f32::$op(as_typed_slice_mut!($qk, f32), as_typed_slice!($cos, f32), as_typed_slice!($sin, f32), $hd),
             #[cfg(target_arch = "x86_64")]
             (IsaLevel::Avx512, 1) => avx512::avx512_f16::$op(as_typed_slice_mut!($qk, half::f16), as_typed_slice!($cos, half::f16), as_typed_slice!($sin, half::f16), $hd),
             #[cfg(target_arch = "x86_64")]
-            (IsaLevel::Avx512, 2) => avx512::avx512_bf16::$op(as_typed_slice_mut!($qk, half::bf16), as_typed_slice!($cos, half::bf16), as_typed_slice!($sin, half::bf16), $hd),
+            (IsaLevel::Avx512 | IsaLevel::Avx512Fp16, 2) => avx512::avx512_bf16::$op(as_typed_slice_mut!($qk, half::bf16), as_typed_slice!($cos, half::bf16), as_typed_slice!($sin, half::bf16), $hd),
             #[cfg(target_arch = "x86_64")]
             (IsaLevel::Avx2, 0) => avx2::avx2_f32::$op(as_typed_slice_mut!($qk, f32), as_typed_slice!($cos, f32), as_typed_slice!($sin, f32), $hd),
             #[cfg(target_arch = "x86_64")]
@@ -667,11 +692,13 @@ macro_rules! dispatch_rope_with_pos {
     ($op:ident, $qk:expr, $cos:expr, $sin:expr, $hd:expr, $pos:expr) => {
         match (get_isa_level(), E::ELEM_ID) {
             #[cfg(target_arch = "x86_64")]
-            (IsaLevel::Avx512, 0) => avx512::avx512_f32::$op(as_typed_slice_mut!($qk, f32), as_typed_slice!($cos, f32), as_typed_slice!($sin, f32), $hd, $pos),
+            (IsaLevel::Avx512Fp16, 1) => avx512::avx512fp16_f16::$op(as_typed_slice_mut!($qk, half::f16), as_typed_slice!($cos, half::f16), as_typed_slice!($sin, half::f16), $hd, $pos),
+            #[cfg(target_arch = "x86_64")]
+            (IsaLevel::Avx512 | IsaLevel::Avx512Fp16, 0) => avx512::avx512_f32::$op(as_typed_slice_mut!($qk, f32), as_typed_slice!($cos, f32), as_typed_slice!($sin, f32), $hd, $pos),
             #[cfg(target_arch = "x86_64")]
             (IsaLevel::Avx512, 1) => avx512::avx512_f16::$op(as_typed_slice_mut!($qk, half::f16), as_typed_slice!($cos, half::f16), as_typed_slice!($sin, half::f16), $hd, $pos),
             #[cfg(target_arch = "x86_64")]
-            (IsaLevel::Avx512, 2) => avx512::avx512_bf16::$op(as_typed_slice_mut!($qk, half::bf16), as_typed_slice!($cos, half::bf16), as_typed_slice!($sin, half::bf16), $hd, $pos),
+            (IsaLevel::Avx512 | IsaLevel::Avx512Fp16, 2) => avx512::avx512_bf16::$op(as_typed_slice_mut!($qk, half::bf16), as_typed_slice!($cos, half::bf16), as_typed_slice!($sin, half::bf16), $hd, $pos),
             #[cfg(target_arch = "x86_64")]
             (IsaLevel::Avx2, 0) => avx2::avx2_f32::$op(as_typed_slice_mut!($qk, f32), as_typed_slice!($cos, f32), as_typed_slice!($sin, f32), $hd, $pos),
             #[cfg(target_arch = "x86_64")]
@@ -697,11 +724,13 @@ macro_rules! dispatch_scale {
     ($op:ident, $x:expr, $sf:expr, $tmp:expr) => {
         match (get_isa_level(), E::ELEM_ID) {
             #[cfg(target_arch = "x86_64")]
-            (IsaLevel::Avx512, 0) => avx512::avx512_f32::$op(as_typed_slice!($x, f32), $sf, as_typed_slice_mut!($tmp, f32)),
+            (IsaLevel::Avx512Fp16, 1) => avx512::avx512fp16_f16::$op(as_typed_slice!($x, half::f16), half::f16::from_f32($sf), as_typed_slice_mut!($tmp, half::f16)),
+            #[cfg(target_arch = "x86_64")]
+            (IsaLevel::Avx512 | IsaLevel::Avx512Fp16, 0) => avx512::avx512_f32::$op(as_typed_slice!($x, f32), $sf, as_typed_slice_mut!($tmp, f32)),
             #[cfg(target_arch = "x86_64")]
             (IsaLevel::Avx512, 1) => avx512::avx512_f16::$op(as_typed_slice!($x, half::f16), half::f16::from_f32($sf), as_typed_slice_mut!($tmp, half::f16)),
             #[cfg(target_arch = "x86_64")]
-            (IsaLevel::Avx512, 2) => avx512::avx512_bf16::$op(as_typed_slice!($x, half::bf16), half::bf16::from_f32($sf), as_typed_slice_mut!($tmp, half::bf16)),
+            (IsaLevel::Avx512 | IsaLevel::Avx512Fp16, 2) => avx512::avx512_bf16::$op(as_typed_slice!($x, half::bf16), half::bf16::from_f32($sf), as_typed_slice_mut!($tmp, half::bf16)),
             #[cfg(target_arch = "x86_64")]
             (IsaLevel::Avx2, 0) => avx2::avx2_f32::$op(as_typed_slice!($x, f32), $sf, as_typed_slice_mut!($tmp, f32)),
             #[cfg(target_arch = "x86_64")]
@@ -728,11 +757,13 @@ macro_rules! dispatch_bias_rows {
     ($op:ident, $c:expr, $bias:expr, $m:expr, $n:expr) => {
         match (get_isa_level(), E::ELEM_ID) {
             #[cfg(target_arch = "x86_64")]
-            (IsaLevel::Avx512, 0) => avx512::avx512_f32::$op(as_typed_slice_mut!($c, f32), as_typed_slice!($bias, f32), $m, $n),
+            (IsaLevel::Avx512Fp16, 1) => avx512::avx512fp16_f16::$op(as_typed_slice_mut!($c, half::f16), as_typed_slice!($bias, half::f16), $m, $n),
+            #[cfg(target_arch = "x86_64")]
+            (IsaLevel::Avx512 | IsaLevel::Avx512Fp16, 0) => avx512::avx512_f32::$op(as_typed_slice_mut!($c, f32), as_typed_slice!($bias, f32), $m, $n),
             #[cfg(target_arch = "x86_64")]
             (IsaLevel::Avx512, 1) => avx512::avx512_f16::$op(as_typed_slice_mut!($c, half::f16), as_typed_slice!($bias, half::f16), $m, $n),
             #[cfg(target_arch = "x86_64")]
-            (IsaLevel::Avx512, 2) => avx512::avx512_bf16::$op(as_typed_slice_mut!($c, half::bf16), as_typed_slice!($bias, half::bf16), $m, $n),
+            (IsaLevel::Avx512 | IsaLevel::Avx512Fp16, 2) => avx512::avx512_bf16::$op(as_typed_slice_mut!($c, half::bf16), as_typed_slice!($bias, half::bf16), $m, $n),
             #[cfg(target_arch = "x86_64")]
             (IsaLevel::Avx2, 0) => avx2::avx2_f32::$op(as_typed_slice_mut!($c, f32), as_typed_slice!($bias, f32), $m, $n),
             #[cfg(target_arch = "x86_64")]
@@ -758,11 +789,13 @@ macro_rules! dispatch_matmul_bias {
     ($op:ident, $a:expr, $b:expr, $bias:expr, $c:expr, $m:expr, $n:expr, $k:expr) => {
         match (get_isa_level(), E::ELEM_ID) {
             #[cfg(target_arch = "x86_64")]
-            (IsaLevel::Avx512, 0) => avx512::avx512_f32::$op(as_typed_slice!($a, f32), as_typed_slice!($b, f32), as_typed_slice!($bias, f32), as_typed_slice_mut!($c, f32), $m, $n, $k),
+            (IsaLevel::Avx512Fp16, 1) => avx512::avx512fp16_f16::$op(as_typed_slice!($a, half::f16), as_typed_slice!($b, half::f16), as_typed_slice!($bias, half::f16), as_typed_slice_mut!($c, half::f16), $m, $n, $k),
+            #[cfg(target_arch = "x86_64")]
+            (IsaLevel::Avx512 | IsaLevel::Avx512Fp16, 0) => avx512::avx512_f32::$op(as_typed_slice!($a, f32), as_typed_slice!($b, f32), as_typed_slice!($bias, f32), as_typed_slice_mut!($c, f32), $m, $n, $k),
             #[cfg(target_arch = "x86_64")]
             (IsaLevel::Avx512, 1) => avx512::avx512_f16::$op(as_typed_slice!($a, half::f16), as_typed_slice!($b, half::f16), as_typed_slice!($bias, half::f16), as_typed_slice_mut!($c, half::f16), $m, $n, $k),
             #[cfg(target_arch = "x86_64")]
-            (IsaLevel::Avx512, 2) => avx512::avx512_bf16::$op(as_typed_slice!($a, half::bf16), as_typed_slice!($b, half::bf16), as_typed_slice!($bias, half::bf16), as_typed_slice_mut!($c, half::bf16), $m, $n, $k),
+            (IsaLevel::Avx512 | IsaLevel::Avx512Fp16, 2) => avx512::avx512_bf16::$op(as_typed_slice!($a, half::bf16), as_typed_slice!($b, half::bf16), as_typed_slice!($bias, half::bf16), as_typed_slice_mut!($c, half::bf16), $m, $n, $k),
             #[cfg(target_arch = "x86_64")]
             (IsaLevel::Avx2, 0) => avx2::avx2_f32::$op(as_typed_slice!($a, f32), as_typed_slice!($b, f32), as_typed_slice!($bias, f32), as_typed_slice_mut!($c, f32), $m, $n, $k),
             #[cfg(target_arch = "x86_64")]
@@ -792,11 +825,13 @@ macro_rules! dispatch_matmul_bias_act {
         }
         match (get_isa_level(), E::ELEM_ID) {
             #[cfg(target_arch = "x86_64")]
-            (IsaLevel::Avx512, 0) => avx512::avx512_f32::$op(as_typed_slice!($a, f32), as_typed_slice!($b, f32), as_typed_slice!($bias, f32), as_typed_slice_mut!($c, f32), $m, $n, $k, act),
+            (IsaLevel::Avx512Fp16, 1) => avx512::avx512fp16_f16::$op(as_typed_slice!($a, half::f16), as_typed_slice!($b, half::f16), as_typed_slice!($bias, half::f16), as_typed_slice_mut!($c, half::f16), $m, $n, $k, act),
+            #[cfg(target_arch = "x86_64")]
+            (IsaLevel::Avx512 | IsaLevel::Avx512Fp16, 0) => avx512::avx512_f32::$op(as_typed_slice!($a, f32), as_typed_slice!($b, f32), as_typed_slice!($bias, f32), as_typed_slice_mut!($c, f32), $m, $n, $k, act),
             #[cfg(target_arch = "x86_64")]
             (IsaLevel::Avx512, 1) => avx512::avx512_f16::$op(as_typed_slice!($a, half::f16), as_typed_slice!($b, half::f16), as_typed_slice!($bias, half::f16), as_typed_slice_mut!($c, half::f16), $m, $n, $k, act),
             #[cfg(target_arch = "x86_64")]
-            (IsaLevel::Avx512, 2) => avx512::avx512_bf16::$op(as_typed_slice!($a, half::bf16), as_typed_slice!($b, half::bf16), as_typed_slice!($bias, half::bf16), as_typed_slice_mut!($c, half::bf16), $m, $n, $k, act),
+            (IsaLevel::Avx512 | IsaLevel::Avx512Fp16, 2) => avx512::avx512_bf16::$op(as_typed_slice!($a, half::bf16), as_typed_slice!($b, half::bf16), as_typed_slice!($bias, half::bf16), as_typed_slice_mut!($c, half::bf16), $m, $n, $k, act),
             #[cfg(target_arch = "x86_64")]
             (IsaLevel::Avx2, 0) => avx2::avx2_f32::$op(as_typed_slice!($a, f32), as_typed_slice!($b, f32), as_typed_slice!($bias, f32), as_typed_slice_mut!($c, f32), $m, $n, $k, act),
             #[cfg(target_arch = "x86_64")]
@@ -837,11 +872,13 @@ macro_rules! dispatch_pack_b {
     ($op:ident, $b:expr, $n:expr, $k:expr) => {
         match (get_isa_level(), E::ELEM_ID) {
             #[cfg(target_arch = "x86_64")]
-            (IsaLevel::Avx512, 0) => transmute_vec!(avx512::avx512_f32::$op(as_typed_slice!($b, f32), $n, $k), f32),
+            (IsaLevel::Avx512Fp16, 1) => transmute_vec!(avx512::avx512fp16_f16::$op(as_typed_slice!($b, half::f16), $n, $k), half::f16),
+            #[cfg(target_arch = "x86_64")]
+            (IsaLevel::Avx512 | IsaLevel::Avx512Fp16, 0) => transmute_vec!(avx512::avx512_f32::$op(as_typed_slice!($b, f32), $n, $k), f32),
             #[cfg(target_arch = "x86_64")]
             (IsaLevel::Avx512, 1) => transmute_vec!(avx512::avx512_f16::$op(as_typed_slice!($b, half::f16), $n, $k), half::f16),
             #[cfg(target_arch = "x86_64")]
-            (IsaLevel::Avx512, 2) => transmute_vec!(avx512::avx512_bf16::$op(as_typed_slice!($b, half::bf16), $n, $k), half::bf16),
+            (IsaLevel::Avx512 | IsaLevel::Avx512Fp16, 2) => transmute_vec!(avx512::avx512_bf16::$op(as_typed_slice!($b, half::bf16), $n, $k), half::bf16),
             #[cfg(target_arch = "x86_64")]
             (IsaLevel::Avx2, 0) => transmute_vec!(avx2::avx2_f32::$op(as_typed_slice!($b, f32), $n, $k), f32),
             #[cfg(target_arch = "x86_64")]

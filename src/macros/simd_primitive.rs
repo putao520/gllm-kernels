@@ -1050,4 +1050,54 @@ macro_rules! simd_primitive {
         }
     };
 
+    // ========================================================================
+    // AVX-512 FP16 Fallback Implementation
+    //
+    // Native __m512h intrinsics require core::f16 (nightly-only). Until stable
+    // Rust supports core::f16, this delegates to the AVX-512 F16C conversion
+    // path (compute in f32, load/store convert f16<->f32).
+    //
+    // TODO: Gate native __m512h path behind #[cfg(feature = "nightly")] when
+    // core::f16 stabilizes.
+    // ========================================================================
+
+    // --- Architecture Constants (same as avx512 f16 F16C path) ---
+    (avx512fp16, f16, lanes) => { $crate::simd_primitive!(avx512, f16, lanes) };
+    (avx512fp16, f16, num_regs) => { $crate::simd_primitive!(avx512, f16, num_regs) };
+    (avx512fp16, f16, optimal_tile_m) => { $crate::simd_primitive!(avx512, f16, optimal_tile_m) };
+    (avx512fp16, f16, optimal_tile_n_vecs) => { $crate::simd_primitive!(avx512, f16, optimal_tile_n_vecs) };
+    (avx512fp16, f16, prefetch_distance) => { $crate::simd_primitive!(avx512, f16, prefetch_distance) };
+    (avx512fp16, f16, has_native_fp16) => { false };
+    (avx512fp16, f16, has_native_bf16) => { false };
+
+    // --- Delegate all compute to avx512 F16C path ---
+    (avx512fp16, f16, zero) => { $crate::simd_primitive!(avx512, f16, zero) };
+    (avx512fp16, f16, splat, $v:expr) => { $crate::simd_primitive!(avx512, f16, splat, $v) };
+    (avx512fp16, f16, load, $p:expr) => { $crate::simd_primitive!(avx512, f16, load, $p) };
+    (avx512fp16, f16, loadu, $p:expr) => { $crate::simd_primitive!(avx512, f16, loadu, $p) };
+    (avx512fp16, f16, store, $p:expr, $v:expr) => { $crate::simd_primitive!(avx512, f16, store, $p, $v) };
+    (avx512fp16, f16, storeu, $p:expr, $v:expr) => { $crate::simd_primitive!(avx512, f16, storeu, $p, $v) };
+    (avx512fp16, f16, add, $a:expr, $b:expr) => { $crate::simd_primitive!(avx512, f16, add, $a, $b) };
+    (avx512fp16, f16, sub, $a:expr, $b:expr) => { $crate::simd_primitive!(avx512, f16, sub, $a, $b) };
+    (avx512fp16, f16, mul, $a:expr, $b:expr) => { $crate::simd_primitive!(avx512, f16, mul, $a, $b) };
+    (avx512fp16, f16, div, $a:expr, $b:expr) => { $crate::simd_primitive!(avx512, f16, div, $a, $b) };
+    (avx512fp16, f16, fma, $a:expr, $b:expr, $c:expr) => { $crate::simd_primitive!(avx512, f16, fma, $a, $b, $c) };
+    (avx512fp16, f16, fnmadd, $a:expr, $b:expr, $c:expr) => { $crate::simd_primitive!(avx512, f16, fnmadd, $a, $b, $c) };
+    (avx512fp16, f16, neg, $a:expr) => { $crate::simd_primitive!(avx512, f16, neg, $a) };
+    (avx512fp16, f16, max, $a:expr, $b:expr) => { $crate::simd_primitive!(avx512, f16, max, $a, $b) };
+    (avx512fp16, f16, min, $a:expr, $b:expr) => { $crate::simd_primitive!(avx512, f16, min, $a, $b) };
+    (avx512fp16, f16, reduce_sum, $v:expr) => { $crate::simd_primitive!(avx512, f16, reduce_sum, $v) };
+    (avx512fp16, f16, reduce_max, $v:expr) => { $crate::simd_primitive!(avx512, f16, reduce_max, $v) };
+    (avx512fp16, f16, abs, $a:expr) => { $crate::simd_primitive!(avx512, f16, abs, $a) };
+    (avx512fp16, f16, sqrt, $a:expr) => { $crate::simd_primitive!(avx512, f16, sqrt, $a) };
+    (avx512fp16, f16, rsqrt, $a:expr) => { $crate::simd_primitive!(avx512, f16, rsqrt, $a) };
+    (avx512fp16, f16, recip, $a:expr) => { $crate::simd_primitive!(avx512, f16, recip, $a) };
+    (avx512fp16, f16, exp, $a:expr) => { $crate::simd_primitive!(avx512, f16, exp, $a) };
+    (avx512fp16, f16, prefetch, $p:expr, $dist:expr) => { $crate::simd_primitive!(avx512, f16, prefetch, $p, $dist) };
+    (avx512fp16, f16, prefetch_t1, $p:expr) => { $crate::simd_primitive!(avx512, f16, prefetch_t1, $p) };
+    (avx512fp16, f16, prefetch_nta, $p:expr) => { $crate::simd_primitive!(avx512, f16, prefetch_nta, $p) };
+    (avx512fp16, f16, stream, $p:expr, $v:expr) => { $crate::simd_primitive!(avx512, f16, stream, $p, $v) };
+    (avx512fp16, f16, maskload, $p:expr, $count:expr) => { $crate::simd_primitive!(avx512, f16, maskload, $p, $count) };
+    (avx512fp16, f16, maskstore, $p:expr, $v:expr, $count:expr) => { $crate::simd_primitive!(avx512, f16, maskstore, $p, $v, $count) };
+
 }

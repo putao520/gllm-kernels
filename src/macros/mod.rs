@@ -17,6 +17,8 @@ pub mod matmul_x86;
 #[macro_use]
 pub mod matmul_x86_bf16;
 #[macro_use]
+pub mod matmul_x86_fp16;
+#[macro_use]
 pub mod matmul_x86_int8;
 #[macro_use]
 pub mod matmul_neon;
