@@ -211,6 +211,31 @@ pub fn blocking_params(tm: usize, nv: usize, lanes: usize, elem_bytes: usize) ->
     BlockingParams { kc, mc, nc }
 }
 
+/// Compute NC using a specific L3 size (for NUMA-aware per-node blocking).
+/// On multi-socket systems, each socket has its own L3 cache, so NC should
+/// be computed against the per-socket L3 rather than the global L3.
+pub fn compute_nc_with_l3(kc: usize, tn: usize, elem_bytes: usize, node_l3: usize) -> usize {
+    let budget = (node_l3 * 2) / 5; // 40% of per-node L3
+    let nc_raw = budget / (kc * elem_bytes);
+    (nc_raw / tn * tn).max(tn).min(8192)
+}
+
+/// Compute NUMA-aware blocking parameters for a specific node.
+/// Uses the node's local L3 cache size for NC computation.
+pub fn blocking_params_for_node(
+    tm: usize, nv: usize, lanes: usize, elem_bytes: usize, node_l3: usize,
+) -> BlockingParams {
+    let kc = compute_kc(tm, nv, lanes, elem_bytes);
+    let mc = compute_mc(kc, tm, elem_bytes);
+    let tn = nv * lanes;
+    let nc = if node_l3 > 0 {
+        compute_nc_with_l3(kc, tn, elem_bytes, node_l3)
+    } else {
+        compute_nc(kc, tn, elem_bytes)
+    };
+    BlockingParams { kc, mc, nc }
+}
+
 // ── Cache-line aligned buffer ─────────────────────────────────────────
 
 /// A `Vec`-like buffer guaranteed to be aligned to 64 bytes (cache line).

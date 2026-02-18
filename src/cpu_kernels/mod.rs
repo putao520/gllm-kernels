@@ -960,8 +960,9 @@ impl<E: Element> Kernels<E> for CpuKernels<E> {
     define_quant_decode_k!(dequant_q5_k, q5_k, BlockQ5K);
     define_quant_decode_k!(dequant_q6_k, q6_k, BlockQ6K);
 
-    // Q2_K/Q8_K decode: avx512 + avx2 + neon + scalar (full ISA coverage)
-    define_quant_decode_k!(dequant_q2_k, q2_k, BlockQ2K);
+    // Q2_K decode: avx512 + neon + scalar (AVX2 decode has interleaving bug, skip for now)
+    define_quant_decode_avx512!(dequant_q2_k, q2_k, BlockQ2K);
+    // Q8_K decode: avx512 + avx2 + neon + scalar (full ISA coverage)
     define_quant_decode_k!(dequant_q8_k, q8_k, BlockQ8K);
 
     // Quantized GEMV/GEMM

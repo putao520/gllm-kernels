@@ -20,11 +20,14 @@
 pub mod traits;
 pub use traits::Activation;
 pub mod cache_params;
+pub mod numa;
 pub mod macros;
 pub mod cpu_kernels;
 pub mod backend;
 pub mod quant;
 pub mod codebooks;
+pub mod profiling;
+pub mod autotuning;
 
 #[cfg(test)]
 pub mod tests;
@@ -36,5 +39,7 @@ mod tests_simd;
 mod tests_int8;
 #[cfg(test)]
 mod check_isa;
+#[cfg(test)]
+mod tests_amx;
 
 pub use traits::{Element, Backend, Kernels};

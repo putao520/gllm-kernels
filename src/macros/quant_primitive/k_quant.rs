@@ -614,16 +614,12 @@ macro_rules! quant_primitive_kquant {
     };
 
     // -----------------------------------------------------------------------
-    // AVX2 Q4_K dot -- hand-optimized microkernel.
+    // AVX2 Q4_K dot -- optimized microkernel.
     //
-    // Algebraic restructuring (deferred scale):
-    //   dot = sum[ (d*nib_i - d*8) * other_i ]
-    //       = d * sum(nib_i * other_i) - d*8 * sum(other_i)
-    //
-    // This eliminates per-iteration dequant FMAs and interleave shuffles.
-    // Even/odd deinterleave via vpermps separates other[even]/other[odd]
-    // to match the natural low/high nibble layout.
-    // Four independent accumulator pairs hide FMA latency (5c lat / 0.5 CPI).
+    // Deferred scale:  dot = d * sum(nib_i * other_i) - d*8 * sum(other_i)
+    //   Eliminates 4 dequant FMAs per iteration (was: fma(vd, nibble, -d*8)).
+    // 4 independent accumulators break the FMA dependency chain
+    //   (original: 4 dependent FMAs on 1 acc = 20c latency-bound per iter).
     // -----------------------------------------------------------------------
     (avx2, q4_k, dot, $block_ptr:expr, $other_ptr:expr) => {
         unsafe {
@@ -635,39 +631,23 @@ macro_rules! quant_primitive_kquant {
 
                 let qs_ptr = block.qs.as_ptr();
                 let other_ptr = $other_ptr;
-
-                // vpermps indices: extract even [0,2,4,6] and odd [1,3,5,7] floats
-                let perm_even = _mm256_setr_epi32(0, 2, 4, 6, 0, 2, 4, 6);
-                let perm_odd  = _mm256_setr_epi32(1, 3, 5, 7, 1, 3, 5, 7);
-
                 let mask = _mm_set1_epi8(0x0F);
 
-                // 4 independent accumulators for nib*other products
-                let mut acc_nib0 = _mm256_setzero_ps();
-                let mut acc_nib1 = _mm256_setzero_ps();
-                let mut acc_nib2 = _mm256_setzero_ps();
-                let mut acc_nib3 = _mm256_setzero_ps();
-                // 4 independent accumulators for other sums (offset term)
-                let mut acc_oth0 = _mm256_setzero_ps();
-                let mut acc_oth1 = _mm256_setzero_ps();
-                let mut acc_oth2 = _mm256_setzero_ps();
-                let mut acc_oth3 = _mm256_setzero_ps();
+                // 4 independent accumulators for nib*other (breaks FMA dep chain)
+                let mut acc0 = _mm256_setzero_ps();
+                let mut acc1 = _mm256_setzero_ps();
+                let mut acc2 = _mm256_setzero_ps();
+                let mut acc3 = _mm256_setzero_ps();
+                // Accumulator for sum(other) -- the offset term
+                let mut acc_oth = _mm256_setzero_ps();
 
-                // 8 iterations: 16 bytes qs -> 32 elements per iteration
                 let mut i = 0usize;
                 while i < 8 {
-                    // Prefetch next iteration
-                    if i < 7 {
-                        _mm_prefetch(other_ptr.add((i + 1) * 32) as *const i8, _MM_HINT_T0);
-                        _mm_prefetch(other_ptr.add((i + 1) * 32 + 16) as *const i8, _MM_HINT_T0);
-                    }
-
-                    // Load 16 packed bytes -> extract low/high nibbles
                     let v128 = _mm_loadu_si128(qs_ptr.add(i * 16) as *const _);
                     let low_bytes  = _mm_and_si128(v128, mask);
                     let high_bytes = _mm_and_si128(_mm_srli_epi16(v128, 4), mask);
 
-                    // Convert nibbles: 16 u8 -> 2x8 f32 each
+                    // Convert nibbles to f32 (raw 0-15 values, no dequant)
                     let f_l_0 = _mm256_cvtepi32_ps(_mm256_cvtepu8_epi32(low_bytes));
                     let f_l_1 = _mm256_cvtepi32_ps(_mm256_cvtepu8_epi32(
                         _mm_srli_si128(low_bytes, 8),
@@ -677,58 +657,47 @@ macro_rules! quant_primitive_kquant {
                         _mm_srli_si128(high_bytes, 8),
                     ));
 
-                    // Load 32 floats from other
-                    let o_a = _mm256_loadu_ps(other_ptr.add(i * 32));
-                    let o_b = _mm256_loadu_ps(other_ptr.add(i * 32 + 8));
-                    let o_c = _mm256_loadu_ps(other_ptr.add(i * 32 + 16));
-                    let o_d = _mm256_loadu_ps(other_ptr.add(i * 32 + 24));
+                    // Interleave low/high to match other[] memory order
+                    let out_0 = _mm256_unpacklo_ps(f_l_0, f_h_0);
+                    let out_1 = _mm256_unpackhi_ps(f_l_0, f_h_0);
+                    let final_0 = _mm256_permute2f128_ps(out_0, out_1, 0x20);
+                    let final_1 = _mm256_permute2f128_ps(out_0, out_1, 0x31);
 
-                    // Deinterleave other into even/odd via vpermps + lane blend.
-                    // o_a=[o0..o7]: even_a=[o0,o2,o4,o6,*,*,*,*], odd_a=[o1,o3,o5,o7,*,*,*,*]
-                    // o_b=[o8..o15]: even_b=[o8,o10,o12,o14,*,*,*,*]
-                    // Combine low128(even_a) | low128(even_b) -> other_even_0 matching f_l_0
-                    let even_a = _mm256_permutevar8x32_ps(o_a, perm_even);
-                    let odd_a  = _mm256_permutevar8x32_ps(o_a, perm_odd);
-                    let even_b = _mm256_permutevar8x32_ps(o_b, perm_even);
-                    let odd_b  = _mm256_permutevar8x32_ps(o_b, perm_odd);
-                    let other_even_0 = _mm256_permute2f128_ps(even_a, even_b, 0x20);
-                    let other_odd_0  = _mm256_permute2f128_ps(odd_a, odd_b, 0x20);
+                    let out_2 = _mm256_unpacklo_ps(f_l_1, f_h_1);
+                    let out_3 = _mm256_unpackhi_ps(f_l_1, f_h_1);
+                    let final_2 = _mm256_permute2f128_ps(out_2, out_3, 0x20);
+                    let final_3 = _mm256_permute2f128_ps(out_2, out_3, 0x31);
 
-                    let even_c = _mm256_permutevar8x32_ps(o_c, perm_even);
-                    let odd_c  = _mm256_permutevar8x32_ps(o_c, perm_odd);
-                    let even_d = _mm256_permutevar8x32_ps(o_d, perm_even);
-                    let odd_d  = _mm256_permutevar8x32_ps(o_d, perm_odd);
-                    let other_even_1 = _mm256_permute2f128_ps(even_c, even_d, 0x20);
-                    let other_odd_1  = _mm256_permute2f128_ps(odd_c, odd_d, 0x20);
+                    // Load other
+                    let other_0 = _mm256_loadu_ps(other_ptr.add(i * 32));
+                    let other_1 = _mm256_loadu_ps(other_ptr.add(i * 32 + 8));
+                    let other_2 = _mm256_loadu_ps(other_ptr.add(i * 32 + 16));
+                    let other_3 = _mm256_loadu_ps(other_ptr.add(i * 32 + 24));
 
-                    // Accumulate nib * other (scale deferred to end)
-                    acc_nib0 = _mm256_fmadd_ps(f_l_0, other_even_0, acc_nib0);
-                    acc_nib1 = _mm256_fmadd_ps(f_l_1, other_even_1, acc_nib1);
-                    acc_nib2 = _mm256_fmadd_ps(f_h_0, other_odd_0, acc_nib2);
-                    acc_nib3 = _mm256_fmadd_ps(f_h_1, other_odd_1, acc_nib3);
+                    // Accumulate nib * other into 4 independent accumulators
+                    acc0 = _mm256_fmadd_ps(final_0, other_0, acc0);
+                    acc1 = _mm256_fmadd_ps(final_1, other_1, acc1);
+                    acc2 = _mm256_fmadd_ps(final_2, other_2, acc2);
+                    acc3 = _mm256_fmadd_ps(final_3, other_3, acc3);
 
-                    // Accumulate other sums for the -d*8 offset term
-                    acc_oth0 = _mm256_add_ps(acc_oth0, other_even_0);
-                    acc_oth1 = _mm256_add_ps(acc_oth1, other_even_1);
-                    acc_oth2 = _mm256_add_ps(acc_oth2, other_odd_0);
-                    acc_oth3 = _mm256_add_ps(acc_oth3, other_odd_1);
+                    // Accumulate sum(other) for offset term
+                    let oth_pair = _mm256_add_ps(
+                        _mm256_add_ps(other_0, other_1),
+                        _mm256_add_ps(other_2, other_3),
+                    );
+                    acc_oth = _mm256_add_ps(acc_oth, oth_pair);
 
                     i += 1;
                 }
 
-                // Merge 4 accumulators each
-                let acc_nib_total = _mm256_add_ps(
-                    _mm256_add_ps(acc_nib0, acc_nib1),
-                    _mm256_add_ps(acc_nib2, acc_nib3),
-                );
-                let acc_oth_total = _mm256_add_ps(
-                    _mm256_add_ps(acc_oth0, acc_oth1),
-                    _mm256_add_ps(acc_oth2, acc_oth3),
+                // Merge 4 nib*other accumulators
+                let acc_nib = _mm256_add_ps(
+                    _mm256_add_ps(acc0, acc1),
+                    _mm256_add_ps(acc2, acc3),
                 );
 
-                // Horizontal reduce
-                let nib_sum = $crate::simd_primitive!(avx2, f32, reduce_sum, acc_nib_total);
-                let oth_sum = $crate::simd_primitive!(avx2, f32, reduce_sum, acc_oth_total);
+                let nib_sum = $crate::simd_primitive!(avx2, f32, reduce_sum, acc_nib);
+                let oth_sum = $crate::simd_primitive!(avx2, f32, reduce_sum, acc_oth);
 
                 // Final: d * sum(nib*other) - d*8 * sum(other)
                 d * nib_sum - d * 8.0 * oth_sum

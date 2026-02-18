@@ -63,7 +63,6 @@ mod linux {
     const PERF_TYPE_HARDWARE: u32 = 0;
     const PERF_COUNT_HW_CPU_CYCLES: u64 = 0;
     const PERF_COUNT_HW_INSTRUCTIONS: u64 = 1;
-    const PERF_COUNT_HW_CACHE_MISSES: u64 = 3;
     const PERF_COUNT_HW_BRANCH_MISSES: u64 = 5;
 
     // Cache event encoding

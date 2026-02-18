@@ -363,12 +363,26 @@ mod tests {
 
     #[test]
     fn test_cache_hit() {
-        // First call tunes, second should hit cache
-        let r1 = tune_gemm_with_report(32, 32, 32, 4, TuneLevel::Fast);
-        assert!(!r1.from_cache);
+        // Clear any stale cache for this shape first
+        {
+            let hw = hw_info();
+            let fp = hw.fingerprint();
+            let shape = search_space::ProblemShape { m: 37, n: 37, k: 37, elem_bytes: 4 };
+            let key = cache::op_key("gemm", &shape);
+            let mut db = wisdom_db().lock().unwrap();
+            // Remove just this entry by re-putting after clear check
+            if db.get(&fp, &key).is_some() {
+                // Entry exists from a previous run; clear this HW's entries
+                db.clear_hw(&fp);
+            }
+        }
 
-        let r2 = tune_gemm_with_report(32, 32, 32, 4, TuneLevel::Fast);
-        assert!(r2.from_cache);
+        // Use an unusual shape unlikely to collide with other tests
+        let r1 = tune_gemm_with_report(37, 37, 37, 4, TuneLevel::Fast);
+        assert!(!r1.from_cache, "First call should not be from cache");
+
+        let r2 = tune_gemm_with_report(37, 37, 37, 4, TuneLevel::Fast);
+        assert!(r2.from_cache, "Second call should hit cache");
         assert_eq!(r1.config, r2.config);
     }
 

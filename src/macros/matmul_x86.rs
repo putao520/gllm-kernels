@@ -926,8 +926,72 @@ macro_rules! define_matmul_x86 {
         /// Threshold: skip B-packing when M ≤ 4*TM (e.g. 56 for AVX-512, 24 for AVX2).
         const SMALL_M_THRESHOLD: usize = 4 * $TM;
 
+        /// NUMA-aware threshold: only partition across NUMA nodes when the problem
+        /// is large enough to amortize the overhead of per-node dispatch.
+        /// M * K * N > 4M elements (~16MB for f32) and M >= 2*TM per node.
+        const NUMA_THRESHOLD_ELEMS: usize = 4 * 1024 * 1024;
+
         #[inline(always)]
         pub fn matmul(a: &[$elem], b: &[$elem], c: &mut [$elem], m_size: usize, n_size: usize, k_size: usize) {
+            // ── NUMA-aware dispatch for multi-socket systems ──
+            // Partition M-dimension across NUMA nodes so each node's threads
+            // work on local A rows and C output rows, minimizing remote memory access.
+            let topo = $crate::numa::topology();
+            const TM: usize = $TM;
+            if topo.is_multi_node()
+                && m_size > SMALL_M_THRESHOLD
+                && m_size >= TM * 2 * topo.num_nodes()
+                && (m_size as u64) * (k_size as u64) * (n_size as u64) > NUMA_THRESHOLD_ELEMS as u64
+            {
+                // Partition M rows across NUMA nodes proportionally to CPU count
+                let partitions = $crate::numa::partition_by_nodes(m_size, TM);
+                if partitions.len() > 1 {
+                    // Each node processes its M-range independently
+                    // B is shared read-only across nodes (interleaved is ideal but
+                    // the OS page cache handles this reasonably for read-only data)
+                    std::thread::scope(|scope| {
+                        let a_ptr = a.as_ptr() as usize;
+                        let b_ptr = b.as_ptr() as usize;
+                        let c_ptr = c.as_mut_ptr() as usize;
+                        let a_len = a.len();
+                        let b_len = b.len();
+                        let c_len = c.len();
+
+                        for &(node_id, m_start, m_end) in &partitions {
+                            let m_local = m_end - m_start;
+                            scope.spawn(move || {
+                                $crate::numa::on_node(node_id, || {
+                                    // Reconstruct slices for this node's M-range
+                                    let a_full = unsafe {
+                                        std::slice::from_raw_parts(a_ptr as *const $elem, a_len)
+                                    };
+                                    let b_sl = unsafe {
+                                        std::slice::from_raw_parts(b_ptr as *const $elem, b_len)
+                                    };
+                                    let c_full = unsafe {
+                                        std::slice::from_raw_parts_mut(c_ptr as *mut $elem, c_len)
+                                    };
+                                    // A sub-slice: rows [m_start, m_end)
+                                    let a_offset = m_start * k_size;
+                                    let a_sl = &a_full[a_offset..a_offset + m_local * k_size];
+                                    // C sub-slice: rows [m_start, m_end)
+                                    let c_offset = m_start * n_size;
+                                    let c_sl = &mut c_full[c_offset..c_offset + m_local * n_size];
+                                    // Dispatch to the appropriate impl for this sub-problem
+                                    if m_local <= SMALL_M_THRESHOLD {
+                                        unsafe { x86_matmul_nopack_impl(a_sl, b_sl, c_sl, m_local, n_size, k_size); }
+                                    } else {
+                                        unsafe { x86_matmul_impl(a_sl, b_sl, c_sl, m_local, n_size, k_size); }
+                                    }
+                                });
+                            });
+                        }
+                    });
+                    return;
+                }
+            }
+
+            // Single-node or small problem: original dispatch
             if m_size <= SMALL_M_THRESHOLD {
                 unsafe { x86_matmul_nopack_impl(a, b, c, m_size, n_size, k_size); }
             } else {

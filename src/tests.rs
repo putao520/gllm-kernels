@@ -989,6 +989,64 @@ mod tests {
         assert!((output[0] - 256.0).abs() < 1.0, "kquant_matmul Q8_K: got {}", output[0]);
     }
 
+    #[test]
+    fn test_q8k_dot_accuracy_random() {
+        // Verify AVX2 Q8K dot matches scalar reference with random data
+        let kernels = CpuKernels::<f32>::new();
+        let d = 0.0371f32; // realistic scale factor
+        // Random-ish i8 values covering full range
+        let mut qs = [0i8; 256];
+        for i in 0..256 {
+            qs[i] = ((i as i32 * 97 + 13) % 256 - 128) as i8;
+        }
+        let block = make_q8k_block(d, &qs);
+        // Random-ish f32 input
+        let mut input: Vec<f32> = (0..256).map(|i| {
+            ((i as f32 * 0.0137 + 0.5).sin()) * 2.0 - 1.0
+        }).collect();
+
+        // Compute scalar reference
+        let mut expected = 0.0f64;
+        for i in 0..256 {
+            expected += (d as f64) * (qs[i] as f64) * (input[i] as f64);
+        }
+
+        // Compute via kernels (goes through AVX2 path)
+        let mut output = vec![0.0f32; 1];
+        kernels.kquant_matmul(&block, &input, &mut output,
+            crate::quant::QuantType::Q8K, 1, 1, 256);
+
+        let rel_err = ((output[0] as f64 - expected) / expected).abs();
+        assert!(rel_err < 1e-5,
+            "Q8K dot accuracy: got {}, expected {}, rel_err {:.2e}",
+            output[0], expected, rel_err);
+    }
+
+    #[test]
+    fn test_q8k_dot_accuracy_extreme_values() {
+        // Test with extreme i8 values (-128, 127) and large scale
+        let kernels = CpuKernels::<f32>::new();
+        let d = 1.5f32;
+        let mut qs = [0i8; 256];
+        for i in 0..128 { qs[i] = 127; }
+        for i in 128..256 { qs[i] = -128; }
+        let block = make_q8k_block(d, &qs);
+        let input: Vec<f32> = (0..256).map(|i| if i < 128 { 1.0 } else { -1.0 }).collect();
+
+        // Expected: d * (128 * 127 * 1.0 + 128 * (-128) * (-1.0))
+        //         = 1.5 * (16256 + 16384) = 1.5 * 32640 = 48960.0
+        let expected = d as f64 * (128.0 * 127.0 + 128.0 * 128.0);
+
+        let mut output = vec![0.0f32; 1];
+        kernels.kquant_matmul(&block, &input, &mut output,
+            crate::quant::QuantType::Q8K, 1, 1, 256);
+
+        let rel_err = ((output[0] as f64 - expected) / expected).abs();
+        assert!(rel_err < 1e-5,
+            "Q8K extreme: got {}, expected {}, rel_err {:.2e}",
+            output[0], expected, rel_err);
+    }
+
     // ========================================================================
     // Block 21: QuantType utility tests
     // ========================================================================

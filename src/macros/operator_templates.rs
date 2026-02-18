@@ -1441,6 +1441,54 @@ macro_rules! define_gemv_op {
             // Parallel threshold: M * K > 256K elements (~1MB for f32)
             const PAR_THRESHOLD: usize = 256 * 1024;
             let nthreads = rayon::current_num_threads().max(1);
+
+            // ── NUMA-aware dispatch: partition M across NUMA nodes ──
+            let topo = $crate::numa::topology();
+            if topo.is_multi_node() && m >= 8 * topo.num_nodes() && m * k >= PAR_THRESHOLD {
+                let partitions = $crate::numa::partition_by_nodes(m, 4);
+                if partitions.len() > 1 {
+                    let a_ptr = a.as_ptr() as usize;
+                    let x_ptr = x.as_ptr() as usize;
+                    let y_ptr = y.as_mut_ptr() as usize;
+                    let a_len = a.len();
+                    let x_len = x.len();
+                    let y_len = y.len();
+                    std::thread::scope(|scope| {
+                        for &(node_id, m_start, m_end) in &partitions {
+                            scope.spawn(move || {
+                                $crate::numa::on_node(node_id, || {
+                                    let a_sl = unsafe { std::slice::from_raw_parts(a_ptr as *const $elem, a_len) };
+                                    let x_sl = unsafe { std::slice::from_raw_parts(x_ptr as *const $elem, x_len) };
+                                    let y_sl = unsafe { std::slice::from_raw_parts_mut(y_ptr as *mut $elem, y_len) };
+                                    // Within this node, further parallelize across node-local threads
+                                    let node_m = m_end - m_start;
+                                    let node_threads = rayon::current_num_threads().max(1);
+                                    if node_m >= 8 && node_threads > 1 {
+                                        let chunk = ((node_m + node_threads - 1) / node_threads + 3) & !3;
+                                        rayon::scope(|s| {
+                                            let mut start = m_start;
+                                            while start < m_end {
+                                                let end = (start + chunk).min(m_end);
+                                                let rs = start;
+                                                let re = end;
+                                                s.spawn(move |_| {
+                                                    gemv_serial(a_sl, x_sl, y_sl, rs, re, k);
+                                                });
+                                                start = end;
+                                            }
+                                        });
+                                    } else {
+                                        gemv_serial(a_sl, x_sl, y_sl, m_start, m_end, k);
+                                    }
+                                });
+                            });
+                        }
+                    });
+                    return;
+                }
+            }
+
+            // ── Single-node parallel dispatch ──
             if m >= 8 && m * k >= PAR_THRESHOLD && nthreads > 1 {
                 // Round chunk to multiple of 4 for alignment with 4-row blocks
                 let chunk = ((m + nthreads - 1) / nthreads + 3) & !3;
