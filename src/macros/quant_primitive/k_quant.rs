@@ -1667,16 +1667,27 @@ macro_rules! quant_primitive_kquant {
                 let block = &*$block_ptr;
                 let d = block.d;
                 let vd = $crate::simd_primitive!(avx2, f32, splat, d);
-                let qs_ptr = block.qs.as_ptr();
+                let qs_ptr = block.qs.as_ptr() as *const i8;
                 let out_ptr = $out_ptr;
-                // 256 i8 values. Process 8 at a time = 32 iterations.
-                for i in 0..32 {
-                    // Load 8 i8 -> i32 -> f32
-                    let v64 = _mm_loadl_epi64(qs_ptr.add(i * 8) as *const _);
-                    let vi32 = _mm256_cvtepi8_epi32(v64);
-                    let vf = _mm256_cvtepi32_ps(vi32);
-                    let res = $crate::simd_primitive!(avx2, f32, mul, vd, vf);
-                    $crate::simd_primitive!(avx2, f32, store, out_ptr.add(i * 8), res);
+
+                // Process 16 i8 values per iteration (2x8 f32), 16 iterations total
+                for i in 0..16 {
+                    // Load 16 i8 values
+                    let v128 = _mm_loadu_si128(qs_ptr.add(i * 16) as *const _);
+
+                    // Convert low 8 i8 -> 8 i32 -> 8 f32
+                    let v64_lo = _mm_loadl_epi64(qs_ptr.add(i * 16) as *const _);
+                    let vi32_lo = _mm256_cvtepi8_epi32(v64_lo);
+                    let vf_lo = _mm256_cvtepi32_ps(vi32_lo);
+                    let res_lo = $crate::simd_primitive!(avx2, f32, mul, vd, vf_lo);
+                    $crate::simd_primitive!(avx2, f32, store, out_ptr.add(i * 16), res_lo);
+
+                    // Convert high 8 i8 -> 8 i32 -> 8 f32
+                    let v64_hi = _mm_loadl_epi64(qs_ptr.add(i * 16 + 8) as *const _);
+                    let vi32_hi = _mm256_cvtepi8_epi32(v64_hi);
+                    let vf_hi = _mm256_cvtepi32_ps(vi32_hi);
+                    let res_hi = $crate::simd_primitive!(avx2, f32, mul, vd, vf_hi);
+                    $crate::simd_primitive!(avx2, f32, store, out_ptr.add(i * 16 + 8), res_hi);
                 }
             }
         }
@@ -1693,6 +1704,8 @@ macro_rules! quant_primitive_kquant {
                 let qs_ptr = block.qs.as_ptr();
                 let other = $other_ptr;
                 let mut acc = $crate::simd_primitive!(avx2, f32, zero);
+
+                // Process 8 i8 values per iteration, 32 iterations total (256 elements)
                 for i in 0..32 {
                     let v64 = _mm_loadl_epi64(qs_ptr.add(i * 8) as *const _);
                     let vi32 = _mm256_cvtepi8_epi32(v64);
@@ -1701,6 +1714,7 @@ macro_rules! quant_primitive_kquant {
                     let vo = $crate::simd_primitive!(avx2, f32, load, other.add(i * 8));
                     acc = $crate::simd_primitive!(avx2, f32, fma, dq, vo, acc);
                 }
+
                 let t1 = _mm256_hadd_ps(acc, acc);
                 let t2 = _mm256_hadd_ps(t1, t1);
                 let hi128 = _mm256_extractf128_ps(t2, 1);

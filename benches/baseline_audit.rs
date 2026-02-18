@@ -342,7 +342,23 @@ fn bench_gemv_q8(c: &mut Criterion) {
     let n = 4096;
     let block_bytes = std::mem::size_of::<gllm_kernels::quant::BlockQ8K>();
     let blocks = n / 256;
-    let weight_raw = vec![0i8; blocks * block_bytes];
+
+    // Create realistic weight data (not all zeros)
+    let mut weight_raw = vec![0u8; blocks * block_bytes];
+    use rand::Rng;
+    let mut rng = rand::thread_rng();
+    for i in 0..blocks {
+        let block_start = i * block_bytes;
+        // Set scale (d) to a non-zero value (first 4 bytes as f32)
+        let scale: f32 = rng.gen_range(0.01..0.1);
+        let scale_bytes = scale.to_le_bytes();
+        weight_raw[block_start..block_start + 4].copy_from_slice(&scale_bytes);
+        // Set quantized values (qs) to random i8 values
+        for j in 4..block_bytes {
+            weight_raw[block_start + j] = rng.gen::<u8>();
+        }
+    }
+
     let weight = unsafe { std::slice::from_raw_parts(weight_raw.as_ptr() as *const i8, weight_raw.len()) };
     let x = rand_vec(n);
     let flops = (2 * n) as u64;
