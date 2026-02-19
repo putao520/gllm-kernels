@@ -1,10 +1,13 @@
 /// Layer 3 quant_primitive dispatcher.
 ///
 /// Routes `quant_primitive!(isa, format, op, ...)` to the appropriate sub-macro:
+/// - Classic (Q4_0~Q8_1) → `quant_primitive_classic!`
 /// - K-Quant (Q2_K~Q8_K) → `quant_primitive_kquant!`
 /// - IQ series (IQ1_S~IQ4_XS) → `quant_primitive_iq!`
 /// - Commercial (AWQ4/GPTQ4/Squeeze) → `quant_primitive_commercial!`
 
+#[macro_use]
+pub mod classic;
 #[macro_use]
 pub mod k_quant;
 #[macro_use]
@@ -14,6 +17,14 @@ pub mod commercial;
 
 #[macro_export]
 macro_rules! quant_primitive {
+    // Classic GGML formats → quant_primitive_classic!
+    ($isa:ident, q4_0, $($rest:tt)*) => { $crate::quant_primitive_classic!($isa, q4_0, $($rest)*) };
+    ($isa:ident, q4_1, $($rest:tt)*) => { $crate::quant_primitive_classic!($isa, q4_1, $($rest)*) };
+    ($isa:ident, q5_0, $($rest:tt)*) => { $crate::quant_primitive_classic!($isa, q5_0, $($rest)*) };
+    ($isa:ident, q5_1, $($rest:tt)*) => { $crate::quant_primitive_classic!($isa, q5_1, $($rest)*) };
+    ($isa:ident, q8_0, $($rest:tt)*) => { $crate::quant_primitive_classic!($isa, q8_0, $($rest)*) };
+    ($isa:ident, q8_1, $($rest:tt)*) => { $crate::quant_primitive_classic!($isa, q8_1, $($rest)*) };
+
     // K-Quant formats → quant_primitive_kquant!
     ($isa:ident, q4_k, $($rest:tt)*) => { $crate::quant_primitive_kquant!($isa, q4_k, $($rest)*) };
     ($isa:ident, q8_k, $($rest:tt)*) => { $crate::quant_primitive_kquant!($isa, q8_k, $($rest)*) };

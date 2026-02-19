@@ -269,6 +269,14 @@ macro_rules! define_quant_dot_commercial {
 // ============================================================================
 
 impl<E: Element> CpuKernels<E> {
+    // Classic GGML dot: avx512 + avx2 + neon + scalar (block_size=32)
+    define_quant_dot_k!(dot_q4_0, q4_0, BlockQ4_0);
+    define_quant_dot_k!(dot_q4_1, q4_1, BlockQ4_1);
+    define_quant_dot_k!(dot_q5_0, q5_0, BlockQ5_0);
+    define_quant_dot_k!(dot_q5_1, q5_1, BlockQ5_1);
+    define_quant_dot_k!(dot_q8_0, q8_0, BlockQ8_0);
+    define_quant_dot_k!(dot_q8_1, q8_1, BlockQ8_1);
+
     // K-Quant dot: avx512 + avx2 + scalar
     define_quant_dot_k!(dot_q4_k, q4_k, BlockQ4K);
     define_quant_dot_k!(dot_q8_k, q8_k, BlockQ8K);
@@ -320,19 +328,22 @@ impl<E: Element> CpuKernels<E> {
         dot_fn: F,
     ) where F: Fn(&Self, &[u8], &[f32]) -> f32 {
         let blocks_per_row = k / BLOCK_SIZE;
-        // Pre-allocate column buffer once, reuse across all j iterations
-        let mut in_f32_col = vec![0.0f32; k];
-        for j in 0..n {
-            // Extract column j from input (stride access: input[p * n + j])
-            for p in 0..k {
-                in_f32_col[p] = input[p * n + j].to_f32();
+        // Pre-transpose input from [k, n] col-major to [n, k] row-major
+        // Eliminates stride-n column access in the inner loop
+        let mut input_t = vec![0.0f32; k * n];
+        for p in 0..k {
+            for j in 0..n {
+                input_t[j * k + p] = input[p * n + j].to_f32();
             }
+        }
+        for j in 0..n {
+            let in_row = &input_t[j * k..];
             for i in 0..m {
                 let mut sum = 0.0f32;
                 for b in 0..blocks_per_row {
                     let off = i * blocks_per_row * BLOCK_BYTES + b * BLOCK_BYTES;
                     let blk = &weight_blocks[off..off + BLOCK_BYTES];
-                    let in_slice = &in_f32_col[b * BLOCK_SIZE..(b + 1) * BLOCK_SIZE];
+                    let in_slice = &in_row[b * BLOCK_SIZE..(b + 1) * BLOCK_SIZE];
                     sum += dot_fn(self, blk, in_slice);
                 }
                 output[i * n + j] = E::from_f32(sum);
@@ -980,6 +991,7 @@ impl<E: Element> Kernels<E> for CpuKernels<E> {
     fn tanh(&self, x: &[E], out: &mut [E]) { dispatch_unary_op!(x, out, tanh); }
     fn exp(&self, x: &[E], out: &mut [E]) { dispatch_unary_op!(x, out, exp); }
     fn softmax(&self, x: &[E], out: &mut [E]) { dispatch_unary_op!(x, out, softmax); }
+    fn softmax_online(&self, x: &[E], out: &mut [E]) { dispatch_unary_op!(x, out, softmax_online); }
 
     fn swiglu(&self, gate: &[E], up: &[E], out: &mut [E]) {
         dispatch_binary_op!(gate, up, out, swiglu);
@@ -995,20 +1007,32 @@ impl<E: Element> Kernels<E> for CpuKernels<E> {
     }
 
     // Positional
-    fn rope(&self, qk: &mut [E], cos: &[E], sin: &[E], head_dim: usize, _interleaved: bool) {
-        dispatch_rope!(rope, qk, cos, sin, head_dim);
+    fn rope(&self, qk: &mut [E], cos: &[E], sin: &[E], head_dim: usize, interleaved: bool) {
+        if interleaved {
+            dispatch_rope!(rope_interleaved, qk, cos, sin, head_dim);
+        } else {
+            dispatch_rope!(rope, qk, cos, sin, head_dim);
+        }
     }
 
     // Sampling
     // Quantization
+    // Classic GGML decode: avx512 + avx2 + neon + scalar (block_size=32)
+    define_quant_decode_k!(dequant_q4_0, q4_0, BlockQ4_0);
+    define_quant_decode_k!(dequant_q4_1, q4_1, BlockQ4_1);
+    define_quant_decode_k!(dequant_q5_0, q5_0, BlockQ5_0);
+    define_quant_decode_k!(dequant_q5_1, q5_1, BlockQ5_1);
+    define_quant_decode_k!(dequant_q8_0, q8_0, BlockQ8_0);
+    define_quant_decode_k!(dequant_q8_1, q8_1, BlockQ8_1);
+
     // K-Quant decode: avx512 + avx2 + scalar
     define_quant_decode_k!(dequant_q4_k, q4_k, BlockQ4K);
     define_quant_decode_k!(dequant_q3_k, q3_k, BlockQ3K);
     define_quant_decode_k!(dequant_q5_k, q5_k, BlockQ5K);
     define_quant_decode_k!(dequant_q6_k, q6_k, BlockQ6K);
 
-    // Q2_K decode: avx512 + neon + scalar (AVX2 decode has interleaving bug, skip for now)
-    define_quant_decode_avx512!(dequant_q2_k, q2_k, BlockQ2K);
+    // Q2_K decode: avx512 + avx2 + neon + scalar (per-sub-block scales fixed)
+    define_quant_decode_k!(dequant_q2_k, q2_k, BlockQ2K);
     // Q8_K decode: avx512 + avx2 + neon + scalar (full ISA coverage)
     define_quant_decode_k!(dequant_q8_k, q8_k, BlockQ8K);
 
@@ -1224,8 +1248,12 @@ impl<E: Element> Kernels<E> for CpuKernels<E> {
     // Position encoding: rope_with_pos
     // ========================================================================
 
-    fn rope_with_pos(&self, qk: &mut [E], cos: &[E], sin: &[E], head_dim: usize, position: usize, _interleaved: bool) {
-        dispatch_rope_with_pos!(rope_with_pos, qk, cos, sin, head_dim, position);
+    fn rope_with_pos(&self, qk: &mut [E], cos: &[E], sin: &[E], head_dim: usize, position: usize, interleaved: bool) {
+        if interleaved {
+            dispatch_rope_with_pos!(rope_interleaved_with_pos, qk, cos, sin, head_dim, position);
+        } else {
+            dispatch_rope_with_pos!(rope_with_pos, qk, cos, sin, head_dim, position);
+        }
     }
 
     // ========================================================================
@@ -1233,31 +1261,30 @@ impl<E: Element> Kernels<E> for CpuKernels<E> {
     // ========================================================================
 
     fn gemv_q2(&self, weight: &[u8], input: &[E], scale: f32, n: usize) -> E {
-        // Dequantize 2-bit weights into f32 buffer, then SIMD dot
-        let mut dequant = vec![0.0f32; n];
+        // Fused dequant-dot: accumulate directly without intermediate buffer
+        let in_f32 = elem_to_f32_vec(input);
+        let mut sum = 0.0f32;
         for i in 0..n {
             let byte_idx = i / 4;
             let shift = (i % 4) * 2;
             let q = ((weight[byte_idx] >> shift) & 0x03) as f32;
-            dequant[i] = scale * (q - 1.5);
+            sum += scale * (q - 1.5) * in_f32[i];
         }
-        let mut in_f32 = vec![0.0f32; n];
-        for i in 0..n { in_f32[i] = input[i].to_f32(); }
-        E::from_f32(self.dot_f32(&dequant, &in_f32))
+        E::from_f32(sum)
     }
 
     fn gemv_q1(&self, weight: &[u8], input: &[E], scale: f32, n: usize) -> E {
-        // Dequantize 1-bit weights into f32 buffer, then SIMD dot
-        let mut dequant = vec![0.0f32; n];
+        // Fused dequant-dot: accumulate directly without intermediate buffer
+        let in_f32 = elem_to_f32_vec(input);
+        let mut sum = 0.0f32;
         for i in 0..n {
             let byte_idx = i / 8;
             let bit_idx = i % 8;
             let q = (weight[byte_idx] >> bit_idx) & 1;
-            dequant[i] = if q == 0 { -scale } else { scale };
+            let w = if q == 0 { -scale } else { scale };
+            sum += w * in_f32[i];
         }
-        let mut in_f32 = vec![0.0f32; n];
-        for i in 0..n { in_f32[i] = input[i].to_f32(); }
-        E::from_f32(self.dot_f32(&dequant, &in_f32))
+        E::from_f32(sum)
     }
 
     // ========================================================================
@@ -1278,6 +1305,22 @@ impl<E: Element> Kernels<E> for CpuKernels<E> {
             QuantType::Q6K => self.quant_matmul_inner::<210, 256, _>(weight_blocks, input, output, m, n, k, Self::dot_q6_k),
             QuantType::Q8K => self.quant_matmul_inner::<292, 256, _>(weight_blocks, input, output, m, n, k, Self::dot_q8_k),
             _ => unimplemented!("unsupported quant type for kquant_matmul"),
+        }
+    }
+
+    fn classic_matmul(
+        &self, weight_blocks: &[u8], input: &[E], output: &mut [E],
+        quant_type: crate::quant::QuantType, m: usize, n: usize, k: usize,
+    ) {
+        use crate::quant::QuantType;
+        match quant_type {
+            QuantType::Q4_0 => self.quant_matmul_inner::<18, 32, _>(weight_blocks, input, output, m, n, k, Self::dot_q4_0),
+            QuantType::Q4_1 => self.quant_matmul_inner::<20, 32, _>(weight_blocks, input, output, m, n, k, Self::dot_q4_1),
+            QuantType::Q5_0 => self.quant_matmul_inner::<22, 32, _>(weight_blocks, input, output, m, n, k, Self::dot_q5_0),
+            QuantType::Q5_1 => self.quant_matmul_inner::<24, 32, _>(weight_blocks, input, output, m, n, k, Self::dot_q5_1),
+            QuantType::Q8_0 => self.quant_matmul_inner::<34, 32, _>(weight_blocks, input, output, m, n, k, Self::dot_q8_0),
+            QuantType::Q8_1 => self.quant_matmul_inner::<36, 32, _>(weight_blocks, input, output, m, n, k, Self::dot_q8_1),
+            _ => unimplemented!("unsupported quant type for classic_matmul"),
         }
     }
 
@@ -1306,30 +1349,39 @@ impl<E: Element> Kernels<E> for CpuKernels<E> {
         input: &[E], output: &mut [E],
         m: usize, n: usize, k: usize,
     ) {
-        // AWQ4: dequant row → f32 buffer, then SIMD dot with input column
+        // AWQ4: dequant row -> f32 buffer, then SIMD dot with pre-transposed input
         let group_size = 128usize;
         let num_groups_per_row = k / group_size;
-        let mut in_f32_col = vec![0.0f32; k];
+        // Pre-transpose input from [k, n] col-major to [n, k] row-major
+        let mut input_t = vec![0.0f32; k * n];
+        for p in 0..k {
+            for j in 0..n {
+                input_t[j * k + p] = input[p * n + j].to_f32();
+            }
+        }
         let mut dequant_row = vec![0.0f32; k];
+        let k_bytes = k / 2;
         for j in 0..n {
-            for p in 0..k { in_f32_col[p] = input[p * n + j].to_f32(); }
+            let in_row = &input_t[j * k..(j + 1) * k];
             for i in 0..m {
-                // Dequantize row i
-                let row_offset = i * k;
-                for idx in 0..k {
-                    let byte_pos = row_offset / 2 + idx / 2;
-                    let nibble = if idx % 2 == 0 {
-                        (weight[byte_pos] & 0x0F) as f32
-                    } else {
-                        (weight[byte_pos] >> 4) as f32
-                    };
-                    let group = (i * num_groups_per_row) + idx / group_size;
-                    let zero = if group < zeros.len() { zeros[group] as f32 } else { 8.0 };
-                    let scale = if group < scales.len() { scales[group].to_f32() } else { 1.0 };
-                    dequant_row[idx] = (nibble - zero) * scale;
+                // Batch-unpack 2 nibbles per byte (branchless)
+                let row_byte_offset = i * k_bytes;
+                for byte_idx in 0..k_bytes {
+                    let b = weight[row_byte_offset + byte_idx];
+                    let lo = (b & 0x0F) as f32;
+                    let hi = (b >> 4) as f32;
+                    let idx = byte_idx * 2;
+                    let group_lo = (i * num_groups_per_row) + idx / group_size;
+                    let group_hi = (i * num_groups_per_row) + (idx + 1) / group_size;
+                    let zero_lo = if group_lo < zeros.len() { zeros[group_lo] as f32 } else { 8.0 };
+                    let zero_hi = if group_hi < zeros.len() { zeros[group_hi] as f32 } else { 8.0 };
+                    let scale_lo = if group_lo < scales.len() { scales[group_lo].to_f32() } else { 1.0 };
+                    let scale_hi = if group_hi < scales.len() { scales[group_hi].to_f32() } else { 1.0 };
+                    dequant_row[idx] = (lo - zero_lo) * scale_lo;
+                    dequant_row[idx + 1] = (hi - zero_hi) * scale_hi;
                 }
                 // SIMD dot product
-                output[i * n + j] = E::from_f32(self.dot_f32(&dequant_row, &in_f32_col));
+                output[i * n + j] = E::from_f32(self.dot_f32(&dequant_row, in_row));
             }
         }
     }
@@ -1339,25 +1391,34 @@ impl<E: Element> Kernels<E> for CpuKernels<E> {
         input: &[E], output: &mut [E],
         m: usize, n: usize, k: usize,
     ) {
-        // GPTQ4: dequant row → f32 buffer, then SIMD dot with input column
-        let mut in_f32_col = vec![0.0f32; k];
+        // GPTQ4: dequant row -> f32 buffer, then SIMD dot with pre-transposed input
+        // Pre-transpose input from [k, n] col-major to [n, k] row-major
+        let mut input_t = vec![0.0f32; k * n];
+        for p in 0..k {
+            for j in 0..n {
+                input_t[j * k + p] = input[p * n + j].to_f32();
+            }
+        }
         let mut dequant_row = vec![0.0f32; k];
+        let k_bytes = k / 2;
         for j in 0..n {
-            for p in 0..k { in_f32_col[p] = input[p * n + j].to_f32(); }
+            let in_row = &input_t[j * k..(j + 1) * k];
             for i in 0..m {
-                let row_offset = i * k;
-                for idx in 0..k {
-                    let byte_pos = row_offset / 2 + idx / 2;
-                    let nibble = if idx % 2 == 0 {
-                        (weight[byte_pos] & 0x0F) as f32
-                    } else {
-                        (weight[byte_pos] >> 4) as f32
-                    };
-                    let group = if idx < g_idx.len() { g_idx[idx] as usize } else { 0 };
-                    let scale = if group < scales.len() { scales[group].to_f32() } else { 1.0 };
-                    dequant_row[idx] = (nibble - 8.0) * scale;
+                // Batch-unpack 2 nibbles per byte (branchless)
+                let row_byte_offset = i * k_bytes;
+                for byte_idx in 0..k_bytes {
+                    let b = weight[row_byte_offset + byte_idx];
+                    let lo = (b & 0x0F) as f32;
+                    let hi = (b >> 4) as f32;
+                    let idx = byte_idx * 2;
+                    let group_lo = if idx < g_idx.len() { g_idx[idx] as usize } else { 0 };
+                    let group_hi = if (idx + 1) < g_idx.len() { g_idx[idx + 1] as usize } else { 0 };
+                    let scale_lo = if group_lo < scales.len() { scales[group_lo].to_f32() } else { 1.0 };
+                    let scale_hi = if group_hi < scales.len() { scales[group_hi].to_f32() } else { 1.0 };
+                    dequant_row[idx] = (lo - 8.0) * scale_lo;
+                    dequant_row[idx + 1] = (hi - 8.0) * scale_hi;
                 }
-                output[i * n + j] = E::from_f32(self.dot_f32(&dequant_row, &in_f32_col));
+                output[i * n + j] = E::from_f32(self.dot_f32(&dequant_row, in_row));
             }
         }
     }
@@ -1369,16 +1430,22 @@ impl<E: Element> Kernels<E> for CpuKernels<E> {
         let block_size = 256usize;
         let block_bytes = 130usize;
         let blocks_per_row = k / block_size;
-        let mut in_f32_col = vec![0.0f32; k];
+        // Pre-transpose input from [k, n] col-major to [n, k] row-major
+        let mut input_t = vec![0.0f32; k * n];
+        for p in 0..k {
+            for j in 0..n {
+                input_t[j * k + p] = input[p * n + j].to_f32();
+            }
+        }
         for j in 0..n {
-            for p in 0..k { in_f32_col[p] = input[p * n + j].to_f32(); }
+            let in_row = &input_t[j * k..];
             for i in 0..m {
                 let mut sum = 0.0f32;
                 for b in 0..blocks_per_row {
                     let off = i * blocks_per_row * block_bytes + b * block_bytes;
                     let blk = &weight_blocks[off..off + block_bytes];
                     let blk_ptr = blk.as_ptr() as *const crate::quant::BlockSqueeze;
-                    let src = in_f32_col[b * block_size..(b + 1) * block_size].as_ptr();
+                    let src = in_row[b * block_size..(b + 1) * block_size].as_ptr();
                     sum += match get_isa_level() {
                         #[cfg(target_arch = "x86_64")]
                         IsaLevel::Avx512 => crate::quant_primitive!(avx512, squeeze, dot, blk_ptr, src),

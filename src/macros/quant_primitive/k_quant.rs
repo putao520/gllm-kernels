@@ -490,18 +490,22 @@ macro_rules! quant_primitive_kquant {
             let block = unsafe { &*$block_ptr };
             let d: f32 = block.d.to_f32();
             let dmin: f32 = block.dmin.to_f32();
-            // qs: 64 bytes, 256 vals. 4 vals/byte.
-            for i in 0..64 {
-                let b = block.qs[i];
-                let v0 = b & 0x03;
-                let v1 = (b >> 2) & 0x03;
-                let v2 = (b >> 4) & 0x03;
-                let v3 = (b >> 6) & 0x03;
-                unsafe {
-                    *$out_ptr.add(i*4+0) = (v0 as f32).mul_add(d, -dmin);
-                    *$out_ptr.add(i*4+1) = (v1 as f32).mul_add(d, -dmin);
-                    *$out_ptr.add(i*4+2) = (v2 as f32).mul_add(d, -dmin);
-                    *$out_ptr.add(i*4+3) = (v3 as f32).mul_add(d, -dmin);
+            // Q2_K: 16 sub-blocks of 16 values each = 256 values
+            // block.scales[16]: each byte encodes sc (low 4 bits) and m (high 4 bits)
+            // Formula: out = d * sc * q - dmin * m
+            for sb in 0..16 {
+                let sc = (block.scales[sb] & 0xF) as f32;
+                let m = (block.scales[sb] >> 4) as f32;
+                let d_sc = d * sc;
+                let neg_dmin_m = -dmin * m;
+                for j in 0..16 {
+                    let idx = sb * 16 + j;
+                    let byte_idx = idx / 4;
+                    let shift = (idx % 4) * 2;
+                    let q = ((block.qs[byte_idx] >> shift) & 0x03) as f32;
+                    unsafe {
+                        *$out_ptr.add(idx) = q.mul_add(d_sc, neg_dmin_m);
+                    }
                 }
             }
         }
@@ -770,17 +774,20 @@ macro_rules! quant_primitive_kquant {
             let dmin: f32 = block.dmin.to_f32();
             let other = $other_ptr;
             let mut sum = 0.0f32;
-            for i in 0..64 {
-                let b = block.qs[i];
-                let v0 = (b & 0x03) as f32;
-                let v1 = ((b >> 2) & 0x03) as f32;
-                let v2 = ((b >> 4) & 0x03) as f32;
-                let v3 = ((b >> 6) & 0x03) as f32;
-                unsafe {
-                    sum += v0.mul_add(d, -dmin) * *other.add(i*4);
-                    sum += v1.mul_add(d, -dmin) * *other.add(i*4+1);
-                    sum += v2.mul_add(d, -dmin) * *other.add(i*4+2);
-                    sum += v3.mul_add(d, -dmin) * *other.add(i*4+3);
+            // Q2_K: 16 sub-blocks of 16 values each
+            for sb in 0..16 {
+                let sc = (block.scales[sb] & 0xF) as f32;
+                let m = (block.scales[sb] >> 4) as f32;
+                let d_sc = d * sc;
+                let neg_dmin_m = -dmin * m;
+                for j in 0..16 {
+                    let idx = sb * 16 + j;
+                    let byte_idx = idx / 4;
+                    let shift = (idx % 4) * 2;
+                    let q = ((block.qs[byte_idx] >> shift) & 0x03) as f32;
+                    unsafe {
+                        sum += q.mul_add(d_sc, neg_dmin_m) * *other.add(idx);
+                    }
                 }
             }
             sum
@@ -847,29 +854,60 @@ macro_rules! quant_primitive_kquant {
                 let block = &*$block_ptr;
                 let d: f32 = block.d.to_f32();
                 let dmin: f32 = block.dmin.to_f32();
-                let vd = $crate::simd_primitive!(avx2, f32, splat, d);
-                let v_neg_dmin = $crate::simd_primitive!(avx2, f32, splat, -dmin);
-                let mask2 = _mm_set1_epi8(0x03);
                 let qs_ptr = block.qs.as_ptr();
                 let out_ptr = $out_ptr;
-                // 64 bytes qs, 4 values per byte = 256 values
-                // Process 16 bytes at a time = 64 values
-                for i in 0..4 {
-                    let v128 = _mm_loadu_si128(qs_ptr.add(i * 16) as *const _);
-                    let v0 = _mm_and_si128(v128, mask2);
-                    let v1 = _mm_and_si128(_mm_srli_epi16(v128, 2), mask2);
-                    let v2 = _mm_and_si128(_mm_srli_epi16(v128, 4), mask2);
-                    let v3 = _mm_and_si128(_mm_srli_epi16(v128, 6), mask2);
-                    // Convert each 16 bytes to 2x8 f32 and store
-                    for (j, vv) in [(0usize, v0), (1, v1), (2, v2), (3, v3)] {
-                        let lo = _mm256_cvtepi32_ps(_mm256_cvtepu8_epi32(vv));
-                        let hi = _mm256_cvtepi32_ps(_mm256_cvtepu8_epi32(_mm_srli_si128(vv, 8)));
-                        let r_lo = $crate::simd_primitive!(avx2, f32, fma, vd, lo, v_neg_dmin);
-                        let r_hi = $crate::simd_primitive!(avx2, f32, fma, vd, hi, v_neg_dmin);
-                        let base = i * 64 + j * 16;
-                        $crate::simd_primitive!(avx2, f32, store, out_ptr.add(base), r_lo);
-                        $crate::simd_primitive!(avx2, f32, store, out_ptr.add(base + 8), r_hi);
-                    }
+                let mask2_128 = _mm_set1_epi8(0x03);
+                // Q2_K: 16 sub-blocks of 16 values each = 256 values
+                // Each sub-block: 4 bytes of qs, per-sub-block scale and min
+                // Process one sub-block (16 values = 2 x ymm of 8 f32) per iteration
+                for sb in 0..16 {
+                    let sc = (block.scales[sb] & 0xF) as f32;
+                    let m = (block.scales[sb] >> 4) as f32;
+                    let vd_sc = $crate::simd_primitive!(avx2, f32, splat, d * sc);
+                    let v_neg_dmin_m = $crate::simd_primitive!(avx2, f32, splat, -dmin * m);
+                    // Load 4 bytes for this sub-block
+                    let qs_off = sb * 4;
+                    // Broadcast 4 bytes into 128-bit register
+                    let raw32 = _mm_set1_epi32(*(qs_ptr.add(qs_off) as *const i32));
+                    // Replicate each byte 4 times: byte0 x4, byte1 x4, byte2 x4, byte3 x4
+                    let shuf = _mm_setr_epi8(0,0,0,0, 1,1,1,1, 2,2,2,2, 3,3,3,3);
+                    let replicated = _mm_shuffle_epi8(raw32, shuf);
+                    // Shift each group of 4 identical bytes by 0,2,4,6 bits
+                    // Use 32-bit variable shift: each 32-bit lane shifts its 4 bytes uniformly
+                    let shift_amounts = _mm_setr_epi32(0, 2, 4, 6);
+                    let shifted = _mm_srlv_epi32(replicated, shift_amounts);
+                    // Mask to 2 bits
+                    let masked = _mm_and_si128(shifted, mask2_128);
+                    // Now masked has 16 bytes, each 0-3, in the correct order:
+                    // [byte0>>0, byte0>>0, byte0>>0, byte0>>0,  <- only low byte matters per lane
+                    //  byte1>>2, ..., byte2>>4, ..., byte3>>6, ...]
+                    // Actually each 32-bit lane has 4 bytes but only the low byte of each lane
+                    // has the correct value after the 32-bit shift. The other 3 bytes in each lane
+                    // are garbage. We need a different approach.
+                    //
+                    // Better: unpack 4 bytes into 16 values using byte-level operations.
+                    // Load 4 bytes, create 16 values by combining shift+mask at byte granularity.
+                    let b0 = *qs_ptr.add(qs_off);
+                    let b1 = *qs_ptr.add(qs_off + 1);
+                    let b2 = *qs_ptr.add(qs_off + 2);
+                    let b3 = *qs_ptr.add(qs_off + 3);
+                    // Pack 16 2-bit values into a __m128i as bytes
+                    let vals = _mm_setr_epi8(
+                        (b0 & 3) as i8, (b0 >> 2 & 3) as i8, (b0 >> 4 & 3) as i8, (b0 >> 6 & 3) as i8,
+                        (b1 & 3) as i8, (b1 >> 2 & 3) as i8, (b1 >> 4 & 3) as i8, (b1 >> 6 & 3) as i8,
+                        (b2 & 3) as i8, (b2 >> 2 & 3) as i8, (b2 >> 4 & 3) as i8, (b2 >> 6 & 3) as i8,
+                        (b3 & 3) as i8, (b3 >> 2 & 3) as i8, (b3 >> 4 & 3) as i8, (b3 >> 6 & 3) as i8,
+                    );
+                    // Convert low 8 bytes -> 8 x f32 (ymm)
+                    let lo = _mm256_cvtepi32_ps(_mm256_cvtepu8_epi32(vals));
+                    // Convert high 8 bytes -> 8 x f32 (ymm)
+                    let hi = _mm256_cvtepi32_ps(_mm256_cvtepu8_epi32(_mm_srli_si128(vals, 8)));
+                    // out = d * sc * q - dmin * m
+                    let r_lo = $crate::simd_primitive!(avx2, f32, fma, vd_sc, lo, v_neg_dmin_m);
+                    let r_hi = $crate::simd_primitive!(avx2, f32, fma, vd_sc, hi, v_neg_dmin_m);
+                    let base = sb * 16;
+                    $crate::simd_primitive!(avx2, f32, store, out_ptr.add(base), r_lo);
+                    $crate::simd_primitive!(avx2, f32, store, out_ptr.add(base + 8), r_hi);
                 }
             }
         }
@@ -883,29 +921,36 @@ macro_rules! quant_primitive_kquant {
                 let block = &*$block_ptr;
                 let d: f32 = block.d.to_f32();
                 let dmin: f32 = block.dmin.to_f32();
-                let vd = $crate::simd_primitive!(avx2, f32, splat, d);
-                let v_neg_dmin = $crate::simd_primitive!(avx2, f32, splat, -dmin);
-                let mask2 = _mm_set1_epi8(0x03);
                 let qs_ptr = block.qs.as_ptr();
                 let other = $other_ptr;
                 let mut acc = $crate::simd_primitive!(avx2, f32, zero);
-                for i in 0..4 {
-                    let v128 = _mm_loadu_si128(qs_ptr.add(i * 16) as *const _);
-                    let v0 = _mm_and_si128(v128, mask2);
-                    let v1 = _mm_and_si128(_mm_srli_epi16(v128, 2), mask2);
-                    let v2 = _mm_and_si128(_mm_srli_epi16(v128, 4), mask2);
-                    let v3 = _mm_and_si128(_mm_srli_epi16(v128, 6), mask2);
-                    for (j, vv) in [(0usize, v0), (1, v1), (2, v2), (3, v3)] {
-                        let lo = _mm256_cvtepi32_ps(_mm256_cvtepu8_epi32(vv));
-                        let hi = _mm256_cvtepi32_ps(_mm256_cvtepu8_epi32(_mm_srli_si128(vv, 8)));
-                        let dq_lo = $crate::simd_primitive!(avx2, f32, fma, vd, lo, v_neg_dmin);
-                        let dq_hi = $crate::simd_primitive!(avx2, f32, fma, vd, hi, v_neg_dmin);
-                        let base = i * 64 + j * 16;
-                        let o_lo = $crate::simd_primitive!(avx2, f32, load, other.add(base));
-                        let o_hi = $crate::simd_primitive!(avx2, f32, load, other.add(base + 8));
-                        acc = $crate::simd_primitive!(avx2, f32, fma, dq_lo, o_lo, acc);
-                        acc = $crate::simd_primitive!(avx2, f32, fma, dq_hi, o_hi, acc);
-                    }
+                // Q2_K: 16 sub-blocks of 16 values each
+                for sb in 0..16 {
+                    let sc = (block.scales[sb] & 0xF) as f32;
+                    let m = (block.scales[sb] >> 4) as f32;
+                    let vd_sc = $crate::simd_primitive!(avx2, f32, splat, d * sc);
+                    let v_neg_dmin_m = $crate::simd_primitive!(avx2, f32, splat, -dmin * m);
+                    let qs_off = sb * 4;
+                    let b0 = *qs_ptr.add(qs_off);
+                    let b1 = *qs_ptr.add(qs_off + 1);
+                    let b2 = *qs_ptr.add(qs_off + 2);
+                    let b3 = *qs_ptr.add(qs_off + 3);
+                    let vals = _mm_setr_epi8(
+                        (b0 & 3) as i8, (b0 >> 2 & 3) as i8, (b0 >> 4 & 3) as i8, (b0 >> 6 & 3) as i8,
+                        (b1 & 3) as i8, (b1 >> 2 & 3) as i8, (b1 >> 4 & 3) as i8, (b1 >> 6 & 3) as i8,
+                        (b2 & 3) as i8, (b2 >> 2 & 3) as i8, (b2 >> 4 & 3) as i8, (b2 >> 6 & 3) as i8,
+                        (b3 & 3) as i8, (b3 >> 2 & 3) as i8, (b3 >> 4 & 3) as i8, (b3 >> 6 & 3) as i8,
+                    );
+                    let lo = _mm256_cvtepi32_ps(_mm256_cvtepu8_epi32(vals));
+                    let hi = _mm256_cvtepi32_ps(_mm256_cvtepu8_epi32(_mm_srli_si128(vals, 8)));
+                    // dq = d * sc * q - dmin * m
+                    let dq_lo = $crate::simd_primitive!(avx2, f32, fma, vd_sc, lo, v_neg_dmin_m);
+                    let dq_hi = $crate::simd_primitive!(avx2, f32, fma, vd_sc, hi, v_neg_dmin_m);
+                    let base = sb * 16;
+                    let o_lo = $crate::simd_primitive!(avx2, f32, load, other.add(base));
+                    let o_hi = $crate::simd_primitive!(avx2, f32, load, other.add(base + 8));
+                    acc = $crate::simd_primitive!(avx2, f32, fma, dq_lo, o_lo, acc);
+                    acc = $crate::simd_primitive!(avx2, f32, fma, dq_hi, o_hi, acc);
                 }
                 let t1 = _mm256_hadd_ps(acc, acc);
                 let t2 = _mm256_hadd_ps(t1, t1);
@@ -924,27 +969,31 @@ macro_rules! quant_primitive_kquant {
                 let block = &*$block_ptr;
                 let d: f32 = block.d.to_f32();
                 let dmin: f32 = block.dmin.to_f32();
-                let vd = $crate::simd_primitive!(avx512, f32, splat, d);
-                let v_neg_dmin = $crate::simd_primitive!(avx512, f32, splat, -dmin);
-                let mask2 = _mm_set1_epi8(0x03);
                 let qs_ptr = block.qs.as_ptr();
                 let out_ptr = $out_ptr;
-
-                // Process 16 bytes at a time = 64 values
-                for i in 0..4 {
-                    let v128 = _mm_loadu_si128(qs_ptr.add(i * 16) as *const _);
-                    let v0 = _mm_and_si128(v128, mask2);
-                    let v1 = _mm_and_si128(_mm_srli_epi16(v128, 2), mask2);
-                    let v2 = _mm_and_si128(_mm_srli_epi16(v128, 4), mask2);
-                    let v3 = _mm_and_si128(_mm_srli_epi16(v128, 6), mask2);
-
-                    for (j, vv) in [(0usize, v0), (1, v1), (2, v2), (3, v3)] {
-                        let ints = _mm512_cvtepu8_epi32(vv);
-                        let vf = _mm512_cvtepi32_ps(ints);
-                        let res = $crate::simd_primitive!(avx512, f32, fma, vd, vf, v_neg_dmin);
-                        let base = i * 64 + j * 16;
-                        $crate::simd_primitive!(avx512, f32, store, out_ptr.add(base), res);
-                    }
+                // Q2_K: 16 sub-blocks of 16 values each = 256 values
+                // AVX-512: process one sub-block (16 values = 1 zmm) per iteration
+                for sb in 0..16 {
+                    let sc = (block.scales[sb] & 0xF) as f32;
+                    let m = (block.scales[sb] >> 4) as f32;
+                    let vd_sc = $crate::simd_primitive!(avx512, f32, splat, d * sc);
+                    let v_neg_dmin_m = $crate::simd_primitive!(avx512, f32, splat, -dmin * m);
+                    let qs_off = sb * 4;
+                    let b0 = *qs_ptr.add(qs_off);
+                    let b1 = *qs_ptr.add(qs_off + 1);
+                    let b2 = *qs_ptr.add(qs_off + 2);
+                    let b3 = *qs_ptr.add(qs_off + 3);
+                    let vals = _mm_setr_epi8(
+                        (b0 & 3) as i8, (b0 >> 2 & 3) as i8, (b0 >> 4 & 3) as i8, (b0 >> 6 & 3) as i8,
+                        (b1 & 3) as i8, (b1 >> 2 & 3) as i8, (b1 >> 4 & 3) as i8, (b1 >> 6 & 3) as i8,
+                        (b2 & 3) as i8, (b2 >> 2 & 3) as i8, (b2 >> 4 & 3) as i8, (b2 >> 6 & 3) as i8,
+                        (b3 & 3) as i8, (b3 >> 2 & 3) as i8, (b3 >> 4 & 3) as i8, (b3 >> 6 & 3) as i8,
+                    );
+                    let ints = _mm512_cvtepu8_epi32(vals);
+                    let vf = _mm512_cvtepi32_ps(ints);
+                    let res = $crate::simd_primitive!(avx512, f32, fma, vd_sc, vf, v_neg_dmin_m);
+                    let base = sb * 16;
+                    $crate::simd_primitive!(avx512, f32, store, out_ptr.add(base), res);
                 }
             }
         }
@@ -958,30 +1007,33 @@ macro_rules! quant_primitive_kquant {
                 let block = &*$block_ptr;
                 let d: f32 = block.d.to_f32();
                 let dmin: f32 = block.dmin.to_f32();
-                let vd = $crate::simd_primitive!(avx512, f32, splat, d);
-                let v_neg_dmin = $crate::simd_primitive!(avx512, f32, splat, -dmin);
-                let mask2 = _mm_set1_epi8(0x03);
                 let qs_ptr = block.qs.as_ptr();
                 let other = $other_ptr;
                 let mut acc = $crate::simd_primitive!(avx512, f32, zero);
-
-                for i in 0..4 {
-                    let v128 = _mm_loadu_si128(qs_ptr.add(i * 16) as *const _);
-                    let v0 = _mm_and_si128(v128, mask2);
-                    let v1 = _mm_and_si128(_mm_srli_epi16(v128, 2), mask2);
-                    let v2 = _mm_and_si128(_mm_srli_epi16(v128, 4), mask2);
-                    let v3 = _mm_and_si128(_mm_srli_epi16(v128, 6), mask2);
-
-                    for (j, vv) in [(0usize, v0), (1, v1), (2, v2), (3, v3)] {
-                        let ints = _mm512_cvtepu8_epi32(vv);
-                        let vf = _mm512_cvtepi32_ps(ints);
-                        let dq = $crate::simd_primitive!(avx512, f32, fma, vd, vf, v_neg_dmin);
-                        let base = i * 64 + j * 16;
-                        let vo = $crate::simd_primitive!(avx512, f32, load, other.add(base));
-                        acc = $crate::simd_primitive!(avx512, f32, fma, dq, vo, acc);
-                    }
+                // Q2_K: 16 sub-blocks of 16 values each
+                for sb in 0..16 {
+                    let sc = (block.scales[sb] & 0xF) as f32;
+                    let m = (block.scales[sb] >> 4) as f32;
+                    let vd_sc = $crate::simd_primitive!(avx512, f32, splat, d * sc);
+                    let v_neg_dmin_m = $crate::simd_primitive!(avx512, f32, splat, -dmin * m);
+                    let qs_off = sb * 4;
+                    let b0 = *qs_ptr.add(qs_off);
+                    let b1 = *qs_ptr.add(qs_off + 1);
+                    let b2 = *qs_ptr.add(qs_off + 2);
+                    let b3 = *qs_ptr.add(qs_off + 3);
+                    let vals = _mm_setr_epi8(
+                        (b0 & 3) as i8, (b0 >> 2 & 3) as i8, (b0 >> 4 & 3) as i8, (b0 >> 6 & 3) as i8,
+                        (b1 & 3) as i8, (b1 >> 2 & 3) as i8, (b1 >> 4 & 3) as i8, (b1 >> 6 & 3) as i8,
+                        (b2 & 3) as i8, (b2 >> 2 & 3) as i8, (b2 >> 4 & 3) as i8, (b2 >> 6 & 3) as i8,
+                        (b3 & 3) as i8, (b3 >> 2 & 3) as i8, (b3 >> 4 & 3) as i8, (b3 >> 6 & 3) as i8,
+                    );
+                    let ints = _mm512_cvtepu8_epi32(vals);
+                    let vf = _mm512_cvtepi32_ps(ints);
+                    let dq = $crate::simd_primitive!(avx512, f32, fma, vd_sc, vf, v_neg_dmin_m);
+                    let base = sb * 16;
+                    let vo = $crate::simd_primitive!(avx512, f32, load, other.add(base));
+                    acc = $crate::simd_primitive!(avx512, f32, fma, dq, vo, acc);
                 }
-
                 $crate::simd_primitive!(avx512, f32, reduce_sum, acc)
             }
         }
@@ -1396,50 +1448,31 @@ macro_rules! quant_primitive_kquant {
                 let block = &*$block_ptr;
                 let d: f32 = block.d.to_f32();
                 let dmin: f32 = block.dmin.to_f32();
-                let vd = $crate::simd_primitive!(neon, f32, splat, d);
-                let v_neg_dmin = $crate::simd_primitive!(neon, f32, splat, -dmin);
                 let qs_ptr = block.qs.as_ptr();
                 let out_ptr = $out_ptr;
-                let mask2 = vdupq_n_u8(0x03);
-
-                // 64 bytes qs, 4 values per byte = 256 values
-                // Process 16 bytes at a time = 64 values, 4 iterations
-                for i in 0..4 {
-                    let v128 = vld1q_u8(qs_ptr.add(i * 16));
-                    let v0 = vandq_u8(v128, mask2);
-                    let v1 = vandq_u8(vshrq_n_u8(v128, 2), mask2);
-                    let v2 = vandq_u8(vshrq_n_u8(v128, 4), mask2);
-                    let v3 = vandq_u8(vshrq_n_u8(v128, 6), mask2);
-
-                    // For each shift variant, expand 16 u8 -> 4x4 f32 and store
-                    let shifts = [v0, v1, v2, v3];
-                    for j in 0..4usize {
-                        let vv = shifts[j];
-                        // u8 -> u16 -> u32 -> f32
-                        let lo_u16 = vmovl_u8(vget_low_u8(vv));
-                        let hi_u16 = vmovl_high_u8(vv);
-
-                        let u32_0 = vmovl_u16(vget_low_u16(lo_u16));
-                        let u32_1 = vmovl_high_u16(lo_u16);
-                        let u32_2 = vmovl_u16(vget_low_u16(hi_u16));
-                        let u32_3 = vmovl_high_u16(hi_u16);
-
-                        let f0 = vcvtq_f32_u32(u32_0);
-                        let f1 = vcvtq_f32_u32(u32_1);
-                        let f2 = vcvtq_f32_u32(u32_2);
-                        let f3 = vcvtq_f32_u32(u32_3);
-
-                        // d * val - dmin
-                        let r0 = $crate::simd_primitive!(neon, f32, fma, vd, f0, v_neg_dmin);
-                        let r1 = $crate::simd_primitive!(neon, f32, fma, vd, f1, v_neg_dmin);
-                        let r2 = $crate::simd_primitive!(neon, f32, fma, vd, f2, v_neg_dmin);
-                        let r3 = $crate::simd_primitive!(neon, f32, fma, vd, f3, v_neg_dmin);
-
-                        let base = i * 64 + j * 16;
-                        $crate::simd_primitive!(neon, f32, store, out_ptr.add(base), r0);
-                        $crate::simd_primitive!(neon, f32, store, out_ptr.add(base + 4), r1);
-                        $crate::simd_primitive!(neon, f32, store, out_ptr.add(base + 8), r2);
-                        $crate::simd_primitive!(neon, f32, store, out_ptr.add(base + 12), r3);
+                // Q2_K: 16 sub-blocks of 16 values each = 256 values
+                // Process one sub-block (16 values = 4 x float32x4) per iteration
+                for sb in 0..16 {
+                    let sc = (block.scales[sb] & 0xF) as f32;
+                    let m = (block.scales[sb] >> 4) as f32;
+                    let vd_sc = $crate::simd_primitive!(neon, f32, splat, d * sc);
+                    let v_neg_dmin_m = $crate::simd_primitive!(neon, f32, splat, -dmin * m);
+                    let qs_off = sb * 4;
+                    // Unpack 4 bytes -> 16 2-bit values -> 4 x float32x4
+                    let mut vals = [0u32; 16];
+                    for bi in 0..4 {
+                        let byte_val = *qs_ptr.add(qs_off + bi);
+                        vals[bi * 4 + 0] = (byte_val & 0x03) as u32;
+                        vals[bi * 4 + 1] = ((byte_val >> 2) & 0x03) as u32;
+                        vals[bi * 4 + 2] = ((byte_val >> 4) & 0x03) as u32;
+                        vals[bi * 4 + 3] = ((byte_val >> 6) & 0x03) as u32;
+                    }
+                    let base = sb * 16;
+                    for chunk in 0..4 {
+                        let vi = vld1q_u32(vals.as_ptr().add(chunk * 4));
+                        let vf = vcvtq_f32_u32(vi);
+                        let r = $crate::simd_primitive!(neon, f32, fma, vd_sc, vf, v_neg_dmin_m);
+                        $crate::simd_primitive!(neon, f32, store, out_ptr.add(base + chunk * 4), r);
                     }
                 }
             }
@@ -1454,54 +1487,33 @@ macro_rules! quant_primitive_kquant {
                 let block = &*$block_ptr;
                 let d: f32 = block.d.to_f32();
                 let dmin: f32 = block.dmin.to_f32();
-                let vd = $crate::simd_primitive!(neon, f32, splat, d);
-                let v_neg_dmin = $crate::simd_primitive!(neon, f32, splat, -dmin);
                 let qs_ptr = block.qs.as_ptr();
                 let other = $other_ptr;
-                let mask2 = vdupq_n_u8(0x03);
                 let mut acc = $crate::simd_primitive!(neon, f32, splat, 0.0);
-
-                for i in 0..4 {
-                    let v128 = vld1q_u8(qs_ptr.add(i * 16));
-                    let v0 = vandq_u8(v128, mask2);
-                    let v1 = vandq_u8(vshrq_n_u8(v128, 2), mask2);
-                    let v2 = vandq_u8(vshrq_n_u8(v128, 4), mask2);
-                    let v3 = vandq_u8(vshrq_n_u8(v128, 6), mask2);
-
-                    let shifts = [v0, v1, v2, v3];
-                    for j in 0..4usize {
-                        let vv = shifts[j];
-                        let lo_u16 = vmovl_u8(vget_low_u8(vv));
-                        let hi_u16 = vmovl_high_u8(vv);
-
-                        let u32_0 = vmovl_u16(vget_low_u16(lo_u16));
-                        let u32_1 = vmovl_high_u16(lo_u16);
-                        let u32_2 = vmovl_u16(vget_low_u16(hi_u16));
-                        let u32_3 = vmovl_high_u16(hi_u16);
-
-                        let f0 = vcvtq_f32_u32(u32_0);
-                        let f1 = vcvtq_f32_u32(u32_1);
-                        let f2 = vcvtq_f32_u32(u32_2);
-                        let f3 = vcvtq_f32_u32(u32_3);
-
-                        let dq0 = $crate::simd_primitive!(neon, f32, fma, vd, f0, v_neg_dmin);
-                        let dq1 = $crate::simd_primitive!(neon, f32, fma, vd, f1, v_neg_dmin);
-                        let dq2 = $crate::simd_primitive!(neon, f32, fma, vd, f2, v_neg_dmin);
-                        let dq3 = $crate::simd_primitive!(neon, f32, fma, vd, f3, v_neg_dmin);
-
-                        let base = i * 64 + j * 16;
-                        let o0 = $crate::simd_primitive!(neon, f32, load, other.add(base));
-                        let o1 = $crate::simd_primitive!(neon, f32, load, other.add(base + 4));
-                        let o2 = $crate::simd_primitive!(neon, f32, load, other.add(base + 8));
-                        let o3 = $crate::simd_primitive!(neon, f32, load, other.add(base + 12));
-
-                        acc = $crate::simd_primitive!(neon, f32, fma, dq0, o0, acc);
-                        acc = $crate::simd_primitive!(neon, f32, fma, dq1, o1, acc);
-                        acc = $crate::simd_primitive!(neon, f32, fma, dq2, o2, acc);
-                        acc = $crate::simd_primitive!(neon, f32, fma, dq3, o3, acc);
+                // Q2_K: 16 sub-blocks of 16 values each
+                for sb in 0..16 {
+                    let sc = (block.scales[sb] & 0xF) as f32;
+                    let m = (block.scales[sb] >> 4) as f32;
+                    let vd_sc = $crate::simd_primitive!(neon, f32, splat, d * sc);
+                    let v_neg_dmin_m = $crate::simd_primitive!(neon, f32, splat, -dmin * m);
+                    let qs_off = sb * 4;
+                    let mut vals = [0u32; 16];
+                    for bi in 0..4 {
+                        let byte_val = *qs_ptr.add(qs_off + bi);
+                        vals[bi * 4 + 0] = (byte_val & 0x03) as u32;
+                        vals[bi * 4 + 1] = ((byte_val >> 2) & 0x03) as u32;
+                        vals[bi * 4 + 2] = ((byte_val >> 4) & 0x03) as u32;
+                        vals[bi * 4 + 3] = ((byte_val >> 6) & 0x03) as u32;
+                    }
+                    let base = sb * 16;
+                    for chunk in 0..4 {
+                        let vi = vld1q_u32(vals.as_ptr().add(chunk * 4));
+                        let vf = vcvtq_f32_u32(vi);
+                        let dq = $crate::simd_primitive!(neon, f32, fma, vd_sc, vf, v_neg_dmin_m);
+                        let vo = $crate::simd_primitive!(neon, f32, load, other.add(base + chunk * 4));
+                        acc = $crate::simd_primitive!(neon, f32, fma, dq, vo, acc);
                     }
                 }
-
                 $crate::simd_primitive!(neon, f32, reduce_sum, acc)
             }
         }

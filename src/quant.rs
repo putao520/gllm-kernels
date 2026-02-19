@@ -20,6 +20,13 @@ pub enum QuantType {
     IQ3S,
     IQ4NL,
     IQ4XS,
+    // Classic GGML quantization formats (block_size=32)
+    Q4_0,
+    Q4_1,
+    Q5_0,
+    Q5_1,
+    Q8_0,
+    Q8_1,
     // External quantization formats
     AWQ4,
     GPTQ4,
@@ -186,6 +193,64 @@ pub struct BlockIQ4XS {
 }
 
 // ==========================================================================
+// Classic GGML Block Structures (block_size=32, matching llama.cpp layout)
+// ==========================================================================
+
+/// Q4_0: 4-bit quantization, 32 elements per block, 18 bytes.
+/// Layout: d(f16) + qs(16 bytes packed 4-bit)
+#[repr(C)]
+#[derive(Debug, Clone, Copy)]
+pub struct BlockQ4_0 {
+    pub d: f16,        // delta (scale)
+    pub qs: [u8; 16],  // 32 x 4-bit quantized values
+}
+
+/// Q4_1: 4-bit quantization with min, 32 elements per block, 20 bytes.
+#[repr(C)]
+#[derive(Debug, Clone, Copy)]
+pub struct BlockQ4_1 {
+    pub d: f16,        // delta (scale)
+    pub m: f16,        // min value
+    pub qs: [u8; 16],  // 32 x 4-bit quantized values
+}
+
+/// Q5_0: 5-bit quantization, 32 elements per block, 22 bytes.
+#[repr(C)]
+#[derive(Debug, Clone, Copy)]
+pub struct BlockQ5_0 {
+    pub d: f16,        // delta (scale)
+    pub qh: [u8; 4],   // 32 high bits (1 bit each)
+    pub qs: [u8; 16],  // 32 x low 4-bit
+}
+
+/// Q5_1: 5-bit quantization with min, 32 elements per block, 24 bytes.
+#[repr(C)]
+#[derive(Debug, Clone, Copy)]
+pub struct BlockQ5_1 {
+    pub d: f16,        // delta (scale)
+    pub m: f16,        // min value
+    pub qh: [u8; 4],   // 32 high bits
+    pub qs: [u8; 16],  // 32 x low 4-bit
+}
+
+/// Q8_0: 8-bit quantization, 32 elements per block, 34 bytes.
+#[repr(C)]
+#[derive(Debug, Clone, Copy)]
+pub struct BlockQ8_0 {
+    pub d: f16,        // delta (scale)
+    pub qs: [i8; 32],  // 32 x 8-bit quantized values
+}
+
+/// Q8_1: 8-bit quantization with sum, 32 elements per block, 36 bytes.
+#[repr(C)]
+#[derive(Debug, Clone, Copy)]
+pub struct BlockQ8_1 {
+    pub d: f16,        // delta (scale)
+    pub s: f16,        // sum of quantized values * d
+    pub qs: [i8; 32],  // 32 x 8-bit quantized values
+}
+
+// ==========================================================================
 // AWQ/GPTQ Block Structures
 // ==========================================================================
 
@@ -219,7 +284,8 @@ impl QuantType {
     /// Elements per block.
     pub const fn block_size(self) -> usize {
         match self {
-            Self::IQ4NL => 32,
+            Self::Q4_0 | Self::Q4_1 | Self::Q5_0 | Self::Q5_1
+            | Self::Q8_0 | Self::Q8_1 | Self::IQ4NL => 32,
             _ => 256,
         }
     }
@@ -227,6 +293,12 @@ impl QuantType {
     /// Bytes per block.
     pub const fn block_bytes(self) -> usize {
         match self {
+            Self::Q4_0 => 18,
+            Self::Q4_1 => 20,
+            Self::Q5_0 => 22,
+            Self::Q5_1 => 24,
+            Self::Q8_0 => 34,
+            Self::Q8_1 => 36,
             Self::Q2K => 84,
             Self::Q3K => 110,
             Self::Q4K => 144,
@@ -253,10 +325,10 @@ impl QuantType {
             Self::IQ1S | Self::IQ1M => 1,
             Self::Q2K | Self::IQ2XXS | Self::IQ2XS | Self::IQ2S => 2,
             Self::Q3K | Self::IQ3XXS | Self::IQ3S | Self::Squeeze => 3,
-            Self::Q4K | Self::IQ4NL | Self::IQ4XS | Self::AWQ4 | Self::GPTQ4 => 4,
-            Self::Q5K => 5,
+            Self::Q4_0 | Self::Q4_1 | Self::Q4K | Self::IQ4NL | Self::IQ4XS | Self::AWQ4 | Self::GPTQ4 => 4,
+            Self::Q5_0 | Self::Q5_1 | Self::Q5K => 5,
             Self::Q6K => 6,
-            Self::Q8K => 8,
+            Self::Q8_0 | Self::Q8_1 | Self::Q8K => 8,
         }
     }
 }

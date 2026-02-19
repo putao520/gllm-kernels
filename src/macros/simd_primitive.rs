@@ -1051,53 +1051,155 @@ macro_rules! simd_primitive {
     };
 
     // ========================================================================
-    // AVX-512 FP16 Fallback Implementation
+    // AVX-512 FP16 Native Implementation (Sapphire Rapids+)
     //
-    // Native __m512h intrinsics require core::f16 (nightly-only). Until stable
-    // Rust supports core::f16, this delegates to the AVX-512 F16C conversion
-    // path (compute in f32, load/store convert f16<->f32).
+    // Uses native __m512h intrinsics via core::f16 + stdarch_x86_avx512_f16.
+    // Public API uses half::f16; we transmute pointers at load/store boundaries.
+    // half::f16 and core::f16 are both IEEE 754 binary16 — same memory layout.
     //
-    // TODO: Gate native __m512h path behind #[cfg(feature = "nightly")] when
-    // core::f16 stabilizes.
+    // Key difference from avx512+f16 (F16C path):
+    //   - SIMD type: __m512h (not __m512)
+    //   - Lanes: 32 (not 16) — 2x throughput
+    //   - All arithmetic native f16 (no f32 conversion overhead)
     // ========================================================================
 
-    // --- Architecture Constants (same as avx512 f16 F16C path) ---
-    (avx512fp16, f16, lanes) => { $crate::simd_primitive!(avx512, f16, lanes) };
-    (avx512fp16, f16, num_regs) => { $crate::simd_primitive!(avx512, f16, num_regs) };
-    (avx512fp16, f16, optimal_tile_m) => { $crate::simd_primitive!(avx512, f16, optimal_tile_m) };
-    (avx512fp16, f16, optimal_tile_n_vecs) => { $crate::simd_primitive!(avx512, f16, optimal_tile_n_vecs) };
-    (avx512fp16, f16, prefetch_distance) => { $crate::simd_primitive!(avx512, f16, prefetch_distance) };
-    (avx512fp16, f16, has_native_fp16) => { false };
+    // --- Architecture Constants ---
+    (avx512fp16, f16, lanes) => { 32 };
+    (avx512fp16, f16, num_regs) => { 32 };
+    (avx512fp16, f16, optimal_tile_m) => { 14 };
+    (avx512fp16, f16, optimal_tile_n_vecs) => { 2 };
+    (avx512fp16, f16, prefetch_distance) => { 512 };
+    (avx512fp16, f16, has_native_fp16) => { true };
     (avx512fp16, f16, has_native_bf16) => { false };
 
-    // --- Delegate all compute to avx512 F16C path ---
-    (avx512fp16, f16, zero) => { $crate::simd_primitive!(avx512, f16, zero) };
-    (avx512fp16, f16, splat, $v:expr) => { $crate::simd_primitive!(avx512, f16, splat, $v) };
-    (avx512fp16, f16, load, $p:expr) => { $crate::simd_primitive!(avx512, f16, load, $p) };
-    (avx512fp16, f16, loadu, $p:expr) => { $crate::simd_primitive!(avx512, f16, loadu, $p) };
-    (avx512fp16, f16, store, $p:expr, $v:expr) => { $crate::simd_primitive!(avx512, f16, store, $p, $v) };
-    (avx512fp16, f16, storeu, $p:expr, $v:expr) => { $crate::simd_primitive!(avx512, f16, storeu, $p, $v) };
-    (avx512fp16, f16, add, $a:expr, $b:expr) => { $crate::simd_primitive!(avx512, f16, add, $a, $b) };
-    (avx512fp16, f16, sub, $a:expr, $b:expr) => { $crate::simd_primitive!(avx512, f16, sub, $a, $b) };
-    (avx512fp16, f16, mul, $a:expr, $b:expr) => { $crate::simd_primitive!(avx512, f16, mul, $a, $b) };
-    (avx512fp16, f16, div, $a:expr, $b:expr) => { $crate::simd_primitive!(avx512, f16, div, $a, $b) };
-    (avx512fp16, f16, fma, $a:expr, $b:expr, $c:expr) => { $crate::simd_primitive!(avx512, f16, fma, $a, $b, $c) };
-    (avx512fp16, f16, fnmadd, $a:expr, $b:expr, $c:expr) => { $crate::simd_primitive!(avx512, f16, fnmadd, $a, $b, $c) };
-    (avx512fp16, f16, neg, $a:expr) => { $crate::simd_primitive!(avx512, f16, neg, $a) };
-    (avx512fp16, f16, max, $a:expr, $b:expr) => { $crate::simd_primitive!(avx512, f16, max, $a, $b) };
-    (avx512fp16, f16, min, $a:expr, $b:expr) => { $crate::simd_primitive!(avx512, f16, min, $a, $b) };
-    (avx512fp16, f16, reduce_sum, $v:expr) => { $crate::simd_primitive!(avx512, f16, reduce_sum, $v) };
-    (avx512fp16, f16, reduce_max, $v:expr) => { $crate::simd_primitive!(avx512, f16, reduce_max, $v) };
-    (avx512fp16, f16, abs, $a:expr) => { $crate::simd_primitive!(avx512, f16, abs, $a) };
-    (avx512fp16, f16, sqrt, $a:expr) => { $crate::simd_primitive!(avx512, f16, sqrt, $a) };
-    (avx512fp16, f16, rsqrt, $a:expr) => { $crate::simd_primitive!(avx512, f16, rsqrt, $a) };
-    (avx512fp16, f16, recip, $a:expr) => { $crate::simd_primitive!(avx512, f16, recip, $a) };
-    (avx512fp16, f16, exp, $a:expr) => { $crate::simd_primitive!(avx512, f16, exp, $a) };
-    (avx512fp16, f16, prefetch, $p:expr, $dist:expr) => { $crate::simd_primitive!(avx512, f16, prefetch, $p, $dist) };
-    (avx512fp16, f16, prefetch_t1, $p:expr) => { $crate::simd_primitive!(avx512, f16, prefetch_t1, $p) };
-    (avx512fp16, f16, prefetch_nta, $p:expr) => { $crate::simd_primitive!(avx512, f16, prefetch_nta, $p) };
-    (avx512fp16, f16, stream, $p:expr, $v:expr) => { $crate::simd_primitive!(avx512, f16, stream, $p, $v) };
-    (avx512fp16, f16, maskload, $p:expr, $count:expr) => { $crate::simd_primitive!(avx512, f16, maskload, $p, $count) };
-    (avx512fp16, f16, maskstore, $p:expr, $v:expr, $count:expr) => { $crate::simd_primitive!(avx512, f16, maskstore, $p, $v, $count) };
+    // --- Zero / Splat ---
+    (avx512fp16, f16, zero) => { std::arch::x86_64::_mm512_setzero_ph() };
+    // _mm512_set1_ph takes primitive f16; transmute from half::f16 (same layout)
+    (avx512fp16, f16, splat, $v:expr) => {
+        {
+            let bits: u16 = ($v).to_bits();
+            let cf16: $crate::prim_f16 = $crate::prim_f16::from_bits(bits);
+            std::arch::x86_64::_mm512_set1_ph(cf16)
+        }
+    };
+
+    // --- Load / Store ---
+    // _mm512_loadu_ph takes *const primitive f16; cast half::f16 ptr
+    (avx512fp16, f16, load, $p:expr) => {
+        std::arch::x86_64::_mm512_loadu_ph($p as *const $crate::prim_f16)
+    };
+    (avx512fp16, f16, loadu, $p:expr) => { $crate::simd_primitive!(avx512fp16, f16, load, $p) };
+    // _mm512_storeu_ph takes *mut primitive f16
+    (avx512fp16, f16, store, $p:expr, $v:expr) => {
+        std::arch::x86_64::_mm512_storeu_ph($p as *mut $crate::prim_f16, $v)
+    };
+    (avx512fp16, f16, storeu, $p:expr, $v:expr) => { $crate::simd_primitive!(avx512fp16, f16, store, $p, $v) };
+
+    // --- Arithmetic (native __m512h) ---
+    (avx512fp16, f16, add, $a:expr, $b:expr) => { std::arch::x86_64::_mm512_add_ph($a, $b) };
+    (avx512fp16, f16, sub, $a:expr, $b:expr) => { std::arch::x86_64::_mm512_sub_ph($a, $b) };
+    (avx512fp16, f16, mul, $a:expr, $b:expr) => { std::arch::x86_64::_mm512_mul_ph($a, $b) };
+    (avx512fp16, f16, div, $a:expr, $b:expr) => { std::arch::x86_64::_mm512_div_ph($a, $b) };
+    (avx512fp16, f16, fma, $a:expr, $b:expr, $c:expr) => { std::arch::x86_64::_mm512_fmadd_ph($a, $b, $c) };
+    (avx512fp16, f16, fnmadd, $a:expr, $b:expr, $c:expr) => { std::arch::x86_64::_mm512_fnmadd_ph($a, $b, $c) };
+    (avx512fp16, f16, neg, $a:expr) => { std::arch::x86_64::_mm512_sub_ph(std::arch::x86_64::_mm512_setzero_ph(), $a) };
+    (avx512fp16, f16, max, $a:expr, $b:expr) => { std::arch::x86_64::_mm512_max_ph($a, $b) };
+    (avx512fp16, f16, min, $a:expr, $b:expr) => { std::arch::x86_64::_mm512_min_ph($a, $b) };
+
+    // --- Reduce (return f32 for compatibility with operator templates) ---
+    // _mm512_reduce_add_ph returns primitive f16; convert to f32 via `as`
+    (avx512fp16, f16, reduce_sum, $v:expr) => { std::arch::x86_64::_mm512_reduce_add_ph($v) as f32 };
+    // _mm512_reduce_max_ph returns primitive f16; convert to f32 via `as`
+    (avx512fp16, f16, reduce_max, $v:expr) => { std::arch::x86_64::_mm512_reduce_max_ph($v) as f32 };
+
+    // --- Math ---
+    (avx512fp16, f16, abs, $a:expr) => { std::arch::x86_64::_mm512_abs_ph($a) };
+    (avx512fp16, f16, sqrt, $a:expr) => { std::arch::x86_64::_mm512_sqrt_ph($a) };
+    // rsqrt: _mm512_rsqrt_ph + Newton-Raphson refinement
+    (avx512fp16, f16, rsqrt, $a:expr) => {
+        {
+            use std::arch::x86_64::*;
+            let r = _mm512_rsqrt_ph($a);
+            let half_v = _mm512_set1_ph($crate::prim_f16::from_bits(0x3800u16)); // 0.5
+            let three = _mm512_set1_ph($crate::prim_f16::from_bits(0x4200u16)); // 3.0
+            let ar = _mm512_mul_ph($a, r);
+            // r * 0.5 * (3.0 - a*r*r)
+            _mm512_mul_ph(_mm512_mul_ph(r, half_v), _mm512_fnmadd_ph(ar, r, three))
+        }
+    };
+    // recip: _mm512_rcp_ph + Newton-Raphson refinement
+    (avx512fp16, f16, recip, $a:expr) => {
+        {
+            use std::arch::x86_64::*;
+            let r = _mm512_rcp_ph($a);
+            let two = _mm512_set1_ph($crate::prim_f16::from_bits(0x4000u16)); // 2.0
+            // r * (2.0 - a*r)
+            _mm512_mul_ph(r, _mm512_fnmadd_ph($a, r, two))
+        }
+    };
+    // exp: no native f16 exp — split 32xf16 into 2x16xf32, compute, convert back
+    (avx512fp16, f16, exp, $a:expr) => {
+        {
+            use std::arch::x86_64::*;
+            // Split __m512h into low/high __m256h, convert each to __m512 (f32)
+            let lo_256h: __m256h = _mm512_castph512_ph256($a);
+            let hi_256h: __m256h = {
+                // Extract upper 256 bits: cast to __m512 and extract high __m256
+                let as_ps: __m512 = _mm512_castph_ps($a);
+                let hi_ps: __m256 = _mm256_castpd_ps(_mm512_extractf64x4_pd(
+                    _mm512_castps_pd(as_ps), 1
+                ));
+                std::mem::transmute::<__m256, __m256h>(hi_ps)
+            };
+            let lo_f32: __m512 = _mm512_cvtxph_ps(lo_256h);
+            let hi_f32: __m512 = _mm512_cvtxph_ps(hi_256h);
+            // Compute exp in f32
+            let exp_lo = $crate::cpu_kernels::avx512::math::avx512_exp_f32(lo_f32);
+            let exp_hi = $crate::cpu_kernels::avx512::math::avx512_exp_f32(hi_f32);
+            // Convert back to f16
+            let lo_ph: __m256h = _mm512_cvtxps_ph(exp_lo);
+            let hi_ph: __m256h = _mm512_cvtxps_ph(exp_hi);
+            // Combine two __m256h into __m512h
+            let lo_512h: __m512h = _mm512_castph256_ph512(lo_ph);
+            let hi_as_ps: __m256 = std::mem::transmute::<__m256h, __m256>(hi_ph);
+            let lo_as_ps: __m512 = _mm512_castph_ps(lo_512h);
+            let combined_ps: __m512 = _mm512_insertf32x8(lo_as_ps, hi_as_ps, 1);
+            _mm512_castps_ph(combined_ps)
+        }
+    };
+
+    // --- Prefetch ---
+    (avx512fp16, f16, prefetch, $p:expr, $dist:expr) => { std::arch::x86_64::_mm_prefetch($p as *const i8, std::arch::x86_64::_MM_HINT_T0) };
+    (avx512fp16, f16, prefetch_t1, $p:expr) => { std::arch::x86_64::_mm_prefetch($p as *const i8, std::arch::x86_64::_MM_HINT_T1) };
+    (avx512fp16, f16, prefetch_nta, $p:expr) => { std::arch::x86_64::_mm_prefetch($p as *const i8, std::arch::x86_64::_MM_HINT_NTA) };
+
+    // --- Stream store (non-temporal) ---
+    (avx512fp16, f16, stream, $p:expr, $v:expr) => {
+        {
+            use std::arch::x86_64::*;
+            let vi: __m512i = _mm512_castph_si512($v);
+            _mm512_stream_si512($p as *mut __m512i, vi);
+        }
+    };
+
+    // --- Masked load (count lanes, rest zero) ---
+    (avx512fp16, f16, maskload, $p:expr, $count:expr) => {
+        {
+            use std::arch::x86_64::*;
+            let mask: __mmask32 = (1u64.wrapping_shl($count as u32) - 1) as __mmask32;
+            let vi = _mm512_maskz_loadu_epi16(mask, $p as *const i16);
+            _mm512_castsi512_ph(vi)
+        }
+    };
+
+    // --- Masked store (count lanes) ---
+    (avx512fp16, f16, maskstore, $p:expr, $v:expr, $count:expr) => {
+        {
+            use std::arch::x86_64::*;
+            let mask: __mmask32 = (1u64.wrapping_shl($count as u32) - 1) as __mmask32;
+            let vi: __m512i = _mm512_castph_si512($v);
+            _mm512_mask_storeu_epi16($p as *mut i16, mask, vi);
+        }
+    };
 
 }

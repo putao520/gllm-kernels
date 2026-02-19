@@ -266,6 +266,10 @@ pub trait Kernels<E: Element>: Send + Sync {
     fn tanh(&self, _x: &[E], _out: &mut [E]) { unimplemented!("tanh") }
     fn swiglu(&self, _gate: &[E], _up: &[E], _out: &mut [E]) { unimplemented!("swiglu") }
     fn softmax(&self, _x: &[E], _out: &mut [E]) { unimplemented!("softmax") }
+    fn softmax_online(&self, _x: &[E], _out: &mut [E]) {
+        // Default: fall back to regular softmax
+        self.softmax(_x, _out);
+    }
     fn exp(&self, _x: &[E], _out: &mut [E]) { unimplemented!("exp") }
 
     // ======================================================================
@@ -301,6 +305,14 @@ pub trait Kernels<E: Element>: Send + Sync {
     fn dequant_q3_k(&self, _block: &[u8], _out: &mut [f32]) { unimplemented!("dequant_q3_k") }
     fn dequant_q5_k(&self, _block: &[u8], _out: &mut [f32]) { unimplemented!("dequant_q5_k") }
     fn dequant_q6_k(&self, _block: &[u8], _out: &mut [f32]) { unimplemented!("dequant_q6_k") }
+
+    // Classic GGML dequantization (block_size=32)
+    fn dequant_q4_0(&self, _block: &[u8], _out: &mut [f32]) { unimplemented!("dequant_q4_0") }
+    fn dequant_q4_1(&self, _block: &[u8], _out: &mut [f32]) { unimplemented!("dequant_q4_1") }
+    fn dequant_q5_0(&self, _block: &[u8], _out: &mut [f32]) { unimplemented!("dequant_q5_0") }
+    fn dequant_q5_1(&self, _block: &[u8], _out: &mut [f32]) { unimplemented!("dequant_q5_1") }
+    fn dequant_q8_0(&self, _block: &[u8], _out: &mut [f32]) { unimplemented!("dequant_q8_0") }
+    fn dequant_q8_1(&self, _block: &[u8], _out: &mut [f32]) { unimplemented!("dequant_q8_1") }
 
     // AWQ/GPTQ/Squeeze dequantization (SPEC §2.3)
     fn dequant_awq4(&self, _packed: &[u8], _zeros: &[u8], _scales: &[f16], _out: &mut [f32]) {
@@ -357,6 +369,13 @@ pub trait Kernels<E: Element>: Send + Sync {
         _quant_type: QuantType, _m: usize, _n: usize, _k: usize,
     ) {
         unimplemented!("kquant_matmul")
+    }
+
+    fn classic_matmul(
+        &self, _weight_blocks: &[u8], _input: &[E], _output: &mut [E],
+        _quant_type: QuantType, _m: usize, _n: usize, _k: usize,
+    ) {
+        unimplemented!("classic_matmul")
     }
 
     fn iq_matmul(

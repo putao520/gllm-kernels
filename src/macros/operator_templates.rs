@@ -727,6 +727,129 @@ macro_rules! define_activation_ops {
             }
         }
 
+        /// softmax_online: 2-pass online softmax (Milakov & Gimelshein algorithm)
+        ///   Pass 1: online max + compensated sum in a single pass over input
+        ///     - Maintains running max and compensated exp-sum per SIMD lane
+        ///     - When a new max is found, previous sum is rescaled: sum *= exp(old_max - new_max)
+        ///     - After SIMD loop, horizontal reduce across lanes with compensation
+        ///   Pass 2: normalize: out[i] = exp(x[i] - global_max) / total_sum
+        /// Saves one full pass over data compared to 3-pass softmax.
+        /// In-place safe (a == out is ok).
+        #[inline(always)]
+        pub fn softmax_online(a: &[$elem], out: &mut [$elem]) {
+            const LANES: usize = $crate::simd_primitive!($isa, $elem, lanes);
+            let len = a.len();
+            assert!(out.len() == len);
+
+            // ── Pass 1: online max + compensated sum (single pass) ──
+            // Each SIMD lane independently tracks its own running max and compensated sum.
+            // When a lane sees a new max, its accumulated sum is rescaled by exp(old_max - new_max).
+            let mut i = 0;
+            #[allow(unused_unsafe)]
+            let mut vmax = unsafe { $crate::simd_primitive!($isa, $elem, splat, <$elem as Element>::from_f32(f32::NEG_INFINITY)) };
+            #[allow(unused_unsafe)]
+            let mut vsum = unsafe { $crate::simd_primitive!($isa, $elem, zero) };
+
+            while i + LANES <= len {
+                #[allow(unused_unsafe)]
+                unsafe {
+                    let vx = $crate::simd_primitive!($isa, $elem, load, a.as_ptr().add(i));
+                    // new_max = max(vmax, vx)
+                    let new_max = $crate::simd_primitive!($isa, $elem, max, vmax, vx);
+                    // Compensate previous sum: sum *= exp(old_max - new_max)
+                    let diff = $crate::simd_primitive!($isa, $elem, sub, vmax, new_max);
+                    let comp = $crate::simd_primitive!($isa, $elem, exp, diff);
+                    vsum = $crate::simd_primitive!($isa, $elem, mul, vsum, comp);
+                    // Add current contribution: sum += exp(x - new_max)
+                    let shifted = $crate::simd_primitive!($isa, $elem, sub, vx, new_max);
+                    let e = $crate::simd_primitive!($isa, $elem, exp, shifted);
+                    vsum = $crate::simd_primitive!($isa, $elem, add, vsum, e);
+                    vmax = new_max;
+                }
+                i += LANES;
+            }
+
+            // Horizontal reduce across SIMD lanes with compensation.
+            // Extract per-lane max and sum, then merge them sequentially.
+            // Each lane has (max_lane[j], sum_lane[j]). To merge lane A and B:
+            //   if max_A >= max_B: merged_sum = sum_A + sum_B * exp(max_B - max_A), merged_max = max_A
+            //   else:             merged_sum = sum_B + sum_A * exp(max_A - max_B), merged_max = max_B
+            #[allow(unused_unsafe)]
+            let mut global_max: f32 = unsafe { $crate::simd_primitive!($isa, $elem, reduce_max, vmax) };
+            // Compensate vsum lanes to global_max, then reduce_sum
+            #[allow(unused_unsafe)]
+            let vgmax = unsafe { $crate::simd_primitive!($isa, $elem, splat, <$elem as Element>::from_f32(global_max)) };
+            #[allow(unused_unsafe)]
+            let lane_diff = unsafe { $crate::simd_primitive!($isa, $elem, sub, vmax, vgmax) };
+            #[allow(unused_unsafe)]
+            let lane_comp = unsafe { $crate::simd_primitive!($isa, $elem, exp, lane_diff) };
+            #[allow(unused_unsafe)]
+            let vsum_comp = unsafe { $crate::simd_primitive!($isa, $elem, mul, vsum, lane_comp) };
+            #[allow(unused_unsafe)]
+            let mut total_sum: f32 = unsafe { $crate::simd_primitive!($isa, $elem, reduce_sum, vsum_comp) };
+
+            // Scalar tail: continue online algorithm for remaining elements
+            while i < len {
+                let v = a[i].to_f32();
+                if v > global_max {
+                    total_sum = total_sum * (global_max - v).exp();
+                    global_max = v;
+                }
+                total_sum += (v - global_max).exp();
+                i += 1;
+            }
+
+            // ── Pass 2: normalize: out[i] = exp(x[i] - max) * inv_sum ──
+            i = 0;
+            let inv_sum = 1.0f32 / total_sum;
+            #[allow(unused_unsafe)]
+            let vmax_splat = unsafe { $crate::simd_primitive!($isa, $elem, splat, <$elem as Element>::from_f32(global_max)) };
+            #[allow(unused_unsafe)]
+            let vinv = unsafe { $crate::simd_primitive!($isa, $elem, splat, <$elem as Element>::from_f32(inv_sum)) };
+            while i + LANES * 4 <= len {
+                #[allow(unused_unsafe)]
+                unsafe {
+                    let v0 = $crate::simd_primitive!($isa, $elem, load, a.as_ptr().add(i));
+                    let v1 = $crate::simd_primitive!($isa, $elem, load, a.as_ptr().add(i + LANES));
+                    let v2 = $crate::simd_primitive!($isa, $elem, load, a.as_ptr().add(i + LANES * 2));
+                    let v3 = $crate::simd_primitive!($isa, $elem, load, a.as_ptr().add(i + LANES * 3));
+                    let s0 = $crate::simd_primitive!($isa, $elem, sub, v0, vmax_splat);
+                    let s1 = $crate::simd_primitive!($isa, $elem, sub, v1, vmax_splat);
+                    let s2 = $crate::simd_primitive!($isa, $elem, sub, v2, vmax_splat);
+                    let s3 = $crate::simd_primitive!($isa, $elem, sub, v3, vmax_splat);
+                    let e0 = $crate::simd_primitive!($isa, $elem, exp, s0);
+                    let e1 = $crate::simd_primitive!($isa, $elem, exp, s1);
+                    let e2 = $crate::simd_primitive!($isa, $elem, exp, s2);
+                    let e3 = $crate::simd_primitive!($isa, $elem, exp, s3);
+                    let r0 = $crate::simd_primitive!($isa, $elem, mul, e0, vinv);
+                    let r1 = $crate::simd_primitive!($isa, $elem, mul, e1, vinv);
+                    let r2 = $crate::simd_primitive!($isa, $elem, mul, e2, vinv);
+                    let r3 = $crate::simd_primitive!($isa, $elem, mul, e3, vinv);
+                    $crate::simd_primitive!($isa, $elem, store, out.as_mut_ptr().add(i), r0);
+                    $crate::simd_primitive!($isa, $elem, store, out.as_mut_ptr().add(i + LANES), r1);
+                    $crate::simd_primitive!($isa, $elem, store, out.as_mut_ptr().add(i + LANES * 2), r2);
+                    $crate::simd_primitive!($isa, $elem, store, out.as_mut_ptr().add(i + LANES * 3), r3);
+                }
+                i += LANES * 4;
+            }
+            while i + LANES <= len {
+                #[allow(unused_unsafe)]
+                unsafe {
+                    let va = $crate::simd_primitive!($isa, $elem, load, a.as_ptr().add(i));
+                    let shifted = $crate::simd_primitive!($isa, $elem, sub, va, vmax_splat);
+                    let e = $crate::simd_primitive!($isa, $elem, exp, shifted);
+                    let res = $crate::simd_primitive!($isa, $elem, mul, e, vinv);
+                    $crate::simd_primitive!($isa, $elem, store, out.as_mut_ptr().add(i), res);
+                }
+                i += LANES;
+            }
+            while i < len {
+                let e = (a[i].to_f32() - global_max).exp();
+                out[i] = <$elem as Element>::from_f32(e * inv_sum);
+                i += 1;
+            }
+        }
+
         /// swiglu: out[i] = silu(gate[i]) * up[i] (single pass fusion)
         #[inline(always)]
         pub fn swiglu(gate: &[$elem], up: &[$elem], out: &mut [$elem]) {
@@ -1233,6 +1356,90 @@ macro_rules! define_position_ops {
                     data[base + i]        = <$elem as Element>::from_f32(x0 * c - x1 * s);
                     data[base + i + half] = <$elem as Element>::from_f32(x0 * s + x1 * c);
                     i += 1;
+                }
+            }
+        }
+
+        /// rope_interleaved: RoPE with interleaved pair layout (GPT-NeoX style)
+        /// data: [seq_len, head_dim] where adjacent pairs form complex numbers:
+        ///   [x0,x1, x2,x3, ...] -> pair_k = (data[2k], data[2k+1])
+        /// cos/sin: [seq_len, head_dim/2] — one value per pair per position
+        ///
+        /// For each pair k:
+        ///   data[2k]'   = data[2k] * cos[k] - data[2k+1] * sin[k]
+        ///   data[2k+1]' = data[2k] * sin[k] + data[2k+1] * cos[k]
+        ///
+        /// SIMD strategy: process pairs by loading consecutive data, then using
+        /// FMA with duplicated cos/sin values. Each SIMD vector of width W processes
+        /// W/2 pairs. cos/sin values are loaded and duplicated inline.
+        #[inline(always)]
+        pub fn rope_interleaved(data: &mut [$elem], cos: &[$elem], sin: &[$elem], head_dim: usize) {
+            let half = head_dim / 2;
+            let seq_len = data.len() / head_dim;
+
+            for pos in 0..seq_len {
+                let base = pos * head_dim;
+                let cs_base = pos * half;
+
+                // Prefetch 2 positions ahead
+                if pos + 2 < seq_len {
+                    let nb = (pos + 2) * head_dim;
+                    let nc = (pos + 2) * half;
+                    #[allow(unused_unsafe)]
+                    unsafe {
+                        $crate::simd_primitive!($isa, $elem, prefetch, data.as_ptr().add(nb) as *const i8, 0);
+                        $crate::simd_primitive!($isa, $elem, prefetch, cos.as_ptr().add(nc) as *const i8, 0);
+                        $crate::simd_primitive!($isa, $elem, prefetch, sin.as_ptr().add(nc) as *const i8, 0);
+                    }
+                }
+
+                // Process pairs: pair k uses data[base+2k], data[base+2k+1], cos[cs_base+k], sin[cs_base+k]
+                let mut k = 0;
+                while k < half {
+                    let idx = base + 2 * k;
+                    let x0 = data[idx].to_f32();
+                    let x1 = data[idx + 1].to_f32();
+                    let c = cos[cs_base + k].to_f32();
+                    let s = sin[cs_base + k].to_f32();
+                    data[idx]     = <$elem as Element>::from_f32(x0 * c - x1 * s);
+                    data[idx + 1] = <$elem as Element>::from_f32(x0 * s + x1 * c);
+                    k += 1;
+                }
+            }
+        }
+
+        /// rope_interleaved_with_pos: Interleaved RoPE with explicit position offset
+        #[inline(always)]
+        pub fn rope_interleaved_with_pos(data: &mut [$elem], cos: &[$elem], sin: &[$elem], head_dim: usize, position: usize) {
+            let half = head_dim / 2;
+            let seq_len = data.len() / head_dim;
+
+            for pos in 0..seq_len {
+                let base = pos * head_dim;
+                let actual_pos = pos + position;
+                let cs_base = actual_pos * half;
+
+                if pos + 2 < seq_len {
+                    let nb = (pos + 2) * head_dim;
+                    let nc = (pos + 2 + position) * half;
+                    #[allow(unused_unsafe)]
+                    unsafe {
+                        $crate::simd_primitive!($isa, $elem, prefetch, data.as_ptr().add(nb) as *const i8, 0);
+                        $crate::simd_primitive!($isa, $elem, prefetch, cos.as_ptr().add(nc) as *const i8, 0);
+                        $crate::simd_primitive!($isa, $elem, prefetch, sin.as_ptr().add(nc) as *const i8, 0);
+                    }
+                }
+
+                let mut k = 0;
+                while k < half {
+                    let idx = base + 2 * k;
+                    let x0 = data[idx].to_f32();
+                    let x1 = data[idx + 1].to_f32();
+                    let c = cos[cs_base + k].to_f32();
+                    let s = sin[cs_base + k].to_f32();
+                    data[idx]     = <$elem as Element>::from_f32(x0 * c - x1 * s);
+                    data[idx + 1] = <$elem as Element>::from_f32(x0 * s + x1 * c);
+                    k += 1;
                 }
             }
         }

@@ -200,6 +200,48 @@ mod tests {
     }
 
     #[test]
+    fn test_softmax_online() {
+        let kernels = CpuKernels::<f32>::new();
+        let a = vec![1.0, 2.0, 3.0];
+        let mut out = vec![0.0; 3];
+        kernels.softmax_online(&a, &mut out);
+        // Verify sum = 1.0
+        let sum: f32 = out.iter().sum();
+        assert!((sum - 1.0).abs() < 1e-5);
+        // Verify ordering
+        assert!(out[2] > out[1] && out[1] > out[0]);
+    }
+
+    #[test]
+    fn test_softmax_online_matches_softmax() {
+        let kernels = CpuKernels::<f32>::new();
+        // Use a larger input to exercise SIMD paths
+        let a: Vec<f32> = (0..64).map(|i| (i as f32) * 0.1 - 3.0).collect();
+        let mut out_3pass = vec![0.0f32; 64];
+        let mut out_online = vec![0.0f32; 64];
+        kernels.softmax(&a, &mut out_3pass);
+        kernels.softmax_online(&a, &mut out_online);
+        for i in 0..64 {
+            assert!((out_3pass[i] - out_online[i]).abs() < 1e-5,
+                "mismatch at {}: 3pass={} online={}", i, out_3pass[i], out_online[i]);
+        }
+    }
+
+    #[test]
+    fn test_softmax_online_large_values() {
+        let kernels = CpuKernels::<f32>::new();
+        // Test numerical stability with large values
+        let a = vec![1000.0, 1001.0, 1002.0];
+        let mut out = vec![0.0; 3];
+        kernels.softmax_online(&a, &mut out);
+        let sum: f32 = out.iter().sum();
+        assert!((sum - 1.0).abs() < 1e-5);
+        assert!(out[2] > out[1] && out[1] > out[0]);
+        // Should not produce NaN or Inf
+        assert!(out.iter().all(|x| x.is_finite()));
+    }
+
+    #[test]
     fn test_swiglu() {
         let kernels = CpuKernels::<f32>::new();
         let gate = vec![1.0, -1.0];
@@ -278,6 +320,44 @@ mod tests {
         assert!((data[1] - (-1.0)).abs() < 1e-5);
         assert!((data[2] - 0.0).abs() < 1e-5);
         assert!((data[3] - 0.0).abs() < 1e-5);
+    }
+
+    #[test]
+    fn test_rope_interleaved() {
+        let kernels = CpuKernels::<f32>::new();
+        // head_dim = 4, seq_len = 1
+        // Interleaved layout: [x0, x1, x2, x3] where pairs are (x0,x1) and (x2,x3)
+        let mut data = vec![1.0, 0.0, 0.0, 1.0];
+        let cos = vec![1.0, 0.0]; // cos for 2 pairs
+        let sin = vec![0.0, 1.0]; // sin for 2 pairs
+        kernels.rope(&mut data, &cos, &sin, 4, true); // interleaved=true
+        // pair 0: (x0=1, x1=0), c=1, s=0
+        //   x0' = 1*1 - 0*0 = 1.0
+        //   x1' = 1*0 + 0*1 = 0.0
+        // pair 1: (x2=0, x3=1), c=0, s=1
+        //   x2' = 0*0 - 1*1 = -1.0
+        //   x3' = 0*1 + 1*0 = 0.0
+        assert!((data[0] - 1.0).abs() < 1e-5);
+        assert!((data[1] - 0.0).abs() < 1e-5);
+        assert!((data[2] - (-1.0)).abs() < 1e-5);
+        assert!((data[3] - 0.0).abs() < 1e-5);
+    }
+
+    #[test]
+    fn test_rope_interleaved_90deg() {
+        let kernels = CpuKernels::<f32>::new();
+        // 90-degree rotation: cos=0, sin=1 for all pairs
+        // head_dim = 4, seq_len = 1
+        let mut data = vec![1.0, 2.0, 3.0, 4.0];
+        let cos = vec![0.0, 0.0]; // cos=0 for both pairs
+        let sin = vec![1.0, 1.0]; // sin=1 for both pairs
+        kernels.rope(&mut data, &cos, &sin, 4, true);
+        // pair 0: (1,2), c=0, s=1 -> x0'=1*0-2*1=-2, x1'=1*1+2*0=1
+        // pair 1: (3,4), c=0, s=1 -> x2'=3*0-4*1=-4, x3'=3*1+4*0=3
+        assert!((data[0] - (-2.0)).abs() < 1e-5);
+        assert!((data[1] - 1.0).abs() < 1e-5);
+        assert!((data[2] - (-4.0)).abs() < 1e-5);
+        assert!((data[3] - 3.0).abs() < 1e-5);
     }
 
     // ========================================================================
@@ -1267,5 +1347,291 @@ mod tests {
         kernels.vec_axpy(&mut y, 2.0, &x);
         // y = a*x + y = 2*x + y = [2+10, 4+20, 6+30] = [12, 24, 36]
         assert_eq!(y, vec![12.0, 24.0, 36.0]);
+    }
+
+    // ========================================================================
+    // Block 23: Large-scale GEMV tests (LLM typical sizes)
+    // ========================================================================
+
+    /// Scalar reference GEMV: y[i] = sum_j(A[i*n+j] * x[j])
+    fn reference_gemv(a: &[f32], x: &[f32], m: usize, n: usize) -> Vec<f32> {
+        let mut y = vec![0.0f32; m];
+        for i in 0..m {
+            let mut sum = 0.0f64; // f64 for reference accuracy
+            for j in 0..n {
+                sum += a[i * n + j] as f64 * x[j] as f64;
+            }
+            y[i] = sum as f32;
+        }
+        y
+    }
+
+    /// Deterministic pseudo-random f32 in [-1, 1]
+    fn pseudo_random_vec(n: usize, seed: u32) -> Vec<f32> {
+        let mut s = seed;
+        (0..n).map(|_| {
+            s = s.wrapping_mul(1103515245).wrapping_add(12345);
+            ((s >> 16) as f32 / 32768.0) - 1.0
+        }).collect()
+    }
+
+    #[test]
+    fn test_gemv_large_4096() {
+        let kernels = CpuKernels::<f32>::new();
+        let (m, n) = (4096, 4096);
+        let a = pseudo_random_vec(m * n, 42);
+        let x = pseudo_random_vec(n, 137);
+        let y_ref = reference_gemv(&a, &x, m, n);
+        let mut y = vec![0.0f32; m];
+        kernels.gemv(&a, &x, &mut y, m, n);
+        for i in 0..m {
+            let rel_err = if y_ref[i].abs() > 1e-6 {
+                ((y[i] - y_ref[i]) / y_ref[i]).abs()
+            } else {
+                (y[i] - y_ref[i]).abs()
+            };
+            assert!(rel_err < 1e-3,
+                "gemv 4096x4096: y[{}]={}, ref={}, rel_err={:.2e}", i, y[i], y_ref[i], rel_err);
+        }
+    }
+
+    #[test]
+    fn test_gemv_large_11008() {
+        let kernels = CpuKernels::<f32>::new();
+        // LLaMA FFN typical: 4096 x 11008
+        let (m, n) = (4096, 11008);
+        let a = pseudo_random_vec(m * n, 99);
+        let x = pseudo_random_vec(n, 200);
+        let y_ref = reference_gemv(&a, &x, m, n);
+        let mut y = vec![0.0f32; m];
+        kernels.gemv(&a, &x, &mut y, m, n);
+        for i in (0..m).step_by(128) { // spot-check every 128th element
+            let rel_err = if y_ref[i].abs() > 1e-6 {
+                ((y[i] - y_ref[i]) / y_ref[i]).abs()
+            } else {
+                (y[i] - y_ref[i]).abs()
+            };
+            assert!(rel_err < 1e-3,
+                "gemv 4096x11008: y[{}]={}, ref={}, rel_err={:.2e}", i, y[i], y_ref[i], rel_err);
+        }
+    }
+
+    // ========================================================================
+    // Block 24: Boundary condition tests
+    // ========================================================================
+
+    #[test]
+    fn test_vec_ops_length_zero() {
+        let kernels = CpuKernels::<f32>::new();
+        let empty: Vec<f32> = vec![];
+        let mut out: Vec<f32> = vec![];
+        // These should not panic on empty input
+        kernels.vec_add(&empty, &empty, &mut out);
+        kernels.vec_mul(&empty, &empty, &mut out);
+        kernels.vec_sub(&empty, &empty, &mut out);
+    }
+
+    #[test]
+    fn test_vec_ops_length_one() {
+        let kernels = CpuKernels::<f32>::new();
+        let a = vec![3.0];
+        let b = vec![4.0];
+        let mut out = vec![0.0];
+        kernels.vec_add(&a, &b, &mut out);
+        assert_eq!(out[0], 7.0);
+        kernels.vec_mul(&a, &b, &mut out);
+        assert_eq!(out[0], 12.0);
+        kernels.vec_sub(&a, &b, &mut out);
+        assert_eq!(out[0], -1.0);
+        let d = kernels.vec_dot(&a, &b);
+        assert!((d - 12.0).abs() < 1e-5);
+        let s = kernels.vec_sum(&a);
+        assert!((s - 3.0).abs() < 1e-5);
+        let m = kernels.vec_max(&a);
+        assert!((m - 3.0).abs() < 1e-5);
+    }
+
+    #[test]
+    fn test_gemm_non_aligned() {
+        // m,n,k not multiples of any SIMD lane width
+        let kernels = CpuKernels::<f32>::new();
+        let (m, n, k) = (3, 7, 5);
+        let a: Vec<f32> = (0..m * k).map(|i| (i as f32) * 0.1 + 0.1).collect();
+        let b: Vec<f32> = (0..k * n).map(|i| (i as f32) * 0.05 + 0.05).collect();
+
+        // f64 reference
+        let mut c_ref = vec![0.0f64; m * n];
+        for i in 0..m {
+            for j in 0..n {
+                for l in 0..k {
+                    c_ref[i * n + j] += a[i * k + l] as f64 * b[l * n + j] as f64;
+                }
+            }
+        }
+
+        let mut c = vec![0.0f32; m * n];
+        kernels.gemm(&a, &b, &mut c, m, n, k);
+        for idx in 0..m * n {
+            let tol = c_ref[idx].abs() * 1e-5 + 1e-4;
+            assert!((c[idx] as f64 - c_ref[idx]).abs() < tol,
+                "gemm 3x7x5: c[{}]={}, ref={}", idx, c[idx], c_ref[idx]);
+        }
+    }
+
+    #[test]
+    fn test_gemm_1x1x1() {
+        let kernels = CpuKernels::<f32>::new();
+        let a = vec![3.5f32];
+        let b = vec![2.0f32];
+        let mut c = vec![0.0f32];
+        kernels.gemm(&a, &b, &mut c, 1, 1, 1);
+        assert!((c[0] - 7.0).abs() < 1e-5);
+    }
+
+    #[test]
+    fn test_softmax_length_1() {
+        let kernels = CpuKernels::<f32>::new();
+        let a = vec![42.0];
+        let mut out = vec![0.0];
+        kernels.softmax(&a, &mut out);
+        assert!((out[0] - 1.0).abs() < 1e-5, "softmax([x]) should be [1.0], got {}", out[0]);
+    }
+
+    #[test]
+    fn test_softmax_length_2() {
+        let kernels = CpuKernels::<f32>::new();
+        let a = vec![0.0, 0.0];
+        let mut out = vec![0.0; 2];
+        kernels.softmax(&a, &mut out);
+        assert!((out[0] - 0.5).abs() < 1e-5);
+        assert!((out[1] - 0.5).abs() < 1e-5);
+    }
+
+    #[test]
+    fn test_rms_norm_length_1() {
+        let kernels = CpuKernels::<f32>::new();
+        let x = vec![5.0];
+        let w = vec![1.0];
+        let mut out = vec![0.0];
+        kernels.rms_norm(&x, &w, &mut out, 1e-5);
+        // rms = sqrt(25/1 + eps) = sqrt(25.00001) ~ 5.0
+        // out = x / rms * w = 5 / 5 * 1 = 1.0
+        assert!((out[0] - 1.0).abs() < 1e-3, "rms_norm len=1: got {}", out[0]);
+    }
+
+    #[test]
+    fn test_layer_norm_length_1() {
+        let kernels = CpuKernels::<f32>::new();
+        let x = vec![5.0];
+        let w = vec![1.0];
+        let b = vec![0.0];
+        let mut out = vec![0.0];
+        kernels.layer_norm(&x, &w, &b, &mut out, 1e-5);
+        // mean=5, var=0, std=sqrt(eps) -> (5-5)/sqrt(eps) = 0
+        assert!(out[0].abs() < 1e-2, "layer_norm len=1: got {}", out[0]);
+    }
+
+    // ========================================================================
+    // Block 25: Online Softmax extended tests
+    // ========================================================================
+
+    #[test]
+    fn test_softmax_online_matches_regular_large() {
+        let kernels = CpuKernels::<f32>::new();
+        let a = pseudo_random_vec(4096, 77);
+        let mut out_regular = vec![0.0f32; 4096];
+        let mut out_online = vec![0.0f32; 4096];
+        kernels.softmax(&a, &mut out_regular);
+        kernels.softmax_online(&a, &mut out_online);
+        for i in 0..4096 {
+            assert!((out_regular[i] - out_online[i]).abs() < 1e-5,
+                "softmax online 4096: [{}] regular={}, online={}", i, out_regular[i], out_online[i]);
+        }
+    }
+
+    #[test]
+    fn test_softmax_online_length_1() {
+        let kernels = CpuKernels::<f32>::new();
+        let a = vec![100.0];
+        let mut out = vec![0.0];
+        kernels.softmax_online(&a, &mut out);
+        assert!((out[0] - 1.0).abs() < 1e-5, "softmax_online([x]) should be [1.0], got {}", out[0]);
+    }
+
+    #[test]
+    fn test_softmax_online_negative_values() {
+        let kernels = CpuKernels::<f32>::new();
+        let a = vec![-100.0, -99.0, -98.0];
+        let mut out_regular = vec![0.0f32; 3];
+        let mut out_online = vec![0.0f32; 3];
+        kernels.softmax(&a, &mut out_regular);
+        kernels.softmax_online(&a, &mut out_online);
+        let sum: f32 = out_online.iter().sum();
+        assert!((sum - 1.0).abs() < 1e-5);
+        for i in 0..3 {
+            assert!((out_regular[i] - out_online[i]).abs() < 1e-5);
+        }
+    }
+
+    // ========================================================================
+    // Block 26: RoPE interleaved extended tests
+    // ========================================================================
+
+    #[test]
+    fn test_rope_interleaved_identity() {
+        let kernels = CpuKernels::<f32>::new();
+        // cos=1, sin=0 for all pairs -> identity rotation
+        let original = vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0];
+        let mut data = original.clone();
+        let cos = vec![1.0; 4]; // 4 pairs for head_dim=8
+        let sin = vec![0.0; 4];
+        kernels.rope(&mut data, &cos, &sin, 8, true);
+        for i in 0..8 {
+            assert!((data[i] - original[i]).abs() < 1e-5,
+                "rope interleaved identity: data[{}]={}, expected {}", i, data[i], original[i]);
+        }
+    }
+
+    #[test]
+    fn test_rope_interleaved_180deg() {
+        let kernels = CpuKernels::<f32>::new();
+        // cos=-1, sin=0 -> 180-degree rotation: x'=-x, y'=-y
+        let mut data = vec![1.0, 2.0, 3.0, 4.0];
+        let cos = vec![-1.0, -1.0];
+        let sin = vec![0.0, 0.0];
+        kernels.rope(&mut data, &cos, &sin, 4, true);
+        // pair 0: (1,2), c=-1, s=0 -> x'=1*(-1)-2*0=-1, y'=1*0+2*(-1)=-2
+        // pair 1: (3,4), c=-1, s=0 -> x'=3*(-1)-4*0=-3, y'=3*0+4*(-1)=-4
+        assert!((data[0] - (-1.0)).abs() < 1e-5);
+        assert!((data[1] - (-2.0)).abs() < 1e-5);
+        assert!((data[2] - (-3.0)).abs() < 1e-5);
+        assert!((data[3] - (-4.0)).abs() < 1e-5);
+    }
+
+    #[test]
+    fn test_rope_non_interleaved_large() {
+        let kernels = CpuKernels::<f32>::new();
+        // head_dim=64, verify non-interleaved RoPE with known cos/sin
+        let head_dim = 64;
+        let half = head_dim / 2;
+        let mut data: Vec<f32> = (0..head_dim).map(|i| (i as f32) * 0.1).collect();
+        let data_orig = data.clone();
+        let cos: Vec<f32> = (0..half).map(|i| ((i as f32) * 0.01).cos()).collect();
+        let sin: Vec<f32> = (0..half).map(|i| ((i as f32) * 0.01).sin()).collect();
+        kernels.rope(&mut data, &cos, &sin, head_dim, false);
+
+        // Verify against manual computation
+        for i in 0..half {
+            let x0 = data_orig[i];
+            let x1 = data_orig[i + half];
+            let c = cos[i];
+            let s = sin[i];
+            let expected_0 = x0 * c - x1 * s;
+            let expected_1 = x0 * s + x1 * c;
+            assert!((data[i] - expected_0).abs() < 1e-4,
+                "rope non-interleaved: data[{}]={}, expected {}", i, data[i], expected_0);
+            assert!((data[i + half] - expected_1).abs() < 1e-4,
+                "rope non-interleaved: data[{}]={}, expected {}", i + half, data[i + half], expected_1);
+        }
     }
 }

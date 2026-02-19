@@ -44,3 +44,9 @@ mod check_isa;
 mod tests_amx;
 
 pub use traits::{Element, Backend, Kernels};
+
+/// Type alias for the primitive `f16` type (core::f16).
+/// Needed because `half::f16` shadows the primitive in macro expansion contexts.
+/// Both are IEEE 754 binary16 with identical memory layout.
+#[allow(non_camel_case_types)]
+pub type prim_f16 = f16;
