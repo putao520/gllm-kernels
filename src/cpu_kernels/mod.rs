@@ -1400,7 +1400,96 @@ impl<E: Element> Kernels<E> for CpuKernels<E> {
         quant_type: crate::quant::QuantType, m: usize, n: usize, k: usize,
     ) {
         use crate::quant::QuantType;
-        // Match once at entry, dispatch to format-specific loop (no match in hot path)
+
+        // Fast path: fused multi-row GEMV for n==1 (bypasses transpose + fn-ptr overhead)
+        // AVX-512 preferred when available, falls back to AVX2.
+        #[cfg(target_arch = "x86_64")]
+        if n == 1 && k % 256 == 0 {
+            let isa = get_isa_level();
+            match isa {
+                IsaLevel::Avx512 | IsaLevel::Avx512Fp16 => {
+                    match quant_type {
+                        QuantType::Q8K => {
+                            if let Some(in_f32) = E::as_f32_slice(input) {
+                                let mut out_f32 = vec![0.0f32; m];
+                                unsafe {
+                                    crate::asm::x86_64::quant_gemv::gemv_q8k_fused_avx512(
+                                        weight_blocks.as_ptr(),
+                                        in_f32.as_ptr(),
+                                        out_f32.as_mut_ptr(),
+                                        m, k,
+                                    );
+                                }
+                                for i in 0..m {
+                                    output[i] = E::from_f32(out_f32[i]);
+                                }
+                                return;
+                            }
+                        }
+                        QuantType::Q4K => {
+                            if let Some(in_f32) = E::as_f32_slice(input) {
+                                let mut out_f32 = vec![0.0f32; m];
+                                unsafe {
+                                    crate::asm::x86_64::quant_gemv::gemv_q4k_fused_avx512(
+                                        weight_blocks.as_ptr(),
+                                        in_f32.as_ptr(),
+                                        out_f32.as_mut_ptr(),
+                                        m, k,
+                                    );
+                                }
+                                for i in 0..m {
+                                    output[i] = E::from_f32(out_f32[i]);
+                                }
+                                return;
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+                IsaLevel::Avx2 => {
+                    match quant_type {
+                        QuantType::Q8K => {
+                            if let Some(in_f32) = E::as_f32_slice(input) {
+                                let mut out_f32 = vec![0.0f32; m];
+                                unsafe {
+                                    crate::asm::x86_64::quant_gemv::gemv_q8k_fused_avx2(
+                                        weight_blocks.as_ptr(),
+                                        in_f32.as_ptr(),
+                                        out_f32.as_mut_ptr(),
+                                        m, k,
+                                    );
+                                }
+                                for i in 0..m {
+                                    output[i] = E::from_f32(out_f32[i]);
+                                }
+                                return;
+                            }
+                        }
+                        QuantType::Q4K => {
+                            if let Some(in_f32) = E::as_f32_slice(input) {
+                                let mut out_f32 = vec![0.0f32; m];
+                                unsafe {
+                                    crate::asm::x86_64::quant_gemv::gemv_q4k_fused_avx2(
+                                        weight_blocks.as_ptr(),
+                                        in_f32.as_ptr(),
+                                        out_f32.as_mut_ptr(),
+                                        m, k,
+                                    );
+                                }
+                                for i in 0..m {
+                                    output[i] = E::from_f32(out_f32[i]);
+                                }
+                                return;
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        // Generic path: transpose + per-block dot
         match quant_type {
             QuantType::Q2K => self.quant_matmul_inner::<84, 256, _>(weight_blocks, input, output, m, n, k, Self::dot_q2_k),
             QuantType::Q3K => self.quant_matmul_inner::<110, 256, _>(weight_blocks, input, output, m, n, k, Self::dot_q3_k),

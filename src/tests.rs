@@ -1128,6 +1128,113 @@ mod tests {
     }
 
     // ========================================================================
+    // Block 19: Q4K dot accuracy tests
+    // ========================================================================
+
+    /// Helper: construct a Q4_K block with known nibble values.
+    /// Q4_K dequant: for byte qs[i], low = qs[i] & 0x0F, high = qs[i] >> 4
+    ///   value[2*i]   = d * low  - d * 8
+    ///   value[2*i+1] = d * high - d * 8
+    fn make_q4k_block(d: f32, qs: &[u8; 128]) -> Vec<u8> {
+        use crate::quant::BlockQ4K;
+        let blk = BlockQ4K {
+            d: half::f16::from_f32(d),
+            dmin: half::f16::from_f32(0.0),
+            scales: [0u8; 12],
+            qs: *qs,
+        };
+        let ptr = &blk as *const BlockQ4K as *const u8;
+        unsafe { std::slice::from_raw_parts(ptr, std::mem::size_of::<BlockQ4K>()).to_vec() }
+    }
+
+    #[test]
+    fn test_q4k_dot_accuracy_random() {
+        // Verify SIMD Q4K dot matches scalar reference with random data.
+        // This catches interleaving bugs in AVX-512 (and AVX2) nibble unpacking.
+        let kernels = CpuKernels::<f32>::new();
+        let d = 0.0371f32;
+
+        // Random-ish nibble values: each byte packs two 4-bit values [0..15]
+        let mut qs = [0u8; 128];
+        for i in 0..128 {
+            let lo = ((i * 97 + 13) % 16) as u8;
+            let hi = ((i * 53 + 7) % 16) as u8;
+            qs[i] = lo | (hi << 4);
+        }
+        let block = make_q4k_block(d, &qs);
+
+        // Random-ish f32 input (256 values for QK_K=256)
+        let input: Vec<f32> = (0..256).map(|i| {
+            ((i as f32 * 0.0137 + 0.5).sin()) * 2.0 - 1.0
+        }).collect();
+
+        // Compute scalar reference (matches the scalar q4_k dot macro)
+        let d64 = d as f64;
+        let mut expected = 0.0f64;
+        for i in 0..128 {
+            let lo = (qs[i] & 0x0F) as f64;
+            let hi = (qs[i] >> 4) as f64;
+            expected += (d64 * lo - d64 * 8.0) * (input[i * 2] as f64);
+            expected += (d64 * hi - d64 * 8.0) * (input[i * 2 + 1] as f64);
+        }
+
+        let mut output = vec![0.0f32; 1];
+        kernels.kquant_matmul(&block, &input, &mut output,
+            crate::quant::QuantType::Q4K, 1, 1, 256);
+
+        let rel_err = ((output[0] as f64 - expected) / expected).abs();
+        assert!(rel_err < 1e-3,
+            "Q4K dot accuracy: got {}, expected {}, rel_err {:.2e}",
+            output[0], expected, rel_err);
+    }
+
+    #[test]
+    fn test_q4k_dot_accuracy_multirow() {
+        // Test Q4K with 5 rows (exercises both 4-row main loop and 1-row tail)
+        let kernels = CpuKernels::<f32>::new();
+        let d = 0.05f32;
+
+        let mut qs = [0u8; 128];
+        for i in 0..128 {
+            let lo = ((i * 31 + 5) % 16) as u8;
+            let hi = ((i * 71 + 3) % 16) as u8;
+            qs[i] = lo | (hi << 4);
+        }
+
+        let input: Vec<f32> = (0..256).map(|i| {
+            ((i as f32 * 0.023 + 1.7).cos()) * 1.5
+        }).collect();
+
+        // Scalar reference
+        let d64 = d as f64;
+        let mut expected = 0.0f64;
+        for i in 0..128 {
+            let lo = (qs[i] & 0x0F) as f64;
+            let hi = (qs[i] >> 4) as f64;
+            expected += (d64 * lo - d64 * 8.0) * (input[i * 2] as f64);
+            expected += (d64 * hi - d64 * 8.0) * (input[i * 2 + 1] as f64);
+        }
+
+        // 5 identical rows
+        let m = 5;
+        let mut weight_data = Vec::new();
+        for _ in 0..m {
+            weight_data.extend_from_slice(&make_q4k_block(d, &qs));
+        }
+
+        let mut output = vec![0.0f32; m];
+        kernels.kquant_matmul(&weight_data, &input, &mut output,
+            crate::quant::QuantType::Q4K, m, 1, 256);
+
+        for row in 0..m {
+            let rel_err = ((output[row] as f64 - expected) / expected).abs();
+            assert!(rel_err < 1e-3,
+                "Q4K multirow[{}]: got {}, expected {}, rel_err {:.2e}",
+                row, output[row], expected, rel_err);
+        }
+    }
+
+    // ========================================================================
     // Block 21: QuantType utility tests
     // ========================================================================
 

@@ -260,6 +260,11 @@ impl<T> AlignedVec<T> {
         let layout = std::alloc::Layout::from_size_align(byte_size, Self::ALIGN).unwrap();
         let new_ptr = unsafe { std::alloc::alloc(layout) as *mut T };
         assert!(!new_ptr.is_null(), "allocation failed");
+        // Hint transparent huge pages for large buffers (≥2MB)
+        #[cfg(target_os = "linux")]
+        if byte_size >= 2 * 1024 * 1024 {
+            unsafe { libc::madvise(new_ptr as *mut libc::c_void, byte_size, libc::MADV_HUGEPAGE); }
+        }
         if self.len > 0 && !self.ptr.is_null() {
             unsafe { std::ptr::copy_nonoverlapping(self.ptr, new_ptr, self.len); }
         }

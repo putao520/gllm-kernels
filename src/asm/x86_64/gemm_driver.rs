@@ -98,6 +98,25 @@ unsafe fn pack_b_f32(
     }
 }
 
+/// Apply bias to a block of C: C[i,j] += bias[j].
+/// Uses slices so the compiler can auto-vectorize with -C target-cpu=native.
+#[cfg(target_arch = "x86_64")]
+#[inline]
+unsafe fn add_bias_block_f32(
+    c: *mut f32, ldc: usize,
+    row_start: usize, col_start: usize,
+    rows: usize, cols: usize,
+    bias: *const f32,
+) {
+    let b_slice = std::slice::from_raw_parts(bias.add(col_start), cols);
+    for i in 0..rows {
+        let c_row = std::slice::from_raw_parts_mut(c.add((row_start + i) * ldc + col_start), cols);
+        for j in 0..cols {
+            c_row[j] += b_slice[j];
+        }
+    }
+}
+
 /// Generic BLIS-style GEMM driver parameterized by microkernel geometry.
 ///
 /// C = A * B  (row-major, C is m x n, A is m x k, B is k x n)
@@ -116,6 +135,7 @@ fn gemm_driver_f32(
     mr: usize,
     nr: usize,
     microkernel: unsafe fn(*const f32, *const f32, *mut f32, usize, usize, bool),
+    bias: *const f32,
 ) {
     assert!(a.len() >= m * k);
     assert!(b.len() >= k * n);
@@ -161,6 +181,7 @@ fn gemm_driver_f32(
         while pc < k {
             let kc = kc_max.min(k - pc);
             let first_kc = pc == 0;
+            let last_kc = pc + kc_max >= k;
 
             // Pack B panel: B[pc..pc+kc, jc..jc+nc] -> packed_b
             unsafe {
@@ -237,6 +258,15 @@ fn gemm_driver_f32(
                     }
                 }
 
+                // Fused bias: apply while C block is L1-hot
+                if last_kc && !bias.is_null() {
+                    let mc_actual = mc_max.min(m - ic);
+                    let nc_actual = nc_max.min(n - jc);
+                    unsafe {
+                        add_bias_block_f32(c_ptr, n, ic, jc, mc_actual, nc_actual, bias);
+                    }
+                }
+
                 ic += mc_max;
             }
 
@@ -249,6 +279,197 @@ fn gemm_driver_f32(
     // Return buffers to thread-local storage
     PACK_A.with(|c| c.set(pa));
     PACK_B.with(|c| c.set(pb));
+}
+
+/// Multi-threaded BLIS-style GEMM driver. Parallelizes the MC loop with Rayon.
+///
+/// C = A * B  (row-major, C is m x n, A is m x k, B is k x n)
+///
+/// The NC/KC outer loops run on the main thread. Pack B is done once per KC
+/// iteration. The MC loop is distributed across Rayon worker threads, each
+/// using a thread-local pack_a buffer.
+///
+/// Falls back to single-threaded `gemm_driver_f32` when the problem is too
+/// small to benefit from parallelism.
+#[cfg(target_arch = "x86_64")]
+fn gemm_driver_f32_mt(
+    a: &[f32],
+    b: &[f32],
+    c: &mut [f32],
+    m: usize,
+    n: usize,
+    k: usize,
+    mr: usize,
+    nr: usize,
+    microkernel: unsafe fn(*const f32, *const f32, *mut f32, usize, usize, bool),
+    bias: *const f32,
+) {
+    assert!(a.len() >= m * k);
+    assert!(b.len() >= k * n);
+    assert!(c.len() >= m * n);
+
+    if m == 0 || n == 0 || k == 0 {
+        return;
+    }
+
+    let cfg = crate::microarch::kernel_config();
+    let kc_max = cfg.kc;
+    let mc_max = cfg.mc;
+    let nc_max = cfg.nc;
+
+    let nthreads = rayon::current_num_threads().max(1);
+    let num_m_blocks = (m + mc_max - 1) / mc_max;
+
+    // Fall back to single-threaded for small problems
+    if num_m_blocks < 2 || nthreads <= 1 {
+        return gemm_driver_f32(a, b, c, m, n, k, mr, nr, microkernel, bias);
+    }
+
+    // Shared pack_b buffer (allocated once on main thread, read by all workers)
+    thread_local! {
+        static PACK_B_MT: std::cell::Cell<AlignedVec<f32>> = std::cell::Cell::new(AlignedVec::new());
+    }
+
+    let pack_b_size = kc_max * nc_max;
+    let mut pb = PACK_B_MT.with(|c| c.take());
+    let prev_cap = pb.capacity();
+    if prev_cap < pack_b_size { pb.reserve(pack_b_size); }
+    unsafe { pb.set_len(pack_b_size); }
+
+    // NUMA: interleave shared pack_b across nodes (only on first alloc)
+    if prev_cap < pack_b_size {
+        let byte_size = pack_b_size * std::mem::size_of::<f32>();
+        let _ = crate::numa::mbind_interleave(pb.as_mut_ptr() as *mut u8, byte_size);
+    }
+
+    let a_ptr = a.as_ptr();
+    let b_ptr = b.as_ptr();
+    let c_ptr = c.as_mut_ptr();
+
+    // NC loop
+    let mut jc = 0usize;
+    while jc < n {
+        let nc = nc_max.min(n - jc);
+
+        // KC loop
+        let mut pc = 0usize;
+        while pc < k {
+            let kc = kc_max.min(k - pc);
+            let first_kc = pc == 0;
+            let last_kc = pc + kc_max >= k;
+
+            // Pack B ONCE on the main thread
+            unsafe {
+                pack_b_f32(b_ptr.add(pc * n + jc), n, pb.as_mut_ptr(), kc, nc, nr);
+            }
+
+            // Send raw pointers across threads via usize (safe: all point into
+            // caller-owned slices that outlive the parallel region).
+            let a_addr = a_ptr as usize;
+            let c_addr = c_ptr as usize;
+            let pb_addr = pb.as_ptr() as usize;
+            let bias_addr = bias as usize;
+
+            use rayon::prelude::*;
+            (0..num_m_blocks).into_par_iter().for_each(|block_idx| {
+                let ic = block_idx * mc_max;
+                if ic >= m { return; }
+                let mc = mc_max.min(m - ic);
+
+                // Thread-local pack_a buffer (separate TLS key from the
+                // single-threaded driver to avoid conflicts)
+                thread_local! {
+                    static PACK_A_MT: std::cell::Cell<AlignedVec<f32>> =
+                        std::cell::Cell::new(AlignedVec::new());
+                }
+                let pack_a_size = mc_max * kc_max;
+                let mut pa = PACK_A_MT.with(|c| c.take());
+                if pa.capacity() < pack_a_size { pa.reserve(pack_a_size); }
+                unsafe { pa.set_len(pack_a_size); }
+
+                let a_ptr = a_addr as *const f32;
+                let c_ptr = c_addr as *mut f32;
+                let pb_ptr = pb_addr as *const f32;
+
+                // Pack A for this M-block
+                unsafe {
+                    pack_a_f32(a_ptr.add(ic * k + pc), k, pa.as_mut_ptr(), mc, kc, mr);
+                }
+
+                let n_mr = (mc + mr - 1) / mr;
+                let n_nr = (nc + nr - 1) / nr;
+                let mut c_tmp = [0.0f32; 14 * 32]; // max MR*NR
+
+                for jr in 0..n_nr {
+                    let col_start = jc + jr * nr;
+                    let col_rem = n.saturating_sub(col_start).min(nr);
+                    let is_edge_col = col_rem < nr;
+
+                    for ir in 0..n_mr {
+                        let row_start = ic + ir * mr;
+                        let row_rem = m.saturating_sub(row_start).min(mr);
+                        let is_edge_row = row_rem < mr;
+
+                        unsafe {
+                            let pa_tile = pa.as_ptr().add(ir * mr * kc);
+                            let pb_tile = pb_ptr.add(jr * nr * kc);
+
+                            if is_edge_row || is_edge_col {
+                                if !first_kc {
+                                    for ri in 0..row_rem {
+                                        for ci in 0..col_rem {
+                                            c_tmp[ri * nr + ci] =
+                                                *c_ptr.add((row_start + ri) * n + col_start + ci);
+                                        }
+                                    }
+                                } else {
+                                    for v in c_tmp[..mr * nr].iter_mut() { *v = 0.0; }
+                                }
+
+                                microkernel(
+                                    pa_tile, pb_tile, c_tmp.as_mut_ptr(),
+                                    kc, nr, !first_kc,
+                                );
+
+                                for ri in 0..row_rem {
+                                    for ci in 0..col_rem {
+                                        *c_ptr.add((row_start + ri) * n + col_start + ci) =
+                                            c_tmp[ri * nr + ci];
+                                    }
+                                }
+                            } else {
+                                let c_tile = c_ptr.add(row_start * n + col_start);
+                                microkernel(
+                                    pa_tile, pb_tile, c_tile,
+                                    kc, n, !first_kc,
+                                );
+                            }
+                        }
+                    }
+                }
+
+                // Fused bias: apply while C block is L1-hot
+                let bias_ptr = bias_addr as *const f32;
+                if last_kc && !bias_ptr.is_null() {
+                    let mc_actual = mc_max.min(m - ic);
+                    let nc_actual = nc_max.min(n - jc);
+                    unsafe {
+                        add_bias_block_f32(c_ptr, n, ic, jc, mc_actual, nc_actual, bias_ptr);
+                    }
+                }
+
+                // Return pack_a to thread-local storage
+                PACK_A_MT.with(|c| c.set(pa));
+            });
+
+            pc += kc_max;
+        }
+
+        jc += nc_max;
+    }
+
+    // Return pack_b to thread-local storage
+    PACK_B_MT.with(|c| c.set(pb));
 }
 
 /// Full GEMM using the hand-written 6x16 AVX2 microkernel.
@@ -265,9 +486,9 @@ pub fn gemm_asm_f32_avx2(
 ) {
     use super::gemm_avx2::{MR, NR, gemm_kernel_6x16_f32};
 
-    gemm_driver_f32(a, b, c, m, n, k, MR, NR, |pa, pb, cp, kc, ldc, acc| unsafe {
+    gemm_driver_f32_mt(a, b, c, m, n, k, MR, NR, |pa, pb, cp, kc, ldc, acc| unsafe {
         gemm_kernel_6x16_f32(pa, pb, cp, kc, ldc, acc);
-    });
+    }, std::ptr::null());
 }
 
 /// Full GEMM using the hand-written 14x32 AVX-512 microkernel.
@@ -284,12 +505,12 @@ pub fn gemm_asm_f32_avx512(
 ) {
     use super::gemm_avx512::{MR, NR, gemm_kernel_14x32_f32};
 
-    gemm_driver_f32(a, b, c, m, n, k, MR, NR, |pa, pb, cp, kc, ldc, acc| unsafe {
+    gemm_driver_f32_mt(a, b, c, m, n, k, MR, NR, |pa, pb, cp, kc, ldc, acc| unsafe {
         gemm_kernel_14x32_f32(pa, pb, cp, kc, ldc, acc);
-    });
+    }, std::ptr::null());
 }
 
-/// GEMM with bias using AVX2: C = A * B + bias
+/// GEMM with fused bias using AVX2: C = A * B + bias (bias applied L1-hot)
 #[cfg(target_arch = "x86_64")]
 pub fn gemm_bias_asm_f32_avx2(
     a: &[f32],
@@ -300,15 +521,14 @@ pub fn gemm_bias_asm_f32_avx2(
     n: usize,
     k: usize,
 ) {
-    gemm_asm_f32_avx2(a, b, c, m, n, k);
-    for i in 0..m {
-        for j in 0..n {
-            c[i * n + j] += bias[j];
-        }
-    }
+    use super::gemm_avx2::{MR, NR, gemm_kernel_6x16_f32};
+
+    gemm_driver_f32_mt(a, b, c, m, n, k, MR, NR, |pa, pb, cp, kc, ldc, acc| unsafe {
+        gemm_kernel_6x16_f32(pa, pb, cp, kc, ldc, acc);
+    }, bias.as_ptr());
 }
 
-/// GEMM with bias using AVX-512: C = A * B + bias
+/// GEMM with fused bias using AVX-512: C = A * B + bias (bias applied L1-hot)
 #[cfg(target_arch = "x86_64")]
 pub fn gemm_bias_asm_f32_avx512(
     a: &[f32],
@@ -319,12 +539,11 @@ pub fn gemm_bias_asm_f32_avx512(
     n: usize,
     k: usize,
 ) {
-    gemm_asm_f32_avx512(a, b, c, m, n, k);
-    for i in 0..m {
-        for j in 0..n {
-            c[i * n + j] += bias[j];
-        }
-    }
+    use super::gemm_avx512::{MR, NR, gemm_kernel_14x32_f32};
+
+    gemm_driver_f32_mt(a, b, c, m, n, k, MR, NR, |pa, pb, cp, kc, ldc, acc| unsafe {
+        gemm_kernel_14x32_f32(pa, pb, cp, kc, ldc, acc);
+    }, bias.as_ptr());
 }
 
 #[cfg(test)]

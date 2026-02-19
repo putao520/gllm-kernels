@@ -138,6 +138,9 @@ global_asm!(
     "vmovups ymm15, [rsi + 96]",
 
     // ──── k+1 ──── B[k+1] in ymm14/ymm15
+    "prefetcht1 [rdi + 512]",       // A L2 prefetch ~21 k-steps ahead
+    "prefetcht1 [rsi + 768]",       // B L2 prefetch ~12 k-steps ahead
+
     "vbroadcastss ymm12, [rdi + 24]",
     "vbroadcastss ymm13, [rdi + 28]",
     "vfmadd231ps ymm0, ymm12, ymm14",
@@ -193,6 +196,9 @@ global_asm!(
     "vmovups ymm15, [rsi + 224]",
 
     // ──── k+3 ────
+    "prefetcht1 [rdi + 704]",       // A L2 prefetch ~29 k-steps ahead
+    "prefetcht1 [rsi + 960]",       // B L2 prefetch ~15 k-steps ahead
+
     "vbroadcastss ymm12, [rdi + 72]",
     "vbroadcastss ymm13, [rdi + 76]",
     "vfmadd231ps ymm0, ymm12, ymm14",
@@ -262,8 +268,22 @@ global_asm!(
     "dec r15",
     "jnz .Lavx2_k_tail",
 
-    // ── Store C accumulators ──
+    // ── Prefetch C rows to reduce RFO latency on stores ──
     ".Lavx2_store_c:",
+    "prefetcht0 [rdx]",
+    "prefetcht0 [rdx + 32]",
+    "prefetcht0 [r10]",
+    "prefetcht0 [r10 + 32]",
+    "prefetcht0 [r11]",
+    "prefetcht0 [r11 + 32]",
+    "prefetcht0 [r12]",
+    "prefetcht0 [r12 + 32]",
+    "prefetcht0 [r13]",
+    "prefetcht0 [r13 + 32]",
+    "prefetcht0 [r14]",
+    "prefetcht0 [r14 + 32]",
+
+    // ── Store C accumulators ──
     "vmovups [rdx], ymm0",
     "vmovups [rdx + 32], ymm1",
     "vmovups [r10], ymm2",

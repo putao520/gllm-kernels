@@ -1,6 +1,7 @@
 //! Hand-written AVX-512 GEMM 14x32 microkernel (x86_64).
 //!
-//! Phase 4 rewrite: BLIS double-buffer pattern.
+//! Phase 5 rewrite: 4x unrolled K-loop with dual-distance prefetch
+//! and C row prefetch before stores.
 //!
 //! Microkernel geometry: 14 rows x 32 columns (2 x ZMM vectors per row)
 //! = 28 accumulator registers (zmm0-zmm27)
@@ -20,8 +21,11 @@
 //!   zmm22 - zmm23 : C row 11
 //!   zmm24 - zmm25 : C row 12
 //!   zmm26 - zmm27 : C row 13
-//!   zmm28 - zmm29 : A broadcast double-buffer
+//!   zmm28 - zmm29 : A broadcast temporaries
 //!   zmm30 - zmm31 : B load double-buffer (software pipeline)
+//!
+//! K-loop: 4x unrolled main loop, 2x remainder, 1x tail.
+//! Prefetch: dual-distance L1 (prefetcht0) + L2 (prefetcht1) schedule.
 //!
 //! Calling convention (System V AMD64 ABI):
 //!   rdi = packed_a, rsi = packed_b, rdx = c_ptr,
@@ -48,7 +52,7 @@ global_asm!(
     "push rbp",
     // Stack: 8 pointers for C rows 6-13
     "sub rsp, 64",
-    // ldc: elements → bytes
+    // ldc: elements -> bytes
     "shl r8, 2",
     // C row pointers: row0=rdx, row1-5 in r10-r14
     "mov r10, rdx",
@@ -78,7 +82,7 @@ global_asm!(
     "test r9, r9",
     "jz .Lavx512_zero_c",
 
-    // ── Load existing C ──
+    // -- Load existing C --
     "vmovups zmm0, [rdx]",
     "vmovups zmm1, [rdx + 64]",
     "vmovups zmm2, [r10]",
@@ -91,7 +95,7 @@ global_asm!(
     "vmovups zmm9, [r13 + 64]",
     "vmovups zmm10, [r14]",
     "vmovups zmm11, [r14 + 64]",
-    "mov rbx, [rsp]",
+    "mov rbx, [rsp + 0]",
     "vmovups zmm12, [rbx]",
     "vmovups zmm13, [rbx + 64]",
     "mov rbx, [rsp + 8]",
@@ -149,23 +153,21 @@ global_asm!(
 
     ".Lavx512_k_setup:",
     "mov r15, rcx",
-    "cmp r15, 2",
-    "jl .Lavx512_k_remainder",
+    "cmp r15, 4",
+    "jl .Lavx512_k_check_2x",
 
     // Pre-load B[k=0]
     "vmovups zmm30, [rsi]",
     "vmovups zmm31, [rsi + 64]",
 
-    // ── Main K-loop: 2x unrolled with double-buffer ──
-    // (2x instead of 4x to reduce code size with 14 rows)
+    // -- Main K-loop: 4x unrolled with software pipeline --
     ".align 64",
-    ".Lavx512_k_loop_2x:",
-
-    // ──── k+0 ──── B in zmm30/zmm31
+    ".Lavx512_k_loop_4x:",
+    // ---- k+0 with L1 prefetch ---- B in zmm30/zmm31
     "prefetcht0 [rdi + 256]",
     "prefetcht0 [rsi + 512]",
 
-    "vbroadcastss zmm28, [rdi]",
+    "vbroadcastss zmm28, [rdi + 0]",
     "vbroadcastss zmm29, [rdi + 4]",
     "vfmadd231ps zmm0, zmm28, zmm30",
     "vfmadd231ps zmm1, zmm28, zmm31",
@@ -218,9 +220,9 @@ global_asm!(
     "vmovups zmm30, [rsi + 128]",
     "vmovups zmm31, [rsi + 192]",
 
-    // ──── k+1 ──── B[k+1] in zmm30/zmm31
-    "prefetcht0 [rdi + 384]",
-    "prefetcht0 [rsi + 768]",
+    // ---- k+1 with L2 prefetch ---- B in zmm30/zmm31
+    "prefetcht1 [rdi + 768]",
+    "prefetcht1 [rsi + 1536]",
 
     "vbroadcastss zmm28, [rdi + 56]",
     "vbroadcastss zmm29, [rdi + 60]",
@@ -271,29 +273,261 @@ global_asm!(
     "vfmadd231ps zmm26, zmm29, zmm30",
     "vfmadd231ps zmm27, zmm29, zmm31",
 
-    // Advance: A += 2*MR*4 = 112, B += 2*NR*4 = 256
-    "add rdi, 112",
-    "add rsi, 256",
+    // Software pipeline: load B[k+2]
+    "vmovups zmm30, [rsi + 256]",
+    "vmovups zmm31, [rsi + 320]",
 
-    "sub r15, 2",
+    // ---- k+2 with L1 prefetch (second distance) ---- B in zmm30/zmm31
+    "prefetcht0 [rdi + 448]",
+    "prefetcht0 [rsi + 768]",
+
+    "vbroadcastss zmm28, [rdi + 112]",
+    "vbroadcastss zmm29, [rdi + 116]",
+    "vfmadd231ps zmm0, zmm28, zmm30",
+    "vfmadd231ps zmm1, zmm28, zmm31",
+    "vfmadd231ps zmm2, zmm29, zmm30",
+    "vfmadd231ps zmm3, zmm29, zmm31",
+
+    "vbroadcastss zmm28, [rdi + 120]",
+    "vbroadcastss zmm29, [rdi + 124]",
+    "vfmadd231ps zmm4, zmm28, zmm30",
+    "vfmadd231ps zmm5, zmm28, zmm31",
+    "vfmadd231ps zmm6, zmm29, zmm30",
+    "vfmadd231ps zmm7, zmm29, zmm31",
+
+    "vbroadcastss zmm28, [rdi + 128]",
+    "vbroadcastss zmm29, [rdi + 132]",
+    "vfmadd231ps zmm8, zmm28, zmm30",
+    "vfmadd231ps zmm9, zmm28, zmm31",
+    "vfmadd231ps zmm10, zmm29, zmm30",
+    "vfmadd231ps zmm11, zmm29, zmm31",
+
+    "vbroadcastss zmm28, [rdi + 136]",
+    "vbroadcastss zmm29, [rdi + 140]",
+    "vfmadd231ps zmm12, zmm28, zmm30",
+    "vfmadd231ps zmm13, zmm28, zmm31",
+    "vfmadd231ps zmm14, zmm29, zmm30",
+    "vfmadd231ps zmm15, zmm29, zmm31",
+
+    "vbroadcastss zmm28, [rdi + 144]",
+    "vbroadcastss zmm29, [rdi + 148]",
+    "vfmadd231ps zmm16, zmm28, zmm30",
+    "vfmadd231ps zmm17, zmm28, zmm31",
+    "vfmadd231ps zmm18, zmm29, zmm30",
+    "vfmadd231ps zmm19, zmm29, zmm31",
+
+    "vbroadcastss zmm28, [rdi + 152]",
+    "vbroadcastss zmm29, [rdi + 156]",
+    "vfmadd231ps zmm20, zmm28, zmm30",
+    "vfmadd231ps zmm21, zmm28, zmm31",
+    "vfmadd231ps zmm22, zmm29, zmm30",
+    "vfmadd231ps zmm23, zmm29, zmm31",
+
+    "vbroadcastss zmm28, [rdi + 160]",
+    "vbroadcastss zmm29, [rdi + 164]",
+    "vfmadd231ps zmm24, zmm28, zmm30",
+    "vfmadd231ps zmm25, zmm28, zmm31",
+    "vfmadd231ps zmm26, zmm29, zmm30",
+    "vfmadd231ps zmm27, zmm29, zmm31",
+
+    // Software pipeline: load B[k+3]
+    "vmovups zmm30, [rsi + 384]",
+    "vmovups zmm31, [rsi + 448]",
+
+    // ---- k+3 (no prefetch) ---- B in zmm30/zmm31
+
+    "vbroadcastss zmm28, [rdi + 168]",
+    "vbroadcastss zmm29, [rdi + 172]",
+    "vfmadd231ps zmm0, zmm28, zmm30",
+    "vfmadd231ps zmm1, zmm28, zmm31",
+    "vfmadd231ps zmm2, zmm29, zmm30",
+    "vfmadd231ps zmm3, zmm29, zmm31",
+
+    "vbroadcastss zmm28, [rdi + 176]",
+    "vbroadcastss zmm29, [rdi + 180]",
+    "vfmadd231ps zmm4, zmm28, zmm30",
+    "vfmadd231ps zmm5, zmm28, zmm31",
+    "vfmadd231ps zmm6, zmm29, zmm30",
+    "vfmadd231ps zmm7, zmm29, zmm31",
+
+    "vbroadcastss zmm28, [rdi + 184]",
+    "vbroadcastss zmm29, [rdi + 188]",
+    "vfmadd231ps zmm8, zmm28, zmm30",
+    "vfmadd231ps zmm9, zmm28, zmm31",
+    "vfmadd231ps zmm10, zmm29, zmm30",
+    "vfmadd231ps zmm11, zmm29, zmm31",
+
+    "vbroadcastss zmm28, [rdi + 192]",
+    "vbroadcastss zmm29, [rdi + 196]",
+    "vfmadd231ps zmm12, zmm28, zmm30",
+    "vfmadd231ps zmm13, zmm28, zmm31",
+    "vfmadd231ps zmm14, zmm29, zmm30",
+    "vfmadd231ps zmm15, zmm29, zmm31",
+
+    "vbroadcastss zmm28, [rdi + 200]",
+    "vbroadcastss zmm29, [rdi + 204]",
+    "vfmadd231ps zmm16, zmm28, zmm30",
+    "vfmadd231ps zmm17, zmm28, zmm31",
+    "vfmadd231ps zmm18, zmm29, zmm30",
+    "vfmadd231ps zmm19, zmm29, zmm31",
+
+    "vbroadcastss zmm28, [rdi + 208]",
+    "vbroadcastss zmm29, [rdi + 212]",
+    "vfmadd231ps zmm20, zmm28, zmm30",
+    "vfmadd231ps zmm21, zmm28, zmm31",
+    "vfmadd231ps zmm22, zmm29, zmm30",
+    "vfmadd231ps zmm23, zmm29, zmm31",
+
+    "vbroadcastss zmm28, [rdi + 216]",
+    "vbroadcastss zmm29, [rdi + 220]",
+    "vfmadd231ps zmm24, zmm28, zmm30",
+    "vfmadd231ps zmm25, zmm28, zmm31",
+    "vfmadd231ps zmm26, zmm29, zmm30",
+    "vfmadd231ps zmm27, zmm29, zmm31",
+
+    // Advance: A += 4*MR*4 = 224, B += 4*NR*4 = 512
+    "add rdi, 224",
+    "add rsi, 512",
+
+    "sub r15, 4",
+    "cmp r15, 4",
+    "jl .Lavx512_k_check_2x",
+
+    // Pre-load B for next 4x iteration
+    "vmovups zmm30, [rsi]",
+    "vmovups zmm31, [rsi + 64]",
+    "jmp .Lavx512_k_loop_4x",
+
+    // -- K-remainder (2x) --
+    ".Lavx512_k_check_2x:",
     "cmp r15, 2",
     "jl .Lavx512_k_remainder",
 
-    // Pre-load B for next 2x iteration
     "vmovups zmm30, [rsi]",
     "vmovups zmm31, [rsi + 64]",
-    "jmp .Lavx512_k_loop_2x",
 
-    // ── K-remainder (1x) ──
+    // ---- 2x remainder: k+0 ---- B in zmm30/zmm31
+
+    "vbroadcastss zmm28, [rdi + 0]",
+    "vbroadcastss zmm29, [rdi + 4]",
+    "vfmadd231ps zmm0, zmm28, zmm30",
+    "vfmadd231ps zmm1, zmm28, zmm31",
+    "vfmadd231ps zmm2, zmm29, zmm30",
+    "vfmadd231ps zmm3, zmm29, zmm31",
+
+    "vbroadcastss zmm28, [rdi + 8]",
+    "vbroadcastss zmm29, [rdi + 12]",
+    "vfmadd231ps zmm4, zmm28, zmm30",
+    "vfmadd231ps zmm5, zmm28, zmm31",
+    "vfmadd231ps zmm6, zmm29, zmm30",
+    "vfmadd231ps zmm7, zmm29, zmm31",
+
+    "vbroadcastss zmm28, [rdi + 16]",
+    "vbroadcastss zmm29, [rdi + 20]",
+    "vfmadd231ps zmm8, zmm28, zmm30",
+    "vfmadd231ps zmm9, zmm28, zmm31",
+    "vfmadd231ps zmm10, zmm29, zmm30",
+    "vfmadd231ps zmm11, zmm29, zmm31",
+
+    "vbroadcastss zmm28, [rdi + 24]",
+    "vbroadcastss zmm29, [rdi + 28]",
+    "vfmadd231ps zmm12, zmm28, zmm30",
+    "vfmadd231ps zmm13, zmm28, zmm31",
+    "vfmadd231ps zmm14, zmm29, zmm30",
+    "vfmadd231ps zmm15, zmm29, zmm31",
+
+    "vbroadcastss zmm28, [rdi + 32]",
+    "vbroadcastss zmm29, [rdi + 36]",
+    "vfmadd231ps zmm16, zmm28, zmm30",
+    "vfmadd231ps zmm17, zmm28, zmm31",
+    "vfmadd231ps zmm18, zmm29, zmm30",
+    "vfmadd231ps zmm19, zmm29, zmm31",
+
+    "vbroadcastss zmm28, [rdi + 40]",
+    "vbroadcastss zmm29, [rdi + 44]",
+    "vfmadd231ps zmm20, zmm28, zmm30",
+    "vfmadd231ps zmm21, zmm28, zmm31",
+    "vfmadd231ps zmm22, zmm29, zmm30",
+    "vfmadd231ps zmm23, zmm29, zmm31",
+
+    "vbroadcastss zmm28, [rdi + 48]",
+    "vbroadcastss zmm29, [rdi + 52]",
+    "vfmadd231ps zmm24, zmm28, zmm30",
+    "vfmadd231ps zmm25, zmm28, zmm31",
+    "vfmadd231ps zmm26, zmm29, zmm30",
+    "vfmadd231ps zmm27, zmm29, zmm31",
+
+    // Software pipeline: load B[k+1]
+    "vmovups zmm30, [rsi + 128]",
+    "vmovups zmm31, [rsi + 192]",
+
+    // ---- 2x remainder: k+1 ---- B in zmm30/zmm31
+
+    "vbroadcastss zmm28, [rdi + 56]",
+    "vbroadcastss zmm29, [rdi + 60]",
+    "vfmadd231ps zmm0, zmm28, zmm30",
+    "vfmadd231ps zmm1, zmm28, zmm31",
+    "vfmadd231ps zmm2, zmm29, zmm30",
+    "vfmadd231ps zmm3, zmm29, zmm31",
+
+    "vbroadcastss zmm28, [rdi + 64]",
+    "vbroadcastss zmm29, [rdi + 68]",
+    "vfmadd231ps zmm4, zmm28, zmm30",
+    "vfmadd231ps zmm5, zmm28, zmm31",
+    "vfmadd231ps zmm6, zmm29, zmm30",
+    "vfmadd231ps zmm7, zmm29, zmm31",
+
+    "vbroadcastss zmm28, [rdi + 72]",
+    "vbroadcastss zmm29, [rdi + 76]",
+    "vfmadd231ps zmm8, zmm28, zmm30",
+    "vfmadd231ps zmm9, zmm28, zmm31",
+    "vfmadd231ps zmm10, zmm29, zmm30",
+    "vfmadd231ps zmm11, zmm29, zmm31",
+
+    "vbroadcastss zmm28, [rdi + 80]",
+    "vbroadcastss zmm29, [rdi + 84]",
+    "vfmadd231ps zmm12, zmm28, zmm30",
+    "vfmadd231ps zmm13, zmm28, zmm31",
+    "vfmadd231ps zmm14, zmm29, zmm30",
+    "vfmadd231ps zmm15, zmm29, zmm31",
+
+    "vbroadcastss zmm28, [rdi + 88]",
+    "vbroadcastss zmm29, [rdi + 92]",
+    "vfmadd231ps zmm16, zmm28, zmm30",
+    "vfmadd231ps zmm17, zmm28, zmm31",
+    "vfmadd231ps zmm18, zmm29, zmm30",
+    "vfmadd231ps zmm19, zmm29, zmm31",
+
+    "vbroadcastss zmm28, [rdi + 96]",
+    "vbroadcastss zmm29, [rdi + 100]",
+    "vfmadd231ps zmm20, zmm28, zmm30",
+    "vfmadd231ps zmm21, zmm28, zmm31",
+    "vfmadd231ps zmm22, zmm29, zmm30",
+    "vfmadd231ps zmm23, zmm29, zmm31",
+
+    "vbroadcastss zmm28, [rdi + 104]",
+    "vbroadcastss zmm29, [rdi + 108]",
+    "vfmadd231ps zmm24, zmm28, zmm30",
+    "vfmadd231ps zmm25, zmm28, zmm31",
+    "vfmadd231ps zmm26, zmm29, zmm30",
+    "vfmadd231ps zmm27, zmm29, zmm31",
+
+    "add rdi, 112",
+    "add rsi, 256",
+    "sub r15, 2",
+
+    // -- K-remainder (1x) --
     ".Lavx512_k_remainder:",
     "test r15, r15",
-    "jz .Lavx512_store_c",
+    "jz .Lavx512_prefetch_c",
 
     ".Lavx512_k_tail:",
     "vmovups zmm30, [rsi]",
     "vmovups zmm31, [rsi + 64]",
 
-    "vbroadcastss zmm28, [rdi]",
+    // ---- 1x tail ---- B in zmm30/zmm31
+
+    "vbroadcastss zmm28, [rdi + 0]",
     "vbroadcastss zmm29, [rdi + 4]",
     "vfmadd231ps zmm0, zmm28, zmm30",
     "vfmadd231ps zmm1, zmm28, zmm31",
@@ -347,7 +581,46 @@ global_asm!(
     "dec r15",
     "jnz .Lavx512_k_tail",
 
-    // ── Store C ──
+    // -- Prefetch C rows before store (reduce RFO latency) --
+    ".Lavx512_prefetch_c:",
+    "prefetcht0 [rdx]",
+    "prefetcht0 [rdx + 64]",
+    "prefetcht0 [r10]",
+    "prefetcht0 [r10 + 64]",
+    "prefetcht0 [r11]",
+    "prefetcht0 [r11 + 64]",
+    "prefetcht0 [r12]",
+    "prefetcht0 [r12 + 64]",
+    "prefetcht0 [r13]",
+    "prefetcht0 [r13 + 64]",
+    "prefetcht0 [r14]",
+    "prefetcht0 [r14 + 64]",
+    "mov rbx, [rsp + 0]",
+    "prefetcht0 [rbx]",
+    "prefetcht0 [rbx + 64]",
+    "mov rbx, [rsp + 8]",
+    "prefetcht0 [rbx]",
+    "prefetcht0 [rbx + 64]",
+    "mov rbx, [rsp + 16]",
+    "prefetcht0 [rbx]",
+    "prefetcht0 [rbx + 64]",
+    "mov rbx, [rsp + 24]",
+    "prefetcht0 [rbx]",
+    "prefetcht0 [rbx + 64]",
+    "mov rbx, [rsp + 32]",
+    "prefetcht0 [rbx]",
+    "prefetcht0 [rbx + 64]",
+    "mov rbx, [rsp + 40]",
+    "prefetcht0 [rbx]",
+    "prefetcht0 [rbx + 64]",
+    "mov rbx, [rsp + 48]",
+    "prefetcht0 [rbx]",
+    "prefetcht0 [rbx + 64]",
+    "mov rbx, [rsp + 56]",
+    "prefetcht0 [rbx]",
+    "prefetcht0 [rbx + 64]",
+
+    // -- Store C --
     ".Lavx512_store_c:",
     "vmovups [rdx], zmm0",
     "vmovups [rdx + 64], zmm1",
@@ -361,7 +634,7 @@ global_asm!(
     "vmovups [r13 + 64], zmm9",
     "vmovups [r14], zmm10",
     "vmovups [r14 + 64], zmm11",
-    "mov rbx, [rsp]",
+    "mov rbx, [rsp + 0]",
     "vmovups [rbx], zmm12",
     "vmovups [rbx + 64], zmm13",
     "mov rbx, [rsp + 8]",

@@ -19,6 +19,7 @@ pub enum MicroArch {
     Haswell,
     Broadwell,
     SkylakeClient,
+    CometLake,      // 10th gen, 14nm, AVX2 only, DDR4
     SkylakeX,       // AVX-512 with heavy downclocking
     CascadeLake,    // SKX derivative, same downclocking
     IceLakeClient,
@@ -59,7 +60,7 @@ impl MicroArch {
 
             // AVX2
             Self::Haswell | Self::Broadwell |
-            Self::SkylakeClient | Self::AlderLake | Self::RaptorLake |
+            Self::SkylakeClient | Self::CometLake | Self::AlderLake | Self::RaptorLake |
             Self::Zen2 | Self::Zen3 |
             Self::GenericAvx2 => (6, 16, 8),
 
@@ -87,7 +88,7 @@ impl MicroArch {
         match self {
             // DDR4 systems (~60-70ns)
             Self::Haswell | Self::Broadwell | Self::SkylakeClient |
-            Self::SkylakeX | Self::CascadeLake |
+            Self::CometLake | Self::SkylakeX | Self::CascadeLake |
             Self::Zen2 | Self::Zen3 => 65,
 
             // DDR5 systems (~80-90ns)
@@ -107,6 +108,7 @@ impl MicroArch {
         match self {
             Self::Haswell | Self::Broadwell => 3.0,
             Self::SkylakeClient | Self::SkylakeX | Self::CascadeLake => 3.5,
+            Self::CometLake => 3.7,
             Self::IceLakeClient | Self::IceLakeServer | Self::TigerLake => 3.5,
             Self::AlderLake | Self::RaptorLake => 3.8,
             Self::SapphireRapids | Self::GraniteRapids => 3.0,
@@ -213,6 +215,8 @@ fn detect_intel(family: u32, model: u32) -> MicroArch {
         0x3D | 0x47 | 0x4F | 0x56 => MicroArch::Broadwell,
         // Skylake client
         0x4E | 0x5E => MicroArch::SkylakeClient,
+        // Comet Lake (10th gen, 14nm, AVX2 only)
+        0xA5 | 0xA6 => MicroArch::CometLake,
         // Skylake-X / Cascade Lake (server AVX-512 with downclocking)
         0x55 => {
             // Stepping >= 5 is Cascade Lake, but same perf characteristics
@@ -359,17 +363,23 @@ impl KernelConfig {
         let (mr, nr, simd_w) = arch.microkernel_geometry();
         let elem = 4usize; // f32
 
-        // ── BLIS standard blocking formulas ──
-        // KC: B strip (KC × NR × elem) ≤ L1D × 0.50
-        let kc_raw = (l1d / 2) / (nr * elem);
+        // ── Optimized BLIS blocking formulas ──
+        // KC: B strip (KC × NR × elem) ≤ L1D × 0.75
+        // A is streaming (not resident in L1), so B strip can use 75% of L1D
+        let kc_raw = (l1d * 3 / 4) / (nr * elem);
         let kc = (kc_raw & !7).clamp(64, 768);
 
         // MC: A panel (MC × KC × elem) ≤ L2 × 0.50
         let mc_raw = (l2 / 2) / (kc * elem);
         let mc = (mc_raw / mr * mr).clamp(mr, 960);
 
-        // NC: B panel (KC × NC × elem) ≤ L3 × 0.50
-        let nc_raw = (l3 / 2) / (kc * elem);
+        // NC: B panel shared across cores in L3
+        // Each core's effective L3 share: L3 / num_physical_cores
+        // NC × KC × elem ≤ effective_L3 / 2
+        let nthreads = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1);
+        let num_cores = (nthreads / 2).max(1); // approximate physical cores (no HT)
+        let effective_l3 = l3 / num_cores;
+        let nc_raw = (effective_l3 / 2) / (kc * elem);
         let nc = (nc_raw / nr * nr).clamp(nr, 8192);
 
         // ── Prefetch distance calculation ──
@@ -448,6 +458,7 @@ impl std::fmt::Display for MicroArch {
             Self::Haswell => "Intel Haswell",
             Self::Broadwell => "Intel Broadwell",
             Self::SkylakeClient => "Intel Skylake (client)",
+            Self::CometLake => "Intel Comet Lake",
             Self::SkylakeX => "Intel Skylake-X/Cascade Lake (AVX-512, downclocking)",
             Self::CascadeLake => "Intel Cascade Lake (AVX-512, downclocking)",
             Self::IceLakeClient => "Intel Ice Lake (client)",

@@ -3,6 +3,7 @@
 pub mod gemm_avx2;
 pub mod gemm_avx512;
 pub mod gemm_driver;
+pub mod quant_gemv;
 
 pub use gemm_avx2::{MR as MR_AVX2, NR as NR_AVX2};
 pub use gemm_avx512::{MR as MR_AVX512, NR as NR_AVX512};

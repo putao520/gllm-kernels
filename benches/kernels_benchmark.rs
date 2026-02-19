@@ -208,12 +208,38 @@ fn bench_quant_gemv(c: &mut Criterion) {
             },
         );
     }
+
+    // kquant_matmul: multi-row Q4K GEMM (simulates batched decode)
+    for &(m, n, k) in &[(1, 1, 4096), (4, 1, 4096)] {
+        let blocks = k / 256;
+        let mut weight_raw = vec![0u8; m * blocks * q4_block_bytes];
+        for i in 0..(m * blocks) {
+            let base = i * q4_block_bytes;
+            // d as f16 at offset 0
+            let d_f16 = half::f16::from_f32(0.05);
+            weight_raw[base..base + 2].copy_from_slice(&d_f16.to_bits().to_le_bytes());
+            for j in 2..q4_block_bytes {
+                weight_raw[base + j] = rng.gen::<u8>();
+            }
+        }
+        let input = rand_vec(k * n);
+        let mut output = vec![0.0f32; m * n];
+        group.throughput(Throughput::Elements((2 * m * n * k) as u64));
+        group.bench_function(
+            BenchmarkId::new("kquant_q4k", format!("{m}x{n}x{k}")),
+            |bench| {
+                bench.iter(|| {
+                    kernels.kquant_matmul(
+                        black_box(&weight_raw), black_box(&input), black_box(&mut output),
+                        gllm_kernels::quant::QuantType::Q4K, m, n, k,
+                    );
+                })
+            },
+        );
+    }
+
     group.finish();
 }
-
-// ============================================================
-// Fused ops: SwiGLU (gate * silu(up)) at LLM FFN sizes
-// ============================================================
 fn bench_swiglu(c: &mut Criterion) {
     let kernels = CpuKernels::<f32>::new();
     let mut group = c.benchmark_group("swiglu_llm");
