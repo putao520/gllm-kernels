@@ -106,27 +106,41 @@ macro_rules! define_element_wise_ops {
             assert!(out.len() == len);
 
             let mut i = 0;
-            // 2-way unrolled main loop: interleave two exp chains to hide latency
-            while i + LANES * 2 <= len {
+            // 4-way unrolled main loop: interleave four exp chains to hide latency
+            while i + LANES * 4 <= len {
                 #[allow(unused_unsafe)]
                 unsafe {
                     let va0 = $crate::simd_primitive!($isa, $elem, load, a.as_ptr().add(i));
                     let va1 = $crate::simd_primitive!($isa, $elem, load, a.as_ptr().add(i + LANES));
+                    let va2 = $crate::simd_primitive!($isa, $elem, load, a.as_ptr().add(i + LANES * 2));
+                    let va3 = $crate::simd_primitive!($isa, $elem, load, a.as_ptr().add(i + LANES * 3));
                     let neg0 = $crate::simd_primitive!($isa, $elem, neg, va0);
                     let neg1 = $crate::simd_primitive!($isa, $elem, neg, va1);
+                    let neg2 = $crate::simd_primitive!($isa, $elem, neg, va2);
+                    let neg3 = $crate::simd_primitive!($isa, $elem, neg, va3);
                     let exp0 = $crate::simd_primitive!($isa, $elem, exp_fast, neg0);
                     let exp1 = $crate::simd_primitive!($isa, $elem, exp_fast, neg1);
+                    let exp2 = $crate::simd_primitive!($isa, $elem, exp_fast, neg2);
+                    let exp3 = $crate::simd_primitive!($isa, $elem, exp_fast, neg3);
                     let one = $crate::simd_primitive!($isa, $elem, splat, <$elem as Element>::ONE);
                     let denom0 = $crate::simd_primitive!($isa, $elem, add, one, exp0);
                     let denom1 = $crate::simd_primitive!($isa, $elem, add, one, exp1);
+                    let denom2 = $crate::simd_primitive!($isa, $elem, add, one, exp2);
+                    let denom3 = $crate::simd_primitive!($isa, $elem, add, one, exp3);
                     let sig0 = $crate::simd_primitive!($isa, $elem, recip, denom0);
                     let sig1 = $crate::simd_primitive!($isa, $elem, recip, denom1);
+                    let sig2 = $crate::simd_primitive!($isa, $elem, recip, denom2);
+                    let sig3 = $crate::simd_primitive!($isa, $elem, recip, denom3);
                     let res0 = $crate::simd_primitive!($isa, $elem, mul, va0, sig0);
                     let res1 = $crate::simd_primitive!($isa, $elem, mul, va1, sig1);
+                    let res2 = $crate::simd_primitive!($isa, $elem, mul, va2, sig2);
+                    let res3 = $crate::simd_primitive!($isa, $elem, mul, va3, sig3);
                     $crate::simd_primitive!($isa, $elem, store, out.as_mut_ptr().add(i), res0);
                     $crate::simd_primitive!($isa, $elem, store, out.as_mut_ptr().add(i + LANES), res1);
+                    $crate::simd_primitive!($isa, $elem, store, out.as_mut_ptr().add(i + LANES * 2), res2);
+                    $crate::simd_primitive!($isa, $elem, store, out.as_mut_ptr().add(i + LANES * 3), res3);
                 }
-                i += LANES * 2;
+                i += LANES * 4;
             }
             // Single-vector remainder
             while i + LANES <= len {
@@ -497,52 +511,74 @@ macro_rules! define_activation_ops {
             assert!(out.len() == len);
 
             let mut i = 0;
-            // 2-way unrolled main loop: interleave two exp(2z) chains to hide latency
-            while i + LANES * 2 <= len {
+            // 4-way unrolled main loop: interleave four exp(2z) chains to hide latency
+            while i + LANES * 4 <= len {
                 #[allow(unused_unsafe)]
                 unsafe {
                     let vx0 = $crate::simd_primitive!($isa, $elem, load, a.as_ptr().add(i));
                     let vx1 = $crate::simd_primitive!($isa, $elem, load, a.as_ptr().add(i + LANES));
+                    let vx2 = $crate::simd_primitive!($isa, $elem, load, a.as_ptr().add(i + LANES * 2));
+                    let vx3 = $crate::simd_primitive!($isa, $elem, load, a.as_ptr().add(i + LANES * 3));
                     let half = $crate::simd_primitive!($isa, $elem, splat, <$elem as Element>::from_f32(0.5));
                     let one = $crate::simd_primitive!($isa, $elem, splat, <$elem as Element>::ONE);
                     let two = $crate::simd_primitive!($isa, $elem, splat, <$elem as Element>::from_f32(2.0));
                     let vc = $crate::simd_primitive!($isa, $elem, splat, <$elem as Element>::from_f32(0.044715));
                     let vs = $crate::simd_primitive!($isa, $elem, splat, <$elem as Element>::from_f32(0.7978845608));
 
-                    // x^3 (interleaved)
                     let x2_0 = $crate::simd_primitive!($isa, $elem, mul, vx0, vx0);
                     let x2_1 = $crate::simd_primitive!($isa, $elem, mul, vx1, vx1);
+                    let x2_2 = $crate::simd_primitive!($isa, $elem, mul, vx2, vx2);
+                    let x2_3 = $crate::simd_primitive!($isa, $elem, mul, vx3, vx3);
                     let x3_0 = $crate::simd_primitive!($isa, $elem, mul, x2_0, vx0);
                     let x3_1 = $crate::simd_primitive!($isa, $elem, mul, x2_1, vx1);
-                    // x + 0.044715 * x^3
+                    let x3_2 = $crate::simd_primitive!($isa, $elem, mul, x2_2, vx2);
+                    let x3_3 = $crate::simd_primitive!($isa, $elem, mul, x2_3, vx3);
                     let inner0 = $crate::simd_primitive!($isa, $elem, fma, vc, x3_0, vx0);
                     let inner1 = $crate::simd_primitive!($isa, $elem, fma, vc, x3_1, vx1);
-                    // sqrt(2/pi) * inner
+                    let inner2 = $crate::simd_primitive!($isa, $elem, fma, vc, x3_2, vx2);
+                    let inner3 = $crate::simd_primitive!($isa, $elem, fma, vc, x3_3, vx3);
                     let scaled0 = $crate::simd_primitive!($isa, $elem, mul, vs, inner0);
                     let scaled1 = $crate::simd_primitive!($isa, $elem, mul, vs, inner1);
-                    // tanh(z) = 1 - 2/(exp(2z)+1) using recip instead of div
+                    let scaled2 = $crate::simd_primitive!($isa, $elem, mul, vs, inner2);
+                    let scaled3 = $crate::simd_primitive!($isa, $elem, mul, vs, inner3);
                     let two_z0 = $crate::simd_primitive!($isa, $elem, mul, two, scaled0);
                     let two_z1 = $crate::simd_primitive!($isa, $elem, mul, two, scaled1);
+                    let two_z2 = $crate::simd_primitive!($isa, $elem, mul, two, scaled2);
+                    let two_z3 = $crate::simd_primitive!($isa, $elem, mul, two, scaled3);
                     let exp_2z0 = $crate::simd_primitive!($isa, $elem, exp_fast, two_z0);
                     let exp_2z1 = $crate::simd_primitive!($isa, $elem, exp_fast, two_z1);
+                    let exp_2z2 = $crate::simd_primitive!($isa, $elem, exp_fast, two_z2);
+                    let exp_2z3 = $crate::simd_primitive!($isa, $elem, exp_fast, two_z3);
                     let den0 = $crate::simd_primitive!($isa, $elem, add, exp_2z0, one);
                     let den1 = $crate::simd_primitive!($isa, $elem, add, exp_2z1, one);
+                    let den2 = $crate::simd_primitive!($isa, $elem, add, exp_2z2, one);
+                    let den3 = $crate::simd_primitive!($isa, $elem, add, exp_2z3, one);
                     let inv_den0 = $crate::simd_primitive!($isa, $elem, recip, den0);
                     let inv_den1 = $crate::simd_primitive!($isa, $elem, recip, den1);
-                    // tanh = 1 - 2*inv_den = fnmadd(two, inv_den, one)
+                    let inv_den2 = $crate::simd_primitive!($isa, $elem, recip, den2);
+                    let inv_den3 = $crate::simd_primitive!($isa, $elem, recip, den3);
                     let tanh0 = $crate::simd_primitive!($isa, $elem, fnmadd, two, inv_den0, one);
                     let tanh1 = $crate::simd_primitive!($isa, $elem, fnmadd, two, inv_den1, one);
-                    // 0.5 * x * (1 + tanh)
+                    let tanh2 = $crate::simd_primitive!($isa, $elem, fnmadd, two, inv_den2, one);
+                    let tanh3 = $crate::simd_primitive!($isa, $elem, fnmadd, two, inv_den3, one);
                     let one_plus_tanh0 = $crate::simd_primitive!($isa, $elem, add, one, tanh0);
                     let one_plus_tanh1 = $crate::simd_primitive!($isa, $elem, add, one, tanh1);
+                    let one_plus_tanh2 = $crate::simd_primitive!($isa, $elem, add, one, tanh2);
+                    let one_plus_tanh3 = $crate::simd_primitive!($isa, $elem, add, one, tanh3);
                     let half_x0 = $crate::simd_primitive!($isa, $elem, mul, half, vx0);
                     let half_x1 = $crate::simd_primitive!($isa, $elem, mul, half, vx1);
+                    let half_x2 = $crate::simd_primitive!($isa, $elem, mul, half, vx2);
+                    let half_x3 = $crate::simd_primitive!($isa, $elem, mul, half, vx3);
                     let res0 = $crate::simd_primitive!($isa, $elem, mul, half_x0, one_plus_tanh0);
                     let res1 = $crate::simd_primitive!($isa, $elem, mul, half_x1, one_plus_tanh1);
+                    let res2 = $crate::simd_primitive!($isa, $elem, mul, half_x2, one_plus_tanh2);
+                    let res3 = $crate::simd_primitive!($isa, $elem, mul, half_x3, one_plus_tanh3);
                     $crate::simd_primitive!($isa, $elem, store, out.as_mut_ptr().add(i), res0);
                     $crate::simd_primitive!($isa, $elem, store, out.as_mut_ptr().add(i + LANES), res1);
+                    $crate::simd_primitive!($isa, $elem, store, out.as_mut_ptr().add(i + LANES * 2), res2);
+                    $crate::simd_primitive!($isa, $elem, store, out.as_mut_ptr().add(i + LANES * 3), res3);
                 }
-                i += LANES * 2;
+                i += LANES * 4;
             }
             // Single-vector remainder
             while i + LANES <= len {
@@ -816,25 +852,113 @@ macro_rules! define_activation_ops {
             #[allow(unused_unsafe)]
             let mut vsum = unsafe { $crate::simd_primitive!($isa, $elem, zero) };
 
+            // 4-way unrolled: 4 independent (max, sum) accumulators
+            #[allow(unused_unsafe)]
+            let (mut vmax1, mut vmax2, mut vmax3) = unsafe { (
+                $crate::simd_primitive!($isa, $elem, splat, <$elem as Element>::from_f32(f32::NEG_INFINITY)),
+                $crate::simd_primitive!($isa, $elem, splat, <$elem as Element>::from_f32(f32::NEG_INFINITY)),
+                $crate::simd_primitive!($isa, $elem, splat, <$elem as Element>::from_f32(f32::NEG_INFINITY)),
+            ) };
+            #[allow(unused_unsafe)]
+            let (mut vsum1, mut vsum2, mut vsum3) = unsafe { (
+                $crate::simd_primitive!($isa, $elem, zero),
+                $crate::simd_primitive!($isa, $elem, zero),
+                $crate::simd_primitive!($isa, $elem, zero),
+            ) };
+
+            while i + LANES * 4 <= len {
+                #[allow(unused_unsafe)]
+                unsafe {
+                    $crate::simd_primitive!($isa, $elem, prefetch, a.as_ptr().add(i + LANES * 8) as *const u8, 0);
+                    let vx0 = $crate::simd_primitive!($isa, $elem, load, a.as_ptr().add(i));
+                    let vx1 = $crate::simd_primitive!($isa, $elem, load, a.as_ptr().add(i + LANES));
+                    let vx2 = $crate::simd_primitive!($isa, $elem, load, a.as_ptr().add(i + LANES * 2));
+                    let vx3 = $crate::simd_primitive!($isa, $elem, load, a.as_ptr().add(i + LANES * 3));
+
+                    let new_max0 = $crate::simd_primitive!($isa, $elem, max, vmax, vx0);
+                    let new_max1 = $crate::simd_primitive!($isa, $elem, max, vmax1, vx1);
+                    let new_max2 = $crate::simd_primitive!($isa, $elem, max, vmax2, vx2);
+                    let new_max3 = $crate::simd_primitive!($isa, $elem, max, vmax3, vx3);
+
+                    let diff0 = $crate::simd_primitive!($isa, $elem, sub, vmax, new_max0);
+                    let diff1 = $crate::simd_primitive!($isa, $elem, sub, vmax1, new_max1);
+                    let diff2 = $crate::simd_primitive!($isa, $elem, sub, vmax2, new_max2);
+                    let diff3 = $crate::simd_primitive!($isa, $elem, sub, vmax3, new_max3);
+                    let comp0 = $crate::simd_primitive!($isa, $elem, exp_fast, diff0);
+                    let comp1 = $crate::simd_primitive!($isa, $elem, exp_fast, diff1);
+                    let comp2 = $crate::simd_primitive!($isa, $elem, exp_fast, diff2);
+                    let comp3 = $crate::simd_primitive!($isa, $elem, exp_fast, diff3);
+                    vsum  = $crate::simd_primitive!($isa, $elem, mul, vsum, comp0);
+                    vsum1 = $crate::simd_primitive!($isa, $elem, mul, vsum1, comp1);
+                    vsum2 = $crate::simd_primitive!($isa, $elem, mul, vsum2, comp2);
+                    vsum3 = $crate::simd_primitive!($isa, $elem, mul, vsum3, comp3);
+
+                    let shifted0 = $crate::simd_primitive!($isa, $elem, sub, vx0, new_max0);
+                    let shifted1 = $crate::simd_primitive!($isa, $elem, sub, vx1, new_max1);
+                    let shifted2 = $crate::simd_primitive!($isa, $elem, sub, vx2, new_max2);
+                    let shifted3 = $crate::simd_primitive!($isa, $elem, sub, vx3, new_max3);
+                    let e0 = $crate::simd_primitive!($isa, $elem, exp_fast, shifted0);
+                    let e1 = $crate::simd_primitive!($isa, $elem, exp_fast, shifted1);
+                    let e2 = $crate::simd_primitive!($isa, $elem, exp_fast, shifted2);
+                    let e3 = $crate::simd_primitive!($isa, $elem, exp_fast, shifted3);
+                    vsum  = $crate::simd_primitive!($isa, $elem, add, vsum, e0);
+                    vsum1 = $crate::simd_primitive!($isa, $elem, add, vsum1, e1);
+                    vsum2 = $crate::simd_primitive!($isa, $elem, add, vsum2, e2);
+                    vsum3 = $crate::simd_primitive!($isa, $elem, add, vsum3, e3);
+
+                    vmax = new_max0;
+                    vmax1 = new_max1;
+                    vmax2 = new_max2;
+                    vmax3 = new_max3;
+                }
+                i += LANES * 4;
+            }
+
+            // 1-way remainder
             while i + LANES <= len {
                 #[allow(unused_unsafe)]
                 unsafe {
-                    // Prefetch next iteration's data
                     $crate::simd_primitive!($isa, $elem, prefetch, a.as_ptr().add(i + LANES * 4) as *const u8, 0);
                     let vx = $crate::simd_primitive!($isa, $elem, load, a.as_ptr().add(i));
-                    // new_max = max(vmax, vx)
                     let new_max = $crate::simd_primitive!($isa, $elem, max, vmax, vx);
-                    // Compensate previous sum: sum *= exp(old_max - new_max)
                     let diff = $crate::simd_primitive!($isa, $elem, sub, vmax, new_max);
                     let comp = $crate::simd_primitive!($isa, $elem, exp_fast, diff);
                     vsum = $crate::simd_primitive!($isa, $elem, mul, vsum, comp);
-                    // Add current contribution: sum += exp(x - new_max)
                     let shifted = $crate::simd_primitive!($isa, $elem, sub, vx, new_max);
                     let e = $crate::simd_primitive!($isa, $elem, exp_fast, shifted);
                     vsum = $crate::simd_primitive!($isa, $elem, add, vsum, e);
                     vmax = new_max;
                 }
                 i += LANES;
+            }
+
+            // Merge 4 accumulators: compensate vsum1/2/3 to vmax, then add to vsum
+            #[allow(unused_unsafe)]
+            unsafe {
+                // Merge acc1 into acc0
+                let m01 = $crate::simd_primitive!($isa, $elem, max, vmax, vmax1);
+                let d0 = $crate::simd_primitive!($isa, $elem, sub, vmax, m01);
+                let d1 = $crate::simd_primitive!($isa, $elem, sub, vmax1, m01);
+                let c0 = $crate::simd_primitive!($isa, $elem, exp_fast, d0);
+                let c1 = $crate::simd_primitive!($isa, $elem, exp_fast, d1);
+                vsum = $crate::simd_primitive!($isa, $elem, fma, vsum, c0, $crate::simd_primitive!($isa, $elem, mul, vsum1, c1));
+                vmax = m01;
+                // Merge acc2
+                let m02 = $crate::simd_primitive!($isa, $elem, max, vmax, vmax2);
+                let d0 = $crate::simd_primitive!($isa, $elem, sub, vmax, m02);
+                let d2 = $crate::simd_primitive!($isa, $elem, sub, vmax2, m02);
+                let c0 = $crate::simd_primitive!($isa, $elem, exp_fast, d0);
+                let c2 = $crate::simd_primitive!($isa, $elem, exp_fast, d2);
+                vsum = $crate::simd_primitive!($isa, $elem, fma, vsum, c0, $crate::simd_primitive!($isa, $elem, mul, vsum2, c2));
+                vmax = m02;
+                // Merge acc3
+                let m03 = $crate::simd_primitive!($isa, $elem, max, vmax, vmax3);
+                let d0 = $crate::simd_primitive!($isa, $elem, sub, vmax, m03);
+                let d3 = $crate::simd_primitive!($isa, $elem, sub, vmax3, m03);
+                let c0 = $crate::simd_primitive!($isa, $elem, exp_fast, d0);
+                let c3 = $crate::simd_primitive!($isa, $elem, exp_fast, d3);
+                vsum = $crate::simd_primitive!($isa, $elem, fma, vsum, c0, $crate::simd_primitive!($isa, $elem, mul, vsum3, c3));
+                vmax = m03;
             }
 
             // Horizontal reduce across SIMD lanes with compensation.
