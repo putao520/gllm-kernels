@@ -115,8 +115,9 @@ macro_rules! define_bf16_helpers {
 #[macro_export]
 macro_rules! define_exp_fast_f32 {
     ($isa:ident) => {
-        /// Fast vectorized exp(x) — degree-3 polynomial, ~12-bit accuracy.
-        /// Use for softmax, sigmoid, and other contexts where full precision isn't needed.
+        /// Fast vectorized exp(x) — degree-4 minimax polynomial, ~18-bit accuracy.
+        /// 4 FMAs (1 more than old degree-3), but much better softmax precision.
+        /// Coefficients from Sollya minimax on [-ln2/2, ln2/2].
         #[inline(always)]
         pub unsafe fn exp_fast_f32_impl(x: $crate::define_exp_f32!(@vec_type $isa)) -> $crate::define_exp_f32!(@vec_type $isa) {
             // Clamp input
@@ -140,12 +141,15 @@ macro_rules! define_exp_fast_f32 {
             let mut y = $crate::simd_primitive!($isa, f32, fma, k_ps, c1, x);
             y = $crate::simd_primitive!($isa, f32, fma, k_ps, c2, y);
 
-            // Degree-3 minimax polynomial (3 FMAs instead of 6)
-            let p2 = $crate::simd_primitive!($isa, f32, splat, 1.661_200_5E-1_f32);
-            let p3 = $crate::simd_primitive!($isa, f32, splat, 4.998_717_1E-1_f32);
+            // Degree-4 minimax polynomial (4 FMAs)
+            // p(y) = 1 + y + y²/2 + y³/6 + y⁴/24  (Taylor-like, Sollya-tuned)
+            let p1 = $crate::simd_primitive!($isa, f32, splat, 4.166_664_6E-2_f32); // ~1/24
+            let p2 = $crate::simd_primitive!($isa, f32, splat, 1.666_532_8E-1_f32); // ~1/6
+            let p3 = $crate::simd_primitive!($isa, f32, splat, 4.999_851_4E-1_f32); // ~1/2
             let one = $crate::simd_primitive!($isa, f32, splat, 1.0_f32);
 
-            let mut p = p2;
+            let mut p = p1;
+            p = $crate::simd_primitive!($isa, f32, fma, p, y, p2);
             p = $crate::simd_primitive!($isa, f32, fma, p, y, p3);
             p = $crate::simd_primitive!($isa, f32, fma, p, y, one);
             p = $crate::simd_primitive!($isa, f32, fma, p, y, one);

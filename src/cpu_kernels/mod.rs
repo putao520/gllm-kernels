@@ -328,27 +328,36 @@ impl<E: Element> CpuKernels<E> {
         dot_fn: F,
     ) where F: Fn(&Self, &[u8], &[f32]) -> f32 {
         let blocks_per_row = k / BLOCK_SIZE;
-        // Pre-transpose input from [k, n] col-major to [n, k] row-major
-        // Eliminates stride-n column access in the inner loop
-        let mut input_t = vec![0.0f32; k * n];
-        for p in 0..k {
-            for j in 0..n {
-                input_t[j * k + p] = input[p * n + j].to_f32();
-            }
+        // Thread-local buffer: avoids heap allocation on every call
+        thread_local! {
+            static INPUT_T: std::cell::Cell<crate::cache_params::AlignedVec<f32>>
+                = std::cell::Cell::new(crate::cache_params::AlignedVec::new());
         }
-        for j in 0..n {
-            let in_row = &input_t[j * k..];
-            for i in 0..m {
-                let mut sum = 0.0f32;
-                for b in 0..blocks_per_row {
-                    let off = i * blocks_per_row * BLOCK_BYTES + b * BLOCK_BYTES;
-                    let blk = &weight_blocks[off..off + BLOCK_BYTES];
-                    let in_slice = &in_row[b * BLOCK_SIZE..(b + 1) * BLOCK_SIZE];
-                    sum += dot_fn(self, blk, in_slice);
+        INPUT_T.with(|cell| {
+            let mut buf = cell.take();
+            buf.resize_zeroed(k * n);
+            let input_t = buf.as_mut_slice();
+            // Pre-transpose input from [k, n] col-major to [n, k] row-major
+            for p in 0..k {
+                for j in 0..n {
+                    input_t[j * k + p] = input[p * n + j].to_f32();
                 }
-                output[i * n + j] = E::from_f32(sum);
             }
-        }
+            for j in 0..n {
+                let in_row = &input_t[j * k..];
+                for i in 0..m {
+                    let mut sum = 0.0f32;
+                    for b in 0..blocks_per_row {
+                        let off = i * blocks_per_row * BLOCK_BYTES + b * BLOCK_BYTES;
+                        let blk = &weight_blocks[off..off + BLOCK_BYTES];
+                        let in_slice = &in_row[b * BLOCK_SIZE..(b + 1) * BLOCK_SIZE];
+                        sum += dot_fn(self, blk, in_slice);
+                    }
+                    output[i * n + j] = E::from_f32(sum);
+                }
+            }
+            cell.set(buf);
+        });
     }
 }
 
@@ -1033,6 +1042,26 @@ impl<E: Element> Kernels<E> for CpuKernels<E> {
             crate::asm::aarch64::gemm_asm_f32(a_f32, b_f32, c_f32, m, n, k);
             return;
         }
+        // x86_64 f32: hand-written ASM microkernels for peak performance
+        #[cfg(target_arch = "x86_64")]
+        if E::ELEM_ID == 0 {
+            let a_f32 = unsafe { std::slice::from_raw_parts(a.as_ptr() as *const f32, a.len()) };
+            let b_f32 = unsafe { std::slice::from_raw_parts(b.as_ptr() as *const f32, b.len()) };
+            let c_f32 = unsafe { std::slice::from_raw_parts_mut(c.as_mut_ptr() as *mut f32, c.len()) };
+            match get_isa_level() {
+                IsaLevel::Avx512 | IsaLevel::Avx512Fp16 => {
+                    crate::asm::x86_64::gemm_asm_f32_avx512(a_f32, b_f32, c_f32, m, n, k);
+                }
+                IsaLevel::Avx2 => {
+                    crate::asm::x86_64::gemm_asm_f32_avx2(a_f32, b_f32, c_f32, m, n, k);
+                }
+                _ => {
+                    // Scalar fallback: use intrinsics path
+                    dispatch_with_dims!(matmul, a, b, c, m, n, k);
+                }
+            }
+            return;
+        }
         dispatch_with_dims!(matmul, a, b, c, m, n, k);
     }
 
@@ -1427,38 +1456,52 @@ impl<E: Element> Kernels<E> for CpuKernels<E> {
         // AWQ4: dequant row -> f32 buffer, then SIMD dot with pre-transposed input
         let group_size = 128usize;
         let num_groups_per_row = k / group_size;
-        // Pre-transpose input from [k, n] col-major to [n, k] row-major
-        let mut input_t = vec![0.0f32; k * n];
-        for p in 0..k {
-            for j in 0..n {
-                input_t[j * k + p] = input[p * n + j].to_f32();
-            }
+        thread_local! {
+            static AWQ_INPUT_T: std::cell::Cell<crate::cache_params::AlignedVec<f32>>
+                = std::cell::Cell::new(crate::cache_params::AlignedVec::new());
+            static AWQ_DEQUANT: std::cell::Cell<crate::cache_params::AlignedVec<f32>>
+                = std::cell::Cell::new(crate::cache_params::AlignedVec::new());
         }
-        let mut dequant_row = vec![0.0f32; k];
-        let k_bytes = k / 2;
-        for j in 0..n {
-            let in_row = &input_t[j * k..(j + 1) * k];
-            for i in 0..m {
-                // Batch-unpack 2 nibbles per byte (branchless)
-                let row_byte_offset = i * k_bytes;
-                for byte_idx in 0..k_bytes {
-                    let b = weight[row_byte_offset + byte_idx];
-                    let lo = (b & 0x0F) as f32;
-                    let hi = (b >> 4) as f32;
-                    let idx = byte_idx * 2;
-                    let group_lo = (i * num_groups_per_row) + idx / group_size;
-                    let group_hi = (i * num_groups_per_row) + (idx + 1) / group_size;
-                    let zero_lo = if group_lo < zeros.len() { zeros[group_lo] as f32 } else { 8.0 };
-                    let zero_hi = if group_hi < zeros.len() { zeros[group_hi] as f32 } else { 8.0 };
-                    let scale_lo = if group_lo < scales.len() { scales[group_lo].to_f32() } else { 1.0 };
-                    let scale_hi = if group_hi < scales.len() { scales[group_hi].to_f32() } else { 1.0 };
-                    dequant_row[idx] = (lo - zero_lo) * scale_lo;
-                    dequant_row[idx + 1] = (hi - zero_hi) * scale_hi;
+        AWQ_INPUT_T.with(|cell_t| {
+        AWQ_DEQUANT.with(|cell_d| {
+            let mut buf_t = cell_t.take();
+            let mut buf_d = cell_d.take();
+            buf_t.resize_zeroed(k * n);
+            buf_d.resize_zeroed(k);
+            let input_t = buf_t.as_mut_slice();
+            let dequant_row = buf_d.as_mut_slice();
+            // Pre-transpose input from [k, n] col-major to [n, k] row-major
+            for p in 0..k {
+                for j in 0..n {
+                    input_t[j * k + p] = input[p * n + j].to_f32();
                 }
-                // SIMD dot product
-                output[i * n + j] = E::from_f32(self.dot_f32(&dequant_row, in_row));
             }
-        }
+            let k_bytes = k / 2;
+            for j in 0..n {
+                let in_row = &input_t[j * k..(j + 1) * k];
+                for i in 0..m {
+                    let row_byte_offset = i * k_bytes;
+                    for byte_idx in 0..k_bytes {
+                        let b = weight[row_byte_offset + byte_idx];
+                        let lo = (b & 0x0F) as f32;
+                        let hi = (b >> 4) as f32;
+                        let idx = byte_idx * 2;
+                        let group_lo = (i * num_groups_per_row) + idx / group_size;
+                        let group_hi = (i * num_groups_per_row) + (idx + 1) / group_size;
+                        let zero_lo = if group_lo < zeros.len() { zeros[group_lo] as f32 } else { 8.0 };
+                        let zero_hi = if group_hi < zeros.len() { zeros[group_hi] as f32 } else { 8.0 };
+                        let scale_lo = if group_lo < scales.len() { scales[group_lo].to_f32() } else { 1.0 };
+                        let scale_hi = if group_hi < scales.len() { scales[group_hi].to_f32() } else { 1.0 };
+                        dequant_row[idx] = (lo - zero_lo) * scale_lo;
+                        dequant_row[idx + 1] = (hi - zero_hi) * scale_hi;
+                    }
+                    output[i * n + j] = E::from_f32(self.dot_f32(dequant_row, in_row));
+                }
+            }
+            cell_t.set(buf_t);
+            cell_d.set(buf_d);
+        });
+        });
     }
 
     fn gptq_matmul(
@@ -1467,35 +1510,49 @@ impl<E: Element> Kernels<E> for CpuKernels<E> {
         m: usize, n: usize, k: usize,
     ) {
         // GPTQ4: dequant row -> f32 buffer, then SIMD dot with pre-transposed input
-        // Pre-transpose input from [k, n] col-major to [n, k] row-major
-        let mut input_t = vec![0.0f32; k * n];
-        for p in 0..k {
-            for j in 0..n {
-                input_t[j * k + p] = input[p * n + j].to_f32();
-            }
+        thread_local! {
+            static GPTQ_INPUT_T: std::cell::Cell<crate::cache_params::AlignedVec<f32>>
+                = std::cell::Cell::new(crate::cache_params::AlignedVec::new());
+            static GPTQ_DEQUANT: std::cell::Cell<crate::cache_params::AlignedVec<f32>>
+                = std::cell::Cell::new(crate::cache_params::AlignedVec::new());
         }
-        let mut dequant_row = vec![0.0f32; k];
-        let k_bytes = k / 2;
-        for j in 0..n {
-            let in_row = &input_t[j * k..(j + 1) * k];
-            for i in 0..m {
-                // Batch-unpack 2 nibbles per byte (branchless)
-                let row_byte_offset = i * k_bytes;
-                for byte_idx in 0..k_bytes {
-                    let b = weight[row_byte_offset + byte_idx];
-                    let lo = (b & 0x0F) as f32;
-                    let hi = (b >> 4) as f32;
-                    let idx = byte_idx * 2;
-                    let group_lo = if idx < g_idx.len() { g_idx[idx] as usize } else { 0 };
-                    let group_hi = if (idx + 1) < g_idx.len() { g_idx[idx + 1] as usize } else { 0 };
-                    let scale_lo = if group_lo < scales.len() { scales[group_lo].to_f32() } else { 1.0 };
-                    let scale_hi = if group_hi < scales.len() { scales[group_hi].to_f32() } else { 1.0 };
-                    dequant_row[idx] = (lo - 8.0) * scale_lo;
-                    dequant_row[idx + 1] = (hi - 8.0) * scale_hi;
+        GPTQ_INPUT_T.with(|cell_t| {
+        GPTQ_DEQUANT.with(|cell_d| {
+            let mut buf_t = cell_t.take();
+            let mut buf_d = cell_d.take();
+            buf_t.resize_zeroed(k * n);
+            buf_d.resize_zeroed(k);
+            let input_t = buf_t.as_mut_slice();
+            let dequant_row = buf_d.as_mut_slice();
+            for p in 0..k {
+                for j in 0..n {
+                    input_t[j * k + p] = input[p * n + j].to_f32();
                 }
-                output[i * n + j] = E::from_f32(self.dot_f32(&dequant_row, in_row));
             }
-        }
+            let k_bytes = k / 2;
+            for j in 0..n {
+                let in_row = &input_t[j * k..(j + 1) * k];
+                for i in 0..m {
+                    let row_byte_offset = i * k_bytes;
+                    for byte_idx in 0..k_bytes {
+                        let b = weight[row_byte_offset + byte_idx];
+                        let lo = (b & 0x0F) as f32;
+                        let hi = (b >> 4) as f32;
+                        let idx = byte_idx * 2;
+                        let group_lo = if idx < g_idx.len() { g_idx[idx] as usize } else { 0 };
+                        let group_hi = if (idx + 1) < g_idx.len() { g_idx[idx + 1] as usize } else { 0 };
+                        let scale_lo = if group_lo < scales.len() { scales[group_lo].to_f32() } else { 1.0 };
+                        let scale_hi = if group_hi < scales.len() { scales[group_hi].to_f32() } else { 1.0 };
+                        dequant_row[idx] = (lo - 8.0) * scale_lo;
+                        dequant_row[idx + 1] = (hi - 8.0) * scale_hi;
+                    }
+                    output[i * n + j] = E::from_f32(self.dot_f32(dequant_row, in_row));
+                }
+            }
+            cell_t.set(buf_t);
+            cell_d.set(buf_d);
+        });
+        });
     }
 
     fn squeeze_matmul(
@@ -1505,35 +1562,43 @@ impl<E: Element> Kernels<E> for CpuKernels<E> {
         let block_size = 256usize;
         let block_bytes = 130usize;
         let blocks_per_row = k / block_size;
-        // Pre-transpose input from [k, n] col-major to [n, k] row-major
-        let mut input_t = vec![0.0f32; k * n];
-        for p in 0..k {
-            for j in 0..n {
-                input_t[j * k + p] = input[p * n + j].to_f32();
-            }
+        thread_local! {
+            static SQ_INPUT_T: std::cell::Cell<crate::cache_params::AlignedVec<f32>>
+                = std::cell::Cell::new(crate::cache_params::AlignedVec::new());
         }
-        for j in 0..n {
-            let in_row = &input_t[j * k..];
-            for i in 0..m {
-                let mut sum = 0.0f32;
-                for b in 0..blocks_per_row {
-                    let off = i * blocks_per_row * block_bytes + b * block_bytes;
-                    let blk = &weight_blocks[off..off + block_bytes];
-                    let blk_ptr = blk.as_ptr() as *const crate::quant::BlockSqueeze;
-                    let src = in_row[b * block_size..(b + 1) * block_size].as_ptr();
-                    sum += match get_isa_level() {
-                        #[cfg(target_arch = "x86_64")]
-                        IsaLevel::Avx512 => crate::quant_primitive!(avx512, squeeze, dot, blk_ptr, src),
-                        #[cfg(target_arch = "x86_64")]
-                        IsaLevel::Avx2 => crate::quant_primitive!(avx2, squeeze, dot, blk_ptr, src),
-                        #[cfg(target_arch = "aarch64")]
-                        IsaLevel::Neon => crate::quant_primitive!(neon, squeeze, dot, blk_ptr, src),
-                        _ => crate::quant_primitive!(scalar, squeeze, dot, blk_ptr, src),
-                    };
+        SQ_INPUT_T.with(|cell| {
+            let mut buf = cell.take();
+            buf.resize_zeroed(k * n);
+            let input_t = buf.as_mut_slice();
+            for p in 0..k {
+                for j in 0..n {
+                    input_t[j * k + p] = input[p * n + j].to_f32();
                 }
-                output[i * n + j] = E::from_f32(sum);
             }
-        }
+            for j in 0..n {
+                let in_row = &input_t[j * k..];
+                for i in 0..m {
+                    let mut sum = 0.0f32;
+                    for b in 0..blocks_per_row {
+                        let off = i * blocks_per_row * block_bytes + b * block_bytes;
+                        let blk = &weight_blocks[off..off + block_bytes];
+                        let blk_ptr = blk.as_ptr() as *const crate::quant::BlockSqueeze;
+                        let src = in_row[b * block_size..(b + 1) * block_size].as_ptr();
+                        sum += match get_isa_level() {
+                            #[cfg(target_arch = "x86_64")]
+                            IsaLevel::Avx512 => crate::quant_primitive!(avx512, squeeze, dot, blk_ptr, src),
+                            #[cfg(target_arch = "x86_64")]
+                            IsaLevel::Avx2 => crate::quant_primitive!(avx2, squeeze, dot, blk_ptr, src),
+                            #[cfg(target_arch = "aarch64")]
+                            IsaLevel::Neon => crate::quant_primitive!(neon, squeeze, dot, blk_ptr, src),
+                            _ => crate::quant_primitive!(scalar, squeeze, dot, blk_ptr, src),
+                        };
+                    }
+                    output[i * n + j] = E::from_f32(sum);
+                }
+            }
+            cell.set(buf);
+        });
     }
 
 }

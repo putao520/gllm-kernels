@@ -11,15 +11,12 @@
 //! - `gemm_asm_f32_avx512`: uses the 14x32 AVX-512 microkernel
 
 #[cfg(target_arch = "x86_64")]
-use crate::cache_params;
+use crate::cache_params::{self, AlignedVec};
 
 /// Pack a panel of A (mc x kc) into column-major MR-wide strips.
 ///
 /// Input A is row-major: a[i*lda + k]
 /// Output: packed[k*MR + i_local] for each MR-wide strip
-///
-/// This layout ensures the microkernel can broadcast individual A elements
-/// with `vbroadcastss` from contiguous memory.
 #[cfg(target_arch = "x86_64")]
 #[inline]
 unsafe fn pack_a_f32(
@@ -33,7 +30,6 @@ unsafe fn pack_a_f32(
     let mut p = packed;
     let mut i = 0usize;
 
-    // Full MR-wide panels
     while i + mr <= mc {
         for k in 0..kc {
             for r in 0..mr {
@@ -44,7 +40,6 @@ unsafe fn pack_a_f32(
         i += mr;
     }
 
-    // Remainder rows (< MR): zero-pad to MR width
     if i < mc {
         let rem = mc - i;
         for k in 0..kc {
@@ -107,10 +102,9 @@ unsafe fn pack_b_f32(
 ///
 /// C = A * B  (row-major, C is m x n, A is m x k, B is k x n)
 ///
-/// Uses 3-level blocking:
-/// - NC blocking on N (B panel fits in L3)
-/// - KC blocking on K (A panel fits in L2, B strip fits in L1)
-/// - MC blocking on M (A panel fits in L2)
+/// Uses 3-level blocking (NC/KC/MC) with parameters from `kernel_config()`.
+/// Pack buffers use thread-local `AlignedVec` (64-byte aligned, zero allocation
+/// on hot path after first call).
 #[cfg(target_arch = "x86_64")]
 fn gemm_driver_f32(
     a: &[f32],
@@ -131,162 +125,130 @@ fn gemm_driver_f32(
         return;
     }
 
-    // Compute NV and LANES from NR for blocking parameter calculation.
-    // AVX2:   NR=16 = 2 vectors x 8 lanes
-    // AVX-512: NR=32 = 2 vectors x 16 lanes
-    let lanes = nr / 2;
-    let nv = 2usize;
-    let bp = cache_params::blocking_params(mr, nv, lanes, 4);
-    let kc_max = bp.kc;
-    let mc_max = bp.mc;
-    let nc_max = bp.nc;
+    // Get blocking params from kernel_config (BLIS formula, computed once)
+    let cfg = crate::microarch::kernel_config();
+    let kc_max = cfg.kc;
+    let mc_max = cfg.mc;
+    let nc_max = cfg.nc;
 
-    // Thread-local packing buffers
+    // Thread-local aligned packing buffers (zero alloc on hot path)
     thread_local! {
-        static PACK_A: std::cell::RefCell<Vec<f32>> = std::cell::RefCell::new(Vec::new());
-        static PACK_B: std::cell::RefCell<Vec<f32>> = std::cell::RefCell::new(Vec::new());
+        static PACK_A: std::cell::Cell<AlignedVec<f32>> = std::cell::Cell::new(AlignedVec::new());
+        static PACK_B: std::cell::Cell<AlignedVec<f32>> = std::cell::Cell::new(AlignedVec::new());
     }
 
     let pack_a_size = mc_max * kc_max;
     let pack_b_size = kc_max * nc_max;
 
-    PACK_A.with(|pa| {
-        PACK_B.with(|pb| {
-            let mut pa = pa.borrow_mut();
-            let mut pb = pb.borrow_mut();
+    let mut pa = PACK_A.with(|c| c.take());
+    let mut pb = PACK_B.with(|c| c.take());
 
-            if pa.len() < pack_a_size {
-                pa.resize(pack_a_size, 0.0);
+    if pa.capacity() < pack_a_size { pa.reserve(pack_a_size); }
+    if pb.capacity() < pack_b_size { pb.reserve(pack_b_size); }
+    unsafe { pa.set_len(pack_a_size); pb.set_len(pack_b_size); }
+
+    let a_ptr = a.as_ptr();
+    let b_ptr = b.as_ptr();
+    let c_ptr = c.as_mut_ptr();
+
+    // NC loop: iterate over N in chunks of nc_max
+    let mut jc = 0usize;
+    while jc < n {
+        let nc = nc_max.min(n - jc);
+
+        // KC loop: iterate over K in chunks of kc_max
+        let mut pc = 0usize;
+        while pc < k {
+            let kc = kc_max.min(k - pc);
+            let first_kc = pc == 0;
+
+            // Pack B panel: B[pc..pc+kc, jc..jc+nc] -> packed_b
+            unsafe {
+                pack_b_f32(
+                    b_ptr.add(pc * n + jc), n,
+                    pb.as_mut_ptr(), kc, nc, nr,
+                );
             }
-            if pb.len() < pack_b_size {
-                pb.resize(pack_b_size, 0.0);
-            }
 
-            let a_ptr = a.as_ptr();
-            let b_ptr = b.as_ptr();
-            let c_ptr = c.as_mut_ptr();
+            // MC loop: iterate over M in chunks of mc_max
+            let mut ic = 0usize;
+            while ic < m {
+                let mc = mc_max.min(m - ic);
 
-            // NC loop: iterate over N in chunks of nc_max
-            let mut jc = 0usize;
-            while jc < n {
-                let nc = nc_max.min(n - jc);
-
-                // KC loop: iterate over K in chunks of kc_max
-                let mut pc = 0usize;
-                while pc < k {
-                    let kc = kc_max.min(k - pc);
-                    let first_kc = pc == 0;
-
-                    // Pack B panel: B[pc..pc+kc, jc..jc+nc] -> packed_b
-                    unsafe {
-                        pack_b_f32(
-                            b_ptr.add(pc * n + jc),
-                            n,
-                            pb.as_mut_ptr(),
-                            kc,
-                            nc,
-                            nr,
-                        );
-                    }
-
-                    // MC loop: iterate over M in chunks of mc_max
-                    let mut ic = 0usize;
-                    while ic < m {
-                        let mc = mc_max.min(m - ic);
-
-                        // Pack A panel: A[ic..ic+mc, pc..pc+kc] -> packed_a
-                        unsafe {
-                            pack_a_f32(
-                                a_ptr.add(ic * k + pc),
-                                k,
-                                pa.as_mut_ptr(),
-                                mc,
-                                kc,
-                                mr,
-                            );
-                        }
-
-                        // Microkernel loop: iterate over tiles
-                        let n_mr = (mc + mr - 1) / mr;
-                        let n_nr = (nc + nr - 1) / nr;
-
-                        // Temp buffer for edge tiles where the full MR×NR
-                        // block would exceed C bounds.
-                        let mut c_tmp = [0.0f32; 14 * 32]; // max MR*NR
-
-                        for jr in 0..n_nr {
-                            let col_start = jc + jr * nr;
-                            let col_rem = n.saturating_sub(col_start).min(nr);
-                            let is_edge_col = col_rem < nr;
-
-                            for ir in 0..n_mr {
-                                let row_start = ic + ir * mr;
-                                let row_rem = m.saturating_sub(row_start).min(mr);
-                                let is_edge_row = row_rem < mr;
-
-                                unsafe {
-                                    let pa_tile = pa.as_ptr().add(ir * mr * kc);
-                                    let pb_tile = pb.as_ptr().add(jr * nr * kc);
-
-                                    if is_edge_row || is_edge_col {
-                                        // Edge tile: compute into temp buffer, copy valid portion
-                                        if !first_kc {
-                                            // Load existing C values into temp
-                                            for ri in 0..row_rem {
-                                                for ci in 0..col_rem {
-                                                    c_tmp[ri * nr + ci] =
-                                                        *c_ptr.add((row_start + ri) * n + col_start + ci);
-                                                }
-                                            }
-                                        } else {
-                                            // Zero the temp buffer
-                                            for v in c_tmp[..mr * nr].iter_mut() {
-                                                *v = 0.0;
-                                            }
-                                        }
-
-                                        microkernel(
-                                            pa_tile,
-                                            pb_tile,
-                                            c_tmp.as_mut_ptr(),
-                                            kc,
-                                            nr, // ldc = nr for temp buffer
-                                            !first_kc,
-                                        );
-
-                                        // Copy back valid portion
-                                        for ri in 0..row_rem {
-                                            for ci in 0..col_rem {
-                                                *c_ptr.add((row_start + ri) * n + col_start + ci) =
-                                                    c_tmp[ri * nr + ci];
-                                            }
-                                        }
-                                    } else {
-                                        // Full tile: write directly into C
-                                        let c_tile = c_ptr.add(row_start * n + col_start);
-                                        microkernel(
-                                            pa_tile,
-                                            pb_tile,
-                                            c_tile,
-                                            kc,
-                                            n, // ldc = n (full C row stride)
-                                            !first_kc,
-                                        );
-                                    }
-                                }
-                            }
-                        }
-
-                        ic += mc_max;
-                    }
-
-                    pc += kc_max;
+                // Pack A panel
+                unsafe {
+                    pack_a_f32(
+                        a_ptr.add(ic * k + pc), k,
+                        pa.as_mut_ptr(), mc, kc, mr,
+                    );
                 }
 
-                jc += nc_max;
+                let n_mr = (mc + mr - 1) / mr;
+                let n_nr = (nc + nr - 1) / nr;
+
+                // Temp buffer for edge tiles
+                let mut c_tmp = [0.0f32; 14 * 32];
+
+                for jr in 0..n_nr {
+                    let col_start = jc + jr * nr;
+                    let col_rem = n.saturating_sub(col_start).min(nr);
+                    let is_edge_col = col_rem < nr;
+
+                    for ir in 0..n_mr {
+                        let row_start = ic + ir * mr;
+                        let row_rem = m.saturating_sub(row_start).min(mr);
+                        let is_edge_row = row_rem < mr;
+
+                        unsafe {
+                            let pa_tile = pa.as_ptr().add(ir * mr * kc);
+                            let pb_tile = pb.as_ptr().add(jr * nr * kc);
+
+                            if is_edge_row || is_edge_col {
+                                if !first_kc {
+                                    for ri in 0..row_rem {
+                                        for ci in 0..col_rem {
+                                            c_tmp[ri * nr + ci] =
+                                                *c_ptr.add((row_start + ri) * n + col_start + ci);
+                                        }
+                                    }
+                                } else {
+                                    for v in c_tmp[..mr * nr].iter_mut() { *v = 0.0; }
+                                }
+
+                                microkernel(
+                                    pa_tile, pb_tile, c_tmp.as_mut_ptr(),
+                                    kc, nr, !first_kc,
+                                );
+
+                                for ri in 0..row_rem {
+                                    for ci in 0..col_rem {
+                                        *c_ptr.add((row_start + ri) * n + col_start + ci) =
+                                            c_tmp[ri * nr + ci];
+                                    }
+                                }
+                            } else {
+                                let c_tile = c_ptr.add(row_start * n + col_start);
+                                microkernel(
+                                    pa_tile, pb_tile, c_tile,
+                                    kc, n, !first_kc,
+                                );
+                            }
+                        }
+                    }
+                }
+
+                ic += mc_max;
             }
-        });
-    });
+
+            pc += kc_max;
+        }
+
+        jc += nc_max;
+    }
+
+    // Return buffers to thread-local storage
+    PACK_A.with(|c| c.set(pa));
+    PACK_B.with(|c| c.set(pb));
 }
 
 /// Full GEMM using the hand-written 6x16 AVX2 microkernel.

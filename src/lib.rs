@@ -20,6 +20,7 @@
 pub mod traits;
 pub use traits::Activation;
 pub mod cache_params;
+pub mod microarch;
 pub mod numa;
 pub mod macros;
 pub mod cpu_kernels;

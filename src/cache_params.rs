@@ -150,56 +150,39 @@ pub fn l3_size() -> usize {
 
 /// Compute optimal KC given microkernel geometry and element size.
 ///
-/// The microkernel inner loop streams through one TN-wide column of packed B
-/// (TN * KC * elem_bytes). The B strip must stay resident in L1D.
-/// A elements are streamed (broadcast once per TN FMAs) and don't need L1 residency.
-/// C accumulators live in SIMD registers.
-///
-/// Constraint: TN * KC * elem_bytes ≤ L1D
-/// (B strip fills L1D; A streaming + HW prefetch handles the rest)
+/// BLIS standard: B strip (KC × NR × elem_bytes) ≤ L1D × 0.50
+/// The other half of L1D is left for A streaming + HW prefetch.
 /// KC is rounded down to a multiple of 8 (for unrolled inner loops) and clamped to [64, 768].
 pub fn compute_kc(_tm: usize, nv: usize, lanes: usize, elem_bytes: usize) -> usize {
     let (l1d, _, _) = cache_sizes();
     let tn = nv * lanes;
-    let budget = l1d; // Full L1D for B panel strip (A is streamed, C in registers)
+    let budget = l1d / 2; // 50% of L1D for B strip
     let kc_raw = budget / (tn * elem_bytes);
-    // Round down to multiple of 8, clamp to [64, 768]
-    let kc = (kc_raw & !7).max(64).min(768);
-    kc
+    (kc_raw & !7).clamp(64, 768)
 }
 
 /// Compute optimal MC given KC, TM, and element size.
 ///
-/// Each thread packs its own A panel (MC × KC) which must fit in L2.
-/// Using 80% of L2 leaves room for B panel strips and C tile writes
-/// that also transit through L2.
-///
-/// Constraint: MC * KC * elem_bytes ≤ L2 * 0.80
+/// BLIS standard: A panel (MC × KC × elem_bytes) ≤ L2 × 0.50
+/// The other half of L2 is left for B panel strips and C tile writes.
 /// MC is rounded down to a multiple of TM and clamped to [TM, 960].
 pub fn compute_mc(kc: usize, tm: usize, elem_bytes: usize) -> usize {
     let (_, l2, _) = cache_sizes();
-    let budget = (l2 * 4) / 5; // 80% of L2 for A panel
+    let budget = l2 / 2; // 50% of L2 for A panel
     let mc_raw = budget / (kc * elem_bytes);
-    // Round down to multiple of TM, clamp
-    let mc = (mc_raw / tm * tm).max(tm).min(960);
-    mc
+    (mc_raw / tm * tm).clamp(tm, 960)
 }
 
 /// Compute optimal NC given KC, TN, and element size.
 ///
-/// The packed B panel (KC × NC) is shared by all cores via L3.
-/// Under multi-core contention, effective L3 capacity per core drops,
-/// so we use a conservative 40% of L3 to avoid thrashing.
-///
-/// Constraint: NC * KC * elem_bytes ≤ L3 * 0.40
+/// BLIS standard: B panel (KC × NC × elem_bytes) ≤ L3 × 0.50
+/// Conservative to avoid thrashing under multi-core contention.
 /// NC is rounded down to a multiple of TN and clamped to [TN, 8192].
 pub fn compute_nc(kc: usize, tn: usize, elem_bytes: usize) -> usize {
     let (_, _, l3) = cache_sizes();
-    let budget = (l3 * 2) / 5; // 40% of L3 for shared B panel
+    let budget = l3 / 2; // 50% of L3 for shared B panel
     let nc_raw = budget / (kc * elem_bytes);
-    // Round down to multiple of TN, clamp to [TN, 8192]
-    let nc = (nc_raw / tn * tn).max(tn).min(8192);
-    nc
+    (nc_raw / tn * tn).clamp(tn, 8192)
 }
 
 /// Compute KC, MC, and NC for a given microkernel geometry.
@@ -212,12 +195,11 @@ pub fn blocking_params(tm: usize, nv: usize, lanes: usize, elem_bytes: usize) ->
 }
 
 /// Compute NC using a specific L3 size (for NUMA-aware per-node blocking).
-/// On multi-socket systems, each socket has its own L3 cache, so NC should
-/// be computed against the per-socket L3 rather than the global L3.
+/// BLIS standard: B panel (KC × NC × elem_bytes) ≤ node_L3 × 0.50
 pub fn compute_nc_with_l3(kc: usize, tn: usize, elem_bytes: usize, node_l3: usize) -> usize {
-    let budget = (node_l3 * 2) / 5; // 40% of per-node L3
+    let budget = node_l3 / 2; // 50% of per-node L3
     let nc_raw = budget / (kc * elem_bytes);
-    (nc_raw / tn * tn).max(tn).min(8192)
+    (nc_raw / tn * tn).clamp(tn, 8192)
 }
 
 /// Compute NUMA-aware blocking parameters for a specific node.
@@ -293,6 +275,27 @@ impl<T> AlignedVec<T> {
         self.len = len;
     }
 
+    /// Resize to `len` elements, zero-filling. Reuses allocation if capacity suffices.
+    pub fn resize_zeroed(&mut self, len: usize) {
+        self.reserve(len);
+        unsafe {
+            std::ptr::write_bytes(self.ptr as *mut u8, 0, len * std::mem::size_of::<T>());
+            self.len = len;
+        }
+    }
+
+    /// Return a mutable slice of the first `len` elements.
+    #[inline]
+    pub fn as_mut_slice(&mut self) -> &mut [T] {
+        unsafe { std::slice::from_raw_parts_mut(self.ptr, self.len) }
+    }
+
+    /// Return a slice of the first `len` elements.
+    #[inline]
+    pub fn as_slice(&self) -> &[T] {
+        unsafe { std::slice::from_raw_parts(self.ptr, self.len) }
+    }
+
     fn dealloc(&mut self) {
         if !self.ptr.is_null() && self.cap > 0 {
             let elem_size = std::mem::size_of::<T>();
@@ -366,11 +369,11 @@ mod tests {
 
     #[test]
     fn test_nc_constraint() {
-        // Verify NC * KC * elem_bytes <= L3 * 0.6
+        // Verify NC * KC * elem_bytes <= L3 * 0.5
         let p = blocking_params(6, 2, 8, 4);
         let tn = 2 * 8;
         let nc_budget = p.nc * p.kc * 4;
-        let l3_budget = (l3_size() * 3) / 5;
+        let l3_budget = l3_size() / 2;
         assert!(nc_budget <= l3_budget + tn * p.kc * 4,
             "NC budget {nc_budget} exceeds L3 budget {l3_budget}");
         // NC must be multiple of TN

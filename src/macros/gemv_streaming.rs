@@ -61,6 +61,10 @@ macro_rules! define_gemv_streaming {
         /// Inner streaming GEMV kernel for N range [n_start, n_end).
         /// Uses 6 × 2-vector accumulator groups (12 SIMD regs) to process
         /// 6*TN output columns simultaneously, hiding FMA latency.
+        ///
+        /// Prefetch distance and hint type are adaptive via `kernel_config()`:
+        /// - Distance: `pf_rows_gemv` (derived from memory latency / frequency)
+        /// - Hint: NTA (non-temporal) for streaming GEMV to avoid L2/L3 pollution
         #[target_feature($(enable = $feat),+)]
         unsafe fn gemv_streaming_range(
             a_ptr: *const $elem, b_ptr: *const $elem, c_ptr: *mut $elem,
@@ -71,11 +75,12 @@ macro_rules! define_gemv_streaming {
             const TN: usize = LANES * 2;  // 2 vectors per accumulator group
             const KC: usize = 512;        // K-tile: 512 elements ≈ 2KB f32, fits L1
 
+            // Adaptive prefetch distance from kernel_config
+            let pf_rows = $crate::microarch::kernel_config().pf_rows_gemv;
+
             // ── Process 3×TN columns at a time (6 accumulator vectors) ──
-            // This gives 6 independent FMA chains, enough to hide ~5 cycle latency
             let mut n = n_start;
             while n + TN * 3 <= n_end {
-                // 6 accumulator vectors (3 groups × 2 vectors)
                 let mut acc0_0 = $crate::simd_primitive!($isa, $elem, zero);
                 let mut acc0_1 = $crate::simd_primitive!($isa, $elem, zero);
                 let mut acc1_0 = $crate::simd_primitive!($isa, $elem, zero);
@@ -91,13 +96,13 @@ macro_rules! define_gemv_streaming {
 
                     while ki < ku {
                         let k = ks + ki;
-                        // Prefetch B rows 8 ahead (~512B per row-segment)
-                        $crate::simd_primitive!($isa, $elem, prefetch,
-                            b_ptr.add((k + 8) * n_size + n) as *const i8, 0);
-                        $crate::simd_primitive!($isa, $elem, prefetch,
-                            b_ptr.add((k + 8) * n_size + n + TN) as *const i8, 0);
-                        $crate::simd_primitive!($isa, $elem, prefetch,
-                            b_ptr.add((k + 8) * n_size + n + TN * 2) as *const i8, 0);
+                        // NTA prefetch: streaming access, don't pollute L2/L3
+                        $crate::simd_primitive!($isa, $elem, prefetch_nta,
+                            b_ptr.add((k + pf_rows) * n_size + n));
+                        $crate::simd_primitive!($isa, $elem, prefetch_nta,
+                            b_ptr.add((k + pf_rows) * n_size + n + TN));
+                        $crate::simd_primitive!($isa, $elem, prefetch_nta,
+                            b_ptr.add((k + pf_rows) * n_size + n + TN * 2));
 
                         // k+0
                         let va = $crate::simd_primitive!($isa, $elem, splat, *a_ptr.add(k));
@@ -203,8 +208,8 @@ macro_rules! define_gemv_streaming {
                     let mut ki = 0usize;
                     while ki < ku {
                         let k = ks + ki;
-                        $crate::simd_primitive!($isa, $elem, prefetch,
-                            b_ptr.add((k + 8) * n_size + n) as *const i8, 0);
+                        $crate::simd_primitive!($isa, $elem, prefetch_nta,
+                            b_ptr.add((k + pf_rows) * n_size + n));
                         // k+0
                         let va = $crate::simd_primitive!($isa, $elem, splat, *a_ptr.add(k));
                         acc0 = $crate::simd_primitive!($isa, $elem, fma, va,
