@@ -17,7 +17,7 @@
 //! # Usage
 //!
 //! ```rust,no_run
-//! use gllm_kernels::autotuning::{self, TuneRequest, TuneLevel};
+//! use gllm_kernels::autotuning::{self, TuneLevel};
 //!
 //! // Quick tune for a specific GEMM shape
 //! let params = autotuning::tune_gemm(512, 512, 512, 4, TuneLevel::Fast);
