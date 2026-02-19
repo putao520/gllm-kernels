@@ -179,10 +179,12 @@ fn bench_quant_gemv(c: &mut Criterion) {
     }
 
     // kquant_matmul: multi-row Q8K GEMM (simulates batched decode)
+    // Semantics: output[m,n] = weight[m,k] · input[k,n]
+    // weight is [m, k] quantized, input is [k, n] col-major
     for &(m, n, k) in &[(1, 1, 4096), (1, 4, 4096), (4, 1, 4096)] {
         let blocks = k / 256;
-        let mut weight_raw = vec![0u8; n * blocks * q8_block_bytes];
-        for i in 0..(n * blocks) {
+        let mut weight_raw = vec![0u8; m * blocks * q8_block_bytes];
+        for i in 0..(m * blocks) {
             let base = i * q8_block_bytes;
             let d: f32 = 0.05;
             weight_raw[base..base + 4].copy_from_slice(&d.to_le_bytes());
@@ -190,7 +192,8 @@ fn bench_quant_gemv(c: &mut Criterion) {
                 weight_raw[base + j] = rng.gen::<u8>();
             }
         }
-        let input = rand_vec(m * k);
+        // input is [k, n] col-major: n column vectors of length k
+        let input = rand_vec(k * n);
         let mut output = vec![0.0f32; m * n];
         group.throughput(Throughput::Elements((2 * m * n * k) as u64));
         group.bench_function(
@@ -288,8 +291,10 @@ fn bench_rope(c: &mut Criterion) {
     ] {
         let total = seq_len * num_heads * head_dim;
         let mut qk = rand_vec(total);
-        let cos = rand_vec(seq_len * head_dim);
-        let sin = rand_vec(seq_len * head_dim);
+        // rope treats data as (total / head_dim) positions, each needing head_dim/2 cos/sin
+        let rope_positions = total / head_dim; // = seq_len * num_heads
+        let cos = rand_vec(rope_positions * head_dim / 2);
+        let sin = rand_vec(rope_positions * head_dim / 2);
         group.throughput(Throughput::Elements(total as u64));
         group.bench_function(
             BenchmarkId::new("rope", format!("s{seq_len}_h{num_heads}_d{head_dim}")),
