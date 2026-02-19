@@ -70,8 +70,8 @@ macro_rules! define_element_wise_ops {
                     let va1 = $crate::simd_primitive!($isa, $elem, load, a.as_ptr().add(i + LANES));
                     let neg0 = $crate::simd_primitive!($isa, $elem, neg, va0);
                     let neg1 = $crate::simd_primitive!($isa, $elem, neg, va1);
-                    let exp0 = $crate::simd_primitive!($isa, $elem, exp, neg0);
-                    let exp1 = $crate::simd_primitive!($isa, $elem, exp, neg1);
+                    let exp0 = $crate::simd_primitive!($isa, $elem, exp_fast, neg0);
+                    let exp1 = $crate::simd_primitive!($isa, $elem, exp_fast, neg1);
                     let one = $crate::simd_primitive!($isa, $elem, splat, <$elem as Element>::ONE);
                     let denom0 = $crate::simd_primitive!($isa, $elem, add, one, exp0);
                     let denom1 = $crate::simd_primitive!($isa, $elem, add, one, exp1);
@@ -90,7 +90,7 @@ macro_rules! define_element_wise_ops {
                 unsafe {
                     let va = $crate::simd_primitive!($isa, $elem, load, a.as_ptr().add(i));
                     let neg_va = $crate::simd_primitive!($isa, $elem, neg, va);
-                    let exp_neg = $crate::simd_primitive!($isa, $elem, exp, neg_va);
+                    let exp_neg = $crate::simd_primitive!($isa, $elem, exp_fast, neg_va);
                     let one = $crate::simd_primitive!($isa, $elem, splat, <$elem as Element>::ONE);
                     let one_plus_exp = $crate::simd_primitive!($isa, $elem, add, one, exp_neg);
                     let sigmoid = $crate::simd_primitive!($isa, $elem, recip, one_plus_exp);
@@ -456,8 +456,8 @@ macro_rules! define_activation_ops {
                     // tanh(z) = 1 - 2/(exp(2z)+1) using recip instead of div
                     let two_z0 = $crate::simd_primitive!($isa, $elem, mul, two, scaled0);
                     let two_z1 = $crate::simd_primitive!($isa, $elem, mul, two, scaled1);
-                    let exp_2z0 = $crate::simd_primitive!($isa, $elem, exp, two_z0);
-                    let exp_2z1 = $crate::simd_primitive!($isa, $elem, exp, two_z1);
+                    let exp_2z0 = $crate::simd_primitive!($isa, $elem, exp_fast, two_z0);
+                    let exp_2z1 = $crate::simd_primitive!($isa, $elem, exp_fast, two_z1);
                     let den0 = $crate::simd_primitive!($isa, $elem, add, exp_2z0, one);
                     let den1 = $crate::simd_primitive!($isa, $elem, add, exp_2z1, one);
                     let inv_den0 = $crate::simd_primitive!($isa, $elem, recip, den0);
@@ -493,7 +493,7 @@ macro_rules! define_activation_ops {
                     let inner = $crate::simd_primitive!($isa, $elem, fma, vc, x3, vx);
                     let scaled = $crate::simd_primitive!($isa, $elem, mul, vs, inner);
                     let two_z = $crate::simd_primitive!($isa, $elem, mul, two, scaled);
-                    let exp_2z = $crate::simd_primitive!($isa, $elem, exp, two_z);
+                    let exp_2z = $crate::simd_primitive!($isa, $elem, exp_fast, two_z);
                     let den = $crate::simd_primitive!($isa, $elem, add, exp_2z, one);
                     let inv_den = $crate::simd_primitive!($isa, $elem, recip, den);
                     let tanh_val = $crate::simd_primitive!($isa, $elem, fnmadd, two, inv_den, one);
@@ -530,7 +530,7 @@ macro_rules! define_activation_ops {
                     let one = $crate::simd_primitive!($isa, $elem, splat, <$elem as Element>::ONE);
                     let two = $crate::simd_primitive!($isa, $elem, splat, <$elem as Element>::from_f32(2.0));
                     let two_x = $crate::simd_primitive!($isa, $elem, mul, two, vx);
-                    let exp_2x = $crate::simd_primitive!($isa, $elem, exp, two_x);
+                    let exp_2x = $crate::simd_primitive!($isa, $elem, exp_fast, two_x);
                     let den = $crate::simd_primitive!($isa, $elem, add, exp_2x, one);
                     let inv_den = $crate::simd_primitive!($isa, $elem, recip, den);
                     // tanh = 1 - 2*inv_den = fnmadd(two, inv_den, one)
@@ -647,11 +647,10 @@ macro_rules! define_activation_ops {
                     let s1 = $crate::simd_primitive!($isa, $elem, sub, v1, vmax_splat);
                     let s2 = $crate::simd_primitive!($isa, $elem, sub, v2, vmax_splat);
                     let s3 = $crate::simd_primitive!($isa, $elem, sub, v3, vmax_splat);
-                    let e0 = $crate::simd_primitive!($isa, $elem, exp, s0);
-                    let e1 = $crate::simd_primitive!($isa, $elem, exp, s1);
-                    let e2 = $crate::simd_primitive!($isa, $elem, exp, s2);
-                    let e3 = $crate::simd_primitive!($isa, $elem, exp, s3);
-                    // Store exp results to out (avoids recomputing in pass 3)
+                    let e0 = $crate::simd_primitive!($isa, $elem, exp_fast, s0);
+                    let e1 = $crate::simd_primitive!($isa, $elem, exp_fast, s1);
+                    let e2 = $crate::simd_primitive!($isa, $elem, exp_fast, s2);
+                    let e3 = $crate::simd_primitive!($isa, $elem, exp_fast, s3);
                     $crate::simd_primitive!($isa, $elem, store, out.as_mut_ptr().add(i), e0);
                     $crate::simd_primitive!($isa, $elem, store, out.as_mut_ptr().add(i + LANES), e1);
                     $crate::simd_primitive!($isa, $elem, store, out.as_mut_ptr().add(i + LANES * 2), e2);
@@ -668,7 +667,7 @@ macro_rules! define_activation_ops {
                 unsafe {
                     let va = $crate::simd_primitive!($isa, $elem, load, a.as_ptr().add(i));
                     let shifted = $crate::simd_primitive!($isa, $elem, sub, va, vmax_splat);
-                    let e = $crate::simd_primitive!($isa, $elem, exp, shifted);
+                    let e = $crate::simd_primitive!($isa, $elem, exp_fast, shifted);
                     $crate::simd_primitive!($isa, $elem, store, out.as_mut_ptr().add(i), e);
                     vsum0 = $crate::simd_primitive!($isa, $elem, add, vsum0, e);
                 }
@@ -753,16 +752,18 @@ macro_rules! define_activation_ops {
             while i + LANES <= len {
                 #[allow(unused_unsafe)]
                 unsafe {
+                    // Prefetch next iteration's data
+                    $crate::simd_primitive!($isa, $elem, prefetch, a.as_ptr().add(i + LANES * 4) as *const u8, 0);
                     let vx = $crate::simd_primitive!($isa, $elem, load, a.as_ptr().add(i));
                     // new_max = max(vmax, vx)
                     let new_max = $crate::simd_primitive!($isa, $elem, max, vmax, vx);
                     // Compensate previous sum: sum *= exp(old_max - new_max)
                     let diff = $crate::simd_primitive!($isa, $elem, sub, vmax, new_max);
-                    let comp = $crate::simd_primitive!($isa, $elem, exp, diff);
+                    let comp = $crate::simd_primitive!($isa, $elem, exp_fast, diff);
                     vsum = $crate::simd_primitive!($isa, $elem, mul, vsum, comp);
                     // Add current contribution: sum += exp(x - new_max)
                     let shifted = $crate::simd_primitive!($isa, $elem, sub, vx, new_max);
-                    let e = $crate::simd_primitive!($isa, $elem, exp, shifted);
+                    let e = $crate::simd_primitive!($isa, $elem, exp_fast, shifted);
                     vsum = $crate::simd_primitive!($isa, $elem, add, vsum, e);
                     vmax = new_max;
                 }
@@ -782,7 +783,7 @@ macro_rules! define_activation_ops {
             #[allow(unused_unsafe)]
             let lane_diff = unsafe { $crate::simd_primitive!($isa, $elem, sub, vmax, vgmax) };
             #[allow(unused_unsafe)]
-            let lane_comp = unsafe { $crate::simd_primitive!($isa, $elem, exp, lane_diff) };
+            let lane_comp = unsafe { $crate::simd_primitive!($isa, $elem, exp_fast, lane_diff) };
             #[allow(unused_unsafe)]
             let vsum_comp = unsafe { $crate::simd_primitive!($isa, $elem, mul, vsum, lane_comp) };
             #[allow(unused_unsafe)]
@@ -817,10 +818,10 @@ macro_rules! define_activation_ops {
                     let s1 = $crate::simd_primitive!($isa, $elem, sub, v1, vmax_splat);
                     let s2 = $crate::simd_primitive!($isa, $elem, sub, v2, vmax_splat);
                     let s3 = $crate::simd_primitive!($isa, $elem, sub, v3, vmax_splat);
-                    let e0 = $crate::simd_primitive!($isa, $elem, exp, s0);
-                    let e1 = $crate::simd_primitive!($isa, $elem, exp, s1);
-                    let e2 = $crate::simd_primitive!($isa, $elem, exp, s2);
-                    let e3 = $crate::simd_primitive!($isa, $elem, exp, s3);
+                    let e0 = $crate::simd_primitive!($isa, $elem, exp_fast, s0);
+                    let e1 = $crate::simd_primitive!($isa, $elem, exp_fast, s1);
+                    let e2 = $crate::simd_primitive!($isa, $elem, exp_fast, s2);
+                    let e3 = $crate::simd_primitive!($isa, $elem, exp_fast, s3);
                     let r0 = $crate::simd_primitive!($isa, $elem, mul, e0, vinv);
                     let r1 = $crate::simd_primitive!($isa, $elem, mul, e1, vinv);
                     let r2 = $crate::simd_primitive!($isa, $elem, mul, e2, vinv);
@@ -837,7 +838,7 @@ macro_rules! define_activation_ops {
                 unsafe {
                     let va = $crate::simd_primitive!($isa, $elem, load, a.as_ptr().add(i));
                     let shifted = $crate::simd_primitive!($isa, $elem, sub, va, vmax_splat);
-                    let e = $crate::simd_primitive!($isa, $elem, exp, shifted);
+                    let e = $crate::simd_primitive!($isa, $elem, exp_fast, shifted);
                     let res = $crate::simd_primitive!($isa, $elem, mul, e, vinv);
                     $crate::simd_primitive!($isa, $elem, store, out.as_mut_ptr().add(i), res);
                 }
@@ -869,8 +870,8 @@ macro_rules! define_activation_ops {
                     let vu1 = $crate::simd_primitive!($isa, $elem, load, up.as_ptr().add(i + LANES));
                     let neg_g0 = $crate::simd_primitive!($isa, $elem, neg, vg0);
                     let neg_g1 = $crate::simd_primitive!($isa, $elem, neg, vg1);
-                    let exp0 = $crate::simd_primitive!($isa, $elem, exp, neg_g0);
-                    let exp1 = $crate::simd_primitive!($isa, $elem, exp, neg_g1);
+                    let exp0 = $crate::simd_primitive!($isa, $elem, exp_fast, neg_g0);
+                    let exp1 = $crate::simd_primitive!($isa, $elem, exp_fast, neg_g1);
                     let one = $crate::simd_primitive!($isa, $elem, splat, <$elem as Element>::ONE);
                     let denom0 = $crate::simd_primitive!($isa, $elem, add, one, exp0);
                     let denom1 = $crate::simd_primitive!($isa, $elem, add, one, exp1);
@@ -893,7 +894,7 @@ macro_rules! define_activation_ops {
                     let vg = $crate::simd_primitive!($isa, $elem, load, gate.as_ptr().add(i));
                     let vu = $crate::simd_primitive!($isa, $elem, load, up.as_ptr().add(i));
                     let neg_g = $crate::simd_primitive!($isa, $elem, neg, vg);
-                    let exp_neg = $crate::simd_primitive!($isa, $elem, exp, neg_g);
+                    let exp_neg = $crate::simd_primitive!($isa, $elem, exp_fast, neg_g);
                     let one = $crate::simd_primitive!($isa, $elem, splat, <$elem as Element>::ONE);
                     let denom = $crate::simd_primitive!($isa, $elem, add, one, exp_neg);
                     let sigmoid = $crate::simd_primitive!($isa, $elem, recip, denom);
@@ -2028,6 +2029,66 @@ macro_rules! define_matmul_op {
                         sum = <$elem as Element>::mul_add(sum, a[m * k_size + k], packed_b[k * n_size + n]);
                     }
                     c[m * n_size + n] = sum + bias[n];
+                }
+            }
+        }
+    };
+}
+
+/// Routes `define_gemv_streaming!` to the correct ISA-specific parameters.
+/// Generates `gemv_streaming(a, b, c, n_size, k_size)` in each ISA module.
+#[macro_export]
+macro_rules! define_gemv_streaming_op {
+    (avx512, $elem:ident) => {
+        $crate::define_gemv_streaming!(avx512, $elem, 16, "avx512f");
+    };
+    (avx2, $elem:ident) => {
+        $crate::define_gemv_streaming!(avx2, $elem, 8, "avx2", "fma");
+    };
+    (neon, $elem:ident) => {
+        $crate::define_gemv_streaming!(neon, $elem, 4, "neon");
+    };
+    ($isa:ident, $elem:ident) => {
+        // Scalar fallback: simple loop, no SIMD streaming
+        #[inline(always)]
+        pub fn gemv_streaming(a: &[$elem], b: &[$elem], c: &mut [$elem],
+                              n_size: usize, k_size: usize) {
+            for n in 0..n_size {
+                let mut sum: $elem = <$elem as Element>::ZERO;
+                for k in 0..k_size {
+                    sum = <$elem as Element>::mul_add(sum, a[k], b[k * n_size + n]);
+                }
+                c[n] = sum;
+            }
+        }
+    };
+}
+
+/// Routes `define_gemm_skinny!` to the correct ISA-specific parameters.
+/// Generates `gemm_skinny(a, b, c, m, n, k)` in each ISA module.
+#[macro_export]
+macro_rules! define_gemm_skinny_op {
+    (avx512, $elem:ident) => {
+        $crate::define_gemm_skinny!(avx512, $elem, 16, "avx512f");
+    };
+    (avx2, $elem:ident) => {
+        $crate::define_gemm_skinny!(avx2, $elem, 8, "avx2", "fma");
+    };
+    (neon, $elem:ident) => {
+        $crate::define_gemm_skinny!(neon, $elem, 4, "neon");
+    };
+    ($isa:ident, $elem:ident) => {
+        // Scalar fallback
+        #[inline(always)]
+        pub fn gemm_skinny(a: &[$elem], b: &[$elem], c: &mut [$elem],
+                           m: usize, n: usize, k: usize) {
+            for i in 0..m {
+                for j in 0..n {
+                    let mut sum = <$elem as Element>::ZERO;
+                    for p in 0..k {
+                        sum = <$elem as Element>::mul_add(sum, a[i * k + p], b[p * n + j]);
+                    }
+                    c[i * n + j] = sum;
                 }
             }
         }

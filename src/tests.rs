@@ -1488,6 +1488,142 @@ mod tests {
         assert!((c[0] - 7.0).abs() < 1e-5);
     }
 
+    /// Streaming GEMV (M=1) with dimensions that exercise SIMD lanes + scalar tail.
+    #[test]
+    fn test_gemv_streaming_m1_large() {
+        let kernels = CpuKernels::<f32>::new();
+        // N=67 (not a multiple of any SIMD width), K=131
+        let (m, n, k) = (1, 67, 131);
+        let a: Vec<f32> = (0..k).map(|i| (i as f32) * 0.01 + 0.1).collect();
+        let b: Vec<f32> = (0..k * n).map(|i| ((i % 97) as f32) * 0.02 - 0.5).collect();
+
+        // f64 reference
+        let mut c_ref = vec![0.0f64; n];
+        for j in 0..n {
+            for l in 0..k {
+                c_ref[j] += a[l] as f64 * b[l * n + j] as f64;
+            }
+        }
+
+        let mut c = vec![0.0f32; n];
+        kernels.gemm(&a, &b, &mut c, m, n, k);
+        for idx in 0..n {
+            let tol = c_ref[idx].abs() * 1e-4 + 1e-3;
+            assert!((c[idx] as f64 - c_ref[idx]).abs() < tol,
+                "gemv_streaming M=1: c[{}]={}, ref={}", idx, c[idx], c_ref[idx]);
+        }
+    }
+
+    /// Streaming GEMV (M=1) with large N that spans multiple 4×LANES strips.
+    #[test]
+    fn test_gemv_streaming_m1_wide() {
+        let kernels = CpuKernels::<f32>::new();
+        let (m, n, k) = (1, 512, 256);
+        let a: Vec<f32> = (0..k).map(|i| ((i % 17) as f32) * 0.1).collect();
+        let b: Vec<f32> = (0..k * n).map(|i| ((i % 53) as f32) * 0.01 - 0.25).collect();
+
+        let mut c_ref = vec![0.0f64; n];
+        for j in 0..n {
+            for l in 0..k {
+                c_ref[j] += a[l] as f64 * b[l * n + j] as f64;
+            }
+        }
+
+        let mut c = vec![0.0f32; n];
+        kernels.gemm(&a, &b, &mut c, m, n, k);
+        for idx in 0..n {
+            let tol = c_ref[idx].abs() * 1e-4 + 1e-3;
+            assert!((c[idx] as f64 - c_ref[idx]).abs() < tol,
+                "gemv_streaming M=1 wide: c[{}]={}, ref={}", idx, c[idx], c_ref[idx]);
+        }
+    }
+
+    /// Skinny GEMM (M=2..32) — exercises all M-tile paths (m8, m4, m2, m1 remainder).
+    #[test]
+    fn test_gemm_skinny_m2_to_m32() {
+        let kernels = CpuKernels::<f32>::new();
+        // Test M values that exercise each code path:
+        // 2 (m2), 4 (m4), 7 (m4+m2+m1), 8 (m8), 15 (m8+m4+m2+m1),
+        // 16 (2×m8), 31 (3×m8+m4+m2+m1), 32 (4×m8)
+        for &m in &[2, 4, 7, 8, 15, 16, 31, 32] {
+            let (n, k) = (67, 131); // non-aligned dims
+            let a: Vec<f32> = (0..m * k).map(|i| ((i % 97) as f32) * 0.01 - 0.5).collect();
+            let b: Vec<f32> = (0..k * n).map(|i| ((i % 53) as f32) * 0.02 - 0.5).collect();
+
+            // f64 reference
+            let mut c_ref = vec![0.0f64; m * n];
+            for i in 0..m {
+                for j in 0..n {
+                    for l in 0..k {
+                        c_ref[i * n + j] += a[i * k + l] as f64 * b[l * n + j] as f64;
+                    }
+                }
+            }
+
+            let mut c = vec![0.0f32; m * n];
+            kernels.gemm(&a, &b, &mut c, m, n, k);
+            for idx in 0..m * n {
+                let tol = c_ref[idx].abs() * 1e-4 + 1e-3;
+                assert!((c[idx] as f64 - c_ref[idx]).abs() < tol,
+                    "skinny GEMM M={}: c[{}]={}, ref={}", m, idx, c[idx], c_ref[idx]);
+            }
+        }
+    }
+
+    /// Skinny GEMM with large N (512) to exercise wide N-tiling.
+    #[test]
+    fn test_gemm_skinny_wide_n() {
+        let kernels = CpuKernels::<f32>::new();
+        let (m, n, k) = (8, 512, 256);
+        let a: Vec<f32> = (0..m * k).map(|i| ((i % 37) as f32) * 0.1 - 1.0).collect();
+        let b: Vec<f32> = (0..k * n).map(|i| ((i % 71) as f32) * 0.01 - 0.3).collect();
+
+        let mut c_ref = vec![0.0f64; m * n];
+        for i in 0..m {
+            for j in 0..n {
+                for l in 0..k {
+                    c_ref[i * n + j] += a[i * k + l] as f64 * b[l * n + j] as f64;
+                }
+            }
+        }
+
+        let mut c = vec![0.0f32; m * n];
+        kernels.gemm(&a, &b, &mut c, m, n, k);
+        for idx in 0..m * n {
+            let tol = c_ref[idx].abs() * 1e-4 + 1e-3;
+            assert!((c[idx] as f64 - c_ref[idx]).abs() < tol,
+                "skinny GEMM 8x512x256: c[{}]={}, ref={}", idx, c[idx], c_ref[idx]);
+        }
+    }
+
+    /// Skinny GEMM with small K (1..4) — edge case for K-unroll remainder.
+    #[test]
+    fn test_gemm_skinny_small_k() {
+        let kernels = CpuKernels::<f32>::new();
+        for &k in &[1, 2, 3] {
+            let (m, n) = (5, 16);
+            let a: Vec<f32> = (0..m * k).map(|i| (i as f32) * 0.5 + 0.1).collect();
+            let b: Vec<f32> = (0..k * n).map(|i| (i as f32) * 0.3 - 0.2).collect();
+
+            let mut c_ref = vec![0.0f64; m * n];
+            for i in 0..m {
+                for j in 0..n {
+                    for l in 0..k {
+                        c_ref[i * n + j] += a[i * k + l] as f64 * b[l * n + j] as f64;
+                    }
+                }
+            }
+
+            let mut c = vec![0.0f32; m * n];
+            kernels.gemm(&a, &b, &mut c, m, n, k);
+            for idx in 0..m * n {
+                let tol = c_ref[idx].abs() * 1e-4 + 1e-3;
+                assert!((c[idx] as f64 - c_ref[idx]).abs() < tol,
+                    "skinny GEMM M=5 K={}: c[{}]={}, ref={}", k, idx, c[idx], c_ref[idx]);
+            }
+        }
+    }
+
     #[test]
     fn test_softmax_length_1() {
         let kernels = CpuKernels::<f32>::new();

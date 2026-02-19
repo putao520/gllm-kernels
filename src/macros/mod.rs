@@ -32,3 +32,7 @@ pub mod quant_primitive;
 pub mod matmul_x86_amx;
 #[macro_use]
 pub mod matmul_x86_amx_int8;
+#[macro_use]
+pub mod gemv_streaming;
+#[macro_use]
+pub mod gemm_skinny;

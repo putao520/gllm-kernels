@@ -270,6 +270,10 @@ pub trait Kernels<E: Element>: Send + Sync {
         // Default: fall back to regular softmax
         self.softmax(_x, _out);
     }
+    fn softmax_3pass(&self, _x: &[E], _out: &mut [E]) {
+        // Default: fall back to regular softmax
+        self.softmax(_x, _out);
+    }
     fn exp(&self, _x: &[E], _out: &mut [E]) { unimplemented!("exp") }
 
     // ======================================================================

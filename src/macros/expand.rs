@@ -21,6 +21,8 @@ macro_rules! expand_isa_impls {
             crate::define_position_ops!($isa, $elem);
             crate::define_gemv_op!($isa, $elem);
             crate::define_matmul_op!($isa, $elem);
+            crate::define_gemv_streaming_op!($isa, $elem);
+            crate::define_gemm_skinny_op!($isa, $elem);
 
         }
     };

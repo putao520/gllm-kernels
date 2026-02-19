@@ -666,6 +666,70 @@ macro_rules! dispatch_with_dims {
     };
 }
 
+/// Dispatch streaming GEMV (M=1): gemv_streaming(a, b, c, n_size, k_size)
+macro_rules! dispatch_gemv_streaming {
+    ($a:expr, $b:expr, $c:expr, $n:expr, $k:expr) => {
+        match (get_isa_level(), E::ELEM_ID) {
+            #[cfg(target_arch = "x86_64")]
+            (IsaLevel::Avx512Fp16, 1) => avx512::avx512fp16_f16::gemv_streaming(as_typed_slice!($a, half::f16), as_typed_slice!($b, half::f16), as_typed_slice_mut!($c, half::f16), $n, $k),
+            #[cfg(target_arch = "x86_64")]
+            (IsaLevel::Avx512 | IsaLevel::Avx512Fp16, 0) => avx512::avx512_f32::gemv_streaming(as_typed_slice!($a, f32), as_typed_slice!($b, f32), as_typed_slice_mut!($c, f32), $n, $k),
+            #[cfg(target_arch = "x86_64")]
+            (IsaLevel::Avx512, 1) => avx512::avx512_f16::gemv_streaming(as_typed_slice!($a, half::f16), as_typed_slice!($b, half::f16), as_typed_slice_mut!($c, half::f16), $n, $k),
+            #[cfg(target_arch = "x86_64")]
+            (IsaLevel::Avx512 | IsaLevel::Avx512Fp16, 2) => avx512::avx512_bf16::gemv_streaming(as_typed_slice!($a, half::bf16), as_typed_slice!($b, half::bf16), as_typed_slice_mut!($c, half::bf16), $n, $k),
+            #[cfg(target_arch = "x86_64")]
+            (IsaLevel::Avx2, 0) => avx2::avx2_f32::gemv_streaming(as_typed_slice!($a, f32), as_typed_slice!($b, f32), as_typed_slice_mut!($c, f32), $n, $k),
+            #[cfg(target_arch = "x86_64")]
+            (IsaLevel::Avx2, 1) => avx2::avx2_f16::gemv_streaming(as_typed_slice!($a, half::f16), as_typed_slice!($b, half::f16), as_typed_slice_mut!($c, half::f16), $n, $k),
+            #[cfg(target_arch = "x86_64")]
+            (IsaLevel::Avx2, 2) => avx2::avx2_bf16::gemv_streaming(as_typed_slice!($a, half::bf16), as_typed_slice!($b, half::bf16), as_typed_slice_mut!($c, half::bf16), $n, $k),
+            #[cfg(target_arch = "aarch64")]
+            (IsaLevel::Neon, 0) => neon::neon_f32::gemv_streaming(as_typed_slice!($a, f32), as_typed_slice!($b, f32), as_typed_slice_mut!($c, f32), $n, $k),
+            #[cfg(target_arch = "aarch64")]
+            (IsaLevel::Neon, 1) => neon::neon_f16::gemv_streaming(as_typed_slice!($a, half::f16), as_typed_slice!($b, half::f16), as_typed_slice_mut!($c, half::f16), $n, $k),
+            #[cfg(target_arch = "aarch64")]
+            (IsaLevel::Neon, 2) => neon::neon_bf16::gemv_streaming(as_typed_slice!($a, half::bf16), as_typed_slice!($b, half::bf16), as_typed_slice_mut!($c, half::bf16), $n, $k),
+            (_, 0) => scalar::scalar_f32::gemv_streaming(as_typed_slice!($a, f32), as_typed_slice!($b, f32), as_typed_slice_mut!($c, f32), $n, $k),
+            (_, 1) => scalar::scalar_f16::gemv_streaming(as_typed_slice!($a, half::f16), as_typed_slice!($b, half::f16), as_typed_slice_mut!($c, half::f16), $n, $k),
+            (_, 2) => scalar::scalar_bf16::gemv_streaming(as_typed_slice!($a, half::bf16), as_typed_slice!($b, half::bf16), as_typed_slice_mut!($c, half::bf16), $n, $k),
+            _ => unreachable!(),
+        }
+    };
+}
+
+// Dispatch skinny GEMM (M=2..32): gemm_skinny(a, b, c, m, n, k)
+macro_rules! dispatch_gemm_skinny {
+    ($a:expr, $b:expr, $c:expr, $m:expr, $n:expr, $k:expr) => {
+        match (get_isa_level(), E::ELEM_ID) {
+            #[cfg(target_arch = "x86_64")]
+            (IsaLevel::Avx512Fp16, 1) => avx512::avx512fp16_f16::gemm_skinny(as_typed_slice!($a, half::f16), as_typed_slice!($b, half::f16), as_typed_slice_mut!($c, half::f16), $m, $n, $k),
+            #[cfg(target_arch = "x86_64")]
+            (IsaLevel::Avx512 | IsaLevel::Avx512Fp16, 0) => avx512::avx512_f32::gemm_skinny(as_typed_slice!($a, f32), as_typed_slice!($b, f32), as_typed_slice_mut!($c, f32), $m, $n, $k),
+            #[cfg(target_arch = "x86_64")]
+            (IsaLevel::Avx512, 1) => avx512::avx512_f16::gemm_skinny(as_typed_slice!($a, half::f16), as_typed_slice!($b, half::f16), as_typed_slice_mut!($c, half::f16), $m, $n, $k),
+            #[cfg(target_arch = "x86_64")]
+            (IsaLevel::Avx512 | IsaLevel::Avx512Fp16, 2) => avx512::avx512_bf16::gemm_skinny(as_typed_slice!($a, half::bf16), as_typed_slice!($b, half::bf16), as_typed_slice_mut!($c, half::bf16), $m, $n, $k),
+            #[cfg(target_arch = "x86_64")]
+            (IsaLevel::Avx2, 0) => avx2::avx2_f32::gemm_skinny(as_typed_slice!($a, f32), as_typed_slice!($b, f32), as_typed_slice_mut!($c, f32), $m, $n, $k),
+            #[cfg(target_arch = "x86_64")]
+            (IsaLevel::Avx2, 1) => avx2::avx2_f16::gemm_skinny(as_typed_slice!($a, half::f16), as_typed_slice!($b, half::f16), as_typed_slice_mut!($c, half::f16), $m, $n, $k),
+            #[cfg(target_arch = "x86_64")]
+            (IsaLevel::Avx2, 2) => avx2::avx2_bf16::gemm_skinny(as_typed_slice!($a, half::bf16), as_typed_slice!($b, half::bf16), as_typed_slice_mut!($c, half::bf16), $m, $n, $k),
+            #[cfg(target_arch = "aarch64")]
+            (IsaLevel::Neon, 0) => neon::neon_f32::gemm_skinny(as_typed_slice!($a, f32), as_typed_slice!($b, f32), as_typed_slice_mut!($c, f32), $m, $n, $k),
+            #[cfg(target_arch = "aarch64")]
+            (IsaLevel::Neon, 1) => neon::neon_f16::gemm_skinny(as_typed_slice!($a, half::f16), as_typed_slice!($b, half::f16), as_typed_slice_mut!($c, half::f16), $m, $n, $k),
+            #[cfg(target_arch = "aarch64")]
+            (IsaLevel::Neon, 2) => neon::neon_bf16::gemm_skinny(as_typed_slice!($a, half::bf16), as_typed_slice!($b, half::bf16), as_typed_slice_mut!($c, half::bf16), $m, $n, $k),
+            (_, 0) => scalar::scalar_f32::gemm_skinny(as_typed_slice!($a, f32), as_typed_slice!($b, f32), as_typed_slice_mut!($c, f32), $m, $n, $k),
+            (_, 1) => scalar::scalar_f16::gemm_skinny(as_typed_slice!($a, half::f16), as_typed_slice!($b, half::f16), as_typed_slice_mut!($c, half::f16), $m, $n, $k),
+            (_, 2) => scalar::scalar_bf16::gemm_skinny(as_typed_slice!($a, half::bf16), as_typed_slice!($b, half::bf16), as_typed_slice_mut!($c, half::bf16), $m, $n, $k),
+            _ => unreachable!(),
+        }
+    };
+}
+
 /// Dispatch for rope: 1 mut slice + 2 read slices + usize
 macro_rules! dispatch_rope {
     ($op:ident, $qk:expr, $cos:expr, $sin:expr, $hd:expr) => {
@@ -949,6 +1013,16 @@ impl<E: Element> Kernels<E> for CpuKernels<E> {
     }
 
     fn gemm(&self, a: &[E], b: &[E], c: &mut [E], m: usize, n: usize, k: usize) {
+        // M=1: streaming GEMV — zero-packing, bandwidth-optimal for LLM decode
+        if m == 1 {
+            dispatch_gemv_streaming!(a, b, c, n, k);
+            return;
+        }
+        // M=2..32: pack-free skinny GEMM — no packing overhead, register-tiled
+        if m <= 32 {
+            dispatch_gemm_skinny!(a, b, c, m, n, k);
+            return;
+        }
         // NEON f32: route to hand-written asm microkernel for peak performance
         #[cfg(target_arch = "aarch64")]
         if E::ELEM_ID == 0 {
@@ -992,6 +1066,7 @@ impl<E: Element> Kernels<E> for CpuKernels<E> {
     fn exp(&self, x: &[E], out: &mut [E]) { dispatch_unary_op!(x, out, exp); }
     fn softmax(&self, x: &[E], out: &mut [E]) { dispatch_unary_op!(x, out, softmax); }
     fn softmax_online(&self, x: &[E], out: &mut [E]) { dispatch_unary_op!(x, out, softmax_online); }
+    fn softmax_3pass(&self, x: &[E], out: &mut [E]) { dispatch_unary_op!(x, out, softmax); }
 
     fn swiglu(&self, gate: &[E], up: &[E], out: &mut [E]) {
         dispatch_binary_op!(gate, up, out, swiglu);

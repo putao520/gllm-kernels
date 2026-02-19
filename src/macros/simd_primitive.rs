@@ -44,6 +44,7 @@ macro_rules! simd_primitive {
     (scalar, f32, reduce_max, $v:expr) => { $v };
     (scalar, f32, abs, $a:expr) => { $a.abs() };
     (scalar, f32, exp, $a:expr) => { $a.exp() };
+    (scalar, f32, exp_fast, $a:expr) => { $a.exp() }; // scalar fallback: same as full exp
     (scalar, f32, recip, $a:expr) => { 1.0 / $a };
     (scalar, f32, sqrt, $a:expr) => { $a.sqrt() };
     (scalar, f32, rsqrt, $a:expr) => { 1.0 / $a.sqrt() };
@@ -143,6 +144,8 @@ macro_rules! simd_primitive {
     };
     // EXP
     (avx2, f32, exp, $a:expr) => { $crate::cpu_kernels::avx2::math::avx2_exp_f32($a) };
+    // EXP_FAST: degree-3 polynomial, ~12-bit accuracy, 2-3x faster
+    (avx2, f32, exp_fast, $a:expr) => { $crate::cpu_kernels::avx2::math::avx2_exp_fast_f32($a) };
 
     // Reduce max: horizontal max
     (avx2, f32, reduce_max, $v:expr) => {
@@ -296,6 +299,9 @@ macro_rules! simd_primitive {
     (avx512, f32, exp, $a:expr) => {
         $crate::cpu_kernels::avx512::math::avx512_exp_f32($a)
     };
+    (avx512, f32, exp_fast, $a:expr) => {
+        $crate::cpu_kernels::avx512::math::avx512_exp_fast_f32($a)
+    };
 
     (avx512, f32, prefetch, $p:expr, $dist:expr) => { std::arch::x86_64::_mm_prefetch($p as *const i8, std::arch::x86_64::_MM_HINT_T0) };
     (avx512, f32, prefetch_t1, $p:expr) => { std::arch::x86_64::_mm_prefetch($p as *const i8, std::arch::x86_64::_MM_HINT_T1) };
@@ -353,6 +359,7 @@ macro_rules! simd_primitive {
     (avx512, f16, rsqrt, $a:expr) => { $crate::simd_primitive!(avx512, f32, rsqrt, $a) };
     (avx512, f16, recip, $a:expr) => { $crate::simd_primitive!(avx512, f32, recip, $a) };
     (avx512, f16, exp, $a:expr) => { $crate::simd_primitive!(avx512, f32, exp, $a) };
+    (avx512, f16, exp_fast, $a:expr) => { $crate::simd_primitive!(avx512, f32, exp_fast, $a) };
     (avx512, f16, prefetch, $p:expr, $dist:expr) => { std::arch::x86_64::_mm_prefetch($p as *const i8, std::arch::x86_64::_MM_HINT_T0) };
     (avx512, f16, prefetch_t1, $p:expr) => { std::arch::x86_64::_mm_prefetch($p as *const i8, std::arch::x86_64::_MM_HINT_T1) };
     (avx512, f16, prefetch_nta, $p:expr) => { std::arch::x86_64::_mm_prefetch($p as *const i8, std::arch::x86_64::_MM_HINT_NTA) };
@@ -444,6 +451,7 @@ macro_rules! simd_primitive {
     (avx512, bf16, rsqrt, $a:expr) => { $crate::simd_primitive!(avx512, f32, rsqrt, $a) };
     (avx512, bf16, recip, $a:expr) => { $crate::simd_primitive!(avx512, f32, recip, $a) };
     (avx512, bf16, exp, $a:expr) => { $crate::simd_primitive!(avx512, f32, exp, $a) };
+    (avx512, bf16, exp_fast, $a:expr) => { $crate::simd_primitive!(avx512, f32, exp_fast, $a) };
     (avx512, bf16, prefetch, $p:expr, $dist:expr) => { std::arch::x86_64::_mm_prefetch($p as *const i8, std::arch::x86_64::_MM_HINT_T0) };
     (avx512, bf16, prefetch_t1, $p:expr) => { std::arch::x86_64::_mm_prefetch($p as *const i8, std::arch::x86_64::_MM_HINT_T1) };
     (avx512, bf16, prefetch_nta, $p:expr) => { std::arch::x86_64::_mm_prefetch($p as *const i8, std::arch::x86_64::_MM_HINT_NTA) };
@@ -593,6 +601,7 @@ macro_rules! simd_primitive {
     
     // EXP
     (neon, f32, exp, $a:expr) => { $crate::cpu_kernels::neon::math::exp_ps($a) };
+    (neon, f32, exp_fast, $a:expr) => { $crate::cpu_kernels::neon::math::exp_ps($a) }; // NEON: same impl (already fast)
 
     (neon, f32, prefetch, $p:expr, $dist:expr) => {
         unsafe { core::arch::asm!("prfm pldl1keep, [{addr}]", addr = in(reg) ($p as *const u8).add($dist), options(nostack, preserves_flags)) }
@@ -659,6 +668,7 @@ macro_rules! simd_primitive {
     (neon, f16, rsqrt, $a:expr) => { $crate::simd_primitive!(neon, f32, rsqrt, $a) };
     (neon, f16, recip, $a:expr) => { $crate::simd_primitive!(neon, f32, recip, $a) };
     (neon, f16, exp, $a:expr) => { $crate::cpu_kernels::neon::math::exp_ps($a) };
+    (neon, f16, exp_fast, $a:expr) => { $crate::cpu_kernels::neon::math::exp_ps($a) };
     (neon, f16, prefetch, $p:expr, $dist:expr) => {
         unsafe { core::arch::asm!("prfm pldl1keep, [{addr}]", addr = in(reg) ($p as *const u8).add($dist), options(nostack, preserves_flags)) }
     };
@@ -731,6 +741,7 @@ macro_rules! simd_primitive {
     (neon, bf16, rsqrt, $a:expr) => { $crate::simd_primitive!(neon, f32, rsqrt, $a) };
     (neon, bf16, recip, $a:expr) => { $crate::simd_primitive!(neon, f32, recip, $a) };
     (neon, bf16, exp, $a:expr) => { $crate::cpu_kernels::neon::math::exp_ps($a) };
+    (neon, bf16, exp_fast, $a:expr) => { $crate::cpu_kernels::neon::math::exp_ps($a) };
     (neon, bf16, prefetch, $p:expr, $dist:expr) => {
         unsafe { core::arch::asm!("prfm pldl1keep, [{addr}]", addr = in(reg) ($p as *const u8).add($dist), options(nostack, preserves_flags)) }
     };
@@ -820,6 +831,7 @@ macro_rules! simd_primitive {
     (scalar, f16, reduce_max, $v:expr) => { $v };
     (scalar, f16, abs, $a:expr) => { $a.abs() };
     (scalar, f16, exp, $a:expr) => { $a.exp() };
+    (scalar, f16, exp_fast, $a:expr) => { $a.exp() };
     (scalar, f16, recip, $a:expr) => { 1.0 / $a };
     (scalar, f16, sqrt, $a:expr) => { $a.sqrt() };
     (scalar, f16, rsqrt, $a:expr) => { 1.0 / $a.sqrt() };
@@ -867,6 +879,7 @@ macro_rules! simd_primitive {
     (avx2, f16, reduce_max, $v:expr) => { $crate::simd_primitive!(avx2, f32, reduce_max, $v) };
     (avx2, f16, abs, $a:expr) => { std::arch::x86_64::_mm256_andnot_ps(std::arch::x86_64::_mm256_set1_ps(-0.0), $a) };
     (avx2, f16, exp, $a:expr) => { $crate::cpu_kernels::avx2::math::avx2_exp_f32($a) };
+    (avx2, f16, exp_fast, $a:expr) => { $crate::cpu_kernels::avx2::math::avx2_exp_fast_f32($a) };
     (avx2, f16, sqrt, $a:expr) => { std::arch::x86_64::_mm256_sqrt_ps($a) };
     (avx2, f16, rsqrt, $a:expr) => { $crate::simd_primitive!(avx2, f32, rsqrt, $a) };
     (avx2, f16, recip, $a:expr) => { $crate::simd_primitive!(avx2, f32, recip, $a) };
@@ -943,6 +956,7 @@ macro_rules! simd_primitive {
     (scalar, bf16, reduce_max, $v:expr) => { $v };
     (scalar, bf16, abs, $a:expr) => { $a.abs() };
     (scalar, bf16, exp, $a:expr) => { $a.exp() };
+    (scalar, bf16, exp_fast, $a:expr) => { $a.exp() };
     (scalar, bf16, recip, $a:expr) => { 1.0 / $a };
     (scalar, bf16, sqrt, $a:expr) => { $a.sqrt() };
     (scalar, bf16, rsqrt, $a:expr) => { 1.0 / $a.sqrt() };
@@ -997,6 +1011,7 @@ macro_rules! simd_primitive {
     (avx2, bf16, reduce_max, $v:expr) => { $crate::simd_primitive!(avx2, f32, reduce_max, $v) };
     (avx2, bf16, abs, $a:expr) => { std::arch::x86_64::_mm256_andnot_ps(std::arch::x86_64::_mm256_set1_ps(-0.0), $a) };
     (avx2, bf16, exp, $a:expr) => { $crate::cpu_kernels::avx2::math::avx2_exp_f32($a) };
+    (avx2, bf16, exp_fast, $a:expr) => { $crate::cpu_kernels::avx2::math::avx2_exp_fast_f32($a) };
     (avx2, bf16, sqrt, $a:expr) => { std::arch::x86_64::_mm256_sqrt_ps($a) };
     (avx2, bf16, rsqrt, $a:expr) => { $crate::simd_primitive!(avx2, f32, rsqrt, $a) };
     (avx2, bf16, recip, $a:expr) => { $crate::simd_primitive!(avx2, f32, recip, $a) };
@@ -1160,6 +1175,31 @@ macro_rules! simd_primitive {
             let lo_ph: __m256h = _mm512_cvtxps_ph(exp_lo);
             let hi_ph: __m256h = _mm512_cvtxps_ph(exp_hi);
             // Combine two __m256h into __m512h
+            let lo_512h: __m512h = _mm512_castph256_ph512(lo_ph);
+            let hi_as_ps: __m256 = std::mem::transmute::<__m256h, __m256>(hi_ph);
+            let lo_as_ps: __m512 = _mm512_castph_ps(lo_512h);
+            let combined_ps: __m512 = _mm512_insertf32x8(lo_as_ps, hi_as_ps, 1);
+            _mm512_castps_ph(combined_ps)
+        }
+    };
+    // exp_fast: same split strategy but using fast exp in f32
+    (avx512fp16, f16, exp_fast, $a:expr) => {
+        {
+            use std::arch::x86_64::*;
+            let lo_256h: __m256h = _mm512_castph512_ph256($a);
+            let hi_256h: __m256h = {
+                let as_ps: __m512 = _mm512_castph_ps($a);
+                let hi_ps: __m256 = _mm256_castpd_ps(_mm512_extractf64x4_pd(
+                    _mm512_castps_pd(as_ps), 1
+                ));
+                std::mem::transmute::<__m256, __m256h>(hi_ps)
+            };
+            let lo_f32: __m512 = _mm512_cvtxph_ps(lo_256h);
+            let hi_f32: __m512 = _mm512_cvtxph_ps(hi_256h);
+            let exp_lo = $crate::cpu_kernels::avx512::math::avx512_exp_fast_f32(lo_f32);
+            let exp_hi = $crate::cpu_kernels::avx512::math::avx512_exp_fast_f32(hi_f32);
+            let lo_ph: __m256h = _mm512_cvtxps_ph(exp_lo);
+            let hi_ph: __m256h = _mm512_cvtxps_ph(exp_hi);
             let lo_512h: __m512h = _mm512_castph256_ph512(lo_ph);
             let hi_as_ps: __m256 = std::mem::transmute::<__m256h, __m256>(hi_ph);
             let lo_as_ps: __m512 = _mm512_castph_ps(lo_512h);
