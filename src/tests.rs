@@ -200,48 +200,6 @@ mod tests {
     }
 
     #[test]
-    fn test_softmax_online() {
-        let kernels = CpuKernels::<f32>::new();
-        let a = vec![1.0, 2.0, 3.0];
-        let mut out = vec![0.0; 3];
-        kernels.softmax_online(&a, &mut out);
-        // Verify sum = 1.0
-        let sum: f32 = out.iter().sum();
-        assert!((sum - 1.0).abs() < 1e-5);
-        // Verify ordering
-        assert!(out[2] > out[1] && out[1] > out[0]);
-    }
-
-    #[test]
-    fn test_softmax_online_matches_softmax() {
-        let kernels = CpuKernels::<f32>::new();
-        // Use a larger input to exercise SIMD paths
-        let a: Vec<f32> = (0..64).map(|i| (i as f32) * 0.1 - 3.0).collect();
-        let mut out_3pass = vec![0.0f32; 64];
-        let mut out_online = vec![0.0f32; 64];
-        kernels.softmax(&a, &mut out_3pass);
-        kernels.softmax_online(&a, &mut out_online);
-        for i in 0..64 {
-            assert!((out_3pass[i] - out_online[i]).abs() < 1e-5,
-                "mismatch at {}: 3pass={} online={}", i, out_3pass[i], out_online[i]);
-        }
-    }
-
-    #[test]
-    fn test_softmax_online_large_values() {
-        let kernels = CpuKernels::<f32>::new();
-        // Test numerical stability with large values
-        let a = vec![1000.0, 1001.0, 1002.0];
-        let mut out = vec![0.0; 3];
-        kernels.softmax_online(&a, &mut out);
-        let sum: f32 = out.iter().sum();
-        assert!((sum - 1.0).abs() < 1e-5);
-        assert!(out[2] > out[1] && out[1] > out[0]);
-        // Should not produce NaN or Inf
-        assert!(out.iter().all(|x| x.is_finite()));
-    }
-
-    #[test]
     fn test_swiglu() {
         let kernels = CpuKernels::<f32>::new();
         let gate = vec![1.0, -1.0];
@@ -1772,48 +1730,6 @@ mod tests {
         kernels.layer_norm(&x, &w, &b, &mut out, 1e-5);
         // mean=5, var=0, std=sqrt(eps) -> (5-5)/sqrt(eps) = 0
         assert!(out[0].abs() < 1e-2, "layer_norm len=1: got {}", out[0]);
-    }
-
-    // ========================================================================
-    // Block 25: Online Softmax extended tests
-    // ========================================================================
-
-    #[test]
-    fn test_softmax_online_matches_regular_large() {
-        let kernels = CpuKernels::<f32>::new();
-        let a = pseudo_random_vec(4096, 77);
-        let mut out_regular = vec![0.0f32; 4096];
-        let mut out_online = vec![0.0f32; 4096];
-        kernels.softmax(&a, &mut out_regular);
-        kernels.softmax_online(&a, &mut out_online);
-        for i in 0..4096 {
-            assert!((out_regular[i] - out_online[i]).abs() < 1e-5,
-                "softmax online 4096: [{}] regular={}, online={}", i, out_regular[i], out_online[i]);
-        }
-    }
-
-    #[test]
-    fn test_softmax_online_length_1() {
-        let kernels = CpuKernels::<f32>::new();
-        let a = vec![100.0];
-        let mut out = vec![0.0];
-        kernels.softmax_online(&a, &mut out);
-        assert!((out[0] - 1.0).abs() < 1e-5, "softmax_online([x]) should be [1.0], got {}", out[0]);
-    }
-
-    #[test]
-    fn test_softmax_online_negative_values() {
-        let kernels = CpuKernels::<f32>::new();
-        let a = vec![-100.0, -99.0, -98.0];
-        let mut out_regular = vec![0.0f32; 3];
-        let mut out_online = vec![0.0f32; 3];
-        kernels.softmax(&a, &mut out_regular);
-        kernels.softmax_online(&a, &mut out_online);
-        let sum: f32 = out_online.iter().sum();
-        assert!((sum - 1.0).abs() < 1e-5);
-        for i in 0..3 {
-            assert!((out_regular[i] - out_online[i]).abs() < 1e-5);
-        }
     }
 
     // ========================================================================

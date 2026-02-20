@@ -30,28 +30,26 @@ unsafe fn pack_a_f32(
     let mut p = packed;
     let mut i = 0usize;
 
-    // Full MR-wide panels: swap loop order so A reads are sequential (row-major friendly)
     while i + mr <= mc {
-        for r in 0..mr {
-            let a_row = a.add((i + r) * lda);
-            for k in 0..kc {
-                *p.add(k * mr + r) = *a_row.add(k);
+        for k in 0..kc {
+            for r in 0..mr {
+                *p.add(r) = *a.add((i + r) * lda + k);
             }
+            p = p.add(mr);
         }
-        p = p.add(mr * kc);
         i += mr;
     }
 
-    // Remainder rows (< MR): zero-pad
     if i < mc {
         let rem = mc - i;
-        // Zero the entire remainder panel first
-        std::ptr::write_bytes(p, 0, mr * kc);
-        for r in 0..rem {
-            let a_row = a.add((i + r) * lda);
-            for k in 0..kc {
-                *p.add(k * mr + r) = *a_row.add(k);
+        for k in 0..kc {
+            for r in 0..rem {
+                *p.add(r) = *a.add((i + r) * lda + k);
             }
+            for r in rem..mr {
+                *p.add(r) = 0.0;
+            }
+            p = p.add(mr);
         }
     }
 }
@@ -227,16 +225,15 @@ fn gemm_driver_f32(
                             let pb_tile = pb.as_ptr().add(jr * nr * kc);
 
                             if is_edge_row || is_edge_col {
-                                // Zero c_tmp, then copy valid C values (memcpy per row)
-                                for v in c_tmp[..mr * nr].iter_mut() { *v = 0.0; }
                                 if !first_kc {
                                     for ri in 0..row_rem {
-                                        std::ptr::copy_nonoverlapping(
-                                            c_ptr.add((row_start + ri) * n + col_start),
-                                            c_tmp.as_mut_ptr().add(ri * nr),
-                                            col_rem,
-                                        );
+                                        for ci in 0..col_rem {
+                                            c_tmp[ri * nr + ci] =
+                                                *c_ptr.add((row_start + ri) * n + col_start + ci);
+                                        }
                                     }
+                                } else {
+                                    for v in c_tmp[..mr * nr].iter_mut() { *v = 0.0; }
                                 }
 
                                 microkernel(
@@ -244,13 +241,11 @@ fn gemm_driver_f32(
                                     kc, nr, !first_kc,
                                 );
 
-                                // Copy-out: memcpy valid columns per row
                                 for ri in 0..row_rem {
-                                    std::ptr::copy_nonoverlapping(
-                                        c_tmp.as_ptr().add(ri * nr),
-                                        c_ptr.add((row_start + ri) * n + col_start),
-                                        col_rem,
-                                    );
+                                    for ci in 0..col_rem {
+                                        *c_ptr.add((row_start + ri) * n + col_start + ci) =
+                                            c_tmp[ri * nr + ci];
+                                    }
                                 }
                             } else {
                                 let c_tile = c_ptr.add(row_start * n + col_start);
@@ -420,16 +415,15 @@ fn gemm_driver_f32_mt(
                             let pb_tile = pb_ptr.add(jr * nr * kc);
 
                             if is_edge_row || is_edge_col {
-                                // Zero c_tmp, then copy valid C values (memcpy per row)
-                                for v in c_tmp[..mr * nr].iter_mut() { *v = 0.0; }
                                 if !first_kc {
                                     for ri in 0..row_rem {
-                                        std::ptr::copy_nonoverlapping(
-                                            c_ptr.add((row_start + ri) * n + col_start),
-                                            c_tmp.as_mut_ptr().add(ri * nr),
-                                            col_rem,
-                                        );
+                                        for ci in 0..col_rem {
+                                            c_tmp[ri * nr + ci] =
+                                                *c_ptr.add((row_start + ri) * n + col_start + ci);
+                                        }
                                     }
+                                } else {
+                                    for v in c_tmp[..mr * nr].iter_mut() { *v = 0.0; }
                                 }
 
                                 microkernel(
@@ -437,13 +431,11 @@ fn gemm_driver_f32_mt(
                                     kc, nr, !first_kc,
                                 );
 
-                                // Copy-out: memcpy valid columns per row
                                 for ri in 0..row_rem {
-                                    std::ptr::copy_nonoverlapping(
-                                        c_tmp.as_ptr().add(ri * nr),
-                                        c_ptr.add((row_start + ri) * n + col_start),
-                                        col_rem,
-                                    );
+                                    for ci in 0..col_rem {
+                                        *c_ptr.add((row_start + ri) * n + col_start + ci) =
+                                            c_tmp[ri * nr + ci];
+                                    }
                                 }
                             } else {
                                 let c_tile = c_ptr.add(row_start * n + col_start);
@@ -552,217 +544,6 @@ pub fn gemm_bias_asm_f32_avx512(
     gemm_driver_f32_mt(a, b, c, m, n, k, MR, NR, |pa, pb, cp, kc, ldc, acc| unsafe {
         gemm_kernel_14x32_f32(pa, pb, cp, kc, ldc, acc);
     }, bias.as_ptr());
-}
-
-// ============================================================================
-// Pre-packed B: pack_b + GEMM driver
-// ============================================================================
-
-/// Pack B (K x N, row-major) into NR-wide strip format for the ASM microkernel.
-/// Returns a Vec of size ceil(N/NR) * K * NR.
-#[cfg(target_arch = "x86_64")]
-fn pack_b_full_f32(b: &[f32], n: usize, k: usize, nr: usize) -> Vec<f32> {
-    let n_strips = (n + nr - 1) / nr;
-    let packed_size = n_strips * k * nr;
-    let mut packed = vec![0.0f32; packed_size];
-    unsafe {
-        pack_b_f32(b.as_ptr(), n, packed.as_mut_ptr(), k, n, nr);
-    }
-    packed
-}
-
-/// Pack B for AVX2 microkernel (NR=16).
-#[cfg(target_arch = "x86_64")]
-pub fn pack_b_asm_f32_avx2(b: &[f32], n: usize, k: usize) -> Vec<f32> {
-    pack_b_full_f32(b, n, k, super::gemm_avx2::NR)
-}
-
-/// Pack B for AVX-512 microkernel (NR=32).
-#[cfg(target_arch = "x86_64")]
-pub fn pack_b_asm_f32_avx512(b: &[f32], n: usize, k: usize) -> Vec<f32> {
-    pack_b_full_f32(b, n, k, super::gemm_avx512::NR)
-}
-
-/// BLIS-style GEMM driver for pre-packed B.
-/// packed_b must be in NR-wide strip format (from pack_b_asm_f32_*).
-/// Layout: ceil(N/NR) strips, each strip has K*NR elements.
-/// Strip s, k-row p: packed_b[s * K * NR + p * NR .. + NR].
-#[cfg(target_arch = "x86_64")]
-fn gemm_prepacked_driver_f32(
-    a: &[f32],
-    packed_b: &[f32],
-    c: &mut [f32],
-    m: usize,
-    n: usize,
-    k: usize,
-    mr: usize,
-    nr: usize,
-    microkernel: fn(*const f32, *const f32, *mut f32, usize, usize, bool),
-    bias: *const f32,
-) {
-    assert!(a.len() >= m * k);
-    assert!(c.len() >= m * n);
-
-    if m == 0 || n == 0 || k == 0 {
-        return;
-    }
-
-    let cfg = crate::microarch::kernel_config();
-    let kc_max = cfg.kc;
-    let mc_max = cfg.mc;
-    let nc_max = cfg.nc;
-
-    thread_local! {
-        static PACK_A_PP: std::cell::Cell<AlignedVec<f32>> = std::cell::Cell::new(AlignedVec::new());
-    }
-
-    let pack_a_size = mc_max * kc_max;
-    let mut pa = PACK_A_PP.with(|c| c.take());
-    if pa.capacity() < pack_a_size { pa.reserve(pack_a_size); }
-    unsafe { pa.set_len(pack_a_size); }
-
-    let a_ptr = a.as_ptr();
-    let c_ptr = c.as_mut_ptr();
-    let pb_ptr = packed_b.as_ptr();
-
-    // NC loop
-    let mut jc = 0usize;
-    while jc < n {
-        let nc = nc_max.min(n - jc);
-
-        // KC loop
-        let mut pc = 0usize;
-        while pc < k {
-            let kc = kc_max.min(k - pc);
-            let first_kc = pc == 0;
-            let last_kc = pc + kc_max >= k;
-
-            // MC loop
-            let mut ic = 0usize;
-            while ic < m {
-                let mc = mc_max.min(m - ic);
-
-                unsafe {
-                    pack_a_f32(a_ptr.add(ic * k + pc), k, pa.as_mut_ptr(), mc, kc, mr);
-                }
-
-                let n_mr = (mc + mr - 1) / mr;
-                let n_nr = (nc + nr - 1) / nr;
-                let mut c_tmp = [0.0f32; 14 * 32]; // max MR * NR
-
-                for jr in 0..n_nr {
-                    let col_start = jc + jr * nr;
-                    let col_rem = n.saturating_sub(col_start).min(nr);
-                    let is_edge_col = col_rem < nr;
-
-                    // Index into pre-packed B: global strip (jc/nr + jr), k-offset pc
-                    let global_strip = jc / nr + jr;
-                    let pb_tile = unsafe { pb_ptr.add(global_strip * k * nr + pc * nr) };
-
-                    for ir in 0..n_mr {
-                        let row_start = ic + ir * mr;
-                        let row_rem = m.saturating_sub(row_start).min(mr);
-                        let is_edge_row = row_rem < mr;
-
-                        unsafe {
-                            let pa_tile = pa.as_ptr().add(ir * mr * kc);
-
-                            if is_edge_row || is_edge_col {
-                                for v in c_tmp[..mr * nr].iter_mut() { *v = 0.0; }
-                                if !first_kc {
-                                    for ri in 0..row_rem {
-                                        std::ptr::copy_nonoverlapping(
-                                            c_ptr.add((row_start + ri) * n + col_start),
-                                            c_tmp.as_mut_ptr().add(ri * nr),
-                                            col_rem,
-                                        );
-                                    }
-                                }
-
-                                microkernel(pa_tile, pb_tile, c_tmp.as_mut_ptr(), kc, nr, !first_kc);
-
-                                for ri in 0..row_rem {
-                                    std::ptr::copy_nonoverlapping(
-                                        c_tmp.as_ptr().add(ri * nr),
-                                        c_ptr.add((row_start + ri) * n + col_start),
-                                        col_rem,
-                                    );
-                                }
-                            } else {
-                                let c_tile = c_ptr.add(row_start * n + col_start);
-                                microkernel(pa_tile, pb_tile, c_tile, kc, n, !first_kc);
-                            }
-                        }
-                    }
-                }
-
-                // Fused bias while C block is L1-hot
-                if last_kc && !bias.is_null() {
-                    let mc_actual = mc_max.min(m - ic);
-                    let nc_actual = nc_max.min(n - jc);
-                    unsafe {
-                        add_bias_block_f32(c_ptr, n, ic, jc, mc_actual, nc_actual, bias);
-                    }
-                }
-
-                ic += mc_max;
-            }
-
-            pc += kc_max;
-        }
-
-        jc += nc_max;
-    }
-
-    PACK_A_PP.with(|c| c.set(pa));
-}
-
-/// GEMM with pre-packed B, AVX2.
-#[cfg(target_arch = "x86_64")]
-pub fn gemm_prepacked_asm_f32_avx2(
-    a: &[f32], packed_b: &[f32], c: &mut [f32],
-    m: usize, n: usize, k: usize,
-) {
-    use super::gemm_avx2::{MR, NR, gemm_kernel_6x16_f32};
-    gemm_prepacked_driver_f32(a, packed_b, c, m, n, k, MR, NR,
-        |pa, pb, cp, kc, ldc, acc| unsafe { gemm_kernel_6x16_f32(pa, pb, cp, kc, ldc, acc); },
-        std::ptr::null());
-}
-
-/// GEMM with pre-packed B, AVX-512.
-#[cfg(target_arch = "x86_64")]
-pub fn gemm_prepacked_asm_f32_avx512(
-    a: &[f32], packed_b: &[f32], c: &mut [f32],
-    m: usize, n: usize, k: usize,
-) {
-    use super::gemm_avx512::{MR, NR, gemm_kernel_14x32_f32};
-    gemm_prepacked_driver_f32(a, packed_b, c, m, n, k, MR, NR,
-        |pa, pb, cp, kc, ldc, acc| unsafe { gemm_kernel_14x32_f32(pa, pb, cp, kc, ldc, acc); },
-        std::ptr::null());
-}
-
-/// GEMM with pre-packed B + fused bias, AVX2.
-#[cfg(target_arch = "x86_64")]
-pub fn gemm_bias_prepacked_asm_f32_avx2(
-    a: &[f32], packed_b: &[f32], bias: &[f32], c: &mut [f32],
-    m: usize, n: usize, k: usize,
-) {
-    use super::gemm_avx2::{MR, NR, gemm_kernel_6x16_f32};
-    gemm_prepacked_driver_f32(a, packed_b, c, m, n, k, MR, NR,
-        |pa, pb, cp, kc, ldc, acc| unsafe { gemm_kernel_6x16_f32(pa, pb, cp, kc, ldc, acc); },
-        bias.as_ptr());
-}
-
-/// GEMM with pre-packed B + fused bias, AVX-512.
-#[cfg(target_arch = "x86_64")]
-pub fn gemm_bias_prepacked_asm_f32_avx512(
-    a: &[f32], packed_b: &[f32], bias: &[f32], c: &mut [f32],
-    m: usize, n: usize, k: usize,
-) {
-    use super::gemm_avx512::{MR, NR, gemm_kernel_14x32_f32};
-    gemm_prepacked_driver_f32(a, packed_b, c, m, n, k, MR, NR,
-        |pa, pb, cp, kc, ldc, acc| unsafe { gemm_kernel_14x32_f32(pa, pb, cp, kc, ldc, acc); },
-        bias.as_ptr());
 }
 
 #[cfg(test)]

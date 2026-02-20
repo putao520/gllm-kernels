@@ -374,13 +374,12 @@ impl KernelConfig {
         let mc = (mc_raw / mr * mr).clamp(mr, 960);
 
         // NC: B panel shared across cores in L3
-        // B panel is read-only and shared, so it benefits from L3's inclusive nature.
         // Each core's effective L3 share: L3 / num_physical_cores
-        // NC × KC × elem ≤ effective_L3 × 0.75 (B is shared, can use more)
+        // NC × KC × elem ≤ effective_L3 / 2
         let nthreads = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1);
         let num_cores = (nthreads / 2).max(1); // approximate physical cores (no HT)
         let effective_l3 = l3 / num_cores;
-        let nc_raw = (effective_l3 * 3 / 4) / (kc * elem);
+        let nc_raw = (effective_l3 / 2) / (kc * elem);
         let nc = (nc_raw / nr * nr).clamp(nr, 8192);
 
         // ── Prefetch distance calculation ──
@@ -418,7 +417,7 @@ impl KernelConfig {
     /// Compute NUMA-aware NC using a specific node's L3 size.
     pub fn nc_for_node_l3(&self, node_l3: usize) -> usize {
         let elem = 4usize;
-        let nc_raw = (node_l3 * 3 / 4) / (self.kc * elem);
+        let nc_raw = (node_l3 / 2) / (self.kc * elem);
         (nc_raw / self.nr * self.nr).clamp(self.nr, 8192)
     }
 

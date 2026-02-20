@@ -266,14 +266,6 @@ pub trait Kernels<E: Element>: Send + Sync {
     fn tanh(&self, _x: &[E], _out: &mut [E]) { unimplemented!("tanh") }
     fn swiglu(&self, _gate: &[E], _up: &[E], _out: &mut [E]) { unimplemented!("swiglu") }
     fn softmax(&self, _x: &[E], _out: &mut [E]) { unimplemented!("softmax") }
-    fn softmax_online(&self, _x: &[E], _out: &mut [E]) {
-        // Default: fall back to regular softmax
-        self.softmax(_x, _out);
-    }
-    fn softmax_3pass(&self, _x: &[E], _out: &mut [E]) {
-        // Default: fall back to regular softmax
-        self.softmax(_x, _out);
-    }
     fn exp(&self, _x: &[E], _out: &mut [E]) { unimplemented!("exp") }
 
     // ======================================================================

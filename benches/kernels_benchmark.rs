@@ -108,29 +108,6 @@ fn bench_large_gemm(c: &mut Criterion) {
 // ============================================================
 // Softmax: online (2-pass) vs 3-pass comparison
 // ============================================================
-fn bench_softmax_compare(c: &mut Criterion) {
-    let kernels = CpuKernels::<f32>::new();
-    let mut group = c.benchmark_group("softmax_compare");
-
-    // Typical attention softmax sizes:
-    //   seq_len=512, 1024, 2048 (attention scores per head)
-    //   vocab=32000, 128256 (logit softmax)
-    for &n in &[512, 1024, 2048, 4096, 32000, 128256] {
-        let data = rand_vec(n);
-        let mut out = vec![0.0f32; n];
-        group.throughput(Throughput::Bytes((2 * n * 4) as u64));
-
-        group.bench_function(BenchmarkId::new("online_2pass", n), |bench| {
-            bench.iter(|| kernels.softmax_online(black_box(&data), black_box(&mut out)))
-        });
-        group.bench_function(BenchmarkId::new("classic_3pass", n), |bench| {
-            bench.iter(|| kernels.softmax_3pass(black_box(&data), black_box(&mut out)))
-        });
-    }
-    group.finish();
-}
-
-// ============================================================
 // Quantized GEMV: Q4_K and Q8_K at LLM sizes
 // ============================================================
 fn bench_quant_gemv(c: &mut Criterion) {
@@ -347,7 +324,6 @@ criterion_group!(
         bench_gemv,
         bench_skinny_gemm,
         bench_large_gemm,
-        bench_softmax_compare,
         bench_quant_gemv,
         bench_swiglu,
         bench_activations,

@@ -27,64 +27,57 @@ macro_rules! quant_primitive_kquant {
              #[cfg(target_arch = "x86_64")]
              {
                 use std::arch::x86_64::*;
-
+                
                 let block = &*$block_ptr;
-                let d: f32 = block.d.to_f32();
-
-                // vpshufb LUT: map each nibble [0..15] to signed byte (nib - 8).
-                // This bakes the Q4_K zero-point bias into the lookup, eliminating
-                // the FMA step from the dequant pipeline entirely.
-                // Pipeline: vpshufb -> cvtepi8_epi32 -> cvtepi32_ps -> mul(d)
-                // vs old:   mask -> cvtepu8_epi32 -> cvtepi32_ps -> fma(d, -d*8)
-                let lut = _mm_setr_epi8(-8, -7, -6, -5, -4, -3, -2, -1,
-                                         0,  1,  2,  3,  4,  5,  6,  7);
-
+                let d: f32 = block.d.to_f32(); 
                 let vd = $crate::simd_primitive!(avx2, f32, splat, d);
-                let mask_0f = _mm_set1_epi8(0x0F);
+                let v_neg_d_offset = $crate::simd_primitive!(avx2, f32, splat, -d * 8.0);
 
                 let qs_ptr = block.qs.as_ptr();
                 let out_ptr = $out_ptr;
 
-                // Each iteration: 16 packed bytes = 32 nibbles = 32 f32 outputs.
-                // vpshufb maps each nibble to its (nib-8) signed byte in one instruction,
-                // then we widen to i32 and convert to f32 via the standard pipeline.
                 for i in 0..8 {
-                    let v128 = _mm_loadu_si128(qs_ptr.add(i * 16) as *const _);
+                    // Load 16 bytes (32 nibbles)
+                    let v128 = _mm_loadu_si128(qs_ptr.add(i*16) as *const _);
 
-                    // Extract low and high nibbles (xmm domain, 16 bytes each)
-                    let lo = _mm_and_si128(v128, mask_0f);
-                    let hi = _mm_and_si128(_mm_srli_epi16(v128, 4), mask_0f);
+                    // Extract Low/High using masks
+                    let mask = _mm_set1_epi8(0x0F);
+                    let low_bytes = _mm_and_si128(v128, mask);
+                    let high_bytes = _mm_and_si128(_mm_srli_epi16(v128, 4), mask);
 
-                    // vpshufb LUT lookup: nibble -> signed byte (nib - 8)
-                    let lo_biased = _mm_shuffle_epi8(lut, lo);
-                    let hi_biased = _mm_shuffle_epi8(lut, hi);
+                    // Convert Low 8 bytes -> 8 i32 -> 8 f32
+                    let ints_l_0 = _mm256_cvtepu8_epi32(low_bytes);
+                    let ints_l_1 = _mm256_cvtepu8_epi32(_mm_srli_si128(low_bytes, 8));
 
-                    // Widen low nibbles: 16 signed bytes -> 4x8 i32 -> 4x8 f32
-                    let f_l_0 = _mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(lo_biased));
-                    let f_l_1 = _mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(_mm_srli_si128(lo_biased, 8)));
+                    let f_l_0 = _mm256_cvtepi32_ps(ints_l_0);
+                    let f_l_1 = _mm256_cvtepi32_ps(ints_l_1);
 
-                    // Widen high nibbles
-                    let f_h_0 = _mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(hi_biased));
-                    let f_h_1 = _mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(_mm_srli_si128(hi_biased, 8)));
+                    // Convert High 8 bytes -> 8 i32 -> 8 f32
+                    let ints_h_0 = _mm256_cvtepu8_epi32(high_bytes);
+                    let ints_h_1 = _mm256_cvtepu8_epi32(_mm_srli_si128(high_bytes, 8));
 
-                    // Scale by d (bias already applied by LUT)
-                    let res_l_0 = _mm256_mul_ps(vd, f_l_0);
-                    let res_l_1 = _mm256_mul_ps(vd, f_l_1);
-                    let res_h_0 = _mm256_mul_ps(vd, f_h_0);
-                    let res_h_1 = _mm256_mul_ps(vd, f_h_1);
+                    let f_h_0 = _mm256_cvtepi32_ps(ints_h_0);
+                    let f_h_1 = _mm256_cvtepi32_ps(ints_h_1);
 
-                    // Interleave low/high pairs: [l0,h0,l1,h1,...]
+                    // Dequantize: d * val + (-d * 8.0) via FMA
+                    let res_l_0 = $crate::simd_primitive!(avx2, f32, fma, vd, f_l_0, v_neg_d_offset);
+                    let res_l_1 = $crate::simd_primitive!(avx2, f32, fma, vd, f_l_1, v_neg_d_offset);
+                    let res_h_0 = $crate::simd_primitive!(avx2, f32, fma, vd, f_h_0, v_neg_d_offset);
+                    let res_h_1 = $crate::simd_primitive!(avx2, f32, fma, vd, f_h_1, v_neg_d_offset);
+                    
+                    // Interleave: Store Low/High pairs
+                    // We want [l0, h0, l1, h1...]
                     let out_0 = _mm256_unpacklo_ps(res_l_0, res_h_0);
                     let out_1 = _mm256_unpackhi_ps(res_l_0, res_h_0);
                     let out_2 = _mm256_unpacklo_ps(res_l_1, res_h_1);
                     let out_3 = _mm256_unpackhi_ps(res_l_1, res_h_1);
-
+                    
                     // Permute to correct linear order for store
                     let final_0 = _mm256_permute2f128_ps(out_0, out_1, 0x20);
                     let final_1 = _mm256_permute2f128_ps(out_0, out_1, 0x31);
                     let final_2 = _mm256_permute2f128_ps(out_2, out_3, 0x20);
                     let final_3 = _mm256_permute2f128_ps(out_2, out_3, 0x31);
-
+                    
                     $crate::simd_primitive!(avx2, f32, store, out_ptr.add(i*32 + 0), final_0);
                     $crate::simd_primitive!(avx2, f32, store, out_ptr.add(i*32 + 8), final_1);
                     $crate::simd_primitive!(avx2, f32, store, out_ptr.add(i*32 + 16), final_2);
