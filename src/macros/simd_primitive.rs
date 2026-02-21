@@ -627,6 +627,24 @@ macro_rules! simd_primitive {
         }
     };
 
+    // --- NEON f32 masked load/store (emulated via scalar for 0..4 tail) ---
+    (neon, f32, maskload, $p:expr, $count:expr) => {
+        unsafe {
+            let mut buf = [0.0f32; 4];
+            let cnt = ($count as usize).min(4);
+            core::ptr::copy_nonoverlapping($p as *const f32, buf.as_mut_ptr(), cnt);
+            std::arch::aarch64::vld1q_f32(buf.as_ptr())
+        }
+    };
+    (neon, f32, maskstore, $p:expr, $v:expr, $count:expr) => {
+        unsafe {
+            let mut buf = [0.0f32; 4];
+            std::arch::aarch64::vst1q_f32(buf.as_mut_ptr(), $v);
+            let cnt = ($count as usize).min(4);
+            core::ptr::copy_nonoverlapping(buf.as_ptr(), $p as *mut f32, cnt);
+        }
+    };
+
     // --- NEON f16 (ARMv8.2 native FP16 when available, else convert) ---
     (neon, f16, lanes) => { 4 };
     (neon, f16, num_regs) => { 32 };
@@ -635,14 +653,14 @@ macro_rules! simd_primitive {
     // Load 4 f16 → 4 f32 via vcvt
     (neon, f16, load, $p:expr) => {
         unsafe {
-            let h = std::arch::aarch64::vld1_f16($p as *const std::arch::aarch64::float16_t);
+            let h = std::arch::aarch64::vld1_f16(($p as *const u8).cast());
             std::arch::aarch64::vcvt_f32_f16(h)
         }
     };
     (neon, f16, store, $p:expr, $v:expr) => {
         unsafe {
             let h = std::arch::aarch64::vcvt_f16_f32($v);
-            std::arch::aarch64::vst1_f16($p as *mut std::arch::aarch64::float16_t, h);
+            std::arch::aarch64::vst1_f16(($p as *mut u8).cast(), h);
         }
     };
     (neon, f16, optimal_tile_m) => { 8 };
@@ -693,6 +711,26 @@ macro_rules! simd_primitive {
                 ptr = in(reg) ptr,
                 options(nostack, preserves_flags),
             );
+        }
+    };
+
+    // --- NEON f16 masked load/store (emulated: scalar f16 copy → convert) ---
+    (neon, f16, maskload, $p:expr, $count:expr) => {
+        unsafe {
+            let mut buf = [half::f16::ZERO; 4];
+            let cnt = ($count as usize).min(4);
+            core::ptr::copy_nonoverlapping($p as *const half::f16, buf.as_mut_ptr(), cnt);
+            let h = std::arch::aarch64::vld1_f16((buf.as_ptr() as *const u8).cast());
+            std::arch::aarch64::vcvt_f32_f16(h)
+        }
+    };
+    (neon, f16, maskstore, $p:expr, $v:expr, $count:expr) => {
+        unsafe {
+            let h = std::arch::aarch64::vcvt_f16_f32($v);
+            let mut buf = [half::f16::ZERO; 4];
+            std::arch::aarch64::vst1_f16((buf.as_mut_ptr() as *mut u8).cast(), h);
+            let cnt = ($count as usize).min(4);
+            core::ptr::copy_nonoverlapping(buf.as_ptr(), $p as *mut half::f16, cnt);
         }
     };
 
@@ -768,6 +806,31 @@ macro_rules! simd_primitive {
                 ptr = in(reg) ptr,
                 options(nostack, preserves_flags),
             );
+        }
+    };
+    // --- NEON bf16 masked load/store (emulated: scalar bf16 copy → convert) ---
+    (neon, bf16, maskload, $p:expr, $count:expr) => {
+        unsafe {
+            let mut buf = [half::bf16::ZERO; 4];
+            let cnt = ($count as usize).min(4);
+            core::ptr::copy_nonoverlapping($p as *const half::bf16, buf.as_mut_ptr(), cnt);
+            // bf16 → f32: load as u16, shift left 16 bits
+            let raw = std::arch::aarch64::vld1_u16(buf.as_ptr() as *const u16);
+            let wide = std::arch::aarch64::vmovl_u16(raw);
+            let shifted = std::arch::aarch64::vshlq_n_u32::<16>(wide);
+            std::arch::aarch64::vreinterpretq_f32_u32(shifted)
+        }
+    };
+    (neon, bf16, maskstore, $p:expr, $v:expr, $count:expr) => {
+        unsafe {
+            // f32 → bf16: shift right 16 bits, narrow
+            let vi = std::arch::aarch64::vreinterpretq_u32_f32($v);
+            let shifted = std::arch::aarch64::vshrq_n_u32(vi, 16);
+            let narrow = std::arch::aarch64::vmovn_u32(shifted);
+            let mut buf = [half::bf16::ZERO; 4];
+            std::arch::aarch64::vst1_u16(buf.as_mut_ptr() as *mut u16, narrow);
+            let cnt = ($count as usize).min(4);
+            core::ptr::copy_nonoverlapping(buf.as_ptr(), $p as *mut half::bf16, cnt);
         }
     };
 

@@ -1,5 +1,6 @@
-#![feature(x86_amx_intrinsics)]
-#![feature(stdarch_x86_avx512_f16)]
+#![cfg_attr(target_arch = "x86_64", feature(x86_amx_intrinsics))]
+#![cfg_attr(target_arch = "x86_64", feature(stdarch_x86_avx512_f16))]
+#![cfg_attr(target_arch = "aarch64", feature(stdarch_neon_f16))]
 #![feature(f16)]
 #![allow(
     dead_code,

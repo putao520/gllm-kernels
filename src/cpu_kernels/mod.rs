@@ -1154,6 +1154,12 @@ impl<E: Element> Kernels<E> for CpuKernels<E> {
             };
             return transmute_vec!(packed, f32);
         }
+        #[cfg(target_arch = "aarch64")]
+        if E::ELEM_ID == 0 {
+            let b_f32 = unsafe { std::slice::from_raw_parts(b.as_ptr() as *const f32, b.len()) };
+            let packed = crate::asm::aarch64::pack_b_asm_f32_neon(b_f32, n, k);
+            return transmute_vec!(packed, f32);
+        }
         dispatch_pack_b!(pack_b, b, n, k)
     }
 
@@ -1175,6 +1181,14 @@ impl<E: Element> Kernels<E> for CpuKernels<E> {
                 }
                 _ => {}
             }
+        }
+        #[cfg(target_arch = "aarch64")]
+        if E::ELEM_ID == 0 {
+            let a_f32 = unsafe { std::slice::from_raw_parts(a.as_ptr() as *const f32, a.len()) };
+            let pb_f32 = unsafe { std::slice::from_raw_parts(packed_b.as_ptr() as *const f32, packed_b.len()) };
+            let c_f32 = unsafe { std::slice::from_raw_parts_mut(c.as_mut_ptr() as *mut f32, c.len()) };
+            crate::asm::aarch64::gemm_prepacked_asm_f32(a_f32, pb_f32, c_f32, m, n, k);
+            return;
         }
         dispatch_with_dims!(matmul_prepacked, a, packed_b, c, m, n, k);
     }
@@ -1198,6 +1212,15 @@ impl<E: Element> Kernels<E> for CpuKernels<E> {
                 }
                 _ => {}
             }
+        }
+        #[cfg(target_arch = "aarch64")]
+        if E::ELEM_ID == 0 {
+            let a_f32 = unsafe { std::slice::from_raw_parts(a.as_ptr() as *const f32, a.len()) };
+            let pb_f32 = unsafe { std::slice::from_raw_parts(packed_b.as_ptr() as *const f32, packed_b.len()) };
+            let bias_f32 = unsafe { std::slice::from_raw_parts(bias.as_ptr() as *const f32, bias.len()) };
+            let c_f32 = unsafe { std::slice::from_raw_parts_mut(c.as_mut_ptr() as *mut f32, c.len()) };
+            crate::asm::aarch64::gemm_bias_prepacked_asm_f32(a_f32, pb_f32, bias_f32, c_f32, m, n, k);
+            return;
         }
         dispatch_matmul_bias!(matmul_bias_prepacked, a, packed_b, bias, c, m, n, k);
     }

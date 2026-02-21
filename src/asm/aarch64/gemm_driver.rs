@@ -1,13 +1,18 @@
 //! NEON GEMM driver using the hand-written 8x12 assembly microkernel.
 //!
 //! This module provides the complete GEMM implementation:
-//! - Pack A into column-major MR-wide panels
-//! - Pack B into row-major NR-wide panels
+//! - Pack A into column-major MR-wide panels (r-inner / k-outer order)
+//! - Pack B into row-major NR-wide panels (KC-blocked full-matrix prepacking)
 //! - Tile the M/N/K dimensions with cache-aware blocking
 //! - Call the assembly microkernel for each tile
+//! - Multi-threaded MC loop via Rayon
 //!
-//! The assembly microkernel handles the innermost 8x12 tile computation.
-//! This driver handles everything else: blocking, packing, edge cases.
+//! Two entry points:
+//! - `gemm_asm_f32`:           standard GEMM (packs B on the fly)
+//! - `gemm_prepacked_asm_f32`: GEMM with pre-packed B (skips pack_b step)
+//!
+//! Pre-packing helpers:
+//! - `pack_b_asm_f32_neon`:    pack the full B matrix for repeated use
 
 #[cfg(target_arch = "aarch64")]
 use crate::asm::aarch64::{MR, NR, gemm_kernel_8x12_f32};
@@ -104,6 +109,64 @@ unsafe fn pack_b_f32(
     }
 }
 
+/// Inner microkernel loop over MR×NR tiles for a single MC×NC block.
+///
+/// Shared by both single-threaded and multi-threaded paths.
+#[cfg(target_arch = "aarch64")]
+#[inline]
+unsafe fn compute_mc_block(
+    pa: *const f32,
+    pb: *const f32,
+    c_ptr: *mut f32,
+    ic: usize,
+    jc: usize,
+    mc: usize,
+    nc: usize,
+    kc: usize,
+    n: usize,
+    first_kc: bool,
+) {
+    let n_mr = (mc + MR - 1) / MR;
+    let n_nr = (nc + NR - 1) / NR;
+    let mut tmp = [0.0f32; 8 * 12]; // MR * NR
+
+    for jr in 0..n_nr {
+        let nc_cur = NR.min(nc - jr * NR);
+
+        for ir in 0..n_mr {
+            let mc_cur = MR.min(mc - ir * MR);
+
+            let pa_tile = pa.add(ir * MR * kc);
+            let pb_tile = pb.add(jr * NR * kc);
+
+            if mc_cur == MR && nc_cur == NR {
+                let c_tile = c_ptr.add((ic + ir * MR) * n + (jc + jr * NR));
+                gemm_kernel_8x12_f32(pa_tile, pb_tile, c_tile, kc, n, !first_kc);
+            } else {
+                if !first_kc {
+                    for r in 0..mc_cur {
+                        for col in 0..nc_cur {
+                            tmp[r * NR + col] =
+                                *c_ptr.add((ic + ir * MR + r) * n + (jc + jr * NR + col));
+                        }
+                    }
+                } else {
+                    tmp.fill(0.0);
+                }
+
+                gemm_kernel_8x12_f32(pa_tile, pb_tile, tmp.as_mut_ptr(), kc, NR, !first_kc);
+
+                for r in 0..mc_cur {
+                    for col in 0..nc_cur {
+                        *c_ptr.add((ic + ir * MR + r) * n + (jc + jr * NR + col)) =
+                            tmp[r * NR + col];
+                    }
+                }
+            }
+        }
+    }
+}
+
 /// Full GEMM using the hand-written 8x12 NEON microkernel.
 ///
 /// C = A * B  (row-major, C is m x n, A is m x k, B is k x n)
@@ -112,6 +175,10 @@ unsafe fn pack_b_f32(
 /// - NC blocking on N (B panel fits in L3)
 /// - KC blocking on K (A panel fits in L2, B strip fits in L1)
 /// - MC blocking on M (A panel fits in L2)
+///
+/// Multi-threaded: MC loop is parallelized via Rayon when there are
+/// enough M-blocks to fill available cores. B is packed once on the
+/// main thread and shared read-only; each worker packs its own A block.
 #[cfg(target_arch = "aarch64")]
 pub fn gemm_asm_f32(
     a: &[f32],
@@ -129,130 +196,121 @@ pub fn gemm_asm_f32(
         return;
     }
 
-    // Get cache-aware blocking parameters
-    let bp = cache_params::blocking_params(MR, 3, 4, 4); // MR=8, NV=3, LANES=4, f32=4 bytes
+    let bp = cache_params::blocking_params(MR, 3, 4, 4);
     let kc_max = bp.kc;
     let mc_max = bp.mc;
     let nc_max = bp.nc;
 
-    // Allocate packing buffers (reuse via thread-local)
+    let nthreads = rayon::current_num_threads().max(1);
+    let num_m_blocks = (m + mc_max - 1) / mc_max;
+    let use_mt = num_m_blocks >= 2 && nthreads > 1;
+
+    // Shared pack_b buffer (main thread packs, workers read)
     thread_local! {
-        static PACK_A: std::cell::RefCell<Vec<f32>> = std::cell::RefCell::new(Vec::new());
         static PACK_B: std::cell::RefCell<Vec<f32>> = std::cell::RefCell::new(Vec::new());
     }
 
-    let pack_a_size = mc_max * kc_max;
     let pack_b_size = kc_max * nc_max;
 
-    PACK_A.with(|pa| {
-        PACK_B.with(|pb| {
-            let mut pa = pa.borrow_mut();
-            let mut pb = pb.borrow_mut();
+    PACK_B.with(|pb_cell| {
+        let mut pb = pb_cell.borrow_mut();
+        if pb.len() < pack_b_size {
+            pb.resize(pack_b_size, 0.0);
+        }
 
-            if pa.len() < pack_a_size {
-                pa.resize(pack_a_size, 0.0);
-            }
-            if pb.len() < pack_b_size {
-                pb.resize(pack_b_size, 0.0);
-            }
+        let a_ptr = a.as_ptr();
+        let b_ptr = b.as_ptr();
+        let c_ptr = c.as_mut_ptr();
 
-            let a_ptr = a.as_ptr();
-            let b_ptr = b.as_ptr();
-            let c_ptr = c.as_mut_ptr();
+        // NC loop
+        let mut jc = 0usize;
+        while jc < n {
+            let nc = nc_max.min(n - jc);
 
-            // NC loop: iterate over N in chunks of nc_max
-            let mut jc = 0usize;
-            while jc < n {
-                let nc = nc_max.min(n - jc);
+            // KC loop
+            let mut pc = 0usize;
+            while pc < k {
+                let kc = kc_max.min(k - pc);
+                let first_kc = pc == 0;
 
-                // KC loop: iterate over K in chunks of kc_max
-                let mut pc = 0usize;
-                while pc < k {
-                    let kc = kc_max.min(k - pc);
-                    let first_kc = pc == 0;
-
-                    // Pack B panel: B[pc..pc+kc, jc..jc+nc] -> packed_b
-                    unsafe {
-                        pack_b_f32(
-                            b_ptr.add(pc * n + jc),
-                            n,
-                            pb.as_mut_ptr(),
-                            kc,
-                            nc,
-                        );
-                    }
-
-                    // MC loop: iterate over M in chunks of mc_max
-                    let mut ic = 0usize;
-                    while ic < m {
-                        let mc = mc_max.min(m - ic);
-
-                        // Pack A panel: A[ic..ic+mc, pc..pc+kc] -> packed_a
-                        unsafe {
-                            pack_a_f32(
-                                a_ptr.add(ic * k + pc),
-                                k,
-                                pa.as_mut_ptr(),
-                                mc,
-                                kc,
-                            );
-                        }
-
-                        // Microkernel loop: iterate over tiles
-                        let n_mr = (mc + MR - 1) / MR;
-                        let n_nr = (nc + NR - 1) / NR;
-
-                        for jr in 0..n_nr {
-                            let _nc_cur = NR.min(nc - jr * NR);
-
-                            for ir in 0..n_mr {
-                                let _mc_cur = MR.min(mc - ir * MR);
-
-                                unsafe {
-                                    let pa_tile = pa.as_ptr().add(ir * MR * kc);
-                                    let pb_tile = pb.as_ptr().add(jr * NR * kc);
-                                    let c_tile = c_ptr.add((ic + ir * MR) * n + (jc + jr * NR));
-
-                                    gemm_kernel_8x12_f32(
-                                        pa_tile,
-                                        pb_tile,
-                                        c_tile,
-                                        kc,
-                                        n,  // ldc = n (full C row stride)
-                                        !first_kc, // accumulate if not first KC chunk
-                                    );
-                                }
-                            }
-                        }
-
-                        ic += mc_max;
-                    }
-
-                    pc += kc_max;
+                // Pack B once on main thread
+                unsafe {
+                    pack_b_f32(b_ptr.add(pc * n + jc), n, pb.as_mut_ptr(), kc, nc);
                 }
 
-                jc += nc_max;
+                if use_mt {
+                    // Multi-threaded MC loop
+                    let pb_addr = pb.as_ptr() as usize;
+                    let a_addr = a_ptr as usize;
+                    let c_addr = c_ptr as usize;
+
+                    use rayon::prelude::*;
+                    (0..num_m_blocks).into_par_iter().for_each(|block_idx| {
+                        let ic = block_idx * mc_max;
+                        if ic >= m { return; }
+                        let mc = mc_max.min(m - ic);
+
+                        // Thread-local pack_a
+                        thread_local! {
+                            static PACK_A_MT: std::cell::RefCell<Vec<f32>> =
+                                std::cell::RefCell::new(Vec::new());
+                        }
+                        let pack_a_size = mc_max * kc_max;
+                        PACK_A_MT.with(|pa_cell| {
+                            let mut pa = pa_cell.borrow_mut();
+                            if pa.len() < pack_a_size {
+                                pa.resize(pack_a_size, 0.0);
+                            }
+
+                            let a_ptr = a_addr as *const f32;
+                            let c_ptr = c_addr as *mut f32;
+                            let pb_ptr = pb_addr as *const f32;
+
+                            unsafe {
+                                pack_a_f32(a_ptr.add(ic * k + pc), k, pa.as_mut_ptr(), mc, kc);
+                                compute_mc_block(
+                                    pa.as_ptr(), pb_ptr, c_ptr,
+                                    ic, jc, mc, nc, kc, n, first_kc,
+                                );
+                            }
+                        });
+                    });
+                } else {
+                    // Single-threaded MC loop
+                    thread_local! {
+                        static PACK_A: std::cell::RefCell<Vec<f32>> =
+                            std::cell::RefCell::new(Vec::new());
+                    }
+                    let pack_a_size = mc_max * kc_max;
+
+                    PACK_A.with(|pa_cell| {
+                        let mut pa = pa_cell.borrow_mut();
+                        if pa.len() < pack_a_size {
+                            pa.resize(pack_a_size, 0.0);
+                        }
+
+                        let mut ic = 0usize;
+                        while ic < m {
+                            let mc = mc_max.min(m - ic);
+
+                            unsafe {
+                                pack_a_f32(a_ptr.add(ic * k + pc), k, pa.as_mut_ptr(), mc, kc);
+                                compute_mc_block(
+                                    pa.as_ptr(), pb.as_ptr(), c_ptr,
+                                    ic, jc, mc, nc, kc, n, first_kc,
+                                );
+                            }
+
+                            ic += mc_max;
+                        }
+                    });
+                }
+
+                pc += kc_max;
             }
 
-            // Handle edge case: if m or n is not a multiple of MR/NR,
-            // the microkernel wrote into zero-padded regions of C.
-            // We need to mask those out. But since we write directly to C
-            // with the correct ldc stride, only the valid region is touched
-            // by the store instructions (the microkernel stores exactly
-            // MR rows x NR cols). For edge tiles where mc_cur < MR or
-            // nc_cur < NR, we need to use a masked store path.
-            //
-            // For now, the edge tiles are handled by the zero-padding in
-            // pack_a/pack_b: the extra rows/cols compute with zeros and
-            // the results are written to C memory that extends beyond the
-            // logical matrix. The caller must ensure C is allocated with
-            // enough padding, OR we fall back to the macro-generated path
-            // for edge tiles.
-            //
-            // The production integration in matmul_neon.rs handles this
-            // by only dispatching full MR x NR tiles to the asm kernel
-            // and using the intrinsics path for remainders.
-        });
+            jc += nc_max;
+        }
     });
 }
 
@@ -271,6 +329,210 @@ pub fn gemm_bias_asm_f32(
     gemm_asm_f32(a, b, c, m, n, k);
 
     // Then add bias to each row
+    for i in 0..m {
+        for j in 0..n {
+            c[i * n + j] += bias[j];
+        }
+    }
+}
+
+/// Pack the full B matrix (k x n) into NEON ASM tile format for repeated use.
+///
+/// Layout: for each NR-wide strip j, data is stored as k*NR contiguous floats.
+/// i.e. packed[j_strip * NR * k + kk * NR .. + NR] = B[kk, j_strip*NR .. j_strip*NR+NR]
+#[cfg(target_arch = "aarch64")]
+pub fn pack_b_asm_f32_neon(b: &[f32], n: usize, k: usize) -> Vec<f32> {
+    let n_nr = (n + NR - 1) / NR;
+    let packed_size = n_nr * NR * k;
+    let mut packed = vec![0.0f32; packed_size];
+    unsafe {
+        pack_b_f32(b.as_ptr(), n, packed.as_mut_ptr(), k, n);
+    }
+    packed
+}
+
+/// GEMM with pre-packed B: C = A * packed_B
+///
+/// packed_B must have been produced by `pack_b_asm_f32_neon`.
+/// Layout: packed_b[j_strip * NR * k + kk * NR + j_local]
+///
+/// Multi-threaded: MC loop is parallelized via Rayon.
+#[cfg(target_arch = "aarch64")]
+pub fn gemm_prepacked_asm_f32(
+    a: &[f32],
+    packed_b: &[f32],
+    c: &mut [f32],
+    m: usize,
+    n: usize,
+    k: usize,
+) {
+    assert!(a.len() >= m * k);
+    assert!(c.len() >= m * n);
+
+    if m == 0 || n == 0 || k == 0 {
+        return;
+    }
+
+    let bp = cache_params::blocking_params(MR, 3, 4, 4);
+    let kc_max = bp.kc;
+    let mc_max = bp.mc;
+
+    let nthreads = rayon::current_num_threads().max(1);
+    let num_m_blocks = (m + mc_max - 1) / mc_max;
+    let use_mt = num_m_blocks >= 2 && nthreads > 1;
+    let n_nr = (n + NR - 1) / NR;
+
+    let a_ptr = a.as_ptr();
+    let c_ptr = c.as_mut_ptr();
+    let pb_ptr = packed_b.as_ptr();
+
+    // KC loop
+    let mut pc = 0usize;
+    while pc < k {
+        let kc = kc_max.min(k - pc);
+        let first_kc = pc == 0;
+
+        if use_mt {
+            let a_addr = a_ptr as usize;
+            let c_addr = c_ptr as usize;
+            let pb_addr = pb_ptr as usize;
+
+            use rayon::prelude::*;
+            (0..num_m_blocks).into_par_iter().for_each(|block_idx| {
+                let ic = block_idx * mc_max;
+                if ic >= m { return; }
+                let mc = mc_max.min(m - ic);
+
+                thread_local! {
+                    static PACK_A_PP_MT: std::cell::RefCell<Vec<f32>> =
+                        std::cell::RefCell::new(Vec::new());
+                }
+                let pack_a_size = mc_max * kc_max;
+                PACK_A_PP_MT.with(|pa_cell| {
+                    let mut pa = pa_cell.borrow_mut();
+                    if pa.len() < pack_a_size {
+                        pa.resize(pack_a_size, 0.0);
+                    }
+
+                    let a_ptr = a_addr as *const f32;
+                    let c_ptr = c_addr as *mut f32;
+                    let pb_ptr = pb_addr as *const f32;
+
+                    unsafe {
+                        pack_a_f32(a_ptr.add(ic * k + pc), k, pa.as_mut_ptr(), mc, kc);
+                        compute_mc_block_prepacked(
+                            pa.as_ptr(), pb_ptr, c_ptr,
+                            ic, mc, n, k, kc, pc, n_nr, first_kc,
+                        );
+                    }
+                });
+            });
+        } else {
+            // Single-threaded MC loop
+            thread_local! {
+                static PACK_A_PP: std::cell::RefCell<Vec<f32>> =
+                    std::cell::RefCell::new(Vec::new());
+            }
+            let pack_a_size = mc_max * kc_max;
+
+            PACK_A_PP.with(|pa_cell| {
+                let mut pa = pa_cell.borrow_mut();
+                if pa.len() < pack_a_size {
+                    pa.resize(pack_a_size, 0.0);
+                }
+
+                let mut ic = 0usize;
+                while ic < m {
+                    let mc = mc_max.min(m - ic);
+
+                    unsafe {
+                        pack_a_f32(a_ptr.add(ic * k + pc), k, pa.as_mut_ptr(), mc, kc);
+                        compute_mc_block_prepacked(
+                            pa.as_ptr(), pb_ptr, c_ptr,
+                            ic, mc, n, k, kc, pc, n_nr, first_kc,
+                        );
+                    }
+
+                    ic += mc_max;
+                }
+            });
+        }
+
+        pc += kc_max;
+    }
+}
+
+/// Inner microkernel loop for prepacked-B path.
+///
+/// B offset: `jr * NR * k + pc * NR` (full-K prepacked layout).
+#[cfg(target_arch = "aarch64")]
+#[inline]
+unsafe fn compute_mc_block_prepacked(
+    pa: *const f32,
+    pb_ptr: *const f32,
+    c_ptr: *mut f32,
+    ic: usize,
+    mc: usize,
+    n: usize,
+    k: usize,
+    kc: usize,
+    pc: usize,
+    n_nr: usize,
+    first_kc: bool,
+) {
+    let n_mr = (mc + MR - 1) / MR;
+    let mut tmp = [0.0f32; 8 * 12]; // MR * NR
+
+    for jr in 0..n_nr {
+        let nc_cur = NR.min(n.saturating_sub(jr * NR));
+        if nc_cur == 0 { continue; }
+
+        for ir in 0..n_mr {
+            let mc_cur = MR.min(mc - ir * MR);
+
+            let pa_tile = pa.add(ir * MR * kc);
+            let pb_tile = pb_ptr.add(jr * NR * k + pc * NR);
+
+            if mc_cur == MR && nc_cur == NR {
+                let c_tile = c_ptr.add((ic + ir * MR) * n + jr * NR);
+                gemm_kernel_8x12_f32(pa_tile, pb_tile, c_tile, kc, n, !first_kc);
+            } else {
+                if !first_kc {
+                    for r in 0..mc_cur {
+                        for col in 0..nc_cur {
+                            tmp[r * NR + col] =
+                                *c_ptr.add((ic + ir * MR + r) * n + jr * NR + col);
+                        }
+                    }
+                } else {
+                    tmp.fill(0.0);
+                }
+
+                gemm_kernel_8x12_f32(pa_tile, pb_tile, tmp.as_mut_ptr(), kc, NR, !first_kc);
+
+                for r in 0..mc_cur {
+                    for col in 0..nc_cur {
+                        *c_ptr.add((ic + ir * MR + r) * n + jr * NR + col) =
+                            tmp[r * NR + col];
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// GEMM with pre-packed B and bias: C = A * packed_B + bias
+#[cfg(target_arch = "aarch64")]
+pub fn gemm_bias_prepacked_asm_f32(
+    a: &[f32],
+    packed_b: &[f32],
+    bias: &[f32],
+    c: &mut [f32],
+    m: usize,
+    n: usize,
+    k: usize,
+) {
+    gemm_prepacked_asm_f32(a, packed_b, c, m, n, k);
     for i in 0..m {
         for j in 0..n {
             c[i * n + j] += bias[j];
