@@ -622,6 +622,49 @@ global_asm!(
 
     // -- Store C --
     ".Lavx512_store_c:",
+
+    // ── Fuse bias if bias pointer (7th arg) is non-null ──
+    // Stack layout: sub rsp 64 + 6 pushes (48) + return addr (8) = 120
+    "mov rax, [rsp + 120]",
+    "test rax, rax",
+    "jz .Lavx512_store_no_bias",
+
+    // Load bias vector (32 floats = 2 zmm)
+    "vmovups zmm28, [rax]",
+    "vmovups zmm29, [rax + 64]",
+
+    // Add bias to all 14 rows
+    "vaddps zmm0, zmm0, zmm28",
+    "vaddps zmm1, zmm1, zmm29",
+    "vaddps zmm2, zmm2, zmm28",
+    "vaddps zmm3, zmm3, zmm29",
+    "vaddps zmm4, zmm4, zmm28",
+    "vaddps zmm5, zmm5, zmm29",
+    "vaddps zmm6, zmm6, zmm28",
+    "vaddps zmm7, zmm7, zmm29",
+    "vaddps zmm8, zmm8, zmm28",
+    "vaddps zmm9, zmm9, zmm29",
+    "vaddps zmm10, zmm10, zmm28",
+    "vaddps zmm11, zmm11, zmm29",
+    "vaddps zmm12, zmm12, zmm28",
+    "vaddps zmm13, zmm13, zmm29",
+    "vaddps zmm14, zmm14, zmm28",
+    "vaddps zmm15, zmm15, zmm29",
+    "vaddps zmm16, zmm16, zmm28",
+    "vaddps zmm17, zmm17, zmm29",
+    "vaddps zmm18, zmm18, zmm28",
+    "vaddps zmm19, zmm19, zmm29",
+    "vaddps zmm20, zmm20, zmm28",
+    "vaddps zmm21, zmm21, zmm29",
+    "vaddps zmm22, zmm22, zmm28",
+    "vaddps zmm23, zmm23, zmm29",
+    "vaddps zmm24, zmm24, zmm28",
+    "vaddps zmm25, zmm25, zmm29",
+    "vaddps zmm26, zmm26, zmm28",
+    "vaddps zmm27, zmm27, zmm29",
+
+    ".Lavx512_store_no_bias:",
+
     "vmovups [rdx], zmm0",
     "vmovups [rdx + 64], zmm1",
     "vmovups [r10], zmm2",
@@ -681,6 +724,7 @@ extern "C" {
         kc: usize,
         ldc: usize,
         accumulate: usize,
+        bias: *const f32,
     );
 }
 
@@ -694,5 +738,21 @@ pub unsafe fn gemm_kernel_14x32_f32(
     ldc: usize,
     accumulate: bool,
 ) {
-    _gllm_gemm_14x32_avx512_f32(packed_a, packed_b, c_ptr, kc, ldc, accumulate as usize);
+    _gllm_gemm_14x32_avx512_f32(packed_a, packed_b, c_ptr, kc, ldc, accumulate as usize, std::ptr::null());
+}
+
+/// AVX-512 GEMM microkernel with fused bias addition.
+/// `bias` must point to NR (32) floats for the current tile columns.
+#[cfg(target_arch = "x86_64")]
+#[inline(always)]
+pub unsafe fn gemm_kernel_14x32_f32_bias(
+    packed_a: *const f32,
+    packed_b: *const f32,
+    c_ptr: *mut f32,
+    kc: usize,
+    ldc: usize,
+    accumulate: bool,
+    bias: *const f32,
+) {
+    _gllm_gemm_14x32_avx512_f32(packed_a, packed_b, c_ptr, kc, ldc, accumulate as usize, bias);
 }

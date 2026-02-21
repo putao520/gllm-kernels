@@ -38,7 +38,7 @@ fn detect_x86_cache() -> Option<(usize, usize, usize)> {
     let mut l3: Option<usize> = None;
 
     for sub in 0..16u32 {
-        let info = unsafe { std::arch::x86_64::__cpuid_count(4, sub) };
+        let info = std::arch::x86_64::__cpuid_count(4, sub);
         let cache_type = info.eax & 0x1F;
         if cache_type == 0 {
             break; // No more caches

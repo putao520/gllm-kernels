@@ -216,6 +216,11 @@ pub trait Kernels<E: Element>: Send + Sync {
         unimplemented!("gemv")
     }
     fn gemm(&self, a: &[E], b: &[E], c: &mut [E], m: usize, n: usize, k: usize); // required
+    /// GEMM with transposed B: C[M×N] = A[M×K] * B^T[N×K].
+    /// b_t is stored as [N×K] row-major, i.e. b_t[j*k + ki] == original B[ki*n + j].
+    fn gemm_bt(&self, _a: &[E], _b_t: &[E], _c: &mut [E], _m: usize, _n: usize, _k: usize) {
+        unimplemented!("gemm_bt")
+    }
     fn gemm_bias(&self, _a: &[E], _b: &[E], _bias: &[E], _c: &mut [E], _m: usize, _n: usize, _k: usize) {
         unimplemented!("gemm_bias")
     }

@@ -1247,7 +1247,7 @@ macro_rules! quant_primitive_iq {
         unsafe {
             #[cfg(target_arch = "x86_64")]
             {
-                use std::arch::x86_64::*;
+                
                 let block = &*$block_ptr;
                 let d: f32 = block.d.to_f32();
                 let vd = $crate::simd_primitive!(avx2, f32, splat, d);
@@ -1583,7 +1583,7 @@ macro_rules! quant_primitive_iq {
         unsafe {
             #[cfg(target_arch = "x86_64")]
             {
-                use std::arch::x86_64::*;
+                
                 let block = &*$block_ptr;
                 let d: f32 = block.d.to_f32();
                 let vd = $crate::simd_primitive!(avx512, f32, splat, d);
@@ -1617,7 +1617,7 @@ macro_rules! quant_primitive_iq {
         unsafe {
             #[cfg(target_arch = "x86_64")]
             {
-                use std::arch::x86_64::*;
+                
                 let block = &*$block_ptr;
                 let d: f32 = block.d.to_f32();
                 let vd = $crate::simd_primitive!(avx512, f32, splat, d);
@@ -1655,7 +1655,7 @@ macro_rules! quant_primitive_iq {
         unsafe {
             #[cfg(target_arch = "x86_64")]
             {
-                use std::arch::x86_64::*;
+                
                 let block = &*$block_ptr;
                 let d: f32 = block.d.to_f32();
                 let vd = $crate::simd_primitive!(avx512, f32, splat, d);
@@ -1686,7 +1686,7 @@ macro_rules! quant_primitive_iq {
         unsafe {
             #[cfg(target_arch = "x86_64")]
             {
-                use std::arch::x86_64::*;
+                
                 let block = &*$block_ptr;
                 let d: f32 = block.d.to_f32();
                 let vd = $crate::simd_primitive!(avx512, f32, splat, d);
@@ -1727,7 +1727,7 @@ macro_rules! quant_primitive_iq {
         unsafe {
             #[cfg(target_arch = "x86_64")]
             {
-                use std::arch::x86_64::*;
+                
                 let block = &*$block_ptr;
                 let d: f32 = block.d.to_f32();
                 let qs = &block.qs;
@@ -1778,7 +1778,7 @@ macro_rules! quant_primitive_iq {
         unsafe {
             #[cfg(target_arch = "x86_64")]
             {
-                use std::arch::x86_64::*;
+                
                 let block = &*$block_ptr;
                 let d: f32 = block.d.to_f32();
                 let qs = &block.qs;
@@ -1834,7 +1834,7 @@ macro_rules! quant_primitive_iq {
         unsafe {
             #[cfg(target_arch = "x86_64")]
             {
-                use std::arch::x86_64::*;
+                
                 let block = &*$block_ptr;
                 let qs = &block.qs;
                 let qh = &block.qh;
@@ -1877,7 +1877,7 @@ macro_rules! quant_primitive_iq {
         unsafe {
             #[cfg(target_arch = "x86_64")]
             {
-                use std::arch::x86_64::*;
+                
                 let block = &*$block_ptr;
                 let qs = &block.qs;
                 let qh = &block.qh;
@@ -1923,7 +1923,7 @@ macro_rules! quant_primitive_iq {
         unsafe {
             #[cfg(target_arch = "x86_64")]
             {
-                use std::arch::x86_64::*;
+                
                 let block = &*$block_ptr;
                 let d: f32 = block.d.to_f32();
                 let vd = $crate::simd_primitive!(avx512, f32, splat, d);
@@ -1957,7 +1957,7 @@ macro_rules! quant_primitive_iq {
         unsafe {
             #[cfg(target_arch = "x86_64")]
             {
-                use std::arch::x86_64::*;
+                
                 let block = &*$block_ptr;
                 let d: f32 = block.d.to_f32();
                 let vd = $crate::simd_primitive!(avx512, f32, splat, d);
@@ -1995,7 +1995,7 @@ macro_rules! quant_primitive_iq {
         unsafe {
             #[cfg(target_arch = "x86_64")]
             {
-                use std::arch::x86_64::*;
+                
                 let block = &*$block_ptr;
                 let d: f32 = block.d.to_f32();
                 let qs = &block.qs;
@@ -2033,7 +2033,7 @@ macro_rules! quant_primitive_iq {
         unsafe {
             #[cfg(target_arch = "x86_64")]
             {
-                use std::arch::x86_64::*;
+                
                 let block = &*$block_ptr;
                 let d: f32 = block.d.to_f32();
                 let qs = &block.qs;
@@ -2074,7 +2074,7 @@ macro_rules! quant_primitive_iq {
         unsafe {
             #[cfg(target_arch = "x86_64")]
             {
-                use std::arch::x86_64::*;
+                
                 let block = &*$block_ptr;
                 let d: f32 = block.d.to_f32();
                 let qs = &block.qs;
@@ -2116,7 +2116,7 @@ macro_rules! quant_primitive_iq {
         unsafe {
             #[cfg(target_arch = "x86_64")]
             {
-                use std::arch::x86_64::*;
+                
                 let block = &*$block_ptr;
                 let d: f32 = block.d.to_f32();
                 let qs = &block.qs;
@@ -2202,7 +2202,7 @@ macro_rules! quant_primitive_iq {
         unsafe {
             #[cfg(target_arch = "x86_64")]
             {
-                use std::arch::x86_64::*;
+                
                 let block = &*$block_ptr;
                 let d: f32 = block.d.to_f32();
                 let qs = &block.qs;
@@ -2253,7 +2253,7 @@ macro_rules! quant_primitive_iq {
         unsafe {
             #[cfg(target_arch = "x86_64")]
             {
-                use std::arch::x86_64::*;
+                
                 let block = &*$block_ptr;
                 let qs = &block.qs;
                 let qh = &block.qh;
@@ -2285,7 +2285,7 @@ macro_rules! quant_primitive_iq {
         unsafe {
             #[cfg(target_arch = "x86_64")]
             {
-                use std::arch::x86_64::*;
+                
                 let block = &*$block_ptr;
                 let d: f32 = block.d.to_f32();
                 let vd = $crate::simd_primitive!(avx2, f32, splat, d);
@@ -2311,7 +2311,7 @@ macro_rules! quant_primitive_iq {
         unsafe {
             #[cfg(target_arch = "x86_64")]
             {
-                use std::arch::x86_64::*;
+                
                 let block = &*$block_ptr;
                 let d: f32 = block.d.to_f32();
                 let qs = &block.qs;
@@ -2339,7 +2339,7 @@ macro_rules! quant_primitive_iq {
         unsafe {
             #[cfg(target_arch = "x86_64")]
             {
-                use std::arch::x86_64::*;
+                
                 let block = &*$block_ptr;
                 let d: f32 = block.d.to_f32();
                 let qs = &block.qs;
@@ -2374,7 +2374,7 @@ macro_rules! quant_primitive_iq {
         unsafe {
             #[cfg(target_arch = "x86_64")]
             {
-                use std::arch::x86_64::*;
+                
                 let block = &*$block_ptr;
                 let d: f32 = block.d.to_f32();
                 let vd = $crate::simd_primitive!(avx2, f32, splat, d);
@@ -2410,7 +2410,7 @@ macro_rules! quant_primitive_iq {
         unsafe {
             #[cfg(target_arch = "x86_64")]
             {
-                use std::arch::x86_64::*;
+                
                 let block = &*$block_ptr;
                 let d: f32 = block.d.to_f32();
                 let qs = &block.qs;
@@ -2454,7 +2454,7 @@ macro_rules! quant_primitive_iq {
         unsafe {
             #[cfg(target_arch = "x86_64")]
             {
-                use std::arch::x86_64::*;
+                
                 let block = &*$block_ptr;
                 let d: f32 = block.d.to_f32();
                 let vd = $crate::simd_primitive!(avx512, f32, splat, d);
@@ -2495,7 +2495,7 @@ macro_rules! quant_primitive_iq {
         unsafe {
             #[cfg(target_arch = "x86_64")]
             {
-                use std::arch::x86_64::*;
+                
                 let block = &*$block_ptr;
                 let d: f32 = block.d.to_f32();
                 let vd = $crate::simd_primitive!(avx512, f32, splat, d);
@@ -2540,7 +2540,7 @@ macro_rules! quant_primitive_iq {
         unsafe {
             #[cfg(target_arch = "x86_64")]
             {
-                use std::arch::x86_64::*;
+                
                 let block = &*$block_ptr;
                 let d: f32 = block.d.to_f32();
                 let qs = &block.qs;
@@ -2586,7 +2586,7 @@ macro_rules! quant_primitive_iq {
         unsafe {
             #[cfg(target_arch = "x86_64")]
             {
-                use std::arch::x86_64::*;
+                
                 let block = &*$block_ptr;
                 let d: f32 = block.d.to_f32();
                 let qs = &block.qs;

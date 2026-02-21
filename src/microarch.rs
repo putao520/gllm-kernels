@@ -168,7 +168,7 @@ fn detect_x86() -> MicroArch {
     use std::arch::x86_64::__cpuid;
 
     // Leaf 0: vendor string
-    let leaf0 = unsafe { __cpuid(0) };
+    let leaf0 = __cpuid(0);
     let mut vendor_bytes = [0u8; 12];
     vendor_bytes[0..4].copy_from_slice(&leaf0.ebx.to_le_bytes());
     vendor_bytes[4..8].copy_from_slice(&leaf0.edx.to_le_bytes());
@@ -176,7 +176,7 @@ fn detect_x86() -> MicroArch {
     let vendor = core::str::from_utf8(&vendor_bytes).unwrap_or("");
 
     // Leaf 1: family/model/stepping
-    let leaf1 = unsafe { __cpuid(1) };
+    let leaf1 = __cpuid(1);
     let family_id = (leaf1.eax >> 8) & 0xF;
     let model_id = (leaf1.eax >> 4) & 0xF;
     let ext_family = (leaf1.eax >> 20) & 0xFF;
@@ -374,11 +374,10 @@ impl KernelConfig {
         let mc = (mc_raw / mr * mr).clamp(mr, 960);
 
         // NC: B panel shared across cores in L3
-        // Each core's effective L3 share: L3 / num_physical_cores
-        // NC × KC × elem ≤ effective_L3 / 2
-        let nthreads = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1);
-        let num_cores = (nthreads / 2).max(1); // approximate physical cores (no HT)
-        let effective_l3 = l3 / num_cores;
+        // L3 is shared across all cores on single-socket (UMA) systems.
+        // Only divide by NUMA nodes for multi-socket systems.
+        let num_numa_nodes = crate::numa::num_nodes().max(1);
+        let effective_l3 = l3 / num_numa_nodes;
         let nc_raw = (effective_l3 / 2) / (kc * elem);
         let nc = (nc_raw / nr * nr).clamp(nr, 8192);
 

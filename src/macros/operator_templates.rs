@@ -2010,6 +2010,9 @@ macro_rules! define_gemv_streaming_op {
 /// Generates `gemm_skinny(a, b, c, m, n, k)` in each ISA module.
 #[macro_export]
 macro_rules! define_gemm_skinny_op {
+    (avx512fp16, $elem:ident) => {
+        $crate::define_gemm_skinny!(avx512fp16, $elem, 32, "avx512fp16");
+    };
     (avx512, $elem:ident) => {
         $crate::define_gemm_skinny!(avx512, $elem, 16, "avx512f");
     };
@@ -2029,6 +2032,20 @@ macro_rules! define_gemm_skinny_op {
                     let mut sum = <$elem as Element>::ZERO;
                     for p in 0..k {
                         sum = <$elem as Element>::mul_add(sum, a[i * k + p], b[p * n + j]);
+                    }
+                    c[i * n + j] = sum;
+                }
+            }
+        }
+
+        #[inline(always)]
+        pub fn gemm_skinny_bt(a: &[$elem], b_t: &[$elem], c: &mut [$elem],
+                              m: usize, n: usize, k: usize) {
+            for i in 0..m {
+                for j in 0..n {
+                    let mut sum = <$elem as Element>::ZERO;
+                    for p in 0..k {
+                        sum = <$elem as Element>::mul_add(sum, a[i * k + p], b_t[j * k + p]);
                     }
                     c[i * n + j] = sum;
                 }

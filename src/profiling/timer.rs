@@ -106,7 +106,7 @@ fn detect_tsc_freq() -> u64 {
 fn detect_tsc_cpuid() -> Option<u64> {
     // Leaf 0x15: eax=denominator, ebx=numerator, ecx=crystal_hz
     // TSC_freq = crystal_hz * numerator / denominator
-    let info = unsafe { core::arch::x86_64::__cpuid(0x15) };
+    let info = core::arch::x86_64::__cpuid(0x15);
     let denom = info.eax as u64;
     let numer = info.ebx as u64;
     let crystal = info.ecx as u64;
@@ -117,7 +117,7 @@ fn detect_tsc_cpuid() -> Option<u64> {
         return Some(crystal * numer / denom);
     }
     // Some CPUs report crystal=0 but leaf 0x16 has base frequency in MHz
-    let info16 = unsafe { core::arch::x86_64::__cpuid(0x16) };
+    let info16 = core::arch::x86_64::__cpuid(0x16);
     let base_mhz = info16.eax as u64 & 0xFFFF;
     if base_mhz > 0 {
         // TSC typically runs at base frequency on modern Intel

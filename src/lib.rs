@@ -2,6 +2,10 @@
 #![feature(stdarch_x86_avx512_f16)]
 #![feature(f16)]
 #![allow(
+    dead_code,
+    unused_macros,
+    unused_variables,
+    unused_assignments,
     clippy::too_many_arguments,
     clippy::crate_in_macro_def,
     clippy::new_without_default,

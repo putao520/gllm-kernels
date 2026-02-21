@@ -11,6 +11,7 @@ fn benchmark_gemm_f32(c: &mut Criterion) {
         (512, 512, 512),
         (1024, 1024, 1024),
         // Transformer-like shapes: (tokens, hidden, hidden)
+        (512, 4096, 4096),
         (128, 4096, 4096),
         (1, 4096, 4096),
         // N-unaligned: exercises N-remainder paths (N not multiple of TILE_N)

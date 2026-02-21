@@ -1,11 +1,17 @@
 use criterion::{black_box, criterion_group, criterion_main, Criterion, BenchmarkId, Throughput};
 use gllm_kernels::cpu_kernels::CpuKernels;
 use gllm_kernels::traits::Kernels;
+use half::f16;
 use rand::Rng;
 
 fn rand_vec(n: usize) -> Vec<f32> {
     let mut rng = rand::thread_rng();
     (0..n).map(|_| rng.gen::<f32>() * 2.0 - 1.0).collect()
+}
+
+fn rand_vec_f16(n: usize) -> Vec<f16> {
+    let mut rng = rand::thread_rng();
+    (0..n).map(|_| f16::from_f32(rng.gen::<f32>() * 2.0 - 1.0)).collect()
 }
 
 // ============================================================
@@ -61,6 +67,106 @@ fn bench_skinny_gemm(c: &mut Criterion) {
         group.bench_function(BenchmarkId::new("gemm", format!("{m}x{n}x{k}")), |bench| {
             bench.iter(|| {
                 kernels.gemm(black_box(&a), black_box(&b), black_box(&mut out), m, n, k);
+            })
+        });
+    }
+    group.finish();
+}
+
+// ============================================================
+// Skinny GEMM B-transposed: compare packing cost vs non-transposed
+// ============================================================
+fn bench_skinny_gemm_bt(c: &mut Criterion) {
+    let kernels = CpuKernels::<f32>::new();
+    let mut group = c.benchmark_group("skinny_gemm_bt");
+    group.sample_size(20);
+
+    for &(m, n, k) in &[
+        (4, 4096, 4096),
+        (8, 4096, 4096),
+        (16, 4096, 4096),
+        (32, 4096, 4096),
+        (16, 11008, 4096),
+        (32, 11008, 4096),
+    ] {
+        let a = rand_vec(m * k);
+        let b = rand_vec(k * n);
+        // Pre-transpose B[K×N] → B^T[N×K]
+        let mut b_t = vec![0.0f32; n * k];
+        for ki in 0..k {
+            for j in 0..n {
+                b_t[j * k + ki] = b[ki * n + j];
+            }
+        }
+        let mut out = vec![0.0f32; m * n];
+        group.throughput(Throughput::Elements((2 * m * n * k) as u64));
+        group.bench_function(BenchmarkId::new("gemm_bt", format!("{m}x{n}x{k}")), |bench| {
+            bench.iter(|| {
+                kernels.gemm_bt(black_box(&a), black_box(&b_t), black_box(&mut out), m, n, k);
+            })
+        });
+    }
+    group.finish();
+}
+
+// ============================================================
+// Skinny GEMM f16: LLM prefill shapes (M=2..32)
+// ============================================================
+fn bench_skinny_gemm_f16(c: &mut Criterion) {
+    let kernels = CpuKernels::<f16>::new();
+    let mut group = c.benchmark_group("skinny_gemm_f16");
+    group.sample_size(20);
+
+    for &(m, n, k) in &[
+        (4, 4096, 4096),
+        (8, 4096, 4096),
+        (16, 4096, 4096),
+        (32, 4096, 4096),
+        (16, 11008, 4096),
+        (32, 11008, 4096),
+    ] {
+        let a = rand_vec_f16(m * k);
+        let b = rand_vec_f16(k * n);
+        let mut out = vec![f16::ZERO; m * n];
+        group.throughput(Throughput::Elements((2 * m * n * k) as u64));
+        group.bench_function(BenchmarkId::new("gemm", format!("{m}x{n}x{k}")), |bench| {
+            bench.iter(|| {
+                kernels.gemm(black_box(&a), black_box(&b), black_box(&mut out), m, n, k);
+            })
+        });
+    }
+    group.finish();
+}
+
+// ============================================================
+// Skinny GEMM B-transposed f16
+// ============================================================
+fn bench_skinny_gemm_bt_f16(c: &mut Criterion) {
+    let kernels = CpuKernels::<f16>::new();
+    let mut group = c.benchmark_group("skinny_gemm_bt_f16");
+    group.sample_size(20);
+
+    for &(m, n, k) in &[
+        (4, 4096, 4096),
+        (8, 4096, 4096),
+        (16, 4096, 4096),
+        (32, 4096, 4096),
+        (16, 11008, 4096),
+        (32, 11008, 4096),
+    ] {
+        let a = rand_vec_f16(m * k);
+        let b = rand_vec_f16(k * n);
+        let mut b_t = vec![f16::ZERO; n * k];
+        for ki in 0..k {
+            for j in 0..n {
+                b_t[j * k + ki] = b[ki * n + j];
+            }
+        }
+        let mut out = vec![f16::ZERO; m * n];
+        group.throughput(Throughput::Elements((2 * m * n * k) as u64));
+        group.bench_function(BenchmarkId::new("gemm_bt", format!("{m}x{n}x{k}")), |bench| {
+            bench.iter(|| {
+                kernels.gemm_bt(black_box(&a), black_box(&b_t), black_box(&mut out), m, n, k);
             })
         });
     }
@@ -323,6 +429,9 @@ criterion_group!(
     targets =
         bench_gemv,
         bench_skinny_gemm,
+        bench_skinny_gemm_bt,
+        bench_skinny_gemm_f16,
+        bench_skinny_gemm_bt_f16,
         bench_large_gemm,
         bench_quant_gemv,
         bench_swiglu,

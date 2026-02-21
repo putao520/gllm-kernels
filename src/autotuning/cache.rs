@@ -283,7 +283,7 @@ fn extract_f64(json: &str, key: &str) -> Option<f64> {
 fn split_json_object(s: &str) -> Vec<(String, String)> {
     let mut result = Vec::new();
     let mut depth = 0i32;
-    let mut in_string = false;
+    let _in_string = false;
     let mut escape = false;
     let mut current_key = String::new();
     let mut current_value = String::new();

@@ -381,12 +381,14 @@ pub mod neon;
 /// Safety: caller must ensure E is actually $target (checked via ELEM_ID).
 macro_rules! as_typed_slice {
     ($slice:expr, $target:ty) => {
+        #[allow(unused_unsafe)]
         unsafe { std::slice::from_raw_parts($slice.as_ptr() as *const $target, $slice.len()) }
     };
 }
 
 macro_rules! as_typed_slice_mut {
     ($slice:expr, $target:ty) => {
+        #[allow(unused_unsafe)]
         unsafe { std::slice::from_raw_parts_mut($slice.as_mut_ptr() as *mut $target, $slice.len()) }
     };
 }
@@ -739,6 +741,38 @@ macro_rules! dispatch_gemm_skinny {
     };
 }
 
+// Dispatch skinny GEMM bt (M=2..32): gemm_skinny_bt(a, b_t, c, m, n, k)
+macro_rules! dispatch_gemm_skinny_bt {
+    ($a:expr, $b_t:expr, $c:expr, $m:expr, $n:expr, $k:expr) => {
+        match (get_isa_level(), E::ELEM_ID) {
+            #[cfg(target_arch = "x86_64")]
+            (IsaLevel::Avx512Fp16, 1) => avx512::avx512fp16_f16::gemm_skinny_bt(as_typed_slice!($a, half::f16), as_typed_slice!($b_t, half::f16), as_typed_slice_mut!($c, half::f16), $m, $n, $k),
+            #[cfg(target_arch = "x86_64")]
+            (IsaLevel::Avx512 | IsaLevel::Avx512Fp16, 0) => avx512::avx512_f32::gemm_skinny_bt(as_typed_slice!($a, f32), as_typed_slice!($b_t, f32), as_typed_slice_mut!($c, f32), $m, $n, $k),
+            #[cfg(target_arch = "x86_64")]
+            (IsaLevel::Avx512, 1) => avx512::avx512_f16::gemm_skinny_bt(as_typed_slice!($a, half::f16), as_typed_slice!($b_t, half::f16), as_typed_slice_mut!($c, half::f16), $m, $n, $k),
+            #[cfg(target_arch = "x86_64")]
+            (IsaLevel::Avx512 | IsaLevel::Avx512Fp16, 2) => avx512::avx512_bf16::gemm_skinny_bt(as_typed_slice!($a, half::bf16), as_typed_slice!($b_t, half::bf16), as_typed_slice_mut!($c, half::bf16), $m, $n, $k),
+            #[cfg(target_arch = "x86_64")]
+            (IsaLevel::Avx2, 0) => avx2::avx2_f32::gemm_skinny_bt(as_typed_slice!($a, f32), as_typed_slice!($b_t, f32), as_typed_slice_mut!($c, f32), $m, $n, $k),
+            #[cfg(target_arch = "x86_64")]
+            (IsaLevel::Avx2, 1) => avx2::avx2_f16::gemm_skinny_bt(as_typed_slice!($a, half::f16), as_typed_slice!($b_t, half::f16), as_typed_slice_mut!($c, half::f16), $m, $n, $k),
+            #[cfg(target_arch = "x86_64")]
+            (IsaLevel::Avx2, 2) => avx2::avx2_bf16::gemm_skinny_bt(as_typed_slice!($a, half::bf16), as_typed_slice!($b_t, half::bf16), as_typed_slice_mut!($c, half::bf16), $m, $n, $k),
+            #[cfg(target_arch = "aarch64")]
+            (IsaLevel::Neon, 0) => neon::neon_f32::gemm_skinny_bt(as_typed_slice!($a, f32), as_typed_slice!($b_t, f32), as_typed_slice_mut!($c, f32), $m, $n, $k),
+            #[cfg(target_arch = "aarch64")]
+            (IsaLevel::Neon, 1) => neon::neon_f16::gemm_skinny_bt(as_typed_slice!($a, half::f16), as_typed_slice!($b_t, half::f16), as_typed_slice_mut!($c, half::f16), $m, $n, $k),
+            #[cfg(target_arch = "aarch64")]
+            (IsaLevel::Neon, 2) => neon::neon_bf16::gemm_skinny_bt(as_typed_slice!($a, half::bf16), as_typed_slice!($b_t, half::bf16), as_typed_slice_mut!($c, half::bf16), $m, $n, $k),
+            (_, 0) => scalar::scalar_f32::gemm_skinny_bt(as_typed_slice!($a, f32), as_typed_slice!($b_t, f32), as_typed_slice_mut!($c, f32), $m, $n, $k),
+            (_, 1) => scalar::scalar_f16::gemm_skinny_bt(as_typed_slice!($a, half::f16), as_typed_slice!($b_t, half::f16), as_typed_slice_mut!($c, half::f16), $m, $n, $k),
+            (_, 2) => scalar::scalar_bf16::gemm_skinny_bt(as_typed_slice!($a, half::bf16), as_typed_slice!($b_t, half::bf16), as_typed_slice_mut!($c, half::bf16), $m, $n, $k),
+            _ => unreachable!(),
+        }
+    };
+}
+
 /// Dispatch for rope: 1 mut slice + 2 read slices + usize
 macro_rules! dispatch_rope {
     ($op:ident, $qk:expr, $cos:expr, $sin:expr, $hd:expr) => {
@@ -1065,8 +1099,35 @@ impl<E: Element> Kernels<E> for CpuKernels<E> {
         dispatch_with_dims!(matmul, a, b, c, m, n, k);
     }
 
+    fn gemm_bt(&self, a: &[E], b_t: &[E], c: &mut [E], m: usize, n: usize, k: usize) {
+        assert!(a.len() >= m * k);
+        assert!(b_t.len() >= n * k);
+        assert!(c.len() >= m * n);
+        assert!(m >= 2 && m <= 32, "gemm_bt currently supports M=2..32");
+        dispatch_gemm_skinny_bt!(a, b_t, c, m, n, k);
+    }
+
     fn gemm_bias(&self, a: &[E], b: &[E], bias: &[E], c: &mut [E], m: usize, n: usize, k: usize) {
         assert!(c.len() == m * n && bias.len() == n);
+        // x86_64 f32 M>32: hand-written ASM microkernels with fused bias
+        #[cfg(target_arch = "x86_64")]
+        if E::ELEM_ID == 0 && m > 32 {
+            let a_f32 = unsafe { std::slice::from_raw_parts(a.as_ptr() as *const f32, a.len()) };
+            let b_f32 = unsafe { std::slice::from_raw_parts(b.as_ptr() as *const f32, b.len()) };
+            let bias_f32 = unsafe { std::slice::from_raw_parts(bias.as_ptr() as *const f32, bias.len()) };
+            let c_f32 = unsafe { std::slice::from_raw_parts_mut(c.as_mut_ptr() as *mut f32, c.len()) };
+            match get_isa_level() {
+                IsaLevel::Avx512 | IsaLevel::Avx512Fp16 => {
+                    crate::asm::x86_64::gemm_bias_asm_f32_avx512(a_f32, b_f32, bias_f32, c_f32, m, n, k);
+                    return;
+                }
+                IsaLevel::Avx2 => {
+                    crate::asm::x86_64::gemm_bias_asm_f32_avx2(a_f32, b_f32, bias_f32, c_f32, m, n, k);
+                    return;
+                }
+                _ => {}
+            }
+        }
         dispatch_matmul_bias!(matmul_bias, a, b, bias, c, m, n, k);
     }
 
@@ -1076,14 +1137,68 @@ impl<E: Element> Kernels<E> for CpuKernels<E> {
     }
 
     fn pack_b(&self, b: &[E], n: usize, k: usize) -> Vec<E> {
+        // x86_64 f32: use ASM driver's pack_b format (NR-wide strips, full K contiguous)
+        #[cfg(target_arch = "x86_64")]
+        if E::ELEM_ID == 0 {
+            let b_f32 = unsafe { std::slice::from_raw_parts(b.as_ptr() as *const f32, b.len()) };
+            let packed = match get_isa_level() {
+                IsaLevel::Avx512 | IsaLevel::Avx512Fp16 => {
+                    crate::asm::x86_64::pack_b_asm_f32_avx512(b_f32, n, k)
+                }
+                IsaLevel::Avx2 => {
+                    crate::asm::x86_64::pack_b_asm_f32_avx2(b_f32, n, k)
+                }
+                _ => {
+                    return dispatch_pack_b!(pack_b, b, n, k);
+                }
+            };
+            return transmute_vec!(packed, f32);
+        }
         dispatch_pack_b!(pack_b, b, n, k)
     }
 
     fn gemm_prepacked(&self, a: &[E], packed_b: &[E], c: &mut [E], m: usize, n: usize, k: usize) {
+        // x86_64 f32: pack_b always produces ASM format, so prepacked must use ASM driver
+        #[cfg(target_arch = "x86_64")]
+        if E::ELEM_ID == 0 {
+            let a_f32 = unsafe { std::slice::from_raw_parts(a.as_ptr() as *const f32, a.len()) };
+            let pb_f32 = unsafe { std::slice::from_raw_parts(packed_b.as_ptr() as *const f32, packed_b.len()) };
+            let c_f32 = unsafe { std::slice::from_raw_parts_mut(c.as_mut_ptr() as *mut f32, c.len()) };
+            match get_isa_level() {
+                IsaLevel::Avx512 | IsaLevel::Avx512Fp16 => {
+                    crate::asm::x86_64::gemm_prepacked_asm_f32_avx512(a_f32, pb_f32, c_f32, m, n, k);
+                    return;
+                }
+                IsaLevel::Avx2 => {
+                    crate::asm::x86_64::gemm_prepacked_asm_f32_avx2(a_f32, pb_f32, c_f32, m, n, k);
+                    return;
+                }
+                _ => {}
+            }
+        }
         dispatch_with_dims!(matmul_prepacked, a, packed_b, c, m, n, k);
     }
 
     fn gemm_bias_prepacked(&self, a: &[E], packed_b: &[E], bias: &[E], c: &mut [E], m: usize, n: usize, k: usize) {
+        // x86_64 f32: pack_b always produces ASM format, so prepacked must use ASM driver
+        #[cfg(target_arch = "x86_64")]
+        if E::ELEM_ID == 0 {
+            let a_f32 = unsafe { std::slice::from_raw_parts(a.as_ptr() as *const f32, a.len()) };
+            let pb_f32 = unsafe { std::slice::from_raw_parts(packed_b.as_ptr() as *const f32, packed_b.len()) };
+            let bias_f32 = unsafe { std::slice::from_raw_parts(bias.as_ptr() as *const f32, bias.len()) };
+            let c_f32 = unsafe { std::slice::from_raw_parts_mut(c.as_mut_ptr() as *mut f32, c.len()) };
+            match get_isa_level() {
+                IsaLevel::Avx512 | IsaLevel::Avx512Fp16 => {
+                    crate::asm::x86_64::gemm_bias_prepacked_asm_f32_avx512(a_f32, pb_f32, bias_f32, c_f32, m, n, k);
+                    return;
+                }
+                IsaLevel::Avx2 => {
+                    crate::asm::x86_64::gemm_bias_prepacked_asm_f32_avx2(a_f32, pb_f32, bias_f32, c_f32, m, n, k);
+                    return;
+                }
+                _ => {}
+            }
+        }
         dispatch_matmul_bias!(matmul_bias_prepacked, a, packed_b, bias, c, m, n, k);
     }
 

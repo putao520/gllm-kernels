@@ -1689,6 +1689,113 @@ mod tests {
         }
     }
 
+    // ── gemm_bt (B-transposed skinny GEMM) ──
+
+    /// gemm_bt correctness: M=2..32, non-aligned dims, compared to f64 reference.
+    #[test]
+    fn test_gemm_bt_m2_to_m32() {
+        let kernels = CpuKernels::<f32>::new();
+        for &m in &[2, 4, 7, 8, 15, 16, 31, 32] {
+            let (n, k) = (67, 131);
+            let a: Vec<f32> = (0..m * k).map(|i| ((i % 97) as f32) * 0.01 - 0.5).collect();
+            let b: Vec<f32> = (0..k * n).map(|i| ((i % 53) as f32) * 0.02 - 0.5).collect();
+
+            // Transpose B[K×N] → B^T[N×K]
+            let mut b_t = vec![0.0f32; n * k];
+            for ki in 0..k {
+                for j in 0..n {
+                    b_t[j * k + ki] = b[ki * n + j];
+                }
+            }
+
+            // f64 reference
+            let mut c_ref = vec![0.0f64; m * n];
+            for i in 0..m {
+                for j in 0..n {
+                    for l in 0..k {
+                        c_ref[i * n + j] += a[i * k + l] as f64 * b[l * n + j] as f64;
+                    }
+                }
+            }
+
+            let mut c = vec![0.0f32; m * n];
+            kernels.gemm_bt(&a, &b_t, &mut c, m, n, k);
+            for idx in 0..m * n {
+                let tol = c_ref[idx].abs() * 1e-4 + 1e-3;
+                assert!((c[idx] as f64 - c_ref[idx]).abs() < tol,
+                    "gemm_bt M={}: c[{}]={}, ref={}", m, idx, c[idx], c_ref[idx]);
+            }
+        }
+    }
+
+    /// gemm_bt with large N to exercise wide N-tiling + scalar tail.
+    #[test]
+    fn test_gemm_bt_wide_n() {
+        let kernels = CpuKernels::<f32>::new();
+        let (m, n, k) = (8, 512, 256);
+        let a: Vec<f32> = (0..m * k).map(|i| ((i % 37) as f32) * 0.1 - 1.0).collect();
+        let b: Vec<f32> = (0..k * n).map(|i| ((i % 71) as f32) * 0.01 - 0.3).collect();
+
+        let mut b_t = vec![0.0f32; n * k];
+        for ki in 0..k {
+            for j in 0..n {
+                b_t[j * k + ki] = b[ki * n + j];
+            }
+        }
+
+        let mut c_ref = vec![0.0f64; m * n];
+        for i in 0..m {
+            for j in 0..n {
+                for l in 0..k {
+                    c_ref[i * n + j] += a[i * k + l] as f64 * b[l * n + j] as f64;
+                }
+            }
+        }
+
+        let mut c = vec![0.0f32; m * n];
+        kernels.gemm_bt(&a, &b_t, &mut c, m, n, k);
+        for idx in 0..m * n {
+            let tol = c_ref[idx].abs() * 1e-4 + 1e-3;
+            assert!((c[idx] as f64 - c_ref[idx]).abs() < tol,
+                "gemm_bt 8x512x256: c[{}]={}, ref={}", idx, c[idx], c_ref[idx]);
+        }
+    }
+
+    /// gemm_bt with small K (1..3) — edge case for K-unroll remainder.
+    #[test]
+    fn test_gemm_bt_small_k() {
+        let kernels = CpuKernels::<f32>::new();
+        for &k in &[1, 2, 3] {
+            let (m, n) = (5, 16);
+            let a: Vec<f32> = (0..m * k).map(|i| (i as f32) * 0.5 + 0.1).collect();
+            let b: Vec<f32> = (0..k * n).map(|i| (i as f32) * 0.3 - 0.2).collect();
+
+            let mut b_t = vec![0.0f32; n * k];
+            for ki in 0..k {
+                for j in 0..n {
+                    b_t[j * k + ki] = b[ki * n + j];
+                }
+            }
+
+            let mut c_ref = vec![0.0f64; m * n];
+            for i in 0..m {
+                for j in 0..n {
+                    for l in 0..k {
+                        c_ref[i * n + j] += a[i * k + l] as f64 * b[l * n + j] as f64;
+                    }
+                }
+            }
+
+            let mut c = vec![0.0f32; m * n];
+            kernels.gemm_bt(&a, &b_t, &mut c, m, n, k);
+            for idx in 0..m * n {
+                let tol = c_ref[idx].abs() * 1e-4 + 1e-3;
+                assert!((c[idx] as f64 - c_ref[idx]).abs() < tol,
+                    "gemm_bt M=5 K={}: c[{}]={}, ref={}", k, idx, c[idx], c_ref[idx]);
+            }
+        }
+    }
+
     #[test]
     fn test_softmax_length_1() {
         let kernels = CpuKernels::<f32>::new();
@@ -1793,4 +1900,190 @@ mod tests {
                 "rope non-interleaved: data[{}]={}, expected {}", i + half, data[i + half], expected_1);
         }
     }
+
+    // ========================================================================
+    // Block 27: ASM GEMM boundary correctness tests
+    // ========================================================================
+    //
+    // Systematic edge-case coverage for the ASM GEMM path (AVX2 6x16 / AVX-512 14x32).
+    // Tests go through CpuKernels which dispatches to the best available ISA at runtime.
+    //
+    // Edge cases covered:
+    //   - N not a multiple of NR (16 for AVX2, 32 for AVX-512)
+    //   - M not a multiple of MR (6 for AVX2, 14 for AVX-512)
+    //   - K very small (1, 2, 3)
+    //   - K not a multiple of 8 (unroll remainder)
+    //   - Extreme sizes: 1x1x1, 1x1024x1
+    //   - All of the above for gemm, gemm_prepacked, gemm_bias, gemm_bias_prepacked
+
+    /// Deterministic patterned data for reproducible tests.
+    /// Values in [-1.5, 1.5] range to avoid large accumulation errors.
+    fn asm_test_pattern_a(m: usize, k: usize) -> Vec<f32> {
+        (0..m * k).map(|i| ((i % 7) as f32 - 3.0) * 0.5).collect()
+    }
+
+    fn asm_test_pattern_b(k: usize, n: usize) -> Vec<f32> {
+        (0..k * n).map(|i| ((i % 5) as f32 - 2.0) * 0.25).collect()
+    }
+
+    fn asm_test_bias(n: usize) -> Vec<f32> {
+        (0..n).map(|i| ((i % 11) as f32 - 5.0) * 0.3).collect()
+    }
+
+    /// f64 reference GEMM (triple loop). Already exists as `reference_matmul` but
+    /// we define a local version that also supports bias addition for the fused tests.
+    fn ref_gemm_bias(a: &[f32], b: &[f32], bias: Option<&[f32]>, m: usize, n: usize, k: usize) -> Vec<f64> {
+        let mut c = vec![0.0f64; m * n];
+        for i in 0..m {
+            for j in 0..n {
+                let mut sum = 0.0f64;
+                for l in 0..k {
+                    sum += a[i * k + l] as f64 * b[l * n + j] as f64;
+                }
+                if let Some(bias) = bias {
+                    sum += bias[j] as f64;
+                }
+                c[i * n + j] = sum;
+            }
+        }
+        c
+    }
+
+    /// Assert ASM GEMM output matches f64 reference within 1e-5 relative tolerance.
+    fn assert_gemm_close(got: &[f32], expected: &[f64], m: usize, n: usize, label: &str) {
+        assert_eq!(got.len(), m * n, "{label}: output length mismatch");
+        for i in 0..m {
+            for j in 0..n {
+                let idx = i * n + j;
+                let g = got[idx] as f64;
+                let e = expected[idx];
+                let tol = e.abs() * 1e-5 + 1e-4;
+                assert!(
+                    (g - e).abs() < tol,
+                    "{label} [{i},{j}]: got={g}, expected={e}, diff={}, tol={tol}",
+                    (g - e).abs()
+                );
+            }
+        }
+    }
+
+    /// Core test runner: tests gemm, gemm_prepacked, gemm_bias, gemm_bias_prepacked
+    /// for a single (M, N, K) combination.
+    fn check_asm_gemm_all_paths(m: usize, n: usize, k: usize) {
+        let kernels = CpuKernels::<f32>::new();
+        let a = asm_test_pattern_a(m, k);
+        let b = asm_test_pattern_b(k, n);
+        let bias = asm_test_bias(n);
+        let label_base = format!("{}x{}x{}", m, n, k);
+
+        // 1) gemm (regular path)
+        {
+            let ref_c = ref_gemm_bias(&a, &b, None, m, n, k);
+            let mut c = vec![0.0f32; m * n];
+            kernels.gemm(&a, &b, &mut c, m, n, k);
+            assert_gemm_close(&c, &ref_c, m, n, &format!("gemm {label_base}"));
+        }
+
+        // 2) gemm_prepacked
+        {
+            let ref_c = ref_gemm_bias(&a, &b, None, m, n, k);
+            let packed_b = kernels.pack_b(&b, n, k);
+            let mut c = vec![0.0f32; m * n];
+            kernels.gemm_prepacked(&a, &packed_b, &mut c, m, n, k);
+            assert_gemm_close(&c, &ref_c, m, n, &format!("gemm_prepacked {label_base}"));
+        }
+
+        // 3) gemm_bias
+        {
+            let ref_c = ref_gemm_bias(&a, &b, Some(&bias), m, n, k);
+            let mut c = vec![0.0f32; m * n];
+            kernels.gemm_bias(&a, &b, &bias, &mut c, m, n, k);
+            assert_gemm_close(&c, &ref_c, m, n, &format!("gemm_bias {label_base}"));
+        }
+
+        // 4) gemm_bias_prepacked
+        {
+            let ref_c = ref_gemm_bias(&a, &b, Some(&bias), m, n, k);
+            let packed_b = kernels.pack_b(&b, n, k);
+            let mut c = vec![0.0f32; m * n];
+            kernels.gemm_bias_prepacked(&a, &packed_b, &bias, &mut c, m, n, k);
+            assert_gemm_close(&c, &ref_c, m, n, &format!("gemm_bias_prepacked {label_base}"));
+        }
+    }
+
+    // --- N not a multiple of NR ---
+    // NR=16 (AVX2), NR=32 (AVX-512). These N values are not multiples of either.
+
+    #[test] fn test_asm_gemm_n1()  { check_asm_gemm_all_paths(8, 1, 32); }
+    #[test] fn test_asm_gemm_n7()  { check_asm_gemm_all_paths(8, 7, 32); }
+    #[test] fn test_asm_gemm_n15() { check_asm_gemm_all_paths(8, 15, 32); }
+    #[test] fn test_asm_gemm_n17() { check_asm_gemm_all_paths(8, 17, 32); }
+    #[test] fn test_asm_gemm_n31() { check_asm_gemm_all_paths(8, 31, 32); }
+    #[test] fn test_asm_gemm_n33() { check_asm_gemm_all_paths(8, 33, 32); }
+    #[test] fn test_asm_gemm_n63() { check_asm_gemm_all_paths(8, 63, 32); }
+
+    // --- M not a multiple of MR ---
+    // MR=6 (AVX2), MR=14 (AVX-512). These M values are not multiples of either.
+
+    #[test] fn test_asm_gemm_m1()  { check_asm_gemm_all_paths(1, 32, 32); }
+    #[test] fn test_asm_gemm_m3()  { check_asm_gemm_all_paths(3, 32, 32); }
+    #[test] fn test_asm_gemm_m5()  { check_asm_gemm_all_paths(5, 32, 32); }
+    #[test] fn test_asm_gemm_m7()  { check_asm_gemm_all_paths(7, 32, 32); }
+    #[test] fn test_asm_gemm_m13() { check_asm_gemm_all_paths(13, 32, 32); }
+
+    // --- K very small ---
+
+    #[test] fn test_asm_gemm_k1() { check_asm_gemm_all_paths(8, 32, 1); }
+    #[test] fn test_asm_gemm_k2() { check_asm_gemm_all_paths(8, 32, 2); }
+    #[test] fn test_asm_gemm_k3() { check_asm_gemm_all_paths(8, 32, 3); }
+
+    // --- K not a multiple of 8 (unroll remainder) ---
+
+    #[test] fn test_asm_gemm_k5()  { check_asm_gemm_all_paths(8, 32, 5); }
+    #[test] fn test_asm_gemm_k7()  { check_asm_gemm_all_paths(8, 32, 7); }
+    #[test] fn test_asm_gemm_k9()  { check_asm_gemm_all_paths(8, 32, 9); }
+    #[test] fn test_asm_gemm_k15() { check_asm_gemm_all_paths(8, 32, 15); }
+
+    // --- Extreme sizes ---
+
+    #[test] fn test_asm_gemm_1x1x1()    { check_asm_gemm_all_paths(1, 1, 1); }
+    #[test] fn test_asm_gemm_1x1024x1() { check_asm_gemm_all_paths(1, 1024, 1); }
+
+    // --- Combined M/N/K edge cases (all three dimensions non-aligned simultaneously) ---
+
+    #[test] fn test_asm_gemm_m1_n1_k1()   { check_asm_gemm_all_paths(1, 1, 1); }
+    #[test] fn test_asm_gemm_m1_n7_k3()   { check_asm_gemm_all_paths(1, 7, 3); }
+    #[test] fn test_asm_gemm_m3_n15_k5()  { check_asm_gemm_all_paths(3, 15, 5); }
+    #[test] fn test_asm_gemm_m5_n17_k7()  { check_asm_gemm_all_paths(5, 17, 7); }
+    #[test] fn test_asm_gemm_m7_n31_k9()  { check_asm_gemm_all_paths(7, 31, 9); }
+    #[test] fn test_asm_gemm_m13_n33_k15() { check_asm_gemm_all_paths(13, 33, 15); }
+    #[test] fn test_asm_gemm_m5_n63_k2()  { check_asm_gemm_all_paths(5, 63, 2); }
+    #[test] fn test_asm_gemm_m7_n1_k15()  { check_asm_gemm_all_paths(7, 1, 15); }
+    #[test] fn test_asm_gemm_m13_n7_k1()  { check_asm_gemm_all_paths(13, 7, 1); }
+    #[test] fn test_asm_gemm_m1_n33_k9()  { check_asm_gemm_all_paths(1, 33, 9); }
+
+    // --- Exact tile boundaries (should work perfectly, regression guard) ---
+    // AVX2: MR=6, NR=16
+    #[test] fn test_asm_gemm_avx2_exact()  { check_asm_gemm_all_paths(6, 16, 8); }
+    #[test] fn test_asm_gemm_avx2_2x2()   { check_asm_gemm_all_paths(12, 32, 16); }
+    // AVX-512: MR=14, NR=32
+    #[test] fn test_asm_gemm_avx512_exact() { check_asm_gemm_all_paths(14, 32, 8); }
+    #[test] fn test_asm_gemm_avx512_2x2()  { check_asm_gemm_all_paths(28, 64, 16); }
+
+    // --- One-off from tile boundary (most likely to trigger off-by-one bugs) ---
+    // AVX2 MR-1, MR+1, NR-1, NR+1
+    #[test] fn test_asm_gemm_avx2_mr_minus1() { check_asm_gemm_all_paths(5, 16, 32); }
+    #[test] fn test_asm_gemm_avx2_mr_plus1()  { check_asm_gemm_all_paths(7, 16, 32); }
+    #[test] fn test_asm_gemm_avx2_nr_minus1() { check_asm_gemm_all_paths(6, 15, 32); }
+    #[test] fn test_asm_gemm_avx2_nr_plus1()  { check_asm_gemm_all_paths(6, 17, 32); }
+    // AVX-512 MR-1, MR+1, NR-1, NR+1
+    #[test] fn test_asm_gemm_avx512_mr_minus1() { check_asm_gemm_all_paths(13, 32, 32); }
+    #[test] fn test_asm_gemm_avx512_mr_plus1()  { check_asm_gemm_all_paths(15, 32, 32); }
+    #[test] fn test_asm_gemm_avx512_nr_minus1() { check_asm_gemm_all_paths(14, 31, 32); }
+    #[test] fn test_asm_gemm_avx512_nr_plus1()  { check_asm_gemm_all_paths(14, 33, 32); }
+
+    // --- Large non-aligned (multi-tile with remainder on all dimensions) ---
+    #[test] fn test_asm_gemm_large_non_aligned() { check_asm_gemm_all_paths(37, 67, 131); }
+    #[test] fn test_asm_gemm_large_m1_wide()     { check_asm_gemm_all_paths(1, 257, 64); }
+    #[test] fn test_asm_gemm_large_skinny_tall()  { check_asm_gemm_all_paths(97, 3, 15); }
 }

@@ -132,7 +132,7 @@ macro_rules! quant_primitive_commercial {
         unsafe {
             #[cfg(target_arch = "x86_64")]
             {
-                use std::arch::x86_64::*;
+                
 
                 let block = &*$block_ptr;
                 let d: f32 = block.d.to_f32();
@@ -169,7 +169,7 @@ macro_rules! quant_primitive_commercial {
         unsafe {
             #[cfg(target_arch = "x86_64")]
             {
-                use std::arch::x86_64::*;
+                
 
                 let block = &*$block_ptr;
                 let d: f32 = block.d.to_f32();
@@ -215,7 +215,7 @@ macro_rules! quant_primitive_commercial {
         unsafe {
             #[cfg(target_arch = "x86_64")]
             {
-                use std::arch::x86_64::*;
+                
 
                 let block = &*$block_ptr;
                 let d: f32 = block.d.to_f32();
@@ -252,7 +252,7 @@ macro_rules! quant_primitive_commercial {
         unsafe {
             #[cfg(target_arch = "x86_64")]
             {
-                use std::arch::x86_64::*;
+                
 
                 let block = &*$block_ptr;
                 let d: f32 = block.d.to_f32();
@@ -381,7 +381,7 @@ macro_rules! quant_primitive_commercial {
         unsafe {
             #[cfg(target_arch = "x86_64")]
             {
-                use std::arch::x86_64::*;
+                
 
                 let block = &*$block_ptr;
                 let d: f32 = block.scales.to_f32();
@@ -418,7 +418,7 @@ macro_rules! quant_primitive_commercial {
         unsafe {
             #[cfg(target_arch = "x86_64")]
             {
-                use std::arch::x86_64::*;
+                
 
                 let block = &*$block_ptr;
                 let d: f32 = block.scales.to_f32();
@@ -460,7 +460,7 @@ macro_rules! quant_primitive_commercial {
         unsafe {
             #[cfg(target_arch = "x86_64")]
             {
-                use std::arch::x86_64::*;
+                
 
                 let block = &*$block_ptr;
                 let d: f32 = block.scales.to_f32();
@@ -496,7 +496,7 @@ macro_rules! quant_primitive_commercial {
         unsafe {
             #[cfg(target_arch = "x86_64")]
             {
-                use std::arch::x86_64::*;
+                
 
                 let block = &*$block_ptr;
                 let d: f32 = block.scales.to_f32();
@@ -540,7 +540,7 @@ macro_rules! quant_primitive_commercial {
         unsafe {
             #[cfg(target_arch = "x86_64")]
             {
-                use std::arch::x86_64::*;
+                
 
                 let block = &*$block_ptr;
                 let d: f32 = block.scales.to_f32();
@@ -576,7 +576,7 @@ macro_rules! quant_primitive_commercial {
         unsafe {
             #[cfg(target_arch = "x86_64")]
             {
-                use std::arch::x86_64::*;
+                
 
                 let block = &*$block_ptr;
                 let d: f32 = block.scales.to_f32();
@@ -616,7 +616,7 @@ macro_rules! quant_primitive_commercial {
         unsafe {
             #[cfg(target_arch = "x86_64")]
             {
-                use std::arch::x86_64::*;
+                
 
                 let block = &*$block_ptr;
                 let d: f32 = block.scales.to_f32();
@@ -652,7 +652,7 @@ macro_rules! quant_primitive_commercial {
         unsafe {
             #[cfg(target_arch = "x86_64")]
             {
-                use std::arch::x86_64::*;
+                
 
                 let block = &*$block_ptr;
                 let d: f32 = block.scales.to_f32();

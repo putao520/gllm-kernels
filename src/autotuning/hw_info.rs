@@ -140,7 +140,7 @@ fn detect_cpu_identity() -> (String, String) {
 
 #[cfg(target_arch = "x86_64")]
 fn detect_x86_identity() -> Option<(String, String)> {
-    let vendor = unsafe {
+    let vendor = {
         let r = std::arch::x86_64::__cpuid(0);
         let mut bytes = [0u8; 12];
         bytes[0..4].copy_from_slice(&r.ebx.to_le_bytes());
@@ -149,7 +149,7 @@ fn detect_x86_identity() -> Option<(String, String)> {
         String::from_utf8_lossy(&bytes).trim().to_string()
     };
 
-    let model_name = unsafe {
+    let model_name = {
         let mut name = String::with_capacity(48);
         for leaf in 0x80000002u32..=0x80000004u32 {
             let r = std::arch::x86_64::__cpuid(leaf);
@@ -237,7 +237,7 @@ fn detect_linux_physical_cores() -> Option<usize> {
 fn detect_cacheline_size() -> usize {
     #[cfg(target_arch = "x86_64")]
     {
-        let info = unsafe { std::arch::x86_64::__cpuid(1) };
+        let info = std::arch::x86_64::__cpuid(1);
         let cl = ((info.ebx >> 8) & 0xFF) as usize * 8;
         if cl > 0 {
             return cl;
