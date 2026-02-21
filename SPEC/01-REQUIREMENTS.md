@@ -12,10 +12,10 @@
 
 | ID | 需求 | 验收标准 | 状态 |
 |----|------|----------|------|
-| **REQ-PERF-001** | Compute-bound 算子逼近计算峰值 | GEMM 达到理论 FLOPS 峰值的 **≥ 85%** | 🔴 当前 41%，需手写汇编 |
-| **REQ-PERF-002** | Memory-bound 算子逼近带宽峰值 | 激活/归一化/BLAS-1 达到内存带宽的 **≥ 90%** | 🟡 待测 |
-| **REQ-PERF-003** | 量化算子逼近瓶颈极限 | 量化 GEMV/GEMM 达到 **≥ 85%** 瓶颈极限 | 🔴 需手写汇编 |
-| **REQ-PERF-004** | 手写汇编微内核 | GEMM、量化 GEMV/GEMM 必须使用 `global_asm!` 手写汇编 | 🔴 待实现 |
+| **REQ-PERF-001** | Compute-bound 算子逼近计算峰值 | GEMM 达到理论 FLOPS 峰值的 **≥ 85%** | 🟡 当前 59% (prepacked)，优化中 |
+| **REQ-PERF-002** | Memory-bound 算子逼近带宽峰值 | 激活/归一化/BLAS-1 达到内存带宽的 **≥ 90%** | 🟡 GEMV 67-76%，activation 需大尺寸验证 |
+| **REQ-PERF-003** | 量化算子逼近瓶颈极限 | 量化 GEMV/GEMM 达到 **≥ 85%** 瓶颈极限 | 🟡 ASM 微内核已写，待效率验证 |
+| **REQ-PERF-004** | 手写汇编微内核 | GEMM、量化 GEMV/GEMM 必须使用 `global_asm!` 手写汇编 | 🟢 已完成（8 个 global_asm! 微内核） |
 | **REQ-PERF-005** | 运行时 CPUID 分发 | 启动时一次检测 ISA，之后零开销分发到最优微内核 | 🟢 已完成 |
 
 ---
@@ -36,9 +36,9 @@
 | **REQ-OPS-008** | vec_max | `(x: &[E]) -> E` | Memory | 🟢 已完成 |
 | **REQ-OPS-009** | vec_sum_squares | `(x: &[E]) -> E` | Memory | 🟢 已完成 |
 | **REQ-OPS-010** | gemv | `(a: &[E], x: &[E], y: &mut [E], m, n)` | Memory | 🟢 已完成 |
-| **REQ-OPS-011** | gemm | `(a: &[E], b: &[E], c: &mut [E], m, n, k)` | Compute | 🟡 intrinsics 实现，需手写 asm |
-| **REQ-OPS-012** | gemm_bias | `(a, b, bias, c, m, n, k)` | Compute | 🟡 同上 |
-| **REQ-OPS-013** | gemm_prepacked | `(a, packed_b, c, m, n, k)` | Compute | 🟡 同上 |
+| **REQ-OPS-011** | gemm | `(a: &[E], b: &[E], c: &mut [E], m, n, k)` | Compute | 🟢 ASM 微内核 (AVX2 6×16, AVX-512 14×32, NEON 8×12) |
+| **REQ-OPS-012** | gemm_bias | `(a, b, bias, c, m, n, k)` | Compute | 🟢 ASM fused path |
+| **REQ-OPS-013** | gemm_prepacked | `(a, packed_b, c, m, n, k)` | Compute | 🟢 ASM driver |
 | **REQ-OPS-014** | pack_b | `(b, packed_b, n, k)` | Memory | 🟢 已完成 |
 
 ### 2.2 激活函数
@@ -94,17 +94,17 @@
 
 | ID | 算子 | 权重格式 | 状态 |
 |----|------|----------|------|
-| **REQ-OPS-070** | gemv_q8 | INT8 | 🟡 intrinsics，需手写 asm |
-| **REQ-OPS-071** | gemv_q4 | INT4 packed | 🟡 同上 |
-| **REQ-OPS-072** | gemv_q2 | INT2 packed | 🟡 同上 |
-| **REQ-OPS-073** | gemv_q1 | INT1 packed | 🟡 同上 |
-| **REQ-OPS-074** | gemm_q8 | INT8 | 🟡 同上 |
-| **REQ-OPS-075** | gemm_q4 | INT4 packed | 🟡 同上 |
-| **REQ-OPS-076** | kquant_matmul | K-Quant 系列 | 🟡 同上 |
-| **REQ-OPS-077** | iq_matmul | IQ 系列 | 🟡 同上 |
-| **REQ-OPS-078** | awq_matmul | AWQ4 | 🟡 同上 |
-| **REQ-OPS-079** | gptq_matmul | GPTQ4 | 🟡 同上 |
-| **REQ-OPS-080** | squeeze_matmul | SqueezeLLM | 🟡 同上 |
+| **REQ-OPS-070** | gemv_q8 | INT8 | 🟢 ASM 微内核 (AVX2/AVX-512/NEON) |
+| **REQ-OPS-071** | gemv_q4 | INT4 packed | 🟢 ASM 微内核 (AVX2/AVX-512/NEON) |
+| **REQ-OPS-072** | gemv_q2 | INT2 packed | 🟡 intrinsics |
+| **REQ-OPS-073** | gemv_q1 | INT1 packed | 🟡 intrinsics |
+| **REQ-OPS-074** | gemm_q8 | INT8 | 🟡 intrinsics |
+| **REQ-OPS-075** | gemm_q4 | INT4 packed | 🟡 intrinsics |
+| **REQ-OPS-076** | kquant_matmul | K-Quant 系列 | 🟢 Q4K/Q8K ASM, 其余 intrinsics |
+| **REQ-OPS-077** | iq_matmul | IQ 系列 | 🟡 intrinsics |
+| **REQ-OPS-078** | awq_matmul | AWQ4 | 🟡 intrinsics |
+| **REQ-OPS-079** | gptq_matmul | GPTQ4 | 🟡 intrinsics |
+| **REQ-OPS-080** | squeeze_matmul | SqueezeLLM | 🟡 intrinsics |
 
 ---
 
@@ -113,7 +113,7 @@
 | ID | 需求 | 验收标准 | 状态 |
 |----|------|----------|------|
 | **REQ-ARCH-001** | 纯 Rust 零外部依赖 | `cargo install` 一键安装，禁止 faer/OpenBLAS/MKL | 🟢 已完成 |
-| **REQ-ARCH-002** | 手写汇编微内核 | GEMM/量化 GEMV 使用 `global_asm!` | 🔴 待实现 |
+| **REQ-ARCH-002** | 手写汇编微内核 | GEMM/量化 GEMV 使用 `global_asm!` | 🟢 已完成（8 个微内核） |
 | **REQ-ARCH-003** | 运行时 ISA 分发 | OnceLock + CPUID 检测，启动后零开销 | 🟢 已完成 |
 | **REQ-ARCH-004** | 泛型精度支持 | f32/f16/bf16 通过 `<E: Element>` 编译时单态化 | 🟢 已完成 |
 | **REQ-ARCH-005** | 宏驱动代码生成 | 非热路径通过四层宏架构批量展开 | 🟢 已完成 |
@@ -126,9 +126,9 @@
 | ISA | f32 | f16 | bf16 | 手写 asm | 状态 |
 |-----|-----|-----|------|---------|------|
 | **Scalar** | ✅ | ✅ 软件转换 | ✅ 软件转换 | N/A | 🟢 |
-| **AVX2** | ✅ | ✅ F16C | ✅ 位转换 | 🔴 待实现 | 🟡 |
-| **AVX-512** | ✅ | ⚡ FP16 原生 | ⚡ BF16 原生 | 🔴 待实现 | 🟡 |
-| **NEON** | ✅ | ⚡ FP16 原生 | ✅ 位转换 | 🔴 待实现 | 🟡 |
+| **AVX2** | ✅ | ✅ F16C | ✅ 位转换 | ✅ GEMM 6×16 + Q4K/Q8K GEMV | 🟢 |
+| **AVX-512** | ✅ | ⚡ FP16 原生 | ⚡ BF16 原生 | ✅ GEMM 14×32 + Q4K/Q8K GEMV | 🟢 |
+| **NEON** | ✅ | ⚡ FP16 原生 | ✅ 位转换 | ✅ GEMM 8×12 + Q4K/Q8K GEMV | 🟢 |
 
 ---
 

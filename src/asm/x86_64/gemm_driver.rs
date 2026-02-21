@@ -17,6 +17,12 @@ use crate::cache_params::{self, AlignedVec};
 ///
 /// Input A is row-major: a[i*lda + k]
 /// Output: packed[k*MR + i_local] for each MR-wide strip
+///
+/// For MR=6 (AVX2) uses a vectorized 6×8 transpose kernel:
+///   - Reads 6 rows × 8 columns with vmovups (sequential, cache-friendly)
+///   - Transposes with vunpcklps/vunpckhps/vperm2f128 (no memory traffic)
+///   - Writes 8 packed columns of 6 elements each
+/// This eliminates the scalar gather pattern and saturates L1D bandwidth.
 #[cfg(target_arch = "x86_64")]
 #[inline]
 unsafe fn pack_a_f32(
@@ -27,10 +33,18 @@ unsafe fn pack_a_f32(
     kc: usize,
     mr: usize,
 ) {
+    // AVX2 fast path for MR=6: vectorized 6×8 transpose.
+    // Runtime check so this works regardless of compile-time target-cpu.
+    if mr == 6 && is_x86_feature_detected!("avx2") {
+        // Safety: we just confirmed AVX2 is available at runtime.
+        pack_a_f32_avx2_mr6(a, lda, packed, mc, kc);
+        return;
+    }
+
+    // Scalar fallback for other MR values or non-AVX2 hosts
     let mut p = packed;
     let mut i = 0usize;
 
-    // Full MR-wide panels: swap loop order so A reads are sequential (row-major friendly)
     while i + mr <= mc {
         for r in 0..mr {
             let a_row = a.add((i + r) * lda);
@@ -42,15 +56,186 @@ unsafe fn pack_a_f32(
         i += mr;
     }
 
-    // Remainder panel: zero-pad to MR width
     if i < mc {
         let rem = mc - i;
-        // Zero the entire remainder panel first
         std::ptr::write_bytes(p, 0, mr * kc);
         for r in 0..rem {
             let a_row = a.add((i + r) * lda);
             for k in 0..kc {
                 *p.add(k * mr + r) = *a_row.add(k);
+            }
+        }
+    }
+}
+
+/// AVX2 vectorized pack_a for MR=6: 6×8 transpose kernel.
+///
+/// Processes 8 K-columns at a time using AVX2 shuffle instructions.
+/// Each iteration reads 6×8 = 48 floats and writes 48 floats in packed layout.
+///
+/// Transpose of 6×8 block:
+///   Input rows:  r0[k0..k7], r1[k0..k7], ..., r5[k0..k7]
+///   Output cols: packed[k*6 + 0..5] for k in 0..8
+///
+/// Uses vunpcklps/vunpckhps to interleave pairs, then vperm2f128 to
+/// combine low/high 128-bit halves across the 256-bit registers.
+///
+/// Marked with #[target_feature(enable = "avx2")] so it always compiles
+/// but is only called after a runtime `is_x86_feature_detected!("avx2")` check.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+#[inline]
+unsafe fn pack_a_f32_avx2_mr6(
+    a: *const f32,
+    lda: usize,
+    packed: *mut f32,
+    mc: usize,
+    kc: usize,
+) {
+    use std::arch::x86_64::*;
+    const MR: usize = 6;
+
+    let mut p = packed;
+    let mut i = 0usize;
+
+    // Full MR=6 panels
+    while i + MR <= mc {
+        let row0 = a.add((i + 0) * lda);
+        let row1 = a.add((i + 1) * lda);
+        let row2 = a.add((i + 2) * lda);
+        let row3 = a.add((i + 3) * lda);
+        let row4 = a.add((i + 4) * lda);
+        let row5 = a.add((i + 5) * lda);
+
+        let mut k = 0usize;
+
+        // Process 8 K-columns at a time with AVX2 transpose
+        while k + 8 <= kc {
+            // Load 8 floats from each of the 6 rows
+            let r0 = _mm256_loadu_ps(row0.add(k));
+            let r1 = _mm256_loadu_ps(row1.add(k));
+            let r2 = _mm256_loadu_ps(row2.add(k));
+            let r3 = _mm256_loadu_ps(row3.add(k));
+            let r4 = _mm256_loadu_ps(row4.add(k));
+            let r5 = _mm256_loadu_ps(row5.add(k));
+
+            // Transpose 6×8 → 8×6 using shuffle/permute
+            // Step 1: interleave pairs within each 128-bit lane
+            // unpacklo: [a0,b0,a1,b1, a4,b4,a5,b5]
+            // unpackhi: [a2,b2,a3,b3, a6,b6,a7,b7]
+            let u01l = _mm256_unpacklo_ps(r0, r1); // [r0[0],r1[0],r0[1],r1[1], r0[4],r1[4],r0[5],r1[5]]
+            let u01h = _mm256_unpackhi_ps(r0, r1); // [r0[2],r1[2],r0[3],r1[3], r0[6],r1[6],r0[7],r1[7]]
+            let u23l = _mm256_unpacklo_ps(r2, r3);
+            let u23h = _mm256_unpackhi_ps(r2, r3);
+            let u45l = _mm256_unpacklo_ps(r4, r5);
+            let u45h = _mm256_unpackhi_ps(r4, r5);
+
+            // Step 2: interleave quads
+            // shuffle(u01l, u23l, 0x44) = [u01l[0..1], u23l[0..1], u01l[4..5], u23l[4..5]]
+            //   = [r0[0],r1[0],r2[0],r3[0], r0[4],r1[4],r2[4],r3[4]]
+            let q0 = _mm256_shuffle_ps::<0x44>(u01l, u23l); // cols 0,4: r0-r3
+            let q1 = _mm256_shuffle_ps::<0xEE>(u01l, u23l); // cols 1,5: r0-r3
+            let q2 = _mm256_shuffle_ps::<0x44>(u01h, u23h); // cols 2,6: r0-r3
+            let q3 = _mm256_shuffle_ps::<0xEE>(u01h, u23h); // cols 3,7: r0-r3
+
+            // Step 3: extract low/high 128-bit halves to get contiguous k-columns
+            // For k-column 0: [r0[0],r1[0],r2[0],r3[0]] from low half of q0
+            // For k-column 4: [r0[4],r1[4],r2[4],r3[4]] from high half of q0
+            let col0_03 = _mm256_permute2f128_ps::<0x20>(q0, q1); // low halves: k=0,1
+            let col2_03 = _mm256_permute2f128_ps::<0x20>(q2, q3); // low halves: k=2,3
+            let col4_03 = _mm256_permute2f128_ps::<0x31>(q0, q1); // high halves: k=4,5
+            let col6_03 = _mm256_permute2f128_ps::<0x31>(q2, q3); // high halves: k=6,7
+
+            // Extract 128-bit lanes for the 4-element (r0-r3) parts of each k-column
+            let c0_03 = _mm256_castps256_ps128(col0_03);      // [r0[0],r1[0],r2[0],r3[0]]
+            let c1_03 = _mm256_extractf128_ps::<1>(col0_03);  // [r0[1],r1[1],r2[1],r3[1]]
+            let c2_03 = _mm256_castps256_ps128(col2_03);
+            let c3_03 = _mm256_extractf128_ps::<1>(col2_03);
+            let c4_03 = _mm256_castps256_ps128(col4_03);
+            let c5_03 = _mm256_extractf128_ps::<1>(col4_03);
+            let c6_03 = _mm256_castps256_ps128(col6_03);
+            let c7_03 = _mm256_extractf128_ps::<1>(col6_03);
+
+            // r4,r5 contribution: 2 rows only, use 128-bit ops
+            let u45l_lo = _mm256_castps256_ps128(u45l);
+            let u45l_hi = _mm256_extractf128_ps::<1>(u45l);
+            let u45h_lo = _mm256_castps256_ps128(u45h);
+            let u45h_hi = _mm256_extractf128_ps::<1>(u45h);
+
+            // Store the 128-bit registers to temp arrays for scalar extraction.
+            // u45l_lo = [r4[0], r5[0], r4[1], r5[1]]
+            // u45h_lo = [r4[2], r5[2], r4[3], r5[3]]
+            // u45l_hi = [r4[4], r5[4], r4[5], r5[5]]
+            // u45h_hi = [r4[6], r5[6], r4[7], r5[7]]
+            let mut t45ll = [0.0f32; 4];
+            let mut t45lh = [0.0f32; 4];
+            let mut t45hl = [0.0f32; 4];
+            let mut t45hh = [0.0f32; 4];
+            _mm_storeu_ps(t45ll.as_mut_ptr(), u45l_lo);
+            _mm_storeu_ps(t45lh.as_mut_ptr(), u45l_hi);
+            _mm_storeu_ps(t45hl.as_mut_ptr(), u45h_lo);
+            _mm_storeu_ps(t45hh.as_mut_ptr(), u45h_hi);
+
+            // Write each k-column: 4 floats (r0-r3) via 128-bit store, then 2 floats (r4-r5) scalar
+            // k+0
+            _mm_storeu_ps(p.add((k + 0) * MR), c0_03);
+            *p.add((k + 0) * MR + 4) = t45ll[0];
+            *p.add((k + 0) * MR + 5) = t45ll[1];
+            // k+1
+            _mm_storeu_ps(p.add((k + 1) * MR), c1_03);
+            *p.add((k + 1) * MR + 4) = t45ll[2];
+            *p.add((k + 1) * MR + 5) = t45ll[3];
+            // k+2
+            _mm_storeu_ps(p.add((k + 2) * MR), c2_03);
+            *p.add((k + 2) * MR + 4) = t45hl[0];
+            *p.add((k + 2) * MR + 5) = t45hl[1];
+            // k+3
+            _mm_storeu_ps(p.add((k + 3) * MR), c3_03);
+            *p.add((k + 3) * MR + 4) = t45hl[2];
+            *p.add((k + 3) * MR + 5) = t45hl[3];
+            // k+4
+            _mm_storeu_ps(p.add((k + 4) * MR), c4_03);
+            *p.add((k + 4) * MR + 4) = t45lh[0];
+            *p.add((k + 4) * MR + 5) = t45lh[1];
+            // k+5
+            _mm_storeu_ps(p.add((k + 5) * MR), c5_03);
+            *p.add((k + 5) * MR + 4) = t45lh[2];
+            *p.add((k + 5) * MR + 5) = t45lh[3];
+            // k+6
+            _mm_storeu_ps(p.add((k + 6) * MR), c6_03);
+            *p.add((k + 6) * MR + 4) = t45hh[0];
+            *p.add((k + 6) * MR + 5) = t45hh[1];
+            // k+7
+            _mm_storeu_ps(p.add((k + 7) * MR), c7_03);
+            *p.add((k + 7) * MR + 4) = t45hh[2];
+            *p.add((k + 7) * MR + 5) = t45hh[3];
+
+            k += 8;
+        }
+
+        // Scalar tail for remaining k columns
+        while k < kc {
+            *p.add(k * MR + 0) = *row0.add(k);
+            *p.add(k * MR + 1) = *row1.add(k);
+            *p.add(k * MR + 2) = *row2.add(k);
+            *p.add(k * MR + 3) = *row3.add(k);
+            *p.add(k * MR + 4) = *row4.add(k);
+            *p.add(k * MR + 5) = *row5.add(k);
+            k += 1;
+        }
+
+        p = p.add(MR * kc);
+        i += MR;
+    }
+
+    // Remainder panel (< MR rows): zero-pad to MR width
+    if i < mc {
+        let rem = mc - i;
+        std::ptr::write_bytes(p, 0, MR * kc);
+        for r in 0..rem {
+            let a_row = a.add((i + r) * lda);
+            for k in 0..kc {
+                *p.add(k * MR + r) = *a_row.add(k);
             }
         }
     }
@@ -738,50 +923,62 @@ pub fn gemm_bias_asm_f32_avx512(
 // Pre-packed B support: pack_b + prepacked GEMM drivers
 // ============================================================================
 
-/// Pack the entire B matrix [K x N] into NR-wide strips for the ASM driver.
+/// Pack the entire B matrix [K x N] into KC-blocked, NR-wide strips.
 ///
-/// Layout: for each NR-wide strip j (j=0, NR, 2*NR, ...):
-///   packed[strip * K * NR + k * NR + j_local] = B[k, j + j_local]
+/// Layout (KC-blocked):
+///   For each KC-block p (p=0, KC, 2*KC, ...):
+///     For each NR-wide strip j (j=0, NR, 2*NR, ...):
+///       packed[p_block * n_strips * kc_len * NR + strip * kc_len * NR + k_local * NR + j_local]
+///         = B[p*KC + k_local, j + j_local]
 ///
-/// Remainder columns (N % NR != 0) are zero-padded to NR width.
-/// Total size: ceil(N/NR) * K * NR.
+/// This layout ensures that within a KC iteration, all NR-strips for that
+/// KC-block are contiguous in memory. The prefetcher sees a linear scan
+/// of size (n_strips * kc_len * NR * 4) bytes per KC-block, eliminating
+/// the 131KB inter-strip jumps of the old flat layout.
 ///
-/// This format allows the prepacked driver to index directly into the
-/// correct (kc, nc) tile without any repacking.
+/// Total size: n_kc_blocks * n_strips * kc_len * NR + NR (padding).
+/// The `kc` parameter must match the driver's KC blocking (from `kernel_config().kc`).
 #[cfg(target_arch = "x86_64")]
-fn pack_b_full_f32(b: &[f32], n: usize, k: usize, nr: usize) -> Vec<f32> {
+fn pack_b_full_f32(b: &[f32], n: usize, k: usize, nr: usize, kc: usize) -> Vec<f32> {
     assert!(b.len() >= k * n);
     let n_strips = (n + nr - 1) / nr;
+    let n_kc_blocks = (k + kc - 1) / kc;
     // +nr padding: microkernel speculatively loads B[next] before checking loop exit
-    let total = n_strips * k * nr + nr;
+    let total = n_kc_blocks * n_strips * kc * nr + nr;
     let mut packed = vec![0.0f32; total];
 
     let b_ptr = b.as_ptr();
     let p_ptr = packed.as_mut_ptr();
 
     unsafe {
-        let mut j = 0usize;
-        let mut strip = 0usize;
-        while j + nr <= n {
-            // Full NR-wide strip: copy NR elements per row
-            let base = strip * k * nr;
-            for kk in 0..k {
-                let src = b_ptr.add(kk * n + j);
-                let dst = p_ptr.add(base + kk * nr);
-                std::ptr::copy_nonoverlapping(src, dst, nr);
-            }
-            j += nr;
-            strip += 1;
-        }
-        if j < n {
-            // Remainder strip: copy actual columns, rest is already zero
-            let rem = n - j;
-            let base = strip * k * nr;
-            for kk in 0..k {
-                let src = b_ptr.add(kk * n + j);
-                let dst = p_ptr.add(base + kk * nr);
-                std::ptr::copy_nonoverlapping(src, dst, rem);
-                // Remaining (nr - rem) elements are already 0 from vec init
+        for kc_block in 0..n_kc_blocks {
+            let pc = kc_block * kc;
+            let kc_len = kc.min(k - pc); // actual rows in this KC-block
+
+            for strip in 0..n_strips {
+                let j = strip * nr;
+                let col_rem = nr.min(n - j); // actual columns in this strip
+
+                // Base offset for this (kc_block, strip) tile
+                let tile_base = kc_block * n_strips * kc * nr + strip * kc * nr;
+
+                if col_rem == nr {
+                    // Full NR-wide strip: copy NR elements per row
+                    for k_local in 0..kc_len {
+                        let src = b_ptr.add((pc + k_local) * n + j);
+                        let dst = p_ptr.add(tile_base + k_local * nr);
+                        std::ptr::copy_nonoverlapping(src, dst, nr);
+                    }
+                    // Zero-pad remaining kc rows (kc_len..kc) — already zero from vec init
+                } else {
+                    // Remainder strip: copy actual columns, rest already zero
+                    for k_local in 0..kc_len {
+                        let src = b_ptr.add((pc + k_local) * n + j);
+                        let dst = p_ptr.add(tile_base + k_local * nr);
+                        std::ptr::copy_nonoverlapping(src, dst, col_rem);
+                        // Remaining (nr - col_rem) elements are already 0
+                    }
+                }
             }
         }
     }
@@ -793,22 +990,27 @@ fn pack_b_full_f32(b: &[f32], n: usize, k: usize, nr: usize) -> Vec<f32> {
 #[cfg(target_arch = "x86_64")]
 pub fn pack_b_asm_f32_avx2(b: &[f32], n: usize, k: usize) -> Vec<f32> {
     use super::gemm_avx2::NR;
-    pack_b_full_f32(b, n, k, NR)
+    let kc = crate::microarch::kernel_config().kc;
+    pack_b_full_f32(b, n, k, NR, kc)
 }
 
 /// Pack B for the AVX-512 ASM driver (NR=32).
 #[cfg(target_arch = "x86_64")]
 pub fn pack_b_asm_f32_avx512(b: &[f32], n: usize, k: usize) -> Vec<f32> {
     use super::gemm_avx512::NR;
-    pack_b_full_f32(b, n, k, NR)
+    let kc = crate::microarch::kernel_config().kc;
+    pack_b_full_f32(b, n, k, NR, kc)
 }
 
 /// Single-threaded BLIS-style GEMM driver with pre-packed B.
 ///
 /// C = A * packed_B  (row-major, C is m x n, A is m x k)
 ///
-/// `packed_b` must have been produced by `pack_b_full_f32` with the same NR.
-/// The driver skips the pack_b step and indexes directly into the pre-packed buffer.
+/// `packed_b` must have been produced by `pack_b_full_f32` with the same NR and KC.
+/// The driver skips the pack_b step and indexes directly into the KC-blocked pre-packed buffer.
+///
+/// KC-blocked B layout: packed_b[kc_block * n_strips * kc * nr + strip * kc * nr + k_local * nr]
+/// This gives sequential memory access within each KC iteration (no inter-strip jumps).
 #[cfg(target_arch = "x86_64")]
 fn gemm_prepacked_driver_f32(
     a: &[f32],
@@ -836,16 +1038,10 @@ fn gemm_prepacked_driver_f32(
     // Dynamic KC: when M is small (few MC blocks), increase KC to reduce
     // KC-block count and C matrix load/store traffic. Constraint: A panel
     // (MC × KC × 4 bytes) must fit in L2 cache.
-    let num_mc_blocks = (m + mc_max - 1) / mc_max;
-    let kc_max = if num_mc_blocks <= 3 && k > cfg.kc {
-        // A panel budget: ~90% of L2
-        let l2_budget = cfg.l2 * 9 / 10;
-        let kc_l2 = l2_budget / (mc_max * 4);
-        let kc = (kc_l2 & !7).min(k).max(cfg.kc);
-        kc
-    } else {
-        cfg.kc
-    };
+    // NOTE: kc_max must match the kc used in pack_b_full_f32 (cfg.kc).
+    // Dynamic KC expansion is disabled for prepacked B because the buffer
+    // was packed with cfg.kc. Use cfg.kc always.
+    let kc_max = cfg.kc;
 
     // Thread-local aligned pack_a buffer
     thread_local! {
@@ -861,6 +1057,8 @@ fn gemm_prepacked_driver_f32(
     let c_ptr = c.as_mut_ptr();
     let pb_base = packed_b.as_ptr();
 
+    let n_strips_total = (n + nr - 1) / nr;
+
     // NC loop
     let mut jc = 0usize;
     while jc < n {
@@ -873,6 +1071,7 @@ fn gemm_prepacked_driver_f32(
             let kc = kc_max.min(k - pc);
             let first_kc = pc == 0;
             let last_kc = pc + kc_max >= k;
+            let kc_block_idx = pc / kc_max;
 
             // MC loop
             let mut ic = 0usize;
@@ -897,11 +1096,42 @@ fn gemm_prepacked_driver_f32(
                     let col_rem = n.saturating_sub(col_start).min(nr);
                     let is_edge_col = col_rem < nr;
 
-                    // Index into pre-packed B:
-                    // strip index = strip_start + jr
-                    // within that strip, offset to row pc: strip_base + pc * nr
+                    // KC-blocked B indexing:
+                    // tile base = kc_block_idx * n_strips_total * kc_max * nr
+                    //           + global_strip * kc_max * nr
+                    // Within tile, k_local offset is already baked in (k_local * nr).
+                    // The microkernel strides by nr per k step, matching kc_max*nr tile size.
                     let global_strip = strip_start + jr;
-                    let pb_tile_base = unsafe { pb_base.add(global_strip * k * nr + pc * nr) };
+                    let pb_tile_base = unsafe {
+                        pb_base.add(
+                            kc_block_idx * n_strips_total * kc_max * nr
+                            + global_strip * kc_max * nr,
+                        )
+                    };
+
+                    // Opt 4: prefetch next strip's B data into L2 while computing current strip
+                    if jr + 1 < n_nr {
+                        let next_strip = global_strip + 1;
+                        let next_pb = unsafe {
+                            pb_base.add(
+                                kc_block_idx * n_strips_total * kc_max * nr
+                                + next_strip * kc_max * nr,
+                            )
+                        };
+                        // Prefetch kc*nr floats = kc*nr*4 bytes, one cache line (64B) at a time
+                        let prefetch_bytes = kc * nr * 4;
+                        let mut pf_off = 0usize;
+                        while pf_off < prefetch_bytes {
+                            unsafe {
+                                #[cfg(target_arch = "x86_64")]
+                                std::arch::x86_64::_mm_prefetch(
+                                    next_pb.add(pf_off / 4) as *const i8,
+                                    std::arch::x86_64::_MM_HINT_T1,
+                                );
+                            }
+                            pf_off += 64;
+                        }
+                    }
 
                     for ir in 0..n_mr {
                         let row_start = ic + ir * mr;
@@ -969,6 +1199,7 @@ fn gemm_prepacked_driver_f32(
 ///
 /// Same structure as `gemm_driver_f32_mt` but skips pack_b entirely.
 /// Falls back to single-threaded `gemm_prepacked_driver_f32` for small problems.
+/// Uses KC-blocked B layout: packed_b[kc_block * n_strips * kc * nr + strip * kc * nr + k_local * nr].
 #[cfg(target_arch = "x86_64")]
 fn gemm_prepacked_driver_f32_mt(
     a: &[f32],
@@ -992,6 +1223,8 @@ fn gemm_prepacked_driver_f32_mt(
     let cfg = crate::microarch::kernel_config();
     let mc_max = cfg.mc;
     let nc_max = cfg.nc;
+    // kc_max must match the kc used in pack_b_full_f32 (always cfg.kc for prepacked)
+    let kc_max = cfg.kc;
 
     let nthreads = rayon::current_num_threads().max(1);
     let phys_cores = (nthreads / 2).max(1);
@@ -1005,17 +1238,8 @@ fn gemm_prepacked_driver_f32_mt(
         }
     };
 
-    // Dynamic KC for small M (same logic as ST drivers)
-    let num_mc_blocks_for_kc = (m + mc_max - 1) / mc_max;
-    let kc_max = if num_mc_blocks_for_kc <= 3 && k > cfg.kc {
-        let l2_budget = cfg.l2 * 9 / 10;
-        let kc_l2 = l2_budget / (mc_max * 4);
-        (kc_l2 & !7).min(k).max(cfg.kc)
-    } else {
-        cfg.kc
-    };
-
     let num_m_blocks = (m + mc_max - 1) / mc_max;
+    let n_strips_total = (n + nr - 1) / nr;
 
     if num_m_blocks < 2 || nthreads <= 1 {
         return gemm_prepacked_driver_f32(a, packed_b, c, m, n, k, mr, nr, microkernel, bias);
@@ -1039,6 +1263,7 @@ fn gemm_prepacked_driver_f32_mt(
             let kc = kc_max.min(k - pc);
             let first_kc = pc == 0;
             let last_kc = pc + kc_max >= k;
+            let kc_block_idx = pc / kc_max;
 
             let a_addr = a_ptr as usize;
             let c_addr = c_ptr as usize;
@@ -1100,7 +1325,35 @@ fn gemm_prepacked_driver_f32_mt(
                         let is_edge_col = col_rem < nr;
 
                         let global_strip = strip_start + jr;
-                        let pb_tile_base = unsafe { pb_ptr.add(global_strip * k * nr + pc * nr) };
+                        let pb_tile_base = unsafe {
+                            pb_ptr.add(
+                                kc_block_idx * n_strips_total * kc_max * nr
+                                + global_strip * kc_max * nr,
+                            )
+                        };
+
+                        // Prefetch next strip's B data
+                        if jr + 1 < jr_end {
+                            let next_strip = global_strip + 1;
+                            let next_pb = unsafe {
+                                pb_ptr.add(
+                                    kc_block_idx * n_strips_total * kc_max * nr
+                                    + next_strip * kc_max * nr,
+                                )
+                            };
+                            let prefetch_bytes = kc * nr * 4;
+                            let mut pf_off = 0usize;
+                            while pf_off < prefetch_bytes {
+                                unsafe {
+                                    #[cfg(target_arch = "x86_64")]
+                                    std::arch::x86_64::_mm_prefetch(
+                                        next_pb.add(pf_off / 4) as *const i8,
+                                        std::arch::x86_64::_MM_HINT_T1,
+                                    );
+                                }
+                                pf_off += 64;
+                            }
+                        }
 
                         for ir in 0..n_mr {
                             let row_start = ic + ir * mr;
@@ -1192,7 +1445,35 @@ fn gemm_prepacked_driver_f32_mt(
                     let is_edge_col = col_rem < nr;
 
                     let global_strip = strip_start + jr;
-                    let pb_tile_base = unsafe { pb_ptr.add(global_strip * k * nr + pc * nr) };
+                    let pb_tile_base = unsafe {
+                        pb_ptr.add(
+                            kc_block_idx * n_strips_total * kc_max * nr
+                            + global_strip * kc_max * nr,
+                        )
+                    };
+
+                    // Prefetch next strip's B data
+                    if jr + 1 < n_nr {
+                        let next_strip = global_strip + 1;
+                        let next_pb = unsafe {
+                            pb_ptr.add(
+                                kc_block_idx * n_strips_total * kc_max * nr
+                                + next_strip * kc_max * nr,
+                            )
+                        };
+                        let prefetch_bytes = kc * nr * 4;
+                        let mut pf_off = 0usize;
+                        while pf_off < prefetch_bytes {
+                            unsafe {
+                                #[cfg(target_arch = "x86_64")]
+                                std::arch::x86_64::_mm_prefetch(
+                                    next_pb.add(pf_off / 4) as *const i8,
+                                    std::arch::x86_64::_MM_HINT_T1,
+                                );
+                            }
+                            pf_off += 64;
+                        }
+                    }
 
                     for ir in 0..n_mr {
                         let row_start = ic + ir * mr;

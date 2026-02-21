@@ -364,9 +364,11 @@ impl KernelConfig {
         let elem = 4usize; // f32
 
         // ── Optimized BLIS blocking formulas ──
-        // KC: B strip (KC × NR × elem) ≤ L1D × 0.75
-        // A is streaming (not resident in L1), so B strip can use 75% of L1D
-        let kc_raw = (l1d * 3 / 4) / (nr * elem);
+        // KC: B strip (KC × NR × elem) ≤ L1D × 0.875
+        // A is streaming (not resident in L1), so B strip can use 7/8 of L1D.
+        // Larger KC reduces KC-iteration count, cutting C matrix load/store traffic.
+        // Example: L1D=32KB, NR=16 → KC=448 (was 384), B strip=28KB (fits in 32KB L1D).
+        let kc_raw = (l1d * 7 / 8) / (nr * elem);
         let kc = (kc_raw & !7).clamp(64, 768);
 
         // MC: A panel (MC × KC × elem) ≤ L2 × 0.50
@@ -526,7 +528,7 @@ mod tests {
         assert!(cfg.mc >= cfg.mr, "MC={} < MR={}", cfg.mc, cfg.mr);
         assert!(cfg.nc >= cfg.nr, "NC={} < NR={}", cfg.nc, cfg.nr);
 
-        // BLIS constraint: B strip fits in L1D/2
+        // BLIS constraint: B strip fits in L1D (≤ 7/8 of L1D)
         let b_strip = cfg.nr * cfg.kc * 4;
         assert!(b_strip <= cfg.l1d,
             "B strip {}B exceeds L1D {}B", b_strip, cfg.l1d);
