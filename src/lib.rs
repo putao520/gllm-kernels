@@ -30,11 +30,16 @@ pub mod numa;
 pub mod macros;
 pub mod cpu_kernels;
 pub mod backend;
+pub mod gpu;
 pub mod quant;
 pub mod codebooks;
 pub mod asm;
 pub mod profiling;
 pub mod autotuning;
+pub mod dispatch;
+pub mod inference;
+pub mod compiler;
+pub mod ffi;
 
 #[cfg(test)]
 pub mod tests;
