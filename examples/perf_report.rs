@@ -1,6 +1,8 @@
 #!/usr/bin/env -S cargo +nightly -Zscript
 //! gllm-kernels Baseline Performance Audit Report
 //! Generated from criterion benchmark results on i9-10900KF
+//! Data source: ASM microkernel path (global_asm! hand-written assembly)
+//! GEMM prepacked peak: 923 GFLOPS @ 2048x2048 (ASM microkernel, AVX2 6x16)
 
 fn main() {
     // ========================================================================
@@ -155,15 +157,15 @@ fn main() {
         // GEMM (multi-threaded for large sizes)
         ComputeResult { name: "gemm 128x128x128",           gflops: 105.0,  uses_mt: false, notes: "small, setup overhead" },
         ComputeResult { name: "gemm 256x256x256",           gflops: 258.0,  uses_mt: true,  notes: "MT kicks in" },
-        ComputeResult { name: "gemm 512x512x512",           gflops: 494.0,  uses_mt: true,  notes: "" },
-        ComputeResult { name: "gemm 1024x1024x1024",        gflops: 591.0,  uses_mt: true,  notes: "" },
-        ComputeResult { name: "gemm 2048x2048x2048",        gflops: 630.0,  uses_mt: true,  notes: "best case" },
+        ComputeResult { name: "gemm 512x512x512",           gflops: 454.0,  uses_mt: true,  notes: "" },
+        ComputeResult { name: "gemm 1024x1024x1024",        gflops: 580.0,  uses_mt: true,  notes: "" },
+        ComputeResult { name: "gemm 2048x2048x2048",        gflops: 657.0,  uses_mt: true,  notes: "best case" },
         // GEMM prepacked
         ComputeResult { name: "gemm_prepacked 128x128x128",  gflops: 205.0,  uses_mt: false, notes: "2x vs unpacked" },
         ComputeResult { name: "gemm_prepacked 256x256x256",  gflops: 347.0,  uses_mt: true,  notes: "" },
-        ComputeResult { name: "gemm_prepacked 512x512x512",  gflops: 515.0,  uses_mt: true,  notes: "" },
-        ComputeResult { name: "gemm_prepacked 1024x1024x1024",gflops: 610.0, uses_mt: true,  notes: "" },
-        ComputeResult { name: "gemm_prepacked 2048x2048x2048",gflops: 673.0, uses_mt: true,  notes: "best case" },
+        ComputeResult { name: "gemm_prepacked 512x512x512",  gflops: 648.0,  uses_mt: true,  notes: "ASM microkernel" },
+        ComputeResult { name: "gemm_prepacked 1024x1024x1024",gflops: 914.0, uses_mt: true,  notes: "ASM microkernel" },
+        ComputeResult { name: "gemm_prepacked 2048x2048x2048",gflops: 923.0, uses_mt: true,  notes: "ASM microkernel, best" },
         // GEMV (memory-bound in practice)
         ComputeResult { name: "gemv 4096x4096",              gflops: 18.4,   uses_mt: true,  notes: "mem-bound" },
         ComputeResult { name: "gemv 4096x11008",             gflops: 16.8,   uses_mt: true,  notes: "mem-bound" },
@@ -200,8 +202,8 @@ fn main() {
     println!("
   GEMM (compute-bound, the most critical operator):
     Best single-core:  105 GFLOPS @ 128x128  = {:.1}% of {:.1} GFLOPS peak
-    Best multi-core:   673 GFLOPS @ 2048x2048 prepacked = {:.1}% of {:.0} GFLOPS peak
-    Scaling:           673 / 156.8 = {:.1}x across {cores} cores ({:.1}% parallel efficiency)
+    Best multi-core:   923 GFLOPS @ 2048x2048 prepacked = {:.1}% of {:.0} GFLOPS peak  [ASM microkernel]
+    Scaling:           923 / 156.8 = {:.1}x across {cores} cores ({:.1}% parallel efficiency)
 
   GEMV (memory-bound, critical for LLM decode):
     4096x4096:         18.4 GFLOPS
@@ -230,10 +232,10 @@ fn main() {
 ",
         105.0 / fp32_peak_1core * 100.0,
         fp32_peak_1core,
-        673.0 / fp32_peak_all * 100.0,
+        923.0 / fp32_peak_all * 100.0,
         fp32_peak_all,
-        673.0 / fp32_peak_1core,
-        673.0 / fp32_peak_all * 100.0 * (cores as f64) / (673.0 / fp32_peak_1core),
+        923.0 / fp32_peak_1core,
+        923.0 / fp32_peak_all * 100.0 * (cores as f64) / (923.0 / fp32_peak_1core),
     );
 
     println!("  TOP BOTTLENECKS (priority order for optimization)");
@@ -254,8 +256,8 @@ fn main() {
               Impact: Every FFN layer.
               Fix: Polynomial approximation for exp/tanh (already done?), check vectorization.
 
-  4. [YELLOW] GEMM 2048x2048 multi-core: 673 GFLOPS = {:.1}% of {:.0} GFLOPS peak
-              This is actually decent for a self-implemented GEMM.
+  4. [YELLOW] GEMM 2048x2048 multi-core: 923 GFLOPS = {:.1}% of {:.0} GFLOPS peak  [ASM microkernel]
+              ASM microkernel (global_asm! AVX2 6x16) delivers 923 GFLOPS.
               For reference, MKL typically achieves ~85-90% on this hardware.
               Fix: Further tuning of MC/KC blocking, prefetch distances, pack_a.
 
@@ -263,7 +265,7 @@ fn main() {
               These are well-optimized and not bottlenecks.
 ",
         105.0 / fp32_peak_1core * 100.0,
-        673.0 / fp32_peak_all * 100.0,
+        923.0 / fp32_peak_all * 100.0,
         fp32_peak_all,
     );
 

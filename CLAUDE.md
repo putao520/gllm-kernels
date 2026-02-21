@@ -41,9 +41,9 @@
 
 | 算子 | 当前效率 | 目标 | 手段 |
 |------|---------|------|------|
-| F32 GEMM (intrinsics) | ~41% | 85%+ | 手写汇编微内核 |
-| 量化 GEMV | 待测 | 85%+ | 手写汇编微内核 |
-| Softmax/RMSNorm/SiLU | 待测 | 90%+ 带宽 | 验证是否已达带宽瓶颈 |
+| F32 GEMM | unpacked ~42%, prepacked ~59% (ASM 微内核路径) | 85%+ | 手写汇编微内核 |
+| 量化 GEMV | intrinsics 路径，待升级手写 ASM | 85%+ | 手写汇编微内核 |
+| Softmax/RMSNorm/SiLU | ALU-limited 7-13 GiB/s，待重新测量带宽效率 | 90%+ 带宽 | 验证是否已达带宽瓶颈 |
 
 ---
 
@@ -111,8 +111,8 @@ fn gemm(a, b, c, m, n, k) {
 | 类别 | 算子 | 瓶颈类型 |
 |------|------|---------|
 | **BLAS-1** | vec_dot, vec_add, vec_mul, vec_scale, vec_axpy, vec_sum, vec_max | Memory-bound |
-| **BLAS-2** | gemv | Memory-bound |
-| **BLAS-3** | gemm, gemm_bias, gemm_prepacked, pack_b | Compute-bound |
+| **BLAS-2** | gemv, streaming GEMV (M=1 路径) | Memory-bound |
+| **BLAS-3** | gemm, gemm_bias, gemm_prepacked, pack_b, gemm_bt (B-transposed skinny GEMM) | Compute-bound |
 | **激活函数** | silu, gelu, relu, tanh, swiglu, softmax, exp | Memory-bound |
 | **归一化** | rms_norm, layer_norm | Memory-bound |
 | **位置编码** | rope | Memory-bound |
@@ -154,6 +154,9 @@ Layer 4: expand_all_xxx!     — 批量展开
 - 手写汇编微内核**必须**用于：GEMM、量化 GEMV/GEMM
 - 宏生成的基线实现作为**正确性参考**和**非热路径兜底**
 - 覆写必须通过 benchmark 证明优于宏生成版本
+- M=1 走 streaming GEMV 路径
+- M≤32 走 skinny GEMM intrinsics 路径
+- M>32 走 ASM 微内核路径
 
 ---
 
@@ -202,15 +205,16 @@ src/
 │   ├── avx512/             # AVX-512（含手写 asm 微内核）
 │   └── neon/               # NEON（含手写 asm 微内核）
 │
-└── asm/                    # 手写汇编微内核（新增）
+└── asm/                    # 手写汇编微内核
     ├── x86_64/
-    │   ├── gemm_avx2.S     # AVX2 GEMM 6×16 微内核
-    │   ├── gemm_avx512.S   # AVX-512 GEMM 14×32 微内核
-    │   ├── gemv_q4_avx2.S  # AVX2 Q4 GEMV 微内核
-    │   └── gemv_q8_avx2.S  # AVX2 Q8 GEMV 微内核
+    │   ├── mod.rs
+    │   ├── gemm_avx2.rs    # AVX2 GEMM 6×16 微内核 (global_asm!)
+    │   ├── gemm_avx512.rs  # AVX-512 GEMM 14×32 微内核 (global_asm!)
+    │   ├── gemm_driver.rs  # 缓存分块驱动 (pack_b + MC/KC/NC blocking)
+    │   └── quant_gemv.rs   # 量化 GEMV (intrinsics, 待升级 ASM)
     └── aarch64/
-        ├── gemm_neon.S     # NEON GEMM 8×12 微内核
-        └── gemv_q4_neon.S  # NEON Q4 GEMV 微内核
+        ├── mod.rs
+        └── gemm_neon.rs    # NEON GEMM 8×12 微内核 (global_asm!)
 ```
 
 ---

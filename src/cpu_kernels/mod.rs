@@ -1565,7 +1565,7 @@ impl<E: Element> Kernels<E> for CpuKernels<E> {
                             if let Some(in_f32) = E::as_f32_slice(input) {
                                 let mut out_f32 = vec![0.0f32; m];
                                 unsafe {
-                                    crate::asm::x86_64::quant_gemv::gemv_q8k_fused_avx2(
+                                    crate::asm::x86_64::quant_gemv::gemv_q8k_fused_avx2_asm(
                                         weight_blocks.as_ptr(),
                                         in_f32.as_ptr(),
                                         out_f32.as_mut_ptr(),
