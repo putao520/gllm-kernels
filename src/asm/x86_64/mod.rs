@@ -13,4 +13,7 @@ pub use gemm_driver::{
     pack_b_asm_f32_avx2, pack_b_asm_f32_avx512,
     gemm_prepacked_asm_f32_avx2, gemm_prepacked_asm_f32_avx512,
     gemm_bias_prepacked_asm_f32_avx2, gemm_bias_prepacked_asm_f32_avx512,
+    pack_a_asm_f32_avx2, pack_a_asm_f32_avx512,
+    gemm_prepacked_ab_asm_f32_avx2, gemm_prepacked_ab_asm_f32_avx512,
+    SharedPackA,
 };

@@ -1467,3 +1467,983 @@ src/
 
 > 注：实际汇编数量取决于格式合并策略。同位宽格式（如 Q4_K/IQ4_NL/IQ4_XS）可共享解包逻辑，
 > 只在 scale/zero 处理上分支，减少实际汇编文件数。
+
+---
+
+## 11.5 FusedGraph 桥接设计（DATA-FUSED-GRAPH）
+
+> 路径 A 编译器的输入契约。gllm 负责将高层 FusedOp 展开为原子算子 DAG 后传入 gllm-kernels。
+
+### 接口边界
+
+```
+gllm 侧:
+  ONNX Graph → GraphOptimizer → FusedGraph（高层融合: FlashAttention/SwiGLU/GQA/...）
+                                     │
+                                     ▼ expand_for_compiler()
+                              CompilerGraph（原子算子: MatMul/RmsNorm/SiLU/Add/...）
+                                     │
+                                     ▼ 传入 gllm-kernels
+gllm-kernels 侧:
+  compile_graph(graph: &CompilerGraph, profile: &DeviceProfile) → CompiledLayer
+```
+
+**设计决策**：gllm 负责展开，因为 gllm 拥有模型结构知识（哪些算子可以拆分、拆分后的形状推导）。gllm-kernels 只关心原子算子的语义和融合。
+
+### CompilerGraph（gllm-kernels 接收的原子算子图）
+
+```rust
+/// 原子算子图 — gllm 展开高层融合后传入 gllm-kernels 的编译器输入
+/// 节点为原子算子，边为张量数据流
+pub struct CompilerGraph {
+    /// 原子算子节点列表（拓扑序）
+    pub nodes: Vec<CompilerNode>,
+    /// 图输入张量描述
+    pub inputs: Vec<TensorDesc>,
+    /// 图输出张量描述
+    pub outputs: Vec<TensorDesc>,
+}
+
+/// 原子算子节点
+pub struct CompilerNode {
+    /// 节点名称（调试用）
+    pub name: String,
+    /// 原子算子类型
+    pub op: CompilerOp,
+    /// 输入张量索引列表（指向其他节点的输出或图输入）
+    pub inputs: Vec<TensorRef>,
+    /// 输出张量描述
+    pub output: TensorDesc,
+}
+
+/// 张量引用
+pub enum TensorRef {
+    /// 图输入（第 n 个）
+    GraphInput(usize),
+    /// 其他节点的输出: (node_idx, output_idx)
+    NodeOutput(usize, usize),
+    /// 权重张量（名称引用，运行时由 WeightsHandle 提供）
+    Weight(String),
+}
+
+/// 原子算子类型 — gllm-kernels 编译器理解的最小粒度
+pub enum CompilerOp {
+    /// 矩阵乘: C[m,n] = A[m,k] × B[k,n]
+    MatMul { m: usize, n: usize, k: usize, transpose_b: bool },
+    /// RMSNorm: out = x * w * rsqrt(mean(x²) + eps)
+    RmsNorm { hidden_size: usize, eps: f32 },
+    /// LayerNorm: out = (x - mean) / sqrt(var + eps) * gamma + beta
+    LayerNorm { hidden_size: usize, eps: f32 },
+    /// 激活函数
+    Activation(ActivationType),
+    /// 逐元素加
+    Add,
+    /// 逐元素乘
+    Mul,
+    /// RoPE 位置编码
+    Rope { head_dim: usize, max_seq_len: usize, theta: f64 },
+    /// Softmax
+    Softmax { axis: i32 },
+    /// 量化矩阵乘
+    QuantMatMul { quant_type: QuantType, m: usize, n: usize, k: usize },
+    /// Reshape（零拷贝，仅改变逻辑形状）
+    Reshape { target_shape: Vec<usize> },
+    /// Transpose（可能需要物理重排）
+    Transpose { perm: Vec<usize> },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ActivationType {
+    SiLU, GeLU, ReLU, Tanh, Exp,
+}
+
+/// 张量描述
+pub struct TensorDesc {
+    pub shape: Vec<usize>,
+    pub dtype: DType,
+}
+```
+
+### gllm 侧展开规则
+
+| gllm FusedOp | 展开为 CompilerOp 序列 |
+|--------------|----------------------|
+| `FlashAttention` | Reshape(Q) → Reshape(K) → Reshape(V) → MatMul(Q,K^T) → Softmax → MatMul(attn,V) → Reshape(out) |
+| `SwiGLU` | MatMul(gate) → Activation(SiLU) → MatMul(up) → Mul → MatMul(down) |
+| `FusedRMSLinear` | RmsNorm → MatMul |
+| `FusedQkvRope` | MatMul(Wq) → Rope → MatMul(Wk) → Rope → MatMul(Wv) |
+| `RoPE` | Rope（直接映射） |
+| `GQA` | 展开为 FlashAttention 等价序列 |
+| `Atomic("MatMul")` | MatMul（直接映射） |
+| `Atomic("Add")` | Add（直接映射） |
+| `Atomic("Softmax")` | Softmax（直接映射） |
+
+### 与编译器的关系
+
+- 基础入口：`compile_model(config: &ModelConfig)` → `LayerIR` → `ExecutionPlan` → `CompiledLayer`
+- 语义驱动入口：`compile_graph(graph: &CompilerGraph, profile: &DeviceProfile)` → `SemanticDAG` → `FusionPlan` → `CompiledLayer`
+- 共享基础设施：`CompiledLayer`、`CompilationCache`
+- 编译失败时回退到 Layer 2 fallback（逐算子调用）
+
+---
+
+## 12. 编译器数据结构（DATA-COMPILER）
+
+> 语义驱动编译器的核心数据结构。四阶段编译流水线（符号执行 → DAG 构筑 → 融合决策 → 代码生成）的中间表示。
+
+### 12.1 Phase 0 数据结构：标量函数分析
+
+编译器通过二进制符号执行自动提取算子的计算结构。算子的唯一定义来源是 `extern "C"` 纯标量函数。
+
+```rust
+/// Phase 0 输出：算子的完整计算结构描述
+/// 由二进制符号执行从 extern "C" 标量函数自动提取
+pub struct OpTrace {
+    /// 算子类型标识
+    pub op_kind: OpKind,
+    /// 计算模式（完整计算结构，非分类标签）
+    pub pattern: ComputePattern,
+    /// 标量函数签名
+    pub signature: ScalarFnSignature,
+}
+
+/// 计算模式 — 从标量函数的循环结构和数据流自动识别
+pub enum ComputePattern {
+    /// out[i] = f(in[i]) — 单输入逐元素变换
+    /// 符号执行识别：单循环，每次迭代 load 1 → compute → store 1
+    Elementwise { body: Vec<TraceOp> },
+
+    /// out[i] = f(a[i], b[i]) — 双输入逐元素运算
+    /// 符号执行识别：单循环，每次迭代 load 2 → compute → store 1
+    BinaryElementwise { body: Vec<TraceOp> },
+
+    /// out[i] = f(in[i], extra_0[i], extra_1[i], ...) — 带额外参数的逐元素变换
+    /// 符号执行识别：单循环，每次迭代 load N (N≥2) → compute → store M (M≥1)
+    /// 典型算子：RoPE (4 输入 2 输出)、带位置编码的变换
+    /// 与 Elementwise/BinaryElementwise 的区别：输入/输出数量不固定
+    /// OpClass 推导为 Injective（可融合进消费者，但不能作为 epilogue 注入 GEMM）
+    Injective {
+        body: Vec<TraceOp>,
+        num_inputs: usize,
+        num_outputs: usize,
+    },
+
+    /// result = fold(input, identity, combine) — 归约
+    /// 符号执行识别：循环内累加器跨迭代存活
+    Reduction { identity: f64, combine: Vec<TraceOp> },
+
+    /// Pass 1: reduce, Pass 2: elementwise with reduction result — 归一化类
+    /// 符号执行识别：两个连续循环，第二个循环使用第一个循环的归约结果
+    NormLike {
+        reduce: Vec<TraceOp>,
+        finalize: Vec<TraceOp>,
+        transform: Vec<TraceOp>,
+    },
+
+    /// 三重循环矩阵乘
+    /// 符号执行识别：三层嵌套循环 + FMA 累加
+    /// 注意：epilogue 不在此处 — GEMM 的 epilogue 是 Phase 2 融合决策的结果，
+    /// 存储在 FusionPlan 中，由消费者算子的 OpTrace.body 提供
+    Gemm,
+
+    /// 量化解码 + 计算
+    /// 符号执行识别：块级循环 + 位操作解包 + scale 应用
+    QuantDecode { block_size: usize, decode: Vec<TraceOp> },
+}
+
+/// 计算操作（SSA 形式，u32 引用前序操作的输出索引）
+/// Phase 3 代码生成时，每个 TraceOp 映射到对应的 SIMD 指令
+#[derive(Debug, Clone)]
+pub enum TraceOp {
+    /// 输入值（参数索引）
+    Input(u32),
+    /// 常量
+    Const(f64),
+    /// 算术运算
+    Add(u32, u32), Sub(u32, u32), Mul(u32, u32), Div(u32, u32),
+    /// 融合乘加: a * b + c
+    Fma(u32, u32, u32),
+    /// 一元运算
+    Neg(u32), Abs(u32),
+    /// 超越函数（符号执行通过 libm 调用识别）
+    Exp(u32), Sqrt(u32), Rsqrt(u32), Tanh(u32),
+    /// 快速近似
+    Recip(u32),
+    /// 比较
+    Max(u32, u32), Min(u32, u32),
+}
+
+/// 标量函数签名 — 描述 extern "C" 函数的参数布局
+pub struct ScalarFnSignature {
+    /// 函数指针（编译后的标量函数地址）
+    pub fn_ptr: *const u8,
+    /// 参数列表
+    pub params: Vec<ScalarParam>,
+}
+
+/// 标量函数参数类型
+pub enum ScalarParam {
+    /// 输入数据指针 (*const f32)
+    InputPtr,
+    /// 输出数据指针 (*mut f32)
+    OutputPtr,
+    /// 权重数据指针 (*const f32)
+    WeightPtr,
+    /// 维度参数 (usize)
+    Dim(usize),
+    /// 标量参数（如 eps）
+    Scalar(f32),
+}
+
+/// 标量算子注册表 — 所有算子的 extern "C" 标量函数集中注册
+pub struct ScalarOpRegistry {
+    /// OpKind → 标量函数指针
+    entries: HashMap<OpKind, ScalarFnSignature>,
+    /// OpKind → 已缓存的 OpTrace（首次分析后缓存）
+    trace_cache: HashMap<OpKind, OpTrace>,
+}
+
+impl ScalarOpRegistry {
+    /// 注册标量函数
+    pub fn register(&mut self, op: OpKind, sig: ScalarFnSignature);
+    /// 获取 OpTrace（首次调用时触发符号执行，之后从缓存返回）
+    pub fn get_trace(&mut self, op: &OpKind) -> Result<&OpTrace, CompileError>;
+}
+```
+
+#### 符号执行内部类型（不导出，仅引擎内部使用）
+
+```rust
+/// 符号值 — 追踪寄存器/内存中数据的来源
+enum SymValue {
+    /// 函数参数（第 n 个）
+    Input(usize),
+    /// 常量
+    Const(f64),
+    /// 从内存加载
+    Load(Box<SymValue>),
+    /// 算术运算
+    Add(Box<SymValue>, Box<SymValue>),
+    Mul(Box<SymValue>, Box<SymValue>),
+    Div(Box<SymValue>, Box<SymValue>),
+    Neg(Box<SymValue>),
+    /// libm 函数调用
+    Call(LibmFn, Vec<SymValue>),
+}
+
+/// 识别的 libm 函数
+enum LibmFn {
+    Expf, Sqrtf, Tanhf, Logf, Fabsf,
+}
+
+/// 符号执行状态
+struct SymState {
+    /// 寄存器 → 符号值映射
+    regs: HashMap<iced_x86::Register, SymValue>,
+    /// 栈偏移 → 符号值映射
+    stack: HashMap<i64, SymValue>,
+    /// 内存操作记录（用于识别 load/store 模式）
+    memory: Vec<SymMemOp>,
+}
+
+/// 内存操作记录
+struct SymMemOp {
+    kind: MemOpKind,
+    addr: SymValue,
+    value: SymValue,
+}
+
+enum MemOpKind { Load, Store }
+```
+
+### 12.2 Phase 1 数据结构：语义 DAG
+
+#### SemanticDAG（语义标注图）
+
+```rust
+/// 语义 DAG — CompilerGraph + 语义标注 + 数据流分析
+pub struct SemanticDAG {
+    /// 语义标注节点列表（保持拓扑序）
+    pub nodes: Vec<SemanticNode>,
+    /// 张量 def-use 链
+    pub tensor_edges: Vec<TensorEdge>,
+    /// 全局输入张量 ID 列表
+    pub inputs: Vec<TensorId>,
+    /// 全局输出张量 ID 列表
+    pub outputs: Vec<TensorId>,
+    /// 后支配树（用于融合组划分）
+    pub post_dominator_tree: PostDomTree,
+}
+
+/// 语义标注节点
+pub struct SemanticNode {
+    /// 节点 ID（对应 CompilerGraph 中的索引）
+    pub node_id: usize,
+    /// 算子计算结构（Phase 0 符号执行提取，替代原来的 OpSemanticsKind）
+    pub op_trace: OpTrace,
+    /// TVM 算子分类（从 op_trace.pattern 自动推导）
+    pub op_class: OpClass,
+    /// 瓶颈类型
+    pub bottleneck: Bottleneck,
+    /// 算术强度 (FLOPs / Bytes)
+    pub arithmetic_intensity: f32,
+    /// 每元素字节数
+    pub bytes_per_elem: usize,
+    /// 每元素浮点运算数
+    pub flops_per_elem: usize,
+    /// 输入张量 ID 列表
+    pub inputs: Vec<TensorId>,
+    /// 输出张量 ID 列表
+    pub outputs: Vec<TensorId>,
+    /// 输出形状（元素数）
+    pub output_elems: usize,
+}
+
+/// TVM 算子分类
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OpClass {
+    /// 逐元素: vec_add, silu, gelu, relu, exp, vec_mul
+    ElemWise,
+    /// 注入式: rope, reshape, transpose（带额外参数的逐元素变换）
+    Injective,
+    /// 归约: softmax, rms_norm, layer_norm
+    Reduction,
+    /// 矩阵乘: gemm, gemv
+    Gemm,
+    /// 不透明: 量化 matmul 等
+    Opaque,
+}
+
+/// ComputePattern → OpClass 自动推导规则
+///
+/// | ComputePattern      | OpClass    | 说明 |
+/// |---------------------|------------|------|
+/// | Elementwise         | ElemWise   | 单输入逐元素 |
+/// | BinaryElementwise   | ElemWise   | 双输入逐元素 |
+/// | Injective           | Injective  | 多输入/多输出逐元素（如 RoPE） |
+/// | Reduction           | Reduction  | 纯归约 |
+/// | NormLike            | Reduction  | 归约 + 逐元素（两 pass） |
+/// | Gemm                | Gemm       | 三重循环矩阵乘 |
+/// | QuantDecode         | Opaque     | 量化解码，不参与融合 |
+
+/// 瓶颈类型
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Bottleneck {
+    Compute,
+    Memory,
+    Mixed,
+}
+
+/// 张量 def-use 边
+pub struct TensorEdge {
+    /// 张量 ID
+    pub tensor_id: TensorId,
+    /// 生产者节点 ID
+    pub producer: usize,
+    /// 消费者节点 ID 列表
+    pub consumers: Vec<usize>,
+    /// 数据量（字节）
+    pub data_bytes: usize,
+    /// 是否可寄存器传递（单消费者 + 生产者/消费者均为 elemwise）
+    pub can_register_pass: bool,
+}
+
+/// 张量标识符（图内唯一）
+pub type TensorId = u32;
+
+/// 后支配树（简化表示）
+pub struct PostDomTree {
+    /// 每个节点的直接后支配者
+    pub ipost_dom: Vec<Option<usize>>,
+}
+```
+
+### 12.3 Phase 2 数据结构：融合决策
+
+#### FusionPlan（融合计划）
+
+```rust
+/// 融合计划 — Phase 2 的完整输出
+pub struct FusionPlan {
+    /// 融合组列表（拓扑序）
+    pub groups: Vec<FusionGroup>,
+    /// 分块配置（每个融合组一个）
+    pub tile_configs: Vec<TileConfig>,
+    /// 缓冲区规划
+    pub buffer_plan: BufferPlan,
+}
+
+/// 融合组 — 一组将被编译为单一代码块的算子
+pub struct FusionGroup {
+    /// 组内的节点 ID 列表（拓扑序）
+    pub node_ids: Vec<usize>,
+    /// 融合策略
+    pub strategy: FusionStrategy,
+    /// 组的聚合瓶颈类型
+    pub bottleneck: Bottleneck,
+    /// 组输入张量 ID
+    pub inputs: Vec<TensorId>,
+    /// 组输出张量 ID
+    pub outputs: Vec<TensorId>,
+    /// 融合后的寄存器压力估算
+    pub register_pressure: RegisterPressure,
+}
+
+/// 融合策略（Profile-Driven，非模板能力驱动）
+///
+/// 每个 FusionGroup 携带一个 FusionStrategy，由硬件 profile 和数据量共同决定。
+/// Phase 2 入口签名: `fuse(graph: &CompilerGraph, profile: &DeviceProfile) -> FusionPlan`
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum FusionStrategy {
+    /// 单算子，不融合
+    Single,
+
+    /// Loop Fusion: 多个 elemwise 算子合并为单循环
+    /// 数据在寄存器中流过整个链，消除中间内存往返
+    LoopFusion {
+        /// 链中每个算子的节点 ID（按执行顺序）
+        chain_nodes: Vec<usize>,
+    },
+
+    /// Epilogue Injection: 将 elemwise 消费者注入 GEMM store 阶段
+    /// 在累加器寄存器上原地执行，不经过内存
+    /// epilogue 的指令序列从消费者算子的 OpTrace.body 自动生成
+    EpilogueInjection {
+        /// GEMM 节点 ID
+        gemm_node: usize,
+        /// 注入的 epilogue 算子列表（按执行顺序）
+        epilogue_ops: Vec<EpilogueOp>,
+    },
+
+    /// Tile-Level Fusion: 前驱算子的 tile 计算嵌入 GEMM MC 循环
+    ///
+    /// 硬件驱动决策: 当前驱输出 > L1 * 0.75 时使用
+    /// 例: RMSNorm(hidden=16384) 输出 64KB > L1(32KB)*0.75 → 嵌入 MC 循环
+    ///
+    /// scratch buffer 方案:
+    /// · MC 行的前驱结果写入 scratchpad 的 normed 区域（MC × K × sizeof(E) bytes）
+    /// · 紧接着被 pack_a 消费，pack_a 按 KC 列切片读取（MC × KC × sizeof(E)，在 L2 内）
+    /// · weight 向量通过 JIT 函数参数传入（graph input，不在 scratchpad 里）
+    /// · 前驱算子逐行独立（如 RMSNorm），按 MC 行切分不影响正确性
+    /// · 每个 MC tile 独立做完整的多 pass（如 RMSNorm: pass1 sum_squares + pass2 scale）
+    TileLevelFusion {
+        /// GEMM 节点 ID
+        gemm_node: usize,
+        /// 嵌入 MC 循环的前驱算子
+        tiled_predecessor: usize,
+        /// MC tile 行数（由 GEMM blocking 参数决定，来自 DeviceProfile 的 cache 层级）
+        tile_rows: usize,
+        /// 可选的 epilogue 注入
+        epilogue_ops: Vec<EpilogueOp>,
+    },
+
+    /// ComputeRoot: 前驱算子先整体算完，结果留在 L1
+    ///
+    /// 硬件驱动决策: 当前驱输出 ≤ L1 * 0.75 时使用
+    /// 例: RMSNorm(hidden=4096) 输出 16KB ≤ L1(32KB)*0.75 → 先算完，GEMM 读时仍热
+    ///
+    /// 与 TileLevelFusion 互斥 — 同一个 (前驱, GEMM) 对只选其一
+    ComputeRoot {
+        /// 先整体执行的前驱算子
+        predecessor: usize,
+        /// 后续 GEMM 节点 ID
+        gemm_node: usize,
+    },
+
+    /// Fallback: 调用 Kernels<E> 方法（Opaque 算子）
+    KernelCall {
+        method: KernelMethod,
+    },
+}
+
+/// Epilogue 操作
+/// 不再使用硬编码的 EpilogueKind 枚举（BiasAdd/Activation 等），
+/// 而是直接携带消费者算子的 OpTrace，Phase 3 代码生成遍历 TraceOp 序列生成 SIMD 指令
+#[derive(Debug, Clone)]
+pub struct EpilogueOp {
+    /// 对应的算子节点 ID
+    pub node_id: usize,
+    /// 消费者算子的 OpTrace（包含完整计算结构）
+    /// Phase 3 从 trace.pattern 的 body/TraceOp 序列直接映射到 SIMD 指令
+    pub trace: OpTrace,
+    /// 额外参数指针（如 bias 向量地址）
+    pub extra_ptr: Option<PtrSource>,
+}
+
+/// 寄存器压力估算
+#[derive(Debug, Clone)]
+pub struct RegisterPressure {
+    /// 需要的 SIMD 寄存器数（ymm/zmm/v）
+    pub simd_regs_needed: usize,
+    /// 需要的通用寄存器数
+    pub gpr_regs_needed: usize,
+    /// 是否超出可用寄存器（需要 spill）
+    pub needs_spill: bool,
+}
+
+/// Kernels<E> 方法标识（用于 fallback 路径）
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum KernelMethod {
+    Gemm, GemmBias, GemmBiasAct, GemmPrepacked, Gemv, PackB,
+    RmsNorm, LayerNorm, Silu, Gelu, Relu, Swiglu,
+    Softmax, Rope, RopeWithPos, VecAdd, VecMul, Exp,
+    KquantMatmul, IqMatmul, AwqMatmul, GptqMatmul, SqueezeMatmul,
+}
+```
+
+#### TileConfig（分块配置）
+
+```rust
+/// 分块配置 — 根据 DeviceProfile cache 层级 + 融合策略确定
+pub struct TileConfig {
+    /// GEMM BLIS 三级分块（仅 Gemm/EpilogueInjection/TileLevelFusion）
+    pub gemm_blocking: Option<GemmBlocking>,
+    /// Elementwise tile 大小（元素数，适配 L1）
+    pub elem_tile: usize,
+    /// Tile-Level Fusion 的前驱 tile 大小（MC 对齐）
+    pub predecessor_tile: Option<usize>,
+    /// 线程数
+    pub num_threads: usize,
+    /// 并行策略（Phase 2 决定，Phase 3 生成对应代码）
+    pub parallel: ParallelStrategy,
+    /// 预取距离 (bytes)
+    pub prefetch_distance: usize,
+}
+
+/// 并行策略 — Phase 2 决定哪个循环层级并行化
+///
+/// JIT 生成的代码是单线程的（纯计算，无线程同步逻辑）。
+/// 调用方（InferenceBackend）负责线程调度：
+///   1. Phase 2 决定并行维度和 tile 划分
+///   2. Phase 3 生成单个 tile 的计算函数
+///   3. 运行时 thread pool 按 ParallelStrategy 分发 tile 到各线程
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ParallelStrategy {
+    /// GEMM: NC 循环并行（每个 NC tile 独立，无数据依赖）
+    /// 线程 i 处理 NC tiles [i*chunk .. (i+1)*chunk]
+    GemmNcParallel {
+        /// 每线程处理的 NC tile 数
+        tiles_per_thread: usize,
+    },
+    /// Elementwise/LoopFusion: 按元素数均分
+    /// 线程 i 处理 elements [i*chunk .. (i+1)*chunk]
+    ElemParallel {
+        /// 每线程处理的元素数（对齐到 SIMD 宽度）
+        elems_per_thread: usize,
+    },
+    /// 单线程执行（数据量太小，并行开销不值得）
+    Sequential,
+}
+
+/// GEMM BLIS 分块参数
+pub struct GemmBlocking {
+    /// K 维度分块（适配 L1 Cache）
+    pub kc: usize,
+    /// M 维度分块（适配 L2 Cache）
+    pub mc: usize,
+    /// N 维度分块（适配 L3 Cache）
+    pub nc: usize,
+    /// 微内核行数
+    pub mr: usize,
+    /// 微内核列数
+    pub nr: usize,
+    /// K 维度展开因子
+    pub k_unroll: usize,
+}
+```
+
+#### BufferPlan（缓冲区规划）
+
+```rust
+/// 缓冲区规划 — 通过张量活性分析 + 区间图着色生成
+pub struct BufferPlan {
+    /// 总 scratchpad 字节数
+    pub scratchpad_bytes: usize,
+    /// 每个张量的 buffer 分配
+    pub allocations: Vec<BufferAlloc>,
+}
+
+/// 单个 buffer 分配
+pub struct BufferAlloc {
+    /// 张量 ID
+    pub tensor_id: TensorId,
+    /// scratchpad 内的字节偏移
+    pub offset: usize,
+    /// 字节大小
+    pub size_bytes: usize,
+    /// 是否原地复用其他 buffer（Some = 复用的源张量 ID）
+    pub reuses: Option<TensorId>,
+    /// 张量生命周期: (birth 拓扑序位置, death 拓扑序位置)
+    pub lifetime: (usize, usize),
+}
+```
+
+**缓冲区分配算法（张量活性分析 + 区间图着色）**
+
+Phase 2 Step 4 执行以下流程，输入为 SemanticDAG 的拓扑排序结果：
+
+```
+Step 1: 张量活性分析
+  对 SemanticDAG 做拓扑排序，为每条边（张量）计算生命周期：
+    birth = 生产者节点的拓扑序位置
+    death = 所有消费者节点中最大的拓扑序位置
+  输出: Vec<(TensorId, birth, death, size_bytes)>
+
+Step 2: 按 size_bytes 降序排序（大张量优先分配，减少碎片）
+
+Step 3: 区间图着色贪心分配
+  维护 free_list: Vec<(offset, size)>，初始为空
+  对每个张量 t（按 Step 2 排序）:
+    a. 检查原地复用：如果 t 的生产者是 elemwise 且 t.size_bytes == input.size_bytes
+       且 input.death == t.birth（输入在此处死亡），则复用 input 的 offset
+       → BufferAlloc { reuses: Some(input_id), offset: input.offset, ... }
+    b. 否则在 free_list 中找 first-fit 空闲区间（offset 对齐到 64 字节）
+    c. 找不到则在 scratchpad 末尾追加，更新 scratchpad_bytes
+    d. 当张量到达 death 位置时，将其区间归还 free_list（合并相邻空闲区间）
+
+Step 4: 输出 BufferPlan { scratchpad_bytes, allocations }
+```
+
+约束：
+- 所有 offset 按 64 字节对齐（SIMD 对齐要求）
+- 图的输入/输出张量不参与 scratchpad 分配（由调用方提供）
+- 仅中间张量（融合组内部产生且内部消费的张量）参与分配
+
+### 12.4 Phase 3 数据结构：代码生成
+
+#### CodeGenPlan（代码生成计划）
+
+FusionPlan 到机器码的最终中间表示。每个 FusionGroup 对应一个 CodeGenUnit。
+
+```rust
+/// 代码生成计划 — 驱动 MachineCodeEmitter (x86_64: iced-x86 / aarch64: dynasm-rs)
+pub struct CodeGenPlan {
+    /// 代码生成单元列表（与 FusionGroup 一一对应）
+    pub units: Vec<CodeGenUnit>,
+    /// 缓冲区规划（从 FusionPlan 继承）
+    pub buffer_plan: BufferPlan,
+    /// 常量池（SIMD 对齐常量，如 SiLU Horner 系数）
+    pub constant_pool: ConstantPool,
+}
+
+/// 代码生成单元
+pub enum CodeGenUnit {
+    /// Loop Fusion: 生成单循环，数据在寄存器中流过整个链
+    FusedLoop {
+        /// 循环元素数
+        num_elements: usize,
+        /// 循环体内的算子列表（按执行顺序，编译器根据语义生成指令）
+        body_ops: Vec<FusedLoopOp>,
+        /// 输入指针
+        input: PtrSource,
+        /// 输出指针
+        output: PtrSource,
+        /// 额外输入指针（如 VecMul 的权重、VecAdd 的残差）
+        extra_inputs: Vec<PtrSource>,
+    },
+
+    /// GEMM + 可选 epilogue + 可选 tile-level fusion
+    GemmUnit {
+        /// BLIS 分块参数
+        blocking: GemmBlocking,
+        /// 可选 epilogue 注入（在 store 之前执行）
+        epilogue_ops: Vec<EpilogueOp>,
+        /// 可选 tile-level fusion（嵌入 MC 循环的前驱算子）
+        tiled_predecessor: Option<TiledPredecessor>,
+        /// M, N, K 维度
+        m: usize, n: usize, k: usize,
+        /// 指针
+        a: PtrSource, b: PtrSource, c: PtrSource,
+        /// 可选 bias 指针
+        bias: Option<PtrSource>,
+    },
+
+    /// Fallback: 调用 Kernels<E> 方法
+    KernelCall {
+        method: KernelMethod,
+        args: Vec<PtrSource>,
+        output: PtrSource,
+    },
+}
+
+/// Tile-Level Fusion 的前驱算子描述
+pub struct TiledPredecessor {
+    /// 前驱算子的计算结构（从 OpTrace 获取，编译器据此生成 tile 代码）
+    pub op_trace: OpTrace,
+    /// 前驱算子的节点 ID
+    pub node_id: usize,
+    /// 前驱输出写入的 scratch buffer
+    pub scratch: PtrSource,
+    /// tile 大小（与 MC 对齐）
+    pub tile_size: usize,
+}
+
+/// 常量池
+pub struct ConstantPool {
+    /// 对齐的常量数据
+    pub data: Vec<u8>,
+    /// 常量条目: (偏移, 大小, 对齐)
+    pub entries: Vec<ConstantEntry>,
+}
+
+pub struct ConstantEntry {
+    pub id: usize,
+    pub offset: usize,
+    pub size: usize,
+    pub align: usize,
+}
+```
+
+#### PtrSource（指针来源）
+
+```rust
+/// 指针来源 — 描述运行时数据的位置
+#[derive(Debug, Clone)]
+pub enum PtrSource {
+    /// CompiledLayer 入口参数
+    EntryArg(EntryArgKind),
+    /// Scratchpad 内的偏移
+    Scratch { offset: usize },
+    /// 权重张量
+    Weight { layer_idx: usize, kind: WeightKind },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EntryArgKind {
+    Input, Output, Weights, KvCache,
+    Scratchpad, ScratchA, ScratchB,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WeightKind {
+    AttnNorm, Wq, Wk, Wv, Wo,
+    FfnNorm, WGate, WUp, WDown,
+}
+```
+
+#### 平台后端统一接口
+
+Phase 3（代码生成）的平台差异通过 `MachineCodeEmitter` trait 封装，Phase 1/2 完全平台无关。
+
+```rust
+// ============================================================
+// Phase 3: 代码生成（平台特定）
+// ============================================================
+
+/// 平台无关的代码生成接口
+/// x86_64: X86Emitter (iced-x86 CodeAssembler)
+/// aarch64: Arm64Emitter (dynasm-rs Assembler)
+pub trait MachineCodeEmitter {
+    /// 生成 GEMM 单元（三重循环 + 微内核 + 可选 epilogue/tile-fusion）
+    fn emit_gemm_unit(&mut self, unit: &GemmUnit) -> Result<Vec<u8>>;
+    /// 生成融合 Elementwise 循环
+    fn emit_fused_loop(&mut self, unit: &FusedLoop) -> Result<Vec<u8>>;
+    /// 从 OpTrace.body 的 TraceOp 序列生成 SIMD 指令（对指定寄存器原地执行）
+    /// reg: 主数据寄存器（输入/输出）
+    /// scratch: 可用的 scratch 寄存器集合（GEMM epilogue 场景下只有累加器剩余的几个）
+    fn emit_trace_ops(&mut self, ops: &[TraceOp], reg: Register, scratch: &[Register]) -> Result<()>;
+    /// 生成 prologue（保存 callee-saved 寄存器）
+    fn emit_prologue(&mut self) -> Result<()>;
+    /// 生成 epilogue（恢复 + ret）
+    fn emit_epilogue(&mut self) -> Result<()>;
+    /// 完成并返回可执行字节
+    fn finalize(self) -> Result<Vec<u8>>;
+}
+
+/// 融合循环体内的算子描述
+/// 代码生成时遍历 op_trace.body 中的 TraceOp，逐条映射到 SIMD 指令
+#[derive(Debug, Clone)]
+pub struct FusedLoopOp {
+    /// 算子的计算结构（从 OpTrace 获取）
+    pub op_trace: OpTrace,
+    /// 额外输入指针索引（对应 FusedLoop::extra_inputs）
+    pub extra_input_idx: Option<usize>,
+}
+
+// ============================================================
+// 统一入口：PlatformBackend
+// ============================================================
+
+/// 平台后端 — 提供 Phase 3 代码生成能力
+/// 编译流水线通过此 trait 获取当前平台的代码生成器
+pub trait PlatformBackend {
+    type Emitter: MachineCodeEmitter;
+
+    fn new_emitter(&self) -> Self::Emitter;
+    fn platform(&self) -> Platform;
+    fn num_simd_regs(&self) -> usize;
+}
+
+#[derive(Debug, Clone, Copy)]
+pub enum Platform {
+    X86_64 { avx512: bool },
+    Aarch64 { sve: bool },
+}
+
+// ============================================================
+// 平台具体实现
+// ============================================================
+
+/// x86_64 后端
+pub struct X86Backend;
+
+pub struct X86Emitter {
+    asm: iced_x86::code_asm::CodeAssembler,
+}
+
+/// aarch64 后端
+pub struct Arm64Backend;
+
+pub struct Arm64Emitter {
+    ops: dynasmrt::aarch64::Assembler,
+}
+```
+
+#### Register（平台寄存器抽象）
+
+```rust
+/// 平台无关的寄存器标识
+/// 在 Phase 3 代码生成时映射到平台具体寄存器
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum Register {
+    /// x86_64 通用寄存器 (rax=0, rcx=1, ..., r15=15)
+    X86Gpr(u8),
+    /// x86_64 SIMD 寄存器 (ymm0-ymm15 / zmm0-zmm31)
+    X86Simd(u8),
+    /// aarch64 通用寄存器 (x0-x30)
+    Arm64Gpr(u8),
+    /// aarch64 NEON 寄存器 (v0-v31)
+    Arm64Neon(u8),
+}
+```
+
+## 13. 推理层数据结构（DATA-INFERENCE）
+
+> 路径 B（推理执行）使用的核心类型。详细语义见 SPEC/05。
+
+### 13.1 ModelConfig（模型配置）
+
+```rust
+/// 模型配置 — 由 gllm 传入，描述模型架构参数
+pub struct ModelConfig {
+    pub arch: ModelArch,
+    pub hidden_size: usize,
+    pub num_heads: usize,
+    pub num_kv_heads: usize,
+    pub head_dim: usize,
+    pub intermediate_size: usize,
+    pub num_layers: usize,
+    pub vocab_size: usize,
+    pub max_seq_len: usize,
+    pub norm_type: NormType,
+    pub activation: ActivationKind,
+    pub rope_config: Option<RopeConfig>,
+    pub dtype: DType,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ModelArch {
+    Llama, Gpt2, Mistral, Phi, Qwen, Gemma,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NormType {
+    RmsNorm, LayerNorm,
+}
+
+#[derive(Debug, Clone)]
+pub struct RopeConfig {
+    pub base: f32,
+    pub scaling: Option<RopeScaling>,
+}
+
+#[derive(Debug, Clone)]
+pub enum RopeScaling {
+    Linear(f32),
+    Dynamic { factor: f32, max_seq_len: usize },
+}
+```
+
+### 13.2 DeviceTensor（统一张量句柄）
+
+```rust
+/// 统一张量句柄 — CPU/GPU 透明
+pub struct DeviceTensor {
+    /// CPU: host pointer; GPU: device pointer
+    ptr: *mut u8,
+    len_bytes: usize,
+    num_elements: usize,
+    dtype: DType,
+    device: DeviceKind,
+    /// true = Drop 时释放
+    owned: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DeviceKind {
+    Cpu,
+    Cuda(u32),
+    Metal(u32),
+}
+```
+
+- CPU 路径零开销：`as_slice::<E>()` 直接返回 `&[E]`
+- GPU 路径：数据留在设备端，通过 `upload_f32` / `download_f32` 传输
+- 64 字节对齐分配（cache line aligned）
+
+### 13.3 KvCache（分页 KV 缓存）
+
+```rust
+/// 分页 KV 缓存 — 设计灵感: vLLM PagedAttention
+pub struct KvCache {
+    /// 物理页池
+    pages: Vec<Page>,
+    /// 空闲页栈
+    free_pages: Vec<usize>,
+    /// [layer][seq] → 页表
+    layer_tables: Vec<Vec<SeqPageTable>>,
+}
+```
+
+- 页大小：16 tokens
+- 每页存储：`[2(K+V), num_kv_heads, PAGE_SIZE, head_dim]`
+- 支持：append / reset_seq / swap_out / swap_in
+
+### 13.4 ModelWeights（权重存储）
+
+```rust
+pub struct ModelWeights {
+    pub embedding: DeviceTensor,     // [vocab_size, hidden_size]
+    pub layers: Vec<LayerWeights>,
+    pub final_norm: DeviceTensor,    // [hidden_size]
+    pub lm_head: DeviceTensor,       // [hidden_size, vocab_size]
+}
+
+pub struct LayerWeights {
+    pub attn_norm: DeviceTensor,     // RMSNorm / LayerNorm weight
+    pub wq: DeviceTensor,
+    pub wk: DeviceTensor,
+    pub wv: DeviceTensor,
+    pub wo: DeviceTensor,
+    pub ffn_norm: DeviceTensor,
+    pub w_gate: DeviceTensor,
+    pub w_up: DeviceTensor,
+    pub w_down: DeviceTensor,
+}
+```
+
+### 13.5 InferenceError（推理错误）
+
+```rust
+#[derive(Debug)]
+pub enum InferenceError {
+    OutOfMemory { requested: usize, available: usize },
+    InvalidArg(String),
+    CompileError(String),
+    RuntimeError(String),
+    Unsupported(String),
+    IoError(std::io::Error),
+}
+```
+
+与 FFI 层 `GllmStatus` 错误码一一对应（见 SPEC/05 §6）。

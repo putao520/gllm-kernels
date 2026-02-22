@@ -1,30 +1,36 @@
 //! Layer 3: Inference Compiler — JIT compilation of transformer layers.
 //!
 //! The compiler takes a `ModelConfig`, builds a `LayerIR` for each layer,
-//! plans execution via `ExecutionPlan`, generates machine code via the
-//! appropriate `LayerCodegen` backend, and caches the result.
+//! plans execution via `ExecutionPlan`, generates machine code, and caches
+//! the result.
 //!
 //! # Pipeline
 //!
 //! ```text
-//! ModelConfig → LayerIR → ExecutionPlan → Codegen → CompiledLayer
-//!                  ↑            ↑            ↑
-//!              inference    dispatch     codegen/
-//!              /types.rs   /device_     x86_64.rs
-//!                          profile.rs   aarch64.rs
+//! CompilerGraph → OpSemantics (validate) → Phase 1 (DAG) → Phase 2 (Fusion) → Phase 3 (Emit) → CompiledLayer
 //! ```
+//!
+//! The `graph` module builds a typed DAG of compiler ops, and `semantics`
+//! validates shapes and fusion legality before codegen.
 
 pub mod ir;
 pub mod planner;
 pub mod executable;
 pub mod cache;
 pub mod codegen;
+pub mod graph;
+pub mod semantics;
+pub mod fusion;
 
 pub use ir::{LayerIR, LayerArch};
 pub use planner::{ExecutionPlan, FusionDecision, GemmShape, MicrokernelChoice};
 pub use executable::{CompiledLayer, CompiledLayerFn};
-pub use cache::CompilationCache;
-pub use codegen::{CodegenOutput, LayerCodegen};
+pub use cache::{CompilationCache, CacheSource, IncrementalCompileResult, CACHE_VERSION};
+pub use codegen::CodegenOutput;
+pub use graph::{CompilerGraph, CompilerOp, OpKind, TensorId, OpId};
+pub use semantics::OpSemantics;
+pub use fusion::{FusionPlan, FusionGroup, FusionPattern};
+pub use codegen::emitter::ScratchpadLayout;
 
 use crate::dispatch::{DeviceProfile, device_profile};
 use crate::inference::types::{InferenceError, ModelConfig};
@@ -65,14 +71,10 @@ impl InferenceCompiler {
         max_batch: usize,
     ) -> Result<Vec<CompiledLayer>, InferenceError> {
         let ir = LayerIR::from_model_config(config, max_batch);
-        let plan = ExecutionPlan::build(&ir, &self.profile);
-
-        // All layers share the same IR in standard transformers
         let hash = self.compute_hash(&ir);
 
         // Check cache
-        if let Some(cached) = self.cache.get(hash) {
-            // Replicate for all layers (they share the same code)
+        if let Some(_cached) = self.cache.get(hash) {
             let mut layers = Vec::with_capacity(config.num_layers);
             for _ in 0..config.num_layers {
                 let layer = self.cache.get(hash).ok_or_else(|| {
@@ -83,9 +85,8 @@ impl InferenceCompiler {
             return Ok(layers);
         }
 
-        // Compile
-        let codegen = codegen::select_codegen(self.profile.isa)?;
-        let output = codegen.generate(&ir, &plan)?;
+        // Full JIT pipeline: LayerIR → Graph → Fuse → Emit → Code
+        let output = self.jit_compile(&ir)?;
 
         // Cache the compiled code
         self.cache.put(hash, &output.code, output.scratchpad_bytes);
@@ -93,11 +94,7 @@ impl InferenceCompiler {
         // Create CompiledLayer instances for each layer
         let mut layers = Vec::with_capacity(config.num_layers);
         for _ in 0..config.num_layers {
-            let layer = CompiledLayer::from_code(
-                &output.code,
-                output.scratchpad_bytes,
-                hash,
-            )?;
+            let layer = CompiledLayer::from_code(&output.code, output.scratchpad_bytes, hash)?;
             layers.push(layer);
         }
 
@@ -109,24 +106,75 @@ impl InferenceCompiler {
         &mut self,
         ir: &LayerIR,
     ) -> Result<CompiledLayer, InferenceError> {
-        let plan = ExecutionPlan::build(ir, &self.profile);
         let hash = self.compute_hash(ir);
 
         if let Some(cached) = self.cache.get(hash) {
             return Ok(cached);
         }
 
-        let codegen = codegen::select_codegen(self.profile.isa)?;
-        let output = codegen.generate(ir, &plan)?;
+        let output = self.jit_compile(ir)?;
 
         self.cache.put(hash, &output.code, output.scratchpad_bytes);
 
         CompiledLayer::from_code(&output.code, output.scratchpad_bytes, hash)
     }
 
-    /// Clear the compilation cache.
+    /// Compile a model incrementally — only recompile layers whose hash
+    /// is not already in the cache (memory or disk). Returns per-layer
+    /// compiled code plus hit/miss statistics for logging.
+    pub fn compile_model_incremental(
+        &mut self,
+        config: &ModelConfig,
+        max_batch: usize,
+    ) -> Result<IncrementalCompileResult, InferenceError> {
+        let ir = LayerIR::from_model_config(config, max_batch);
+        let hash = self.compute_hash(&ir);
+
+        let mut memory_hits: usize = 0;
+        let mut disk_hits: usize = 0;
+        let mut compiled: usize = 0;
+
+        // All decoder layers share the same IR shape, so one lookup decides.
+        match self.cache.lookup(hash) {
+            Some((_, CacheSource::Memory)) => {
+                memory_hits = config.num_layers;
+            }
+            Some((_, CacheSource::Disk)) => {
+                // First hit loaded from disk (now promoted to memory).
+                disk_hits = 1;
+                memory_hits = config.num_layers.saturating_sub(1);
+            }
+            None => {
+                let output = self.jit_compile(&ir)?;
+                self.cache.put(hash, &output.code, output.scratchpad_bytes);
+                compiled = config.num_layers;
+            }
+        }
+
+        let mut layers = Vec::with_capacity(config.num_layers);
+        for _ in 0..config.num_layers {
+            let layer = self.cache.get(hash).ok_or_else(|| {
+                InferenceError::CompileError("cache inconsistency after compilation".into())
+            })?;
+            layers.push(layer);
+        }
+
+        Ok(IncrementalCompileResult {
+            layers,
+            memory_hits,
+            disk_hits,
+            compiled,
+        })
+    }
+
+    /// Clear the compilation cache (memory + disk).
     pub fn clear_cache(&mut self) {
         self.cache.clear();
+    }
+
+    /// Clear only the on-disk cache, keeping memory entries.
+    pub fn clear_disk_cache(&mut self) {
+        self.cache.clear_disk_cache();
     }
 
     /// Number of cached compilations.
@@ -135,7 +183,6 @@ impl InferenceCompiler {
     }
 
     fn compute_hash(&self, ir: &LayerIR) -> u64 {
-        // Serialize IR fields into bytes for hashing
         let ir_desc = format!(
             "{:?}_h{}_nh{}_nkv{}_hd{}_inter{}_q{:?}_dt{:?}_mb{}_ms{}",
             ir.arch, ir.hidden, ir.num_heads, ir.num_kv_heads,
@@ -144,6 +191,25 @@ impl InferenceCompiler {
         );
         let hw_fp = self.profile.hw_info.fingerprint();
         cache::config_hash(ir_desc.as_bytes(), &hw_fp)
+    }
+
+    /// Full JIT compilation pipeline:
+    /// LayerIR → CompilerGraph → FusionPlan → Phase 3 codegen → CodegenOutput
+    ///
+    /// TODO: Phase 3 currently emits a stub. The real implementation should
+    /// use `MachineCodeEmitter` to programmatically generate fused machine code
+    /// per SPEC §8.5.
+    fn jit_compile(&self, ir: &LayerIR) -> Result<codegen::CodegenOutput, InferenceError> {
+        // Phase 1: Build DAG
+        let graph = CompilerGraph::from_layer_ir(ir, &self.profile);
+
+        // Phase 2: Fusion decisions
+        let _fusion_plan = fusion::fuse(&graph);
+
+        // Phase 3: Code generation (currently stub)
+        let output = codegen::emitter::emit_stub_code(&graph);
+
+        Ok(output)
     }
 }
 
@@ -177,12 +243,90 @@ mod tests {
     #[test]
     fn test_compile_model() {
         let mut config = ModelConfig::llama_7b();
-        config.num_layers = 2; // small for testing
+        config.num_layers = 2;
         let mut compiler = InferenceCompiler::new();
 
         let layers = compiler.compile_model(&config, 1).unwrap();
         assert_eq!(layers.len(), 2);
-        // All layers should share the same config hash
         assert_eq!(layers[0].config_hash, layers[1].config_hash);
+        assert!(layers[0].scratchpad_bytes > 0);
+    }
+
+    /// End-to-end: full JIT pipeline for LLaMA-7B decoder layer.
+    #[test]
+    fn test_e2e_llama_7b() {
+        let config = ModelConfig::llama_7b();
+        let ir = LayerIR::from_model_config(&config, 1);
+        let profile = DeviceProfile::detect();
+
+        // Phase 1: DAG
+        let graph = CompilerGraph::from_layer_ir(&ir, &profile);
+        assert!(graph.num_ops() >= 14);
+
+        // Phase 2: Fusion
+        let fplan = fusion::fuse(&graph);
+        assert!(fplan.num_groups() < graph.num_ops());
+
+        // Phase 3: Codegen (stub for now)
+        let output = codegen::emitter::emit_stub_code(&graph);
+        assert!(!output.code.is_empty());
+        assert!(output.scratchpad_bytes > 0);
+
+        // Wrap as CompiledLayer
+        let layer = CompiledLayer::from_code(&output.code, output.scratchpad_bytes, 0).unwrap();
+        assert!(layer.code_size() > 0);
+
+        eprintln!(
+            "E2E LLaMA-7B: {} ops → {} groups → {} bytes code, {} bytes scratch",
+            graph.num_ops(),
+            fplan.num_groups(),
+            layer.code_size(),
+            output.scratchpad_bytes,
+        );
+    }
+
+    /// End-to-end: full JIT pipeline for Gemma-2B (GeGLU variant).
+    #[test]
+    fn test_e2e_gemma_2b() {
+        let config = ModelConfig::gemma_2b();
+        let ir = LayerIR::from_model_config(&config, 1);
+        let profile = DeviceProfile::detect();
+
+        let graph = CompilerGraph::from_layer_ir(&ir, &profile);
+        let fplan = fusion::fuse(&graph);
+        let output = codegen::emitter::emit_stub_code(&graph);
+
+        let mut compiler = InferenceCompiler::with_profile(profile);
+        let layer = compiler.compile_layer(&ir).unwrap();
+        assert!(layer.code_size() > 0);
+
+        eprintln!(
+            "E2E Gemma-2B: {} ops → {} groups → {} bytes code",
+            graph.num_ops(),
+            fplan.num_groups(),
+            layer.code_size(),
+        );
+    }
+
+    #[test]
+    fn test_compile_model_incremental_cold() {
+        let mut config = ModelConfig::llama_7b();
+        config.num_layers = 3;
+        let profile = DeviceProfile::detect();
+        let mut compiler = InferenceCompiler::with_profile(profile);
+
+        // First call: everything is a fresh compile
+        let result = compiler.compile_model_incremental(&config, 1).unwrap();
+        assert_eq!(result.layers.len(), 3);
+        assert_eq!(result.compiled, 3);
+        assert_eq!(result.memory_hits, 0);
+        assert_eq!(result.disk_hits, 0);
+
+        // Second call: all from memory
+        let result2 = compiler.compile_model_incremental(&config, 1).unwrap();
+        assert_eq!(result2.layers.len(), 3);
+        assert_eq!(result2.compiled, 0);
+        assert_eq!(result2.memory_hits, 3);
+        assert_eq!(result2.disk_hits, 0);
     }
 }

@@ -9,6 +9,8 @@ pub enum Activation {
     Relu,
     Silu,
     Gelu,
+    /// GeGLU: gelu(gate) * up — used by Gemma
+    GeGlu,
 }
 
 /// Represents a device-specific representation of a tensor or buffer.
@@ -240,7 +242,7 @@ pub trait Kernels<E: Element>: Send + Sync {
                             let v = c[i].to_f32();
                             E::from_f32(v / (1.0 + (-v).exp()))
                         },
-                        Activation::Gelu => {
+                        Activation::Gelu | Activation::GeGlu => {
                             let x = c[i].to_f32();
                             let inner = 0.7978845608f32 * (x + 0.044715f32 * x * x * x);
                             E::from_f32(0.5 * x * (1.0 + inner.tanh()))

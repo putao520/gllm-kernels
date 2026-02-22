@@ -57,6 +57,8 @@ pub struct GllmModelConfig {
     pub norm_eps: f32,
     pub dtype: i32,          // 0=F32, 1=F16, 2=BF16
     pub quant_type: i32,     // -1=None, 0=Q4_0, 1=Q4_1, 2=Q8_0
+    pub has_qkv_bias: i32,   // 0=false, 1=true
+    pub partial_rotary_factor: f32, // 0.0..=1.0
 }
 
 impl GllmModelConfig {
@@ -104,6 +106,9 @@ impl GllmModelConfig {
             dtype,
             quant_type,
             rope_interleaved: false,
+            has_qkv_bias: self.has_qkv_bias != 0,
+            partial_rotary_factor: self.partial_rotary_factor,
+            sliding_window: None, // TODO: expose via GllmModelConfig when needed
         })
     }
 }

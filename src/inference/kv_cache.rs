@@ -7,7 +7,7 @@
 use crate::inference::types::{DType, InferenceError, ModelConfig};
 
 /// Page size in tokens.
-const PAGE_SIZE: usize = 16;
+pub const PAGE_SIZE: usize = 16;
 
 /// A single page of KV cache data.
 struct Page {
@@ -234,6 +234,9 @@ mod tests {
             dtype: DType::F32,
             quant_type: None,
             rope_interleaved: false,
+            has_qkv_bias: false,
+            partial_rotary_factor: 1.0,
+            sliding_window: None,
         }
     }
 

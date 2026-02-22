@@ -405,6 +405,13 @@ macro_rules! define_matmul_x86_fp16_native {
                         c[i] = half::f16::from_f32(0.5 * x * (1.0 + inner.tanh()));
                     }
                 },
+                $crate::Activation::GeGlu => {
+                    for i in 0..len {
+                        let x = c[i].to_f32();
+                        let inner = 0.7978845608f32 * (x + 0.044715f32 * x * x * x);
+                        c[i] = half::f16::from_f32(0.5 * x * (1.0 + inner.tanh()));
+                    }
+                },
             }
         }
     };

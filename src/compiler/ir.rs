@@ -5,6 +5,7 @@
 
 use crate::inference::types::DType;
 use crate::quant::QuantType;
+use crate::traits::Activation;
 
 /// Architecture of a single transformer layer.
 #[derive(Debug, Clone, PartialEq)]
@@ -48,6 +49,10 @@ pub struct LayerIR {
     pub max_batch: usize,
     /// Maximum sequence length
     pub max_seq: usize,
+    /// Fraction of head_dim to apply RoPE (0.0..=1.0)
+    pub partial_rotary_factor: f32,
+    /// FFN activation function
+    pub activation: Activation,
 }
 
 impl LayerIR {
@@ -66,6 +71,12 @@ impl LayerIR {
             ModelArch::Phi => LayerArch::Decoder,
         };
 
+        let activation = match config.arch {
+            ModelArch::Gemma => Activation::GeGlu,
+            ModelArch::Gpt2 => Activation::Gelu,
+            _ => Activation::Silu, // LLaMA, Mistral, Qwen, Phi use SwiGLU
+        };
+
         LayerIR {
             arch,
             hidden: config.hidden_size,
@@ -79,6 +90,8 @@ impl LayerIR {
             rms_eps: config.norm_eps,
             max_batch,
             max_seq: config.max_seq_len,
+            partial_rotary_factor: config.partial_rotary_factor,
+            activation,
         }
     }
 

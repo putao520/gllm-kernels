@@ -78,6 +78,14 @@ pub struct ModelConfig {
     pub quant_type: Option<QuantType>,
     /// Whether to use interleaved RoPE
     pub rope_interleaved: bool,
+    /// Whether QKV projections have bias (Qwen: true, Llama: false)
+    pub has_qkv_bias: bool,
+    /// Fraction of head_dim to apply RoPE (0.0..=1.0).
+    /// 1.0 = full rotary (Llama), 0.5 = partial rotary (Phi).
+    pub partial_rotary_factor: f32,
+    /// Sliding window size for attention (Mistral-style).
+    /// `None` = full causal attention, `Some(W)` = attend to at most the last W positions.
+    pub sliding_window: Option<usize>,
 }
 
 impl ModelConfig {
@@ -122,6 +130,109 @@ impl ModelConfig {
             dtype: DType::F32,
             quant_type: None,
             rope_interleaved: false,
+            has_qkv_bias: false,
+            partial_rotary_factor: 1.0,
+            sliding_window: None,
+        }
+    }
+
+    /// Create a Mistral-7B config for testing.
+    ///
+    /// Mistral uses the LLaMA decoder architecture with sliding window
+    /// attention (W=4096): each token attends only to the most recent
+    /// 4096 positions instead of the full context.
+    pub fn mistral_7b() -> Self {
+        ModelConfig {
+            arch: ModelArch::Mistral,
+            hidden_size: 4096,
+            num_heads: 32,
+            num_kv_heads: 8,
+            head_dim: 128,
+            intermediate_size: 14336,
+            num_layers: 32,
+            vocab_size: 32000,
+            max_seq_len: 32768,
+            rope_theta: 1_000_000.0,
+            norm_eps: 1e-5,
+            dtype: DType::F32,
+            quant_type: None,
+            rope_interleaved: false,
+            has_qkv_bias: false,
+            partial_rotary_factor: 1.0,
+            sliding_window: Some(4096),
+        }
+    }
+
+    /// Create a Qwen-7B config for testing.
+    ///
+    /// Qwen reuses the Llama decoder architecture (RMSNorm + GQA + SwiGLU)
+    /// with two key differences: QKV projections carry bias, and RoPE uses
+    /// a larger theta (1_000_000).
+    pub fn qwen_7b() -> Self {
+        ModelConfig {
+            arch: ModelArch::Qwen,
+            hidden_size: 4096,
+            num_heads: 32,
+            num_kv_heads: 32,
+            head_dim: 128,
+            intermediate_size: 11008,
+            num_layers: 32,
+            vocab_size: 151936,
+            max_seq_len: 8192,
+            rope_theta: 1_000_000.0,
+            norm_eps: 1e-6,
+            dtype: DType::F32,
+            quant_type: None,
+            rope_interleaved: false,
+            has_qkv_bias: true,
+            partial_rotary_factor: 1.0,
+            sliding_window: None,
+        }
+    }
+
+    /// Create a Phi-2B-like config for testing (partial rotary).
+    pub fn phi_2b() -> Self {
+        ModelConfig {
+            arch: ModelArch::Phi,
+            hidden_size: 2560,
+            num_heads: 32,
+            num_kv_heads: 32,
+            head_dim: 80,
+            intermediate_size: 10240,
+            num_layers: 32,
+            vocab_size: 51200,
+            max_seq_len: 2048,
+            rope_theta: 10000.0,
+            norm_eps: 1e-5,
+            dtype: DType::F32,
+            quant_type: None,
+            rope_interleaved: false,
+            has_qkv_bias: false,
+            partial_rotary_factor: 0.5,
+            sliding_window: None,
+        }
+    }
+
+    /// Create a Gemma-2B-like config for testing (GeGLU activation).
+    pub fn gemma_2b() -> Self {
+        ModelConfig {
+            arch: ModelArch::Gemma,
+            hidden_size: 2048,
+            num_heads: 8,
+            num_kv_heads: 1,
+            head_dim: 256,
+            intermediate_size: 16384,
+            num_layers: 18,
+            vocab_size: 256000,
+            max_seq_len: 8192,
+            rope_theta: 10000.0,
+            norm_eps: 1e-6,
+            dtype: DType::F32,
+            quant_type: None,
+            rope_interleaved: false,
+            has_qkv_bias: false,
+            partial_rotary_factor: 1.0,
+            sliding_window: None,
         }
     }
 }

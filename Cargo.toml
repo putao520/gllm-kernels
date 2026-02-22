@@ -9,6 +9,11 @@ paste = "1"
 rayon = "1.10"
 libc = "0.2"
 seq-macro = "0.3"
+iced-x86 = { version = "1.21", features = ["code_asm"], optional = true }
+
+[features]
+default = ["jit-x86"]
+jit-x86 = ["iced-x86"]
 
 [dev-dependencies]
 criterion = "0.5"

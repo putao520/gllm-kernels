@@ -1,108 +1,52 @@
-//! x86_64 code generator — AVX2 / AVX-512 machine code emission.
+//! x86_64 JIT code generation via iced-x86 CodeAssembler.
 //!
-//! Phase 1: emits a minimal stub that calls back into Rust (trampoline).
-//! Phase 2 (future): full JIT with fused GEMM + activation + norm.
+//! TODO: Rewrite per SPEC §8.5 Phase 3 — programmatic code generation.
+//!
+//! The correct implementation should:
+//! - Generate complete GEMM microkernels (K-loop, FMA sequences) via iced-x86
+//! - Inject epilogue ops (SiLU/GELU/BiasAdd) into accumulator registers before store
+//! - Generate fused elementwise loops (data flows through registers, no intermediate memory)
+//! - Generate tile-level fusion (predecessor tile computation embedded in GEMM MC loop)
+//!
+//! The previous implementation was a trampoline dispatcher that emitted `call`
+//! instructions to pre-compiled Rust functions. This violated the SPEC's core
+//! principle: "融合 = 全新代码生成".
 
-use crate::compiler::ir::LayerIR;
-use crate::compiler::planner::ExecutionPlan;
-use crate::compiler::codegen::{CodegenOutput, LayerCodegen};
-use crate::dispatch::device_profile::IsaLevel;
-use crate::inference::types::InferenceError;
+use super::CodegenOutput;
 
-/// x86_64 code generator.
-pub struct X86_64Codegen {
-    isa: IsaLevel,
-}
-
-impl X86_64Codegen {
-    pub fn new(isa: IsaLevel) -> Self {
-        X86_64Codegen { isa }
+/// Emit a minimal x86_64 stub (push rbp; mov rbp,rsp; nops; pop rbp; ret).
+///
+/// Used as fallback until the real Phase 3 code generator is implemented.
+pub fn emit_stub() -> CodegenOutput {
+    let mut code = Vec::with_capacity(16);
+    code.push(0x55);                          // push rbp
+    code.extend_from_slice(&[0x48, 0x89, 0xE5]); // mov rbp, rsp
+    for _ in 0..8 {
+        code.push(0x90);                      // nop
     }
-}
-
-impl LayerCodegen for X86_64Codegen {
-    fn generate(
-        &self,
-        ir: &LayerIR,
-        plan: &ExecutionPlan,
-    ) -> Result<CodegenOutput, InferenceError> {
-        // Phase 1: emit a trampoline stub.
-        // The stub saves callee-saved registers, sets up the stack frame,
-        // and calls back into a Rust function that executes the fallback path.
-        //
-        // This allows the compilation cache and dispatch infrastructure to
-        // work end-to-end while the actual JIT codegen is developed.
-
-        let mut code = Vec::with_capacity(256);
-
-        // x86_64 System V ABI:
-        // Args: rdi, rsi, rdx, rcx, r8, r9 (matches CompiledLayerFn signature)
-        //
-        // Emit: push rbp; mov rbp, rsp; ... ; pop rbp; ret
-        // For now, just emit a `ret` — the caller handles fallback.
-
-        // push rbp
-        code.push(0x55);
-        // mov rbp, rsp
-        code.extend_from_slice(&[0x48, 0x89, 0xE5]);
-        // nop sled (placeholder for future codegen)
-        for _ in 0..8 {
-            code.push(0x90); // nop
-        }
-        // pop rbp
-        code.push(0x5D);
-        // ret
-        code.push(0xC3);
-
-        Ok(CodegenOutput {
-            code,
-            scratchpad_bytes: plan.scratchpad_bytes,
-        })
-    }
-
-    fn isa_level(&self) -> IsaLevel {
-        self.isa
-    }
+    code.push(0x5D);                          // pop rbp
+    code.push(0xC3);                          // ret
+    CodegenOutput { code, scratchpad_bytes: 0 }
 }
 
 #[cfg(test)]
 #[cfg(target_arch = "x86_64")]
 mod tests {
     use super::*;
-    use crate::compiler::ir::LayerIR;
-    use crate::compiler::planner::ExecutionPlan;
-    use crate::dispatch::DeviceProfile;
-    use crate::inference::types::ModelConfig;
+    use crate::compiler::executable::CompiledLayer;
 
     #[test]
-    fn test_x86_codegen_stub() {
-        let config = ModelConfig::llama_7b();
-        let ir = LayerIR::from_model_config(&config, 1);
-        let profile = DeviceProfile::detect();
-        let plan = ExecutionPlan::build(&ir, &profile);
-
-        let codegen = X86_64Codegen::new(profile.isa);
-        let output = codegen.generate(&ir, &plan).unwrap();
-
+    fn test_x86_stub_callable() {
+        let output = emit_stub();
         assert!(!output.code.is_empty());
-        assert!(output.scratchpad_bytes > 0);
-
-        // Verify the stub is callable (it just returns)
-        use crate::compiler::executable::CompiledLayer;
-        let layer = CompiledLayer::from_code(&output.code, output.scratchpad_bytes, 0).unwrap();
+        let layer = CompiledLayer::from_code(&output.code, 0, 0).unwrap();
         unsafe {
             let f = layer.entry_point();
-            // Call with null pointers — the stub just returns
             f(
-                std::ptr::null(),
-                std::ptr::null(),
-                std::ptr::null_mut(),
-                std::ptr::null(),
-                std::ptr::null(),
-                0,
-                0,
-                std::ptr::null_mut(),
-                std::ptr::null_mut(),
+                std::ptr::null(), std::ptr::null(), std::ptr::null_mut(),
+                std::ptr::null(), std::ptr::null(),
+                0, 0,
+                std::ptr::null_mut(), std::ptr::null_mut(),
             );
         }
     }

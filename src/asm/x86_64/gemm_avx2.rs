@@ -42,6 +42,19 @@ use std::arch::global_asm;
 pub const MR: usize = 6;
 pub const NR: usize = 16;
 
+/// Epilogue variant selector for fused GEMM microkernels.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GemmEpilogue {
+    /// No epilogue — plain GEMM (optional bias via pointer).
+    None,
+    /// Fused SiLU: C = silu(A*B) or C = silu(A*B + bias).
+    Silu,
+    /// Fused GELU: C = gelu(A*B) or C = gelu(A*B + bias).
+    Gelu,
+    /// Fused residual add: C = A*B + residual.
+    Residual,
+}
+
 // Helper macro: one K-step of 6x16 FMA with B already in ymm14/ymm15.
 // B[k+1] load interleaved after row 2 FMAs (between 4th and 5th FMA).
 // $a_off = byte offset into packed_a for this K step

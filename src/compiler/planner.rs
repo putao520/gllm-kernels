@@ -37,6 +37,8 @@ pub enum FusionDecision {
     FlashAttention,
     /// Gate and Up GEMMs fused with SiLU: SiLU(gate) * up
     SwiGluFusion,
+    /// Gate and Up GEMMs fused with GELU: GELU(gate) * up (Gemma GeGLU)
+    GeGluFusion,
 }
 
 /// Complete execution plan for a compiled transformer layer.
@@ -219,8 +221,11 @@ fn plan_fusions(ir: &LayerIR) -> Vec<FusionDecision> {
 
     match &ir.arch {
         LayerArch::Decoder | LayerArch::DecoderMoE { .. } => {
-            // SwiGLU fusion for LLaMA-style FFN
-            fusions.push(FusionDecision::SwiGluFusion);
+            // Gated FFN fusion: SwiGLU or GeGLU depending on activation
+            match ir.activation {
+                Activation::GeGlu => fusions.push(FusionDecision::GeGluFusion),
+                _ => fusions.push(FusionDecision::SwiGluFusion),
+            }
         }
         LayerArch::Encoder => {
             // GELU fusion for encoder FFN
@@ -279,5 +284,16 @@ mod tests {
         assert!(plan.fusions.contains(&FusionDecision::SwiGluFusion));
         assert!(plan.fusions.contains(&FusionDecision::RmsNormIntoGemm));
         assert!(plan.fusions.contains(&FusionDecision::FlashAttention));
+    }
+
+    #[test]
+    fn test_fusions_gemma_geglu() {
+        let config = ModelConfig::gemma_2b();
+        let ir = LayerIR::from_model_config(&config, 1);
+        let profile = DeviceProfile::detect();
+        let plan = ExecutionPlan::build(&ir, &profile);
+
+        assert!(plan.fusions.contains(&FusionDecision::GeGluFusion));
+        assert!(!plan.fusions.contains(&FusionDecision::SwiGluFusion));
     }
 }

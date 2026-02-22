@@ -1618,6 +1618,480 @@ pub fn gemm_bias_prepacked_asm_f32_avx512(
     }, bias.as_ptr());
 }
 
+// ============================================================================
+// Pre-packed A support: pack_a + SharedPackA + prepacked AB GEMM drivers
+// ============================================================================
+
+/// Shared pre-packed A buffer for QKV-style reuse.
+///
+/// In transformer inference, Q/K/V projections share the same input activation
+/// matrix A. Packing A once and reusing it across all three GEMMs saves ~3x
+/// pack_a bandwidth.
+///
+/// Create via `SharedPackA::pack()`, then pass to `gemm_prepacked_ab_asm_f32_*`.
+#[cfg(target_arch = "x86_64")]
+pub struct SharedPackA {
+    packed: Vec<f32>,
+    m: usize,
+    k: usize,
+    mr: usize,
+    kc: usize,
+}
+
+#[cfg(target_arch = "x86_64")]
+impl SharedPackA {
+    /// Pack a row-major A matrix [m x k] into KC-blocked, MR-wide strips.
+    pub fn pack(a: &[f32], m: usize, k: usize, mr: usize, kc: usize) -> Self {
+        let packed = pack_a_full_f32(a, m, k, mr, kc);
+        Self { packed, m, k, mr, kc }
+    }
+
+    /// Get the packed data slice.
+    #[inline]
+    pub fn as_slice(&self) -> &[f32] {
+        &self.packed
+    }
+
+    /// Dimensions.
+    #[inline]
+    pub fn m(&self) -> usize { self.m }
+    #[inline]
+    pub fn k(&self) -> usize { self.k }
+    #[inline]
+    pub fn mr(&self) -> usize { self.mr }
+    #[inline]
+    pub fn kc(&self) -> usize { self.kc }
+}
+
+/// Pack the entire A matrix [M x K] into KC-blocked, MR-wide strips.
+///
+/// Layout (KC-blocked, mirrors `pack_b_full_f32`):
+///   For each KC-block p (p=0, KC, 2*KC, ...):
+///     For each MR-wide strip i (i=0, MR, 2*MR, ...):
+///       packed[kc_block * n_mr_strips * kc * mr + strip * kc * mr + k_local * mr + i_local]
+///         = A[i + i_local, p*KC + k_local]
+///
+/// Total size: n_kc_blocks * n_mr_strips * kc * mr.
+#[cfg(target_arch = "x86_64")]
+fn pack_a_full_f32(a: &[f32], m: usize, k: usize, mr: usize, kc: usize) -> Vec<f32> {
+    assert!(a.len() >= m * k);
+    let n_mr_strips = (m + mr - 1) / mr;
+    let n_kc_blocks = (k + kc - 1) / kc;
+    let total = n_kc_blocks * n_mr_strips * kc * mr;
+    let mut packed = vec![0.0f32; total];
+
+    let a_ptr = a.as_ptr();
+    let p_ptr = packed.as_mut_ptr();
+
+    unsafe {
+        for kc_block in 0..n_kc_blocks {
+            let pc = kc_block * kc;
+            let kc_len = kc.min(k - pc);
+
+            for strip in 0..n_mr_strips {
+                let i = strip * mr;
+                let mc = mr.min(m - i);
+
+                let tile_base = kc_block * n_mr_strips * kc * mr + strip * kc * mr;
+
+                // Reuse the optimized pack_a_f32 (AVX2 6x8 transpose for MR=6).
+                // pack_a_f32 writes mc (up to mr) rows x kc_len cols into
+                // packed[k_local * mr + i_local] layout, zero-padding remainder rows.
+                // Remaining (kc - kc_len) * mr floats are already zero from vec init.
+                pack_a_f32(
+                    a_ptr.add(i * k + pc), k,
+                    p_ptr.add(tile_base),
+                    mc, kc_len, mr,
+                );
+            }
+        }
+    }
+
+    packed
+}
+
+/// Pack A for the AVX2 ASM driver (MR=6).
+#[cfg(target_arch = "x86_64")]
+pub fn pack_a_asm_f32_avx2(a: &[f32], m: usize, k: usize) -> SharedPackA {
+    use super::gemm_avx2::MR;
+    let kc = crate::microarch::kernel_config().kc;
+    SharedPackA::pack(a, m, k, MR, kc)
+}
+
+/// Pack A for the AVX-512 ASM driver (MR=14).
+#[cfg(target_arch = "x86_64")]
+pub fn pack_a_asm_f32_avx512(a: &[f32], m: usize, k: usize) -> SharedPackA {
+    use super::gemm_avx512::MR;
+    let kc = crate::microarch::kernel_config().kc;
+    SharedPackA::pack(a, m, k, MR, kc)
+}
+
+/// Single-threaded BLIS-style GEMM driver with both pre-packed A and pre-packed B.
+///
+/// C = packed_A * packed_B  (row-major C, m x n)
+///
+/// Both `packed_a` and `packed_b` must have been produced by `pack_a_full_f32`
+/// and `pack_b_full_f32` respectively, with matching MR/NR/KC parameters.
+/// The driver skips all packing and indexes directly into the KC-blocked buffers.
+#[cfg(target_arch = "x86_64")]
+fn gemm_prepacked_ab_driver_f32(
+    packed_a: &[f32],
+    packed_b: &[f32],
+    c: &mut [f32],
+    m: usize,
+    n: usize,
+    k: usize,
+    mr: usize,
+    nr: usize,
+    microkernel: unsafe fn(*const f32, *const f32, *mut f32, usize, usize, bool, *const f32),
+    bias: *const f32,
+) {
+    assert!(c.len() >= m * n);
+
+    if m == 0 || n == 0 || k == 0 {
+        return;
+    }
+
+    let cfg = crate::microarch::kernel_config();
+    let kc_max = cfg.kc;
+    let nc_max = cfg.nc;
+
+    let c_ptr = c.as_mut_ptr();
+    let pa_base = packed_a.as_ptr();
+    let pb_base = packed_b.as_ptr();
+
+    let n_mr_strips_total = (m + mr - 1) / mr;
+    let n_nr_strips_total = (n + nr - 1) / nr;
+
+    // NC loop
+    let mut jc = 0usize;
+    while jc < n {
+        let nc = nc_max.min(n - jc);
+        let strip_start_n = jc / nr;
+
+        // KC loop
+        let mut pc = 0usize;
+        while pc < k {
+            let kc = kc_max.min(k - pc);
+            let first_kc = pc == 0;
+            let last_kc = pc + kc_max >= k;
+            let kc_block_idx = pc / kc_max;
+
+            let n_nr = (nc + nr - 1) / nr;
+
+            // MR-strip loop (no MC blocking needed — A is already packed)
+            for mr_strip in 0..n_mr_strips_total {
+                let row_start = mr_strip * mr;
+                let row_rem = mr.min(m - row_start);
+                let is_edge_row = row_rem < mr;
+
+                let pa_strip = unsafe {
+                    pa_base.add(
+                        kc_block_idx * n_mr_strips_total * kc_max * mr
+                        + mr_strip * kc_max * mr,
+                    )
+                };
+
+                let mut c_tmp = [0.0f32; 14 * 32];
+
+                for jr in 0..n_nr {
+                    let col_start = jc + jr * nr;
+                    let col_rem = n.saturating_sub(col_start).min(nr);
+                    let is_edge_col = col_rem < nr;
+
+                    let global_strip_n = strip_start_n + jr;
+                    let pb_tile = unsafe {
+                        pb_base.add(
+                            kc_block_idx * n_nr_strips_total * kc_max * nr
+                            + global_strip_n * kc_max * nr,
+                        )
+                    };
+
+                    // Prefetch next B strip
+                    if jr + 1 < n_nr {
+                        let next_strip = global_strip_n + 1;
+                        let next_pb = unsafe {
+                            pb_base.add(
+                                kc_block_idx * n_nr_strips_total * kc_max * nr
+                                + next_strip * kc_max * nr,
+                            )
+                        };
+                        let prefetch_bytes = kc * nr * 4;
+                        let mut pf_off = 0usize;
+                        while pf_off < prefetch_bytes {
+                            unsafe {
+                                #[cfg(target_arch = "x86_64")]
+                                std::arch::x86_64::_mm_prefetch(
+                                    next_pb.add(pf_off / 4) as *const i8,
+                                    std::arch::x86_64::_MM_HINT_T1,
+                                );
+                            }
+                            pf_off += 64;
+                        }
+                    }
+
+                    unsafe {
+                        if is_edge_row || is_edge_col {
+                            if !first_kc {
+                                for ri in 0..row_rem {
+                                    for ci in 0..col_rem {
+                                        c_tmp[ri * nr + ci] =
+                                            *c_ptr.add((row_start + ri) * n + col_start + ci);
+                                    }
+                                }
+                            } else {
+                                for v in c_tmp[..mr * nr].iter_mut() { *v = 0.0; }
+                            }
+
+                            microkernel(
+                                pa_strip, pb_tile, c_tmp.as_mut_ptr(),
+                                kc, nr, !first_kc, std::ptr::null(),
+                            );
+
+                            for ri in 0..row_rem {
+                                for ci in 0..col_rem {
+                                    let mut val = c_tmp[ri * nr + ci];
+                                    if last_kc && !bias.is_null() {
+                                        val += *bias.add(col_start + ci);
+                                    }
+                                    *c_ptr.add((row_start + ri) * n + col_start + ci) = val;
+                                }
+                            }
+                        } else {
+                            let c_tile = c_ptr.add(row_start * n + col_start);
+                            let tile_bias = if last_kc && !bias.is_null() {
+                                bias.add(col_start)
+                            } else {
+                                std::ptr::null()
+                            };
+                            microkernel(
+                                pa_strip, pb_tile, c_tile,
+                                kc, n, !first_kc, tile_bias,
+                            );
+                        }
+                    }
+                }
+            }
+
+            pc += kc_max;
+        }
+
+        jc += nc_max;
+    }
+}
+
+/// Multi-threaded GEMM driver with both pre-packed A and pre-packed B.
+///
+/// Since both A and B are pre-packed, no per-thread packing buffers are needed.
+/// Parallelizes directly over MR-strips (1D) or (MR-strip, NR-chunk) tiles (2D).
+#[cfg(target_arch = "x86_64")]
+fn gemm_prepacked_ab_driver_f32_mt(
+    packed_a: &[f32],
+    packed_b: &[f32],
+    c: &mut [f32],
+    m: usize,
+    n: usize,
+    k: usize,
+    mr: usize,
+    nr: usize,
+    microkernel: unsafe fn(*const f32, *const f32, *mut f32, usize, usize, bool, *const f32),
+    bias: *const f32,
+) {
+    assert!(c.len() >= m * n);
+
+    if m == 0 || n == 0 || k == 0 {
+        return;
+    }
+
+    let cfg = crate::microarch::kernel_config();
+    let kc_max = cfg.kc;
+    let nc_max = cfg.nc;
+
+    let nthreads = rayon::current_num_threads().max(1);
+    let n_mr_strips_total = (m + mr - 1) / mr;
+    let n_nr_strips_total = (n + nr - 1) / nr;
+
+    // Fall back to single-threaded for small problems
+    if n_mr_strips_total < 2 || nthreads <= 1 {
+        return gemm_prepacked_ab_driver_f32(
+            packed_a, packed_b, c, m, n, k, mr, nr, microkernel, bias,
+        );
+    }
+
+    let pa_base = packed_a.as_ptr();
+    let pb_base = packed_b.as_ptr();
+    let c_ptr = c.as_mut_ptr();
+
+    // NC loop
+    let mut jc = 0usize;
+    while jc < n {
+        let nc = nc_max.min(n - jc);
+        let strip_start_n = jc / nr;
+
+        // KC loop
+        let mut pc = 0usize;
+        while pc < k {
+            let kc = kc_max.min(k - pc);
+            let first_kc = pc == 0;
+            let last_kc = pc + kc_max >= k;
+            let kc_block_idx = pc / kc_max;
+
+            let n_nr = (nc + nr - 1) / nr;
+
+            let pa_addr = pa_base as usize;
+            let pb_addr = pb_base as usize;
+            let c_addr = c_ptr as usize;
+            let bias_addr = bias as usize;
+
+            use rayon::prelude::*;
+
+            // Parallel over MR-strips — no packing buffers needed
+            (0..n_mr_strips_total).into_par_iter().for_each(|mr_strip| {
+                let row_start = mr_strip * mr;
+                let row_rem = mr.min(m - row_start);
+                let is_edge_row = row_rem < mr;
+
+                let pa_ptr = pa_addr as *const f32;
+                let pb_ptr = pb_addr as *const f32;
+                let c_ptr = c_addr as *mut f32;
+
+                let pa_strip = unsafe {
+                    pa_ptr.add(
+                        kc_block_idx * n_mr_strips_total * kc_max * mr
+                        + mr_strip * kc_max * mr,
+                    )
+                };
+
+                let mut c_tmp = [0.0f32; 14 * 32];
+
+                for jr in 0..n_nr {
+                    let col_start = jc + jr * nr;
+                    let col_rem = n.saturating_sub(col_start).min(nr);
+                    if col_rem == 0 { continue; }
+                    let is_edge_col = col_rem < nr;
+
+                    let global_strip_n = strip_start_n + jr;
+                    let pb_tile = unsafe {
+                        pb_ptr.add(
+                            kc_block_idx * n_nr_strips_total * kc_max * nr
+                            + global_strip_n * kc_max * nr,
+                        )
+                    };
+
+                    // Prefetch next B strip
+                    if jr + 1 < n_nr {
+                        let next_strip = global_strip_n + 1;
+                        let next_pb = unsafe {
+                            pb_ptr.add(
+                                kc_block_idx * n_nr_strips_total * kc_max * nr
+                                + next_strip * kc_max * nr,
+                            )
+                        };
+                        let prefetch_bytes = kc * nr * 4;
+                        let mut pf_off = 0usize;
+                        while pf_off < prefetch_bytes {
+                            unsafe {
+                                #[cfg(target_arch = "x86_64")]
+                                std::arch::x86_64::_mm_prefetch(
+                                    next_pb.add(pf_off / 4) as *const i8,
+                                    std::arch::x86_64::_MM_HINT_T1,
+                                );
+                            }
+                            pf_off += 64;
+                        }
+                    }
+
+                    unsafe {
+                        if is_edge_row || is_edge_col {
+                            if !first_kc {
+                                for ri in 0..row_rem {
+                                    for ci in 0..col_rem {
+                                        c_tmp[ri * nr + ci] =
+                                            *c_ptr.add((row_start + ri) * n + col_start + ci);
+                                    }
+                                }
+                            } else {
+                                for v in c_tmp[..mr * nr].iter_mut() { *v = 0.0; }
+                            }
+
+                            microkernel(
+                                pa_strip, pb_tile, c_tmp.as_mut_ptr(),
+                                kc, nr, !first_kc, std::ptr::null(),
+                            );
+
+                            let bias_ptr = bias_addr as *const f32;
+                            let fuse_bias = last_kc && !bias_ptr.is_null();
+
+                            for ri in 0..row_rem {
+                                for ci in 0..col_rem {
+                                    let mut val = c_tmp[ri * nr + ci];
+                                    if fuse_bias {
+                                        val += *bias_ptr.add(col_start + ci);
+                                    }
+                                    *c_ptr.add((row_start + ri) * n + col_start + ci) = val;
+                                }
+                            }
+                        } else {
+                            let c_tile = c_ptr.add(row_start * n + col_start);
+                            let bias_ptr = bias_addr as *const f32;
+                            let tile_bias = if last_kc && !bias_ptr.is_null() {
+                                bias_ptr.add(col_start)
+                            } else {
+                                std::ptr::null()
+                            };
+                            microkernel(
+                                pa_strip, pb_tile, c_tile,
+                                kc, n, !first_kc, tile_bias,
+                            );
+                        }
+                    }
+                }
+            });
+
+            pc += kc_max;
+        }
+
+        jc += nc_max;
+    }
+}
+
+/// Prepacked AB GEMM using AVX2: C = packed_A * packed_B
+///
+/// Both A and B must be pre-packed via `pack_a_asm_f32_avx2` / `pack_b_asm_f32_avx2`.
+/// Use this for QKV-style shared-A reuse: pack A once, call this 3x with different packed_B.
+#[cfg(target_arch = "x86_64")]
+pub fn gemm_prepacked_ab_asm_f32_avx2(
+    packed_a: &[f32],
+    packed_b: &[f32],
+    c: &mut [f32],
+    m: usize,
+    n: usize,
+    k: usize,
+) {
+    use super::gemm_avx2::{MR, NR, gemm_kernel_6x16_f32};
+
+    gemm_prepacked_ab_driver_f32_mt(packed_a, packed_b, c, m, n, k, MR, NR, |pa, pb, cp, kc, ldc, acc, _bias| unsafe {
+        gemm_kernel_6x16_f32(pa, pb, cp, kc, ldc, acc);
+    }, std::ptr::null());
+}
+
+/// Prepacked AB GEMM using AVX-512: C = packed_A * packed_B
+#[cfg(target_arch = "x86_64")]
+pub fn gemm_prepacked_ab_asm_f32_avx512(
+    packed_a: &[f32],
+    packed_b: &[f32],
+    c: &mut [f32],
+    m: usize,
+    n: usize,
+    k: usize,
+) {
+    use super::gemm_avx512::{MR, NR, gemm_kernel_14x32_f32};
+
+    gemm_prepacked_ab_driver_f32_mt(packed_a, packed_b, c, m, n, k, MR, NR, |pa, pb, cp, kc, ldc, acc, _bias| unsafe {
+        gemm_kernel_14x32_f32(pa, pb, cp, kc, ldc, acc);
+    }, std::ptr::null());
+}
+
 #[cfg(test)]
 #[cfg(target_arch = "x86_64")]
 mod tests {
@@ -2063,5 +2537,228 @@ mod tests {
             }
         }
         check_close(&c_pp, &c_ref, 1e-4, "avx512_prepacked_bias");
+    }
+
+    // ── Prepacked AB (shared pack_a) AVX2 tests ──
+
+    #[test]
+    fn test_avx2_prepacked_ab_exact_tile() {
+        if !is_x86_feature_detected!("avx2") || !is_x86_feature_detected!("fma") {
+            return;
+        }
+        let (m, n, k) = (6, 16, 32);
+        let a: Vec<f32> = (0..m * k).map(|i| (i as f32) * 0.01).collect();
+        let b: Vec<f32> = (0..k * n).map(|i| (i as f32) * 0.02).collect();
+        let packed_a = pack_a_asm_f32_avx2(&a, m, k);
+        let packed_b = pack_b_asm_f32_avx2(&b, n, k);
+        let mut c_ab = vec![0.0f32; m * n];
+        let mut c_ref = vec![0.0f32; m * n];
+        gemm_prepacked_ab_asm_f32_avx2(packed_a.as_slice(), &packed_b, &mut c_ab, m, n, k);
+        gemm_ref(&a, &b, &mut c_ref, m, n, k);
+        check_close(&c_ab, &c_ref, 1e-4, "avx2_prepacked_ab_exact_tile");
+    }
+
+    #[test]
+    fn test_avx2_prepacked_ab_multi_tile() {
+        if !is_x86_feature_detected!("avx2") || !is_x86_feature_detected!("fma") {
+            return;
+        }
+        let (m, n, k) = (24, 64, 128);
+        let a: Vec<f32> = (0..m * k).map(|i| ((i % 97) as f32 - 48.0) * 0.01).collect();
+        let b: Vec<f32> = (0..k * n).map(|i| ((i % 83) as f32 - 41.0) * 0.02).collect();
+        let packed_a = pack_a_asm_f32_avx2(&a, m, k);
+        let packed_b = pack_b_asm_f32_avx2(&b, n, k);
+        let mut c_ab = vec![0.0f32; m * n];
+        let mut c_ref = vec![0.0f32; m * n];
+        gemm_prepacked_ab_asm_f32_avx2(packed_a.as_slice(), &packed_b, &mut c_ab, m, n, k);
+        gemm_ref(&a, &b, &mut c_ref, m, n, k);
+        check_close(&c_ab, &c_ref, 1e-4, "avx2_prepacked_ab_multi_tile");
+    }
+
+    #[test]
+    fn test_avx2_prepacked_ab_non_aligned() {
+        if !is_x86_feature_detected!("avx2") || !is_x86_feature_detected!("fma") {
+            return;
+        }
+        let (m, n, k) = (7, 19, 13);
+        let a: Vec<f32> = (0..m * k).map(|i| (i as f32) * 0.03).collect();
+        let b: Vec<f32> = (0..k * n).map(|i| (i as f32) * 0.04).collect();
+        let packed_a = pack_a_asm_f32_avx2(&a, m, k);
+        let packed_b = pack_b_asm_f32_avx2(&b, n, k);
+        let mut c_ab = vec![0.0f32; m * n];
+        let mut c_ref = vec![0.0f32; m * n];
+        gemm_prepacked_ab_asm_f32_avx2(packed_a.as_slice(), &packed_b, &mut c_ab, m, n, k);
+        gemm_ref(&a, &b, &mut c_ref, m, n, k);
+        for i in 0..m {
+            for j in 0..n {
+                let diff = (c_ab[i * n + j] - c_ref[i * n + j]).abs();
+                let scale = c_ab[i * n + j].abs().max(c_ref[i * n + j].abs()).max(1.0);
+                assert!(
+                    diff / scale < 1e-4,
+                    "avx2_prepacked_ab_non_aligned[{i},{j}]: ab={}, ref={}, diff={diff}",
+                    c_ab[i * n + j], c_ref[i * n + j]
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn test_avx2_prepacked_ab_vs_regular() {
+        if !is_x86_feature_detected!("avx2") || !is_x86_feature_detected!("fma") {
+            return;
+        }
+        let (m, n, k) = (48, 96, 256);
+        let a: Vec<f32> = (0..m * k).map(|i| ((i % 97) as f32 - 48.0) * 0.01).collect();
+        let b: Vec<f32> = (0..k * n).map(|i| ((i % 83) as f32 - 41.0) * 0.02).collect();
+        let packed_a = pack_a_asm_f32_avx2(&a, m, k);
+        let packed_b = pack_b_asm_f32_avx2(&b, n, k);
+        let mut c_ab = vec![0.0f32; m * n];
+        let mut c_reg = vec![0.0f32; m * n];
+        gemm_prepacked_ab_asm_f32_avx2(packed_a.as_slice(), &packed_b, &mut c_ab, m, n, k);
+        gemm_asm_f32_avx2(&a, &b, &mut c_reg, m, n, k);
+        check_close(&c_ab, &c_reg, 1e-5, "avx2_prepacked_ab_vs_regular");
+    }
+
+    /// Verify pack_a output matches what the internal pack_a_f32 produces
+    /// for a single KC-block.
+    #[test]
+    fn test_avx2_pack_a_matches_internal() {
+        if !is_x86_feature_detected!("avx2") || !is_x86_feature_detected!("fma") {
+            return;
+        }
+        use super::super::gemm_avx2::MR;
+        let kc = crate::microarch::kernel_config().kc;
+        let (m, k) = (13, 37); // non-aligned
+
+        let a: Vec<f32> = (0..m * k).map(|i| (i as f32) * 0.07).collect();
+        let shared = pack_a_asm_f32_avx2(&a, m, k);
+
+        // Manually pack the first KC-block using pack_a_f32 and compare
+        let kc_len = kc.min(k);
+        let n_mr_strips = (m + MR - 1) / MR;
+        let mut manual = vec![0.0f32; n_mr_strips * MR * kc_len];
+        unsafe {
+            pack_a_f32(a.as_ptr(), k, manual.as_mut_ptr(), m, kc_len, MR);
+        }
+
+        // The first KC-block in shared should match manual
+        // shared layout: kc_block=0 → offset 0, each strip is kc*MR floats
+        // manual layout: each strip is kc_len*MR floats (contiguous)
+        for strip in 0..n_mr_strips {
+            let shared_off = strip * kc * MR; // kc (max) stride in shared
+            let manual_off = strip * kc_len * MR;
+            for kl in 0..kc_len {
+                for r in 0..MR {
+                    let sv = shared.as_slice()[shared_off + kl * MR + r];
+                    let mv = manual[manual_off + kl * MR + r];
+                    assert!(
+                        (sv - mv).abs() < 1e-6,
+                        "pack_a mismatch strip={strip} k={kl} r={r}: shared={sv}, manual={mv}"
+                    );
+                }
+            }
+        }
+    }
+
+    /// QKV-style shared pack_a reuse: pack A once, multiply with 3 different B matrices.
+    #[test]
+    fn test_avx2_shared_pack_a_qkv() {
+        if !is_x86_feature_detected!("avx2") || !is_x86_feature_detected!("fma") {
+            return;
+        }
+        let (m, n, k) = (12, 32, 64);
+        let a: Vec<f32> = (0..m * k).map(|i| ((i % 97) as f32 - 48.0) * 0.01).collect();
+        let bq: Vec<f32> = (0..k * n).map(|i| ((i % 83) as f32 - 41.0) * 0.02).collect();
+        let bk: Vec<f32> = (0..k * n).map(|i| ((i % 71) as f32 - 35.0) * 0.03).collect();
+        let bv: Vec<f32> = (0..k * n).map(|i| ((i % 59) as f32 - 29.0) * 0.04).collect();
+
+        // Pack A once
+        let packed_a = pack_a_asm_f32_avx2(&a, m, k);
+        let packed_bq = pack_b_asm_f32_avx2(&bq, n, k);
+        let packed_bk = pack_b_asm_f32_avx2(&bk, n, k);
+        let packed_bv = pack_b_asm_f32_avx2(&bv, n, k);
+
+        // Compute Q, K, V with shared packed A
+        let mut cq = vec![0.0f32; m * n];
+        let mut ck = vec![0.0f32; m * n];
+        let mut cv = vec![0.0f32; m * n];
+        gemm_prepacked_ab_asm_f32_avx2(packed_a.as_slice(), &packed_bq, &mut cq, m, n, k);
+        gemm_prepacked_ab_asm_f32_avx2(packed_a.as_slice(), &packed_bk, &mut ck, m, n, k);
+        gemm_prepacked_ab_asm_f32_avx2(packed_a.as_slice(), &packed_bv, &mut cv, m, n, k);
+
+        // Reference
+        let mut cq_ref = vec![0.0f32; m * n];
+        let mut ck_ref = vec![0.0f32; m * n];
+        let mut cv_ref = vec![0.0f32; m * n];
+        gemm_ref(&a, &bq, &mut cq_ref, m, n, k);
+        gemm_ref(&a, &bk, &mut ck_ref, m, n, k);
+        gemm_ref(&a, &bv, &mut cv_ref, m, n, k);
+
+        check_close(&cq, &cq_ref, 1e-4, "shared_pack_a_Q");
+        check_close(&ck, &ck_ref, 1e-4, "shared_pack_a_K");
+        check_close(&cv, &cv_ref, 1e-4, "shared_pack_a_V");
+    }
+
+    // ── Prepacked AB AVX-512 tests ──
+
+    #[test]
+    fn test_avx512_prepacked_ab_exact_tile() {
+        if !is_x86_feature_detected!("avx512f") {
+            return;
+        }
+        let (m, n, k) = (14, 32, 64);
+        let a: Vec<f32> = (0..m * k).map(|i| (i as f32) * 0.01).collect();
+        let b: Vec<f32> = (0..k * n).map(|i| (i as f32) * 0.02).collect();
+        let packed_a = pack_a_asm_f32_avx512(&a, m, k);
+        let packed_b = pack_b_asm_f32_avx512(&b, n, k);
+        let mut c_ab = vec![0.0f32; m * n];
+        let mut c_ref = vec![0.0f32; m * n];
+        gemm_prepacked_ab_asm_f32_avx512(packed_a.as_slice(), &packed_b, &mut c_ab, m, n, k);
+        gemm_ref(&a, &b, &mut c_ref, m, n, k);
+        check_close(&c_ab, &c_ref, 1e-4, "avx512_prepacked_ab_exact_tile");
+    }
+
+    #[test]
+    fn test_avx512_prepacked_ab_non_aligned() {
+        if !is_x86_feature_detected!("avx512f") {
+            return;
+        }
+        let (m, n, k) = (15, 37, 17);
+        let a: Vec<f32> = (0..m * k).map(|i| (i as f32) * 0.03).collect();
+        let b: Vec<f32> = (0..k * n).map(|i| (i as f32) * 0.04).collect();
+        let packed_a = pack_a_asm_f32_avx512(&a, m, k);
+        let packed_b = pack_b_asm_f32_avx512(&b, n, k);
+        let mut c_ab = vec![0.0f32; m * n];
+        let mut c_ref = vec![0.0f32; m * n];
+        gemm_prepacked_ab_asm_f32_avx512(packed_a.as_slice(), &packed_b, &mut c_ab, m, n, k);
+        gemm_ref(&a, &b, &mut c_ref, m, n, k);
+        for i in 0..m {
+            for j in 0..n {
+                let diff = (c_ab[i * n + j] - c_ref[i * n + j]).abs();
+                let scale = c_ab[i * n + j].abs().max(c_ref[i * n + j].abs()).max(1.0);
+                assert!(
+                    diff / scale < 1e-4,
+                    "avx512_prepacked_ab_non_aligned[{i},{j}]: ab={}, ref={}, diff={diff}",
+                    c_ab[i * n + j], c_ref[i * n + j]
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn test_avx512_prepacked_ab_vs_regular() {
+        if !is_x86_feature_detected!("avx512f") {
+            return;
+        }
+        let (m, n, k) = (56, 128, 256);
+        let a: Vec<f32> = (0..m * k).map(|i| ((i % 97) as f32 - 48.0) * 0.01).collect();
+        let b: Vec<f32> = (0..k * n).map(|i| ((i % 83) as f32 - 41.0) * 0.02).collect();
+        let packed_a = pack_a_asm_f32_avx512(&a, m, k);
+        let packed_b = pack_b_asm_f32_avx512(&b, n, k);
+        let mut c_ab = vec![0.0f32; m * n];
+        let mut c_reg = vec![0.0f32; m * n];
+        gemm_prepacked_ab_asm_f32_avx512(packed_a.as_slice(), &packed_b, &mut c_ab, m, n, k);
+        gemm_asm_f32_avx512(&a, &b, &mut c_reg, m, n, k);
+        check_close(&c_ab, &c_reg, 1e-5, "avx512_prepacked_ab_vs_regular");
     }
 }

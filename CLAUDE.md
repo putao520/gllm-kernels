@@ -15,7 +15,7 @@
 | **P2 🟢 代码量最少** | 编译器代码本身保持精简 | 宏/泛型复用编译器内部逻辑，避免重复代码 |
 | **P3 ⚪ 可维护性** | 新增 ISA/量化格式/算子的变更路径清晰 | 遵循维护检查清单 |
 
-> **核心判断准则**：所有性能优化通过 JIT 编译器实现。不存在"热路径/非热路径"区分 — 全部走 JIT 最优化生成。
+> **核心判断准则**：所有性能优化通过 JIT 编译器实现。算子的唯一定义来源是 `extern "C"` 纯标量函数，编译器通过二进制符号执行自动提取计算结构（OpTrace），然后根据 DeviceProfile 生成最优融合 SIMD 代码。项目中现有的手写 asm / intrinsics / 宏生成实现作为正确性基准和性能参考。
 
 ---
 
@@ -62,32 +62,43 @@
 
 ## 🚨 算法意图编译器（ARCH-COMPILER）— 最易偏离的设计
 
-> **核心原则：分析语义 → 决策融合 → 生成新代码。**
+> **核心原则：标量定义 → 二进制分析 → 融合决策 → 全新代码生成。**
 > **融合 = 全新代码生成。不是 trampoline 调度，不是模板拼接。**
 
-### 三阶段编译流水线
+### 四阶段编译流水线
 
 ```
+ScalarOpRegistry (extern "C" 标量函数)
+    │
+    ▼
+Phase 0: 二进制符号执行
+    · iced-x86 Decoder 反汇编标量函数
+    · 符号执行提取计算结构 → OpTrace
+    · OpTrace = { pattern: ComputePattern, body: Vec<TraceOp> }
+    · 首次分析后缓存，同一算子不重复分析
+    │
+    ▼
 CompilerGraph (from GLLM) + DeviceProfile
     │
     ▼
 Phase 1: 语义 DAG 构筑
-    · 算子 → 内置语义描述绑定（OpSemanticsKind）
+    · 算子 → 查 ScalarOpRegistry → 取已缓存的 OpTrace
+    · OpTrace.pattern 自动推导算子分类（不再手动映射）
     · 张量 def-use 链 + 后支配树
-    · 算子分类: elemwise / injective / reduction / gemm / opaque
     │
     ▼
 Phase 2: Profile-Driven 融合决策
     · 后支配树 + TVM 规则 → 融合组划分
     · Profile 约束检查（L1 容量、寄存器压力、消费者数）
     · 三种融合模式:
-      - Epilogue Injection: GEMM 累加器写回前，在寄存器上原地执行 activation
-      - Loop Fusion: elementwise 链 → 单循环，数据在寄存器中流过整个链
+      - Epilogue Injection: 取消费者 OpTrace.body，在 GEMM 累加器上原地生成 SIMD 指令
+      - Loop Fusion: 遍历每个算子的 OpTrace.body 生成单循环
       - Tile-Level Fusion: 前驱 tile 计算嵌入 GEMM MC 循环，结果留在 L1
     │
     ▼
 Phase 3: 全新代码生成（iced-x86 / dynasm-rs）
-    · 程序化生成每一条指令（vfmadd231ps, vbroadcastss, ...）
+    · 从 OpTrace 的 Vec<TraceOp> 直接映射到 SIMD 指令
+    · TraceOp::Add → vaddps, TraceOp::Exp → 多项式逼近指令序列
     · GEMM: 完整 K-loop + FMA 序列 + epilogue 在累加器上原地执行 + store
     · Elementwise: 单循环体，数据在 ymm 寄存器中流过整个算子链
     · 输出: CompiledLayer (mmap RWX)
@@ -97,10 +108,11 @@ Phase 3: 全新代码生成（iced-x86 / dynasm-rs）
 
 | 禁止模式 | 为什么错 | 正确做法 |
 |----------|---------|---------|
-| `mov rax, trampoline_addr; call rax` | 数据落地内存，融合收益为零 | iced-x86 程序化生成 FMA/activation 指令序列 |
-| 预编译微内核变体（gemm_silu, gemm_gelu） | 组合爆炸，不可扩展 | Phase 3 根据融合决策动态生成 epilogue |
+| `mov rax, trampoline_addr; call rax` | 数据落地内存，融合收益为零 | 从 OpTrace.body 的 TraceOp 序列生成 SIMD 指令 |
+| 预编译微内核变体（gemm_silu, gemm_gelu） | 组合爆炸，不可扩展 | Phase 3 从消费者 OpTrace.body 动态生成 epilogue |
 | EmitAction::CallGemm / CallElementwise | "调度器"不是"编译器" | MachineCodeEmitter trait 生成新代码 |
-| 模板字节拼接（复制 body bytes） | 融合后算法结构变了，不能拼 | 根据算子数学语义程序化生成新循环 |
+| 模板字节拼接（复制 body bytes） | 融合后算法结构变了，不能拼 | 从 OpTrace 的 TraceOp 逐条映射到 SIMD 指令 |
+| 手动维护 OpSemanticsKind 映射表 | 新增算子需改编译器内部 | extern "C" 标量函数 + 符号执行自动提取 |
 
 ### 正确的 Phase 3 代码结构
 
@@ -119,7 +131,8 @@ GEMM + SiLU epilogue（JIT 生成，非模板）:
             vmovups ymm14, [B]
             vfmadd231ps ymm0, ymm12, ymm14
             ...
-          // ★ epilogue 在 store 前执行，数据不落地
+          // ★ epilogue: 从消费者 OpTrace.body 提取 TraceOp 序列
+          //   [Neg, Exp, Add(1.0), Recip, Mul] → 逐条映射到 SIMD 指令
           SiLU on ymm0..ymm11 (用 ymm12-14 做 scratch)
           vmovups [C], ymm0..ymm11     // 一次 store
   epilogue
@@ -136,7 +149,8 @@ trait PlatformBackend {
 trait MachineCodeEmitter {
     fn emit_gemm_unit(&mut self, unit: &GemmUnit) -> Result<Vec<u8>>;
     fn emit_fused_loop(&mut self, unit: &FusedLoop) -> Result<Vec<u8>>;
-    fn emit_activation(&mut self, kind: ActivationKind, reg: Register) -> Result<()>;
+    /// 从 OpTrace.body 的 TraceOp 序列生成 SIMD 指令（对指定寄存器原地执行）
+    fn emit_trace_ops(&mut self, ops: &[TraceOp], reg: Register) -> Result<()>;
     fn finalize(self) -> Result<Vec<u8>>;
 }
 ```
@@ -144,7 +158,7 @@ trait MachineCodeEmitter {
 ### 当前状态
 
 Phase 1（graph.rs, semantics.rs）和 Phase 2（fusion.rs）的基础已实现。
-Phase 3 当前是 stub — 等待按上述设计正确实现。
+Phase 0（标量函数符号执行）和 Phase 3（代码生成）当前是 stub — 等待按上述设计正确实现。
 详见 `SPEC/02-ARCHITECTURE.md` §8 和 `SPEC/01-REQUIREMENTS.md` §6。
 
 ---
@@ -154,18 +168,20 @@ Phase 3 当前是 stub — 等待按上述设计正确实现。
 | Component | Technology | Constraint |
 |-----------|------------|------------|
 | **Language** | Rust nightly (1.93.0+) | `global_asm!`, `naked_fn`, `target_feature` |
-| **JIT 编译器 (主路径)** | iced-x86 (x86_64) / dynasm-rs (aarch64) | 程序化生成每条指令，全部算子 JIT 最优化 |
-| **Layer 1 算子库** | `global_asm!` 微内核 + intrinsics + 宏生成 | 正确性参考 + 编译器测试基准 |
+| **JIT 编译器 (主路径)** | iced-x86 (x86_64) / dynasm-rs (aarch64) | iced-x86: Phase 0 反汇编 + Phase 3 代码生成；dynasm-rs: Phase 3 代码生成 |
+| **算子定义** | `extern "C"` 纯标量函数 + ScalarOpRegistry | 编译器通过二进制符号执行自动提取 OpTrace |
+| **现有算子实现** | `global_asm!` 微内核 + intrinsics + 宏生成 | 正确性基准 + 性能参考（非编译器知识来源） |
 | **分发** | `cargo install` 一键安装 | 零外部依赖，纯 Rust crate |
 
 ---
 
-## Layer 1 算子库（ARCH-ASM-MICROKERNEL）
+## 现有算子实现（ARCH-ASM-MICROKERNEL）
 
-> **定位**：JIT 编译器的正确性参考基准 + 测试 oracle。
-> 所有算子的生产路径走 JIT 编译器 Phase 3 自动生成。
+> **定位**：项目中所有现有算子实现（手写 asm、intrinsics、宏生成）作为正确性基准和性能参考。
+> 编译器的算子知识来源是 `extern "C"` 纯标量函数 + 二进制符号执行自动提取的 OpTrace。
+> 现有 SIMD 实现用于：(1) 正确性回归测试的 golden reference；(2) 性能对标基准。
 
-### 现有微内核规格（正确性参考）
+### 微内核规格
 
 | ISA | 微内核尺寸 | 累加器 | 临时寄存器 | 实现方式 |
 |-----|-----------|--------|-----------|---------|
@@ -220,7 +236,7 @@ fn gemm(a, b, c, m, n, k) {
 
 ## 🚨 四层宏架构（ARCH-MACRO-LAYERS）
 
-> Layer 1 算子库的内部代码组织。宏批量生成基线实现，手写 asm 作为正确性参考。
+> Layer 1 算子库的内部代码组织。宏批量生成基线实现，手写 asm 提供算子计算结构的参考知识。
 
 ```
 Layer 1: simd_primitive!     — 硬件原语映射表（每 ISA × 精度 22 个操作）
@@ -231,9 +247,9 @@ Layer 3: quant_primitive!    — 量化特化原语（位解包/码本查表）
             ↓ 被调用
 Layer 4: expand_all_xxx!     — 批量展开
 
-正确性参考实现：
-  gemm_avx2_asm()     — 手写汇编 GEMM（JIT 编译器测试 oracle）
-  gemv_q4_avx2_asm()  — 手写汇编量化 GEMV（JIT 编译器测试 oracle）
+正确性参考 + 算子结构知识来源：
+  gemm_avx2_asm()     — 手写汇编 GEMM（编译器据此理解累加器布局、K-loop、store 位置）
+  gemv_q4_avx2_asm()  — 手写汇编量化 GEMV（编译器据此理解解包/查表/累加结构）
 ```
 
 ### 路径选择（Layer 1 算子库内部）
@@ -303,16 +319,25 @@ src/
 └── compiler/               # 算法意图编译器（JIT）
     ├── mod.rs              # InferenceCompiler 入口
     ├── graph.rs            # Phase 1: CompilerGraph DAG ✅
-    ├── semantics.rs        # Phase 1: 算子语义分析 ✅
+    ├── semantics.rs        # Phase 1: 算子分类（从 OpTrace.pattern 自动推导）✅
     ├── fusion.rs           # Phase 2: 融合决策（需增强）
     ├── planner.rs          # Phase 2: ExecutionPlan（需增强）
     ├── executable.rs       # CompiledLayer mmap RWX ✅
     ├── cache.rs            # 编译缓存 ✅
     ├── ir.rs               # LayerIR 中间表示 ✅
+    ├── symexec.rs          # Phase 0: 二进制符号执行引擎（待实现）
+    ├── trace.rs            # OpTrace / ComputePattern / TraceOp 数据结构（待实现）
+    ├── registry.rs         # ScalarOpRegistry（标量函数注册 + OpTrace 缓存）（待实现）
+    ├── buffer.rs           # Phase 2 Step 4: 张量活性分析 + BufferPlan（待实现）
     └── codegen/            # Phase 3: 代码生成（当前 stub，待实现）
-        ├── emitter.rs      # ScratchpadLayout + buffer 规划
-        ├── x86_64.rs       # iced-x86 后端（待实现）
-        └── aarch64.rs      # dynasm-rs 后端（待实现）
+        ├── emitter.rs      # MachineCodeEmitter trait + CodeGenPlan
+        ├── x86_64.rs       # iced-x86 后端（Phase 0 Decoder + Phase 3 CodeAssembler）
+        └── aarch64.rs      # dynasm-rs 后端（Phase 3 Assembler）
+└── scalar_ops/             # extern "C" 纯标量函数（算子的唯一定义来源）（待实现）
+    ├── mod.rs              # register_all() → ScalarOpRegistry
+    ├── activations.rs      # scalar_silu, scalar_gelu, scalar_relu, ...
+    ├── norms.rs            # scalar_rms_norm, scalar_layer_norm, ...
+    └── elementwise.rs      # scalar_vec_add, scalar_vec_mul, ...
 ```
 
 ---

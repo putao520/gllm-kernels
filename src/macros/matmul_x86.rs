@@ -2220,6 +2220,15 @@ macro_rules! define_matmul_x86 {
                         unsafe { x86_apply_act_inplace::<{2u8}>(c, m_size * n_size); }
                     }
                 },
+                // GeGlu: element-wise activation is GELU (gating handled externally)
+                $crate::Activation::GeGlu => {
+                    if m_size <= SMALL_M_THRESHOLD {
+                        unsafe { x86_matmul_bias_act_nopack_impl::<{2u8}>(a, b, bias, c, m_size, n_size, k_size); }
+                    } else {
+                        matmul_bias(a, b, bias, c, m_size, n_size, k_size);
+                        unsafe { x86_apply_act_inplace::<{2u8}>(c, m_size * n_size); }
+                    }
+                },
             }
         }
 

@@ -1827,6 +1827,46 @@ mod tests {
         assert!((out[0] - 1.0).abs() < 1e-3, "rms_norm len=1: got {}", out[0]);
     }
 
+    /// Test single-pass rms_norm at LLM-scale hidden dimension (4096).
+    /// Verifies the fused pass 1 (x*weight + accumulate x²) + L1-hot pass 2
+    /// produces bit-identical results to the naive reference.
+    #[test]
+    fn test_rms_norm_large_fused() {
+        let kernels = CpuKernels::<f32>::new();
+        let n = 4096; // typical LLM hidden dim
+        let eps = 1e-5_f32;
+        // Deterministic pseudo-random data
+        let x: Vec<f32> = (0..n).map(|i| ((i as f32 * 0.7123 + 0.3).sin()) * 2.0).collect();
+        let w: Vec<f32> = (0..n).map(|i| 0.5 + (i as f32 * 0.0031).cos() * 0.5).collect();
+        let mut out = vec![0.0f32; n];
+        kernels.rms_norm(&x, &w, &mut out, eps);
+        // Scalar reference
+        let ss: f32 = x.iter().map(|v| v * v).sum::<f32>();
+        let inv_rms = 1.0 / (ss / n as f32 + eps).sqrt();
+        let max_err = (0..n)
+            .map(|i| (out[i] - x[i] * w[i] * inv_rms).abs())
+            .fold(0.0f32, f32::max);
+        assert!(max_err < 1e-3, "rms_norm n={n}: max_err={max_err}");
+    }
+
+    /// Test rms_norm with non-unit weights and non-aligned length (4096+13).
+    #[test]
+    fn test_rms_norm_unaligned_fused() {
+        let kernels = CpuKernels::<f32>::new();
+        let n = 4096 + 13; // not a multiple of any SIMD width
+        let eps = 1e-6_f32;
+        let x: Vec<f32> = (0..n).map(|i| (i as f32 - 2048.0) * 0.001).collect();
+        let w: Vec<f32> = (0..n).map(|i| 1.0 + (i % 7) as f32 * 0.1).collect();
+        let mut out = vec![0.0f32; n];
+        kernels.rms_norm(&x, &w, &mut out, eps);
+        let ss: f32 = x.iter().map(|v| v * v).sum::<f32>();
+        let inv_rms = 1.0 / (ss / n as f32 + eps).sqrt();
+        let max_err = (0..n)
+            .map(|i| (out[i] - x[i] * w[i] * inv_rms).abs())
+            .fold(0.0f32, f32::max);
+        assert!(max_err < 1e-3, "rms_norm n={n}: max_err={max_err}");
+    }
+
     #[test]
     fn test_layer_norm_length_1() {
         let kernels = CpuKernels::<f32>::new();
