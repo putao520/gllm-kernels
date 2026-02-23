@@ -24,6 +24,7 @@
 
 pub mod traits;
 pub use traits::Activation;
+pub mod types;
 pub mod cache_params;
 pub mod microarch;
 pub mod numa;

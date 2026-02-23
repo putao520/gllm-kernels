@@ -44,13 +44,14 @@ macro_rules! quant_primitive_commercial {
         {
             let block = unsafe { &*$block_ptr };
             let d: f32 = block.scales.to_f32();
+            let zero = (block.zeros & 0xF) as f32;
             let qw = &block.qweight;
             let out_ptr = $out_ptr;
             for w in 0..32 {
                 let word = qw[w];
                 for nib in 0..8 {
                     let q = ((word >> (nib * 4)) & 0xF) as f32;
-                    unsafe { *out_ptr.add(w * 8 + nib) = d * (q - 8.0); }
+                    unsafe { *out_ptr.add(w * 8 + nib) = d * (q - zero); }
                 }
             }
         }
@@ -60,6 +61,7 @@ macro_rules! quant_primitive_commercial {
         {
             let block = unsafe { &*$block_ptr };
             let d: f32 = block.scales.to_f32();
+            let zero = (block.zeros & 0xF) as f32;
             let qw = &block.qweight;
             let other = $other_ptr;
             let mut sum = 0.0f32;
@@ -67,7 +69,7 @@ macro_rules! quant_primitive_commercial {
                 let word = qw[w];
                 for nib in 0..8 {
                     let q = ((word >> (nib * 4)) & 0xF) as f32;
-                    unsafe { sum += (d * (q - 8.0)) * *other.add(w * 8 + nib); }
+                    unsafe { sum += (d * (q - zero)) * *other.add(w * 8 + nib); }
                 }
             }
             sum

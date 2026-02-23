@@ -13,7 +13,7 @@ use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::compiler::executable::CompiledLayer;
-use crate::inference::types::InferenceError;
+use crate::types::InferenceError;
 
 /// Cache format version — bump when the compiler's codegen changes.
 /// Stale entries with a different version are discarded on load.

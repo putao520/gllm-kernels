@@ -10,6 +10,7 @@
 ///
 /// Layout: `x` and `out` are `[n_heads, head_dim]`, `cos`/`sin` are `[head_dim/2]`.
 #[no_mangle]
+#[inline(never)]
 pub extern "C" fn scalar_rope(
     x: *const f32,
     cos: *const f32,

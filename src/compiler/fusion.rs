@@ -30,21 +30,25 @@ pub struct FusionGroup {
     pub anchor: OpId,
     /// Ops absorbed into this group's epilogue (in execution order).
     pub epilogue: Vec<OpId>,
-    /// The fusion pattern that was applied.
-    pub pattern: FusionPattern,
+    /// The fusion mode that was applied.
+    pub mode: FusionMode,
     /// All op IDs in this group (anchor + epilogue), in execution order.
     pub ops: Vec<OpId>,
 }
 
-/// Named fusion patterns recognized by the pass.
+/// Named fusion modes recognized by the pass.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum FusionPattern {
+pub enum FusionMode {
     /// Single op, no fusion applied.
     Standalone,
     /// GEMM with fused elementwise epilogue (e.g., GEMM + SiLU, GEMM + Add).
-    GemmEpilogue,
+    EpilogueInjection,
     /// Chain of elementwise ops collapsed into a single loop.
-    ElementwiseChain,
+    LoopFusion,
+    /// Tile-level fusion: predecessor tile computation embedded in GEMM MC loop.
+    TileLevelFusion,
+    /// Compute root: standalone compute-bound op (placeholder for future use).
+    ComputeRoot,
     /// Three QKV GEMMs sharing the same input → single pack_a.
     QkvSharedInput,
     /// RmsNorm output feeds directly into GEMM (no intermediate writeback).
@@ -75,7 +79,7 @@ impl FusionPlan {
     pub fn num_fused_ops(&self) -> usize {
         self.groups
             .iter()
-            .filter(|g| g.pattern != FusionPattern::Standalone)
+            .filter(|g| g.mode != FusionMode::Standalone)
             .map(|g| g.ops.len())
             .sum()
     }
@@ -130,13 +134,13 @@ pub fn fuse(graph: &CompilerGraph) -> FusionPlan {
                     let gid = groups.len();
                     let mut all_ops = Vec::new();
 
-                    let pattern = if norm_prefix.is_some() && !epilogue.is_empty() {
+                    let mode = if norm_prefix.is_some() && !epilogue.is_empty() {
                         // Both norm prefix and epilogue
-                        FusionPattern::GemmEpilogue
+                        FusionMode::EpilogueInjection
                     } else if norm_prefix.is_some() {
-                        FusionPattern::NormIntoGemm
+                        FusionMode::NormIntoGemm
                     } else {
-                        FusionPattern::GemmEpilogue
+                        FusionMode::EpilogueInjection
                     };
 
                     if let Some(norm_id) = norm_prefix {
@@ -162,7 +166,7 @@ pub fn fuse(graph: &CompilerGraph) -> FusionPlan {
                         id: gid,
                         anchor: op_id,
                         epilogue: epilogue_ids,
-                        pattern,
+                        mode,
                         ops: all_ops,
                     });
                 } else {
@@ -174,7 +178,7 @@ pub fn fuse(graph: &CompilerGraph) -> FusionPlan {
                         id: gid,
                         anchor: op_id,
                         epilogue: Vec::new(),
-                        pattern: FusionPattern::Standalone,
+                        mode: FusionMode::Standalone,
                         ops: vec![op_id],
                     });
                 }
@@ -187,10 +191,10 @@ pub fn fuse(graph: &CompilerGraph) -> FusionPlan {
                 let chain_ids: Vec<OpId> = chain.iter().map(|o| o.id).collect();
                 all_ops.extend_from_slice(&chain_ids);
 
-                let pattern = if chain_ids.is_empty() {
-                    FusionPattern::Standalone
+                let mode = if chain_ids.is_empty() {
+                    FusionMode::Standalone
                 } else {
-                    FusionPattern::ElementwiseChain
+                    FusionMode::LoopFusion
                 };
 
                 for &oid in &all_ops {
@@ -202,7 +206,7 @@ pub fn fuse(graph: &CompilerGraph) -> FusionPlan {
                     id: gid,
                     anchor: op_id,
                     epilogue: chain_ids,
-                    pattern,
+                    mode,
                     ops: all_ops,
                 });
             }
@@ -215,7 +219,7 @@ pub fn fuse(graph: &CompilerGraph) -> FusionPlan {
                     id: gid,
                     anchor: op_id,
                     epilogue: Vec::new(),
-                    pattern: FusionPattern::Standalone,
+                    mode: FusionMode::Standalone,
                     ops: vec![op_id],
                 });
             }
@@ -281,7 +285,7 @@ fn detect_qkv_shared_input(graph: &CompilerGraph, topo: &[OpId]) -> Vec<FusionGr
                     id: 0, // will be reassigned
                     anchor: all_ops[0],
                     epilogue: all_ops[1..].to_vec(),
-                    pattern: FusionPattern::QkvSharedInput,
+                    mode: FusionMode::QkvSharedInput,
                     ops: all_ops,
                 });
             }
@@ -425,6 +429,15 @@ fn collect_elementwise_chain<'a>(
 /// This is the new preferred entry point; `fuse()` is kept for backward compat.
 pub fn fuse_with_dag(graph: &CompilerGraph, registry: &ScalarOpRegistry) -> FusionPlan {
     let dag = SemanticDAG::from_graph(graph, registry);
+    fuse_with_dag_prebuilt(graph, &dag)
+}
+
+/// Fusion pass using a pre-built SemanticDAG.
+///
+/// Use this when the caller already has a `SemanticDAG` to avoid redundant
+/// construction (e.g., `jit_compile` builds the DAG once for both analysis
+/// and fusion).
+pub fn fuse_with_dag_prebuilt(graph: &CompilerGraph, dag: &SemanticDAG) -> FusionPlan {
     let topo = graph.topological_sort();
     let mut groups: Vec<FusionGroup> = Vec::new();
     let mut op_to_group: HashMap<OpId, usize> = HashMap::new();
@@ -465,12 +478,12 @@ pub fn fuse_with_dag(graph: &CompilerGraph, registry: &ScalarOpRegistry) -> Fusi
                 if norm_prefix.is_some() || !epilogue.is_empty() {
                     let gid = groups.len();
                     let mut all_ops = Vec::new();
-                    let pattern = if norm_prefix.is_some() && !epilogue.is_empty() {
-                        FusionPattern::GemmEpilogue
+                    let mode = if norm_prefix.is_some() && !epilogue.is_empty() {
+                        FusionMode::EpilogueInjection
                     } else if norm_prefix.is_some() {
-                        FusionPattern::NormIntoGemm
+                        FusionMode::NormIntoGemm
                     } else {
-                        FusionPattern::GemmEpilogue
+                        FusionMode::EpilogueInjection
                     };
 
                     if let Some(norm_id) = norm_prefix {
@@ -496,7 +509,7 @@ pub fn fuse_with_dag(graph: &CompilerGraph, registry: &ScalarOpRegistry) -> Fusi
                         id: gid,
                         anchor: op_id,
                         epilogue: epilogue_ids,
-                        pattern,
+                        mode,
                         ops: all_ops,
                     });
                 } else {
@@ -508,7 +521,7 @@ pub fn fuse_with_dag(graph: &CompilerGraph, registry: &ScalarOpRegistry) -> Fusi
                         id: gid,
                         anchor: op_id,
                         epilogue: Vec::new(),
-                        pattern: FusionPattern::Standalone,
+                        mode: FusionMode::Standalone,
                         ops: vec![op_id],
                     });
                 }
@@ -521,10 +534,10 @@ pub fn fuse_with_dag(graph: &CompilerGraph, registry: &ScalarOpRegistry) -> Fusi
                 let chain_ids: Vec<OpId> = chain.iter().map(|o| o.id).collect();
                 all_ops.extend_from_slice(&chain_ids);
 
-                let pattern = if chain_ids.is_empty() {
-                    FusionPattern::Standalone
+                let mode = if chain_ids.is_empty() {
+                    FusionMode::Standalone
                 } else {
-                    FusionPattern::ElementwiseChain
+                    FusionMode::LoopFusion
                 };
 
                 for &oid in &all_ops {
@@ -536,7 +549,7 @@ pub fn fuse_with_dag(graph: &CompilerGraph, registry: &ScalarOpRegistry) -> Fusi
                     id: gid,
                     anchor: op_id,
                     epilogue: chain_ids,
-                    pattern,
+                    mode,
                     ops: all_ops,
                 });
             }
@@ -548,7 +561,7 @@ pub fn fuse_with_dag(graph: &CompilerGraph, registry: &ScalarOpRegistry) -> Fusi
                     id: gid,
                     anchor: op_id,
                     epilogue: Vec::new(),
-                    pattern: FusionPattern::Standalone,
+                    mode: FusionMode::Standalone,
                     ops: vec![op_id],
                 });
             }
@@ -717,7 +730,7 @@ impl std::fmt::Display for FusionPlan {
                 f,
                 "  [{}] {:?} anchor=Op({}) ops=[{}]",
                 g.id,
-                g.pattern,
+                g.mode,
                 g.anchor.0,
                 ops_str.join(", ")
             )?;
@@ -757,7 +770,7 @@ mod tests {
         let has_qkv = plan
             .groups
             .iter()
-            .any(|g| g.pattern == FusionPattern::QkvSharedInput);
+            .any(|g| g.mode == FusionMode::QkvSharedInput);
         assert!(has_qkv, "Expected QKV shared input fusion");
 
         // Should have fewer groups than ops (some ops fused)
@@ -792,7 +805,7 @@ mod tests {
 
         // Should fuse into one group
         assert_eq!(plan.num_groups(), 1);
-        assert_eq!(plan.groups[0].pattern, FusionPattern::GemmEpilogue);
+        assert_eq!(plan.groups[0].mode, FusionMode::EpilogueInjection);
         assert_eq!(plan.groups[0].ops.len(), 2);
     }
 
@@ -807,7 +820,7 @@ mod tests {
 
         let plan = fuse(&g);
         assert_eq!(plan.num_groups(), 1);
-        assert_eq!(plan.groups[0].pattern, FusionPattern::Standalone);
+        assert_eq!(plan.groups[0].mode, FusionMode::Standalone);
     }
 
     #[test]
@@ -825,7 +838,7 @@ mod tests {
 
         let plan = fuse(&g);
         assert_eq!(plan.num_groups(), 1);
-        assert_eq!(plan.groups[0].pattern, FusionPattern::ElementwiseChain);
+        assert_eq!(plan.groups[0].mode, FusionMode::LoopFusion);
         assert_eq!(plan.groups[0].ops.len(), 3);
     }
 
@@ -888,7 +901,7 @@ mod tests {
         let has_qkv = plan
             .groups
             .iter()
-            .any(|g| g.pattern == FusionPattern::QkvSharedInput);
+            .any(|g| g.mode == FusionMode::QkvSharedInput);
         assert!(has_qkv, "Expected QKV shared input fusion");
 
         // Should have fewer groups than ops
@@ -945,7 +958,7 @@ mod tests {
         let plan = fuse_with_dag(&g, &registry);
 
         assert_eq!(plan.num_groups(), 1);
-        assert_eq!(plan.groups[0].pattern, FusionPattern::GemmEpilogue);
+        assert_eq!(plan.groups[0].mode, FusionMode::EpilogueInjection);
     }
 
     #[test]
@@ -971,7 +984,7 @@ mod tests {
 
         // RoPE + Silu should fuse (both fusable in new path: Injective + ElemWise)
         assert_eq!(plan.num_groups(), 1);
-        assert_eq!(plan.groups[0].pattern, FusionPattern::ElementwiseChain);
+        assert_eq!(plan.groups[0].mode, FusionMode::LoopFusion);
     }
 
     // ── QuantGemm fusion tests ──────────────────────────────────────
@@ -996,7 +1009,7 @@ mod tests {
 
         let plan = fuse(&g);
         assert_eq!(plan.num_groups(), 1);
-        assert_eq!(plan.groups[0].pattern, FusionPattern::GemmEpilogue);
+        assert_eq!(plan.groups[0].mode, FusionMode::EpilogueInjection);
     }
 
     #[test]
@@ -1016,7 +1029,7 @@ mod tests {
 
         let plan = fuse(&g);
         assert_eq!(plan.num_groups(), 1);
-        assert_eq!(plan.groups[0].pattern, FusionPattern::Standalone);
+        assert_eq!(plan.groups[0].mode, FusionMode::Standalone);
     }
 
     #[test]
@@ -1065,8 +1078,8 @@ mod tests {
         assert_eq!(plan.num_groups(), 2, "Softmax should not fuse as norm prefix");
         for group in &plan.groups {
             assert_ne!(
-                group.pattern,
-                FusionPattern::NormIntoGemm,
+                group.mode,
+                FusionMode::NormIntoGemm,
                 "Softmax must not produce NormIntoGemm pattern"
             );
         }

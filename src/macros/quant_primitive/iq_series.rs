@@ -1170,8 +1170,9 @@ macro_rules! quant_primitive_iq {
                 let qs_ptr = block.qs.as_ptr();
                 let out_ptr = $out_ptr;
                 let mask_lo = _mm_set1_epi8(0x0F);
-                // Process 16 bytes at a time (32 values)
-                for i in 0..8 {
+                // IQ4_NL block_size=32: 16 bytes of qs → 32 values
+                // Process the single 16-byte chunk
+                for i in 0..1 {
                     let v128 = _mm_loadu_si128(qs_ptr.add(i * 16) as *const _);
                     let lo_bytes = _mm_and_si128(v128, mask_lo);
                     let hi_bytes = _mm_and_si128(_mm_srli_epi16(v128, 4), mask_lo);
@@ -1210,7 +1211,8 @@ macro_rules! quant_primitive_iq {
                 let other = $other_ptr;
                 let mask_lo = _mm_set1_epi8(0x0F);
                 let mut acc = $crate::simd_primitive!(avx2, f32, zero);
-                for i in 0..8 {
+                // IQ4_NL block_size=32: 16 bytes of qs → 32 values
+                for i in 0..1 {
                     let v128 = _mm_loadu_si128(qs_ptr.add(i * 16) as *const _);
                     let lo_bytes = _mm_and_si128(v128, mask_lo);
                     let hi_bytes = _mm_and_si128(_mm_srli_epi16(v128, 4), mask_lo);
@@ -1396,30 +1398,32 @@ macro_rules! quant_primitive_iq {
                 let scales = &block.scales;
                 let other = $other_ptr;
                 let mut acc = $crate::simd_primitive!(avx2, f32, zero);
-                // 256 values in groups of 32 (8 groups)
-                for group in 0..8 {
-                    let scale = scales[group / 2] as f32 / 15.0;
-                    let group_d = d * scale;
-                    let vgd = $crate::simd_primitive!(avx2, f32, splat, group_d);
-                    // Process 32 values in 4 chunks of 8
-                    for chunk in 0..4 {
-                        let base = group * 32 + chunk * 8;
-                        let mut vals = [0.0f32; 8];
-                        for j in 0..8 {
-                            let idx = base + j;
-                            let low = (qs[idx / 4] >> ((idx % 4) * 2)) & 3;
-                            let high = (qh[idx / 8] >> (idx % 8)) & 1;
-                            let val = (high << 2) | low;
-                            let sign_byte = signs[idx / 8];
-                            let sign_bit = (sign_byte >> (idx % 8)) & 1;
-                            let signed_val = if sign_bit == 0 { val as f32 } else { -(val as f32) };
-                            vals[j] = signed_val;
+                // IQ3_S: 64 groups of 4 values, codebook lookup via IQ3S_GRID
+                for pair in 0..32 {
+                    let mut vals = [0.0f32; 8];
+                    for half in 0..2 {
+                        let group = pair * 2 + half;
+                        let qh_idx = group / 8;
+                        let qh_shift = group % 8;
+                        let idx = ((qs[group] as usize) |
+                                  (((qh[qh_idx] >> qh_shift) & 1) as usize) << 8) & 0x1FF;
+                        let grid_val = crate::codebooks::IQ3S_GRID[idx];
+                        let scale_idx = group / 16;
+                        let scale = scales[scale_idx] as f32 / 255.0;
+                        let group_d = d * scale;
+
+                        for j in 0..4 {
+                            let v = ((grid_val >> (j * 8)) & 0xFF) as i8;
+                            let sign_idx = group / 2;
+                            let sign_shift = (group % 2) * 4 + j;
+                            let sign_bit = (signs[sign_idx] >> sign_shift) & 1;
+                            let signed_v = if sign_bit == 0 { v } else { -v };
+                            vals[half * 4 + j] = group_d * (signed_v as f32);
                         }
-                        let vf = $crate::simd_primitive!(avx2, f32, load, vals.as_ptr());
-                        let dq = $crate::simd_primitive!(avx2, f32, mul, vgd, vf);
-                        let vo = $crate::simd_primitive!(avx2, f32, load, other.add(base));
-                        acc = $crate::simd_primitive!(avx2, f32, fma, dq, vo, acc);
                     }
+                    let vf = $crate::simd_primitive!(avx2, f32, load, vals.as_ptr());
+                    let vo = $crate::simd_primitive!(avx2, f32, load, other.add(pair * 8));
+                    acc = $crate::simd_primitive!(avx2, f32, fma, vf, vo, acc);
                 }
                 let t1 = _mm256_hadd_ps(acc, acc);
                 let t2 = _mm256_hadd_ps(t1, t1);
@@ -1441,27 +1445,21 @@ macro_rules! quant_primitive_iq {
                 let qs = &block.qs;
                 let other = $other_ptr;
                 let mut acc = $crate::simd_primitive!(avx2, f32, zero);
-                // IQ3_XXS: 3-bit packed in qs, 256 values
-                for i in 0..32 {
-                    let base = i * 8;
+                // IQ3_XXS: 64 groups of 4 values, codebook lookup via IQ3XXS_GRID
+                for pair in 0..32 {
                     let mut vals = [0.0f32; 8];
-                    for j in 0..8 {
-                        let idx = base + j;
-                        let bit_offset = idx * 3;
-                        let byte_idx = bit_offset / 8;
-                        let bit_idx = bit_offset % 8;
-                        let q = if bit_idx <= 5 {
-                            (qs[byte_idx] >> bit_idx) & 0x07
-                        } else {
-                            let lo = qs[byte_idx] >> bit_idx;
-                            let hi = if byte_idx + 1 < qs.len() { qs[byte_idx + 1] << (8 - bit_idx) } else { 0 };
-                            (lo | hi) & 0x07
-                        };
-                        vals[j] = q as f32 - 4.0;
+                    for half in 0..2 {
+                        let group = pair * 2 + half;
+                        let idx = qs[group] as usize;
+                        let grid_val = crate::codebooks::IQ3XXS_GRID[idx];
+                        for j in 0..4 {
+                            let v = ((grid_val >> (j * 8)) & 0xFF) as i8;
+                            vals[half * 4 + j] = v as f32;
+                        }
                     }
                     let vf = $crate::simd_primitive!(avx2, f32, load, vals.as_ptr());
                     let dq = $crate::simd_primitive!(avx2, f32, mul, vd, vf);
-                    let vo = $crate::simd_primitive!(avx2, f32, load, other.add(base));
+                    let vo = $crate::simd_primitive!(avx2, f32, load, other.add(pair * 8));
                     acc = $crate::simd_primitive!(avx2, f32, fma, dq, vo, acc);
                 }
                 let t1 = _mm256_hadd_ps(acc, acc);
@@ -1485,26 +1483,29 @@ macro_rules! quant_primitive_iq {
                 let scales = &block.scales;
                 let other = $other_ptr;
                 let mut acc = $crate::simd_primitive!(avx2, f32, zero);
-                // 256 values in groups of 32 (8 groups)
-                for group in 0..8 {
-                    let scale = scales[group] as f32 / 255.0;
+                // 256 values in 32 groups of 8 (matching scalar logic)
+                for group in 0..32 {
+                    let qs_idx = group * 2;
+                    let qh_idx = group / 4;
+                    let qh_shift = (group % 4) * 2;
+                    let idx = ((qs[qs_idx] as usize) |
+                              ((qs[qs_idx + 1] as usize) << 8) |
+                              (((qh[qh_idx] >> qh_shift) & 0x03) as usize) << 8) & 0x3FF;
+                    let grid_val = crate::codebooks::IQ2S_GRID[idx];
+                    let scale_idx = group / 4;
+                    let scale = scales[scale_idx] as f32 / 255.0;
                     let group_d = d * scale;
                     let vgd = $crate::simd_primitive!(avx2, f32, splat, group_d);
-                    for chunk in 0..4 {
-                        let base = group * 32 + chunk * 8;
-                        let mut vals = [0.0f32; 8];
-                        for j in 0..8 {
-                            let idx = base + j;
-                            let q = (qs[idx / 4] >> ((idx % 4) * 2)) & 3;
-                            let h = (qh[idx / 8] >> (idx % 8)) & 1;
-                            let val = ((h << 2) | q) as f32 - 4.0;
-                            vals[j] = val;
-                        }
-                        let vf = $crate::simd_primitive!(avx2, f32, load, vals.as_ptr());
-                        let dq = $crate::simd_primitive!(avx2, f32, mul, vgd, vf);
-                        let vo = $crate::simd_primitive!(avx2, f32, load, other.add(base));
-                        acc = $crate::simd_primitive!(avx2, f32, fma, dq, vo, acc);
+
+                    let mut vals = [0.0f32; 8];
+                    for j in 0..8 {
+                        let v = ((grid_val >> (j * 8)) & 0xFF) as i8;
+                        vals[j] = v as f32;
                     }
+                    let vf = $crate::simd_primitive!(avx2, f32, load, vals.as_ptr());
+                    let dq = $crate::simd_primitive!(avx2, f32, mul, vgd, vf);
+                    let vo = $crate::simd_primitive!(avx2, f32, load, other.add(group * 8));
+                    acc = $crate::simd_primitive!(avx2, f32, fma, dq, vo, acc);
                 }
                 let t1 = _mm256_hadd_ps(acc, acc);
                 let t2 = _mm256_hadd_ps(t1, t1);
@@ -2339,32 +2340,38 @@ macro_rules! quant_primitive_iq {
         unsafe {
             #[cfg(target_arch = "x86_64")]
             {
-                
+
                 let block = &*$block_ptr;
                 let d: f32 = block.d.to_f32();
                 let qs = &block.qs;
                 let qh = &block.qh;
                 let scales = &block.scales;
                 let out_ptr = $out_ptr;
-                // 256 values in groups of 32 (8 groups)
-                for group in 0..8 {
-                    let scale = scales[group] as f32 / 255.0;
+                // 256 values in 32 groups of 8 (matching scalar logic)
+                for group in 0..32 {
+                    // Extract 10-bit grid index from qs + qh
+                    let qs_idx = group * 2;
+                    let qh_idx = group / 4;
+                    let qh_shift = (group % 4) * 2;
+                    let idx = ((qs[qs_idx] as usize) |
+                              ((qs[qs_idx + 1] as usize) << 8) |
+                              (((qh[qh_idx] >> qh_shift) & 0x03) as usize) << 8) & 0x3FF;
+                    let grid_val = crate::codebooks::IQ2S_GRID[idx];
+
+                    let scale_idx = group / 4;
+                    let scale = scales[scale_idx] as f32 / 255.0;
                     let group_d = d * scale;
                     let vgd = $crate::simd_primitive!(avx2, f32, splat, group_d);
-                    for chunk in 0..4 {
-                        let base = group * 32 + chunk * 8;
-                        let mut vals = [0.0f32; 8];
-                        for j in 0..8 {
-                            let idx = base + j;
-                            let q = (qs[idx / 4] >> ((idx % 4) * 2)) & 3;
-                            let h = (qh[idx / 8] >> (idx % 8)) & 1;
-                            let val = ((h << 2) | q) as f32 - 4.0;
-                            vals[j] = val;
-                        }
-                        let vf = $crate::simd_primitive!(avx2, f32, load, vals.as_ptr());
-                        let res = $crate::simd_primitive!(avx2, f32, mul, vgd, vf);
-                        $crate::simd_primitive!(avx2, f32, store, out_ptr.add(base), res);
+
+                    // Unpack 8 int8 values from u64 grid entry
+                    let mut vals = [0.0f32; 8];
+                    for j in 0..8 {
+                        let v = ((grid_val >> (j * 8)) & 0xFF) as i8;
+                        vals[j] = v as f32;
                     }
+                    let vf = $crate::simd_primitive!(avx2, f32, load, vals.as_ptr());
+                    let res = $crate::simd_primitive!(avx2, f32, mul, vgd, vf);
+                    $crate::simd_primitive!(avx2, f32, store, out_ptr.add(group * 8), res);
                 }
             }
         }
@@ -2374,33 +2381,28 @@ macro_rules! quant_primitive_iq {
         unsafe {
             #[cfg(target_arch = "x86_64")]
             {
-                
+
                 let block = &*$block_ptr;
                 let d: f32 = block.d.to_f32();
                 let vd = $crate::simd_primitive!(avx2, f32, splat, d);
                 let qs = &block.qs;
                 let out_ptr = $out_ptr;
-                // IQ3_XXS: 3-bit packed in qs, 256 values
-                for i in 0..32 {
-                    let base = i * 8;
+                // IQ3_XXS: 64 groups of 4 values, codebook lookup via IQ3XXS_GRID
+                // Process 2 groups (8 values) per iteration for AVX2
+                for pair in 0..32 {
                     let mut vals = [0.0f32; 8];
-                    for j in 0..8 {
-                        let idx = base + j;
-                        let bit_offset = idx * 3;
-                        let byte_idx = bit_offset / 8;
-                        let bit_idx = bit_offset % 8;
-                        let q = if bit_idx <= 5 {
-                            (qs[byte_idx] >> bit_idx) & 0x07
-                        } else {
-                            let lo = qs[byte_idx] >> bit_idx;
-                            let hi = if byte_idx + 1 < qs.len() { qs[byte_idx + 1] << (8 - bit_idx) } else { 0 };
-                            (lo | hi) & 0x07
-                        };
-                        vals[j] = q as f32 - 4.0;
+                    for half in 0..2 {
+                        let group = pair * 2 + half;
+                        let idx = qs[group] as usize;
+                        let grid_val = crate::codebooks::IQ3XXS_GRID[idx];
+                        for j in 0..4 {
+                            let v = ((grid_val >> (j * 8)) & 0xFF) as i8;
+                            vals[half * 4 + j] = v as f32;
+                        }
                     }
                     let vf = $crate::simd_primitive!(avx2, f32, load, vals.as_ptr());
                     let res = $crate::simd_primitive!(avx2, f32, mul, vd, vf);
-                    $crate::simd_primitive!(avx2, f32, store, out_ptr.add(base), res);
+                    $crate::simd_primitive!(avx2, f32, store, out_ptr.add(pair * 8), res);
                 }
             }
         }
@@ -2410,7 +2412,7 @@ macro_rules! quant_primitive_iq {
         unsafe {
             #[cfg(target_arch = "x86_64")]
             {
-                
+
                 let block = &*$block_ptr;
                 let d: f32 = block.d.to_f32();
                 let qs = &block.qs;
@@ -2418,29 +2420,37 @@ macro_rules! quant_primitive_iq {
                 let signs = &block.signs;
                 let scales = &block.scales;
                 let out_ptr = $out_ptr;
-                // 256 values in groups of 32 (8 groups)
-                for group in 0..8 {
-                    let scale = scales[group / 2] as f32 / 15.0;
-                    let group_d = d * scale;
-                    let vgd = $crate::simd_primitive!(avx2, f32, splat, group_d);
-                    // Process 32 values in 4 chunks of 8
-                    for chunk in 0..4 {
-                        let base = group * 32 + chunk * 8;
-                        let mut vals = [0.0f32; 8];
-                        for j in 0..8 {
-                            let idx = base + j;
-                            let low = (qs[idx / 4] >> ((idx % 4) * 2)) & 3;
-                            let high = (qh[idx / 8] >> (idx % 8)) & 1;
-                            let val = (high << 2) | low;
-                            let sign_byte = signs[idx / 8];
-                            let sign_bit = (sign_byte >> (idx % 8)) & 1;
-                            let signed_val = if sign_bit == 0 { val as f32 } else { -(val as f32) };
-                            vals[j] = signed_val;
+                // IQ3_S: 64 groups of 4 values, codebook lookup via IQ3S_GRID
+                // Process 2 groups (8 values) per iteration for AVX2
+                for pair in 0..32 {
+                    let mut vals = [0.0f32; 8];
+                    for half in 0..2 {
+                        let group = pair * 2 + half;
+                        // Extract 9-bit index from qs (8 bits) + qh (1 bit)
+                        let qh_idx = group / 8;
+                        let qh_shift = group % 8;
+                        let idx = ((qs[group] as usize) |
+                                  (((qh[qh_idx] >> qh_shift) & 1) as usize) << 8) & 0x1FF;
+                        let grid_val = crate::codebooks::IQ3S_GRID[idx];
+
+                        let scale_idx = group / 16;
+                        let scale = scales[scale_idx] as f32 / 255.0;
+                        let group_d = d * scale;
+
+                        for j in 0..4 {
+                            let v = ((grid_val >> (j * 8)) & 0xFF) as i8;
+                            let sign_idx = group / 2;
+                            let sign_shift = (group % 2) * 4 + j;
+                            let sign_bit = (signs[sign_idx] >> sign_shift) & 1;
+                            let signed_v = if sign_bit == 0 { v } else { -v };
+                            vals[half * 4 + j] = group_d * (signed_v as f32);
                         }
-                        let vf = $crate::simd_primitive!(avx2, f32, load, vals.as_ptr());
-                        let res = $crate::simd_primitive!(avx2, f32, mul, vgd, vf);
-                        $crate::simd_primitive!(avx2, f32, store, out_ptr.add(base), res);
                     }
+                    // Note: vals already scaled per-group, so just store directly
+                    let mut out_vals = [0.0f32; 8];
+                    out_vals.copy_from_slice(&vals);
+                    let vf = $crate::simd_primitive!(avx2, f32, load, out_vals.as_ptr());
+                    $crate::simd_primitive!(avx2, f32, store, out_ptr.add(pair * 8), vf);
                 }
             }
         }

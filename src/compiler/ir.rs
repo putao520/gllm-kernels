@@ -3,7 +3,7 @@
 //! Not a general-purpose DAG — this is a transformer-specific IR that
 //! captures the computation graph of a single layer for the JIT compiler.
 
-use crate::inference::types::DType;
+use crate::types::DType;
 use crate::quant::QuantType;
 use crate::traits::Activation;
 

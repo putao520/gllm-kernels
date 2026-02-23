@@ -5,7 +5,7 @@
 //! is based on the group's computation pattern, problem size, and the
 //! hardware's parallel threshold from `DeviceProfile`.
 
-use crate::compiler::fusion::{FusionGroup, FusionPlan, FusionPattern};
+use crate::compiler::fusion::{FusionGroup, FusionPlan, FusionMode};
 use crate::compiler::graph::{CompilerGraph, OpKind};
 use crate::compiler::semantic_dag::{SemanticDAG, OpClass};
 use crate::dispatch::DeviceProfile;
@@ -56,13 +56,13 @@ fn plan_group(
     dag: &SemanticDAG,
     profile: &DeviceProfile,
 ) -> ParallelStrategy {
-    let (num_threads, parallel_dim, thread_local_acc) = match group.pattern {
-        FusionPattern::GemmEpilogue
-        | FusionPattern::NormIntoGemm
-        | FusionPattern::QkvSharedInput => {
+    let (num_threads, parallel_dim, thread_local_acc) = match group.mode {
+        FusionMode::EpilogueInjection
+        | FusionMode::NormIntoGemm
+        | FusionMode::QkvSharedInput => {
             plan_gemm_group(group, graph, profile)
         }
-        FusionPattern::Standalone => {
+        FusionMode::Standalone => {
             // Standalone: check if anchor is a GEMM
             let is_gemm = graph
                 .op(group.anchor)
@@ -74,8 +74,12 @@ fn plan_group(
                 plan_elementwise_group(group, graph, dag, profile)
             }
         }
-        FusionPattern::ElementwiseChain => {
+        FusionMode::LoopFusion => {
             plan_elementwise_group(group, graph, dag, profile)
+        }
+        FusionMode::TileLevelFusion | FusionMode::ComputeRoot => {
+            // Future: dedicated strategies; fall back to GEMM-like for now
+            plan_gemm_group(group, graph, profile)
         }
     };
 

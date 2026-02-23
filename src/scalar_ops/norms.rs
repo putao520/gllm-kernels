@@ -4,6 +4,7 @@
 ///
 /// `out[i] = x[i] * weight[i] / sqrt(mean(x^2) + eps)`
 #[no_mangle]
+#[inline(never)]
 pub extern "C" fn scalar_rms_norm(
     x: *const f32,
     weight: *const f32,
@@ -31,6 +32,7 @@ pub extern "C" fn scalar_rms_norm(
 ///
 /// `out[i] = (x[i] - mean) / sqrt(var + eps) * weight[i] + bias[i]`
 #[no_mangle]
+#[inline(never)]
 pub extern "C" fn scalar_layer_norm(
     x: *const f32,
     weight: *const f32,

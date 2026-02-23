@@ -19,6 +19,7 @@ jit-aarch64 = []
 [dev-dependencies]
 criterion = "0.5"
 rand = "0.8"
+proptest = "1"
 
 [[bench]]
 name = "gemm_benchmark"

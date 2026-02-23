@@ -1,5 +1,6 @@
 /// Vector add: `out[i] = a[i] + b[i]`
 #[no_mangle]
+#[inline(never)]
 pub extern "C" fn scalar_vec_add(a: *const f32, b: *const f32, out: *mut f32, n: usize) {
     for i in 0..n {
         unsafe {
@@ -10,6 +11,7 @@ pub extern "C" fn scalar_vec_add(a: *const f32, b: *const f32, out: *mut f32, n:
 
 /// Vector mul: `out[i] = a[i] * b[i]`
 #[no_mangle]
+#[inline(never)]
 pub extern "C" fn scalar_vec_mul(a: *const f32, b: *const f32, out: *mut f32, n: usize) {
     for i in 0..n {
         unsafe {
@@ -20,6 +22,7 @@ pub extern "C" fn scalar_vec_mul(a: *const f32, b: *const f32, out: *mut f32, n:
 
 /// Exp: `out[i] = exp(x[i])`
 #[no_mangle]
+#[inline(never)]
 pub extern "C" fn scalar_exp(x: *const f32, out: *mut f32, n: usize) {
     for i in 0..n {
         unsafe {
@@ -32,6 +35,7 @@ pub extern "C" fn scalar_exp(x: *const f32, out: *mut f32, n: usize) {
 ///
 /// Numerically stable three-pass: max -> exp-sum -> normalize.
 #[no_mangle]
+#[inline(never)]
 pub extern "C" fn scalar_softmax(x: *const f32, out: *mut f32, n: usize) {
     if n == 0 {
         return;
@@ -64,6 +68,7 @@ pub extern "C" fn scalar_softmax(x: *const f32, out: *mut f32, n: usize) {
 /// Naive triple-loop. A is [M,K], B is [K,N], C is [M,N].
 /// C is assumed zero-initialized by the caller.
 #[no_mangle]
+#[inline(never)]
 pub extern "C" fn scalar_gemm(
     a: *const f32,
     b: *const f32,
@@ -89,6 +94,7 @@ pub extern "C" fn scalar_gemm(
 ///
 /// A is [M,K], B is [K,N], bias is [N], C is [M,N].
 #[no_mangle]
+#[inline(never)]
 pub extern "C" fn scalar_gemm_bias(
     a: *const f32,
     b: *const f32,
@@ -115,6 +121,7 @@ pub extern "C" fn scalar_gemm_bias(
 ///
 /// input is [rows, cols], out is [cols, rows].
 #[no_mangle]
+#[inline(never)]
 pub extern "C" fn scalar_transpose_2d(
     input: *const f32,
     out: *mut f32,
@@ -134,6 +141,7 @@ pub extern "C" fn scalar_transpose_2d(
 ///
 /// Reshape is a layout-only operation; the scalar version is a memcpy.
 #[no_mangle]
+#[inline(never)]
 pub extern "C" fn scalar_reshape(input: *const f32, out: *mut f32, n: usize) {
     unsafe {
         for i in 0..n {
@@ -147,6 +155,7 @@ pub extern "C" fn scalar_reshape(input: *const f32, out: *mut f32, n: usize) {
 /// Minimal scalar reference for uniform block quantization.
 /// Real quantization formats (Q4_0, Q8_0, etc.) have format-specific decode logic.
 #[no_mangle]
+#[inline(never)]
 pub extern "C" fn scalar_dequantize(
     quant: *const f32,
     scale: *const f32,
@@ -166,6 +175,7 @@ pub extern "C" fn scalar_dequantize(
 ///
 /// A is [M,K] f32, B_quant is [K,N] quantized, B_scale is [K*N/block_size], C is [M,N].
 #[no_mangle]
+#[inline(never)]
 pub extern "C" fn scalar_quant_gemm(
     a: *const f32,
     b_quant: *const f32,

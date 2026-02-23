@@ -1,4 +1,4 @@
-use crate::compiler::fusion::{FusionGroup, FusionPattern};
+use crate::compiler::fusion::{FusionGroup, FusionMode};
 use crate::compiler::graph::{CompilerGraph, OpKind};
 use crate::dispatch::DeviceProfile;
 
@@ -250,8 +250,8 @@ fn estimate_register_pressure(
     graph: &CompilerGraph,
     profile: &DeviceProfile,
 ) -> usize {
-    match group.pattern {
-        FusionPattern::Standalone => {
+    match group.mode {
+        FusionMode::Standalone => {
             if let Some(op) = graph.op(group.anchor) {
                 match &op.kind {
                     OpKind::Gemm { .. } | OpKind::GemmBias { .. } | OpKind::QuantGemm { .. } => {
@@ -263,13 +263,17 @@ fn estimate_register_pressure(
                 2
             }
         }
-        FusionPattern::GemmEpilogue => {
+        FusionMode::EpilogueInjection => {
             let epilogue_scratch = group.epilogue.len().min(4);
             gemm_base_regs(profile) + epilogue_scratch
         }
-        FusionPattern::ElementwiseChain => 3 + group.ops.len(),
-        FusionPattern::QkvSharedInput => gemm_base_regs(profile),
-        FusionPattern::NormIntoGemm => gemm_base_regs(profile) + 2,
+        FusionMode::LoopFusion => 3 + group.ops.len(),
+        FusionMode::QkvSharedInput => gemm_base_regs(profile),
+        FusionMode::NormIntoGemm => gemm_base_regs(profile) + 2,
+        FusionMode::TileLevelFusion | FusionMode::ComputeRoot => {
+            // Future: refine when these modes are implemented
+            gemm_base_regs(profile)
+        }
     }
 }
 
@@ -391,7 +395,7 @@ mod tests {
                 r.valid,
                 "Group {} ({:?}) failed constraints: {:?}",
                 r.group_id,
-                plan.groups[r.group_id].pattern,
+                plan.groups[r.group_id].mode,
                 r.violations
             );
         }
@@ -410,7 +414,7 @@ mod tests {
             id: 0,
             anchor: OpId(0),
             epilogue: Vec::new(),
-            pattern: FusionPattern::Standalone,
+            mode: FusionMode::Standalone,
             ops: vec![OpId(0)],
         };
 
@@ -418,7 +422,7 @@ mod tests {
             id: 1,
             anchor: OpId(0),
             epilogue: vec![OpId(1), OpId(2)],
-            pattern: FusionPattern::GemmEpilogue,
+            mode: FusionMode::EpilogueInjection,
             ops: vec![OpId(0), OpId(1), OpId(2)],
         };
 
@@ -495,7 +499,7 @@ mod tests {
             id: 0,
             anchor: OpId(0),
             epilogue: epilogue_ops,
-            pattern: FusionPattern::GemmEpilogue,
+            mode: FusionMode::EpilogueInjection,
             ops: all_ops,
         };
 
@@ -524,7 +528,7 @@ mod tests {
             id: 0,
             anchor: OpId(0),
             epilogue: epilogue_ops,
-            pattern: FusionPattern::GemmEpilogue,
+            mode: FusionMode::EpilogueInjection,
             ops: all_ops,
         };
 
@@ -556,7 +560,7 @@ mod tests {
             id: 0,
             anchor: OpId(0),
             epilogue: Vec::new(),
-            pattern: FusionPattern::Standalone,
+            mode: FusionMode::Standalone,
             ops: vec![OpId(0)],
         };
         let base_pressure = estimate_register_pressure(&standalone, &g, &profile);
@@ -572,7 +576,7 @@ mod tests {
             id: 1,
             anchor: OpId(0),
             epilogue: vec![OpId(1), OpId(2), OpId(3)],
-            pattern: FusionPattern::GemmEpilogue,
+            mode: FusionMode::EpilogueInjection,
             ops: vec![OpId(0), OpId(1), OpId(2), OpId(3)],
         };
         let epi_pressure = estimate_register_pressure(&with_epilogue, &g, &profile);
@@ -612,7 +616,7 @@ mod tests {
             id: 0,
             anchor: OpId(0),
             epilogue: Vec::new(),
-            pattern: FusionPattern::Standalone,
+            mode: FusionMode::Standalone,
             ops: vec![OpId(0)],
         };
 
@@ -661,7 +665,7 @@ mod tests {
             id: 0,
             anchor: OpId(0),
             epilogue: Vec::new(),
-            pattern: FusionPattern::Standalone,
+            mode: FusionMode::Standalone,
             ops: vec![OpId(0)],
         };
 

@@ -43,7 +43,7 @@ pub use cache::{CompilationCache, CacheSource, IncrementalCompileResult, CACHE_V
 pub use codegen::CodegenOutput;
 pub use graph::{CompilerGraph, CompilerOp, OpKind, TensorId, OpId};
 pub use semantics::OpSemantics;
-pub use fusion::{FusionPlan, FusionGroup, FusionPattern};
+pub use fusion::{FusionPlan, FusionGroup, FusionMode};
 pub use codegen::emitter::ScratchpadLayout;
 pub use trace::{OpTrace, ComputePattern, TraceOp, ScalarFnSignature, ScalarParam};
 pub use registry::{ScalarOpRegistry, OpKindKey};
@@ -53,7 +53,7 @@ pub use parallel::{ParallelStrategy, ParallelDim};
 pub use buffer_alloc::{BufferAllocation, BufferSlot, Lifetime};
 
 use crate::dispatch::{DeviceProfile, device_profile};
-use crate::inference::types::{InferenceError, ModelConfig};
+use crate::types::{InferenceError, ModelConfig};
 
 /// The inference compiler: compiles transformer layers to native code.
 ///
@@ -227,10 +227,10 @@ impl InferenceCompiler {
 
         // Phase 0 + 1: ScalarOpRegistry (OpTrace cache) + SemanticDAG (OpClass auto-derivation)
         let registry = ScalarOpRegistry::with_defaults();
-        let _semantic_dag = SemanticDAG::from_graph(&graph, &registry);
+        let semantic_dag = SemanticDAG::from_graph(&graph, &registry);
 
         // Phase 2: Fusion decisions + buffer allocation
-        let fusion_plan = fusion::fuse_with_dag(&graph, &registry);
+        let fusion_plan = fusion::fuse_with_dag_prebuilt(&graph, &semantic_dag);
         let lifetimes = buffer_alloc::analyze_lifetimes(&graph, &fusion_plan);
         let alloc = buffer_alloc::allocate_buffers(&lifetimes);
 
@@ -259,7 +259,8 @@ impl InferenceCompiler {
         graph: &CompilerGraph,
     ) -> Result<CompiledLayer, InferenceError> {
         let registry = ScalarOpRegistry::with_defaults();
-        let fusion_plan = fusion::fuse_with_dag(graph, &registry);
+        let semantic_dag = SemanticDAG::from_graph(graph, &registry);
+        let fusion_plan = fusion::fuse_with_dag_prebuilt(graph, &semantic_dag);
         let lifetimes = buffer_alloc::analyze_lifetimes(graph, &fusion_plan);
         let alloc = buffer_alloc::allocate_buffers(&lifetimes);
 
@@ -284,7 +285,7 @@ impl InferenceCompiler {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::inference::types::ModelConfig;
+    use crate::types::ModelConfig;
 
     #[test]
     fn test_compiler_new() {

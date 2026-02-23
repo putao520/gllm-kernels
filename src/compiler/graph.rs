@@ -10,7 +10,7 @@
 use std::collections::HashMap;
 use crate::compiler::ir::LayerIR;
 use crate::dispatch::device_profile::DeviceProfile;
-use crate::inference::types::DType;
+use crate::types::DType;
 use crate::traits::Activation;
 
 // ── Identifiers ────────────────────────────────────────────────────

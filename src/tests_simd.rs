@@ -197,13 +197,12 @@ mod tests {
     }
 
     // ========================================================================
-    // IGNORED: pre-existing AVX2 bugs (not regressions from refactor)
+    // FIXED: previously ignored AVX2 bugs, now corrected
     // ========================================================================
 
-    // BUG: iq4_nl AVX2 decode wrong from element 32 onward (scalar=0, simd=-127)
+    // IQ4_NL: fixed loop bound (was reading 256 values from 32-value block)
     #[test]
     #[cfg(target_arch = "x86_64")]
-    #[ignore = "pre-existing: iq4_nl AVX2 decode diverges from scalar at element 32"]
     fn test_simd_iq4_nl_decode() {
         use crate::quant::BlockIQ4NL;
         let mut block: BlockIQ4NL = unsafe { std::mem::zeroed() };
@@ -215,7 +214,6 @@ mod tests {
 
     #[test]
     #[cfg(target_arch = "x86_64")]
-    #[ignore = "pre-existing: iq4_nl AVX2 dot diverges from scalar"]
     fn test_simd_iq4_nl_dot() {
         use crate::quant::BlockIQ4NL;
         let mut block: BlockIQ4NL = unsafe { std::mem::zeroed() };
@@ -226,10 +224,9 @@ mod tests {
         assert_dot_close(s, v, "iq4_nl dot", 1e-2);
     }
 
-    // BUG: iq2_s codebook index out of bounds (len=8, index=8)
+    // IQ2_S: fixed to use IQ2S_GRID codebook lookup (was doing raw bit unpacking)
     #[test]
     #[cfg(target_arch = "x86_64")]
-    #[ignore = "pre-existing: iq2_s codebook table too small (index 8, len 8)"]
     fn test_simd_iq2_s_decode() {
         use crate::quant::BlockIQ2S;
         let mut block: BlockIQ2S = unsafe { std::mem::zeroed() };
@@ -241,7 +238,6 @@ mod tests {
 
     #[test]
     #[cfg(target_arch = "x86_64")]
-    #[ignore = "pre-existing: iq2_s codebook table too small (index 8, len 8)"]
     fn test_simd_iq2_s_dot() {
         use crate::quant::BlockIQ2S;
         let mut block: BlockIQ2S = unsafe { std::mem::zeroed() };
@@ -252,10 +248,9 @@ mod tests {
         assert_dot_close(s, v, "iq2_s dot", 1e-2);
     }
 
-    // BUG: iq3_xxs AVX2 sign flip (scalar=4, simd=-4)
+    // IQ3_XXS: fixed to use IQ3XXS_GRID codebook lookup (was doing 3-bit unpack with wrong offset)
     #[test]
     #[cfg(target_arch = "x86_64")]
-    #[ignore = "pre-existing: iq3_xxs AVX2 sign flip vs scalar"]
     fn test_simd_iq3_xxs_decode() {
         use crate::quant::BlockIQ3XXS;
         let mut block: BlockIQ3XXS = unsafe { std::mem::zeroed() };
@@ -267,7 +262,6 @@ mod tests {
 
     #[test]
     #[cfg(target_arch = "x86_64")]
-    #[ignore = "pre-existing: iq3_xxs AVX2 sign flip vs scalar"]
     fn test_simd_iq3_xxs_dot() {
         use crate::quant::BlockIQ3XXS;
         let mut block: BlockIQ3XXS = unsafe { std::mem::zeroed() };
@@ -278,10 +272,9 @@ mod tests {
         assert_dot_close(s, v, "iq3_xxs dot", 1e-2);
     }
 
-    // BUG: iq3_s codebook index out of bounds (len=8, index=8)
+    // IQ3_S: fixed to use IQ3S_GRID codebook lookup + correct scale calculation
     #[test]
     #[cfg(target_arch = "x86_64")]
-    #[ignore = "pre-existing: iq3_s codebook table too small (index 8, len 8)"]
     fn test_simd_iq3_s_decode() {
         use crate::quant::BlockIQ3S;
         let mut block: BlockIQ3S = unsafe { std::mem::zeroed() };
@@ -293,7 +286,6 @@ mod tests {
 
     #[test]
     #[cfg(target_arch = "x86_64")]
-    #[ignore = "pre-existing: iq3_s codebook table too small (index 8, len 8)"]
     fn test_simd_iq3_s_dot() {
         use crate::quant::BlockIQ3S;
         let mut block: BlockIQ3S = unsafe { std::mem::zeroed() };
@@ -304,10 +296,9 @@ mod tests {
         assert_dot_close(s, v, "iq3_s dot", 1e-2);
     }
 
-    // BUG: gptq4 AVX2 zero-point handling differs (scalar=-8, simd=0)
+    // GPTQ4: fixed scalar to use block.zeros instead of hardcoded 8.0
     #[test]
     #[cfg(target_arch = "x86_64")]
-    #[ignore = "pre-existing: gptq4 AVX2 zero-point handling differs from scalar"]
     fn test_simd_gptq4_decode() {
         use crate::quant::BlockGPTQ4;
         let mut block: BlockGPTQ4 = unsafe { std::mem::zeroed() };
@@ -319,7 +310,6 @@ mod tests {
 
     #[test]
     #[cfg(target_arch = "x86_64")]
-    #[ignore = "pre-existing: gptq4 AVX2 zero-point handling differs from scalar"]
     fn test_simd_gptq4_dot() {
         use crate::quant::BlockGPTQ4;
         let mut block: BlockGPTQ4 = unsafe { std::mem::zeroed() };

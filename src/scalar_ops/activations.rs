@@ -2,6 +2,7 @@
 
 /// SiLU: `out[i] = x[i] / (1 + exp(-x[i]))`
 #[no_mangle]
+#[inline(never)]
 pub extern "C" fn scalar_silu(x: *const f32, out: *mut f32, n: usize) {
     for i in 0..n {
         unsafe {
@@ -14,6 +15,7 @@ pub extern "C" fn scalar_silu(x: *const f32, out: *mut f32, n: usize) {
 /// GELU (tanh approximation):
 /// `out[i] = 0.5 * x * (1 + tanh(sqrt(2/pi) * (x + 0.044715 * x^3)))`
 #[no_mangle]
+#[inline(never)]
 pub extern "C" fn scalar_gelu(x: *const f32, out: *mut f32, n: usize) {
     const SQRT_2_OVER_PI: f32 = 0.7978845608_f32;
     const COEFF: f32 = 0.044715_f32;
@@ -28,6 +30,7 @@ pub extern "C" fn scalar_gelu(x: *const f32, out: *mut f32, n: usize) {
 
 /// ReLU: `out[i] = max(0, x[i])`
 #[no_mangle]
+#[inline(never)]
 pub extern "C" fn scalar_relu(x: *const f32, out: *mut f32, n: usize) {
     for i in 0..n {
         unsafe {
@@ -39,6 +42,7 @@ pub extern "C" fn scalar_relu(x: *const f32, out: *mut f32, n: usize) {
 
 /// SwiGLU: `out[i] = silu(gate[i]) * up[i]`
 #[no_mangle]
+#[inline(never)]
 pub extern "C" fn scalar_swiglu(
     gate: *const f32,
     up: *const f32,
@@ -57,6 +61,7 @@ pub extern "C" fn scalar_swiglu(
 
 /// GeGLU: `out[i] = gelu(gate[i]) * up[i]`
 #[no_mangle]
+#[inline(never)]
 pub extern "C" fn scalar_geglu(
     gate: *const f32,
     up: *const f32,

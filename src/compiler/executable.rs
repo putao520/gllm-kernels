@@ -4,7 +4,7 @@
 //! transformer layer. The code is stored in an executable memory region
 //! (via mmap) and called through a function pointer.
 
-use crate::inference::types::InferenceError;
+use crate::types::InferenceError;
 
 /// Signature of a compiled layer function.
 ///

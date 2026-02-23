@@ -2,11 +2,11 @@
 
 ## 定位
 
-**gllm-kernels = 极限性能 CPU 算子库**
+**gllm-kernels = 极限性能算子库 + JIT 编译器**
 
-提供逼近硬件理论峰值的底层计算原语。上层推理引擎（gllm）通过组合这些算子构建完整推理管线。
+提供逼近硬件理论峰值的底层计算原语，以及算法意图编译器（JIT）自动融合优化。上层推理引擎（gllm）通过组合这些算子构建完整推理管线。
 
-**不是**推理引擎、不含业务逻辑、不含 GPU 后端。
+当前聚焦 CPU 后端，GPU 后端为规划中的未来工作（见 SPEC/04-GPU-BACKEND.md）。
 
 ---
 
@@ -42,9 +42,9 @@
 全核: 单核 × 核心数 × 全核 Turbo 频率
 ```
 
-### 3. 纯 CPU 算子库（ARCH-CPU-ONLY）
+### 3. CPU 优先（ARCH-CPU-FIRST）
 
-本库只实现 CPU 后端。GPU 后端（CUDA/Metal/ROCm）由上层推理引擎负责。
+当前聚焦 CPU 后端。GPU 后端（CUDA/Metal）为规划中的未来工作（见 SPEC/04-GPU-BACKEND.md）。
 
 **禁止的外部依赖**：
 ```rust
@@ -59,13 +59,16 @@ use cudarc::*;      // GPU
 
 **属于本库**：纯计算原语（BLAS、激活、归一化、位置编码、量化解码、量化 GEMV/GEMM）
 
-**不属于本库**：
+**不属于 Layer 1 算子库**：
 - FlashAttention / Paged Attention（业务算法）
 - KV Cache 管理（业务状态）
 - 融合算子 fused_qkv_rope / fused_ffn 等（业务组合）
 - Embedding lookup（查表，非计算密集）
 - Sampling（业务逻辑）
-- GPU 后端（独立项目）
+
+**规划中的未来工作**：
+- GPU 后端（CUDA/Metal）— 见 SPEC/04-GPU-BACKEND.md
+- Layer 2 推理后端 — 见 SPEC/05-LAYER2-INFERENCE.md
 
 ---
 

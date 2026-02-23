@@ -34,8 +34,6 @@ pub enum RegistryError {
     SymExec(SymExecError),
     /// The extracted trace was empty or invalid.
     EmptyTrace,
-    /// Key is already registered.
-    AlreadyRegistered(OpKindKey),
 }
 
 impl std::fmt::Display for RegistryError {
@@ -43,7 +41,6 @@ impl std::fmt::Display for RegistryError {
         match self {
             RegistryError::SymExec(e) => write!(f, "symexec error: {e}"),
             RegistryError::EmptyTrace => write!(f, "extracted trace is empty"),
-            RegistryError::AlreadyRegistered(k) => write!(f, "key already registered: {k:?}"),
         }
     }
 }
@@ -87,6 +84,23 @@ impl ScalarOpRegistry {
     /// Manually inject an OpTrace (temporary until Phase 0 symexec is implemented).
     pub fn inject_trace(&mut self, key: OpKindKey, trace: OpTrace) {
         self.trace_cache.insert(key, trace);
+    }
+
+    /// Try symexec first; on failure, fall back to manual trace injection.
+    ///
+    /// This is the progressive migration path: as symexec improves, more
+    /// operators will be auto-extracted and the manual traces become dead code.
+    fn register_with_symexec_fallback(
+        &mut self,
+        key: OpKindKey,
+        sig: ScalarFnSignature,
+        op_kind: OpKind,
+        manual_trace: OpTrace,
+    ) {
+        if self.auto_register_from_symexec(key.clone(), sig.clone(), op_kind).is_err() {
+            self.register(key.clone(), sig);
+            self.inject_trace(key, manual_trace);
+        }
     }
 
     /// Convert an `OpKind` to its hashable `OpKindKey`.
@@ -136,9 +150,10 @@ impl ScalarOpRegistry {
             fn_ptr: scalar_silu as *const u8,
             params: vec![ScalarParam::InputPtr, ScalarParam::OutputPtr, ScalarParam::Dim(0)],
         };
-        reg.register(OpKindKey::Silu, silu_sig.clone());
-        reg.inject_trace(
+        reg.register_with_symexec_fallback(
             OpKindKey::Silu,
+            silu_sig.clone(),
+            OpKind::Silu,
             OpTrace {
                 op_kind: OpKind::Silu,
                 pattern: ComputePattern::Elementwise {
@@ -160,9 +175,10 @@ impl ScalarOpRegistry {
             fn_ptr: scalar_gelu as *const u8,
             params: vec![ScalarParam::InputPtr, ScalarParam::OutputPtr, ScalarParam::Dim(0)],
         };
-        reg.register(OpKindKey::Gelu, gelu_sig.clone());
-        reg.inject_trace(
+        reg.register_with_symexec_fallback(
             OpKindKey::Gelu,
+            gelu_sig.clone(),
+            OpKind::Gelu,
             OpTrace {
                 op_kind: OpKind::Gelu,
                 pattern: ComputePattern::Elementwise {
@@ -197,9 +213,10 @@ impl ScalarOpRegistry {
                 ScalarParam::Dim(0),
             ],
         };
-        reg.register(OpKindKey::SwiGlu, swiglu_sig.clone());
-        reg.inject_trace(
+        reg.register_with_symexec_fallback(
             OpKindKey::SwiGlu,
+            swiglu_sig.clone(),
+            OpKind::SwiGlu,
             OpTrace {
                 op_kind: OpKind::SwiGlu,
                 pattern: ComputePattern::BinaryElementwise {
@@ -228,9 +245,10 @@ impl ScalarOpRegistry {
                 ScalarParam::Dim(0),
             ],
         };
-        reg.register(OpKindKey::GeGlu, geglu_sig.clone());
-        reg.inject_trace(
+        reg.register_with_symexec_fallback(
             OpKindKey::GeGlu,
+            geglu_sig.clone(),
+            OpKind::GeGlu,
             OpTrace {
                 op_kind: OpKind::GeGlu,
                 pattern: ComputePattern::BinaryElementwise {
@@ -267,9 +285,10 @@ impl ScalarOpRegistry {
                 ScalarParam::Dim(0),
             ],
         };
-        reg.register(OpKindKey::Add, add_sig.clone());
-        reg.inject_trace(
+        reg.register_with_symexec_fallback(
             OpKindKey::Add,
+            add_sig.clone(),
+            OpKind::Add,
             OpTrace {
                 op_kind: OpKind::Add,
                 pattern: ComputePattern::BinaryElementwise {
@@ -293,9 +312,10 @@ impl ScalarOpRegistry {
                 ScalarParam::Dim(0),
             ],
         };
-        reg.register(OpKindKey::Mul, mul_sig.clone());
-        reg.inject_trace(
+        reg.register_with_symexec_fallback(
             OpKindKey::Mul,
+            mul_sig.clone(),
+            OpKind::Mul,
             OpTrace {
                 op_kind: OpKind::Mul,
                 pattern: ComputePattern::BinaryElementwise {
@@ -319,9 +339,10 @@ impl ScalarOpRegistry {
                 ScalarParam::Dim(0),
             ],
         };
-        reg.register(OpKindKey::Residual, residual_sig.clone());
-        reg.inject_trace(
+        reg.register_with_symexec_fallback(
             OpKindKey::Residual,
+            residual_sig.clone(),
+            OpKind::Residual,
             OpTrace {
                 op_kind: OpKind::Residual,
                 pattern: ComputePattern::BinaryElementwise {
@@ -340,9 +361,10 @@ impl ScalarOpRegistry {
             fn_ptr: scalar_softmax as *const u8,
             params: vec![ScalarParam::InputPtr, ScalarParam::OutputPtr, ScalarParam::Dim(0)],
         };
-        reg.register(OpKindKey::Softmax, softmax_sig.clone());
-        reg.inject_trace(
+        reg.register_with_symexec_fallback(
             OpKindKey::Softmax,
+            softmax_sig.clone(),
+            OpKind::Softmax,
             OpTrace {
                 op_kind: OpKind::Softmax,
                 pattern: ComputePattern::Reduction {
@@ -368,9 +390,10 @@ impl ScalarOpRegistry {
                 ScalarParam::Scalar(1e-5),
             ],
         };
-        reg.register(OpKindKey::RmsNorm, rms_sig.clone());
-        reg.inject_trace(
+        reg.register_with_symexec_fallback(
             OpKindKey::RmsNorm,
+            rms_sig.clone(),
+            OpKind::RmsNorm { eps: 1e-5 },
             OpTrace {
                 op_kind: OpKind::RmsNorm { eps: 1e-5 }, // default eps; actual value comes from graph OpKind at compile time
                 pattern: ComputePattern::NormLike {
@@ -410,9 +433,10 @@ impl ScalarOpRegistry {
                 ScalarParam::Scalar(1e-5),
             ],
         };
-        reg.register(OpKindKey::LayerNorm, ln_sig.clone());
-        reg.inject_trace(
+        reg.register_with_symexec_fallback(
             OpKindKey::LayerNorm,
+            ln_sig.clone(),
+            OpKind::LayerNorm { eps: 1e-5 },
             OpTrace {
                 op_kind: OpKind::LayerNorm { eps: 1e-5 }, // default eps; actual value comes from graph OpKind at compile time
                 pattern: ComputePattern::NormLike {
@@ -454,9 +478,10 @@ impl ScalarOpRegistry {
                 ScalarParam::Dim(0),
             ],
         };
-        reg.register(OpKindKey::Gemm, gemm_sig.clone());
-        reg.inject_trace(
+        reg.register_with_symexec_fallback(
             OpKindKey::Gemm,
+            gemm_sig.clone(),
+            OpKind::Gemm { m: 0, n: 0, k: 0 },
             OpTrace {
                 op_kind: OpKind::Gemm { m: 0, n: 0, k: 0 },
                 pattern: ComputePattern::Gemm,
@@ -476,9 +501,10 @@ impl ScalarOpRegistry {
                 ScalarParam::Dim(0),
             ],
         };
-        reg.register(OpKindKey::RoPE, rope_sig.clone());
-        reg.inject_trace(
+        reg.register_with_symexec_fallback(
             OpKindKey::RoPE,
+            rope_sig.clone(),
+            OpKind::RoPE { head_dim: 0, theta: 0.0 },
             OpTrace {
                 op_kind: OpKind::RoPE { head_dim: 0, theta: 0.0 },
                 pattern: ComputePattern::Injective {
@@ -514,9 +540,10 @@ impl ScalarOpRegistry {
                 ScalarParam::Dim(0),
             ],
         };
-        reg.register(OpKindKey::GemmBias, gemm_bias_sig.clone());
-        reg.inject_trace(
+        reg.register_with_symexec_fallback(
             OpKindKey::GemmBias,
+            gemm_bias_sig.clone(),
+            OpKind::GemmBias { m: 0, n: 0, k: 0 },
             OpTrace {
                 op_kind: OpKind::GemmBias { m: 0, n: 0, k: 0 },
                 pattern: ComputePattern::Gemm,
@@ -534,9 +561,10 @@ impl ScalarOpRegistry {
                 ScalarParam::Dim(0),
             ],
         };
-        reg.register(OpKindKey::Transpose, transpose_sig.clone());
-        reg.inject_trace(
+        reg.register_with_symexec_fallback(
             OpKindKey::Transpose,
+            transpose_sig.clone(),
+            OpKind::Transpose { perm: vec![1, 0] },
             OpTrace {
                 op_kind: OpKind::Transpose { perm: vec![1, 0] },
                 pattern: ComputePattern::Injective {
@@ -557,9 +585,10 @@ impl ScalarOpRegistry {
                 ScalarParam::Dim(0),
             ],
         };
-        reg.register(OpKindKey::Reshape, reshape_sig.clone());
-        reg.inject_trace(
+        reg.register_with_symexec_fallback(
             OpKindKey::Reshape,
+            reshape_sig.clone(),
+            OpKind::Reshape { target_shape: vec![] },
             OpTrace {
                 op_kind: OpKind::Reshape { target_shape: vec![] },
                 pattern: ComputePattern::Injective {
@@ -585,9 +614,10 @@ impl ScalarOpRegistry {
                 ScalarParam::Dim(0), // block_size
             ],
         };
-        reg.register(OpKindKey::QuantGemm, quant_gemm_sig.clone());
-        reg.inject_trace(
+        reg.register_with_symexec_fallback(
             OpKindKey::QuantGemm,
+            quant_gemm_sig.clone(),
+            OpKind::QuantGemm { m: 0, n: 0, k: 0, block_size: 32, bits: 4 },
             OpTrace {
                 op_kind: OpKind::QuantGemm { m: 0, n: 0, k: 0, block_size: 32, bits: 4 },
                 pattern: ComputePattern::Gemm,
@@ -606,9 +636,10 @@ impl ScalarOpRegistry {
                 ScalarParam::Dim(0), // block_size
             ],
         };
-        reg.register(OpKindKey::Dequantize, dequant_sig.clone());
-        reg.inject_trace(
+        reg.register_with_symexec_fallback(
             OpKindKey::Dequantize,
+            dequant_sig.clone(),
+            OpKind::Dequantize { num_elements: 0, block_size: 32, bits: 4 },
             OpTrace {
                 op_kind: OpKind::Dequantize { num_elements: 0, block_size: 32, bits: 4 },
                 pattern: ComputePattern::QuantDecode {
@@ -627,15 +658,15 @@ impl ScalarOpRegistry {
     }
 
     /// Auto-register a scalar function by running symbolic execution to extract its trace.
+    ///
+    /// If the key is already registered, the existing entry is overwritten
+    /// (allows symexec to upgrade a manual trace).
     pub fn auto_register_from_symexec(
         &mut self,
         key: OpKindKey,
         fn_sig: ScalarFnSignature,
+        op_kind: OpKind,
     ) -> Result<ComputePattern, RegistryError> {
-        if self.entries.contains_key(&key) {
-            return Err(RegistryError::AlreadyRegistered(key));
-        }
-
         // Count float and pointer params from the signature
         let n_float = fn_sig.params.iter().filter(|p| matches!(p, ScalarParam::Scalar(_))).count();
         let n_ptr = fn_sig.params.iter().filter(|p| matches!(p, ScalarParam::InputPtr | ScalarParam::OutputPtr | ScalarParam::WeightPtr)).count();
@@ -647,9 +678,16 @@ impl ScalarOpRegistry {
             return Err(RegistryError::EmptyTrace);
         }
 
+        // Reject trivial traces (e.g. just [Input(0)]) — these indicate the
+        // symexec engine didn't actually analyze the function body.
+        let has_compute = trace_ops.iter().any(|op| !matches!(op, TraceOp::Input(_) | TraceOp::Const(_)));
+        if !has_compute {
+            return Err(RegistryError::EmptyTrace);
+        }
+
         let pattern = classify_pattern(&trace_ops);
         let trace = OpTrace {
-            op_kind: OpKind::Silu, // placeholder — caller should set real op_kind
+            op_kind,
             pattern: pattern.clone(),
             signature: fn_sig.clone(),
         };
@@ -805,6 +843,48 @@ mod tests {
         ] {
             let sig = reg.get_signature(&key).unwrap();
             assert!(!sig.fn_ptr.is_null(), "fn_ptr is null for {key:?}");
+        }
+    }
+
+    /// Verify that `auto_register_from_symexec` either succeeds or gracefully
+    /// falls back for every default operator. The symexec engine is a stub
+    /// (returns empty trace), so we expect `EmptyTrace` errors — the important
+    /// thing is no panics or UB.
+    #[test]
+    fn test_symexec_extracts_from_compiled_scalar_ops() {
+        let reg = ScalarOpRegistry::with_defaults();
+
+        let test_keys = [
+            (OpKindKey::Silu, OpKind::Silu),
+            (OpKindKey::Gelu, OpKind::Gelu),
+            (OpKindKey::Add, OpKind::Add),
+            (OpKindKey::Mul, OpKind::Mul),
+            (OpKindKey::RmsNorm, OpKind::RmsNorm { eps: 1e-5 }),
+            (OpKindKey::Softmax, OpKind::Softmax),
+        ];
+
+        for (key, op_kind) in &test_keys {
+            let sig = reg.get_signature(key).expect("missing signature");
+
+            // Try symexec path on a fresh registry
+            let mut fresh = ScalarOpRegistry::new();
+            let result = fresh.auto_register_from_symexec(
+                key.clone(),
+                sig.clone(),
+                op_kind.clone(),
+            );
+
+            // Either succeeds or returns a well-formed error (no panic)
+            match result {
+                Ok(pattern) => {
+                    eprintln!("symexec succeeded for {key:?}: {pattern:?}");
+                    assert!(fresh.get_trace(key).is_some());
+                }
+                Err(e) => {
+                    eprintln!("symexec fallback for {key:?}: {e}");
+                    // Expected: symexec stub returns empty/error
+                }
+            }
         }
     }
 

@@ -223,4 +223,114 @@ mod tests {
             Platform::Aarch64 { .. } => {},
         }
     }
+
+    #[cfg(feature = "jit-x86")]
+    #[test]
+    fn test_x86_backend_trait_roundtrip() {
+        use crate::compiler::codegen::x86_64::X86Backend;
+
+        let backend = X86Backend;
+        let profile = DeviceProfile::detect();
+        let emitter = backend.new_emitter(&profile);
+
+        let plat = backend.platform();
+        assert!(matches!(plat, Platform::X86_64 { .. }));
+        assert!(backend.num_simd_regs() == 16 || backend.num_simd_regs() == 32);
+        assert!(emitter.simd_width() == 8 || emitter.simd_width() == 16);
+    }
+
+    #[cfg(feature = "jit-x86")]
+    #[test]
+    fn test_emitter_emit_plan_standalone_silu() {
+        use crate::compiler::codegen::x86_64::jit::X86CodeGen;
+        use crate::compiler::graph::{CompilerGraph, OpKind};
+        use crate::compiler::fusion::{FusionGroup, FusionMode, FusionPlan};
+        use crate::compiler::buffer_alloc::BufferAllocation;
+        use crate::inference::types::DType;
+        use std::collections::HashMap;
+
+        let mut g = CompilerGraph::new();
+        let input = g.add_tensor("input", vec![16], DType::F32);
+        let output = g.add_tensor("output", vec![16], DType::F32);
+        g.inputs = vec![input];
+        g.outputs = vec![output];
+        let op_id = g.add_op(OpKind::Silu, vec![input], vec![output], "silu");
+
+        let mut op_to_group = HashMap::new();
+        op_to_group.insert(op_id, 0);
+        let plan = FusionPlan {
+            groups: vec![FusionGroup {
+                id: 0,
+                anchor: op_id,
+                epilogue: vec![],
+                mode: FusionMode::LoopFusion,
+                ops: vec![op_id],
+            }],
+            op_to_group,
+        };
+        let alloc = BufferAllocation { slots: vec![], total_bytes: 0, num_tensors: 0, bytes_saved: 0 };
+        let profile = DeviceProfile::detect();
+
+        let mut emitter: Box<dyn MachineCodeEmitter> = Box::new(X86CodeGen::new(&profile));
+        let output = emitter.emit_plan(&plan, &g, &alloc, &profile, None).unwrap();
+        assert!(!output.code.is_empty(), "emit_plan via trait should produce code");
+    }
+
+    #[cfg(feature = "jit-x86")]
+    #[test]
+    fn test_emitter_emit_plan_with_registry() {
+        use crate::compiler::codegen::x86_64::jit::X86CodeGen;
+        use crate::compiler::graph::{CompilerGraph, OpKind};
+        use crate::compiler::fusion::{FusionGroup, FusionMode, FusionPlan};
+        use crate::compiler::buffer_alloc::BufferAllocation;
+        use crate::compiler::registry::ScalarOpRegistry;
+        use crate::inference::types::DType;
+        use std::collections::HashMap;
+
+        let mut g = CompilerGraph::new();
+        let input = g.add_tensor("input", vec![16], DType::F32);
+        let output = g.add_tensor("output", vec![16], DType::F32);
+        g.inputs = vec![input];
+        g.outputs = vec![output];
+        let op_id = g.add_op(OpKind::Silu, vec![input], vec![output], "silu");
+
+        let mut op_to_group = HashMap::new();
+        op_to_group.insert(op_id, 0);
+        let plan = FusionPlan {
+            groups: vec![FusionGroup {
+                id: 0,
+                anchor: op_id,
+                epilogue: vec![],
+                mode: FusionMode::LoopFusion,
+                ops: vec![op_id],
+            }],
+            op_to_group,
+        };
+        let alloc = BufferAllocation { slots: vec![], total_bytes: 0, num_tensors: 0, bytes_saved: 0 };
+        let profile = DeviceProfile::detect();
+        let registry = ScalarOpRegistry::with_defaults();
+
+        let mut emitter = X86CodeGen::new(&profile);
+        let output = emitter.emit_plan(&plan, &g, &alloc, &profile, Some(&registry)).unwrap();
+        assert!(!output.code.is_empty(), "registry-driven emit_plan should produce code");
+    }
+
+    #[cfg(feature = "jit-x86")]
+    #[test]
+    fn test_platform_detect_consistency() {
+        use crate::compiler::codegen::x86_64::X86Backend;
+
+        let profile = DeviceProfile::detect();
+        let detected = Platform::detect(&profile);
+        let backend = X86Backend;
+        let backend_plat = backend.platform();
+
+        // Both should report X86_64 on x86_64 hosts
+        match (detected, backend_plat) {
+            (Platform::X86_64 { avx512: a }, Platform::X86_64 { avx512: b }) => {
+                assert_eq!(a, b, "Platform::detect and X86Backend::platform disagree on avx512");
+            }
+            _ => panic!("platform mismatch between detect and backend"),
+        }
+    }
 }
