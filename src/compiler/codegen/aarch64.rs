@@ -35,7 +35,7 @@ pub fn emit_stub() -> CodegenOutput {
 #[cfg(feature = "jit-aarch64")]
 pub mod jit {
     use crate::compiler::trace::TraceOp;
-    use crate::compiler::fusion::{FusionGroup, FusionPlan, FusionPattern};
+    use crate::compiler::fusion::{FusionGroup, FusionPlan, FusionMode};
     use crate::compiler::graph::{CompilerGraph, OpKind};
     use crate::compiler::buffer_alloc::BufferAllocation;
     use crate::dispatch::DeviceProfile;
@@ -130,11 +130,11 @@ pub mod jit {
             group: &FusionGroup,
             graph: &CompilerGraph,
         ) -> Result<(), String> {
-            match group.pattern {
-                FusionPattern::Standalone => {
+            match group.mode {
+                FusionMode::Standalone => {
                     self.emit_standalone(group, graph)
                 }
-                FusionPattern::ElementwiseChain => {
+                FusionMode::LoopFusion => {
                     // MVP: emit a nop marker per fused op
                     // Real implementation: single loop body with TraceOp -> NEON for each op
                     for _ in &group.ops {
@@ -142,7 +142,7 @@ pub mod jit {
                     }
                     Ok(())
                 }
-                FusionPattern::GemmEpilogue => {
+                FusionMode::EpilogueInjection => {
                     self.emit_standalone(group, graph)?;
                     // Epilogue ops would be injected into the store phase
                     // MVP: emit nop markers for each epilogue op
@@ -151,14 +151,15 @@ pub mod jit {
                     }
                     Ok(())
                 }
-                FusionPattern::QkvSharedInput | FusionPattern::NormIntoGemm => {
+                FusionMode::QkvSharedInput | FusionMode::NormIntoGemm
+                | FusionMode::TileLevelFusion | FusionMode::ComputeRoot => {
                     // Emit as separate standalone ops for now
                     for &op_id in &group.ops {
                         let single = FusionGroup {
                             id: group.id,
                             anchor: op_id,
                             epilogue: vec![],
-                            pattern: FusionPattern::Standalone,
+                            mode: FusionMode::Standalone,
                             ops: vec![op_id],
                         };
                         self.emit_standalone(&single, graph)?;
@@ -384,6 +385,45 @@ pub mod jit {
         fn emit_u32(&mut self, insn: u32) {
             self.code.extend_from_slice(&insn.to_le_bytes());
         }
+    }
+}
+
+#[cfg(feature = "jit-aarch64")]
+impl crate::compiler::codegen::emitter::MachineCodeEmitter for jit::AArch64CodeGen {
+    fn emit_plan(
+        &mut self,
+        plan: &crate::compiler::fusion::FusionPlan,
+        graph: &crate::compiler::graph::CompilerGraph,
+        alloc: &crate::compiler::buffer_alloc::BufferAllocation,
+        profile: &crate::dispatch::DeviceProfile,
+        _registry: Option<&crate::compiler::registry::ScalarOpRegistry>,
+    ) -> Result<super::CodegenOutput, String> {
+        self.emit_plan(plan, graph, alloc, profile)
+    }
+
+    fn simd_width(&self) -> usize {
+        self.simd_width()
+    }
+}
+
+/// AArch64 platform backend factory.
+#[cfg(feature = "jit-aarch64")]
+pub struct Arm64Backend;
+
+#[cfg(feature = "jit-aarch64")]
+impl crate::compiler::codegen::emitter::PlatformBackend for Arm64Backend {
+    type Emitter = jit::AArch64CodeGen;
+
+    fn new_emitter(&self, profile: &crate::dispatch::DeviceProfile) -> Self::Emitter {
+        jit::AArch64CodeGen::new(profile)
+    }
+
+    fn platform(&self) -> crate::compiler::codegen::emitter::Platform {
+        crate::compiler::codegen::emitter::Platform::Aarch64 { sve: false }
+    }
+
+    fn num_simd_regs(&self) -> usize {
+        32 // AArch64: v0-v31
     }
 }
 

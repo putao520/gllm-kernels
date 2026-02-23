@@ -19,6 +19,8 @@ pub mod x86_64;
 pub mod aarch64;
 pub mod emitter;
 
+pub use emitter::{MachineCodeEmitter, PlatformBackend, Platform};
+
 /// Output of code generation: raw machine code bytes.
 pub struct CodegenOutput {
     /// Raw machine code

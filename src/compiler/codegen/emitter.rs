@@ -1,18 +1,99 @@
-//! Emitter — legacy scratchpad layout + stub code generation.
+//! Emitter — Phase 3 trait abstraction + legacy scratchpad layout.
 //!
-//! Phase 3 code generation is now implemented in `codegen::x86_64::jit::X86CodeGen`
-//! (under the `jit-x86` feature flag), which uses `FusionPlan` + `BufferAllocation`
-//! to emit native x86_64 machine code via iced-x86.
+//! ## Trait Architecture (SPEC §8.6)
 //!
-//! What remains here:
-//! - `ScratchpadLayout` / `compute_layout()`: legacy bump allocator for scratchpad
-//!   planning. New code should use `buffer_alloc::allocate_buffers()` which implements
-//!   interval-graph coloring for buffer reuse (SPEC Phase 2 Step 4).
-//! - `emit_stub_code()`: fallback stub used when the `jit-x86` feature is not enabled.
+//! Platform differences in Phase 3 code generation are encapsulated via two traits:
+//!
+//! - `MachineCodeEmitter`: the code-generation interface (emit_plan, simd_width).
+//!   Implemented by `X86CodeGen` (jit-x86) and `AArch64CodeGen` (jit-aarch64).
+//!
+//! - `PlatformBackend`: factory + platform metadata. Implemented by `X86Backend`
+//!   and `Arm64Backend`. The compiler pipeline depends only on `PlatformBackend`,
+//!   not on the concrete emitter type.
+//!
+//! ## Legacy
+//!
+//! `ScratchpadLayout` / `compute_layout()` and `emit_stub_code()` are retained for
+//! backward compatibility with the non-JIT fallback path and existing tests.
+//! New code should use `buffer_alloc::allocate_buffers()` for buffer planning.
 
 use std::collections::HashMap;
 use crate::compiler::graph::{CompilerGraph, TensorId};
 use crate::compiler::codegen::CodegenOutput;
+use crate::compiler::fusion::FusionPlan;
+use crate::compiler::buffer_alloc::BufferAllocation;
+use crate::dispatch::DeviceProfile;
+
+// ── Trait definitions ─────────────────────────────────────────────────────────
+
+/// Platform identifier — carries capability flags used by the compiler pipeline.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Platform {
+    /// x86_64 with optional AVX-512 support.
+    X86_64 { avx512: bool },
+    /// AArch64 with optional SVE support.
+    Aarch64 { sve: bool },
+}
+
+impl Platform {
+    /// Detect the current host platform.
+    pub fn detect(profile: &DeviceProfile) -> Self {
+        use crate::dispatch::IsaLevel;
+
+        #[cfg(target_arch = "x86_64")]
+        return Platform::X86_64 {
+            avx512: matches!(profile.isa, IsaLevel::Avx512),
+        };
+
+        #[cfg(target_arch = "aarch64")]
+        return Platform::Aarch64 { sve: false };
+
+        #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+        return Platform::X86_64 { avx512: false };
+    }
+}
+
+/// Phase 3 code-generation interface.
+///
+/// Implemented by each platform's JIT backend. The compiler pipeline calls
+/// `emit_plan` to produce native machine code for a complete fusion plan.
+///
+/// The `registry` parameter carries scalar-op metadata used by x86_64 for
+/// epilogue injection; aarch64 implementations may ignore it.
+pub trait MachineCodeEmitter {
+    /// Generate native machine code for a complete fusion plan.
+    fn emit_plan(
+        &mut self,
+        plan: &FusionPlan,
+        graph: &CompilerGraph,
+        alloc: &BufferAllocation,
+        profile: &DeviceProfile,
+        registry: Option<&crate::compiler::registry::ScalarOpRegistry>,
+    ) -> Result<CodegenOutput, String>;
+
+    /// Number of f32 elements per SIMD register on this backend.
+    fn simd_width(&self) -> usize;
+}
+
+/// Platform backend factory — provides platform metadata and constructs emitters.
+///
+/// The compiler pipeline depends only on this trait, not on the concrete emitter
+/// type, keeping Phase 1-2 (DAG construction, fusion decisions) platform-agnostic.
+pub trait PlatformBackend {
+    /// The concrete emitter type produced by this backend.
+    type Emitter: MachineCodeEmitter;
+
+    /// Construct a new emitter for the given device profile.
+    fn new_emitter(&self, profile: &DeviceProfile) -> Self::Emitter;
+
+    /// The platform this backend targets.
+    fn platform(&self) -> Platform;
+
+    /// Number of SIMD registers available on this platform.
+    fn num_simd_regs(&self) -> usize;
+}
+
+// ── Legacy scratchpad layout (retained for backward compatibility) ─────────────
 
 /// A scratchpad memory layout: maps each intermediate tensor to an offset.
 #[derive(Debug, Clone)]
@@ -130,5 +211,16 @@ mod tests {
 
         assert!(!output.code.is_empty());
         assert!(output.scratchpad_bytes > 0);
+    }
+
+    #[test]
+    fn test_platform_detect() {
+        let profile = DeviceProfile::detect();
+        let platform = Platform::detect(&profile);
+        // Just verify it returns a valid variant without panicking
+        match platform {
+            Platform::X86_64 { .. } => {},
+            Platform::Aarch64 { .. } => {},
+        }
     }
 }

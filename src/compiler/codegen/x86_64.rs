@@ -33,7 +33,7 @@ pub fn emit_stub() -> CodegenOutput {
 pub mod jit {
     use iced_x86::code_asm::*;
     use crate::compiler::trace::{TraceOp, ComputePattern};
-    use crate::compiler::fusion::{FusionGroup, FusionPlan, FusionPattern};
+    use crate::compiler::fusion::{FusionGroup, FusionPlan, FusionMode};
     use crate::compiler::graph::{CompilerGraph, OpKind};
     use crate::compiler::registry::ScalarOpRegistry;
     use crate::compiler::buffer_alloc::BufferAllocation;
@@ -78,7 +78,12 @@ pub mod jit {
             }
         }
 
-        /// Add a f32 constant to the pool and return its label.
+        /// Number of f32 elements per SIMD register (8 for AVX2, 16 for AVX-512).
+        pub fn simd_width(&self) -> usize {
+            self.simd_width
+        }
+
+
         /// Deduplicates: returns existing label if value already present.
         fn const_f32(&mut self, val: f32) -> CodeLabel {
             let bits = val.to_bits();
@@ -174,31 +179,35 @@ pub mod jit {
             profile: &DeviceProfile,
             registry: Option<&ScalarOpRegistry>,
         ) -> Result<(), String> {
-            match group.pattern {
-                FusionPattern::Standalone => {
+            match group.mode {
+                FusionMode::Standalone => {
                     self.emit_standalone(group, graph, profile)
                 }
-                FusionPattern::ElementwiseChain => {
+                FusionMode::LoopFusion => {
                     self.emit_elementwise_chain(group, graph, alloc, profile, registry)
                 }
-                FusionPattern::GemmEpilogue => {
+                FusionMode::EpilogueInjection => {
                     self.emit_gemm_with_epilogue(group, graph, alloc, profile, registry)
                 }
-                FusionPattern::QkvSharedInput => {
+                FusionMode::QkvSharedInput => {
                     for &op_id in &group.ops {
                         let single = FusionGroup {
                             id: group.id,
                             anchor: op_id,
                             epilogue: vec![],
-                            pattern: FusionPattern::Standalone,
+                            mode: FusionMode::Standalone,
                             ops: vec![op_id],
                         };
                         self.emit_standalone(&single, graph, profile)?;
                     }
                     Ok(())
                 }
-                FusionPattern::NormIntoGemm => {
+                FusionMode::NormIntoGemm => {
                     self.emit_norm_into_gemm(group, graph, profile)
+                }
+                FusionMode::TileLevelFusion | FusionMode::ComputeRoot => {
+                    // Future: dedicated emitters; treat as standalone for now
+                    self.emit_standalone(group, graph, profile)
                 }
             }
         }
@@ -859,6 +868,10 @@ pub mod jit {
             let pack_a_off = self.blis_scratchpad_offset as i32;
             let pack_b_off = (self.blis_scratchpad_offset + pack_a_bytes) as i32;
 
+            // NOTE: pack_a / pack_b are data layout transforms (row-major → panel-major),
+            // not compute operators. Calling precompiled packing routines via `call rax`
+            // is correct here — the SPEC trampoline prohibition applies only to compute
+            // operators whose fusion semantics require new code generation from TraceOp.
             let pack_a_fn = crate::asm::x86_64::gemm_driver::gllm_pack_a_f32 as *const () as u64;
             let pack_b_fn = crate::asm::x86_64::gemm_driver::gllm_pack_b_f32 as *const () as u64;
 
@@ -2418,6 +2431,49 @@ pub mod jit {
 }
 
 #[cfg(feature = "jit-x86")]
+impl crate::compiler::codegen::emitter::MachineCodeEmitter for jit::X86CodeGen {
+    fn emit_plan(
+        &mut self,
+        plan: &crate::compiler::fusion::FusionPlan,
+        graph: &crate::compiler::graph::CompilerGraph,
+        alloc: &crate::compiler::buffer_alloc::BufferAllocation,
+        profile: &crate::dispatch::DeviceProfile,
+        registry: Option<&crate::compiler::registry::ScalarOpRegistry>,
+    ) -> Result<CodegenOutput, String> {
+        self.emit_plan(plan, graph, alloc, profile, registry)
+    }
+
+    fn simd_width(&self) -> usize {
+        self.simd_width()
+    }
+}
+
+/// x86_64 platform backend factory.
+#[cfg(feature = "jit-x86")]
+pub struct X86Backend;
+
+#[cfg(feature = "jit-x86")]
+impl crate::compiler::codegen::emitter::PlatformBackend for X86Backend {
+    type Emitter = jit::X86CodeGen;
+
+    fn new_emitter(&self, profile: &crate::dispatch::DeviceProfile) -> Self::Emitter {
+        jit::X86CodeGen::new(profile)
+    }
+
+    fn platform(&self) -> crate::compiler::codegen::emitter::Platform {
+        #[cfg(target_arch = "x86_64")]
+        let avx512 = std::is_x86_feature_detected!("avx512f");
+        #[cfg(not(target_arch = "x86_64"))]
+        let avx512 = false;
+        crate::compiler::codegen::emitter::Platform::X86_64 { avx512 }
+    }
+
+    fn num_simd_regs(&self) -> usize {
+        16 // x86_64: ymm0-ymm15 (AVX2) or zmm0-zmm15 (AVX-512)
+    }
+}
+
+#[cfg(feature = "jit-x86")]
 pub use jit::X86CodeGen;
 
 #[cfg(test)]
@@ -2628,7 +2684,7 @@ mod e2e_tests {
     use crate::compiler::codegen::x86_64::jit::X86CodeGen;
     use crate::compiler::executable::CompiledLayer;
     use crate::compiler::graph::{CompilerGraph, OpKind, OpId, TensorId};
-    use crate::compiler::fusion::{FusionGroup, FusionPlan, FusionPattern};
+    use crate::compiler::fusion::{FusionGroup, FusionPlan, FusionMode};
     use crate::compiler::buffer_alloc::BufferAllocation;
     use crate::dispatch::DeviceProfile;
     use crate::inference::types::DType;
@@ -2673,7 +2729,7 @@ mod e2e_tests {
                 id: 0,
                 anchor: op_id,
                 epilogue: vec![],
-                pattern: FusionPattern::ElementwiseChain,
+                mode: FusionMode::LoopFusion,
                 ops: vec![op_id],
             }],
             op_to_group,
@@ -2889,7 +2945,7 @@ mod e2e_tests {
                 id: 0,
                 anchor: op_id,
                 epilogue: vec![],
-                pattern: FusionPattern::Standalone,
+                mode: FusionMode::Standalone,
                 ops: vec![op_id],
             }],
             op_to_group,
@@ -3195,7 +3251,7 @@ mod e2e_tests {
                 id: 0,
                 anchor: gemm_id,
                 epilogue: vec![epi_id],
-                pattern: FusionPattern::GemmEpilogue,
+                mode: FusionMode::EpilogueInjection,
                 ops: vec![gemm_id, epi_id],
             }],
             op_to_group,
@@ -3415,7 +3471,7 @@ mod e2e_tests {
                 id: 0,
                 anchor: gemm_id,
                 epilogue: vec![],
-                pattern: FusionPattern::NormIntoGemm,
+                mode: FusionMode::NormIntoGemm,
                 ops: vec![norm_id, gemm_id],
             }],
             op_to_group,
@@ -3525,7 +3581,7 @@ mod registry_elementwise_tests {
     use crate::compiler::codegen::x86_64::jit::X86CodeGen;
     use crate::compiler::executable::CompiledLayer;
     use crate::compiler::graph::{CompilerGraph, OpKind, OpId, TensorId};
-    use crate::compiler::fusion::{FusionGroup, FusionPlan, FusionPattern};
+    use crate::compiler::fusion::{FusionGroup, FusionPlan, FusionMode};
     use crate::compiler::buffer_alloc::BufferAllocation;
     use crate::dispatch::DeviceProfile;
     use crate::inference::types::DType;
@@ -3581,7 +3637,7 @@ mod registry_elementwise_tests {
                 id: 0,
                 anchor: op_id,
                 epilogue: vec![],
-                pattern: FusionPattern::ElementwiseChain,
+                mode: FusionMode::LoopFusion,
                 ops: vec![op_id],
             }],
             op_to_group,
@@ -3597,7 +3653,7 @@ mod registry_elementwise_tests {
                 id: 0,
                 anchor: anchor_id,
                 epilogue: vec![epi_id],
-                pattern: FusionPattern::ElementwiseChain,
+                mode: FusionMode::LoopFusion,
                 ops: vec![anchor_id, epi_id],
             }],
             op_to_group,
@@ -3856,7 +3912,7 @@ mod registry_elementwise_tests {
                 id: 0,
                 anchor: op_id,
                 epilogue: vec![],
-                pattern: FusionPattern::ElementwiseChain,
+                mode: FusionMode::LoopFusion,
                 ops: vec![op_id],
             }],
             op_to_group,
