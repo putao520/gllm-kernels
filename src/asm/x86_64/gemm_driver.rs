@@ -285,6 +285,40 @@ unsafe fn pack_b_f32(
     }
 }
 
+// ── C-ABI wrappers for JIT codegen ──────────────────────────────────
+//
+// The JIT compiler emits `mov rax, fn_ptr; call rax` to invoke these.
+// They must use the C calling convention so the JIT-generated code can
+// set up arguments in the standard System V AMD64 registers.
+
+/// C-ABI wrapper around [`pack_a_f32`] for JIT-emitted GEMM code.
+#[cfg(target_arch = "x86_64")]
+#[no_mangle]
+pub unsafe extern "C" fn gllm_pack_a_f32(
+    a: *const f32,
+    lda: usize,
+    packed: *mut f32,
+    mc: usize,
+    kc: usize,
+    mr: usize,
+) {
+    pack_a_f32(a, lda, packed, mc, kc, mr);
+}
+
+/// C-ABI wrapper around [`pack_b_f32`] for JIT-emitted GEMM code.
+#[cfg(target_arch = "x86_64")]
+#[no_mangle]
+pub unsafe extern "C" fn gllm_pack_b_f32(
+    b: *const f32,
+    ldb: usize,
+    packed: *mut f32,
+    kc: usize,
+    nc: usize,
+    nr: usize,
+) {
+    pack_b_f32(b, ldb, packed, kc, nc, nr);
+}
+
 /// Apply bias to a block of C: C[i,j] += bias[j].
 /// Uses slices so the compiler can auto-vectorize with -C target-cpu=native.
 #[cfg(target_arch = "x86_64")]
@@ -2760,5 +2794,110 @@ mod tests {
         gemm_prepacked_ab_asm_f32_avx512(packed_a.as_slice(), &packed_b, &mut c_ab, m, n, k);
         gemm_asm_f32_avx512(&a, &b, &mut c_reg, m, n, k);
         check_close(&c_ab, &c_reg, 1e-5, "avx512_prepacked_ab_vs_regular");
+    }
+}
+
+#[cfg(test)]
+#[cfg(target_arch = "x86_64")]
+mod pack_tests {
+    use super::*;
+
+    /// Scalar reference pack_a (known correct)
+    fn pack_a_ref(a: &[f32], lda: usize, mc: usize, kc: usize, mr: usize) -> Vec<f32> {
+        let mut packed = vec![0.0f32; mc.div_ceil(mr) * mr * kc];
+        let mut p = 0usize;
+        let mut i = 0usize;
+        while i + mr <= mc {
+            for r in 0..mr {
+                for k in 0..kc {
+                    packed[p + k * mr + r] = a[(i + r) * lda + k];
+                }
+            }
+            p += mr * kc;
+            i += mr;
+        }
+        if i < mc {
+            let rem = mc - i;
+            for r in 0..rem {
+                for k in 0..kc {
+                    packed[p + k * mr + r] = a[(i + r) * lda + k];
+                }
+            }
+        }
+        packed
+    }
+
+    #[test]
+    fn test_pack_a_avx2_vs_scalar() {
+        let mr = 6usize;
+        // Test various mc/kc combinations including non-multiples of 8
+        for &(mc, kc) in &[(6, 8), (6, 16), (12, 296), (128, 296), (6, 7), (12, 9), (128, 216)] {
+            let lda = kc;
+            let a: Vec<f32> = (0..mc * lda).map(|i| (i as f32) * 0.01 - 5.0).collect();
+            
+            let expected = pack_a_ref(&a, lda, mc, kc, mr);
+            
+            let mut packed = vec![0.0f32; expected.len()];
+            unsafe {
+                gllm_pack_a_f32(a.as_ptr(), lda, packed.as_mut_ptr(), mc, kc, mr);
+            }
+            
+            for idx in 0..expected.len() {
+                let diff = (packed[idx] - expected[idx]).abs();
+                assert!(
+                    diff < 1e-6,
+                    "pack_a mismatch at idx={} for mc={} kc={}: got={}, expected={}, diff={}",
+                    idx, mc, kc, packed[idx], expected[idx], diff,
+                );
+            }
+            eprintln!("pack_a mc={} kc={}: OK", mc, kc);
+        }
+    }
+
+    #[test]
+    fn test_pack_b_correctness() {
+        let nr = 16usize;
+        for &(kc, nc) in &[(8usize, 16usize), (296, 256), (216, 256), (8, 15), (296, 17)] {
+            let ldb = nc;
+            let b: Vec<f32> = (0..kc * ldb).map(|i| (i as f32) * 0.01 - 3.0).collect();
+            
+            // Reference pack_b
+            let num_panels = nc.div_ceil(nr);
+            let mut expected = vec![0.0f32; num_panels * kc * nr];
+            let mut p = 0usize;
+            let mut j = 0usize;
+            while j + nr <= nc {
+                for k in 0..kc {
+                    for c in 0..nr {
+                        expected[p + k * nr + c] = b[k * ldb + j + c];
+                    }
+                }
+                p += kc * nr;
+                j += nr;
+            }
+            if j < nc {
+                let rem = nc - j;
+                for k in 0..kc {
+                    for c in 0..rem {
+                        expected[p + k * nr + c] = b[k * ldb + j + c];
+                    }
+                }
+            }
+            
+            let mut packed = vec![0.0f32; expected.len()];
+            unsafe {
+                gllm_pack_b_f32(b.as_ptr(), ldb, packed.as_mut_ptr(), kc, nc, nr);
+            }
+            
+            for idx in 0..expected.len() {
+                let diff = (packed[idx] - expected[idx]).abs();
+                assert!(
+                    diff < 1e-6,
+                    "pack_b mismatch at idx={} for kc={} nc={}: got={}, expected={}, diff={}",
+                    idx, kc, nc, packed[idx], expected[idx], diff,
+                );
+            }
+            eprintln!("pack_b kc={} nc={}: OK", kc, nc);
+        }
     }
 }

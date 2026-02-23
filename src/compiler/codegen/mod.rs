@@ -1,17 +1,19 @@
-//! Code generation — JIT compiler backend.
+//! Code generation — Phase 3 of the JIT compiler pipeline.
 //!
-//! This module hosts the JIT compilation system. The architecture per SPEC §8:
+//! This module hosts the JIT compilation backends. The full pipeline per SPEC §8:
 //!
-//!   CompilerGraph → Phase 1 (DAG construction)
-//!                 → Phase 2 (fusion decisions)
-//!                 → Phase 3 (MachineCodeEmitter via iced-x86 / dynasm-rs)
-//!                 → CompiledLayer
+//!   Phase 0 (ScalarOpRegistry + OpTrace via SymbolicExecutor)
+//!   → Phase 1 (SemanticDAG: OpClass auto-derivation)
+//!   → Phase 2 (Fusion + HW constraints + Parallel strategy + Buffer alloc)
+//!   → Phase 3 (this module: native code generation via iced-x86 / dynasm-rs)
+//!   → CompiledLayer
 //!
-//! Phase 3 should programmatically generate new machine code for each fused
-//! kernel — complete GEMM microkernels with epilogue injection, fused
-//! elementwise loops, and tile-level fusion. NOT trampoline calls.
+//! Phase 3 programmatically generates new machine code for each fused kernel —
+//! complete GEMM microkernels with epilogue injection, fused elementwise loops,
+//! and tile-level fusion. NOT trampoline calls.
 //!
-//! TODO: Implement `PlatformBackend` and `MachineCodeEmitter` traits per SPEC §8.6.
+//! Current status: x86_64 MVP implemented under `jit-x86` feature flag
+//! (`x86_64::jit::X86CodeGen`). aarch64 backend is stub.
 
 pub mod x86_64;
 pub mod aarch64;

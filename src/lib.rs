@@ -38,6 +38,7 @@ pub mod profiling;
 pub mod autotuning;
 pub mod dispatch;
 pub mod inference;
+pub mod scalar_ops;
 pub mod compiler;
 pub mod ffi;
 

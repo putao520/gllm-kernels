@@ -13,8 +13,11 @@
 //! - QKV shared input: three GEMMs reading the same normed input → single pack_a
 //! - RmsNorm → GEMM: norm output feeds GEMM input without memory writeback
 
+use std::collections::{HashMap, HashSet};
 use crate::compiler::graph::{CompilerGraph, CompilerOp, OpKind, OpId, TensorId};
 use crate::compiler::semantics::{self, OpSemantics};
+use crate::compiler::semantic_dag::{SemanticDAG, OpClass};
+use crate::compiler::registry::ScalarOpRegistry;
 
 /// A group of fused operations that will be compiled as a single unit.
 #[derive(Debug, Clone)]
@@ -244,12 +247,12 @@ fn detect_qkv_shared_input(graph: &CompilerGraph, topo: &[OpId]) -> Vec<FusionGr
     let gemm_ops: Vec<&CompilerOp> = topo
         .iter()
         .filter_map(|&id| graph.op(id))
-        .filter(|op| matches!(op.kind, OpKind::Gemm { .. } | OpKind::GemmBias { .. }))
+        .filter(|op| matches!(op.kind, OpKind::Gemm { .. } | OpKind::GemmBias { .. } | OpKind::QuantGemm { .. }))
         .collect();
 
-    // Group by first input tensor
-    let mut by_input: std::collections::HashMap<TensorId, Vec<&CompilerOp>> =
-        std::collections::HashMap::new();
+    // Group by first input tensor (BTreeMap for deterministic iteration order)
+    let mut by_input: std::collections::BTreeMap<TensorId, Vec<&CompilerOp>> =
+        std::collections::BTreeMap::new();
     for op in &gemm_ops {
         if let Some(&first_input) = op.inputs.first() {
             by_input.entry(first_input).or_default().push(op);
@@ -346,14 +349,20 @@ fn collect_epilogue<'a>(
             None => break,
         };
 
-        // Consumer must be elementwise and fusable
-        if !semantics::can_fuse(&anchor.kind, &consumer.kind)
-            && !matches!(semantics::classify(&consumer.kind), OpSemantics::Elementwise)
-        {
+        // Consumer must be elementwise to be fusable as epilogue
+        if semantics::classify(&consumer.kind) != OpSemantics::Elementwise {
             break;
         }
 
-        if semantics::classify(&consumer.kind) != OpSemantics::Elementwise {
+        // Verify all consumer inputs come from the fusion chain or are graph inputs
+        let chain_tids: std::collections::HashSet<TensorId> =
+            std::iter::once(anchor.outputs[0])
+            .chain(epilogue.iter().flat_map(|op: &&CompilerOp| op.outputs.iter().copied()))
+            .collect();
+        let all_inputs_available = consumer.inputs.iter().all(|tid| {
+            chain_tids.contains(tid) || graph.tensor(*tid).map_or(false, |t| t.producer.is_none())
+        });
+        if !all_inputs_available {
             break;
         }
 
@@ -398,6 +407,297 @@ fn collect_elementwise_chain<'a>(
         };
 
         if semantics::classify(&consumer.kind) != OpSemantics::Elementwise {
+            break;
+        }
+
+        chain.push(consumer);
+        current_outputs = consumer.outputs.clone();
+    }
+
+    chain
+}
+
+// ── DAG-based fusion (Phase 1 path) ─────────────────────────────────
+
+/// Fusion pass based on SemanticDAG (Phase 1 path).
+///
+/// Uses OpTrace-derived `OpClass` instead of hand-maintained `OpSemantics`.
+/// This is the new preferred entry point; `fuse()` is kept for backward compat.
+pub fn fuse_with_dag(graph: &CompilerGraph, registry: &ScalarOpRegistry) -> FusionPlan {
+    let dag = SemanticDAG::from_graph(graph, registry);
+    let topo = graph.topological_sort();
+    let mut groups: Vec<FusionGroup> = Vec::new();
+    let mut op_to_group: HashMap<OpId, usize> = HashMap::new();
+    let mut claimed: HashSet<OpId> = HashSet::new();
+
+    // First pass: QKV shared input detection (reuse existing logic)
+    let qkv_groups = detect_qkv_shared_input(graph, &topo);
+    for qkv in &qkv_groups {
+        let gid = groups.len();
+        for &op_id in &qkv.ops {
+            op_to_group.insert(op_id, gid);
+            claimed.insert(op_id);
+        }
+        groups.push(qkv.clone());
+    }
+
+    // Second pass: walk topo order using OpClass from SemanticDAG
+    for &op_id in &topo {
+        if claimed.contains(&op_id) {
+            continue;
+        }
+
+        let op = match graph.op(op_id) {
+            Some(o) => o,
+            None => continue,
+        };
+
+        let node = dag.node(op_id);
+        let op_class = node.map(|n| n.op_class).unwrap_or(OpClass::Opaque);
+
+        match op_class {
+            OpClass::Gemm => {
+                // Check norm prefix
+                let norm_prefix = detect_norm_into_gemm_dag(graph, op, &dag);
+                // Collect epilogue using OpClass
+                let epilogue = collect_epilogue_dag(graph, op, &claimed, &dag);
+
+                if norm_prefix.is_some() || !epilogue.is_empty() {
+                    let gid = groups.len();
+                    let mut all_ops = Vec::new();
+                    let pattern = if norm_prefix.is_some() && !epilogue.is_empty() {
+                        FusionPattern::GemmEpilogue
+                    } else if norm_prefix.is_some() {
+                        FusionPattern::NormIntoGemm
+                    } else {
+                        FusionPattern::GemmEpilogue
+                    };
+
+                    if let Some(norm_id) = norm_prefix {
+                        if !claimed.contains(&norm_id) {
+                            all_ops.push(norm_id);
+                            op_to_group.insert(norm_id, gid);
+                            claimed.insert(norm_id);
+                        }
+                    }
+
+                    all_ops.push(op_id);
+                    op_to_group.insert(op_id, gid);
+                    claimed.insert(op_id);
+
+                    let epilogue_ids: Vec<OpId> = epilogue.iter().map(|o| o.id).collect();
+                    for &eid in &epilogue_ids {
+                        all_ops.push(eid);
+                        op_to_group.insert(eid, gid);
+                        claimed.insert(eid);
+                    }
+
+                    groups.push(FusionGroup {
+                        id: gid,
+                        anchor: op_id,
+                        epilogue: epilogue_ids,
+                        pattern,
+                        ops: all_ops,
+                    });
+                } else {
+                    // Standalone GEMM
+                    let gid = groups.len();
+                    op_to_group.insert(op_id, gid);
+                    claimed.insert(op_id);
+                    groups.push(FusionGroup {
+                        id: gid,
+                        anchor: op_id,
+                        epilogue: Vec::new(),
+                        pattern: FusionPattern::Standalone,
+                        ops: vec![op_id],
+                    });
+                }
+            }
+            OpClass::ElemWise | OpClass::Injective => {
+                // Try to chain with downstream elementwise/injective ops
+                let chain = collect_elementwise_chain_dag(graph, op, &claimed, &dag);
+                let gid = groups.len();
+                let mut all_ops = vec![op_id];
+                let chain_ids: Vec<OpId> = chain.iter().map(|o| o.id).collect();
+                all_ops.extend_from_slice(&chain_ids);
+
+                let pattern = if chain_ids.is_empty() {
+                    FusionPattern::Standalone
+                } else {
+                    FusionPattern::ElementwiseChain
+                };
+
+                for &oid in &all_ops {
+                    op_to_group.insert(oid, gid);
+                    claimed.insert(oid);
+                }
+
+                groups.push(FusionGroup {
+                    id: gid,
+                    anchor: op_id,
+                    epilogue: chain_ids,
+                    pattern,
+                    ops: all_ops,
+                });
+            }
+            OpClass::Reduction | OpClass::Opaque => {
+                let gid = groups.len();
+                op_to_group.insert(op_id, gid);
+                claimed.insert(op_id);
+                groups.push(FusionGroup {
+                    id: gid,
+                    anchor: op_id,
+                    epilogue: Vec::new(),
+                    pattern: FusionPattern::Standalone,
+                    ops: vec![op_id],
+                });
+            }
+        }
+    }
+
+    // Re-sort groups by execution order
+    groups.sort_by_key(|g| g.ops.iter().map(|o| o.0).min().unwrap_or(0));
+    let mut new_op_to_group = HashMap::new();
+    for (i, g) in groups.iter_mut().enumerate() {
+        g.id = i;
+        for &oid in &g.ops {
+            new_op_to_group.insert(oid, i);
+        }
+    }
+
+    FusionPlan {
+        groups,
+        op_to_group: new_op_to_group,
+    }
+}
+
+/// Check norm prefix using SemanticDAG OpClass.
+fn detect_norm_into_gemm_dag(
+    graph: &CompilerGraph,
+    gemm_op: &CompilerOp,
+    dag: &SemanticDAG,
+) -> Option<OpId> {
+    let input_tid = gemm_op.inputs.first()?;
+    let tensor = graph.tensor(*input_tid)?;
+    let producer_id = tensor.producer?;
+
+    // Use OpClass from DAG instead of manual classify
+    let producer_node = dag.node(producer_id)?;
+    if producer_node.op_class != OpClass::Reduction {
+        return None;
+    }
+
+    // OpClass::Reduction includes Softmax — only accept actual norm ops
+    let producer = graph.op(producer_id)?;
+    if !matches!(producer.kind, OpKind::RmsNorm { .. } | OpKind::LayerNorm { .. }) {
+        return None;
+    }
+
+    // Must be single consumer
+    if tensor.consumers.len() != 1 {
+        return None;
+    }
+
+    Some(producer_id)
+}
+
+/// Collect epilogue using DAG OpClass.
+fn collect_epilogue_dag<'a>(
+    graph: &'a CompilerGraph,
+    anchor: &CompilerOp,
+    claimed: &HashSet<OpId>,
+    dag: &SemanticDAG,
+) -> Vec<&'a CompilerOp> {
+    let mut epilogue = Vec::new();
+    let mut current_outputs = anchor.outputs.clone();
+
+    loop {
+        if current_outputs.len() != 1 {
+            break;
+        }
+        let out_tid = current_outputs[0];
+        let tensor = match graph.tensor(out_tid) {
+            Some(t) => t,
+            None => break,
+        };
+        if tensor.consumers.len() != 1 {
+            break;
+        }
+        let consumer_id = tensor.consumers[0];
+        if claimed.contains(&consumer_id) {
+            break;
+        }
+        let consumer = match graph.op(consumer_id) {
+            Some(o) => o,
+            None => break,
+        };
+
+        // Use OpClass from DAG
+        let consumer_class = dag
+            .node(consumer_id)
+            .map(|n| n.op_class)
+            .unwrap_or(OpClass::Opaque);
+
+        if !matches!(consumer_class, OpClass::ElemWise | OpClass::Injective) {
+            break;
+        }
+
+        // Verify all consumer inputs come from the fusion chain or are graph inputs
+        let chain_tids: HashSet<TensorId> =
+            std::iter::once(anchor.outputs[0])
+            .chain(epilogue.iter().flat_map(|op: &&CompilerOp| op.outputs.iter().copied()))
+            .collect();
+        let all_inputs_available = consumer.inputs.iter().all(|tid| {
+            chain_tids.contains(tid) || graph.tensor(*tid).map_or(false, |t| t.producer.is_none())
+        });
+        if !all_inputs_available {
+            break;
+        }
+
+        epilogue.push(consumer);
+        current_outputs = consumer.outputs.clone();
+    }
+
+    epilogue
+}
+
+/// Collect elementwise chain using DAG OpClass.
+fn collect_elementwise_chain_dag<'a>(
+    graph: &'a CompilerGraph,
+    start: &CompilerOp,
+    claimed: &HashSet<OpId>,
+    dag: &SemanticDAG,
+) -> Vec<&'a CompilerOp> {
+    let mut chain = Vec::new();
+    let mut current_outputs = start.outputs.clone();
+
+    loop {
+        if current_outputs.len() != 1 {
+            break;
+        }
+        let out_tid = current_outputs[0];
+        let tensor = match graph.tensor(out_tid) {
+            Some(t) => t,
+            None => break,
+        };
+        if tensor.consumers.len() != 1 {
+            break;
+        }
+        let consumer_id = tensor.consumers[0];
+        if claimed.contains(&consumer_id) {
+            break;
+        }
+        let consumer = match graph.op(consumer_id) {
+            Some(o) => o,
+            None => break,
+        };
+
+        let consumer_class = dag
+            .node(consumer_id)
+            .map(|n| n.op_class)
+            .unwrap_or(OpClass::Opaque);
+
+        if !matches!(consumer_class, OpClass::ElemWise | OpClass::Injective) {
             break;
         }
 
@@ -559,5 +859,313 @@ mod tests {
         for op in &graph.ops {
             assert!(plan.op_to_group.contains_key(&op.id));
         }
+    }
+
+    // ── DAG-based fusion tests ──────────────────────────────────────
+
+    #[test]
+    fn test_fuse_with_dag_decoder_layer() {
+        let config = ModelConfig::llama_7b();
+        let ir = LayerIR::from_model_config(&config, 1);
+        let profile = DeviceProfile::detect();
+        let graph = CompilerGraph::from_layer_ir(&ir, &profile);
+        let registry = crate::compiler::registry::ScalarOpRegistry::with_defaults();
+
+        let plan = fuse_with_dag(&graph, &registry);
+
+        eprintln!("DAG-based fusion:\n{plan}");
+
+        // Every op should be in exactly one group
+        for op in &graph.ops {
+            assert!(
+                plan.op_to_group.contains_key(&op.id),
+                "Op {} not in any group",
+                op.id.0
+            );
+        }
+
+        // Should have QKV shared input group
+        let has_qkv = plan
+            .groups
+            .iter()
+            .any(|g| g.pattern == FusionPattern::QkvSharedInput);
+        assert!(has_qkv, "Expected QKV shared input fusion");
+
+        // Should have fewer groups than ops
+        assert!(plan.num_groups() < graph.num_ops());
+    }
+
+    #[test]
+    fn test_fuse_with_dag_matches_old_fuse() {
+        // The new DAG-based fusion should produce similar results to the old path
+        let config = ModelConfig::llama_7b();
+        let ir = LayerIR::from_model_config(&config, 1);
+        let profile = DeviceProfile::detect();
+        let graph = CompilerGraph::from_layer_ir(&ir, &profile);
+        let registry = crate::compiler::registry::ScalarOpRegistry::with_defaults();
+
+        let old_plan = fuse(&graph);
+        let new_plan = fuse_with_dag(&graph, &registry);
+
+        // Same number of groups (or very close — Injective handling may differ slightly)
+        let diff = (old_plan.num_groups() as i32 - new_plan.num_groups() as i32).abs();
+        assert!(
+            diff <= 2,
+            "Old plan has {} groups, new plan has {} groups (diff={})",
+            old_plan.num_groups(),
+            new_plan.num_groups(),
+            diff
+        );
+
+        eprintln!(
+            "Old: {} groups, New: {} groups",
+            old_plan.num_groups(),
+            new_plan.num_groups()
+        );
+    }
+
+    #[test]
+    fn test_fuse_with_dag_gemm_epilogue() {
+        let mut g = CompilerGraph::new();
+        let dt = DType::F32;
+        let a = g.add_tensor("a", vec![1, 4096], dt);
+        let w = g.add_tensor("w", vec![4096, 4096], dt);
+        let gemm_out = g.add_tensor("gemm_out", vec![1, 4096], dt);
+        let silu_out = g.add_tensor("silu_out", vec![1, 4096], dt);
+
+        g.add_op(
+            OpKind::Gemm { m: 1, n: 4096, k: 4096 },
+            vec![a, w],
+            vec![gemm_out],
+            "gemm",
+        );
+        g.add_op(OpKind::Silu, vec![gemm_out], vec![silu_out], "silu");
+
+        let registry = crate::compiler::registry::ScalarOpRegistry::with_defaults();
+        let plan = fuse_with_dag(&g, &registry);
+
+        assert_eq!(plan.num_groups(), 1);
+        assert_eq!(plan.groups[0].pattern, FusionPattern::GemmEpilogue);
+    }
+
+    #[test]
+    fn test_fuse_with_dag_injective_chain() {
+        // RoPE (Injective) should be fusable in elementwise chains
+        let mut g = CompilerGraph::new();
+        let dt = DType::F32;
+        let a = g.add_tensor("a", vec![1, 128], dt);
+        let cos = g.add_tensor("cos", vec![64], dt);
+        let rope_out = g.add_tensor("rope_out", vec![1, 128], dt);
+        let silu_out = g.add_tensor("silu_out", vec![1, 128], dt);
+
+        g.add_op(
+            OpKind::RoPE { head_dim: 128, theta: 10000.0 },
+            vec![a, cos],
+            vec![rope_out],
+            "rope",
+        );
+        g.add_op(OpKind::Silu, vec![rope_out], vec![silu_out], "silu");
+
+        let registry = crate::compiler::registry::ScalarOpRegistry::with_defaults();
+        let plan = fuse_with_dag(&g, &registry);
+
+        // RoPE + Silu should fuse (both fusable in new path: Injective + ElemWise)
+        assert_eq!(plan.num_groups(), 1);
+        assert_eq!(plan.groups[0].pattern, FusionPattern::ElementwiseChain);
+    }
+
+    // ── QuantGemm fusion tests ──────────────────────────────────────
+
+    #[test]
+    fn test_fuse_quant_gemm_epilogue() {
+        // QuantGemm + SiLU should fuse as GemmEpilogue
+        let mut g = CompilerGraph::new();
+        let dt = DType::F32;
+        let a = g.add_tensor("a", vec![1, 4096], dt);
+        let w = g.add_tensor("w_q4", vec![4096, 4096], dt);
+        let gemm_out = g.add_tensor("gemm_out", vec![1, 4096], dt);
+        let silu_out = g.add_tensor("silu_out", vec![1, 4096], dt);
+
+        g.add_op(
+            OpKind::QuantGemm { m: 1, n: 4096, k: 4096, block_size: 32, bits: 4 },
+            vec![a, w],
+            vec![gemm_out],
+            "qgemm",
+        );
+        g.add_op(OpKind::Silu, vec![gemm_out], vec![silu_out], "silu");
+
+        let plan = fuse(&g);
+        assert_eq!(plan.num_groups(), 1);
+        assert_eq!(plan.groups[0].pattern, FusionPattern::GemmEpilogue);
+    }
+
+    #[test]
+    fn test_fuse_standalone_quant_gemm() {
+        let mut g = CompilerGraph::new();
+        let dt = DType::F32;
+        let a = g.add_tensor("a", vec![1, 4096], dt);
+        let w = g.add_tensor("w_q4", vec![4096, 4096], dt);
+        let out = g.add_tensor("out", vec![1, 4096], dt);
+
+        g.add_op(
+            OpKind::QuantGemm { m: 1, n: 4096, k: 4096, block_size: 32, bits: 4 },
+            vec![a, w],
+            vec![out],
+            "qgemm",
+        );
+
+        let plan = fuse(&g);
+        assert_eq!(plan.num_groups(), 1);
+        assert_eq!(plan.groups[0].pattern, FusionPattern::Standalone);
+    }
+
+    #[test]
+    fn test_fuse_dequantize_standalone() {
+        let mut g = CompilerGraph::new();
+        let dt = DType::F32;
+        let a = g.add_tensor("a_q4", vec![4096], dt);
+        let b = g.add_tensor("b_f32", vec![4096], dt);
+
+        g.add_op(
+            OpKind::Dequantize { num_elements: 4096, block_size: 32, bits: 4 },
+            vec![a],
+            vec![b],
+            "dequant",
+        );
+
+        let plan = fuse(&g);
+        assert_eq!(plan.num_groups(), 1);
+    }
+
+    // ── M5: Softmax must not be misidentified as norm prefix ────────
+
+    #[test]
+    fn test_softmax_not_norm_prefix_dag() {
+        // Softmax → GEMM: Softmax is Reduction but NOT a norm op.
+        // detect_norm_into_gemm_dag must reject it.
+        let mut g = CompilerGraph::new();
+        let dt = DType::F32;
+        let a = g.add_tensor("a", vec![1, 4096], dt);
+        let softmax_out = g.add_tensor("softmax_out", vec![1, 4096], dt);
+        let w = g.add_tensor("w", vec![4096, 4096], dt);
+        let gemm_out = g.add_tensor("gemm_out", vec![1, 4096], dt);
+
+        g.add_op(OpKind::Softmax, vec![a], vec![softmax_out], "softmax");
+        g.add_op(
+            OpKind::Gemm { m: 1, n: 4096, k: 4096 },
+            vec![softmax_out, w],
+            vec![gemm_out],
+            "gemm",
+        );
+
+        let registry = crate::compiler::registry::ScalarOpRegistry::with_defaults();
+        let plan = fuse_with_dag(&g, &registry);
+
+        // Softmax and GEMM must be in separate groups — no NormIntoGemm fusion
+        assert_eq!(plan.num_groups(), 2, "Softmax should not fuse as norm prefix");
+        for group in &plan.groups {
+            assert_ne!(
+                group.pattern,
+                FusionPattern::NormIntoGemm,
+                "Softmax must not produce NormIntoGemm pattern"
+            );
+        }
+    }
+
+    // ── M6: Multi-input consumer with external input must not fuse ──
+
+    #[test]
+    fn test_multi_input_consumer_not_fused_as_epilogue() {
+        // GEMM → SwiGlu(gemm_out, other_out): SwiGlu has two inputs.
+        // If only gemm_out comes from the GEMM chain and other_out is from
+        // a different op, SwiGlu must NOT be fused as epilogue.
+        let dt = DType::F32;
+        let mut g = CompilerGraph::new();
+        let a = g.add_tensor("a", vec![1, 4096], dt);
+        let w = g.add_tensor("w", vec![4096, 4096], dt);
+        let gemm_out = g.add_tensor("gemm_out", vec![1, 4096], dt);
+        let other_out = g.add_tensor("other_out", vec![1, 4096], dt);
+        let swiglu_out = g.add_tensor("swiglu_out", vec![1, 4096], dt);
+
+        // Another GEMM produces other_out (not in the fusion chain of the first GEMM)
+        g.add_op(
+            OpKind::Gemm { m: 1, n: 4096, k: 4096 },
+            vec![a, w],
+            vec![other_out],
+            "gemm_other",
+        );
+        g.add_op(
+            OpKind::Gemm { m: 1, n: 4096, k: 4096 },
+            vec![a, w],
+            vec![gemm_out],
+            "gemm_main",
+        );
+        // SwiGlu takes gemm_out (from main chain) + other_out (from different op)
+        g.add_op(
+            OpKind::SwiGlu,
+            vec![gemm_out, other_out],
+            vec![swiglu_out],
+            "swiglu",
+        );
+
+        let plan = fuse(&g);
+        // SwiGlu must NOT be fused into gemm_main's epilogue
+        let gemm_main_group = plan.groups.iter().find(|grp| {
+            grp.ops.iter().any(|&oid| {
+                g.op(oid).map_or(false, |o| o.label == "gemm_main")
+            })
+        }).expect("gemm_main should have a group");
+        assert!(
+            !gemm_main_group.ops.iter().any(|&oid| {
+                g.op(oid).map_or(false, |o| o.label == "swiglu")
+            }),
+            "SwiGlu with external input must not be fused into GEMM epilogue"
+        );
+    }
+
+    #[test]
+    fn test_multi_input_consumer_not_fused_dag() {
+        // Same test but for the DAG-based path
+        let dt = DType::F32;
+        let mut g = CompilerGraph::new();
+        let a = g.add_tensor("a", vec![1, 4096], dt);
+        let w = g.add_tensor("w", vec![4096, 4096], dt);
+        let gemm_out = g.add_tensor("gemm_out", vec![1, 4096], dt);
+        let other_out = g.add_tensor("other_out", vec![1, 4096], dt);
+        let swiglu_out = g.add_tensor("swiglu_out", vec![1, 4096], dt);
+
+        g.add_op(
+            OpKind::Gemm { m: 1, n: 4096, k: 4096 },
+            vec![a, w],
+            vec![other_out],
+            "gemm_other",
+        );
+        g.add_op(
+            OpKind::Gemm { m: 1, n: 4096, k: 4096 },
+            vec![a, w],
+            vec![gemm_out],
+            "gemm_main",
+        );
+        g.add_op(
+            OpKind::SwiGlu,
+            vec![gemm_out, other_out],
+            vec![swiglu_out],
+            "swiglu",
+        );
+
+        let registry = crate::compiler::registry::ScalarOpRegistry::with_defaults();
+        let plan = fuse_with_dag(&g, &registry);
+
+        let gemm_main_group = plan.groups.iter().find(|grp| {
+            grp.ops.iter().any(|&oid| {
+                g.op(oid).map_or(false, |o| o.label == "gemm_main")
+            })
+        }).expect("gemm_main should have a group");
+        assert!(
+            !gemm_main_group.ops.iter().any(|&oid| {
+                g.op(oid).map_or(false, |o| o.label == "swiglu")
+            }),
+            "SwiGlu with external input must not be fused into GEMM epilogue (DAG path)"
+        );
     }
 }

@@ -329,7 +329,6 @@ pub fn config_hash(ir_bytes: &[u8], hw_fingerprint: &str) -> u64 {
 // ── Incremental compilation result ──────────────────────────────────
 
 /// Statistics from an incremental model compilation.
-/// Statistics from an incremental model compilation.
 pub struct IncrementalCompileResult {
     /// Compiled layers (one per model layer).
     pub layers: Vec<CompiledLayer>,
@@ -339,6 +338,157 @@ pub struct IncrementalCompileResult {
     pub disk_hits: usize,
     /// Number of layers that required fresh compilation.
     pub compiled: usize,
+}
+
+// ── OpTrace persistence ─────────────────────────────────────────────
+
+use crate::compiler::trace::TraceOp;
+
+/// Compact binary representation of a TraceOp.
+/// Internal to cache — not exposed publicly.
+#[derive(Debug, Clone)]
+struct SerializedTraceOp {
+    tag: u8,
+    operands: [u32; 3],
+    float_val: f64,
+}
+
+impl SerializedTraceOp {
+    fn from_trace_op(op: &TraceOp) -> Self {
+        match op {
+            TraceOp::Input(n) => Self { tag: 0, operands: [*n, 0, 0], float_val: 0.0 },
+            TraceOp::Const(v) => Self { tag: 1, operands: [0, 0, 0], float_val: *v },
+            TraceOp::Add(a, b) => Self { tag: 2, operands: [*a, *b, 0], float_val: 0.0 },
+            TraceOp::Sub(a, b) => Self { tag: 3, operands: [*a, *b, 0], float_val: 0.0 },
+            TraceOp::Mul(a, b) => Self { tag: 4, operands: [*a, *b, 0], float_val: 0.0 },
+            TraceOp::Div(a, b) => Self { tag: 5, operands: [*a, *b, 0], float_val: 0.0 },
+            TraceOp::Fma(a, b, c) => Self { tag: 6, operands: [*a, *b, *c], float_val: 0.0 },
+            TraceOp::Neg(a) => Self { tag: 7, operands: [*a, 0, 0], float_val: 0.0 },
+            TraceOp::Abs(a) => Self { tag: 8, operands: [*a, 0, 0], float_val: 0.0 },
+            TraceOp::Exp(a) => Self { tag: 9, operands: [*a, 0, 0], float_val: 0.0 },
+            TraceOp::Sqrt(a) => Self { tag: 10, operands: [*a, 0, 0], float_val: 0.0 },
+            TraceOp::Rsqrt(a) => Self { tag: 11, operands: [*a, 0, 0], float_val: 0.0 },
+            TraceOp::Tanh(a) => Self { tag: 12, operands: [*a, 0, 0], float_val: 0.0 },
+            TraceOp::Recip(a) => Self { tag: 13, operands: [*a, 0, 0], float_val: 0.0 },
+            TraceOp::Max(a, b) => Self { tag: 14, operands: [*a, *b, 0], float_val: 0.0 },
+            TraceOp::Min(a, b) => Self { tag: 15, operands: [*a, *b, 0], float_val: 0.0 },
+        }
+    }
+
+    fn to_trace_op(&self) -> Option<TraceOp> {
+        match self.tag {
+            0 => Some(TraceOp::Input(self.operands[0])),
+            1 => Some(TraceOp::Const(self.float_val)),
+            2 => Some(TraceOp::Add(self.operands[0], self.operands[1])),
+            3 => Some(TraceOp::Sub(self.operands[0], self.operands[1])),
+            4 => Some(TraceOp::Mul(self.operands[0], self.operands[1])),
+            5 => Some(TraceOp::Div(self.operands[0], self.operands[1])),
+            6 => Some(TraceOp::Fma(self.operands[0], self.operands[1], self.operands[2])),
+            7 => Some(TraceOp::Neg(self.operands[0])),
+            8 => Some(TraceOp::Abs(self.operands[0])),
+            9 => Some(TraceOp::Exp(self.operands[0])),
+            10 => Some(TraceOp::Sqrt(self.operands[0])),
+            11 => Some(TraceOp::Rsqrt(self.operands[0])),
+            12 => Some(TraceOp::Tanh(self.operands[0])),
+            13 => Some(TraceOp::Recip(self.operands[0])),
+            14 => Some(TraceOp::Max(self.operands[0], self.operands[1])),
+            15 => Some(TraceOp::Min(self.operands[0], self.operands[1])),
+            _ => None,
+        }
+    }
+
+    /// Serialize to bytes (fixed 28 bytes per op).
+    fn to_bytes(&self) -> Vec<u8> {
+        let mut buf = Vec::with_capacity(28);
+        buf.push(self.tag);
+        for &op in &self.operands {
+            buf.extend_from_slice(&op.to_le_bytes());
+        }
+        buf.extend_from_slice(&self.float_val.to_le_bytes());
+        // Pad to 28 bytes
+        while buf.len() < 28 {
+            buf.push(0);
+        }
+        buf
+    }
+
+    fn from_bytes(data: &[u8]) -> Option<Self> {
+        if data.len() < 21 { return None; }
+        let tag = data[0];
+        let o0 = u32::from_le_bytes(data[1..5].try_into().ok()?);
+        let o1 = u32::from_le_bytes(data[5..9].try_into().ok()?);
+        let o2 = u32::from_le_bytes(data[9..13].try_into().ok()?);
+        let fv = f64::from_le_bytes(data[13..21].try_into().ok()?);
+        Some(Self { tag, operands: [o0, o1, o2], float_val: fv })
+    }
+}
+
+/// Serialize a `Vec<TraceOp>` to bytes (no serde dependency).
+pub fn serialize_trace_ops(ops: &[TraceOp]) -> Vec<u8> {
+    let mut buf = Vec::new();
+    // Header: number of ops (u32)
+    buf.extend_from_slice(&(ops.len() as u32).to_le_bytes());
+    for op in ops {
+        let sop = SerializedTraceOp::from_trace_op(op);
+        buf.extend_from_slice(&sop.to_bytes());
+    }
+    buf
+}
+
+/// Deserialize a `Vec<TraceOp>` from bytes.
+pub fn deserialize_trace_ops(data: &[u8]) -> Option<Vec<TraceOp>> {
+    if data.len() < 4 { return None; }
+    let count = u32::from_le_bytes(data[0..4].try_into().ok()?) as usize;
+    let mut ops = Vec::with_capacity(count);
+    let mut offset = 4;
+    for _ in 0..count {
+        if offset + 28 > data.len() { return None; }
+        let sop = SerializedTraceOp::from_bytes(&data[offset..offset + 28])?;
+        ops.push(sop.to_trace_op()?);
+        offset += 28;
+    }
+    Some(ops)
+}
+
+/// Compute a hash that includes OpTrace content.
+/// This ensures cache invalidation when the scalar op implementation changes.
+pub fn trace_aware_hash(ir_bytes: &[u8], hw_fingerprint: &str, trace_ops: &[TraceOp]) -> u64 {
+    let mut h = config_hash(ir_bytes, hw_fingerprint);
+    // Mix in trace ops
+    let trace_bytes = serialize_trace_ops(trace_ops);
+    for &b in &trace_bytes {
+        h ^= b as u64;
+        h = h.wrapping_mul(0x100000001b3);
+    }
+    h
+}
+
+// ── Cache statistics ────────────────────────────────────────────────
+
+/// Cache statistics snapshot.
+#[derive(Debug, Clone, Default)]
+pub struct CacheStats {
+    pub memory_hits: u64,
+    pub disk_hits: u64,
+    pub misses: u64,
+    pub total_code_bytes: usize,
+    pub num_entries: usize,
+}
+
+impl CompilationCache {
+    /// Get cache statistics.
+    pub fn stats(&self) -> CacheStats {
+        let total_code_bytes: usize = self.entries.values()
+            .map(|e| e.code_bytes.len())
+            .sum();
+        CacheStats {
+            memory_hits: 0,
+            disk_hits: 0,
+            misses: 0,
+            total_code_bytes,
+            num_entries: self.entries.len(),
+        }
+    }
 }
 
 #[cfg(test)]
@@ -580,5 +730,119 @@ mod tests {
         }
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // ── OpTrace persistence tests ───────────────────────────────────
+
+    #[test]
+    fn test_serialize_trace_ops_roundtrip() {
+        use crate::compiler::trace::TraceOp;
+
+        let ops = vec![
+            TraceOp::Input(0),
+            TraceOp::Neg(0),
+            TraceOp::Exp(1),
+            TraceOp::Const(1.0),
+            TraceOp::Add(2, 3),
+            TraceOp::Div(0, 4),
+            TraceOp::Fma(0, 1, 2),
+            TraceOp::Max(3, 4),
+            TraceOp::Min(0, 5),
+            TraceOp::Rsqrt(2),
+            TraceOp::Tanh(1),
+            TraceOp::Recip(0),
+            TraceOp::Abs(3),
+            TraceOp::Sqrt(2),
+            TraceOp::Sub(0, 1),
+            TraceOp::Mul(2, 3),
+        ];
+
+        let bytes = serialize_trace_ops(&ops);
+        let decoded = deserialize_trace_ops(&bytes).unwrap();
+
+        assert_eq!(ops.len(), decoded.len());
+        for (orig, dec) in ops.iter().zip(decoded.iter()) {
+            assert_eq!(orig, dec, "mismatch: {orig:?} vs {dec:?}");
+        }
+    }
+
+    #[test]
+    fn test_serialize_empty() {
+        let bytes = serialize_trace_ops(&[]);
+        let decoded = deserialize_trace_ops(&bytes).unwrap();
+        assert!(decoded.is_empty());
+    }
+
+    #[test]
+    fn test_trace_aware_hash_differs() {
+        use crate::compiler::trace::TraceOp;
+
+        let ops1 = vec![TraceOp::Input(0), TraceOp::Neg(0)];
+        let ops2 = vec![TraceOp::Input(0), TraceOp::Exp(0)];
+
+        let h1 = trace_aware_hash(b"test", "hw", &ops1);
+        let h2 = trace_aware_hash(b"test", "hw", &ops2);
+
+        assert_ne!(h1, h2, "Different traces should produce different hashes");
+    }
+
+    #[test]
+    fn test_trace_aware_hash_deterministic() {
+        use crate::compiler::trace::TraceOp;
+
+        let ops = vec![TraceOp::Input(0), TraceOp::Const(3.14), TraceOp::Mul(0, 1)];
+
+        let h1 = trace_aware_hash(b"ir", "hw_fp", &ops);
+        let h2 = trace_aware_hash(b"ir", "hw_fp", &ops);
+
+        assert_eq!(h1, h2);
+    }
+
+    #[test]
+    fn test_cache_stats() {
+        let mut cache = CompilationCache::new();
+        let stats = cache.stats();
+        assert_eq!(stats.num_entries, 0);
+        assert_eq!(stats.total_code_bytes, 0);
+
+        cache.put(0x1111, &[0xC3; 100], 4096);
+        cache.put(0x2222, &[0xC3; 200], 8192);
+
+        let stats = cache.stats();
+        assert_eq!(stats.num_entries, 2);
+        assert_eq!(stats.total_code_bytes, 300);
+    }
+
+    #[test]
+    fn test_serialized_trace_op_all_variants() {
+        use crate::compiler::trace::TraceOp;
+
+        let all_ops = vec![
+            TraceOp::Input(42),
+            TraceOp::Const(std::f64::consts::PI),
+            TraceOp::Add(0, 1),
+            TraceOp::Sub(2, 3),
+            TraceOp::Mul(4, 5),
+            TraceOp::Div(6, 7),
+            TraceOp::Fma(0, 1, 2),
+            TraceOp::Neg(3),
+            TraceOp::Abs(4),
+            TraceOp::Exp(5),
+            TraceOp::Sqrt(6),
+            TraceOp::Rsqrt(7),
+            TraceOp::Tanh(8),
+            TraceOp::Recip(9),
+            TraceOp::Max(0, 1),
+            TraceOp::Min(2, 3),
+        ];
+
+        // Each op should roundtrip correctly
+        for op in &all_ops {
+            let sop = SerializedTraceOp::from_trace_op(op);
+            let bytes = sop.to_bytes();
+            let decoded_sop = SerializedTraceOp::from_bytes(&bytes).unwrap();
+            let decoded_op = decoded_sop.to_trace_op().unwrap();
+            assert_eq!(op, &decoded_op, "roundtrip failed for {op:?}");
+        }
     }
 }

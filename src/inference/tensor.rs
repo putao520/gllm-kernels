@@ -22,6 +22,9 @@ pub struct DeviceTensor {
     dtype: DType,
     device: DeviceKind,
     owned: bool,
+    /// True when created from `from_slice` (immutable source).
+    /// Mutable access (`as_mut_ptr`, `as_mut_slice`) will panic.
+    immutable: bool,
 }
 
 unsafe impl Send for DeviceTensor {}
@@ -39,6 +42,7 @@ impl DeviceTensor {
                 dtype,
                 device: DeviceKind::Cpu,
                 owned: false,
+                immutable: false,
             });
         }
         let layout = std::alloc::Layout::from_size_align(len_bytes, 64)
@@ -57,6 +61,7 @@ impl DeviceTensor {
             dtype,
             device: DeviceKind::Cpu,
             owned: true,
+            immutable: false,
         })
     }
 
@@ -72,6 +77,7 @@ impl DeviceTensor {
             dtype: dtype_from_elem_id(E::ELEM_ID),
             device: DeviceKind::Cpu,
             owned: false,
+            immutable: true,
         }
     }
 
@@ -87,13 +93,17 @@ impl DeviceTensor {
             dtype: dtype_from_elem_id(E::ELEM_ID),
             device: DeviceKind::Cpu,
             owned: false,
+            immutable: false,
         }
     }
 
     #[inline]
     pub fn as_ptr(&self) -> *const u8 { self.ptr }
     #[inline]
-    pub fn as_mut_ptr(&mut self) -> *mut u8 { self.ptr }
+    pub fn as_mut_ptr(&mut self) -> *mut u8 {
+        assert!(!self.immutable, "cannot mutate immutable tensor created from from_slice");
+        self.ptr
+    }
 
     /// View as a typed slice (CPU only).
     ///
@@ -111,6 +121,7 @@ impl DeviceTensor {
     /// Caller must ensure the dtype matches E and the tensor is on CPU.
     #[inline]
     pub unsafe fn as_mut_slice<E: Element>(&mut self) -> &mut [E] {
+        assert!(!self.immutable, "cannot mutate immutable tensor created from from_slice");
         debug_assert_eq!(self.device, DeviceKind::Cpu);
         std::slice::from_raw_parts_mut(self.ptr as *mut E, self.num_elements)
     }
@@ -176,5 +187,32 @@ mod tests {
         let t = DeviceTensor::alloc_cpu(0, DType::F32).unwrap();
         assert_eq!(t.num_elements(), 0);
         assert_eq!(t.len_bytes(), 0);
+    }
+
+    #[test]
+    #[should_panic(expected = "cannot mutate immutable tensor created from from_slice")]
+    fn test_immutable_tensor_as_mut_ptr_panics() {
+        let data = vec![1.0f32, 2.0, 3.0];
+        let mut t = unsafe { DeviceTensor::from_slice(&data) };
+        let _ = t.as_mut_ptr();
+    }
+
+    #[test]
+    #[should_panic(expected = "cannot mutate immutable tensor created from from_slice")]
+    fn test_immutable_tensor_as_mut_slice_panics() {
+        let data = vec![1.0f32, 2.0, 3.0];
+        let mut t = unsafe { DeviceTensor::from_slice(&data) };
+        let _ = unsafe { t.as_mut_slice::<f32>() };
+    }
+
+    #[test]
+    fn test_mutable_tensor_from_mut_slice() {
+        let mut data = vec![1.0f32, 2.0, 3.0];
+        let mut t = unsafe { DeviceTensor::from_mut_slice(&mut data) };
+        // Should not panic — created from mutable source
+        let _ = t.as_mut_ptr();
+        let s: &mut [f32] = unsafe { t.as_mut_slice() };
+        s[0] = 42.0;
+        assert_eq!(s[0], 42.0);
     }
 }

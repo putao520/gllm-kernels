@@ -7,11 +7,18 @@
 //! # Pipeline
 //!
 //! ```text
-//! CompilerGraph → OpSemantics (validate) → Phase 1 (DAG) → Phase 2 (Fusion) → Phase 3 (Emit) → CompiledLayer
+//! LayerIR → CompilerGraph → Phase 0 (ScalarOpRegistry + OpTrace via SymbolicExecutor)
+//!         → Phase 1 (SemanticDAG: OpClass auto-derivation from OpTrace::ComputePattern)
+//!         → Phase 2 (Fusion: fuse_with_dag + HW constraints + Parallel strategy + Buffer alloc)
+//!         → Phase 3 (CodeGen: x86_64/aarch64 JIT via iced-x86/dynasm-rs)
+//!         → CompiledLayer (cached)
 //! ```
 //!
-//! The `graph` module builds a typed DAG of compiler ops, and `semantics`
-//! validates shapes and fusion legality before codegen.
+//! Phase 0 extracts `OpTrace` from `extern "C"` scalar functions via binary
+//! symbolic execution. Phase 1 builds a `SemanticDAG` with auto-derived
+//! `OpClass`. Phase 2 performs fusion decisions with HW constraint checks,
+//! parallel strategy selection, and interval-graph buffer allocation.
+//! Phase 3 generates native machine code from `TraceOp` sequences.
 
 pub mod ir;
 pub mod planner;
@@ -21,6 +28,13 @@ pub mod codegen;
 pub mod graph;
 pub mod semantics;
 pub mod fusion;
+pub mod trace;
+pub mod registry;
+pub mod semantic_dag;
+pub mod symexec;
+pub mod hw_constraints;
+pub mod parallel;
+pub mod buffer_alloc;
 
 pub use ir::{LayerIR, LayerArch};
 pub use planner::{ExecutionPlan, FusionDecision, GemmShape, MicrokernelChoice};
@@ -31,6 +45,12 @@ pub use graph::{CompilerGraph, CompilerOp, OpKind, TensorId, OpId};
 pub use semantics::OpSemantics;
 pub use fusion::{FusionPlan, FusionGroup, FusionPattern};
 pub use codegen::emitter::ScratchpadLayout;
+pub use trace::{OpTrace, ComputePattern, TraceOp, ScalarFnSignature, ScalarParam};
+pub use registry::{ScalarOpRegistry, OpKindKey};
+pub use semantic_dag::{SemanticDAG, SemanticNode, OpClass, Bottleneck, TensorEdge};
+pub use hw_constraints::{HwConstraintResult, HwConstraintChecker, ConstraintViolation};
+pub use parallel::{ParallelStrategy, ParallelDim};
+pub use buffer_alloc::{BufferAllocation, BufferSlot, Lifetime};
 
 use crate::dispatch::{DeviceProfile, device_profile};
 use crate::inference::types::{InferenceError, ModelConfig};
@@ -194,22 +214,70 @@ impl InferenceCompiler {
     }
 
     /// Full JIT compilation pipeline:
-    /// LayerIR → CompilerGraph → FusionPlan → Phase 3 codegen → CodegenOutput
+    /// LayerIR → CompilerGraph → Phase 0 (registry) → Phase 1 (SemanticDAG)
+    ///         → Phase 2 (fusion + HW + parallel + buffer) → Phase 3 (codegen)
+    ///         → CodegenOutput
     ///
-    /// TODO: Phase 3 currently emits a stub. The real implementation should
-    /// use `MachineCodeEmitter` to programmatically generate fused machine code
-    /// per SPEC §8.5.
+    /// Phase 3 has an MVP implementation under the `jit-x86` feature flag
+    /// (see `codegen::x86_64::jit::X86CodeGen`). Without the feature flag,
+    /// a stub is emitted as fallback.
     fn jit_compile(&self, ir: &LayerIR) -> Result<codegen::CodegenOutput, InferenceError> {
-        // Phase 1: Build DAG
+        // Phase 1: Build CompilerGraph DAG
         let graph = CompilerGraph::from_layer_ir(ir, &self.profile);
 
-        // Phase 2: Fusion decisions
-        let _fusion_plan = fusion::fuse(&graph);
+        // Phase 0 + 1: ScalarOpRegistry (OpTrace cache) + SemanticDAG (OpClass auto-derivation)
+        let registry = ScalarOpRegistry::with_defaults();
+        let _semantic_dag = SemanticDAG::from_graph(&graph, &registry);
 
-        // Phase 3: Code generation (currently stub)
-        let output = codegen::emitter::emit_stub_code(&graph);
+        // Phase 2: Fusion decisions + buffer allocation
+        let fusion_plan = fusion::fuse_with_dag(&graph, &registry);
+        let lifetimes = buffer_alloc::analyze_lifetimes(&graph, &fusion_plan);
+        let alloc = buffer_alloc::allocate_buffers(&lifetimes);
 
-        Ok(output)
+        // Phase 3: Code generation
+        #[cfg(feature = "jit-x86")]
+        {
+            let mut cg = codegen::x86_64::X86CodeGen::new(&self.profile);
+            return cg.emit_plan(&fusion_plan, &graph, &alloc, &self.profile, Some(&registry))
+                .map_err(|e| InferenceError::CompileError(e));
+        }
+
+        #[cfg(not(feature = "jit-x86"))]
+        {
+            let _ = (fusion_plan, alloc);
+            Ok(codegen::emitter::emit_stub_code(&graph))
+        }
+    }
+
+    /// Compile a CompilerGraph directly.
+    ///
+    /// This is the primary entry point for GLLM integration: GLLM expands
+    /// its high-level FusedGraph into an atomic-op DAG (`CompilerGraph`)
+    /// and passes it here for JIT compilation.
+    pub fn compile_graph(
+        &mut self,
+        graph: &CompilerGraph,
+    ) -> Result<CompiledLayer, InferenceError> {
+        let registry = ScalarOpRegistry::with_defaults();
+        let fusion_plan = fusion::fuse_with_dag(graph, &registry);
+        let lifetimes = buffer_alloc::analyze_lifetimes(graph, &fusion_plan);
+        let alloc = buffer_alloc::allocate_buffers(&lifetimes);
+
+        #[cfg(feature = "jit-x86")]
+        let output = {
+            let mut cg = codegen::x86_64::X86CodeGen::new(&self.profile);
+            cg.emit_plan(&fusion_plan, graph, &alloc, &self.profile, Some(&registry))
+                .map_err(|e| InferenceError::CompileError(e))?
+        };
+
+        #[cfg(not(feature = "jit-x86"))]
+        let output = {
+            let _ = (fusion_plan, alloc);
+            codegen::emitter::emit_stub_code(graph)
+        };
+
+        let hash = 0; // TODO: graph-level content hash
+        CompiledLayer::from_code(&output.code, output.scratchpad_bytes, hash)
     }
 }
 

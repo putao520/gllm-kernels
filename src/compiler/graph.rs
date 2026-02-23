@@ -16,7 +16,7 @@ use crate::traits::Activation;
 // ── Identifiers ────────────────────────────────────────────────────
 
 /// Unique tensor identifier within a CompilerGraph.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct TensorId(pub u32);
 
 /// Unique operation identifier within a CompilerGraph.
@@ -73,6 +73,27 @@ pub enum OpKind {
     Mul,
     /// Residual connection: out = x + residual
     Residual,
+
+    // ── Quantization ──
+    /// Quantized GEMM: dequantize weights on-the-fly during matmul.
+    QuantGemm {
+        m: usize,
+        n: usize,
+        k: usize,
+        /// Quantization block size (e.g., 32 for Q4_0)
+        block_size: usize,
+        /// Bits per weight element
+        bits: usize,
+    },
+    /// Standalone dequantization: convert quantized block to f32.
+    Dequantize {
+        /// Number of elements to dequantize
+        num_elements: usize,
+        /// Block size
+        block_size: usize,
+        /// Bits per element
+        bits: usize,
+    },
 
     // ── Layout ──
     Transpose { perm: Vec<usize> },
@@ -178,6 +199,11 @@ impl CompilerGraph {
     /// Get tensor metadata by ID.
     pub fn tensor(&self, id: TensorId) -> Option<&TensorMeta> {
         self.tensors.iter().find(|t| t.id == id)
+    }
+
+    /// Total number of elements in a tensor (product of shape dimensions).
+    pub fn tensor_numel(&self, id: TensorId) -> Option<usize> {
+        self.tensor(id).map(|t| t.shape.iter().product::<usize>().max(1))
     }
 
     /// Get mutable tensor metadata by ID.
@@ -366,8 +392,14 @@ impl CompilerGraph {
             "rope_k",
         );
 
-        // Attention: softmax(Q·K^T / √d) · V → [B, Q]
-        // Represented as a single opaque Softmax node for now.
+        // Attention: softmax(Q·K^T / √d) · V
+        //
+        // Simplified per-head modeling: `b` here represents seq_len (the
+        // token dimension), not the batch dimension. The GEMMs below model
+        // a single attention head's computation:
+        //   Q·K^T : [seq_len, head_dim] × [head_dim, seq_len] → [seq_len, seq_len]
+        //   A·V   : [seq_len, seq_len] × [seq_len, head_dim] → [seq_len, head_dim]
+        // Multi-head parallelism is implicit (num_heads independent heads).
         // Phase 2 fusion will expand this into FlashAttention tiling.
         let attn_scores = g.add_tensor("attn_scores", vec![b, ir.num_heads, b], dt);
         g.add_op(
@@ -440,17 +472,25 @@ impl CompilerGraph {
             "gemm_up",
         );
 
-        // SwiGLU / GeGLU fusion
+        // Gated activation fusion: activation(gate) * up
         let ffn_act = g.add_tensor("ffn_act", vec![b, inter], dt);
-        let act_kind = match ir.activation {
-            Activation::GeGlu => OpKind::GeGlu,
-            _ => OpKind::SwiGlu,
+        let (act_kind, act_label) = match ir.activation {
+            Activation::Silu => (OpKind::SwiGlu, "swiglu"),
+            Activation::Gelu => (OpKind::GeGlu, "geglu"),
+            Activation::GeGlu => (OpKind::GeGlu, "geglu"),
+            Activation::None | Activation::Relu => {
+                panic!(
+                    "Unsupported gated activation {:?} in FFN — \
+                     only Silu (SwiGLU), Gelu (GeGLU) are supported for gate*up fusion",
+                    ir.activation
+                );
+            }
         };
         g.add_op(
             act_kind,
             vec![gate_out, up_out],
             vec![ffn_act],
-            "swiglu",
+            act_label,
         );
 
         // Down GEMM: [B, Inter] × [Inter, H] → [B, H]

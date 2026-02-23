@@ -7,6 +7,7 @@
 //! compiled layer function. Otherwise it falls back to operator-by-operator
 //! execution through this module.
 
+use crate::compiler::InferenceCompiler;
 use crate::cpu_kernels::CpuKernels;
 use crate::dispatch::{DeviceProfile, device_profile};
 use crate::inference::types::{DType, InferenceError, ModelConfig};
@@ -17,33 +18,29 @@ use crate::inference::InferenceBackend;
 use crate::traits::Kernels;
 
 /// CPU inference backend with fallback operator composition.
+///
+/// When the JIT compiler is available, `decoder_forward` attempts to use
+/// compiled fused layers. Falls back to operator-by-operator execution
+/// through Layer 1 kernels when JIT is unavailable or compilation fails.
 pub struct CpuInferenceBackend {
     config: ModelConfig,
     profile: DeviceProfile,
     kernels: CpuKernels<f32>,
-    /// Pre-allocated scratchpad for intermediate results
-    scratchpad: Vec<f32>,
+    /// Optional JIT compiler for fused layer execution
+    compiler: Option<InferenceCompiler>,
 }
 
 impl InferenceBackend for CpuInferenceBackend {
     fn init(config: &ModelConfig) -> Result<Self, InferenceError> {
         let profile = device_profile().clone();
 
-        // Scratchpad: enough for the largest intermediate tensor in a single layer
-        // QKV projection output: batch=1, seq=1 → 3 * hidden_size
-        // FFN intermediate: 2 * intermediate_size (gate + up)
-        // Attention scores: num_heads * max_seq_len
-        let scratch_size = (3 * config.hidden_size)
-            .max(2 * config.intermediate_size)
-            .max(config.num_heads * config.max_seq_len)
-            * 4; // generous padding
-        let scratchpad = vec![0.0f32; scratch_size];
+        let compiler = Some(InferenceCompiler::with_profile(profile.clone()));
 
         Ok(CpuInferenceBackend {
             config: config.clone(),
             profile,
             kernels: CpuKernels::new(),
-            scratchpad,
+            compiler,
         })
     }
 
@@ -56,6 +53,12 @@ impl InferenceBackend for CpuInferenceBackend {
     }
 
     fn upload_f32(&self, src: &[f32], dst: &mut DeviceTensor) -> Result<(), InferenceError> {
+        if dst.dtype() != DType::F32 {
+            return Err(InferenceError::ShapeMismatch {
+                expected: "F32 tensor".to_string(),
+                got: format!("{:?} tensor", dst.dtype()),
+            });
+        }
         if dst.num_elements() < src.len() {
             return Err(InferenceError::ShapeMismatch {
                 expected: format!("{} elements", src.len()),
@@ -73,6 +76,12 @@ impl InferenceBackend for CpuInferenceBackend {
     }
 
     fn download_f32(&self, src: &DeviceTensor, dst: &mut [f32]) -> Result<(), InferenceError> {
+        if src.dtype() != DType::F32 {
+            return Err(InferenceError::ShapeMismatch {
+                expected: "F32 tensor".to_string(),
+                got: format!("{:?} tensor", src.dtype()),
+            });
+        }
         if dst.len() < src.num_elements() {
             return Err(InferenceError::ShapeMismatch {
                 expected: format!("{} elements", src.num_elements()),
@@ -285,6 +294,9 @@ impl InferenceBackend for CpuInferenceBackend {
             self.kernels.vec_add(&residual, &down, &mut hidden);
         }
 
+        // TODO: Apply weights.final_norm (RMSNorm) and weights.lm_head (linear projection)
+        // to produce logits. Currently outputs raw hidden state from the last decoder layer.
+
         // Copy to output
         unsafe {
             std::ptr::copy_nonoverlapping(
@@ -444,6 +456,11 @@ impl InferenceBackend for CpuInferenceBackend {
         Ok(())
     }
 
+    /// Sample token IDs from logits.
+    ///
+    /// Current implementation: greedy argmax only. When temperature > 0,
+    /// logits are temperature-scaled but selection is still argmax.
+    /// `top_k` and `top_p` parameters are accepted but not yet implemented.
     fn sample(
         &self,
         logits: &DeviceTensor,
@@ -643,7 +660,7 @@ mod tests {
 
         let cfg = tiny_qwen_config();
         let backend = CpuInferenceBackend::init(&cfg).unwrap();
-        let weights = ModelWeights::alloc_cpu(&cfg).unwrap();
+        let mut weights = ModelWeights::alloc_cpu(&cfg).unwrap();
 
         // Verify bias tensors were allocated
         for lw in &weights.layers {
@@ -656,18 +673,12 @@ mod tests {
 
         // Fill norm weights with 1.0 for stable RMSNorm
         let ones = vec![1.0f32; cfg.hidden_size];
-        for lw in &weights.layers {
+        for lw in weights.layers.iter_mut() {
             unsafe {
-                std::ptr::copy_nonoverlapping(
-                    ones.as_ptr() as *const u8,
-                    lw.attn_norm.as_ptr() as *mut u8,
-                    cfg.hidden_size * 4,
-                );
-                std::ptr::copy_nonoverlapping(
-                    ones.as_ptr() as *const u8,
-                    lw.ffn_norm.as_ptr() as *mut u8,
-                    cfg.hidden_size * 4,
-                );
+                let norm: &mut [f32] = lw.attn_norm.as_mut_slice();
+                norm.copy_from_slice(&ones);
+                let ffn: &mut [f32] = lw.ffn_norm.as_mut_slice();
+                ffn.copy_from_slice(&ones);
             }
         }
 
@@ -1186,25 +1197,25 @@ mod tests {
 
         // Fill weights into the model
         let backend = CpuInferenceBackend::init(&cfg).unwrap();
-        let weights = ModelWeights::alloc_cpu(&cfg).unwrap();
+        let mut weights = ModelWeights::alloc_cpu(&cfg).unwrap();
         unsafe {
-            let lw = &weights.layers[0];
-            let copy = |dst: &DeviceTensor, src: &[f32]| {
+            let lw = &mut weights.layers[0];
+            let copy = |dst: &mut DeviceTensor, src: &[f32]| {
                 std::ptr::copy_nonoverlapping(
                     src.as_ptr() as *const u8,
-                    dst.as_ptr() as *mut u8,
+                    dst.as_mut_ptr(),
                     src.len() * 4,
                 );
             };
-            copy(&lw.attn_norm, &norm_w);
-            copy(&lw.ffn_norm, &norm_w);
-            copy(&lw.wq, &wq_data);
-            copy(&lw.wk, &wk_data);
-            copy(&lw.wv, &wv_data);
-            copy(&lw.wo, &wo_data);
-            copy(&lw.w_gate, &wg_data);
-            copy(&lw.w_up, &wu_data);
-            copy(&lw.w_down, &wd_data);
+            copy(&mut lw.attn_norm, &norm_w);
+            copy(&mut lw.ffn_norm, &norm_w);
+            copy(&mut lw.wq, &wq_data);
+            copy(&mut lw.wk, &wk_data);
+            copy(&mut lw.wv, &wv_data);
+            copy(&mut lw.wo, &wo_data);
+            copy(&mut lw.w_gate, &wg_data);
+            copy(&mut lw.w_up, &wu_data);
+            copy(&mut lw.w_down, &wd_data);
         }
 
         // Input vector

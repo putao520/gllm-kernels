@@ -1,12 +1,17 @@
 //! Operation semantics — classifies ops for fusion and scheduling decisions.
 //!
+//! NOTE: This module is the legacy classification path. New code should use
+//! `semantic_dag::OpClass` which auto-derives from `OpTrace::ComputePattern`.
+//! The `fusion::fuse_with_dag()` function uses the new path.
+//! This module is retained for backward compatibility with `fusion::fuse()`.
+//!
 //! Each `OpKind` is classified by:
 //! - `OpSemantics`: elementwise / gemm / reduction / opaque
 //! - `BottleneckType`: compute-bound or memory-bound
 //! - Arithmetic intensity (FLOP/byte) for roofline analysis
 //!
-//! The fusion pass (Phase 2) uses these classifications to decide which
-//! adjacent ops can be fused without violating data dependencies.
+//! The legacy fusion pass (`fusion::fuse()`) uses these classifications to
+//! decide which adjacent ops can be fused without violating data dependencies.
 
 use crate::compiler::graph::OpKind;
 
@@ -47,7 +52,12 @@ pub fn classify(kind: &OpKind) -> OpSemantics {
         OpKind::SwiGlu | OpKind::GeGlu => OpSemantics::Elementwise,
 
         // GEMM variants
-        OpKind::Gemm { .. } | OpKind::GemmBias { .. } => OpSemantics::Gemm,
+        OpKind::Gemm { .. } | OpKind::GemmBias { .. } | OpKind::QuantGemm { .. } => {
+            OpSemantics::Gemm
+        }
+
+        // Dequantize: elementwise decode
+        OpKind::Dequantize { .. } => OpSemantics::Elementwise,
 
         // Reductions (need full input before output)
         OpKind::Softmax | OpKind::RmsNorm { .. } | OpKind::LayerNorm { .. } => {
@@ -79,6 +89,21 @@ pub fn bottleneck(kind: &OpKind) -> BottleneckType {
                 BottleneckType::MemoryBound
             }
         }
+        // Quantized GEMM: fewer bytes for weights
+        OpKind::QuantGemm { m, n, k, bits, .. } => {
+            let weight_bytes = (k * n * bits + 7) / 8;
+            let input_bytes = m * k * 4;
+            let output_bytes = m * n * 4;
+            let flops = 2 * m * n * k;
+            let total_bytes = weight_bytes + input_bytes + output_bytes;
+            if total_bytes > 0 && (flops / total_bytes) >= 4 {
+                BottleneckType::ComputeBound
+            } else {
+                BottleneckType::MemoryBound
+            }
+        }
+        // Dequantize: pure memory-bound
+        OpKind::Dequantize { .. } => BottleneckType::MemoryBound,
         // Everything else is memory-bound (bandwidth-limited)
         _ => BottleneckType::MemoryBound,
     }
@@ -93,6 +118,20 @@ pub fn arithmetic_intensity(kind: &OpKind) -> f64 {
         OpKind::Gemm { m, n, k } | OpKind::GemmBias { m, n, k } => {
             let flops = (2 * m * n * k) as f64;
             let bytes = (4 * (m * k + k * n + m * n)) as f64;
+            if bytes > 0.0 { flops / bytes } else { 0.0 }
+        }
+        OpKind::QuantGemm { m, n, k, bits, .. } => {
+            let flops = (2 * m * n * k) as f64;
+            let weight_bytes = ((k * n * bits + 7) / 8) as f64;
+            let io_bytes = ((m * k + m * n) * 4) as f64;
+            if (weight_bytes + io_bytes) > 0.0 { flops / (weight_bytes + io_bytes) } else { 0.0 }
+        }
+        OpKind::Dequantize { num_elements, bits, .. } => {
+            // ~2 FLOPs per element (scale + offset), input = bits/8 bytes, output = 4 bytes
+            let flops = (*num_elements * 2) as f64;
+            let input_bytes = *num_elements as f64 * (*bits as f64 / 8.0);
+            let output_bytes = *num_elements as f64 * 4.0;
+            let bytes = input_bytes + output_bytes;
             if bytes > 0.0 { flops / bytes } else { 0.0 }
         }
         // Elementwise: 1 FLOP per element, 8 bytes (read + write)
@@ -256,5 +295,53 @@ mod tests {
         assert!(fusable_as_gemm_epilogue(&OpKind::Silu));
         assert!(!fusable_as_gemm_epilogue(&OpKind::SwiGlu));
         assert!(!fusable_as_gemm_epilogue(&OpKind::Softmax));
+    }
+
+    // ── QuantGemm / Dequantize tests ──
+
+    #[test]
+    fn test_quant_gemm_classify() {
+        let kind = OpKind::QuantGemm { m: 1, n: 4096, k: 4096, block_size: 32, bits: 4 };
+        assert_eq!(classify(&kind), OpSemantics::Gemm);
+    }
+
+    #[test]
+    fn test_quant_gemm_bottleneck() {
+        let kind = OpKind::QuantGemm { m: 128, n: 4096, k: 4096, block_size: 32, bits: 4 };
+        assert_eq!(bottleneck(&kind), BottleneckType::ComputeBound);
+    }
+
+    #[test]
+    fn test_quant_gemm_arithmetic_intensity() {
+        let kind = OpKind::QuantGemm { m: 128, n: 4096, k: 4096, block_size: 32, bits: 4 };
+        let ai = arithmetic_intensity(&kind);
+        // Q4 weights are 4x smaller → higher AI than F32 GEMM
+        assert!(ai > 20.0, "Q4 GEMM AI={ai}, expected >20");
+    }
+
+    #[test]
+    fn test_dequantize_classify() {
+        let kind = OpKind::Dequantize { num_elements: 4096, block_size: 32, bits: 4 };
+        assert_eq!(classify(&kind), OpSemantics::Elementwise);
+    }
+
+    #[test]
+    fn test_dequantize_bottleneck() {
+        let kind = OpKind::Dequantize { num_elements: 4096, block_size: 32, bits: 4 };
+        assert_eq!(bottleneck(&kind), BottleneckType::MemoryBound);
+    }
+
+    #[test]
+    fn test_can_fuse_quant_gemm_silu() {
+        let qgemm = OpKind::QuantGemm { m: 1, n: 4096, k: 4096, block_size: 32, bits: 4 };
+        assert!(can_fuse(&qgemm, &OpKind::Silu));
+        assert!(can_fuse(&qgemm, &OpKind::Add));
+    }
+
+    #[test]
+    fn test_cannot_fuse_quant_gemm_gemm() {
+        let qg = OpKind::QuantGemm { m: 1, n: 4096, k: 4096, block_size: 32, bits: 4 };
+        let g = OpKind::Gemm { m: 1, n: 4096, k: 4096 };
+        assert!(!can_fuse(&qg, &g));
     }
 }

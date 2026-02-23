@@ -5,7 +5,7 @@
 
 pub mod device_profile;
 
-pub use device_profile::{DeviceProfile, IsaLevel};
+pub use device_profile::{DeviceProfile, GemmBlocking, IsaLevel};
 
 use std::sync::OnceLock;
 

@@ -72,6 +72,31 @@ impl CompiledLayer {
     pub fn code_size(&self) -> usize {
         self.code.len
     }
+
+    /// Execute the compiled layer.
+    ///
+    /// # Safety
+    /// The caller must ensure all pointers are valid and the buffer sizes
+    /// match the compiled graph's expected layout.
+    #[inline]
+    pub unsafe fn execute(
+        &self,
+        input: *const u8,
+        weights: *const u8,
+        kv_cache: *mut u8,
+        positions: *const u32,
+        seq_lens: *const usize,
+        batch_size: usize,
+        seq_len: usize,
+        output: *mut u8,
+        scratchpad: *mut u8,
+    ) {
+        let f = self.entry_point();
+        f(
+            input, weights, kv_cache, positions, seq_lens,
+            batch_size, seq_len, output, scratchpad,
+        );
+    }
 }
 
 /// An executable memory buffer backed by mmap.

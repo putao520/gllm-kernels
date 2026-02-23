@@ -107,7 +107,11 @@ impl ModelConfig {
             }
             None => self.dtype.size_bytes(),
         };
-        let per_layer = (3 * h * h + h * h + 2 * h * inter + inter * h) * elem
+        let q_dim = self.num_heads * self.head_dim;
+        let kv_dim = self.num_kv_heads * self.head_dim;
+        // QKV projections: Q is h*q_dim, K and V are each h*kv_dim
+        let qkv = h * q_dim + 2 * h * kv_dim;
+        let per_layer = (qkv + h * h + 2 * h * inter + inter * h) * elem
             + 2 * h * self.dtype.size_bytes(); // norm weights
         let embedding = self.vocab_size * h * self.dtype.size_bytes();
         per_layer * self.num_layers + 2 * embedding

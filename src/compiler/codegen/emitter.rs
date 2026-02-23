@@ -1,17 +1,14 @@
-//! Emitter — Phase 3 of the JIT compiler pipeline.
+//! Emitter — legacy scratchpad layout + stub code generation.
 //!
-//! TODO: Rewrite per SPEC §8.5 Phase 3 — programmatic code generation.
+//! Phase 3 code generation is now implemented in `codegen::x86_64::jit::X86CodeGen`
+//! (under the `jit-x86` feature flag), which uses `FusionPlan` + `BufferAllocation`
+//! to emit native x86_64 machine code via iced-x86.
 //!
-//! The correct implementation should use `MachineCodeEmitter` trait with:
-//! - `emit_gemm_unit(&mut self, unit: &GemmUnit)` — generate complete GEMM microkernel
-//! - `emit_fused_loop(&mut self, unit: &FusedLoop)` — generate fused elementwise loop
-//! - `emit_activation(&mut self, kind: ActivationKind, reg: Register)` — inject activation
-//!
-//! The previous `EmitAction`/`EmitPlan` abstraction was a "call dispatcher" that
-//! emitted `call` instructions to pre-compiled trampolines. This violated the SPEC.
-//!
-//! What remains here: `ScratchpadLayout` and `compute_layout()` — these are correct
-//! per SPEC's Phase 2 Step 4 (buffer planning).
+//! What remains here:
+//! - `ScratchpadLayout` / `compute_layout()`: legacy bump allocator for scratchpad
+//!   planning. New code should use `buffer_alloc::allocate_buffers()` which implements
+//!   interval-graph coloring for buffer reuse (SPEC Phase 2 Step 4).
+//! - `emit_stub_code()`: fallback stub used when the `jit-x86` feature is not enabled.
 
 use std::collections::HashMap;
 use crate::compiler::graph::{CompilerGraph, TensorId};
@@ -32,8 +29,10 @@ pub struct ScratchpadLayout {
 /// not the scratchpad. Only intermediate tensors (produced by ops) need
 /// scratchpad space.
 ///
-/// TODO: Implement interval-graph coloring for buffer reuse (SPEC Phase 2 Step 4).
-/// Currently uses a simple bump allocator — no buffer sharing.
+/// NOTE: This is a legacy bump allocator with no buffer sharing. The new path
+/// uses `buffer_alloc::allocate_buffers()` which implements interval-graph
+/// coloring for optimal buffer reuse. Retained for backward compatibility
+/// with `emit_stub_code()`.
 pub fn compute_layout(graph: &CompilerGraph) -> ScratchpadLayout {
     let mut offsets = HashMap::new();
     let mut current_offset: usize = 0;

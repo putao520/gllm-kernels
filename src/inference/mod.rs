@@ -9,12 +9,14 @@ pub mod tensor;
 pub mod weights;
 pub mod kv_cache;
 pub mod cpu_backend;
+pub mod flash_attn;
 
 pub use types::{DType, ModelArch, ModelConfig, InferenceError};
 pub use tensor::{DeviceTensor, DeviceKind};
 pub use weights::{ModelWeights, LayerWeights};
 pub use kv_cache::KvCache;
 pub use cpu_backend::CpuInferenceBackend;
+pub use flash_attn::{FlashAttnConfig, flash_attn_single_head, flash_attn_multi_head};
 
 /// The primary inference backend trait.
 ///
