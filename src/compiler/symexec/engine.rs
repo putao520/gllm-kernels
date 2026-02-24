@@ -142,6 +142,11 @@ impl SymbolicExecutor {
         self.constants.insert(addr, value);
     }
 
+    /// Check if a constant is already registered at an address.
+    pub fn has_constant(&self, addr: u64) -> bool {
+        self.constants.contains_key(&addr)
+    }
+
     /// Get the symbolic value of a register, or Unknown.
     fn get(&self, reg: &str) -> SymValue {
         self.regs
@@ -150,8 +155,13 @@ impl SymbolicExecutor {
             .unwrap_or_else(|| SymValue::Unknown(reg.to_string()))
     }
 
+    /// Public accessor for the symbolic value of a register.
+    pub fn get_value(&self, reg: &str) -> SymValue {
+        self.get(reg)
+    }
+
     /// Set a register to a symbolic value.
-    fn set(&mut self, reg: &str, val: SymValue) {
+    pub fn set(&mut self, reg: &str, val: SymValue) {
         self.regs.insert(reg.to_string(), val);
     }
 
@@ -299,6 +309,15 @@ impl SymbolicExecutor {
             // --- XOR (zero idiom + sign flip) ---
             "xorps" | "vxorps" | "pxor" | "vpxor" | "xorpd" | "vxorpd" => {
                 self.xor_op(operands)
+            }
+
+            // --- Negation injected by decoder (xorps with sign mask) ---
+            "neg_float" => {
+                if !operands.is_empty() && is_xmm_reg(operands[0]) {
+                    let val = self.get(operands[0]);
+                    self.set(operands[0], SymValue::Neg(Box::new(val)));
+                }
+                Ok(())
             }
 
             // --- Comparison (flag tracking) ---
@@ -686,14 +705,9 @@ fn linearize(
                     i
                 }
                 LibmFn::Logf => {
-                    // No TraceOp::Log yet — expand as Recip(Exp(Neg(x))) approximation?
-                    // For now, emit as Neg(Exp(Neg(x))) which is wrong but placeholder.
-                    // TODO: add TraceOp::Log when needed.
                     let ai = linearize(&args[0], ops, cache);
-                    let _ = ai;
                     let i = ops.len() as u32;
-                    // Emit the arg index directly — codegen will need to handle this.
-                    ops.push(TraceOp::Neg(ai)); // placeholder
+                    ops.push(TraceOp::Log(ai));
                     i
                 }
             }
@@ -1012,7 +1026,7 @@ mod tests {
                 TraceOp::Input(_) | TraceOp::Const(_) => {}
                 TraceOp::Neg(a) | TraceOp::Exp(a) | TraceOp::Abs(a)
                 | TraceOp::Sqrt(a) | TraceOp::Rsqrt(a) | TraceOp::Tanh(a)
-                | TraceOp::Recip(a) => {
+                | TraceOp::Recip(a) | TraceOp::Log(a) => {
                     assert!((*a as usize) < i, "SSA violation at {i}");
                 }
                 TraceOp::Add(a, b) | TraceOp::Sub(a, b) | TraceOp::Mul(a, b)
@@ -1100,5 +1114,151 @@ mod tests {
         }
         // xmm0 should still be param(0)
         assert!(matches!(exec.return_value().unwrap(), SymValue::Param(0)));
+    }
+
+    // -----------------------------------------------------------------------
+    // WI-21: Additional symexec engine tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_symexec_log_extraction() {
+        // f(x) = log(x) via call to logf
+        let mut exec = SymbolicExecutor::new(1, 0);
+        exec.step("call", &["logf@PLT"]).unwrap();
+
+        let trace = exec.extract_trace().unwrap();
+        // Expected: [Input(0), Log(0)]
+        assert_eq!(trace.len(), 2);
+        assert_eq!(trace[0], TraceOp::Input(0));
+        assert_eq!(trace[1], TraceOp::Log(0));
+    }
+
+    #[test]
+    fn test_symexec_constant_folding() {
+        // f(x) = x + 0.0 should simplify to just x via extract_trace
+        let mut exec = SymbolicExecutor::new(1, 0);
+        exec.register_constant(0x100, 0.0);
+        exec.step("movss", &["xmm1", "[rip+0x100]"]).unwrap();
+        exec.step("addss", &["xmm0", "xmm1"]).unwrap();
+
+        let trace = exec.extract_trace().unwrap();
+        // After simplification: x + 0.0 -> x -> [Input(0)]
+        assert_eq!(trace.len(), 1);
+        assert_eq!(trace[0], TraceOp::Input(0));
+    }
+
+    #[test]
+    fn test_symexec_identity_mul() {
+        // f(x) = x * 1.0 should simplify to just x
+        let mut exec = SymbolicExecutor::new(1, 0);
+        exec.register_constant(0x100, 1.0);
+        exec.step("movss", &["xmm1", "[rip+0x100]"]).unwrap();
+        exec.step("mulss", &["xmm0", "xmm1"]).unwrap();
+
+        let trace = exec.extract_trace().unwrap();
+        // After simplification: x * 1.0 -> x -> [Input(0)]
+        assert_eq!(trace.len(), 1);
+        assert_eq!(trace[0], TraceOp::Input(0));
+    }
+
+    #[test]
+    fn test_symexec_zero_sub() {
+        // f(x) = x - x should simplify to Const(0.0)
+        let mut exec = SymbolicExecutor::new(1, 0);
+        exec.step("subss", &["xmm0", "xmm0"]).unwrap();
+
+        let trace = exec.extract_trace().unwrap();
+        // After simplification: x - x -> 0.0 -> [Const(0.0)]
+        assert_eq!(trace.len(), 1);
+        assert_eq!(trace[0], TraceOp::Const(0.0));
+    }
+
+    #[test]
+    fn test_symexec_stack_spill_reload() {
+        // Compute x + 1, spill to stack, clobber registers, reload, verify preserved
+        let mut exec = SymbolicExecutor::new(2, 0);
+        exec.register_constant(0x100, 1.0);
+
+        // Compute param(0) + 1.0 into xmm3
+        exec.step("movss", &["xmm2", "[rip+0x100]"]).unwrap();
+        exec.step("vaddss", &["xmm3", "xmm0", "xmm2"]).unwrap();
+        // Spill computed value to stack
+        exec.step("movss", &["[rsp+0x20]", "xmm3"]).unwrap();
+        // Clobber xmm3 with unrelated work
+        exec.step("vmulss", &["xmm3", "xmm1", "xmm1"]).unwrap();
+        // Clobber xmm0 too
+        exec.step("xorps", &["xmm0", "xmm0"]).unwrap();
+        // Reload the spilled value into xmm0
+        exec.step("movss", &["xmm0", "[rsp+0x20]"]).unwrap();
+
+        let ret = exec.return_value().unwrap();
+        let s = format!("{ret}");
+        // Should be param(0) + 1.0, not 0.0 or param(1)*param(1)
+        assert!(s.contains("param(0)"), "spilled value should reference param(0)");
+        assert!(s.contains("1.0"), "spilled value should reference constant 1.0");
+    }
+
+    #[test]
+    fn test_symexec_fma_variants() {
+        // Test all 3 FMA operand orderings and verify correct operand placement.
+
+        // vfmadd132ss xmm0, xmm1, xmm2 -> dst = dst * src2 + src1
+        let mut exec132 = SymbolicExecutor::new(3, 0);
+        exec132.step("vfmadd132ss", &["xmm0", "xmm1", "xmm2"]).unwrap();
+        let ret132 = exec132.return_value().unwrap();
+        if let SymValue::Fma(a, b, c) = &ret132 {
+            assert!(matches!(**a, SymValue::Param(0)), "132: a should be dst=param(0)");
+            assert!(matches!(**b, SymValue::Param(2)), "132: b should be src2=param(2)");
+            assert!(matches!(**c, SymValue::Param(1)), "132: c should be src1=param(1)");
+        } else {
+            panic!("vfmadd132ss should produce Fma, got: {ret132:?}");
+        }
+
+        // vfmadd213ss xmm0, xmm1, xmm2 -> dst = src1 * dst + src2
+        let mut exec213 = SymbolicExecutor::new(3, 0);
+        exec213.step("vfmadd213ss", &["xmm0", "xmm1", "xmm2"]).unwrap();
+        let ret213 = exec213.return_value().unwrap();
+        if let SymValue::Fma(a, b, c) = &ret213 {
+            assert!(matches!(**a, SymValue::Param(1)), "213: a should be src1=param(1)");
+            assert!(matches!(**b, SymValue::Param(0)), "213: b should be dst=param(0)");
+            assert!(matches!(**c, SymValue::Param(2)), "213: c should be src2=param(2)");
+        } else {
+            panic!("vfmadd213ss should produce Fma, got: {ret213:?}");
+        }
+
+        // vfmadd231ss xmm0, xmm1, xmm2 -> dst = src1 * src2 + dst
+        let mut exec231 = SymbolicExecutor::new(3, 0);
+        exec231.step("vfmadd231ss", &["xmm0", "xmm1", "xmm2"]).unwrap();
+        let ret231 = exec231.return_value().unwrap();
+        if let SymValue::Fma(a, b, c) = &ret231 {
+            assert!(matches!(**a, SymValue::Param(1)), "231: a should be src1=param(1)");
+            assert!(matches!(**b, SymValue::Param(2)), "231: b should be src2=param(2)");
+            assert!(matches!(**c, SymValue::Param(0)), "231: c should be dst=param(0)");
+        } else {
+            panic!("vfmadd231ss should produce Fma, got: {ret231:?}");
+        }
+    }
+
+    #[test]
+    fn test_linearize_dedup() {
+        // Build (x+1) * (x+1) — the shared sub-expression (x+1) should be emitted once
+        let mut exec = SymbolicExecutor::new(1, 0);
+        let x_plus_1 = SymValue::Add(
+            Box::new(SymValue::Param(0)),
+            Box::new(SymValue::Const(1.0)),
+        );
+        let product = SymValue::Mul(
+            Box::new(x_plus_1.clone()),
+            Box::new(x_plus_1),
+        );
+        exec.set("xmm0", product);
+
+        let trace = exec.extract_trace().unwrap();
+        // Expected: [Input(0), Const(1.0), Add(0,1), Mul(2,2)]
+        // The Add should appear only once due to dedup
+        let add_count = trace.iter().filter(|op| matches!(op, TraceOp::Add(_, _))).count();
+        assert_eq!(add_count, 1, "shared (x+1) sub-expression should be deduplicated");
+        assert_eq!(trace.len(), 4, "expected 4 ops: Input, Const, Add, Mul");
+        assert_eq!(trace[3], TraceOp::Mul(2, 2), "Mul should reference the same Add index twice");
     }
 }

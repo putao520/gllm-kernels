@@ -3,14 +3,18 @@ use crate::compiler::graph::OpKind;
 use crate::compiler::trace::{
     classify_pattern, ComputePattern, OpTrace, ScalarFnSignature, ScalarParam, TraceOp,
 };
-use crate::compiler::symexec::{SymbolicExecutor, SymExecError};
+use crate::compiler::symexec::SymExecError;
 
 /// Hashable key for `OpKind` (OpKind contains f32/f64 fields that prevent `Hash`).
+///
+/// For norm ops, `eps` is stored as `f32::to_bits()` so different epsilon
+/// values produce distinct cache keys and compiled kernels.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
-// TODO: parameterize eps in OpKindKey to support per-model values
 pub enum OpKindKey {
-    RmsNorm,
-    LayerNorm,
+    /// RmsNorm keyed by eps (as f32 bits for Hash/Eq).
+    RmsNorm { eps_bits: u32 },
+    /// LayerNorm keyed by eps (as f32 bits for Hash/Eq).
+    LayerNorm { eps_bits: u32 },
     Gemm,
     GemmBias,
     Silu,
@@ -106,8 +110,8 @@ impl ScalarOpRegistry {
     /// Convert an `OpKind` to its hashable `OpKindKey`.
     pub fn key_from_op_kind(kind: &OpKind) -> OpKindKey {
         match kind {
-            OpKind::RmsNorm { .. } => OpKindKey::RmsNorm,
-            OpKind::LayerNorm { .. } => OpKindKey::LayerNorm,
+            OpKind::RmsNorm { eps } => OpKindKey::RmsNorm { eps_bits: eps.to_bits() },
+            OpKind::LayerNorm { eps } => OpKindKey::LayerNorm { eps_bits: eps.to_bits() },
             OpKind::Gemm { .. } => OpKindKey::Gemm,
             OpKind::GemmBias { .. } => OpKindKey::GemmBias,
             OpKind::Silu => OpKindKey::Silu,
@@ -390,10 +394,11 @@ impl ScalarOpRegistry {
                 ScalarParam::Scalar(1e-5),
             ],
         };
+        let default_eps: f32 = 1e-5;
         reg.register_with_symexec_fallback(
-            OpKindKey::RmsNorm,
+            OpKindKey::RmsNorm { eps_bits: default_eps.to_bits() },
             rms_sig.clone(),
-            OpKind::RmsNorm { eps: 1e-5 },
+            OpKind::RmsNorm { eps: default_eps },
             OpTrace {
                 op_kind: OpKind::RmsNorm { eps: 1e-5 }, // default eps; actual value comes from graph OpKind at compile time
                 pattern: ComputePattern::NormLike {
@@ -434,9 +439,9 @@ impl ScalarOpRegistry {
             ],
         };
         reg.register_with_symexec_fallback(
-            OpKindKey::LayerNorm,
+            OpKindKey::LayerNorm { eps_bits: default_eps.to_bits() },
             ln_sig.clone(),
-            OpKind::LayerNorm { eps: 1e-5 },
+            OpKind::LayerNorm { eps: default_eps },
             OpTrace {
                 op_kind: OpKind::LayerNorm { eps: 1e-5 }, // default eps; actual value comes from graph OpKind at compile time
                 pattern: ComputePattern::NormLike {
@@ -659,6 +664,10 @@ impl ScalarOpRegistry {
 
     /// Auto-register a scalar function by running symbolic execution to extract its trace.
     ///
+    /// On x86_64 with the `jit-x86` feature, this disassembles the compiled scalar
+    /// function via iced-x86 and feeds each instruction into the symbolic execution
+    /// engine to extract the computational structure automatically.
+    ///
     /// If the key is already registered, the existing entry is overwritten
     /// (allows symexec to upgrade a manual trace).
     pub fn auto_register_from_symexec(
@@ -667,12 +676,7 @@ impl ScalarOpRegistry {
         fn_sig: ScalarFnSignature,
         op_kind: OpKind,
     ) -> Result<ComputePattern, RegistryError> {
-        // Count float and pointer params from the signature
-        let n_float = fn_sig.params.iter().filter(|p| matches!(p, ScalarParam::Scalar(_))).count();
-        let n_ptr = fn_sig.params.iter().filter(|p| matches!(p, ScalarParam::InputPtr | ScalarParam::OutputPtr | ScalarParam::WeightPtr)).count();
-
-        let executor = SymbolicExecutor::new(n_float, n_ptr);
-        let trace_ops = executor.extract_trace().map_err(RegistryError::SymExec)?;
+        let trace_ops = self.run_symexec(&fn_sig)?;
 
         if trace_ops.is_empty() {
             return Err(RegistryError::EmptyTrace);
@@ -695,6 +699,29 @@ impl ScalarOpRegistry {
         self.trace_cache.insert(key, trace);
         Ok(pattern)
     }
+
+    /// Run symbolic execution on a scalar function to extract its trace ops.
+    ///
+    /// Uses the decoder bridge (iced-x86 disassembly → symexec) when available,
+    /// otherwise falls back to the stub path (no instructions → empty trace).
+    fn run_symexec(&self, fn_sig: &ScalarFnSignature) -> Result<Vec<TraceOp>, RegistryError> {
+        // Decoder bridge: disassemble the compiled function and symbolically execute it.
+        #[cfg(feature = "jit-x86")]
+        {
+            use crate::compiler::symexec::decoder::analyze_scalar_fn;
+            return analyze_scalar_fn(fn_sig.fn_ptr, fn_sig)
+                .map_err(RegistryError::SymExec);
+        }
+
+        // Fallback: no decoder available, create an empty executor.
+        #[cfg(not(feature = "jit-x86"))]
+        {
+            let n_float = fn_sig.params.iter().filter(|p| matches!(p, ScalarParam::Scalar(_))).count();
+            let n_ptr = fn_sig.params.iter().filter(|p| matches!(p, ScalarParam::InputPtr | ScalarParam::OutputPtr | ScalarParam::WeightPtr)).count();
+            let executor = SymbolicExecutor::new(n_float, n_ptr);
+            executor.extract_trace().map_err(RegistryError::SymExec)
+        }
+    }
 }
 
 #[cfg(test)]
@@ -715,8 +742,8 @@ mod tests {
             OpKindKey::Mul,
             OpKindKey::Residual,
             OpKindKey::Softmax,
-            OpKindKey::RmsNorm,
-            OpKindKey::LayerNorm,
+            OpKindKey::RmsNorm { eps_bits: 1e-5_f32.to_bits() },
+            OpKindKey::LayerNorm { eps_bits: 1e-5_f32.to_bits() },
             OpKindKey::Gemm,
             OpKindKey::GemmBias,
             OpKindKey::RoPE,
@@ -752,8 +779,8 @@ mod tests {
             (OpKind::Mul, OpKindKey::Mul),
             (OpKind::Residual, OpKindKey::Residual),
             (OpKind::Softmax, OpKindKey::Softmax),
-            (OpKind::RmsNorm { eps: 1e-6 }, OpKindKey::RmsNorm),
-            (OpKind::LayerNorm { eps: 1e-5 }, OpKindKey::LayerNorm),
+            (OpKind::RmsNorm { eps: 1e-6 }, OpKindKey::RmsNorm { eps_bits: 1e-6_f32.to_bits() }),
+            (OpKind::LayerNorm { eps: 1e-5 }, OpKindKey::LayerNorm { eps_bits: 1e-5_f32.to_bits() }),
             (OpKind::Gemm { m: 1, n: 4096, k: 4096 }, OpKindKey::Gemm),
             (OpKind::GemmBias { m: 1, n: 4096, k: 4096 }, OpKindKey::GemmBias),
             (OpKind::RoPE { head_dim: 128, theta: 10000.0 }, OpKindKey::RoPE),
@@ -788,9 +815,15 @@ mod tests {
         let trace = reg.get_trace(&OpKindKey::Gelu).unwrap();
 
         if let ComputePattern::Elementwise { body } = &trace.pattern {
-            assert_eq!(body.len(), 14);
-            assert_eq!(body[0], TraceOp::Input(0));
-            assert_eq!(body[8], TraceOp::Tanh(7));
+            // The trace may come from symexec (auto-extracted) or the manual
+            // fallback. Both are valid as long as the structural invariants hold.
+            assert!(body.len() >= 10, "GELU trace too short: {} ops", body.len());
+            assert_eq!(body[0], TraceOp::Input(0), "first op must be Input(0)");
+            // Must contain Tanh and Mul (core GELU structure).
+            let has_tanh = body.iter().any(|op| matches!(op, TraceOp::Tanh(_)));
+            let has_mul = body.iter().any(|op| matches!(op, TraceOp::Mul(_, _)));
+            assert!(has_tanh, "GELU missing Tanh");
+            assert!(has_mul, "GELU missing Mul");
         } else {
             panic!("GELU should be Elementwise");
         }
@@ -799,7 +832,7 @@ mod tests {
     #[test]
     fn registry_rms_norm_trace_is_normlike() {
         let reg = ScalarOpRegistry::with_defaults();
-        let trace = reg.get_trace(&OpKindKey::RmsNorm).unwrap();
+        let trace = reg.get_trace(&OpKindKey::RmsNorm { eps_bits: 1e-5_f32.to_bits() }).unwrap();
         assert!(
             matches!(trace.pattern, ComputePattern::NormLike { .. }),
             "RmsNorm should be NormLike"
@@ -837,7 +870,7 @@ mod tests {
             OpKindKey::Gelu,
             OpKindKey::Add,
             OpKindKey::Mul,
-            OpKindKey::RmsNorm,
+            OpKindKey::RmsNorm { eps_bits: 1e-5_f32.to_bits() },
             OpKindKey::Gemm,
             OpKindKey::RoPE,
         ] {
@@ -859,7 +892,7 @@ mod tests {
             (OpKindKey::Gelu, OpKind::Gelu),
             (OpKindKey::Add, OpKind::Add),
             (OpKindKey::Mul, OpKind::Mul),
-            (OpKindKey::RmsNorm, OpKind::RmsNorm { eps: 1e-5 }),
+            (OpKindKey::RmsNorm { eps_bits: 1e-5_f32.to_bits() }, OpKind::RmsNorm { eps: 1e-5 }),
             (OpKindKey::Softmax, OpKind::Softmax),
         ];
 

@@ -164,8 +164,8 @@
 
 | ID | 需求 | 验收标准 | 状态 |
 |----|------|----------|------|
-| **REQ-SCALAR-001** | 标量算子 C ABI | 所有算子必须有 `extern "C"` 纯标量实现，注册到 `ScalarOpRegistry`。纯标量运算，无 SIMD 指令 | 🟢 已完成（`src/scalar_ops/` 17 个 `extern "C"` 函数，全部注册到 `ScalarOpRegistry::with_defaults()`） |
-| **REQ-SCALAR-002** | 编译约束 | 标量函数编译用 `opt-level=1`（保留循环结构，消除冗余，不做向量化），确保符号执行可分析 | 🟡 函数已实现，`opt-level=1` 编译约束待配置 |
+| **REQ-SCALAR-001** | 标量算子 C ABI | 所有算子必须有 `extern "C"` 纯标量实现，注册到 `ScalarOpRegistry`。纯标量运算，无 SIMD 指令 | 🟢 已完成（`scalar-ops/src/` 17 个 `extern "C"` 函数，全部注册到 `ScalarOpRegistry::with_defaults()`） |
+| **REQ-SCALAR-002** | 编译约束 | 标量函数编译用 `opt-level=1`（保留循环结构，消除冗余，不做向量化），确保符号执行可分析 | 🟢 已完成（`gllm-scalar-ops` 独立 subcrate，`[profile.release.package.gllm-scalar-ops] opt-level = 1`，objdump 验证零 ymm/zmm 指令） |
 | **REQ-SCALAR-003** | 正确性基准 | 标量实现作为 JIT 代码的 golden reference。JIT 生成的代码与标量实现数值误差 ≤ 1e-4（f32）/ 1e-2（f16） | 🟢 已完成（E2E 测试对比标量 reference，tolerance ≤ 1e-4） |
 
 ### 6.2 二进制符号执行（Phase 0）
@@ -174,7 +174,7 @@
 |----|------|----------|------|
 | **REQ-SYMEXEC-001** | 符号执行覆盖 | 正确提取 elementwise / binary_elementwise / reduction / normlike / gemm 五类计算模式的 OpTrace | 🟢 已完成（`src/compiler/symexec/engine.rs` 1104 行，支持 FMA/比较/位运算/栈溢出/常量池/libm 识别） |
 | **REQ-SYMEXEC-002** | OpTrace 缓存 | 同一算子不重复分析。`ScalarOpRegistry::get_trace()` 首次调用触发分析，之后从缓存返回 | 🟢 已完成（`ScalarOpRegistry::with_defaults()` 预填充 17 个算子的 OpTrace） |
-| **REQ-SYMEXEC-003** | 分析延迟 | 单个算子符号执行 < 1ms（标量函数通常 < 100 条指令） | 🟡 引擎已实现，延迟未正式基准测试 |
+| **REQ-SYMEXEC-003** | 分析延迟 | 单个算子符号执行 < 1ms（标量函数通常 < 100 条指令） | 🟢 已完成（symexec_benchmark.rs 验证：2.5-15μs/算子，远低于 1ms 预算） |
 
 ### 6.3 语义 DAG 构筑与数据流分析（Phase 1）
 
@@ -189,23 +189,22 @@
 |----|------|----------|------|
 | **REQ-COMPILER-004** | 接收 CompilerGraph | `compile_graph(graph: &CompilerGraph, profile: &DeviceProfile) -> Result<CompiledLayer>` 接口可用，支持 GLLM 传入的任意合法 CompilerGraph（由 GLLM 将 FusedGraph 展开为原子算子 DAG） | 🟢 已完成（`InferenceCompiler::compile_graph()` 接口可用） |
 | **REQ-COMPILER-005** | 算子分类自动推导 | 算子分类从 `OpTrace.pattern` 自动推导，不手动维护映射表。`ComputePattern::Elementwise` → kElemWise，`Reduction` → kReduction，`NormLike` → kReduction，`Gemm` → kGemm，`QuantDecode` → kOpaque | 🟢 已完成（`semantic_dag.rs::derive_op_class()` 从 `ComputePattern` 自动映射） |
-| **REQ-COMPILER-006** | Profile-Driven 融合决策 | 基于 DeviceProfile（cache 容量、roofline ridge point、寄存器数量、SIMD 宽度）和 OpTrace（计算结构、数据量）做融合决策。三种融合模式：(a) Epilogue Injection — 取消费者 OpTrace.body 的 TraceOp 序列，在 GEMM 累加器上原地生成 SIMD 指令；(b) Tile-Level Fusion — 在 GEMM MC 循环内按 tile 计算前驱算子；(c) Loop Fusion — 多个 elementwise 算子合并为单循环，遍历每个算子的 OpTrace.body 生成指令。融合决策必须考虑：中间张量是否放得进目标 cache 层级、融合后寄存器压力是否超出可用寄存器数、生产者是否有多个消费者 | 🟡 融合决策框架完成（`fuse_with_dag()` 5 种模式 + `HwConstraintChecker` 寄存器/L1/epilogue 深度验证），Epilogue Injection 和 Loop Fusion 的 codegen 接线待完成 |
+| **REQ-COMPILER-006** | Profile-Driven 融合决策 | 基于 DeviceProfile（cache 容量、roofline ridge point、寄存器数量、SIMD 宽度）和 OpTrace（计算结构、数据量）做融合决策。三种融合模式：(a) Epilogue Injection — 取消费者 OpTrace.body 的 TraceOp 序列，在 GEMM 累加器上原地生成 SIMD 指令；(b) Tile-Level Fusion — 在 GEMM MC 循环内按 tile 计算前驱算子；(c) Loop Fusion — 多个 elementwise 算子合并为单循环，遍历每个算子的 OpTrace.body 生成指令。融合决策必须考虑：中间张量是否放得进目标 cache 层级、融合后寄存器压力是否超出可用寄存器数、生产者是否有多个消费者 | 🟡 融合决策框架完成（`fuse_with_dag()` 5 种模式 + `HwConstraintChecker` 寄存器/L1/epilogue 深度验证）。Epilogue Injection + Loop Fusion codegen 已接线。TileLevelFusion/ComputeRoot codegen 已完成（aarch64 `emit_gemm_blis_neon` BLIS 5 级循环嵌套）。缺口：融合代价模型 |
 | **REQ-COMPILER-007** | 张量活性分析 | 对 SemanticDAG 执行张量生命周期分析（birth = 生产指令拓扑序位置，death = 最后消费指令拓扑序位置），通过区间图着色贪心算法最大化 buffer 原地复用，输出 BufferPlan | 🟢 已完成（`buffer_alloc.rs` 285 行，区间图着色 + 贪心分配） |
 
 ### 6.5 代码生成（Phase 3）
 
 | ID | 需求 | 验收标准 | 状态 |
 |----|------|----------|------|
-| **REQ-COMPILER-008** | TraceOp → SIMD 代码生成 | 根据 FusionPlan 通过 `MachineCodeEmitter` trait 程序化生成全新机器码。核心机制：遍历 OpTrace.body 中的 `Vec<TraceOp>`，每个 TraceOp 映射到对应的 SIMD 指令（如 `TraceOp::Add` → `vaddps`，`TraceOp::Exp` → 多项式逼近指令序列）。底层使用 iced-x86 CodeAssembler（x86_64）/ dynasm-rs（aarch64） | 🟡 x86_64 `emit_trace_ops_avx2()` 完整实现（所有 TraceOp 变体 → AVX2 SIMD），BLIS GEMM 5 级循环 codegen 完成。Epilogue injection / Loop fusion 结构就绪但未接线到 `emit_trace_ops_avx2()` |
-| **REQ-COMPILER-009** | GEMM Tile-Level Fusion | GEMM 的 MC 循环内可嵌入前驱算子的 tile 计算。嵌入决策由 profile 驱动：当前驱输出 > L1 容量时启用 tile-level fusion，否则 compute_root | 🔴 未实现 |
-| **REQ-COMPILER-010** | 数值一致性 | 编译器生成的 CompiledLayer 与标量函数实现（golden reference）数值误差 ≤ 1e-4（f32）/ 1e-2（f16），通过自动化回归测试验证 | 🟡 GEMM + elementwise 链 E2E 测试已验证（tolerance ≤ 1e-4），epilogue fusion 路径待验证 |
-| **REQ-COMPILER-011** | 算子知识自动提取 | 算子计算结构通过二进制符号执行自动提取（OpTrace），编译器不内置算子计算逻辑。新增算子只需写 `extern "C"` 标量函数并注册，编译器自动分析 + 生成最优代码 | 🟡 架构正确（标量函数 → symexec → OpTrace → codegen），`auto_register_from_symexec()` 已实现但生产路径使用手动注入的 OpTrace |
+| **REQ-COMPILER-008** | TraceOp → SIMD 代码生成 | 根据 FusionPlan 通过 `MachineCodeEmitter` trait 程序化生成全新机器码。核心机制：遍历 OpTrace.body 中的 `Vec<TraceOp>`，每个 TraceOp 映射到对应的 SIMD 指令（如 `TraceOp::Add` → `vaddps`，`TraceOp::Exp` → 多项式逼近指令序列）。底层使用 iced-x86 CodeAssembler（x86_64）/ dynasm-rs（aarch64） | 🟢 x86_64 完整实现：`emit_trace_ops_avx2()`（独立寄存器分配）、`emit_trace_on_accumulator()`（GEMM epilogue 原地执行）、`emit_elementwise_trace_body()`（elementwise 链含 binary Input(1)）三条路径均覆盖所有 TraceOp 变体。Epilogue injection 已接线（emit_gemm_with_epilogue → registry → emit_epilogue_on_accumulators）。Loop fusion 已接线（emit_elementwise_chain → registry → emit_elementwise_trace_body）。aarch64 实质实现：BLIS 5 级循环嵌套（`emit_gemm_blis_neon`）、TileLevelFusion/ComputeRoot codegen、tanh（15 条 NEON 指令，2*sigmoid(2x)-1）、log（36 条 NEON 指令，指数/尾数分解 + degree-4 Horner）真实实现 |
+| **REQ-COMPILER-009** | GEMM Tile-Level Fusion | GEMM 的 MC 循环内可嵌入前驱算子的 tile 计算。嵌入决策由 profile 驱动：当前驱输出 > L1 容量时启用 tile-level fusion，否则 compute_root | 🟡 aarch64 已实现（`emit_gemm_blis_neon` BLIS 5 级循环嵌套 + TileLevelFusion/ComputeRoot codegen），x86_64 待实现 |
+| **REQ-COMPILER-010** | 数值一致性 | 编译器生成的 CompiledLayer 与标量函数实现（golden reference）数值误差 ≤ 1e-4（f32）/ 1e-2（f16），通过自动化回归测试验证 | 🟡 GEMM + elementwise 链 E2E 测试已验证（tolerance ≤ 1e-4），epilogue fusion bias 路径已修复（AddBias 数值 bug 已修正：bias_saved 追踪 + rdx 保存至 [rbp-48] + bias tile 基指针计算） |
+| **REQ-COMPILER-011** | 算子知识自动提取 | 算子计算结构通过二进制符号执行自动提取（OpTrace），编译器不内置算子计算逻辑。新增算子只需写 `extern "C"` 标量函数并注册，编译器自动分析 + 生成最优代码 | 🟢 已完成（生产路径已接通：fn_ptr → iced-x86 Decoder → SymbolicExecutor → OpTrace。`decoder.rs` 927 行，自动提取 SiLU/GELU/ReLU 等激活函数的 OpTrace。`auto_register_from_symexec()` 从编译后的 scalar_ops 二进制自动分析） |
 
 ### 6.6 外部依赖与平台支持
 
 | ID | 需求 | 验收标准 | 状态 |
 |----|------|----------|------|
-| **REQ-COMPILER-012** | 汇编器后端 | 两层 trait 架构：`PlatformBackend`（统一入口）→ `MachineCodeEmitter`（Phase 3 代码生成）。x86_64 使用 `iced-x86`（CodeAssembler + Decoder）；aarch64 使用 `dynasm-rs`（Assembler）。iced-x86 同时用于 Phase 0（Decoder 反汇编）和 Phase 3（CodeAssembler 代码生成） | 🟡 x86_64 iced-x86 集成完成（Phase 0 Decoder + Phase 3 CodeAssembler），aarch64 dynasm-rs 506 行框架 |
-| **REQ-COMPILER-013** | x86_64 完整 ISA 覆盖 | iced-x86 后端支持：AVX2 全指令集、AVX-512（EVEX 编码, zmm 寄存器, mask 寄存器）、FMA、F16C、AVX512-BF16/FP16/VNNI | 🟡 AVX2 完整支持，AVX-512 基础路径（zmm 寄存器 + EVEX），mask/VNNI/BF16/FP16 待实现 |
-| **REQ-COMPILER-014** | aarch64 完整 ISA 覆盖 | dynasm-rs 后端支持：NEON 全指令集（fmla, fmul, fadd, ld1/st1/ldp/stp, dup, sdot/udot）、ARMv8.4+ | 🔴 框架已搭建（506 行），指令生成待实现 |
-| **REQ-COMPILER-016** | JIT 延迟 | 单个 transformer layer 的编译延迟 < 100ms（含 Phase 0-3）。Phase 0 符号执行 < 1ms/算子，iced-x86 和 dynasm-rs 均为 μs 级指令编码 | 🟡 管线完整可运行，延迟未正式基准测试 |
+| **REQ-COMPILER-012** | 汇编器后端 | 两层 trait 架构：`PlatformBackend`（统一入口）→ `MachineCodeEmitter`（Phase 3 代码生成）。x86_64 使用 `iced-x86`（CodeAssembler + Decoder）；aarch64 使用 `dynasm-rs`（Assembler）。iced-x86 同时用于 Phase 0（Decoder 反汇编）和 Phase 3（CodeAssembler 代码生成） | 🟡 x86_64 iced-x86 集成完成（Phase 0 Decoder + Phase 3 CodeAssembler），aarch64 dynasm-rs 实质实现（BLIS 5 级循环嵌套、GP 寄存器编码辅助、tanh/log 真实 NEON 指令生成） |
+| **REQ-COMPILER-013** | 平台后端 ISA 覆盖 | x86_64 后端（iced-x86）：AVX2 全指令集 + AVX-512（EVEX 编码, zmm, mask）+ FMA/F16C/VNNI/BF16/FP16。AVX2 和 AVX-512 是同一后端的寄存器宽度分支（由 DeviceProfile.isa 选择），不是独立实现。aarch64 后端（dynasm-rs）：NEON 全指令集（fmla, fmul, fadd, ld1/st1/ldp/stp, dup, sdot/udot）+ ARMv8.4+ | 🟡 x86_64: AVX2 完整支持，AVX-512 基础路径；aarch64: BLIS 5 级循环嵌套 + NEON 真实指令生成（tanh 15 条指令、log 36 条指令、GP 寄存器编码辅助），elementwise 链待补全 |
+| **REQ-COMPILER-016** | JIT 延迟 | 单个 transformer layer 的编译延迟 < 100ms（含 Phase 0-3）。Phase 0 符号执行 < 1ms/算子，iced-x86 和 dynasm-rs 均为 μs 级指令编码 | 🟢 已完成（基准测试验证：symexec 2.5-15μs/算子，JIT 编译 16-237μs/layer，均远低于 100ms 预算） |

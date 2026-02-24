@@ -6,6 +6,8 @@
 
 pub mod engine;
 pub mod sym_value;
+#[cfg(feature = "jit-x86")]
+pub mod decoder;
 
 pub use engine::{SymbolicExecutor, SymExecError};
 pub use sym_value::{SymValue, LibmFn};

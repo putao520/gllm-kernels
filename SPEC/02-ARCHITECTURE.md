@@ -329,6 +329,8 @@ src/
 
 **Profile 驱动。** 同一算子 DAG 在不同硬件上可能产生完全不同的融合策略和代码结构。融合决策完全由 DeviceProfile 驱动，不依赖"模板是否存在"。
 
+**ISA 无关性。** AVX2、AVX-512、NEON 不是独立功能。它们是 MachineCodeEmitter 后端的寄存器宽度选择。x86_64 后端根据 DeviceProfile.isa 在 ymm (256-bit) 和 zmm (512-bit) 之间选择。aarch64 后端使用 v 寄存器 (128-bit)。Phase 0-2 完全不感知 ISA。
+
 ### 8.2 四阶段编译流水线
 
 ```
@@ -753,24 +755,49 @@ DAG: RMSNorm(4096) → Wq_GEMM → RoPE → Attention
 
 **核心原则**：用平台特定汇编器（x86_64: iced-x86 CodeAssembler / aarch64: dynasm-rs Assembler）程序化生成每一条指令。编译器从 OpTrace 的 `Vec<TraceOp>` 直接映射到 SIMD 指令，不从模板中提取片段。两个后端通过 `MachineCodeEmitter` trait 统一接口。
 
-**TraceOp → SIMD 指令映射表**：
+**TraceOp → SIMD 指令映射**：
 
-| TraceOp | AVX2 (ymm) | AVX-512 (zmm) | NEON (v) |
-|---------|-------------|----------------|----------|
-| Add(a,b) | vaddps | vaddps | fadd |
-| Sub(a,b) | vsubps | vsubps | fsub |
-| Mul(a,b) | vmulps | vmulps | fmul |
-| Div(a,b) | vdivps | vdivps | fdiv |
-| Fma(a,b,c) | vfmadd231ps | vfmadd231ps | fmla |
-| Neg(a) | vxorps(sign_mask) | vxorps | fneg |
-| Exp(a) | [多项式逼近 ~12 条] | [多项式逼近] | [多项式逼近] |
-| Recip(a) | vrcpps + Newton | vrcp14ps + Newton | frecpe + Newton |
-| Rsqrt(a) | vrsqrtps + Newton | vrsqrt14ps + Newton | frsqrte + Newton |
-| Sqrt(a) | vsqrtps | vsqrtps | fsqrt |
-| Tanh(a) | [有理逼近 ~15 条] | [有理逼近] | [有理逼近] |
-| Abs(a) | vandps(abs_mask) | vandps | fabs |
-| Max(a,b) | vmaxps | vmaxps | fmax |
-| Min(a,b) | vminps | vminps | fmin |
+两个后端通过 `MachineCodeEmitter` trait 统一接口，ISA 变体是同一后端的寄存器宽度分支。
+
+**x86_64 后端 (iced-x86)**：根据 DeviceProfile.isa 选择 ymm (AVX2) 或 zmm (AVX-512)
+
+| TraceOp | AVX2 (ymm) / AVX-512 (zmm) |
+|---------|----------------------------|
+| Add(a,b) | vaddps |
+| Sub(a,b) | vsubps |
+| Mul(a,b) | vmulps |
+| Div(a,b) | vdivps |
+| Fma(a,b,c) | vfmadd231ps |
+| Neg(a) | vxorps(sign_mask) |
+| Exp(a) | 多项式逼近 ~12 条（寄存器宽度由 DeviceProfile 决定） |
+| Recip(a) | vrcpps/vrcp14ps + Newton |
+| Rsqrt(a) | vrsqrtps/vrsqrt14ps + Newton |
+| Sqrt(a) | vsqrtps |
+| Tanh(a) | 有理逼近 ~15 条 |
+| Abs(a) | vandps(abs_mask) |
+| Max(a,b) | vmaxps |
+| Min(a,b) | vminps |
+
+注: AVX2 和 AVX-512 是同一后端的寄存器宽度分支，不是独立实现。
+
+**aarch64 后端 (dynasm-rs)**：NEON v 寄存器 (128-bit)
+
+| TraceOp | NEON (v.4s) |
+|---------|-------------|
+| Add(a,b) | fadd |
+| Sub(a,b) | fsub |
+| Mul(a,b) | fmul |
+| Div(a,b) | fdiv |
+| Fma(a,b,c) | fmla |
+| Neg(a) | fneg |
+| Exp(a) | 多项式逼近（v 寄存器） |
+| Recip(a) | frecpe + Newton |
+| Rsqrt(a) | frsqrte + Newton |
+| Sqrt(a) | fsqrt |
+| Tanh(a) | 有理逼近 |
+| Abs(a) | fabs |
+| Max(a,b) | fmax |
+| Min(a,b) | fmin |
 
 **Epilogue Injection 的数据来源**：
 - GEMM 微内核累加完毕后，取消费者算子的 `OpTrace.body`（`Vec<TraceOp>`）
@@ -864,9 +891,10 @@ trait PlatformBackend {
 
 /// Phase 3: 代码生成
 trait MachineCodeEmitter {
+    /// 从 OpTrace.body 的 TraceOp 序列生成 SIMD 指令（对指定寄存器原地执行）
+    fn emit_trace_ops(&mut self, ops: &[TraceOp], regs: &[VirtReg], scratch: &[VirtReg]) -> Result<()>;
     fn emit_gemm_unit(&mut self, unit: &GemmUnit) -> Result<Vec<u8>>;
     fn emit_fused_loop(&mut self, unit: &FusedLoop) -> Result<Vec<u8>>;
-    fn emit_activation(&mut self, kind: ActivationKind, reg: Register) -> Result<()>;
     fn emit_prologue(&mut self) -> Result<()>;
     fn emit_epilogue(&mut self) -> Result<()>;
     fn finalize(self) -> Result<Vec<u8>>;
@@ -882,7 +910,7 @@ compile_graph(graph, profile, backend: &dyn PlatformBackend)
 │
 └── Phase 3 [平台特定]: let mut emitter = backend.new_emitter();
                          emitter.emit_gemm_unit(&gemm_unit)?;
-                         emitter.emit_activation(SiLU, ymm0)?;
+                         emitter.emit_trace_ops(&silu_trace.body, &regs, &scratch)?;
                          let code = emitter.finalize()?;
 ```
 

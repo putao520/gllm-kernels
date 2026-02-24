@@ -540,6 +540,42 @@ pub fn gemm_bias_prepacked_asm_f32(
     }
 }
 
+/// C-ABI wrapper around [`pack_a_f32`] for JIT-emitted GEMM code.
+///
+/// Signature matches the x86_64 `gllm_pack_a_f32` so the JIT compiler
+/// can use the same calling convention on both architectures.
+/// The `_mr` parameter is accepted for API compatibility but ignored
+/// (the NEON packer always uses MR=8).
+#[cfg(target_arch = "aarch64")]
+#[no_mangle]
+pub unsafe extern "C" fn gllm_pack_a_f32_neon(
+    a: *const f32,
+    lda: usize,
+    packed: *mut f32,
+    mc: usize,
+    kc: usize,
+    _mr: usize,
+) {
+    pack_a_f32(a, lda, packed, mc, kc);
+}
+
+/// C-ABI wrapper around [`pack_b_f32`] for JIT-emitted GEMM code.
+///
+/// The `_nr` parameter is accepted for API compatibility but ignored
+/// (the NEON packer always uses NR=12).
+#[cfg(target_arch = "aarch64")]
+#[no_mangle]
+pub unsafe extern "C" fn gllm_pack_b_f32_neon(
+    b: *const f32,
+    ldb: usize,
+    packed: *mut f32,
+    kc: usize,
+    nc: usize,
+    _nr: usize,
+) {
+    pack_b_f32(b, ldb, packed, kc, nc);
+}
+
 #[cfg(test)]
 #[cfg(target_arch = "aarch64")]
 mod tests {

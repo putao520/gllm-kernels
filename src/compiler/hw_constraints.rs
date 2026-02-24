@@ -270,8 +270,12 @@ fn estimate_register_pressure(
         FusionMode::LoopFusion => 3 + group.ops.len(),
         FusionMode::QkvSharedInput => gemm_base_regs(profile),
         FusionMode::NormIntoGemm => gemm_base_regs(profile) + 2,
-        FusionMode::TileLevelFusion | FusionMode::ComputeRoot => {
-            // Future: refine when these modes are implemented
+        FusionMode::TileLevelFusion { .. } => {
+            // GEMM base + 3 scratch for norm (mean, rsqrt, weight)
+            gemm_base_regs(profile) + 3
+        }
+        FusionMode::ComputeRoot { .. } => {
+            // Norm computed fully before GEMM; GEMM runs with base regs only
             gemm_base_regs(profile)
         }
     }
@@ -338,8 +342,8 @@ mod tests {
             "gemm",
         );
 
-        let plan = fusion::fuse(&g);
         let profile = DeviceProfile::detect();
+        let plan = fusion::fuse(&g, &profile);
         let results = check_plan(&plan.groups, &g, &profile);
 
         assert_eq!(results.len(), 1);
@@ -367,8 +371,8 @@ mod tests {
         );
         g.add_op(OpKind::Silu, vec![gemm_out], vec![silu_out], "silu");
 
-        let plan = fusion::fuse(&g);
         let profile = DeviceProfile::detect();
+        let plan = fusion::fuse(&g, &profile);
         let results = check_plan(&plan.groups, &g, &profile);
 
         assert_eq!(results.len(), 1);
@@ -386,7 +390,7 @@ mod tests {
         let profile = DeviceProfile::detect();
         let graph = CompilerGraph::from_layer_ir(&ir, &profile);
         let registry = ScalarOpRegistry::with_defaults();
-        let plan = fusion::fuse_with_dag(&graph, &registry);
+        let plan = fusion::fuse_with_dag(&graph, &registry, &profile);
 
         let results = check_plan(&plan.groups, &graph, &profile);
 
@@ -471,8 +475,8 @@ mod tests {
         );
         g.add_op(OpKind::Silu, vec![gemm_out], vec![silu_out], "silu");
 
-        let plan = fusion::fuse(&g);
         let profile = DeviceProfile::detect();
+        let plan = fusion::fuse(&g, &profile);
         let checker = HwConstraintChecker::new(&profile);
 
         for group in &plan.groups {
@@ -633,7 +637,7 @@ mod tests {
         let profile = DeviceProfile::detect();
         let graph = CompilerGraph::from_layer_ir(&ir, &profile);
         let registry = ScalarOpRegistry::with_defaults();
-        let plan = fusion::fuse_with_dag(&graph, &registry);
+        let plan = fusion::fuse_with_dag(&graph, &registry, &profile);
 
         let checker = HwConstraintChecker::new(&profile);
         let results = checker.validate_plan(&plan.groups, &graph);

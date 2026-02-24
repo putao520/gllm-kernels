@@ -1534,8 +1534,8 @@ pub enum CompilerOp {
     RmsNorm { hidden_size: usize, eps: f32 },
     /// LayerNorm: out = (x - mean) / sqrt(var + eps) * gamma + beta
     LayerNorm { hidden_size: usize, eps: f32 },
-    /// 激活函数
-    Activation(ActivationType),
+    /// 激活函数（通过 OpKind 引用 → registry → OpTrace）
+    Activation(OpKind),
     /// 逐元素加
     Add,
     /// 逐元素乘
@@ -1552,10 +1552,13 @@ pub enum CompilerOp {
     Transpose { perm: Vec<usize> },
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ActivationType {
-    SiLU, GeLU, ReLU, Tanh, Exp,
-}
+// ActivationType 已删除 — 激活函数通过 OpKind 引用 ScalarOpRegistry，
+// 编译器从 OpTrace.body 的 TraceOp 序列自动生成 SIMD 指令，
+// 不再硬编码算子语义。
+//
+// 原 CompilerOp::Activation(ActivationType::SiLU)
+// → CompilerOp::Activation(OpKind::Silu)
+// → registry.get_trace(OpKind::Silu) → OpTrace { pattern: Elementwise { body: [...] } }
 
 /// 张量描述
 pub struct TensorDesc {
@@ -2336,7 +2339,8 @@ pub struct ModelConfig {
     pub vocab_size: usize,
     pub max_seq_len: usize,
     pub norm_type: NormType,
-    pub activation: ActivationKind,
+    /// FFN 激活函数的 OpTrace body（从 ScalarOpRegistry 获取，不再使用 ActivationKind 枚举）
+    pub activation_trace: Option<Vec<TraceOp>>,
     pub rope_config: Option<RopeConfig>,
     pub dtype: DType,
 }

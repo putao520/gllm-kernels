@@ -1,3 +1,6 @@
+[workspace]
+members = [".", "scalar-ops"]
+
 [package]
 name = "gllm-kernels"
 version = "0.1.0"
@@ -10,6 +13,7 @@ rayon = "1.10"
 libc = "0.2"
 seq-macro = "0.3"
 iced-x86 = { version = "1.21", features = ["code_asm"], optional = true }
+gllm-scalar-ops = { path = "scalar-ops" }
 
 [features]
 default = ["jit-x86"]
@@ -32,3 +36,21 @@ harness = false
 [[bench]]
 name = "baseline_audit"
 harness = false
+
+[[bench]]
+name = "symexec_benchmark"
+harness = false
+
+[[bench]]
+name = "jit_compile_benchmark"
+harness = false
+
+# ── Profile overrides for scalar-ops subcrate ──
+# REQ-SCALAR-002: scalar functions must compile at opt-level=1 to preserve
+# loop structure for symexec binary analysis. opt-level=1 eliminates trivial
+# redundancy but does NOT vectorize or unroll loops.
+[profile.dev.package.gllm-scalar-ops]
+opt-level = 1
+
+[profile.release.package.gllm-scalar-ops]
+opt-level = 1

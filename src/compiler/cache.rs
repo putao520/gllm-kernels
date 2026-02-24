@@ -326,6 +326,78 @@ pub fn config_hash(ir_bytes: &[u8], hw_fingerprint: &str) -> u64 {
     h
 }
 
+// ── CRC32C for data integrity verification ───────────────────────────
+
+/// Compute CRC32C checksum for data integrity verification.
+///
+/// Uses the hardware CRC32C instruction (SSE4.2) when available on x86_64,
+/// otherwise falls back to a software lookup table implementation.
+/// This is for integrity checks on cached code, not for cache keying.
+pub fn crc32c(data: &[u8]) -> u32 {
+    #[cfg(target_arch = "x86_64")]
+    {
+        if is_x86_feature_detected!("sse4.2") {
+            return unsafe { crc32c_hw(data) };
+        }
+    }
+    crc32c_sw(data)
+}
+
+/// Hardware-accelerated CRC32C using SSE4.2 `_mm_crc32_u64` / `_mm_crc32_u8`.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "sse4.2")]
+unsafe fn crc32c_hw(data: &[u8]) -> u32 {
+    #[cfg(target_arch = "x86_64")]
+    use std::arch::x86_64::{_mm_crc32_u64, _mm_crc32_u8};
+
+    let mut crc: u64 = 0xFFFF_FFFF;
+    let mut i = 0;
+    let len = data.len();
+
+    // Process 8 bytes at a time
+    while i + 8 <= len {
+        let chunk = u64::from_le_bytes(data[i..i + 8].try_into().unwrap());
+        crc = _mm_crc32_u64(crc, chunk);
+        i += 8;
+    }
+
+    // Process remaining bytes
+    while i < len {
+        crc = _mm_crc32_u8(crc as u32, data[i]) as u64;
+        i += 1;
+    }
+
+    (crc as u32) ^ 0xFFFF_FFFF
+}
+
+/// Software CRC32C using the Castagnoli polynomial (0x1EDC6F41).
+fn crc32c_sw(data: &[u8]) -> u32 {
+    static TABLE: std::sync::OnceLock<[u32; 256]> = std::sync::OnceLock::new();
+    let table = TABLE.get_or_init(|| {
+        let poly: u32 = 0x82F6_3B78; // bit-reversed Castagnoli
+        let mut t = [0u32; 256];
+        for i in 0..256 {
+            let mut crc = i as u32;
+            for _ in 0..8 {
+                if crc & 1 != 0 {
+                    crc = (crc >> 1) ^ poly;
+                } else {
+                    crc >>= 1;
+                }
+            }
+            t[i] = crc;
+        }
+        t
+    });
+
+    let mut crc = 0xFFFF_FFFFu32;
+    for &b in data {
+        let idx = ((crc ^ b as u32) & 0xFF) as usize;
+        crc = (crc >> 8) ^ table[idx];
+    }
+    crc ^ 0xFFFF_FFFF
+}
+
 // ── Incremental compilation result ──────────────────────────────────
 
 /// Statistics from an incremental model compilation.
@@ -370,6 +442,7 @@ impl SerializedTraceOp {
             TraceOp::Rsqrt(a) => Self { tag: 11, operands: [*a, 0, 0], float_val: 0.0 },
             TraceOp::Tanh(a) => Self { tag: 12, operands: [*a, 0, 0], float_val: 0.0 },
             TraceOp::Recip(a) => Self { tag: 13, operands: [*a, 0, 0], float_val: 0.0 },
+            TraceOp::Log(a) => Self { tag: 16, operands: [*a, 0, 0], float_val: 0.0 },
             TraceOp::Max(a, b) => Self { tag: 14, operands: [*a, *b, 0], float_val: 0.0 },
             TraceOp::Min(a, b) => Self { tag: 15, operands: [*a, *b, 0], float_val: 0.0 },
         }
@@ -393,6 +466,7 @@ impl SerializedTraceOp {
             13 => Some(TraceOp::Recip(self.operands[0])),
             14 => Some(TraceOp::Max(self.operands[0], self.operands[1])),
             15 => Some(TraceOp::Min(self.operands[0], self.operands[1])),
+            16 => Some(TraceOp::Log(self.operands[0])),
             _ => None,
         }
     }
@@ -844,5 +918,48 @@ mod tests {
             let decoded_op = decoded_sop.to_trace_op().unwrap();
             assert_eq!(op, &decoded_op, "roundtrip failed for {op:?}");
         }
+    }
+
+    #[test]
+    fn test_crc32c_known_vectors() {
+        // Empty input
+        assert_eq!(super::crc32c(&[]), 0x0000_0000);
+        // Single zero byte
+        let one_zero = super::crc32c(&[0u8]);
+        assert_ne!(one_zero, 0);
+        // Deterministic
+        assert_eq!(super::crc32c(b"hello"), super::crc32c(b"hello"));
+        // Different data → different checksum
+        assert_ne!(super::crc32c(b"hello"), super::crc32c(b"world"));
+    }
+
+    #[test]
+    fn test_crc32c_sw_matches_hw() {
+        // Ensure software path produces consistent results
+        let data = b"The quick brown fox jumps over the lazy dog";
+        let sw = super::crc32c_sw(data);
+        let full = super::crc32c(data);
+        // On x86_64 with SSE4.2, both paths should agree
+        #[cfg(target_arch = "x86_64")]
+        {
+            if is_x86_feature_detected!("sse4.2") {
+                assert_eq!(sw, full, "HW and SW CRC32C disagree");
+            }
+        }
+        #[cfg(not(target_arch = "x86_64"))]
+        {
+            assert_eq!(sw, full);
+        }
+    }
+
+    #[test]
+    fn test_crc32c_large_data() {
+        let data: Vec<u8> = (0..4096).map(|i| (i & 0xFF) as u8).collect();
+        let crc = super::crc32c(&data);
+        assert_ne!(crc, 0);
+        // Flipping one byte should change the checksum
+        let mut corrupted = data.clone();
+        corrupted[2048] ^= 0x01;
+        assert_ne!(super::crc32c(&corrupted), crc);
     }
 }

@@ -45,7 +45,7 @@ fn test_e2e_llama_7b_full_pipeline() {
     assert_eq!(dag.num_nodes(), graph.num_ops());
 
     // Phase 2: Fusion
-    let plan = fuse_with_dag(&graph, &registry);
+    let plan = fuse_with_dag(&graph, &registry, &profile);
     assert!(
         plan.num_groups() < graph.num_ops(),
         "Fusion should reduce groups: {} groups from {} ops",
@@ -105,7 +105,7 @@ fn test_e2e_gemma_2b_full_pipeline() {
 
     let graph = CompilerGraph::from_layer_ir(&ir, &profile);
     let dag = SemanticDAG::from_graph(&graph, &registry);
-    let plan = fuse_with_dag(&graph, &registry);
+    let plan = fuse_with_dag(&graph, &registry, &profile);
     let hw_results = check_plan(&plan.groups, &graph, &profile);
     let parallel = plan_parallelism(&plan, &graph, &dag, &profile);
     let lifetimes = analyze_lifetimes(&graph, &plan);
@@ -140,8 +140,8 @@ fn test_e2e_fusion_consistency() {
 
     let graph = CompilerGraph::from_layer_ir(&ir, &profile);
 
-    let old_plan = fuse(&graph);
-    let new_plan = fuse_with_dag(&graph, &registry);
+    let old_plan = fuse(&graph, &profile);
+    let new_plan = fuse_with_dag(&graph, &registry, &profile);
 
     // New plan should have same or fewer groups (more aggressive fusion)
     let diff = (old_plan.num_groups() as i32 - new_plan.num_groups() as i32).abs();
@@ -233,7 +233,7 @@ fn test_e2e_buffer_no_overlap() {
     let profile = DeviceProfile::detect();
     let registry = ScalarOpRegistry::with_defaults();
     let graph = CompilerGraph::from_layer_ir(&ir, &profile);
-    let plan = fuse_with_dag(&graph, &registry);
+    let plan = fuse_with_dag(&graph, &registry, &profile);
     let lifetimes = analyze_lifetimes(&graph, &plan);
     let alloc = allocate_buffers(&lifetimes);
 
@@ -274,6 +274,232 @@ fn test_e2e_buffer_no_overlap() {
 
 // ── HW constraints across models ─────────────────────────────────────
 
+// ── Concurrent compilation ─────────────────────────────────────────
+
+/// Spawn 4 threads, each compiling a different LayerIR (different model
+/// configs / hidden sizes). Verify all succeed and produce valid code.
+#[test]
+#[cfg(target_arch = "x86_64")]
+fn test_concurrent_compile_different_layers() {
+    use std::sync::Arc;
+    use std::thread;
+
+    let configs: Vec<ModelConfig> = vec![
+        ModelConfig::llama_7b(),
+        ModelConfig::gemma_2b(),
+        ModelConfig::mistral_7b(),
+        ModelConfig::phi_2b(),
+    ];
+
+    let profile = Arc::new(DeviceProfile::detect());
+
+    let handles: Vec<_> = configs
+        .into_iter()
+        .map(|config| {
+            let profile = Arc::clone(&profile);
+            thread::spawn(move || {
+                let ir = LayerIR::from_model_config(&config, 1);
+                let mut compiler = InferenceCompiler::with_profile((*profile).clone());
+                let layer = compiler.compile_layer(&ir).unwrap();
+                assert!(layer.code_size() > 0);
+                assert!(layer.scratchpad_bytes > 0);
+                (config.arch, layer.config_hash, layer.code_size())
+            })
+        })
+        .collect();
+
+    let results: Vec<_> = handles.into_iter().map(|h| h.join().unwrap()).collect();
+
+    // All 4 threads produced valid, distinct compilations
+    assert_eq!(results.len(), 4);
+    for (i, (arch_i, hash_i, _)) in results.iter().enumerate() {
+        for (j, (_, hash_j, _)) in results.iter().enumerate() {
+            if i != j {
+                assert_ne!(
+                    hash_i, hash_j,
+                    "Different models should produce different hashes"
+                );
+            }
+        }
+    }
+
+    eprintln!(
+        "Concurrent different-layer compile: {:?}",
+        results.iter().map(|(a, _, sz)| format!("{a:?}={sz}B")).collect::<Vec<_>>()
+    );
+}
+
+/// Spawn 4 threads all compiling the same LayerIR through a shared
+/// compiler (behind Arc<Mutex>). Verify all produce identical results
+/// and the cache is hit after the first compilation.
+#[test]
+#[cfg(target_arch = "x86_64")]
+fn test_concurrent_compile_same_layer() {
+    use std::sync::{Arc, Mutex};
+    use std::thread;
+
+    let config = ModelConfig::llama_7b();
+    let ir = LayerIR::from_model_config(&config, 1);
+    let profile = DeviceProfile::detect();
+    let compiler = Arc::new(Mutex::new(InferenceCompiler::with_profile(profile)));
+
+    let handles: Vec<_> = (0..4)
+        .map(|_| {
+            let compiler = Arc::clone(&compiler);
+            let ir = ir.clone();
+            thread::spawn(move || {
+                let mut comp = compiler.lock().unwrap();
+                let layer = comp.compile_layer(&ir).unwrap();
+                (layer.config_hash, layer.code_size(), layer.scratchpad_bytes)
+            })
+        })
+        .collect();
+
+    let results: Vec<_> = handles.into_iter().map(|h| h.join().unwrap()).collect();
+
+    // All threads should get identical results
+    let (first_hash, first_size, first_scratch) = results[0];
+    for (hash, size, scratch) in &results[1..] {
+        assert_eq!(*hash, first_hash, "Cache should return same hash");
+        assert_eq!(*size, first_size, "Cache should return same code size");
+        assert_eq!(*scratch, first_scratch, "Cache should return same scratchpad");
+    }
+
+    // Only 1 entry in cache (all threads compiled the same IR)
+    let comp = compiler.lock().unwrap();
+    assert_eq!(comp.cache_size(), 1);
+}
+
+/// Pre-compile a layer, then spawn 4 threads that all call compile_layer()
+/// with the same IR. All should hit the cache and return consistent results.
+#[test]
+#[cfg(target_arch = "x86_64")]
+fn test_compile_cache_thread_safety() {
+    use std::sync::{Arc, Mutex};
+    use std::thread;
+
+    let config = ModelConfig::llama_7b();
+    let ir = LayerIR::from_model_config(&config, 1);
+    let profile = DeviceProfile::detect();
+    let mut compiler = InferenceCompiler::with_profile(profile);
+
+    // Pre-compile to populate cache
+    let first = compiler.compile_layer(&ir).unwrap();
+    assert_eq!(compiler.cache_size(), 1);
+
+    let compiler = Arc::new(Mutex::new(compiler));
+
+    let handles: Vec<_> = (0..4)
+        .map(|_| {
+            let compiler = Arc::clone(&compiler);
+            let ir = ir.clone();
+            thread::spawn(move || {
+                let mut comp = compiler.lock().unwrap();
+                let layer = comp.compile_layer(&ir).unwrap();
+                (layer.config_hash, layer.code_size(), layer.scratchpad_bytes)
+            })
+        })
+        .collect();
+
+    let results: Vec<_> = handles.into_iter().map(|h| h.join().unwrap()).collect();
+
+    // All cache hits should match the pre-compiled result
+    for (hash, size, scratch) in &results {
+        assert_eq!(*hash, first.config_hash);
+        assert_eq!(*size, first.code_size());
+        assert_eq!(*scratch, first.scratchpad_bytes);
+    }
+
+    // Cache size unchanged — no new entries
+    let comp = compiler.lock().unwrap();
+    assert_eq!(comp.cache_size(), 1);
+}
+
+/// Verify concurrent creation of ScalarOpRegistry is safe and produces
+/// consistent results across threads.
+#[test]
+fn test_concurrent_scalar_op_registry() {
+    use std::thread;
+
+    let handles: Vec<_> = (0..4)
+        .map(|_| {
+            thread::spawn(|| {
+                let reg = ScalarOpRegistry::with_defaults();
+                let num_entries = reg.num_entries();
+                let num_traces = reg.num_traces();
+
+                // Spot-check a few traces exist
+                assert!(reg.get_trace(&gllm_kernels::compiler::OpKindKey::Silu).is_some());
+                assert!(reg.get_trace(&gllm_kernels::compiler::OpKindKey::Gelu).is_some());
+                assert!(reg.get_trace(&gllm_kernels::compiler::OpKindKey::Gemm).is_some());
+
+                (num_entries, num_traces)
+            })
+        })
+        .collect();
+
+    let results: Vec<_> = handles.into_iter().map(|h| h.join().unwrap()).collect();
+
+    // All threads should see the same registry contents
+    let (first_entries, first_traces) = results[0];
+    assert!(first_entries > 0);
+    assert!(first_traces > 0);
+    for (entries, traces) in &results[1..] {
+        assert_eq!(*entries, first_entries, "Registry entry count mismatch across threads");
+        assert_eq!(*traces, first_traces, "Registry trace count mismatch across threads");
+    }
+}
+
+/// Compile the same IR in 4 independent threads (each with its own compiler),
+/// verify all produce byte-identical code.
+#[test]
+#[cfg(target_arch = "x86_64")]
+fn test_deterministic_across_threads() {
+    use std::sync::Arc;
+    use std::thread;
+
+    let config = ModelConfig::llama_7b();
+    let ir = Arc::new(LayerIR::from_model_config(&config, 1));
+    let profile = Arc::new(DeviceProfile::detect());
+
+    let handles: Vec<_> = (0..4)
+        .map(|_| {
+            let ir = Arc::clone(&ir);
+            let profile = Arc::clone(&profile);
+            thread::spawn(move || {
+                // Use lower-level APIs to get raw code bytes
+                let graph = CompilerGraph::from_layer_ir(&ir, &profile);
+                let output = codegen::emitter::emit_stub_code(&graph);
+                (output.code, output.scratchpad_bytes)
+            })
+        })
+        .collect();
+
+    let results: Vec<_> = handles.into_iter().map(|h| h.join().unwrap()).collect();
+
+    let (ref first_code, first_scratch) = results[0];
+    assert!(!first_code.is_empty());
+    for (i, (code, scratch)) in results.iter().enumerate().skip(1) {
+        assert_eq!(
+            code, first_code,
+            "Thread {} produced different code bytes than thread 0",
+            i
+        );
+        assert_eq!(
+            *scratch, first_scratch,
+            "Thread {} produced different scratchpad size than thread 0",
+            i
+        );
+    }
+
+    eprintln!(
+        "Determinism verified: {} bytes identical across 4 threads",
+        first_code.len()
+    );
+}
+
+// ── HW constraints across models ─────────────────────────────────────
+
 /// HW constraints: all groups for all model configs should pass.
 #[test]
 fn test_e2e_hw_constraints_all_models() {
@@ -285,7 +511,7 @@ fn test_e2e_hw_constraints_all_models() {
     for config in &configs {
         let ir = LayerIR::from_model_config(config, 1);
         let graph = CompilerGraph::from_layer_ir(&ir, &profile);
-        let plan = fuse_with_dag(&graph, &registry);
+        let plan = fuse_with_dag(&graph, &registry, &profile);
         let results = check_plan(&plan.groups, &graph, &profile);
 
         let violations: Vec<_> = results.iter().filter(|r| !r.valid).collect();

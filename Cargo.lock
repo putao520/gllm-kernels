@@ -274,6 +274,7 @@ name = "gllm-kernels"
 version = "0.1.0"
 dependencies = [
  "criterion",
+ "gllm-scalar-ops",
  "half",
  "iced-x86",
  "libc",
@@ -283,6 +284,10 @@ dependencies = [
  "rayon",
  "seq-macro",
 ]
+
+[[package]]
+name = "gllm-scalar-ops"
+version = "0.1.0"
 
 [[package]]
 name = "half"

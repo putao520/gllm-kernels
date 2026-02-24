@@ -59,7 +59,9 @@ fn plan_group(
     let (num_threads, parallel_dim, thread_local_acc) = match group.mode {
         FusionMode::EpilogueInjection
         | FusionMode::NormIntoGemm
-        | FusionMode::QkvSharedInput => {
+        | FusionMode::QkvSharedInput
+        | FusionMode::TileLevelFusion { .. }
+        | FusionMode::ComputeRoot { .. } => {
             plan_gemm_group(group, graph, profile)
         }
         FusionMode::Standalone => {
@@ -76,10 +78,6 @@ fn plan_group(
         }
         FusionMode::LoopFusion => {
             plan_elementwise_group(group, graph, dag, profile)
-        }
-        FusionMode::TileLevelFusion | FusionMode::ComputeRoot => {
-            // Future: dedicated strategies; fall back to GEMM-like for now
-            plan_gemm_group(group, graph, profile)
         }
     };
 
@@ -196,9 +194,9 @@ mod tests {
         );
 
         let registry = ScalarOpRegistry::with_defaults();
-        let plan = fusion::fuse_with_dag(&g, &registry);
-        let dag = SemanticDAG::from_graph(&g, &registry);
         let profile = DeviceProfile::detect();
+        let plan = fusion::fuse_with_dag(&g, &registry, &profile);
+        let dag = SemanticDAG::from_graph(&g, &registry);
 
         let strategies = plan_parallelism(&plan, &g, &dag, &profile);
         assert_eq!(strategies.len(), 1);
@@ -224,9 +222,9 @@ mod tests {
         g.add_op(OpKind::Silu, vec![a], vec![b], "silu");
 
         let registry = ScalarOpRegistry::with_defaults();
-        let plan = fusion::fuse_with_dag(&g, &registry);
-        let dag = SemanticDAG::from_graph(&g, &registry);
         let profile = DeviceProfile::detect();
+        let plan = fusion::fuse_with_dag(&g, &registry, &profile);
+        let dag = SemanticDAG::from_graph(&g, &registry);
 
         let strategies = plan_parallelism(&plan, &g, &dag, &profile);
         assert_eq!(strategies.len(), 1);
@@ -241,7 +239,7 @@ mod tests {
         let profile = DeviceProfile::detect();
         let graph = CompilerGraph::from_layer_ir(&ir, &profile);
         let registry = ScalarOpRegistry::with_defaults();
-        let plan = fusion::fuse_with_dag(&graph, &registry);
+        let plan = fusion::fuse_with_dag(&graph, &registry, &profile);
         let dag = SemanticDAG::from_graph(&graph, &registry);
 
         let strategies = plan_parallelism(&plan, &graph, &dag, &profile);

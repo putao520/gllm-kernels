@@ -124,6 +124,8 @@ pub enum TraceOp {
     Rsqrt(u32),
     Tanh(u32),
     Recip(u32),
+    /// Natural logarithm: ln(x).
+    Log(u32),
     Max(u32, u32),
     Min(u32, u32),
 }
@@ -180,7 +182,7 @@ mod tests {
                 TraceOp::Input(_) | TraceOp::Const(_) => {}
                 TraceOp::Neg(a) | TraceOp::Abs(a) | TraceOp::Exp(a)
                 | TraceOp::Sqrt(a) | TraceOp::Rsqrt(a) | TraceOp::Tanh(a)
-                | TraceOp::Recip(a) => {
+                | TraceOp::Recip(a) | TraceOp::Log(a) => {
                     assert!((*a as usize) < i, "SSA violation at index {i}: operand {a}");
                 }
                 TraceOp::Add(a, b) | TraceOp::Sub(a, b) | TraceOp::Mul(a, b)
@@ -280,5 +282,15 @@ mod tests {
     fn trace_scalar_fn_signature_send_sync() {
         fn assert_send_sync<T: Send + Sync>() {}
         assert_send_sync::<ScalarFnSignature>();
+    }
+
+    #[test]
+    fn test_trace_op_log_display() {
+        // Verify TraceOp::Log Debug representation is correct
+        let op = TraceOp::Log(0);
+        assert_eq!(format!("{op:?}"), "Log(0)");
+
+        let op5 = TraceOp::Log(5);
+        assert_eq!(format!("{op5:?}"), "Log(5)");
     }
 }

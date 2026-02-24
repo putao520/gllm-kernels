@@ -204,10 +204,10 @@ impl InferenceCompiler {
 
     fn compute_hash(&self, ir: &LayerIR) -> u64 {
         let ir_desc = format!(
-            "{:?}_h{}_nh{}_nkv{}_hd{}_inter{}_q{:?}_dt{:?}_mb{}_ms{}",
+            "{:?}_h{}_nh{}_nkv{}_hd{}_inter{}_q{:?}_dt{:?}_mb{}_ms{}_eps{}",
             ir.arch, ir.hidden, ir.num_heads, ir.num_kv_heads,
             ir.head_dim, ir.intermediate, ir.quant, ir.dtype,
-            ir.max_batch, ir.max_seq,
+            ir.max_batch, ir.max_seq, ir.rms_eps.to_bits(),
         );
         let hw_fp = self.profile.hw_info.fingerprint();
         cache::config_hash(ir_desc.as_bytes(), &hw_fp)
@@ -230,7 +230,7 @@ impl InferenceCompiler {
         let semantic_dag = SemanticDAG::from_graph(&graph, &registry);
 
         // Phase 2: Fusion decisions + buffer allocation
-        let fusion_plan = fusion::fuse_with_dag_prebuilt(&graph, &semantic_dag);
+        let fusion_plan = fusion::fuse_with_dag_prebuilt(&graph, &semantic_dag, &self.profile);
         let lifetimes = buffer_alloc::analyze_lifetimes(&graph, &fusion_plan);
         let alloc = buffer_alloc::allocate_buffers(&lifetimes);
 
@@ -260,7 +260,7 @@ impl InferenceCompiler {
     ) -> Result<CompiledLayer, InferenceError> {
         let registry = ScalarOpRegistry::with_defaults();
         let semantic_dag = SemanticDAG::from_graph(graph, &registry);
-        let fusion_plan = fusion::fuse_with_dag_prebuilt(graph, &semantic_dag);
+        let fusion_plan = fusion::fuse_with_dag_prebuilt(graph, &semantic_dag, &self.profile);
         let lifetimes = buffer_alloc::analyze_lifetimes(graph, &fusion_plan);
         let alloc = buffer_alloc::allocate_buffers(&lifetimes);
 
@@ -333,7 +333,7 @@ mod tests {
         assert!(graph.num_ops() >= 14);
 
         // Phase 2: Fusion
-        let fplan = fusion::fuse(&graph);
+        let fplan = fusion::fuse(&graph, &profile);
         assert!(fplan.num_groups() < graph.num_ops());
 
         // Phase 3: Codegen (stub for now)
@@ -362,7 +362,7 @@ mod tests {
         let profile = DeviceProfile::detect();
 
         let graph = CompilerGraph::from_layer_ir(&ir, &profile);
-        let fplan = fusion::fuse(&graph);
+        let fplan = fusion::fuse(&graph, &profile);
         let output = codegen::emitter::emit_stub_code(&graph);
 
         let mut compiler = InferenceCompiler::with_profile(profile);

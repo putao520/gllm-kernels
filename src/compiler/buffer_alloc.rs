@@ -5,8 +5,8 @@
 //! graph coloring.
 
 use std::collections::{HashMap, HashSet};
-use crate::compiler::graph::{CompilerGraph, TensorId, OpId};
-use crate::compiler::fusion::FusionPlan;
+use crate::compiler::graph::{CompilerGraph, TensorId, OpId, OpKind};
+use crate::compiler::fusion::{FusionPlan, FusionMode};
 
 /// A tensor's lifetime interval: [first_use, last_use] in schedule order.
 #[derive(Debug, Clone, Copy)]
@@ -172,6 +172,63 @@ fn find_offset(lt: &Lifetime, active: &[(usize, usize, usize)]) -> usize {
     (candidate + 63) & !63
 }
 
+/// Per-group scratch buffer requirement for TileLevelFusion.
+#[derive(Debug, Clone)]
+pub struct GroupScratch {
+    /// Fusion group ID.
+    pub group_id: usize,
+    /// Scratch bytes needed (tile_rows × K × sizeof(f32)).
+    pub scratch_bytes: usize,
+}
+
+/// Compute scratch buffer requirements for TileLevelFusion groups.
+///
+/// Each TileLevelFusion group needs a scratch buffer to hold the tiled norm
+/// output (tile_rows × K × element_size). This is separate from the
+/// intermediate tensor allocation because it's a temporary within the
+/// microkernel's MC loop, not a full tensor.
+pub fn compute_scratch_requirements(
+    plan: &FusionPlan,
+    graph: &CompilerGraph,
+) -> Vec<GroupScratch> {
+    plan.groups
+        .iter()
+        .filter_map(|group| {
+            if let FusionMode::TileLevelFusion { tile_rows, .. } = group.mode {
+                // Find the GEMM op to get K dimension
+                let k = group.ops.iter().find_map(|&oid| {
+                    graph.op(oid).and_then(|o| match &o.kind {
+                        OpKind::Gemm { k, .. }
+                        | OpKind::GemmBias { k, .. }
+                        | OpKind::QuantGemm { k, .. } => Some(*k),
+                        _ => None,
+                    })
+                }).unwrap_or(0);
+
+                let elem_size = group.ops.iter().find_map(|&oid| {
+                    graph.op(oid).and_then(|o| {
+                        o.outputs.first().and_then(|&tid| {
+                            graph.tensor(tid).map(|t| t.dtype.size_bytes())
+                        })
+                    })
+                }).unwrap_or(4);
+
+                let scratch_bytes = tile_rows * k * elem_size;
+                if scratch_bytes > 0 {
+                    Some(GroupScratch {
+                        group_id: group.id,
+                        scratch_bytes,
+                    })
+                } else {
+                    None
+                }
+            } else {
+                None
+            }
+        })
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -249,7 +306,7 @@ mod tests {
         let profile = DeviceProfile::detect();
         let graph = CompilerGraph::from_layer_ir(&ir, &profile);
         let registry = ScalarOpRegistry::with_defaults();
-        let plan = fusion::fuse_with_dag(&graph, &registry);
+        let plan = fusion::fuse_with_dag(&graph, &registry, &profile);
 
         let lifetimes = analyze_lifetimes(&graph, &plan);
         assert!(!lifetimes.is_empty(), "LLaMA graph should have intermediate tensors");

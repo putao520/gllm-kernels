@@ -39,7 +39,10 @@ pub mod profiling;
 pub mod autotuning;
 pub mod dispatch;
 pub mod inference;
-pub mod scalar_ops;
+/// Re-export scalar_ops from the `gllm-scalar-ops` subcrate.
+/// The subcrate is compiled at opt-level=1 (REQ-SCALAR-002) to preserve
+/// loop structure for symexec binary analysis.
+pub use gllm_scalar_ops as scalar_ops;
 pub mod compiler;
 pub mod ffi;
 

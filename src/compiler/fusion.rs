@@ -46,9 +46,19 @@ pub enum FusionMode {
     /// Chain of elementwise ops collapsed into a single loop.
     LoopFusion,
     /// Tile-level fusion: predecessor tile computation embedded in GEMM MC loop.
-    TileLevelFusion,
-    /// Compute root: standalone compute-bound op (placeholder for future use).
-    ComputeRoot,
+    /// Used when predecessor output > 75% L1 — tiles are computed per MC strip.
+    TileLevelFusion {
+        /// The predecessor op (e.g. RmsNorm) whose output is tiled into the GEMM MC loop.
+        predecessor: OpId,
+        /// Number of rows per tile (= MC from GEMM blocking).
+        tile_rows: usize,
+    },
+    /// Compute root: predecessor computed fully before GEMM, result stays in L1/L2.
+    /// Used when predecessor output ≤ 75% L1.
+    ComputeRoot {
+        /// The predecessor op computed as a standalone root.
+        predecessor: OpId,
+    },
     /// Three QKV GEMMs sharing the same input → single pack_a.
     QkvSharedInput,
     /// RmsNorm output feeds directly into GEMM (no intermediate writeback).
@@ -85,12 +95,129 @@ impl FusionPlan {
     }
 }
 
+// ── Fusion cost model (WI-4) ────────────────────────────────────────────
+
+/// Cost estimate for a fusion decision.
+#[derive(Debug, Clone)]
+pub struct FusionCost {
+    /// Bytes of intermediate data eliminated by fusion (saved memory traffic).
+    pub bytes_saved: usize,
+    /// Extra registers consumed by the fused kernel vs separate kernels.
+    pub extra_regs: usize,
+    /// Scratch buffer bytes needed for tiled fusion (0 for epilogue/loop fusion).
+    pub scratch_bytes: usize,
+    /// Net benefit score: positive means fusion is profitable.
+    /// `benefit = bytes_saved - penalty`, where penalty accounts for register
+    /// spill cost and scratch buffer overhead.
+    pub benefit: i64,
+}
+
+/// Estimate the cost/benefit of a fusion group.
+///
+/// The model is roofline-inspired:
+/// - Benefit: bytes of intermediate tensors that no longer need to be written/read
+///   from memory (2× the tensor size for write + read-back).
+/// - Cost: register pressure increase may cause spills (each spill ≈ 64 bytes
+///   round-trip to stack), plus scratch buffer allocation overhead.
+pub fn estimate_fusion_cost(
+    group: &FusionGroup,
+    graph: &CompilerGraph,
+    profile: &crate::dispatch::DeviceProfile,
+) -> FusionCost {
+    let avail_regs = profile.num_simd_regs();
+    let (l1, _, _) = profile.cache_sizes();
+
+    // Bytes saved: sum of intermediate tensor sizes that are consumed only within the group
+    let group_ops: HashSet<OpId> = group.ops.iter().copied().collect();
+    let mut bytes_saved: usize = 0;
+
+    for &op_id in &group.ops {
+        let op = match graph.op(op_id) {
+            Some(o) => o,
+            None => continue,
+        };
+        for &out_tid in &op.outputs {
+            let tensor = match graph.tensor(out_tid) {
+                Some(t) => t,
+                None => continue,
+            };
+            // If all consumers are within the group, this intermediate is eliminated
+            let all_internal = tensor
+                .consumers
+                .iter()
+                .all(|c| group_ops.contains(c));
+            if all_internal && !tensor.consumers.is_empty() {
+                // Write + read-back eliminated
+                let size = tensor.shape.iter().product::<usize>() * tensor.dtype.size_bytes();
+                bytes_saved += size * 2;
+            }
+        }
+    }
+
+    // Register pressure estimate
+    let base_regs = match group.mode {
+        FusionMode::EpilogueInjection => {
+            // GEMM accumulators + epilogue temporaries
+            let nr = profile.gemm_blocking(0, 0, 0).nr;
+            let mr = profile.gemm_blocking(0, 0, 0).mr;
+            let acc = (mr * nr) / (profile.simd_width_bytes() / 4);
+            acc + group.epilogue.len().min(4)
+        }
+        FusionMode::TileLevelFusion { .. } => {
+            let nr = profile.gemm_blocking(0, 0, 0).nr;
+            let mr = profile.gemm_blocking(0, 0, 0).mr;
+            let acc = (mr * nr) / (profile.simd_width_bytes() / 4);
+            acc + 3 // norm scratch: mean, rsqrt, weight
+        }
+        FusionMode::LoopFusion => {
+            // 1 input + 1 output + 1 temp per fused op
+            1 + group.ops.len().min(8)
+        }
+        _ => 0,
+    };
+    let extra_regs = base_regs.saturating_sub(avail_regs / 2);
+
+    // Scratch buffer for TileLevelFusion
+    let scratch_bytes = match group.mode {
+        FusionMode::TileLevelFusion { tile_rows, .. } => {
+            // Scratch = tile_rows × K × sizeof(f32) for the tiled norm output
+            let k = group.ops.iter().find_map(|&oid| {
+                graph.op(oid).and_then(|o| match &o.kind {
+                    OpKind::Gemm { k, .. }
+                    | OpKind::GemmBias { k, .. }
+                    | OpKind::QuantGemm { k, .. } => Some(*k),
+                    _ => None,
+                })
+            }).unwrap_or(0);
+            tile_rows * k * 4 // f32
+        }
+        _ => 0,
+    };
+
+    // Penalty: spill cost + scratch overhead
+    let spill_penalty = (extra_regs as i64) * 64 * 2; // 64B per spill, write+read
+    let scratch_penalty = if scratch_bytes > l1 / 2 {
+        scratch_bytes as i64 // heavy penalty if scratch exceeds half L1
+    } else {
+        0
+    };
+
+    let benefit = bytes_saved as i64 - spill_penalty - scratch_penalty;
+
+    FusionCost {
+        bytes_saved,
+        extra_regs,
+        scratch_bytes,
+        benefit,
+    }
+}
+
 /// Run the fusion pass on a CompilerGraph.
 ///
 /// Returns a `FusionPlan` describing which ops are grouped together.
 /// The plan respects data dependencies (topological order) and only
 /// fuses ops that `semantics::can_fuse()` approves.
-pub fn fuse(graph: &CompilerGraph) -> FusionPlan {
+pub fn fuse(graph: &CompilerGraph, profile: &crate::dispatch::DeviceProfile) -> FusionPlan {
     let topo = graph.topological_sort();
     let mut groups: Vec<FusionGroup> = Vec::new();
     let mut op_to_group: std::collections::HashMap<OpId, usize> = std::collections::HashMap::new();
@@ -134,11 +261,13 @@ pub fn fuse(graph: &CompilerGraph) -> FusionPlan {
                     let gid = groups.len();
                     let mut all_ops = Vec::new();
 
-                    let mode = if norm_prefix.is_some() && !epilogue.is_empty() {
-                        // Both norm prefix and epilogue
-                        FusionMode::EpilogueInjection
-                    } else if norm_prefix.is_some() {
-                        FusionMode::NormIntoGemm
+                    let mode = if let Some(norm_id) = norm_prefix {
+                        if !epilogue.is_empty() {
+                            // Both norm prefix and epilogue
+                            FusionMode::EpilogueInjection
+                        } else {
+                            detect_tile_vs_compute_root(graph, op, norm_id, profile)
+                        }
                     } else {
                         FusionMode::EpilogueInjection
                     };
@@ -427,9 +556,9 @@ fn collect_elementwise_chain<'a>(
 ///
 /// Uses OpTrace-derived `OpClass` instead of hand-maintained `OpSemantics`.
 /// This is the new preferred entry point; `fuse()` is kept for backward compat.
-pub fn fuse_with_dag(graph: &CompilerGraph, registry: &ScalarOpRegistry) -> FusionPlan {
+pub fn fuse_with_dag(graph: &CompilerGraph, registry: &ScalarOpRegistry, profile: &crate::dispatch::DeviceProfile) -> FusionPlan {
     let dag = SemanticDAG::from_graph(graph, registry);
-    fuse_with_dag_prebuilt(graph, &dag)
+    fuse_with_dag_prebuilt(graph, &dag, profile)
 }
 
 /// Fusion pass using a pre-built SemanticDAG.
@@ -437,7 +566,7 @@ pub fn fuse_with_dag(graph: &CompilerGraph, registry: &ScalarOpRegistry) -> Fusi
 /// Use this when the caller already has a `SemanticDAG` to avoid redundant
 /// construction (e.g., `jit_compile` builds the DAG once for both analysis
 /// and fusion).
-pub fn fuse_with_dag_prebuilt(graph: &CompilerGraph, dag: &SemanticDAG) -> FusionPlan {
+pub fn fuse_with_dag_prebuilt(graph: &CompilerGraph, dag: &SemanticDAG, profile: &crate::dispatch::DeviceProfile) -> FusionPlan {
     let topo = graph.topological_sort();
     let mut groups: Vec<FusionGroup> = Vec::new();
     let mut op_to_group: HashMap<OpId, usize> = HashMap::new();
@@ -478,10 +607,13 @@ pub fn fuse_with_dag_prebuilt(graph: &CompilerGraph, dag: &SemanticDAG) -> Fusio
                 if norm_prefix.is_some() || !epilogue.is_empty() {
                     let gid = groups.len();
                     let mut all_ops = Vec::new();
-                    let mode = if norm_prefix.is_some() && !epilogue.is_empty() {
-                        FusionMode::EpilogueInjection
-                    } else if norm_prefix.is_some() {
-                        FusionMode::NormIntoGemm
+                    let mode = if let Some(norm_id) = norm_prefix {
+                        if !epilogue.is_empty() {
+                            FusionMode::EpilogueInjection
+                        } else {
+                            // Decide TileLevelFusion vs ComputeRoot based on L1 capacity
+                            detect_tile_vs_compute_root(graph, op, norm_id, profile)
+                        }
                     } else {
                         FusionMode::EpilogueInjection
                     };
@@ -612,6 +744,49 @@ fn detect_norm_into_gemm_dag(
     }
 
     Some(producer_id)
+}
+
+/// Decide between TileLevelFusion and ComputeRoot for a norm→GEMM pair.
+///
+/// If the norm output tensor exceeds 75% of L1, the norm must be tiled into
+/// the GEMM MC loop (TileLevelFusion). Otherwise, the norm is computed fully
+/// first and its result stays in L1 (ComputeRoot).
+fn detect_tile_vs_compute_root(
+    graph: &CompilerGraph,
+    gemm_op: &CompilerOp,
+    norm_id: OpId,
+    profile: &crate::dispatch::DeviceProfile,
+) -> FusionMode {
+    let (l1, _, _) = profile.cache_sizes();
+    let l1_budget = l1 * 75 / 100; // 75% of L1
+
+    // Compute norm output size in bytes
+    let norm_output_bytes = gemm_op
+        .inputs
+        .first()
+        .and_then(|tid| graph.tensor(*tid))
+        .map(|t| t.shape.iter().product::<usize>() * t.dtype.size_bytes())
+        .unwrap_or(0);
+
+    if norm_output_bytes > l1_budget {
+        // Norm output doesn't fit in L1 → tile into GEMM MC loop
+        let (m, n, k) = match &gemm_op.kind {
+            OpKind::Gemm { m, n, k }
+            | OpKind::GemmBias { m, n, k }
+            | OpKind::QuantGemm { m, n, k, .. } => (*m, *n, *k),
+            _ => (0, 0, 0),
+        };
+        let blocking = profile.gemm_blocking(m, n, k);
+        FusionMode::TileLevelFusion {
+            predecessor: norm_id,
+            tile_rows: blocking.mc,
+        }
+    } else {
+        // Norm output fits in L1 → compute root (standalone norm, result stays in L1)
+        FusionMode::ComputeRoot {
+            predecessor: norm_id,
+        }
+    }
 }
 
 /// Collect epilogue using DAG OpClass.
@@ -753,7 +928,7 @@ mod tests {
         let ir = LayerIR::from_model_config(&config, 1);
         let profile = DeviceProfile::detect();
         let graph = CompilerGraph::from_layer_ir(&ir, &profile);
-        let plan = fuse(&graph);
+        let plan = fuse(&graph, &profile);
 
         eprintln!("{plan}");
 
@@ -800,7 +975,8 @@ mod tests {
         );
         g.add_op(OpKind::Silu, vec![gemm_out], vec![silu_out], "silu");
 
-        let plan = fuse(&g);
+        let profile = DeviceProfile::detect();
+        let plan = fuse(&g, &profile);
         eprintln!("{plan}");
 
         // Should fuse into one group
@@ -818,7 +994,8 @@ mod tests {
 
         g.add_op(OpKind::Softmax, vec![a], vec![b], "softmax");
 
-        let plan = fuse(&g);
+        let profile = DeviceProfile::detect();
+        let plan = fuse(&g, &profile);
         assert_eq!(plan.num_groups(), 1);
         assert_eq!(plan.groups[0].mode, FusionMode::Standalone);
     }
@@ -836,7 +1013,8 @@ mod tests {
         g.add_op(OpKind::Silu, vec![b], vec![c], "silu2");
         g.add_op(OpKind::Silu, vec![c], vec![d], "silu3");
 
-        let plan = fuse(&g);
+        let profile = DeviceProfile::detect();
+        let plan = fuse(&g, &profile);
         assert_eq!(plan.num_groups(), 1);
         assert_eq!(plan.groups[0].mode, FusionMode::LoopFusion);
         assert_eq!(plan.groups[0].ops.len(), 3);
@@ -853,7 +1031,8 @@ mod tests {
         g.add_op(OpKind::Silu, vec![a], vec![b], "silu");
         g.add_op(OpKind::Softmax, vec![b], vec![c], "softmax");
 
-        let plan = fuse(&g);
+        let profile = DeviceProfile::detect();
+        let plan = fuse(&g, &profile);
         // Silu and Softmax should be in separate groups
         assert_eq!(plan.num_groups(), 2);
     }
@@ -864,7 +1043,7 @@ mod tests {
         let ir = LayerIR::from_model_config(&config, 1);
         let profile = DeviceProfile::detect();
         let graph = CompilerGraph::from_layer_ir(&ir, &profile);
-        let plan = fuse(&graph);
+        let plan = fuse(&graph, &profile);
 
         eprintln!("{plan}");
 
@@ -884,7 +1063,7 @@ mod tests {
         let graph = CompilerGraph::from_layer_ir(&ir, &profile);
         let registry = crate::compiler::registry::ScalarOpRegistry::with_defaults();
 
-        let plan = fuse_with_dag(&graph, &registry);
+        let plan = fuse_with_dag(&graph, &registry, &profile);
 
         eprintln!("DAG-based fusion:\n{plan}");
 
@@ -917,8 +1096,8 @@ mod tests {
         let graph = CompilerGraph::from_layer_ir(&ir, &profile);
         let registry = crate::compiler::registry::ScalarOpRegistry::with_defaults();
 
-        let old_plan = fuse(&graph);
-        let new_plan = fuse_with_dag(&graph, &registry);
+        let old_plan = fuse(&graph, &profile);
+        let new_plan = fuse_with_dag(&graph, &registry, &profile);
 
         // Same number of groups (or very close — Injective handling may differ slightly)
         let diff = (old_plan.num_groups() as i32 - new_plan.num_groups() as i32).abs();
@@ -955,7 +1134,8 @@ mod tests {
         g.add_op(OpKind::Silu, vec![gemm_out], vec![silu_out], "silu");
 
         let registry = crate::compiler::registry::ScalarOpRegistry::with_defaults();
-        let plan = fuse_with_dag(&g, &registry);
+        let profile = DeviceProfile::detect();
+        let plan = fuse_with_dag(&g, &registry, &profile);
 
         assert_eq!(plan.num_groups(), 1);
         assert_eq!(plan.groups[0].mode, FusionMode::EpilogueInjection);
@@ -980,7 +1160,8 @@ mod tests {
         g.add_op(OpKind::Silu, vec![rope_out], vec![silu_out], "silu");
 
         let registry = crate::compiler::registry::ScalarOpRegistry::with_defaults();
-        let plan = fuse_with_dag(&g, &registry);
+        let profile = DeviceProfile::detect();
+        let plan = fuse_with_dag(&g, &registry, &profile);
 
         // RoPE + Silu should fuse (both fusable in new path: Injective + ElemWise)
         assert_eq!(plan.num_groups(), 1);
@@ -1007,7 +1188,8 @@ mod tests {
         );
         g.add_op(OpKind::Silu, vec![gemm_out], vec![silu_out], "silu");
 
-        let plan = fuse(&g);
+        let profile = DeviceProfile::detect();
+        let plan = fuse(&g, &profile);
         assert_eq!(plan.num_groups(), 1);
         assert_eq!(plan.groups[0].mode, FusionMode::EpilogueInjection);
     }
@@ -1027,7 +1209,8 @@ mod tests {
             "qgemm",
         );
 
-        let plan = fuse(&g);
+        let profile = DeviceProfile::detect();
+        let plan = fuse(&g, &profile);
         assert_eq!(plan.num_groups(), 1);
         assert_eq!(plan.groups[0].mode, FusionMode::Standalone);
     }
@@ -1046,7 +1229,8 @@ mod tests {
             "dequant",
         );
 
-        let plan = fuse(&g);
+        let profile = DeviceProfile::detect();
+        let plan = fuse(&g, &profile);
         assert_eq!(plan.num_groups(), 1);
     }
 
@@ -1072,7 +1256,8 @@ mod tests {
         );
 
         let registry = crate::compiler::registry::ScalarOpRegistry::with_defaults();
-        let plan = fuse_with_dag(&g, &registry);
+        let profile = DeviceProfile::detect();
+        let plan = fuse_with_dag(&g, &registry, &profile);
 
         // Softmax and GEMM must be in separate groups — no NormIntoGemm fusion
         assert_eq!(plan.num_groups(), 2, "Softmax should not fuse as norm prefix");
@@ -1121,7 +1306,7 @@ mod tests {
             "swiglu",
         );
 
-        let plan = fuse(&g);
+        let plan = fuse(&g, &DeviceProfile::detect());
         // SwiGlu must NOT be fused into gemm_main's epilogue
         let gemm_main_group = plan.groups.iter().find(|grp| {
             grp.ops.iter().any(|&oid| {
@@ -1167,7 +1352,8 @@ mod tests {
         );
 
         let registry = crate::compiler::registry::ScalarOpRegistry::with_defaults();
-        let plan = fuse_with_dag(&g, &registry);
+        let profile = DeviceProfile::detect();
+        let plan = fuse_with_dag(&g, &registry, &profile);
 
         let gemm_main_group = plan.groups.iter().find(|grp| {
             grp.ops.iter().any(|&oid| {
@@ -1180,5 +1366,323 @@ mod tests {
             }),
             "SwiGlu with external input must not be fused into GEMM epilogue (DAG path)"
         );
+    }
+
+    // ── WI-22: Fusion cost model tests ────────────────────────────────
+
+    /// Helper: find the fusion group containing the op with the given label.
+    fn find_group_by_label<'a>(
+        plan: &'a FusionPlan,
+        graph: &CompilerGraph,
+        label: &str,
+    ) -> Option<&'a FusionGroup> {
+        plan.groups.iter().find(|grp| {
+            grp.ops.iter().any(|&oid| {
+                graph.op(oid).map_or(false, |o| o.label == label)
+            })
+        })
+    }
+
+    /// When norm output > 75% L1, TileLevelFusion is chosen;
+    /// when <= 75% L1, ComputeRoot is chosen.
+    #[test]
+    fn test_tile_vs_compute_root_threshold() {
+        let profile = DeviceProfile::detect();
+        let (l1, _, _) = profile.cache_sizes();
+        let l1_budget = l1 * 75 / 100;
+        let dt = DType::F32;
+
+        // ── Large norm output: exceeds 75% L1 → TileLevelFusion ──
+        // Pick K so that [1, K] * 4 bytes > l1_budget
+        let k_large = (l1_budget / 4) + 1;
+        {
+            let mut g = CompilerGraph::new();
+            let x = g.add_tensor("x", vec![1, k_large], dt);
+            let norm_out = g.add_tensor("norm_out", vec![1, k_large], dt);
+            let w = g.add_tensor("w", vec![k_large, k_large], dt);
+            let gemm_out = g.add_tensor("gemm_out", vec![1, k_large], dt);
+
+            g.add_op(OpKind::RmsNorm { eps: 1e-5 }, vec![x], vec![norm_out], "rms_norm");
+            g.add_op(
+                OpKind::Gemm { m: 1, n: k_large, k: k_large },
+                vec![norm_out, w],
+                vec![gemm_out],
+                "gemm",
+            );
+
+            let plan = fuse(&g, &profile);
+            let gemm_group = find_group_by_label(&plan, &g, "gemm")
+                .expect("GEMM should have a fusion group");
+            assert!(
+                matches!(gemm_group.mode, FusionMode::TileLevelFusion { .. }),
+                "Expected TileLevelFusion for norm output ({} B) > 75% L1 ({} B), got {:?}",
+                k_large * 4, l1_budget, gemm_group.mode,
+            );
+        }
+
+        // ── Small norm output: fits in 75% L1 → ComputeRoot ──
+        // Pick K so that [1, K] * 4 bytes <= l1_budget, with m=1
+        let k_small = l1_budget / 4;
+        {
+            let mut g = CompilerGraph::new();
+            let x = g.add_tensor("x", vec![1, k_small], dt);
+            let norm_out = g.add_tensor("norm_out", vec![1, k_small], dt);
+            // Use n=4096 so m*n*k >> 4096 (avoids small-matrix direct path)
+            let n_small = 4096;
+            let w = g.add_tensor("w", vec![k_small, n_small], dt);
+            let gemm_out = g.add_tensor("gemm_out", vec![1, n_small], dt);
+
+            let norm_bytes = k_small * 4;
+            assert!(
+                norm_bytes <= l1_budget,
+                "Test setup error: norm output {norm_bytes}B should be <= l1_budget {l1_budget}B"
+            );
+
+            g.add_op(OpKind::RmsNorm { eps: 1e-5 }, vec![x], vec![norm_out], "rms_norm");
+            g.add_op(
+                OpKind::Gemm { m: 1, n: n_small, k: k_small },
+                vec![norm_out, w],
+                vec![gemm_out],
+                "gemm",
+            );
+
+            let plan = fuse(&g, &profile);
+            let gemm_group = find_group_by_label(&plan, &g, "gemm")
+                .expect("GEMM should have a fusion group");
+            assert!(
+                matches!(gemm_group.mode, FusionMode::ComputeRoot { .. }),
+                "Expected ComputeRoot for norm output ({} B) <= 75% L1 ({} B), got {:?}",
+                norm_bytes, l1_budget, gemm_group.mode,
+            );
+        }
+    }
+
+    /// GEMM followed by elementwise gets EpilogueInjection mode.
+    #[test]
+    fn test_epilogue_injection_decision() {
+        let profile = DeviceProfile::detect();
+        let dt = DType::F32;
+
+        // GEMM → Gelu (different activation than existing test_fuse_gemm_epilogue)
+        let mut g = CompilerGraph::new();
+        let a = g.add_tensor("a", vec![4, 4096], dt);
+        let w = g.add_tensor("w", vec![4096, 4096], dt);
+        let gemm_out = g.add_tensor("gemm_out", vec![4, 4096], dt);
+        let gelu_out = g.add_tensor("gelu_out", vec![4, 4096], dt);
+
+        g.add_op(
+            OpKind::Gemm { m: 4, n: 4096, k: 4096 },
+            vec![a, w],
+            vec![gemm_out],
+            "gemm",
+        );
+        g.add_op(OpKind::Gelu, vec![gemm_out], vec![gelu_out], "gelu");
+
+        let plan = fuse(&g, &profile);
+        assert_eq!(plan.num_groups(), 1);
+        assert_eq!(
+            plan.groups[0].mode,
+            FusionMode::EpilogueInjection,
+            "GEMM + elementwise should produce EpilogueInjection"
+        );
+        assert_eq!(plan.groups[0].epilogue.len(), 1, "epilogue should contain the Gelu op");
+    }
+
+    /// Consecutive elementwise ops get LoopFusion mode.
+    #[test]
+    fn test_loop_fusion_decision() {
+        let profile = DeviceProfile::detect();
+        let dt = DType::F32;
+
+        // Add → Mul chain (different ops than existing test_elementwise_chain)
+        let mut g = CompilerGraph::new();
+        let a = g.add_tensor("a", vec![1, 4096], dt);
+        let b = g.add_tensor("b", vec![1, 4096], dt);
+        let add_out = g.add_tensor("add_out", vec![1, 4096], dt);
+        let mul_out = g.add_tensor("mul_out", vec![1, 4096], dt);
+
+        g.add_op(OpKind::Add, vec![a, b], vec![add_out], "add");
+        g.add_op(OpKind::Silu, vec![add_out], vec![mul_out], "silu");
+
+        let plan = fuse(&g, &profile);
+        assert_eq!(plan.num_groups(), 1);
+        assert_eq!(
+            plan.groups[0].mode,
+            FusionMode::LoopFusion,
+            "Consecutive elementwise ops should produce LoopFusion"
+        );
+        assert_eq!(plan.groups[0].ops.len(), 2);
+    }
+
+    /// 3 GEMMs sharing the same norm output get QkvSharedInput mode.
+    #[test]
+    fn test_qkv_shared_input_detection() {
+        let profile = DeviceProfile::detect();
+        let dt = DType::F32;
+        let dim = 4096;
+
+        let mut g = CompilerGraph::new();
+        let x = g.add_tensor("x", vec![1, dim], dt);
+        let norm_out = g.add_tensor("norm_out", vec![1, dim], dt);
+        let wq = g.add_tensor("wq", vec![dim, dim], dt);
+        let wk = g.add_tensor("wk", vec![dim, dim], dt);
+        let wv = g.add_tensor("wv", vec![dim, dim], dt);
+        let q_out = g.add_tensor("q_out", vec![1, dim], dt);
+        let k_out = g.add_tensor("k_out", vec![1, dim], dt);
+        let v_out = g.add_tensor("v_out", vec![1, dim], dt);
+
+        // RmsNorm produces norm_out
+        g.add_op(OpKind::RmsNorm { eps: 1e-5 }, vec![x], vec![norm_out], "rms_norm");
+        // 3 GEMMs all read norm_out as first input
+        g.add_op(
+            OpKind::Gemm { m: 1, n: dim, k: dim },
+            vec![norm_out, wq],
+            vec![q_out],
+            "gemm_q",
+        );
+        g.add_op(
+            OpKind::Gemm { m: 1, n: dim, k: dim },
+            vec![norm_out, wk],
+            vec![k_out],
+            "gemm_k",
+        );
+        g.add_op(
+            OpKind::Gemm { m: 1, n: dim, k: dim },
+            vec![norm_out, wv],
+            vec![v_out],
+            "gemm_v",
+        );
+
+        let plan = fuse(&g, &profile);
+
+        let qkv_group = plan.groups.iter().find(|grp| grp.mode == FusionMode::QkvSharedInput);
+        assert!(
+            qkv_group.is_some(),
+            "Expected QkvSharedInput group for 3 GEMMs sharing norm output"
+        );
+        let qkv = qkv_group.unwrap();
+        assert_eq!(qkv.ops.len(), 3, "QKV group should contain exactly 3 GEMM ops");
+    }
+
+    /// RmsNorm → GEMM (single consumer, no epilogue) gets a norm-aware
+    /// fusion mode (ComputeRoot or TileLevelFusion), not Standalone.
+    #[test]
+    fn test_norm_into_gemm_decision() {
+        let profile = DeviceProfile::detect();
+        let dt = DType::F32;
+
+        let mut g = CompilerGraph::new();
+        let x = g.add_tensor("x", vec![1, 512], dt);
+        let norm_out = g.add_tensor("norm_out", vec![1, 512], dt);
+        let w = g.add_tensor("w", vec![512, 512], dt);
+        let gemm_out = g.add_tensor("gemm_out", vec![1, 512], dt);
+
+        g.add_op(OpKind::RmsNorm { eps: 1e-5 }, vec![x], vec![norm_out], "rms_norm");
+        g.add_op(
+            OpKind::Gemm { m: 1, n: 512, k: 512 },
+            vec![norm_out, w],
+            vec![gemm_out],
+            "gemm",
+        );
+
+        let plan = fuse(&g, &profile);
+
+        // The GEMM group must carry a norm-aware fusion mode
+        let gemm_group = find_group_by_label(&plan, &g, "gemm")
+            .expect("GEMM should have a fusion group");
+        let mode = &gemm_group.mode;
+        assert!(
+            matches!(mode, FusionMode::ComputeRoot { .. } | FusionMode::TileLevelFusion { .. }),
+            "RmsNorm → GEMM should produce ComputeRoot or TileLevelFusion, got {:?}",
+            mode,
+        );
+        // The mode must reference the norm op as predecessor
+        match mode {
+            FusionMode::ComputeRoot { predecessor } |
+            FusionMode::TileLevelFusion { predecessor, .. } => {
+                let pred_op = g.op(*predecessor).expect("predecessor op should exist");
+                assert!(
+                    matches!(pred_op.kind, OpKind::RmsNorm { .. }),
+                    "predecessor should be RmsNorm, got {:?}", pred_op.kind,
+                );
+            }
+            _ => unreachable!(),
+        }
+    }
+
+    /// Verify KC * (MR + NR) * 4 <= L1 * 0.85 for various GEMM sizes.
+    #[test]
+    fn test_gemm_blocking_l1_constraint() {
+        let profile = DeviceProfile::detect();
+        let (l1, _, _) = profile.cache_sizes();
+        let (mr, nr) = profile.microkernel_mr_nr();
+
+        for &(m, n, k) in &[
+            (1024, 1024, 1024),
+            (4096, 4096, 4096),
+            (512, 2048, 768),
+            (128, 128, 128),
+        ] {
+            let b = profile.gemm_blocking(m, n, k);
+            let micropanel_bytes = b.kc * (mr + nr) * 4;
+            assert!(
+                micropanel_bytes <= l1 * 85 / 100,
+                "L1 constraint violated for m={m} n={n} k={k}: \
+                 KC({}) * (MR({mr}) + NR({nr})) * 4 = {micropanel_bytes}B > 85% of L1 ({}B)",
+                b.kc, l1 * 85 / 100,
+            );
+        }
+    }
+
+    /// Verify MC * KC * 4 <= L2 * 0.85 for various GEMM sizes.
+    #[test]
+    fn test_gemm_blocking_l2_constraint() {
+        let profile = DeviceProfile::detect();
+        let (_, l2, _) = profile.cache_sizes();
+
+        for &(m, n, k) in &[
+            (1024, 1024, 1024),
+            (4096, 4096, 4096),
+            (512, 2048, 768),
+            (128, 128, 128),
+        ] {
+            let b = profile.gemm_blocking(m, n, k);
+            let a_panel_bytes = b.mc * b.kc * 4;
+            assert!(
+                a_panel_bytes <= l2 * 85 / 100,
+                "L2 constraint violated for m={m} n={n} k={k}: \
+                 MC({}) * KC({}) * 4 = {a_panel_bytes}B > 85% of L2 ({}B)",
+                b.mc, b.kc, l2 * 85 / 100,
+            );
+        }
+    }
+
+    /// Verify KC * NC * 4 <= L3 * 0.65 for various GEMM sizes.
+    #[test]
+    fn test_gemm_blocking_l3_constraint() {
+        let profile = DeviceProfile::detect();
+        let (_, _, l3) = profile.cache_sizes();
+
+        // Only meaningful when L3 >= 1MB (otherwise fallback to L2 budget)
+        if l3 < 1024 * 1024 {
+            eprintln!("Skipping L3 constraint test: L3 = {l3}B < 1MB");
+            return;
+        }
+
+        for &(m, n, k) in &[
+            (1024, 1024, 1024),
+            (4096, 4096, 4096),
+            (512, 2048, 768),
+            (128, 128, 128),
+        ] {
+            let b = profile.gemm_blocking(m, n, k);
+            let b_panel_bytes = b.kc * b.nc * 4;
+            assert!(
+                b_panel_bytes <= l3 * 65 / 100,
+                "L3 constraint violated for m={m} n={n} k={k}: \
+                 KC({}) * NC({}) * 4 = {b_panel_bytes}B > 65% of L3 ({}B)",
+                b.kc, b.nc, l3 * 65 / 100,
+            );
+        }
     }
 }
