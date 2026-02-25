@@ -34,7 +34,7 @@ fn test_e2e_llama_7b_full_pipeline() {
     let registry = ScalarOpRegistry::with_defaults();
 
     // Phase 1: CompilerGraph + SemanticDAG
-    let graph = CompilerGraph::from_layer_ir(&ir, &profile);
+    let graph = CompilerGraph::from_layer_ir(&ir, &profile).expect("from_layer_ir failed");
     assert!(
         graph.num_ops() >= 14,
         "LLaMA should have >=14 ops, got {}",
@@ -104,7 +104,7 @@ fn test_e2e_gemma_2b_full_pipeline() {
     let profile = DeviceProfile::detect();
     let registry = ScalarOpRegistry::with_defaults();
 
-    let graph = CompilerGraph::from_layer_ir(&ir, &profile);
+    let graph = CompilerGraph::from_layer_ir(&ir, &profile).expect("from_layer_ir failed");
     let dag = SemanticDAG::from_graph(&graph, &registry);
     let plan = fuse_with_dag(&graph, &registry, &profile);
     let hw_results = check_plan(&plan.groups, &graph, &profile);
@@ -139,7 +139,7 @@ fn test_e2e_fusion_consistency() {
     let profile = DeviceProfile::detect();
     let registry = ScalarOpRegistry::with_defaults();
 
-    let graph = CompilerGraph::from_layer_ir(&ir, &profile);
+    let graph = CompilerGraph::from_layer_ir(&ir, &profile).expect("from_layer_ir failed");
 
     let old_plan = fuse(&graph, &profile);
     let new_plan = fuse_with_dag(&graph, &registry, &profile);
@@ -211,7 +211,7 @@ fn test_e2e_semantic_dag_coverage() {
         let ir = LayerIR::from_model_config(config, 1);
         let profile = DeviceProfile::detect();
         let registry = ScalarOpRegistry::with_defaults();
-        let graph = CompilerGraph::from_layer_ir(&ir, &profile);
+        let graph = CompilerGraph::from_layer_ir(&ir, &profile).expect("from_layer_ir failed");
         let dag = SemanticDAG::from_graph(&graph, &registry);
 
         assert_eq!(
@@ -233,7 +233,7 @@ fn test_e2e_buffer_no_overlap() {
     let ir = LayerIR::from_model_config(&config, 1);
     let profile = DeviceProfile::detect();
     let registry = ScalarOpRegistry::with_defaults();
-    let graph = CompilerGraph::from_layer_ir(&ir, &profile);
+    let graph = CompilerGraph::from_layer_ir(&ir, &profile).expect("from_layer_ir failed");
     let plan = fuse_with_dag(&graph, &registry, &profile);
     let lifetimes = analyze_lifetimes(&graph, &plan);
     let alloc = allocate_buffers(&lifetimes);
@@ -469,7 +469,7 @@ fn test_deterministic_across_threads() {
             let profile = Arc::clone(&profile);
             thread::spawn(move || {
                 // Use lower-level APIs to get raw code bytes
-                let graph = CompilerGraph::from_layer_ir(&ir, &profile);
+                let graph = CompilerGraph::from_layer_ir(&ir, &profile).expect("from_layer_ir failed");
                 #[allow(deprecated)]
                 let output = codegen::emitter::emit_stub_code(&graph);
                 (output.code, output.scratchpad_bytes)
@@ -512,7 +512,7 @@ fn test_e2e_hw_constraints_all_models() {
 
     for config in &configs {
         let ir = LayerIR::from_model_config(config, 1);
-        let graph = CompilerGraph::from_layer_ir(&ir, &profile);
+        let graph = CompilerGraph::from_layer_ir(&ir, &profile).expect("from_layer_ir failed");
         let plan = fuse_with_dag(&graph, &registry, &profile);
         let results = check_plan(&plan.groups, &graph, &profile);
 

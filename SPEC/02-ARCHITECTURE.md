@@ -12,22 +12,25 @@
 
 ## 核心架构原则
 
-### 1. 手写汇编优先（ARCH-ASM-FIRST）🚨 铁律
+### 1. JIT 编译器优先（ARCH-JIT-FIRST）🚨 铁律
 
-核心热路径**必须**使用手写汇编微内核，不依赖编译器的寄存器分配和指令调度。
+**所有性能优化通过 JIT 编译器实现。** 算子的唯一定义来源是 `extern "C"` 纯标量函数，编译器通过二进制符号执行自动提取计算结构（OpTrace），然后根据 DeviceProfile 生成最优融合 SIMD 代码。
 
-**必须手写汇编的算子**：
-- F32/F16/BF16 GEMM 微内核
-- 量化 GEMV/GEMM 微内核（Q4_K, Q8_K 等）
+**性能交付路径（唯一）**：
+- JIT Phase 3 代码生成（iced-x86 / dynasm-rs 程序化生成每条指令）
+- 性能目标（≥85% 理论峰值）由 JIT 生成的代码达到，不是手写 ASM 达到
+- BLIS 5 级循环（含 pack_a/pack_b 向量化）由 JIT 自动生成
+- 软件流水线（K-loop load/compute 重叠）由 JIT 自动生成
+- Epilogue injection（GEMM+activation 融合）由 JIT 自动生成
 
-**可以用 intrinsics 的算子**（memory-bound，瓶颈在带宽不在计算）：
-- BLAS-1（vec_dot, vec_add 等）
-- 激活函数（silu, gelu, softmax 等）
-- 归一化（rms_norm, layer_norm）
-- 位置编码（rope）
-- 量化解码（dequant_*）
+**手写 ASM 的定位 — 正确性基准 + 性能参考**：
+- 项目中现有的手写 asm / intrinsics / 宏生成实现保留为 golden reference
+- 用途 1：验证 JIT 输出的数值正确性（JIT 结果 vs 手写 ASM 结果，tolerance ≤ 1e-4）
+- 用途 2：性能对标基准（JIT 生成代码的效率应 ≥ 手写 ASM 的 95%）
+- 用途 3：计算结构的参考知识（编译器开发者理解累加器布局、K-loop、store 位置）
+- 手写 ASM 不是生产路径，不是性能交付路径
 
-**判断标准**：如果算子是 compute-bound 且 intrinsics 版本达不到 85% 理论峰值，就必须手写汇编。
+**判断标准**：性能不达标时，优化 JIT 编译器的代码生成质量，不是手写更多 ASM。
 
 ### 2. 逼近理论极限（ARCH-PEAK-PERF）🚨 铁律
 
@@ -72,16 +75,22 @@ use cudarc::*;      // GPU
 
 ---
 
-## 手写汇编微内核架构（ARCH-ASM-MICROKERNEL）
+## 参考微内核架构（ARCH-REFERENCE-MICROKERNEL）
 
-### 为什么 intrinsics 不够
+> **定位**：本节描述的手写汇编微内核是正确性基准和性能参考，不是生产路径。
+> 生产路径由 JIT 编译器 Phase 3 自动生成等价（或更优）的代码。
+> 手写微内核的价值：(1) golden reference 验证 JIT 输出正确性；(2) 性能对标基准；(3) 编译器开发者理解最优代码结构。
 
-| 问题 | 说明 | 影响 |
-|------|------|------|
-| 寄存器 spill | 编译器可能将累加器 spill 到栈 | 额外 load/store，降低 IPC |
-| 指令调度 | 编译器不一定交错 FMA 和 load | 流水线气泡 |
-| 软件流水线 | 无法手动安排 load(k+1) 与 compute(k) 重叠 | 访存延迟暴露 |
-| 寄存器分配 | 无法指定哪个 ymm/zmm 做累加器 | 可能用到高编号寄存器导致 VEX→EVEX 切换 |
+### 为什么 JIT 需要生成汇编级代码
+
+JIT 编译器直接生成机器码（而非 intrinsics），原因与手写汇编相同：
+
+| 问题 | 说明 | JIT 的解决方式 |
+|------|------|---------------|
+| 寄存器 spill | LLVM/GCC 可能将累加器 spill 到栈 | JIT 程序化分配寄存器，确保零 spill |
+| 指令调度 | 编译器不一定交错 FMA 和 load | JIT 生成交错的 load/FMA 序列 |
+| 软件流水线 | intrinsics 无法控制 load(k+1) 与 compute(k) 重叠 | JIT 自动生成流水线化的 K-loop |
+| 寄存器分配 | 无法指定哪个 ymm/zmm 做累加器 | JIT 精确控制每个寄存器的用途 |
 
 ### 微内核设计
 
@@ -134,8 +143,8 @@ gemm(A, B, C, M, N, K)
 │   │   ├── pack_a: A[MC×KC] → packed_a[MC×KC]
 │   │   │
 │   │   └── L1 分块: MR×NR 微内核（适配 L1 Cache + 寄存器）
-│   │       └── gemm_microkernel_asm(KC, packed_a, packed_b, C)
-│   │           └── 手写汇编：精确控制寄存器、指令调度、预取
+│   │       └── gemm_microkernel(KC, packed_a, packed_b, C)
+│   │           └── JIT 生成：精确控制寄存器、指令调度、预取
 ```
 
 **分块参数**：
@@ -152,6 +161,8 @@ gemm(A, B, C, M, N, K)
 
 ## 量化微内核架构（ARCH-QUANT-MICROKERNEL）
 
+> **定位**：同参考微内核，现有量化 ASM 微内核作为正确性基准和性能参考。生产路径由 JIT 编译器自动生成。
+
 量化 GEMV/GEMM 的核心是 on-the-fly dequantization + FMA：
 
 ```
@@ -163,11 +174,11 @@ for each block (256 elements):
     SIMD FMA with input activation
 ```
 
-**关键优化**：
+**关键优化**（JIT 自动生成）：
 1. 不生成完整 f32 矩阵（on-the-fly）
 2. 块级解码，L1 Cache 友好
 3. 输入向量 SIMD 广播复用
-4. 手写汇编精确控制解包+FMA 交错
+4. JIT 精确控制解包+FMA 交错调度
 
 ---
 
@@ -248,7 +259,8 @@ pub trait Element: Copy + Send + Sync + Default + 'static {
 
 ## 四层宏架构（ARCH-MACRO）
 
-> 非热路径代码通过宏批量生成。热路径手写汇编覆写。
+> 宏批量生成基线实现，作为正确性基准。生产路径由 JIT 编译器 Phase 3 自动生成最优代码。
+> 手写 asm 微内核提供算子计算结构的参考知识。
 
 ```
 Layer 1: simd_primitive!     — 硬件原语映射表
@@ -257,10 +269,10 @@ Layer 3: quant_primitive!    — 量化特化原语
 Layer 4: expand_all_xxx!     — 批量展开
 ```
 
-**覆写规则**：
-- 宏生成的实现是**基线**（保证正确性）
-- 手写汇编微内核**覆写**热路径（保证性能）
-- 覆写必须通过 benchmark 证明优于基线
+**层次关系**：
+- 宏生成的实现是**基线**（保证正确性，作为 golden reference）
+- 手写汇编微内核是**性能参考**（JIT 生成代码的对标基准）
+- JIT 编译器 Phase 3 是**生产路径**（自动生成最优融合代码）
 
 **详细宏设计**：见 `03-DATA-STRUCTURE.md` §8
 
@@ -278,7 +290,7 @@ Layer 4: expand_all_xxx!     — 批量展开
 | INT8 点积 | 无 | VNNI vpdpbusd | sdot |
 | 预取距离 | 256B | 512B | 128B |
 
-这就是为什么必须用宏（或手写汇编）而不是泛型 trait：一个 `fn gemm<S: SimdOps>()` 无法同时对 AVX2 用 6×16、对 AVX-512 用 14×32 微内核。
+这就是为什么 JIT 编译器需要 ISA 感知的代码生成（通过 `MachineCodeEmitter` 后端），而不是泛型 trait：一个 `fn gemm<S: SimdOps>()` 无法同时对 AVX2 用 6×16、对 AVX-512 用 14×32 微内核。JIT 根据 DeviceProfile.isa 自动选择最优微内核规格和指令序列。
 
 ---
 

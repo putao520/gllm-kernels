@@ -151,7 +151,7 @@ pub fn compute_layout(graph: &CompilerGraph) -> ScratchpadLayout {
 /// Used when the full Phase 3 code generator is bypassed or unavailable.
 /// Produces a valid but no-op function.
 #[deprecated(note = "Use JIT codegen path instead. Retained for test scaffolding only.")]
-pub(crate) fn emit_stub_code(graph: &CompilerGraph) -> CodegenOutput {
+pub fn emit_stub_code(graph: &CompilerGraph) -> CodegenOutput {
     let layout = compute_layout(graph);
     let scratchpad_bytes = layout.total_bytes;
 

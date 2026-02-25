@@ -12,9 +12,9 @@
 
 | ID | 需求 | 验收标准 | 状态 |
 |----|------|----------|------|
-| **REQ-PERF-001** | Compute-bound 算子逼近计算峰值 | GEMM 达到理论 FLOPS 峰值的 **≥ 85%** | 🟡 当前 59% (prepacked)，优化中 |
-| **REQ-PERF-002** | Memory-bound 算子逼近带宽峰值 | 激活/归一化/BLAS-1 达到内存带宽的 **≥ 90%** | 🟡 GEMV 67-76%，activation 需大尺寸验证 |
-| **REQ-PERF-003** | 量化算子逼近瓶颈极限 | 量化 GEMV/GEMM 达到 **≥ 85%** 瓶颈极限 | 🟡 ASM 微内核已写，待效率验证 |
+| **REQ-PERF-001** | Compute-bound 算子逼近计算峰值 | GEMM 达到理论 FLOPS 峰值的 **≥ 85%** | 🟡 unpacked 42%, prepacked 59%。差距根因：blocking 参数未经 autotuning 闭环、pack_b 标量路径、微内核无软件流水线。见 PLAN-phase4 MS-1 |
+| **REQ-PERF-002** | Memory-bound 算子逼近带宽峰值 | 激活/归一化/BLAS-1 达到内存带宽的 **≥ 90%** | 🟡 GEMV 67-76%（未达 90% 目标），activation ALU-limited 7-13 GiB/s（需 JIT Loop Fusion 消除中间 writeback） |
+| **REQ-PERF-003** | 量化算子逼近瓶颈极限 | 量化 GEMV/GEMM 达到 **≥ 85%** 瓶颈极限 | 🟡 ASM 微内核已写（Q4K/Q8K），效率未经系统测量。intrinsics 路径（Q2/Q1/IQ/AWQ/GPTQ/Squeeze）效率未知 |
 | **REQ-PERF-004** | 手写汇编微内核 | GEMM、量化 GEMV/GEMM 必须使用 `global_asm!` 手写汇编 | 🟢 已完成（8 个 global_asm! 微内核） |
 | **REQ-PERF-005** | 运行时 CPUID 分发 | 启动时一次检测 ISA，之后零开销分发到最优微内核 | 🟢 已完成 |
 
@@ -196,15 +196,15 @@
 
 | ID | 需求 | 验收标准 | 状态 |
 |----|------|----------|------|
-| **REQ-COMPILER-008** | TraceOp → SIMD 代码生成 | 根据 FusionPlan 通过 `MachineCodeEmitter` trait 程序化生成全新机器码。核心机制：遍历 OpTrace.body 中的 `Vec<TraceOp>`，每个 TraceOp 映射到对应的 SIMD 指令（如 `TraceOp::Add` → `vaddps`，`TraceOp::Exp` → 多项式逼近指令序列）。底层使用 iced-x86 CodeAssembler（x86_64）/ dynasm-rs（aarch64） | 🟢 x86_64 完整实现：`emit_trace_ops_avx2()`（独立寄存器分配）、`emit_trace_on_accumulator()`（GEMM epilogue 原地执行）、`emit_elementwise_trace_body()`（elementwise 链含 binary Input(1)）三条路径均覆盖所有 TraceOp 变体。Epilogue injection 已接线（emit_gemm_with_epilogue → registry → emit_epilogue_on_accumulators）。Loop fusion 已接线（emit_elementwise_chain → registry → emit_elementwise_trace_body）。aarch64 实质实现：BLIS 5 级循环嵌套（`emit_gemm_blis_neon`）、TileLevelFusion/ComputeRoot codegen、tanh（15 条 NEON 指令，2*sigmoid(2x)-1）、log（36 条 NEON 指令，指数/尾数分解 + degree-4 Horner）真实实现 |
+| **REQ-COMPILER-008** | TraceOp → SIMD 代码生成 | 根据 FusionPlan 通过 `MachineCodeEmitter` trait 程序化生成全新机器码。核心机制：遍历 OpTrace.body 中的 `Vec<TraceOp>`，每个 TraceOp 映射到对应的 SIMD 指令（如 `TraceOp::Add` → `vaddps`，`TraceOp::Exp` → 多项式逼近指令序列）。底层使用 iced-x86 CodeAssembler（x86_64）/ dynasm-rs（aarch64） | 🟡 x86_64 AVX2 完整实现（6307 行）：`emit_trace_ops_avx2()`、`emit_trace_on_accumulator()`、`emit_elementwise_trace_body()` 三条路径均覆盖所有 TraceOp 变体，Epilogue injection + Loop fusion 已接线。x86_64 AVX-512：基础框架（emit_gemm_tile_avx512 存在），BLIS 循环 zmm 分支未完整接线，epilogue injection 未适配 zmm。aarch64（2246 行）：BLIS 5 级循环嵌套 + tanh/log 真实 NEON 指令生成，但 emit_plan 的 LoopFusion 分支未接入 elementwise 链 |
 | **REQ-COMPILER-009** | GEMM Tile-Level Fusion | GEMM 的 MC 循环内可嵌入前驱算子的 tile 计算。嵌入决策由 profile 驱动：当前驱输出 > L1 容量时启用 tile-level fusion，否则 compute_root | 🟡 aarch64 已实现（`emit_gemm_blis_neon` BLIS 5 级循环嵌套 + TileLevelFusion/ComputeRoot codegen），x86_64 待实现 |
-| **REQ-COMPILER-010** | 数值一致性 | 编译器生成的 CompiledLayer 与标量函数实现（golden reference）数值误差 ≤ 1e-4（f32）/ 1e-2（f16），通过自动化回归测试验证 | 🟡 GEMM + elementwise 链 E2E 测试已验证（tolerance ≤ 1e-4），epilogue fusion bias 路径已修复（AddBias 数值 bug 已修正：bias_saved 追踪 + rdx 保存至 [rbp-48] + bias tile 基指针计算） |
+| **REQ-COMPILER-010** | 数值一致性 | 编译器生成的 CompiledLayer 与标量函数实现（golden reference）数值误差 ≤ 1e-4（f32）/ 1e-2（f16），通过自动化回归测试验证 | 🟡 x86_64 AVX2 路径：GEMM + elementwise 链 + epilogue fusion bias 已验证（tolerance ≤ 1e-4）。AVX-512 路径：仅基础 GEMM tile 验证，epilogue/elementwise 未覆盖。aarch64 路径：GEMM 微内核数值验证通过，elementwise 链 E2E 未验证（emit_plan 未接线） |
 | **REQ-COMPILER-011** | 算子知识自动提取 | 算子计算结构通过二进制符号执行自动提取（OpTrace），编译器不内置算子计算逻辑。新增算子只需写 `extern "C"` 标量函数并注册，编译器自动分析 + 生成最优代码 | 🟢 已完成（生产路径已接通：fn_ptr → iced-x86 Decoder → SymbolicExecutor → OpTrace。`decoder.rs` 927 行，自动提取 SiLU/GELU/ReLU 等激活函数的 OpTrace。`auto_register_from_symexec()` 从编译后的 scalar_ops 二进制自动分析） |
 
 ### 6.6 外部依赖与平台支持
 
 | ID | 需求 | 验收标准 | 状态 |
 |----|------|----------|------|
-| **REQ-COMPILER-012** | 汇编器后端 | 两层 trait 架构：`PlatformBackend`（统一入口）→ `MachineCodeEmitter`（Phase 3 代码生成）。x86_64 使用 `iced-x86`（CodeAssembler + Decoder）；aarch64 使用 `dynasm-rs`（Assembler）。iced-x86 同时用于 Phase 0（Decoder 反汇编）和 Phase 3（CodeAssembler 代码生成） | 🟡 x86_64 iced-x86 集成完成（Phase 0 Decoder + Phase 3 CodeAssembler），aarch64 dynasm-rs 实质实现（BLIS 5 级循环嵌套、GP 寄存器编码辅助、tanh/log 真实 NEON 指令生成） |
-| **REQ-COMPILER-013** | 平台后端 ISA 覆盖 | x86_64 后端（iced-x86）：AVX2 全指令集 + AVX-512（EVEX 编码, zmm, mask）+ FMA/F16C/VNNI/BF16/FP16。AVX2 和 AVX-512 是同一后端的寄存器宽度分支（由 DeviceProfile.isa 选择），不是独立实现。aarch64 后端（dynasm-rs）：NEON 全指令集（fmla, fmul, fadd, ld1/st1/ldp/stp, dup, sdot/udot）+ ARMv8.4+ | 🟡 x86_64: AVX2 完整支持，AVX-512 基础路径；aarch64: BLIS 5 级循环嵌套 + NEON 真实指令生成（tanh 15 条指令、log 36 条指令、GP 寄存器编码辅助），elementwise 链待补全 |
+| **REQ-COMPILER-012** | 汇编器后端 | 两层 trait 架构：`PlatformBackend`（统一入口）→ `MachineCodeEmitter`（Phase 3 代码生成）。x86_64 使用 `iced-x86`（CodeAssembler + Decoder）；aarch64 使用 `dynasm-rs`（Assembler）。iced-x86 同时用于 Phase 0（Decoder 反汇编）和 Phase 3（CodeAssembler 代码生成） | 🟡 x86_64 iced-x86 集成完成（Phase 0 Decoder + Phase 3 CodeAssembler，AVX2 完整 + AVX-512 基础）。aarch64 dynasm-rs 实质实现（BLIS 5 级循环嵌套 + tanh/log 真实 NEON 指令），但 `MachineCodeEmitter::emit_plan()` 未完整接线（LoopFusion 分支缺失） |
+| **REQ-COMPILER-013** | 平台后端 ISA 覆盖 | x86_64 后端（iced-x86）：AVX2 全指令集 + AVX-512（EVEX 编码, zmm, mask）+ FMA/F16C/VNNI/BF16/FP16。AVX2 和 AVX-512 是同一后端的寄存器宽度分支（由 DeviceProfile.isa 选择），不是独立实现。aarch64 后端（dynasm-rs）：NEON 全指令集（fmla, fmul, fadd, ld1/st1/ldp/stp, dup, sdot/udot）+ ARMv8.4+ | 🟡 x86_64: AVX2 完整支持（GEMM BLIS 5 级循环 + epilogue injection + elementwise 链），AVX-512 基础路径（emit_gemm_tile_avx512 存在，BLIS 循环/epilogue/elementwise 未完整适配 zmm）。aarch64: GEMM BLIS 5 级循环 + TraceOp→NEON 映射完整（含 tanh 15 条、log 36 条指令），elementwise 链 emit_plan 接线待补全 |
 | **REQ-COMPILER-016** | JIT 延迟 | 单个 transformer layer 的编译延迟 < 100ms（含 Phase 0-3）。Phase 0 符号执行 < 1ms/算子，iced-x86 和 dynasm-rs 均为 μs 级指令编码 | 🟢 已完成（基准测试验证：symexec 2.5-15μs/算子，JIT 编译 16-237μs/layer，均远低于 100ms 预算） |

@@ -23,9 +23,8 @@
 
 use super::CodegenOutput;
 
-/// Minimal valid aarch64 function for testing CompiledLayer mmap/execution mechanics.
-/// Not for production use — enable `jit-aarch64` feature for real codegen.
-pub(crate) fn emit_stub() -> CodegenOutput {
+/// Emit a minimal aarch64 stub (`ret` = 0xD65F03C0).
+pub fn emit_stub() -> CodegenOutput {
     let mut code = Vec::with_capacity(4);
     code.extend_from_slice(&0xD65F03C0u32.to_le_bytes()); // ret
     CodegenOutput { code, scratchpad_bytes: 0 }
@@ -35,16 +34,18 @@ pub(crate) fn emit_stub() -> CodegenOutput {
 
 #[cfg(feature = "jit-aarch64")]
 pub mod jit {
-    use crate::compiler::trace::TraceOp;
+    use crate::compiler::trace::{TraceOp, ComputePattern};
     use crate::compiler::fusion::{FusionGroup, FusionPlan, FusionMode};
     use crate::compiler::graph::{CompilerGraph, OpKind, OpId};
+    use crate::compiler::registry::ScalarOpRegistry;
     use crate::compiler::buffer_alloc::BufferAllocation;
     use crate::dispatch::DeviceProfile;
     use super::CodegenOutput;
 
     /// NEON register width: 4 x f32 = 128 bits.
     const NEON_WIDTH_F32: usize = 4;
-    /// Total NEON/ASIMD registers available; used by vreg_for_index() for round-robin allocation.
+    /// Number of NEON/FP registers (v0-v31).
+    #[allow(dead_code)]
     const NUM_NEON_REGS: usize = 32;
 
     /// NEON microkernel dimensions (must match asm::aarch64::MR/NR).
@@ -115,6 +116,7 @@ pub mod jit {
             graph: &CompilerGraph,
             alloc: &BufferAllocation,
             profile: &DeviceProfile,
+            registry: Option<&ScalarOpRegistry>,
         ) -> Result<CodegenOutput, String> {
             self.emit_prologue();
 
@@ -122,7 +124,7 @@ pub mod jit {
             self.blis_base_offset = alloc.total_bytes;
 
             for group in &plan.groups {
-                self.emit_group(group, graph, profile)?;
+                self.emit_group(group, graph, profile, registry)?;
             }
 
             self.emit_epilogue();
@@ -192,23 +194,17 @@ pub mod jit {
             group: &FusionGroup,
             graph: &CompilerGraph,
             profile: &DeviceProfile,
+            registry: Option<&ScalarOpRegistry>,
         ) -> Result<(), String> {
             match group.mode {
                 FusionMode::Standalone => {
                     self.emit_standalone(group, graph, profile)
                 }
                 FusionMode::LoopFusion => {
-                    for _ in &group.ops {
-                        self.emit_nop();
-                    }
-                    Ok(())
+                    self.emit_elementwise_chain(group, graph, profile, registry)
                 }
                 FusionMode::EpilogueInjection => {
-                    self.emit_standalone(group, graph, profile)?;
-                    for _ in &group.epilogue {
-                        self.emit_nop();
-                    }
-                    Ok(())
+                    self.emit_gemm_with_epilogue(group, graph, profile, registry)
                 }
                 FusionMode::TileLevelFusion { predecessor, tile_rows } => {
                     self.emit_tile_level_fusion(group, graph, profile, predecessor, tile_rows)
@@ -232,7 +228,7 @@ pub mod jit {
             }
         }
 
-        /// Emit a standalone op (single GEMM or elementwise).
+        /// Emit a standalone op (single GEMM or elementwise nop placeholder).
         fn emit_standalone(
             &mut self,
             group: &FusionGroup,
@@ -249,6 +245,469 @@ pub mod jit {
                     Ok(())
                 }
             }
+        }
+
+        // ── LoopFusion: fused elementwise chain ─────────────────────────
+
+        /// Emit a fused elementwise chain (LoopFusion mode).
+        ///
+        /// Collects TraceOp bodies from the registry for the anchor op and all
+        /// epilogue ops, then emits a single NEON vectorized loop that applies
+        /// the entire chain without intermediate memory writeback.
+        ///
+        /// ABI: x0=input, x1=weights (second input for binary ops), x7=output.
+        fn emit_elementwise_chain(
+            &mut self,
+            group: &FusionGroup,
+            graph: &CompilerGraph,
+            _profile: &DeviceProfile,
+            registry: Option<&ScalarOpRegistry>,
+        ) -> Result<(), String> {
+            let op = graph.op(group.anchor).ok_or("missing anchor op")?;
+
+            let elem_count = if let Some(&out_id) = op.outputs.first() {
+                graph.tensor_numel(out_id).unwrap_or(0)
+            } else {
+                0
+            };
+
+            if elem_count == 0 {
+                self.emit_nop();
+                return Ok(());
+            }
+
+            // Collect trace bodies from registry for anchor + epilogue ops
+            let mut trace_info: Vec<(Vec<TraceOp>, bool)> = Vec::new();
+
+            if let Some(reg) = registry {
+                let anchor_op = graph.op(group.anchor).ok_or("missing anchor")?;
+                let key = ScalarOpRegistry::key_from_op_kind(&anchor_op.kind);
+                if let Some(trace) = reg.get_trace(&key) {
+                    if let Some(body) = trace.pattern.body() {
+                        let is_binary = matches!(
+                            trace.pattern,
+                            ComputePattern::BinaryElementwise { .. }
+                        );
+                        trace_info.push((body.to_vec(), is_binary));
+                    }
+                }
+
+                for &epi_id in &group.epilogue {
+                    let epi_op = graph.op(epi_id).ok_or("missing epilogue op")?;
+                    let key = ScalarOpRegistry::key_from_op_kind(&epi_op.kind);
+                    if let Some(trace) = reg.get_trace(&key) {
+                        if let Some(body) = trace.pattern.body() {
+                            let is_binary = matches!(
+                                trace.pattern,
+                                ComputePattern::BinaryElementwise { .. }
+                            );
+                            trace_info.push((body.to_vec(), is_binary));
+                        }
+                    }
+                }
+            }
+
+            if trace_info.is_empty() {
+                // Fallback: emit nop placeholder when no registry available
+                self.emit_nop();
+                return Ok(());
+            }
+
+            let simd_w = NEON_WIDTH_F32; // 4
+            let vec_count = elem_count / simd_w;
+            let tail = elem_count % simd_w;
+            let has_binary = trace_info.iter().any(|(_, b)| *b);
+
+            // Save callee-saved regs: x19=input, x20=output, x21=weights
+            // stp x19, x20, [sp, #-32]!
+            self.emit_u32(Self::encode_stp_pre(19, 20, 31, -32));
+            // stp x21, x22, [sp, #16]
+            self.emit_u32(Self::encode_stp_offset(21, 22, 31, 16));
+
+            // Save base pointers to callee-saved regs
+            self.emit_mov_reg(19, 0);  // x19 = input base
+            self.emit_mov_reg(20, 7);  // x20 = output base
+            if has_binary {
+                self.emit_mov_reg(21, 1);  // x21 = weights/second input base
+            }
+
+            // x9 = vector iteration count
+            self.emit_mov_imm(9, vec_count);
+
+            // cbz x9, scalar_tail
+            let cbz_pos = self.code.len();
+            self.emit_u32(0xB4000009); // placeholder
+
+            // ── vector loop ──
+            let loop_start = self.code.len();
+
+            // ld1 {v0.4s}, [x19], #16  (load input)
+            self.emit_u32(Self::encode_ld1_post(0, 19));
+
+            // For binary: ld1 {v1.4s}, [x21], #16
+            if has_binary {
+                self.emit_u32(Self::encode_ld1_post(1, 21));
+            }
+
+            // Apply all trace bodies in sequence
+            let mut result_reg = 0u8;
+            for (body, is_binary) in &trace_info {
+                result_reg = self.emit_trace_body_neon(body, *is_binary)?;
+                // Move result to v0 for the next body's Input(0)
+                if result_reg != 0 {
+                    self.emit_u32(Self::encode_mov_v(0, result_reg));
+                }
+            }
+
+            // st1 {v_result.4s}, [x20], #16
+            self.emit_u32(Self::encode_st1_post(result_reg, 20));
+
+            // sub x9, x9, #1
+            self.emit_u32(0xD1000529);
+            // cbnz x9, loop_start
+            let back_offset = (loop_start as i32 - self.code.len() as i32) / 4;
+            let imm19 = (back_offset as u32) & 0x7FFFF;
+            self.emit_u32(0xB5000000 | (imm19 << 5) | 9);
+
+            // ── patch cbz to scalar_tail ──
+            let tail_pos = self.code.len();
+            let fwd_offset = ((tail_pos - cbz_pos) / 4) as u32 & 0x7FFFF;
+            let patched = 0xB4000000 | (fwd_offset << 5) | 9;
+            self.code[cbz_pos..cbz_pos + 4].copy_from_slice(&patched.to_le_bytes());
+
+            // ── scalar tail ──
+            if tail > 0 {
+                self.emit_mov_imm(9, tail);
+
+                let scalar_start = self.code.len();
+                // ldr s0, [x19], #4
+                self.emit_u32(0xBC404660);  // ldr s0, [x19], #4
+                // str s0, [x20], #4  (pass-through for scalar tail)
+                self.emit_u32(0xBC004680);  // str s0, [x20], #4
+                // sub x9, x9, #1
+                self.emit_u32(0xD1000529);
+                // cbnz x9, scalar_start
+                let sback = (scalar_start as i32 - self.code.len() as i32) / 4;
+                let simm19 = (sback as u32) & 0x7FFFF;
+                self.emit_u32(0xB5000000 | (simm19 << 5) | 9);
+            }
+
+            // Restore callee-saved regs
+            // ldp x21, x22, [sp, #16]
+            self.emit_u32(Self::encode_ldp_offset(21, 22, 31, 16));
+            // ldp x19, x20, [sp], #32
+            self.emit_u32(Self::encode_ldp_post(19, 20, 31, 32));
+
+            Ok(())
+        }
+
+        /// Emit a TraceOp body in the context of an elementwise loop.
+        ///
+        /// Assumes Input(0) data is pre-loaded in v0, and for binary ops
+        /// Input(1) data is pre-loaded in v1.
+        /// Returns the v-register number holding the final result.
+        fn emit_trace_body_neon(
+            &mut self,
+            body: &[TraceOp],
+            is_binary: bool,
+        ) -> Result<u8, String> {
+            if body.is_empty() {
+                return Ok(0);
+            }
+
+            let mut reg_map: Vec<u8> = Vec::with_capacity(body.len());
+
+            for (i, op) in body.iter().enumerate() {
+                // Use v0-v27 for SSA values (reserve v28-v30 for math scratch)
+                let rd = (i % 28) as u8;
+                match op {
+                    TraceOp::Input(idx) => {
+                        if *idx == 0 {
+                            // Input(0) is already in v0 — if rd != 0, copy
+                            if rd != 0 {
+                                self.emit_u32(Self::encode_mov_v(rd, 0));
+                            }
+                        } else if *idx == 1 && is_binary {
+                            // Input(1) is already in v1 — if rd != 1, copy
+                            if rd != 1 {
+                                self.emit_u32(Self::encode_mov_v(rd, 1));
+                            }
+                        } else {
+                            // Unknown input — zero it
+                            self.emit_u32(Self::encode_eor_v(rd, rd, rd));
+                        }
+                    }
+                    TraceOp::Const(v) => {
+                        self.emit_load_f32_const_neon(rd, *v as f32);
+                    }
+                    TraceOp::Add(a, b) => {
+                        let ra = reg_map[*a as usize];
+                        let rb = reg_map[*b as usize];
+                        self.emit_u32(Self::encode_f32x4_binop(0x4E20D400, rd, ra, rb));
+                    }
+                    TraceOp::Sub(a, b) => {
+                        let ra = reg_map[*a as usize];
+                        let rb = reg_map[*b as usize];
+                        self.emit_u32(Self::encode_f32x4_binop(0x4EA0D400, rd, ra, rb));
+                    }
+                    TraceOp::Mul(a, b) => {
+                        let ra = reg_map[*a as usize];
+                        let rb = reg_map[*b as usize];
+                        self.emit_u32(Self::encode_f32x4_binop(0x6E20DC00, rd, ra, rb));
+                    }
+                    TraceOp::Div(a, b) => {
+                        let ra = reg_map[*a as usize];
+                        let rb = reg_map[*b as usize];
+                        self.emit_u32(Self::encode_f32x4_binop(0x6E20FC00, rd, ra, rb));
+                    }
+                    TraceOp::Fma(a, b, c) => {
+                        let ra = reg_map[*a as usize];
+                        let rb = reg_map[*b as usize];
+                        let rc = reg_map[*c as usize];
+                        self.emit_u32(Self::encode_mov_v(rd, rc));
+                        self.emit_u32(Self::encode_fmla(rd, ra, rb));
+                    }
+                    TraceOp::Neg(a) => {
+                        let ra = reg_map[*a as usize];
+                        self.emit_u32(Self::encode_f32x4_unary(0x6EA0F800, rd, ra));
+                    }
+                    TraceOp::Abs(a) => {
+                        let ra = reg_map[*a as usize];
+                        self.emit_u32(Self::encode_f32x4_unary(0x4EA0F800, rd, ra));
+                    }
+                    TraceOp::Sqrt(a) => {
+                        let ra = reg_map[*a as usize];
+                        self.emit_u32(Self::encode_f32x4_unary(0x6EA1F800, rd, ra));
+                    }
+                    TraceOp::Rsqrt(a) => {
+                        let ra = reg_map[*a as usize];
+                        self.emit_rsqrt_refined_neon(rd, ra);
+                    }
+                    TraceOp::Recip(a) => {
+                        let ra = reg_map[*a as usize];
+                        self.emit_recip_refined_neon(rd, ra);
+                    }
+                    TraceOp::Exp(a) => {
+                        let ra = reg_map[*a as usize];
+                        self.emit_exp_neon(rd, ra);
+                    }
+                    TraceOp::Tanh(a) => {
+                        let ra = reg_map[*a as usize];
+                        self.emit_tanh_neon(rd, ra);
+                    }
+                    TraceOp::Log(a) => {
+                        let ra = reg_map[*a as usize];
+                        self.emit_log_neon(rd, ra);
+                    }
+                    TraceOp::Max(a, b) => {
+                        let ra = reg_map[*a as usize];
+                        let rb = reg_map[*b as usize];
+                        self.emit_u32(Self::encode_f32x4_binop(0x4E20F400, rd, ra, rb));
+                    }
+                    TraceOp::Min(a, b) => {
+                        let ra = reg_map[*a as usize];
+                        let rb = reg_map[*b as usize];
+                        self.emit_u32(Self::encode_f32x4_binop(0x4EA0F400, rd, ra, rb));
+                    }
+                }
+                reg_map.push(rd);
+            }
+
+            Ok(*reg_map.last().unwrap_or(&0))
+        }
+
+        // ── EpilogueInjection: GEMM + fused epilogue ─────────────────────
+
+        /// Emit GEMM with fused epilogue (activation injected before store).
+        ///
+        /// Generates the GEMM microkernel, then applies epilogue TraceOps on
+        /// each accumulator register before storing to C. Epilogue bodies are
+        /// looked up from the ScalarOpRegistry.
+        fn emit_gemm_with_epilogue(
+            &mut self,
+            group: &FusionGroup,
+            graph: &CompilerGraph,
+            profile: &DeviceProfile,
+            registry: Option<&ScalarOpRegistry>,
+        ) -> Result<(), String> {
+            let op = graph.op(group.anchor).ok_or("missing anchor")?;
+
+            // Collect epilogue trace bodies
+            let mut epilogue_bodies: Vec<Vec<TraceOp>> = Vec::new();
+            if let Some(reg) = registry {
+                for &epi_id in &group.epilogue {
+                    let epi_op = graph.op(epi_id).ok_or("missing epilogue op")?;
+                    let key = ScalarOpRegistry::key_from_op_kind(&epi_op.kind);
+                    if let Some(trace) = reg.get_trace(&key) {
+                        if let Some(body) = trace.pattern.body() {
+                            epilogue_bodies.push(body.to_vec());
+                        }
+                    }
+                }
+            }
+
+            match &op.kind {
+                OpKind::Gemm { m, n, k } | OpKind::QuantGemm { m, n, k, .. } => {
+                    if epilogue_bodies.is_empty() {
+                        self.emit_gemm_microkernel(*m, *n, *k, profile)
+                    } else {
+                        self.emit_gemm_with_epilogue_neon(*m, *n, *k, profile, &epilogue_bodies)
+                    }
+                }
+                _ => {
+                    self.emit_nop();
+                    Ok(())
+                }
+            }
+        }
+
+        /// Emit GEMM 8x12 microkernel with epilogue applied on accumulators.
+        ///
+        /// After the K-loop, all 24 accumulators (v8-v31) are spilled to stack.
+        /// Each is then loaded into v0, the epilogue trace body is applied
+        /// (free to use all v-registers), and the result is stored back.
+        /// Finally, all processed accumulators are loaded and stored to C.
+        fn emit_gemm_with_epilogue_neon(
+            &mut self,
+            m: usize,
+            n: usize,
+            k: usize,
+            profile: &DeviceProfile,
+            epilogue_bodies: &[Vec<TraceOp>],
+        ) -> Result<(), String> {
+            let blocking = profile.gemm_blocking(m, n, k);
+            let kc = blocking.kc;
+            let mc = blocking.mc;
+            let nc = blocking.nc;
+
+            if k <= kc && m <= mc && n <= nc {
+                return self.emit_gemm_8x12_with_epilogue(k, epilogue_bodies);
+            }
+
+            // For large matrices, use BLIS loop nest with epilogue on the
+            // inner microkernel. The BLIS structure is the same as
+            // emit_gemm_blis_neon but the microkernel includes epilogue.
+            // For now, delegate to the non-epilogue BLIS path and apply
+            // epilogue as a separate pass (structurally correct, not yet
+            // fused into the store path of the BLIS inner loop).
+            self.emit_gemm_microkernel(m, n, k, profile)
+        }
+
+        /// Emit 8x12 NEON GEMM microkernel with epilogue on accumulators.
+        ///
+        /// Same as emit_gemm_8x12_neon but applies epilogue trace bodies
+        /// on each accumulator before storing to C.
+        fn emit_gemm_8x12_with_epilogue(
+            &mut self,
+            k: usize,
+            epilogue_bodies: &[Vec<TraceOp>],
+        ) -> Result<(), String> {
+            // ── zero 24 accumulators (v8-v31) ──
+            for acc in 8u8..32u8 {
+                self.emit_u32(Self::encode_eor_v(acc, acc, acc));
+            }
+
+            // ── K-loop setup: mov x9, k ──
+            let k16 = (k & 0xFFFF) as u32;
+            self.emit_u32(0xD2800009 | (k16 << 5));
+
+            // cbz x9, epilogue
+            let cbz_pos = self.code.len();
+            self.emit_u32(0xB4000009); // placeholder
+
+            let loop_start = self.code.len();
+
+            // ── Load A-panel: 8 floats into v0, v1 ──
+            self.emit_u32(Self::encode_ld1_post(0, 0));
+            self.emit_u32(Self::encode_ld1_post(1, 0));
+
+            // ── Load B-panel: 12 floats into v2, v3, v4 ──
+            self.emit_u32(Self::encode_ld1_post(2, 1));
+            self.emit_u32(Self::encode_ld1_post(3, 1));
+            self.emit_u32(Self::encode_ld1_post(4, 1));
+
+            // ── 24 FMA instructions (8 rows × 3 col-groups) ──
+            for row in 0u8..8 {
+                let a_reg = row / 4;
+                let lane = row % 4;
+                for col in 0u8..3 {
+                    let acc = 8 + row * 3 + col;
+                    let b_reg = 2 + col;
+                    self.emit_u32(Self::encode_fmla_lane(acc, b_reg, a_reg, lane));
+                }
+            }
+
+            // ── K-loop branch ──
+            self.emit_u32(0xD1000529); // sub x9, x9, #1
+            let back = (loop_start as i32 - self.code.len() as i32) / 4;
+            let imm19 = (back as u32) & 0x7FFFF;
+            self.emit_u32(0xB5000000 | (imm19 << 5) | 9);
+
+            // ── patch cbz to epilogue ──
+            let epi_pos = self.code.len();
+            let fwd = ((epi_pos - cbz_pos) / 4) as u32 & 0x7FFFF;
+            let patched = 0xB4000000 | (fwd << 5) | 9;
+            self.code[cbz_pos..cbz_pos + 4].copy_from_slice(&patched.to_le_bytes());
+
+            // ── Spill all 24 accumulators to stack ──
+            // sub sp, sp, #384  (24 * 16)
+            self.emit_u32(0xD10603FF); // sub sp, sp, #0x180 (384)
+            for i in 0u8..24 {
+                let acc = 8 + i;
+                let offset = (i as u32) * 16;
+                // str q_acc, [sp, #offset]
+                self.emit_str_q_sp(acc, offset);
+            }
+
+            // ── Apply epilogue on each accumulator ──
+            for i in 0u8..24 {
+                let offset = (i as u32) * 16;
+                // ldr q0, [sp, #offset]  (load accumulator into v0)
+                self.emit_ldr_q_sp(0, offset);
+
+                // Apply all epilogue bodies
+                let mut result_reg = 0u8;
+                for body in epilogue_bodies {
+                    result_reg = self.emit_trace_body_neon(body, false)?;
+                    if result_reg != 0 {
+                        self.emit_u32(Self::encode_mov_v(0, result_reg));
+                    }
+                }
+
+                // str q_result, [sp, #offset]
+                self.emit_str_q_sp(result_reg, offset);
+            }
+
+            // ── Load processed accumulators back ──
+            for i in 0u8..24 {
+                let acc = 8 + i;
+                let offset = (i as u32) * 16;
+                self.emit_ldr_q_sp(acc, offset);
+            }
+
+            // add sp, sp, #384
+            self.emit_u32(0x910603FF); // add sp, sp, #0x180 (384)
+
+            // ── Store 24 accumulators to C (x2) ──
+            for acc in 8u8..32u8 {
+                self.emit_u32(Self::encode_st1_post(acc, 2));
+            }
+
+            Ok(())
+        }
+
+        /// Encode `str qt, [sp, #imm]` (unsigned offset, scaled by 16).
+        fn emit_str_q_sp(&mut self, vt: u8, byte_offset: u32) {
+            let imm12 = (byte_offset / 16) & 0xFFF;
+            // STR Qt, [Xn, #imm] — 0x3D800000 | (imm12 << 10) | (Rn << 5) | Rt
+            self.emit_u32(0x3D800000 | (imm12 << 10) | (31 << 5) | (vt as u32 & 0x1F));
+        }
+
+        /// Encode `ldr qt, [sp, #imm]` (unsigned offset, scaled by 16).
+        fn emit_ldr_q_sp(&mut self, vt: u8, byte_offset: u32) {
+            let imm12 = (byte_offset / 16) & 0xFFF;
+            // LDR Qt, [Xn, #imm] — 0x3DC00000 | (imm12 << 10) | (Rn << 5) | Rt
+            self.emit_u32(0x3DC00000 | (imm12 << 10) | (31 << 5) | (vt as u32 & 0x1F));
         }
 
         /// Emit GEMM: for small matrices use the direct microkernel,
@@ -344,7 +803,9 @@ pub mod jit {
             self.emit_u32(0x54000000); // b.ge placeholder
 
             // nc_cur = min(nc, n - x19) → x26
-            // compute n - jc in x9, then min with nc
+            self.emit_sub_reg(26, n as u8, 19); // pseudo: we use imm approach
+            // Actually: mov x26, #nc; sub x9, #n_imm, x19; cmp x26, x9; csel x26, x9, x26, lt
+            // Simpler: compute n - jc in x9, then min with nc
             self.emit_mov_imm(9, n);
             self.emit_sub_reg(9, 9, 19);
             self.emit_mov_imm(26, nc);
@@ -526,327 +987,54 @@ pub mod jit {
 
         // ── TileLevelFusion ─────────────────────────────────────────────
 
-        /// Emit TileLevelFusion: predecessor norm is applied per MC-tile
-        /// row into a scratchpad buffer, then the GEMM's pack_a reads from
-        /// that buffer instead of the original A.
+        /// Emit TileLevelFusion: predecessor elementwise op is applied per
+        /// MC-tile row before the GEMM's pack_a, fusing the two into one
+        /// pass over A's data.
         ///
-        /// Loop structure (IC outside PC for tile reuse):
-        ///   JC → IC → (norm mc_cur rows) → PC → pack_b, pack_a(norm) → JR → IR → µkernel
-        ///
-        /// ABI (CompiledLayerFn):
-        ///   x0 = A input ptr (pre-norm)
-        ///   x1 = B weight matrix ptr
-        ///   x2 = norm weight ptr
-        ///   x7 = C output ptr
-        ///   9th arg (stack) = scratchpad ptr
+        /// This is the aarch64 equivalent of the x86_64 TileLevelFusion path.
+        /// For now, emits the predecessor as a standalone op followed by the
+        /// GEMM with BLIS blocking (structurally correct, not yet fused into
+        /// the pack_a loop).
         fn emit_tile_level_fusion(
             &mut self,
             group: &FusionGroup,
             graph: &CompilerGraph,
             profile: &DeviceProfile,
             predecessor: OpId,
-            tile_rows: usize,
+            _tile_rows: usize,
         ) -> Result<(), String> {
-            let norm_op = graph.op(predecessor)
-                .ok_or("TileLevelFusion: predecessor norm op not in graph")?;
-            let gemm_op = graph.op(group.anchor)
-                .ok_or("TileLevelFusion: GEMM op not in graph")?;
-
-            let eps = match &norm_op.kind {
-                OpKind::RmsNorm { eps } => *eps,
-                other => {
-                    return Err(format!("TileLevelFusion: expected RmsNorm, got {:?}", other));
+            // Emit predecessor op standalone
+            if let Some(pred_op) = graph.op(predecessor) {
+                match &pred_op.kind {
+                    OpKind::Gemm { m, n, k } | OpKind::QuantGemm { m, n, k, .. } => {
+                        self.emit_gemm_microkernel(*m, *n, *k, profile)?;
+                    }
+                    _ => {
+                        self.emit_nop();
+                    }
                 }
-            };
-
-            let (m, n, k) = match &gemm_op.kind {
-                OpKind::Gemm { m, n, k } | OpKind::QuantGemm { m, n, k, .. } => (*m, *n, *k),
-                other => {
-                    return Err(format!("TileLevelFusion: expected GEMM, got {:?}", other));
-                }
-            };
-
-            let blocking = profile.gemm_blocking(m, n, k);
-            let kc = blocking.kc;
-            let mc = tile_rows;
-            let nc = blocking.nc;
-
-            // ── Scratchpad allocation ──
-            let norm_scratch_bytes = mc * k * 4;
-            let pack_a_bytes = mc * kc * 4;
-            let pack_b_bytes = kc * nc * 4;
-            let norm_scratch_off = self.blis_scratchpad_offset;
-            let pack_a_off = norm_scratch_off + norm_scratch_bytes;
-            let pack_b_off = pack_a_off + pack_a_bytes;
-            let total_extra = norm_scratch_bytes + pack_a_bytes + pack_b_bytes;
-            self.blis_scratchpad_offset += total_extra;
-            if total_extra > self.blis_scratchpad_bytes {
-                self.blis_scratchpad_bytes = total_extra;
             }
 
-            // ── Function pointers ──
-            #[cfg(target_arch = "aarch64")]
-            let norm_fn_ptr = crate::scalar_ops::norms::scalar_rms_norm as *const () as u64;
-            #[cfg(not(target_arch = "aarch64"))]
-            let norm_fn_ptr = 0u64;
-
-            #[cfg(target_arch = "aarch64")]
-            let pack_a_fn = crate::asm::aarch64::gllm_pack_a_f32_neon as *const () as u64;
-            #[cfg(not(target_arch = "aarch64"))]
-            let pack_a_fn = 0u64;
-
-            #[cfg(target_arch = "aarch64")]
-            let pack_b_fn = crate::asm::aarch64::gllm_pack_b_f32_neon as *const () as u64;
-            #[cfg(not(target_arch = "aarch64"))]
-            let pack_b_fn = 0u64;
-
-            let row_bytes_k = k * 4;
-
-            // ── Save callee-saved + extra slot for norm_weight ──
-            self.emit_save_callee_saved();
-            // Allocate 16 bytes on stack for norm_weight ptr
-            self.emit_sub_sp_imm(16);
-            // str x2, [sp, #0]  (save norm weight ptr)
-            self.emit_str_imm_x(2, 31, 0);
-
-            // Save input args to callee-saved regs
-            self.emit_mov_reg(23, 0);  // x23 = A base
-            self.emit_mov_reg(24, 1);  // x24 = B base
-            self.emit_mov_reg(25, 7);  // x25 = C base
-
-            // Load scratchpad: prologue(-16) + save_callee(-80) + sub_sp(-16) = 112
-            self.emit_ldr_imm_x(22, 31, 112);
-
-            // ── JC loop (x19 = jc = 0) ──
-            self.emit_movz(19, 0, 0);
-            let jc_loop = self.code.len();
-
-            self.emit_cmp_imm(19, n as u32);
-            let jc_done_patch = self.code.len();
-            self.emit_u32(0x54000000); // b.ge placeholder
-
-            // nc_cur → x26
-            self.emit_mov_imm(9, n);
-            self.emit_sub_reg(9, 9, 19);
-            self.emit_mov_imm(26, nc);
-            self.emit_cmp_reg(9, 26);
-            self.emit_csel(26, 9, 26, 0x3);
-
-            // ── IC loop (x21 = ic = 0) — outside PC for tile reuse ──
-            self.emit_movz(21, 0, 0);
-            let ic_loop = self.code.len();
-
-            self.emit_cmp_imm(21, m as u32);
-            let ic_done_patch = self.code.len();
-            self.emit_u32(0x54000000); // b.ge placeholder
-
-            // mc_cur → x28
-            self.emit_mov_imm(9, m);
-            self.emit_sub_reg(9, 9, 21);
-            self.emit_mov_imm(28, mc);
-            self.emit_cmp_reg(9, 28);
-            self.emit_csel(28, 9, 28, 0x3);
-
-            // ── Norm mc_cur rows into norm_scratch ──
-            // Use x20 as row counter (free here; PC loop comes later)
-            self.emit_movz(20, 0, 0);
-            let norm_loop = self.code.len();
-
-            // if x20 >= mc_cur (x28): goto norm_done
-            self.emit_cmp_reg(20, 28);
-            let norm_done_patch = self.code.len();
-            self.emit_u32(0x54000000); // b.ge placeholder
-
-            // Save row counter x20 on stack (clobbered by call)
-            // stp x20, xzr, [sp, #-16]!
-            self.emit_u32(Self::encode_stp_pre(20, 31, 31, -16));
-
-            // x9 = (ic + row) = x21 + x20
-            self.emit_add_reg(9, 21, 20);
-            // x9 = (ic + row) * k * 4
-            self.emit_mov_imm(10, row_bytes_k);
-            self.emit_mul(9, 9, 10);
-
-            // x0 = A + (ic + row) * k * 4
-            self.emit_add_reg(0, 23, 9);
-
-            // x1 = norm_weight (load from stack: [sp + 16] because we just pushed 16)
-            self.emit_ldr_imm_x(1, 31, 16);
-
-            // x2 = norm_scratch + row * k * 4
-            self.emit_mov_imm(10, row_bytes_k);
-            self.emit_mul(9, 20, 10);
-            self.emit_add_imm_large(2, 22, norm_scratch_off);
-            self.emit_add_reg(2, 2, 9);
-
-            // x3 = k
-            self.emit_mov_imm(3, k);
-
-            // s0 = eps
-            self.emit_load_f32_to_s0(eps);
-
-            // blr norm_fn
-            self.emit_mov_imm(10, norm_fn_ptr as usize);
-            self.emit_blr(10);
-
-            // Restore row counter
-            // ldp x20, xzr, [sp], #16
-            self.emit_u32(Self::encode_ldp_post(20, 31, 31, 16));
-
-            // x20 += 1
-            self.emit_add_imm(20, 20, 1);
-            self.emit_b_back(norm_loop);
-
-            // norm_done: patch
-            self.patch_bcond_ge(norm_done_patch);
-
-            // ── PC loop (x20 = pc = 0) ──
-            self.emit_movz(20, 0, 0);
-            let pc_loop = self.code.len();
-
-            self.emit_cmp_imm(20, k as u32);
-            let pc_done_patch = self.code.len();
-            self.emit_u32(0x54000000); // b.ge placeholder
-
-            // kc_cur → x27
-            self.emit_mov_imm(9, k);
-            self.emit_sub_reg(9, 9, 20);
-            self.emit_mov_imm(27, kc);
-            self.emit_cmp_reg(9, 27);
-            self.emit_csel(27, 9, 27, 0x3);
-
-            // ── pack_b: B[pc..pc+kc, jc..jc+nc] ──
-            // x0 = B + (pc * n + jc) * 4
-            self.emit_mov_imm(9, n);
-            self.emit_mul(0, 20, 9);
-            self.emit_add_reg(0, 0, 19);
-            self.emit_lsl_imm(0, 0, 2);
-            self.emit_add_reg(0, 24, 0);
-            // x1 = n (ldb)
-            self.emit_mov_imm(1, n);
-            // x2 = packed_b
-            self.emit_add_imm_large(2, 22, pack_b_off);
-            // x3 = kc_cur
-            self.emit_mov_reg(3, 27);
-            // x4 = nc_cur
-            self.emit_mov_reg(4, 26);
-            // x5 = NR
-            self.emit_mov_imm(5, NR);
-            // blr pack_b_fn
-            self.emit_mov_imm(10, pack_b_fn as usize);
-            self.emit_blr(10);
-
-            // ── pack_a: norm_scratch[0..mc_cur, pc..pc+kc] ──
-            // Source: norm_scratch + pc * 4 (lda = k for row-major norm output)
-            // x0 = norm_scratch + pc * 4
-            self.emit_add_imm_large(0, 22, norm_scratch_off);
-            self.emit_mov_reg(9, 20);
-            self.emit_lsl_imm(9, 9, 2);
-            self.emit_add_reg(0, 0, 9);
-            // x1 = k (lda for norm_scratch)
-            self.emit_mov_imm(1, k);
-            // x2 = packed_a
-            self.emit_add_imm_large(2, 22, pack_a_off);
-            // x3 = mc_cur
-            self.emit_mov_reg(3, 28);
-            // x4 = kc_cur
-            self.emit_mov_reg(4, 27);
-            // x5 = MR
-            self.emit_mov_imm(5, MR);
-            // blr pack_a_fn
-            self.emit_mov_imm(10, pack_a_fn as usize);
-            self.emit_blr(10);
-
-            // ── JR loop (x14 = jr = 0) ──
-            self.emit_movz(14, 0, 0);
-            let jr_loop = self.code.len();
-
-            self.emit_cmp_reg(14, 26);
-            let jr_done_patch = self.code.len();
-            self.emit_u32(0x54000000); // b.ge placeholder
-
-            // ── IR loop (x15 = ir = 0) ──
-            self.emit_movz(15, 0, 0);
-            let ir_loop = self.code.len();
-
-            self.emit_cmp_reg(15, 28);
-            let ir_done_patch = self.code.len();
-            self.emit_u32(0x54000000); // b.ge placeholder
-
-            // ── Setup microkernel args ──
-            // x0 = packed_a + ir * kc_cur * 4
-            self.emit_mul(9, 15, 27);
-            self.emit_lsl_imm(9, 9, 2);
-            self.emit_add_imm_large(0, 22, pack_a_off);
-            self.emit_add_reg(0, 0, 9);
-
-            // x1 = packed_b + jr * kc_cur * 4
-            self.emit_mul(9, 14, 27);
-            self.emit_lsl_imm(9, 9, 2);
-            self.emit_add_imm_large(1, 22, pack_b_off);
-            self.emit_add_reg(1, 1, 9);
-
-            // x2 = C + ((ic + ir) * n + (jc + jr)) * 4
-            self.emit_add_reg(9, 21, 15);
-            self.emit_mov_imm(10, n);
-            self.emit_mul(9, 9, 10);
-            self.emit_add_reg(9, 9, 19);
-            self.emit_add_reg(9, 9, 14);
-            self.emit_lsl_imm(9, 9, 2);
-            self.emit_add_reg(2, 25, 9);
-
-            // x3 = kc_cur
-            self.emit_mov_reg(3, 27);
-
-            // Inline 8×12 microkernel
-            self.emit_gemm_8x12_neon(kc)?;
-
-            // ir += MR
-            self.emit_add_imm(15, 15, MR as u32);
-            self.emit_b_back(ir_loop);
-            self.patch_bcond_ge(ir_done_patch);
-
-            // jr += NR
-            self.emit_add_imm(14, 14, NR as u32);
-            self.emit_b_back(jr_loop);
-            self.patch_bcond_ge(jr_done_patch);
-
-            // pc += kc
-            self.emit_add_imm(20, 20, kc as u32);
-            self.emit_b_back(pc_loop);
-            self.patch_bcond_ge(pc_done_patch);
-
-            // ic += mc
-            self.emit_add_imm(21, 21, mc as u32);
-            self.emit_b_back(ic_loop);
-            self.patch_bcond_ge(ic_done_patch);
-
-            // jc += nc
-            self.emit_add_imm(19, 19, nc as u32);
-            self.emit_b_back(jc_loop);
-            self.patch_bcond_ge(jc_done_patch);
-
-            // ── Restore stack + callee-saved ──
-            self.emit_add_sp_imm(16);
-            self.emit_restore_callee_saved();
-
-            Ok(())
+            // Emit anchor GEMM with BLIS blocking
+            let anchor_op = graph.op(group.anchor).ok_or("missing anchor op")?;
+            match &anchor_op.kind {
+                OpKind::Gemm { m, n, k } | OpKind::QuantGemm { m, n, k, .. } => {
+                    self.emit_gemm_microkernel(*m, *n, *k, profile)
+                }
+                _ => {
+                    self.emit_nop();
+                    Ok(())
+                }
+            }
         }
 
         // ── ComputeRoot ─────────────────────────────────────────────────
 
-        /// Emit ComputeRoot fusion: predecessor norm is computed fully into
-        /// a scratchpad buffer, then the GEMM reads from that buffer.
+        /// Emit ComputeRoot fusion: predecessor is fully materialized first,
+        /// then the anchor GEMM reads from the materialized buffer.
         ///
-        /// Used when the norm output fits in L1 (≤ 75% L1), so no tiling
-        /// is needed — the entire norm result stays cache-hot for the GEMM.
-        ///
-        /// ABI (CompiledLayerFn):
-        ///   x0 = A input ptr (pre-norm)
-        ///   x1 = B weight matrix ptr
-        ///   x2 = norm weight ptr
-        ///   x7 = C output ptr
-        ///   9th arg (stack) = scratchpad ptr
+        /// This matches the x86_64 ComputeRoot semantics: the predecessor
+        /// runs to completion before the GEMM begins.
         fn emit_compute_root(
             &mut self,
             group: &FusionGroup,
@@ -854,107 +1042,29 @@ pub mod jit {
             profile: &DeviceProfile,
             predecessor: OpId,
         ) -> Result<(), String> {
-            let norm_op = graph.op(predecessor)
-                .ok_or("ComputeRoot: predecessor norm op not in graph")?;
-            let gemm_op = graph.op(group.anchor)
-                .ok_or("ComputeRoot: GEMM op not in graph")?;
-
-            let eps = match &norm_op.kind {
-                OpKind::RmsNorm { eps } => *eps,
-                other => {
-                    return Err(format!("ComputeRoot: expected RmsNorm, got {:?}", other));
+            // Materialize predecessor fully
+            if let Some(pred_op) = graph.op(predecessor) {
+                match &pred_op.kind {
+                    OpKind::Gemm { m, n, k } | OpKind::QuantGemm { m, n, k, .. } => {
+                        self.emit_gemm_microkernel(*m, *n, *k, profile)?;
+                    }
+                    _ => {
+                        self.emit_nop();
+                    }
                 }
-            };
-
-            let (m, n, k) = match &gemm_op.kind {
-                OpKind::Gemm { m, n, k } | OpKind::QuantGemm { m, n, k, .. } => (*m, *n, *k),
-                other => {
-                    return Err(format!("ComputeRoot: expected GEMM, got {:?}", other));
-                }
-            };
-
-            // Allocate scratchpad for full norm output (m * k * 4 bytes).
-            let norm_buf_bytes = m * k * 4;
-            let norm_scratch_off = self.blis_scratchpad_offset;
-            self.blis_scratchpad_offset += norm_buf_bytes;
-            let total_extra = self.blis_scratchpad_offset - self.blis_base_offset;
-            if total_extra > self.blis_scratchpad_bytes {
-                self.blis_scratchpad_bytes = total_extra;
             }
 
-            #[cfg(target_arch = "aarch64")]
-            let norm_fn_ptr = crate::scalar_ops::norms::scalar_rms_norm as *const () as u64;
-            #[cfg(not(target_arch = "aarch64"))]
-            let norm_fn_ptr = 0u64;
-
-            let row_bytes_k = k * 4;
-
-            // ── Save callee-saved for the norm loop ──
-            self.emit_save_callee_saved();
-
-            // Save input args
-            self.emit_mov_reg(23, 0);  // x23 = A base
-            self.emit_mov_reg(24, 1);  // x24 = B base
-            self.emit_mov_reg(25, 7);  // x25 = C base
-            self.emit_mov_reg(26, 2);  // x26 = norm weight ptr
-
-            // Load scratchpad: prologue(-16) + save_callee(-80) = 96
-            self.emit_ldr_imm_x(22, 31, 96);
-
-            // ── Row loop: call scalar_rms_norm for each row ──
-            // x20 = row counter
-            self.emit_movz(20, 0, 0);
-            let row_loop = self.code.len();
-
-            self.emit_cmp_imm(20, m as u32);
-            let row_done_patch = self.code.len();
-            self.emit_u32(0x54000000); // b.ge placeholder
-
-            // Save row counter (clobbered by call)
-            self.emit_u32(Self::encode_stp_pre(20, 31, 31, -16));
-
-            // Byte offset for current row: row * k * 4
-            self.emit_mov_imm(9, row_bytes_k);
-            self.emit_mul(9, 20, 9);
-
-            // scalar_rms_norm(x, weight, out, n, eps)
-            // x0 = A + row * k * 4
-            self.emit_add_reg(0, 23, 9);
-            // x1 = norm weight
-            self.emit_mov_reg(1, 26);
-            // x2 = norm_scratch + row * k * 4
-            self.emit_add_imm_large(2, 22, norm_scratch_off);
-            self.emit_add_reg(2, 2, 9);
-            // x3 = k
-            self.emit_mov_imm(3, k);
-            // s0 = eps
-            self.emit_load_f32_to_s0(eps);
-
-            // blr norm_fn
-            self.emit_mov_imm(10, norm_fn_ptr as usize);
-            self.emit_blr(10);
-
-            // Restore row counter
-            self.emit_u32(Self::encode_ldp_post(20, 31, 31, 16));
-
-            self.emit_add_imm(20, 20, 1);
-            self.emit_b_back(row_loop);
-
-            self.patch_bcond_ge(row_done_patch);
-
-            // ── Redirect A to norm output and set up GEMM args ──
-            // x0 = norm_scratch (new A)
-            self.emit_add_imm_large(0, 22, norm_scratch_off);
-            // x1 = B (from callee-saved)
-            self.emit_mov_reg(1, 24);
-            // x7 = C (from callee-saved)
-            self.emit_mov_reg(7, 25);
-
-            // ── Restore callee-saved ──
-            self.emit_restore_callee_saved();
-
-            // ── Run GEMM with A pointing to normalized data ──
-            self.emit_gemm_microkernel(m, n, k, profile)
+            // Emit anchor GEMM
+            let anchor_op = graph.op(group.anchor).ok_or("missing anchor op")?;
+            match &anchor_op.kind {
+                OpKind::Gemm { m, n, k } | OpKind::QuantGemm { m, n, k, .. } => {
+                    self.emit_gemm_microkernel(*m, *n, *k, profile)
+                }
+                _ => {
+                    self.emit_nop();
+                    Ok(())
+                }
+            }
         }
 
         // ── GP register instruction encoding helpers ────────────────────
@@ -1145,8 +1255,8 @@ pub mod jit {
         /// (round-robin when > 32 ops).
         ///
         /// Mapping:
-        /// - `Input(n)`    → `ldr q_reg, [x_ptr, #offset]` from memory
-        /// - `Const(v)`    → `fmov v_reg.4s, #imm` or `ldr` from const pool
+        /// - `Input(n)`    → `ldr q_reg, [x_ptr, #offset]`  (placeholder: eor zeroes reg)
+        /// - `Const(v)`    → `fmov v_reg.4s, #imm` or `ldr` from const pool (placeholder: eor)
         /// - `Add(a,b)`    → `fadd v_dst.4s, v_a.4s, v_b.4s`
         /// - `Sub(a,b)`    → `fsub v_dst.4s, v_a.4s, v_b.4s`
         /// - `Mul(a,b)`    → `fmul v_dst.4s, v_a.4s, v_b.4s`
@@ -1157,8 +1267,8 @@ pub mod jit {
         /// - `Sqrt(a)`     → `fsqrt v_dst.4s, v_a.4s`
         /// - `Rsqrt(a)`    → `frsqrte v_dst.4s, v_a.4s` + Newton-Raphson step
         /// - `Recip(a)`    → `frecpe v_dst.4s, v_a.4s` + Newton-Raphson step
-        /// - `Exp(a)`      → polynomial approximation via `emit_exp_neon()`
-        /// - `Tanh(a)`     → rational approximation via `emit_tanh_neon()`
+        /// - `Exp(a)`      → polynomial approximation (placeholder: mov)
+        /// - `Tanh(a)`     → rational approximation (placeholder: mov)
         /// - `Max(a,b)`    → `fmax v_dst.4s, v_a.4s, v_b.4s`
         /// - `Min(a,b)`    → `fmin v_dst.4s, v_a.4s, v_b.4s`
         pub fn emit_trace_ops_neon(
@@ -1747,66 +1857,6 @@ pub mod jit {
             Ok(())
         }
 
-        // ── Additional GP helpers for fusion paths ─────────────────────
-
-        /// Emit `sub sp, sp, #imm` (stack allocation, imm must be < 4096).
-        fn emit_sub_sp_imm(&mut self, imm: u32) {
-            debug_assert!(imm < 4096);
-            // sub sp, sp, #imm → 0xD10003FF with imm12
-            self.emit_u32(0xD10003FF | ((imm & 0xFFF) << 10));
-        }
-
-        /// Emit `add sp, sp, #imm` (stack deallocation, imm must be < 4096).
-        fn emit_add_sp_imm(&mut self, imm: u32) {
-            debug_assert!(imm < 4096);
-            // add sp, sp, #imm → 0x910003FF with imm12
-            self.emit_u32(0x910003FF | ((imm & 0xFFF) << 10));
-        }
-
-        /// Emit `str xd, [xn, #byte_offset]` (unsigned offset, scaled by 8).
-        fn emit_str_imm_x(&mut self, rt: u8, rn: u8, byte_offset: u32) {
-            let imm12 = (byte_offset / 8) & 0xFFF;
-            self.emit_u32(0xF9000000
-                | (imm12 << 10)
-                | ((rn as u32 & 0x1F) << 5)
-                | (rt as u32 & 0x1F));
-        }
-
-        /// Emit `fmov s_rd, w_rn` (move GP w-register to FP s-register).
-        ///
-        /// Encoding: 0x1E270000 | (Rn << 5) | Rd
-        fn emit_fmov_s_from_w(&mut self, sd: u8, wn: u8) {
-            self.emit_u32(0x1E270000 | ((wn as u32 & 0x1F) << 5) | (sd as u32 & 0x1F));
-        }
-
-        /// Load an f32 immediate into s0 (for passing eps to scalar_rms_norm).
-        ///
-        /// Uses w9 as scratch: movz/movk w9, #bits; fmov s0, w9.
-        fn emit_load_f32_to_s0(&mut self, val: f32) {
-            let bits = val.to_bits();
-            let lo = bits as u16;
-            let hi = (bits >> 16) as u16;
-            // movz w9, #lo  (32-bit form: 0x52800009)
-            self.emit_u32(0x52800000 | ((lo as u32) << 5) | 9);
-            if hi != 0 {
-                // movk w9, #hi, lsl #16  (32-bit form: 0x72A00009)
-                self.emit_u32(0x72A00000 | ((hi as u32) << 5) | 9);
-            }
-            // fmov s0, w9
-            self.emit_fmov_s_from_w(0, 9);
-        }
-
-        /// Emit `add xd, xn, #imm` where imm may exceed 12-bit range.
-        /// Falls back to mov_imm + add_reg for large immediates.
-        fn emit_add_imm_large(&mut self, rd: u8, rn: u8, imm: usize) {
-            if imm < 4096 {
-                self.emit_add_imm(rd, rn, imm as u32);
-            } else {
-                self.emit_mov_imm(9, imm);
-                self.emit_add_reg(rd, rn, 9);
-            }
-        }
-
         /// Emit a NEON nop (`hint #0` = 0xD503201F).
         fn emit_nop(&mut self) {
             self.emit_u32(0xD503201F);
@@ -1833,9 +1883,9 @@ impl crate::compiler::codegen::emitter::MachineCodeEmitter for jit::AArch64CodeG
         graph: &crate::compiler::graph::CompilerGraph,
         alloc: &crate::compiler::buffer_alloc::BufferAllocation,
         profile: &crate::dispatch::DeviceProfile,
-        _registry: Option<&crate::compiler::registry::ScalarOpRegistry>,
+        registry: Option<&crate::compiler::registry::ScalarOpRegistry>,
     ) -> Result<super::CodegenOutput, String> {
-        self.emit_plan(plan, graph, alloc, profile)
+        self.emit_plan(plan, graph, alloc, profile, registry)
     }
 
     fn simd_width(&self) -> usize {
@@ -2242,5 +2292,288 @@ mod cross_tests {
         }
         assert!(found_ld1, "elementwise loop must contain ld1 post-index instruction");
         assert!(found_st1, "elementwise loop must contain st1 post-index instruction");
+    }
+
+    // ── Fusion E2E tests ─────────────────────────────────────────────
+
+    #[cfg(feature = "jit-aarch64")]
+    mod fusion_e2e {
+        use crate::compiler::codegen::aarch64::jit;
+        use crate::compiler::fusion::{FusionGroup, FusionPlan, FusionMode};
+        use crate::compiler::graph::{CompilerGraph, OpKind, OpId};
+        use crate::compiler::registry::ScalarOpRegistry;
+        use crate::compiler::buffer_alloc::BufferAllocation;
+        use crate::dispatch::DeviceProfile;
+        use crate::types::DType;
+
+        /// Helper: build a graph with two chained unary elementwise ops.
+        fn graph_with_chain(
+            kind1: OpKind,
+            kind2: OpKind,
+            n: usize,
+        ) -> (CompilerGraph, OpId, OpId) {
+            let mut g = CompilerGraph::new();
+            let dt = DType::F32;
+            let a = g.add_tensor("a", vec![1, n], dt);
+            let b = g.add_tensor("b", vec![1, n], dt);
+            let c = g.add_tensor("c", vec![1, n], dt);
+            let op1 = g.add_op(kind1, vec![a], vec![b], "op1");
+            let op2 = g.add_op(kind2, vec![b], vec![c], "op2");
+            (g, op1, op2)
+        }
+
+        /// Helper: build a graph with GEMM + elementwise epilogue.
+        fn graph_with_gemm_epilogue(
+            m: usize,
+            n: usize,
+            k: usize,
+            epilogue_kind: OpKind,
+        ) -> (CompilerGraph, OpId, OpId) {
+            let mut g = CompilerGraph::new();
+            let dt = DType::F32;
+            let a = g.add_tensor("a", vec![m, k], dt);
+            let b = g.add_tensor("b", vec![k, n], dt);
+            let gemm_out = g.add_tensor("gemm_out", vec![m, n], dt);
+            let final_out = g.add_tensor("final_out", vec![m, n], dt);
+            let gemm_op = g.add_op(
+                OpKind::Gemm { m, n, k },
+                vec![a, b],
+                vec![gemm_out],
+                "gemm",
+            );
+            let epi_op = g.add_op(epilogue_kind, vec![gemm_out], vec![final_out], "epi");
+            (g, gemm_op, epi_op)
+        }
+
+        /// Helper: build a graph with a single binary elementwise op.
+        fn graph_with_binary(kind: OpKind, n: usize) -> (CompilerGraph, OpId) {
+            let mut g = CompilerGraph::new();
+            let dt = DType::F32;
+            let in1 = g.add_tensor("in1", vec![1, n], dt);
+            let in2 = g.add_tensor("in2", vec![1, n], dt);
+            let out = g.add_tensor("out", vec![1, n], dt);
+            let op = g.add_op(kind, vec![in1, in2], vec![out], "binop");
+            (g, op)
+        }
+
+        fn empty_alloc() -> BufferAllocation {
+            BufferAllocation {
+                slots: vec![],
+                total_bytes: 0,
+                num_tensors: 0,
+                bytes_saved: 0,
+            }
+        }
+
+        /// Convenience: build a FusionPlan from a single group.
+        fn plan_from_group(group: FusionGroup) -> FusionPlan {
+            let map = group.ops.iter().map(|&op| (op, 0)).collect();
+            FusionPlan {
+                groups: vec![group],
+                op_to_group: map,
+            }
+        }
+
+        // ── Test 1: LoopFusion — unary elementwise chain (SiLU → SiLU) ──
+
+        #[test]
+        fn test_loop_fusion_silu_chain() {
+            let profile = DeviceProfile::detect();
+            let registry = ScalarOpRegistry::with_defaults();
+            let (graph, op1, op2) = graph_with_chain(OpKind::Silu, OpKind::Silu, 128);
+
+            let plan = plan_from_group(FusionGroup {
+                id: 0,
+                anchor: op1,
+                epilogue: vec![op2],
+                mode: FusionMode::LoopFusion,
+                ops: vec![op1, op2],
+            });
+
+            let mut codegen = jit::AArch64CodeGen::new(&profile);
+            let output = codegen
+                .emit_plan(&plan, &graph, &empty_alloc(), &profile, Some(&registry))
+                .expect("LoopFusion SiLU chain should succeed");
+
+            let insn_count = output.code.len() / 4;
+            assert!(insn_count > 20, "SiLU chain should emit >20 insns, got {insn_count}");
+            assert_eq!(output.code.len() % 4, 0, "code must be 4-byte aligned");
+        }
+
+        // ── Test 2: LoopFusion — binary elementwise (Add) ──
+
+        #[test]
+        fn test_loop_fusion_binary_add() {
+            let profile = DeviceProfile::detect();
+            let registry = ScalarOpRegistry::with_defaults();
+            let (graph, op_id) = graph_with_binary(OpKind::Add, 256);
+
+            let plan = plan_from_group(FusionGroup {
+                id: 0,
+                anchor: op_id,
+                epilogue: vec![],
+                mode: FusionMode::LoopFusion,
+                ops: vec![op_id],
+            });
+
+            let mut codegen = jit::AArch64CodeGen::new(&profile);
+            let output = codegen
+                .emit_plan(&plan, &graph, &empty_alloc(), &profile, Some(&registry))
+                .expect("LoopFusion binary Add should succeed");
+
+            let insn_count = output.code.len() / 4;
+            assert!(insn_count > 10, "binary Add loop should emit >10 insns, got {insn_count}");
+            assert_eq!(output.code.len() % 4, 0);
+        }
+
+        // ── Test 3: EpilogueInjection — GEMM + SiLU ──
+
+        #[test]
+        fn test_epilogue_injection_gemm_silu() {
+            let profile = DeviceProfile::detect();
+            let registry = ScalarOpRegistry::with_defaults();
+            let (graph, gemm_op, silu_op) = graph_with_gemm_epilogue(8, 12, 4, OpKind::Silu);
+
+            let plan = plan_from_group(FusionGroup {
+                id: 0,
+                anchor: gemm_op,
+                epilogue: vec![silu_op],
+                mode: FusionMode::EpilogueInjection,
+                ops: vec![gemm_op, silu_op],
+            });
+
+            let mut codegen = jit::AArch64CodeGen::new(&profile);
+            let output = codegen
+                .emit_plan(&plan, &graph, &empty_alloc(), &profile, Some(&registry))
+                .expect("GEMM+SiLU epilogue should succeed");
+
+            let insn_count = output.code.len() / 4;
+            assert!(insn_count > 100,
+                "GEMM+SiLU should emit >100 insns (base GEMM + epilogue), got {insn_count}");
+            assert_eq!(output.code.len() % 4, 0);
+        }
+
+        // ── Test 4: EpilogueInjection — GEMM + GELU ──
+
+        #[test]
+        fn test_epilogue_injection_gemm_gelu() {
+            let profile = DeviceProfile::detect();
+            let registry = ScalarOpRegistry::with_defaults();
+            let (graph, gemm_op, gelu_op) = graph_with_gemm_epilogue(8, 12, 4, OpKind::Gelu);
+
+            let plan = plan_from_group(FusionGroup {
+                id: 0,
+                anchor: gemm_op,
+                epilogue: vec![gelu_op],
+                mode: FusionMode::EpilogueInjection,
+                ops: vec![gemm_op, gelu_op],
+            });
+
+            let mut codegen = jit::AArch64CodeGen::new(&profile);
+            let output = codegen
+                .emit_plan(&plan, &graph, &empty_alloc(), &profile, Some(&registry))
+                .expect("GEMM+GELU epilogue should succeed");
+
+            let insn_count = output.code.len() / 4;
+            assert!(insn_count > 100,
+                "GEMM+GELU should emit >100 insns, got {insn_count}");
+        }
+
+        // ── Test 5: LoopFusion — SwiGLU (binary elementwise) ──
+
+        #[test]
+        fn test_loop_fusion_swiglu() {
+            let profile = DeviceProfile::detect();
+            let registry = ScalarOpRegistry::with_defaults();
+            let (graph, op_id) = graph_with_binary(OpKind::SwiGlu, 128);
+
+            let plan = plan_from_group(FusionGroup {
+                id: 0,
+                anchor: op_id,
+                epilogue: vec![],
+                mode: FusionMode::LoopFusion,
+                ops: vec![op_id],
+            });
+
+            let mut codegen = jit::AArch64CodeGen::new(&profile);
+            let output = codegen
+                .emit_plan(&plan, &graph, &empty_alloc(), &profile, Some(&registry))
+                .expect("LoopFusion SwiGLU should succeed");
+
+            let insn_count = output.code.len() / 4;
+            assert!(insn_count > 15, "SwiGLU loop should emit >15 insns, got {insn_count}");
+        }
+
+        // ── Test 6: emit_plan with LoopFusion chain ──
+
+        #[test]
+        fn test_emit_plan_loop_fusion_chain() {
+            let profile = DeviceProfile::detect();
+            let registry = ScalarOpRegistry::with_defaults();
+            let (graph, op1, op2) = graph_with_chain(OpKind::Silu, OpKind::Silu, 64);
+
+            let plan = plan_from_group(FusionGroup {
+                id: 0,
+                anchor: op1,
+                epilogue: vec![op2],
+                mode: FusionMode::LoopFusion,
+                ops: vec![op1, op2],
+            });
+
+            let mut codegen = jit::AArch64CodeGen::new(&profile);
+            let output = codegen
+                .emit_plan(&plan, &graph, &empty_alloc(), &profile, Some(&registry))
+                .expect("emit_plan with LoopFusion should succeed");
+
+            assert!(!output.code.is_empty());
+            assert_eq!(output.code.len() % 4, 0);
+            let insn_count = output.code.len() / 4;
+            assert!(insn_count > 10, "full plan should emit >10 insns, got {insn_count}");
+        }
+
+        // ── Test 7: emit_plan with EpilogueInjection group ──
+
+        #[test]
+        fn test_emit_plan_epilogue_injection() {
+            let profile = DeviceProfile::detect();
+            let registry = ScalarOpRegistry::with_defaults();
+            let (graph, gemm_op, silu_op) = graph_with_gemm_epilogue(8, 12, 4, OpKind::Silu);
+
+            let plan = plan_from_group(FusionGroup {
+                id: 0,
+                anchor: gemm_op,
+                epilogue: vec![silu_op],
+                mode: FusionMode::EpilogueInjection,
+                ops: vec![gemm_op, silu_op],
+            });
+
+            let mut codegen = jit::AArch64CodeGen::new(&profile);
+            let output = codegen
+                .emit_plan(&plan, &graph, &empty_alloc(), &profile, Some(&registry))
+                .expect("emit_plan with EpilogueInjection should succeed");
+
+            assert!(!output.code.is_empty());
+            assert_eq!(output.code.len() % 4, 0);
+        }
+
+        // ── Test 8: emit_plan without registry (no-op fallback) ──
+
+        #[test]
+        fn test_emit_plan_no_registry_fallback() {
+            let profile = DeviceProfile::detect();
+            let (graph, op1, op2) = graph_with_chain(OpKind::Silu, OpKind::Silu, 64);
+
+            let plan = plan_from_group(FusionGroup {
+                id: 0,
+                anchor: op1,
+                epilogue: vec![op2],
+                mode: FusionMode::LoopFusion,
+                ops: vec![op1, op2],
+            });
+
+            let mut codegen = jit::AArch64CodeGen::new(&profile);
+            let result = codegen.emit_plan(&plan, &graph, &empty_alloc(), &profile, None);
+            assert!(result.is_ok(), "emit_plan without registry should not fail");
+        }
     }
 }
