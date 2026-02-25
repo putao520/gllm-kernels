@@ -185,7 +185,7 @@ pub mod jit {
         ) -> Result<(), String> {
             match group.mode {
                 FusionMode::Standalone => {
-                    self.emit_standalone(group, graph, profile)
+                    self.emit_standalone(group, graph, profile, registry)
                 }
                 FusionMode::LoopFusion => {
                     self.emit_elementwise_chain(group, graph, alloc, profile, registry)
@@ -202,7 +202,7 @@ pub mod jit {
                             mode: FusionMode::Standalone,
                             ops: vec![op_id],
                         };
-                        self.emit_standalone(&single, graph, profile)?;
+                        self.emit_standalone(&single, graph, profile, registry)?;
                     }
                     Ok(())
                 }
@@ -218,12 +218,13 @@ pub mod jit {
             }
         }
 
-        /// Emit a standalone op (single GEMM or elementwise nop placeholder).
+        /// Emit a standalone op (GEMM, elementwise, norm, or reduction).
         fn emit_standalone(
             &mut self,
             group: &FusionGroup,
             graph: &CompilerGraph,
             profile: &DeviceProfile,
+            registry: Option<&ScalarOpRegistry>,
         ) -> Result<(), String> {
             let op = graph.op(group.anchor).ok_or("missing op")?;
             match &op.kind {
@@ -233,9 +234,267 @@ pub mod jit {
                 OpKind::QuantGemm { m, n, k, block_size, bits } => {
                     self.emit_quant_gemm(*m, *n, *k, *block_size, *bits, profile, &[])
                 }
-                _ => self.emit_nop_placeholder(),
+                OpKind::Reshape { .. } | OpKind::Transpose { .. } => Ok(()),
+                _ => {
+                    let elem_count = op.outputs.first()
+                        .and_then(|&out_id| graph.tensor_numel(out_id))
+                        .unwrap_or(0);
+                    if elem_count == 0 { return Ok(()); }
 
+                    let key = ScalarOpRegistry::key_from_op_kind(&op.kind);
+                    let trace = registry.and_then(|r| r.get_trace(&key));
+
+                    match trace {
+                        Some(t) => self.emit_traced_standalone(&t.pattern, &op.kind, elem_count),
+                        None => match &op.kind {
+                            OpKind::RmsNorm { eps } | OpKind::LayerNorm { eps } => {
+                                self.emit_norm_standalone(elem_count, *eps)
+                            }
+                            _ => self.emit_inline_elementwise(&op.kind, elem_count),
+                        },
+                    }
+                }
             }
+        }
+
+        /// Dispatch a traced standalone op by its ComputePattern.
+        fn emit_traced_standalone(
+            &mut self,
+            pattern: &ComputePattern,
+            op_kind: &OpKind,
+            elem_count: usize,
+        ) -> Result<(), String> {
+            match pattern {
+                ComputePattern::Elementwise { body } => {
+                    self.emit_standalone_elementwise_loop(body, elem_count, false)
+                }
+                ComputePattern::BinaryElementwise { body } => {
+                    self.emit_standalone_elementwise_loop(body, elem_count, true)
+                }
+                ComputePattern::Injective { body, .. } => {
+                    let is_binary = body.iter().any(|op| matches!(op, TraceOp::Input(n) if *n >= 1));
+                    self.emit_standalone_elementwise_loop(body, elem_count, is_binary)
+                }
+                ComputePattern::QuantDecode { decode, .. } => {
+                    self.emit_standalone_elementwise_loop(decode, elem_count, false)
+                }
+                ComputePattern::NormLike { reduce: _, finalize: _, transform: _ } => {
+                    let eps = match op_kind {
+                        OpKind::RmsNorm { eps } | OpKind::LayerNorm { eps } => *eps,
+                        _ => 1e-5,
+                    };
+                    self.emit_norm_standalone(elem_count, eps)
+                }
+                ComputePattern::Reduction { identity, combine: _ } => {
+                    self.emit_reduce_standalone(elem_count, *identity as f32)
+                }
+                ComputePattern::Gemm => {
+                    Err("unexpected Gemm pattern in traced standalone".into())
+                }
+            }
+        }
+
+        /// Emit a standalone elementwise loop using AVX2.
+        /// Processes `elem_count` f32 elements through the given trace body.
+        fn emit_standalone_elementwise_loop(
+            &mut self,
+            body: &[TraceOp],
+            elem_count: usize,
+            is_binary: bool,
+        ) -> Result<(), String> {
+            use iced_x86::code_asm::*;
+
+            let vec_count = elem_count / 8;
+            let remainder = elem_count % 8;
+
+            // ABI: rdi = input0, rsi = input1 (if binary), r8 = output
+            if vec_count > 0 {
+                self.asm.xor(ebx, ebx).map_err(|e| e.to_string())?;
+                let mut loop_label = self.asm.create_label();
+                self.asm.set_label(&mut loop_label).map_err(|e| e.to_string())?;
+
+                self.asm.vmovups(ymm0, ymmword_ptr(rdi + rbx)).map_err(|e| e.to_string())?;
+                if is_binary {
+                    self.asm.vmovups(ymm1, ymmword_ptr(rsi + rbx)).map_err(|e| e.to_string())?;
+                }
+
+                self.emit_elementwise_trace_body(ymm0, body, is_binary, false)?;
+
+                self.asm.vmovups(ymmword_ptr(r8 + rbx), ymm0).map_err(|e| e.to_string())?;
+
+                self.asm.add(ebx, 32i32).map_err(|e| e.to_string())?;
+                self.asm.cmp(ebx, (vec_count * 32) as i32).map_err(|e| e.to_string())?;
+                self.asm.jb(loop_label).map_err(|e| e.to_string())?;
+            }
+
+            if remainder > 0 {
+                let tail_offset = (vec_count * 32) as i32;
+                for i in 0..remainder {
+                    let off = tail_offset + (i * 4) as i32;
+                    self.asm.vmovss(xmm0, dword_ptr(rdi + off)).map_err(|e| e.to_string())?;
+                    if is_binary {
+                        self.asm.vmovss(xmm1, dword_ptr(rsi + off)).map_err(|e| e.to_string())?;
+                    }
+                    self.emit_elementwise_trace_body(ymm0, body, is_binary, true)?;
+                    self.asm.vmovss(dword_ptr(r8 + off), xmm0).map_err(|e| e.to_string())?;
+                }
+            }
+
+            Ok(())
+        }
+
+        /// Inline elementwise fallback when no registry trace is available.
+        fn emit_inline_elementwise(
+            &mut self,
+            op_kind: &OpKind,
+            elem_count: usize,
+        ) -> Result<(), String> {
+            let body: Vec<TraceOp> = match op_kind {
+                OpKind::Silu => vec![
+                    TraceOp::Input(0), TraceOp::Neg(0), TraceOp::Exp(1),
+                    TraceOp::Const(1.0), TraceOp::Add(3, 2), TraceOp::Recip(4),
+                    TraceOp::Mul(0, 5),
+                ],
+                OpKind::Gelu => vec![
+                    TraceOp::Input(0), TraceOp::Const(0.7978845608028654),
+                    TraceOp::Const(0.044715), TraceOp::Mul(0, 0), TraceOp::Mul(3, 2),
+                    TraceOp::Const(1.0), TraceOp::Add(5, 4), TraceOp::Mul(0, 6),
+                    TraceOp::Mul(7, 1), TraceOp::Tanh(8), TraceOp::Const(1.0),
+                    TraceOp::Add(10, 9), TraceOp::Const(0.5), TraceOp::Mul(0, 12),
+                    TraceOp::Mul(13, 11),
+                ],
+                OpKind::Add | OpKind::Residual => vec![
+                    TraceOp::Input(0), TraceOp::Input(1), TraceOp::Add(0, 1),
+                ],
+                OpKind::Mul => vec![
+                    TraceOp::Input(0), TraceOp::Input(1), TraceOp::Mul(0, 1),
+                ],
+                OpKind::SwiGlu => vec![
+                    TraceOp::Input(0), TraceOp::Input(1), TraceOp::Neg(0),
+                    TraceOp::Exp(2), TraceOp::Const(1.0), TraceOp::Add(4, 3),
+                    TraceOp::Recip(5), TraceOp::Mul(0, 6), TraceOp::Mul(7, 1),
+                ],
+                _ => return Err(format!("no inline fallback for {:?} on x86_64", op_kind)),
+            };
+            let is_binary = body.iter().any(|op| matches!(op, TraceOp::Input(n) if *n >= 1));
+            self.emit_standalone_elementwise_loop(&body, elem_count, is_binary)
+        }
+
+        /// Emit standalone RmsNorm/LayerNorm using AVX2.
+        /// Pass 1: accumulate x², compute rsqrt(mean + eps).
+        /// Pass 2: output[i] = input[i] * scale * weight[i].
+        fn emit_norm_standalone(
+            &mut self,
+            elem_count: usize,
+            eps: f32,
+        ) -> Result<(), String> {
+            use iced_x86::code_asm::*;
+
+            let vec_count = elem_count / 8;
+            let remainder = elem_count % 8;
+            let eps_label = self.const_f32(eps);
+            let elem_f32 = self.const_f32(elem_count as f32);
+
+            // ABI: rdi = input, rsi = weight, r8 = output
+
+            // Pass 1: accumulate sum of squares
+            self.asm.vxorps(ymm0, ymm0, ymm0).map_err(|e| e.to_string())?;
+
+            if vec_count > 0 {
+                self.asm.xor(ebx, ebx).map_err(|e| e.to_string())?;
+                let mut loop1 = self.asm.create_label();
+                self.asm.set_label(&mut loop1).map_err(|e| e.to_string())?;
+                self.asm.vmovups(ymm1, ymmword_ptr(rdi + rbx)).map_err(|e| e.to_string())?;
+                self.asm.vfmadd231ps(ymm0, ymm1, ymm1).map_err(|e| e.to_string())?;
+                self.asm.add(ebx, 32i32).map_err(|e| e.to_string())?;
+                self.asm.cmp(ebx, (vec_count * 32) as i32).map_err(|e| e.to_string())?;
+                self.asm.jb(loop1).map_err(|e| e.to_string())?;
+            }
+
+            for i in 0..remainder {
+                let off = (vec_count * 32 + i * 4) as i32;
+                self.asm.vmovss(xmm1, dword_ptr(rdi + off)).map_err(|e| e.to_string())?;
+                self.asm.vfmadd231ss(xmm0, xmm1, xmm1).map_err(|e| e.to_string())?;
+            }
+
+            // Horizontal sum
+            self.asm.vextractf128(xmm1, ymm0, 1u32).map_err(|e| e.to_string())?;
+            self.asm.vaddps(xmm0, xmm0, xmm1).map_err(|e| e.to_string())?;
+            self.asm.vhaddps(xmm0, xmm0, xmm0).map_err(|e| e.to_string())?;
+            self.asm.vhaddps(xmm0, xmm0, xmm0).map_err(|e| e.to_string())?;
+
+            // mean = sum / elem_count, then + eps, then rsqrt
+            self.asm.vdivss(xmm0, xmm0, dword_ptr(elem_f32)).map_err(|e| e.to_string())?;
+            self.asm.vaddss(xmm0, xmm0, dword_ptr(eps_label)).map_err(|e| e.to_string())?;
+            self.asm.vrsqrtss(xmm0, xmm0, xmm0).map_err(|e| e.to_string())?;
+            self.asm.vbroadcastss(ymm2, xmm0).map_err(|e| e.to_string())?;
+
+            // Pass 2: output[i] = input[i] * scale * weight[i]
+            if vec_count > 0 {
+                self.asm.xor(ebx, ebx).map_err(|e| e.to_string())?;
+                let mut loop2 = self.asm.create_label();
+                self.asm.set_label(&mut loop2).map_err(|e| e.to_string())?;
+                self.asm.vmovups(ymm0, ymmword_ptr(rdi + rbx)).map_err(|e| e.to_string())?;
+                self.asm.vmulps(ymm0, ymm0, ymm2).map_err(|e| e.to_string())?;
+                self.asm.vmovups(ymm1, ymmword_ptr(rsi + rbx)).map_err(|e| e.to_string())?;
+                self.asm.vmulps(ymm0, ymm0, ymm1).map_err(|e| e.to_string())?;
+                self.asm.vmovups(ymmword_ptr(r8 + rbx), ymm0).map_err(|e| e.to_string())?;
+                self.asm.add(ebx, 32i32).map_err(|e| e.to_string())?;
+                self.asm.cmp(ebx, (vec_count * 32) as i32).map_err(|e| e.to_string())?;
+                self.asm.jb(loop2).map_err(|e| e.to_string())?;
+            }
+
+            for i in 0..remainder {
+                let off = (vec_count * 32 + i * 4) as i32;
+                self.asm.vmovss(xmm0, dword_ptr(rdi + off)).map_err(|e| e.to_string())?;
+                self.asm.vmulss(xmm0, xmm0, xmm2).map_err(|e| e.to_string())?;
+                self.asm.vmovss(xmm1, dword_ptr(rsi + off)).map_err(|e| e.to_string())?;
+                self.asm.vmulss(xmm0, xmm0, xmm1).map_err(|e| e.to_string())?;
+                self.asm.vmovss(dword_ptr(r8 + off), xmm0).map_err(|e| e.to_string())?;
+            }
+
+            Ok(())
+        }
+
+        /// Emit standalone reduction (sum) using AVX2.
+        fn emit_reduce_standalone(
+            &mut self,
+            elem_count: usize,
+            identity: f32,
+        ) -> Result<(), String> {
+            use iced_x86::code_asm::*;
+
+            let vec_count = elem_count / 8;
+            let remainder = elem_count % 8;
+            let id_label = self.const_f32(identity);
+
+            // ABI: rdi = input, r8 = output (single f32)
+            self.asm.vbroadcastss(ymm0, dword_ptr(id_label)).map_err(|e| e.to_string())?;
+
+            if vec_count > 0 {
+                self.asm.xor(ebx, ebx).map_err(|e| e.to_string())?;
+                let mut loop1 = self.asm.create_label();
+                self.asm.set_label(&mut loop1).map_err(|e| e.to_string())?;
+                self.asm.vaddps(ymm0, ymm0, ymmword_ptr(rdi + rbx)).map_err(|e| e.to_string())?;
+                self.asm.add(ebx, 32i32).map_err(|e| e.to_string())?;
+                self.asm.cmp(ebx, (vec_count * 32) as i32).map_err(|e| e.to_string())?;
+                self.asm.jb(loop1).map_err(|e| e.to_string())?;
+            }
+
+            for i in 0..remainder {
+                let off = (vec_count * 32 + i * 4) as i32;
+                self.asm.vaddss(xmm0, xmm0, dword_ptr(rdi + off)).map_err(|e| e.to_string())?;
+            }
+
+            // Horizontal sum
+            self.asm.vextractf128(xmm1, ymm0, 1u32).map_err(|e| e.to_string())?;
+            self.asm.vaddps(xmm0, xmm0, xmm1).map_err(|e| e.to_string())?;
+            self.asm.vhaddps(xmm0, xmm0, xmm0).map_err(|e| e.to_string())?;
+            self.asm.vhaddps(xmm0, xmm0, xmm0).map_err(|e| e.to_string())?;
+
+            self.asm.vmovss(dword_ptr(r8), xmm0).map_err(|e| e.to_string())?;
+
+            Ok(())
         }
 
         /// Emit fused RmsNorm → GEMM: normalize A in-place (via scratchpad),
@@ -831,7 +1090,7 @@ pub mod jit {
             };
 
             if elem_count == 0 {
-                return self.emit_nop_placeholder();
+                return Ok(());
             }
 
             let mut trace_info: Vec<(Vec<TraceOp>, bool)> = Vec::new();
@@ -3694,10 +3953,6 @@ pub mod jit {
             Ok(())
         }
 
-        /// Emit a single nop as placeholder.
-        fn emit_nop_placeholder(&mut self) -> Result<(), String> {
-            self.asm.nop().map_err(|e| e.to_string())
-        }
     }
 
     // ── AVX-512 codegen unit tests ──────────────────────────────────────
