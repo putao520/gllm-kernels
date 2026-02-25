@@ -45,6 +45,10 @@ harness = false
 name = "jit_compile_benchmark"
 harness = false
 
+[[bench]]
+name = "jit_vs_asm"
+harness = false
+
 # ── Profile overrides for scalar-ops subcrate ──
 # REQ-SCALAR-002: scalar functions must compile at opt-level=1 to preserve
 # loop structure for symexec binary analysis. opt-level=1 eliminates trivial
