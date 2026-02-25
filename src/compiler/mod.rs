@@ -277,8 +277,85 @@ impl InferenceCompiler {
             codegen::emitter::emit_stub_code(graph)
         };
 
-        let hash = 0; // TODO: graph-level content hash
+        let hash = self.graph_content_hash(graph);
         CompiledLayer::from_code(&output.code, output.scratchpad_bytes, hash)
+    }
+
+    /// Compute a deterministic content hash for a CompilerGraph.
+    ///
+    /// Hash inputs: op kinds in topological order, edge connections (tensor IDs),
+    /// tensor shapes, and hardware fingerprint. Uses the standard library's
+    /// `DefaultHasher` (SipHash-1-3) for collision resistance.
+    fn graph_content_hash(&self, graph: &CompilerGraph) -> u64 {
+        use std::hash::{Hash, Hasher};
+        use std::collections::hash_map::DefaultHasher;
+
+        let mut hasher = DefaultHasher::new();
+
+        // Ops in topological order for determinism
+        let topo = graph.topological_sort();
+        topo.len().hash(&mut hasher);
+
+        for &op_id in &topo {
+            if let Some(op) = graph.op(op_id) {
+                // Op kind discriminant + parameters
+                std::mem::discriminant(&op.kind).hash(&mut hasher);
+                match &op.kind {
+                    OpKind::RmsNorm { eps } | OpKind::LayerNorm { eps } => {
+                        eps.to_bits().hash(&mut hasher);
+                    }
+                    OpKind::Gemm { m, n, k } | OpKind::GemmBias { m, n, k } => {
+                        m.hash(&mut hasher);
+                        n.hash(&mut hasher);
+                        k.hash(&mut hasher);
+                    }
+                    OpKind::QuantGemm { m, n, k, block_size, bits } => {
+                        m.hash(&mut hasher);
+                        n.hash(&mut hasher);
+                        k.hash(&mut hasher);
+                        block_size.hash(&mut hasher);
+                        bits.hash(&mut hasher);
+                    }
+                    OpKind::Dequantize { num_elements, block_size, bits } => {
+                        num_elements.hash(&mut hasher);
+                        block_size.hash(&mut hasher);
+                        bits.hash(&mut hasher);
+                    }
+                    OpKind::RoPE { head_dim, theta } => {
+                        head_dim.hash(&mut hasher);
+                        theta.to_bits().hash(&mut hasher);
+                    }
+                    OpKind::Transpose { perm } => {
+                        perm.hash(&mut hasher);
+                    }
+                    OpKind::Reshape { target_shape } => {
+                        target_shape.hash(&mut hasher);
+                    }
+                    // Silu, Gelu, SwiGlu, GeGlu, Softmax, Add, Mul, Residual
+                    // — discriminant alone is sufficient
+                    _ => {}
+                }
+                // Edge connections
+                for &tid in &op.inputs {
+                    tid.0.hash(&mut hasher);
+                }
+                for &tid in &op.outputs {
+                    tid.0.hash(&mut hasher);
+                }
+            }
+        }
+
+        // Tensor shapes and dtypes
+        for t in &graph.tensors {
+            t.id.0.hash(&mut hasher);
+            t.shape.hash(&mut hasher);
+            t.dtype.size_bytes().hash(&mut hasher);
+        }
+
+        // Hardware fingerprint — same graph on different HW produces different code
+        self.profile.hw_info.fingerprint().hash(&mut hasher);
+
+        hasher.finish()
     }
 }
 
@@ -397,5 +474,49 @@ mod tests {
         assert_eq!(result2.compiled, 0);
         assert_eq!(result2.memory_hits, 3);
         assert_eq!(result2.disk_hits, 0);
+    }
+
+    #[test]
+    fn test_graph_content_hash_deterministic() {
+        let config = ModelConfig::llama_7b();
+        let ir = LayerIR::from_model_config(&config, 1);
+        let profile = DeviceProfile::detect();
+        let graph = CompilerGraph::from_layer_ir(&ir, &profile);
+
+        let compiler = InferenceCompiler::with_profile(profile);
+        let h1 = compiler.graph_content_hash(&graph);
+        let h2 = compiler.graph_content_hash(&graph);
+        assert_eq!(h1, h2, "same graph must produce identical hash");
+        assert_ne!(h1, 0, "hash should not be zero");
+    }
+
+    #[test]
+    fn test_graph_content_hash_differs_for_different_graphs() {
+        let profile = DeviceProfile::detect();
+        let compiler = InferenceCompiler::with_profile(profile.clone());
+
+        let config_a = ModelConfig::llama_7b();
+        let ir_a = LayerIR::from_model_config(&config_a, 1);
+        let graph_a = CompilerGraph::from_layer_ir(&ir_a, &profile);
+
+        let config_b = ModelConfig::gemma_2b();
+        let ir_b = LayerIR::from_model_config(&config_b, 1);
+        let graph_b = CompilerGraph::from_layer_ir(&ir_b, &profile);
+
+        let ha = compiler.graph_content_hash(&graph_a);
+        let hb = compiler.graph_content_hash(&graph_b);
+        assert_ne!(ha, hb, "different graphs should produce different hashes");
+    }
+
+    #[test]
+    fn test_compile_graph_nonzero_hash() {
+        let config = ModelConfig::llama_7b();
+        let ir = LayerIR::from_model_config(&config, 1);
+        let profile = DeviceProfile::detect();
+        let graph = CompilerGraph::from_layer_ir(&ir, &profile);
+
+        let mut compiler = InferenceCompiler::with_profile(profile);
+        let layer = compiler.compile_graph(&graph).unwrap();
+        assert_ne!(layer.config_hash, 0, "compile_graph should produce a non-zero hash");
     }
 }

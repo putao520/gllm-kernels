@@ -315,29 +315,35 @@ pub fn fuse(graph: &CompilerGraph, profile: &crate::dispatch::DeviceProfile) -> 
             OpSemantics::Elementwise => {
                 // Try to chain with downstream elementwise ops
                 let chain = collect_elementwise_chain(graph, op, &claimed);
-                let gid = groups.len();
                 let mut all_ops = vec![op_id];
                 let chain_ids: Vec<OpId> = chain.iter().map(|o| o.id).collect();
                 all_ops.extend_from_slice(&chain_ids);
 
-                let mode = if chain_ids.is_empty() {
-                    FusionMode::Standalone
-                } else {
-                    FusionMode::LoopFusion
-                };
+                // Split chain by L1 budget to avoid thrashing
+                let sub_chains = split_elementwise_by_l1(graph, &all_ops, profile);
 
-                for &oid in &all_ops {
-                    op_to_group.insert(oid, gid);
-                    claimed.insert(oid);
+                for sub in sub_chains {
+                    let gid = groups.len();
+                    let mode = if sub.len() <= 1 {
+                        FusionMode::Standalone
+                    } else {
+                        FusionMode::LoopFusion
+                    };
+                    let epilogue = if sub.len() > 1 { sub[1..].to_vec() } else { Vec::new() };
+
+                    for &oid in &sub {
+                        op_to_group.insert(oid, gid);
+                        claimed.insert(oid);
+                    }
+
+                    groups.push(FusionGroup {
+                        id: gid,
+                        anchor: sub[0],
+                        epilogue,
+                        mode,
+                        ops: sub,
+                    });
                 }
-
-                groups.push(FusionGroup {
-                    id: gid,
-                    anchor: op_id,
-                    epilogue: chain_ids,
-                    mode,
-                    ops: all_ops,
-                });
             }
             _ => {
                 // Reduction, Opaque → standalone
@@ -550,6 +556,54 @@ fn collect_elementwise_chain<'a>(
     chain
 }
 
+/// Split an elementwise op chain into sub-chains based on L1 cache budget.
+///
+/// Walks the chain accumulating intermediate tensor bytes. When the cumulative
+/// size exceeds 75% of L1, a new sub-chain starts. This prevents fused loops
+/// from thrashing L1 with oversized intermediate data.
+fn split_elementwise_by_l1(
+    graph: &CompilerGraph,
+    all_ops: &[OpId],
+    profile: &crate::dispatch::DeviceProfile,
+) -> Vec<Vec<OpId>> {
+    if all_ops.len() <= 1 {
+        return vec![all_ops.to_vec()];
+    }
+
+    let (l1, _, _) = profile.cache_sizes();
+    let l1_budget = l1 * 75 / 100;
+
+    let mut sub_chains: Vec<Vec<OpId>> = Vec::new();
+    let mut current = vec![all_ops[0]];
+    let mut cumulative_bytes: usize = 0;
+
+    for i in 1..all_ops.len() {
+        // Intermediate tensor = output of the previous op in the chain
+        let intermediate_bytes = graph
+            .op(all_ops[i - 1])
+            .and_then(|op| op.outputs.first())
+            .and_then(|tid| graph.tensor(*tid))
+            .map(|t| t.shape.iter().product::<usize>() * t.dtype.size_bytes())
+            .unwrap_or(0);
+
+        cumulative_bytes += intermediate_bytes;
+
+        if cumulative_bytes > l1_budget {
+            sub_chains.push(current);
+            current = vec![all_ops[i]];
+            cumulative_bytes = 0;
+        } else {
+            current.push(all_ops[i]);
+        }
+    }
+
+    if !current.is_empty() {
+        sub_chains.push(current);
+    }
+
+    sub_chains
+}
+
 // ── DAG-based fusion (Phase 1 path) ─────────────────────────────────
 
 /// Fusion pass based on SemanticDAG (Phase 1 path).
@@ -661,29 +715,35 @@ pub fn fuse_with_dag_prebuilt(graph: &CompilerGraph, dag: &SemanticDAG, profile:
             OpClass::ElemWise | OpClass::Injective => {
                 // Try to chain with downstream elementwise/injective ops
                 let chain = collect_elementwise_chain_dag(graph, op, &claimed, &dag);
-                let gid = groups.len();
                 let mut all_ops = vec![op_id];
                 let chain_ids: Vec<OpId> = chain.iter().map(|o| o.id).collect();
                 all_ops.extend_from_slice(&chain_ids);
 
-                let mode = if chain_ids.is_empty() {
-                    FusionMode::Standalone
-                } else {
-                    FusionMode::LoopFusion
-                };
+                // Split chain by L1 budget to avoid thrashing
+                let sub_chains = split_elementwise_by_l1(graph, &all_ops, profile);
 
-                for &oid in &all_ops {
-                    op_to_group.insert(oid, gid);
-                    claimed.insert(oid);
+                for sub in sub_chains {
+                    let gid = groups.len();
+                    let mode = if sub.len() <= 1 {
+                        FusionMode::Standalone
+                    } else {
+                        FusionMode::LoopFusion
+                    };
+                    let epilogue = if sub.len() > 1 { sub[1..].to_vec() } else { Vec::new() };
+
+                    for &oid in &sub {
+                        op_to_group.insert(oid, gid);
+                        claimed.insert(oid);
+                    }
+
+                    groups.push(FusionGroup {
+                        id: gid,
+                        anchor: sub[0],
+                        epilogue,
+                        mode,
+                        ops: sub,
+                    });
                 }
-
-                groups.push(FusionGroup {
-                    id: gid,
-                    anchor: op_id,
-                    epilogue: chain_ids,
-                    mode,
-                    ops: all_ops,
-                });
             }
             OpClass::Reduction | OpClass::Opaque => {
                 let gid = groups.len();
@@ -1002,12 +1062,13 @@ mod tests {
 
     #[test]
     fn test_elementwise_chain() {
+        // Use small tensors (256 * 4 = 1 KB each) to stay well within L1 budget
         let mut g = CompilerGraph::new();
         let dt = DType::F32;
-        let a = g.add_tensor("a", vec![1, 4096], dt);
-        let b = g.add_tensor("b", vec![1, 4096], dt);
-        let c = g.add_tensor("c", vec![1, 4096], dt);
-        let d = g.add_tensor("d", vec![1, 4096], dt);
+        let a = g.add_tensor("a", vec![1, 256], dt);
+        let b = g.add_tensor("b", vec![1, 256], dt);
+        let c = g.add_tensor("c", vec![1, 256], dt);
+        let d = g.add_tensor("d", vec![1, 256], dt);
 
         g.add_op(OpKind::Silu, vec![a], vec![b], "silu");
         g.add_op(OpKind::Silu, vec![b], vec![c], "silu2");
@@ -1683,6 +1744,128 @@ mod tests {
                  KC({}) * NC({}) * 4 = {b_panel_bytes}B > 65% of L3 ({}B)",
                 b.kc, b.nc, l3 * 65 / 100,
             );
+        }
+    }
+
+    /// Norm output > 75% L1 → TileLevelFusion with tile_rows = MC.
+    #[test]
+    fn test_tile_level_fusion_decision() {
+        let profile = DeviceProfile::detect();
+        let (l1, _, _) = profile.cache_sizes();
+        let l1_budget = l1 * 75 / 100;
+        let dt = DType::F32;
+
+        // Pick K so that [1, K] * 4 bytes > l1_budget
+        let k = (l1_budget / 4) + 1;
+        let mut g = CompilerGraph::new();
+        let x = g.add_tensor("x", vec![1, k], dt);
+        let norm_out = g.add_tensor("norm_out", vec![1, k], dt);
+        let w = g.add_tensor("w", vec![k, k], dt);
+        let gemm_out = g.add_tensor("gemm_out", vec![1, k], dt);
+
+        g.add_op(OpKind::RmsNorm { eps: 1e-5 }, vec![x], vec![norm_out], "rms_norm");
+        g.add_op(
+            OpKind::Gemm { m: 1, n: k, k },
+            vec![norm_out, w],
+            vec![gemm_out],
+            "gemm",
+        );
+
+        let plan = fuse(&g, &profile);
+        let gemm_group = find_group_by_label(&plan, &g, "gemm")
+            .expect("GEMM should have a fusion group");
+
+        match &gemm_group.mode {
+            FusionMode::TileLevelFusion { predecessor, tile_rows } => {
+                let pred_op = g.op(*predecessor).expect("predecessor should exist");
+                assert!(matches!(pred_op.kind, OpKind::RmsNorm { .. }));
+                let blocking = profile.gemm_blocking(1, k, k);
+                assert_eq!(*tile_rows, blocking.mc, "tile_rows should equal MC from GEMM blocking");
+            }
+            other => panic!(
+                "Expected TileLevelFusion for norm output ({} B) > 75% L1 ({} B), got {:?}",
+                k * 4, l1_budget, other,
+            ),
+        }
+    }
+
+    /// Norm output <= 75% L1 → ComputeRoot (standalone norm, result stays in L1).
+    #[test]
+    fn test_compute_root_decision() {
+        let profile = DeviceProfile::detect();
+        let (l1, _, _) = profile.cache_sizes();
+        let l1_budget = l1 * 75 / 100;
+        let dt = DType::F32;
+
+        // Pick K so that [1, K] * 4 bytes <= l1_budget, with n=4096 to avoid small-matrix path
+        let k = l1_budget / 4;
+        let n = 4096;
+        let norm_bytes = k * 4;
+        assert!(norm_bytes <= l1_budget, "test setup: norm output should fit in L1 budget");
+
+        let mut g = CompilerGraph::new();
+        let x = g.add_tensor("x", vec![1, k], dt);
+        let norm_out = g.add_tensor("norm_out", vec![1, k], dt);
+        let w = g.add_tensor("w", vec![k, n], dt);
+        let gemm_out = g.add_tensor("gemm_out", vec![1, n], dt);
+
+        g.add_op(OpKind::RmsNorm { eps: 1e-5 }, vec![x], vec![norm_out], "rms_norm");
+        g.add_op(
+            OpKind::Gemm { m: 1, n, k },
+            vec![norm_out, w],
+            vec![gemm_out],
+            "gemm",
+        );
+
+        let plan = fuse(&g, &profile);
+        let gemm_group = find_group_by_label(&plan, &g, "gemm")
+            .expect("GEMM should have a fusion group");
+
+        match &gemm_group.mode {
+            FusionMode::ComputeRoot { predecessor } => {
+                let pred_op = g.op(*predecessor).expect("predecessor should exist");
+                assert!(matches!(pred_op.kind, OpKind::RmsNorm { .. }));
+            }
+            other => panic!(
+                "Expected ComputeRoot for norm output ({} B) <= 75% L1 ({} B), got {:?}",
+                norm_bytes, l1_budget, other,
+            ),
+        }
+    }
+
+    /// Elementwise chain with oversized intermediates gets split into multiple LoopFusion groups.
+    #[test]
+    fn test_elementwise_chain_l1_split() {
+        let profile = DeviceProfile::detect();
+        let (l1, _, _) = profile.cache_sizes();
+        let l1_budget = l1 * 75 / 100;
+        let dt = DType::F32;
+
+        // Each intermediate tensor = dim * 4 bytes. Pick dim so one tensor > l1_budget.
+        let dim = (l1_budget / 4) + 1;
+
+        let mut g = CompilerGraph::new();
+        let a = g.add_tensor("a", vec![1, dim], dt);
+        let b = g.add_tensor("b", vec![1, dim], dt);
+        let c = g.add_tensor("c", vec![1, dim], dt);
+        let d = g.add_tensor("d", vec![1, dim], dt);
+
+        g.add_op(OpKind::Silu, vec![a], vec![b], "silu1");
+        g.add_op(OpKind::Silu, vec![b], vec![c], "silu2");
+        g.add_op(OpKind::Silu, vec![c], vec![d], "silu3");
+
+        let plan = fuse(&g, &profile);
+
+        // With each intermediate > l1_budget, the chain must be split
+        assert!(
+            plan.num_groups() > 1,
+            "Expected chain split: {} groups for 3 ops with intermediate {} B > L1 budget {} B",
+            plan.num_groups(), dim * 4, l1_budget,
+        );
+
+        // Every op must still be accounted for
+        for op in &g.ops {
+            assert!(plan.op_to_group.contains_key(&op.id), "Op {} not in any group", op.id.0);
         }
     }
 }
