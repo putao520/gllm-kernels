@@ -1464,13 +1464,20 @@ pub mod jit {
                 self.asm.cmp(rcx, qword_ptr(rsp + loc_kc)).map_err(|e| e.to_string())?;
                 self.asm.jge(k_done).map_err(|e| e.to_string())?;
 
-                // Load NR=16 floats (2 ymm) from B[k, j..j+16]
-                self.asm.vmovups(ymm0, ymmword_ptr(rdx)).map_err(|e| e.to_string())?;
-                self.asm.vmovups(ymm1, ymmword_ptr(rdx + 32)).map_err(|e| e.to_string())?;
+                // Load NR floats from B[k, j..j+NR] using nr/8 ymm registers
+                let nr_vecs_local = nr / 8;
+                for v in 0..nr_vecs_local {
+                    let ymm_reg = Self::ymm_for_index(v)?;
+                    let off = (v as i32) * 32;
+                    self.asm.vmovups(ymm_reg, ymmword_ptr(rdx + off)).map_err(|e| e.to_string())?;
+                }
 
                 // Store to packed_b
-                self.asm.vmovups(ymmword_ptr(r15), ymm0).map_err(|e| e.to_string())?;
-                self.asm.vmovups(ymmword_ptr(r15 + 32), ymm1).map_err(|e| e.to_string())?;
+                for v in 0..nr_vecs_local {
+                    let ymm_reg = Self::ymm_for_index(v)?;
+                    let off = (v as i32) * 32;
+                    self.asm.vmovups(ymmword_ptr(r15 + off), ymm_reg).map_err(|e| e.to_string())?;
+                }
 
                 // Advance: src += ldb * 4, dst += NR * 4
                 self.asm.add(rdx, ldb_bytes).map_err(|e| e.to_string())?;
@@ -1513,8 +1520,11 @@ pub mod jit {
 
                 // Zero the destination NR floats
                 self.asm.vxorps(ymm0, ymm0, ymm0).map_err(|e| e.to_string())?;
-                self.asm.vmovups(ymmword_ptr(r15), ymm0).map_err(|e| e.to_string())?;
-                self.asm.vmovups(ymmword_ptr(r15 + 32), ymm0).map_err(|e| e.to_string())?;
+                let nr_vecs_local = nr / 8;
+                for v in 0..nr_vecs_local {
+                    let off = (v as i32) * 32;
+                    self.asm.vmovups(ymmword_ptr(r15 + off), ymm0).map_err(|e| e.to_string())?;
+                }
 
                 // Scalar copy of nc_rem floats
                 {
