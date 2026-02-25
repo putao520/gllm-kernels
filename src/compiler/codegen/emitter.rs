@@ -271,8 +271,9 @@ mod tests {
         let alloc = BufferAllocation { slots: vec![], total_bytes: 0, num_tensors: 0, bytes_saved: 0 };
         let profile = DeviceProfile::detect();
 
+        let registry = crate::compiler::registry::ScalarOpRegistry::with_defaults();
         let mut emitter: Box<dyn MachineCodeEmitter> = Box::new(X86CodeGen::new(&profile));
-        let output = emitter.emit_plan(&plan, &g, &alloc, &profile, None).unwrap();
+        let output = emitter.emit_plan(&plan, &g, &alloc, &profile, Some(&registry)).unwrap();
         assert!(!output.code.is_empty(), "emit_plan via trait should produce code");
     }
 

@@ -4988,8 +4988,9 @@ mod e2e_tests {
         alloc: &BufferAllocation,
     ) -> CompiledLayer {
         let profile = DeviceProfile::detect();
+        let registry = ScalarOpRegistry::with_defaults();
         let mut codegen = X86CodeGen::new(&profile);
-        let output = codegen.emit_plan(plan, graph, alloc, &profile, None).unwrap();
+        let output = codegen.emit_plan(plan, graph, alloc, &profile, Some(&registry)).unwrap();
         assert!(!output.code.is_empty(), "codegen produced empty code");
         CompiledLayer::from_code(&output.code, output.scratchpad_bytes, 0).unwrap()
     }
