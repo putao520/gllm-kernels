@@ -3080,10 +3080,10 @@ pub mod jit {
                             .map_err(|e| e.to_string())?;
                     }
                     TraceOp::Log(a) => {
-                        // Placeholder: copy input (real: polynomial approximation)
                         self.asm.vmovups(zmm29, zmmword_ptr(rsp + slot_off(*a)))
                             .map_err(|e| e.to_string())?;
-                        self.asm.vmovups(zmmword_ptr(rsp + slot_off(i32_idx)), zmm29)
+                        self.emit_log_avx512(zmm30, zmm29, [zmm29, zmm31, acc])?;
+                        self.asm.vmovups(zmmword_ptr(rsp + slot_off(i32_idx)), zmm30)
                             .map_err(|e| e.to_string())?;
                     }
                 }
@@ -3267,10 +3267,10 @@ pub mod jit {
                             .map_err(|e| e.to_string())?;
                     }
                     TraceOp::Log(a) => {
-                        // Placeholder: copy input (real: polynomial approximation)
                         self.asm.vmovups(zmm29, zmmword_ptr(rsp + slot_off(*a)))
                             .map_err(|e| e.to_string())?;
-                        self.asm.vmovups(zmmword_ptr(rsp + slot_off(i32_idx)), zmm29)
+                        self.emit_log_avx512(zmm30, zmm29, [zmm29, zmm31, acc])?;
+                        self.asm.vmovups(zmmword_ptr(rsp + slot_off(i32_idx)), zmm30)
                             .map_err(|e| e.to_string())?;
                     }
                 }
@@ -3548,6 +3548,58 @@ pub mod jit {
             Ok(())
         }
 
+        /// Emit AVX-512 log(x) approximation (same algorithm as `emit_log_avx2`, zmm registers).
+        fn emit_log_avx512(
+            &mut self,
+            dst: AsmRegisterZmm,
+            src: AsmRegisterZmm,
+            s: [AsmRegisterZmm; 3],
+        ) -> Result<(), String> {
+            let mantissa_mask = self.const_f32(f32::from_bits(0x007F_FFFF));
+            let one           = self.const_f32(1.0);
+            let magic127      = self.const_f32(127.0);
+            let ln2           = self.const_f32(0.6931471805599453);
+            let c1            = self.const_f32(0.99999934);
+            let c2            = self.const_f32(-0.49987412);
+            let c3            = self.const_f32(0.33179903);
+            let c4            = self.const_f32(-0.24073381);
+
+            // Backup src in case s[0] aliases src
+            self.asm.vmovaps(dst, src).map_err(|e| e.to_string())?;
+
+            // Extract exponent: e = float(x >> 23) - 127.0
+            self.asm.vpsrld(s[0], dst, 23i32).map_err(|e| e.to_string())?;
+            self.asm.vcvtdq2ps(s[0], s[0]).map_err(|e| e.to_string())?;
+            self.asm.vbroadcastss(s[2], dword_ptr(magic127)).map_err(|e| e.to_string())?;
+            self.asm.vsubps(s[0], s[0], s[2]).map_err(|e| e.to_string())?;
+
+            // Extract mantissa: m = (x & 0x007FFFFF) | 0x3F800000
+            self.asm.vbroadcastss(s[2], dword_ptr(mantissa_mask)).map_err(|e| e.to_string())?;
+            self.asm.vandps(s[1], dst, s[2]).map_err(|e| e.to_string())?;
+            self.asm.vbroadcastss(s[2], dword_ptr(one)).map_err(|e| e.to_string())?;
+            self.asm.vorps(s[1], s[1], s[2]).map_err(|e| e.to_string())?;
+
+            // t = m - 1.0
+            self.asm.vsubps(s[1], s[1], s[2]).map_err(|e| e.to_string())?;
+
+            // Horner: p = ((c4*t + c3)*t + c2)*t + c1
+            self.asm.vbroadcastss(dst, dword_ptr(c4)).map_err(|e| e.to_string())?;
+            self.asm.vbroadcastss(s[2], dword_ptr(c3)).map_err(|e| e.to_string())?;
+            self.asm.vfmadd213ps(dst, s[1], s[2]).map_err(|e| e.to_string())?;
+            self.asm.vbroadcastss(s[2], dword_ptr(c2)).map_err(|e| e.to_string())?;
+            self.asm.vfmadd213ps(dst, s[1], s[2]).map_err(|e| e.to_string())?;
+            self.asm.vbroadcastss(s[2], dword_ptr(c1)).map_err(|e| e.to_string())?;
+            self.asm.vfmadd213ps(dst, s[1], s[2]).map_err(|e| e.to_string())?;
+            self.asm.vmulps(dst, dst, s[1]).map_err(|e| e.to_string())?;
+
+            // result = e * ln(2) + p
+            self.asm.vbroadcastss(s[2], dword_ptr(ln2)).map_err(|e| e.to_string())?;
+            self.asm.vfmadd231ps(dst, s[0], s[2]).map_err(|e| e.to_string())?;
+
+            Ok(())
+        }
+
+
         /// Emit a TraceOp sequence as AVX2 SIMD instructions.
         ///
         /// This is the core of Phase 3: each TraceOp maps to one or more
@@ -3556,20 +3608,20 @@ pub mod jit {
         /// values; returns Err if exceeded).
         ///
         /// Mapping:
-        /// - `Input(n)` → `vxorps` (placeholder; real: `vmovups` from memory)
-        /// - `Const(v)` → `vxorps` (placeholder; real: `vbroadcastss` from const pool)
+        /// - `Input(n)` → `vmovups` from memory (caller preloads input pointer)
+        /// - `Const(v)` → `vbroadcastss` from const pool
         /// - `Add(a,b)` → `vaddps`
         /// - `Sub(a,b)` → `vsubps`
         /// - `Mul(a,b)` → `vmulps`
         /// - `Div(a,b)` → `vdivps`
         /// - `Fma(a,b,c)` → `vmovaps` + `vfmadd231ps`
         /// - `Neg(a)` → `vxorps` + `vsubps` (0 - x)
-        /// - `Exp(a)` → `vmovaps` (placeholder; real: polynomial approximation)
+        /// - `Exp(a)` → `emit_exp_avx2()` polynomial approximation
         /// - `Sqrt(a)` → `vsqrtps`
         /// - `Rsqrt(a)` → `vrsqrtps`
-        /// - `Tanh(a)` → `vmovaps` (placeholder; real: rational approximation)
+        /// - `Tanh(a)` → `emit_tanh_avx2()` rational approximation
         /// - `Recip(a)` → `vrcpps`
-        /// - `Abs(a)` → `vmovaps` (placeholder; real: `vandps` with 0x7FFFFFFF)
+        /// - `Abs(a)` → `vandps` with `0x7FFFFFFF` mask
         /// - `Max(a,b)` → `vmaxps`
         /// - `Min(a,b)` → `vminps`
         pub fn emit_trace_ops_avx2(
