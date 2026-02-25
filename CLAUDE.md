@@ -159,7 +159,7 @@ trait MachineCodeEmitter {
 
 Phase 0（symexec/engine.rs 1104 行）：符号执行引擎已完整实现，支持 FMA/比较/位运算/栈溢出/常量池/libm 识别。生产路径使用手动注入的 OpTrace 作为回退。
 Phase 1（graph.rs, semantics.rs, semantic_dag.rs）：CompilerGraph DAG + SemanticDAG + OpClass 自动推导已完成。
-Phase 2（fusion.rs 1185 行 + hw_constraints.rs 675 行）：5 种融合模式 + HwConstraintChecker 已实现。缺口：TileLevelFusion/ComputeRoot 决策逻辑、融合代价模型。
+Phase 2（fusion.rs + hw_constraints.rs）：5 种融合模式 + HwConstraintChecker + Cost 代价模型 + L1 阈值决策 + elementwise L1 split 全部完成。无缺口。
 Phase 3 x86_64（codegen/x86_64.rs 3945 行）：AVX2 完整实现，含 emit_trace_ops_avx2()、emit_trace_on_accumulator()、emit_elementwise_trace_body() 三条路径。
 Phase 3 aarch64（codegen/aarch64.rs 546 行）：框架 + TraceOp→NEON 映射已实现，循环结构（GEMM/elementwise）待补全。
 详见 `SPEC/02-ARCHITECTURE.md` §8 和 `SPEC/01-REQUIREMENTS.md` §6。
