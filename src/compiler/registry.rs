@@ -410,7 +410,7 @@ impl ScalarOpRegistry {
                         TraceOp::Input(0),    // [0] sum_sq
                         TraceOp::Input(1),    // [1] n (as float)
                         TraceOp::Div(0, 1),   // [2] mean = sum_sq / n
-                        TraceOp::Const(1e-5), // [3] placeholder eps; codegen must substitute actual value from OpKind::RmsNorm { eps }
+                        TraceOp::Const(1e-5), // [3] default eps; codegen uses actual value from OpKind::RmsNorm { eps }
                         TraceOp::Add(2, 3),   // [4] mean + eps
                         TraceOp::Rsqrt(4),    // [5] rsqrt(mean + eps)
                     ],
@@ -451,7 +451,7 @@ impl ScalarOpRegistry {
                     finalize: vec![
                         TraceOp::Input(0),    // [0] mean
                         TraceOp::Input(1),    // [1] var
-                        TraceOp::Const(1e-5), // [2] placeholder eps; codegen must substitute actual value from OpKind::LayerNorm { eps }
+                        TraceOp::Const(1e-5), // [2] default eps; codegen uses actual value from OpKind::LayerNorm { eps }
                         TraceOp::Add(1, 2),   // [3] var + eps
                         TraceOp::Rsqrt(3),    // [4] rsqrt(var + eps)
                     ],
