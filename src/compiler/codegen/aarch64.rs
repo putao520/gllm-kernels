@@ -344,9 +344,7 @@ pub mod jit {
             self.emit_u32(0x54000000); // b.ge placeholder
 
             // nc_cur = min(nc, n - x19) → x26
-            self.emit_sub_reg(26, n as u8, 19); // pseudo: we use imm approach
-            // Actually: mov x26, #nc; sub x9, #n_imm, x19; cmp x26, x9; csel x26, x9, x26, lt
-            // Simpler: compute n - jc in x9, then min with nc
+            // compute n - jc in x9, then min with nc
             self.emit_mov_imm(9, n);
             self.emit_sub_reg(9, 9, 19);
             self.emit_mov_imm(26, nc);
@@ -528,54 +526,327 @@ pub mod jit {
 
         // ── TileLevelFusion ─────────────────────────────────────────────
 
-        /// Emit TileLevelFusion: predecessor elementwise op is applied per
-        /// MC-tile row before the GEMM's pack_a, fusing the two into one
-        /// pass over A's data.
+        /// Emit TileLevelFusion: predecessor norm is applied per MC-tile
+        /// row into a scratchpad buffer, then the GEMM's pack_a reads from
+        /// that buffer instead of the original A.
         ///
-        /// This is the aarch64 equivalent of the x86_64 TileLevelFusion path.
-        /// For now, emits the predecessor as a standalone op followed by the
-        /// GEMM with BLIS blocking (structurally correct, not yet fused into
-        /// the pack_a loop).
+        /// Loop structure (IC outside PC for tile reuse):
+        ///   JC → IC → (norm mc_cur rows) → PC → pack_b, pack_a(norm) → JR → IR → µkernel
+        ///
+        /// ABI (CompiledLayerFn):
+        ///   x0 = A input ptr (pre-norm)
+        ///   x1 = B weight matrix ptr
+        ///   x2 = norm weight ptr
+        ///   x7 = C output ptr
+        ///   9th arg (stack) = scratchpad ptr
         fn emit_tile_level_fusion(
             &mut self,
             group: &FusionGroup,
             graph: &CompilerGraph,
             profile: &DeviceProfile,
             predecessor: OpId,
-            _tile_rows: usize,
+            tile_rows: usize,
         ) -> Result<(), String> {
-            // Emit predecessor op standalone
-            if let Some(pred_op) = graph.op(predecessor) {
-                match &pred_op.kind {
-                    OpKind::Gemm { m, n, k } | OpKind::QuantGemm { m, n, k, .. } => {
-                        self.emit_gemm_microkernel(*m, *n, *k, profile)?;
-                    }
-                    _ => {
-                        self.emit_nop();
-                    }
+            let norm_op = graph.op(predecessor)
+                .ok_or("TileLevelFusion: predecessor norm op not in graph")?;
+            let gemm_op = graph.op(group.anchor)
+                .ok_or("TileLevelFusion: GEMM op not in graph")?;
+
+            let eps = match &norm_op.kind {
+                OpKind::RmsNorm { eps } => *eps,
+                other => {
+                    return Err(format!("TileLevelFusion: expected RmsNorm, got {:?}", other));
                 }
+            };
+
+            let (m, n, k) = match &gemm_op.kind {
+                OpKind::Gemm { m, n, k } | OpKind::QuantGemm { m, n, k, .. } => (*m, *n, *k),
+                other => {
+                    return Err(format!("TileLevelFusion: expected GEMM, got {:?}", other));
+                }
+            };
+
+            let blocking = profile.gemm_blocking(m, n, k);
+            let kc = blocking.kc;
+            let mc = tile_rows;
+            let nc = blocking.nc;
+
+            // ── Scratchpad allocation ──
+            let norm_scratch_bytes = mc * k * 4;
+            let pack_a_bytes = mc * kc * 4;
+            let pack_b_bytes = kc * nc * 4;
+            let norm_scratch_off = self.blis_scratchpad_offset;
+            let pack_a_off = norm_scratch_off + norm_scratch_bytes;
+            let pack_b_off = pack_a_off + pack_a_bytes;
+            let total_extra = norm_scratch_bytes + pack_a_bytes + pack_b_bytes;
+            self.blis_scratchpad_offset += total_extra;
+            if total_extra > self.blis_scratchpad_bytes {
+                self.blis_scratchpad_bytes = total_extra;
             }
 
-            // Emit anchor GEMM with BLIS blocking
-            let anchor_op = graph.op(group.anchor).ok_or("missing anchor op")?;
-            match &anchor_op.kind {
-                OpKind::Gemm { m, n, k } | OpKind::QuantGemm { m, n, k, .. } => {
-                    self.emit_gemm_microkernel(*m, *n, *k, profile)
-                }
-                _ => {
-                    self.emit_nop();
-                    Ok(())
-                }
-            }
+            // ── Function pointers ──
+            #[cfg(target_arch = "aarch64")]
+            let norm_fn_ptr = crate::scalar_ops::norms::scalar_rms_norm as *const () as u64;
+            #[cfg(not(target_arch = "aarch64"))]
+            let norm_fn_ptr = 0u64;
+
+            #[cfg(target_arch = "aarch64")]
+            let pack_a_fn = crate::asm::aarch64::gllm_pack_a_f32_neon as *const () as u64;
+            #[cfg(not(target_arch = "aarch64"))]
+            let pack_a_fn = 0u64;
+
+            #[cfg(target_arch = "aarch64")]
+            let pack_b_fn = crate::asm::aarch64::gllm_pack_b_f32_neon as *const () as u64;
+            #[cfg(not(target_arch = "aarch64"))]
+            let pack_b_fn = 0u64;
+
+            let row_bytes_k = k * 4;
+
+            // ── Save callee-saved + extra slot for norm_weight ──
+            self.emit_save_callee_saved();
+            // Allocate 16 bytes on stack for norm_weight ptr
+            self.emit_sub_sp_imm(16);
+            // str x2, [sp, #0]  (save norm weight ptr)
+            self.emit_str_imm_x(2, 31, 0);
+
+            // Save input args to callee-saved regs
+            self.emit_mov_reg(23, 0);  // x23 = A base
+            self.emit_mov_reg(24, 1);  // x24 = B base
+            self.emit_mov_reg(25, 7);  // x25 = C base
+
+            // Load scratchpad: prologue(-16) + save_callee(-80) + sub_sp(-16) = 112
+            self.emit_ldr_imm_x(22, 31, 112);
+
+            // ── JC loop (x19 = jc = 0) ──
+            self.emit_movz(19, 0, 0);
+            let jc_loop = self.code.len();
+
+            self.emit_cmp_imm(19, n as u32);
+            let jc_done_patch = self.code.len();
+            self.emit_u32(0x54000000); // b.ge placeholder
+
+            // nc_cur → x26
+            self.emit_mov_imm(9, n);
+            self.emit_sub_reg(9, 9, 19);
+            self.emit_mov_imm(26, nc);
+            self.emit_cmp_reg(9, 26);
+            self.emit_csel(26, 9, 26, 0x3);
+
+            // ── IC loop (x21 = ic = 0) — outside PC for tile reuse ──
+            self.emit_movz(21, 0, 0);
+            let ic_loop = self.code.len();
+
+            self.emit_cmp_imm(21, m as u32);
+            let ic_done_patch = self.code.len();
+            self.emit_u32(0x54000000); // b.ge placeholder
+
+            // mc_cur → x28
+            self.emit_mov_imm(9, m);
+            self.emit_sub_reg(9, 9, 21);
+            self.emit_mov_imm(28, mc);
+            self.emit_cmp_reg(9, 28);
+            self.emit_csel(28, 9, 28, 0x3);
+
+            // ── Norm mc_cur rows into norm_scratch ──
+            // Use x20 as row counter (free here; PC loop comes later)
+            self.emit_movz(20, 0, 0);
+            let norm_loop = self.code.len();
+
+            // if x20 >= mc_cur (x28): goto norm_done
+            self.emit_cmp_reg(20, 28);
+            let norm_done_patch = self.code.len();
+            self.emit_u32(0x54000000); // b.ge placeholder
+
+            // Save row counter x20 on stack (clobbered by call)
+            // stp x20, xzr, [sp, #-16]!
+            self.emit_u32(Self::encode_stp_pre(20, 31, 31, -16));
+
+            // x9 = (ic + row) = x21 + x20
+            self.emit_add_reg(9, 21, 20);
+            // x9 = (ic + row) * k * 4
+            self.emit_mov_imm(10, row_bytes_k);
+            self.emit_mul(9, 9, 10);
+
+            // x0 = A + (ic + row) * k * 4
+            self.emit_add_reg(0, 23, 9);
+
+            // x1 = norm_weight (load from stack: [sp + 16] because we just pushed 16)
+            self.emit_ldr_imm_x(1, 31, 16);
+
+            // x2 = norm_scratch + row * k * 4
+            self.emit_mov_imm(10, row_bytes_k);
+            self.emit_mul(9, 20, 10);
+            self.emit_add_imm_large(2, 22, norm_scratch_off);
+            self.emit_add_reg(2, 2, 9);
+
+            // x3 = k
+            self.emit_mov_imm(3, k);
+
+            // s0 = eps
+            self.emit_load_f32_to_s0(eps);
+
+            // blr norm_fn
+            self.emit_mov_imm(10, norm_fn_ptr as usize);
+            self.emit_blr(10);
+
+            // Restore row counter
+            // ldp x20, xzr, [sp], #16
+            self.emit_u32(Self::encode_ldp_post(20, 31, 31, 16));
+
+            // x20 += 1
+            self.emit_add_imm(20, 20, 1);
+            self.emit_b_back(norm_loop);
+
+            // norm_done: patch
+            self.patch_bcond_ge(norm_done_patch);
+
+            // ── PC loop (x20 = pc = 0) ──
+            self.emit_movz(20, 0, 0);
+            let pc_loop = self.code.len();
+
+            self.emit_cmp_imm(20, k as u32);
+            let pc_done_patch = self.code.len();
+            self.emit_u32(0x54000000); // b.ge placeholder
+
+            // kc_cur → x27
+            self.emit_mov_imm(9, k);
+            self.emit_sub_reg(9, 9, 20);
+            self.emit_mov_imm(27, kc);
+            self.emit_cmp_reg(9, 27);
+            self.emit_csel(27, 9, 27, 0x3);
+
+            // ── pack_b: B[pc..pc+kc, jc..jc+nc] ──
+            // x0 = B + (pc * n + jc) * 4
+            self.emit_mov_imm(9, n);
+            self.emit_mul(0, 20, 9);
+            self.emit_add_reg(0, 0, 19);
+            self.emit_lsl_imm(0, 0, 2);
+            self.emit_add_reg(0, 24, 0);
+            // x1 = n (ldb)
+            self.emit_mov_imm(1, n);
+            // x2 = packed_b
+            self.emit_add_imm_large(2, 22, pack_b_off);
+            // x3 = kc_cur
+            self.emit_mov_reg(3, 27);
+            // x4 = nc_cur
+            self.emit_mov_reg(4, 26);
+            // x5 = NR
+            self.emit_mov_imm(5, NR);
+            // blr pack_b_fn
+            self.emit_mov_imm(10, pack_b_fn as usize);
+            self.emit_blr(10);
+
+            // ── pack_a: norm_scratch[0..mc_cur, pc..pc+kc] ──
+            // Source: norm_scratch + pc * 4 (lda = k for row-major norm output)
+            // x0 = norm_scratch + pc * 4
+            self.emit_add_imm_large(0, 22, norm_scratch_off);
+            self.emit_mov_reg(9, 20);
+            self.emit_lsl_imm(9, 9, 2);
+            self.emit_add_reg(0, 0, 9);
+            // x1 = k (lda for norm_scratch)
+            self.emit_mov_imm(1, k);
+            // x2 = packed_a
+            self.emit_add_imm_large(2, 22, pack_a_off);
+            // x3 = mc_cur
+            self.emit_mov_reg(3, 28);
+            // x4 = kc_cur
+            self.emit_mov_reg(4, 27);
+            // x5 = MR
+            self.emit_mov_imm(5, MR);
+            // blr pack_a_fn
+            self.emit_mov_imm(10, pack_a_fn as usize);
+            self.emit_blr(10);
+
+            // ── JR loop (x14 = jr = 0) ──
+            self.emit_movz(14, 0, 0);
+            let jr_loop = self.code.len();
+
+            self.emit_cmp_reg(14, 26);
+            let jr_done_patch = self.code.len();
+            self.emit_u32(0x54000000); // b.ge placeholder
+
+            // ── IR loop (x15 = ir = 0) ──
+            self.emit_movz(15, 0, 0);
+            let ir_loop = self.code.len();
+
+            self.emit_cmp_reg(15, 28);
+            let ir_done_patch = self.code.len();
+            self.emit_u32(0x54000000); // b.ge placeholder
+
+            // ── Setup microkernel args ──
+            // x0 = packed_a + ir * kc_cur * 4
+            self.emit_mul(9, 15, 27);
+            self.emit_lsl_imm(9, 9, 2);
+            self.emit_add_imm_large(0, 22, pack_a_off);
+            self.emit_add_reg(0, 0, 9);
+
+            // x1 = packed_b + jr * kc_cur * 4
+            self.emit_mul(9, 14, 27);
+            self.emit_lsl_imm(9, 9, 2);
+            self.emit_add_imm_large(1, 22, pack_b_off);
+            self.emit_add_reg(1, 1, 9);
+
+            // x2 = C + ((ic + ir) * n + (jc + jr)) * 4
+            self.emit_add_reg(9, 21, 15);
+            self.emit_mov_imm(10, n);
+            self.emit_mul(9, 9, 10);
+            self.emit_add_reg(9, 9, 19);
+            self.emit_add_reg(9, 9, 14);
+            self.emit_lsl_imm(9, 9, 2);
+            self.emit_add_reg(2, 25, 9);
+
+            // x3 = kc_cur
+            self.emit_mov_reg(3, 27);
+
+            // Inline 8×12 microkernel
+            self.emit_gemm_8x12_neon(kc)?;
+
+            // ir += MR
+            self.emit_add_imm(15, 15, MR as u32);
+            self.emit_b_back(ir_loop);
+            self.patch_bcond_ge(ir_done_patch);
+
+            // jr += NR
+            self.emit_add_imm(14, 14, NR as u32);
+            self.emit_b_back(jr_loop);
+            self.patch_bcond_ge(jr_done_patch);
+
+            // pc += kc
+            self.emit_add_imm(20, 20, kc as u32);
+            self.emit_b_back(pc_loop);
+            self.patch_bcond_ge(pc_done_patch);
+
+            // ic += mc
+            self.emit_add_imm(21, 21, mc as u32);
+            self.emit_b_back(ic_loop);
+            self.patch_bcond_ge(ic_done_patch);
+
+            // jc += nc
+            self.emit_add_imm(19, 19, nc as u32);
+            self.emit_b_back(jc_loop);
+            self.patch_bcond_ge(jc_done_patch);
+
+            // ── Restore stack + callee-saved ──
+            self.emit_add_sp_imm(16);
+            self.emit_restore_callee_saved();
+
+            Ok(())
         }
 
         // ── ComputeRoot ─────────────────────────────────────────────────
 
-        /// Emit ComputeRoot fusion: predecessor is fully materialized first,
-        /// then the anchor GEMM reads from the materialized buffer.
+        /// Emit ComputeRoot fusion: predecessor norm is computed fully into
+        /// a scratchpad buffer, then the GEMM reads from that buffer.
         ///
-        /// This matches the x86_64 ComputeRoot semantics: the predecessor
-        /// runs to completion before the GEMM begins.
+        /// Used when the norm output fits in L1 (≤ 75% L1), so no tiling
+        /// is needed — the entire norm result stays cache-hot for the GEMM.
+        ///
+        /// ABI (CompiledLayerFn):
+        ///   x0 = A input ptr (pre-norm)
+        ///   x1 = B weight matrix ptr
+        ///   x2 = norm weight ptr
+        ///   x7 = C output ptr
+        ///   9th arg (stack) = scratchpad ptr
         fn emit_compute_root(
             &mut self,
             group: &FusionGroup,
@@ -583,29 +854,107 @@ pub mod jit {
             profile: &DeviceProfile,
             predecessor: OpId,
         ) -> Result<(), String> {
-            // Materialize predecessor fully
-            if let Some(pred_op) = graph.op(predecessor) {
-                match &pred_op.kind {
-                    OpKind::Gemm { m, n, k } | OpKind::QuantGemm { m, n, k, .. } => {
-                        self.emit_gemm_microkernel(*m, *n, *k, profile)?;
-                    }
-                    _ => {
-                        self.emit_nop();
-                    }
+            let norm_op = graph.op(predecessor)
+                .ok_or("ComputeRoot: predecessor norm op not in graph")?;
+            let gemm_op = graph.op(group.anchor)
+                .ok_or("ComputeRoot: GEMM op not in graph")?;
+
+            let eps = match &norm_op.kind {
+                OpKind::RmsNorm { eps } => *eps,
+                other => {
+                    return Err(format!("ComputeRoot: expected RmsNorm, got {:?}", other));
                 }
+            };
+
+            let (m, n, k) = match &gemm_op.kind {
+                OpKind::Gemm { m, n, k } | OpKind::QuantGemm { m, n, k, .. } => (*m, *n, *k),
+                other => {
+                    return Err(format!("ComputeRoot: expected GEMM, got {:?}", other));
+                }
+            };
+
+            // Allocate scratchpad for full norm output (m * k * 4 bytes).
+            let norm_buf_bytes = m * k * 4;
+            let norm_scratch_off = self.blis_scratchpad_offset;
+            self.blis_scratchpad_offset += norm_buf_bytes;
+            let total_extra = self.blis_scratchpad_offset - self.blis_base_offset;
+            if total_extra > self.blis_scratchpad_bytes {
+                self.blis_scratchpad_bytes = total_extra;
             }
 
-            // Emit anchor GEMM
-            let anchor_op = graph.op(group.anchor).ok_or("missing anchor op")?;
-            match &anchor_op.kind {
-                OpKind::Gemm { m, n, k } | OpKind::QuantGemm { m, n, k, .. } => {
-                    self.emit_gemm_microkernel(*m, *n, *k, profile)
-                }
-                _ => {
-                    self.emit_nop();
-                    Ok(())
-                }
-            }
+            #[cfg(target_arch = "aarch64")]
+            let norm_fn_ptr = crate::scalar_ops::norms::scalar_rms_norm as *const () as u64;
+            #[cfg(not(target_arch = "aarch64"))]
+            let norm_fn_ptr = 0u64;
+
+            let row_bytes_k = k * 4;
+
+            // ── Save callee-saved for the norm loop ──
+            self.emit_save_callee_saved();
+
+            // Save input args
+            self.emit_mov_reg(23, 0);  // x23 = A base
+            self.emit_mov_reg(24, 1);  // x24 = B base
+            self.emit_mov_reg(25, 7);  // x25 = C base
+            self.emit_mov_reg(26, 2);  // x26 = norm weight ptr
+
+            // Load scratchpad: prologue(-16) + save_callee(-80) = 96
+            self.emit_ldr_imm_x(22, 31, 96);
+
+            // ── Row loop: call scalar_rms_norm for each row ──
+            // x20 = row counter
+            self.emit_movz(20, 0, 0);
+            let row_loop = self.code.len();
+
+            self.emit_cmp_imm(20, m as u32);
+            let row_done_patch = self.code.len();
+            self.emit_u32(0x54000000); // b.ge placeholder
+
+            // Save row counter (clobbered by call)
+            self.emit_u32(Self::encode_stp_pre(20, 31, 31, -16));
+
+            // Byte offset for current row: row * k * 4
+            self.emit_mov_imm(9, row_bytes_k);
+            self.emit_mul(9, 20, 9);
+
+            // scalar_rms_norm(x, weight, out, n, eps)
+            // x0 = A + row * k * 4
+            self.emit_add_reg(0, 23, 9);
+            // x1 = norm weight
+            self.emit_mov_reg(1, 26);
+            // x2 = norm_scratch + row * k * 4
+            self.emit_add_imm_large(2, 22, norm_scratch_off);
+            self.emit_add_reg(2, 2, 9);
+            // x3 = k
+            self.emit_mov_imm(3, k);
+            // s0 = eps
+            self.emit_load_f32_to_s0(eps);
+
+            // blr norm_fn
+            self.emit_mov_imm(10, norm_fn_ptr as usize);
+            self.emit_blr(10);
+
+            // Restore row counter
+            self.emit_u32(Self::encode_ldp_post(20, 31, 31, 16));
+
+            self.emit_add_imm(20, 20, 1);
+            self.emit_b_back(row_loop);
+
+            self.patch_bcond_ge(row_done_patch);
+
+            // ── Redirect A to norm output and set up GEMM args ──
+            // x0 = norm_scratch (new A)
+            self.emit_add_imm_large(0, 22, norm_scratch_off);
+            // x1 = B (from callee-saved)
+            self.emit_mov_reg(1, 24);
+            // x7 = C (from callee-saved)
+            self.emit_mov_reg(7, 25);
+
+            // ── Restore callee-saved ──
+            self.emit_restore_callee_saved();
+
+            // ── Run GEMM with A pointing to normalized data ──
+            self.emit_gemm_microkernel(m, n, k, profile)
         }
 
         // ── GP register instruction encoding helpers ────────────────────
@@ -1396,6 +1745,66 @@ pub mod jit {
             }
 
             Ok(())
+        }
+
+        // ── Additional GP helpers for fusion paths ─────────────────────
+
+        /// Emit `sub sp, sp, #imm` (stack allocation, imm must be < 4096).
+        fn emit_sub_sp_imm(&mut self, imm: u32) {
+            debug_assert!(imm < 4096);
+            // sub sp, sp, #imm → 0xD10003FF with imm12
+            self.emit_u32(0xD10003FF | ((imm & 0xFFF) << 10));
+        }
+
+        /// Emit `add sp, sp, #imm` (stack deallocation, imm must be < 4096).
+        fn emit_add_sp_imm(&mut self, imm: u32) {
+            debug_assert!(imm < 4096);
+            // add sp, sp, #imm → 0x910003FF with imm12
+            self.emit_u32(0x910003FF | ((imm & 0xFFF) << 10));
+        }
+
+        /// Emit `str xd, [xn, #byte_offset]` (unsigned offset, scaled by 8).
+        fn emit_str_imm_x(&mut self, rt: u8, rn: u8, byte_offset: u32) {
+            let imm12 = (byte_offset / 8) & 0xFFF;
+            self.emit_u32(0xF9000000
+                | (imm12 << 10)
+                | ((rn as u32 & 0x1F) << 5)
+                | (rt as u32 & 0x1F));
+        }
+
+        /// Emit `fmov s_rd, w_rn` (move GP w-register to FP s-register).
+        ///
+        /// Encoding: 0x1E270000 | (Rn << 5) | Rd
+        fn emit_fmov_s_from_w(&mut self, sd: u8, wn: u8) {
+            self.emit_u32(0x1E270000 | ((wn as u32 & 0x1F) << 5) | (sd as u32 & 0x1F));
+        }
+
+        /// Load an f32 immediate into s0 (for passing eps to scalar_rms_norm).
+        ///
+        /// Uses w9 as scratch: movz/movk w9, #bits; fmov s0, w9.
+        fn emit_load_f32_to_s0(&mut self, val: f32) {
+            let bits = val.to_bits();
+            let lo = bits as u16;
+            let hi = (bits >> 16) as u16;
+            // movz w9, #lo  (32-bit form: 0x52800009)
+            self.emit_u32(0x52800000 | ((lo as u32) << 5) | 9);
+            if hi != 0 {
+                // movk w9, #hi, lsl #16  (32-bit form: 0x72A00009)
+                self.emit_u32(0x72A00000 | ((hi as u32) << 5) | 9);
+            }
+            // fmov s0, w9
+            self.emit_fmov_s_from_w(0, 9);
+        }
+
+        /// Emit `add xd, xn, #imm` where imm may exceed 12-bit range.
+        /// Falls back to mov_imm + add_reg for large immediates.
+        fn emit_add_imm_large(&mut self, rd: u8, rn: u8, imm: usize) {
+            if imm < 4096 {
+                self.emit_add_imm(rd, rn, imm as u32);
+            } else {
+                self.emit_mov_imm(9, imm);
+                self.emit_add_reg(rd, rn, 9);
+            }
         }
 
         /// Emit a NEON nop (`hint #0` = 0xD503201F).
