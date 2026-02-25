@@ -3,11 +3,14 @@
 //! Tuned parameters are saved to a JSON file keyed by hardware fingerprint
 //! and problem shape. On subsequent runs, cached parameters are loaded
 //! instantly instead of re-tuning.
+//!
+//! JIT-specific parameters (k_unroll, prefetch, reg_alloc, sw_pipeline, nr_variant)
+//! are serialized alongside the base blocking parameters when present.
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
-use crate::autotuning::search_space::{ProblemShape, TuningConfig};
+use crate::autotuning::search_space::{ProblemShape, TuningConfig, JitParams, RegAllocStrategy};
 
 /// A single cached tuning result.
 #[derive(Debug, Clone)]
@@ -141,6 +144,28 @@ impl WisdomDb {
             self.dirty = true;
         }
     }
+
+    /// Look up a cached GEMM blocking result and return it as a GemmBlocking.
+    ///
+    /// Used by `DeviceProfile::gemm_blocking()` to prefer empirically-tuned
+    /// parameters over heuristic defaults.
+    pub fn get_gemm_blocking(
+        &self,
+        hw_fingerprint: &str,
+        m: usize,
+        n: usize,
+        k: usize,
+        elem_bytes: usize,
+    ) -> Option<&CachedResult> {
+        let shape = ProblemShape { m, n, k, elem_bytes };
+        // Try JIT key first, then standard key
+        let jit_key = op_key("jit_gemm", &shape);
+        if let Some(result) = self.get(hw_fingerprint, &jit_key) {
+            return Some(result);
+        }
+        let std_key = op_key("gemm", &shape);
+        self.get(hw_fingerprint, &std_key)
+    }
 }
 
 /// Generate the operation key for cache lookup.
@@ -170,7 +195,7 @@ fn serialize_wisdom(
         for (oi, op_key) in op_keys.iter().enumerate() {
             let r = &hw_map[*op_key];
             out.push_str(&format!(
-                "    \"{}\": {{\"kc\":{},\"mc\":{},\"nc\":{},\"threads\":{},\"median_ns\":{:.1},\"gflops\":{},\"ts\":{}}}",
+                "    \"{}\": {{\"kc\":{},\"mc\":{},\"nc\":{},\"threads\":{},\"median_ns\":{:.1},\"gflops\":{},\"ts\":{}",
                 escape_json(op_key),
                 r.config.kc,
                 r.config.mc,
@@ -180,6 +205,18 @@ fn serialize_wisdom(
                 r.gflops.map(|g| format!("{g:.2}")).unwrap_or_else(|| "null".into()),
                 r.timestamp,
             ));
+            // Serialize JIT params if present
+            if let Some(jit) = &r.config.jit {
+                out.push_str(&format!(
+                    ",\"k_unroll\":{},\"prefetch\":{},\"reg_alloc\":{},\"sw_pipeline\":{},\"nr_variant\":{}",
+                    jit.k_unroll,
+                    jit.prefetch_distance,
+                    jit.reg_alloc_strategy.to_index(),
+                    jit.sw_pipeline_depth,
+                    jit.nr_variant,
+                ));
+            }
+            out.push('}');
             if oi + 1 < op_keys.len() {
                 out.push(',');
             }
@@ -199,7 +236,6 @@ fn parse_wisdom(
     content: &str,
 ) -> Result<HashMap<String, HashMap<String, CachedResult>>, String> {
     // Minimal JSON parser for our known schema.
-    // Format: { "hw_fp": { "op_key": { "kc":N, "mc":N, "nc":N, "threads":N, "median_ns":F, "gflops":F|null, "ts":N } } }
     let mut result: HashMap<String, HashMap<String, CachedResult>> = HashMap::new();
 
     let content = content.trim();
@@ -244,16 +280,38 @@ fn parse_cached_result(json: &str) -> Option<CachedResult> {
     let gflops = extract_f64(inner, "gflops"); // optional
     let timestamp = extract_usize(inner, "ts").unwrap_or(0) as u64;
 
+    // Parse optional JIT params
+    let jit = parse_jit_params(inner);
+
     Some(CachedResult {
         config: TuningConfig {
             kc,
             mc,
             nc,
             num_threads: threads,
+            jit,
         },
         median_ns,
         gflops,
         timestamp,
+    })
+}
+
+/// Parse JIT parameters from a JSON object interior.
+/// Returns None if any JIT field is missing (backward compatible with old entries).
+fn parse_jit_params(inner: &str) -> Option<JitParams> {
+    let k_unroll = extract_usize(inner, "k_unroll")?;
+    let prefetch_distance = extract_usize(inner, "prefetch")?;
+    let reg_alloc_idx = extract_usize(inner, "reg_alloc")?;
+    let sw_pipeline_depth = extract_usize(inner, "sw_pipeline")?;
+    let nr_variant = extract_usize(inner, "nr_variant")?;
+
+    Some(JitParams {
+        k_unroll,
+        prefetch_distance,
+        reg_alloc_strategy: RegAllocStrategy::from_index(reg_alloc_idx),
+        sw_pipeline_depth,
+        nr_variant,
     })
 }
 
@@ -391,6 +449,7 @@ mod tests {
             mc: 72,
             nc: 1024,
             num_threads: 8,
+            jit: None,
         };
         db.put("test_hw_fp", "gemm_512x512x512_e4", config.clone(), 1234.5, Some(42.0));
         db.save().unwrap();
@@ -402,8 +461,46 @@ mod tests {
         assert_eq!(cached.config.mc, 72);
         assert_eq!(cached.config.nc, 1024);
         assert_eq!(cached.config.num_threads, 8);
+        assert!(cached.config.jit.is_none());
         assert!((cached.median_ns - 1234.5).abs() < 0.1);
         assert!((cached.gflops.unwrap() - 42.0).abs() < 0.01);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_roundtrip_jit_params() {
+        let dir = std::env::temp_dir().join("gllm_wisdom_test_jit");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("test_wisdom_jit.json");
+
+        let mut db = WisdomDb::new(path.clone());
+        let config = TuningConfig {
+            kc: 128,
+            mc: 48,
+            nc: 512,
+            num_threads: 4,
+            jit: Some(JitParams {
+                k_unroll: 4,
+                prefetch_distance: 8,
+                reg_alloc_strategy: RegAllocStrategy::Balanced,
+                sw_pipeline_depth: 1,
+                nr_variant: 16,
+            }),
+        };
+        db.put("test_hw_jit", "jit_gemm_256x256x256_e4", config.clone(), 500.0, Some(80.0));
+        db.save().unwrap();
+
+        let db2 = WisdomDb::load(&path);
+        let cached = db2.get("test_hw_jit", "jit_gemm_256x256x256_e4").unwrap();
+        assert_eq!(cached.config.kc, 128);
+        let jit = cached.config.jit.as_ref().unwrap();
+        assert_eq!(jit.k_unroll, 4);
+        assert_eq!(jit.prefetch_distance, 8);
+        assert_eq!(jit.reg_alloc_strategy, RegAllocStrategy::Balanced);
+        assert_eq!(jit.sw_pipeline_depth, 1);
+        assert_eq!(jit.nr_variant, 16);
 
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -416,11 +513,11 @@ mod tests {
         let path = dir.join("test_wisdom2.json");
 
         let mut db = WisdomDb::new(path.clone());
-        let c1 = TuningConfig { kc: 128, mc: 48, nc: 512, num_threads: 4 };
-        let c2 = TuningConfig { kc: 256, mc: 96, nc: 2048, num_threads: 8 };
+        let c1 = TuningConfig { kc: 128, mc: 48, nc: 512, num_threads: 4, jit: None };
+        let c2 = TuningConfig { kc: 256, mc: 96, nc: 2048, num_threads: 8, jit: None };
         db.put("hw1", "gemm_256x256x256_e4", c1, 500.0, Some(10.0));
         db.put("hw1", "gemm_1024x1024x1024_e4", c2, 2000.0, Some(80.0));
-        db.put("hw2", "gemm_256x256x256_e4", TuningConfig { kc: 64, mc: 24, nc: 256, num_threads: 2 }, 800.0, None);
+        db.put("hw2", "gemm_256x256x256_e4", TuningConfig { kc: 64, mc: 24, nc: 256, num_threads: 2, jit: None }, 800.0, None);
         db.save().unwrap();
 
         let db2 = WisdomDb::load(&path);
@@ -439,5 +536,26 @@ mod tests {
         let shape = ProblemShape { m: 512, n: 1024, k: 768, elem_bytes: 4 };
         let key = op_key("gemm", &shape);
         assert_eq!(key, "gemm_512x1024x768_e4");
+    }
+
+    #[test]
+    fn test_get_gemm_blocking() {
+        let dir = std::env::temp_dir().join("gllm_wisdom_blocking");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("test_blocking.json");
+
+        let mut db = WisdomDb::new(path);
+        let config = TuningConfig { kc: 256, mc: 72, nc: 1024, num_threads: 8, jit: None };
+        db.put("hw_test", "gemm_512x512x512_e4", config, 1000.0, Some(50.0));
+
+        let result = db.get_gemm_blocking("hw_test", 512, 512, 512, 4);
+        assert!(result.is_some());
+        assert_eq!(result.unwrap().config.kc, 256);
+
+        // Non-existent shape returns None
+        assert!(db.get_gemm_blocking("hw_test", 1024, 1024, 1024, 4).is_none());
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

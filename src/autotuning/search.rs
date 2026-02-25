@@ -180,6 +180,7 @@ where
                     mc: 72,
                     nc: 1024,
                     num_threads: 1,
+                    jit: None,
                 },
                 BenchResult {
                     median_ns: f64::MAX,

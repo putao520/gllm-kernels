@@ -27,6 +27,10 @@
 //! // Full tune with report
 //! let report = autotuning::tune_gemm_with_report(1024, 1024, 1024, 4, TuneLevel::Default);
 //! println!("{}", report.report);
+//!
+//! // JIT-extended tune (includes codegen parameters)
+//! let jit_result = autotuning::tune_jit_gemm(512, 512, 512, 4, TuneLevel::Fast);
+//! println!("JIT optimal: {}", jit_result.config);
 //! ```
 
 pub mod hw_info;
@@ -38,7 +42,7 @@ pub mod cache;
 use std::sync::OnceLock;
 
 pub use hw_info::HwInfo;
-pub use search_space::{ProblemShape, TuningConfig, OpClass, SearchSpace};
+pub use search_space::{ProblemShape, TuningConfig, OpClass, SearchSpace, JitParams, RegAllocStrategy, JitSearchRanges};
 pub use measure::{BenchConfig, BenchResult};
 pub use search::{SearchConfig, SearchResult};
 pub use cache::WisdomDb;
@@ -80,6 +84,11 @@ static WISDOM: OnceLock<std::sync::Mutex<WisdomDb>> = OnceLock::new();
 
 fn wisdom_db() -> &'static std::sync::Mutex<WisdomDb> {
     WISDOM.get_or_init(|| std::sync::Mutex::new(WisdomDb::load_default()))
+}
+
+/// Get a reference to the global wisdom database (for external queries).
+pub fn global_wisdom_db() -> &'static std::sync::Mutex<WisdomDb> {
+    wisdom_db()
 }
 
 /// Tune GEMM blocking parameters for a specific problem shape.
@@ -186,6 +195,101 @@ pub fn tune_gemm_with_report(
         if let Err(e) = db.save() {
             eprintln!("[gllm-kernels] warning: failed to save wisdom cache: {e}");
         }
+    }
+
+    TuneResult {
+        config: search_result.best_config,
+        perf: search_result.best_result,
+        from_cache: false,
+        report,
+    }
+}
+
+/// Tune JIT-compiled GEMM with extended search space (9 dimensions).
+///
+/// Extends the standard GEMM tuning with 5 JIT-specific code generation
+/// parameters: K-loop unroll factor, prefetch distance, register allocation
+/// strategy, software pipelining depth, and NR tile variant.
+///
+/// Each candidate configuration generates a fresh GEMM microkernel via the
+/// Phase 3 JIT codegen pipeline, maps it into executable memory, and
+/// benchmarks it. Results are cached under the "jit_gemm" key.
+pub fn tune_jit_gemm(
+    m: usize,
+    n: usize,
+    k: usize,
+    elem_bytes: usize,
+    level: TuneLevel,
+) -> TuneResult {
+    let hw = hw_info();
+    let shape = ProblemShape { m, n, k, elem_bytes };
+    let op_key = cache::op_key("jit_gemm", &shape);
+    let fp = hw.fingerprint();
+
+    // Check cache first
+    {
+        let db = wisdom_db().lock().unwrap();
+        if let Some(cached) = db.get(&fp, &op_key) {
+            return TuneResult {
+                config: cached.config.clone(),
+                perf: BenchResult {
+                    median_ns: cached.median_ns,
+                    iqr_ns: 0.0,
+                    min_ns: cached.median_ns,
+                    samples: 0,
+                    gflops: cached.gflops,
+                    bandwidth_gbs: None,
+                },
+                from_cache: true,
+                report: format!("Loaded from cache: {}", cached.config),
+            };
+        }
+    }
+
+    let (tm, tn) = microkernel_geometry(hw, elem_bytes);
+    let space = SearchSpace::for_jit_gemm(hw, &shape, tm, tn);
+
+    let search_cfg = match level {
+        TuneLevel::Fast => SearchConfig::fast(),
+        TuneLevel::Default => SearchConfig::default(),
+        TuneLevel::Thorough => SearchConfig::thorough(),
+    };
+
+    let search_result = search::run_search(&space, &search_cfg, |cfg, bench_cfg| {
+        match measure::measure_jit_gemm(m, n, k, cfg, bench_cfg) {
+            Ok(result) => result,
+            Err(_) => {
+                // Codegen failure for this parameter combination — return
+                // a very high time so the search engine skips it.
+                BenchResult {
+                    median_ns: f64::MAX,
+                    iqr_ns: 0.0,
+                    min_ns: f64::MAX,
+                    samples: 0,
+                    gflops: None,
+                    bandwidth_gbs: None,
+                }
+            }
+        }
+    });
+
+    let report = search::format_report(
+        &search_result,
+        "JIT GEMM",
+        &format!("{shape}"),
+    );
+
+    // Save to cache
+    {
+        let mut db = wisdom_db().lock().unwrap();
+        db.put(
+            &fp,
+            &op_key,
+            search_result.best_config.clone(),
+            search_result.best_result.median_ns,
+            search_result.best_result.gflops,
+        );
+        let _ = db.save();
     }
 
     TuneResult {
@@ -400,5 +504,46 @@ mod tests {
         let summary = cache_summary();
         assert!(summary.contains("entries"));
         eprintln!("{summary}");
+    }
+
+    #[test]
+    fn test_jit_search_space_dimensions() {
+        let hw = hw_info();
+        let shape = ProblemShape { m: 256, n: 256, k: 256, elem_bytes: 4 };
+        let (tm, tn) = microkernel_geometry(hw, 4);
+        let space = SearchSpace::for_jit_gemm(hw, &shape, tm, tn);
+
+        // Must have JIT ranges
+        let jit = space.jit_ranges.as_ref().unwrap();
+
+        // Verify all 5 JIT dimensions are present
+        assert!(jit.k_unroll_range.max >= 1, "k_unroll range must be non-empty");
+        assert!(jit.prefetch_range.max >= 0, "prefetch range must be non-empty");
+        assert!(!jit.reg_alloc_strategies.is_empty(), "reg_alloc strategies must be non-empty");
+        assert!(jit.sw_pipeline_range.count() >= 1, "sw_pipeline range must be non-empty");
+        assert!(jit.nr_variant_range.count() >= 1, "nr_variant range must be non-empty");
+
+        let grid = space.grid_size();
+        let base_space = SearchSpace::for_gemm(hw, &shape, tm, tn);
+        let base_grid = base_space.grid_size();
+
+        // JIT grid must be strictly larger than base grid (more dimensions)
+        assert!(
+            grid > base_grid,
+            "JIT grid ({grid}) must be larger than base grid ({base_grid})"
+        );
+
+        eprintln!(
+            "JIT search space: {} configs (base: {}, JIT multiplier: {:.1}x)",
+            grid, base_grid, grid as f64 / base_grid as f64
+        );
+    }
+
+    #[test]
+    fn test_global_wisdom_db_accessible() {
+        let db = global_wisdom_db();
+        let guard = db.lock().unwrap();
+        // Just verify we can access it without panic
+        let _ = guard.total_entries();
     }
 }

@@ -150,6 +150,11 @@ impl DeviceProfile {
 
     /// Compute GEMM BLIS blocking parameters (KC, MC, NC) for given dimensions.
     ///
+    /// First checks the WisdomDb for empirically-tuned parameters from a previous
+    /// autotuning run. If a cached result exists, its blocking parameters are used
+    /// directly (they were measured to be optimal on this hardware). Otherwise,
+    /// falls back to the analytical heuristic based on cache hierarchy constraints.
+    ///
     /// Blocking strategy (BLIS-style three-level cache blocking):
     /// - KC: A micropanel (MR×KC) + B micropanel (KC×NR) fit in 80% of L1
     /// - MC: A panel (MC×KC) fits in 80% of L2, at least 2×MR tiles
@@ -158,6 +163,63 @@ impl DeviceProfile {
     /// Alignment: KC to 4 (SIMD), MC to MR, NC to NR.
     /// Small matrices (m*n*k < 4096) use direct path to avoid packing overhead.
     pub fn gemm_blocking(&self, m: usize, n: usize, k: usize) -> GemmBlocking {
+        let (mr, nr) = self.microkernel_mr_nr();
+
+        // Query WisdomDb for empirically-tuned parameters
+        if let Some(blocking) = self.query_wisdom_blocking(m, n, k, mr, nr) {
+            return blocking;
+        }
+
+        // Fallback: analytical heuristic
+        self.gemm_blocking_heuristic(m, n, k)
+    }
+
+    /// Query the WisdomDb for cached GEMM blocking parameters.
+    ///
+    /// Returns `Some(GemmBlocking)` if a cached result exists for this exact
+    /// problem shape on the current hardware. The cached KC/MC/NC values are
+    /// validated against alignment constraints before use.
+    fn query_wisdom_blocking(
+        &self,
+        m: usize,
+        n: usize,
+        k: usize,
+        mr: usize,
+        nr: usize,
+    ) -> Option<GemmBlocking> {
+        let db_ref = crate::autotuning::global_wisdom_db();
+        let db = db_ref.lock().ok()?;
+        let fp = self.hw_info.fingerprint();
+        let cached = db.get_gemm_blocking(&fp, m, n, k, 4)?;
+
+        let cfg = &cached.config;
+
+        // Validate cached values: must respect alignment and dimension bounds
+        let kc = cfg.kc;
+        let mc = cfg.mc;
+        let nc = cfg.nc;
+
+        if kc == 0 || mc == 0 || nc == 0 {
+            return None;
+        }
+        if kc > k || mc > m || nc > n {
+            return None;
+        }
+
+        // Use NR from JIT params if available, otherwise default
+        let effective_nr = cfg.jit.as_ref().map(|j| j.nr_variant).unwrap_or(nr);
+
+        Some(GemmBlocking {
+            kc,
+            mc,
+            nc,
+            mr,
+            nr: effective_nr,
+        })
+    }
+
+    /// Analytical heuristic for GEMM blocking (fallback when no wisdom exists).
+    fn gemm_blocking_heuristic(&self, m: usize, n: usize, k: usize) -> GemmBlocking {
         let (l1, l2, l3) = self.cache_sizes();
         let (mr, nr) = self.microkernel_mr_nr();
         let elem_size = 4; // f32

@@ -63,6 +63,8 @@ pub mod jit {
         /// Whether rdx (external tensor pointer) was saved to [rbp-48] for
         /// epilogue Input(1) access (e.g. bias vector in GEMM+AddBias).
         bias_saved: bool,
+        /// JIT tuning parameters (set via `set_jit_params`).
+        jit_params: Option<crate::autotuning::search_space::JitParams>,
     }
 
     impl X86CodeGen {
@@ -79,12 +81,103 @@ pub mod jit {
                 blis_scratchpad_offset: 0,
                 blis_base_offset: 0,
                 bias_saved: false,
+                jit_params: None,
             }
         }
 
         /// Number of f32 elements per SIMD register (8 for AVX2, 16 for AVX-512).
         pub fn simd_width(&self) -> usize {
             self.simd_width
+        }
+
+        /// Set JIT tuning parameters for code generation.
+        ///
+        /// These parameters control K-loop unrolling, prefetch distance,
+        /// register allocation strategy, software pipelining, and NR tile variant.
+        /// When set, `emit_gemm_microkernel` and `emit_standalone_gemm` use
+        /// these values instead of the defaults.
+        pub fn set_jit_params(&mut self, params: &crate::autotuning::search_space::JitParams) {
+            self.jit_params = Some(params.clone());
+        }
+
+        /// K-loop unroll factor from JIT params, or default 1.
+        fn k_unroll_factor(&self) -> usize {
+            self.jit_params.as_ref().map(|p| p.k_unroll).unwrap_or(1)
+        }
+
+        /// Prefetch distance from JIT params, or default 0 (disabled).
+        fn prefetch_distance(&self) -> usize {
+            self.jit_params.as_ref().map(|p| p.prefetch_distance).unwrap_or(0)
+        }
+
+        /// Emit a standalone GEMM function for autotuning measurement.
+        ///
+        /// Generates a complete function with ABI:
+        ///   rdi = A ptr (*const f32, row-major [m, k])
+        ///   rsi = B ptr (*const f32, row-major [k, n])
+        ///   rdx = C ptr (*mut f32, row-major [m, n])
+        ///   rcx = scratchpad ptr (*mut u8)
+        ///
+        /// The function includes prologue, GEMM microkernel with the specified
+        /// blocking parameters, and epilogue. Returns assembled machine code bytes.
+        pub fn emit_standalone_gemm(
+            &mut self,
+            m: usize,
+            n: usize,
+            k: usize,
+            blocking: &crate::dispatch::device_profile::GemmBlocking,
+            profile: &DeviceProfile,
+        ) -> Result<Vec<u8>, String> {
+            // Prologue: save callee-saved registers
+            self.emit_prologue()?;
+
+            // Save scratchpad ptr (rcx) to rbp+32 area for BLIS packing
+            // In standalone ABI: rdi=A, rsi=B, rdx=C, rcx=scratchpad
+            // We need to remap to match the internal GEMM ABI where
+            // rbp+32 holds the scratchpad pointer.
+            self.asm.sub(rsp, 16i32).map_err(|e| e.to_string())?;
+            self.asm.mov(qword_ptr(rbp + 32), rcx).map_err(|e| e.to_string())?;
+
+            // The internal GEMM emitter expects: rdi=A, rsi=B, rdx=C
+            // which matches our standalone ABI (rdx=C, not scratchpad).
+            // But we need to save rdx (C ptr) and use it for output.
+            self.asm.mov(r15, rdx).map_err(|e| e.to_string())?;
+
+            self.blis_scratchpad_offset = 0;
+            self.blis_base_offset = 0;
+
+            let mr = blocking.mr;
+            let nr = blocking.nr;
+            let simd_w = self.simd_width;
+            let nr_vecs = nr / simd_w;
+            let kc = blocking.kc;
+            let mc = blocking.mc;
+            let nc = blocking.nc;
+
+            // Restore rdx = C ptr for the microkernel
+            self.asm.mov(rdx, r15).map_err(|e| e.to_string())?;
+
+            if m == 1 {
+                self.emit_gemm_microkernel_direct(1, n, k, 1, nr, nr_vecs, simd_w, &[])?;
+            } else if k <= kc && m <= mc && n <= nc {
+                self.emit_gemm_microkernel_direct(m, n, k, mr, nr, nr_vecs, simd_w, &[])?;
+            } else {
+                self.emit_gemm_blis(m, n, k, mr, nr, nr_vecs, kc, mc, nc, &[])?;
+            }
+
+            self.asm.add(rsp, 16i32).map_err(|e| e.to_string())?;
+
+            // Epilogue: restore callee-saved registers and return
+            self.emit_epilogue()?;
+
+            // Emit constant pool
+            self.emit_const_pool()?;
+
+            // Assemble
+            let code = self.asm.assemble(0x0)
+                .map_err(|e| format!("asm error: {e}"))?;
+
+            Ok(code)
         }
 
 
