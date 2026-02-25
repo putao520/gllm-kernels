@@ -57,7 +57,7 @@ pub trait InferenceBackend: Send + Sync {
 
 | 后端 | 模块 | 状态 |
 |------|------|------|
-| `CpuInferenceBackend` | `inference/cpu_backend.rs` | 🟡 基础实现，attention 简化 |
+| `CpuInferenceBackend` | `inference/cpu_backend.rs` | 🟡 基础实现（final_norm+lm_head 已完成，attention 简化） |
 | `CudaInferenceBackend` | 未实现 | 🔴 中期规划 |
 | `MetalInferenceBackend` | 未实现 | 🔴 中期规划 |
 
