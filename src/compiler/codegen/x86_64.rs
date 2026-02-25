@@ -523,11 +523,9 @@ pub mod jit {
             let gemm_op = graph.op(group.anchor)
                 .ok_or("NormIntoGemm: GEMM op not in graph")?;
 
-            let eps = match &norm_op.kind {
-                OpKind::RmsNorm { eps } => *eps,
-                OpKind::LayerNorm { eps } => {
-                    return Err("NormIntoGemm: LayerNorm not yet supported".into());
-                }
+            let (eps, is_layer_norm) = match &norm_op.kind {
+                OpKind::RmsNorm { eps } => (*eps, false),
+                OpKind::LayerNorm { eps } => (*eps, true),
                 other => {
                     return Err(format!("NormIntoGemm: expected norm op, got {:?}", other));
                 }
@@ -548,14 +546,22 @@ pub mod jit {
                 self.blis_scratchpad_offset - self.blis_base_offset
             );
 
-            let norm_fn_ptr = crate::scalar_ops::norms::scalar_rms_norm as *const () as u64;
+            let norm_fn_ptr = if is_layer_norm {
+                crate::scalar_ops::norms::scalar_layer_norm as *const () as u64
+            } else {
+                crate::scalar_ops::norms::scalar_rms_norm as *const () as u64
+            };
 
             let row_bytes = (k * 4) as i32;
 
             self.asm.mov(rbx, qword_ptr(rbp + 32)).map_err(|e| e.to_string())?;
 
-            self.asm.sub(rsp, 16i32).map_err(|e| e.to_string())?;  // 16-byte aligned slot
+            // Allocate stack: [rsp+0]=C output, [rsp+8]=bias ptr (LayerNorm).
+            self.asm.sub(rsp, 32i32).map_err(|e| e.to_string())?;
             self.asm.mov(qword_ptr(rsp), r8).map_err(|e| e.to_string())?;  // save C output ptr
+            if is_layer_norm {
+                self.asm.mov(qword_ptr(rsp + 8), rcx).map_err(|e| e.to_string())?;  // save bias ptr
+            }
             self.asm.mov(r13, rdi).map_err(|e| e.to_string())?;  // A input base
             self.asm.mov(r14, rdx).map_err(|e| e.to_string())?;  // norm weight ptr
             self.asm.mov(r15, rsi).map_err(|e| e.to_string())?;  // B matrix ptr
@@ -571,10 +577,20 @@ pub mod jit {
             self.asm.mov(rax, r12).map_err(|e| e.to_string())?;
             self.asm.imul_3(rax, rax, row_bytes).map_err(|e| e.to_string())?;
 
-            self.asm.lea(rdi, qword_ptr(r13 + rax)).map_err(|e| e.to_string())?;
-            self.asm.mov(rsi, r14).map_err(|e| e.to_string())?;
-            self.asm.lea(rdx, qword_ptr(rbx + rax + norm_scratch_offset as i32)).map_err(|e| e.to_string())?;
-            self.asm.mov(rcx, k as u64).map_err(|e| e.to_string())?;
+            if is_layer_norm {
+                // scalar_layer_norm(x, weight, bias, out, n, eps)
+                self.asm.lea(rdi, qword_ptr(r13 + rax)).map_err(|e| e.to_string())?;
+                self.asm.mov(rsi, r14).map_err(|e| e.to_string())?;
+                self.asm.mov(rdx, qword_ptr(rsp + 8)).map_err(|e| e.to_string())?;  // bias
+                self.asm.lea(rcx, qword_ptr(rbx + rax + norm_scratch_offset as i32)).map_err(|e| e.to_string())?;  // out
+                self.asm.mov(r8, k as u64).map_err(|e| e.to_string())?;  // n
+            } else {
+                // scalar_rms_norm(x, weight, out, n, eps)
+                self.asm.lea(rdi, qword_ptr(r13 + rax)).map_err(|e| e.to_string())?;
+                self.asm.mov(rsi, r14).map_err(|e| e.to_string())?;
+                self.asm.lea(rdx, qword_ptr(rbx + rax + norm_scratch_offset as i32)).map_err(|e| e.to_string())?;
+                self.asm.mov(rcx, k as u64).map_err(|e| e.to_string())?;
+            }
 
             let eps_label = self.const_f32(eps);
             self.asm.movss(xmm0, dword_ptr(eps_label)).map_err(|e| e.to_string())?;
@@ -587,7 +603,7 @@ pub mod jit {
             self.asm.set_label(&mut row_done).map_err(|e| e.to_string())?;
 
             self.asm.mov(r8, qword_ptr(rsp)).map_err(|e| e.to_string())?;  // restore C output ptr
-            self.asm.add(rsp, 16i32).map_err(|e| e.to_string())?;
+            self.asm.add(rsp, 32i32).map_err(|e| e.to_string())?;
             self.asm.mov(rsi, r15).map_err(|e| e.to_string())?;  // restore B matrix ptr
             self.asm.lea(rdi, qword_ptr(rbx + norm_scratch_offset as i32)).map_err(|e| e.to_string())?;  // A = normalized data
 
@@ -634,11 +650,9 @@ pub mod jit {
             let gemm_op = graph.op(group.anchor)
                 .ok_or("TileLevelFusion: GEMM op not in graph")?;
 
-            let eps = match &norm_op.kind {
-                OpKind::RmsNorm { eps } => *eps,
-                OpKind::LayerNorm { eps: _ } => {
-                    return Err("TileLevelFusion: LayerNorm not yet supported".into());
-                }
+            let (eps, is_layer_norm) = match &norm_op.kind {
+                OpKind::RmsNorm { eps } => (*eps, false),
+                OpKind::LayerNorm { eps } => (*eps, true),
                 other => {
                     return Err(format!("TileLevelFusion: expected norm op, got {:?}", other));
                 }
@@ -681,25 +695,33 @@ pub mod jit {
                 + pack_a_bytes + pack_b_bytes - self.blis_base_offset;
             self.blis_scratchpad_bytes = self.blis_scratchpad_bytes.max(total_extra);
 
-            let norm_fn_ptr = crate::scalar_ops::norms::scalar_rms_norm as *const () as u64;
+            let norm_fn_ptr = if is_layer_norm {
+                crate::scalar_ops::norms::scalar_layer_norm as *const () as u64
+            } else {
+                crate::scalar_ops::norms::scalar_rms_norm as *const () as u64
+            };
             let pack_a_fn = crate::asm::x86_64::gemm_driver::gllm_pack_a_f32 as *const () as u64;
             let pack_b_fn = crate::asm::x86_64::gemm_driver::gllm_pack_b_f32 as *const () as u64;
 
             // Load scratchpad base.
             self.asm.mov(rbx, qword_ptr(rbp + 32)).map_err(|e| e.to_string())?;
 
-            // Allocate stack locals (48 bytes, 16-byte aligned):
+            // Allocate stack locals (64 bytes, 16-byte aligned):
             //   [rsp+0]  = nc_cur
             //   [rsp+8]  = kc_cur
             //   [rsp+16] = mc_cur
             //   [rsp+24] = ir (reused by inner loops)
             //   [rsp+32] = saved norm weight ptr (rdx)
             //   [rsp+40] = saved original A ptr (rdi)
-            self.asm.sub(rsp, 48i32).map_err(|e| e.to_string())?;
+            //   [rsp+48] = saved bias ptr (rcx, LayerNorm only)
+            self.asm.sub(rsp, 64i32).map_err(|e| e.to_string())?;
 
             // Save norm weight ptr and original A ptr -- clobbered by inner loops.
             self.asm.mov(qword_ptr(rsp + 32), rdx).map_err(|e| e.to_string())?;
             self.asm.mov(qword_ptr(rsp + 40), rdi).map_err(|e| e.to_string())?;
+            if is_layer_norm {
+                self.asm.mov(qword_ptr(rsp + 48), rcx).map_err(|e| e.to_string())?;  // save bias ptr
+            }
 
             let loc_nc: i32 = 0;
             let loc_kc: i32 = 8;
@@ -760,16 +782,29 @@ pub mod jit {
                 self.asm.mov(r9, rcx).map_err(|e| e.to_string())?;
                 self.asm.imul_3(r9, r9, row_bytes_k).map_err(|e| e.to_string())?;
 
-                // scalar_rms_norm(x, weight, out, n, eps)
+                // Norm call: set up args depending on norm type.
                 // +8 accounts for the push rcx above
                 let saved_a_off = 40 + Self::CALL_SAVE_SIZE + 8;
                 let saved_wt_off = 32 + Self::CALL_SAVE_SIZE + 8;
-                self.asm.mov(rdi, qword_ptr(rsp + saved_a_off)).map_err(|e| e.to_string())?;
-                self.asm.add(rdi, rax).map_err(|e| e.to_string())?;
-                self.asm.mov(rsi, qword_ptr(rsp + saved_wt_off)).map_err(|e| e.to_string())?;
-                self.asm.lea(rdx, qword_ptr(rbx + norm_scratch_off)).map_err(|e| e.to_string())?;
-                self.asm.add(rdx, r9).map_err(|e| e.to_string())?;
-                self.asm.mov(rcx, k as u64).map_err(|e| e.to_string())?;
+                if is_layer_norm {
+                    // scalar_layer_norm(x, weight, bias, out, n, eps)
+                    let saved_bias_off = 48 + Self::CALL_SAVE_SIZE + 8;
+                    self.asm.mov(rdi, qword_ptr(rsp + saved_a_off)).map_err(|e| e.to_string())?;
+                    self.asm.add(rdi, rax).map_err(|e| e.to_string())?;
+                    self.asm.mov(rsi, qword_ptr(rsp + saved_wt_off)).map_err(|e| e.to_string())?;
+                    self.asm.mov(rdx, qword_ptr(rsp + saved_bias_off)).map_err(|e| e.to_string())?;  // bias
+                    self.asm.lea(rcx, qword_ptr(rbx + norm_scratch_off)).map_err(|e| e.to_string())?;  // out
+                    self.asm.add(rcx, r9).map_err(|e| e.to_string())?;
+                    self.asm.mov(r8, k as u64).map_err(|e| e.to_string())?;  // n
+                } else {
+                    // scalar_rms_norm(x, weight, out, n, eps)
+                    self.asm.mov(rdi, qword_ptr(rsp + saved_a_off)).map_err(|e| e.to_string())?;
+                    self.asm.add(rdi, rax).map_err(|e| e.to_string())?;
+                    self.asm.mov(rsi, qword_ptr(rsp + saved_wt_off)).map_err(|e| e.to_string())?;
+                    self.asm.lea(rdx, qword_ptr(rbx + norm_scratch_off)).map_err(|e| e.to_string())?;
+                    self.asm.add(rdx, r9).map_err(|e| e.to_string())?;
+                    self.asm.mov(rcx, k as u64).map_err(|e| e.to_string())?;
+                }
 
                 let eps_label = self.const_f32(eps);
                 self.asm.movss(xmm0, dword_ptr(eps_label)).map_err(|e| e.to_string())?;
@@ -919,7 +954,7 @@ pub mod jit {
             self.asm.jmp(jc_loop).map_err(|e| e.to_string())?;
             self.asm.set_label(&mut jc_done).map_err(|e| e.to_string())?;
 
-            self.asm.add(rsp, 48i32).map_err(|e| e.to_string())?;
+            self.asm.add(rsp, 64i32).map_err(|e| e.to_string())?;
 
             Ok(())
         }
@@ -948,11 +983,9 @@ pub mod jit {
             let gemm_op = graph.op(group.anchor)
                 .ok_or("ComputeRoot: GEMM op not in graph")?;
 
-            let eps = match &norm_op.kind {
-                OpKind::RmsNorm { eps } => *eps,
-                OpKind::LayerNorm { eps: _ } => {
-                    return Err("ComputeRoot: LayerNorm not yet supported".into());
-                }
+            let (eps, is_layer_norm) = match &norm_op.kind {
+                OpKind::RmsNorm { eps } => (*eps, false),
+                OpKind::LayerNorm { eps } => (*eps, true),
                 other => {
                     return Err(format!("ComputeRoot: expected norm op, got {:?}", other));
                 }
@@ -973,20 +1006,28 @@ pub mod jit {
                 self.blis_scratchpad_offset - self.blis_base_offset
             );
 
-            let norm_fn_ptr = crate::scalar_ops::norms::scalar_rms_norm as *const () as u64;
+            let norm_fn_ptr = if is_layer_norm {
+                crate::scalar_ops::norms::scalar_layer_norm as *const () as u64
+            } else {
+                crate::scalar_ops::norms::scalar_rms_norm as *const () as u64
+            };
             let row_bytes = (k * 4) as i32;
 
             // Load scratchpad base into rbx.
             self.asm.mov(rbx, qword_ptr(rbp + 32)).map_err(|e| e.to_string())?;
 
             // Save registers that the norm loop clobbers.
-            self.asm.sub(rsp, 16i32).map_err(|e| e.to_string())?;
+            // [rsp+0]=C output, [rsp+8]=bias ptr (LayerNorm).
+            self.asm.sub(rsp, 32i32).map_err(|e| e.to_string())?;
             self.asm.mov(qword_ptr(rsp), r8).map_err(|e| e.to_string())?;   // save C output ptr
+            if is_layer_norm {
+                self.asm.mov(qword_ptr(rsp + 8), rcx).map_err(|e| e.to_string())?;  // save bias ptr
+            }
             self.asm.mov(r13, rdi).map_err(|e| e.to_string())?;  // A input base
             self.asm.mov(r14, rdx).map_err(|e| e.to_string())?;  // norm weight ptr
             self.asm.mov(r15, rsi).map_err(|e| e.to_string())?;  // B matrix ptr
 
-            // Row loop: call scalar_rms_norm for each row.
+            // Row loop: call norm function for each row.
             let mut row_loop = self.asm.create_label();
             let mut row_done = self.asm.create_label();
 
@@ -999,11 +1040,20 @@ pub mod jit {
             self.asm.mov(rax, r12).map_err(|e| e.to_string())?;
             self.asm.imul_3(rax, rax, row_bytes).map_err(|e| e.to_string())?;
 
-            // scalar_rms_norm(x, weight, out, n, eps)
-            self.asm.lea(rdi, qword_ptr(r13 + rax)).map_err(|e| e.to_string())?;
-            self.asm.mov(rsi, r14).map_err(|e| e.to_string())?;
-            self.asm.lea(rdx, qword_ptr(rbx + rax + norm_scratch_offset as i32)).map_err(|e| e.to_string())?;
-            self.asm.mov(rcx, k as u64).map_err(|e| e.to_string())?;
+            if is_layer_norm {
+                // scalar_layer_norm(x, weight, bias, out, n, eps)
+                self.asm.lea(rdi, qword_ptr(r13 + rax)).map_err(|e| e.to_string())?;
+                self.asm.mov(rsi, r14).map_err(|e| e.to_string())?;
+                self.asm.mov(rdx, qword_ptr(rsp + 8)).map_err(|e| e.to_string())?;  // bias
+                self.asm.lea(rcx, qword_ptr(rbx + rax + norm_scratch_offset as i32)).map_err(|e| e.to_string())?;  // out
+                self.asm.mov(r8, k as u64).map_err(|e| e.to_string())?;  // n
+            } else {
+                // scalar_rms_norm(x, weight, out, n, eps)
+                self.asm.lea(rdi, qword_ptr(r13 + rax)).map_err(|e| e.to_string())?;
+                self.asm.mov(rsi, r14).map_err(|e| e.to_string())?;
+                self.asm.lea(rdx, qword_ptr(rbx + rax + norm_scratch_offset as i32)).map_err(|e| e.to_string())?;
+                self.asm.mov(rcx, k as u64).map_err(|e| e.to_string())?;
+            }
 
             let eps_label = self.const_f32(eps);
             self.asm.movss(xmm0, dword_ptr(eps_label)).map_err(|e| e.to_string())?;
@@ -1017,7 +1067,7 @@ pub mod jit {
 
             // Restore registers and redirect A to the norm output buffer.
             self.asm.mov(r8, qword_ptr(rsp)).map_err(|e| e.to_string())?;   // restore C
-            self.asm.add(rsp, 16i32).map_err(|e| e.to_string())?;
+            self.asm.add(rsp, 32i32).map_err(|e| e.to_string())?;
             self.asm.mov(rsi, r15).map_err(|e| e.to_string())?;  // restore B
             self.asm.lea(rdi, qword_ptr(rbx + norm_scratch_offset as i32)).map_err(|e| e.to_string())?;  // A = norm output
 
@@ -5258,6 +5308,130 @@ mod e2e_tests {
 
         let tol = k as f32 * 1e-3;
         assert_matrix_close(&c_jit, &c_ref, m, n, tol, "NormIntoGemm-medium");
+    }
+
+    // ---- LayerNorm + GEMM fusion tests ----
+
+    fn build_layer_norm_gemm_graph(
+        m: usize, n: usize, k: usize, eps: f32,
+    ) -> (CompilerGraph, OpId, OpId) {
+        let mut g = CompilerGraph::new();
+        let a = g.add_tensor("A", vec![m, k], DType::F32);
+        let norm_w = g.add_tensor("norm_w", vec![k], DType::F32);
+        let norm_b = g.add_tensor("norm_b", vec![k], DType::F32);
+        let normed = g.add_tensor("normed", vec![m, k], DType::F32);
+        let b = g.add_tensor("B", vec![k, n], DType::F32);
+        let c = g.add_tensor("C", vec![m, n], DType::F32);
+        g.inputs = vec![a, b, norm_w, norm_b];
+        g.outputs = vec![c];
+        let norm_id = g.add_op(
+            OpKind::LayerNorm { eps }, vec![a, norm_w, norm_b], vec![normed], "layer_norm",
+        );
+        let gemm_id = g.add_op(
+            OpKind::Gemm { m, n, k }, vec![normed, b], vec![c], "gemm",
+        );
+        (g, norm_id, gemm_id)
+    }
+
+    /// Execute a compiled LayerNorm+GEMM kernel.
+    ///
+    /// ABI: rdi=A, rsi=B, rdx=norm_weight, rcx=norm_bias, r8=C, scratchpad on stack.
+    unsafe fn exec_layer_norm_gemm(
+        layer: &CompiledLayer,
+        a: &[f32],
+        b: &[f32],
+        norm_w: &[f32],
+        norm_b: &[f32],
+        c: &mut [f32],
+    ) {
+        let mut scratch = vec![0u8; layer.scratchpad_bytes];
+        let scratch_ptr = if layer.scratchpad_bytes > 0 {
+            scratch.as_mut_ptr()
+        } else {
+            std::ptr::null_mut()
+        };
+        let f = layer.entry_point();
+        f(
+            a.as_ptr() as *const u8,              // rdi = A input
+            b.as_ptr() as *const u8,              // rsi = B weight matrix
+            norm_w.as_ptr() as *mut u8,           // rdx = norm weight ptr
+            norm_b.as_ptr() as *const u32,         // rcx = norm bias ptr
+            c.as_mut_ptr() as *const usize,       // r8 = C output
+            0,                                    // r9 = batch_size (unused)
+            0,                                    // stack = seq_len (unused)
+            std::ptr::null_mut(),                 // stack = output (unused)
+            scratch_ptr,                          // stack = scratchpad
+        );
+    }
+
+    /// Reference: row-wise LayerNorm then matmul.
+    fn ref_layer_norm_gemm(
+        a: &[f32], b: &[f32], norm_w: &[f32], norm_b: &[f32], c: &mut [f32],
+        m: usize, n: usize, k: usize, eps: f32,
+    ) {
+        let mut normed = vec![0.0f32; m * k];
+        for row in 0..m {
+            let off = row * k;
+            // mean
+            let mut sum = 0.0f32;
+            for j in 0..k { sum += a[off + j]; }
+            let mean = sum / k as f32;
+            // variance
+            let mut var = 0.0f32;
+            for j in 0..k { var += (a[off + j] - mean) * (a[off + j] - mean); }
+            var /= k as f32;
+            let scale = 1.0 / (var + eps).sqrt();
+            for j in 0..k {
+                normed[off + j] = (a[off + j] - mean) * scale * norm_w[j] + norm_b[j];
+            }
+        }
+        ref_matmul(&normed, b, c, m, n, k);
+    }
+
+    #[test]
+    fn test_e2e_layer_norm_gemm_small() {
+        let (m, n, k) = (4, 8, 16);
+        let eps = 1e-5;
+        let (graph, norm_id, gemm_id) = build_layer_norm_gemm_graph(m, n, k, eps);
+        let plan = build_norm_gemm_plan(norm_id, gemm_id);
+        let alloc = build_alloc(m * n * 4);
+        let layer = compile(&graph, &plan, &alloc);
+
+        let a = fill_matrix(m, k, 42);
+        let b = fill_matrix(k, n, 137);
+        let norm_w: Vec<f32> = (0..k).map(|i| 0.8 + 0.4 * (i as f32) / k as f32).collect();
+        let norm_b: Vec<f32> = (0..k).map(|i| 0.1 * (i as f32) / k as f32).collect();
+        let mut c_jit = vec![0.0f32; m * n];
+        let mut c_ref = vec![0.0f32; m * n];
+
+        ref_layer_norm_gemm(&a, &b, &norm_w, &norm_b, &mut c_ref, m, n, k, eps);
+        unsafe { exec_layer_norm_gemm(&layer, &a, &b, &norm_w, &norm_b, &mut c_jit) };
+
+        let tol = k as f32 * 1e-3;
+        assert_matrix_close(&c_jit, &c_ref, m, n, tol, "LayerNormGemm-small");
+    }
+
+    #[test]
+    fn test_e2e_layer_norm_gemm_medium() {
+        let (m, n, k) = (32, 64, 128);
+        let eps = 1e-5;
+        let (graph, norm_id, gemm_id) = build_layer_norm_gemm_graph(m, n, k, eps);
+        let plan = build_norm_gemm_plan(norm_id, gemm_id);
+        let alloc = build_alloc(m * n * 4);
+        let layer = compile(&graph, &plan, &alloc);
+
+        let a = fill_matrix(m, k, 271828);
+        let b = fill_matrix(k, n, 314159);
+        let norm_w: Vec<f32> = (0..k).map(|i| 0.5 + 1.0 * (i as f32) / k as f32).collect();
+        let norm_b: Vec<f32> = (0..k).map(|i| -0.1 + 0.2 * (i as f32) / k as f32).collect();
+        let mut c_jit = vec![0.0f32; m * n];
+        let mut c_ref = vec![0.0f32; m * n];
+
+        ref_layer_norm_gemm(&a, &b, &norm_w, &norm_b, &mut c_ref, m, n, k, eps);
+        unsafe { exec_layer_norm_gemm(&layer, &a, &b, &norm_w, &norm_b, &mut c_jit) };
+
+        let tol = k as f32 * 1e-3;
+        assert_matrix_close(&c_jit, &c_ref, m, n, tol, "LayerNormGemm-medium");
     }
 
 }
