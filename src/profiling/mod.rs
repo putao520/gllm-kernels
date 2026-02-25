@@ -153,7 +153,11 @@ impl Profiler {
         }
 
         // Sort by elapsed time, pick median
-        all_metrics.sort_by(|a, b| a.elapsed_secs.partial_cmp(&b.elapsed_secs).unwrap());
+        all_metrics.sort_by(|a, b| {
+            a.elapsed_secs
+                .partial_cmp(&b.elapsed_secs)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
         let median = all_metrics[iterations / 2];
 
         // Collect HW counters from the median run (re-run once with counters)

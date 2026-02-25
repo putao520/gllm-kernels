@@ -478,7 +478,9 @@ impl<T> NumaAlignedVec<T> {
 
         // Apply NUMA binding if on a multi-node system
         if let Some(node) = self.node_id {
-            let _ = mbind_to_node(new_ptr as *mut u8, byte_size, node);
+            if let Err(e) = mbind_to_node(new_ptr as *mut u8, byte_size, node) {
+                eprintln!("[gllm-kernels] debug: NUMA mbind to node {node} failed: {e}");
+            }
         }
 
         // Copy existing data
@@ -546,7 +548,11 @@ pub fn node_pools() -> &'static Vec<rayon::ThreadPool> {
                 rayon::ThreadPoolBuilder::new()
                     .num_threads(cpus.len())
                     .start_handler(move |_thread_idx| {
-                        let _ = pin_to_node(node_id);
+                        if let Err(e) = pin_to_node(node_id) {
+                            eprintln!(
+                                "[gllm-kernels] debug: pin thread to NUMA node {node_id} failed: {e}"
+                            );
+                        }
                     })
                     .thread_name(move |idx| format!("numa{node_id}-worker{idx}"))
                     .build()
