@@ -395,7 +395,7 @@ pub mod jit {
             let blocking = profile.gemm_blocking(m, n, k);
             let mr = blocking.mr;
             let nr = blocking.nr;
-            let nr_vecs = nr / 8; // AVX2: 8 f32 per ymm
+            let nr_vecs = nr / self.simd_width;
             let kc = blocking.kc;
             let mc = tile_rows;
             let nc = blocking.nc;
@@ -587,7 +587,7 @@ pub mod jit {
             {
                 let m_rem = m % mr;
                 let n_rem = n % nr;
-                let simd_w = 8usize;
+                let simd_w = self.simd_width;
                 let n_rem_vecs = n_rem / simd_w;
 
                 let mut jr_loop = self.asm.create_label();
@@ -1242,11 +1242,19 @@ pub mod jit {
             let kc = blocking.kc;
             let mc = blocking.mc;
             let nc = blocking.nc;
-            let simd_w = 8usize; // AVX2: 8 f32 per ymm
+            let simd_w = self.simd_width; // 8 for AVX2, 16 for AVX-512
             let nr_vecs = nr / simd_w;
             let num_acc = mr * nr_vecs;
 
-            if num_acc + 1 > 13 {
+            if self.use_avx512 {
+                if num_acc + 2 > 32 {
+                    return Err(format!(
+                        "GEMM {}x{} microkernel needs {} accumulators + 2 scratch, \
+                         exceeds 32 zmm registers",
+                        mr, nr, num_acc
+                    ));
+                }
+            } else if num_acc + 1 > 13 {
                 return Err(format!(
                     "GEMM {}x{} microkernel needs {} accumulators + 1 scratch, \
                      exceeds 13 usable ymm (ymm13-15 reserved)",
@@ -1621,11 +1629,19 @@ pub mod jit {
             self.asm.test(r13, r13).map_err(|e| e.to_string())?;
             self.asm.jnz(not_first).map_err(|e| e.to_string())?;
 
-            self.emit_gemm_tile_packed(tile_mr, tile_nr_vecs, loc_kc, c_row_bytes, true, packed_mr, packed_nr, epilogue_bodies, k_total)?;
+            if self.use_avx512 {
+                self.emit_gemm_tile_packed_avx512(tile_mr, tile_nr_vecs, loc_kc, c_row_bytes, true, packed_mr, packed_nr, epilogue_bodies, k_total)?;
+            } else {
+                self.emit_gemm_tile_packed(tile_mr, tile_nr_vecs, loc_kc, c_row_bytes, true, packed_mr, packed_nr, epilogue_bodies, k_total)?;
+            }
             self.asm.jmp(tile_done).map_err(|e| e.to_string())?;
 
             self.asm.set_label(&mut not_first).map_err(|e| e.to_string())?;
-            self.emit_gemm_tile_packed(tile_mr, tile_nr_vecs, loc_kc, c_row_bytes, false, packed_mr, packed_nr, epilogue_bodies, k_total)?;
+            if self.use_avx512 {
+                self.emit_gemm_tile_packed_avx512(tile_mr, tile_nr_vecs, loc_kc, c_row_bytes, false, packed_mr, packed_nr, epilogue_bodies, k_total)?;
+            } else {
+                self.emit_gemm_tile_packed(tile_mr, tile_nr_vecs, loc_kc, c_row_bytes, false, packed_mr, packed_nr, epilogue_bodies, k_total)?;
+            }
 
             self.asm.set_label(&mut tile_done).map_err(|e| e.to_string())?;
             Ok(())
@@ -1752,7 +1768,11 @@ pub mod jit {
             self.asm.cmp(r13, m_limit as i32).map_err(|e| e.to_string())?;
             self.asm.jge(m_done).map_err(|e| e.to_string())?;
 
-            self.emit_gemm_tile(tile_mr, tile_nr_vecs, k, a_row_bytes, b_row_bytes, c_row_bytes, epilogue_bodies)?;
+            if self.use_avx512 {
+                self.emit_gemm_tile_avx512(tile_mr, tile_nr_vecs, k, a_row_bytes, b_row_bytes, c_row_bytes, epilogue_bodies)?;
+            } else {
+                self.emit_gemm_tile(tile_mr, tile_nr_vecs, k, a_row_bytes, b_row_bytes, c_row_bytes, epilogue_bodies)?;
+            }
 
             let mr_a_advance = (tile_mr as i32) * a_row_bytes;
             let mr_c_advance = (tile_mr as i32) * c_row_bytes;
@@ -1790,7 +1810,11 @@ pub mod jit {
                 self.asm.add(r10, (m_full as i32) * c_row_bytes).map_err(|e| e.to_string())?;
             }
 
-            self.emit_gemm_tile(rem_mr, tile_nr_vecs, k, a_row_bytes, b_row_bytes, c_row_bytes, epilogue_bodies)
+            if self.use_avx512 {
+                self.emit_gemm_tile_avx512(rem_mr, tile_nr_vecs, k, a_row_bytes, b_row_bytes, c_row_bytes, epilogue_bodies)
+            } else {
+                self.emit_gemm_tile(rem_mr, tile_nr_vecs, k, a_row_bytes, b_row_bytes, c_row_bytes, epilogue_bodies)
+            }
         }
 
         /// Emit a single MR×NR GEMM tile: zero accumulators, K-loop with
@@ -1901,6 +1925,121 @@ pub mod jit {
                     let c_disp = (ii as i32) * c_row_bytes + (v as i32) * 32;
                     self.asm.vmovups(
                         ymmword_ptr(r10 + c_disp),
+                        acc,
+                    ).map_err(|e| e.to_string())?;
+                }
+            }
+
+            Ok(())
+        }
+
+        /// AVX-512 version of `emit_gemm_tile`: single MR×NR tile using zmm registers.
+        ///
+        /// Same structure as the AVX2 version but uses zmm0-zmm27 as accumulators,
+        /// zmm28-zmm29 as A broadcast scratch, and 64-byte (zmmword) memory operands.
+        fn emit_gemm_tile_avx512(
+            &mut self,
+            tile_mr: usize,
+            tile_nr_vecs: usize,
+            k: usize,
+            a_row_bytes: i32,
+            b_row_bytes: i32,
+            c_row_bytes: i32,
+            epilogue_bodies: &[&[TraceOp]],
+        ) -> Result<(), String> {
+            let num_acc = tile_mr * tile_nr_vecs;
+            if num_acc + 2 > 32 {
+                return Err(format!(
+                    "AVX-512 GEMM tile {}x{} needs {} accumulators + 2 scratch, exceeds 32 zmm registers",
+                    tile_mr, tile_nr_vecs, num_acc
+                ));
+            }
+            let a_scratch_0 = Self::zmm_any(num_acc)?;
+            let a_scratch_1 = Self::zmm_any(num_acc + 1)?;
+
+            // Zero accumulators
+            for a in 0..num_acc {
+                let reg = Self::zmm_for_index(a)?;
+                self.asm.vxorps(reg, reg, reg).map_err(|e| e.to_string())?;
+            }
+
+            // K-loop
+            let mut k_loop = self.asm.create_label();
+            let mut k_done = self.asm.create_label();
+
+            self.asm.mov(r9, r11).map_err(|e| e.to_string())?;
+            self.asm.xor(r12, r12).map_err(|e| e.to_string())?;
+
+            self.asm.set_label(&mut k_loop).map_err(|e| e.to_string())?;
+            self.asm.cmp(r12, k as i32).map_err(|e| e.to_string())?;
+            self.asm.jge(k_done).map_err(|e| e.to_string())?;
+
+            // Prefetch next B row
+            self.asm.prefetcht0(byte_ptr(r9 + b_row_bytes)).map_err(|e| e.to_string())?;
+            if b_row_bytes > 64 {
+                self.asm.prefetcht0(byte_ptr(r9 + b_row_bytes + 64)).map_err(|e| e.to_string())?;
+            }
+
+            // Broadcast first A element
+            let a_disp_0 = 0i32;
+            self.asm.vbroadcastss(
+                a_scratch_0,
+                dword_ptr(r15 + r12 * 4 + a_disp_0),
+            ).map_err(|e| e.to_string())?;
+
+            // FMA for each row
+            for ii in 0..tile_mr {
+                let cur_scratch = if ii % 2 == 0 { a_scratch_0 } else { a_scratch_1 };
+                let nxt_scratch = if ii % 2 == 0 { a_scratch_1 } else { a_scratch_0 };
+
+                let acc0 = Self::zmm_for_index(ii * tile_nr_vecs)?;
+                self.asm.vfmadd231ps(
+                    acc0,
+                    cur_scratch,
+                    zmmword_ptr(r9),
+                ).map_err(|e| e.to_string())?;
+
+                // Pre-broadcast next A element
+                if ii + 1 < tile_mr {
+                    let a_disp_next = ((ii + 1) as i32) * a_row_bytes;
+                    self.asm.vbroadcastss(
+                        nxt_scratch,
+                        dword_ptr(r15 + r12 * 4 + a_disp_next),
+                    ).map_err(|e| e.to_string())?;
+                }
+
+                // Remaining NR vectors for this row
+                for v in 1..tile_nr_vecs {
+                    let acc = Self::zmm_for_index(ii * tile_nr_vecs + v)?;
+                    let b_disp = (v as i32) * 64; // 64 bytes per zmm
+                    self.asm.vfmadd231ps(
+                        acc,
+                        cur_scratch,
+                        zmmword_ptr(r9 + b_disp),
+                    ).map_err(|e| e.to_string())?;
+                }
+            }
+
+            self.asm.add(r9, b_row_bytes).map_err(|e| e.to_string())?;
+            self.asm.inc(r12).map_err(|e| e.to_string())?;
+            self.asm.jmp(k_loop).map_err(|e| e.to_string())?;
+
+            self.asm.set_label(&mut k_done).map_err(|e| e.to_string())?;
+
+            // Epilogue on accumulators (bias pointer setup + trace ops)
+            if self.bias_saved && !epilogue_bodies.is_empty() {
+                self.asm.mov(rax, qword_ptr(rbp - 48)).map_err(|e| e.to_string())?;
+                self.asm.lea(rax, qword_ptr(rax + r14 * 4)).map_err(|e| e.to_string())?;
+            }
+            self.emit_epilogue_on_accumulators_inner_avx512(epilogue_bodies, num_acc, tile_nr_vecs)?;
+
+            // Store accumulators to C
+            for ii in 0..tile_mr {
+                for v in 0..tile_nr_vecs {
+                    let acc = Self::zmm_for_index(ii * tile_nr_vecs + v)?;
+                    let c_disp = (ii as i32) * c_row_bytes + (v as i32) * 64;
+                    self.asm.vmovups(
+                        zmmword_ptr(r10 + c_disp),
                         acc,
                     ).map_err(|e| e.to_string())?;
                 }
@@ -2055,6 +2194,150 @@ pub mod jit {
                     let c_disp = (ii as i32) * c_row_bytes + (v as i32) * 32;
                     self.asm.vmovups(
                         ymmword_ptr(r10 + c_disp),
+                        acc,
+                    ).map_err(|e| e.to_string())?;
+                }
+            }
+
+            Ok(())
+        }
+
+        /// AVX-512 version of `emit_gemm_tile_packed`: packed A/B tile using zmm registers.
+        ///
+        /// Same structure as the AVX2 version but uses zmm0-zmm27 as accumulators,
+        /// zmm28-zmm29 as A broadcast scratch, and 64-byte (zmmword) memory operands.
+        fn emit_gemm_tile_packed_avx512(
+            &mut self,
+            tile_mr: usize,
+            tile_nr_vecs: usize,
+            loc_kc: i32,
+            c_row_bytes: i32,
+            first_kc_block: bool,
+            packed_mr: usize,
+            packed_nr: usize,
+            epilogue_bodies: &[&[TraceOp]],
+            k_total: usize,
+        ) -> Result<(), String> {
+            let num_acc = tile_mr * tile_nr_vecs;
+            if num_acc + 2 > 32 {
+                return Err(format!(
+                    "AVX-512 GEMM tile {}x{} needs {} accumulators + 2 scratch, exceeds 32 zmm registers",
+                    tile_mr, tile_nr_vecs, num_acc
+                ));
+            }
+            let a_scratch_0 = Self::zmm_any(num_acc)?;
+            let a_scratch_1 = Self::zmm_any(num_acc + 1)?;
+            let mr_stride_bytes = (packed_mr as i32) * 4;
+            let nr_stride_bytes = (packed_nr as i32) * 4;
+
+            // Init accumulators: zero or load from C
+            if first_kc_block {
+                for a in 0..num_acc {
+                    let reg = Self::zmm_for_index(a)?;
+                    self.asm.vxorps(reg, reg, reg).map_err(|e| e.to_string())?;
+                }
+            } else {
+                for ii in 0..tile_mr {
+                    for v in 0..tile_nr_vecs {
+                        let acc = Self::zmm_for_index(ii * tile_nr_vecs + v)?;
+                        let c_disp = (ii as i32) * c_row_bytes + (v as i32) * 64;
+                        self.asm.vmovups(acc, zmmword_ptr(r10 + c_disp))
+                            .map_err(|e| e.to_string())?;
+                    }
+                }
+            }
+
+            // K-loop over packed panels
+            let mut k_loop = self.asm.create_label();
+            let mut k_done = self.asm.create_label();
+
+            self.asm.mov(rdx, r11).map_err(|e| e.to_string())?;
+            self.asm.xor(rcx, rcx).map_err(|e| e.to_string())?;
+
+            self.asm.set_label(&mut k_loop).map_err(|e| e.to_string())?;
+            self.asm.cmp(rcx, qword_ptr(rsp + loc_kc)).map_err(|e| e.to_string())?;
+            self.asm.jge(k_done).map_err(|e| e.to_string())?;
+
+            // Prefetch
+            self.asm.prefetcht0(byte_ptr(r15 + mr_stride_bytes)).map_err(|e| e.to_string())?;
+            self.asm.prefetcht0(byte_ptr(rdx + nr_stride_bytes)).map_err(|e| e.to_string())?;
+            if nr_stride_bytes > 64 {
+                self.asm.prefetcht0(byte_ptr(rdx + nr_stride_bytes + 64)).map_err(|e| e.to_string())?;
+            }
+
+            // Broadcast first A element
+            self.asm.vbroadcastss(
+                a_scratch_0,
+                dword_ptr(r15),
+            ).map_err(|e| e.to_string())?;
+
+            // FMA for each row
+            for ii in 0..tile_mr {
+                let cur_scratch = if ii % 2 == 0 { a_scratch_0 } else { a_scratch_1 };
+                let nxt_scratch = if ii % 2 == 0 { a_scratch_1 } else { a_scratch_0 };
+
+                let acc0 = Self::zmm_for_index(ii * tile_nr_vecs)?;
+                self.asm.vfmadd231ps(
+                    acc0,
+                    cur_scratch,
+                    zmmword_ptr(rdx),
+                ).map_err(|e| e.to_string())?;
+
+                if ii + 1 < tile_mr {
+                    let a_disp_next = ((ii + 1) as i32) * 4;
+                    self.asm.vbroadcastss(
+                        nxt_scratch,
+                        dword_ptr(r15 + a_disp_next),
+                    ).map_err(|e| e.to_string())?;
+                }
+
+                for v in 1..tile_nr_vecs {
+                    let acc = Self::zmm_for_index(ii * tile_nr_vecs + v)?;
+                    let b_disp = (v as i32) * 64;
+                    self.asm.vfmadd231ps(
+                        acc,
+                        cur_scratch,
+                        zmmword_ptr(rdx + b_disp),
+                    ).map_err(|e| e.to_string())?;
+                }
+            }
+
+            self.asm.add(r15, mr_stride_bytes).map_err(|e| e.to_string())?;
+            self.asm.add(rdx, nr_stride_bytes).map_err(|e| e.to_string())?;
+            self.asm.inc(rcx).map_err(|e| e.to_string())?;
+            self.asm.jmp(k_loop).map_err(|e| e.to_string())?;
+
+            self.asm.set_label(&mut k_done).map_err(|e| e.to_string())?;
+
+            // Restore r15 (packed_a ptr) for next tile
+            self.asm.mov(rax, qword_ptr(rsp + loc_kc)).map_err(|e| e.to_string())?;
+            self.asm.imul_3(rax, rax, mr_stride_bytes).map_err(|e| e.to_string())?;
+            self.asm.sub(r15, rax).map_err(|e| e.to_string())?;
+
+            // Epilogue (only on final KC block)
+            if !epilogue_bodies.is_empty() {
+                let mut skip_epi = self.asm.create_label();
+                self.asm.mov(rax, r13).map_err(|e| e.to_string())?;
+                self.asm.add(rax, qword_ptr(rsp + loc_kc)).map_err(|e| e.to_string())?;
+                self.asm.cmp(rax, k_total as i32).map_err(|e| e.to_string())?;
+                self.asm.jl(skip_epi).map_err(|e| e.to_string())?;
+                if self.bias_saved {
+                    self.asm.mov(rax, qword_ptr(rbp - 48)).map_err(|e| e.to_string())?;
+                    self.asm.mov(rcx, r12).map_err(|e| e.to_string())?;
+                    self.asm.add(rcx, r9).map_err(|e| e.to_string())?;
+                    self.asm.lea(rax, qword_ptr(rax + rcx * 4)).map_err(|e| e.to_string())?;
+                }
+                self.emit_epilogue_on_accumulators_inner_avx512(epilogue_bodies, num_acc, tile_nr_vecs)?;
+                self.asm.set_label(&mut skip_epi).map_err(|e| e.to_string())?;
+            }
+
+            // Store accumulators to C
+            for ii in 0..tile_mr {
+                for v in 0..tile_nr_vecs {
+                    let acc = Self::zmm_for_index(ii * tile_nr_vecs + v)?;
+                    let c_disp = (ii as i32) * c_row_bytes + (v as i32) * 64;
+                    self.asm.vmovups(
+                        zmmword_ptr(r10 + c_disp),
                         acc,
                     ).map_err(|e| e.to_string())?;
                 }
@@ -2663,6 +2946,220 @@ pub mod jit {
             }
 
             self.asm.vmovups(acc, ymmword_ptr(rsp + slot_off((n - 1) as u32)))
+                .map_err(|e| e.to_string())?;
+
+            self.asm.add(rsp, frame_size).map_err(|e| e.to_string())?;
+
+            Ok(())
+        }
+
+        // ── AVX-512 epilogue on accumulators ──────────────────────────────
+
+        /// AVX-512 version of `emit_epilogue_on_accumulators_inner`.
+        ///
+        /// Applies epilogue TraceOp bodies to zmm0..zmm(num_acc-1).
+        /// Uses zmm29-31 as scratch. When `bias_saved` is true and a body
+        /// contains `Input(1)`, the bias base pointer is expected in `rax`.
+        fn emit_epilogue_on_accumulators_inner_avx512(
+            &mut self,
+            epilogue_bodies: &[&[TraceOp]],
+            num_acc: usize,
+            nr_vecs: usize,
+        ) -> Result<(), String> {
+            if epilogue_bodies.is_empty() || num_acc == 0 {
+                return Ok(());
+            }
+
+            let acc_count = num_acc.min(28); // zmm0-zmm27 max
+
+            for body in epilogue_bodies {
+                if body.is_empty() {
+                    continue;
+                }
+                let has_ext = body.iter().any(|op| matches!(op, TraceOp::Input(i) if *i > 0));
+                for a in 0..acc_count {
+                    let acc = Self::zmm_for_index(a)?;
+                    if has_ext && self.bias_saved {
+                        let v = a % nr_vecs;
+                        let bias_disp = (v as i32) * 64; // 64 bytes per zmm
+                        self.emit_trace_on_accumulator_with_bias_avx512(acc, body, bias_disp)?;
+                    } else {
+                        self.emit_trace_on_accumulator_avx512(acc, body)?;
+                    }
+                }
+            }
+
+            Ok(())
+        }
+
+        /// AVX-512 version of `emit_trace_on_accumulator_with_bias`.
+        ///
+        /// Same as `emit_trace_on_accumulator_avx512` but `Input(1)` loads
+        /// from `[rax + bias_disp]` using `vmovups zmm`.
+        fn emit_trace_on_accumulator_with_bias_avx512(
+            &mut self,
+            acc: AsmRegisterZmm,
+            body: &[TraceOp],
+            bias_disp: i32,
+        ) -> Result<(), String> {
+            let n = body.len();
+            if n == 0 {
+                return Ok(());
+            }
+
+            let frame_size = (n * 64) as i32;
+            self.asm.sub(rsp, frame_size).map_err(|e| e.to_string())?;
+
+            let slot_off = |i: u32| -> i32 { (i as i32) * 64 };
+
+            for (i, op) in body.iter().enumerate() {
+                let i32_idx = i as u32;
+                match op {
+                    TraceOp::Input(idx) => {
+                        if *idx == 0 {
+                            self.asm.vmovups(zmmword_ptr(rsp + slot_off(i32_idx)), acc)
+                                .map_err(|e| e.to_string())?;
+                        } else {
+                            // Input(1+): load from external tensor via rax + bias_disp
+                            self.asm.vmovups(zmm29, zmmword_ptr(rax + bias_disp))
+                                .map_err(|e| e.to_string())?;
+                            self.asm.vmovups(zmmword_ptr(rsp + slot_off(i32_idx)), zmm29)
+                                .map_err(|e| e.to_string())?;
+                        }
+                    }
+                    TraceOp::Const(v) => {
+                        let label = self.const_f32(*v as f32);
+                        self.asm.vbroadcastss(zmm29, dword_ptr(label))
+                            .map_err(|e| e.to_string())?;
+                        self.asm.vmovups(zmmword_ptr(rsp + slot_off(i32_idx)), zmm29)
+                            .map_err(|e| e.to_string())?;
+                    }
+                    TraceOp::Add(a, b) => {
+                        self.asm.vmovups(zmm29, zmmword_ptr(rsp + slot_off(*a)))
+                            .map_err(|e| e.to_string())?;
+                        self.asm.vaddps(zmm29, zmm29, zmmword_ptr(rsp + slot_off(*b)))
+                            .map_err(|e| e.to_string())?;
+                        self.asm.vmovups(zmmword_ptr(rsp + slot_off(i32_idx)), zmm29)
+                            .map_err(|e| e.to_string())?;
+                    }
+                    TraceOp::Sub(a, b) => {
+                        self.asm.vmovups(zmm29, zmmword_ptr(rsp + slot_off(*a)))
+                            .map_err(|e| e.to_string())?;
+                        self.asm.vsubps(zmm29, zmm29, zmmword_ptr(rsp + slot_off(*b)))
+                            .map_err(|e| e.to_string())?;
+                        self.asm.vmovups(zmmword_ptr(rsp + slot_off(i32_idx)), zmm29)
+                            .map_err(|e| e.to_string())?;
+                    }
+                    TraceOp::Mul(a, b) => {
+                        self.asm.vmovups(zmm29, zmmword_ptr(rsp + slot_off(*a)))
+                            .map_err(|e| e.to_string())?;
+                        self.asm.vmulps(zmm29, zmm29, zmmword_ptr(rsp + slot_off(*b)))
+                            .map_err(|e| e.to_string())?;
+                        self.asm.vmovups(zmmword_ptr(rsp + slot_off(i32_idx)), zmm29)
+                            .map_err(|e| e.to_string())?;
+                    }
+                    TraceOp::Div(a, b) => {
+                        self.asm.vmovups(zmm29, zmmword_ptr(rsp + slot_off(*a)))
+                            .map_err(|e| e.to_string())?;
+                        self.asm.vdivps(zmm29, zmm29, zmmword_ptr(rsp + slot_off(*b)))
+                            .map_err(|e| e.to_string())?;
+                        self.asm.vmovups(zmmword_ptr(rsp + slot_off(i32_idx)), zmm29)
+                            .map_err(|e| e.to_string())?;
+                    }
+                    TraceOp::Fma(a, b, c) => {
+                        self.asm.vmovups(zmm29, zmmword_ptr(rsp + slot_off(*c)))
+                            .map_err(|e| e.to_string())?;
+                        self.asm.vmovups(zmm30, zmmword_ptr(rsp + slot_off(*a)))
+                            .map_err(|e| e.to_string())?;
+                        self.asm.vfmadd231ps(zmm29, zmm30, zmmword_ptr(rsp + slot_off(*b)))
+                            .map_err(|e| e.to_string())?;
+                        self.asm.vmovups(zmmword_ptr(rsp + slot_off(i32_idx)), zmm29)
+                            .map_err(|e| e.to_string())?;
+                    }
+                    TraceOp::Neg(a) => {
+                        self.asm.vpxord(zmm29, zmm29, zmm29)
+                            .map_err(|e| e.to_string())?;
+                        self.asm.vsubps(zmm29, zmm29, zmmword_ptr(rsp + slot_off(*a)))
+                            .map_err(|e| e.to_string())?;
+                        self.asm.vmovups(zmmword_ptr(rsp + slot_off(i32_idx)), zmm29)
+                            .map_err(|e| e.to_string())?;
+                    }
+                    TraceOp::Abs(a) => {
+                        let abs_mask = self.const_f32(f32::from_bits(0x7FFF_FFFF));
+                        self.asm.vmovups(zmm29, zmmword_ptr(rsp + slot_off(*a)))
+                            .map_err(|e| e.to_string())?;
+                        self.asm.vbroadcastss(zmm30, dword_ptr(abs_mask))
+                            .map_err(|e| e.to_string())?;
+                        self.asm.vandps(zmm29, zmm29, zmm30)
+                            .map_err(|e| e.to_string())?;
+                        self.asm.vmovups(zmmword_ptr(rsp + slot_off(i32_idx)), zmm29)
+                            .map_err(|e| e.to_string())?;
+                    }
+                    TraceOp::Exp(a) => {
+                        self.asm.vmovups(zmm29, zmmword_ptr(rsp + slot_off(*a)))
+                            .map_err(|e| e.to_string())?;
+                        self.emit_exp_avx512(zmm30, zmm29, [zmm29, zmm31, acc])?;
+                        self.asm.vmovups(zmmword_ptr(rsp + slot_off(i32_idx)), zmm30)
+                            .map_err(|e| e.to_string())?;
+                    }
+                    TraceOp::Sqrt(a) => {
+                        self.asm.vmovups(zmm29, zmmword_ptr(rsp + slot_off(*a)))
+                            .map_err(|e| e.to_string())?;
+                        self.asm.vsqrtps(zmm29, zmm29)
+                            .map_err(|e| e.to_string())?;
+                        self.asm.vmovups(zmmword_ptr(rsp + slot_off(i32_idx)), zmm29)
+                            .map_err(|e| e.to_string())?;
+                    }
+                    TraceOp::Rsqrt(a) => {
+                        self.asm.vmovups(zmm29, zmmword_ptr(rsp + slot_off(*a)))
+                            .map_err(|e| e.to_string())?;
+                        self.asm.vrsqrt14ps(zmm29, zmm29)
+                            .map_err(|e| e.to_string())?;
+                        self.asm.vmovups(zmmword_ptr(rsp + slot_off(i32_idx)), zmm29)
+                            .map_err(|e| e.to_string())?;
+                    }
+                    TraceOp::Tanh(a) => {
+                        self.asm.vmovups(zmm29, zmmword_ptr(rsp + slot_off(*a)))
+                            .map_err(|e| e.to_string())?;
+                        self.emit_tanh_avx512(zmm30, zmm29, [zmm29, zmm31, acc])?;
+                        self.asm.vmovups(zmmword_ptr(rsp + slot_off(i32_idx)), zmm30)
+                            .map_err(|e| e.to_string())?;
+                    }
+                    TraceOp::Recip(a) => {
+                        self.asm.vmovups(zmm29, zmmword_ptr(rsp + slot_off(*a)))
+                            .map_err(|e| e.to_string())?;
+                        self.asm.vrcp14ps(zmm29, zmm29)
+                            .map_err(|e| e.to_string())?;
+                        self.asm.vmovups(zmmword_ptr(rsp + slot_off(i32_idx)), zmm29)
+                            .map_err(|e| e.to_string())?;
+                    }
+                    TraceOp::Max(a, b) => {
+                        self.asm.vmovups(zmm29, zmmword_ptr(rsp + slot_off(*a)))
+                            .map_err(|e| e.to_string())?;
+                        self.asm.vmaxps(zmm29, zmm29, zmmword_ptr(rsp + slot_off(*b)))
+                            .map_err(|e| e.to_string())?;
+                        self.asm.vmovups(zmmword_ptr(rsp + slot_off(i32_idx)), zmm29)
+                            .map_err(|e| e.to_string())?;
+                    }
+                    TraceOp::Min(a, b) => {
+                        self.asm.vmovups(zmm29, zmmword_ptr(rsp + slot_off(*a)))
+                            .map_err(|e| e.to_string())?;
+                        self.asm.vminps(zmm29, zmm29, zmmword_ptr(rsp + slot_off(*b)))
+                            .map_err(|e| e.to_string())?;
+                        self.asm.vmovups(zmmword_ptr(rsp + slot_off(i32_idx)), zmm29)
+                            .map_err(|e| e.to_string())?;
+                    }
+                    TraceOp::Log(a) => {
+                        // Placeholder: copy input (real: polynomial approximation)
+                        self.asm.vmovups(zmm29, zmmword_ptr(rsp + slot_off(*a)))
+                            .map_err(|e| e.to_string())?;
+                        self.asm.vmovups(zmmword_ptr(rsp + slot_off(i32_idx)), zmm29)
+                            .map_err(|e| e.to_string())?;
+                    }
+                }
+            }
+
+            self.asm.vmovups(acc, zmmword_ptr(rsp + slot_off((n - 1) as u32)))
                 .map_err(|e| e.to_string())?;
 
             self.asm.add(rsp, frame_size).map_err(|e| e.to_string())?;
