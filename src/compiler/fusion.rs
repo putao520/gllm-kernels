@@ -18,6 +18,8 @@ use crate::compiler::graph::{CompilerGraph, CompilerOp, OpKind, OpId, TensorId};
 use crate::compiler::semantics::{self, OpSemantics};
 use crate::compiler::semantic_dag::{SemanticDAG, OpClass};
 use crate::compiler::registry::ScalarOpRegistry;
+use crate::compiler::trace::{OpTrace, TraceOp, ComputePattern, ScalarParam};
+use crate::dispatch::DeviceProfile;
 
 /// A group of fused operations that will be compiled as a single unit.
 #[derive(Debug, Clone)]
@@ -210,6 +212,183 @@ pub fn estimate_fusion_cost(
         scratch_bytes,
         benefit,
     }
+}
+
+// ── Roofline cost model ─────────────────────────────────────────────
+
+/// Per-operator roofline cost estimate.
+///
+/// Classifies an operator as compute-bound or memory-bound by comparing
+/// estimated compute cycles against memory cycles. Used by the fusion pass
+/// to quantify the benefit of eliminating intermediate memory traffic.
+#[derive(Debug, Clone)]
+pub struct Cost {
+    /// Total floating-point operations (per invocation, across all elements).
+    pub flops: u64,
+    /// Total memory traffic in bytes (all inputs + outputs).
+    pub bytes: u64,
+    /// Estimated time spent on compute (flops / peak_gflops, in nanoseconds).
+    pub compute_cycles: f64,
+    /// Estimated time spent on memory (bytes / peak_bandwidth, in nanoseconds).
+    pub memory_cycles: f64,
+}
+
+/// FLOP cost for a single TraceOp.
+///
+/// Simple arithmetic = 1 FLOP, FMA = 2, transcendentals = polynomial
+/// approximation cost (Exp/Log ~10, Tanh ~12).
+fn trace_op_flops(op: &TraceOp) -> u64 {
+    match op {
+        TraceOp::Input(_) | TraceOp::Const(_) => 0,
+        TraceOp::Add(..) | TraceOp::Sub(..) | TraceOp::Mul(..) | TraceOp::Div(..) => 1,
+        TraceOp::Neg(..) | TraceOp::Abs(..) | TraceOp::Recip(..) => 1,
+        TraceOp::Fma(..) => 2,
+        TraceOp::Sqrt(..) | TraceOp::Rsqrt(..) => 2,
+        TraceOp::Max(..) | TraceOp::Min(..) => 1,
+        TraceOp::Exp(..) | TraceOp::Log(..) => 10,
+        TraceOp::Tanh(..) => 12,
+    }
+}
+
+/// Count per-element FLOPs from a ComputePattern's body.
+fn pattern_per_element_flops(pattern: &ComputePattern) -> u64 {
+    match pattern {
+        ComputePattern::Gemm => 0, // GEMM flops come from M*N*K, handled separately
+        ComputePattern::Elementwise { body }
+        | ComputePattern::BinaryElementwise { body }
+        | ComputePattern::Injective { body, .. }
+        | ComputePattern::QuantDecode { decode: body, .. } => {
+            body.iter().map(|op| trace_op_flops(op)).sum()
+        }
+        ComputePattern::NormLike { reduce, finalize, transform } => {
+            // reduce and transform run per-element; finalize runs once (amortized to ~0)
+            let r: u64 = reduce.iter().map(|op| trace_op_flops(op)).sum();
+            let t: u64 = transform.iter().map(|op| trace_op_flops(op)).sum();
+            let f: u64 = finalize.iter().map(|op| trace_op_flops(op)).sum();
+            r + t + f
+        }
+        ComputePattern::Reduction { combine, .. } => {
+            combine.iter().map(|op| trace_op_flops(op)).sum()
+        }
+    }
+}
+
+/// Extract (max_dim, num_input_ptrs, num_output_ptrs) from a scalar function signature.
+fn parse_signature(sig: &crate::compiler::trace::ScalarFnSignature) -> (u64, u64, u64) {
+    let mut inputs = 0u64;
+    let mut outputs = 0u64;
+    let mut dims = Vec::new();
+    for p in &sig.params {
+        match p {
+            ScalarParam::InputPtr | ScalarParam::WeightPtr => inputs += 1,
+            ScalarParam::OutputPtr => outputs += 1,
+            ScalarParam::Dim(d) => dims.push(*d as u64),
+            ScalarParam::Scalar(_) => {}
+        }
+    }
+    let max_dim = dims.iter().copied().max().unwrap_or(0);
+    (max_dim, inputs, outputs)
+}
+
+impl Cost {
+    /// Compute roofline cost for a single operator from its OpTrace.
+    ///
+    /// For elementwise/norm/reduction patterns, FLOPs are counted from the
+    /// TraceOp body and scaled by the dimension from the signature.
+    /// For GEMM, FLOPs = 2*M*N*K derived from the signature's Dim params.
+    /// Memory bytes = (input_ptrs + output_ptrs) * dim * sizeof(f32).
+    pub fn compute(trace: &OpTrace, profile: &DeviceProfile) -> Self {
+        let (max_dim, input_ptrs, output_ptrs) = parse_signature(&trace.signature);
+
+        let (flops, bytes) = if matches!(trace.pattern, ComputePattern::Gemm) {
+            // GEMM: extract M, N, K from Dim params → flops = 2*M*N*K
+            let dims: Vec<u64> = trace.signature.params.iter().filter_map(|p| {
+                if let ScalarParam::Dim(d) = p { Some(*d as u64) } else { None }
+            }).collect();
+            let (m, n, k) = if dims.len() >= 3 {
+                (dims[0], dims[1], dims[2])
+            } else {
+                (max_dim, max_dim, max_dim)
+            };
+            let flops = 2 * m * n * k;
+            // A(M×K) + B(K×N) + C(M×N), all f32
+            let bytes = (m * k + k * n + m * n) * 4;
+            (flops, bytes)
+        } else {
+            let per_elem = pattern_per_element_flops(&trace.pattern);
+            let flops = per_elem * max_dim;
+            let bytes = (input_ptrs + output_ptrs) * max_dim * 4;
+            (flops, bytes)
+        };
+
+        // Convert to nanoseconds:
+        //   peak_gflops_f32 is in GFLOP/s = 1e9 FLOP/s
+        //   peak_bandwidth_gbs is in GB/s = 1e9 B/s
+        //   compute_ns = flops / (peak_gflops * 1e9) * 1e9 = flops / peak_gflops
+        //   memory_ns  = bytes / (peak_bw * 1e9) * 1e9     = bytes / peak_bw
+        let compute_cycles = if profile.peak_gflops_f32 > 0.0 {
+            flops as f64 / profile.peak_gflops_f32
+        } else {
+            0.0
+        };
+        let memory_cycles = if profile.peak_bandwidth_gbs > 0.0 {
+            bytes as f64 / profile.peak_bandwidth_gbs
+        } else {
+            0.0
+        };
+
+        Cost { flops, bytes, compute_cycles, memory_cycles }
+    }
+
+    /// Compute the memory-cycle savings from eliminating intermediate traffic.
+    ///
+    /// Returns saved nanoseconds (as integer) from not writing + reading back
+    /// `eliminated_bytes` of intermediate data.
+    pub fn fusion_benefit(eliminated_bytes: usize, profile: &DeviceProfile) -> u64 {
+        if profile.peak_bandwidth_gbs > 0.0 {
+            (eliminated_bytes as f64 / profile.peak_bandwidth_gbs) as u64
+        } else {
+            0
+        }
+    }
+
+    /// True if this operator is compute-bound (compute time > memory time).
+    ///
+    /// Equivalently, arithmetic intensity > roofline ridge point.
+    #[inline]
+    pub fn is_compute_bound(&self) -> bool {
+        self.compute_cycles > self.memory_cycles
+    }
+}
+
+/// Compute eliminated bytes for a candidate elementwise chain fusion.
+///
+/// Each intermediate tensor between adjacent ops in the chain is written then
+/// read back — fusion eliminates both accesses (2× tensor size).
+fn chain_eliminated_bytes(graph: &CompilerGraph, anchor: &CompilerOp, chain: &[&CompilerOp]) -> usize {
+    if chain.is_empty() {
+        return 0;
+    }
+    let mut eliminated = 0usize;
+    // anchor's output → chain[0]: eliminated
+    for &out_tid in &anchor.outputs {
+        if let Some(t) = graph.tensor(out_tid) {
+            if t.consumers.len() == 1 {
+                eliminated += t.shape.iter().product::<usize>() * t.dtype.size_bytes() * 2;
+            }
+        }
+    }
+    // Each chain op's output (except the last) → next chain op: eliminated
+    for i in 0..chain.len().saturating_sub(1) {
+        for &out_tid in &chain[i].outputs {
+            if let Some(t) = graph.tensor(out_tid) {
+                if t.consumers.len() == 1 {
+                    eliminated += t.shape.iter().product::<usize>() * t.dtype.size_bytes() * 2;
+                }
+            }
+        }
+    }
+    eliminated
 }
 
 /// Run the fusion pass on a CompilerGraph.
@@ -715,9 +894,20 @@ pub fn fuse_with_dag_prebuilt(graph: &CompilerGraph, dag: &SemanticDAG, profile:
             OpClass::ElemWise | OpClass::Injective => {
                 // Try to chain with downstream elementwise/injective ops
                 let chain = collect_elementwise_chain_dag(graph, op, &claimed, &dag);
+                // Cost-based filter: only fuse if eliminating intermediates saves cycles
+                let accepted_chain: Vec<OpId> = if chain.is_empty() {
+                    Vec::new()
+                } else {
+                    let eliminated = chain_eliminated_bytes(graph, op, &chain);
+                    if Cost::fusion_benefit(eliminated, profile) > 0 {
+                        chain.iter().map(|o| o.id).collect()
+                    } else {
+                        Vec::new()
+                    }
+                };
+
                 let mut all_ops = vec![op_id];
-                let chain_ids: Vec<OpId> = chain.iter().map(|o| o.id).collect();
-                all_ops.extend_from_slice(&chain_ids);
+                all_ops.extend_from_slice(&accepted_chain);
 
                 // Split chain by L1 budget to avoid thrashing
                 let sub_chains = split_elementwise_by_l1(graph, &all_ops, profile);
@@ -1867,5 +2057,158 @@ mod tests {
         for op in &g.ops {
             assert!(plan.op_to_group.contains_key(&op.id), "Op {} not in any group", op.id.0);
         }
+    }
+
+    // ── Roofline Cost model tests ──────────────────────────────────────
+
+    #[test]
+    fn test_cost_compute_bound() {
+        // GEMM is compute-bound: 2*M*N*K FLOPs with relatively small memory footprint
+        use crate::compiler::trace::{OpTrace, ComputePattern, ScalarFnSignature, ScalarParam};
+        use crate::compiler::graph::OpKind;
+
+        let profile = DeviceProfile::detect();
+        let trace = OpTrace {
+            op_kind: OpKind::Gemm { m: 1024, n: 1024, k: 1024 },
+            pattern: ComputePattern::Gemm,
+            signature: ScalarFnSignature {
+                fn_ptr: std::ptr::null(),
+                params: vec![
+                    ScalarParam::InputPtr,   // A
+                    ScalarParam::InputPtr,   // B
+                    ScalarParam::OutputPtr,  // C
+                    ScalarParam::Dim(1024),  // M
+                    ScalarParam::Dim(1024),  // N
+                    ScalarParam::Dim(1024),  // K
+                ],
+            },
+        };
+
+        let cost = Cost::compute(&trace, &profile);
+        assert!(cost.is_compute_bound(),
+            "GEMM 1024x1024x1024 should be compute-bound: compute_cycles={:.1} > memory_cycles={:.1}",
+            cost.compute_cycles, cost.memory_cycles);
+        // 2 * 1024^3 = 2,147,483,648 FLOPs
+        assert_eq!(cost.flops, 2 * 1024 * 1024 * 1024);
+        // A(1024*1024) + B(1024*1024) + C(1024*1024) = 3*1024*1024 f32 = 12 MiB
+        assert_eq!(cost.bytes, 3 * 1024 * 1024 * 4);
+        eprintln!("GEMM cost: flops={}, bytes={}, compute_ns={:.1}, memory_ns={:.1}, compute_bound={}",
+            cost.flops, cost.bytes, cost.compute_cycles, cost.memory_cycles, cost.is_compute_bound());
+    }
+
+    #[test]
+    fn test_cost_memory_bound() {
+        // SiLU is memory-bound: ~13 FLOPs per element, 2 memory accesses (read + write)
+        use crate::compiler::trace::{OpTrace, ComputePattern, ScalarFnSignature, ScalarParam, TraceOp};
+        use crate::compiler::graph::OpKind;
+
+        let profile = DeviceProfile::detect();
+        let body = vec![
+            TraceOp::Input(0),   // [0] v
+            TraceOp::Neg(0),     // [1] -v
+            TraceOp::Exp(1),     // [2] exp(-v)
+            TraceOp::Const(1.0), // [3] 1.0
+            TraceOp::Add(2, 3),  // [4] 1 + exp(-v)
+            TraceOp::Div(0, 4),  // [5] v / (1 + exp(-v))
+        ];
+        let trace = OpTrace {
+            op_kind: OpKind::Silu,
+            pattern: ComputePattern::Elementwise { body },
+            signature: ScalarFnSignature {
+                fn_ptr: std::ptr::null(),
+                params: vec![
+                    ScalarParam::InputPtr,
+                    ScalarParam::OutputPtr,
+                    ScalarParam::Dim(4096),
+                ],
+            },
+        };
+
+        let cost = Cost::compute(&trace, &profile);
+        assert!(!cost.is_compute_bound(),
+            "SiLU on 4096 elements should be memory-bound: compute_cycles={:.1} <= memory_cycles={:.1}",
+            cost.compute_cycles, cost.memory_cycles);
+        // Per-element: Neg(1) + Exp(10) + Add(1) + Div(1) = 13 FLOPs
+        assert_eq!(cost.flops, 13 * 4096);
+        // 1 input + 1 output = 2 * 4096 * 4 = 32768 bytes
+        assert_eq!(cost.bytes, 2 * 4096 * 4);
+        eprintln!("SiLU cost: flops={}, bytes={}, compute_ns={:.1}, memory_ns={:.1}, compute_bound={}",
+            cost.flops, cost.bytes, cost.compute_cycles, cost.memory_cycles, cost.is_compute_bound());
+    }
+
+    #[test]
+    fn test_fusion_benefit() {
+        let profile = DeviceProfile::detect();
+
+        // Fusing two elementwise ops on a 4096-element f32 tensor eliminates
+        // one intermediate write + read = 2 * 4096 * 4 = 32768 bytes
+        let eliminated = 2 * 4096 * 4;
+        let benefit = Cost::fusion_benefit(eliminated, &profile);
+        assert!(benefit > 0,
+            "Eliminating {} bytes should yield positive benefit, got {}",
+            eliminated, benefit);
+
+        // Larger tensors yield proportionally larger benefit
+        let eliminated_large = 2 * 4096 * 4096 * 4;
+        let benefit_large = Cost::fusion_benefit(eliminated_large, &profile);
+        assert!(benefit_large > benefit,
+            "Larger elimination ({} bytes) should yield larger benefit ({}) than smaller ({} bytes, {})",
+            eliminated_large, benefit_large, eliminated, benefit);
+
+        // Zero eliminated bytes → zero benefit
+        assert_eq!(Cost::fusion_benefit(0, &profile), 0);
+
+        eprintln!("Fusion benefit: {}B → {} ns, {}B → {} ns",
+            eliminated, benefit, eliminated_large, benefit_large);
+    }
+
+    #[test]
+    fn test_cost_chain_eliminated_bytes() {
+        // Build: SiLU → SiLU → SiLU chain, verify eliminated bytes
+        let dt = DType::F32;
+        let mut g = CompilerGraph::new();
+        let a = g.add_tensor("a", vec![1, 4096], dt);
+        let b = g.add_tensor("b", vec![1, 4096], dt);
+        let c = g.add_tensor("c", vec![1, 4096], dt);
+        let d = g.add_tensor("d", vec![1, 4096], dt);
+
+        g.add_op(OpKind::Silu, vec![a], vec![b], "silu1");
+        g.add_op(OpKind::Silu, vec![b], vec![c], "silu2");
+        g.add_op(OpKind::Silu, vec![c], vec![d], "silu3");
+
+        let anchor = g.op(OpId(0)).unwrap();
+        let chain: Vec<&CompilerOp> = vec![
+            g.op(OpId(1)).unwrap(),
+            g.op(OpId(2)).unwrap(),
+        ];
+
+        let eliminated = chain_eliminated_bytes(&g, anchor, &chain);
+        // b is intermediate (silu1→silu2): 4096 * 4 * 2 = 32768
+        // c is intermediate (silu2→silu3): 4096 * 4 * 2 = 32768
+        // Total = 65536
+        assert_eq!(eliminated, 2 * 4096 * 4 * 2,
+            "Expected 2 intermediates eliminated, got {} bytes", eliminated);
+    }
+
+    #[test]
+    fn test_cost_dag_fusion_uses_cost_filter() {
+        // Verify that the DAG-based fusion path applies cost filtering
+        // (a valid chain should still fuse because benefit > 0)
+        let dt = DType::F32;
+        let mut g = CompilerGraph::new();
+        let a = g.add_tensor("a", vec![1, 4096], dt);
+        let b = g.add_tensor("b", vec![1, 4096], dt);
+        let c = g.add_tensor("c", vec![1, 4096], dt);
+
+        g.add_op(OpKind::Silu, vec![a], vec![b], "silu1");
+        g.add_op(OpKind::Silu, vec![b], vec![c], "silu2");
+
+        let registry = crate::compiler::registry::ScalarOpRegistry::with_defaults();
+        let profile = DeviceProfile::detect();
+        let plan = fuse_with_dag(&g, &registry, &profile);
+
+        // Chain should still fuse (benefit > 0 for 4096-element intermediate)
+        assert_eq!(plan.num_groups(), 1);
+        assert_eq!(plan.groups[0].mode, FusionMode::LoopFusion);
     }
 }
