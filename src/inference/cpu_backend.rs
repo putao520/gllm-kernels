@@ -294,15 +294,24 @@ impl InferenceBackend for CpuInferenceBackend {
             self.kernels.vec_add(&residual, &down, &mut hidden);
         }
 
-        // TODO: Apply weights.final_norm (RMSNorm) and weights.lm_head (linear projection)
-        // to produce logits. Currently outputs raw hidden state from the last decoder layer.
+        // 10. Final RMSNorm
+        let final_norm_w: &[f32] = unsafe { weights.final_norm.as_slice() };
+        let mut final_normed = vec![0.0f32; h];
+        self.kernels.rms_norm(&hidden, final_norm_w, &mut final_normed, self.config.norm_eps);
 
-        // Copy to output
+        // 11. LM head projection (hidden_size -> vocab_size)
+        let lm_head_w: &[f32] = unsafe { weights.lm_head.as_slice() };
+        let vocab = self.config.vocab_size;
+        let mut logits = vec![0.0f32; vocab];
+        self.kernels.gemm(&final_normed, lm_head_w, &mut logits, 1, vocab, h);
+
+        // Copy logits to output
+        let out_elems = output.num_elements().min(vocab);
         unsafe {
             std::ptr::copy_nonoverlapping(
-                hidden.as_ptr() as *const u8,
+                logits.as_ptr() as *const u8,
                 output.as_mut_ptr() as *mut u8,
-                h * 4,
+                out_elems * 4,
             );
         }
 
@@ -1216,6 +1225,18 @@ mod tests {
             copy(&mut lw.w_gate, &wg_data);
             copy(&mut lw.w_up, &wu_data);
             copy(&mut lw.w_down, &wd_data);
+            copy(&mut weights.final_norm, &norm_w);
+        }
+        let lm_head_data = weight_pattern(h * cfg.vocab_size, 700);
+        unsafe {
+            let copy = |dst: &mut DeviceTensor, src: &[f32]| {
+                std::ptr::copy_nonoverlapping(
+                    src.as_ptr() as *const u8,
+                    dst.as_mut_ptr(),
+                    src.len() * 4,
+                );
+            };
+            copy(&mut weights.lm_head, &lm_head_data);
         }
 
         // Input vector
@@ -1226,7 +1247,7 @@ mod tests {
         let positions_data = vec![0.0f32; 1];
         let positions = unsafe { DeviceTensor::from_slice(&positions_data) };
         let mut kv_cache = backend.alloc_kv_cache(1, cfg.max_seq_len).unwrap();
-        let mut output = backend.alloc(h, DType::F32).unwrap();
+        let mut output = backend.alloc(cfg.vocab_size, DType::F32).unwrap();
 
         // Run the kernel path
         backend
@@ -1303,7 +1324,13 @@ mod tests {
         let down = ref_matmul(&gate_up, &wd_data, h, inter);
 
         // Step 10: Second residual connection
-        let expected = ref_add(&hidden, &down);
+        let hidden_final = ref_add(&hidden, &down);
+
+        // Step 11: Final RMSNorm
+        let final_normed = ref_rms_norm(&hidden_final, &norm_w, cfg.norm_eps);
+
+        // Step 12: LM head projection (hidden_size -> vocab_size)
+        let expected = ref_matmul(&final_normed, &lm_head_data, cfg.vocab_size, h);
 
         // ---- Compare kernel output vs reference ----
         let max_rel_err = kernel_out

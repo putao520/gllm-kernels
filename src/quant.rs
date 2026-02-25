@@ -101,7 +101,6 @@ pub struct BlockQ8K {
     pub bsums: [i16; 16],
 }
 
-// PLACEHOLDER_IQ_BLOCKS
 
 // ==========================================================================
 // IQ Block Structures (importance-matrix quantization, matching llama.cpp)
@@ -153,7 +152,6 @@ pub struct BlockIQ2S {
     pub scales: [u8; QK_K / 32],
 }
 
-// PLACEHOLDER_IQ_BLOCKS_2
 
 /// IQ3_XXS: 3-bit importance quantization (extra extra small).
 #[repr(C)]
