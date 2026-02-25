@@ -40,6 +40,74 @@ pub type GllmKvCache = *mut std::ffi::c_void;
 /// Opaque handle to model weights.
 pub type GllmWeights = *mut std::ffi::c_void;
 
+/// Weight field identifiers for `gllm_weights_get_ptr`.
+///
+/// Fields 0..2 are global (layer_idx ignored).
+/// Fields 10..21 are per-layer (require valid layer_idx).
+#[repr(i32)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GllmWeightField {
+    /// Token embedding: [vocab_size, hidden_size]
+    Embedding = 0,
+    /// Final norm weight: [hidden_size]
+    FinalNorm = 1,
+    /// LM head: [hidden_size, vocab_size]
+    LmHead = 2,
+    /// Attention norm weight: [hidden_size]
+    AttnNorm = 10,
+    /// Q projection: [hidden_size, num_heads * head_dim]
+    Wq = 11,
+    /// K projection: [hidden_size, num_kv_heads * head_dim]
+    Wk = 12,
+    /// V projection: [hidden_size, num_kv_heads * head_dim]
+    Wv = 13,
+    /// Output projection: [num_heads * head_dim, hidden_size]
+    Wo = 14,
+    /// FFN norm weight: [hidden_size]
+    FfnNorm = 15,
+    /// FFN gate projection: [hidden_size, intermediate_size]
+    WGate = 16,
+    /// FFN up projection: [hidden_size, intermediate_size]
+    WUp = 17,
+    /// FFN down projection: [intermediate_size, hidden_size]
+    WDown = 18,
+    /// QKV bias: [q_dim + 2*kv_dim] (optional, may be absent)
+    QkvBias = 19,
+    /// Attention norm bias: [hidden_size] (LayerNorm models only)
+    AttnNormBias = 20,
+    /// FFN norm bias: [hidden_size] (LayerNorm models only)
+    FfnNormBias = 21,
+}
+
+impl GllmWeightField {
+    /// Convert from raw i32. Returns None for unknown values.
+    pub fn from_i32(v: i32) -> Option<Self> {
+        match v {
+            0 => Some(Self::Embedding),
+            1 => Some(Self::FinalNorm),
+            2 => Some(Self::LmHead),
+            10 => Some(Self::AttnNorm),
+            11 => Some(Self::Wq),
+            12 => Some(Self::Wk),
+            13 => Some(Self::Wv),
+            14 => Some(Self::Wo),
+            15 => Some(Self::FfnNorm),
+            16 => Some(Self::WGate),
+            17 => Some(Self::WUp),
+            18 => Some(Self::WDown),
+            19 => Some(Self::QkvBias),
+            20 => Some(Self::AttnNormBias),
+            21 => Some(Self::FfnNormBias),
+            _ => None,
+        }
+    }
+
+    /// Whether this field is global (not per-layer).
+    pub fn is_global(self) -> bool {
+        (self as i32) < 10
+    }
+}
+
 /// Model configuration passed from C.
 #[repr(C)]
 #[derive(Debug, Clone)]
@@ -59,7 +127,6 @@ pub struct GllmModelConfig {
     pub quant_type: i32,     // -1=None, 0=Q4_0, 1=Q4_1, 2=Q8_0
     pub has_qkv_bias: i32,   // 0=false, 1=true
     pub partial_rotary_factor: f32, // 0.0..=1.0
-    pub sliding_window: i32,  // 0=disabled, >0=window size
 }
 
 impl GllmModelConfig {
@@ -109,7 +176,7 @@ impl GllmModelConfig {
             rope_interleaved: false,
             has_qkv_bias: self.has_qkv_bias != 0,
             partial_rotary_factor: self.partial_rotary_factor,
-            sliding_window: if self.sliding_window > 0 { Some(self.sliding_window as usize) } else { None },
+            sliding_window: None, // TODO: expose via GllmModelConfig when needed
         })
     }
 }
