@@ -64,7 +64,7 @@ pub trait InferenceBackend: Send + Sync {
     /// `kv_cache`: mutable KV cache
     /// `weights`: model weights on device
     /// `seq_lens`: per-sequence lengths in the batch
-    /// `output`: [batch_size, seq_len, hidden_size] — output hidden states
+    /// `output`: [batch_size, seq_len, vocab_size] — output logits
     fn decoder_forward(
         &self,
         input: &DeviceTensor,
