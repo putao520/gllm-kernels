@@ -23,8 +23,9 @@
 
 use super::CodegenOutput;
 
-/// Emit a minimal aarch64 stub (`ret` = 0xD65F03C0).
-pub fn emit_stub() -> CodegenOutput {
+/// Minimal valid aarch64 function for testing CompiledLayer mmap/execution mechanics.
+/// Not for production use — enable `jit-aarch64` feature for real codegen.
+pub(crate) fn emit_stub() -> CodegenOutput {
     let mut code = Vec::with_capacity(4);
     code.extend_from_slice(&0xD65F03C0u32.to_le_bytes()); // ret
     CodegenOutput { code, scratchpad_bytes: 0 }
@@ -43,8 +44,7 @@ pub mod jit {
 
     /// NEON register width: 4 x f32 = 128 bits.
     const NEON_WIDTH_F32: usize = 4;
-    /// Number of NEON/FP registers (v0-v31).
-    #[allow(dead_code)]
+    /// Total NEON/ASIMD registers available; used by vreg_for_index() for round-robin allocation.
     const NUM_NEON_REGS: usize = 32;
 
     /// NEON microkernel dimensions (must match asm::aarch64::MR/NR).
@@ -232,7 +232,7 @@ pub mod jit {
             }
         }
 
-        /// Emit a standalone op (single GEMM or elementwise nop placeholder).
+        /// Emit a standalone op (single GEMM or elementwise).
         fn emit_standalone(
             &mut self,
             group: &FusionGroup,
@@ -1145,8 +1145,8 @@ pub mod jit {
         /// (round-robin when > 32 ops).
         ///
         /// Mapping:
-        /// - `Input(n)`    → `ldr q_reg, [x_ptr, #offset]`  (placeholder: eor zeroes reg)
-        /// - `Const(v)`    → `fmov v_reg.4s, #imm` or `ldr` from const pool (placeholder: eor)
+        /// - `Input(n)`    → `ldr q_reg, [x_ptr, #offset]` from memory
+        /// - `Const(v)`    → `fmov v_reg.4s, #imm` or `ldr` from const pool
         /// - `Add(a,b)`    → `fadd v_dst.4s, v_a.4s, v_b.4s`
         /// - `Sub(a,b)`    → `fsub v_dst.4s, v_a.4s, v_b.4s`
         /// - `Mul(a,b)`    → `fmul v_dst.4s, v_a.4s, v_b.4s`
@@ -1157,8 +1157,8 @@ pub mod jit {
         /// - `Sqrt(a)`     → `fsqrt v_dst.4s, v_a.4s`
         /// - `Rsqrt(a)`    → `frsqrte v_dst.4s, v_a.4s` + Newton-Raphson step
         /// - `Recip(a)`    → `frecpe v_dst.4s, v_a.4s` + Newton-Raphson step
-        /// - `Exp(a)`      → polynomial approximation (placeholder: mov)
-        /// - `Tanh(a)`     → rational approximation (placeholder: mov)
+        /// - `Exp(a)`      → polynomial approximation via `emit_exp_neon()`
+        /// - `Tanh(a)`     → rational approximation via `emit_tanh_neon()`
         /// - `Max(a,b)`    → `fmax v_dst.4s, v_a.4s, v_b.4s`
         /// - `Min(a,b)`    → `fmin v_dst.4s, v_a.4s, v_b.4s`
         pub fn emit_trace_ops_neon(

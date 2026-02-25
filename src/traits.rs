@@ -200,67 +200,53 @@ pub trait Kernels<E: Element>: Send + Sync {
     // BLAS-1: Vector operations
     // ======================================================================
 
-    fn vec_dot(&self, _a: &[E], _b: &[E]) -> E { unimplemented!("vec_dot") }
+    fn vec_dot(&self, _a: &[E], _b: &[E]) -> E { unimplemented!("Kernels::vec_dot not implemented for this backend") }
     fn vec_add(&self, a: &[E], b: &[E], out: &mut [E]);  // required
-    fn vec_sub(&self, _a: &[E], _b: &[E], _out: &mut [E]) { unimplemented!("vec_sub") }
+    fn vec_sub(&self, _a: &[E], _b: &[E], _out: &mut [E]) { unimplemented!("Kernels::vec_sub not implemented for this backend") }
     fn vec_mul(&self, a: &[E], b: &[E], out: &mut [E]);  // required
-    fn vec_scale(&self, _x: &mut [E], _s: E) { unimplemented!("vec_scale") }
-    fn vec_axpy(&self, _y: &mut [E], _a: E, _x: &[E]) { unimplemented!("vec_axpy") }
-    fn vec_sum(&self, _x: &[E]) -> E { unimplemented!("vec_sum") }
-    fn vec_max(&self, _x: &[E]) -> E { unimplemented!("vec_max") }
-    fn vec_sum_squares(&self, _x: &[E]) -> E { unimplemented!("vec_sum_squares") }
+    fn vec_scale(&self, _x: &mut [E], _s: E) { unimplemented!("Kernels::vec_scale not implemented for this backend") }
+    fn vec_axpy(&self, _y: &mut [E], _a: E, _x: &[E]) { unimplemented!("Kernels::vec_axpy not implemented for this backend") }
+    fn vec_sum(&self, _x: &[E]) -> E { unimplemented!("Kernels::vec_sum not implemented for this backend") }
+    fn vec_max(&self, _x: &[E]) -> E { unimplemented!("Kernels::vec_max not implemented for this backend") }
+    fn vec_sum_squares(&self, _x: &[E]) -> E { unimplemented!("Kernels::vec_sum_squares not implemented for this backend") }
 
     // ======================================================================
     // BLAS-2/3: Matrix operations
     // ======================================================================
 
     fn gemv(&self, _a: &[E], _x: &[E], _y: &mut [E], _m: usize, _n: usize) {
-        unimplemented!("gemv")
+        unimplemented!("Kernels::gemv not implemented for this backend")
     }
     fn gemm(&self, a: &[E], b: &[E], c: &mut [E], m: usize, n: usize, k: usize); // required
     /// GEMM with transposed B: C[M×N] = A[M×K] * B^T[N×K].
     /// b_t is stored as [N×K] row-major, i.e. b_t[j*k + ki] == original B[ki*n + j].
     fn gemm_bt(&self, _a: &[E], _b_t: &[E], _c: &mut [E], _m: usize, _n: usize, _k: usize) {
-        unimplemented!("gemm_bt")
+        unimplemented!("Kernels::gemm_bt not implemented for this backend")
     }
     fn gemm_bias(&self, _a: &[E], _b: &[E], _bias: &[E], _c: &mut [E], _m: usize, _n: usize, _k: usize) {
-        unimplemented!("gemm_bias")
+        unimplemented!("Kernels::gemm_bias not implemented for this backend")
     }
     /// Fused GEMM+bias+activation: C = act(A*B + bias)
     /// Activation is applied in-register before writeback, avoiding an extra C read/write pass.
     fn gemm_bias_act(&self, a: &[E], b: &[E], bias: &[E], c: &mut [E], m: usize, n: usize, k: usize, act: Activation) {
         // Default: unfused fallback — compute gemm_bias, then apply activation in-place
         self.gemm_bias(a, b, bias, c, m, n, k);
+        let len = m * n;
         match act {
             Activation::None => {},
-            _ => {
-                let len = m * n;
-                for i in 0..len {
-                    c[i] = match act {
-                        Activation::Relu => E::max(c[i], E::ZERO),
-                        Activation::Silu => {
-                            let v = c[i].to_f32();
-                            E::from_f32(v / (1.0 + (-v).exp()))
-                        },
-                        Activation::Gelu | Activation::GeGlu => {
-                            let x = c[i].to_f32();
-                            let inner = 0.7978845608f32 * (x + 0.044715f32 * x * x * x);
-                            E::from_f32(0.5 * x * (1.0 + inner.tanh()))
-                        },
-                        Activation::None => unreachable!(),
-                    };
-                }
-            }
+            Activation::Relu => self.relu(&c[..len].to_vec(), &mut c[..len]),
+            Activation::Silu => self.silu(&c[..len].to_vec(), &mut c[..len]),
+            Activation::Gelu | Activation::GeGlu => self.gelu(&c[..len].to_vec(), &mut c[..len]),
         }
     }
     fn pack_b(&self, _b: &[E], _n: usize, _k: usize) -> Vec<E> {
-        unimplemented!("pack_b")
+        unimplemented!("Kernels::pack_b not implemented for this backend")
     }
     fn gemm_prepacked(&self, _a: &[E], _packed_b: &[E], _c: &mut [E], _m: usize, _n: usize, _k: usize) {
-        unimplemented!("gemm_prepacked")
+        unimplemented!("Kernels::gemm_prepacked not implemented for this backend")
     }
     fn gemm_bias_prepacked(&self, _a: &[E], _packed_b: &[E], _bias: &[E], _c: &mut [E], _m: usize, _n: usize, _k: usize) {
-        unimplemented!("gemm_bias_prepacked")
+        unimplemented!("Kernels::gemm_bias_prepacked not implemented for this backend")
     }
 
     // ======================================================================
@@ -268,22 +254,22 @@ pub trait Kernels<E: Element>: Send + Sync {
     // ======================================================================
 
     fn silu(&self, a: &[E], out: &mut [E]); // required
-    fn gelu(&self, _x: &[E], _out: &mut [E]) { unimplemented!("gelu") }
-    fn relu(&self, _x: &[E], _out: &mut [E]) { unimplemented!("relu") }
-    fn tanh(&self, _x: &[E], _out: &mut [E]) { unimplemented!("tanh") }
-    fn swiglu(&self, _gate: &[E], _up: &[E], _out: &mut [E]) { unimplemented!("swiglu") }
-    fn softmax(&self, _x: &[E], _out: &mut [E]) { unimplemented!("softmax") }
-    fn exp(&self, _x: &[E], _out: &mut [E]) { unimplemented!("exp") }
+    fn gelu(&self, _x: &[E], _out: &mut [E]) { unimplemented!("Kernels::gelu not implemented for this backend") }
+    fn relu(&self, _x: &[E], _out: &mut [E]) { unimplemented!("Kernels::relu not implemented for this backend") }
+    fn tanh(&self, _x: &[E], _out: &mut [E]) { unimplemented!("Kernels::tanh not implemented for this backend") }
+    fn swiglu(&self, _gate: &[E], _up: &[E], _out: &mut [E]) { unimplemented!("Kernels::swiglu not implemented for this backend") }
+    fn softmax(&self, _x: &[E], _out: &mut [E]) { unimplemented!("Kernels::softmax not implemented for this backend") }
+    fn exp(&self, _x: &[E], _out: &mut [E]) { unimplemented!("Kernels::exp not implemented for this backend") }
 
     // ======================================================================
     // Normalization
     // ======================================================================
 
     fn rms_norm(&self, _x: &[E], _weight: &[E], _out: &mut [E], _eps: f32) {
-        unimplemented!("rms_norm")
+        unimplemented!("Kernels::rms_norm not implemented for this backend")
     }
     fn layer_norm(&self, _x: &[E], _gamma: &[E], _beta: &[E], _out: &mut [E], _eps: f32) {
-        unimplemented!("layer_norm")
+        unimplemented!("Kernels::layer_norm not implemented for this backend")
     }
 
     // ======================================================================
@@ -291,11 +277,11 @@ pub trait Kernels<E: Element>: Send + Sync {
     // ======================================================================
 
     fn rope(&self, _qk: &mut [E], _cos: &[E], _sin: &[E], _head_dim: usize, _interleaved: bool) {
-        unimplemented!("rope")
+        unimplemented!("Kernels::rope not implemented for this backend")
     }
 
     fn rope_with_pos(&self, _qk: &mut [E], _cos: &[E], _sin: &[E], _head_dim: usize, _position: usize, _interleaved: bool) {
-        unimplemented!("rope_with_pos")
+        unimplemented!("Kernels::rope_with_pos not implemented for this backend")
     }
 
     // ======================================================================
@@ -304,64 +290,64 @@ pub trait Kernels<E: Element>: Send + Sync {
 
     fn dequant_q4_k(&self, block: &[u8], out: &mut [f32]); // required
     fn dequant_q8_k(&self, block: &[u8], out: &mut [f32]); // required
-    fn dequant_q2_k(&self, _block: &[u8], _out: &mut [f32]) { unimplemented!("dequant_q2_k") }
-    fn dequant_q3_k(&self, _block: &[u8], _out: &mut [f32]) { unimplemented!("dequant_q3_k") }
-    fn dequant_q5_k(&self, _block: &[u8], _out: &mut [f32]) { unimplemented!("dequant_q5_k") }
-    fn dequant_q6_k(&self, _block: &[u8], _out: &mut [f32]) { unimplemented!("dequant_q6_k") }
+    fn dequant_q2_k(&self, _block: &[u8], _out: &mut [f32]) { unimplemented!("Kernels::dequant_q2_k not implemented for this backend") }
+    fn dequant_q3_k(&self, _block: &[u8], _out: &mut [f32]) { unimplemented!("Kernels::dequant_q3_k not implemented for this backend") }
+    fn dequant_q5_k(&self, _block: &[u8], _out: &mut [f32]) { unimplemented!("Kernels::dequant_q5_k not implemented for this backend") }
+    fn dequant_q6_k(&self, _block: &[u8], _out: &mut [f32]) { unimplemented!("Kernels::dequant_q6_k not implemented for this backend") }
 
     // Classic GGML dequantization (block_size=32)
-    fn dequant_q4_0(&self, _block: &[u8], _out: &mut [f32]) { unimplemented!("dequant_q4_0") }
-    fn dequant_q4_1(&self, _block: &[u8], _out: &mut [f32]) { unimplemented!("dequant_q4_1") }
-    fn dequant_q5_0(&self, _block: &[u8], _out: &mut [f32]) { unimplemented!("dequant_q5_0") }
-    fn dequant_q5_1(&self, _block: &[u8], _out: &mut [f32]) { unimplemented!("dequant_q5_1") }
-    fn dequant_q8_0(&self, _block: &[u8], _out: &mut [f32]) { unimplemented!("dequant_q8_0") }
-    fn dequant_q8_1(&self, _block: &[u8], _out: &mut [f32]) { unimplemented!("dequant_q8_1") }
+    fn dequant_q4_0(&self, _block: &[u8], _out: &mut [f32]) { unimplemented!("Kernels::dequant_q4_0 not implemented for this backend") }
+    fn dequant_q4_1(&self, _block: &[u8], _out: &mut [f32]) { unimplemented!("Kernels::dequant_q4_1 not implemented for this backend") }
+    fn dequant_q5_0(&self, _block: &[u8], _out: &mut [f32]) { unimplemented!("Kernels::dequant_q5_0 not implemented for this backend") }
+    fn dequant_q5_1(&self, _block: &[u8], _out: &mut [f32]) { unimplemented!("Kernels::dequant_q5_1 not implemented for this backend") }
+    fn dequant_q8_0(&self, _block: &[u8], _out: &mut [f32]) { unimplemented!("Kernels::dequant_q8_0 not implemented for this backend") }
+    fn dequant_q8_1(&self, _block: &[u8], _out: &mut [f32]) { unimplemented!("Kernels::dequant_q8_1 not implemented for this backend") }
 
     // AWQ/GPTQ/Squeeze dequantization (SPEC §2.3)
     fn dequant_awq4(&self, _packed: &[u8], _zeros: &[u8], _scales: &[f16], _out: &mut [f32]) {
-        unimplemented!("dequant_awq4")
+        unimplemented!("Kernels::dequant_awq4 not implemented for this backend")
     }
     fn dequant_gptq4(&self, _packed: &[u8], _g_idx: &[i32], _scales: &[f16], _out: &mut [f32]) {
-        unimplemented!("dequant_gptq4")
+        unimplemented!("Kernels::dequant_gptq4 not implemented for this backend")
     }
-    fn dequant_squeeze(&self, _block: &[u8], _out: &mut [f32]) { unimplemented!("dequant_squeeze") }
+    fn dequant_squeeze(&self, _block: &[u8], _out: &mut [f32]) { unimplemented!("Kernels::dequant_squeeze not implemented for this backend") }
 
     // ======================================================================
     // Quantized GEMV
     // ======================================================================
 
     fn gemv_q8(&self, _weight: &[i8], _input: &[E], _scale: f32, _n: usize) -> E {
-        unimplemented!("gemv_q8")
+        unimplemented!("Kernels::gemv_q8 not implemented for this backend")
     }
     fn gemv_q4(&self, _weight: &[u8], _input: &[E], _scale: f32, _n: usize) -> E {
-        unimplemented!("gemv_q4")
+        unimplemented!("Kernels::gemv_q4 not implemented for this backend")
     }
     fn gemv_q2(&self, _weight: &[u8], _input: &[E], _scale: f32, _n: usize) -> E {
-        unimplemented!("gemv_q2")
+        unimplemented!("Kernels::gemv_q2 not implemented for this backend")
     }
     fn gemv_q1(&self, _weight: &[u8], _input: &[E], _scale: f32, _n: usize) -> E {
-        unimplemented!("gemv_q1")
+        unimplemented!("Kernels::gemv_q1 not implemented for this backend")
     }
     fn gemm_q8(&self, _weight: &[i8], _input: &[E], _output: &mut [E], _scales: &[f32], _m: usize, _n: usize, _k: usize) {
-        unimplemented!("gemm_q8")
+        unimplemented!("Kernels::gemm_q8 not implemented for this backend")
     }
     fn gemm_q4(&self, _weight: &[u8], _input: &[E], _output: &mut [E], _scales: &[f32], _m: usize, _n: usize, _k: usize) {
-        unimplemented!("gemm_q4")
+        unimplemented!("Kernels::gemm_q4 not implemented for this backend")
     }
 
     // ======================================================================
     // IQ Quantized operations
     // ======================================================================
 
-    fn dequant_iq1_s(&self, _block: &[u8], _out: &mut [f32]) { unimplemented!("dequant_iq1_s") }
-    fn dequant_iq1_m(&self, _block: &[u8], _out: &mut [f32]) { unimplemented!("dequant_iq1_m") }
-    fn dequant_iq2_xxs(&self, _block: &[u8], _out: &mut [f32]) { unimplemented!("dequant_iq2_xxs") }
-    fn dequant_iq2_xs(&self, _block: &[u8], _out: &mut [f32]) { unimplemented!("dequant_iq2_xs") }
-    fn dequant_iq2_s(&self, _block: &[u8], _out: &mut [f32]) { unimplemented!("dequant_iq2_s") }
-    fn dequant_iq3_xxs(&self, _block: &[u8], _out: &mut [f32]) { unimplemented!("dequant_iq3_xxs") }
-    fn dequant_iq3_s(&self, _block: &[u8], _out: &mut [f32]) { unimplemented!("dequant_iq3_s") }
-    fn dequant_iq4_nl(&self, _block: &[u8], _out: &mut [f32]) { unimplemented!("dequant_iq4_nl") }
-    fn dequant_iq4_xs(&self, _block: &[u8], _out: &mut [f32]) { unimplemented!("dequant_iq4_xs") }
+    fn dequant_iq1_s(&self, _block: &[u8], _out: &mut [f32]) { unimplemented!("Kernels::dequant_iq1_s not implemented for this backend") }
+    fn dequant_iq1_m(&self, _block: &[u8], _out: &mut [f32]) { unimplemented!("Kernels::dequant_iq1_m not implemented for this backend") }
+    fn dequant_iq2_xxs(&self, _block: &[u8], _out: &mut [f32]) { unimplemented!("Kernels::dequant_iq2_xxs not implemented for this backend") }
+    fn dequant_iq2_xs(&self, _block: &[u8], _out: &mut [f32]) { unimplemented!("Kernels::dequant_iq2_xs not implemented for this backend") }
+    fn dequant_iq2_s(&self, _block: &[u8], _out: &mut [f32]) { unimplemented!("Kernels::dequant_iq2_s not implemented for this backend") }
+    fn dequant_iq3_xxs(&self, _block: &[u8], _out: &mut [f32]) { unimplemented!("Kernels::dequant_iq3_xxs not implemented for this backend") }
+    fn dequant_iq3_s(&self, _block: &[u8], _out: &mut [f32]) { unimplemented!("Kernels::dequant_iq3_s not implemented for this backend") }
+    fn dequant_iq4_nl(&self, _block: &[u8], _out: &mut [f32]) { unimplemented!("Kernels::dequant_iq4_nl not implemented for this backend") }
+    fn dequant_iq4_xs(&self, _block: &[u8], _out: &mut [f32]) { unimplemented!("Kernels::dequant_iq4_xs not implemented for this backend") }
 
     // ======================================================================
     // Quantized format-specific matmul (SPEC §2.3)
@@ -371,21 +357,21 @@ pub trait Kernels<E: Element>: Send + Sync {
         &self, _weight_blocks: &[u8], _input: &[E], _output: &mut [E],
         _quant_type: QuantType, _m: usize, _n: usize, _k: usize,
     ) {
-        unimplemented!("kquant_matmul")
+        unimplemented!("Kernels::kquant_matmul not implemented for this backend")
     }
 
     fn classic_matmul(
         &self, _weight_blocks: &[u8], _input: &[E], _output: &mut [E],
         _quant_type: QuantType, _m: usize, _n: usize, _k: usize,
     ) {
-        unimplemented!("classic_matmul")
+        unimplemented!("Kernels::classic_matmul not implemented for this backend")
     }
 
     fn iq_matmul(
         &self, _weight_blocks: &[u8], _input: &[E], _output: &mut [E],
         _quant_type: QuantType, _m: usize, _n: usize, _k: usize,
     ) {
-        unimplemented!("iq_matmul")
+        unimplemented!("Kernels::iq_matmul not implemented for this backend")
     }
 
     fn awq_matmul(
@@ -393,7 +379,7 @@ pub trait Kernels<E: Element>: Send + Sync {
         _input: &[E], _output: &mut [E],
         _m: usize, _n: usize, _k: usize,
     ) {
-        unimplemented!("awq_matmul")
+        unimplemented!("Kernels::awq_matmul not implemented for this backend")
     }
 
     fn gptq_matmul(
@@ -401,14 +387,14 @@ pub trait Kernels<E: Element>: Send + Sync {
         _input: &[E], _output: &mut [E],
         _m: usize, _n: usize, _k: usize,
     ) {
-        unimplemented!("gptq_matmul")
+        unimplemented!("Kernels::gptq_matmul not implemented for this backend")
     }
 
     fn squeeze_matmul(
         &self, _weight_blocks: &[u8], _input: &[E], _output: &mut [E],
         _m: usize, _n: usize, _k: usize,
     ) {
-        unimplemented!("squeeze_matmul")
+        unimplemented!("Kernels::squeeze_matmul not implemented for this backend")
     }
 
 }

@@ -13,7 +13,7 @@
 //! and tile-level fusion. NOT trampoline calls.
 //!
 //! Current status: x86_64 MVP implemented under `jit-x86` feature flag
-//! (`x86_64::jit::X86CodeGen`). aarch64 backend is stub.
+//! (`x86_64::jit::X86CodeGen`). aarch64 backend uses dynasm-rs (BLIS 5-level loop nesting, NEON tanh/log/exp real implementations).
 
 pub mod x86_64;
 pub mod aarch64;

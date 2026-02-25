@@ -228,6 +228,8 @@ pub struct AlignedVec<T> {
     cap: usize,
 }
 
+// SAFETY: AlignedVec owns its heap allocation exclusively. The raw pointer is never
+// aliased, and all mutation requires &mut self. Send/Sync bounds on T are propagated.
 unsafe impl<T: Send> Send for AlignedVec<T> {}
 unsafe impl<T: Sync> Sync for AlignedVec<T> {}
 
@@ -257,7 +259,10 @@ impl<T> AlignedVec<T> {
         let elem_size = std::mem::size_of::<T>();
         assert!(elem_size > 0, "ZST not supported");
         let byte_size = new_cap * elem_size;
-        let layout = std::alloc::Layout::from_size_align(byte_size, Self::ALIGN).unwrap();
+        let layout = std::alloc::Layout::from_size_align(byte_size, Self::ALIGN)
+            .expect("AlignedVec::reserve: byte_size overflows Layout constraints");
+        // SAFETY: layout is valid (checked by from_size_align above), alloc returns
+        // a properly aligned pointer or null (checked on next line).
         let new_ptr = unsafe { std::alloc::alloc(layout) as *mut T };
         assert!(!new_ptr.is_null(), "allocation failed");
         // Hint transparent huge pages for large buffers (≥2MB)
@@ -266,6 +271,8 @@ impl<T> AlignedVec<T> {
             unsafe { libc::madvise(new_ptr as *mut libc::c_void, byte_size, libc::MADV_HUGEPAGE); }
         }
         if self.len > 0 && !self.ptr.is_null() {
+            // SAFETY: src (self.ptr) and dst (new_ptr) are non-overlapping heap allocations,
+            // both valid for self.len elements. new_cap >= self.len is guaranteed.
             unsafe { std::ptr::copy_nonoverlapping(self.ptr, new_ptr, self.len); }
         }
         self.dealloc();
@@ -305,8 +312,10 @@ impl<T> AlignedVec<T> {
         if !self.ptr.is_null() && self.cap > 0 {
             let elem_size = std::mem::size_of::<T>();
             let byte_size = self.cap * elem_size;
-            let layout = std::alloc::Layout::from_size_align(byte_size, Self::ALIGN).unwrap();
-            unsafe { std::alloc::dealloc(self.ptr as *mut u8, layout); }
+            if let Ok(layout) = std::alloc::Layout::from_size_align(byte_size, Self::ALIGN) {
+                // SAFETY: ptr was allocated with this exact layout in reserve().
+                unsafe { std::alloc::dealloc(self.ptr as *mut u8, layout); }
+            }
         }
     }
 }

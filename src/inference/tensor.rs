@@ -27,6 +27,9 @@ pub struct DeviceTensor {
     immutable: bool,
 }
 
+// SAFETY: DeviceTensor's raw pointer is either a heap allocation owned exclusively
+// by this struct (owned=true) or a borrowed reference whose lifetime is managed by
+// the caller (owned=false). No interior mutability without &mut self.
 unsafe impl Send for DeviceTensor {}
 unsafe impl Sync for DeviceTensor {}
 
@@ -47,6 +50,7 @@ impl DeviceTensor {
         }
         let layout = std::alloc::Layout::from_size_align(len_bytes, 64)
             .map_err(|e| InferenceError::RuntimeError(format!("layout error: {e}")))?;
+        // SAFETY: layout is valid (from_size_align succeeded above). Null check follows.
         let ptr = unsafe { std::alloc::alloc_zeroed(layout) };
         if ptr.is_null() {
             return Err(InferenceError::OutOfMemory {
@@ -142,9 +146,10 @@ impl Drop for DeviceTensor {
     fn drop(&mut self) {
         if self.owned && !self.ptr.is_null() && self.len_bytes > 0 {
             if let DeviceKind::Cpu = self.device {
-                let layout = std::alloc::Layout::from_size_align(self.len_bytes, 64)
-                    .expect("invalid layout in drop");
-                unsafe { std::alloc::dealloc(self.ptr, layout); }
+                if let Ok(layout) = std::alloc::Layout::from_size_align(self.len_bytes, 64) {
+                    // SAFETY: ptr was allocated with this exact layout in DeviceTensor::new().
+                    unsafe { std::alloc::dealloc(self.ptr, layout); }
+                }
             }
         }
     }

@@ -312,7 +312,7 @@ impl CompilerGraph {
     /// input → RmsNorm₁ → Q/K/V GEMMs → RoPE → Attention → O GEMM → Residual₁
     ///       → RmsNorm₂ → Gate GEMM → SwiGLU(↑Up GEMM) → Down GEMM → Residual₂
     /// ```
-    pub fn from_layer_ir(ir: &LayerIR, _profile: &DeviceProfile) -> Self {
+    pub fn from_layer_ir(ir: &LayerIR, _profile: &DeviceProfile) -> Result<Self, String> {
         let mut g = CompilerGraph::new();
         let dt = ir.dtype;
         let b = ir.max_batch;
@@ -479,11 +479,11 @@ impl CompilerGraph {
             Activation::Gelu => (OpKind::GeGlu, "geglu"),
             Activation::GeGlu => (OpKind::GeGlu, "geglu"),
             Activation::None | Activation::Relu => {
-                panic!(
+                return Err(format!(
                     "Unsupported gated activation {:?} in FFN — \
                      only Silu (SwiGLU), Gelu (GeGLU) are supported for gate*up fusion",
                     ir.activation
-                );
+                ));
             }
         };
         g.add_op(
@@ -512,7 +512,7 @@ impl CompilerGraph {
         );
 
         g.outputs = vec![output];
-        g
+        Ok(g)
     }
 }
 
@@ -619,7 +619,7 @@ mod tests {
         let config = ModelConfig::llama_7b();
         let ir = LayerIR::from_model_config(&config, 1);
         let profile = DeviceProfile::detect();
-        let g = CompilerGraph::from_layer_ir(&ir, &profile);
+        let g = CompilerGraph::from_layer_ir(&ir, &profile).expect("from_layer_ir failed");
 
         eprintln!("{g}");
 
@@ -638,7 +638,7 @@ mod tests {
         let config = ModelConfig::gemma_2b();
         let ir = LayerIR::from_model_config(&config, 1);
         let profile = DeviceProfile::detect();
-        let g = CompilerGraph::from_layer_ir(&ir, &profile);
+        let g = CompilerGraph::from_layer_ir(&ir, &profile).expect("from_layer_ir failed");
 
         // Should contain a GeGlu op
         let has_geglu = g.ops.iter().any(|op| matches!(op.kind, OpKind::GeGlu));

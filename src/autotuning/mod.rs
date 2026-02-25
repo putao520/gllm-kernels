@@ -106,7 +106,7 @@ pub fn tune_gemm_with_report(
 
     // Check cache first
     {
-        let db = wisdom_db().lock().unwrap();
+        let db = wisdom_db().lock().unwrap_or_else(|e| e.into_inner());
         if let Some(cached) = db.get(&fp, &op_key) {
             return TuneResult {
                 config: cached.config.clone(),
@@ -142,7 +142,7 @@ pub fn tune_gemm_with_report(
         let pool = rayon::ThreadPoolBuilder::new()
             .num_threads(cfg.num_threads)
             .build()
-            .unwrap();
+            .expect("failed to build rayon thread pool for autotuning");
 
         pool.install(|| {
             // Allocate test matrices
@@ -175,7 +175,7 @@ pub fn tune_gemm_with_report(
 
     // Save to cache
     {
-        let mut db = wisdom_db().lock().unwrap();
+        let mut db = wisdom_db().lock().unwrap_or_else(|e| e.into_inner());
         db.put(
             &fp,
             &op_key,
@@ -183,7 +183,9 @@ pub fn tune_gemm_with_report(
             search_result.best_result.median_ns,
             search_result.best_result.gflops,
         );
-        let _ = db.save();
+        if let Err(e) = db.save() {
+            eprintln!("[gllm-kernels] warning: failed to save wisdom cache: {e}");
+        }
     }
 
     TuneResult {
@@ -208,7 +210,7 @@ pub fn tune_memory_bound(data_bytes: usize, level: TuneLevel) -> TuningConfig {
 
     // Check cache
     {
-        let db = wisdom_db().lock().unwrap();
+        let db = wisdom_db().lock().unwrap_or_else(|e| e.into_inner());
         if let Some(cached) = db.get(&fp, &op_key) {
             return cached.config.clone();
         }
@@ -225,7 +227,7 @@ pub fn tune_memory_bound(data_bytes: usize, level: TuneLevel) -> TuningConfig {
         let pool = rayon::ThreadPoolBuilder::new()
             .num_threads(cfg.num_threads)
             .build()
-            .unwrap();
+            .expect("failed to build rayon thread pool for autotuning");
 
         pool.install(|| {
             let src = vec![1.0f32; data_bytes / 4];
@@ -252,7 +254,7 @@ pub fn tune_memory_bound(data_bytes: usize, level: TuneLevel) -> TuningConfig {
 
     // Save to cache
     {
-        let mut db = wisdom_db().lock().unwrap();
+        let mut db = wisdom_db().lock().unwrap_or_else(|e| e.into_inner());
         db.put(
             &fp,
             &op_key,
@@ -260,7 +262,9 @@ pub fn tune_memory_bound(data_bytes: usize, level: TuneLevel) -> TuningConfig {
             search_result.best_result.median_ns,
             search_result.best_result.bandwidth_gbs,
         );
-        let _ = db.save();
+        if let Err(e) = db.save() {
+            eprintln!("[gllm-kernels] warning: failed to save wisdom cache: {e}");
+        }
     }
 
     search_result.best_config
@@ -268,22 +272,26 @@ pub fn tune_memory_bound(data_bytes: usize, level: TuneLevel) -> TuningConfig {
 
 /// Clear all cached tuning results.
 pub fn clear_cache() {
-    let mut db = wisdom_db().lock().unwrap();
+    let mut db = wisdom_db().lock().unwrap_or_else(|e| e.into_inner());
     db.clear_all();
-    let _ = db.save();
+    if let Err(e) = db.save() {
+        eprintln!("[gllm-kernels] warning: failed to save wisdom cache: {e}");
+    }
 }
 
 /// Clear cached results for the current hardware only.
 pub fn clear_cache_current_hw() {
     let fp = hw_info().fingerprint();
-    let mut db = wisdom_db().lock().unwrap();
+    let mut db = wisdom_db().lock().unwrap_or_else(|e| e.into_inner());
     db.clear_hw(&fp);
-    let _ = db.save();
+    if let Err(e) = db.save() {
+        eprintln!("[gllm-kernels] warning: failed to save wisdom cache: {e}");
+    }
 }
 
 /// Get a summary of the wisdom cache.
 pub fn cache_summary() -> String {
-    let db = wisdom_db().lock().unwrap();
+    let db = wisdom_db().lock().unwrap_or_else(|e| e.into_inner());
     let mut summary = format!("Wisdom cache: {} entries\n", db.total_entries());
     for fp in db.fingerprints() {
         summary.push_str(&format!("  HW: {fp}\n"));
@@ -369,7 +377,7 @@ mod tests {
             let fp = hw.fingerprint();
             let shape = search_space::ProblemShape { m: 37, n: 37, k: 37, elem_bytes: 4 };
             let key = cache::op_key("gemm", &shape);
-            let mut db = wisdom_db().lock().unwrap();
+            let mut db = wisdom_db().lock().unwrap_or_else(|e| e.into_inner());
             // Remove just this entry by re-putting after clear check
             if db.get(&fp, &key).is_some() {
                 // Entry exists from a previous run; clear this HW's entries

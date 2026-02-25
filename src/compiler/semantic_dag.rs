@@ -85,7 +85,7 @@ impl SemanticDAG {
 
         let mut nodes = Vec::with_capacity(topo_order.len());
         for &op_id in &topo_order {
-            let op = graph.op(op_id).unwrap();
+            let op = graph.op(op_id).expect("topological_sort returned invalid OpId");
             let key = ScalarOpRegistry::key_from_op_kind(&op.kind);
             let op_trace = registry.get_trace(&key).cloned();
             let op_class = op_trace
@@ -301,7 +301,7 @@ mod tests {
         let config = ModelConfig::llama_7b();
         let ir = LayerIR::from_model_config(&config, 1);
         let profile = DeviceProfile::detect();
-        let graph = CompilerGraph::from_layer_ir(&ir, &profile);
+        let graph = CompilerGraph::from_layer_ir(&ir, &profile).expect("from_layer_ir failed");
         let registry = ScalarOpRegistry::with_defaults();
 
         let dag = SemanticDAG::from_graph(&graph, &registry);
@@ -354,7 +354,7 @@ mod tests {
         let config = ModelConfig::llama_7b();
         let ir = LayerIR::from_model_config(&config, 1);
         let profile = DeviceProfile::detect();
-        let graph = CompilerGraph::from_layer_ir(&ir, &profile);
+        let graph = CompilerGraph::from_layer_ir(&ir, &profile).expect("from_layer_ir failed");
         let registry = ScalarOpRegistry::with_defaults();
 
         let dag = SemanticDAG::from_graph(&graph, &registry);
@@ -374,7 +374,7 @@ mod tests {
         let config = ModelConfig::llama_7b();
         let ir = LayerIR::from_model_config(&config, 1);
         let profile = DeviceProfile::detect();
-        let graph = CompilerGraph::from_layer_ir(&ir, &profile);
+        let graph = CompilerGraph::from_layer_ir(&ir, &profile).expect("from_layer_ir failed");
         let registry = ScalarOpRegistry::with_defaults();
 
         let dag = SemanticDAG::from_graph(&graph, &registry);

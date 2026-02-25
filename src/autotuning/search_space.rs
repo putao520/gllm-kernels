@@ -318,6 +318,7 @@ fn subsample(values: &[usize], stride: usize) -> Vec<usize> {
         i += stride;
     }
     // Always include last
+    // NOTE: result is non-empty (pushed values[0] above), values is non-empty (checked at entry).
     if *result.last().unwrap() != *values.last().unwrap() {
         result.push(*values.last().unwrap());
     }

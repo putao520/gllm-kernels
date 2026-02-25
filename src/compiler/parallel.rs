@@ -237,7 +237,7 @@ mod tests {
         let config = ModelConfig::llama_7b();
         let ir = LayerIR::from_model_config(&config, 1);
         let profile = DeviceProfile::detect();
-        let graph = CompilerGraph::from_layer_ir(&ir, &profile);
+        let graph = CompilerGraph::from_layer_ir(&ir, &profile).expect("from_layer_ir failed");
         let registry = ScalarOpRegistry::with_defaults();
         let plan = fusion::fuse_with_dag(&graph, &registry, &profile);
         let dag = SemanticDAG::from_graph(&graph, &registry);

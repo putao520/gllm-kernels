@@ -78,6 +78,7 @@ fn test_e2e_llama_7b_full_pipeline() {
     assert!(exec_plan.scratchpad_bytes > 0);
 
     // Phase 3: Codegen (stub)
+    #[allow(deprecated)]
     let output = codegen::emitter::emit_stub_code(&graph);
     assert!(!output.code.is_empty());
 
@@ -469,6 +470,7 @@ fn test_deterministic_across_threads() {
             thread::spawn(move || {
                 // Use lower-level APIs to get raw code bytes
                 let graph = CompilerGraph::from_layer_ir(&ir, &profile);
+                #[allow(deprecated)]
                 let output = codegen::emitter::emit_stub_code(&graph);
                 (output.code, output.scratchpad_bytes)
             })

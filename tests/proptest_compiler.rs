@@ -206,11 +206,12 @@ proptest! {
         let lifetimes = buffer_alloc::analyze_lifetimes(&graph, &plan);
         let alloc = buffer_alloc::allocate_buffers(&lifetimes);
 
+        let registry = gllm_kernels::compiler::registry::ScalarOpRegistry::with_defaults();
         let mut cg1 = X86CodeGen::new(&profile);
-        let out1 = cg1.emit_plan(&plan, &graph, &alloc, &profile, None).unwrap();
+        let out1 = cg1.emit_plan(&plan, &graph, &alloc, &profile, Some(&registry)).unwrap();
 
         let mut cg2 = X86CodeGen::new(&profile);
-        let out2 = cg2.emit_plan(&plan, &graph, &alloc, &profile, None).unwrap();
+        let out2 = cg2.emit_plan(&plan, &graph, &alloc, &profile, Some(&registry)).unwrap();
 
         prop_assert_eq!(
             out1.code, out2.code,

@@ -146,11 +146,12 @@ pub fn compute_layout(graph: &CompilerGraph) -> ScratchpadLayout {
     }
 }
 
-/// Temporary: generate a stub CodegenOutput.
+/// Generate a fallback CodegenOutput (single `ret` instruction).
 ///
-/// This is a placeholder until the real Phase 3 code generator is implemented.
-/// It produces a valid but no-op function.
-pub fn emit_stub_code(graph: &CompilerGraph) -> CodegenOutput {
+/// Used when the full Phase 3 code generator is bypassed or unavailable.
+/// Produces a valid but no-op function.
+#[deprecated(note = "Use JIT codegen path instead. Retained for test scaffolding only.")]
+pub(crate) fn emit_stub_code(graph: &CompilerGraph) -> CodegenOutput {
     let layout = compute_layout(graph);
     let scratchpad_bytes = layout.total_bytes;
 
@@ -182,7 +183,7 @@ mod tests {
         let config = ModelConfig::llama_7b();
         let ir = LayerIR::from_model_config(&config, 1);
         let profile = DeviceProfile::detect();
-        let graph = CompilerGraph::from_layer_ir(&ir, &profile);
+        let graph = CompilerGraph::from_layer_ir(&ir, &profile).expect("from_layer_ir failed");
         let layout = compute_layout(&graph);
 
         // Should have offsets for intermediate tensors (not graph inputs)
@@ -202,11 +203,12 @@ mod tests {
     }
 
     #[test]
+    #[allow(deprecated)]
     fn test_emit_stub_code() {
         let config = ModelConfig::llama_7b();
         let ir = LayerIR::from_model_config(&config, 1);
         let profile = DeviceProfile::detect();
-        let graph = CompilerGraph::from_layer_ir(&ir, &profile);
+        let graph = CompilerGraph::from_layer_ir(&ir, &profile).expect("from_layer_ir failed");
         let output = emit_stub_code(&graph);
 
         assert!(!output.code.is_empty());

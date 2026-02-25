@@ -223,7 +223,8 @@ impl InferenceCompiler {
     /// a stub is emitted as fallback.
     fn jit_compile(&self, ir: &LayerIR) -> Result<codegen::CodegenOutput, InferenceError> {
         // Phase 1: Build CompilerGraph DAG
-        let graph = CompilerGraph::from_layer_ir(ir, &self.profile);
+        let graph = CompilerGraph::from_layer_ir(ir, &self.profile)
+            .map_err(InferenceError::CompileError)?;
 
         // Phase 0 + 1: ScalarOpRegistry (OpTrace cache) + SemanticDAG (OpClass auto-derivation)
         let registry = ScalarOpRegistry::with_defaults();
@@ -244,8 +245,8 @@ impl InferenceCompiler {
 
         #[cfg(not(feature = "jit-x86"))]
         {
-            let _ = (fusion_plan, alloc);
-            Ok(codegen::emitter::emit_stub_code(&graph))
+            let _ = (fusion_plan, alloc, graph);
+            Err(InferenceError::CompileError("JIT backend not enabled (feature jit-x86 required)".into()))
         }
     }
 
@@ -272,10 +273,10 @@ impl InferenceCompiler {
         };
 
         #[cfg(not(feature = "jit-x86"))]
-        let output = {
+        {
             let _ = (fusion_plan, alloc);
-            codegen::emitter::emit_stub_code(graph)
-        };
+            return Err(InferenceError::CompileError("JIT backend not enabled (feature jit-x86 required)".into()));
+        }
 
         let hash = self.graph_content_hash(graph);
         CompiledLayer::from_code(&output.code, output.scratchpad_bytes, hash)
@@ -406,14 +407,15 @@ mod tests {
         let profile = DeviceProfile::detect();
 
         // Phase 1: DAG
-        let graph = CompilerGraph::from_layer_ir(&ir, &profile);
+        let graph = CompilerGraph::from_layer_ir(&ir, &profile).expect("from_layer_ir failed");
         assert!(graph.num_ops() >= 14);
 
         // Phase 2: Fusion
         let fplan = fusion::fuse(&graph, &profile);
         assert!(fplan.num_groups() < graph.num_ops());
 
-        // Phase 3: Codegen (stub for now)
+        // Phase 3: Codegen (stub — JIT feature not enabled in this test)
+        #[allow(deprecated)]
         let output = codegen::emitter::emit_stub_code(&graph);
         assert!(!output.code.is_empty());
         assert!(output.scratchpad_bytes > 0);
@@ -438,8 +440,9 @@ mod tests {
         let ir = LayerIR::from_model_config(&config, 1);
         let profile = DeviceProfile::detect();
 
-        let graph = CompilerGraph::from_layer_ir(&ir, &profile);
+        let graph = CompilerGraph::from_layer_ir(&ir, &profile).expect("from_layer_ir failed");
         let fplan = fusion::fuse(&graph, &profile);
+        #[allow(deprecated)]
         let output = codegen::emitter::emit_stub_code(&graph);
 
         let mut compiler = InferenceCompiler::with_profile(profile);
@@ -481,7 +484,7 @@ mod tests {
         let config = ModelConfig::llama_7b();
         let ir = LayerIR::from_model_config(&config, 1);
         let profile = DeviceProfile::detect();
-        let graph = CompilerGraph::from_layer_ir(&ir, &profile);
+        let graph = CompilerGraph::from_layer_ir(&ir, &profile).expect("from_layer_ir failed");
 
         let compiler = InferenceCompiler::with_profile(profile);
         let h1 = compiler.graph_content_hash(&graph);
@@ -497,11 +500,13 @@ mod tests {
 
         let config_a = ModelConfig::llama_7b();
         let ir_a = LayerIR::from_model_config(&config_a, 1);
-        let graph_a = CompilerGraph::from_layer_ir(&ir_a, &profile);
+        let graph_a =
+            CompilerGraph::from_layer_ir(&ir_a, &profile).expect("from_layer_ir failed");
 
         let config_b = ModelConfig::gemma_2b();
         let ir_b = LayerIR::from_model_config(&config_b, 1);
-        let graph_b = CompilerGraph::from_layer_ir(&ir_b, &profile);
+        let graph_b =
+            CompilerGraph::from_layer_ir(&ir_b, &profile).expect("from_layer_ir failed");
 
         let ha = compiler.graph_content_hash(&graph_a);
         let hb = compiler.graph_content_hash(&graph_b);
@@ -513,7 +518,7 @@ mod tests {
         let config = ModelConfig::llama_7b();
         let ir = LayerIR::from_model_config(&config, 1);
         let profile = DeviceProfile::detect();
-        let graph = CompilerGraph::from_layer_ir(&ir, &profile);
+        let graph = CompilerGraph::from_layer_ir(&ir, &profile).expect("from_layer_ir failed");
 
         let mut compiler = InferenceCompiler::with_profile(profile);
         let layer = compiler.compile_graph(&graph).unwrap();

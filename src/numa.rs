@@ -425,6 +425,8 @@ pub struct NumaAlignedVec<T> {
     node_id: Option<usize>, // None = default policy
 }
 
+// SAFETY: NumaAlignedVec owns its heap allocation exclusively (same invariants as
+// AlignedVec). NUMA binding is a placement hint and does not affect memory safety.
 unsafe impl<T: Send> Send for NumaAlignedVec<T> {}
 unsafe impl<T: Sync> Sync for NumaAlignedVec<T> {}
 
@@ -556,7 +558,7 @@ pub fn node_pools() -> &'static Vec<rayon::ThreadPool> {
                     })
                     .thread_name(move |idx| format!("numa{node_id}-worker{idx}"))
                     .build()
-                    .expect("failed to build per-node thread pool")
+                    .unwrap_or_else(|e| panic!("failed to build thread pool for NUMA node {}: {e}", node.id))
             })
             .collect()
     })

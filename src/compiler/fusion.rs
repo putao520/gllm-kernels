@@ -1177,7 +1177,7 @@ mod tests {
         let config = ModelConfig::llama_7b();
         let ir = LayerIR::from_model_config(&config, 1);
         let profile = DeviceProfile::detect();
-        let graph = CompilerGraph::from_layer_ir(&ir, &profile);
+        let graph = CompilerGraph::from_layer_ir(&ir, &profile).expect("from_layer_ir failed");
         let plan = fuse(&graph, &profile);
 
         eprintln!("{plan}");
@@ -1293,7 +1293,7 @@ mod tests {
         let config = ModelConfig::gemma_2b();
         let ir = LayerIR::from_model_config(&config, 1);
         let profile = DeviceProfile::detect();
-        let graph = CompilerGraph::from_layer_ir(&ir, &profile);
+        let graph = CompilerGraph::from_layer_ir(&ir, &profile).expect("from_layer_ir failed");
         let plan = fuse(&graph, &profile);
 
         eprintln!("{plan}");
@@ -1311,7 +1311,7 @@ mod tests {
         let config = ModelConfig::llama_7b();
         let ir = LayerIR::from_model_config(&config, 1);
         let profile = DeviceProfile::detect();
-        let graph = CompilerGraph::from_layer_ir(&ir, &profile);
+        let graph = CompilerGraph::from_layer_ir(&ir, &profile).expect("from_layer_ir failed");
         let registry = crate::compiler::registry::ScalarOpRegistry::with_defaults();
 
         let plan = fuse_with_dag(&graph, &registry, &profile);
@@ -1344,7 +1344,7 @@ mod tests {
         let config = ModelConfig::llama_7b();
         let ir = LayerIR::from_model_config(&config, 1);
         let profile = DeviceProfile::detect();
-        let graph = CompilerGraph::from_layer_ir(&ir, &profile);
+        let graph = CompilerGraph::from_layer_ir(&ir, &profile).expect("from_layer_ir failed");
         let registry = crate::compiler::registry::ScalarOpRegistry::with_defaults();
 
         let old_plan = fuse(&graph, &profile);

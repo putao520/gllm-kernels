@@ -63,7 +63,9 @@ impl CompilationCache {
     pub fn default_disk() -> Self {
         let dir = default_cache_dir();
         if let Some(ref d) = dir {
-            let _ = std::fs::create_dir_all(d);
+            if let Err(e) = std::fs::create_dir_all(d) {
+                eprintln!("[gllm-kernels] warning: failed to create cache dir {}: {e}", d.display());
+            }
         }
         CompilationCache {
             entries: HashMap::new(),
@@ -123,7 +125,9 @@ impl CompilationCache {
 
         // Save to disk
         if let Some(ref dir) = self.disk_dir {
-            let _ = save_to_disk(dir, config_hash, &entry);
+            if let Err(e) = save_to_disk(dir, config_hash, &entry) {
+                eprintln!("[gllm-kernels] warning: failed to save compiled cache to disk: {e}");
+            }
         }
 
         self.entries.insert(config_hash, entry);

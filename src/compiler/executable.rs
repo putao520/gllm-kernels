@@ -105,6 +105,8 @@ struct ExecutableBuffer {
     len: usize,
 }
 
+// SAFETY: ExecutableBuffer owns its mmap'd memory exclusively. The pointer is
+// never aliased and the buffer is immutable (PROT_READ|PROT_EXEC) after construction.
 unsafe impl Send for ExecutableBuffer {}
 unsafe impl Sync for ExecutableBuffer {}
 
@@ -122,6 +124,8 @@ impl ExecutableBuffer {
         let page_size = page_size();
         let len = (code.len() + page_size - 1) & !(page_size - 1);
 
+        // SAFETY: mmap with MAP_PRIVATE|MAP_ANONYMOUS creates a new anonymous mapping.
+        // No file descriptor is used (-1). Return value is checked for MAP_FAILED.
         let ptr = unsafe {
             libc::mmap(
                 std::ptr::null_mut(),

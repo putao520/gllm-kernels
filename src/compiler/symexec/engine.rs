@@ -267,21 +267,21 @@ impl SymbolicExecutor {
             // --- Unary math ---
             "sqrtss" | "vsqrtss" => {
                 if operands.len() >= 2 {
-                    let src = self.resolve(operands.last().unwrap());
+                    let src = self.resolve(operands.last().expect("guarded by operands.len() >= 2"));
                     self.set(operands[0], SymValue::Sqrt(Box::new(src)));
                 }
                 Ok(())
             }
             "rcpss" | "vrcpss" => {
                 if operands.len() >= 2 {
-                    let src = self.resolve(operands.last().unwrap());
+                    let src = self.resolve(operands.last().expect("guarded by operands.len() >= 2"));
                     self.set(operands[0], SymValue::Recip(Box::new(src)));
                 }
                 Ok(())
             }
             "rsqrtss" | "vrsqrtss" => {
                 if operands.len() >= 2 {
-                    let src = self.resolve(operands.last().unwrap());
+                    let src = self.resolve(operands.last().expect("guarded by operands.len() >= 2"));
                     self.set(operands[0], SymValue::Rsqrt(Box::new(src)));
                 }
                 Ok(())

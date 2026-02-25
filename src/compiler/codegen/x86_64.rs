@@ -17,7 +17,7 @@ use super::CodegenOutput;
 /// Emit a minimal x86_64 stub (push rbp; mov rbp,rsp; nops; pop rbp; ret).
 ///
 /// Used as fallback until the real Phase 3 code generator is implemented.
-pub fn emit_stub() -> CodegenOutput {
+pub(crate) fn emit_stub() -> CodegenOutput {
     let mut code = Vec::with_capacity(16);
     code.push(0x55);                          // push rbp
     code.extend_from_slice(&[0x48, 0x89, 0xE5]); // mov rbp, rsp
@@ -70,7 +70,8 @@ pub mod jit {
         pub fn new(profile: &DeviceProfile) -> Self {
             let use_avx512 = profile.kernel_config.use_avx512;
             X86CodeGen {
-                asm: CodeAssembler::new(64).unwrap(),
+                // NOTE: CodeAssembler::new(64) is infallible — 64-bit mode is always valid in iced-x86.
+                asm: CodeAssembler::new(64).expect("64-bit CodeAssembler creation is infallible"),
                 use_avx512,
                 simd_width: if use_avx512 { 16 } else { 8 },
                 const_pool: Vec::new(),
@@ -4895,7 +4896,8 @@ mod tests {
             let config = ModelConfig::llama_7b();
             let ir = LayerIR::from_model_config(&config, 1);
             let profile = DeviceProfile::detect();
-            let graph = CompilerGraph::from_layer_ir(&ir, &profile);
+            let graph =
+                CompilerGraph::from_layer_ir(&ir, &profile).expect("from_layer_ir failed");
             let registry = ScalarOpRegistry::with_defaults();
             let plan = fuse_with_dag(&graph, &registry, &profile);
             let lifetimes = analyze_lifetimes(&graph, &plan);

@@ -175,10 +175,8 @@ fn detect_physical_cores() -> usize {
     // Try to get physical cores (not hyperthreads)
     #[cfg(target_os = "linux")]
     {
-        if let Ok(content) = std::fs::read_to_string("/sys/devices/system/cpu/cpu0/topology/core_siblings_list") {
-            // Count unique core IDs
-            let _ = content; // complex parsing, fall through
-        }
+        // NOTE: /sys/.../core_siblings_list parsing is unreliable across kernel versions;
+        // using heuristic below instead.
         // Simpler: count online CPUs / 2 (assuming HT)
         let online = std::thread::available_parallelism()
             .map(|n| n.get())

@@ -139,6 +139,8 @@ pub struct ScalarFnSignature {
     pub params: Vec<ScalarParam>,
 }
 
+// SAFETY: fn_ptr points to a static extern "C" function in the binary's text segment.
+// Static function pointers are inherently thread-safe (read-only, never deallocated).
 unsafe impl Send for ScalarFnSignature {}
 unsafe impl Sync for ScalarFnSignature {}
 

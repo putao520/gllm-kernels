@@ -1633,7 +1633,19 @@ impl<E: Element> Kernels<E> for CpuKernels<E> {
             QuantType::Q5K => self.quant_matmul_inner::<176, 256, _>(weight_blocks, input, output, m, n, k, Self::dot_q5_k),
             QuantType::Q6K => self.quant_matmul_inner::<210, 256, _>(weight_blocks, input, output, m, n, k, Self::dot_q6_k),
             QuantType::Q8K => self.quant_matmul_inner::<292, 256, _>(weight_blocks, input, output, m, n, k, Self::dot_q8_k),
-            _ => unimplemented!("unsupported quant type for kquant_matmul"),
+            // Classic GGML formats — use classic_matmul()
+            QuantType::Q4_0 | QuantType::Q4_1 | QuantType::Q5_0
+            | QuantType::Q5_1 | QuantType::Q8_0 | QuantType::Q8_1 =>
+                unimplemented!("kquant_matmul does not support classic format {:?}, use classic_matmul()", quant_type),
+            // IQ formats — use iq_matmul()
+            QuantType::IQ1S | QuantType::IQ1M | QuantType::IQ2XXS | QuantType::IQ2XS
+            | QuantType::IQ2S | QuantType::IQ3XXS | QuantType::IQ3S
+            | QuantType::IQ4NL | QuantType::IQ4XS =>
+                unimplemented!("kquant_matmul does not support IQ format {:?}, use iq_matmul()", quant_type),
+            // External formats — use dedicated matmul
+            QuantType::AWQ4 => unimplemented!("kquant_matmul does not support AWQ4, use awq_matmul()"),
+            QuantType::GPTQ4 => unimplemented!("kquant_matmul does not support GPTQ4, use gptq_matmul()"),
+            QuantType::Squeeze => unimplemented!("kquant_matmul does not support Squeeze, use squeeze_matmul()"),
         }
     }
 
@@ -1649,7 +1661,19 @@ impl<E: Element> Kernels<E> for CpuKernels<E> {
             QuantType::Q5_1 => self.quant_matmul_inner::<24, 32, _>(weight_blocks, input, output, m, n, k, Self::dot_q5_1),
             QuantType::Q8_0 => self.quant_matmul_inner::<34, 32, _>(weight_blocks, input, output, m, n, k, Self::dot_q8_0),
             QuantType::Q8_1 => self.quant_matmul_inner::<36, 32, _>(weight_blocks, input, output, m, n, k, Self::dot_q8_1),
-            _ => unimplemented!("unsupported quant type for classic_matmul"),
+            // K-Quant formats — use kquant_matmul()
+            QuantType::Q2K | QuantType::Q3K | QuantType::Q4K
+            | QuantType::Q5K | QuantType::Q6K | QuantType::Q8K =>
+                unimplemented!("classic_matmul does not support K-Quant format {:?}, use kquant_matmul()", quant_type),
+            // IQ formats — use iq_matmul()
+            QuantType::IQ1S | QuantType::IQ1M | QuantType::IQ2XXS | QuantType::IQ2XS
+            | QuantType::IQ2S | QuantType::IQ3XXS | QuantType::IQ3S
+            | QuantType::IQ4NL | QuantType::IQ4XS =>
+                unimplemented!("classic_matmul does not support IQ format {:?}, use iq_matmul()", quant_type),
+            // External formats — use dedicated matmul
+            QuantType::AWQ4 => unimplemented!("classic_matmul does not support AWQ4, use awq_matmul()"),
+            QuantType::GPTQ4 => unimplemented!("classic_matmul does not support GPTQ4, use gptq_matmul()"),
+            QuantType::Squeeze => unimplemented!("classic_matmul does not support Squeeze, use squeeze_matmul()"),
         }
     }
 
@@ -1669,7 +1693,18 @@ impl<E: Element> Kernels<E> for CpuKernels<E> {
             QuantType::IQ3S => self.quant_matmul_inner::<110, 256, _>(weight_blocks, input, output, m, n, k, Self::dot_iq3_s),
             QuantType::IQ4NL => self.quant_matmul_inner::<18, 32, _>(weight_blocks, input, output, m, n, k, Self::dot_iq4_nl),
             QuantType::IQ4XS => self.quant_matmul_inner::<136, 256, _>(weight_blocks, input, output, m, n, k, Self::dot_iq4_xs),
-            _ => unimplemented!("unsupported quant type for iq_matmul"),
+            // K-Quant formats — use kquant_matmul()
+            QuantType::Q2K | QuantType::Q3K | QuantType::Q4K
+            | QuantType::Q5K | QuantType::Q6K | QuantType::Q8K =>
+                unimplemented!("iq_matmul does not support K-Quant format {:?}, use kquant_matmul()", quant_type),
+            // Classic GGML formats — use classic_matmul()
+            QuantType::Q4_0 | QuantType::Q4_1 | QuantType::Q5_0
+            | QuantType::Q5_1 | QuantType::Q8_0 | QuantType::Q8_1 =>
+                unimplemented!("iq_matmul does not support classic format {:?}, use classic_matmul()", quant_type),
+            // External formats — use dedicated matmul
+            QuantType::AWQ4 => unimplemented!("iq_matmul does not support AWQ4, use awq_matmul()"),
+            QuantType::GPTQ4 => unimplemented!("iq_matmul does not support GPTQ4, use gptq_matmul()"),
+            QuantType::Squeeze => unimplemented!("iq_matmul does not support Squeeze, use squeeze_matmul()"),
         }
     }
 
