@@ -7,3 +7,5 @@ __pycache__/
 # already existing elements were commented out
 
 #/target
+.cargo/
+.claude/
