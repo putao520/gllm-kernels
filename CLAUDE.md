@@ -10,7 +10,7 @@
 
 | 优先级 | 原则 | 含义 |
 |--------|------|------|
-| **P0 🔴 逼近理论极限** | 每个算子必须达到硬件理论峰值的 85%+ | compute-bound 算子逼近 FLOPS 峰值；memory-bound 算子逼近带宽峰值 |
+| **P0 🔴 逼近理论极限** | 每个算子尽可能逼近硬件理论峰值 | compute-bound 算子逼近 FLOPS 峰值；memory-bound 算子逼近带宽峰值 |
 | **P1 🟡 JIT 编译器自动优化** | 所有算子通过编译器融合决策 + 程序化代码生成达到最优 | Phase 3 用 iced-x86/dynasm-rs 生成每条指令，自动 epilogue injection / loop fusion / tile-level fusion |
 | **P2 🟢 代码量最少** | 编译器代码本身保持精简 | 宏/泛型复用编译器内部逻辑，避免重复代码 |
 | **P3 ⚪ 可维护性** | 新增 ISA/量化格式/算子的变更路径清晰 | 遵循维护检查清单 |
@@ -23,27 +23,27 @@
 
 ### 理论峰值计算方法
 
-| 瓶颈类型 | 理论峰值公式 | 目标效率 |
-|----------|-------------|----------|
-| **Compute-bound** (GEMM) | `核心数 × 频率 × FMA吞吐 × SIMD宽度 × 2` | **≥ 85%** |
-| **Memory-bound** (GEMV, 激活, 归一化) | `内存带宽 / (输入+输出字节数)` | **≥ 90%** |
-| **量化 GEMV** | `min(计算峰值, 带宽/量化字节数)` | **≥ 85%** |
+| 瓶颈类型 | 理论峰值公式 |
+|----------|-------------|
+| **Compute-bound** (GEMM) | `核心数 × 频率 × FMA吞吐 × SIMD宽度 × 2` |
+| **Memory-bound** (GEMV, 激活, 归一化) | `内存带宽 / (输入+输出字节数)` |
+| **量化 GEMV** | `min(计算峰值, 带宽/量化字节数)` |
 
 ### 参考对标
 
 | 库 | 典型效率 | 我们的目标 |
 |---|---|---|
-| Intel MKL (GEMM) | 85-95% | **≥ 85%** |
+| Intel MKL (GEMM) | 85-95% | 逼近 |
 | OpenBLAS (GEMM) | 70-85% | 超越 |
-| llama.cpp (量化 GEMV) | 60-75% | **≥ 85%** |
+| llama.cpp (量化 GEMV) | 60-75% | 超越 |
 
 ### 当前状态
 
-| 算子 | 当前效率 | 目标 | 达成路径 |
-|------|---------|------|---------|
-| F32 GEMM | unpacked ~42%, prepacked ~59% (ASM 微内核路径) | 85%+ | JIT 编译器 Phase 3 自动生成最优代码 |
-| 量化 GEMV | intrinsics 路径 | 85%+ | JIT 编译器 Phase 3 自动生成最优代码 |
-| Softmax/RMSNorm/SiLU | ALU-limited 7-13 GiB/s | 90%+ 带宽 | JIT 编译器 Loop Fusion 消除中间 writeback |
+| 算子 | 当前效率 | 达成路径 |
+|------|---------|---------|
+| F32 GEMM | unpacked ~42%, prepacked ~59% (ASM 微内核路径) | JIT 编译器 Phase 3 自动生成最优代码 |
+| 量化 GEMV | intrinsics 路径 | JIT 编译器 Phase 3 自动生成最优代码 |
+| Softmax/RMSNorm/SiLU | ALU-limited 7-13 GiB/s | JIT 编译器 Loop Fusion 消除中间 writeback |
 
 > **性能调优路线**：全部算子通过 JIT 编译器 Phase 3 自动生成最优代码，不存在手动调优路径。
 

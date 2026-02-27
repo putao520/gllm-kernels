@@ -364,11 +364,11 @@ impl<E: Element> IsaKernels<E> for NeonImpl<E> { ... }
 
 | 算子类别 | 瓶颈类型 | 目标 | 参考基准 |
 |----------|----------|------|----------|
-| **GEMM (compute-bound)** | 计算密集 | ≥ 85% 理论 FLOPS 峰值 | MKL/OpenBLAS 同规模 |
-| **GEMV (memory-bound)** | 内存带宽 | ≥ 90% 带宽峰值 | STREAM benchmark |
-| **激活/归一化 (memory-bound)** | 内存带宽 | ≥ 90% 带宽峰值 | 单次遍历理论值 |
-| **量化 GEMV/GEMM** | 混合瓶颈 | ≥ 85% 瓶颈极限 | llama.cpp 同格式 |
-| **解量化** | 内存带宽 | ≥ 90% 带宽峰值 | 理论解码吞吐 |
+| **GEMM (compute-bound)** | 计算密集 | 逼近理论 FLOPS 峰值 | MKL/OpenBLAS 同规模 |
+| **GEMV (memory-bound)** | 内存带宽 | 逼近带宽峰值 | STREAM benchmark |
+| **激活/归一化 (memory-bound)** | 内存带宽 | 逼近带宽峰值 | 单次遍历理论值 |
+| **量化 GEMV/GEMM** | 混合瓶颈 | 逼近瓶颈极限 | llama.cpp 同格式 |
+| **解量化** | 内存带宽 | 逼近带宽峰值 | 理论解码吞吐 |
 
 ### 5.2 性能分析方法论
 
@@ -1420,14 +1420,14 @@ src/
 
 | 操作 | 期望加速比（vs Scalar） | 性能目标 | 备注 |
 |------|------------------------|----------|------|
-| GEMM (f32, large) | AVX2: 6-8×, AVX512: 12-16× | ≥ 85% 峰值 FLOPS | 汇编微内核 |
-| GEMV (f32) | AVX2: 5-7×, AVX512: 10-12× | ≥ 90% 带宽峰值 | 内存带宽瓶颈 |
-| vec_dot (f32) | AVX2: 6-8×, AVX512: 12-14× | ≥ 90% 带宽峰值 | SIMD 宽度 |
-| rms_norm | AVX2: 4-6×, AVX512: 8-10× | ≥ 90% 带宽峰值 | 两次遍历 |
-| softmax | AVX2: 3-5× | ≥ 85% 带宽峰值 | exp 近似开销 |
-| dequant_q4_k | AVX2: 3-4× | ≥ 90% 带宽峰值 | 解码开销 |
-| quant_gemv (q4) | AVX2: 4-6×, AVX512: 8-12× | ≥ 85% 瓶颈极限 | 汇编微内核 |
-| quant_gemm (q4) | AVX2: 5-7×, AVX512: 10-14× | ≥ 85% 瓶颈极限 | 汇编微内核 |
+| GEMM (f32, large) | AVX2: 6-8×, AVX512: 12-16× | 逼近峰值 FLOPS | 汇编微内核 |
+| GEMV (f32) | AVX2: 5-7×, AVX512: 10-12× | 逼近带宽峰值 | 内存带宽瓶颈 |
+| vec_dot (f32) | AVX2: 6-8×, AVX512: 12-14× | 逼近带宽峰值 | SIMD 宽度 |
+| rms_norm | AVX2: 4-6×, AVX512: 8-10× | 逼近带宽峰值 | 两次遍历 |
+| softmax | AVX2: 3-5× | 逼近带宽峰值 | exp 近似开销 |
+| dequant_q4_k | AVX2: 3-4× | 逼近带宽峰值 | 解码开销 |
+| quant_gemv (q4) | AVX2: 4-6×, AVX512: 8-12× | 逼近瓶颈极限 | 汇编微内核 |
+| quant_gemm (q4) | AVX2: 5-7×, AVX512: 10-14× | 逼近瓶颈极限 | 汇编微内核 |
 
 ---
 

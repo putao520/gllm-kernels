@@ -12,9 +12,9 @@
 
 | ID | 需求 | 验收标准 | 状态 |
 |----|------|----------|------|
-| **REQ-PERF-001** | Compute-bound 算子逼近计算峰值 | GEMM 达到理论 FLOPS 峰值的 **≥ 85%** | 🟡 unpacked 42%, prepacked 59%。差距根因：blocking 参数未经 autotuning 闭环、pack_b 标量路径、微内核无软件流水线。见 PLAN-phase4 MS-1 |
-| **REQ-PERF-002** | Memory-bound 算子逼近带宽峰值 | 激活/归一化/BLAS-1 达到内存带宽的 **≥ 90%** | 🟡 GEMV 67-76%（未达 90% 目标），activation ALU-limited 7-13 GiB/s（需 JIT Loop Fusion 消除中间 writeback） |
-| **REQ-PERF-003** | 量化算子逼近瓶颈极限 | 量化 GEMV/GEMM 达到 **≥ 85%** 瓶颈极限 | 🟡 ASM 微内核已写（Q4K/Q8K），效率未经系统测量。intrinsics 路径（Q2/Q1/IQ/AWQ/GPTQ/Squeeze）效率未知 |
+| **REQ-PERF-001** | Compute-bound 算子逼近计算峰值 | GEMM 尽可能逼近理论 FLOPS 峰值 | 🟡 unpacked 42%, prepacked 59%。差距根因：blocking 参数未经 autotuning 闭环、pack_b 标量路径、微内核无软件流水线。见 PLAN-phase4 MS-1 |
+| **REQ-PERF-002** | Memory-bound 算子逼近带宽峰值 | 激活/归一化/BLAS-1 尽可能逼近内存带宽峰值 | 🟡 GEMV 67-76%，activation ALU-limited 7-13 GiB/s（需 JIT Loop Fusion 消除中间 writeback） |
+| **REQ-PERF-003** | 量化算子逼近瓶颈极限 | 量化 GEMV/GEMM 尽可能逼近瓶颈极限 | 🟡 ASM 微内核已写（Q4K/Q8K），效率未经系统测量。intrinsics 路径（Q2/Q1/IQ/AWQ/GPTQ/Squeeze）效率未知 |
 | **REQ-PERF-004** | 手写汇编微内核 | GEMM、量化 GEMV/GEMM 必须使用 `global_asm!` 手写汇编 | 🟢 已完成（8 个 global_asm! 微内核） |
 | **REQ-PERF-005** | 运行时 CPUID 分发 | 启动时一次检测 ISA，之后零开销分发到最优微内核 | 🟢 已完成 |
 

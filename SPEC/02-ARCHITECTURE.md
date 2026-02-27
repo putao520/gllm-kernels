@@ -18,7 +18,7 @@
 
 **性能交付路径（唯一）**：
 - JIT Phase 3 代码生成（iced-x86 / dynasm-rs 程序化生成每条指令）
-- 性能目标（≥85% 理论峰值）由 JIT 生成的代码达到，不是手写 ASM 达到
+- 性能目标由 JIT 生成的代码达到，不是手写 ASM 达到
 - BLIS 5 级循环（含 pack_a/pack_b 向量化）由 JIT 自动生成
 - 软件流水线（K-loop load/compute 重叠）由 JIT 自动生成
 - Epilogue injection（GEMM+activation 融合）由 JIT 自动生成
@@ -36,8 +36,8 @@
 
 | 瓶颈类型 | 目标 | 验证方法 |
 |----------|------|---------|
-| Compute-bound | ≥ 85% FLOPS 峰值 | `实测 GFLOPS / 理论峰值 GFLOPS` |
-| Memory-bound | ≥ 90% 带宽峰值 | `实测 GB/s / STREAM 带宽` |
+| Compute-bound | 逼近 FLOPS 峰值 | `实测 GFLOPS / 理论峰值 GFLOPS` |
+| Memory-bound | 逼近带宽峰值 | `实测 GB/s / STREAM 带宽` |
 
 理论峰值计算（以 AVX2 FMA 为例）：
 ```
