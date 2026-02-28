@@ -46,7 +46,6 @@ pub mod jit {
     /// NEON register width: 4 x f32 = 128 bits.
     const NEON_WIDTH_F32: usize = 4;
     /// Number of NEON/FP registers (v0-v31).
-    #[allow(dead_code)]
     const NUM_NEON_REGS: usize = 32;
 
     /// NEON microkernel dimensions (must match asm::aarch64::MR/NR).
