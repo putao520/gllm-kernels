@@ -5,3 +5,4 @@
 # It is recommended to check this file in to source control so that
 # everyone who runs the test benefits from these saved cases.
 cc c135bcf12e5382a95331555aac6133b8e15a9e04a6a31be28be11008f1637203 # shrinks to n_ops = 2
+cc 8f3b1c6ecc126e05627c7bd38c61f0224942c6af727cb82013d13cca459acca5 # shrinks to m = 1, n = 1, k = 373

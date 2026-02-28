@@ -41,6 +41,7 @@ pub mod jit {
     use crate::compiler::buffer_alloc::BufferAllocation;
     use crate::dispatch::DeviceProfile;
     use super::CodegenOutput;
+    use crate::compiler::codegen::simd_ops::{SimdOps, VReg, BaseReg, MemOperand, Label};
 
     /// NEON register width: 4 x f32 = 128 bits.
     const NEON_WIDTH_F32: usize = 4;
@@ -85,6 +86,12 @@ pub mod jit {
         blis_scratchpad_offset: usize,
         /// Initial value of blis_scratchpad_offset (= alloc.total_bytes).
         blis_base_offset: usize,
+        /// Label counter for SimdOps label allocation.
+        label_counter: u32,
+        /// Label positions (byte offset in code buffer), None if not yet defined.
+        labels: Vec<Option<usize>>,
+        /// Pending forward branch patches: (patch_position_in_code, label_id).
+        pending_patches: Vec<(usize, u32)>,
     }
 
     impl AArch64CodeGen {
@@ -96,6 +103,9 @@ pub mod jit {
                 blis_scratchpad_bytes: 0,
                 blis_scratchpad_offset: 0,
                 blis_base_offset: 0,
+                label_counter: 0,
+                labels: Vec::new(),
+                pending_patches: Vec::new(),
             }
         }
 
@@ -118,7 +128,7 @@ pub mod jit {
             profile: &DeviceProfile,
             registry: Option<&ScalarOpRegistry>,
         ) -> Result<CodegenOutput, String> {
-            self.emit_prologue();
+            self.emit_prologue_raw();
 
             self.blis_scratchpad_offset = alloc.total_bytes;
             self.blis_base_offset = alloc.total_bytes;
@@ -127,7 +137,7 @@ pub mod jit {
                 self.emit_group(group, graph, profile, registry)?;
             }
 
-            self.emit_epilogue();
+            self.emit_epilogue_raw();
 
             Ok(CodegenOutput {
                 code: self.code.clone(),
@@ -136,7 +146,7 @@ pub mod jit {
         }
 
         /// AAPCS64 prologue: save frame pointer + link register.
-        fn emit_prologue(&mut self) {
+        fn emit_prologue_raw(&mut self) {
             // stp x29, x30, [sp, #-16]!
             self.emit_u32(0xA9BF7BFD);
             // mov x29, sp
@@ -144,7 +154,7 @@ pub mod jit {
         }
 
         /// Restore frame pointer + link register and return.
-        fn emit_epilogue(&mut self) {
+        fn emit_epilogue_raw(&mut self) {
             // ldp x29, x30, [sp], #16
             self.emit_u32(0xA8C17BFD);
             // ret
@@ -241,7 +251,7 @@ pub mod jit {
                     self.emit_gemm_microkernel(*m, *n, *k, profile)
                 }
                 _ => {
-                    self.emit_nop();
+                    self.emit_nop_raw();
                     Ok(())
                 }
             }
@@ -272,7 +282,7 @@ pub mod jit {
             };
 
             if elem_count == 0 {
-                self.emit_nop();
+                self.emit_nop_raw();
                 return Ok(());
             }
 
@@ -309,7 +319,7 @@ pub mod jit {
 
             if trace_info.is_empty() {
                 // Fallback: emit nop placeholder when no registry available
-                self.emit_nop();
+                self.emit_nop_raw();
                 return Ok(());
             }
 
@@ -555,7 +565,7 @@ pub mod jit {
                     }
                 }
                 _ => {
-                    self.emit_nop();
+                    self.emit_nop_raw();
                     Ok(())
                 }
             }
@@ -1010,7 +1020,7 @@ pub mod jit {
                         self.emit_gemm_microkernel(*m, *n, *k, profile)?;
                     }
                     _ => {
-                        self.emit_nop();
+                        self.emit_nop_raw();
                     }
                 }
             }
@@ -1022,7 +1032,7 @@ pub mod jit {
                     self.emit_gemm_microkernel(*m, *n, *k, profile)
                 }
                 _ => {
-                    self.emit_nop();
+                    self.emit_nop_raw();
                     Ok(())
                 }
             }
@@ -1049,7 +1059,7 @@ pub mod jit {
                         self.emit_gemm_microkernel(*m, *n, *k, profile)?;
                     }
                     _ => {
-                        self.emit_nop();
+                        self.emit_nop_raw();
                     }
                 }
             }
@@ -1061,7 +1071,7 @@ pub mod jit {
                     self.emit_gemm_microkernel(*m, *n, *k, profile)
                 }
                 _ => {
-                    self.emit_nop();
+                    self.emit_nop_raw();
                     Ok(())
                 }
             }
@@ -1858,7 +1868,7 @@ pub mod jit {
         }
 
         /// Emit a NEON nop (`hint #0` = 0xD503201F).
-        fn emit_nop(&mut self) {
+        fn emit_nop_raw(&mut self) {
             self.emit_u32(0xD503201F);
         }
 
@@ -1871,6 +1881,546 @@ pub mod jit {
         #[cfg(test)]
         pub fn code_bytes(&self) -> &[u8] {
             &self.code
+        }
+    }
+
+    // ── SimdOps trait implementation ──────────────────────────────────
+
+    /// Convert a BaseReg to its AArch64 GP register number.
+    fn gpr_num(base: &BaseReg) -> u8 {
+        match base {
+            BaseReg::Arg(n) => *n,
+            BaseReg::StackPtr => 31,
+            BaseReg::ScratchpadBase => 22,
+            BaseReg::OutputPtr => 7,
+            BaseReg::LoopVar(n) => 19 + *n,
+            BaseReg::Scratch(n) => 9 + *n,
+        }
+    }
+
+    impl SimdOps for AArch64CodeGen {
+        // ── Vector arithmetic ───────────────────────────────────────
+
+        fn vadd(&mut self, dst: VReg, a: VReg, b: VReg) -> Result<(), String> {
+            self.emit_u32(Self::encode_f32x4_binop(0x4E20D400, dst.0, a.0, b.0));
+            Ok(())
+        }
+
+        fn vsub(&mut self, dst: VReg, a: VReg, b: VReg) -> Result<(), String> {
+            self.emit_u32(Self::encode_f32x4_binop(0x4EA0D400, dst.0, a.0, b.0));
+            Ok(())
+        }
+
+        fn vmul(&mut self, dst: VReg, a: VReg, b: VReg) -> Result<(), String> {
+            self.emit_u32(Self::encode_f32x4_binop(0x6E20DC00, dst.0, a.0, b.0));
+            Ok(())
+        }
+
+        fn vdiv(&mut self, dst: VReg, a: VReg, b: VReg) -> Result<(), String> {
+            self.emit_u32(Self::encode_f32x4_binop(0x6E20FC00, dst.0, a.0, b.0));
+            Ok(())
+        }
+
+        fn vfma(&mut self, dst: VReg, a: VReg, b: VReg, c: VReg) -> Result<(), String> {
+            self.emit_u32(Self::encode_mov_v(dst.0, c.0));
+            self.emit_u32(Self::encode_fmla(dst.0, a.0, b.0));
+            Ok(())
+        }
+
+        fn vneg(&mut self, dst: VReg, a: VReg) -> Result<(), String> {
+            self.emit_u32(Self::encode_f32x4_unary(0x6EA0F800, dst.0, a.0));
+            Ok(())
+        }
+
+        fn vabs(&mut self, dst: VReg, a: VReg) -> Result<(), String> {
+            self.emit_u32(Self::encode_f32x4_unary(0x4EA0F800, dst.0, a.0));
+            Ok(())
+        }
+
+        fn vsqrt(&mut self, dst: VReg, a: VReg) -> Result<(), String> {
+            self.emit_u32(Self::encode_f32x4_unary(0x6EA1F800, dst.0, a.0));
+            Ok(())
+        }
+
+        fn vmax(&mut self, dst: VReg, a: VReg, b: VReg) -> Result<(), String> {
+            self.emit_u32(Self::encode_f32x4_binop(0x4E20F400, dst.0, a.0, b.0));
+            Ok(())
+        }
+
+        fn vmin(&mut self, dst: VReg, a: VReg, b: VReg) -> Result<(), String> {
+            self.emit_u32(Self::encode_f32x4_binop(0x4EA0F400, dst.0, a.0, b.0));
+            Ok(())
+        }
+
+        // ── Approximate reciprocals ─────────────────────────────────
+
+        fn vrecip(&mut self, dst: VReg, a: VReg) -> Result<(), String> {
+            self.emit_recip_refined_neon(dst.0, a.0);
+            Ok(())
+        }
+
+        fn vrsqrt(&mut self, dst: VReg, a: VReg) -> Result<(), String> {
+            self.emit_rsqrt_refined_neon(dst.0, a.0);
+            Ok(())
+        }
+
+        // ── Memory operations ───────────────────────────────────────
+
+        fn vload(&mut self, dst: VReg, mem: MemOperand) -> Result<(), String> {
+            let base = gpr_num(&mem.base);
+            if mem.offset == 0 && base != 31 {
+                // ld1 {vt.4s}, [xn]
+                self.emit_u32(0x4C407800 | ((base as u32) << 5) | (dst.0 as u32));
+            } else {
+                // Compute effective address in x9
+                self.emit_mov_reg(9, base);
+                if mem.offset != 0 {
+                    if mem.offset > 0 && (mem.offset as u32) < 4096 {
+                        self.emit_add_imm(9, 9, mem.offset as u32);
+                    } else if mem.offset < 0 && ((-mem.offset) as u32) < 4096 {
+                        let imm = (-mem.offset) as u32;
+                        self.emit_u32(0xD1000000
+                            | ((imm & 0xFFF) << 10)
+                            | (9u32 << 5)
+                            | 9u32);
+                    } else {
+                        self.emit_mov_imm(10, mem.offset as usize);
+                        self.emit_add_reg(9, 9, 10);
+                    }
+                }
+                // ld1 {vt.4s}, [x9]
+                self.emit_u32(0x4C407800 | (9u32 << 5) | (dst.0 as u32));
+            }
+            Ok(())
+        }
+
+        fn vstore(&mut self, mem: MemOperand, src: VReg) -> Result<(), String> {
+            let base = gpr_num(&mem.base);
+            if mem.offset == 0 && base != 31 {
+                // st1 {vt.4s}, [xn]
+                self.emit_u32(0x4C007800 | ((base as u32) << 5) | (src.0 as u32));
+            } else {
+                self.emit_mov_reg(9, base);
+                if mem.offset != 0 {
+                    if mem.offset > 0 && (mem.offset as u32) < 4096 {
+                        self.emit_add_imm(9, 9, mem.offset as u32);
+                    } else if mem.offset < 0 && ((-mem.offset) as u32) < 4096 {
+                        let imm = (-mem.offset) as u32;
+                        self.emit_u32(0xD1000000
+                            | ((imm & 0xFFF) << 10)
+                            | (9u32 << 5)
+                            | 9u32);
+                    } else {
+                        self.emit_mov_imm(10, mem.offset as usize);
+                        self.emit_add_reg(9, 9, 10);
+                    }
+                }
+                // st1 {vt.4s}, [x9]
+                self.emit_u32(0x4C007800 | (9u32 << 5) | (src.0 as u32));
+            }
+            Ok(())
+        }
+
+        fn vbroadcast(&mut self, dst: VReg, mem: MemOperand) -> Result<(), String> {
+            let base = gpr_num(&mem.base);
+            // Compute effective address in x9
+            self.emit_mov_reg(9, base);
+            if mem.offset != 0 {
+                if mem.offset > 0 && (mem.offset as u32) < 4096 {
+                    self.emit_add_imm(9, 9, mem.offset as u32);
+                } else if mem.offset < 0 && ((-mem.offset) as u32) < 4096 {
+                    let imm = (-mem.offset) as u32;
+                    self.emit_u32(0xD1000000 | ((imm & 0xFFF) << 10) | (9u32 << 5) | 9u32);
+                } else {
+                    self.emit_mov_imm(10, mem.offset as usize);
+                    self.emit_add_reg(9, 9, 10);
+                }
+            }
+            // ldr s_dst, [x9] (scalar load)
+            self.emit_u32(0xBD400000 | (9u32 << 5) | (dst.0 as u32));
+            // dup v_dst.4s, v_dst.s[0]
+            self.emit_u32(0x4E040400 | ((dst.0 as u32) << 5) | (dst.0 as u32));
+            Ok(())
+        }
+
+        fn vbroadcast_const(&mut self, dst: VReg, val: f32) -> Result<(), String> {
+            self.emit_load_f32_const_neon(dst.0, val);
+            Ok(())
+        }
+
+        fn vzero(&mut self, dst: VReg) -> Result<(), String> {
+            self.emit_u32(Self::encode_eor_v(dst.0, dst.0, dst.0));
+            Ok(())
+        }
+
+        fn vmov(&mut self, dst: VReg, src: VReg) -> Result<(), String> {
+            self.emit_u32(Self::encode_mov_v(dst.0, src.0));
+            Ok(())
+        }
+
+        // ── Bitwise / integer operations ────────────────────────────
+
+        fn vand(&mut self, dst: VReg, a: VReg, b: VReg) -> Result<(), String> {
+            self.emit_u32(Self::encode_and_v(dst.0, a.0, b.0));
+            Ok(())
+        }
+
+        fn vor(&mut self, dst: VReg, a: VReg, b: VReg) -> Result<(), String> {
+            self.emit_u32(Self::encode_orr_v(dst.0, a.0, b.0));
+            Ok(())
+        }
+
+        fn vxor(&mut self, dst: VReg, a: VReg, b: VReg) -> Result<(), String> {
+            self.emit_u32(Self::encode_eor_v(dst.0, a.0, b.0));
+            Ok(())
+        }
+
+        fn vshr_i32(&mut self, dst: VReg, a: VReg, imm: u8) -> Result<(), String> {
+            self.emit_u32(Self::encode_ushr_4s(dst.0, a.0, imm));
+            Ok(())
+        }
+
+        fn vshl_i32(&mut self, dst: VReg, a: VReg, imm: u8) -> Result<(), String> {
+            // SHL Vd.4S, Vn.4S, #shift
+            // immh:immb = shift + 32 (for 32-bit element size)
+            let immh_immb = (imm as u32) + 32;
+            self.emit_u32(0x4F005400
+                | ((immh_immb & 0x7F) << 16)
+                | ((a.0 as u32) << 5)
+                | (dst.0 as u32));
+            Ok(())
+        }
+
+        fn vcvt_i32_f32(&mut self, dst: VReg, a: VReg) -> Result<(), String> {
+            // SCVTF Vd.4S, Vn.4S (signed i32 → f32)
+            self.emit_u32(0x4E21D800 | ((a.0 as u32) << 5) | (dst.0 as u32));
+            Ok(())
+        }
+
+        fn vcvt_f32_i32(&mut self, dst: VReg, a: VReg) -> Result<(), String> {
+            // FCVTZS Vd.4S, Vn.4S (f32 → signed i32, truncate toward zero)
+            self.emit_u32(0x4EA1B800 | ((a.0 as u32) << 5) | (dst.0 as u32));
+            Ok(())
+        }
+
+        fn vround(&mut self, dst: VReg, a: VReg) -> Result<(), String> {
+            // FRINTN Vd.4S, Vn.4S (round to nearest, ties to even)
+            self.emit_u32(0x4E218800 | ((a.0 as u32) << 5) | (dst.0 as u32));
+            Ok(())
+        }
+
+        fn vadd_i32(&mut self, dst: VReg, a: VReg, b: VReg) -> Result<(), String> {
+            // ADD Vd.4S, Vn.4S, Vm.4S (integer add)
+            self.emit_u32(0x4EA08400
+                | ((b.0 as u32) << 16)
+                | ((a.0 as u32) << 5)
+                | (dst.0 as u32));
+            Ok(())
+        }
+
+        // ── FMA variants ────────────────────────────────────────────
+
+        fn vfmadd213(&mut self, dst: VReg, a: VReg, b: VReg) -> Result<(), String> {
+            // dst = dst * a + b
+            // Use v30 as scratch: mov v30, b; fmla v30, dst, a; mov dst, v30
+            self.emit_u32(Self::encode_mov_v(30, b.0));
+            self.emit_u32(Self::encode_fmla(30, dst.0, a.0));
+            self.emit_u32(Self::encode_mov_v(dst.0, 30));
+            Ok(())
+        }
+
+        fn vfmadd231(&mut self, dst: VReg, a: VReg, b: VReg) -> Result<(), String> {
+            // dst = a * b + dst → FMLA dst, a, b
+            self.emit_u32(Self::encode_fmla(dst.0, a.0, b.0));
+            Ok(())
+        }
+
+        // ── Loop control ────────────────────────────────────────────
+
+        fn alloc_label(&mut self) -> Label {
+            let id = self.label_counter;
+            self.label_counter += 1;
+            self.labels.push(None);
+            Label(id)
+        }
+
+        fn define_label(&mut self, label: Label) -> Result<(), String> {
+            let id = label.0 as usize;
+            if id >= self.labels.len() {
+                return Err(format!("label {} not allocated", id));
+            }
+            let here = self.code.len();
+            self.labels[id] = Some(here);
+
+            // Patch all pending forward references to this label
+            let mut i = 0;
+            while i < self.pending_patches.len() {
+                if self.pending_patches[i].1 == label.0 {
+                    let patch_pos = self.pending_patches[i].0;
+                    let existing = u32::from_le_bytes([
+                        self.code[patch_pos],
+                        self.code[patch_pos + 1],
+                        self.code[patch_pos + 2],
+                        self.code[patch_pos + 3],
+                    ]);
+                    let offset = ((here as i32) - (patch_pos as i32)) / 4;
+
+                    let patched = if existing & 0xFC000000 == 0x14000000 {
+                        // Unconditional branch B
+                        0x14000000 | ((offset as u32) & 0x3FFFFFF)
+                    } else if existing & 0xFF000010 == 0x54000000 {
+                        // Conditional branch B.cond
+                        let cond = existing & 0xF;
+                        0x54000000 | (((offset as u32) & 0x7FFFF) << 5) | cond
+                    } else if existing & 0x7F000000 == 0x35000000
+                           || existing & 0x7F000000 == 0x34000000 {
+                        // CBNZ / CBZ
+                        let base = existing & 0xFF00001F;
+                        base | (((offset as u32) & 0x7FFFF) << 5)
+                    } else {
+                        return Err(format!("unknown branch encoding at {}", patch_pos));
+                    };
+
+                    self.code[patch_pos..patch_pos + 4]
+                        .copy_from_slice(&patched.to_le_bytes());
+                    self.pending_patches.swap_remove(i);
+                } else {
+                    i += 1;
+                }
+            }
+            Ok(())
+        }
+
+        fn jump(&mut self, label: Label) -> Result<(), String> {
+            let id = label.0 as usize;
+            if id < self.labels.len() {
+                if let Some(target) = self.labels[id] {
+                    // Label already defined — emit backward branch
+                    let offset = ((target as i32) - (self.code.len() as i32)) / 4;
+                    self.emit_u32(0x14000000 | ((offset as u32) & 0x3FFFFFF));
+                    return Ok(());
+                }
+            }
+            // Forward reference — emit placeholder and record patch
+            let patch_pos = self.code.len();
+            self.emit_u32(0x14000000); // placeholder B
+            self.pending_patches.push((patch_pos, label.0));
+            Ok(())
+        }
+
+        fn dec_and_branch_nz(&mut self, counter: BaseReg, label: Label) -> Result<(), String> {
+            let rd = gpr_num(&counter);
+            // sub rd, rd, #1
+            self.emit_u32(0xD1000400 | ((rd as u32) << 5) | (rd as u32));
+
+            let id = label.0 as usize;
+            if id < self.labels.len() {
+                if let Some(target) = self.labels[id] {
+                    let offset = ((target as i32) - (self.code.len() as i32)) / 4;
+                    let imm19 = (offset as u32) & 0x7FFFF;
+                    self.emit_u32(0xB5000000 | (imm19 << 5) | (rd as u32));
+                    return Ok(());
+                }
+            }
+            // Forward reference
+            let patch_pos = self.code.len();
+            self.emit_u32(0xB5000000 | (rd as u32)); // CBNZ placeholder
+            self.pending_patches.push((patch_pos, label.0));
+            Ok(())
+        }
+
+        fn cmp_and_branch_lt(&mut self, reg: BaseReg, imm: i64, label: Label) -> Result<(), String> {
+            let rn = gpr_num(&reg);
+            // cmp rn, #imm
+            self.emit_cmp_imm(rn, imm as u32);
+
+            let id = label.0 as usize;
+            if id < self.labels.len() {
+                if let Some(target) = self.labels[id] {
+                    let offset = ((target as i32) - (self.code.len() as i32)) / 4;
+                    let imm19 = (offset as u32) & 0x7FFFF;
+                    // b.lt = condition 0xB
+                    self.emit_u32(0x5400000B | (imm19 << 5));
+                    return Ok(());
+                }
+            }
+            let patch_pos = self.code.len();
+            self.emit_u32(0x5400000B); // b.lt placeholder
+            self.pending_patches.push((patch_pos, label.0));
+            Ok(())
+        }
+
+        fn cmp_and_branch_ge(&mut self, reg: BaseReg, imm: i64, label: Label) -> Result<(), String> {
+            let rn = gpr_num(&reg);
+            // cmp rn, #imm
+            self.emit_cmp_imm(rn, imm as u32);
+
+            let id = label.0 as usize;
+            if id < self.labels.len() {
+                if let Some(target) = self.labels[id] {
+                    let offset = ((target as i32) - (self.code.len() as i32)) / 4;
+                    let imm19 = (offset as u32) & 0x7FFFF;
+                    // b.ge = condition 0xA
+                    self.emit_u32(0x5400000A | (imm19 << 5));
+                    return Ok(());
+                }
+            }
+            let patch_pos = self.code.len();
+            self.emit_u32(0x5400000A); // b.ge placeholder
+            self.pending_patches.push((patch_pos, label.0));
+            Ok(())
+        }
+
+        // ── GPR operations ──────────────────────────────────────────
+
+        fn gpr_load_imm(&mut self, dst: BaseReg, imm: i64) -> Result<(), String> {
+            let rd = gpr_num(&dst);
+            self.emit_mov_imm(rd, imm as usize);
+            Ok(())
+        }
+
+        fn gpr_add_imm(&mut self, dst: BaseReg, imm: i32) -> Result<(), String> {
+            let rd = gpr_num(&dst);
+            if imm >= 0 && (imm as u32) < 4096 {
+                self.emit_add_imm(rd, rd, imm as u32);
+            } else if imm < 0 && ((-imm) as u32) < 4096 {
+                // sub rd, rd, #(-imm)
+                let abs_imm = (-imm) as u32;
+                self.emit_u32(0xD1000000
+                    | ((abs_imm & 0xFFF) << 10)
+                    | ((rd as u32) << 5)
+                    | (rd as u32));
+            } else {
+                // Large immediate: load into x10, then add/sub
+                if imm >= 0 {
+                    self.emit_mov_imm(10, imm as usize);
+                    self.emit_add_reg(rd, rd, 10);
+                } else {
+                    self.emit_mov_imm(10, (-imm) as usize);
+                    self.emit_sub_reg(rd, rd, 10);
+                }
+            }
+            Ok(())
+        }
+
+        fn gpr_mov(&mut self, dst: BaseReg, src: BaseReg) -> Result<(), String> {
+            self.emit_mov_reg(gpr_num(&dst), gpr_num(&src));
+            Ok(())
+        }
+
+        // ── Function frame ──────────────────────────────────────────
+
+        fn emit_prologue(&mut self) -> Result<(), String> {
+            self.emit_prologue_raw();
+            Ok(())
+        }
+
+        fn emit_epilogue(&mut self) -> Result<(), String> {
+            self.emit_epilogue_raw();
+            Ok(())
+        }
+
+        fn finalize(&mut self) -> Result<CodegenOutput, String> {
+            Ok(CodegenOutput {
+                code: self.code.clone(),
+                scratchpad_bytes: self.blis_scratchpad_bytes,
+            })
+        }
+
+        // ── Prefetch ────────────────────────────────────────────────
+
+        fn prefetch_l1(&mut self, mem: MemOperand) -> Result<(), String> {
+            let base = gpr_num(&mem.base);
+            if mem.offset == 0 {
+                // PRFM PLDL1KEEP, [xn]
+                self.emit_u32(0xF9800000 | ((base as u32) << 5));
+            } else if mem.offset > 0 && mem.offset % 8 == 0 && (mem.offset / 8) < 4096 {
+                let imm12 = (mem.offset / 8) as u32;
+                self.emit_u32(0xF9800000 | (imm12 << 10) | ((base as u32) << 5));
+            } else {
+                // Compute address in x9, then prefetch
+                self.emit_mov_reg(9, base);
+                if mem.offset > 0 && (mem.offset as u32) < 4096 {
+                    self.emit_add_imm(9, 9, mem.offset as u32);
+                } else {
+                    self.emit_mov_imm(10, mem.offset as usize);
+                    self.emit_add_reg(9, 9, 10);
+                }
+                self.emit_u32(0xF9800000 | (9u32 << 5));
+            }
+            Ok(())
+        }
+
+        // ── Non-temporal store ──────────────────────────────────────
+
+        fn vstore_nt(&mut self, mem: MemOperand, src: VReg) -> Result<(), String> {
+            // NEON doesn't have direct non-temporal vector stores like x86.
+            // Fall back to regular store.
+            self.vstore(mem, src)
+        }
+
+        // ── Memory fence ────────────────────────────────────────────
+
+        fn sfence(&mut self) -> Result<(), String> {
+            // DMB ISH (data memory barrier, inner shareable)
+            self.emit_u32(0xD5033BBF);
+            Ok(())
+        }
+
+        // ── Scalar operations ───────────────────────────────────────
+
+        fn scalar_load(&mut self, dst: VReg, mem: MemOperand) -> Result<(), String> {
+            let base = gpr_num(&mem.base);
+            self.emit_mov_reg(9, base);
+            if mem.offset != 0 {
+                if mem.offset > 0 && (mem.offset as u32) < 4096 {
+                    self.emit_add_imm(9, 9, mem.offset as u32);
+                } else if mem.offset < 0 && ((-mem.offset) as u32) < 4096 {
+                    let imm = (-mem.offset) as u32;
+                    self.emit_u32(0xD1000000 | ((imm & 0xFFF) << 10) | (9u32 << 5) | 9u32);
+                } else {
+                    self.emit_mov_imm(10, mem.offset as usize);
+                    self.emit_add_reg(9, 9, 10);
+                }
+            }
+            // ldr s_dst, [x9]
+            self.emit_u32(0xBD400000 | (9u32 << 5) | (dst.0 as u32));
+            Ok(())
+        }
+
+        fn scalar_store(&mut self, mem: MemOperand, src: VReg) -> Result<(), String> {
+            let base = gpr_num(&mem.base);
+            self.emit_mov_reg(9, base);
+            if mem.offset != 0 {
+                if mem.offset > 0 && (mem.offset as u32) < 4096 {
+                    self.emit_add_imm(9, 9, mem.offset as u32);
+                } else if mem.offset < 0 && ((-mem.offset) as u32) < 4096 {
+                    let imm = (-mem.offset) as u32;
+                    self.emit_u32(0xD1000000 | ((imm & 0xFFF) << 10) | (9u32 << 5) | 9u32);
+                } else {
+                    self.emit_mov_imm(10, mem.offset as usize);
+                    self.emit_add_reg(9, 9, 10);
+                }
+            }
+            // str s_src, [x9]
+            self.emit_u32(0xBD000000 | (9u32 << 5) | (src.0 as u32));
+            Ok(())
+        }
+
+        // ── External function calls ─────────────────────────────────
+
+        fn call_fn_ptr(&mut self, addr: u64) -> Result<(), String> {
+            // Load address into x10, then blr x10
+            self.emit_mov_imm(10, addr as usize);
+            self.emit_blr(10);
+            Ok(())
+        }
+
+        // ── NOP ─────────────────────────────────────────────────────
+
+        fn emit_nop(&mut self) -> Result<(), String> {
+            self.emit_nop_raw();
+            Ok(())
         }
     }
 }

@@ -227,8 +227,13 @@ impl DeviceProfile {
         // Small matrix optimization: skip blocking overhead for tiny matrices.
         // Packing cost dominates when the total volume is small.
         if m.saturating_mul(n).saturating_mul(k) < 4096 {
+            let (l1, _, _) = self.cache_sizes();
+            let elem_size = 4usize; // f32
+            // Clamp kc so micropanels (MR×KC + NR×KC) still fit in L1
+            let max_kc = l1 / (elem_size * (mr + nr));
+            let kc = k.max(1).min(max_kc.max(1));
             return GemmBlocking {
-                kc: k.max(1),
+                kc,
                 mc: m.max(1),
                 nc: n.max(1),
                 mr,

@@ -18,6 +18,10 @@
 pub mod x86_64;
 pub mod aarch64;
 pub mod emitter;
+pub mod simd_ops;
+pub mod algorithm;
+pub mod math_approx;
+pub mod target_desc;
 
 pub use emitter::{MachineCodeEmitter, PlatformBackend, Platform};
 
