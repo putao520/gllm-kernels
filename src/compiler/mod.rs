@@ -414,23 +414,35 @@ mod tests {
         let fplan = fusion::fuse(&graph, &profile);
         assert!(fplan.num_groups() < graph.num_ops());
 
-        // Phase 3: Codegen (stub — JIT feature not enabled in this test)
-        #[allow(deprecated)]
-        let output = codegen::emitter::emit_stub_code(&graph);
-        assert!(!output.code.is_empty());
-        assert!(output.scratchpad_bytes > 0);
-
-        // Wrap as CompiledLayer
-        let layer = CompiledLayer::from_code(&output.code, output.scratchpad_bytes, 0).unwrap();
-        assert!(layer.code_size() > 0);
-
-        eprintln!(
-            "E2E LLaMA-7B: {} ops → {} groups → {} bytes code, {} bytes scratch",
-            graph.num_ops(),
-            fplan.num_groups(),
-            layer.code_size(),
-            output.scratchpad_bytes,
-        );
+        // Phase 3: Codegen
+        #[cfg(feature = "jit-x86")]
+        {
+            let registry = registry::ScalarOpRegistry::with_defaults();
+            let dag = semantic_dag::SemanticDAG::from_graph(&graph, &registry);
+            let fusion_plan = fusion::fuse_with_dag_prebuilt(&graph, &dag, &profile);
+            let lifetimes = buffer_alloc::analyze_lifetimes(&graph, &fusion_plan);
+            let alloc = buffer_alloc::allocate_buffers(&lifetimes);
+            let mut cg = codegen::x86_64::X86CodeGen::new(&profile);
+            let output = cg.emit_plan(&fusion_plan, &graph, &alloc, &profile, Some(&registry))
+                .expect("JIT codegen failed");
+            let layer = CompiledLayer::from_code(&output.code, output.scratchpad_bytes, 0).unwrap();
+            assert!(layer.code_size() > 0);
+            eprintln!(
+                "E2E LLaMA-7B: {} ops → {} groups → {} bytes code, {} bytes scratch",
+                graph.num_ops(),
+                fplan.num_groups(),
+                layer.code_size(),
+                output.scratchpad_bytes,
+            );
+        }
+        #[cfg(not(feature = "jit-x86"))]
+        {
+            eprintln!(
+                "E2E LLaMA-7B: {} ops → {} groups (Phase 3 skipped, jit-x86 not enabled)",
+                graph.num_ops(),
+                fplan.num_groups(),
+            );
+        }
     }
 
     /// End-to-end: full JIT pipeline for Gemma-2B (GeGLU variant).
@@ -442,19 +454,27 @@ mod tests {
 
         let graph = CompilerGraph::from_layer_ir(&ir, &profile).expect("from_layer_ir failed");
         let fplan = fusion::fuse(&graph, &profile);
-        #[allow(deprecated)]
-        let output = codegen::emitter::emit_stub_code(&graph);
 
-        let mut compiler = InferenceCompiler::with_profile(profile);
-        let layer = compiler.compile_layer(&ir).unwrap();
-        assert!(layer.code_size() > 0);
-
-        eprintln!(
-            "E2E Gemma-2B: {} ops → {} groups → {} bytes code",
-            graph.num_ops(),
-            fplan.num_groups(),
-            layer.code_size(),
-        );
+        #[cfg(feature = "jit-x86")]
+        {
+            let mut compiler = InferenceCompiler::with_profile(profile);
+            let layer = compiler.compile_layer(&ir).unwrap();
+            assert!(layer.code_size() > 0);
+            eprintln!(
+                "E2E Gemma-2B: {} ops → {} groups → {} bytes code",
+                graph.num_ops(),
+                fplan.num_groups(),
+                layer.code_size(),
+            );
+        }
+        #[cfg(not(feature = "jit-x86"))]
+        {
+            eprintln!(
+                "E2E Gemma-2B: {} ops → {} groups (Phase 3 skipped, jit-x86 not enabled)",
+                graph.num_ops(),
+                fplan.num_groups(),
+            );
+        }
     }
 
     #[test]

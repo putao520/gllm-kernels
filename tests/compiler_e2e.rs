@@ -77,23 +77,34 @@ fn test_e2e_llama_7b_full_pipeline() {
     assert!(!exec_plan.fusions.is_empty());
     assert!(exec_plan.scratchpad_bytes > 0);
 
-    // Phase 3: Codegen (stub)
-    #[allow(deprecated)]
-    let output = codegen::emitter::emit_stub_code(&graph);
-    assert!(!output.code.is_empty());
-
-    // Wrap as CompiledLayer
-    let layer = CompiledLayer::from_code(&output.code, output.scratchpad_bytes, 0).unwrap();
-    assert!(layer.code_size() > 0);
-
-    eprintln!(
-        "E2E LLaMA-7B: {} ops -> {} groups -> {} parallel strategies -> {} buffer bytes (saved {})",
-        graph.num_ops(),
-        plan.num_groups(),
-        parallel.len(),
-        alloc.total_bytes,
-        alloc.bytes_saved
-    );
+    // Phase 3: Codegen
+    #[cfg(feature = "jit-x86")]
+    {
+        let mut cg = codegen::x86_64::X86CodeGen::new(&profile);
+        let output = cg.emit_plan(&plan, &graph, &alloc, &profile, Some(&registry))
+            .expect("JIT codegen failed");
+        let layer = CompiledLayer::from_code(&output.code, output.scratchpad_bytes, 0).unwrap();
+        assert!(layer.code_size() > 0);
+        eprintln!(
+            "E2E LLaMA-7B: {} ops -> {} groups -> {} parallel strategies -> {} buffer bytes (saved {})",
+            graph.num_ops(),
+            plan.num_groups(),
+            parallel.len(),
+            alloc.total_bytes,
+            alloc.bytes_saved
+        );
+    }
+    #[cfg(not(feature = "jit-x86"))]
+    {
+        eprintln!(
+            "E2E LLaMA-7B: {} ops -> {} groups -> {} parallel strategies -> {} buffer bytes (saved {}) [Phase 3 skipped]",
+            graph.num_ops(),
+            plan.num_groups(),
+            parallel.len(),
+            alloc.total_bytes,
+            alloc.bytes_saved
+        );
+    }
 }
 
 /// Full pipeline test for Gemma-2B (GeGLU variant).
@@ -454,6 +465,7 @@ fn test_concurrent_scalar_op_registry() {
 /// Compile the same IR in 4 independent threads (each with its own compiler),
 /// verify all produce byte-identical code.
 #[test]
+#[cfg(feature = "jit-x86")]
 #[cfg(target_arch = "x86_64")]
 fn test_deterministic_across_threads() {
     use std::sync::Arc;
@@ -468,10 +480,14 @@ fn test_deterministic_across_threads() {
             let ir = Arc::clone(&ir);
             let profile = Arc::clone(&profile);
             thread::spawn(move || {
-                // Use lower-level APIs to get raw code bytes
                 let graph = CompilerGraph::from_layer_ir(&ir, &profile).expect("from_layer_ir failed");
-                #[allow(deprecated)]
-                let output = codegen::emitter::emit_stub_code(&graph);
+                let registry = ScalarOpRegistry::with_defaults();
+                let plan = fuse_with_dag(&graph, &registry, &profile);
+                let lifetimes = analyze_lifetimes(&graph, &plan);
+                let alloc = allocate_buffers(&lifetimes);
+                let mut cg = codegen::x86_64::X86CodeGen::new(&profile);
+                let output = cg.emit_plan(&plan, &graph, &alloc, &profile, Some(&registry))
+                    .expect("JIT codegen failed");
                 (output.code, output.scratchpad_bytes)
             })
         })
