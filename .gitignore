@@ -9,3 +9,14 @@ __pycache__/
 #/target
 .cargo/
 .claude/
+
+# Sensitive files
+.env
+.env.*
+*.pem
+*.key
+
+# OS / editor
+.DS_Store
+*.log
+*.tmp

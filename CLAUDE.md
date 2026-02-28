@@ -57,6 +57,9 @@
 | `SPEC/02-ARCHITECTURE.md` | 核心架构：手写汇编 + 宏驱动 + 运行时分发 + §8 编译器架构 |
 | `SPEC/03-DATA-STRUCTURE.md` | 数据结构 + 宏架构详细设计 |
 | `SPEC/05-LAYER2-INFERENCE.md` | 推理后端 + §7 JIT 编译器流水线 |
+| `SPEC/04-GPU-BACKEND.md` | GPU 后端规划（CUDA/Metal）🔴 未实现 |
+| `SPEC/PLAN-phase4-maturity.md` | Phase 4 成熟度路线图 |
+| `SPEC/PLAN-quality-hardening.md` | 质量加固计划 |
 
 ---
 
