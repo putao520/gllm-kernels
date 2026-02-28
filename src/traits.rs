@@ -232,11 +232,16 @@ pub trait Kernels<E: Element>: Send + Sync {
         // Default: unfused fallback — compute gemm_bias, then apply activation in-place
         self.gemm_bias(a, b, bias, c, m, n, k);
         let len = m * n;
+        if matches!(act, Activation::None) {
+            return;
+        }
+        // Single allocation reused for all activation types
+        let input = c[..len].to_vec();
         match act {
-            Activation::None => {},
-            Activation::Relu => self.relu(&c[..len].to_vec(), &mut c[..len]),
-            Activation::Silu => self.silu(&c[..len].to_vec(), &mut c[..len]),
-            Activation::Gelu | Activation::GeGlu => self.gelu(&c[..len].to_vec(), &mut c[..len]),
+            Activation::None => unreachable!(),
+            Activation::Relu => self.relu(&input, &mut c[..len]),
+            Activation::Silu => self.silu(&input, &mut c[..len]),
+            Activation::Gelu | Activation::GeGlu => self.gelu(&input, &mut c[..len]),
         }
     }
     fn pack_b(&self, _b: &[E], _n: usize, _k: usize) -> Vec<E> {
