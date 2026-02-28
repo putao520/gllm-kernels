@@ -1265,8 +1265,8 @@ pub mod jit {
         /// (round-robin when > 32 ops).
         ///
         /// Mapping:
-        /// - `Input(n)`    → `ldr q_reg, [x_ptr, #offset]`  (placeholder: eor zeroes reg)
-        /// - `Const(v)`    → `fmov v_reg.4s, #imm` or `ldr` from const pool (placeholder: eor)
+        /// - `Input(n)`    → `eor` zeroes reg (caller pre-loads via outer loop)
+        /// - `Const(v)`    → `eor` zeroes reg (caller pre-loads via outer loop)
         /// - `Add(a,b)`    → `fadd v_dst.4s, v_a.4s, v_b.4s`
         /// - `Sub(a,b)`    → `fsub v_dst.4s, v_a.4s, v_b.4s`
         /// - `Mul(a,b)`    → `fmul v_dst.4s, v_a.4s, v_b.4s`
@@ -1277,8 +1277,9 @@ pub mod jit {
         /// - `Sqrt(a)`     → `fsqrt v_dst.4s, v_a.4s`
         /// - `Rsqrt(a)`    → `frsqrte v_dst.4s, v_a.4s` + Newton-Raphson step
         /// - `Recip(a)`    → `frecpe v_dst.4s, v_a.4s` + Newton-Raphson step
-        /// - `Exp(a)`      → polynomial approximation (placeholder: mov)
-        /// - `Tanh(a)`     → rational approximation (placeholder: mov)
+        /// - `Exp(a)`      → polynomial approximation (`emit_exp_neon`)
+        /// - `Tanh(a)`     → rational approximation (`emit_tanh_neon`)
+        /// - `Log(a)`      → exponent extraction + polynomial (`emit_log_neon`)
         /// - `Max(a,b)`    → `fmax v_dst.4s, v_a.4s, v_b.4s`
         /// - `Min(a,b)`    → `fmin v_dst.4s, v_a.4s, v_b.4s`
         pub fn emit_trace_ops_neon(

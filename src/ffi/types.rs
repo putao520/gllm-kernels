@@ -176,7 +176,7 @@ impl GllmModelConfig {
             rope_interleaved: false,
             has_qkv_bias: self.has_qkv_bias != 0,
             partial_rotary_factor: self.partial_rotary_factor,
-            sliding_window: None, // TODO: expose via GllmModelConfig when needed
+            sliding_window: None, // not yet exposed via GllmModelConfig C ABI
         })
     }
 }

@@ -116,7 +116,7 @@ impl InferenceBackend for CpuInferenceBackend {
         output: &mut DeviceTensor,
     ) -> Result<(), InferenceError> {
         // Fallback path: operator-by-operator execution
-        // For now, implement a simplified single-token, single-batch path
+        // Single-token, single-batch path (multi-token/batch requires Layer 2 JIT)
         let h = self.config.hidden_size;
         let q_dim = self.config.num_heads * self.config.head_dim;
         let kv_dim = self.config.num_kv_heads * self.config.head_dim;
