@@ -58,8 +58,8 @@ pub trait InferenceBackend: Send + Sync {
 | 后端 | 模块 | 状态 |
 |------|------|------|
 | `CpuInferenceBackend` | `inference/cpu_backend.rs` | 🟡 基础实现（final_norm+lm_head 已完成，attention 简化） |
-| `CudaInferenceBackend` | 未实现 | 🔴 中期规划 |
-| `MetalInferenceBackend` | 未实现 | 🔴 中期规划 |
+
+> **GPU 后端**: GPU 推理不通过独立的 `InferenceBackend` 实现，而是复用同一 JIT 编译器管线（Phase 0-2 完全复用，Phase 3 新增 GPU CodeGen）。详见 SPEC/04-GPU-BACKEND.md。
 
 ---
 
