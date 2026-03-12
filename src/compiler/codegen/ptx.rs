@@ -786,6 +786,350 @@ fn emit_meanpool_kernel_ptx(
     writeln!(out).unwrap();
 }
 
+
+fn emit_gemm_kernel_ptx(out: &mut String, kernel_name: &str, m: usize, n: usize, k: usize) {
+    // 16x16 tiled GEMM: C[m,n] = A[m,k] * B[k,n]
+    // Grid: (ceil(n/16), ceil(m/16))  Block: (16, 16)
+    let tile = 16usize;
+    writeln!(out, ".visible .entry {kernel_name}(").unwrap();
+    writeln!(out, "    .param .u64 param_A,").unwrap();
+    writeln!(out, "    .param .u64 param_B,").unwrap();
+    writeln!(out, "    .param .u64 param_C,").unwrap();
+    writeln!(out, "    .param .u32 param_M,").unwrap();
+    writeln!(out, "    .param .u32 param_N,").unwrap();
+    writeln!(out, "    .param .u32 param_K").unwrap();
+    writeln!(out, ") {{").unwrap();
+    writeln!(out, "    .shared .f32 smA[{t2}];", t2 = tile * tile).unwrap();
+    writeln!(out, "    .shared .f32 smB[{t2}];", t2 = tile * tile).unwrap();
+    writeln!(out, "    .reg .u64 %rd<12>;").unwrap();
+    writeln!(out, "    .reg .u32 %r<20>;").unwrap();
+    writeln!(out, "    .reg .f32 %f<8>;").unwrap();
+    writeln!(out, "    .reg .pred %p<4>;").unwrap();
+    writeln!(out).unwrap();
+    // Load params
+    writeln!(out, "    ld.param.u64 %rd0, [param_A];").unwrap();
+    writeln!(out, "    ld.param.u64 %rd1, [param_B];").unwrap();
+    writeln!(out, "    ld.param.u64 %rd2, [param_C];").unwrap();
+    writeln!(out, "    ld.param.u32 %r0, [param_M];").unwrap();
+    writeln!(out, "    ld.param.u32 %r1, [param_N];").unwrap();
+    writeln!(out, "    ld.param.u32 %r2, [param_K];").unwrap();
+    // Thread/block indices
+    writeln!(out, "    mov.u32 %r3, %tid.x;").unwrap();   // tx
+    writeln!(out, "    mov.u32 %r4, %tid.y;").unwrap();   // ty
+    writeln!(out, "    mov.u32 %r5, %ctaid.x;").unwrap(); // bx
+    writeln!(out, "    mov.u32 %r6, %ctaid.y;").unwrap(); // by
+    // row = by*16 + ty,  col = bx*16 + tx
+    writeln!(out, "    mad.lo.u32 %r7, %r6, {tile}, %r4;").unwrap(); // row
+    writeln!(out, "    mad.lo.u32 %r8, %r5, {tile}, %r3;").unwrap(); // col
+    // acc = 0
+    writeln!(out, "    mov.f32 %f0, 0f00000000;").unwrap();
+    // smem base pointers
+    writeln!(out, "    mov.u64 %rd3, smA;").unwrap();
+    writeln!(out, "    mov.u64 %rd4, smB;").unwrap();
+    // tile loop: t = 0..ceil(K/16)
+    writeln!(out, "    mov.u32 %r9, 0;").unwrap(); // t
+    writeln!(out, "{kernel_name}_TILE_LOOP:").unwrap();
+    writeln!(out, "    // check t < ceil(K/16)").unwrap();
+    writeln!(out, "    mul.lo.u32 %r10, %r9, {tile};").unwrap(); // t*16
+    writeln!(out, "    setp.ge.u32 %p0, %r10, %r2;").unwrap();
+    writeln!(out, "    @%p0 bra {kernel_name}_TILE_DONE;").unwrap();
+    // Load A tile: A[row, t*16+tx]
+    writeln!(out, "    add.u32 %r11, %r10, %r3;").unwrap(); // t*16+tx
+    writeln!(out, "    setp.lt.u32 %p1, %r7, %r0;").unwrap();
+    writeln!(out, "    setp.lt.u32 %p2, %r11, %r2;").unwrap();
+    writeln!(out, "    and.pred %p1, %p1, %p2;").unwrap();
+    writeln!(out, "    mov.f32 %f1, 0f00000000;").unwrap();
+    writeln!(out, "    @%p1 {{").unwrap();
+    writeln!(out, "        mad.lo.u32 %r12, %r7, %r2, %r11;").unwrap();
+    writeln!(out, "        mul.wide.u32 %rd5, %r12, 4;").unwrap();
+    writeln!(out, "        add.u64 %rd5, %rd0, %rd5;").unwrap();
+    writeln!(out, "        ld.global.f32 %f1, [%rd5];").unwrap();
+    writeln!(out, "    }}").unwrap();
+    // store to smA[ty*16+tx]
+    writeln!(out, "    mad.lo.u32 %r13, %r4, {tile}, %r3;").unwrap();
+    writeln!(out, "    mul.wide.u32 %rd6, %r13, 4;").unwrap();
+    writeln!(out, "    add.u64 %rd6, %rd3, %rd6;").unwrap();
+    writeln!(out, "    st.shared.f32 [%rd6], %f1;").unwrap();
+    // Load B tile: B[t*16+ty, col]
+    writeln!(out, "    add.u32 %r11, %r10, %r4;").unwrap(); // t*16+ty
+    writeln!(out, "    setp.lt.u32 %p1, %r11, %r2;").unwrap();
+    writeln!(out, "    setp.lt.u32 %p2, %r8, %r1;").unwrap();
+    writeln!(out, "    and.pred %p1, %p1, %p2;").unwrap();
+    writeln!(out, "    mov.f32 %f2, 0f00000000;").unwrap();
+    writeln!(out, "    @%p1 {{").unwrap();
+    writeln!(out, "        mad.lo.u32 %r12, %r11, %r1, %r8;").unwrap();
+    writeln!(out, "        mul.wide.u32 %rd5, %r12, 4;").unwrap();
+    writeln!(out, "        add.u64 %rd5, %rd1, %rd5;").unwrap();
+    writeln!(out, "        ld.global.f32 %f2, [%rd5];").unwrap();
+    writeln!(out, "    }}").unwrap();
+    // store to smB[ty*16+tx]
+    writeln!(out, "    mul.wide.u32 %rd7, %r13, 4;").unwrap();
+    writeln!(out, "    add.u64 %rd7, %rd4, %rd7;").unwrap();
+    writeln!(out, "    st.shared.f32 [%rd7], %f2;").unwrap();
+    writeln!(out, "    bar.sync 0;").unwrap();
+    // Compute partial dot product
+    writeln!(out, "    mov.u32 %r14, 0;").unwrap(); // i
+    writeln!(out, "{kernel_name}_DOT_LOOP:").unwrap();
+    writeln!(out, "    setp.ge.u32 %p3, %r14, {tile};").unwrap();
+    writeln!(out, "    @%p3 bra {kernel_name}_DOT_DONE;").unwrap();
+    // smA[ty*16+i]
+    writeln!(out, "    mad.lo.u32 %r15, %r4, {tile}, %r14;").unwrap();
+    writeln!(out, "    mul.wide.u32 %rd8, %r15, 4;").unwrap();
+    writeln!(out, "    add.u64 %rd8, %rd3, %rd8;").unwrap();
+    writeln!(out, "    ld.shared.f32 %f3, [%rd8];").unwrap();
+    // smB[i*16+tx]
+    writeln!(out, "    mad.lo.u32 %r15, %r14, {tile}, %r3;").unwrap();
+    writeln!(out, "    mul.wide.u32 %rd9, %r15, 4;").unwrap();
+    writeln!(out, "    add.u64 %rd9, %rd4, %rd9;").unwrap();
+    writeln!(out, "    ld.shared.f32 %f4, [%rd9];").unwrap();
+    writeln!(out, "    fma.rn.f32 %f0, %f3, %f4, %f0;").unwrap();
+    writeln!(out, "    add.u32 %r14, %r14, 1;").unwrap();
+    writeln!(out, "    bra {kernel_name}_DOT_LOOP;").unwrap();
+    writeln!(out, "{kernel_name}_DOT_DONE:").unwrap();
+    writeln!(out, "    bar.sync 0;").unwrap();
+    writeln!(out, "    add.u32 %r9, %r9, 1;").unwrap();
+    writeln!(out, "    bra {kernel_name}_TILE_LOOP;").unwrap();
+    writeln!(out, "{kernel_name}_TILE_DONE:").unwrap();
+    // Write C[row, col] if in bounds
+    writeln!(out, "    setp.lt.u32 %p1, %r7, %r0;").unwrap();
+    writeln!(out, "    setp.lt.u32 %p2, %r8, %r1;").unwrap();
+    writeln!(out, "    and.pred %p1, %p1, %p2;").unwrap();
+    writeln!(out, "    @!%p1 bra {kernel_name}_END;").unwrap();
+    writeln!(out, "    mad.lo.u32 %r16, %r7, %r1, %r8;").unwrap();
+    writeln!(out, "    mul.wide.u32 %rd10, %r16, 4;").unwrap();
+    writeln!(out, "    add.u64 %rd10, %rd2, %rd10;").unwrap();
+    writeln!(out, "    st.global.f32 [%rd10], %f0;").unwrap();
+    writeln!(out, "{kernel_name}_END:").unwrap();
+    writeln!(out, "    ret;").unwrap();
+    writeln!(out, "}}").unwrap();
+    writeln!(out).unwrap();
+}
+
+
+fn emit_mha_kernel_ptx(out: &mut String, kernel_name: &str, seq_len: usize, num_heads: usize, head_dim: usize) {
+    // Multi-Head Attention: output[b,h,i,j] = softmax(Q*K^T/sqrt(d)) * V
+    // Simplified: one block per (head, query_row), block_size = head_dim (capped at 256)
+    let block_size = head_dim.next_power_of_two().min(256);
+    let scale_bits = format!("{:.8e}", 1.0_f64 / (head_dim as f64).sqrt())
+        .replace("e", "e+").replace("e+-", "e-");
+    // We encode scale as hex float literal for PTX
+    let scale_f32 = 1.0_f32 / (head_dim as f32).sqrt();
+    let scale_hex = format!("0f{:08X}", scale_f32.to_bits());
+
+    writeln!(out, ".visible .entry {kernel_name}(").unwrap();
+    writeln!(out, "    .param .u64 param_Q,").unwrap();
+    writeln!(out, "    .param .u64 param_K,").unwrap();
+    writeln!(out, "    .param .u64 param_V,").unwrap();
+    writeln!(out, "    .param .u64 param_out,").unwrap();
+    writeln!(out, "    .param .u32 param_seq,").unwrap();
+    writeln!(out, "    .param .u32 param_heads,").unwrap();
+    writeln!(out, "    .param .u32 param_dim").unwrap();
+    writeln!(out, ") {{").unwrap();
+    writeln!(out, "    .shared .f32 smem_scores[{block_size}];").unwrap();
+    writeln!(out, "    .shared .f32 smem_reduce[{block_size}];").unwrap();
+    writeln!(out, "    .reg .u64 %rd<20>;").unwrap();
+    writeln!(out, "    .reg .u32 %r<24>;").unwrap();
+    writeln!(out, "    .reg .f32 %f<16>;").unwrap();
+    writeln!(out, "    .reg .pred %p<6>;").unwrap();
+    writeln!(out).unwrap();
+
+    // Load params
+    writeln!(out, "    ld.param.u64 %rd0, [param_Q];").unwrap();
+    writeln!(out, "    ld.param.u64 %rd1, [param_K];").unwrap();
+    writeln!(out, "    ld.param.u64 %rd2, [param_V];").unwrap();
+    writeln!(out, "    ld.param.u64 %rd3, [param_out];").unwrap();
+    writeln!(out, "    ld.param.u32 %r0, [param_seq];").unwrap();
+    writeln!(out, "    ld.param.u32 %r1, [param_heads];").unwrap();
+    writeln!(out, "    ld.param.u32 %r2, [param_dim];").unwrap();
+    writeln!(out, "    mov.u32 %r3, %tid.x;").unwrap();   // thread in block
+    writeln!(out, "    mov.u32 %r4, %ctaid.x;").unwrap(); // query row index
+    writeln!(out, "    mov.u32 %r5, %ctaid.y;").unwrap(); // head index
+    writeln!(out).unwrap();
+
+    // Compute Q row base: Q + (head * seq * dim + query_row * dim) * 4
+    writeln!(out, "    mul.lo.u32 %r6, %r5, %r0;").unwrap();       // head * seq
+    writeln!(out, "    add.u32 %r6, %r6, %r4;").unwrap();           // + query_row
+    writeln!(out, "    mul.lo.u32 %r6, %r6, %r2;").unwrap();        // * dim
+    writeln!(out, "    mul.wide.u32 %rd4, %r6, 4;").unwrap();
+    writeln!(out, "    add.u64 %rd4, %rd0, %rd4;").unwrap();        // Q row ptr
+    writeln!(out).unwrap();
+
+    // K base for this head: K + head * seq * dim * 4
+    writeln!(out, "    mul.lo.u32 %r7, %r5, %r0;").unwrap();
+    writeln!(out, "    mul.lo.u32 %r7, %r7, %r2;").unwrap();
+    writeln!(out, "    mul.wide.u32 %rd5, %r7, 4;").unwrap();
+    writeln!(out, "    add.u64 %rd5, %rd1, %rd5;").unwrap();        // K head ptr
+    writeln!(out).unwrap();
+
+    // V base for this head
+    writeln!(out, "    add.u64 %rd6, %rd2, %rd5;").unwrap();        // reuse offset (V same layout as K)
+    writeln!(out, "    sub.u64 %rd6, %rd6, %rd1;").unwrap();
+    writeln!(out, "    add.u64 %rd6, %rd2, %rd4;").unwrap();
+    writeln!(out, "    sub.u64 %rd6, %rd6, %rd0;").unwrap();        // V row ptr = V + same offset as Q
+    writeln!(out).unwrap();
+
+    // --- Pass 1: compute attention scores scores[j] = dot(Q[i], K[j]) * scale ---
+    writeln!(out, "    mov.u32 %r8, %r3;").unwrap(); // j = tid
+    writeln!(out, "{kernel_name}_SCORE_LOOP:").unwrap();
+    writeln!(out, "    setp.ge.u32 %p0, %r8, %r0;").unwrap();
+    writeln!(out, "    @%p0 bra {kernel_name}_SCORE_DONE;").unwrap();
+    // dot(Q[i], K[j]) over dim
+    writeln!(out, "    mov.f32 %f0, 0f00000000;").unwrap();
+    writeln!(out, "    mov.u32 %r9, 0;").unwrap(); // d
+    writeln!(out, "{kernel_name}_DOT_LOOP:").unwrap();
+    writeln!(out, "    setp.ge.u32 %p1, %r9, %r2;").unwrap();
+    writeln!(out, "    @%p1 bra {kernel_name}_DOT_DONE;").unwrap();
+    // Q[i][d]
+    writeln!(out, "    mul.wide.u32 %rd7, %r9, 4;").unwrap();
+    writeln!(out, "    add.u64 %rd7, %rd4, %rd7;").unwrap();
+    writeln!(out, "    ld.global.f32 %f1, [%rd7];").unwrap();
+    // K[j][d]
+    writeln!(out, "    mul.lo.u32 %r10, %r8, %r2;").unwrap();
+    writeln!(out, "    add.u32 %r10, %r10, %r9;").unwrap();
+    writeln!(out, "    mul.wide.u32 %rd8, %r10, 4;").unwrap();
+    writeln!(out, "    add.u64 %rd8, %rd5, %rd8;").unwrap();
+    writeln!(out, "    ld.global.f32 %f2, [%rd8];").unwrap();
+    writeln!(out, "    fma.rn.f32 %f0, %f1, %f2, %f0;").unwrap();
+    writeln!(out, "    add.u32 %r9, %r9, 1;").unwrap();
+    writeln!(out, "    bra {kernel_name}_DOT_LOOP;").unwrap();
+    writeln!(out, "{kernel_name}_DOT_DONE:").unwrap();
+    // scale
+    writeln!(out, "    mul.f32 %f0, %f0, {scale_hex};").unwrap();
+    // store to smem_scores[j % block_size]
+    writeln!(out, "    rem.u32 %r11, %r8, {block_size};").unwrap();
+    writeln!(out, "    mov.u64 %rd9, smem_scores;").unwrap();
+    writeln!(out, "    mul.wide.u32 %rd10, %r11, 4;").unwrap();
+    writeln!(out, "    add.u64 %rd10, %rd9, %rd10;").unwrap();
+    writeln!(out, "    st.shared.f32 [%rd10], %f0;").unwrap();
+    writeln!(out, "    add.u32 %r8, %r8, {block_size};").unwrap();
+    writeln!(out, "    bra {kernel_name}_SCORE_LOOP;").unwrap();
+    writeln!(out, "{kernel_name}_SCORE_DONE:").unwrap();
+    writeln!(out, "    bar.sync 0;").unwrap();
+    writeln!(out).unwrap();
+
+    // --- Pass 2: softmax over scores (reuse emit_softmax logic inline) ---
+    // find max
+    writeln!(out, "    mov.f32 %f3, 0fFF800000;").unwrap(); // -INF
+    writeln!(out, "    mov.u32 %r8, %r3;").unwrap();
+    writeln!(out, "{kernel_name}_SMAX_LOOP:").unwrap();
+    writeln!(out, "    setp.ge.u32 %p0, %r8, %r0;").unwrap();
+    writeln!(out, "    @%p0 bra {kernel_name}_SMAX_DONE;").unwrap();
+    writeln!(out, "    rem.u32 %r11, %r8, {block_size};").unwrap();
+    writeln!(out, "    mov.u64 %rd9, smem_scores;").unwrap();
+    writeln!(out, "    mul.wide.u32 %rd10, %r11, 4;").unwrap();
+    writeln!(out, "    add.u64 %rd10, %rd9, %rd10;").unwrap();
+    writeln!(out, "    ld.shared.f32 %f4, [%rd10];").unwrap();
+    writeln!(out, "    max.f32 %f3, %f3, %f4;").unwrap();
+    writeln!(out, "    add.u32 %r8, %r8, {block_size};").unwrap();
+    writeln!(out, "    bra {kernel_name}_SMAX_LOOP;").unwrap();
+    writeln!(out, "{kernel_name}_SMAX_DONE:").unwrap();
+    // reduce max across threads
+    writeln!(out, "    mov.u64 %rd11, smem_reduce;").unwrap();
+    writeln!(out, "    mul.wide.u32 %rd12, %r3, 4;").unwrap();
+    writeln!(out, "    add.u64 %rd12, %rd11, %rd12;").unwrap();
+    writeln!(out, "    st.shared.f32 [%rd12], %f3;").unwrap();
+    writeln!(out, "    bar.sync 0;").unwrap();
+    let mut stride = block_size / 2;
+    while stride > 0 {
+        writeln!(out, "    setp.lt.u32 %p1, %r3, {stride};").unwrap();
+        writeln!(out, "    @!%p1 bra {kernel_name}_MAXR_{stride};").unwrap();
+        writeln!(out, "    add.u32 %r12, %r3, {stride};").unwrap();
+        writeln!(out, "    mul.wide.u32 %rd13, %r12, 4;").unwrap();
+        writeln!(out, "    add.u64 %rd13, %rd11, %rd13;").unwrap();
+        writeln!(out, "    ld.shared.f32 %f5, [%rd13];").unwrap();
+        writeln!(out, "    ld.shared.f32 %f6, [%rd12];").unwrap();
+        writeln!(out, "    max.f32 %f6, %f6, %f5;").unwrap();
+        writeln!(out, "    st.shared.f32 [%rd12], %f6;").unwrap();
+        writeln!(out, "{kernel_name}_MAXR_{stride}:").unwrap();
+        writeln!(out, "    bar.sync 0;").unwrap();
+        stride /= 2;
+    }
+    writeln!(out, "    ld.shared.f32 %f7, [%rd11];").unwrap(); // row_max
+    writeln!(out).unwrap();
+
+    // exp(score - max) and sum
+    writeln!(out, "    mov.f32 %f8, 0f00000000;").unwrap();
+    writeln!(out, "    mov.u32 %r8, %r3;").unwrap();
+    writeln!(out, "{kernel_name}_EXP_LOOP:").unwrap();
+    writeln!(out, "    setp.ge.u32 %p0, %r8, %r0;").unwrap();
+    writeln!(out, "    @%p0 bra {kernel_name}_EXP_DONE;").unwrap();
+    writeln!(out, "    rem.u32 %r11, %r8, {block_size};").unwrap();
+    writeln!(out, "    mul.wide.u32 %rd10, %r11, 4;").unwrap();
+    writeln!(out, "    add.u64 %rd10, %rd9, %rd10;").unwrap();
+    writeln!(out, "    ld.shared.f32 %f4, [%rd10];").unwrap();
+    writeln!(out, "    sub.f32 %f4, %f4, %f7;").unwrap();
+    writeln!(out, "    mul.f32 %f4, %f4, 0f3FB8AA3B;").unwrap();
+    writeln!(out, "    ex2.approx.f32 %f4, %f4;").unwrap();
+    writeln!(out, "    st.shared.f32 [%rd10], %f4;").unwrap();
+    writeln!(out, "    add.f32 %f8, %f8, %f4;").unwrap();
+    writeln!(out, "    add.u32 %r8, %r8, {block_size};").unwrap();
+    writeln!(out, "    bra {kernel_name}_EXP_LOOP;").unwrap();
+    writeln!(out, "{kernel_name}_EXP_DONE:").unwrap();
+    // reduce sum
+    writeln!(out, "    st.shared.f32 [%rd12], %f8;").unwrap();
+    writeln!(out, "    bar.sync 0;").unwrap();
+    stride = block_size / 2;
+    while stride > 0 {
+        writeln!(out, "    setp.lt.u32 %p1, %r3, {stride};").unwrap();
+        writeln!(out, "    @!%p1 bra {kernel_name}_SUMR_{stride};").unwrap();
+        writeln!(out, "    add.u32 %r12, %r3, {stride};").unwrap();
+        writeln!(out, "    mul.wide.u32 %rd13, %r12, 4;").unwrap();
+        writeln!(out, "    add.u64 %rd13, %rd11, %rd13;").unwrap();
+        writeln!(out, "    ld.shared.f32 %f5, [%rd13];").unwrap();
+        writeln!(out, "    ld.shared.f32 %f6, [%rd12];").unwrap();
+        writeln!(out, "    add.f32 %f6, %f6, %f5;").unwrap();
+        writeln!(out, "    st.shared.f32 [%rd12], %f6;").unwrap();
+        writeln!(out, "{kernel_name}_SUMR_{stride}:").unwrap();
+        writeln!(out, "    bar.sync 0;").unwrap();
+        stride /= 2;
+    }
+    writeln!(out, "    ld.shared.f32 %f9, [%rd11];").unwrap();
+    writeln!(out, "    rcp.approx.f32 %f9, %f9;").unwrap(); // inv_sum
+    writeln!(out).unwrap();
+
+    // --- Pass 3: weighted sum over V ---
+    // out[i][d] = sum_j attn[j] * V[j][d]
+    writeln!(out, "    mov.u32 %r8, %r3;").unwrap(); // d = tid
+    writeln!(out, "{kernel_name}_OUT_LOOP:").unwrap();
+    writeln!(out, "    setp.ge.u32 %p0, %r8, %r2;").unwrap();
+    writeln!(out, "    @%p0 bra {kernel_name}_OUT_DONE;").unwrap();
+    writeln!(out, "    mov.f32 %f10, 0f00000000;").unwrap();
+    writeln!(out, "    mov.u32 %r9, 0;").unwrap(); // j
+    writeln!(out, "{kernel_name}_WSUM_LOOP:").unwrap();
+    writeln!(out, "    setp.ge.u32 %p1, %r9, %r0;").unwrap();
+    writeln!(out, "    @%p1 bra {kernel_name}_WSUM_DONE;").unwrap();
+    // attn[j] from smem_scores
+    writeln!(out, "    rem.u32 %r11, %r9, {block_size};").unwrap();
+    writeln!(out, "    mul.wide.u32 %rd10, %r11, 4;").unwrap();
+    writeln!(out, "    add.u64 %rd10, %rd9, %rd10;").unwrap();
+    writeln!(out, "    ld.shared.f32 %f11, [%rd10];").unwrap();
+    writeln!(out, "    mul.f32 %f11, %f11, %f9;").unwrap(); // normalize
+    // V[j][d]
+    writeln!(out, "    mul.lo.u32 %r13, %r9, %r2;").unwrap();
+    writeln!(out, "    add.u32 %r13, %r13, %r8;").unwrap();
+    writeln!(out, "    mul.wide.u32 %rd14, %r13, 4;").unwrap();
+    writeln!(out, "    add.u64 %rd14, %rd6, %rd14;").unwrap();
+    writeln!(out, "    ld.global.f32 %f12, [%rd14];").unwrap();
+    writeln!(out, "    fma.rn.f32 %f10, %f11, %f12, %f10;").unwrap();
+    writeln!(out, "    add.u32 %r9, %r9, 1;").unwrap();
+    writeln!(out, "    bra {kernel_name}_WSUM_LOOP;").unwrap();
+    writeln!(out, "{kernel_name}_WSUM_DONE:").unwrap();
+    // store out[i][d]
+    writeln!(out, "    mul.lo.u32 %r14, %r5, %r0;").unwrap();
+    writeln!(out, "    add.u32 %r14, %r14, %r4;").unwrap();
+    writeln!(out, "    mul.lo.u32 %r14, %r14, %r2;").unwrap();
+    writeln!(out, "    add.u32 %r14, %r14, %r8;").unwrap();
+    writeln!(out, "    mul.wide.u32 %rd15, %r14, 4;").unwrap();
+    writeln!(out, "    add.u64 %rd15, %rd3, %rd15;").unwrap();
+    writeln!(out, "    st.global.f32 [%rd15], %f10;").unwrap();
+    writeln!(out, "    add.u32 %r8, %r8, {block_size};").unwrap();
+    writeln!(out, "    bra {kernel_name}_OUT_LOOP;").unwrap();
+    writeln!(out, "{kernel_name}_OUT_DONE:").unwrap();
+    writeln!(out, "    ret;").unwrap();
+    writeln!(out, "}}").unwrap();
+    writeln!(out).unwrap();
+}
+
 // ── MachineCodeEmitter impl ─────────────────────────────────────────────────
 
 impl MachineCodeEmitter for PtxCodeGen {
@@ -887,10 +1231,20 @@ impl MachineCodeEmitter for PtxCodeGen {
                     }
                 }
                 ComputePattern::Gemm => {
-                    return Err(format!(
-                        "PtxCodeGen: GEMM codegen not yet implemented (op {:?})",
-                        op_kind
-                    ));
+                    match op_kind {
+                        OpKind::Gemm { m, n, k } | OpKind::GemmBias { m, n, k } => {
+                            emit_gemm_kernel_ptx(&mut ptx, &kernel_name, *m, *n, *k);
+                        }
+                        OpKind::MultiHeadAttention { seq_len, num_heads, head_dim } => {
+                            emit_mha_kernel_ptx(&mut ptx, &kernel_name, *seq_len, *num_heads, *head_dim);
+                        }
+                        _ => {
+                            return Err(format!(
+                                "PtxCodeGen: unsupported Gemm-pattern op {:?}",
+                                op_kind
+                            ));
+                        }
+                    }
                 }
                 ComputePattern::Injective { body, .. } => {
                     if body.is_empty() {

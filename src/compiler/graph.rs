@@ -8,7 +8,7 @@
 //! Pipeline: LayerIR → CompilerGraph → (Phase 2: fusion) → (Phase 3: codegen)
 
 use std::collections::HashMap;
-use crate::compiler::ir::LayerIR;
+use crate::compiler::ir::{LayerArch, LayerIR};
 use crate::dispatch::device_profile::DeviceProfile;
 use crate::types::DType;
 use crate::traits::Activation;
@@ -380,14 +380,19 @@ impl CompilerGraph {
         result
     }
 
-    /// Lower a `LayerIR` (Decoder architecture) into a CompilerGraph.
+    /// Lower a `LayerIR` into a CompilerGraph.
     ///
-    /// Produces the standard LLaMA-style decoder graph:
-    /// ```text
-    /// input → RmsNorm₁ → Q/K/V GEMMs → RoPE → Attention → O GEMM → Residual₁
-    ///       → RmsNorm₂ → Gate GEMM → SwiGLU(↑Up GEMM) → Down GEMM → Residual₂
-    /// ```
+    /// Dispatches to architecture-specific builders:
+    /// - Decoder: RmsNorm → Attn(QKV+RoPE+GQA+O) → Residual → RmsNorm → FFN(gate+up+SiLU+down) → Residual
+    /// - Encoder: LayerNorm → Attn(QKV+O) → Residual → LayerNorm → FFN(up+GELU+down) → Residual → MeanPool → L2Normalize
     pub fn from_layer_ir(ir: &LayerIR, _profile: &DeviceProfile) -> Result<Self, String> {
+        match &ir.arch {
+            LayerArch::Encoder => return Self::from_layer_ir_encoder(ir),
+            LayerArch::DecoderMoE { .. } => {
+                return Err("MoE decoder not yet supported in from_layer_ir".into());
+            }
+            LayerArch::Decoder => {} // fall through to existing decoder logic
+        }
         let mut g = CompilerGraph::new();
         let dt = ir.dtype;
         let b = ir.max_batch;
@@ -589,6 +594,180 @@ impl CompilerGraph {
         g.outputs = vec![output];
         Ok(g)
     }
+
+    /// Build an Encoder graph from LayerIR.
+    ///
+    /// ```text
+    /// input → LayerNorm₁ → Q/K/V GEMMs → MHA → O GEMM → Residual₁
+    ///       → LayerNorm₂ → Up GEMM → GELU → Down GEMM → Residual₂
+    ///       → MeanPool → L2Normalize
+    /// ```
+    fn from_layer_ir_encoder(ir: &LayerIR) -> Result<Self, String> {
+        let mut g = CompilerGraph::new();
+        let dt = ir.dtype;
+        let seq = ir.max_batch; // seq_len dimension
+        let h = ir.hidden;
+        let q_dim = ir.q_dim();
+        let kv_dim = ir.kv_dim();
+        let inter = ir.intermediate;
+
+        // ── Graph inputs ──
+        let input = g.add_tensor("input", vec![seq, h], dt);
+        let w_norm1 = g.add_tensor("w_ln1_gamma", vec![h], dt);
+        let w_norm1_b = g.add_tensor("w_ln1_beta", vec![h], dt);
+        let w_q = g.add_tensor("w_q", vec![h, q_dim], dt);
+        let w_k = g.add_tensor("w_k", vec![h, kv_dim], dt);
+        let w_v = g.add_tensor("w_v", vec![h, kv_dim], dt);
+        let w_o = g.add_tensor("w_o", vec![q_dim, h], dt);
+        let w_norm2 = g.add_tensor("w_ln2_gamma", vec![h], dt);
+        let w_norm2_b = g.add_tensor("w_ln2_beta", vec![h], dt);
+        let w_up = g.add_tensor("w_up", vec![h, inter], dt);
+        let w_down = g.add_tensor("w_down", vec![inter, h], dt);
+
+        g.inputs = vec![
+            input, w_norm1, w_norm1_b, w_q, w_k, w_v, w_o,
+            w_norm2, w_norm2_b, w_up, w_down,
+        ];
+
+        // ── Phase 1: Attention ──
+
+        // LayerNorm₁ (with bias, unlike RmsNorm)
+        let normed1 = g.add_tensor("normed1", vec![seq, h], dt);
+        g.add_op(
+            OpKind::LayerNorm { eps: ir.rms_eps },
+            vec![input, w_norm1, w_norm1_b],
+            vec![normed1],
+            "layer_norm_1",
+        );
+
+        // Q projection: [seq, H] × [H, Q] → [seq, Q]
+        let q_out = g.add_tensor("q", vec![seq, q_dim], dt);
+        g.add_op(
+            OpKind::Gemm { m: seq, n: q_dim, k: h },
+            vec![normed1, w_q],
+            vec![q_out],
+            "gemm_q",
+        );
+
+        // K projection: [seq, H] × [H, KV] → [seq, KV]
+        let k_out = g.add_tensor("k", vec![seq, kv_dim], dt);
+        g.add_op(
+            OpKind::Gemm { m: seq, n: kv_dim, k: h },
+            vec![normed1, w_k],
+            vec![k_out],
+            "gemm_k",
+        );
+
+        // V projection: [seq, H] × [H, KV] → [seq, KV]
+        let v_out = g.add_tensor("v", vec![seq, kv_dim], dt);
+        g.add_op(
+            OpKind::Gemm { m: seq, n: kv_dim, k: h },
+            vec![normed1, w_v],
+            vec![v_out],
+            "gemm_v",
+        );
+
+        // Multi-head attention (no RoPE for encoder)
+        let attn_out = g.add_tensor("attn_out", vec![seq, q_dim], dt);
+        g.add_op(
+            OpKind::MultiHeadAttention {
+                seq_len: seq,
+                num_heads: ir.num_heads,
+                head_dim: ir.head_dim,
+            },
+            vec![q_out, k_out, v_out],
+            vec![attn_out],
+            "mha",
+        );
+
+        // O projection: [seq, Q] × [Q, H] → [seq, H]
+        let o_out = g.add_tensor("o_proj", vec![seq, h], dt);
+        g.add_op(
+            OpKind::Gemm { m: seq, n: h, k: q_dim },
+            vec![attn_out, w_o],
+            vec![o_out],
+            "gemm_o",
+        );
+
+        // Residual₁: input + o_out
+        let resid1 = g.add_tensor("residual1", vec![seq, h], dt);
+        g.add_op(
+            OpKind::Residual,
+            vec![input, o_out],
+            vec![resid1],
+            "residual_1",
+        );
+
+        // ── Phase 2: FFN ──
+
+        // LayerNorm₂
+        let normed2 = g.add_tensor("normed2", vec![seq, h], dt);
+        g.add_op(
+            OpKind::LayerNorm { eps: ir.rms_eps },
+            vec![resid1, w_norm2, w_norm2_b],
+            vec![normed2],
+            "layer_norm_2",
+        );
+
+        // Up GEMM: [seq, H] × [H, Inter] → [seq, Inter]
+        let up_out = g.add_tensor("up", vec![seq, inter], dt);
+        g.add_op(
+            OpKind::Gemm { m: seq, n: inter, k: h },
+            vec![normed2, w_up],
+            vec![up_out],
+            "gemm_up",
+        );
+
+        // GELU activation
+        let gelu_out = g.add_tensor("gelu", vec![seq, inter], dt);
+        g.add_op(
+            OpKind::Gelu,
+            vec![up_out],
+            vec![gelu_out],
+            "gelu",
+        );
+
+        // Down GEMM: [seq, Inter] × [Inter, H] → [seq, H]
+        let down_out = g.add_tensor("down", vec![seq, h], dt);
+        g.add_op(
+            OpKind::Gemm { m: seq, n: h, k: inter },
+            vec![gelu_out, w_down],
+            vec![down_out],
+            "gemm_down",
+        );
+
+        // Residual₂: resid1 + down_out
+        let resid2 = g.add_tensor("residual2", vec![seq, h], dt);
+        g.add_op(
+            OpKind::Residual,
+            vec![resid1, down_out],
+            vec![resid2],
+            "residual_2",
+        );
+
+        // ── Phase 3: Pooling + Normalization ──
+
+        // Mean pooling across sequence dimension → [1, H]
+        let pooled = g.add_tensor("pooled", vec![1, h], dt);
+        g.add_op(
+            OpKind::MeanPool { seq_len: seq, hidden: h },
+            vec![resid2],
+            vec![pooled],
+            "mean_pool",
+        );
+
+        // L2 normalize the embedding
+        let normalized = g.add_tensor("normalized", vec![1, h], dt);
+        g.add_op(
+            OpKind::L2Normalize { hidden: h },
+            vec![pooled],
+            vec![normalized],
+            "l2_normalize",
+        );
+
+        g.outputs = vec![normalized];
+        Ok(g)
+    }
 }
 
 impl Default for CompilerGraph {
@@ -718,5 +897,48 @@ mod tests {
         // Should contain a GeGlu op
         let has_geglu = g.ops.iter().any(|op| matches!(op.kind, OpKind::GeGlu));
         assert!(has_geglu, "Gemma graph should have GeGlu op");
+    }
+
+    #[test]
+    fn test_from_layer_ir_encoder() {
+        let mut config = ModelConfig::llama_7b();
+        // Override to make it an encoder-style model
+        config.arch = crate::inference::types::ModelArch::Gpt2;
+        let ir = LayerIR::from_model_config(&config, 4); // seq_len=4
+        assert_eq!(ir.arch, crate::compiler::ir::LayerArch::Encoder);
+
+        let profile = DeviceProfile::detect();
+        let g = CompilerGraph::from_layer_ir(&ir, &profile).expect("from_layer_ir encoder failed");
+
+        eprintln!("{g}");
+
+        // Encoder graph: LN1 + QKV(3) + MHA + O + Resid1 + LN2 + Up + GELU + Down + Resid2 + MeanPool + L2Norm = 14 ops
+        assert!(g.num_ops() >= 14, "expected ≥14 ops, got {}", g.num_ops());
+        assert!(!g.inputs.is_empty());
+        assert!(!g.outputs.is_empty());
+
+        // Should have LayerNorm (not RmsNorm)
+        let has_ln = g.ops.iter().any(|op| matches!(op.kind, OpKind::LayerNorm { .. }));
+        assert!(has_ln, "Encoder graph should have LayerNorm");
+
+        // Should have MHA
+        let has_mha = g.ops.iter().any(|op| matches!(op.kind, OpKind::MultiHeadAttention { .. }));
+        assert!(has_mha, "Encoder graph should have MultiHeadAttention");
+
+        // Should have MeanPool and L2Normalize
+        let has_pool = g.ops.iter().any(|op| matches!(op.kind, OpKind::MeanPool { .. }));
+        let has_l2 = g.ops.iter().any(|op| matches!(op.kind, OpKind::L2Normalize { .. }));
+        assert!(has_pool, "Encoder graph should have MeanPool");
+        assert!(has_l2, "Encoder graph should have L2Normalize");
+
+        // Should NOT have RoPE or RmsNorm
+        let has_rope = g.ops.iter().any(|op| matches!(op.kind, OpKind::RoPE { .. }));
+        let has_rms = g.ops.iter().any(|op| matches!(op.kind, OpKind::RmsNorm { .. }));
+        assert!(!has_rope, "Encoder graph should NOT have RoPE");
+        assert!(!has_rms, "Encoder graph should NOT have RmsNorm");
+
+        // Topological sort should succeed
+        let sorted = g.topological_sort();
+        assert_eq!(sorted.len(), g.num_ops());
     }
 }

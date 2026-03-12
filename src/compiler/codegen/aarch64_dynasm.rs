@@ -27,6 +27,8 @@ pub mod jit {
     use crate::compiler::registry::ScalarOpRegistry;
     use crate::compiler::trace::{ComputePattern, TraceOp};
     use crate::dispatch::DeviceProfile;
+    use crate::dispatch::device_profile::IsaLevel;
+    use crate::compiler::codegen::apple_amx::{emit_apple_amx_f32_gemm, apple_amx_gemm_eligible};
 
     /// NEON register width: 4 x f32 = 128 bits.
     const NEON_WIDTH_F32: usize = 4;
@@ -1565,6 +1567,14 @@ pub mod jit {
             k: usize,
             profile: &DeviceProfile,
         ) -> Result<(), String> {
+            // Dispatch to Apple AMX path when hardware supports it and dimensions fit.
+            if profile.isa == IsaLevel::NeonAmx && apple_amx_gemm_eligible(m, n, k) {
+                let words = emit_apple_amx_f32_gemm(m, n, k);
+                for w in words {
+                    self.ops.push_u32(w);
+                }
+                return Ok(());
+            }
             let blocking = profile.gemm_blocking(m, n, k);
             if k <= blocking.kc && m <= blocking.mc && n <= blocking.nc {
                 return self.emit_gemm_8x12_neon(k);
@@ -1727,6 +1737,7 @@ pub mod jit {
                 ComputePattern::NormLike { reduce, finalize, transform } => {
                     let eps = match op_kind {
                         OpKind::RmsNorm { eps } | OpKind::LayerNorm { eps } => *eps,
+                        OpKind::L2Normalize { .. } => 1e-12,
                         _ => 1e-5,
                     };
                     self.emit_norm_standalone_neon(reduce, finalize, transform, elem_count, eps)

@@ -583,6 +583,30 @@ impl ScalarOpRegistry {
             },
         );
 
+        // --- MultiHeadAttention: fused QKV attention ---
+        let mha_sig = ScalarFnSignature {
+            fn_ptr: crate::scalar_ops::attention::scalar_multi_head_attention as *const u8,
+            params: vec![
+                ScalarParam::InputPtr,  // Q
+                ScalarParam::InputPtr,  // K
+                ScalarParam::InputPtr,  // V
+                ScalarParam::OutputPtr,
+                ScalarParam::Dim(0),    // seq_len
+                ScalarParam::Dim(1),    // num_heads
+                ScalarParam::Dim(2),    // head_dim
+            ],
+        };
+        reg.register_with_symexec_fallback(
+            OpKindKey::MultiHeadAttention,
+            mha_sig.clone(),
+            OpKind::MultiHeadAttention { seq_len: 1, num_heads: 1, head_dim: 1 },
+            OpTrace {
+                op_kind: OpKind::MultiHeadAttention { seq_len: 1, num_heads: 1, head_dim: 1 },
+                pattern: ComputePattern::Gemm,
+                signature: mha_sig,
+            },
+        );
+
         // --- Transpose: layout transform, no compute ---
         let transpose_sig = ScalarFnSignature {
             fn_ptr: scalar_transpose_2d as *const u8,
@@ -811,6 +835,7 @@ mod tests {
             OpKindKey::QuantGemm,
             OpKindKey::Dequantize,
             OpKindKey::L2Normalize,
+            OpKindKey::MultiHeadAttention,
         ];
 
         for key in &expected_keys {

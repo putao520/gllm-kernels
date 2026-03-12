@@ -2930,6 +2930,23 @@ pub mod jit {
                 self.bias_saved = true;
             }
 
+            // AMX BF16 fast path: dispatch to tile-based 2x2 GEMM when eligible.
+            if self.has_amx
+                && epilogue_bodies.is_empty()
+                && crate::compiler::codegen::x86_amx::amx_gemm_eligible(m, n, k, true)
+            {
+                let tile_m = m.min(16) as u8;
+                let tile_n = n.min(16) as u8;
+                let tile_k = k.min(16) as u8;
+                eprintln!("GEMM {}x{}x{}: AMX BF16 path (tile {}x{}x{})", m, n, k, tile_m, tile_n, tile_k);
+                return crate::compiler::codegen::x86_amx::jit::emit_amx_bf16_gemm_2x2(
+                    &mut self.asm,
+                    tile_m,
+                    tile_n,
+                    tile_k,
+                );
+            }
+
             if m == 1 {
                 eprintln!("GEMV 1x{}x{}: direct path (mr=1, nr={})", n, k, nr);
                 return self.emit_gemm_microkernel_direct(1, n, k, 1, nr, nr_vecs, simd_w, epilogue_bodies);
@@ -4609,6 +4626,7 @@ pub mod jit {
             let is_layer_norm = matches!(op.kind, OpKind::LayerNorm { .. });
             let eps = match &op.kind {
                 OpKind::RmsNorm { eps } | OpKind::LayerNorm { eps } => *eps,
+                OpKind::L2Normalize { .. } => 1e-12,
                 _ => 1e-5,
             };
 

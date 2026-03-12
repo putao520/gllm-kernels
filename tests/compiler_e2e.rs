@@ -142,6 +142,96 @@ fn test_e2e_gemma_2b_full_pipeline() {
 
 // ── Fusion consistency ───────────────────────────────────────────────
 
+/// Full pipeline test for Encoder (GPT-2 style embedding model).
+///
+/// Verifies the encoder graph: LayerNorm → QKV → MHA → O → Residual
+///   → LayerNorm → Up → GELU → Down → Residual → MeanPool → L2Normalize
+#[test]
+fn test_e2e_encoder_full_pipeline() {
+    use gllm_kernels::inference::types::ModelArch;
+
+    let config = ModelConfig {
+        arch: ModelArch::Gpt2,
+        hidden_size: 64,
+        num_heads: 4,
+        num_kv_heads: 4,
+        head_dim: 16,
+        intermediate_size: 128,
+        num_layers: 1,
+        vocab_size: 100,
+        max_seq_len: 32,
+        rope_theta: 10000.0,
+        norm_eps: 1e-5,
+        dtype: gllm_kernels::types::DType::F32,
+        quant_type: None,
+        rope_interleaved: false,
+        has_qkv_bias: false,
+        partial_rotary_factor: 1.0,
+        sliding_window: None,
+    };
+
+    let ir = LayerIR::from_model_config(&config, 8); // seq_len=8
+    let profile = DeviceProfile::detect();
+    let registry = ScalarOpRegistry::with_defaults();
+
+    // Phase 1: CompilerGraph + SemanticDAG
+    let graph = CompilerGraph::from_layer_ir(&ir, &profile).expect("from_layer_ir encoder failed");
+    assert!(
+        graph.num_ops() >= 14,
+        "Encoder should have >=14 ops, got {}",
+        graph.num_ops()
+    );
+
+    let dag = SemanticDAG::from_graph(&graph, &registry);
+    assert_eq!(dag.num_nodes(), graph.num_ops());
+
+    // Phase 2: Fusion
+    let plan = fuse_with_dag(&graph, &registry, &profile);
+    assert!(
+        plan.num_groups() <= graph.num_ops(),
+        "Fusion should not increase groups"
+    );
+
+    // Phase 2: HW constraints
+    let hw_results = check_plan(&plan.groups, &graph, &profile);
+    for result in &hw_results {
+        assert!(
+            result.valid,
+            "Encoder group {} failed HW constraints: {:?}",
+            result.group_id, result.violations
+        );
+    }
+
+    // Phase 2: Parallel strategy
+    let parallel = plan_parallelism(&plan, &graph, &dag, &profile);
+    assert_eq!(parallel.len(), plan.num_groups());
+
+    // Phase 2: Buffer allocation
+    let lifetimes = analyze_lifetimes(&graph, &plan);
+    let alloc = allocate_buffers(&lifetimes);
+
+    // Phase 3: Codegen (x86_64)
+    #[cfg(feature = "jit-x86")]
+    {
+        let mut cg = codegen::x86_64::X86CodeGen::new(&profile);
+        let output = cg.emit_plan(&plan, &graph, &alloc, &profile, Some(&registry))
+            .expect("Encoder JIT codegen failed");
+        let layer = CompiledLayer::from_code(&output.code, output.scratchpad_bytes, 0).unwrap();
+        assert!(layer.code_size() > 0);
+    }
+
+    eprintln!(
+        "E2E Encoder: {} ops -> {} groups -> {} parallel strategies -> {} buffer bytes (saved {})",
+        graph.num_ops(),
+        plan.num_groups(),
+        parallel.len(),
+        alloc.total_bytes,
+        alloc.bytes_saved
+    );
+}
+
+// ── Fusion consistency ───────────────────────────────────────────────
+
 /// Verify old fuse() and new fuse_with_dag() produce compatible results.
 #[test]
 fn test_e2e_fusion_consistency() {

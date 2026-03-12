@@ -331,6 +331,110 @@ fn emit_meanpool_kernel(
     writeln!(out, "}}\n").unwrap();
 }
 
+fn emit_gemm_kernel_msl(out: &mut String, kernel_name: &str, m: usize, n: usize, k: usize) {
+    let tile = 16usize;
+    writeln!(out, "kernel void {kernel_name}(").unwrap();
+    writeln!(out, "    device const float* A [[buffer(0)]],").unwrap();
+    writeln!(out, "    device const float* B [[buffer(1)]],").unwrap();
+    writeln!(out, "    device float* C [[buffer(2)]],").unwrap();
+    writeln!(out, "    uint2 gid [[threadgroup_position_in_grid]],").unwrap();
+    writeln!(out, "    uint2 tid [[thread_position_in_threadgroup]]").unwrap();
+    writeln!(out, ") {{").unwrap();
+    writeln!(out, "    const uint M = {m}u, N = {n}u, K = {k}u;").unwrap();
+    writeln!(out, "    const uint TILE = {tile}u;").unwrap();
+    writeln!(out, "    threadgroup float smA[{t2}];", t2 = tile * tile).unwrap();
+    writeln!(out, "    threadgroup float smB[{t2}];", t2 = tile * tile).unwrap();
+    writeln!(out, "    uint row = gid.y * TILE + tid.y;").unwrap();
+    writeln!(out, "    uint col = gid.x * TILE + tid.x;").unwrap();
+    writeln!(out, "    float acc = 0.0f;").unwrap();
+    writeln!(out, "    for (uint t = 0; t < (K + TILE - 1) / TILE; t++) {{").unwrap();
+    writeln!(out, "        uint aCol = t * TILE + tid.x;").unwrap();
+    writeln!(out, "        uint bRow = t * TILE + tid.y;").unwrap();
+    writeln!(out, "        smA[tid.y * TILE + tid.x] = (row < M && aCol < K) ? A[row * K + aCol] : 0.0f;").unwrap();
+    writeln!(out, "        smB[tid.y * TILE + tid.x] = (bRow < K && col < N) ? B[bRow * N + col] : 0.0f;").unwrap();
+    writeln!(out, "        threadgroup_barrier(mem_flags::mem_threadgroup);").unwrap();
+    writeln!(out, "        for (uint i = 0; i < TILE; i++) {{").unwrap();
+    writeln!(out, "            acc += smA[tid.y * TILE + i] * smB[i * TILE + tid.x];").unwrap();
+    writeln!(out, "        }}").unwrap();
+    writeln!(out, "        threadgroup_barrier(mem_flags::mem_threadgroup);").unwrap();
+    writeln!(out, "    }}").unwrap();
+    writeln!(out, "    if (row < M && col < N) {{").unwrap();
+    writeln!(out, "        C[row * N + col] = acc;").unwrap();
+    writeln!(out, "    }}").unwrap();
+    writeln!(out, "}}\n").unwrap();
+}
+
+fn emit_mha_kernel_msl(
+    out: &mut String,
+    kernel_name: &str,
+    seq_len: usize,
+    num_heads: usize,
+    head_dim: usize,
+) {
+    let block_size = head_dim.next_power_of_two().min(256);
+    let scale_f32 = 1.0_f32 / (head_dim as f32).sqrt();
+    writeln!(out, "kernel void {kernel_name}(").unwrap();
+    writeln!(out, "    device const float* Q [[buffer(0)]],").unwrap();
+    writeln!(out, "    device const float* K [[buffer(1)]],").unwrap();
+    writeln!(out, "    device const float* V [[buffer(2)]],").unwrap();
+    writeln!(out, "    device float* out [[buffer(3)]],").unwrap();
+    writeln!(out, "    uint2 gid [[threadgroup_position_in_grid]],").unwrap();
+    writeln!(out, "    uint tid [[thread_index_in_threadgroup]]").unwrap();
+    writeln!(out, ") {{").unwrap();
+    writeln!(out, "    const uint SEQ = {seq_len}u;").unwrap();
+    writeln!(out, "    const uint DIM = {head_dim}u;").unwrap();
+    writeln!(out, "    const float scale = {scale_f32};").unwrap();
+    writeln!(out, "    uint query_row = gid.x;").unwrap();
+    writeln!(out, "    uint head = gid.y;").unwrap();
+    writeln!(out, "    uint base = head * SEQ * DIM;").unwrap();
+    writeln!(out, "    threadgroup float smem_scores[{block_size}];").unwrap();
+    writeln!(out, "    threadgroup float smem_max[1];").unwrap();
+    writeln!(out, "    threadgroup float smem_sum[1];").unwrap();
+    writeln!(out).unwrap();
+    // Compute scores: score[j] = dot(Q[query_row], K[j]) * scale
+    writeln!(out, "    for (uint j = tid; j < SEQ; j += {block_size}u) {{").unwrap();
+    writeln!(out, "        float dot = 0.0f;").unwrap();
+    writeln!(out, "        for (uint d = 0; d < DIM; d++) {{").unwrap();
+    writeln!(out, "            dot += Q[base + query_row * DIM + d] * K[base + j * DIM + d];").unwrap();
+    writeln!(out, "        }}").unwrap();
+    writeln!(out, "        smem_scores[j] = dot * scale;").unwrap();
+    writeln!(out, "    }}").unwrap();
+    writeln!(out, "    threadgroup_barrier(mem_flags::mem_threadgroup);").unwrap();
+    writeln!(out).unwrap();
+    // Softmax: find max
+    writeln!(out, "    if (tid == 0) {{").unwrap();
+    writeln!(out, "        float mx = smem_scores[0];").unwrap();
+    writeln!(out, "        for (uint j = 1; j < SEQ; j++) mx = max(mx, smem_scores[j]);").unwrap();
+    writeln!(out, "        smem_max[0] = mx;").unwrap();
+    writeln!(out, "    }}").unwrap();
+    writeln!(out, "    threadgroup_barrier(mem_flags::mem_threadgroup);").unwrap();
+    // Softmax: exp and sum
+    writeln!(out, "    for (uint j = tid; j < SEQ; j += {block_size}u) {{").unwrap();
+    writeln!(out, "        smem_scores[j] = exp(smem_scores[j] - smem_max[0]);").unwrap();
+    writeln!(out, "    }}").unwrap();
+    writeln!(out, "    threadgroup_barrier(mem_flags::mem_threadgroup);").unwrap();
+    writeln!(out, "    if (tid == 0) {{").unwrap();
+    writeln!(out, "        float s = 0.0f;").unwrap();
+    writeln!(out, "        for (uint j = 0; j < SEQ; j++) s += smem_scores[j];").unwrap();
+    writeln!(out, "        smem_sum[0] = s;").unwrap();
+    writeln!(out, "    }}").unwrap();
+    writeln!(out, "    threadgroup_barrier(mem_flags::mem_threadgroup);").unwrap();
+    writeln!(out, "    for (uint j = tid; j < SEQ; j += {block_size}u) {{").unwrap();
+    writeln!(out, "        smem_scores[j] /= smem_sum[0];").unwrap();
+    writeln!(out, "    }}").unwrap();
+    writeln!(out, "    threadgroup_barrier(mem_flags::mem_threadgroup);").unwrap();
+    writeln!(out).unwrap();
+    // Weighted sum: out[query_row, d] = sum_j scores[j] * V[j, d]
+    writeln!(out, "    for (uint d = tid; d < DIM; d += {block_size}u) {{").unwrap();
+    writeln!(out, "        float acc = 0.0f;").unwrap();
+    writeln!(out, "        for (uint j = 0; j < SEQ; j++) {{").unwrap();
+    writeln!(out, "            acc += smem_scores[j] * V[base + j * DIM + d];").unwrap();
+    writeln!(out, "        }}").unwrap();
+    writeln!(out, "        out[base + query_row * DIM + d] = acc;").unwrap();
+    writeln!(out, "    }}").unwrap();
+    writeln!(out, "}}\n").unwrap();
+}
+
 // ── MachineCodeEmitter impl ─────────────────────────────────────────────────
 
 impl MachineCodeEmitter for AirCodeGen {
@@ -423,10 +527,20 @@ impl MachineCodeEmitter for AirCodeGen {
                     }
                 }
                 ComputePattern::Gemm => {
-                    return Err(format!(
-                        "AirCodeGen: GEMM codegen not yet implemented for Metal (op {:?})",
-                        op_kind
-                    ));
+                    match op_kind {
+                        OpKind::Gemm { m, n, k } | OpKind::GemmBias { m, n, k } => {
+                            emit_gemm_kernel_msl(&mut msl, &kernel_name, *m, *n, *k);
+                        }
+                        OpKind::MultiHeadAttention { seq_len, num_heads, head_dim } => {
+                            emit_mha_kernel_msl(&mut msl, &kernel_name, *seq_len, *num_heads, *head_dim);
+                        }
+                        _ => {
+                            return Err(format!(
+                                "AirCodeGen: unsupported Gemm op {:?}",
+                                op_kind
+                            ));
+                        }
+                    }
                 }
                 ComputePattern::Injective { body, .. } => {
                     if body.is_empty() {
@@ -601,5 +715,131 @@ mod tests {
         let plat = backend.platform();
         assert!(matches!(plat, Platform::Metal { gpu_family: 9 }));
         assert_eq!(backend.num_simd_regs(), 32);
+    }
+
+    #[test]
+    fn test_air_emit_gemm_kernel() {
+        let mut out = String::new();
+        emit_gemm_kernel_msl(&mut out, "test_gemm", 64, 64, 32);
+        assert!(out.contains("kernel void test_gemm("));
+        assert!(out.contains("device const float* A"));
+        assert!(out.contains("device const float* B"));
+        assert!(out.contains("device float* C"));
+        assert!(out.contains("threadgroup float smA[256]"));
+        assert!(out.contains("threadgroup_barrier"));
+        assert!(out.contains("C[row * N + col] = acc"));
+    }
+
+    #[test]
+    fn test_air_emit_mha_kernel() {
+        let mut out = String::new();
+        emit_mha_kernel_msl(&mut out, "test_mha", 4, 2, 8);
+        assert!(out.contains("kernel void test_mha("));
+        assert!(out.contains("device const float* Q"));
+        assert!(out.contains("device const float* K"));
+        assert!(out.contains("device const float* V"));
+        assert!(out.contains("device float* out"));
+        assert!(out.contains("smem_scores"));
+        assert!(out.contains("exp(smem_scores"));
+        assert!(out.contains("smem_sum[0]"));
+    }
+
+    #[test]
+    fn test_air_emit_plan_gemm() {
+        use crate::compiler::buffer_alloc::BufferAllocation;
+        use crate::compiler::fusion::{FusionGroup, FusionMode, FusionPlan};
+        use crate::compiler::graph::CompilerGraph;
+        use crate::compiler::registry::ScalarOpRegistry;
+        use crate::inference::types::DType;
+        use crate::dispatch::DeviceProfile;
+        use std::collections::HashMap;
+
+        let mut g = CompilerGraph::new();
+        let a = g.add_tensor("A", vec![32, 16], DType::F32);
+        let b = g.add_tensor("B", vec![16, 32], DType::F32);
+        let c = g.add_tensor("C", vec![32, 32], DType::F32);
+        g.inputs = vec![a, b];
+        g.outputs = vec![c];
+        let op_id = g.add_op(OpKind::Gemm { m: 32, n: 32, k: 16 }, vec![a, b], vec![c], "gemm");
+
+        let mut op_to_group = HashMap::new();
+        op_to_group.insert(op_id, 0);
+        let plan = FusionPlan {
+            groups: vec![FusionGroup {
+                id: 0,
+                anchor: op_id,
+                epilogue: vec![],
+                mode: FusionMode::LoopFusion,
+                ops: vec![op_id],
+            }],
+            op_to_group,
+        };
+        let alloc = BufferAllocation { slots: vec![], total_bytes: 0, num_tensors: 0, bytes_saved: 0 };
+        let profile = DeviceProfile::detect();
+        let registry = ScalarOpRegistry::with_defaults();
+
+        let mut cg = AirCodeGen::new(9);
+        let result = cg.emit_plan(&plan, &g, &alloc, &profile, Some(&registry));
+        let msl = match result {
+            Ok(o) => String::from_utf8(o.code).unwrap(),
+            Err(e) => panic!("emit_plan GEMM failed: {e}"),
+        };
+        assert!(msl.contains("kernel void group_0("), "missing kernel entry");
+        assert!(msl.contains("device const float* A"), "missing A param");
+    }
+
+    #[test]
+    fn test_air_emit_plan_mha() {
+        use crate::compiler::buffer_alloc::BufferAllocation;
+        use crate::compiler::fusion::{FusionGroup, FusionMode, FusionPlan};
+        use crate::compiler::graph::CompilerGraph;
+        use crate::compiler::registry::ScalarOpRegistry;
+        use crate::inference::types::DType;
+        use crate::dispatch::DeviceProfile;
+        use std::collections::HashMap;
+
+        let seq_len = 4;
+        let num_heads = 2;
+        let head_dim = 8;
+        let hidden = num_heads * head_dim;
+
+        let mut g = CompilerGraph::new();
+        let q = g.add_tensor("Q", vec![seq_len, hidden], DType::F32);
+        let k = g.add_tensor("K", vec![seq_len, hidden], DType::F32);
+        let v = g.add_tensor("V", vec![seq_len, hidden], DType::F32);
+        let out = g.add_tensor("out", vec![seq_len, hidden], DType::F32);
+        g.inputs = vec![q, k, v];
+        g.outputs = vec![out];
+        let op_id = g.add_op(
+            OpKind::MultiHeadAttention { seq_len, num_heads, head_dim },
+            vec![q, k, v],
+            vec![out],
+            "mha",
+        );
+
+        let mut op_to_group = HashMap::new();
+        op_to_group.insert(op_id, 0);
+        let plan = FusionPlan {
+            groups: vec![FusionGroup {
+                id: 0,
+                anchor: op_id,
+                epilogue: vec![],
+                mode: FusionMode::LoopFusion,
+                ops: vec![op_id],
+            }],
+            op_to_group,
+        };
+        let alloc = BufferAllocation { slots: vec![], total_bytes: 0, num_tensors: 0, bytes_saved: 0 };
+        let profile = DeviceProfile::detect();
+        let registry = ScalarOpRegistry::with_defaults();
+
+        let mut cg = AirCodeGen::new(9);
+        let result = cg.emit_plan(&plan, &g, &alloc, &profile, Some(&registry));
+        let msl = match result {
+            Ok(o) => String::from_utf8(o.code).unwrap(),
+            Err(e) => panic!("emit_plan MHA failed: {e}"),
+        };
+        assert!(msl.contains("kernel void group_0("), "missing kernel entry");
+        assert!(msl.contains("smem_scores"), "missing shared memory");
     }
 }
