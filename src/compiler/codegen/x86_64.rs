@@ -3028,9 +3028,11 @@ pub mod jit {
         /// Expects: r8 = output ptr, rdx = bias ptr.
         fn emit_bias_add(&mut self, m: usize, n: usize) -> Result<(), String> {
             use iced_x86::code_asm::*;
+            let simd_w = if self.use_avx512 { 16 } else { 8 };
+            let vec_bytes = simd_w * 4; // 64 for AVX-512, 32 for AVX2
             let row_bytes = (n * 4) as i32;
-            let vec_count = n / 8;
-            let tail = n % 8;
+            let vec_count = n / simd_w;
+            let tail = n % simd_w;
 
             // rax = row counter
             self.asm.xor(eax, eax).map_err(|e| e.to_string())?;
@@ -3046,21 +3048,25 @@ pub mod jit {
             self.asm.mov(ecx, eax).map_err(|e| e.to_string())?;
             self.asm.imul_3(ecx, eax, row_bytes).map_err(|e| e.to_string())?;
 
-            // Vectorized bias add for this row
-            for v in 0..vec_count {
-                let bias_off = (v * 32) as i32;
-                let out_off = bias_off;
-                // ymm0 = bias[v*8..v*8+8]
-                self.asm.vmovups(ymm0, ymmword_ptr(rdx + bias_off)).map_err(|e| e.to_string())?;
-                // ymm1 = C[row, v*8..v*8+8]
-                self.asm.vaddps(ymm1, ymm0, ymmword_ptr(r8 + rcx + out_off)).map_err(|e| e.to_string())?;
-                // Store back
-                self.asm.vmovups(ymmword_ptr(r8 + rcx + out_off), ymm1).map_err(|e| e.to_string())?;
+            if self.use_avx512 {
+                for v in 0..vec_count {
+                    let bias_off = (v * vec_bytes) as i32;
+                    self.asm.vmovups(zmm0, zmmword_ptr(rdx + bias_off)).map_err(|e| e.to_string())?;
+                    self.asm.vaddps(zmm1, zmm0, zmmword_ptr(r8 + rcx + bias_off)).map_err(|e| e.to_string())?;
+                    self.asm.vmovups(zmmword_ptr(r8 + rcx + bias_off), zmm1).map_err(|e| e.to_string())?;
+                }
+            } else {
+                for v in 0..vec_count {
+                    let bias_off = (v * vec_bytes) as i32;
+                    self.asm.vmovups(ymm0, ymmword_ptr(rdx + bias_off)).map_err(|e| e.to_string())?;
+                    self.asm.vaddps(ymm1, ymm0, ymmword_ptr(r8 + rcx + bias_off)).map_err(|e| e.to_string())?;
+                    self.asm.vmovups(ymmword_ptr(r8 + rcx + bias_off), ymm1).map_err(|e| e.to_string())?;
+                }
             }
 
             // Scalar tail
             for t in 0..tail {
-                let off = ((vec_count * 8 + t) * 4) as i32;
+                let off = ((vec_count * simd_w + t) * 4) as i32;
                 self.asm.vmovss(xmm0, dword_ptr(rdx + off)).map_err(|e| e.to_string())?;
                 self.asm.vaddss(xmm0, xmm0, dword_ptr(r8 + rcx + off)).map_err(|e| e.to_string())?;
                 self.asm.vmovss(dword_ptr(r8 + rcx + off), xmm0).map_err(|e| e.to_string())?;
@@ -3591,49 +3597,76 @@ pub mod jit {
         /// Emit one K-iteration of the FMA body for the direct (unpacked) path.
         ///
         /// Reads A from `[r15 + r12*4 + extra_a_disp + ii*a_row_bytes]` and
-        /// B from `[r9 + b_base_disp + v*32]`.
-        fn emit_direct_fma_body(
+        /// B from `[r9 + b_base_disp + v*vec_bytes]`.
+        /// Dispatches to zmm (AVX-512) or ymm (AVX2) based on `self.use_avx512`.
+        fn emit_direct_fma_body_dispatch(
             &mut self,
             tile_mr: usize,
             tile_nr_vecs: usize,
-            a_scratch_0: AsmRegisterYmm,
-            a_scratch_1: AsmRegisterYmm,
+            num_acc: usize,
             extra_a_disp: i32,
             a_row_bytes: i32,
             b_base_disp: i32,
         ) -> Result<(), String> {
-            self.asm.vbroadcastss(
-                a_scratch_0,
-                dword_ptr(r15 + r12 * 4 + extra_a_disp),
-            ).map_err(|e| e.to_string())?;
-
-            for ii in 0..tile_mr {
-                let cur_scratch = if ii % 2 == 0 { a_scratch_0 } else { a_scratch_1 };
-                let nxt_scratch = if ii % 2 == 0 { a_scratch_1 } else { a_scratch_0 };
-
-                let acc0 = Self::ymm_for_index(ii * tile_nr_vecs)?;
-                self.asm.vfmadd231ps(
-                    acc0,
-                    cur_scratch,
-                    ymmword_ptr(r9 + b_base_disp),
+            if self.use_avx512 {
+                let vec_bytes = 64i32;
+                let a_scratch_0 = Self::zmm_any(num_acc)?;
+                let a_scratch_1 = Self::zmm_any(num_acc + 1)?;
+                self.asm.vbroadcastss(
+                    a_scratch_0,
+                    dword_ptr(r15 + r12 * 4 + extra_a_disp),
                 ).map_err(|e| e.to_string())?;
 
-                if ii + 1 < tile_mr {
-                    let a_disp_next = extra_a_disp + ((ii + 1) as i32) * a_row_bytes;
-                    self.asm.vbroadcastss(
-                        nxt_scratch,
-                        dword_ptr(r15 + r12 * 4 + a_disp_next),
-                    ).map_err(|e| e.to_string())?;
-                }
+                for ii in 0..tile_mr {
+                    let cur = if ii % 2 == 0 { a_scratch_0 } else { a_scratch_1 };
+                    let nxt = if ii % 2 == 0 { a_scratch_1 } else { a_scratch_0 };
 
-                for v in 1..tile_nr_vecs {
-                    let acc = Self::ymm_for_index(ii * tile_nr_vecs + v)?;
-                    let b_disp = b_base_disp + (v as i32) * 32;
-                    self.asm.vfmadd231ps(
-                        acc,
-                        cur_scratch,
-                        ymmword_ptr(r9 + b_disp),
-                    ).map_err(|e| e.to_string())?;
+                    let acc0 = Self::zmm_for_index(ii * tile_nr_vecs)?;
+                    self.asm.vfmadd231ps(acc0, cur, zmmword_ptr(r9 + b_base_disp))
+                        .map_err(|e| e.to_string())?;
+
+                    if ii + 1 < tile_mr {
+                        let a_disp_next = extra_a_disp + ((ii + 1) as i32) * a_row_bytes;
+                        self.asm.vbroadcastss(nxt, dword_ptr(r15 + r12 * 4 + a_disp_next))
+                            .map_err(|e| e.to_string())?;
+                    }
+
+                    for v in 1..tile_nr_vecs {
+                        let acc = Self::zmm_for_index(ii * tile_nr_vecs + v)?;
+                        let b_disp = b_base_disp + (v as i32) * vec_bytes;
+                        self.asm.vfmadd231ps(acc, cur, zmmword_ptr(r9 + b_disp))
+                            .map_err(|e| e.to_string())?;
+                    }
+                }
+            } else {
+                let vec_bytes = 32i32;
+                let a_scratch_0 = Self::ymm_any(num_acc)?;
+                let a_scratch_1 = Self::ymm_any(num_acc + 1)?;
+                self.asm.vbroadcastss(
+                    a_scratch_0,
+                    dword_ptr(r15 + r12 * 4 + extra_a_disp),
+                ).map_err(|e| e.to_string())?;
+
+                for ii in 0..tile_mr {
+                    let cur = if ii % 2 == 0 { a_scratch_0 } else { a_scratch_1 };
+                    let nxt = if ii % 2 == 0 { a_scratch_1 } else { a_scratch_0 };
+
+                    let acc0 = Self::ymm_for_index(ii * tile_nr_vecs)?;
+                    self.asm.vfmadd231ps(acc0, cur, ymmword_ptr(r9 + b_base_disp))
+                        .map_err(|e| e.to_string())?;
+
+                    if ii + 1 < tile_mr {
+                        let a_disp_next = extra_a_disp + ((ii + 1) as i32) * a_row_bytes;
+                        self.asm.vbroadcastss(nxt, dword_ptr(r15 + r12 * 4 + a_disp_next))
+                            .map_err(|e| e.to_string())?;
+                    }
+
+                    for v in 1..tile_nr_vecs {
+                        let acc = Self::ymm_for_index(ii * tile_nr_vecs + v)?;
+                        let b_disp = b_base_disp + (v as i32) * vec_bytes;
+                        self.asm.vfmadd231ps(acc, cur, ymmword_ptr(r9 + b_disp))
+                            .map_err(|e| e.to_string())?;
+                    }
                 }
             }
             Ok(())
@@ -3647,43 +3680,65 @@ pub mod jit {
             &mut self,
             tile_mr: usize,
             tile_nr_vecs: usize,
-            a_scratch_0: AsmRegisterYmm,
-            a_scratch_1: AsmRegisterYmm,
+            num_acc: usize,
             extra_a_off: i32,
             extra_b_off: i32,
         ) -> Result<(), String> {
-            self.asm.vbroadcastss(
-                a_scratch_0,
-                dword_ptr(r15 + extra_a_off),
-            ).map_err(|e| e.to_string())?;
+            if self.use_avx512 {
+                let vec_bytes = 64i32;
+                let a_scratch_0 = Self::zmm_any(num_acc)?;
+                let a_scratch_1 = Self::zmm_any(num_acc + 1)?;
+                self.asm.vbroadcastss(a_scratch_0, dword_ptr(r15 + extra_a_off))
+                    .map_err(|e| e.to_string())?;
 
-            for ii in 0..tile_mr {
-                let cur_scratch = if ii % 2 == 0 { a_scratch_0 } else { a_scratch_1 };
-                let nxt_scratch = if ii % 2 == 0 { a_scratch_1 } else { a_scratch_0 };
+                for ii in 0..tile_mr {
+                    let cur = if ii % 2 == 0 { a_scratch_0 } else { a_scratch_1 };
+                    let nxt = if ii % 2 == 0 { a_scratch_1 } else { a_scratch_0 };
 
-                let acc0 = Self::ymm_for_index(ii * tile_nr_vecs)?;
-                self.asm.vfmadd231ps(
-                    acc0,
-                    cur_scratch,
-                    ymmword_ptr(rdx + extra_b_off),
-                ).map_err(|e| e.to_string())?;
+                    let acc0 = Self::zmm_for_index(ii * tile_nr_vecs)?;
+                    self.asm.vfmadd231ps(acc0, cur, zmmword_ptr(rdx + extra_b_off))
+                        .map_err(|e| e.to_string())?;
 
-                if ii + 1 < tile_mr {
-                    let a_disp_next = extra_a_off + ((ii + 1) as i32) * 4;
-                    self.asm.vbroadcastss(
-                        nxt_scratch,
-                        dword_ptr(r15 + a_disp_next),
-                    ).map_err(|e| e.to_string())?;
+                    if ii + 1 < tile_mr {
+                        let a_disp_next = extra_a_off + ((ii + 1) as i32) * 4;
+                        self.asm.vbroadcastss(nxt, dword_ptr(r15 + a_disp_next))
+                            .map_err(|e| e.to_string())?;
+                    }
+
+                    for v in 1..tile_nr_vecs {
+                        let acc = Self::zmm_for_index(ii * tile_nr_vecs + v)?;
+                        let b_disp = extra_b_off + (v as i32) * vec_bytes;
+                        self.asm.vfmadd231ps(acc, cur, zmmword_ptr(rdx + b_disp))
+                            .map_err(|e| e.to_string())?;
+                    }
                 }
+            } else {
+                let vec_bytes = 32i32;
+                let a_scratch_0 = Self::ymm_any(num_acc)?;
+                let a_scratch_1 = Self::ymm_any(num_acc + 1)?;
+                self.asm.vbroadcastss(a_scratch_0, dword_ptr(r15 + extra_a_off))
+                    .map_err(|e| e.to_string())?;
 
-                for v in 1..tile_nr_vecs {
-                    let acc = Self::ymm_for_index(ii * tile_nr_vecs + v)?;
-                    let b_disp = extra_b_off + (v as i32) * 32;
-                    self.asm.vfmadd231ps(
-                        acc,
-                        cur_scratch,
-                        ymmword_ptr(rdx + b_disp),
-                    ).map_err(|e| e.to_string())?;
+                for ii in 0..tile_mr {
+                    let cur = if ii % 2 == 0 { a_scratch_0 } else { a_scratch_1 };
+                    let nxt = if ii % 2 == 0 { a_scratch_1 } else { a_scratch_0 };
+
+                    let acc0 = Self::ymm_for_index(ii * tile_nr_vecs)?;
+                    self.asm.vfmadd231ps(acc0, cur, ymmword_ptr(rdx + extra_b_off))
+                        .map_err(|e| e.to_string())?;
+
+                    if ii + 1 < tile_mr {
+                        let a_disp_next = extra_a_off + ((ii + 1) as i32) * 4;
+                        self.asm.vbroadcastss(nxt, dword_ptr(r15 + a_disp_next))
+                            .map_err(|e| e.to_string())?;
+                    }
+
+                    for v in 1..tile_nr_vecs {
+                        let acc = Self::ymm_for_index(ii * tile_nr_vecs + v)?;
+                        let b_disp = extra_b_off + (v as i32) * vec_bytes;
+                        self.asm.vfmadd231ps(acc, cur, ymmword_ptr(rdx + b_disp))
+                            .map_err(|e| e.to_string())?;
+                    }
                 }
             }
             Ok(())
@@ -3711,18 +3766,30 @@ pub mod jit {
             epilogue_bodies: &[&[TraceOp]],
         ) -> Result<(), String> {
             let num_acc = tile_mr * tile_nr_vecs;
-            if num_acc + 2 > 16 {
-                return Err(format!(
-                    "GEMM tile {}x{} needs {} accumulators + 2 scratch, exceeds 16 ymm registers",
-                    tile_mr, tile_nr_vecs, num_acc
-                ));
-            }
-            let a_scratch_0 = Self::ymm_any(num_acc)?;
-            let a_scratch_1 = Self::ymm_any(num_acc + 1)?;
+            let vec_bytes: i32 = if self.use_avx512 { 64 } else { 32 };
 
-            for a in 0..num_acc {
-                let reg = Self::ymm_for_index(a)?;
-                self.asm.vxorps(reg, reg, reg).map_err(|e| e.to_string())?;
+            if self.use_avx512 {
+                if num_acc + 2 > 32 {
+                    return Err(format!(
+                        "GEMM tile {}x{} needs {} accumulators + 2 scratch, exceeds 32 zmm registers",
+                        tile_mr, tile_nr_vecs, num_acc
+                    ));
+                }
+                for a in 0..num_acc {
+                    let reg = Self::zmm_for_index(a)?;
+                    self.asm.vpxord(reg, reg, reg).map_err(|e| e.to_string())?;
+                }
+            } else {
+                if num_acc + 2 > 16 {
+                    return Err(format!(
+                        "GEMM tile {}x{} needs {} accumulators + 2 scratch, exceeds 16 ymm registers",
+                        tile_mr, tile_nr_vecs, num_acc
+                    ));
+                }
+                for a in 0..num_acc {
+                    let reg = Self::ymm_for_index(a)?;
+                    self.asm.vxorps(reg, reg, reg).map_err(|e| e.to_string())?;
+                }
             }
 
             let k_main = (k & !1) as i32;
@@ -3745,9 +3812,9 @@ pub mod jit {
             }
 
             // Iteration 0 (K = r12)
-            self.emit_direct_fma_body(tile_mr, tile_nr_vecs, a_scratch_0, a_scratch_1, 0, a_row_bytes, 0)?;
+            self.emit_direct_fma_body_dispatch(tile_mr, tile_nr_vecs, num_acc, 0, a_row_bytes, 0)?;
             // Iteration 1 (K = r12 + 1)
-            self.emit_direct_fma_body(tile_mr, tile_nr_vecs, a_scratch_0, a_scratch_1, 4, a_row_bytes, b_row_bytes)?;
+            self.emit_direct_fma_body_dispatch(tile_mr, tile_nr_vecs, num_acc, 4, a_row_bytes, b_row_bytes)?;
 
             self.asm.add(r9, 2 * b_row_bytes).map_err(|e| e.to_string())?;
             self.asm.add(r12, 2i32).map_err(|e| e.to_string())?;
@@ -3758,7 +3825,7 @@ pub mod jit {
             self.asm.cmp(r12, k as i32).map_err(|e| e.to_string())?;
             self.asm.jge(k_done).map_err(|e| e.to_string())?;
 
-            self.emit_direct_fma_body(tile_mr, tile_nr_vecs, a_scratch_0, a_scratch_1, 0, a_row_bytes, 0)?;
+            self.emit_direct_fma_body_dispatch(tile_mr, tile_nr_vecs, num_acc, 0, a_row_bytes, 0)?;
             self.asm.add(r9, b_row_bytes).map_err(|e| e.to_string())?;
             self.asm.inc(r12).map_err(|e| e.to_string())?;
 
@@ -3773,14 +3840,23 @@ pub mod jit {
             }
             self.emit_epilogue_on_accumulators_inner(epilogue_bodies, num_acc, tile_nr_vecs)?;
 
-            for ii in 0..tile_mr {
-                for v in 0..tile_nr_vecs {
-                    let acc = Self::ymm_for_index(ii * tile_nr_vecs + v)?;
-                    let c_disp = (ii as i32) * c_row_bytes + (v as i32) * 32;
-                    self.asm.vmovups(
-                        ymmword_ptr(r10 + c_disp),
-                        acc,
-                    ).map_err(|e| e.to_string())?;
+            if self.use_avx512 {
+                for ii in 0..tile_mr {
+                    for v in 0..tile_nr_vecs {
+                        let acc = Self::zmm_for_index(ii * tile_nr_vecs + v)?;
+                        let c_disp = (ii as i32) * c_row_bytes + (v as i32) * vec_bytes;
+                        self.asm.vmovups(zmmword_ptr(r10 + c_disp), acc)
+                            .map_err(|e| e.to_string())?;
+                    }
+                }
+            } else {
+                for ii in 0..tile_mr {
+                    for v in 0..tile_nr_vecs {
+                        let acc = Self::ymm_for_index(ii * tile_nr_vecs + v)?;
+                        let c_disp = (ii as i32) * c_row_bytes + (v as i32) * vec_bytes;
+                        self.asm.vmovups(ymmword_ptr(r10 + c_disp), acc)
+                            .map_err(|e| e.to_string())?;
+                    }
                 }
             }
 
@@ -3820,29 +3896,57 @@ pub mod jit {
             k_total: usize,
         ) -> Result<(), String> {
             let num_acc = tile_mr * tile_nr_vecs;
-            if num_acc + 2 > 16 {
-                return Err(format!(
-                    "GEMM tile {}x{} needs {} accumulators + 2 scratch, exceeds 16 ymm registers",
-                    tile_mr, tile_nr_vecs, num_acc
-                ));
+            let vec_bytes: i32 = if self.use_avx512 { 64 } else { 32 };
+
+            if self.use_avx512 {
+                if num_acc + 2 > 32 {
+                    return Err(format!(
+                        "GEMM tile {}x{} needs {} accumulators + 2 scratch, exceeds 32 zmm registers",
+                        tile_mr, tile_nr_vecs, num_acc
+                    ));
+                }
+            } else {
+                if num_acc + 2 > 16 {
+                    return Err(format!(
+                        "GEMM tile {}x{} needs {} accumulators + 2 scratch, exceeds 16 ymm registers",
+                        tile_mr, tile_nr_vecs, num_acc
+                    ));
+                }
             }
-            let a_scratch_0 = Self::ymm_any(num_acc)?;
-            let a_scratch_1 = Self::ymm_any(num_acc + 1)?;
+
             let mr_stride_bytes = (packed_mr as i32) * 4; // packed_a advance per K step
             let nr_stride_bytes = (packed_nr as i32) * 4; // packed_b advance per K step
 
             if first_kc_block {
-                for a in 0..num_acc {
-                    let reg = Self::ymm_for_index(a)?;
-                    self.asm.vxorps(reg, reg, reg).map_err(|e| e.to_string())?;
+                if self.use_avx512 {
+                    for a in 0..num_acc {
+                        let reg = Self::zmm_for_index(a)?;
+                        self.asm.vpxord(reg, reg, reg).map_err(|e| e.to_string())?;
+                    }
+                } else {
+                    for a in 0..num_acc {
+                        let reg = Self::ymm_for_index(a)?;
+                        self.asm.vxorps(reg, reg, reg).map_err(|e| e.to_string())?;
+                    }
                 }
             } else {
-                for ii in 0..tile_mr {
-                    for v in 0..tile_nr_vecs {
-                        let acc = Self::ymm_for_index(ii * tile_nr_vecs + v)?;
-                        let c_disp = (ii as i32) * c_row_bytes + (v as i32) * 32;
-                        self.asm.vmovups(acc, ymmword_ptr(r10 + c_disp))
-                            .map_err(|e| e.to_string())?;
+                if self.use_avx512 {
+                    for ii in 0..tile_mr {
+                        for v in 0..tile_nr_vecs {
+                            let acc = Self::zmm_for_index(ii * tile_nr_vecs + v)?;
+                            let c_disp = (ii as i32) * c_row_bytes + (v as i32) * vec_bytes;
+                            self.asm.vmovups(acc, zmmword_ptr(r10 + c_disp))
+                                .map_err(|e| e.to_string())?;
+                        }
+                    }
+                } else {
+                    for ii in 0..tile_mr {
+                        for v in 0..tile_nr_vecs {
+                            let acc = Self::ymm_for_index(ii * tile_nr_vecs + v)?;
+                            let c_disp = (ii as i32) * c_row_bytes + (v as i32) * vec_bytes;
+                            self.asm.vmovups(acc, ymmword_ptr(r10 + c_disp))
+                                .map_err(|e| e.to_string())?;
+                        }
                     }
                 }
             }
@@ -3871,9 +3975,9 @@ pub mod jit {
             }
 
             // Iteration 0 (K = rcx)
-            self.emit_packed_fma_body(tile_mr, tile_nr_vecs, a_scratch_0, a_scratch_1, 0, 0)?;
+            self.emit_packed_fma_body(tile_mr, tile_nr_vecs, num_acc, 0, 0)?;
             // Iteration 1 (K = rcx + 1)
-            self.emit_packed_fma_body(tile_mr, tile_nr_vecs, a_scratch_0, a_scratch_1, mr_stride_bytes, nr_stride_bytes)?;
+            self.emit_packed_fma_body(tile_mr, tile_nr_vecs, num_acc, mr_stride_bytes, nr_stride_bytes)?;
 
             self.asm.add(r15, 2 * mr_stride_bytes).map_err(|e| e.to_string())?;
             self.asm.add(rdx, 2 * nr_stride_bytes).map_err(|e| e.to_string())?;
@@ -3891,7 +3995,7 @@ pub mod jit {
                 self.asm.prefetcht0(byte_ptr(rdx + nr_stride_bytes + 64)).map_err(|e| e.to_string())?;
             }
 
-            self.emit_packed_fma_body(tile_mr, tile_nr_vecs, a_scratch_0, a_scratch_1, 0, 0)?;
+            self.emit_packed_fma_body(tile_mr, tile_nr_vecs, num_acc, 0, 0)?;
 
             self.asm.add(r15, mr_stride_bytes).map_err(|e| e.to_string())?;
             self.asm.add(rdx, nr_stride_bytes).map_err(|e| e.to_string())?;
@@ -3922,14 +4026,23 @@ pub mod jit {
                 self.asm.set_label(&mut skip_epi).map_err(|e| e.to_string())?;
             }
 
-            for ii in 0..tile_mr {
-                for v in 0..tile_nr_vecs {
-                    let acc = Self::ymm_for_index(ii * tile_nr_vecs + v)?;
-                    let c_disp = (ii as i32) * c_row_bytes + (v as i32) * 32;
-                    self.asm.vmovups(
-                        ymmword_ptr(r10 + c_disp),
-                        acc,
-                    ).map_err(|e| e.to_string())?;
+            if self.use_avx512 {
+                for ii in 0..tile_mr {
+                    for v in 0..tile_nr_vecs {
+                        let acc = Self::zmm_for_index(ii * tile_nr_vecs + v)?;
+                        let c_disp = (ii as i32) * c_row_bytes + (v as i32) * vec_bytes;
+                        self.asm.vmovups(zmmword_ptr(r10 + c_disp), acc)
+                            .map_err(|e| e.to_string())?;
+                    }
+                }
+            } else {
+                for ii in 0..tile_mr {
+                    for v in 0..tile_nr_vecs {
+                        let acc = Self::ymm_for_index(ii * tile_nr_vecs + v)?;
+                        let c_disp = (ii as i32) * c_row_bytes + (v as i32) * vec_bytes;
+                        self.asm.vmovups(ymmword_ptr(r10 + c_disp), acc)
+                            .map_err(|e| e.to_string())?;
+                    }
                 }
             }
 

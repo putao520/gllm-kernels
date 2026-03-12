@@ -169,6 +169,71 @@ pub mod jit {
         0x3DC00000 | (imm12 << 10) | ((xn as u32 & 0x1F) << 5) | (vt as u32 & 0x1F)
     }
 
+    /// ZIP1 Vd.4S, Vn.4S, Vm.4S — interleave even elements
+    fn encode_zip1_4s(rd: u8, rn: u8, rm: u8) -> u32 {
+        0x4E803800
+            | ((rm as u32 & 0x1F) << 16)
+            | ((rn as u32 & 0x1F) << 5)
+            | (rd as u32 & 0x1F)
+    }
+
+    /// ZIP2 Vd.4S, Vn.4S, Vm.4S — interleave odd elements
+    fn encode_zip2_4s(rd: u8, rn: u8, rm: u8) -> u32 {
+        0x4E807800
+            | ((rm as u32 & 0x1F) << 16)
+            | ((rn as u32 & 0x1F) << 5)
+            | (rd as u32 & 0x1F)
+    }
+
+    /// REV64 Vd.4S, Vn.4S — reverse elements within 64-bit lanes (swaps adjacent pairs)
+    fn encode_rev64_4s(rd: u8, rn: u8) -> u32 {
+        0x4EA00800
+            | ((rn as u32 & 0x1F) << 5)
+            | (rd as u32 & 0x1F)
+    }
+
+    // ── Scalar float helpers ────────────────────────────────────────
+
+    /// FMUL Sd, Sn, Sm — scalar single-precision multiply
+    fn encode_fmul_s(rd: u8, rn: u8, rm: u8) -> u32 {
+        0x1E200800
+            | ((rm as u32 & 0x1F) << 16)
+            | ((rn as u32 & 0x1F) << 5)
+            | (rd as u32 & 0x1F)
+    }
+
+    /// FSUB Sd, Sn, Sm — scalar single-precision subtract
+    fn encode_fsub_s(rd: u8, rn: u8, rm: u8) -> u32 {
+        0x1E203800
+            | ((rm as u32 & 0x1F) << 16)
+            | ((rn as u32 & 0x1F) << 5)
+            | (rd as u32 & 0x1F)
+    }
+
+    /// FMAXNM Sd, Sn, Sm — scalar single-precision max (NaN-propagating)
+    fn encode_fmaxnm_s(rd: u8, rn: u8, rm: u8) -> u32 {
+        0x1E206800
+            | ((rm as u32 & 0x1F) << 16)
+            | ((rn as u32 & 0x1F) << 5)
+            | (rd as u32 & 0x1F)
+    }
+
+    /// FSQRT Sd, Sn — scalar single-precision square root
+    fn encode_fsqrt_s(rd: u8, rn: u8) -> u32 {
+        0x1E21C000
+            | ((rn as u32 & 0x1F) << 5)
+            | (rd as u32 & 0x1F)
+    }
+
+    /// FMADD Sd, Sn, Sm, Sa — scalar fused multiply-add: Sd = Sa + Sn * Sm
+    fn encode_fmadd_s(rd: u8, rn: u8, rm: u8, ra: u8) -> u32 {
+        0x1F000000
+            | ((rm as u32 & 0x1F) << 16)
+            | ((ra as u32 & 0x1F) << 10)
+            | ((rn as u32 & 0x1F) << 5)
+            | (rd as u32 & 0x1F)
+    }
+
     // ── Helpers: push a raw u32 instruction ────────────────────────────
 
     /// Push a raw 32-bit instruction word into the assembler.
@@ -701,6 +766,151 @@ pub mod jit {
             Ok(())
         }
 
+
+        // ── RoPE (Rotary Position Embedding) ─────────────────────────
+
+        /// Emit NEON RoPE: non-interleaved rotary position embedding.
+        ///
+        /// ABI: x0 = input ptr [n_heads * head_dim f32],
+        ///      x1 = cos table ptr [head_dim/2 f32],
+        ///      x7 = output ptr [n_heads * head_dim f32].
+        ///
+        /// For each head, pairs (x[2i], x[2i+1]) are rotated by (cos[i], sin[i]):
+        ///   out[2i]   = x[2i]   * cos[i] - x[2i+1] * sin[i]
+        ///   out[2i+1] = x[2i+1] * cos[i] + x[2i]   * sin[i]
+        /// where sin[i] = sqrt(max(0, 1 - cos[i]²)).
+        fn emit_rope_standalone_neon(
+            &mut self,
+            head_dim: usize,
+            n_heads: usize,
+        ) -> Result<(), String> {
+            let half = head_dim / 2;
+            // NEON processes 4 cos values → 8 x floats (4 pairs) per iteration
+            let simd_pairs = NEON_WIDTH_F32; // 4 pairs per v register
+            let vec_iters = half / simd_pairs;
+
+            for head in 0..n_heads {
+                let head_byte_off = (head * head_dim * 4) as u64;
+
+                for chunk in 0..vec_iters {
+                    let cos_off = (chunk * simd_pairs * 4) as u64;
+                    let x_off = head_byte_off + (chunk * simd_pairs * 2 * 4) as u64;
+
+                    // Load 4 cos values into v0: ld1 {v0.4s}, [x1, #cos_off]
+                    // x10 = x1 + cos_off
+                    self.emit_add_offset_gp(10, 1, cos_off as usize);
+                    emit_raw(&mut self.ops, 0x4C407800 | (10 << 5) | 0); // ld1 {v0.4s}, [x10]
+
+                    // Duplicate cos to pairs: [c0,c0,c1,c1,c2,c2,c3,c3]
+                    // v2 = zip1 v0.4s, v0.4s → [c0,c0,c1,c1]
+                    emit_raw(&mut self.ops, encode_zip1_4s(2, 0, 0));
+                    // v3 = zip2 v0.4s, v0.4s → [c2,c2,c3,c3]
+                    emit_raw(&mut self.ops, encode_zip2_4s(3, 0, 0));
+
+                    // sin = sqrt(max(0, 1 - cos²))
+                    // v4 = v2 * v2 (cos² low), v5 = v3 * v3 (cos² high)
+                    emit_raw(&mut self.ops, encode_f32x4_binop(0x6E20DC00, 4, 2, 2));
+                    emit_raw(&mut self.ops, encode_f32x4_binop(0x6E20DC00, 5, 3, 3));
+                    // v6 = 1.0 broadcast
+                    self.emit_load_f32_const_neon(6, 1.0);
+                    // v4 = 1.0 - cos² low
+                    emit_raw(&mut self.ops, encode_f32x4_binop(0x4EA0D400, 4, 6, 4)); // fsub
+                    // v5 = 1.0 - cos² high (v6 still holds 1.0)
+                    emit_raw(&mut self.ops, encode_f32x4_binop(0x4EA0D400, 5, 6, 5)); // fsub
+                    // clamp negative to zero
+                    emit_raw(&mut self.ops, encode_eor_v(6, 6, 6)); // v6 = 0
+                    emit_raw(&mut self.ops, encode_f32x4_binop(0x4E20F400, 4, 4, 6)); // fmax v4, v4, v6
+                    emit_raw(&mut self.ops, encode_f32x4_binop(0x4E20F400, 5, 5, 6)); // fmax v5, v5, v6
+                    // sqrt → sin duplicated
+                    emit_raw(&mut self.ops, encode_f32x4_unary(0x6EA1F800, 4, 4)); // fsqrt v4
+                    emit_raw(&mut self.ops, encode_f32x4_unary(0x6EA1F800, 5, 5)); // fsqrt v5
+
+                    // Build sin_signed: [-s,s,-s,s,...] by negating even lanes
+                    // v6 = [-1,-1,-1,-1], v7 = [1,1,1,1]
+                    self.emit_load_f32_const_neon(6, -1.0);
+                    self.emit_load_f32_const_neon(7, 1.0);
+                    // zip1 → v6 = [-1,1,-1,1]
+                    emit_raw(&mut self.ops, encode_zip1_4s(6, 6, 7));
+                    // v4 = sin_low * sign = [-s0,s0,-s1,s1]
+                    emit_raw(&mut self.ops, encode_f32x4_binop(0x6E20DC00, 4, 4, 6)); // fmul
+                    // v5 = sin_high * sign = [-s2,s2,-s3,s3]
+                    emit_raw(&mut self.ops, encode_f32x4_binop(0x6E20DC00, 5, 5, 6)); // fmul
+
+                    // Load 8 x floats (two v regs): x[2i..2i+7]
+                    // x10 = x0 + x_off
+                    self.emit_add_offset_gp(10, 0, x_off as usize);
+                    emit_raw(&mut self.ops, 0x4C407800 | (10 << 5) | 16); // ld1 {v16.4s}, [x10]
+                    self.emit_add_offset_gp(10, 0, (x_off + 16) as usize);
+                    emit_raw(&mut self.ops, 0x4C407800 | (10 << 5) | 17); // ld1 {v17.4s}, [x10]
+
+                    // Swap adjacent pairs: [x1,x0,x3,x2] via rev64
+                    // rev64 v18.4s, v16.4s → swaps pairs within 64-bit lanes
+                    emit_raw(&mut self.ops, encode_rev64_4s(18, 16));
+                    emit_raw(&mut self.ops, encode_rev64_4s(19, 17));
+
+                    // result = x * cos_dup + x_swapped * sin_signed
+                    // v16 = v16 * v2 (x_low * cos_low)
+                    emit_raw(&mut self.ops, encode_f32x4_binop(0x6E20DC00, 16, 16, 2)); // fmul
+                    // v16 = v16 + v18 * v4 (fmla: v16 += x_swapped_low * sin_signed_low)
+                    emit_raw(&mut self.ops, encode_fmla(16, 18, 4));
+                    // v17 = v17 * v3 (x_high * cos_high)
+                    emit_raw(&mut self.ops, encode_f32x4_binop(0x6E20DC00, 17, 17, 3)); // fmul
+                    // v17 = v17 + v19 * v5 (fmla: v17 += x_swapped_high * sin_signed_high)
+                    emit_raw(&mut self.ops, encode_fmla(17, 19, 5));
+
+                    // Store results
+                    self.emit_add_offset_gp(10, 7, x_off as usize);
+                    emit_raw(&mut self.ops, encode_st1_post(16, 10));
+                    emit_raw(&mut self.ops, encode_st1_post(17, 10));
+                }
+
+                // Scalar tail for remaining pairs
+                for i in (vec_iters * simd_pairs)..half {
+                    let cos_off = (i * 4) as usize;
+                    let x_off = (head_byte_off as usize) + i * 2 * 4;
+
+                    // Load cos[i] into s0
+                    self.emit_add_offset_gp(10, 1, cos_off);
+                    emit_raw(&mut self.ops, 0xBD400000 | (10 << 5) | 0); // ldr s0, [x10]
+
+                    // Load x[2i] into s16, x[2i+1] into s17
+                    self.emit_add_offset_gp(10, 0, x_off);
+                    emit_raw(&mut self.ops, 0xBD400000 | (10 << 5) | 16); // ldr s16, [x10]
+                    self.emit_add_offset_gp(10, 0, x_off + 4);
+                    emit_raw(&mut self.ops, 0xBD400000 | (10 << 5) | 17); // ldr s17, [x10]
+
+                    // sin = sqrt(max(0, 1 - cos²))
+                    // s1 = s0 * s0  (cos²)
+                    emit_raw(&mut self.ops, encode_fmul_s(1, 0, 0));
+                    // s2 = 1.0
+                    self.emit_load_f32_const_neon(2, 1.0);
+                    // s1 = s2 - s1  (1 - cos²)
+                    emit_raw(&mut self.ops, encode_fsub_s(1, 2, 1));
+                    // clamp: s3 = 0, s1 = fmaxnm(s1, s3)
+                    emit_raw(&mut self.ops, encode_eor_v(3, 3, 3)); // v3 = 0
+                    emit_raw(&mut self.ops, encode_fmaxnm_s(1, 1, 3));
+                    // s1 = sqrt(s1)
+                    emit_raw(&mut self.ops, encode_fsqrt_s(1, 1));
+
+                    // out[2i] = x0*cos - x1*sin
+                    emit_raw(&mut self.ops, encode_fmul_s(4, 16, 0));  // s4 = s16 * s0
+                    emit_raw(&mut self.ops, encode_fmul_s(5, 17, 1));  // s5 = s17 * s1
+                    emit_raw(&mut self.ops, encode_fsub_s(4, 4, 5));   // s4 = s4 - s5
+
+                    // out[2i+1] = x1*cos + x0*sin
+                    emit_raw(&mut self.ops, encode_fmul_s(5, 17, 0));  // s5 = s17 * s0
+                    emit_raw(&mut self.ops, encode_fmadd_s(5, 16, 1, 5)); // s5 += s16 * s1
+
+                    // Store
+                    self.emit_add_offset_gp(10, 7, x_off);
+                    emit_raw(&mut self.ops, 0xBD000000 | (10 << 5) | 4); // str s4, [x10]
+                    self.emit_add_offset_gp(10, 7, x_off + 4);
+                    emit_raw(&mut self.ops, 0xBD000000 | (10 << 5) | 5); // str s5, [x10]
+                }
+            }
+
+            Ok(())
+        }
 
         // ── Mean pooling ──────────────────────────────────────────────
 
@@ -1779,6 +1989,16 @@ pub mod jit {
                 OpKind::MeanPool { seq_len, hidden } => {
                     self.emit_mean_pool_neon(*seq_len, *hidden)
                 }
+                OpKind::RoPE { head_dim, .. } => {
+                    let total_elems = op.outputs.first()
+                        .and_then(|&out_id| graph.tensor_numel(out_id))
+                        .unwrap_or(0);
+                    if total_elems == 0 || *head_dim == 0 {
+                        return Err("RoPE: zero-element tensor or head_dim".into());
+                    }
+                    let n_heads = total_elems / head_dim;
+                    self.emit_rope_standalone_neon(*head_dim, n_heads)
+                }
                 _ => {
                     let elem_count = op.outputs.first()
                         .and_then(|&out_id| graph.tensor_numel(out_id))
@@ -1804,21 +2024,40 @@ pub mod jit {
             _profile: &DeviceProfile,
             registry: Option<&ScalarOpRegistry>,
         ) -> Result<(), String> {
-            let last_op = graph.op(*group.ops.last().ok_or("empty fusion group")?)
-                .ok_or("missing last op")?;
-            let elem_count = last_op.outputs.first()
-                .and_then(|&out_id| graph.tensor_numel(out_id))
-                .unwrap_or(0);
+            // Determine elem_count from the anchor op (like x86_64 emit_elementwise_chain)
+            let anchor_op = graph.op(group.anchor).ok_or("missing anchor op")?;
+            let elem_count = if let Some(&out_id) = anchor_op.outputs.first() {
+                graph.tensor_numel(out_id).unwrap_or(0)
+            } else {
+                0
+            };
             if elem_count == 0 { return Err("zero-element tensor in loop fusion".into()); }
 
+            // Collect trace bodies from anchor + epilogue ops
             let mut trace_bodies: Vec<(Vec<TraceOp>, bool)> = Vec::new();
             if let Some(reg) = registry {
-                for &op_id in &group.ops {
-                    let op = graph.op(op_id).ok_or("missing op in fusion group")?;
-                    let key = ScalarOpRegistry::key_from_op_kind(&op.kind);
+                // Anchor op trace
+                let key = ScalarOpRegistry::key_from_op_kind(&anchor_op.kind);
+                if let Some(trace) = reg.get_trace(&key) {
+                    if let Some(body) = trace.pattern.body() {
+                        let is_binary = matches!(
+                            trace.pattern,
+                            ComputePattern::BinaryElementwise { .. }
+                        );
+                        trace_bodies.push((body.to_vec(), is_binary));
+                    }
+                }
+
+                // Epilogue op traces
+                for &epi_id in &group.epilogue {
+                    let epi_op = graph.op(epi_id).ok_or("missing epilogue op")?;
+                    let key = ScalarOpRegistry::key_from_op_kind(&epi_op.kind);
                     if let Some(trace) = reg.get_trace(&key) {
                         if let Some(body) = trace.pattern.body() {
-                            let is_binary = matches!(trace.pattern, ComputePattern::BinaryElementwise { .. });
+                            let is_binary = matches!(
+                                trace.pattern,
+                                ComputePattern::BinaryElementwise { .. }
+                            );
                             trace_bodies.push((body.to_vec(), is_binary));
                         }
                     }
@@ -1826,13 +2065,17 @@ pub mod jit {
             }
 
             if trace_bodies.is_empty() {
-                let anchor_op = graph.op(group.anchor).ok_or("missing anchor")?;
-                return self.emit_inline_elementwise(&anchor_op.kind, elem_count);
+                return Err(format!(
+                    "loop fusion: no trace info found for group (anchor={:?}), registry lookup required",
+                    group.anchor
+                ));
             }
 
             let has_binary = trace_bodies.iter().any(|(_, b)| *b);
 
-            let first_op = graph.op(*group.ops.first().unwrap()).ok_or("missing first op")?;
+            // Set up pointers from scratchpad allocation
+            let first_op = graph.op(*group.ops.first().unwrap_or(&group.anchor))
+                .ok_or("missing first op")?;
             if let Some(&input_tid) = first_op.inputs.first() {
                 if let Some(slot) = alloc.slots.iter().find(|s| s.tensor_id == input_tid) {
                     // ldr x14, [x29, #16]  — scratchpad base
@@ -1848,7 +2091,10 @@ pub mod jit {
                     }
                 }
             }
-            if let Some(&output_tid) = last_op.outputs.first() {
+            // Output pointer: use the last epilogue op's output, or anchor if no epilogue
+            let final_op_id = group.epilogue.last().copied().unwrap_or(group.anchor);
+            let final_op = graph.op(final_op_id).unwrap_or(anchor_op);
+            if let Some(&output_tid) = final_op.outputs.first() {
                 if let Some(slot) = alloc.slots.iter().find(|s| s.tensor_id == output_tid) {
                     emit_raw(&mut self.ops, 0xF9400000 | (16 / 8 << 10) | (29 << 5) | 14);
                     self.emit_add_offset_gp(7, 14, slot.offset);
