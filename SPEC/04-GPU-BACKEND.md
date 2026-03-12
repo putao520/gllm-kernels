@@ -1,628 +1,460 @@
-# SPEC/04 — GPU Backend Architecture
+# SPEC/04 — GPU Backend: JIT 编译器统一路径
 
 ## §1 Overview
 
-This document specifies the GPU compute backend for `gllm-kernels`, extending the existing `Backend` / `Kernels<E>` trait hierarchy (SPEC/03 §2.2–2.3) to CUDA (NVIDIA) and Metal (Apple Silicon) accelerators.
+GPU 后端（CUDA/HIP/Metal）与 CPU 后端走**同一条 JIT 编译器路径**。Phase 0→1→2 完全复用，Phase 3 新增 GPU ISA 代码生成后端。
 
-### §1.1 Design Goals
+### §1.1 设计目标
 
-1. **Unified trait surface** — GPU backends implement the same `Kernels<E>` trait as `CpuKernels<E>`. User code is generic over `B: Backend`.
-2. **Async command-buffer model** — All kernel launches return immediately; synchronization is explicit (`stream.sync()` / `command_buffer.wait_until_completed()`).
-3. **Zero-copy where possible** — Host↔device transfers use pinned/page-locked memory. Device tensors stay on-device across operator chains.
-4. **Feature-gated compilation** — `cuda` and `metal` are Cargo features; the crate compiles on any platform without GPU SDKs installed.
-5. **Runtime kernel selection** — PTX/MSL kernels are embedded at compile time (`include_str!`) or compiled at first use via NVRTC / Metal shader compilation.
+1. **JIT 编译器统一路径** — Phase 0→1→2 完全复用（标量函数 → 符号执行 → OpTrace → SemanticDAG → FusionPlan），Phase 3 新增 `PtxCodeGen`（CUDA）、`AmdgpuCodeGen`（HIP）和 `AirCodeGen`（Metal），与 `X86CodeGen` / `DynasmAArch64CodeGen` 平级
+2. **零外部依赖** — 仅依赖 GPU driver API（`libcuda.so` / `libamdhip64.so` / `Metal.framework`），运行时动态链接。不依赖 cudarc、cuBLAS、metal-rs、MPS 或任何第三方 GPU 库
+3. **硬件能力驱动** — `GpuDeviceProfile` 检测 SM version / shared memory / register file / bandwidth（CUDA/HIP）或 GPU Family / threadgroup memory（Metal），驱动融合决策和代码生成
+4. **Feature-gated** — `jit-cuda`、`jit-hip`、`jit-metal` Cargo features，编译时不需要 CUDA SDK / ROCm SDK / Xcode
 
 ### §1.2 Non-Goals
 
-- Multi-GPU (tensor parallelism, pipeline parallelism) — deferred to a future SPEC.
-- Vulkan/OpenCL compute — out of scope.
-- Custom autograd / backward pass — this crate is inference-only.
+- Multi-GPU（tensor parallelism, pipeline parallelism）— 延后
+- Vulkan/OpenCL — 不在范围内
+- 反向传播 — 仅推理
 
 ---
 
-## §2 Cargo Feature Gates
+## §2 架构总览
+
+```
+Phase 0-2 [完全复用，平台无关]
+    标量函数 → 符号执行 → OpTrace → SemanticDAG → FusionPlan
+
+Phase 3 [平台特定代码生成]
+    ├── X86CodeGen (iced-x86)        → 机器码 → mmap+call
+    ├── DynasmAArch64CodeGen         → 机器码 → mmap+call
+    ├── PtxCodeGen (新增)            → PTX 文本 → cuModuleLoadData → cuLaunchKernel
+    ├── AmdgpuCodeGen (新增)         → AMDGPU ISA → hipModuleLoadData → hipLaunchKernel
+    └── AirCodeGen (新增)            → AIR bitcode → MTLLibrary → dispatch
+```
+
+所有代码生成后端实现同一个 `MachineCodeEmitter` trait。Phase 0-2 的 `FusionPlan` 是平台无关的，Phase 3 根据 `Platform` 选择对应的 CodeGen 后端。
+
+---
+
+## §3 Platform 枚举扩展
+
+```rust
+pub enum Platform {
+    X86_64 { avx512: bool, amx: bool },   // Intel AMX: Sapphire Rapids+
+    Aarch64 { sve: bool, amx: bool },      // Apple AMX: M1+ (未公开指令集)
+    Cuda { sm_version: u32 },              // sm_70, sm_80, sm_89, sm_90
+    Hip { gfx_arch: u32 },                 // gfx908, gfx90a, gfx942, gfx1100
+    Metal { gpu_family: u32 },             // Apple GPU family (7=M1, 8=M2, 9=M3, 10=M4)
+}
+```
+
+### §3.1 AMX 作为 CPU 平台的能力扩展
+
+AMX 不是独立 Platform variant，而是 CPU 平台的微内核加速能力：
+
+| AMX 变体 | 微内核规格 | 指令 | 对比基线 |
+|----------|-----------|------|---------|
+| Intel AMX (SPR+) | 16×16 tile | `TDPBF16PS` / `TDPFP16PS` / `TDPBSSD` | vs AVX-512 14×32 FMA |
+| Apple AMX (M1+) | 32×32 block | `AMX_LDX` / `AMX_FMA64` (未公开) | vs NEON 8×12 FMA |
+
+AMX 不改变 Phase 0-2 的任何逻辑。Phase 3 的 X86CodeGen / DynasmAArch64CodeGen 检测到 AMX 后，GEMM 微内核生成切换到 tile/block 指令，一条指令完成整个 MR×NR 块的乘累加。这是"更宽的微内核"，不是新的执行模型。
+
+---
+
+## §4 GpuDeviceProfile
+
+与 CPU `DeviceProfile` 同构，通过 driver API 检测硬件能力。
+
+### §4.1 CPU 侧 IsaLevel 扩展
+
+与 GPU 无关，但属于同一次 Platform 扩展：
+
+```rust
+pub enum IsaLevel {
+    Scalar,
+    Avx2,
+    Avx512,
+    Avx512Amx,     // 新增: Sapphire Rapids+ (AVX-512 + AMX tile 指令)
+    Neon,
+    Sve,
+    Sve2,
+    NeonAmx,       // 新增: Apple M1+ (NEON + AMX 协处理器指令)
+}
+```
+
+### §4.2 GPU 侧 GpuDeviceProfile
+
+#### CUDA
+
+| 属性 | CUDA Driver API | 用途 |
+|------|----------------|------|
+| SM version | `cuDeviceGetAttribute(COMPUTE_CAPABILITY_MAJOR/MINOR)` | 指令集选择（wmma/mma.sync/wgmma） |
+| Shared memory/SM | `cuDeviceGetAttribute(MAX_SHARED_MEMORY_PER_MULTIPROCESSOR)` | Tile 尺寸决策（类比 CPU L1） |
+| Register file/SM | `cuDeviceGetAttribute(MAX_REGISTERS_PER_MULTIPROCESSOR)` | Register blocking（类比 CPU SIMD regs） |
+| SM count | `cuDeviceGetAttribute(MULTIPROCESSOR_COUNT)` | Grid 尺寸 |
+| L2 cache | `cuDeviceGetAttribute(L2_CACHE_SIZE)` | Tiling 决策（类比 CPU L3） |
+| Memory bandwidth | clock rate × bus width | Roofline 分析 |
+| Warp size | `cuDeviceGetAttribute(WARP_SIZE)` | 线程组织（始终 32） |
+
+#### HIP
+
+HIP driver API 与 CUDA 几乎 1:1 映射（`hipDeviceGetAttribute`），属性名对应替换。
+
+#### Metal
+
+| 属性 | Metal API | 用途 |
+|------|-----------|------|
+| GPU Family | `MTLDevice.supportsFamily()` | 指令集能力 |
+| Max threadgroup memory | `MTLDevice.maxThreadgroupMemoryLength` | Tile 尺寸决策 |
+| Max threads per threadgroup | `MTLDevice.maxThreadsPerThreadgroup` | Block 尺寸 |
+| Recommended working set size | `MTLDevice.recommendedMaxWorkingSetSize` | 内存预算 |
+
+这些参数驱动 Phase 2 融合决策和 Phase 3 代码生成，与 CPU 路径的 `cache_sizes()` / `num_simd_regs()` / `gemm_blocking()` 完全同构。
+
+---
+
+## §5 Driver API FFI 绑定
+
+零依赖，运行时 `dlopen`。
+
+### §5.1 CUDA Driver API
+
+```rust
+struct CudaDriver {
+    lib: *mut c_void,  // dlopen("libcuda.so.1")
+    // 初始化
+    cuInit: unsafe extern "C" fn(u32) -> CUresult,
+    // 设备管理
+    cuDeviceGet: unsafe extern "C" fn(*mut CUdevice, i32) -> CUresult,
+    cuDeviceGetAttribute: unsafe extern "C" fn(*mut i32, CUdevice_attribute, CUdevice) -> CUresult,
+    // 上下文管理
+    cuCtxCreate: unsafe extern "C" fn(*mut CUcontext, u32, CUdevice) -> CUresult,
+    cuCtxDestroy: unsafe extern "C" fn(CUcontext) -> CUresult,
+    // 模块/内核
+    cuModuleLoadData: unsafe extern "C" fn(*mut CUmodule, *const c_void) -> CUresult,
+    cuModuleGetFunction: unsafe extern "C" fn(*mut CUfunction, CUmodule, *const c_char) -> CUresult,
+    cuLaunchKernel: unsafe extern "C" fn(
+        CUfunction, u32, u32, u32, u32, u32, u32,
+        u32, CUstream, *mut *mut c_void, *mut *mut c_void,
+    ) -> CUresult,
+    // 内存管理
+    cuMemAlloc: unsafe extern "C" fn(*mut CUdeviceptr, usize) -> CUresult,
+    cuMemFree: unsafe extern "C" fn(CUdeviceptr) -> CUresult,
+    cuMemcpyHtoD: unsafe extern "C" fn(CUdeviceptr, *const c_void, usize) -> CUresult,
+    cuMemcpyDtoH: unsafe extern "C" fn(*mut c_void, CUdeviceptr, usize) -> CUresult,
+    // 流管理
+    cuStreamCreate: unsafe extern "C" fn(*mut CUstream, u32) -> CUresult,
+    cuStreamSynchronize: unsafe extern "C" fn(CUstream) -> CUresult,
+    cuStreamDestroy: unsafe extern "C" fn(CUstream) -> CUresult,
+}
+```
+
+加载方式：
+
+```rust
+impl CudaDriver {
+    pub fn load() -> Result<Self, DriverError> {
+        let lib = unsafe { dlopen(b"libcuda.so.1\0".as_ptr() as _, RTLD_LAZY) };
+        if lib.is_null() {
+            return Err(DriverError::NotFound("libcuda.so.1"));
+        }
+        // dlsym 逐个解析函数指针...
+        Ok(Self { lib, cuInit: ..., ... })
+    }
+}
+```
+
+### §5.2 HIP Driver API
+
+```rust
+struct HipDriver {
+    lib: *mut c_void,  // dlopen("libamdhip64.so")
+    hipInit: unsafe extern "C" fn(u32) -> hipError_t,
+    hipModuleLoadData: unsafe extern "C" fn(*mut hipModule_t, *const c_void) -> hipError_t,
+    hipModuleGetFunction: unsafe extern "C" fn(*mut hipFunction_t, hipModule_t, *const c_char) -> hipError_t,
+    hipModuleLaunchKernel: unsafe extern "C" fn(
+        hipFunction_t, u32, u32, u32, u32, u32, u32,
+        u32, hipStream_t, *mut *mut c_void, *mut *mut c_void,
+    ) -> hipError_t,
+    hipMalloc: unsafe extern "C" fn(*mut *mut c_void, usize) -> hipError_t,
+    hipFree: unsafe extern "C" fn(*mut c_void) -> hipError_t,
+    hipMemcpyHtoD: unsafe extern "C" fn(*mut c_void, *const c_void, usize) -> hipError_t,
+    hipMemcpyDtoH: unsafe extern "C" fn(*mut c_void, *const c_void, usize) -> hipError_t,
+    // ...
+}
+```
+
+API 与 CUDA 几乎 1:1 映射，函数名 `cu` → `hip` 前缀替换。
+
+### §5.3 Metal Framework 绑定
+
+通过 Objective-C runtime 绑定（`dlopen("Metal.framework/Metal")`）：
+
+```rust
+struct MetalDriver {
+    // Objective-C runtime
+    objc_msgSend: unsafe extern "C" fn(*mut Object, Sel, ...) -> *mut Object,
+    // Metal classes
+    MTLCreateSystemDefaultDevice: unsafe extern "C" fn() -> *mut Object,
+    // 通过 objc_msgSend 调用:
+    // [device newCommandQueue]
+    // [device newBufferWithLength:options:]
+    // [device newLibraryWithData:error:]
+    // [library newFunctionWithName:]
+    // [device newComputePipelineStateWithFunction:error:]
+    // [commandBuffer computeCommandEncoder]
+    // [encoder setComputePipelineState:]
+    // [encoder setBuffer:offset:atIndex:]
+    // [encoder dispatchThreadgroups:threadsPerThreadgroup:]
+    // [encoder endEncoding]
+    // [commandBuffer commit]
+    // [commandBuffer waitUntilCompleted]
+}
+```
+
+macOS 上 Metal framework 始终可用，无需额外安装。
+
+---
+
+## §6 PtxCodeGen — Phase 3 PTX 代码生成
+
+实现 `MachineCodeEmitter` trait，与 X86CodeGen / DynasmAArch64CodeGen 平级。
+
+### §6.1 TraceOp → PTX 指令映射
+
+| TraceOp | PTX 指令 | 备注 |
+|---------|---------|------|
+| Add | `add.f32` | |
+| Mul | `mul.f32` | |
+| Fma | `fma.rn.f32` | Round-to-nearest |
+| Exp | `ex2.approx.f32` + 多项式修正 | `exp(x) = exp2(x * log2(e))` |
+| Sqrt | `sqrt.rn.f32` | |
+| Recip | `rcp.approx.f32` + Newton-Raphson | 1 次 Newton 迭代达到 fp32 精度 |
+| Neg | `neg.f32` | |
+| Max | `max.f32` | |
+| Min | `min.f32` | |
+| Load | `ld.global.f32` | Global memory load |
+| Store | `st.global.f32` | Global memory store |
+
+### §6.2 SM 版本感知指令选择
+
+类比 CPU 的 AVX2 vs AVX-512 选择：
+
+| SM | 关键能力 | GEMM 策略 |
+|----|---------|----------|
+| sm_70 (V100) | HMMA fp16 | `wmma.load` / `wmma.mma` / `wmma.store` PTX |
+| sm_80 (A100) | async copy + mma.sync | `cp.async.cg.shared.global` + `mma.sync.aligned.m16n8k16` |
+| sm_89 (L40/4090) | FP8 Tensor Core | FP8 `mma.sync` 变体 |
+| sm_90 (H100) | WGMMA + TMA | `wgmma.mma_async` + TMA descriptor（硬件异步数据搬运） |
+
+### §6.3 PTX 生成流程
+
+```
+FusionPlan
+  → PtxCodeGen.emit_plan(plan, &gpu_profile)
+  → PTX 文本 (String)
+  → cuModuleLoadData(ptx.as_ptr())  // driver 编译 PTX → SASS
+  → cuModuleGetFunction("kernel_name")
+  → GpuCompiledLayer { module, kernel, block_dim, grid_calculator, ... }
+```
+
+PTX 是文本格式的虚拟 ISA，由 NVIDIA driver 在 `cuModuleLoadData` 时编译为目标 GPU 的 SASS 机器码。这意味着：
+- 我们生成 PTX 文本，不需要 NVRTC 或 nvcc
+- Driver 负责最终的指令调度和寄存器分配
+- PTX 版本需匹配目标 SM（`.version 7.0` for sm_70, `.version 8.0` for sm_80, etc.）
+
+---
+
+## §7 Phase 2 融合决策 GPU 适配
+
+Phase 2 融合规则完全复用，硬件约束参数替换为 GPU 等价物：
+
+| CPU 概念 | GPU 等价 | 说明 |
+|----------|---------|------|
+| L1 cache → TileLevelFusion 阈值 | Shared memory → SharedMemoryFusion 阈值 | GPU shared memory 是显式管理的 L1 |
+| L2 cache → ComputeRoot 容量 | L2 cache（GPU 通常 4-40MB） | GPU L2 是隐式缓存 |
+| SIMD 寄存器数 → epilogue 可行性 | Per-thread 寄存器数 → epilogue 可行性 | GPU 寄存器文件远大于 CPU |
+| BLIS MC/NC/KC blocking | GPU block_m/block_n/block_k/warp_m/warp_n | 分层 tiling 模型统一 |
+
+融合决策的核心逻辑（EpilogueInjection、LoopFusion、TileLevelFusion）不变，只是参数来源从 `DeviceProfile` 切换到 `GpuDeviceProfile`。
+
+---
+
+## §8 GEMM Tiling — 统一的分层映射
+
+所有平台的 GEMM 都是同一个分层 tiling 模型，只是每层映射到不同的硬件资源：
+
+| 层次 | CPU (AVX2) | CPU (AVX-512) | CPU (Intel AMX) | CPU (Apple AMX) | GPU (CUDA) |
+|------|-----------|--------------|----------------|----------------|-----------|
+| 最外层 | NC×KC (L3) | NC×KC (L3) | NC×KC (L3) | NC×KC (L3) | Grid tile |
+| 中间层 | MC×KC (L2) | MC×KC (L2) | MC×KC (L2) | MC×KC (L2) | Block tile (shared mem) |
+| 微内核 | 6×16 FMA | 14×32 FMA | 16×16 TDPBF16PS | 32×32 AMX_FMA | Warp mma.sync |
+| 数据搬运 | pack_a/pack_b | pack_a/pack_b | tile load/store | AMX_LDX/STX | Global→Shared (`cp.async`) |
+
+Phase 2 的融合决策（EpilogueInjection、TileLevelFusion 等）对所有平台通用。差异只在 Phase 3 微内核指令选择。
+
+---
+
+## §9 CompiledLayer 执行层分叉
+
+```rust
+pub enum CompiledLayer {
+    Cpu(CpuCompiledLayer),    // 现有: mmap + fn_ptr call
+    Gpu(GpuCompiledLayer),    // 新增: module + kernel launch
+}
+
+pub struct GpuCompiledLayer {
+    module: GpuModule,          // CUmodule / hipModule_t / MTLLibrary
+    kernel: GpuFunction,        // CUfunction / hipFunction_t / MTLComputePipelineState
+    block_dim: (u32, u32, u32), // threads per block/threadgroup
+    grid_calculator: GridCalc,  // 根据输入尺寸计算 grid 维度
+    shared_mem_bytes: u32,      // 动态 shared memory 大小
+    scratchpad_bytes: usize,    // 额外设备内存需求
+    config_hash: u64,           // 用于缓存查找
+}
+
+/// Grid 尺寸计算器
+pub enum GridCalc {
+    /// Elementwise: grid = ceil(n / block_size)
+    Linear { elements_per_thread: u32 },
+    /// GEMM: grid = (ceil(M/block_m), ceil(N/block_n))
+    Tiled2D { block_m: u32, block_n: u32 },
+    /// Reduction: grid = num_rows (每行一个 block)
+    PerRow,
+}
+```
+
+---
+
+## §10 AmdgpuCodeGen — HIP 后端
+
+与 PtxCodeGen 平级。生成 AMDGPU ISA 汇编，通过 `hipModuleLoadData` 加载。
+
+### §10.1 GFX 架构感知
+
+| GFX Arch | 代表 GPU | 关键能力 | GEMM 策略 |
+|----------|---------|---------|----------|
+| gfx908 | MI100 | MFMA fp32/fp16 | `v_mfma_f32_32x32x8f16` |
+| gfx90a | MI210 | MFMA + unified memory | MFMA + 统一寻址 |
+| gfx942 | MI300X | MFMA + HBM3 | MFMA + 更大 LDS |
+| gfx1100 | RX 7900 | WMMA | `v_wmma_f32_16x16x16_f16` |
+
+### §10.2 AMDGPU vs PTX 差异
+
+| 维度 | CUDA PTX | AMDGPU ISA |
+|------|---------|-----------|
+| 虚拟 ISA | PTX（driver 编译为 SASS） | 直接生成 GCN/RDNA ISA |
+| Warp 大小 | 32 (warp) | 64 (wavefront, CDNA) / 32 (wave32, RDNA) |
+| Shared memory | `shared` 地址空间 | LDS (Local Data Share) |
+| 同步 | `bar.sync` | `s_barrier` |
+| Tensor Core | `mma.sync` / `wgmma` | `v_mfma_*` / `v_wmma_*` |
+
+---
+
+## §11 AirCodeGen — Metal 后端
+
+与 PtxCodeGen 平级。生成 Apple IR (AIR) bitcode，通过 Metal framework 加载。
+
+AIR 是 Metal 的中间表示（类似 PTX 之于 CUDA），是 LLVM bitcode 的 Apple 定制变体。JIT 路径：
+
+```
+AirCodeGen 生成 AIR bitcode
+  → MTLDevice.makeLibrary(data:)    // 从 AIR bitcode 创建 MTLLibrary
+  → MTLLibrary.makeFunction(name:)  // 获取 kernel 函数
+  → MTLDevice.makeComputePipelineState(function:)  // 编译为 PSO
+  → dispatch
+```
+
+### Apple GPU Family 感知
+
+| GPU Family | 芯片 | 关键能力 |
+|-----------|------|---------|
+| Family 7 | M1 | 基础 SIMD-group 操作 |
+| Family 8 | M2 | 增强 SIMD-group + 更大 threadgroup memory |
+| Family 9 | M3 | 动态缓存 (Dynamic Caching) + mesh shading |
+| Family 10 | M4 | 增强 AI 加速 |
+
+### Metal 特有概念映射
+
+| GPU 通用概念 | Metal 等价 |
+|-------------|-----------|
+| Thread block | Threadgroup |
+| Shared memory | Threadgroup memory |
+| Warp (32 threads) | SIMD-group (32 threads) |
+| Grid | Dispatch grid |
+| Register file | Per-thread registers |
+| Global memory | Device memory (`device` address space) |
+
+---
+
+## §12 Cargo Features
 
 ```toml
 [features]
 default = []
-cuda = ["dep:cudarc"]
-metal = ["dep:metal", "dep:objc"]
-
-[target.'cfg(target_os = "linux")'.dependencies]
-cudarc = { version = "0.12", optional = true, features = ["driver", "nvrtc"] }
-
-[target.'cfg(target_os = "macos")'.dependencies]
-metal = { version = "0.29", optional = true }
-objc = { version = "0.2", optional = true }
+jit-cuda = []     # 零外部依赖，运行时 dlopen libcuda.so.1
+jit-hip = []      # 零外部依赖，运行时 dlopen libamdhip64.so
+jit-metal = []    # 零外部依赖，运行时 dlopen Metal.framework (macOS only)
 ```
 
-All GPU modules are gated:
+所有 GPU feature 均为零外部依赖。编译时不需要 CUDA SDK、ROCm SDK 或 Xcode。GPU 相关代码通过 `#[cfg(feature = "jit-cuda")]` 等条件编译。
 
-```rust
-#[cfg(feature = "cuda")]
-pub mod cuda;
-
-#[cfg(feature = "metal")]
-pub mod metal_backend;
-```
+运行时通过 `dlopen` 动态加载 driver 库。如果 driver 不存在，返回 `DriverError::NotFound` 而非 panic。
 
 ---
 
-## §3 Device Abstraction Layer
+## §13 实现优先级
 
-### §3.1 `GpuDevice` Trait
-
-A thin abstraction over device handles, shared by both backends:
-
-```rust
-pub trait GpuDevice: Send + Sync + 'static {
-    type Buffer: GpuBuffer;
-    type Stream: GpuStream;
-
-    fn name(&self) -> &str;
-    fn total_memory(&self) -> usize;
-    fn free_memory(&self) -> usize;
-
-    /// Allocate device memory (uninitialized).
-    fn alloc(&self, bytes: usize) -> Result<Self::Buffer, GpuError>;
-
-    /// Allocate and zero-fill.
-    fn alloc_zeros(&self, bytes: usize) -> Result<Self::Buffer, GpuError>;
-
-    /// Copy host → device.
-    fn htod(&self, src: &[u8], dst: &mut Self::Buffer, stream: &Self::Stream) -> Result<(), GpuError>;
-
-    /// Copy device → host.
-    fn dtoh(&self, src: &Self::Buffer, dst: &mut [u8], stream: &Self::Stream) -> Result<(), GpuError>;
-
-    /// Copy device → device (same device).
-    fn dtod(&self, src: &Self::Buffer, dst: &mut Self::Buffer, stream: &Self::Stream) -> Result<(), GpuError>;
-
-    /// Create an execution stream / command queue.
-    fn create_stream(&self) -> Result<Self::Stream, GpuError>;
-
-    /// Default stream.
-    fn default_stream(&self) -> &Self::Stream;
-
-    /// Synchronize all pending work on the device.
-    fn sync(&self) -> Result<(), GpuError>;
-}
-```
-
-### §3.2 `GpuBuffer` Trait
-
-```rust
-pub trait GpuBuffer: Send + Sync {
-    /// Raw device pointer (for kernel launch).
-    fn as_device_ptr(&self) -> u64;
-    /// Size in bytes.
-    fn len(&self) -> usize;
-    fn is_empty(&self) -> bool { self.len() == 0 }
-}
-```
-
-### §3.3 `GpuStream` Trait
-
-```rust
-pub trait GpuStream: Send + Sync {
-    /// Block host until all enqueued work completes.
-    fn synchronize(&self) -> Result<(), GpuError>;
-}
-```
-
-### §3.4 Error Type
-
-```rust
-#[derive(Debug, thiserror::Error)]
-pub enum GpuError {
-    #[error("device not found: {0}")]
-    DeviceNotFound(String),
-    #[error("out of memory: requested {requested} bytes, {available} available")]
-    OutOfMemory { requested: usize, available: usize },
-    #[error("kernel launch failed: {0}")]
-    KernelLaunch(String),
-    #[error("shader compilation failed: {0}")]
-    ShaderCompilation(String),
-    #[error("transfer failed: {0}")]
-    Transfer(String),
-    #[error("driver error: {0}")]
-    Driver(String),
-}
-```
+| 阶段 | 内容 | 依赖 |
+|------|------|------|
+| P0 | Driver API FFI 绑定（CUDA/HIP/Metal）+ GpuDeviceProfile 检测 | 无 |
+| P1 | PtxCodeGen: Elementwise LoopFusion → 单 kernel | P0 |
+| P2 | PtxCodeGen: GEMM tiled kernel (sm_80 mma.sync) | P1 |
+| P3 | EpilogueInjection + SharedMemoryFusion | P2 |
+| P4 | SM 版本特化 (sm_70 wmma / sm_90 wgmma+TMA) | P2 |
+| P5 | AmdgpuCodeGen: 同 P1-P4 for HIP | P0 |
+| P6 | AirCodeGen: 同 P1-P3 for Metal | P0 |
 
 ---
 
-## §4 CUDA Backend (`feature = "cuda"`)
+## §14 测试策略
 
-### §4.1 Module Layout
+### §14.1 CPU Golden Reference
 
-```
-src/cuda/
-├── mod.rs              // CudaBackend, CudaDevice, re-exports
-├── device.rs           // GpuDevice impl over cudarc::driver::CudaDevice
-├── kernels.rs          // Kernels<E> impl: CudaKernels<E>
-├── launch.rs           // Grid/block helpers, occupancy calculator
-├── shaders/
-│   ├── elementwise.cu  // vec_add, vec_mul, silu, gelu, relu, etc.
-│   ├── reduce.cu       // vec_sum, vec_max, softmax
-│   ├── norm.cu         // rms_norm, layer_norm
-│   ├── gemm.cu         // tiled GEMM (fallback; prefer cuBLAS)
-│   ├── gemv.cu         // GEMV kernels
-│   ├── rope.cu         // RoPE positional encoding
-│   ├── quant.cu        // dequantization (Q4_K, Q8_K, etc.)
-│   └── quant_gemv.cu   // fused dequant+GEMV
-└── ptx/                // Pre-compiled PTX (optional, for offline builds)
-```
-
-### §4.2 `CudaDevice` — `GpuDevice` Implementation
+GPU JIT 输出 vs CPU JIT 输出，逐元素比较：
 
 ```rust
-#[cfg(feature = "cuda")]
-pub struct CudaDeviceWrapper {
-    inner: Arc<cudarc::driver::CudaDevice>,
-    default_stream: CudaStreamWrapper,
-}
-
-impl GpuDevice for CudaDeviceWrapper {
-    type Buffer = CudaBufferWrapper;
-    type Stream = CudaStreamWrapper;
-    // ... delegates to cudarc
-}
+// 伪代码
+let cpu_output = cpu_jit_execute(fusion_plan, &cpu_profile, &input);
+let gpu_output = gpu_jit_execute(fusion_plan, &gpu_profile, &input);
+assert_approx_eq(&cpu_output, &gpu_output, tolerance);
 ```
 
-Key design decisions:
-- Uses `cudarc` with `driver` + `nvrtc` features (runtime PTX compilation).
-- `cudarc::driver::CudaDevice` is `Arc`-wrapped internally; our wrapper adds the `GpuDevice` trait surface.
-- Kernel modules are loaded lazily via `OnceLock<CudaFunction>` per kernel.
-
-### §4.3 `CudaKernels<E>` — `Kernels<E>` Implementation
-
-```rust
-pub struct CudaKernels<E: Element> {
-    device: Arc<CudaDeviceWrapper>,
-    _phantom: PhantomData<E>,
-}
-
-impl<E: Element> Kernels<E> for CudaKernels<E> {
-    fn vec_add(&self, a: &[E], b: &[E], out: &mut [E]) { ... }
-    fn gemm(&self, a: &[E], b: &[E], c: &mut [E], m: usize, n: usize, k: usize) { ... }
-    fn silu(&self, a: &[E], out: &mut [E]) { ... }
-    fn dequant_q4_k(&self, block: &[u8], out: &mut [f32]) { ... }
-    fn dequant_q8_k(&self, block: &[u8], out: &mut [f32]) { ... }
-    // ... all 70+ operators
-}
-```
-
-**Kernel launch pattern** (internal):
-
-```rust
-fn launch_elementwise<E: Element>(
-    device: &CudaDeviceWrapper,
-    kernel_name: &str,
-    a: &[E], b: &[E], out: &mut [E],
-) -> Result<(), GpuError> {
-    let n = a.len();
-    let block_size = 256;
-    let grid_size = (n + block_size - 1) / block_size;
-
-    let d_a = device.htod_sync(a)?;
-    let d_b = device.htod_sync(b)?;
-    let mut d_out = device.alloc(n * std::mem::size_of::<E>())?;
-
-    let func = device.get_or_load_func(kernel_name, ELEMENTWISE_PTX)?;
-    unsafe {
-        func.launch(
-            LaunchConfig::for_num_elems(n as u32),
-            (&d_a, &d_b, &mut d_out, n as u32),
-        )?;
-    }
-
-    device.dtoh_sync(&d_out, out)?;
-    Ok(())
-}
-```
-
-### §4.4 GEMM Strategy
-
-| M×N×K range | Strategy |
-|---|---|
-| Any (default) | cuBLAS `sgemm` / `hgemm` via `cudarc::cublas` |
-| M=1 (GEMV) | Custom CUDA GEMV kernel (better for single-token decode) |
-| Quantized | Fused dequant+GEMV kernel (§4.6) |
-
-cuBLAS is preferred for dense GEMM — no point reimplementing what NVIDIA already optimized. The custom kernels exist for:
-- Quantized weight formats (no cuBLAS equivalent)
-- Fused epilogues (bias + activation in one pass)
-- GEMV with M=1 (cuBLAS overhead dominates at small M)
-
-### §4.5 Kernel Compilation
-
-Two modes:
-1. **NVRTC (default)** — `.cu` sources compiled to PTX at first kernel launch, cached in `OnceLock`.
-2. **Pre-compiled PTX** — `include_str!("ptx/kernel.ptx")` for offline/hermetic builds. Selected via `cuda-precompiled` feature flag.
-
-```rust
-static ELEMENTWISE_PTX: OnceLock<CudaModule> = OnceLock::new();
-
-fn get_elementwise_module(device: &CudaDeviceWrapper) -> &CudaModule {
-    ELEMENTWISE_PTX.get_or_init(|| {
-        device.compile_ptx(include_str!("shaders/elementwise.cu"))
-            .expect("elementwise.cu compilation failed")
-    })
-}
-```
-
-### §4.6 Quantized Kernels
-
-Fused dequant+dot kernels for all GGML quant formats:
-
-| Format | Block size | Kernel | Notes |
-|---|---|---|---|
-| Q4_K | 256 | `dequant_q4k_f32` / `fused_gemv_q4k` | Super-blocks, 4-bit + 6-bit scales |
-| Q8_K | 256 | `dequant_q8k_f32` / `fused_gemv_q8k` | 8-bit quantized |
-| Q2_K–Q6_K | 256 | `dequant_qNk_f32` | K-quant family |
-| Q4_0–Q8_1 | 32 | `dequant_qN_M_f32` | Classic GGML |
-| IQ1–IQ4 | varies | `dequant_iqN_f32` | Importance quant |
-
-Each dequant kernel:
-1. One thread-block per super-block (256 elements for K-quants, 32 for classic).
-2. Shared memory for scale/min unpacking.
-3. Output to global f32 buffer.
-
-Fused GEMV kernels skip the intermediate f32 buffer — dequant + dot in registers.
-
----
-
-## §5 Metal Backend (`feature = "metal"`)
-
-### §5.1 Module Layout
-
-```
-src/metal_backend/
-├── mod.rs              // MetalBackend, MetalDevice, re-exports
-├── device.rs           // GpuDevice impl over metal::Device
-├── kernels.rs          // Kernels<E> impl: MetalKernels<E>
-├── pipeline.rs         // Pipeline state cache (MSL → PSO)
-├── shaders/
-│   ├── elementwise.metal
-│   ├── reduce.metal
-│   ├── norm.metal
-│   ├── gemm.metal
-│   ├── gemv.metal
-│   ├── rope.metal
-│   ├── quant.metal
-│   └── quant_gemv.metal
-└── metallib/           // Pre-compiled .metallib (optional)
-```
-
-### §5.2 `MetalDevice` — `GpuDevice` Implementation
-
-```rust
-#[cfg(feature = "metal")]
-pub struct MetalDeviceWrapper {
-    device: metal::Device,
-    command_queue: metal::CommandQueue,
-    pipeline_cache: DashMap<String, metal::ComputePipelineState>,
-}
-
-impl GpuDevice for MetalDeviceWrapper {
-    type Buffer = MetalBufferWrapper;
-    type Stream = MetalCommandBuffer;
-    // ...
-}
-```
-
-Key design decisions:
-- `metal::Device::system_default()` for device acquisition.
-- Pipeline states (compiled shaders) cached in `DashMap` by kernel name.
-- Command buffers are the "stream" equivalent — created per-batch, committed, waited.
-
-### §5.3 `MetalKernels<E>` — `Kernels<E>` Implementation
-
-Same structure as CUDA. Metal-specific considerations:
-
-- **Threadgroup sizes**: Metal uses `threads_per_threadgroup` (≈ CUDA block) and `threadgroups_per_grid` (≈ CUDA grid). Max threadgroup size is typically 1024.
-- **SIMD-groups**: Metal's equivalent of warps (32 threads on Apple GPU). Reductions use `simd_shuffle` / `simd_sum`.
-- **Shared memory**: `threadgroup` address space in MSL, declared in kernel signature.
-
-### §5.4 MSL Shader Compilation
-
-```rust
-fn get_or_create_pipeline(
-    device: &MetalDeviceWrapper,
-    kernel_name: &str,
-    source: &str,
-) -> Result<metal::ComputePipelineState, GpuError> {
-    if let Some(pso) = device.pipeline_cache.get(kernel_name) {
-        return Ok(pso.clone());
-    }
-    let library = device.device.new_library_with_source(source, &metal::CompileOptions::new())
-        .map_err(|e| GpuError::ShaderCompilation(e.to_string()))?;
-    let func = library.get_function(kernel_name, None)
-        .map_err(|e| GpuError::KernelLaunch(e.to_string()))?;
-    let pso = device.device.new_compute_pipeline_state_with_function(&func)
-        .map_err(|e| GpuError::KernelLaunch(e.to_string()))?;
-    device.pipeline_cache.insert(kernel_name.to_string(), pso.clone());
-    Ok(pso)
-}
-```
-
-### §5.5 GEMM Strategy (Metal)
-
-| M×N×K range | Strategy |
-|---|---|
-| Large dense | MPS (Metal Performance Shaders) `MPSMatrixMultiplication` |
-| M=1 (GEMV) | Custom MSL GEMV kernel |
-| Quantized | Fused dequant+GEMV MSL kernel |
-
-MPS is Apple's equivalent of cuBLAS — use it for dense matmul, custom kernels for everything else.
-
-### §5.6 Memory Model
-
-Metal uses a unified memory architecture (UMA) on Apple Silicon:
-- `MTLResourceStorageModeShared` — CPU and GPU share the same physical memory. Zero-copy for host↔device.
-- No explicit `htod`/`dtoh` needed for shared buffers — just `contents()` pointer.
-- For `GpuDevice` trait compliance, `htod`/`dtoh` become `memcpy` into shared buffers.
-
-```rust
-impl GpuDevice for MetalDeviceWrapper {
-    fn htod(&self, src: &[u8], dst: &mut Self::Buffer, _stream: &Self::Stream) -> Result<(), GpuError> {
-        // UMA: direct memcpy into shared buffer
-        unsafe {
-            std::ptr::copy_nonoverlapping(
-                src.as_ptr(),
-                dst.buffer.contents() as *mut u8,
-                src.len(),
-            );
-        }
-        Ok(())
-    }
-}
-```
-
----
-
-## §6 `GpuTensor<E, D>` — Device-Resident Tensor
-
-To avoid round-tripping through host slices on every operator call, GPU backends use a device-resident tensor wrapper:
-
-```rust
-pub struct GpuTensor<E: Element, D: GpuDevice> {
-    buffer: D::Buffer,
-    len: usize,       // number of elements (not bytes)
-    _elem: PhantomData<E>,
-}
-
-impl<E: Element, D: GpuDevice> GpuTensor<E, D> {
-    /// Allocate on device, uninitialized.
-    pub fn alloc(device: &D, len: usize) -> Result<Self, GpuError> { ... }
-
-    /// Upload from host slice.
-    pub fn from_slice(device: &D, data: &[E], stream: &D::Stream) -> Result<Self, GpuError> { ... }
-
-    /// Download to host Vec.
-    pub fn to_vec(&self, device: &D, stream: &D::Stream) -> Result<Vec<E>, GpuError> { ... }
-
-    pub fn len(&self) -> usize { self.len }
-    pub fn device_ptr(&self) -> u64 { self.buffer.as_device_ptr() }
-}
-```
-
-### §6.1 Kernels Trait Adaptation
-
-The existing `Kernels<E>` trait uses host slices (`&[E]`, `&mut [E]`). For GPU, this means implicit htod→kernel→dtoh per call — correct but slow for operator chains.
-
-Two-phase approach:
-1. **Phase 1 (this SPEC)**: Implement `Kernels<E>` with implicit transfers. Functionally correct, enables all existing tests to pass.
-2. **Phase 2 (future SPEC)**: Add `GpuKernels<E>` extension trait with `GpuTensor` parameters for zero-copy operator chaining.
-
-```rust
-/// Phase 2 extension (future):
-pub trait GpuKernelsExt<E: Element>: Kernels<E> {
-    type Device: GpuDevice;
-
-    fn vec_add_gpu(&self, a: &GpuTensor<E, Self::Device>, b: &GpuTensor<E, Self::Device>,
-                   out: &mut GpuTensor<E, Self::Device>) -> Result<(), GpuError>;
-    fn gemm_gpu(&self, a: &GpuTensor<E, Self::Device>, b: &GpuTensor<E, Self::Device>,
-                c: &mut GpuTensor<E, Self::Device>, m: usize, n: usize, k: usize) -> Result<(), GpuError>;
-    // ...
-}
-```
-
----
-
-## §7 Backend Registration
-
-### §7.1 `CudaBackend` / `MetalBackend`
-
-```rust
-#[cfg(feature = "cuda")]
-pub struct CudaBackend;
-
-#[cfg(feature = "cuda")]
-impl Backend for CudaBackend {
-    const NAME: &'static str = "cuda";
-    type Kernels<E: Element> = CudaKernels<E>;
-
-    fn init<E: Element>() -> Self::Kernels<E> {
-        CudaKernels::new(CudaDeviceWrapper::default_device()
-            .expect("CUDA device initialization failed"))
-    }
-}
-
-#[cfg(feature = "metal")]
-pub struct MetalBackend;
-
-#[cfg(feature = "metal")]
-impl Backend for MetalBackend {
-    const NAME: &'static str = "metal";
-    type Kernels<E: Element> = MetalKernels<E>;
-
-    fn init<E: Element>() -> Self::Kernels<E> {
-        MetalKernels::new(MetalDeviceWrapper::system_default()
-            .expect("Metal device initialization failed"))
-    }
-}
-```
-
-### §7.2 `CpuBackend` (existing, for reference)
-
-```rust
-pub struct CpuBackend;
-
-impl Backend for CpuBackend {
-    const NAME: &'static str = "cpu";
-    type Kernels<E: Element> = CpuKernels<E>;
-
-    fn init<E: Element>() -> Self::Kernels<E> {
-        CpuKernels::new()
-    }
-}
-```
-
----
-
-## §8 Kernel Implementation Priority
-
-Ordered by inference-critical-path impact:
-
-| Priority | Kernel group | Operators | Notes |
-|---|---|---|---|
-| P0 | Dense GEMM | `gemm`, `gemm_bt`, `gemm_bias`, `gemm_bias_act` | Delegates to cuBLAS/MPS |
-| P0 | Dequant | `dequant_q4_k`, `dequant_q8_k`, all K-quant/classic/IQ | Required for quantized models |
-| P0 | Quant matmul | `kquant_matmul`, `classic_matmul`, `iq_matmul` | Fused dequant+GEMV |
-| P1 | Normalization | `rms_norm`, `layer_norm` | Per-token, latency-sensitive |
-| P1 | Activations | `silu`, `gelu`, `relu`, `swiglu`, `softmax` | Fused where possible |
-| P1 | RoPE | `rope`, `rope_with_pos` | Positional encoding |
-| P2 | BLAS-1 | `vec_add`, `vec_mul`, `vec_dot`, `vec_scale`, `vec_axpy` | Element-wise |
-| P2 | Reductions | `vec_sum`, `vec_max`, `vec_sum_squares` | Single-pass reduce |
-| P3 | Quantized GEMV | `gemv_q8`, `gemv_q4`, `gemv_q2`, `gemv_q1` | INT8/INT4 paths |
-| P3 | AWQ/GPTQ | `awq_matmul`, `gptq_matmul`, `squeeze_matmul` | External quant formats |
-
----
-
-## §9 Testing Strategy
-
-### §9.1 Cross-Backend Correctness
-
-All GPU kernel outputs are validated against CPU reference implementations:
-
-```rust
-#[cfg(test)]
-fn test_kernel_cross_backend<F>(name: &str, cpu_fn: F, gpu_fn: F, tolerance: f32)
-where F: Fn(&dyn Kernels<f32>, &[f32], &[f32], &mut [f32])
-{
-    let cpu_k = CpuKernels::<f32>::new();
-    let gpu_k = GpuKernels::<f32>::new(...);
-
-    let a = random_vec(1024);
-    let b = random_vec(1024);
-    let mut cpu_out = vec![0.0; 1024];
-    let mut gpu_out = vec![0.0; 1024];
-
-    cpu_fn(&cpu_k, &a, &b, &mut cpu_out);
-    gpu_fn(&gpu_k, &a, &b, &mut gpu_out);
-
-    assert_approx_eq(&cpu_out, &gpu_out, tolerance);
-}
-```
-
-### §9.2 Tolerance Thresholds
-
-| Precision | Element-wise ops | Reductions | GEMM |
-|---|---|---|---|
-| f32 | 1e-6 | 1e-5 | 1e-4 (accumulation error) |
+### §14.2 Tolerance 阈值
+
+| 精度 | Elementwise | Reduction | GEMM |
+|------|------------|-----------|------|
+| f32 | 1e-6 | 1e-5 | 1e-4（累积误差） |
 | f16 | 1e-3 | 1e-2 | 1e-2 |
 
-### §9.3 CI Configuration
+### §14.3 性能对标
 
-- CUDA tests: Run on GPU-enabled CI runners (or skipped with `#[cfg(feature = "cuda")]`).
-- Metal tests: Run on macOS CI runners (or skipped with `#[cfg(feature = "metal")]`).
-- CPU tests: Always run, serve as ground truth.
+自研 JIT PTX vs 理论峰值（Roofline model）。目标：
+- Elementwise: 达到 memory bandwidth 上限的 90%+
+- GEMM: 达到 Tensor Core 峰值的 70%+（初始目标）
 
----
+### §14.4 集成测试
 
-## §10 Performance Considerations
-
-### §10.1 Launch Overhead Amortization
-
-GPU kernel launch overhead (~5–10μs CUDA, ~2–5μs Metal) dominates for small tensors. Rules:
-
-- Tensors < 1024 elements: Fall back to CPU (configurable threshold).
-- Tensors 1K–64K: Single threadblock, minimize grid overhead.
-- Tensors > 64K: Full grid occupancy.
-
-```rust
-const GPU_DISPATCH_THRESHOLD: usize = 1024;
-
-fn vec_add(&self, a: &[E], b: &[E], out: &mut [E]) {
-    if a.len() < GPU_DISPATCH_THRESHOLD {
-        // Fall back to CPU kernel
-        self.cpu_fallback.vec_add(a, b, out);
-        return;
-    }
-    // GPU path
-    self.launch_elementwise("vec_add", a, b, out);
-}
-```
-
-### §10.2 Memory Pool
-
-Repeated alloc/free is expensive. Both backends use a simple free-list allocator:
-
-```rust
-struct GpuMemoryPool<D: GpuDevice> {
-    free_list: Mutex<BTreeMap<usize, Vec<D::Buffer>>>,  // size → available buffers
-    device: Arc<D>,
-}
-
-impl<D: GpuDevice> GpuMemoryPool<D> {
-    fn alloc(&self, bytes: usize) -> Result<D::Buffer, GpuError> { ... }
-    fn free(&self, buf: D::Buffer) { ... }
-}
-```
-
-### §10.3 Kernel Fusion Opportunities
-
-Future optimization — not required for Phase 1:
-
-| Fusion | Operators | Benefit |
-|---|---|---|
-| GEMM+bias+act | `gemm` → `vec_add` → `silu` | 1 kernel instead of 3, no intermediate buffer |
-| RMSNorm+scale | `rms_norm` → `vec_scale` | Single pass over data |
-| Dequant+GEMV | `dequant_q4k` → `gemv` | No intermediate f32 buffer |
+与 `test_local_pipeline` 模型测试集成，端到端验证 GPU 推理路径。
 
 ---
 
-## §11 File Inventory
+## §15 与其他 SPEC 的一致性
 
-| File | Purpose | Feature gate |
-|---|---|---|
-| `src/gpu/mod.rs` | `GpuDevice`, `GpuBuffer`, `GpuStream`, `GpuError`, `GpuTensor` | always (trait defs) |
-| `src/cuda/mod.rs` | `CudaBackend`, `CudaDeviceWrapper`, re-exports | `cuda` |
-| `src/cuda/device.rs` | `GpuDevice` impl for CUDA | `cuda` |
-| `src/cuda/kernels.rs` | `Kernels<E>` impl for CUDA | `cuda` |
-| `src/cuda/launch.rs` | Grid/block config helpers | `cuda` |
-| `src/cuda/shaders/*.cu` | CUDA kernel sources | `cuda` |
-| `src/metal_backend/mod.rs` | `MetalBackend`, `MetalDeviceWrapper`, re-exports | `metal` |
-| `src/metal_backend/device.rs` | `GpuDevice` impl for Metal | `metal` |
-| `src/metal_backend/kernels.rs` | `Kernels<E>` impl for Metal | `metal` |
-| `src/metal_backend/pipeline.rs` | PSO cache | `metal` |
-| `src/metal_backend/shaders/*.metal` | MSL kernel sources | `metal` |
-
----
-
-## §12 Migration Checklist
-
-1. [ ] Add `gpu` module with trait definitions (`GpuDevice`, `GpuBuffer`, `GpuStream`, `GpuError`)
-2. [ ] Add `cuda` feature + `cudarc` dependency
-3. [ ] Implement `CudaDeviceWrapper` + `GpuDevice` impl
-4. [ ] Implement P0 CUDA kernels (GEMM via cuBLAS, dequant, quant_matmul)
-5. [ ] Implement P1 CUDA kernels (norm, activations, RoPE)
-6. [ ] Implement P2/P3 CUDA kernels (BLAS-1, reductions, quantized GEMV)
-7. [ ] Add `metal` feature + `metal-rs` dependency
-8. [ ] Implement `MetalDeviceWrapper` + `GpuDevice` impl
-9. [ ] Port all kernel groups to MSL
-10. [ ] Cross-backend test suite
-11. [ ] Benchmark suite (GPU vs CPU, kernel launch overhead characterization)
-12. [ ] `CpuBackend` impl in `src/backend.rs` (currently missing file)
+| SPEC | 约束 | 本文档对齐 |
+|------|------|-----------|
+| SPEC/01 (ARCH-CPU-FIRST) | CPU 优先，GPU 扩展 | Platform enum 扩展不破坏 CPU 路径 |
+| SPEC/02 (ARCH-JIT-FIRST) | 禁止 cudarc/cuBLAS/MPS | 零外部依赖，仅 driver API |
+| SPEC/02 (ARCH-PEAK-PERF) | 硬件能力驱动 | GpuDeviceProfile 检测 + Roofline |
+| SPEC/03 (MachineCodeEmitter) | 统一 trait 接口 | PtxCodeGen/AmdgpuCodeGen/AirCodeGen 实现同一 trait |

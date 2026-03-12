@@ -13,12 +13,16 @@ rayon = "1.10"
 libc = "0.2"
 seq-macro = "0.3"
 iced-x86 = { version = "1.21", features = ["code_asm"], optional = true }
+dynasm = { version = "2", optional = true }
+dynasmrt = { version = "2", optional = true }
 gllm-scalar-ops = { path = "scalar-ops" }
 
 [features]
 default = ["jit-x86"]
 jit-x86 = ["iced-x86"]
-jit-aarch64 = []
+jit-aarch64 = ["dynasm", "dynasmrt"]
+jit-aarch64-dynasm = ["jit-aarch64"]  # legacy alias
+jit-sve = []
 
 [dev-dependencies]
 criterion = "0.5"

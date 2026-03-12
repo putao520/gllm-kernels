@@ -360,64 +360,15 @@ impl CpuBackend {
 
 ---
 
-## 4. CUDA 端实现映射
+## 4. GPU 端实现映射（JIT 统一路径）
 
-### 4.1 模板实例化策略
+GPU 量化 matmul 不使用手写 `.cu` 内核或 AOT CUBIN。量化解码 + FMA 逻辑通过 JIT 编译器统一路径实现：
 
-| Rust 泛型 | CUDA 模板 | 实例化 |
-|-----------|-----------|--------|
-| `linear_generic::<F32>` | `matmul_f32` | 无模板 |
-| `linear_generic::<I8>` | `matmul_int8<BITS=8>` | `BITS=8` |
-| `linear_generic::<PackedI4>` | `matmul_int4<BITS=4>` | `BITS=4` |
-| `linear_generic::<PackedI2>` | `matmul_int2<BITS=2>` | `BITS=2` |
-| `linear_generic::<PackedI1>` | `matmul_int1<BITS=1>` | `BITS=1` |
+1. 量化解码定义为 `extern "C"` 标量函数（与 CPU 路径共享 Phase 0-2）
+2. Phase 3 根据 `Platform::Cuda { sm_version }` 生成 PTX 量化 matmul kernel
+3. `cuModuleLoadData` 加载 PTX，driver 编译为目标 GPU 的 SASS
 
-### 4.2 CUDA 模板定义 (参考)
-
-```cpp
-// 统一的量化矩阵乘模板
-template <int BITS>
-__global__ void quantized_matmul_kernel(
-    const float* __restrict__ input,
-    const uint8_t* __restrict__ weight,
-    const half* __restrict__ scales,
-    float* __restrict__ output,
-    int m, int n, int k
-);
-
-// 编译时实例化 (每个 GPU 架构)
-template void quantized_matmul_kernel<1>(...);  // Int1
-template void quantized_matmul_kernel<2>(...);  // Int2
-template void quantized_matmul_kernel<4>(...);  // Int4
-template void quantized_matmul_kernel<8>(...);  // Int8
-```
-
-### 4.3 Rust → CUDA FFI 桥接
-
-```rust
-// cuda_backend.rs
-extern "C" {
-    fn quantized_matmul_int1(...) -> i32;
-    fn quantized_matmul_int2(...) -> i32;
-    fn quantized_matmul_int4(...) -> i32;
-    fn quantized_matmul_int8(...) -> i32;
-}
-
-impl QuantizedMatMul<PackedI1> for CudaBackend {
-    fn matmul(...) -> Result<()> {
-        unsafe {
-            quantized_matmul_int1(
-                input.as_ptr(),
-                weight.as_ptr(),
-                scales.as_ptr(),
-                output.as_mut_ptr(),
-                m, n, k,
-            );
-        }
-        Ok(())
-    }
-}
-```
+详见 `SPEC/04-GPU-BACKEND.md`。
 
 ---
 
@@ -447,13 +398,13 @@ impl QuantizedMatMul<PackedI1> for CudaBackend {
 | `src/cpu_kernels/qkv_generic.rs` | 新增 `qkv_projection_rope_generic` | 🔵 待实现 |
 | `src/cpu_backend.rs` | 替换 `fused_qkv_rope` 为泛型版本 | 🔵 待实现 |
 
-### 5.4 阶段 4: CUDA 端集成 (REQ-QUANT-004.4)
+### 5.4 阶段 4: GPU 端集成 — JIT 路径 (REQ-QUANT-004.4)
 
 | 文件 | 修改 | 状态 |
 |------|------|------|
-| `src/cuda_kernels/quantized.cu` | 实现 `template<int BITS>` 内核 | 🔵 待实现 |
-| `src/cuda_kernels/kernels/` | 添加各架构的 `.cubin` | 🔵 待实现 |
-| `src/cuda_backend.rs` | 实现 `QuantizedMatMul<T>` for `CudaBackend` | 🔵 待实现 |
+| `src/scalar_ops/quant_decode.rs` | 量化解码 `extern "C"` 标量函数 | 🔵 待实现 |
+| `src/compiler/codegen/ptx.rs` | PtxCodeGen 量化 matmul kernel 生成 | 🔵 待实现 |
+| `src/compiler/codegen/amdgpu.rs` | AmdgpuCodeGen 量化 matmul kernel 生成 | 🔵 待实现 |
 
 ---
 

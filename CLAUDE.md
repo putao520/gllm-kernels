@@ -107,6 +107,18 @@ Phase 3: 全新代码生成（iced-x86 / dynasm-rs）
     · 输出: CompiledLayer (mmap RWX)
 ```
 
+### 🚫 禁止 JIT Codegen 静默降级 (NO_SILENT_FALLBACK)
+
+**铁律：JIT codegen 遇到无法生成代码的 OpKind 必须返回 `Err`，禁止静默 NOP**：
+
+- ❌ `emit_nop_raw()` / `emit_nop_placeholder()` 作为未实现 op 的 catch-all
+- ❌ `match _ => Ok(())` 吞掉未知 OpKind
+- ❌ `eprintln!("[WARN]...")` + scalar 计算替代 JIT 编译失败
+- ✅ 未实现的 op 必须 `Err(format!("codegen not implemented for {:?}", op_kind))`
+- ✅ 仅 `Reshape` / `Transpose`（纯元数据 op，不需要计算）允许 NOP
+
+**理由**：NOP placeholder 让编译成功、测试通过，但输出是全零或内存垃圾。这是最危险的 bug — 静默产生错误结果，无法通过常规测试发现。审查发现 aarch64 codegen 中有 8 处 `emit_nop_raw()` catch-all，导致所有非 GEMM op 在 aarch64 上被静默跳过。
+
 ### 🚫 绝对禁止的实现模式
 
 | 禁止模式 | 为什么错 | 正确做法 |
@@ -378,3 +390,58 @@ lto = "fat"
 codegen-units = 1
 panic = "abort"
 ```
+
+---
+
+## 🚨 JIT Codegen 寄存器生命周期约定（ARCH-JIT-REGS）
+
+> **教训来源**：r13/r14 跨 group 被 clobber 导致 SIGSEGV（pack_a 读取 rdi=0x7e）。
+
+### 跨 Group 寄存器（callee-saved，生命周期 = 整个 CompiledLayer）
+
+| 寄存器 | 用途 | 设置位置 |
+|--------|------|---------|
+| `r13` | activation input base ptr | `emit_body()` prologue |
+| `r14` | weights blob base ptr | `emit_body()` prologue |
+| `rbp` | frame pointer | `emit_prologue()` |
+| `rbx` | scratchpad base (各 group 内部重新加载) | 各 emit 函数 |
+
+### 铁律
+
+1. **任何 emit_group 实现（BLIS、NormIntoGemm、TileLevelFusion 等）都可能 clobber r13/r14**
+2. **主循环通过 push/pop r13/r14 保护跨 group 值**（在 `emit_group_pointer_setup` 之后、`emit_group` 前后）
+3. **新增 emit 函数如果使用 r13/r14 作为临时寄存器，无需额外保存**——主循环已保护
+4. **[rsp+N] 局部变量不得与 push/pop 冲突**——BLIS 的 `sub rsp, 32` 在 push 之后分配，互不干扰
+
+---
+
+## 🔧 JIT 代码调试方法（DEBUG-JIT）
+
+本地已安装 `lldb-20`（LLDB 20.1.2）和 `rust-lldb`。JIT 生成的机器码无符号信息，需要用以下方法调试：
+
+### 崩溃定位流程
+
+```bash
+# 1. 用 LLDB 运行崩溃测试，获取 fault address 和寄存器状态
+lldb-20 -- ./target/debug/deps/test_xxx -- --nocapture
+(lldb) run
+# 崩溃后自动停在 signal handler
+(lldb) register read     # 查看所有寄存器
+(lldb) disassemble -s $pc -c 40   # 反汇编崩溃点附近代码
+
+# 2. 反汇编 JIT 代码区域（根据 RIP 地址范围）
+(lldb) disassemble -s 0x7ffff7e56c00 -c 100
+
+# 3. 关键：对比寄存器值与预期
+#    - 指针寄存器应该是大数（0x7fff...），小数值（如 0x7e）= 被 clobber
+#    - 循环计数器通常是小整数
+```
+
+### 常见 JIT Bug 模式
+
+| 症状 | 可能原因 |
+|------|---------|
+| 寄存器值是小整数而非指针 | 被循环计数器覆盖（寄存器生命周期冲突） |
+| `[rsp+N]` 读到错误值 | 栈局部变量偏移冲突（多个 loc_xxx 用了同一偏移） |
+| SIGSEGV 在 pack_a/pack_b | A/B/C 指针未正确设置（检查 rdi/rsi/r8） |
+| 第 N 个 group 崩溃，前面正常 | 跨 group 寄存器被前一个 group clobber |
