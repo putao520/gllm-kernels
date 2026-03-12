@@ -12,6 +12,9 @@ use std::marker::PhantomData;
 
 use crate::traits::Element;
 
+#[cfg(feature = "jit-metal")]
+pub mod metal;
+
 // ── Error ────────────────────────────────────────────────────────────
 
 /// Errors from GPU device operations.
@@ -229,3 +232,8 @@ impl<E: Element, D: GpuDevice> GpuTensor<E, D> {
 /// Below this threshold, kernel launch overhead (~5–10μs CUDA, ~2–5μs Metal)
 /// dominates and CPU execution is faster.
 pub const GPU_DISPATCH_THRESHOLD: usize = 1024;
+
+// ── Platform-specific backends ───────────────────────────────────────
+
+#[cfg(feature = "jit-cuda")]
+pub mod cuda;

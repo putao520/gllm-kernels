@@ -2502,7 +2502,7 @@ impl crate::compiler::codegen::emitter::PlatformBackend for DynasmArm64Backend {
     }
 
     fn platform(&self) -> crate::compiler::codegen::emitter::Platform {
-        crate::compiler::codegen::emitter::Platform::Aarch64 { sve: false }
+        crate::compiler::codegen::emitter::Platform::Aarch64 { sve: false, amx: false }
     }
 
     fn num_simd_regs(&self) -> usize {

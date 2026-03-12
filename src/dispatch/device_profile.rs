@@ -34,6 +34,8 @@ pub enum IsaLevel {
     Sve,
     /// ARM SVE2 — superset of SVE with additional integer/crypto/bitmanip instructions.
     Sve2,
+    /// Apple AMX (M1+): 32x32 matrix block operations via undocumented coprocessor.
+    NeonAmx,
 }
 
 /// Unified hardware profile for the inference compiler.
@@ -129,7 +131,7 @@ impl DeviceProfile {
         match self.isa {
             IsaLevel::Avx512 => 32,
             IsaLevel::Avx2 => 16,
-            IsaLevel::Neon => 32,
+            IsaLevel::Neon | IsaLevel::NeonAmx => 32,
             IsaLevel::Sve | IsaLevel::Sve2 => 32, // z0-z31
             IsaLevel::Scalar => 0,
         }
@@ -142,7 +144,7 @@ impl DeviceProfile {
         match self.isa {
             IsaLevel::Avx512 => 64,
             IsaLevel::Avx2 => 32,
-            IsaLevel::Neon => 16,
+            IsaLevel::Neon | IsaLevel::NeonAmx => 16,
             // SVE: runtime-determined, return minimum guaranteed (128-bit).
             // Actual VL is queried at runtime via RDVL.
             IsaLevel::Sve | IsaLevel::Sve2 => self.hw_info.isa.sve_vl_bytes.max(16),
@@ -343,6 +345,10 @@ fn detect_isa_level(arch: MicroArch) -> IsaLevel {
         if hw.isa.sve {
             return IsaLevel::Sve;
         }
+        // Apple AMX is available on all Apple Silicon (M1+) — detect via macOS target.
+        #[cfg(target_os = "macos")]
+        return IsaLevel::NeonAmx;
+        #[cfg(not(target_os = "macos"))]
         return IsaLevel::Neon;
     }
     #[allow(unreachable_code)]
@@ -389,7 +395,7 @@ mod tests {
         #[cfg(target_arch = "aarch64")]
         assert!(matches!(
             profile.isa,
-            IsaLevel::Neon | IsaLevel::Sve | IsaLevel::Sve2
+            IsaLevel::Neon | IsaLevel::NeonAmx | IsaLevel::Sve | IsaLevel::Sve2
         ));
     }
 

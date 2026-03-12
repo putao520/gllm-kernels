@@ -34,6 +34,7 @@ pub enum OpKindKey {
     Dequantize,
     MultiHeadAttention,
     MeanPool,
+    L2Normalize,
 }
 
 #[derive(Debug)]
@@ -133,6 +134,7 @@ impl ScalarOpRegistry {
             OpKind::Dequantize { .. } => OpKindKey::Dequantize,
             OpKind::MultiHeadAttention { .. } => OpKindKey::MultiHeadAttention,
             OpKind::MeanPool { .. } => OpKindKey::MeanPool,
+            OpKind::L2Normalize { .. } => OpKindKey::L2Normalize,
         }
     }
 
@@ -684,6 +686,38 @@ impl ScalarOpRegistry {
             },
         );
 
+
+        // ── L2Normalize ──
+        let l2norm_sig = ScalarFnSignature {
+            fn_ptr: scalar_l2_normalize as *const u8,
+            params: vec![ScalarParam::InputPtr, ScalarParam::OutputPtr, ScalarParam::Dim(0)],
+        };
+        reg.register_with_symexec_fallback(
+            OpKindKey::L2Normalize,
+            l2norm_sig.clone(),
+            OpKind::L2Normalize { hidden: 0 },
+            OpTrace {
+                op_kind: OpKind::L2Normalize { hidden: 0 },
+                pattern: ComputePattern::NormLike {
+                    reduce: vec![
+                        TraceOp::Input(0),  // [0] x
+                        TraceOp::Mul(0, 0), // [1] x^2
+                    ],
+                    finalize: vec![
+                        TraceOp::Input(0),      // [0] sum_sq
+                        TraceOp::Const(1e-12),   // [1] eps
+                        TraceOp::Add(0, 1),      // [2] sum_sq + eps
+                        TraceOp::Rsqrt(2),       // [3] 1/sqrt(sum_sq + eps)
+                    ],
+                    transform: vec![
+                        TraceOp::Input(0),  // [0] x
+                        TraceOp::Input(1),  // [1] inv_norm (from finalize)
+                        TraceOp::Mul(0, 1), // [2] x * inv_norm
+                    ],
+                },
+                signature: l2norm_sig,
+            },
+        );
         reg
     }
 
@@ -776,6 +810,7 @@ mod tests {
             OpKindKey::Reshape,
             OpKindKey::QuantGemm,
             OpKindKey::Dequantize,
+            OpKindKey::L2Normalize,
         ];
 
         for key in &expected_keys {

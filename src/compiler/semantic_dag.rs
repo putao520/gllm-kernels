@@ -153,7 +153,7 @@ impl SemanticDAG {
             OpKind::RoPE { .. } | OpKind::Transpose { .. } | OpKind::Reshape { .. } => {
                 OpClass::Injective
             }
-            OpKind::Softmax | OpKind::RmsNorm { .. } | OpKind::LayerNorm { .. } | OpKind::MeanPool { .. } => {
+            OpKind::Softmax | OpKind::RmsNorm { .. } | OpKind::LayerNorm { .. } | OpKind::MeanPool { .. } | OpKind::L2Normalize { .. } => {
                 OpClass::Reduction
             }
             OpKind::Gemm { .. } | OpKind::GemmBias { .. } | OpKind::QuantGemm { .. } => {

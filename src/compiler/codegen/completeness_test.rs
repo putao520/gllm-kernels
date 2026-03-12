@@ -146,6 +146,10 @@ mod completeness_tests {
                 vec![("input", vec![SEQ, HIDDEN])],
                 vec![("output", vec![HIDDEN])]),
 
+            // ── L2 Normalize ──
+            ("L2Normalize", OpKind::L2Normalize { hidden: HIDDEN },
+                vec![("input", vec![HIDDEN])], vec![("output", vec![HIDDEN])]),
+
             // ── Quantization ──
             ("QuantGemm", OpKind::QuantGemm { m: SEQ, n: HIDDEN, k: HIDDEN, block_size: 32, bits: 4 },
                 vec![("a", vec![SEQ, HIDDEN]), ("b_quant", vec![HIDDEN * HIDDEN / 2])],

@@ -451,12 +451,32 @@ impl InferenceBackend for CpuInferenceBackend {
             hidden.copy_from_slice(&residual);
         }
 
-        // Copy result to output tensor
+        // --- Mean pooling: average across sequence dimension ---
+        let mut pooled = vec![0.0f32; h];
+        for d in 0..h {
+            let mut sum = 0.0f32;
+            for s in 0..seq_len {
+                sum += hidden[s * h + d];
+            }
+            pooled[d] = sum / seq_len as f32;
+        }
+
+        // --- L2 normalize the pooled embedding ---
+        let mut sum_sq = 0.0f32;
+        for d in 0..h {
+            sum_sq += pooled[d] * pooled[d];
+        }
+        let inv_norm = 1.0 / (sum_sq + 1e-12_f32).sqrt();
+        for d in 0..h {
+            pooled[d] *= inv_norm;
+        }
+
+        // Copy pooled result to output tensor
         unsafe {
             std::ptr::copy_nonoverlapping(
-                hidden.as_ptr() as *const u8,
+                pooled.as_ptr() as *const u8,
                 output.as_mut_ptr(),
-                seq_len * h * 4,
+                h * 4,
             );
         }
 

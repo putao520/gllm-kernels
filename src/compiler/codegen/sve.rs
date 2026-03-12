@@ -77,7 +77,7 @@ impl SveCodeGen {
     /// Create from a DeviceProfile's detected platform.
     pub fn from_platform(platform: &Platform) -> Option<Self> {
         match platform {
-            Platform::Aarch64 { sve: true } => {
+            Platform::Aarch64 { sve: true, .. } => {
                 // Default to 128-bit minimum; actual VL is set at runtime.
                 Some(Self::new(false, 16))
             }

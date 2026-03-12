@@ -23,6 +23,9 @@ jit-x86 = ["iced-x86"]
 jit-aarch64 = ["dynasm", "dynasmrt"]
 jit-aarch64-dynasm = ["jit-aarch64"]  # legacy alias
 jit-sve = []
+jit-cuda = []
+jit-hip = []
+jit-metal = []
 
 [dev-dependencies]
 criterion = "0.5"

@@ -67,6 +67,35 @@ pub extern "C" fn scalar_layer_norm(
     }
 }
 
+
+/// L2 Normalize: two-pass — compute L2 norm then scale.
+///
+/// `out[i] = x[i] / sqrt(sum(x^2) + eps)`
+///
+/// Structure is NormLike (same as RmsNorm): reduce(sum_sq) → finalize(rsqrt) → transform(scale).
+/// No weight parameter — pure geometric normalization.
+#[no_mangle]
+#[inline(never)]
+pub extern "C" fn scalar_l2_normalize(
+    x: *const f32,
+    out: *mut f32,
+    n: usize,
+) {
+    unsafe {
+        // Pass 1: sum of squares
+        let mut sum_sq = 0.0_f32;
+        for i in 0..n {
+            let v = *x.add(i);
+            sum_sq += v * v;
+        }
+        let inv_norm = 1.0 / (sum_sq + 1e-12_f32).sqrt();
+
+        // Pass 2: normalize
+        for i in 0..n {
+            *out.add(i) = *x.add(i) * inv_norm;
+        }
+    }
+}
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -167,6 +196,59 @@ mod tests {
             assert!(
                 (out[i] - expected).abs() < 1e-4,
                 "layer_norm_affine[{i}]: got {}, expected {expected}",
+                out[i]
+            );
+        }
+    }
+
+    #[test]
+    fn test_scalar_l2_normalize() {
+        let n = 4;
+        let x = vec![1.0_f32, 2.0, 3.0, 4.0];
+        let mut out = vec![0.0_f32; n];
+
+        scalar_l2_normalize(x.as_ptr(), out.as_mut_ptr(), n);
+
+        let norm = (1.0 + 4.0 + 9.0 + 16.0_f32).sqrt();
+        for i in 0..n {
+            let expected = x[i] / norm;
+            assert!(
+                (out[i] - expected).abs() < 1e-5,
+                "l2_normalize[{i}]: got {}, expected {expected}",
+                out[i]
+            );
+        }
+    }
+
+    #[test]
+    fn test_scalar_l2_normalize_unit_vector() {
+        // Already unit vector — should be unchanged
+        let x = vec![0.0_f32, 0.0, 1.0, 0.0];
+        let mut out = vec![0.0_f32; 4];
+
+        scalar_l2_normalize(x.as_ptr(), out.as_mut_ptr(), 4);
+
+        for i in 0..4 {
+            assert!(
+                (out[i] - x[i]).abs() < 1e-5,
+                "l2_normalize_unit[{i}]: got {}, expected {}",
+                out[i], x[i]
+            );
+        }
+    }
+
+    #[test]
+    fn test_scalar_l2_normalize_zero_vector() {
+        // Zero vector — should produce near-zero (eps prevents div-by-zero)
+        let x = vec![0.0_f32; 4];
+        let mut out = vec![1.0_f32; 4];
+
+        scalar_l2_normalize(x.as_ptr(), out.as_mut_ptr(), 4);
+
+        for i in 0..4 {
+            assert!(
+                out[i].abs() < 1e-3,
+                "l2_normalize_zero[{i}]: got {}, expected ~0",
                 out[i]
             );
         }

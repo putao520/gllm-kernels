@@ -32,7 +32,16 @@ pub enum Platform {
     /// x86_64 with optional AVX-512 support.
     X86_64 { avx512: bool },
     /// AArch64 with optional SVE support.
-    Aarch64 { sve: bool },
+    Aarch64 { sve: bool, amx: bool },
+    /// NVIDIA CUDA — sm_version encodes compute capability (e.g. 80 = sm_80 / A100).
+    #[cfg(feature = "jit-cuda")]
+    Cuda { sm_version: u32 },
+    /// AMD HIP — gfx_arch encodes GFX ISA (e.g. 908 = gfx908 / MI100).
+    #[cfg(feature = "jit-hip")]
+    Hip { gfx_arch: u32 },
+    /// Apple Metal — gpu_family encodes Metal GPU family (e.g. 9 = Apple9).
+    #[cfg(feature = "jit-metal")]
+    Metal { gpu_family: u32 },
 }
 
 impl Platform {
@@ -46,7 +55,7 @@ impl Platform {
         };
 
         #[cfg(target_arch = "aarch64")]
-        return Platform::Aarch64 { sve: false };
+        return Platform::Aarch64 { sve: false, amx: matches!(profile.isa, IsaLevel::NeonAmx) };
 
         #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
         return Platform::X86_64 { avx512: false };
@@ -223,6 +232,12 @@ mod tests {
         match platform {
             Platform::X86_64 { .. } => {},
             Platform::Aarch64 { .. } => {},
+            #[cfg(feature = "jit-cuda")]
+            Platform::Cuda { .. } => {},
+            #[cfg(feature = "jit-hip")]
+            Platform::Hip { .. } => {},
+            #[cfg(feature = "jit-metal")]
+            Platform::Metal { .. } => {},
         }
     }
 

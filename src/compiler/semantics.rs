@@ -60,7 +60,7 @@ pub fn classify(kind: &OpKind) -> OpSemantics {
         OpKind::Dequantize { .. } => OpSemantics::Elementwise,
 
         // Reductions (need full input before output)
-        OpKind::Softmax | OpKind::RmsNorm { .. } | OpKind::LayerNorm { .. } | OpKind::MeanPool { .. } => {
+        OpKind::Softmax | OpKind::RmsNorm { .. } | OpKind::LayerNorm { .. } | OpKind::MeanPool { .. } | OpKind::L2Normalize { .. } => {
             OpSemantics::Reduction
         }
 
@@ -151,7 +151,7 @@ pub fn arithmetic_intensity(kind: &OpKind) -> f64 {
             // 3-pass: ~5N FLOPs, ~12N bytes
             5.0 / 12.0
         }
-        OpKind::RmsNorm { .. } | OpKind::LayerNorm { .. } => {
+        OpKind::RmsNorm { .. } | OpKind::LayerNorm { .. } | OpKind::L2Normalize { .. } => {
             // 2-pass: ~5N FLOPs, ~12N bytes
             5.0 / 12.0
         }

@@ -130,6 +130,10 @@ pub enum OpKind {
     /// Input: [seq_len, hidden], Output: [hidden]
     MeanPool { seq_len: usize, hidden: usize },
 
+    /// L2 normalize: out[i] = x[i] / ||x||₂
+    /// Input: [hidden], Output: [hidden]
+    L2Normalize { hidden: usize },
+
     // ── Quantization ──
     /// Quantized GEMM: dequantize weights on-the-fly during matmul.
     QuantGemm {
