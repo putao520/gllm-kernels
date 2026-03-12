@@ -188,6 +188,7 @@ impl Profiler {
     /// Build a report from all collected entries.
     pub fn report(&self) -> ProfileReport {
         let isa_str = match get_isa_level() {
+            crate::cpu_kernels::IsaLevel::Avx512Amx => "avx512amx",
             crate::cpu_kernels::IsaLevel::Avx512Fp16 => "avx512fp16",
             crate::cpu_kernels::IsaLevel::Avx512 => "avx512",
             crate::cpu_kernels::IsaLevel::Avx2 => "avx2",

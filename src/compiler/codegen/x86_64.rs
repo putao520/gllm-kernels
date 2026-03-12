@@ -6427,7 +6427,11 @@ impl crate::compiler::codegen::emitter::PlatformBackend for X86Backend {
         let avx512 = std::is_x86_feature_detected!("avx512f");
         #[cfg(not(target_arch = "x86_64"))]
         let avx512 = false;
-        crate::compiler::codegen::emitter::Platform::X86_64 { avx512 }
+        #[cfg(target_arch = "x86_64")]
+        let amx = std::is_x86_feature_detected!("amx-tile") && std::is_x86_feature_detected!("amx-bf16");
+        #[cfg(not(target_arch = "x86_64"))]
+        let amx = false;
+        crate::compiler::codegen::emitter::Platform::X86_64 { avx512, amx }
     }
 
     fn num_simd_regs(&self) -> usize {

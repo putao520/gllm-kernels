@@ -125,13 +125,20 @@ impl CudaDevice {
             driver: Arc::clone(&driver),
         };
 
+        let total_memory = {
+            let mut free: usize = 0;
+            let mut total: usize = 0;
+            let res = unsafe { (driver.cuMemGetInfo_v2)(&mut free, &mut total) };
+            if res == CUDA_SUCCESS { total } else { 0 }
+        };
+
         Ok(Self {
             driver,
             context,
             device_id,
             default_stream,
             name,
-            total_memory: 0, // TODO: query via cuMemGetInfo
+            total_memory,
             sm_version,
         })
     }
@@ -165,8 +172,13 @@ impl GpuDevice for CudaDevice {
     }
 
     fn free_memory(&self) -> usize {
-        // TODO: implement via cuMemGetInfo
-        0
+        let mut free: usize = 0;
+        let mut total: usize = 0;
+        let res = unsafe { (self.driver.cuMemGetInfo_v2)(&mut free, &mut total) };
+        if res != CUDA_SUCCESS {
+            return 0;
+        }
+        free
     }
 
     fn alloc(&self, bytes: usize) -> Result<Self::Buffer, GpuError> {
@@ -236,12 +248,18 @@ impl GpuDevice for CudaDevice {
 
     fn dtod(
         &self,
-        _src: &Self::Buffer,
-        _dst: &mut Self::Buffer,
+        src: &Self::Buffer,
+        dst: &mut Self::Buffer,
         _stream: &Self::Stream,
     ) -> Result<(), GpuError> {
-        // TODO: implement via cuMemcpyDtoD_v2
-        Err(GpuError::Driver("cuMemcpyDtoD_v2 not yet bound".into()))
+        let bytes = src.size.min(dst.size);
+        let res = unsafe { (self.driver.cuMemcpyDtoD_v2)(dst.ptr, src.ptr, bytes) };
+        if res != CUDA_SUCCESS {
+            return Err(GpuError::Transfer(format!(
+                "cuMemcpyDtoD_v2 failed with error {res}"
+            )));
+        }
+        Ok(())
     }
 
     fn create_stream(&self) -> Result<Self::Stream, GpuError> {

@@ -29,8 +29,8 @@ use crate::dispatch::DeviceProfile;
 /// Platform identifier — carries capability flags used by the compiler pipeline.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Platform {
-    /// x86_64 with optional AVX-512 support.
-    X86_64 { avx512: bool },
+    /// x86_64 with optional AVX-512 and AMX support.
+    X86_64 { avx512: bool, amx: bool },
     /// AArch64 with optional SVE support.
     Aarch64 { sve: bool, amx: bool },
     /// NVIDIA CUDA — sm_version encodes compute capability (e.g. 80 = sm_80 / A100).
@@ -51,14 +51,15 @@ impl Platform {
 
         #[cfg(target_arch = "x86_64")]
         return Platform::X86_64 {
-            avx512: matches!(profile.isa, IsaLevel::Avx512),
+            avx512: matches!(profile.isa, IsaLevel::Avx512 | IsaLevel::Avx512Amx),
+            amx: matches!(profile.isa, IsaLevel::Avx512Amx),
         };
 
         #[cfg(target_arch = "aarch64")]
         return Platform::Aarch64 { sve: false, amx: matches!(profile.isa, IsaLevel::NeonAmx) };
 
         #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
-        return Platform::X86_64 { avx512: false };
+        return Platform::X86_64 { avx512: false, amx: false };
     }
 }
 
@@ -345,7 +346,7 @@ mod tests {
 
         // Both should report X86_64 on x86_64 hosts
         match (detected, backend_plat) {
-            (Platform::X86_64 { avx512: a }, Platform::X86_64 { avx512: b }) => {
+            (Platform::X86_64 { avx512: a, .. }, Platform::X86_64 { avx512: b, .. }) => {
                 assert_eq!(a, b, "Platform::detect and X86Backend::platform disagree on avx512");
             }
             _ => panic!("platform mismatch between detect and backend"),

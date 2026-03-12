@@ -74,6 +74,8 @@ pub struct CudaDriver {
     pub cuMemFree_v2: unsafe extern "C" fn(CUdeviceptr) -> CUresult,
     pub cuMemcpyHtoD_v2: unsafe extern "C" fn(CUdeviceptr, *const c_void, usize) -> CUresult,
     pub cuMemcpyDtoH_v2: unsafe extern "C" fn(*mut c_void, CUdeviceptr, usize) -> CUresult,
+    pub cuMemcpyDtoD_v2: unsafe extern "C" fn(CUdeviceptr, CUdeviceptr, usize) -> CUresult,
+    pub cuMemGetInfo_v2: unsafe extern "C" fn(*mut usize, *mut usize) -> CUresult,
 
     // ── Stream management ──
     pub cuStreamCreate: unsafe extern "C" fn(*mut CUstream, c_uint) -> CUresult,
@@ -126,6 +128,8 @@ impl CudaDriver {
                 cuMemFree_v2: load_sym(lib, b"cuMemFree_v2\0")?,
                 cuMemcpyHtoD_v2: load_sym(lib, b"cuMemcpyHtoD_v2\0")?,
                 cuMemcpyDtoH_v2: load_sym(lib, b"cuMemcpyDtoH_v2\0")?,
+                cuMemcpyDtoD_v2: load_sym(lib, b"cuMemcpyDtoD_v2\0")?,
+                cuMemGetInfo_v2: load_sym(lib, b"cuMemGetInfo_v2\0")?,
                 cuStreamCreate: load_sym(lib, b"cuStreamCreate\0")?,
                 cuStreamSynchronize: load_sym(lib, b"cuStreamSynchronize\0")?,
                 cuStreamDestroy_v2: load_sym(lib, b"cuStreamDestroy_v2\0")?,

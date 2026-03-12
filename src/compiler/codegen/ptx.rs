@@ -11,7 +11,9 @@ use std::fmt::Write;
 use crate::compiler::codegen::emitter::{MachineCodeEmitter, PlatformBackend, Platform};
 use crate::compiler::codegen::CodegenOutput;
 use crate::compiler::fusion::FusionPlan;
-use crate::compiler::graph::CompilerGraph;
+use crate::compiler::graph::{CompilerGraph, OpKind};
+use crate::compiler::registry::ScalarOpRegistry;
+use crate::compiler::trace::{ComputePattern, TraceOp};
 use crate::compiler::buffer_alloc::BufferAllocation;
 use crate::dispatch::DeviceProfile;
 
@@ -49,7 +51,7 @@ impl PtxCodeGen {
 
     // ── PTX generation helpers ──────────────────────────────────────
 
-    /// Emit the PTX module header (`.version`, `.target`, `.address_size`).
+    /// Emit the PTX module header (, , ).
     ///
     /// PTX version is chosen based on SM:
     /// - sm_70+: PTX 6.0
@@ -69,18 +71,12 @@ impl PtxCodeGen {
         writeln!(self.ptx_buffer).unwrap();
     }
 
-    /// Emit a simple elementwise kernel that applies `op` to each element.
+    /// Emit a simple elementwise kernel that applies  to each element.
     ///
     /// Supported ops: "add", "mul", "silu", "relu", "neg".
     ///
     /// Generated kernel signature:
-    /// ```ptx
-    /// .visible .entry kernel_<op>(
-    ///     .param .u64 input,
-    ///     .param .u64 output,
-    ///     .param .u32 n
-    /// )
-    /// ```
+    /// 
     pub fn emit_elementwise_kernel(&mut self, op: &str) -> Result<(), String> {
         let kernel_name = format!("kernel_{op}");
 
@@ -176,16 +172,748 @@ impl PtxCodeGen {
     }
 }
 
+// ── PTX TraceOp → instruction codegen ───────────────────────────────────────
+
+/// Emit a PTX instruction sequence for a single `TraceOp`.
+/// `vars` contains the PTX register name for each prior SSA op.
+/// Returns the register name holding this op's result.
+fn trace_op_to_ptx(
+    out: &mut String,
+    op: &TraceOp,
+    idx: usize,
+    vars: &[String],
+    base: usize,
+) -> String {
+    let reg = format!("%t{}_{}", base, idx);
+    match op {
+        TraceOp::Input(i) => {
+            // Input bindings are handled by the caller — just return a placeholder.
+            // The caller replaces Input ops with pre-bound register names.
+            format!("%input{i}")
+        }
+        TraceOp::Const(val) => {
+            let bits = (*val as f32).to_bits();
+            writeln!(out, "    mov.f32 {reg}, 0f{bits:08X};").unwrap();
+            reg
+        }
+        TraceOp::Add(a, b) => {
+            writeln!(out, "    add.f32 {reg}, {}, {};", vars[*a as usize], vars[*b as usize]).unwrap();
+            reg
+        }
+        TraceOp::Sub(a, b) => {
+            writeln!(out, "    sub.f32 {reg}, {}, {};", vars[*a as usize], vars[*b as usize]).unwrap();
+            reg
+        }
+        TraceOp::Mul(a, b) => {
+            writeln!(out, "    mul.f32 {reg}, {}, {};", vars[*a as usize], vars[*b as usize]).unwrap();
+            reg
+        }
+        TraceOp::Div(a, b) => {
+            writeln!(out, "    div.approx.f32 {reg}, {}, {};", vars[*a as usize], vars[*b as usize]).unwrap();
+            reg
+        }
+        TraceOp::Fma(a, b, c) => {
+            writeln!(out, "    fma.rn.f32 {reg}, {}, {}, {};", vars[*a as usize], vars[*b as usize], vars[*c as usize]).unwrap();
+            reg
+        }
+        TraceOp::Neg(a) => {
+            writeln!(out, "    neg.f32 {reg}, {};", vars[*a as usize]).unwrap();
+            reg
+        }
+        TraceOp::Abs(a) => {
+            writeln!(out, "    abs.f32 {reg}, {};", vars[*a as usize]).unwrap();
+            reg
+        }
+        TraceOp::Exp(a) => {
+            // exp(x) = exp2(x * log2(e)), log2(e) ≈ 1.4426950408889634 = 0x3FB8AA3B
+            writeln!(out, "    mul.f32 {reg}, {}, 0f3FB8AA3B;", vars[*a as usize]).unwrap();
+            writeln!(out, "    ex2.approx.f32 {reg}, {reg};").unwrap();
+            reg
+        }
+        TraceOp::Sqrt(a) => {
+            writeln!(out, "    sqrt.approx.f32 {reg}, {};", vars[*a as usize]).unwrap();
+            reg
+        }
+        TraceOp::Rsqrt(a) => {
+            writeln!(out, "    rsqrt.approx.f32 {reg}, {};", vars[*a as usize]).unwrap();
+            reg
+        }
+        TraceOp::Tanh(a) => {
+            writeln!(out, "    tanh.approx.f32 {reg}, {};", vars[*a as usize]).unwrap();
+            reg
+        }
+        TraceOp::Recip(a) => {
+            writeln!(out, "    rcp.approx.f32 {reg}, {};", vars[*a as usize]).unwrap();
+            reg
+        }
+        TraceOp::Log(a) => {
+            // ln(x) = log2(x) / log2(e) = log2(x) * ln(2)
+            // ln(2) ≈ 0.6931471805599453 = 0x3F317218
+            writeln!(out, "    lg2.approx.f32 {reg}, {};", vars[*a as usize]).unwrap();
+            writeln!(out, "    mul.f32 {reg}, {reg}, 0f3F317218;").unwrap();
+            reg
+        }
+        TraceOp::Max(a, b) => {
+            writeln!(out, "    max.f32 {reg}, {}, {};", vars[*a as usize], vars[*b as usize]).unwrap();
+            reg
+        }
+        TraceOp::Min(a, b) => {
+            writeln!(out, "    min.f32 {reg}, {}, {};", vars[*a as usize], vars[*b as usize]).unwrap();
+            reg
+        }
+    }
+}
+
+/// Emit a sequence of `TraceOp`s as PTX instructions.
+/// `input_bindings` maps Input(i) → register name.
+/// Returns the register name of the last (result) op.
+fn emit_trace_body_ptx(
+    out: &mut String,
+    ops: &[TraceOp],
+    base: usize,
+    input_bindings: &[String],
+) -> String {
+    let mut vars: Vec<String> = Vec::with_capacity(ops.len());
+    for (i, op) in ops.iter().enumerate() {
+        let var = if let TraceOp::Input(idx) = op {
+            input_bindings
+                .get(*idx as usize)
+                .cloned()
+                .unwrap_or_else(|| format!("%input{idx}"))
+        } else {
+            trace_op_to_ptx(out, op, i, &vars, base)
+        };
+        vars.push(var);
+    }
+    vars.last()
+        .cloned()
+        .unwrap_or_else(|| "%zero".to_string())
+}
+
+// ── Kernel generators per ComputePattern ────────────────────────────────────
+
+/// Count the maximum register index needed for a trace body.
+fn max_regs_needed(ops: &[TraceOp], base: usize) -> usize {
+    // Each non-Input op gets a register t{base}_{i}
+    ops.len() + 8 // padding for temporaries
+}
+
+fn emit_elementwise_kernel_ptx(
+    out: &mut String,
+    kernel_name: &str,
+    body: &[TraceOp],
+) {
+    let nregs = max_regs_needed(body, 0);
+    writeln!(out, ".visible .entry {kernel_name}(").unwrap();
+    writeln!(out, "    .param .u64 param_input,").unwrap();
+    writeln!(out, "    .param .u64 param_output,").unwrap();
+    writeln!(out, "    .param .u32 param_n").unwrap();
+    writeln!(out, ")").unwrap();
+    writeln!(out, "{{").unwrap();
+    writeln!(out, "    .reg .u64 %rd<4>;").unwrap();
+    writeln!(out, "    .reg .u32 %r<4>;").unwrap();
+    writeln!(out, "    .reg .f32 %t0_<{nregs}>;").unwrap();
+    writeln!(out, "    .reg .f32 %f<4>;").unwrap();
+    writeln!(out, "    .reg .pred %p<2>;").unwrap();
+    writeln!(out).unwrap();
+
+    // Load params + compute tid
+    writeln!(out, "    ld.param.u64 %rd0, [param_input];").unwrap();
+    writeln!(out, "    ld.param.u64 %rd1, [param_output];").unwrap();
+    writeln!(out, "    ld.param.u32 %r0, [param_n];").unwrap();
+    writeln!(out, "    mov.u32 %r1, %ctaid.x;").unwrap();
+    writeln!(out, "    mov.u32 %r2, %ntid.x;").unwrap();
+    writeln!(out, "    mad.lo.u32 %r1, %r1, %r2, %tid.x;").unwrap();
+    writeln!(out, "    setp.ge.u32 %p0, %r1, %r0;").unwrap();
+    writeln!(out, "    @%p0 bra {kernel_name}_DONE;").unwrap();
+    writeln!(out).unwrap();
+
+    // Load input element
+    writeln!(out, "    mul.wide.u32 %rd2, %r1, 4;").unwrap();
+    writeln!(out, "    add.u64 %rd2, %rd0, %rd2;").unwrap();
+    writeln!(out, "    ld.global.f32 %f0, [%rd2];").unwrap();
+    writeln!(out).unwrap();
+
+    // Emit trace body
+    let bindings = vec!["%f0".to_string()];
+    let result = emit_trace_body_ptx(out, body, 0, &bindings);
+    writeln!(out).unwrap();
+
+    // Store result
+    writeln!(out, "    mul.wide.u32 %rd3, %r1, 4;").unwrap();
+    writeln!(out, "    add.u64 %rd3, %rd1, %rd3;").unwrap();
+    writeln!(out, "    st.global.f32 [%rd3], {result};").unwrap();
+    writeln!(out).unwrap();
+
+    writeln!(out, "{kernel_name}_DONE:").unwrap();
+    writeln!(out, "    ret;").unwrap();
+    writeln!(out, "}}").unwrap();
+    writeln!(out).unwrap();
+}
+
+fn emit_binary_elementwise_kernel_ptx(
+    out: &mut String,
+    kernel_name: &str,
+    body: &[TraceOp],
+) {
+    let nregs = max_regs_needed(body, 0);
+    writeln!(out, ".visible .entry {kernel_name}(").unwrap();
+    writeln!(out, "    .param .u64 param_input0,").unwrap();
+    writeln!(out, "    .param .u64 param_input1,").unwrap();
+    writeln!(out, "    .param .u64 param_output,").unwrap();
+    writeln!(out, "    .param .u32 param_n").unwrap();
+    writeln!(out, ")").unwrap();
+    writeln!(out, "{{").unwrap();
+    writeln!(out, "    .reg .u64 %rd<6>;").unwrap();
+    writeln!(out, "    .reg .u32 %r<4>;").unwrap();
+    writeln!(out, "    .reg .f32 %t0_<{nregs}>;").unwrap();
+    writeln!(out, "    .reg .f32 %f<4>;").unwrap();
+    writeln!(out, "    .reg .pred %p<2>;").unwrap();
+    writeln!(out).unwrap();
+
+    // Load params + compute tid
+    writeln!(out, "    ld.param.u64 %rd0, [param_input0];").unwrap();
+    writeln!(out, "    ld.param.u64 %rd1, [param_input1];").unwrap();
+    writeln!(out, "    ld.param.u64 %rd2, [param_output];").unwrap();
+    writeln!(out, "    ld.param.u32 %r0, [param_n];").unwrap();
+    writeln!(out, "    mov.u32 %r1, %ctaid.x;").unwrap();
+    writeln!(out, "    mov.u32 %r2, %ntid.x;").unwrap();
+    writeln!(out, "    mad.lo.u32 %r1, %r1, %r2, %tid.x;").unwrap();
+    writeln!(out, "    setp.ge.u32 %p0, %r1, %r0;").unwrap();
+    writeln!(out, "    @%p0 bra {kernel_name}_DONE;").unwrap();
+    writeln!(out).unwrap();
+
+    // Load both input elements
+    writeln!(out, "    mul.wide.u32 %rd3, %r1, 4;").unwrap();
+    writeln!(out, "    add.u64 %rd4, %rd0, %rd3;").unwrap();
+    writeln!(out, "    ld.global.f32 %f0, [%rd4];").unwrap();
+    writeln!(out, "    add.u64 %rd4, %rd1, %rd3;").unwrap();
+    writeln!(out, "    ld.global.f32 %f1, [%rd4];").unwrap();
+    writeln!(out).unwrap();
+
+    // Emit trace body
+    let bindings = vec!["%f0".to_string(), "%f1".to_string()];
+    let result = emit_trace_body_ptx(out, body, 0, &bindings);
+    writeln!(out).unwrap();
+
+    // Store result
+    writeln!(out, "    add.u64 %rd5, %rd2, %rd3;").unwrap();
+    writeln!(out, "    st.global.f32 [%rd5], {result};").unwrap();
+    writeln!(out).unwrap();
+
+    writeln!(out, "{kernel_name}_DONE:").unwrap();
+    writeln!(out, "    ret;").unwrap();
+    writeln!(out, "}}").unwrap();
+    writeln!(out).unwrap();
+}
+
+fn emit_normlike_kernel_ptx(
+    out: &mut String,
+    kernel_name: &str,
+    reduce: &[TraceOp],
+    finalize: &[TraceOp],
+    transform: &[TraceOp],
+    has_weight: bool,
+    has_bias: bool,
+    eps_override: Option<f32>,
+) {
+    let block_size: u32 = 256;
+    let nregs_r = max_regs_needed(reduce, 1);
+    let nregs_f = max_regs_needed(finalize, 2);
+    let nregs_t = max_regs_needed(transform, 3);
+    let _max_nregs = nregs_r.max(nregs_f).max(nregs_t);
+
+    writeln!(out, ".visible .entry {kernel_name}(").unwrap();
+    writeln!(out, "    .param .u64 param_input,").unwrap();
+    if has_weight {
+        writeln!(out, "    .param .u64 param_weight,").unwrap();
+    }
+    if has_bias {
+        writeln!(out, "    .param .u64 param_bias,").unwrap();
+    }
+    writeln!(out, "    .param .u64 param_output,").unwrap();
+    writeln!(out, "    .param .u32 param_N").unwrap();
+    writeln!(out, ")").unwrap();
+    writeln!(out, "{{").unwrap();
+
+    // Shared memory for reduction
+    writeln!(out, "    .shared .f32 smem[{block_size}];").unwrap();
+    writeln!(out).unwrap();
+
+    // Registers
+    writeln!(out, "    .reg .u64 %rd<16>;").unwrap();
+    writeln!(out, "    .reg .u32 %r<16>;").unwrap();
+    writeln!(out, "    .reg .f32 %t1_<{nregs_r}>;").unwrap();
+    writeln!(out, "    .reg .f32 %t2_<{nregs_f}>;").unwrap();
+    writeln!(out, "    .reg .f32 %t3_<{nregs_t}>;").unwrap();
+    writeln!(out, "    .reg .f32 %f<16>;").unwrap();
+    writeln!(out, "    .reg .pred %p<4>;").unwrap();
+    writeln!(out).unwrap();
+
+    // Load params
+    writeln!(out, "    ld.param.u64 %rd0, [param_input];").unwrap();
+    if has_weight {
+        writeln!(out, "    ld.param.u64 %rd1, [param_weight];").unwrap();
+    }
+    if has_bias {
+        writeln!(out, "    ld.param.u64 %rd2, [param_bias];").unwrap();
+    }
+    writeln!(out, "    ld.param.u64 %rd3, [param_output];").unwrap();
+    writeln!(out, "    ld.param.u32 %r0, [param_N];").unwrap();
+    writeln!(out).unwrap();
+
+    // tid = threadIdx.x, gid = blockIdx.x
+    writeln!(out, "    mov.u32 %r1, %tid.x;").unwrap();   // lid
+    writeln!(out, "    mov.u32 %r2, %ctaid.x;").unwrap();  // gid
+    writeln!(out).unwrap();
+
+    // row_base = gid * N
+    writeln!(out, "    mul.lo.u32 %r3, %r2, %r0;").unwrap();
+    writeln!(out).unwrap();
+
+    // ── Phase 1: partial reduction ──
+    writeln!(out, "    mov.f32 %f0, 0f00000000;").unwrap(); // acc = 0.0
+    writeln!(out, "    mov.u32 %r4, %r1;").unwrap();        // i = lid
+    writeln!(out, "{kernel_name}_REDUCE_LOOP:").unwrap();
+    writeln!(out, "    setp.ge.u32 %p0, %r4, %r0;").unwrap();
+    writeln!(out, "    @%p0 bra {kernel_name}_REDUCE_DONE;").unwrap();
+
+    // Load input[row_base + i]
+    writeln!(out, "    add.u32 %r5, %r3, %r4;").unwrap();
+    writeln!(out, "    mul.wide.u32 %rd4, %r5, 4;").unwrap();
+    writeln!(out, "    add.u64 %rd5, %rd0, %rd4;").unwrap();
+    writeln!(out, "    ld.global.f32 %f1, [%rd5];").unwrap();
+
+    // Apply reduce body (e.g. x*x for RmsNorm)
+    let reduce_bindings = vec!["%f1".to_string()];
+    let reduce_result = emit_trace_body_ptx(out, reduce, 1, &reduce_bindings);
+    writeln!(out, "    add.f32 %f0, %f0, {reduce_result};").unwrap();
+
+    writeln!(out, "    add.u32 %r4, %r4, {block_size};").unwrap();
+    writeln!(out, "    bra {kernel_name}_REDUCE_LOOP;").unwrap();
+    writeln!(out, "{kernel_name}_REDUCE_DONE:").unwrap();
+    writeln!(out).unwrap();
+
+    // Store partial sum to shared memory
+    writeln!(out, "    mul.wide.u32 %rd6, %r1, 4;").unwrap();
+    writeln!(out, "    mov.u64 %rd7, smem;").unwrap();
+    writeln!(out, "    add.u64 %rd6, %rd7, %rd6;").unwrap();
+    writeln!(out, "    st.shared.f32 [%rd6], %f0;").unwrap();
+    writeln!(out, "    bar.sync 0;").unwrap();
+    writeln!(out).unwrap();
+
+    // Tree reduction in shared memory
+    let mut stride = block_size / 2;
+    while stride > 0 {
+        writeln!(out, "    setp.lt.u32 %p1, %r1, {stride};").unwrap();
+        writeln!(out, "    @!%p1 bra {kernel_name}_SKIP_{stride};").unwrap();
+        writeln!(out, "    add.u32 %r6, %r1, {stride};").unwrap();
+        writeln!(out, "    mul.wide.u32 %rd8, %r6, 4;").unwrap();
+        writeln!(out, "    add.u64 %rd8, %rd7, %rd8;").unwrap();
+        writeln!(out, "    ld.shared.f32 %f2, [%rd8];").unwrap();
+        writeln!(out, "    ld.shared.f32 %f3, [%rd6];").unwrap();
+        writeln!(out, "    add.f32 %f3, %f3, %f2;").unwrap();
+        writeln!(out, "    st.shared.f32 [%rd6], %f3;").unwrap();
+        writeln!(out, "{kernel_name}_SKIP_{stride}:").unwrap();
+        writeln!(out, "    bar.sync 0;").unwrap();
+        stride /= 2;
+    }
+    writeln!(out).unwrap();
+
+    // ── Phase 2: finalize (compute scale from reduction result) ──
+    writeln!(out, "    ld.shared.f32 %f4, [smem];").unwrap(); // sum_val
+    // Convert N to float for finalize
+    writeln!(out, "    cvt.rn.f32.u32 %f5, %r0;").unwrap();  // float(N)
+
+    let finalize_bindings = vec!["%f4".to_string(), "%f5".to_string()];
+    let mut patched_finalize: Vec<TraceOp>;
+    let finalize_ops: &[TraceOp] = if let Some(eps) = eps_override {
+        patched_finalize = finalize.to_vec();
+        for op in &mut patched_finalize {
+            if let TraceOp::Const(v) = op {
+                if (*v - 1e-5f64).abs() < 1e-10 || (*v - 1e-12f64).abs() < 1e-15 {
+                    *v = eps as f64;
+                }
+            }
+        }
+        &patched_finalize[..]
+    } else {
+        finalize
+    };
+    let scale_var = emit_trace_body_ptx(out, finalize_ops, 2, &finalize_bindings);
+    writeln!(out).unwrap();
+
+    // ── Phase 3: per-element transform ──
+    writeln!(out, "    mov.u32 %r4, %r1;").unwrap(); // i = lid
+    writeln!(out, "{kernel_name}_XFORM_LOOP:").unwrap();
+    writeln!(out, "    setp.ge.u32 %p2, %r4, %r0;").unwrap();
+    writeln!(out, "    @%p2 bra {kernel_name}_XFORM_DONE;").unwrap();
+
+    // Load input[row_base + i]
+    writeln!(out, "    add.u32 %r5, %r3, %r4;").unwrap();
+    writeln!(out, "    mul.wide.u32 %rd9, %r5, 4;").unwrap();
+    writeln!(out, "    add.u64 %rd10, %rd0, %rd9;").unwrap();
+    writeln!(out, "    ld.global.f32 %f6, [%rd10];").unwrap();
+
+    let mut xform_bindings = vec![
+        "%f6".to_string(),
+        scale_var.clone(),
+    ];
+
+    if has_weight {
+        // Load weight[i]
+        writeln!(out, "    mul.wide.u32 %rd11, %r4, 4;").unwrap();
+        writeln!(out, "    add.u64 %rd12, %rd1, %rd11;").unwrap();
+        writeln!(out, "    ld.global.f32 %f7, [%rd12];").unwrap();
+        xform_bindings.push("%f7".to_string());
+    }
+    if has_bias {
+        // Load bias[i]
+        writeln!(out, "    mul.wide.u32 %rd13, %r4, 4;").unwrap();
+        writeln!(out, "    add.u64 %rd14, %rd2, %rd13;").unwrap();
+        writeln!(out, "    ld.global.f32 %f8, [%rd14];").unwrap();
+        xform_bindings.push("%f8".to_string());
+    }
+
+    let xform_result = emit_trace_body_ptx(out, transform, 3, &xform_bindings);
+
+    // Store output[row_base + i]
+    writeln!(out, "    add.u64 %rd15, %rd3, %rd9;").unwrap();
+    writeln!(out, "    st.global.f32 [%rd15], {xform_result};").unwrap();
+
+    writeln!(out, "    add.u32 %r4, %r4, {block_size};").unwrap();
+    writeln!(out, "    bra {kernel_name}_XFORM_LOOP;").unwrap();
+    writeln!(out, "{kernel_name}_XFORM_DONE:").unwrap();
+    writeln!(out, "    ret;").unwrap();
+    writeln!(out, "}}").unwrap();
+    writeln!(out).unwrap();
+}
+
+fn emit_softmax_kernel_ptx(out: &mut String, kernel_name: &str) {
+    let block_size: u32 = 256;
+    writeln!(out, ".visible .entry {kernel_name}(").unwrap();
+    writeln!(out, "    .param .u64 param_input,").unwrap();
+    writeln!(out, "    .param .u64 param_output,").unwrap();
+    writeln!(out, "    .param .u32 param_N").unwrap();
+    writeln!(out, ")").unwrap();
+    writeln!(out, "{{").unwrap();
+    writeln!(out, "    .shared .f32 smem[{block_size}];").unwrap();
+    writeln!(out, "    .reg .u64 %rd<16>;").unwrap();
+    writeln!(out, "    .reg .u32 %r<16>;").unwrap();
+    writeln!(out, "    .reg .f32 %f<16>;").unwrap();
+    writeln!(out, "    .reg .pred %p<4>;").unwrap();
+    writeln!(out).unwrap();
+
+    // Load params
+    writeln!(out, "    ld.param.u64 %rd0, [param_input];").unwrap();
+    writeln!(out, "    ld.param.u64 %rd1, [param_output];").unwrap();
+    writeln!(out, "    ld.param.u32 %r0, [param_N];").unwrap();
+    writeln!(out, "    mov.u32 %r1, %tid.x;").unwrap();
+    writeln!(out, "    mov.u32 %r2, %ctaid.x;").unwrap();
+    writeln!(out, "    mul.lo.u32 %r3, %r2, %r0;").unwrap();
+    writeln!(out).unwrap();
+
+    // Pass 1: find max
+    writeln!(out, "    mov.f32 %f0, 0fFF800000;").unwrap(); // -INF
+    writeln!(out, "    mov.u32 %r4, %r1;").unwrap();
+    writeln!(out, "{kernel_name}_MAX_LOOP:").unwrap();
+    writeln!(out, "    setp.ge.u32 %p0, %r4, %r0;").unwrap();
+    writeln!(out, "    @%p0 bra {kernel_name}_MAX_DONE;").unwrap();
+    writeln!(out, "    add.u32 %r5, %r3, %r4;").unwrap();
+    writeln!(out, "    mul.wide.u32 %rd2, %r5, 4;").unwrap();
+    writeln!(out, "    add.u64 %rd3, %rd0, %rd2;").unwrap();
+    writeln!(out, "    ld.global.f32 %f1, [%rd3];").unwrap();
+    writeln!(out, "    max.f32 %f0, %f0, %f1;").unwrap();
+    writeln!(out, "    add.u32 %r4, %r4, {block_size};").unwrap();
+    writeln!(out, "    bra {kernel_name}_MAX_LOOP;").unwrap();
+    writeln!(out, "{kernel_name}_MAX_DONE:").unwrap();
+
+    // Reduce max in shared memory
+    writeln!(out, "    mov.u64 %rd4, smem;").unwrap();
+    writeln!(out, "    mul.wide.u32 %rd5, %r1, 4;").unwrap();
+    writeln!(out, "    add.u64 %rd5, %rd4, %rd5;").unwrap();
+    writeln!(out, "    st.shared.f32 [%rd5], %f0;").unwrap();
+    writeln!(out, "    bar.sync 0;").unwrap();
+
+    let mut stride = block_size / 2;
+    while stride > 0 {
+        writeln!(out, "    setp.lt.u32 %p1, %r1, {stride};").unwrap();
+        writeln!(out, "    @!%p1 bra {kernel_name}_MAXR_{stride};").unwrap();
+        writeln!(out, "    add.u32 %r6, %r1, {stride};").unwrap();
+        writeln!(out, "    mul.wide.u32 %rd6, %r6, 4;").unwrap();
+        writeln!(out, "    add.u64 %rd6, %rd4, %rd6;").unwrap();
+        writeln!(out, "    ld.shared.f32 %f2, [%rd6];").unwrap();
+        writeln!(out, "    ld.shared.f32 %f3, [%rd5];").unwrap();
+        writeln!(out, "    max.f32 %f3, %f3, %f2;").unwrap();
+        writeln!(out, "    st.shared.f32 [%rd5], %f3;").unwrap();
+        writeln!(out, "{kernel_name}_MAXR_{stride}:").unwrap();
+        writeln!(out, "    bar.sync 0;").unwrap();
+        stride /= 2;
+    }
+    writeln!(out, "    ld.shared.f32 %f4, [smem];").unwrap(); // row_max
+    writeln!(out).unwrap();
+
+    // Pass 2: exp(x - max) and sum
+    writeln!(out, "    mov.f32 %f5, 0f00000000;").unwrap(); // sum = 0
+    writeln!(out, "    mov.u32 %r4, %r1;").unwrap();
+    writeln!(out, "{kernel_name}_SUM_LOOP:").unwrap();
+    writeln!(out, "    setp.ge.u32 %p0, %r4, %r0;").unwrap();
+    writeln!(out, "    @%p0 bra {kernel_name}_SUM_DONE;").unwrap();
+    writeln!(out, "    add.u32 %r5, %r3, %r4;").unwrap();
+    writeln!(out, "    mul.wide.u32 %rd2, %r5, 4;").unwrap();
+    writeln!(out, "    add.u64 %rd3, %rd0, %rd2;").unwrap();
+    writeln!(out, "    ld.global.f32 %f1, [%rd3];").unwrap();
+    writeln!(out, "    sub.f32 %f1, %f1, %f4;").unwrap();
+    // exp via exp2
+    writeln!(out, "    mul.f32 %f1, %f1, 0f3FB8AA3B;").unwrap();
+    writeln!(out, "    ex2.approx.f32 %f1, %f1;").unwrap();
+    writeln!(out, "    add.f32 %f5, %f5, %f1;").unwrap();
+    writeln!(out, "    add.u32 %r4, %r4, {block_size};").unwrap();
+    writeln!(out, "    bra {kernel_name}_SUM_LOOP;").unwrap();
+    writeln!(out, "{kernel_name}_SUM_DONE:").unwrap();
+
+    // Reduce sum in shared memory
+    writeln!(out, "    st.shared.f32 [%rd5], %f5;").unwrap();
+    writeln!(out, "    bar.sync 0;").unwrap();
+    stride = block_size / 2;
+    while stride > 0 {
+        writeln!(out, "    setp.lt.u32 %p1, %r1, {stride};").unwrap();
+        writeln!(out, "    @!%p1 bra {kernel_name}_SUMR_{stride};").unwrap();
+        writeln!(out, "    add.u32 %r6, %r1, {stride};").unwrap();
+        writeln!(out, "    mul.wide.u32 %rd6, %r6, 4;").unwrap();
+        writeln!(out, "    add.u64 %rd6, %rd4, %rd6;").unwrap();
+        writeln!(out, "    ld.shared.f32 %f2, [%rd6];").unwrap();
+        writeln!(out, "    ld.shared.f32 %f3, [%rd5];").unwrap();
+        writeln!(out, "    add.f32 %f3, %f3, %f2;").unwrap();
+        writeln!(out, "    st.shared.f32 [%rd5], %f3;").unwrap();
+        writeln!(out, "{kernel_name}_SUMR_{stride}:").unwrap();
+        writeln!(out, "    bar.sync 0;").unwrap();
+        stride /= 2;
+    }
+    writeln!(out, "    ld.shared.f32 %f6, [smem];").unwrap(); // sum
+    writeln!(out, "    rcp.approx.f32 %f6, %f6;").unwrap();   // inv_sum
+    writeln!(out).unwrap();
+
+    // Pass 3: normalize
+    writeln!(out, "    mov.u32 %r4, %r1;").unwrap();
+    writeln!(out, "{kernel_name}_NORM_LOOP:").unwrap();
+    writeln!(out, "    setp.ge.u32 %p0, %r4, %r0;").unwrap();
+    writeln!(out, "    @%p0 bra {kernel_name}_NORM_DONE;").unwrap();
+    writeln!(out, "    add.u32 %r5, %r3, %r4;").unwrap();
+    writeln!(out, "    mul.wide.u32 %rd2, %r5, 4;").unwrap();
+    writeln!(out, "    add.u64 %rd3, %rd0, %rd2;").unwrap();
+    writeln!(out, "    ld.global.f32 %f1, [%rd3];").unwrap();
+    writeln!(out, "    sub.f32 %f1, %f1, %f4;").unwrap();
+    writeln!(out, "    mul.f32 %f1, %f1, 0f3FB8AA3B;").unwrap();
+    writeln!(out, "    ex2.approx.f32 %f1, %f1;").unwrap();
+    writeln!(out, "    mul.f32 %f1, %f1, %f6;").unwrap();
+    writeln!(out, "    add.u64 %rd7, %rd1, %rd2;").unwrap();
+    writeln!(out, "    st.global.f32 [%rd7], %f1;").unwrap();
+    writeln!(out, "    add.u32 %r4, %r4, {block_size};").unwrap();
+    writeln!(out, "    bra {kernel_name}_NORM_LOOP;").unwrap();
+    writeln!(out, "{kernel_name}_NORM_DONE:").unwrap();
+    writeln!(out, "    ret;").unwrap();
+    writeln!(out, "}}").unwrap();
+    writeln!(out).unwrap();
+}
+
+fn emit_meanpool_kernel_ptx(
+    out: &mut String,
+    kernel_name: &str,
+    seq_len: usize,
+    hidden: usize,
+) {
+    let block_size: u32 = 256;
+    writeln!(out, ".visible .entry {kernel_name}(").unwrap();
+    writeln!(out, "    .param .u64 param_input,").unwrap();
+    writeln!(out, "    .param .u64 param_output").unwrap();
+    writeln!(out, ")").unwrap();
+    writeln!(out, "{{").unwrap();
+    writeln!(out, "    .reg .u64 %rd<8>;").unwrap();
+    writeln!(out, "    .reg .u32 %r<8>;").unwrap();
+    writeln!(out, "    .reg .f32 %f<4>;").unwrap();
+    writeln!(out, "    .reg .pred %p<2>;").unwrap();
+    writeln!(out).unwrap();
+
+    // Load params
+    writeln!(out, "    ld.param.u64 %rd0, [param_input];").unwrap();
+    writeln!(out, "    ld.param.u64 %rd1, [param_output];").unwrap();
+    writeln!(out).unwrap();
+
+    // tid = blockIdx.x * blockDim.x + threadIdx.x
+    writeln!(out, "    mov.u32 %r0, %ctaid.x;").unwrap();
+    writeln!(out, "    mov.u32 %r1, %tid.x;").unwrap();
+    writeln!(out, "    mad.lo.u32 %r2, %r0, {block_size}, %r1;").unwrap();
+    writeln!(out).unwrap();
+
+    // Guard: if tid >= hidden {{ return; }}
+    writeln!(out, "    setp.ge.u32 %p0, %r2, {hidden};").unwrap();
+    writeln!(out, "    @%p0 bra {kernel_name}_DONE;").unwrap();
+    writeln!(out).unwrap();
+
+    // acc = 0.0
+    writeln!(out, "    mov.f32 %f0, 0f00000000;").unwrap();
+    writeln!(out, "    mov.u32 %r3, 0;").unwrap(); // s = 0
+    writeln!(out, "{kernel_name}_LOOP:").unwrap();
+    writeln!(out, "    setp.ge.u32 %p1, %r3, {seq_len};").unwrap();
+    writeln!(out, "    @%p1 bra {kernel_name}_LOOP_DONE;").unwrap();
+
+    // offset = s * hidden + tid
+    writeln!(out, "    mad.lo.u32 %r4, %r3, {hidden}, %r2;").unwrap();
+    writeln!(out, "    mul.wide.u32 %rd2, %r4, 4;").unwrap();
+    writeln!(out, "    add.u64 %rd3, %rd0, %rd2;").unwrap();
+    writeln!(out, "    ld.global.f32 %f1, [%rd3];").unwrap();
+    writeln!(out, "    add.f32 %f0, %f0, %f1;").unwrap();
+
+    writeln!(out, "    add.u32 %r3, %r3, 1;").unwrap();
+    writeln!(out, "    bra {kernel_name}_LOOP;").unwrap();
+    writeln!(out, "{kernel_name}_LOOP_DONE:").unwrap();
+    writeln!(out).unwrap();
+
+    // output[tid] = acc * (1.0 / seq_len) using rcp.approx
+    writeln!(out, "    mov.u32 %r5, {seq_len};").unwrap();
+    writeln!(out, "    cvt.rn.f32.u32 %f2, %r5;").unwrap();
+    writeln!(out, "    rcp.approx.f32 %f2, %f2;").unwrap();
+    writeln!(out, "    mul.f32 %f0, %f0, %f2;").unwrap();
+    writeln!(out, "    mul.wide.u32 %rd4, %r2, 4;").unwrap();
+    writeln!(out, "    add.u64 %rd5, %rd1, %rd4;").unwrap();
+    writeln!(out, "    st.global.f32 [%rd5], %f0;").unwrap();
+    writeln!(out).unwrap();
+
+    writeln!(out, "{kernel_name}_DONE:").unwrap();
+    writeln!(out, "    ret;").unwrap();
+    writeln!(out, "}}").unwrap();
+    writeln!(out).unwrap();
+}
+
+// ── MachineCodeEmitter impl ─────────────────────────────────────────────────
+
 impl MachineCodeEmitter for PtxCodeGen {
     fn emit_plan(
         &mut self,
-        _plan: &FusionPlan,
-        _graph: &CompilerGraph,
+        plan: &FusionPlan,
+        graph: &CompilerGraph,
         _alloc: &BufferAllocation,
         _profile: &DeviceProfile,
-        _registry: Option<&crate::compiler::registry::ScalarOpRegistry>,
+        registry: Option<&ScalarOpRegistry>,
     ) -> Result<CodegenOutput, String> {
-        Err("PtxCodeGen: not yet implemented".into())
+        let mut ptx = String::new();
+
+        // PTX header
+        let ptx_version = match self.sm_version {
+            90.. => "8.0",
+            80..=89 => "7.0",
+            _ => "6.0",
+        };
+        writeln!(ptx, ".version {ptx_version}").unwrap();
+        writeln!(ptx, ".target sm_{}", self.sm_version).unwrap();
+        writeln!(ptx, ".address_size 64").unwrap();
+        writeln!(ptx).unwrap();
+
+        if plan.groups.is_empty() {
+            return Ok(CodegenOutput {
+                code: ptx.into_bytes(),
+                scratchpad_bytes: 0,
+            });
+        }
+
+        for group in &plan.groups {
+            let anchor_op = graph.op(group.anchor).ok_or_else(|| {
+                format!("PtxCodeGen: anchor op {:?} not found in graph", group.anchor)
+            })?;
+
+            let kernel_name = format!("group_{}", group.id);
+            let op_kind = &anchor_op.kind;
+
+            // Reshape/Transpose are metadata-only — NOP on GPU
+            if matches!(op_kind, OpKind::Reshape { .. } | OpKind::Transpose { .. }) {
+                continue;
+            }
+
+
+            let registry = registry.ok_or_else(|| {
+                format!("PtxCodeGen: emit_plan requires a ScalarOpRegistry for {:?}", op_kind)
+            })?;
+            let key = ScalarOpRegistry::key_from_op_kind(op_kind);
+            let trace = registry.get_trace(&key).ok_or_else(|| {
+                format!("PtxCodeGen: no OpTrace for {:?}", op_kind)
+            })?;
+
+            match &trace.pattern {
+                ComputePattern::Elementwise { body } => {
+                    emit_elementwise_kernel_ptx(&mut ptx, &kernel_name, body);
+                }
+                ComputePattern::BinaryElementwise { body } => {
+                    emit_binary_elementwise_kernel_ptx(&mut ptx, &kernel_name, body);
+                }
+                ComputePattern::NormLike { reduce, finalize, transform } => {
+                    let eps_override = match op_kind {
+                        OpKind::RmsNorm { eps } => Some(*eps),
+                        OpKind::LayerNorm { eps } => Some(*eps),
+                        _ => None,
+                    };
+                    let has_weight = matches!(
+                        op_kind,
+                        OpKind::RmsNorm { .. } | OpKind::LayerNorm { .. }
+                    );
+                    let has_bias = matches!(op_kind, OpKind::LayerNorm { .. });
+                    emit_normlike_kernel_ptx(
+                        &mut ptx,
+                        &kernel_name,
+                        reduce,
+                        finalize,
+                        transform,
+                        has_weight,
+                        has_bias,
+                        eps_override,
+                    );
+                }
+                ComputePattern::Reduction { .. } => {
+                    match op_kind {
+                        OpKind::Softmax => {
+                            emit_softmax_kernel_ptx(&mut ptx, &kernel_name);
+                        }
+                        OpKind::MeanPool { seq_len, hidden } => {
+                            emit_meanpool_kernel_ptx(
+                                &mut ptx, &kernel_name, *seq_len, *hidden,
+                            );
+                        }
+                        _ => {
+                            return Err(format!(
+                                "PtxCodeGen: unsupported Reduction op {:?}",
+                                op_kind
+                            ));
+                        }
+                    }
+                }
+                ComputePattern::Gemm => {
+                    return Err(format!(
+                        "PtxCodeGen: GEMM codegen not yet implemented (op {:?})",
+                        op_kind
+                    ));
+                }
+                ComputePattern::Injective { body, .. } => {
+                    if body.is_empty() {
+                        continue;
+                    }
+                    return Err(format!(
+                        "PtxCodeGen: non-trivial Injective codegen not yet implemented (op {:?})",
+                        op_kind
+                    ));
+                }
+                ComputePattern::QuantDecode { .. } => {
+                    return Err(format!(
+                        "PtxCodeGen: QuantDecode codegen not yet implemented (op {:?})",
+                        op_kind
+                    ));
+                }
+            }
+        }
+
+        Ok(CodegenOutput {
+            code: ptx.into_bytes(),
+            scratchpad_bytes: 0,
+        })
     }
 
     /// PTX threads process one element each — "SIMD width" is effectively 1
@@ -300,21 +1028,226 @@ mod tests {
     }
 
     #[test]
-    fn test_ptx_emit_plan_not_yet_implemented() {
+    fn test_ptx_trace_op_to_ptx_basic() {
+        let mut out = String::new();
+        let vars = vec!["%f0".to_string(), "%f1".to_string()];
+
+        let reg = trace_op_to_ptx(&mut out, &TraceOp::Add(0, 1), 0, &vars, 99);
+        assert!(out.contains("add.f32"));
+        assert_eq!(reg, "%t99_0");
+
+        out.clear();
+        let reg = trace_op_to_ptx(&mut out, &TraceOp::Mul(0, 1), 1, &vars, 99);
+        assert!(out.contains("mul.f32"));
+
+        out.clear();
+        let reg = trace_op_to_ptx(&mut out, &TraceOp::Exp(0), 2, &vars, 99);
+        assert!(out.contains("ex2.approx.f32"));
+
+        out.clear();
+        let reg = trace_op_to_ptx(&mut out, &TraceOp::Rsqrt(0), 3, &vars, 99);
+        assert!(out.contains("rsqrt.approx.f32"));
+    }
+
+    #[test]
+    fn test_ptx_emit_trace_body() {
+        let body = vec![
+            TraceOp::Input(0),
+            TraceOp::Neg(0),
+        ];
+        let mut out = String::new();
+        let bindings = vec!["%f0".to_string()];
+        let result = emit_trace_body_ptx(&mut out, &body, 0, &bindings);
+        assert!(out.contains("neg.f32"));
+        assert_eq!(result, "%t0_1");
+    }
+
+    #[test]
+    fn test_ptx_emit_elementwise_kernel_from_trace() {
+        let body = vec![
+            TraceOp::Input(0),
+            TraceOp::Neg(0),
+        ];
+        let mut out = String::new();
+        emit_elementwise_kernel_ptx(&mut out, "test_neg", &body);
+        assert!(out.contains(".visible .entry test_neg("));
+        assert!(out.contains("neg.f32"));
+        assert!(out.contains("st.global.f32"));
+        assert!(out.contains("ret;"));
+    }
+
+    #[test]
+    fn test_ptx_emit_binary_elementwise_kernel_from_trace() {
+        let body = vec![
+            TraceOp::Input(0),
+            TraceOp::Input(1),
+            TraceOp::Add(0, 1),
+        ];
+        let mut out = String::new();
+        emit_binary_elementwise_kernel_ptx(&mut out, "test_add", &body);
+        assert!(out.contains(".visible .entry test_add("));
+        assert!(out.contains("param_input0"));
+        assert!(out.contains("param_input1"));
+        assert!(out.contains("add.f32"));
+    }
+
+    #[test]
+    fn test_ptx_emit_normlike_kernel() {
+        let reduce = vec![
+            TraceOp::Input(0),
+            TraceOp::Mul(0, 0),
+        ];
+        let finalize = vec![
+            TraceOp::Input(0),
+            TraceOp::Input(1),
+            TraceOp::Div(0, 1),
+            TraceOp::Const(1e-5),
+            TraceOp::Add(2, 3),
+            TraceOp::Rsqrt(4),
+        ];
+        let transform = vec![
+            TraceOp::Input(0),
+            TraceOp::Input(1),
+            TraceOp::Input(2),
+            TraceOp::Mul(0, 1),
+            TraceOp::Mul(3, 2),
+        ];
+        let mut out = String::new();
+        emit_normlike_kernel_ptx(
+            &mut out, "test_rmsnorm",
+            &reduce, &finalize, &transform,
+            true, false, Some(1e-5),
+        );
+        assert!(out.contains(".visible .entry test_rmsnorm("));
+        assert!(out.contains(".shared .f32 smem[256]"));
+        assert!(out.contains("bar.sync 0"));
+        assert!(out.contains("rsqrt.approx.f32"));
+        assert!(out.contains("param_weight"));
+        assert!(!out.contains("param_bias"));
+    }
+
+
+    #[test]
+    fn test_ptx_emit_normlike_l2normalize() {
+        let reduce = vec![
+            TraceOp::Input(0),
+            TraceOp::Mul(0, 0),
+        ];
+        let finalize = vec![
+            TraceOp::Input(0),
+            TraceOp::Input(1),
+            TraceOp::Div(0, 1),
+            TraceOp::Const(1e-5),
+            TraceOp::Add(2, 3),
+            TraceOp::Rsqrt(4),
+        ];
+        let transform = vec![
+            TraceOp::Input(0),
+            TraceOp::Input(1),
+            TraceOp::Mul(0, 1),
+        ];
+        let mut out = String::new();
+        emit_normlike_kernel_ptx(
+            &mut out, "test_l2norm",
+            &reduce, &finalize, &transform,
+            false, false, Some(1e-5),
+        );
+        assert!(out.contains(".visible .entry test_l2norm("));
+        assert!(out.contains("rsqrt.approx.f32"));
+        assert!(!out.contains("param_weight"));
+        assert!(!out.contains("param_bias"));
+    }
+    #[test]
+    fn test_ptx_emit_softmax_kernel() {
+        let mut out = String::new();
+        emit_softmax_kernel_ptx(&mut out, "test_softmax");
+        assert!(out.contains(".visible .entry test_softmax("));
+        assert!(out.contains("max.f32"));
+        assert!(out.contains("ex2.approx.f32"));
+        assert!(out.contains("rcp.approx.f32"));
+    }
+
+    #[test]
+    fn test_ptx_emit_plan_empty() {
+        use crate::compiler::buffer_alloc::BufferAllocation;
         use crate::compiler::fusion::FusionPlan;
         use crate::compiler::graph::CompilerGraph;
-        use crate::compiler::buffer_alloc::BufferAllocation;
         use crate::dispatch::DeviceProfile;
 
         let mut cg = PtxCodeGen::new(80);
-        let plan = FusionPlan { groups: vec![], op_to_group: Default::default() };
+        let plan = FusionPlan {
+            groups: vec![],
+            op_to_group: Default::default(),
+        };
         let graph = CompilerGraph::new();
-        let alloc = BufferAllocation { slots: vec![], total_bytes: 0, num_tensors: 0, bytes_saved: 0 };
+        let alloc = BufferAllocation {
+            slots: vec![],
+            total_bytes: 0,
+            num_tensors: 0,
+            bytes_saved: 0,
+        };
         let profile = DeviceProfile::detect();
 
         let result = cg.emit_plan(&plan, &graph, &alloc, &profile, None);
-        assert!(result.is_err());
-        match result { Err(e) => assert!(e.contains("not yet implemented")), Ok(_) => panic!("expected Err"), }
+        match result {
+            Ok(output) => {
+                let ptx = String::from_utf8(output.code).unwrap();
+                assert!(ptx.contains(".version 7.0"));
+                assert!(ptx.contains(".target sm_80"));
+                assert!(ptx.contains(".address_size 64"));
+            }
+            Err(e) => panic!("expected Ok for empty plan, got Err: {e}"),
+        }
+    }
+
+    #[test]
+    fn test_ptx_emit_plan_requires_registry() {
+        use crate::compiler::buffer_alloc::BufferAllocation;
+        use crate::compiler::fusion::{FusionGroup, FusionMode, FusionPlan};
+        use crate::compiler::graph::{CompilerGraph, OpKind};
+        use crate::compiler::registry::ScalarOpRegistry;
+        use crate::inference::types::DType;
+        use crate::dispatch::DeviceProfile;
+        use std::collections::HashMap;
+
+        let mut g = CompilerGraph::new();
+        let input = g.add_tensor("input", vec![16], DType::F32);
+        let output = g.add_tensor("output", vec![16], DType::F32);
+        g.inputs = vec![input];
+        g.outputs = vec![output];
+        let op_id = g.add_op(OpKind::Silu, vec![input], vec![output], "silu");
+
+        let mut op_to_group = HashMap::new();
+        op_to_group.insert(op_id, 0);
+        let plan = FusionPlan {
+            groups: vec![FusionGroup {
+                id: 0,
+                anchor: op_id,
+                epilogue: vec![],
+                mode: FusionMode::LoopFusion,
+                ops: vec![op_id],
+            }],
+            op_to_group,
+        };
+        let alloc = BufferAllocation { slots: vec![], total_bytes: 0, num_tensors: 0, bytes_saved: 0 };
+        let profile = DeviceProfile::detect();
+
+        let mut cg = PtxCodeGen::new(80);
+        // Without registry should fail
+        let result = cg.emit_plan(&plan, &g, &alloc, &profile, None);
+        match result {
+            Err(e) => assert!(e.contains("requires a ScalarOpRegistry"), "unexpected error: {e}"),
+            Ok(_) => panic!("expected Err when registry is None"),
+        }
+
+        // With registry should succeed
+        let registry = ScalarOpRegistry::with_defaults();
+        let result = cg.emit_plan(&plan, &g, &alloc, &profile, Some(&registry));
+        let ptx = match result {
+            Ok(output) => String::from_utf8(output.code).unwrap(),
+            Err(e) => panic!("expected Ok with registry, got Err: {e}"),
+        };
+        assert!(ptx.contains(".visible .entry group_0("));
     }
 
     #[test]
@@ -331,5 +1264,16 @@ mod tests {
         let emitter = backend.new_emitter(&profile);
         assert_eq!(emitter.sm_version(), 89);
         assert_eq!(emitter.simd_width(), 1);
+    }
+
+    #[test]
+    fn test_ptx_emit_meanpool_kernel() {
+        let mut out = String::new();
+        emit_meanpool_kernel_ptx(&mut out, "test_meanpool", 128, 768);
+        assert!(out.contains(".visible .entry test_meanpool("));
+        assert!(out.contains("param_input"));
+        assert!(out.contains("param_output"));
+        assert!(out.contains("rcp.approx.f32"));
+        assert!(out.contains("st.global.f32"));
     }
 }

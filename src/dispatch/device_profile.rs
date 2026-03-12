@@ -29,6 +29,8 @@ pub enum IsaLevel {
     Scalar,
     Avx2,
     Avx512,
+    /// AVX-512 + Intel AMX tile instructions (Sapphire Rapids+).
+    Avx512Amx,
     Neon,
     /// ARM SVE (Scalable Vector Extension) — runtime vector length 128..2048 bits.
     Sve,
@@ -129,7 +131,7 @@ impl DeviceProfile {
     #[inline]
     pub fn num_simd_regs(&self) -> usize {
         match self.isa {
-            IsaLevel::Avx512 => 32,
+            IsaLevel::Avx512 | IsaLevel::Avx512Amx => 32,
             IsaLevel::Avx2 => 16,
             IsaLevel::Neon | IsaLevel::NeonAmx => 32,
             IsaLevel::Sve | IsaLevel::Sve2 => 32, // z0-z31
@@ -142,7 +144,7 @@ impl DeviceProfile {
     #[inline]
     pub fn simd_width_bytes(&self) -> usize {
         match self.isa {
-            IsaLevel::Avx512 => 64,
+            IsaLevel::Avx512 | IsaLevel::Avx512Amx => 64,
             IsaLevel::Avx2 => 32,
             IsaLevel::Neon | IsaLevel::NeonAmx => 16,
             // SVE: runtime-determined, return minimum guaranteed (128-bit).
@@ -328,6 +330,10 @@ impl DeviceProfile {
 
 fn detect_isa_level(arch: MicroArch) -> IsaLevel {
     if arch.use_avx512() {
+        #[cfg(target_arch = "x86_64")]
+        if is_x86_feature_detected!("amx-tile") && is_x86_feature_detected!("amx-bf16") {
+            return IsaLevel::Avx512Amx;
+        }
         return IsaLevel::Avx512;
     }
     #[cfg(target_arch = "x86_64")]
@@ -390,7 +396,7 @@ mod tests {
         #[cfg(target_arch = "x86_64")]
         assert!(matches!(
             profile.isa,
-            IsaLevel::Avx2 | IsaLevel::Avx512
+            IsaLevel::Avx2 | IsaLevel::Avx512 | IsaLevel::Avx512Amx
         ));
         #[cfg(target_arch = "aarch64")]
         assert!(matches!(
