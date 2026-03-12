@@ -356,6 +356,35 @@ impl InferenceBackend for CpuFallbackBackend {
                     );
                     intermediates.insert(out_ids[0], out);
                 }
+
+                OpKind::MeanPool { seq_len, hidden } => {
+                    let x = resolve_tensor(in_ids[0], graph, inputs, &intermediates)?;
+                    let mut out = alloc_output(graph, out_ids[0])?;
+                    crate::scalar_ops::pooling::scalar_mean_pool(
+                        x.as_ptr(),
+                        out.as_f32_slice_mut().as_mut_ptr(),
+                        seq_len,
+                        hidden,
+                    );
+                    intermediates.insert(out_ids[0], out);
+                }
+
+                OpKind::MultiHeadAttention { seq_len, num_heads, head_dim } => {
+                    let q = resolve_tensor(in_ids[0], graph, inputs, &intermediates)?;
+                    let k = resolve_tensor(in_ids[1], graph, inputs, &intermediates)?;
+                    let v = resolve_tensor(in_ids[2], graph, inputs, &intermediates)?;
+                    let mut out = alloc_output(graph, out_ids[0])?;
+                    crate::scalar_ops::attention::scalar_multi_head_attention(
+                        q.as_ptr(),
+                        k.as_ptr(),
+                        v.as_ptr(),
+                        out.as_f32_slice_mut().as_mut_ptr(),
+                        seq_len,
+                        num_heads,
+                        head_dim,
+                    );
+                    intermediates.insert(out_ids[0], out);
+                }
             }
         }
 

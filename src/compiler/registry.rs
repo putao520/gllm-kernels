@@ -1,20 +1,22 @@
 use std::collections::HashMap;
 use crate::compiler::graph::OpKind;
 use crate::compiler::trace::{
-    classify_pattern, ComputePattern, OpTrace, ScalarFnSignature, ScalarParam, TraceOp,
+    classify_pattern, ComputePattern, OpTrace, ReductionSecondPass, ScalarFnSignature, ScalarParam, TraceOp,
 };
-use crate::compiler::symexec::SymExecError;
+use crate::compiler::symexec::{SymExecError, SymbolicExecutor};
 
 /// Hashable key for `OpKind` (OpKind contains f32/f64 fields that prevent `Hash`).
 ///
-/// For norm ops, `eps` is stored as `f32::to_bits()` so different epsilon
+/// For norm ops, the key is eps-agnostic: the trace pattern is identical
+/// regardless of epsilon, so a single cached trace serves all eps values.
+/// The actual eps is read from `OpKind` at codegen time.
 /// values produce distinct cache keys and compiled kernels.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum OpKindKey {
-    /// RmsNorm keyed by eps (as f32 bits for Hash/Eq).
-    RmsNorm { eps_bits: u32 },
-    /// LayerNorm keyed by eps (as f32 bits for Hash/Eq).
-    LayerNorm { eps_bits: u32 },
+    /// RmsNorm (eps-agnostic; actual eps comes from OpKind at codegen time).
+    RmsNorm,
+    /// LayerNorm (eps-agnostic; actual eps comes from OpKind at codegen time).
+    LayerNorm,
     Gemm,
     GemmBias,
     Silu,
@@ -30,6 +32,8 @@ pub enum OpKindKey {
     Transpose,
     QuantGemm,
     Dequantize,
+    MultiHeadAttention,
+    MeanPool,
 }
 
 #[derive(Debug)]
@@ -110,8 +114,8 @@ impl ScalarOpRegistry {
     /// Convert an `OpKind` to its hashable `OpKindKey`.
     pub fn key_from_op_kind(kind: &OpKind) -> OpKindKey {
         match kind {
-            OpKind::RmsNorm { eps } => OpKindKey::RmsNorm { eps_bits: eps.to_bits() },
-            OpKind::LayerNorm { eps } => OpKindKey::LayerNorm { eps_bits: eps.to_bits() },
+            OpKind::RmsNorm { .. } => OpKindKey::RmsNorm,
+            OpKind::LayerNorm { .. } => OpKindKey::LayerNorm,
             OpKind::Gemm { .. } => OpKindKey::Gemm,
             OpKind::GemmBias { .. } => OpKindKey::GemmBias,
             OpKind::Silu => OpKindKey::Silu,
@@ -127,6 +131,8 @@ impl ScalarOpRegistry {
             OpKind::Reshape { .. } => OpKindKey::Reshape,
             OpKind::QuantGemm { .. } => OpKindKey::QuantGemm,
             OpKind::Dequantize { .. } => OpKindKey::Dequantize,
+            OpKind::MultiHeadAttention { .. } => OpKindKey::MultiHeadAttention,
+            OpKind::MeanPool { .. } => OpKindKey::MeanPool,
         }
     }
 
@@ -374,10 +380,29 @@ impl ScalarOpRegistry {
                 pattern: ComputePattern::Reduction {
                     identity: f64::NEG_INFINITY,
                     combine: vec![
-                        TraceOp::Input(0),  // [0] a (running max / sum)
+                        TraceOp::Input(0),  // [0] a (running max)
                         TraceOp::Input(1),  // [1] b (new element)
                         TraceOp::Max(0, 1), // [2] max(a, b)
                     ],
+                    second_pass: Some(Box::new(ReductionSecondPass {
+                        identity: 0.0,
+                        element_transform: vec![
+                            TraceOp::Input(0),  // [0] x (current element)
+                            TraceOp::Input(1),  // [1] max (broadcast)
+                            TraceOp::Sub(0, 1), // [2] x - max
+                            TraceOp::Exp(2),    // [3] exp(x - max)
+                        ],
+                        combine: vec![
+                            TraceOp::Input(0),  // [0] acc (running sum)
+                            TraceOp::Input(1),  // [1] exp_val
+                            TraceOp::Add(0, 1), // [2] acc + exp_val
+                        ],
+                    })),
+                    normalize: Some(vec![
+                        TraceOp::Input(0),  // [0] exp_val
+                        TraceOp::Input(1),  // [1] inv_sum (broadcast)
+                        TraceOp::Mul(0, 1), // [2] exp_val * inv_sum
+                    ]),
                 },
                 signature: softmax_sig,
             },
@@ -396,7 +421,7 @@ impl ScalarOpRegistry {
         };
         let default_eps: f32 = 1e-5;
         reg.register_with_symexec_fallback(
-            OpKindKey::RmsNorm { eps_bits: default_eps.to_bits() },
+            OpKindKey::RmsNorm,
             rms_sig.clone(),
             OpKind::RmsNorm { eps: default_eps },
             OpTrace {
@@ -439,7 +464,7 @@ impl ScalarOpRegistry {
             ],
         };
         reg.register_with_symexec_fallback(
-            OpKindKey::LayerNorm { eps_bits: default_eps.to_bits() },
+            OpKindKey::LayerNorm,
             ln_sig.clone(),
             OpKind::LayerNorm { eps: default_eps },
             OpTrace {
@@ -742,8 +767,8 @@ mod tests {
             OpKindKey::Mul,
             OpKindKey::Residual,
             OpKindKey::Softmax,
-            OpKindKey::RmsNorm { eps_bits: 1e-5_f32.to_bits() },
-            OpKindKey::LayerNorm { eps_bits: 1e-5_f32.to_bits() },
+            OpKindKey::RmsNorm,
+            OpKindKey::LayerNorm,
             OpKindKey::Gemm,
             OpKindKey::GemmBias,
             OpKindKey::RoPE,
@@ -779,8 +804,8 @@ mod tests {
             (OpKind::Mul, OpKindKey::Mul),
             (OpKind::Residual, OpKindKey::Residual),
             (OpKind::Softmax, OpKindKey::Softmax),
-            (OpKind::RmsNorm { eps: 1e-6 }, OpKindKey::RmsNorm { eps_bits: 1e-6_f32.to_bits() }),
-            (OpKind::LayerNorm { eps: 1e-5 }, OpKindKey::LayerNorm { eps_bits: 1e-5_f32.to_bits() }),
+            (OpKind::RmsNorm { eps: 1e-6 }, OpKindKey::RmsNorm),
+            (OpKind::LayerNorm { eps: 1e-5 }, OpKindKey::LayerNorm),
             (OpKind::Gemm { m: 1, n: 4096, k: 4096 }, OpKindKey::Gemm),
             (OpKind::GemmBias { m: 1, n: 4096, k: 4096 }, OpKindKey::GemmBias),
             (OpKind::RoPE { head_dim: 128, theta: 10000.0 }, OpKindKey::RoPE),
@@ -832,7 +857,7 @@ mod tests {
     #[test]
     fn registry_rms_norm_trace_is_normlike() {
         let reg = ScalarOpRegistry::with_defaults();
-        let trace = reg.get_trace(&OpKindKey::RmsNorm { eps_bits: 1e-5_f32.to_bits() }).unwrap();
+        let trace = reg.get_trace(&OpKindKey::RmsNorm).unwrap();
         assert!(
             matches!(trace.pattern, ComputePattern::NormLike { .. }),
             "RmsNorm should be NormLike"
@@ -870,7 +895,7 @@ mod tests {
             OpKindKey::Gelu,
             OpKindKey::Add,
             OpKindKey::Mul,
-            OpKindKey::RmsNorm { eps_bits: 1e-5_f32.to_bits() },
+            OpKindKey::RmsNorm,
             OpKindKey::Gemm,
             OpKindKey::RoPE,
         ] {
@@ -892,7 +917,7 @@ mod tests {
             (OpKindKey::Gelu, OpKind::Gelu),
             (OpKindKey::Add, OpKind::Add),
             (OpKindKey::Mul, OpKind::Mul),
-            (OpKindKey::RmsNorm { eps_bits: 1e-5_f32.to_bits() }, OpKind::RmsNorm { eps: 1e-5 }),
+            (OpKindKey::RmsNorm, OpKind::RmsNorm { eps: 1e-5 }),
             (OpKindKey::Softmax, OpKind::Softmax),
         ];
 

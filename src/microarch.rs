@@ -168,7 +168,7 @@ fn detect_x86() -> MicroArch {
     use std::arch::x86_64::__cpuid;
 
     // Leaf 0: vendor string
-    let leaf0 = __cpuid(0);
+    let leaf0 = unsafe { __cpuid(0) };
     let mut vendor_bytes = [0u8; 12];
     vendor_bytes[0..4].copy_from_slice(&leaf0.ebx.to_le_bytes());
     vendor_bytes[4..8].copy_from_slice(&leaf0.edx.to_le_bytes());
@@ -176,7 +176,7 @@ fn detect_x86() -> MicroArch {
     let vendor = core::str::from_utf8(&vendor_bytes).unwrap_or("");
 
     // Leaf 1: family/model/stepping
-    let leaf1 = __cpuid(1);
+    let leaf1 = unsafe { __cpuid(1) };
     let family_id = (leaf1.eax >> 8) & 0xF;
     let model_id = (leaf1.eax >> 4) & 0xF;
     let ext_family = (leaf1.eax >> 20) & 0xFF;
@@ -349,6 +349,12 @@ pub struct KernelConfig {
     pub has_vnni: bool,
     pub has_avx512fp16: bool,
     pub has_bf16: bool,
+    /// ARM SVE (Scalable Vector Extension) available.
+    pub has_sve: bool,
+    /// ARM SVE2 available.
+    pub has_sve2: bool,
+    /// ARM SVE vector length in bytes (0 if SVE not available).
+    pub sve_vl_bytes: usize,
 }
 
 impl KernelConfig {
@@ -397,7 +403,8 @@ impl KernelConfig {
         // Each row processes N elements, ~1 cycle per FMA
         let pf_rows = (lat_cycles / 8).clamp(16, 64);
 
-        KernelConfig {
+        #[allow(unused_mut)]
+        let mut cfg = KernelConfig {
             arch,
             mr, nr, simd_width: simd_w,
             kc, mc, nc,
@@ -412,7 +419,21 @@ impl KernelConfig {
             has_vnni: arch.has_vnni(),
             has_avx512fp16: arch.has_avx512fp16(),
             has_bf16: arch.has_bf16(),
+            has_sve: false,
+            has_sve2: false,
+            sve_vl_bytes: 0,
+        };
+
+        // Detect ARM SVE from HwInfo if on aarch64.
+        #[cfg(target_arch = "aarch64")]
+        {
+            let hw = crate::autotuning::HwInfo::detect();
+            cfg.has_sve = hw.isa.sve;
+            cfg.has_sve2 = hw.isa.sve2;
+            cfg.sve_vl_bytes = hw.isa.sve_vl_bytes;
         }
+
+        cfg
     }
 
     /// Compute NUMA-aware NC using a specific node's L3 size.

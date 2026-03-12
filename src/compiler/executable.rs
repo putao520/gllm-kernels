@@ -5,6 +5,7 @@
 //! (via mmap) and called through a function pointer.
 
 use crate::types::InferenceError;
+use crate::compiler::graph::WeightLayout;
 
 /// Signature of a compiled layer function.
 ///
@@ -39,6 +40,8 @@ pub struct CompiledLayer {
     pub scratchpad_bytes: usize,
     /// Hash of the LayerIR + ExecutionPlan (for cache validation)
     pub config_hash: u64,
+    /// Weight blob layout for multi-weight graphs (BERT etc.)
+    pub weight_layout: Option<WeightLayout>,
 }
 
 impl CompiledLayer {
@@ -54,6 +57,7 @@ impl CompiledLayer {
             entry_offset: 0,
             scratchpad_bytes,
             config_hash,
+            weight_layout: None,
         })
     }
 

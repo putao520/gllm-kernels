@@ -85,7 +85,7 @@ mod tests {
             hmask: [0u8; 32],
             qs: [0u8; 64],
             scales: [0u8; 12],
-            d: 1.0,
+            d: f16::from_f32(1.0),
         };
         block.qs[0] = 0x03; 
         block.hmask[0] = 0x01;
@@ -125,7 +125,7 @@ mod tests {
             qs: [0u8; 128],
             qh: [0u8; 64],
             scales: [0u8; 16],
-            d: 1.0,
+            d: f16::from_f32(1.0),
         };
         block.qs[0] = 0x0F;
         block.qh[0] = 0x03;

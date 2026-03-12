@@ -13,6 +13,7 @@
 //! or unrolling loops, which would make binary analysis intractable.
 
 pub mod activations;
+pub mod attention;
 pub mod norms;
 pub mod blas;
 pub mod rope;

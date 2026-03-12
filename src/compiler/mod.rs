@@ -41,7 +41,7 @@ pub use planner::{ExecutionPlan, FusionDecision, GemmShape, MicrokernelChoice};
 pub use executable::{CompiledLayer, CompiledLayerFn};
 pub use cache::{CompilationCache, CacheSource, IncrementalCompileResult, CACHE_VERSION};
 pub use codegen::CodegenOutput;
-pub use graph::{CompilerGraph, CompilerOp, OpKind, TensorId, OpId};
+pub use graph::{CompilerGraph, CompilerOp, OpKind, TensorId, OpId, WeightLayout, PtrSource, GroupPointerMap};
 pub use semantics::OpSemantics;
 pub use fusion::{FusionPlan, FusionGroup, FusionMode};
 pub use codegen::emitter::ScratchpadLayout;
@@ -264,22 +264,29 @@ impl InferenceCompiler {
         let fusion_plan = fusion::fuse_with_dag_prebuilt(graph, &semantic_dag, &self.profile);
         let lifetimes = buffer_alloc::analyze_lifetimes(graph, &fusion_plan);
         let alloc = buffer_alloc::allocate_buffers(&lifetimes);
+        let weight_layout = graph.weight_layout();
 
         #[cfg(feature = "jit-x86")]
         let output = {
             let mut cg = codegen::x86_64::X86CodeGen::new(&self.profile);
+            cg.set_weight_layout(weight_layout.clone());
             cg.emit_plan(&fusion_plan, graph, &alloc, &self.profile, Some(&registry))
                 .map_err(|e| InferenceError::CompileError(e))?
         };
 
         #[cfg(not(feature = "jit-x86"))]
         {
-            let _ = (fusion_plan, alloc);
+            let _ = (fusion_plan, alloc, weight_layout);
             return Err(InferenceError::CompileError("JIT backend not enabled (feature jit-x86 required)".into()));
         }
 
-        let hash = self.graph_content_hash(graph);
-        CompiledLayer::from_code(&output.code, output.scratchpad_bytes, hash)
+        #[cfg(feature = "jit-x86")]
+        {
+            let hash = self.graph_content_hash(graph);
+            let mut layer = CompiledLayer::from_code(&output.code, output.scratchpad_bytes, hash)?;
+            layer.weight_layout = Some(weight_layout);
+            Ok(layer)
+        }
     }
 
     /// Compute a deterministic content hash for a CompilerGraph.
@@ -331,6 +338,10 @@ impl InferenceCompiler {
                     }
                     OpKind::Reshape { target_shape } => {
                         target_shape.hash(&mut hasher);
+                    }
+                    OpKind::MeanPool { seq_len, hidden } => {
+                        seq_len.hash(&mut hasher);
+                        hidden.hash(&mut hasher);
                     }
                     // Silu, Gelu, SwiGlu, GeGlu, Softmax, Add, Mul, Residual
                     // — discriminant alone is sufficient

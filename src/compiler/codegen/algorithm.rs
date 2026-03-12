@@ -191,10 +191,19 @@ pub fn emit_trace_body<E: SimdOps>(
     base_vreg: u8,
     scratch: [VReg; 3],
 ) -> Result<Vec<VReg>, String> {
+    // The lowest scratch register index is the upper bound for data registers.
+    let max_vreg = scratch.iter().map(|s| s.0).min().unwrap_or(u8::MAX);
+
     let mut reg_map: Vec<VReg> = Vec::with_capacity(ops.len());
 
     for (i, op) in ops.iter().enumerate() {
         let dst = VReg(base_vreg + i as u8);
+        if dst.0 >= max_vreg {
+            return Err(format!(
+                "SSA index {} exceeds available registers (max {}; registers {}-{} reserved for scratch)",
+                i, max_vreg, max_vreg, scratch.iter().map(|s| s.0).max().unwrap_or(max_vreg),
+            ));
+        }
         emit_trace_op(e, op, dst, &reg_map, scratch)?;
         reg_map.push(dst);
     }

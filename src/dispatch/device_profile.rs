@@ -30,6 +30,10 @@ pub enum IsaLevel {
     Avx2,
     Avx512,
     Neon,
+    /// ARM SVE (Scalable Vector Extension) — runtime vector length 128..2048 bits.
+    Sve,
+    /// ARM SVE2 — superset of SVE with additional integer/crypto/bitmanip instructions.
+    Sve2,
 }
 
 /// Unified hardware profile for the inference compiler.
@@ -126,6 +130,7 @@ impl DeviceProfile {
             IsaLevel::Avx512 => 32,
             IsaLevel::Avx2 => 16,
             IsaLevel::Neon => 32,
+            IsaLevel::Sve | IsaLevel::Sve2 => 32, // z0-z31
             IsaLevel::Scalar => 0,
         }
     }
@@ -138,6 +143,9 @@ impl DeviceProfile {
             IsaLevel::Avx512 => 64,
             IsaLevel::Avx2 => 32,
             IsaLevel::Neon => 16,
+            // SVE: runtime-determined, return minimum guaranteed (128-bit).
+            // Actual VL is queried at runtime via RDVL.
+            IsaLevel::Sve | IsaLevel::Sve2 => self.hw_info.isa.sve_vl_bytes.max(16),
             IsaLevel::Scalar => 4, // single f32
         }
     }
@@ -328,6 +336,13 @@ fn detect_isa_level(arch: MicroArch) -> IsaLevel {
     }
     #[cfg(target_arch = "aarch64")]
     {
+        let hw = crate::autotuning::HwInfo::detect();
+        if hw.isa.sve2 {
+            return IsaLevel::Sve2;
+        }
+        if hw.isa.sve {
+            return IsaLevel::Sve;
+        }
         return IsaLevel::Neon;
     }
     #[allow(unreachable_code)]
@@ -372,7 +387,10 @@ mod tests {
             IsaLevel::Avx2 | IsaLevel::Avx512
         ));
         #[cfg(target_arch = "aarch64")]
-        assert_eq!(profile.isa, IsaLevel::Neon);
+        assert!(matches!(
+            profile.isa,
+            IsaLevel::Neon | IsaLevel::Sve | IsaLevel::Sve2
+        ));
     }
 
     #[test]

@@ -192,6 +192,8 @@ impl Profiler {
             crate::cpu_kernels::IsaLevel::Avx512 => "avx512",
             crate::cpu_kernels::IsaLevel::Avx2 => "avx2",
             crate::cpu_kernels::IsaLevel::Neon => "neon",
+            crate::cpu_kernels::IsaLevel::Sve => "sve",
+            crate::cpu_kernels::IsaLevel::Sve2 => "sve2",
             crate::cpu_kernels::IsaLevel::Scalar => "scalar",
         };
         let mut report = ProfileReport::new(self.peak, isa_str);

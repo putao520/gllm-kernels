@@ -11,6 +11,50 @@
 
 use super::CodegenOutput;
 
+// ── SIMD width model ────────────────────────────────────────────────────────
+
+/// SIMD vector width — allows mixed-width emission within a single kernel.
+///
+/// A codegen instance can switch between widths via `push_width`/`pop_width`,
+/// enabling patterns like: zmm main loop → ymm epilogue → xmm scalar tail.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum SimdWidth {
+    /// 128-bit (xmm / NEON 128-bit): 4 × f32
+    W128,
+    /// 256-bit (ymm / SVE 256-bit): 8 × f32
+    W256,
+    /// 512-bit (zmm / SVE 512-bit): 16 × f32
+    W512,
+    /// SVE runtime vector length (hardware-determined, 128..2048 bits)
+    Wvl,
+}
+
+impl SimdWidth {
+    /// Number of f32 lanes for this width.
+    ///
+    /// Returns `None` for `Wvl` since it's runtime-determined.
+    pub fn f32_lanes(&self) -> Option<usize> {
+        match self {
+            SimdWidth::W128 => Some(4),
+            SimdWidth::W256 => Some(8),
+            SimdWidth::W512 => Some(16),
+            SimdWidth::Wvl => None,
+        }
+    }
+
+    /// Width in bytes.
+    ///
+    /// Returns `None` for `Wvl` since it's runtime-determined.
+    pub fn bytes(&self) -> Option<usize> {
+        match self {
+            SimdWidth::W128 => Some(16),
+            SimdWidth::W256 => Some(32),
+            SimdWidth::W512 => Some(64),
+            SimdWidth::Wvl => None,
+        }
+    }
+}
+
 // ── Virtual register model ──────────────────────────────────────────────────
 
 /// Virtual SIMD register — a lightweight index mapped to physical registers
@@ -192,9 +236,54 @@ pub trait SimdOps {
 
     /// Call an external function pointer (for pack_a/pack_b/norm).
     fn call_fn_ptr(&mut self, addr: u64) -> Result<(), String>;
+    // ── Horizontal reductions ────────────────────────────────────────────
+
+    /// Horizontal sum: reduce all lanes of `src` to a scalar, broadcast back
+    /// into all lanes of `dst`.
+    fn vhsum(&mut self, dst: VReg, src: VReg) -> Result<(), String>;
+
+    /// Horizontal max: reduce all lanes of `src` to a scalar max, broadcast
+    /// back into all lanes of `dst`.
+    fn vhmax(&mut self, dst: VReg, src: VReg) -> Result<(), String>;
+
+    // ── Masked operations (AVX-512 k-mask; no-op on AVX2/NEON) ──────────
+
+    /// Set tail mask for the next masked load/store.
+    /// AVX-512: writes k1 register with `(1 << remainder) - 1`.
+    /// AVX2/NEON: stores remainder for scalar fallback (no-op if 0).
+    fn set_tail_mask(&mut self, remainder: usize) -> Result<(), String>;
+
+    /// Masked load: inactive lanes are zeroed. Requires prior `set_tail_mask`.
+    fn vload_masked(&mut self, dst: VReg, mem: MemOperand) -> Result<(), String>;
+
+    /// Masked store: only active lanes are written. Requires prior `set_tail_mask`.
+    fn vstore_masked(&mut self, mem: MemOperand, src: VReg) -> Result<(), String>;
+
+    // ── Additional FMA variant ───────────────────────────────────────────
+
+    /// dst = -(a * b) + dst  (fused negate-multiply-add)
+    fn vfnmadd231(&mut self, dst: VReg, a: VReg, b: VReg) -> Result<(), String>;
+
 
     // ── NOP placeholder ─────────────────────────────────────────────────
 
     /// Emit a no-op instruction.
-    fn emit_nop(&mut self) -> Result<(), String>;
+    fn emit_metadata_nop(&mut self) -> Result<(), String>;
+
+    // ── Mixed-width support ─────────────────────────────────────────────
+
+    /// Current SIMD width of this emitter.
+    fn current_simd_width(&self) -> SimdWidth;
+
+    /// Number of f32 lanes at the current width.
+    fn width_f32_lanes(&self) -> usize;
+
+    /// Temporarily switch to a different SIMD width.
+    ///
+    /// Returns the previous width (to pass to `pop_width`).
+    /// Backends that don't support the requested width return `Err`.
+    fn push_width(&mut self, w: SimdWidth) -> Result<SimdWidth, String>;
+
+    /// Restore the previous SIMD width after a `push_width` call.
+    fn pop_width(&mut self, prev: SimdWidth) -> Result<(), String>;
 }

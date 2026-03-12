@@ -58,7 +58,7 @@ pub struct BlockQ3K {
     pub hmask: [u8; 32],
     pub qs: [u8; 64],
     pub scales: [u8; 12],
-    pub d: f32,
+    pub d: f16,
 }
 
 /// A Q4_K block containing 256 packed 4-bit values + scales/min.
@@ -75,11 +75,11 @@ pub struct BlockQ4K {
 #[repr(C)]
 #[derive(Debug, Clone, Copy)]
 pub struct BlockQ5K {
+    pub d: f16,
+    pub dmin: f16,
     pub scales: [u8; 12],
     pub qh: [u8; 32],
     pub qs: [u8; 128],
-    pub d: f16,
-    pub dmin: f16,
 }
 
 /// A Q6_K block containing 256 packed 6-bit values.
@@ -89,7 +89,7 @@ pub struct BlockQ6K {
     pub qs: [u8; 128],
     pub qh: [u8; 64],
     pub scales: [u8; 16],
-    pub d: f32,
+    pub d: f16,
 }
 
 /// A Q8_K block containing 256 packed 8-bit values + scales.

@@ -11,6 +11,19 @@ pub struct OpTrace {
     pub signature: ScalarFnSignature,
 }
 
+/// Second-pass reduction descriptor (e.g. exp-sum in Softmax).
+#[derive(Debug, Clone)]
+pub struct ReductionSecondPass {
+    /// Identity element for the second reduction (e.g. 0.0 for sum).
+    pub identity: f64,
+    /// Per-element transform before combining.
+    /// Input(0) = current element, Input(1) = broadcast scalar from first pass.
+    pub element_transform: Vec<TraceOp>,
+    /// Combine step for the second reduction (e.g. add for sum).
+    /// Input(0) = accumulator, Input(1) = transformed element.
+    pub combine: Vec<TraceOp>,
+}
+
 /// Computational pattern — determines how Phase 3 vectorizes the operator.
 #[derive(Debug, Clone)]
 pub enum ComputePattern {
@@ -25,9 +38,19 @@ pub enum ComputePattern {
         num_outputs: usize,
     },
     /// Reduction with identity element and combine step.
+    ///
+    /// For multi-pass reductions (e.g. Softmax = max → exp-sum → normalize):
+    /// - `combine`: first-pass reduction (e.g. max)
+    /// - `second_pass`: optional second-pass with per-element transform + reduction
+    /// - `normalize`: optional final per-element normalization
     Reduction {
         identity: f64,
         combine: Vec<TraceOp>,
+        /// Second reduction pass (e.g. exp-sum in Softmax).
+        second_pass: Option<Box<ReductionSecondPass>>,
+        /// Final per-element normalization (e.g. multiply by inv_sum).
+        /// Input(0) = element from second_pass, Input(1) = broadcast scalar from second_pass reduction.
+        normalize: Option<Vec<TraceOp>>,
     },
     /// Two-pass normalize: reduce → finalize → per-element transform.
     NormLike {

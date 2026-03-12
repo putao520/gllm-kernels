@@ -45,6 +45,15 @@ pub struct BufferAllocation {
     pub bytes_saved: usize,
 }
 
+impl BufferAllocation {
+    /// Look up scratchpad offset for an intermediate tensor.
+    pub fn offset_of(&self, tid: TensorId) -> Option<usize> {
+        self.slots.iter()
+            .find(|s| s.tensor_id == tid)
+            .map(|s| s.offset)
+    }
+}
+
 /// Analyze tensor lifetimes from the fusion plan's execution order.
 ///
 /// Only intermediate tensors are included — graph inputs and outputs are

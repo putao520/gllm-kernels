@@ -153,13 +153,14 @@ impl SemanticDAG {
             OpKind::RoPE { .. } | OpKind::Transpose { .. } | OpKind::Reshape { .. } => {
                 OpClass::Injective
             }
-            OpKind::Softmax | OpKind::RmsNorm { .. } | OpKind::LayerNorm { .. } => {
+            OpKind::Softmax | OpKind::RmsNorm { .. } | OpKind::LayerNorm { .. } | OpKind::MeanPool { .. } => {
                 OpClass::Reduction
             }
             OpKind::Gemm { .. } | OpKind::GemmBias { .. } | OpKind::QuantGemm { .. } => {
                 OpClass::Gemm
             }
             OpKind::Dequantize { .. } => OpClass::ElemWise,
+            OpKind::MultiHeadAttention { .. } => OpClass::Opaque,
         }
     }
 
@@ -271,7 +272,9 @@ mod tests {
         assert_eq!(
             SemanticDAG::derive_op_class(&ComputePattern::Reduction {
                 identity: 0.0,
-                combine: vec![]
+                combine: vec![],
+                second_pass: None,
+                normalize: None,
             }),
             OpClass::Reduction
         );

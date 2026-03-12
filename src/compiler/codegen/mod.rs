@@ -16,12 +16,17 @@
 //! (`x86_64::jit::X86CodeGen`). aarch64 backend uses dynasm-rs (BLIS 5-level loop nesting, NEON tanh/log/exp real implementations).
 
 pub mod x86_64;
-pub mod aarch64;
+pub mod x86_amx;
+pub mod tile_ops;
+pub mod aarch64_dynasm;
+pub mod sve;
 pub mod emitter;
 pub mod simd_ops;
 pub mod algorithm;
 pub mod math_approx;
 pub mod target_desc;
+pub mod isa_scheduler;
+pub mod completeness_test;
 
 pub use emitter::{MachineCodeEmitter, PlatformBackend, Platform};
 

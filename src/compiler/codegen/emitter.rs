@@ -5,10 +5,10 @@
 //! Platform differences in Phase 3 code generation are encapsulated via two traits:
 //!
 //! - `MachineCodeEmitter`: the code-generation interface (emit_plan, simd_width).
-//!   Implemented by `X86CodeGen` (jit-x86) and `AArch64CodeGen` (jit-aarch64).
+//!   Implemented by `X86CodeGen` (jit-x86) and `DynasmAArch64CodeGen` (jit-aarch64).
 //!
 //! - `PlatformBackend`: factory + platform metadata. Implemented by `X86Backend`
-//!   and `Arm64Backend`. The compiler pipeline depends only on `PlatformBackend`,
+//!   and `DynasmArm64Backend`. The compiler pipeline depends only on `PlatformBackend`,
 //!   not on the concrete emitter type.
 //!
 //! ## Legacy
@@ -159,7 +159,7 @@ pub fn emit_stub_code(graph: &CompilerGraph) -> CodegenOutput {
     let code = super::x86_64::emit_stub().code;
 
     #[cfg(target_arch = "aarch64")]
-    let code = super::aarch64::emit_stub().code;
+    let code = super::aarch64_dynasm::emit_stub().code;
 
     #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
     let code = vec![0xC3]; // ret

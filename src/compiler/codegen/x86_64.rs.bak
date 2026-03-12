@@ -70,14 +70,6 @@ pub mod jit {
         weight_layout: Option<WeightLayout>,
         /// Labels allocated by SimdOps::alloc_label / define_label / jump.
         simd_labels: Vec<CodeLabel>,
-        /// Width stack for push_width/pop_width mixed-width emission.
-        width_stack: Vec<crate::compiler::codegen::simd_ops::SimdWidth>,
-        /// Whether the target has AVX-512 capability (immutable hardware flag).
-        /// Unlike `use_avx512` which tracks the *current* emission width,
-        /// this records the hardware capability for push_width(W512) validation.
-        has_avx512: bool,
-        /// Whether the target has AMX tile instructions (SPR+).
-        has_amx: bool,
     }
 
     /// How `Input(idx)` nodes are materialised in trace evaluation.
@@ -128,297 +120,6 @@ pub mod jit {
         panic!("unknown zmm register")
     }
 
-        /// Macro: generates trace-on-stack evaluator body for both AVX2 (ymm) and AVX-512 (zmm).
-    ///
-    /// The two ISA paths are structurally identical — they differ only in register
-    /// width, scratch register numbers, a handful of ISA-specific instructions, and
-    /// the scalar-tail load strategy.  This macro captures the shared logic once.
-    macro_rules! trace_on_stack_body {
-        (
-            $self_:expr, $acc:expr, $body:expr, $mode:expr,
-            simd_bytes: $simd_bytes:expr,
-            ptr_fn: $ptr_fn:ident,
-            s0: $s0:expr, s1: $s1:expr,
-            math_s0: $math_s0:expr, math_s1: $math_s1:expr,
-            broadcast_reg: $broadcast_reg:expr,
-            mean_reg: $mean_reg:expr,
-            scale_reg: $scale_reg:expr,
-            zero_instr: $zero_instr:ident,
-            rcp_instr: $rcp_instr:ident,
-            rsqrt_instr: $rsqrt_instr:ident,
-            emit_exp: $emit_exp:ident,
-            emit_tanh: $emit_tanh:ident,
-            emit_log: $emit_log:ident,
-            scalar_tail_load: $scalar_tail_load:expr
-        ) => {{
-            let n = $body.len();
-            if n == 0 {
-                return Ok(());
-            }
-
-            let frame_size = (n as i32) * $simd_bytes;
-            $self_.asm.sub(rsp, frame_size).map_err(|e| e.to_string())?;
-
-            let slot_off = |i: u32| -> i32 { (i as i32) * $simd_bytes };
-
-            for (i, op) in $body.iter().enumerate() {
-                let i32_idx = i as u32;
-                match op {
-                    TraceOp::Input(idx) => {
-                        match &$mode {
-                            InputMode::AccOnly => {
-                                $self_.asm.vmovups($ptr_fn(rsp + slot_off(i32_idx)), $acc)
-                                    .map_err(|e| e.to_string())?;
-                            }
-                            InputMode::WithBias { bias_disp } => {
-                                if *idx == 0 {
-                                    $self_.asm.vmovups($ptr_fn(rsp + slot_off(i32_idx)), $acc)
-                                        .map_err(|e| e.to_string())?;
-                                } else {
-                                    $self_.asm.vmovups($s0, $ptr_fn(rax + *bias_disp))
-                                        .map_err(|e| e.to_string())?;
-                                    $self_.asm.vmovups($ptr_fn(rsp + slot_off(i32_idx)), $s0)
-                                        .map_err(|e| e.to_string())?;
-                                }
-                            }
-                            InputMode::Elementwise { is_binary, scalar_tail } => {
-                                if *idx == 0 {
-                                    $self_.asm.vmovups($ptr_fn(rsp + slot_off(i32_idx)), $acc)
-                                        .map_err(|e| e.to_string())?;
-                                } else if *idx == 1 && *is_binary {
-                                    if *scalar_tail {
-                                        #[allow(clippy::redundant_closure_call)]
-                                        ($scalar_tail_load)(&mut $self_.asm)?;
-                                    } else {
-                                        $self_.asm.vmovups($s0, $ptr_fn(rsi + rbx))
-                                            .map_err(|e| e.to_string())?;
-                                    }
-                                    $self_.asm.vmovups($ptr_fn(rsp + slot_off(i32_idx)), $s0)
-                                        .map_err(|e| e.to_string())?;
-                                } else {
-                                    $self_.asm.vmovups($ptr_fn(rsp + slot_off(i32_idx)), $acc)
-                                        .map_err(|e| e.to_string())?;
-                                }
-                            }
-                            InputMode::ReductionCombine => {
-                                if *idx == 0 {
-                                    $self_.asm.vmovups($ptr_fn(rsp + slot_off(i32_idx)), $acc)
-                                        .map_err(|e| e.to_string())?;
-                                } else {
-                                    $self_.asm.vmovups($s0, $ptr_fn(rdi + rbx))
-                                        .map_err(|e| e.to_string())?;
-                                    $self_.asm.vmovups($ptr_fn(rsp + slot_off(i32_idx)), $s0)
-                                        .map_err(|e| e.to_string())?;
-                                }
-                            }
-                            InputMode::WithBroadcast => {
-                                if *idx == 0 {
-                                    $self_.asm.vmovups($s0, $ptr_fn(rdi + rbx))
-                                        .map_err(|e| e.to_string())?;
-                                    $self_.asm.vmovups($ptr_fn(rsp + slot_off(i32_idx)), $s0)
-                                        .map_err(|e| e.to_string())?;
-                                } else {
-                                    $self_.asm.vmovups($ptr_fn(rsp + slot_off(i32_idx)), $broadcast_reg)
-                                        .map_err(|e| e.to_string())?;
-                                }
-                            }
-                            InputMode::NormTransform { has_mean, has_weight, has_bias } => {
-                                match *idx {
-                                    0 => {
-                                        $self_.asm.vmovups($s0, $ptr_fn(rdi + rbx))
-                                            .map_err(|e| e.to_string())?;
-                                        $self_.asm.vmovups($ptr_fn(rsp + slot_off(i32_idx)), $s0)
-                                            .map_err(|e| e.to_string())?;
-                                    }
-                                    1 => {
-                                        if *has_mean {
-                                            $self_.asm.vmovups($ptr_fn(rsp + slot_off(i32_idx)), $mean_reg)
-                                                .map_err(|e| e.to_string())?;
-                                        } else {
-                                            // RmsNorm: Input(1) = scale
-                                            $self_.asm.vmovups($ptr_fn(rsp + slot_off(i32_idx)), $scale_reg)
-                                                .map_err(|e| e.to_string())?;
-                                        }
-                                    }
-                                    2 => {
-                                        // scale — only used when has_mean (LayerNorm)
-                                        $self_.asm.vmovups($ptr_fn(rsp + slot_off(i32_idx)), $scale_reg)
-                                            .map_err(|e| e.to_string())?;
-                                    }
-                                    3 => {
-                                        // weight from [rdx+rbx]
-                                        if *has_weight {
-                                            $self_.asm.vmovups($s0, $ptr_fn(rdx + rbx))
-                                                .map_err(|e| e.to_string())?;
-                                        } else {
-                                            let one = $self_.const_f32(1.0);
-                                            $self_.asm.vbroadcastss($s0, dword_ptr(one))
-                                                .map_err(|e| e.to_string())?;
-                                        }
-                                        $self_.asm.vmovups($ptr_fn(rsp + slot_off(i32_idx)), $s0)
-                                            .map_err(|e| e.to_string())?;
-                                    }
-                                    4 => {
-                                        // bias from [rcx+rbx]
-                                        if *has_bias {
-                                            $self_.asm.vmovups($s0, $ptr_fn(rcx + rbx))
-                                                .map_err(|e| e.to_string())?;
-                                        } else {
-                                            $self_.asm.$zero_instr($s0, $s0, $s0)
-                                                .map_err(|e| e.to_string())?;
-                                        }
-                                        $self_.asm.vmovups($ptr_fn(rsp + slot_off(i32_idx)), $s0)
-                                            .map_err(|e| e.to_string())?;
-                                    }
-                                    _ => {
-                                        $self_.asm.vmovups($ptr_fn(rsp + slot_off(i32_idx)), $acc)
-                                            .map_err(|e| e.to_string())?;
-                                    }
-                                }
-                            }
-                        }
-                    }
-                    TraceOp::Const(v) => {
-                        let label = $self_.const_f32(*v as f32);
-                        $self_.asm.vbroadcastss($s0, dword_ptr(label))
-                            .map_err(|e| e.to_string())?;
-                        $self_.asm.vmovups($ptr_fn(rsp + slot_off(i32_idx)), $s0)
-                            .map_err(|e| e.to_string())?;
-                    }
-                    TraceOp::Add(a, b) => {
-                        $self_.asm.vmovups($s0, $ptr_fn(rsp + slot_off(*a)))
-                            .map_err(|e| e.to_string())?;
-                        $self_.asm.vaddps($s0, $s0, $ptr_fn(rsp + slot_off(*b)))
-                            .map_err(|e| e.to_string())?;
-                        $self_.asm.vmovups($ptr_fn(rsp + slot_off(i32_idx)), $s0)
-                            .map_err(|e| e.to_string())?;
-                    }
-                    TraceOp::Sub(a, b) => {
-                        $self_.asm.vmovups($s0, $ptr_fn(rsp + slot_off(*a)))
-                            .map_err(|e| e.to_string())?;
-                        $self_.asm.vsubps($s0, $s0, $ptr_fn(rsp + slot_off(*b)))
-                            .map_err(|e| e.to_string())?;
-                        $self_.asm.vmovups($ptr_fn(rsp + slot_off(i32_idx)), $s0)
-                            .map_err(|e| e.to_string())?;
-                    }
-                    TraceOp::Mul(a, b) => {
-                        $self_.asm.vmovups($s0, $ptr_fn(rsp + slot_off(*a)))
-                            .map_err(|e| e.to_string())?;
-                        $self_.asm.vmulps($s0, $s0, $ptr_fn(rsp + slot_off(*b)))
-                            .map_err(|e| e.to_string())?;
-                        $self_.asm.vmovups($ptr_fn(rsp + slot_off(i32_idx)), $s0)
-                            .map_err(|e| e.to_string())?;
-                    }
-                    TraceOp::Div(a, b) => {
-                        $self_.asm.vmovups($s0, $ptr_fn(rsp + slot_off(*a)))
-                            .map_err(|e| e.to_string())?;
-                        $self_.asm.vdivps($s0, $s0, $ptr_fn(rsp + slot_off(*b)))
-                            .map_err(|e| e.to_string())?;
-                        $self_.asm.vmovups($ptr_fn(rsp + slot_off(i32_idx)), $s0)
-                            .map_err(|e| e.to_string())?;
-                    }
-                    TraceOp::Fma(a, b, c) => {
-                        $self_.asm.vmovups($s0, $ptr_fn(rsp + slot_off(*c)))
-                            .map_err(|e| e.to_string())?;
-                        $self_.asm.vmovups($s1, $ptr_fn(rsp + slot_off(*a)))
-                            .map_err(|e| e.to_string())?;
-                        $self_.asm.vfmadd231ps($s0, $s1, $ptr_fn(rsp + slot_off(*b)))
-                            .map_err(|e| e.to_string())?;
-                        $self_.asm.vmovups($ptr_fn(rsp + slot_off(i32_idx)), $s0)
-                            .map_err(|e| e.to_string())?;
-                    }
-                    TraceOp::Neg(a) => {
-                        $self_.asm.$zero_instr($s0, $s0, $s0)
-                            .map_err(|e| e.to_string())?;
-                        $self_.asm.vsubps($s0, $s0, $ptr_fn(rsp + slot_off(*a)))
-                            .map_err(|e| e.to_string())?;
-                        $self_.asm.vmovups($ptr_fn(rsp + slot_off(i32_idx)), $s0)
-                            .map_err(|e| e.to_string())?;
-                    }
-                    TraceOp::Abs(a) => {
-                        let abs_mask = $self_.const_f32(f32::from_bits(0x7FFF_FFFF));
-                        $self_.asm.vmovups($s0, $ptr_fn(rsp + slot_off(*a)))
-                            .map_err(|e| e.to_string())?;
-                        $self_.asm.vbroadcastss($s1, dword_ptr(abs_mask))
-                            .map_err(|e| e.to_string())?;
-                        $self_.asm.vandps($s0, $s0, $s1)
-                            .map_err(|e| e.to_string())?;
-                        $self_.asm.vmovups($ptr_fn(rsp + slot_off(i32_idx)), $s0)
-                            .map_err(|e| e.to_string())?;
-                    }
-                    TraceOp::Exp(a) => {
-                        $self_.asm.vmovups($s0, $ptr_fn(rsp + slot_off(*a)))
-                            .map_err(|e| e.to_string())?;
-                        $self_.$emit_exp($s1, $s0, [$s0, $math_s0, $math_s1])?;
-                        $self_.asm.vmovups($ptr_fn(rsp + slot_off(i32_idx)), $s1)
-                            .map_err(|e| e.to_string())?;
-                    }
-                    TraceOp::Sqrt(a) => {
-                        $self_.asm.vmovups($s0, $ptr_fn(rsp + slot_off(*a)))
-                            .map_err(|e| e.to_string())?;
-                        $self_.asm.vsqrtps($s0, $s0)
-                            .map_err(|e| e.to_string())?;
-                        $self_.asm.vmovups($ptr_fn(rsp + slot_off(i32_idx)), $s0)
-                            .map_err(|e| e.to_string())?;
-                    }
-                    TraceOp::Rsqrt(a) => {
-                        $self_.asm.vmovups($s0, $ptr_fn(rsp + slot_off(*a)))
-                            .map_err(|e| e.to_string())?;
-                        $self_.asm.$rsqrt_instr($s0, $s0)
-                            .map_err(|e| e.to_string())?;
-                        $self_.asm.vmovups($ptr_fn(rsp + slot_off(i32_idx)), $s0)
-                            .map_err(|e| e.to_string())?;
-                    }
-                    TraceOp::Tanh(a) => {
-                        $self_.asm.vmovups($s0, $ptr_fn(rsp + slot_off(*a)))
-                            .map_err(|e| e.to_string())?;
-                        $self_.$emit_tanh($s1, $s0, [$s0, $math_s0, $math_s1])?;
-                        $self_.asm.vmovups($ptr_fn(rsp + slot_off(i32_idx)), $s1)
-                            .map_err(|e| e.to_string())?;
-                    }
-                    TraceOp::Recip(a) => {
-                        $self_.asm.vmovups($s0, $ptr_fn(rsp + slot_off(*a)))
-                            .map_err(|e| e.to_string())?;
-                        $self_.asm.$rcp_instr($s0, $s0)
-                            .map_err(|e| e.to_string())?;
-                        $self_.asm.vmovups($ptr_fn(rsp + slot_off(i32_idx)), $s0)
-                            .map_err(|e| e.to_string())?;
-                    }
-                    TraceOp::Log(a) => {
-                        $self_.asm.vmovups($s0, $ptr_fn(rsp + slot_off(*a)))
-                            .map_err(|e| e.to_string())?;
-                        $self_.$emit_log($s1, $s0, [$s0, $math_s0, $math_s1])?;
-                        $self_.asm.vmovups($ptr_fn(rsp + slot_off(i32_idx)), $s1)
-                            .map_err(|e| e.to_string())?;
-                    }
-                    TraceOp::Max(a, b) => {
-                        $self_.asm.vmovups($s0, $ptr_fn(rsp + slot_off(*a)))
-                            .map_err(|e| e.to_string())?;
-                        $self_.asm.vmaxps($s0, $s0, $ptr_fn(rsp + slot_off(*b)))
-                            .map_err(|e| e.to_string())?;
-                        $self_.asm.vmovups($ptr_fn(rsp + slot_off(i32_idx)), $s0)
-                            .map_err(|e| e.to_string())?;
-                    }
-                    TraceOp::Min(a, b) => {
-                        $self_.asm.vmovups($s0, $ptr_fn(rsp + slot_off(*a)))
-                            .map_err(|e| e.to_string())?;
-                        $self_.asm.vminps($s0, $s0, $ptr_fn(rsp + slot_off(*b)))
-                            .map_err(|e| e.to_string())?;
-                        $self_.asm.vmovups($ptr_fn(rsp + slot_off(i32_idx)), $s0)
-                            .map_err(|e| e.to_string())?;
-                    }
-                }
-            }
-
-            $self_.asm.vmovups($acc, $ptr_fn(rsp + slot_off((n - 1) as u32)))
-                .map_err(|e| e.to_string())?;
-
-            $self_.asm.add(rsp, frame_size).map_err(|e| e.to_string())?;
-
-            Ok(())
-        }};
-    }
-
     impl X86CodeGen {
         /// Create a new code generator configured for the detected hardware.
         pub fn new(profile: &DeviceProfile) -> Self {
@@ -436,9 +137,6 @@ pub mod jit {
                 jit_params: None,
                 weight_layout: None,
                 simd_labels: Vec::new(),
-                width_stack: Vec::new(),
-                has_avx512: use_avx512,
-                has_amx: profile.kernel_config.has_amx,
             }
         }
 
@@ -450,22 +148,6 @@ pub mod jit {
         /// Number of f32 elements per SIMD register (8 for AVX2, 16 for AVX-512).
         pub fn simd_width(&self) -> usize {
             self.simd_width
-        }
-
-        /// Build HwCapabilityMatrix from the current codegen state.
-        pub fn hw_capability_matrix(&self) -> crate::compiler::codegen::isa_scheduler::HwCapabilityMatrix {
-            use crate::compiler::codegen::simd_ops::SimdWidth;
-            use crate::compiler::codegen::tile_ops::TileAccelKind;
-            let mut widths = vec![SimdWidth::W128, SimdWidth::W256];
-            if self.use_avx512 { widths.push(SimdWidth::W512); }
-            crate::compiler::codegen::isa_scheduler::HwCapabilityMatrix {
-                simd_widths: widths,
-                has_tile_accel: self.has_amx,
-                tile_accel: if self.has_amx { Some(TileAccelKind::Amx) } else { None },
-                peak_gflops_f32: 0.0,
-                peak_bandwidth_gbs: 0.0,
-                roofline_crossover: 0.0,
-            }
         }
 
         /// Set JIT tuning parameters for code generation.
@@ -960,9 +642,6 @@ pub mod jit {
                 OpKind::MultiHeadAttention { seq_len, num_heads, head_dim } => {
                     self.emit_multi_head_attention(*seq_len, *num_heads, *head_dim)
                 }
-                OpKind::MeanPool { seq_len, hidden } => {
-                    self.emit_mean_pool(*seq_len, *hidden)
-                }
                 _ => {
                     if let Some(reg) = registry {
                         let key = ScalarOpRegistry::key_from_op_kind(&op.kind);
@@ -978,95 +657,13 @@ pub mod jit {
                                 ComputePattern::Reduction { .. } => {
                                     self.emit_standalone_reduction(group, graph, profile, reg)
                                 }
-                                other => Err(format!("x86_64: unhandled ComputePattern {:?} for {:?}", other, op.kind)),
+                                _ => self.emit_nop_placeholder(),
                             };
                         }
                     }
-                    Err(format!("x86_64: no registry entry for {:?}", op.kind))
+                    self.emit_nop_placeholder()
                 }
             }
-        }
-
-        /// Emit mean-pool: average `seq_len` rows of `hidden` f32 elements.
-        ///
-        /// ABI contract (same as other standalone ops):
-        ///   rdi = input ptr  \[seq_len * hidden f32\]
-        ///   r8  = output ptr \[hidden f32\]
-        fn emit_mean_pool(
-            &mut self,
-            seq_len: usize,
-            hidden: usize,
-        ) -> Result<(), String> {
-            // Broadcast 1.0 / seq_len for the final scaling multiply
-            let inv_n = 1.0f32 / seq_len as f32;
-            let inv_label = self.const_f32(inv_n);
-
-            let simd_w = self.simd_width; // 8 for AVX2, 16 for AVX-512
-            let vec_bytes = simd_w * 4;   // 32 for AVX2, 64 for AVX-512
-            let vec_count = hidden / simd_w;
-            let tail = hidden % simd_w;
-
-            // ── SIMD columns (zmm for AVX-512, ymm for AVX2) ──
-            for col in 0..vec_count {
-                let col_byte_off = (col * vec_bytes) as i32;
-
-                if self.use_avx512 {
-                    // ── 16-wide (zmm) path ──
-                    self.asm.vmovups(zmm0, zmmword_ptr(rdi + col_byte_off))
-                        .map_err(|e| e.to_string())?;
-                    for row in 1..seq_len {
-                        let off = (row * hidden * 4 + col * vec_bytes) as i32;
-                        self.asm.vaddps(zmm0, zmm0, zmmword_ptr(rdi + off))
-                            .map_err(|e| e.to_string())?;
-                    }
-                    self.asm.vbroadcastss(zmm1, dword_ptr(inv_label))
-                        .map_err(|e| e.to_string())?;
-                    self.asm.vmulps(zmm0, zmm0, zmm1)
-                        .map_err(|e| e.to_string())?;
-                    self.asm.vmovups(zmmword_ptr(r8 + col_byte_off), zmm0)
-                        .map_err(|e| e.to_string())?;
-                } else {
-                    // ── 8-wide (ymm) path ──
-                    self.asm.vmovups(ymm0, ymmword_ptr(rdi + col_byte_off))
-                        .map_err(|e| e.to_string())?;
-                    for row in 1..seq_len {
-                        let off = (row * hidden * 4 + col * vec_bytes) as i32;
-                        self.asm.vaddps(ymm0, ymm0, ymmword_ptr(rdi + off))
-                            .map_err(|e| e.to_string())?;
-                    }
-                    self.asm.vbroadcastss(ymm1, dword_ptr(inv_label))
-                        .map_err(|e| e.to_string())?;
-                    self.asm.vmulps(ymm0, ymm0, ymm1)
-                        .map_err(|e| e.to_string())?;
-                    self.asm.vmovups(ymmword_ptr(r8 + col_byte_off), ymm0)
-                        .map_err(|e| e.to_string())?;
-                }
-            }
-
-            // ── Scalar tail ──
-            if tail > 0 {
-                let base = (vec_count * vec_bytes) as i32;
-                for i in 0..tail {
-                    let col_off = base + (i * 4) as i32;
-                    // First row
-                    self.asm.vmovss(xmm0, dword_ptr(rdi + col_off))
-                        .map_err(|e| e.to_string())?;
-                    // Sum remaining rows
-                    for row in 1..seq_len {
-                        let off = (row * hidden * 4) as i32 + col_off;
-                        self.asm.vaddss(xmm0, xmm0, dword_ptr(rdi + off))
-                            .map_err(|e| e.to_string())?;
-                    }
-                    // Scale
-                    self.asm.vmulss(xmm0, xmm0, dword_ptr(inv_label))
-                        .map_err(|e| e.to_string())?;
-                    // Store
-                    self.asm.vmovss(dword_ptr(r8 + col_off), xmm0)
-                        .map_err(|e| e.to_string())?;
-                }
-            }
-
-            Ok(())
         }
 
         /// Emit multi-head attention as fully JIT-compiled SIMD code.
@@ -2152,7 +1749,7 @@ pub mod jit {
             };
 
             if elem_count == 0 {
-                return Err("elementwise chain: elem_count=0".into());
+                return self.emit_nop_placeholder();
             }
 
             let mut trace_info: Vec<(Vec<TraceOp>, bool)> = Vec::new();
@@ -2189,8 +1786,13 @@ pub mod jit {
                 return self.emit_elementwise_chain_hardcoded(group, graph, elem_count);
             }
 
-            let simd_w = self.simd_width; // 8 for AVX2, 16 for AVX-512
-            let simd_bytes = (simd_w * 4) as i32; // 32 or 64
+            if self.use_avx512 {
+                return self.emit_elementwise_chain_avx512(
+                    &trace_info, elem_count, profile,
+                );
+            }
+
+            let simd_w = self.simd_width; // 8 for AVX2
             let vec_count = elem_count / simd_w;
             let tail = elem_count % simd_w;
 
@@ -2204,6 +1806,7 @@ pub mod jit {
 
             let unroll = 4usize;
             let unrolled_vecs = (vec_count / unroll) * unroll;
+            let remainder_vecs = vec_count - unrolled_vecs;
 
             let unrolled_bytes = (unrolled_vecs * simd_w * 4) as i32;
             let total_vec_bytes = (vec_count * simd_w * 4) as i32;
@@ -2227,42 +1830,22 @@ pub mod jit {
                 }
 
                 for _u in 0..unroll {
-                    if self.use_avx512 {
-                        self.asm.vmovups(zmm0, zmmword_ptr(rdi + rbx))
-                            .map_err(|e| e.to_string())?;
-                    } else {
-                        self.asm.vmovups(ymm0, ymmword_ptr(rdi + rbx))
-                            .map_err(|e| e.to_string())?;
-                    }
+                    self.asm.vmovups(ymm0, ymmword_ptr(rdi + rbx))
+                        .map_err(|e| e.to_string())?;
 
                     for (body, is_binary) in &trace_info {
-                        let mode = InputMode::Elementwise { is_binary: *is_binary, scalar_tail: false };
-                        if self.use_avx512 {
-                            self.emit_trace_on_stack_zmm(zmm0, body, mode)?;
-                        } else {
-                            self.emit_trace_on_stack_ymm(ymm0, body, mode)?;
-                        }
+                        self.emit_elementwise_trace_body(ymm0, body, *is_binary, false)?;
                     }
 
-                    if self.use_avx512 {
-                        if use_nt_store {
-                            self.asm.vmovntps(zmmword_ptr(r8 + rbx), zmm0)
-                                .map_err(|e| e.to_string())?;
-                        } else {
-                            self.asm.vmovups(zmmword_ptr(r8 + rbx), zmm0)
-                                .map_err(|e| e.to_string())?;
-                        }
+                    if use_nt_store {
+                        self.asm.vmovntps(ymmword_ptr(r8 + rbx), ymm0)
+                            .map_err(|e| e.to_string())?;
                     } else {
-                        if use_nt_store {
-                            self.asm.vmovntps(ymmword_ptr(r8 + rbx), ymm0)
-                                .map_err(|e| e.to_string())?;
-                        } else {
-                            self.asm.vmovups(ymmword_ptr(r8 + rbx), ymm0)
-                                .map_err(|e| e.to_string())?;
-                        }
+                        self.asm.vmovups(ymmword_ptr(r8 + rbx), ymm0)
+                            .map_err(|e| e.to_string())?;
                     }
 
-                    self.asm.add(rbx, simd_bytes).map_err(|e| e.to_string())?;
+                    self.asm.add(rbx, 32i32).map_err(|e| e.to_string())?;
                 }
 
                 self.asm.jmp(unrolled_loop).map_err(|e| e.to_string())?;
@@ -2275,42 +1858,22 @@ pub mod jit {
             self.asm.prefetcht0(byte_ptr(rdi + rbx + prefetch_dist))
                 .map_err(|e| e.to_string())?;
 
-            if self.use_avx512 {
-                self.asm.vmovups(zmm0, zmmword_ptr(rdi + rbx))
-                    .map_err(|e| e.to_string())?;
-            } else {
-                self.asm.vmovups(ymm0, ymmword_ptr(rdi + rbx))
-                    .map_err(|e| e.to_string())?;
-            }
+            self.asm.vmovups(ymm0, ymmword_ptr(rdi + rbx))
+                .map_err(|e| e.to_string())?;
 
             for (body, is_binary) in &trace_info {
-                let mode = InputMode::Elementwise { is_binary: *is_binary, scalar_tail: false };
-                if self.use_avx512 {
-                    self.emit_trace_on_stack_zmm(zmm0, body, mode)?;
-                } else {
-                    self.emit_trace_on_stack_ymm(ymm0, body, mode)?;
-                }
+                self.emit_elementwise_trace_body(ymm0, body, *is_binary, false)?;
             }
 
-            if self.use_avx512 {
-                if use_nt_store {
-                    self.asm.vmovntps(zmmword_ptr(r8 + rbx), zmm0)
-                        .map_err(|e| e.to_string())?;
-                } else {
-                    self.asm.vmovups(zmmword_ptr(r8 + rbx), zmm0)
-                        .map_err(|e| e.to_string())?;
-                }
+            if use_nt_store {
+                self.asm.vmovntps(ymmword_ptr(r8 + rbx), ymm0)
+                    .map_err(|e| e.to_string())?;
             } else {
-                if use_nt_store {
-                    self.asm.vmovntps(ymmword_ptr(r8 + rbx), ymm0)
-                        .map_err(|e| e.to_string())?;
-                } else {
-                    self.asm.vmovups(ymmword_ptr(r8 + rbx), ymm0)
-                        .map_err(|e| e.to_string())?;
-                }
+                self.asm.vmovups(ymmword_ptr(r8 + rbx), ymm0)
+                    .map_err(|e| e.to_string())?;
             }
 
-            self.asm.add(rbx, simd_bytes).map_err(|e| e.to_string())?;
+            self.asm.add(rbx, 32i32).map_err(|e| e.to_string())?;
             self.asm.jmp(remainder_loop).map_err(|e| e.to_string())?;
 
             self.asm.set_label(&mut done_label).map_err(|e| e.to_string())?;
@@ -2319,34 +1882,135 @@ pub mod jit {
                 self.asm.sfence().map_err(|e| e.to_string())?;
             }
 
-            // Tail handling: AVX-512 uses masked load/store, AVX2 uses scalar loop
             if tail > 0 {
                 let base_bytes = (vec_count * simd_w * 4) as i32;
-                if self.use_avx512 {
-                    self.emit_set_kmask(tail)?;
-                    self.asm.mov(rbx, base_bytes as i64).map_err(|e| e.to_string())?;
-                    self.asm.vmovups(zmm0.k1().z(), zmmword_ptr(rdi + base_bytes))
+                for t in 0..tail as i32 {
+                    let off = base_bytes + t * 4;
+                    self.asm.mov(rbx, off as i64).map_err(|e| e.to_string())?;
+                    self.asm.vmovss(xmm0, dword_ptr(rdi + off))
                         .map_err(|e| e.to_string())?;
                     for (body, is_binary) in &trace_info {
-                        let mode = InputMode::Elementwise { is_binary: *is_binary, scalar_tail: true };
-                        self.emit_trace_on_stack_zmm(zmm0, body, mode)?;
+                        self.emit_elementwise_trace_body(ymm0, body, *is_binary, true)?;
                     }
-                    self.asm.vmovups(zmmword_ptr(r8 + base_bytes).k1(), zmm0)
+                    self.asm.vmovss(dword_ptr(r8 + off), xmm0)
                         .map_err(|e| e.to_string())?;
-                } else {
-                    for t in 0..tail as i32 {
-                        let off = base_bytes + t * 4;
-                        self.asm.mov(rbx, off as i64).map_err(|e| e.to_string())?;
-                        self.asm.vmovss(xmm0, dword_ptr(rdi + off))
+                }
+            }
+
+            Ok(())
+        }
+
+        /// Emit a fused elementwise chain as a single AVX-512 SIMD loop.
+        ///
+        /// AVX-512 counterpart of `emit_elementwise_chain`'s TraceOp path.
+        /// Uses zmm0 as the live value register and masked tail load/store
+        /// (`k1`) for the final partial vector.
+        fn emit_elementwise_chain_avx512(
+            &mut self,
+            trace_info: &[(Vec<TraceOp>, bool)],
+            elem_count: usize,
+            profile: &DeviceProfile,
+        ) -> Result<(), String> {
+            let simd_w = 16usize; // 16 f32 lanes per zmm
+            let vec_count = elem_count / simd_w;
+            let tail = elem_count % simd_w;
+
+            let output_bytes = elem_count * 4;
+            let (_, l2_size, _) = profile.cache_sizes();
+            let use_nt_store = output_bytes > l2_size;
+
+            let has_binary = trace_info.iter().any(|(_, b)| *b);
+            let prefetch_dist = 512i32;
+
+            let unroll = 4usize;
+            let unrolled_vecs = (vec_count / unroll) * unroll;
+            let _remainder_vecs = vec_count - unrolled_vecs;
+
+            let unrolled_bytes = (unrolled_vecs * simd_w * 4) as i32;
+            let total_vec_bytes = (vec_count * simd_w * 4) as i32;
+
+            let mut unrolled_loop = self.asm.create_label();
+            let mut remainder_loop = self.asm.create_label();
+            let mut done_label = self.asm.create_label();
+
+            self.asm.xor(rbx, rbx).map_err(|e| e.to_string())?;
+
+            if unrolled_vecs > 0 {
+                self.asm.set_label(&mut unrolled_loop).map_err(|e| e.to_string())?;
+                self.asm.cmp(rbx, unrolled_bytes).map_err(|e| e.to_string())?;
+                self.asm.jge(remainder_loop).map_err(|e| e.to_string())?;
+
+                self.asm.prefetcht0(byte_ptr(rdi + rbx + prefetch_dist))
+                    .map_err(|e| e.to_string())?;
+                if has_binary {
+                    self.asm.prefetcht0(byte_ptr(rsi + rbx + prefetch_dist))
+                        .map_err(|e| e.to_string())?;
+                }
+
+                for _u in 0..unroll {
+                    self.asm.vmovups(zmm0, zmmword_ptr(rdi + rbx))
+                        .map_err(|e| e.to_string())?;
+
+                    for (body, is_binary) in trace_info {
+                        self.emit_elementwise_trace_body_avx512(zmm0, body, *is_binary, false)?;
+                    }
+
+                    if use_nt_store {
+                        self.asm.vmovntps(zmmword_ptr(r8 + rbx), zmm0)
                             .map_err(|e| e.to_string())?;
-                        for (body, is_binary) in &trace_info {
-                            let mode = InputMode::Elementwise { is_binary: *is_binary, scalar_tail: true };
-                            self.emit_trace_on_stack_ymm(ymm0, body, mode)?;
-                        }
-                        self.asm.vmovss(dword_ptr(r8 + off), xmm0)
+                    } else {
+                        self.asm.vmovups(zmmword_ptr(r8 + rbx), zmm0)
                             .map_err(|e| e.to_string())?;
                     }
+
+                    self.asm.add(rbx, 64i32).map_err(|e| e.to_string())?;
                 }
+
+                self.asm.jmp(unrolled_loop).map_err(|e| e.to_string())?;
+            }
+
+            self.asm.set_label(&mut remainder_loop).map_err(|e| e.to_string())?;
+            self.asm.cmp(rbx, total_vec_bytes).map_err(|e| e.to_string())?;
+            self.asm.jge(done_label).map_err(|e| e.to_string())?;
+
+            self.asm.prefetcht0(byte_ptr(rdi + rbx + prefetch_dist))
+                .map_err(|e| e.to_string())?;
+
+            self.asm.vmovups(zmm0, zmmword_ptr(rdi + rbx))
+                .map_err(|e| e.to_string())?;
+
+            for (body, is_binary) in trace_info {
+                self.emit_elementwise_trace_body_avx512(zmm0, body, *is_binary, false)?;
+            }
+
+            if use_nt_store {
+                self.asm.vmovntps(zmmword_ptr(r8 + rbx), zmm0)
+                    .map_err(|e| e.to_string())?;
+            } else {
+                self.asm.vmovups(zmmword_ptr(r8 + rbx), zmm0)
+                    .map_err(|e| e.to_string())?;
+            }
+
+            self.asm.add(rbx, 64i32).map_err(|e| e.to_string())?;
+            self.asm.jmp(remainder_loop).map_err(|e| e.to_string())?;
+
+            self.asm.set_label(&mut done_label).map_err(|e| e.to_string())?;
+
+            if use_nt_store {
+                self.asm.sfence().map_err(|e| e.to_string())?;
+            }
+
+            if tail > 0 {
+                let base_bytes = (vec_count * simd_w * 4) as i32;
+                self.emit_set_kmask(tail)?;
+                self.asm.mov(rbx, base_bytes as i64).map_err(|e| e.to_string())?;
+                self.asm.vmovups(zmm0.k1().z(), zmmword_ptr(rdi + base_bytes))
+                    .map_err(|e| e.to_string())?;
+                for (body, is_binary) in trace_info {
+                    self.emit_elementwise_trace_body_avx512(zmm0, body, *is_binary, true)?;
+                }
+                self.asm.vmovups(zmmword_ptr(r8 + base_bytes).k1(), zmm0)
+                    .map_err(|e| e.to_string())?;
             }
 
             Ok(())
@@ -3932,7 +3596,7 @@ pub mod jit {
             Ok(())
         }
 
-        /// AVX2 trace-on-stack evaluator.
+        /// Unified AVX2 trace-on-stack evaluator.
         ///
         /// Allocates `n * 32` bytes on the stack, evaluates each `TraceOp`
         /// into its slot, then loads the final slot back into `acc`.
@@ -3943,26 +3607,276 @@ pub mod jit {
             body: &[TraceOp],
             mode: InputMode,
         ) -> Result<(), String> {
-            trace_on_stack_body!(
-                self, acc, body, mode,
-                simd_bytes: 32i32,
-                ptr_fn: ymmword_ptr,
-                s0: ymm13, s1: ymm14,
-                math_s0: ymm15, math_s1: ymm12,
-                broadcast_reg: ymm15,
-                mean_reg: ymm14,
-                scale_reg: ymm15,
-                zero_instr: vxorps,
-                rcp_instr: vrcpps,
-                rsqrt_instr: vrsqrtps,
-                emit_exp: emit_exp_avx2,
-                emit_tanh: emit_tanh_avx2,
-                emit_log: emit_log_avx2,
-                scalar_tail_load: |asm: &mut CodeAssembler| -> Result<(), String> {
-                    asm.vmovss(xmm13, dword_ptr(rsi + rbx))
-                        .map_err(|e| e.to_string())
+            let n = body.len();
+            if n == 0 {
+                return Ok(());
+            }
+
+            let frame_size = (n * 32) as i32;
+            self.asm.sub(rsp, frame_size).map_err(|e| e.to_string())?;
+
+            let slot_off = |i: u32| -> i32 { (i as i32) * 32 };
+
+            for (i, op) in body.iter().enumerate() {
+                let i32_idx = i as u32;
+                match op {
+                    TraceOp::Input(idx) => {
+                        match &mode {
+                            InputMode::AccOnly => {
+                                self.asm.vmovups(ymmword_ptr(rsp + slot_off(i32_idx)), acc)
+                                    .map_err(|e| e.to_string())?;
+                            }
+                            InputMode::WithBias { bias_disp } => {
+                                if *idx == 0 {
+                                    self.asm.vmovups(ymmword_ptr(rsp + slot_off(i32_idx)), acc)
+                                        .map_err(|e| e.to_string())?;
+                                } else {
+                                    self.asm.vmovups(ymm13, ymmword_ptr(rax + *bias_disp))
+                                        .map_err(|e| e.to_string())?;
+                                    self.asm.vmovups(ymmword_ptr(rsp + slot_off(i32_idx)), ymm13)
+                                        .map_err(|e| e.to_string())?;
+                                }
+                            }
+                            InputMode::Elementwise { is_binary, scalar_tail } => {
+                                if *idx == 0 {
+                                    self.asm.vmovups(ymmword_ptr(rsp + slot_off(i32_idx)), acc)
+                                        .map_err(|e| e.to_string())?;
+                                } else if *idx == 1 && *is_binary {
+                                    if *scalar_tail {
+                                        self.asm.vmovss(xmm13, dword_ptr(rsi + rbx))
+                                            .map_err(|e| e.to_string())?;
+                                    } else {
+                                        self.asm.vmovups(ymm13, ymmword_ptr(rsi + rbx))
+                                            .map_err(|e| e.to_string())?;
+                                    }
+                                    self.asm.vmovups(ymmword_ptr(rsp + slot_off(i32_idx)), ymm13)
+                                        .map_err(|e| e.to_string())?;
+                                } else {
+                                    self.asm.vmovups(ymmword_ptr(rsp + slot_off(i32_idx)), acc)
+                                        .map_err(|e| e.to_string())?;
+                                }
+                            }
+                            InputMode::ReductionCombine => {
+                                // Input(0) = accumulator, Input(1) = current vector from [rdi+rbx]
+                                if *idx == 0 {
+                                    self.asm.vmovups(ymmword_ptr(rsp + slot_off(i32_idx)), acc)
+                                        .map_err(|e| e.to_string())?;
+                                } else {
+                                    self.asm.vmovups(ymm13, ymmword_ptr(rdi + rbx))
+                                        .map_err(|e| e.to_string())?;
+                                    self.asm.vmovups(ymmword_ptr(rsp + slot_off(i32_idx)), ymm13)
+                                        .map_err(|e| e.to_string())?;
+                                }
+                            }
+                            InputMode::WithBroadcast => {
+                                // Input(0) = load from [rdi+rbx], Input(1) = broadcast ymm15
+                                if *idx == 0 {
+                                    self.asm.vmovups(ymm13, ymmword_ptr(rdi + rbx))
+                                        .map_err(|e| e.to_string())?;
+                                    self.asm.vmovups(ymmword_ptr(rsp + slot_off(i32_idx)), ymm13)
+                                        .map_err(|e| e.to_string())?;
+                                } else {
+                                    self.asm.vmovups(ymmword_ptr(rsp + slot_off(i32_idx)), ymm15)
+                                        .map_err(|e| e.to_string())?;
+                                }
+                            }
+                            InputMode::NormTransform { has_mean, has_weight, has_bias } => {
+                                // Input(0)=load [rdi+rbx], Input(1)=ymm14 (mean), Input(2)=ymm15 (scale),
+                                // Input(3)=load [rdx+rbx] (weight), Input(4)=load [rcx+rbx] (bias)
+                                match *idx {
+                                    0 => {
+                                        self.asm.vmovups(ymm13, ymmword_ptr(rdi + rbx))
+                                            .map_err(|e| e.to_string())?;
+                                        self.asm.vmovups(ymmword_ptr(rsp + slot_off(i32_idx)), ymm13)
+                                            .map_err(|e| e.to_string())?;
+                                    }
+                                    1 => {
+                                        // mean (ymm14) or scale (ymm15) depending on has_mean
+                                        if *has_mean {
+                                            self.asm.vmovups(ymmword_ptr(rsp + slot_off(i32_idx)), ymm14)
+                                                .map_err(|e| e.to_string())?;
+                                        } else {
+                                            // RmsNorm: Input(1) = scale = ymm15
+                                            self.asm.vmovups(ymmword_ptr(rsp + slot_off(i32_idx)), ymm15)
+                                                .map_err(|e| e.to_string())?;
+                                        }
+                                    }
+                                    2 => {
+                                        // scale (ymm15) — only used when has_mean (LayerNorm)
+                                        self.asm.vmovups(ymmword_ptr(rsp + slot_off(i32_idx)), ymm15)
+                                            .map_err(|e| e.to_string())?;
+                                    }
+                                    3 => {
+                                        // weight from [rdx+rbx]
+                                        if *has_weight {
+                                            self.asm.vmovups(ymm13, ymmword_ptr(rdx + rbx))
+                                                .map_err(|e| e.to_string())?;
+                                        } else {
+                                            let one = self.const_f32(1.0);
+                                            self.asm.vbroadcastss(ymm13, dword_ptr(one))
+                                                .map_err(|e| e.to_string())?;
+                                        }
+                                        self.asm.vmovups(ymmword_ptr(rsp + slot_off(i32_idx)), ymm13)
+                                            .map_err(|e| e.to_string())?;
+                                    }
+                                    4 => {
+                                        // bias from [rcx+rbx]
+                                        if *has_bias {
+                                            self.asm.vmovups(ymm13, ymmword_ptr(rcx + rbx))
+                                                .map_err(|e| e.to_string())?;
+                                        } else {
+                                            self.asm.vxorps(ymm13, ymm13, ymm13)
+                                                .map_err(|e| e.to_string())?;
+                                        }
+                                        self.asm.vmovups(ymmword_ptr(rsp + slot_off(i32_idx)), ymm13)
+                                            .map_err(|e| e.to_string())?;
+                                    }
+                                    _ => {
+                                        self.asm.vmovups(ymmword_ptr(rsp + slot_off(i32_idx)), acc)
+                                            .map_err(|e| e.to_string())?;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    TraceOp::Const(v) => {
+                        let label = self.const_f32(*v as f32);
+                        self.asm.vbroadcastss(ymm13, dword_ptr(label))
+                            .map_err(|e| e.to_string())?;
+                        self.asm.vmovups(ymmword_ptr(rsp + slot_off(i32_idx)), ymm13)
+                            .map_err(|e| e.to_string())?;
+                    }
+                    TraceOp::Add(a, b) => {
+                        self.asm.vmovups(ymm13, ymmword_ptr(rsp + slot_off(*a)))
+                            .map_err(|e| e.to_string())?;
+                        self.asm.vaddps(ymm13, ymm13, ymmword_ptr(rsp + slot_off(*b)))
+                            .map_err(|e| e.to_string())?;
+                        self.asm.vmovups(ymmword_ptr(rsp + slot_off(i32_idx)), ymm13)
+                            .map_err(|e| e.to_string())?;
+                    }
+                    TraceOp::Sub(a, b) => {
+                        self.asm.vmovups(ymm13, ymmword_ptr(rsp + slot_off(*a)))
+                            .map_err(|e| e.to_string())?;
+                        self.asm.vsubps(ymm13, ymm13, ymmword_ptr(rsp + slot_off(*b)))
+                            .map_err(|e| e.to_string())?;
+                        self.asm.vmovups(ymmword_ptr(rsp + slot_off(i32_idx)), ymm13)
+                            .map_err(|e| e.to_string())?;
+                    }
+                    TraceOp::Mul(a, b) => {
+                        self.asm.vmovups(ymm13, ymmword_ptr(rsp + slot_off(*a)))
+                            .map_err(|e| e.to_string())?;
+                        self.asm.vmulps(ymm13, ymm13, ymmword_ptr(rsp + slot_off(*b)))
+                            .map_err(|e| e.to_string())?;
+                        self.asm.vmovups(ymmword_ptr(rsp + slot_off(i32_idx)), ymm13)
+                            .map_err(|e| e.to_string())?;
+                    }
+                    TraceOp::Div(a, b) => {
+                        self.asm.vmovups(ymm13, ymmword_ptr(rsp + slot_off(*a)))
+                            .map_err(|e| e.to_string())?;
+                        self.asm.vdivps(ymm13, ymm13, ymmword_ptr(rsp + slot_off(*b)))
+                            .map_err(|e| e.to_string())?;
+                        self.asm.vmovups(ymmword_ptr(rsp + slot_off(i32_idx)), ymm13)
+                            .map_err(|e| e.to_string())?;
+                    }
+                    TraceOp::Fma(a, b, c) => {
+                        self.asm.vmovups(ymm13, ymmword_ptr(rsp + slot_off(*c)))
+                            .map_err(|e| e.to_string())?;
+                        self.asm.vmovups(ymm14, ymmword_ptr(rsp + slot_off(*a)))
+                            .map_err(|e| e.to_string())?;
+                        self.asm.vfmadd231ps(ymm13, ymm14, ymmword_ptr(rsp + slot_off(*b)))
+                            .map_err(|e| e.to_string())?;
+                        self.asm.vmovups(ymmword_ptr(rsp + slot_off(i32_idx)), ymm13)
+                            .map_err(|e| e.to_string())?;
+                    }
+                    TraceOp::Neg(a) => {
+                        self.asm.vxorps(ymm13, ymm13, ymm13)
+                            .map_err(|e| e.to_string())?;
+                        self.asm.vsubps(ymm13, ymm13, ymmword_ptr(rsp + slot_off(*a)))
+                            .map_err(|e| e.to_string())?;
+                        self.asm.vmovups(ymmword_ptr(rsp + slot_off(i32_idx)), ymm13)
+                            .map_err(|e| e.to_string())?;
+                    }
+                    TraceOp::Abs(a) => {
+                        let abs_mask = self.const_f32(f32::from_bits(0x7FFF_FFFF));
+                        self.asm.vmovups(ymm13, ymmword_ptr(rsp + slot_off(*a)))
+                            .map_err(|e| e.to_string())?;
+                        self.asm.vbroadcastss(ymm14, dword_ptr(abs_mask))
+                            .map_err(|e| e.to_string())?;
+                        self.asm.vandps(ymm13, ymm13, ymm14)
+                            .map_err(|e| e.to_string())?;
+                        self.asm.vmovups(ymmword_ptr(rsp + slot_off(i32_idx)), ymm13)
+                            .map_err(|e| e.to_string())?;
+                    }
+                    TraceOp::Exp(a) => {
+                        self.asm.vmovups(ymm13, ymmword_ptr(rsp + slot_off(*a)))
+                            .map_err(|e| e.to_string())?;
+                        self.emit_exp_avx2(ymm14, ymm13, [ymm13, ymm15, ymm12])?;
+                        self.asm.vmovups(ymmword_ptr(rsp + slot_off(i32_idx)), ymm14)
+                            .map_err(|e| e.to_string())?;
+                    }
+                    TraceOp::Sqrt(a) => {
+                        self.asm.vmovups(ymm13, ymmword_ptr(rsp + slot_off(*a)))
+                            .map_err(|e| e.to_string())?;
+                        self.asm.vsqrtps(ymm13, ymm13)
+                            .map_err(|e| e.to_string())?;
+                        self.asm.vmovups(ymmword_ptr(rsp + slot_off(i32_idx)), ymm13)
+                            .map_err(|e| e.to_string())?;
+                    }
+                    TraceOp::Rsqrt(a) => {
+                        self.asm.vmovups(ymm13, ymmword_ptr(rsp + slot_off(*a)))
+                            .map_err(|e| e.to_string())?;
+                        self.asm.vrsqrtps(ymm13, ymm13)
+                            .map_err(|e| e.to_string())?;
+                        self.asm.vmovups(ymmword_ptr(rsp + slot_off(i32_idx)), ymm13)
+                            .map_err(|e| e.to_string())?;
+                    }
+                    TraceOp::Tanh(a) => {
+                        self.asm.vmovups(ymm13, ymmword_ptr(rsp + slot_off(*a)))
+                            .map_err(|e| e.to_string())?;
+                        self.emit_tanh_avx2(ymm14, ymm13, [ymm13, ymm15, ymm12])?;
+                        self.asm.vmovups(ymmword_ptr(rsp + slot_off(i32_idx)), ymm14)
+                            .map_err(|e| e.to_string())?;
+                    }
+                    TraceOp::Recip(a) => {
+                        self.asm.vmovups(ymm13, ymmword_ptr(rsp + slot_off(*a)))
+                            .map_err(|e| e.to_string())?;
+                        self.asm.vrcpps(ymm13, ymm13)
+                            .map_err(|e| e.to_string())?;
+                        self.asm.vmovups(ymmword_ptr(rsp + slot_off(i32_idx)), ymm13)
+                            .map_err(|e| e.to_string())?;
+                    }
+                    TraceOp::Log(a) => {
+                        self.asm.vmovups(ymm13, ymmword_ptr(rsp + slot_off(*a)))
+                            .map_err(|e| e.to_string())?;
+                        self.emit_log_avx2(ymm14, ymm13, [ymm13, ymm15, ymm12])?;
+                        self.asm.vmovups(ymmword_ptr(rsp + slot_off(i32_idx)), ymm14)
+                            .map_err(|e| e.to_string())?;
+                    }
+                    TraceOp::Max(a, b) => {
+                        self.asm.vmovups(ymm13, ymmword_ptr(rsp + slot_off(*a)))
+                            .map_err(|e| e.to_string())?;
+                        self.asm.vmaxps(ymm13, ymm13, ymmword_ptr(rsp + slot_off(*b)))
+                            .map_err(|e| e.to_string())?;
+                        self.asm.vmovups(ymmword_ptr(rsp + slot_off(i32_idx)), ymm13)
+                            .map_err(|e| e.to_string())?;
+                    }
+                    TraceOp::Min(a, b) => {
+                        self.asm.vmovups(ymm13, ymmword_ptr(rsp + slot_off(*a)))
+                            .map_err(|e| e.to_string())?;
+                        self.asm.vminps(ymm13, ymm13, ymmword_ptr(rsp + slot_off(*b)))
+                            .map_err(|e| e.to_string())?;
+                        self.asm.vmovups(ymmword_ptr(rsp + slot_off(i32_idx)), ymm13)
+                            .map_err(|e| e.to_string())?;
+                    }
                 }
-            )
+            }
+
+            self.asm.vmovups(acc, ymmword_ptr(rsp + slot_off((n - 1) as u32)))
+                .map_err(|e| e.to_string())?;
+
+            self.asm.add(rsp, frame_size).map_err(|e| e.to_string())?;
+
+            Ok(())
         }
 
         /// AVX2 trace-on-accumulator (acc-only). Thin wrapper.
@@ -3984,7 +3898,18 @@ pub mod jit {
             self.emit_trace_on_stack_ymm(acc, body, InputMode::WithBias { bias_disp })
         }
 
-        /// AVX-512 trace-on-stack evaluator.
+        /// AVX2 elementwise trace body. Thin wrapper.
+        fn emit_elementwise_trace_body(
+            &mut self,
+            acc: AsmRegisterYmm,
+            body: &[TraceOp],
+            is_binary: bool,
+            scalar_tail: bool,
+        ) -> Result<(), String> {
+            self.emit_trace_on_stack_ymm(acc, body, InputMode::Elementwise { is_binary, scalar_tail })
+        }
+
+        /// Unified AVX-512 trace-on-stack evaluator.
         ///
         /// Allocates `n * 64` bytes on the stack, evaluates each `TraceOp`
         /// into its slot, then loads the final slot back into `acc`.
@@ -3995,26 +3920,277 @@ pub mod jit {
             body: &[TraceOp],
             mode: InputMode,
         ) -> Result<(), String> {
-            trace_on_stack_body!(
-                self, acc, body, mode,
-                simd_bytes: 64i32,
-                ptr_fn: zmmword_ptr,
-                s0: zmm29, s1: zmm30,
-                math_s0: zmm27, math_s1: zmm26,
-                broadcast_reg: zmm31,
-                mean_reg: zmm30,
-                scale_reg: zmm31,
-                zero_instr: vpxord,
-                rcp_instr: vrcp14ps,
-                rsqrt_instr: vrsqrt14ps,
-                emit_exp: emit_exp_avx512,
-                emit_tanh: emit_tanh_avx512,
-                emit_log: emit_log_avx512,
-                scalar_tail_load: |asm: &mut CodeAssembler| -> Result<(), String> {
-                    asm.vmovups(zmm29.k1().z(), zmmword_ptr(rsi + rbx))
-                        .map_err(|e| e.to_string())
+            let n = body.len();
+            if n == 0 {
+                return Ok(());
+            }
+
+            let frame_size = (n * 64) as i32;
+            self.asm.sub(rsp, frame_size).map_err(|e| e.to_string())?;
+
+            let slot_off = |i: u32| -> i32 { (i as i32) * 64 };
+
+            for (i, op) in body.iter().enumerate() {
+                let i32_idx = i as u32;
+                match op {
+                    TraceOp::Input(idx) => {
+                        match &mode {
+                            InputMode::AccOnly => {
+                                // All inputs map to the accumulator
+                                self.asm.vmovups(zmmword_ptr(rsp + slot_off(i32_idx)), acc)
+                                    .map_err(|e| e.to_string())?;
+                            }
+                            InputMode::WithBias { bias_disp } => {
+                                if *idx == 0 {
+                                    self.asm.vmovups(zmmword_ptr(rsp + slot_off(i32_idx)), acc)
+                                        .map_err(|e| e.to_string())?;
+                                } else {
+                                    self.asm.vmovups(zmm29, zmmword_ptr(rax + *bias_disp))
+                                        .map_err(|e| e.to_string())?;
+                                    self.asm.vmovups(zmmword_ptr(rsp + slot_off(i32_idx)), zmm29)
+                                        .map_err(|e| e.to_string())?;
+                                }
+                            }
+                            InputMode::Elementwise { is_binary, scalar_tail } => {
+                                if *idx == 0 {
+                                    self.asm.vmovups(zmmword_ptr(rsp + slot_off(i32_idx)), acc)
+                                        .map_err(|e| e.to_string())?;
+                                } else if *idx == 1 && *is_binary {
+                                    if *scalar_tail {
+                                        self.asm.vmovups(zmm29.k1().z(), zmmword_ptr(rsi + rbx))
+                                            .map_err(|e| e.to_string())?;
+                                    } else {
+                                        self.asm.vmovups(zmm29, zmmword_ptr(rsi + rbx))
+                                            .map_err(|e| e.to_string())?;
+                                    }
+                                    self.asm.vmovups(zmmword_ptr(rsp + slot_off(i32_idx)), zmm29)
+                                        .map_err(|e| e.to_string())?;
+                                } else {
+                                    self.asm.vmovups(zmmword_ptr(rsp + slot_off(i32_idx)), acc)
+                                        .map_err(|e| e.to_string())?;
+                                }
+                            }
+                            InputMode::ReductionCombine => {
+                                // Input(0) = accumulator, Input(1) = current vector from [rdi+rbx]
+                                if *idx == 0 {
+                                    self.asm.vmovups(zmmword_ptr(rsp + slot_off(i32_idx)), acc)
+                                        .map_err(|e| e.to_string())?;
+                                } else {
+                                    self.asm.vmovups(zmm29, zmmword_ptr(rdi + rbx))
+                                        .map_err(|e| e.to_string())?;
+                                    self.asm.vmovups(zmmword_ptr(rsp + slot_off(i32_idx)), zmm29)
+                                        .map_err(|e| e.to_string())?;
+                                }
+                            }
+                            InputMode::WithBroadcast => {
+                                // Input(0) = load from [rdi+rbx], Input(1) = broadcast zmm31
+                                if *idx == 0 {
+                                    self.asm.vmovups(zmm29, zmmword_ptr(rdi + rbx))
+                                        .map_err(|e| e.to_string())?;
+                                    self.asm.vmovups(zmmword_ptr(rsp + slot_off(i32_idx)), zmm29)
+                                        .map_err(|e| e.to_string())?;
+                                } else {
+                                    self.asm.vmovups(zmmword_ptr(rsp + slot_off(i32_idx)), zmm31)
+                                        .map_err(|e| e.to_string())?;
+                                }
+                            }
+                            InputMode::NormTransform { has_mean, has_weight, has_bias } => {
+                                // Input(0)=load [rdi+rbx], Input(1)=zmm30 (mean), Input(2)=zmm31 (scale),
+                                // Input(3)=load [rdx+rbx] (weight), Input(4)=load [rcx+rbx] (bias)
+                                match *idx {
+                                    0 => {
+                                        self.asm.vmovups(zmm29, zmmword_ptr(rdi + rbx))
+                                            .map_err(|e| e.to_string())?;
+                                        self.asm.vmovups(zmmword_ptr(rsp + slot_off(i32_idx)), zmm29)
+                                            .map_err(|e| e.to_string())?;
+                                    }
+                                    1 => {
+                                        // mean (zmm30) or scale (zmm31) depending on has_mean
+                                        if *has_mean {
+                                            self.asm.vmovups(zmmword_ptr(rsp + slot_off(i32_idx)), zmm30)
+                                                .map_err(|e| e.to_string())?;
+                                        } else {
+                                            // RmsNorm: Input(1) = scale = zmm31
+                                            self.asm.vmovups(zmmword_ptr(rsp + slot_off(i32_idx)), zmm31)
+                                                .map_err(|e| e.to_string())?;
+                                        }
+                                    }
+                                    2 => {
+                                        // scale (zmm31) — only used when has_mean (LayerNorm)
+                                        self.asm.vmovups(zmmword_ptr(rsp + slot_off(i32_idx)), zmm31)
+                                            .map_err(|e| e.to_string())?;
+                                    }
+                                    3 => {
+                                        // weight from [rdx+rbx]
+                                        if *has_weight {
+                                            self.asm.vmovups(zmm29, zmmword_ptr(rdx + rbx))
+                                                .map_err(|e| e.to_string())?;
+                                        } else {
+                                            let one = self.const_f32(1.0);
+                                            self.asm.vbroadcastss(zmm29, dword_ptr(one))
+                                                .map_err(|e| e.to_string())?;
+                                        }
+                                        self.asm.vmovups(zmmword_ptr(rsp + slot_off(i32_idx)), zmm29)
+                                            .map_err(|e| e.to_string())?;
+                                    }
+                                    4 => {
+                                        // bias from [rcx+rbx]
+                                        if *has_bias {
+                                            self.asm.vmovups(zmm29, zmmword_ptr(rcx + rbx))
+                                                .map_err(|e| e.to_string())?;
+                                        } else {
+                                            self.asm.vpxord(zmm29, zmm29, zmm29)
+                                                .map_err(|e| e.to_string())?;
+                                        }
+                                        self.asm.vmovups(zmmword_ptr(rsp + slot_off(i32_idx)), zmm29)
+                                            .map_err(|e| e.to_string())?;
+                                    }
+                                    _ => {
+                                        self.asm.vmovups(zmmword_ptr(rsp + slot_off(i32_idx)), acc)
+                                            .map_err(|e| e.to_string())?;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    TraceOp::Const(v) => {
+                        let label = self.const_f32(*v as f32);
+                        self.asm.vbroadcastss(zmm29, dword_ptr(label))
+                            .map_err(|e| e.to_string())?;
+                        self.asm.vmovups(zmmword_ptr(rsp + slot_off(i32_idx)), zmm29)
+                            .map_err(|e| e.to_string())?;
+                    }
+                    TraceOp::Add(a, b) => {
+                        self.asm.vmovups(zmm29, zmmword_ptr(rsp + slot_off(*a)))
+                            .map_err(|e| e.to_string())?;
+                        self.asm.vaddps(zmm29, zmm29, zmmword_ptr(rsp + slot_off(*b)))
+                            .map_err(|e| e.to_string())?;
+                        self.asm.vmovups(zmmword_ptr(rsp + slot_off(i32_idx)), zmm29)
+                            .map_err(|e| e.to_string())?;
+                    }
+                    TraceOp::Sub(a, b) => {
+                        self.asm.vmovups(zmm29, zmmword_ptr(rsp + slot_off(*a)))
+                            .map_err(|e| e.to_string())?;
+                        self.asm.vsubps(zmm29, zmm29, zmmword_ptr(rsp + slot_off(*b)))
+                            .map_err(|e| e.to_string())?;
+                        self.asm.vmovups(zmmword_ptr(rsp + slot_off(i32_idx)), zmm29)
+                            .map_err(|e| e.to_string())?;
+                    }
+                    TraceOp::Mul(a, b) => {
+                        self.asm.vmovups(zmm29, zmmword_ptr(rsp + slot_off(*a)))
+                            .map_err(|e| e.to_string())?;
+                        self.asm.vmulps(zmm29, zmm29, zmmword_ptr(rsp + slot_off(*b)))
+                            .map_err(|e| e.to_string())?;
+                        self.asm.vmovups(zmmword_ptr(rsp + slot_off(i32_idx)), zmm29)
+                            .map_err(|e| e.to_string())?;
+                    }
+                    TraceOp::Div(a, b) => {
+                        self.asm.vmovups(zmm29, zmmword_ptr(rsp + slot_off(*a)))
+                            .map_err(|e| e.to_string())?;
+                        self.asm.vdivps(zmm29, zmm29, zmmword_ptr(rsp + slot_off(*b)))
+                            .map_err(|e| e.to_string())?;
+                        self.asm.vmovups(zmmword_ptr(rsp + slot_off(i32_idx)), zmm29)
+                            .map_err(|e| e.to_string())?;
+                    }
+                    TraceOp::Fma(a, b, c) => {
+                        self.asm.vmovups(zmm29, zmmword_ptr(rsp + slot_off(*c)))
+                            .map_err(|e| e.to_string())?;
+                        self.asm.vmovups(zmm30, zmmword_ptr(rsp + slot_off(*a)))
+                            .map_err(|e| e.to_string())?;
+                        self.asm.vfmadd231ps(zmm29, zmm30, zmmword_ptr(rsp + slot_off(*b)))
+                            .map_err(|e| e.to_string())?;
+                        self.asm.vmovups(zmmword_ptr(rsp + slot_off(i32_idx)), zmm29)
+                            .map_err(|e| e.to_string())?;
+                    }
+                    TraceOp::Neg(a) => {
+                        self.asm.vpxord(zmm29, zmm29, zmm29)
+                            .map_err(|e| e.to_string())?;
+                        self.asm.vsubps(zmm29, zmm29, zmmword_ptr(rsp + slot_off(*a)))
+                            .map_err(|e| e.to_string())?;
+                        self.asm.vmovups(zmmword_ptr(rsp + slot_off(i32_idx)), zmm29)
+                            .map_err(|e| e.to_string())?;
+                    }
+                    TraceOp::Abs(a) => {
+                        let abs_mask = self.const_f32(f32::from_bits(0x7FFF_FFFF));
+                        self.asm.vmovups(zmm29, zmmword_ptr(rsp + slot_off(*a)))
+                            .map_err(|e| e.to_string())?;
+                        self.asm.vbroadcastss(zmm30, dword_ptr(abs_mask))
+                            .map_err(|e| e.to_string())?;
+                        self.asm.vandps(zmm29, zmm29, zmm30)
+                            .map_err(|e| e.to_string())?;
+                        self.asm.vmovups(zmmword_ptr(rsp + slot_off(i32_idx)), zmm29)
+                            .map_err(|e| e.to_string())?;
+                    }
+                    TraceOp::Exp(a) => {
+                        self.asm.vmovups(zmm29, zmmword_ptr(rsp + slot_off(*a)))
+                            .map_err(|e| e.to_string())?;
+                        self.emit_exp_avx512(zmm30, zmm29, [zmm29, zmm27, zmm26])?;
+                        self.asm.vmovups(zmmword_ptr(rsp + slot_off(i32_idx)), zmm30)
+                            .map_err(|e| e.to_string())?;
+                    }
+                    TraceOp::Sqrt(a) => {
+                        self.asm.vmovups(zmm29, zmmword_ptr(rsp + slot_off(*a)))
+                            .map_err(|e| e.to_string())?;
+                        self.asm.vsqrtps(zmm29, zmm29)
+                            .map_err(|e| e.to_string())?;
+                        self.asm.vmovups(zmmword_ptr(rsp + slot_off(i32_idx)), zmm29)
+                            .map_err(|e| e.to_string())?;
+                    }
+                    TraceOp::Rsqrt(a) => {
+                        self.asm.vmovups(zmm29, zmmword_ptr(rsp + slot_off(*a)))
+                            .map_err(|e| e.to_string())?;
+                        self.asm.vrsqrt14ps(zmm29, zmm29)
+                            .map_err(|e| e.to_string())?;
+                        self.asm.vmovups(zmmword_ptr(rsp + slot_off(i32_idx)), zmm29)
+                            .map_err(|e| e.to_string())?;
+                    }
+                    TraceOp::Tanh(a) => {
+                        self.asm.vmovups(zmm29, zmmword_ptr(rsp + slot_off(*a)))
+                            .map_err(|e| e.to_string())?;
+                        self.emit_tanh_avx512(zmm30, zmm29, [zmm29, zmm27, zmm26])?;
+                        self.asm.vmovups(zmmword_ptr(rsp + slot_off(i32_idx)), zmm30)
+                            .map_err(|e| e.to_string())?;
+                    }
+                    TraceOp::Recip(a) => {
+                        self.asm.vmovups(zmm29, zmmword_ptr(rsp + slot_off(*a)))
+                            .map_err(|e| e.to_string())?;
+                        self.asm.vrcp14ps(zmm29, zmm29)
+                            .map_err(|e| e.to_string())?;
+                        self.asm.vmovups(zmmword_ptr(rsp + slot_off(i32_idx)), zmm29)
+                            .map_err(|e| e.to_string())?;
+                    }
+                    TraceOp::Log(a) => {
+                        self.asm.vmovups(zmm29, zmmword_ptr(rsp + slot_off(*a)))
+                            .map_err(|e| e.to_string())?;
+                        self.emit_log_avx512(zmm30, zmm29, [zmm29, zmm27, zmm26])?;
+                        self.asm.vmovups(zmmword_ptr(rsp + slot_off(i32_idx)), zmm30)
+                            .map_err(|e| e.to_string())?;
+                    }
+                    TraceOp::Max(a, b) => {
+                        self.asm.vmovups(zmm29, zmmword_ptr(rsp + slot_off(*a)))
+                            .map_err(|e| e.to_string())?;
+                        self.asm.vmaxps(zmm29, zmm29, zmmword_ptr(rsp + slot_off(*b)))
+                            .map_err(|e| e.to_string())?;
+                        self.asm.vmovups(zmmword_ptr(rsp + slot_off(i32_idx)), zmm29)
+                            .map_err(|e| e.to_string())?;
+                    }
+                    TraceOp::Min(a, b) => {
+                        self.asm.vmovups(zmm29, zmmword_ptr(rsp + slot_off(*a)))
+                            .map_err(|e| e.to_string())?;
+                        self.asm.vminps(zmm29, zmm29, zmmword_ptr(rsp + slot_off(*b)))
+                            .map_err(|e| e.to_string())?;
+                        self.asm.vmovups(zmmword_ptr(rsp + slot_off(i32_idx)), zmm29)
+                            .map_err(|e| e.to_string())?;
+                    }
                 }
-            )
+            }
+
+            self.asm.vmovups(acc, zmmword_ptr(rsp + slot_off((n - 1) as u32)))
+                .map_err(|e| e.to_string())?;
+
+            self.asm.add(rsp, frame_size).map_err(|e| e.to_string())?;
+
+            Ok(())
         }
 
         /// AVX-512 trace-on-accumulator with bias. Thin wrapper.
@@ -4036,6 +4212,16 @@ pub mod jit {
             self.emit_trace_on_stack_zmm(acc, body, InputMode::AccOnly)
         }
 
+        /// AVX-512 elementwise trace body. Thin wrapper.
+        fn emit_elementwise_trace_body_avx512(
+            &mut self,
+            acc: AsmRegisterZmm,
+            body: &[TraceOp],
+            is_binary: bool,
+            scalar_tail: bool,
+        ) -> Result<(), String> {
+            self.emit_trace_on_stack_zmm(acc, body, InputMode::Elementwise { is_binary, scalar_tail })
+        }
 
         /// Emit exp(x) via shared SimdOps path.
         /// Wrapper for call sites that still use physical ymm registers.
@@ -4503,12 +4689,7 @@ pub mod jit {
                 self.asm.set_label(&mut r_done).map_err(|e| e.to_string())?;
             }
 
-            // -- Phase 1.5: Horizontal sum --
-            // Must reduce ymm0 to scalar BEFORE scalar tail, because VEX-encoded
-            // scalar ops (vfmadd231ss etc.) zero bits [255:128] of the destination ymm.
-            self.emit_horizontal_sum_ymm(ymm0, ymm0)?;
-
-            // Scalar tail for reduce (now safe: ymm0 is already a broadcast scalar)
+            // Scalar tail for reduce
             if tail > 0 {
                 let base = total_vec_bytes;
                 for t in 0..tail as i32 {
@@ -4518,12 +4699,13 @@ pub mod jit {
                 }
             }
 
+            // -- Phase 1.5: Horizontal sum --
+            self.emit_horizontal_sum_ymm(ymm0, ymm0)?;
+
             // -- Phase 2: Finalize -- scale = rsqrt(sum_sq / n + eps) --
             let n_label = self.const_f32(n_f32);
             let eps_label = self.const_f32(eps);
 
-            // After hsum + scalar tail, sum_sq is in xmm0[0]. Broadcast to ymm for vectorized divide.
-            self.asm.vbroadcastss(ymm0, xmm0).map_err(|e| e.to_string())?;
             self.asm.vbroadcastss(ymm3, dword_ptr(n_label)).map_err(|e| e.to_string())?;
             self.asm.vdivps(ymm2, ymm0, ymm3).map_err(|e| e.to_string())?;    // mean_sq = sum_sq / n
             self.asm.vbroadcastss(ymm3, dword_ptr(eps_label)).map_err(|e| e.to_string())?;
@@ -4591,7 +4773,7 @@ pub mod jit {
             };
             let elem_count: usize = out_shape.iter().product::<usize>().max(1);
             if elem_count == 0 || out_shape.is_empty() {
-                return Err("norm op: elem_count=0 or empty shape".into());
+                return self.emit_nop_placeholder();
             }
             // LayerNorm/RmsNorm normalizes over the last dimension
             let row_size = *out_shape.last().unwrap();
@@ -4668,16 +4850,7 @@ pub mod jit {
                 self.asm.set_label(&mut r_done).map_err(|e| e.to_string())?;
             }
 
-            // Horizontal sum BEFORE scalar tail — VEX-encoded scalar ops
-            // (vfmadd231ss, vaddss) zero bits [255:128] of the destination ymm.
-            self.emit_horizontal_sum_ymm(ymm0, ymm0)?;
-            if is_layer_norm {
-                self.asm.vmovaps(ymm14, ymm0).map_err(|e| e.to_string())?;
-                self.emit_horizontal_sum_ymm(ymm1, ymm1)?;
-                self.asm.vmovaps(ymm0, ymm14).map_err(|e| e.to_string())?;
-            }
-
-            // Scalar tail for reduce (now safe: accumulators are already scalar)
+            // Scalar tail for reduce
             if tail > 0 {
                 let base = total_vec_bytes;
                 for t in 0..tail as i32 {
@@ -4692,10 +4865,17 @@ pub mod jit {
                 }
             }
 
-            // Broadcast scalar results back to ymm for vectorized finalize
-            self.asm.vbroadcastss(ymm0, xmm0).map_err(|e| e.to_string())?;
+            // Horizontal sum
+            self.emit_horizontal_sum_ymm(ymm0, ymm0)?;
+            // ymm0 = broadcast scalar sum (or sum_sq for RmsNorm)
+
             if is_layer_norm {
-                self.asm.vbroadcastss(ymm1, xmm1).map_err(|e| e.to_string())?;
+                // Save ymm0 (sum) before second hsum clobbers xmm0
+                self.asm.vmovaps(ymm14, ymm0).map_err(|e| e.to_string())?;
+                self.emit_horizontal_sum_ymm(ymm1, ymm1)?;
+                // ymm1 = broadcast scalar sum_sq
+                // Restore ymm0 from ymm14
+                self.asm.vmovaps(ymm0, ymm14).map_err(|e| e.to_string())?;
             }
 
             // Phase 2: Finalize — compute scale (and mean for LayerNorm)
@@ -4941,7 +5121,7 @@ pub mod jit {
             };
             if elem_count == 0 {
                 eprintln!("[JIT-DBG] emit_standalone_reduction: elem_count=0, emitting NOP");
-                return Err("reduction op: elem_count=0".into());
+                return self.emit_nop_placeholder();
             }
 
             let key = ScalarOpRegistry::key_from_op_kind(&op.kind);
@@ -4992,21 +5172,18 @@ pub mod jit {
                 self.asm.set_label(&mut p1_done).map_err(|e| e.to_string())?;
             }
 
-            // Horizontal max BEFORE scalar tail — VEX-encoded vmaxss zeros
-            // bits [255:128] of the destination ymm.
-            self.emit_horizontal_max_ymm(ymm0, ymm15)?;
-
-            // Scalar tail for pass 1 (now safe: max is scalar in xmm15)
+            // Scalar tail for pass 1
             if tail > 0 {
                 let base = total_vec_bytes;
                 for t in 0..tail as i32 {
                     let off = base + t * 4;
                     self.asm.vmovss(xmm1, dword_ptr(rdi + off)).map_err(|e| e.to_string())?;
-                    self.asm.vmaxss(xmm15, xmm15, xmm1).map_err(|e| e.to_string())?;
+                    self.asm.vmaxss(xmm0, xmm0, xmm1).map_err(|e| e.to_string())?;
                 }
-                // Re-broadcast updated max to ymm15
-                self.asm.vbroadcastss(ymm15, xmm15).map_err(|e| e.to_string())?;
             }
+
+            // Horizontal max → broadcast into ymm15
+            self.emit_horizontal_max_ymm(ymm0, ymm15)?;
 
             // If no second_pass, we're done with just the reduction
             let second = match second_pass.as_deref() {
@@ -5051,11 +5228,7 @@ pub mod jit {
                 self.asm.set_label(&mut p2_done).map_err(|e| e.to_string())?;
             }
 
-            // Horizontal sum BEFORE scalar tail — VEX-encoded vaddss zeros
-            // bits [255:128] of the destination ymm.
-            self.emit_horizontal_sum_ymm(ymm0, ymm0)?;
-
-            // Scalar tail for pass 2 (now safe: ymm0 is already a scalar)
+            // Scalar tail for pass 2
             if tail > 0 {
                 let base = total_vec_bytes;
                 for t in 0..tail as i32 {
@@ -5073,8 +5246,8 @@ pub mod jit {
 
             self.asm.add(rsp, 64i32).map_err(|e| e.to_string())?;
 
-            // Broadcast scalar sum back to ymm for reciprocal
-            self.asm.vbroadcastss(ymm15, xmm0).map_err(|e| e.to_string())?;
+            // Horizontal sum → reciprocal → broadcast into ymm15
+            self.emit_horizontal_sum_ymm(ymm0, ymm15)?;
             // ymm15 = broadcast sum, compute reciprocal
             self.asm.vrcpps(ymm15, ymm15).map_err(|e| e.to_string())?;
             // ymm15 = broadcast inv_sum
@@ -5285,6 +5458,11 @@ pub mod jit {
             zmm_dst: AsmRegisterZmm,
         ) -> Result<(), String> {
             self.vhsum(VReg(zmm_index(zmm_dst)), VReg(zmm_index(zmm_src)))
+        }
+
+        /// Emit a single nop as placeholder.
+        fn emit_nop_placeholder(&mut self) -> Result<(), String> {
+            self.asm.nop().map_err(|e| e.to_string())
         }
 
         // ── SimdOps helper methods ──────────────────────────────────────
@@ -6005,189 +6183,8 @@ pub mod jit {
 
         // ── NOP ─────────────────────────────────────────────────────────
 
-        fn emit_metadata_nop(&mut self) -> Result<(), String> {
+        fn emit_nop(&mut self) -> Result<(), String> {
             self.asm.nop().map_err(|e| e.to_string())
-        }
-
-        // ── Mixed-width support ─────────────────────────────────────────
-
-        fn current_simd_width(&self) -> crate::compiler::codegen::simd_ops::SimdWidth {
-            use crate::compiler::codegen::simd_ops::SimdWidth;
-            if self.use_avx512 {
-                SimdWidth::W512
-            } else {
-                SimdWidth::W256
-            }
-        }
-
-        fn width_f32_lanes(&self) -> usize {
-            self.simd_width
-        }
-
-        fn push_width(&mut self, w: crate::compiler::codegen::simd_ops::SimdWidth) -> Result<crate::compiler::codegen::simd_ops::SimdWidth, String> {
-            use crate::compiler::codegen::simd_ops::SimdWidth;
-            let prev = self.current_simd_width();
-            match w {
-                SimdWidth::W128 => {
-                    self.width_stack.push(prev);
-                    self.use_avx512 = false;
-                    self.simd_width = 4;
-                    Ok(prev)
-                }
-                SimdWidth::W256 => {
-                    self.width_stack.push(prev);
-                    self.use_avx512 = false;
-                    self.simd_width = 8;
-                    Ok(prev)
-                }
-                SimdWidth::W512 => {
-                    if self.has_avx512 {
-                        self.width_stack.push(prev);
-                        self.use_avx512 = true;
-                        self.simd_width = 16;
-                        Ok(prev)
-                    } else {
-                        Err("AVX-512 not available on this hardware".into())
-                    }
-                }
-                SimdWidth::Wvl => {
-                    Err("SVE variable-length not supported on x86_64".into())
-                }
-            }
-        }
-
-        fn pop_width(&mut self, prev: crate::compiler::codegen::simd_ops::SimdWidth) -> Result<(), String> {
-            use crate::compiler::codegen::simd_ops::SimdWidth;
-            if self.width_stack.pop().is_none() {
-                return Err("pop_width called without matching push_width".into());
-            }
-            match prev {
-                SimdWidth::W128 => {
-                    self.use_avx512 = false;
-                    self.simd_width = 4;
-                }
-                SimdWidth::W256 => {
-                    self.use_avx512 = false;
-                    self.simd_width = 8;
-                }
-                SimdWidth::W512 => {
-                    self.use_avx512 = true;
-                    self.simd_width = 16;
-                }
-                SimdWidth::Wvl => {
-                    return Err("SVE variable-length not supported on x86_64".into());
-                }
-            }
-            Ok(())
-        }
-    }
-
-    // ── TileOps implementation (AMX) ────────────────────────────────────
-
-    impl crate::compiler::codegen::tile_ops::TileOps for X86CodeGen {
-        fn tile_configure(&mut self, configs: &[(crate::compiler::codegen::tile_ops::TReg, crate::compiler::codegen::tile_ops::TileConfig)]) -> Result<(), String> {
-            if !self.has_amx {
-                return Err("AMX not available on this target".into());
-            }
-            use crate::compiler::codegen::x86_amx::TileCfg;
-            let mut cfg = TileCfg::zeroed();
-            cfg.data[0] = 1; // palette 1
-            for (treg, tc) in configs {
-                let idx = treg.0;
-                if idx >= 8 {
-                    return Err(format!("AMX tile index {} out of range (0..7)", idx));
-                }
-                let i = idx as usize;
-                let cb = tc.cols_bytes.to_le_bytes();
-                cfg.data[16 + 2 * i] = cb[0];
-                cfg.data[16 + 2 * i + 1] = cb[1];
-                cfg.data[48 + i] = tc.rows;
-            }
-            // Use stack-based LDTILECFG (same approach as x86_amx::jit::emit_ldtilecfg)
-            crate::compiler::codegen::x86_amx::jit::emit_ldtilecfg(&mut self.asm, &cfg)
-        }
-
-        fn tile_release(&mut self) -> Result<(), String> {
-            if !self.has_amx {
-                return Err("AMX not available on this target".into());
-            }
-            self.asm.tilerelease().map_err(|e| format!("tilerelease: {e}"))
-        }
-
-        fn tile_zero(&mut self, dst: crate::compiler::codegen::tile_ops::TReg) -> Result<(), String> {
-            if !self.has_amx {
-                return Err("AMX not available on this target".into());
-            }
-            let tmm = crate::compiler::codegen::x86_amx::jit::tmm_reg(dst.0)?;
-            self.asm.tilezero(tmm).map_err(|e| format!("tilezero: {e}"))
-        }
-
-        fn tile_load(&mut self, dst: crate::compiler::codegen::tile_ops::TReg, base: BaseReg, stride: BaseReg) -> Result<(), String> {
-            if !self.has_amx {
-                return Err("AMX not available on this target".into());
-            }
-            let tmm = crate::compiler::codegen::x86_amx::jit::tmm_reg(dst.0)?;
-            let base_gpr = self.gpr64(base)?;
-            let stride_gpr = self.gpr64(stride)?;
-            // TILELOADD tmm, [base + stride*1] — stride register encodes row stride
-            self.asm.tileloadd(tmm, ptr(base_gpr + stride_gpr))
-                .map_err(|e| format!("tileloadd: {e}"))
-        }
-
-        fn tile_store(&mut self, base: BaseReg, stride: BaseReg, src: crate::compiler::codegen::tile_ops::TReg) -> Result<(), String> {
-            if !self.has_amx {
-                return Err("AMX not available on this target".into());
-            }
-            let tmm = crate::compiler::codegen::x86_amx::jit::tmm_reg(src.0)?;
-            let base_gpr = self.gpr64(base)?;
-            let stride_gpr = self.gpr64(stride)?;
-            // TILESTORED [base + stride*1], tmm
-            self.asm.tilestored(ptr(base_gpr + stride_gpr), tmm)
-                .map_err(|e| format!("tilestored: {e}"))
-        }
-
-        fn tile_dpbf16(&mut self, dst: crate::compiler::codegen::tile_ops::TReg, a: crate::compiler::codegen::tile_ops::TReg, b: crate::compiler::codegen::tile_ops::TReg) -> Result<(), String> {
-            if !self.has_amx {
-                return Err("AMX not available on this target".into());
-            }
-            let d = crate::compiler::codegen::x86_amx::jit::tmm_reg(dst.0)?;
-            let ta = crate::compiler::codegen::x86_amx::jit::tmm_reg(a.0)?;
-            let tb = crate::compiler::codegen::x86_amx::jit::tmm_reg(b.0)?;
-            self.asm.tdpbf16ps(d, ta, tb).map_err(|e| format!("tdpbf16ps: {e}"))
-        }
-
-        fn tile_dpbssd(&mut self, dst: crate::compiler::codegen::tile_ops::TReg, a: crate::compiler::codegen::tile_ops::TReg, b: crate::compiler::codegen::tile_ops::TReg) -> Result<(), String> {
-            if !self.has_amx {
-                return Err("AMX not available on this target".into());
-            }
-            let d = crate::compiler::codegen::x86_amx::jit::tmm_reg(dst.0)?;
-            let ta = crate::compiler::codegen::x86_amx::jit::tmm_reg(a.0)?;
-            let tb = crate::compiler::codegen::x86_amx::jit::tmm_reg(b.0)?;
-            self.asm.tdpbssd(d, ta, tb).map_err(|e| format!("tdpbssd: {e}"))
-        }
-
-        fn tile_max_rows(&self) -> u8 { 16 }
-        fn tile_max_cols_bytes(&self) -> u16 { 64 }
-        fn tile_count(&self) -> u8 { 8 }
-        fn has_tile_ops(&self) -> bool { self.has_amx }
-
-        fn tile_accel_kind(&self) -> Option<crate::compiler::codegen::tile_ops::TileAccelKind> {
-            if self.has_amx {
-                Some(crate::compiler::codegen::tile_ops::TileAccelKind::Amx)
-            } else {
-                None
-            }
-        }
-
-        fn tile_supported_dtypes(&self) -> Vec<crate::compiler::codegen::tile_ops::TileDtype> {
-            if self.has_amx {
-                vec![
-                    crate::compiler::codegen::tile_ops::TileDtype::BF16,
-                    crate::compiler::codegen::tile_ops::TileDtype::INT8,
-                ]
-            } else {
-                vec![]
-            }
         }
     }
 
@@ -6292,8 +6289,8 @@ pub mod jit {
                 TraceOp::Input(0),
                 TraceOp::Neg(0),
             ];
-            let result = codegen.emit_trace_on_stack_zmm(zmm0, &body, InputMode::Elementwise { is_binary: false, scalar_tail: false });
-            assert!(result.is_ok(), "emit_trace_on_stack_zmm elementwise failed: {:?}", result.err());
+            let result = codegen.emit_elementwise_trace_body_avx512(zmm0, &body, false, false);
+            assert!(result.is_ok(), "emit_elementwise_trace_body_avx512 failed: {:?}", result.err());
         }
 
         #[test]
@@ -6363,17 +6360,12 @@ pub mod jit {
         fn test_avx512_trace_ops_overflow() {
             let profile = avx512_profile();
             let mut codegen = X86CodeGen::new(&profile);
-            // zmm0-zmm28 are usable (29 regs); zmm29-zmm31 reserved as scratch.
-            // 29 inputs fill zmm0-zmm28, index 29 should fail.
-            let mut ops: Vec<TraceOp> = (0..29).map(|i| TraceOp::Input(i as u32)).collect();
-            ops.push(TraceOp::Add(0, 1)); // SSA index 29
+            // 28 inputs fill zmm0-zmm27, index 28 should fail
+            let mut ops: Vec<TraceOp> = (0..28).map(|i| TraceOp::Input(i as u32)).collect();
+            ops.push(TraceOp::Add(0, 1)); // SSA index 28
             let result = codegen.emit_trace_ops_avx512(&ops);
             assert!(result.is_err());
-            let msg = result.unwrap_err();
-            assert!(
-                msg.contains("SSA index 29 exceeds available registers"),
-                "unexpected error: {msg}"
-            );
+            assert!(result.unwrap_err().contains("exceeds available zmm accumulators"));
         }
 
         #[test]
@@ -6591,7 +6583,7 @@ mod tests {
             assert!(result.is_err());
             let msg = result.unwrap_err();
             assert!(
-                msg.contains("SSA index 13 exceeds available registers"),
+                msg.contains("SSA index 13 exceeds available ymm registers"),
                 "unexpected error: {msg}"
             );
         }
@@ -8664,4 +8656,3 @@ mod registry_elementwise_tests {
         eprintln!("Registry SiLU with tail: all {} elements within 1e-3", TAIL_N);
     }
 }
-

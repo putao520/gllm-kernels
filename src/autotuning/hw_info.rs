@@ -38,6 +38,13 @@ pub struct IsaFeatures {
     pub avx512bw: bool,
     pub avx512vnni: bool,
     pub neon: bool,
+    /// ARM SVE (Scalable Vector Extension) detected.
+    pub sve: bool,
+    /// ARM SVE2 detected (superset of SVE).
+    pub sve2: bool,
+    /// SVE vector length in bytes (runtime-determined via RDVL/CNTB).
+    /// 0 if SVE is not available.
+    pub sve_vl_bytes: usize,
 }
 
 impl fmt::Display for HwInfo {
@@ -70,6 +77,11 @@ impl fmt::Display for IsaFeatures {
         }
         if self.fma {
             feats.push("FMA");
+        }
+        if self.sve2 {
+            feats.push("SVE2");
+        } else if self.sve {
+            feats.push("SVE");
         }
         if self.neon {
             feats.push("NEON");
@@ -141,7 +153,7 @@ fn detect_cpu_identity() -> (String, String) {
 #[cfg(target_arch = "x86_64")]
 fn detect_x86_identity() -> Option<(String, String)> {
     let vendor = {
-        let r = std::arch::x86_64::__cpuid(0);
+        let r = unsafe { std::arch::x86_64::__cpuid(0) };
         let mut bytes = [0u8; 12];
         bytes[0..4].copy_from_slice(&r.ebx.to_le_bytes());
         bytes[4..8].copy_from_slice(&r.edx.to_le_bytes());
@@ -152,7 +164,7 @@ fn detect_x86_identity() -> Option<(String, String)> {
     let model_name = {
         let mut name = String::with_capacity(48);
         for leaf in 0x80000002u32..=0x80000004u32 {
-            let r = std::arch::x86_64::__cpuid(leaf);
+            let r = unsafe { std::arch::x86_64::__cpuid(leaf) };
             for reg in [r.eax, r.ebx, r.ecx, r.edx] {
                 for byte in reg.to_le_bytes() {
                     if byte != 0 {
@@ -237,7 +249,7 @@ fn detect_linux_physical_cores() -> Option<usize> {
 fn detect_cacheline_size() -> usize {
     #[cfg(target_arch = "x86_64")]
     {
-        let info = std::arch::x86_64::__cpuid(1);
+        let info = unsafe { std::arch::x86_64::__cpuid(1) };
         let cl = ((info.ebx >> 8) & 0xFF) as usize * 8;
         if cl > 0 {
             return cl;
@@ -258,10 +270,16 @@ fn detect_isa_features() -> IsaFeatures {
             avx512bw: is_x86_feature_detected!("avx512bw"),
             avx512vnni: is_x86_feature_detected!("avx512vnni"),
             neon: false,
+            sve: false,
+            sve2: false,
+            sve_vl_bytes: 0,
         };
     }
     #[cfg(target_arch = "aarch64")]
     {
+        let sve = std::arch::is_aarch64_feature_detected!("sve");
+        let sve2 = std::arch::is_aarch64_feature_detected!("sve2");
+        let sve_vl_bytes = if sve { detect_sve_vl_bytes() } else { 0 };
         return IsaFeatures {
             avx2: false,
             fma: false,
@@ -269,6 +287,9 @@ fn detect_isa_features() -> IsaFeatures {
             avx512bw: false,
             avx512vnni: false,
             neon: true,
+            sve,
+            sve2,
+            sve_vl_bytes,
         };
     }
     #[allow(unreachable_code)]
@@ -279,7 +300,25 @@ fn detect_isa_features() -> IsaFeatures {
         avx512bw: false,
         avx512vnni: false,
         neon: false,
+        sve: false,
+        sve2: false,
+        sve_vl_bytes: 0,
     }
+}
+
+/// Detect SVE vector length in bytes at runtime.
+///
+/// On aarch64 with SVE, uses inline assembly (CNTB) to read the
+/// hardware vector length. Returns 0 on non-SVE platforms.
+#[cfg(target_arch = "aarch64")]
+fn detect_sve_vl_bytes() -> usize {
+    // CNTB Xd — count the number of bytes in a SVE vector register.
+    // This is a safe instruction that reads a system register.
+    let vl: u64;
+    unsafe {
+        std::arch::asm!("cntb {}", out(reg) vl, options(nomem, nostack, preserves_flags));
+    }
+    vl as usize
 }
 
 #[cfg(test)]

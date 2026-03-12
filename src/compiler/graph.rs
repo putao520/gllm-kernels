@@ -13,6 +13,55 @@ use crate::dispatch::device_profile::DeviceProfile;
 use crate::types::DType;
 use crate::traits::Activation;
 
+
+// ── Weight blob layout ────────────────────────────────────────────
+
+/// Weight blob layout: maps graph input tensors to byte offsets.
+/// Platform-independent — used by all backends.
+#[derive(Debug, Clone)]
+pub struct WeightLayout {
+    /// (TensorId, byte_offset) for each weight tensor in blob order.
+    pub offsets: Vec<(TensorId, usize)>,
+    /// Total weight blob size in bytes.
+    pub total_bytes: usize,
+}
+
+impl WeightLayout {
+    /// Look up the byte offset of a weight tensor in the blob.
+    pub fn offset_of(&self, tid: TensorId) -> Option<usize> {
+        self.offsets.iter().find(|(t, _)| *t == tid).map(|(_, off)| *off)
+    }
+}
+
+/// Platform-independent pointer source for a fusion group.
+#[derive(Debug, Clone)]
+pub enum PtrSource {
+    /// Activation input (graph.inputs[0]) — passed via ABI arg 0
+    ActivationInput,
+    /// Weight blob at byte offset — passed via ABI arg 1 + offset
+    WeightBlob(usize),
+    /// Intermediate tensor in scratchpad at byte offset
+    Scratchpad(usize),
+    /// Graph output — passed via ABI output ptr
+    GraphOutput,
+}
+
+/// Platform-independent pointer binding for a fusion group.
+#[derive(Debug, Clone, Default)]
+pub struct GroupPointerMap {
+    /// A matrix (GEMM input / elementwise input)
+    pub a_ptr: Option<PtrSource>,
+    /// B matrix (GEMM weight)
+    pub b_ptr: Option<PtrSource>,
+    /// Bias vector (GemmBias)
+    pub bias_ptr: Option<PtrSource>,
+    /// Norm weight
+    pub norm_weight_ptr: Option<PtrSource>,
+    /// Norm bias (LayerNorm)
+    pub norm_bias_ptr: Option<PtrSource>,
+    /// Output destination
+    pub output_ptr: Option<PtrSource>,
+}
 // ── Identifiers ────────────────────────────────────────────────────
 
 /// Unique tensor identifier within a CompilerGraph.
@@ -65,6 +114,9 @@ pub enum OpKind {
 
     // ── Attention ──
     Softmax,
+    /// Multi-head attention: Q[s,h] × K[s,h] → softmax → × V[s,h] → [s,h]
+    /// Handles reshape to [num_heads, s, head_dim] internally.
+    MultiHeadAttention { seq_len: usize, num_heads: usize, head_dim: usize },
     /// Rotary position embedding (non-interleaved).
     RoPE { head_dim: usize, theta: f64 },
 
@@ -73,6 +125,10 @@ pub enum OpKind {
     Mul,
     /// Residual connection: out = x + residual
     Residual,
+
+    /// Mean pooling: average seq_len rows of hidden elements.
+    /// Input: [seq_len, hidden], Output: [hidden]
+    MeanPool { seq_len: usize, hidden: usize },
 
     // ── Quantization ──
     /// Quantized GEMM: dequantize weights on-the-fly during matmul.
@@ -224,6 +280,21 @@ impl CompilerGraph {
     /// Number of tensors.
     pub fn num_tensors(&self) -> usize {
         self.tensors.len()
+    }
+
+    /// Compute weight blob layout: skip inputs[0] (activation input),
+    /// remaining inputs packed contiguously in order.
+    pub fn weight_layout(&self) -> WeightLayout {
+        let mut offsets = Vec::new();
+        let mut cursor = 0usize;
+        for &tid in self.inputs.iter().skip(1) {
+            offsets.push((tid, cursor));
+            let numel = self.tensor_numel(tid).unwrap_or(0);
+            let dtype_size = self.tensor(tid)
+                .map(|t| t.dtype.size_bytes()).unwrap_or(4);
+            cursor += numel * dtype_size;
+        }
+        WeightLayout { offsets, total_bytes: cursor }
     }
 
     /// Build def-use chains: TensorId → (producer OpId, consumer OpIds).

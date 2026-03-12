@@ -47,6 +47,10 @@ pub enum IsaLevel {
     /// 32 x f16 per register, native FMA/add/mul — 2x throughput vs F16C conversion path.
     Avx512Fp16,
     Neon,
+    /// ARM SVE (Scalable Vector Extension) — runtime vector length 128..2048 bits.
+    Sve,
+    /// ARM SVE2 — superset of SVE with additional integer/crypto/bitmanip instructions.
+    Sve2,
 }
 
 static ISA_LEVEL: OnceLock<IsaLevel> = OnceLock::new();
@@ -70,7 +74,14 @@ fn detect_isa_features() -> IsaLevel {
 
 #[cfg(target_arch = "aarch64")]
 fn detect_isa_features() -> IsaLevel {
-    IsaLevel::Neon
+    let hw = crate::autotuning::HwInfo::detect();
+    if hw.isa.sve2 {
+        IsaLevel::Sve2
+    } else if hw.isa.sve {
+        IsaLevel::Sve
+    } else {
+        IsaLevel::Neon
+    }
 }
 
 #[cfg(not(any(target_arch = "x86", target_arch = "x86_64", target_arch = "aarch64")))]
@@ -107,7 +118,11 @@ impl<E: Element> CpuKernels<E> {
 macro_rules! define_quant_dot_k {
     ($fn_name:ident, $qfmt:ident, $block_ty:ident) => {
         fn $fn_name(&self, block: &[u8], other: &[f32]) -> f32 {
-            let blk = block.as_ptr() as *const crate::quant::$block_ty;
+            // Copy to aligned stack variable to handle unaligned mmap data
+            let aligned: crate::quant::$block_ty = unsafe {
+                std::ptr::read_unaligned(block.as_ptr() as *const crate::quant::$block_ty)
+            };
+            let blk = &aligned as *const crate::quant::$block_ty;
             let src = other.as_ptr();
             match get_isa_level() {
                 #[cfg(target_arch = "x86_64")]
@@ -115,7 +130,7 @@ macro_rules! define_quant_dot_k {
                 #[cfg(target_arch = "x86_64")]
                 IsaLevel::Avx2 => { crate::quant_primitive!(avx2, $qfmt, dot, blk, src) }
                 #[cfg(target_arch = "aarch64")]
-                IsaLevel::Neon => { crate::quant_primitive!(neon, $qfmt, dot, blk, src) }
+                IsaLevel::Neon | IsaLevel::Sve | IsaLevel::Sve2 => { crate::quant_primitive!(neon, $qfmt, dot, blk, src) }
                 _ => { crate::quant_primitive!(scalar, $qfmt, dot, blk, src) }
             }
         }
@@ -126,7 +141,10 @@ macro_rules! define_quant_dot_k {
 macro_rules! define_quant_dot_iq {
     ($fn_name:ident, $qfmt:ident, $block_ty:ident) => {
         fn $fn_name(&self, block: &[u8], other: &[f32]) -> f32 {
-            let blk = block.as_ptr() as *const crate::quant::$block_ty;
+            let aligned: crate::quant::$block_ty = unsafe {
+                std::ptr::read_unaligned(block.as_ptr() as *const crate::quant::$block_ty)
+            };
+            let blk = &aligned as *const crate::quant::$block_ty;
             let src = other.as_ptr();
             match get_isa_level() {
                 #[cfg(target_arch = "x86_64")]
@@ -134,7 +152,7 @@ macro_rules! define_quant_dot_iq {
                 #[cfg(target_arch = "x86_64")]
                 IsaLevel::Avx2 => { crate::quant_primitive!(avx2, $qfmt, dot, blk, src) }
                 #[cfg(target_arch = "aarch64")]
-                IsaLevel::Neon => { crate::quant_primitive!(neon, $qfmt, dot, blk, src) }
+                IsaLevel::Neon | IsaLevel::Sve | IsaLevel::Sve2 => { crate::quant_primitive!(neon, $qfmt, dot, blk, src) }
                 _ => { crate::quant_primitive!(scalar, $qfmt, dot, blk, src) }
             }
         }
@@ -145,7 +163,10 @@ macro_rules! define_quant_dot_iq {
 macro_rules! define_quant_decode_k {
     ($fn_name:ident, $qfmt:ident, $block_ty:ident) => {
         fn $fn_name(&self, block: &[u8], out: &mut [f32]) {
-            let blk = block.as_ptr() as *const crate::quant::$block_ty;
+            let aligned: crate::quant::$block_ty = unsafe {
+                std::ptr::read_unaligned(block.as_ptr() as *const crate::quant::$block_ty)
+            };
+            let blk = &aligned as *const crate::quant::$block_ty;
             let dst = out.as_mut_ptr();
             match get_isa_level() {
                 #[cfg(target_arch = "x86_64")]
@@ -153,7 +174,7 @@ macro_rules! define_quant_decode_k {
                 #[cfg(target_arch = "x86_64")]
                 IsaLevel::Avx2 => { crate::quant_primitive!(avx2, $qfmt, decode, blk, dst); }
                 #[cfg(target_arch = "aarch64")]
-                IsaLevel::Neon => { crate::quant_primitive!(neon, $qfmt, decode, blk, dst); }
+                IsaLevel::Neon | IsaLevel::Sve | IsaLevel::Sve2 => { crate::quant_primitive!(neon, $qfmt, decode, blk, dst); }
                 _ => { crate::quant_primitive!(scalar, $qfmt, decode, blk, dst); }
             }
         }
@@ -164,7 +185,10 @@ macro_rules! define_quant_decode_k {
 macro_rules! define_quant_decode_scalar {
     ($fn_name:ident, $qfmt:ident, $block_ty:ident) => {
         fn $fn_name(&self, block: &[u8], out: &mut [f32]) {
-            let blk = block.as_ptr() as *const crate::quant::$block_ty;
+            let aligned: crate::quant::$block_ty = unsafe {
+                std::ptr::read_unaligned(block.as_ptr() as *const crate::quant::$block_ty)
+            };
+            let blk = &aligned as *const crate::quant::$block_ty;
             let dst = out.as_mut_ptr();
             crate::quant_primitive!(scalar, $qfmt, decode, blk, dst);
         }
@@ -175,13 +199,16 @@ macro_rules! define_quant_decode_scalar {
 macro_rules! define_quant_decode_avx512 {
     ($fn_name:ident, $qfmt:ident, $block_ty:ident) => {
         fn $fn_name(&self, block: &[u8], out: &mut [f32]) {
-            let blk = block.as_ptr() as *const crate::quant::$block_ty;
+            let aligned: crate::quant::$block_ty = unsafe {
+                std::ptr::read_unaligned(block.as_ptr() as *const crate::quant::$block_ty)
+            };
+            let blk = &aligned as *const crate::quant::$block_ty;
             let dst = out.as_mut_ptr();
             match get_isa_level() {
                 #[cfg(target_arch = "x86_64")]
                 IsaLevel::Avx512 | IsaLevel::Avx512Fp16 => { crate::quant_primitive!(avx512, $qfmt, decode, blk, dst); }
                 #[cfg(target_arch = "aarch64")]
-                IsaLevel::Neon => { crate::quant_primitive!(neon, $qfmt, decode, blk, dst); }
+                IsaLevel::Neon | IsaLevel::Sve | IsaLevel::Sve2 => { crate::quant_primitive!(neon, $qfmt, decode, blk, dst); }
                 _ => { crate::quant_primitive!(scalar, $qfmt, decode, blk, dst); }
             }
         }
@@ -192,7 +219,10 @@ macro_rules! define_quant_decode_avx512 {
 macro_rules! define_quant_decode_iq {
     ($fn_name:ident, $qfmt:ident, $block_ty:ident) => {
         fn $fn_name(&self, block: &[u8], out: &mut [f32]) {
-            let blk = block.as_ptr() as *const crate::quant::$block_ty;
+            let aligned: crate::quant::$block_ty = unsafe {
+                std::ptr::read_unaligned(block.as_ptr() as *const crate::quant::$block_ty)
+            };
+            let blk = &aligned as *const crate::quant::$block_ty;
             let dst = out.as_mut_ptr();
             match get_isa_level() {
                 #[cfg(target_arch = "x86_64")]
@@ -200,7 +230,7 @@ macro_rules! define_quant_decode_iq {
                 #[cfg(target_arch = "x86_64")]
                 IsaLevel::Avx2 => { crate::quant_primitive!(avx2, $qfmt, decode, blk, dst); }
                 #[cfg(target_arch = "aarch64")]
-                IsaLevel::Neon => { crate::quant_primitive!(neon, $qfmt, decode, blk, dst); }
+                IsaLevel::Neon | IsaLevel::Sve | IsaLevel::Sve2 => { crate::quant_primitive!(neon, $qfmt, decode, blk, dst); }
                 _ => { crate::quant_primitive!(scalar, $qfmt, decode, blk, dst); }
             }
         }
@@ -211,7 +241,10 @@ macro_rules! define_quant_decode_iq {
 macro_rules! define_quant_dot_iq4 {
     ($fn_name:ident, $qfmt:ident, $block_ty:ident) => {
         fn $fn_name(&self, block: &[u8], other: &[f32]) -> f32 {
-            let blk = block.as_ptr() as *const crate::quant::$block_ty;
+            let aligned: crate::quant::$block_ty = unsafe {
+                std::ptr::read_unaligned(block.as_ptr() as *const crate::quant::$block_ty)
+            };
+            let blk = &aligned as *const crate::quant::$block_ty;
             let src = other.as_ptr();
             match get_isa_level() {
                 #[cfg(target_arch = "x86_64")]
@@ -219,7 +252,7 @@ macro_rules! define_quant_dot_iq4 {
                 #[cfg(target_arch = "x86_64")]
                 IsaLevel::Avx2 => { crate::quant_primitive!(avx2, $qfmt, dot, blk, src) }
                 #[cfg(target_arch = "aarch64")]
-                IsaLevel::Neon => { crate::quant_primitive!(neon, $qfmt, dot, blk, src) }
+                IsaLevel::Neon | IsaLevel::Sve | IsaLevel::Sve2 => { crate::quant_primitive!(neon, $qfmt, dot, blk, src) }
                 _ => { crate::quant_primitive!(scalar, $qfmt, dot, blk, src) }
             }
         }
@@ -230,7 +263,10 @@ macro_rules! define_quant_dot_iq4 {
 macro_rules! define_quant_decode_iq4 {
     ($fn_name:ident, $qfmt:ident, $block_ty:ident) => {
         fn $fn_name(&self, block: &[u8], out: &mut [f32]) {
-            let blk = block.as_ptr() as *const crate::quant::$block_ty;
+            let aligned: crate::quant::$block_ty = unsafe {
+                std::ptr::read_unaligned(block.as_ptr() as *const crate::quant::$block_ty)
+            };
+            let blk = &aligned as *const crate::quant::$block_ty;
             let dst = out.as_mut_ptr();
             match get_isa_level() {
                 #[cfg(target_arch = "x86_64")]
@@ -238,7 +274,7 @@ macro_rules! define_quant_decode_iq4 {
                 #[cfg(target_arch = "x86_64")]
                 IsaLevel::Avx2 => { crate::quant_primitive!(avx2, $qfmt, decode, blk, dst); }
                 #[cfg(target_arch = "aarch64")]
-                IsaLevel::Neon => { crate::quant_primitive!(neon, $qfmt, decode, blk, dst); }
+                IsaLevel::Neon | IsaLevel::Sve | IsaLevel::Sve2 => { crate::quant_primitive!(neon, $qfmt, decode, blk, dst); }
                 _ => { crate::quant_primitive!(scalar, $qfmt, decode, blk, dst); }
             }
         }
@@ -249,7 +285,10 @@ macro_rules! define_quant_decode_iq4 {
 macro_rules! define_quant_dot_commercial {
     ($fn_name:ident, $qfmt:ident, $block_ty:ident) => {
         fn $fn_name(&self, block: &[u8], other: &[f32]) -> f32 {
-            let blk = block.as_ptr() as *const crate::quant::$block_ty;
+            let aligned: crate::quant::$block_ty = unsafe {
+                std::ptr::read_unaligned(block.as_ptr() as *const crate::quant::$block_ty)
+            };
+            let blk = &aligned as *const crate::quant::$block_ty;
             let src = other.as_ptr();
             match get_isa_level() {
                 #[cfg(target_arch = "x86_64")]
@@ -257,7 +296,7 @@ macro_rules! define_quant_dot_commercial {
                 #[cfg(target_arch = "x86_64")]
                 IsaLevel::Avx2 => { crate::quant_primitive!(avx2, $qfmt, dot, blk, src) }
                 #[cfg(target_arch = "aarch64")]
-                IsaLevel::Neon => { crate::quant_primitive!(neon, $qfmt, dot, blk, src) }
+                IsaLevel::Neon | IsaLevel::Sve | IsaLevel::Sve2 => { crate::quant_primitive!(neon, $qfmt, dot, blk, src) }
                 _ => { crate::quant_primitive!(scalar, $qfmt, dot, blk, src) }
             }
         }
@@ -311,7 +350,7 @@ impl<E: Element> CpuKernels<E> {
             #[cfg(target_arch = "x86_64")]
             IsaLevel::Avx2 => avx2::avx2_f32::dot(a, b).to_f32(),
             #[cfg(target_arch = "aarch64")]
-            IsaLevel::Neon => neon::neon_f32::dot(a, b).to_f32(),
+            IsaLevel::Neon | IsaLevel::Sve | IsaLevel::Sve2 => neon::neon_f32::dot(a, b).to_f32(),
             _ => scalar::scalar_f32::dot(a, b).to_f32(),
         }
     }
@@ -411,11 +450,11 @@ macro_rules! dispatch_binary_op {
             #[cfg(target_arch = "x86_64")]
             (IsaLevel::Avx2, 2) => avx2::avx2_bf16::$op(as_typed_slice!($a, half::bf16), as_typed_slice!($b, half::bf16), as_typed_slice_mut!($out, half::bf16)),
             #[cfg(target_arch = "aarch64")]
-            (IsaLevel::Neon, 0) => neon::neon_f32::$op(as_typed_slice!($a, f32), as_typed_slice!($b, f32), as_typed_slice_mut!($out, f32)),
+            (IsaLevel::Neon | IsaLevel::Sve | IsaLevel::Sve2, 0) => neon::neon_f32::$op(as_typed_slice!($a, f32), as_typed_slice!($b, f32), as_typed_slice_mut!($out, f32)),
             #[cfg(target_arch = "aarch64")]
-            (IsaLevel::Neon, 1) => neon::neon_f16::$op(as_typed_slice!($a, half::f16), as_typed_slice!($b, half::f16), as_typed_slice_mut!($out, half::f16)),
+            (IsaLevel::Neon | IsaLevel::Sve | IsaLevel::Sve2, 1) => neon::neon_f16::$op(as_typed_slice!($a, half::f16), as_typed_slice!($b, half::f16), as_typed_slice_mut!($out, half::f16)),
             #[cfg(target_arch = "aarch64")]
-            (IsaLevel::Neon, 2) => neon::neon_bf16::$op(as_typed_slice!($a, half::bf16), as_typed_slice!($b, half::bf16), as_typed_slice_mut!($out, half::bf16)),
+            (IsaLevel::Neon | IsaLevel::Sve | IsaLevel::Sve2, 2) => neon::neon_bf16::$op(as_typed_slice!($a, half::bf16), as_typed_slice!($b, half::bf16), as_typed_slice_mut!($out, half::bf16)),
             (_, 0) => scalar::scalar_f32::$op(as_typed_slice!($a, f32), as_typed_slice!($b, f32), as_typed_slice_mut!($out, f32)),
             (_, 1) => scalar::scalar_f16::$op(as_typed_slice!($a, half::f16), as_typed_slice!($b, half::f16), as_typed_slice_mut!($out, half::f16)),
             (_, 2) => scalar::scalar_bf16::$op(as_typed_slice!($a, half::bf16), as_typed_slice!($b, half::bf16), as_typed_slice_mut!($out, half::bf16)),
@@ -442,11 +481,11 @@ macro_rules! dispatch_unary_op {
             #[cfg(target_arch = "x86_64")]
             (IsaLevel::Avx2, 2) => avx2::avx2_bf16::$op(as_typed_slice!($a, half::bf16), as_typed_slice_mut!($out, half::bf16)),
             #[cfg(target_arch = "aarch64")]
-            (IsaLevel::Neon, 0) => neon::neon_f32::$op(as_typed_slice!($a, f32), as_typed_slice_mut!($out, f32)),
+            (IsaLevel::Neon | IsaLevel::Sve | IsaLevel::Sve2, 0) => neon::neon_f32::$op(as_typed_slice!($a, f32), as_typed_slice_mut!($out, f32)),
             #[cfg(target_arch = "aarch64")]
-            (IsaLevel::Neon, 1) => neon::neon_f16::$op(as_typed_slice!($a, half::f16), as_typed_slice_mut!($out, half::f16)),
+            (IsaLevel::Neon | IsaLevel::Sve | IsaLevel::Sve2, 1) => neon::neon_f16::$op(as_typed_slice!($a, half::f16), as_typed_slice_mut!($out, half::f16)),
             #[cfg(target_arch = "aarch64")]
-            (IsaLevel::Neon, 2) => neon::neon_bf16::$op(as_typed_slice!($a, half::bf16), as_typed_slice_mut!($out, half::bf16)),
+            (IsaLevel::Neon | IsaLevel::Sve | IsaLevel::Sve2, 2) => neon::neon_bf16::$op(as_typed_slice!($a, half::bf16), as_typed_slice_mut!($out, half::bf16)),
             (_, 0) => scalar::scalar_f32::$op(as_typed_slice!($a, f32), as_typed_slice_mut!($out, f32)),
             (_, 1) => scalar::scalar_f16::$op(as_typed_slice!($a, half::f16), as_typed_slice_mut!($out, half::f16)),
             (_, 2) => scalar::scalar_bf16::$op(as_typed_slice!($a, half::bf16), as_typed_slice_mut!($out, half::bf16)),
@@ -473,11 +512,11 @@ macro_rules! dispatch_reduce_op {
             #[cfg(target_arch = "x86_64")]
             (IsaLevel::Avx2, 2) => avx2::avx2_bf16::$op(as_typed_slice!($a, half::bf16)).to_f32(),
             #[cfg(target_arch = "aarch64")]
-            (IsaLevel::Neon, 0) => neon::neon_f32::$op(as_typed_slice!($a, f32)).to_f32(),
+            (IsaLevel::Neon | IsaLevel::Sve | IsaLevel::Sve2, 0) => neon::neon_f32::$op(as_typed_slice!($a, f32)).to_f32(),
             #[cfg(target_arch = "aarch64")]
-            (IsaLevel::Neon, 1) => neon::neon_f16::$op(as_typed_slice!($a, half::f16)).to_f32(),
+            (IsaLevel::Neon | IsaLevel::Sve | IsaLevel::Sve2, 1) => neon::neon_f16::$op(as_typed_slice!($a, half::f16)).to_f32(),
             #[cfg(target_arch = "aarch64")]
-            (IsaLevel::Neon, 2) => neon::neon_bf16::$op(as_typed_slice!($a, half::bf16)).to_f32(),
+            (IsaLevel::Neon | IsaLevel::Sve | IsaLevel::Sve2, 2) => neon::neon_bf16::$op(as_typed_slice!($a, half::bf16)).to_f32(),
             (_, 0) => scalar::scalar_f32::$op(as_typed_slice!($a, f32)).to_f32(),
             (_, 1) => scalar::scalar_f16::$op(as_typed_slice!($a, half::f16)).to_f32(),
             (_, 2) => scalar::scalar_bf16::$op(as_typed_slice!($a, half::bf16)).to_f32(),
@@ -505,11 +544,11 @@ macro_rules! dispatch_dot_op {
             #[cfg(target_arch = "x86_64")]
             (IsaLevel::Avx2, 2) => avx2::avx2_bf16::$op(as_typed_slice!($a, half::bf16), as_typed_slice!($b, half::bf16)).to_f32(),
             #[cfg(target_arch = "aarch64")]
-            (IsaLevel::Neon, 0) => neon::neon_f32::$op(as_typed_slice!($a, f32), as_typed_slice!($b, f32)).to_f32(),
+            (IsaLevel::Neon | IsaLevel::Sve | IsaLevel::Sve2, 0) => neon::neon_f32::$op(as_typed_slice!($a, f32), as_typed_slice!($b, f32)).to_f32(),
             #[cfg(target_arch = "aarch64")]
-            (IsaLevel::Neon, 1) => neon::neon_f16::$op(as_typed_slice!($a, half::f16), as_typed_slice!($b, half::f16)).to_f32(),
+            (IsaLevel::Neon | IsaLevel::Sve | IsaLevel::Sve2, 1) => neon::neon_f16::$op(as_typed_slice!($a, half::f16), as_typed_slice!($b, half::f16)).to_f32(),
             #[cfg(target_arch = "aarch64")]
-            (IsaLevel::Neon, 2) => neon::neon_bf16::$op(as_typed_slice!($a, half::bf16), as_typed_slice!($b, half::bf16)).to_f32(),
+            (IsaLevel::Neon | IsaLevel::Sve | IsaLevel::Sve2, 2) => neon::neon_bf16::$op(as_typed_slice!($a, half::bf16), as_typed_slice!($b, half::bf16)).to_f32(),
             (_, 0) => scalar::scalar_f32::$op(as_typed_slice!($a, f32), as_typed_slice!($b, f32)).to_f32(),
             (_, 1) => scalar::scalar_f16::$op(as_typed_slice!($a, half::f16), as_typed_slice!($b, half::f16)).to_f32(),
             (_, 2) => scalar::scalar_bf16::$op(as_typed_slice!($a, half::bf16), as_typed_slice!($b, half::bf16)).to_f32(),
@@ -538,11 +577,11 @@ macro_rules! dispatch_with_scalar {
             #[cfg(target_arch = "x86_64")]
             (IsaLevel::Avx2, 2) => avx2::avx2_bf16::$op(half::bf16::from_f32($scalar), as_typed_slice!($x, half::bf16), as_typed_slice_mut!($y, half::bf16)),
             #[cfg(target_arch = "aarch64")]
-            (IsaLevel::Neon, 0) => neon::neon_f32::$op($scalar, as_typed_slice!($x, f32), as_typed_slice_mut!($y, f32)),
+            (IsaLevel::Neon | IsaLevel::Sve | IsaLevel::Sve2, 0) => neon::neon_f32::$op($scalar, as_typed_slice!($x, f32), as_typed_slice_mut!($y, f32)),
             #[cfg(target_arch = "aarch64")]
-            (IsaLevel::Neon, 1) => neon::neon_f16::$op(half::f16::from_f32($scalar), as_typed_slice!($x, half::f16), as_typed_slice_mut!($y, half::f16)),
+            (IsaLevel::Neon | IsaLevel::Sve | IsaLevel::Sve2, 1) => neon::neon_f16::$op(half::f16::from_f32($scalar), as_typed_slice!($x, half::f16), as_typed_slice_mut!($y, half::f16)),
             #[cfg(target_arch = "aarch64")]
-            (IsaLevel::Neon, 2) => neon::neon_bf16::$op(half::bf16::from_f32($scalar), as_typed_slice!($x, half::bf16), as_typed_slice_mut!($y, half::bf16)),
+            (IsaLevel::Neon | IsaLevel::Sve | IsaLevel::Sve2, 2) => neon::neon_bf16::$op(half::bf16::from_f32($scalar), as_typed_slice!($x, half::bf16), as_typed_slice_mut!($y, half::bf16)),
             (_, 0) => scalar::scalar_f32::$op($scalar, as_typed_slice!($x, f32), as_typed_slice_mut!($y, f32)),
             (_, 1) => scalar::scalar_f16::$op(half::f16::from_f32($scalar), as_typed_slice!($x, half::f16), as_typed_slice_mut!($y, half::f16)),
             (_, 2) => scalar::scalar_bf16::$op(half::bf16::from_f32($scalar), as_typed_slice!($x, half::bf16), as_typed_slice_mut!($y, half::bf16)),
@@ -572,11 +611,11 @@ macro_rules! dispatch_with_eps {
             #[cfg(target_arch = "x86_64")]
             (IsaLevel::Avx2, 2) => avx2::avx2_bf16::$op(as_typed_slice!($x, half::bf16), as_typed_slice!($w, half::bf16), as_typed_slice_mut!($out, half::bf16), half::bf16::from_f32($eps)),
             #[cfg(target_arch = "aarch64")]
-            (IsaLevel::Neon, 0) => neon::neon_f32::$op(as_typed_slice!($x, f32), as_typed_slice!($w, f32), as_typed_slice_mut!($out, f32), $eps),
+            (IsaLevel::Neon | IsaLevel::Sve | IsaLevel::Sve2, 0) => neon::neon_f32::$op(as_typed_slice!($x, f32), as_typed_slice!($w, f32), as_typed_slice_mut!($out, f32), $eps),
             #[cfg(target_arch = "aarch64")]
-            (IsaLevel::Neon, 1) => neon::neon_f16::$op(as_typed_slice!($x, half::f16), as_typed_slice!($w, half::f16), as_typed_slice_mut!($out, half::f16), half::f16::from_f32($eps)),
+            (IsaLevel::Neon | IsaLevel::Sve | IsaLevel::Sve2, 1) => neon::neon_f16::$op(as_typed_slice!($x, half::f16), as_typed_slice!($w, half::f16), as_typed_slice_mut!($out, half::f16), half::f16::from_f32($eps)),
             #[cfg(target_arch = "aarch64")]
-            (IsaLevel::Neon, 2) => neon::neon_bf16::$op(as_typed_slice!($x, half::bf16), as_typed_slice!($w, half::bf16), as_typed_slice_mut!($out, half::bf16), half::bf16::from_f32($eps)),
+            (IsaLevel::Neon | IsaLevel::Sve | IsaLevel::Sve2, 2) => neon::neon_bf16::$op(as_typed_slice!($x, half::bf16), as_typed_slice!($w, half::bf16), as_typed_slice_mut!($out, half::bf16), half::bf16::from_f32($eps)),
             (_, 0) => scalar::scalar_f32::$op(as_typed_slice!($x, f32), as_typed_slice!($w, f32), as_typed_slice_mut!($out, f32), $eps),
             (_, 1) => scalar::scalar_f16::$op(as_typed_slice!($x, half::f16), as_typed_slice!($w, half::f16), as_typed_slice_mut!($out, half::f16), half::f16::from_f32($eps)),
             (_, 2) => scalar::scalar_bf16::$op(as_typed_slice!($x, half::bf16), as_typed_slice!($w, half::bf16), as_typed_slice_mut!($out, half::bf16), half::bf16::from_f32($eps)),
@@ -601,11 +640,11 @@ macro_rules! dispatch_with_eps {
             #[cfg(target_arch = "x86_64")]
             (IsaLevel::Avx2, 2) => avx2::avx2_bf16::$op(as_typed_slice!($x, half::bf16), as_typed_slice!($g, half::bf16), as_typed_slice!($b, half::bf16), as_typed_slice_mut!($out, half::bf16), half::bf16::from_f32($eps)),
             #[cfg(target_arch = "aarch64")]
-            (IsaLevel::Neon, 0) => neon::neon_f32::$op(as_typed_slice!($x, f32), as_typed_slice!($g, f32), as_typed_slice!($b, f32), as_typed_slice_mut!($out, f32), $eps),
+            (IsaLevel::Neon | IsaLevel::Sve | IsaLevel::Sve2, 0) => neon::neon_f32::$op(as_typed_slice!($x, f32), as_typed_slice!($g, f32), as_typed_slice!($b, f32), as_typed_slice_mut!($out, f32), $eps),
             #[cfg(target_arch = "aarch64")]
-            (IsaLevel::Neon, 1) => neon::neon_f16::$op(as_typed_slice!($x, half::f16), as_typed_slice!($g, half::f16), as_typed_slice!($b, half::f16), as_typed_slice_mut!($out, half::f16), half::f16::from_f32($eps)),
+            (IsaLevel::Neon | IsaLevel::Sve | IsaLevel::Sve2, 1) => neon::neon_f16::$op(as_typed_slice!($x, half::f16), as_typed_slice!($g, half::f16), as_typed_slice!($b, half::f16), as_typed_slice_mut!($out, half::f16), half::f16::from_f32($eps)),
             #[cfg(target_arch = "aarch64")]
-            (IsaLevel::Neon, 2) => neon::neon_bf16::$op(as_typed_slice!($x, half::bf16), as_typed_slice!($g, half::bf16), as_typed_slice!($b, half::bf16), as_typed_slice_mut!($out, half::bf16), half::bf16::from_f32($eps)),
+            (IsaLevel::Neon | IsaLevel::Sve | IsaLevel::Sve2, 2) => neon::neon_bf16::$op(as_typed_slice!($x, half::bf16), as_typed_slice!($g, half::bf16), as_typed_slice!($b, half::bf16), as_typed_slice_mut!($out, half::bf16), half::bf16::from_f32($eps)),
             (_, 0) => scalar::scalar_f32::$op(as_typed_slice!($x, f32), as_typed_slice!($g, f32), as_typed_slice!($b, f32), as_typed_slice_mut!($out, f32), $eps),
             (_, 1) => scalar::scalar_f16::$op(as_typed_slice!($x, half::f16), as_typed_slice!($g, half::f16), as_typed_slice!($b, half::f16), as_typed_slice_mut!($out, half::f16), half::f16::from_f32($eps)),
             (_, 2) => scalar::scalar_bf16::$op(as_typed_slice!($x, half::bf16), as_typed_slice!($g, half::bf16), as_typed_slice!($b, half::bf16), as_typed_slice_mut!($out, half::bf16), half::bf16::from_f32($eps)),
@@ -635,11 +674,11 @@ macro_rules! dispatch_with_dims {
             #[cfg(target_arch = "x86_64")]
             (IsaLevel::Avx2, 2) => avx2::avx2_bf16::$op(as_typed_slice!($a, half::bf16), as_typed_slice!($x, half::bf16), as_typed_slice_mut!($y, half::bf16), $m, $n),
             #[cfg(target_arch = "aarch64")]
-            (IsaLevel::Neon, 0) => neon::neon_f32::$op(as_typed_slice!($a, f32), as_typed_slice!($x, f32), as_typed_slice_mut!($y, f32), $m, $n),
+            (IsaLevel::Neon | IsaLevel::Sve | IsaLevel::Sve2, 0) => neon::neon_f32::$op(as_typed_slice!($a, f32), as_typed_slice!($x, f32), as_typed_slice_mut!($y, f32), $m, $n),
             #[cfg(target_arch = "aarch64")]
-            (IsaLevel::Neon, 1) => neon::neon_f16::$op(as_typed_slice!($a, half::f16), as_typed_slice!($x, half::f16), as_typed_slice_mut!($y, half::f16), $m, $n),
+            (IsaLevel::Neon | IsaLevel::Sve | IsaLevel::Sve2, 1) => neon::neon_f16::$op(as_typed_slice!($a, half::f16), as_typed_slice!($x, half::f16), as_typed_slice_mut!($y, half::f16), $m, $n),
             #[cfg(target_arch = "aarch64")]
-            (IsaLevel::Neon, 2) => neon::neon_bf16::$op(as_typed_slice!($a, half::bf16), as_typed_slice!($x, half::bf16), as_typed_slice_mut!($y, half::bf16), $m, $n),
+            (IsaLevel::Neon | IsaLevel::Sve | IsaLevel::Sve2, 2) => neon::neon_bf16::$op(as_typed_slice!($a, half::bf16), as_typed_slice!($x, half::bf16), as_typed_slice_mut!($y, half::bf16), $m, $n),
             (_, 0) => scalar::scalar_f32::$op(as_typed_slice!($a, f32), as_typed_slice!($x, f32), as_typed_slice_mut!($y, f32), $m, $n),
             (_, 1) => scalar::scalar_f16::$op(as_typed_slice!($a, half::f16), as_typed_slice!($x, half::f16), as_typed_slice_mut!($y, half::f16), $m, $n),
             (_, 2) => scalar::scalar_bf16::$op(as_typed_slice!($a, half::bf16), as_typed_slice!($x, half::bf16), as_typed_slice_mut!($y, half::bf16), $m, $n),
@@ -664,11 +703,11 @@ macro_rules! dispatch_with_dims {
             #[cfg(target_arch = "x86_64")]
             (IsaLevel::Avx2, 2) => avx2::avx2_bf16::$op(as_typed_slice!($a, half::bf16), as_typed_slice!($b, half::bf16), as_typed_slice_mut!($c, half::bf16), $m, $n, $k),
             #[cfg(target_arch = "aarch64")]
-            (IsaLevel::Neon, 0) => neon::neon_f32::$op(as_typed_slice!($a, f32), as_typed_slice!($b, f32), as_typed_slice_mut!($c, f32), $m, $n, $k),
+            (IsaLevel::Neon | IsaLevel::Sve | IsaLevel::Sve2, 0) => neon::neon_f32::$op(as_typed_slice!($a, f32), as_typed_slice!($b, f32), as_typed_slice_mut!($c, f32), $m, $n, $k),
             #[cfg(target_arch = "aarch64")]
-            (IsaLevel::Neon, 1) => neon::neon_f16::$op(as_typed_slice!($a, half::f16), as_typed_slice!($b, half::f16), as_typed_slice_mut!($c, half::f16), $m, $n, $k),
+            (IsaLevel::Neon | IsaLevel::Sve | IsaLevel::Sve2, 1) => neon::neon_f16::$op(as_typed_slice!($a, half::f16), as_typed_slice!($b, half::f16), as_typed_slice_mut!($c, half::f16), $m, $n, $k),
             #[cfg(target_arch = "aarch64")]
-            (IsaLevel::Neon, 2) => neon::neon_bf16::$op(as_typed_slice!($a, half::bf16), as_typed_slice!($b, half::bf16), as_typed_slice_mut!($c, half::bf16), $m, $n, $k),
+            (IsaLevel::Neon | IsaLevel::Sve | IsaLevel::Sve2, 2) => neon::neon_bf16::$op(as_typed_slice!($a, half::bf16), as_typed_slice!($b, half::bf16), as_typed_slice_mut!($c, half::bf16), $m, $n, $k),
             (_, 0) => scalar::scalar_f32::$op(as_typed_slice!($a, f32), as_typed_slice!($b, f32), as_typed_slice_mut!($c, f32), $m, $n, $k),
             (_, 1) => scalar::scalar_f16::$op(as_typed_slice!($a, half::f16), as_typed_slice!($b, half::f16), as_typed_slice_mut!($c, half::f16), $m, $n, $k),
             (_, 2) => scalar::scalar_bf16::$op(as_typed_slice!($a, half::bf16), as_typed_slice!($b, half::bf16), as_typed_slice_mut!($c, half::bf16), $m, $n, $k),
@@ -696,11 +735,11 @@ macro_rules! dispatch_gemv_streaming {
             #[cfg(target_arch = "x86_64")]
             (IsaLevel::Avx2, 2) => avx2::avx2_bf16::gemv_streaming(as_typed_slice!($a, half::bf16), as_typed_slice!($b, half::bf16), as_typed_slice_mut!($c, half::bf16), $n, $k),
             #[cfg(target_arch = "aarch64")]
-            (IsaLevel::Neon, 0) => neon::neon_f32::gemv_streaming(as_typed_slice!($a, f32), as_typed_slice!($b, f32), as_typed_slice_mut!($c, f32), $n, $k),
+            (IsaLevel::Neon | IsaLevel::Sve | IsaLevel::Sve2, 0) => neon::neon_f32::gemv_streaming(as_typed_slice!($a, f32), as_typed_slice!($b, f32), as_typed_slice_mut!($c, f32), $n, $k),
             #[cfg(target_arch = "aarch64")]
-            (IsaLevel::Neon, 1) => neon::neon_f16::gemv_streaming(as_typed_slice!($a, half::f16), as_typed_slice!($b, half::f16), as_typed_slice_mut!($c, half::f16), $n, $k),
+            (IsaLevel::Neon | IsaLevel::Sve | IsaLevel::Sve2, 1) => neon::neon_f16::gemv_streaming(as_typed_slice!($a, half::f16), as_typed_slice!($b, half::f16), as_typed_slice_mut!($c, half::f16), $n, $k),
             #[cfg(target_arch = "aarch64")]
-            (IsaLevel::Neon, 2) => neon::neon_bf16::gemv_streaming(as_typed_slice!($a, half::bf16), as_typed_slice!($b, half::bf16), as_typed_slice_mut!($c, half::bf16), $n, $k),
+            (IsaLevel::Neon | IsaLevel::Sve | IsaLevel::Sve2, 2) => neon::neon_bf16::gemv_streaming(as_typed_slice!($a, half::bf16), as_typed_slice!($b, half::bf16), as_typed_slice_mut!($c, half::bf16), $n, $k),
             (_, 0) => scalar::scalar_f32::gemv_streaming(as_typed_slice!($a, f32), as_typed_slice!($b, f32), as_typed_slice_mut!($c, f32), $n, $k),
             (_, 1) => scalar::scalar_f16::gemv_streaming(as_typed_slice!($a, half::f16), as_typed_slice!($b, half::f16), as_typed_slice_mut!($c, half::f16), $n, $k),
             (_, 2) => scalar::scalar_bf16::gemv_streaming(as_typed_slice!($a, half::bf16), as_typed_slice!($b, half::bf16), as_typed_slice_mut!($c, half::bf16), $n, $k),
@@ -728,11 +767,11 @@ macro_rules! dispatch_gemm_skinny {
             #[cfg(target_arch = "x86_64")]
             (IsaLevel::Avx2, 2) => avx2::avx2_bf16::gemm_skinny(as_typed_slice!($a, half::bf16), as_typed_slice!($b, half::bf16), as_typed_slice_mut!($c, half::bf16), $m, $n, $k),
             #[cfg(target_arch = "aarch64")]
-            (IsaLevel::Neon, 0) => neon::neon_f32::gemm_skinny(as_typed_slice!($a, f32), as_typed_slice!($b, f32), as_typed_slice_mut!($c, f32), $m, $n, $k),
+            (IsaLevel::Neon | IsaLevel::Sve | IsaLevel::Sve2, 0) => neon::neon_f32::gemm_skinny(as_typed_slice!($a, f32), as_typed_slice!($b, f32), as_typed_slice_mut!($c, f32), $m, $n, $k),
             #[cfg(target_arch = "aarch64")]
-            (IsaLevel::Neon, 1) => neon::neon_f16::gemm_skinny(as_typed_slice!($a, half::f16), as_typed_slice!($b, half::f16), as_typed_slice_mut!($c, half::f16), $m, $n, $k),
+            (IsaLevel::Neon | IsaLevel::Sve | IsaLevel::Sve2, 1) => neon::neon_f16::gemm_skinny(as_typed_slice!($a, half::f16), as_typed_slice!($b, half::f16), as_typed_slice_mut!($c, half::f16), $m, $n, $k),
             #[cfg(target_arch = "aarch64")]
-            (IsaLevel::Neon, 2) => neon::neon_bf16::gemm_skinny(as_typed_slice!($a, half::bf16), as_typed_slice!($b, half::bf16), as_typed_slice_mut!($c, half::bf16), $m, $n, $k),
+            (IsaLevel::Neon | IsaLevel::Sve | IsaLevel::Sve2, 2) => neon::neon_bf16::gemm_skinny(as_typed_slice!($a, half::bf16), as_typed_slice!($b, half::bf16), as_typed_slice_mut!($c, half::bf16), $m, $n, $k),
             (_, 0) => scalar::scalar_f32::gemm_skinny(as_typed_slice!($a, f32), as_typed_slice!($b, f32), as_typed_slice_mut!($c, f32), $m, $n, $k),
             (_, 1) => scalar::scalar_f16::gemm_skinny(as_typed_slice!($a, half::f16), as_typed_slice!($b, half::f16), as_typed_slice_mut!($c, half::f16), $m, $n, $k),
             (_, 2) => scalar::scalar_bf16::gemm_skinny(as_typed_slice!($a, half::bf16), as_typed_slice!($b, half::bf16), as_typed_slice_mut!($c, half::bf16), $m, $n, $k),
@@ -760,11 +799,11 @@ macro_rules! dispatch_gemm_skinny_bt {
             #[cfg(target_arch = "x86_64")]
             (IsaLevel::Avx2, 2) => avx2::avx2_bf16::gemm_skinny_bt(as_typed_slice!($a, half::bf16), as_typed_slice!($b_t, half::bf16), as_typed_slice_mut!($c, half::bf16), $m, $n, $k),
             #[cfg(target_arch = "aarch64")]
-            (IsaLevel::Neon, 0) => neon::neon_f32::gemm_skinny_bt(as_typed_slice!($a, f32), as_typed_slice!($b_t, f32), as_typed_slice_mut!($c, f32), $m, $n, $k),
+            (IsaLevel::Neon | IsaLevel::Sve | IsaLevel::Sve2, 0) => neon::neon_f32::gemm_skinny_bt(as_typed_slice!($a, f32), as_typed_slice!($b_t, f32), as_typed_slice_mut!($c, f32), $m, $n, $k),
             #[cfg(target_arch = "aarch64")]
-            (IsaLevel::Neon, 1) => neon::neon_f16::gemm_skinny_bt(as_typed_slice!($a, half::f16), as_typed_slice!($b_t, half::f16), as_typed_slice_mut!($c, half::f16), $m, $n, $k),
+            (IsaLevel::Neon | IsaLevel::Sve | IsaLevel::Sve2, 1) => neon::neon_f16::gemm_skinny_bt(as_typed_slice!($a, half::f16), as_typed_slice!($b_t, half::f16), as_typed_slice_mut!($c, half::f16), $m, $n, $k),
             #[cfg(target_arch = "aarch64")]
-            (IsaLevel::Neon, 2) => neon::neon_bf16::gemm_skinny_bt(as_typed_slice!($a, half::bf16), as_typed_slice!($b_t, half::bf16), as_typed_slice_mut!($c, half::bf16), $m, $n, $k),
+            (IsaLevel::Neon | IsaLevel::Sve | IsaLevel::Sve2, 2) => neon::neon_bf16::gemm_skinny_bt(as_typed_slice!($a, half::bf16), as_typed_slice!($b_t, half::bf16), as_typed_slice_mut!($c, half::bf16), $m, $n, $k),
             (_, 0) => scalar::scalar_f32::gemm_skinny_bt(as_typed_slice!($a, f32), as_typed_slice!($b_t, f32), as_typed_slice_mut!($c, f32), $m, $n, $k),
             (_, 1) => scalar::scalar_f16::gemm_skinny_bt(as_typed_slice!($a, half::f16), as_typed_slice!($b_t, half::f16), as_typed_slice_mut!($c, half::f16), $m, $n, $k),
             (_, 2) => scalar::scalar_bf16::gemm_skinny_bt(as_typed_slice!($a, half::bf16), as_typed_slice!($b_t, half::bf16), as_typed_slice_mut!($c, half::bf16), $m, $n, $k),
@@ -792,11 +831,11 @@ macro_rules! dispatch_rope {
             #[cfg(target_arch = "x86_64")]
             (IsaLevel::Avx2, 2) => avx2::avx2_bf16::$op(as_typed_slice_mut!($qk, half::bf16), as_typed_slice!($cos, half::bf16), as_typed_slice!($sin, half::bf16), $hd),
             #[cfg(target_arch = "aarch64")]
-            (IsaLevel::Neon, 0) => neon::neon_f32::$op(as_typed_slice_mut!($qk, f32), as_typed_slice!($cos, f32), as_typed_slice!($sin, f32), $hd),
+            (IsaLevel::Neon | IsaLevel::Sve | IsaLevel::Sve2, 0) => neon::neon_f32::$op(as_typed_slice_mut!($qk, f32), as_typed_slice!($cos, f32), as_typed_slice!($sin, f32), $hd),
             #[cfg(target_arch = "aarch64")]
-            (IsaLevel::Neon, 1) => neon::neon_f16::$op(as_typed_slice_mut!($qk, half::f16), as_typed_slice!($cos, half::f16), as_typed_slice!($sin, half::f16), $hd),
+            (IsaLevel::Neon | IsaLevel::Sve | IsaLevel::Sve2, 1) => neon::neon_f16::$op(as_typed_slice_mut!($qk, half::f16), as_typed_slice!($cos, half::f16), as_typed_slice!($sin, half::f16), $hd),
             #[cfg(target_arch = "aarch64")]
-            (IsaLevel::Neon, 2) => neon::neon_bf16::$op(as_typed_slice_mut!($qk, half::bf16), as_typed_slice!($cos, half::bf16), as_typed_slice!($sin, half::bf16), $hd),
+            (IsaLevel::Neon | IsaLevel::Sve | IsaLevel::Sve2, 2) => neon::neon_bf16::$op(as_typed_slice_mut!($qk, half::bf16), as_typed_slice!($cos, half::bf16), as_typed_slice!($sin, half::bf16), $hd),
             (_, 0) => scalar::scalar_f32::$op(as_typed_slice_mut!($qk, f32), as_typed_slice!($cos, f32), as_typed_slice!($sin, f32), $hd),
             (_, 1) => scalar::scalar_f16::$op(as_typed_slice_mut!($qk, half::f16), as_typed_slice!($cos, half::f16), as_typed_slice!($sin, half::f16), $hd),
             (_, 2) => scalar::scalar_bf16::$op(as_typed_slice_mut!($qk, half::bf16), as_typed_slice!($cos, half::bf16), as_typed_slice!($sin, half::bf16), $hd),
@@ -824,11 +863,11 @@ macro_rules! dispatch_rope_with_pos {
             #[cfg(target_arch = "x86_64")]
             (IsaLevel::Avx2, 2) => avx2::avx2_bf16::$op(as_typed_slice_mut!($qk, half::bf16), as_typed_slice!($cos, half::bf16), as_typed_slice!($sin, half::bf16), $hd, $pos),
             #[cfg(target_arch = "aarch64")]
-            (IsaLevel::Neon, 0) => neon::neon_f32::$op(as_typed_slice_mut!($qk, f32), as_typed_slice!($cos, f32), as_typed_slice!($sin, f32), $hd, $pos),
+            (IsaLevel::Neon | IsaLevel::Sve | IsaLevel::Sve2, 0) => neon::neon_f32::$op(as_typed_slice_mut!($qk, f32), as_typed_slice!($cos, f32), as_typed_slice!($sin, f32), $hd, $pos),
             #[cfg(target_arch = "aarch64")]
-            (IsaLevel::Neon, 1) => neon::neon_f16::$op(as_typed_slice_mut!($qk, half::f16), as_typed_slice!($cos, half::f16), as_typed_slice!($sin, half::f16), $hd, $pos),
+            (IsaLevel::Neon | IsaLevel::Sve | IsaLevel::Sve2, 1) => neon::neon_f16::$op(as_typed_slice_mut!($qk, half::f16), as_typed_slice!($cos, half::f16), as_typed_slice!($sin, half::f16), $hd, $pos),
             #[cfg(target_arch = "aarch64")]
-            (IsaLevel::Neon, 2) => neon::neon_bf16::$op(as_typed_slice_mut!($qk, half::bf16), as_typed_slice!($cos, half::bf16), as_typed_slice!($sin, half::bf16), $hd, $pos),
+            (IsaLevel::Neon | IsaLevel::Sve | IsaLevel::Sve2, 2) => neon::neon_bf16::$op(as_typed_slice_mut!($qk, half::bf16), as_typed_slice!($cos, half::bf16), as_typed_slice!($sin, half::bf16), $hd, $pos),
             (_, 0) => scalar::scalar_f32::$op(as_typed_slice_mut!($qk, f32), as_typed_slice!($cos, f32), as_typed_slice!($sin, f32), $hd, $pos),
             (_, 1) => scalar::scalar_f16::$op(as_typed_slice_mut!($qk, half::f16), as_typed_slice!($cos, half::f16), as_typed_slice!($sin, half::f16), $hd, $pos),
             (_, 2) => scalar::scalar_bf16::$op(as_typed_slice_mut!($qk, half::bf16), as_typed_slice!($cos, half::bf16), as_typed_slice!($sin, half::bf16), $hd, $pos),
@@ -856,11 +895,11 @@ macro_rules! dispatch_scale {
             #[cfg(target_arch = "x86_64")]
             (IsaLevel::Avx2, 2) => avx2::avx2_bf16::$op(as_typed_slice!($x, half::bf16), half::bf16::from_f32($sf), as_typed_slice_mut!($tmp, half::bf16)),
             #[cfg(target_arch = "aarch64")]
-            (IsaLevel::Neon, 0) => neon::neon_f32::$op(as_typed_slice!($x, f32), $sf, as_typed_slice_mut!($tmp, f32)),
+            (IsaLevel::Neon | IsaLevel::Sve | IsaLevel::Sve2, 0) => neon::neon_f32::$op(as_typed_slice!($x, f32), $sf, as_typed_slice_mut!($tmp, f32)),
             #[cfg(target_arch = "aarch64")]
-            (IsaLevel::Neon, 1) => neon::neon_f16::$op(as_typed_slice!($x, half::f16), half::f16::from_f32($sf), as_typed_slice_mut!($tmp, half::f16)),
+            (IsaLevel::Neon | IsaLevel::Sve | IsaLevel::Sve2, 1) => neon::neon_f16::$op(as_typed_slice!($x, half::f16), half::f16::from_f32($sf), as_typed_slice_mut!($tmp, half::f16)),
             #[cfg(target_arch = "aarch64")]
-            (IsaLevel::Neon, 2) => neon::neon_bf16::$op(as_typed_slice!($x, half::bf16), half::bf16::from_f32($sf), as_typed_slice_mut!($tmp, half::bf16)),
+            (IsaLevel::Neon | IsaLevel::Sve | IsaLevel::Sve2, 2) => neon::neon_bf16::$op(as_typed_slice!($x, half::bf16), half::bf16::from_f32($sf), as_typed_slice_mut!($tmp, half::bf16)),
             (_, 0) => scalar::scalar_f32::$op(as_typed_slice!($x, f32), $sf, as_typed_slice_mut!($tmp, f32)),
             (_, 1) => scalar::scalar_f16::$op(as_typed_slice!($x, half::f16), half::f16::from_f32($sf), as_typed_slice_mut!($tmp, half::f16)),
             (_, 2) => scalar::scalar_bf16::$op(as_typed_slice!($x, half::bf16), half::bf16::from_f32($sf), as_typed_slice_mut!($tmp, half::bf16)),
@@ -889,11 +928,11 @@ macro_rules! dispatch_bias_rows {
             #[cfg(target_arch = "x86_64")]
             (IsaLevel::Avx2, 2) => avx2::avx2_bf16::$op(as_typed_slice_mut!($c, half::bf16), as_typed_slice!($bias, half::bf16), $m, $n),
             #[cfg(target_arch = "aarch64")]
-            (IsaLevel::Neon, 0) => neon::neon_f32::$op(as_typed_slice_mut!($c, f32), as_typed_slice!($bias, f32), $m, $n),
+            (IsaLevel::Neon | IsaLevel::Sve | IsaLevel::Sve2, 0) => neon::neon_f32::$op(as_typed_slice_mut!($c, f32), as_typed_slice!($bias, f32), $m, $n),
             #[cfg(target_arch = "aarch64")]
-            (IsaLevel::Neon, 1) => neon::neon_f16::$op(as_typed_slice_mut!($c, half::f16), as_typed_slice!($bias, half::f16), $m, $n),
+            (IsaLevel::Neon | IsaLevel::Sve | IsaLevel::Sve2, 1) => neon::neon_f16::$op(as_typed_slice_mut!($c, half::f16), as_typed_slice!($bias, half::f16), $m, $n),
             #[cfg(target_arch = "aarch64")]
-            (IsaLevel::Neon, 2) => neon::neon_bf16::$op(as_typed_slice_mut!($c, half::bf16), as_typed_slice!($bias, half::bf16), $m, $n),
+            (IsaLevel::Neon | IsaLevel::Sve | IsaLevel::Sve2, 2) => neon::neon_bf16::$op(as_typed_slice_mut!($c, half::bf16), as_typed_slice!($bias, half::bf16), $m, $n),
             (_, 0) => scalar::scalar_f32::$op(as_typed_slice_mut!($c, f32), as_typed_slice!($bias, f32), $m, $n),
             (_, 1) => scalar::scalar_f16::$op(as_typed_slice_mut!($c, half::f16), as_typed_slice!($bias, half::f16), $m, $n),
             (_, 2) => scalar::scalar_bf16::$op(as_typed_slice_mut!($c, half::bf16), as_typed_slice!($bias, half::bf16), $m, $n),
@@ -921,11 +960,11 @@ macro_rules! dispatch_matmul_bias {
             #[cfg(target_arch = "x86_64")]
             (IsaLevel::Avx2, 2) => avx2::avx2_bf16::$op(as_typed_slice!($a, half::bf16), as_typed_slice!($b, half::bf16), as_typed_slice!($bias, half::bf16), as_typed_slice_mut!($c, half::bf16), $m, $n, $k),
             #[cfg(target_arch = "aarch64")]
-            (IsaLevel::Neon, 0) => neon::neon_f32::$op(as_typed_slice!($a, f32), as_typed_slice!($b, f32), as_typed_slice!($bias, f32), as_typed_slice_mut!($c, f32), $m, $n, $k),
+            (IsaLevel::Neon | IsaLevel::Sve | IsaLevel::Sve2, 0) => neon::neon_f32::$op(as_typed_slice!($a, f32), as_typed_slice!($b, f32), as_typed_slice!($bias, f32), as_typed_slice_mut!($c, f32), $m, $n, $k),
             #[cfg(target_arch = "aarch64")]
-            (IsaLevel::Neon, 1) => neon::neon_f16::$op(as_typed_slice!($a, half::f16), as_typed_slice!($b, half::f16), as_typed_slice!($bias, half::f16), as_typed_slice_mut!($c, half::f16), $m, $n, $k),
+            (IsaLevel::Neon | IsaLevel::Sve | IsaLevel::Sve2, 1) => neon::neon_f16::$op(as_typed_slice!($a, half::f16), as_typed_slice!($b, half::f16), as_typed_slice!($bias, half::f16), as_typed_slice_mut!($c, half::f16), $m, $n, $k),
             #[cfg(target_arch = "aarch64")]
-            (IsaLevel::Neon, 2) => neon::neon_bf16::$op(as_typed_slice!($a, half::bf16), as_typed_slice!($b, half::bf16), as_typed_slice!($bias, half::bf16), as_typed_slice_mut!($c, half::bf16), $m, $n, $k),
+            (IsaLevel::Neon | IsaLevel::Sve | IsaLevel::Sve2, 2) => neon::neon_bf16::$op(as_typed_slice!($a, half::bf16), as_typed_slice!($b, half::bf16), as_typed_slice!($bias, half::bf16), as_typed_slice_mut!($c, half::bf16), $m, $n, $k),
             (_, 0) => scalar::scalar_f32::$op(as_typed_slice!($a, f32), as_typed_slice!($b, f32), as_typed_slice!($bias, f32), as_typed_slice_mut!($c, f32), $m, $n, $k),
             (_, 1) => scalar::scalar_f16::$op(as_typed_slice!($a, half::f16), as_typed_slice!($b, half::f16), as_typed_slice!($bias, half::f16), as_typed_slice_mut!($c, half::f16), $m, $n, $k),
             (_, 2) => scalar::scalar_bf16::$op(as_typed_slice!($a, half::bf16), as_typed_slice!($b, half::bf16), as_typed_slice!($bias, half::bf16), as_typed_slice_mut!($c, half::bf16), $m, $n, $k),
@@ -1004,11 +1043,11 @@ macro_rules! dispatch_pack_b {
             #[cfg(target_arch = "x86_64")]
             (IsaLevel::Avx2, 2) => transmute_vec!(avx2::avx2_bf16::$op(as_typed_slice!($b, half::bf16), $n, $k), half::bf16),
             #[cfg(target_arch = "aarch64")]
-            (IsaLevel::Neon, 0) => transmute_vec!(neon::neon_f32::$op(as_typed_slice!($b, f32), $n, $k), f32),
+            (IsaLevel::Neon | IsaLevel::Sve | IsaLevel::Sve2, 0) => transmute_vec!(neon::neon_f32::$op(as_typed_slice!($b, f32), $n, $k), f32),
             #[cfg(target_arch = "aarch64")]
-            (IsaLevel::Neon, 1) => transmute_vec!(neon::neon_f16::$op(as_typed_slice!($b, half::f16), $n, $k), half::f16),
+            (IsaLevel::Neon | IsaLevel::Sve | IsaLevel::Sve2, 1) => transmute_vec!(neon::neon_f16::$op(as_typed_slice!($b, half::f16), $n, $k), half::f16),
             #[cfg(target_arch = "aarch64")]
-            (IsaLevel::Neon, 2) => transmute_vec!(neon::neon_bf16::$op(as_typed_slice!($b, half::bf16), $n, $k), half::bf16),
+            (IsaLevel::Neon | IsaLevel::Sve | IsaLevel::Sve2, 2) => transmute_vec!(neon::neon_bf16::$op(as_typed_slice!($b, half::bf16), $n, $k), half::bf16),
             (_, 0) => transmute_vec!(scalar::scalar_f32::$op(as_typed_slice!($b, f32), $n, $k), f32),
             (_, 1) => transmute_vec!(scalar::scalar_f16::$op(as_typed_slice!($b, half::f16), $n, $k), half::f16),
             (_, 2) => transmute_vec!(scalar::scalar_bf16::$op(as_typed_slice!($b, half::bf16), $n, $k), half::bf16),
@@ -1422,7 +1461,7 @@ impl<E: Element> Kernels<E> for CpuKernels<E> {
                 #[cfg(target_arch = "x86_64")]
                 IsaLevel::Avx2 => { crate::quant_primitive!(avx2, awq4, decode, blk_ptr, dst); }
                 #[cfg(target_arch = "aarch64")]
-                IsaLevel::Neon => { crate::quant_primitive!(neon, awq4, decode, blk_ptr, dst); }
+                IsaLevel::Neon | IsaLevel::Sve | IsaLevel::Sve2 => { crate::quant_primitive!(neon, awq4, decode, blk_ptr, dst); }
                 _ => { crate::quant_primitive!(scalar, awq4, decode, blk_ptr, dst); }
             }
         } else {
@@ -1453,7 +1492,7 @@ impl<E: Element> Kernels<E> for CpuKernels<E> {
                 #[cfg(target_arch = "x86_64")]
                 IsaLevel::Avx2 => { crate::quant_primitive!(avx2, gptq4, decode, blk_ptr, dst); }
                 #[cfg(target_arch = "aarch64")]
-                IsaLevel::Neon => { crate::quant_primitive!(neon, gptq4, decode, blk_ptr, dst); }
+                IsaLevel::Neon | IsaLevel::Sve | IsaLevel::Sve2 => { crate::quant_primitive!(neon, gptq4, decode, blk_ptr, dst); }
                 _ => { crate::quant_primitive!(scalar, gptq4, decode, blk_ptr, dst); }
             }
         } else {
@@ -1471,7 +1510,10 @@ impl<E: Element> Kernels<E> for CpuKernels<E> {
         }
     }
     fn dequant_squeeze(&self, block: &[u8], out: &mut [f32]) {
-        let blk = block.as_ptr() as *const crate::quant::BlockSqueeze;
+        let aligned: crate::quant::BlockSqueeze = unsafe {
+            std::ptr::read_unaligned(block.as_ptr() as *const crate::quant::BlockSqueeze)
+        };
+        let blk = &aligned as *const crate::quant::BlockSqueeze;
         let dst = out.as_mut_ptr();
         match get_isa_level() {
             #[cfg(target_arch = "x86_64")]
@@ -1479,7 +1521,7 @@ impl<E: Element> Kernels<E> for CpuKernels<E> {
             #[cfg(target_arch = "x86_64")]
             IsaLevel::Avx2 => { crate::quant_primitive!(avx2, squeeze, decode, blk, dst); }
             #[cfg(target_arch = "aarch64")]
-            IsaLevel::Neon => { crate::quant_primitive!(neon, squeeze, decode, blk, dst); }
+            IsaLevel::Neon | IsaLevel::Sve | IsaLevel::Sve2 => { crate::quant_primitive!(neon, squeeze, decode, blk, dst); }
             _ => { crate::quant_primitive!(scalar, squeeze, decode, blk, dst); }
         }
     }
@@ -1850,7 +1892,7 @@ impl<E: Element> Kernels<E> for CpuKernels<E> {
                             #[cfg(target_arch = "x86_64")]
                             IsaLevel::Avx2 => crate::quant_primitive!(avx2, squeeze, dot, blk_ptr, src),
                             #[cfg(target_arch = "aarch64")]
-                            IsaLevel::Neon => crate::quant_primitive!(neon, squeeze, dot, blk_ptr, src),
+                            IsaLevel::Neon | IsaLevel::Sve | IsaLevel::Sve2 => crate::quant_primitive!(neon, squeeze, dot, blk_ptr, src),
                             _ => crate::quant_primitive!(scalar, squeeze, dot, blk_ptr, src),
                         };
                     }

@@ -60,12 +60,12 @@ pub fn classify(kind: &OpKind) -> OpSemantics {
         OpKind::Dequantize { .. } => OpSemantics::Elementwise,
 
         // Reductions (need full input before output)
-        OpKind::Softmax | OpKind::RmsNorm { .. } | OpKind::LayerNorm { .. } => {
+        OpKind::Softmax | OpKind::RmsNorm { .. } | OpKind::LayerNorm { .. } | OpKind::MeanPool { .. } => {
             OpSemantics::Reduction
         }
 
         // Opaque (complex multi-step)
-        OpKind::RoPE { .. } | OpKind::Transpose { .. } | OpKind::Reshape { .. } => {
+        OpKind::MultiHeadAttention { .. } | OpKind::RoPE { .. } | OpKind::Transpose { .. } | OpKind::Reshape { .. } => {
             OpSemantics::Opaque
         }
     }
@@ -159,7 +159,19 @@ pub fn arithmetic_intensity(kind: &OpKind) -> f64 {
             // 6 FLOPs per pair, 16 bytes (2 reads + 2 writes + cos/sin)
             6.0 / 16.0
         }
-        OpKind::Transpose { .. } | OpKind::Reshape { .. } => {
+        // Multi-head attention: O(s^2 * d * h) compute, dominated by QK^T and attn@V
+        OpKind::MultiHeadAttention { seq_len, num_heads, head_dim } => {
+            let s = *seq_len as f64;
+            let h = *num_heads as f64;
+            let d = *head_dim as f64;
+            let hidden = h * d;
+            // FLOPs: 2*s*s*d*h (QK^T) + 3*s*s*h (softmax) + 2*s*s*d*h (attn@V)
+            let flops = 4.0 * s * s * d * h + 3.0 * s * s * h;
+            // Bytes: 3*s*hidden*4 (Q,K,V read) + s*hidden*4 (output write)
+            let bytes = 4.0 * s * hidden * 4.0;
+            if bytes > 0.0 { flops / bytes } else { 0.0 }
+        }
+        OpKind::MeanPool { .. } | OpKind::Transpose { .. } | OpKind::Reshape { .. } => {
             // Pure data movement, 0 compute
             0.0
         }
