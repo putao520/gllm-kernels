@@ -1316,27 +1316,6 @@ fn emit_gemm_tc_sm89_ptx(out: &mut String, kernel_name: &str, m: usize, n: usize
     writeln!(out, "}}").unwrap();
 }
 
-/// Emit sm_90 Tensor Core GEMM stub using wgmma.mma_async + TMA.
-///
-/// Hopper (sm_90) introduces warpgroup-level MMA (wgmma) and TMA (Tensor Memory
-/// Accelerator). Full implementation requires TMA descriptors and warpgroup
-/// synchronization which is significantly more complex.
-///
-/// This is a TODO stub that falls back to the sm_80 mma.sync path for now,
-/// returning an error to signal that native sm_90 codegen is not yet available.
-fn emit_gemm_tc_sm90_ptx(out: &mut String, kernel_name: &str, m: usize, n: usize, k: usize) {
-    // TODO: Implement native wgmma.mma_async + TMA path for Hopper.
-    //
-    // Required PTX features:
-    //   - cp.async.bulk.tensor (TMA descriptor-based loads)
-    //   - wgmma.mma_async.sync.aligned.m64n{N}k16.f32.f16.f16
-    //   - wgmma.fence / wgmma.commit_group / wgmma.wait_group
-    //   - setmaxnreg for dynamic register allocation
-    //
-    // For now, fall back to sm_80 mma.sync which works on sm_90 hardware.
-    emit_gemm_tc_sm80_ptx(out, kernel_name, m, n, k);
-}
-
 /// Emit RoPE (Rotary Position Embedding) kernel.
 ///
 /// RoPE applies rotation to pairs of elements: for each pair (x[2i], x[2i+1]),
@@ -1667,6 +1646,95 @@ fn emit_mha_kernel_ptx(out: &mut String, kernel_name: &str, seq_len: usize, num_
     writeln!(out).unwrap();
 }
 
+fn emit_dequantize_kernel_ptx(
+    out: &mut String,
+    kernel_name: &str,
+    num_elements: usize,
+    block_size: usize,
+    bits: usize,
+) {
+    let mask = (1u64 << bits) - 1;
+    let elems_per_u32 = 32 / bits;
+    let ptx_block: u32 = 256;
+
+    writeln!(out, ".visible .entry {kernel_name}(").unwrap();
+    writeln!(out, "    .param .u64 param_packed,").unwrap();
+    writeln!(out, "    .param .u64 param_scales,").unwrap();
+    writeln!(out, "    .param .u64 param_output").unwrap();
+    writeln!(out, ")").unwrap();
+    writeln!(out, "{{").unwrap();
+    writeln!(out, "    .reg .u64 %rd<8>;").unwrap();
+    writeln!(out, "    .reg .u32 %r<12>;").unwrap();
+    writeln!(out, "    .reg .f32 %f<4>;").unwrap();
+    writeln!(out, "    .reg .pred %p<2>;").unwrap();
+    writeln!(out).unwrap();
+
+    // Load params
+    writeln!(out, "    ld.param.u64 %rd0, [param_packed];").unwrap();
+    writeln!(out, "    ld.param.u64 %rd1, [param_scales];").unwrap();
+    writeln!(out, "    ld.param.u64 %rd2, [param_output];").unwrap();
+    writeln!(out).unwrap();
+
+    // tid = blockIdx.x * blockDim.x + threadIdx.x
+    writeln!(out, "    mov.u32 %r0, %ctaid.x;").unwrap();
+    writeln!(out, "    mov.u32 %r1, %tid.x;").unwrap();
+    writeln!(out, "    mad.lo.u32 %r2, %r0, {ptx_block}, %r1;").unwrap();
+    writeln!(out).unwrap();
+
+    // Guard: if tid >= num_elements return
+    writeln!(out, "    setp.ge.u32 %p0, %r2, {num_elements};").unwrap();
+    writeln!(out, "    @%p0 bra {kernel_name}_DONE;").unwrap();
+    writeln!(out).unwrap();
+
+    // block_idx = tid / BLOCK_SIZE
+    writeln!(out, "    div.u32 %r3, %r2, {block_size};").unwrap();
+    // in_block = tid % BLOCK_SIZE
+    writeln!(out, "    rem.u32 %r4, %r2, {block_size};").unwrap();
+    writeln!(out).unwrap();
+
+    // scale = scales[block_idx]
+    writeln!(out, "    mul.wide.u32 %rd3, %r3, 4;").unwrap();
+    writeln!(out, "    add.u64 %rd4, %rd1, %rd3;").unwrap();
+    writeln!(out, "    ld.global.f32 %f0, [%rd4];").unwrap();
+    writeln!(out).unwrap();
+
+    // packed_idx = tid / ELEMS_PER_U32
+    writeln!(out, "    div.u32 %r5, %r2, {elems_per_u32};").unwrap();
+    // bit_offset = (in_block % ELEMS_PER_U32) * BITS
+    writeln!(out, "    rem.u32 %r6, %r4, {elems_per_u32};").unwrap();
+    writeln!(out, "    mul.lo.u32 %r6, %r6, {bits};").unwrap();
+    writeln!(out).unwrap();
+
+    // raw = (packed[packed_idx] >> bit_offset) & MASK
+    writeln!(out, "    mul.wide.u32 %rd5, %r5, 4;").unwrap();
+    writeln!(out, "    add.u64 %rd6, %rd0, %rd5;").unwrap();
+    writeln!(out, "    ld.global.u32 %r7, [%rd6];").unwrap();
+    writeln!(out, "    shr.b32 %r7, %r7, %r6;").unwrap();
+    writeln!(out, "    and.b32 %r7, %r7, {mask};").unwrap();
+    writeln!(out).unwrap();
+
+    // zero_point = 1 << (BITS - 1)
+    let zero_point = 1u32 << (bits - 1);
+    // output[tid] = (float(raw) - zero_point) * scale
+    writeln!(out, "    cvt.rn.f32.u32 %f1, %r7;").unwrap();
+    writeln!(out, "    mov.u32 %r8, {zero_point};").unwrap();
+    writeln!(out, "    cvt.rn.f32.u32 %f2, %r8;").unwrap();
+    writeln!(out, "    sub.f32 %f1, %f1, %f2;").unwrap();
+    writeln!(out, "    mul.f32 %f1, %f1, %f0;").unwrap();
+    writeln!(out).unwrap();
+
+    // Store output
+    writeln!(out, "    mul.wide.u32 %rd7, %r2, 4;").unwrap();
+    writeln!(out, "    add.u64 %rd6, %rd2, %rd7;").unwrap();
+    writeln!(out, "    st.global.f32 [%rd6], %f1;").unwrap();
+    writeln!(out).unwrap();
+
+    writeln!(out, "{kernel_name}_DONE:").unwrap();
+    writeln!(out, "    ret;").unwrap();
+    writeln!(out, "}}").unwrap();
+    writeln!(out).unwrap();
+}
+
 // ── MachineCodeEmitter impl ─────────────────────────────────────────────────
 
 impl MachineCodeEmitter for PtxCodeGen {
@@ -1769,9 +1837,16 @@ impl MachineCodeEmitter for PtxCodeGen {
                 }
                 ComputePattern::Gemm => {
                     match op_kind {
+                        OpKind::QuantGemm { m, n, k, .. } => {
+                            return Err(format!(
+                                "PtxCodeGen: fused QuantGemm not yet implemented ({}x{}x{}), use Dequantize + Gemm",
+                                m, n, k
+                            ));
+                        }
                         OpKind::Gemm { m, n, k } | OpKind::GemmBias { m, n, k } => {
                             if self.sm_version >= 90 {
-                                emit_gemm_tc_sm90_ptx(&mut ptx, &kernel_name, *m, *n, *k);
+                                // sm_90 native wgmma not implemented; use sm_80 mma.sync (compatible)
+                                emit_gemm_tc_sm80_ptx(&mut ptx, &kernel_name, *m, *n, *k);
                             } else if self.sm_version >= 89 {
                                 emit_gemm_tc_sm89_ptx(&mut ptx, &kernel_name, *m, *n, *k);
                             } else if self.sm_version >= 80 {
@@ -1809,11 +1884,20 @@ impl MachineCodeEmitter for PtxCodeGen {
                         }
                     }
                 }
-                ComputePattern::QuantDecode { .. } => {
-                    return Err(format!(
-                        "PtxCodeGen: QuantDecode codegen not yet implemented (op {:?})",
-                        op_kind
-                    ));
+                ComputePattern::QuantDecode { block_size, .. } => {
+                    match op_kind {
+                        OpKind::Dequantize { num_elements, block_size: bs, bits } => {
+                            emit_dequantize_kernel_ptx(
+                                &mut ptx, &kernel_name, *num_elements, *bs, *bits,
+                            );
+                        }
+                        _ => {
+                            return Err(format!(
+                                "PtxCodeGen: unsupported QuantDecode op {:?} (block_size={})",
+                                op_kind, block_size
+                            ));
+                        }
+                    }
                 }
             }
         }

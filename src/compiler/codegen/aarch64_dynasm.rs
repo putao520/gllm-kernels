@@ -1918,6 +1918,26 @@ pub mod jit {
                     TraceOp::Exp(2), TraceOp::Const(1.0), TraceOp::Add(4, 3),
                     TraceOp::Recip(5), TraceOp::Mul(0, 6), TraceOp::Mul(7, 1),
                 ],
+                OpKind::GeGlu => vec![
+                    TraceOp::Input(0),  // a (gate)
+                    TraceOp::Input(1),  // b (value to apply gelu)
+                    // gelu(b): 0.5 * b * (1 + tanh(sqrt(2/pi) * (b + 0.044715 * b^3)))
+                    TraceOp::Const(0.7978845608028654),  // sqrt(2/pi)
+                    TraceOp::Const(0.044715),
+                    TraceOp::Mul(1, 1),      // b^2
+                    TraceOp::Mul(4, 3),      // 0.044715 * b^2
+                    TraceOp::Const(1.0),
+                    TraceOp::Add(6, 5),      // 1.0 + 0.044715*b^2
+                    TraceOp::Mul(1, 7),      // b * (1.0 + 0.044715*b^2)
+                    TraceOp::Mul(8, 2),      // sqrt(2/pi) * b * (...)
+                    TraceOp::Tanh(9),        // tanh(...)
+                    TraceOp::Const(1.0),
+                    TraceOp::Add(11, 10),    // 1 + tanh(...)
+                    TraceOp::Const(0.5),
+                    TraceOp::Mul(1, 13),     // 0.5 * b
+                    TraceOp::Mul(14, 12),    // gelu(b) = 0.5 * b * (1 + tanh(...))
+                    TraceOp::Mul(0, 15),     // a * gelu(b)
+                ],
                 _ => return Err(format!("no inline fallback for {:?} on aarch64-dynasm", op_kind)),
             };
             let is_binary = body.iter().any(|op| matches!(op, TraceOp::Input(n) if *n >= 1));
@@ -1998,6 +2018,26 @@ pub mod jit {
                     }
                     let n_heads = total_elems / head_dim;
                     self.emit_rope_standalone_neon(*head_dim, n_heads)
+                }
+                OpKind::Softmax => {
+                    let elem_count = op.outputs.first()
+                        .and_then(|&out_id| graph.tensor_numel(out_id))
+                        .unwrap_or(0);
+                    if elem_count == 0 { return Err("Softmax: zero-element tensor".into()); }
+                    let key = ScalarOpRegistry::key_from_op_kind(&op.kind);
+                    let trace = registry.and_then(|r| r.get_trace(&key))
+                        .ok_or("Softmax: no trace in ScalarOpRegistry")?;
+                    self.emit_traced_standalone(&trace.pattern, &op.kind, elem_count)
+                }
+                OpKind::Dequantize { .. } => {
+                    let elem_count = op.outputs.first()
+                        .and_then(|&out_id| graph.tensor_numel(out_id))
+                        .unwrap_or(0);
+                    if elem_count == 0 { return Err("Dequantize: zero-element tensor".into()); }
+                    let key = ScalarOpRegistry::key_from_op_kind(&op.kind);
+                    let trace = registry.and_then(|r| r.get_trace(&key))
+                        .ok_or("Dequantize: no trace in ScalarOpRegistry")?;
+                    self.emit_traced_standalone(&trace.pattern, &op.kind, elem_count)
                 }
                 _ => {
                     let elem_count = op.outputs.first()

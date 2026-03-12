@@ -490,6 +490,110 @@ fn emit_gemm_mfma_kernel_hip(out: &mut String, name: &str) {
     writeln!(out, "}}\n").unwrap();
 }
 
+// ── NormLike kernel ─────────────────────────────────────────────────
+
+/// Emit a NormLike (RMSNorm / LayerNorm) kernel using 3 phases:
+/// Phase 1: partial reduction (sum of squares), Phase 2: finalize (rsqrt),
+/// Phase 3: per-element transform (scale * weight [+ bias]).
+fn emit_normlike_kernel_hip(
+    out: &mut String,
+    kernel_name: &str,
+    _reduce: &[TraceOp],
+    _finalize: &[TraceOp],
+    _transform: &[TraceOp],
+    has_weight: bool,
+    has_bias: bool,
+    eps_override: Option<f32>,
+) {
+    let block_size = 256;
+
+    write!(out, "extern \"C\" __global__ void {kernel_name}(\n").unwrap();
+    writeln!(out, "    const float* __restrict__ input,").unwrap();
+    writeln!(out, "    float* __restrict__ output,").unwrap();
+    if has_weight {
+        writeln!(out, "    const float* __restrict__ weight,").unwrap();
+    }
+    if has_bias {
+        writeln!(out, "    const float* __restrict__ bias,").unwrap();
+    }
+    writeln!(out, "    const int N").unwrap();
+    writeln!(out, ") {{").unwrap();
+
+    writeln!(out, "    __shared__ float smem[{block_size}];").unwrap();
+    writeln!(out, "    int row = blockIdx.x;").unwrap();
+    writeln!(out, "    int tid = threadIdx.x;").unwrap();
+    writeln!(out, "    const float* row_in = input + row * N;").unwrap();
+    writeln!(out, "    float* row_out = output + row * N;").unwrap();
+    writeln!(out).unwrap();
+
+    // Phase 1: Partial reduction
+    writeln!(out, "    // Phase 1: reduction").unwrap();
+    writeln!(out, "    float partial = 0.0f;").unwrap();
+    writeln!(out, "    for (int i = tid; i < N; i += {block_size}) {{").unwrap();
+    writeln!(out, "        float x = row_in[i];").unwrap();
+    writeln!(out, "        partial += x * x;").unwrap();
+    writeln!(out, "    }}").unwrap();
+    writeln!(out, "    smem[tid] = partial;").unwrap();
+    writeln!(out, "    __syncthreads();").unwrap();
+    writeln!(out).unwrap();
+
+    // Tree reduction
+    writeln!(out, "    for (int s = {block_size} / 2; s > 0; s >>= 1) {{").unwrap();
+    writeln!(out, "        if (tid < s) smem[tid] += smem[tid + s];").unwrap();
+    writeln!(out, "        __syncthreads();").unwrap();
+    writeln!(out, "    }}").unwrap();
+    writeln!(out).unwrap();
+
+    // Phase 2: Finalize
+    writeln!(out, "    // Phase 2: finalize").unwrap();
+    let eps = eps_override.unwrap_or(1e-5);
+    writeln!(out, "    float variance = smem[0] / float(N);").unwrap();
+    writeln!(out, "    float scale = rsqrtf(variance + {eps:.8e}f);").unwrap();
+    writeln!(out).unwrap();
+
+    // Phase 3: Per-element transform
+    writeln!(out, "    // Phase 3: transform").unwrap();
+    writeln!(out, "    for (int i = tid; i < N; i += {block_size}) {{").unwrap();
+    writeln!(out, "        float x = row_in[i];").unwrap();
+    writeln!(out, "        float y = x * scale;").unwrap();
+    if has_weight {
+        writeln!(out, "        y *= weight[i];").unwrap();
+    }
+    if has_bias {
+        writeln!(out, "        y += bias[i];").unwrap();
+    }
+    writeln!(out, "        row_out[i] = y;").unwrap();
+    writeln!(out, "    }}").unwrap();
+    writeln!(out, "}}\n").unwrap();
+}
+
+// ── MeanPool kernel ────────────────────────────────────────────────
+
+/// Emit a MeanPool kernel: average over the sequence dimension.
+/// Each thread handles one hidden dimension element.
+fn emit_meanpool_kernel_hip(
+    out: &mut String,
+    kernel_name: &str,
+    seq_len: usize,
+    hidden: usize,
+) {
+    let block_size = 256;
+    writeln!(out, "extern \"C\" __global__ void {kernel_name}(").unwrap();
+    writeln!(out, "    const float* __restrict__ input,").unwrap();
+    writeln!(out, "    float* __restrict__ output,").unwrap();
+    writeln!(out, "    const int seq_len,").unwrap();
+    writeln!(out, "    const int hidden").unwrap();
+    writeln!(out, ") {{").unwrap();
+    writeln!(out, "    int h = blockIdx.x * {block_size} + threadIdx.x;").unwrap();
+    writeln!(out, "    if (h >= {hidden}) return;").unwrap();
+    writeln!(out, "    float acc = 0.0f;").unwrap();
+    writeln!(out, "    for (int s = 0; s < {seq_len}; s++) {{").unwrap();
+    writeln!(out, "        acc += input[s * {hidden} + h];").unwrap();
+    writeln!(out, "    }}").unwrap();
+    writeln!(out, "    output[h] = acc / float({seq_len});").unwrap();
+    writeln!(out, "}}\n").unwrap();
+}
+
 // ── Softmax kernel ──────────────────────────────────────────────────
 
 /// Emit a row-wise softmax kernel using shared memory reduction.
@@ -548,84 +652,394 @@ fn emit_softmax_kernel_hip(out: &mut String, name: &str, gfx_arch: u32) {
     writeln!(out).unwrap();
 }
 
+// ── RoPE kernel ─────────────────────────────────────────────────────
+
+/// Emit a Rotary Position Embedding (RoPE) kernel for HIP.
+///
+/// Applies rotary embeddings to input tensor with the given head dimension
+/// and frequency base theta. Grid: (seq_len, num_heads), Block: (256).
+fn emit_rope_kernel_hip(
+    out: &mut String,
+    kernel_name: &str,
+    head_dim: usize,
+    theta: f64,
+) {
+    let half_dim = head_dim / 2;
+    let block_size = 256;
+    writeln!(out, "extern \"C\" __global__ void {kernel_name}(").unwrap();
+    writeln!(out, "    const float* __restrict__ input,").unwrap();
+    writeln!(out, "    float* __restrict__ output,").unwrap();
+    writeln!(out, "    const int num_heads,").unwrap();
+    writeln!(out, "    const int seq_len").unwrap();
+    writeln!(out, ") {{").unwrap();
+    writeln!(out, "    const int HEAD_DIM = {head_dim};").unwrap();
+    writeln!(out, "    const int HALF_DIM = {half_dim};").unwrap();
+    writeln!(out, "    const float THETA = {theta:e}f;").unwrap();
+    writeln!(out, "    int pos = blockIdx.x;").unwrap();
+    writeln!(out, "    int head = blockIdx.y;").unwrap();
+    writeln!(out, "    int tid = threadIdx.x;").unwrap();
+    writeln!(out, "    int base = (pos * num_heads + head) * HEAD_DIM;").unwrap();
+    writeln!(out).unwrap();
+    writeln!(out, "    for (int i = tid; i < HALF_DIM; i += {block_size}) {{").unwrap();
+    writeln!(out, "        float freq = 1.0f / powf(THETA, float(2 * i) / float(HEAD_DIM));").unwrap();
+    writeln!(out, "        float angle = float(pos) * freq;").unwrap();
+    writeln!(out, "        float cos_a = cosf(angle);").unwrap();
+    writeln!(out, "        float sin_a = sinf(angle);").unwrap();
+    writeln!(out, "        float x0 = input[base + i];").unwrap();
+    writeln!(out, "        float x1 = input[base + i + HALF_DIM];").unwrap();
+    writeln!(out, "        output[base + i] = x0 * cos_a - x1 * sin_a;").unwrap();
+    writeln!(out, "        output[base + i + HALF_DIM] = x1 * cos_a + x0 * sin_a;").unwrap();
+    writeln!(out, "    }}").unwrap();
+    writeln!(out, "}}\n").unwrap();
+}
+
+// ── MHA kernel ──────────────────────────────────────────────────────
+
+/// Emit a Multi-Head Attention kernel for HIP.
+///
+/// 3-pass structure: (1) Q·K^T scores, (2) softmax, (3) weighted sum with V.
+/// Grid: (seq_len, num_heads), Block: (head_dim.next_power_of_two().min(256)).
+fn emit_mha_kernel_hip(
+    out: &mut String,
+    kernel_name: &str,
+    seq_len: usize,
+    num_heads: usize,
+    head_dim: usize,
+) {
+    let block_size = head_dim.next_power_of_two().min(256);
+    let scale = 1.0_f32 / (head_dim as f32).sqrt();
+
+    writeln!(out, "extern \"C\" __global__ void {kernel_name}(").unwrap();
+    writeln!(out, "    const float* __restrict__ Q,").unwrap();
+    writeln!(out, "    const float* __restrict__ K,").unwrap();
+    writeln!(out, "    const float* __restrict__ V,").unwrap();
+    writeln!(out, "    float* __restrict__ output,").unwrap();
+    writeln!(out, "    const int seq_len,").unwrap();
+    writeln!(out, "    const int num_heads,").unwrap();
+    writeln!(out, "    const int head_dim").unwrap();
+    writeln!(out, ") {{").unwrap();
+    writeln!(out, "    const float scale = {scale:.8e}f;").unwrap();
+    writeln!(out, "    __shared__ float smem_scores[{seq_len}];").unwrap();
+    writeln!(out, "    __shared__ float smem_max[1];").unwrap();
+    writeln!(out, "    __shared__ float smem_sum[1];").unwrap();
+    writeln!(out).unwrap();
+
+    writeln!(out, "    int query_idx = blockIdx.x;").unwrap();
+    writeln!(out, "    int head_idx = blockIdx.y;").unwrap();
+    writeln!(out, "    int tid = threadIdx.x;").unwrap();
+    writeln!(out).unwrap();
+
+    writeln!(out, "    int q_offset = (query_idx * {num_heads} + head_idx) * {head_dim};").unwrap();
+    writeln!(out).unwrap();
+
+    // Pass 1: Q·K^T scores
+    writeln!(out, "    // Pass 1: compute attention scores").unwrap();
+    writeln!(out, "    for (int j = tid; j < {seq_len}; j += {block_size}) {{").unwrap();
+    writeln!(out, "        int k_offset = (j * {num_heads} + head_idx) * {head_dim};").unwrap();
+    writeln!(out, "        float dot = 0.0f;").unwrap();
+    writeln!(out, "        for (int d = 0; d < {head_dim}; d++) {{").unwrap();
+    writeln!(out, "            dot += Q[q_offset + d] * K[k_offset + d];").unwrap();
+    writeln!(out, "        }}").unwrap();
+    writeln!(out, "        smem_scores[j] = dot * scale;").unwrap();
+    writeln!(out, "    }}").unwrap();
+    writeln!(out, "    __syncthreads();").unwrap();
+    writeln!(out).unwrap();
+
+    // Pass 2: Softmax
+    writeln!(out, "    // Pass 2: softmax").unwrap();
+    writeln!(out, "    if (tid == 0) {{").unwrap();
+    writeln!(out, "        float max_val = smem_scores[0];").unwrap();
+    writeln!(out, "        for (int j = 1; j < {seq_len}; j++) {{").unwrap();
+    writeln!(out, "            max_val = fmaxf(max_val, smem_scores[j]);").unwrap();
+    writeln!(out, "        }}").unwrap();
+    writeln!(out, "        smem_max[0] = max_val;").unwrap();
+    writeln!(out, "    }}").unwrap();
+    writeln!(out, "    __syncthreads();").unwrap();
+    writeln!(out).unwrap();
+
+    writeln!(out, "    for (int j = tid; j < {seq_len}; j += {block_size}) {{").unwrap();
+    writeln!(out, "        smem_scores[j] = expf(smem_scores[j] - smem_max[0]);").unwrap();
+    writeln!(out, "    }}").unwrap();
+    writeln!(out, "    __syncthreads();").unwrap();
+    writeln!(out).unwrap();
+
+    writeln!(out, "    if (tid == 0) {{").unwrap();
+    writeln!(out, "        float sum = 0.0f;").unwrap();
+    writeln!(out, "        for (int j = 0; j < {seq_len}; j++) {{").unwrap();
+    writeln!(out, "            sum += smem_scores[j];").unwrap();
+    writeln!(out, "        }}").unwrap();
+    writeln!(out, "        float inv_sum = 1.0f / sum;").unwrap();
+    writeln!(out, "        for (int j = 0; j < {seq_len}; j++) {{").unwrap();
+    writeln!(out, "            smem_scores[j] *= inv_sum;").unwrap();
+    writeln!(out, "        }}").unwrap();
+    writeln!(out, "    }}").unwrap();
+    writeln!(out, "    __syncthreads();").unwrap();
+    writeln!(out).unwrap();
+
+    // Pass 3: Weighted sum
+    writeln!(out, "    // Pass 3: weighted sum").unwrap();
+    writeln!(out, "    int out_offset = (query_idx * {num_heads} + head_idx) * {head_dim};").unwrap();
+    writeln!(out, "    for (int d = tid; d < {head_dim}; d += {block_size}) {{").unwrap();
+    writeln!(out, "        float acc = 0.0f;").unwrap();
+    writeln!(out, "        for (int j = 0; j < {seq_len}; j++) {{").unwrap();
+    writeln!(out, "            int v_offset = (j * {num_heads} + head_idx) * {head_dim};").unwrap();
+    writeln!(out, "            acc += smem_scores[j] * V[v_offset + d];").unwrap();
+    writeln!(out, "        }}").unwrap();
+    writeln!(out, "        output[out_offset + d] = acc;").unwrap();
+    writeln!(out, "    }}").unwrap();
+    writeln!(out, "}}\n").unwrap();
+}
+
+// ── QuantDecode kernel ──────────────────────────────────────────────
+
+/// Emit a dequantization kernel for HIP.
+///
+/// Unpacks N-bit quantized values from packed u32 words, applies scale and
+/// zero-point offset to produce float output.
+fn emit_dequantize_kernel_hip(
+    out: &mut String,
+    kernel_name: &str,
+    num_elements: usize,
+    block_size: usize,
+    bits: usize,
+) {
+    let mask = (1u64 << bits) - 1;
+    let elems_per_u32 = 32 / bits;
+    let hip_block: usize = 256;
+    let zero_point = 1u32 << (bits - 1);
+
+    writeln!(out, "extern \"C\" __global__ void {kernel_name}(").unwrap();
+    writeln!(out, "    const unsigned int* __restrict__ packed,").unwrap();
+    writeln!(out, "    const float* __restrict__ scales,").unwrap();
+    writeln!(out, "    float* __restrict__ output").unwrap();
+    writeln!(out, ") {{").unwrap();
+    writeln!(out, "    const unsigned int NUM_ELEMENTS = {num_elements}u;").unwrap();
+    writeln!(out, "    const unsigned int BLOCK_SIZE = {block_size}u;").unwrap();
+    writeln!(out, "    const unsigned int BITS = {bits}u;").unwrap();
+    writeln!(out, "    const unsigned int MASK = {mask}u;").unwrap();
+    writeln!(out, "    const unsigned int ELEMS_PER_U32 = {elems_per_u32}u;").unwrap();
+    writeln!(out, "    unsigned int tid = blockIdx.x * {hip_block}u + threadIdx.x;").unwrap();
+    writeln!(out, "    if (tid >= NUM_ELEMENTS) return;").unwrap();
+    writeln!(out, "    unsigned int block_idx = tid / BLOCK_SIZE;").unwrap();
+    writeln!(out, "    unsigned int in_block = tid % BLOCK_SIZE;").unwrap();
+    writeln!(out, "    float scale = scales[block_idx];").unwrap();
+    writeln!(out, "    unsigned int packed_idx = tid / ELEMS_PER_U32;").unwrap();
+    writeln!(out, "    unsigned int bit_offset = (in_block % ELEMS_PER_U32) * BITS;").unwrap();
+    writeln!(out, "    unsigned int raw = (packed[packed_idx] >> bit_offset) & MASK;").unwrap();
+    writeln!(out, "    float zero_point = float({zero_point}u);").unwrap();
+    writeln!(out, "    output[tid] = (float(raw) - zero_point) * scale;").unwrap();
+    writeln!(out, "}}\n").unwrap();
+}
+
 // ── MachineCodeEmitter implementation ───────────────────────────────
 
 impl MachineCodeEmitter for HipCodeGen {
-    fn platform(&self) -> Platform {
-        Platform::Hip
-    }
-
-    fn backend(&self) -> PlatformBackend {
-        PlatformBackend::Hip {
-            gfx_arch: self.gfx_arch,
-        }
-    }
-
     fn emit_plan(
         &mut self,
         plan: &FusionPlan,
         graph: &CompilerGraph,
-        registry: &ScalarOpRegistry,
-        alloc: &BufferAllocation,
-        device: &DeviceProfile,
+        _alloc: &BufferAllocation,
+        _profile: &DeviceProfile,
+        registry: Option<&ScalarOpRegistry>,
     ) -> Result<CodegenOutput, String> {
         self.emit_header();
 
-        let kernel_name = plan.name().unwrap_or("fused_kernel");
-        let pattern = plan.compute_pattern();
+        if plan.groups.is_empty() {
+            return Ok(CodegenOutput {
+                code: self.hip_buffer.clone().into_bytes(),
+                scratchpad_bytes: 0,
+            });
+        }
 
-        match pattern {
-            ComputePattern::Elementwise { body, .. } => {
-                let num_inputs = plan.num_inputs();
-                let num_outputs = plan.num_outputs();
-                if num_inputs == 1 {
-                    emit_elementwise_kernel_hip(&mut self.hip_buffer, kernel_name, body);
-                } else {
-                    emit_binary_elementwise_kernel_hip(&mut self.hip_buffer, kernel_name, body);
+        for group in &plan.groups {
+            let anchor_op = graph.op(group.anchor).ok_or_else(|| {
+                format!("HipCodeGen: anchor op {:?} not found in graph", group.anchor)
+            })?;
+
+            let kernel_name = format!("group_{}", group.id);
+            let op_kind = &anchor_op.kind;
+
+            // Reshape/Transpose are metadata-only — NOP on GPU
+            if matches!(op_kind, OpKind::Reshape { .. } | OpKind::Transpose { .. }) {
+                continue;
+            }
+
+            let registry = registry.ok_or_else(|| {
+                format!("HipCodeGen: emit_plan requires a ScalarOpRegistry for {:?}", op_kind)
+            })?;
+            let key = ScalarOpRegistry::key_from_op_kind(op_kind);
+            let trace = registry.get_trace(&key).ok_or_else(|| {
+                format!("HipCodeGen: no OpTrace for {:?}", op_kind)
+            })?;
+
+            match &trace.pattern {
+                ComputePattern::Elementwise { body } => {
+                    emit_elementwise_kernel_hip(&mut self.hip_buffer, &kernel_name, body);
                 }
-            }
-            ComputePattern::Injective { body, num_inputs, num_outputs, .. } => {
-                emit_injective_kernel_hip(
-                    &mut self.hip_buffer,
-                    kernel_name,
-                    body,
-                    *num_inputs,
-                    *num_outputs,
-                );
-            }
-            ComputePattern::Reduction { body, combine, identity, .. } => {
-                emit_reduction_kernel_hip(
-                    &mut self.hip_buffer,
-                    kernel_name,
-                    *identity,
-                    combine,
-                    self.gfx_arch,
-                );
-            }
-            ComputePattern::Gemm { m, n, k, .. } => {
-                if self.gfx_arch >= 908 {
-                    emit_gemm_mfma_kernel_hip(&mut self.hip_buffer, kernel_name);
-                } else {
-                    let tile = if self.gfx_arch >= 1000 { 16 } else { 32 };
-                    emit_gemm_kernel_hip(&mut self.hip_buffer, kernel_name, tile);
+                ComputePattern::BinaryElementwise { body } => {
+                    emit_binary_elementwise_kernel_hip(&mut self.hip_buffer, &kernel_name, body);
                 }
-            }
-            ComputePattern::Softmax { .. } => {
-                emit_softmax_kernel_hip(&mut self.hip_buffer, kernel_name, self.gfx_arch);
-            }
-            _ => {
-                return Err(format!(
-                    "HipCodeGen: unsupported compute pattern {:?}",
-                    pattern
-                ));
+                ComputePattern::Injective { body, num_inputs, num_outputs } => {
+                    match op_kind {
+                        OpKind::RoPE { head_dim, theta } => {
+                            emit_rope_kernel_hip(
+                                &mut self.hip_buffer,
+                                &kernel_name,
+                                *head_dim,
+                                *theta,
+                            );
+                        }
+                        _ => {
+                            if body.is_empty() {
+                                continue;
+                            }
+                            emit_injective_kernel_hip(
+                                &mut self.hip_buffer,
+                                &kernel_name,
+                                body,
+                                *num_inputs,
+                                *num_outputs,
+                            );
+                        }
+                    }
+                }
+                ComputePattern::NormLike { reduce, finalize, transform } => {
+                    let eps_override = match op_kind {
+                        OpKind::RmsNorm { eps } => Some(*eps),
+                        OpKind::LayerNorm { eps } => Some(*eps),
+                        _ => None,
+                    };
+                    let has_weight = matches!(
+                        op_kind,
+                        OpKind::RmsNorm { .. } | OpKind::LayerNorm { .. }
+                    );
+                    let has_bias = matches!(op_kind, OpKind::LayerNorm { .. });
+                    emit_normlike_kernel_hip(
+                        &mut self.hip_buffer,
+                        &kernel_name,
+                        reduce,
+                        finalize,
+                        transform,
+                        has_weight,
+                        has_bias,
+                        eps_override,
+                    );
+                }
+                ComputePattern::Reduction { combine, identity, .. } => {
+                    match op_kind {
+                        OpKind::Softmax => {
+                            emit_softmax_kernel_hip(
+                                &mut self.hip_buffer,
+                                &kernel_name,
+                                self.gfx_arch,
+                            );
+                        }
+                        OpKind::MeanPool { seq_len, hidden } => {
+                            emit_meanpool_kernel_hip(
+                                &mut self.hip_buffer,
+                                &kernel_name,
+                                *seq_len,
+                                *hidden,
+                            );
+                        }
+                        _ => {
+                            emit_reduction_kernel_hip(
+                                &mut self.hip_buffer,
+                                &kernel_name,
+                                *identity,
+                                combine,
+                                self.gfx_arch,
+                            );
+                        }
+                    }
+                }
+                ComputePattern::Gemm => {
+                    match op_kind {
+                        OpKind::Gemm { .. } | OpKind::GemmBias { .. } => {
+                            if self.gfx_arch >= 908 {
+                                emit_gemm_mfma_kernel_hip(&mut self.hip_buffer, &kernel_name);
+                            } else {
+                                let tile = if self.gfx_arch >= 1000 { 16 } else { 32 };
+                                emit_gemm_kernel_hip(&mut self.hip_buffer, &kernel_name, tile);
+                            }
+                        }
+                        OpKind::MultiHeadAttention { seq_len, num_heads, head_dim } => {
+                            emit_mha_kernel_hip(
+                                &mut self.hip_buffer,
+                                &kernel_name,
+                                *seq_len,
+                                *num_heads,
+                                *head_dim,
+                            );
+                        }
+                        _ => {
+                            return Err(format!(
+                                "HipCodeGen: unsupported Gemm-pattern op {:?}",
+                                op_kind
+                            ));
+                        }
+                    }
+                }
+                ComputePattern::QuantDecode { block_size, decode: _ } => {
+                    match op_kind {
+                        OpKind::Dequantize { num_elements, block_size: bs, bits } => {
+                            emit_dequantize_kernel_hip(
+                                &mut self.hip_buffer,
+                                &kernel_name,
+                                *num_elements,
+                                *bs,
+                                *bits,
+                            );
+                        }
+                        _ => {
+                            return Err(format!(
+                                "HipCodeGen: unsupported QuantDecode op {:?}",
+                                op_kind
+                            ));
+                        }
+                    }
+                }
             }
         }
 
         Ok(CodegenOutput {
-            source: self.hip_buffer.clone(),
-            kernel_name: kernel_name.to_string(),
-            platform: Platform::Hip,
+            code: self.hip_buffer.clone().into_bytes(),
+            scratchpad_bytes: 0,
         })
+    }
+
+    fn simd_width(&self) -> usize {
+        // HIP wavefront width in f32 elements
+        wavefront_size(self.gfx_arch) as usize
+    }
+}
+
+// ── HipBackend ──────────────────────────────────────────────────────
+
+/// HIP platform backend factory.
+pub struct HipBackend {
+    gfx_arch: u32,
+}
+
+impl HipBackend {
+    pub fn new(gfx_arch: u32) -> Self {
+        Self { gfx_arch }
+    }
+}
+
+impl PlatformBackend for HipBackend {
+    type Emitter = HipCodeGen;
+
+    fn new_emitter(&self, _profile: &DeviceProfile) -> HipCodeGen {
+        HipCodeGen::new(self.gfx_arch)
+    }
+
+    fn platform(&self) -> Platform {
+        Platform::Hip { gfx_arch: self.gfx_arch }
+    }
+
+    fn num_simd_regs(&self) -> usize {
+        256
     }
 }
 
@@ -734,5 +1148,112 @@ mod tests {
         assert!(out.contains("softmax"));
         assert!(out.contains("expf("));
         assert!(out.contains("inv_sum"));
+    }
+
+    #[test]
+    fn test_emit_normlike_kernel_rmsnorm() {
+        let mut out = String::new();
+        emit_normlike_kernel_hip(
+            &mut out, "rmsnorm", &[], &[], &[],
+            true,  // has_weight
+            false, // no bias
+            Some(1e-5),
+        );
+        assert!(out.contains("rmsnorm"));
+        assert!(out.contains("rsqrtf("));
+        assert!(out.contains("weight[i]"));
+        assert!(!out.contains("bias[i]"));
+        assert!(out.contains("__shared__"));
+    }
+
+    #[test]
+    fn test_emit_normlike_kernel_layernorm() {
+        let mut out = String::new();
+        emit_normlike_kernel_hip(
+            &mut out, "layernorm", &[], &[], &[],
+            true, // has_weight
+            true, // has_bias
+            Some(1e-6),
+        );
+        assert!(out.contains("layernorm"));
+        assert!(out.contains("weight[i]"));
+        assert!(out.contains("bias[i]"));
+    }
+
+    #[test]
+    fn test_emit_meanpool_kernel() {
+        let mut out = String::new();
+        emit_meanpool_kernel_hip(&mut out, "meanpool", 128, 768);
+        assert!(out.contains("meanpool"));
+        assert!(out.contains("128"));
+        assert!(out.contains("768"));
+        assert!(out.contains("float(128)"));
+    }
+
+    #[test]
+    fn test_emit_binary_elementwise_kernel() {
+        let mut out = String::new();
+        let body = vec![TraceOp::Add(0, 1)];
+        emit_binary_elementwise_kernel_hip(&mut out, "binary_add", &body);
+        assert!(out.contains("binary_add"));
+        assert!(out.contains("input0"));
+        assert!(out.contains("input1"));
+        assert!(out.contains("in0"));
+        assert!(out.contains("in1"));
+    }
+
+    #[test]
+    fn test_emit_gemm_mfma_kernel() {
+        let mut out = String::new();
+        emit_gemm_mfma_kernel_hip(&mut out, "mfma_gemm");
+        assert!(out.contains("mfma_gemm"));
+        assert!(out.contains("__builtin_amdgcn_mfma_f32_16x16x16f16"));
+    }
+
+    #[test]
+    fn test_emit_rope_kernel() {
+        let mut out = String::new();
+        emit_rope_kernel_hip(&mut out, "rope", 128, 10000.0);
+        assert!(out.contains("rope"));
+        assert!(out.contains("cosf("));
+        assert!(out.contains("sinf("));
+    }
+
+    #[test]
+    fn test_emit_mha_kernel() {
+        let mut out = String::new();
+        emit_mha_kernel_hip(&mut out, "mha", 32, 8, 64);
+        assert!(out.contains("mha"));
+        assert!(out.contains("smem_scores"));
+        assert!(out.contains("expf("));
+    }
+
+    #[test]
+    fn test_emit_dequantize_kernel() {
+        let mut out = String::new();
+        emit_dequantize_kernel_hip(&mut out, "dequant", 1024, 128, 4);
+        assert!(out.contains("dequant"));
+        assert!(out.contains("MASK"));
+        assert!(out.contains("zero_point"));
+    }
+
+    #[test]
+    fn test_hip_backend() {
+        let backend = HipBackend::new(908);
+        assert!(matches!(backend.platform(), Platform::Hip { gfx_arch: 908 }));
+        assert_eq!(backend.num_simd_regs(), 256);
+        let profile = DeviceProfile::detect();
+        let emitter = backend.new_emitter(&profile);
+        assert_eq!(emitter.gfx_arch(), 908);
+        assert_eq!(emitter.simd_width(), 64); // CDNA wave64
+    }
+
+    #[test]
+    fn test_hip_backend_rdna() {
+        let backend = HipBackend::new(1100);
+        assert!(matches!(backend.platform(), Platform::Hip { gfx_arch: 1100 }));
+        let profile = DeviceProfile::detect();
+        let emitter = backend.new_emitter(&profile);
+        assert_eq!(emitter.simd_width(), 32); // RDNA wave32
     }
 }
