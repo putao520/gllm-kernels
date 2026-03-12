@@ -906,6 +906,543 @@ fn emit_gemm_kernel_ptx(out: &mut String, kernel_name: &str, m: usize, n: usize,
 }
 
 
+
+/// Emit sm_80+ Tensor Core GEMM using mma.sync.aligned.m16n8k16.f32.f16.f16.f32.
+///
+/// Uses cp.async for global→shared loads, then shared→register packing for
+/// mma operands. Each warp computes a 16×8 output tile per mma instruction.
+/// Grid: (ceil(N/16), ceil(M/16)), Block: (32, 1) — one warp per block.
+fn emit_gemm_tc_sm80_ptx(out: &mut String, kernel_name: &str, m: usize, n: usize, k: usize) {
+    use std::fmt::Write;
+    let _ = (m, n); // dimensions used for grid launch, not baked into kernel
+    let ktiles = (k + 15) / 16;
+
+    writeln!(out, ".visible .entry {kernel_name}(").unwrap();
+    writeln!(out, "    .param .u64 param_A,").unwrap();
+    writeln!(out, "    .param .u64 param_B,").unwrap();
+    writeln!(out, "    .param .u64 param_C,").unwrap();
+    writeln!(out, "    .param .u32 param_M,").unwrap();
+    writeln!(out, "    .param .u32 param_N,").unwrap();
+    writeln!(out, "    .param .u32 param_K").unwrap();
+    writeln!(out, ") {{").unwrap();
+
+    // Shared memory for A tile (16×16 f16) and B tile (16×8 f16)
+    writeln!(out, "    .shared .align 16 .b8 smA[512];").unwrap();  // 16*16*2 bytes
+    writeln!(out, "    .shared .align 16 .b8 smB[256];").unwrap();  // 16*8*2 bytes
+
+    // Registers: mma needs 4×f32 accumulators, 4×b32 for A, 2×b32 for B
+    writeln!(out, "    .reg .u64 %rd<16>;").unwrap();
+    writeln!(out, "    .reg .u32 %r<32>;").unwrap();
+    writeln!(out, "    .reg .f32 %acc<4>;").unwrap();
+    writeln!(out, "    .reg .b32 %fragA<4>;").unwrap();
+    writeln!(out, "    .reg .b32 %fragB<2>;").unwrap();
+    writeln!(out, "    .reg .pred %p<4>;").unwrap();
+    writeln!(out).unwrap();
+
+    // Load params
+    writeln!(out, "    ld.param.u64 %rd0, [param_A];").unwrap();
+    writeln!(out, "    ld.param.u64 %rd1, [param_B];").unwrap();
+    writeln!(out, "    ld.param.u64 %rd2, [param_C];").unwrap();
+    writeln!(out, "    ld.param.u32 %r0, [param_M];").unwrap();
+    writeln!(out, "    ld.param.u32 %r1, [param_N];").unwrap();
+    writeln!(out, "    ld.param.u32 %r2, [param_K];").unwrap();
+    writeln!(out).unwrap();
+
+    // Block indices → tile row/col
+    writeln!(out, "    mov.u32 %r3, %ctaid.y;").unwrap();  // tile row
+    writeln!(out, "    mov.u32 %r4, %ctaid.x;").unwrap();  // tile col
+    writeln!(out, "    mov.u32 %r5, %tid.x;").unwrap();    // lane id (0..31)
+    writeln!(out).unwrap();
+
+    // Zero accumulators
+    writeln!(out, "    mov.f32 %acc0, 0f00000000;").unwrap();
+    writeln!(out, "    mov.f32 %acc1, 0f00000000;").unwrap();
+    writeln!(out, "    mov.f32 %acc2, 0f00000000;").unwrap();
+    writeln!(out, "    mov.f32 %acc3, 0f00000000;").unwrap();
+    writeln!(out).unwrap();
+
+    // K-tile loop
+    writeln!(out, "    mov.u32 %r6, 0;").unwrap();  // k_iter
+    writeln!(out, "LOOP_K_{kernel_name}:").unwrap();
+
+    // cp.async: global → shared for A tile (16×16 f16)
+    writeln!(out, "    // -- cp.async load A tile --").unwrap();
+    writeln!(out, "    shl.b32 %r7, %r3, 4;").unwrap();         // tile_row * 16
+    writeln!(out, "    add.u32 %r8, %r7, %r5;").unwrap();       // row offset by lane
+    writeln!(out, "    shl.b32 %r9, %r6, 4;").unwrap();         // k_iter * 16
+    writeln!(out, "    mad.lo.u32 %r10, %r8, %r2, %r9;").unwrap(); // row*K + k_off
+    writeln!(out, "    shl.b32 %r10, %r10, 1;").unwrap();       // byte offset (f16)
+    writeln!(out, "    cvt.u64.u32 %rd3, %r10;").unwrap();
+    writeln!(out, "    add.u64 %rd4, %rd0, %rd3;").unwrap();    // &A[row][k_off]
+    writeln!(out, "    shl.b32 %r11, %r5, 5;").unwrap();        // lane*32 shared offset
+    writeln!(out, "    mov.u32 %r12, smA;").unwrap();
+    writeln!(out, "    add.u32 %r12, %r12, %r11;").unwrap();
+    writeln!(out, "    cp.async.cg.shared.global [%r12], [%rd4], 16;").unwrap();
+    writeln!(out).unwrap();
+
+    // cp.async: global → shared for B tile (16×8 f16)
+    writeln!(out, "    // -- cp.async load B tile --").unwrap();
+    writeln!(out, "    shl.b32 %r13, %r4, 3;").unwrap();        // tile_col * 8
+    writeln!(out, "    mad.lo.u32 %r14, %r9, %r1, %r13;").unwrap(); // k_off*N + col_off (B is K×N)
+    writeln!(out, "    add.u32 %r14, %r14, %r5;").unwrap();     // + lane
+    writeln!(out, "    shl.b32 %r14, %r14, 1;").unwrap();       // byte offset
+    writeln!(out, "    cvt.u64.u32 %rd5, %r14;").unwrap();
+    writeln!(out, "    add.u64 %rd6, %rd1, %rd5;").unwrap();
+    writeln!(out, "    shl.b32 %r15, %r5, 4;").unwrap();        // lane*16 shared offset
+    writeln!(out, "    mov.u32 %r16, smB;").unwrap();
+    writeln!(out, "    add.u32 %r16, %r16, %r15;").unwrap();
+    writeln!(out, "    cp.async.cg.shared.global [%r16], [%rd6], 16;").unwrap();
+    writeln!(out).unwrap();
+
+    // Commit and wait
+    writeln!(out, "    cp.async.commit_group;").unwrap();
+    writeln!(out, "    cp.async.wait_group 0;").unwrap();
+    writeln!(out, "    bar.sync 0;").unwrap();
+    writeln!(out).unwrap();
+
+    // Load fragments from shared memory
+    writeln!(out, "    // -- load mma fragments from shared --").unwrap();
+    writeln!(out, "    mov.u32 %r17, smA;").unwrap();
+    writeln!(out, "    ld.shared.b32 %fragA0, [%r17];").unwrap();
+    writeln!(out, "    ld.shared.b32 %fragA1, [%r17+4];").unwrap();
+    writeln!(out, "    ld.shared.b32 %fragA2, [%r17+8];").unwrap();
+    writeln!(out, "    ld.shared.b32 %fragA3, [%r17+12];").unwrap();
+    writeln!(out, "    mov.u32 %r18, smB;").unwrap();
+    writeln!(out, "    ld.shared.b32 %fragB0, [%r18];").unwrap();
+    writeln!(out, "    ld.shared.b32 %fragB1, [%r18+4];").unwrap();
+    writeln!(out).unwrap();
+
+    // mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32
+    writeln!(out, "    mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32").unwrap();
+    writeln!(out, "        {{%acc0, %acc1, %acc2, %acc3}},").unwrap();
+    writeln!(out, "        {{%fragA0, %fragA1, %fragA2, %fragA3}},").unwrap();
+    writeln!(out, "        {{%fragB0, %fragB1}},").unwrap();
+    writeln!(out, "        {{%acc0, %acc1, %acc2, %acc3}};").unwrap();
+    writeln!(out).unwrap();
+
+    writeln!(out, "    bar.sync 0;").unwrap();
+
+    // Loop increment
+    writeln!(out, "    add.u32 %r6, %r6, 1;").unwrap();
+    writeln!(out, "    setp.lt.u32 %p0, %r6, {ktiles};").unwrap();
+    writeln!(out, "    @%p0 bra LOOP_K_{kernel_name};").unwrap();
+    writeln!(out).unwrap();
+
+    // Store accumulators to C
+    writeln!(out, "    // -- store C tile --").unwrap();
+    writeln!(out, "    shl.b32 %r19, %r3, 4;").unwrap();        // tile_row*16
+    writeln!(out, "    add.u32 %r20, %r19, %r5;").unwrap();     // + lane
+    writeln!(out, "    shl.b32 %r21, %r4, 3;").unwrap();        // tile_col*8
+    writeln!(out, "    mad.lo.u32 %r22, %r20, %r1, %r21;").unwrap(); // row*N + col
+    writeln!(out, "    shl.b32 %r22, %r22, 2;").unwrap();       // byte offset (f32)
+    writeln!(out, "    cvt.u64.u32 %rd7, %r22;").unwrap();
+    writeln!(out, "    add.u64 %rd8, %rd2, %rd7;").unwrap();
+    writeln!(out, "    st.global.f32 [%rd8], %acc0;").unwrap();
+    writeln!(out, "    st.global.f32 [%rd8+4], %acc1;").unwrap();
+    writeln!(out, "    st.global.f32 [%rd8+8], %acc2;").unwrap();
+    writeln!(out, "    st.global.f32 [%rd8+12], %acc3;").unwrap();
+    writeln!(out).unwrap();
+
+    writeln!(out, "    ret;").unwrap();
+    writeln!(out, "}}").unwrap();
+}
+
+/// Emit sm_70 Tensor Core GEMM using wmma.load/wmma.mma/wmma.store (16×16×16).
+///
+/// Volta-era wmma path: simpler than mma.sync but still uses Tensor Cores.
+/// Grid: (ceil(N/16), ceil(M/16)), Block: (32, 1) — one warp per block.
+fn emit_gemm_tc_sm70_ptx(out: &mut String, kernel_name: &str, m: usize, n: usize, k: usize) {
+    use std::fmt::Write;
+    let _ = (m, n);
+    let ktiles = (k + 15) / 16;
+
+    writeln!(out, ".visible .entry {kernel_name}(").unwrap();
+    writeln!(out, "    .param .u64 param_A,").unwrap();
+    writeln!(out, "    .param .u64 param_B,").unwrap();
+    writeln!(out, "    .param .u64 param_C,").unwrap();
+    writeln!(out, "    .param .u32 param_M,").unwrap();
+    writeln!(out, "    .param .u32 param_N,").unwrap();
+    writeln!(out, "    .param .u32 param_K").unwrap();
+    writeln!(out, ") {{").unwrap();
+
+    // wmma fragment registers: a(8 .b32), b(8 .b32), c(8 .f32), d(8 .f32)
+    writeln!(out, "    .reg .u64 %rd<12>;").unwrap();
+    writeln!(out, "    .reg .u32 %r<24>;").unwrap();
+    writeln!(out, "    .reg .b32 %fragA<8>;").unwrap();
+    writeln!(out, "    .reg .b32 %fragB<8>;").unwrap();
+    writeln!(out, "    .reg .f32 %fragC<8>;").unwrap();
+    writeln!(out, "    .reg .f32 %fragD<8>;").unwrap();
+    writeln!(out, "    .reg .pred %p<4>;").unwrap();
+    writeln!(out).unwrap();
+
+    // Load params
+    writeln!(out, "    ld.param.u64 %rd0, [param_A];").unwrap();
+    writeln!(out, "    ld.param.u64 %rd1, [param_B];").unwrap();
+    writeln!(out, "    ld.param.u64 %rd2, [param_C];").unwrap();
+    writeln!(out, "    ld.param.u32 %r0, [param_M];").unwrap();
+    writeln!(out, "    ld.param.u32 %r1, [param_N];").unwrap();
+    writeln!(out, "    ld.param.u32 %r2, [param_K];").unwrap();
+    writeln!(out).unwrap();
+
+    // Block indices
+    writeln!(out, "    mov.u32 %r3, %ctaid.y;").unwrap();
+    writeln!(out, "    mov.u32 %r4, %ctaid.x;").unwrap();
+    writeln!(out).unwrap();
+
+    // Zero accumulator fragments
+    for i in 0..8 {
+        writeln!(out, "    mov.f32 %fragC{i}, 0f00000000;").unwrap();
+    }
+    writeln!(out).unwrap();
+
+    // Compute base pointers for this tile
+    writeln!(out, "    shl.b32 %r5, %r3, 4;").unwrap();   // tile_row * 16
+    writeln!(out, "    shl.b32 %r6, %r4, 4;").unwrap();   // tile_col * 16
+    writeln!(out).unwrap();
+
+    // K-tile loop
+    writeln!(out, "    mov.u32 %r7, 0;").unwrap();
+    writeln!(out, "LOOP_K_{kernel_name}:").unwrap();
+    writeln!(out, "    shl.b32 %r8, %r7, 4;").unwrap();   // k_iter * 16
+    writeln!(out).unwrap();
+
+    // Compute A tile address: A + (tile_row*16)*K + k_iter*16, stride=K
+    writeln!(out, "    mad.lo.u32 %r9, %r5, %r2, %r8;").unwrap();
+    writeln!(out, "    shl.b32 %r9, %r9, 1;").unwrap();   // f16 byte offset
+    writeln!(out, "    cvt.u64.u32 %rd3, %r9;").unwrap();
+    writeln!(out, "    add.u64 %rd4, %rd0, %rd3;").unwrap();
+    writeln!(out, "    cvt.u64.u32 %rd5, %r2;").unwrap();  // stride = K
+    writeln!(out, "    shl.b64 %rd5, %rd5, 1;").unwrap();  // stride in bytes
+    writeln!(out).unwrap();
+
+    // wmma.load.a.sync.aligned.row.m16n16k16.f16
+    writeln!(out, "    wmma.load.a.sync.aligned.row.m16n16k16.f16").unwrap();
+    writeln!(out, "        {{%fragA0, %fragA1, %fragA2, %fragA3, %fragA4, %fragA5, %fragA6, %fragA7}},").unwrap();
+    writeln!(out, "        [%rd4], %rd5;").unwrap();
+    writeln!(out).unwrap();
+
+    // Compute B tile address: B + (k_iter*16)*N + tile_col*16, stride=N
+    writeln!(out, "    mad.lo.u32 %r10, %r8, %r1, %r6;").unwrap();
+    writeln!(out, "    shl.b32 %r10, %r10, 1;").unwrap();
+    writeln!(out, "    cvt.u64.u32 %rd6, %r10;").unwrap();
+    writeln!(out, "    add.u64 %rd7, %rd1, %rd6;").unwrap();
+    writeln!(out, "    cvt.u64.u32 %rd8, %r1;").unwrap();  // stride = N
+    writeln!(out, "    shl.b64 %rd8, %rd8, 1;").unwrap();
+    writeln!(out).unwrap();
+
+    // wmma.load.b.sync.aligned.row.m16n16k16.f16
+    writeln!(out, "    wmma.load.b.sync.aligned.row.m16n16k16.f16").unwrap();
+    writeln!(out, "        {{%fragB0, %fragB1, %fragB2, %fragB3, %fragB4, %fragB5, %fragB6, %fragB7}},").unwrap();
+    writeln!(out, "        [%rd7], %rd8;").unwrap();
+    writeln!(out).unwrap();
+
+    // wmma.mma.sync.aligned.row.row.m16n16k16.f32.f16.f16.f32
+    writeln!(out, "    wmma.mma.sync.aligned.row.row.m16n16k16.f32.f16.f16.f32").unwrap();
+    writeln!(out, "        {{%fragD0, %fragD1, %fragD2, %fragD3, %fragD4, %fragD5, %fragD6, %fragD7}},").unwrap();
+    writeln!(out, "        {{%fragA0, %fragA1, %fragA2, %fragA3, %fragA4, %fragA5, %fragA6, %fragA7}},").unwrap();
+    writeln!(out, "        {{%fragB0, %fragB1, %fragB2, %fragB3, %fragB4, %fragB5, %fragB6, %fragB7}},").unwrap();
+    writeln!(out, "        {{%fragC0, %fragC1, %fragC2, %fragC3, %fragC4, %fragC5, %fragC6, %fragC7}};").unwrap();
+    writeln!(out).unwrap();
+
+    // Copy D → C for next accumulation
+    for i in 0..8 {
+        writeln!(out, "    mov.f32 %fragC{i}, %fragD{i};").unwrap();
+    }
+    writeln!(out).unwrap();
+
+    // Loop
+    writeln!(out, "    add.u32 %r7, %r7, 1;").unwrap();
+    writeln!(out, "    setp.lt.u32 %p0, %r7, {ktiles};").unwrap();
+    writeln!(out, "    @%p0 bra LOOP_K_{kernel_name};").unwrap();
+    writeln!(out).unwrap();
+
+    // Store C tile: C + (tile_row*16)*N + tile_col*16, stride=N
+    writeln!(out, "    mad.lo.u32 %r11, %r5, %r1, %r6;").unwrap();
+    writeln!(out, "    shl.b32 %r11, %r11, 2;").unwrap();  // f32 byte offset
+    writeln!(out, "    cvt.u64.u32 %rd9, %r11;").unwrap();
+    writeln!(out, "    add.u64 %rd10, %rd2, %rd9;").unwrap();
+    writeln!(out, "    cvt.u64.u32 %rd11, %r1;").unwrap();
+    writeln!(out, "    shl.b64 %rd11, %rd11, 2;").unwrap(); // stride in bytes (f32)
+    writeln!(out).unwrap();
+
+    // wmma.store.d.sync.aligned.row.m16n16k16.f32
+    writeln!(out, "    wmma.store.d.sync.aligned.row.m16n16k16.f32").unwrap();
+    writeln!(out, "        [%rd10], {{%fragC0, %fragC1, %fragC2, %fragC3, %fragC4, %fragC5, %fragC6, %fragC7}},").unwrap();
+    writeln!(out, "        %rd11;").unwrap();
+    writeln!(out).unwrap();
+
+    writeln!(out, "    ret;").unwrap();
+    writeln!(out, "}}").unwrap();
+}
+
+
+/// Emit sm_89 Tensor Core GEMM using FP8 mma.sync variant (e4m3/e5m2).
+///
+/// Ada Lovelace (sm_89) supports FP8 Tensor Core via mma.sync.aligned.m16n8k32.
+/// A operands are .e4m3, B operands are .e4m3, accumulators are .f32.
+/// Grid: (ceil(N/16), ceil(M/16)), Block: (32, 1) — one warp per block.
+fn emit_gemm_tc_sm89_ptx(out: &mut String, kernel_name: &str, m: usize, n: usize, k: usize) {
+    use std::fmt::Write;
+    let _ = (m, n);
+    let ktiles = (k + 31) / 32; // FP8 k-tile is 32
+
+    writeln!(out, ".visible .entry {kernel_name}(").unwrap();
+    writeln!(out, "    .param .u64 param_A,").unwrap();
+    writeln!(out, "    .param .u64 param_B,").unwrap();
+    writeln!(out, "    .param .u64 param_C,").unwrap();
+    writeln!(out, "    .param .u32 param_M,").unwrap();
+    writeln!(out, "    .param .u32 param_N,").unwrap();
+    writeln!(out, "    .param .u32 param_K").unwrap();
+    writeln!(out, ") {{").unwrap();
+
+    // Shared memory for A tile (16×32 FP8 = 512 bytes) and B tile (32×8 FP8 = 256 bytes)
+    writeln!(out, "    .shared .align 16 .b8 smA[512];").unwrap();
+    writeln!(out, "    .shared .align 16 .b8 smB[256];").unwrap();
+
+    // Registers: mma needs 4×f32 accumulators, 4×b32 for A (FP8 packed), 2×b32 for B
+    writeln!(out, "    .reg .u64 %rd<16>;").unwrap();
+    writeln!(out, "    .reg .u32 %r<32>;").unwrap();
+    writeln!(out, "    .reg .f32 %acc<4>;").unwrap();
+    writeln!(out, "    .reg .b32 %fragA<4>;").unwrap();
+    writeln!(out, "    .reg .b32 %fragB<2>;").unwrap();
+    writeln!(out, "    .reg .pred %p<4>;").unwrap();
+    writeln!(out).unwrap();
+
+    // Load params
+    writeln!(out, "    ld.param.u64 %rd0, [param_A];").unwrap();
+    writeln!(out, "    ld.param.u64 %rd1, [param_B];").unwrap();
+    writeln!(out, "    ld.param.u64 %rd2, [param_C];").unwrap();
+    writeln!(out, "    ld.param.u32 %r0, [param_M];").unwrap();
+    writeln!(out, "    ld.param.u32 %r1, [param_N];").unwrap();
+    writeln!(out, "    ld.param.u32 %r2, [param_K];").unwrap();
+    writeln!(out).unwrap();
+
+    // Block indices → tile row/col
+    writeln!(out, "    mov.u32 %r3, %ctaid.y;").unwrap();  // tile row
+    writeln!(out, "    mov.u32 %r4, %ctaid.x;").unwrap();  // tile col
+    writeln!(out, "    mov.u32 %r5, %tid.x;").unwrap();    // lane id (0..31)
+    writeln!(out).unwrap();
+
+    // Zero accumulators
+    writeln!(out, "    mov.f32 %acc0, 0f00000000;").unwrap();
+    writeln!(out, "    mov.f32 %acc1, 0f00000000;").unwrap();
+    writeln!(out, "    mov.f32 %acc2, 0f00000000;").unwrap();
+    writeln!(out, "    mov.f32 %acc3, 0f00000000;").unwrap();
+    writeln!(out).unwrap();
+
+    // K-tile loop (k-tile = 32 for FP8)
+    writeln!(out, "    mov.u32 %r6, 0;").unwrap();
+    writeln!(out, "LOOP_K_{kernel_name}:").unwrap();
+
+    // cp.async: global → shared for A tile (16×32 FP8 = 512 bytes)
+    writeln!(out, "    // -- cp.async load A tile (FP8) --").unwrap();
+    writeln!(out, "    shl.b32 %r7, %r3, 4;").unwrap();         // tile_row * 16
+    writeln!(out, "    add.u32 %r8, %r7, %r5;").unwrap();       // row offset by lane
+    writeln!(out, "    shl.b32 %r9, %r6, 5;").unwrap();         // k_iter * 32
+    writeln!(out, "    mad.lo.u32 %r10, %r8, %r2, %r9;").unwrap(); // row*K + k_off
+    // FP8: 1 byte per element, no shift needed
+    writeln!(out, "    cvt.u64.u32 %rd3, %r10;").unwrap();
+    writeln!(out, "    add.u64 %rd4, %rd0, %rd3;").unwrap();
+    writeln!(out, "    shl.b32 %r11, %r5, 5;").unwrap();        // lane*32 shared offset
+    writeln!(out, "    mov.u32 %r12, smA;").unwrap();
+    writeln!(out, "    add.u32 %r12, %r12, %r11;").unwrap();
+    writeln!(out, "    cp.async.cg.shared.global [%r12], [%rd4], 16;").unwrap();
+    writeln!(out).unwrap();
+
+    // cp.async: global → shared for B tile (32×8 FP8 = 256 bytes)
+    writeln!(out, "    // -- cp.async load B tile (FP8) --").unwrap();
+    writeln!(out, "    shl.b32 %r13, %r4, 3;").unwrap();        // tile_col * 8
+    writeln!(out, "    mad.lo.u32 %r14, %r9, %r1, %r13;").unwrap();
+    writeln!(out, "    add.u32 %r14, %r14, %r5;").unwrap();
+    // FP8: 1 byte per element
+    writeln!(out, "    cvt.u64.u32 %rd5, %r14;").unwrap();
+    writeln!(out, "    add.u64 %rd6, %rd1, %rd5;").unwrap();
+    writeln!(out, "    shl.b32 %r15, %r5, 4;").unwrap();
+    writeln!(out, "    mov.u32 %r16, smB;").unwrap();
+    writeln!(out, "    add.u32 %r16, %r16, %r15;").unwrap();
+    writeln!(out, "    cp.async.cg.shared.global [%r16], [%rd6], 16;").unwrap();
+    writeln!(out).unwrap();
+
+    // Commit and wait
+    writeln!(out, "    cp.async.commit_group;").unwrap();
+    writeln!(out, "    cp.async.wait_group 0;").unwrap();
+    writeln!(out, "    bar.sync 0;").unwrap();
+    writeln!(out).unwrap();
+
+    // Load fragments from shared memory
+    writeln!(out, "    // -- load mma fragments from shared (FP8 packed into b32) --").unwrap();
+    writeln!(out, "    mov.u32 %r17, smA;").unwrap();
+    writeln!(out, "    ld.shared.b32 %fragA0, [%r17];").unwrap();
+    writeln!(out, "    ld.shared.b32 %fragA1, [%r17+4];").unwrap();
+    writeln!(out, "    ld.shared.b32 %fragA2, [%r17+8];").unwrap();
+    writeln!(out, "    ld.shared.b32 %fragA3, [%r17+12];").unwrap();
+    writeln!(out, "    mov.u32 %r18, smB;").unwrap();
+    writeln!(out, "    ld.shared.b32 %fragB0, [%r18];").unwrap();
+    writeln!(out, "    ld.shared.b32 %fragB1, [%r18+4];").unwrap();
+    writeln!(out).unwrap();
+
+    // mma.sync.aligned.m16n8k32.row.col.f32.e4m3.e4m3.f32
+    writeln!(out, "    mma.sync.aligned.m16n8k32.row.col.f32.e4m3.e4m3.f32").unwrap();
+    writeln!(out, "        {{%acc0, %acc1, %acc2, %acc3}},").unwrap();
+    writeln!(out, "        {{%fragA0, %fragA1, %fragA2, %fragA3}},").unwrap();
+    writeln!(out, "        {{%fragB0, %fragB1}},").unwrap();
+    writeln!(out, "        {{%acc0, %acc1, %acc2, %acc3}};").unwrap();
+    writeln!(out).unwrap();
+
+    writeln!(out, "    bar.sync 0;").unwrap();
+
+    // Loop increment
+    writeln!(out, "    add.u32 %r6, %r6, 1;").unwrap();
+    writeln!(out, "    setp.lt.u32 %p0, %r6, {ktiles};").unwrap();
+    writeln!(out, "    @%p0 bra LOOP_K_{kernel_name};").unwrap();
+    writeln!(out).unwrap();
+
+    // Store accumulators to C (f32)
+    writeln!(out, "    // -- store C tile --").unwrap();
+    writeln!(out, "    shl.b32 %r19, %r3, 4;").unwrap();
+    writeln!(out, "    add.u32 %r20, %r19, %r5;").unwrap();
+    writeln!(out, "    shl.b32 %r21, %r4, 3;").unwrap();
+    writeln!(out, "    mad.lo.u32 %r22, %r20, %r1, %r21;").unwrap();
+    writeln!(out, "    shl.b32 %r22, %r22, 2;").unwrap();
+    writeln!(out, "    cvt.u64.u32 %rd7, %r22;").unwrap();
+    writeln!(out, "    add.u64 %rd8, %rd2, %rd7;").unwrap();
+    writeln!(out, "    st.global.f32 [%rd8], %acc0;").unwrap();
+    writeln!(out, "    st.global.f32 [%rd8+4], %acc1;").unwrap();
+    writeln!(out, "    st.global.f32 [%rd8+8], %acc2;").unwrap();
+    writeln!(out, "    st.global.f32 [%rd8+12], %acc3;").unwrap();
+    writeln!(out).unwrap();
+
+    writeln!(out, "    ret;").unwrap();
+    writeln!(out, "}}").unwrap();
+}
+
+/// Emit sm_90 Tensor Core GEMM stub using wgmma.mma_async + TMA.
+///
+/// Hopper (sm_90) introduces warpgroup-level MMA (wgmma) and TMA (Tensor Memory
+/// Accelerator). Full implementation requires TMA descriptors and warpgroup
+/// synchronization which is significantly more complex.
+///
+/// This is a TODO stub that falls back to the sm_80 mma.sync path for now,
+/// returning an error to signal that native sm_90 codegen is not yet available.
+fn emit_gemm_tc_sm90_ptx(out: &mut String, kernel_name: &str, m: usize, n: usize, k: usize) {
+    // TODO: Implement native wgmma.mma_async + TMA path for Hopper.
+    //
+    // Required PTX features:
+    //   - cp.async.bulk.tensor (TMA descriptor-based loads)
+    //   - wgmma.mma_async.sync.aligned.m64n{N}k16.f32.f16.f16
+    //   - wgmma.fence / wgmma.commit_group / wgmma.wait_group
+    //   - setmaxnreg for dynamic register allocation
+    //
+    // For now, fall back to sm_80 mma.sync which works on sm_90 hardware.
+    emit_gemm_tc_sm80_ptx(out, kernel_name, m, n, k);
+}
+
+/// Emit RoPE (Rotary Position Embedding) kernel.
+///
+/// RoPE applies rotation to pairs of elements: for each pair (x[2i], x[2i+1]),
+///   x'[2i]   = x[2i]   * cos(theta_i) - x[2i+1] * sin(theta_i)
+///   x'[2i+1] = x[2i]   * sin(theta_i) + x[2i+1] * cos(theta_i)
+/// where theta_i = pos / (theta_base ^ (2i / head_dim))
+///
+/// Kernel signature: (input, output, pos, N, head_dim, theta_base_inv_hex)
+fn emit_rope_kernel_ptx(out: &mut String, kernel_name: &str, head_dim: usize, theta: f64) {
+    let block_size: u32 = 256;
+    let half_dim = head_dim / 2;
+    // Precompute 1/theta as f32 hex for PTX
+    let inv_theta_f32 = (1.0 / theta) as f32;
+    let inv_theta_hex = format!("0f{:08X}", inv_theta_f32.to_bits());
+
+    writeln!(out, ".visible .entry {kernel_name}(").unwrap();
+    writeln!(out, "    .param .u64 param_input,").unwrap();
+    writeln!(out, "    .param .u64 param_output,").unwrap();
+    writeln!(out, "    .param .u32 param_pos,").unwrap();
+    writeln!(out, "    .param .u32 param_N").unwrap();
+    writeln!(out, ")").unwrap();
+    writeln!(out, "{{").unwrap();
+    writeln!(out, "    .reg .u64 %rd<12>;").unwrap();
+    writeln!(out, "    .reg .u32 %r<12>;").unwrap();
+    writeln!(out, "    .reg .f32 %f<12>;").unwrap();
+    writeln!(out, "    .reg .pred %p<2>;").unwrap();
+    writeln!(out).unwrap();
+
+    // Load params
+    writeln!(out, "    ld.param.u64 %rd0, [param_input];").unwrap();
+    writeln!(out, "    ld.param.u64 %rd1, [param_output];").unwrap();
+    writeln!(out, "    ld.param.u32 %r0, [param_pos];").unwrap();
+    writeln!(out, "    ld.param.u32 %r1, [param_N];").unwrap();
+    writeln!(out).unwrap();
+
+    // tid = blockIdx.x * blockDim.x + threadIdx.x
+    writeln!(out, "    mov.u32 %r2, %ctaid.x;").unwrap();
+    writeln!(out, "    mov.u32 %r3, %ntid.x;").unwrap();
+    writeln!(out, "    mad.lo.u32 %r2, %r2, %r3, %tid.x;").unwrap();
+    writeln!(out).unwrap();
+
+    // Each thread handles one pair index i (processes elements 2*i and 2*i+1)
+    // Guard: if tid >= N/2 return
+    writeln!(out, "    shr.u32 %r4, %r1, 1;").unwrap(); // N/2
+    writeln!(out, "    setp.ge.u32 %p0, %r2, %r4;").unwrap();
+    writeln!(out, "    @%p0 bra {kernel_name}_DONE;").unwrap();
+    writeln!(out).unwrap();
+
+    // Compute i_mod = tid % half_dim (position within head)
+    writeln!(out, "    rem.u32 %r5, %r2, {half_dim};").unwrap();
+    writeln!(out).unwrap();
+
+    // Compute freq = pos * (1/theta)^(2*i_mod/head_dim)
+    // = pos * exp(-2*i_mod/head_dim * ln(theta))
+    // We compute: freq_exp = 2*i_mod / head_dim (as float)
+    // Then: base_freq = pow(1/theta, freq_exp) via exp2(freq_exp * log2(1/theta))
+    // Then: angle = pos * base_freq
+    writeln!(out, "    shl.b32 %r6, %r5, 1;").unwrap();         // 2 * i_mod
+    writeln!(out, "    cvt.rn.f32.u32 %f0, %r6;").unwrap();     // float(2*i_mod)
+    writeln!(out, "    mov.f32 %f1, 0f{:08X};", (1.0f32 / head_dim as f32).to_bits()).unwrap(); // 1/head_dim
+    writeln!(out, "    mul.f32 %f0, %f0, %f1;").unwrap();       // 2*i_mod/head_dim
+    // log2(1/theta) = -log2(theta)
+    writeln!(out, "    mov.f32 %f2, {inv_theta_hex};").unwrap(); // 1/theta
+    writeln!(out, "    lg2.approx.f32 %f2, %f2;").unwrap();     // log2(1/theta)
+    writeln!(out, "    mul.f32 %f0, %f0, %f2;").unwrap();       // freq_exp * log2(1/theta)
+    writeln!(out, "    ex2.approx.f32 %f0, %f0;").unwrap();     // (1/theta)^(2i/d)
+    // angle = pos * base_freq
+    writeln!(out, "    cvt.rn.f32.u32 %f3, %r0;").unwrap();     // float(pos)
+    writeln!(out, "    mul.f32 %f0, %f3, %f0;").unwrap();       // angle
+    writeln!(out).unwrap();
+
+    // Compute sin(angle) and cos(angle) via PTX approx
+    writeln!(out, "    sin.approx.f32 %f4, %f0;").unwrap();     // sin(angle)
+    writeln!(out, "    cos.approx.f32 %f5, %f0;").unwrap();     // cos(angle)
+    writeln!(out).unwrap();
+
+    // Load input pair: x0 = input[2*tid], x1 = input[2*tid+1]
+    writeln!(out, "    shl.b32 %r7, %r2, 1;").unwrap();         // 2*tid
+    writeln!(out, "    mul.wide.u32 %rd2, %r7, 4;").unwrap();   // byte offset for x0
+    writeln!(out, "    add.u64 %rd3, %rd0, %rd2;").unwrap();
+    writeln!(out, "    ld.global.f32 %f6, [%rd3];").unwrap();    // x0
+    writeln!(out, "    ld.global.f32 %f7, [%rd3+4];").unwrap();  // x1
+    writeln!(out).unwrap();
+
+    // Apply rotation:
+    //   out0 = x0 * cos - x1 * sin
+    //   out1 = x0 * sin + x1 * cos
+    writeln!(out, "    mul.f32 %f8, %f6, %f5;").unwrap();       // x0 * cos
+    writeln!(out, "    mul.f32 %f9, %f7, %f4;").unwrap();       // x1 * sin
+    writeln!(out, "    sub.f32 %f8, %f8, %f9;").unwrap();       // out0 = x0*cos - x1*sin
+    writeln!(out, "    mul.f32 %f10, %f6, %f4;").unwrap();      // x0 * sin
+    writeln!(out, "    fma.rn.f32 %f11, %f7, %f5, %f10;").unwrap(); // out1 = x1*cos + x0*sin
+    writeln!(out).unwrap();
+
+    // Store output pair
+    writeln!(out, "    add.u64 %rd4, %rd1, %rd2;").unwrap();
+    writeln!(out, "    st.global.f32 [%rd4], %f8;").unwrap();
+    writeln!(out, "    st.global.f32 [%rd4+4], %f11;").unwrap();
+    writeln!(out).unwrap();
+
+    writeln!(out, "{kernel_name}_DONE:").unwrap();
+    writeln!(out, "    ret;").unwrap();
+    writeln!(out, "}}").unwrap();
+    writeln!(out).unwrap();
+}
+
 fn emit_mha_kernel_ptx(out: &mut String, kernel_name: &str, seq_len: usize, num_heads: usize, head_dim: usize) {
     // Multi-Head Attention: output[b,h,i,j] = softmax(Q*K^T/sqrt(d)) * V
     // Simplified: one block per (head, query_row), block_size = head_dim (capped at 256)
@@ -1233,7 +1770,17 @@ impl MachineCodeEmitter for PtxCodeGen {
                 ComputePattern::Gemm => {
                     match op_kind {
                         OpKind::Gemm { m, n, k } | OpKind::GemmBias { m, n, k } => {
-                            emit_gemm_kernel_ptx(&mut ptx, &kernel_name, *m, *n, *k);
+                            if self.sm_version >= 90 {
+                                emit_gemm_tc_sm90_ptx(&mut ptx, &kernel_name, *m, *n, *k);
+                            } else if self.sm_version >= 89 {
+                                emit_gemm_tc_sm89_ptx(&mut ptx, &kernel_name, *m, *n, *k);
+                            } else if self.sm_version >= 80 {
+                                emit_gemm_tc_sm80_ptx(&mut ptx, &kernel_name, *m, *n, *k);
+                            } else if self.sm_version >= 70 {
+                                emit_gemm_tc_sm70_ptx(&mut ptx, &kernel_name, *m, *n, *k);
+                            } else {
+                                emit_gemm_kernel_ptx(&mut ptx, &kernel_name, *m, *n, *k);
+                            }
                         }
                         OpKind::MultiHeadAttention { seq_len, num_heads, head_dim } => {
                             emit_mha_kernel_ptx(&mut ptx, &kernel_name, *seq_len, *num_heads, *head_dim);
@@ -1247,13 +1794,20 @@ impl MachineCodeEmitter for PtxCodeGen {
                     }
                 }
                 ComputePattern::Injective { body, .. } => {
-                    if body.is_empty() {
-                        continue;
+                    match op_kind {
+                        OpKind::RoPE { head_dim, theta } => {
+                            emit_rope_kernel_ptx(&mut ptx, &kernel_name, *head_dim, *theta);
+                        }
+                        _ => {
+                            if body.is_empty() {
+                                continue;
+                            }
+                            return Err(format!(
+                                "PtxCodeGen: non-trivial Injective codegen not yet implemented (op {:?})",
+                                op_kind
+                            ));
+                        }
                     }
-                    return Err(format!(
-                        "PtxCodeGen: non-trivial Injective codegen not yet implemented (op {:?})",
-                        op_kind
-                    ));
                 }
                 ComputePattern::QuantDecode { .. } => {
                     return Err(format!(
@@ -1629,5 +2183,58 @@ mod tests {
         assert!(out.contains("param_output"));
         assert!(out.contains("rcp.approx.f32"));
         assert!(out.contains("st.global.f32"));
+    }
+
+    #[test]
+    fn test_ptx_emit_gemm_tc_sm89_fp8() {
+        let mut out = String::new();
+        emit_gemm_tc_sm89_ptx(&mut out, "test_gemm_fp8", 64, 64, 64);
+        assert!(out.contains(".visible .entry test_gemm_fp8("));
+        assert!(out.contains("mma.sync.aligned.m16n8k32.row.col.f32.e4m3.e4m3.f32"));
+        assert!(out.contains("cp.async.cg.shared.global"));
+        assert!(out.contains("cp.async.commit_group"));
+        assert!(out.contains("st.global.f32"));
+    }
+
+    #[test]
+    fn test_ptx_emit_gemm_tc_sm90_stub() {
+        // sm_90 stub should fall back to sm_80 mma.sync path
+        let mut out = String::new();
+        emit_gemm_tc_sm90_ptx(&mut out, "test_gemm_h100", 64, 64, 64);
+        assert!(out.contains(".visible .entry test_gemm_h100("));
+        assert!(out.contains("mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32"));
+        assert!(out.contains("cp.async.cg.shared.global"));
+    }
+
+    #[test]
+    fn test_ptx_emit_rope_kernel() {
+        let mut out = String::new();
+        emit_rope_kernel_ptx(&mut out, "test_rope", 128, 10000.0);
+        assert!(out.contains(".visible .entry test_rope("));
+        assert!(out.contains("param_input"));
+        assert!(out.contains("param_output"));
+        assert!(out.contains("param_pos"));
+        assert!(out.contains("sin.approx.f32"));
+        assert!(out.contains("cos.approx.f32"));
+        assert!(out.contains("st.global.f32"));
+    }
+
+    #[test]
+    fn test_ptx_gemm_sm_dispatch() {
+        // Verify that different SM versions select different GEMM paths
+        let mut out_70 = String::new();
+        emit_gemm_tc_sm70_ptx(&mut out_70, "gemm_70", 64, 64, 64);
+        assert!(out_70.contains("wmma.load.a.sync.aligned"));
+        assert!(out_70.contains("wmma.mma.sync.aligned"));
+
+        let mut out_80 = String::new();
+        emit_gemm_tc_sm80_ptx(&mut out_80, "gemm_80", 64, 64, 64);
+        assert!(out_80.contains("mma.sync.aligned.m16n8k16"));
+        assert!(!out_80.contains("wmma.load"));
+
+        let mut out_89 = String::new();
+        emit_gemm_tc_sm89_ptx(&mut out_89, "gemm_89", 64, 64, 64);
+        assert!(out_89.contains("mma.sync.aligned.m16n8k32"));
+        assert!(out_89.contains("e4m3"));
     }
 }

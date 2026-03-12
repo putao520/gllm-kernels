@@ -364,6 +364,52 @@ fn emit_gemm_kernel_msl(out: &mut String, kernel_name: &str, m: usize, n: usize,
     writeln!(out, "}}\n").unwrap();
 }
 
+/// Emit Apple GPU family 7+ GEMM using `simdgroup_matrix` (8×8 tiles).
+///
+/// Uses `simdgroup_load` / `simdgroup_multiply_accumulate` / `simdgroup_store`
+/// for hardware-accelerated matrix multiply on Apple Silicon (A14+, M1+).
+/// Grid: (ceil(N/8), ceil(M/8)), Block: (32, 1) — one simdgroup per threadgroup.
+fn emit_gemm_simdgroup_msl(out: &mut String, kernel_name: &str, m: usize, n: usize, k: usize) {
+    let ktiles = (k + 7) / 8;
+    writeln!(out, "#include <metal_simdgroup_matrix>").unwrap();
+    writeln!(out, "using namespace metal;").unwrap();
+    writeln!(out).unwrap();
+    writeln!(out, "kernel void {kernel_name}(").unwrap();
+    writeln!(out, "    device const half* A [[buffer(0)]],").unwrap();
+    writeln!(out, "    device const half* B [[buffer(1)]],").unwrap();
+    writeln!(out, "    device float* C [[buffer(2)]],").unwrap();
+    writeln!(out, "    uint2 gid [[threadgroup_position_in_grid]],").unwrap();
+    writeln!(out, "    uint simd_lane [[thread_index_in_simdgroup]]").unwrap();
+    writeln!(out, ") {{").unwrap();
+    writeln!(out, "    const uint M = {m}u, N = {n}u, K = {k}u;").unwrap();
+    writeln!(out).unwrap();
+    writeln!(out, "    simdgroup_float8x8 acc;").unwrap();
+    writeln!(out, "    simdgroup_half8x8 fragA, fragB;").unwrap();
+    writeln!(out).unwrap();
+    writeln!(out, "    // Zero accumulator").unwrap();
+    writeln!(out, "    acc = simdgroup_float8x8(0);").unwrap();
+    writeln!(out).unwrap();
+    writeln!(out, "    uint tile_row = gid.y * 8;").unwrap();
+    writeln!(out, "    uint tile_col = gid.x * 8;").unwrap();
+    writeln!(out).unwrap();
+    writeln!(out, "    for (uint kt = 0; kt < {ktiles}u; ++kt) {{").unwrap();
+    writeln!(out, "        uint k_off = kt * 8;").unwrap();
+    writeln!(out).unwrap();
+    writeln!(out, "        // Load A tile: A[tile_row..+8][k_off..+8], stride=K").unwrap();
+    writeln!(out, "        simdgroup_load(fragA, A + tile_row * K + k_off, K);").unwrap();
+    writeln!(out).unwrap();
+    writeln!(out, "        // Load B tile: B[k_off..+8][tile_col..+8], stride=N").unwrap();
+    writeln!(out, "        simdgroup_load(fragB, B + k_off * N + tile_col, N);").unwrap();
+    writeln!(out).unwrap();
+    writeln!(out, "        // Multiply-accumulate").unwrap();
+    writeln!(out, "        simdgroup_multiply_accumulate(acc, fragA, fragB, acc);").unwrap();
+    writeln!(out, "    }}").unwrap();
+    writeln!(out).unwrap();
+    writeln!(out, "    // Store result: C[tile_row..+8][tile_col..+8], stride=N").unwrap();
+    writeln!(out, "    simdgroup_store(acc, C + tile_row * N + tile_col, N);").unwrap();
+    writeln!(out, "}}\n").unwrap();
+}
+
 fn emit_mha_kernel_msl(
     out: &mut String,
     kernel_name: &str,
@@ -432,6 +478,170 @@ fn emit_mha_kernel_msl(
     writeln!(out, "        }}").unwrap();
     writeln!(out, "        out[base + query_row * DIM + d] = acc;").unwrap();
     writeln!(out, "    }}").unwrap();
+    writeln!(out, "}}\n").unwrap();
+}
+
+fn emit_rope_kernel_msl(
+    out: &mut String,
+    kernel_name: &str,
+    head_dim: usize,
+    theta: f64,
+) {
+    let half_dim = head_dim / 2;
+    writeln!(out, "kernel void {kernel_name}(").unwrap();
+    writeln!(out, "    device const float* input [[buffer(0)]],").unwrap();
+    writeln!(out, "    device float* output [[buffer(1)]],").unwrap();
+    writeln!(out, "    constant uint& seq_len [[buffer(2)]],").unwrap();
+    writeln!(out, "    constant uint& num_heads [[buffer(3)]],").unwrap();
+    writeln!(out, "    uint2 gid [[threadgroup_position_in_grid]],").unwrap();
+    writeln!(out, "    uint tid [[thread_index_in_threadgroup]]").unwrap();
+    writeln!(out, ") {{").unwrap();
+    writeln!(out, "    const uint HEAD_DIM = {head_dim}u;").unwrap();
+    writeln!(out, "    const uint HALF_DIM = {half_dim}u;").unwrap();
+    writeln!(out, "    const float THETA = float({theta:e});").unwrap();
+    writeln!(out, "    uint pos = gid.x;").unwrap();
+    writeln!(out, "    uint head = gid.y;").unwrap();
+    writeln!(out, "    uint base = (pos * num_heads + head) * HEAD_DIM;").unwrap();
+    writeln!(out).unwrap();
+    writeln!(out, "    for (uint i = tid; i < HALF_DIM; i += 32) {{").unwrap();
+    writeln!(out, "        float freq = 1.0f / pow(THETA, float(2 * i) / float(HEAD_DIM));").unwrap();
+    writeln!(out, "        float angle = float(pos) * freq;").unwrap();
+    writeln!(out, "        float cos_a = cos(angle);").unwrap();
+    writeln!(out, "        float sin_a = sin(angle);").unwrap();
+    writeln!(out, "        float x0 = input[base + i];").unwrap();
+    writeln!(out, "        float x1 = input[base + i + HALF_DIM];").unwrap();
+    writeln!(out, "        output[base + i] = x0 * cos_a - x1 * sin_a;").unwrap();
+    writeln!(out, "        output[base + i + HALF_DIM] = x1 * cos_a + x0 * sin_a;").unwrap();
+    writeln!(out, "    }}").unwrap();
+    writeln!(out, "}}\n").unwrap();
+}
+
+fn emit_gemm_bias_simdgroup_msl(
+    out: &mut String,
+    kernel_name: &str,
+    m: usize,
+    n: usize,
+    k: usize,
+) {
+    let ktiles = (k + 7) / 8;
+    writeln!(out, "#include <metal_simdgroup_matrix>").unwrap();
+    writeln!(out, "using namespace metal;").unwrap();
+    writeln!(out).unwrap();
+    writeln!(out, "kernel void {kernel_name}(").unwrap();
+    writeln!(out, "    device const half* A [[buffer(0)]],").unwrap();
+    writeln!(out, "    device const half* B [[buffer(1)]],").unwrap();
+    writeln!(out, "    device const float* bias [[buffer(2)]],").unwrap();
+    writeln!(out, "    device float* C [[buffer(3)]],").unwrap();
+    writeln!(out, "    uint2 gid [[threadgroup_position_in_grid]],").unwrap();
+    writeln!(out, "    uint simd_lane [[thread_index_in_simdgroup]]").unwrap();
+    writeln!(out, ") {{").unwrap();
+    writeln!(out, "    const uint M = {m}u, N = {n}u, K = {k}u;").unwrap();
+    writeln!(out).unwrap();
+    writeln!(out, "    simdgroup_float8x8 acc;").unwrap();
+    writeln!(out, "    simdgroup_half8x8 fragA, fragB;").unwrap();
+    writeln!(out).unwrap();
+    writeln!(out, "    acc = simdgroup_float8x8(0);").unwrap();
+    writeln!(out).unwrap();
+    writeln!(out, "    uint tile_row = gid.y * 8;").unwrap();
+    writeln!(out, "    uint tile_col = gid.x * 8;").unwrap();
+    writeln!(out).unwrap();
+    writeln!(out, "    for (uint kt = 0; kt < {ktiles}u; ++kt) {{").unwrap();
+    writeln!(out, "        uint k_off = kt * 8;").unwrap();
+    writeln!(out, "        simdgroup_load(fragA, A + tile_row * K + k_off, K);").unwrap();
+    writeln!(out, "        simdgroup_load(fragB, B + k_off * N + tile_col, N);").unwrap();
+    writeln!(out, "        simdgroup_multiply_accumulate(acc, fragA, fragB, acc);").unwrap();
+    writeln!(out, "    }}").unwrap();
+    writeln!(out).unwrap();
+    writeln!(out, "    // Store to threadgroup, add bias, write to C").unwrap();
+    writeln!(out, "    threadgroup float tile[64];").unwrap();
+    writeln!(out, "    simdgroup_store(acc, tile, 8);").unwrap();
+    writeln!(out).unwrap();
+    writeln!(out, "    // First 32 lanes cover rows 0..3 of the 8x8 tile").unwrap();
+    writeln!(out, "    uint lane_row = simd_lane / 8;").unwrap();
+    writeln!(out, "    uint lane_col = simd_lane % 8;").unwrap();
+    writeln!(out, "    uint out_row = tile_row + lane_row;").unwrap();
+    writeln!(out, "    uint out_col = tile_col + lane_col;").unwrap();
+    writeln!(out, "    if (out_row < M && out_col < N) {{").unwrap();
+    writeln!(out, "        C[out_row * N + out_col] = tile[lane_row * 8 + lane_col] + bias[out_col];").unwrap();
+    writeln!(out, "    }}").unwrap();
+    writeln!(out, "    // Remaining rows 4..7").unwrap();
+    writeln!(out, "    uint lane_row2 = lane_row + 4;").unwrap();
+    writeln!(out, "    uint out_row2 = tile_row + lane_row2;").unwrap();
+    writeln!(out, "    if (out_row2 < M && out_col < N) {{").unwrap();
+    writeln!(out, "        C[out_row2 * N + out_col] = tile[lane_row2 * 8 + lane_col] + bias[out_col];").unwrap();
+    writeln!(out, "    }}").unwrap();
+    writeln!(out, "}}\n").unwrap();
+}
+
+fn emit_gemm_bias_kernel_msl(
+    out: &mut String,
+    kernel_name: &str,
+    m: usize,
+    n: usize,
+    k: usize,
+) {
+    let tile = 16usize;
+    writeln!(out, "kernel void {kernel_name}(").unwrap();
+    writeln!(out, "    device const float* A [[buffer(0)]],").unwrap();
+    writeln!(out, "    device const float* B [[buffer(1)]],").unwrap();
+    writeln!(out, "    device const float* bias [[buffer(2)]],").unwrap();
+    writeln!(out, "    device float* C [[buffer(3)]],").unwrap();
+    writeln!(out, "    uint2 gid [[threadgroup_position_in_grid]],").unwrap();
+    writeln!(out, "    uint2 tid [[thread_position_in_threadgroup]]").unwrap();
+    writeln!(out, ") {{").unwrap();
+    writeln!(out, "    const uint M = {m}u, N = {n}u, K = {k}u;").unwrap();
+    writeln!(out, "    const uint TILE = {tile}u;").unwrap();
+    writeln!(out, "    threadgroup float smA[{t2}];", t2 = tile * tile).unwrap();
+    writeln!(out, "    threadgroup float smB[{t2}];", t2 = tile * tile).unwrap();
+    writeln!(out, "    uint row = gid.y * TILE + tid.y;").unwrap();
+    writeln!(out, "    uint col = gid.x * TILE + tid.x;").unwrap();
+    writeln!(out, "    float acc = 0.0f;").unwrap();
+    writeln!(out, "    for (uint t = 0; t < (K + TILE - 1) / TILE; t++) {{").unwrap();
+    writeln!(out, "        uint aCol = t * TILE + tid.x;").unwrap();
+    writeln!(out, "        uint bRow = t * TILE + tid.y;").unwrap();
+    writeln!(out, "        smA[tid.y * TILE + tid.x] = (row < M && aCol < K) ? A[row * K + aCol] : 0.0f;").unwrap();
+    writeln!(out, "        smB[tid.y * TILE + tid.x] = (bRow < K && col < N) ? B[bRow * N + col] : 0.0f;").unwrap();
+    writeln!(out, "        threadgroup_barrier(mem_flags::mem_threadgroup);").unwrap();
+    writeln!(out, "        for (uint i = 0; i < TILE; i++) {{").unwrap();
+    writeln!(out, "            acc += smA[tid.y * TILE + i] * smB[i * TILE + tid.x];").unwrap();
+    writeln!(out, "        }}").unwrap();
+    writeln!(out, "        threadgroup_barrier(mem_flags::mem_threadgroup);").unwrap();
+    writeln!(out, "    }}").unwrap();
+    writeln!(out, "    if (row < M && col < N) {{").unwrap();
+    writeln!(out, "        C[row * N + col] = acc + bias[col];").unwrap();
+    writeln!(out, "    }}").unwrap();
+    writeln!(out, "}}\n").unwrap();
+}
+
+fn emit_dequantize_kernel_msl(
+    out: &mut String,
+    kernel_name: &str,
+    num_elements: usize,
+    block_size: usize,
+    bits: usize,
+) {
+    let mask = (1u64 << bits) - 1;
+    let elems_per_u32 = 32 / bits;
+    writeln!(out, "kernel void {kernel_name}(").unwrap();
+    writeln!(out, "    device const uint* packed [[buffer(0)]],").unwrap();
+    writeln!(out, "    device const float* scales [[buffer(1)]],").unwrap();
+    writeln!(out, "    device float* output [[buffer(2)]],").unwrap();
+    writeln!(out, "    uint tid [[thread_position_in_grid]]").unwrap();
+    writeln!(out, ") {{").unwrap();
+    writeln!(out, "    const uint NUM_ELEMENTS = {num_elements}u;").unwrap();
+    writeln!(out, "    const uint BLOCK_SIZE = {block_size}u;").unwrap();
+    writeln!(out, "    const uint BITS = {bits}u;").unwrap();
+    writeln!(out, "    const uint MASK = {mask}u;").unwrap();
+    writeln!(out, "    const uint ELEMS_PER_U32 = {elems_per_u32}u;").unwrap();
+    writeln!(out, "    if (tid >= NUM_ELEMENTS) return;").unwrap();
+    writeln!(out, "    uint block_idx = tid / BLOCK_SIZE;").unwrap();
+    writeln!(out, "    uint in_block = tid % BLOCK_SIZE;").unwrap();
+    writeln!(out, "    float scale = scales[block_idx];").unwrap();
+    writeln!(out, "    uint packed_idx = (block_idx * BLOCK_SIZE + in_block) / ELEMS_PER_U32;").unwrap();
+    writeln!(out, "    uint bit_offset = (in_block % ELEMS_PER_U32) * BITS;").unwrap();
+    writeln!(out, "    uint raw = (packed[packed_idx] >> bit_offset) & MASK;").unwrap();
+    writeln!(out, "    float zero_point = float(1u << (BITS - 1));").unwrap();
+    writeln!(out, "    output[tid] = (float(raw) - zero_point) * scale;").unwrap();
     writeln!(out, "}}\n").unwrap();
 }
 
@@ -528,8 +738,27 @@ impl MachineCodeEmitter for AirCodeGen {
                 }
                 ComputePattern::Gemm => {
                     match op_kind {
-                        OpKind::Gemm { m, n, k } | OpKind::GemmBias { m, n, k } => {
-                            emit_gemm_kernel_msl(&mut msl, &kernel_name, *m, *n, *k);
+                        OpKind::Gemm { m, n, k } => {
+                            if self.gpu_family >= 7 {
+                                emit_gemm_simdgroup_msl(&mut msl, &kernel_name, *m, *n, *k);
+                            } else {
+                                emit_gemm_kernel_msl(&mut msl, &kernel_name, *m, *n, *k);
+                            }
+                        }
+                        OpKind::GemmBias { m, n, k } => {
+                            if self.gpu_family >= 7 {
+                                emit_gemm_bias_simdgroup_msl(&mut msl, &kernel_name, *m, *n, *k);
+                            } else {
+                                emit_gemm_bias_kernel_msl(&mut msl, &kernel_name, *m, *n, *k);
+                            }
+                        }
+                        OpKind::QuantGemm { m, n, k, .. } => {
+                            // QuantGemm uses the same GEMM structure; dequant is handled at load time
+                            if self.gpu_family >= 7 {
+                                emit_gemm_simdgroup_msl(&mut msl, &kernel_name, *m, *n, *k);
+                            } else {
+                                emit_gemm_kernel_msl(&mut msl, &kernel_name, *m, *n, *k);
+                            }
                         }
                         OpKind::MultiHeadAttention { seq_len, num_heads, head_dim } => {
                             emit_mha_kernel_msl(&mut msl, &kernel_name, *seq_len, *num_heads, *head_dim);
@@ -546,16 +775,32 @@ impl MachineCodeEmitter for AirCodeGen {
                     if body.is_empty() {
                         continue;
                     }
-                    return Err(format!(
-                        "AirCodeGen: non-trivial Injective codegen not yet implemented (op {:?})",
-                        op_kind
-                    ));
+                    match op_kind {
+                        OpKind::RoPE { head_dim, theta } => {
+                            emit_rope_kernel_msl(&mut msl, &kernel_name, *head_dim, *theta);
+                        }
+                        _ => {
+                            return Err(format!(
+                                "AirCodeGen: unsupported Injective op {:?}",
+                                op_kind
+                            ));
+                        }
+                    }
                 }
-                ComputePattern::QuantDecode { .. } => {
-                    return Err(format!(
-                        "AirCodeGen: QuantDecode codegen not yet implemented (op {:?})",
-                        op_kind
-                    ));
+                ComputePattern::QuantDecode { block_size, .. } => {
+                    match op_kind {
+                        OpKind::Dequantize { num_elements, block_size: bs, bits } => {
+                            emit_dequantize_kernel_msl(
+                                &mut msl, &kernel_name, *num_elements, *bs, *bits,
+                            );
+                        }
+                        _ => {
+                            return Err(format!(
+                                "AirCodeGen: unsupported QuantDecode op {:?} (block_size={})",
+                                op_kind, block_size
+                            ));
+                        }
+                    }
                 }
             }
         }
@@ -785,7 +1030,11 @@ mod tests {
             Err(e) => panic!("emit_plan GEMM failed: {e}"),
         };
         assert!(msl.contains("kernel void group_0("), "missing kernel entry");
-        assert!(msl.contains("device const float* A"), "missing A param");
+        // gpu_family 9 → simdgroup path uses half* inputs
+        assert!(
+            msl.contains("device const half* A") || msl.contains("device const float* A"),
+            "missing A param"
+        );
     }
 
     #[test]
@@ -841,5 +1090,143 @@ mod tests {
         };
         assert!(msl.contains("kernel void group_0("), "missing kernel entry");
         assert!(msl.contains("smem_scores"), "missing shared memory");
+    }
+
+    #[test]
+    fn test_air_emit_rope_kernel() {
+        let mut out = String::new();
+        emit_rope_kernel_msl(&mut out, "test_rope", 128, 10000.0);
+        assert!(out.contains("kernel void test_rope("));
+        assert!(out.contains("const uint HEAD_DIM = 128u"));
+        assert!(out.contains("const uint HALF_DIM = 64u"));
+        assert!(out.contains("cos(angle)"));
+        assert!(out.contains("sin(angle)"));
+        assert!(out.contains("x0 * cos_a - x1 * sin_a"));
+        assert!(out.contains("x1 * cos_a + x0 * sin_a"));
+    }
+
+    #[test]
+    fn test_air_emit_gemm_bias_kernel() {
+        let mut out = String::new();
+        emit_gemm_bias_kernel_msl(&mut out, "test_gemm_bias", 64, 64, 32);
+        assert!(out.contains("kernel void test_gemm_bias("));
+        assert!(out.contains("device const float* bias"));
+        assert!(out.contains("acc + bias[col]"));
+    }
+
+    #[test]
+    fn test_air_emit_gemm_bias_simdgroup() {
+        let mut out = String::new();
+        emit_gemm_bias_simdgroup_msl(&mut out, "test_gemm_bias_sg", 64, 64, 32);
+        assert!(out.contains("kernel void test_gemm_bias_sg("));
+        assert!(out.contains("simdgroup_float8x8"));
+        assert!(out.contains("simdgroup_multiply_accumulate"));
+        assert!(out.contains("device const float* bias"));
+        assert!(out.contains("+ bias[out_col]"));
+    }
+
+    #[test]
+    fn test_air_emit_dequantize_kernel() {
+        let mut out = String::new();
+        emit_dequantize_kernel_msl(&mut out, "test_dequant", 4096, 32, 4);
+        assert!(out.contains("kernel void test_dequant("));
+        assert!(out.contains("device const uint* packed"));
+        assert!(out.contains("device const float* scales"));
+        assert!(out.contains("const uint BLOCK_SIZE = 32u"));
+        assert!(out.contains("const uint BITS = 4u"));
+        assert!(out.contains("const uint MASK = 15u"));
+        assert!(out.contains("zero_point"));
+    }
+
+    #[test]
+    fn test_air_emit_plan_gemm_bias_family7() {
+        use crate::compiler::buffer_alloc::BufferAllocation;
+        use crate::compiler::fusion::{FusionGroup, FusionMode, FusionPlan};
+        use crate::compiler::graph::CompilerGraph;
+        use crate::compiler::registry::ScalarOpRegistry;
+        use crate::inference::types::DType;
+        use crate::dispatch::DeviceProfile;
+        use std::collections::HashMap;
+
+        let mut g = CompilerGraph::new();
+        let a = g.add_tensor("A", vec![32, 16], DType::F32);
+        let b = g.add_tensor("B", vec![16, 32], DType::F32);
+        let c = g.add_tensor("C", vec![32, 32], DType::F32);
+        g.inputs = vec![a, b];
+        g.outputs = vec![c];
+        let op_id = g.add_op(OpKind::GemmBias { m: 32, n: 32, k: 16 }, vec![a, b], vec![c], "gemm_bias");
+
+        let mut op_to_group = HashMap::new();
+        op_to_group.insert(op_id, 0);
+        let plan = FusionPlan {
+            groups: vec![FusionGroup {
+                id: 0,
+                anchor: op_id,
+                epilogue: vec![],
+                mode: FusionMode::LoopFusion,
+                ops: vec![op_id],
+            }],
+            op_to_group,
+        };
+        let alloc = BufferAllocation { slots: vec![], total_bytes: 0, num_tensors: 0, bytes_saved: 0 };
+        let profile = DeviceProfile::detect();
+        let registry = ScalarOpRegistry::with_defaults();
+
+        // gpu_family 9 → simdgroup path with bias
+        let mut cg = AirCodeGen::new(9);
+        let result = cg.emit_plan(&plan, &g, &alloc, &profile, Some(&registry));
+        let msl = match result {
+            Ok(o) => String::from_utf8(o.code).unwrap(),
+            Err(e) => panic!("emit_plan GemmBias failed: {e}"),
+        };
+        assert!(msl.contains("kernel void group_0("), "missing kernel entry");
+        assert!(msl.contains("simdgroup_multiply_accumulate"), "missing simdgroup MAC");
+        assert!(msl.contains("bias"), "missing bias");
+    }
+
+    #[test]
+    fn test_air_emit_plan_gemm_family5_scalar() {
+        use crate::compiler::buffer_alloc::BufferAllocation;
+        use crate::compiler::fusion::{FusionGroup, FusionMode, FusionPlan};
+        use crate::compiler::graph::CompilerGraph;
+        use crate::compiler::registry::ScalarOpRegistry;
+        use crate::inference::types::DType;
+        use crate::dispatch::DeviceProfile;
+        use std::collections::HashMap;
+
+        let mut g = CompilerGraph::new();
+        let a = g.add_tensor("A", vec![32, 16], DType::F32);
+        let b = g.add_tensor("B", vec![16, 32], DType::F32);
+        let c = g.add_tensor("C", vec![32, 32], DType::F32);
+        g.inputs = vec![a, b];
+        g.outputs = vec![c];
+        let op_id = g.add_op(OpKind::Gemm { m: 32, n: 32, k: 16 }, vec![a, b], vec![c], "gemm");
+
+        let mut op_to_group = HashMap::new();
+        op_to_group.insert(op_id, 0);
+        let plan = FusionPlan {
+            groups: vec![FusionGroup {
+                id: 0,
+                anchor: op_id,
+                epilogue: vec![],
+                mode: FusionMode::LoopFusion,
+                ops: vec![op_id],
+            }],
+            op_to_group,
+        };
+        let alloc = BufferAllocation { slots: vec![], total_bytes: 0, num_tensors: 0, bytes_saved: 0 };
+        let profile = DeviceProfile::detect();
+        let registry = ScalarOpRegistry::with_defaults();
+
+        // gpu_family 5 → scalar tiled path
+        let mut cg = AirCodeGen::new(5);
+        let result = cg.emit_plan(&plan, &g, &alloc, &profile, Some(&registry));
+        let msl = match result {
+            Ok(o) => String::from_utf8(o.code).unwrap(),
+            Err(e) => panic!("emit_plan Gemm scalar failed: {e}"),
+        };
+        assert!(msl.contains("kernel void group_0("), "missing kernel entry");
+        assert!(msl.contains("threadgroup float smA"), "missing shared memory tiling");
+        assert!(!msl.contains("simdgroup"), "should not use simdgroup on family 5");
     }
 }

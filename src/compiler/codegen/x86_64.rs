@@ -963,6 +963,17 @@ pub mod jit {
                 OpKind::MeanPool { seq_len, hidden } => {
                     self.emit_mean_pool(*seq_len, *hidden)
                 }
+                OpKind::RoPE { head_dim, .. } => {
+                    let total_elems = op.outputs.first()
+                        .and_then(|&out_id| graph.tensor_numel(out_id))
+                        .unwrap_or(0);
+                    if total_elems == 0 || *head_dim == 0 {
+                        return Err("RoPE: zero-element tensor or head_dim".into());
+                    }
+                    let n_heads = total_elems / head_dim;
+                    self.emit_rope_standalone(*head_dim, n_heads)
+                }
+                OpKind::Reshape { .. } | OpKind::Transpose { .. } => Ok(()),
                 _ => {
                     if let Some(reg) = registry {
                         let key = ScalarOpRegistry::key_from_op_kind(&op.kind);
@@ -970,6 +981,10 @@ pub mod jit {
                             return match &trace.pattern {
                                 ComputePattern::Elementwise { .. }
                                 | ComputePattern::BinaryElementwise { .. } => {
+                                    self.emit_elementwise_chain(group, graph, alloc, profile, registry)
+                                }
+                                ComputePattern::Injective { body, .. } => {
+                                    let is_binary = body.iter().any(|op| matches!(op, TraceOp::Input(n) if *n >= 1));
                                     self.emit_elementwise_chain(group, graph, alloc, profile, registry)
                                 }
                                 ComputePattern::NormLike { .. } => {
@@ -985,6 +1000,148 @@ pub mod jit {
                     Err(format!("x86_64: no registry entry for {:?}", op.kind))
                 }
             }
+        }
+
+        /// Emit RoPE (Rotary Position Embedding) standalone.
+        ///
+        /// ABI contract:
+        ///   rdi = x input ptr  [n_heads * head_dim f32]
+        ///   rsi = cos_sin ptr  [head_dim/2 f32]  (cos values; sin = sqrt(1-cos^2))
+        ///   r8  = output ptr   [n_heads * head_dim f32]
+        ///
+        /// For each head, pairs (x[2i], x[2i+1]) are rotated by (cos[i], sin[i]):
+        ///   out[2i]   = x[2i]   * cos[i] - x[2i+1] * sin[i]
+        ///   out[2i+1] = x[2i+1] * cos[i] + x[2i]   * sin[i]
+        fn emit_rope_standalone(
+            &mut self,
+            head_dim: usize,
+            n_heads: usize,
+        ) -> Result<(), String> {
+            let half = head_dim / 2;
+            let one_label = self.const_f32(1.0);
+            let neg_one_label = self.const_f32(-1.0);
+
+            // Both AVX2 and AVX-512 use ymm (4 pairs = 8 floats per chunk).
+            // The algorithm per chunk:
+            //   1. Load 4 cos values [c0,c1,c2,c3] → duplicate to [c0,c0,c1,c1,c2,c2,c3,c3]
+            //   2. Derive sin = sqrt(max(0, 1 - cos^2))
+            //   3. Build sin_signed = sin * [-1,1,-1,1,-1,1,-1,1]
+            //   4. Load 8 x floats, swap adjacent → x_swapped
+            //   5. result = x * cos_dup + x_swapped * sin_signed
+            let simd_pairs = 4usize; // 8 floats = 4 pairs per ymm
+            let vec_iters = half / simd_pairs;
+
+            for head in 0..n_heads {
+                let head_byte_off = (head * head_dim * 4) as i32;
+
+                for chunk in 0..vec_iters {
+                    let cos_off = (chunk * simd_pairs * 4) as i32;
+                    let x_off = head_byte_off + (chunk * simd_pairs * 2 * 4) as i32;
+
+                    // Load 4 cos values: [c0,c1,c2,c3]
+                    self.asm.vmovups(xmm0, xmmword_ptr(rsi + cos_off))
+                        .map_err(|e| e.to_string())?;
+                    // Duplicate to pairs: [c0,c0,c1,c1,c2,c2,c3,c3]
+                    self.asm.vunpcklps(xmm2, xmm0, xmm0)
+                        .map_err(|e| e.to_string())?; // [c0,c0,c1,c1]
+                    self.asm.vunpckhps(xmm3, xmm0, xmm0)
+                        .map_err(|e| e.to_string())?; // [c2,c2,c3,c3]
+                    self.asm.vinsertf128(ymm2, ymm2, xmm3, 1i32)
+                        .map_err(|e| e.to_string())?; // ymm2 = cos duplicated
+
+                    // sin = sqrt(max(0, 1 - cos^2))
+                    self.asm.vbroadcastss(ymm4, dword_ptr(one_label))
+                        .map_err(|e| e.to_string())?;
+                    self.asm.vmulps(ymm3, ymm2, ymm2)
+                        .map_err(|e| e.to_string())?;
+                    self.asm.vsubps(ymm3, ymm4, ymm3)
+                        .map_err(|e| e.to_string())?;
+                    self.asm.vxorps(ymm5, ymm5, ymm5)
+                        .map_err(|e| e.to_string())?;
+                    self.asm.vmaxps(ymm3, ymm3, ymm5)
+                        .map_err(|e| e.to_string())?;
+                    self.asm.vsqrtps(ymm3, ymm3)
+                        .map_err(|e| e.to_string())?;
+                    // ymm3 = sin duplicated [s0,s0,s1,s1,s2,s2,s3,s3]
+
+                    // Build sign mask [-1,1,-1,1,-1,1,-1,1] and apply
+                    self.asm.vbroadcastss(ymm5, dword_ptr(neg_one_label))
+                        .map_err(|e| e.to_string())?;
+                    self.asm.vbroadcastss(ymm6, dword_ptr(one_label))
+                        .map_err(|e| e.to_string())?;
+                    self.asm.vunpcklps(xmm5, xmm5, xmm6)
+                        .map_err(|e| e.to_string())?; // [-1,1,-1,1]
+                    self.asm.vinsertf128(ymm5, ymm5, xmm5, 1i32)
+                        .map_err(|e| e.to_string())?; // ymm5 = [-1,1,-1,1,-1,1,-1,1]
+                    self.asm.vmulps(ymm3, ymm3, ymm5)
+                        .map_err(|e| e.to_string())?;
+                    // ymm3 = [-s0,s0,-s1,s1,-s2,s2,-s3,s3]
+
+                    // Load 8 floats (4 pairs) from x
+                    self.asm.vmovups(ymm0, ymmword_ptr(rdi + x_off))
+                        .map_err(|e| e.to_string())?;
+                    // Swap adjacent: [x1,x0,x3,x2,x5,x4,x7,x6]
+                    self.asm.vshufps(ymm1, ymm0, ymm0, 0b10_11_00_01)
+                        .map_err(|e| e.to_string())?;
+                    // result = x * cos + x_swapped * sin_signed
+                    self.asm.vmulps(ymm0, ymm0, ymm2)
+                        .map_err(|e| e.to_string())?;
+                    self.asm.vfmadd231ps(ymm0, ymm1, ymm3)
+                        .map_err(|e| e.to_string())?;
+                    self.asm.vmovups(ymmword_ptr(r8 + x_off), ymm0)
+                        .map_err(|e| e.to_string())?;
+                }
+
+                // Scalar tail for remaining pairs
+                for i in (vec_iters * simd_pairs)..half {
+                    let cos_off = (i * 4) as i32;
+                    let x_off = head_byte_off + (i * 2 * 4) as i32;
+
+                    // cos
+                    self.asm.vmovss(xmm0, dword_ptr(rsi + cos_off))
+                        .map_err(|e| e.to_string())?;
+                    // sin = sqrt(max(0, 1 - cos^2))
+                    self.asm.vmulss(xmm1, xmm0, xmm0)
+                        .map_err(|e| e.to_string())?;
+                    self.asm.vmovss(xmm2, dword_ptr(one_label))
+                        .map_err(|e| e.to_string())?;
+                    self.asm.vsubss(xmm1, xmm2, xmm1)
+                        .map_err(|e| e.to_string())?;
+                    self.asm.vxorps(xmm3, xmm3, xmm3)
+                        .map_err(|e| e.to_string())?;
+                    self.asm.vmaxss(xmm1, xmm1, xmm3)
+                        .map_err(|e| e.to_string())?;
+                    self.asm.vsqrtss(xmm1, xmm1, xmm1)
+                        .map_err(|e| e.to_string())?;
+                    // xmm0 = cos, xmm1 = sin
+
+                    // x0 = x[2i], x1 = x[2i+1]
+                    self.asm.vmovss(xmm2, dword_ptr(rdi + x_off))
+                        .map_err(|e| e.to_string())?;
+                    self.asm.vmovss(xmm3, dword_ptr(rdi + x_off + 4))
+                        .map_err(|e| e.to_string())?;
+
+                    // out[2i] = x0*cos - x1*sin
+                    self.asm.vmulss(xmm4, xmm2, xmm0)
+                        .map_err(|e| e.to_string())?;
+                    self.asm.vmulss(xmm5, xmm3, xmm1)
+                        .map_err(|e| e.to_string())?;
+                    self.asm.vsubss(xmm4, xmm4, xmm5)
+                        .map_err(|e| e.to_string())?;
+                    self.asm.vmovss(dword_ptr(r8 + x_off), xmm4)
+                        .map_err(|e| e.to_string())?;
+
+                    // out[2i+1] = x1*cos + x0*sin
+                    self.asm.vmulss(xmm4, xmm3, xmm0)
+                        .map_err(|e| e.to_string())?;
+                    self.asm.vfmadd231ss(xmm4, xmm2, xmm1)
+                        .map_err(|e| e.to_string())?;
+                    self.asm.vmovss(dword_ptr(r8 + x_off + 4), xmm4)
+                        .map_err(|e| e.to_string())?;
+                }
+            }
+
+            Ok(())
         }
 
         /// Emit mean-pool: average `seq_len` rows of `hidden` f32 elements.
@@ -2113,8 +2270,7 @@ pub mod jit {
         ///
         /// All ops in the chain execute on the same data in registers,
         /// no intermediate memory traffic. Trace bodies are looked up
-        /// from the `ScalarOpRegistry` when available; falls back to
-        /// the hardcoded `emit_chain_body` path otherwise.
+        /// from the `ScalarOpRegistry`; returns an error if no trace is found.
         ///
         /// Generated code layout (System V AMD64 ABI):
         /// ```text
@@ -2186,7 +2342,10 @@ pub mod jit {
             }
 
             if trace_info.is_empty() {
-                return self.emit_elementwise_chain_hardcoded(group, graph, elem_count);
+                return Err(format!(
+                    "elementwise chain: no trace info found for group (anchor={:?}), registry lookup required",
+                    group.anchor
+                ));
             }
 
             let simd_w = self.simd_width; // 8 for AVX2, 16 for AVX-512
@@ -2352,112 +2511,6 @@ pub mod jit {
             Ok(())
         }
 
-        /// Hardcoded fallback for elementwise chain (no registry available).
-        ///
-        /// Uses the original OpKind-matching approach for SiLU, GELU, Add, Mul.
-        fn emit_elementwise_chain_hardcoded(
-            &mut self,
-            group: &FusionGroup,
-            graph: &CompilerGraph,
-            elem_count: usize,
-        ) -> Result<(), String> {
-            let simd_w = self.simd_width;
-            let vec_count = elem_count / simd_w;
-            let tail = elem_count % simd_w;
-
-            let mut loop_label = self.asm.create_label();
-            let mut done_label = self.asm.create_label();
-
-            let total_vec_bytes = (vec_count * simd_w * 4) as i32;
-            self.asm.xor(rbx, rbx).map_err(|e| e.to_string())?;
-
-            self.asm.set_label(&mut loop_label).map_err(|e| e.to_string())?;
-            self.asm.cmp(rbx, total_vec_bytes).map_err(|e| e.to_string())?;
-            self.asm.jge(done_label).map_err(|e| e.to_string())?;
-
-            self.asm.vmovups(ymm0, ymmword_ptr(rdi + rbx))
-                .map_err(|e| e.to_string())?;
-
-            let result_reg = self.emit_chain_body(group, graph)?;
-
-            self.asm.vmovups(ymmword_ptr(r8 + rbx), result_reg)
-                .map_err(|e| e.to_string())?;
-
-            self.asm.add(rbx, 32i32).map_err(|e| e.to_string())?;
-            self.asm.jmp(loop_label).map_err(|e| e.to_string())?;
-
-            self.asm.set_label(&mut done_label).map_err(|e| e.to_string())?;
-
-            if tail > 0 {
-                let base_offset = (vec_count * simd_w) as i32;
-                for t in 0..tail as i32 {
-                    let off = (base_offset + t) * 4;
-                    self.asm.vmovss(xmm0, dword_ptr(rdi + off))
-                        .map_err(|e| e.to_string())?;
-                    self.asm.vmovss(dword_ptr(r8 + off), xmm0)
-                        .map_err(|e| e.to_string())?;
-                }
-            }
-
-            Ok(())
-        }
-
-        /// Emit the compute body for an elementwise chain (hardcoded fallback).
-        ///
-        /// Input is pre-loaded in ymm0. Returns the register holding the result.
-        /// Uses ymm0-ymm5 for data, ymm13-ymm15 as scratch for exp/tanh.
-        fn emit_chain_body(
-            &mut self,
-            group: &FusionGroup,
-            graph: &CompilerGraph,
-        ) -> Result<AsmRegisterYmm, String> {
-            let op = graph.op(group.anchor).ok_or("missing anchor")?;
-            match &op.kind {
-                OpKind::Silu => {
-                    self.asm.vxorps(ymm1, ymm1, ymm1).map_err(|e| e.to_string())?;
-                    self.asm.vsubps(ymm1, ymm1, ymm0).map_err(|e| e.to_string())?;
-                    self.emit_exp_avx2(ymm2, ymm1, [ymm13, ymm14, ymm15])?;
-                    let one_label = self.const_f32(1.0);
-                    self.asm.vbroadcastss(ymm3, dword_ptr(one_label)).map_err(|e| e.to_string())?;
-                    self.asm.vaddps(ymm2, ymm2, ymm3).map_err(|e| e.to_string())?;
-                    self.asm.vdivps(ymm0, ymm0, ymm2).map_err(|e| e.to_string())?;
-                    Ok(ymm0)
-                }
-                OpKind::Gelu => {
-                    self.asm.vmulps(ymm1, ymm0, ymm0).map_err(|e| e.to_string())?;
-                    self.asm.vmulps(ymm1, ymm1, ymm0).map_err(|e| e.to_string())?;
-                    let coeff_label = self.const_f32(0.044715);
-                    self.asm.vbroadcastss(ymm2, dword_ptr(coeff_label)).map_err(|e| e.to_string())?;
-                    self.asm.vmulps(ymm1, ymm2, ymm1).map_err(|e| e.to_string())?;
-                    self.asm.vaddps(ymm1, ymm0, ymm1).map_err(|e| e.to_string())?;
-                    let sqrt2pi_label = self.const_f32(0.7978845608);
-                    self.asm.vbroadcastss(ymm2, dword_ptr(sqrt2pi_label)).map_err(|e| e.to_string())?;
-                    self.asm.vmulps(ymm1, ymm2, ymm1).map_err(|e| e.to_string())?;
-                    self.emit_tanh_avx2(ymm1, ymm1, [ymm13, ymm14, ymm15])?;
-                    let one_label = self.const_f32(1.0);
-                    self.asm.vbroadcastss(ymm2, dword_ptr(one_label)).map_err(|e| e.to_string())?;
-                    self.asm.vaddps(ymm1, ymm1, ymm2).map_err(|e| e.to_string())?;
-                    let half_label = self.const_f32(0.5);
-                    self.asm.vbroadcastss(ymm2, dword_ptr(half_label)).map_err(|e| e.to_string())?;
-                    self.asm.vmulps(ymm0, ymm2, ymm0).map_err(|e| e.to_string())?;
-                    self.asm.vmulps(ymm0, ymm0, ymm1).map_err(|e| e.to_string())?;
-                    Ok(ymm0)
-                }
-                OpKind::Add => {
-                    self.asm.vmovups(ymm1, ymmword_ptr(rsi + rbx)).map_err(|e| e.to_string())?;
-                    self.asm.vaddps(ymm0, ymm0, ymm1).map_err(|e| e.to_string())?;
-                    Ok(ymm0)
-                }
-                OpKind::Mul => {
-                    self.asm.vmovups(ymm1, ymmword_ptr(rsi + rbx)).map_err(|e| e.to_string())?;
-                    self.asm.vmulps(ymm0, ymm0, ymm1).map_err(|e| e.to_string())?;
-                    Ok(ymm0)
-                }
-                _ => {
-                    Ok(ymm0)
-                }
-            }
-        }
         /// Emit GEMM with fused epilogue (activation injected before store).
         ///
         /// Generates the full GEMM microkernel, then applies epilogue ops
@@ -2911,11 +2964,19 @@ pub mod jit {
             let kc = blocking.kc;
             let mc = blocking.mc;
             let nc = blocking.nc;
-            let simd_w = 8usize; // AVX2: 8 f32 per ymm
+            let simd_w = if self.use_avx512 { 16usize } else { 8usize };
             let nr_vecs = nr / simd_w;
             let num_acc = mr * nr_vecs;
 
-            if num_acc + 1 > 13 {
+            if self.use_avx512 {
+                if num_acc + 2 > 32 {
+                    return Err(format!(
+                        "GEMM {}x{} microkernel needs {} accumulators + 2 scratch, \
+                         exceeds 32 zmm registers",
+                        mr, nr, num_acc
+                    ));
+                }
+            } else if num_acc + 1 > 13 {
                 return Err(format!(
                     "GEMM {}x{} microkernel needs {} accumulators + 1 scratch, \
                      exceeds 13 usable ymm (ymm13-15 reserved)",
@@ -6738,7 +6799,8 @@ mod e2e_tests {
     ) -> CompiledLayer {
         let profile = DeviceProfile::detect();
         let mut codegen = X86CodeGen::new(&profile);
-        let output = codegen.emit_plan(plan, graph, alloc, &profile, None).unwrap();
+        let registry = crate::compiler::registry::ScalarOpRegistry::with_defaults();
+        let output = codegen.emit_plan(plan, graph, alloc, &profile, Some(&registry)).unwrap();
         assert!(!output.code.is_empty(), "codegen produced empty code");
         CompiledLayer::from_code(&output.code, output.scratchpad_bytes, 0).unwrap()
     }

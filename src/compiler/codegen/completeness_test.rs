@@ -258,4 +258,133 @@ mod completeness_tests {
             }
         }
     }
+
+    // ── CUDA PTX tests ───────────────────────────────────────────────────────
+
+    #[cfg(feature = "jit-cuda")]
+    mod ptx {
+        use super::*;
+        use crate::compiler::codegen::ptx::PtxCodeGen;
+
+        fn try_compile(kind: OpKind, inputs: &[(&str, Vec<usize>)], outputs: &[(&str, Vec<usize>)]) -> Result<usize, String> {
+            try_compile_with(kind, inputs, outputs, |_profile| {
+                Box::new(PtxCodeGen::new(80)) // SM 80 (A100)
+            })
+        }
+
+        #[test]
+        fn codegen_completeness_ptx() {
+            let mut failures = Vec::new();
+            for (label, kind, inputs, outputs) in &compute_op_cases() {
+                let result = try_compile(kind.clone(), inputs, outputs);
+                match &result {
+                    Ok(size) if *size <= 4 => {
+                        failures.push(format!("{}: silent NOP ({} bytes)", label, size));
+                    }
+                    _ => {}
+                }
+                assert_no_silent_nop(label, result);
+            }
+            if !failures.is_empty() {
+                panic!("PTX completeness violations:\n  {}", failures.join("\n  "));
+            }
+        }
+
+        #[test]
+        fn codegen_completeness_metadata_ops_ptx() {
+            for (label, kind, inputs, outputs) in &metadata_op_cases() {
+                let result = try_compile(kind.clone(), inputs, outputs);
+                match &result {
+                    Ok(_) => eprintln!("[completeness] {} (metadata/ptx): OK", label),
+                    Err(msg) => eprintln!("[completeness] {} (metadata/ptx): Err — {}", label, msg),
+                }
+            }
+        }
+    }
+
+    // ── HIP AMDGPU tests ────────────────────────────────────────────────────
+
+    #[cfg(feature = "jit-hip")]
+    mod hip {
+        use super::*;
+        use crate::compiler::codegen::hip::HipCodeGen;
+
+        fn try_compile(kind: OpKind, inputs: &[(&str, Vec<usize>)], outputs: &[(&str, Vec<usize>)]) -> Result<usize, String> {
+            try_compile_with(kind, inputs, outputs, |_profile| {
+                Box::new(HipCodeGen::new(908)) // gfx908 (MI100)
+            })
+        }
+
+        #[test]
+        fn codegen_completeness_hip() {
+            let mut failures = Vec::new();
+            for (label, kind, inputs, outputs) in &compute_op_cases() {
+                let result = try_compile(kind.clone(), inputs, outputs);
+                match &result {
+                    Ok(size) if *size <= 4 => {
+                        failures.push(format!("{}: silent NOP ({} bytes)", label, size));
+                    }
+                    _ => {}
+                }
+                assert_no_silent_nop(label, result);
+            }
+            if !failures.is_empty() {
+                panic!("HIP completeness violations:\n  {}", failures.join("\n  "));
+            }
+        }
+
+        #[test]
+        fn codegen_completeness_metadata_ops_hip() {
+            for (label, kind, inputs, outputs) in &metadata_op_cases() {
+                let result = try_compile(kind.clone(), inputs, outputs);
+                match &result {
+                    Ok(_) => eprintln!("[completeness] {} (metadata/hip): OK", label),
+                    Err(msg) => eprintln!("[completeness] {} (metadata/hip): Err — {}", label, msg),
+                }
+            }
+        }
+    }
+
+    // ── Metal AIR tests ─────────────────────────────────────────────────────
+
+    #[cfg(feature = "jit-metal")]
+    mod metal {
+        use super::*;
+        use crate::compiler::codegen::air::AirCodeGen;
+
+        fn try_compile(kind: OpKind, inputs: &[(&str, Vec<usize>)], outputs: &[(&str, Vec<usize>)]) -> Result<usize, String> {
+            try_compile_with(kind, inputs, outputs, |_profile| {
+                Box::new(AirCodeGen::new(9)) // Apple GPU family 9
+            })
+        }
+
+        #[test]
+        fn codegen_completeness_metal() {
+            let mut failures = Vec::new();
+            for (label, kind, inputs, outputs) in &compute_op_cases() {
+                let result = try_compile(kind.clone(), inputs, outputs);
+                match &result {
+                    Ok(size) if *size <= 4 => {
+                        failures.push(format!("{}: silent NOP ({} bytes)", label, size));
+                    }
+                    _ => {}
+                }
+                assert_no_silent_nop(label, result);
+            }
+            if !failures.is_empty() {
+                panic!("Metal completeness violations:\n  {}", failures.join("\n  "));
+            }
+        }
+
+        #[test]
+        fn codegen_completeness_metadata_ops_metal() {
+            for (label, kind, inputs, outputs) in &metadata_op_cases() {
+                let result = try_compile(kind.clone(), inputs, outputs);
+                match &result {
+                    Ok(_) => eprintln!("[completeness] {} (metadata/metal): OK", label),
+                    Err(msg) => eprintln!("[completeness] {} (metadata/metal): Err — {}", label, msg),
+                }
+            }
+        }
+    }
 }

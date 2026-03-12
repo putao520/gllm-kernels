@@ -31,6 +31,8 @@ pub mod target_desc;
 pub mod isa_scheduler;
 #[cfg(feature = "jit-metal")]
 pub mod air;
+#[cfg(feature = "jit-hip")]
+pub mod hip;
 pub mod completeness_test;
 
 pub use emitter::{MachineCodeEmitter, PlatformBackend, Platform};

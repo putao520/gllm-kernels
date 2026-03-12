@@ -220,7 +220,7 @@ impl InferenceCompiler {
     ///
     /// Phase 3 has an MVP implementation under the `jit-x86` feature flag
     /// (see `codegen::x86_64::jit::X86CodeGen`). Without the feature flag,
-    /// a stub is emitted as fallback.
+    /// an error is returned.
     fn jit_compile(&self, ir: &LayerIR) -> Result<codegen::CodegenOutput, InferenceError> {
         // Phase 1: Build CompilerGraph DAG
         let graph = CompilerGraph::from_layer_ir(ir, &self.profile)

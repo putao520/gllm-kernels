@@ -19,22 +19,32 @@ mod tests {
     #[test]
     fn test_dequant_q4_k_scalar() {
         let kernels = CpuKernels::<f32>::new();
+        // Q4_K formula: out[l] = d * sc * (qs[l] & 0xF) - dmin * m
+        // Group 0, first 32 outputs use low nibbles with scale index 0
+        // get_scale_min_k4(0, scales): sc = scales[0] & 63, m = scales[4] & 63
         let mut block = BlockQ4K {
             d: f16::from_f32(1.0),
-            dmin: f16::from_f32(0.0),
+            dmin: f16::from_f32(0.5),
             scales: [0u8; 12],
             qs: [0u8; 128],
         };
-        block.qs[0] = 0x88;
-        block.qs[1] = 0x97;
+        // Set sc=2 for sub-block 0 (scales[0] low 6 bits)
+        block.scales[0] = 2;
+        // Set m=4 for sub-block 0 (scales[4] low 6 bits)
+        block.scales[4] = 4;
+        // qs[0] low nibble = 5, qs[1] low nibble = 3
+        block.qs[0] = 0x05;
+        block.qs[1] = 0x03;
 
         let mut out = vec![0.0f32; 256];
         kernels.dequant_q4_k(as_u8_slice(&block), &mut out);
-        
-        assert_eq!(out[0], 0.0);
-        assert_eq!(out[1], 0.0);
-        assert_eq!(out[2], -1.0);
-        assert_eq!(out[3], 1.0);
+
+        // out[0] = d * sc * q - dmin * m = 1.0 * 2 * 5 - 0.5 * 4 = 10.0 - 2.0 = 8.0
+        assert_eq!(out[0], 8.0);
+        // out[1] = 1.0 * 2 * 3 - 0.5 * 4 = 6.0 - 2.0 = 4.0
+        assert_eq!(out[1], 4.0);
+        // out[2] = 1.0 * 2 * 0 - 0.5 * 4 = -2.0 (qs[2] = 0)
+        assert_eq!(out[2], -2.0);
     }
 
     #[test]
@@ -64,18 +74,26 @@ mod tests {
             d: f16::from_f32(2.0),
             dmin: f16::from_f32(0.0),
         };
-        // Set per-sub-block scale for sub-block 0: sc=1 (low nibble), m=0 (high nibble)
-        // Formula: out = d * sc * q - dmin * m = 2.0 * 1 * q - 0 = 2*q
+        // Q2_K decode layout (scalar):
+        //   Elements 0-15:  qs[0..16] bits[1:0] (shift=0), scale from scales[0]
+        //   Elements 16-31: qs[16..32] bits[1:0] (shift=0), scale from scales[1]
+        // Formula: out = d * (sc & 0xF) * q - dmin * (sc >> 4)
+        // Set scale for sub-block 0: sc=1 (low nibble), m=0 (high nibble)
         block.scales[0] = 0x01;
-        block.qs[0] = 0x1B; // q values: 3, 2, 1, 0
+        // Set qs[0..4] low 2 bits to q values 3, 2, 1, 0
+        block.qs[0] = 3; // bits[1:0] = 3
+        block.qs[1] = 2; // bits[1:0] = 2
+        block.qs[2] = 1; // bits[1:0] = 1
+        block.qs[3] = 0; // bits[1:0] = 0
 
         let mut out = vec![0.0f32; 256];
         kernels.dequant_q2_k(as_u8_slice(&block), &mut out);
 
-        assert_eq!(out[0], 6.0);
-        assert_eq!(out[1], 4.0);
-        assert_eq!(out[2], 2.0);
-        assert_eq!(out[3], 0.0);
+        // out[i] = d * sc * q = 2.0 * 1 * q
+        assert_eq!(out[0], 6.0);  // 2*1*3
+        assert_eq!(out[1], 4.0);  // 2*1*2
+        assert_eq!(out[2], 2.0);  // 2*1*1
+        assert_eq!(out[3], 0.0);  // 2*1*0
     }
 
     #[test]
@@ -87,12 +105,21 @@ mod tests {
             scales: [0u8; 12],
             d: f16::from_f32(1.0),
         };
-        block.qs[0] = 0x03; 
+        // Q3_K scale unpacking: 12 raw bytes → 16 x 6-bit scales (as i8), then dl = d * (scale - 32)
+        // First unpacked scale byte = (raw[0] & 0x0F) | ((raw[8] & 0x03) << 4)
+        // We want scale = 33 so that dl = 1.0 * (33 - 32) = 1.0
+        // 33 = 0x21 → raw[0] & 0x0F = 1, (raw[8] & 0x03) << 4 = 0x20 → raw[8] = 2
+        block.scales[0] = 0x01;
+        block.scales[8] = 0x02;
+        // qs[0] bits[1:0] = 3
+        block.qs[0] = 0x03;
+        // hmask[0] bit 0 = 1 → hbit = 0 (high bit NOT set means hbit=4, set means hbit=0)
         block.hmask[0] = 0x01;
 
         let mut out = vec![0.0f32; 256];
         kernels.dequant_q3_k(as_u8_slice(&block), &mut out);
-        
+
+        // out[0] = dl * (qval - hbit) = 1.0 * (3 - 0) = 3.0
         assert_eq!(out[0], 3.0);
     }
 
@@ -106,15 +133,23 @@ mod tests {
             d: f16::from_f32(1.0),
             dmin: f16::from_f32(0.0),
         };
+        // Q5_K: out[l] = d * sc * ((qs[l] & 0xF) + 16*hbit) - dmin * m
+        // get_scale_min_k4(0): sc = scales[0] & 63, m = scales[4] & 63
+        // Set sc=1 for sub-block 0
+        block.scales[0] = 1;
+        // qs[0] low nibble = 0xF = 15, qh[0] bit 0 (u1=1) set → val = 15 + 16 = 31
         block.qs[0] = 0x0F;
         block.qh[0] = 0x01;
-        block.qs[0] |= 0xF0;
-        block.qh[0] |= 0x02;
+        // qs[1] low nibble = 0xF = 15, qh[1] bit 0 (u1=1) set → val = 15 + 16 = 31
+        block.qs[1] = 0x0F;
+        block.qh[1] = 0x01;
 
         let mut out = vec![0.0f32; 256];
         kernels.dequant_q5_k(as_u8_slice(&block), &mut out);
 
+        // out[0] = 1.0 * 1 * 31 - 0 = 31.0
         assert_eq!(out[0], 31.0);
+        // out[1] = 1.0 * 1 * 31 - 0 = 31.0
         assert_eq!(out[1], 31.0);
     }
 
@@ -127,12 +162,20 @@ mod tests {
             scales: [0u8; 16],
             d: f16::from_f32(1.0),
         };
+        // Q6_K: q1 = ((ql[l] & 0xF) | (((qh[l] >> 0) & 3) << 4)) as i8 - 32
+        //        out[l] = d * (sc[is] as i8 as f32) * q1
+        // Set scales[0] = 1 so that sc = 1 as i8 = 1
+        block.scales[0] = 1;
+        // qs[0] = 0x0F → low nibble = 15
+        // qh[0] = 0x03 → bits[1:0] = 3
+        // q1 = (15 | (3 << 4)) - 32 = 63 - 32 = 31
         block.qs[0] = 0x0F;
         block.qh[0] = 0x03;
 
         let mut out = vec![0.0f32; 256];
         kernels.dequant_q6_k(as_u8_slice(&block), &mut out);
 
+        // out[0] = 1.0 * 1.0 * 31.0 = 31.0
         assert_eq!(out[0], 31.0);
     }
 
@@ -142,42 +185,49 @@ mod tests {
         let m = 2; // batch
         let n = 2; // out_features
         let k = 256; // in_features (must be multiple of 256)
-        
+
         let block_size = size_of::<BlockQ4K>();
         let mut weight_data = vec![0u8; n * (k / 256) * block_size];
-        
+
         let w_ptr = weight_data.as_mut_ptr() as *mut BlockQ4K;
-        
+
         unsafe {
-            // Block 0 (Row 0)
+            // Block 0 (Row 0): d=1.0, dmin=0.0, sc=1 for sub-block 0
+            // qs[0] low nibble = 5, qs[1] low nibble = 3
+            // dequant: out[0] = 1*1*5 = 5, out[1] = 1*1*3 = 3
             let b0 = &mut *w_ptr.add(0);
             b0.d = f16::from_f32(1.0);
             b0.dmin = f16::from_f32(0.0);
-            b0.qs[0] = 0x88;
-            b0.qs[1] = 0x97;
-            
-            // Block 1 (Row 1)
+            b0.scales[0] = 1; // sc=1 for sub-block 0
+            b0.qs[0] = 0x05;
+            b0.qs[1] = 0x03;
+
+            // Block 1 (Row 1): d=2.0, dmin=0.0, sc=1 for sub-block 0
+            // dequant: out[0] = 2*1*5 = 10, out[1] = 2*1*3 = 6
             let b1 = &mut *w_ptr.add(1);
             b1.d = f16::from_f32(2.0);
             b1.dmin = f16::from_f32(0.0);
-            b1.qs[0] = 0x88;
-            b1.qs[1] = 0x97;
+            b1.scales[0] = 1;
+            b1.qs[0] = 0x05;
+            b1.qs[1] = 0x03;
         }
-        
+
+        // input[0] = 1.0, input[1] = 1.0 for both batch rows
         let mut input = vec![0.0f32; m * k];
-        input[2] = -1.0;
-        input[3] = 1.0;
-        input[k + 2] = -1.0;
-        input[k + 3] = 1.0;
-        
+        input[0] = 1.0;
+        input[1] = 1.0;
+        input[k] = 1.0;
+        input[k + 1] = 1.0;
+
         let mut output = vec![0.0f32; m * n];
-        
+
+        // dot row0 = 5*1 + 3*1 = 8, dot row1 = 10*1 + 6*1 = 16
         kernels.gemm_q4(&weight_data, &input, &mut output, &[], m, n, k);
-        
-        assert_eq!(output[0], 2.0);
-        assert_eq!(output[1], 4.0);
-        assert_eq!(output[2], 2.0);
-        assert_eq!(output[3], 4.0);
+
+        assert_eq!(output[0], 8.0);   // batch0 x row0
+        assert_eq!(output[1], 16.0);  // batch0 x row1
+        assert_eq!(output[2], 8.0);   // batch1 x row0
+        assert_eq!(output[3], 16.0);  // batch1 x row1
     }
 
     // ========================================================================
@@ -603,38 +653,44 @@ mod tests {
     #[test]
     fn test_gemm_q4_scaled() {
         let kernels = CpuKernels::<f32>::new();
-        let m = 1; 
-        let n = 2; 
-        let k = 256; 
-        
+        let m = 1;
+        let n = 2;
+        let k = 256;
+
         let block_size = size_of::<BlockQ4K>();
         let mut weight_data = vec![0u8; n * block_size];
         let w_ptr = weight_data.as_mut_ptr() as *mut BlockQ4K;
         unsafe {
-             (*w_ptr.add(0)).d = f16::from_f32(1.0);
-             (*w_ptr.add(0)).dmin = f16::from_f32(0.0);
-             (*w_ptr.add(0)).qs[0] = 0x88;
-             
-             (*w_ptr.add(1)).d = f16::from_f32(1.0);
-             (*w_ptr.add(1)).dmin = f16::from_f32(0.0);
-             (*w_ptr.add(1)).qs[0] = 0x88;
-        }
-        
-        let mut input = vec![0.0f32; m * k];
-        input[0] = -1.0;
-        input[1] = 1.0; 
-        
-        unsafe {
-            (*w_ptr.add(0)).qs[0] = 0x97; // Block 0 -> 2.0
-            (*w_ptr.add(1)).qs[0] = 0x97; // Block 1 -> 2.0
+            // Row 0: d=1.0, dmin=0.0, sc=1 for sub-block 0
+            // qs[0] low nibble = 2 → dequant[0] = 1*1*2 = 2
+            let b0 = &mut *w_ptr.add(0);
+            b0.d = f16::from_f32(1.0);
+            b0.dmin = f16::from_f32(0.0);
+            b0.scales[0] = 1;
+            b0.qs[0] = 0x02;
+
+            // Row 1: same block data
+            let b1 = &mut *w_ptr.add(1);
+            b1.d = f16::from_f32(1.0);
+            b1.dmin = f16::from_f32(0.0);
+            b1.scales[0] = 1;
+            b1.qs[0] = 0x02;
         }
 
+        // input[0] = 1.0, rest zero
+        let mut input = vec![0.0f32; m * k];
+        input[0] = 1.0;
+
         let mut output = vec![0.0f32; m * n];
-        let scales = vec![10.0, 0.5]; 
-        
+        // per-channel scales: row0 scaled by 10.0, row1 scaled by 0.5
+        let scales = vec![10.0, 0.5];
+
         kernels.gemm_q4(&weight_data, &input, &mut output, &scales, m, n, k);
-        
-        assert_eq!(output[0], 20.0); 
-        assert_eq!(output[1], 1.0);  
+
+        // dot = dequant[0] * input[0] = 2 * 1 = 2
+        // output[0] = 2 * 10.0 = 20.0
+        assert_eq!(output[0], 20.0);
+        // output[1] = 2 * 0.5 = 1.0
+        assert_eq!(output[1], 1.0);
     }
 }
