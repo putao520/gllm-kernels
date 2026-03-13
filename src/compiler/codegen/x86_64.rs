@@ -78,6 +78,8 @@ pub mod jit {
         has_avx512: bool,
         /// Whether the target has AMX tile instructions (SPR+).
         has_amx: bool,
+        /// AVX2 tail remainder count (set by set_tail_mask, used by vload/vstore_masked).
+        avx2_tail_remainder: usize,
     }
 
     /// How `Input(idx)` nodes are materialised in trace evaluation.
@@ -439,6 +441,7 @@ pub mod jit {
                 width_stack: Vec::new(),
                 has_avx512: use_avx512,
                 has_amx: profile.kernel_config.has_amx,
+                avx2_tail_remainder: 0,
             }
         }
 
@@ -462,9 +465,6 @@ pub mod jit {
                 simd_widths: widths,
                 has_tile_accel: self.has_amx,
                 tile_accel: if self.has_amx { Some(TileAccelKind::Amx) } else { None },
-                peak_gflops_f32: 0.0,
-                peak_bandwidth_gbs: 0.0,
-                roofline_crossover: 0.0,
             }
         }
 
@@ -569,6 +569,17 @@ pub mod jit {
             }
             let label = self.asm.create_label();
             self.const_pool.push([val; 8]);
+            self.const_labels.push(label);
+            label
+        }
+
+        /// Add an i32×8 mask constant to the pool (for AVX2 vmaskmovps).
+        /// Stores the i32 values reinterpreted as f32 bits.
+        fn const_i32x8(&mut self, vals: [i32; 8]) -> CodeLabel {
+            // Reinterpret i32 mask as f32 bits for storage in the f32 const pool
+            let as_f32: [f32; 8] = unsafe { std::mem::transmute(vals) };
+            let label = self.asm.create_label();
+            self.const_pool.push(as_f32);
             self.const_labels.push(label);
             label
         }
@@ -1789,11 +1800,9 @@ pub mod jit {
             let gemm_op = graph.op(group.anchor)
                 .ok_or("NormIntoGemm: GEMM op not in graph")?;
 
-            let eps = match &norm_op.kind {
-                OpKind::RmsNorm { eps } => *eps,
-                OpKind::LayerNorm { eps } => {
-                    return Err("NormIntoGemm: LayerNorm not yet supported".into());
-                }
+            let (eps, is_layer_norm) = match &norm_op.kind {
+                OpKind::RmsNorm { eps } => (*eps, false),
+                OpKind::LayerNorm { eps } => (*eps, true),
                 other => {
                     return Err(format!("NormIntoGemm: expected norm op, got {:?}", other));
                 }
@@ -1818,8 +1827,9 @@ pub mod jit {
 
             self.asm.mov(rbx, qword_ptr(rbp + 32)).map_err(|e| e.to_string())?;
 
-            self.asm.sub(rsp, 16i32).map_err(|e| e.to_string())?;  // 16-byte aligned slot
-            self.asm.mov(qword_ptr(rsp), r8).map_err(|e| e.to_string())?;  // save C output ptr
+            self.asm.sub(rsp, 32i32).map_err(|e| e.to_string())?;  // 32-byte aligned slot
+            self.asm.mov(qword_ptr(rsp), r8).map_err(|e| e.to_string())?;    // [rsp+0] = C output ptr
+            self.asm.mov(qword_ptr(rsp + 8), rcx).map_err(|e| e.to_string())?; // [rsp+8] = bias ptr
             self.asm.mov(r13, rdi).map_err(|e| e.to_string())?;  // A input base
             self.asm.mov(r14, rdx).map_err(|e| e.to_string())?;  // norm weight ptr
             self.asm.mov(r15, rsi).map_err(|e| e.to_string())?;  // B matrix ptr
@@ -1838,7 +1848,12 @@ pub mod jit {
             // rdi = input row, r10 = output (norm scratch), r14 = weight
             self.asm.lea(rdi, qword_ptr(r13 + rax)).map_err(|e| e.to_string())?;
             self.asm.lea(r10, qword_ptr(rbx + rax + norm_scratch_offset as i32)).map_err(|e| e.to_string())?;
-            self.emit_norm_row_jit(r10, r14, k, eps)?;
+            if is_layer_norm {
+                self.asm.mov(r11, qword_ptr(rsp + 8)).map_err(|e| e.to_string())?;  // reload bias ptr
+                self.emit_layer_norm_row_jit(r10, r14, r11, k, eps)?;
+            } else {
+                self.emit_norm_row_jit(r10, r14, k, eps)?;
+            }
 
             self.asm.inc(r12).map_err(|e| e.to_string())?;
             self.asm.jmp(row_loop).map_err(|e| e.to_string())?;
@@ -1846,7 +1861,7 @@ pub mod jit {
             self.asm.set_label(&mut row_done).map_err(|e| e.to_string())?;
 
             self.asm.mov(r8, qword_ptr(rsp)).map_err(|e| e.to_string())?;  // restore C output ptr
-            self.asm.add(rsp, 16i32).map_err(|e| e.to_string())?;
+            self.asm.add(rsp, 32i32).map_err(|e| e.to_string())?;
             self.asm.mov(rsi, r15).map_err(|e| e.to_string())?;  // restore B matrix ptr
             self.asm.lea(rdi, qword_ptr(rbx + norm_scratch_offset as i32)).map_err(|e| e.to_string())?;  // A = normalized data
 
@@ -1893,11 +1908,9 @@ pub mod jit {
             let gemm_op = graph.op(group.anchor)
                 .ok_or("TileLevelFusion: GEMM op not in graph")?;
 
-            let eps = match &norm_op.kind {
-                OpKind::RmsNorm { eps } => *eps,
-                OpKind::LayerNorm { eps: _ } => {
-                    return Err("TileLevelFusion: LayerNorm not yet supported".into());
-                }
+            let (eps, is_layer_norm) = match &norm_op.kind {
+                OpKind::RmsNorm { eps } => (*eps, false),
+                OpKind::LayerNorm { eps } => (*eps, true),
                 other => {
                     return Err(format!("TileLevelFusion: expected norm op, got {:?}", other));
                 }
@@ -1943,18 +1956,22 @@ pub mod jit {
             // Load scratchpad base.
             self.asm.mov(rbx, qword_ptr(rbp + 32)).map_err(|e| e.to_string())?;
 
-            // Allocate stack locals (48 bytes, 16-byte aligned):
+            // Allocate stack locals (64 bytes, 16-byte aligned):
             //   [rsp+0]  = nc_cur
             //   [rsp+8]  = kc_cur
             //   [rsp+16] = mc_cur
             //   [rsp+24] = ir (reused by inner loops)
             //   [rsp+32] = saved norm weight ptr (rdx)
             //   [rsp+40] = saved original A ptr (rdi)
-            self.asm.sub(rsp, 48i32).map_err(|e| e.to_string())?;
+            //   [rsp+48] = saved norm bias ptr (rcx, LayerNorm only)
+            self.asm.sub(rsp, 64i32).map_err(|e| e.to_string())?;
 
             // Save norm weight ptr and original A ptr -- clobbered by inner loops.
             self.asm.mov(qword_ptr(rsp + 32), rdx).map_err(|e| e.to_string())?;
             self.asm.mov(qword_ptr(rsp + 40), rdi).map_err(|e| e.to_string())?;
+            if is_layer_norm {
+                self.asm.mov(qword_ptr(rsp + 48), rcx).map_err(|e| e.to_string())?;
+            }
 
             let loc_nc: i32 = 0;
             let loc_kc: i32 = 8;
@@ -2018,7 +2035,13 @@ pub mod jit {
                 // r11 = weight ptr (saved on stack at [rsp+32])
                 self.asm.mov(r11, qword_ptr(rsp + 32)).map_err(|e| e.to_string())?;
 
-                self.emit_norm_row_jit(r10, r11, k, eps)?;
+                if is_layer_norm {
+                    // r8 temporarily used as bias ptr (saved on stack at [rsp+48])
+                    self.asm.mov(r8, qword_ptr(rsp + 48)).map_err(|e| e.to_string())?;
+                    self.emit_layer_norm_row_jit(r10, r11, r8, k, eps)?;
+                } else {
+                    self.emit_norm_row_jit(r10, r11, k, eps)?;
+                }
 
                 // Increment row counter
                 self.asm.mov(rax, qword_ptr(rsp + loc_ir)).map_err(|e| e.to_string())?;
@@ -2145,7 +2168,7 @@ pub mod jit {
             self.asm.jmp(jc_loop).map_err(|e| e.to_string())?;
             self.asm.set_label(&mut jc_done).map_err(|e| e.to_string())?;
 
-            self.asm.add(rsp, 48i32).map_err(|e| e.to_string())?;
+            self.asm.add(rsp, 64i32).map_err(|e| e.to_string())?;
 
             Ok(())
         }
@@ -2174,11 +2197,9 @@ pub mod jit {
             let gemm_op = graph.op(group.anchor)
                 .ok_or("ComputeRoot: GEMM op not in graph")?;
 
-            let eps = match &norm_op.kind {
-                OpKind::RmsNorm { eps } => *eps,
-                OpKind::LayerNorm { eps: _ } => {
-                    return Err("ComputeRoot: LayerNorm not yet supported".into());
-                }
+            let (eps, is_layer_norm) = match &norm_op.kind {
+                OpKind::RmsNorm { eps } => (*eps, false),
+                OpKind::LayerNorm { eps } => (*eps, true),
                 other => {
                     return Err(format!("ComputeRoot: expected norm op, got {:?}", other));
                 }
@@ -2205,13 +2226,14 @@ pub mod jit {
             self.asm.mov(rbx, qword_ptr(rbp + 32)).map_err(|e| e.to_string())?;
 
             // Save registers that the norm loop clobbers.
-            self.asm.sub(rsp, 16i32).map_err(|e| e.to_string())?;
-            self.asm.mov(qword_ptr(rsp), r8).map_err(|e| e.to_string())?;   // save C output ptr
+            self.asm.sub(rsp, 32i32).map_err(|e| e.to_string())?;
+            self.asm.mov(qword_ptr(rsp), r8).map_err(|e| e.to_string())?;     // [rsp+0] = C output ptr
+            self.asm.mov(qword_ptr(rsp + 8), rcx).map_err(|e| e.to_string())?; // [rsp+8] = bias ptr
             self.asm.mov(r13, rdi).map_err(|e| e.to_string())?;  // A input base
             self.asm.mov(r14, rdx).map_err(|e| e.to_string())?;  // norm weight ptr
             self.asm.mov(r15, rsi).map_err(|e| e.to_string())?;  // B matrix ptr
 
-            // Row loop: JIT RmsNorm for each row.
+            // Row loop: JIT norm for each row.
             let mut row_loop = self.asm.create_label();
             let mut row_done = self.asm.create_label();
 
@@ -2227,7 +2249,12 @@ pub mod jit {
             // rdi = input row, r10 = output (norm scratch), r14 = weight
             self.asm.lea(rdi, qword_ptr(r13 + rax)).map_err(|e| e.to_string())?;
             self.asm.lea(r10, qword_ptr(rbx + rax + norm_scratch_offset as i32)).map_err(|e| e.to_string())?;
-            self.emit_norm_row_jit(r10, r14, k, eps)?;
+            if is_layer_norm {
+                self.asm.mov(r11, qword_ptr(rsp + 8)).map_err(|e| e.to_string())?;  // reload bias ptr
+                self.emit_layer_norm_row_jit(r10, r14, r11, k, eps)?;
+            } else {
+                self.emit_norm_row_jit(r10, r14, k, eps)?;
+            }
 
             self.asm.inc(r12).map_err(|e| e.to_string())?;
             self.asm.jmp(row_loop).map_err(|e| e.to_string())?;
@@ -2236,7 +2263,7 @@ pub mod jit {
 
             // Restore registers and redirect A to the norm output buffer.
             self.asm.mov(r8, qword_ptr(rsp)).map_err(|e| e.to_string())?;   // restore C
-            self.asm.add(rsp, 16i32).map_err(|e| e.to_string())?;
+            self.asm.add(rsp, 32i32).map_err(|e| e.to_string())?;
             self.asm.mov(rsi, r15).map_err(|e| e.to_string())?;  // restore B
             self.asm.lea(rdi, qword_ptr(rbx + norm_scratch_offset as i32)).map_err(|e| e.to_string())?;  // A = norm output
 
@@ -4759,6 +4786,133 @@ pub mod jit {
 
 
 
+        /// Emit a single-row LayerNorm into `output_reg`.
+        ///
+        /// Three-phase structure (symmetric with `emit_norm_row_jit`):
+        ///   Phase 1 Reduce: dual accumulators ymm0=sum(x), ymm1=sum(x^2)
+        ///   Phase 2 Finalize: mean=sum/n -> ymm14, var=sum_sq/n - mean^2, scale=rsqrt(var+eps) -> ymm15
+        ///   Phase 3 Transform: output = (x - mean) * scale * weight + bias
+        ///
+        /// Register convention: rdi=input (read-only), rcx=loop counter (clobber),
+        /// ymm0-3=scratch, ymm14=mean, ymm15=scale
+        fn emit_layer_norm_row_jit(
+            &mut self,
+            output_reg: AsmRegister64,
+            weight_reg: AsmRegister64,
+            bias_reg: AsmRegister64,
+            row_size: usize,
+            eps: f32,
+        ) -> Result<(), String> {
+            let simd_w = self.simd_width; // 8 for AVX2
+            let vec_count = row_size / simd_w;
+            let tail = row_size % simd_w;
+            let total_vec_bytes = (vec_count * simd_w * 4) as i32;
+            let n_f32 = row_size as f32;
+
+            // -- Phase 1: Reduce -- accumulate sum(x) and sum(x^2) --
+            self.asm.vxorps(ymm0, ymm0, ymm0).map_err(|e| e.to_string())?; // ymm0 = sum
+            self.asm.vxorps(ymm1, ymm1, ymm1).map_err(|e| e.to_string())?; // ymm1 = sum_sq
+
+            if vec_count > 0 {
+                let mut r_loop = self.asm.create_label();
+                let mut r_done = self.asm.create_label();
+                self.asm.xor(rcx, rcx).map_err(|e| e.to_string())?;
+                self.asm.set_label(&mut r_loop).map_err(|e| e.to_string())?;
+                self.asm.cmp(rcx, total_vec_bytes).map_err(|e| e.to_string())?;
+                self.asm.jge(r_done).map_err(|e| e.to_string())?;
+
+                self.asm.vmovups(ymm2, ymmword_ptr(rdi + rcx)).map_err(|e| e.to_string())?;
+                self.asm.vaddps(ymm0, ymm0, ymm2).map_err(|e| e.to_string())?;       // sum += x
+                self.asm.vfmadd231ps(ymm1, ymm2, ymm2).map_err(|e| e.to_string())?;  // sum_sq += x*x
+
+                self.asm.add(rcx, 32i32).map_err(|e| e.to_string())?;
+                self.asm.jmp(r_loop).map_err(|e| e.to_string())?;
+                self.asm.set_label(&mut r_done).map_err(|e| e.to_string())?;
+            }
+
+            // -- Phase 1.5: Horizontal sums --
+            // Must reduce ymm0/ymm1 to scalar BEFORE scalar tail, because VEX-encoded
+            // scalar ops zero bits [255:128] of the destination ymm.
+            // Save ymm0 (sum) into ymm14 while we hsum ymm1 (sum_sq).
+            self.emit_horizontal_sum_ymm(ymm0, ymm0)?;
+            self.asm.vmovaps(ymm14, ymm0).map_err(|e| e.to_string())?;
+            self.emit_horizontal_sum_ymm(ymm1, ymm1)?;
+            self.asm.vmovaps(ymm0, ymm14).map_err(|e| e.to_string())?;
+
+            // Scalar tail for reduce
+            if tail > 0 {
+                let base = total_vec_bytes;
+                for t in 0..tail as i32 {
+                    let off = base + t * 4;
+                    self.asm.vmovss(xmm2, dword_ptr(rdi + off)).map_err(|e| e.to_string())?;
+                    self.asm.vaddss(xmm0, xmm0, xmm2).map_err(|e| e.to_string())?;       // sum += x
+                    self.asm.vfmadd231ss(xmm1, xmm2, xmm2).map_err(|e| e.to_string())?;  // sum_sq += x*x
+                }
+            }
+
+            // -- Phase 2: Finalize -- mean, var, scale --
+            let n_label = self.const_f32(n_f32);
+            let eps_label = self.const_f32(eps);
+
+            // Broadcast scalar results back to ymm
+            self.asm.vbroadcastss(ymm0, xmm0).map_err(|e| e.to_string())?;
+            self.asm.vbroadcastss(ymm1, xmm1).map_err(|e| e.to_string())?;
+
+            // mean = sum / n -> ymm14
+            self.asm.vbroadcastss(ymm3, dword_ptr(n_label)).map_err(|e| e.to_string())?;
+            self.asm.vdivps(ymm14, ymm0, ymm3).map_err(|e| e.to_string())?;
+
+            // var = sum_sq / n - mean^2
+            self.asm.vdivps(ymm2, ymm1, ymm3).map_err(|e| e.to_string())?;
+            self.asm.vfnmadd231ps(ymm2, ymm14, ymm14).map_err(|e| e.to_string())?;
+
+            // scale = rsqrt(var + eps) -> ymm15
+            self.asm.vbroadcastss(ymm3, dword_ptr(eps_label)).map_err(|e| e.to_string())?;
+            self.asm.vaddps(ymm2, ymm2, ymm3).map_err(|e| e.to_string())?;
+            self.asm.vrsqrtps(ymm15, ymm2).map_err(|e| e.to_string())?;
+
+            // -- Phase 3: Transform -- output = (x - mean) * scale * weight + bias --
+            if vec_count > 0 {
+                let mut t_loop = self.asm.create_label();
+                let mut t_done = self.asm.create_label();
+                self.asm.xor(rcx, rcx).map_err(|e| e.to_string())?;
+                self.asm.set_label(&mut t_loop).map_err(|e| e.to_string())?;
+                self.asm.cmp(rcx, total_vec_bytes).map_err(|e| e.to_string())?;
+                self.asm.jge(t_done).map_err(|e| e.to_string())?;
+
+                self.asm.vmovups(ymm2, ymmword_ptr(rdi + rcx)).map_err(|e| e.to_string())?;       // x
+                self.asm.vsubps(ymm2, ymm2, ymm14).map_err(|e| e.to_string())?;                   // x - mean
+                self.asm.vmulps(ymm2, ymm2, ymm15).map_err(|e| e.to_string())?;                   // (x - mean) * scale
+                self.asm.vmovups(ymm3, ymmword_ptr(weight_reg + rcx)).map_err(|e| e.to_string())?; // weight
+                self.asm.vmulps(ymm2, ymm2, ymm3).map_err(|e| e.to_string())?;                    // * weight
+                self.asm.vmovups(ymm3, ymmword_ptr(bias_reg + rcx)).map_err(|e| e.to_string())?;   // bias
+                self.asm.vaddps(ymm2, ymm2, ymm3).map_err(|e| e.to_string())?;                    // + bias
+                self.asm.vmovups(ymmword_ptr(output_reg + rcx), ymm2).map_err(|e| e.to_string())?; // store
+
+                self.asm.add(rcx, 32i32).map_err(|e| e.to_string())?;
+                self.asm.jmp(t_loop).map_err(|e| e.to_string())?;
+                self.asm.set_label(&mut t_done).map_err(|e| e.to_string())?;
+            }
+
+            // Scalar tail for transform
+            if tail > 0 {
+                let base = total_vec_bytes;
+                for t in 0..tail as i32 {
+                    let off = base + t * 4;
+                    self.asm.vmovss(xmm0, dword_ptr(rdi + off)).map_err(|e| e.to_string())?;       // x
+                    self.asm.vsubss(xmm0, xmm0, xmm14).map_err(|e| e.to_string())?;                // x - mean
+                    self.asm.vmulss(xmm0, xmm0, xmm15).map_err(|e| e.to_string())?;                // (x - mean) * scale
+                    self.asm.vmovss(xmm2, dword_ptr(weight_reg + off)).map_err(|e| e.to_string())?; // weight
+                    self.asm.vmulss(xmm0, xmm0, xmm2).map_err(|e| e.to_string())?;                 // * weight
+                    self.asm.vmovss(xmm2, dword_ptr(bias_reg + off)).map_err(|e| e.to_string())?;   // bias
+                    self.asm.vaddss(xmm0, xmm0, xmm2).map_err(|e| e.to_string())?;                 // + bias
+                    self.asm.vmovss(dword_ptr(output_reg + off), xmm0).map_err(|e| e.to_string())?; // store
+                }
+            }
+
+            Ok(())
+        }
+
         /// Emit a standalone NormLike op (RmsNorm / LayerNorm).
         ///
         /// Three-phase structure, trace-driven:
@@ -6169,8 +6323,10 @@ pub mod jit {
                 let mask_val = (1u32 << remainder) - 1;
                 self.asm.mov(eax, mask_val as i32).map_err(|e| e.to_string())?;
                 self.asm.kmovw(k1, eax).map_err(|e| e.to_string())?;
+            } else {
+                // AVX2: save remainder for vload_masked/vstore_masked
+                self.avx2_tail_remainder = remainder;
             }
-            // AVX2/NEON: no-op (caller uses scalar fallback)
             Ok(())
         }
 
@@ -6180,8 +6336,18 @@ pub mod jit {
                 let m = self.zmm_mem(mem)?;
                 self.asm.vmovups(d.k1().z(), m).map_err(|e| e.to_string())
             } else {
-                // AVX2: no hardware mask support; caller should use scalar fallback
-                Err("vload_masked not supported on AVX2 (use scalar fallback)".into())
+                // AVX2: use vmaskmovps with lane mask from const pool
+                let remainder = self.avx2_tail_remainder;
+                let mut mask_arr = [0i32; 8];
+                for i in 0..remainder.min(8) {
+                    mask_arr[i] = -1i32; // 0xFFFFFFFF — bit 31 set = active lane
+                }
+                let mask_label = self.const_i32x8(mask_arr);
+                let d = Self::ymm_any(dst.0 as usize)?;
+                // Use ymm15 as scratch for the mask
+                self.asm.vmovups(ymm15, ymmword_ptr(mask_label)).map_err(|e| e.to_string())?;
+                let m = self.ymm_mem(mem)?;
+                self.asm.vmaskmovps(d, ymm15, m).map_err(|e| e.to_string())
             }
         }
 
@@ -6191,7 +6357,18 @@ pub mod jit {
                 let m = self.zmm_mem(mem)?;
                 self.asm.vmovups(m.k1(), s).map_err(|e| e.to_string())
             } else {
-                Err("vstore_masked not supported on AVX2 (use scalar fallback)".into())
+                // AVX2: use vmaskmovps with lane mask from const pool
+                let remainder = self.avx2_tail_remainder;
+                let mut mask_arr = [0i32; 8];
+                for i in 0..remainder.min(8) {
+                    mask_arr[i] = -1i32; // 0xFFFFFFFF — bit 31 set = active lane
+                }
+                let mask_label = self.const_i32x8(mask_arr);
+                let s = Self::ymm_any(src.0 as usize)?;
+                // Use ymm15 as scratch for the mask
+                self.asm.vmovups(ymm15, ymmword_ptr(mask_label)).map_err(|e| e.to_string())?;
+                let m = self.ymm_mem(mem)?;
+                self.asm.vmaskmovps(m, ymm15, s).map_err(|e| e.to_string())
             }
         }
 

@@ -95,10 +95,11 @@ impl ScalarOpRegistry {
         self.trace_cache.insert(key, trace);
     }
 
-    /// Try symexec first; on failure, fall back to manual trace injection.
+    /// Three-level fallback: structured CFG → linear symexec → manual trace.
     ///
-    /// This is the progressive migration path: as symexec improves, more
-    /// operators will be auto-extracted and the manual traces become dead code.
+    /// 1. `auto_register_structured` — CFG multi-loop analysis (most precise).
+    /// 2. `auto_register_from_symexec` — linear symbolic execution.
+    /// 3. Manual trace injection — last resort.
     fn register_with_symexec_fallback(
         &mut self,
         key: OpKindKey,
@@ -106,10 +107,21 @@ impl ScalarOpRegistry {
         op_kind: OpKind,
         manual_trace: OpTrace,
     ) {
-        if self.auto_register_from_symexec(key.clone(), sig.clone(), op_kind).is_err() {
-            self.register(key.clone(), sig);
-            self.inject_trace(key, manual_trace);
+        // Level 1: structured CFG analysis (handles NormLike, Reduction with multiple loops)
+        if let Ok(Some(_)) = self.auto_register_structured(
+            key.clone(), sig.clone(), op_kind.clone(),
+        ) {
+            return;
         }
+
+        // Level 2: linear symexec (handles single-loop Elementwise, BinaryElementwise)
+        if self.auto_register_from_symexec(key.clone(), sig.clone(), op_kind).is_ok() {
+            return;
+        }
+
+        // Level 3: manual trace fallback
+        self.register(key.clone(), sig);
+        self.inject_trace(key, manual_trace);
     }
 
     /// Convert an `OpKind` to its hashable `OpKindKey`.
@@ -711,6 +723,40 @@ impl ScalarOpRegistry {
         );
 
 
+        // ── MeanPool ──
+        let meanpool_sig = ScalarFnSignature {
+            fn_ptr: crate::scalar_ops::pooling::scalar_mean_pool as *const u8,
+            params: vec![
+                ScalarParam::InputPtr,
+                ScalarParam::OutputPtr,
+                ScalarParam::Dim(0), // seq_len
+                ScalarParam::Dim(1), // hidden
+            ],
+        };
+        reg.register_with_symexec_fallback(
+            OpKindKey::MeanPool,
+            meanpool_sig.clone(),
+            OpKind::MeanPool { seq_len: 1, hidden: 1 },
+            OpTrace {
+                op_kind: OpKind::MeanPool { seq_len: 1, hidden: 1 },
+                pattern: ComputePattern::Reduction {
+                    identity: 0.0,
+                    combine: vec![
+                        TraceOp::Input(0),  // [0] acc (running sum)
+                        TraceOp::Input(1),  // [1] new element
+                        TraceOp::Add(0, 1), // [2] acc + element
+                    ],
+                    second_pass: None,
+                    normalize: Some(vec![
+                        TraceOp::Input(0),  // [0] sum
+                        TraceOp::Input(1),  // [1] inv_seq_len (broadcast)
+                        TraceOp::Mul(0, 1), // [2] sum * inv_seq_len = mean
+                    ]),
+                },
+                signature: meanpool_sig,
+            },
+        );
+
         // ── L2Normalize ──
         let l2norm_sig = ScalarFnSignature {
             fn_ptr: scalar_l2_normalize as *const u8,
@@ -805,6 +851,50 @@ impl ScalarOpRegistry {
             executor.extract_trace().map_err(RegistryError::SymExec)
         }
     }
+
+    /// Auto-register a multi-loop scalar function using structured CFG analysis.
+    ///
+    /// This is the Phase 3 upgrade path: instead of linear symexec (which only
+    /// handles single-loop elementwise ops), this uses CFG → loop detection →
+    /// multi-pass combination to classify NormLike and Reduction patterns.
+    ///
+    /// Returns `Ok(Some(pattern))` if structured analysis succeeded,
+    /// `Ok(None)` if the function has no loops (caller should try linear symexec),
+    /// or `Err` on failure.
+    pub fn auto_register_structured(
+        &mut self,
+        key: OpKindKey,
+        fn_sig: ScalarFnSignature,
+        op_kind: OpKind,
+    ) -> Result<Option<ComputePattern>, RegistryError> {
+        #[cfg(feature = "jit-x86")]
+        {
+            use crate::compiler::symexec::decoder::analyze_scalar_fn_structured;
+
+            match analyze_scalar_fn_structured(fn_sig.fn_ptr, &fn_sig)
+                .map_err(RegistryError::SymExec)?
+            {
+                Some(analysis) => {
+                    let pattern = analysis.pattern.clone();
+                    let trace = OpTrace {
+                        op_kind,
+                        pattern: pattern.clone(),
+                        signature: fn_sig.clone(),
+                    };
+                    self.entries.insert(key.clone(), fn_sig);
+                    self.trace_cache.insert(key, trace);
+                    Ok(Some(pattern))
+                }
+                None => Ok(None), // No loops → fall back to linear.
+            }
+        }
+
+        #[cfg(not(feature = "jit-x86"))]
+        {
+            let _ = (key, fn_sig, op_kind);
+            Ok(None)
+        }
+    }
 }
 
 #[cfg(test)]
@@ -835,6 +925,7 @@ mod tests {
             OpKindKey::QuantGemm,
             OpKindKey::Dequantize,
             OpKindKey::L2Normalize,
+            OpKindKey::MeanPool,
             OpKindKey::MultiHeadAttention,
         ];
 
@@ -995,11 +1086,9 @@ mod tests {
             // Either succeeds or returns a well-formed error (no panic)
             match result {
                 Ok(pattern) => {
-                    eprintln!("symexec succeeded for {key:?}: {pattern:?}");
                     assert!(fresh.get_trace(key).is_some());
                 }
                 Err(e) => {
-                    eprintln!("symexec fallback for {key:?}: {e}");
                     // Expected: symexec stub returns empty/error
                 }
             }

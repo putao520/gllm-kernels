@@ -12,12 +12,17 @@ use std::fmt::Write;
 
 use crate::compiler::codegen::emitter::{MachineCodeEmitter, PlatformBackend, Platform};
 use crate::compiler::codegen::CodegenOutput;
+use crate::compiler::codegen::gpu_ir::trace_emitter::{GpuDialect, HipDialect};
+use crate::compiler::codegen::gpu_ir::plan_emitter::gpu_emit_plan;
 use crate::compiler::fusion::FusionPlan;
 use crate::compiler::graph::{CompilerGraph, OpKind};
 use crate::compiler::registry::ScalarOpRegistry;
 use crate::compiler::trace::{ComputePattern, TraceOp};
 use crate::compiler::buffer_alloc::BufferAllocation;
 use crate::dispatch::DeviceProfile;
+
+// Re-export GEMM emitters from hip_gemm submodule.
+pub(crate) use super::hip_gemm::*;
 
 // ── HipCodeGen ──────────────────────────────────────────────────────
 
@@ -223,7 +228,7 @@ fn max_regs_needed(body: &[TraceOp], base: u32) -> u32 {
 // ── Kernel emitters ─────────────────────────────────────────────────
 
 /// Emit a unary elementwise kernel from a trace body.
-fn emit_elementwise_kernel_hip(out: &mut String, name: &str, body: &[TraceOp]) {
+pub(crate) fn emit_elementwise_kernel_hip(out: &mut String, name: &str, body: &[TraceOp]) {
     writeln!(out, "extern \"C\" __global__ void {name}(").unwrap();
     writeln!(out, "    const float* __restrict__ input,").unwrap();
     writeln!(out, "    float* __restrict__ output,").unwrap();
@@ -242,7 +247,7 @@ fn emit_elementwise_kernel_hip(out: &mut String, name: &str, body: &[TraceOp]) {
 }
 
 /// Emit a binary elementwise kernel from a trace body.
-fn emit_binary_elementwise_kernel_hip(out: &mut String, name: &str, body: &[TraceOp]) {
+pub(crate) fn emit_binary_elementwise_kernel_hip(out: &mut String, name: &str, body: &[TraceOp]) {
     writeln!(out, "extern \"C\" __global__ void {name}(").unwrap();
     writeln!(out, "    const float* __restrict__ input0,").unwrap();
     writeln!(out, "    const float* __restrict__ input1,").unwrap();
@@ -263,7 +268,7 @@ fn emit_binary_elementwise_kernel_hip(out: &mut String, name: &str, body: &[Trac
 }
 
 /// Emit a multi-input/multi-output injective kernel from a trace body.
-fn emit_injective_kernel_hip(
+pub(crate) fn emit_injective_kernel_hip(
     out: &mut String,
     name: &str,
     body: &[TraceOp],
@@ -323,7 +328,7 @@ fn wavefront_size(gfx_arch: u32) -> u32 {
 ///
 /// Uses shared memory + warp-shuffle reduction. The block size is chosen
 /// based on the wavefront size of the target architecture.
-fn emit_reduction_kernel_hip(
+pub(crate) fn emit_reduction_kernel_hip(
     out: &mut String,
     name: &str,
     identity: f64,
@@ -384,118 +389,14 @@ fn emit_reduction_kernel_hip(
 
 /// Emit a tiled GEMM kernel using shared memory.
 ///
-/// C = alpha * A * B + beta * C
-/// Uses a TILE_SIZE x TILE_SIZE blocking strategy.
-fn emit_gemm_kernel_hip(
-    out: &mut String,
-    name: &str,
-    tile_size: u32,
-) {
-    let ts = tile_size;
-    writeln!(out, "#define TILE_SIZE {ts}").unwrap();
-    writeln!(out, "extern \"C\" __global__ void {name}(").unwrap();
-    writeln!(out, "    const float* __restrict__ A,").unwrap();
-    writeln!(out, "    const float* __restrict__ B,").unwrap();
-    writeln!(out, "    float* __restrict__ C,").unwrap();
-    writeln!(out, "    const unsigned int M,").unwrap();
-    writeln!(out, "    const unsigned int N,").unwrap();
-    writeln!(out, "    const unsigned int K,").unwrap();
-    writeln!(out, "    const float alpha,").unwrap();
-    writeln!(out, "    const float beta").unwrap();
-    writeln!(out, ") {{").unwrap();
-    writeln!(out, "    __shared__ float As[TILE_SIZE][TILE_SIZE];").unwrap();
-    writeln!(out, "    __shared__ float Bs[TILE_SIZE][TILE_SIZE];").unwrap();
-    writeln!(out).unwrap();
-    writeln!(out, "    unsigned int row = hipBlockIdx_y * TILE_SIZE + hipThreadIdx_y;").unwrap();
-    writeln!(out, "    unsigned int col = hipBlockIdx_x * TILE_SIZE + hipThreadIdx_x;").unwrap();
-    writeln!(out, "    float acc = 0.0f;").unwrap();
-    writeln!(out).unwrap();
-    writeln!(out, "    for (unsigned int t = 0; t < (K + TILE_SIZE - 1) / TILE_SIZE; ++t) {{").unwrap();
-    writeln!(out, "        unsigned int a_col = t * TILE_SIZE + hipThreadIdx_x;").unwrap();
-    writeln!(out, "        unsigned int b_row = t * TILE_SIZE + hipThreadIdx_y;").unwrap();
-    writeln!(out, "        As[hipThreadIdx_y][hipThreadIdx_x] = (row < M && a_col < K) ? A[row * K + a_col] : 0.0f;").unwrap();
-    writeln!(out, "        Bs[hipThreadIdx_y][hipThreadIdx_x] = (b_row < K && col < N) ? B[b_row * N + col] : 0.0f;").unwrap();
-    writeln!(out, "        __syncthreads();").unwrap();
-    writeln!(out).unwrap();
-    writeln!(out, "        for (unsigned int k = 0; k < TILE_SIZE; ++k) {{").unwrap();
-    writeln!(out, "            acc = fmaf(As[hipThreadIdx_y][k], Bs[k][hipThreadIdx_x], acc);").unwrap();
-    writeln!(out, "        }}").unwrap();
-    writeln!(out, "        __syncthreads();").unwrap();
-    writeln!(out, "    }}").unwrap();
-    writeln!(out).unwrap();
-    writeln!(out, "    if (row < M && col < N) {{").unwrap();
-    writeln!(out, "        unsigned int idx = row * N + col;").unwrap();
-    writeln!(out, "        C[idx] = fmaf(alpha, acc, beta * C[idx]);").unwrap();
-    writeln!(out, "    }}").unwrap();
-    writeln!(out, "}}").unwrap();
-    writeln!(out, "#undef TILE_SIZE").unwrap();
-    writeln!(out).unwrap();
-}
-
-/// Emit gfx908+ MFMA-based GEMM kernel using `__builtin_amdgcn_mfma_f32_16x16x16f16`.
-///
-/// Each wavefront (64 lanes) computes a 16×16 output tile via MFMA intrinsics.
-/// Grid: (ceil(N/16), ceil(M/16)), Block: (64, 1).
-fn emit_gemm_mfma_kernel_hip(out: &mut String, name: &str) {
-    writeln!(out, "typedef _Float16 half8 __attribute__((ext_vector_type(8)));").unwrap();
-    writeln!(out, "typedef float float4 __attribute__((ext_vector_type(4)));").unwrap();
-    writeln!(out, "extern \"C\" float4 __builtin_amdgcn_mfma_f32_16x16x16f16(half8, half8, float4, int, int, int);").unwrap();
-    writeln!(out).unwrap();
-    writeln!(out, "extern \"C\" __global__ void {name}(").unwrap();
-    writeln!(out, "    const _Float16* __restrict__ A,").unwrap();
-    writeln!(out, "    const _Float16* __restrict__ B,").unwrap();
-    writeln!(out, "    float* __restrict__ C,").unwrap();
-    writeln!(out, "    const unsigned int M,").unwrap();
-    writeln!(out, "    const unsigned int N,").unwrap();
-    writeln!(out, "    const unsigned int K").unwrap();
-    writeln!(out, ") {{").unwrap();
-    writeln!(out, "    unsigned int tile_row = hipBlockIdx_y;").unwrap();
-    writeln!(out, "    unsigned int tile_col = hipBlockIdx_x;").unwrap();
-    writeln!(out, "    unsigned int lane = hipThreadIdx_x;").unwrap();
-    writeln!(out).unwrap();
-    writeln!(out, "    float4 acc = {{0.0f, 0.0f, 0.0f, 0.0f}};").unwrap();
-    writeln!(out).unwrap();
-    writeln!(out, "    for (unsigned int kt = 0; kt < (K + 15) / 16; ++kt) {{").unwrap();
-    writeln!(out, "        // Load A tile fragment (each lane loads 8 f16 values)").unwrap();
-    writeln!(out, "        unsigned int a_row = tile_row * 16 + (lane / 16);").unwrap();
-    writeln!(out, "        unsigned int a_col = kt * 16;").unwrap();
-    writeln!(out, "        half8 fragA;").unwrap();
-    writeln!(out, "        for (int i = 0; i < 8; ++i) {{").unwrap();
-    writeln!(out, "            unsigned int c = a_col + (lane % 16 < 8 ? lane % 16 : lane % 16 - 8) + i;").unwrap();
-    writeln!(out, "            fragA[i] = (a_row < M && c < K) ? A[a_row * K + c] : (_Float16)0.0f;").unwrap();
-    writeln!(out, "        }}").unwrap();
-    writeln!(out).unwrap();
-    writeln!(out, "        // Load B tile fragment").unwrap();
-    writeln!(out, "        unsigned int b_row = kt * 16 + (lane / 16);").unwrap();
-    writeln!(out, "        unsigned int b_col = tile_col * 16;").unwrap();
-    writeln!(out, "        half8 fragB;").unwrap();
-    writeln!(out, "        for (int i = 0; i < 8; ++i) {{").unwrap();
-    writeln!(out, "            unsigned int c = b_col + (lane % 16 < 8 ? lane % 16 : lane % 16 - 8) + i;").unwrap();
-    writeln!(out, "            fragB[i] = (b_row < K && c < N) ? B[b_row * N + c] : (_Float16)0.0f;").unwrap();
-    writeln!(out, "        }}").unwrap();
-    writeln!(out).unwrap();
-    writeln!(out, "        acc = __builtin_amdgcn_mfma_f32_16x16x16f16(fragA, fragB, acc, 0, 0, 0);").unwrap();
-    writeln!(out, "    }}").unwrap();
-    writeln!(out).unwrap();
-    writeln!(out, "    // Store 4 output values per lane").unwrap();
-    writeln!(out, "    unsigned int out_row = tile_row * 16 + (lane / 4);").unwrap();
-    writeln!(out, "    unsigned int out_col = tile_col * 16 + (lane % 4) * 4;").unwrap();
-    writeln!(out, "    if (out_row < M) {{").unwrap();
-    writeln!(out, "        for (int i = 0; i < 4; ++i) {{").unwrap();
-    writeln!(out, "            if (out_col + i < N) {{").unwrap();
-    writeln!(out, "                C[out_row * N + out_col + i] = acc[i];").unwrap();
-    writeln!(out, "            }}").unwrap();
-    writeln!(out, "        }}").unwrap();
-    writeln!(out, "    }}").unwrap();
-    writeln!(out, "}}\n").unwrap();
-}
+// GEMM kernels (emit_gemm_kernel_hip, emit_gemm_mfma_kernel_hip) moved to hip_gemm.rs
 
 // ── NormLike kernel ─────────────────────────────────────────────────
 
 /// Emit a NormLike (RMSNorm / LayerNorm) kernel using 3 phases:
 /// Phase 1: partial reduction (sum of squares), Phase 2: finalize (rsqrt),
 /// Phase 3: per-element transform (scale * weight [+ bias]).
-fn emit_normlike_kernel_hip(
+pub(crate) fn emit_normlike_kernel_hip(
     out: &mut String,
     kernel_name: &str,
     _reduce: &[TraceOp],
@@ -571,7 +472,7 @@ fn emit_normlike_kernel_hip(
 
 /// Emit a MeanPool kernel: average over the sequence dimension.
 /// Each thread handles one hidden dimension element.
-fn emit_meanpool_kernel_hip(
+pub(crate) fn emit_meanpool_kernel_hip(
     out: &mut String,
     kernel_name: &str,
     seq_len: usize,
@@ -597,7 +498,7 @@ fn emit_meanpool_kernel_hip(
 // ── Softmax kernel ──────────────────────────────────────────────────
 
 /// Emit a row-wise softmax kernel using shared memory reduction.
-fn emit_softmax_kernel_hip(out: &mut String, name: &str, gfx_arch: u32) {
+pub(crate) fn emit_softmax_kernel_hip(out: &mut String, name: &str, gfx_arch: u32) {
     let wf = wavefront_size(gfx_arch);
     writeln!(out, "extern \"C\" __global__ void {name}(").unwrap();
     writeln!(out, "    const float* __restrict__ input,").unwrap();
@@ -658,7 +559,7 @@ fn emit_softmax_kernel_hip(out: &mut String, name: &str, gfx_arch: u32) {
 ///
 /// Applies rotary embeddings to input tensor with the given head dimension
 /// and frequency base theta. Grid: (seq_len, num_heads), Block: (256).
-fn emit_rope_kernel_hip(
+pub(crate) fn emit_rope_kernel_hip(
     out: &mut String,
     kernel_name: &str,
     head_dim: usize,
@@ -699,7 +600,7 @@ fn emit_rope_kernel_hip(
 ///
 /// 3-pass structure: (1) Q·K^T scores, (2) softmax, (3) weighted sum with V.
 /// Grid: (seq_len, num_heads), Block: (head_dim.next_power_of_two().min(256)).
-fn emit_mha_kernel_hip(
+pub(crate) fn emit_mha_kernel_hip(
     out: &mut String,
     kernel_name: &str,
     seq_len: usize,
@@ -796,7 +697,7 @@ fn emit_mha_kernel_hip(
 ///
 /// Unpacks N-bit quantized values from packed u32 words, applies scale and
 /// zero-point offset to produce float output.
-fn emit_dequantize_kernel_hip(
+pub(crate) fn emit_dequantize_kernel_hip(
     out: &mut String,
     kernel_name: &str,
     num_elements: usize,
@@ -842,168 +743,21 @@ impl MachineCodeEmitter for HipCodeGen {
         _profile: &DeviceProfile,
         registry: Option<&ScalarOpRegistry>,
     ) -> Result<CodegenOutput, String> {
-        self.emit_header();
+        let dialect = HipDialect { gfx_arch: self.gfx_arch };
+        let mut hip = String::new();
+        dialect.emit_header(&mut hip);
 
         if plan.groups.is_empty() {
             return Ok(CodegenOutput {
-                code: self.hip_buffer.clone().into_bytes(),
+                code: hip.into_bytes(),
                 scratchpad_bytes: 0,
             });
         }
 
-        for group in &plan.groups {
-            let anchor_op = graph.op(group.anchor).ok_or_else(|| {
-                format!("HipCodeGen: anchor op {:?} not found in graph", group.anchor)
-            })?;
-
-            let kernel_name = format!("group_{}", group.id);
-            let op_kind = &anchor_op.kind;
-
-            // Reshape/Transpose are metadata-only — NOP on GPU
-            if matches!(op_kind, OpKind::Reshape { .. } | OpKind::Transpose { .. }) {
-                continue;
-            }
-
-            let registry = registry.ok_or_else(|| {
-                format!("HipCodeGen: emit_plan requires a ScalarOpRegistry for {:?}", op_kind)
-            })?;
-            let key = ScalarOpRegistry::key_from_op_kind(op_kind);
-            let trace = registry.get_trace(&key).ok_or_else(|| {
-                format!("HipCodeGen: no OpTrace for {:?}", op_kind)
-            })?;
-
-            match &trace.pattern {
-                ComputePattern::Elementwise { body } => {
-                    emit_elementwise_kernel_hip(&mut self.hip_buffer, &kernel_name, body);
-                }
-                ComputePattern::BinaryElementwise { body } => {
-                    emit_binary_elementwise_kernel_hip(&mut self.hip_buffer, &kernel_name, body);
-                }
-                ComputePattern::Injective { body, num_inputs, num_outputs } => {
-                    match op_kind {
-                        OpKind::RoPE { head_dim, theta } => {
-                            emit_rope_kernel_hip(
-                                &mut self.hip_buffer,
-                                &kernel_name,
-                                *head_dim,
-                                *theta,
-                            );
-                        }
-                        _ => {
-                            if body.is_empty() {
-                                continue;
-                            }
-                            emit_injective_kernel_hip(
-                                &mut self.hip_buffer,
-                                &kernel_name,
-                                body,
-                                *num_inputs,
-                                *num_outputs,
-                            );
-                        }
-                    }
-                }
-                ComputePattern::NormLike { reduce, finalize, transform } => {
-                    let eps_override = match op_kind {
-                        OpKind::RmsNorm { eps } => Some(*eps),
-                        OpKind::LayerNorm { eps } => Some(*eps),
-                        _ => None,
-                    };
-                    let has_weight = matches!(
-                        op_kind,
-                        OpKind::RmsNorm { .. } | OpKind::LayerNorm { .. }
-                    );
-                    let has_bias = matches!(op_kind, OpKind::LayerNorm { .. });
-                    emit_normlike_kernel_hip(
-                        &mut self.hip_buffer,
-                        &kernel_name,
-                        reduce,
-                        finalize,
-                        transform,
-                        has_weight,
-                        has_bias,
-                        eps_override,
-                    );
-                }
-                ComputePattern::Reduction { combine, identity, .. } => {
-                    match op_kind {
-                        OpKind::Softmax => {
-                            emit_softmax_kernel_hip(
-                                &mut self.hip_buffer,
-                                &kernel_name,
-                                self.gfx_arch,
-                            );
-                        }
-                        OpKind::MeanPool { seq_len, hidden } => {
-                            emit_meanpool_kernel_hip(
-                                &mut self.hip_buffer,
-                                &kernel_name,
-                                *seq_len,
-                                *hidden,
-                            );
-                        }
-                        _ => {
-                            emit_reduction_kernel_hip(
-                                &mut self.hip_buffer,
-                                &kernel_name,
-                                *identity,
-                                combine,
-                                self.gfx_arch,
-                            );
-                        }
-                    }
-                }
-                ComputePattern::Gemm => {
-                    match op_kind {
-                        OpKind::Gemm { .. } | OpKind::GemmBias { .. } => {
-                            if self.gfx_arch >= 908 {
-                                emit_gemm_mfma_kernel_hip(&mut self.hip_buffer, &kernel_name);
-                            } else {
-                                let tile = if self.gfx_arch >= 1000 { 16 } else { 32 };
-                                emit_gemm_kernel_hip(&mut self.hip_buffer, &kernel_name, tile);
-                            }
-                        }
-                        OpKind::MultiHeadAttention { seq_len, num_heads, head_dim } => {
-                            emit_mha_kernel_hip(
-                                &mut self.hip_buffer,
-                                &kernel_name,
-                                *seq_len,
-                                *num_heads,
-                                *head_dim,
-                            );
-                        }
-                        _ => {
-                            return Err(format!(
-                                "HipCodeGen: unsupported Gemm-pattern op {:?}",
-                                op_kind
-                            ));
-                        }
-                    }
-                }
-                ComputePattern::QuantDecode { block_size, decode: _ } => {
-                    match op_kind {
-                        OpKind::Dequantize { num_elements, block_size: bs, bits } => {
-                            emit_dequantize_kernel_hip(
-                                &mut self.hip_buffer,
-                                &kernel_name,
-                                *num_elements,
-                                *bs,
-                                *bits,
-                            );
-                        }
-                        _ => {
-                            return Err(format!(
-                                "HipCodeGen: unsupported QuantDecode op {:?}",
-                                op_kind
-                            ));
-                        }
-                    }
-                }
-            }
-        }
+        gpu_emit_plan(&dialect, &mut hip, plan, graph, registry)?;
 
         Ok(CodegenOutput {
-            code: self.hip_buffer.clone().into_bytes(),
+            code: hip.into_bytes(),
             scratchpad_bytes: 0,
         })
     }

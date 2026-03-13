@@ -51,8 +51,12 @@ pub mod jit {
         blis_base_offset: usize,
         label_counter: u32,
         labels: Vec<Option<usize>>,
+        /// Dynamic labels for SimdOps define_label/jump/branch.
+        simd_labels: Vec<dynasmrt::DynamicLabel>,
         /// Width stack for push_width/pop_width (NEON is fixed W128).
         width_stack: Vec<crate::compiler::codegen::simd_ops::SimdWidth>,
+        /// Tail mask remainder count (set by set_tail_mask, used by vload/vstore_masked).
+        tail_mask_remainder: usize,
     }
 
     // ── NEON encoding helpers (ported from manual backend) ─────────────
@@ -121,6 +125,38 @@ pub mod jit {
         0x4C9F7800 | ((xn as u32 & 0x1F) << 5) | (vt as u32 & 0x1F)
     }
 
+    /// LD1 {Vt.S}[lane], [Xn], #4  — load single S-lane, post-index by 4 bytes.
+    ///
+    /// Encoding (ARMv8 AdvSIMD single-structure, post-index, immediate offset):
+    ///   31 30 | 29:23   | 22 | 21 | 20:16 | 15:13 | 12  | 11:10 | 9:5 | 4:0
+    ///    Q  0 | 0011011 | L  | 0  | 11111 | opc   | S   | size  | Rn  | Rt
+    ///
+    /// For S-element (32-bit): opc=100, size=00, L=1 (load)
+    /// Q = lane[1], S = lane[0]
+    /// Post-index immediate = Rm=11111 (immediate #4 for S-element)
+    fn encode_ld1_s_lane_post(vt: u8, xn: u8, lane: u8) -> u32 {
+        let q = ((lane >> 1) & 1) as u32;
+        let s = (lane & 1) as u32;
+        0x0DDF8000
+            | (q << 30)
+            | (s << 12)
+            | ((xn as u32 & 0x1F) << 5)
+            | (vt as u32 & 0x1F)
+    }
+
+    /// ST1 {Vt.S}[lane], [Xn], #4  — store single S-lane, post-index by 4 bytes.
+    ///
+    /// Same encoding as LD1 but L=0 (store).
+    fn encode_st1_s_lane_post(vt: u8, xn: u8, lane: u8) -> u32 {
+        let q = ((lane >> 1) & 1) as u32;
+        let s = (lane & 1) as u32;
+        0x0D9F8000
+            | (q << 30)
+            | (s << 12)
+            | ((xn as u32 & 0x1F) << 5)
+            | (vt as u32 & 0x1F)
+    }
+
     fn encode_fmov_one(rd: u8) -> u32 {
         0x4F03F600 | (rd as u32 & 0x1F)
     }
@@ -167,6 +203,42 @@ pub mod jit {
     fn encode_ldr_q(vt: u8, xn: u8, byte_offset: u32) -> u32 {
         let imm12 = (byte_offset / 16) & 0xFFF;
         0x3DC00000 | (imm12 << 10) | ((xn as u32 & 0x1F) << 5) | (vt as u32 & 0x1F)
+    }
+
+    /// LDR Sd, [Xn, #imm] — load single-precision scalar from memory.
+    /// imm12 is byte_offset / 4 (scaled by 4 for S-size).
+    fn encode_ldr_s(vd: u8, xn: u8, byte_offset: u32) -> u32 {
+        let imm12 = (byte_offset / 4) & 0xFFF;
+        0xBD400000 | (imm12 << 10) | ((xn as u32 & 0x1F) << 5) | (vd as u32 & 0x1F)
+    }
+
+    /// STR Sd, [Xn, #imm] — store single-precision scalar to memory.
+    /// imm12 is byte_offset / 4 (scaled by 4 for S-size).
+    fn encode_str_s(vd: u8, xn: u8, byte_offset: u32) -> u32 {
+        let imm12 = (byte_offset / 4) & 0xFFF;
+        0xBD000000 | (imm12 << 10) | ((xn as u32 & 0x1F) << 5) | (vd as u32 & 0x1F)
+    }
+
+    /// LD1R {Vd.4S}, [Xn] — load single element and replicate to all lanes.
+    fn encode_ld1r_4s(vd: u8, xn: u8) -> u32 {
+        0x4D40C800 | ((xn as u32 & 0x1F) << 5) | (vd as u32 & 0x1F)
+    }
+
+    /// PRFM PLDL1KEEP, [Xn] — prefetch to L1 data cache.
+    fn encode_prfm_l1(xn: u8) -> u32 {
+        // PRFM #0 (PLDL1KEEP), [Xn, #0]
+        0xF9800000 | ((xn as u32 & 0x1F) << 5)
+    }
+
+    /// SUBS Xd, Xn, #imm12 — subtract immediate and set flags.
+    fn encode_subs_imm(rd: u32, rn: u32, imm: u32) -> u32 {
+        0xF1000000 | ((imm & 0xFFF) << 10) | ((rn & 0x1F) << 5) | (rd & 0x1F)
+    }
+
+    /// CMP Xn, Xm — compare registers (alias for SUBS XZR, Xn, Xm).
+    fn encode_cmp_reg(rn: u32, rm: u32) -> u32 {
+        // SUBS XZR(=x31), Xn, Xm
+        0xEB000000 | ((rm & 0x1F) << 16) | ((rn & 0x1F) << 5) | 31
     }
 
     /// ZIP1 Vd.4S, Vn.4S, Vm.4S — interleave even elements
@@ -256,7 +328,9 @@ pub mod jit {
                 blis_base_offset: 0,
                 label_counter: 0,
                 labels: Vec::new(),
+                simd_labels: Vec::new(),
                 width_stack: Vec::new(),
+                tail_mask_remainder: 0,
             }
         }
 
@@ -2388,16 +2462,46 @@ pub mod jit {
 
         // ── Memory operations ───────────────────────────────────────
 
-        fn vload(&mut self, _dst: VReg, _mem: MemOperand) -> Result<(), String> {
-            Err("vload not yet implemented for dynasm backend".into())
+        fn vload(&mut self, dst: VReg, mem: MemOperand) -> Result<(), String> {
+            let xn = gpr_num(&mem.base);
+            let offset = mem.offset;
+            if offset >= 0 && (offset as u32) % 16 == 0 && (offset as u32 / 16) < 4096 {
+                // LDR Qd, [Xn, #imm] — scaled offset fits in imm12
+                emit_raw(&mut self.ops, encode_ldr_q(dst.0, xn, offset as u32));
+            } else {
+                // Large or unaligned offset: ADD x15, Xn, #offset; LDR Qd, [x15]
+                self.emit_add_offset_gp(15, xn as u32, offset as usize);
+                emit_raw(&mut self.ops, encode_ldr_q(dst.0, 15, 0));
+            }
+            Ok(())
         }
 
-        fn vstore(&mut self, _mem: MemOperand, _src: VReg) -> Result<(), String> {
-            Err("vstore not yet implemented for dynasm backend".into())
+        fn vstore(&mut self, mem: MemOperand, src: VReg) -> Result<(), String> {
+            let xn = gpr_num(&mem.base);
+            let offset = mem.offset;
+            if offset >= 0 && (offset as u32) % 16 == 0 && (offset as u32 / 16) < 4096 {
+                // STR Qd, [Xn, #imm] — scaled offset fits in imm12
+                emit_raw(&mut self.ops, encode_str_q(src.0, xn, offset as u32));
+            } else {
+                // Large or unaligned offset: ADD x15, Xn, #offset; STR Qd, [x15]
+                self.emit_add_offset_gp(15, xn as u32, offset as usize);
+                emit_raw(&mut self.ops, encode_str_q(src.0, 15, 0));
+            }
+            Ok(())
         }
 
-        fn vbroadcast(&mut self, _dst: VReg, _mem: MemOperand) -> Result<(), String> {
-            Err("vbroadcast not yet implemented for dynasm backend".into())
+        fn vbroadcast(&mut self, dst: VReg, mem: MemOperand) -> Result<(), String> {
+            let xn = gpr_num(&mem.base);
+            let offset = mem.offset;
+            if offset == 0 {
+                // LD1R {Vd.4S}, [Xn]
+                emit_raw(&mut self.ops, encode_ld1r_4s(dst.0, xn));
+            } else {
+                // Non-zero offset: ADD x15, Xn, #offset; LD1R {Vd.4S}, [x15]
+                self.emit_add_offset_gp(15, xn as u32, offset as usize);
+                emit_raw(&mut self.ops, encode_ld1r_4s(dst.0, 15));
+            }
+            Ok(())
         }
 
         fn vbroadcast_const(&mut self, dst: VReg, val: f32) -> Result<(), String> {
@@ -2494,30 +2598,64 @@ pub mod jit {
         // ── Loop control ────────────────────────────────────────────
 
         fn alloc_label(&mut self) -> Label {
-            let id = self.label_counter;
-            self.label_counter += 1;
-            self.labels.push(None);
-            Label(id)
+            let dyn_label = self.ops.new_dynamic_label();
+            let idx = self.simd_labels.len();
+            self.simd_labels.push(dyn_label);
+            Label(idx as u32)
         }
 
-        fn define_label(&mut self, _label: Label) -> Result<(), String> {
-            Err("define_label not yet implemented for dynasm backend (use dynasm! labels)".into())
+        fn define_label(&mut self, label: Label) -> Result<(), String> {
+            let idx = label.0 as usize;
+            let dyn_label = *self.simd_labels.get(idx)
+                .ok_or_else(|| format!("define_label: invalid label index {}", idx))?;
+            dynasm!(self.ops ; .arch aarch64 ; =>dyn_label);
+            Ok(())
         }
 
-        fn jump(&mut self, _label: Label) -> Result<(), String> {
-            Err("jump not yet implemented for dynasm backend (use dynasm! labels)".into())
+        fn jump(&mut self, label: Label) -> Result<(), String> {
+            let idx = label.0 as usize;
+            let dyn_label = *self.simd_labels.get(idx)
+                .ok_or_else(|| format!("jump: invalid label index {}", idx))?;
+            dynasm!(self.ops ; .arch aarch64 ; b =>dyn_label);
+            Ok(())
         }
 
-        fn dec_and_branch_nz(&mut self, _counter: BaseReg, _label: Label) -> Result<(), String> {
-            Err("dec_and_branch_nz not yet implemented for dynasm backend".into())
+        fn dec_and_branch_nz(&mut self, counter: BaseReg, label: Label) -> Result<(), String> {
+            let idx = label.0 as usize;
+            let dyn_label = *self.simd_labels.get(idx)
+                .ok_or_else(|| format!("dec_and_branch_nz: invalid label index {}", idx))?;
+            let rd = gpr_num(&counter) as u32;
+            // SUBS Xd, Xd, #1
+            emit_raw(&mut self.ops, encode_subs_imm(rd, rd, 1));
+            // B.NE =>label
+            dynasm!(self.ops ; .arch aarch64 ; b.ne =>dyn_label);
+            Ok(())
         }
 
-        fn cmp_and_branch_lt(&mut self, _reg: BaseReg, _imm: i64, _label: Label) -> Result<(), String> {
-            Err("cmp_and_branch_lt not yet implemented for dynasm backend".into())
+        fn cmp_and_branch_lt(&mut self, reg: BaseReg, imm: i64, label: Label) -> Result<(), String> {
+            let idx = label.0 as usize;
+            let dyn_label = *self.simd_labels.get(idx)
+                .ok_or_else(|| format!("cmp_and_branch_lt: invalid label index {}", idx))?;
+            let rn = gpr_num(&reg) as u32;
+            // Load immediate into x15, then CMP
+            self.emit_mov_imm_gp(15, imm as usize);
+            emit_raw(&mut self.ops, encode_cmp_reg(rn, 15));
+            // B.LT =>label
+            dynasm!(self.ops ; .arch aarch64 ; b.lt =>dyn_label);
+            Ok(())
         }
 
-        fn cmp_and_branch_ge(&mut self, _reg: BaseReg, _imm: i64, _label: Label) -> Result<(), String> {
-            Err("cmp_and_branch_ge not yet implemented for dynasm backend".into())
+        fn cmp_and_branch_ge(&mut self, reg: BaseReg, imm: i64, label: Label) -> Result<(), String> {
+            let idx = label.0 as usize;
+            let dyn_label = *self.simd_labels.get(idx)
+                .ok_or_else(|| format!("cmp_and_branch_ge: invalid label index {}", idx))?;
+            let rn = gpr_num(&reg) as u32;
+            // Load immediate into x15, then CMP
+            self.emit_mov_imm_gp(15, imm as usize);
+            emit_raw(&mut self.ops, encode_cmp_reg(rn, 15));
+            // B.GE =>label
+            dynasm!(self.ops ; .arch aarch64 ; b.ge =>dyn_label);
+            Ok(())
         }
 
         // ── GPR operations ──────────────────────────────────────────
@@ -2591,14 +2729,24 @@ pub mod jit {
 
         // ── Prefetch ────────────────────────────────────────────────
 
-        fn prefetch_l1(&mut self, _mem: MemOperand) -> Result<(), String> {
-            Err("prefetch_l1 not yet implemented for dynasm backend".into())
+        fn prefetch_l1(&mut self, mem: MemOperand) -> Result<(), String> {
+            let xn = gpr_num(&mem.base);
+            let offset = mem.offset;
+            if offset == 0 {
+                emit_raw(&mut self.ops, encode_prfm_l1(xn));
+            } else {
+                // Non-zero offset: ADD x15, Xn, #offset; PRFM [x15]
+                self.emit_add_offset_gp(15, xn as u32, offset as usize);
+                emit_raw(&mut self.ops, encode_prfm_l1(15));
+            }
+            Ok(())
         }
 
         // ── Non-temporal store ──────────────────────────────────────
 
-        fn vstore_nt(&mut self, _mem: MemOperand, _src: VReg) -> Result<(), String> {
-            Err("vstore_nt not yet implemented for dynasm backend".into())
+        fn vstore_nt(&mut self, mem: MemOperand, src: VReg) -> Result<(), String> {
+            // NEON has no native non-temporal store; fall back to regular vstore.
+            self.vstore(mem, src)
         }
 
         // ── Memory fence ────────────────────────────────────────────
@@ -2611,12 +2759,32 @@ pub mod jit {
 
         // ── Scalar operations ───────────────────────────────────────
 
-        fn scalar_load(&mut self, _dst: VReg, _mem: MemOperand) -> Result<(), String> {
-            Err("scalar_load not yet implemented for dynasm backend".into())
+        fn scalar_load(&mut self, dst: VReg, mem: MemOperand) -> Result<(), String> {
+            let xn = gpr_num(&mem.base);
+            let offset = mem.offset;
+            if offset >= 0 && (offset as u32) % 4 == 0 && (offset as u32 / 4) < 4096 {
+                // LDR Sd, [Xn, #imm] — scaled offset fits in imm12
+                emit_raw(&mut self.ops, encode_ldr_s(dst.0, xn, offset as u32));
+            } else {
+                // Large or unaligned offset: ADD x15, Xn, #offset; LDR Sd, [x15]
+                self.emit_add_offset_gp(15, xn as u32, offset as usize);
+                emit_raw(&mut self.ops, encode_ldr_s(dst.0, 15, 0));
+            }
+            Ok(())
         }
 
-        fn scalar_store(&mut self, _mem: MemOperand, _src: VReg) -> Result<(), String> {
-            Err("scalar_store not yet implemented for dynasm backend".into())
+        fn scalar_store(&mut self, mem: MemOperand, src: VReg) -> Result<(), String> {
+            let xn = gpr_num(&mem.base);
+            let offset = mem.offset;
+            if offset >= 0 && (offset as u32) % 4 == 0 && (offset as u32 / 4) < 4096 {
+                // STR Sd, [Xn, #imm] — scaled offset fits in imm12
+                emit_raw(&mut self.ops, encode_str_s(src.0, xn, offset as u32));
+            } else {
+                // Large or unaligned offset: ADD x15, Xn, #offset; STR Sd, [x15]
+                self.emit_add_offset_gp(15, xn as u32, offset as usize);
+                emit_raw(&mut self.ops, encode_str_s(src.0, 15, 0));
+            }
+            Ok(())
         }
 
         // ── External function calls ─────────────────────────────────
@@ -2653,18 +2821,44 @@ pub mod jit {
             Ok(())
         }
 
-        // ── Masked operations (NEON: no-op / scalar fallback) ────────
+        // ── Masked operations (NEON: per-lane scalar LD1/ST1) ────────
 
-        fn set_tail_mask(&mut self, _remainder: usize) -> Result<(), String> {
+        fn set_tail_mask(&mut self, remainder: usize) -> Result<(), String> {
+            self.tail_mask_remainder = remainder;
             Ok(())
         }
 
-        fn vload_masked(&mut self, _dst: VReg, _mem: MemOperand) -> Result<(), String> {
-            Err("vload_masked not yet implemented for dynasm backend".into())
+        fn vload_masked(&mut self, dst: VReg, mem: MemOperand) -> Result<(), String> {
+            let remainder = self.tail_mask_remainder;
+            let xn = gpr_num(&mem.base);
+            let base_offset = mem.offset;
+
+            // 1. Zero dst register: EOR Vd.16B, Vd.16B, Vd.16B
+            emit_raw(&mut self.ops, encode_eor_v(dst.0, dst.0, dst.0));
+
+            // 2. Compute base address into x15
+            self.emit_add_offset_gp(15, xn as u32, base_offset as usize);
+
+            // 3. Per-lane load with post-index (x15 auto-increments by 4)
+            for lane in 0..(remainder.min(4) as u8) {
+                emit_raw(&mut self.ops, encode_ld1_s_lane_post(dst.0, 15, lane));
+            }
+            Ok(())
         }
 
-        fn vstore_masked(&mut self, _mem: MemOperand, _src: VReg) -> Result<(), String> {
-            Err("vstore_masked not yet implemented for dynasm backend".into())
+        fn vstore_masked(&mut self, mem: MemOperand, src: VReg) -> Result<(), String> {
+            let remainder = self.tail_mask_remainder;
+            let xn = gpr_num(&mem.base);
+            let base_offset = mem.offset;
+
+            // 1. Compute base address into x15
+            self.emit_add_offset_gp(15, xn as u32, base_offset as usize);
+
+            // 2. Per-lane store with post-index (x15 auto-increments by 4)
+            for lane in 0..(remainder.min(4) as u8) {
+                emit_raw(&mut self.ops, encode_st1_s_lane_post(src.0, 15, lane));
+            }
+            Ok(())
         }
 
         // ── Additional FMA variant ───────────────────────────────────
@@ -2757,9 +2951,6 @@ pub mod jit {
                 simd_widths: vec![SimdWidth::W128],
                 has_tile_accel: false,
                 tile_accel: None,
-                peak_gflops_f32: 0.0,
-                peak_bandwidth_gbs: 0.0,
-                roofline_crossover: 0.0,
             }
         }
     }

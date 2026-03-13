@@ -24,6 +24,8 @@ pub mod apple_amx;
 pub mod emitter;
 #[cfg(feature = "jit-cuda")]
 pub mod ptx;
+#[cfg(feature = "jit-cuda")]
+pub mod ptx_gemm;
 pub mod simd_ops;
 pub mod algorithm;
 pub mod math_approx;
@@ -31,9 +33,14 @@ pub mod target_desc;
 pub mod isa_scheduler;
 #[cfg(feature = "jit-metal")]
 pub mod air;
+#[cfg(feature = "jit-metal")]
+pub mod air_gemm;
 #[cfg(feature = "jit-hip")]
 pub mod hip;
+#[cfg(feature = "jit-hip")]
+pub mod hip_gemm;
 pub mod completeness_test;
+pub mod gpu_ir;
 
 pub use emitter::{MachineCodeEmitter, PlatformBackend, Platform};
 

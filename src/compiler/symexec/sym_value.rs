@@ -36,8 +36,34 @@ pub enum SymValue {
     Rsqrt(Box<SymValue>),
     /// libm function call.
     Call(LibmFn, Vec<SymValue>),
+    /// Conditional select: `Select(kind, cond_lhs, cond_rhs, true_val, false_val)`.
+    /// Represents `if cond_lhs <kind> cond_rhs { true_val } else { false_val }`.
+    Select {
+        kind: SelectKind,
+        cond_lhs: Box<SymValue>,
+        cond_rhs: Box<SymValue>,
+        true_val: Box<SymValue>,
+        false_val: Box<SymValue>,
+    },
     /// Unknown / untrackable value.
     Unknown(String),
+}
+
+/// Comparison kind for Select nodes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SelectKind {
+    /// `>` (unsigned above for floats)
+    Gt,
+    /// `>=`
+    Ge,
+    /// `<` (unsigned below for floats)
+    Lt,
+    /// `<=`
+    Le,
+    /// `==`
+    Eq,
+    /// `!=`
+    Ne,
 }
 
 /// Recognized libm functions.
@@ -48,6 +74,19 @@ pub enum LibmFn {
     Tanhf,
     Logf,
     Fabsf,
+}
+
+impl std::fmt::Display for SelectKind {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            SelectKind::Gt => write!(f, ">"),
+            SelectKind::Ge => write!(f, ">="),
+            SelectKind::Lt => write!(f, "<"),
+            SelectKind::Le => write!(f, "<="),
+            SelectKind::Eq => write!(f, "=="),
+            SelectKind::Ne => write!(f, "!="),
+        }
+    }
 }
 
 impl std::fmt::Display for LibmFn {
@@ -83,6 +122,9 @@ impl std::fmt::Display for SymValue {
             SymValue::Call(func, args) => {
                 let args_str: Vec<String> = args.iter().map(|a| format!("{a}")).collect();
                 write!(f, "{func}({})", args_str.join(", "))
+            }
+            SymValue::Select { kind, cond_lhs, cond_rhs, true_val, false_val } => {
+                write!(f, "select({cond_lhs} {kind} {cond_rhs}, {true_val}, {false_val})")
             }
             SymValue::Unknown(s) => write!(f, "?({s})"),
         }
@@ -238,6 +280,76 @@ impl SymValue {
                     }
                 }
                 SymValue::Call(*f, args)
+            }
+
+            SymValue::Select { kind, cond_lhs, cond_rhs, true_val, false_val } => {
+                let cl = cond_lhs.simplify();
+                let cr = cond_rhs.simplify();
+                let tv = true_val.simplify();
+                let fv = false_val.simplify();
+
+                // Pattern: Select(a > b, a, b) → Max(a, b)
+                //          Select(a >= b, a, b) → Max(a, b)
+                //          Select(a < b, a, b) → Min(a, b)
+                //          Select(a <= b, a, b) → Min(a, b)
+                // Also handle the swapped case:
+                //          Select(a > b, b, a) → Min(a, b)
+                //          Select(a < b, b, a) → Max(a, b)
+                let cl_s = format!("{cl}");
+                let cr_s = format!("{cr}");
+                let tv_s = format!("{tv}");
+                let fv_s = format!("{fv}");
+
+                // true_val == cond_lhs && false_val == cond_rhs
+                if tv_s == cl_s && fv_s == cr_s {
+                    match kind {
+                        SelectKind::Gt | SelectKind::Ge => {
+                            return SymValue::Max(Box::new(cl), Box::new(cr));
+                        }
+                        SelectKind::Lt | SelectKind::Le => {
+                            return SymValue::Min(Box::new(cl), Box::new(cr));
+                        }
+                        _ => {}
+                    }
+                }
+                // true_val == cond_rhs && false_val == cond_lhs (swapped)
+                if tv_s == cr_s && fv_s == cl_s {
+                    match kind {
+                        SelectKind::Gt | SelectKind::Ge => {
+                            return SymValue::Min(Box::new(cl), Box::new(cr));
+                        }
+                        SelectKind::Lt | SelectKind::Le => {
+                            return SymValue::Max(Box::new(cl), Box::new(cr));
+                        }
+                        _ => {}
+                    }
+                }
+
+                // Constant condition folding
+                if let (SymValue::Const(lv), SymValue::Const(rv)) = (&cl, &cr) {
+                    let cond = match kind {
+                        SelectKind::Gt => lv > rv,
+                        SelectKind::Ge => lv >= rv,
+                        SelectKind::Lt => (lv) < rv,
+                        SelectKind::Le => lv <= rv,
+                        SelectKind::Eq => (lv - rv).abs() < f64::EPSILON,
+                        SelectKind::Ne => (lv - rv).abs() >= f64::EPSILON,
+                    };
+                    return if cond { tv } else { fv };
+                }
+
+                // Same true/false → collapse
+                if tv_s == fv_s {
+                    return tv;
+                }
+
+                SymValue::Select {
+                    kind: *kind,
+                    cond_lhs: Box::new(cl),
+                    cond_rhs: Box::new(cr),
+                    true_val: Box::new(tv),
+                    false_val: Box::new(fv),
+                }
             }
 
             SymValue::Load { base, index } => SymValue::Load {

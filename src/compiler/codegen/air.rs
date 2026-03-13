@@ -9,12 +9,17 @@
 use std::fmt::Write;
 use crate::compiler::codegen::emitter::{MachineCodeEmitter, Platform, PlatformBackend};
 use crate::compiler::codegen::CodegenOutput;
+use crate::compiler::codegen::gpu_ir::trace_emitter::{GpuDialect, MslDialect};
+use crate::compiler::codegen::gpu_ir::plan_emitter::gpu_emit_plan;
 use crate::compiler::fusion::FusionPlan;
 use crate::compiler::graph::{CompilerGraph, OpKind};
 use crate::compiler::buffer_alloc::BufferAllocation;
 use crate::compiler::registry::ScalarOpRegistry;
 use crate::compiler::trace::{ComputePattern, TraceOp};
 use crate::dispatch::DeviceProfile;
+
+// Re-export GEMM emitters from air_gemm submodule.
+pub(crate) use super::air_gemm::*;
 
 // ── AirCodeGen ──────────────────────────────────────────────────────────────
 
@@ -143,7 +148,7 @@ fn emit_trace_body(
 
 // ── Kernel generators per ComputePattern ────────────────────────────────────
 
-fn emit_elementwise_kernel_from_trace(
+pub(crate) fn emit_elementwise_kernel_from_trace(
     out: &mut String,
     kernel_name: &str,
     body: &[TraceOp],
@@ -159,7 +164,7 @@ fn emit_elementwise_kernel_from_trace(
     writeln!(out, "}}\n").unwrap();
 }
 
-fn emit_binary_elementwise_kernel_from_trace(
+pub(crate) fn emit_binary_elementwise_kernel_from_trace(
     out: &mut String,
     kernel_name: &str,
     body: &[TraceOp],
@@ -176,7 +181,110 @@ fn emit_binary_elementwise_kernel_from_trace(
     writeln!(out, "}}\n").unwrap();
 }
 
-fn emit_normlike_kernel(
+/// Emit a generic reduction kernel in MSL.
+///
+/// Grid-stride accumulation + threadgroup shared memory tree reduction.
+/// Block size = 256 (8 SIMD-groups).
+pub(crate) fn emit_reduction_kernel_msl(
+    out: &mut String,
+    kernel_name: &str,
+    identity: f64,
+    combine: &[TraceOp],
+) {
+    let block_size: usize = 256;
+    let id_bits = (identity as f32).to_bits();
+
+    writeln!(out, "kernel void {kernel_name}(").unwrap();
+    writeln!(out, "    device const float* input [[buffer(0)]],").unwrap();
+    writeln!(out, "    device float* output [[buffer(1)]],").unwrap();
+    writeln!(out, "    constant uint& n [[buffer(2)]],").unwrap();
+    writeln!(out, "    uint lid [[thread_position_in_threadgroup]],").unwrap();
+    writeln!(out, "    uint gid [[threadgroup_position_in_grid]],").unwrap();
+    writeln!(out, "    uint grid_size [[threadgroups_per_grid]]").unwrap();
+    writeln!(out, ") {{").unwrap();
+    writeln!(out, "    threadgroup float sdata[{block_size}];").unwrap();
+    writeln!(out, "    float acc = as_type<float>(0x{id_bits:08X}u);").unwrap();
+    writeln!(out).unwrap();
+
+    // Grid-stride accumulation.
+    writeln!(out, "    for (uint i = gid * {block_size} + lid; i < n; i += grid_size * {block_size}) {{").unwrap();
+    writeln!(out, "        float in0 = acc;").unwrap();
+    writeln!(out, "        float in1 = input[i];").unwrap();
+    let bindings = vec!["in0".to_string(), "in1".to_string()];
+    let result = emit_trace_body(out, combine, 1, &bindings);
+    writeln!(out, "        acc = {result};").unwrap();
+    writeln!(out, "    }}").unwrap();
+    writeln!(out).unwrap();
+
+    // Shared memory tree reduction.
+    writeln!(out, "    sdata[lid] = acc;").unwrap();
+    writeln!(out, "    threadgroup_barrier(mem_flags::mem_threadgroup);").unwrap();
+    writeln!(out).unwrap();
+
+    let mut s = block_size / 2;
+    while s > 0 {
+        writeln!(out, "    if (lid < {s}) {{").unwrap();
+        writeln!(out, "        float in0 = sdata[lid];").unwrap();
+        writeln!(out, "        float in1 = sdata[lid + {s}];").unwrap();
+        let bindings2 = vec!["in0".to_string(), "in1".to_string()];
+        let r2 = emit_trace_body(out, combine, 2, &bindings2);
+        writeln!(out, "        sdata[lid] = {r2};").unwrap();
+        writeln!(out, "    }}").unwrap();
+        writeln!(out, "    threadgroup_barrier(mem_flags::mem_threadgroup);").unwrap();
+        s /= 2;
+    }
+
+    writeln!(out, "    if (lid == 0) output[gid] = sdata[0];").unwrap();
+    writeln!(out, "}}\n").unwrap();
+}
+
+/// Emit a multi-input/multi-output injective kernel in MSL.
+///
+/// Uses `thread_position_in_grid` for global thread ID with bounds check.
+pub(crate) fn emit_injective_kernel_msl(
+    out: &mut String,
+    kernel_name: &str,
+    body: &[TraceOp],
+    num_inputs: usize,
+    num_outputs: usize,
+) {
+    writeln!(out, "kernel void {kernel_name}(").unwrap();
+    let mut buf_idx: usize = 0;
+    for i in 0..num_inputs {
+        writeln!(out, "    device const float* input{i} [[buffer({buf_idx})]],").unwrap();
+        buf_idx += 1;
+    }
+    for i in 0..num_outputs {
+        writeln!(out, "    device float* output{i} [[buffer({buf_idx})]],").unwrap();
+        buf_idx += 1;
+    }
+    writeln!(out, "    constant uint& n [[buffer({buf_idx})]],").unwrap();
+    writeln!(out, "    uint tid [[thread_position_in_grid]]").unwrap();
+    writeln!(out, ") {{").unwrap();
+    writeln!(out, "    if (tid >= n) return;").unwrap();
+
+    let mut bindings = Vec::new();
+    for i in 0..num_inputs {
+        writeln!(out, "    float in{i} = input{i}[tid];").unwrap();
+        bindings.push(format!("in{i}"));
+    }
+
+    let result = emit_trace_body(out, body, 0, &bindings);
+
+    if num_outputs == 1 {
+        writeln!(out, "    output0[tid] = {result};").unwrap();
+    } else {
+        let base = body.len().saturating_sub(num_outputs);
+        for i in 0..num_outputs {
+            let var = format!("t0_{}", base + i);
+            writeln!(out, "    output{i}[tid] = {var};").unwrap();
+        }
+    }
+
+    writeln!(out, "}}\n").unwrap();
+}
+
+pub(crate) fn emit_normlike_kernel(
     out: &mut String,
     kernel_name: &str,
     reduce: &[TraceOp],
@@ -263,7 +371,7 @@ fn emit_normlike_kernel(
     writeln!(out, "}}\n").unwrap();
 }
 
-fn emit_softmax_kernel(out: &mut String, kernel_name: &str) {
+pub(crate) fn emit_softmax_kernel(out: &mut String, kernel_name: &str) {
     let tg_size: usize = 256;
     writeln!(out, "kernel void {kernel_name}(").unwrap();
     writeln!(out, "    device const float* input [[buffer(0)]],").unwrap();
@@ -310,7 +418,7 @@ fn emit_softmax_kernel(out: &mut String, kernel_name: &str) {
     writeln!(out, "}}\n").unwrap();
 }
 
-fn emit_meanpool_kernel(
+pub(crate) fn emit_meanpool_kernel(
     out: &mut String,
     kernel_name: &str,
     seq_len: usize,
@@ -331,86 +439,9 @@ fn emit_meanpool_kernel(
     writeln!(out, "}}\n").unwrap();
 }
 
-fn emit_gemm_kernel_msl(out: &mut String, kernel_name: &str, m: usize, n: usize, k: usize) {
-    let tile = 16usize;
-    writeln!(out, "kernel void {kernel_name}(").unwrap();
-    writeln!(out, "    device const float* A [[buffer(0)]],").unwrap();
-    writeln!(out, "    device const float* B [[buffer(1)]],").unwrap();
-    writeln!(out, "    device float* C [[buffer(2)]],").unwrap();
-    writeln!(out, "    uint2 gid [[threadgroup_position_in_grid]],").unwrap();
-    writeln!(out, "    uint2 tid [[thread_position_in_threadgroup]]").unwrap();
-    writeln!(out, ") {{").unwrap();
-    writeln!(out, "    const uint M = {m}u, N = {n}u, K = {k}u;").unwrap();
-    writeln!(out, "    const uint TILE = {tile}u;").unwrap();
-    writeln!(out, "    threadgroup float smA[{t2}];", t2 = tile * tile).unwrap();
-    writeln!(out, "    threadgroup float smB[{t2}];", t2 = tile * tile).unwrap();
-    writeln!(out, "    uint row = gid.y * TILE + tid.y;").unwrap();
-    writeln!(out, "    uint col = gid.x * TILE + tid.x;").unwrap();
-    writeln!(out, "    float acc = 0.0f;").unwrap();
-    writeln!(out, "    for (uint t = 0; t < (K + TILE - 1) / TILE; t++) {{").unwrap();
-    writeln!(out, "        uint aCol = t * TILE + tid.x;").unwrap();
-    writeln!(out, "        uint bRow = t * TILE + tid.y;").unwrap();
-    writeln!(out, "        smA[tid.y * TILE + tid.x] = (row < M && aCol < K) ? A[row * K + aCol] : 0.0f;").unwrap();
-    writeln!(out, "        smB[tid.y * TILE + tid.x] = (bRow < K && col < N) ? B[bRow * N + col] : 0.0f;").unwrap();
-    writeln!(out, "        threadgroup_barrier(mem_flags::mem_threadgroup);").unwrap();
-    writeln!(out, "        for (uint i = 0; i < TILE; i++) {{").unwrap();
-    writeln!(out, "            acc += smA[tid.y * TILE + i] * smB[i * TILE + tid.x];").unwrap();
-    writeln!(out, "        }}").unwrap();
-    writeln!(out, "        threadgroup_barrier(mem_flags::mem_threadgroup);").unwrap();
-    writeln!(out, "    }}").unwrap();
-    writeln!(out, "    if (row < M && col < N) {{").unwrap();
-    writeln!(out, "        C[row * N + col] = acc;").unwrap();
-    writeln!(out, "    }}").unwrap();
-    writeln!(out, "}}\n").unwrap();
-}
+// GEMM kernels (emit_gemm_kernel_msl, emit_gemm_simdgroup_msl) moved to air_gemm.rs
 
-/// Emit Apple GPU family 7+ GEMM using `simdgroup_matrix` (8×8 tiles).
-///
-/// Uses `simdgroup_load` / `simdgroup_multiply_accumulate` / `simdgroup_store`
-/// for hardware-accelerated matrix multiply on Apple Silicon (A14+, M1+).
-/// Grid: (ceil(N/8), ceil(M/8)), Block: (32, 1) — one simdgroup per threadgroup.
-fn emit_gemm_simdgroup_msl(out: &mut String, kernel_name: &str, m: usize, n: usize, k: usize) {
-    let ktiles = (k + 7) / 8;
-    writeln!(out, "#include <metal_simdgroup_matrix>").unwrap();
-    writeln!(out, "using namespace metal;").unwrap();
-    writeln!(out).unwrap();
-    writeln!(out, "kernel void {kernel_name}(").unwrap();
-    writeln!(out, "    device const half* A [[buffer(0)]],").unwrap();
-    writeln!(out, "    device const half* B [[buffer(1)]],").unwrap();
-    writeln!(out, "    device float* C [[buffer(2)]],").unwrap();
-    writeln!(out, "    uint2 gid [[threadgroup_position_in_grid]],").unwrap();
-    writeln!(out, "    uint simd_lane [[thread_index_in_simdgroup]]").unwrap();
-    writeln!(out, ") {{").unwrap();
-    writeln!(out, "    const uint M = {m}u, N = {n}u, K = {k}u;").unwrap();
-    writeln!(out).unwrap();
-    writeln!(out, "    simdgroup_float8x8 acc;").unwrap();
-    writeln!(out, "    simdgroup_half8x8 fragA, fragB;").unwrap();
-    writeln!(out).unwrap();
-    writeln!(out, "    // Zero accumulator").unwrap();
-    writeln!(out, "    acc = simdgroup_float8x8(0);").unwrap();
-    writeln!(out).unwrap();
-    writeln!(out, "    uint tile_row = gid.y * 8;").unwrap();
-    writeln!(out, "    uint tile_col = gid.x * 8;").unwrap();
-    writeln!(out).unwrap();
-    writeln!(out, "    for (uint kt = 0; kt < {ktiles}u; ++kt) {{").unwrap();
-    writeln!(out, "        uint k_off = kt * 8;").unwrap();
-    writeln!(out).unwrap();
-    writeln!(out, "        // Load A tile: A[tile_row..+8][k_off..+8], stride=K").unwrap();
-    writeln!(out, "        simdgroup_load(fragA, A + tile_row * K + k_off, K);").unwrap();
-    writeln!(out).unwrap();
-    writeln!(out, "        // Load B tile: B[k_off..+8][tile_col..+8], stride=N").unwrap();
-    writeln!(out, "        simdgroup_load(fragB, B + k_off * N + tile_col, N);").unwrap();
-    writeln!(out).unwrap();
-    writeln!(out, "        // Multiply-accumulate").unwrap();
-    writeln!(out, "        simdgroup_multiply_accumulate(acc, fragA, fragB, acc);").unwrap();
-    writeln!(out, "    }}").unwrap();
-    writeln!(out).unwrap();
-    writeln!(out, "    // Store result: C[tile_row..+8][tile_col..+8], stride=N").unwrap();
-    writeln!(out, "    simdgroup_store(acc, C + tile_row * N + tile_col, N);").unwrap();
-    writeln!(out, "}}\n").unwrap();
-}
-
-fn emit_mha_kernel_msl(
+pub(crate) fn emit_mha_kernel_msl(
     out: &mut String,
     kernel_name: &str,
     seq_len: usize,
@@ -481,7 +512,7 @@ fn emit_mha_kernel_msl(
     writeln!(out, "}}\n").unwrap();
 }
 
-fn emit_rope_kernel_msl(
+pub(crate) fn emit_rope_kernel_msl(
     out: &mut String,
     kernel_name: &str,
     head_dim: usize,
@@ -516,104 +547,9 @@ fn emit_rope_kernel_msl(
     writeln!(out, "}}\n").unwrap();
 }
 
-fn emit_gemm_bias_simdgroup_msl(
-    out: &mut String,
-    kernel_name: &str,
-    m: usize,
-    n: usize,
-    k: usize,
-) {
-    let ktiles = (k + 7) / 8;
-    writeln!(out, "#include <metal_simdgroup_matrix>").unwrap();
-    writeln!(out, "using namespace metal;").unwrap();
-    writeln!(out).unwrap();
-    writeln!(out, "kernel void {kernel_name}(").unwrap();
-    writeln!(out, "    device const half* A [[buffer(0)]],").unwrap();
-    writeln!(out, "    device const half* B [[buffer(1)]],").unwrap();
-    writeln!(out, "    device const float* bias [[buffer(2)]],").unwrap();
-    writeln!(out, "    device float* C [[buffer(3)]],").unwrap();
-    writeln!(out, "    uint2 gid [[threadgroup_position_in_grid]],").unwrap();
-    writeln!(out, "    uint simd_lane [[thread_index_in_simdgroup]]").unwrap();
-    writeln!(out, ") {{").unwrap();
-    writeln!(out, "    const uint M = {m}u, N = {n}u, K = {k}u;").unwrap();
-    writeln!(out).unwrap();
-    writeln!(out, "    simdgroup_float8x8 acc;").unwrap();
-    writeln!(out, "    simdgroup_half8x8 fragA, fragB;").unwrap();
-    writeln!(out).unwrap();
-    writeln!(out, "    acc = simdgroup_float8x8(0);").unwrap();
-    writeln!(out).unwrap();
-    writeln!(out, "    uint tile_row = gid.y * 8;").unwrap();
-    writeln!(out, "    uint tile_col = gid.x * 8;").unwrap();
-    writeln!(out).unwrap();
-    writeln!(out, "    for (uint kt = 0; kt < {ktiles}u; ++kt) {{").unwrap();
-    writeln!(out, "        uint k_off = kt * 8;").unwrap();
-    writeln!(out, "        simdgroup_load(fragA, A + tile_row * K + k_off, K);").unwrap();
-    writeln!(out, "        simdgroup_load(fragB, B + k_off * N + tile_col, N);").unwrap();
-    writeln!(out, "        simdgroup_multiply_accumulate(acc, fragA, fragB, acc);").unwrap();
-    writeln!(out, "    }}").unwrap();
-    writeln!(out).unwrap();
-    writeln!(out, "    // Store to threadgroup, add bias, write to C").unwrap();
-    writeln!(out, "    threadgroup float tile[64];").unwrap();
-    writeln!(out, "    simdgroup_store(acc, tile, 8);").unwrap();
-    writeln!(out).unwrap();
-    writeln!(out, "    // First 32 lanes cover rows 0..3 of the 8x8 tile").unwrap();
-    writeln!(out, "    uint lane_row = simd_lane / 8;").unwrap();
-    writeln!(out, "    uint lane_col = simd_lane % 8;").unwrap();
-    writeln!(out, "    uint out_row = tile_row + lane_row;").unwrap();
-    writeln!(out, "    uint out_col = tile_col + lane_col;").unwrap();
-    writeln!(out, "    if (out_row < M && out_col < N) {{").unwrap();
-    writeln!(out, "        C[out_row * N + out_col] = tile[lane_row * 8 + lane_col] + bias[out_col];").unwrap();
-    writeln!(out, "    }}").unwrap();
-    writeln!(out, "    // Remaining rows 4..7").unwrap();
-    writeln!(out, "    uint lane_row2 = lane_row + 4;").unwrap();
-    writeln!(out, "    uint out_row2 = tile_row + lane_row2;").unwrap();
-    writeln!(out, "    if (out_row2 < M && out_col < N) {{").unwrap();
-    writeln!(out, "        C[out_row2 * N + out_col] = tile[lane_row2 * 8 + lane_col] + bias[out_col];").unwrap();
-    writeln!(out, "    }}").unwrap();
-    writeln!(out, "}}\n").unwrap();
-}
+// GEMM bias kernels (emit_gemm_bias_simdgroup_msl, emit_gemm_bias_kernel_msl) moved to air_gemm.rs
 
-fn emit_gemm_bias_kernel_msl(
-    out: &mut String,
-    kernel_name: &str,
-    m: usize,
-    n: usize,
-    k: usize,
-) {
-    let tile = 16usize;
-    writeln!(out, "kernel void {kernel_name}(").unwrap();
-    writeln!(out, "    device const float* A [[buffer(0)]],").unwrap();
-    writeln!(out, "    device const float* B [[buffer(1)]],").unwrap();
-    writeln!(out, "    device const float* bias [[buffer(2)]],").unwrap();
-    writeln!(out, "    device float* C [[buffer(3)]],").unwrap();
-    writeln!(out, "    uint2 gid [[threadgroup_position_in_grid]],").unwrap();
-    writeln!(out, "    uint2 tid [[thread_position_in_threadgroup]]").unwrap();
-    writeln!(out, ") {{").unwrap();
-    writeln!(out, "    const uint M = {m}u, N = {n}u, K = {k}u;").unwrap();
-    writeln!(out, "    const uint TILE = {tile}u;").unwrap();
-    writeln!(out, "    threadgroup float smA[{t2}];", t2 = tile * tile).unwrap();
-    writeln!(out, "    threadgroup float smB[{t2}];", t2 = tile * tile).unwrap();
-    writeln!(out, "    uint row = gid.y * TILE + tid.y;").unwrap();
-    writeln!(out, "    uint col = gid.x * TILE + tid.x;").unwrap();
-    writeln!(out, "    float acc = 0.0f;").unwrap();
-    writeln!(out, "    for (uint t = 0; t < (K + TILE - 1) / TILE; t++) {{").unwrap();
-    writeln!(out, "        uint aCol = t * TILE + tid.x;").unwrap();
-    writeln!(out, "        uint bRow = t * TILE + tid.y;").unwrap();
-    writeln!(out, "        smA[tid.y * TILE + tid.x] = (row < M && aCol < K) ? A[row * K + aCol] : 0.0f;").unwrap();
-    writeln!(out, "        smB[tid.y * TILE + tid.x] = (bRow < K && col < N) ? B[bRow * N + col] : 0.0f;").unwrap();
-    writeln!(out, "        threadgroup_barrier(mem_flags::mem_threadgroup);").unwrap();
-    writeln!(out, "        for (uint i = 0; i < TILE; i++) {{").unwrap();
-    writeln!(out, "            acc += smA[tid.y * TILE + i] * smB[i * TILE + tid.x];").unwrap();
-    writeln!(out, "        }}").unwrap();
-    writeln!(out, "        threadgroup_barrier(mem_flags::mem_threadgroup);").unwrap();
-    writeln!(out, "    }}").unwrap();
-    writeln!(out, "    if (row < M && col < N) {{").unwrap();
-    writeln!(out, "        C[row * N + col] = acc + bias[col];").unwrap();
-    writeln!(out, "    }}").unwrap();
-    writeln!(out, "}}\n").unwrap();
-}
-
-fn emit_dequantize_kernel_msl(
+pub(crate) fn emit_dequantize_kernel_msl(
     out: &mut String,
     kernel_name: &str,
     num_elements: usize,
@@ -656,9 +592,9 @@ impl MachineCodeEmitter for AirCodeGen {
         _profile: &DeviceProfile,
         registry: Option<&ScalarOpRegistry>,
     ) -> Result<CodegenOutput, String> {
+        let dialect = MslDialect { gpu_family: self.gpu_family };
         let mut msl = String::new();
-        msl.push_str("#include <metal_stdlib>\n");
-        msl.push_str("using namespace metal;\n\n");
+        dialect.emit_header(&mut msl);
 
         if plan.groups.is_empty() {
             return Ok(CodegenOutput {
@@ -667,143 +603,7 @@ impl MachineCodeEmitter for AirCodeGen {
             });
         }
 
-        for group in &plan.groups {
-            let anchor_op = graph.op(group.anchor).ok_or_else(|| {
-                format!("AirCodeGen: anchor op {:?} not found in graph", group.anchor)
-            })?;
-
-            let kernel_name = format!("group_{}", group.id);
-            let op_kind = &anchor_op.kind;
-
-            // Reshape/Transpose are metadata-only — NOP on GPU
-            if matches!(op_kind, OpKind::Reshape { .. } | OpKind::Transpose { .. }) {
-                continue;
-            }
-
-            let registry = registry.ok_or_else(|| {
-                format!("AirCodeGen: emit_plan requires a ScalarOpRegistry for {:?}", op_kind)
-            })?;
-
-            let key = ScalarOpRegistry::key_from_op_kind(op_kind);
-            let trace = registry.get_trace(&key).ok_or_else(|| {
-                format!("AirCodeGen: no OpTrace for {:?}", op_kind)
-            })?;
-
-            match &trace.pattern {
-                ComputePattern::Elementwise { body } => {
-                    emit_elementwise_kernel_from_trace(&mut msl, &kernel_name, body);
-                }
-                ComputePattern::BinaryElementwise { body } => {
-                    emit_binary_elementwise_kernel_from_trace(&mut msl, &kernel_name, body);
-                }
-                ComputePattern::NormLike { reduce, finalize, transform } => {
-                    let eps_override = match op_kind {
-                        OpKind::RmsNorm { eps } => Some(*eps),
-                        OpKind::LayerNorm { eps } => Some(*eps),
-                        _ => None,
-                    };
-                    let has_weight = matches!(
-                        op_kind,
-                        OpKind::RmsNorm { .. } | OpKind::LayerNorm { .. }
-                    );
-                    let has_bias = matches!(op_kind, OpKind::LayerNorm { .. });
-                    emit_normlike_kernel(
-                        &mut msl,
-                        &kernel_name,
-                        reduce,
-                        finalize,
-                        transform,
-                        has_weight,
-                        has_bias,
-                        eps_override,
-                    );
-                }
-                ComputePattern::Reduction { .. } => {
-                    match op_kind {
-                        OpKind::Softmax => {
-                            emit_softmax_kernel(&mut msl, &kernel_name);
-                        }
-                        OpKind::MeanPool { seq_len, hidden } => {
-                            emit_meanpool_kernel(
-                                &mut msl, &kernel_name, *seq_len, *hidden,
-                            );
-                        }
-                        _ => {
-                            return Err(format!(
-                                "AirCodeGen: unsupported Reduction op {:?}",
-                                op_kind
-                            ));
-                        }
-                    }
-                }
-                ComputePattern::Gemm => {
-                    match op_kind {
-                        OpKind::Gemm { m, n, k } => {
-                            if self.gpu_family >= 7 {
-                                emit_gemm_simdgroup_msl(&mut msl, &kernel_name, *m, *n, *k);
-                            } else {
-                                emit_gemm_kernel_msl(&mut msl, &kernel_name, *m, *n, *k);
-                            }
-                        }
-                        OpKind::GemmBias { m, n, k } => {
-                            if self.gpu_family >= 7 {
-                                emit_gemm_bias_simdgroup_msl(&mut msl, &kernel_name, *m, *n, *k);
-                            } else {
-                                emit_gemm_bias_kernel_msl(&mut msl, &kernel_name, *m, *n, *k);
-                            }
-                        }
-                        OpKind::QuantGemm { m, n, k, .. } => {
-                            // QuantGemm uses the same GEMM structure; dequant is handled at load time
-                            if self.gpu_family >= 7 {
-                                emit_gemm_simdgroup_msl(&mut msl, &kernel_name, *m, *n, *k);
-                            } else {
-                                emit_gemm_kernel_msl(&mut msl, &kernel_name, *m, *n, *k);
-                            }
-                        }
-                        OpKind::MultiHeadAttention { seq_len, num_heads, head_dim } => {
-                            emit_mha_kernel_msl(&mut msl, &kernel_name, *seq_len, *num_heads, *head_dim);
-                        }
-                        _ => {
-                            return Err(format!(
-                                "AirCodeGen: unsupported Gemm op {:?}",
-                                op_kind
-                            ));
-                        }
-                    }
-                }
-                ComputePattern::Injective { body, .. } => {
-                    if body.is_empty() {
-                        continue;
-                    }
-                    match op_kind {
-                        OpKind::RoPE { head_dim, theta } => {
-                            emit_rope_kernel_msl(&mut msl, &kernel_name, *head_dim, *theta);
-                        }
-                        _ => {
-                            return Err(format!(
-                                "AirCodeGen: unsupported Injective op {:?}",
-                                op_kind
-                            ));
-                        }
-                    }
-                }
-                ComputePattern::QuantDecode { block_size, .. } => {
-                    match op_kind {
-                        OpKind::Dequantize { num_elements, block_size: bs, bits } => {
-                            emit_dequantize_kernel_msl(
-                                &mut msl, &kernel_name, *num_elements, *bs, *bits,
-                            );
-                        }
-                        _ => {
-                            return Err(format!(
-                                "AirCodeGen: unsupported QuantDecode op {:?} (block_size={})",
-                                op_kind, block_size
-                            ));
-                        }
-                    }
-                }
-            }
-        }
+        gpu_emit_plan(&dialect, &mut msl, plan, graph, registry)?;
 
         Ok(CodegenOutput {
             code: msl.into_bytes(),

@@ -19,12 +19,6 @@ pub struct HwCapabilityMatrix {
     pub has_tile_accel: bool,
     /// Tile accelerator kind (if available).
     pub tile_accel: Option<TileAccelKind>,
-    /// Peak GFLOPS (f32) for compute-bound roofline analysis.
-    pub peak_gflops_f32: f64,
-    /// Peak memory bandwidth in GB/s for memory-bound roofline analysis.
-    pub peak_bandwidth_gbs: f64,
-    /// Arithmetic intensity crossover point (FLOPS/byte).
-    pub roofline_crossover: f64,
 }
 
 impl HwCapabilityMatrix {
@@ -52,10 +46,6 @@ impl HwCapabilityMatrix {
             simd_widths,
             has_tile_accel: cfg.has_amx,
             tile_accel,
-            // TODO: derive from microarch (frequency × FMA ports × SIMD width)
-            peak_gflops_f32: 0.0,
-            peak_bandwidth_gbs: 0.0,
-            roofline_crossover: 0.0,
         }
     }
 }
@@ -204,9 +194,6 @@ mod tests {
             simd_widths: vec![SimdWidth::W128, SimdWidth::W256],
             has_tile_accel: false,
             tile_accel: None,
-            peak_gflops_f32: 0.0,
-            peak_bandwidth_gbs: 0.0,
-            roofline_crossover: 0.0,
         }
     }
 
@@ -215,9 +202,6 @@ mod tests {
             simd_widths: vec![SimdWidth::W128, SimdWidth::W256, SimdWidth::W512],
             has_tile_accel: true,
             tile_accel: Some(TileAccelKind::Amx),
-            peak_gflops_f32: 0.0,
-            peak_bandwidth_gbs: 0.0,
-            roofline_crossover: 0.0,
         }
     }
 
@@ -226,9 +210,6 @@ mod tests {
             simd_widths: vec![SimdWidth::W128],
             has_tile_accel: false,
             tile_accel: None,
-            peak_gflops_f32: 0.0,
-            peak_bandwidth_gbs: 0.0,
-            roofline_crossover: 0.0,
         }
     }
 
@@ -237,9 +218,6 @@ mod tests {
             simd_widths: vec![SimdWidth::W128, SimdWidth::Wvl],
             has_tile_accel: false,
             tile_accel: None,
-            peak_gflops_f32: 0.0,
-            peak_bandwidth_gbs: 0.0,
-            roofline_crossover: 0.0,
         }
     }
 

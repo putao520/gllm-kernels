@@ -16,4 +16,5 @@ pub mod activations;
 pub mod attention;
 pub mod norms;
 pub mod blas;
+pub mod pooling;
 pub mod rope;

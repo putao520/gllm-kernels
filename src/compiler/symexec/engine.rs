@@ -1,5 +1,5 @@
 use std::collections::HashMap;
-use super::sym_value::{SymValue, LibmFn};
+use super::sym_value::{SymValue, LibmFn, SelectKind};
 use crate::compiler::trace::TraceOp;
 
 #[derive(Debug)]
@@ -30,6 +30,7 @@ struct CmpFlags {
 
 /// Symbolic execution state: maps register names to symbolic values,
 /// with stack spill tracking and constant pool support.
+#[derive(Clone)]
 pub struct SymbolicExecutor {
     regs: HashMap<String, SymValue>,
     /// Stack spill slots: offset from RSP → symbolic value.
@@ -547,6 +548,47 @@ impl SymbolicExecutor {
     }
 
     // -----------------------------------------------------------------------
+    // State snapshot / restore (for loop analysis)
+    // -----------------------------------------------------------------------
+
+    /// Take a snapshot of the current executor state.
+    pub fn snapshot(&self) -> SymbolicExecutor {
+        self.clone()
+    }
+
+    /// Restore from a previously taken snapshot.
+    pub fn restore(&mut self, snap: &SymbolicExecutor) {
+        self.regs = snap.regs.clone();
+        self.stack = snap.stack.clone();
+        self.constants = snap.constants.clone();
+        self.flags = snap.flags.clone();
+    }
+
+    /// Return the current XMM register state (xmm0..xmm15).
+    pub fn xmm_state(&self) -> HashMap<String, SymValue> {
+        self.regs
+            .iter()
+            .filter(|(k, _)| k.starts_with("xmm"))
+            .map(|(k, v)| (k.clone(), v.clone()))
+            .collect()
+    }
+
+    /// Return the current comparison flags (lhs, rhs) if set.
+    pub fn get_flags(&self) -> Option<(SymValue, SymValue)> {
+        self.flags.as_ref().map(|f| (f.lhs.clone(), f.rhs.clone()))
+    }
+
+    /// Return the current stack spill state.
+    pub fn stack_state(&self) -> &HashMap<i64, SymValue> {
+        &self.stack
+    }
+
+    /// Set a stack spill slot to a symbolic value.
+    pub fn set_stack(&mut self, offset: i64, val: SymValue) {
+        self.stack.insert(offset, val);
+    }
+
+    // -----------------------------------------------------------------------
     // OpTrace extraction
     // -----------------------------------------------------------------------
 
@@ -711,6 +753,26 @@ fn linearize(
                     i
                 }
             }
+        }
+        SymValue::Select { kind, true_val, false_val, .. } => {
+            // Select that survived simplification — linearize as Max/Min
+            // based on the comparison kind, or fall back to true_val.
+            let ti = linearize(true_val, ops, cache);
+            let fi = linearize(false_val, ops, cache);
+            let i = ops.len() as u32;
+            match kind {
+                SelectKind::Gt | SelectKind::Ge => {
+                    ops.push(TraceOp::Max(ti, fi));
+                }
+                SelectKind::Lt | SelectKind::Le => {
+                    ops.push(TraceOp::Min(ti, fi));
+                }
+                _ => {
+                    // For Eq/Ne selects, just use the true branch as best effort.
+                    return ti;
+                }
+            }
+            i
         }
         SymValue::Load { .. } | SymValue::Unknown(_) => {
             // Unresolvable — emit as Input(0) placeholder.

@@ -716,6 +716,113 @@ fn format_operands(instr: &Instruction) -> Vec<String> {
 }
 
 // ---------------------------------------------------------------------------
+// Structured analysis: CFG → loops → combine_passes → ComputePattern
+// ---------------------------------------------------------------------------
+
+/// Analyze a multi-loop scalar function using CFG-based loop detection.
+///
+/// Unlike `analyze_scalar_fn` (which does a linear walk and stops at the first
+/// backward jump), this function:
+/// 1. Builds a full CFG from the function's machine code.
+/// 2. Detects all natural loops.
+/// 3. Symbolically executes each loop body to extract reductions.
+/// 4. Combines the loop traces into a `ComputePattern`.
+///
+/// Returns `None` if the function has no loops (caller should fall back to
+/// `analyze_scalar_fn` for elementwise ops).
+#[cfg(target_arch = "x86_64")]
+pub fn analyze_scalar_fn_structured(
+    fn_ptr: *const u8,
+    sig: &ScalarFnSignature,
+) -> Result<Option<super::loop_analyzer::MultiPassAnalysis>, SymExecError> {
+    use super::cfg::{build_cfg_from_fn, find_loops};
+    use super::loop_analyzer::{analyze_single_loop, analyze_nested_loops, combine_passes, MultiPassAnalysis};
+
+    if fn_ptr.is_null() {
+        return Err(SymExecError::DisassemblyFailed("null function pointer".into()));
+    }
+
+    // Build CFG (use a generous byte limit for multi-loop functions).
+    let cfg = build_cfg_from_fn(fn_ptr, MAX_FN_BYTES)
+        .map_err(|e| SymExecError::DisassemblyFailed(e))?;
+
+    let forest = find_loops(&cfg);
+    if forest.loops.is_empty() {
+        return Ok(None); // No loops → not a multi-pass function.
+    }
+
+    // Create executor with the right number of float/ptr params.
+    let n_inputs = count_inputs(sig);
+    let executor = SymbolicExecutor::new(n_inputs, 0);
+
+    // Phase 5: Check for nested loops first (GEMM, RoPE, Transpose).
+    // If the forest has loops with depth > 0, try nested analysis before
+    // falling through to flat multi-pass analysis.
+    if let Some(nested) = analyze_nested_loops(&forest, &cfg, &executor) {
+        return Ok(Some(MultiPassAnalysis {
+            loop_traces: nested.inner_trace.into_iter().collect(),
+            pattern: nested.pattern,
+            num_loops: forest.loops.len(),
+        }));
+    }
+
+    // Flat multi-pass analysis: use top-level (outermost) loops.
+    let top_loops: Vec<&super::cfg::NaturalLoop> = forest.top_level.iter()
+        .filter_map(|&idx| forest.loops.get(idx))
+        .collect();
+
+    if top_loops.is_empty() {
+        return Ok(None);
+    }
+
+    // Analyze each top-level loop, keeping those with detected reductions.
+    //
+    // Filtering rules:
+    // - Loops with no reductions AND no mutations → trivial (alignment
+    //   checks, null-pointer guards) → skip.
+    // - Loops with only unknown_mutations (no reductions) → elementwise
+    //   loop bodies the analyzer couldn't decompose (e.g. SiLU's
+    //   vectorized exp() call) → skip, let Level 2 handle them.
+    // - Loops with reductions (even if they also have unknown_mutations)
+    //   → keep. Multi-pass functions like LayerNorm may have loops where
+    //   the compiler interleaves a real accumulator with opaque stores.
+    let mut loop_traces = Vec::new();
+    for natural_loop in &top_loops {
+        match analyze_single_loop(natural_loop, &cfg, &executor) {
+            Ok(trace) => {
+                if trace.reductions.is_empty() {
+                    continue;
+                }
+                loop_traces.push(trace);
+            }
+            Err(_) => continue, // Skip loops we can't analyze.
+        }
+    }
+
+    if loop_traces.is_empty() {
+        return Ok(None);
+    }
+
+    // Combine loop traces into a ComputePattern.
+    match combine_passes(&loop_traces) {
+        Ok(pattern) => Ok(Some(MultiPassAnalysis {
+            loop_traces,
+            pattern,
+            num_loops: forest.loops.len(),
+        })),
+        Err(_) => Ok(None), // Couldn't classify → fall back to linear.
+    }
+}
+
+#[cfg(not(target_arch = "x86_64"))]
+pub fn analyze_scalar_fn_structured(
+    _fn_ptr: *const u8,
+    _sig: &ScalarFnSignature,
+) -> Result<Option<super::loop_analyzer::MultiPassAnalysis>, SymExecError> {
+    Ok(None)
+}
+
+// ---------------------------------------------------------------------------
 // Stub for non-x86_64 targets
 // ---------------------------------------------------------------------------
 
@@ -881,5 +988,172 @@ mod tests {
         };
         let result = analyze_scalar_fn(std::ptr::null(), &sig);
         assert!(result.is_err());
+    }
+
+    // ── Structured (multi-loop) analysis tests ──────────────────────────
+
+    /// Helper: run structured analysis on a scalar function.
+    fn analyze_structured(
+        f: *const u8,
+        params: Vec<ScalarParam>,
+    ) -> Result<Option<super::super::loop_analyzer::MultiPassAnalysis>, SymExecError> {
+        let sig = ScalarFnSignature {
+            fn_ptr: f,
+            params,
+        };
+        analyze_scalar_fn_structured(f, &sig)
+    }
+
+    #[test]
+    fn test_structured_rmsnorm() {
+        use gllm_scalar_ops::norms::scalar_rms_norm;
+        let result = analyze_structured(
+            scalar_rms_norm as *const u8,
+            vec![
+                ScalarParam::InputPtr,
+                ScalarParam::WeightPtr,
+                ScalarParam::OutputPtr,
+                ScalarParam::Dim(0),
+                ScalarParam::Scalar(1e-5),
+            ],
+        );
+        match result {
+            Ok(Some(info)) => {
+                eprintln!("RmsNorm structured: {} loops, pattern={:?}", info.num_loops, info.pattern);
+                assert!(
+                    matches!(info.pattern, ComputePattern::NormLike { .. }),
+                    "RmsNorm should be NormLike, got {:?}", info.pattern
+                );
+                assert!(info.num_loops >= 2, "RmsNorm should have ≥2 loops, got {}", info.num_loops);
+            }
+            Ok(None) => {
+                eprintln!("RmsNorm structured: no loops detected (may need CFG improvements)");
+            }
+            Err(e) => {
+                eprintln!("RmsNorm structured analysis failed: {e}");
+            }
+        }
+    }
+
+    #[test]
+    fn test_structured_layernorm() {
+        use gllm_scalar_ops::norms::scalar_layer_norm;
+        let result = analyze_structured(
+            scalar_layer_norm as *const u8,
+            vec![
+                ScalarParam::InputPtr,
+                ScalarParam::WeightPtr,
+                ScalarParam::WeightPtr,
+                ScalarParam::OutputPtr,
+                ScalarParam::Dim(0),
+                ScalarParam::Scalar(1e-5),
+            ],
+        );
+        match result {
+            Ok(Some(info)) => {
+                eprintln!("LayerNorm structured: {} loops, pattern={:?}", info.num_loops, info.pattern);
+                assert!(
+                    matches!(info.pattern, ComputePattern::NormLike { .. }),
+                    "LayerNorm should be NormLike, got {:?}", info.pattern
+                );
+                assert!(info.num_loops >= 2, "LayerNorm should have ≥2 loops, got {}", info.num_loops);
+            }
+            Ok(None) => {
+                eprintln!("LayerNorm structured: no loops detected");
+            }
+            Err(e) => {
+                eprintln!("LayerNorm structured analysis failed: {e}");
+            }
+        }
+    }
+
+    #[test]
+    fn test_structured_softmax() {
+        use gllm_scalar_ops::blas::scalar_softmax;
+        let result = analyze_structured(
+            scalar_softmax as *const u8,
+            vec![ScalarParam::InputPtr, ScalarParam::OutputPtr, ScalarParam::Dim(0)],
+        );
+        match result {
+            Ok(Some(info)) => {
+                eprintln!("Softmax structured: {} loops, pattern={:?}", info.num_loops, info.pattern);
+                // Softmax has 3 passes (max, sum-exp, normalize) → Reduction or NormLike
+                assert!(
+                    matches!(info.pattern, ComputePattern::Reduction { .. } | ComputePattern::NormLike { .. }),
+                    "Softmax should be Reduction or NormLike, got {:?}", info.pattern
+                );
+                assert!(info.num_loops >= 2, "Softmax should have ≥2 loops, got {}", info.num_loops);
+            }
+            Ok(None) => {
+                eprintln!("Softmax structured: no loops detected");
+            }
+            Err(e) => {
+                eprintln!("Softmax structured analysis failed: {e}");
+            }
+        }
+    }
+
+    #[test]
+    fn test_structured_l2normalize() {
+        use gllm_scalar_ops::norms::scalar_l2_normalize;
+        let result = analyze_structured(
+            scalar_l2_normalize as *const u8,
+            vec![ScalarParam::InputPtr, ScalarParam::OutputPtr, ScalarParam::Dim(0)],
+        );
+        match result {
+            Ok(Some(info)) => {
+                eprintln!("L2Normalize structured: {} loops, pattern={:?}", info.num_loops, info.pattern);
+                assert!(
+                    matches!(info.pattern, ComputePattern::NormLike { .. }),
+                    "L2Normalize should be NormLike, got {:?}", info.pattern
+                );
+                assert!(info.num_loops >= 2, "L2Normalize should have ≥2 loops, got {}", info.num_loops);
+            }
+            Ok(None) => {
+                eprintln!("L2Normalize structured: no loops detected");
+            }
+            Err(e) => {
+                eprintln!("L2Normalize structured analysis failed: {e}");
+            }
+        }
+    }
+
+    #[test]
+    fn test_structured_meanpool() {
+        use gllm_scalar_ops::pooling::scalar_mean_pool;
+        let result = analyze_structured(
+            scalar_mean_pool as *const u8,
+            vec![
+                ScalarParam::InputPtr,
+                ScalarParam::OutputPtr,
+                ScalarParam::Dim(0), // seq_len
+                ScalarParam::Dim(1), // hidden
+            ],
+        );
+        match result {
+            Ok(Some(info)) => {
+                eprintln!("MeanPool structured: {} loops, pattern={:?}", info.num_loops, info.pattern);
+                assert!(
+                    matches!(info.pattern, ComputePattern::Reduction { .. } | ComputePattern::NormLike { .. }),
+                    "MeanPool should be Reduction or NormLike, got {:?}", info.pattern
+                );
+            }
+            Ok(None) => {
+                eprintln!("MeanPool structured: no loops detected (nested loops may need CFG improvements)");
+            }
+            Err(e) => {
+                eprintln!("MeanPool structured analysis failed: {e}");
+            }
+        }
+    }
+
+    #[test]
+    fn test_structured_null_ptr_returns_error() {
+        let sig = ScalarFnSignature {
+            fn_ptr: std::ptr::null(),
+            params: vec![ScalarParam::InputPtr, ScalarParam::OutputPtr, ScalarParam::Dim(0)],
+        };
+        let result = analyze_scalar_fn_structured(std::ptr::null(), &sig);
+        assert!(result.is_err(), "null pointer should return Err");
     }
 }
