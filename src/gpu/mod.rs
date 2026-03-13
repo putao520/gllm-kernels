@@ -237,3 +237,153 @@ pub const GPU_DISPATCH_THRESHOLD: usize = 1024;
 
 #[cfg(feature = "jit-cuda")]
 pub mod cuda;
+
+use crate::compiler::codegen::emitter::Platform;
+
+/// GPU 硬件能力描述，用于 codegen 决策（tile size、block size、指令选择）。
+#[derive(Debug, Clone)]
+pub struct GpuDeviceProfile {
+    /// 目标平台
+    pub platform: Platform,
+    /// SM/CU/GPU core 数量
+    pub compute_units: u32,
+    /// Shared memory per block/threadgroup (bytes)
+    pub shared_mem_per_block: u32,
+    /// Max registers per thread
+    pub max_registers_per_thread: u32,
+    /// Warp/wavefront/SIMD-group 大小
+    pub warp_size: u32,
+    /// Max threads per block/threadgroup
+    pub max_threads_per_block: u32,
+    /// Max block dimensions (x, y, z)
+    pub max_block_dim: [u32; 3],
+    /// Max grid dimensions (x, y, z)
+    pub max_grid_dim: [u32; 3],
+    /// Total device memory (bytes)
+    pub total_memory: usize,
+    /// Memory bandwidth (GB/s, best-effort estimate)
+    pub memory_bandwidth_gbs: f64,
+    /// Peak compute (GFLOPS f32, best-effort estimate)
+    pub peak_gflops_f32: f64,
+    /// Has matrix acceleration unit (Tensor Core / MFMA / simdgroup_matrix)
+    pub has_matrix_unit: bool,
+    /// Clock rate (MHz) for roofline estimation
+    pub clock_mhz: u32,
+}
+
+/// Kernel launch 参数。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LaunchConfig {
+    pub grid_dim: [u32; 3],
+    pub block_dim: [u32; 3],
+    pub shared_mem_bytes: u32,
+}
+
+impl GpuDeviceProfile {
+    /// 根据元素数量计算 1D elementwise launch 参数。
+    pub fn launch_config_1d(&self, n_elements: usize) -> LaunchConfig {
+        let block_x = self.max_threads_per_block.min(256);
+        let grid_x = ((n_elements as u32) + block_x - 1) / block_x;
+        let grid_x = grid_x.min(self.max_grid_dim[0]);
+        LaunchConfig {
+            grid_dim: [grid_x, 1, 1],
+            block_dim: [block_x, 1, 1],
+            shared_mem_bytes: 0,
+        }
+    }
+
+    /// 根据行数和 block_size 计算 row-wise kernel launch 参数（softmax、normlike）。
+    pub fn launch_config_row_wise(&self, num_rows: usize, block_size: u32) -> LaunchConfig {
+        let block_x = block_size.min(self.max_threads_per_block);
+        let grid_x = (num_rows as u32).min(self.max_grid_dim[0]);
+        let shared_bytes = block_x * 4; // float per thread
+        LaunchConfig {
+            grid_dim: [grid_x, 1, 1],
+            block_dim: [block_x, 1, 1],
+            shared_mem_bytes: shared_bytes,
+        }
+    }
+
+    /// Roofline model: 计算 arithmetic intensity 阈值。
+    pub fn roofline_ridge_point(&self) -> f64 {
+        if self.memory_bandwidth_gbs > 0.0 {
+            self.peak_gflops_f32 / self.memory_bandwidth_gbs
+        } else {
+            0.0
+        }
+    }
+}
+
+#[cfg(all(test, feature = "jit-cuda"))]
+mod tests {
+    use super::*;
+
+    fn mock_cuda_profile() -> GpuDeviceProfile {
+        use crate::compiler::codegen::emitter::Platform;
+        GpuDeviceProfile {
+            platform: Platform::Cuda { sm_version: 80 },
+            compute_units: 108,
+            shared_mem_per_block: 49152,
+            max_registers_per_thread: 255,
+            warp_size: 32,
+            max_threads_per_block: 1024,
+            max_block_dim: [1024, 1024, 64],
+            max_grid_dim: [2147483647, 65535, 65535],
+            total_memory: 40 * 1024 * 1024 * 1024, // 40 GB
+            memory_bandwidth_gbs: 1555.0,
+            peak_gflops_f32: 19500.0,
+            has_matrix_unit: true,
+            clock_mhz: 1410,
+        }
+    }
+
+    #[test]
+    fn test_gpu_device_profile_construction() {
+        let p = mock_cuda_profile();
+        assert_eq!(p.compute_units, 108);
+        assert_eq!(p.warp_size, 32);
+        assert!(p.has_matrix_unit);
+        assert_eq!(p.max_threads_per_block, 1024);
+    }
+
+    #[test]
+    fn test_launch_config_1d_small() {
+        let p = mock_cuda_profile();
+        let lc = p.launch_config_1d(512);
+        assert_eq!(lc.block_dim, [256, 1, 1]);
+        assert_eq!(lc.grid_dim, [2, 1, 1]);
+        assert_eq!(lc.shared_mem_bytes, 0);
+    }
+
+    #[test]
+    fn test_launch_config_1d_large() {
+        let p = mock_cuda_profile();
+        let lc = p.launch_config_1d(1_000_000);
+        assert_eq!(lc.block_dim, [256, 1, 1]);
+        assert_eq!(lc.grid_dim[0], 3907); // ceil(1M / 256)
+    }
+
+    #[test]
+    fn test_launch_config_row_wise() {
+        let p = mock_cuda_profile();
+        let lc = p.launch_config_row_wise(32, 256);
+        assert_eq!(lc.block_dim, [256, 1, 1]);
+        assert_eq!(lc.grid_dim, [32, 1, 1]);
+        assert_eq!(lc.shared_mem_bytes, 1024); // 256 * 4
+    }
+
+    #[test]
+    fn test_roofline_ridge_point() {
+        let p = mock_cuda_profile();
+        let ridge = p.roofline_ridge_point();
+        // A100: ~19500 GFLOPS / ~1555 GB/s ≈ 12.5 FLOP/byte
+        assert!(ridge > 10.0 && ridge < 15.0, "ridge = {ridge}");
+    }
+
+    #[test]
+    fn test_launch_config_equality() {
+        let a = LaunchConfig { grid_dim: [1, 1, 1], block_dim: [256, 1, 1], shared_mem_bytes: 0 };
+        let b = LaunchConfig { grid_dim: [1, 1, 1], block_dim: [256, 1, 1], shared_mem_bytes: 0 };
+        assert_eq!(a, b);
+    }
+}

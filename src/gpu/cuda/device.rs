@@ -157,6 +157,60 @@ impl CudaDevice {
     pub fn driver(&self) -> &Arc<CudaDriver> {
         &self.driver
     }
+
+    /// 查询 GPU 硬件能力，构建 GpuDeviceProfile。
+    pub fn gpu_profile(&self) -> Result<crate::gpu::GpuDeviceProfile, GpuError> {
+        use super::driver::*;
+        use crate::compiler::codegen::emitter::Platform;
+
+        let d = &self.driver;
+        let id = self.device_id;
+
+        let compute_units = d.device_attribute(CU_DEVICE_ATTRIBUTE_MULTIPROCESSOR_COUNT, id)? as u32;
+        let shared_mem = d.device_attribute(CU_DEVICE_ATTRIBUTE_MAX_SHARED_MEMORY_PER_BLOCK, id)? as u32;
+        let max_regs = d.device_attribute(CU_DEVICE_ATTRIBUTE_MAX_REGISTERS_PER_BLOCK, id)? as u32;
+        let warp_size = d.device_attribute(CU_DEVICE_ATTRIBUTE_WARP_SIZE, id)? as u32;
+        let max_threads = d.device_attribute(CU_DEVICE_ATTRIBUTE_MAX_THREADS_PER_BLOCK, id)? as u32;
+
+        let max_block_dim = [
+            d.device_attribute(CU_DEVICE_ATTRIBUTE_MAX_BLOCK_DIM_X, id)? as u32,
+            d.device_attribute(CU_DEVICE_ATTRIBUTE_MAX_BLOCK_DIM_Y, id)? as u32,
+            d.device_attribute(CU_DEVICE_ATTRIBUTE_MAX_BLOCK_DIM_Z, id)? as u32,
+        ];
+        let max_grid_dim = [
+            d.device_attribute(CU_DEVICE_ATTRIBUTE_MAX_GRID_DIM_X, id)? as u32,
+            d.device_attribute(CU_DEVICE_ATTRIBUTE_MAX_GRID_DIM_Y, id)? as u32,
+            d.device_attribute(CU_DEVICE_ATTRIBUTE_MAX_GRID_DIM_Z, id)? as u32,
+        ];
+
+        let clock_khz = d.device_attribute(CU_DEVICE_ATTRIBUTE_CLOCK_RATE, id)? as u32;
+        let clock_mhz = clock_khz / 1000;
+
+        // Memory bandwidth estimate: mem_clock (MHz) * bus_width (bits) * 2 (DDR) / 8 (bytes)
+        let mem_clock_khz = d.device_attribute(CU_DEVICE_ATTRIBUTE_MEMORY_CLOCK_RATE, id).unwrap_or(0) as f64;
+        let bus_width = d.device_attribute(CU_DEVICE_ATTRIBUTE_GLOBAL_MEMORY_BUS_WIDTH, id).unwrap_or(0) as f64;
+        let memory_bandwidth_gbs = (mem_clock_khz * 1e-6) * (bus_width / 8.0) * 2.0;
+
+        // Peak GFLOPS estimate: SMs * cores/SM * 2 (FMA) * clock_GHz
+        let cores_per_sm: f64 = if self.sm_version >= 80 { 128.0 } else if self.sm_version >= 70 { 64.0 } else { 128.0 };
+        let peak_gflops_f32 = (compute_units as f64) * cores_per_sm * 2.0 * (clock_mhz as f64 / 1000.0);
+
+        Ok(crate::gpu::GpuDeviceProfile {
+            platform: Platform::Cuda { sm_version: self.sm_version },
+            compute_units,
+            shared_mem_per_block: shared_mem,
+            max_registers_per_thread: max_regs / max_threads.max(1),
+            warp_size,
+            max_threads_per_block: max_threads,
+            max_block_dim,
+            max_grid_dim,
+            total_memory: self.total_memory,
+            memory_bandwidth_gbs,
+            peak_gflops_f32,
+            has_matrix_unit: self.sm_version >= 70,
+            clock_mhz,
+        })
+    }
 }
 
 impl GpuDevice for CudaDevice {

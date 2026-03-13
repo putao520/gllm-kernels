@@ -12,10 +12,10 @@ use crate::compiler::codegen::CodegenOutput;
 use crate::compiler::codegen::gpu_ir::trace_emitter::{GpuDialect, MslDialect};
 use crate::compiler::codegen::gpu_ir::plan_emitter::gpu_emit_plan;
 use crate::compiler::fusion::FusionPlan;
-use crate::compiler::graph::{CompilerGraph, OpKind};
+use crate::compiler::graph::CompilerGraph;
 use crate::compiler::buffer_alloc::BufferAllocation;
 use crate::compiler::registry::ScalarOpRegistry;
-use crate::compiler::trace::{ComputePattern, TraceOp};
+use crate::compiler::trace::TraceOp;
 use crate::dispatch::DeviceProfile;
 
 // Re-export GEMM emitters from air_gemm submodule.
@@ -148,39 +148,6 @@ fn emit_trace_body(
 
 // ── Kernel generators per ComputePattern ────────────────────────────────────
 
-pub(crate) fn emit_elementwise_kernel_from_trace(
-    out: &mut String,
-    kernel_name: &str,
-    body: &[TraceOp],
-) {
-    writeln!(out, "kernel void {kernel_name}(").unwrap();
-    writeln!(out, "    device const float* input [[buffer(0)]],").unwrap();
-    writeln!(out, "    device float* output [[buffer(1)]],").unwrap();
-    writeln!(out, "    uint tid [[thread_position_in_grid]]").unwrap();
-    writeln!(out, ") {{").unwrap();
-    let bindings = vec!["input[tid]".to_string()];
-    let result = emit_trace_body(out, body, 0, &bindings);
-    writeln!(out, "    output[tid] = {result};").unwrap();
-    writeln!(out, "}}\n").unwrap();
-}
-
-pub(crate) fn emit_binary_elementwise_kernel_from_trace(
-    out: &mut String,
-    kernel_name: &str,
-    body: &[TraceOp],
-) {
-    writeln!(out, "kernel void {kernel_name}(").unwrap();
-    writeln!(out, "    device const float* input0 [[buffer(0)]],").unwrap();
-    writeln!(out, "    device const float* input1 [[buffer(1)]],").unwrap();
-    writeln!(out, "    device float* output [[buffer(2)]],").unwrap();
-    writeln!(out, "    uint tid [[thread_position_in_grid]]").unwrap();
-    writeln!(out, ") {{").unwrap();
-    let bindings = vec!["input0[tid]".to_string(), "input1[tid]".to_string()];
-    let result = emit_trace_body(out, body, 0, &bindings);
-    writeln!(out, "    output[tid] = {result};").unwrap();
-    writeln!(out, "}}\n").unwrap();
-}
-
 /// Emit a generic reduction kernel in MSL.
 ///
 /// Grid-stride accumulation + threadgroup shared memory tree reduction.
@@ -281,161 +248,6 @@ pub(crate) fn emit_injective_kernel_msl(
         }
     }
 
-    writeln!(out, "}}\n").unwrap();
-}
-
-pub(crate) fn emit_normlike_kernel(
-    out: &mut String,
-    kernel_name: &str,
-    reduce: &[TraceOp],
-    finalize: &[TraceOp],
-    transform: &[TraceOp],
-    has_weight: bool,
-    has_bias: bool,
-    eps_override: Option<f32>,
-) {
-    let tg_size: usize = 256;
-    writeln!(out, "kernel void {kernel_name}(").unwrap();
-    writeln!(out, "    device const float* input [[buffer(0)]],").unwrap();
-    let mut buf_idx: usize = 1;
-    if has_weight {
-        writeln!(out, "    device const float* weight [[buffer({buf_idx})]],").unwrap();
-        buf_idx += 1;
-    }
-    if has_bias {
-        writeln!(out, "    device const float* bias [[buffer({buf_idx})]],").unwrap();
-        buf_idx += 1;
-    }
-    writeln!(out, "    device float* output [[buffer({buf_idx})]],").unwrap();
-    buf_idx += 1;
-    writeln!(out, "    constant uint& N [[buffer({buf_idx})]],").unwrap();
-    writeln!(out, "    uint lid [[thread_position_in_threadgroup]],").unwrap();
-    writeln!(out, "    uint gid [[threadgroup_position_in_grid]]").unwrap();
-    writeln!(out, ") {{").unwrap();
-    writeln!(out, "    threadgroup float shared[{tg_size}];").unwrap();
-    writeln!(out).unwrap();
-
-    // Phase 1: partial reduction
-    writeln!(out, "    float acc = 0.0f;").unwrap();
-    writeln!(out, "    for (uint i = lid; i < N; i += {tg_size}) {{").unwrap();
-    let reduce_bindings = vec!["input[gid * N + i]".to_string()];
-    let reduce_result = emit_trace_body(out, reduce, 1, &reduce_bindings);
-    writeln!(out, "        acc += {reduce_result};").unwrap();
-    writeln!(out, "    }}").unwrap();
-    writeln!(out, "    shared[lid] = acc;").unwrap();
-    writeln!(out, "    threadgroup_barrier(mem_flags::mem_threadgroup);").unwrap();
-    writeln!(out).unwrap();
-
-    // Tree reduction in shared memory
-    writeln!(out, "    for (uint s = {tg_size} / 2; s > 0; s >>= 1) {{").unwrap();
-    writeln!(out, "        if (lid < s) {{ shared[lid] += shared[lid + s]; }}").unwrap();
-    writeln!(out, "        threadgroup_barrier(mem_flags::mem_threadgroup);").unwrap();
-    writeln!(out, "    }}").unwrap();
-    writeln!(out).unwrap();
-
-    // Phase 2: finalize
-    writeln!(out, "    float sum_val = shared[0];").unwrap();
-    let finalize_bindings = vec!["sum_val".to_string(), "float(N)".to_string()];
-    let mut patched_finalize: Vec<TraceOp>;
-    let finalize_ops: &[TraceOp] = if let Some(eps) = eps_override {
-        patched_finalize = finalize.to_vec();
-        for op in &mut patched_finalize {
-            if let TraceOp::Const(v) = op {
-                if (*v - 1e-5f64).abs() < 1e-10 || (*v - 1e-12f64).abs() < 1e-15 {
-                    *v = eps as f64;
-                }
-            }
-        }
-        &patched_finalize[..]
-    } else {
-        finalize
-    };
-    let scale_var = emit_trace_body(out, finalize_ops, 2, &finalize_bindings);
-    writeln!(out).unwrap();
-
-    // Phase 3: per-element transform
-    writeln!(out, "    for (uint i = lid; i < N; i += {tg_size}) {{").unwrap();
-    let mut xform_bindings = vec![
-        "input[gid * N + i]".to_string(),
-        scale_var.clone(),
-    ];
-    if has_weight {
-        xform_bindings.push("weight[i]".to_string());
-    }
-    if has_bias {
-        xform_bindings.push("bias[i]".to_string());
-    }
-    let xform_result = emit_trace_body(out, transform, 3, &xform_bindings);
-    writeln!(out, "        output[gid * N + i] = {xform_result};").unwrap();
-    writeln!(out, "    }}").unwrap();
-    writeln!(out, "}}\n").unwrap();
-}
-
-pub(crate) fn emit_softmax_kernel(out: &mut String, kernel_name: &str) {
-    let tg_size: usize = 256;
-    writeln!(out, "kernel void {kernel_name}(").unwrap();
-    writeln!(out, "    device const float* input [[buffer(0)]],").unwrap();
-    writeln!(out, "    device float* output [[buffer(1)]],").unwrap();
-    writeln!(out, "    constant uint& N [[buffer(2)]],").unwrap();
-    writeln!(out, "    uint lid [[thread_position_in_threadgroup]],").unwrap();
-    writeln!(out, "    uint gid [[threadgroup_position_in_grid]]").unwrap();
-    writeln!(out, ") {{").unwrap();
-    writeln!(out, "    threadgroup float shared[{tg_size}];").unwrap();
-    writeln!(out).unwrap();
-
-    // Pass 1: find max
-    writeln!(out, "    float max_val = -INFINITY;").unwrap();
-    writeln!(out, "    for (uint i = lid; i < N; i += {tg_size}) {{").unwrap();
-    writeln!(out, "        max_val = max(max_val, input[gid * N + i]);").unwrap();
-    writeln!(out, "    }}").unwrap();
-    writeln!(out, "    shared[lid] = max_val;").unwrap();
-    writeln!(out, "    threadgroup_barrier(mem_flags::mem_threadgroup);").unwrap();
-    writeln!(out, "    for (uint s = {tg_size} / 2; s > 0; s >>= 1) {{").unwrap();
-    writeln!(out, "        if (lid < s) {{ shared[lid] = max(shared[lid], shared[lid + s]); }}").unwrap();
-    writeln!(out, "        threadgroup_barrier(mem_flags::mem_threadgroup);").unwrap();
-    writeln!(out, "    }}").unwrap();
-    writeln!(out, "    float row_max = shared[0];").unwrap();
-    writeln!(out).unwrap();
-
-    // Pass 2: exp and sum
-    writeln!(out, "    float sum_exp = 0.0f;").unwrap();
-    writeln!(out, "    for (uint i = lid; i < N; i += {tg_size}) {{").unwrap();
-    writeln!(out, "        sum_exp += exp(input[gid * N + i] - row_max);").unwrap();
-    writeln!(out, "    }}").unwrap();
-    writeln!(out, "    shared[lid] = sum_exp;").unwrap();
-    writeln!(out, "    threadgroup_barrier(mem_flags::mem_threadgroup);").unwrap();
-    writeln!(out, "    for (uint s = {tg_size} / 2; s > 0; s >>= 1) {{").unwrap();
-    writeln!(out, "        if (lid < s) {{ shared[lid] += shared[lid + s]; }}").unwrap();
-    writeln!(out, "        threadgroup_barrier(mem_flags::mem_threadgroup);").unwrap();
-    writeln!(out, "    }}").unwrap();
-    writeln!(out, "    float inv_sum = 1.0f / shared[0];").unwrap();
-    writeln!(out).unwrap();
-
-    // Pass 3: normalize
-    writeln!(out, "    for (uint i = lid; i < N; i += {tg_size}) {{").unwrap();
-    writeln!(out, "        output[gid * N + i] = exp(input[gid * N + i] - row_max) * inv_sum;").unwrap();
-    writeln!(out, "    }}").unwrap();
-    writeln!(out, "}}\n").unwrap();
-}
-
-pub(crate) fn emit_meanpool_kernel(
-    out: &mut String,
-    kernel_name: &str,
-    seq_len: usize,
-    hidden: usize,
-) {
-    writeln!(out, "kernel void {kernel_name}(").unwrap();
-    writeln!(out, "    device const float* input [[buffer(0)]],").unwrap();
-    writeln!(out, "    device float* output [[buffer(1)]],").unwrap();
-    writeln!(out, "    uint tid [[thread_position_in_grid]]").unwrap();
-    writeln!(out, ") {{").unwrap();
-    writeln!(out, "    uint h = tid;").unwrap();
-    writeln!(out, "    if (h >= {hidden}u) return;").unwrap();
-    writeln!(out, "    float acc = 0.0f;").unwrap();
-    writeln!(out, "    for (uint s = 0; s < {seq_len}u; s++) {{").unwrap();
-    writeln!(out, "        acc += input[s * {hidden}u + h];").unwrap();
-    writeln!(out, "    }}").unwrap();
-    writeln!(out, "    output[h] = acc / float({seq_len}u);").unwrap();
     writeln!(out, "}}\n").unwrap();
 }
 
@@ -549,38 +361,6 @@ pub(crate) fn emit_rope_kernel_msl(
 
 // GEMM bias kernels (emit_gemm_bias_simdgroup_msl, emit_gemm_bias_kernel_msl) moved to air_gemm.rs
 
-pub(crate) fn emit_dequantize_kernel_msl(
-    out: &mut String,
-    kernel_name: &str,
-    num_elements: usize,
-    block_size: usize,
-    bits: usize,
-) {
-    let mask = (1u64 << bits) - 1;
-    let elems_per_u32 = 32 / bits;
-    writeln!(out, "kernel void {kernel_name}(").unwrap();
-    writeln!(out, "    device const uint* packed [[buffer(0)]],").unwrap();
-    writeln!(out, "    device const float* scales [[buffer(1)]],").unwrap();
-    writeln!(out, "    device float* output [[buffer(2)]],").unwrap();
-    writeln!(out, "    uint tid [[thread_position_in_grid]]").unwrap();
-    writeln!(out, ") {{").unwrap();
-    writeln!(out, "    const uint NUM_ELEMENTS = {num_elements}u;").unwrap();
-    writeln!(out, "    const uint BLOCK_SIZE = {block_size}u;").unwrap();
-    writeln!(out, "    const uint BITS = {bits}u;").unwrap();
-    writeln!(out, "    const uint MASK = {mask}u;").unwrap();
-    writeln!(out, "    const uint ELEMS_PER_U32 = {elems_per_u32}u;").unwrap();
-    writeln!(out, "    if (tid >= NUM_ELEMENTS) return;").unwrap();
-    writeln!(out, "    uint block_idx = tid / BLOCK_SIZE;").unwrap();
-    writeln!(out, "    uint in_block = tid % BLOCK_SIZE;").unwrap();
-    writeln!(out, "    float scale = scales[block_idx];").unwrap();
-    writeln!(out, "    uint packed_idx = (block_idx * BLOCK_SIZE + in_block) / ELEMS_PER_U32;").unwrap();
-    writeln!(out, "    uint bit_offset = (in_block % ELEMS_PER_U32) * BITS;").unwrap();
-    writeln!(out, "    uint raw = (packed[packed_idx] >> bit_offset) & MASK;").unwrap();
-    writeln!(out, "    float zero_point = float(1u << (BITS - 1));").unwrap();
-    writeln!(out, "    output[tid] = (float(raw) - zero_point) * scale;").unwrap();
-    writeln!(out, "}}\n").unwrap();
-}
-
 // ── MachineCodeEmitter impl ─────────────────────────────────────────────────
 
 impl MachineCodeEmitter for AirCodeGen {
@@ -653,6 +433,7 @@ impl PlatformBackend for MetalBackend {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::compiler::graph::OpKind;
 
     #[test]
     fn test_air_codegen_msl_header() {
@@ -726,6 +507,7 @@ mod tests {
 
     #[test]
     fn test_air_emit_normlike_l2normalize() {
+        use crate::compiler::codegen::gpu_ir::trace_emitter::{GpuDialect, MslDialect};
         let reduce = vec![
             TraceOp::Input(0),
             TraceOp::Mul(0, 0),
@@ -743,16 +525,18 @@ mod tests {
             TraceOp::Input(1),
             TraceOp::Mul(0, 1),
         ];
+        let dialect = MslDialect::new(9);
         let mut out = String::new();
-        emit_normlike_kernel(
+        dialect.emit_header(&mut out);
+        dialect.emit_normlike_kernel(
             &mut out, "test_l2norm",
             &reduce, &finalize, &transform,
             false, false, Some(1e-5),
         );
-        assert!(out.contains("kernel void test_l2norm("));
-        assert!(out.contains("rsqrt"));
-        assert!(!out.contains("weight"));
-        assert!(!out.contains("bias"));
+        assert!(out.contains("kernel void test_l2norm("), "missing kernel sig:\n{out}");
+        assert!(out.contains("rsqrt"), "missing rsqrt:\n{out}");
+        assert!(!out.contains("weight"), "unexpected weight:\n{out}");
+        assert!(!out.contains("bias"), "unexpected bias:\n{out}");
     }
     #[test]
     fn test_metal_backend_platform() {
@@ -927,15 +711,14 @@ mod tests {
 
     #[test]
     fn test_air_emit_dequantize_kernel() {
+        use crate::compiler::codegen::gpu_ir::trace_emitter::{GpuDialect, MslDialect};
+        let dialect = MslDialect::new(9);
         let mut out = String::new();
-        emit_dequantize_kernel_msl(&mut out, "test_dequant", 4096, 32, 4);
-        assert!(out.contains("kernel void test_dequant("));
-        assert!(out.contains("device const uint* packed"));
-        assert!(out.contains("device const float* scales"));
-        assert!(out.contains("const uint BLOCK_SIZE = 32u"));
-        assert!(out.contains("const uint BITS = 4u"));
-        assert!(out.contains("const uint MASK = 15u"));
-        assert!(out.contains("zero_point"));
+        dialect.emit_header(&mut out);
+        dialect.emit_dequantize_kernel(&mut out, "test_dequant", 4096, 32, 4);
+        assert!(out.contains("kernel void test_dequant("), "missing kernel sig:\n{out}");
+        assert!(out.contains("MASK = 15u"), "missing mask for 4-bit:\n{out}");
+        assert!(out.contains("ELEMS_PER_U32 = 8u"), "missing elems_per_u32:\n{out}");
     }
 
     #[test]

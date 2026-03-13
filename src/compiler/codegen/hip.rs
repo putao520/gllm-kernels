@@ -227,46 +227,6 @@ fn max_regs_needed(body: &[TraceOp], base: u32) -> u32 {
 
 // ── Kernel emitters ─────────────────────────────────────────────────
 
-/// Emit a unary elementwise kernel from a trace body.
-pub(crate) fn emit_elementwise_kernel_hip(out: &mut String, name: &str, body: &[TraceOp]) {
-    writeln!(out, "extern \"C\" __global__ void {name}(").unwrap();
-    writeln!(out, "    const float* __restrict__ input,").unwrap();
-    writeln!(out, "    float* __restrict__ output,").unwrap();
-    writeln!(out, "    const unsigned int n").unwrap();
-    writeln!(out, ") {{").unwrap();
-    writeln!(out, "    unsigned int tid = hipBlockIdx_x * hipBlockDim_x + hipThreadIdx_x;").unwrap();
-    writeln!(out, "    if (tid >= n) return;").unwrap();
-    writeln!(out, "    float in0 = input[tid];").unwrap();
-
-    let bindings = vec!["in0".to_string()];
-    let result = emit_trace_body_hip(out, body, 0, &bindings);
-
-    writeln!(out, "    output[tid] = {result};").unwrap();
-    writeln!(out, "}}").unwrap();
-    writeln!(out).unwrap();
-}
-
-/// Emit a binary elementwise kernel from a trace body.
-pub(crate) fn emit_binary_elementwise_kernel_hip(out: &mut String, name: &str, body: &[TraceOp]) {
-    writeln!(out, "extern \"C\" __global__ void {name}(").unwrap();
-    writeln!(out, "    const float* __restrict__ input0,").unwrap();
-    writeln!(out, "    const float* __restrict__ input1,").unwrap();
-    writeln!(out, "    float* __restrict__ output,").unwrap();
-    writeln!(out, "    const unsigned int n").unwrap();
-    writeln!(out, ") {{").unwrap();
-    writeln!(out, "    unsigned int tid = hipBlockIdx_x * hipBlockDim_x + hipThreadIdx_x;").unwrap();
-    writeln!(out, "    if (tid >= n) return;").unwrap();
-    writeln!(out, "    float in0 = input0[tid];").unwrap();
-    writeln!(out, "    float in1 = input1[tid];").unwrap();
-
-    let bindings = vec!["in0".to_string(), "in1".to_string()];
-    let result = emit_trace_body_hip(out, body, 0, &bindings);
-
-    writeln!(out, "    output[tid] = {result};").unwrap();
-    writeln!(out, "}}").unwrap();
-    writeln!(out).unwrap();
-}
-
 /// Emit a multi-input/multi-output injective kernel from a trace body.
 pub(crate) fn emit_injective_kernel_hip(
     out: &mut String,
@@ -393,172 +353,6 @@ pub(crate) fn emit_reduction_kernel_hip(
 
 // ── NormLike kernel ─────────────────────────────────────────────────
 
-/// Emit a NormLike (RMSNorm / LayerNorm) kernel using 3 phases:
-/// Phase 1: partial reduction (sum of squares), Phase 2: finalize (rsqrt),
-/// Phase 3: per-element transform (scale * weight [+ bias]).
-pub(crate) fn emit_normlike_kernel_hip(
-    out: &mut String,
-    kernel_name: &str,
-    _reduce: &[TraceOp],
-    _finalize: &[TraceOp],
-    _transform: &[TraceOp],
-    has_weight: bool,
-    has_bias: bool,
-    eps_override: Option<f32>,
-) {
-    let block_size = 256;
-
-    write!(out, "extern \"C\" __global__ void {kernel_name}(\n").unwrap();
-    writeln!(out, "    const float* __restrict__ input,").unwrap();
-    writeln!(out, "    float* __restrict__ output,").unwrap();
-    if has_weight {
-        writeln!(out, "    const float* __restrict__ weight,").unwrap();
-    }
-    if has_bias {
-        writeln!(out, "    const float* __restrict__ bias,").unwrap();
-    }
-    writeln!(out, "    const int N").unwrap();
-    writeln!(out, ") {{").unwrap();
-
-    writeln!(out, "    __shared__ float smem[{block_size}];").unwrap();
-    writeln!(out, "    int row = blockIdx.x;").unwrap();
-    writeln!(out, "    int tid = threadIdx.x;").unwrap();
-    writeln!(out, "    const float* row_in = input + row * N;").unwrap();
-    writeln!(out, "    float* row_out = output + row * N;").unwrap();
-    writeln!(out).unwrap();
-
-    // Phase 1: Partial reduction
-    writeln!(out, "    // Phase 1: reduction").unwrap();
-    writeln!(out, "    float partial = 0.0f;").unwrap();
-    writeln!(out, "    for (int i = tid; i < N; i += {block_size}) {{").unwrap();
-    writeln!(out, "        float x = row_in[i];").unwrap();
-    writeln!(out, "        partial += x * x;").unwrap();
-    writeln!(out, "    }}").unwrap();
-    writeln!(out, "    smem[tid] = partial;").unwrap();
-    writeln!(out, "    __syncthreads();").unwrap();
-    writeln!(out).unwrap();
-
-    // Tree reduction
-    writeln!(out, "    for (int s = {block_size} / 2; s > 0; s >>= 1) {{").unwrap();
-    writeln!(out, "        if (tid < s) smem[tid] += smem[tid + s];").unwrap();
-    writeln!(out, "        __syncthreads();").unwrap();
-    writeln!(out, "    }}").unwrap();
-    writeln!(out).unwrap();
-
-    // Phase 2: Finalize
-    writeln!(out, "    // Phase 2: finalize").unwrap();
-    let eps = eps_override.unwrap_or(1e-5);
-    writeln!(out, "    float variance = smem[0] / float(N);").unwrap();
-    writeln!(out, "    float scale = rsqrtf(variance + {eps:.8e}f);").unwrap();
-    writeln!(out).unwrap();
-
-    // Phase 3: Per-element transform
-    writeln!(out, "    // Phase 3: transform").unwrap();
-    writeln!(out, "    for (int i = tid; i < N; i += {block_size}) {{").unwrap();
-    writeln!(out, "        float x = row_in[i];").unwrap();
-    writeln!(out, "        float y = x * scale;").unwrap();
-    if has_weight {
-        writeln!(out, "        y *= weight[i];").unwrap();
-    }
-    if has_bias {
-        writeln!(out, "        y += bias[i];").unwrap();
-    }
-    writeln!(out, "        row_out[i] = y;").unwrap();
-    writeln!(out, "    }}").unwrap();
-    writeln!(out, "}}\n").unwrap();
-}
-
-// ── MeanPool kernel ────────────────────────────────────────────────
-
-/// Emit a MeanPool kernel: average over the sequence dimension.
-/// Each thread handles one hidden dimension element.
-pub(crate) fn emit_meanpool_kernel_hip(
-    out: &mut String,
-    kernel_name: &str,
-    seq_len: usize,
-    hidden: usize,
-) {
-    let block_size = 256;
-    writeln!(out, "extern \"C\" __global__ void {kernel_name}(").unwrap();
-    writeln!(out, "    const float* __restrict__ input,").unwrap();
-    writeln!(out, "    float* __restrict__ output,").unwrap();
-    writeln!(out, "    const int seq_len,").unwrap();
-    writeln!(out, "    const int hidden").unwrap();
-    writeln!(out, ") {{").unwrap();
-    writeln!(out, "    int h = blockIdx.x * {block_size} + threadIdx.x;").unwrap();
-    writeln!(out, "    if (h >= {hidden}) return;").unwrap();
-    writeln!(out, "    float acc = 0.0f;").unwrap();
-    writeln!(out, "    for (int s = 0; s < {seq_len}; s++) {{").unwrap();
-    writeln!(out, "        acc += input[s * {hidden} + h];").unwrap();
-    writeln!(out, "    }}").unwrap();
-    writeln!(out, "    output[h] = acc / float({seq_len});").unwrap();
-    writeln!(out, "}}\n").unwrap();
-}
-
-// ── Softmax kernel ──────────────────────────────────────────────────
-
-/// Emit a row-wise softmax kernel using shared memory reduction.
-pub(crate) fn emit_softmax_kernel_hip(out: &mut String, name: &str, gfx_arch: u32) {
-    let wf = wavefront_size(gfx_arch);
-    writeln!(out, "extern \"C\" __global__ void {name}(").unwrap();
-    writeln!(out, "    const float* __restrict__ input,").unwrap();
-    writeln!(out, "    float* __restrict__ output,").unwrap();
-    writeln!(out, "    const unsigned int rows,").unwrap();
-    writeln!(out, "    const unsigned int cols").unwrap();
-    writeln!(out, ") {{").unwrap();
-    writeln!(out, "    extern __shared__ float sdata[];").unwrap();
-    writeln!(out, "    unsigned int row = hipBlockIdx_x;").unwrap();
-    writeln!(out, "    unsigned int tid = hipThreadIdx_x;").unwrap();
-    writeln!(out, "    if (row >= rows) return;").unwrap();
-    writeln!(out).unwrap();
-
-    // Phase 1: find row max
-    writeln!(out, "    float local_max = -3.402823466e+38f;").unwrap();
-    writeln!(out, "    for (unsigned int i = tid; i < cols; i += hipBlockDim_x) {{").unwrap();
-    writeln!(out, "        local_max = fmaxf(local_max, input[row * cols + i]);").unwrap();
-    writeln!(out, "    }}").unwrap();
-    writeln!(out, "    sdata[tid] = local_max;").unwrap();
-    writeln!(out, "    __syncthreads();").unwrap();
-    writeln!(out, "    for (unsigned int s = hipBlockDim_x / 2; s > 0; s >>= 1) {{").unwrap();
-    writeln!(out, "        if (tid < s) sdata[tid] = fmaxf(sdata[tid], sdata[tid + s]);").unwrap();
-    writeln!(out, "        __syncthreads();").unwrap();
-    writeln!(out, "    }}").unwrap();
-    writeln!(out, "    float row_max = sdata[0];").unwrap();
-    writeln!(out, "    __syncthreads();").unwrap();
-    writeln!(out).unwrap();
-
-    // Phase 2: compute exp(x - max) and sum
-    writeln!(out, "    float local_sum = 0.0f;").unwrap();
-    writeln!(out, "    for (unsigned int i = tid; i < cols; i += hipBlockDim_x) {{").unwrap();
-    writeln!(out, "        float val = expf(input[row * cols + i] - row_max);").unwrap();
-    writeln!(out, "        output[row * cols + i] = val;").unwrap();
-    writeln!(out, "        local_sum += val;").unwrap();
-    writeln!(out, "    }}").unwrap();
-    writeln!(out, "    sdata[tid] = local_sum;").unwrap();
-    writeln!(out, "    __syncthreads();").unwrap();
-    writeln!(out, "    for (unsigned int s = hipBlockDim_x / 2; s > 0; s >>= 1) {{").unwrap();
-    writeln!(out, "        if (tid < s) sdata[tid] += sdata[tid + s];").unwrap();
-    writeln!(out, "        __syncthreads();").unwrap();
-    writeln!(out, "    }}").unwrap();
-    writeln!(out, "    float row_sum = sdata[0];").unwrap();
-    writeln!(out, "    __syncthreads();").unwrap();
-    writeln!(out).unwrap();
-
-    // Phase 3: normalize
-    writeln!(out, "    float inv_sum = 1.0f / row_sum;").unwrap();
-    writeln!(out, "    for (unsigned int i = tid; i < cols; i += hipBlockDim_x) {{").unwrap();
-    writeln!(out, "        output[row * cols + i] *= inv_sum;").unwrap();
-    writeln!(out, "    }}").unwrap();
-    writeln!(out, "}}").unwrap();
-    writeln!(out).unwrap();
-}
-
-// ── RoPE kernel ─────────────────────────────────────────────────────
-
-/// Emit a Rotary Position Embedding (RoPE) kernel for HIP.
-///
-/// Applies rotary embeddings to input tensor with the given head dimension
-/// and frequency base theta. Grid: (seq_len, num_heads), Block: (256).
 pub(crate) fn emit_rope_kernel_hip(
     out: &mut String,
     kernel_name: &str,
@@ -695,42 +489,6 @@ pub(crate) fn emit_mha_kernel_hip(
 
 /// Emit a dequantization kernel for HIP.
 ///
-/// Unpacks N-bit quantized values from packed u32 words, applies scale and
-/// zero-point offset to produce float output.
-pub(crate) fn emit_dequantize_kernel_hip(
-    out: &mut String,
-    kernel_name: &str,
-    num_elements: usize,
-    block_size: usize,
-    bits: usize,
-) {
-    let mask = (1u64 << bits) - 1;
-    let elems_per_u32 = 32 / bits;
-    let hip_block: usize = 256;
-    let zero_point = 1u32 << (bits - 1);
-
-    writeln!(out, "extern \"C\" __global__ void {kernel_name}(").unwrap();
-    writeln!(out, "    const unsigned int* __restrict__ packed,").unwrap();
-    writeln!(out, "    const float* __restrict__ scales,").unwrap();
-    writeln!(out, "    float* __restrict__ output").unwrap();
-    writeln!(out, ") {{").unwrap();
-    writeln!(out, "    const unsigned int NUM_ELEMENTS = {num_elements}u;").unwrap();
-    writeln!(out, "    const unsigned int BLOCK_SIZE = {block_size}u;").unwrap();
-    writeln!(out, "    const unsigned int BITS = {bits}u;").unwrap();
-    writeln!(out, "    const unsigned int MASK = {mask}u;").unwrap();
-    writeln!(out, "    const unsigned int ELEMS_PER_U32 = {elems_per_u32}u;").unwrap();
-    writeln!(out, "    unsigned int tid = blockIdx.x * {hip_block}u + threadIdx.x;").unwrap();
-    writeln!(out, "    if (tid >= NUM_ELEMENTS) return;").unwrap();
-    writeln!(out, "    unsigned int block_idx = tid / BLOCK_SIZE;").unwrap();
-    writeln!(out, "    unsigned int in_block = tid % BLOCK_SIZE;").unwrap();
-    writeln!(out, "    float scale = scales[block_idx];").unwrap();
-    writeln!(out, "    unsigned int packed_idx = tid / ELEMS_PER_U32;").unwrap();
-    writeln!(out, "    unsigned int bit_offset = (in_block % ELEMS_PER_U32) * BITS;").unwrap();
-    writeln!(out, "    unsigned int raw = (packed[packed_idx] >> bit_offset) & MASK;").unwrap();
-    writeln!(out, "    float zero_point = float({zero_point}u);").unwrap();
-    writeln!(out, "    output[tid] = (float(raw) - zero_point) * scale;").unwrap();
-    writeln!(out, "}}\n").unwrap();
-}
 
 // ── MachineCodeEmitter implementation ───────────────────────────────
 
@@ -896,67 +654,6 @@ mod tests {
     }
 
     #[test]
-    fn test_emit_softmax_kernel() {
-        let mut out = String::new();
-        emit_softmax_kernel_hip(&mut out, "softmax", 1100);
-        assert!(out.contains("softmax"));
-        assert!(out.contains("expf("));
-        assert!(out.contains("inv_sum"));
-    }
-
-    #[test]
-    fn test_emit_normlike_kernel_rmsnorm() {
-        let mut out = String::new();
-        emit_normlike_kernel_hip(
-            &mut out, "rmsnorm", &[], &[], &[],
-            true,  // has_weight
-            false, // no bias
-            Some(1e-5),
-        );
-        assert!(out.contains("rmsnorm"));
-        assert!(out.contains("rsqrtf("));
-        assert!(out.contains("weight[i]"));
-        assert!(!out.contains("bias[i]"));
-        assert!(out.contains("__shared__"));
-    }
-
-    #[test]
-    fn test_emit_normlike_kernel_layernorm() {
-        let mut out = String::new();
-        emit_normlike_kernel_hip(
-            &mut out, "layernorm", &[], &[], &[],
-            true, // has_weight
-            true, // has_bias
-            Some(1e-6),
-        );
-        assert!(out.contains("layernorm"));
-        assert!(out.contains("weight[i]"));
-        assert!(out.contains("bias[i]"));
-    }
-
-    #[test]
-    fn test_emit_meanpool_kernel() {
-        let mut out = String::new();
-        emit_meanpool_kernel_hip(&mut out, "meanpool", 128, 768);
-        assert!(out.contains("meanpool"));
-        assert!(out.contains("128"));
-        assert!(out.contains("768"));
-        assert!(out.contains("float(128)"));
-    }
-
-    #[test]
-    fn test_emit_binary_elementwise_kernel() {
-        let mut out = String::new();
-        let body = vec![TraceOp::Add(0, 1)];
-        emit_binary_elementwise_kernel_hip(&mut out, "binary_add", &body);
-        assert!(out.contains("binary_add"));
-        assert!(out.contains("input0"));
-        assert!(out.contains("input1"));
-        assert!(out.contains("in0"));
-        assert!(out.contains("in1"));
-    }
-
-    #[test]
     fn test_emit_gemm_mfma_kernel() {
         let mut out = String::new();
         emit_gemm_mfma_kernel_hip(&mut out, "mfma_gemm");
@@ -980,15 +677,6 @@ mod tests {
         assert!(out.contains("mha"));
         assert!(out.contains("smem_scores"));
         assert!(out.contains("expf("));
-    }
-
-    #[test]
-    fn test_emit_dequantize_kernel() {
-        let mut out = String::new();
-        emit_dequantize_kernel_hip(&mut out, "dequant", 1024, 128, 4);
-        assert!(out.contains("dequant"));
-        assert!(out.contains("MASK"));
-        assert!(out.contains("zero_point"));
     }
 
     #[test]

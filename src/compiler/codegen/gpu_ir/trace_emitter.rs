@@ -497,11 +497,11 @@ impl GpuDialect for PtxDialect {
     }
 
     fn emit_elementwise_kernel(&self, out: &mut String, name: &str, body: &[TraceOp]) {
-        crate::compiler::codegen::ptx::emit_elementwise_kernel_ptx(out, name, body);
+        super::kernel_builder::build_elementwise_kernel(self, out, name, body);
     }
 
     fn emit_binary_elementwise_kernel(&self, out: &mut String, name: &str, body: &[TraceOp]) {
-        crate::compiler::codegen::ptx::emit_binary_elementwise_kernel_ptx(out, name, body);
+        super::kernel_builder::build_binary_elementwise_kernel(self, out, name, body);
     }
 
     fn emit_gemm_kernel(
@@ -597,17 +597,18 @@ impl GpuDialect for PtxDialect {
         has_bias: bool,
         eps_override: Option<f32>,
     ) {
-        crate::compiler::codegen::ptx::emit_normlike_kernel_ptx(
-            out, name, reduce, finalize, transform, has_weight, has_bias, eps_override,
+        super::kernel_builder::build_normlike_kernel(
+            self, out, name, reduce, finalize, transform,
+            has_weight, has_bias, eps_override.map(|e| e as f64), self.default_block_size(),
         );
     }
 
     fn emit_softmax_kernel(&self, out: &mut String, name: &str) {
-        crate::compiler::codegen::ptx::emit_softmax_kernel_ptx(out, name);
+        super::kernel_builder::build_softmax_kernel(self, out, name, self.default_block_size());
     }
 
     fn emit_meanpool_kernel(&self, out: &mut String, name: &str, seq_len: usize, hidden: usize) {
-        crate::compiler::codegen::ptx::emit_meanpool_kernel_ptx(out, name, seq_len, hidden);
+        super::kernel_builder::build_meanpool_kernel(self, out, name, seq_len, hidden);
     }
 
     fn emit_dequantize_kernel(
@@ -618,8 +619,8 @@ impl GpuDialect for PtxDialect {
         block_size: usize,
         bits: u8,
     ) {
-        crate::compiler::codegen::ptx::emit_dequantize_kernel_ptx(
-            out, name, num_elements, block_size, bits.into(),
+        super::kernel_builder::build_dequantize_kernel(
+            self, out, name, num_elements, block_size, bits.into(),
         );
     }
 }
@@ -824,11 +825,11 @@ impl GpuDialect for HipDialect {
     }
 
     fn emit_elementwise_kernel(&self, out: &mut String, name: &str, body: &[TraceOp]) {
-        crate::compiler::codegen::hip::emit_elementwise_kernel_hip(out, name, body);
+        super::kernel_builder::build_elementwise_kernel(self, out, name, body);
     }
 
     fn emit_binary_elementwise_kernel(&self, out: &mut String, name: &str, body: &[TraceOp]) {
-        crate::compiler::codegen::hip::emit_binary_elementwise_kernel_hip(out, name, body);
+        super::kernel_builder::build_binary_elementwise_kernel(self, out, name, body);
     }
 
     fn emit_gemm_kernel(
@@ -921,17 +922,18 @@ impl GpuDialect for HipDialect {
         has_bias: bool,
         eps_override: Option<f32>,
     ) {
-        crate::compiler::codegen::hip::emit_normlike_kernel_hip(
-            out, name, reduce, finalize, transform, has_weight, has_bias, eps_override,
+        super::kernel_builder::build_normlike_kernel(
+            self, out, name, reduce, finalize, transform,
+            has_weight, has_bias, eps_override.map(|e| e as f64), self.default_block_size(),
         );
     }
 
     fn emit_softmax_kernel(&self, out: &mut String, name: &str) {
-        crate::compiler::codegen::hip::emit_softmax_kernel_hip(out, name, self.gfx_arch);
+        super::kernel_builder::build_softmax_kernel(self, out, name, self.default_block_size());
     }
 
     fn emit_meanpool_kernel(&self, out: &mut String, name: &str, seq_len: usize, hidden: usize) {
-        crate::compiler::codegen::hip::emit_meanpool_kernel_hip(out, name, seq_len, hidden);
+        super::kernel_builder::build_meanpool_kernel(self, out, name, seq_len, hidden);
     }
 
     fn emit_dequantize_kernel(
@@ -942,8 +944,8 @@ impl GpuDialect for HipDialect {
         block_size: usize,
         bits: u8,
     ) {
-        crate::compiler::codegen::hip::emit_dequantize_kernel_hip(
-            out, name, num_elements, block_size, bits.into(),
+        super::kernel_builder::build_dequantize_kernel(
+            self, out, name, num_elements, block_size, bits.into(),
         );
     }
 }
@@ -1135,11 +1137,11 @@ impl GpuDialect for MslDialect {
     }
 
     fn emit_elementwise_kernel(&self, out: &mut String, name: &str, body: &[TraceOp]) {
-        crate::compiler::codegen::air::emit_elementwise_kernel_from_trace(out, name, body);
+        super::kernel_builder::build_elementwise_kernel(self, out, name, body);
     }
 
     fn emit_binary_elementwise_kernel(&self, out: &mut String, name: &str, body: &[TraceOp]) {
-        crate::compiler::codegen::air::emit_binary_elementwise_kernel_from_trace(out, name, body);
+        super::kernel_builder::build_binary_elementwise_kernel(self, out, name, body);
     }
 
     fn emit_gemm_kernel(
@@ -1241,17 +1243,18 @@ impl GpuDialect for MslDialect {
         has_bias: bool,
         eps_override: Option<f32>,
     ) {
-        crate::compiler::codegen::air::emit_normlike_kernel(
-            out, name, reduce, finalize, transform, has_weight, has_bias, eps_override,
+        super::kernel_builder::build_normlike_kernel(
+            self, out, name, reduce, finalize, transform,
+            has_weight, has_bias, eps_override.map(|e| e as f64), self.default_block_size(),
         );
     }
 
     fn emit_softmax_kernel(&self, out: &mut String, name: &str) {
-        crate::compiler::codegen::air::emit_softmax_kernel(out, name);
+        super::kernel_builder::build_softmax_kernel(self, out, name, self.default_block_size());
     }
 
     fn emit_meanpool_kernel(&self, out: &mut String, name: &str, seq_len: usize, hidden: usize) {
-        crate::compiler::codegen::air::emit_meanpool_kernel(out, name, seq_len, hidden);
+        super::kernel_builder::build_meanpool_kernel(self, out, name, seq_len, hidden);
     }
 
     fn emit_dequantize_kernel(
@@ -1262,8 +1265,8 @@ impl GpuDialect for MslDialect {
         block_size: usize,
         bits: u8,
     ) {
-        crate::compiler::codegen::air::emit_dequantize_kernel_msl(
-            out, name, num_elements, block_size, bits.into(),
+        super::kernel_builder::build_dequantize_kernel(
+            self, out, name, num_elements, block_size, bits.into(),
         );
     }
 }
@@ -1288,6 +1291,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "jit-cuda")]
     fn ptx_dialect_silu_matches_legacy() {
         let dialect = PtxDialect::new(80);
         let mut out = String::new();
@@ -1305,6 +1309,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "jit-hip")]
     fn hip_dialect_silu_matches_legacy() {
         let dialect = HipDialect::new(908);
         let mut out = String::new();
@@ -1318,6 +1323,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "jit-metal")]
     fn msl_dialect_silu_matches_legacy() {
         let dialect = MslDialect::new(9);
         let mut out = String::new();
@@ -1331,6 +1337,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(all(feature = "jit-cuda", feature = "jit-hip", feature = "jit-metal"))]
     fn all_trace_ops_covered() {
         // Ensure every TraceOp variant produces output for all three dialects.
         let ops = vec![
@@ -1369,6 +1376,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(all(feature = "jit-cuda", feature = "jit-hip", feature = "jit-metal"))]
     fn warp_sizes_correct() {
         assert_eq!(PtxDialect::new(80).warp_size(), 32);
         assert_eq!(HipDialect::new(908).warp_size(), 64);  // CDNA wave64
@@ -1377,6 +1385,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "jit-cuda")]
     fn empty_body_returns_default() {
         let dialect = PtxDialect::new(80);
         let mut out = String::new();
@@ -1386,6 +1395,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "jit-hip")]
     fn tier_namespacing() {
         // Different tiers should produce different variable names.
         let ops = vec![

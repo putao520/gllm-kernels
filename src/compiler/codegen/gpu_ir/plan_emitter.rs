@@ -252,8 +252,14 @@ mod tests {
 
         assert!(result.is_ok(), "gpu_emit_plan failed: {:?}", result);
         assert!(out.contains("group_0"), "missing kernel name:\n{out}");
-        assert!(out.contains("input0"), "missing input0 param:\n{out}");
-        assert!(out.contains("input1"), "missing input1 param:\n{out}");
+        assert!(
+            out.contains("input0") || out.contains("__restrict__ A"),
+            "missing first input param:\n{out}",
+        );
+        assert!(
+            out.contains("input1") || out.contains("__restrict__ B"),
+            "missing second input param:\n{out}",
+        );
     }
 
     // ── NormLike dispatch ───────────────────────────────────────────

@@ -384,7 +384,10 @@ fn emit_tree_reduce<D: GpuDialect>(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use super::super::trace_emitter::{HipDialect, MslDialect};
+    #[cfg(feature = "jit-hip")]
+    use super::super::trace_emitter::HipDialect;
+    #[cfg(feature = "jit-metal")]
+    use super::super::trace_emitter::MslDialect;
     use crate::compiler::trace::TraceOp;
 
     /// SiLU body: x / (1 + exp(-x))
@@ -409,6 +412,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "jit-hip")]
     fn hip_elementwise_kernel_compiles() {
         let dialect = HipDialect::new(908);
         let mut out = String::new();
@@ -423,6 +427,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "jit-metal")]
     fn msl_elementwise_kernel_compiles() {
         let dialect = MslDialect::new(9);
         let mut out = String::new();
@@ -436,6 +441,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "jit-hip")]
     fn hip_binary_elementwise_kernel_compiles() {
         let dialect = HipDialect::new(908);
         let mut out = String::new();
@@ -448,6 +454,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "jit-metal")]
     fn msl_binary_elementwise_kernel_compiles() {
         let dialect = MslDialect::new(9);
         let mut out = String::new();
@@ -459,6 +466,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "jit-hip")]
     fn hip_softmax_kernel_structure() {
         let dialect = HipDialect::new(908);
         let mut out = String::new();
@@ -472,6 +480,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "jit-metal")]
     fn msl_softmax_kernel_structure() {
         let dialect = MslDialect::new(9);
         let mut out = String::new();
@@ -483,6 +492,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "jit-hip")]
     fn hip_meanpool_kernel_structure() {
         let dialect = HipDialect::new(908);
         let mut out = String::new();
@@ -495,6 +505,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "jit-metal")]
     fn msl_meanpool_kernel_structure() {
         let dialect = MslDialect::new(9);
         let mut out = String::new();
@@ -505,6 +516,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "jit-hip")]
     fn hip_dequantize_kernel_structure() {
         let dialect = HipDialect::new(908);
         let mut out = String::new();
@@ -517,6 +529,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "jit-hip")]
     fn normlike_kernel_rmsnorm_structure() {
         let dialect = HipDialect::new(908);
         let mut out = String::new();

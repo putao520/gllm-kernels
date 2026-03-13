@@ -181,6 +181,185 @@ fn page_size() -> usize {
     unsafe { libc::sysconf(libc::_SC_PAGESIZE) as usize }
 }
 
+// ── GPU Compiled Layer ──────────────────────────────────────────────
+
+/// GPU 编译层 — 持有 GPU kernel module + launch 参数。
+#[cfg(feature = "jit-cuda")]
+pub struct GpuCompiledKernel {
+    /// 编译后的 GPU module handle
+    module: crate::gpu::cuda::driver::CUmodule,
+    /// Kernel function handle
+    function: crate::gpu::cuda::driver::CUfunction,
+    /// Kernel 名称
+    kernel_name: String,
+    /// Launch 参数
+    pub grid_dim: [u32; 3],
+    pub block_dim: [u32; 3],
+    pub shared_mem_bytes: u32,
+    /// Driver reference (for cleanup)
+    driver: std::sync::Arc<crate::gpu::cuda::driver::CudaDriver>,
+}
+
+#[cfg(feature = "jit-cuda")]
+impl GpuCompiledKernel {
+    /// Kernel 名称。
+    pub fn name(&self) -> &str {
+        &self.kernel_name
+    }
+
+    /// Raw function handle for advanced usage.
+    pub fn function(&self) -> crate::gpu::cuda::driver::CUfunction {
+        self.function
+    }
+}
+
+#[cfg(feature = "jit-cuda")]
+impl Drop for GpuCompiledKernel {
+    fn drop(&mut self) {
+        if self.module != 0 {
+            unsafe { (self.driver.cuModuleUnload)(self.module); }
+        }
+    }
+}
+
+/// GPU 编译层 — 包含一个或多个 GPU kernel。
+#[cfg(feature = "jit-cuda")]
+pub struct GpuCompiledLayer {
+    /// 按 FusionGroup 顺序排列的 kernel 列表
+    kernels: Vec<GpuCompiledKernel>,
+    /// 所需的 scratchpad 大小
+    pub scratchpad_bytes: usize,
+    /// 配置哈希
+    pub config_hash: u64,
+}
+
+#[cfg(feature = "jit-cuda")]
+impl GpuCompiledLayer {
+    /// 从 PTX 文本编译 GPU kernel。
+    pub fn from_ptx(
+        device: &crate::gpu::cuda::device::CudaDevice,
+        ptx_source: &[u8],
+        kernel_names: &[&str],
+        launch_configs: &[crate::gpu::LaunchConfig],
+        scratchpad_bytes: usize,
+        config_hash: u64,
+    ) -> Result<Self, crate::gpu::GpuError> {
+        use crate::gpu::cuda::driver::*;
+        use crate::gpu::GpuError;
+
+        if kernel_names.len() != launch_configs.len() {
+            return Err(GpuError::KernelLaunch(
+                "kernel_names and launch_configs length mismatch".into(),
+            ));
+        }
+
+        let driver = device.driver();
+
+        // Load PTX module
+        let mut module: CUmodule = 0;
+        let res = unsafe { (driver.cuModuleLoadData)(&mut module, ptx_source.as_ptr() as *const _) };
+        if res != CUDA_SUCCESS {
+            return Err(GpuError::ShaderCompilation(format!(
+                "cuModuleLoadData failed with error {res}"
+            )));
+        }
+
+        let mut kernels = Vec::with_capacity(kernel_names.len());
+        for (i, name) in kernel_names.iter().enumerate() {
+            let c_name = std::ffi::CString::new(*name).map_err(|e| {
+                GpuError::KernelLaunch(format!("invalid kernel name: {e}"))
+            })?;
+            let mut function: CUfunction = 0;
+            let res = unsafe {
+                (driver.cuModuleGetFunction)(&mut function, module, c_name.as_ptr())
+            };
+            if res != CUDA_SUCCESS {
+                // Cleanup module on failure
+                unsafe { (driver.cuModuleUnload)(module); }
+                return Err(GpuError::KernelLaunch(format!(
+                    "cuModuleGetFunction({name}) failed with error {res}"
+                )));
+            }
+
+            let lc = &launch_configs[i];
+            kernels.push(GpuCompiledKernel {
+                module: if i == 0 { module } else { 0 }, // Only first kernel owns the module
+                function,
+                kernel_name: name.to_string(),
+                grid_dim: lc.grid_dim,
+                block_dim: lc.block_dim,
+                shared_mem_bytes: lc.shared_mem_bytes,
+                driver: std::sync::Arc::clone(driver),
+            });
+        }
+
+        Ok(GpuCompiledLayer {
+            kernels,
+            scratchpad_bytes,
+            config_hash,
+        })
+    }
+
+    /// 返回 kernel 数量。
+    pub fn num_kernels(&self) -> usize {
+        self.kernels.len()
+    }
+
+    /// 按索引获取 kernel。
+    pub fn kernel(&self, index: usize) -> Option<&GpuCompiledKernel> {
+        self.kernels.get(index)
+    }
+
+    /// 执行所有 kernel（按顺序）。
+    ///
+    /// # Safety
+    /// 调用者必须确保所有 device pointer 有效且 buffer 大小匹配。
+    pub unsafe fn execute(
+        &self,
+        input: u64,
+        weights: u64,
+        output: u64,
+        n_elements: u32,
+        stream: &crate::gpu::cuda::device::CudaStream,
+    ) -> Result<(), crate::gpu::GpuError> {
+        use crate::gpu::cuda::driver::*;
+        use crate::gpu::GpuError;
+
+        for kernel in &self.kernels {
+            let mut input_val = input;
+            let mut weights_val = weights;
+            let mut output_val = output;
+            let mut n_val = n_elements;
+
+            let mut params: [*mut std::ffi::c_void; 4] = [
+                &mut input_val as *mut u64 as *mut _,
+                &mut weights_val as *mut u64 as *mut _,
+                &mut output_val as *mut u64 as *mut _,
+                &mut n_val as *mut u32 as *mut _,
+            ];
+
+            let res = (kernel.driver.cuLaunchKernel)(
+                kernel.function,
+                kernel.grid_dim[0], kernel.grid_dim[1], kernel.grid_dim[2],
+                kernel.block_dim[0], kernel.block_dim[1], kernel.block_dim[2],
+                kernel.shared_mem_bytes,
+                stream.handle(),
+                params.as_mut_ptr(),
+                std::ptr::null_mut(),
+            );
+
+            if res != CUDA_SUCCESS {
+                return Err(GpuError::KernelLaunch(format!(
+                    "cuLaunchKernel({}) failed with error {res}",
+                    kernel.kernel_name
+                )));
+            }
+        }
+
+        Ok(())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -231,5 +410,16 @@ mod tests {
             assert_eq!(layer.scratchpad_bytes, 4096);
             assert_eq!(layer.config_hash, 0x1234);
         }
+    }
+
+    #[cfg(feature = "jit-cuda")]
+    #[test]
+    fn test_gpu_compiled_layer_struct() {
+        // 验证结构体可以构造（不需要真实 GPU）
+        let _lc = crate::gpu::LaunchConfig {
+            grid_dim: [1, 1, 1],
+            block_dim: [256, 1, 1],
+            shared_mem_bytes: 0,
+        };
     }
 }
