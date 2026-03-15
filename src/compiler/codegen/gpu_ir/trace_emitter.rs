@@ -702,6 +702,570 @@ impl GpuDialect for PtxDialect {
             self, out, name, op_kind, epilogue_bodies,
         )
     }
+
+    fn emit_tile_level_fusion_kernel(
+        &self,
+        out: &mut String,
+        name: &str,
+        norm_op: &OpKind,
+        gemm_op: &OpKind,
+        tile_rows: usize,
+        norm_reduce: &[TraceOp],
+        norm_finalize: &[TraceOp],
+        norm_transform: &[TraceOp],
+        shared_mem_budget: usize,
+    ) -> Result<(), String> {
+        ptx_tile_level_fusion(
+            self, out, name, norm_op, gemm_op, tile_rows,
+            norm_reduce, norm_finalize, norm_transform, shared_mem_budget,
+        )
+    }
+
+    fn emit_compute_root_kernel(
+        &self,
+        out: &mut String,
+        name: &str,
+        norm_op: &OpKind,
+        gemm_op: &OpKind,
+        norm_reduce: &[TraceOp],
+        norm_finalize: &[TraceOp],
+        norm_transform: &[TraceOp],
+        shared_mem_budget: usize,
+    ) -> Result<(), String> {
+        ptx_compute_root(
+            self, out, name, norm_op, gemm_op,
+            norm_reduce, norm_finalize, norm_transform, shared_mem_budget,
+        )
+    }
+}
+
+/// PTX: extract norm eps and weight flag from OpKind.
+#[cfg(feature = "jit-cuda")]
+fn ptx_norm_params(norm_op: &OpKind) -> (f32, bool) {
+    let eps = match norm_op {
+        OpKind::RmsNorm { eps } | OpKind::LayerNorm { eps } => *eps,
+        _ => 1e-6,
+    };
+    let has_w = matches!(norm_op, OpKind::RmsNorm { .. } | OpKind::LayerNorm { .. });
+    (eps, has_w)
+}
+
+// ── PTX TileLevelFusion ─────────────────────────────────────────────────────
+
+/// Single fused kernel: Phase 1 cooperative norm → shared memory, Phase 2
+/// tiled GEMM reads from shared memory. Mirrors HipDialect logic in PTX ISA.
+#[cfg(feature = "jit-cuda")]
+#[allow(clippy::too_many_arguments)]
+fn ptx_tile_level_fusion(
+    dialect: &PtxDialect,
+    out: &mut String,
+    name: &str,
+    norm_op: &OpKind,
+    gemm_op: &OpKind,
+    tile_rows: usize,
+    norm_reduce: &[TraceOp],
+    norm_finalize: &[TraceOp],
+    norm_transform: &[TraceOp],
+    shared_mem_budget: usize,
+) -> Result<(), String> {
+    let (_m, _n, k) = match gemm_op {
+        OpKind::Gemm { m, n, k } | OpKind::GemmBias { m, n, k } => (*m, *n, *k),
+        _ => return Err(format!(
+            "TileLevelFusion anchor must be Gemm/GemmBias, got {:?}", gemm_op
+        )),
+    };
+    let (eps, has_nw) = ptx_norm_params(norm_op);
+    let bs = 256usize;
+    let ntf = tile_rows * k;
+    if ntf * 4 > shared_mem_budget {
+        return Err(format!(
+            "TileLevelFusion: norm tile ({} B) > budget ({} B)", ntf * 4, shared_mem_budget
+        ));
+    }
+    let eps_bits = eps.to_bits();
+    let tile_k = 16usize;
+    let btf = tile_k * 16;
+
+    dialect.emit_header(out);
+    // -- kernel signature --
+    writeln!(out, ".visible .entry {name}(").unwrap();
+    writeln!(out, "    .param .u64 param_input,").unwrap();
+    if has_nw { writeln!(out, "    .param .u64 param_nw,").unwrap(); }
+    writeln!(out, "    .param .u64 param_weight,").unwrap();
+    writeln!(out, "    .param .u64 param_output,").unwrap();
+    writeln!(out, "    .param .u32 param_M,").unwrap();
+    writeln!(out, "    .param .u32 param_N,").unwrap();
+    writeln!(out, "    .param .u32 param_K").unwrap();
+    writeln!(out, ")").unwrap();
+    writeln!(out, "{{").unwrap();
+    writeln!(out, "    .reg .u64 %rd<32>;").unwrap();
+    writeln!(out, "    .reg .u32 %r<64>;").unwrap();
+    writeln!(out, "    .reg .f32 %f<64>;").unwrap();
+    writeln!(out, "    .reg .pred %p<16>;").unwrap();
+    writeln!(out, "    .shared .f32 norm_tile[{ntf}];").unwrap();
+    writeln!(out, "    .shared .f32 b_tile[{btf}];").unwrap();
+    writeln!(out).unwrap();
+    // -- load params --
+    writeln!(out, "    ld.param.u64 %rd0, [param_input];").unwrap();
+    let (nw_rd, w_rd, o_rd) = if has_nw {
+        writeln!(out, "    ld.param.u64 %rd1, [param_nw];").unwrap();
+        writeln!(out, "    ld.param.u64 %rd2, [param_weight];").unwrap();
+        writeln!(out, "    ld.param.u64 %rd3, [param_output];").unwrap();
+        (1u32, 2u32, 3u32)
+    } else {
+        writeln!(out, "    ld.param.u64 %rd1, [param_weight];").unwrap();
+        writeln!(out, "    ld.param.u64 %rd2, [param_output];").unwrap();
+        (0u32, 1u32, 2u32)
+    };
+    writeln!(out, "    ld.param.u32 %r0, [param_M];").unwrap();
+    writeln!(out, "    ld.param.u32 %r1, [param_N];").unwrap();
+    writeln!(out, "    ld.param.u32 %r2, [param_K];").unwrap();
+    writeln!(out).unwrap();
+
+    // block_row = blockIdx.x * TILE_ROWS; tid; mc_cur = min(TILE_ROWS, M-block_row)
+    writeln!(out, "    mov.u32 %r3, %ctaid.x;").unwrap();
+    writeln!(out, "    mul.lo.u32 %r3, %r3, {tile_rows};").unwrap();
+    writeln!(out, "    mov.u32 %r4, %tid.x;").unwrap();
+    writeln!(out, "    sub.u32 %r5, %r0, %r3;").unwrap();
+    writeln!(out, "    min.u32 %r5, {tile_rows}, %r5;").unwrap();
+    writeln!(out).unwrap();
+
+    // ── Phase 1: Cooperative norm ──
+    writeln!(out, "    mov.u32 %r6, %r4;").unwrap();
+    writeln!(out, "{name}_P1:").unwrap();
+    writeln!(out, "    setp.ge.u32 %p0, %r6, %r5;").unwrap();
+    writeln!(out, "    @%p0 bra {name}_P1D;").unwrap();
+    // reduce: sum_sq(%f0) over c(%r7)
+    writeln!(out, "    mov.f32 %f0, 0f00000000;").unwrap();
+    writeln!(out, "    mov.u32 %r7, 0;").unwrap();
+    writeln!(out, "{name}_RL:").unwrap();
+    writeln!(out, "    setp.ge.u32 %p1, %r7, %r2;").unwrap();
+    writeln!(out, "    @%p1 bra {name}_RD;").unwrap();
+    // x = input[(block_row+r)*K+c]
+    writeln!(out, "    add.u32 %r8, %r3, %r6;").unwrap();
+    writeln!(out, "    mul.lo.u32 %r8, %r8, %r2;").unwrap();
+    writeln!(out, "    add.u32 %r8, %r8, %r7;").unwrap();
+    writeln!(out, "    mul.wide.u32 %rd10, %r8, 4;").unwrap();
+    writeln!(out, "    add.u64 %rd10, %rd0, %rd10;").unwrap();
+    writeln!(out, "    ld.global.f32 %f1, [%rd10];").unwrap();
+    let rb = vec!["%f1".into(), "%f0".into()];
+    let rr = emit_trace_body(dialect, out, norm_reduce, 10, &rb);
+    writeln!(out, "    add.f32 %f0, %f0, {rr};").unwrap();
+    writeln!(out, "    add.u32 %r7, %r7, 1;").unwrap();
+    writeln!(out, "    bra {name}_RL;").unwrap();
+    writeln!(out, "{name}_RD:").unwrap();
+    // finalize: norm_mean = sum_sq/K
+    writeln!(out, "    cvt.rn.f32.u32 %f2, %r2;").unwrap();
+    writeln!(out, "    div.approx.f32 %f2, %f0, %f2;").unwrap();
+    let fb = vec!["%f2".into()];
+    let inv = emit_trace_body(dialect, out, norm_finalize, 11, &fb);
+    // transform loop: norm_tile[r*K+c] = transform(x, inv[, w])
+    writeln!(out, "    mov.u32 %r7, 0;").unwrap();
+    writeln!(out, "{name}_XL:").unwrap();
+    writeln!(out, "    setp.ge.u32 %p2, %r7, %r2;").unwrap();
+    writeln!(out, "    @%p2 bra {name}_XD;").unwrap();
+    writeln!(out, "    add.u32 %r8, %r3, %r6;").unwrap();
+    writeln!(out, "    mul.lo.u32 %r8, %r8, %r2;").unwrap();
+    writeln!(out, "    add.u32 %r8, %r8, %r7;").unwrap();
+    writeln!(out, "    mul.wide.u32 %rd10, %r8, 4;").unwrap();
+    writeln!(out, "    add.u64 %rd10, %rd0, %rd10;").unwrap();
+    writeln!(out, "    ld.global.f32 %f3, [%rd10];").unwrap();
+    let normed = if has_nw {
+        writeln!(out, "    mul.wide.u32 %rd11, %r7, 4;").unwrap();
+        writeln!(out, "    add.u64 %rd11, %rd{nw_rd}, %rd11;").unwrap();
+        writeln!(out, "    ld.global.f32 %f4, [%rd11];").unwrap();
+        emit_trace_body(dialect, out, norm_transform, 12,
+            &["%f3".into(), inv.clone(), "%f4".into()])
+    } else {
+        emit_trace_body(dialect, out, norm_transform, 12,
+            &["%f3".into(), inv.clone()])
+    };
+    // st.shared norm_tile[r*K+c]
+    writeln!(out, "    mul.lo.u32 %r9, %r6, %r2;").unwrap();
+    writeln!(out, "    add.u32 %r9, %r9, %r7;").unwrap();
+    writeln!(out, "    mul.wide.u32 %rd12, %r9, 4;").unwrap();
+    writeln!(out, "    mov.u64 %rd13, norm_tile;").unwrap();
+    writeln!(out, "    add.u64 %rd12, %rd13, %rd12;").unwrap();
+    writeln!(out, "    st.shared.f32 [%rd12], {normed};").unwrap();
+    writeln!(out, "    add.u32 %r7, %r7, 1;").unwrap();
+    writeln!(out, "    bra {name}_XL;").unwrap();
+    writeln!(out, "{name}_XD:").unwrap();
+    writeln!(out, "    add.u32 %r6, %r6, {bs};").unwrap();
+    writeln!(out, "    bra {name}_P1;").unwrap();
+    writeln!(out, "{name}_P1D:").unwrap();
+    writeln!(out, "    bar.sync 0;").unwrap();
+    writeln!(out).unwrap();
+
+    // ── Phase 2: Tiled GEMM from shared memory ──
+    // ty = tid / 16; tx = tid % 16
+    writeln!(out, "    shr.u32 %r10, %r4, 4;").unwrap();
+    writeln!(out, "    and.b32 %r11, %r4, 15;").unwrap();
+    // col_block loop (%r12)
+    writeln!(out, "    mov.u32 %r12, 0;").unwrap();
+    writeln!(out, "{name}_CB:").unwrap();
+    writeln!(out, "    setp.ge.u32 %p3, %r12, %r1;").unwrap();
+    writeln!(out, "    @%p3 bra {name}_CBD;").unwrap();
+    // row loop: row = ty; row < mc_cur; row += bs/16
+    let rows_per_iter = bs / 16;
+    writeln!(out, "    mov.u32 %r13, %r10;").unwrap();
+    writeln!(out, "{name}_RW:").unwrap();
+    writeln!(out, "    setp.ge.u32 %p4, %r13, %r5;").unwrap();
+    writeln!(out, "    @%p4 bra {name}_RWD;").unwrap();
+    // acc = 0
+    writeln!(out, "    mov.f32 %f10, 0f00000000;").unwrap();
+    // pc loop (%r14): tile over K
+    writeln!(out, "    mov.u32 %r14, 0;").unwrap();
+    writeln!(out, "{name}_PC:").unwrap();
+    writeln!(out, "    setp.ge.u32 %p5, %r14, %r2;").unwrap();
+    writeln!(out, "    @%p5 bra {name}_PCD;").unwrap();
+    // Load B tile: if tid < TILE_K*16
+    writeln!(out, "    setp.ge.u32 %p6, %r4, {btf};").unwrap();
+    writeln!(out, "    @%p6 bra {name}_BLD;").unwrap();
+    // bk = tid/16, bn = tid%16
+    writeln!(out, "    shr.u32 %r15, %r4, 4;").unwrap();
+    writeln!(out, "    and.b32 %r16, %r4, 15;").unwrap();
+    // gk = pc + bk, gn = col_block + bn
+    writeln!(out, "    add.u32 %r17, %r14, %r15;").unwrap();
+    writeln!(out, "    add.u32 %r18, %r12, %r16;").unwrap();
+    // bounds check: gk < K && gn < N
+    writeln!(out, "    setp.lt.u32 %p7, %r17, %r2;").unwrap();
+    writeln!(out, "    setp.lt.u32 %p8, %r18, %r1;").unwrap();
+    writeln!(out, "    and.pred %p7, %p7, %p8;").unwrap();
+    writeln!(out, "    @!%p7 bra {name}_BZ;").unwrap();
+    // b_tile[bk*16+bn] = weight[gk*N+gn]
+    writeln!(out, "    mul.lo.u32 %r19, %r17, %r1;").unwrap();
+    writeln!(out, "    add.u32 %r19, %r19, %r18;").unwrap();
+    writeln!(out, "    mul.wide.u32 %rd14, %r19, 4;").unwrap();
+    writeln!(out, "    add.u64 %rd14, %rd{w_rd}, %rd14;").unwrap();
+    writeln!(out, "    ld.global.f32 %f11, [%rd14];").unwrap();
+    writeln!(out, "    bra {name}_BST;").unwrap();
+    writeln!(out, "{name}_BZ:").unwrap();
+    writeln!(out, "    mov.f32 %f11, 0f00000000;").unwrap();
+    writeln!(out, "{name}_BST:").unwrap();
+    // store to b_tile shared
+    writeln!(out, "    shl.b32 %r20, %r15, 4;").unwrap();
+    writeln!(out, "    add.u32 %r20, %r20, %r16;").unwrap();
+    writeln!(out, "    mul.wide.u32 %rd15, %r20, 4;").unwrap();
+    writeln!(out, "    mov.u64 %rd16, b_tile;").unwrap();
+    writeln!(out, "    add.u64 %rd15, %rd16, %rd15;").unwrap();
+    writeln!(out, "    st.shared.f32 [%rd15], %f11;").unwrap();
+    writeln!(out, "{name}_BLD:").unwrap();
+    writeln!(out, "    bar.sync 0;").unwrap();
+
+    // inner product: kk = 0..TILE_K
+    writeln!(out, "    mov.u32 %r21, 0;").unwrap();
+    writeln!(out, "{name}_KK:").unwrap();
+    writeln!(out, "    setp.ge.u32 %p9, %r21, {tile_k};").unwrap();
+    writeln!(out, "    @%p9 bra {name}_KKD;").unwrap();
+    // gk = pc + kk; bounds check
+    writeln!(out, "    add.u32 %r22, %r14, %r21;").unwrap();
+    writeln!(out, "    setp.ge.u32 %p10, %r22, %r2;").unwrap();
+    writeln!(out, "    @%p10 bra {name}_AZ;").unwrap();
+    // a_val = norm_tile[row*K+gk]
+    writeln!(out, "    mul.lo.u32 %r23, %r13, %r2;").unwrap();
+    writeln!(out, "    add.u32 %r23, %r23, %r22;").unwrap();
+    writeln!(out, "    mul.wide.u32 %rd17, %r23, 4;").unwrap();
+    writeln!(out, "    mov.u64 %rd18, norm_tile;").unwrap();
+    writeln!(out, "    add.u64 %rd17, %rd18, %rd17;").unwrap();
+    writeln!(out, "    ld.shared.f32 %f12, [%rd17];").unwrap();
+    writeln!(out, "    bra {name}_AFMA;").unwrap();
+    writeln!(out, "{name}_AZ:").unwrap();
+    writeln!(out, "    mov.f32 %f12, 0f00000000;").unwrap();
+    writeln!(out, "{name}_AFMA:").unwrap();
+    // b_val = b_tile[kk*16+tx]
+    writeln!(out, "    shl.b32 %r24, %r21, 4;").unwrap();
+    writeln!(out, "    add.u32 %r24, %r24, %r11;").unwrap();
+    writeln!(out, "    mul.wide.u32 %rd19, %r24, 4;").unwrap();
+    writeln!(out, "    mov.u64 %rd20, b_tile;").unwrap();
+    writeln!(out, "    add.u64 %rd19, %rd20, %rd19;").unwrap();
+    writeln!(out, "    ld.shared.f32 %f13, [%rd19];").unwrap();
+    writeln!(out, "    fma.rn.f32 %f10, %f12, %f13, %f10;").unwrap();
+    writeln!(out, "    add.u32 %r21, %r21, 1;").unwrap();
+    writeln!(out, "    bra {name}_KK;").unwrap();
+    writeln!(out, "{name}_KKD:").unwrap();
+    writeln!(out, "    bar.sync 0;").unwrap();
+    // pc += TILE_K
+    writeln!(out, "    add.u32 %r14, %r14, {tile_k};").unwrap();
+    writeln!(out, "    bra {name}_PC;").unwrap();
+    writeln!(out, "{name}_PCD:").unwrap();
+
+    // Store output[out_row*N+out_col]
+    writeln!(out, "    add.u32 %r25, %r3, %r13;").unwrap();
+    writeln!(out, "    add.u32 %r26, %r12, %r11;").unwrap();
+    writeln!(out, "    setp.lt.u32 %p11, %r25, %r0;").unwrap();
+    writeln!(out, "    setp.lt.u32 %p12, %r26, %r1;").unwrap();
+    writeln!(out, "    and.pred %p11, %p11, %p12;").unwrap();
+    writeln!(out, "    @!%p11 bra {name}_NST;").unwrap();
+    writeln!(out, "    mul.lo.u32 %r27, %r25, %r1;").unwrap();
+    writeln!(out, "    add.u32 %r27, %r27, %r26;").unwrap();
+    writeln!(out, "    mul.wide.u32 %rd21, %r27, 4;").unwrap();
+    writeln!(out, "    add.u64 %rd21, %rd{o_rd}, %rd21;").unwrap();
+    writeln!(out, "    st.global.f32 [%rd21], %f10;").unwrap();
+    writeln!(out, "{name}_NST:").unwrap();
+    // row += bs/16
+    writeln!(out, "    add.u32 %r13, %r13, {rows_per_iter};").unwrap();
+    writeln!(out, "    bra {name}_RW;").unwrap();
+    writeln!(out, "{name}_RWD:").unwrap();
+    // col_block += 16
+    writeln!(out, "    add.u32 %r12, %r12, 16;").unwrap();
+    writeln!(out, "    bra {name}_CB;").unwrap();
+    writeln!(out, "{name}_CBD:").unwrap();
+    writeln!(out, "    ret;").unwrap();
+    writeln!(out, "}}").unwrap();
+    writeln!(out).unwrap();
+
+    Ok(())
+}
+
+// ── PTX ComputeRoot ─────────────────────────────────────────────────────────
+
+/// Two-kernel approach: Kernel 1 computes full norm to global memory,
+/// Kernel 2 runs tiled GEMM reading from that buffer.
+#[cfg(feature = "jit-cuda")]
+#[allow(clippy::too_many_arguments)]
+fn ptx_compute_root(
+    dialect: &PtxDialect,
+    out: &mut String,
+    name: &str,
+    norm_op: &OpKind,
+    gemm_op: &OpKind,
+    norm_reduce: &[TraceOp],
+    norm_finalize: &[TraceOp],
+    norm_transform: &[TraceOp],
+    _shared_mem_budget: usize,
+) -> Result<(), String> {
+    let (_m, _n, _k) = match gemm_op {
+        OpKind::Gemm { m, n, k } | OpKind::GemmBias { m, n, k } => (*m, *n, *k),
+        _ => return Err(format!(
+            "ComputeRoot anchor must be Gemm/GemmBias, got {:?}", gemm_op
+        )),
+    };
+    let (eps, has_nw) = ptx_norm_params(norm_op);
+    let _eps_bits = eps.to_bits();
+
+    // ── Kernel 1: Full norm ──
+    dialect.emit_header(out);
+    let nn = format!("{name}_norm");
+    writeln!(out, ".visible .entry {nn}(").unwrap();
+    writeln!(out, "    .param .u64 param_input,").unwrap();
+    if has_nw { writeln!(out, "    .param .u64 param_nw,").unwrap(); }
+    writeln!(out, "    .param .u64 param_normed,").unwrap();
+    writeln!(out, "    .param .u32 param_M,").unwrap();
+    writeln!(out, "    .param .u32 param_K").unwrap();
+    writeln!(out, ")").unwrap();
+    writeln!(out, "{{").unwrap();
+    writeln!(out, "    .reg .u64 %rd<16>;").unwrap();
+    writeln!(out, "    .reg .u32 %r<32>;").unwrap();
+    writeln!(out, "    .reg .f32 %f<32>;").unwrap();
+    writeln!(out, "    .reg .pred %p<8>;").unwrap();
+    writeln!(out).unwrap();
+    writeln!(out, "    ld.param.u64 %rd0, [param_input];").unwrap();
+    let (nw_rd, no_rd) = if has_nw {
+        writeln!(out, "    ld.param.u64 %rd1, [param_nw];").unwrap();
+        writeln!(out, "    ld.param.u64 %rd2, [param_normed];").unwrap();
+        (1u32, 2u32)
+    } else {
+        writeln!(out, "    ld.param.u64 %rd1, [param_normed];").unwrap();
+        (0u32, 1u32)
+    };
+    writeln!(out, "    ld.param.u32 %r0, [param_M];").unwrap();
+    writeln!(out, "    ld.param.u32 %r1, [param_K];").unwrap();
+    // row = blockIdx.x * blockDim.x + threadIdx.x
+    writeln!(out, "    mov.u32 %r2, %ctaid.x;").unwrap();
+    writeln!(out, "    mov.u32 %r3, %ntid.x;").unwrap();
+    writeln!(out, "    mul.lo.u32 %r2, %r2, %r3;").unwrap();
+    writeln!(out, "    mov.u32 %r3, %tid.x;").unwrap();
+    writeln!(out, "    add.u32 %r2, %r2, %r3;").unwrap();
+    writeln!(out, "    setp.ge.u32 %p0, %r2, %r0;").unwrap();
+    writeln!(out, "    @%p0 bra {nn}_RET;").unwrap();
+    writeln!(out).unwrap();
+    // Reduce
+    writeln!(out, "    mov.f32 %f0, 0f00000000;").unwrap();
+    writeln!(out, "    mov.u32 %r4, 0;").unwrap();
+    writeln!(out, "{nn}_RL:").unwrap();
+    writeln!(out, "    setp.ge.u32 %p1, %r4, %r1;").unwrap();
+    writeln!(out, "    @%p1 bra {nn}_RD;").unwrap();
+    writeln!(out, "    mul.lo.u32 %r5, %r2, %r1;").unwrap();
+    writeln!(out, "    add.u32 %r5, %r5, %r4;").unwrap();
+    writeln!(out, "    mul.wide.u32 %rd5, %r5, 4;").unwrap();
+    writeln!(out, "    add.u64 %rd5, %rd0, %rd5;").unwrap();
+    writeln!(out, "    ld.global.f32 %f1, [%rd5];").unwrap();
+    let rb = vec!["%f1".into(), "%f0".into()];
+    let rr = emit_trace_body(dialect, out, norm_reduce, 10, &rb);
+    writeln!(out, "    add.f32 %f0, %f0, {rr};").unwrap();
+    writeln!(out, "    add.u32 %r4, %r4, 1;").unwrap();
+    writeln!(out, "    bra {nn}_RL;").unwrap();
+    writeln!(out, "{nn}_RD:").unwrap();
+    // Finalize
+    writeln!(out, "    cvt.rn.f32.u32 %f2, %r1;").unwrap();
+    writeln!(out, "    div.approx.f32 %f2, %f0, %f2;").unwrap();
+    let fb = vec!["%f2".into()];
+    let inv = emit_trace_body(dialect, out, norm_finalize, 11, &fb);
+    // Transform
+    writeln!(out, "    mov.u32 %r4, 0;").unwrap();
+    writeln!(out, "{nn}_XL:").unwrap();
+    writeln!(out, "    setp.ge.u32 %p2, %r4, %r1;").unwrap();
+    writeln!(out, "    @%p2 bra {nn}_RET;").unwrap();
+    writeln!(out, "    mul.lo.u32 %r5, %r2, %r1;").unwrap();
+    writeln!(out, "    add.u32 %r5, %r5, %r4;").unwrap();
+    writeln!(out, "    mul.wide.u32 %rd5, %r5, 4;").unwrap();
+    writeln!(out, "    add.u64 %rd5, %rd0, %rd5;").unwrap();
+    writeln!(out, "    ld.global.f32 %f3, [%rd5];").unwrap();
+    let normed = if has_nw {
+        writeln!(out, "    mul.wide.u32 %rd6, %r4, 4;").unwrap();
+        writeln!(out, "    add.u64 %rd6, %rd{nw_rd}, %rd6;").unwrap();
+        writeln!(out, "    ld.global.f32 %f4, [%rd6];").unwrap();
+        emit_trace_body(dialect, out, norm_transform, 12,
+            &["%f3".into(), inv.clone(), "%f4".into()])
+    } else {
+        emit_trace_body(dialect, out, norm_transform, 12,
+            &["%f3".into(), inv.clone()])
+    };
+    writeln!(out, "    mul.lo.u32 %r6, %r2, %r1;").unwrap();
+    writeln!(out, "    add.u32 %r6, %r6, %r4;").unwrap();
+    writeln!(out, "    mul.wide.u32 %rd7, %r6, 4;").unwrap();
+    writeln!(out, "    add.u64 %rd7, %rd{no_rd}, %rd7;").unwrap();
+    writeln!(out, "    st.global.f32 [%rd7], {normed};").unwrap();
+    writeln!(out, "    add.u32 %r4, %r4, 1;").unwrap();
+    writeln!(out, "    bra {nn}_XL;").unwrap();
+    writeln!(out, "{nn}_RET:").unwrap();
+    writeln!(out, "    ret;").unwrap();
+    writeln!(out, "}}").unwrap();
+    writeln!(out).unwrap();
+
+    // ── Kernel 2: Tiled GEMM (A=normed, B=weight, C=output) ──
+    ptx_compute_root_gemm(out, name);
+
+    Ok(())
+}
+
+/// Emit the GEMM kernel for ComputeRoot (standard 16x16 tiled GEMM in PTX).
+#[cfg(feature = "jit-cuda")]
+fn ptx_compute_root_gemm(out: &mut String, name: &str) {
+    let gn = format!("{name}_gemm");
+    let ts = 16usize;
+    writeln!(out, ".visible .entry {gn}(").unwrap();
+    writeln!(out, "    .param .u64 param_A,").unwrap();
+    writeln!(out, "    .param .u64 param_B,").unwrap();
+    writeln!(out, "    .param .u64 param_C,").unwrap();
+    writeln!(out, "    .param .u32 param_M,").unwrap();
+    writeln!(out, "    .param .u32 param_N,").unwrap();
+    writeln!(out, "    .param .u32 param_K").unwrap();
+    writeln!(out, ")").unwrap();
+    writeln!(out, "{{").unwrap();
+    writeln!(out, "    .reg .u64 %rd<16>;").unwrap();
+    writeln!(out, "    .reg .u32 %r<32>;").unwrap();
+    writeln!(out, "    .reg .f32 %f<16>;").unwrap();
+    writeln!(out, "    .reg .pred %p<8>;").unwrap();
+    writeln!(out, "    .shared .f32 As[{ts} * {ts}];").unwrap();
+    writeln!(out, "    .shared .f32 Bs[{ts} * {ts}];").unwrap();
+    writeln!(out).unwrap();
+    writeln!(out, "    ld.param.u64 %rd0, [param_A];").unwrap();
+    writeln!(out, "    ld.param.u64 %rd1, [param_B];").unwrap();
+    writeln!(out, "    ld.param.u64 %rd2, [param_C];").unwrap();
+    writeln!(out, "    ld.param.u32 %r0, [param_M];").unwrap();
+    writeln!(out, "    ld.param.u32 %r1, [param_N];").unwrap();
+    writeln!(out, "    ld.param.u32 %r2, [param_K];").unwrap();
+    // row = blockIdx.y*TS + threadIdx.y; col = blockIdx.x*TS + threadIdx.x
+    writeln!(out, "    mov.u32 %r3, %ctaid.y;").unwrap();
+    writeln!(out, "    shl.b32 %r3, %r3, 4;").unwrap();
+    writeln!(out, "    mov.u32 %r4, %tid.y;").unwrap();
+    writeln!(out, "    add.u32 %r3, %r3, %r4;").unwrap();
+    writeln!(out, "    mov.u32 %r5, %ctaid.x;").unwrap();
+    writeln!(out, "    shl.b32 %r5, %r5, 4;").unwrap();
+    writeln!(out, "    mov.u32 %r6, %tid.x;").unwrap();
+    writeln!(out, "    add.u32 %r5, %r5, %r6;").unwrap();
+    writeln!(out, "    mov.f32 %f0, 0f00000000;").unwrap();
+    // num_tiles
+    writeln!(out, "    add.u32 %r7, %r2, {};", ts - 1).unwrap();
+    writeln!(out, "    shr.u32 %r7, %r7, 4;").unwrap();
+    writeln!(out, "    mov.u32 %r8, 0;").unwrap();
+    writeln!(out, "{gn}_TL:").unwrap();
+    writeln!(out, "    setp.ge.u32 %p0, %r8, %r7;").unwrap();
+    writeln!(out, "    @%p0 bra {gn}_TD;").unwrap();
+    // ak = t*TS+tx, bk = t*TS+ty
+    writeln!(out, "    shl.b32 %r9, %r8, 4;").unwrap();
+    writeln!(out, "    add.u32 %r10, %r9, %r6;").unwrap();
+    writeln!(out, "    add.u32 %r11, %r9, %r4;").unwrap();
+    // Load As
+    writeln!(out, "    setp.lt.u32 %p1, %r3, %r0;").unwrap();
+    writeln!(out, "    setp.lt.u32 %p2, %r10, %r2;").unwrap();
+    writeln!(out, "    and.pred %p1, %p1, %p2;").unwrap();
+    writeln!(out, "    @!%p1 bra {gn}_AZ;").unwrap();
+    writeln!(out, "    mul.lo.u32 %r12, %r3, %r2;").unwrap();
+    writeln!(out, "    add.u32 %r12, %r12, %r10;").unwrap();
+    writeln!(out, "    mul.wide.u32 %rd5, %r12, 4;").unwrap();
+    writeln!(out, "    add.u64 %rd5, %rd0, %rd5;").unwrap();
+    writeln!(out, "    ld.global.f32 %f1, [%rd5];").unwrap();
+    writeln!(out, "    bra {gn}_AST;").unwrap();
+    writeln!(out, "{gn}_AZ:").unwrap();
+    writeln!(out, "    mov.f32 %f1, 0f00000000;").unwrap();
+    writeln!(out, "{gn}_AST:").unwrap();
+    // ty*TS+tx index for shared
+    writeln!(out, "    shl.b32 %r13, %r4, 4;").unwrap();
+    writeln!(out, "    add.u32 %r13, %r13, %r6;").unwrap();
+    writeln!(out, "    mul.wide.u32 %rd6, %r13, 4;").unwrap();
+    writeln!(out, "    mov.u64 %rd7, As;").unwrap();
+    writeln!(out, "    add.u64 %rd6, %rd7, %rd6;").unwrap();
+    writeln!(out, "    st.shared.f32 [%rd6], %f1;").unwrap();
+    // Load Bs
+    writeln!(out, "    setp.lt.u32 %p3, %r11, %r2;").unwrap();
+    writeln!(out, "    setp.lt.u32 %p4, %r5, %r1;").unwrap();
+    writeln!(out, "    and.pred %p3, %p3, %p4;").unwrap();
+    writeln!(out, "    @!%p3 bra {gn}_BZ;").unwrap();
+    writeln!(out, "    mul.lo.u32 %r14, %r11, %r1;").unwrap();
+    writeln!(out, "    add.u32 %r14, %r14, %r5;").unwrap();
+    writeln!(out, "    mul.wide.u32 %rd8, %r14, 4;").unwrap();
+    writeln!(out, "    add.u64 %rd8, %rd1, %rd8;").unwrap();
+    writeln!(out, "    ld.global.f32 %f2, [%rd8];").unwrap();
+    writeln!(out, "    bra {gn}_BST;").unwrap();
+    writeln!(out, "{gn}_BZ:").unwrap();
+    writeln!(out, "    mov.f32 %f2, 0f00000000;").unwrap();
+    writeln!(out, "{gn}_BST:").unwrap();
+    writeln!(out, "    mul.wide.u32 %rd9, %r13, 4;").unwrap();
+    writeln!(out, "    mov.u64 %rd10, Bs;").unwrap();
+    writeln!(out, "    add.u64 %rd9, %rd10, %rd9;").unwrap();
+    writeln!(out, "    st.shared.f32 [%rd9], %f2;").unwrap();
+    writeln!(out, "    bar.sync 0;").unwrap();
+    // Inner product kk=0..TS
+    writeln!(out, "    mov.u32 %r15, 0;").unwrap();
+    writeln!(out, "{gn}_KK:").unwrap();
+    writeln!(out, "    setp.ge.u32 %p5, %r15, {ts};").unwrap();
+    writeln!(out, "    @%p5 bra {gn}_KKD;").unwrap();
+    writeln!(out, "    shl.b32 %r16, %r4, 4;").unwrap();
+    writeln!(out, "    add.u32 %r16, %r16, %r15;").unwrap();
+    writeln!(out, "    mul.wide.u32 %rd11, %r16, 4;").unwrap();
+    writeln!(out, "    mov.u64 %rd12, As;").unwrap();
+    writeln!(out, "    add.u64 %rd11, %rd12, %rd11;").unwrap();
+    writeln!(out, "    ld.shared.f32 %f3, [%rd11];").unwrap();
+    writeln!(out, "    shl.b32 %r17, %r15, 4;").unwrap();
+    writeln!(out, "    add.u32 %r17, %r17, %r6;").unwrap();
+    writeln!(out, "    mul.wide.u32 %rd13, %r17, 4;").unwrap();
+    writeln!(out, "    mov.u64 %rd14, Bs;").unwrap();
+    writeln!(out, "    add.u64 %rd13, %rd14, %rd13;").unwrap();
+    writeln!(out, "    ld.shared.f32 %f4, [%rd13];").unwrap();
+    writeln!(out, "    fma.rn.f32 %f0, %f3, %f4, %f0;").unwrap();
+    writeln!(out, "    add.u32 %r15, %r15, 1;").unwrap();
+    writeln!(out, "    bra {gn}_KK;").unwrap();
+    writeln!(out, "{gn}_KKD:").unwrap();
+    writeln!(out, "    bar.sync 0;").unwrap();
+    writeln!(out, "    add.u32 %r8, %r8, 1;").unwrap();
+    writeln!(out, "    bra {gn}_TL;").unwrap();
+    writeln!(out, "{gn}_TD:").unwrap();
+    // Store C
+    writeln!(out, "    setp.lt.u32 %p6, %r3, %r0;").unwrap();
+    writeln!(out, "    setp.lt.u32 %p7, %r5, %r1;").unwrap();
+    writeln!(out, "    and.pred %p6, %p6, %p7;").unwrap();
+    writeln!(out, "    @!%p6 bra {gn}_RET;").unwrap();
+    writeln!(out, "    mul.lo.u32 %r18, %r3, %r1;").unwrap();
+    writeln!(out, "    add.u32 %r18, %r18, %r5;").unwrap();
+    writeln!(out, "    mul.wide.u32 %rd15, %r18, 4;").unwrap();
+    writeln!(out, "    add.u64 %rd15, %rd2, %rd15;").unwrap();
+    writeln!(out, "    st.global.f32 [%rd15], %f0;").unwrap();
+    writeln!(out, "{gn}_RET:").unwrap();
+    writeln!(out, "    ret;").unwrap();
+    writeln!(out, "}}").unwrap();
+    writeln!(out).unwrap();
 }
 
 // ── HipDialect ──────────────────────────────────────────────────────────────
@@ -1515,10 +2079,7 @@ impl GpuDialect for MslDialect {
                 if self.gpu_family >= 7 {
                     emit_gemm_simdgroup_msl(out, name, *m, *n, *k);
                 } else {
-                    // Use unified tiled GEMM builder for older GPU families
-                    return super::kernel_builder::build_gemm_tiled_kernel(
-                        self, out, name, false, &[],
-                    );
+                    emit_gemm_kernel_msl(out, name, *m, *n, *k);
                 }
                 Ok(())
             }
@@ -1526,10 +2087,7 @@ impl GpuDialect for MslDialect {
                 if self.gpu_family >= 7 {
                     emit_gemm_bias_simdgroup_msl(out, name, *m, *n, *k);
                 } else {
-                    // Use unified tiled GEMM builder for older GPU families
-                    return super::kernel_builder::build_gemm_tiled_kernel(
-                        self, out, name, true, &[],
-                    );
+                    emit_gemm_bias_kernel_msl(out, name, *m, *n, *k);
                 }
                 Ok(())
             }
@@ -1542,7 +2100,7 @@ impl GpuDialect for MslDialect {
                 Ok(())
             }
             OpKind::MultiHeadAttention { seq_len, num_heads, head_dim } => {
-                super::kernel_builder::build_mha_kernel(self, out, name, *seq_len, *num_heads, *head_dim);
+                emit_mha_kernel_msl(out, name, *seq_len, *num_heads, *head_dim);
                 Ok(())
             }
             _ => Err(format!("MslDialect: unsupported Gemm-pattern op {:?}", op_kind)),
@@ -1557,7 +2115,7 @@ impl GpuDialect for MslDialect {
         num_heads: usize,
         head_dim: usize,
     ) {
-        super::kernel_builder::build_mha_kernel(self, out, name, seq_len, num_heads, head_dim);
+        crate::compiler::codegen::air::emit_mha_kernel_msl(out, name, seq_len, num_heads, head_dim);
     }
 
     fn emit_rope_kernel(
@@ -1642,9 +2200,286 @@ impl GpuDialect for MslDialect {
         op_kind: &OpKind,
         epilogue_bodies: &[&[TraceOp]],
     ) -> Result<(), String> {
-        super::kernel_builder::build_gemm_epilogue_kernel(
-            self, out, name, op_kind, epilogue_bodies,
-        )
+        let (_m, _n, _k) = match op_kind {
+            OpKind::Gemm { m, n, k } | OpKind::GemmBias { m, n, k } => (*m, *n, *k),
+            _ => return Err(format!(
+                "MslDialect emit_gemm_epilogue_kernel: expected Gemm/GemmBias, got {:?}", op_kind
+            )),
+        };
+        let has_bias = matches!(op_kind, OpKind::GemmBias { .. });
+        let tile_size = 16usize;
+        let mut buf_idx = 0u32;
+        writeln!(out, "kernel void {name}(").unwrap();
+        writeln!(out, "    device const float* A [[buffer({buf_idx})]],").unwrap(); buf_idx += 1;
+        writeln!(out, "    device const float* B [[buffer({buf_idx})]],").unwrap(); buf_idx += 1;
+        if has_bias {
+            writeln!(out, "    device const float* bias [[buffer({buf_idx})]],").unwrap(); buf_idx += 1;
+        }
+        writeln!(out, "    device float* C [[buffer({buf_idx})]],").unwrap(); buf_idx += 1;
+        writeln!(out, "    constant uint& M [[buffer({buf_idx})]],").unwrap(); buf_idx += 1;
+        writeln!(out, "    constant uint& N [[buffer({buf_idx})]],").unwrap(); buf_idx += 1;
+        writeln!(out, "    constant uint& K_dim [[buffer({buf_idx})]],").unwrap();
+        writeln!(out, "    uint2 lid [[thread_position_in_threadgroup]],").unwrap();
+        writeln!(out, "    uint2 gid [[threadgroup_position_in_grid]]").unwrap();
+        writeln!(out, ") {{").unwrap();
+        writeln!(out, "    const uint TILE = {tile_size};").unwrap();
+        writeln!(out, "    threadgroup float As[{tile_size} * {tile_size}];").unwrap();
+        writeln!(out, "    threadgroup float Bs[{tile_size} * {tile_size}];").unwrap();
+        writeln!(out, "    uint row = gid.y * TILE + lid.y;").unwrap();
+        writeln!(out, "    uint col = gid.x * TILE + lid.x;").unwrap();
+        writeln!(out, "    float acc = 0.0f;").unwrap();
+        writeln!(out).unwrap();
+        writeln!(out, "    for (uint t = 0; t < (K_dim + TILE - 1) / TILE; t++) {{").unwrap();
+        writeln!(out, "        uint ak = t * TILE + lid.x;").unwrap();
+        writeln!(out, "        uint bk = t * TILE + lid.y;").unwrap();
+        writeln!(out, "        As[lid.y * TILE + lid.x] = (row < M && ak < K_dim) ? A[row * K_dim + ak] : 0.0f;").unwrap();
+        writeln!(out, "        Bs[lid.y * TILE + lid.x] = (bk < K_dim && col < N) ? B[bk * N + col] : 0.0f;").unwrap();
+        writeln!(out, "        threadgroup_barrier(mem_flags::mem_threadgroup);").unwrap();
+        writeln!(out, "        for (uint kk = 0; kk < TILE; kk++) {{").unwrap();
+        writeln!(out, "            acc = fma(As[lid.y * TILE + kk], Bs[kk * TILE + lid.x], acc);").unwrap();
+        writeln!(out, "        }}").unwrap();
+        writeln!(out, "        threadgroup_barrier(mem_flags::mem_threadgroup);").unwrap();
+        writeln!(out, "    }}").unwrap();
+        if has_bias { writeln!(out, "    if (col < N) acc += bias[col];").unwrap(); }
+        let mut prev = "acc".to_string();
+        for (ei, body) in epilogue_bodies.iter().enumerate() {
+            let b = vec![prev.clone()];
+            prev = emit_trace_body(self, out, body, 20 + ei, &b);
+        }
+        writeln!(out, "    if (row < M && col < N) C[row * N + col] = {prev};").unwrap();
+        writeln!(out, "}}\n").unwrap();
+        Ok(())
+    }
+
+    fn emit_tile_level_fusion_kernel(
+        &self,
+        out: &mut String,
+        name: &str,
+        norm_op: &OpKind,
+        gemm_op: &OpKind,
+        tile_rows: usize,
+        norm_reduce: &[TraceOp],
+        norm_finalize: &[TraceOp],
+        norm_transform: &[TraceOp],
+        shared_mem_budget: usize,
+    ) -> Result<(), String> {
+        let (_m, _n, k) = match gemm_op {
+            OpKind::Gemm { m, n, k } | OpKind::GemmBias { m, n, k } => (*m, *n, *k),
+            _ => return Err(format!(
+                "TileLevelFusion anchor must be Gemm/GemmBias, got {:?}", gemm_op
+            )),
+        };
+        let eps = match norm_op {
+            OpKind::RmsNorm { eps } | OpKind::LayerNorm { eps } => *eps,
+            _ => 1e-6,
+        };
+        let has_norm_weight = matches!(
+            norm_op, OpKind::RmsNorm { .. } | OpKind::LayerNorm { .. }
+        );
+        let block_size = 256usize;
+        let norm_tile_floats = tile_rows * k;
+        let norm_tile_bytes = norm_tile_floats * 4;
+        if norm_tile_bytes > shared_mem_budget {
+            return Err(format!(
+                "TileLevelFusion: norm tile ({} bytes) exceeds shared_mem budget ({} bytes)",
+                norm_tile_bytes, shared_mem_budget
+            ));
+        }
+        let eps_bits = eps.to_bits();
+        let mut buf_idx = 0u32;
+        writeln!(out, "kernel void {name}(").unwrap();
+        writeln!(out, "    device const float* input [[buffer({buf_idx})]],").unwrap(); buf_idx += 1;
+        if has_norm_weight {
+            writeln!(out, "    device const float* norm_weight [[buffer({buf_idx})]],").unwrap(); buf_idx += 1;
+        }
+        writeln!(out, "    device const float* weight [[buffer({buf_idx})]],").unwrap(); buf_idx += 1;
+        writeln!(out, "    device float* output [[buffer({buf_idx})]],").unwrap(); buf_idx += 1;
+        writeln!(out, "    constant uint& M [[buffer({buf_idx})]],").unwrap(); buf_idx += 1;
+        writeln!(out, "    constant uint& N [[buffer({buf_idx})]],").unwrap(); buf_idx += 1;
+        writeln!(out, "    constant uint& K_dim [[buffer({buf_idx})]],").unwrap();
+        writeln!(out, "    uint lid [[thread_position_in_threadgroup]],").unwrap();
+        writeln!(out, "    uint gid [[threadgroup_position_in_grid]]").unwrap();
+        writeln!(out, ") {{").unwrap();
+        writeln!(out, "    const uint TILE_ROWS = {tile_rows};").unwrap();
+        writeln!(out, "    const float eps = as_type<float>(0x{eps_bits:08X}u);").unwrap();
+        writeln!(out, "    threadgroup float norm_tile[{norm_tile_floats}];").unwrap();
+        writeln!(out).unwrap();
+        writeln!(out, "    uint block_row = gid * TILE_ROWS;").unwrap();
+        writeln!(out, "    uint mc_cur = min(TILE_ROWS, M - block_row);").unwrap();
+        writeln!(out).unwrap();
+        // Phase 1: Cooperative norm
+        writeln!(out, "    // Phase 1: Cooperative norm for tile rows").unwrap();
+        writeln!(out, "    for (uint r = lid; r < mc_cur; r += {block_size}) {{").unwrap();
+        writeln!(out, "        float sum_sq = 0.0f;").unwrap();
+        writeln!(out, "        for (uint c = 0; c < K_dim; c++) {{").unwrap();
+        writeln!(out, "            float x = input[(block_row + r) * K_dim + c];").unwrap();
+        let reduce_bindings = vec!["x".to_string(), "sum_sq".to_string()];
+        let reduce_result = emit_trace_body(self, out, norm_reduce, 10, &reduce_bindings);
+        writeln!(out, "            sum_sq += {reduce_result};").unwrap();
+        writeln!(out, "        }}").unwrap();
+        writeln!(out, "        float norm_mean = sum_sq / float(K_dim);").unwrap();
+        let finalize_bindings = vec!["norm_mean".to_string()];
+        let inv_rms = emit_trace_body(self, out, norm_finalize, 11, &finalize_bindings);
+        writeln!(out).unwrap();
+        writeln!(out, "        for (uint c = 0; c < K_dim; c++) {{").unwrap();
+        writeln!(out, "            float x = input[(block_row + r) * K_dim + c];").unwrap();
+        if has_norm_weight {
+            let transform_bindings = vec![
+                "x".to_string(), inv_rms.clone(), "norm_weight[c]".to_string(),
+            ];
+            let normed = emit_trace_body(self, out, norm_transform, 12, &transform_bindings);
+            writeln!(out, "            norm_tile[r * K_dim + c] = {normed};").unwrap();
+        } else {
+            let transform_bindings = vec!["x".to_string(), inv_rms.clone()];
+            let normed = emit_trace_body(self, out, norm_transform, 12, &transform_bindings);
+            writeln!(out, "            norm_tile[r * K_dim + c] = {normed};").unwrap();
+        }
+        writeln!(out, "        }}").unwrap();
+        writeln!(out, "    }}").unwrap();
+        writeln!(out, "    threadgroup_barrier(mem_flags::mem_threadgroup);").unwrap();
+        writeln!(out).unwrap();
+        // Phase 2: Tiled GEMM
+        let tile_k = 16usize;
+        writeln!(out, "    // Phase 2: Tiled GEMM from threadgroup memory").unwrap();
+        writeln!(out, "    const uint TILE_N = 16;").unwrap();
+        writeln!(out, "    const uint TILE_K = {tile_k};").unwrap();
+        writeln!(out, "    threadgroup float b_tile[{tile_k} * 16];").unwrap();
+        writeln!(out).unwrap();
+        writeln!(out, "    uint ty = lid / TILE_N;").unwrap();
+        writeln!(out, "    uint tx = lid % TILE_N;").unwrap();
+        writeln!(out).unwrap();
+        writeln!(out, "    for (uint col_block = 0; col_block < N; col_block += TILE_N) {{").unwrap();
+        writeln!(out, "        for (uint row = ty; row < mc_cur; row += ({block_size} / TILE_N)) {{").unwrap();
+        writeln!(out, "            float acc = 0.0f;").unwrap();
+        writeln!(out, "            for (uint pc = 0; pc < K_dim; pc += TILE_K) {{").unwrap();
+        writeln!(out, "                if (lid < TILE_K * TILE_N) {{").unwrap();
+        writeln!(out, "                    uint bk = lid / TILE_N;").unwrap();
+        writeln!(out, "                    uint bn = lid % TILE_N;").unwrap();
+        writeln!(out, "                    uint gk = pc + bk;").unwrap();
+        writeln!(out, "                    uint gn = col_block + bn;").unwrap();
+        writeln!(out, "                    b_tile[bk * TILE_N + bn] = (gk < K_dim && gn < N) ? weight[gk * N + gn] : 0.0f;").unwrap();
+        writeln!(out, "                }}").unwrap();
+        writeln!(out, "                threadgroup_barrier(mem_flags::mem_threadgroup);").unwrap();
+        writeln!(out, "                for (uint kk = 0; kk < TILE_K; kk++) {{").unwrap();
+        writeln!(out, "                    uint gk = pc + kk;").unwrap();
+        writeln!(out, "                    float a_val = (gk < K_dim) ? norm_tile[row * K_dim + gk] : 0.0f;").unwrap();
+        writeln!(out, "                    acc = fma(a_val, b_tile[kk * TILE_N + tx], acc);").unwrap();
+        writeln!(out, "                }}").unwrap();
+        writeln!(out, "                threadgroup_barrier(mem_flags::mem_threadgroup);").unwrap();
+        writeln!(out, "            }}").unwrap();
+        writeln!(out, "            uint out_row = block_row + row;").unwrap();
+        writeln!(out, "            uint out_col = col_block + tx;").unwrap();
+        writeln!(out, "            if (out_row < M && out_col < N) {{").unwrap();
+        writeln!(out, "                output[out_row * N + out_col] = acc;").unwrap();
+        writeln!(out, "            }}").unwrap();
+        writeln!(out, "        }}").unwrap();
+        writeln!(out, "    }}").unwrap();
+        writeln!(out, "}}\n").unwrap();
+        Ok(())
+    }
+
+    fn emit_compute_root_kernel(
+        &self,
+        out: &mut String,
+        name: &str,
+        norm_op: &OpKind,
+        gemm_op: &OpKind,
+        norm_reduce: &[TraceOp],
+        norm_finalize: &[TraceOp],
+        norm_transform: &[TraceOp],
+        _shared_mem_budget: usize,
+    ) -> Result<(), String> {
+        let (_m, _n, _k) = match gemm_op {
+            OpKind::Gemm { m, n, k } | OpKind::GemmBias { m, n, k } => (*m, *n, *k),
+            _ => return Err(format!(
+                "ComputeRoot anchor must be Gemm/GemmBias, got {:?}", gemm_op
+            )),
+        };
+        let eps = match norm_op {
+            OpKind::RmsNorm { eps } | OpKind::LayerNorm { eps } => *eps,
+            _ => 1e-6,
+        };
+        let has_norm_weight = matches!(
+            norm_op, OpKind::RmsNorm { .. } | OpKind::LayerNorm { .. }
+        );
+        let eps_bits = eps.to_bits();
+        // Kernel 1: Full norm to device memory
+        let norm_name = format!("{name}_norm");
+        let mut buf_idx = 0u32;
+        writeln!(out, "kernel void {norm_name}(").unwrap();
+        writeln!(out, "    device const float* input [[buffer({buf_idx})]],").unwrap(); buf_idx += 1;
+        if has_norm_weight {
+            writeln!(out, "    device const float* norm_weight [[buffer({buf_idx})]],").unwrap(); buf_idx += 1;
+        }
+        writeln!(out, "    device float* normed [[buffer({buf_idx})]],").unwrap(); buf_idx += 1;
+        writeln!(out, "    constant uint& M [[buffer({buf_idx})]],").unwrap(); buf_idx += 1;
+        writeln!(out, "    constant uint& K_dim [[buffer({buf_idx})]],").unwrap();
+        writeln!(out, "    uint tid [[thread_position_in_grid]]").unwrap();
+        writeln!(out, ") {{").unwrap();
+        writeln!(out, "    const float eps = as_type<float>(0x{eps_bits:08X}u);").unwrap();
+        writeln!(out, "    uint row = tid;").unwrap();
+        writeln!(out, "    if (row >= M) return;").unwrap();
+        writeln!(out).unwrap();
+        writeln!(out, "    float sum_sq = 0.0f;").unwrap();
+        writeln!(out, "    for (uint c = 0; c < K_dim; c++) {{").unwrap();
+        writeln!(out, "        float x = input[row * K_dim + c];").unwrap();
+        let reduce_bindings = vec!["x".to_string(), "sum_sq".to_string()];
+        let reduce_result = emit_trace_body(self, out, norm_reduce, 10, &reduce_bindings);
+        writeln!(out, "        sum_sq += {reduce_result};").unwrap();
+        writeln!(out, "    }}").unwrap();
+        writeln!(out, "    float norm_mean = sum_sq / float(K_dim);").unwrap();
+        let finalize_bindings = vec!["norm_mean".to_string()];
+        let inv_rms = emit_trace_body(self, out, norm_finalize, 11, &finalize_bindings);
+        writeln!(out).unwrap();
+        writeln!(out, "    for (uint c = 0; c < K_dim; c++) {{").unwrap();
+        writeln!(out, "        float x = input[row * K_dim + c];").unwrap();
+        if has_norm_weight {
+            let transform_bindings = vec![
+                "x".to_string(), inv_rms.clone(), "norm_weight[c]".to_string(),
+            ];
+            let normed = emit_trace_body(self, out, norm_transform, 12, &transform_bindings);
+            writeln!(out, "        normed[row * K_dim + c] = {normed};").unwrap();
+        } else {
+            let transform_bindings = vec!["x".to_string(), inv_rms.clone()];
+            let normed = emit_trace_body(self, out, norm_transform, 12, &transform_bindings);
+            writeln!(out, "        normed[row * K_dim + c] = {normed};").unwrap();
+        }
+        writeln!(out, "    }}").unwrap();
+        writeln!(out, "}}\n").unwrap();
+        // Kernel 2: Standard tiled GEMM
+        let gemm_name = format!("{name}_gemm");
+        let tile_size = 16usize;
+        writeln!(out, "kernel void {gemm_name}(").unwrap();
+        writeln!(out, "    device const float* A [[buffer(0)]],").unwrap();
+        writeln!(out, "    device const float* B [[buffer(1)]],").unwrap();
+        writeln!(out, "    device float* C [[buffer(2)]],").unwrap();
+        writeln!(out, "    constant uint& M [[buffer(3)]],").unwrap();
+        writeln!(out, "    constant uint& N [[buffer(4)]],").unwrap();
+        writeln!(out, "    constant uint& K_dim [[buffer(5)]],").unwrap();
+        writeln!(out, "    uint2 lid [[thread_position_in_threadgroup]],").unwrap();
+        writeln!(out, "    uint2 gid [[threadgroup_position_in_grid]]").unwrap();
+        writeln!(out, ") {{").unwrap();
+        writeln!(out, "    const uint TILE_SIZE = {tile_size};").unwrap();
+        writeln!(out, "    threadgroup float As[{tile_size} * {tile_size}];").unwrap();
+        writeln!(out, "    threadgroup float Bs[{tile_size} * {tile_size}];").unwrap();
+        writeln!(out, "    uint row = gid.y * TILE_SIZE + lid.y;").unwrap();
+        writeln!(out, "    uint col = gid.x * TILE_SIZE + lid.x;").unwrap();
+        writeln!(out, "    float acc = 0.0f;").unwrap();
+        writeln!(out).unwrap();
+        writeln!(out, "    for (uint t = 0; t < (K_dim + TILE_SIZE - 1) / TILE_SIZE; t++) {{").unwrap();
+        writeln!(out, "        uint ak = t * TILE_SIZE + lid.x;").unwrap();
+        writeln!(out, "        uint bk = t * TILE_SIZE + lid.y;").unwrap();
+        writeln!(out, "        As[lid.y * TILE_SIZE + lid.x] = (row < M && ak < K_dim) ? A[row * K_dim + ak] : 0.0f;").unwrap();
+        writeln!(out, "        Bs[lid.y * TILE_SIZE + lid.x] = (bk < K_dim && col < N) ? B[bk * N + col] : 0.0f;").unwrap();
+        writeln!(out, "        threadgroup_barrier(mem_flags::mem_threadgroup);").unwrap();
+        writeln!(out, "        for (uint kk = 0; kk < TILE_SIZE; kk++) {{").unwrap();
+        writeln!(out, "            acc = fma(As[lid.y * TILE_SIZE + kk], Bs[kk * TILE_SIZE + lid.x], acc);").unwrap();
+        writeln!(out, "        }}").unwrap();
+        writeln!(out, "        threadgroup_barrier(mem_flags::mem_threadgroup);").unwrap();
+        writeln!(out, "    }}").unwrap();
+        writeln!(out, "    if (row < M && col < N) C[row * N + col] = acc;").unwrap();
+        writeln!(out, "}}\n").unwrap();
+        Ok(())
     }
 }
 

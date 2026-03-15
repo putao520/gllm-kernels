@@ -1062,3 +1062,209 @@ mod tests {
         );
     }
 }
+
+// ── MSL TileLevelFusion / ComputeRoot tests ─────────────────────────────────
+
+#[cfg(all(test, feature = "jit-metal"))]
+mod msl_tests {
+    use super::*;
+    use super::super::trace_emitter::MslDialect;
+    use crate::compiler::fusion::{FusionGroup, FusionMode, FusionPlan};
+    use crate::compiler::graph::{CompilerGraph, OpId, OpKind};
+    use crate::compiler::registry::{OpKindKey, ScalarOpRegistry};
+    use crate::compiler::trace::{ComputePattern, OpTrace, ScalarFnSignature, ScalarParam, TraceOp};
+    use crate::types::DType;
+    use std::collections::HashMap;
+
+    fn dummy_sig() -> ScalarFnSignature {
+        ScalarFnSignature {
+            fn_ptr: std::ptr::null(),
+            params: vec![ScalarParam::InputPtr, ScalarParam::OutputPtr, ScalarParam::Dim(0)],
+        }
+    }
+
+    fn norm_gemm_graph() -> (CompilerGraph, OpId, OpId) {
+        let mut g = CompilerGraph::new();
+        let t_in = g.add_tensor("in", vec![64, 64], DType::F32);
+        let t_normed = g.add_tensor("normed", vec![64, 64], DType::F32);
+        let t_weight = g.add_tensor("weight", vec![64, 64], DType::F32);
+        let t_out = g.add_tensor("out", vec![64, 64], DType::F32);
+        let norm_op = g.add_op(
+            OpKind::RmsNorm { eps: 1e-6 },
+            vec![t_in], vec![t_normed], "rmsnorm",
+        );
+        let gemm_op = g.add_op(
+            OpKind::Gemm { m: 64, n: 64, k: 64 },
+            vec![t_normed, t_weight], vec![t_out], "gemm",
+        );
+        (g, norm_op, gemm_op)
+    }
+
+    fn rmsnorm_trace() -> (Vec<TraceOp>, Vec<TraceOp>, Vec<TraceOp>) {
+        let reduce = vec![TraceOp::Input(0), TraceOp::Mul(0, 0)];
+        let finalize = vec![TraceOp::Input(0), TraceOp::Rsqrt(0)];
+        let transform = vec![
+            TraceOp::Input(0), TraceOp::Input(1), TraceOp::Mul(0, 1),
+            TraceOp::Input(2), TraceOp::Mul(2, 3),
+        ];
+        (reduce, finalize, transform)
+    }
+
+    #[test]
+    fn msl_tile_level_fusion_emits_fused_kernel() {
+        let (graph, norm_op, gemm_op) = norm_gemm_graph();
+        let (reduce, finalize, transform) = rmsnorm_trace();
+
+        let plan = FusionPlan {
+            groups: vec![FusionGroup {
+                id: 0,
+                anchor: gemm_op,
+                epilogue: vec![],
+                mode: FusionMode::TileLevelFusion {
+                    predecessor: norm_op,
+                    tile_rows: 32,
+                },
+                ops: vec![norm_op, gemm_op],
+            }],
+            op_to_group: {
+                let mut m = HashMap::new();
+                m.insert(norm_op, 0);
+                m.insert(gemm_op, 0);
+                m
+            },
+        };
+
+        let mut reg = ScalarOpRegistry::new();
+        reg.inject_trace(OpKindKey::RmsNorm, OpTrace {
+            op_kind: OpKind::RmsNorm { eps: 1e-6 },
+            pattern: ComputePattern::NormLike { reduce, finalize, transform },
+            signature: dummy_sig(),
+        });
+
+        let dialect = MslDialect::new(9);
+        let mut out = String::new();
+        dialect.emit_header(&mut out);
+        let result = gpu_emit_plan(&dialect, &mut out, &plan, &graph, Some(&reg), None);
+
+        assert!(result.is_ok(), "MSL TileLevelFusion failed: {:?}", result);
+        assert!(out.contains("kernel void group_0("), "missing kernel sig:\n{out}");
+        assert!(out.contains("threadgroup float norm_tile["), "missing norm_tile:\n{out}");
+        assert!(out.contains("threadgroup_barrier(mem_flags::mem_threadgroup)"), "missing barrier:\n{out}");
+        assert!(out.contains("rsqrt("), "missing rsqrt:\n{out}");
+        assert!(out.contains("fma("), "missing fma:\n{out}");
+        assert!(out.contains("device const float* input"), "missing input:\n{out}");
+        assert!(out.contains("device const float* norm_weight"), "missing norm_weight:\n{out}");
+        assert!(out.contains("[[buffer("), "missing buffer attr:\n{out}");
+        assert!(!out.contains("__shared__"), "leaked __shared__:\n{out}");
+        assert!(!out.contains("__syncthreads"), "leaked __syncthreads:\n{out}");
+        assert!(!out.contains("extern \"C\""), "leaked extern C:\n{out}");
+    }
+
+    #[test]
+    fn msl_compute_root_emits_two_kernels() {
+        let (graph, norm_op, gemm_op) = norm_gemm_graph();
+        let (reduce, finalize, transform) = rmsnorm_trace();
+
+        let plan = FusionPlan {
+            groups: vec![FusionGroup {
+                id: 0,
+                anchor: gemm_op,
+                epilogue: vec![],
+                mode: FusionMode::ComputeRoot {
+                    predecessor: norm_op,
+                },
+                ops: vec![norm_op, gemm_op],
+            }],
+            op_to_group: {
+                let mut m = HashMap::new();
+                m.insert(norm_op, 0);
+                m.insert(gemm_op, 0);
+                m
+            },
+        };
+
+        let mut reg = ScalarOpRegistry::new();
+        reg.inject_trace(OpKindKey::RmsNorm, OpTrace {
+            op_kind: OpKind::RmsNorm { eps: 1e-6 },
+            pattern: ComputePattern::NormLike { reduce, finalize, transform },
+            signature: dummy_sig(),
+        });
+
+        let dialect = MslDialect::new(9);
+        let mut out = String::new();
+        dialect.emit_header(&mut out);
+        let result = gpu_emit_plan(&dialect, &mut out, &plan, &graph, Some(&reg), None);
+
+        assert!(result.is_ok(), "MSL ComputeRoot failed: {:?}", result);
+        assert!(out.contains("kernel void group_0_norm("), "missing norm kernel:\n{out}");
+        assert!(out.contains("kernel void group_0_gemm("), "missing gemm kernel:\n{out}");
+        assert!(out.contains("rsqrt("), "missing rsqrt:\n{out}");
+        assert!(out.contains("fma("), "missing fma:\n{out}");
+        assert!(out.contains("threadgroup float As["), "missing GEMM shared mem:\n{out}");
+        assert!(out.contains("threadgroup_barrier(mem_flags::mem_threadgroup)"), "missing barrier:\n{out}");
+        assert!(out.contains("device float* normed"), "missing normed output:\n{out}");
+        assert!(!out.contains("__shared__"), "leaked __shared__:\n{out}");
+        assert!(!out.contains("__syncthreads"), "leaked __syncthreads:\n{out}");
+        assert!(!out.contains("blockIdx"), "leaked blockIdx:\n{out}");
+    }
+
+    #[test]
+    fn msl_tile_level_fusion_rejects_budget_overflow() {
+        let (graph, norm_op, gemm_op) = norm_gemm_graph();
+        let (reduce, finalize, transform) = rmsnorm_trace();
+
+        let plan = FusionPlan {
+            groups: vec![FusionGroup {
+                id: 0,
+                anchor: gemm_op,
+                epilogue: vec![],
+                mode: FusionMode::TileLevelFusion {
+                    predecessor: norm_op,
+                    tile_rows: 32,
+                },
+                ops: vec![norm_op, gemm_op],
+            }],
+            op_to_group: {
+                let mut m = HashMap::new();
+                m.insert(norm_op, 0);
+                m.insert(gemm_op, 0);
+                m
+            },
+        };
+
+        let mut reg = ScalarOpRegistry::new();
+        reg.inject_trace(OpKindKey::RmsNorm, OpTrace {
+            op_kind: OpKind::RmsNorm { eps: 1e-6 },
+            pattern: ComputePattern::NormLike { reduce, finalize, transform },
+            signature: dummy_sig(),
+        });
+
+        // Budget too small: 32 tile_rows * 64 K * 4 bytes = 8192, budget = 1023
+        let tiny_profile = crate::gpu::GpuDeviceProfile {
+            platform: crate::compiler::codegen::emitter::Platform::Metal { gpu_family: 9 },
+            compute_units: 10,
+            shared_mem_per_block: 1365,
+            max_registers_per_thread: 256,
+            warp_size: 32,
+            max_threads_per_block: 1024,
+            max_block_dim: [1024, 1024, 64],
+            max_grid_dim: [65535, 65535, 65535],
+            total_memory: 8 * 1024 * 1024 * 1024,
+            memory_bandwidth_gbs: 200.0,
+            peak_gflops_f32: 5000.0,
+            has_matrix_unit: true,
+            clock_mhz: 1000,
+        };
+
+        let dialect = MslDialect::new(9);
+        let mut out = String::new();
+        dialect.emit_header(&mut out);
+        let result = gpu_emit_plan(
+            &dialect, &mut out, &plan, &graph, Some(&reg), Some(&tiny_profile),
+        );
+
+        assert!(result.is_err(), "should fail with tiny budget");
+        let err = result.unwrap_err();
+        assert!(err.contains("exceeds shared_mem budget"), "wrong error: {err}");
+    }
+}
