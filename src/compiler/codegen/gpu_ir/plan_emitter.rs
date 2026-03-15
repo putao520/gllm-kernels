@@ -1268,3 +1268,196 @@ mod msl_tests {
         assert!(err.contains("exceeds shared_mem budget"), "wrong error: {err}");
     }
 }
+
+#[cfg(all(test, feature = "jit-cuda"))]
+mod ptx_tests {
+    use super::*;
+    use super::super::trace_emitter::PtxDialect;
+    use crate::compiler::fusion::{FusionGroup, FusionMode, FusionPlan};
+    use crate::compiler::graph::{CompilerGraph, OpId, OpKind};
+    use crate::compiler::registry::{OpKindKey, ScalarOpRegistry};
+    use crate::compiler::trace::{ComputePattern, OpTrace, ScalarFnSignature, ScalarParam, TraceOp};
+    use crate::types::DType;
+    use std::collections::HashMap;
+
+    fn dummy_sig() -> ScalarFnSignature {
+        ScalarFnSignature {
+            fn_ptr: std::ptr::null(),
+            params: vec![ScalarParam::InputPtr, ScalarParam::OutputPtr, ScalarParam::Dim(0)],
+        }
+    }
+
+    fn norm_gemm_graph() -> (CompilerGraph, OpId, OpId) {
+        let mut g = CompilerGraph::new();
+        let t_in = g.add_tensor("in", vec![64, 64], DType::F32);
+        let t_normed = g.add_tensor("normed", vec![64, 64], DType::F32);
+        let t_weight = g.add_tensor("weight", vec![64, 64], DType::F32);
+        let t_out = g.add_tensor("out", vec![64, 64], DType::F32);
+        let norm_op = g.add_op(
+            OpKind::RmsNorm { eps: 1e-6 },
+            vec![t_in], vec![t_normed], "rmsnorm",
+        );
+        let gemm_op = g.add_op(
+            OpKind::Gemm { m: 64, n: 64, k: 64 },
+            vec![t_normed, t_weight], vec![t_out], "gemm",
+        );
+        (g, norm_op, gemm_op)
+    }
+
+    fn rmsnorm_trace() -> (Vec<TraceOp>, Vec<TraceOp>, Vec<TraceOp>) {
+        let reduce = vec![TraceOp::Input(0), TraceOp::Mul(0, 0)];
+        let finalize = vec![TraceOp::Input(0), TraceOp::Rsqrt(0)];
+        let transform = vec![
+            TraceOp::Input(0),
+            TraceOp::Input(1),
+            TraceOp::Mul(0, 1),
+            TraceOp::Input(2),
+            TraceOp::Mul(2, 3),
+        ];
+        (reduce, finalize, transform)
+    }
+
+    #[test]
+    fn ptx_tile_level_fusion_emits_fused_kernel() {
+        let (graph, norm_op, gemm_op) = norm_gemm_graph();
+        let (reduce, finalize, transform) = rmsnorm_trace();
+        let plan = FusionPlan {
+            groups: vec![FusionGroup {
+                id: 0,
+                anchor: gemm_op,
+                epilogue: vec![],
+                mode: FusionMode::TileLevelFusion {
+                    predecessor: norm_op,
+                    tile_rows: 32,
+                },
+                ops: vec![norm_op, gemm_op],
+            }],
+            op_to_group: {
+                let mut m = HashMap::new();
+                m.insert(norm_op, 0);
+                m.insert(gemm_op, 0);
+                m
+            },
+        };
+        let mut reg = ScalarOpRegistry::new();
+        reg.inject_trace(OpKindKey::RmsNorm, OpTrace {
+            op_kind: OpKind::RmsNorm { eps: 1e-6 },
+            pattern: ComputePattern::NormLike { reduce, finalize, transform },
+            signature: dummy_sig(),
+        });
+        let dialect = PtxDialect::new(80);
+        let mut out = String::new();
+        dialect.emit_header(&mut out);
+        let result = gpu_emit_plan(&dialect, &mut out, &plan, &graph, Some(&reg), None);
+
+        assert!(result.is_ok(), "PTX TileLevelFusion failed: {:?}", result);
+        assert!(out.contains("group_0"), "missing kernel name:\n{out}");
+        assert!(out.contains(".shared .f32 norm_tile"), "missing norm_tile shared:\n{out}");
+        assert!(out.contains(".shared .f32 b_tile"), "missing b_tile shared:\n{out}");
+        assert!(out.contains("bar.sync 0"), "missing barrier:\n{out}");
+        assert!(out.contains("rsqrt.approx.f32"), "missing rsqrt (norm finalize):\n{out}");
+        assert!(out.contains("fma.rn.f32"), "missing fma (GEMM accumulate):\n{out}");
+        assert!(out.contains("ld.global.f32"), "missing global load:\n{out}");
+        assert!(out.contains("st.shared.f32"), "missing shared store:\n{out}");
+    }
+
+    #[test]
+    fn ptx_compute_root_emits_two_kernels() {
+        let (graph, norm_op, gemm_op) = norm_gemm_graph();
+        let (reduce, finalize, transform) = rmsnorm_trace();
+        let plan = FusionPlan {
+            groups: vec![FusionGroup {
+                id: 0,
+                anchor: gemm_op,
+                epilogue: vec![],
+                mode: FusionMode::ComputeRoot {
+                    predecessor: norm_op,
+                },
+                ops: vec![norm_op, gemm_op],
+            }],
+            op_to_group: {
+                let mut m = HashMap::new();
+                m.insert(norm_op, 0);
+                m.insert(gemm_op, 0);
+                m
+            },
+        };
+        let mut reg = ScalarOpRegistry::new();
+        reg.inject_trace(OpKindKey::RmsNorm, OpTrace {
+            op_kind: OpKind::RmsNorm { eps: 1e-6 },
+            pattern: ComputePattern::NormLike { reduce, finalize, transform },
+            signature: dummy_sig(),
+        });
+        let dialect = PtxDialect::new(80);
+        let mut out = String::new();
+        dialect.emit_header(&mut out);
+        let result = gpu_emit_plan(&dialect, &mut out, &plan, &graph, Some(&reg), None);
+
+        assert!(result.is_ok(), "PTX ComputeRoot failed: {:?}", result);
+        assert!(out.contains("group_0_norm"), "missing norm kernel:\n{out}");
+        assert!(out.contains("group_0_gemm"), "missing gemm kernel:\n{out}");
+        assert!(out.contains("rsqrt.approx.f32"), "missing rsqrt (norm):\n{out}");
+        assert!(out.contains("fma.rn.f32"), "missing fma (GEMM):\n{out}");
+        assert!(out.contains(".shared .f32 As"), "missing As shared:\n{out}");
+        assert!(out.contains(".shared .f32 Bs"), "missing Bs shared:\n{out}");
+        assert!(out.contains("bar.sync 0"), "missing barrier:\n{out}");
+    }
+
+    #[test]
+    fn ptx_tile_level_fusion_rejects_budget_overflow() {
+        let (graph, norm_op, gemm_op) = norm_gemm_graph();
+        let (reduce, finalize, transform) = rmsnorm_trace();
+        let plan = FusionPlan {
+            groups: vec![FusionGroup {
+                id: 0,
+                anchor: gemm_op,
+                epilogue: vec![],
+                mode: FusionMode::TileLevelFusion {
+                    predecessor: norm_op,
+                    tile_rows: 32,
+                },
+                ops: vec![norm_op, gemm_op],
+            }],
+            op_to_group: {
+                let mut m = HashMap::new();
+                m.insert(norm_op, 0);
+                m.insert(gemm_op, 0);
+                m
+            },
+        };
+        let mut reg = ScalarOpRegistry::new();
+        reg.inject_trace(OpKindKey::RmsNorm, OpTrace {
+            op_kind: OpKind::RmsNorm { eps: 1e-6 },
+            pattern: ComputePattern::NormLike { reduce, finalize, transform },
+            signature: dummy_sig(),
+        });
+
+        // Budget too small: 32 * 64 * 4 = 8192 bytes needed, budget = 1023
+        let tiny_profile = crate::gpu::GpuDeviceProfile {
+            platform: crate::compiler::codegen::emitter::Platform::Cuda { sm_version: 80 },
+            compute_units: 108,
+            shared_mem_per_block: 1365,
+            max_registers_per_thread: 255,
+            warp_size: 32,
+            max_threads_per_block: 1024,
+            max_block_dim: [1024, 1024, 64],
+            max_grid_dim: [2147483647, 65535, 65535],
+            total_memory: 40 * 1024 * 1024 * 1024,
+            memory_bandwidth_gbs: 1555.0,
+            peak_gflops_f32: 19500.0,
+            has_matrix_unit: true,
+            clock_mhz: 1410,
+        };
+
+        let dialect = PtxDialect::new(80);
+        let mut out = String::new();
+        dialect.emit_header(&mut out);
+        let result = gpu_emit_plan(
+            &dialect, &mut out, &plan, &graph, Some(&reg), Some(&tiny_profile),
+        );
+
+        assert!(result.is_err(), "should fail with tiny budget");
+        let err = result.unwrap_err();
+        assert!(err.contains("budget"), "wrong error: {err}");
+    }
+}
