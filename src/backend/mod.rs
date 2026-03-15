@@ -1,5 +1,4 @@
 use std::marker::PhantomData;
-use std::sync::atomic::{AtomicBool, Ordering};
 use crate::traits::{Backend, Element, Kernels};
 use crate::quant::{QK_K, QuantType};
 use half::f16;
@@ -15,51 +14,6 @@ const KVALUES_IQ4NL: [f32; 16] = [
     -127.0, -104.0, -83.0, -65.0, -49.0, -35.0, -22.0, -10.0,
     1.0, 13.0, 25.0, 38.0, 53.0, 69.0, 89.0, 113.0,
 ];
-
-// ==========================================================================
-// IQ stub helpers
-// ==========================================================================
-
-/// Per-format one-shot warning flags for IQ grid-based formats awaiting
-/// codebook table embedding.
-static IQ1S_WARNED: AtomicBool = AtomicBool::new(false);
-static IQ1M_WARNED: AtomicBool = AtomicBool::new(false);
-static IQ2XXS_WARNED: AtomicBool = AtomicBool::new(false);
-static IQ2XS_WARNED: AtomicBool = AtomicBool::new(false);
-static IQ2S_WARNED: AtomicBool = AtomicBool::new(false);
-static IQ3XXS_WARNED: AtomicBool = AtomicBool::new(false);
-static IQ3S_WARNED: AtomicBool = AtomicBool::new(false);
-
-/// Non-panicking stub for IQ grid-based formats whose E8/D4 lattice codebook
-/// tables are not yet embedded. Outputs zeros and emits a one-shot warning
-/// via eprintln. This ensures downstream code never panics on encountering
-/// these quant types.
-fn iq_stub_dequant(name: &str, block: &[u8], out: &mut [f32], block_bytes: usize, block_size: usize) {
-    let warned_flag = match name {
-        "IQ1_S" => &IQ1S_WARNED,
-        "IQ1_M" => &IQ1M_WARNED,
-        "IQ2_XXS" => &IQ2XXS_WARNED,
-        "IQ2_XS" => &IQ2XS_WARNED,
-        "IQ2_S" => &IQ2S_WARNED,
-        "IQ3_XXS" => &IQ3XXS_WARNED,
-        "IQ3_S" => &IQ3S_WARNED,
-        _ => &IQ1S_WARNED, // fallback, should not happen
-    };
-    if !warned_flag.swap(true, Ordering::Relaxed) {
-        eprintln!(
-            "[gllm-kernels] WARNING: dequant_{} outputs zeros — \
-             E8/D4 lattice codebook tables not yet embedded. \
-             IQ4_NL and IQ4_XS are fully functional.",
-            name
-        );
-    }
-    let num_blocks = block.len() / block_bytes;
-    let total = num_blocks * block_size;
-    let len = out.len();
-    for v in out[..total.min(len)].iter_mut() {
-        *v = 0.0;
-    }
-}
 
 /// Scalar CPU kernel implementation.
 ///
