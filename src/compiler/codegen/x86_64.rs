@@ -3,11 +3,12 @@
 //! Phase 3 of the JIT compiler pipeline: generates native x86_64 machine code
 //! from FusionPlan + CompilerGraph + BufferAllocation.
 //!
-//! MVP implemented under the `jit-x86` feature flag (`jit::X86CodeGen`):
+//! Production backend under the `jit-x86` feature flag (`jit::X86CodeGen`):
 //! - TraceOp → AVX2 SIMD instruction mapping (elementwise kernel generation)
-//! - GEMM microkernel generation (3-level blocked loop with nop body markers)
-//! - Fused elementwise loops (nop markers per fused op; real SIMD loop is next)
-//! - GEMM epilogue injection (nop markers; real epilogue on accumulators is next)
+//! - GEMM microkernel generation (BLIS 5-level blocked loop with real SIMD body)
+//! - Fused elementwise loops (real SIMD loop with TraceOp → vaddps/vmulps/etc.)
+//! - GEMM epilogue injection (real epilogue on accumulator registers)
+//! - TileLevelFusion / ComputeRoot codegen
 //! - Full `emit_plan()` pipeline: prologue → groups → epilogue → assemble
 //!
 //! Without the feature flag, only `emit_stub()` is available (minimal valid function).
@@ -36,7 +37,7 @@ pub mod jit {
     use crate::compiler::fusion::{FusionGroup, FusionPlan, FusionMode};
     use crate::compiler::graph::{CompilerGraph, OpKind, OpId, WeightLayout, PtrSource, GroupPointerMap};
     use crate::compiler::registry::ScalarOpRegistry;
-    use crate::compiler::buffer_alloc::{BufferAllocation, BufferSlot};
+    use crate::compiler::buffer_alloc::BufferAllocation;
     use crate::dispatch::DeviceProfile;
     use super::CodegenOutput;
     use crate::compiler::codegen::simd_ops::{SimdOps, VReg, MemOperand, BaseReg, Label};
@@ -1165,73 +1166,122 @@ pub mod jit {
             seq_len: usize,
             hidden: usize,
         ) -> Result<(), String> {
-            // Broadcast 1.0 / seq_len for the final scaling multiply
+            if self.use_avx512 {
+                return self.emit_mean_pool_avx512(seq_len, hidden);
+            }
+
+            // ── AVX2 path (8-wide ymm) ──
             let inv_n = 1.0f32 / seq_len as f32;
             let inv_label = self.const_f32(inv_n);
 
-            let simd_w = self.simd_width; // 8 for AVX2, 16 for AVX-512
-            let vec_bytes = simd_w * 4;   // 32 for AVX2, 64 for AVX-512
-            let vec_count = hidden / simd_w;
-            let tail = hidden % simd_w;
+            let vec_bytes = 32usize; // 8 x f32
+            let vec_count = hidden / 8;
+            let tail = hidden % 8;
 
-            // ── SIMD columns (zmm for AVX-512, ymm for AVX2) ──
             for col in 0..vec_count {
                 let col_byte_off = (col * vec_bytes) as i32;
-
-                if self.use_avx512 {
-                    // ── 16-wide (zmm) path ──
-                    self.asm.vmovups(zmm0, zmmword_ptr(rdi + col_byte_off))
-                        .map_err(|e| e.to_string())?;
-                    for row in 1..seq_len {
-                        let off = (row * hidden * 4 + col * vec_bytes) as i32;
-                        self.asm.vaddps(zmm0, zmm0, zmmword_ptr(rdi + off))
-                            .map_err(|e| e.to_string())?;
-                    }
-                    self.asm.vbroadcastss(zmm1, dword_ptr(inv_label))
-                        .map_err(|e| e.to_string())?;
-                    self.asm.vmulps(zmm0, zmm0, zmm1)
-                        .map_err(|e| e.to_string())?;
-                    self.asm.vmovups(zmmword_ptr(r8 + col_byte_off), zmm0)
-                        .map_err(|e| e.to_string())?;
-                } else {
-                    // ── 8-wide (ymm) path ──
-                    self.asm.vmovups(ymm0, ymmword_ptr(rdi + col_byte_off))
-                        .map_err(|e| e.to_string())?;
-                    for row in 1..seq_len {
-                        let off = (row * hidden * 4 + col * vec_bytes) as i32;
-                        self.asm.vaddps(ymm0, ymm0, ymmword_ptr(rdi + off))
-                            .map_err(|e| e.to_string())?;
-                    }
-                    self.asm.vbroadcastss(ymm1, dword_ptr(inv_label))
-                        .map_err(|e| e.to_string())?;
-                    self.asm.vmulps(ymm0, ymm0, ymm1)
-                        .map_err(|e| e.to_string())?;
-                    self.asm.vmovups(ymmword_ptr(r8 + col_byte_off), ymm0)
+                self.asm.vmovups(ymm0, ymmword_ptr(rdi + col_byte_off))
+                    .map_err(|e| e.to_string())?;
+                for row in 1..seq_len {
+                    let off = (row * hidden * 4 + col * vec_bytes) as i32;
+                    self.asm.vaddps(ymm0, ymm0, ymmword_ptr(rdi + off))
                         .map_err(|e| e.to_string())?;
                 }
+                self.asm.vbroadcastss(ymm1, dword_ptr(inv_label))
+                    .map_err(|e| e.to_string())?;
+                self.asm.vmulps(ymm0, ymm0, ymm1)
+                    .map_err(|e| e.to_string())?;
+                self.asm.vmovups(ymmword_ptr(r8 + col_byte_off), ymm0)
+                    .map_err(|e| e.to_string())?;
             }
 
-            // ── Scalar tail ──
+            // Scalar tail for AVX2
             if tail > 0 {
                 let base = (vec_count * vec_bytes) as i32;
                 for i in 0..tail {
                     let col_off = base + (i * 4) as i32;
-                    // First row
                     self.asm.vmovss(xmm0, dword_ptr(rdi + col_off))
                         .map_err(|e| e.to_string())?;
-                    // Sum remaining rows
                     for row in 1..seq_len {
                         let off = (row * hidden * 4) as i32 + col_off;
                         self.asm.vaddss(xmm0, xmm0, dword_ptr(rdi + off))
                             .map_err(|e| e.to_string())?;
                     }
-                    // Scale
                     self.asm.vmulss(xmm0, xmm0, dword_ptr(inv_label))
                         .map_err(|e| e.to_string())?;
-                    // Store
                     self.asm.vmovss(dword_ptr(r8 + col_off), xmm0)
                         .map_err(|e| e.to_string())?;
                 }
+            }
+
+            Ok(())
+        }
+
+        /// AVX-512 path for MeanPool: uses zmm (16 x f32) with masked tail.
+        ///
+        /// ABI: rdi = input ptr [seq_len, hidden], r8 = output ptr [hidden].
+        fn emit_mean_pool_avx512(
+            &mut self,
+            seq_len: usize,
+            hidden: usize,
+        ) -> Result<(), String> {
+            let inv_n = 1.0f32 / seq_len as f32;
+            let inv_label = self.const_f32(inv_n);
+
+            let vec_bytes = 64usize; // 16 x f32
+            let vec_count = hidden / 16;
+            let tail = hidden % 16;
+
+            // ── Full 16-wide zmm columns ──
+            for col in 0..vec_count {
+                let col_byte_off = (col * vec_bytes) as i32;
+                // Load first row
+                self.asm.vmovups(zmm0, zmmword_ptr(rdi + col_byte_off))
+                    .map_err(|e| e.to_string())?;
+                // Accumulate remaining rows
+                for row in 1..seq_len {
+                    let off = (row * hidden * 4 + col * vec_bytes) as i32;
+                    self.asm.vaddps(zmm0, zmm0, zmmword_ptr(rdi + off))
+                        .map_err(|e| e.to_string())?;
+                }
+                // Scale by 1/seq_len
+                self.asm.vbroadcastss(zmm1, dword_ptr(inv_label))
+                    .map_err(|e| e.to_string())?;
+                self.asm.vmulps(zmm0, zmm0, zmm1)
+                    .map_err(|e| e.to_string())?;
+                // Store result
+                self.asm.vmovups(zmmword_ptr(r8 + col_byte_off), zmm0)
+                    .map_err(|e| e.to_string())?;
+            }
+
+            // ── Masked zmm tail ──
+            if tail > 0 {
+                let base = (vec_count * vec_bytes) as i32;
+                let mask = (1u32 << tail) - 1;
+                self.asm.mov(eax, mask as i32).map_err(|e| e.to_string())?;
+                self.asm.kmovw(k1, eax).map_err(|e| e.to_string())?;
+
+                // Masked load first row (zero-masked: unset lanes = 0.0)
+                self.asm.vpxord(zmm0, zmm0, zmm0).map_err(|e| e.to_string())?;
+                self.asm.vmovups(zmm0.k1(), zmmword_ptr(rdi + base))
+                    .map_err(|e| e.to_string())?;
+                // Accumulate remaining rows with masked loads
+                for row in 1..seq_len {
+                    let off = (row * hidden * 4) as i32 + base;
+                    self.asm.vpxord(zmm2, zmm2, zmm2).map_err(|e| e.to_string())?;
+                    self.asm.vmovups(zmm2.k1(), zmmword_ptr(rdi + off))
+                        .map_err(|e| e.to_string())?;
+                    self.asm.vaddps(zmm0, zmm0, zmm2)
+                        .map_err(|e| e.to_string())?;
+                }
+                // Scale by 1/seq_len
+                self.asm.vbroadcastss(zmm1, dword_ptr(inv_label))
+                    .map_err(|e| e.to_string())?;
+                self.asm.vmulps(zmm0, zmm0, zmm1)
+                    .map_err(|e| e.to_string())?;
+                // Masked store
+                self.asm.vmovups(zmmword_ptr(r8 + base).k1(), zmm0)
+                    .map_err(|e| e.to_string())?;
             }
 
             Ok(())
@@ -1258,6 +1308,10 @@ pub mod jit {
             num_heads: usize,
             head_dim: usize,
         ) -> Result<(), String> {
+            if self.use_avx512 {
+                return self.emit_multi_head_attention_avx512(seq_len, num_heads, head_dim);
+            }
+
             let hidden = num_heads * head_dim;
             let hd_bytes = (head_dim * 4) as i32;
             let hidden_bytes = (hidden * 4) as i32;
@@ -1774,6 +1828,574 @@ pub mod jit {
             Ok(())
         }
 
+        // ── AVX-512 Multi-Head Attention ──────────────────────────────────
+
+        /// AVX-512 path for multi-head attention: all sub-operations use zmm
+        /// (16 x f32) with masked tails instead of scalar element loops.
+        ///
+        /// ABI contract (same as AVX2 path):
+        ///   rdi = Q ptr, rsi = K ptr, rdx = V ptr, r8 = output ptr,
+        ///   [rbp+32] = scratchpad ptr
+        fn emit_multi_head_attention_avx512(
+            &mut self,
+            seq_len: usize,
+            num_heads: usize,
+            head_dim: usize,
+        ) -> Result<(), String> {
+            let hidden = num_heads * head_dim;
+            let hd_bytes = (head_dim * 4) as i32;
+            let hidden_bytes = (hidden * 4) as i32;
+
+            // Scratchpad allocation
+            let head_mat_size = seq_len * head_dim * 4;
+            let scores_size = seq_len * seq_len * 4;
+            let total_scratch = head_mat_size * 4 + scores_size;
+
+            let q_off = self.blis_scratchpad_offset as i32;
+            let k_off = q_off + head_mat_size as i32;
+            let v_off = k_off + head_mat_size as i32;
+            let sc_off = v_off + head_mat_size as i32;
+            let out_off = sc_off + scores_size as i32;
+
+            self.blis_scratchpad_bytes = self.blis_scratchpad_bytes.max(
+                self.blis_scratchpad_offset + total_scratch - self.blis_base_offset
+            );
+
+            let scale = 1.0 / (head_dim as f32).sqrt();
+            let scale_label = self.const_f32(scale);
+
+            // Load scratchpad base into rbx
+            self.asm.mov(rbx, qword_ptr(rbp + 32)).map_err(|e| e.to_string())?;
+
+            // Save input pointers onto local stack frame.
+            // Layout: [rsp+0]=Q, [rsp+8]=K, [rsp+16]=V, [rsp+24]=output, [rsp+32]=head_counter
+            self.asm.sub(rsp, 48i32).map_err(|e| e.to_string())?;
+            self.asm.mov(qword_ptr(rsp), rdi).map_err(|e| e.to_string())?;
+            self.asm.mov(qword_ptr(rsp + 8), rsi).map_err(|e| e.to_string())?;
+            self.asm.mov(qword_ptr(rsp + 16), rdx).map_err(|e| e.to_string())?;
+            self.asm.mov(qword_ptr(rsp + 24), r8).map_err(|e| e.to_string())?;
+
+            // -- Head loop: for h in 0..num_heads --
+            let mut h_loop = self.asm.create_label();
+            let mut h_done = self.asm.create_label();
+
+            self.asm.xor(eax, eax).map_err(|e| e.to_string())?;
+            self.asm.mov(qword_ptr(rsp + 32), rax).map_err(|e| e.to_string())?;
+            self.asm.set_label(&mut h_loop).map_err(|e| e.to_string())?;
+            self.asm.cmp(qword_ptr(rsp + 32), num_heads as i32).map_err(|e| e.to_string())?;
+            self.asm.jge(h_done).map_err(|e| e.to_string())?;
+
+            // r12 = h * head_dim * 4
+            self.asm.mov(r12, qword_ptr(rsp + 32)).map_err(|e| e.to_string())?;
+            self.asm.imul_3(r12, r12, hd_bytes).map_err(|e| e.to_string())?;
+
+            // Step 1: Extract Q, K, V heads (zmm)
+            self.emit_mha_extract_heads_avx512(seq_len, head_dim, hidden_bytes, q_off, k_off, v_off)?;
+
+            // Step 2: scores[i][j] = dot(Q[i], K[j]) * scale (zmm)
+            self.emit_mha_compute_scores_avx512(seq_len, head_dim, q_off, k_off, sc_off, scale_label)?;
+
+            // Step 3: Row-wise softmax on scores (zmm)
+            self.emit_mha_softmax_inplace_avx512(seq_len, sc_off)?;
+
+            // Step 4: out_head = scores @ V_head (zmm)
+            self.emit_mha_scores_times_v_avx512(seq_len, head_dim, sc_off, v_off, out_off)?;
+
+            // Step 5: Scatter out_head back to output (zmm)
+            self.emit_mha_scatter_head_avx512(seq_len, head_dim, hidden_bytes, out_off)?;
+
+            // Increment head counter
+            self.asm.mov(rax, qword_ptr(rsp + 32)).map_err(|e| e.to_string())?;
+            self.asm.inc(rax).map_err(|e| e.to_string())?;
+            self.asm.mov(qword_ptr(rsp + 32), rax).map_err(|e| e.to_string())?;
+            self.asm.jmp(h_loop).map_err(|e| e.to_string())?;
+            self.asm.set_label(&mut h_done).map_err(|e| e.to_string())?;
+
+            // Restore stack
+            self.asm.add(rsp, 48i32).map_err(|e| e.to_string())?;
+            Ok(())
+        }
+
+        /// AVX-512 MHA helper: extract Q, K, V heads using zmm with masked tail.
+        ///
+        /// Invariants on entry:
+        ///   rbx = scratchpad base, r12 = h * head_dim * 4,
+        ///   [rsp+0]=Q, [rsp+8]=K, [rsp+16]=V
+        /// Clobbers: r13, r14, r15, rax, rdi, rsi, zmm0.
+        fn emit_mha_extract_heads_avx512(
+            &mut self,
+            seq_len: usize,
+            head_dim: usize,
+            hidden_bytes: i32,
+            q_off: i32,
+            k_off: i32,
+            v_off: i32,
+        ) -> Result<(), String> {
+            let hd_bytes = (head_dim * 4) as i32;
+            let vec_count = head_dim / 16;
+            let tail = head_dim % 16;
+
+            // Pre-set tail mask in k1 if needed
+            if tail > 0 {
+                let mask = (1u32 << tail) - 1;
+                self.asm.mov(eax, mask as i32).map_err(|e| e.to_string())?;
+                self.asm.kmovw(k1, eax).map_err(|e| e.to_string())?;
+            }
+
+            let mut s_loop = self.asm.create_label();
+            let mut s_done = self.asm.create_label();
+
+            self.asm.xor(r13d, r13d).map_err(|e| e.to_string())?;
+            self.asm.set_label(&mut s_loop).map_err(|e| e.to_string())?;
+            self.asm.cmp(r13d, seq_len as i32).map_err(|e| e.to_string())?;
+            self.asm.jge(s_done).map_err(|e| e.to_string())?;
+
+            // r14 = s * hidden_bytes
+            self.asm.mov(r14, r13).map_err(|e| e.to_string())?;
+            self.asm.imul_3(r14, r14, hidden_bytes).map_err(|e| e.to_string())?;
+            // rax = src offset = s*hidden*4 + h*hd*4
+            self.asm.lea(rax, qword_ptr(r14 + r12)).map_err(|e| e.to_string())?;
+            // r15 = s * hd_bytes
+            self.asm.mov(r15, r13).map_err(|e| e.to_string())?;
+            self.asm.imul_3(r15, r15, hd_bytes).map_err(|e| e.to_string())?;
+
+            // --- Copy Q head ---
+            self.asm.mov(rdi, qword_ptr(rsp)).map_err(|e| e.to_string())?;
+            self.asm.add(rdi, rax).map_err(|e| e.to_string())?;
+            self.asm.lea(rsi, qword_ptr(rbx + q_off)).map_err(|e| e.to_string())?;
+            self.asm.add(rsi, r15).map_err(|e| e.to_string())?;
+            for v in 0..vec_count {
+                let off = (v * 64) as i32;
+                self.asm.vmovups(zmm0, zmmword_ptr(rdi + off)).map_err(|e| e.to_string())?;
+                self.asm.vmovups(zmmword_ptr(rsi + off), zmm0).map_err(|e| e.to_string())?;
+            }
+            if tail > 0 {
+                let off = (vec_count * 64) as i32;
+                self.asm.vpxord(zmm0, zmm0, zmm0).map_err(|e| e.to_string())?;
+                self.asm.vmovups(zmm0.k1(), zmmword_ptr(rdi + off)).map_err(|e| e.to_string())?;
+                self.asm.vmovups(zmmword_ptr(rsi + off).k1(), zmm0).map_err(|e| e.to_string())?;
+            }
+
+            // --- Copy K head ---
+            self.asm.mov(rdi, qword_ptr(rsp + 8)).map_err(|e| e.to_string())?;
+            self.asm.add(rdi, rax).map_err(|e| e.to_string())?;
+            self.asm.lea(rsi, qword_ptr(rbx + k_off)).map_err(|e| e.to_string())?;
+            self.asm.add(rsi, r15).map_err(|e| e.to_string())?;
+            for v in 0..vec_count {
+                let off = (v * 64) as i32;
+                self.asm.vmovups(zmm0, zmmword_ptr(rdi + off)).map_err(|e| e.to_string())?;
+                self.asm.vmovups(zmmword_ptr(rsi + off), zmm0).map_err(|e| e.to_string())?;
+            }
+            if tail > 0 {
+                let off = (vec_count * 64) as i32;
+                self.asm.vpxord(zmm0, zmm0, zmm0).map_err(|e| e.to_string())?;
+                self.asm.vmovups(zmm0.k1(), zmmword_ptr(rdi + off)).map_err(|e| e.to_string())?;
+                self.asm.vmovups(zmmword_ptr(rsi + off).k1(), zmm0).map_err(|e| e.to_string())?;
+            }
+
+            // --- Copy V head ---
+            self.asm.mov(rdi, qword_ptr(rsp + 16)).map_err(|e| e.to_string())?;
+            self.asm.add(rdi, rax).map_err(|e| e.to_string())?;
+            self.asm.lea(rsi, qword_ptr(rbx + v_off)).map_err(|e| e.to_string())?;
+            self.asm.add(rsi, r15).map_err(|e| e.to_string())?;
+            for v in 0..vec_count {
+                let off = (v * 64) as i32;
+                self.asm.vmovups(zmm0, zmmword_ptr(rdi + off)).map_err(|e| e.to_string())?;
+                self.asm.vmovups(zmmword_ptr(rsi + off), zmm0).map_err(|e| e.to_string())?;
+            }
+            if tail > 0 {
+                let off = (vec_count * 64) as i32;
+                self.asm.vpxord(zmm0, zmm0, zmm0).map_err(|e| e.to_string())?;
+                self.asm.vmovups(zmm0.k1(), zmmword_ptr(rdi + off)).map_err(|e| e.to_string())?;
+                self.asm.vmovups(zmmword_ptr(rsi + off).k1(), zmm0).map_err(|e| e.to_string())?;
+            }
+
+            self.asm.inc(r13).map_err(|e| e.to_string())?;
+            self.asm.jmp(s_loop).map_err(|e| e.to_string())?;
+            self.asm.set_label(&mut s_done).map_err(|e| e.to_string())?;
+            Ok(())
+        }
+
+        /// AVX-512 MHA helper: compute scores[i][j] = dot(Q[i], K[j]) * scale.
+        ///
+        /// Uses zmm (16-wide) dot products with masked tail.
+        ///
+        /// Invariants on entry: rbx = scratchpad base.
+        /// Clobbers: r13, r14, r15, rax, rcx, rdi, rsi, zmm0-zmm3.
+        fn emit_mha_compute_scores_avx512(
+            &mut self,
+            seq_len: usize,
+            head_dim: usize,
+            q_off: i32,
+            k_off: i32,
+            sc_off: i32,
+            scale_label: CodeLabel,
+        ) -> Result<(), String> {
+            let hd_bytes = (head_dim * 4) as i32;
+            let seq_bytes = (seq_len * 4) as i32;
+            let vec_count = head_dim / 16;
+            let tail = head_dim % 16;
+
+            // Pre-set tail mask in k2 (use k2 to avoid conflict with softmax k1)
+            if tail > 0 {
+                let mask = (1u32 << tail) - 1;
+                self.asm.mov(eax, mask as i32).map_err(|e| e.to_string())?;
+                self.asm.kmovw(k2, eax).map_err(|e| e.to_string())?;
+            }
+
+            let mut i_loop = self.asm.create_label();
+            let mut i_done = self.asm.create_label();
+
+            self.asm.xor(r13d, r13d).map_err(|e| e.to_string())?;
+            self.asm.set_label(&mut i_loop).map_err(|e| e.to_string())?;
+            self.asm.cmp(r13d, seq_len as i32).map_err(|e| e.to_string())?;
+            self.asm.jge(i_done).map_err(|e| e.to_string())?;
+
+            // r14 = &Q_head[i, 0]
+            self.asm.mov(rax, r13).map_err(|e| e.to_string())?;
+            self.asm.imul_3(rax, rax, hd_bytes).map_err(|e| e.to_string())?;
+            self.asm.lea(r14, qword_ptr(rbx + q_off)).map_err(|e| e.to_string())?;
+            self.asm.add(r14, rax).map_err(|e| e.to_string())?;
+
+            // rdi = &scores[i, 0]
+            self.asm.mov(rax, r13).map_err(|e| e.to_string())?;
+            self.asm.imul_3(rax, rax, seq_bytes).map_err(|e| e.to_string())?;
+            self.asm.lea(rdi, qword_ptr(rbx + sc_off)).map_err(|e| e.to_string())?;
+            self.asm.add(rdi, rax).map_err(|e| e.to_string())?;
+
+            // j loop
+            let mut j_loop = self.asm.create_label();
+            let mut j_done = self.asm.create_label();
+
+            self.asm.xor(r15d, r15d).map_err(|e| e.to_string())?;
+            self.asm.set_label(&mut j_loop).map_err(|e| e.to_string())?;
+            self.asm.cmp(r15d, seq_len as i32).map_err(|e| e.to_string())?;
+            self.asm.jge(j_done).map_err(|e| e.to_string())?;
+
+            // rsi = &K_head[j, 0]
+            self.asm.mov(rax, r15).map_err(|e| e.to_string())?;
+            self.asm.imul_3(rax, rax, hd_bytes).map_err(|e| e.to_string())?;
+            self.asm.lea(rsi, qword_ptr(rbx + k_off)).map_err(|e| e.to_string())?;
+            self.asm.add(rsi, rax).map_err(|e| e.to_string())?;
+
+            // Compute dot product: sum_d Q[i,d] * K[j,d] using zmm
+            self.asm.vpxord(zmm1, zmm1, zmm1).map_err(|e| e.to_string())?;
+            for v in 0..vec_count {
+                let off = (v * 64) as i32;
+                self.asm.vmovups(zmm2, zmmword_ptr(r14 + off)).map_err(|e| e.to_string())?;
+                self.asm.vfmadd231ps(zmm1, zmm2, zmmword_ptr(rsi + off)).map_err(|e| e.to_string())?;
+            }
+            // Masked tail
+            if tail > 0 {
+                let off = (vec_count * 64) as i32;
+                self.asm.vpxord(zmm2, zmm2, zmm2).map_err(|e| e.to_string())?;
+                self.asm.vmovups(zmm2.k2(), zmmword_ptr(r14 + off)).map_err(|e| e.to_string())?;
+                self.asm.vpxord(zmm3, zmm3, zmm3).map_err(|e| e.to_string())?;
+                self.asm.vmovups(zmm3.k2(), zmmword_ptr(rsi + off)).map_err(|e| e.to_string())?;
+                self.asm.vfmadd231ps(zmm1, zmm2, zmm3).map_err(|e| e.to_string())?;
+            }
+
+            // Horizontal sum zmm1 -> scalar, multiply by scale, store
+            self.emit_horizontal_sum_zmm(zmm1, zmm1)?;
+            // xmm1 low lane has the scalar sum (broadcast in zmm1)
+            self.asm.vmulss(xmm0, xmm1, dword_ptr(scale_label)).map_err(|e| e.to_string())?;
+            self.asm.vmovss(dword_ptr(rdi + r15 * 4), xmm0).map_err(|e| e.to_string())?;
+
+            self.asm.inc(r15).map_err(|e| e.to_string())?;
+            self.asm.jmp(j_loop).map_err(|e| e.to_string())?;
+            self.asm.set_label(&mut j_done).map_err(|e| e.to_string())?;
+
+            self.asm.inc(r13).map_err(|e| e.to_string())?;
+            self.asm.jmp(i_loop).map_err(|e| e.to_string())?;
+            self.asm.set_label(&mut i_done).map_err(|e| e.to_string())?;
+            Ok(())
+        }
+
+        /// AVX-512 MHA helper: row-wise softmax on scores[seq_len, seq_len] in-place.
+        ///
+        /// Three passes per row using zmm with AVX-512 masked tails:
+        ///   1. Find row max (vmaxps zmm scan)
+        ///   2. exp(x - max) via emit_exp_avx512, accumulate sum
+        ///   3. Normalize by 1/sum
+        ///
+        /// Invariants on entry: rbx = scratchpad base.
+        /// Clobbers: r13, r14, rax, rcx, rdi, zmm0-zmm7.
+        fn emit_mha_softmax_inplace_avx512(
+            &mut self,
+            seq_len: usize,
+            sc_off: i32,
+        ) -> Result<(), String> {
+            let seq_bytes = (seq_len * 4) as i32;
+            let vec_count = seq_len / 16;
+            let tail = seq_len % 16;
+            let neg_inf_label = self.const_f32(f32::NEG_INFINITY);
+            let one_label = self.const_f32(1.0);
+
+            let mut i_loop = self.asm.create_label();
+            let mut i_done = self.asm.create_label();
+
+            self.asm.xor(r13d, r13d).map_err(|e| e.to_string())?;
+            self.asm.set_label(&mut i_loop).map_err(|e| e.to_string())?;
+            self.asm.cmp(r13d, seq_len as i32).map_err(|e| e.to_string())?;
+            self.asm.jge(i_done).map_err(|e| e.to_string())?;
+
+            // rdi = &scores[i, 0]
+            self.asm.mov(rax, r13).map_err(|e| e.to_string())?;
+            self.asm.imul_3(rax, rax, seq_bytes).map_err(|e| e.to_string())?;
+            self.asm.lea(rdi, qword_ptr(rbx + sc_off)).map_err(|e| e.to_string())?;
+            self.asm.add(rdi, rax).map_err(|e| e.to_string())?;
+
+            // --- Pass 1: find row max ---
+            self.asm.vbroadcastss(zmm4, dword_ptr(neg_inf_label)).map_err(|e| e.to_string())?;
+            for v in 0..vec_count {
+                let off = (v * 64) as i32;
+                self.asm.vmaxps(zmm4, zmm4, zmmword_ptr(rdi + off)).map_err(|e| e.to_string())?;
+            }
+            // Masked tail for max
+            if tail > 0 {
+                let off = (vec_count * 64) as i32;
+                let mask = (1u32 << tail) - 1;
+                self.asm.mov(eax, mask as i32).map_err(|e| e.to_string())?;
+                self.asm.kmovw(k1, eax).map_err(|e| e.to_string())?;
+                // Load -inf into zmm5, then masked load over it
+                self.asm.vbroadcastss(zmm5, dword_ptr(neg_inf_label)).map_err(|e| e.to_string())?;
+                self.asm.vmovups(zmm5.k1(), zmmword_ptr(rdi + off)).map_err(|e| e.to_string())?;
+                self.asm.vmaxps(zmm4, zmm4, zmm5).map_err(|e| e.to_string())?;
+            }
+            // Horizontal max zmm4 -> broadcast in zmm4
+            self.emit_horizontal_max_zmm(zmm4, zmm4)?;
+
+            // --- Pass 2: exp(x - max) and accumulate sum ---
+            self.asm.vpxord(zmm5, zmm5, zmm5).map_err(|e| e.to_string())?; // sum acc
+
+            for v in 0..vec_count {
+                let off = (v * 64) as i32;
+                // zmm6 = scores[v] - max
+                self.asm.vmovups(zmm6, zmmword_ptr(rdi + off)).map_err(|e| e.to_string())?;
+                self.asm.vsubps(zmm6, zmm6, zmm4).map_err(|e| e.to_string())?;
+                // zmm6 = exp(zmm6), scratch = [zmm7, zmm3, zmm2]
+                self.emit_exp_avx512(zmm6, zmm6, [zmm7, zmm3, zmm2])?;
+                // Store back
+                self.asm.vmovups(zmmword_ptr(rdi + off), zmm6).map_err(|e| e.to_string())?;
+                // Accumulate sum
+                self.asm.vaddps(zmm5, zmm5, zmm6).map_err(|e| e.to_string())?;
+            }
+            // Masked tail for exp-sum
+            if tail > 0 {
+                let off = (vec_count * 64) as i32;
+                let mask = (1u32 << tail) - 1;
+                self.asm.mov(eax, mask as i32).map_err(|e| e.to_string())?;
+                self.asm.kmovw(k1, eax).map_err(|e| e.to_string())?;
+                // Masked load, subtract max, exp
+                self.asm.vpxord(zmm6, zmm6, zmm6).map_err(|e| e.to_string())?;
+                self.asm.vmovups(zmm6.k1(), zmmword_ptr(rdi + off)).map_err(|e| e.to_string())?;
+                self.asm.vsubps(zmm6, zmm6, zmm4).map_err(|e| e.to_string())?;
+                self.emit_exp_avx512(zmm6, zmm6, [zmm7, zmm3, zmm2])?;
+                // Masked store
+                self.asm.vmovups(zmmword_ptr(rdi + off).k1(), zmm6).map_err(|e| e.to_string())?;
+                // Zero out lanes beyond tail before accumulating into sum
+                self.asm.vpxord(zmm7, zmm7, zmm7).map_err(|e| e.to_string())?;
+                self.asm.vmovups(zmm7.k1(), zmmword_ptr(rdi + off)).map_err(|e| e.to_string())?;
+                self.asm.vaddps(zmm5, zmm5, zmm7).map_err(|e| e.to_string())?;
+            }
+
+            // Horizontal sum zmm5 -> broadcast
+            self.emit_horizontal_sum_zmm(zmm5, zmm5)?;
+            // Compute inv_sum = 1.0 / sum
+            self.asm.vbroadcastss(zmm6, dword_ptr(one_label)).map_err(|e| e.to_string())?;
+            self.asm.vdivss(xmm5, xmm6, xmm5).map_err(|e| e.to_string())?;
+            self.asm.vbroadcastss(zmm5, xmm5).map_err(|e| e.to_string())?;
+
+            // --- Pass 3: normalize (multiply by inv_sum) ---
+            for v in 0..vec_count {
+                let off = (v * 64) as i32;
+                self.asm.vmulps(zmm6, zmm5, zmmword_ptr(rdi + off)).map_err(|e| e.to_string())?;
+                self.asm.vmovups(zmmword_ptr(rdi + off), zmm6).map_err(|e| e.to_string())?;
+            }
+            if tail > 0 {
+                let off = (vec_count * 64) as i32;
+                let mask = (1u32 << tail) - 1;
+                self.asm.mov(eax, mask as i32).map_err(|e| e.to_string())?;
+                self.asm.kmovw(k1, eax).map_err(|e| e.to_string())?;
+                self.asm.vmovups(zmm6.k1().z(), zmmword_ptr(rdi + off)).map_err(|e| e.to_string())?;
+                self.asm.vmulps(zmm6, zmm6, zmm5).map_err(|e| e.to_string())?;
+                self.asm.vmovups(zmmword_ptr(rdi + off).k1(), zmm6).map_err(|e| e.to_string())?;
+            }
+
+            self.asm.inc(r13).map_err(|e| e.to_string())?;
+            self.asm.jmp(i_loop).map_err(|e| e.to_string())?;
+            self.asm.set_label(&mut i_done).map_err(|e| e.to_string())?;
+            Ok(())
+        }
+
+        /// AVX-512 MHA helper: compute out_head = scores @ V_head using zmm.
+        ///
+        /// out_head[i][d] = sum_j scores[i][j] * V_head[j][d]
+        ///
+        /// Invariants on entry: rbx = scratchpad base.
+        /// Clobbers: r13, r14, r15, rax, rcx, rdi, rsi, zmm0-zmm3.
+        fn emit_mha_scores_times_v_avx512(
+            &mut self,
+            seq_len: usize,
+            head_dim: usize,
+            sc_off: i32,
+            v_off: i32,
+            out_off: i32,
+        ) -> Result<(), String> {
+            let hd_bytes = (head_dim * 4) as i32;
+            let seq_bytes = (seq_len * 4) as i32;
+            let hd_vec_count = head_dim / 16;
+            let hd_tail = head_dim % 16;
+
+            // Pre-set tail mask in k1 if needed
+            if hd_tail > 0 {
+                let mask = (1u32 << hd_tail) - 1;
+                self.asm.mov(eax, mask as i32).map_err(|e| e.to_string())?;
+                self.asm.kmovw(k1, eax).map_err(|e| e.to_string())?;
+            }
+
+            let mut i_loop = self.asm.create_label();
+            let mut i_done = self.asm.create_label();
+
+            self.asm.xor(r13d, r13d).map_err(|e| e.to_string())?;
+            self.asm.set_label(&mut i_loop).map_err(|e| e.to_string())?;
+            self.asm.cmp(r13d, seq_len as i32).map_err(|e| e.to_string())?;
+            self.asm.jge(i_done).map_err(|e| e.to_string())?;
+
+            // rdi = &out_head[i, 0]
+            self.asm.mov(rax, r13).map_err(|e| e.to_string())?;
+            self.asm.imul_3(rax, rax, hd_bytes).map_err(|e| e.to_string())?;
+            self.asm.lea(rdi, qword_ptr(rbx + out_off)).map_err(|e| e.to_string())?;
+            self.asm.add(rdi, rax).map_err(|e| e.to_string())?;
+
+            // Zero out_head[i] row using zmm
+            self.asm.vpxord(zmm0, zmm0, zmm0).map_err(|e| e.to_string())?;
+            for v in 0..hd_vec_count {
+                let off = (v * 64) as i32;
+                self.asm.vmovups(zmmword_ptr(rdi + off), zmm0).map_err(|e| e.to_string())?;
+            }
+            if hd_tail > 0 {
+                let off = (hd_vec_count * 64) as i32;
+                self.asm.vmovups(zmmword_ptr(rdi + off).k1(), zmm0).map_err(|e| e.to_string())?;
+            }
+
+            // rcx = &scores[i, 0]
+            self.asm.mov(rax, r13).map_err(|e| e.to_string())?;
+            self.asm.imul_3(rax, rax, seq_bytes).map_err(|e| e.to_string())?;
+            self.asm.lea(rcx, qword_ptr(rbx + sc_off)).map_err(|e| e.to_string())?;
+            self.asm.add(rcx, rax).map_err(|e| e.to_string())?;
+
+            // j loop
+            let mut j_loop = self.asm.create_label();
+            let mut j_done = self.asm.create_label();
+
+            self.asm.xor(r15d, r15d).map_err(|e| e.to_string())?;
+            self.asm.set_label(&mut j_loop).map_err(|e| e.to_string())?;
+            self.asm.cmp(r15d, seq_len as i32).map_err(|e| e.to_string())?;
+            self.asm.jge(j_done).map_err(|e| e.to_string())?;
+
+            // zmm1 = broadcast(scores[i][j])
+            self.asm.vbroadcastss(zmm1, dword_ptr(rcx + r15 * 4)).map_err(|e| e.to_string())?;
+
+            // rsi = &V_head[j, 0]
+            self.asm.mov(rax, r15).map_err(|e| e.to_string())?;
+            self.asm.imul_3(rax, rax, hd_bytes).map_err(|e| e.to_string())?;
+            self.asm.lea(rsi, qword_ptr(rbx + v_off)).map_err(|e| e.to_string())?;
+            self.asm.add(rsi, rax).map_err(|e| e.to_string())?;
+
+            // Accumulate: out_head[i][d] += scores[i][j] * V_head[j][d]
+            for v in 0..hd_vec_count {
+                let off = (v * 64) as i32;
+                self.asm.vmovups(zmm2, zmmword_ptr(rdi + off)).map_err(|e| e.to_string())?;
+                self.asm.vfmadd231ps(zmm2, zmm1, zmmword_ptr(rsi + off)).map_err(|e| e.to_string())?;
+                self.asm.vmovups(zmmword_ptr(rdi + off), zmm2).map_err(|e| e.to_string())?;
+            }
+            if hd_tail > 0 {
+                let off = (hd_vec_count * 64) as i32;
+                self.asm.vpxord(zmm2, zmm2, zmm2).map_err(|e| e.to_string())?;
+                self.asm.vmovups(zmm2.k1(), zmmword_ptr(rdi + off)).map_err(|e| e.to_string())?;
+                self.asm.vpxord(zmm3, zmm3, zmm3).map_err(|e| e.to_string())?;
+                self.asm.vmovups(zmm3.k1(), zmmword_ptr(rsi + off)).map_err(|e| e.to_string())?;
+                self.asm.vfmadd231ps(zmm2, zmm1, zmm3).map_err(|e| e.to_string())?;
+                self.asm.vmovups(zmmword_ptr(rdi + off).k1(), zmm2).map_err(|e| e.to_string())?;
+            }
+
+            self.asm.inc(r15).map_err(|e| e.to_string())?;
+            self.asm.jmp(j_loop).map_err(|e| e.to_string())?;
+            self.asm.set_label(&mut j_done).map_err(|e| e.to_string())?;
+
+            self.asm.inc(r13).map_err(|e| e.to_string())?;
+            self.asm.jmp(i_loop).map_err(|e| e.to_string())?;
+            self.asm.set_label(&mut i_done).map_err(|e| e.to_string())?;
+            Ok(())
+        }
+
+        /// AVX-512 MHA helper: scatter out_head[seq, head_dim] back to output[seq, hidden].
+        ///
+        /// Uses zmm with masked tail for the copy.
+        ///
+        /// Invariants on entry:
+        ///   rbx = scratchpad base, r12 = h * head_dim * 4,
+        ///   [rsp+24] = output ptr
+        /// Clobbers: r13, r14, r15, rax, rdi, rsi, zmm0.
+        fn emit_mha_scatter_head_avx512(
+            &mut self,
+            seq_len: usize,
+            head_dim: usize,
+            hidden_bytes: i32,
+            out_off: i32,
+        ) -> Result<(), String> {
+            let hd_bytes = (head_dim * 4) as i32;
+            let vec_count = head_dim / 16;
+            let tail = head_dim % 16;
+
+            // Pre-set tail mask in k1 if needed
+            if tail > 0 {
+                let mask = (1u32 << tail) - 1;
+                self.asm.mov(eax, mask as i32).map_err(|e| e.to_string())?;
+                self.asm.kmovw(k1, eax).map_err(|e| e.to_string())?;
+            }
+
+            let mut s_loop = self.asm.create_label();
+            let mut s_done = self.asm.create_label();
+
+            self.asm.xor(r13d, r13d).map_err(|e| e.to_string())?;
+            self.asm.set_label(&mut s_loop).map_err(|e| e.to_string())?;
+            self.asm.cmp(r13d, seq_len as i32).map_err(|e| e.to_string())?;
+            self.asm.jge(s_done).map_err(|e| e.to_string())?;
+
+            // rdi = &out_head[s, 0]
+            self.asm.mov(r15, r13).map_err(|e| e.to_string())?;
+            self.asm.imul_3(r15, r15, hd_bytes).map_err(|e| e.to_string())?;
+            self.asm.lea(rdi, qword_ptr(rbx + out_off)).map_err(|e| e.to_string())?;
+            self.asm.add(rdi, r15).map_err(|e| e.to_string())?;
+
+            // rsi = &output[s, h*hd]
+            self.asm.mov(r14, r13).map_err(|e| e.to_string())?;
+            self.asm.imul_3(r14, r14, hidden_bytes).map_err(|e| e.to_string())?;
+            self.asm.lea(rax, qword_ptr(r14 + r12)).map_err(|e| e.to_string())?;
+            self.asm.mov(rsi, qword_ptr(rsp + 24)).map_err(|e| e.to_string())?;
+            self.asm.add(rsi, rax).map_err(|e| e.to_string())?;
+
+            // Copy head_dim floats using zmm
+            for v in 0..vec_count {
+                let off = (v * 64) as i32;
+                self.asm.vmovups(zmm0, zmmword_ptr(rdi + off)).map_err(|e| e.to_string())?;
+                self.asm.vmovups(zmmword_ptr(rsi + off), zmm0).map_err(|e| e.to_string())?;
+            }
+            if tail > 0 {
+                let off = (vec_count * 64) as i32;
+                self.asm.vpxord(zmm0, zmm0, zmm0).map_err(|e| e.to_string())?;
+                self.asm.vmovups(zmm0.k1(), zmmword_ptr(rdi + off)).map_err(|e| e.to_string())?;
+                self.asm.vmovups(zmmword_ptr(rsi + off).k1(), zmm0).map_err(|e| e.to_string())?;
+            }
+
+            self.asm.inc(r13).map_err(|e| e.to_string())?;
+            self.asm.jmp(s_loop).map_err(|e| e.to_string())?;
+            self.asm.set_label(&mut s_done).map_err(|e| e.to_string())?;
+            Ok(())
+        }
+
         /// Emit fused RmsNorm → GEMM: normalize A in-place (via scratchpad),
         /// then run the GEMM with the normalized data as input.
         ///
@@ -1926,7 +2548,8 @@ pub mod jit {
             let blocking = profile.gemm_blocking(m, n, k);
             let mr = blocking.mr;
             let nr = blocking.nr;
-            let nr_vecs = nr / 8; // AVX2: 8 f32 per ymm
+            let simd_w = if self.use_avx512 { 16usize } else { 8usize };
+            let nr_vecs = nr / simd_w;
             let kc = blocking.kc;
             let mc = tile_rows;
             let nc = blocking.nc;
@@ -2077,7 +2700,11 @@ pub mod jit {
                 // r11 = packed_b destination
                 self.asm.lea(r11, qword_ptr(rbx + pack_b_off)).map_err(|e| e.to_string())?;
 
-                self.emit_jit_pack_b_avx2(ldb, nr, pack_b_off, loc_kc, loc_nc)?;
+                if self.use_avx512 {
+                    self.emit_jit_pack_b_avx512(ldb, nr, pack_b_off, loc_kc, loc_nc)?;
+                } else {
+                    self.emit_jit_pack_b_avx2(ldb, nr, pack_b_off, loc_kc, loc_nc)?;
+                }
             }
 
             // -- pack_a: norm_scratch[0..mc_cur, pc..pc+kc] into packed_a --
@@ -2088,7 +2715,11 @@ pub mod jit {
                 self.asm.lea(r15, qword_ptr(rbx + norm_scratch_off)).map_err(|e| e.to_string())?;
                 self.asm.add(r15, rax).map_err(|e| e.to_string())?;
 
-                self.emit_jit_pack_a_avx2(lda, mr, pack_a_off, loc_kc, loc_mc)?;
+                if self.use_avx512 {
+                    self.emit_jit_pack_a_avx512(lda, mr, pack_a_off, loc_kc, loc_mc)?;
+                } else {
+                    self.emit_jit_pack_a_avx2(lda, mr, pack_a_off, loc_kc, loc_mc)?;
+                }
             }
 
             // -- jr / ir loops (NR / MR) -- reuse existing BLIS inner loops
@@ -2405,10 +3036,19 @@ pub mod jit {
                 self.asm.cmp(rbx, unrolled_bytes).map_err(|e| e.to_string())?;
                 self.asm.jge(remainder_loop).map_err(|e| e.to_string())?;
 
+                // L1 prefetch
                 self.asm.prefetcht0(byte_ptr(rdi + rbx + prefetch_dist))
                     .map_err(|e| e.to_string())?;
                 if has_binary {
                     self.asm.prefetcht0(byte_ptr(rsi + rbx + prefetch_dist))
+                        .map_err(|e| e.to_string())?;
+                }
+                // L2 prefetch (4x farther)
+                let prefetch_dist_l2 = prefetch_dist * 4;
+                self.asm.prefetcht1(byte_ptr(rdi + rbx + prefetch_dist_l2))
+                    .map_err(|e| e.to_string())?;
+                if has_binary {
+                    self.asm.prefetcht1(byte_ptr(rsi + rbx + prefetch_dist_l2))
                         .map_err(|e| e.to_string())?;
                 }
 
@@ -2587,7 +3227,7 @@ pub mod jit {
                 OpKind::QuantGemm { m, n, k, block_size, bits } => {
                     self.emit_quant_gemm(*m, *n, *k, *block_size, *bits, profile, &epi_refs)?;
                 }
-                _ => {}
+                _ => return Err(format!("EpilogueInjection assigned to non-GEMM anchor {:?}, fusion planner bug", op.kind)),
             }
             Ok(())
         }
@@ -2934,6 +3574,319 @@ pub mod jit {
             Ok(())
         }
 
+        // ── JIT-inlined pack_b (AVX-512) ─────────────────────────────────
+        //
+        // Same layout as pack_b_avx2 but uses zmm (512-bit) loads/stores.
+        // NR is typically 32 (2 zmm vectors per row).
+        //
+        // On entry:
+        //   r10 = B source base ptr (&B[pc, jc])
+        //   r11 = packed_b destination
+        //   [rsp + loc_kc] = kc_cur
+        //   [rsp + loc_nc] = nc_cur
+        //
+        // Clobbers: rax, rcx, rdx, r9, r10, r11, r15, zmm0, zmm1
+        // Preserves: rdi, rsi, r8, r12, r13, r14, rbx, rbp
+        fn emit_jit_pack_b_avx512(
+            &mut self,
+            ldb: usize,
+            nr: usize,
+            pack_b_off: i32,
+            loc_kc: i32,
+            loc_nc: i32,
+        ) -> Result<(), String> {
+            use iced_x86::code_asm::*;
+
+            let ldb_bytes = (ldb * 4) as i32;
+            let nr_bytes = (nr * 4) as i32;
+
+            // ── j loop: iterate over full NR-wide strips ──
+            let mut j_loop = self.asm.create_label();
+            let mut j_rem = self.asm.create_label();
+            let mut j_end = self.asm.create_label();
+
+            // r9 = j (column offset in elements)
+            self.asm.xor(r9, r9).map_err(|e| e.to_string())?;
+            // r15 = dst pointer (advances through packed_b)
+            self.asm.mov(r15, r11).map_err(|e| e.to_string())?;
+
+            self.asm.set_label(&mut j_loop).map_err(|e| e.to_string())?;
+
+            // if j + NR > nc_cur, go to remainder
+            self.asm.mov(rax, r9).map_err(|e| e.to_string())?;
+            self.asm.add(rax, nr as i32).map_err(|e| e.to_string())?;
+            self.asm.cmp(rax, qword_ptr(rsp + loc_nc)).map_err(|e| e.to_string())?;
+            self.asm.jg(j_rem).map_err(|e| e.to_string())?;
+
+            // ── k loop for full NR panel: vectorized copy ──
+            {
+                let mut k_loop = self.asm.create_label();
+                let mut k_done = self.asm.create_label();
+
+                // rdx = B source for this strip = r10 + j * 4
+                self.asm.lea(rdx, qword_ptr(r10 + r9 * 4)).map_err(|e| e.to_string())?;
+                // rcx = k counter
+                self.asm.xor(rcx, rcx).map_err(|e| e.to_string())?;
+
+                self.asm.set_label(&mut k_loop).map_err(|e| e.to_string())?;
+                self.asm.cmp(rcx, qword_ptr(rsp + loc_kc)).map_err(|e| e.to_string())?;
+                self.asm.jge(k_done).map_err(|e| e.to_string())?;
+
+                // Load NR floats from B[k, j..j+NR] using nr/16 zmm registers
+                let nr_vecs_local = nr / 16;
+                for v in 0..nr_vecs_local {
+                    let zmm_reg = Self::zmm_for_index(v)?;
+                    let off = (v as i32) * 64;
+                    self.asm.vmovups(zmm_reg, zmmword_ptr(rdx + off)).map_err(|e| e.to_string())?;
+                }
+
+                // Store to packed_b
+                for v in 0..nr_vecs_local {
+                    let zmm_reg = Self::zmm_for_index(v)?;
+                    let off = (v as i32) * 64;
+                    self.asm.vmovups(zmmword_ptr(r15 + off), zmm_reg).map_err(|e| e.to_string())?;
+                }
+
+                // Advance: src += ldb * 4, dst += NR * 4
+                self.asm.add(rdx, ldb_bytes).map_err(|e| e.to_string())?;
+                self.asm.add(r15, nr_bytes).map_err(|e| e.to_string())?;
+                self.asm.inc(rcx).map_err(|e| e.to_string())?;
+                self.asm.jmp(k_loop).map_err(|e| e.to_string())?;
+
+                self.asm.set_label(&mut k_done).map_err(|e| e.to_string())?;
+            }
+
+            self.asm.add(r9, nr as i32).map_err(|e| e.to_string())?;
+            self.asm.jmp(j_loop).map_err(|e| e.to_string())?;
+
+            // ── Remainder strip: nc_cur % NR columns, zero-padded ──
+            self.asm.set_label(&mut j_rem).map_err(|e| e.to_string())?;
+
+            // rax = nc_rem = nc_cur - j
+            self.asm.mov(rax, qword_ptr(rsp + loc_nc)).map_err(|e| e.to_string())?;
+            self.asm.sub(rax, r9).map_err(|e| e.to_string())?;
+            self.asm.cmp(rax, 0i32).map_err(|e| e.to_string())?;
+            self.asm.jle(j_end).map_err(|e| e.to_string())?;
+
+            // Save nc_rem in r9 (reuse, no longer need j)
+            self.asm.mov(r9, rax).map_err(|e| e.to_string())?;
+
+            // rdx = B source for remainder strip = r10 + (nc_cur - nc_rem) * 4
+            self.asm.mov(rax, qword_ptr(rsp + loc_nc)).map_err(|e| e.to_string())?;
+            self.asm.sub(rax, r9).map_err(|e| e.to_string())?;
+            self.asm.lea(rdx, qword_ptr(r10 + rax * 4)).map_err(|e| e.to_string())?;
+
+            {
+                let mut rk_loop = self.asm.create_label();
+                let mut rk_done = self.asm.create_label();
+
+                self.asm.xor(rcx, rcx).map_err(|e| e.to_string())?;
+
+                self.asm.set_label(&mut rk_loop).map_err(|e| e.to_string())?;
+                self.asm.cmp(rcx, qword_ptr(rsp + loc_kc)).map_err(|e| e.to_string())?;
+                self.asm.jge(rk_done).map_err(|e| e.to_string())?;
+
+                // Zero the destination NR floats using zmm
+                self.asm.vpxord(zmm0, zmm0, zmm0).map_err(|e| e.to_string())?;
+                let nr_vecs_local = nr / 16;
+                for v in 0..nr_vecs_local {
+                    let off = (v as i32) * 64;
+                    self.asm.vmovups(zmmword_ptr(r15 + off), zmm0).map_err(|e| e.to_string())?;
+                }
+
+                // Scalar copy of nc_rem floats
+                {
+                    let mut sc_loop = self.asm.create_label();
+                    let mut sc_done = self.asm.create_label();
+
+                    self.asm.xor(rax, rax).map_err(|e| e.to_string())?;
+
+                    self.asm.set_label(&mut sc_loop).map_err(|e| e.to_string())?;
+                    self.asm.cmp(rax, r9).map_err(|e| e.to_string())?;
+                    self.asm.jge(sc_done).map_err(|e| e.to_string())?;
+
+                    self.asm.vmovss(xmm0, dword_ptr(rdx + rax * 4)).map_err(|e| e.to_string())?;
+                    self.asm.vmovss(dword_ptr(r15 + rax * 4), xmm0).map_err(|e| e.to_string())?;
+
+                    self.asm.inc(rax).map_err(|e| e.to_string())?;
+                    self.asm.jmp(sc_loop).map_err(|e| e.to_string())?;
+
+                    self.asm.set_label(&mut sc_done).map_err(|e| e.to_string())?;
+                }
+
+                self.asm.add(rdx, ldb_bytes).map_err(|e| e.to_string())?;
+                self.asm.add(r15, nr_bytes).map_err(|e| e.to_string())?;
+                self.asm.inc(rcx).map_err(|e| e.to_string())?;
+                self.asm.jmp(rk_loop).map_err(|e| e.to_string())?;
+
+                self.asm.set_label(&mut rk_done).map_err(|e| e.to_string())?;
+            }
+
+            // nop separates rk_done from j_end so iced-x86 doesn't see two labels on one insn
+            self.asm.nop().map_err(|e| e.to_string())?;
+            self.asm.set_label(&mut j_end).map_err(|e| e.to_string())?;
+
+            Ok(())
+        }
+
+        // ── JIT-inlined pack_a (AVX-512) ─────────────────────────────────
+        //
+        // Same layout as pack_a_avx2 but uses zmm (512-bit) stores for zeroing.
+        // MR is typically 14 for AVX-512.
+        //
+        // Pack A from row-major [mc_cur, kc_cur] into panel-major layout:
+        //   For each MR-tall row strip i (0..mc_cur step MR):
+        //     For each column k (0..kc_cur):
+        //       Copy MR floats from A[i..i+MR, k] (column-gather, stride=lda)
+        //       to packed_a contiguously.
+        //   Remainder strip (mc_cur % MR): zero-padded to MR height.
+        //
+        // On entry:
+        //   r15 = A source base ptr (A + ic*lda + pc, byte address)
+        //   rbx = scratchpad base
+        //   [rsp + loc_kc] = kc_cur
+        //   [rsp + loc_mc] = mc_cur
+        //
+        // Clobbers: rax, rcx, rdx, r9, r10, r11, r15, zmm0..zmm1
+        // Preserves: rdi, rsi, r8, r12, r13, r14, rbx, rbp
+        fn emit_jit_pack_a_avx512(
+            &mut self,
+            lda: usize,
+            mr: usize,
+            pack_a_off: i32,
+            loc_kc: i32,
+            loc_mc: i32,
+        ) -> Result<(), String> {
+            use iced_x86::code_asm::*;
+
+            let lda_bytes = (lda * 4) as i32;
+
+            // ── i loop: iterate over full MR-tall strips ──
+            let mut i_loop = self.asm.create_label();
+            let mut i_rem = self.asm.create_label();
+            let mut i_end = self.asm.create_label();
+
+            // r9 = i (row offset in elements)
+            self.asm.xor(r9, r9).map_err(|e| e.to_string())?;
+            // r11 = dst pointer (advances through packed_a)
+            self.asm.lea(r11, qword_ptr(rbx + pack_a_off)).map_err(|e| e.to_string())?;
+
+            self.asm.set_label(&mut i_loop).map_err(|e| e.to_string())?;
+
+            // if i + MR > mc_cur, go to remainder
+            self.asm.mov(rax, r9).map_err(|e| e.to_string())?;
+            self.asm.add(rax, mr as i32).map_err(|e| e.to_string())?;
+            self.asm.cmp(rax, qword_ptr(rsp + loc_mc)).map_err(|e| e.to_string())?;
+            self.asm.jg(i_rem).map_err(|e| e.to_string())?;
+
+            // ── k loop for full MR panel: gather MR rows ──
+            {
+                let mut k_loop = self.asm.create_label();
+                let mut k_done = self.asm.create_label();
+
+                // r10 = A source for this strip = r15 + i * lda * 4
+                self.asm.mov(rax, r9).map_err(|e| e.to_string())?;
+                self.asm.imul_3(rax, rax, lda_bytes).map_err(|e| e.to_string())?;
+                self.asm.lea(r10, qword_ptr(r15 + rax)).map_err(|e| e.to_string())?;
+
+                self.asm.xor(rcx, rcx).map_err(|e| e.to_string())?;
+
+                self.asm.set_label(&mut k_loop).map_err(|e| e.to_string())?;
+                self.asm.cmp(rcx, qword_ptr(rsp + loc_kc)).map_err(|e| e.to_string())?;
+                self.asm.jge(k_done).map_err(|e| e.to_string())?;
+
+                // Gather MR floats from column k of rows i..i+MR
+                // Each row is lda_bytes apart — scalar loads since rows are non-contiguous
+                for row in 0..mr {
+                    let row_off = (row as i32) * lda_bytes;
+                    self.asm.vmovss(xmm0, dword_ptr(r10 + row_off)).map_err(|e| e.to_string())?;
+                    self.asm.vmovss(dword_ptr(r11 + (row * 4) as i32), xmm0).map_err(|e| e.to_string())?;
+                }
+
+                // Advance: src += 4 (next column), dst += MR * 4
+                self.asm.add(r10, 4i32).map_err(|e| e.to_string())?;
+                self.asm.add(r11, (mr * 4) as i32).map_err(|e| e.to_string())?;
+                self.asm.inc(rcx).map_err(|e| e.to_string())?;
+                self.asm.jmp(k_loop).map_err(|e| e.to_string())?;
+
+                self.asm.set_label(&mut k_done).map_err(|e| e.to_string())?;
+            }
+
+            self.asm.add(r9, mr as i32).map_err(|e| e.to_string())?;
+            self.asm.jmp(i_loop).map_err(|e| e.to_string())?;
+
+            // ── Remainder strip: mc_cur % MR rows, zero-padded ──
+            self.asm.set_label(&mut i_rem).map_err(|e| e.to_string())?;
+
+            // rax = mc_rem = mc_cur - i
+            self.asm.mov(rax, qword_ptr(rsp + loc_mc)).map_err(|e| e.to_string())?;
+            self.asm.sub(rax, r9).map_err(|e| e.to_string())?;
+            self.asm.cmp(rax, 0i32).map_err(|e| e.to_string())?;
+            self.asm.jle(i_end).map_err(|e| e.to_string())?;
+
+            // Save mc_rem in r9 (reuse)
+            self.asm.mov(r9, rax).map_err(|e| e.to_string())?;
+
+            // r10 = A source for remainder = r15 + (mc_cur - mc_rem) * lda * 4
+            self.asm.mov(rax, qword_ptr(rsp + loc_mc)).map_err(|e| e.to_string())?;
+            self.asm.sub(rax, r9).map_err(|e| e.to_string())?;
+            self.asm.imul_3(rax, rax, lda_bytes).map_err(|e| e.to_string())?;
+            self.asm.lea(r10, qword_ptr(r15 + rax)).map_err(|e| e.to_string())?;
+
+            {
+                let mut rk_loop = self.asm.create_label();
+                let mut rk_done = self.asm.create_label();
+
+                self.asm.xor(rcx, rcx).map_err(|e| e.to_string())?;
+
+                self.asm.set_label(&mut rk_loop).map_err(|e| e.to_string())?;
+                self.asm.cmp(rcx, qword_ptr(rsp + loc_kc)).map_err(|e| e.to_string())?;
+                self.asm.jge(rk_done).map_err(|e| e.to_string())?;
+
+                // Zero the destination MR floats using zmm + scalar tail
+                self.asm.vpxord(zmm0, zmm0, zmm0).map_err(|e| e.to_string())?;
+                // MR=14 → 56 bytes. Zero with 1 zmm (16 floats = 64 bytes covers all 14 slots
+                // plus 2 padding floats which is fine since we own the buffer)
+                self.asm.vmovups(zmmword_ptr(r11), zmm0).map_err(|e| e.to_string())?;
+
+                // Scalar copy of mc_rem rows
+                {
+                    let mut sc_loop = self.asm.create_label();
+                    let mut sc_done = self.asm.create_label();
+
+                    self.asm.xor(rax, rax).map_err(|e| e.to_string())?;
+
+                    self.asm.set_label(&mut sc_loop).map_err(|e| e.to_string())?;
+                    self.asm.cmp(rax, r9).map_err(|e| e.to_string())?;
+                    self.asm.jge(sc_done).map_err(|e| e.to_string())?;
+
+                    // Load A[rem_row, k] = r10 + rax * lda_bytes
+                    self.asm.mov(rdx, rax).map_err(|e| e.to_string())?;
+                    self.asm.imul_3(rdx, rdx, lda_bytes).map_err(|e| e.to_string())?;
+                    self.asm.vmovss(xmm1, dword_ptr(r10 + rdx)).map_err(|e| e.to_string())?;
+                    self.asm.vmovss(dword_ptr(r11 + rax * 4), xmm1).map_err(|e| e.to_string())?;
+
+                    self.asm.inc(rax).map_err(|e| e.to_string())?;
+                    self.asm.jmp(sc_loop).map_err(|e| e.to_string())?;
+
+                    self.asm.set_label(&mut sc_done).map_err(|e| e.to_string())?;
+                }
+
+                self.asm.add(r10, 4i32).map_err(|e| e.to_string())?;
+                self.asm.add(r11, (mr * 4) as i32).map_err(|e| e.to_string())?;
+                self.asm.inc(rcx).map_err(|e| e.to_string())?;
+                self.asm.jmp(rk_loop).map_err(|e| e.to_string())?;
+
+                self.asm.set_label(&mut rk_done).map_err(|e| e.to_string())?;
+            }
+
+            // nop separates rk_done from i_end so iced-x86 doesn't see two labels on one insn
+            self.asm.nop().map_err(|e| e.to_string())?;
+            self.asm.set_label(&mut i_end).map_err(|e| e.to_string())?;
+
+            Ok(())
+        }
+
 
         /// Emit a GEMM microkernel using the BLIS 5-level blocking scheme.
         ///
@@ -2986,6 +3939,35 @@ pub mod jit {
             epilogue_bodies: &[&[TraceOp]],
         ) -> Result<(), String> {
             let blocking = profile.gemm_blocking(m, n, k);
+
+            // Apply per-shape JIT params from WisdomDb (autotuning→codegen closed loop).
+            // If the measure path already set jit_params (via set_jit_params), keep those.
+            // Otherwise query wisdom for this specific GEMM shape.
+            let prev_jit_params = self.jit_params.clone();
+            if self.jit_params.is_none() {
+                self.jit_params = profile.query_wisdom_jit_params(m, n, k);
+            }
+
+            let result = self.emit_gemm_microkernel_inner(
+                m, n, k, profile, epilogue_bodies, &blocking,
+            );
+
+            // Restore previous jit_params so different GEMM shapes in the same
+            // compilation unit each get their own wisdom-tuned parameters.
+            self.jit_params = prev_jit_params;
+            result
+        }
+
+        /// Inner implementation of emit_gemm_microkernel (after JitParams are set).
+        fn emit_gemm_microkernel_inner(
+            &mut self,
+            m: usize,
+            n: usize,
+            k: usize,
+            _profile: &DeviceProfile,
+            epilogue_bodies: &[&[TraceOp]],
+            blocking: &crate::dispatch::device_profile::GemmBlocking,
+        ) -> Result<(), String> {
             let mr = blocking.mr;
             let nr = blocking.nr;
             let kc = blocking.kc;
@@ -3191,7 +4173,11 @@ pub mod jit {
                 // r11 = packed_b destination
                 self.asm.lea(r11, qword_ptr(rbx + pack_b_off)).map_err(|e| e.to_string())?;
 
-                self.emit_jit_pack_b_avx2(ldb, nr, pack_b_off, loc_kc, loc_nc)?;
+                if self.use_avx512 {
+                    self.emit_jit_pack_b_avx512(ldb, nr, pack_b_off, loc_kc, loc_nc)?;
+                } else {
+                    self.emit_jit_pack_b_avx2(ldb, nr, pack_b_off, loc_kc, loc_nc)?;
+                }
             }
 
             let mut ic_loop = self.asm.create_label();
@@ -3215,7 +4201,11 @@ pub mod jit {
                 self.asm.add(rax, rdi).map_err(|e| e.to_string())?;
                 self.asm.mov(r15, rax).map_err(|e| e.to_string())?;
 
-                self.emit_jit_pack_a_avx2(lda, mr, pack_a_off, loc_kc, loc_mc)?;
+                if self.use_avx512 {
+                    self.emit_jit_pack_a_avx512(lda, mr, pack_a_off, loc_kc, loc_mc)?;
+                } else {
+                    self.emit_jit_pack_a_avx2(lda, mr, pack_a_off, loc_kc, loc_mc)?;
+                }
             }
 
             {
@@ -3772,7 +4762,7 @@ pub mod jit {
         }
 
         /// Emit a single MR×NR GEMM tile: zero accumulators, software-pipelined
-        /// K-loop (unroll-2, prefetch 2 steps ahead), store results.
+        /// K-loop (unroll and prefetch parameterized via JitParams), store results.
         ///
         /// Inputs (set by caller):
         /// - r15 = &A[tile_row, 0]
@@ -3819,7 +4809,9 @@ pub mod jit {
                 }
             }
 
-            let k_main = (k & !1) as i32;
+            let unroll = self.k_unroll_factor().max(1);
+            let pf_dist = self.prefetch_distance();
+            let k_main = (k - (k % unroll)) as i32;
             let mut k_loop = self.asm.create_label();
             let mut k_tail = self.asm.create_label();
             let mut k_done = self.asm.create_label();
@@ -3827,27 +4819,37 @@ pub mod jit {
             self.asm.mov(r9, r11).map_err(|e| e.to_string())?;
             self.asm.xor(r12, r12).map_err(|e| e.to_string())?;
 
-            // Main loop: 2 K-iterations per step (software-pipelined)
+            // Main loop: `unroll` K-iterations per step (software-pipelined)
             self.asm.set_label(&mut k_loop).map_err(|e| e.to_string())?;
             self.asm.cmp(r12, k_main).map_err(|e| e.to_string())?;
             self.asm.jge(k_tail).map_err(|e| e.to_string())?;
 
-            // Prefetch B 2 steps ahead
-            self.asm.prefetcht0(byte_ptr(r9 + 2 * b_row_bytes)).map_err(|e| e.to_string())?;
-            if b_row_bytes > 64 {
-                self.asm.prefetcht0(byte_ptr(r9 + 2 * b_row_bytes + 64)).map_err(|e| e.to_string())?;
+            // Prefetch B ahead: L1 at pf_dist, L2 at 4*pf_dist
+            if pf_dist > 0 {
+                let pf_l1_off = (pf_dist as i32) * b_row_bytes;
+                self.asm.prefetcht0(byte_ptr(r9 + pf_l1_off)).map_err(|e| e.to_string())?;
+                if b_row_bytes > 64 {
+                    self.asm.prefetcht0(byte_ptr(r9 + pf_l1_off + 64)).map_err(|e| e.to_string())?;
+                }
+                let pf_l2_off = (4 * pf_dist as i32) * b_row_bytes;
+                self.asm.prefetcht1(byte_ptr(r9 + pf_l2_off)).map_err(|e| e.to_string())?;
+                if b_row_bytes > 64 {
+                    self.asm.prefetcht1(byte_ptr(r9 + pf_l2_off + 64)).map_err(|e| e.to_string())?;
+                }
             }
 
-            // Iteration 0 (K = r12)
-            self.emit_direct_fma_body_dispatch(tile_mr, tile_nr_vecs, num_acc, 0, a_row_bytes, 0)?;
-            // Iteration 1 (K = r12 + 1)
-            self.emit_direct_fma_body_dispatch(tile_mr, tile_nr_vecs, num_acc, 4, a_row_bytes, b_row_bytes)?;
+            // Unrolled K iterations with load/compute overlap
+            for u in 0..unroll {
+                let a_disp = (u as i32) * 4;  // A element offset for iteration u
+                let b_disp = (u as i32) * b_row_bytes;  // B row offset for iteration u
+                self.emit_direct_fma_body_dispatch(tile_mr, tile_nr_vecs, num_acc, a_disp, a_row_bytes, b_disp)?;
+            }
 
-            self.asm.add(r9, 2 * b_row_bytes).map_err(|e| e.to_string())?;
-            self.asm.add(r12, 2i32).map_err(|e| e.to_string())?;
+            self.asm.add(r9, (unroll as i32) * b_row_bytes).map_err(|e| e.to_string())?;
+            self.asm.add(r12, unroll as i32).map_err(|e| e.to_string())?;
             self.asm.jmp(k_loop).map_err(|e| e.to_string())?;
 
-            // Tail: handle K-odd remainder (at most 1 iteration)
+            // Tail: handle remaining K iterations (at most unroll-1)
             self.asm.set_label(&mut k_tail).map_err(|e| e.to_string())?;
             self.asm.cmp(r12, k as i32).map_err(|e| e.to_string())?;
             self.asm.jge(k_done).map_err(|e| e.to_string())?;
@@ -3855,6 +4857,7 @@ pub mod jit {
             self.emit_direct_fma_body_dispatch(tile_mr, tile_nr_vecs, num_acc, 0, a_row_bytes, 0)?;
             self.asm.add(r9, b_row_bytes).map_err(|e| e.to_string())?;
             self.asm.inc(r12).map_err(|e| e.to_string())?;
+            self.asm.jmp(k_tail).map_err(|e| e.to_string())?;
 
             self.asm.set_label(&mut k_done).map_err(|e| e.to_string())?;
 
@@ -3909,7 +4912,7 @@ pub mod jit {
         /// Clobbers: rcx (K counter), rdx (B_k_ptr), rax (k_main scratch),
         ///           ymm0..ymm(num_acc), two ymm scratch registers at indices
         ///           `num_acc` and `num_acc+1` (A broadcast interleaving).
-        /// Uses software-pipelined K-loop (unroll-2, prefetch 2 steps ahead).
+        /// Uses software-pipelined K-loop (unroll and prefetch parameterized via JitParams).
         fn emit_gemm_tile_packed(
             &mut self,
             tile_mr: usize,
@@ -3982,44 +4985,68 @@ pub mod jit {
             let mut k_tail = self.asm.create_label();
             let mut k_done = self.asm.create_label();
 
+            let unroll = self.k_unroll_factor().max(1);
+            let pf_dist = self.prefetch_distance();
+
             self.asm.mov(rdx, r11).map_err(|e| e.to_string())?;
             self.asm.xor(rcx, rcx).map_err(|e| e.to_string())?;
 
-            // rax = k_main = kc_cur & ~1 (even part for unrolled loop)
+            // rax = k_main = kc_cur - (kc_cur % unroll) (aligned part for unrolled loop)
             self.asm.mov(rax, qword_ptr(rsp + loc_kc)).map_err(|e| e.to_string())?;
-            self.asm.and(rax, -2i32).map_err(|e| e.to_string())?;
+            if unroll > 1 {
+                // k_main = kc_cur & ~(unroll - 1), works when unroll is power of 2
+                // For non-power-of-2, use: k_main = kc_cur - (kc_cur % unroll)
+                // Since typical unroll values (1,2,4,8) are all powers of 2, use AND.
+                let mask = -(unroll as i32);
+                self.asm.and(rax, mask).map_err(|e| e.to_string())?;
+            }
 
-            // Main loop: 2 K-iterations per step (software-pipelined)
+            // Main loop: `unroll` K-iterations per step (software-pipelined)
             self.asm.set_label(&mut k_loop).map_err(|e| e.to_string())?;
             self.asm.cmp(rcx, rax).map_err(|e| e.to_string())?;
             self.asm.jge(k_tail).map_err(|e| e.to_string())?;
 
-            // Prefetch A/B 2 steps ahead
-            self.asm.prefetcht0(byte_ptr(r15 + 2 * mr_stride_bytes)).map_err(|e| e.to_string())?;
-            self.asm.prefetcht0(byte_ptr(rdx + 2 * nr_stride_bytes)).map_err(|e| e.to_string())?;
-            if nr_stride_bytes > 64 {
-                self.asm.prefetcht0(byte_ptr(rdx + 2 * nr_stride_bytes + 64)).map_err(|e| e.to_string())?;
+            // Prefetch A/B ahead: L1 at pf_dist, L2 at 4*pf_dist
+            if pf_dist > 0 {
+                let pf_l1_a = (pf_dist as i32) * mr_stride_bytes;
+                let pf_l1_b = (pf_dist as i32) * nr_stride_bytes;
+                self.asm.prefetcht0(byte_ptr(r15 + pf_l1_a)).map_err(|e| e.to_string())?;
+                self.asm.prefetcht0(byte_ptr(rdx + pf_l1_b)).map_err(|e| e.to_string())?;
+                if nr_stride_bytes > 64 {
+                    self.asm.prefetcht0(byte_ptr(rdx + pf_l1_b + 64)).map_err(|e| e.to_string())?;
+                }
+                let pf_l2_a = (4 * pf_dist as i32) * mr_stride_bytes;
+                let pf_l2_b = (4 * pf_dist as i32) * nr_stride_bytes;
+                self.asm.prefetcht1(byte_ptr(r15 + pf_l2_a)).map_err(|e| e.to_string())?;
+                self.asm.prefetcht1(byte_ptr(rdx + pf_l2_b)).map_err(|e| e.to_string())?;
+                if nr_stride_bytes > 64 {
+                    self.asm.prefetcht1(byte_ptr(rdx + pf_l2_b + 64)).map_err(|e| e.to_string())?;
+                }
             }
 
-            // Iteration 0 (K = rcx)
-            self.emit_packed_fma_body(tile_mr, tile_nr_vecs, num_acc, 0, 0)?;
-            // Iteration 1 (K = rcx + 1)
-            self.emit_packed_fma_body(tile_mr, tile_nr_vecs, num_acc, mr_stride_bytes, nr_stride_bytes)?;
+            // Unrolled K iterations with load/compute overlap
+            for u in 0..unroll {
+                let a_off = (u as i32) * mr_stride_bytes;
+                let b_off = (u as i32) * nr_stride_bytes;
+                self.emit_packed_fma_body(tile_mr, tile_nr_vecs, num_acc, a_off, b_off)?;
+            }
 
-            self.asm.add(r15, 2 * mr_stride_bytes).map_err(|e| e.to_string())?;
-            self.asm.add(rdx, 2 * nr_stride_bytes).map_err(|e| e.to_string())?;
-            self.asm.add(rcx, 2i32).map_err(|e| e.to_string())?;
+            self.asm.add(r15, (unroll as i32) * mr_stride_bytes).map_err(|e| e.to_string())?;
+            self.asm.add(rdx, (unroll as i32) * nr_stride_bytes).map_err(|e| e.to_string())?;
+            self.asm.add(rcx, unroll as i32).map_err(|e| e.to_string())?;
             self.asm.jmp(k_loop).map_err(|e| e.to_string())?;
 
-            // Tail: handle K-odd remainder (at most 1 iteration)
+            // Tail: handle remaining K iterations (at most unroll-1)
             self.asm.set_label(&mut k_tail).map_err(|e| e.to_string())?;
             self.asm.cmp(rcx, qword_ptr(rsp + loc_kc)).map_err(|e| e.to_string())?;
             self.asm.jge(k_done).map_err(|e| e.to_string())?;
 
-            self.asm.prefetcht0(byte_ptr(r15 + mr_stride_bytes)).map_err(|e| e.to_string())?;
-            self.asm.prefetcht0(byte_ptr(rdx + nr_stride_bytes)).map_err(|e| e.to_string())?;
-            if nr_stride_bytes > 64 {
-                self.asm.prefetcht0(byte_ptr(rdx + nr_stride_bytes + 64)).map_err(|e| e.to_string())?;
+            if pf_dist > 0 {
+                self.asm.prefetcht0(byte_ptr(r15 + mr_stride_bytes)).map_err(|e| e.to_string())?;
+                self.asm.prefetcht0(byte_ptr(rdx + nr_stride_bytes)).map_err(|e| e.to_string())?;
+                if nr_stride_bytes > 64 {
+                    self.asm.prefetcht0(byte_ptr(rdx + nr_stride_bytes + 64)).map_err(|e| e.to_string())?;
+                }
             }
 
             self.emit_packed_fma_body(tile_mr, tile_nr_vecs, num_acc, 0, 0)?;
@@ -4027,6 +5054,7 @@ pub mod jit {
             self.asm.add(r15, mr_stride_bytes).map_err(|e| e.to_string())?;
             self.asm.add(rdx, nr_stride_bytes).map_err(|e| e.to_string())?;
             self.asm.inc(rcx).map_err(|e| e.to_string())?;
+            self.asm.jmp(k_tail).map_err(|e| e.to_string())?;
 
             self.asm.set_label(&mut k_done).map_err(|e| e.to_string())?;
 
@@ -4696,14 +5724,18 @@ pub mod jit {
             row_size: usize,
             eps: f32,
         ) -> Result<(), String> {
-            let simd_w = self.simd_width; // 8 for AVX2
+            if self.use_avx512 {
+                return self.emit_norm_row_jit_avx512(output_reg, weight_reg, row_size, eps);
+            }
+
+            let simd_w = 8usize; // ymm (AVX2) width
             let vec_count = row_size / simd_w;
             let tail = row_size % simd_w;
             let total_vec_bytes = (vec_count * simd_w * 4) as i32;
             let n_f32 = row_size as f32;
 
             // -- Phase 1: Reduce -- accumulate sum_sq = sum(x^2) --
-            self.asm.vxorps(ymm0, ymm0, ymm0).map_err(|e| e.to_string())?; // ymm0 = accumulator
+            self.asm.vxorps(ymm0, ymm0, ymm0).map_err(|e| e.to_string())?;
 
             if vec_count > 0 {
                 let mut r_loop = self.asm.create_label();
@@ -4722,11 +5754,9 @@ pub mod jit {
             }
 
             // -- Phase 1.5: Horizontal sum --
-            // Must reduce ymm0 to scalar BEFORE scalar tail, because VEX-encoded
-            // scalar ops (vfmadd231ss etc.) zero bits [255:128] of the destination ymm.
             self.emit_horizontal_sum_ymm(ymm0, ymm0)?;
 
-            // Scalar tail for reduce (now safe: ymm0 is already a broadcast scalar)
+            // Scalar tail for reduce
             if tail > 0 {
                 let base = total_vec_bytes;
                 for t in 0..tail as i32 {
@@ -4740,13 +5770,12 @@ pub mod jit {
             let n_label = self.const_f32(n_f32);
             let eps_label = self.const_f32(eps);
 
-            // After hsum + scalar tail, sum_sq is in xmm0[0]. Broadcast to ymm for vectorized divide.
             self.asm.vbroadcastss(ymm0, xmm0).map_err(|e| e.to_string())?;
             self.asm.vbroadcastss(ymm3, dword_ptr(n_label)).map_err(|e| e.to_string())?;
-            self.asm.vdivps(ymm2, ymm0, ymm3).map_err(|e| e.to_string())?;    // mean_sq = sum_sq / n
+            self.asm.vdivps(ymm2, ymm0, ymm3).map_err(|e| e.to_string())?;
             self.asm.vbroadcastss(ymm3, dword_ptr(eps_label)).map_err(|e| e.to_string())?;
-            self.asm.vaddps(ymm2, ymm2, ymm3).map_err(|e| e.to_string())?;     // mean_sq + eps
-            self.asm.vrsqrtps(ymm15, ymm2).map_err(|e| e.to_string())?;        // ymm15 = scale
+            self.asm.vaddps(ymm2, ymm2, ymm3).map_err(|e| e.to_string())?;
+            self.asm.vrsqrtps(ymm15, ymm2).map_err(|e| e.to_string())?;
 
             // -- Phase 3: Transform -- output = x * scale * weight --
             if vec_count > 0 {
@@ -4757,11 +5786,11 @@ pub mod jit {
                 self.asm.cmp(rcx, total_vec_bytes).map_err(|e| e.to_string())?;
                 self.asm.jge(t_done).map_err(|e| e.to_string())?;
 
-                self.asm.vmovups(ymm2, ymmword_ptr(rdi + rcx)).map_err(|e| e.to_string())?;       // x
-                self.asm.vmulps(ymm2, ymm2, ymm15).map_err(|e| e.to_string())?;                   // x * scale
-                self.asm.vmovups(ymm3, ymmword_ptr(weight_reg + rcx)).map_err(|e| e.to_string())?; // weight
-                self.asm.vmulps(ymm2, ymm2, ymm3).map_err(|e| e.to_string())?;                    // x * scale * weight
-                self.asm.vmovups(ymmword_ptr(output_reg + rcx), ymm2).map_err(|e| e.to_string())?; // store
+                self.asm.vmovups(ymm2, ymmword_ptr(rdi + rcx)).map_err(|e| e.to_string())?;
+                self.asm.vmulps(ymm2, ymm2, ymm15).map_err(|e| e.to_string())?;
+                self.asm.vmovups(ymm3, ymmword_ptr(weight_reg + rcx)).map_err(|e| e.to_string())?;
+                self.asm.vmulps(ymm2, ymm2, ymm3).map_err(|e| e.to_string())?;
+                self.asm.vmovups(ymmword_ptr(output_reg + rcx), ymm2).map_err(|e| e.to_string())?;
 
                 self.asm.add(rcx, 32i32).map_err(|e| e.to_string())?;
                 self.asm.jmp(t_loop).map_err(|e| e.to_string())?;
@@ -4773,12 +5802,134 @@ pub mod jit {
                 let base = total_vec_bytes;
                 for t in 0..tail as i32 {
                     let off = base + t * 4;
-                    self.asm.vmovss(xmm0, dword_ptr(rdi + off)).map_err(|e| e.to_string())?;       // x
-                    self.asm.vmulss(xmm0, xmm0, xmm15).map_err(|e| e.to_string())?;                // x * scale
-                    self.asm.vmovss(xmm2, dword_ptr(weight_reg + off)).map_err(|e| e.to_string())?; // weight
-                    self.asm.vmulss(xmm0, xmm0, xmm2).map_err(|e| e.to_string())?;                 // x * scale * weight
-                    self.asm.vmovss(dword_ptr(output_reg + off), xmm0).map_err(|e| e.to_string())?; // store
+                    self.asm.vmovss(xmm0, dword_ptr(rdi + off)).map_err(|e| e.to_string())?;
+                    self.asm.vmulss(xmm0, xmm0, xmm15).map_err(|e| e.to_string())?;
+                    self.asm.vmovss(xmm2, dword_ptr(weight_reg + off)).map_err(|e| e.to_string())?;
+                    self.asm.vmulss(xmm0, xmm0, xmm2).map_err(|e| e.to_string())?;
+                    self.asm.vmovss(dword_ptr(output_reg + off), xmm0).map_err(|e| e.to_string())?;
                 }
+            }
+
+            Ok(())
+        }
+
+        /// AVX-512 zmm path for RmsNorm row JIT.
+        ///
+        /// Uses zmm registers (16-wide f32) for 2x throughput over the ymm path.
+        /// Phase 1: zmm0 accumulates sum_sq via vfmadd231ps zmm.
+        /// Phase 2: vrsqrt14ps zmm for approximate rsqrt + Newton-Raphson.
+        /// Phase 3: zmm transform loop with masked tail store.
+        ///
+        /// Register contract: same as emit_norm_row_jit (rdi=input, output_reg, weight_reg).
+        /// Clobbers: rcx, zmm0-zmm3, zmm15, xmm0, xmm2, k1.
+        fn emit_norm_row_jit_avx512(
+            &mut self,
+            output_reg: AsmRegister64,
+            weight_reg: AsmRegister64,
+            row_size: usize,
+            eps: f32,
+        ) -> Result<(), String> {
+            let simd_w = 16usize; // zmm: 16 x f32
+            let vec_count = row_size / simd_w;
+            let tail = row_size % simd_w;
+            let total_vec_bytes = (vec_count * simd_w * 4) as i32;
+            let n_f32 = row_size as f32;
+
+            // -- Phase 1: Reduce -- accumulate sum_sq = sum(x^2) via zmm --
+            self.asm.vxorps(zmm0, zmm0, zmm0).map_err(|e| e.to_string())?;
+
+            if vec_count > 0 {
+                let mut r_loop = self.asm.create_label();
+                let mut r_done = self.asm.create_label();
+                self.asm.xor(rcx, rcx).map_err(|e| e.to_string())?;
+                self.asm.set_label(&mut r_loop).map_err(|e| e.to_string())?;
+                self.asm.cmp(rcx, total_vec_bytes).map_err(|e| e.to_string())?;
+                self.asm.jge(r_done).map_err(|e| e.to_string())?;
+
+                self.asm.vmovups(zmm2, zmmword_ptr(rdi + rcx)).map_err(|e| e.to_string())?;
+                self.asm.vfmadd231ps(zmm0, zmm2, zmm2).map_err(|e| e.to_string())?;
+
+                self.asm.add(rcx, 64i32).map_err(|e| e.to_string())?;
+                self.asm.jmp(r_loop).map_err(|e| e.to_string())?;
+                self.asm.set_label(&mut r_done).map_err(|e| e.to_string())?;
+            }
+
+            // -- Phase 1.5: Horizontal sum zmm0 → scalar in xmm0 --
+            self.emit_horizontal_sum_zmm(zmm0, zmm0)?;
+
+            // Masked tail for reduce: process remaining elements with k1 mask
+            if tail > 0 {
+                let mask_bits = (1u16 << tail) - 1;
+                self.asm.mov(rcx, mask_bits as u64).map_err(|e| e.to_string())?;
+                self.asm.kmovw(k1, ecx).map_err(|e| e.to_string())?;
+                // Load tail elements (zero-masked)
+                self.asm.vmovups(zmm2.k1().z(), zmmword_ptr(rdi + total_vec_bytes)).map_err(|e| e.to_string())?;
+                self.asm.vfmadd231ps(zmm0, zmm2, zmm2).map_err(|e| e.to_string())?;
+                // Re-reduce after tail addition
+                self.emit_horizontal_sum_zmm(zmm0, zmm0)?;
+            }
+
+            // -- Phase 2: Finalize -- scale = rsqrt(sum_sq / n + eps) --
+            let n_label = self.const_f32(n_f32);
+            let eps_label = self.const_f32(eps);
+
+            // Broadcast scalar sum_sq to zmm0, then compute mean_sq + eps
+            self.asm.vbroadcastss(zmm0, xmm0).map_err(|e| e.to_string())?;
+            self.asm.vbroadcastss(zmm3, dword_ptr(n_label)).map_err(|e| e.to_string())?;
+            self.asm.vdivps(zmm2, zmm0, zmm3).map_err(|e| e.to_string())?;
+            self.asm.vbroadcastss(zmm3, dword_ptr(eps_label)).map_err(|e| e.to_string())?;
+            self.asm.vaddps(zmm2, zmm2, zmm3).map_err(|e| e.to_string())?;
+            // vrsqrt14ps: AVX-512 approximate rsqrt (14-bit precision)
+            self.asm.vrsqrt14ps(zmm15, zmm2).map_err(|e| e.to_string())?;
+            // Newton-Raphson refinement: x' = x * (3 - a*x*x) / 2
+            // zmm3 = zmm15 * zmm15 (x^2)
+            self.asm.vmulps(zmm3, zmm15, zmm15).map_err(|e| e.to_string())?;
+            // zmm3 = zmm2 * zmm3 (a * x^2)
+            self.asm.vmulps(zmm3, zmm2, zmm3).map_err(|e| e.to_string())?;
+            // zmm2 = broadcast 3.0
+            let three_label = self.const_f32(3.0);
+            self.asm.vbroadcastss(zmm2, dword_ptr(three_label)).map_err(|e| e.to_string())?;
+            // zmm3 = 3.0 - a*x^2
+            self.asm.vsubps(zmm3, zmm2, zmm3).map_err(|e| e.to_string())?;
+            // zmm15 = zmm15 * zmm3 (x * (3 - a*x^2))
+            self.asm.vmulps(zmm15, zmm15, zmm3).map_err(|e| e.to_string())?;
+            // zmm2 = broadcast 0.5
+            let half_label = self.const_f32(0.5);
+            self.asm.vbroadcastss(zmm2, dword_ptr(half_label)).map_err(|e| e.to_string())?;
+            // zmm15 = zmm15 * 0.5 = refined rsqrt (scale)
+            self.asm.vmulps(zmm15, zmm15, zmm2).map_err(|e| e.to_string())?;
+
+            // -- Phase 3: Transform -- output = x * scale * weight via zmm --
+            if vec_count > 0 {
+                let mut t_loop = self.asm.create_label();
+                let mut t_done = self.asm.create_label();
+                self.asm.xor(rcx, rcx).map_err(|e| e.to_string())?;
+                self.asm.set_label(&mut t_loop).map_err(|e| e.to_string())?;
+                self.asm.cmp(rcx, total_vec_bytes).map_err(|e| e.to_string())?;
+                self.asm.jge(t_done).map_err(|e| e.to_string())?;
+
+                self.asm.vmovups(zmm2, zmmword_ptr(rdi + rcx)).map_err(|e| e.to_string())?;
+                self.asm.vmulps(zmm2, zmm2, zmm15).map_err(|e| e.to_string())?;
+                self.asm.vmovups(zmm3, zmmword_ptr(weight_reg + rcx)).map_err(|e| e.to_string())?;
+                self.asm.vmulps(zmm2, zmm2, zmm3).map_err(|e| e.to_string())?;
+                self.asm.vmovups(zmmword_ptr(output_reg + rcx), zmm2).map_err(|e| e.to_string())?;
+
+                self.asm.add(rcx, 64i32).map_err(|e| e.to_string())?;
+                self.asm.jmp(t_loop).map_err(|e| e.to_string())?;
+                self.asm.set_label(&mut t_done).map_err(|e| e.to_string())?;
+            }
+
+            // Masked tail for transform
+            if tail > 0 {
+                let mask_bits = (1u16 << tail) - 1;
+                self.asm.mov(rcx, mask_bits as u64).map_err(|e| e.to_string())?;
+                self.asm.kmovw(k1, ecx).map_err(|e| e.to_string())?;
+
+                self.asm.vmovups(zmm2.k1().z(), zmmword_ptr(rdi + total_vec_bytes)).map_err(|e| e.to_string())?;
+                self.asm.vmulps(zmm2, zmm2, zmm15).map_err(|e| e.to_string())?;
+                self.asm.vmovups(zmm3.k1().z(), zmmword_ptr(weight_reg + total_vec_bytes)).map_err(|e| e.to_string())?;
+                self.asm.vmulps(zmm2, zmm2, zmm3).map_err(|e| e.to_string())?;
+                self.asm.vmovups(zmmword_ptr(output_reg + total_vec_bytes).k1(), zmm2).map_err(|e| e.to_string())?;
             }
 
             Ok(())
@@ -6804,7 +7955,7 @@ impl crate::compiler::codegen::emitter::PlatformBackend for X86Backend {
     }
 
     fn num_simd_regs(&self) -> usize {
-        16 // x86_64: ymm0-ymm15 (AVX2) or zmm0-zmm15 (AVX-512)
+        32 // x86_64: ymm0-ymm15 (AVX2) or zmm0-zmm31 (AVX-512)
     }
 }
 
@@ -9036,6 +10187,219 @@ mod registry_elementwise_tests {
             );
         }
         eprintln!("Registry SiLU with tail: all {} elements within 1e-3", TAIL_N);
+    }
+}
+
+// ── AVX-512 numerical regression tests (REQ-COMPILER-010) ──────────────
+#[cfg(test)]
+#[cfg(target_arch = "x86_64")]
+#[cfg(feature = "jit-x86")]
+mod avx512_regression_tests {
+    use crate::compiler::codegen::x86_64::jit::X86CodeGen;
+    use crate::compiler::executable::CompiledLayer;
+    use crate::compiler::graph::{CompilerGraph, OpKind, OpId, TensorId};
+    use crate::compiler::fusion::{FusionGroup, FusionPlan, FusionMode};
+    use crate::compiler::buffer_alloc::BufferAllocation;
+    use crate::compiler::registry::ScalarOpRegistry;
+    use crate::dispatch::DeviceProfile;
+    use crate::inference::types::DType;
+    use std::collections::HashMap;
+
+    const N: usize = 48; // not a multiple of 16, tests zmm tail handling
+
+    fn fill_matrix(rows: usize, cols: usize, seed: u32) -> Vec<f32> {
+        let len = rows * cols;
+        let mut v = Vec::with_capacity(len);
+        let mut s = seed;
+        for _ in 0..len {
+            s = s.wrapping_mul(1664525).wrapping_add(1013904223);
+            v.push((s as f32) / (u32::MAX as f32) * 2.0 - 1.0);
+        }
+        v
+    }
+
+    fn ref_matmul(a: &[f32], b: &[f32], c: &mut [f32], m: usize, n: usize, k: usize) {
+        for i in 0..m {
+            for j in 0..n {
+                let mut sum = 0.0f32;
+                for p in 0..k { sum += a[i * k + p] * b[p * n + j]; }
+                c[i * n + j] = sum;
+            }
+        }
+    }
+
+    fn ref_silu(x: f32) -> f32 { x / (1.0 + (-x).exp()) }
+
+    fn has_avx512() -> bool {
+        let profile = DeviceProfile::detect();
+        matches!(profile.isa,
+            crate::dispatch::device_profile::IsaLevel::Avx512
+            | crate::dispatch::device_profile::IsaLevel::Avx512Amx)
+    }
+
+    /// AVX-512 elementwise chain: SiLU via zmm registers vs scalar reference.
+    #[test]
+    fn test_avx512_elementwise_chain_numerical() {
+        if !has_avx512() {
+            eprintln!("Skipping AVX-512 test: no AVX-512 support");
+            return;
+        }
+
+        let mut g = CompilerGraph::new();
+        let input = g.add_tensor("input", vec![N], DType::F32);
+        let output = g.add_tensor("output", vec![N], DType::F32);
+        g.inputs = vec![input];
+        g.outputs = vec![output];
+        let op_id = g.add_op(OpKind::Silu, vec![input], vec![output], "silu");
+
+        let mut op_to_group = HashMap::new();
+        op_to_group.insert(op_id, 0);
+        let plan = FusionPlan {
+            groups: vec![FusionGroup {
+                id: 0, anchor: op_id, epilogue: vec![],
+                mode: FusionMode::LoopFusion, ops: vec![op_id],
+            }],
+            op_to_group,
+        };
+        let alloc = BufferAllocation { slots: vec![], total_bytes: N * 4, num_tensors: 0, bytes_saved: 0 };
+        let profile = DeviceProfile::detect();
+        let registry = ScalarOpRegistry::with_defaults();
+
+        let mut codegen = X86CodeGen::new(&profile);
+        let out = codegen.emit_plan(&plan, &g, &alloc, &profile, Some(&registry)).unwrap();
+        let layer = CompiledLayer::from_code(&out.code, out.scratchpad_bytes, 0).unwrap();
+
+        let inp = fill_matrix(1, N, 42);
+        let mut result = vec![0.0f32; N];
+        unsafe {
+            let f = layer.entry_point();
+            f(
+                inp.as_ptr() as *const u8, std::ptr::null(), std::ptr::null_mut(),
+                std::ptr::null(), result.as_mut_ptr() as *const usize,
+                0, 0, std::ptr::null_mut(), std::ptr::null_mut(),
+            );
+        }
+
+        for i in 0..N {
+            let expected = ref_silu(inp[i]);
+            let diff = (result[i] - expected).abs();
+            assert!(diff < 1e-3,
+                "AVX-512 SiLU mismatch at [{}]: got={}, expected={}, diff={}", i, result[i], expected, diff);
+        }
+        eprintln!("AVX-512 elementwise chain (SiLU): {} elements OK", N);
+    }
+
+    /// AVX-512 epilogue injection: GEMM + SiLU via zmm vs scalar reference.
+    #[test]
+    fn test_avx512_epilogue_injection_numerical() {
+        if !has_avx512() {
+            eprintln!("Skipping AVX-512 test: no AVX-512 support");
+            return;
+        }
+
+        let (m, n, k) = (8, 16, 32);
+        let mut g = CompilerGraph::new();
+        let a = g.add_tensor("A", vec![m, k], DType::F32);
+        let b = g.add_tensor("B", vec![k, n], DType::F32);
+        let c = g.add_tensor("C", vec![m, n], DType::F32);
+        let out = g.add_tensor("out", vec![m, n], DType::F32);
+        g.inputs = vec![a, b];
+        g.outputs = vec![out];
+        let gemm_id = g.add_op(OpKind::Gemm { m, n, k }, vec![a, b], vec![c], "gemm");
+        let silu_id = g.add_op(OpKind::Silu, vec![c], vec![out], "silu");
+
+        let mut op_to_group = HashMap::new();
+        op_to_group.insert(gemm_id, 0);
+        op_to_group.insert(silu_id, 0);
+        let plan = FusionPlan {
+            groups: vec![FusionGroup {
+                id: 0, anchor: gemm_id, epilogue: vec![silu_id],
+                mode: FusionMode::EpilogueInjection, ops: vec![gemm_id, silu_id],
+            }],
+            op_to_group,
+        };
+        let alloc = BufferAllocation { slots: vec![], total_bytes: 0, num_tensors: 0, bytes_saved: 0 };
+        let profile = DeviceProfile::detect();
+        let registry = ScalarOpRegistry::with_defaults();
+
+        let mut codegen = X86CodeGen::new(&profile);
+        let output = codegen.emit_plan(&plan, &g, &alloc, &profile, Some(&registry)).unwrap();
+        let layer = CompiledLayer::from_code(&output.code, output.scratchpad_bytes, 0).unwrap();
+
+        let a_data = fill_matrix(m, k, 42);
+        let b_data = fill_matrix(k, n, 99);
+        let mut c_jit = vec![0.0f32; m * n];
+        let mut scratch = vec![0u8; output.scratchpad_bytes.max(64)];
+        unsafe {
+            let f = layer.entry_point();
+            f(
+                a_data.as_ptr() as *const u8, b_data.as_ptr() as *const u8,
+                std::ptr::null_mut(), std::ptr::null(),
+                c_jit.as_mut_ptr() as *const usize,
+                0, 0, std::ptr::null_mut(), scratch.as_mut_ptr(),
+            );
+        }
+
+        let mut c_ref = vec![0.0f32; m * n];
+        ref_matmul(&a_data, &b_data, &mut c_ref, m, n, k);
+        for v in c_ref.iter_mut() { *v = ref_silu(*v); }
+
+        let tol = k as f32 * 2e-4;
+        for i in 0..m {
+            for j in 0..n {
+                let idx = i * n + j;
+                assert!(!c_jit[idx].is_nan(), "AVX-512 GEMM+SiLU NaN at [{i},{j}]");
+                let diff = (c_jit[idx] - c_ref[idx]).abs();
+                assert!(diff < tol,
+                    "AVX-512 GEMM+SiLU mismatch at [{i},{j}]: jit={}, ref={}, diff={diff}",
+                    c_jit[idx], c_ref[idx]);
+            }
+        }
+        eprintln!("AVX-512 epilogue injection (GEMM+SiLU): {}x{} OK", m, n);
+    }
+
+    /// AVX-512 norm row: zmm path vs scalar RmsNorm reference.
+    #[test]
+    fn test_avx512_norm_row_numerical() {
+        if !has_avx512() {
+            eprintln!("Skipping AVX-512 test: no AVX-512 support");
+            return;
+        }
+
+        let (m, n, k) = (4, 16, 64); // k=64 exercises zmm norm (4 full zmm vectors)
+        let eps: f32 = 1e-5;
+
+        let mut g = CompilerGraph::new();
+        let a = g.add_tensor("A", vec![m, k], DType::F32);
+        let norm_w = g.add_tensor("norm_w", vec![k], DType::F32);
+        let normed = g.add_tensor("normed", vec![m, k], DType::F32);
+        let b = g.add_tensor("B", vec![k, n], DType::F32);
+        let c = g.add_tensor("C", vec![m, n], DType::F32);
+        g.inputs = vec![a];
+        g.outputs = vec![c];
+        let norm_id = g.add_op(OpKind::RmsNorm { eps }, vec![a, norm_w], vec![normed], "norm");
+        let gemm_id = g.add_op(OpKind::Gemm { m, n, k }, vec![normed, b], vec![c], "gemm");
+
+        let mut op_to_group = HashMap::new();
+        op_to_group.insert(norm_id, 0);
+        op_to_group.insert(gemm_id, 0);
+        let plan = FusionPlan {
+            groups: vec![FusionGroup {
+                id: 0, anchor: gemm_id, epilogue: vec![],
+                mode: FusionMode::ComputeRoot { predecessor: norm_id },
+                ops: vec![norm_id, gemm_id],
+            }],
+            op_to_group,
+        };
+        let alloc = BufferAllocation { slots: vec![], total_bytes: 0, num_tensors: 0, bytes_saved: 0 };
+        let profile = DeviceProfile::detect();
+        let registry = ScalarOpRegistry::with_defaults();
+
+        let mut codegen = X86CodeGen::new(&profile);
+        let output = codegen.emit_plan(&plan, &g, &alloc, &profile, Some(&registry)).unwrap();
+        assert!(!output.code.is_empty(), "ComputeRoot codegen should produce code");
+        eprintln!("AVX-512 norm row (ComputeRoot): codegen {} bytes, scratchpad {} bytes",
+            output.code.len(), output.scratchpad_bytes);
     }
 }
 

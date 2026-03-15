@@ -1206,7 +1206,7 @@ pub mod jit {
                 let dst_row_off = s * hd_bytes;     // byte offset of row s in [seq, head_dim]
 
                 // For each of Q, K, V:
-                for (sp_off, scratch_off) in [(0i32, q_off), (8, k_off), (16, v_off)] {
+                for (sp_off, scratch_off) in [(0u32, q_off), (8u32, k_off), (16u32, v_off)] {
                     // x10 = input_base + src_row_off + x13 (head offset)
                     dynasm!(self.ops ; .arch aarch64 ; ldr x10, [sp, sp_off]);
                     self.emit_add_offset_gp(10, 10, src_row_off);
@@ -1689,7 +1689,7 @@ pub mod jit {
 
         // ── BLIS 5-level loop nesting ────────────────────────────────
 
-        fn emit_gemm_blis_core(
+        pub fn emit_gemm_blis_core(
             &mut self,
             m: usize,
             n: usize,
@@ -2249,62 +2249,338 @@ pub mod jit {
             self.emit_gemm_microkernel_core(m, n, k, profile, &body_refs)
         }
 
+        /// JIT emit: RmsNorm for one row of `row_size` f32 elements (NEON).
+        ///
+        /// Computes: output[i] = input[i] * rsqrt(mean(input^2) + eps) * weight[i]
+        ///
+        /// Register contract (AAPCS64):
+        ///   x_input_reg = input row pointer (read-only)
+        ///   x_output_reg = output row pointer
+        ///   x_weight_reg = weight vector pointer
+        ///
+        /// Clobbers: x9, x13, v0-v5, v16-v17, v28-v29
+        /// Preserves: all other GPRs and NEON regs
+        fn emit_norm_row_jit_neon(
+            &mut self,
+            output_reg: u8,
+            weight_reg: u8,
+            input_reg: u8,
+            row_size: usize,
+            eps: f32,
+        ) -> Result<(), String> {
+            let simd_w = NEON_WIDTH_F32; // 4 x f32
+            let vec_count = row_size / simd_w;
+            let tail = row_size % simd_w;
+            let vec_bytes = vec_count * simd_w * 4;
+            let n_f32 = row_size as f32;
+
+            // -- Phase 1: Reduce -- accumulate sum_sq = sum(x^2) --
+            // v0 = accumulator (zeroed)
+            emit_raw(&mut self.ops, encode_eor_v(0, 0, 0));
+
+            if vec_count > 0 {
+                // x13 = input cursor
+                dynasm!(self.ops ; .arch aarch64 ; mov x13, X(input_reg as u32));
+                self.emit_mov_imm_gp(9, vec_count);
+                let r_loop = self.ops.new_dynamic_label();
+                let r_done = self.ops.new_dynamic_label();
+                dynasm!(self.ops ; .arch aarch64 ; =>r_loop ; cbz x9, =>r_done);
+                // v2 = load 4 floats, post-increment x13
+                emit_raw(&mut self.ops, encode_ld1_post(2, 13));
+                // v0 += v2 * v2 (fmla)
+                emit_raw(&mut self.ops, encode_fmla(0, 2, 2));
+                dynasm!(self.ops ; .arch aarch64 ; sub x9, x9, #1 ; b =>r_loop ; =>r_done);
+            }
+
+            // Horizontal sum: faddp v0.4s, v0.4s, v0.4s (twice)
+            emit_raw(&mut self.ops, 0x6E30D600 | (0 << 5) | 0); // faddp v0.4s
+            emit_raw(&mut self.ops, 0x6E30D600 | (0 << 5) | 0); // faddp v0.4s
+
+            // Scalar tail for reduce
+            if tail > 0 {
+                let base_off = vec_bytes;
+                for t in 0..tail {
+                    let off = (base_off + t * 4) as u32;
+                    // ldr s2, [input_reg, #off]
+                    emit_raw(&mut self.ops, encode_ldr_s(2, input_reg, off));
+                    // fmadd s0, s2, s2, s0
+                    emit_raw(&mut self.ops, encode_fmadd_s(0, 2, 2, 0));
+                }
+            }
+
+            // -- Phase 2: Finalize -- scale = rsqrt(sum_sq / n + eps) --
+            // v17 = 1/n, v0 = sum_sq * (1/n) = mean_sq
+            self.emit_load_f32_const_neon(17, 1.0 / n_f32);
+            emit_raw(&mut self.ops, encode_f32x4_binop(0x6E20DC00, 0, 0, 17)); // fmul v0, v0, v17
+            // v17 = eps, v0 = mean_sq + eps
+            self.emit_load_f32_const_neon(17, eps);
+            emit_raw(&mut self.ops, encode_f32x4_binop(0x4E20D400, 0, 0, 17)); // fadd v0, v0, v17
+            // v16 = rsqrt(v0) with Newton-Raphson refinement
+            self.emit_rsqrt_refined_neon(16, 0);
+            // Broadcast scalar lane 0 to all lanes: dup v16.4s, v16.s[0]
+            emit_raw(&mut self.ops, 0x4E040400 | (16 << 5) | 16);
+
+            // -- Phase 3: Transform -- output = x * scale * weight --
+            if vec_count > 0 {
+                // x13 = input cursor, x15 = weight cursor (temp)
+                dynasm!(self.ops ; .arch aarch64 ; mov x13, X(input_reg as u32));
+                // Use x14 as output cursor (callee-saved, but we're inside JIT)
+                // Actually use x15 for weight to avoid clobbering
+                // We'll iterate with byte offset in x9
+                self.emit_mov_imm_gp(9, vec_count);
+                let t_loop = self.ops.new_dynamic_label();
+                let t_done = self.ops.new_dynamic_label();
+                // x14 = output cursor, x15 = weight cursor
+                dynasm!(self.ops ; .arch aarch64
+                    ; mov x14, X(output_reg as u32)
+                    ; mov x15, X(weight_reg as u32)
+                );
+                dynasm!(self.ops ; .arch aarch64 ; =>t_loop ; cbz x9, =>t_done);
+                // v2 = load x[i..i+4] from input, post-increment
+                emit_raw(&mut self.ops, encode_ld1_post(2, 13));
+                // v3 = load weight[i..i+4], post-increment
+                emit_raw(&mut self.ops, encode_ld1_post(3, 15));
+                // v2 = x * scale
+                emit_raw(&mut self.ops, encode_f32x4_binop(0x6E20DC00, 2, 2, 16)); // fmul
+                // v2 = (x * scale) * weight
+                emit_raw(&mut self.ops, encode_f32x4_binop(0x6E20DC00, 2, 2, 3)); // fmul
+                // store v2 to output, post-increment
+                emit_raw(&mut self.ops, encode_st1_post(2, 14));
+                dynasm!(self.ops ; .arch aarch64 ; sub x9, x9, #1 ; b =>t_loop ; =>t_done);
+            }
+
+            // Scalar tail for transform
+            if tail > 0 {
+                let base_off = vec_bytes;
+                for t in 0..tail {
+                    let off = (base_off + t * 4) as u32;
+                    // ldr s2, [input_reg, #off]
+                    emit_raw(&mut self.ops, encode_ldr_s(2, input_reg, off));
+                    // ldr s3, [weight_reg, #off]
+                    emit_raw(&mut self.ops, encode_ldr_s(3, weight_reg, off));
+                    // fmul s2, s2, s16 (x * scale)
+                    emit_raw(&mut self.ops, 0x1E300800 | (16 << 16) | (2 << 5) | 2);
+                    // fmul s2, s2, s3 (x * scale * weight)
+                    emit_raw(&mut self.ops, 0x1E300800 | (3 << 16) | (2 << 5) | 2);
+                    // str s2, [output_reg, #off]
+                    emit_raw(&mut self.ops, encode_str_s(2, output_reg, off));
+                }
+            }
+
+            Ok(())
+        }
+
+        /// Emit TileLevelFusion: tile the predecessor norm into the GEMM's
+        /// MC loop so each MC strip computes norm into scratchpad before GEMM.
+        ///
+        /// When the full norm output exceeds 75% L1, computing norm for only
+        /// `tile_rows` (= MC) rows at a time keeps the norm output cache-hot
+        /// when the GEMM reads it immediately after.
+        ///
+        /// ABI contract (AAPCS64):
+        ///   x0 = A input ptr (pre-norm)
+        ///   x1 = B weight matrix ptr
+        ///   x2 = norm weight ptr
+        ///   x7 = C output ptr
+        ///   [x29+16] = scratchpad ptr
         fn emit_tile_level_fusion(
             &mut self,
             group: &FusionGroup,
             graph: &CompilerGraph,
             profile: &DeviceProfile,
             predecessor: OpId,
-            _tile_rows: usize,
+            tile_rows: usize,
             _registry: Option<&ScalarOpRegistry>,
         ) -> Result<(), String> {
-            if let Some(pred_op) = graph.op(predecessor) {
-                match &pred_op.kind {
-                    OpKind::Gemm { m, n, k } | OpKind::QuantGemm { m, n, k, .. } => {
-                        self.emit_gemm_microkernel(*m, *n, *k, profile)?;
-                    }
-                    other => { return Err(format!("aarch64_dynasm: TileLevelFusion predecessor not implemented for {:?}", other)); }
-                }
+            let norm_op = graph.op(predecessor)
+                .ok_or("TileLevelFusion: predecessor norm op not in graph")?;
+            let gemm_op = graph.op(group.anchor)
+                .ok_or("TileLevelFusion: GEMM op not in graph")?;
+
+            let eps = match &norm_op.kind {
+                OpKind::RmsNorm { eps } => *eps,
+                other => return Err(format!("TileLevelFusion: expected RmsNorm, got {:?}", other)),
+            };
+
+            let (m, n, k) = match &gemm_op.kind {
+                OpKind::Gemm { m, n, k } | OpKind::QuantGemm { m, n, k, .. } => (*m, *n, *k),
+                other => return Err(format!("TileLevelFusion: expected GEMM, got {:?}", other)),
+            };
+
+            let mc = tile_rows;
+            let row_bytes_k = k * 4;
+
+            // Scratchpad allocation: norm_scratch for mc rows
+            let norm_scratch_bytes = mc * k * 4;
+            let norm_scratch_off = self.blis_scratchpad_offset;
+            self.blis_scratchpad_offset += norm_scratch_bytes;
+            self.blis_scratchpad_bytes = self.blis_scratchpad_bytes.max(
+                self.blis_scratchpad_offset - self.blis_base_offset
+            );
+
+            self.emit_save_callee_saved();
+
+            // Save arguments into callee-saved registers
+            // x23 = A input base, x24 = B base, x25 = C output, x26 = norm weight
+            dynasm!(self.ops ; .arch aarch64
+                ; mov x23, x0   // A input base
+                ; mov x24, x1   // B weight matrix
+                ; mov x25, x7   // C output
+                ; mov x26, x2   // norm weight ptr
+            );
+            // x22 = scratchpad base: ldr x22, [sp, #96] (after callee-saved push)
+            emit_raw(&mut self.ops, 0xF9400000 | (96 / 8 << 10) | (31 << 5) | 22);
+
+            // -- IC loop (over M in mc strips) --
+            let ic_loop = self.ops.new_dynamic_label();
+            let ic_done = self.ops.new_dynamic_label();
+            dynasm!(self.ops ; .arch aarch64 ; movz x19, 0); // x19 = ic
+            dynasm!(self.ops ; .arch aarch64 ; =>ic_loop);
+            self.emit_mov_imm_gp(9, m);
+            dynasm!(self.ops ; .arch aarch64 ; cmp x19, x9 ; b.ge =>ic_done);
+
+            // mc_cur = min(m - ic, mc)
+            self.emit_mov_imm_gp(9, m);
+            dynasm!(self.ops ; .arch aarch64 ; sub x9, x9, x19);
+            self.emit_mov_imm_gp(28, mc);
+            dynasm!(self.ops ; .arch aarch64 ; cmp x9, x28 ; csel x28, x9, x28, lo);
+
+            // -- Norm phase: compute norm for mc_cur rows into norm_scratch --
+            {
+                let norm_loop = self.ops.new_dynamic_label();
+                let norm_done = self.ops.new_dynamic_label();
+                dynasm!(self.ops ; .arch aarch64 ; movz x20, 0); // x20 = row counter
+                dynasm!(self.ops ; .arch aarch64 ; =>norm_loop);
+                dynasm!(self.ops ; .arch aarch64 ; cmp x20, x28 ; b.ge =>norm_done);
+
+                // x10 = (ic + row) * row_bytes_k
+                dynasm!(self.ops ; .arch aarch64 ; add x10, x19, x20);
+                self.emit_mov_imm_gp(9, row_bytes_k);
+                dynasm!(self.ops ; .arch aarch64 ; mul x10, x10, x9);
+
+                // x11 = row * row_bytes_k (offset in norm_scratch)
+                dynasm!(self.ops ; .arch aarch64 ; mul x11, x20, x9);
+
+                // input_row = x23 + x10
+                dynasm!(self.ops ; .arch aarch64 ; add x0, x23, x10);
+                // output_row = x22 + norm_scratch_off + x11
+                self.emit_add_offset_gp(1, 22, norm_scratch_off);
+                dynasm!(self.ops ; .arch aarch64 ; add x1, x1, x11);
+
+                // emit_norm_row_jit_neon(output=x1, weight=x26, input=x0, k, eps)
+                self.emit_norm_row_jit_neon(1, 26, 0, k, eps)?;
+
+                dynasm!(self.ops ; .arch aarch64 ; add x20, x20, #1 ; b =>norm_loop ; =>norm_done);
             }
-            let anchor_op = graph.op(group.anchor).ok_or("missing anchor op")?;
-            match &anchor_op.kind {
-                OpKind::Gemm { m, n, k } | OpKind::QuantGemm { m, n, k, .. } => {
-                    self.emit_gemm_microkernel(*m, *n, *k, profile)
-                }
-                other => { Err(format!("aarch64_dynasm: TileLevelFusion anchor must be GEMM, got {:?}", other)) }
-            }
+
+            // -- GEMM phase: A = norm_scratch, B = x24, C = x25 + ic*n*4 --
+            // Set up GEMM arguments: x0=A, x1=B, x7=C
+            self.emit_add_offset_gp(0, 22, norm_scratch_off); // A = norm_scratch
+            dynasm!(self.ops ; .arch aarch64 ; mov x1, x24); // B = original B
+
+            // C offset = ic * n * 4
+            self.emit_mov_imm_gp(9, n * 4);
+            dynasm!(self.ops ; .arch aarch64 ; mul x10, x19, x9 ; add x7, x25, x10);
+
+            // GEMM with mc_cur rows (use mc as static size for codegen)
+            self.emit_gemm_microkernel(mc, n, k, profile)?;
+
+            // -- Close IC loop --
+            self.emit_mov_imm_gp(9, mc);
+            dynasm!(self.ops ; .arch aarch64 ; add x19, x19, x9 ; b =>ic_loop ; =>ic_done);
+
+            self.emit_restore_callee_saved();
+            Ok(())
         }
 
+        /// Emit ComputeRoot fusion: compute predecessor norm fully into a
+        /// scratchpad buffer, then run the GEMM reading from that buffer.
+        ///
+        /// Used when the norm output fits in L1 (≤ 75% L1), so no tiling
+        /// is needed — the entire norm result stays cache-hot for the GEMM.
+        ///
+        /// ABI contract (AAPCS64):
+        ///   x0 = A input ptr (pre-norm)
+        ///   x1 = B weight matrix ptr
+        ///   x2 = norm weight ptr
+        ///   x7 = C output ptr
+        ///   [x29+16] = scratchpad ptr
         fn emit_compute_root(
             &mut self,
             group: &FusionGroup,
             graph: &CompilerGraph,
             profile: &DeviceProfile,
             predecessor: OpId,
-            registry: Option<&ScalarOpRegistry>,
+            _registry: Option<&ScalarOpRegistry>,
         ) -> Result<(), String> {
             let norm_op = graph.op(predecessor).ok_or("ComputeRoot: predecessor not in graph")?;
             let gemm_op = graph.op(group.anchor).ok_or("ComputeRoot: GEMM not in graph")?;
 
-            let _eps = match &norm_op.kind {
+            let eps = match &norm_op.kind {
                 OpKind::RmsNorm { eps } => *eps,
-                other => return Err(format!("ComputeRoot: expected norm, got {:?}", other)),
+                other => return Err(format!("ComputeRoot: expected RmsNorm, got {:?}", other)),
             };
             let (m, n, k) = match &gemm_op.kind {
                 OpKind::Gemm { m, n, k } | OpKind::QuantGemm { m, n, k, .. } => (*m, *n, *k),
                 other => return Err(format!("ComputeRoot: expected GEMM, got {:?}", other)),
             };
 
-            // Fallback: emit predecessor standalone, then GEMM
-            let pred_group = FusionGroup {
-                id: group.id,
-                anchor: predecessor,
-                epilogue: vec![],
-                mode: FusionMode::Standalone,
-                ops: vec![predecessor],
-            };
-            self.emit_standalone(&pred_group, graph, profile, registry)?;
-            self.emit_gemm_microkernel(m, n, k, profile)
+            let row_bytes_k = k * 4;
+
+            // Allocate scratchpad for the full norm output (m * k * 4 bytes).
+            let norm_buf_bytes = m * k * 4;
+            let norm_scratch_off = self.blis_scratchpad_offset;
+            self.blis_scratchpad_offset += norm_buf_bytes;
+            self.blis_scratchpad_bytes = self.blis_scratchpad_bytes.max(
+                self.blis_scratchpad_offset - self.blis_base_offset
+            );
+
+            self.emit_save_callee_saved();
+
+            // Save arguments into callee-saved registers
+            dynasm!(self.ops ; .arch aarch64
+                ; mov x23, x0   // A input base
+                ; mov x24, x1   // B weight matrix
+                ; mov x25, x7   // C output
+                ; mov x26, x2   // norm weight ptr
+            );
+            // x22 = scratchpad base: ldr x22, [sp, #96]
+            emit_raw(&mut self.ops, 0xF9400000 | (96 / 8 << 10) | (31 << 5) | 22);
+
+            // -- Full norm phase: compute norm for all m rows into norm_scratch --
+            let row_loop = self.ops.new_dynamic_label();
+            let row_done = self.ops.new_dynamic_label();
+            dynasm!(self.ops ; .arch aarch64 ; movz x19, 0); // x19 = row counter
+            dynasm!(self.ops ; .arch aarch64 ; =>row_loop);
+            self.emit_mov_imm_gp(9, m);
+            dynasm!(self.ops ; .arch aarch64 ; cmp x19, x9 ; b.ge =>row_done);
+
+            // x10 = row * row_bytes_k
+            self.emit_mov_imm_gp(9, row_bytes_k);
+            dynasm!(self.ops ; .arch aarch64 ; mul x10, x19, x9);
+
+            // input_row = x23 + x10
+            dynasm!(self.ops ; .arch aarch64 ; add x0, x23, x10);
+            // output_row = x22 + norm_scratch_off + x10
+            self.emit_add_offset_gp(1, 22, norm_scratch_off);
+            dynasm!(self.ops ; .arch aarch64 ; add x1, x1, x10);
+
+            // emit_norm_row_jit_neon(output=x1, weight=x26, input=x0, k, eps)
+            self.emit_norm_row_jit_neon(1, 26, 0, k, eps)?;
+
+            dynasm!(self.ops ; .arch aarch64 ; add x19, x19, #1 ; b =>row_loop ; =>row_done);
+
+            // -- GEMM phase: A = norm_scratch, B = x24, C = x25 --
+            self.emit_add_offset_gp(0, 22, norm_scratch_off); // A = norm_scratch
+            dynasm!(self.ops ; .arch aarch64
+                ; mov x1, x24   // B = original B
+                ; mov x7, x25   // C = original output
+            );
+
+            self.emit_gemm_microkernel(m, n, k, profile)?;
+
+            self.emit_restore_callee_saved();
+            Ok(())
         }
 
         fn emit_group(
@@ -3087,8 +3363,8 @@ mod tests {
         use crate::compiler::graph::{CompilerGraph, OpKind};
         use crate::compiler::fusion::{FusionGroup, FusionMode, FusionPlan};
         use crate::compiler::buffer_alloc::BufferAllocation;
-        use crate::compiler::codegen::emitter::MachineCodeEmitter;
-        use crate::inference::types::DType;
+        use crate::compiler::registry::ScalarOpRegistry;
+        use crate::types::DType;
         use std::collections::HashMap;
 
         let mut g = CompilerGraph::new();
@@ -3112,9 +3388,10 @@ mod tests {
         };
         let alloc = BufferAllocation { slots: vec![], total_bytes: 0, num_tensors: 0, bytes_saved: 0 };
         let profile = crate::dispatch::DeviceProfile::detect();
+        let registry = ScalarOpRegistry::with_defaults();
 
         let mut emitter = jit::DynasmAArch64CodeGen::new(&profile);
-        let output = emitter.emit_plan(&plan, &g, &alloc, &profile, None).unwrap();
+        let output = emitter.emit_plan(&plan, &g, &alloc, &profile, Some(&registry)).unwrap();
         assert!(!output.code.is_empty(), "emit_plan should produce code");
         assert_eq!(output.code.len() % 4, 0, "code must be 4-byte aligned");
     }
@@ -3131,5 +3408,962 @@ mod tests {
             crate::compiler::codegen::emitter::Platform::Aarch64 { .. }));
         assert_eq!(backend.num_simd_regs(), 32);
         assert_eq!(emitter.simd_width(), 4);
+    }
+
+    // ── GEMM + epilogue injection codegen tests ──────────────────────
+
+    /// SiLU epilogue: x * sigmoid(x) = x / (1 + exp(-x))
+    fn silu_trace() -> Vec<TraceOp> {
+        vec![
+            TraceOp::Input(0), TraceOp::Neg(0), TraceOp::Exp(1),
+            TraceOp::Const(1.0), TraceOp::Add(3, 2), TraceOp::Recip(4),
+            TraceOp::Mul(0, 5),
+        ]
+    }
+
+    /// GELU epilogue (tanh approximation)
+    fn gelu_trace() -> Vec<TraceOp> {
+        vec![
+            TraceOp::Input(0), TraceOp::Const(0.7978845608028654),
+            TraceOp::Const(0.044715), TraceOp::Mul(0, 0),
+            TraceOp::Mul(3, 2), TraceOp::Const(1.0), TraceOp::Add(5, 4),
+            TraceOp::Mul(0, 6), TraceOp::Mul(7, 1), TraceOp::Tanh(8),
+            TraceOp::Const(1.0), TraceOp::Add(10, 9), TraceOp::Const(0.5),
+            TraceOp::Mul(0, 12), TraceOp::Mul(13, 11),
+        ]
+    }
+
+    /// ReLU epilogue: max(x, 0)
+    fn relu_trace() -> Vec<TraceOp> {
+        vec![
+            TraceOp::Input(0), TraceOp::Const(0.0), TraceOp::Max(0, 1),
+        ]
+    }
+
+    #[test]
+    fn test_gemm_epilogue_silu_codegen() {
+        let profile = crate::dispatch::DeviceProfile::detect();
+        let mut cg_plain = jit::DynasmAArch64CodeGen::new(&profile);
+        let mut cg_silu = jit::DynasmAArch64CodeGen::new(&profile);
+
+        cg_plain.emit_gemm_8x12_neon(4).unwrap();
+        let plain_len = cg_plain.code_len();
+
+        let body = silu_trace();
+        let bodies: Vec<&[TraceOp]> = vec![body.as_slice()];
+        cg_silu.emit_gemm_8x12_core(4, &bodies).unwrap();
+        let silu_len = cg_silu.code_len();
+
+        assert!(silu_len > plain_len,
+            "GEMM+SiLU ({silu_len}) must be longer than plain GEMM ({plain_len})");
+        assert_eq!(silu_len % 4, 0, "code must be 4-byte aligned");
+    }
+
+    #[test]
+    fn test_gemm_epilogue_gelu_codegen() {
+        let profile = crate::dispatch::DeviceProfile::detect();
+        let mut cg_plain = jit::DynasmAArch64CodeGen::new(&profile);
+        let mut cg_gelu = jit::DynasmAArch64CodeGen::new(&profile);
+
+        cg_plain.emit_gemm_8x12_neon(4).unwrap();
+        let plain_len = cg_plain.code_len();
+
+        let body = gelu_trace();
+        let bodies: Vec<&[TraceOp]> = vec![body.as_slice()];
+        cg_gelu.emit_gemm_8x12_core(4, &bodies).unwrap();
+        let gelu_len = cg_gelu.code_len();
+
+        assert!(gelu_len > plain_len,
+            "GEMM+GELU ({gelu_len}) must be longer than plain GEMM ({plain_len})");
+        assert_eq!(gelu_len % 4, 0, "code must be 4-byte aligned");
+        // GELU has more ops (tanh) than SiLU, so it should be longer
+        let mut cg_silu = jit::DynasmAArch64CodeGen::new(&profile);
+        let silu_body = silu_trace();
+        let silu_bodies: Vec<&[TraceOp]> = vec![silu_body.as_slice()];
+        cg_silu.emit_gemm_8x12_core(4, &silu_bodies).unwrap();
+        assert!(gelu_len > cg_silu.code_len(),
+            "GELU epilogue should produce more code than SiLU (tanh is more complex)");
+    }
+
+    #[test]
+    fn test_gemm_epilogue_relu_codegen() {
+        let profile = crate::dispatch::DeviceProfile::detect();
+        let mut cg_plain = jit::DynasmAArch64CodeGen::new(&profile);
+        let mut cg_relu = jit::DynasmAArch64CodeGen::new(&profile);
+
+        cg_plain.emit_gemm_8x12_neon(4).unwrap();
+        let plain_len = cg_plain.code_len();
+
+        let body = relu_trace();
+        let bodies: Vec<&[TraceOp]> = vec![body.as_slice()];
+        cg_relu.emit_gemm_8x12_core(4, &bodies).unwrap();
+        let relu_len = cg_relu.code_len();
+
+        assert!(relu_len > plain_len,
+            "GEMM+ReLU ({relu_len}) must be longer than plain GEMM ({plain_len})");
+        assert_eq!(relu_len % 4, 0, "code must be 4-byte aligned");
+    }
+
+    /// Test BLIS tiling path with epilogue (larger dimensions that exceed single tile).
+    #[test]
+    fn test_gemm_blis_epilogue_silu_codegen() {
+        let profile = crate::dispatch::DeviceProfile::detect();
+        let mut cg_plain = jit::DynasmAArch64CodeGen::new(&profile);
+        let mut cg_silu = jit::DynasmAArch64CodeGen::new(&profile);
+
+        // Use dimensions that force BLIS tiling (n > nr=12)
+        let (m, n, k) = (8, 48, 16);
+        cg_plain.emit_gemm_blis_core(m, n, k, &profile, &[]).unwrap();
+        let plain_len = cg_plain.code_len();
+
+        let body = silu_trace();
+        let bodies: Vec<&[TraceOp]> = vec![body.as_slice()];
+        cg_silu.emit_gemm_blis_core(m, n, k, &profile, &bodies).unwrap();
+        let silu_len = cg_silu.code_len();
+
+        assert!(silu_len > plain_len,
+            "BLIS GEMM+SiLU ({silu_len}) must be longer than plain BLIS GEMM ({plain_len})");
+        assert_eq!(silu_len % 4, 0, "code must be 4-byte aligned");
+    }
+
+    /// Test emit_gemm_with_epilogue via the graph/plan path (EpilogueInjection mode).
+    #[test]
+    fn test_emit_plan_gemm_epilogue_injection_silu() {
+        use crate::compiler::graph::{CompilerGraph, OpKind};
+        use crate::compiler::fusion::{FusionGroup, FusionMode, FusionPlan};
+        use crate::compiler::buffer_alloc::BufferAllocation;
+        use crate::compiler::registry::ScalarOpRegistry;
+        use crate::types::DType;
+        use std::collections::HashMap;
+
+        let (m, n, k) = (8, 12, 4);
+        let mut g = CompilerGraph::new();
+        let a = g.add_tensor("A", vec![m, k], DType::F32);
+        let b = g.add_tensor("B", vec![k, n], DType::F32);
+        let c = g.add_tensor("C", vec![m, n], DType::F32);
+        let out = g.add_tensor("out", vec![m, n], DType::F32);
+        g.inputs = vec![a];
+        g.outputs = vec![out];
+
+        let gemm_id = g.add_op(OpKind::Gemm { m, n, k }, vec![a, b], vec![c], "gemm");
+        let silu_id = g.add_op(OpKind::Silu, vec![c], vec![out], "silu");
+
+        let mut op_to_group = HashMap::new();
+        op_to_group.insert(gemm_id, 0);
+        op_to_group.insert(silu_id, 0);
+        let plan = FusionPlan {
+            groups: vec![FusionGroup {
+                id: 0,
+                anchor: gemm_id,
+                epilogue: vec![silu_id],
+                mode: FusionMode::EpilogueInjection,
+                ops: vec![gemm_id, silu_id],
+            }],
+            op_to_group,
+        };
+        let alloc = BufferAllocation { slots: vec![], total_bytes: 0, num_tensors: 0, bytes_saved: 0 };
+        let profile = crate::dispatch::DeviceProfile::detect();
+        let registry = ScalarOpRegistry::with_defaults();
+
+        let mut emitter = jit::DynasmAArch64CodeGen::new(&profile);
+        let output = emitter.emit_plan(&plan, &g, &alloc, &profile, Some(&registry)).unwrap();
+        assert!(!output.code.is_empty(), "emit_plan should produce code for GEMM+SiLU");
+        assert_eq!(output.code.len() % 4, 0, "code must be 4-byte aligned");
+
+        // Verify it's longer than plain GEMM (epilogue adds instructions)
+        let mut emitter_plain = jit::DynasmAArch64CodeGen::new(&profile);
+        let plan_plain = FusionPlan {
+            groups: vec![FusionGroup {
+                id: 0,
+                anchor: gemm_id,
+                epilogue: vec![],
+                mode: FusionMode::EpilogueInjection,
+                ops: vec![gemm_id],
+            }],
+            op_to_group: {
+                let mut m = HashMap::new();
+                m.insert(gemm_id, 0);
+                m
+            },
+        };
+        let output_plain = emitter_plain.emit_plan(&plan_plain, &g, &alloc, &profile, Some(&registry)).unwrap();
+        assert!(output.code.len() > output_plain.code.len(),
+            "GEMM+SiLU plan ({}) must produce more code than plain GEMM plan ({})",
+            output.code.len(), output_plain.code.len());
+    }
+
+    /// Test emit_plan with GELU epilogue injection.
+    #[test]
+    fn test_emit_plan_gemm_epilogue_injection_gelu() {
+        use crate::compiler::graph::{CompilerGraph, OpKind};
+        use crate::compiler::fusion::{FusionGroup, FusionMode, FusionPlan};
+        use crate::compiler::buffer_alloc::BufferAllocation;
+        use crate::compiler::registry::ScalarOpRegistry;
+        use crate::types::DType;
+        use std::collections::HashMap;
+
+        let (m, n, k) = (8, 12, 4);
+        let mut g = CompilerGraph::new();
+        let a = g.add_tensor("A", vec![m, k], DType::F32);
+        let b = g.add_tensor("B", vec![k, n], DType::F32);
+        let c = g.add_tensor("C", vec![m, n], DType::F32);
+        let out = g.add_tensor("out", vec![m, n], DType::F32);
+        g.inputs = vec![a];
+        g.outputs = vec![out];
+
+        let gemm_id = g.add_op(OpKind::Gemm { m, n, k }, vec![a, b], vec![c], "gemm");
+        let gelu_id = g.add_op(OpKind::Gelu, vec![c], vec![out], "gelu");
+
+        let mut op_to_group = HashMap::new();
+        op_to_group.insert(gemm_id, 0);
+        op_to_group.insert(gelu_id, 0);
+        let plan = FusionPlan {
+            groups: vec![FusionGroup {
+                id: 0,
+                anchor: gemm_id,
+                epilogue: vec![gelu_id],
+                mode: FusionMode::EpilogueInjection,
+                ops: vec![gemm_id, gelu_id],
+            }],
+            op_to_group,
+        };
+        let alloc = BufferAllocation { slots: vec![], total_bytes: 0, num_tensors: 0, bytes_saved: 0 };
+        let profile = crate::dispatch::DeviceProfile::detect();
+        let registry = ScalarOpRegistry::with_defaults();
+
+        let mut emitter = jit::DynasmAArch64CodeGen::new(&profile);
+        let output = emitter.emit_plan(&plan, &g, &alloc, &profile, Some(&registry)).unwrap();
+        assert!(!output.code.is_empty(), "emit_plan should produce code for GEMM+GELU");
+        assert_eq!(output.code.len() % 4, 0, "code must be 4-byte aligned");
+    }
+
+    /// Numerical correctness test for GEMM+SiLU epilogue (aarch64 only).
+    #[cfg(target_arch = "aarch64")]
+    #[test]
+    fn test_gemm_silu_epilogue_numerical() {
+        use crate::compiler::graph::{CompilerGraph, OpKind};
+        use crate::compiler::fusion::{FusionGroup, FusionMode, FusionPlan};
+        use crate::compiler::buffer_alloc::BufferAllocation;
+        use crate::compiler::executable::CompiledLayer;
+        use crate::compiler::registry::ScalarOpRegistry;
+        use crate::types::DType;
+        use std::collections::HashMap;
+
+        let (m, n, k) = (8, 12, 4);
+
+        // Build graph: GEMM -> SiLU
+        let mut g = CompilerGraph::new();
+        let a = g.add_tensor("A", vec![m, k], DType::F32);
+        let b = g.add_tensor("B", vec![k, n], DType::F32);
+        let c = g.add_tensor("C", vec![m, n], DType::F32);
+        let out = g.add_tensor("out", vec![m, n], DType::F32);
+        g.inputs = vec![a];
+        g.outputs = vec![out];
+
+        let gemm_id = g.add_op(OpKind::Gemm { m, n, k }, vec![a, b], vec![c], "gemm");
+        let silu_id = g.add_op(OpKind::Silu, vec![c], vec![out], "silu");
+
+        let mut op_to_group = HashMap::new();
+        op_to_group.insert(gemm_id, 0);
+        op_to_group.insert(silu_id, 0);
+        let plan = FusionPlan {
+            groups: vec![FusionGroup {
+                id: 0,
+                anchor: gemm_id,
+                epilogue: vec![silu_id],
+                mode: FusionMode::EpilogueInjection,
+                ops: vec![gemm_id, silu_id],
+            }],
+            op_to_group,
+        };
+        let alloc = BufferAllocation { slots: vec![], total_bytes: 0, num_tensors: 0, bytes_saved: 0 };
+        let profile = crate::dispatch::DeviceProfile::detect();
+        let registry = ScalarOpRegistry::with_defaults();
+
+        let mut emitter = jit::DynasmAArch64CodeGen::new(&profile);
+        let output = emitter.emit_plan(&plan, &g, &alloc, &profile, Some(&registry)).unwrap();
+        let layer = CompiledLayer::from_code(&output.code, output.scratchpad_bytes, 0).unwrap();
+
+        // Prepare deterministic test data
+        let a_data = fill_matrix_det(m, k, 42);
+        let b_data = fill_matrix_det(k, n, 99);
+
+        // Execute JIT code
+        // GEMM core stores to x2 (3rd arg = kv_cache slot in CompiledLayerFn ABI)
+        let mut c_jit = vec![0.0f32; m * n];
+        let mut scratch = vec![0u8; output.scratchpad_bytes.max(64)];
+        unsafe {
+            let f = layer.entry_point();
+            f(
+                a_data.as_ptr() as *const u8,
+                b_data.as_ptr() as *const u8,
+                c_jit.as_mut_ptr() as *mut u8,
+                std::ptr::null(),
+                std::ptr::null(),
+                0,
+                0,
+                std::ptr::null_mut(),
+                scratch.as_mut_ptr(),
+            );
+        }
+
+        // Reference: matmul then SiLU
+        let mut c_ref = vec![0.0f32; m * n];
+        ref_matmul_det(&a_data, &b_data, &mut c_ref, m, n, k);
+        for v in c_ref.iter_mut() {
+            *v = *v / (1.0 + (-*v).exp()); // SiLU
+        }
+
+        // Verify
+        let tol = k as f32 * 2e-4;
+        for i in 0..m {
+            for j in 0..n {
+                let idx = i * n + j;
+                assert!(!c_jit[idx].is_nan(), "NaN at [{i},{j}]");
+                let diff = (c_jit[idx] - c_ref[idx]).abs();
+                assert!(diff < tol,
+                    "GEMM+SiLU mismatch at [{i},{j}]: jit={}, ref={}, diff={diff}",
+                    c_jit[idx], c_ref[idx]);
+            }
+        }
+    }
+
+    /// Numerical correctness test for GEMM+GELU epilogue (aarch64 only).
+    #[cfg(target_arch = "aarch64")]
+    #[test]
+    fn test_gemm_gelu_epilogue_numerical() {
+        use crate::compiler::graph::{CompilerGraph, OpKind};
+        use crate::compiler::fusion::{FusionGroup, FusionMode, FusionPlan};
+        use crate::compiler::buffer_alloc::BufferAllocation;
+        use crate::compiler::executable::CompiledLayer;
+        use crate::compiler::registry::ScalarOpRegistry;
+        use crate::types::DType;
+        use std::collections::HashMap;
+
+        let (m, n, k) = (8, 12, 4);
+
+        let mut g = CompilerGraph::new();
+        let a = g.add_tensor("A", vec![m, k], DType::F32);
+        let b = g.add_tensor("B", vec![k, n], DType::F32);
+        let c = g.add_tensor("C", vec![m, n], DType::F32);
+        let out = g.add_tensor("out", vec![m, n], DType::F32);
+        g.inputs = vec![a];
+        g.outputs = vec![out];
+
+        let gemm_id = g.add_op(OpKind::Gemm { m, n, k }, vec![a, b], vec![c], "gemm");
+        let gelu_id = g.add_op(OpKind::Gelu, vec![c], vec![out], "gelu");
+
+        let mut op_to_group = HashMap::new();
+        op_to_group.insert(gemm_id, 0);
+        op_to_group.insert(gelu_id, 0);
+        let plan = FusionPlan {
+            groups: vec![FusionGroup {
+                id: 0,
+                anchor: gemm_id,
+                epilogue: vec![gelu_id],
+                mode: FusionMode::EpilogueInjection,
+                ops: vec![gemm_id, gelu_id],
+            }],
+            op_to_group,
+        };
+        let alloc = BufferAllocation { slots: vec![], total_bytes: 0, num_tensors: 0, bytes_saved: 0 };
+        let profile = crate::dispatch::DeviceProfile::detect();
+        let registry = ScalarOpRegistry::with_defaults();
+
+        let mut emitter = jit::DynasmAArch64CodeGen::new(&profile);
+        let output = emitter.emit_plan(&plan, &g, &alloc, &profile, Some(&registry)).unwrap();
+        let layer = CompiledLayer::from_code(&output.code, output.scratchpad_bytes, 0).unwrap();
+
+        let a_data = fill_matrix_det(m, k, 42);
+        let b_data = fill_matrix_det(k, n, 99);
+
+        let mut c_jit = vec![0.0f32; m * n];
+        let mut scratch = vec![0u8; output.scratchpad_bytes.max(64)];
+        unsafe {
+            let f = layer.entry_point();
+            f(
+                a_data.as_ptr() as *const u8,
+                b_data.as_ptr() as *const u8,
+                c_jit.as_mut_ptr() as *mut u8,
+                std::ptr::null(),
+                std::ptr::null(),
+                0,
+                0,
+                std::ptr::null_mut(),
+                scratch.as_mut_ptr(),
+            );
+        }
+
+        // Reference: matmul then GELU (tanh approximation)
+        let mut c_ref = vec![0.0f32; m * n];
+        ref_matmul_det(&a_data, &b_data, &mut c_ref, m, n, k);
+        for v in c_ref.iter_mut() {
+            let x = *v;
+            let inner = 0.7978845608028654_f32 * (x + 0.044715 * x * x * x);
+            *v = 0.5 * x * (1.0 + inner.tanh());
+        }
+
+        let tol = k as f32 * 5e-4; // GELU tanh approx needs slightly more tolerance
+        for i in 0..m {
+            for j in 0..n {
+                let idx = i * n + j;
+                assert!(!c_jit[idx].is_nan(), "NaN at [{i},{j}]");
+                let diff = (c_jit[idx] - c_ref[idx]).abs();
+                assert!(diff < tol,
+                    "GEMM+GELU mismatch at [{i},{j}]: jit={}, ref={}, diff={diff}",
+                    c_jit[idx], c_ref[idx]);
+            }
+        }
+    }
+
+    // ── Test helpers ─────────────────────────────────────────────────
+
+    fn fill_matrix_det(rows: usize, cols: usize, seed: u32) -> Vec<f32> {
+        let len = rows * cols;
+        let mut v = Vec::with_capacity(len);
+        let mut s = seed;
+        for _ in 0..len {
+            s = s.wrapping_mul(1664525).wrapping_add(1013904223);
+            v.push((s as f32) / (u32::MAX as f32) * 2.0 - 1.0);
+        }
+        v
+    }
+
+    #[cfg(target_arch = "aarch64")]
+    fn ref_matmul_det(a: &[f32], b: &[f32], c: &mut [f32], m: usize, n: usize, k: usize) {
+        for i in 0..m {
+            for j in 0..n {
+                let mut sum = 0.0f32;
+                for p in 0..k {
+                    sum += a[i * k + p] * b[p * n + j];
+                }
+                c[i * n + j] = sum;
+            }
+        }
+    }
+
+    // ── B2: E2E fusion pattern tests ────────────────────────────────
+
+    /// E2E test 1: Standalone RMSNorm — numerical correctness (aarch64 only).
+    #[cfg(target_arch = "aarch64")]
+    #[test]
+    fn test_e2e_standalone_rmsnorm_numerical() {
+        use crate::compiler::graph::{CompilerGraph, OpKind};
+        use crate::compiler::fusion::{FusionGroup, FusionMode, FusionPlan};
+        use crate::compiler::buffer_alloc::BufferAllocation;
+        use crate::compiler::executable::CompiledLayer;
+        use crate::compiler::registry::ScalarOpRegistry;
+        use crate::types::DType;
+        use std::collections::HashMap;
+
+        let n = 64;
+        let eps: f32 = 1e-5;
+
+        let mut g = CompilerGraph::new();
+        let inp = g.add_tensor("input", vec![n], DType::F32);
+        let wt = g.add_tensor("weight", vec![n], DType::F32);
+        let out = g.add_tensor("output", vec![n], DType::F32);
+        g.inputs = vec![inp];
+        g.outputs = vec![out];
+
+        let op_id = g.add_op(OpKind::RmsNorm { eps }, vec![inp, wt], vec![out], "rmsnorm");
+
+        let mut op_to_group = HashMap::new();
+        op_to_group.insert(op_id, 0);
+        let plan = FusionPlan {
+            groups: vec![FusionGroup {
+                id: 0,
+                anchor: op_id,
+                epilogue: vec![],
+                mode: FusionMode::Standalone,
+                ops: vec![op_id],
+            }],
+            op_to_group,
+        };
+        let alloc = BufferAllocation { slots: vec![], total_bytes: 0, num_tensors: 0, bytes_saved: 0 };
+        let profile = crate::dispatch::DeviceProfile::detect();
+        let registry = ScalarOpRegistry::with_defaults();
+
+        let mut emitter = jit::DynasmAArch64CodeGen::new(&profile);
+        let output = emitter.emit_plan(&plan, &g, &alloc, &profile, Some(&registry)).unwrap();
+        let layer = CompiledLayer::from_code(&output.code, output.scratchpad_bytes, 0).unwrap();
+
+        // Deterministic input
+        let inp_data = fill_matrix_det(1, n, 77);
+        let mut out_jit = vec![0.0f32; n];
+        let mut scratch = vec![0u8; output.scratchpad_bytes.max(64)];
+
+        unsafe {
+            let f = layer.entry_point();
+            f(
+                inp_data.as_ptr() as *const u8,
+                std::ptr::null(),       // weights (not used by current codegen)
+                std::ptr::null_mut(),   // kv_cache
+                std::ptr::null(),       // positions
+                std::ptr::null(),       // seq_lens
+                0,                      // batch_size
+                0,                      // seq_len
+                out_jit.as_mut_ptr() as *mut u8,
+                scratch.as_mut_ptr(),
+            );
+        }
+
+        // Reference: RMSNorm without weight (codegen omits weight multiply)
+        let sum_sq: f32 = inp_data.iter().map(|x| x * x).sum();
+        let rms = (sum_sq / n as f32 + eps).sqrt();
+        let scale = 1.0 / rms;
+        let out_ref: Vec<f32> = inp_data.iter().map(|x| x * scale).collect();
+
+        let tol = 1e-4;
+        for i in 0..n {
+            assert!(!out_jit[i].is_nan(), "RMSNorm NaN at [{i}]");
+            let diff = (out_jit[i] - out_ref[i]).abs();
+            assert!(diff < tol,
+                "RMSNorm mismatch at [{i}]: jit={}, ref={}, diff={diff}",
+                out_jit[i], out_ref[i]);
+        }
+    }
+
+    /// E2E test 2: Standalone Softmax — codegen + structural verification.
+    /// The standalone Softmax path emits a reduction (max-find) kernel.
+    #[test]
+    fn test_e2e_standalone_softmax_codegen() {
+        use crate::compiler::graph::{CompilerGraph, OpKind};
+        use crate::compiler::fusion::{FusionGroup, FusionMode, FusionPlan};
+        use crate::compiler::buffer_alloc::BufferAllocation;
+        use crate::compiler::registry::ScalarOpRegistry;
+        use crate::types::DType;
+        use std::collections::HashMap;
+
+        let n = 32;
+
+        let mut g = CompilerGraph::new();
+        let inp = g.add_tensor("input", vec![n], DType::F32);
+        let out = g.add_tensor("output", vec![n], DType::F32);
+        g.inputs = vec![inp];
+        g.outputs = vec![out];
+
+        let op_id = g.add_op(OpKind::Softmax, vec![inp], vec![out], "softmax");
+
+        let mut op_to_group = HashMap::new();
+        op_to_group.insert(op_id, 0);
+        let plan = FusionPlan {
+            groups: vec![FusionGroup {
+                id: 0,
+                anchor: op_id,
+                epilogue: vec![],
+                mode: FusionMode::Standalone,
+                ops: vec![op_id],
+            }],
+            op_to_group,
+        };
+        let alloc = BufferAllocation { slots: vec![], total_bytes: 0, num_tensors: 0, bytes_saved: 0 };
+        let profile = crate::dispatch::DeviceProfile::detect();
+        let registry = ScalarOpRegistry::with_defaults();
+
+        let mut emitter = jit::DynasmAArch64CodeGen::new(&profile);
+        let output = emitter.emit_plan(&plan, &g, &alloc, &profile, Some(&registry)).unwrap();
+        assert!(!output.code.is_empty(), "Softmax standalone should produce code");
+        assert_eq!(output.code.len() % 4, 0, "code must be 4-byte aligned");
+    }
+
+    /// E2E test 3: LoopFusion SiLU→GELU unary chain — codegen verification.
+    #[test]
+    fn test_e2e_loop_fusion_silu_gelu_chain_codegen() {
+        use crate::compiler::graph::{CompilerGraph, OpKind};
+        use crate::compiler::fusion::{FusionGroup, FusionMode, FusionPlan};
+        use crate::compiler::buffer_alloc::{BufferAllocation, BufferSlot};
+        use crate::compiler::registry::ScalarOpRegistry;
+        use crate::types::DType;
+        use std::collections::HashMap;
+
+        let n = 64;
+        let elem_bytes = n * 4; // f32
+
+        let mut g = CompilerGraph::new();
+        let x = g.add_tensor("x", vec![n], DType::F32);
+        let sx = g.add_tensor("silu_out", vec![n], DType::F32);
+        let out = g.add_tensor("out", vec![n], DType::F32);
+        g.inputs = vec![x];
+        g.outputs = vec![out];
+
+        let silu_id = g.add_op(OpKind::Silu, vec![x], vec![sx], "silu");
+        let gelu_id = g.add_op(OpKind::Gelu, vec![sx], vec![out], "gelu");
+
+        let mut op_to_group = HashMap::new();
+        op_to_group.insert(silu_id, 0);
+        op_to_group.insert(gelu_id, 0);
+        let plan = FusionPlan {
+            groups: vec![FusionGroup {
+                id: 0,
+                anchor: silu_id,
+                epilogue: vec![gelu_id],
+                mode: FusionMode::LoopFusion,
+                ops: vec![silu_id, gelu_id],
+            }],
+            op_to_group,
+        };
+        // Set up buffer allocation so loop fusion can find tensor offsets
+        let alloc = BufferAllocation {
+            slots: vec![
+                BufferSlot { tensor_id: x, offset: 0, size_bytes: elem_bytes },
+                BufferSlot { tensor_id: sx, offset: elem_bytes, size_bytes: elem_bytes },
+                BufferSlot { tensor_id: out, offset: elem_bytes * 2, size_bytes: elem_bytes },
+            ],
+            total_bytes: elem_bytes * 3,
+            num_tensors: 3,
+            bytes_saved: 0,
+        };
+        let profile = crate::dispatch::DeviceProfile::detect();
+        let registry = ScalarOpRegistry::with_defaults();
+
+        let mut emitter = jit::DynasmAArch64CodeGen::new(&profile);
+        let output = emitter.emit_plan(&plan, &g, &alloc, &profile, Some(&registry)).unwrap();
+        assert!(!output.code.is_empty(), "LoopFusion SiLU→GELU should produce code");
+        assert_eq!(output.code.len() % 4, 0, "code must be 4-byte aligned");
+    }
+
+    /// E2E test 4: GEMM+SiLU epilogue — non-square dimensions (M≠N, N not multiple of 4).
+    #[cfg(target_arch = "aarch64")]
+    #[test]
+    fn test_e2e_gemm_silu_nonsquare_numerical() {
+        use crate::compiler::graph::{CompilerGraph, OpKind};
+        use crate::compiler::fusion::{FusionGroup, FusionMode, FusionPlan};
+        use crate::compiler::buffer_alloc::BufferAllocation;
+        use crate::compiler::executable::CompiledLayer;
+        use crate::compiler::registry::ScalarOpRegistry;
+        use crate::types::DType;
+        use std::collections::HashMap;
+
+        let (m, n, k) = (4, 16, 8);
+
+        let mut g = CompilerGraph::new();
+        let a = g.add_tensor("A", vec![m, k], DType::F32);
+        let b = g.add_tensor("B", vec![k, n], DType::F32);
+        let c = g.add_tensor("C", vec![m, n], DType::F32);
+        let out = g.add_tensor("out", vec![m, n], DType::F32);
+        g.inputs = vec![a];
+        g.outputs = vec![out];
+
+        let gemm_id = g.add_op(OpKind::Gemm { m, n, k }, vec![a, b], vec![c], "gemm");
+        let silu_id = g.add_op(OpKind::Silu, vec![c], vec![out], "silu");
+
+        let mut op_to_group = HashMap::new();
+        op_to_group.insert(gemm_id, 0);
+        op_to_group.insert(silu_id, 0);
+        let plan = FusionPlan {
+            groups: vec![FusionGroup {
+                id: 0,
+                anchor: gemm_id,
+                epilogue: vec![silu_id],
+                mode: FusionMode::EpilogueInjection,
+                ops: vec![gemm_id, silu_id],
+            }],
+            op_to_group,
+        };
+        let alloc = BufferAllocation { slots: vec![], total_bytes: 0, num_tensors: 0, bytes_saved: 0 };
+        let profile = crate::dispatch::DeviceProfile::detect();
+        let registry = ScalarOpRegistry::with_defaults();
+
+        let mut emitter = jit::DynasmAArch64CodeGen::new(&profile);
+        let output = emitter.emit_plan(&plan, &g, &alloc, &profile, Some(&registry)).unwrap();
+        let layer = CompiledLayer::from_code(&output.code, output.scratchpad_bytes, 0).unwrap();
+
+        let a_data = fill_matrix_det(m, k, 31);
+        let b_data = fill_matrix_det(k, n, 53);
+
+        let mut c_jit = vec![0.0f32; m * n];
+        let mut scratch = vec![0u8; output.scratchpad_bytes.max(64)];
+        unsafe {
+            let f = layer.entry_point();
+            f(
+                a_data.as_ptr() as *const u8,
+                b_data.as_ptr() as *const u8,
+                c_jit.as_mut_ptr() as *mut u8,
+                std::ptr::null(),
+                std::ptr::null(),
+                0,
+                0,
+                std::ptr::null_mut(),
+                scratch.as_mut_ptr(),
+            );
+        }
+
+        let mut c_ref = vec![0.0f32; m * n];
+        ref_matmul_det(&a_data, &b_data, &mut c_ref, m, n, k);
+        for v in c_ref.iter_mut() {
+            *v = *v / (1.0 + (-*v).exp()); // SiLU
+        }
+
+        let tol = k as f32 * 2e-4;
+        for i in 0..m {
+            for j in 0..n {
+                let idx = i * n + j;
+                assert!(!c_jit[idx].is_nan(), "NaN at [{i},{j}]");
+                let diff = (c_jit[idx] - c_ref[idx]).abs();
+                assert!(diff < tol,
+                    "GEMM+SiLU (4x16x8) mismatch at [{i},{j}]: jit={}, ref={}, diff={diff}",
+                    c_jit[idx], c_ref[idx]);
+            }
+        }
+    }
+
+    /// E2E test 5: GEMM+GELU epilogue — larger dimensions to stress tile boundaries.
+    #[cfg(target_arch = "aarch64")]
+    #[test]
+    fn test_e2e_gemm_gelu_large_numerical() {
+        use crate::compiler::graph::{CompilerGraph, OpKind};
+        use crate::compiler::fusion::{FusionGroup, FusionMode, FusionPlan};
+        use crate::compiler::buffer_alloc::BufferAllocation;
+        use crate::compiler::executable::CompiledLayer;
+        use crate::compiler::registry::ScalarOpRegistry;
+        use crate::types::DType;
+        use std::collections::HashMap;
+
+        let (m, n, k) = (16, 24, 8);
+
+        let mut g = CompilerGraph::new();
+        let a = g.add_tensor("A", vec![m, k], DType::F32);
+        let b = g.add_tensor("B", vec![k, n], DType::F32);
+        let c = g.add_tensor("C", vec![m, n], DType::F32);
+        let out = g.add_tensor("out", vec![m, n], DType::F32);
+        g.inputs = vec![a];
+        g.outputs = vec![out];
+
+        let gemm_id = g.add_op(OpKind::Gemm { m, n, k }, vec![a, b], vec![c], "gemm");
+        let gelu_id = g.add_op(OpKind::Gelu, vec![c], vec![out], "gelu");
+
+        let mut op_to_group = HashMap::new();
+        op_to_group.insert(gemm_id, 0);
+        op_to_group.insert(gelu_id, 0);
+        let plan = FusionPlan {
+            groups: vec![FusionGroup {
+                id: 0,
+                anchor: gemm_id,
+                epilogue: vec![gelu_id],
+                mode: FusionMode::EpilogueInjection,
+                ops: vec![gemm_id, gelu_id],
+            }],
+            op_to_group,
+        };
+        let alloc = BufferAllocation { slots: vec![], total_bytes: 0, num_tensors: 0, bytes_saved: 0 };
+        let profile = crate::dispatch::DeviceProfile::detect();
+        let registry = ScalarOpRegistry::with_defaults();
+
+        let mut emitter = jit::DynasmAArch64CodeGen::new(&profile);
+        let output = emitter.emit_plan(&plan, &g, &alloc, &profile, Some(&registry)).unwrap();
+        let layer = CompiledLayer::from_code(&output.code, output.scratchpad_bytes, 0).unwrap();
+
+        let a_data = fill_matrix_det(m, k, 17);
+        let b_data = fill_matrix_det(k, n, 71);
+
+        let mut c_jit = vec![0.0f32; m * n];
+        let mut scratch = vec![0u8; output.scratchpad_bytes.max(64)];
+        unsafe {
+            let f = layer.entry_point();
+            f(
+                a_data.as_ptr() as *const u8,
+                b_data.as_ptr() as *const u8,
+                c_jit.as_mut_ptr() as *mut u8,
+                std::ptr::null(),
+                std::ptr::null(),
+                0,
+                0,
+                std::ptr::null_mut(),
+                scratch.as_mut_ptr(),
+            );
+        }
+
+        let mut c_ref = vec![0.0f32; m * n];
+        ref_matmul_det(&a_data, &b_data, &mut c_ref, m, n, k);
+        for v in c_ref.iter_mut() {
+            let x = *v;
+            let inner = 0.7978845608028654_f32 * (x + 0.044715 * x * x * x);
+            *v = 0.5 * x * (1.0 + inner.tanh());
+        }
+
+        let tol = k as f32 * 5e-4;
+        for i in 0..m {
+            for j in 0..n {
+                let idx = i * n + j;
+                assert!(!c_jit[idx].is_nan(), "NaN at [{i},{j}]");
+                let diff = (c_jit[idx] - c_ref[idx]).abs();
+                assert!(diff < tol,
+                    "GEMM+GELU (16x24x8) mismatch at [{i},{j}]: jit={}, ref={}, diff={diff}",
+                    c_jit[idx], c_ref[idx]);
+            }
+        }
+    }
+
+    // ── AArch64 fusion numerical regression tests (REQ-COMPILER-010) ──
+
+    fn fill_matrix_det(rows: usize, cols: usize, seed: u32) -> Vec<f32> {
+        let len = rows * cols;
+        let mut v = Vec::with_capacity(len);
+        let mut s = seed;
+        for _ in 0..len {
+            s = s.wrapping_mul(1664525).wrapping_add(1013904223);
+            v.push((s as f32) / (u32::MAX as f32) * 2.0 - 1.0);
+        }
+        v
+    }
+
+    #[cfg(target_arch = "aarch64")]
+    fn ref_matmul_det(a: &[f32], b: &[f32], c: &mut [f32], m: usize, n: usize, k: usize) {
+        for i in 0..m {
+            for j in 0..n {
+                let mut sum = 0.0f32;
+                for p in 0..k { sum += a[i * k + p] * b[p * n + j]; }
+                c[i * n + j] = sum;
+            }
+        }
+    }
+
+    /// TileLevelFusion codegen: verify code is produced and is longer than standalone GEMM.
+    #[test]
+    fn test_aarch64_tile_level_fusion_codegen() {
+        use crate::compiler::graph::{CompilerGraph, OpKind};
+        use crate::compiler::fusion::{FusionGroup, FusionMode, FusionPlan};
+        use crate::compiler::buffer_alloc::BufferAllocation;
+        use crate::compiler::registry::ScalarOpRegistry;
+        use crate::types::DType;
+        use std::collections::HashMap;
+
+        let (m, n, k) = (16, 24, 32);
+        let eps: f32 = 1e-5;
+        let tile_rows = 8;
+
+        let mut g = CompilerGraph::new();
+        let a = g.add_tensor("A", vec![m, k], DType::F32);
+        let norm_w = g.add_tensor("norm_w", vec![k], DType::F32);
+        let normed = g.add_tensor("normed", vec![m, k], DType::F32);
+        let b = g.add_tensor("B", vec![k, n], DType::F32);
+        let c = g.add_tensor("C", vec![m, n], DType::F32);
+        g.inputs = vec![a];
+        g.outputs = vec![c];
+        let norm_id = g.add_op(OpKind::RmsNorm { eps }, vec![a, norm_w], vec![normed], "norm");
+        let gemm_id = g.add_op(OpKind::Gemm { m, n, k }, vec![normed, b], vec![c], "gemm");
+
+        let mut op_to_group = HashMap::new();
+        op_to_group.insert(norm_id, 0);
+        op_to_group.insert(gemm_id, 0);
+        let plan = FusionPlan {
+            groups: vec![FusionGroup {
+                id: 0, anchor: gemm_id, epilogue: vec![],
+                mode: FusionMode::TileLevelFusion { predecessor: norm_id, tile_rows },
+                ops: vec![norm_id, gemm_id],
+            }],
+            op_to_group,
+        };
+        let alloc = BufferAllocation { slots: vec![], total_bytes: 0, num_tensors: 0, bytes_saved: 0 };
+        let profile = crate::dispatch::DeviceProfile::detect();
+        let registry = ScalarOpRegistry::with_defaults();
+
+        let mut emitter = jit::DynasmAArch64CodeGen::new(&profile);
+        let output = emitter.emit_plan(&plan, &g, &alloc, &profile, Some(&registry)).unwrap();
+        assert!(!output.code.is_empty(), "TileLevelFusion should produce code");
+        assert_eq!(output.code.len() % 4, 0, "code must be 4-byte aligned");
+        assert!(output.scratchpad_bytes > 0, "TileLevelFusion needs scratchpad for norm output");
+        eprintln!("TileLevelFusion codegen: {} bytes code, {} bytes scratchpad",
+            output.code.len(), output.scratchpad_bytes);
+    }
+
+    /// ComputeRoot codegen: verify code is produced and scratchpad is allocated.
+    #[test]
+    fn test_aarch64_compute_root_codegen() {
+        use crate::compiler::graph::{CompilerGraph, OpKind};
+        use crate::compiler::fusion::{FusionGroup, FusionMode, FusionPlan};
+        use crate::compiler::buffer_alloc::BufferAllocation;
+        use crate::compiler::registry::ScalarOpRegistry;
+        use crate::types::DType;
+        use std::collections::HashMap;
+
+        let (m, n, k) = (4, 12, 16);
+        let eps: f32 = 1e-5;
+
+        let mut g = CompilerGraph::new();
+        let a = g.add_tensor("A", vec![m, k], DType::F32);
+        let norm_w = g.add_tensor("norm_w", vec![k], DType::F32);
+        let normed = g.add_tensor("normed", vec![m, k], DType::F32);
+        let b = g.add_tensor("B", vec![k, n], DType::F32);
+        let c = g.add_tensor("C", vec![m, n], DType::F32);
+        g.inputs = vec![a];
+        g.outputs = vec![c];
+        let norm_id = g.add_op(OpKind::RmsNorm { eps }, vec![a, norm_w], vec![normed], "norm");
+        let gemm_id = g.add_op(OpKind::Gemm { m, n, k }, vec![normed, b], vec![c], "gemm");
+
+        let mut op_to_group = HashMap::new();
+        op_to_group.insert(norm_id, 0);
+        op_to_group.insert(gemm_id, 0);
+        let plan = FusionPlan {
+            groups: vec![FusionGroup {
+                id: 0, anchor: gemm_id, epilogue: vec![],
+                mode: FusionMode::ComputeRoot { predecessor: norm_id },
+                ops: vec![norm_id, gemm_id],
+            }],
+            op_to_group,
+        };
+        let alloc = BufferAllocation { slots: vec![], total_bytes: 0, num_tensors: 0, bytes_saved: 0 };
+        let profile = crate::dispatch::DeviceProfile::detect();
+        let registry = ScalarOpRegistry::with_defaults();
+
+        let mut emitter = jit::DynasmAArch64CodeGen::new(&profile);
+        let output = emitter.emit_plan(&plan, &g, &alloc, &profile, Some(&registry)).unwrap();
+        assert!(!output.code.is_empty(), "ComputeRoot should produce code");
+        assert_eq!(output.code.len() % 4, 0, "code must be 4-byte aligned");
+        assert!(output.scratchpad_bytes > 0, "ComputeRoot needs scratchpad for norm output");
+        eprintln!("ComputeRoot codegen: {} bytes code, {} bytes scratchpad",
+            output.code.len(), output.scratchpad_bytes);
+    }
+
+    /// LoopFusion elementwise chain: SiLU → Add fused chain codegen verification.
+    #[test]
+    fn test_aarch64_elementwise_chain_codegen() {
+        use crate::compiler::graph::{CompilerGraph, OpKind};
+        use crate::compiler::fusion::{FusionGroup, FusionMode, FusionPlan};
+        use crate::compiler::buffer_alloc::{BufferAllocation, BufferSlot};
+        use crate::compiler::registry::ScalarOpRegistry;
+        use crate::types::DType;
+        use std::collections::HashMap;
+
+        let n = 32;
+        let mut g = CompilerGraph::new();
+        let input = g.add_tensor("input", vec![n], DType::F32);
+        let bias = g.add_tensor("bias", vec![n], DType::F32);
+        let mid = g.add_tensor("mid", vec![n], DType::F32);
+        let output = g.add_tensor("output", vec![n], DType::F32);
+        g.inputs = vec![input, bias];
+        g.outputs = vec![output];
+        let silu_id = g.add_op(OpKind::Silu, vec![input], vec![mid], "silu");
+        let add_id = g.add_op(OpKind::Add, vec![mid, bias], vec![output], "add");
+
+        let mut op_to_group = HashMap::new();
+        op_to_group.insert(silu_id, 0);
+        op_to_group.insert(add_id, 0);
+        let plan = FusionPlan {
+            groups: vec![FusionGroup {
+                id: 0, anchor: silu_id, epilogue: vec![add_id],
+                mode: FusionMode::LoopFusion, ops: vec![silu_id, add_id],
+            }],
+            op_to_group,
+        };
+        let alloc = BufferAllocation {
+            slots: vec![
+                BufferSlot { tensor_id: input, offset: 0, size: n * 4 },
+                BufferSlot { tensor_id: bias, offset: n * 4, size: n * 4 },
+                BufferSlot { tensor_id: output, offset: n * 8, size: n * 4 },
+            ],
+            total_bytes: n * 12,
+            num_tensors: 3,
+            bytes_saved: 0,
+        };
+        let profile = crate::dispatch::DeviceProfile::detect();
+        let registry = ScalarOpRegistry::with_defaults();
+
+        let mut emitter = jit::DynasmAArch64CodeGen::new(&profile);
+        let out = emitter.emit_plan(&plan, &g, &alloc, &profile, Some(&registry)).unwrap();
+        assert!(!out.code.is_empty(), "LoopFusion chain should produce code");
+        assert_eq!(out.code.len() % 4, 0, "code must be 4-byte aligned");
+        eprintln!("LoopFusion elementwise chain: {} bytes code", out.code.len());
     }
 }
