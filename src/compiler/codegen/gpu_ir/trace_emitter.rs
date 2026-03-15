@@ -213,6 +213,69 @@ pub trait GpuDialect {
         block_size: usize,
         bits: u8,
     );
+
+    /// Emit a fused GEMM + epilogue kernel (EpilogueInjection).
+    ///
+    /// The GEMM computes C = A * B (+ bias for GemmBias), then each output
+    /// element has the epilogue trace bodies applied in sequence before the
+    /// final store. This avoids a round-trip through global memory between
+    /// the GEMM and the activation/elementwise ops.
+    ///
+    /// `epilogue_bodies` contains the `TraceOp` SSA traces for each epilogue
+    /// op (e.g. GELU, SiLU, residual add), in execution order.
+    fn emit_gemm_epilogue_kernel(
+        &self,
+        out: &mut String,
+        name: &str,
+        op_kind: &OpKind,
+        epilogue_bodies: &[&[TraceOp]],
+    ) -> Result<(), String>;
+
+    /// Emit a fused TileLevelFusion kernel: norm tiled into GEMM thread-block
+    /// loop via shared memory.
+    ///
+    /// The predecessor (NormLike) output is computed per tile strip in shared
+    /// memory, then the GEMM reads from shared memory instead of global memory.
+    /// This avoids a full global memory round-trip for the norm output.
+    ///
+    /// Default implementation returns `Err` — backends implement as needed.
+    fn emit_tile_level_fusion_kernel(
+        &self,
+        out: &mut String,
+        name: &str,
+        norm_op: &OpKind,
+        gemm_op: &OpKind,
+        tile_rows: usize,
+        norm_reduce: &[TraceOp],
+        norm_finalize: &[TraceOp],
+        norm_transform: &[TraceOp],
+        shared_mem_budget: usize,
+    ) -> Result<(), String> {
+        let _ = (out, name, norm_op, gemm_op, tile_rows, norm_reduce, norm_finalize, norm_transform, shared_mem_budget);
+        Err("TileLevelFusion not implemented for this GPU dialect".into())
+    }
+
+    /// Emit a ComputeRoot kernel: full norm into shared/global memory, then GEMM.
+    ///
+    /// The predecessor (NormLike) is computed fully before the GEMM. If the norm
+    /// output fits in shared memory (≤ budget), it stays there; otherwise a
+    /// two-kernel approach is used with global memory as intermediate.
+    ///
+    /// Default implementation returns `Err` — backends implement as needed.
+    fn emit_compute_root_kernel(
+        &self,
+        out: &mut String,
+        name: &str,
+        norm_op: &OpKind,
+        gemm_op: &OpKind,
+        norm_reduce: &[TraceOp],
+        norm_finalize: &[TraceOp],
+        norm_transform: &[TraceOp],
+        shared_mem_budget: usize,
+    ) -> Result<(), String> {
+        let _ = (out, name, norm_op, gemm_op, norm_reduce, norm_finalize, norm_transform, shared_mem_budget);
+        Err("ComputeRoot not implemented for this GPU dialect".into())
+    }
 }
 
 // ── Unified emit_trace_body ─────────────────────────────────────────────────
@@ -526,12 +589,16 @@ impl GpuDialect for PtxDialect {
                 } else if self.sm_version >= 70 {
                     emit_gemm_tc_sm70_ptx(out, name, *m, *n, *k);
                 } else {
-                    emit_gemm_kernel_ptx(out, name, *m, *n, *k);
+                    // Fallback to unified tiled GEMM builder for older GPUs
+                    let has_bias = matches!(op_kind, OpKind::GemmBias { .. });
+                    return super::kernel_builder::build_gemm_tiled_kernel(
+                        self, out, name, has_bias, &[],
+                    );
                 }
                 Ok(())
             }
             OpKind::MultiHeadAttention { seq_len, num_heads, head_dim } => {
-                emit_mha_kernel_ptx(out, name, *seq_len, *num_heads, *head_dim);
+                super::kernel_builder::build_mha_kernel(self, out, name, *seq_len, *num_heads, *head_dim);
                 Ok(())
             }
             _ => Err(format!("PtxDialect: unsupported Gemm-pattern op {:?}", op_kind)),
@@ -546,7 +613,7 @@ impl GpuDialect for PtxDialect {
         num_heads: usize,
         head_dim: usize,
     ) {
-        crate::compiler::codegen::ptx::emit_mha_kernel_ptx(out, name, seq_len, num_heads, head_dim);
+        super::kernel_builder::build_mha_kernel(self, out, name, seq_len, num_heads, head_dim);
     }
 
     fn emit_rope_kernel(
@@ -622,6 +689,18 @@ impl GpuDialect for PtxDialect {
         super::kernel_builder::build_dequantize_kernel(
             self, out, name, num_elements, block_size, bits.into(),
         );
+    }
+
+    fn emit_gemm_epilogue_kernel(
+        &self,
+        out: &mut String,
+        name: &str,
+        op_kind: &OpKind,
+        epilogue_bodies: &[&[TraceOp]],
+    ) -> Result<(), String> {
+        super::kernel_builder::build_gemm_epilogue_kernel(
+            self, out, name, op_kind, epilogue_bodies,
+        )
     }
 }
 
@@ -844,13 +923,16 @@ impl GpuDialect for HipDialect {
                 if self.gfx_arch >= 908 {
                     emit_gemm_mfma_kernel_hip(out, name);
                 } else {
-                    let tile = if self.gfx_arch >= 1000 { 16 } else { 32 };
-                    emit_gemm_kernel_hip(out, name, tile);
+                    // Use unified tiled GEMM builder for non-MFMA hardware
+                    let has_bias = matches!(op_kind, OpKind::GemmBias { .. });
+                    return super::kernel_builder::build_gemm_tiled_kernel(
+                        self, out, name, has_bias, &[],
+                    );
                 }
                 Ok(())
             }
             OpKind::MultiHeadAttention { seq_len, num_heads, head_dim } => {
-                emit_mha_kernel_hip(out, name, *seq_len, *num_heads, *head_dim);
+                super::kernel_builder::build_mha_kernel(self, out, name, *seq_len, *num_heads, *head_dim);
                 Ok(())
             }
             OpKind::QuantGemm { m, n, k, .. } => {
@@ -871,7 +953,7 @@ impl GpuDialect for HipDialect {
         num_heads: usize,
         head_dim: usize,
     ) {
-        crate::compiler::codegen::hip::emit_mha_kernel_hip(out, name, seq_len, num_heads, head_dim);
+        super::kernel_builder::build_mha_kernel(self, out, name, seq_len, num_heads, head_dim);
     }
 
     fn emit_rope_kernel(
@@ -947,6 +1029,283 @@ impl GpuDialect for HipDialect {
         super::kernel_builder::build_dequantize_kernel(
             self, out, name, num_elements, block_size, bits.into(),
         );
+    }
+
+    fn emit_gemm_epilogue_kernel(
+        &self,
+        out: &mut String,
+        name: &str,
+        op_kind: &OpKind,
+        epilogue_bodies: &[&[TraceOp]],
+    ) -> Result<(), String> {
+        super::kernel_builder::build_gemm_epilogue_kernel(
+            self, out, name, op_kind, epilogue_bodies,
+        )
+    }
+
+    fn emit_tile_level_fusion_kernel(
+        &self,
+        out: &mut String,
+        name: &str,
+        norm_op: &OpKind,
+        gemm_op: &OpKind,
+        tile_rows: usize,
+        norm_reduce: &[TraceOp],
+        norm_finalize: &[TraceOp],
+        norm_transform: &[TraceOp],
+        shared_mem_budget: usize,
+    ) -> Result<(), String> {
+        // Extract GEMM dimensions from anchor op
+        let (m, n, k) = match gemm_op {
+            OpKind::Gemm { m, n, k } | OpKind::GemmBias { m, n, k } => (*m, *n, *k),
+            _ => return Err(format!(
+                "TileLevelFusion anchor must be Gemm/GemmBias, got {:?}", gemm_op
+            )),
+        };
+
+        // Extract eps from norm op (RmsNorm/LayerNorm)
+        let eps = match norm_op {
+            OpKind::RmsNorm { eps } | OpKind::LayerNorm { eps } => *eps,
+            _ => 1e-6,
+        };
+        let has_norm_weight = matches!(
+            norm_op, OpKind::RmsNorm { .. } | OpKind::LayerNorm { .. }
+        );
+
+        let block_size = 256usize;
+        // shared memory: norm_tile[tile_rows * K] for norm output
+        let norm_tile_floats = tile_rows * k;
+        let norm_tile_bytes = norm_tile_floats * 4;
+        if norm_tile_bytes > shared_mem_budget {
+            return Err(format!(
+                "TileLevelFusion: norm tile ({} bytes) exceeds shared_mem budget ({} bytes)",
+                norm_tile_bytes, shared_mem_budget
+            ));
+        }
+
+        let eps_bits = eps.to_bits();
+
+        // Kernel signature
+        writeln!(out, "extern \"C\" __global__ void {name}(").unwrap();
+        writeln!(out, "    const float* __restrict__ input,").unwrap();
+        if has_norm_weight {
+            writeln!(out, "    const float* __restrict__ norm_weight,").unwrap();
+        }
+        writeln!(out, "    const float* __restrict__ weight,").unwrap();
+        writeln!(out, "    float* __restrict__ output,").unwrap();
+        writeln!(out, "    const int M,").unwrap();
+        writeln!(out, "    const int N,").unwrap();
+        writeln!(out, "    const int K").unwrap();
+        writeln!(out, ") {{").unwrap();
+
+        // Constants and shared memory
+        writeln!(out, "    const int TILE_ROWS = {tile_rows};").unwrap();
+        writeln!(out, "    const float eps = __uint_as_float(0x{eps_bits:08X}u);").unwrap();
+        writeln!(out, "    __shared__ float norm_tile[{norm_tile_floats}];").unwrap();
+        writeln!(out).unwrap();
+
+        // Block-level row tiling
+        writeln!(out, "    int block_row = blockIdx.x * TILE_ROWS;").unwrap();
+        writeln!(out, "    int tid = threadIdx.x;").unwrap();
+        writeln!(out, "    int mc_cur = min(TILE_ROWS, M - block_row);").unwrap();
+        writeln!(out).unwrap();
+
+        // Phase 1: Cooperative RmsNorm/LayerNorm for tile_rows into shared memory
+        writeln!(out, "    // Phase 1: Cooperative norm for tile rows").unwrap();
+        writeln!(out, "    for (int r = tid; r < mc_cur; r += {block_size}) {{").unwrap();
+
+        // Reduce phase: compute sum of squares
+        writeln!(out, "        float sum_sq = 0.0f;").unwrap();
+        writeln!(out, "        for (int c = 0; c < K; c++) {{").unwrap();
+        writeln!(out, "            float x = input[(block_row + r) * K + c];").unwrap();
+
+        // Emit reduce trace inline (sum_sq += x*x for RmsNorm)
+        let reduce_bindings = vec!["x".to_string(), "sum_sq".to_string()];
+        let reduce_result = emit_trace_body(self, out, norm_reduce, 10, &reduce_bindings);
+        writeln!(out, "            sum_sq += {reduce_result};").unwrap();
+        writeln!(out, "        }}").unwrap();
+
+        // Finalize phase: compute normalization factor
+        writeln!(out, "        float norm_mean = sum_sq / (float)K;").unwrap();
+        let finalize_bindings = vec!["norm_mean".to_string()];
+        let inv_rms = emit_trace_body(self, out, norm_finalize, 11, &finalize_bindings);
+        writeln!(out).unwrap();
+
+        // Transform phase: apply norm and write to shared memory
+        writeln!(out, "        for (int c = 0; c < K; c++) {{").unwrap();
+        writeln!(out, "            float x = input[(block_row + r) * K + c];").unwrap();
+        if has_norm_weight {
+            let transform_bindings = vec![
+                "x".to_string(), inv_rms.clone(), "norm_weight[c]".to_string(),
+            ];
+            let normed = emit_trace_body(self, out, norm_transform, 12, &transform_bindings);
+            writeln!(out, "            norm_tile[r * K + c] = {normed};").unwrap();
+        } else {
+            let transform_bindings = vec!["x".to_string(), inv_rms.clone()];
+            let normed = emit_trace_body(self, out, norm_transform, 12, &transform_bindings);
+            writeln!(out, "            norm_tile[r * K + c] = {normed};").unwrap();
+        }
+        writeln!(out, "        }}").unwrap();
+        writeln!(out, "    }}").unwrap();
+        writeln!(out, "    __syncthreads();").unwrap();
+        writeln!(out).unwrap();
+
+        // Phase 2: Tiled GEMM from shared memory
+        let tile_k = 16usize;
+        writeln!(out, "    // Phase 2: Tiled GEMM from shared memory").unwrap();
+        writeln!(out, "    const int TILE_N = 16;").unwrap();
+        writeln!(out, "    const int TILE_K = {tile_k};").unwrap();
+        writeln!(out, "    __shared__ float b_tile[{tile_k} * 16];").unwrap();
+        writeln!(out).unwrap();
+        writeln!(out, "    int ty = tid / TILE_N;").unwrap();
+        writeln!(out, "    int tx = tid % TILE_N;").unwrap();
+        writeln!(out).unwrap();
+        writeln!(out, "    for (int col_block = 0; col_block < N; col_block += TILE_N) {{").unwrap();
+        writeln!(out, "        for (int row = ty; row < mc_cur; row += ({block_size} / TILE_N)) {{").unwrap();
+        writeln!(out, "            float acc = 0.0f;").unwrap();
+        writeln!(out, "            for (int pc = 0; pc < K; pc += TILE_K) {{").unwrap();
+        writeln!(out, "                // Load B tile to shared").unwrap();
+        writeln!(out, "                if (tid < TILE_K * TILE_N) {{").unwrap();
+        writeln!(out, "                    int bk = tid / TILE_N;").unwrap();
+        writeln!(out, "                    int bn = tid % TILE_N;").unwrap();
+        writeln!(out, "                    int gk = pc + bk;").unwrap();
+        writeln!(out, "                    int gn = col_block + bn;").unwrap();
+        writeln!(out, "                    b_tile[bk * TILE_N + bn] = (gk < K && gn < N) ? weight[gk * N + gn] : 0.0f;").unwrap();
+        writeln!(out, "                }}").unwrap();
+        writeln!(out, "                __syncthreads();").unwrap();
+        writeln!(out, "                for (int kk = 0; kk < TILE_K; kk++) {{").unwrap();
+        writeln!(out, "                    int gk = pc + kk;").unwrap();
+        writeln!(out, "                    float a_val = (gk < K) ? norm_tile[row * K + gk] : 0.0f;").unwrap();
+        writeln!(out, "                    acc = fmaf(a_val, b_tile[kk * TILE_N + tx], acc);").unwrap();
+        writeln!(out, "                }}").unwrap();
+        writeln!(out, "                __syncthreads();").unwrap();
+        writeln!(out, "            }}").unwrap();
+        writeln!(out, "            int out_row = block_row + row;").unwrap();
+        writeln!(out, "            int out_col = col_block + tx;").unwrap();
+        writeln!(out, "            if (out_row < M && out_col < N) {{").unwrap();
+        writeln!(out, "                output[out_row * N + out_col] = acc;").unwrap();
+        writeln!(out, "            }}").unwrap();
+        writeln!(out, "        }}").unwrap();
+        writeln!(out, "    }}").unwrap();
+        writeln!(out, "}}\n").unwrap();
+
+        Ok(())
+    }
+
+    fn emit_compute_root_kernel(
+        &self,
+        out: &mut String,
+        name: &str,
+        norm_op: &OpKind,
+        gemm_op: &OpKind,
+        norm_reduce: &[TraceOp],
+        norm_finalize: &[TraceOp],
+        norm_transform: &[TraceOp],
+        _shared_mem_budget: usize,
+    ) -> Result<(), String> {
+        // ComputeRoot: two-kernel approach — full norm to global buffer, then GEMM.
+        // Emitted as a single kernel with two phases using global memory intermediate.
+        let (_m, _n, k) = match gemm_op {
+            OpKind::Gemm { m, n, k } | OpKind::GemmBias { m, n, k } => (*m, *n, *k),
+            _ => return Err(format!(
+                "ComputeRoot anchor must be Gemm/GemmBias, got {:?}", gemm_op
+            )),
+        };
+
+        let eps = match norm_op {
+            OpKind::RmsNorm { eps } | OpKind::LayerNorm { eps } => *eps,
+            _ => 1e-6,
+        };
+        let has_norm_weight = matches!(
+            norm_op, OpKind::RmsNorm { .. } | OpKind::LayerNorm { .. }
+        );
+
+        let block_size = 256usize;
+        let eps_bits = eps.to_bits();
+
+        // Kernel 1: Full norm
+        let norm_name = format!("{name}_norm");
+        writeln!(out, "extern \"C\" __global__ void {norm_name}(").unwrap();
+        writeln!(out, "    const float* __restrict__ input,").unwrap();
+        if has_norm_weight {
+            writeln!(out, "    const float* __restrict__ norm_weight,").unwrap();
+        }
+        writeln!(out, "    float* __restrict__ normed,").unwrap();
+        writeln!(out, "    const int M,").unwrap();
+        writeln!(out, "    const int K").unwrap();
+        writeln!(out, ") {{").unwrap();
+        writeln!(out, "    const float eps = __uint_as_float(0x{eps_bits:08X}u);").unwrap();
+        writeln!(out, "    int row = blockIdx.x * blockDim.x + threadIdx.x;").unwrap();
+        writeln!(out, "    if (row >= M) return;").unwrap();
+        writeln!(out).unwrap();
+
+        // Reduce
+        writeln!(out, "    float sum_sq = 0.0f;").unwrap();
+        writeln!(out, "    for (int c = 0; c < K; c++) {{").unwrap();
+        writeln!(out, "        float x = input[row * K + c];").unwrap();
+        let reduce_bindings = vec!["x".to_string(), "sum_sq".to_string()];
+        let reduce_result = emit_trace_body(self, out, norm_reduce, 10, &reduce_bindings);
+        writeln!(out, "        sum_sq += {reduce_result};").unwrap();
+        writeln!(out, "    }}").unwrap();
+
+        // Finalize
+        writeln!(out, "    float norm_mean = sum_sq / (float)K;").unwrap();
+        let finalize_bindings = vec!["norm_mean".to_string()];
+        let inv_rms = emit_trace_body(self, out, norm_finalize, 11, &finalize_bindings);
+        writeln!(out).unwrap();
+
+        // Transform
+        writeln!(out, "    for (int c = 0; c < K; c++) {{").unwrap();
+        writeln!(out, "        float x = input[row * K + c];").unwrap();
+        if has_norm_weight {
+            let transform_bindings = vec![
+                "x".to_string(), inv_rms.clone(), "norm_weight[c]".to_string(),
+            ];
+            let normed = emit_trace_body(self, out, norm_transform, 12, &transform_bindings);
+            writeln!(out, "        normed[row * K + c] = {normed};").unwrap();
+        } else {
+            let transform_bindings = vec!["x".to_string(), inv_rms.clone()];
+            let normed = emit_trace_body(self, out, norm_transform, 12, &transform_bindings);
+            writeln!(out, "        normed[row * K + c] = {normed};").unwrap();
+        }
+        writeln!(out, "    }}").unwrap();
+        writeln!(out, "}}\n").unwrap();
+
+        // Kernel 2: Standard tiled GEMM reading from normed buffer
+        let gemm_name = format!("{name}_gemm");
+        let tile_size = 16usize;
+        writeln!(out, "extern \"C\" __global__ void {gemm_name}(").unwrap();
+        writeln!(out, "    const float* __restrict__ A,").unwrap();
+        writeln!(out, "    const float* __restrict__ B,").unwrap();
+        writeln!(out, "    float* __restrict__ C,").unwrap();
+        writeln!(out, "    const int M,").unwrap();
+        writeln!(out, "    const int N,").unwrap();
+        writeln!(out, "    const int K").unwrap();
+        writeln!(out, ") {{").unwrap();
+        writeln!(out, "    const int TILE_SIZE = {tile_size};").unwrap();
+        writeln!(out, "    __shared__ float As[{tile_size} * {tile_size}];").unwrap();
+        writeln!(out, "    __shared__ float Bs[{tile_size} * {tile_size}];").unwrap();
+        writeln!(out, "    int row = blockIdx.y * TILE_SIZE + threadIdx.y;").unwrap();
+        writeln!(out, "    int col = blockIdx.x * TILE_SIZE + threadIdx.x;").unwrap();
+        writeln!(out, "    float acc = 0.0f;").unwrap();
+        writeln!(out).unwrap();
+        writeln!(out, "    for (int t = 0; t < (K + TILE_SIZE - 1) / TILE_SIZE; t++) {{").unwrap();
+        writeln!(out, "        int ak = t * TILE_SIZE + threadIdx.x;").unwrap();
+        writeln!(out, "        int bk = t * TILE_SIZE + threadIdx.y;").unwrap();
+        writeln!(out, "        As[threadIdx.y * TILE_SIZE + threadIdx.x] = (row < M && ak < K) ? A[row * K + ak] : 0.0f;").unwrap();
+        writeln!(out, "        Bs[threadIdx.y * TILE_SIZE + threadIdx.x] = (bk < K && col < N) ? B[bk * N + col] : 0.0f;").unwrap();
+        writeln!(out, "        __syncthreads();").unwrap();
+        writeln!(out, "        for (int kk = 0; kk < TILE_SIZE; kk++) {{").unwrap();
+        writeln!(out, "            acc = fmaf(As[threadIdx.y * TILE_SIZE + kk], Bs[kk * TILE_SIZE + threadIdx.x], acc);").unwrap();
+        writeln!(out, "        }}").unwrap();
+        writeln!(out, "        __syncthreads();").unwrap();
+        writeln!(out, "    }}").unwrap();
+        writeln!(out, "    if (row < M && col < N) {{").unwrap();
+        writeln!(out, "        C[row * N + col] = acc;").unwrap();
+        writeln!(out, "    }}").unwrap();
+        writeln!(out, "}}\n").unwrap();
+
+        Ok(())
     }
 }
 
@@ -1156,7 +1515,10 @@ impl GpuDialect for MslDialect {
                 if self.gpu_family >= 7 {
                     emit_gemm_simdgroup_msl(out, name, *m, *n, *k);
                 } else {
-                    emit_gemm_kernel_msl(out, name, *m, *n, *k);
+                    // Use unified tiled GEMM builder for older GPU families
+                    return super::kernel_builder::build_gemm_tiled_kernel(
+                        self, out, name, false, &[],
+                    );
                 }
                 Ok(())
             }
@@ -1164,7 +1526,10 @@ impl GpuDialect for MslDialect {
                 if self.gpu_family >= 7 {
                     emit_gemm_bias_simdgroup_msl(out, name, *m, *n, *k);
                 } else {
-                    emit_gemm_bias_kernel_msl(out, name, *m, *n, *k);
+                    // Use unified tiled GEMM builder for older GPU families
+                    return super::kernel_builder::build_gemm_tiled_kernel(
+                        self, out, name, true, &[],
+                    );
                 }
                 Ok(())
             }
@@ -1177,7 +1542,7 @@ impl GpuDialect for MslDialect {
                 Ok(())
             }
             OpKind::MultiHeadAttention { seq_len, num_heads, head_dim } => {
-                emit_mha_kernel_msl(out, name, *seq_len, *num_heads, *head_dim);
+                super::kernel_builder::build_mha_kernel(self, out, name, *seq_len, *num_heads, *head_dim);
                 Ok(())
             }
             _ => Err(format!("MslDialect: unsupported Gemm-pattern op {:?}", op_kind)),
@@ -1192,7 +1557,7 @@ impl GpuDialect for MslDialect {
         num_heads: usize,
         head_dim: usize,
     ) {
-        crate::compiler::codegen::air::emit_mha_kernel_msl(out, name, seq_len, num_heads, head_dim);
+        super::kernel_builder::build_mha_kernel(self, out, name, seq_len, num_heads, head_dim);
     }
 
     fn emit_rope_kernel(
@@ -1268,6 +1633,18 @@ impl GpuDialect for MslDialect {
         super::kernel_builder::build_dequantize_kernel(
             self, out, name, num_elements, block_size, bits.into(),
         );
+    }
+
+    fn emit_gemm_epilogue_kernel(
+        &self,
+        out: &mut String,
+        name: &str,
+        op_kind: &OpKind,
+        epilogue_bodies: &[&[TraceOp]],
+    ) -> Result<(), String> {
+        super::kernel_builder::build_gemm_epilogue_kernel(
+            self, out, name, op_kind, epilogue_bodies,
+        )
     }
 }
 

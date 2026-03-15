@@ -15,9 +15,9 @@ use crate::compiler::codegen::CodegenOutput;
 use crate::compiler::codegen::gpu_ir::trace_emitter::{GpuDialect, HipDialect};
 use crate::compiler::codegen::gpu_ir::plan_emitter::gpu_emit_plan;
 use crate::compiler::fusion::FusionPlan;
-use crate::compiler::graph::{CompilerGraph, OpKind};
+use crate::compiler::graph::CompilerGraph;
 use crate::compiler::registry::ScalarOpRegistry;
-use crate::compiler::trace::{ComputePattern, TraceOp};
+use crate::compiler::trace::TraceOp;
 use crate::compiler::buffer_alloc::BufferAllocation;
 use crate::dispatch::DeviceProfile;
 
@@ -512,7 +512,7 @@ impl MachineCodeEmitter for HipCodeGen {
             });
         }
 
-        gpu_emit_plan(&dialect, &mut hip, plan, graph, registry)?;
+        gpu_emit_plan(&dialect, &mut hip, plan, graph, registry, None)?;
 
         Ok(CodegenOutput {
             code: hip.into_bytes(),

@@ -658,7 +658,7 @@ impl MachineCodeEmitter for PtxCodeGen {
             });
         }
 
-        gpu_emit_plan(&dialect, &mut ptx, plan, graph, registry)?;
+        gpu_emit_plan(&dialect, &mut ptx, plan, graph, registry, None)?;
 
         Ok(CodegenOutput {
             code: ptx.into_bytes(),

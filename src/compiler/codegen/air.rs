@@ -383,7 +383,7 @@ impl MachineCodeEmitter for AirCodeGen {
             });
         }
 
-        gpu_emit_plan(&dialect, &mut msl, plan, graph, registry)?;
+        gpu_emit_plan(&dialect, &mut msl, plan, graph, registry, None)?;
 
         Ok(CodegenOutput {
             code: msl.into_bytes(),
