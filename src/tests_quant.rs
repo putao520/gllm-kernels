@@ -2,7 +2,7 @@
 mod tests {
     use crate::quant::{BlockQ4K, BlockQ8K, BlockQ2K, BlockQ3K, BlockQ5K, BlockQ6K};
     use crate::Kernels;
-    use crate::cpu_kernels::CpuKernels;
+    use crate::backend::CpuKernels;
     use half::f16;
     use std::slice;
     use std::mem::size_of;
@@ -692,5 +692,167 @@ mod tests {
         assert_eq!(output[0], 20.0);
         // output[1] = 2 * 0.5 = 1.0
         assert_eq!(output[1], 1.0);
+    }
+
+    // ---- IQ Codebook dequantization tests (REQ-KERNELS-IQ-001~008) ----
+
+    /// Helper: build a minimal IQ block with known d and qs bytes.
+    fn make_iq_block(d: f32, block_bytes: usize, payload: &[u8]) -> Vec<u8> {
+        let mut block = vec![0u8; block_bytes];
+        let d_bytes = f16::from_f32(d).to_le_bytes();
+        block[0] = d_bytes[0];
+        block[1] = d_bytes[1];
+        // Copy payload after d
+        let copy_len = payload.len().min(block_bytes - 2);
+        block[2..2 + copy_len].copy_from_slice(&payload[..copy_len]);
+        block
+    }
+
+    /// TEST-KERNELS-IQ-001: IQ1_S dequant outputs non-zero
+    #[test]
+    fn test_dequant_iq1_s_nonzero() {
+        let kernels = CpuKernels::<f32>::new();
+        // Build a block with d=1.0 and non-zero qs/qh
+        let mut block = vec![0u8; 50];
+        let d_bytes = f16::from_f32(1.0).to_le_bytes();
+        block[0] = d_bytes[0];
+        block[1] = d_bytes[1];
+        // Set qs[0] = 1 (grid index 1)
+        block[2] = 1;
+        // Set qh: first u16 = 0 (no high bits, no sign flip)
+        let mut out = vec![0.0f32; 256];
+        kernels.dequant_iq1_s(&block, &mut out);
+        // At least some output should be non-zero
+        let nonzero_count = out.iter().filter(|&&v| v != 0.0).count();
+        assert!(nonzero_count > 0, "IQ1_S dequant should produce non-zero output");
+    }
+
+    /// TEST-KERNELS-IQ-002: IQ1_M dequant outputs non-zero
+    #[test]
+    fn test_dequant_iq1_m_nonzero() {
+        let kernels = CpuKernels::<f32>::new();
+        // IQ1_M layout: qs(32) + qh(16) + scales(6) + d(2) = 56
+        let mut block = vec![0u8; 56];
+        // d is at bytes 54-55
+        let d_bytes = f16::from_f32(1.0).to_le_bytes();
+        block[54] = d_bytes[0];
+        block[55] = d_bytes[1];
+        // Set qs[0] = 1, scales[0] = 0x11 (non-zero scale)
+        block[0] = 1;
+        block[48] = 0x11;
+        let mut out = vec![0.0f32; 256];
+        kernels.dequant_iq1_m(&block, &mut out);
+        let nonzero_count = out.iter().filter(|&&v| v != 0.0).count();
+        assert!(nonzero_count > 0, "IQ1_M dequant should produce non-zero output");
+    }
+
+    /// TEST-KERNELS-IQ-003: IQ2_XXS dequant outputs non-zero
+    #[test]
+    fn test_dequant_iq2_xxs_nonzero() {
+        let kernels = CpuKernels::<f32>::new();
+        let mut block = make_iq_block(1.0, 66, &[]);
+        // Set first u16 in qs to grid_idx=8 (non-trivial grid entry)
+        block[2] = 8;
+        block[3] = 0;
+        // Set scale info in the 4th u16 of first sub-block (bytes 8-9)
+        block[8] = 0;
+        block[9] = 0x10; // scale bits in high nibble
+        let mut out = vec![0.0f32; 256];
+        kernels.dequant_iq2_xxs(&block, &mut out);
+        let nonzero_count = out.iter().filter(|&&v| v != 0.0).count();
+        assert!(nonzero_count > 0, "IQ2_XXS dequant should produce non-zero output");
+    }
+
+    /// TEST-KERNELS-IQ-004: IQ2_XS dequant outputs non-zero
+    #[test]
+    fn test_dequant_iq2_xs_nonzero() {
+        let kernels = CpuKernels::<f32>::new();
+        let mut block = make_iq_block(1.0, 74, &[]);
+        // Set first u16 in qs to grid_idx=5
+        block[2] = 5;
+        block[3] = 0;
+        // Set scales[0] = 0x02 (scale = 0.5 + 2 = 2.5, * 0.25 = 0.625)
+        block[66] = 0x02;
+        let mut out = vec![0.0f32; 256];
+        kernels.dequant_iq2_xs(&block, &mut out);
+        let nonzero_count = out.iter().filter(|&&v| v != 0.0).count();
+        assert!(nonzero_count > 0, "IQ2_XS dequant should produce non-zero output");
+    }
+
+    /// TEST-KERNELS-IQ-005: IQ2_S dequant outputs non-zero
+    #[test]
+    fn test_dequant_iq2_s_nonzero() {
+        let kernels = CpuKernels::<f32>::new();
+        let mut block = make_iq_block(1.0, 82, &[]);
+        // Set qs[0] = 3, scales[0] = 0x02
+        block[2] = 3;
+        block[50] = 0x02;
+        let mut out = vec![0.0f32; 256];
+        kernels.dequant_iq2_s(&block, &mut out);
+        let nonzero_count = out.iter().filter(|&&v| v != 0.0).count();
+        assert!(nonzero_count > 0, "IQ2_S dequant should produce non-zero output");
+    }
+
+    /// TEST-KERNELS-IQ-006: IQ3_XXS dequant outputs non-zero
+    #[test]
+    fn test_dequant_iq3_xxs_nonzero() {
+        let kernels = CpuKernels::<f32>::new();
+        let mut block = make_iq_block(1.0, 98, &[]);
+        // Set qs[0] = 5 (grid index)
+        block[2] = 5;
+        // Set scale in signs_scales area: bytes 50+4..50+6
+        block[54] = 0x01;
+        block[55] = 0x00;
+        let mut out = vec![0.0f32; 256];
+        kernels.dequant_iq3_xxs(&block, &mut out);
+        let nonzero_count = out.iter().filter(|&&v| v != 0.0).count();
+        assert!(nonzero_count > 0, "IQ3_XXS dequant should produce non-zero output");
+    }
+
+    /// TEST-KERNELS-IQ-007: IQ3_S dequant outputs non-zero
+    #[test]
+    fn test_dequant_iq3_s_nonzero() {
+        let kernels = CpuKernels::<f32>::new();
+        let mut block = make_iq_block(1.0, 110, &[]);
+        // Set qs[0] = 0x0A (non-zero grid indices)
+        block[2] = 0x0A;
+        // Set scales[0] = 0x03
+        block[98] = 0x03;
+        let mut out = vec![0.0f32; 256];
+        kernels.dequant_iq3_s(&block, &mut out);
+        let nonzero_count = out.iter().filter(|&&v| v != 0.0).count();
+        assert!(nonzero_count > 0, "IQ3_S dequant should produce non-zero output");
+    }
+
+    /// TEST-KERNELS-IQ-008: All 7 IQ formats produce different outputs (not all zeros)
+    #[test]
+    fn test_iq_all_formats_nonzero() {
+        let kernels = CpuKernels::<f32>::new();
+        let formats: Vec<(usize, Box<dyn Fn(&CpuKernels<f32>, &[u8], &mut [f32])>)> = vec![
+            (50, Box::new(|k, b, o| k.dequant_iq1_s(b, o))),
+            (56, Box::new(|k, b, o| k.dequant_iq1_m(b, o))),
+            (66, Box::new(|k, b, o| k.dequant_iq2_xxs(b, o))),
+            (74, Box::new(|k, b, o| k.dequant_iq2_xs(b, o))),
+            (82, Box::new(|k, b, o| k.dequant_iq2_s(b, o))),
+            (98, Box::new(|k, b, o| k.dequant_iq3_xxs(b, o))),
+            (110, Box::new(|k, b, o| k.dequant_iq3_s(b, o))),
+        ];
+        for (block_bytes, dequant_fn) in &formats {
+            let mut block = vec![0xABu8; *block_bytes];
+            // Set d to 1.0
+            let d_bytes = f16::from_f32(1.0).to_le_bytes();
+            if *block_bytes == 56 {
+                // IQ1_M: d at end
+                block[54] = d_bytes[0];
+                block[55] = d_bytes[1];
+            } else {
+                block[0] = d_bytes[0];
+                block[1] = d_bytes[1];
+            }
+            let mut out = vec![0.0f32; 256];
+            dequant_fn(&kernels, &block, &mut out);
+            let nonzero = out.iter().filter(|&&v| v != 0.0).count();
+            assert!(nonzero > 0, "block_bytes={} should produce non-zero output", block_bytes);
+        }
     }
 }
