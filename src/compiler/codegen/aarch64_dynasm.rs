@@ -29,6 +29,7 @@ pub mod jit {
     use crate::dispatch::DeviceProfile;
     use crate::dispatch::device_profile::IsaLevel;
     use crate::compiler::codegen::apple_amx::{emit_apple_amx_f32_gemm, apple_amx_gemm_eligible};
+    use crate::compiler::codegen::sve::SveCodeGen;
 
     /// NEON register width: 4 x f32 = 128 bits.
     const NEON_WIDTH_F32: usize = 4;
@@ -57,6 +58,12 @@ pub mod jit {
         width_stack: Vec<crate::compiler::codegen::simd_ops::SimdWidth>,
         /// Tail mask remainder count (set by set_tail_mask, used by vload/vstore_masked).
         tail_mask_remainder: usize,
+        /// Whether SVE is available (runtime-detected from DeviceProfile).
+        use_sve: bool,
+        /// Whether SVE2 extensions are available.
+        use_sve2: bool,
+        /// SVE vector length in bytes (0 if SVE not available).
+        sve_vl_bytes: usize,
     }
 
     // ── NEON encoding helpers (ported from manual backend) ─────────────
@@ -319,10 +326,22 @@ pub mod jit {
     }
 
     impl DynasmAArch64CodeGen {
-        pub fn new(_profile: &DeviceProfile) -> Self {
+        pub fn new(profile: &DeviceProfile) -> Self {
+            let use_sve = matches!(profile.isa, IsaLevel::Sve | IsaLevel::Sve2);
+            let use_sve2 = matches!(profile.isa, IsaLevel::Sve2);
+            let sve_vl_bytes = if use_sve {
+                profile.hw_info.isa.sve_vl_bytes.max(16)
+            } else {
+                0
+            };
+            let simd_width = if use_sve {
+                sve_vl_bytes / 4
+            } else {
+                NEON_WIDTH_F32
+            };
             DynasmAArch64CodeGen {
                 ops: Assembler::new().expect("failed to create aarch64 assembler"),
-                simd_width: NEON_WIDTH_F32,
+                simd_width,
                 blis_scratchpad_bytes: 0,
                 blis_scratchpad_offset: 0,
                 blis_base_offset: 0,
@@ -331,6 +350,9 @@ pub mod jit {
                 simd_labels: Vec::new(),
                 width_stack: Vec::new(),
                 tail_mask_remainder: 0,
+                use_sve,
+                use_sve2,
+                sve_vl_bytes,
             }
         }
 
@@ -1851,6 +1873,10 @@ pub mod jit {
             k: usize,
             profile: &DeviceProfile,
         ) -> Result<(), String> {
+            // SVE path: use VLA GEMM when SVE is available
+            if self.use_sve {
+                return self.emit_gemm_sve(m, n, k, profile);
+            }
             // Dispatch to Apple AMX path when hardware supports it and dimensions fit.
             if profile.isa == IsaLevel::NeonAmx && apple_amx_gemm_eligible(m, n, k) {
                 let words = emit_apple_amx_f32_gemm(m, n, k);
@@ -2370,6 +2396,355 @@ pub mod jit {
             Ok(())
         }
 
+        // ── SVE GEMM micro-kernel ──────────────────────────────────────
+
+        /// Emit an SVE GEMM micro-kernel using VLA (vector-length agnostic) code.
+        ///
+        /// Uses SveCodeGen to emit prologue/rank1-update/store patterns.
+        /// Simple outer-product style: 1 row of A × Nr SVE vectors of B.
+        ///
+        /// Register convention:
+        ///   x0 = A ptr, x1 = B ptr, x2 = C ptr
+        ///   z0..z(nr_vecs-1) = accumulators
+        ///   z24 = A broadcast, z28..z31 = B vectors
+        ///   p0 = all-true, p1 = tail predicate
+        fn emit_gemm_sve(
+            &mut self,
+            m: usize,
+            n: usize,
+            k: usize,
+            profile: &DeviceProfile,
+        ) -> Result<(), String> {
+            if !self.use_sve {
+                return Err("emit_gemm_sve called but SVE not available".into());
+            }
+            let vl_bytes = self.sve_vl_bytes;
+            let f32_per_vec = vl_bytes / 4;
+            let nr_vecs = ((n + f32_per_vec - 1) / f32_per_vec).min(4);
+
+            let blocking = profile.gemm_blocking(m, n, k);
+            if m > blocking.mc || n > blocking.nc || k > blocking.kc {
+                return self.emit_gemm_blis_sve(m, n, k, profile);
+            }
+
+            // Prologue: PTRUE p0.s, zero accumulators
+            {
+                let mut sve = SveCodeGen::new(self.use_sve2, vl_bytes);
+                let _pg = sve.emit_gemm_prologue(nr_vecs as u8);
+                sve.emit_cntw(9);
+                for w in sve.code_bytes() {
+                    emit_raw(&mut self.ops, *w);
+                }
+            }
+
+            // K-loop
+            self.emit_mov_imm_gp(10, k);
+            let k_loop = self.ops.new_dynamic_label();
+            let k_done = self.ops.new_dynamic_label();
+            dynasm!(self.ops ; .arch aarch64 ; =>k_loop ; cbz x10, =>k_done);
+
+            // LD1RW z24, p0, [x0] — broadcast A[k]
+            emit_raw(&mut self.ops, 0x8540C000 | (0 << 10) | (0 << 5) | 24);
+            dynasm!(self.ops ; .arch aarch64 ; add x0, x0, #4);
+
+            // Load B vectors + FMA
+            {
+                let mut inner = SveCodeGen::new(self.use_sve2, vl_bytes);
+                for j in 0..nr_vecs as u8 {
+                    inner.emit_ld1w_imm(28 + j, 0, 1, j as i8);
+                }
+                inner.emit_rank1_update(0, 0, 24, 28, nr_vecs as u8);
+                for w in inner.code_bytes() {
+                    emit_raw(&mut self.ops, *w);
+                }
+            }
+            self.emit_add_offset_gp(1, 1, nr_vecs * vl_bytes);
+
+            dynasm!(self.ops ; .arch aarch64 ; sub x10, x10, #1 ; b =>k_loop ; =>k_done);
+
+            // Store accumulators
+            {
+                let mut st = SveCodeGen::new(self.use_sve2, vl_bytes);
+                st.emit_store_accumulators(0, 2, 0, nr_vecs as u8);
+                for w in st.code_bytes() {
+                    emit_raw(&mut self.ops, *w);
+                }
+            }
+            Ok(())
+        }
+
+        /// SVE BLIS-style 5-level loop GEMM with SVE inner micro-kernel.
+        fn emit_gemm_blis_sve(
+            &mut self,
+            m: usize,
+            n: usize,
+            k: usize,
+            profile: &DeviceProfile,
+        ) -> Result<(), String> {
+            let vl_bytes = self.sve_vl_bytes;
+            let f32_per_vec = vl_bytes / 4;
+            let blocking = profile.gemm_blocking(m, n, k);
+            let (kc, mc, nc) = (blocking.kc, blocking.mc, blocking.nc);
+
+            let pack_a_bytes = mc * kc * 4;
+            let pack_b_bytes = kc * nc * 4;
+            let pack_a_off = self.blis_scratchpad_offset;
+            let pack_b_off = pack_a_off + pack_a_bytes;
+            let total_extra = pack_a_bytes + pack_b_bytes;
+            self.blis_scratchpad_offset += total_extra;
+            self.blis_scratchpad_bytes = self.blis_scratchpad_bytes.max(total_extra);
+
+            #[cfg(target_arch = "aarch64")]
+            let pack_a_fn = crate::asm::aarch64::gllm_pack_a_f32_neon as *const () as u64;
+            #[cfg(not(target_arch = "aarch64"))]
+            let pack_a_fn = 0u64;
+            #[cfg(target_arch = "aarch64")]
+            let pack_b_fn = crate::asm::aarch64::gllm_pack_b_f32_neon as *const () as u64;
+            #[cfg(not(target_arch = "aarch64"))]
+            let pack_b_fn = 0u64;
+
+            self.emit_save_callee_saved();
+            dynasm!(self.ops ; .arch aarch64
+                ; mov x23, x0 ; mov x24, x1 ; mov x25, x7
+            );
+            emit_raw(&mut self.ops, 0xF9400000 | (96 / 8 << 10) | (31 << 5) | 22);
+
+            // JC loop (over N)
+            let jc_loop = self.ops.new_dynamic_label();
+            let jc_done = self.ops.new_dynamic_label();
+            dynasm!(self.ops ; .arch aarch64 ; movz x19, 0 ; =>jc_loop);
+            self.emit_mov_imm_gp(9, n);
+            dynasm!(self.ops ; .arch aarch64 ; cmp x19, x9 ; b.ge =>jc_done);
+            self.emit_mov_imm_gp(9, n);
+            dynasm!(self.ops ; .arch aarch64 ; sub x9, x9, x19);
+            self.emit_mov_imm_gp(26, nc);
+            dynasm!(self.ops ; .arch aarch64 ; cmp x9, x26 ; csel x26, x9, x26, lo);
+
+            // Pack B
+            self.emit_add_offset_gp(0, 22, pack_b_off);
+            self.emit_mov_imm_gp(9, k * 4);
+            dynasm!(self.ops ; .arch aarch64 ; mul x10, x19, x9 ; add x1, x24, x10);
+            self.emit_mov_imm_gp(2, kc);
+            dynasm!(self.ops ; .arch aarch64 ; mov x3, x26);
+            self.emit_mov_imm_gp(4, k);
+            self.emit_mov_imm_gp(9, pack_b_fn as usize);
+            dynasm!(self.ops ; .arch aarch64 ; blr x9);
+
+            // IC loop (over M)
+            let ic_loop = self.ops.new_dynamic_label();
+            let ic_done = self.ops.new_dynamic_label();
+            dynasm!(self.ops ; .arch aarch64 ; movz x20, 0 ; =>ic_loop);
+            self.emit_mov_imm_gp(9, m);
+            dynasm!(self.ops ; .arch aarch64 ; cmp x20, x9 ; b.ge =>ic_done);
+            self.emit_mov_imm_gp(9, m);
+            dynasm!(self.ops ; .arch aarch64 ; sub x9, x9, x20);
+            self.emit_mov_imm_gp(27, mc);
+            dynasm!(self.ops ; .arch aarch64 ; cmp x9, x27 ; csel x27, x9, x27, lo);
+
+            // Pack A
+            self.emit_add_offset_gp(0, 22, pack_a_off);
+            self.emit_mov_imm_gp(9, k * 4);
+            dynasm!(self.ops ; .arch aarch64 ; mul x10, x20, x9 ; add x1, x23, x10);
+            self.emit_mov_imm_gp(2, kc);
+            dynasm!(self.ops ; .arch aarch64 ; mov x3, x27);
+            self.emit_mov_imm_gp(4, k);
+            self.emit_mov_imm_gp(9, pack_a_fn as usize);
+            dynasm!(self.ops ; .arch aarch64 ; blr x9);
+
+            // SVE micro-kernel
+            self.emit_add_offset_gp(0, 22, pack_a_off);
+            self.emit_add_offset_gp(1, 22, pack_b_off);
+            self.emit_mov_imm_gp(9, n * 4);
+            dynasm!(self.ops ; .arch aarch64 ; mul x10, x20, x9);
+            self.emit_mov_imm_gp(9, 4);
+            dynasm!(self.ops ; .arch aarch64
+                ; mul x11, x19, x9 ; add x10, x10, x11 ; add x2, x25, x10
+            );
+
+            let nr_vecs = ((nc + f32_per_vec - 1) / f32_per_vec).min(4);
+            {
+                let mut sve = SveCodeGen::new(self.use_sve2, vl_bytes);
+                let _pg = sve.emit_gemm_prologue(nr_vecs as u8);
+                for w in sve.code_bytes() { emit_raw(&mut self.ops, *w); }
+            }
+
+            self.emit_mov_imm_gp(10, kc);
+            let kl = self.ops.new_dynamic_label();
+            let kd = self.ops.new_dynamic_label();
+            dynasm!(self.ops ; .arch aarch64 ; =>kl ; cbz x10, =>kd);
+            emit_raw(&mut self.ops, 0x8540C000 | (0 << 10) | (0 << 5) | 24);
+            dynasm!(self.ops ; .arch aarch64 ; add x0, x0, #4);
+            {
+                let mut inner = SveCodeGen::new(self.use_sve2, vl_bytes);
+                for j in 0..nr_vecs as u8 {
+                    inner.emit_ld1w_imm(28 + j, 0, 1, j as i8);
+                }
+                inner.emit_rank1_update(0, 0, 24, 28, nr_vecs as u8);
+                for w in inner.code_bytes() { emit_raw(&mut self.ops, *w); }
+            }
+            self.emit_add_offset_gp(1, 1, nr_vecs * vl_bytes);
+            dynasm!(self.ops ; .arch aarch64 ; sub x10, x10, #1 ; b =>kl ; =>kd);
+
+            {
+                let mut st = SveCodeGen::new(self.use_sve2, vl_bytes);
+                st.emit_store_accumulators(0, 2, 0, nr_vecs as u8);
+                for w in st.code_bytes() { emit_raw(&mut self.ops, *w); }
+            }
+
+            self.emit_mov_imm_gp(9, mc);
+            dynasm!(self.ops ; .arch aarch64 ; add x20, x20, x9 ; b =>ic_loop ; =>ic_done);
+            self.emit_mov_imm_gp(9, nc);
+            dynasm!(self.ops ; .arch aarch64 ; add x19, x19, x9 ; b =>jc_loop ; =>jc_done);
+
+            self.emit_restore_callee_saved();
+            Ok(())
+        }
+
+        // ── SVE norm JIT ───────────────────────────────────────────────
+
+        /// JIT emit: RmsNorm for one row using SVE predicated loads/stores.
+        ///
+        /// VLA (vector-length agnostic): uses WHILELT for tail masking,
+        /// CNTW for loop increment. Works for any SVE vector length.
+        ///
+        /// Register contract (same as NEON version):
+        ///   x_input_reg = input row pointer
+        ///   x_output_reg = output row pointer
+        ///   x_weight_reg = weight vector pointer
+        fn emit_norm_row_jit_sve(
+            &mut self,
+            output_reg: u8,
+            weight_reg: u8,
+            input_reg: u8,
+            row_size: usize,
+            eps: f32,
+        ) -> Result<(), String> {
+            if !self.use_sve {
+                return Err("emit_norm_row_jit_sve called but SVE not available".into());
+            }
+            let vl_bytes = self.sve_vl_bytes;
+
+            // SVE prologue: PTRUE p0.s, CNTW x9
+            {
+                let mut init = SveCodeGen::new(self.use_sve2, vl_bytes);
+                init.emit_ptrue_s(0);
+                init.emit_cntw(9);
+                for w in init.code_bytes() { emit_raw(&mut self.ops, *w); }
+            }
+
+            // Phase 1: Reduce — accumulate sum_sq = sum(x^2)
+            {
+                let mut z = SveCodeGen::new(self.use_sve2, vl_bytes);
+                z.emit_zero_z(0);
+                for w in z.code_bytes() { emit_raw(&mut self.ops, *w); }
+            }
+
+            dynasm!(self.ops ; .arch aarch64
+                ; mov x13, X(input_reg as u32)
+                ; movz x10, 0
+            );
+            self.emit_mov_imm_gp(11, row_size);
+
+            let r_loop = self.ops.new_dynamic_label();
+            let r_done = self.ops.new_dynamic_label();
+            dynasm!(self.ops ; .arch aarch64 ; =>r_loop);
+            {
+                let mut w = SveCodeGen::new(self.use_sve2, vl_bytes);
+                w.emit_whilelt_s(1, 10, 11);
+                for insn in w.code_bytes() { emit_raw(&mut self.ops, *insn); }
+            }
+            // WHILELT sets condition flags: b.none (no active lanes) = b.eq
+            dynasm!(self.ops ; .arch aarch64 ; b.eq =>r_done);
+            {
+                let mut ld = SveCodeGen::new(self.use_sve2, vl_bytes);
+                ld.emit_ld1w_imm(2, 1, 13, 0);
+                ld.emit_fmla_vec_s(0, 1, 2, 2); // z0 += z2 * z2
+                for insn in ld.code_bytes() { emit_raw(&mut self.ops, *insn); }
+            }
+            dynasm!(self.ops ; .arch aarch64
+                ; add x10, x10, x9
+                ; lsl x12, x9, #2
+                ; add x13, x13, x12
+                ; b =>r_loop
+                ; =>r_done
+            );
+
+            // Horizontal reduction: FADDV s0, p0, z0.S
+            emit_raw(&mut self.ops, 0x65A02000 | (0 << 10) | (0 << 5) | 0);
+
+            // Phase 2: Finalize — scale = rsqrt(sum_sq / n + eps)
+            self.emit_load_f32_const_neon(17, 1.0 / (row_size as f32));
+            // fmul s0, s0, s17
+            emit_raw(&mut self.ops, 0x1E370800 | (17 << 16) | (0 << 5) | 0);
+            self.emit_load_f32_const_neon(17, eps);
+            // fadd s0, s0, s17
+            emit_raw(&mut self.ops, 0x1E372800 | (17 << 16) | (0 << 5) | 0);
+            // Newton-Raphson rsqrt s0 → s16
+            self.emit_rsqrt_refined_neon(16, 0);
+            // DUP z16.S, s16 — broadcast scalar to all SVE lanes
+            emit_raw(&mut self.ops, 0x05212000 | (16 << 5) | 16);
+
+            // Phase 3: Transform — output = x * scale * weight
+            dynasm!(self.ops ; .arch aarch64
+                ; mov x13, X(input_reg as u32)
+                ; mov x14, X(output_reg as u32)
+                ; mov x15, X(weight_reg as u32)
+                ; movz x10, 0
+            );
+            self.emit_mov_imm_gp(11, row_size);
+
+            let t_loop = self.ops.new_dynamic_label();
+            let t_done = self.ops.new_dynamic_label();
+            dynasm!(self.ops ; .arch aarch64 ; =>t_loop);
+            {
+                let mut w = SveCodeGen::new(self.use_sve2, vl_bytes);
+                w.emit_whilelt_s(1, 10, 11);
+                for insn in w.code_bytes() { emit_raw(&mut self.ops, *insn); }
+            }
+            dynasm!(self.ops ; .arch aarch64 ; b.eq =>t_done);
+            {
+                let mut ld = SveCodeGen::new(self.use_sve2, vl_bytes);
+                ld.emit_ld1w_imm(2, 1, 13, 0); // input
+                ld.emit_ld1w_imm(3, 1, 15, 0); // weight
+                for insn in ld.code_bytes() { emit_raw(&mut self.ops, *insn); }
+            }
+            // FMUL z2.S, p1/M, z2.S, z16.S — x * scale
+            emit_raw(&mut self.ops, 0x650D8000 | (16 << 16) | (1 << 10) | (2 << 5) | 2);
+            // FMUL z2.S, p1/M, z2.S, z3.S — (x * scale) * weight
+            emit_raw(&mut self.ops, 0x650D8000 | (3 << 16) | (1 << 10) | (2 << 5) | 2);
+            {
+                let mut st = SveCodeGen::new(self.use_sve2, vl_bytes);
+                st.emit_st1w_imm(2, 1, 14, 0);
+                for insn in st.code_bytes() { emit_raw(&mut self.ops, *insn); }
+            }
+            dynasm!(self.ops ; .arch aarch64
+                ; add x10, x10, x9
+                ; lsl x12, x9, #2
+                ; add x13, x13, x12
+                ; add x14, x14, x12
+                ; add x15, x15, x12
+                ; b =>t_loop
+                ; =>t_done
+            );
+            Ok(())
+        }
+
+        /// Dispatch norm JIT to SVE or NEON based on runtime capability.
+        fn emit_norm_row_jit(
+            &mut self,
+            output_reg: u8,
+            weight_reg: u8,
+            input_reg: u8,
+            row_size: usize,
+            eps: f32,
+        ) -> Result<(), String> {
+            if self.use_sve {
+                self.emit_norm_row_jit_sve(output_reg, weight_reg, input_reg, row_size, eps)
+            } else {
+                self.emit_norm_row_jit_neon(output_reg, weight_reg, input_reg, row_size, eps)
+            }
+        }
+
         /// Emit TileLevelFusion: tile the predecessor norm into the GEMM's
         /// MC loop so each MC strip computes norm into scratchpad before GEMM.
         ///
@@ -2467,8 +2842,8 @@ pub mod jit {
                 self.emit_add_offset_gp(1, 22, norm_scratch_off);
                 dynasm!(self.ops ; .arch aarch64 ; add x1, x1, x11);
 
-                // emit_norm_row_jit_neon(output=x1, weight=x26, input=x0, k, eps)
-                self.emit_norm_row_jit_neon(1, 26, 0, k, eps)?;
+                // emit norm JIT (SVE or NEON dispatch): output=x1, weight=x26, input=x0, k, eps
+                self.emit_norm_row_jit(1, 26, 0, k, eps)?;
 
                 dynasm!(self.ops ; .arch aarch64 ; add x20, x20, #1 ; b =>norm_loop ; =>norm_done);
             }
@@ -2565,8 +2940,8 @@ pub mod jit {
             self.emit_add_offset_gp(1, 22, norm_scratch_off);
             dynasm!(self.ops ; .arch aarch64 ; add x1, x1, x10);
 
-            // emit_norm_row_jit_neon(output=x1, weight=x26, input=x0, k, eps)
-            self.emit_norm_row_jit_neon(1, 26, 0, k, eps)?;
+            // emit norm JIT (SVE or NEON dispatch): output=x1, weight=x26, input=x0, k, eps
+            self.emit_norm_row_jit(1, 26, 0, k, eps)?;
 
             dynasm!(self.ops ; .arch aarch64 ; add x19, x19, #1 ; b =>row_loop ; =>row_done);
 
@@ -3223,8 +3598,18 @@ pub mod jit {
         /// Build HwCapabilityMatrix from the current codegen state.
         pub fn hw_capability_matrix(&self) -> crate::compiler::codegen::isa_scheduler::HwCapabilityMatrix {
             use crate::compiler::codegen::simd_ops::SimdWidth;
+            let simd_widths = if self.use_sve {
+                let sve_w = match self.sve_vl_bytes {
+                    32 => SimdWidth::W256,
+                    64 => SimdWidth::W512,
+                    _ => SimdWidth::Wvl,
+                };
+                vec![SimdWidth::W128, sve_w]
+            } else {
+                vec![SimdWidth::W128]
+            };
             crate::compiler::codegen::isa_scheduler::HwCapabilityMatrix {
-                simd_widths: vec![SimdWidth::W128],
+                simd_widths,
                 has_tile_accel: false,
                 tile_accel: None,
             }
@@ -3266,7 +3651,15 @@ impl crate::compiler::codegen::emitter::PlatformBackend for DynasmArm64Backend {
     }
 
     fn platform(&self) -> crate::compiler::codegen::emitter::Platform {
-        crate::compiler::codegen::emitter::Platform::Aarch64 { sve: false, amx: false }
+        #[cfg(target_arch = "aarch64")]
+        let sve = std::arch::is_aarch64_feature_detected!("sve");
+        #[cfg(not(target_arch = "aarch64"))]
+        let sve = false;
+        #[cfg(all(target_arch = "aarch64", target_os = "macos"))]
+        let amx = true;
+        #[cfg(not(all(target_arch = "aarch64", target_os = "macos")))]
+        let amx = false;
+        crate::compiler::codegen::emitter::Platform::Aarch64 { sve, amx }
     }
 
     fn num_simd_regs(&self) -> usize {
@@ -3289,7 +3682,9 @@ mod tests {
     fn test_dynasm_codegen_creates() {
         let profile = crate::dispatch::DeviceProfile::detect();
         let codegen = jit::DynasmAArch64CodeGen::new(&profile);
-        assert_eq!(codegen.simd_width(), 4);
+        // SVE: simd_width = sve_vl_bytes / 4; NEON: simd_width = 4
+        assert!(codegen.simd_width() >= 4);
+        assert_eq!(codegen.simd_width() % 4, 0);
     }
 
     #[test]
@@ -3407,7 +3802,9 @@ mod tests {
         assert!(matches!(backend.platform(),
             crate::compiler::codegen::emitter::Platform::Aarch64 { .. }));
         assert_eq!(backend.num_simd_regs(), 32);
-        assert_eq!(emitter.simd_width(), 4);
+        // SVE: simd_width >= 4; NEON: simd_width == 4
+        assert!(emitter.simd_width() >= 4);
+        assert_eq!(emitter.simd_width() % 4, 0);
     }
 
     // ── GEMM + epilogue injection codegen tests ──────────────────────

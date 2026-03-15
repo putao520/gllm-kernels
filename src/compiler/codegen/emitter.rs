@@ -56,7 +56,10 @@ impl Platform {
         };
 
         #[cfg(target_arch = "aarch64")]
-        return Platform::Aarch64 { sve: false, amx: matches!(profile.isa, IsaLevel::NeonAmx) };
+        return Platform::Aarch64 {
+            sve: matches!(profile.isa, IsaLevel::Sve | IsaLevel::Sve2),
+            amx: matches!(profile.isa, IsaLevel::NeonAmx),
+        };
 
         #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
         return Platform::X86_64 { avx512: false, amx: false };

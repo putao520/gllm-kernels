@@ -230,6 +230,23 @@ impl DeviceProfile {
         })
     }
 
+    /// Query the WisdomDb for cached JIT codegen parameters for a GEMM shape.
+    ///
+    /// Returns `Some(JitParams)` if a cached autotuning result exists with
+    /// JIT-specific parameters for this exact problem shape on the current hardware.
+    pub fn query_wisdom_jit_params(
+        &self,
+        m: usize,
+        n: usize,
+        k: usize,
+    ) -> Option<crate::autotuning::search_space::JitParams> {
+        let db_ref = crate::autotuning::global_wisdom_db();
+        let db = db_ref.lock().ok()?;
+        let fp = self.hw_info.fingerprint();
+        let cached = db.get_gemm_blocking(&fp, m, n, k, 4)?;
+        cached.config.jit.clone()
+    }
+
     /// Analytical heuristic for GEMM blocking (fallback when no wisdom exists).
     fn gemm_blocking_heuristic(&self, m: usize, n: usize, k: usize) -> GemmBlocking {
         let (l1, l2, l3) = self.cache_sizes();
