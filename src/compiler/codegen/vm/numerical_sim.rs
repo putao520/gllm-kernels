@@ -80,6 +80,8 @@ struct SimState {
     values: HashMap<ValueId, SimValue>,
     /// 模拟的内存 (简化版: 字节数组)
     memory: Vec<u8>,
+    /// 下一个分配的 ValueId（独立于 HashMap len，防止与 Input slot 碰撞）
+    next_id: u32,
 }
 
 impl SimState {
@@ -88,10 +90,18 @@ impl SimState {
         Self {
             values: HashMap::new(),
             memory: vec![0u8; 65536], // 64KB 模拟内存
+            next_id: 0,
         }
     }
 
-    /// 设置输入值。
+    /// 分配新的 ValueId（自增，不依赖 HashMap len）。
+    fn alloc_id(&mut self) -> ValueId {
+        let id = ValueId(self.next_id);
+        self.next_id += 1;
+        id
+    }
+
+    /// 设置输入值（必须先调用 alloc_input_slots 预留空间）。
     fn set_input(&mut self, input_idx: u32, value: SimValue) {
         let id = ValueId(input_idx);
         self.values.insert(id, value);
@@ -352,24 +362,47 @@ impl NumericalSimulator {
             state.store_u8(block_base_addr + i as i64, byte)?;
         }
 
-        // 设置输入值
-        // Input(0) = block_base 指针
-        state.set_input(0, SimValue::Integer(inputs.first().copied().unwrap_or(block_base_addr)));
-        // Input(1) = data_ptr 指针
-        state.set_input(1, SimValue::Integer(inputs.get(1).copied().unwrap_or(block_base_addr)));
-        // Input(2) = lane_offset (可选)
-        if inputs.len() > 2 {
-            state.set_input(2, SimValue::Integer(inputs[2]));
-        }
-        // Input(3) = high_bits_ptr (可选)
-        if inputs.len() > 3 {
-            state.set_input(3, SimValue::Integer(inputs[3]));
-        }
+        // 预扫描 trace 找到最大 Input 索引，推进 next_id 跳过 Input slot 空间。
+        // Input(N) 使用 ValueId(N) 作为 slot，中间操作用 alloc_id() 分配。
+        // next_id 必须从 max_input_idx+1 开始，防止与 Input ValueId 碰撞。
+        let max_input_idx = trace.iter().map(|op| {
+            if let TraceOp::Input(idx) = op { *idx as u32 + 1 } else { 0 }
+        }).max().unwrap_or(0);
+        state.next_id = max_input_idx;
+
+        // 准备输入值映射: Input(idx) → SimValue。
+        // Input(N) 的 N 是输入参数编号，不是 trace 位置。模拟器在执行时
+        // 将 Input(N) 映射为 ValueId(trace_pos)，并把 input_values[N] 存入。
+        let input_values: Vec<SimValue> = vec![
+            SimValue::Integer(inputs.first().copied().unwrap_or(block_base_addr)),  // Input(0) = block_base
+            SimValue::Integer(inputs.get(1).copied().unwrap_or(block_base_addr)),   // Input(1) = data_ptr
+            SimValue::Integer(inputs.get(2).copied().unwrap_or(0)),                 // Input(2) = lane_offset
+            SimValue::Integer(inputs.get(3).copied().unwrap_or(block_base_addr)),   // Input(3) = high_bits_ptr
+        ];
 
         // 执行 TraceOp 序列
         let mut output_id = None;
-        for op in trace {
-            let result = self.exec_op(op, &mut state, desc)?;
+        for (i, op) in trace.iter().enumerate() {
+            let trace_pos = i as u32;
+            let result = match op {
+                TraceOp::Input(idx) => {
+                    let id = ValueId(trace_pos);
+                    let val = input_values.get(*idx as usize)
+                        .copied()
+                        .unwrap_or(SimValue::Integer(0));
+                    state.set(id, val);
+                    Ok(Some(id))
+                }
+                _ => self.exec_op_with_pos(op, trace_pos, &mut state, desc)
+            };
+            let result = result.map_err(|e| {
+                CompilerError::CodegenViolation(format!(
+                    "{} (at trace op #{}: {:?})",
+                    match &e { CompilerError::CodegenViolation(s) => s.clone(), _ => format!("{:?}", e) },
+                    i,
+                    op
+                ))
+            })?;
             if let Some(id) = result {
                 output_id = Some(id);
             }
@@ -398,10 +431,32 @@ impl NumericalSimulator {
         })
     }
 
-    /// 执行单个 TraceOp.
+    /// 执行单个 TraceOp（自分配 ValueId）。用于测试和 Loop body 内部调用。
     fn exec_op(
         &self,
         op: &TraceOp,
+        state: &mut SimState,
+        desc: &QuantFormatDescriptor,
+    ) -> Result<Option<ValueId>, CompilerError> {
+        let pos = state.next_id;
+        state.next_id += 1;
+        match op {
+            TraceOp::Input(idx) => {
+                // Input 引用外部已设置的值，但用 next_id 作为本 op 的 ValueId
+                let src_val = state.get(ValueId(*idx));
+                state.set(ValueId(pos), src_val);
+                Ok(Some(ValueId(pos)))
+            }
+            _ => self.exec_op_with_pos(op, pos, state, desc)
+        }
+    }
+
+    /// 执行单个 TraceOp，结果存储在 ValueId(trace_pos)。
+    /// trace_pos 对应 trace 数组索引，与 push_op 分配的 ValueId 一致。
+    fn exec_op_with_pos(
+        &self,
+        op: &TraceOp,
+        trace_pos: u32,
         state: &mut SimState,
         desc: &QuantFormatDescriptor,
     ) -> Result<Option<ValueId>, CompilerError> {
@@ -415,7 +470,7 @@ impl NumericalSimulator {
 
             // 常量
             TraceOp::Const(c) => {
-                let id = ValueId(state.values.len() as u32);
+                let id = ValueId(trace_pos);
                 state.set(id, SimValue::Float(*c as f32));
                 Ok(Some(id))
             }
@@ -425,7 +480,7 @@ impl NumericalSimulator {
                 let a_val = state.get(*a).as_float()?;
                 let b_val = state.get(*b).as_float()?;
                 let result = a_val + b_val;
-                let id = ValueId(state.values.len() as u32);
+                let id = ValueId(trace_pos);
                 state.set(id, SimValue::Float(result));
                 Ok(Some(id))
             }
@@ -434,7 +489,7 @@ impl NumericalSimulator {
                 let a_val = state.get(*a).as_float()?;
                 let b_val = state.get(*b).as_float()?;
                 let result = a_val - b_val;
-                let id = ValueId(state.values.len() as u32);
+                let id = ValueId(trace_pos);
                 state.set(id, SimValue::Float(result));
                 Ok(Some(id))
             }
@@ -443,7 +498,7 @@ impl NumericalSimulator {
                 let a_val = state.get(*a).as_float()?;
                 let b_val = state.get(*b).as_float()?;
                 let result = a_val * b_val;
-                let id = ValueId(state.values.len() as u32);
+                let id = ValueId(trace_pos);
                 state.set(id, SimValue::Float(result));
                 Ok(Some(id))
             }
@@ -457,7 +512,7 @@ impl NumericalSimulator {
                     ));
                 }
                 let result = a_val / b_val;
-                let id = ValueId(state.values.len() as u32);
+                let id = ValueId(trace_pos);
                 state.set(id, SimValue::Float(result));
                 Ok(Some(id))
             }
@@ -467,7 +522,7 @@ impl NumericalSimulator {
                 let b_val = state.get(*b).as_float()?;
                 let c_val = state.get(*c).as_float()?;
                 let result = a_val * b_val + c_val;
-                let id = ValueId(state.values.len() as u32);
+                let id = ValueId(trace_pos);
                 state.set(id, SimValue::Float(result));
                 Ok(Some(id))
             }
@@ -476,7 +531,7 @@ impl NumericalSimulator {
             TraceOp::Neg(a) => {
                 let a_val = state.get(*a).as_float()?;
                 let result = -a_val;
-                let id = ValueId(state.values.len() as u32);
+                let id = ValueId(trace_pos);
                 state.set(id, SimValue::Float(result));
                 Ok(Some(id))
             }
@@ -484,7 +539,7 @@ impl NumericalSimulator {
             TraceOp::Abs(a) => {
                 let a_val = state.get(*a).as_float()?;
                 let result = a_val.abs();
-                let id = ValueId(state.values.len() as u32);
+                let id = ValueId(trace_pos);
                 state.set(id, SimValue::Float(result));
                 Ok(Some(id))
             }
@@ -497,7 +552,7 @@ impl NumericalSimulator {
                     ));
                 }
                 let result = a_val.sqrt();
-                let id = ValueId(state.values.len() as u32);
+                let id = ValueId(trace_pos);
                 state.set(id, SimValue::Float(result));
                 Ok(Some(id))
             }
@@ -510,7 +565,7 @@ impl NumericalSimulator {
                     ));
                 }
                 let result = 1.0 / a_val.sqrt();
-                let id = ValueId(state.values.len() as u32);
+                let id = ValueId(trace_pos);
                 state.set(id, SimValue::Float(result));
                 Ok(Some(id))
             }
@@ -519,7 +574,7 @@ impl NumericalSimulator {
                 let a_val = state.get(*a).as_float()?;
                 let b_val = state.get(*b).as_float()?;
                 let result = a_val.max(b_val);
-                let id = ValueId(state.values.len() as u32);
+                let id = ValueId(trace_pos);
                 state.set(id, SimValue::Float(result));
                 Ok(Some(id))
             }
@@ -528,7 +583,7 @@ impl NumericalSimulator {
                 let a_val = state.get(*a).as_float()?;
                 let b_val = state.get(*b).as_float()?;
                 let result = a_val.min(b_val);
-                let id = ValueId(state.values.len() as u32);
+                let id = ValueId(trace_pos);
                 state.set(id, SimValue::Float(result));
                 Ok(Some(id))
             }
@@ -538,7 +593,7 @@ impl NumericalSimulator {
                 let lhs_val = state.get(*lhs).as_integer()?;
                 let rhs_val = state.get(*rhs).as_integer()?;
                 let result = lhs_val & rhs_val;
-                let id = ValueId(state.values.len() as u32);
+                let id = ValueId(trace_pos);
                 state.set(id, SimValue::Integer(result));
                 Ok(Some(id))
             }
@@ -547,7 +602,7 @@ impl NumericalSimulator {
                 let lhs_val = state.get(*lhs).as_integer()?;
                 let rhs_val = state.get(*rhs).as_integer()?;
                 let result = lhs_val | rhs_val;
-                let id = ValueId(state.values.len() as u32);
+                let id = ValueId(trace_pos);
                 state.set(id, SimValue::Integer(result));
                 Ok(Some(id))
             }
@@ -555,7 +610,7 @@ impl NumericalSimulator {
             TraceOp::QuantBroadcast { src, lanes: _ } => {
                 let src_val = state.get(*src).as_float()?;
                 // 标量模拟: 广播就是复制值
-                let id = ValueId(state.values.len() as u32);
+                let id = ValueId(trace_pos);
                 state.set(id, SimValue::Float(src_val));
                 Ok(Some(id))
             }
@@ -564,7 +619,7 @@ impl NumericalSimulator {
                 let src_val = state.get(*src).as_integer()?;
                 let addr = src_val;
                 let f32_val = state.load_f16(addr)?;
-                let id = ValueId(state.values.len() as u32);
+                let id = ValueId(trace_pos);
                 state.set(id, SimValue::Float(f32_val));
                 Ok(Some(id))
             }
@@ -573,7 +628,7 @@ impl NumericalSimulator {
                 let src_val = state.get(*src).as_integer()?;
                 let addr = src_val;
                 let i8_val = state.load_u8(addr)? as i8;
-                let id = ValueId(state.values.len() as u32);
+                let id = ValueId(trace_pos);
                 state.set(id, SimValue::Float(i8_val as f32));
                 Ok(Some(id))
             }
@@ -587,7 +642,7 @@ impl NumericalSimulator {
                 } else {
                     Self::fp8_e5m2_to_f32(byte)
                 };
-                let id = ValueId(state.values.len() as u32);
+                let id = ValueId(trace_pos);
                 state.set(id, SimValue::Float(f32_val));
                 Ok(Some(id))
             }
@@ -596,7 +651,7 @@ impl NumericalSimulator {
                 let src_val = state.get(*src).as_integer()?;
                 let mask = (1i64 << bit_width) - 1;
                 let result = (src_val >> bit_offset) & mask;
-                let id = ValueId(state.values.len() as u32);
+                let id = ValueId(trace_pos);
                 state.set(id, SimValue::Integer(result));
                 Ok(Some(id))
             }
@@ -609,7 +664,7 @@ impl NumericalSimulator {
                     ));
                 }
                 let result = src_val / divisor;
-                let id = ValueId(state.values.len() as u32);
+                let id = ValueId(trace_pos);
                 state.set(id, SimValue::Integer(result));
                 Ok(Some(id))
             }
@@ -617,7 +672,7 @@ impl NumericalSimulator {
             TraceOp::QuantPtrAddOffset { base, offset_bytes } => {
                 let base_val = state.get(*base).as_integer()?;
                 let addr = base_val + offset_bytes;
-                let id = ValueId(state.values.len() as u32);
+                let id = ValueId(trace_pos);
                 state.set(id, SimValue::Integer(addr));
                 Ok(Some(id))
             }
@@ -626,7 +681,7 @@ impl NumericalSimulator {
                 let base_val = state.get(*base).as_integer()?;
                 let idx_val = state.get(*index).as_integer()?;
                 let addr = base_val + idx_val;
-                let id = ValueId(state.values.len() as u32);
+                let id = ValueId(trace_pos);
                 state.set(id, SimValue::Integer(addr));
                 Ok(Some(id))
             }
@@ -635,7 +690,7 @@ impl NumericalSimulator {
                 let ptr_val = state.get(*ptr).as_integer()?;
                 let addr = ptr_val + offset_bytes;
                 let byte_val = state.load_u8(addr)?;
-                let id = ValueId(state.values.len() as u32);
+                let id = ValueId(trace_pos);
                 state.set(id, SimValue::Integer(byte_val as i64));
                 Ok(Some(id))
             }
@@ -645,7 +700,7 @@ impl NumericalSimulator {
                 let a_val = state.get(*a).as_float()?;
                 let b_val = state.get(*b).as_float()?;
                 let result = acc_val + a_val * b_val;
-                let id = ValueId(state.values.len() as u32);
+                let id = ValueId(trace_pos);
                 state.set(id, SimValue::Float(result));
                 Ok(Some(id))
             }
@@ -653,7 +708,7 @@ impl NumericalSimulator {
             TraceOp::QuantIntMul { src, factor } => {
                 let src_val = state.get(*src).as_integer()?;
                 let result = src_val * factor;
-                let id = ValueId(state.values.len() as u32);
+                let id = ValueId(trace_pos);
                 state.set(id, SimValue::Integer(result));
                 Ok(Some(id))
             }
@@ -661,7 +716,7 @@ impl NumericalSimulator {
             TraceOp::QuantInterleave { lo, hi } => {
                 // 标量模拟: 简单返回 lo 值
                 let lo_val = state.get(*lo);
-                let id = ValueId(state.values.len() as u32);
+                let id = ValueId(trace_pos);
                 state.set(id, lo_val);
                 Ok(Some(id))
             }
@@ -669,7 +724,7 @@ impl NumericalSimulator {
             TraceOp::QuantAndMask { src, mask } => {
                 let src_val = state.get(*src).as_integer()?;
                 let result = src_val & (*mask as i64);
-                let id = ValueId(state.values.len() as u32);
+                let id = ValueId(trace_pos);
                 state.set(id, SimValue::Integer(result));
                 Ok(Some(id))
             }
@@ -678,7 +733,7 @@ impl NumericalSimulator {
                 let ptr_val = state.get(*ptr).as_integer()?;
                 let addr = ptr_val + offset_bytes;
                 let f32_val = state.load_f16(addr)?;
-                let id = ValueId(state.values.len() as u32);
+                let id = ValueId(trace_pos);
                 state.set(id, SimValue::Float(f32_val));
                 Ok(Some(id))
             }
@@ -687,7 +742,7 @@ impl NumericalSimulator {
                 let ptr_val = state.get(*ptr).as_integer()?;
                 let addr = ptr_val + offset_bytes;
                 let i8_val = state.load_u8(addr)? as i8;
-                let id = ValueId(state.values.len() as u32);
+                let id = ValueId(trace_pos);
                 state.set(id, SimValue::Float(i8_val as f32));
                 Ok(Some(id))
             }
@@ -701,7 +756,7 @@ impl NumericalSimulator {
                 } else {
                     byte_val as i64
                 };
-                let id = ValueId(state.values.len() as u32);
+                let id = ValueId(trace_pos);
                 state.set(id, SimValue::Integer(val));
                 Ok(Some(id))
             }
@@ -709,7 +764,7 @@ impl NumericalSimulator {
             TraceOp::QuantShiftLeft { src, amount } => {
                 let src_val = state.get(*src).as_integer()?;
                 let result = src_val << amount;
-                let id = ValueId(state.values.len() as u32);
+                let id = ValueId(trace_pos);
                 state.set(id, SimValue::Integer(result));
                 Ok(Some(id))
             }
@@ -717,7 +772,7 @@ impl NumericalSimulator {
             TraceOp::QuantShiftRight { src, amount } => {
                 let src_val = state.get(*src).as_integer()?;
                 let result = src_val >> amount;
-                let id = ValueId(state.values.len() as u32);
+                let id = ValueId(trace_pos);
                 state.set(id, SimValue::Integer(result));
                 Ok(Some(id))
             }
@@ -726,7 +781,7 @@ impl NumericalSimulator {
             TraceOp::Exp(a) => {
                 let a_val = state.get(*a).as_float()?;
                 let result = a_val.exp();
-                let id = ValueId(state.values.len() as u32);
+                let id = ValueId(trace_pos);
                 state.set(id, SimValue::Float(result));
                 Ok(Some(id))
             }
@@ -735,7 +790,7 @@ impl NumericalSimulator {
             TraceOp::Tanh(a) => {
                 let a_val = state.get(*a).as_float()?;
                 let result = a_val.tanh();
-                let id = ValueId(state.values.len() as u32);
+                let id = ValueId(trace_pos);
                 state.set(id, SimValue::Float(result));
                 Ok(Some(id))
             }
@@ -749,7 +804,7 @@ impl NumericalSimulator {
                     ));
                 }
                 let result = 1.0 / a_val;
-                let id = ValueId(state.values.len() as u32);
+                let id = ValueId(trace_pos);
                 state.set(id, SimValue::Float(result));
                 Ok(Some(id))
             }
@@ -763,7 +818,7 @@ impl NumericalSimulator {
                     ));
                 }
                 let result = a_val.ln();
-                let id = ValueId(state.values.len() as u32);
+                let id = ValueId(trace_pos);
                 state.set(id, SimValue::Float(result));
                 Ok(Some(id))
             }
@@ -772,7 +827,7 @@ impl NumericalSimulator {
             TraceOp::Sigmoid(a) => {
                 let a_val = state.get(*a).as_float()?;
                 let result = 1.0 / (1.0 + (-a_val).exp());
-                let id = ValueId(state.values.len() as u32);
+                let id = ValueId(trace_pos);
                 state.set(id, SimValue::Float(result));
                 Ok(Some(id))
             }
@@ -783,7 +838,7 @@ impl NumericalSimulator {
                 let t = state.get(*true_val).as_float()?;
                 let f = state.get(*false_val).as_float()?;
                 let result = if m != 0.0 { t } else { f };
-                let id = ValueId(state.values.len() as u32);
+                let id = ValueId(trace_pos);
                 state.set(id, SimValue::Float(result));
                 Ok(Some(id))
             }
@@ -794,7 +849,7 @@ impl NumericalSimulator {
                 let act_val = state.get(*act).as_float()?;
                 let weight_val = state.get(*weight).as_float()?;
                 let result = acc_val + act_val * weight_val;
-                let id = ValueId(state.values.len() as u32);
+                let id = ValueId(trace_pos);
                 state.set(id, SimValue::Float(result));
                 Ok(Some(id))
             }
@@ -804,7 +859,7 @@ impl NumericalSimulator {
                 let data_val = state.get(*data).as_float()?;
                 let scale_val = state.get(*scale).as_float()?;
                 let result = data_val * scale_val;
-                let id = ValueId(state.values.len() as u32);
+                let id = ValueId(trace_pos);
                 state.set(id, SimValue::Float(result));
                 Ok(Some(id))
             }
@@ -814,12 +869,12 @@ impl NumericalSimulator {
                 let val = state.get(*src);
                 match val {
                     SimValue::Float(_) => {
-                        let id = ValueId(state.values.len() as u32);
+                        let id = ValueId(trace_pos);
                         state.set(id, val);
                         Ok(Some(id))
                     }
                     SimValue::Integer(i) => {
-                        let id = ValueId(state.values.len() as u32);
+                        let id = ValueId(trace_pos);
                         state.set(id, SimValue::Float(i as f32));
                         Ok(Some(id))
                     }
@@ -838,7 +893,7 @@ impl NumericalSimulator {
                     ReduceKind::Count => 1.0,
                     ReduceKind::ArgMax => 0.0,
                 };
-                let id = ValueId(state.values.len() as u32);
+                let id = ValueId(trace_pos);
                 state.set(id, SimValue::Float(result));
                 Ok(Some(id))
             }
@@ -847,14 +902,14 @@ impl NumericalSimulator {
             TraceOp::Prefetch { level: _ } => {
                 // Prefetch 是内存层级提示，标量模拟不需要执行
                 // 返回一个虚值以保持 SSA 连续性
-                let id = ValueId(state.values.len() as u32);
+                let id = ValueId(trace_pos);
                 state.set(id, SimValue::Float(0.0));
                 Ok(Some(id))
             }
 
             // ── NonTemporalStore (标量模拟: NOP) ──
             TraceOp::NonTemporalStore => {
-                let id = ValueId(state.values.len() as u32);
+                let id = ValueId(trace_pos);
                 state.set(id, SimValue::Float(0.0));
                 Ok(Some(id))
             }
@@ -864,7 +919,7 @@ impl NumericalSimulator {
                 let src_val = state.get(*src).as_integer()?;
                 let mask = (1i64 << width) - 1;
                 let result = (src_val >> offset) & mask;
-                let id = ValueId(state.values.len() as u32);
+                let id = ValueId(trace_pos);
                 state.set(id, SimValue::Integer(result));
                 Ok(Some(id))
             }
@@ -872,7 +927,7 @@ impl NumericalSimulator {
             // ── Permute (标量模拟: 传递源值) ──
             TraceOp::Permute { src, indices: _ } => {
                 let val = state.get(*src);
-                let id = ValueId(state.values.len() as u32);
+                let id = ValueId(trace_pos);
                 state.set(id, val);
                 Ok(Some(id))
             }
@@ -889,7 +944,7 @@ impl NumericalSimulator {
                     CmpOp::Gt => if a_val > b_val { 1.0 } else { 0.0 },
                     CmpOp::Ge => if a_val >= b_val { 1.0 } else { 0.0 },
                 };
-                let id = ValueId(state.values.len() as u32);
+                let id = ValueId(trace_pos);
                 state.set(id, SimValue::Float(result));
                 Ok(Some(id))
             }
@@ -898,9 +953,9 @@ impl NumericalSimulator {
             TraceOp::MaskedOp { op, mask } => {
                 let mask_val = state.get(*mask).as_float()?;
                 if mask_val != 0.0 {
-                    self.exec_op(op, state, desc)
+                    self.exec_op_with_pos(op, trace_pos, state, desc)
                 } else {
-                    let id = ValueId(state.values.len() as u32);
+                    let id = ValueId(trace_pos);
                     state.set(id, SimValue::Float(0.0));
                     Ok(Some(id))
                 }
@@ -909,7 +964,7 @@ impl NumericalSimulator {
             // ── AtomicAdd (标量模拟: 对 value 求和) ──
             TraceOp::AtomicAdd { addr: _, val } => {
                 let val_val = state.get(*val).as_float()?;
-                let id = ValueId(state.values.len() as u32);
+                let id = ValueId(trace_pos);
                 state.set(id, SimValue::Float(val_val));
                 Ok(Some(id))
             }
@@ -917,7 +972,7 @@ impl NumericalSimulator {
             // ── FWHT (Fast Walsh-Hadamard Transform, 标量模拟: 传递源值) ──
             TraceOp::FWHT { src, dim: _ } => {
                 let val = state.get(*src);
-                let id = ValueId(state.values.len() as u32);
+                let id = ValueId(trace_pos);
                 state.set(id, val);
                 Ok(Some(id))
             }
@@ -928,7 +983,7 @@ impl NumericalSimulator {
                 let offset_val = state.get(*offset).as_integer()?;
                 let addr = base_val + offset_val;
                 let byte_val = state.load_u8(addr)?;
-                let id = ValueId(state.values.len() as u32);
+                let id = ValueId(trace_pos);
                 state.set(id, SimValue::Integer(byte_val as i64));
                 Ok(Some(id))
             }
@@ -937,7 +992,7 @@ impl NumericalSimulator {
             TraceOp::StrideMul { value, stride } => {
                 let value_val = state.get(*value).as_integer()?;
                 let result = value_val * (*stride as i64);
-                let id = ValueId(state.values.len() as u32);
+                let id = ValueId(trace_pos);
                 state.set(id, SimValue::Integer(result));
                 Ok(Some(id))
             }
@@ -947,7 +1002,7 @@ impl NumericalSimulator {
                 let base_val = state.get(*base).as_integer()?;
                 let offset_val = state.get(*offset).as_integer()?;
                 let addr = base_val + offset_val;
-                let id = ValueId(state.values.len() as u32);
+                let id = ValueId(trace_pos);
                 state.set(id, SimValue::Integer(addr));
                 Ok(Some(id))
             }
@@ -958,7 +1013,7 @@ impl NumericalSimulator {
                 let offset_val = state.get(*offset).as_integer()?;
                 let addr = base_val + offset_val;
                 let byte_val = state.load_u8(addr)?;
-                let id = ValueId(state.values.len() as u32);
+                let id = ValueId(trace_pos);
                 state.set(id, SimValue::Float(byte_val as f32));
                 Ok(Some(id))
             }
@@ -970,7 +1025,7 @@ impl NumericalSimulator {
                 let value_val = state.get(*value).as_float()?;
                 let addr = base_val + offset_val;
                 state.store_u8(addr, value_val as u8)?;
-                let id = ValueId(state.values.len() as u32);
+                let id = ValueId(trace_pos);
                 state.set(id, SimValue::Float(value_val));
                 Ok(Some(id))
             }
@@ -978,7 +1033,7 @@ impl NumericalSimulator {
             // ── BroadcastScalar ──
             TraceOp::BroadcastScalar { src } => {
                 let val = state.get(*src);
-                let id = ValueId(state.values.len() as u32);
+                let id = ValueId(trace_pos);
                 state.set(id, val);
                 Ok(Some(id))
             }
@@ -989,7 +1044,7 @@ impl NumericalSimulator {
                 let offset_val = state.get(*offset).as_integer()?;
                 let addr = base_val + offset_val;
                 let byte_val = state.load_u8(addr)?;
-                let id = ValueId(state.values.len() as u32);
+                let id = ValueId(trace_pos);
                 state.set(id, SimValue::Float(byte_val as f32));
                 Ok(Some(id))
             }
@@ -1000,7 +1055,7 @@ impl NumericalSimulator {
                 let idx_val = state.get(*indices).as_integer()?;
                 let addr = base_val + idx_val * (*stride as i64);
                 let byte_val = state.load_u8(addr)?;
-                let id = ValueId(state.values.len() as u32);
+                let id = ValueId(trace_pos);
                 state.set(id, SimValue::Float(byte_val as f32));
                 Ok(Some(id))
             }
@@ -1012,7 +1067,7 @@ impl NumericalSimulator {
                 let value_val = state.get(*value).as_float()?;
                 let addr = base_val + idx_val * (*stride as i64);
                 state.store_u8(addr, value_val as u8)?;
-                let id = ValueId(state.values.len() as u32);
+                let id = ValueId(trace_pos);
                 state.set(id, SimValue::Float(value_val));
                 Ok(Some(id))
             }
@@ -1023,7 +1078,7 @@ impl NumericalSimulator {
                 let row_idx = state.get(*row_index).as_integer()?;
                 let addr = base_val + row_idx * (*row_bytes as i64);
                 let byte_val = state.load_u8(addr)?;
-                let id = ValueId(state.values.len() as u32);
+                let id = ValueId(trace_pos);
                 state.set(id, SimValue::Float(byte_val as f32));
                 Ok(Some(id))
             }
@@ -1040,7 +1095,7 @@ impl NumericalSimulator {
                 // E8M0 反量化: scale = 2^(scale_byte - 15)
                 let scale = (2.0_f32).powi((scale_byte as i32) - 15);
                 let result = e2m1_val * scale;
-                let id = ValueId(state.values.len() as u32);
+                let id = ValueId(trace_pos);
                 state.set(id, SimValue::Float(result));
                 Ok(Some(id))
             }
@@ -1050,7 +1105,7 @@ impl NumericalSimulator {
                 let a_val = state.get(*a).as_integer()?;
                 let b_val = state.get(*b).as_integer()?;
                 let result = a_val & b_val;
-                let id = ValueId(state.values.len() as u32);
+                let id = ValueId(trace_pos);
                 state.set(id, SimValue::Integer(result));
                 Ok(Some(id))
             }
@@ -1062,7 +1117,7 @@ impl NumericalSimulator {
                 let codebook_idx = idx as usize;
                 if codebook_idx < codebook.len() {
                     let val = codebook[codebook_idx] as f32;
-                    let id = ValueId(state.values.len() as u32);
+                    let id = ValueId(trace_pos);
                     state.set(id, SimValue::Float(val));
                     Ok(Some(id))
                 } else {
@@ -1090,7 +1145,7 @@ impl NumericalSimulator {
                     (2.0_f32).powi((scale_raw as i32) - 15)
                 };
                 let result = decoded * scale;
-                let id = ValueId(state.values.len() as u32);
+                let id = ValueId(trace_pos);
                 state.set(id, SimValue::Float(result));
                 Ok(Some(id))
             }
@@ -1129,7 +1184,7 @@ impl NumericalSimulator {
                         ((b_low & 0x0F) | ((b_high >> 6) << 4)) as f32
                     }
                 };
-                let id = ValueId(state.values.len() as u32);
+                let id = ValueId(trace_pos);
                 state.set(id, SimValue::Float(result));
                 Ok(Some(id))
             }
@@ -1139,7 +1194,7 @@ impl NumericalSimulator {
                 let ptr = state.get(*source).as_integer()?;
                 let addr = ptr + *offset as i64;
                 let f32_val = state.load_f16(addr)?;
-                let id = ValueId(state.values.len() as u32);
+                let id = ValueId(trace_pos);
                 state.set(id, SimValue::Float(f32_val));
                 Ok(Some(id))
             }
@@ -1163,7 +1218,7 @@ impl NumericalSimulator {
                     }
                     _ => byte as f32,
                 };
-                let id = ValueId(state.values.len() as u32);
+                let id = ValueId(trace_pos);
                 state.set(id, SimValue::Float(val));
                 Ok(Some(id))
             }
@@ -1178,7 +1233,7 @@ impl NumericalSimulator {
                         state.load_f16(addr)?
                     }
                 };
-                let id = ValueId(state.values.len() as u32);
+                let id = ValueId(trace_pos);
                 state.set(id, SimValue::Float(val));
                 Ok(Some(id))
             }
@@ -1188,7 +1243,7 @@ impl NumericalSimulator {
                 let ptr = state.get(*block_ptr).as_integer()?;
                 let addr = ptr + *byte_offset as i64;
                 let val = state.load_f16(addr)?;
-                let id = ValueId(state.values.len() as u32);
+                let id = ValueId(trace_pos);
                 state.set(id, SimValue::Float(val));
                 Ok(Some(id))
             }
@@ -1198,7 +1253,7 @@ impl NumericalSimulator {
                 let ptr = state.get(*block_ptr).as_integer()?;
                 let addr = ptr + *byte_offset as i64;
                 let byte = state.load_u8(addr)?;
-                let id = ValueId(state.values.len() as u32);
+                let id = ValueId(trace_pos);
                 state.set(id, SimValue::Integer(byte as i64));
                 Ok(Some(id))
             }
@@ -1209,18 +1264,32 @@ impl NumericalSimulator {
                 let cb_ptr = state.get(*codebook_ptr).as_integer()?;
                 let addr = cb_ptr + idx;
                 let byte = state.load_u8(addr)?;
-                let id = ValueId(state.values.len() as u32);
+                let id = ValueId(trace_pos);
                 state.set(id, SimValue::Float(byte as f32));
                 Ok(Some(id))
             }
 
             // ── Loop (标量模拟: 展开一次迭代) ──
             TraceOp::Loop { bound: _, step_bytes: _, body } => {
-                // 标量模拟: 仅执行 body 一次
+                // 标量模拟: 仅执行 body 一次。
+                // body 内的 op 共享外层 trace_pos 空间，使用 alloc_id 避免碰撞。
                 let mut last_id = None;
-                for op in body {
-                    if let Ok(Some(id)) = self.exec_op(op, state, desc) {
-                        last_id = Some(id);
+                for inner_op in body {
+                    let inner_pos = state.next_id;
+                    state.next_id += 1;
+                    match inner_op {
+                        TraceOp::Input(idx) => {
+                            // Loop body 内的 Input 引用外层输入
+                            let val = state.get(ValueId(*idx));
+                            let id = ValueId(inner_pos);
+                            state.set(id, val);
+                            last_id = Some(id);
+                        }
+                        _ => {
+                            if let Ok(Some(id)) = self.exec_op_with_pos(inner_op, inner_pos, state, desc) {
+                                last_id = Some(id);
+                            }
+                        }
                     }
                 }
                 Ok(last_id)
@@ -1232,7 +1301,7 @@ impl NumericalSimulator {
                 let offset_val = state.get(*offset).as_integer()?;
                 let addr = base_val + offset_val;
                 let byte = state.load_u8(addr)?;
-                let id = ValueId(state.values.len() as u32);
+                let id = ValueId(trace_pos);
                 state.set(id, SimValue::Float(byte as f32));
                 Ok(Some(id))
             }
@@ -1242,7 +1311,7 @@ impl NumericalSimulator {
                 let base_val = state.get(*base).as_integer()?;
                 let offset_val = state.get(*offset).as_integer()?;
                 // 标量模拟中，存储源的最后一个浮点值
-                let id = ValueId(state.values.len() as u32);
+                let id = ValueId(trace_pos);
                 state.set(id, SimValue::Float(0.0));
                 Ok(Some(id))
             }
@@ -1250,49 +1319,49 @@ impl NumericalSimulator {
             // ── PackBuffer (标量模拟: NOP) ──
             TraceOp::PackBuffer { src, dst: _, rows: _, cols: _, layout: _ } => {
                 let val = state.get(*src);
-                let id = ValueId(state.values.len() as u32);
+                let id = ValueId(trace_pos);
                 state.set(id, val);
                 Ok(Some(id))
             }
 
             // ── SharedMemDeclare (标量模拟: NOP) ──
             TraceOp::SharedMemDeclare { name: _, bytes: _ } => {
-                let id = ValueId(state.values.len() as u32);
+                let id = ValueId(trace_pos);
                 state.set(id, SimValue::Float(0.0));
                 Ok(Some(id))
             }
 
             // ── AsyncCopyToShared (标量模拟: NOP) ──
             TraceOp::AsyncCopyToShared { name: _, src_offset: _, bytes: _ } => {
-                let id = ValueId(state.values.len() as u32);
+                let id = ValueId(trace_pos);
                 state.set(id, SimValue::Float(0.0));
                 Ok(Some(id))
             }
 
             // ── Tma2DCopy (标量模拟: NOP) ──
             TraceOp::Tma2DCopy { desc: _, coord_x: _, coord_y: _, bytes: _ } => {
-                let id = ValueId(state.values.len() as u32);
+                let id = ValueId(trace_pos);
                 state.set(id, SimValue::Float(0.0));
                 Ok(Some(id))
             }
 
             // ── AsyncWaitGroup (标量模拟: NOP) ──
             TraceOp::AsyncWaitGroup { n: _ } => {
-                let id = ValueId(state.values.len() as u32);
+                let id = ValueId(trace_pos);
                 state.set(id, SimValue::Float(0.0));
                 Ok(Some(id))
             }
 
             // ── SyncBarrier (标量模拟: NOP) ──
             TraceOp::SyncBarrier { name: _ } => {
-                let id = ValueId(state.values.len() as u32);
+                let id = ValueId(trace_pos);
                 state.set(id, SimValue::Float(0.0));
                 Ok(Some(id))
             }
 
             // ── TileConfig (标量模拟: NOP) ──
             TraceOp::TileConfig { rows: _, cols: _ } => {
-                let id = ValueId(state.values.len() as u32);
+                let id = ValueId(trace_pos);
                 state.set(id, SimValue::Float(0.0));
                 Ok(Some(id))
             }
@@ -1303,14 +1372,14 @@ impl NumericalSimulator {
                 let a_val = state.get(*a).as_float()?;
                 let b_val = state.get(*b).as_float()?;
                 let result = c_val + a_val * b_val;
-                let id = ValueId(state.values.len() as u32);
+                let id = ValueId(trace_pos);
                 state.set(id, SimValue::Float(result));
                 Ok(Some(id))
             }
 
             // ── TileRelease (标量模拟: NOP) ──
             TraceOp::TileRelease => {
-                let id = ValueId(state.values.len() as u32);
+                let id = ValueId(trace_pos);
                 state.set(id, SimValue::Float(0.0));
                 Ok(Some(id))
             }
@@ -1319,14 +1388,14 @@ impl NumericalSimulator {
             TraceOp::Softmax { src, dst: _ } => {
                 let s = state.get(*src).as_float()?;
                 // 标量模拟: softmax(标量) = 1.0 (单个元素的 softmax 总是 1.0)
-                let id = ValueId(state.values.len() as u32);
+                let id = ValueId(trace_pos);
                 state.set(id, SimValue::Float(1.0));
                 Ok(Some(id))
             }
 
             // ── EpilogueChain (标量模拟: 传递源值) ──
             TraceOp::EpilogueChain { ops: _ } => {
-                let id = ValueId(state.values.len() as u32);
+                let id = ValueId(trace_pos);
                 state.set(id, SimValue::Float(0.0));
                 Ok(Some(id))
             }
@@ -1338,7 +1407,7 @@ impl NumericalSimulator {
             | TraceOp::MlaAttnScore { .. }
             | TraceOp::MlaRopeMerge { .. }
             | TraceOp::DynamicPrecisionSelect { .. } => {
-                let id = ValueId(state.values.len() as u32);
+                let id = ValueId(trace_pos);
                 state.set(id, SimValue::Float(0.0));
                 Ok(Some(id))
             }

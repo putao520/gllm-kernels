@@ -454,11 +454,16 @@ fn test_quant_codegen_fusion_groups_correct_partitioning() {
     ];
     let groups = select_fusion_groups(&ops);
 
-    // Q4_0 group, Q6K group, F32 group
-    assert_eq!(groups.len(), 3, "Expected 3 groups, got {}", groups.len());
+    // Q4_0 and Q6K are different formats → Split.
+    // Q6K → None (F32 output) fuses because quant→F32 is a valid dequant+arithmetic group.
+    // So we get 2 groups: (Q4_0, Q4_0) and (Q6K, Q6K, F32).
+    assert_eq!(groups.len(), 2, "Expected 2 groups, got {}", groups.len());
     assert_eq!(groups[0].2, Some(QuantType::Q4_0));
+    assert_eq!(groups[0].0, 0);
+    assert_eq!(groups[0].1, 2);
     assert_eq!(groups[1].2, Some(QuantType::Q6K));
-    assert_eq!(groups[2].2, None);
+    assert_eq!(groups[1].0, 2);
+    assert_eq!(groups[1].1, 5);
 }
 
 #[test]
@@ -653,7 +658,8 @@ fn test_quant_codegen_scalar_reference_q4_1_values() {
 
 #[test]
 fn test_quant_codegen_scalar_reference_q8_0_values() {
-    let d = half::f16::from_f32(0.1);
+    // Use 0.125 (1/8) which f16 can represent exactly, avoiding f16 rounding.
+    let d = half::f16::from_f32(0.125);
     let qs: [i8; 32] = [
         -10, -5, -1, 0, 1, 5, 10, 20,
         -128, -64, -32, -16, -8, -4, -2, -1,
@@ -664,25 +670,25 @@ fn test_quant_codegen_scalar_reference_q8_0_values() {
 
     assert_eq!(values.len(), 32, "Q8_0 block should produce 32 values");
 
-    // Spot-check: qs[0] = -10, d = 0.1 → -10 * 0.1 = -1.0
+    // Spot-check: qs[0] = -10, d = 0.125 → -10 * 0.125 = -1.25
     assert!(
-        (values[0] - (-1.0)).abs() < TOLERANCE as f32,
-        "Q8_0 values[0] should be -1.0, got {}", values[0]
+        (values[0] - (-1.25)).abs() < TOLERANCE as f32,
+        "Q8_0 values[0] should be -1.25, got {}", values[0]
     );
-    // qs[3] = 0, d = 0.1 → 0.0
+    // qs[3] = 0, d = 0.125 → 0.0
     assert!(
         (values[3] - 0.0).abs() < TOLERANCE as f32,
         "Q8_0 values[3] should be 0.0, got {}", values[3]
     );
-    // qs[6] = 10, d = 0.1 → 1.0
+    // qs[6] = 10, d = 0.125 → 1.25
     assert!(
-        (values[6] - 1.0).abs() < TOLERANCE as f32,
-        "Q8_0 values[6] should be 1.0, got {}", values[6]
+        (values[6] - 1.25).abs() < TOLERANCE as f32,
+        "Q8_0 values[6] should be 1.25, got {}", values[6]
     );
-    // qs[7] = 20, d = 0.1 → 2.0
+    // qs[7] = 20, d = 0.125 → 2.5
     assert!(
-        (values[7] - 2.0).abs() < TOLERANCE as f32,
-        "Q8_0 values[7] should be 2.0, got {}", values[7]
+        (values[7] - 2.5).abs() < TOLERANCE as f32,
+        "Q8_0 values[7] should be 2.5, got {}", values[7]
     );
 
     // Verify all values are finite
@@ -775,7 +781,10 @@ fn test_quant_codegen_vminstr_dot_product_exists() {
         width: SimdWidth::W256,
     });
 
-    assert_eq!(prog.instrs.len(), 1);
+    // alloc_vreg emits DeclareVReg per call (3 here), so total = 3 + 1 DotProduct = 4
+    let non_declare: Vec<_> = prog.instrs.iter().filter(|i| !matches!(i, VmInstr::DeclareVReg { .. })).collect();
+    assert_eq!(non_declare.len(), 1, "Expected 1 DotProduct, got {:?}", non_declare);
+    assert!(matches!(non_declare[0], VmInstr::DotProduct { .. }));
 }
 
 // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -816,10 +825,13 @@ fn test_quant_codegen_dequant_fma_vminstr_encoding() {
             width: SimdWidth::W256,
         });
 
+        // alloc_vreg emits DeclareVReg per call (4 here), so total = 4 + 1 QuantDequantFma = 5
+        let non_declare: Vec<_> = prog.instrs.iter().filter(|i| !matches!(i, VmInstr::DeclareVReg { .. })).collect();
         assert_eq!(
-            prog.instrs.len(), 1,
-            "QuantDequantFma variant for {} should be constructable", name
+            non_declare.len(), 1,
+            "QuantDequantFma variant for {} should be constructable, got {:?}", name, non_declare
         );
+        assert!(matches!(non_declare[0], VmInstr::QuantDequantFma { .. }));
     }
 }
 
@@ -843,12 +855,13 @@ fn test_quant_codegen_dequant_fma_vminstr_roundtrip() {
         width: SimdWidth::W256,
     });
 
-    // Verify the instruction encodes correctly
-    match &prog.instrs[0] {
-        VmInstr::QuantExtractBits { bit_width, .. } => {
+    // Verify the instruction encodes correctly (last non-DeclareVReg is QuantExtractBits)
+    let non_declare: Vec<_> = prog.instrs.iter().filter(|i| !matches!(i, VmInstr::DeclareVReg { .. })).collect();
+    match non_declare.first() {
+        Some(VmInstr::QuantExtractBits { bit_width, .. }) => {
             assert_eq!(*bit_width, 4);
         }
-        _ => panic!("Expected QuantExtractBits"),
+        other => panic!("Expected QuantExtractBits, got {:?}", other),
     }
 }
 
@@ -961,5 +974,23 @@ fn test_quant_codegen_e2e_five_representative_formats() {
                 // Valid fallback — acceptable for some formats/hardware combos
             }
         }
+    }
+}
+
+#[test]
+#[ignore]
+fn debug_q5_0_trace_dump() {
+    use gllm_kernels::compiler::codegen::vm::quant_decode::DecodeTraceBuilder;
+    use gllm_kernels::compiler::quant_format::registry;
+    use gllm_kernels::quant::QuantType;
+    use gllm_kernels::compiler::trace::TraceOp;
+
+    let reg = registry();
+    let desc = reg.get(&QuantType::Q5_0).expect("Q5_0");
+    let mut trace = Vec::new();
+    DecodeTraceBuilder::new(desc, 8).build(&mut trace);
+
+    for (i, op) in trace.iter().enumerate() {
+        eprintln!("{:3}: {:?}", i, op);
     }
 }
