@@ -1,0 +1,77 @@
+[workspace]
+members = [".", "scalar-ops"]
+
+[package]
+name = "gllm-kernels"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+half = "2.3.1"
+paste = "1"
+rayon = "1.10"
+libc = "0.2"
+seq-macro = "0.3"
+iced-x86 = { version = "1.21", features = ["code_asm"], optional = true }
+dynasm = { version = "2", optional = true }
+dynasmrt = { version = "2", optional = true }
+gllm-scalar-ops = { path = "scalar-ops" }
+gllm-nccl = { path = "../gllm-nccl", optional = true }
+
+[target.'cfg(windows)'.dependencies]
+winapi = { version = "0.3", features = ["memoryapi", "winnt"] }
+
+[features]
+default = ["jit-x86"]
+jit-x86 = ["iced-x86"]
+jit-aarch64 = ["dynasm", "dynasmrt"]
+jit-aarch64-dynasm = ["jit-aarch64"]  # legacy alias
+jit-sve = []
+jit-cuda = []
+jit-hip = []
+jit-metal = []
+onednn = []
+# cublas/rocblas: 已物理删除 — GPU GEMM 全部走 JIT codegen (ARCH-NO-EXTERNAL-BLAS)
+accelerate = []
+nccl = ["dep:gllm-nccl"]
+experimental = []
+
+[dev-dependencies]
+criterion = "0.5"
+rand = "0.8"
+proptest = "1"
+iced-x86 = { version = "1.21", features = ["code_asm"] }
+
+[[bench]]
+name = "gemm_benchmark"
+harness = false
+
+[[bench]]
+name = "kernels_benchmark"
+harness = false
+
+[[bench]]
+name = "baseline_audit"
+harness = false
+
+[[bench]]
+name = "symexec_benchmark"
+harness = false
+
+[[bench]]
+name = "jit_compile_benchmark"
+harness = false
+
+[[bench]]
+name = "jit_vs_asm"
+harness = false
+
+# ── Profile overrides for scalar-ops subcrate ──
+# REQ-SCALAR-002: scalar functions must compile at opt-level=1 to preserve
+# loop structure for symexec binary analysis. opt-level=1 eliminates trivial
+# redundancy but does NOT vectorize or unroll loops.
+[profile.dev.package.gllm-scalar-ops]
+opt-level = 1
+
+[profile.release.package.gllm-scalar-ops]
+opt-level = 1

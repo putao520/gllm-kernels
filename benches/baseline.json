@@ -1,0 +1,16 @@
+{
+  "results": [
+    {"name": "gemm 256x256x256", "metric": 231.2408, "unit": "GFLOPS"},
+    {"name": "gemm 512x512x512", "metric": 651.2215, "unit": "GFLOPS"},
+    {"name": "gemm 1024x1024x1024", "metric": 691.0209, "unit": "GFLOPS"},
+    {"name": "gemm 128x4096x4096", "metric": 149.5070, "unit": "GFLOPS"},
+    {"name": "gemv 1x4096x4096", "metric": 12.2684, "unit": "GFLOPS"},
+    {"name": "gemv_q4k 1x4096x4096", "metric": 16.4834, "unit": "GFLOPS"},
+    {"name": "gemv_q4k 1x4096x4096 BW", "metric": 4.6440, "unit": "GB/s"},
+    {"name": "gemv_q8k 1x4096x4096", "metric": 28.3409, "unit": "GFLOPS"},
+    {"name": "gemv_q8k 1x4096x4096 BW", "metric": 16.1770, "unit": "GB/s"},
+    {"name": "rms_norm 4096", "metric": 86.5352, "unit": "GB/s"},
+    {"name": "softmax 4096", "metric": 16.7640, "unit": "GB/s"},
+    {"name": "rope 32heads dim128", "metric": 96.9467, "unit": "GB/s"}
+  ]
+}

@@ -1,0 +1,48 @@
+/target
+Cargo.lock
+__pycache__/
+
+# Added by cargo
+.cargo/
+
+# AI Agent
+.claude/
+CLAUDE.md
+
+# Internal design docs
+SPEC
+SPEC/
+SPEC-archive/
+
+# Internal status docs
+IMPLEMENTATION_SUMMARY.md
+MEGA_KERNEL_OBSERVATION.md
+PERFORMANCE_REPORT.md
+
+# Development artifacts
+bench_mkl.*
+bench_mkl_mt
+/*.py
+/*.c
+benches/examples/
+cargo
+rust_out.s
+scripts/
+
+# AI tools
+.serena/
+.gsc/
+
+# Sensitive files
+.env
+.env.*
+*.pem
+*.key
+
+# OS / editor
+.DS_Store
+*.log
+*.tmp
+*.swp
+*.swo
+*~

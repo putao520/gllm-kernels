@@ -1,0 +1,7 @@
+[package]
+name = "gllm-scalar-ops"
+version = "0.1.0"
+edition = "2021"
+description = "extern \"C\" scalar operator definitions for gllm-kernels (compiled at opt-level=1 for symexec analysis)"
+
+[dependencies]

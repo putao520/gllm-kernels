@@ -1,0 +1,148 @@
+name: Codegen Validation
+
+# 触发条件：PR/push 涉及 codegen 层代码时自动跑无设备验证
+on:
+  push:
+    branches: [ master, main ]
+    paths:
+      - 'src/compiler/codegen/**'
+      - 'src/compiler/**'
+      - 'tests/codegen_validation.rs'
+      - 'scripts/validate_codegen.sh'
+      - '.github/workflows/codegen-validation.yml'
+  pull_request:
+    paths:
+      - 'src/compiler/codegen/**'
+      - 'src/compiler/**'
+      - 'tests/codegen_validation.rs'
+      - 'scripts/validate_codegen.sh'
+
+  workflow_dispatch: # 手动触发
+
+jobs:
+  # ══════════════════════════════════════════════════════════════════
+  # Linux 主 job: 所有 ISA 路径的静态分析 + QEMU 运行验证
+  # ══════════════════════════════════════════════════════════════════
+  linux-validation:
+    name: Linux (PTX/HIP/QEMU/LLVM)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Cache cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-codegen-${{ hashFiles('**/Cargo.lock') }}
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-unknown-linux-gnu
+
+      - name: Install QEMU + cross gcc + LLVM
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            qemu-user qemu-user-static \
+            gcc-aarch64-linux-gnu \
+            llvm llvm-dev \
+            build-essential
+          # 验证 QEMU 版本 ≥ 8.0 (AMX/AVX-512 支持)
+          qemu-x86_64 --version
+
+      - name: Install CUDA Toolkit (ptxas / cuobjdump / nvdisasm)
+        run: |
+          wget -q https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2404/x86_64/cuda-keyring_1.1-1_all.deb
+          sudo dpkg -i cuda-keyring_1.1-1_all.deb
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends cuda-nvcc-12-9 cuda-cuobjdump-12-9
+          echo "/usr/local/cuda/bin" >> "$GITHUB_PATH"
+
+      - name: Install ROCm (hipcc / clang-offload-bundler / rocm-llvm)
+        run: |
+          # 最小化安装：仅 hipcc + llvm 工具（无 runtime）
+          wget -q https://repo.radeon.com/amdgpu-install/6.2/ubuntu/noble/amdgpu-install_6.2.60200-1_all.deb
+          sudo dpkg -i amdgpu-install_6.2.60200-1_all.deb || true
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            hip-dev rocm-llvm || echo "ROCm 部分工具缺失，对应测试会 skip"
+
+      - name: Probe tools
+        run: ./scripts/validate_codegen.sh --probe
+
+      - name: Run full validation suite
+        run: ./scripts/validate_codegen.sh
+
+      - name: Upload failure artifacts
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: codegen-failure-logs-linux
+          path: |
+            target/debug/deps/codegen_validation*
+            /tmp/gllm_*
+          retention-days: 7
+
+  # ══════════════════════════════════════════════════════════════════
+  # macOS job: Metal xcrun 验证（Apple 专有路径）
+  # ══════════════════════════════════════════════════════════════════
+  macos-metal-validation:
+    name: macOS (Metal MSL via xcrun)
+    runs-on: macos-14
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-codegen-${{ hashFiles('**/Cargo.lock') }}
+
+      - name: Verify xcrun metal available
+        run: xcrun --find metal && xcrun metal --version
+
+      - name: Run Metal validation
+        run: cargo test --test codegen_validation test_metal -- --nocapture
+
+  # ══════════════════════════════════════════════════════════════════
+  # 严格模式 job (可选, manual trigger)
+  # ══════════════════════════════════════════════════════════════════
+  strict-validation:
+    name: Strict Mode (所有工具必装)
+    runs-on: ubuntu-24.04
+    if: github.event_name == 'workflow_dispatch'
+    needs: linux-validation
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-unknown-linux-gnu
+      - name: Install all validation tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            qemu-user qemu-user-static gcc-aarch64-linux-gnu \
+            llvm llvm-dev build-essential
+          # CUDA + ROCm install 同上
+          wget -q https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2404/x86_64/cuda-keyring_1.1-1_all.deb
+          sudo dpkg -i cuda-keyring_1.1-1_all.deb
+          sudo apt-get update
+          sudo apt-get install -y cuda-nvcc-12-9 cuda-cuobjdump-12-9
+          echo "/usr/local/cuda/bin" >> "$GITHUB_PATH"
+      - name: Strict probe (fails if any tool missing)
+        run: ./scripts/validate_codegen.sh --strict --probe
+      - name: Strict validation run
+        run: ./scripts/validate_codegen.sh --strict
