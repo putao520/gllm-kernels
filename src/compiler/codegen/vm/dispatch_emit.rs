@@ -1116,7 +1116,52 @@ pub(crate) fn dispatch_compute_pattern(
             };
             let weight_tid = op.inputs.get(1).copied();
             let pm = ctx.pack_map_for_gemm(weight_tid);
-            emit_gemm_inline_with_hook(prog, m, *n, *k, ctx, input_ptr, weight_ptr, output_ptr, gemm_seq_override.as_ref(), Some(op.id), pm, *trans_b).map(|_| true)
+            emit_gemm_inline_with_hook(prog, m, *n, *k, ctx, input_ptr, weight_ptr, output_ptr, gemm_seq_override.as_ref(), Some(op.id), pm, *trans_b)?;
+
+            // GemmBias: add bias vector (broadcast across M rows) after GEMM.
+            // output[i, j] += bias[j] for each row i.
+            if matches!(op.kind, OpKind::GemmBias { .. }) {
+                if let Some(&bias_tid) = op.inputs.get(2) {
+                    let bias_ptr = resolver.materialize(prog, bias_tid, abi)
+                        .ok_or_else(|| CompilerError::CodegenViolation(
+                            format!("GemmBias: bias tensor {} cannot be materialized", bias_tid.0)
+                        ))?;
+                    let n_elem = *n;
+                    let m_bound = gemm_seq_override.as_ref()
+                        .cloned()
+                        .unwrap_or_else(|| sym_map.to_bound(m));
+                    let row_bytes = n_elem * 4;
+                    let row_ptr = prog.alloc_vreg(VRegKind::Ptr, SimdWidth::Scalar);
+                    prog.emit_loop(m_bound, row_bytes, |prog, _row_ctr, row_off| {
+                        // row_ptr = output_ptr + row_off (current row byte offset)
+                        prog.emit(VmInstr::GprBinOp { dst: row_ptr, a: output_ptr, b: GprOperand::VReg(row_off), op: GprOp::Add });
+                        let lanes = width.f32_lanes().max(1);
+                        let n_vec = n_elem / lanes;
+                        for vj in 0..n_vec {
+                            let byte_off = vj * lanes * 4;
+                            let b_data = prog.alloc_vreg(VRegKind::Vec, width);
+                            let c_data = prog.alloc_vreg(VRegKind::Vec, width);
+                            prog.emit(VmInstr::VecLoad { dst: b_data, base: bias_ptr, offset: OffsetExpr::Const(byte_off), width, dtype: QuantPrecision::F32 });
+                            prog.emit(VmInstr::VecLoad { dst: c_data, base: row_ptr, offset: OffsetExpr::Const(byte_off), width, dtype: QuantPrecision::F32 });
+                            prog.emit(VmInstr::VecBinOp { dst: c_data, a: c_data, b: b_data, op: VecOp::Add, dtype: QuantPrecision::F32 });
+                            prog.emit(VmInstr::VecStore { base: row_ptr, offset: OffsetExpr::Const(byte_off), src: c_data, width, dtype: QuantPrecision::F32 });
+                        }
+                        let rem_start = n_vec * lanes;
+                        if rem_start < n_elem {
+                            for jj in rem_start..n_elem {
+                                let byte_off = jj * 4;
+                                let b_s = prog.alloc_vreg(VRegKind::Vec, SimdWidth::Scalar);
+                                let c_s = prog.alloc_vreg(VRegKind::Vec, SimdWidth::Scalar);
+                                prog.emit(VmInstr::VecLoad { dst: b_s, base: bias_ptr, offset: OffsetExpr::Const(byte_off), width: SimdWidth::Scalar, dtype: QuantPrecision::F32 });
+                                prog.emit(VmInstr::VecLoad { dst: c_s, base: row_ptr, offset: OffsetExpr::Const(byte_off), width: SimdWidth::Scalar, dtype: QuantPrecision::F32 });
+                                prog.emit(VmInstr::VecBinOp { dst: c_s, a: c_s, b: b_s, op: VecOp::Add, dtype: QuantPrecision::F32 });
+                                prog.emit(VmInstr::VecStore { base: row_ptr, offset: OffsetExpr::Const(byte_off), src: c_s, width: SimdWidth::Scalar, dtype: QuantPrecision::F32 });
+                            }
+                        }
+                    });
+                }
+            }
+            Ok(true)
         }
 
 

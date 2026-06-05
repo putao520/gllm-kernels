@@ -301,7 +301,45 @@ impl TemplateInterpreter {
                     ActivationKind::Relu => {
                         ops.push(TraceOp::Max(src, src));
                     }
-                    ActivationKind::Gelu | ActivationKind::Tanh | ActivationKind::Sigmoid => {
+                    ActivationKind::Gelu => {
+                        // gelu(x) = 0.5 * x * (1 + tanh(sqrt(2/pi) * (x + 0.044715 * x^3)))
+                        let x = src;
+                        // x^2
+                        ops.push(TraceOp::Mul(x, x));
+                        let x2 = Self::next_slot(ops) - 1;
+                        // x^3 = x^2 * x
+                        ops.push(TraceOp::Mul(x2, x));
+                        let x3 = Self::next_slot(ops) - 1;
+                        // 0.044715 * x^3
+                        ops.push(TraceOp::Const(0.044715));
+                        let c0447 = Self::next_slot(ops) - 1;
+                        ops.push(TraceOp::Mul(c0447, x3));
+                        let cx3 = Self::next_slot(ops) - 1;
+                        // inner = x + 0.044715 * x^3
+                        ops.push(TraceOp::Add(x, cx3));
+                        let inner = Self::next_slot(ops) - 1;
+                        // scaled = sqrt(2/pi) * inner = 0.7978845608 * inner
+                        ops.push(TraceOp::Const(0.7978845608));
+                        let c7978 = Self::next_slot(ops) - 1;
+                        ops.push(TraceOp::Mul(c7978, inner));
+                        let scaled = Self::next_slot(ops) - 1;
+                        // t = tanh(scaled)
+                        ops.push(TraceOp::Tanh(scaled));
+                        let t = Self::next_slot(ops) - 1;
+                        // 1 + t
+                        ops.push(TraceOp::Const(1.0));
+                        let one = Self::next_slot(ops) - 1;
+                        ops.push(TraceOp::Add(one, t));
+                        let one_plus_t = Self::next_slot(ops) - 1;
+                        // x * (1 + t)
+                        ops.push(TraceOp::Mul(x, one_plus_t));
+                        let x_opt = Self::next_slot(ops) - 1;
+                        // 0.5 * x * (1 + t)
+                        ops.push(TraceOp::Const(0.5));
+                        let half = Self::next_slot(ops) - 1;
+                        ops.push(TraceOp::Mul(half, x_opt));
+                    }
+                    ActivationKind::Tanh | ActivationKind::Sigmoid => {
                         ops.push(TraceOp::Tanh(src));
                     }
                 }
@@ -500,20 +538,48 @@ impl TemplateInterpreter {
                     ActivationKind::Relu => {
                         body_ops.push(TraceOp::Max(src, src));
                     }
-                    ActivationKind::Gelu | ActivationKind::Tanh | ActivationKind::Sigmoid => {
+                    ActivationKind::Gelu => {
+                        let x = src;
+                        body_ops.push(TraceOp::Mul(x, x));
+                        let x2 = Self::next_slot(body_ops) - 1;
+                        body_ops.push(TraceOp::Mul(x2, x));
+                        let x3 = Self::next_slot(body_ops) - 1;
+                        body_ops.push(TraceOp::Const(0.044715));
+                        let c0447 = Self::next_slot(body_ops) - 1;
+                        body_ops.push(TraceOp::Mul(c0447, x3));
+                        let cx3 = Self::next_slot(body_ops) - 1;
+                        body_ops.push(TraceOp::Add(x, cx3));
+                        let inner = Self::next_slot(body_ops) - 1;
+                        body_ops.push(TraceOp::Const(0.7978845608));
+                        let c7978 = Self::next_slot(body_ops) - 1;
+                        body_ops.push(TraceOp::Mul(c7978, inner));
+                        let scaled = Self::next_slot(body_ops) - 1;
+                        body_ops.push(TraceOp::Tanh(scaled));
+                        let t = Self::next_slot(body_ops) - 1;
+                        body_ops.push(TraceOp::Const(1.0));
+                        let one = Self::next_slot(body_ops) - 1;
+                        body_ops.push(TraceOp::Add(one, t));
+                        let one_plus_t = Self::next_slot(body_ops) - 1;
+                        body_ops.push(TraceOp::Mul(x, one_plus_t));
+                        let x_opt = Self::next_slot(body_ops) - 1;
+                        body_ops.push(TraceOp::Const(0.5));
+                        let half = Self::next_slot(body_ops) - 1;
+                        body_ops.push(TraceOp::Mul(half, x_opt));
+                    }
+                    ActivationKind::Tanh | ActivationKind::Sigmoid => {
                         body_ops.push(TraceOp::Tanh(src));
                     }
                 }
             }
 
-            AlgoStep::Softmax => {
-                let src = env.get("panel_a");
-                body_ops.push(TraceOp::Softmax { src, dst: src });
-            }
-
             AlgoStep::Dequantize { mode: _ } => {
                 let src = env.get("panel_a");
                 body_ops.push(TraceOp::Input(src.0));
+            }
+
+            AlgoStep::Softmax => {
+                let src = env.get("panel_a");
+                body_ops.push(TraceOp::Softmax { src, dst: src });
             }
 
             AlgoStep::EmbeddingGather => {

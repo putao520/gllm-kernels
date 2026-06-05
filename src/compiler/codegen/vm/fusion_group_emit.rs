@@ -14,7 +14,52 @@ use crate::compiler::fusion::{FusionGroup, FusionMode};
 use crate::compiler::graph::{CompilerGraph, OpKind};
 use crate::compiler::buffer_alloc::BufferAllocation;
 use crate::compiler::layout_negotiator::MovementType;
+use crate::compiler::trace::QuantPrecision;
 use crate::types::CompilerError;
+
+/// Emit broadcast bias add: output[i,j] += bias[j] for M rows × N cols.
+/// Used by GemmBias across all fusion modes (Standalone, EpilogueInjection, NormIntoGemm, QkvSharedInput).
+fn emit_bias_add(
+    prog: &mut VmProgram,
+    output_ptr: VRegId,
+    bias_ptr: VRegId,
+    n: usize,
+    m_bound: BoundExpr,
+    width: SimdWidth,
+    dtype: QuantPrecision,
+    sym_map: &super::plan_lower::SymDimSlotMap,
+) {
+    let elem = dtype.elem_bytes();
+    let lanes = width.f32_lanes().max(1);
+    let n_vec = n / lanes;
+    let n_tail = n - n_vec * lanes;
+    let row_bytes = n * elem;
+    let row_ptr = prog.alloc_vreg(VRegKind::Ptr, SimdWidth::Scalar);
+    prog.emit_loop(m_bound, row_bytes, |prog, _row_ctr, row_off| {
+        prog.emit(VmInstr::GprBinOp { dst: row_ptr, a: output_ptr, b: GprOperand::VReg(row_off), op: GprOp::Add });
+        for vj in 0..n_vec {
+            let byte_off = vj * lanes * elem;
+            let b_data = prog.alloc_vreg(VRegKind::Vec, width);
+            let c_data = prog.alloc_vreg(VRegKind::Vec, width);
+            prog.emit(VmInstr::VecLoad { dst: b_data, base: bias_ptr, offset: OffsetExpr::Const(byte_off), width, dtype });
+            prog.emit(VmInstr::VecLoad { dst: c_data, base: row_ptr, offset: OffsetExpr::Const(byte_off), width, dtype });
+            prog.emit(VmInstr::VecBinOp { dst: c_data, a: c_data, b: b_data, op: VecOp::Add, dtype });
+            prog.emit(VmInstr::VecStore { base: row_ptr, offset: OffsetExpr::Const(byte_off), src: c_data, width, dtype });
+        }
+        if n_tail > 0 {
+            let tail_base = n_vec * lanes * elem;
+            for jj in 0..n_tail {
+                let byte_off = tail_base + jj * elem;
+                let b_s = prog.alloc_vreg(VRegKind::Vec, SimdWidth::Scalar);
+                let c_s = prog.alloc_vreg(VRegKind::Vec, SimdWidth::Scalar);
+                prog.emit(VmInstr::VecLoad { dst: b_s, base: bias_ptr, offset: OffsetExpr::Const(byte_off), width: SimdWidth::Scalar, dtype });
+                prog.emit(VmInstr::VecLoad { dst: c_s, base: row_ptr, offset: OffsetExpr::Const(byte_off), width: SimdWidth::Scalar, dtype });
+                prog.emit(VmInstr::VecBinOp { dst: c_s, a: c_s, b: b_s, op: VecOp::Add, dtype });
+                prog.emit(VmInstr::VecStore { base: row_ptr, offset: OffsetExpr::Const(byte_off), src: c_s, width: SimdWidth::Scalar, dtype });
+            }
+        }
+    });
+}
 
 /// §0.2.11 InterOpTransform 布局变换 VmInstr 发射
 ///
@@ -180,10 +225,46 @@ pub(super) fn emit_fusion_group_by_mode(
                 OpKind::Gemm { trans_b, .. } | OpKind::GemmBias { trans_b, .. } => *trans_b,
                 _ => false,
             };
-            emit_gemm_inline_with_epilogue(prog, &m_dim, n, k, width,
-                group_input_ptr, group_weight_ptr, gemm_output_ptr,
-                &epi_trace, sym_map, graph.telemetry.gemm_row_stats, seq_bound_override, ctx.dtype, gemm_trans_b,
-                super::isa_hook::EpiloguePlace::OnAccumulators)?;
+
+            // GemmBias: bias must be added BEFORE epilogue (e.g. GELU(bias+GEMM) != GELU(GEMM)+bias).
+            // Decompose: GEMM(no epilogue) → bias add → elementwise epilogue ops.
+            if matches!(anchor_op.kind, OpKind::GemmBias { .. }) && !epi_trace.is_empty() {
+                // Step 1: GEMM without epilogue → writes unbiased result to gemm_output_ptr
+                emit_gemm_inline_with_epilogue(prog, &m_dim, n, k, width,
+                    group_input_ptr, group_weight_ptr, gemm_output_ptr,
+                    &[], sym_map, false, seq_bound_override, ctx.dtype, gemm_trans_b,
+                    super::isa_hook::EpiloguePlace::OnAccumulators)?;
+                // Step 2: Bias add (broadcast across M rows)
+                if let Some(&bias_tid) = anchor_op.inputs.get(2) {
+                    let bias_ptr = resolver.materialize(prog, bias_tid, abi)
+                        .ok_or_else(|| CompilerError::CodegenViolation(
+                            format!("GemmBias EpilogueInjection: bias tensor {} cannot be materialized", bias_tid.0)
+                        ))?;
+                    let m_bound = seq_bound_override.cloned()
+                        .unwrap_or_else(|| sym_map.to_bound(&m_dim));
+                    emit_bias_add(prog, gemm_output_ptr, bias_ptr, n, m_bound, width, ctx.dtype, sym_map);
+                }
+                // Step 3: Apply epilogue ops as standalone elementwise on biased output
+                for &epi_op_id in &group.epilogue {
+                    if let Some(epi_op) = graph.op(epi_op_id) {
+                        let epi_input_ptr = epi_op.inputs.first()
+                            .and_then(|&tid| resolver.materialize(prog, tid, abi))
+                            .unwrap_or(gemm_output_ptr);
+                        let epi_output_ptr = epi_op.outputs.first()
+                            .and_then(|&tid| resolver.materialize(prog, tid, abi))
+                            .unwrap_or(gemm_output_ptr);
+                        // Epilogue ops are elementwise (GELU, SiLU, etc.) — use standalone dispatch
+                        emit_standalone_op(prog, epi_op, graph, ctx,
+                            epi_input_ptr, group_weight_ptr, epi_output_ptr, rope_cache_offset,
+                            resolver, abi)?;
+                    }
+                }
+            } else {
+                emit_gemm_inline_with_epilogue(prog, &m_dim, n, k, width,
+                    group_input_ptr, group_weight_ptr, gemm_output_ptr,
+                    &epi_trace, sym_map, graph.telemetry.gemm_row_stats, seq_bound_override, ctx.dtype, gemm_trans_b,
+                    super::isa_hook::EpiloguePlace::OnAccumulators)?;
+            }
         }
 
         FusionMode::NormIntoGemm => {
@@ -220,6 +301,16 @@ pub(super) fn emit_fusion_group_by_mode(
                 };
                 emit_gemm_inline_with_hook(p, &m_dim, n, k, ctx,
                     scratch_ptr, group_weight_ptr, group_output_ptr, seq_bound_override, Some(anchor_op.id), pm, norm_into_gemm_trans_b)?;
+                // GemmBias: add bias after GEMM in NormIntoGemm mode
+                if matches!(anchor_op.kind, OpKind::GemmBias { .. }) {
+                    if let Some(&bias_tid) = anchor_op.inputs.get(2) {
+                        if let Some(bias_ptr) = resolver.materialize(p, bias_tid, abi) {
+                            let m_bound = seq_bound_override.cloned()
+                                .unwrap_or_else(|| sym_map.to_bound(&m_dim));
+                            emit_bias_add(p, group_output_ptr, bias_ptr, n, m_bound, ctx.width, ctx.dtype, sym_map);
+                        }
+                    }
+                }
                 Ok(())
             })?;
         }
@@ -242,6 +333,16 @@ pub(super) fn emit_fusion_group_by_mode(
                         };
                         prog.emit_scope(|p| -> Result<(), CompilerError> {
                             emit_gemm_inline_with_hook(p, &m_dim, n, k, ctx, gemm_input, gemm_weight, out_ptr, seq_bound_override, Some(op.id), pm, qkv_trans_b)?;
+                            // GemmBias: add bias after GEMM in QkvSharedInput mode
+                            if matches!(op.kind, OpKind::GemmBias { .. }) {
+                                if let Some(&bias_tid) = op.inputs.get(2) {
+                                    if let Some(bias_ptr) = resolver.materialize(p, bias_tid, abi) {
+                                        let m_bound = seq_bound_override.cloned()
+                                            .unwrap_or_else(|| sym_map.to_bound(&m_dim));
+                                        emit_bias_add(p, out_ptr, bias_ptr, n, m_bound, ctx.width, ctx.dtype, sym_map);
+                                    }
+                                }
+                            }
                             Ok(())
                         })?;
                     }
@@ -272,6 +373,16 @@ pub(super) fn emit_fusion_group_by_mode(
             };
             emit_gemm_inline_with_hook(prog, &m_dim, n, k, ctx,
                 pre_scratch, group_weight_ptr, group_output_ptr, seq_bound_override, Some(anchor_op.id), pm, pre_fusion_trans_b)?;
+            // GemmBias: add bias after GEMM in TileLevelFusion mode
+            if matches!(anchor_op.kind, OpKind::GemmBias { .. }) {
+                if let Some(&bias_tid) = anchor_op.inputs.get(2) {
+                    if let Some(bias_ptr) = resolver.materialize(prog, bias_tid, abi) {
+                        let m_bound = seq_bound_override.cloned()
+                            .unwrap_or_else(|| sym_map.to_bound(&m_dim));
+                        emit_bias_add(prog, group_output_ptr, bias_ptr, n, m_bound, ctx.width, ctx.dtype, sym_map);
+                    }
+                }
+            }
         }
 
         FusionMode::ComputeRoot { predecessor } => {
@@ -300,6 +411,16 @@ pub(super) fn emit_fusion_group_by_mode(
             };
             emit_gemm_inline_with_hook(prog, &m_dim, n, k, ctx,
                 pre_scratch, group_weight_ptr, group_output_ptr, seq_bound_override, Some(anchor_op.id), pm, pre_fusion_trans_b)?;
+            // GemmBias: add bias after GEMM in ComputeRoot mode
+            if matches!(anchor_op.kind, OpKind::GemmBias { .. }) {
+                if let Some(&bias_tid) = anchor_op.inputs.get(2) {
+                    if let Some(bias_ptr) = resolver.materialize(prog, bias_tid, abi) {
+                        let m_bound = seq_bound_override.cloned()
+                            .unwrap_or_else(|| sym_map.to_bound(&m_dim));
+                        emit_bias_add(prog, group_output_ptr, bias_ptr, n, m_bound, ctx.width, ctx.dtype, sym_map);
+                    }
+                }
+            }
         }
 
         FusionMode::FFNBlock { gate_gemm, up_gemm, activation, combine } => {
@@ -324,6 +445,15 @@ pub(super) fn emit_fusion_group_by_mode(
                 };
                 prog.emit_scope(|p| -> Result<(), CompilerError> {
                     emit_gemm_inline_with_hook(p, &m_dim, n, k, ctx, gate_input, gate_weight, gate_scratch, seq_bound_override, Some(gate_op.id), pm, gate_trans_b)?;
+                    if matches!(gate_op.kind, OpKind::GemmBias { .. }) {
+                        if let Some(&bias_tid) = gate_op.inputs.get(2) {
+                            if let Some(bias_ptr) = resolver.materialize(p, bias_tid, abi) {
+                                let m_bound = seq_bound_override.cloned()
+                                    .unwrap_or_else(|| sym_map.to_bound(&m_dim));
+                                emit_bias_add(p, gate_scratch, bias_ptr, n, m_bound, ctx.width, ctx.dtype, sym_map);
+                            }
+                        }
+                    }
                     Ok(())
                 })?;
             }
@@ -342,6 +472,15 @@ pub(super) fn emit_fusion_group_by_mode(
                 };
                 prog.emit_scope(|p| -> Result<(), CompilerError> {
                     emit_gemm_inline_with_hook(p, &m_dim, n, k, ctx, up_input, up_weight, up_scratch, seq_bound_override, Some(up_op.id), pm, up_trans_b)?;
+                    if matches!(up_op.kind, OpKind::GemmBias { .. }) {
+                        if let Some(&bias_tid) = up_op.inputs.get(2) {
+                            if let Some(bias_ptr) = resolver.materialize(p, bias_tid, abi) {
+                                let m_bound = seq_bound_override.cloned()
+                                    .unwrap_or_else(|| sym_map.to_bound(&m_dim));
+                                emit_bias_add(p, up_scratch, bias_ptr, n, m_bound, ctx.width, ctx.dtype, sym_map);
+                            }
+                        }
+                    }
                     Ok(())
                 })?;
             }
