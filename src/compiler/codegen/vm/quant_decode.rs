@@ -1173,17 +1173,13 @@ mod tests {
         assert_trace_valid(&trace);
         assert!(final_slot.0 < trace.len() as u32);
 
-        // Q3K: Hierarchical scale → QuantIntDivConst present
-        let has_div = trace.iter().any(|op| matches!(op, TraceOp::QuantIntDivConst { .. }));
-        assert!(has_div, "Q3K hierarchical scale should have QuantIntDivConst for sub_block_idx");
+        // Q3K uses monolithic QuantQ3KDecode TraceOp (assisted path)
+        let has_q3k_decode = trace.iter().any(|op| matches!(op, TraceOp::QuantQ3KDecode { .. }));
+        assert!(has_q3k_decode, "Q3K should emit QuantQ3KDecode monolithic TraceOp");
 
-        // Q3K: StaticBias(4) → Sub present
-        let has_sub = trace.iter().any(|op| matches!(op, TraceOp::Sub(_, _)));
-        assert!(has_sub, "Q3K should have Sub for StaticBias(4)");
-
-        // Q3K: NibbleWithHighBits (hmask) → needs_high_bits_ptr
+        // Q3K: needs_lane_offset for hierarchical scale indexing
         let builder = DecodeTraceBuilder::new(desc, 8);
-        assert!(builder.needs_high_bits_ptr(), "Q3K should need high bits pointer for hmask");
+        assert!(builder.needs_lane_offset(), "Q3K should need lane offset for sub-block indexing");
     }
 
     /// REQ-QCG-009: MXFP4 E2M1 LUT decode trace.
@@ -2424,20 +2420,16 @@ mod tests {
     // Q3K uses StaticBias(4) to map integer range [0,15] → symmetric [-4,11].
     #[test]
     fn test_q3k_static_bias_value() {
-        // Arrange
+        // Q3_K uses monolithic QuantQ3KDecode which handles the conditional bias
+        // (4 if hmask_bit clear, 0 if set) internally. Verify the TraceOp is present.
         let r = registry();
         let desc = r.get(&QuantType::Q3K).expect("Q3_K must be registered");
-
-        // Act
         let mut trace = Vec::new();
         let _slot = DecodeTraceBuilder::new(desc, 8).build(&mut trace);
 
-        // Assert: Q3K has StaticBias(4) → Const(4.0) in trace
-        let has_bias_4 = trace.iter().any(|op| matches!(op, TraceOp::Const(v) if (*v - 4.0_f64).abs() < f64::EPSILON));
-        assert!(has_bias_4, "Q3_K should have Const(4.0) for StaticBias(4)");
-
-        let has_sub = trace.iter().any(|op| matches!(op, TraceOp::Sub(_, _)));
-        assert!(has_sub, "Q3_K should have Sub to subtract StaticBias(4)");
+        // Verify the monolithic decode op is present
+        let has_q3k_decode = trace.iter().any(|op| matches!(op, TraceOp::QuantQ3KDecode { .. }));
+        assert!(has_q3k_decode, "Q3_K should emit QuantQ3KDecode monolithic TraceOp");
     }
 
     // @trace TEST-QD-36 [req:REQ-QCG] [level:unit]

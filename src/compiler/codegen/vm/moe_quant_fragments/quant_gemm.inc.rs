@@ -453,21 +453,17 @@ pub(crate) fn emit_gemm_highbit_from_plan(
     } = *plan;
     let quant_row_stride = plan.quant_row_stride;
 
-    let biplane_mode = match high_bits {
-        1 => super::instr::BiPlaneMode::Low5,   // Q5_0, Q5_1, Q5_K: 4 low + 1 high = 5 bit
-        2 => super::instr::BiPlaneMode::Low6,   // Q6_K: 4 low + 2 high = 6 bit
-        _ => return Err(CompilerError::CodegenViolation(
-            format!("emit_gemm_highbit: unsupported high_bits={high_bits}, expected 1 or 2")
-        )),
-    };
-
     let acc = prog.alloc_vreg(VRegKind::Vec, width);
     let a_val = prog.alloc_vreg(VRegKind::Vec, width);
+    let nibble_vec = prog.alloc_vreg(VRegKind::Vec, width);
+    let qh_vec = prog.alloc_vreg(VRegKind::Vec, width);
     let w_merged = prog.alloc_vreg(VRegKind::Vec, width);
     let scale_vec = prog.alloc_vreg(VRegKind::Vec, width);
+    let bias_vec = prog.alloc_vreg(VRegKind::Vec, width);
     let hreduce_dst = prog.alloc_vreg(VRegKind::Vec, width);
     let zero_gpr = prog.alloc_vreg(VRegKind::Ptr, SimdWidth::Scalar);
     prog.emit(VmInstr::GprLoadImm { dst: zero_gpr, value: 0 });
+    prog.emit(VmInstr::Broadcast { dst: bias_vec, src: ScalarExpr::Const(bias), width, dtype });
 
     let blk_ptr_stride = prog.alloc_vreg(VRegKind::Ptr, SimdWidth::Scalar);
     let j_weight_stride = prog.alloc_vreg(VRegKind::Ptr, SimdWidth::Scalar);
@@ -477,6 +473,17 @@ pub(crate) fn emit_gemm_highbit_from_plan(
     prog.emit(VmInstr::GprLoadImm { dst: act_stride_reg, value: block_size * elem });
 
     let k_act_base = prog.alloc_vreg(VRegKind::Ptr, SimdWidth::Scalar);
+
+    // INT5/INT6 nibble packing: each byte stores 2 elements (low nibble = elem i, high nibble = elem i+half).
+    // Two-phase approach (same as Assisted Q4_0):
+    //   Phase A: low nibbles → sequential elements [0..7], activation at current offset
+    //   Phase B: high nibbles → sequential elements [half..half+7], activation at +half_block offset
+    // Each phase also merges high-bit-plane (qh) values.
+    let nibble_iters = iters_per_block / 2;
+    let half_block_elem = block_size / 2 * elem;
+
+    // qh bit value: for INT5, bit_value=16 (bit 4); for INT6, bit_value=16 (bit 4) per bit
+    let qh_bit_value = (1u32 << (high_bits as u32 * 4)) as f32; // 1<<4 = 16 for INT5
 
     let do_m_block = |prog: &mut VmProgram, i_cnt, weight_row_ptr| -> Result<(), CompilerError> {
         prog.emit_loop_try(BoundExpr::Const(n), elem, |prog, _j_ctr, j_off| -> Result<(), CompilerError> {
@@ -488,7 +495,7 @@ pub(crate) fn emit_gemm_highbit_from_plan(
 
             prog.emit_loop_try(BoundExpr::Const(gguf_num_blocks), block_bytes,
                 |prog, _blk_ctr, _blk_off| -> Result<(), CompilerError> {
-                    // 1. 加载 scale (f16 broadcast or f16 d+m)
+                    // 1. Load scale
                     match &desc.scale_layout {
                         crate::quant_format::ScaleLayout::BlockScalar { .. } => {
                             prog.emit(VmInstr::QuantBlockLoad {
@@ -498,7 +505,6 @@ pub(crate) fn emit_gemm_highbit_from_plan(
                             });
                         }
                         crate::quant_format::ScaleLayout::BlockScalarWithMin { d_offset, m_offset, .. } => {
-                            // Load d (scale) and m (min), compute effective scale = d * x + m
                             let d_vec = prog.alloc_vreg(VRegKind::Vec, width);
                             let m_vec = prog.alloc_vreg(VRegKind::Vec, width);
                             prog.emit(VmInstr::QuantBlockLoad {
@@ -511,18 +517,15 @@ pub(crate) fn emit_gemm_highbit_from_plan(
                                 offset: OffsetExpr::Const(*m_offset),
                                 unpack: BlockUnpackMode::F16Broadcast, width,
                             });
-                            // scale_vec = d (used for weight scaling), min handled in epilogue
                             prog.emit(VmInstr::VecBinOp { dst: scale_vec, a: d_vec, b: m_vec, op: VecOp::Add, dtype: QuantPrecision::F32 });
                         }
-                        // Hierarchical (Q5_K) and Q6KScales (Q6_K) are routed to DequantFma
-                        // by QuantGemmPlan::derive — they never reach this path.
                         _ => unreachable!(
                             "emit_gemm_highbit: Hierarchical/Q6KScales/ExternalArray/SubBlockScalars \
                              should use DequantFma path"
                         ),
                     }
 
-                    // 2. 构建低 bit 平面和高 bit 平面的指针
+                    // 2. Build qs_ptr and qh_ptr
                     let qs_ptr = prog.alloc_vreg(VRegKind::Ptr, SimdWidth::Scalar);
                     if low_offset > 0 {
                         let off_reg = prog.alloc_vreg(VRegKind::Ptr, SimdWidth::Scalar);
@@ -541,40 +544,90 @@ pub(crate) fn emit_gemm_highbit_from_plan(
                         prog.emit(VmInstr::GprBinOp { dst: qh_ptr, a: blk_ptr, b: GprOperand::VReg(zero_gpr), op: GprOp::Add });
                     }
 
-                    // 3. 内层循环: per-lane BiPlaneLoad + scale + FMA
-                    prog.emit_loop_try(BoundExpr::Const(iters_per_block), lanes * elem,
+                    // 3. Inner loop: two-phase FMA per iteration
+                    //    Each iteration processes `lanes` low-nibble elements + `lanes` high-nibble elements
+                    //    = 2*lanes block positions from `lanes` packed bytes.
+                    prog.emit_loop_try(BoundExpr::Const(nibble_iters), lanes * elem,
                         |prog, _ei_ctr, ei_off| -> Result<(), CompilerError> {
-                            // Load activation
-                            let act_off = OffsetExpr::Add(
+                            // ── Phase A: Low nibbles ──
+                            let lo_act_off = OffsetExpr::Add(
                                 Box::new(OffsetExpr::Add(
                                     Box::new(OffsetExpr::Mul(Box::new(OffsetExpr::LoopOffset(i_cnt)), a_row_stride)),
                                     Box::new(OffsetExpr::ScalarVReg(k_act_base)),
                                 )),
                                 Box::new(OffsetExpr::LoopOffset(ei_off)),
                             );
-                            prog.emit(VmInstr::VecLoad { dst: a_val, base: input_ptr, offset: act_off, width, dtype });
+                            prog.emit(VmInstr::VecLoad { dst: a_val, base: input_ptr, offset: lo_act_off, width, dtype });
 
-                            // BiPlaneLoad: merge low nibbles + high bits, subtract bias → F32
-                            prog.emit(VmInstr::QuantBiPlaneLoad {
-                                dst: w_merged,
-                                qs_base: qs_ptr,
-                                extra_base: qh_ptr,
-                                bias,
-                                mode: biplane_mode,
-                                width,
+                            prog.emit(VmInstr::QuantBlockLoad {
+                                dst: nibble_vec, base: qs_ptr,
+                                offset: OffsetExpr::Const(0),
+                                unpack: BlockUnpackMode::UnsignedNibbleLow, width,
                             });
-
-                            // Scale: w_merged = w_merged * scale
+                            prog.emit(VmInstr::QuantBlockLoad {
+                                dst: qh_vec, base: qh_ptr,
+                                offset: OffsetExpr::Const(0),
+                                unpack: BlockUnpackMode::QhBitExpand { bit_value: qh_bit_value }, width,
+                            });
+                            // Merge: nibble + qh → INT5 value
+                            prog.emit(VmInstr::VecBinOp { dst: w_merged, a: nibble_vec, b: qh_vec, op: VecOp::Add, dtype: QuantPrecision::F32 });
+                            // Subtract bias
+                            prog.emit(VmInstr::VecBinOp { dst: w_merged, a: w_merged, b: bias_vec, op: VecOp::Sub, dtype: QuantPrecision::F32 });
+                            // Scale
                             prog.emit(VmInstr::VecBinOp { dst: w_merged, a: w_merged, b: scale_vec, op: VecOp::Mul, dtype: QuantPrecision::F32 });
-
-                            // FMA: acc += a_val * w_merged
+                            // FMA
                             prog.emit(VmInstr::Fma { dst: acc, acc, a: a_val, b: w_merged, dtype });
 
-                            // Advance qs_ptr by data_step (low nibble plane bytes per iteration)
-                            let qs_step = plan.data_step.max(1);
+                            // ── Phase B: High nibbles ──
+                            let hi_act_off = OffsetExpr::Add(
+                                Box::new(OffsetExpr::Add(
+                                    Box::new(OffsetExpr::Mul(Box::new(OffsetExpr::LoopOffset(i_cnt)), a_row_stride)),
+                                    Box::new(OffsetExpr::Add(
+                                        Box::new(OffsetExpr::ScalarVReg(k_act_base)),
+                                        Box::new(OffsetExpr::Const(half_block_elem)),
+                                    )),
+                                )),
+                                Box::new(OffsetExpr::LoopOffset(ei_off)),
+                            );
+                            prog.emit(VmInstr::VecLoad { dst: a_val, base: input_ptr, offset: hi_act_off, width, dtype });
+
+                            prog.emit(VmInstr::QuantBlockLoad {
+                                dst: nibble_vec, base: qs_ptr,
+                                offset: OffsetExpr::Const(0),
+                                unpack: BlockUnpackMode::UnsignedNibbleHigh, width,
+                            });
+                            // Load next qh byte for high-nibble elements
+                            // Phase A reads qh byte N (for elements 0-7 of this iteration).
+                            // Phase B reads qh byte N+2 (for elements 16-23 of this iteration).
+                            // Q5_0 qh layout: byte 0=bits 0-7, byte 1=bits 8-15, byte 2=bits 16-23, byte 3=bits 24-31.
+                            // Low nibble elements [i*8..i*8+7] use qh byte i; high nibble elements use qh byte i+2.
+                            let qh_hi_off_reg = prog.alloc_vreg(VRegKind::Ptr, SimdWidth::Scalar);
+                            prog.emit(VmInstr::GprLoadImm { dst: qh_hi_off_reg, value: 2usize });
+                            let qh_hi_ptr = prog.alloc_vreg(VRegKind::Ptr, SimdWidth::Scalar);
+                            prog.emit(VmInstr::GprBinOp { dst: qh_hi_ptr, a: qh_ptr, b: GprOperand::VReg(qh_hi_off_reg), op: GprOp::Add });
+                            prog.emit(VmInstr::QuantBlockLoad {
+                                dst: qh_vec, base: qh_hi_ptr,
+                                offset: OffsetExpr::Const(0),
+                                unpack: BlockUnpackMode::QhBitExpand { bit_value: qh_bit_value }, width,
+                            });
+                            // Merge: nibble + qh → INT5 value
+                            prog.emit(VmInstr::VecBinOp { dst: w_merged, a: nibble_vec, b: qh_vec, op: VecOp::Add, dtype: QuantPrecision::F32 });
+                            // Subtract bias
+                            prog.emit(VmInstr::VecBinOp { dst: w_merged, a: w_merged, b: bias_vec, op: VecOp::Sub, dtype: QuantPrecision::F32 });
+                            // Scale
+                            prog.emit(VmInstr::VecBinOp { dst: w_merged, a: w_merged, b: scale_vec, op: VecOp::Mul, dtype: QuantPrecision::F32 });
+                            // FMA
+                            prog.emit(VmInstr::Fma { dst: acc, acc, a: a_val, b: w_merged, dtype });
+
+                            // Advance qs_ptr by `lanes` bytes (8 bytes per iteration, low+high from same bytes)
                             let qs_step_reg = prog.alloc_vreg(VRegKind::Ptr, SimdWidth::Scalar);
-                            prog.emit(VmInstr::GprLoadImm { dst: qs_step_reg, value: qs_step });
+                            prog.emit(VmInstr::GprLoadImm { dst: qs_step_reg, value: lanes });
                             prog.emit(VmInstr::GprBinOp { dst: qs_ptr, a: qs_ptr, b: GprOperand::VReg(qs_step_reg), op: GprOp::Add });
+
+                            // Advance qh_ptr by 1 byte per iteration (Phase A reads qh[N], Phase B reads qh[N+2])
+                            let qh_step_reg = prog.alloc_vreg(VRegKind::Ptr, SimdWidth::Scalar);
+                            prog.emit(VmInstr::GprLoadImm { dst: qh_step_reg, value: 1usize });
+                            prog.emit(VmInstr::GprBinOp { dst: qh_ptr, a: qh_ptr, b: GprOperand::VReg(qh_step_reg), op: GprOp::Add });
                             Ok(())
                         },
                     )?;

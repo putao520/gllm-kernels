@@ -748,6 +748,58 @@ mod quant_gemv_tests {
         }
     }
 
+    // ── Q4_K GEMV build ───────────────────────────────────────────────────
+
+    fn build_q4_k_gemv_prog(k: usize, n: usize) -> VmProgram {
+        let mut prog = VmProgram::new();
+        let input_ptr = prog.alloc_vreg(VRegKind::Ptr, SimdWidth::Scalar);
+        let weight_ptr = prog.alloc_vreg(VRegKind::Ptr, SimdWidth::Scalar);
+        let output_ptr = prog.alloc_vreg(VRegKind::Ptr, SimdWidth::Scalar);
+
+        prog.emit(VmInstr::LoadPtr { dst: input_ptr, src: PtrExpr::AbiArg(0) });
+        prog.emit(VmInstr::LoadPtr { dst: weight_ptr, src: PtrExpr::AbiArg(1) });
+        prog.emit(VmInstr::LoadPtr { dst: output_ptr, src: PtrExpr::StackArg(24) });
+
+        emit_quant_gemm_inline(
+            &mut prog,
+            BoundExpr::Const(1),
+            n, k,
+            QuantType::Q4K,
+            SimdWidth::W256,
+            input_ptr, weight_ptr, output_ptr,
+            QuantPrecision::F32,
+            DotProductCap::SimdAssisted,
+        ).expect("Q4_K GEMV emit should succeed");
+
+        prog
+    }
+
+    // ── Q5_0 GEMV build ───────────────────────────────────────────────────
+
+    fn build_q5_0_gemv_prog(k: usize, n: usize) -> VmProgram {
+        let mut prog = VmProgram::new();
+        let input_ptr = prog.alloc_vreg(VRegKind::Ptr, SimdWidth::Scalar);
+        let weight_ptr = prog.alloc_vreg(VRegKind::Ptr, SimdWidth::Scalar);
+        let output_ptr = prog.alloc_vreg(VRegKind::Ptr, SimdWidth::Scalar);
+
+        prog.emit(VmInstr::LoadPtr { dst: input_ptr, src: PtrExpr::AbiArg(0) });
+        prog.emit(VmInstr::LoadPtr { dst: weight_ptr, src: PtrExpr::AbiArg(1) });
+        prog.emit(VmInstr::LoadPtr { dst: output_ptr, src: PtrExpr::StackArg(24) });
+
+        emit_quant_gemm_inline(
+            &mut prog,
+            BoundExpr::Const(1),
+            n, k,
+            QuantType::Q5_0,
+            SimdWidth::W256,
+            input_ptr, weight_ptr, output_ptr,
+            QuantPrecision::F32,
+            DotProductCap::SimdAssisted,
+        ).expect("Q5_0 GEMV emit should succeed");
+
+        prog
+    }
+
     /// Diagnostic test: dump VmInstr sequence + register allocation for Q4_0 GEMV K=32 N=1
     /// to identify why the FMA accumulator is not accumulating across ei loop iterations.
     #[test]

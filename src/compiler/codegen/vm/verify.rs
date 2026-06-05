@@ -723,6 +723,7 @@ pub fn verify_quant_offsets(
                     | BlockUnpackMode::SignedNibbleHigh | BlockUnpackMode::UnsignedNibbleHigh => 1,
                     BlockUnpackMode::Bitpack2 { .. } => 1,
                     BlockUnpackMode::Mxfp4 { .. } | BlockUnpackMode::Nvfp4 { .. } => 1,
+                    BlockUnpackMode::QhBitExpand { .. } => 1,
                 };
 
                 // Check Const offset alignment to block_bytes (not elem_bytes)

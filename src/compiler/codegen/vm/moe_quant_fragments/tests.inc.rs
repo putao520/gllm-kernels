@@ -117,7 +117,7 @@ mod tests {
     }
 
     #[test]
-    fn test_q5_0_emit_gemm_produces_biplane_load() {
+    fn test_q5_0_emit_gemm_uses_highbit_merge() {
         let mut prog = super::super::instr::VmProgram::new();
         let input_ptr = prog.alloc_vreg(VRegKind::Ptr, SimdWidth::Scalar);
         let weight_ptr = prog.alloc_vreg(VRegKind::Ptr, SimdWidth::Scalar);
@@ -131,8 +131,11 @@ mod tests {
 
         assert!(result.is_ok(), "Q5_0 emit failed: {:?}", result.err());
         assert!(prog.instrs.len() > 10, "Q5_0 GEMM should produce > 10 instrs, got {}", prog.instrs.len());
-        let has_biplane = prog.instrs.iter().any(|i| matches!(i, VmInstr::QuantBiPlaneLoad { .. }));
-        assert!(has_biplane, "Q5_0 GEMM should emit QuantBiPlaneLoad");
+        // Q5_0 uses HighBitMerge path: QuantBlockLoad with QhBitExpand
+        let has_qh_expand = prog.instrs.iter().any(|i| matches!(
+            i, VmInstr::QuantBlockLoad { unpack: BlockUnpackMode::QhBitExpand { .. }, .. }
+        ));
+        assert!(has_qh_expand, "Q5_0 GEMM should emit QuantBlockLoad with QhBitExpand");
     }
 
     // ── Additional format coverage tests ─────────────────────────────────

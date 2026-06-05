@@ -351,6 +351,9 @@ impl GpuLower {
             BlockUnpackMode::Nvfp4 { scale_src } => {
                 self.emit_nvfp4_sub_block_dequant_gpu(dst, base, offset, *scale_src, width, alloc)
             }
+            BlockUnpackMode::QhBitExpand { .. } => {
+                Err(CompilerError::CodegenViolation("QhBitExpand: GPU not yet implemented".into()))
+            }
         }
     }
 

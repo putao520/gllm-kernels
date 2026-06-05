@@ -773,6 +773,67 @@ impl X86Lower {
             BlockUnpackMode::Nvfp4 { scale_src } => {
                 self.emit_nvfp4_sub_block_dequant(dst, base, offset, *scale_src, *width, alloc)
             }
+
+            BlockUnpackMode::QhBitExpand { bit_value } => {
+                let lanes = width.f32_lanes().max(1);
+                if lanes != 8 {
+                    return Err(CompilerError::CodegenViolation(
+                        format!("QhBitExpand: only 8 lanes supported, got {}", lanes)
+                    ));
+                }
+                let (dst_ymm, dst_spilled) = self.resolve_ymm_or_spill_write(dst, alloc, 2)?;
+                let base_reg = self.resolve_gpr_read(base, alloc, 2)?;
+                self.eval_offset_to_rax(offset, alloc)?;
+                self.asm.add(rax, base_reg).map_err(Self::err)?;
+
+                // Save qh address in a scratch GPR before using rax for constants
+                let addr_reg = self.scratch_gprs[1]; // r10
+                self.asm.mov(addr_reg, rax).map_err(Self::err)?;
+
+                let scratch_xmm = self.scratch_xmm(0);
+                let scratch_ymm = self.scratch_ymm(0);
+                let qh_xmm = self.scratch_xmm(2);
+                let qh_ymm = self.scratch_ymm(2);
+
+                // Bit-position mask: [1,2,4,8,16,32,64,128]
+                self.asm.mov(rax, 0x8040201008040201u64).map_err(Self::err)?;
+                self.asm.vmovq(scratch_xmm, rax).map_err(Self::err)?;
+                self.asm.vpbroadcastq(scratch_ymm, scratch_xmm).map_err(Self::err)?;
+
+                // Load qh byte from saved address → broadcast
+                self.asm.movzx(rax, byte_ptr(addr_reg)).map_err(Self::err)?;
+                self.asm.vmovd(qh_xmm, eax).map_err(Self::err)?;
+                self.asm.vpbroadcastb(qh_ymm, qh_xmm).map_err(Self::err)?;
+
+                // AND with bit mask
+                self.asm.vpand(qh_ymm, qh_ymm, scratch_ymm).map_err(Self::err)?;
+
+                // Non-zero → 0xFF per byte (unsigned-aware).
+                // vpcmpgtb is signed: 0x80 = -128 > 0 = false — breaks bit 7.
+                // Use pcmpeqb + invert instead: detect zero, then XOR with all-ones.
+                let ones_ymm = self.scratch_ymm(1);
+                self.asm.vpcmpeqb(ones_ymm, ones_ymm, ones_ymm).map_err(Self::err)?;
+                self.asm.vpxor(scratch_ymm, scratch_ymm, scratch_ymm).map_err(Self::err)?;
+                self.asm.vpcmpeqb(scratch_ymm, qh_ymm, scratch_ymm).map_err(Self::err)?;
+                self.asm.vpxor(qh_ymm, ones_ymm, scratch_ymm).map_err(Self::err)?;
+
+                // AND with bit_value as byte (e.g., 16 = 0x10 for INT5)
+                let bv = *bit_value as i32;
+                self.asm.mov(rax, ((bv as u64) * 0x0101010101010101u64)).map_err(Self::err)?;
+                self.asm.vmovq(scratch_xmm, rax).map_err(Self::err)?;
+                self.asm.vpbroadcastb(scratch_ymm, scratch_xmm).map_err(Self::err)?;
+                self.asm.vpand(qh_ymm, qh_ymm, scratch_ymm).map_err(Self::err)?;
+
+                // Expand 8 bytes → 8 × i32
+                let qh_xmm2 = Self::ymm_to_xmm(qh_ymm);
+                self.asm.vpmovzxbd(dst_ymm, qh_xmm2).map_err(Self::err)?;
+
+                // Convert to f32
+                self.asm.vcvtdq2ps(dst_ymm, dst_ymm).map_err(Self::err)?;
+
+                if dst_spilled { self.spill_store_ymm(dst, alloc, 2)?; }
+                Ok(())
+            }
         }
     }
 

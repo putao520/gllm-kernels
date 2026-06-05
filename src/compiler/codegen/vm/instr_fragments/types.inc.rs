@@ -459,6 +459,9 @@ pub enum BlockUnpackMode {
     Bitpack2 { bias: f32 },
     Mxfp4 { scale_src: VRegId },
     Nvfp4 { scale_src: VRegId },
+    /// Q5_0/Q5_1 high-bit plane expand: load 1 byte from base, expand each of 8 bits
+    /// to f32 (0.0 or `bit_value`). Used for INT5/INT6 qh plane in two-phase GEMV.
+    QhBitExpand { bit_value: f32 },
 }
 
 impl BlockUnpackMode {
@@ -489,6 +492,7 @@ impl BlockUnpackMode {
             Self::Bitpack2 { .. } => 8,
             Self::Mxfp4 { .. } => 16,
             Self::Nvfp4 { .. } => 16,
+            Self::QhBitExpand { .. } => 1,
         }
     }
 }

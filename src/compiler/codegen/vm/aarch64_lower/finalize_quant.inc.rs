@@ -311,6 +311,9 @@ impl AArch64Lower {
             BlockUnpackMode::Nvfp4 { scale_src } => {
                 self.emit_nvfp4_sub_block_dequant(dst, base, offset, *scale_src, width, alloc)
             }
+            BlockUnpackMode::QhBitExpand { .. } => {
+                Err(CompilerError::CodegenViolation("QhBitExpand: AArch64 not yet implemented".into()))
+            }
         }
     }
 
