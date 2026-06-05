@@ -45,7 +45,9 @@ mod tests {
     }
 
     #[test]
-    fn test_q6_k_selects_highbit_merge() {
+    fn test_q6_k_selects_dequant_fma() {
+        // Q6_K has Q6KScales scale layout → routed to DequantFma which handles
+        // the per-sub-block scale + StaticBias(32) via DecodeTraceBuilder.
         let desc = QuantAlgoKind::Q6K.descriptor();
         let plan = QuantGemmPlan::derive(
             BoundExpr::Const(1), 1, 256, &desc, SimdWidth::W256,
@@ -53,11 +55,8 @@ mod tests {
         ).expect("Q6_K plan derive should succeed");
 
         match &plan.kernel {
-            GemmKernel::HighBitMerge { bias, high_bits, .. } => {
-                assert_eq!(*high_bits, 2);
-                assert_eq!(*bias, 32.0);
-            }
-            other => panic!("Q6_K should select HighBitMerge, got {:?}", other),
+            GemmKernel::DequantFma => {}
+            other => panic!("Q6_K should select DequantFma (Q6KScales scale), got {:?}", other),
         }
     }
 
@@ -167,7 +166,9 @@ mod tests {
     }
 
     #[test]
-    fn test_q5k_selects_highbit_merge() {
+    fn test_q5k_selects_dequant_fma() {
+        // Q5_K has Hierarchical scale layout → routed to DequantFma which handles
+        // the packed sub-scale decode + Hierarchical zero (dmin * sub_m) via DecodeTraceBuilder.
         let desc = QuantAlgoKind::Q5K.descriptor();
         let plan = QuantGemmPlan::derive(
             BoundExpr::Const(1), 1, 256, &desc, SimdWidth::W256,
@@ -175,11 +176,8 @@ mod tests {
         ).expect("Q5K plan derive should succeed");
 
         match &plan.kernel {
-            GemmKernel::HighBitMerge { bias, high_bits, .. } => {
-                assert_eq!(*bias, 0.0);
-                assert!(*high_bits >= 1, "Q5K high_bits should be >= 1");
-            }
-            other => panic!("Q5K should select HighBitMerge, got {:?}", other),
+            GemmKernel::DequantFma => {}
+            other => panic!("Q5_K should select DequantFma (Hierarchical scale), got {:?}", other),
         }
     }
 

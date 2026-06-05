@@ -500,9 +500,12 @@ pub(crate) fn emit_gemm_highbit_from_plan(
                             // scale_vec = d (used for weight scaling), min handled in epilogue
                             prog.emit(VmInstr::VecBinOp { dst: scale_vec, a: d_vec, b: m_vec, op: VecOp::Add, dtype: QuantPrecision::F32 });
                         }
-                        other => return Err(CompilerError::CodegenViolation(
-                            format!("emit_gemm_highbit: unsupported scale_layout {:?}", other)
-                        )),
+                        // Hierarchical (Q5_K) and Q6KScales (Q6_K) are routed to DequantFma
+                        // by QuantGemmPlan::derive — they never reach this path.
+                        _ => unreachable!(
+                            "emit_gemm_highbit: Hierarchical/Q6KScales/ExternalArray/SubBlockScalars \
+                             should use DequantFma path"
+                        ),
                     }
 
                     // 2. 构建低 bit 平面和高 bit 平面的指针

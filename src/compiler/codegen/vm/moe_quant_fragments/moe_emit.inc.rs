@@ -784,9 +784,17 @@ impl QuantGemmPlan {
                 let data_offset = match &desc.data_layout { DataLayout::Bytes { offset, .. } | DataLayout::PackedNibbles { offset, .. } => *offset, _ => 0 };
                 let scale_offset = match &desc.scale_layout { ScaleLayout::BlockScalar { offset_bytes, .. } => *offset_bytes, _ => 0 };
                 GemmKernel::Assisted { scale_offset, data_offset }
-            } else if matches!(desc.data_kind, DK::PackedInt5 | DK::PackedInt6) {
+            } else if matches!(desc.data_kind, DK::PackedInt5 | DK::PackedInt6)
+                && matches!(
+                    &desc.scale_layout,
+                    ScaleLayout::BlockScalar { .. } | ScaleLayout::BlockScalarWithMin { .. }
+                )
+            {
                 // INT5/INT6 HighBitMerge path (REQ-QCG-006):
                 // Uses QuantBiPlaneLoad to merge low nibbles + high bit-plane.
+                // Only selected for flat scale layouts (BlockScalar / BlockScalarWithMin).
+                // Hierarchical (Q5_K) / Q6KScales (Q6_K) formats fall through to DequantFma
+                // which handles complex scale + zero layouts via DecodeTraceBuilder.
                 let (low_offset, high_offset, high_bits) = match &desc.data_layout {
                     DataLayout::NibbleWithHighBits { low_offset, high_offset, high_bits_per_elem } =>
                         (*low_offset, *high_offset, *high_bits_per_elem),
@@ -797,7 +805,7 @@ impl QuantGemmPlan {
                 let scale_offset = match &desc.scale_layout {
                     ScaleLayout::BlockScalar { offset_bytes, .. } => *offset_bytes,
                     ScaleLayout::BlockScalarWithMin { d_offset, .. } => *d_offset,
-                    _ => 0,
+                    _ => unreachable!("guarded by outer match"),
                 };
                 let bias = match &desc.zero_layout {
                     crate::quant_format::ZeroLayout::StaticBias { value } => *value as f32,
