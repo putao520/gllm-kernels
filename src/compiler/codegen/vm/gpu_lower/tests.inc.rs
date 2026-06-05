@@ -1563,6 +1563,7 @@ mod tests {
             embed_ptr,
             output_ptr,
             crate::compiler::trace::QuantPrecision::F32,
+            None,
         );
 
         // QuantGather should succeed for Q4_0

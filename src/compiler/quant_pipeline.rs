@@ -122,6 +122,7 @@ impl QuantPipeline {
             embed_ptr,
             output_ptr,
             self.compute_dtype,
+            None,
         )
     }
 

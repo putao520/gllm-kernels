@@ -397,6 +397,7 @@ pub(crate) fn dispatch_structural(
             emit_quant_gather_inline(
                 prog, seq_bound, *vocab_size, *hidden_dim, *quant_type,
                 ctx.width, input_ptr, weight_ptr, output_ptr, ctx.dtype,
+                graph.embedding_scale,
             )?;
             Ok(())
         }

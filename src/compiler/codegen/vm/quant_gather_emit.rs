@@ -3,7 +3,7 @@
 use super::instr::*;
 use super::auto_select;
 use super::quant_offset_dsl::QuantOffsetDsl;
-use crate::compiler::trace::QuantPrecision;
+use crate::compiler::trace::{QuantPrecision, TraceOp, ValueId};
 use crate::types::CompilerError;
 
 /// QuantGather: embedding lookup on quantized weight table (ARCH-RUST-IS-CODEGEN §4.2 REQ-QCG-005).
@@ -31,6 +31,7 @@ pub(crate) fn emit_quant_gather_inline(
     embed_ptr: VRegId,     // weight: quantized embed table
     output_ptr: VRegId,    // output: F32 [seq_len, hidden_dim]
     dtype: QuantPrecision,
+    embedding_scale: Option<f32>,
 ) -> Result<(), CompilerError> {
     let desc = crate::quant_format::registry().get(&quant_type)
         .cloned()
@@ -55,7 +56,7 @@ pub(crate) fn emit_quant_gather_inline(
 
     emit_quant_gather_trace_driven(
         prog, seq_bound, hidden_dim, &desc, quant_type, width,
-        indices_ptr, embed_ptr, output_ptr, dtype,
+        indices_ptr, embed_ptr, output_ptr, dtype, embedding_scale,
     )
 }
 
@@ -80,6 +81,7 @@ fn emit_quant_gather_trace_driven(
     embed_ptr: VRegId,
     output_ptr: VRegId,
     dtype: QuantPrecision,
+    embedding_scale: Option<f32>,
 ) -> Result<(), CompilerError> {
     // REQ-LC-007/009: 所有偏移通过 QuantOffsetDsl derive 方法推导
     // REQ-LC-011: 编译时数值模拟 — 验证解量化不产生 NaN/Inf
@@ -234,6 +236,27 @@ fn emit_quant_gather_trace_driven(
                                 format!("QuantGather: decode trace produced no output for {:?}", quant_type)
                             ))?;
 
+                        // Apply embedding_scale (e.g. Gemma 4: sqrt(hidden_size))
+                        let store_src = if let Some(s) = embedding_scale {
+                            let scale_trace = vec![
+                                TraceOp::Const(s as f64),
+                                TraceOp::Input(0),
+                                TraceOp::Mul(ValueId(0), ValueId(1)),
+                            ];
+                            let scale_inputs = vec![decoded];
+                            let scale_slots = auto_select::auto_lower_trace_raw(
+                                prog, &scale_trace, &scale_inputs, width, QuantPrecision::F32,
+                            ).map_err(|e| CompilerError::CodegenViolation(
+                                format!("QuantGather: embedding_scale auto_lower failed: {:?}", e)
+                            ))?;
+                            scale_slots.last().copied()
+                                .ok_or_else(|| CompilerError::CodegenViolation(
+                                    "QuantGather: scale trace produced no output".into()
+                                ))?
+                        } else {
+                            decoded
+                        };
+
                         // REQ-LC-008/009: 输出偏移 = blk_ctr * block_size * compute_elem_bytes + sub_off
                         // block_size * compute_elem_bytes 是输出缓冲区的步进 (不是量化数据的 block_bytes)
                         // derive_output_block_offset 使用 compute_elem_bytes, 不使用 block_bytes
@@ -247,7 +270,7 @@ fn emit_quant_gather_trace_driven(
                         prog.emit(VmInstr::VecStore {
                             base: out_row,
                             offset: out_offset,
-                            src: decoded,
+                            src: store_src,
                             width,
                             dtype,
                         });
@@ -492,6 +515,7 @@ mod tests {
             SimdWidth::W256,
             idx, emb, out,
             QuantPrecision::F32,
+            None,
         );
 
         // Assert
@@ -521,6 +545,7 @@ mod tests {
             SimdWidth::W256,
             idx, emb, out,
             QuantPrecision::F32,
+            None,
         );
 
         // Assert
@@ -553,6 +578,7 @@ mod tests {
             SimdWidth::W256,
             idx, emb, out,
             QuantPrecision::F32,
+            None,
         );
 
         // Assert: must succeed and produce instructions
@@ -577,6 +603,7 @@ mod tests {
             SimdWidth::W256,
             idx, emb, out,
             QuantPrecision::F32,
+            None,
         );
 
         // Assert
@@ -601,6 +628,7 @@ mod tests {
             SimdWidth::W256,
             idx, emb, out,
             QuantPrecision::F32,
+            None,
         );
         assert!(result.is_ok());
 
@@ -632,6 +660,7 @@ mod tests {
             SimdWidth::W256,
             idx, emb, out,
             QuantPrecision::F32,
+            None,
         ).unwrap();
 
         // Assert: must have at least one LoopBegin and LoopEnd
@@ -658,6 +687,7 @@ mod tests {
             SimdWidth::W256,
             idx, emb, out,
             QuantPrecision::F32,
+            None,
         ).unwrap();
 
         // Assert: must have ScalarLoad for loading token_id
@@ -684,6 +714,7 @@ mod tests {
             SimdWidth::W256,
             idx, emb, out,
             QuantPrecision::F32,
+            None,
         ).unwrap();
 
         // Assert: must have ScalarToIndex for row_base = token_id * row_stride
@@ -710,6 +741,7 @@ mod tests {
             SimdWidth::W256,
             idx, emb, out,
             QuantPrecision::F32,
+            None,
         ).unwrap();
 
         // Assert: must have VecStore for writing decoded F32 output
@@ -736,6 +768,7 @@ mod tests {
             SimdWidth::W256,
             idx, emb, out,
             QuantPrecision::F32,
+            None,
         );
 
         // Assert
@@ -761,6 +794,7 @@ mod tests {
             SimdWidth::W256,
             idx, emb, out,
             QuantPrecision::F32,
+            None,
         ).unwrap();
 
         // Assert: find the block loop (inner loop with BoundExpr::Const(4))
@@ -799,6 +833,7 @@ mod tests {
             SimdWidth::W256,
             idx, emb, out,
             QuantPrecision::F32,
+            None,
         );
 
         // Assert: Symbolic bound should work (seq dimension is dynamic)
@@ -833,6 +868,7 @@ mod tests {
             SimdWidth::W256,
             idx, emb, out,
             QuantPrecision::F32,
+            None,
         ).unwrap();
 
         // Assert: emit should have allocated additional VRegs for temporaries
@@ -860,6 +896,7 @@ mod tests {
             SimdWidth::W256,
             idx, emb, out,
             QuantPrecision::F32,
+            None,
         ).unwrap();
 
         // Assert: must have LoadPtr for row_ptr = embed_ptr + row_base
@@ -886,6 +923,7 @@ mod tests {
             SimdWidth::W256,
             idx, emb, out,
             QuantPrecision::F32,
+            None,
         ).unwrap();
 
         // Assert: must have GprLoadImm for lane_offset = 0 initialization
@@ -912,6 +950,7 @@ mod tests {
             SimdWidth::W256,
             idx, emb, out,
             QuantPrecision::F32,
+            None,
         );
 
         // Assert
@@ -936,6 +975,7 @@ mod tests {
             SimdWidth::W256,
             idx, emb, out,
             QuantPrecision::F32,
+            None,
         ).unwrap();
 
         // Assert: comment should mention hidden=64 and block_size=32
@@ -968,6 +1008,7 @@ mod tests {
             SimdWidth::W256,
             idx, emb, out,
             QuantPrecision::F32,
+            None,
         );
 
         // Assert
@@ -994,6 +1035,7 @@ mod tests {
             SimdWidth::W256,
             idx, emb, out,
             QuantPrecision::F32,
+            None,
         ).unwrap();
 
         // Assert: should have 3 nested LoopBegin (seq, block, sub_block)
@@ -1018,6 +1060,7 @@ mod tests {
             SimdWidth::W512,
             idx, emb, out,
             QuantPrecision::F32,
+            None,
         );
 
         // Assert: W512 should also work (more lanes per vector)
@@ -1042,6 +1085,7 @@ mod tests {
             SimdWidth::W256,
             idx1, emb1, out1,
             QuantPrecision::F32,
+            None,
         ).unwrap();
         let len1 = prog1.len();
 
@@ -1054,6 +1098,7 @@ mod tests {
             SimdWidth::W256,
             idx2, emb2, out2,
             QuantPrecision::F32,
+            None,
         ).unwrap();
         let len2 = prog2.len();
 
@@ -1081,6 +1126,7 @@ mod tests {
             SimdWidth::W256,
             idx, emb, out,
             QuantPrecision::BF16,
+            None,
         );
 
         // Assert: BF16 output should succeed (decode to F32 then store as BF16)
@@ -1105,6 +1151,7 @@ mod tests {
             SimdWidth::W256,
             idx, emb, out,
             QuantPrecision::F32,
+            None,
         );
 
         // Assert: Q6K must succeed with NibbleWithHighBits + lane offset path
@@ -1129,6 +1176,7 @@ mod tests {
             SimdWidth::W256,
             idx, emb, out,
             QuantPrecision::F32,
+            None,
         ).unwrap();
 
         // Assert: program should contain AddPtr for constructing high_bits_ptr
@@ -1155,6 +1203,7 @@ mod tests {
             SimdWidth::W256,
             idx, emb, out,
             QuantPrecision::F32,
+            None,
         );
 
         // Assert
@@ -1180,6 +1229,7 @@ mod tests {
             SimdWidth::W256,
             idx, emb, out,
             QuantPrecision::F32,
+            None,
         );
 
         // Assert: Q4K must succeed with block_size=256
@@ -1210,6 +1260,7 @@ mod tests {
             SimdWidth::W128,
             idx, emb, out,
             QuantPrecision::F32,
+            None,
         );
 
         // Assert: W128 should succeed with fewer lanes per vector op
@@ -1233,6 +1284,7 @@ mod tests {
             SimdWidth::Scalar,
             idx, emb, out,
             QuantPrecision::F32,
+            None,
         );
 
         // Assert: scalar width should still produce a valid program
@@ -1256,6 +1308,7 @@ mod tests {
             SimdWidth::W256,
             idx, emb, out,
             QuantPrecision::F32,
+            None,
         );
 
         // Assert
@@ -1280,6 +1333,7 @@ mod tests {
             SimdWidth::W256,
             idx, emb, out,
             QuantPrecision::F32,
+            None,
         ).unwrap();
 
         // Assert: must have at least one GprBinOp for data_advance step
@@ -1307,6 +1361,7 @@ mod tests {
             SimdWidth::W256,
             idx, emb, out,
             QuantPrecision::F32,
+            None,
         );
 
         // Assert: IQ4NL codebook-based format must succeed
@@ -1332,6 +1387,7 @@ mod tests {
             SimdWidth::W256,
             idx, emb, out,
             QuantPrecision::BF16,
+            None,
         );
 
         // Assert: BF16→BF16 should succeed (native path, zero dequantization overhead)
@@ -1356,6 +1412,7 @@ mod tests {
             SimdWidth::W256,
             idx, emb, out,
             QuantPrecision::F32,
+            None,
         );
 
         // Assert: TQ1_0 ternary quantization format must succeed
@@ -1380,6 +1437,7 @@ mod tests {
             SimdWidth::W256,
             idx, emb, out,
             QuantPrecision::F32,
+            None,
         );
 
         // Assert
@@ -1404,6 +1462,7 @@ mod tests {
             SimdWidth::W256,
             idx, emb, out,
             QuantPrecision::F16,
+            None,
         );
 
         // Assert: F16→F16 should succeed (native float path)
@@ -1428,6 +1487,7 @@ mod tests {
             SimdWidth::W256,
             idx, emb, out,
             QuantPrecision::F32,
+            None,
         );
 
         // Assert: Q2K must succeed (super-block K-Quant path)
@@ -1452,6 +1512,7 @@ mod tests {
             SimdWidth::W256,
             idx, emb, out,
             QuantPrecision::F32,
+            None,
         );
 
         // Assert
@@ -1476,6 +1537,7 @@ mod tests {
             SimdWidth::W256,
             idx, emb, out,
             QuantPrecision::F32,
+            None,
         );
 
         // Assert
@@ -1501,6 +1563,7 @@ mod tests {
             SimdWidth::W256,
             idx, emb, out,
             QuantPrecision::F32,
+            None,
         );
 
         // Assert: should succeed (vocab_size is not used in codegen)
@@ -1526,6 +1589,7 @@ mod tests {
             SimdWidth::W256,
             idx, emb, out,
             QuantPrecision::F32,
+            None,
         );
 
         // Assert
@@ -1559,6 +1623,7 @@ mod tests {
             SimdWidth::W256,
             idx, emb, out,
             QuantPrecision::F32,
+            None,
         );
 
         // Assert: F32→F32 should succeed (identity-like path)
@@ -1584,6 +1649,7 @@ mod tests {
             SimdWidth::W256,
             idx, emb, out,
             QuantPrecision::F32,
+            None,
         );
 
         // Assert: IQ4XS codebook format must succeed

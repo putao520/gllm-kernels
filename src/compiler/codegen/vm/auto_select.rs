@@ -1370,6 +1370,7 @@ fn dispatch_trace_op(
             super::quant_gather_emit::emit_quant_gather_inline(
                 prog, seq_bound, *vocab_size, *hidden_dim, *quant_type,
                 width, indices_ptr, embed_ptr, output_ptr, default_dtype,
+                None,
             )?;
             Ok(output_ptr)
         }
