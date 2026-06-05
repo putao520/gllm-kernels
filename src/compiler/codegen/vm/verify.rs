@@ -570,7 +570,8 @@ fn is_pure_write_to(instr: &VmInstr, vreg: VRegId) -> bool {
         VmInstr::QuantBroadcastInt { dst, .. } => *dst == vreg,
         VmInstr::QuantExtractBits { dst, src, .. } => *dst == vreg && *src != vreg,
         VmInstr::QuantCodebookLookup { dst, indices, .. } => *dst == vreg && *indices != vreg,
-        VmInstr::QuantInterleave { dst, lo, hi, .. } => *dst == vreg && *lo != vreg && *hi != vreg,
+        VmInstr::QuantInterleave { dst, lo, hi, .. } | VmInstr::QuantConcatSeq { dst, lo, hi, .. } => *dst == vreg && *lo != vreg && *hi != vreg,
+        VmInstr::Q3KDecodeStep { dst, block_base, lane_offset, d_vreg, .. } => *dst == vreg && *block_base != vreg && *lane_offset != vreg && *d_vreg != vreg,
         VmInstr::QuantScalarCvtLoad { dst, base, .. } => *dst == vreg && *base != vreg,
         VmInstr::QuantDequantFma { dst, weight, activation, scale, zero_point, .. } => {
             *dst == vreg && *weight != vreg && *activation != vreg
@@ -1246,7 +1247,8 @@ fn collect_src_vregs(instr: &VmInstr) -> Vec<VRegId> {
         VmInstr::QuantCodebookLookup { indices, .. } => vec![*indices],
         VmInstr::QuantExtractBits { src, .. } => vec![*src],
         VmInstr::QuantDequantFma { dst, weight, activation, scale, zero_point, .. } => vec![*dst, *weight, *activation, *scale, *zero_point],
-        VmInstr::QuantInterleave { lo, hi, .. } => vec![*lo, *hi],
+        VmInstr::QuantInterleave { lo, hi, .. } | VmInstr::QuantConcatSeq { lo, hi, .. } => vec![*lo, *hi],
+        VmInstr::Q3KDecodeStep { block_base, lane_offset, d_vreg, .. } => vec![*block_base, *lane_offset, *d_vreg],
         VmInstr::QuantScalarCvtLoad { base, .. } => vec![*base],
         VmInstr::QuantBlockLoad { base, offset, .. } => {
             let mut v = vec![*base];
@@ -1380,6 +1382,8 @@ fn collect_dst_vreg(instr: &VmInstr) -> Option<VRegId> {
         | VmInstr::QuantExtractBits { dst, .. }
         | VmInstr::QuantDequantFma { dst, .. }
         | VmInstr::QuantInterleave { dst, .. }
+        | VmInstr::QuantConcatSeq { dst, .. }
+        | VmInstr::Q3KDecodeStep { dst, .. }
         | VmInstr::DotProduct { acc: dst, .. }
         | VmInstr::ScaleApply { dst, .. }
         | VmInstr::SharedMemSwizzle { dst, .. }

@@ -721,6 +721,14 @@ impl NumericalSimulator {
                 Ok(Some(id))
             }
 
+            TraceOp::QuantConcatSeq { lo, hi } => {
+                // 标量模拟: 顺序拼接在标量上下文中与 interleave 相同 (返回 lo 值)
+                let lo_val = state.get(*lo);
+                let id = ValueId(trace_pos);
+                state.set(id, lo_val);
+                Ok(Some(id))
+            }
+
             TraceOp::QuantAndMask { src, mask } => {
                 let src_val = state.get(*src).as_integer()?;
                 let result = src_val & (*mask as i64);
@@ -1406,7 +1414,8 @@ impl NumericalSimulator {
             | TraceOp::MtpDraft { .. }
             | TraceOp::MlaAttnScore { .. }
             | TraceOp::MlaRopeMerge { .. }
-            | TraceOp::DynamicPrecisionSelect { .. } => {
+            | TraceOp::DynamicPrecisionSelect { .. }
+            | TraceOp::QuantQ3KDecode { .. } => {
                 let id = ValueId(trace_pos);
                 state.set(id, SimValue::Float(0.0));
                 Ok(Some(id))

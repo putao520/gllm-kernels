@@ -2764,6 +2764,27 @@ impl AArch64Lower {
                 Ok(())
             }
 
+            VmInstr::QuantConcatSeq { dst, lo, hi, .. } => {
+                // Sequential concat: dst = [lo[0..3], hi[0..3]]
+                // Use MOV (ORR) to copy lo to dst, then INS to place hi elements at positions 2,3.
+                let vd = self.resolve_vreg(*dst, alloc)?;
+                let vn = self.resolve_vreg(*lo, alloc)?;
+                let vm = self.resolve_vreg(*hi, alloc)?;
+                // MOV Vd.16B, Vlo.16B — ORR encoding: 0x6E001C00 | Rm<<16 | Rn<<5 | Rd (Rd=Rn)
+                self.emit32(0x6E001C00 | ((vn as u32) << 16) | ((vd as u32) << 5) | vd as u32);
+                // INS Vd.S[2], Vhi.S[0]: 0x4E081C00 | Rm<<5 | Rd
+                self.emit32(0x4E081C00 | ((vm as u32) << 5) | vd as u32);
+                // INS Vd.S[3], Vhi.S[1]: 0x4E0C1C00 | Rm<<5 | Rd
+                self.emit32(0x4E0C1C00 | ((vm as u32) << 5) | vd as u32);
+                Ok(())
+            }
+
+            VmInstr::Q3KDecodeStep { .. } => {
+                Err(CompilerError::CodegenViolation(
+                    "Q3KDecodeStep AArch64: not yet implemented".into()
+                ))
+            }
+
             // ── SPEC 23-QUANT-CODEGEN-ALGO §4.3: 原生 Dot-Product VmInstr (AArch64 NEON) ──
 
             VmInstr::DotProduct { acc, a, b, input_dtype, .. } => {

@@ -866,6 +866,28 @@ fn dispatch_trace_op(
             Ok(r)
         }
 
+        TraceOp::QuantConcatSeq { lo, hi } => {
+            let r = prog.alloc_vreg(VRegKind::Vec, width);
+            prog.emit(VmInstr::QuantConcatSeq { dst: r, lo: slots[lo.0 as usize], hi: slots[hi.0 as usize], width });
+            Ok(r)
+        }
+
+        TraceOp::QuantQ3KDecode { block_base, lane_offset, d_slot, qs_offset, hmask_offset } => {
+            let r = prog.alloc_vreg(VRegKind::Vec, width);
+            let lanes = if matches!(width, SimdWidth::W512) { 16 } else if matches!(width, SimdWidth::W256) { 8 } else { 4 };
+            prog.emit(VmInstr::Q3KDecodeStep {
+                dst: r,
+                block_base: slots[block_base.0 as usize],
+                lane_offset: slots[lane_offset.0 as usize],
+                d_vreg: slots[d_slot.0 as usize],
+                qs_offset: *qs_offset,
+                hmask_offset: *hmask_offset,
+                lanes,
+                width,
+            });
+            Ok(r)
+        }
+
         TraceOp::QuantPtrAddOffset { base, offset_bytes } => {
             let r = prog.alloc_vreg(VRegKind::Ptr, SimdWidth::Scalar);
             prog.emit(VmInstr::AddPtr { dst: r, base: slots[base.0 as usize], offset: *offset_bytes as usize });

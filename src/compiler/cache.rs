@@ -500,6 +500,7 @@ impl SerializedTraceOp {
             TraceOp::QuantIntDivConst { src, divisor } => Self { tag: 58, operands: [src.0, 0, 0, 0], float_val: *divisor as f64 },
             TraceOp::QuantIntMul { src, factor } => Self { tag: 59, operands: [src.0, 0, 0, 0], float_val: *factor as f64 },
             TraceOp::QuantInterleave { lo, hi } => Self { tag: 60, operands: [lo.0, hi.0, 0, 0], float_val: 0.0 },
+            TraceOp::QuantConcatSeq { lo, hi } => Self { tag: 61, operands: [lo.0, hi.0, 0, 0], float_val: 0.0 },
             TraceOp::QuantPtrAddOffset { base, offset_bytes } => Self { tag: 66, operands: [base.0, 0, 0, 0], float_val: *offset_bytes as f64 },
             TraceOp::QuantPtrAddDynamic { base, index } => Self { tag: 67, operands: [base.0, index.0, 0, 0], float_val: 0.0 },
             TraceOp::QuantAndMask { src, mask } => Self { tag: 68, operands: [src.0, 0, 0, 0], float_val: *mask as f64 },
@@ -537,6 +538,7 @@ impl SerializedTraceOp {
             TraceOp::MlaRopeMerge { .. } => Self { tag: 97, operands: [0, 0, 0, 0], float_val: 0.0 },
             TraceOp::Tma2DCopy { .. } => Self { tag: 128, operands: [0, 0, 0, 0], float_val: 0.0 },
             TraceOp::DynamicPrecisionSelect { .. } => Self { tag: 129, operands: [0, 0, 0, 0], float_val: 0.0 },
+            TraceOp::QuantQ3KDecode { block_base, lane_offset, d_slot, .. } => Self { tag: 130, operands: [block_base.0, lane_offset.0, d_slot.0, 0], float_val: 0.0 },
         }
     }
 
@@ -598,6 +600,13 @@ impl SerializedTraceOp {
             98 => Some(TraceOp::QuantCastFp8toF32 { src: ValueId(o[0]), is_e4m3: true }),
             99 => Some(TraceOp::QuantCastFp8toF32 { src: ValueId(o[0]), is_e4m3: false }),
             128 => Some(TraceOp::Tma2DCopy { desc: String::new(), coord_x: ValueId(0), coord_y: ValueId(0), bytes: 0 }),
+            130 => Some(TraceOp::QuantQ3KDecode {
+                block_base: ValueId(o[0]),
+                lane_offset: ValueId(o[1]),
+                d_slot: ValueId(o[2]),
+                qs_offset: 32,
+                hmask_offset: 0,
+            }),
             _ => None,
         }
     }

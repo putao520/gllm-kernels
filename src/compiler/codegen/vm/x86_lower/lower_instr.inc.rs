@@ -2708,6 +2708,148 @@ impl X86Lower {
                 Ok(())
             }
 
+            VmInstr::QuantConcatSeq { dst, lo, hi, .. } => {
+                // Sequential concatenation: dst = [lo[0..3], hi[0..3]]
+                // lo is low 128 bits, hi goes to high 128 bits.
+                // vinserti128: copy hi's low 128 into dst's upper 128, keep lo in lower 128.
+                let (dst_ymm, dst_spilled) = self.resolve_ymm_or_spill_write(*dst, alloc, 0)?;
+                let (lo_ymm, _) = self.resolve_ymm_or_spill(*lo, alloc, 1)?;
+                let (hi_ymm, _) = self.resolve_ymm_or_spill(*hi, alloc, 2)?;
+                // dst = lo (full YMM copy)
+                if dst_ymm != lo_ymm {
+                    self.asm.vmovdqa(dst_ymm, lo_ymm).map_err(Self::err)?;
+                }
+                // dst upper 128 = hi lower 128
+                let hi_xmm = Self::ymm_to_xmm(hi_ymm);
+                self.asm.vinserti128(dst_ymm, dst_ymm, hi_xmm, 1).map_err(Self::err)?;
+                if dst_spilled { self.spill_store_ymm(*dst, alloc, 0)?; }
+                Ok(())
+            }
+
+            // ── Q3_K Decode: 2-bit extraction + conditional hmask bias + scale ──
+            //
+            // Per-element logic (element i, lanes=8):
+            //   global_elem = lane_offset * lanes + i
+            //   seg = global_elem / 128   (0 or 1)
+            //   group = (global_elem % 128) / 16  (0..7)
+            //   j = group % 4             (shift index: 0..3)
+            //   run = group / 4           (run index: 0 or 1)
+            //   l = global_elem % 16      (element within run)
+            //
+            //   qs_val = (qs[seg*32 + run*16 + l] >> (j*2)) & 3
+            //   hmask_bit = (hmask[run*16 + l] >> (seg*4 + j)) & 1
+            //   bias = if hmask_bit { 0 } else { 4 }
+            //   scale_idx = seg*8 + j*2 + run
+            //   dl = d * (scale[scale_idx] - 32)
+            //   result[i] = (qs_val - bias) * dl
+            //
+            // Implementation: scalar loop over lanes elements, using GPR arithmetic
+            // to compute indices, then broadcast result into dst YMM.
+            //
+            // Assisted path: call native helper function q3k_decode_step_native.
+            // The helper performs Q3KExtended scale rearrangement + per-element
+            // 2-bit extraction + conditional hmask bias + scale multiplication.
+            // This is the SPEC 23 "Assisted" tier — acceptable for formats that
+            // cannot be expressed as generic integer × float algebra.
+            //
+            // Helper signature (System V ABI):
+            //   fn(block: *const u8, lane_offset: u64, d_f32: f32,
+            //      qs_offset: u64, hmask_offset: u64, lanes: u64, out: *mut f32)
+            //
+            // ABI mapping: RDI=block, RSI=lane_offset, XMM0=d_f32(unused by helper),
+            //              RDX=qs_offset, RCX=hmask_offset, R8=lanes, R9=out_ptr
+
+            VmInstr::Q3KDecodeStep { dst, block_base, lane_offset, d_vreg: _, qs_offset, hmask_offset, lanes, width } => {
+                // ── Assisted path: call native helper function ──
+                // Helper signature (System V ABI):
+                //   fn(block: *const u8, lane_offset: u64, d_f32: f32,
+                //      qs_offset: u64, hmask_offset: u64, lanes: u64, out: *mut f32)
+                // ABI: RDI=block, RSI=lane_offset, XMM0=d_f32, RDX=qs_offset, RCX=hmask_offset, R8=lanes, R9=out_ptr
+
+                let bb_gpr = self.resolve_gpr_read(*block_base, alloc, 0)?;
+                let lo_gpr = self.resolve_gpr_read(*lane_offset, alloc, 1)?;
+
+                // Resolve dst for write — we need to know which physical YMM it maps to
+                let (dst_ymm, dst_spilled) = self.resolve_ymm_or_spill_write(*dst, alloc, 0)?;
+
+                // Build YMM save list EXCLUDING dst_ymm — we write the result into dst_ymm
+                // after the call, and restore_all must NOT overwrite it.
+                #[rustfmt::skip]
+                let all_ymms: [AsmRegisterYmm; 16] = [ymm0, ymm1, ymm2, ymm3, ymm4, ymm5, ymm6, ymm7, ymm8, ymm9, ymm10, ymm11, ymm12, ymm13, ymm14, ymm15];
+                let save_ymms: Vec<AsmRegisterYmm> = all_ymms.iter().filter(|&&r| r != dst_ymm).copied().collect();
+
+                let save_gprs = [rax, rbx, rcx, rdx, rsi, rdi, r8, r9, r10, r11, r12, r13, r14, r15];
+
+                // Save all GPRs + pushfq + save YMMs (excluding dst)
+                {
+                    let mut frame = SymbolicSaveFrame::new(&mut self.asm);
+                    frame.push_gprs(&save_gprs)?;
+                    frame.pushfq()?;
+                    frame.save_ymm_block(&save_ymms)?;
+                    // Total: 14*8=112 + 8 + 15*32=480 = 600 → 600%16=8 ✓
+                    frame.verify_alignment()?;
+                }
+
+                // Set up arguments
+                self.asm.mov(rdi, bb_gpr).map_err(Self::err)?;
+                self.asm.mov(rsi, lo_gpr).map_err(Self::err)?;
+                self.asm.vxorps(xmm0, xmm0, xmm0).map_err(Self::err)?;
+                self.asm.mov(rdx, *qs_offset as u64).map_err(Self::err)?;
+                self.asm.mov(rcx, *hmask_offset as u64).map_err(Self::err)?;
+                self.asm.mov(r8, *lanes as u64).map_err(Self::err)?;
+
+                // Dynamic stack alignment + output buffer
+                // We need to pass an output pointer to the helper.
+                // Align rsp, then allocate space for output.
+                // lanes * 4 bytes, rounded up to 16-byte multiple.
+                let aligned_out_bytes = ((*lanes as i32 + 3) & !3) * 4;
+                self.asm.mov(r10, rsp).map_err(Self::err)?;
+                self.asm.and(rsp, -16i32).map_err(Self::err)?;
+                self.asm.sub(rsp, aligned_out_bytes).map_err(Self::err)?;
+                self.asm.lea(r9, qword_ptr(rsp)).map_err(Self::err)?;
+
+                // Call helper
+                let fn_ptr = crate::asm::x86_64::quant_gemv::q3k_decode_step_native as *const () as u64;
+                self.asm.mov(rax, fn_ptr).map_err(Self::err)?;
+                self.asm.call(rax).map_err(Self::err)?;
+
+                // Load result from aligned stack into dst_ymm
+                match width {
+                    SimdWidth::W128 => {
+                        self.asm.vmovups(dst_ymm, xmmword_ptr(rsp)).map_err(Self::err)?;
+                    }
+                    SimdWidth::W256 => {
+                        self.asm.vmovups(dst_ymm, ymmword_ptr(rsp)).map_err(Self::err)?;
+                    }
+                    SimdWidth::W512 => {
+                        self.asm.vmovups(dst_ymm, ymmword_ptr(rsp)).map_err(Self::err)?;
+                    }
+                    SimdWidth::Scalar => {
+                        let dst_xmm = Self::ymm_to_xmm(dst_ymm);
+                        self.asm.vmovss(dst_xmm, dword_ptr(rsp)).map_err(Self::err)?;
+                    }
+                    SimdWidth::Warp(_) | SimdWidth::Scalable => {
+                        return Err(CompilerError::CodegenViolation(
+                            "Q3KDecodeStep: Warp/Scalable SIMD width not supported on x86".into()
+                        ));
+                    }
+                }
+
+                // Restore rsp from r10 (undo dynamic alignment)
+                self.asm.mov(rsp, r10).map_err(Self::err)?;
+
+                // Restore YMMs (excluding dst_ymm), popfq, pop GPRs
+                {
+                    let mut frame = SymbolicSaveFrame::new(&mut self.asm);
+                    frame.restore_all(&save_gprs, &save_ymms)?;
+                }
+
+                if dst_spilled { self.spill_store_ymm(*dst, alloc, 0)?; }
+
+                Ok(())
+            }
+
+
             // ── SPEC 23-QUANT-CODEGEN-ALGO §4.3: 原生 Dot-Product VmInstr (REQ-VR-002) ──
 
             VmInstr::DotProduct { acc, a, b, input_dtype, width } => {

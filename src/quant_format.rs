@@ -230,6 +230,16 @@ pub enum DataLayout {
     Bytes { offset: usize, signed: bool },
     /// Codebook indices (IQ family).
     CodebookIndex { offset: usize, index_bits: u8 },
+    /// Q3_K: 2-bit values at variable shifts + conditional bias from hmask.
+    /// Layout: hmask[32] + qs[64] + scales[12] + d(f16) = 110 bytes, 256 elements.
+    /// Elements accessed as: seg*128 + j*32 + run*16 + l (0..16).
+    /// qs_val = (qs[seg*32 + run*16 + l] >> (j*2)) & 3
+    /// bias = 0 if (hmask[run*16 + l] & (1 << (seg*4 + j))) else 4
+    /// result = (qs_val - bias) * dl   where dl = d * (scale - 32)
+    TwoBitConditionalBias {
+        qs_offset: usize,    // offset to qs[] within block (32 for Q3_K)
+        hmask_offset: usize, // offset to hmask[] within block (0 for Q3_K)
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -562,6 +572,8 @@ impl QuantFormatRegistry {
         });
 
         // Q3_K: hmask[32] + qs[64] + scales[12] + d(f16) = 110 bytes, 256 elements
+        // 3-bit value = (qs 2-bit) | (hmask 1-bit as sign/high)
+        // result = (3-bit_value - 4) × d × scale_6bit
         self.insert(QuantFormatDescriptor {
             name: "Q3_K",
             quant_type: QuantType::Q3K,
@@ -573,20 +585,19 @@ impl QuantFormatRegistry {
                 block_dmin_offset: None,
                 sub_scales_offset: 96,
                 sub_scales_bits: 6,
-                sub_scales_count: 8,
-                sub_block_elements: 32,
+                sub_scales_count: 16,
+                sub_block_elements: 16,
                 packed_layout: PackedScaleLayout { algorithm: PackedScaleAlgorithm::Q3KExtended },
             },
             zero_layout: ZeroLayout::StaticBias { value: 4 },
-            data_layout: DataLayout::NibbleWithHighBits {
-                low_offset: 32,
-                high_offset: 0,
-                high_bits_per_elem: 1,
+            data_layout: DataLayout::TwoBitConditionalBias {
+                qs_offset: 32,
+                hmask_offset: 0,
             },
             data_kind: QuantDataKind::SuperLowBit,
             codebook: None,
             storage_layout: StorageLayout::RowMajor,
-            native_isa: None, // 3-bit: DequantFMA on all ISAs
+            native_isa: None, // 3-bit conditional: DequantFMA on all ISAs
         });
 
         // Q8_K: d(f32) + qs[256 i8] + bsums[16 i16] = 292 bytes, 256 elements

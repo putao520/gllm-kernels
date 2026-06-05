@@ -1250,6 +1250,30 @@ pub enum VmInstr {
     /// 整数向量交叉合并 (lo nibbles + hi nibbles → lanes 个元素)。
     QuantInterleave { dst: VRegId, lo: VRegId, hi: VRegId, width: SimdWidth },
 
+    /// 整数向量顺序拼接: dst = [lo[0..N/2], hi[0..N/2]]。
+    /// 用于 QuantGather 路径，元素必须保持原始顺序。
+    QuantConcatSeq { dst: VRegId, lo: VRegId, hi: VRegId, width: SimdWidth },
+
+    /// Q3_K combined decode: extracts 2-bit values from qs[] at variable shift,
+    /// applies conditional hmask bias, multiplies by per-sub-block scale.
+    /// dst = f32 vector of decoded values.
+    /// block_base: pointer to Q3_K block start (hmask + qs + scales + d)
+    /// lane_offset: GPR holding iteration counter (0..31 for lanes=8)
+    /// d_vreg: Vec VReg holding f32 super-block scale d
+    /// qs_offset: byte offset from block_base to qs[] array (32 for Q3_K)
+    /// hmask_offset: byte offset from block_base to hmask[] array (0 for Q3_K)
+    /// lanes: number of output elements per iteration (8 for AVX2)
+    Q3KDecodeStep {
+        dst: VRegId,
+        block_base: VRegId,
+        lane_offset: VRegId,
+        d_vreg: VRegId,
+        qs_offset: usize,
+        hmask_offset: usize,
+        lanes: usize,
+        width: SimdWidth,
+    },
+
     // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
     // SPEC 23-QUANT-CODEGEN-ALGO §4.3: 原生 Dot-Product VmInstr
     // 硬件无关语义，ISA lowering 决定具体指令

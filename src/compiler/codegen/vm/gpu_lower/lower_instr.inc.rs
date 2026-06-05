@@ -2574,6 +2574,26 @@ impl GpuLower {
                 Ok(())
             }
 
+            VmInstr::QuantConcatSeq { dst, lo, hi, .. } => {
+                // GPU scalar per-thread: sequential concat maps to thread index < half → lo, else → hi.
+                let d = self.reg_name_with_kind(*dst, alloc);
+                let vlo = self.reg_name_with_kind(*lo, alloc);
+                let vhi = self.reg_name_with_kind(*hi, alloc);
+                match self.dialect {
+                    GpuDialect::Ptx { .. } => {
+                        self.emit_line(&format!("{{ .reg .pred %ccat_p; .reg .u32 %ccat_tid; mov.u32 %ccat_tid, %tid.x; setp.lt.u32 %ccat_p, %ccat_tid, 4; selp.f32 {d}, {vlo}, {vhi}, %ccat_p; }}"));
+                    }
+                    _ => self.emit_line(&format!("{d} = (threadIdx.x < 4) ? {vlo} : {vhi};")),
+                }
+                Ok(())
+            }
+
+            VmInstr::Q3KDecodeStep { .. } => {
+                Err(CompilerError::CodegenViolation(
+                    "Q3KDecodeStep GPU: not yet implemented".into()
+                ))
+            }
+
             VmInstr::ScopeBegin { .. } | VmInstr::ScopeEnd { .. } => Ok(()),
 
             // ── SPEC 23-QUANT-CODEGEN-ALGO §4.3 / REQ-VR-002: Unified Dot-Product VmInstr (GPU lowering) ──

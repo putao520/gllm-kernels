@@ -473,6 +473,12 @@ pub enum TraceOp {
     /// 后端映射: VmInstr::QuantInterleave
     QuantInterleave { lo: ValueId, hi: ValueId },
 
+    /// 顺序拼接两个半宽向量: result = [lo[0..N/2], hi[0..N/2]]。
+    /// 用于 PackedNibbles 的 QuantGather 路径: 元素顺序必须为 [0,1,...,15,16,17,...,31]
+    /// 而非交错 [0,16,1,17,...] (QuantInterleave)。
+    /// 后端映射: VmInstr::QuantConcatSeq
+    QuantConcatSeq { lo: ValueId, hi: ValueId },
+
     /// 指针算术 (不读内存): result = base_ptr + offset_bytes。
     /// 用于计算 block 内子数组的起始地址。
     /// 后端映射: VmInstr::AddPtr
@@ -551,6 +557,28 @@ pub enum TraceOp {
         nvfp4_mode: bool,
     },
 
+    /// Q3_K combined decode step: extracts 2-bit values from qs[] at variable shift,
+    /// applies conditional bias from hmask[], multiplies by scale (dl = d * (scale - 32)).
+    ///
+    /// This is a monolithic op because Q3_K's non-linear data access pattern
+    /// (qs bytes read with variable shifts, hmask bit positions accumulate across segments)
+    /// cannot be decomposed into the standard load→unpack→dequant pipeline.
+    ///
+    /// Inputs:
+    /// - `block_base`: pointer to the start of the Q3_K block
+    /// - `lane_offset`: iteration counter within the block (0..31 for lanes=8)
+    /// - `d_slot`: f32 scalar holding the block's super-block scale d (loaded from f16)
+    ///
+    /// Output: f32 vector of `lanes` decoded values.
+    ///
+    /// Internal logic (per element i in 0..lanes):
+    ///   global_elem = lane_offset * lanes + i
+    ///   seg = global_elem / 128
+    ///   group_in_seg = (global_elem % 128) / 16
+    ///   j = group_in_seg % 4  (shift index)
+    ///   run = group_in_seg / 4  (run index, 0 or 1)
+    ///   l = global_elem % 16
+    ///   qs_val = (qs[seg*32 + run*16 + l] >> (j*2)) & 3
     // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
     // SPEC 24-QUANT-PIPELINE-JIT §1.3: QuantGather/QuantGemm trace pipeline
     // 量化块级加载操作，驱动 auto_select 生成正确的 VmInstr 序列。
@@ -612,6 +640,16 @@ pub enum TraceOp {
         codebook_ptr: ValueId,
         vector_size: usize,
         bits_per_entry: usize,
+    },
+
+    /// Q3_K combined decode: super-block d (f16→f32) + qs packed bits + hmask
+    /// → outputs 256 f32 values in-place via QuantGather/GEMM lane decode.
+    QuantQ3KDecode {
+        block_base: ValueId,
+        lane_offset: ValueId,
+        d_slot: ValueId,
+        qs_offset: usize,
+        hmask_offset: usize,
     },
 
     // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -1217,7 +1255,7 @@ pub fn infer_result_dtype(op: &TraceOp, slots: &[TypedSlot]) -> QuantPrecision {
         TraceOp::QuantDequantFma { acc, .. } => slot_dtype(slots, *acc),
         TraceOp::QuantIntDivConst { .. } => QuantPrecision::F32,
         TraceOp::QuantIntMul { .. } => QuantPrecision::F32,
-        TraceOp::QuantInterleave { lo, .. } => slot_dtype(slots, *lo),
+        TraceOp::QuantInterleave { lo, .. } | TraceOp::QuantConcatSeq { lo, .. } => slot_dtype(slots, *lo),
         TraceOp::QuantPtrAddOffset { .. } | TraceOp::QuantPtrAddDynamic { .. } | TraceOp::QuantScalarLoad { .. } | TraceOp::QuantLoadF16toF32 { .. } | TraceOp::QuantLoadI8toF32 { .. } | TraceOp::QuantLoadBytesVec { .. } | TraceOp::QuantAndMask { .. } | TraceOp::QuantKQuantPackedScaleLookup { .. } => QuantPrecision::F32,
         TraceOp::QuantShiftLeft { src, .. } => slot_dtype(slots, *src),
         TraceOp::QuantShiftRight { src, .. } => slot_dtype(slots, *src),
@@ -1229,6 +1267,7 @@ pub fn infer_result_dtype(op: &TraceOp, slots: &[TypedSlot]) -> QuantPrecision {
         TraceOp::QuantSubScaleLoad { .. } => QuantPrecision::F32,
         TraceOp::QuantHighBitsLoad { .. } => QuantPrecision::F32,
         TraceOp::QuantCodebookDequant { .. } => QuantPrecision::F32,
+        TraceOp::QuantQ3KDecode { .. } => QuantPrecision::F32,
         // ── SPEC 24-QUANT-PIPELINE-JIT §1.3: QuantGather/QuantGemm structural ──
         TraceOp::QuantGather { .. } => QuantPrecision::F32,
         TraceOp::QuantGemm { .. } => QuantPrecision::F32,
@@ -1287,6 +1326,7 @@ impl TraceOp {
             | TraceOp::QuantBitAnd { lhs: a, rhs: b }
             | TraceOp::QuantBitOr { lhs: a, rhs: b }
             | TraceOp::QuantInterleave { lo: a, hi: b }
+            | TraceOp::QuantConcatSeq { lo: a, hi: b }
             | TraceOp::Permute { src: a, indices: b }
             | TraceOp::AtomicAdd { addr: a, val: b }
             | TraceOp::Compare { a, b, .. }
@@ -1300,6 +1340,10 @@ impl TraceOp {
             | TraceOp::QuantKQuantPackedScaleLookup { scales_base: a, sub_block_idx: b, .. }
             | TraceOp::QuantCodebookDequant { indices: a, codebook_ptr: b, .. } => {
                 f(*a); f(*b);
+            }
+
+            TraceOp::QuantQ3KDecode { block_base: a, lane_offset: b, d_slot: c, .. } => {
+                f(*a); f(*b); f(*c);
             }
 
             // Ternary (3 ValueId)
@@ -1474,6 +1518,7 @@ impl TraceOp {
             TraceOp::QuantIntDivConst { src, divisor } => TraceOp::QuantIntDivConst { src: m(src), divisor },
             TraceOp::QuantIntMul { src, factor } => TraceOp::QuantIntMul { src: m(src), factor },
             TraceOp::QuantInterleave { lo, hi } => TraceOp::QuantInterleave { lo: m(lo), hi: m(hi) },
+            TraceOp::QuantConcatSeq { lo, hi } => TraceOp::QuantConcatSeq { lo: m(lo), hi: m(hi) },
             TraceOp::QuantPtrAddOffset { base, offset_bytes } => TraceOp::QuantPtrAddOffset { base: m(base), offset_bytes },
             TraceOp::QuantPtrAddDynamic { base, index } => TraceOp::QuantPtrAddDynamic { base: m(base), index: m(index) },
             TraceOp::QuantAndMask { src, mask } => TraceOp::QuantAndMask { src: m(src), mask },
@@ -1488,7 +1533,8 @@ impl TraceOp {
             TraceOp::QuantShiftRight { src, amount } => TraceOp::QuantShiftRight { src: m(src), amount },
             TraceOp::QuantE2m1LutDecode { packed_data_ptr, scale_byte, nvfp4_mode } =>
                 TraceOp::QuantE2m1LutDecode { packed_data_ptr: m(packed_data_ptr), scale_byte: m(scale_byte), nvfp4_mode },
-
+            TraceOp::QuantQ3KDecode { block_base, lane_offset, d_slot, qs_offset, hmask_offset } =>
+                TraceOp::QuantQ3KDecode { block_base: m(block_base), lane_offset: m(lane_offset), d_slot: m(d_slot), qs_offset, hmask_offset },
             // SPEC 24 QuantGather/QuantGemm pipeline
             TraceOp::QuantScaleLoad { source, offset, dtype } =>
                 TraceOp::QuantScaleLoad { source: m(source), offset, dtype },

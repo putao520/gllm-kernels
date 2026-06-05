@@ -55,6 +55,24 @@ impl<'a> SymbolicSaveFrame<'a> {
         Ok(())
     }
 
+    /// 从 YMM 寄存器存储到栈上指定偏移（用于 save_ymm_block 之后手动放置）。
+    /// 不改变 total_adjustment（空间已由 sub_rsp / save_ymm_block 分配）。
+    pub fn vmovups_store(&mut self, src: AsmRegisterYmm, rsp_offset: i32) -> Result<(), CompilerError> {
+        self.asm.vmovups(
+            ymmword_ptr(rsp + rsp_offset), src,
+        ).map_err(X86Lower::err)?;
+        Ok(())
+    }
+
+    /// 额外分配栈空间（用于 output buffer 等）。自动计入 total_adjustment。
+    pub fn sub_rsp(&mut self, bytes: i32) -> Result<(), CompilerError> {
+        if bytes > 0 {
+            self.asm.sub(rsp, bytes).map_err(X86Lower::err)?;
+            self.total_adjustment += bytes;
+        }
+        Ok(())
+    }
+
     /// 执行 call rax, 验证 16B 栈对齐。
     /// call pushes 8B return addr, 所以 call 前 RSP 应为 8-mod-16,
     /// call 后 (callee 入口) RSP 为 16B-aligned。

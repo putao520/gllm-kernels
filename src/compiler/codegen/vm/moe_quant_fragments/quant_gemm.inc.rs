@@ -225,10 +225,13 @@ pub(crate) fn emit_gemm_int8_from_plan(
 /// Assisted 半硬件辅助 GEMM — 寄存器内 INT4 nibble unpack + dequant + FMA (REQ-QCG5)
 ///
 /// 适用于 SimdAssisted/SimdBasic dot_cap + INT4 weight-only:
-///   1. QuantBlockLoad(UnsignedNibbleLow + UnsignedNibbleHigh) or (SignedNibbleLow + SignedNibbleHigh)
-///   2. QuantInterleave(lo, hi) → 顺序 f32 元素
-///   3. scale 从 block header 加载并广播
-///   4. FMA(act, weight_f32 * scale, acc)
+///   1. QuantBlockLoad(SignedNibbleLow/UnsignedNibbleLow) → lo nibbles dequant
+///   2. FMA(act_lo, weight_lo * scale, acc)
+///   3. QuantBlockLoad(SignedNibbleHigh/UnsignedNibbleHigh) → hi nibbles dequant
+///   4. FMA(act_hi, weight_hi * scale, acc)
+///
+/// 每个 GGUF 字节存储两个值: lo nibble = block_pos[i], hi nibble = block_pos[i+16].
+/// 两次独立 FMA 分别处理 lo/hi nibble 位置，激活偏移相差 block_size/2.
 ///
 /// 相比 DequantFma: 避免 DecodeTraceBuilder 生成的完整反量化 trace，
 /// 直接在寄存器层面完成 nibble 提取 + 反量化，延迟更低。
@@ -256,7 +259,6 @@ pub(crate) fn emit_gemm_assisted_from_plan(
     let a_val = prog.alloc_vreg(VRegKind::Vec, width);
     let b_lo = prog.alloc_vreg(VRegKind::Vec, width);
     let b_hi = prog.alloc_vreg(VRegKind::Vec, width);
-    let b_f32 = prog.alloc_vreg(VRegKind::Vec, width);
     let scale_vec = prog.alloc_vreg(VRegKind::Vec, width);
     let zero_vec = prog.alloc_vreg(VRegKind::Vec, width);
     let hreduce_dst = prog.alloc_vreg(VRegKind::Vec, width);
@@ -271,7 +273,8 @@ pub(crate) fn emit_gemm_assisted_from_plan(
     prog.emit(VmInstr::GprLoadImm { dst: blk_ptr_stride, value: block_bytes });
     prog.emit(VmInstr::GprLoadImm { dst: j_weight_stride, value: quant_row_stride });
     prog.emit(VmInstr::GprLoadImm { dst: act_stride_reg, value: block_size * elem });
-    prog.emit(VmInstr::GprLoadImm { dst: data_step_reg, value: plan.data_step.max(1) });
+    // Assisted nibble path: each iteration loads `lanes` bytes for lo+hi nibble decode
+    prog.emit(VmInstr::GprLoadImm { dst: data_step_reg, value: lanes });
 
     let k_act_base = prog.alloc_vreg(VRegKind::Ptr, SimdWidth::Scalar);
 
@@ -303,19 +306,27 @@ pub(crate) fn emit_gemm_assisted_from_plan(
                         prog.emit(VmInstr::GprBinOp { dst: data_ptr, a: blk_ptr, b: GprOperand::VReg(zero_gpr ), op: GprOp::Add });
                     }
 
-                    prog.emit_loop_try(BoundExpr::Const(iters_per_block), lanes * elem,
+                    // ei loop: each iteration processes `lanes` low-nibble positions +
+                    // `lanes` high-nibble positions from the same packed bytes.
+                    // GGUF Q4_0 layout: byte_i → lo_nibble = block_pos[i], hi_nibble = block_pos[16+i].
+                    // We must do TWO separate FMA operations with DIFFERENT activation offsets.
+                    // Nibble packing: each byte holds 2 values, so `lanes` values need only lanes/2 bytes.
+                    // But SignedNibbleLow loads 8 bytes → 8 values. So we process lanes lo + lanes hi
+                    // per iteration = 2*lanes block positions, needing only iters_per_block/2 iterations.
+                    let nibble_iters = iters_per_block / 2;
+                    let half_block_elem = block_size / 2 * elem; // offset to hi-nibble activations
+                    prog.emit_loop_try(BoundExpr::Const(nibble_iters), lanes * elem,
                         |prog, _ei_ctr, ei_off| -> Result<(), CompilerError> {
-                            // 2. 加载激活值: a_val = input[offset]
-                            let act_off = OffsetExpr::Add(
+                            // --- Low nibble FMA: lo nibbles = block positions [0..7] ---
+                            let lo_act_off = OffsetExpr::Add(
                                 Box::new(OffsetExpr::Add(
                                     Box::new(OffsetExpr::Mul(Box::new(OffsetExpr::LoopOffset(i_cnt)), a_row_stride)),
                                     Box::new(OffsetExpr::ScalarVReg(k_act_base)),
                                 )),
                                 Box::new(OffsetExpr::LoopOffset(ei_off)),
                             );
-                            prog.emit(VmInstr::VecLoad { dst: a_val, base: input_ptr, offset: act_off, width, dtype });
+                            prog.emit(VmInstr::VecLoad { dst: a_val, base: input_ptr, offset: lo_act_off, width, dtype });
 
-                            // 3. Load low nibbles → f32 (bias subtracted if signed)
                             let low_unpack = if use_signed {
                                 BlockUnpackMode::SignedNibbleLow
                             } else {
@@ -325,8 +336,22 @@ pub(crate) fn emit_gemm_assisted_from_plan(
                                 dst: b_lo, base: data_ptr,
                                 offset: OffsetExpr::Const(0), unpack: low_unpack, width,
                             });
+                            prog.emit(VmInstr::VecBinOp { dst: b_lo, a: b_lo, b: scale_vec, op: VecOp::Mul, dtype: QuantPrecision::F32 });
+                            prog.emit(VmInstr::Fma { dst: acc, acc, a: a_val, b: b_lo, dtype });
 
-                            // 4. Load high nibbles → f32 (bias subtracted if signed)
+                            // --- High nibble FMA: hi nibbles = block positions [16..23] ---
+                            let hi_act_off = OffsetExpr::Add(
+                                Box::new(OffsetExpr::Add(
+                                    Box::new(OffsetExpr::Mul(Box::new(OffsetExpr::LoopOffset(i_cnt)), a_row_stride)),
+                                    Box::new(OffsetExpr::Add(
+                                        Box::new(OffsetExpr::ScalarVReg(k_act_base)),
+                                        Box::new(OffsetExpr::Const(half_block_elem)),
+                                    )),
+                                )),
+                                Box::new(OffsetExpr::LoopOffset(ei_off)),
+                            );
+                            prog.emit(VmInstr::VecLoad { dst: a_val, base: input_ptr, offset: hi_act_off, width, dtype });
+
                             let high_unpack = if use_signed {
                                 BlockUnpackMode::SignedNibbleHigh
                             } else {
@@ -336,21 +361,10 @@ pub(crate) fn emit_gemm_assisted_from_plan(
                                 dst: b_hi, base: data_ptr,
                                 offset: OffsetExpr::Const(0), unpack: high_unpack, width,
                             });
+                            prog.emit(VmInstr::VecBinOp { dst: b_hi, a: b_hi, b: scale_vec, op: VecOp::Mul, dtype: QuantPrecision::F32 });
+                            prog.emit(VmInstr::Fma { dst: acc, acc, a: a_val, b: b_hi, dtype });
 
-                            // 5. Interleave: b_f32 = [lo[0], hi[0], lo[1], hi[1], ...] → sequential order
-                            prog.emit(VmInstr::QuantInterleave { dst: b_f32, lo: b_lo, hi: b_hi, width });
-
-                            // 6. 累加器: acc += a_val * (b_f32 * scale_vec)
-                            // 先 scale weight: b_f32 = b_f32 * scale_vec
-                            prog.emit(VmInstr::VecBinOp { dst: b_f32, a: b_f32, b: scale_vec, op: VecOp::Mul, dtype: QuantPrecision::F32 });
-
-                            // 对于 unsigned nibbles (PackedInt4 = Q4_0-style), 已经减了 8.0 bias
-                            // 对于 signed nibbles (SignedPackedInt4), 已保持有符号值
-                            // b_f32 now = (nibble - bias) * scale
-                            // FMA: acc = acc + a_val * b_f32
-                            prog.emit(VmInstr::Fma { dst: acc, acc, a: a_val, b: b_f32, dtype });
-
-                            // 7. 前进 data_ptr
+                            // Advance data_ptr
                             prog.emit(VmInstr::GprBinOp { dst: data_ptr, a: data_ptr, b: GprOperand::VReg(data_step_reg ), op: GprOp::Add });
                             Ok(())
                         },

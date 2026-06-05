@@ -183,6 +183,9 @@ impl QuantOffsetDsl {
             DataLayout::NibbleWithHighBits { .. } => (lanes / 2) as i64,
             DataLayout::CodebookIndex { index_bits, .. } =>
                 ((lanes * (*index_bits as usize) + 7) / 8) as i64,
+            // Q3_K: specialized decode, data_step handled by Q3KDecodeStep VmInstr.
+            // Placeholder: lanes bytes per iteration (8 qs bytes for 8 elements).
+            DataLayout::TwoBitConditionalBias { .. } => lanes as i64,
         }
     }
 

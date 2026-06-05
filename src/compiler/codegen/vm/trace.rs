@@ -97,6 +97,7 @@ fn data_offset_from_desc(desc: &QuantFormatDescriptor) -> usize {
         crate::quant_format::DataLayout::NibbleWithHighBits { low_offset, .. } => *low_offset,
         crate::quant_format::DataLayout::Bytes { offset, .. } => *offset,
         crate::quant_format::DataLayout::CodebookIndex { offset, .. } => *offset,
+        crate::quant_format::DataLayout::TwoBitConditionalBias { qs_offset, .. } => *qs_offset,
     }
 }
 

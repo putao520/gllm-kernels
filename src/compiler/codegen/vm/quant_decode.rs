@@ -178,6 +178,11 @@ impl<'a> DecodeTraceBuilder<'a> {
             return self.build_e2m1_decode(trace, block_base_slot, data_ptr_slot, lane_offset_slot);
         }
 
+        // Q3_K (TwoBitConditionalBias): use monolithic decode TraceOp
+        if self.is_q3k_format() {
+            return self.build_q3k_decode(trace, block_base_slot, lane_offset_slot);
+        }
+
         let scale_result = self.emit_scale_load(trace, block_base_slot, lane_offset_slot);
         let zero_result = self.emit_zero_load(trace, block_base_slot, lane_offset_slot);
         let quant_data_slot = self.emit_data_load(trace, data_ptr_slot);
@@ -189,6 +194,45 @@ impl<'a> DecodeTraceBuilder<'a> {
     fn is_e2m1_format(&self) -> bool {
         use crate::quant_format::QuantDataKind;
         matches!(self.desc.data_kind, QuantDataKind::Float4 | QuantDataKind::Nvfp4)
+    }
+
+    /// Whether this format uses Q3_K monolithic decode (TwoBitConditionalBias layout).
+    fn is_q3k_format(&self) -> bool {
+        matches!(&self.desc.data_layout, DataLayout::TwoBitConditionalBias { .. })
+    }
+
+    /// Q3_K combined decode: loads d (f16), delegates to QuantQ3KDecode TraceOp
+    /// which handles 2-bit extraction + conditional hmask bias + scale multiplication.
+    fn build_q3k_decode(
+        &self,
+        trace: &mut Vec<TraceOp>,
+        block_base_slot: ValueId,
+        lane_offset_slot: ValueId,
+    ) -> ValueId {
+        let (qs_offset, hmask_offset) = match &self.desc.data_layout {
+            DataLayout::TwoBitConditionalBias { qs_offset, hmask_offset } => (*qs_offset, *hmask_offset),
+            _ => unreachable!("is_q3k_format guarantees TwoBitConditionalBias"),
+        };
+
+        // Load block super-scale d as f16→f32
+        let d_offset = match &self.desc.scale_layout {
+            ScaleLayout::Hierarchical { block_d_offset, .. } => *block_d_offset,
+            _ => 0,
+        };
+        let d_ptr = push_op(trace, TraceOp::QuantPtrAddOffset {
+            base: block_base_slot,
+            offset_bytes: d_offset as i64,
+        });
+        let d_slot = push_op(trace, TraceOp::QuantLoadF16toF32 { ptr: d_ptr, offset_bytes: 0 });
+
+        // Emit the monolithic Q3_K decode TraceOp
+        push_op(trace, TraceOp::QuantQ3KDecode {
+            block_base: block_base_slot,
+            lane_offset: lane_offset_slot,
+            d_slot,
+            qs_offset,
+            hmask_offset,
+        })
     }
 
     /// E2M1 LUT decode path for MXFP4/NVFP4: load raw scale byte + data pointer
@@ -588,6 +632,12 @@ impl<'a> DecodeTraceBuilder<'a> {
                     },
                 )
             }
+
+            DataLayout::TwoBitConditionalBias { .. } => {
+                // Q3_K uses build_q3k_decode instead of the standard data_load→unpack→dequant pipeline.
+                // This branch should never be reached.
+                unreachable!("TwoBitConditionalBias uses build_q3k_decode, not emit_data_load")
+            }
         }
     }
 
@@ -612,13 +662,13 @@ impl<'a> DecodeTraceBuilder<'a> {
                     trace,
                     TraceOp::QuantAndMask { src: hi_shifted, mask: 0x0F },
                 );
-                let interleaved = if *low_first {
-                    push_op(trace, TraceOp::QuantInterleave { lo: lo_slot, hi: hi_slot })
+                let concatenated = if *low_first {
+                    push_op(trace, TraceOp::QuantConcatSeq { lo: lo_slot, hi: hi_slot })
                 } else {
-                    push_op(trace, TraceOp::QuantInterleave { lo: hi_slot, hi: lo_slot })
+                    push_op(trace, TraceOp::QuantConcatSeq { lo: hi_slot, hi: lo_slot })
                 };
-                // Interleave output is integer (i32 lanes) — convert to f32 before arithmetic.
-                push_op(trace, TraceOp::QuantCastI8toF32 { src: interleaved })
+                // Concat output is integer (i32 lanes) — convert to f32 before arithmetic.
+                push_op(trace, TraceOp::QuantCastI8toF32 { src: concatenated })
             }
 
             DataLayout::NibbleWithHighBits { high_bits_per_elem, .. } => {
@@ -693,6 +743,10 @@ impl<'a> DecodeTraceBuilder<'a> {
                         },
                     )
                 }
+            }
+
+            DataLayout::TwoBitConditionalBias { .. } => {
+                unreachable!("TwoBitConditionalBias uses build_q3k_decode, not emit_unpack")
             }
         }
     }
@@ -888,9 +942,9 @@ mod tests {
             .build(&mut trace);
         assert_trace_valid(&trace);
         assert!(final_slot.0 < trace.len() as u32);
-        // Q4_1: PackedNibbles → QuantInterleave present
-        let has_interleave = trace.iter().any(|op| matches!(op, TraceOp::QuantInterleave { .. }));
-        assert!(has_interleave, "Q4_1 should have QuantInterleave for PackedNibbles");
+        // Q4_1: PackedNibbles → QuantConcatSeq present
+        let has_concat = trace.iter().any(|op| matches!(op, TraceOp::QuantConcatSeq { .. }));
+        assert!(has_concat, "Q4_1 should have QuantConcatSeq for PackedNibbles");
     }
 
     #[test]
@@ -985,7 +1039,7 @@ mod tests {
                     TraceOp::QuantShiftRight { src, .. } => vec![*src],
                     TraceOp::QuantCodebookLookup { indices, .. } => vec![*indices],
                     TraceOp::QuantDequantFma { acc, a, b } => vec![*acc, *a, *b],
-                    TraceOp::QuantInterleave { lo, hi } => vec![*lo, *hi],
+                    TraceOp::QuantInterleave { lo, hi } | TraceOp::QuantConcatSeq { lo, hi } => vec![*lo, *hi],
                     TraceOp::QuantScalarLoad { ptr, .. } => vec![*ptr],
                     TraceOp::Add(a, b) | TraceOp::Sub(a, b) | TraceOp::Mul(a, b) => vec![*a, *b],
                     _ => vec![],
@@ -1366,9 +1420,9 @@ mod tests {
         let has_sub = trace.iter().any(|op| matches!(op, TraceOp::Sub(_, _)));
         assert!(has_sub, "Squeeze should have Sub for static bias of 4");
 
-        // Squeeze: PackedNibbles → QuantInterleave present
-        let has_interleave = trace.iter().any(|op| matches!(op, TraceOp::QuantInterleave { .. }));
-        assert!(has_interleave, "Squeeze should have QuantInterleave for PackedNibbles");
+        // Squeeze: PackedNibbles → QuantConcatSeq present
+        let has_concat = trace.iter().any(|op| matches!(op, TraceOp::QuantConcatSeq { .. }));
+        assert!(has_concat, "Squeeze should have QuantConcatSeq for PackedNibbles");
 
         // Squeeze: no post-scale add (only pre-scale sub)
         let has_add = trace.iter().any(|op| matches!(op, TraceOp::Add(_, _)));
@@ -1801,9 +1855,9 @@ mod tests {
         let has_f16 = trace.iter().any(|op| matches!(op, TraceOp::QuantLoadF16toF32 { .. }));
         assert!(has_f16, "TQ2_0 should load f16 scale");
 
-        // TQ2_0: PackedNibbles → QuantInterleave
-        let has_interleave = trace.iter().any(|op| matches!(op, TraceOp::QuantInterleave { .. }));
-        assert!(has_interleave, "TQ2_0 should have QuantInterleave for PackedNibbles");
+        // TQ2_0: PackedNibbles → QuantConcatSeq
+        let has_concat = trace.iter().any(|op| matches!(op, TraceOp::QuantConcatSeq { .. }));
+        assert!(has_concat, "TQ2_0 should have QuantConcatSeq for PackedNibbles");
 
         // TQ2_0: no high bits pointer needed
         let builder = DecodeTraceBuilder::new(desc, 8);
@@ -2271,9 +2325,9 @@ mod tests {
             .count();
         assert!(f16_count >= 1, "Q4_1 should load at least 1 f16 value (d), got {}", f16_count);
 
-        // Assert: Q4_1 has QuantInterleave for PackedNibbles
-        let has_interleave = trace.iter().any(|op| matches!(op, TraceOp::QuantInterleave { .. }));
-        assert!(has_interleave, "Q4_1 should have QuantInterleave for PackedNibbles");
+        // Assert: Q4_1 has QuantConcatSeq for PackedNibbles
+        let has_concat = trace.iter().any(|op| matches!(op, TraceOp::QuantConcatSeq { .. }));
+        assert!(has_concat, "Q4_1 should have QuantConcatSeq for PackedNibbles");
 
         // Assert: Q4_1 has QuantBroadcast for scale
         let has_broadcast = trace.iter().any(|op| matches!(op, TraceOp::QuantBroadcast { .. }));
@@ -2301,9 +2355,9 @@ mod tests {
         let has_shift = trace.iter().any(|op| matches!(op, TraceOp::QuantShiftRight { .. }));
         assert!(has_shift, "Squeeze should have QuantShiftRight for high nibble");
 
-        // Assert: PackedNibbles → QuantInterleave
-        let has_interleave = trace.iter().any(|op| matches!(op, TraceOp::QuantInterleave { .. }));
-        assert!(has_interleave, "Squeeze should have QuantInterleave for lo/hi merge");
+        // Assert: PackedNibbles → QuantConcatSeq
+        let has_concat = trace.iter().any(|op| matches!(op, TraceOp::QuantConcatSeq { .. }));
+        assert!(has_concat, "Squeeze should have QuantConcatSeq for lo/hi merge");
     }
 
     // @trace TEST-QD-33 [req:REQ-QCG] [level:unit]

@@ -828,6 +828,8 @@ impl<'a> RegAllocator<'a> {
             VmInstr::QuantExtractBits { dst, src, .. } => vec![*dst, *src],
             VmInstr::QuantDequantFma { dst, weight, activation, scale, zero_point, .. } => vec![*dst, *weight, *activation, *scale, *zero_point],
             VmInstr::QuantInterleave { dst, lo, hi, .. } => vec![*dst, *lo, *hi],
+            VmInstr::QuantConcatSeq { dst, lo, hi, .. } => vec![*dst, *lo, *hi],
+            VmInstr::Q3KDecodeStep { dst, block_base, lane_offset, d_vreg, .. } => vec![*dst, *block_base, *lane_offset, *d_vreg],
             VmInstr::DotProduct { acc, a, b, .. } => vec![*acc, *a, *b],
             VmInstr::ScaleApply { dst, acc, scale, zero, .. } => vec![*dst, *acc, *scale, *zero],
             VmInstr::BitwiseGemm { dst, sign_bits, input_sign_bits, scale, .. } => vec![*dst, *sign_bits, *input_sign_bits, *scale],
@@ -1235,8 +1237,12 @@ impl<'a> RegAllocator<'a> {
                 VmInstr::QuantBroadcastInt { dst, .. } => *dst == vreg,
                 VmInstr::QuantExtractBits { dst, src, .. } => *dst == vreg && *src != vreg,
                 VmInstr::QuantCodebookLookup { dst, indices, .. } => *dst == vreg && *indices != vreg,
-                VmInstr::QuantInterleave { dst, lo, hi, .. } => {
+                VmInstr::QuantInterleave { dst, lo, hi, .. }
+                | VmInstr::QuantConcatSeq { dst, lo, hi, .. } => {
                     *dst == vreg && *lo != vreg && *hi != vreg
+                }
+                VmInstr::Q3KDecodeStep { dst, block_base, lane_offset, d_vreg, .. } => {
+                    *dst == vreg && *block_base != vreg && *lane_offset != vreg && *d_vreg != vreg
                 }
                 VmInstr::QuantScalarCvtLoad { dst, base, .. } => *dst == vreg && *base != vreg,
                 VmInstr::QuantDequantFma { dst, weight, activation, scale, zero_point, .. } => {

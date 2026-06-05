@@ -1874,3 +1874,96 @@ pub unsafe fn gemv_q4k_fused_avx512(
         row += 1;
     }
 }
+
+// ============================================================================
+// Q3_K native helper — Assisted decode path for complex quant format
+// ============================================================================
+
+/// Q3_K block layout (110 bytes, 256 elements):
+///   [0..32]   hmask[32]
+///   [32..96]  qs[64]
+///   [96..108] scales[12] (raw, before Q3KExtended rearrangement)
+///   [108..110] d (f16)
+///
+/// Dequant formula:
+///   Perform Q3KExtended rearrangement on raw scales → 16 scale bytes
+///   For each element:
+///     global_elem = lane_offset * lanes + i
+///     seg   = global_elem / 128           (0 or 1)
+///     group = (global_elem % 128) / 16    (0..7)
+///     j     = group % 4                   (shift index: 0..3)
+///     run   = group / 4                   (run index: 0 or 1)
+///     l     = global_elem % 16            (element within run)
+///
+///     qs_val = (qs[seg*32 + run*16 + l] >> (j*2)) & 3
+///     hmask_bit = (hmask[run*16 + l] >> (seg*4 + j)) & 1
+///     bias = if hmask_bit { 0 } else { 4 }
+///     scale_idx = seg*8 + j*2 + run
+///     dl = d * (scales[scale_idx] as i8 - 32)
+///     result = (qs_val - bias) * dl
+///
+/// This helper processes `lanes` consecutive elements starting at
+/// `lane_offset * lanes` within the block.
+#[no_mangle]
+#[cfg(target_arch = "x86_64")]
+pub unsafe extern "C" fn q3k_decode_step_native(
+    block: *const u8,
+    lane_offset: u64,
+    _d_f32: f32,
+    _qs_offset: u64,   // always 32 for Q3_K
+    _hmask_offset: u64, // always 0 for Q3_K
+    lanes: u64,
+    out: *mut f32,
+) {
+    if block.is_null() {
+        return;
+    }
+
+    // Load d from block (f16 at offset 108) via half crate
+    let d_bits = (*block.add(108) as u16) | ((*block.add(109) as u16) << 8);
+    let d = half::f16::from_bits(d_bits).to_f32();
+
+    // Q3KExtended rearrangement
+    let bp = block.add(96);
+    let a0 = (bp.add(0) as *const u32).read_unaligned();
+    let a1 = (bp.add(4) as *const u32).read_unaligned();
+    let tmp = (bp.add(8) as *const u32).read_unaligned();
+    let kmask1: u32 = 0x03030303;
+    let kmask2: u32 = 0x0f0f0f0f;
+    let aux_0 = (a0 & kmask2) | (((tmp >> 0) & kmask1) << 4);
+    let aux_1 = (a1 & kmask2) | (((tmp >> 2) & kmask1) << 4);
+    let aux_2 = ((a0 >> 4) & kmask2) | (((tmp >> 4) & kmask1) << 4);
+    let aux_3 = ((a1 >> 4) & kmask2) | (((tmp >> 6) & kmask1) << 4);
+
+    // Store scales into local array
+    let mut scales_arr = [0i8; 16];
+    for b in 0..4 {
+        let bytes = [aux_0.to_ne_bytes(), aux_1.to_ne_bytes(), aux_2.to_ne_bytes(), aux_3.to_ne_bytes()];
+        scales_arr[b * 4 + 0] = bytes[b][0] as i8;
+        scales_arr[b * 4 + 1] = bytes[b][1] as i8;
+        scales_arr[b * 4 + 2] = bytes[b][2] as i8;
+        scales_arr[b * 4 + 3] = bytes[b][3] as i8;
+    }
+
+    let q = block.add(32);   // qs[64]
+    let hm = block.add(0);   // hmask[32]
+
+    for i in 0..lanes as usize {
+        let global_elem = (lane_offset as usize) + i;
+        let seg = global_elem / 128;
+        let j = (global_elem % 128) / 32;
+        let run = (global_elem % 32) / 16;
+        let l = global_elem % 16;
+
+        let shift = j * 2;
+        let qs_val = (*q.add(seg * 32 + run * 16 + l) >> shift) & 3;
+        let m = 1u8 << (seg * 4 + j);
+        let hmask_bit = (*hm.add(run * 16 + l) & m) != 0;
+        let bias = if hmask_bit { 0i8 } else { 4i8 };
+
+        let scale_idx = seg * 8 + j * 2 + run;
+        let dl = d * (scales_arr[scale_idx] as f32 - 32.0f32);
+
+        *out.add(i) = (qs_val as i8 - bias) as f32 * dl;
+    }
+}

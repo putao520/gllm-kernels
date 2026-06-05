@@ -305,7 +305,7 @@ fn trace_op_flops(op: &TraceOp) -> u64 {
         TraceOp::QuantExtractBits { .. } => 1,
         TraceOp::QuantDequantFma { .. } => 2,
         TraceOp::QuantIntDivConst { .. } | TraceOp::QuantIntMul { .. } => 1,
-        TraceOp::QuantInterleave { .. } => 1,
+        TraceOp::QuantInterleave { .. } | TraceOp::QuantConcatSeq { .. } => 1,
         TraceOp::QuantPtrAddOffset { .. } | TraceOp::QuantPtrAddDynamic { .. } | TraceOp::QuantAndMask { .. } | TraceOp::QuantScalarLoad { .. } | TraceOp::QuantLoadF16toF32 { .. } | TraceOp::QuantLoadI8toF32 { .. } | TraceOp::QuantLoadBytesVec { .. } | TraceOp::QuantKQuantPackedScaleLookup { .. } => 0,
         TraceOp::QuantShiftLeft { .. } | TraceOp::QuantShiftRight { .. } => 1,
         // SPEC 24-QUANT-PIPELINE-JIT: quant block-level load TraceOps
@@ -313,6 +313,7 @@ fn trace_op_flops(op: &TraceOp) -> u64 {
         | TraceOp::QuantZeroLoad { .. } | TraceOp::QuantSubScaleLoad { .. }
         | TraceOp::QuantHighBitsLoad { .. } | TraceOp::QuantE2m1LutDecode { .. } => 0,
         TraceOp::QuantCodebookDequant { .. } => 4,
+        TraceOp::QuantQ3KDecode { .. } => 8,
         // ── SPEC 27 AT-002: 结构型扩展 ──
         TraceOp::Loop { .. } => 0,
         TraceOp::PanelLoad { .. } | TraceOp::PanelStore { .. } => 0,
