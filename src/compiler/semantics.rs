@@ -67,7 +67,7 @@ pub fn classify(kind: &OpKind) -> OpSemantics {
         }
 
         // RoPE: elementwise rotation (x*cos - y*sin, x*sin + y*cos)
-        OpKind::RoPE { .. } => OpSemantics::Elementwise,
+        OpKind::RoPE { .. } | OpKind::DualRoPE { .. } => OpSemantics::Elementwise,
 
         // Attention: can fuse with pre/post projections
         OpKind::MultiHeadAttention { .. } | OpKind::CachedGQA { .. } => {
@@ -253,7 +253,7 @@ pub fn arithmetic_intensity(kind: &OpKind, graph_dtype: crate::types::DType) -> 
             // 2-pass: ~5N FLOPs, ~3*eb*N bytes
             5.0 / (3.0 * eb)
         }
-        OpKind::RoPE { .. } => {
+        OpKind::RoPE { .. } | OpKind::DualRoPE { .. } => {
             // 6 FLOPs per pair, 4*eb bytes (2 reads + 2 writes) + cos/sin overhead
             6.0 / (4.0 * eb)
         }

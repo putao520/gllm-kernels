@@ -89,6 +89,7 @@ impl ScalarOpRegistry {
             OpKind::GeGlu => OpKindKey::GeGlu,
             OpKind::Softmax => OpKindKey::Softmax,
             OpKind::RoPE { .. } => OpKindKey::RoPE,
+            OpKind::DualRoPE { .. } => OpKindKey::DualRoPE,
             OpKind::Add => OpKindKey::Add,
             OpKind::Mul => OpKindKey::Mul,
             OpKind::Residual => OpKindKey::Residual,

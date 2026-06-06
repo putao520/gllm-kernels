@@ -76,6 +76,28 @@ pub enum OpKind {
         partial: f32,
         rope_scaling: Option<RopeScaling>,
     },
+    /// Dual RoPE for models with per-layer different theta/partial (e.g., Gemma 4).
+    /// At runtime, selects between sliding and global RoPE parameters based on
+    /// the layer index: if `(layer_idx + offset) % divisor == remainder` → global,
+    /// otherwise → sliding. The cos/sin tables for both parameter sets are
+    /// precomputed into primary and secondary scratchpad caches.
+    DualRoPE {
+        num_heads: usize,
+        head_dim: usize,
+        /// Sliding layer theta (e.g., 10000 for Gemma 4)
+        sliding_theta: f64,
+        /// Sliding layer partial ratio (e.g., 1.0 for full rotation)
+        sliding_partial: f32,
+        /// Global layer theta (e.g., 1000000 for Gemma 4)
+        global_theta: f64,
+        /// Global layer partial ratio (e.g., 0.25 for p-RoPE)
+        global_partial: f32,
+        rope_scaling: Option<RopeScaling>,
+        /// Layer index condition: global when `(layer_idx + offset) % divisor == remainder`
+        layer_offset: usize,
+        layer_divisor: usize,
+        layer_remainder: usize,
+    },
 
     // ── Elementwise ──
     Add,

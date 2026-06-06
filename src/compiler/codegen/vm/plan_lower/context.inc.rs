@@ -286,7 +286,21 @@ pub(crate) fn compute_rope_requirement(
     for group in &plan.groups {
         for &op_id in &group.ops {
             let Some(op) = graph.op(op_id) else { continue };
-            if let OpKind::RoPE { head_dim, theta, partial, rope_scaling, .. } = &op.kind {
+            // Collect RoPE params from both standard RoPE and DualRoPE ops.
+            // DualRoPE contributes two entries (sliding + global) simultaneously.
+            let rope_params: Vec<(usize, f64, f32, Option<RopeScaling>)> = match &op.kind {
+                OpKind::RoPE { head_dim, theta, partial, rope_scaling, .. } => {
+                    vec![(*head_dim, *theta, *partial, rope_scaling.clone())]
+                }
+                OpKind::DualRoPE { head_dim, sliding_theta, sliding_partial, global_theta, global_partial, rope_scaling, .. } => {
+                    vec![
+                        (*head_dim, *sliding_theta, *sliding_partial, rope_scaling.clone()),
+                        (*head_dim, *global_theta, *global_partial, rope_scaling.clone()),
+                    ]
+                }
+                _ => continue,
+            };
+            for (head_dim, theta, partial, rope_scaling) in rope_params {
                 let out_tensor = op.outputs.first()
                     .and_then(|&tid| graph.tensor(tid))
                     .ok_or_else(|| CompilerError::CodegenViolation(format!(
@@ -298,11 +312,11 @@ pub(crate) fn compute_rope_requirement(
                     .ok_or_else(|| CompilerError::CodegenViolation(format!(
                         "RoPE op {:?}: 无法推导 seq 维度 (shape={:?})", op_id, out_tensor.shape)))?;
 
-                let entry = (*head_dim, *theta, *partial, max_seq, *rope_scaling);
+                let entry = (head_dim, theta, partial, max_seq, rope_scaling);
 
                 let matches = |e: &(usize, f64, f32, usize, Option<RopeScaling>)| -> bool {
                     let (h, t, p, _, s) = e;
-                    *h == *head_dim && (t - *theta).abs() < 1e-6 && (p - *partial).abs() < 1e-6
+                    *h == head_dim && (t - theta).abs() < 1e-6 && (p - partial).abs() < 1e-6
                         && s.as_ref().map(|s| s.fingerprint_bytes()) == rope_scaling.as_ref().map(|s| s.fingerprint_bytes())
                 };
 

@@ -610,6 +610,12 @@ impl InferenceCompiler {
                     resource_plan.summary.peak_gpr_regs);
             }
 
+            let needs_kv = config.business_config.output_modes.iter().any(|m| {
+                matches!(m, crate::compiler::mega_kernel_abi::OutputMode::Generate { .. })
+            });
+            let is_encoder = !config.business_config.output_modes.iter().any(|m| {
+                matches!(m, crate::compiler::mega_kernel_abi::OutputMode::Generate { .. })
+            });
             let t4 = std::time::Instant::now();
             let (mut program, rope_cache, logits_scratch_offset) = compile_mega_kernel_vm(
                 &fusion_plan, &graph, &alloc, Some(&registry), &profile,
@@ -618,6 +624,8 @@ impl InferenceCompiler {
                 config.business_config.debug_jit,
                 config.business_config.mtp_config.as_ref(),
                 Some(&resource_plan),
+                needs_kv,
+                is_encoder,
             ).map_err(InferenceError::CompileError)?;
             eprintln!("[JIT-TIME] compile_mega_kernel_vm: {:.2}ms ({} VmInstrs)", t4.elapsed().as_secs_f64() * 1000.0, program.len());
             // Dump VmProgram for debugging
@@ -795,12 +803,20 @@ impl InferenceCompiler {
             &graph, &fusion_plan, &profile, &alloc,
             geometry.hidden, activation_bytes, kv_bytes,
         );
+        let needs_kv = config.business_config.output_modes.iter().any(|m| {
+            matches!(m, crate::compiler::mega_kernel_abi::OutputMode::Generate { .. })
+        });
+        let is_encoder = !config.business_config.output_modes.iter().any(|m| {
+            matches!(m, crate::compiler::mega_kernel_abi::OutputMode::Generate { .. })
+        });
         let (mut program, rope_cache, logits_scratch_offset) =
             codegen::vm::mega_kernel_emit::compile_mega_kernel_vm(
                 &fusion_plan, &graph, &alloc, Some(&registry), &profile,
                 None, geometry.vocab_size, &buffer_layout, Some(bottleneck_map),
                 Some(&virtual_activation), Some(&virtual_tensor_map), Some(&layout_assignment),
                 false, None, Some(&resource_plan),
+                needs_kv,
+                is_encoder,
             ).map_err(|e| InferenceError::CompileError(e.into()))?;
 
         let pass_registry = PassRegistry::with_defaults();

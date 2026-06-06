@@ -478,6 +478,8 @@ impl AArch64Lower {
                         step: *step_bytes,
                         is_sve: true,
                         bound_reg: Some(bound_reg),
+                        counter_spill_sp_off: None,
+                        offset_spill_sp_off: None,
                     });
                 } else {
                     // ── NEON path: CMP + B.GE traditional loop ──
@@ -520,6 +522,8 @@ impl AArch64Lower {
                         step: *step_bytes,
                         is_sve: false,
                         bound_reg: None,
+                        counter_spill_sp_off: None,
+                        offset_spill_sp_off: None,
                     });
                 }
                 Ok(())

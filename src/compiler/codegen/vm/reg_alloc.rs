@@ -1027,22 +1027,12 @@ impl<'a> RegAllocator<'a> {
                         mapping.insert(iv.vreg, PhysReg::Gpr(*reg));
                         gpr_used.insert(*reg);
                     } else {
-                        // Counter 是循环控制寄存器 (初始化、cmp、inc 每步都用)，
-                        // 一旦 spill 必须每条指令 load/store，语义和性能都不可接受。
-                        // ByteOffset 可以 spill — x86_lower 在 LoopEnd 时通过 scratch r10
-                        // 从 spill slot 加载、加 step、存回 (见 x86_lower LoopBegin/LoopEnd)。
-                        if matches!(iv.kind, VRegKind::Counter) {
-                            return Err(format!(
-                                "RegAllocator: {:?} v{} cannot be spilled (loop-control VReg). \
-                                 pool_size={} occupied={}. 需要减少同时活跃的 Counter \
-                                 或扩大 GPR 池 (ARCH-REGALLOC-COUNTER-NOSPILL)",
-                                iv.kind, iv.vreg.0, pool.len(), occupied_gpr.len(),
-                            ));
-                        }
-                        // GPR spill: 无可用物理寄存器 → 落到栈 slot。
+                        // Counter/ByteOffset/Ptr/Scalar: 无可用物理 GPR → spill 到栈。
                         // ARCH-REGALLOC-GPR-SPILL: mapping 必须记录 Spilled 变体，
                         // 否则 resolve_gpr 在 ISA Lower 阶段找不到 mapping 报错。
                         // REQ-LC-004~006: 使用 ScopedSpillAllocator 分配 scope-aware slot。
+                        // Counter spilling: ISA Lower 在 LoopBegin/LoopEnd 通过 scratch GPR
+                        // 做 load→cmp→inc→store (见 x86_lower/aarch64_lower LoopBegin/LoopEnd)。
                         let scope_id = Self::scope_at_position(&scope_positions, iv.def_point);
                         let (slot_id, _offset) = scoped_alloc.alloc(iv.vreg, 8, scope_id);
                         mapping.insert(iv.vreg, PhysReg::Spilled(slot_id as u32));
@@ -1421,17 +1411,7 @@ impl<'a> RegAllocator<'a> {
             }
         }
 
-        // 3. Counter 永远不 spill
-        for iv in intervals {
-            if matches!(iv.kind, VRegKind::Counter) {
-                if let Some(PhysReg::Spilled(_)) = mapping.get(&iv.vreg) {
-                    return Err(format!(
-                        "post_alloc_verify: Counter VRegId({}) was spilled — counters must stay in physical registers",
-                        iv.vreg.0
-                    ));
-                }
-            }
-        }
+        // 3. Counter spill is now supported (load→cmp→inc→store pattern in ISA lower)
 
         // 4. LifecycleTag 一致性 — LoopInvariant 的活跃区间应跨 loop
         for iv in intervals {
@@ -2325,7 +2305,7 @@ mod tests {
     }
 
     #[test]
-    fn test_post_alloc_verify_counter_spilled_rejected() {
+    fn test_post_alloc_verify_counter_spilled_accepted() {
         let intervals = vec![LiveInterval {
             vreg: VRegId(0), kind: VRegKind::Counter, width: SimdWidth::Scalar,
             def_point: 0, last_use: 10, lifecycle: LifecycleTag::LoopCarried,
@@ -2333,7 +2313,7 @@ mod tests {
         let mut mapping = HashMap::new();
         mapping.insert(VRegId(0), PhysReg::Spilled(0));
         let spills = vec![SpillSlot { vreg: VRegId(0), offset: 0, size: 8 }];
-        assert!(RegAllocator::post_alloc_verify(&mapping, &intervals, &spills).is_err());
+        assert!(RegAllocator::post_alloc_verify(&mapping, &intervals, &spills).is_ok());
     }
 
     #[test]

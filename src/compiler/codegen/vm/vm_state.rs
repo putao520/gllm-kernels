@@ -367,6 +367,8 @@ pub struct EmitState {
     pub hetero_seg_byte_offset: Option<super::instr::VRegId>,
     /// 异构段权重基址 VReg
     pub hetero_seg_weight_base: Option<super::instr::VRegId>,
+    /// 全局 layer_idx VReg（异构层中用于 GprCondAction）
+    pub hetero_global_layer_idx: Option<super::instr::VRegId>,
     /// Current active layer guard (for guard run merging).
     /// `Always` = no guard active. When consecutive ops share the same guard,
     /// only one GprCondAction is emitted covering all of them.

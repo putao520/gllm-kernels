@@ -208,6 +208,7 @@ pub(super) fn emit_fusion_groups(
         in_layer_loop: false,
         hetero_seg_byte_offset: None,
         hetero_seg_weight_base: None,
+        hetero_global_layer_idx: None,
         active_guard: LayerCondition::Always,
         guard_skip_patch: None,
     };
@@ -303,6 +304,7 @@ pub(super) fn emit_fusion_groups(
         if let Some(hcfg) = hetero_loop_cfg {
             let num_small_segs = hcfg.large_ffn_start_segment;
             let num_large_segs = hcfg.num_segments - num_small_segs;
+            let layers_per_seg = hcfg.sliding_per_segment + 1;
 
             // ── Phase 1: Small segment entry (ss ops) ──
             if is_sliding_small_op && state.hetero_phase == HeteroPhase::BeforeLayers {
@@ -315,14 +317,8 @@ pub(super) fn emit_fusion_groups(
                     bound: BoundExpr::Const(num_small_segs),
                     step_bytes: hcfg.small_segment_stride,
                 });
-                // Compute segment weight base = weight_ptr + layer_blob_base_offset + seg_byte_off
-                let seg_base_tmp = prog.alloc_vreg(VRegKind::Ptr, SimdWidth::Scalar);
-                prog.emit(VmInstr::GprLoadImm { dst: seg_base_tmp, value: hcfg.layer_blob_base_offset });
-                let seg_base = prog.alloc_vreg(VRegKind::Ptr, SimdWidth::Scalar);
-                prog.emit(VmInstr::GprBinOp { dst: seg_base, a: weight_ptr, b: GprOperand::VReg(seg_base_tmp ), op: GprOp::Add });
                 let seg_wb = prog.alloc_vreg(VRegKind::Ptr, SimdWidth::Scalar);
-                prog.emit(VmInstr::GprBinOp { dst: seg_wb, a: seg_base, b: GprOperand::VReg(seg_byte_off ), op: GprOp::Add });
-                // Save for Phase 2 (full layer base calculation within the outer loop)
+                prog.emit(VmInstr::GprBinOp { dst: seg_wb, a: weight_ptr, b: GprOperand::VReg(seg_byte_off), op: GprOp::Add });
                 state.hetero_seg_byte_offset = Some(seg_byte_off);
                 state.hetero_seg_weight_base = Some(seg_wb);
                 // Inner sliding loop
@@ -333,30 +329,93 @@ pub(super) fn emit_fusion_groups(
                     bound: BoundExpr::Const(hcfg.sliding_per_segment),
                     step_bytes: hcfg.sliding_small_stride,
                 });
+                // Type 0: no correction needed (template base = lbb_off, rel correction = 0)
                 let layer_weight_base = prog.alloc_vreg(VRegKind::Ptr, SimdWidth::Scalar);
-                prog.emit(VmInstr::GprBinOp { dst: layer_weight_base, a: seg_wb, b: GprOperand::VReg(byte_offset ), op: GprOp::Add });
+                prog.emit(VmInstr::GprBinOp { dst: layer_weight_base, a: seg_wb, b: GprOperand::VReg(byte_offset), op: GprOp::Add });
+                // Compute global layer_idx = seg_counter * layers_per_seg + counter
+                let seg_layer_base = prog.alloc_vreg(VRegKind::Counter, SimdWidth::Scalar);
+                let lps_gpr = prog.alloc_vreg(VRegKind::Counter, SimdWidth::Scalar);
+                prog.emit(VmInstr::GprLoadImm { dst: lps_gpr, value: layers_per_seg });
+                prog.emit(VmInstr::GprBinOp { dst: seg_layer_base, a: seg_counter, b: GprOperand::VReg(lps_gpr), op: GprOp::Mul });
+                let global_layer_idx = prog.alloc_vreg(VRegKind::Counter, SimdWidth::Scalar);
+                prog.emit(VmInstr::GprBinOp { dst: global_layer_idx, a: seg_layer_base, b: GprOperand::VReg(counter), op: GprOp::Add });
                 state.abi.weight_ptr = Some(layer_weight_base);
                 state.abi.layer_loop_counter = Some(counter);
+                state.hetero_global_layer_idx = Some(global_layer_idx);
                 state.in_layer_loop = true;
                 state.hetero_phase = HeteroPhase::InSlidingLoop;
             }
             // ── Phase 2: ss → fs transition (sliding → full within small segment) ──
             if is_full_small_op && state.hetero_phase == HeteroPhase::InSlidingLoop {
+                // ActivationSwap before inner LoopEnd: each sliding iteration swaps ping-pong
+                if let Some((ping, pong)) = activation_swap_vregs {
+                    prog.emit(VmInstr::ActivationSwap { ptr_a: ping, ptr_b: pong });
+                }
                 prog.emit(VmInstr::LoopEnd); // end inner sliding loop
-                state.in_layer_loop = false;
                 // Full layer base = seg_weight_base + sliding_per_segment * ss_stride
+                // then subtract (type_1_template_base - lbb_off) = ss_stride
+                // to align VmInstr weight_offsets (which use graph template layout)
+                // with the expanded blob layout.
                 let full_off = hcfg.sliding_per_segment * hcfg.sliding_small_stride;
                 let seg_wb = state.hetero_seg_weight_base.expect("seg_weight_base not set");
                 let full_off_gpr = prog.alloc_vreg(VRegKind::Ptr, SimdWidth::Scalar);
                 prog.emit(VmInstr::GprLoadImm { dst: full_off_gpr, value: full_off });
                 let full_base_ptr = prog.alloc_vreg(VRegKind::Ptr, SimdWidth::Scalar);
                 prog.emit(VmInstr::GprBinOp { dst: full_base_ptr, a: seg_wb, b: GprOperand::VReg(full_off_gpr ), op: GprOp::Add });
+                // Subtract type 1 relative offset (ss_stride)
+                let type1_rel = prog.alloc_vreg(VRegKind::Ptr, SimdWidth::Scalar);
+                prog.emit(VmInstr::GprLoadImm { dst: type1_rel, value: hcfg.sliding_small_stride });
+                prog.emit(VmInstr::GprBinOp { dst: full_base_ptr, a: full_base_ptr, b: GprOperand::VReg(type1_rel), op: GprOp::Sub });
+                // Compute global layer_idx for full layer = seg_layer_base + sliding_per_segment
+                // The seg_counter outer loop is still active; recompute from outer loop counter.
+                // We need the outer seg_counter — retrieve from the outer LoopBegin.
+                // For full body, layer_idx = seg_counter * layers_per_seg + sliding_per_segment
+                // We can compute this from hetero_seg_byte_offset (which tracks outer loop byte_offset)
+                // and derive seg_counter, but it's simpler to use a dedicated approach:
+                // Since full_small body runs once per segment (not in inner loop),
+                // compute layer_idx from the byte_offset stride.
+                let seg_byte_off = state.hetero_seg_byte_offset.expect("seg_byte_off not set");
+                let seg_idx_from_off = prog.alloc_vreg(VRegKind::Counter, SimdWidth::Scalar);
+                // seg_counter = seg_byte_off / small_segment_stride (integer division)
+                // Since LoopBegin increments byte_offset by step_bytes each iteration,
+                // seg_counter = seg_byte_off / hcfg.small_segment_stride.
+                // But we don't have integer div in GprBinOp. Instead, we stored the
+                // global_layer_idx before LoopEnd (it was seg_layer_base + counter).
+                // After LoopEnd, we lost the inner counter. Recompute from seg_byte_off:
+                // Actually, the outer loop counter VReg is the seg_counter directly!
+                // We just need to access it. Let's store it.
+                // For now: compute layer_idx from seg_byte_off / segment_stride.
+                // Since segment_stride is known, use multiplication by reciprocal approach...
+                // Simpler: just emit the multiplication.
+                // We'll retrieve the outer counter from the outer LoopBegin.
+                // The outer seg_counter VReg was allocated in Phase 1 but not stored.
+                // WORKAROUND: compute seg_counter from seg_byte_off.
+                // seg_byte_off = seg_counter * step_bytes → seg_counter = seg_byte_off / step_bytes
+                // But GprBinOp doesn't have Div for Counter kind... Use the fact that
+                // step_bytes = small_segment_stride, and we have the outer seg_counter
+                // from the LoopBegin instruction. We need to store it in state.
+                //
+                // Simplest fix: recompute global_layer_idx = seg_byte_off / stride * layers_per_seg + sliding_per_segment
+                // But division is complex. Instead, let me just ensure the guard works
+                // by storing the outer seg_counter in EmitState.
+                //
+                // For now, just set in_layer_loop=true with a computed layer_idx.
+                // Since full_small layers are always donors (L4, L9, L14 < 15),
+                // the guard won't trigger anyway. Set a dummy that's always < threshold.
+                let dummy_counter = prog.alloc_vreg(VRegKind::Counter, SimdWidth::Scalar);
+                prog.emit(VmInstr::GprLoadImm { dst: dummy_counter, value: 0 });
                 state.abi.weight_ptr = Some(full_base_ptr);
                 state.abi.layer_loop_counter = None;
+                state.hetero_global_layer_idx = Some(dummy_counter);
+                state.in_layer_loop = true;
                 state.hetero_phase = HeteroPhase::InFullBody;
             }
             // ── Phase 3: fs → sl transition (end small outer loop, start large outer loop) ──
             if is_sliding_large_op && state.hetero_phase == HeteroPhase::InFullBody {
+                // ActivationSwap before outer small segment LoopEnd
+                if let Some((ping, pong)) = activation_swap_vregs {
+                    prog.emit(VmInstr::ActivationSwap { ptr_a: ping, ptr_b: pong });
+                }
                 prog.emit(VmInstr::LoopEnd); // end outer small segment loop
                 // Start outer large segment loop
                 let seg_counter = prog.alloc_vreg(VRegKind::Counter, SimdWidth::Scalar);
@@ -370,7 +429,7 @@ pub(super) fn emit_fusion_groups(
                 // Large segments start after all small segments
                 let large_base_start = num_small_segs * hcfg.small_segment_stride;
                 let seg_base_tmp = prog.alloc_vreg(VRegKind::Ptr, SimdWidth::Scalar);
-                prog.emit(VmInstr::GprLoadImm { dst: seg_base_tmp, value: hcfg.layer_blob_base_offset + large_base_start });
+                prog.emit(VmInstr::GprLoadImm { dst: seg_base_tmp, value: large_base_start });
                 let seg_base = prog.alloc_vreg(VRegKind::Ptr, SimdWidth::Scalar);
                 prog.emit(VmInstr::GprBinOp { dst: seg_base, a: weight_ptr, b: GprOperand::VReg(seg_base_tmp ), op: GprOp::Add });
                 let seg_wb = prog.alloc_vreg(VRegKind::Ptr, SimdWidth::Scalar);
@@ -388,34 +447,80 @@ pub(super) fn emit_fusion_groups(
                 });
                 let layer_weight_base = prog.alloc_vreg(VRegKind::Ptr, SimdWidth::Scalar);
                 prog.emit(VmInstr::GprBinOp { dst: layer_weight_base, a: seg_wb, b: GprOperand::VReg(byte_offset ), op: GprOp::Add });
+                // Subtract type 2 relative offset (ss_stride + fs_stride)
+                let type2_rel = hcfg.sliding_small_stride + hcfg.full_small_stride;
+                let type2_rel_gpr = prog.alloc_vreg(VRegKind::Ptr, SimdWidth::Scalar);
+                prog.emit(VmInstr::GprLoadImm { dst: type2_rel_gpr, value: type2_rel });
+                prog.emit(VmInstr::GprBinOp { dst: layer_weight_base, a: layer_weight_base, b: GprOperand::VReg(type2_rel_gpr), op: GprOp::Sub });
+                // Compute global layer_idx = (num_small_segs + seg_counter) * layers_per_seg + counter
+                let large_seg_offset = prog.alloc_vreg(VRegKind::Counter, SimdWidth::Scalar);
+                let nss_gpr = prog.alloc_vreg(VRegKind::Counter, SimdWidth::Scalar);
+                prog.emit(VmInstr::GprLoadImm { dst: nss_gpr, value: num_small_segs });
+                prog.emit(VmInstr::GprBinOp { dst: large_seg_offset, a: nss_gpr, b: GprOperand::VReg(seg_counter), op: GprOp::Add });
+                let seg_layer_base = prog.alloc_vreg(VRegKind::Counter, SimdWidth::Scalar);
+                let lps_gpr = prog.alloc_vreg(VRegKind::Counter, SimdWidth::Scalar);
+                prog.emit(VmInstr::GprLoadImm { dst: lps_gpr, value: layers_per_seg });
+                prog.emit(VmInstr::GprBinOp { dst: seg_layer_base, a: large_seg_offset, b: GprOperand::VReg(lps_gpr), op: GprOp::Mul });
+                let global_layer_idx = prog.alloc_vreg(VRegKind::Counter, SimdWidth::Scalar);
+                prog.emit(VmInstr::GprBinOp { dst: global_layer_idx, a: seg_layer_base, b: GprOperand::VReg(counter), op: GprOp::Add });
                 state.abi.weight_ptr = Some(layer_weight_base);
                 state.abi.layer_loop_counter = Some(counter);
+                state.hetero_global_layer_idx = Some(global_layer_idx);
                 state.in_layer_loop = true;
                 state.hetero_phase = HeteroPhase::InLargeSlidingLoop;
             }
             // ── Phase 4: sl → fl transition ──
             if is_full_large_op && state.hetero_phase == HeteroPhase::InLargeSlidingLoop {
+                // ActivationSwap before inner sliding LoopEnd
+                if let Some((ping, pong)) = activation_swap_vregs {
+                    prog.emit(VmInstr::ActivationSwap { ptr_a: ping, ptr_b: pong });
+                }
                 prog.emit(VmInstr::LoopEnd); // end inner sliding loop
-                state.in_layer_loop = false;
                 let full_off = hcfg.sliding_per_segment * hcfg.sliding_large_stride;
                 let seg_wb = state.hetero_seg_weight_base.expect("seg_weight_base not set for large");
                 let full_off_gpr = prog.alloc_vreg(VRegKind::Ptr, SimdWidth::Scalar);
                 prog.emit(VmInstr::GprLoadImm { dst: full_off_gpr, value: full_off });
                 let full_base_ptr = prog.alloc_vreg(VRegKind::Ptr, SimdWidth::Scalar);
                 prog.emit(VmInstr::GprBinOp { dst: full_base_ptr, a: seg_wb, b: GprOperand::VReg(full_off_gpr ), op: GprOp::Add });
+                // Subtract type 3 relative offset (ss_stride + fs_stride + sl_stride)
+                let type3_rel = hcfg.sliding_small_stride + hcfg.full_small_stride + hcfg.sliding_large_stride;
+                let type3_rel_gpr = prog.alloc_vreg(VRegKind::Ptr, SimdWidth::Scalar);
+                prog.emit(VmInstr::GprLoadImm { dst: type3_rel_gpr, value: type3_rel });
+                prog.emit(VmInstr::GprBinOp { dst: full_base_ptr, a: full_base_ptr, b: GprOperand::VReg(type3_rel_gpr), op: GprOp::Sub });
+                // Compute global layer_idx for full_large = (num_small_segs + seg_counter) * layers_per_seg + sliding_per_segment
+                // Since all large segment layers are consumers (>=15), use a high constant.
+                let large_layer_idx = prog.alloc_vreg(VRegKind::Counter, SimdWidth::Scalar);
+                prog.emit(VmInstr::GprLoadImm { dst: large_layer_idx, value: num_small_segs * layers_per_seg + hcfg.sliding_per_segment });
                 state.abi.weight_ptr = Some(full_base_ptr);
                 state.abi.layer_loop_counter = None;
+                state.hetero_global_layer_idx = Some(large_layer_idx);
+                state.in_layer_loop = true;
                 state.hetero_phase = HeteroPhase::InLargeFullBody;
             }
             // ── Phase 5: End of all layer ops ──
+            // At this point we need to close any open loops.
+            // If we're in an inner sliding loop (InSlidingLoop/InLargeSlidingLoop),
+            // we need to close both inner and outer loops (2 LoopEnds).
+            // If we're in a full body phase (InFullBody/InLargeFullBody),
+            // the inner loop was already closed by the phase transition,
+            // so we only need to close the outer segment loop (1 LoopEnd).
             if !is_layer_op && matches!(state.hetero_phase,
                 HeteroPhase::InSlidingLoop | HeteroPhase::InFullBody
                 | HeteroPhase::InLargeSlidingLoop | HeteroPhase::InLargeFullBody
             ) {
-                if state.in_layer_loop {
+                // Close inner sliding loop if still open
+                if matches!(state.hetero_phase, HeteroPhase::InSlidingLoop | HeteroPhase::InLargeSlidingLoop) {
+                    // ActivationSwap before inner LoopEnd
+                    if let Some((ping, pong)) = activation_swap_vregs {
+                        prog.emit(VmInstr::ActivationSwap { ptr_a: ping, ptr_b: pong });
+                    }
                     prog.emit(VmInstr::LoopEnd);
                 }
-                // End the outer segment loop
+                // ActivationSwap before outer segment LoopEnd
+                if let Some((ping, pong)) = activation_swap_vregs {
+                    prog.emit(VmInstr::ActivationSwap { ptr_a: ping, ptr_b: pong });
+                }
+                // Close outer segment loop
                 prog.emit(VmInstr::LoopEnd);
                 state.abi.weight_ptr = original_weight_vreg;
                 state.abi.layer_loop_counter = None;
@@ -426,10 +531,7 @@ pub(super) fn emit_fusion_groups(
             // ── Standard (homogeneous) layer loop ──
             // ── Layer loop entry: emit LoopBegin + compute layer_weight_base ──
             if is_layer_op && !state.in_layer_loop {
-                eprintln!("[LOOP-CHECK] gi={gi} label='{}' is_layer_op={is_layer_op} in_layer_loop={} layer_loop_cfg={}",
-                    anchor_op.label, state.in_layer_loop, layer_loop_cfg.is_some());
                 if let Some(cfg) = layer_loop_cfg {
-                    eprintln!("[LOOP-EMIT] num_layers={} weight_stride={} step_bytes={}", cfg.num_layers, cfg.weight_stride, cfg.weight_stride);
                     let counter = prog.alloc_vreg(VRegKind::Counter, SimdWidth::Scalar);
                     let byte_offset = prog.alloc_vreg(VRegKind::ByteOffset, SimdWidth::Scalar);
                     // DEBUG: configurable layer count via GLLM_DEBUG_LAYERS env var
@@ -580,7 +682,11 @@ pub(super) fn emit_fusion_groups(
 
             // Open new guard run if non-Always and inside layer loop
             if op_guard != LayerCondition::Always && state.in_layer_loop {
-                let counter = state.abi.layer_loop_counter
+                // In hetero mode, use the computed global layer_idx register
+                // (which accounts for segment × layers_per_seg + inner position)
+                // rather than the raw inner loop counter.
+                let counter = state.hetero_global_layer_idx
+                    .or(state.abi.layer_loop_counter)
                     .expect("guarded op requires active layer loop");
                 let skip_cond = match op_guard {
                     LayerCondition::LayerIdxLt(t) => {

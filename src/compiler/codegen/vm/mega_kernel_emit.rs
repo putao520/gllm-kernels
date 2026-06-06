@@ -936,6 +936,8 @@ pub fn compile_mega_kernel_vm(
     debug_jit: bool,
     mtp_config: Option<&MtpKernelConfig>,
     resource_plan: Option<&GraphResourcePlan>,
+    needs_kv_for_decode: bool,
+    is_encoder: bool,
 ) -> Result<(VmProgram, Option<RopeCacheRequirement>, usize), CompilerError> {
     use crate::compiler::mega_kernel_abi::MEGA_KERNEL_STACK_OFFSETS;
 
@@ -1043,16 +1045,32 @@ pub fn compile_mega_kernel_vm(
     let decode_counter = prog.alloc_vreg(VRegKind::Counter, SimdWidth::Scalar);
     prog.emit(VmInstr::GprLoadImm { dst: decode_counter, value: 0 });
 
+    // ── Phase 2: Unified prefill + generate loop ──
+    // For encoder models: single iteration with M=prompt_len (all tokens at once).
+    // For decoder models: total_iters = (prompt_len - 1) + max_new_tokens iterations,
+    //   processing tokens one at a time (prefill then generate).
+    let loop_bound = if is_encoder {
+        BoundExpr::Const(1)
+    } else {
+        BoundExpr::DynamicVReg(total_iters)
+    };
+
     prog.emit(VmInstr::LoopBegin {
         counter: gen_counter,
         byte_offset: gen_byte_offset,
-        bound: BoundExpr::DynamicVReg(total_iters),
+        bound: loop_bound,
         step_bytes: 4,
     });
 
     // ── Phase 3: Compute per-iteration input_ptr ──
+    // Encoder: full input_ids (all tokens processed in one pass).
+    // Decoder: single token at current position.
     let gen_input_ptr = prog.alloc_vreg(VRegKind::Ptr, SimdWidth::Scalar);
-    prog.emit(VmInstr::LoadPtr { dst: gen_input_ptr, src: PtrExpr::VRegPlusVReg(input_base, gen_byte_offset) });
+    if is_encoder {
+        prog.emit(VmInstr::LoadPtr { dst: gen_input_ptr, src: PtrExpr::VRegPlusConst(input_base, 0) });
+    } else {
+        prog.emit(VmInstr::LoadPtr { dst: gen_input_ptr, src: PtrExpr::VRegPlusVReg(input_base, gen_byte_offset) });
+    }
 
     // ── Phase 3.1: Reload scratchpad_ptr from ABI stack slot ──
     // ARCH-REGALLOC-LOOP-RELOAD: scratchpad_ptr (v2) may be spilled to a stack slot
@@ -1102,24 +1120,31 @@ pub fn compile_mega_kernel_vm(
 
     let original_weight_vreg = Some(weight_reloaded);
 
-    // ── Mega-kernel logits redirect ──
-    // BufferAllocation maps logits to an Intermediate scratch offset, but the
-    // mega-kernel argmax reads from abi.output_ptr (= scratchpad + logits_offset).
-    // Redirect the lm_head output tensor to Output { offset: 0 } so the GEMM
-    // writes directly to the logits region that argmax reads from.
+    // ── Mega-kernel output redirect ──
+    // BufferAllocation maps output tensors to Intermediate scratch offsets, but the
+    // mega-kernel output region starts at abi.output_ptr (= scratchpad + logits_offset).
+    // Redirect the final output tensor to Output { offset: 0 } so it writes directly
+    // to the region that Rust reads from.
     if let Some(lm_head_op) = graph.ops.iter().find(|op| op.label == "lm_head") {
+        // Decoder: lm_head GEMM writes logits to output region
         if let Some(&logits_tid) = lm_head_op.outputs.first() {
-            let _before = resolver.source(logits_tid);
             resolver.override_source(logits_tid, TensorPtrSource::Output { offset: 0 });
         }
+    } else if let Some(&output_tid) = graph.outputs.first() {
+        // Encoder/embedding: graph output (MeanPool/classifier result) writes to output region
+        resolver.override_source(output_tid, TensorPtrSource::Output { offset: 0 });
     }
 
     // ── Phase 3.5: Compute seq_len for this iteration ──
-    // seq_len = gen_counter + 1 (token position 0..total_iters-1)
-    // For prefill: seq_len grows from 1 to prompt_len-1
-    // For generate: seq_len = prompt_len, prompt_len+1, ...
+    // Encoder: seq_len = prompt_len (all tokens processed in one pass).
+    // Decoder: seq_len = gen_counter + 1 (grows during prefill, stays at prompt_len for decode).
     let decode_seq_len = prog.alloc_vreg(VRegKind::Scalar, SimdWidth::Scalar);
-    prog.emit(VmInstr::GprBinOp { dst: decode_seq_len, a: gen_counter, b: GprOperand::VReg(one_imm ), op: GprOp::Add });
+    if is_encoder {
+        // Encoder: seq_len = prompt_len (copy from prompt_len_vreg)
+        prog.emit(VmInstr::GprBinOp { dst: decode_seq_len, a: prompt_len_vreg, b: GprOperand::Imm(0), op: GprOp::Add });
+    } else {
+        prog.emit(VmInstr::GprBinOp { dst: decode_seq_len, a: gen_counter, b: GprOperand::VReg(one_imm ), op: GprOp::Add });
+    }
 
     let mut current_abi = AbiPtrs {
         // gen_input_ptr points to the single current decode token:
@@ -1229,7 +1254,12 @@ pub fn compile_mega_kernel_vm(
             let has_mha = graph.ops.iter().any(|op| {
                 matches!(op.kind, OpKind::MultiHeadAttention { .. })
             });
-            if has_mha {
+            // Encoder/embedding models (EncodeToLayer/Classify*) have MHA ops but
+            // never decode, so they don't need persistent KV cache. When
+            // needs_kv_for_decode is false, skip loading kv_cache_ptr entirely —
+            // the MHA lowering falls through to using K/V projection pointers
+            // directly (no KV store, no page-table lookup).
+            if has_mha && needs_kv_for_decode {
                 let kv_ptr = prog.alloc_vreg(VRegKind::Ptr, SimdWidth::Scalar);
                 prog.emit(VmInstr::LoadPtr {
                     dst: kv_ptr,

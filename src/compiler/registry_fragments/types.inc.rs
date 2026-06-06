@@ -24,6 +24,7 @@ pub enum OpKindKey {
     GeGlu,
     Softmax,
     RoPE,
+    DualRoPE,
     Add,
     Mul,
     Residual,

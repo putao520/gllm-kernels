@@ -74,7 +74,7 @@ pub struct X86Lower {
     pub asm: CodeAssembler,
     use_avx512: bool,
     const_pool: Vec<([f32; 8], CodeLabel)>,
-    loop_stack: Vec<(CodeLabel, CodeLabel, AsmRegister64, AsmRegister64, usize, Option<i32>)>,
+    loop_stack: Vec<(CodeLabel, CodeLabel, AsmRegister64, Option<i32>, AsmRegister64, usize, Option<i32>)>,
     scope_saves: Vec<Vec<AsmRegister64>>,
     skip_stack: Vec<(usize, CodeLabel)>,
     stack_layout: StackLayout,

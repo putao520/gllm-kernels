@@ -62,6 +62,10 @@ struct LoopCtx {
     is_sve: bool,
     /// SVE2 路径: 存放 bound 的 GPR (x17 / 传入的 reg)
     bound_reg: Option<u8>,
+    /// counter spill slot offset from sp (None = in physical GPR)
+    counter_spill_sp_off: Option<i32>,
+    /// byte_offset spill slot offset from sp (None = in physical GPR)
+    offset_spill_sp_off: Option<i32>,
 }
 
 // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━

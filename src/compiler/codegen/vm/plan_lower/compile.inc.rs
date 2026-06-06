@@ -397,6 +397,7 @@ fn op_kind_to_key(kind: &OpKind) -> Option<crate::compiler::registry::OpKindKey>
         OpKind::GeGlu => Some(OpKindKey::GeGlu),
         OpKind::Softmax => Some(OpKindKey::Softmax),
         OpKind::RoPE { .. } => Some(OpKindKey::RoPE),
+        OpKind::DualRoPE { .. } => Some(OpKindKey::DualRoPE),
         OpKind::Add => Some(OpKindKey::Add),
         OpKind::Mul => Some(OpKindKey::Mul),
         OpKind::Residual => Some(OpKindKey::Residual),

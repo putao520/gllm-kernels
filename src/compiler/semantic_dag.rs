@@ -194,7 +194,7 @@ impl SemanticDAG {
                 OpClass::ElemWise
             }
             OpKind::SwiGlu | OpKind::SwiGluClipped { .. } | OpKind::GeGlu => OpClass::ElemWise,
-            OpKind::RoPE { .. } | OpKind::Transpose { .. } | OpKind::Reshape { .. } | OpKind::SliceView { .. } => {
+            OpKind::RoPE { .. } | OpKind::DualRoPE { .. } | OpKind::Transpose { .. } | OpKind::Reshape { .. } | OpKind::SliceView { .. } => {
                 OpClass::Injective
             }
             // Gather: memory-bound indexed lookup (Injective — out[i] = table[indices[i]])

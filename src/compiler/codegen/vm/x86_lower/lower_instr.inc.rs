@@ -721,7 +721,27 @@ impl X86Lower {
             }
 
             VmInstr::LoopBegin { counter, byte_offset, bound, step_bytes } => {
-                let counter_reg = self.resolve_gpr(*counter, alloc)?;
+                // counter: handle spilled case (use rax as scratch for cmp)
+                let (counter_reg, counter_spill_rbp_off) = match alloc.get(*counter) {
+                    Some(super::isa_profile::PhysReg::Gpr(g)) => {
+                        let reg = Self::gpr(g);
+                        self.asm.xor(reg, reg).map_err(Self::err)?;
+                        (reg, None)
+                    }
+                    Some(super::isa_profile::PhysReg::Spilled(slot_id)) => {
+                        let spill = alloc.spills.get(slot_id as usize)
+                            .ok_or_else(|| CompilerError::CodegenViolation(
+                                format!("LoopBegin: spill slot {} missing for counter v{}", slot_id, counter.0)
+                            ))?;
+                        let rbp_off = self.gpr_spill_rbp_offset(spill.offset);
+                        self.asm.mov(qword_ptr(rbp + rbp_off), 0i32).map_err(Self::err)?;
+                        let scratch = self.scratch_gprs[0]; // rax
+                        self.asm.xor(scratch, scratch).map_err(Self::err)?;
+                        (scratch, Some(rbp_off))
+                    }
+                    _ => return Err(CompilerError::CodegenViolation(
+                        format!("counter v{} not allocated to GPR", counter.0))),
+                };
 
                 // byte_offset: initialize to 0 (either xor GPR or store 0 to spill slot)
                 let (offset_reg, offset_spill_rbp_off) = match alloc.get(*byte_offset) {
@@ -748,7 +768,6 @@ impl X86Lower {
                 let mut loop_start = self.asm.create_label();
                 let loop_done = self.asm.create_label();
 
-                self.asm.xor(counter_reg, counter_reg).map_err(Self::err)?;
                 self.asm.set_label(&mut loop_start).map_err(Self::err)?;
 
                 match bound {
@@ -787,24 +806,36 @@ impl X86Lower {
                     }
                     BoundExpr::DynamicVRegPlusOne(vreg_id) => {
                         let bound_reg = self.resolve_gpr_read(*vreg_id, alloc, 1)?;
-                        self.asm.lea(rax, qword_ptr(bound_reg + 1)).map_err(Self::err)?;
-                        self.asm.cmp(counter_reg, rax).map_err(Self::err)?;
+                        let lea_dst = self.scratch_gprs[2]; // r11 — avoids clobbering rax (counter spill scratch)
+                        self.asm.lea(lea_dst, qword_ptr(bound_reg + 1)).map_err(Self::err)?;
+                        self.asm.cmp(counter_reg, lea_dst).map_err(Self::err)?;
                     }
                     _ => return Err(CompilerError::CodegenViolation("unsupported BoundExpr".into())),
                 }
                 self.asm.jge(loop_done).map_err(Self::err)?;
 
-                self.loop_stack.push((loop_start, loop_done, counter_reg, offset_reg, *step_bytes, offset_spill_rbp_off));
+                self.loop_stack.push((loop_start, loop_done, counter_reg, counter_spill_rbp_off, offset_reg, *step_bytes, offset_spill_rbp_off));
                 Ok(())
             }
 
             VmInstr::LoopEnd => {
-                let (loop_start, mut loop_done, counter_reg, offset_reg, step_bytes, offset_spill_rbp_off) =
+                let (loop_start, mut loop_done, counter_reg, counter_spill_rbp_off, offset_reg, step_bytes, offset_spill_rbp_off) =
                     self.loop_stack.pop()
                     .ok_or_else(|| CompilerError::CodegenViolation("LoopEnd without LoopBegin".into()))?;
 
                 // counter++
-                self.asm.inc(counter_reg).map_err(Self::err)?;
+                match counter_spill_rbp_off {
+                    Some(rbp_off) => {
+                        // Spilled: load → inc → store back (rax = counter for next cmp)
+                        self.asm.mov(counter_reg, qword_ptr(rbp + rbp_off)).map_err(Self::err)?;
+                        self.asm.inc(counter_reg).map_err(Self::err)?;
+                        self.asm.mov(qword_ptr(rbp + rbp_off), counter_reg).map_err(Self::err)?;
+                    }
+                    None => {
+                        // In physical GPR: direct inc
+                        self.asm.inc(counter_reg).map_err(Self::err)?;
+                    }
+                }
                 // byte_offset += step_bytes
                 match offset_spill_rbp_off {
                     Some(rbp_off) => {
@@ -1729,7 +1760,7 @@ impl X86Lower {
 
                 // token_id == eos_token_id → done
                 self.asm.cmp(id_val, eos_val).map_err(Self::err)?;
-                if let Some((_, done_label, _, _, _, _)) = self.loop_stack.last() {
+                if let Some((_, done_label, _, _, _, _, _)) = self.loop_stack.last() {
                     self.asm.je(*done_label).map_err(Self::err)?;
                 }
                 // Free eos slot, reuse for max_tokens
@@ -1740,7 +1771,7 @@ impl X86Lower {
 
                 // counter >= max_new_tokens → done
                 self.asm.cmp(ctr_reg, max_val).map_err(Self::err)?;
-                if let Some((_, done_label, _, _, _, _)) = self.loop_stack.last() {
+                if let Some((_, done_label, _, _, _, _, _)) = self.loop_stack.last() {
                     self.asm.jge(*done_label).map_err(Self::err)?;
                 }
                 let _ = ctr_slot;

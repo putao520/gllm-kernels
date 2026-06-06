@@ -1354,6 +1354,107 @@ pub(crate) fn dispatch_compute_pattern(
             Ok(true)
         }
 
+        // ── DualRoPE — runtime theta/partial selection based on layer_idx ──
+        OpKind::DualRoPE {
+            num_heads, head_dim,
+            sliding_theta: _, sliding_partial,
+            global_theta: _, global_partial,
+            rope_scaling, layer_offset, layer_divisor, layer_remainder,
+        } => {
+            let out_tid = op.outputs.first().copied().ok_or_else(|| CompilerError::CodegenViolation(
+                format!("DualRoPE op {:?}: 无输出张量", op.id)))?;
+            let out_tensor = graph.tensor(out_tid).ok_or_else(|| CompilerError::CodegenViolation(
+                format!("DualRoPE op {:?}: 输出张量不存在", op.id)))?;
+            let seq_dim = out_tensor.shape.iter().find(|d| d.is_symbolic()).cloned()
+                .or_else(|| out_tensor.shape.first().cloned())
+                .ok_or_else(|| CompilerError::CodegenViolation(format!(
+                    "DualRoPE op {:?}: 输出 shape 为空", op.id)))?;
+            let seq_bound = resolve_dim(&seq_dim);
+
+            let base_offset = rope_cache_offset.ok_or_else(|| CompilerError::CodegenViolation(
+                "DualRoPE lower: rope_cache_offset 未配置".into()))?;
+            let (sliding_cos_offset, global_cos_offset) = if let Some(rope_req) = rope_req {
+                let sec_offset = rope_req.secondary_cache.as_ref()
+                    .map(|sec| sec.cache_offset)
+                    .unwrap_or(base_offset);
+                (base_offset, sec_offset)
+            } else {
+                return Err(CompilerError::CodegenViolation(
+                    "DualRoPE requires RopeCacheRequirement with secondary_cache".into()));
+            };
+
+            // Validate rope_scaling
+            if let Some(scaling) = rope_scaling {
+                match scaling {
+                    crate::compiler::graph::RopeScaling::Yarn { factor, beta_fast, beta_slow, original_max_position } => {
+                        if !(*factor > 0.0) { return Err(CompilerError::CodegenViolation(format!("DualRoPE: yarn factor must be > 0, got {factor}"))); }
+                        if !(*beta_fast > *beta_slow) { return Err(CompilerError::CodegenViolation(format!("DualRoPE: yarn beta_fast ({beta_fast}) must be > beta_slow ({beta_slow})"))); }
+                        if *original_max_position == 0 { return Err(CompilerError::CodegenViolation("DualRoPE: yarn original_max_position must be > 0".into())); }
+                    }
+                    crate::compiler::graph::RopeScaling::Linear { factor } => {
+                        if !(*factor > 0.0) { return Err(CompilerError::CodegenViolation(format!("DualRoPE: linear factor must be > 0, got {factor}"))); }
+                    }
+                }
+            }
+
+            let (rope_seq_bound, rope_pos_offset) = if let Some(gen_ctr) = abi.gen_loop_counter {
+                (BoundExpr::Const(1), Some(gen_ctr))
+            } else {
+                (seq_bound, None)
+            };
+
+            let layer_ctr = abi.layer_loop_counter.ok_or_else(|| CompilerError::CodegenViolation(
+                "DualRoPE requires layer_loop_counter (only inside mega-kernel layer loop)".into()))?;
+
+            // Allocate unique labels for this DualRoPE op
+            let label_global = prog.alloc_label();
+            let label_end = prog.alloc_label();
+
+            // Compute (layer_idx + offset) % divisor
+            // remainder = (layer_idx + offset) - ((layer_idx + offset) / divisor) * divisor
+            let temp_add = prog.alloc_vreg(VRegKind::Scalar, SimdWidth::Scalar);
+            prog.emit(VmInstr::GprBinOp {
+                dst: temp_add, a: layer_ctr, b: GprOperand::Imm(*layer_offset as i64), op: GprOp::Add,
+            });
+            let quotient = prog.alloc_vreg(VRegKind::Scalar, SimdWidth::Scalar);
+            prog.emit(VmInstr::GprBinOp {
+                dst: quotient, a: temp_add, b: GprOperand::Imm(*layer_divisor as i64), op: GprOp::Div,
+            });
+            let product = prog.alloc_vreg(VRegKind::Scalar, SimdWidth::Scalar);
+            prog.emit(VmInstr::GprBinOp {
+                dst: product, a: quotient, b: GprOperand::Imm(*layer_divisor as i64), op: GprOp::Mul,
+            });
+            let remainder = prog.alloc_vreg(VRegKind::Scalar, SimdWidth::Scalar);
+            prog.emit(VmInstr::GprBinOp {
+                dst: remainder, a: temp_add, b: GprOperand::VReg(product), op: GprOp::Sub,
+            });
+
+            // If global layer (remainder == expected) → jump to global RoPE
+            prog.emit(VmInstr::GprCondAction {
+                cond: GprCondition::CmpEq(remainder, *layer_remainder as u64),
+                action: GprBranchAction::JumpToLabel(label_global),
+            });
+
+            // Sliding RoPE (fallthrough when not global)
+            emit_rope_inline(prog, rope_seq_bound.clone(), *num_heads, *head_dim,
+                *sliding_partial, width, input_ptr, output_ptr, sliding_cos_offset, sym_map, ctx.dtype,
+                rope_pos_offset)?;
+            // Jump past global RoPE
+            prog.emit(VmInstr::GprCondAction {
+                cond: GprCondition::IsNonNull(layer_ctr), // always true (layer_ctr >= 0)
+                action: GprBranchAction::JumpToLabel(label_end),
+            });
+
+            // Global RoPE
+            prog.emit(VmInstr::MarkLabel { label_id: label_global });
+            emit_rope_inline(prog, rope_seq_bound, *num_heads, *head_dim,
+                *global_partial, width, input_ptr, output_ptr, global_cos_offset, sym_map, ctx.dtype,
+                rope_pos_offset)?;
+
+            prog.emit(VmInstr::MarkLabel { label_id: label_end });
+            Ok(true)
+        }
+
 
         // ── MoE Gate: softmax + topk + expert dispatch + §13.6 telemetry ──
         // Softmax arithmetic: auto-driven via emit_softmax_inline (uses auto_lower_trace).
