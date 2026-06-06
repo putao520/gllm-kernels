@@ -416,6 +416,7 @@ fn op_kind_to_key(kind: &OpKind) -> Option<crate::compiler::registry::OpKindKey>
         OpKind::AltUpPredict { .. } => Some(OpKindKey::AltUpPredict),
         OpKind::AltUpCorrect { .. } => Some(OpKindKey::AltUpCorrect),
         OpKind::AltUpInject { .. } => Some(OpKindKey::AltUpInject),
+        OpKind::LogitSoftcap { .. } => Some(OpKindKey::LogitSoftcap),
         OpKind::DepthwiseConv1D { .. } => Some(OpKindKey::DepthwiseConv1D),
         OpKind::PatchEmbed { .. } => Some(OpKindKey::PatchEmbed),
         OpKind::LearnedPos2D { .. } => Some(OpKindKey::LearnedPos2D),

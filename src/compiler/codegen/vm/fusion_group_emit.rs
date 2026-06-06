@@ -166,7 +166,8 @@ pub(super) fn emit_fusion_group_by_mode(
             anchor_op.label, group.mode, group.ops.len(),
             group.epilogue.iter().filter_map(|&oid| graph.op(oid).map(|o| o.label.clone())).collect::<Vec<_>>(),
             abi.weight_ptr);
-        for &op_id in &group.ops {
+        let all_ops: Vec<_> = group.ops.iter().chain(group.epilogue.iter()).copied().collect();
+        for &op_id in &all_ops {
             let op = graph.op(op_id).ok_or_else(|| CompilerError::CodegenViolation(
                 format!("QuantGemm fallback: op {:?} not found", op_id)))?;
             let op_input = op.inputs.first()

@@ -819,7 +819,7 @@ impl X86Lower {
 
                 // AND with bit_value as byte (e.g., 16 = 0x10 for INT5)
                 let bv = *bit_value as i32;
-                self.asm.mov(rax, ((bv as u64) * 0x0101010101010101u64)).map_err(Self::err)?;
+                self.asm.mov(rax, (bv as u64) * 0x0101010101010101u64).map_err(Self::err)?;
                 self.asm.vmovq(scratch_xmm, rax).map_err(Self::err)?;
                 self.asm.vpbroadcastb(scratch_ymm, scratch_xmm).map_err(Self::err)?;
                 self.asm.vpand(qh_ymm, qh_ymm, scratch_ymm).map_err(Self::err)?;
