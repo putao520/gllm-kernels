@@ -6,6 +6,17 @@
 //!
 //! 新增 TraceOp 变体只需在此文件添加一行 match arm。
 //!
+//! # REQ-AIS-001: ComputePattern 驱动路由
+//!
+//! 三个公开入口函数按 ComputePattern 分类：
+//! - `auto_lower_elementwise`: Elementwise / BinaryElementwise / Injective
+//! - `auto_lower_reduction`: Reduction (含 NormLike)
+//! - `auto_lower_structural`: Structural (Gather/Scatter/Loop/Panel 等)
+//!
+//! 每个入口验证 ComputePattern 一致性后委托给 `dispatch_trace_op`。
+//! 调用方通过 `classify_pattern` 获取 ComputePattern，选择对应入口，
+//! 消除手写 OpKind→VmInstr match arm。
+//!
 //! # dtype 自然传播 (QPJ4)
 //!
 //! `propagate_dtype` 链：每个 TraceOp 的输出 dtype 由输入 dtype 和操作语义决定，
@@ -20,7 +31,7 @@
 
 use super::instr::*;
 use super::trace_opt::TracePassPipeline;
-use crate::compiler::trace::{CmpOp, QuantPrecision, ReduceKind, TraceOp, TypedSlot, infer_result_dtype, ValueId};
+use crate::compiler::trace::{CmpOp, ComputePattern, QuantPrecision, ReduceKind, TraceOp, TypedSlot, infer_result_dtype, ValueId};
 use crate::quant::QuantType;
 use crate::quant_format::{QuantDataKind, ZeroLayout};
 use crate::types::CompilerError;
@@ -171,6 +182,107 @@ fn emit_binop_dtype(
     prog.emit(VmInstr::VecBinOp { dst: r, a: slots[a.0 as usize], b: slots[b.0 as usize], op, dtype });
     Ok(r)
 }
+
+// ────────────────────────────────────────────────────────────────────────────
+// REQ-AIS-001: ComputePattern 驱动路由 — 三个公开入口函数
+// ────────────────────────────────────────────────────────────────────────────
+
+/// Elementwise 路由 (REQ-AIS-001)。
+///
+/// 处理 ComputePattern::Elementwise / BinaryElementwise / Injective。
+/// `out[i] = f(in[i])` 或 `out[i] = f(a[i], b[i])` 或多输入映射。
+///
+/// 内部调用 `auto_lower_trace_raw` 完成实际的 TraceOp→VmInstr 编译。
+/// dtype 通过 `default_dtype` 参数传播到每条 VmInstr。
+pub fn auto_lower_elementwise(
+    prog: &mut VmProgram,
+    body: &[TraceOp],
+    inputs: &[VRegId],
+    width: SimdWidth,
+    default_dtype: QuantPrecision,
+    pattern: &ComputePattern,
+) -> Result<Vec<VRegId>, CompilerError> {
+    match pattern {
+        ComputePattern::Elementwise { .. }
+        | ComputePattern::BinaryElementwise { .. }
+        | ComputePattern::Injective { .. } => {}
+        other => {
+            return Err(CompilerError::CodegenViolation(format!(
+                "auto_lower_elementwise: 不兼容的 ComputePattern {:?}，\
+                 需要 Elementwise/BinaryElementwise/Injective",
+                other
+            )));
+        }
+    }
+    auto_lower_trace_raw(prog, body, inputs, width, default_dtype)
+}
+
+/// Reduction 路由 (REQ-AIS-001)。
+///
+/// 处理 ComputePattern::Reduction / NormLike。
+/// 多阶段归一化: reduce → finalize → transform 或 combine → normalize。
+///
+/// `combine_body`: 第一阶段归约 trace (如 Sum/Max)
+/// `normalize_body`: 可选的逐元素归一化 trace (如 mul by inv_sum)
+pub fn auto_lower_reduction(
+    prog: &mut VmProgram,
+    combine_body: &[TraceOp],
+    normalize_body: Option<&[TraceOp]>,
+    inputs: &[VRegId],
+    width: SimdWidth,
+    default_dtype: QuantPrecision,
+    pattern: &ComputePattern,
+) -> Result<VRegId, CompilerError> {
+    match pattern {
+        ComputePattern::Reduction { .. } | ComputePattern::NormLike { .. } => {}
+        other => {
+            return Err(CompilerError::CodegenViolation(format!(
+                "auto_lower_reduction: 不兼容的 ComputePattern {:?}，\
+                 需要 Reduction/NormLike",
+                other
+            )));
+        }
+    }
+    // Phase 1: combine (归约阶段)
+    let slots = auto_lower_trace_raw(prog, combine_body, inputs, width, default_dtype)?;
+    let reduce_result = slots.last().copied().ok_or_else(|| {
+        CompilerError::CodegenViolation("auto_lower_reduction: combine body 产生零 slot".into())
+    })?;
+    // Phase 2: normalize (可选归一化阶段)
+    if let Some(norm_body) = normalize_body {
+        if !norm_body.is_empty() {
+            let norm_inputs = &[reduce_result];
+            let norm_slots =
+                auto_lower_trace_raw(prog, norm_body, norm_inputs, width, default_dtype)?;
+            return norm_slots.last().copied().ok_or_else(|| {
+                CompilerError::CodegenViolation(
+                    "auto_lower_reduction: normalize body 产生零 slot".into(),
+                )
+            });
+        }
+    }
+    Ok(reduce_result)
+}
+
+/// Structural 路由 (REQ-AIS-001)。
+///
+/// 处理结构型 TraceOp: GatherLoad/ScatterStore/TableLookup/Loop/PanelLoad/PanelStore 等。
+/// 这些操作涉及内存寻址、循环控制、多输出，不能走 elementwise 路径。
+///
+/// dtype 通过 `default_dtype` 参数传播。
+pub fn auto_lower_structural(
+    prog: &mut VmProgram,
+    body: &[TraceOp],
+    inputs: &[VRegId],
+    width: SimdWidth,
+    default_dtype: QuantPrecision,
+) -> Result<Vec<VRegId>, CompilerError> {
+    auto_lower_trace_raw(prog, body, inputs, width, default_dtype)
+}
+
+// ────────────────────────────────────────────────────────────────────────────
+// 核心 API: auto_lower_trace_raw / auto_lower_trace / auto_lower_trace_multi
+// ────────────────────────────────────────────────────────────────────────────
 
 /// 核心编译：将 TraceOp SSA body 编译为 VmInstr 序列，返回所有 slot VRegIds。
 ///
@@ -2726,5 +2838,205 @@ mod tests {
         let result = auto_lower_trace(&mut prog, body, &[], SimdWidth::W256, QuantPrecision::F32);
         // Assert: should fail because inputs is empty (no primary to write back to)
         assert!(result.is_err());
+    }
+
+    // ── REQ-AIS-001: ComputePattern 驱动路由入口函数测试 ──
+
+    #[test]
+    fn auto_lower_elementwise_accepts_elementwise_pattern() {
+        use crate::compiler::trace::ComputePattern;
+        let mut prog = VmProgram::new();
+        let input = prog.alloc_vreg(VRegKind::Vec, SimdWidth::W256);
+        let body = &[TraceOp::Input(0), TraceOp::Const(2.0), TraceOp::Mul(ValueId(0), ValueId(1))];
+        let pattern = ComputePattern::Elementwise { body: body.to_vec() };
+        let result = auto_lower_elementwise(&mut prog, body, &[input], SimdWidth::W256, QuantPrecision::F32, &pattern);
+        assert!(result.is_ok());
+        assert_eq!(result.unwrap().len(), 3);
+    }
+
+    #[test]
+    fn auto_lower_elementwise_accepts_binary_elementwise_pattern() {
+        use crate::compiler::trace::ComputePattern;
+        let mut prog = VmProgram::new();
+        let input = prog.alloc_vreg(VRegKind::Vec, SimdWidth::W256);
+        let body = &[TraceOp::Input(0), TraceOp::Input(0), TraceOp::Add(ValueId(0), ValueId(1))];
+        let pattern = ComputePattern::BinaryElementwise { body: body.to_vec() };
+        let result = auto_lower_elementwise(&mut prog, body, &[input], SimdWidth::W256, QuantPrecision::BF16, &pattern);
+        assert!(result.is_ok());
+        // Verify BF16 dtype propagated
+        assert!(prog.instrs.iter().any(|i| matches!(
+            i,
+            VmInstr::VecBinOp { op: VecOp::Add, dtype: QuantPrecision::BF16, .. }
+        )));
+    }
+
+    #[test]
+    fn auto_lower_elementwise_accepts_injective_pattern() {
+        use crate::compiler::trace::ComputePattern;
+        let mut prog = VmProgram::new();
+        let input = prog.alloc_vreg(VRegKind::Vec, SimdWidth::W256);
+        let body = &[TraceOp::Input(0), TraceOp::Sqrt(ValueId(0))];
+        let pattern = ComputePattern::Injective { body: body.to_vec(), num_inputs: 1, num_outputs: 1 };
+        let result = auto_lower_elementwise(&mut prog, body, &[input], SimdWidth::W256, QuantPrecision::F32, &pattern);
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn auto_lower_elementwise_rejects_reduction_pattern() {
+        use crate::compiler::trace::ComputePattern;
+        let mut prog = VmProgram::new();
+        let input = prog.alloc_vreg(VRegKind::Vec, SimdWidth::W256);
+        let body = &[TraceOp::Input(0), TraceOp::HReduce { src: ValueId(0), op: ReduceKind::Sum }];
+        let pattern = ComputePattern::Reduction {
+            identity: 0.0,
+            combine: body.to_vec(),
+            second_pass: None,
+            normalize: None,
+        };
+        let result = auto_lower_elementwise(&mut prog, body, &[input], SimdWidth::W256, QuantPrecision::F32, &pattern);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn auto_lower_elementwise_rejects_gemm_pattern() {
+        use crate::compiler::trace::ComputePattern;
+        let mut prog = VmProgram::new();
+        let input = prog.alloc_vreg(VRegKind::Vec, SimdWidth::W256);
+        let result = auto_lower_elementwise(&mut prog, &[], &[input], SimdWidth::W256, QuantPrecision::F32, &ComputePattern::Gemm);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn auto_lower_reduction_accepts_reduction_pattern() {
+        use crate::compiler::trace::ComputePattern;
+        let mut prog = VmProgram::new();
+        let input = prog.alloc_vreg(VRegKind::Vec, SimdWidth::W256);
+        let combine_body = &[TraceOp::Input(0), TraceOp::HReduce { src: ValueId(0), op: ReduceKind::Sum }];
+        let pattern = ComputePattern::Reduction {
+            identity: 0.0,
+            combine: combine_body.to_vec(),
+            second_pass: None,
+            normalize: None,
+        };
+        let result = auto_lower_reduction(&mut prog, combine_body, None, &[input], SimdWidth::W256, QuantPrecision::F32, &pattern);
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn auto_lower_reduction_accepts_normlike_pattern() {
+        use crate::compiler::trace::ComputePattern;
+        let mut prog = VmProgram::new();
+        let input = prog.alloc_vreg(VRegKind::Vec, SimdWidth::W256);
+        let reduce_body = &[TraceOp::Input(0), TraceOp::HReduce { src: ValueId(0), op: ReduceKind::Max }];
+        let pattern = ComputePattern::NormLike {
+            reduce: reduce_body.to_vec(),
+            finalize: vec![],
+            transform: vec![],
+        };
+        let result = auto_lower_reduction(&mut prog, reduce_body, None, &[input], SimdWidth::W256, QuantPrecision::F32, &pattern);
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn auto_lower_reduction_with_normalize_phase() {
+        use crate::compiler::trace::ComputePattern;
+        let mut prog = VmProgram::new();
+        let input = prog.alloc_vreg(VRegKind::Vec, SimdWidth::W256);
+        let combine_body = &[TraceOp::Input(0), TraceOp::HReduce { src: ValueId(0), op: ReduceKind::Sum }];
+        let normalize_body = &[TraceOp::Input(0), TraceOp::Const(0.5), TraceOp::Mul(ValueId(0), ValueId(1))];
+        let pattern = ComputePattern::Reduction {
+            identity: 0.0,
+            combine: combine_body.to_vec(),
+            second_pass: None,
+            normalize: Some(normalize_body.to_vec()),
+        };
+        let result = auto_lower_reduction(&mut prog, combine_body, Some(normalize_body), &[input], SimdWidth::W256, QuantPrecision::F32, &pattern);
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn auto_lower_reduction_rejects_elementwise_pattern() {
+        use crate::compiler::trace::ComputePattern;
+        let mut prog = VmProgram::new();
+        let input = prog.alloc_vreg(VRegKind::Vec, SimdWidth::W256);
+        let body = &[TraceOp::Input(0), TraceOp::Const(2.0), TraceOp::Mul(ValueId(0), ValueId(1))];
+        let pattern = ComputePattern::Elementwise { body: body.to_vec() };
+        let result = auto_lower_reduction(&mut prog, body, None, &[input], SimdWidth::W256, QuantPrecision::F32, &pattern);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn auto_lower_structural_handles_gather_load() {
+        let mut prog = VmProgram::new();
+        let base = prog.alloc_vreg(VRegKind::Ptr, SimdWidth::Scalar);
+        let indices = prog.alloc_vreg(VRegKind::Vec, SimdWidth::W256);
+        let body = &[
+            TraceOp::Input(0),
+            TraceOp::Input(1),
+            TraceOp::GatherLoad { base: ValueId(0), indices: ValueId(1), stride: 4 },
+        ];
+        let result = auto_lower_structural(&mut prog, body, &[base, indices], SimdWidth::W256, QuantPrecision::F32);
+        assert!(result.is_ok());
+        assert!(prog.instrs.iter().any(|i| matches!(i, VmInstr::GatherLoad { stride: 4, .. })));
+    }
+
+    #[test]
+    fn auto_lower_structural_handles_table_lookup() {
+        let mut prog = VmProgram::new();
+        let base = prog.alloc_vreg(VRegKind::Ptr, SimdWidth::Scalar);
+        let row_idx = prog.alloc_vreg(VRegKind::Scalar, SimdWidth::Scalar);
+        let body = &[
+            TraceOp::Input(0),
+            TraceOp::Input(1),
+            TraceOp::TableLookup { base: ValueId(0), row_index: ValueId(1), row_bytes: 256 },
+        ];
+        let result = auto_lower_structural(&mut prog, body, &[base, row_idx], SimdWidth::W256, QuantPrecision::F32);
+        assert!(result.is_ok());
+        assert!(prog.instrs.iter().any(|i| matches!(i, VmInstr::TableLookup { row_bytes: 256, .. })));
+    }
+
+    #[test]
+    fn auto_lower_structural_dtype_propagation() {
+        let mut prog = VmProgram::new();
+        let base = prog.alloc_vreg(VRegKind::Ptr, SimdWidth::Scalar);
+        let offset = prog.alloc_vreg(VRegKind::Scalar, SimdWidth::Scalar);
+        let body = &[
+            TraceOp::Input(0),
+            TraceOp::Input(1),
+            TraceOp::VecLoadIndexed { base: ValueId(0), offset: ValueId(1) },
+        ];
+        let result = auto_lower_structural(&mut prog, body, &[base, offset], SimdWidth::W256, QuantPrecision::BF16);
+        assert!(result.is_ok());
+        assert!(prog.instrs.iter().any(|i| matches!(
+            i,
+            VmInstr::VecLoad { dtype: QuantPrecision::BF16, .. }
+        )));
+    }
+
+    #[test]
+    fn compute_pattern_driven_dispatch_end_to_end() {
+        // Simulate full AIS flow: classify_pattern → route to correct entry
+        use crate::compiler::trace::classify_pattern;
+        let mut prog = VmProgram::new();
+        let input = prog.alloc_vreg(VRegKind::Vec, SimdWidth::W256);
+
+        // Elementwise body: Input(0), Const(2.0), Mul
+        let body = &[TraceOp::Input(0), TraceOp::Const(2.0), TraceOp::Mul(ValueId(0), ValueId(1))];
+        let pattern = classify_pattern(body);
+
+        // classify_pattern should produce Elementwise or Injective
+        let result = match &pattern {
+            ComputePattern::Elementwise { .. }
+            | ComputePattern::BinaryElementwise { .. }
+            | ComputePattern::Injective { .. } => {
+                auto_lower_elementwise(&mut prog, body, &[input], SimdWidth::W256, QuantPrecision::BF16, &pattern)
+            }
+            _ => panic!("Expected Elementwise/BinaryElementwise/Injective, got {:?}", pattern),
+        };
+        assert!(result.is_ok());
+        assert!(prog.instrs.iter().any(|i| matches!(
+            i,
+            VmInstr::VecBinOp { op: VecOp::Mul, dtype: QuantPrecision::BF16, .. }
+        )));
     }
 }

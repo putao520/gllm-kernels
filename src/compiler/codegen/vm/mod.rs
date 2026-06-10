@@ -57,6 +57,7 @@ pub mod trace_opt;
 pub mod mla_emit;
 pub mod numerical_sim;
 pub mod compiler_constraints;
+pub mod ptx_registry;
 #[cfg(test)]
 mod e2e_tests;
 

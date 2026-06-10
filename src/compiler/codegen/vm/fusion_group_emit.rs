@@ -1017,6 +1017,7 @@ mod tests {
             consumer: OpId(1),
             transform,
             movement: MovementType::RegisterDirect,
+            dtype_transform: None,
         };
 
         // Assert
@@ -1040,11 +1041,13 @@ mod tests {
                 cost: 1.0,
             },
             movement: MovementType::RegisterDirect,
+            dtype_transform: None,
         };
         let gla = GroupLayoutAssignment {
             group_id: 7,
             op_layouts: HashMap::new(),
             inter_op_transforms: vec![xform],
+            dtype_transforms: Vec::new(),
             total_benefit: 10.0,
             total_transform_cost: 1.0,
         };
@@ -1297,6 +1300,7 @@ mod tests {
                 cost: 0.0,
             },
             movement: MovementType::RegisterDirect,
+            dtype_transform: None,
         };
         let memory_xform = InterOpTransform {
             producer: OpId(2),
@@ -1307,11 +1311,13 @@ mod tests {
                 cost: 5.0,
             },
             movement: MovementType::RegisterToMemory,
+            dtype_transform: None,
         };
         let gla = GroupLayoutAssignment {
             group_id: 1,
             op_layouts: HashMap::new(),
             inter_op_transforms: vec![free_xform, memory_xform],
+            dtype_transforms: Vec::new(),
             total_benefit: 10.0,
             total_transform_cost: 5.0,
         };
@@ -1595,6 +1601,7 @@ mod tests {
             group_id: 0,
             op_layouts: HashMap::new(),
             inter_op_transforms: vec![],
+            dtype_transforms: Vec::new(),
             total_benefit: 5.0,
             total_transform_cost: 0.0,
         };
@@ -1615,6 +1622,7 @@ mod tests {
             group_id: 0,
             op_layouts: HashMap::new(),
             inter_op_transforms: vec![],
+            dtype_transforms: Vec::new(),
             total_benefit: 10.0,
             total_transform_cost: 3.5,
         };
@@ -1690,6 +1698,7 @@ mod tests {
             group_id: 42,
             op_layouts: HashMap::new(),
             inter_op_transforms: vec![],
+            dtype_transforms: Vec::new(),
             total_benefit: 100.0,
             total_transform_cost: 5.0,
         };

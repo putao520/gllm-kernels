@@ -310,7 +310,7 @@ pub(crate) fn emit_gemm_gpu_tiled_inline(
     _trans_b: bool,
 ) -> Result<(), CompilerError> {
     let elem = dtype.elem_bytes();
-    let acc_dtype = dtype.accumulator_dtype();
+    let acc_dtype = dtype.gpu_accumulator_dtype(); // REQ-DTYPE-005: GPU path
     let mma_k = mma_k.max(16);
 
     // GPU GEMM 三级分块:
@@ -444,7 +444,7 @@ pub(crate) fn emit_gemm_gpu_pipelined(
     use_tma: bool,
 ) -> Result<(), CompilerError> {
     let elem = dtype.elem_bytes();
-    let acc_dtype = dtype.accumulator_dtype();
+    let acc_dtype = dtype.gpu_accumulator_dtype(); // REQ-DTYPE-005: GPU path
     let mma_k = mma_k.max(16);
     let num_stages = pipeline_depth.min(3);
 
@@ -1165,13 +1165,19 @@ pub(crate) fn emit_gemm_inline_with_epilogue(
                     lower::lower_trace_body_compat(prog, epilogue, s_acc, None, s_width)
                         .expect("lower_trace_body: OpTrace invariant violation");
                 }
+                // REQ-DTYPE-006: 窄化写回 (scalar tail path)
+                let s_store_src = if needs_narrow {
+                    let s_narrowed = prog.alloc_vreg(VRegKind::Vec, s_width);
+                    prog.emit(VmInstr::VecNarrow { dst: s_narrowed, src: s_acc, dst_dtype: dtype, src_dtype: acc_dtype, width: s_width });
+                    s_narrowed
+                } else { s_acc };
                 prog.emit(VmInstr::VecStore {
                     base: c_ptr,
                     offset: OffsetExpr::Add(
                         Box::new(OffsetExpr::Mul(Box::new(OffsetExpr::LoopOffset(m_off)), c_row_stride)),
                         Box::new(OffsetExpr::Const(j_off_const)),
                     ),
-                    src: s_acc, width: s_width, dtype,
+                    src: s_store_src, width: s_width, dtype,
                 });
             }
         }

@@ -10,6 +10,8 @@
 
 use crate::types::{DType, InferenceError};
 use super::graph::{CompilerGraph, OpKind, RopeScaling, SymDim};
+use super::dtype_chain::derive_compute_dtype;
+use crate::dispatch::device_profile::DeviceProfile;
 
 /// Geometry extracted purely from CompilerGraph tensor shapes + OpKind variants.
 #[derive(Debug, Clone)]
@@ -55,7 +57,11 @@ impl GraphDerivedGeometry {
     }
 
     /// Extract geometry from a CompilerGraph by scanning ops and tensor shapes.
-    pub fn from_graph(graph: &CompilerGraph) -> Result<Self, InferenceError> {
+    ///
+    /// REQ-DTYPE-CHAIN-005: compute_dtype is derived from (storage_dtype, DeviceProfile),
+    /// not simply equal to storage_dtype. This allows hardware-aware promotion
+    /// (e.g. BF16 storage → F32 compute on AVX-512).
+    pub fn from_graph(graph: &CompilerGraph, device: &DeviceProfile) -> Result<Self, InferenceError> {
         let mut num_heads = None;
         let mut num_kv_heads = None;
         let mut head_dim = None;
@@ -121,10 +127,10 @@ impl GraphDerivedGeometry {
         // Derive storage dtype — most common dtype among weight (input) tensors.
         let storage_dtype = derive_storage_dtype(graph);
 
-        // Compute dtype — derived from storage dtype (model weight dtype).
-        // GEMM accumulation happens in F32 regardless, but output/logits tensors
-        // should match the model's native dtype (e.g. BF16 for BF16 models).
-        let compute_dtype = storage_dtype;
+        // REQ-DTYPE-CHAIN-005: Compute dtype — derived from (storage_dtype, DeviceProfile).
+        // BF16 storage + AVX-512 → F32 compute, etc. Weight offset calculation
+        // uses per-tensor dtype via graph.weight_layout(), not this field.
+        let compute_dtype = derive_compute_dtype(storage_dtype, device);
 
         Ok(Self {
             hidden,
@@ -301,7 +307,7 @@ mod tests {
             theta: 1000000.0, partial: 0.25, rope_scaling: None,
         }, vec![q_out], vec![rope_out], "rope");
 
-        let geo = GraphDerivedGeometry::from_graph(&g).unwrap();
+        let geo = GraphDerivedGeometry::from_graph(&g, &DeviceProfile::detect()).unwrap();
 
         assert_eq!(geo.hidden, 1024);
         assert_eq!(geo.num_heads, 16);
@@ -327,7 +333,7 @@ mod tests {
         g.add_op(OpKind::Gemm { m: SymDim::Concrete(64), n: 768, k: 768, dtype: dt, trans_b: false }, vec![a, b], vec![c], "proj");
         g.inputs = vec![a, b];
 
-        let geo = GraphDerivedGeometry::from_graph(&g).unwrap();
+        let geo = GraphDerivedGeometry::from_graph(&g, &DeviceProfile::detect()).unwrap();
         assert_eq!(geo.hidden, 768);
     }
 
@@ -344,7 +350,7 @@ mod tests {
         let out = g.add_tensor_concrete("out", &[1, 512], DType::F32);
         g.add_op(OpKind::Gemm { m: SymDim::Concrete(1), n: 512, k: 512, dtype: DType::F32, trans_b: false }, vec![act, w1], vec![out], "gemm1");
 
-        let geo = GraphDerivedGeometry::from_graph(&g).unwrap();
+        let geo = GraphDerivedGeometry::from_graph(&g, &DeviceProfile::detect()).unwrap();
         assert_eq!(geo.storage_dtype, DType::BF16);
     }
 
@@ -364,7 +370,7 @@ mod tests {
         let gate_out = g.add_tensor_concrete("gate_out", &[1, 2048], dt);
         g.add_op(OpKind::Gemm { m: SymDim::Concrete(1), n: 2048, k: 512, dtype: dt, trans_b: false }, vec![input, gate_w], vec![gate_out], "gate_proj");
 
-        let geo = GraphDerivedGeometry::from_graph(&g).unwrap();
+        let geo = GraphDerivedGeometry::from_graph(&g, &DeviceProfile::detect()).unwrap();
         assert_eq!(geo.intermediate, 2048);
     }
 
@@ -379,7 +385,7 @@ mod tests {
         g.add_op(OpKind::Gemm { m: SymDim::Concrete(1), n: 256, k: 256, dtype: dt, trans_b: false }, vec![a, b], vec![c], "gemm");
         g.inputs = vec![a, b];
 
-        let geo = GraphDerivedGeometry::from_graph(&g).unwrap();
+        let geo = GraphDerivedGeometry::from_graph(&g, &DeviceProfile::detect()).unwrap();
         assert_eq!(geo.num_heads, 1);
         assert_eq!(geo.num_kv_heads, 1);
         assert_eq!(geo.head_dim, 256);
@@ -401,14 +407,14 @@ mod tests {
         g.add_op(OpKind::Gemm { m: SymDim::Concrete(1), n: 512, k: 512, dtype: dt, trans_b: false }, vec![a, w], vec![c], "attn_proj");
         g.inputs = vec![a, w];
 
-        let geo = GraphDerivedGeometry::from_graph(&g).unwrap();
+        let geo = GraphDerivedGeometry::from_graph(&g, &DeviceProfile::detect()).unwrap();
         assert_eq!(geo.intermediate, 512 * 4);
     }
 
     #[test]
     fn derive_hidden_fails_with_empty_graph() {
         let g = CompilerGraph::new();
-        let result = GraphDerivedGeometry::from_graph(&g);
+        let result = GraphDerivedGeometry::from_graph(&g, &DeviceProfile::detect());
         assert!(result.is_err(), "empty graph should fail to derive hidden");
     }
 
@@ -425,7 +431,7 @@ mod tests {
         g.add_op(OpKind::RoPE { num_heads: 8, head_dim: 32, theta: 500000.0, partial: 1.0, rope_scaling: Some(scaling) }, vec![a], vec![rope_out], "rope");
         g.inputs = vec![a, w];
 
-        let geo = GraphDerivedGeometry::from_graph(&g).unwrap();
+        let geo = GraphDerivedGeometry::from_graph(&g, &DeviceProfile::detect()).unwrap();
         assert_eq!(geo.rope_theta, 500000.0);
         assert!(matches!(geo.rope_scaling, Some(RopeScaling::Yarn { factor: 32.0, .. })));
     }
@@ -441,7 +447,7 @@ mod tests {
         let out = g.add_tensor_concrete("out", &[128, 768], dt);
         g.add_op(OpKind::Gemm { m: SymDim::Concrete(128), n: 768, k: 768, dtype: dt, trans_b: false }, vec![hidden, w], vec![out], "proj");
 
-        let geo = GraphDerivedGeometry::from_graph(&g).unwrap();
+        let geo = GraphDerivedGeometry::from_graph(&g, &DeviceProfile::detect()).unwrap();
         assert_eq!(geo.hidden, 768);
     }
 
@@ -465,7 +471,7 @@ mod tests {
         g.inputs = vec![a, b, bias];
 
         // Act
-        let geo = GraphDerivedGeometry::from_graph(&g).unwrap();
+        let geo = GraphDerivedGeometry::from_graph(&g, &DeviceProfile::detect()).unwrap();
 
         // Assert
         assert_eq!(geo.hidden, 2048);
@@ -493,7 +499,7 @@ mod tests {
         g.inputs = vec![a, b];
 
         // Act
-        let geo = GraphDerivedGeometry::from_graph(&g).unwrap();
+        let geo = GraphDerivedGeometry::from_graph(&g, &DeviceProfile::detect()).unwrap();
 
         // Assert
         assert_eq!(geo.hidden, 1024);
@@ -514,7 +520,7 @@ mod tests {
         g.add_op(OpKind::Gemm { m: SymDim::Concrete(1), n: 512, k: 512, dtype: DType::F32, trans_b: false }, vec![act, w1], vec![out], "gemm1");
 
         // Act
-        let geo = GraphDerivedGeometry::from_graph(&g).unwrap();
+        let geo = GraphDerivedGeometry::from_graph(&g, &DeviceProfile::detect()).unwrap();
 
         // Assert: F16 count (3) > BF16 count (1) > F32 count (0).
         assert_eq!(geo.storage_dtype, DType::F16);
@@ -531,7 +537,7 @@ mod tests {
         g.add_op(OpKind::Gemm { m: SymDim::Concrete(1), n: 256, k: 256, dtype: DType::F32, trans_b: false }, vec![act, w], vec![out], "gemm1");
 
         // Act
-        let geo = GraphDerivedGeometry::from_graph(&g).unwrap();
+        let geo = GraphDerivedGeometry::from_graph(&g, &DeviceProfile::detect()).unwrap();
 
         // Assert: only F32 weights, so storage_dtype = F32.
         assert_eq!(geo.storage_dtype, DType::F32);
@@ -556,7 +562,7 @@ mod tests {
         );
 
         // Act
-        let geo = GraphDerivedGeometry::from_graph(&g).unwrap();
+        let geo = GraphDerivedGeometry::from_graph(&g, &DeviceProfile::detect()).unwrap();
 
         // Assert
         assert_eq!(geo.intermediate, 3072);
@@ -582,7 +588,7 @@ mod tests {
         });
 
         // Act
-        let geo = GraphDerivedGeometry::from_graph(&g).unwrap();
+        let geo = GraphDerivedGeometry::from_graph(&g, &DeviceProfile::detect()).unwrap();
 
         // Assert
         assert_eq!(geo.num_layers, 32);
@@ -617,7 +623,7 @@ mod tests {
         });
 
         // Act
-        let geo = GraphDerivedGeometry::from_graph(&g).unwrap();
+        let geo = GraphDerivedGeometry::from_graph(&g, &DeviceProfile::detect()).unwrap();
 
         // Assert: 7 * (4 + 1) = 35.
         assert_eq!(geo.num_layers, 35);
@@ -637,7 +643,7 @@ mod tests {
         g.add_op(OpKind::LayerNorm { eps: 1e-12 }, vec![a], vec![normed], "layernorm");
 
         // Act
-        let geo = GraphDerivedGeometry::from_graph(&g).unwrap();
+        let geo = GraphDerivedGeometry::from_graph(&g, &DeviceProfile::detect()).unwrap();
 
         // Assert
         assert_eq!(geo.rms_eps, 1e-12);
@@ -657,7 +663,7 @@ mod tests {
         g.add_op(OpKind::ValueNorm { eps: 1e-4 }, vec![a], vec![vnormed], "value_norm");
 
         // Act
-        let geo = GraphDerivedGeometry::from_graph(&g).unwrap();
+        let geo = GraphDerivedGeometry::from_graph(&g, &DeviceProfile::detect()).unwrap();
 
         // Assert
         assert_eq!(geo.rms_eps, 1e-4);
@@ -683,7 +689,7 @@ mod tests {
         g.inputs = vec![a, w];
 
         // Act
-        let geo = GraphDerivedGeometry::from_graph(&g).unwrap();
+        let geo = GraphDerivedGeometry::from_graph(&g, &DeviceProfile::detect()).unwrap();
 
         // Assert
         assert_eq!(geo.rope_theta, 10000.0);
@@ -716,7 +722,7 @@ mod tests {
         );
 
         // Act
-        let geo = GraphDerivedGeometry::from_graph(&g).unwrap();
+        let geo = GraphDerivedGeometry::from_graph(&g, &DeviceProfile::detect()).unwrap();
 
         // Assert
         assert_eq!(geo.vocab_size, 128256);
@@ -737,7 +743,7 @@ mod tests {
         g.add_op(OpKind::Argmax { vocab_size: 50257 }, vec![c], vec![argmax_out], "argmax");
 
         // Act
-        let geo = GraphDerivedGeometry::from_graph(&g).unwrap();
+        let geo = GraphDerivedGeometry::from_graph(&g, &DeviceProfile::detect()).unwrap();
 
         // Assert
         assert_eq!(geo.vocab_size, 50257);
@@ -768,7 +774,7 @@ mod tests {
         );
 
         // Act
-        let geo = GraphDerivedGeometry::from_graph(&g).unwrap();
+        let geo = GraphDerivedGeometry::from_graph(&g, &DeviceProfile::detect()).unwrap();
 
         // Assert
         assert_eq!(geo.intermediate, 8192);
@@ -802,7 +808,7 @@ mod tests {
         );
 
         // Act
-        let geo = GraphDerivedGeometry::from_graph(&g).unwrap();
+        let geo = GraphDerivedGeometry::from_graph(&g, &DeviceProfile::detect()).unwrap();
 
         // Assert: first RoPE's parameters should be captured.
         assert_eq!(geo.rope_theta, 500000.0);
@@ -824,7 +830,7 @@ mod tests {
         g.add_op(OpKind::Gemm { m: SymDim::Concrete(64), n: 2048, k: 2048, dtype: dt, trans_b: false }, vec![input, w], vec![out], "proj");
 
         // Act
-        let geo = GraphDerivedGeometry::from_graph(&g).unwrap();
+        let geo = GraphDerivedGeometry::from_graph(&g, &DeviceProfile::detect()).unwrap();
 
         // Assert
         assert_eq!(geo.hidden, 2048);
@@ -842,7 +848,7 @@ mod tests {
         g.inputs = vec![input, w];
 
         // Act
-        let geo = GraphDerivedGeometry::from_graph(&g).unwrap();
+        let geo = GraphDerivedGeometry::from_graph(&g, &DeviceProfile::detect()).unwrap();
 
         // Assert: Symbolic dim was skipped, GEMM k=4096 used.
         assert_eq!(geo.hidden, 4096);
@@ -860,15 +866,16 @@ mod tests {
         g.inputs = vec![a, w];
 
         // Act
-        let geo = GraphDerivedGeometry::from_graph(&g).unwrap();
+        let geo = GraphDerivedGeometry::from_graph(&g, &DeviceProfile::detect()).unwrap();
 
         // Assert: no layer config → defaults to 1.
         assert_eq!(geo.num_layers, 1);
     }
 
     #[test]
-    fn compute_dtype_equals_storage_dtype() {
-        // Arrange: BF16 weights — both storage_dtype and compute_dtype should be BF16.
+    fn compute_dtype_derived_from_storage_dtype_and_device() {
+        // REQ-DTYPE-CHAIN-005: compute_dtype is derived from (storage_dtype, DeviceProfile).
+        // BF16 storage + any current hardware → F32 compute (widened accumulation).
         let mut g = CompilerGraph::new();
         let act = g.add_tensor_concrete("input", &[1, 512], DType::F32);
         let w1 = g.add_tensor_concrete("w1", &[512, 512], DType::BF16);
@@ -878,11 +885,12 @@ mod tests {
         g.add_op(OpKind::Gemm { m: SymDim::Concrete(1), n: 512, k: 512, dtype: DType::F32, trans_b: false }, vec![act, w1], vec![out], "gemm1");
 
         // Act
-        let geo = GraphDerivedGeometry::from_graph(&g).unwrap();
+        let geo = GraphDerivedGeometry::from_graph(&g, &DeviceProfile::detect()).unwrap();
 
-        // Assert: compute_dtype tracks storage_dtype per the design.
+        // Assert: storage_dtype is BF16 (most common weight dtype).
+        // compute_dtype is F32 (BF16→F32 widened accumulation on current hardware).
         assert_eq!(geo.storage_dtype, DType::BF16);
-        assert_eq!(geo.compute_dtype, DType::BF16);
+        assert_eq!(geo.compute_dtype, DType::F32);
     }
 
     #[test]
@@ -899,7 +907,7 @@ mod tests {
         g.add_op(OpKind::RmsNorm { eps: 1e-4 }, vec![a], vec![normed], "rmsnorm");
 
         // Act
-        let geo = GraphDerivedGeometry::from_graph(&g).unwrap();
+        let geo = GraphDerivedGeometry::from_graph(&g, &DeviceProfile::detect()).unwrap();
 
         // Assert
         assert_eq!(geo.rms_eps, 1e-4);
@@ -925,7 +933,7 @@ mod tests {
         g.add_op(OpKind::Argmax { vocab_size: 99999 }, vec![proj_out], vec![argmax_out], "argmax");
 
         // Act
-        let geo = GraphDerivedGeometry::from_graph(&g).unwrap();
+        let geo = GraphDerivedGeometry::from_graph(&g, &DeviceProfile::detect()).unwrap();
 
         // Assert: Gather's vocab_size=50000 wins (first op scanned).
         assert_eq!(geo.vocab_size, 50000);
@@ -952,7 +960,7 @@ mod tests {
         }, vec![q_out, k_out, v_out], vec![attn_out], "attn");
 
         // Act
-        let geo = GraphDerivedGeometry::from_graph(&g).unwrap();
+        let geo = GraphDerivedGeometry::from_graph(&g, &DeviceProfile::detect()).unwrap();
 
         // Assert: num_kv_heads equals num_heads when not using GQA.
         assert_eq!(geo.num_heads, 8);
@@ -985,7 +993,7 @@ mod tests {
         );
 
         // Act
-        let geo = GraphDerivedGeometry::from_graph(&g).unwrap();
+        let geo = GraphDerivedGeometry::from_graph(&g, &DeviceProfile::detect()).unwrap();
 
         // Assert: RoPE provides both num_heads=12 and head_dim=64.
         assert_eq!(geo.num_heads, 12);
@@ -1010,7 +1018,7 @@ mod tests {
         g.add_op(OpKind::Gemm { m: SymDim::Concrete(1), n: 512, k: 512, dtype: DType::F32, trans_b: false }, vec![act, w1], vec![out], "gemm1");
 
         // Act
-        let geo = GraphDerivedGeometry::from_graph(&g).unwrap();
+        let geo = GraphDerivedGeometry::from_graph(&g, &DeviceProfile::detect()).unwrap();
 
         // Assert: quantized dtypes are not counted, so storage_dtype falls back to F32.
         assert_eq!(geo.storage_dtype, DType::F32);
@@ -1033,7 +1041,7 @@ mod tests {
         g.add_op(OpKind::Gemm { m: SymDim::Concrete(1), n: 4096, k: 768, dtype: dt, trans_b: false }, vec![input, gate_w_large], vec![gate_out_large], "gate_large");
 
         // Act
-        let geo = GraphDerivedGeometry::from_graph(&g).unwrap();
+        let geo = GraphDerivedGeometry::from_graph(&g, &DeviceProfile::detect()).unwrap();
 
         // Assert: largest FFN GEMM n=4096 wins.
         assert_eq!(geo.intermediate, 4096);
@@ -1052,7 +1060,7 @@ mod tests {
         let normed = g.add_tensor_concrete("normed", &[1, 256], dt);
         g.add_op(OpKind::RmsNorm { eps: 1e-6 }, vec![a], vec![normed], "norm");
 
-        let geo = GraphDerivedGeometry::from_graph(&g).unwrap();
+        let geo = GraphDerivedGeometry::from_graph(&g, &DeviceProfile::detect()).unwrap();
 
         // Act
         let debug_str = format!("{:?}", geo);
@@ -1075,7 +1083,7 @@ mod tests {
         g.add_op(OpKind::Gemm { m: SymDim::Concrete(1), n: 512, k: 512, dtype: dt, trans_b: false }, vec![a, w], vec![c], "gemm");
         g.inputs = vec![a, w];
 
-        let geo = GraphDerivedGeometry::from_graph(&g).unwrap();
+        let geo = GraphDerivedGeometry::from_graph(&g, &DeviceProfile::detect()).unwrap();
 
         // Act
         let cloned = geo.clone();
@@ -1108,7 +1116,7 @@ mod tests {
         g.add_op(OpKind::Gemm { m: SymDim::Concrete(1), n: 256, k: 256, dtype: DType::F32, trans_b: false }, vec![act, w_bf16], vec![out], "gemm1");
 
         // Act
-        let geo = GraphDerivedGeometry::from_graph(&g).unwrap();
+        let geo = GraphDerivedGeometry::from_graph(&g, &DeviceProfile::detect()).unwrap();
 
         // Assert: BF16 count (1) >= F16 count (1) and BF16 > 0, so BF16 wins.
         assert_eq!(geo.storage_dtype, DType::BF16);
@@ -1126,7 +1134,7 @@ mod tests {
         g.inputs = vec![a];
 
         // Act
-        let geo = GraphDerivedGeometry::from_graph(&g).unwrap();
+        let geo = GraphDerivedGeometry::from_graph(&g, &DeviceProfile::detect()).unwrap();
 
         // Assert: no weight tensors after skip → F32 fallback.
         assert_eq!(geo.storage_dtype, DType::F32);
@@ -1146,7 +1154,7 @@ mod tests {
         g.add_op(OpKind::Gemm { m: SymDim::Concrete(1), n: 256, k: 1024, dtype: dt, trans_b: false }, vec![input, kv_w], vec![kv_out], "kv_proj");
 
         // Act
-        let geo = GraphDerivedGeometry::from_graph(&g).unwrap();
+        let geo = GraphDerivedGeometry::from_graph(&g, &DeviceProfile::detect()).unwrap();
 
         // Assert: derive_intermediate picks the GEMM n value even when n < hidden.
         // The function selects the largest GEMM n across all ops, not just FFN ops.
@@ -1166,7 +1174,7 @@ mod tests {
         g.add_op(OpKind::Gemm { m: SymDim::Concrete(32), n: 2048, k: 2048, dtype: dt, trans_b: false }, vec![hidden, w], vec![out], "proj");
 
         // Act
-        let geo = GraphDerivedGeometry::from_graph(&g).unwrap();
+        let geo = GraphDerivedGeometry::from_graph(&g, &DeviceProfile::detect()).unwrap();
 
         // Assert
         assert_eq!(geo.hidden, 2048);
@@ -1184,7 +1192,7 @@ mod tests {
         g.inputs = vec![a, w];
 
         // Act
-        let geo = GraphDerivedGeometry::from_graph(&g).unwrap();
+        let geo = GraphDerivedGeometry::from_graph(&g, &DeviceProfile::detect()).unwrap();
 
         // Assert
         assert_eq!(geo.rope_partial, 1.0);
@@ -1212,7 +1220,7 @@ mod tests {
         }, vec![q_out, k_out, v_out], vec![attn_out], "attn");
 
         // Act
-        let geo = GraphDerivedGeometry::from_graph(&g).unwrap();
+        let geo = GraphDerivedGeometry::from_graph(&g, &DeviceProfile::detect()).unwrap();
 
         // Assert: MHA provides both num_heads and num_kv_heads independently.
         assert_eq!(geo.num_heads, 16);
@@ -1234,7 +1242,7 @@ mod tests {
         g.inputs = vec![a, w];
 
         // Act
-        let geo = GraphDerivedGeometry::from_graph(&g).unwrap();
+        let geo = GraphDerivedGeometry::from_graph(&g, &DeviceProfile::detect()).unwrap();
 
         // Assert: 1D input skipped, GEMM k=512 used.
         assert_eq!(geo.hidden, 512);
@@ -1252,7 +1260,7 @@ mod tests {
         g.inputs = vec![a, w];
 
         // Act
-        let geo = GraphDerivedGeometry::from_graph(&g).unwrap();
+        let geo = GraphDerivedGeometry::from_graph(&g, &DeviceProfile::detect()).unwrap();
 
         // Assert: 3D input skipped, GEMM k=1024 used.
         assert_eq!(geo.hidden, 1024);
@@ -1280,7 +1288,7 @@ mod tests {
         g.add_op(OpKind::Gemm { m: SymDim::Concrete(1), n: 1536, k: 512, dtype: dt, trans_b: false }, vec![input, w3], vec![out3], "proj3");
 
         // Act
-        let geo = GraphDerivedGeometry::from_graph(&g).unwrap();
+        let geo = GraphDerivedGeometry::from_graph(&g, &DeviceProfile::detect()).unwrap();
 
         // Assert: largest n=2048 wins.
         assert_eq!(geo.intermediate, 2048);
@@ -1300,7 +1308,7 @@ mod tests {
         g.add_op(OpKind::Gemm { m: SymDim::Concrete(1), n: 768, k: 768, dtype: dt, trans_b: false }, vec![input, attn_w], vec![attn_out], "attn_proj");
 
         // Act
-        let geo = GraphDerivedGeometry::from_graph(&g).unwrap();
+        let geo = GraphDerivedGeometry::from_graph(&g, &DeviceProfile::detect()).unwrap();
 
         // Assert: no GEMM with n > hidden, so fallback to hidden * 4.
         assert_eq!(geo.intermediate, 768 * 4);
@@ -1326,7 +1334,7 @@ mod tests {
         );
 
         // Act
-        let geo = GraphDerivedGeometry::from_graph(&g).unwrap();
+        let geo = GraphDerivedGeometry::from_graph(&g, &DeviceProfile::detect()).unwrap();
 
         // Assert
         assert!(geo.rope_scaling.is_none());
@@ -1344,7 +1352,7 @@ mod tests {
         g.inputs = vec![a, w];
 
         // Act
-        let geo = GraphDerivedGeometry::from_graph(&g).unwrap();
+        let geo = GraphDerivedGeometry::from_graph(&g, &DeviceProfile::detect()).unwrap();
 
         // Assert: vocab_size falls back to hidden.
         assert_eq!(geo.vocab_size, 1024);
@@ -1370,7 +1378,7 @@ mod tests {
         );
 
         // Act
-        let geo = GraphDerivedGeometry::from_graph(&g).unwrap();
+        let geo = GraphDerivedGeometry::from_graph(&g, &DeviceProfile::detect()).unwrap();
 
         // Assert: num_kv_heads defaults to num_heads when no MHA op.
         assert_eq!(geo.num_heads, 8);
@@ -1397,7 +1405,7 @@ mod tests {
         );
 
         // Act
-        let geo = GraphDerivedGeometry::from_graph(&g).unwrap();
+        let geo = GraphDerivedGeometry::from_graph(&g, &DeviceProfile::detect()).unwrap();
 
         // Assert: RoPE provides head_dim directly.
         assert_eq!(geo.hidden, 1000);
@@ -1444,7 +1452,7 @@ mod tests {
         });
 
         // Act
-        let geo = GraphDerivedGeometry::from_graph(&g).unwrap();
+        let geo = GraphDerivedGeometry::from_graph(&g, &DeviceProfile::detect()).unwrap();
 
         // Assert: layer_loop_config (24) takes priority over hetero (5 * 4 = 20).
         assert_eq!(geo.num_layers, 24);
@@ -1467,7 +1475,7 @@ mod tests {
         g.inputs = vec![input, w];
 
         // Act
-        let geo = GraphDerivedGeometry::from_graph(&g).unwrap();
+        let geo = GraphDerivedGeometry::from_graph(&g, &DeviceProfile::detect()).unwrap();
 
         // Assert: Symbolic second dim skipped, GEMM k=2048 used.
         assert_eq!(geo.hidden, 2048);

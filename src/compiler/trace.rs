@@ -1071,10 +1071,32 @@ impl QuantPrecision {
 
     /// GEMM 累加器 dtype (REQ-DTYPE-005)。
     /// 由 (kind × packing × 硬件能力) 联合决定。
+    /// x86 路径: BF16→F32 累加, F32→F32 累加
     pub fn accumulator_dtype(&self) -> QuantPrecision {
         match self.x86_elem_strategy() {
             X86ElemStrategy::Native => *self,
             X86ElemStrategy::WidenCompute | X86ElemStrategy::DequantCompute(_) => QuantPrecision::F32,
+        }
+    }
+
+    /// GPU GEMM 累加器 dtype (REQ-DTYPE-005)。
+    /// 由 (kind × packing × GPU 能力) 联合决定。
+    /// GPU: BF16→F32 tensor core 累加, F16→F16 累加, 量化→F32
+    pub fn gpu_accumulator_dtype(&self) -> QuantPrecision {
+        match self.gpu_elem_strategy() {
+            GpuElemStrategy::Native => match self.kind {
+                // BF16 uses F32 tensor core accumulation (HMMA.16816.F32)
+                DTypeKind::BF16 | DTypeKind::TF32 => QuantPrecision::F32,
+                // F16 can use F16 accumulation (HMMA.16816.F16) or F32
+                DTypeKind::F16 => QuantPrecision::F32,
+                // FP8 uses F32 accumulation
+                DTypeKind::FP8E4M3 | DTypeKind::FP8E5M2 | DTypeKind::FP4E2M1 => QuantPrecision::F32,
+                // INT8 uses F32 accumulation
+                DTypeKind::INT8 => QuantPrecision::F32,
+                // Other native types keep their dtype
+                _ => *self,
+            },
+            GpuElemStrategy::WidenCompute | GpuElemStrategy::DequantCompute => QuantPrecision::F32,
         }
     }
 
@@ -2564,5 +2586,89 @@ mod tests {
             ComputePattern::Elementwise { body: b } => assert_eq!(b.len(), 3),
             other => panic!("expected Elementwise, got {:?}", other),
         }
+    }
+
+    // ── REQ-DTYPE-005: gpu_accumulator_dtype tests ──
+
+    /// @trace TEST-DTYPE-005-1 [req:REQ-DTYPE-005] [level:unit]
+    /// GPU: BF16 → F32 tensor core accumulation
+    #[test]
+    fn gpu_accumulator_dtype_bf16_is_f32() {
+        assert_eq!(QuantPrecision::BF16.gpu_accumulator_dtype(), QuantPrecision::F32);
+    }
+
+    /// @trace TEST-DTYPE-005-2 [req:REQ-DTYPE-005] [level:unit]
+    /// GPU: F16 → F32 accumulation (HMMA.16816.F32)
+    #[test]
+    fn gpu_accumulator_dtype_f16_is_f32() {
+        assert_eq!(QuantPrecision::F16.gpu_accumulator_dtype(), QuantPrecision::F32);
+    }
+
+    /// @trace TEST-DTYPE-005-3 [req:REQ-DTYPE-005] [level:unit]
+    /// GPU: F32 → F32 accumulation (identity)
+    #[test]
+    fn gpu_accumulator_dtype_f32_is_f32() {
+        assert_eq!(QuantPrecision::F32.gpu_accumulator_dtype(), QuantPrecision::F32);
+    }
+
+    /// @trace TEST-DTYPE-005-4 [req:REQ-DTYPE-005] [level:unit]
+    /// GPU: x86 accumulator_dtype for BF16 is F32 (WidenCompute)
+    #[test]
+    fn x86_accumulator_dtype_bf16_is_f32() {
+        assert_eq!(QuantPrecision::BF16.accumulator_dtype(), QuantPrecision::F32);
+    }
+
+    /// @trace TEST-DTYPE-005-5 [req:REQ-DTYPE-005] [level:unit]
+    /// GPU: x86 accumulator_dtype for F32 is F32 (Native)
+    #[test]
+    fn x86_accumulator_dtype_f32_is_f32() {
+        assert_eq!(QuantPrecision::F32.accumulator_dtype(), QuantPrecision::F32);
+    }
+
+    // ── REQ-DTYPE-006: needs_narrowing_from tests ──
+
+    /// @trace TEST-DTYPE-006-1 [req:REQ-DTYPE-006] [level:unit]
+    /// F32→BF16 narrowing: needs_narrowing_from returns true
+    #[test]
+    fn needs_narrowing_f32_to_bf16() {
+        assert!(QuantPrecision::BF16.needs_narrowing_from(QuantPrecision::F32));
+    }
+
+    /// @trace TEST-DTYPE-006-2 [req:REQ-DTYPE-006] [level:unit]
+    /// F32→F32: no narrowing needed
+    #[test]
+    fn needs_no_narrowing_f32_to_f32() {
+        assert!(!QuantPrecision::F32.needs_narrowing_from(QuantPrecision::F32));
+    }
+
+    /// @trace TEST-DTYPE-006-3 [req:REQ-DTYPE-006] [level:unit]
+    /// BF16→BF16: no narrowing needed (same dtype)
+    #[test]
+    fn needs_no_narrowing_bf16_to_bf16() {
+        assert!(!QuantPrecision::BF16.needs_narrowing_from(QuantPrecision::BF16));
+    }
+
+    /// @trace TEST-DTYPE-006-4 [req:REQ-DTYPE-006] [level:unit]
+    /// BF16 GEMM accumulator chain: BF16 → accumulator_dtype() = F32 → needs narrowing
+    #[test]
+    fn bf16_gemm_accumulator_needs_narrowing() {
+        let acc = QuantPrecision::BF16.accumulator_dtype();
+        assert!(QuantPrecision::BF16.needs_narrowing_from(acc));
+    }
+
+    /// @trace TEST-DTYPE-006-5 [req:REQ-DTYPE-006] [level:unit]
+    /// F32 GEMM accumulator chain: F32 → accumulator_dtype() = F32 → no narrowing
+    #[test]
+    fn f32_gemm_accumulator_no_narrowing() {
+        let acc = QuantPrecision::F32.accumulator_dtype();
+        assert!(!QuantPrecision::F32.needs_narrowing_from(acc));
+    }
+
+    /// @trace TEST-DTYPE-006-6 [req:REQ-DTYPE-006] [level:unit]
+    /// GPU BF16 GEMM: gpu_accumulator_dtype() = F32 → needs narrowing
+    #[test]
+    fn gpu_bf16_gemm_accumulator_needs_narrowing() {
+        let acc = QuantPrecision::BF16.gpu_accumulator_dtype();
+        assert!(QuantPrecision::BF16.needs_narrowing_from(acc));
     }
 }

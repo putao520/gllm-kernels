@@ -49,6 +49,7 @@ pub mod virtual_activation;
 pub mod pack_map;
 pub mod counters;
 
+pub mod dtype_chain;
 pub mod graph_geometry;
 pub mod mega_kernel_abi;
 pub mod quant_ir;
@@ -445,7 +446,7 @@ impl InferenceCompiler {
         // SPEC/39 REQ-UMK-001: single compilation entry point handles all graph topologies.
         // All graphs (with or without layer loops) go through compile_mega_kernel_vm.
         // Simple graphs use LoopBegin { bound: Const(1) } + LoopEnd — single iteration, zero overhead.
-        let geometry = graph_geometry::GraphDerivedGeometry::from_graph(&graph)
+        let geometry = graph_geometry::GraphDerivedGeometry::from_graph(&graph, &DeviceProfile::detect())
             .map_err(|e| InferenceError::CompileError(format!("GraphDerivedGeometry: {}", e).into()))?;
 
         let buffer_layout = mega_kernel_abi::BufferLayout::from_graph_geometry(
@@ -705,7 +706,7 @@ impl InferenceCompiler {
         use codegen::vm::isa_profile::IsaProfile;
         use codegen::vm::opt_pass::PassRegistry;
 
-        let geometry = graph_geometry::GraphDerivedGeometry::from_graph(&graph)
+        let geometry = graph_geometry::GraphDerivedGeometry::from_graph(&graph, &DeviceProfile::detect())
             .map_err(|e| InferenceError::CompileError(format!("GraphDerivedGeometry: {}", e).into()))?;
 
         let buffer_layout = mega_kernel_abi::BufferLayout::from_graph_geometry(

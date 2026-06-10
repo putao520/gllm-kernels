@@ -38,6 +38,28 @@ pub struct LayoutTransform {
     pub cost: f64,
 }
 
+/// REQ-DTYPE-004: dtype 变换描述 — 当相邻 op 的 dtype 不同时
+#[derive(Debug, Clone)]
+pub struct DtypeTransform {
+    /// 源 dtype (producer 的输出 dtype)
+    pub source: crate::compiler::trace::QuantPrecision,
+    /// 目标 dtype (consumer 的输入 dtype)
+    pub target: crate::compiler::trace::QuantPrecision,
+    /// 变换方式: VecWiden / VecNarrow / PackMap 转换
+    pub method: DtypeTransformMethod,
+}
+
+/// REQ-DTYPE-004: dtype 变换方式
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DtypeTransformMethod {
+    /// VecWiden: 窄→宽 (BF16→F32)，编译时 bake
+    VecWiden,
+    /// VecNarrow: 宽→窄 (F32→BF16)，编译时 bake
+    VecNarrow,
+    /// PackMap 转换: 通过重排 stride 实现 dtype+layout 同时转换
+    PackMap,
+}
+
 /// 单个 op 的布局分配结果
 #[derive(Debug, Clone)]
 pub struct OpLayoutAssignment {
@@ -49,6 +71,8 @@ pub struct OpLayoutAssignment {
     pub output_layout: LayoutConstraint,
     /// 匹配到的加速指令 ID (如果有)
     pub accel_id: Option<&'static str>,
+    /// REQ-DTYPE-004: 该 op 的输入 dtype，参与布局决策
+    pub dtype: Option<crate::compiler::trace::QuantPrecision>,
 }
 
 /// 两个相邻 op 之间的布局变换结果
@@ -58,10 +82,12 @@ pub struct InterOpTransform {
     pub producer: OpId,
     /// 下游 op
     pub consumer: OpId,
-    /// 变换描述
+    /// 布局变换描述
     pub transform: LayoutTransform,
     /// 搬运类型
     pub movement: MovementType,
+    /// REQ-DTYPE-004: dtype 变换描述 (None 表示 dtype 相同，零变换)
+    pub dtype_transform: Option<DtypeTransform>,
 }
 
 /// 一个融合组的布局协商结果
@@ -73,6 +99,8 @@ pub struct GroupLayoutAssignment {
     pub op_layouts: HashMap<OpId, OpLayoutAssignment>,
     /// op 间的布局变换
     pub inter_op_transforms: Vec<InterOpTransform>,
+    /// REQ-DTYPE-004: op 间的 dtype 变换
+    pub dtype_transforms: Vec<DtypeTransform>,
     /// 总加速收益 (满足的加速指令收益之和)
     pub total_benefit: f64,
     /// 总变换代价
@@ -162,6 +190,7 @@ fn negotiate_group(
             group_id: group.id,
             op_layouts,
             inter_op_transforms,
+            dtype_transforms: Vec::new(),
             total_benefit: 0.0,
             total_transform_cost: 0.0,
         };
@@ -210,6 +239,8 @@ fn negotiate_group(
         });
     }
 
+    let mut dtype_transforms = Vec::new();
+
     // Step 2: 流水线级联协商 — 对相邻 op 进行布局协商
     // 每个 (op[i], op[i+1]) 对是一个协商点
     for i in 0..ops.len() {
@@ -227,48 +258,82 @@ fn negotiate_group(
             weight_layout: pref.weight_layout.clone(),
             output_layout: pref.output_layout.clone(),
             accel_id: pref.accel_id,
+            dtype: pref.dtype,
         });
 
-        // Step 3: 与下一个 op 的布局协商
+        // Step 3: 与下一个 op 的布局协商 + REQ-DTYPE-004 dtype 协商
         if i + 1 < ops.len() {
             let next = &preferred[i + 1];
             let movement = classify_movement(pref.op_class, next.op_class, i, group);
 
+            // REQ-DTYPE-004: dtype 协商 — 相同 dtype 共享 buffer (零变换),
+            // 不同 dtype 需要通过 VecWiden/VecNarrow/PackMap 转换
+            let dtype_xform = match (pref.dtype, next.dtype) {
+                (Some(src), Some(dst)) if src != dst => {
+                    let method = if dst.elem_bytes() > src.elem_bytes() {
+                        DtypeTransformMethod::VecWiden
+                    } else if dst.elem_bytes() < src.elem_bytes() {
+                        DtypeTransformMethod::VecNarrow
+                    } else {
+                        // Same byte width but different dtype (e.g. F16↔BF16) — PackMap stride remap
+                        DtypeTransformMethod::PackMap
+                    };
+                    let xform = DtypeTransform { source: src, target: dst, method };
+                    dtype_transforms.push(xform.clone());
+                    Some(xform)
+                }
+                _ => None,
+            };
+
             match movement {
                 MovementType::RegisterDirect => {
                     // 无搬运点: 布局必须兼容
-                    if pref.output_layout.compatible_with(&next.input_layout) {
+                    // REQ-DTYPE-004: dtype 不同时 RegisterDirect 不可行 — 需要显式变换
+                    let layout_compatible = pref.output_layout.compatible_with(&next.input_layout);
+                    let dtype_compatible = dtype_xform.is_none();
+
+                    if layout_compatible && dtype_compatible {
                         // 零变换, 下游直接消费上游输出布局
                     } else {
                         // 不兼容: 找折中布局
-                        let compromise = find_compromise(&pref.output_layout, &next.input_layout);
-                        let cost = if compromise == LayoutConstraint::Any { 0.0 } else { 1.0 };
-                        total_transform_cost += cost;
+                        let compromise = if !layout_compatible {
+                            find_compromise(&pref.output_layout, &next.input_layout)
+                        } else {
+                            pref.output_layout.clone()
+                        };
+                        let layout_cost = if !layout_compatible && compromise == LayoutConstraint::Any { 0.0 } else if !layout_compatible { 1.0 } else { 0.0 };
+                        // dtype 变换零成本 (编译时 bake)
+                        total_transform_cost += layout_cost;
                         inter_op_transforms.push(InterOpTransform {
                             producer: pref.op_id,
                             consumer: next.op_id,
                             transform: LayoutTransform {
                                 source: pref.output_layout.clone(),
                                 target: compromise,
-                                cost,
+                                cost: layout_cost,
                             },
                             movement,
+                            dtype_transform: dtype_xform,
                         });
                     }
                 }
                 MovementType::RegisterToMemory | MovementType::MemoryToMemory | MovementType::GpuGlobalToShared => {
                     // 免费变换窗口: 下游用自己的偏好布局
                     // store/copy 本来就要发生, 改变 stride/layout = 零额外成本
-                    if !pref.output_layout.compatible_with(&next.input_layout) {
+                    // REQ-DTYPE-004: dtype 变换也是零成本 (VecWiden/VecNarrow 编译时 bake)
+                    let needs_layout_xform = !pref.output_layout.compatible_with(&next.input_layout);
+                    let needs_dtype_xform = dtype_xform.is_some();
+                    if needs_layout_xform || needs_dtype_xform {
                         inter_op_transforms.push(InterOpTransform {
                             producer: pref.op_id,
                             consumer: next.op_id,
                             transform: LayoutTransform {
                                 source: pref.output_layout.clone(),
-                                target: next.input_layout.clone(),
+                                target: if needs_layout_xform { next.input_layout.clone() } else { pref.output_layout.clone() },
                                 cost: 0.0, // 免费!
                             },
                             movement,
+                            dtype_transform: dtype_xform,
                         });
                     }
                 }
@@ -280,6 +345,7 @@ fn negotiate_group(
         group_id: group.id,
         op_layouts,
         inter_op_transforms,
+        dtype_transforms,
         total_benefit,
         total_transform_cost,
     }
@@ -1088,7 +1154,9 @@ mod tests {
                         cost: 1.0,
                     },
                     movement: MovementType::RegisterDirect,
+                    dtype_transform: None,
                 }],
+                dtype_transforms: Vec::new(),
                 total_benefit: 2.0,
                 total_transform_cost: 1.0,
             }],
@@ -1268,6 +1336,7 @@ mod tests {
             consumer: OpId(20),
             transform: transform.clone(),
             movement: MovementType::MemoryToMemory,
+            dtype_transform: None,
         };
 
         // Act & Assert: verify all fields are correctly stored
@@ -1332,6 +1401,7 @@ mod tests {
             weight_layout: None,
             output_layout: LayoutConstraint::Any,
             accel_id: None,
+            dtype: None,
         };
 
         // Assert: weight_layout is None, accel_id is None
@@ -1351,6 +1421,7 @@ mod tests {
             weight_layout: Some(LayoutConstraint::PanelPacked { mr: 6, nr: 256 }),
             output_layout: LayoutConstraint::RowMajor { align_bytes: 64 },
             accel_id: Some("avx512_gemm"),
+            dtype: None,
         };
 
         // Assert: all fields populated correctly
@@ -1370,6 +1441,7 @@ mod tests {
             weight_layout: None,
             output_layout: LayoutConstraint::Any,
             accel_id: None,
+            dtype: None,
         });
         let original = GroupLayoutAssignment {
             group_id: 7,
@@ -1383,7 +1455,9 @@ mod tests {
                     cost: 0.0,
                 },
                 movement: MovementType::RegisterToMemory,
+                dtype_transform: None,
             }],
+            dtype_transforms: Vec::new(),
             total_benefit: 5.0,
             total_transform_cost: 1.5,
         };
@@ -2147,7 +2221,9 @@ mod tests {
                     cost: 0.0,
                 },
                 movement: MovementType::MemoryToMemory,
+                dtype_transform: None,
             }],
+            dtype_transforms: Vec::new(),
             total_benefit: 3.0,
             total_transform_cost: 0.5,
         };
@@ -2155,6 +2231,7 @@ mod tests {
             group_id: 1,
             op_layouts: HashMap::new(),
             inter_op_transforms: Vec::new(),
+            dtype_transforms: Vec::new(),
             total_benefit: 7.0,
             total_transform_cost: 2.0,
         };
@@ -2359,12 +2436,14 @@ mod tests {
             weight_layout: None,
             output_layout: LayoutConstraint::Any,
             accel_id: None,
+            dtype: None,
         });
         let assignment = LayoutAssignment {
             group_assignments: vec![GroupLayoutAssignment {
                 group_id: 0,
                 op_layouts,
                 inter_op_transforms: Vec::new(),
+                dtype_transforms: Vec::new(),
                 total_benefit: 10.0,
                 total_transform_cost: 0.0,
             }],
@@ -2392,6 +2471,7 @@ mod tests {
             consumer: OpId(6),
             transform,
             movement: MovementType::GpuGlobalToShared,
+        dtype_transform: None,
         };
 
         // Act & Assert
@@ -3008,6 +3088,7 @@ mod tests {
             group_id: 0,
             op_layouts: HashMap::new(),
             inter_op_transforms: Vec::new(),
+                dtype_transforms: Vec::new(),
             total_benefit: 2.0,
             total_transform_cost: 0.0,
         };
@@ -3015,6 +3096,7 @@ mod tests {
             group_id: 1,
             op_layouts: HashMap::new(),
             inter_op_transforms: Vec::new(),
+                dtype_transforms: Vec::new(),
             total_benefit: 3.0,
             total_transform_cost: 1.5,
         };
@@ -3022,6 +3104,7 @@ mod tests {
             group_id: 2,
             op_layouts: HashMap::new(),
             inter_op_transforms: Vec::new(),
+                dtype_transforms: Vec::new(),
             total_benefit: 5.0,
             total_transform_cost: 0.5,
         };
