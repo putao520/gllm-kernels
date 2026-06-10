@@ -108,7 +108,7 @@ pub enum OpKindKey {
     /// No scalar reference trace (dispatch goes through `lower_qtap_stg`).
     QTapSTG,
     /// Argmax: find max element index in a vector (GRAPH-SHAPE-DRIVEN-MEGA-KERNEL §2.2).
-    /// Reduction op, can be fused as GEMM epilogue (e.g., lm_head + argmax).
+    /// Reduction op, can be fused as GEMM epilogue (e.g., logits GEMM + argmax).
     Argmax,
     /// StoreToken: write generated token to output buffer (side-effect, Opaque).
     StoreToken,

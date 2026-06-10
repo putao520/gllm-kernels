@@ -9,39 +9,13 @@ use crate::compiler::graph::WeightLayout;
 use crate::compiler::hotpatch::HotPatchRegistry;
 use crate::types::CompilerError;
 
-/// Signature of a compiled layer function.
-///
-/// ```text
-/// fn(input: *const u8, weights: *const u8, kv_cache: *mut u8,
-///    positions: *const u32, seq_lens: *const usize,
-///    batch_size: usize, seq_len: usize,
-///    output: *mut u8, scratchpad: *mut u8,
-///    telemetry: *mut u8)
-/// ```
-///
-/// The `telemetry` pointer (arg 10) points to the epilogue telemetry buffer.
-/// When NULL, all telemetry probes are skipped (zero overhead).
-/// See `EpilogueTelemetryConfig` and `telemetry_offsets` in `graph.rs`.
-pub type CompiledLayerFn = unsafe extern "C" fn(
-    *const u8,    // arg 0: input        → rdi   (AbiArg(0))
-    *const u8,    // arg 1: weights      → rsi   (AbiArg(1))
-    *mut u8,      // arg 2: kv_cache     → rdx   (AbiArg(2))
-    *const u32,   // arg 3: positions    → rcx   (AbiArg(3))
-    *const usize, // arg 4: seq_lens     → r8    (AbiArg(4))
-    usize,        // arg 5: batch_size   → r9    (AbiArg(5))
-    usize,        // arg 6: seq_len      → [rsp+0]  → [rbp+16] after prologue
-    *mut u8,      // arg 7: output       → [rsp+8]  → [rbp+24] after prologue
-    *mut u8,      // arg 8: scratchpad   → [rsp+16] → [rbp+32] after prologue
-    *mut u8,      // arg 9: telemetry    → [rsp+24] → [rbp+40] after prologue (NULL = disabled)
-);
-
 // ═══════════════════════════════════════════════════════════════
 //  ABI 参数位置由 VmState 动态计算 (ARCH-VM-STATE-TRACKING)
 //
 //  旧的 abi_slots 硬编码常量模块已删除。
 //  所有参数位置通过 vm_state::VmState::arg_ptr_expr("name") 查询。
-//  VmState 的初始化由平台 ABI 规则驱动 (init_x86_sysv)。
-//  参数名序列定义在 vm_state::COMPILED_LAYER_PARAMS。
+//  VmState 的初始化由平台 ABI 规则驱动 (init_mega_kernel_x86)。
+//  参数名序列内联在 VmState::init_mega_kernel_x86() 中。
 // ═══════════════════════════════════════════════════════════════
 
 /// A JIT-compiled transformer layer.
@@ -90,17 +64,6 @@ impl CompiledLayer {
         })
     }
 
-    /// Get the entry point function pointer.
-    ///
-    /// # Safety
-    /// The caller must ensure the compiled code is valid and the arguments
-    /// match the expected signature.
-    #[inline]
-    pub unsafe fn entry_point(&self) -> CompiledLayerFn {
-        let ptr = self.code.ptr.add(self.entry_offset);
-        std::mem::transmute(ptr)
-    }
-
     /// Get the entry point as a MegaKernelFn (mega-kernel single-entry-point).
     ///
     /// # Safety
@@ -125,58 +88,47 @@ impl CompiledLayer {
         unsafe { std::slice::from_raw_parts(self.code.ptr, self.code.len) }
     }
 
-    /// Execute the compiled layer.
+    /// Execute via MegaKernelFn ABI (23-param). All graphs now use the unified
+    /// `compile_mega_kernel_vm` entry point (SPEC/39).
     ///
     /// # Safety
     /// The caller must ensure all pointers are valid and the buffer sizes
     /// match the compiled graph's expected layout.
-    /// `telemetry` may be NULL to disable all telemetry probes.
     #[inline]
-    pub unsafe fn execute(
+    pub unsafe fn execute_as_mega_kernel(
         &self,
         input: *const u8,
         weights: *const u8,
-        kv_cache: *mut u8,
-        positions: *const u32,
-        seq_lens: *const usize,
         batch_size: usize,
         seq_len: usize,
         output: *mut u8,
         scratchpad: *mut u8,
     ) {
-        let f = self.entry_point();
+        let f = self.entry_point_as_mega_kernel();
+        let output_tokens = output as *mut u32;
         f(
-            input, weights, kv_cache, positions, seq_lens,
-            batch_size, seq_len, output, scratchpad,
-            std::ptr::null_mut(), // telemetry disabled by default
-        );
-    }
-
-    /// Execute the compiled layer with an epilogue telemetry buffer.
-    ///
-    /// # Safety
-    /// The caller must ensure all pointers are valid.
-    /// `telemetry` must point to at least `TELEMETRY_BUFFER_MIN_BYTES` bytes,
-    /// or be NULL to disable all probes.
-    #[inline]
-    pub unsafe fn execute_with_telemetry(
-        &self,
-        input: *const u8,
-        weights: *const u8,
-        kv_cache: *mut u8,
-        positions: *const u32,
-        seq_lens: *const usize,
-        batch_size: usize,
-        seq_len: usize,
-        output: *mut u8,
-        scratchpad: *mut u8,
-        telemetry: *mut u8,
-    ) {
-        let f = self.entry_point();
-        f(
-            input, weights, kv_cache, positions, seq_lens,
-            batch_size, seq_len, output, scratchpad,
-            telemetry,
+            input as *const u32,   // arg 0: input_ids_ptr
+            weights,               // arg 1: weight_blob_ptr
+            std::ptr::null_mut(),  // arg 2: kv_cache_ptr
+            std::ptr::null(),      // arg 3: positions_ptr
+            std::ptr::null(),      // arg 4: aux_ptr
+            batch_size,            // arg 5: batch_size
+            seq_len,               // arg 6: prompt_len
+            scratchpad,            // arg 7: scratchpad_ptr
+            output_tokens,         // arg 8: output_tokens_ptr
+            0,                     // arg 9: temperature_u32
+            0,                     // arg 10: top_k
+            0,                     // arg 11: top_p_u32
+            0,                     // arg 12: max_new_tokens
+            0,                     // arg 13: eos_token_id
+            std::ptr::null(),      // arg 14: hook_ctx_ptr
+            std::ptr::null_mut(),  // arg 15: telemetry_ptr
+            0,                     // arg 16: session_position
+            std::ptr::null(),      // arg 17: fused_hidden_ptr
+            0,                     // arg 18: num_mm_tokens
+            std::ptr::null(),      // arg 19: callback_table_ptr
+            std::ptr::null(),      // arg 20: page_table_ptr
+            std::ptr::null(),      // arg 21: batch_ctx_ptr
         );
     }
 
@@ -857,26 +809,6 @@ mod tests {
         }
     }
 
-    // @trace TEST-EXE-16 [req:REQ-JIT] [level:unit]
-    #[test]
-    fn test_entry_point_returns_valid_fn_ptr() {
-        #[cfg(target_arch = "x86_64")]
-        {
-            let code = [0xC3u8]; // ret
-            let layer = CompiledLayer::from_code(&code, 0, 0).unwrap();
-            unsafe {
-                let f = layer.entry_point();
-                // The function pointer should be non-null and point into the code buffer
-                let fptr = f as *const u8;
-                assert!(!fptr.is_null());
-                // Should point within the allocated code region
-                assert!(fptr >= layer.code_base());
-                let offset = fptr as usize - layer.code_base() as usize;
-                assert!(offset < layer.code_size());
-            }
-        }
-    }
-
     // @trace TEST-EXE-17 [req:REQ-JIT] [level:unit]
     #[test]
     fn test_entry_point_as_mega_kernel_returns_valid_ptr() {
@@ -1005,10 +937,7 @@ mod tests {
 
             // Act: call execute with null pointers — it should just return
             unsafe {
-                layer.execute(
-                    std::ptr::null(),
-                    std::ptr::null(),
-                    std::ptr::null_mut(),
+                layer.execute_as_mega_kernel(
                     std::ptr::null(),
                     std::ptr::null(),
                     0,
@@ -1018,34 +947,6 @@ mod tests {
                 );
             }
             // Assert: no crash = success
-        }
-    }
-
-    // @trace TEST-EXE-25 [req:REQ-JIT] [level:unit]
-    #[test]
-    fn test_execute_with_null_telemetry() {
-        #[cfg(target_arch = "x86_64")]
-        {
-            // Arrange
-            let code = [0xC3u8];
-            let layer = CompiledLayer::from_code(&code, 0, 0).unwrap();
-
-            // Act: execute_with_telemetry passing NULL telemetry
-            unsafe {
-                layer.execute_with_telemetry(
-                    std::ptr::null(),
-                    std::ptr::null(),
-                    std::ptr::null_mut(),
-                    std::ptr::null(),
-                    std::ptr::null(),
-                    0,
-                    0,
-                    std::ptr::null_mut(),
-                    std::ptr::null_mut(),
-                    std::ptr::null_mut(),
-                );
-            }
-            // Assert: no crash
         }
     }
 

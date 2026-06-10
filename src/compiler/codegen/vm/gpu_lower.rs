@@ -63,11 +63,11 @@ pub struct GpuLower {
     /// VReg → Kind 映射 (ARCH-GPU-REG-KIND)。
     /// 由 set_vreg_kind_map() 从 VmProgram 提取，使 reg_name 可按 kind 选正确命名空间。
     vreg_kinds: Vec<Option<VRegKind>>,
-    /// OutputModeDispatch path labels — key = MarkLabel label_id, value = generated label string.
+    /// MarkLabel path labels — key = MarkLabel label_id, value = generated label string.
     path_labels: std::collections::HashMap<usize, String>,
     /// Function epilogue label — BreakLoop bra 到此标签.
     epilogue_label: String,
-    /// Path label counter for OutputModeDispatch.
+    /// Path label counter for MarkLabel label generation.
     path_label_counter: u32,
     /// 硬件资源生命周期追踪 (SPEC 15 REQ-JCTX-012)
     jit_ctx: crate::compiler::jit_context::JitContext,

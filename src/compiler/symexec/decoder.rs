@@ -1,4 +1,4 @@
-//! Phase 0 decoder bridge: fn_ptr → iced-x86 Decoder → SymbolicExecutor → OpTrace.
+//! Scalar + SymExec decoder bridge: fn_ptr → iced-x86 Decoder → SymbolicExecutor → OpTrace.
 //!
 //! Takes a scalar function pointer, disassembles its machine code with iced-x86,
 //! and feeds each instruction into the symbolic execution engine to extract the
@@ -753,7 +753,7 @@ pub unsafe fn analyze_scalar_fn_structured(
     let n_inputs = count_inputs(sig);
     let executor = SymbolicExecutor::new(n_inputs, 0);
 
-    // Phase 5: Check for nested loops first (GEMM, RoPE, Transpose).
+    // Check for nested loops first (GEMM, RoPE, Transpose).
     // If the forest has loops with depth > 0, try nested analysis before
     // falling through to flat multi-pass analysis.
     if let Some(nested) = analyze_nested_loops(&forest, &cfg, &executor) {

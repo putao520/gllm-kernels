@@ -301,6 +301,67 @@ impl X86Lower {
                 Ok(())
             }
 
+            VmInstr::VecWiden { dst, src, dst_dtype, src_dtype, width } => {
+                // REQ-DTYPE-003: 向量宽化。将窄 dtype 向量宽化为宽 dtype（如 BF16→F32）。
+                // BF16→F32: vcvtph2ps (F16C AVX2) — interprets BF16 bits as F16 for conversion.
+                // This is the standard widening path used before compute in WidenCompute strategy.
+                if dst_dtype == src_dtype {
+                    // Same dtype: register-to-register copy
+                    match width {
+                        SimdWidth::W512 => {
+                            let (s, _) = self.resolve_zmm_or_spill(*src, alloc, 0)?;
+                            let (d, dst_spilled) = self.resolve_zmm_or_spill_write(*dst, alloc, 1)?;
+                            if d != s { self.asm.vmovups(d, s).map_err(Self::err)?; }
+                            if dst_spilled { self.spill_store_zmm(*dst, alloc, 1)?; }
+                        }
+                        _ => {
+                            let (s, _) = self.resolve_ymm_or_spill(*src, alloc, 0)?;
+                            let (d, dst_spilled) = self.resolve_ymm_or_spill_write(*dst, alloc, 1)?;
+                            if d != s { self.asm.vmovups(d, s).map_err(Self::err)?; }
+                            if dst_spilled { self.spill_store_ymm(*dst, alloc, 1)?; }
+                        }
+                    }
+                } else if dst_dtype.elem_bytes() > src_dtype.elem_bytes() {
+                    // Widen: narrow → wide
+                    // BF16→F32: vcvtph2ps (F16C). xmm(8×BF16) → ymm(8×F32), ymm(16×BF16) → zmm(16×F32).
+                    match width {
+                        SimdWidth::W512 => {
+                            let (s, _) = self.resolve_zmm_or_spill(*src, alloc, 0)?;
+                            let (d, dst_spilled) = self.resolve_zmm_or_spill_write(*dst, alloc, 1)?;
+                            if src_dtype.kind == crate::compiler::trace::DTypeKind::BF16 {
+                                // ymm(16×BF16) → vcvtph2ps → zmm(16×F32)
+                                let src_ymm = Self::zmm_to_ymm(s);
+                                self.asm.vcvtph2ps(d, src_ymm).map_err(Self::err)?;
+                            } else {
+                                return Err(CompilerError::CodegenViolation(
+                                    format!("VecWiden: {src_dtype:?} → {dst_dtype:?} widen instruction not yet implemented")
+                                ));
+                            }
+                            if dst_spilled { self.spill_store_zmm(*dst, alloc, 1)?; }
+                        }
+                        _ => {
+                            let (s, _) = self.resolve_ymm_or_spill(*src, alloc, 0)?;
+                            let (d, dst_spilled) = self.resolve_ymm_or_spill_write(*dst, alloc, 1)?;
+                            if src_dtype.kind == crate::compiler::trace::DTypeKind::BF16 {
+                                // xmm(8×BF16) → vcvtph2ps → ymm(8×F32)
+                                let src_xmm = Self::ymm_to_xmm(s);
+                                self.asm.vcvtph2ps(d, src_xmm).map_err(Self::err)?;
+                            } else {
+                                return Err(CompilerError::CodegenViolation(
+                                    format!("VecWiden: {src_dtype:?} → {dst_dtype:?} widen instruction not yet implemented")
+                                ));
+                            }
+                            if dst_spilled { self.spill_store_ymm(*dst, alloc, 1)?; }
+                        }
+                    }
+                } else {
+                    return Err(CompilerError::CodegenViolation(
+                        format!("VecWiden: {src_dtype:?} → {dst_dtype:?} is not a widening conversion")
+                    ));
+                }
+                Ok(())
+            }
+
             VmInstr::Mov { dst, src, .. } => {
                 if self.use_avx512 {
                     let (vs, _) = self.resolve_zmm_or_spill(*src, alloc, 0)?;
@@ -1813,28 +1874,6 @@ impl X86Lower {
                 Ok(())
             }
 
-            VmInstr::OutputModeDispatch { selector, paths } => {
-                let sel_reg = self.resolve_gpr_read(*selector, alloc, 0)?;
-                // 为每个 path 创建 forward label 并注册到 dispatch_labels
-                let mut labels = Vec::with_capacity(paths.len());
-                for &label_id in paths {
-                    let label = self.asm.create_label();
-                    self.dispatch_labels.insert(label_id, label);
-                    labels.push(label);
-                }
-                // SPEC §1.5.5: CMP+JE chain for ALL modes (0..paths.len()-1),
-                // then unconditional JMP to last path as default.
-                // CMP selector, 0 → JE generate
-                // CMP selector, 1 → JE classify_binary
-                // CMP selector, 2 → JE classify_multiway
-                // JMP encode  ← unconditional default (mode 3 and unknown)
-                for (mode_val, label) in labels.iter().enumerate() {
-                    self.asm.cmp(sel_reg, mode_val as i32).map_err(Self::err)?;
-                    self.asm.je(*label).map_err(Self::err)?;
-                }
-                Ok(())
-            }
-
             VmInstr::BreakLoop { return_value } => {
                 match return_value {
                     ReturnValue::Const(val) => {
@@ -1858,8 +1897,10 @@ impl X86Lower {
                 Ok(())
             }
 
-
             VmInstr::MarkLabel { label_id } => {
+                // MarkLabel: emit label for JumpToLabel targets.
+                // Uses dispatch_labels (populated by BranchIfGprLtU and other branch VmInstr)
+                // or falls through as a generic label.
                 match self.dispatch_labels.remove(label_id) {
                     Some(mut label) => {
                         // NOP: separate from any preceding label — iced-x86 forbids
@@ -1867,7 +1908,7 @@ impl X86Lower {
                         self.asm.nop().map_err(Self::err)?;
                         self.asm.set_label(&mut label).map_err(Self::err)?;
                     }
-                    None => {} // label 未被 OutputModeDispatch 引用 — 忽略
+                    None => {} // label not referenced by any branch — ignore
                 }
                 Ok(())
             }

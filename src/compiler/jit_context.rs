@@ -1,13 +1,13 @@
 //! JitContext — Unified hardware resource lifecycle tracker (SPEC 15)
 //!
-//! Tracks resource allocation/release during JIT Phase 3 (ISA Lowering).
+//! Tracks resource allocation/release during JIT ISA Lowering.
 //! Provides budget gating, peak queries, leak detection, and diagnostic reports.
 //!
 //! ## Lifecycle
-//! 1. `JitContext::new(isa_profile)` — created before Phase 3
+//! 1. `JitContext::new(isa_profile)` — created before ISA Lowering
 //! 2. Lowerer calls `allocate`/`release` to track resource usage
 //! 3. Any moment: `peak()`/`available()`/`snapshot()` for queries
-//! 4. Dropped after Phase 3 — zero runtime footprint
+//! 4. Dropped after ISA Lowering — zero runtime footprint
 
 use std::collections::HashMap;
 
@@ -242,10 +242,10 @@ pub enum ResourceWarning {
 // §5 JitContext — Core structure
 // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
-/// JIT compilation context — Phase 3 hardware resource lifecycle tracker.
+/// JIT compilation context — ISA Lowering hardware resource lifecycle tracker.
 ///
 /// !Sync + !Send: single-threaded, compile-time only.
-/// Zero runtime footprint: dropped after Phase 3.
+/// Zero runtime footprint: dropped after ISA Lowering.
 pub struct JitContext {
     budget: JitResourceBudget,
     resources: HashMap<ResourceKind, Vec<ResourceState>>,

@@ -41,6 +41,10 @@ pub struct LoweringContext<'a> {
     /// Layer 6: JIT debug instrumentation enabled.
     /// When true, plan_lower inserts DebugBreakpoint/DebugMarker VmInstr at key points.
     pub debug_jit: bool,
+    /// KV cache element bytes — derived from graph weight tensors (majority vote).
+    /// Must match executor's KV cache allocation stride. Differs from dtype.elem_bytes()
+    /// when the model uses quantized weights (Q8_0 → F32 compute) but BF16 KV cache.
+    pub kv_elem_bytes: usize,
 }
 
 impl<'a> LoweringContext<'a> {
@@ -96,13 +100,52 @@ pub(crate) fn resolve_sym_dim(dim: &SymDim, abi: &AbiPtrs, sym_map: &SymDimSlotM
 /// 合法的默认回退: 无 tensor 时使用 F32 (SPEC §0.8 REQ-DTYPE-001)。
 pub(super) fn graph_dtype(graph: &CompilerGraph) -> QuantPrecision {
     let result = graph.tensors.first()
-        .map(|t| {
-            eprintln!("[graph_dtype] first tensor name='{}' dtype={:?} -> {:?}", t.name, t.dtype, t.dtype.to_quant_precision());
-            t.dtype.to_quant_precision()
-        })
+        .map(|t| t.dtype.to_quant_precision())
         .unwrap_or(QuantPrecision::F32);
-    eprintln!("[graph_dtype] result={:?}", result);
     result
+}
+
+/// 从 op 的第一个输入 tensor 推断计算 dtype (REQ-DTYPE-001)。
+///
+/// dtype 传播链: TensorMeta.dtype → op_input_dtype() → ctx.dtype → emit_*(ctx) → VmInstr{dtype}
+///
+/// 推断方向严格单向：从 op.inputs[0].dtype 推导，禁止反向推断。
+/// 无输入 tensor 时安全回退到 F32 (SPEC §0.8 REQ-DTYPE-001 唯一合法的 F32 默认)。
+pub(crate) fn op_input_dtype(
+    op: &crate::compiler::graph::CompilerOp,
+    graph: &CompilerGraph,
+) -> QuantPrecision {
+    op.inputs.first()
+        .and_then(|&tid| graph.tensor(tid))
+        .map(|t| t.dtype.to_quant_precision())
+        .unwrap_or(QuantPrecision::F32)
+}
+
+/// Derive KV cache element bytes from graph weight tensors (majority vote).
+/// Must match GraphDerivedGeometry::derive_storage_dtype which the executor
+/// uses to allocate the KV cache buffer. Returns the elem_bytes (2 for BF16,
+/// 4 for F32) that the JIT should use for KV cache row stride computation.
+pub(super) fn kv_cache_elem_bytes(graph: &CompilerGraph) -> usize {
+    let mut f32_count = 0usize;
+    let mut bf16_count = 0usize;
+    let mut f16_count = 0usize;
+    for &tid in graph.inputs.iter().skip(1) {
+        if let Some(t) = graph.tensors.get(tid.0 as usize) {
+            match t.dtype {
+                crate::types::DType::F32 => f32_count += 1,
+                crate::types::DType::BF16 => bf16_count += 1,
+                crate::types::DType::F16 => f16_count += 1,
+                _ => {}
+            }
+        }
+    }
+    if bf16_count >= f32_count && bf16_count >= f16_count && bf16_count > 0 {
+        2 // BF16
+    } else if f16_count >= f32_count && f16_count >= bf16_count && f16_count > 0 {
+        2 // F16
+    } else {
+        4 // F32
+    }
 }
 
 /// 从 op 的第一个输入 tensor 获取计算 dtype 的 elem_bytes。
@@ -123,22 +166,63 @@ pub struct TensorPtrResolver {
 impl TensorPtrResolver {
     /// 从 BufferAllocation 的预计算 tensor_sources 构建。
     /// 当 R3 未预计算 tensor_sources（简单 allocate_buffers 路径）时 fallback 到自行构建。
-    pub fn build(graph: &CompilerGraph, alloc: &BufferAllocation) -> Self {
+    pub fn build(graph: &CompilerGraph, alloc: &BufferAllocation, topology: Option<&super::topology::GraphTopologyAnalysis>) -> Self {
         let map = if !alloc.tensor_sources.is_empty() {
             alloc.tensor_sources.clone()
         } else {
-            build_tensor_sources_fallback(graph, alloc)
+            build_tensor_sources_fallback(graph, alloc, topology)
         };
 
         // Diagnostic: dump key tensor mappings for debugging
         if std::env::var("GLLM_DEBUG_RESOURCE").is_ok() {
-            let key_names = ["token_ids", "embed_w", "embedding", "final_normed", "logits",
-                "lm_head_w", "final_norm_w", "argmax_token_id"];
-            for &name in &key_names {
-                if let Some(meta) = graph.tensors.iter().find(|t| t.name == name) {
-                    if let Some(src) = map.get(&meta.id) {
-                        eprintln!("[resolver] {:40} tid={:?} → {:?}", name, meta.id, src);
+            // Dump ALL tensors that map to ActivationPing/ActivationPong/Intermediate
+            let mut ping_count = 0;
+            let mut pong_count = 0;
+            let mut inter_count = 0;
+            let mut activation_count = 0;
+            for meta in &graph.tensors {
+                if let Some(src) = map.get(&meta.id) {
+                    match src {
+                        TensorPtrSource::ActivationPing => {
+                            ping_count += 1;
+                            eprintln!("[resolver] PING  {:40} tid={}", meta.name, meta.id.0);
+                        }
+                        TensorPtrSource::ActivationPong => {
+                            pong_count += 1;
+                            eprintln!("[resolver] PONG  {:40} tid={}", meta.name, meta.id.0);
+                        }
+                        TensorPtrSource::Intermediate { offset: io } => {
+                            eprintln!("[resolver] INTER {:40} tid={} offset={}", meta.name, meta.id.0, io);
+                            inter_count += 1;
+                        }
+                        TensorPtrSource::Activation => { activation_count += 1; }
+                        TensorPtrSource::Output { offset: oo } => {
+                            eprintln!("[resolver] OUTPUT {:40} tid={} offset={}", meta.name, meta.id.0, oo);
+                        }
+                        TensorPtrSource::Weight { offset: wo } => {
+                            if *wo > 0 {
+                                eprintln!("[resolver] WEIGHT {:40} tid={} offset={}", meta.name, meta.id.0, wo);
+                            }
+                        }
                     }
+                }
+            }
+            eprintln!("[resolver] SUMMARY: ping={} pong={} intermediate={} activation={}",
+                ping_count, pong_count, inter_count, activation_count);
+            // Dump activation_alias pairs
+            // SPEC/39: activation_alias 从 topology 推导，替代 graph.layer_loop_config 读取
+            if let Some(topo) = topology {
+                if let Some((in_tid, out_tid)) = &topo.layer_activation_alias {
+                    eprintln!("[resolver] HOMO activation_alias: input_tid={} output_tid={}", in_tid.0, out_tid.0);
+                }
+            }
+            // HETERO: hetero_layer_loop_config.activation_aliases 仍保留在 graph 上
+            // (hetero 拓扑尚未迁移到 GraphTopologyAnalysis)
+            if let Some(cfg) = graph.hetero_layer_loop_config.as_ref() {
+                for (i, (in_tid, out_tid)) in cfg.activation_aliases.iter().enumerate() {
+                    let in_name = graph.tensors.iter().find(|t| t.id == *in_tid).map(|t| t.name.as_str()).unwrap_or("?");
+                    let out_name = graph.tensors.iter().find(|t| t.id == *out_tid).map(|t| t.name.as_str()).unwrap_or("?");
+                    eprintln!("[resolver] HETERO activation_alias[{}]: input={} ({}) output={} ({})", i, in_tid.0, in_name, out_tid.0, out_name);
                 }
             }
             eprintln!("[resolver] graph.inputs: {} tensors, weight_layout: {} offsets",
@@ -188,6 +272,7 @@ impl TensorPtrResolver {
 fn build_tensor_sources_fallback(
     graph: &CompilerGraph,
     alloc: &BufferAllocation,
+    topology: Option<&super::topology::GraphTopologyAnalysis>,
 ) -> HashMap<TensorId, TensorPtrSource> {
     let dtype = graph_dtype(graph);
     let mut map: HashMap<TensorId, TensorPtrSource> = HashMap::new();
@@ -234,12 +319,14 @@ fn build_tensor_sources_fallback(
     // Per-layer 编译路径没有 VAM 分析 → 无 sentinel slots → 保持原始 Activation 映射。
     let has_ping_pong_slots = alloc.slots.iter().any(|s| s.tensor_id.0 == 0xFFFF_FF00);
     if has_ping_pong_slots {
-        if let Some(ref cfg) = graph.layer_loop_config {
-            if let Some((ref input_tid, ref output_tid)) = cfg.activation_alias {
+        // SPEC/39: activation_alias 从 topology 推导，替代 graph.layer_loop_config 读取
+        if let Some(topo) = topology {
+            if let Some((ref input_tid, ref output_tid)) = topo.layer_activation_alias {
                 map.insert(*input_tid, TensorPtrSource::ActivationPing);
                 map.insert(*output_tid, TensorPtrSource::ActivationPong);
             }
         }
+        // HETERO: hetero_layer_loop_config.activation_aliases 仍保留在 graph 上
         if let Some(ref cfg) = graph.hetero_layer_loop_config {
             for (input_tid, output_tid) in &cfg.activation_aliases {
                 map.insert(*input_tid, TensorPtrSource::ActivationPing);
@@ -249,13 +336,15 @@ fn build_tensor_sources_fallback(
     } else {
         // Forward-only path (compile_graph): alias output inherits activation input's source
         // so that post-loop ops (e.g. MeanPool) can read the final layer's output.
-        if let Some(ref cfg) = graph.layer_loop_config {
-            if let Some((ref input_tid, ref output_tid)) = cfg.activation_alias {
+        // SPEC/39: activation_alias 从 topology 推导，替代 graph.layer_loop_config 读取
+        if let Some(topo) = topology {
+            if let Some((ref input_tid, ref output_tid)) = topo.layer_activation_alias {
                 if let Some(src) = map.get(input_tid).copied() {
                     map.insert(*output_tid, src);
                 }
             }
         }
+        // HETERO: hetero_layer_loop_config.activation_aliases 仍保留在 graph 上
         if let Some(ref cfg) = graph.hetero_layer_loop_config {
             for (input_tid, output_tid) in &cfg.activation_aliases {
                 if let Some(src) = map.get(input_tid).copied() {
@@ -517,6 +606,7 @@ use std::collections::HashMap;
 /// 1. 固定参数 (input/weights/output/scratchpad) → VmState 查询 → PtrExpr
 /// 2. 符号维度 (seq_len/batch_size) → VmState 查询 → PtrExpr (运行时绑定)
 /// 3. SymDim → BoundExpr (Concrete→Const, Symbolic→Symbolic)
+#[derive(Clone)]
 pub struct SymDimSlotMap {
     slots: HashMap<String, PtrExpr>,
 }
@@ -551,12 +641,6 @@ impl SymDimSlotMap {
         ])
     }
 
-    /// CPU x86 SysV ABI 默认 SymDimSlotMap。
-    pub fn default_abi() -> Self {
-        let state = super::vm_state::VmState::init_x86_sysv();
-        Self::from_vm_state(&state).expect("default ABI init failed")
-    }
-
     /// GPU kernel ABI SymDimSlotMap（6 参数）。
     /// ARCH-GPU-ABI: input/weights/output/seq_len/telemetry 为 `.param` 入参;
     /// scratchpad 为片上共享内存 (ARCH-GPU-SHARED-SCRATCH),通过符号 `smem` 访问。
@@ -589,6 +673,11 @@ impl SymDimSlotMap {
 
         // scratchpad — MegaKernelFn 的 scratchpad_ptr 在 StackArg(24)
         slots.insert("scratchpad".into(), state.arg_ptr_expr("scratchpad_ptr").unwrap());
+
+        // output — MegaKernelFn 的 output_tokens_ptr (arg 8).
+        // For simple graphs compiled via compile_layer_with_sym_map, the output
+        // buffer is passed via this ABI parameter.
+        slots.insert("output".into(), state.arg_ptr_expr("output_tokens_ptr").unwrap());
 
         // telemetry — MegaKernelFn 的 telemetry_ptr 在 StackArg(96)
         slots.insert("telemetry".into(), state.arg_ptr_expr("telemetry_ptr").unwrap());
@@ -651,8 +740,10 @@ impl SymDimSlotMap {
 
 /// 为 op 的首个输出张量加载指针。
 ///
-/// 优先从 BufferAllocation 查找 scratchpad 偏移；如果 tensor 被虚拟化跳过
-/// （R2 DataFlowOptimizer 消除了中间存储），则 fallback 到 TensorPtrResolver。
+/// Resolver override 优先于 BufferAllocation scratch 偏移。
+/// Mega-kernel output redirect (Output { offset: 0 }) overrides scratch offsets
+/// so that the final output tensor writes to the caller-provided output buffer
+/// instead of scratchpad (which the caller never reads from).
 pub(super) fn load_op_scratch_ptr(
     prog: &mut VmProgram,
     scratch_base: VRegId,
@@ -663,6 +754,25 @@ pub(super) fn load_op_scratch_ptr(
 ) -> Result<VRegId, CompilerError> {
     let out_tid = op.outputs.first().copied().ok_or_else(|| CompilerError::CodegenViolation(
         format!("op {:?} 无输出张量", op.id)))?;
+    // Resolver override takes priority: if the tensor was redirected to Output,
+    // Weight, or Activation (not Intermediate), use the resolver's answer.
+    // This ensures mega-kernel output redirect works correctly — the final
+    // output tensor must write to abi.output_ptr (caller-provided buffer),
+    // not scratchpad (which the caller never reads).
+    if let Some(src) = resolver.source(out_tid) {
+        match src {
+            TensorPtrSource::Output { .. } | TensorPtrSource::Activation
+            | TensorPtrSource::ActivationPing | TensorPtrSource::ActivationPong
+            | TensorPtrSource::Weight { .. } => {
+                if let Some(ptr) = resolver.materialize(prog, out_tid, abi) {
+                    return Ok(ptr);
+                }
+            }
+            TensorPtrSource::Intermediate { .. } => {
+                // Intermediate tensors still use scratchpad offsets
+            }
+        }
+    }
     if let Some(offset) = alloc.offset_of(out_tid) {
         let ptr = prog.alloc_vreg(VRegKind::Ptr, SimdWidth::Scalar);
         prog.emit(VmInstr::LoadPtr {

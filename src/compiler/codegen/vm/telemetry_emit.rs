@@ -635,7 +635,7 @@ mod tests {
         let mut prog = VmProgram::new();
         let acc = prog.alloc_vreg(VRegKind::Vec, SimdWidth::W256);
         let empty_sym_map = {
-            let state = super::super::vm_state::VmState::init_x86_sysv();
+            let state = super::super::vm_state::VmState::init_mega_kernel_x86();
             SymDimSlotMap::from_vm_state_with_params(&state, &[]).unwrap()
         };
 
@@ -665,7 +665,7 @@ mod tests {
         let mut prog = VmProgram::new();
         let input_ptr = prog.alloc_vreg(VRegKind::Ptr, SimdWidth::Scalar);
         let empty_sym_map = {
-            let state = super::super::vm_state::VmState::init_x86_sysv();
+            let state = super::super::vm_state::VmState::init_mega_kernel_x86();
             SymDimSlotMap::from_vm_state_with_params(&state, &[]).unwrap()
         };
 
@@ -695,7 +695,7 @@ mod tests {
     fn rmsnorm_channel_scale_returns_ok_for_zero_feature_dim() {
         let mut prog = VmProgram::new();
         let input_ptr = prog.alloc_vreg(VRegKind::Ptr, SimdWidth::Scalar);
-        let sym_map = SymDimSlotMap::default_abi();
+        let sym_map = SymDimSlotMap::mega_kernel_abi();
         let initial_len = prog.len();
 
         let result = emit_rmsnorm_channel_scale_telemetry(
@@ -721,7 +721,7 @@ mod tests {
     fn rmsnorm_channel_scale_returns_ok_for_scalable_simd_width() {
         let mut prog = VmProgram::new();
         let input_ptr = prog.alloc_vreg(VRegKind::Ptr, SimdWidth::Scalar);
-        let sym_map = SymDimSlotMap::default_abi();
+        let sym_map = SymDimSlotMap::mega_kernel_abi();
         let initial_len = prog.len();
 
         let result = emit_rmsnorm_channel_scale_telemetry(
@@ -750,7 +750,7 @@ mod tests {
     fn gemm_row_stats_returns_ok_for_scalable_simd_width() {
         let mut prog = VmProgram::new();
         let acc = prog.alloc_vreg(VRegKind::Vec, SimdWidth::Scalable);
-        let sym_map = SymDimSlotMap::default_abi();
+        let sym_map = SymDimSlotMap::mega_kernel_abi();
         let initial_len = prog.len();
 
         let result = emit_gemm_row_stats_telemetry(
@@ -780,7 +780,7 @@ mod tests {
         let input_ptr = prog.alloc_vreg(VRegKind::Ptr, SimdWidth::Scalar);
         let shape = vec![SymDim::Concrete(64)];
         let empty_sym_map = {
-            let state = super::super::vm_state::VmState::init_x86_sysv();
+            let state = super::super::vm_state::VmState::init_mega_kernel_x86();
             SymDimSlotMap::from_vm_state_with_params(&state, &[]).unwrap()
         };
 
@@ -811,7 +811,7 @@ mod tests {
         let mut prog = VmProgram::new();
         let input_ptr = prog.alloc_vreg(VRegKind::Ptr, SimdWidth::Scalar);
         let shape = vec![SymDim::Concrete(64)];
-        let sym_map = SymDimSlotMap::default_abi();
+        let sym_map = SymDimSlotMap::mega_kernel_abi();
         let initial_len = prog.len();
 
         let result = emit_silu_dead_neuron_telemetry(
@@ -840,7 +840,7 @@ mod tests {
     fn rmsnorm_channel_scale_emits_instructions_with_valid_params() {
         let mut prog = VmProgram::new();
         let input_ptr = prog.alloc_vreg(VRegKind::Ptr, SimdWidth::Scalar);
-        let sym_map = SymDimSlotMap::default_abi();
+        let sym_map = SymDimSlotMap::mega_kernel_abi();
         let initial_len = prog.len();
 
         let result = emit_rmsnorm_channel_scale_telemetry(
@@ -903,7 +903,7 @@ mod tests {
     fn gemm_row_stats_emits_instructions_with_valid_sym_map() {
         let mut prog = VmProgram::new();
         let acc = prog.alloc_vreg(VRegKind::Vec, SimdWidth::W256);
-        let sym_map = SymDimSlotMap::default_abi();
+        let sym_map = SymDimSlotMap::mega_kernel_abi();
         let initial_len = prog.len();
 
         let result = emit_gemm_row_stats_telemetry(
@@ -934,7 +934,7 @@ mod tests {
             },
             SymDim::Concrete(128),
         ];
-        let sym_map = SymDimSlotMap::default_abi();
+        let sym_map = SymDimSlotMap::mega_kernel_abi();
         let initial_len = prog.len();
 
         let result = emit_silu_dead_neuron_telemetry(
@@ -962,7 +962,7 @@ mod tests {
         let weight_ptr = prog.alloc_vreg(VRegKind::Ptr, SimdWidth::Scalar);
         let output_ptr = prog.alloc_vreg(VRegKind::Ptr, SimdWidth::Scalar);
         let shape = vec![SymDim::Concrete(1), SymDim::Concrete(64)];
-        let sym_map = SymDimSlotMap::default_abi();
+        let sym_map = SymDimSlotMap::mega_kernel_abi();
 
         let result = emit_residual_with_telemetry(
             &mut prog,
@@ -997,7 +997,7 @@ mod tests {
         let output_ptr = prog.alloc_vreg(VRegKind::Ptr, SimdWidth::Scalar);
         let telemetry_ptr_vreg = prog.alloc_vreg(VRegKind::Ptr, SimdWidth::Scalar);
         let shape = vec![SymDim::Concrete(1), SymDim::Concrete(64)];
-        let sym_map = SymDimSlotMap::default_abi();
+        let sym_map = SymDimSlotMap::mega_kernel_abi();
         let len_without_telemetry;
 
         // Act: first run without telemetry to get baseline instruction count
@@ -1058,7 +1058,7 @@ mod tests {
         let output_ptr = prog.alloc_vreg(VRegKind::Ptr, SimdWidth::Scalar);
         let telemetry_ptr_vreg = prog.alloc_vreg(VRegKind::Ptr, SimdWidth::Scalar);
         let shape = vec![SymDim::Concrete(1), SymDim::Concrete(65)];
-        let sym_map = SymDimSlotMap::default_abi();
+        let sym_map = SymDimSlotMap::mega_kernel_abi();
 
         // Act
         let result = emit_residual_with_telemetry(
@@ -1094,7 +1094,7 @@ mod tests {
             SymDim::Symbolic { name: "seq_len".into(), max_value: Some(2048) },
             SymDim::Concrete(64),
         ];
-        let sym_map = SymDimSlotMap::default_abi();
+        let sym_map = SymDimSlotMap::mega_kernel_abi();
         let override_bound = BoundExpr::Const(1);
 
         // Act
@@ -1130,7 +1130,7 @@ mod tests {
         let output_ptr = prog.alloc_vreg(VRegKind::Ptr, SimdWidth::Scalar);
         let telemetry_ptr_vreg = prog.alloc_vreg(VRegKind::Ptr, SimdWidth::Scalar);
         let shape = vec![SymDim::Concrete(4), SymDim::Concrete(64)];
-        let sym_map = SymDimSlotMap::default_abi();
+        let sym_map = SymDimSlotMap::mega_kernel_abi();
 
         // Act
         let result = emit_residual_with_telemetry(
@@ -1169,7 +1169,7 @@ mod tests {
         let output_ptr = prog.alloc_vreg(VRegKind::Ptr, SimdWidth::Scalar);
         let telemetry_ptr_vreg = prog.alloc_vreg(VRegKind::Ptr, SimdWidth::Scalar);
         let shape = vec![SymDim::Concrete(64)];
-        let sym_map = SymDimSlotMap::default_abi();
+        let sym_map = SymDimSlotMap::mega_kernel_abi();
 
         // Act
         let result = emit_residual_with_telemetry(
@@ -1199,7 +1199,7 @@ mod tests {
         // Arrange: feature_dim=4, W256 lanes=8 → vec_count = 4/8 = 0
         let mut prog = VmProgram::new();
         let input_ptr = prog.alloc_vreg(VRegKind::Ptr, SimdWidth::Scalar);
-        let sym_map = SymDimSlotMap::default_abi();
+        let sym_map = SymDimSlotMap::mega_kernel_abi();
         let initial_len = prog.len();
 
         // Act
@@ -1229,7 +1229,7 @@ mod tests {
         // Arrange: W512 has 16 f32 lanes, feature_dim=256 → vec_count = 256/16 = 16
         let mut prog = VmProgram::new();
         let input_ptr = prog.alloc_vreg(VRegKind::Ptr, SimdWidth::Scalar);
-        let sym_map = SymDimSlotMap::default_abi();
+        let sym_map = SymDimSlotMap::mega_kernel_abi();
         let initial_len = prog.len();
 
         // Act
@@ -1258,7 +1258,7 @@ mod tests {
         // Arrange
         let mut prog = VmProgram::new();
         let acc = prog.alloc_vreg(VRegKind::Vec, SimdWidth::W512);
-        let sym_map = SymDimSlotMap::default_abi();
+        let sym_map = SymDimSlotMap::mega_kernel_abi();
         let initial_len = prog.len();
 
         // Act
@@ -1287,7 +1287,7 @@ mod tests {
         let mut prog = VmProgram::new();
         let input_ptr = prog.alloc_vreg(VRegKind::Ptr, SimdWidth::Scalar);
         let shape = vec![SymDim::Concrete(128)];
-        let sym_map = SymDimSlotMap::default_abi();
+        let sym_map = SymDimSlotMap::mega_kernel_abi();
         let initial_len = prog.len();
 
         // Act
@@ -1317,7 +1317,7 @@ mod tests {
         let mut prog = VmProgram::new();
         let input_ptr = prog.alloc_vreg(VRegKind::Ptr, SimdWidth::Scalar);
         let shape = vec![SymDim::Concrete(2), SymDim::Concrete(128)];
-        let sym_map = SymDimSlotMap::default_abi();
+        let sym_map = SymDimSlotMap::mega_kernel_abi();
         let initial_len = prog.len();
 
         // Act
@@ -1348,7 +1348,7 @@ mod tests {
         let mut prog = VmProgram::new();
         let input_ptr = prog.alloc_vreg(VRegKind::Ptr, SimdWidth::Scalar);
         let shape = vec![SymDim::Concrete(4)];
-        let sym_map = SymDimSlotMap::default_abi();
+        let sym_map = SymDimSlotMap::mega_kernel_abi();
 
         // Act
         let result = emit_silu_dead_neuron_telemetry(
@@ -1406,7 +1406,7 @@ mod tests {
         let op_a = prog_aligned.alloc_vreg(VRegKind::Ptr, SimdWidth::Scalar);
         let tp_a = prog_aligned.alloc_vreg(VRegKind::Ptr, SimdWidth::Scalar);
         let shape = vec![SymDim::Concrete(1), SymDim::Concrete(128)];
-        let sym_map = SymDimSlotMap::default_abi();
+        let sym_map = SymDimSlotMap::mega_kernel_abi();
 
         // Act: aligned (128 / 8 = 16 vecs, tail=0)
         let result_aligned = emit_residual_with_telemetry(
@@ -1464,7 +1464,7 @@ mod tests {
         // Arrange: W128 has 4 f32 lanes
         let mut prog = VmProgram::new();
         let acc = prog.alloc_vreg(VRegKind::Vec, SimdWidth::W128);
-        let sym_map = SymDimSlotMap::default_abi();
+        let sym_map = SymDimSlotMap::mega_kernel_abi();
         let initial_len = prog.len();
 
         // Act
@@ -1492,7 +1492,7 @@ mod tests {
         // Arrange: Warp(32) simulates NVIDIA GPU warp width (32 f32 lanes)
         let mut prog = VmProgram::new();
         let input_ptr = prog.alloc_vreg(VRegKind::Ptr, SimdWidth::Scalar);
-        let sym_map = SymDimSlotMap::default_abi();
+        let sym_map = SymDimSlotMap::mega_kernel_abi();
         let initial_len = prog.len();
 
         // Act
@@ -1525,7 +1525,7 @@ mod tests {
         let output_ptr = prog.alloc_vreg(VRegKind::Ptr, SimdWidth::Scalar);
         let telemetry_ptr_vreg = prog.alloc_vreg(VRegKind::Ptr, SimdWidth::Scalar);
         let shape = vec![SymDim::Concrete(1), SymDim::Concrete(0)];
-        let sym_map = SymDimSlotMap::default_abi();
+        let sym_map = SymDimSlotMap::mega_kernel_abi();
 
         // Act
         let result = emit_residual_with_telemetry(
@@ -1559,7 +1559,7 @@ mod tests {
         let mut prog = VmProgram::new();
         let input_ptr = prog.alloc_vreg(VRegKind::Ptr, SimdWidth::Scalar);
         let shape = vec![SymDim::Concrete(128)];
-        let sym_map = SymDimSlotMap::default_abi();
+        let sym_map = SymDimSlotMap::mega_kernel_abi();
         let initial_len = prog.len();
 
         // Act: 128 / 64 = 2 feature_vecs
@@ -1592,7 +1592,7 @@ mod tests {
         let output_ptr = prog.alloc_vreg(VRegKind::Ptr, SimdWidth::Scalar);
         let telemetry_ptr_vreg = prog.alloc_vreg(VRegKind::Ptr, SimdWidth::Scalar);
         let shape = vec![SymDim::Concrete(1), SymDim::Concrete(8)];
-        let sym_map = SymDimSlotMap::default_abi();
+        let sym_map = SymDimSlotMap::mega_kernel_abi();
 
         // Act
         let result = emit_residual_with_telemetry(
@@ -1622,7 +1622,7 @@ mod tests {
         // Arrange
         let mut prog = VmProgram::new();
         let acc = prog.alloc_vreg(VRegKind::Vec, SimdWidth::W256);
-        let sym_map = SymDimSlotMap::default_abi();
+        let sym_map = SymDimSlotMap::mega_kernel_abi();
 
         // Act
         emit_gemm_row_stats_telemetry(
@@ -1649,7 +1649,7 @@ mod tests {
         // Arrange: Warp(0) → f32_lanes() = 0, early exit path
         let mut prog = VmProgram::new();
         let acc = prog.alloc_vreg(VRegKind::Vec, SimdWidth::Warp(0));
-        let sym_map = SymDimSlotMap::default_abi();
+        let sym_map = SymDimSlotMap::mega_kernel_abi();
         let initial_len = prog.len();
 
         // Act
@@ -1678,7 +1678,7 @@ mod tests {
         // Arrange: W256 has 8 lanes, feature_dim=8 → vec_count = 8/8 = 1 (exactly one iteration)
         let mut prog = VmProgram::new();
         let input_ptr = prog.alloc_vreg(VRegKind::Ptr, SimdWidth::Scalar);
-        let sym_map = SymDimSlotMap::default_abi();
+        let sym_map = SymDimSlotMap::mega_kernel_abi();
         let initial_len = prog.len();
 
         // Act
@@ -1712,7 +1712,7 @@ mod tests {
         let output_ptr = prog.alloc_vreg(VRegKind::Ptr, SimdWidth::Scalar);
         let telemetry_ptr_vreg = prog.alloc_vreg(VRegKind::Ptr, SimdWidth::Scalar);
         let shape = vec![SymDim::Concrete(1), SymDim::Concrete(64)];
-        let sym_map = SymDimSlotMap::default_abi();
+        let sym_map = SymDimSlotMap::mega_kernel_abi();
 
         // Act: use BF16 precision (2-byte elements)
         let result = emit_residual_with_telemetry(
@@ -1749,7 +1749,7 @@ mod tests {
         // non-F32 QuantPrecision to VecStore instructions without error.
         let mut prog = VmProgram::new();
         let acc = prog.alloc_vreg(VRegKind::Vec, SimdWidth::W256);
-        let sym_map = SymDimSlotMap::default_abi();
+        let sym_map = SymDimSlotMap::mega_kernel_abi();
         let initial_len = prog.len();
 
         // Act
@@ -1778,7 +1778,7 @@ mod tests {
         // QuantPrecision through Broadcast, VecLoad, VecStore instructions.
         let mut prog = VmProgram::new();
         let input_ptr = prog.alloc_vreg(VRegKind::Ptr, SimdWidth::Scalar);
-        let sym_map = SymDimSlotMap::default_abi();
+        let sym_map = SymDimSlotMap::mega_kernel_abi();
         let initial_len = prog.len();
 
         // Act
@@ -1809,7 +1809,7 @@ mod tests {
         let mut prog = VmProgram::new();
         let input_ptr = prog.alloc_vreg(VRegKind::Ptr, SimdWidth::Scalar);
         let shape = vec![SymDim::Concrete(128)];
-        let sym_map = SymDimSlotMap::default_abi();
+        let sym_map = SymDimSlotMap::mega_kernel_abi();
         let initial_len = prog.len();
 
         // Act
@@ -1838,7 +1838,7 @@ mod tests {
         // Arrange
         let mut prog = VmProgram::new();
         let input_ptr = prog.alloc_vreg(VRegKind::Ptr, SimdWidth::Scalar);
-        let sym_map = SymDimSlotMap::default_abi();
+        let sym_map = SymDimSlotMap::mega_kernel_abi();
 
         // Act
         emit_rmsnorm_channel_scale_telemetry(
@@ -1871,7 +1871,7 @@ mod tests {
         let mut prog = VmProgram::new();
         let input_ptr = prog.alloc_vreg(VRegKind::Ptr, SimdWidth::Scalar);
         let shape = vec![SymDim::Concrete(128)];
-        let sym_map = SymDimSlotMap::default_abi();
+        let sym_map = SymDimSlotMap::mega_kernel_abi();
 
         // Act
         emit_silu_dead_neuron_telemetry(
@@ -1906,7 +1906,7 @@ mod tests {
         let weight_ptr = prog.alloc_vreg(VRegKind::Ptr, SimdWidth::Scalar);
         let output_ptr = prog.alloc_vreg(VRegKind::Ptr, SimdWidth::Scalar);
         let shape = vec![SymDim::Concrete(1), SymDim::Concrete(64)];
-        let sym_map = SymDimSlotMap::default_abi();
+        let sym_map = SymDimSlotMap::mega_kernel_abi();
 
         // Act
         emit_residual_with_telemetry(
@@ -1941,7 +1941,7 @@ mod tests {
         // Arrange
         let mut prog = VmProgram::new();
         let acc = prog.alloc_vreg(VRegKind::Vec, SimdWidth::W256);
-        let sym_map = SymDimSlotMap::default_abi();
+        let sym_map = SymDimSlotMap::mega_kernel_abi();
 
         // Act
         emit_gemm_row_stats_telemetry(
@@ -1993,7 +1993,7 @@ mod tests {
         let output_ptr = prog.alloc_vreg(VRegKind::Ptr, SimdWidth::Scalar);
         let telemetry_ptr_vreg = prog.alloc_vreg(VRegKind::Ptr, SimdWidth::Scalar);
         let shape = vec![SymDim::Concrete(1), SymDim::Concrete(64)];
-        let sym_map = SymDimSlotMap::default_abi();
+        let sym_map = SymDimSlotMap::mega_kernel_abi();
 
         // Act
         let result = emit_residual_with_telemetry(
@@ -2024,7 +2024,7 @@ mod tests {
         let mut prog = VmProgram::new();
         let input_ptr = prog.alloc_vreg(VRegKind::Ptr, SimdWidth::Scalar);
         let shape = vec![SymDim::Concrete(128)];
-        let sym_map = SymDimSlotMap::default_abi();
+        let sym_map = SymDimSlotMap::mega_kernel_abi();
 
         // Act
         emit_silu_dead_neuron_telemetry(
@@ -2069,7 +2069,7 @@ mod tests {
         let output_ptr = prog.alloc_vreg(VRegKind::Ptr, SimdWidth::Scalar);
         let telemetry_ptr_vreg = prog.alloc_vreg(VRegKind::Ptr, SimdWidth::Scalar);
         let shape = vec![SymDim::Concrete(1), SymDim::Concrete(64)];
-        let sym_map = SymDimSlotMap::default_abi();
+        let sym_map = SymDimSlotMap::mega_kernel_abi();
 
         // Act
         emit_residual_with_telemetry(
@@ -2118,7 +2118,7 @@ mod tests {
         // FP16 QuantPrecision to VecStore instructions without error.
         let mut prog = VmProgram::new();
         let acc = prog.alloc_vreg(VRegKind::Vec, SimdWidth::W256);
-        let sym_map = SymDimSlotMap::default_abi();
+        let sym_map = SymDimSlotMap::mega_kernel_abi();
         let initial_len = prog.len();
 
         // Act
@@ -2147,7 +2147,7 @@ mod tests {
         // QuantPrecision through Broadcast, VecLoad, VecStore instructions.
         let mut prog = VmProgram::new();
         let input_ptr = prog.alloc_vreg(VRegKind::Ptr, SimdWidth::Scalar);
-        let sym_map = SymDimSlotMap::default_abi();
+        let sym_map = SymDimSlotMap::mega_kernel_abi();
         let initial_len = prog.len();
 
         // Act
@@ -2178,7 +2178,7 @@ mod tests {
         let mut prog = VmProgram::new();
         let input_ptr = prog.alloc_vreg(VRegKind::Ptr, SimdWidth::Scalar);
         let shape = vec![SymDim::Concrete(128)];
-        let sym_map = SymDimSlotMap::default_abi();
+        let sym_map = SymDimSlotMap::mega_kernel_abi();
         let initial_len = prog.len();
 
         // Act
@@ -2211,7 +2211,7 @@ mod tests {
         let output_ptr = prog.alloc_vreg(VRegKind::Ptr, SimdWidth::Scalar);
         let telemetry_ptr_vreg = prog.alloc_vreg(VRegKind::Ptr, SimdWidth::Scalar);
         let shape = vec![SymDim::Concrete(1), SymDim::Concrete(64)];
-        let sym_map = SymDimSlotMap::default_abi();
+        let sym_map = SymDimSlotMap::mega_kernel_abi();
 
         // Act: W128 lanes=4, feature_vecs=64/4=16, tail=0
         let result = emit_residual_with_telemetry(
@@ -2260,7 +2260,7 @@ mod tests {
         // Arrange: Warp(0) → f32_lanes() = 0, early exit path for rmsnorm
         let mut prog = VmProgram::new();
         let input_ptr = prog.alloc_vreg(VRegKind::Ptr, SimdWidth::Scalar);
-        let sym_map = SymDimSlotMap::default_abi();
+        let sym_map = SymDimSlotMap::mega_kernel_abi();
         let initial_len = prog.len();
 
         // Act
@@ -2291,7 +2291,7 @@ mod tests {
         let mut prog = VmProgram::new();
         let input_ptr = prog.alloc_vreg(VRegKind::Ptr, SimdWidth::Scalar);
         let shape = vec![SymDim::Concrete(128)];
-        let sym_map = SymDimSlotMap::default_abi();
+        let sym_map = SymDimSlotMap::mega_kernel_abi();
         let initial_len = prog.len();
 
         // Act
@@ -2320,7 +2320,7 @@ mod tests {
         // Arrange
         let mut prog = VmProgram::new();
         let acc = prog.alloc_vreg(VRegKind::Vec, SimdWidth::W256);
-        let sym_map = SymDimSlotMap::default_abi();
+        let sym_map = SymDimSlotMap::mega_kernel_abi();
 
         // Act
         emit_gemm_row_stats_telemetry(
@@ -2355,7 +2355,7 @@ mod tests {
         let output_ptr = prog.alloc_vreg(VRegKind::Ptr, SimdWidth::Scalar);
         let telemetry_ptr_vreg = prog.alloc_vreg(VRegKind::Ptr, SimdWidth::Scalar);
         let shape = vec![SymDim::Concrete(1), SymDim::Concrete(3)];
-        let sym_map = SymDimSlotMap::default_abi();
+        let sym_map = SymDimSlotMap::mega_kernel_abi();
 
         // Act
         let result = emit_residual_with_telemetry(
@@ -2403,7 +2403,7 @@ mod tests {
         let mut prog = VmProgram::new();
         let input_ptr = prog.alloc_vreg(VRegKind::Ptr, SimdWidth::Scalar);
         let shape = vec![SymDim::Concrete(256)];
-        let sym_map = SymDimSlotMap::default_abi();
+        let sym_map = SymDimSlotMap::mega_kernel_abi();
         let initial_len = prog.len();
 
         // Act: 256 / 32 = 8 feature_vecs
@@ -2435,7 +2435,7 @@ mod tests {
         let weight_ptr = prog.alloc_vreg(VRegKind::Ptr, SimdWidth::Scalar);
         let output_ptr = prog.alloc_vreg(VRegKind::Ptr, SimdWidth::Scalar);
         let shape = vec![SymDim::Concrete(8), SymDim::Concrete(64)];
-        let sym_map = SymDimSlotMap::default_abi();
+        let sym_map = SymDimSlotMap::mega_kernel_abi();
 
         // Act
         let result = emit_residual_with_telemetry(
@@ -2491,7 +2491,7 @@ mod tests {
             SymDim::Symbolic { name: "seq_len".into(), max_value: Some(2048) },
             SymDim::Concrete(64),
         ];
-        let sym_map = SymDimSlotMap::default_abi();
+        let sym_map = SymDimSlotMap::mega_kernel_abi();
 
         // Act
         let result = emit_residual_with_telemetry(
@@ -2537,7 +2537,7 @@ mod tests {
         // Arrange
         let mut prog = VmProgram::new();
         let input_ptr = prog.alloc_vreg(VRegKind::Ptr, SimdWidth::Scalar);
-        let sym_map = SymDimSlotMap::default_abi();
+        let sym_map = SymDimSlotMap::mega_kernel_abi();
 
         // Act
         emit_rmsnorm_channel_scale_telemetry(
@@ -2572,7 +2572,7 @@ mod tests {
         let mut prog = VmProgram::new();
         let input_ptr = prog.alloc_vreg(VRegKind::Ptr, SimdWidth::Scalar);
         let shape = vec![SymDim::Concrete(128)];
-        let sym_map = SymDimSlotMap::default_abi();
+        let sym_map = SymDimSlotMap::mega_kernel_abi();
 
         // Act
         emit_silu_dead_neuron_telemetry(
@@ -2607,7 +2607,7 @@ mod tests {
             SymDim::Symbolic { name: "seq_len".into(), max_value: Some(2048) },
             SymDim::Concrete(64),
         ];
-        let sym_map = SymDimSlotMap::default_abi();
+        let sym_map = SymDimSlotMap::mega_kernel_abi();
         let override_bound = BoundExpr::Const(2);
 
         // Act
@@ -2657,7 +2657,7 @@ mod tests {
         // produces a broadcast result and the store writes a single scalar value.
         let mut prog = VmProgram::new();
         let acc = prog.alloc_vreg(VRegKind::Vec, SimdWidth::W256);
-        let sym_map = SymDimSlotMap::default_abi();
+        let sym_map = SymDimSlotMap::mega_kernel_abi();
 
         // Act
         emit_gemm_row_stats_telemetry(
@@ -2703,7 +2703,7 @@ mod tests {
         // Arrange: W128 has 4 f32 lanes, feature_dim=64 → vec_count = 64/4 = 16
         let mut prog = VmProgram::new();
         let input_ptr = prog.alloc_vreg(VRegKind::Ptr, SimdWidth::Scalar);
-        let sym_map = SymDimSlotMap::default_abi();
+        let sym_map = SymDimSlotMap::mega_kernel_abi();
         let initial_len = prog.len();
 
         // Act
@@ -2735,7 +2735,7 @@ mod tests {
         let weight_ptr = prog.alloc_vreg(VRegKind::Ptr, SimdWidth::Scalar);
         let output_ptr = prog.alloc_vreg(VRegKind::Ptr, SimdWidth::Scalar);
         let shape = vec![SymDim::Concrete(1), SymDim::Concrete(4)];
-        let sym_map = SymDimSlotMap::default_abi();
+        let sym_map = SymDimSlotMap::mega_kernel_abi();
 
         // Act
         let result = emit_residual_with_telemetry(
@@ -2785,7 +2785,7 @@ mod tests {
             SymDim::Symbolic { name: "seq_len".into(), max_value: Some(512) },
             SymDim::Concrete(64),
         ];
-        let sym_map = SymDimSlotMap::default_abi();
+        let sym_map = SymDimSlotMap::mega_kernel_abi();
         let initial_len = prog.len();
 
         // Act
@@ -2818,7 +2818,7 @@ mod tests {
         let output_ptr = prog.alloc_vreg(VRegKind::Ptr, SimdWidth::Scalar);
         let telemetry_ptr_vreg = prog.alloc_vreg(VRegKind::Ptr, SimdWidth::Scalar);
         let shape = vec![SymDim::Concrete(16), SymDim::Concrete(64)];
-        let sym_map = SymDimSlotMap::default_abi();
+        let sym_map = SymDimSlotMap::mega_kernel_abi();
 
         // Act
         let result = emit_residual_with_telemetry(
@@ -2867,7 +2867,7 @@ mod tests {
         // Arrange
         let mut prog = VmProgram::new();
         let input_ptr = prog.alloc_vreg(VRegKind::Ptr, SimdWidth::Scalar);
-        let sym_map = SymDimSlotMap::default_abi();
+        let sym_map = SymDimSlotMap::mega_kernel_abi();
 
         // Act
         emit_rmsnorm_channel_scale_telemetry(
@@ -2903,7 +2903,7 @@ mod tests {
             SymDim::Concrete(2),
             SymDim::Concrete(64),
         ];
-        let sym_map = SymDimSlotMap::default_abi();
+        let sym_map = SymDimSlotMap::mega_kernel_abi();
         let initial_len = prog.len();
 
         // Act
@@ -2920,11 +2920,11 @@ mod tests {
     // @trace TEST-12kaw [req:REQ-OBS] [level:unit]
 
     #[test]
-    fn gemm_row_stats_produces_instructions_with_default_abi() {
+    fn gemm_row_stats_produces_instructions_with_mega_kernel_abi() {
         // Arrange
         let mut prog = VmProgram::new();
         let acc = prog.alloc_vreg(VRegKind::Vec, SimdWidth::W256);
-        let sym_map = SymDimSlotMap::default_abi();
+        let sym_map = SymDimSlotMap::mega_kernel_abi();
 
         // Act
         let result = emit_gemm_row_stats_telemetry(
@@ -2944,7 +2944,7 @@ mod tests {
         // Arrange
         let mut prog = VmProgram::new();
         let input_ptr = prog.alloc_vreg(VRegKind::Ptr, SimdWidth::Scalar);
-        let sym_map = SymDimSlotMap::default_abi();
+        let sym_map = SymDimSlotMap::mega_kernel_abi();
 
         // Act
         emit_rmsnorm_channel_scale_telemetry(
@@ -2970,7 +2970,7 @@ mod tests {
         let mut prog = VmProgram::new();
         let input_ptr = prog.alloc_vreg(VRegKind::Ptr, SimdWidth::Scalar);
         let shape = vec![SymDim::Concrete(8)];
-        let sym_map = SymDimSlotMap::default_abi();
+        let sym_map = SymDimSlotMap::mega_kernel_abi();
         let initial_len = prog.len();
 
         // Act
@@ -2990,7 +2990,7 @@ mod tests {
     fn residual_with_telemetry_produces_deterministic_instruction_count() {
         // Arrange: run the same emit twice and compare instruction counts
         let shape = vec![SymDim::Concrete(2), SymDim::Concrete(64)];
-        let sym_map = SymDimSlotMap::default_abi();
+        let sym_map = SymDimSlotMap::mega_kernel_abi();
         let run_emit = || -> usize {
             let mut prog = VmProgram::new();
             let ip = prog.alloc_vreg(VRegKind::Ptr, SimdWidth::Scalar);
@@ -3022,7 +3022,7 @@ mod tests {
         let output_ptr = prog.alloc_vreg(VRegKind::Ptr, SimdWidth::Scalar);
         let telemetry_ptr_vreg = prog.alloc_vreg(VRegKind::Ptr, SimdWidth::Scalar);
         let shape = vec![SymDim::Concrete(1), SymDim::Concrete(64)];
-        let sym_map = SymDimSlotMap::default_abi();
+        let sym_map = SymDimSlotMap::mega_kernel_abi();
 
         // Act
         let result = emit_residual_with_telemetry(
@@ -3049,7 +3049,7 @@ mod tests {
         // Arrange: Warp(16) simulates a subset SIMD width, feature_dim=128 → vec_count=128/16=8
         let mut prog = VmProgram::new();
         let input_ptr = prog.alloc_vreg(VRegKind::Ptr, SimdWidth::Scalar);
-        let sym_map = SymDimSlotMap::default_abi();
+        let sym_map = SymDimSlotMap::mega_kernel_abi();
         let initial_len = prog.len();
 
         // Act
@@ -3072,7 +3072,7 @@ mod tests {
         let mut prog = VmProgram::new();
         let input_ptr = prog.alloc_vreg(VRegKind::Ptr, SimdWidth::Scalar);
         let shape = vec![SymDim::Concrete(2), SymDim::Concrete(4), SymDim::Concrete(32)];
-        let sym_map = SymDimSlotMap::default_abi();
+        let sym_map = SymDimSlotMap::mega_kernel_abi();
         let initial_len = prog.len();
 
         // Act
@@ -3097,7 +3097,7 @@ mod tests {
         let output_ptr = prog.alloc_vreg(VRegKind::Ptr, SimdWidth::Scalar);
         let telemetry_ptr_vreg = prog.alloc_vreg(VRegKind::Ptr, SimdWidth::Scalar);
         let shape = vec![SymDim::Concrete(1), SymDim::Concrete(71)];
-        let sym_map = SymDimSlotMap::default_abi();
+        let sym_map = SymDimSlotMap::mega_kernel_abi();
 
         // Act
         let result = emit_residual_with_telemetry(
@@ -3127,7 +3127,7 @@ mod tests {
         // Arrange
         let mut prog = VmProgram::new();
         let acc = prog.alloc_vreg(VRegKind::Vec, SimdWidth::W256);
-        let sym_map = SymDimSlotMap::default_abi();
+        let sym_map = SymDimSlotMap::mega_kernel_abi();
 
         // Act
         emit_gemm_row_stats_telemetry(
@@ -3194,7 +3194,7 @@ mod tests {
         // Arrange
         let mut prog = VmProgram::new();
         let acc = prog.alloc_vreg(VRegKind::Vec, SimdWidth::W256);
-        let sym_map = SymDimSlotMap::default_abi();
+        let sym_map = SymDimSlotMap::mega_kernel_abi();
 
         // Act
         emit_gemm_row_stats_telemetry(
@@ -3231,7 +3231,7 @@ mod tests {
         // Arrange: feature_dim=1, Scalar width (1 lane) → vec_count=1/1=1
         let mut prog = VmProgram::new();
         let input_ptr = prog.alloc_vreg(VRegKind::Ptr, SimdWidth::Scalar);
-        let sym_map = SymDimSlotMap::default_abi();
+        let sym_map = SymDimSlotMap::mega_kernel_abi();
         let initial_len = prog.len();
 
         // Act
@@ -3256,7 +3256,7 @@ mod tests {
         let mut prog = VmProgram::new();
         let input_ptr = prog.alloc_vreg(VRegKind::Ptr, SimdWidth::Scalar);
         let shape = vec![SymDim::Concrete(1)];
-        let sym_map = SymDimSlotMap::default_abi();
+        let sym_map = SymDimSlotMap::mega_kernel_abi();
         let initial_len = prog.len();
 
         // Act
@@ -3284,7 +3284,7 @@ mod tests {
         let output_ptr = prog.alloc_vreg(VRegKind::Ptr, SimdWidth::Scalar);
         let tp = prog.alloc_vreg(VRegKind::Ptr, SimdWidth::Scalar);
         let shape = vec![SymDim::Concrete(1), SymDim::Concrete(1)];
-        let sym_map = SymDimSlotMap::default_abi();
+        let sym_map = SymDimSlotMap::mega_kernel_abi();
 
         // Act
         let result = emit_residual_with_telemetry(
@@ -3360,7 +3360,7 @@ mod tests {
     fn gemm_row_stats_different_simd_widths_produce_different_counts() {
         // Arrange: W256 (8 lanes) vs W512 (16 lanes) should produce different instruction counts
         // because the HReduce and auto_lower_trace emit width-dependent instructions.
-        let sym_map = SymDimSlotMap::default_abi();
+        let sym_map = SymDimSlotMap::mega_kernel_abi();
 
         // Act: emit with W256
         let mut prog_w256 = VmProgram::new();
@@ -3393,7 +3393,7 @@ mod tests {
         let weight_ptr = prog.alloc_vreg(VRegKind::Ptr, SimdWidth::Scalar);
         let output_ptr = prog.alloc_vreg(VRegKind::Ptr, SimdWidth::Scalar);
         let shape = vec![SymDim::Concrete(1), SymDim::Concrete(64)];
-        let sym_map = SymDimSlotMap::default_abi();
+        let sym_map = SymDimSlotMap::mega_kernel_abi();
 
         // Act
         emit_residual_with_telemetry(
@@ -3425,7 +3425,7 @@ mod tests {
         let output_ptr = prog.alloc_vreg(VRegKind::Ptr, SimdWidth::Scalar);
         let telemetry_ptr_vreg = prog.alloc_vreg(VRegKind::Ptr, SimdWidth::Scalar);
         let shape = vec![SymDim::Concrete(1), SymDim::Concrete(64)];
-        let sym_map = SymDimSlotMap::default_abi();
+        let sym_map = SymDimSlotMap::mega_kernel_abi();
 
         // Act
         emit_residual_with_telemetry(
@@ -3454,7 +3454,7 @@ mod tests {
         let mut prog = VmProgram::new();
         let input_ptr = prog.alloc_vreg(VRegKind::Ptr, SimdWidth::Scalar);
         let shape = vec![SymDim::Concrete(128)];
-        let sym_map = SymDimSlotMap::default_abi();
+        let sym_map = SymDimSlotMap::mega_kernel_abi();
 
         // Act
         emit_silu_dead_neuron_telemetry(
@@ -3523,7 +3523,7 @@ mod tests {
     #[test]
     fn rmsnorm_channel_scale_w512_produces_fewer_total_instructions_than_w256() {
         // Arrange: same feature_dim=256, W256 lanes=8 (32 vecs) vs W512 lanes=16 (16 vecs)
-        let sym_map = SymDimSlotMap::default_abi();
+        let sym_map = SymDimSlotMap::mega_kernel_abi();
 
         // Act: W256
         let mut prog_w256 = VmProgram::new();
@@ -3577,7 +3577,7 @@ mod tests {
         let output_ptr = prog.alloc_vreg(VRegKind::Ptr, SimdWidth::Scalar);
         let telemetry_ptr_vreg = prog.alloc_vreg(VRegKind::Ptr, SimdWidth::Scalar);
         let shape = vec![SymDim::Concrete(1), SymDim::Concrete(64)];
-        let sym_map = SymDimSlotMap::default_abi();
+        let sym_map = SymDimSlotMap::mega_kernel_abi();
 
         // Act
         emit_residual_with_telemetry(
@@ -3619,7 +3619,7 @@ mod tests {
     fn residual_with_telemetry_no_telemetry_deterministic_count() {
         // Arrange: run the same emit without telemetry three times
         let shape = vec![SymDim::Concrete(4), SymDim::Concrete(64)];
-        let sym_map = SymDimSlotMap::default_abi();
+        let sym_map = SymDimSlotMap::mega_kernel_abi();
         let run_emit = || -> usize {
             let mut prog = VmProgram::new();
             let ip = prog.alloc_vreg(VRegKind::Ptr, SimdWidth::Scalar);
@@ -3648,7 +3648,7 @@ mod tests {
         // Arrange
         let mut prog = VmProgram::new();
         let acc = prog.alloc_vreg(VRegKind::Vec, SimdWidth::W256);
-        let sym_map = SymDimSlotMap::default_abi();
+        let sym_map = SymDimSlotMap::mega_kernel_abi();
 
         // Act
         emit_gemm_row_stats_telemetry(

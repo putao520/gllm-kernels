@@ -25,7 +25,7 @@ pub struct GraphDerivedGeometry {
     /// Used for scratchpad/buffer sizing, NOT for per-tensor weight layout.
     pub compute_dtype: DType,
     /// Storage dtype — most common weight tensor dtype (BF16/F16/F32).
-    /// Used by `MegaKernelWeightLayout` for simplified weight offset calculation.
+    /// Used by `WeightLayout` for simplified weight offset calculation.
     pub storage_dtype: DType,
     pub rms_eps: f32,
     pub rope_theta: f64,
@@ -34,6 +34,26 @@ pub struct GraphDerivedGeometry {
 }
 
 impl GraphDerivedGeometry {
+    /// Default geometry for simple graphs (no layer loop) that cannot derive
+    /// full model geometry (e.g. a standalone Gather or Norm sub-graph).
+    pub fn default_for_simple() -> Self {
+        Self {
+            hidden: 0,
+            num_layers: 1,
+            num_heads: 1,
+            num_kv_heads: 1,
+            head_dim: 0,
+            intermediate: 0,
+            vocab_size: 0,
+            compute_dtype: DType::F32,
+            storage_dtype: DType::F32,
+            rms_eps: 1e-5,
+            rope_theta: 10000.0,
+            rope_partial: 1.0,
+            rope_scaling: None,
+        }
+    }
+
     /// Extract geometry from a CompilerGraph by scanning ops and tensor shapes.
     pub fn from_graph(graph: &CompilerGraph) -> Result<Self, InferenceError> {
         let mut num_heads = None;
@@ -127,7 +147,9 @@ impl GraphDerivedGeometry {
 /// Derive hidden dimension from graph inputs.
 /// Strategy: find the first non-weight input tensor's feature dimension.
 fn derive_hidden(graph: &CompilerGraph) -> Result<usize, InferenceError> {
-    // Look for input tensors with 2D shape [seq_len, hidden].
+    // Look for the first 2D input tensor with shape [seq_len, hidden].
+    // The activation tensor is always first among non-weight inputs.
+    let mut first_2d_hidden: Option<usize> = None;
     for &tid in &graph.inputs {
         let Some(tensor) = graph.tensors.get(tid.0 as usize) else { continue };
         if tensor.shape.len() == 2 {
@@ -135,14 +157,16 @@ fn derive_hidden(graph: &CompilerGraph) -> Result<usize, InferenceError> {
                 SymDim::Concrete(v) => *v,
                 SymDim::Symbolic { .. } => continue,
             };
-            // Weight tensors are typically 2D too, but the "input" / "activation"
-            // tensor is usually the first non-weight input.
-            if tensor.name.contains("input") || tensor.name.contains("hidden") || tensor.name == "input" {
+            if tensor.name.contains("input") || tensor.name.contains("hidden") {
                 return Ok(last);
+            }
+            // Remember first 2D input as fallback for graphs without named tensors.
+            if first_2d_hidden.is_none() {
+                first_2d_hidden = Some(last);
             }
         }
     }
-    // Fallback: scan GEMM ops for k dimension = hidden.
+    // Fallback: scan ops for hidden dimension indicators.
     for op in &graph.ops {
         if let OpKind::Gemm { k, .. } = op.kind {
             return Ok(k);
@@ -153,8 +177,17 @@ fn derive_hidden(graph: &CompilerGraph) -> Result<usize, InferenceError> {
         if let OpKind::QuantGemm { k, .. } = op.kind {
             return Ok(k);
         }
+        if let OpKind::Gather { embed_dim, .. } = op.kind {
+            return Ok(embed_dim);
+        }
+        if let OpKind::PatchEmbed { embed_dim, .. } = op.kind {
+            return Ok(embed_dim);
+        }
+        // Elementwise ops (Residual, BinaryElementwise, etc.) don't carry
+        // hidden_dim directly — fall through to first-2d-input fallback.
     }
-    Err(InferenceError::CompileError(
+    // Ultimate fallback: first 2D input tensor's last dimension.
+    first_2d_hidden.ok_or_else(|| InferenceError::CompileError(
         "GraphDerivedGeometry: cannot derive hidden dimension from graph".into(),
     ))
 }
@@ -188,7 +221,7 @@ fn derive_storage_dtype(graph: &CompilerGraph) -> DType {
 
 /// Derive intermediate (FFN) dimension from GEMM ops.
 /// The FFN gate GEMM has n = intermediate and k = hidden. We look for the
-/// largest GEMM n that is not the lm_head projection (n != vocab_size).
+/// largest GEMM n that is not the logits-producer projection (n != vocab_size).
 fn derive_intermediate(graph: &CompilerGraph, hidden: usize) -> Result<usize, InferenceError> {
     let mut max_n_not_hidden = 0usize;
     for op in &graph.ops {
@@ -252,7 +285,7 @@ mod tests {
         g.add_op(OpKind::Gemm { m: SymDim::Concrete(512), n: 1024, k: 1024, dtype: dt, trans_b: false }, vec![normed, q_w], vec![q_out], "q_proj");
 
         let gathered = g.add_tensor_concrete("gathered", &[512, 1024], dt);
-        g.add_op(OpKind::Gather { table_rows: 32000, embed_dim: 1024, index_dim: SymDim::Concrete(512), indices_kind: crate::compiler::graph::GatherIndicesKind::Tensor }, vec![input, embed_w], vec![gathered], "embed");
+        g.add_op(OpKind::Gather { table_rows: 32000, embed_dim: 1024, index_dim: SymDim::Concrete(512), indices_kind: crate::compiler::graph::GatherIndicesKind::Tensor, scale: None }, vec![input, embed_w], vec![gathered], "embed");
 
         let k_out = g.add_tensor_concrete("k_out", &[512, 512], dt);
         let v_out = g.add_tensor_concrete("v_out", &[512, 512], dt);
@@ -675,6 +708,7 @@ mod tests {
                 vocab_size: 128256,
                 hidden_dim: 768,
                 index_dim: SymDim::Concrete(4),
+                scale: None,
             },
             vec![a],
             vec![qg_out],
@@ -882,7 +916,7 @@ mod tests {
         g.inputs = vec![a, embed_w, w];
 
         let gathered = g.add_tensor_concrete("gathered", &[1, 768], dt);
-        g.add_op(OpKind::Gather { table_rows: 50000, embed_dim: 768, index_dim: SymDim::Concrete(1), indices_kind: crate::compiler::graph::GatherIndicesKind::Tensor }, vec![a, embed_w], vec![gathered], "embed");
+        g.add_op(OpKind::Gather { table_rows: 50000, embed_dim: 768, index_dim: SymDim::Concrete(1), indices_kind: crate::compiler::graph::GatherIndicesKind::Tensor, scale: None }, vec![a, embed_w], vec![gathered], "embed");
 
         let proj_out = g.add_tensor_concrete("proj_out", &[1, 768], dt);
         g.add_op(OpKind::Gemm { m: SymDim::Concrete(1), n: 768, k: 768, dtype: dt, trans_b: false }, vec![gathered, w], vec![proj_out], "proj");

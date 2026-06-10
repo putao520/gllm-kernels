@@ -29,23 +29,50 @@ pub(crate) fn lower_fusion_plan_inner(
     dwc_req: Option<&DwcScratchRequirement>,
     debug_jit: bool,
 ) -> Result<VmProgram, CompilerError> {
+    lower_fusion_plan_inner_with_sym_map(
+        plan, graph, alloc, registry, profile, hook,
+        rope_req, ple_req, dwc_req, debug_jit, None, None,
+    )
+}
+
+pub(crate) fn lower_fusion_plan_inner_with_sym_map(
+    plan: &FusionPlan,
+    graph: &CompilerGraph,
+    alloc: &BufferAllocation,
+    registry: Option<&ScalarOpRegistry>,
+    profile: &IsaProfile,
+    hook: Option<&dyn super::isa_hook::IsaHook>,
+    rope_req: Option<&RopeCacheRequirement>,
+    ple_req: Option<&PleScratchRequirement>,
+    dwc_req: Option<&DwcScratchRequirement>,
+    debug_jit: bool,
+    sym_map_override: Option<&SymDimSlotMap>,
+    topology: Option<&super::topology::GraphTopologyAnalysis>,
+) -> Result<VmProgram, CompilerError> {
     let width = profile.optimal_simd_width();
     // ARCH-CODEGEN-DISPATCH: 按 platform 选择 ABI SymDimSlotMap
-    let sym_map = match &profile.platform {
-        super::isa_profile::Platform::X86_64 { .. } | super::isa_profile::Platform::AArch64 { .. } => {
-            SymDimSlotMap::default_abi()
-        }
-        super::isa_profile::Platform::Cuda { .. }
-        | super::isa_profile::Platform::Hip { .. }
-        | super::isa_profile::Platform::Metal { .. } => {
-            SymDimSlotMap::gpu_abi()
+    let owned_sym_map;
+    let sym_map = match sym_map_override {
+        Some(override_map) => override_map,
+        None => {
+            owned_sym_map = match &profile.platform {
+                super::isa_profile::Platform::X86_64 { .. } | super::isa_profile::Platform::AArch64 { .. } => {
+                    SymDimSlotMap::mega_kernel_abi()
+                }
+                super::isa_profile::Platform::Cuda { .. }
+                | super::isa_profile::Platform::Hip { .. }
+                | super::isa_profile::Platform::Metal { .. } => {
+                    SymDimSlotMap::gpu_abi()
+                }
+            };
+            &owned_sym_map
         }
     };
 
     let ctx = LoweringContext {
         width,
         dtype: graph_dtype(graph),
-        sym_map: &sym_map,
+        sym_map,
         registry,
         hook,
         budget: None,
@@ -65,6 +92,7 @@ pub(crate) fn lower_fusion_plan_inner(
         dot_cap: profile.dot_cap,
         batch_ctx_ptr: None,
         debug_jit,
+        kv_elem_bytes: kv_cache_elem_bytes(graph),
     };
 
     let mut prog = VmProgram::new();
@@ -87,13 +115,13 @@ pub(crate) fn lower_fusion_plan_inner(
     };
     let output_ptr = prog.alloc_vreg(VRegKind::Ptr, SimdWidth::Scalar);
 
-    // Phase 1: AbiArg 源 (input, weight) — 读取物理 ABI 寄存器
+    // AbiArg sources (input, weight) — load from physical ABI registers
     prog.emit(VmInstr::LoadPtr { dst: input_ptr, src: ctx.sym_map.resolve("input").cloned().expect("ABI: input") });
     if needs_weight {
         prog.emit(VmInstr::LoadPtr { dst: weight_ptr, src: ctx.sym_map.resolve("weights").cloned().expect("ABI: weights") });
     }
 
-    // Phase 2: StackArg/其他源 (output, scratchpad)
+    // StackArg/other sources (output, scratchpad)
     prog.emit(VmInstr::LoadPtr { dst: output_ptr, src: ctx.sym_map.resolve("output").cloned().expect("ABI: output") });
 
     // scratchpad_ptr: 在需要 scratch 的融合模式（NormIntoGemm/QkvSharedInput/FFNBlock/
@@ -127,7 +155,7 @@ pub(crate) fn lower_fusion_plan_inner(
     // 覆盖就出 bug(multi-output 覆写、gemm_k 读 w_q、SwiGLU Mul 读 weight_blob
     // 起点、rope_q 读原 activation 等)。统一收敛到 TensorPtrResolver,一次
     // 建表,每个 op 按 tensor_id 直接 materialize。
-    let resolver = TensorPtrResolver::build(graph, alloc);
+    let resolver = TensorPtrResolver::build(graph, alloc, topology);
     let original_weight_vreg = if needs_weight { Some(weight_ptr) } else { None };
     let mut current_abi = AbiPtrs {
         input_ptr,
@@ -156,7 +184,7 @@ pub(crate) fn lower_fusion_plan_inner(
     emit_fusion_groups(
         &mut prog, plan, graph, alloc, &ctx,
         rope_req.map(|r| r.cache_offset),
-        &mut current_abi, original_weight_vreg, &resolver,
+        &mut current_abi, original_weight_vreg, &resolver, topology,
     )?;
 
     prog.validate_structure().map_err(CompilerError::CodegenViolation)?;
@@ -182,6 +210,7 @@ pub(super) fn emit_fusion_groups(
     current_abi: &mut AbiPtrs,
     original_weight_vreg: Option<VRegId>,
     resolver: &TensorPtrResolver,
+    topology: Option<&super::topology::GraphTopologyAnalysis>,
 ) -> Result<(), CompilerError> {
     let width = ctx.width;
     let dtype = ctx.dtype;
@@ -209,6 +238,7 @@ pub(super) fn emit_fusion_groups(
         hetero_seg_byte_offset: None,
         hetero_seg_weight_base: None,
         hetero_global_layer_idx: None,
+        hetero_outer_seg_counter: None,
         active_guard: LayerCondition::Always,
         guard_skip_patch: None,
     };
@@ -260,10 +290,12 @@ pub(super) fn emit_fusion_groups(
             CompilerError::CodegenViolation(format!("anchor op {:?} not found", group.anchor))
         })?;
 
-        // Mega-kernel: skip ops that are handled by Phase 5-7 (Argmax, StoreToken,
-        // CheckStopCondition, WriteLogits). Processing them here would emit duplicate
-        // instructions with WRONG ABI parameters (CompiledLayerFn offsets instead of
-        // MegaKernelFn offsets), causing memory corruption and wrong control flow.
+        // Mega-kernel: skip sampling ops that are manually emitted by
+        // compile_mega_kernel_vm's conditional pipeline
+        // (GraphTopologyAnalysis.has_sampling_ops). Processing them here would emit
+        // duplicate instructions with WRONG ABI parameters (CompiledLayerFn offsets
+        // instead of MegaKernelFn offsets), causing memory corruption and wrong
+        // control flow.
         if matches!(anchor_op.kind,
             OpKind::Argmax { .. } | OpKind::StoreToken | OpKind::CheckStopCondition
             | OpKind::WriteLogits { .. } | OpKind::MtpDraft { .. }
@@ -271,13 +303,15 @@ pub(super) fn emit_fusion_groups(
             continue;
         }
 
-        let is_sliding_small_op = anchor_op.label.starts_with("layer_sliding_small.");
-        let is_full_small_op = anchor_op.label.starts_with("layer_full_small.");
-        let is_sliding_large_op = anchor_op.label.starts_with("layer_sliding_large.");
-        let is_full_large_op = anchor_op.label.starts_with("layer_full_large.");
+        // REQ-UMK-012: 从 FusionGroup.hetero_layer_type 推导异构层子类型（OpKind 参数驱动），非 label 前缀
+        let is_sliding_small_op = group.hetero_layer_type == Some(HeteroLayerType::SlidingSmall);
+        let is_full_small_op = group.hetero_layer_type == Some(HeteroLayerType::FullSmall);
+        let is_sliding_large_op = group.hetero_layer_type == Some(HeteroLayerType::SlidingLarge);
+        let is_full_large_op = group.hetero_layer_type == Some(HeteroLayerType::FullLarge);
         let is_sliding_op = is_sliding_small_op || is_sliding_large_op;
         let is_full_op = is_full_small_op || is_full_large_op;
-        let is_layer_op = anchor_op.label.starts_with("layer.") || is_sliding_op || is_full_op;
+        // REQ-UMK-012: is_layer_group 替代 anchor_op.label.starts_with("layer.")
+        let is_layer_op = group.is_layer_group;
         let group_op_labels: Vec<String> = group.ops.iter()
             .filter_map(|&oid| graph.op(oid).map(|o| o.label.clone()))
             .collect();
@@ -306,7 +340,7 @@ pub(super) fn emit_fusion_groups(
             let num_large_segs = hcfg.num_segments - num_small_segs;
             let layers_per_seg = hcfg.sliding_per_segment + 1;
 
-            // ── Phase 1: Small segment entry (ss ops) ──
+            // ── Small segment entry (sliding+small ops) ──
             if is_sliding_small_op && state.hetero_phase == HeteroPhase::BeforeLayers {
                 // Outer loop for small segments
                 let seg_counter = prog.alloc_vreg(VRegKind::Counter, SimdWidth::Scalar);
@@ -321,6 +355,7 @@ pub(super) fn emit_fusion_groups(
                 prog.emit(VmInstr::GprBinOp { dst: seg_wb, a: weight_ptr, b: GprOperand::VReg(seg_byte_off), op: GprOp::Add });
                 state.hetero_seg_byte_offset = Some(seg_byte_off);
                 state.hetero_seg_weight_base = Some(seg_wb);
+                state.hetero_outer_seg_counter = Some(seg_counter);
                 // Inner sliding loop
                 let counter = prog.alloc_vreg(VRegKind::Counter, SimdWidth::Scalar);
                 let byte_offset = prog.alloc_vreg(VRegKind::ByteOffset, SimdWidth::Scalar);
@@ -340,12 +375,12 @@ pub(super) fn emit_fusion_groups(
                 let global_layer_idx = prog.alloc_vreg(VRegKind::Counter, SimdWidth::Scalar);
                 prog.emit(VmInstr::GprBinOp { dst: global_layer_idx, a: seg_layer_base, b: GprOperand::VReg(counter), op: GprOp::Add });
                 state.abi.weight_ptr = Some(layer_weight_base);
-                state.abi.layer_loop_counter = Some(counter);
+                state.abi.layer_loop_counter = Some(global_layer_idx);
                 state.hetero_global_layer_idx = Some(global_layer_idx);
                 state.in_layer_loop = true;
                 state.hetero_phase = HeteroPhase::InSlidingLoop;
             }
-            // ── Phase 2: ss → fs transition (sliding → full within small segment) ──
+            // ── Sliding→Full transition within small segment ──
             if is_full_small_op && state.hetero_phase == HeteroPhase::InSlidingLoop {
                 // ActivationSwap before inner LoopEnd: each sliding iteration swaps ping-pong
                 if let Some((ping, pong)) = activation_swap_vregs {
@@ -388,29 +423,31 @@ pub(super) fn emit_fusion_groups(
                 // Since segment_stride is known, use multiplication by reciprocal approach...
                 // Simpler: just emit the multiplication.
                 // We'll retrieve the outer counter from the outer LoopBegin.
-                // The outer seg_counter VReg was allocated in Phase 1 but not stored.
+                // The outer seg_counter VReg was allocated in small segment entry but not stored.
                 // WORKAROUND: compute seg_counter from seg_byte_off.
                 // seg_byte_off = seg_counter * step_bytes → seg_counter = seg_byte_off / step_bytes
                 // But GprBinOp doesn't have Div for Counter kind... Use the fact that
                 // step_bytes = small_segment_stride, and we have the outer seg_counter
                 // from the LoopBegin instruction. We need to store it in state.
                 //
-                // Simplest fix: recompute global_layer_idx = seg_byte_off / stride * layers_per_seg + sliding_per_segment
-                // But division is complex. Instead, let me just ensure the guard works
-                // by storing the outer seg_counter in EmitState.
-                //
-                // For now, just set in_layer_loop=true with a computed layer_idx.
-                // Since full_small layers are always donors (L4, L9, L14 < 15),
-                // the guard won't trigger anyway. Set a dummy that's always < threshold.
-                let dummy_counter = prog.alloc_vreg(VRegKind::Counter, SimdWidth::Scalar);
-                prog.emit(VmInstr::GprLoadImm { dst: dummy_counter, value: 0 });
+                // Compute global_layer_idx for full layer:
+                // full_layer_idx = seg_counter * layers_per_seg + sliding_per_segment
+                let seg_ctr = state.hetero_outer_seg_counter.expect("outer seg_counter not stored in small segment entry");
+                let lps_gpr = prog.alloc_vreg(VRegKind::Counter, SimdWidth::Scalar);
+                prog.emit(VmInstr::GprLoadImm { dst: lps_gpr, value: layers_per_seg });
+                let seg_layer_base = prog.alloc_vreg(VRegKind::Counter, SimdWidth::Scalar);
+                prog.emit(VmInstr::GprBinOp { dst: seg_layer_base, a: seg_ctr, b: GprOperand::VReg(lps_gpr), op: GprOp::Mul });
+                let sps_gpr = prog.alloc_vreg(VRegKind::Counter, SimdWidth::Scalar);
+                prog.emit(VmInstr::GprLoadImm { dst: sps_gpr, value: hcfg.sliding_per_segment });
+                let full_layer_idx = prog.alloc_vreg(VRegKind::Counter, SimdWidth::Scalar);
+                prog.emit(VmInstr::GprBinOp { dst: full_layer_idx, a: seg_layer_base, b: GprOperand::VReg(sps_gpr), op: GprOp::Add });
                 state.abi.weight_ptr = Some(full_base_ptr);
-                state.abi.layer_loop_counter = None;
-                state.hetero_global_layer_idx = Some(dummy_counter);
+                state.abi.layer_loop_counter = Some(full_layer_idx);
+                state.hetero_global_layer_idx = Some(full_layer_idx);
                 state.in_layer_loop = true;
                 state.hetero_phase = HeteroPhase::InFullBody;
             }
-            // ── Phase 3: fs → sl transition (end small outer loop, start large outer loop) ──
+            // ── Small→Large segment transition (end small outer loop, start large outer loop) ──
             if is_sliding_large_op && state.hetero_phase == HeteroPhase::InFullBody {
                 // ActivationSwap before outer small segment LoopEnd
                 if let Some((ping, pong)) = activation_swap_vregs {
@@ -434,9 +471,10 @@ pub(super) fn emit_fusion_groups(
                 prog.emit(VmInstr::GprBinOp { dst: seg_base, a: weight_ptr, b: GprOperand::VReg(seg_base_tmp ), op: GprOp::Add });
                 let seg_wb = prog.alloc_vreg(VRegKind::Ptr, SimdWidth::Scalar);
                 prog.emit(VmInstr::GprBinOp { dst: seg_wb, a: seg_base, b: GprOperand::VReg(seg_byte_off ), op: GprOp::Add });
-                // Save for Phase 4
+                // Save for large→full transition
                 state.hetero_seg_byte_offset = Some(seg_byte_off);
                 state.hetero_seg_weight_base = Some(seg_wb);
+                state.hetero_outer_seg_counter = Some(seg_counter);
                 // Inner sliding loop
                 let counter = prog.alloc_vreg(VRegKind::Counter, SimdWidth::Scalar);
                 let byte_offset = prog.alloc_vreg(VRegKind::ByteOffset, SimdWidth::Scalar);
@@ -464,12 +502,12 @@ pub(super) fn emit_fusion_groups(
                 let global_layer_idx = prog.alloc_vreg(VRegKind::Counter, SimdWidth::Scalar);
                 prog.emit(VmInstr::GprBinOp { dst: global_layer_idx, a: seg_layer_base, b: GprOperand::VReg(counter), op: GprOp::Add });
                 state.abi.weight_ptr = Some(layer_weight_base);
-                state.abi.layer_loop_counter = Some(counter);
+                state.abi.layer_loop_counter = Some(global_layer_idx);
                 state.hetero_global_layer_idx = Some(global_layer_idx);
                 state.in_layer_loop = true;
                 state.hetero_phase = HeteroPhase::InLargeSlidingLoop;
             }
-            // ── Phase 4: sl → fl transition ──
+            // ── Large sliding→Full transition ──
             if is_full_large_op && state.hetero_phase == HeteroPhase::InLargeSlidingLoop {
                 // ActivationSwap before inner sliding LoopEnd
                 if let Some((ping, pong)) = activation_swap_vregs {
@@ -488,16 +526,26 @@ pub(super) fn emit_fusion_groups(
                 prog.emit(VmInstr::GprLoadImm { dst: type3_rel_gpr, value: type3_rel });
                 prog.emit(VmInstr::GprBinOp { dst: full_base_ptr, a: full_base_ptr, b: GprOperand::VReg(type3_rel_gpr), op: GprOp::Sub });
                 // Compute global layer_idx for full_large = (num_small_segs + seg_counter) * layers_per_seg + sliding_per_segment
-                // Since all large segment layers are consumers (>=15), use a high constant.
-                let large_layer_idx = prog.alloc_vreg(VRegKind::Counter, SimdWidth::Scalar);
-                prog.emit(VmInstr::GprLoadImm { dst: large_layer_idx, value: num_small_segs * layers_per_seg + hcfg.sliding_per_segment });
+                let seg_ctr = state.hetero_outer_seg_counter.expect("outer seg_counter not stored in small→large transition");
+                let nss_gpr = prog.alloc_vreg(VRegKind::Counter, SimdWidth::Scalar);
+                prog.emit(VmInstr::GprLoadImm { dst: nss_gpr, value: num_small_segs });
+                let abs_seg = prog.alloc_vreg(VRegKind::Counter, SimdWidth::Scalar);
+                prog.emit(VmInstr::GprBinOp { dst: abs_seg, a: nss_gpr, b: GprOperand::VReg(seg_ctr), op: GprOp::Add });
+                let lps_gpr = prog.alloc_vreg(VRegKind::Counter, SimdWidth::Scalar);
+                prog.emit(VmInstr::GprLoadImm { dst: lps_gpr, value: layers_per_seg });
+                let seg_layer_base = prog.alloc_vreg(VRegKind::Counter, SimdWidth::Scalar);
+                prog.emit(VmInstr::GprBinOp { dst: seg_layer_base, a: abs_seg, b: GprOperand::VReg(lps_gpr), op: GprOp::Mul });
+                let sps_gpr = prog.alloc_vreg(VRegKind::Counter, SimdWidth::Scalar);
+                prog.emit(VmInstr::GprLoadImm { dst: sps_gpr, value: hcfg.sliding_per_segment });
+                let full_layer_idx = prog.alloc_vreg(VRegKind::Counter, SimdWidth::Scalar);
+                prog.emit(VmInstr::GprBinOp { dst: full_layer_idx, a: seg_layer_base, b: GprOperand::VReg(sps_gpr), op: GprOp::Add });
                 state.abi.weight_ptr = Some(full_base_ptr);
-                state.abi.layer_loop_counter = None;
-                state.hetero_global_layer_idx = Some(large_layer_idx);
+                state.abi.layer_loop_counter = Some(full_layer_idx);
+                state.hetero_global_layer_idx = Some(full_layer_idx);
                 state.in_layer_loop = true;
                 state.hetero_phase = HeteroPhase::InLargeFullBody;
             }
-            // ── Phase 5: End of all layer ops ──
+            // ── End of all layer ops ──
             // At this point we need to close any open loops.
             // If we're in an inner sliding loop (InSlidingLoop/InLargeSlidingLoop),
             // we need to close both inner and outer loops (2 LoopEnds).
@@ -535,18 +583,20 @@ pub(super) fn emit_fusion_groups(
                     let counter = prog.alloc_vreg(VRegKind::Counter, SimdWidth::Scalar);
                     let byte_offset = prog.alloc_vreg(VRegKind::ByteOffset, SimdWidth::Scalar);
                     // DEBUG: configurable layer count via GLLM_DEBUG_LAYERS env var
+                    // SPEC/39: num_layers 从 topology 推导，替代 cfg.num_layers 读取
+                    let topology_num_layers = topology.and_then(|t| t.layer_num_layers).unwrap_or(cfg.num_layers);
                     let layer_bound = if let Ok(n) = std::env::var("GLLM_DEBUG_LAYERS") {
                         if let Ok(count) = n.parse::<usize>() {
-                            eprintln!("[DEBUG-LAYERS] Overriding num_layers {} -> {}", cfg.num_layers, count);
+                            eprintln!("[DEBUG-LAYERS] Overriding num_layers {} -> {}", topology_num_layers, count);
                             BoundExpr::Const(count)
                         } else {
-                            BoundExpr::Const(cfg.num_layers)
+                            BoundExpr::Const(topology_num_layers)
                         }
                     } else if std::env::var("GLLM_SINGLE_LAYER").is_ok() {
-                        eprintln!("[SINGLE-LAYER] Overriding num_layers {} -> 1", cfg.num_layers);
+                        eprintln!("[SINGLE-LAYER] Overriding num_layers {} -> 1", topology_num_layers);
                         BoundExpr::Const(1)
                     } else {
-                        BoundExpr::Const(cfg.num_layers)
+                        BoundExpr::Const(topology_num_layers)
                     };
 
                     // §0.2.8 Cross-layer weight prefetch: allocate shared memory for
@@ -626,7 +676,7 @@ pub(super) fn emit_fusion_groups(
                 // original_weight_vreg's spill slot may have been overwritten by the
                 // register allocator during the multi-iteration layer loop. Reloading
                 // from the ABI stack slot guarantees the correct weight_blob base.
-                // Global weights (final_norm, lm_head, embed) are packed at the
+                // Global weights (final_norm, logits-producer, embed) are packed at the
                 // beginning of the blob, before layer template weights. Their graph
                 // offsets are absolute from blob start, so weight_ptr must point to
                 // blob offset 0.
@@ -650,76 +700,178 @@ pub(super) fn emit_fusion_groups(
         current_abi.gen_loop_counter = state.abi.gen_loop_counter;
         current_abi.kv_cache_ptr = state.abi.kv_cache_ptr;
 
-        // ARCH-DATA-FLOW-CONTRACT §3 (D#1 统一根治):
-        // group 内 anchor_op 的 input[0] / input[1] / output[0] 统一经
-        // TensorPtrResolver 查询, 物理位置由建表阶段一次性决定 (Activation /
-        // Weight / Intermediate / Output), 每处按 tensor_id 取真实 base+offset。
-        let group_input_ptr = anchor_op.inputs.first()
-            .and_then(|&tid| resolver.materialize(prog, tid, current_abi))
-            .unwrap_or(input_ptr);
-        let group_weight_ptr = anchor_op.inputs.get(1)
-            .and_then(|&tid| resolver.materialize(prog, tid, current_abi))
-            .unwrap_or(weight_ptr);
-        let group_output_ptr = anchor_op.outputs.first()
-            .and_then(|&tid| resolver.materialize(prog, tid, current_abi))
-            .unwrap_or(output_ptr);
-
         // ── Layer guard (NO_LAYER_EXPAND, SPEC 03 §1.3.1) ──
         // Emit GprCondAction to conditionally skip ops based on layer_idx.
         // Consecutive ops with the same guard are merged into a single skip range.
-        let op_guard = anchor_op.guard;
-        if op_guard != state.active_guard {
-            // Close previous guard run (patch-back Skip count)
-            if let Some(patch_idx) = state.guard_skip_patch.take() {
-                let skip_n = prog.instrs.len() - patch_idx - 1;
-                if let VmInstr::GprCondAction {
-                    action: GprBranchAction::Skip(ref mut n), ..
-                } = prog.instrs[patch_idx] {
-                    *n = skip_n;
+        // IMPORTANT: Guard detection MUST happen before materialize. If materialize
+        // runs first, the new group's LoadPtr instructions get included in the
+        // previous guard's Skip range. When that guard fires, the LoadPtr is skipped
+        // but the computation (outside the skip range) still executes with
+        // uninitialized pointers → SIGSEGV.
+        //
+        // QkvSharedInput special case: when ops within the group have mixed guards
+        // (e.g. Q proj = Always, K/V proj = kv_guard for SharedKvRef), the group
+        // cannot use the anchor's guard for all ops. Each op must be emitted with
+        // its own guard. We break the group into per-op emission with individual
+        // guard transitions.
+        let has_mixed_guards = group.mode == FusionMode::QkvSharedInput
+            && group.ops.iter().any(|&oid| {
+                graph.op(oid).map_or(false, |o| o.guard != anchor_op.guard)
+            });
+
+        if has_mixed_guards {
+            // Per-op guard handling for QkvSharedInput with mixed guards.
+            // Each op gets its own guard transition and individual GEMM emission.
+            for &op_id in &group.ops {
+                let op = match graph.op(op_id) {
+                    Some(o) => o,
+                    None => continue,
+                };
+                let per_op_guard = op.guard;
+
+                // Close previous guard run if guard changed
+                if per_op_guard != state.active_guard {
+                    if let Some(patch_idx) = state.guard_skip_patch.take() {
+                        let skip_n = prog.instrs[patch_idx + 1..]
+                            .iter()
+                            .filter(|i| !i.is_meta())
+                            .count();
+                        if let VmInstr::GprCondAction {
+                            action: GprBranchAction::Skip(ref mut n), ..
+                        } = prog.instrs[patch_idx] {
+                            *n = skip_n;
+                        }
+                    }
+                    state.active_guard = per_op_guard;
+
+                    if per_op_guard != LayerCondition::Always && state.in_layer_loop {
+                        let counter = state.hetero_global_layer_idx
+                            .or(state.abi.layer_loop_counter)
+                            .expect("guarded op requires active layer loop");
+                        let skip_cond = match per_op_guard {
+                            LayerCondition::LayerIdxLt(t) => {
+                                GprCondition::CmpGeU(counter, t as u64)
+                            }
+                            LayerCondition::LayerIdxGe(t) => {
+                                GprCondition::CmpLtU(counter, t as u64)
+                            }
+                            LayerCondition::Always => unreachable!(),
+                        };
+                        prog.emit(VmInstr::GprCondAction {
+                            cond: skip_cond,
+                            action: GprBranchAction::Skip(0),
+                        });
+                        state.guard_skip_patch = Some(prog.instrs.len() - 1);
+                    }
+                }
+
+                // Materialize per-op tensors
+                let op_input_ptr = op.inputs.first()
+                    .and_then(|&tid| resolver.materialize(prog, tid, current_abi))
+                    .unwrap_or(input_ptr);
+                let op_weight_ptr = op.inputs.get(1)
+                    .and_then(|&tid| resolver.materialize(prog, tid, current_abi))
+                    .unwrap_or(weight_ptr);
+
+                // Emit single GEMM for this op
+                if let Ok((m_dim, n, k)) = extract_gemm_dims_sym(op) {
+                    let out_ptr = load_op_scratch_ptr(prog, scratch_base, op, alloc, resolver, current_abi)?;
+                    let pm = ctx.pack_map_for_gemm(op.inputs.get(1).copied());
+                    let trans_b = match &op.kind {
+                        OpKind::Gemm { trans_b, .. } | OpKind::GemmBias { trans_b, .. } => *trans_b,
+                        _ => false,
+                    };
+                    prog.emit_scope(|p| -> Result<(), CompilerError> {
+                        emit_gemm_inline_with_hook(p, &m_dim, n, k, ctx,
+                            op_input_ptr, op_weight_ptr, out_ptr,
+                            seq_bound_override.as_ref(), Some(op.id), pm, trans_b)?;
+                        Ok(())
+                    })?;
                 }
             }
-            state.active_guard = op_guard;
+        } else {
+            // Standard group-level guard handling
+            let op_guard = anchor_op.guard;
+            if op_guard != state.active_guard {
+                // Close previous guard run (patch-back Skip count)
+                if let Some(patch_idx) = state.guard_skip_patch.take() {
+                    // Skip count must only include non-meta instructions.
+                    // x86 codegen only decrements the skip counter for non-meta
+                    // instructions, so counting meta ones here would extend the
+                    // skip range past the intended boundary.
+                    let skip_n = prog.instrs[patch_idx + 1..]
+                        .iter()
+                        .filter(|i| !i.is_meta())
+                        .count();
+                    if let VmInstr::GprCondAction {
+                        action: GprBranchAction::Skip(ref mut n), ..
+                    } = prog.instrs[patch_idx] {
+                        *n = skip_n;
+                    }
+                }
+                state.active_guard = op_guard;
 
-            // Open new guard run if non-Always and inside layer loop
-            if op_guard != LayerCondition::Always && state.in_layer_loop {
-                // In hetero mode, use the computed global layer_idx register
-                // (which accounts for segment × layers_per_seg + inner position)
-                // rather than the raw inner loop counter.
-                let counter = state.hetero_global_layer_idx
-                    .or(state.abi.layer_loop_counter)
-                    .expect("guarded op requires active layer loop");
-                let skip_cond = match op_guard {
-                    LayerCondition::LayerIdxLt(t) => {
-                        // Guard = "donor executes" → skip when consumer (idx >= t)
-                        GprCondition::CmpGeU(counter, t as u64)
-                    }
-                    LayerCondition::LayerIdxGe(t) => {
-                        // Guard = "consumer executes" → skip when donor (idx < t)
-                        GprCondition::CmpLtU(counter, t as u64)
-                    }
-                    LayerCondition::Always => unreachable!(),
-                };
-                prog.emit(VmInstr::GprCondAction {
-                    cond: skip_cond,
-                    action: GprBranchAction::Skip(0),
-                });
-                state.guard_skip_patch = Some(prog.instrs.len() - 1);
+                // Open new guard run if non-Always and inside layer loop
+                if op_guard != LayerCondition::Always && state.in_layer_loop {
+                    // In hetero mode, use the computed global layer_idx register
+                    // (which accounts for segment × layers_per_seg + inner position)
+                    // rather than the raw inner loop counter.
+                    let counter = state.hetero_global_layer_idx
+                        .or(state.abi.layer_loop_counter)
+                        .expect("guarded op requires active layer loop");
+                    let skip_cond = match op_guard {
+                        LayerCondition::LayerIdxLt(t) => {
+                            // Guard = "donor executes" → skip when consumer (idx >= t)
+                            GprCondition::CmpGeU(counter, t as u64)
+                        }
+                        LayerCondition::LayerIdxGe(t) => {
+                            // Guard = "consumer executes" → skip when donor (idx < t)
+                            GprCondition::CmpLtU(counter, t as u64)
+                        }
+                        LayerCondition::Always => unreachable!(),
+                    };
+                    prog.emit(VmInstr::GprCondAction {
+                        cond: skip_cond,
+                        action: GprBranchAction::Skip(0),
+                    });
+                    state.guard_skip_patch = Some(prog.instrs.len() - 1);
+                }
             }
-        }
 
-        // §4 CompoundExecution: 先按 FusionMode dispatch，再按 OpKind
-        emit_fusion_group_by_mode(
-            prog, group, anchor_op, graph, alloc, ctx,
-            group_input_ptr, group_weight_ptr, group_output_ptr,
-            scratch_base, input_ptr, weight_ptr, output_ptr,
-            rope_cache_offset, seq_bound_override.as_ref(),
-            resolver, current_abi,
-        )?;
+            // ARCH-DATA-FLOW-CONTRACT §3 (D#1 统一根治):
+            // group 内 anchor_op 的 input[0] / input[1] / output[0] 统一经
+            // TensorPtrResolver 查询, 物理位置由建表阶段一次性决定 (Activation /
+            // Weight / Intermediate / Output), 每处按 tensor_id 取真实 base+offset.
+            // Materialize runs AFTER guard detection so that LoadPtr instructions
+            // are correctly placed relative to the guard's skip range.
+            let group_input_ptr = anchor_op.inputs.first()
+                .and_then(|&tid| resolver.materialize(prog, tid, current_abi))
+                .unwrap_or(input_ptr);
+            let group_weight_ptr = anchor_op.inputs.get(1)
+                .and_then(|&tid| resolver.materialize(prog, tid, current_abi))
+                .unwrap_or(weight_ptr);
+            let group_output_ptr = anchor_op.outputs.first()
+                .and_then(|&tid| resolver.materialize(prog, tid, current_abi))
+                .unwrap_or(output_ptr);
+
+            // §4 CompoundExecution: 先按 FusionMode dispatch，再按 OpKind
+            emit_fusion_group_by_mode(
+                prog, group, anchor_op, graph, alloc, ctx,
+                group_input_ptr, group_weight_ptr, group_output_ptr,
+                scratch_base, input_ptr, weight_ptr, output_ptr,
+                rope_cache_offset, seq_bound_override.as_ref(),
+                resolver, current_abi,
+            )?;
+        }
     }
 
     // Close any pending guard run after all groups processed
     if let Some(patch_idx) = state.guard_skip_patch.take() {
-        let skip_n = prog.instrs.len() - patch_idx - 1;
+        // Skip count must only include non-meta instructions (see above).
+        let skip_n = prog.instrs[patch_idx + 1..]
+            .iter()
+            .filter(|i| !i.is_meta())
+            .count();
         if let VmInstr::GprCondAction {
             action: GprBranchAction::Skip(ref mut n), ..
         } = prog.instrs[patch_idx] {

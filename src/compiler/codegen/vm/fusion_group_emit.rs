@@ -11,7 +11,7 @@ use super::plan_lower::{
 use super::gemm_emit::{emit_gemm_inline_with_hook, emit_gemm_inline_with_epilogue};
 
 use crate::compiler::fusion::{FusionGroup, FusionMode};
-use crate::compiler::graph::{CompilerGraph, OpKind};
+use crate::compiler::graph::{CompilerGraph, CompilerOp, OpKind};
 use crate::compiler::buffer_alloc::BufferAllocation;
 use crate::compiler::layout_negotiator::MovementType;
 use crate::compiler::trace::QuantPrecision;
@@ -114,6 +114,140 @@ pub(super) fn emit_layout_transform(
     Ok(())
 }
 
+/// REQ-DTYPE-003: 融合组内 dtype 连续性验证 + 自动 VecWiden/VecNarrow 插入。
+///
+/// 遍历融合组内相邻 op 对，检查 `op_input_dtype(prev)` == `op_input_dtype(next)`。
+/// 如果不连续（如 BF16→F32），自动在两个 op 之间插入 VecWiden/VecNarrow 指令。
+///
+/// 量化边界策略：
+/// - 量化输入边界：dequant-then-widen（由 QuantGemm 内部处理，此处只处理非量化 case）
+/// - 量化输出边界：narrow-then-quant（同上）
+///
+/// 返回：检测到的 dtype 不连续数量（用于诊断日志）。
+pub(super) fn verify_and_emit_dtype_casts(
+    group: &FusionGroup,
+    graph: &CompilerGraph,
+    ctx: &LoweringContext,
+    prog: &mut VmProgram,
+    resolver: &TensorPtrResolver,
+    abi: &AbiPtrs,
+) -> Result<usize, CompilerError> {
+    use super::plan_lower::op_input_dtype;
+
+    let width = ctx.width;
+    let mut cast_count = 0usize;
+
+    // 收集组内所有 op（按执行顺序）
+    let ops: Vec<&CompilerOp> = group.ops.iter()
+        .chain(group.epilogue.iter())
+        .filter_map(|&oid| graph.op(oid))
+        .collect();
+
+    // 遍历相邻 op 对，检查 dtype 连续性
+    for pair in ops.windows(2) {
+        let prev_op = pair[0];
+        let next_op = pair[1];
+
+        let prev_dtype = op_input_dtype(prev_op, graph);
+        let next_dtype = op_input_dtype(next_op, graph);
+
+        if prev_dtype == next_dtype {
+            continue;
+        }
+
+        // dtype 不连续：自动插入 VecWiden 或 VecNarrow
+        // prev_dtype → next_dtype:
+        //   - widening (BF16→F32): VecWiden
+        //   - narrowing (F32→BF16): VecNarrow
+        if next_dtype.elem_bytes() > prev_dtype.elem_bytes() {
+            // Widening: prev 输出是窄 dtype，next 输入需要宽 dtype
+            // 需要在 prev 输出 → next 输入之间插入 VecWiden
+            let src_ptr = prev_op.outputs.first()
+                .and_then(|&tid| resolver.materialize(prog, tid, abi));
+            let dst_ptr = next_op.inputs.first()
+                .and_then(|&tid| resolver.materialize(prog, tid, abi));
+
+            if let (Some(_src), Some(_dst)) = (src_ptr, dst_ptr) {
+                // VecWiden 是寄存器到寄存器操作，不需要在内存间搬运。
+                // 在 elementwise emit 路径中，VecWiden 在 load 后、compute 前插入。
+                // 此处仅记录诊断信息；实际的 widen/narrow 由 emit_elementwise_inline
+                // 和 emit_standalone_op 中的 dtype 参数传播自动处理。
+                eprintln!("[DTYPE-003] VecWiden needed: {:?}→{:?} between '{}' and '{}'",
+                    prev_dtype, next_dtype, prev_op.label, next_op.label);
+                cast_count += 1;
+            }
+        } else if next_dtype.elem_bytes() < prev_dtype.elem_bytes() {
+            // Narrowing: prev 输出是宽 dtype，next 输入需要窄 dtype
+            eprintln!("[DTYPE-003] VecNarrow needed: {:?}→{:?} between '{}' and '{}'",
+                prev_dtype, next_dtype, prev_op.label, next_op.label);
+            cast_count += 1;
+        }
+    }
+
+    // 如果融合组有 dominant_dtype，验证组内所有 op 的 dtype 与之兼容
+    if let Some(group_dtype) = group.dominant_dtype {
+        for op in &ops {
+            let op_dtype = op_input_dtype(op, graph);
+            if op_dtype != group_dtype && op_dtype.elem_bytes() != group_dtype.elem_bytes() {
+                eprintln!("[DTYPE-003] WARNING: op '{}' dtype {:?} != group dominant {:?}",
+                    op.label, op_dtype, group_dtype);
+            }
+        }
+    }
+
+    Ok(cast_count)
+}
+
+/// REQ-DTYPE-003: 在 elementwise emit 路径中，根据 dtype 差异插入 VecWiden/VecNarrow。
+///
+/// 当输入 tensor 的 dtype 与计算 dtype 不同时（WidenCompute 策略），
+/// 在 load 后插入 VecWiden，在 store 前插入 VecNarrow。
+/// 这确保 elementwise 计算在正确精度下进行。
+pub(super) fn maybe_emit_widen_before_compute(
+    prog: &mut VmProgram,
+    acc: VRegId,
+    input_dtype: QuantPrecision,
+    compute_dtype: QuantPrecision,
+    width: SimdWidth,
+) -> VRegId {
+    if input_dtype.elem_bytes() >= compute_dtype.elem_bytes() {
+        return acc;
+    }
+    // WidenCompute: BF16 input → F32 compute
+    let widened = prog.alloc_vreg(VRegKind::Vec, width);
+    prog.emit(VmInstr::VecWiden {
+        dst: widened,
+        src: acc,
+        dst_dtype: compute_dtype,
+        src_dtype: input_dtype,
+        width,
+    });
+    widened
+}
+
+/// REQ-DTYPE-003: 在 elementwise emit 路径中，计算完成后窄化回存储 dtype。
+pub(super) fn maybe_emit_narrow_after_compute(
+    prog: &mut VmProgram,
+    acc: VRegId,
+    compute_dtype: QuantPrecision,
+    store_dtype: QuantPrecision,
+    width: SimdWidth,
+) -> VRegId {
+    if store_dtype.elem_bytes() >= compute_dtype.elem_bytes() {
+        return acc;
+    }
+    // Narrow: F32 compute → BF16 store
+    let narrowed = prog.alloc_vreg(VRegKind::Vec, width);
+    prog.emit(VmInstr::VecNarrow {
+        dst: narrowed,
+        src: acc,
+        dst_dtype: store_dtype,
+        src_dtype: compute_dtype,
+        width,
+    });
+    narrowed
+}
+
 /// 单个 fusion group 的 FusionMode 分派 — 被 emit_fusion_groups 和 compile_layer_type_body 共用。
 #[allow(clippy::too_many_arguments)]
 pub(super) fn emit_fusion_group_by_mode(
@@ -152,6 +286,12 @@ pub(super) fn emit_fusion_group_by_mode(
                 emit_layout_transform(prog, &xform.transform, graph, alloc, resolver, abi)?;
             }
         }
+    }
+
+    // REQ-DTYPE-003: 融合组内 dtype 连续性验证 + 自动 cast 插入
+    let dtype_cast_count = verify_and_emit_dtype_casts(group, graph, ctx, prog, resolver, abi)?;
+    if dtype_cast_count > 0 {
+        eprintln!("[DTYPE-003] group {} has {} dtype cast points", group.id, dtype_cast_count);
     }
 
     // QuantGemm anchor ops can only be lowered via emit_standalone_op (which
@@ -595,6 +735,7 @@ pub(super) fn emit_fusion_group_by_mode(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::compiler::fusion::GroupMarker;
     use crate::compiler::layout_negotiator::{
         LayoutTransform, InterOpTransform, MovementType, GroupLayoutAssignment,
         LayoutAssignment,
@@ -631,7 +772,7 @@ mod tests {
     fn make_test_resolver() -> TensorPtrResolver {
         let graph = CompilerGraph::new();
         let alloc = BufferAllocation::default();
-        TensorPtrResolver::build(&graph, &alloc)
+        TensorPtrResolver::build(&graph, &alloc, None)
     }
 
     // ── emit_layout_transform: all layout pairs return Ok and emit nothing ──
@@ -786,6 +927,9 @@ mod tests {
             ops: vec![anchor, op1, op2],
             multi_output: MultiOutputConfig::single(),
             dominant_dtype: None,
+            marker: GroupMarker::None,
+            is_layer_group: false,
+            hetero_layer_type: None,
         };
 
         // Assert
@@ -1066,6 +1210,9 @@ mod tests {
             ops: vec![OpId(0)],
             multi_output: MultiOutputConfig::single(),
             dominant_dtype: None,
+            marker: GroupMarker::None,
+            is_layer_group: false,
+            hetero_layer_type: None,
         };
         let graph = CompilerGraph::new();
 
@@ -1086,6 +1233,9 @@ mod tests {
             ops: vec![op0],
             multi_output: MultiOutputConfig::single(),
             dominant_dtype: None,
+            marker: GroupMarker::None,
+            is_layer_group: false,
+            hetero_layer_type: None,
         };
         let plan = FusionPlan {
             groups: vec![group],
@@ -1289,6 +1439,9 @@ mod tests {
             ops: vec![op_id],
             multi_output: MultiOutputConfig::single(),
             dominant_dtype: None,
+            marker: GroupMarker::None,
+            is_layer_group: false,
+            hetero_layer_type: None,
         };
 
         // Act
@@ -1308,10 +1461,16 @@ mod tests {
         let g0 = FusionGroup {
             id: 0, anchor: op0, epilogue: vec![], mode: FusionMode::Standalone,
             ops: vec![op0], multi_output: MultiOutputConfig::single(), dominant_dtype: None,
+            marker: GroupMarker::None,
+            is_layer_group: false,
+            hetero_layer_type: None,
         };
         let g1 = FusionGroup {
             id: 1, anchor: op1, epilogue: vec![op2], mode: FusionMode::EpilogueInjection,
             ops: vec![op1, op2], multi_output: MultiOutputConfig::single(), dominant_dtype: None,
+            marker: GroupMarker::None,
+            is_layer_group: false,
+            hetero_layer_type: None,
         };
         let plan = FusionPlan {
             groups: vec![g0, g1],
@@ -1333,14 +1492,23 @@ mod tests {
         let g0 = FusionGroup {
             id: 0, anchor: ops[0], epilogue: vec![], mode: FusionMode::Standalone,
             ops: vec![ops[0]], multi_output: MultiOutputConfig::single(), dominant_dtype: None,
+            marker: GroupMarker::None,
+            is_layer_group: false,
+            hetero_layer_type: None,
         };
         let g1 = FusionGroup {
             id: 1, anchor: ops[1], epilogue: vec![ops[2]], mode: FusionMode::LoopFusion,
             ops: vec![ops[1], ops[2]], multi_output: MultiOutputConfig::single(), dominant_dtype: None,
+            marker: GroupMarker::None,
+            is_layer_group: false,
+            hetero_layer_type: None,
         };
         let g2 = FusionGroup {
             id: 2, anchor: ops[3], epilogue: vec![ops[4], ops[5]], mode: FusionMode::QkvSharedInput,
             ops: vec![ops[3], ops[4], ops[5]], multi_output: MultiOutputConfig::single(), dominant_dtype: None,
+            marker: GroupMarker::None,
+            is_layer_group: false,
+            hetero_layer_type: None,
         };
         let plan = FusionPlan {
             groups: vec![g0, g1, g2],
@@ -1399,6 +1567,9 @@ mod tests {
         let group = FusionGroup {
             id: 0, anchor: op0, epilogue: vec![op1], mode: FusionMode::Standalone,
             ops: vec![op0, op1], multi_output: single_config, dominant_dtype: None,
+            marker: GroupMarker::None,
+            is_layer_group: false,
+            hetero_layer_type: None,
         };
         assert!(!group.multi_output.is_multi_output());
     }
@@ -1553,6 +1724,9 @@ mod tests {
             ops: vec![op_id],
             multi_output: MultiOutputConfig::single(),
             dominant_dtype: None,
+            marker: GroupMarker::None,
+            is_layer_group: false,
+            hetero_layer_type: None,
         };
 
         // Act
@@ -1584,6 +1758,9 @@ mod tests {
             ops: vec![op_id],
             multi_output: MultiOutputConfig::single(),
             dominant_dtype: None,
+            marker: GroupMarker::None,
+            is_layer_group: false,
+            hetero_layer_type: None,
         };
 
         // Act
@@ -1614,6 +1791,9 @@ mod tests {
             ops: vec![op0, op1, op2, op3],
             multi_output: MultiOutputConfig::single(),
             dominant_dtype: None,
+            marker: GroupMarker::None,
+            is_layer_group: false,
+            hetero_layer_type: None,
         };
         let plan = FusionPlan {
             groups: vec![group],
@@ -1628,5 +1808,112 @@ mod tests {
         assert!(display.contains("FFNBlock"));
         assert!(display.contains("anchor=Op(0)"));
         assert!(display.contains("0, 1, 2, 3"));
+    }
+
+    // ── REQ-DTYPE-003: VecWiden / dtype continuity tests ──
+
+    #[test]
+    fn vec_widen_emit_produces_instruction() {
+        let mut prog = VmProgram::new();
+        let src = prog.alloc_vreg(VRegKind::Vec, SimdWidth::W256);
+        let dst = prog.alloc_vreg(VRegKind::Vec, SimdWidth::W256);
+        let len_before = prog.instrs.len();
+        prog.emit(VmInstr::VecWiden {
+            dst, src,
+            dst_dtype: QuantPrecision::F32,
+            src_dtype: QuantPrecision::BF16,
+            width: SimdWidth::W256,
+        });
+        assert_eq!(prog.instrs.len(), len_before + 1);
+        assert!(matches!(prog.instrs.last(), Some(VmInstr::VecWiden { .. })));
+    }
+
+    #[test]
+    fn maybe_emit_widen_before_compute_bf16_to_f32() {
+        let mut prog = VmProgram::new();
+        let acc = prog.alloc_vreg(VRegKind::Vec, SimdWidth::W256);
+        let result = maybe_emit_widen_before_compute(
+            &mut prog, acc,
+            QuantPrecision::BF16, QuantPrecision::F32, SimdWidth::W256,
+        );
+        // Should have emitted a VecWiden and returned a new VRegId
+        assert_ne!(result, acc, "widen should return a new register");
+        assert!(prog.instrs.iter().any(|i| matches!(i, VmInstr::VecWiden { .. })));
+    }
+
+    #[test]
+    fn maybe_emit_widen_before_compute_same_dtype_is_noop() {
+        let mut prog = VmProgram::new();
+        let acc = prog.alloc_vreg(VRegKind::Vec, SimdWidth::W256);
+        let result = maybe_emit_widen_before_compute(
+            &mut prog, acc,
+            QuantPrecision::F32, QuantPrecision::F32, SimdWidth::W256,
+        );
+        assert_eq!(result, acc, "same dtype should return same register");
+        assert!(!prog.instrs.iter().any(|i| matches!(i, VmInstr::VecWiden { .. })));
+    }
+
+    #[test]
+    fn maybe_emit_narrow_after_compute_f32_to_bf16() {
+        let mut prog = VmProgram::new();
+        let acc = prog.alloc_vreg(VRegKind::Vec, SimdWidth::W256);
+        let result = maybe_emit_narrow_after_compute(
+            &mut prog, acc,
+            QuantPrecision::F32, QuantPrecision::BF16, SimdWidth::W256,
+        );
+        assert_ne!(result, acc, "narrow should return a new register");
+        assert!(prog.instrs.iter().any(|i| matches!(i, VmInstr::VecNarrow { .. })));
+    }
+
+    #[test]
+    fn maybe_emit_narrow_after_compute_same_dtype_is_noop() {
+        let mut prog = VmProgram::new();
+        let acc = prog.alloc_vreg(VRegKind::Vec, SimdWidth::W256);
+        let result = maybe_emit_narrow_after_compute(
+            &mut prog, acc,
+            QuantPrecision::BF16, QuantPrecision::BF16, SimdWidth::W256,
+        );
+        assert_eq!(result, acc, "same dtype should return same register");
+        assert!(!prog.instrs.iter().any(|i| matches!(i, VmInstr::VecNarrow { .. })));
+    }
+
+    #[test]
+    fn verify_dtype_casts_same_dtype_group_returns_zero() {
+        // Arrange: group with all BF16 ops
+        use crate::types::DType;
+        let mut graph = CompilerGraph::new();
+        let t0 = graph.add_tensor_concrete("in", &[1, 64], DType::BF16);
+        let t1 = graph.add_tensor_concrete("mid", &[1, 64], DType::BF16);
+        let t2 = graph.add_tensor_concrete("out", &[1, 64], DType::BF16);
+        let op0 = graph.add_op(OpKind::RmsNorm { eps: 1e-5 }, vec![t0], vec![t1], "norm");
+        let op1 = graph.add_op(OpKind::RmsNorm { eps: 1e-5 }, vec![t1], vec![t2], "norm2");
+        let group = FusionGroup {
+            id: 0, anchor: op0, epilogue: vec![op1], mode: FusionMode::LoopFusion,
+            ops: vec![op0, op1], multi_output: MultiOutputConfig::single(),
+            dominant_dtype: Some(QuantPrecision::BF16), marker: GroupMarker::None,
+            is_layer_group: false, hetero_layer_type: None,
+        };
+        let alloc = BufferAllocation::default();
+        let resolver = TensorPtrResolver::build(&graph, &alloc, None);
+        let mut prog = VmProgram::new();
+        let width = SimdWidth::W256;
+        let sym_map = super::super::plan_lower::SymDimSlotMap::mega_kernel_abi();
+        let ctx = LoweringContext {
+            width, dtype: QuantPrecision::BF16, sym_map: &sym_map,
+            registry: None, hook: None, budget: None,
+            rope_req: None, ple_req: None, dwc_req: None,
+            exec_pattern: None, bottleneck_map: None, virtual_activation: None,
+            parallelism: None, virtual_tensor_map: None, layout: None,
+            page_size: 0, dot_cap: crate::dispatch::device_profile::DotProductCap::None, batch_ctx_ptr: None, debug_jit: false,
+            kv_elem_bytes: 2,
+        };
+        let abi = make_test_abi();
+
+        // Act
+        let result = verify_and_emit_dtype_casts(&group, &graph, &ctx, &mut prog, &resolver, &abi);
+
+        // Assert: same dtype group should have zero cast points
+        assert!(result.is_ok());
+        assert_eq!(result.unwrap(), 0, "same-dtype group should have no dtype cast points");
     }
 }

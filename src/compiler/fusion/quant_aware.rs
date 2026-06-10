@@ -6,6 +6,7 @@
 //! ops need explicit cast insertion at group boundaries.
 
 use crate::quant::QuantType;
+use crate::compiler::trace::QuantPrecision;
 
 /// Fusion decision for quant-aware analysis.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -122,6 +123,68 @@ pub fn select_fusion_groups(
     }
     groups.push((group_start, op_quant_types.len(), group_qt));
     groups
+}
+
+/// REQ-DTYPE-003: 检测 widen→compute→narrow→widen 链，返回应合并的融合组对。
+///
+/// 当相邻融合组形成 widen→compute→narrow→widen 模式时，中间的 narrow→widen
+/// 是冗余的（F32→BF16→F32），应将两个组合并为 widen→compute→narrow，
+/// 消除不必要的精度转换。
+///
+/// 参数 `group_dtypes` 是每个融合组的 dominant_dtype 列表。
+/// 返回值是应合并的 (left_group_idx, right_group_idx) 对列表。
+pub fn detect_widen_narrow_chains(
+    group_dtypes: &[Option<QuantPrecision>],
+) -> Vec<(usize, usize)> {
+    use crate::compiler::trace::QuantPrecision;
+
+    let mut merges = Vec::new();
+    if group_dtypes.len() < 2 {
+        return merges;
+    }
+
+    for i in 0..group_dtypes.len() - 1 {
+        let left = group_dtypes[i];
+        let right = group_dtypes[i + 1];
+
+        // 检测 narrow→widen 模式：
+        // left 组的 dominant dtype > right 组的 dominant dtype
+        // 即 left 输出窄 dtype (BF16)，right 输入也窄 dtype (BF16)
+        // 但中间经过 F32 计算 → 形成 BF16→F32→BF16 冗余链
+        match (left, right) {
+            (Some(QuantPrecision::F32), Some(QuantPrecision::BF16)) |
+            (Some(QuantPrecision::F32), Some(QuantPrecision::F16)) => {
+                // F32→BF16/F16 narrowing at boundary
+                // 检查下一个边界是否是 widening（BF16/F16→F32）
+                if i + 2 < group_dtypes.len() {
+                    if let Some(next_next) = group_dtypes[i + 2] {
+                        if next_next.elem_bytes() > right.unwrap().elem_bytes() {
+                            // 完整链: F32→BF16→F32 (narrow→widen)
+                            // 合并 i+1 和 i+2 为一组
+                            merges.push((i + 1, i + 2));
+                        }
+                    }
+                }
+            }
+            (Some(QuantPrecision::BF16), Some(QuantPrecision::F32)) |
+            (Some(QuantPrecision::F16), Some(QuantPrecision::F32)) => {
+                // BF16/F16→F32 widening at boundary
+                // 检查前一个边界是否是 narrowing
+                if i > 0 {
+                    if let Some(prev_prev) = group_dtypes[i - 1] {
+                        if prev_prev.elem_bytes() > left.unwrap().elem_bytes() {
+                            // 完整链: F32→BF16→F32 (narrow→widen)
+                            // 合并 i-1 和 i 为一组
+                            merges.push((i - 1, i));
+                        }
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+
+    merges
 }
 
 #[cfg(test)]
@@ -266,5 +329,59 @@ mod tests {
         let groups = select_fusion_groups(&ops);
         // Q4_0→None fuses (quant output → unquant fuses), then None→Q6K splits
         assert!(groups.len() >= 2, "should split at Q6K boundary");
+    }
+
+    // ── REQ-DTYPE-003: widen-narrow chain detection tests ──
+
+    #[test]
+    fn detect_widen_narrow_chain_f32_bf16_f32() {
+        // F32 → BF16 → F32 pattern: should detect merge at (1, 2)
+        let dtypes = vec![
+            Some(QuantPrecision::F32),
+            Some(QuantPrecision::BF16),
+            Some(QuantPrecision::F32),
+        ];
+        let merges = detect_widen_narrow_chains(&dtypes);
+        assert!(!merges.is_empty(), "should detect F32→BF16→F32 chain");
+        // The merge should be for the BF16→F32 boundary
+        assert!(merges.iter().any(|&(l, r)| l == 1 && r == 2),
+            "expected merge at (1, 2), got {:?}", merges);
+    }
+
+    #[test]
+    fn detect_widen_narrow_chain_no_chain_same_dtype() {
+        // BF16 → BF16 → BF16: no chain
+        let dtypes = vec![
+            Some(QuantPrecision::BF16),
+            Some(QuantPrecision::BF16),
+            Some(QuantPrecision::BF16),
+        ];
+        let merges = detect_widen_narrow_chains(&dtypes);
+        assert!(merges.is_empty(), "same-dtype chain should have no merges");
+    }
+
+    #[test]
+    fn detect_widen_narrow_chain_empty() {
+        let merges = detect_widen_narrow_chains(&[]);
+        assert!(merges.is_empty());
+    }
+
+    #[test]
+    fn detect_widen_narrow_chain_single_group() {
+        let dtypes = vec![Some(QuantPrecision::F32)];
+        let merges = detect_widen_narrow_chains(&dtypes);
+        assert!(merges.is_empty(), "single group cannot form a chain");
+    }
+
+    #[test]
+    fn detect_widen_narrow_chain_f16_variant() {
+        // F32 → F16 → F32 pattern
+        let dtypes = vec![
+            Some(QuantPrecision::F32),
+            Some(QuantPrecision::F16),
+            Some(QuantPrecision::F32),
+        ];
+        let merges = detect_widen_narrow_chains(&dtypes);
+        assert!(!merges.is_empty(), "should detect F32→F16→F32 chain");
     }
 }

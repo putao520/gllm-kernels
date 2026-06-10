@@ -18,7 +18,7 @@ use crate::types::DType;
 /// §0.2.3 一个 CompilerGraph 张量在运行时的物理位置分类。
 ///
 /// R3 BufferAllocation 输出 — 在 buffer 分配阶段一次性推导，
-/// Phase 3 codegen 直接消费，无需独立推导逻辑。
+/// ISA Lowering codegen 直接消费，无需独立推导逻辑。
 #[derive(Debug, Clone, Copy)]
 pub enum TensorPtrSource {
     /// graph.inputs[0] — ABI activation arg。
@@ -104,7 +104,7 @@ pub struct BufferAllocation {
     /// R2: Tensors skipped because they are virtual (no physical buffer needed).
     pub skipped_virtual: HashSet<TensorId>,
     /// §0.2.3 R3: Tensor → 物理位置分类 (Activation/Weight/Intermediate/Output)
-    /// 在 buffer 分配阶段一次性推导，Phase 3 codegen 直接消费。
+    /// 在 buffer 分配阶段一次性推导，ISA Lowering codegen 直接消费。
     pub tensor_sources: HashMap<TensorId, TensorPtrSource>,
 }
 
@@ -483,7 +483,7 @@ pub fn allocate_buffers_aligned(
     }
 
     // R3: Build tensor source classification (§0.2.3 虚拟内存)
-    // Phase 3 codegen 直接消费, 无需独立推导。
+    // ISA Lowering codegen 直接消费, 无需独立推导。
     let tensor_sources = build_tensor_sources(graph, &slots, &activation_tids, activation_buffer_size, vam);
 
     BufferAllocation {

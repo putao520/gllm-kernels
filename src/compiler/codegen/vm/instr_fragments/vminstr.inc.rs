@@ -28,6 +28,15 @@ pub enum VmInstr {
         src_dtype: crate::compiler::trace::QuantPrecision,
         width: SimdWidth,
     },
+    /// 向量宽化: dst = widen(src) (REQ-DTYPE-003)
+    ///将窄 dtype 的向量宽化为宽 dtype（如 BF16→F32）。
+    VecWiden {
+        dst: VRegId,
+        src: VRegId,
+        dst_dtype: crate::compiler::trace::QuantPrecision,
+        src_dtype: crate::compiler::trace::QuantPrecision,
+        width: SimdWidth,
+    },
     /// 标量广播到 SIMD 向量: dst = broadcast(scalar)
     Broadcast {
         dst: VRegId,
@@ -491,7 +500,7 @@ pub enum VmInstr {
     },
 
     /// §20 BCI: 如果 ptr 寄存器非 NULL，跳转到 target_label。
-    /// 用于 Phase 0 → Phase 1.Legacy / Batch 分支。
+    /// 用于 ABI prologue → outer loop setup Legacy / Batch 分支。
     /// x86 lower: test ptr, ptr; jnz target_label
     BranchIfPtrNonNull {
         ptr: VRegId,
@@ -831,25 +840,6 @@ pub enum VmInstr {
         bytes: usize,
     },
 
-    /// JMP table: 根据 output_mode_selector 分发到不同尾部路径。
-    ///
-    /// Phase 4.5 — forward pass 完成后，selector 值决定走哪条尾部路径：
-    ///   0 → Generate (argmax → store → check → loop)
-    ///   1 → ClassifyBinary (写 logits → BreakLoop)
-    ///   2 → ClassifyMultiway (写 logits → BreakLoop)
-    ///   3 → EncodeToLayer (pool hidden → BreakLoop)
-    ///
-    /// x86 lower: MOV + CMP(selector, 0) + JE path_0 + CMP + JE path_1 + ...
-    /// 最后一个 path 为 default (fall-through)。
-    OutputModeDispatch {
-        /// output_mode_selector 值的 GPR (Ptr → u32，从 [rbp+80] 加载)
-        selector: VRegId,
-        /// 每种 mode 对应的路径起始指令索引。
-        /// paths[0] = Generate 路径起始, paths[1] = ClassifyBinary, ...
-        /// 由 compile_mega_kernel_vm Phase 4.5 填充。
-        paths: Vec<usize>,
-    },
-
     /// 跳出 generate loop 到函数 epilogue。
     ///
     /// 用于所有输出模式的退出路径:
@@ -923,7 +913,7 @@ pub enum VmInstr {
     },
     /// 标记代码位置 (供 JMP table 的目标 label)。
     ///
-    /// compile_mega_kernel_vm Phase 4.5 在每条输出模式路径起始处插入 MarkLabel。
+    /// compile_mega_kernel_vm output redirect 在每条输出模式路径起始处插入 MarkLabel。
     /// x86 lower: create_label() + set_label() — 下一条指令即路径入口。
     MarkLabel {
         label_id: usize,
@@ -1633,7 +1623,7 @@ pub enum VmInstr {
     // ── Layer 6: JIT Debug Instrumentation ──
 
     /// 软件断点 — 生成 INT3 (0xCC)，DAP attach 后在此暂停。
-    /// 仅当 MegaKernelBusinessConfig.debug_jit=true 时插入。
+    /// 仅当 CompileConfig.debug_jit=true 时插入。
     DebugBreakpoint {
         /// 断点标签（如 "embed_done", "L0_qkv_start"）
         label: String,

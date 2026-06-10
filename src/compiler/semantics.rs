@@ -720,7 +720,7 @@ mod tests {
     #[test]
     fn test_arithmetic_intensity_zero_for_pure_memory_ops() {
         // Pure memory/data-movement ops should have zero arithmetic intensity
-        assert_eq!(arithmetic_intensity(&OpKind::Gather { table_rows: 32000, embed_dim: 4096, index_dim: SymDim::Concrete(1), indices_kind: crate::compiler::graph::GatherIndicesKind::Tensor }, DType::F32), 0.0);
+        assert_eq!(arithmetic_intensity(&OpKind::Gather { table_rows: 32000, embed_dim: 4096, index_dim: SymDim::Concrete(1), indices_kind: crate::compiler::graph::GatherIndicesKind::Tensor, scale: None }, DType::F32), 0.0);
         assert_eq!(arithmetic_intensity(&OpKind::Reshape { target_shape: vec![1, 4096] }, DType::F32), 0.0);
         assert_eq!(arithmetic_intensity(&OpKind::Transpose { perm: vec![0, 2, 1, 3] }, DType::F32), 0.0);
     }

@@ -368,7 +368,7 @@ impl CompilerGraph {
 
         g.inputs = vec![input, w_norm1, w_q, w_k, w_v, w_o, w_norm2, w_gate, w_up, w_down, cos_sin];
 
-        // ── Phase 1: Attention ──
+        // ── Attention section ──
 
         // RmsNorm₁
         let normed1 = g.add_tensor_concrete("normed1", &[b, h], dt);
@@ -432,7 +432,7 @@ impl CompilerGraph {
         //   Q·K^T : [seq_len, head_dim] × [head_dim, seq_len] → [seq_len, seq_len]
         //   A·V   : [seq_len, seq_len] × [seq_len, head_dim] → [seq_len, head_dim]
         // Multi-head parallelism is implicit (num_heads independent heads).
-        // Phase 2 fusion will expand this into FlashAttention tiling.
+        // Fusion will expand this into FlashAttention tiling.
         let attn_scores = g.add_tensor_concrete("attn_scores", &[b, ir.num_heads, b], dt);
         g.add_op(
             OpKind::Gemm { m: SymDim::Concrete(b), n: b, k: ir.head_dim, dtype: dt, trans_b: false },
@@ -475,7 +475,7 @@ impl CompilerGraph {
             "residual_1",
         );
 
-        // ── Phase 2: FFN ──
+        // ── FFN section ──
 
         // RmsNorm₂
         let normed2 = g.add_tensor_concrete("normed2", &[b, h], dt);
@@ -581,7 +581,7 @@ impl CompilerGraph {
             w_norm2, w_norm2_b, w_up, w_down,
         ];
 
-        // ── Phase 1: Attention ──
+        // ── Attention section ──
 
         // LayerNorm₁ (with bias, unlike RmsNorm)
         let normed1 = g.add_tensor_concrete("normed1", &[seq, h], dt);
@@ -653,7 +653,7 @@ impl CompilerGraph {
             "residual_1",
         );
 
-        // ── Phase 2: FFN ──
+        // ── FFN section ──
 
         // LayerNorm₂
         let normed2 = g.add_tensor_concrete("normed2", &[seq, h], dt);
@@ -700,7 +700,7 @@ impl CompilerGraph {
             "residual_2",
         );
 
-        // ── Phase 3: Pooling + Normalization ──
+        // ── Pooling + Normalization section ──
 
         // Mean pooling across sequence dimension → [1, H]
         let pooled = g.add_tensor_concrete("pooled", &[1, h], dt);

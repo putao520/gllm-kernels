@@ -6,7 +6,7 @@ use super::vm_state::AbiPtrs;
 use super::plan_lower::{
     LoweringContext, SymDimSlotMap, TensorPtrResolver,
     emit_fusion_groups, compute_rope_requirement, compute_ple_requirement,
-    compute_dwc_requirement, graph_dtype, maybe_debug_bp,
+    compute_dwc_requirement, graph_dtype, kv_cache_elem_bytes, maybe_debug_bp,
 };
 
 use crate::compiler::codegen::RopeCacheRequirement;
@@ -914,7 +914,7 @@ pub fn decode_fusion_params(profile: &crate::compiler::hardware_profile::Hardwar
 /// 1. MegaKernelFn ABI parameter loading
 /// 2. Generate loop (LoopBegin)
 /// 3. Per-iteration input_ptr computation
-/// 4. Forward pass (embed → N layers → lm_head) via emit_fusion_groups
+/// 4. Forward pass (embed → N layers → logits producer) via emit_fusion_groups
 /// 5. Argmax + StoreToken + CheckStopCondition
 /// 6. Generate loop end (LoopEnd)
 ///
@@ -927,26 +927,28 @@ pub fn compile_mega_kernel_vm(
     registry: Option<&ScalarOpRegistry>,
     profile: &IsaProfile,
     hook: Option<&dyn super::isa_hook::IsaHook>,
-    vocab_size: usize,
-    buffer_layout: &crate::compiler::mega_kernel_abi::MegaKernelBufferLayout,
+    buffer_layout: &crate::compiler::mega_kernel_abi::BufferLayout,
     bottleneck_map: Option<&OpBottleneckMap>,
     virtual_activation: Option<&VirtualActivationMap>,
     virtual_tensor_map: Option<&VirtualTensorMap>,
     layout: Option<&crate::compiler::layout_negotiator::LayoutAssignment>,
     debug_jit: bool,
-    mtp_config: Option<&MtpKernelConfig>,
+    _mtp_config_removed: Option<&MtpKernelConfig>,
     resource_plan: Option<&GraphResourcePlan>,
-    needs_kv_for_decode: bool,
-    is_encoder: bool,
+    topology: super::topology::GraphTopologyAnalysis,
 ) -> Result<(VmProgram, Option<RopeCacheRequirement>, usize), CompilerError> {
     use crate::compiler::mega_kernel_abi::MEGA_KERNEL_STACK_OFFSETS;
+
+    // vocab_size 从图拓扑推导（OpKind::Argmax { vocab_size }），不作为外部参数。
+    // 无 Argmax 的图 vocab_size=0：不分配 logits buffer，不 emit 采样管线。
+    let vocab_size = topology.vocab_size.unwrap_or(0);
 
     let _ = resource_plan;
     let width = profile.optimal_simd_width();
     let sym_map = SymDimSlotMap::mega_kernel_abi();
     let mut prog = VmProgram::new();
 
-    // ── Phase 0: Load MegaKernelFn ABI parameters ──
+    // ── ABI prologue: Load MegaKernelFn ABI parameters ──
     let input_ids_ptr = prog.alloc_vreg(VRegKind::Ptr, SimdWidth::Scalar);
     let weight_ptr = prog.alloc_vreg(VRegKind::Ptr, SimdWidth::Scalar);
 
@@ -962,18 +964,18 @@ pub fn compile_mega_kernel_vm(
     prog.emit(VmInstr::LoadPtr { dst: scratchpad_ptr, src: PtrExpr::StackArg(MEGA_KERNEL_STACK_OFFSETS[1]) }); // scratchpad_ptr → [rbp+24]
     prog.emit(VmInstr::LoadPtr { dst: prompt_len_vreg, src: PtrExpr::StackArg(MEGA_KERNEL_STACK_OFFSETS[0]) }); // prompt_len → [rbp+16]
 
-    // ── Phase 0.5: Load batch_ctx_ptr (ABI arg 16) + branch to batch mode if non-NULL (SPEC/20 BCI-002/003) ──
+    // ── ForwardPhaseDispatch: Load batch_ctx_ptr (ABI arg 16) + branch to batch mode if non-NULL (SPEC/20 BCI-002/003) ──
     let batch_ctx_ptr = prog.alloc_vreg(VRegKind::Ptr, SimdWidth::Scalar);
-    prog.emit(VmInstr::LoadPtr { dst: batch_ctx_ptr, src: PtrExpr::StackArg(MEGA_KERNEL_STACK_OFFSETS[16]) });
-    // If batch_ctx_ptr != NULL → jump to BATCH_MODE label (Phase 2/3 batch logic, to be implemented)
-    // NULL → fall through to Phase 1.Legacy (current single-seq behavior, zero overhead)
+    prog.emit(VmInstr::LoadPtr { dst: batch_ctx_ptr, src: PtrExpr::StackArg(MEGA_KERNEL_STACK_OFFSETS[15]) });
+    // If batch_ctx_ptr != NULL → jump to BATCH_MODE label (iteration setup/seq_len derivation batch logic, to be implemented)
+    // NULL → fall through to outer loop setup.Legacy (current single-seq behavior, zero overhead)
     const BATCH_MODE_LABEL: usize = 100; // label ID for batch mode entry
     prog.emit(VmInstr::BranchIfPtrNonNull { ptr: batch_ctx_ptr, target_label: BATCH_MODE_LABEL });
 
     // seq_len=1 is SymDim::Concrete(1) — no runtime slot needed.
     // Old code wrote to [rbp+104] (caller's stack frame!) which caused heap corruption.
 
-    // ── Phase 1: Compute derived values ──
+    // ── outer loop setup: Compute derived values ──
     // prompt_len_bytes = prompt_len * sizeof(u32) = prompt_len << 2
     // IMPORTANT: compute prompt_len_bytes BEFORE loading output_tokens_ptr,
     // otherwise RegAllocator may reuse the same physical register and clobber prompt_len.
@@ -991,12 +993,12 @@ pub fn compile_mega_kernel_vm(
     let input_base = prog.alloc_vreg(VRegKind::Ptr, SimdWidth::Scalar);
     prog.emit(VmInstr::LoadPtr { dst: input_base, src: PtrExpr::VRegPlusConst(input_ids_ptr, 0) });
 
-    // ── Phase 1.5: Compute logits scratch offset ──
+    // ── Logits scratch offset: Compute buffer layout for sampling pipeline ──
     // CRITICAL: logits must be placed AFTER all intermediate tensors and RoPE cache
-    // to avoid overlap with BufferAllocation (which uses SYMDIM_MAX_SEQ_LEN for sizing).
+    // to avoid overlap with BufferAllocation (which uses graph.max_seq_len for sizing).
     // Using buffer_layout.logits_offset causes memory corruption because that offset
     // is computed with config.max_seq_len (128) while BufferAllocation uses
-    // SYMDIM_MAX_SEQ_LEN (2048) — the logits region lands inside intermediate space.
+    // graph.max_seq_len — the logits region lands inside intermediate space.
     let rope_req = compute_rope_requirement(plan, graph, alloc)?;
     let ple_req = compute_ple_requirement(plan, graph, alloc, rope_req.as_ref())?;
     let dwc_req = compute_dwc_requirement(plan, graph, alloc, rope_req.as_ref(), ple_req.as_ref())?;
@@ -1012,15 +1014,21 @@ pub fn compile_mega_kernel_vm(
         (after_rope + 63) & !63
     };
 
-    // output_ptr = scratchpad + logits_scratch_offset (after intermediates + RoPE cache)
+    // output_ptr: where the graph's final output tensor is written.
+    // Generate graphs: scratchpad + logits_scratch_offset (sampling pipeline reads logits from there).
+    // Non-generate graphs: output_tokens_ptr (caller-provided output buffer, ABI arg 8).
     let output_ptr = prog.alloc_vreg(VRegKind::Ptr, SimdWidth::Scalar);
-    prog.emit(VmInstr::LoadPtr { dst: output_ptr, src: PtrExpr::VRegPlusConst(scratchpad_ptr, logits_scratch_offset) });
+    if topology.has_generate_loop {
+        prog.emit(VmInstr::LoadPtr { dst: output_ptr, src: PtrExpr::VRegPlusConst(scratchpad_ptr, logits_scratch_offset) });
+    } else {
+        prog.emit(VmInstr::LoadPtr { dst: output_ptr, src: PtrExpr::StackArg(MEGA_KERNEL_STACK_OFFSETS[2]) });
+    }
 
 
-    // ── Phase 2: Unified prefill + generate loop ──
+    // ── iteration setup: Unified prefill + generate loop ──
     // Total iterations = (prompt_len - 1) + max_new_tokens
     //   Iterations 0..prompt_len-2: prefill (embed + layers, no sampling)
-    //   Iterations prompt_len-1..end: generate (embed + layers + lm_head + sampling + store)
+    //   Iterations prompt_len-1..end: generate (embed + layers + logits producer + sampling + store)
     // This ensures the KV cache is populated for all prompt tokens before decoding starts.
     let gen_counter = prog.alloc_vreg(VRegKind::Counter, SimdWidth::Scalar);
     let gen_byte_offset = prog.alloc_vreg(VRegKind::ByteOffset, SimdWidth::Scalar);
@@ -1045,14 +1053,13 @@ pub fn compile_mega_kernel_vm(
     let decode_counter = prog.alloc_vreg(VRegKind::Counter, SimdWidth::Scalar);
     prog.emit(VmInstr::GprLoadImm { dst: decode_counter, value: 0 });
 
-    // ── Phase 2: Unified prefill + generate loop ──
-    // For encoder models: single iteration with M=prompt_len (all tokens at once).
-    // For decoder models: total_iters = (prompt_len - 1) + max_new_tokens iterations,
-    //   processing tokens one at a time (prefill then generate).
-    let loop_bound = if is_encoder {
-        BoundExpr::Const(1)
-    } else {
-        BoundExpr::DynamicVReg(total_iters)
+    // ── iteration setup: Unified prefill + generate loop ──
+    // 无 Argmax 的图（pool/classify/encode）: 单遍，M=prompt_len。
+    // 含 Argmax 的图（generate）: total_iters = (prompt_len - 1) + max_new_tokens，
+    //   逐 token 处理（prefill 后 generate）。
+    let loop_bound = match topology.outer_loop_bound {
+        super::topology::TopologyBound::Const(n) => BoundExpr::Const(n),
+        super::topology::TopologyBound::DynamicTotalIters => BoundExpr::DynamicVReg(total_iters),
     };
 
     prog.emit(VmInstr::LoopBegin {
@@ -1062,17 +1069,17 @@ pub fn compile_mega_kernel_vm(
         step_bytes: 4,
     });
 
-    // ── Phase 3: Compute per-iteration input_ptr ──
-    // Encoder: full input_ids (all tokens processed in one pass).
-    // Decoder: single token at current position.
+    // ── input pointer computation: Compute per-iteration input_ptr ──
+    // 无 Argmax 的图: 全量 input_ids（所有 token 一次处理）。
+    // 含 Argmax 的图: 当前位置的单一 token。
     let gen_input_ptr = prog.alloc_vreg(VRegKind::Ptr, SimdWidth::Scalar);
-    if is_encoder {
-        prog.emit(VmInstr::LoadPtr { dst: gen_input_ptr, src: PtrExpr::VRegPlusConst(input_base, 0) });
-    } else {
+    if topology.has_generate_loop {
         prog.emit(VmInstr::LoadPtr { dst: gen_input_ptr, src: PtrExpr::VRegPlusVReg(input_base, gen_byte_offset) });
+    } else {
+        prog.emit(VmInstr::LoadPtr { dst: gen_input_ptr, src: PtrExpr::VRegPlusConst(input_base, 0) });
     }
 
-    // ── Phase 3.1: Reload scratchpad_ptr from ABI stack slot ──
+    // ── Loop-carried reload: Reload scratchpad_ptr from ABI stack slot ──
     // ARCH-REGALLOC-LOOP-RELOAD: scratchpad_ptr (v2) may be spilled to a stack slot
     // that gets overwritten by the massive register pressure in mega-kernel loops
     // (2700+ spill slots). Reloading from the ABI stack argument at each iteration
@@ -1082,12 +1089,19 @@ pub fn compile_mega_kernel_vm(
         dst: scratchpad_reloaded,
         src: PtrExpr::StackArg(MEGA_KERNEL_STACK_OFFSETS[1]),
     });
-    // Also reload output_ptr = scratchpad + logits_offset
+    // Also reload output_ptr: generate graphs from scratchpad, non-generate from ABI stack
     let output_reloaded = prog.alloc_vreg(VRegKind::Ptr, SimdWidth::Scalar);
-    prog.emit(VmInstr::LoadPtr {
-        dst: output_reloaded,
-        src: PtrExpr::VRegPlusConst(scratchpad_reloaded, logits_scratch_offset),
-    });
+    if topology.has_generate_loop {
+        prog.emit(VmInstr::LoadPtr {
+            dst: output_reloaded,
+            src: PtrExpr::VRegPlusConst(scratchpad_reloaded, logits_scratch_offset),
+        });
+    } else {
+        prog.emit(VmInstr::LoadPtr {
+            dst: output_reloaded,
+            src: PtrExpr::StackArg(MEGA_KERNEL_STACK_OFFSETS[2]),
+        });
+    }
     // ARCH-REGALLOC-LOOP-RELOAD: weight_ptr must also be reloaded. With 9000+ spill
     // slots, the original weight VReg's spill slot can be corrupted by intermediate
     // ops. Reload from the prologue-saved rsi slot (AbiArg 1 = weight_blob_ptr).
@@ -1107,8 +1121,8 @@ pub fn compile_mega_kernel_vm(
         src: PtrExpr::AbiArg(0), // input_ids_ptr (rdi, saved in prologue abi_save_area)
     });
 
-    // ── Phase 4: Forward pass (embed → N layers → lm_head) ──
-    // (rope_req, ple_req, dwc_req already computed in Phase 1.5 above)
+    // ── layer loop + fusion groups: Forward pass (embed → N 个同构子结构 → logits producer) ──
+    // (rope_req, ple_req, dwc_req already computed in logits scratch offset section above)
 
     let needs_scratch = alloc.total_bytes > 0 || ple_req.is_some() || dwc_req.is_some() || plan.groups.iter().any(|g| matches!(&g.mode,
         FusionMode::NormIntoGemm | FusionMode::QkvSharedInput | FusionMode::FFNBlock { .. }
@@ -1116,7 +1130,7 @@ pub fn compile_mega_kernel_vm(
         | FusionMode::CrossLayerResidual { .. } | FusionMode::FusedQkvNormRope { .. }
     ));
 
-    let mut resolver = TensorPtrResolver::build(graph, alloc);
+    let mut resolver = TensorPtrResolver::build(graph, alloc, Some(&topology));
 
     let original_weight_vreg = Some(weight_reloaded);
 
@@ -1125,25 +1139,29 @@ pub fn compile_mega_kernel_vm(
     // mega-kernel output region starts at abi.output_ptr (= scratchpad + logits_offset).
     // Redirect the final output tensor to Output { offset: 0 } so it writes directly
     // to the region that Rust reads from.
-    if let Some(lm_head_op) = graph.ops.iter().find(|op| op.label == "lm_head") {
-        // Decoder: lm_head GEMM writes logits to output region
-        if let Some(&logits_tid) = lm_head_op.outputs.first() {
-            resolver.override_source(logits_tid, TensorPtrSource::Output { offset: 0 });
-        }
+    //
+    // 拓扑驱动：logits 产出者的 output tensor 重定向到 output buffer。
+    // 替代旧代码中的 `find(|op| op.label == "lm_head")` label 约定搜索。
+    if let Some(logits_tid) = topology.logits_output_tid {
+        // 有 logits producer 的图: logits producer 的 output 写入输出区
+        resolver.override_source(logits_tid, TensorPtrSource::Output { offset: 0 });
     } else if let Some(&output_tid) = graph.outputs.first() {
-        // Encoder/embedding: graph output (MeanPool/classifier result) writes to output region
+        // 无 logits producer 的图: 图输出（MeanPool/classifier 结果）写入输出区
         resolver.override_source(output_tid, TensorPtrSource::Output { offset: 0 });
     }
 
-    // ── Phase 3.5: Compute seq_len for this iteration ──
-    // Encoder: seq_len = prompt_len (all tokens processed in one pass).
-    // Decoder: seq_len = gen_counter + 1 (grows during prefill, stays at prompt_len for decode).
+    // ── seq_len derivation: Compute seq_len for this iteration ──
+    // 无 Argmax 的图: seq_len = prompt_len（所有 token 一次处理）。
+    // 含 Argmax 的图: seq_len = gen_counter + 1（prefill 时递增，decode 时恒定）。
     let decode_seq_len = prog.alloc_vreg(VRegKind::Scalar, SimdWidth::Scalar);
-    if is_encoder {
-        // Encoder: seq_len = prompt_len (copy from prompt_len_vreg)
-        prog.emit(VmInstr::GprBinOp { dst: decode_seq_len, a: prompt_len_vreg, b: GprOperand::Imm(0), op: GprOp::Add });
-    } else {
-        prog.emit(VmInstr::GprBinOp { dst: decode_seq_len, a: gen_counter, b: GprOperand::VReg(one_imm ), op: GprOp::Add });
+    match topology.seq_len_source {
+        super::topology::SeqLenSource::PromptLen => {
+            // 无 Argmax 的图: seq_len = prompt_len
+            prog.emit(VmInstr::GprBinOp { dst: decode_seq_len, a: prompt_len_vreg, b: GprOperand::Imm(0), op: GprOp::Add });
+        }
+        super::topology::SeqLenSource::LoopCounterPlusOne => {
+            prog.emit(VmInstr::GprBinOp { dst: decode_seq_len, a: gen_counter, b: GprOperand::VReg(one_imm ), op: GprOp::Add });
+        }
     }
 
     let mut current_abi = AbiPtrs {
@@ -1158,7 +1176,7 @@ pub fn compile_mega_kernel_vm(
         scratch_ptr: if needs_scratch { Some(scratchpad_reloaded) } else { None },  // Reloaded each iteration
         gen_loop_counter: Some(gen_counter),
         layer_loop_counter: None,
-        mega_decode_seq_len: Some(decode_seq_len),
+        mega_decode_seq_len: if topology.has_generate_loop { Some(decode_seq_len) } else { None },
         hook_ctx_ptr: {
             let hook_ptr = prog.alloc_vreg(VRegKind::Ptr, SimdWidth::Scalar);
             prog.emit(VmInstr::LoadPtr {
@@ -1179,12 +1197,7 @@ pub fn compile_mega_kernel_vm(
                 .and_then(|d| d.as_concrete());
             match sg_hidden_dim {
                 Some(hdim) => {
-                    let vocab_bytes = graph.tensors.iter()
-                        .find(|t| t.name == "logits")
-                        .and_then(|t| t.shape.last())
-                        .and_then(|d| d.as_concrete())
-                        .map(|v| v * 4)
-                        .unwrap_or(0);
+                    let vocab_bytes = vocab_size * 4;
                     let sampling_bytes = vocab_bytes * 4;
                     let off = (logits_scratch_offset + vocab_bytes + sampling_bytes + 63) & !63;
                     Some(off)
@@ -1201,12 +1214,7 @@ pub fn compile_mega_kernel_vm(
                 .and_then(|d| d.as_concrete());
             match sg_hidden_dim {
                 Some(hdim) => {
-                    let vocab_bytes = graph.tensors.iter()
-                        .find(|t| t.name == "logits")
-                        .and_then(|t| t.shape.last())
-                        .and_then(|d| d.as_concrete())
-                        .map(|v| v * 4)
-                        .unwrap_or(0);
+                    let vocab_bytes = vocab_size * 4;
                     let sampling_bytes = vocab_bytes * 4;
                     let detect_off = (logits_scratch_offset + vocab_bytes + sampling_bytes + 63) & !63;
                     let off = detect_off + hdim * 4;
@@ -1251,15 +1259,10 @@ pub fn compile_mega_kernel_vm(
         },
         kv_load_mode: graph.kv_load_mode,
         kv_cache_ptr: {
-            let has_mha = graph.ops.iter().any(|op| {
-                matches!(op.kind, OpKind::MultiHeadAttention { .. })
-            });
-            // Encoder/embedding models (EncodeToLayer/Classify*) have MHA ops but
-            // never decode, so they don't need persistent KV cache. When
-            // needs_kv_for_decode is false, skip loading kv_cache_ptr entirely —
-            // the MHA lowering falls through to using K/V projection pointers
-            // directly (no KV store, no page-table lookup).
-            if has_mha && needs_kv_for_decode {
+            // 拓扑驱动: 图有 MHA ops → 加载 kv_cache_ptr。
+            // 无 Argmax 的图（EncodeToLayer/Classify*）有 MHA 也需要 KV cache
+            // （prefill 阶段 MHA 仍需 K/V 投影指针）。
+            if topology.has_mha {
                 let kv_ptr = prog.alloc_vreg(VRegKind::Ptr, SimdWidth::Scalar);
                 prog.emit(VmInstr::LoadPtr {
                     dst: kv_ptr,
@@ -1297,36 +1300,34 @@ pub fn compile_mega_kernel_vm(
         dot_cap: profile.dot_cap,
         batch_ctx_ptr: None, // ARCH-LEGACY-NO-BCI: legacy path is non-batch (v5=NULL at runtime).
         debug_jit,
+        kv_elem_bytes: kv_cache_elem_bytes(graph),
     };
+    let kv_eb = ctx.kv_elem_bytes;
+    let dtype_eb = ctx.dtype.elem_bytes();
+    if kv_eb != dtype_eb {
+        eprintln!("[DIAG-KV-DTYPE] kv_elem_bytes={} != dtype.elem_bytes={} — KV cache stride mismatch!", kv_eb, dtype_eb);
+    } else {
+        eprintln!("[DIAG-KV-DTYPE] kv_elem_bytes={} == dtype.elem_bytes={} — KV cache stride OK", kv_eb, dtype_eb);
+    }
 
     emit_fusion_groups(
         &mut prog, plan, graph, alloc, &ctx,
         rope_req.as_ref().map(|r| r.cache_offset),
-        &mut current_abi, original_weight_vreg, &resolver,
+        &mut current_abi, original_weight_vreg, &resolver, Some(&topology),
     )?;
 
-    // L6 debug: embed + all layers done, before output mode dispatch
+    // L6 debug: embed + all layers done, before sampling pipeline
     maybe_debug_bp(&mut prog, &ctx, "forward_pass_done");
 
-    // ── Phase 4.5: Output Mode JMP table ──
-    // Load output_mode_selector from [rbp+80]
-    let mode_selector = prog.alloc_vreg(VRegKind::Scalar, SimdWidth::Scalar);
-    prog.emit(VmInstr::LoadPtr { dst: mode_selector, src: PtrExpr::StackArg(MEGA_KERNEL_STACK_OFFSETS[8]) }); // output_mode_selector → [rbp+80]
-
-    // Label IDs — SPEC §1.5.5 defines exactly 4 paths
-    const LABEL_GENERATE: usize = 0;
-    const LABEL_CLASSIFY_BINARY: usize = 1;
-    const LABEL_CLASSIFY_MULTIWAY: usize = 2;
-    const LABEL_ENCODE: usize = 3;
-
-    prog.emit(VmInstr::OutputModeDispatch {
-        selector: mode_selector,
-        paths: vec![LABEL_GENERATE, LABEL_CLASSIFY_BINARY, LABEL_CLASSIFY_MULTIWAY, LABEL_ENCODE],
-    });
+    // ── 采样管线 ──
+    // 编译时写死唯一路径：has_generate_loop 决定走采样还是直接退出。
+    // 不再需要运行时 JMP table（OutputModeDispatch 已删除）。
+    // Head Routing 场景编译多个 MegaKernel，每个 MegaKernel 走唯一路径。
+    let has_generate_loop = topology.has_generate_loop;
 
 
-    // ── .generate_path: Phase 5-7 ──
-    prog.emit(VmInstr::MarkLabel { label_id: LABEL_GENERATE });
+    // ── .generate_path: 采样管线 ──
+    if has_generate_loop {
 
     // ── Prefill/Generate branch ──
     // During prefill (gen_counter < prompt_len - 1), skip sampling and StoreToken.
@@ -1339,13 +1340,13 @@ pub fn compile_mega_kernel_vm(
         target_label: SKIP_SAMPLING_LABEL,
     });
 
-    // ── Phase 5: Sampling ──
+    // ── 采样: Argmax / Stochastic ──
     // GPU-Resident 采样管线: temperature==0 → argmax, temperature>0 → stochastic
     maybe_debug_bp(&mut prog, &ctx, "pre_sample");
     let vocab_bytes = vocab_size * ctx.dtype.elem_bytes(); // f32 logits
 
     // Argmax reads from row 0 of the logits region.
-    // The lm_head GEMV (M=1 decode) always writes its output to row 0
+    // The logits producer GEMV (M=1 decode) always writes its output to row 0
     // (Output { offset: 0 }), so sampling must read from the same row.
     let row_byte_offset = {
         let z = prog.alloc_vreg(VRegKind::Scalar, SimdWidth::Scalar);
@@ -1359,7 +1360,7 @@ pub fn compile_mega_kernel_vm(
     let fresh_logits_ptr = prog.alloc_vreg(VRegKind::Ptr, SimdWidth::Scalar);
     prog.emit(VmInstr::GprBinOp { dst: fresh_logits_ptr, a: logits_base, b: GprOperand::VReg(row_byte_offset ), op: GprOp::Add });
 
-    // ── Phase 5a: Load temperature, branch to argmax if T==0 ──
+    // ── 采样: Argmax（temperature == 0 时）──
     const ARGMAX_LABEL: usize = 200;
     const SAMPLING_DONE_LABEL: usize = 201;
 
@@ -1370,7 +1371,7 @@ pub fn compile_mega_kernel_vm(
     });
     prog.emit(VmInstr::BranchIfGprZero { value: temp_u32, target_label: ARGMAX_LABEL });
 
-    // ── Phase 5b: Stochastic sampling (T > 0) ──
+    // ── 采样: Stochastic（temperature > 0）──
     // TemperatureScale: logits[i] /= temperature
     let temp_ptr = prog.alloc_vreg(VRegKind::Ptr, SimdWidth::Scalar);
     prog.emit(VmInstr::LoadPtr { dst: temp_ptr, src: PtrExpr::StackArg(MEGA_KERNEL_STACK_OFFSETS[3]) });
@@ -1448,7 +1449,7 @@ pub fn compile_mega_kernel_vm(
     });
     prog.emit(VmInstr::UnconditionalBranch { target_label: SAMPLING_DONE_LABEL });
 
-    // ── Phase 5c: Argmax path (T == 0) ──
+    // ── 采样: Argmax 路径（T == 0）──
     prog.emit(VmInstr::MarkLabel { label_id: ARGMAX_LABEL });
     prog.emit(VmInstr::Argmax {
         dst: sampled_token, // reuse sampled_token for unified path
@@ -1459,7 +1460,7 @@ pub fn compile_mega_kernel_vm(
 
     prog.emit(VmInstr::MarkLabel { label_id: SAMPLING_DONE_LABEL });
 
-    // ── Phase 6: Store token ──
+    // ── 采样: Store token ──
     // decode_counter = gen_counter - (prompt_len - 1) = actual generated token index
     prog.emit(VmInstr::GprBinOp { dst: decode_counter, a: gen_counter, b: GprOperand::VReg(prompt_minus_1 ), op: GprOp::Sub });
     prog.emit(VmInstr::StoreToken {
@@ -1470,26 +1471,36 @@ pub fn compile_mega_kernel_vm(
         prompt_len_bytes,
     });
 
-    // ── Phase 6.5: MTP (Multi-Token Prediction) candidate token generation ──
+    // ── 采样: MTP（Multi-Token Prediction）候选 token 生成 ──
     // Route through TraceOp::MtpDraft → auto_select pipeline (MTP-001).
-    if let Some(mtp) = mtp_config {
+    if let Some(ref mtp) = topology.mtp_config {
         let MtpKernelConfig { depth, hidden_size, vocab_size: _mtp_vocab } = *mtp;
         let elem_bytes = ctx.dtype.elem_bytes();
-        let lm_head_bytes = vocab_size * hidden_size * elem_bytes;
+        // logits_producer_bytes 使用函数级 vocab_size（从拓扑推导）和 MTP hidden_size
+        let logits_producer_bytes = vocab_size * hidden_size * elem_bytes;
 
-        // Resolve MTP weight base: lm_head weight offset + lm_head size
-        let lm_head_blob_offset = graph.ops.iter()
-            .find(|op| op.label == "lm_head")
-            .and_then(|op| op.inputs.get(1))
+        // Resolve MTP weight base: logits producer weight offset + logits producer size
+        // 拓扑驱动：从 topology.logits_producer_op_idx 获取 logits producer op，
+        // 替代旧代码中的 `find(|op| op.label == "lm_head")` label 约定搜索。
+        let logits_producer_idx = topology.logits_producer_op_idx
+            .ok_or_else(|| CompilerError::CodegenViolation(
+                "MTP: cannot find logits producer op (no Argmax in graph)".into()
+            ))?;
+        let logits_producer_op = graph.ops.get(logits_producer_idx)
+            .ok_or_else(|| CompilerError::CodegenViolation(
+                "MTP: logits producer op index out of bounds".into()
+            ))?;
+
+        let logits_producer_blob_offset = logits_producer_op.inputs.get(1)
             .and_then(|&wid| resolver.source(wid))
             .and_then(|src| match src {
                 TensorPtrSource::Weight { offset } => Some(offset),
                 _ => None,
             })
             .ok_or_else(|| CompilerError::CodegenViolation(
-                "MTP: cannot find lm_head weight offset in resolver".into()
+                "MTP: cannot find logits producer weight offset in resolver".into()
             ))?;
-        let mtp_weights_base_offset = lm_head_blob_offset + lm_head_bytes;
+        let mtp_weights_base_offset = logits_producer_blob_offset + logits_producer_bytes;
         let mtp_weight_ptr = prog.alloc_vreg(VRegKind::Ptr, SimdWidth::Scalar);
         prog.emit(VmInstr::GprBinOp {
             dst: mtp_weight_ptr,
@@ -1498,12 +1509,9 @@ pub fn compile_mega_kernel_vm(
             op: GprOp::Add,
         });
 
-        // Resolve hidden pointer (lm_head's first input)
+        // Resolve hidden pointer (logits producer's first input)
         let (hidden_ptr_base, hidden_offset) = {
-            let lm_head_op = graph.ops.iter()
-                .find(|op| op.label == "lm_head")
-                .ok_or_else(|| CompilerError::CodegenViolation("MTP: lm_head op not found".into()))?;
-            let fn_tid = lm_head_op.inputs[0];
+            let fn_tid = logits_producer_op.inputs[0];
             let src = resolver.source(fn_tid)
                 .ok_or_else(|| CompilerError::CodegenViolation(
                     "MTP: final_normed tensor source not found".into()
@@ -1562,7 +1570,7 @@ pub fn compile_mega_kernel_vm(
         )?;
     }
 
-    // ── Phase 7: Check stop condition ──
+    // ── 采样: 检查停止条件 ──
     // Symbolic ABI refs: eos_token_id (arg 13), max_new_tokens (arg 12)
     let eos_value = prog.alloc_vreg(VRegKind::Scalar, SimdWidth::Scalar);
     prog.emit(VmInstr::LoadPtr {
@@ -1585,33 +1593,28 @@ pub fn compile_mega_kernel_vm(
     // ── SKIP_SAMPLING: prefill iterations land here (no sampling, no store) ──
     prog.emit(VmInstr::MarkLabel { label_id: SKIP_SAMPLING_LABEL });
 
-    // ── Phase 8: Generate loop end ──
+    // ── 生成循环结束 ──
     prog.emit(VmInstr::LoopEnd);
     // Return decode_counter + 1 as generated count (decode_counter is 0-indexed)
     let ret_count = prog.alloc_vreg(VRegKind::Scalar, SimdWidth::Scalar);
     prog.emit(VmInstr::GprBinOp { dst: ret_count, a: decode_counter, b: GprOperand::VReg(one_imm ), op: GprOp::Add });
     prog.emit(VmInstr::BreakLoop { return_value: ReturnValue::VReg(ret_count) });
 
-    // ── .classify_binary_path: WriteLogits(pos, neg) → BreakLoop(0) ──
-    // Logits already written to output buffer by lm_head GEMM.
-    // Classify modes read specific logit positions from the output buffer in Rust.
-    prog.emit(VmInstr::MarkLabel { label_id: LABEL_CLASSIFY_BINARY });
-    prog.emit(VmInstr::BreakLoop { return_value: ReturnValue::Const(0) });
+    } // end if has_generate_loop
 
-    // ── .classify_multiway_path: WriteLogits(label_0, ..., label_N) → BreakLoop(0) ──
-    prog.emit(VmInstr::MarkLabel { label_id: LABEL_CLASSIFY_MULTIWAY });
-    prog.emit(VmInstr::BreakLoop { return_value: ReturnValue::Const(0) });
-
-    // ── .encode_path: hidden state already in activation buffer → BreakLoop(0) ──
-    prog.emit(VmInstr::MarkLabel { label_id: LABEL_ENCODE });
-    prog.emit(VmInstr::BreakLoop { return_value: ReturnValue::Const(0) });
+    // 无 generate loop 的图: forward pass done → LoopEnd + BreakLoop(0)
+    // Const(1) 循环仅执行一次，LoopEnd 配对 LoopBegin 后 BreakLoop 返回。
+    if !has_generate_loop {
+        prog.emit(VmInstr::LoopEnd);
+        prog.emit(VmInstr::BreakLoop { return_value: ReturnValue::Const(0) });
+    }
 
     // ── .batch_mode_path: Batch mode entry (SPEC/20 BCI-003) ──
     // BranchIfPtrNonNull jumps here when batch_ctx_ptr != NULL.
     //
     // Batch Prefill: read total_prefill_tokens from batch_ctx[8],
     // set input_ptr to input_ids_flat_ptr from batch_ctx[16],
-    // run full forward pass (embed → N layers → lm_head) with M = total_prefill_tokens,
+    // run full forward pass (embed → N layers → logits producer) with M = total_prefill_tokens,
     // then return total_prefill_tokens to signal "prefill done, Rust handles decode."
     prog.emit(VmInstr::MarkLabel { label_id: BATCH_MODE_LABEL });
 
@@ -1624,7 +1627,7 @@ pub fn compile_mega_kernel_vm(
             offset: OffsetExpr::Const(8),
         });
 
-        // ── Phase 0.7: ForwardPhaseDispatch (SPEC 32 REQ-MKO-001) ──
+        // ── ForwardPhaseDispatch (SPEC 32 REQ-MKO-001) ──
         // Three-way dispatch:
         //   total_prefill_tokens == 0 → .decode_path (label 101)
         //   total_prefill_tokens <= PREFILL_CHUNK_THRESHOLD → .mixed_path (label 102)
@@ -1671,8 +1674,13 @@ pub fn compile_mega_kernel_vm(
 
         // Build batch prefill AbiPtrs — same weight/scratch/output as legacy path,
         // but input points to flat batch input_ids and seq_len = total_prefill_tokens.
+        // 拓扑驱动: generate 图用 scratchpad + logits_scratch_offset，非 generate 图用 output_tokens_ptr
         let batch_output_ptr = prog.alloc_vreg(VRegKind::Ptr, SimdWidth::Scalar);
-        prog.emit(VmInstr::LoadPtr { dst: batch_output_ptr, src: PtrExpr::VRegPlusConst(scratchpad_ptr, logits_scratch_offset) });
+        if topology.has_generate_loop {
+            prog.emit(VmInstr::LoadPtr { dst: batch_output_ptr, src: PtrExpr::VRegPlusConst(scratchpad_ptr, logits_scratch_offset) });
+        } else {
+            prog.emit(VmInstr::LoadPtr { dst: batch_output_ptr, src: PtrExpr::StackArg(MEGA_KERNEL_STACK_OFFSETS[2]) });
+        }
 
         // page_table_flat_ptr from batch_ctx + 40
         let batch_pt_ptr = {
@@ -1737,12 +1745,10 @@ pub fn compile_mega_kernel_vm(
         activation_pong_ptr: None,
         };
 
-        let mut batch_resolver = TensorPtrResolver::build(graph, alloc);
-        // Redirect logits output for batch (same as legacy path)
-        if let Some(lm_head_op) = graph.ops.iter().find(|op| op.label == "lm_head") {
-            if let Some(&logits_tid) = lm_head_op.outputs.first() {
-                batch_resolver.override_source(logits_tid, TensorPtrSource::Output { offset: 0 });
-            }
+        let mut batch_resolver = TensorPtrResolver::build(graph, alloc, Some(&topology));
+        // Redirect logits output for batch — topology-driven
+        if let Some(logits_tid) = topology.logits_output_tid {
+            batch_resolver.override_source(logits_tid, TensorPtrSource::Output { offset: 0 });
         }
 
         let batch_ctx = LoweringContext {
@@ -1768,23 +1774,25 @@ pub fn compile_mega_kernel_vm(
             dot_cap: profile.dot_cap,
             batch_ctx_ptr: Some(batch_ctx_ptr),
             debug_jit,
+            kv_elem_bytes: kv_cache_elem_bytes(graph),
         };
 
-        // Emit batch prefill forward pass: embed → N layers → lm_head
+        // Emit batch prefill forward pass: embed → N layers → logits producer
         // with M = total_prefill_tokens (via mega_decode_seq_len = batch_m).
         // GEMM/FFN/Norm are M-uniform — they just see a larger batch dimension.
         // Attention uses BatchSeqIdLookup for per-token seq_id → KV cache lookup.
         emit_fusion_groups(
             &mut prog, plan, graph, alloc, &batch_ctx,
             rope_req.as_ref().map(|r| r.cache_offset),
-            &mut batch_current_abi, Some(weight_ptr), &batch_resolver,
+            &mut batch_current_abi, Some(weight_ptr), &batch_resolver, Some(&topology),
         )?;
 
-        // ── Phase 2 post: Per-seq argmax on last token of each prompt (BCI-006) ──
+        // ── iteration setup post: Per-seq argmax on last token of each prompt (BCI-006) ──
         // Logits layout: [total_prefill_tokens, vocab_size] in row-major.
         // For seq s, last token row index = cumsum(prompt_lens)[s] - 1.
         // cumsum_acc tracks running sum of prompt_lens[0..seq).
-        {
+        // Only emit when vocab_size > 0 — no Argmax ops means no logits to sample from.
+        if vocab_size > 0 {
             let vocab_bytes = vocab_size * ctx.dtype.elem_bytes();
 
             // Read num_seqs from batch_ctx+0
@@ -1885,13 +1893,13 @@ pub fn compile_mega_kernel_vm(
                     *n = skip_count;
                 }
             });
-        }
+        } // end if vocab_size > 0 (per-seq argmax)
 
-        // ── Phase 3: Batch Decode Step Loop (SPEC/20 REQ-BCI-003) ──
+        // ── input pointer computation: Batch Decode Step Loop (SPEC/20 REQ-BCI-003) ──
         // After prefill + per-seq argmax, enter decode step loop.
-        // Structure: outer LoopBegin(max_decode_steps) → inner loops for scan/build/argmax → LoopEnd.
-        {
-            // ── Phase 0.7 decode entry: jump target when total_prefill_tokens == 0 (SPEC 32 REQ-MKO-001) ──
+        // Only emit when vocab_size > 0 (has Argmax ops). Without Argmax, no decode/sampling needed.
+        if vocab_size > 0 {
+            // ── ForwardPhaseDispatch decode entry: jump target when total_prefill_tokens == 0 (SPEC 32 REQ-MKO-001) ──
             prog.emit(VmInstr::MarkLabel { label_id: DECODE_ENTRY_LABEL });
             let vb = vocab_size * ctx.dtype.elem_bytes();
             let stride: usize = 64; // SEQ_META_STRIDE
@@ -2008,8 +2016,13 @@ pub fn compile_mega_kernel_vm(
 
             // ── Step 3d: Forward pass with M = num_active ──
             // Build decode AbiPtrs: same weights/scratch/output, but input = decode_input, M = num_active.
+            // 拓扑驱动: generate 图用 scratchpad + logits_scratch_offset，非 generate 图用 output_tokens_ptr
             let decode_output_ptr = prog.alloc_vreg(VRegKind::Ptr, SimdWidth::Scalar);
-            prog.emit(VmInstr::LoadPtr { dst: decode_output_ptr, src: PtrExpr::VRegPlusConst(scratchpad_ptr, logits_scratch_offset) });
+            if topology.has_generate_loop {
+                prog.emit(VmInstr::LoadPtr { dst: decode_output_ptr, src: PtrExpr::VRegPlusConst(scratchpad_ptr, logits_scratch_offset) });
+            } else {
+                prog.emit(VmInstr::LoadPtr { dst: decode_output_ptr, src: PtrExpr::StackArg(MEGA_KERNEL_STACK_OFFSETS[2]) });
+            }
 
             let mut decode_abi = AbiPtrs {
                 input_ptr: decode_input_ptr,
@@ -2034,7 +2047,7 @@ pub fn compile_mega_kernel_vm(
             emit_fusion_groups(
                 &mut prog, plan, graph, alloc, &batch_ctx,
                 rope_req.as_ref().map(|r| r.cache_offset),
-                &mut decode_abi, Some(weight_ptr), &batch_resolver,
+                &mut decode_abi, Some(weight_ptr), &batch_resolver, Some(&topology),
             )?;
 
             // ── Step 3e: Per-seq argmax + stop condition ──
@@ -2355,7 +2368,7 @@ pub fn compile_mega_kernel_vm(
 
             // Return total number of decode steps completed
             prog.emit(VmInstr::BreakLoop { return_value: ReturnValue::VReg(total_gen) });
-        }
+        } // end if vocab_size > 0
     }
 
     // Stage 1.5: 符号验证 — 与 compile_layer 对齐
@@ -2390,10 +2403,10 @@ pub fn compile_mega_kernel_vm(
     Ok((prog, rope_req, logits_scratch_offset))
 }
 
-/// Emit MTP candidate token generation (Phase 6.5).
+/// Emit MTP candidate token generation (采样管线内).
 ///
 /// For each MTP depth k=0..depth-1:
-/// 1. Compute weight pointer: weight_ptr + lm_head_end + k * proj_bytes
+/// 1. Compute weight pointer: weight_ptr + logits_producer_end + k * proj_bytes
 /// 2. GEMV: mtp_logits[k] = final_normed @ weight[k]^T
 /// 3. Argmax: candidate[k] = argmax(mtp_logits[k])
 /// 4. Store to output_tokens[max_new_tokens + decode_counter * depth + k]
@@ -2408,6 +2421,7 @@ fn emit_mtp_candidates(
     mtp: &MtpKernelConfig,
     logits_scratch_offset: usize,
     vocab_size: usize,
+    logits_producer_op_idx: Option<usize>,
     weight_ptr: VRegId,
     scratchpad_ptr: VRegId,
     output_tokens_ptr: VRegId,
@@ -2421,27 +2435,32 @@ fn emit_mtp_candidates(
     let hidden_bytes = hidden_size * elem_bytes;
     let proj_bytes = mtp_vocab * hidden_size * elem_bytes;
 
-    // Find lm_head weight blob offset to compute MTP weight start.
-    let lm_head_blob_offset = graph.ops.iter()
-        .find(|op| op.label == "lm_head")
-        .and_then(|op| op.inputs.get(1))
+    // Find logits producer weight blob offset to compute MTP weight start.
+    // 拓扑驱动：从 logits_producer_op_idx 获取，替代 label 搜索。
+    let logits_producer_idx = logits_producer_op_idx
+        .ok_or_else(|| CompilerError::CodegenViolation(
+            "MTP: cannot find logits producer op (no Argmax in graph)".into()
+        ))?;
+    let logits_producer_op = graph.ops.get(logits_producer_idx)
+        .ok_or_else(|| CompilerError::CodegenViolation(
+            "MTP: logits producer op index out of bounds".into()
+        ))?;
+
+    let logits_producer_blob_offset = logits_producer_op.inputs.get(1)
         .and_then(|&wid| resolver.source(wid))
         .and_then(|src| match src {
             TensorPtrSource::Weight { offset } => Some(offset),
             _ => None,
         })
         .ok_or_else(|| CompilerError::CodegenViolation(
-            "MTP: cannot find lm_head weight offset in resolver".into()
+            "MTP: cannot find logits producer weight offset in resolver".into()
         ))?;
-    let lm_head_bytes = vocab_size * hidden_size * elem_bytes;
-    let mtp_weights_base = lm_head_blob_offset + lm_head_bytes;
+    let logits_producer_bytes = vocab_size * hidden_size * elem_bytes;
+    let mtp_weights_base = logits_producer_blob_offset + logits_producer_bytes;
 
-    // Find final_normed tensor source — it's lm_head's first input.
+    // Find final_normed tensor source — logits producer's first input.
     let (hidden_ptr_base, hidden_offset) = {
-        let lm_head_op = graph.ops.iter()
-            .find(|op| op.label == "lm_head")
-            .ok_or_else(|| CompilerError::CodegenViolation("MTP: lm_head op not found".into()))?;
-        let fn_tid = lm_head_op.inputs[0];
+        let fn_tid = logits_producer_op.inputs[0];
         let src = resolver.source(fn_tid)
             .ok_or_else(|| CompilerError::CodegenViolation(
                 "MTP: final_normed tensor source not found".into()
@@ -5073,13 +5092,13 @@ mod tests {
 
         // Assert: slot 0 must be 16 (prompt_len at [rbp+16])
         assert_eq!(MEGA_KERNEL_STACK_OFFSETS[0], 16, "slot 0 must be prompt_len at [rbp+16]");
-        // Assert: last slot must be batch_ctx_ptr at [rbp+144]
+        // Assert: last slot must be batch_ctx_ptr at [rbp+136]
         assert_eq!(
-            *MEGA_KERNEL_STACK_OFFSETS.last().unwrap(), 144,
-            "last slot must be batch_ctx_ptr at [rbp+144]"
+            *MEGA_KERNEL_STACK_OFFSETS.last().unwrap(), 136,
+            "last slot must be batch_ctx_ptr at [rbp+136]"
         );
-        // Assert: total of 17 stack parameters (6 register + 17 stack = 23 total params)
-        assert_eq!(MEGA_KERNEL_STACK_OFFSETS.len(), 17, "must have exactly 17 stack parameters");
+        // Assert: total of 16 stack parameters (6 register + 16 stack = 22 total params)
+        assert_eq!(MEGA_KERNEL_STACK_OFFSETS.len(), 16, "must have exactly 16 stack parameters");
     }
 
     // ── Test 86: emit_mtp_draft_inline depth loop phase ordering — GEMV before Argmax before ScalarStore ──
@@ -5252,14 +5271,14 @@ mod tests {
         assert_eq!(config.vocab_size, vocab_size, "MtpKernelConfig.vocab_size must match input");
     }
 
-    // ── Test 92: MegaKernelBusinessConfig default values match SPEC expectations ──
+    // ── Test 92: BusinessConfig default values match SPEC expectations ──
     #[test]
     fn test_mega_kernel_business_config_default_values() {
         // Arrange
-        use crate::compiler::mega_kernel_abi::{MegaKernelBusinessConfig, FfnActivation, OutputMode};
+        use crate::compiler::mega_kernel_abi::{BusinessConfig, OutputMode};
 
         // Act
-        let default = MegaKernelBusinessConfig::default();
+        let default = BusinessConfig::default();
 
         // Assert: default output mode must be Generate with canonical max_new_tokens and eos
         assert!(
@@ -5274,18 +5293,6 @@ mod tests {
         assert!(default.semantic_gatekeeper.is_none(), "SG must be None by default");
         assert!(default.intent_anchor_layer.is_none(), "intent anchor must be None by default");
         assert!(default.cot_step_hook.is_none(), "CoT step hook must be None by default");
-        assert!(!default.has_head_rms_norm, "head_rms_norm must be false by default");
-        assert!(!default.has_qk_norm, "qk_norm must be false by default");
-        assert!(!default.has_value_norm, "value_norm must be false by default");
-        assert!(default.mtp_config.is_none(), "MTP must be None by default");
-        // Assert: default ffn_activation must be SwiGLU
-        assert_eq!(default.ffn_activation, FfnActivation::SwiGLU, "default FFN activation must be SwiGLU");
-        // Assert: default eps values
-        assert_eq!(default.head_rms_norm_eps, 1e-6, "default head_rms_norm_eps must be 1e-6");
-        assert_eq!(default.value_norm_eps, 1e-6, "default value_norm_eps must be 1e-6");
-        // Assert: default optional fields
-        assert!(default.logit_softcapping.is_none(), "logit softcapping must be None by default");
-        assert!(default.embedding_scale.is_none(), "embedding_scale must be None by default");
         // Assert: default session/multimodal/debug flags
         assert!(!default.session_enabled, "session must be disabled by default");
         assert!(!default.multimodal_enabled, "multimodal must be disabled by default");
@@ -5343,35 +5350,11 @@ mod tests {
         }
     }
 
-    // ── Test 94: FfnActivation enum has exactly three variants with correct equality ──
-    #[test]
-    fn test_ffn_activation_enum_variants_and_equality() {
-        // Arrange
-        use crate::compiler::mega_kernel_abi::FfnActivation;
-
-        // Act: construct all variants
-        let swiglu = FfnActivation::SwiGLU;
-        let geglu = FfnActivation::GeGLU;
-        let gelu = FfnActivation::Gelu;
-
-        // Assert: each variant must be distinct (PartialEq/Eq derived)
-        assert_ne!(swiglu, geglu, "SwiGLU and GeGLU must be different");
-        assert_ne!(swiglu, gelu, "SwiGLU and Gelu must be different");
-        assert_ne!(geglu, gelu, "GeGLU and Gelu must be different");
-        // Assert: self-equality must hold
-        assert_eq!(swiglu, swiglu, "SwiGLU must equal itself");
-        assert_eq!(geglu, geglu, "GeGLU must equal itself");
-        assert_eq!(gelu, gelu, "Gelu must equal itself");
-        // Assert: Copy semantics must hold (each variant is unit-like, Copy derived)
-        let copy_swiglu = swiglu;
-        assert_eq!(copy_swiglu, swiglu, "Copy of SwiGLU must equal original");
-    }
-
-    // ── Test 95: MegaKernelWeightLayout layer_base_offset computation is linear ──
+    // ── Test 95: KernelWeightLayout layer_base_offset computation is linear ──
     #[test]
     fn test_mega_kernel_weight_layout_layer_base_offset_linear() {
         // Arrange
-        use crate::compiler::mega_kernel_abi::{MegaKernelWeightLayout, PerLayerWeightLayout};
+        use crate::compiler::mega_kernel_abi::{KernelWeightLayout, PerLayerWeightLayout};
 
         // Construct a layout with known geometry by hand (build is private).
         // hidden=256, elem_bytes=4, vocab_size=1000, num_layers=4
@@ -5385,10 +5368,10 @@ mod tests {
             + 512*256*4 + 512*256*4 + 256*512*4;
         let final_norm_bytes = 256 * 4;
         let final_norm_offset = layer_0_offset + 4 * layer_stride;
-        let lm_head_offset = final_norm_offset + final_norm_bytes;
-        let lm_head_bytes = 1000 * 256 * 4;
-        let total_bytes = lm_head_offset + lm_head_bytes;
-        let layout = MegaKernelWeightLayout {
+        let logits_producer_offset = final_norm_offset + final_norm_bytes;
+        let logits_producer_bytes = 1000 * 256 * 4;
+        let total_bytes = logits_producer_offset + logits_producer_bytes;
+        let layout = KernelWeightLayout {
             embed_offset: 0,
             embed_bytes,
             layer_0_offset,
@@ -5408,8 +5391,8 @@ mod tests {
             },
             final_norm_offset,
             final_norm_bytes,
-            lm_head_offset,
-            lm_head_bytes,
+            logits_producer_offset,
+            logits_producer_bytes,
             total_bytes,
         };
 
@@ -5517,8 +5500,8 @@ mod tests {
         // Arrange
         use crate::compiler::mega_kernel_abi::{MEGA_KERNEL_PARAMS, MEGA_KERNEL_STACK_OFFSETS};
 
-        // Assert: total ABI params must be 23 (6 register + 17 stack)
-        assert_eq!(MEGA_KERNEL_PARAMS.len(), 23, "MEGA_KERNEL_PARAMS must have exactly 23 entries (6 register + 17 stack)");
+        // Assert: total ABI params must be 22 (6 register + 16 stack)
+        assert_eq!(MEGA_KERNEL_PARAMS.len(), 22, "MEGA_KERNEL_PARAMS must have exactly 22 entries (6 register + 16 stack)");
 
         // Assert: first 6 params are register params (names must contain pointer/usize semantics)
         let register_names = &MEGA_KERNEL_PARAMS[0..6];
@@ -5557,23 +5540,23 @@ mod tests {
 
         // Assert: hook_ctx_ptr must be a StackArg (resolved from mega-kernel ABI)
         match hook_ctx.unwrap() {
-            PtrExpr::StackArg(offset) => assert_eq!(*offset, 88, "hook_ctx_ptr must be at [rbp+88]"),
+            PtrExpr::StackArg(offset) => assert_eq!(*offset, 80, "hook_ctx_ptr must be at [rbp+80]"),
             PtrExpr::AbiArg(arg) => panic!("hook_ctx_ptr should not be a register arg (got AbiArg({}))", arg),
             _ => panic!("hook_ctx_ptr must be StackArg or AbiArg"),
         }
 
         // Assert: callback_table_ptr must be a StackArg (resolved from mega-kernel ABI)
         match callback_table.unwrap() {
-            PtrExpr::StackArg(offset) => assert_eq!(*offset, 128, "callback_table_ptr must be at [rbp+128]"),
+            PtrExpr::StackArg(offset) => assert_eq!(*offset, 120, "callback_table_ptr must be at [rbp+120]"),
             _ => panic!("callback_table_ptr must be StackArg"),
         }
     }
 
-    // ── Test 99: MegaKernelWeightLayout embed offset is zero and embed_bytes is vocab × hidden × elem_bytes ──
+    // ── Test 99: KernelWeightLayout embed offset is zero and embed_bytes is vocab × hidden × elem_bytes ──
     #[test]
     fn test_mega_kernel_weight_layout_embed_offset_zero_and_size_correct() {
         // Arrange
-        use crate::compiler::mega_kernel_abi::{MegaKernelWeightLayout, PerLayerWeightLayout};
+        use crate::compiler::mega_kernel_abi::{KernelWeightLayout, PerLayerWeightLayout};
 
         let vocab_size = 32000;
         let hidden = 4096;
@@ -5587,10 +5570,10 @@ mod tests {
         // Using simplified values for remaining fields — test only verifies embed region
         let final_norm_bytes = hidden * elem_bytes;
         let final_norm_offset = layer_0_offset + 32 * 1739968; // placeholder
-        let lm_head_bytes = vocab_size * hidden * elem_bytes;
-        let lm_head_offset = final_norm_offset + final_norm_bytes;
-        let total_bytes = lm_head_offset + lm_head_bytes;
-        let layout = MegaKernelWeightLayout {
+        let logits_producer_bytes = vocab_size * hidden * elem_bytes;
+        let logits_producer_offset = final_norm_offset + final_norm_bytes;
+        let total_bytes = logits_producer_offset + logits_producer_bytes;
+        let layout = KernelWeightLayout {
             embed_offset,
             embed_bytes,
             layer_0_offset,
@@ -5610,8 +5593,8 @@ mod tests {
             },
             final_norm_offset,
             final_norm_bytes,
-            lm_head_offset,
-            lm_head_bytes,
+            logits_producer_offset,
+            logits_producer_bytes,
             total_bytes,
         };
 
@@ -5621,8 +5604,8 @@ mod tests {
         assert_eq!(layout.embed_bytes, expected_embed_bytes, "embed_bytes must equal vocab({}) * hidden({}) * elem_bytes({})", vocab_size, hidden, elem_bytes);
         // Assert: layer_0_offset must follow immediately after embed
         assert_eq!(layout.layer_0_offset, layout.embed_offset + layout.embed_bytes, "layer_0 must start after embed region");
-        // Assert: lm_head must be the last weight region
-        assert_eq!(layout.total_bytes, layout.lm_head_offset + layout.lm_head_bytes, "total_bytes must equal lm_head_offset + lm_head_bytes");
+        // Assert: logits producer must be the last weight region
+        assert_eq!(layout.total_bytes, layout.logits_producer_offset + layout.logits_producer_bytes, "total_bytes must equal logits_producer_offset + logits_producer_bytes");
     }
 
     // ── Test 100: MtpKernelConfig Debug trait output contains all three fields ──
@@ -5700,7 +5683,7 @@ mod tests {
         match page_table.unwrap() {
             PtrExpr::StackArg(offset) => {
                 // page_table_ptr is ABI arg 21, stack slot index = 21 - 6 = 15, offset = 16 + 15*8 = 136
-                assert_eq!(*offset, 136, "page_table_ptr must be at [rbp+136]");
+                assert_eq!(*offset, 128, "page_table_ptr must be at [rbp+128]");
             }
             other => panic!("page_table_ptr must be StackArg, got {:?}", other),
         }
@@ -5789,40 +5772,14 @@ mod tests {
             "unbalanced LoopBegin without LoopEnd must fail structure validation");
     }
 
-    // ── Test 107: VmProgram with OutputModeDispatch followed by MarkLabels passes structure ──
-    #[test]
-    fn test_output_mode_dispatch_with_labels_passes_structure() {
-        // Arrange: simulate the mega-kernel output mode dispatch pattern
-        let mut prog = VmProgram::new();
-        let selector = prog.alloc_vreg(VRegKind::Scalar, SimdWidth::Scalar);
-        prog.emit(VmInstr::OutputModeDispatch {
-            selector,
-            paths: vec![0, 1, 2, 3],
-        });
-        prog.emit(VmInstr::MarkLabel { label_id: 0 });
-        prog.emit(VmInstr::BreakLoop { return_value: ReturnValue::Const(0) });
-        prog.emit(VmInstr::MarkLabel { label_id: 1 });
-        prog.emit(VmInstr::BreakLoop { return_value: ReturnValue::Const(0) });
-        prog.emit(VmInstr::MarkLabel { label_id: 2 });
-        prog.emit(VmInstr::BreakLoop { return_value: ReturnValue::Const(0) });
-        prog.emit(VmInstr::MarkLabel { label_id: 3 });
-        prog.emit(VmInstr::BreakLoop { return_value: ReturnValue::Const(0) });
-
-        // Assert: the dispatch + labels pattern must pass structure validation
-        assert!(prog.validate_structure().is_ok(),
-            "OutputModeDispatch with 4 MarkLabel paths must pass structure validation");
-        assert!(prog.validate_provenance().is_ok(),
-            "all VRegs in dispatch pattern must be properly declared");
-    }
-
-    // ── Test 108: MegaKernelBufferLayout zero-sized allocation has zero total_scratchpad_bytes ──
+    // ── Test 108: BufferLayout zero-sized allocation has zero total_scratchpad_bytes ──
     #[test]
     fn test_mega_kernel_buffer_layout_zero_total_bytes_when_empty() {
         // Arrange
-        use crate::compiler::mega_kernel_abi::MegaKernelBufferLayout;
+        use crate::compiler::mega_kernel_abi::BufferLayout;
 
         // Act: construct a zero-sized buffer layout matching actual struct fields
-        let layout = MegaKernelBufferLayout {
+        let layout = BufferLayout {
             activation_a_offset: 0,
             activation_b_offset: 0,
             activation_bytes: 0,
@@ -5847,7 +5804,7 @@ mod tests {
     // ── Test 109: VmProgram BranchIfPtrNonNull and BranchIfGprZero use correct VReg kinds ──
     #[test]
     fn test_branch_instructions_use_correct_vreg_kinds() {
-        // Arrange: build a program with branch instructions matching mega-kernel Phase 0.5 pattern
+        // Arrange: build a program with branch instructions matching mega-kernel ForwardPhaseDispatch pattern
         let mut prog = VmProgram::new();
         let ptr_vreg = prog.alloc_vreg(VRegKind::Ptr, SimdWidth::Scalar);
         prog.emit(VmInstr::LoadPtr { dst: ptr_vreg, src: PtrExpr::StackArg(16) });
@@ -6093,7 +6050,7 @@ mod tests {
 
         let mut prog = VmProgram::new();
 
-        // Allocate VRegs matching the Phase 0.7 pattern in compile_mega_kernel_vm
+        // Allocate VRegs matching the ForwardPhaseDispatch pattern in compile_mega_kernel_vm
         let batch_ctx_ptr = prog.alloc_vreg(VRegKind::Ptr, SimdWidth::Scalar);
         let batch_m = prog.alloc_vreg(VRegKind::Scalar, SimdWidth::Scalar);
 
@@ -6104,7 +6061,7 @@ mod tests {
             offset: OffsetExpr::Const(batch_ctx_offsets::TOTAL_PREFILL_TOKENS as usize),
         });
 
-        // Phase 0.7 three-way dispatch (SPEC 32 REQ-MKO-001)
+        // ForwardPhaseDispatch three-way dispatch (SPEC 32 REQ-MKO-001)
         const DECODE_ENTRY_LABEL: usize = 101;
         const MIXED_PATH_LABEL: usize = 102;
         const PREFILL_CHUNK_THRESHOLD: usize = 512;

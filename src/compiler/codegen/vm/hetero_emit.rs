@@ -6,26 +6,13 @@ use super::plan_lower::{
     LoweringContext, TensorPtrResolver, compile_layer_type_body,
 };
 use crate::compiler::buffer_alloc::BufferAllocation;
-use crate::compiler::fusion::FusionPlan;
+use crate::compiler::fusion::{FusionPlan, HeteroLayerType};
 use crate::compiler::graph::CompilerGraph;
 use crate::types::CompilerError;
 
 // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-// 异构层类型枚举 + 边界分析
+// 边界分析
 // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-
-/// 异构层类型 (Gemma 4 风格: sliding/full × small/large FFN)
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub enum HeteroLayerType {
-    /// layer_sliding_small — sliding attention + small FFN
-    SlidingSmall,
-    /// layer_full_small — full attention + small FFN
-    FullSmall,
-    /// layer_sliding_large — sliding attention + large FFN
-    SlidingLarge,
-    /// layer_full_large — full attention + large FFN
-    FullLarge,
-}
 
 /// 层类型的 group 范围
 #[derive(Debug, Clone)]
@@ -35,31 +22,19 @@ pub struct LayerTypeRange {
 }
 
 /// 分析 FusionPlan 中异构层类型的 group 边界
+/// REQ-UMK-012: 从 FusionGroup.hetero_layer_type 推导（OpKind 参数驱动），非 label 前缀。
 pub fn analyze_hetero_layer_boundaries(
     plan: &FusionPlan,
-    graph: &CompilerGraph,
+    _graph: &CompilerGraph,
 ) -> Vec<LayerTypeRange> {
     let mut ranges: Vec<LayerTypeRange> = Vec::new();
     let mut current_type: Option<HeteroLayerType> = None;
     let mut range_start = 0;
 
     for (gi, group) in plan.groups.iter().enumerate() {
-        let anchor_op = match graph.op(group.anchor) {
-            Some(op) => op,
-            None => continue,
-        };
-
-        let lt = if anchor_op.label.starts_with("layer_sliding_small.") {
-            Some(HeteroLayerType::SlidingSmall)
-        } else if anchor_op.label.starts_with("layer_full_small.") {
-            Some(HeteroLayerType::FullSmall)
-        } else if anchor_op.label.starts_with("layer_sliding_large.") {
-            Some(HeteroLayerType::SlidingLarge)
-        } else if anchor_op.label.starts_with("layer_full_large.") {
-            Some(HeteroLayerType::FullLarge)
-        } else {
-            None
-        };
+        // REQ-UMK-012: read from FusionGroup.hetero_layer_type (OpKind-parameter-derived),
+        // not from anchor_op.label string prefix.
+        let lt = group.hetero_layer_type;
 
         match (current_type, lt) {
             (None, Some(new_lt)) => {
@@ -82,7 +57,7 @@ pub fn analyze_hetero_layer_boundaries(
         ranges.push(LayerTypeRange {
             layer_type: lt,
             group_range: range_start..plan.groups.len(),
-        });
+        })
     }
 
     ranges

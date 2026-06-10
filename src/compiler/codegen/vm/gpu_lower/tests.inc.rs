@@ -429,18 +429,6 @@ mod tests {
     }
 
     #[test]
-    fn test_ptx_output_mode_dispatch() {
-        let mut l = GpuLower::new(GpuDialect::Ptx { sm_version: 80 });
-        let alloc = empty_alloc();
-        l.lower_instr(&VmInstr::OutputModeDispatch {
-            selector: VRegId(0), paths: vec![100, 200, 300],
-        }, &alloc).unwrap();
-        let ir = l.finalize().unwrap();
-        assert!(ir.contains("setp.eq.u32"), "PTX OutputModeDispatch should compare selector: {ir}");
-        assert!(ir.contains("bra PATH_"), "PTX OutputModeDispatch should branch to paths: {ir}");
-    }
-
-    #[test]
     fn test_ptx_break_loop_const() {
         let mut l = GpuLower::new(GpuDialect::Ptx { sm_version: 80 });
         let alloc = empty_alloc();
@@ -455,10 +443,9 @@ mod tests {
     fn test_ptx_mark_label() {
         let mut l = GpuLower::new(GpuDialect::Ptx { sm_version: 80 });
         let alloc = empty_alloc();
-        // First create paths via OutputModeDispatch
-        l.lower_instr(&VmInstr::OutputModeDispatch {
-            selector: VRegId(0), paths: vec![42],
-        }, &alloc).unwrap();
+        // Set up a named label via path_labels directly (replaces OutputModeDispatch setup)
+        l.path_labels.insert(42, "PATH_0".to_string());
+        l.path_label_counter = 1;
         // Then mark the label
         l.lower_instr(&VmInstr::MarkLabel { label_id: 42 }, &alloc).unwrap();
         let ir = l.finalize().unwrap();
@@ -1388,19 +1375,17 @@ mod tests {
 
     #[test]
     fn test_ptx_sm61_jump_to_label_with_path_label() {
-        // JumpToLabel also works when path_labels has a named label (from OutputModeDispatch)
+        // JumpToLabel also works when path_labels has a named label
         let mut l = GpuLower::new(GpuDialect::Ptx { sm_version: 61 });
         let alloc = gpu_reg_alloc(&[0, 1]);
         l.emit_prologue(&empty_frame(), &empty_alloc(), Default::default()).unwrap();
 
-        // Set up a named label via OutputModeDispatch
-        let selector = VRegId(0);
-        l.lower_instr(&VmInstr::OutputModeDispatch {
-            selector,
-            paths: vec![200, 201],
-        }, &alloc).unwrap();
+        // Set up named labels via path_labels directly (replaces OutputModeDispatch setup)
+        l.path_labels.insert(200, "PATH_0".to_string());
+        l.path_labels.insert(201, "PATH_1".to_string());
+        l.path_label_counter = 2;
 
-        // Jump to label 200 (should use PATH_0 naming from OutputModeDispatch)
+        // Jump to label 200 (should use PATH_0 naming from path_labels)
         l.lower_instr(&VmInstr::GprCondAction {
             cond: GprCondition::CmpEq(VRegId(1), 0),
             action: GprBranchAction::JumpToLabel(200),

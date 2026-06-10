@@ -444,7 +444,7 @@ fn find_compromise(a: &LayoutConstraint, b: &LayoutConstraint) -> LayoutConstrai
 mod tests {
     use super::*;
     use crate::compiler::accel_registry::AccelerationRegistry;
-    use crate::compiler::fusion::FusionMode;
+    use crate::compiler::fusion::{FusionMode, GroupMarker};
 
     fn make_test_dag() -> SemanticDAG {
         SemanticDAG {
@@ -472,6 +472,9 @@ mod tests {
             ops: vec![OpId(0)],
             multi_output: crate::compiler::graph::MultiOutputConfig::single(),
             dominant_dtype: None,
+            marker: GroupMarker::None,
+            is_layer_group: false,
+            hetero_layer_type: None,
         };
 
         let graph = CompilerGraph::new();
@@ -528,6 +531,9 @@ mod tests {
             ops: vec![OpId(0), OpId(1)],
             multi_output: crate::compiler::graph::MultiOutputConfig::single(),
             dominant_dtype: None,
+            marker: GroupMarker::None,
+            is_layer_group: false,
+            hetero_layer_type: None,
         };
 
         // Act
@@ -550,6 +556,9 @@ mod tests {
             ops: vec![OpId(0), OpId(1)],
             multi_output: crate::compiler::graph::MultiOutputConfig::single(),
             dominant_dtype: None,
+            marker: GroupMarker::None,
+            is_layer_group: false,
+            hetero_layer_type: None,
         };
 
         // Act
@@ -572,6 +581,9 @@ mod tests {
             ops: vec![OpId(0), OpId(1)],
             multi_output: crate::compiler::graph::MultiOutputConfig::single(),
             dominant_dtype: None,
+            marker: GroupMarker::None,
+            is_layer_group: false,
+            hetero_layer_type: None,
         };
 
         // Act
@@ -594,6 +606,9 @@ mod tests {
             ops: vec![OpId(0)],
             multi_output: crate::compiler::graph::MultiOutputConfig::single(),
             dominant_dtype: None,
+            marker: GroupMarker::None,
+            is_layer_group: false,
+            hetero_layer_type: None,
         };
 
         // Act
@@ -616,6 +631,9 @@ mod tests {
             ops: vec![OpId(0), OpId(1)],
             multi_output: crate::compiler::graph::MultiOutputConfig::single(),
             dominant_dtype: None,
+            marker: GroupMarker::None,
+            is_layer_group: false,
+            hetero_layer_type: None,
         };
 
         // Act
@@ -676,6 +694,9 @@ mod tests {
             ops: Vec::new(), // empty
             multi_output: crate::compiler::graph::MultiOutputConfig::single(),
             dominant_dtype: None,
+            marker: GroupMarker::None,
+            is_layer_group: false,
+            hetero_layer_type: None,
         };
 
         // Act
@@ -712,6 +733,9 @@ mod tests {
             ops: vec![OpId(0)],
             multi_output: crate::compiler::graph::MultiOutputConfig::single(),
             dominant_dtype: None,
+            marker: GroupMarker::None,
+            is_layer_group: false,
+            hetero_layer_type: None,
         };
         let group_b = FusionGroup {
             id: 1,
@@ -721,6 +745,9 @@ mod tests {
             ops: vec![OpId(1)],
             multi_output: crate::compiler::graph::MultiOutputConfig::single(),
             dominant_dtype: None,
+            marker: GroupMarker::None,
+            is_layer_group: false,
+            hetero_layer_type: None,
         };
 
         // Act
@@ -786,6 +813,9 @@ mod tests {
             ops: vec![OpId(0), OpId(1)],
             multi_output: crate::compiler::graph::MultiOutputConfig::single(),
             dominant_dtype: None,
+            marker: GroupMarker::None,
+            is_layer_group: false,
+            hetero_layer_type: None,
         };
 
         // Act
@@ -961,6 +991,9 @@ mod tests {
             ops: vec![OpId(0), OpId(1)],
             multi_output: crate::compiler::graph::MultiOutputConfig::single(),
             dominant_dtype: None,
+            marker: GroupMarker::None,
+            is_layer_group: false,
+            hetero_layer_type: None,
         };
 
         // Act
@@ -982,6 +1015,9 @@ mod tests {
             ops: vec![OpId(0), OpId(1)],
             multi_output: crate::compiler::graph::MultiOutputConfig::single(),
             dominant_dtype: None,
+            marker: GroupMarker::None,
+            is_layer_group: false,
+            hetero_layer_type: None,
         });
         assert_eq!(movement, MovementType::RegisterToMemory);
     }
@@ -1022,6 +1058,9 @@ mod tests {
             ops: vec![OpId(0), OpId(1)],
             multi_output: crate::compiler::graph::MultiOutputConfig::single(),
             dominant_dtype: None,
+            marker: GroupMarker::None,
+            is_layer_group: false,
+            hetero_layer_type: None,
         };
 
         // Act: producer_index = 1 (not 0), so GEMM is not anchor
@@ -1843,6 +1882,9 @@ mod tests {
             ops: vec![OpId(0)],
             multi_output: crate::compiler::graph::MultiOutputConfig::single(),
             dominant_dtype: None,
+            marker: GroupMarker::None,
+            is_layer_group: false,
+            hetero_layer_type: None,
         };
 
         // Act
@@ -1967,6 +2009,9 @@ mod tests {
             ops: vec![OpId(0), OpId(1)],
             multi_output: crate::compiler::graph::MultiOutputConfig::single(),
             dominant_dtype: None,
+            marker: GroupMarker::None,
+            is_layer_group: false,
+            hetero_layer_type: None,
         };
 
         // Act
@@ -2187,6 +2232,9 @@ mod tests {
             ops: vec![OpId(0), OpId(1), OpId(2)],
             multi_output: crate::compiler::graph::MultiOutputConfig::single(),
             dominant_dtype: None,
+            marker: GroupMarker::None,
+            is_layer_group: false,
+            hetero_layer_type: None,
         };
 
         // Act
@@ -2283,6 +2331,9 @@ mod tests {
             ops: vec![OpId(99)], // OpId not in DAG
             multi_output: crate::compiler::graph::MultiOutputConfig::single(),
             dominant_dtype: None,
+            marker: GroupMarker::None,
+            is_layer_group: false,
+            hetero_layer_type: None,
         };
 
         // Act
@@ -2407,6 +2458,9 @@ mod tests {
             ops: vec![OpId(0)],
             multi_output: crate::compiler::graph::MultiOutputConfig::single(),
             dominant_dtype: None,
+            marker: GroupMarker::None,
+            is_layer_group: false,
+            hetero_layer_type: None,
         };
 
         // Act
@@ -2572,6 +2626,9 @@ mod tests {
             ops: vec![OpId(0), OpId(1)],
             multi_output: crate::compiler::graph::MultiOutputConfig::single(),
             dominant_dtype: None,
+            marker: GroupMarker::None,
+            is_layer_group: false,
+            hetero_layer_type: None,
         };
 
         // Act
@@ -2644,6 +2701,9 @@ mod tests {
             ops: vec![OpId(0)],
             multi_output: crate::compiler::graph::MultiOutputConfig::single(),
             dominant_dtype: None,
+            marker: GroupMarker::None,
+            is_layer_group: false,
+            hetero_layer_type: None,
         };
         let group_b = FusionGroup {
             id: 20,
@@ -2653,6 +2713,9 @@ mod tests {
             ops: vec![OpId(1)],
             multi_output: crate::compiler::graph::MultiOutputConfig::single(),
             dominant_dtype: None,
+            marker: GroupMarker::None,
+            is_layer_group: false,
+            hetero_layer_type: None,
         };
 
         // Act
@@ -2812,6 +2875,9 @@ mod tests {
             ops: vec![OpId(0), OpId(1)],
             multi_output: crate::compiler::graph::MultiOutputConfig::single(),
             dominant_dtype: None,
+            marker: GroupMarker::None,
+            is_layer_group: false,
+            hetero_layer_type: None,
         };
 
         // Act
@@ -2833,6 +2899,9 @@ mod tests {
             ops: vec![OpId(0), OpId(1)],
             multi_output: crate::compiler::graph::MultiOutputConfig::single(),
             dominant_dtype: None,
+            marker: GroupMarker::None,
+            is_layer_group: false,
+            hetero_layer_type: None,
         };
         assert_eq!(
             classify_movement(OpClass::ElemWise, OpClass::ElemWise, 0, &group_ref),

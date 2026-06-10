@@ -116,7 +116,7 @@ pub(crate) fn emit_gather_inline(
                     dtype: weight_dtype,
                 });
                 let slots = super::auto_select::auto_lower_trace_raw(
-                    prog, &scale_body, &[data], width, QuantPrecision::F32).expect("gather scale trace auto_lower failed");
+                    prog, &scale_body, &[data], width, compute_dtype).expect("gather scale trace auto_lower failed");
                 let result = slots.last().copied().unwrap_or(data);
 
                 prog.emit(VmInstr::VecStore {
@@ -127,7 +127,7 @@ pub(crate) fn emit_gather_inline(
                 if let Some(acc) = norm_sq_acc {
                     let l2_body = vec![TraceOp::Input(0), TraceOp::Mul(ValueId(0), ValueId(0)), TraceOp::Input(1), TraceOp::Add(ValueId(1), ValueId(2))];
                     super::auto_select::auto_lower_trace_into(
-                        prog, &l2_body, &[data, acc], acc, width, QuantPrecision::F32,
+                        prog, &l2_body, &[data, acc], acc, width, compute_dtype,
                     ).expect("gather L2 norm auto_lower failed");
                 }
             });
@@ -145,7 +145,7 @@ pub(crate) fn emit_gather_inline(
             use crate::compiler::graph::telemetry_offsets;
             prog.emit(VmInstr::Comment("§13.10 Embedding L2 norm telemetry (auto_select)".into()));
             let slots = super::auto_select::auto_lower_trace_raw(
-                prog, &norm_body, &[acc], width, QuantPrecision::F32).expect("gather norm trace auto_lower failed");
+                prog, &norm_body, &[acc], width, compute_dtype).expect("gather norm trace auto_lower failed");
             let l2_norm = slots.last().copied().unwrap_or(acc);
             prog.emit(VmInstr::VecStore {
                 base: tel_ptr,
@@ -159,7 +159,7 @@ pub(crate) fn emit_gather_inline(
     Ok(())
 }
 
-/// ARCH-AUTO-INSTR-SELECT Phase 4: ColumnSlice (row-major column copy) via TraceOp + auto_lower_trace。
+/// ARCH-AUTO-INSTR-SELECT structural: ColumnSlice (row-major column copy) via TraceOp + auto_lower_trace。
 ///
 /// 替代 `lower::lower_column_slice` 的手写 VmInstr 发射。
 ///
@@ -227,7 +227,7 @@ pub(crate) fn emit_column_slice_inline(
                 });
                 // Apply identity trace via auto_lower_trace_raw
                 let slots = super::auto_select::auto_lower_trace_raw(
-                    prog, &copy_body, &[data], width, QuantPrecision::F32).expect("column_slice copy trace auto_lower failed");
+                    prog, &copy_body, &[data], width, dtype).expect("column_slice copy trace auto_lower failed");
                 let result = slots[0];
                 prog.emit(VmInstr::VecStore {
                     base: out_row, offset: OffsetExpr::LoopOffset(col_off),
@@ -269,7 +269,7 @@ pub(crate) fn emit_column_slice_inline(
     Ok(())
 }
 
-/// ARCH-AUTO-INSTR-SELECT Phase 4: RoPE (positional encoding) via TraceOp + auto_lower_trace。
+/// ARCH-AUTO-INSTR-SELECT structural: RoPE (positional encoding) via TraceOp + auto_lower_trace。
 ///
 /// 替代 `lower::lower_rope_full` — 旋转计算体使用 `auto_lower_trace_multi`，
 /// passthrough 部分使用 `auto_lower_trace_raw` (identity trace)。
@@ -404,7 +404,7 @@ pub(crate) fn emit_rope_inline(
                     let out_odd = prog.alloc_vreg(VRegKind::Vec, width);
                     super::auto_select::auto_lower_trace_multi(prog, &rope_body,
                         &[x_even, x_odd, cos_val, sin_val],
-                        &[(out_even, 6), (out_odd, 9)], width, QuantPrecision::F32)
+                        &[(out_even, 6), (out_odd, 9)], width, dtype)
                         .expect("emit_rope_inline: rotation trace auto_lower failed");
 
                     prog.emit(VmInstr::VecStore { base: head_output, offset: OffsetExpr::LoopOffset(pair_off), src: out_even, width, dtype, });
@@ -438,7 +438,7 @@ pub(crate) fn emit_rope_inline(
                 let s_out_odd = prog.alloc_vreg(VRegKind::Vec, s1);
                 super::auto_select::auto_lower_trace_multi(prog, &rope_body,
                     &[sx_even, sx_odd, scos, ssin],
-                    &[(s_out_even, 6), (s_out_odd, 9)], s1, QuantPrecision::F32)
+                    &[(s_out_even, 6), (s_out_odd, 9)], s1, dtype)
                     .expect("emit_rope_inline: scalar rotation trace auto_lower failed");
                 prog.emit(VmInstr::VecStore { base: head_output, offset: OffsetExpr::Const(off_even), src: s_out_even, width: s1, dtype, });
                 prog.emit(VmInstr::VecStore {
@@ -460,7 +460,7 @@ pub(crate) fn emit_rope_inline(
                             dtype,
                         });
                         let slots = super::auto_select::auto_lower_trace_raw(
-                            prog, &passthrough_body, &[data], width, QuantPrecision::F32).expect("emit_rope_inline: passthrough trace auto_lower failed");
+                            prog, &passthrough_body, &[data], width, dtype).expect("emit_rope_inline: passthrough trace auto_lower failed");
                         prog.emit(VmInstr::VecStore {
                             base: head_output,
                             offset: OffsetExpr::loop_plus_const(byte_off, pt_base_off),
@@ -477,7 +477,7 @@ pub(crate) fn emit_rope_inline(
                     let s_data = prog.alloc_vreg(VRegKind::Vec, s1);
                     prog.emit(VmInstr::VecLoad { dst: s_data, base: head_input, offset: OffsetExpr::Const(off), width: s1, dtype, });
                     let slots = super::auto_select::auto_lower_trace_raw(
-                        prog, &passthrough_body, &[s_data], s1, QuantPrecision::F32).expect("emit_rope_inline: scalar passthrough trace auto_lower failed");
+                        prog, &passthrough_body, &[s_data], s1, dtype).expect("emit_rope_inline: scalar passthrough trace auto_lower failed");
                     prog.emit(VmInstr::VecStore { base: head_output, offset: OffsetExpr::Const(off), src: slots[0], width: s1, dtype, });
                 }
             }
@@ -828,7 +828,7 @@ mod tests {
         let mut prog = VmProgram::new();
         let input = prog.alloc_vreg(VRegKind::Ptr, SimdWidth::Scalar);
         let output = prog.alloc_vreg(VRegKind::Ptr, SimdWidth::Scalar);
-        let sym_map = SymDimSlotMap::default_abi();
+        let sym_map = SymDimSlotMap::mega_kernel_abi();
 
         let result = emit_rope_inline(
             &mut prog,
@@ -856,7 +856,7 @@ mod tests {
         let mut prog = VmProgram::new();
         let input = prog.alloc_vreg(VRegKind::Ptr, SimdWidth::Scalar);
         let output = prog.alloc_vreg(VRegKind::Ptr, SimdWidth::Scalar);
-        let sym_map = SymDimSlotMap::default_abi();
+        let sym_map = SymDimSlotMap::mega_kernel_abi();
 
         let result = emit_rope_inline(
             &mut prog,
@@ -878,7 +878,7 @@ mod tests {
         let mut prog = VmProgram::new();
         let input = prog.alloc_vreg(VRegKind::Ptr, SimdWidth::Scalar);
         let output = prog.alloc_vreg(VRegKind::Ptr, SimdWidth::Scalar);
-        let sym_map = SymDimSlotMap::default_abi();
+        let sym_map = SymDimSlotMap::mega_kernel_abi();
 
         let result = emit_rope_inline(
             &mut prog,
@@ -1147,7 +1147,7 @@ mod tests {
         let mut prog = VmProgram::new();
         let input = prog.alloc_vreg(VRegKind::Ptr, SimdWidth::Scalar);
         let output = prog.alloc_vreg(VRegKind::Ptr, SimdWidth::Scalar);
-        let sym_map = SymDimSlotMap::default_abi();
+        let sym_map = SymDimSlotMap::mega_kernel_abi();
 
         let result = emit_rope_inline(
             &mut prog,
@@ -1176,7 +1176,7 @@ mod tests {
         let mut prog = VmProgram::new();
         let input = prog.alloc_vreg(VRegKind::Ptr, SimdWidth::Scalar);
         let output = prog.alloc_vreg(VRegKind::Ptr, SimdWidth::Scalar);
-        let sym_map = SymDimSlotMap::default_abi();
+        let sym_map = SymDimSlotMap::mega_kernel_abi();
 
         let result = emit_rope_inline(
             &mut prog,
@@ -1205,7 +1205,7 @@ mod tests {
         let mut prog = VmProgram::new();
         let input = prog.alloc_vreg(VRegKind::Ptr, SimdWidth::Scalar);
         let output = prog.alloc_vreg(VRegKind::Ptr, SimdWidth::Scalar);
-        let sym_map = SymDimSlotMap::default_abi();
+        let sym_map = SymDimSlotMap::mega_kernel_abi();
 
         // head_dim=64, partial=0.25 → rot_dim=16, passthrough_dim=48
         emit_rope_inline(
@@ -1233,7 +1233,7 @@ mod tests {
         let mut prog = VmProgram::new();
         let input = prog.alloc_vreg(VRegKind::Ptr, SimdWidth::Scalar);
         let output = prog.alloc_vreg(VRegKind::Ptr, SimdWidth::Scalar);
-        let sym_map = SymDimSlotMap::default_abi();
+        let sym_map = SymDimSlotMap::mega_kernel_abi();
         let pos_offset = prog.alloc_vreg(VRegKind::Scalar, SimdWidth::Scalar);
 
         emit_rope_inline(
@@ -1333,7 +1333,7 @@ mod tests {
         let mut prog = VmProgram::new();
         let input = prog.alloc_vreg(VRegKind::Ptr, SimdWidth::Scalar);
         let output = prog.alloc_vreg(VRegKind::Ptr, SimdWidth::Scalar);
-        let sym_map = SymDimSlotMap::default_abi();
+        let sym_map = SymDimSlotMap::mega_kernel_abi();
 
         // full partial=1.0, 8 heads — all dimensions are rotated
         emit_rope_inline(
@@ -1359,7 +1359,7 @@ mod tests {
         let mut prog = VmProgram::new();
         let input = prog.alloc_vreg(VRegKind::Ptr, SimdWidth::Scalar);
         let output = prog.alloc_vreg(VRegKind::Ptr, SimdWidth::Scalar);
-        let sym_map = SymDimSlotMap::default_abi();
+        let sym_map = SymDimSlotMap::mega_kernel_abi();
 
         emit_rope_inline(
             &mut prog,
@@ -1385,7 +1385,7 @@ mod tests {
         let mut prog = VmProgram::new();
         let input = prog.alloc_vreg(VRegKind::Ptr, SimdWidth::Scalar);
         let output = prog.alloc_vreg(VRegKind::Ptr, SimdWidth::Scalar);
-        let sym_map = SymDimSlotMap::default_abi();
+        let sym_map = SymDimSlotMap::mega_kernel_abi();
 
         // head_dim=128, partial=0.5 → rot_dim=64, passthrough_dim=64
         emit_rope_inline(
@@ -1629,7 +1629,7 @@ mod tests {
         let mut prog = VmProgram::new();
         let input = prog.alloc_vreg(VRegKind::Ptr, SimdWidth::Scalar);
         let output = prog.alloc_vreg(VRegKind::Ptr, SimdWidth::Scalar);
-        let sym_map = SymDimSlotMap::default_abi();
+        let sym_map = SymDimSlotMap::mega_kernel_abi();
 
         // head_dim=2, partial=1.0 → rot_dim=2, half_rot=1, no vectorized path (lanes=8 > 1 pair)
         emit_rope_inline(
@@ -1659,7 +1659,7 @@ mod tests {
         let mut prog = VmProgram::new();
         let input = prog.alloc_vreg(VRegKind::Ptr, SimdWidth::Scalar);
         let output = prog.alloc_vreg(VRegKind::Ptr, SimdWidth::Scalar);
-        let sym_map = SymDimSlotMap::default_abi();
+        let sym_map = SymDimSlotMap::mega_kernel_abi();
 
         let sym_bound = BoundExpr::Symbolic(SymBound {
             name: "seq_len".to_string(),
@@ -1688,7 +1688,7 @@ mod tests {
         let mut prog = VmProgram::new();
         let input = prog.alloc_vreg(VRegKind::Ptr, SimdWidth::Scalar);
         let output = prog.alloc_vreg(VRegKind::Ptr, SimdWidth::Scalar);
-        let sym_map = SymDimSlotMap::default_abi();
+        let sym_map = SymDimSlotMap::mega_kernel_abi();
 
         // Scalar width = 1 lane, head_dim=4 → half_rot=2, vec_count=2/1=2 scalar iterations
         emit_rope_inline(
@@ -1776,7 +1776,7 @@ mod tests {
         let mut prog = VmProgram::new();
         let input = prog.alloc_vreg(VRegKind::Ptr, SimdWidth::Scalar);
         let output = prog.alloc_vreg(VRegKind::Ptr, SimdWidth::Scalar);
-        let sym_map = SymDimSlotMap::default_abi();
+        let sym_map = SymDimSlotMap::mega_kernel_abi();
 
         // head_dim=24, W256=8 lanes, half_rot=12, vec_count=12/8=1, pair_tail=4
         // → 1 vectorized iteration + 4 scalar tail pairs
@@ -1925,7 +1925,7 @@ mod tests {
         let mut prog = VmProgram::new();
         let input = prog.alloc_vreg(VRegKind::Ptr, SimdWidth::Scalar);
         let output = prog.alloc_vreg(VRegKind::Ptr, SimdWidth::Scalar);
-        let sym_map = SymDimSlotMap::default_abi();
+        let sym_map = SymDimSlotMap::mega_kernel_abi();
 
         // partial=1.0, head_dim=128 → rot_dim=128, passthrough_dim=0 → no passthrough section
         emit_rope_inline(
@@ -1952,7 +1952,7 @@ mod tests {
         let mut prog = VmProgram::new();
         let input = prog.alloc_vreg(VRegKind::Ptr, SimdWidth::Scalar);
         let output = prog.alloc_vreg(VRegKind::Ptr, SimdWidth::Scalar);
-        let sym_map = SymDimSlotMap::default_abi();
+        let sym_map = SymDimSlotMap::mega_kernel_abi();
 
         emit_rope_inline(
             &mut prog,
@@ -1981,7 +1981,7 @@ mod tests {
         let mut prog = VmProgram::new();
         let input = prog.alloc_vreg(VRegKind::Ptr, SimdWidth::Scalar);
         let output = prog.alloc_vreg(VRegKind::Ptr, SimdWidth::Scalar);
-        let sym_map = SymDimSlotMap::default_abi();
+        let sym_map = SymDimSlotMap::mega_kernel_abi();
 
         // 4 heads, head_dim=32 → token_step_bytes = 4 * 32 * 4 = 512
         emit_rope_inline(
@@ -2166,7 +2166,7 @@ mod tests {
         let mut prog = VmProgram::new();
         let input = prog.alloc_vreg(VRegKind::Ptr, SimdWidth::Scalar);
         let output = prog.alloc_vreg(VRegKind::Ptr, SimdWidth::Scalar);
-        let sym_map = SymDimSlotMap::default_abi();
+        let sym_map = SymDimSlotMap::mega_kernel_abi();
 
         let result = emit_rope_inline(
             &mut prog, BoundExpr::Const(1), 4, 64,
@@ -2233,7 +2233,7 @@ mod tests {
         let mut prog = VmProgram::new();
         let input = prog.alloc_vreg(VRegKind::Ptr, SimdWidth::Scalar);
         let output = prog.alloc_vreg(VRegKind::Ptr, SimdWidth::Scalar);
-        let sym_map = SymDimSlotMap::default_abi();
+        let sym_map = SymDimSlotMap::mega_kernel_abi();
 
         emit_rope_inline(
             &mut prog, BoundExpr::Const(1), 4, 128,
@@ -2301,7 +2301,7 @@ mod tests {
         let mut prog = VmProgram::new();
         let input = prog.alloc_vreg(VRegKind::Ptr, SimdWidth::Scalar);
         let output = prog.alloc_vreg(VRegKind::Ptr, SimdWidth::Scalar);
-        let sym_map = SymDimSlotMap::default_abi();
+        let sym_map = SymDimSlotMap::mega_kernel_abi();
         let pos_offset = prog.alloc_vreg(VRegKind::Scalar, SimdWidth::Scalar);
 
         emit_rope_inline(
@@ -2468,7 +2468,7 @@ mod tests {
         let mut prog = VmProgram::new();
         let input = prog.alloc_vreg(VRegKind::Ptr, SimdWidth::Scalar);
         let output = prog.alloc_vreg(VRegKind::Ptr, SimdWidth::Scalar);
-        let sym_map = SymDimSlotMap::default_abi();
+        let sym_map = SymDimSlotMap::mega_kernel_abi();
 
         let num_heads = 8;
         let head_dim = 64;
@@ -2495,7 +2495,7 @@ mod tests {
         let mut prog = VmProgram::new();
         let input = prog.alloc_vreg(VRegKind::Ptr, SimdWidth::Scalar);
         let output = prog.alloc_vreg(VRegKind::Ptr, SimdWidth::Scalar);
-        let sym_map = SymDimSlotMap::default_abi();
+        let sym_map = SymDimSlotMap::mega_kernel_abi();
 
         let num_heads = 6;
         emit_rope_inline(
@@ -2567,7 +2567,7 @@ mod tests {
         let mut prog = VmProgram::new();
         let input = prog.alloc_vreg(VRegKind::Ptr, SimdWidth::Scalar);
         let output = prog.alloc_vreg(VRegKind::Ptr, SimdWidth::Scalar);
-        let sym_map = SymDimSlotMap::default_abi();
+        let sym_map = SymDimSlotMap::mega_kernel_abi();
 
         // head_dim=128, partial=0.5 → rot_dim=64, passthrough_dim=64
         // Passthrough uses identity trace (Input(0)) → VecLoad + VecStore only, no VecBinOp

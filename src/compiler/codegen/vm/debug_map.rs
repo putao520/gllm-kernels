@@ -1,5 +1,5 @@
 /// JIT Source Map — VmInstr → 机器码偏移 → Op 标签映射。
-/// 仅当 MegaKernelBusinessConfig.debug_jit=true 时生成。
+/// 仅当 CompileConfig.debug_jit=true 时生成。
 /// DAP 调试器用它做 source → address 映射。
 
 /// JIT source map 条目集合。

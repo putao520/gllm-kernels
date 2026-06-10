@@ -5,7 +5,7 @@
 // input tensors and produces output tensors. Tensors carry shape metadata
 // and def-use chains (single producer, multiple consumers).
 //
-// Pipeline: LayerIR → CompilerGraph → (Phase 2: fusion) → (Phase 3: codegen)
+// Pipeline: LayerIR → CompilerGraph → (Fusion) → (ISA Lowering: codegen)
 
 use std::collections::HashMap;
 use crate::compiler::ir::{LayerArch, LayerIR};
@@ -191,12 +191,12 @@ impl WeightLayout {
 /// Outside the loop, global weights use absolute offsets from weight_ptr.
 #[derive(Debug, Clone)]
 pub struct LayerLoopConfig {
-    /// Number of decoder layers (loop iteration count).
+    /// Number of layers (loop iteration count).
     pub num_layers: usize,
     /// Byte stride between consecutive layers in the weight blob.
     pub weight_stride: usize,
     /// Absolute byte offset of layer_0's weights in the weight blob
-    /// (= embed_bytes for typical decoder models).
+    /// (= embed_bytes for typical generative models).
     pub layer_blob_base_offset: usize,
     /// Indices into graph.inputs that are per-layer weights.
     /// These weights use offsets relative to layer start in WeightLayout.

@@ -119,6 +119,7 @@ impl GroupDependencyAnalyzer {
 mod tests {
     use super::*;
     use crate::compiler::graph::{SymDim, OpKind};
+    use crate::compiler::fusion::GroupMarker;
     use crate::types::DType;
 
     #[test]
@@ -148,6 +149,9 @@ mod tests {
                 ops: vec![op0],
                 multi_output: crate::compiler::graph::MultiOutputConfig::single(),
                 dominant_dtype: None,
+                marker: GroupMarker::None,
+                is_layer_group: false,
+            hetero_layer_type: None,
             }],
             op_to_group: {
                 let mut m = HashMap::new();
@@ -326,6 +330,9 @@ mod tests {
                     ops: vec![op0, op1],
                     multi_output: crate::compiler::graph::MultiOutputConfig::single(),
                     dominant_dtype: None,
+                    marker: GroupMarker::None,
+                    is_layer_group: false,
+            hetero_layer_type: None,
                 },
                 make_group(1, op2),
             ],
@@ -484,6 +491,9 @@ mod tests {
                 ops: vec![op0, op1],
                 multi_output: crate::compiler::graph::MultiOutputConfig::single(),
                 dominant_dtype: None,
+                marker: GroupMarker::None,
+                is_layer_group: false,
+            hetero_layer_type: None,
             }],
             op_to_group: {
                 let mut m = HashMap::new();
@@ -784,6 +794,9 @@ mod tests {
                     ops: vec![op0a, op0b],
                     multi_output: crate::compiler::graph::MultiOutputConfig::single(),
                     dominant_dtype: None,
+                    marker: GroupMarker::None,
+                    is_layer_group: false,
+            hetero_layer_type: None,
                 },
                 make_group(1, op1),
             ],
@@ -1074,6 +1087,9 @@ mod tests {
                     ops: vec![], // empty ops — no op_to_group entry for group 1
                     multi_output: crate::compiler::graph::MultiOutputConfig::single(),
                     dominant_dtype: None,
+                    marker: GroupMarker::None,
+                    is_layer_group: false,
+            hetero_layer_type: None,
                 },
             ],
             op_to_group: {
@@ -1204,6 +1220,9 @@ mod tests {
                     ops: vec![op0],
                     multi_output: crate::compiler::graph::MultiOutputConfig::single(),
                     dominant_dtype: None,
+                    marker: GroupMarker::None,
+                    is_layer_group: false,
+            hetero_layer_type: None,
                 },
                 crate::compiler::fusion::FusionGroup {
                     id: 3,
@@ -1213,6 +1232,9 @@ mod tests {
                     ops: vec![op1],
                     multi_output: crate::compiler::graph::MultiOutputConfig::single(),
                     dominant_dtype: None,
+                    marker: GroupMarker::None,
+                    is_layer_group: false,
+            hetero_layer_type: None,
                 },
                 crate::compiler::fusion::FusionGroup {
                     id: 1,
@@ -1222,6 +1244,9 @@ mod tests {
                     ops: vec![op2],
                     multi_output: crate::compiler::graph::MultiOutputConfig::single(),
                     dominant_dtype: None,
+                    marker: GroupMarker::None,
+                    is_layer_group: false,
+            hetero_layer_type: None,
                 },
             ],
             op_to_group: {
@@ -1421,6 +1446,9 @@ mod tests {
                 ops: vec![op0, op1, op2],
                 multi_output: crate::compiler::graph::MultiOutputConfig::single(),
                 dominant_dtype: None,
+                marker: GroupMarker::None,
+                is_layer_group: false,
+            hetero_layer_type: None,
             }],
             op_to_group: {
                 let mut m = HashMap::new();
@@ -1601,6 +1629,9 @@ mod tests {
                 ops: vec![op0, op1],
                 multi_output: crate::compiler::graph::MultiOutputConfig::single(),
                 dominant_dtype: None,
+                marker: GroupMarker::None,
+                is_layer_group: false,
+            hetero_layer_type: None,
             }],
             op_to_group: {
                 let mut m = HashMap::new();
@@ -1746,6 +1777,9 @@ mod tests {
                     ops: vec![],
                     multi_output: crate::compiler::graph::MultiOutputConfig::single(),
                     dominant_dtype: None,
+                    marker: GroupMarker::None,
+                    is_layer_group: false,
+            hetero_layer_type: None,
                 },
             ],
             op_to_group: {
@@ -1868,6 +1902,9 @@ mod tests {
                     ops: vec![op0, op1, op2],
                     multi_output: crate::compiler::graph::MultiOutputConfig::single(),
                     dominant_dtype: None,
+                    marker: GroupMarker::None,
+                    is_layer_group: false,
+            hetero_layer_type: None,
                 },
                 make_group(1, op3),
             ],
@@ -2879,6 +2916,9 @@ mod tests {
                     ops: vec![op0a, op0b],
                     multi_output: crate::compiler::graph::MultiOutputConfig::single(),
                     dominant_dtype: None,
+                    marker: GroupMarker::None,
+                    is_layer_group: false,
+            hetero_layer_type: None,
                 },
                 make_group(1, op1),
             ],
@@ -3101,6 +3141,9 @@ mod tests {
                     ops: vec![op0a, op0b],
                     multi_output: crate::compiler::graph::MultiOutputConfig::single(),
                     dominant_dtype: None,
+                    marker: GroupMarker::None,
+                    is_layer_group: false,
+            hetero_layer_type: None,
                 },
                 make_group(1, op1),
                 make_group(2, op2),
@@ -3270,6 +3313,9 @@ mod tests {
                     ops: vec![op0a, op0b],
                     multi_output: crate::compiler::graph::MultiOutputConfig::single(),
                     dominant_dtype: None,
+                    marker: GroupMarker::None,
+                    is_layer_group: false,
+            hetero_layer_type: None,
                 },
                 crate::compiler::fusion::FusionGroup {
                     id: 1,
@@ -3279,6 +3325,9 @@ mod tests {
                     ops: vec![op1a, op1b],
                     multi_output: crate::compiler::graph::MultiOutputConfig::single(),
                     dominant_dtype: None,
+                    marker: GroupMarker::None,
+                    is_layer_group: false,
+            hetero_layer_type: None,
                 },
                 make_group(2, op2),
             ],
@@ -3313,5 +3362,8 @@ fn make_group(id: usize, anchor: OpId) -> crate::compiler::fusion::FusionGroup {
         ops: vec![anchor],
         multi_output: crate::compiler::graph::MultiOutputConfig::single(),
         dominant_dtype: None,
+        marker: crate::compiler::fusion::GroupMarker::None,
+        is_layer_group: false,
+            hetero_layer_type: None,
     }
 }

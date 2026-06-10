@@ -117,10 +117,14 @@ pub struct ScopedSpillAllocator {
     scope_slots: std::collections::HashMap<ScopeId, Vec<usize>>,
     next_scope_id: ScopeId,
     next_offset: usize,
+    /// DIAG: unique allocator instance ID
+    diag_id: usize,
 }
 
 impl ScopedSpillAllocator {
     pub fn new() -> Self {
+        static COUNTER: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+        let id = COUNTER.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         Self {
             slots: Vec::new(),
             free_list: Vec::new(),
@@ -128,6 +132,7 @@ impl ScopedSpillAllocator {
             scope_slots: std::collections::HashMap::new(),
             next_scope_id: 0,
             next_offset: 0,
+            diag_id: id,
         }
     }
 
@@ -144,6 +149,11 @@ impl ScopedSpillAllocator {
         // 优先从 free_list 找 size 完全匹配的 slot
         if let Some(pos) = self.free_list.iter().position(|&idx| self.slots[idx].size == size) {
             let idx = self.free_list.remove(pos);
+            // DIAG: track slot reuse at offset 3720 (0xe88)
+            if self.slots[idx].offset == 3720 {
+                eprintln!("[SPILL-REUSE] alloc={} offset=3720 slot_idx={}: old_vreg={:?} -> new_vreg={:?} scope={:?}",
+                    self.diag_id, idx, self.slots[idx].vreg, vreg, scope_id);
+            }
             self.slots[idx].state = SlotState::Occupied;
             self.slots[idx].vreg = Some(vreg);
             self.slots[idx].owner = scope_id;
@@ -156,6 +166,11 @@ impl ScopedSpillAllocator {
         // 无匹配：分配新 slot
         let offset = self.next_offset;
         self.next_offset += size;
+        // DIAG: track new allocation at offset 3720
+        if offset <= 3720 && offset + size > 3720 {
+            eprintln!("[SPILL-NEW] alloc={} overlap with 3720: offset={} size={} vreg={:?} scope={:?} slots_len={} next_offset={}",
+                self.diag_id, offset, size, vreg, scope_id, self.slots.len(), self.next_offset);
+        }
         let info = SpillSlotInfo {
             offset,
             size,

@@ -1,7 +1,7 @@
 //! Mega-Kernel ABI — whole-model single-entry-point function signature.
 //!
 //! Replaces the per-node `CompiledLayerFn` (10 params) with a single mega-kernel
-//! that does: embedding → N layer loops → lm_head → sampling → generate loop.
+//! that does: embedding → N layer loops → logits producer → sampling → generate loop.
 //!
 //! See SPEC 08-EXECUTOR.md §4.1.3 for the canonical ABI definition.
 
@@ -9,15 +9,18 @@
 
 /// Output mode — multiple output heads for the same model (HEAD-ROUTING.md).
 ///
-/// All output modes are compiled into a single mega-kernel function.
 /// Runtime switching via `output_mode_selector` ABI parameter = zero recompilation.
+///
+/// DELETED: OutputModeDispatch JMP table mechanism removed (SPEC/39 §7).
+/// Head Routing now compiles multiple MegaKernel functions instead.
+/// OutputMode enum remains for BUILD-stage strategy selection only.
 #[derive(Debug, Clone)]
 pub enum OutputMode {
-    /// Autoregressive generation: lm_head → argmax → store → check → loop
+    /// Autoregressive generation: logits producer → argmax → store → check → loop
     Generate { max_new_tokens: usize, eos_token_id: u32 },
-    /// Binary classification: lm_head → write positive/negative token logits
+    /// Binary classification: logits producer → write positive/negative token logits
     ClassifyBinary { positive_token_id: u32, negative_token_id: u32 },
-    /// Multi-way classification: lm_head → write N label token logits
+    /// Multi-way classification: logits producer → write N label token logits
     ClassifyMultiway { label_token_ids: Vec<u32> },
     /// Mid-layer encoding: truncate at anchor layer → pool hidden state
     EncodeToLayer { anchor_layer: usize, pool_mode: PoolMode },
@@ -54,7 +57,7 @@ pub struct CotStepConfig {
 /// MTP (Multi-Token Prediction) configuration for JIT codegen.
 ///
 /// When present, the mega-kernel generates K candidate tokens per decode step
-/// by running depth additional projection passes after the main lm_head.
+/// by running depth additional projection passes after the main logits producer.
 /// Each depth projects the current hidden state to vocab logits via a dedicated
 /// weight matrix packed in the weight blob.
 #[derive(Debug, Clone)]
@@ -68,71 +71,57 @@ pub struct MtpKernelConfig {
     pub vocab_size: usize,
 }
 
-/// FFN activation function kind for mega-kernel graph builder.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum FfnActivation {
-    /// SiLU(gate) * up (Llama, Qwen, Mistral — default)
-    SwiGLU,
-    /// GELU(gate) * up (Gemma 4)
-    GeGLU,
-    /// GELU(up) — non-gated single-projection FFN (Gemma 2 non-gated variant)
-    Gelu,
-}
-
 /// Business configuration for mega-kernel compilation (§1.5).
 ///
 /// Declared at model load time → affects CompilerGraph construction →
 /// compiled as conditional branches embedded in the mega-kernel.
 /// Disabled features produce zero instruction overhead (not even runtime if-else).
 #[derive(Debug, Clone)]
-pub struct MegaKernelBusinessConfig {
+pub struct BusinessConfig {
     /// Output modes to compile (can be multiple for zero-recompilation switching).
+    /// SPEC/39 NOTE: 编译器不直接读取此字段。output_modes 通过 GraphTopologyAnalysis
+    /// 间接使用（has_classify_binary/has_classify_multiway/has_encode_to_layer/max_new_tokens/eos_token_id）。
     pub output_modes: Vec<OutputMode>,
     /// Whether to compile post_node veto probes (GuardrailCheck ops).
+    /// SPEC/39 NOTE: 编译器不读取此字段。GuardrailCheck op 存在性由图拓扑推导。
     pub guardrail_enabled: bool,
     /// Semantic Gatekeeper configuration (knowledge injection + hidden extraction).
+    /// SPEC/39 NOTE: 编译器不读取此字段。SgDetect/SgInject op 存在性由图拓扑推导。
     pub semantic_gatekeeper: Option<SgConfig>,
     /// Intent Recall anchor layer (enables EarlyExit op at this layer).
+    /// SPEC/39 NOTE: 编译器不读取此字段。EarlyExit op 存在性由图拓扑推导。
     pub intent_anchor_layer: Option<usize>,
     /// CoT Step Hook configuration (step control after each inference step).
+    /// SPEC/39 NOTE: 编译器不读取此字段。CotStepHook op 存在性由图拓扑推导。
     pub cot_step_hook: Option<CotStepConfig>,
     /// Whether model uses HeadRmsNorm on Q/K after projection (Qwen3 q_norm/k_norm).
-    pub has_head_rms_norm: bool,
-    /// HeadRmsNorm epsilon (only used when has_head_rms_norm=true).
-    pub head_rms_norm_eps: f32,
-    /// FFN activation function (default: SwiGLU).
-    pub ffn_activation: FfnActivation,
-    /// Whether model uses QkNorm (Gemma 4 per-head L2 normalization + √head_dim rescale).
-    /// Mutually exclusive with has_head_rms_norm.
-    pub has_qk_norm: bool,
-    /// Whether model uses ValueNorm (Gemma 4 V-head RMSNorm without learned weight).
-    pub has_value_norm: bool,
-    /// ValueNorm epsilon (only used when has_value_norm=true).
-    pub value_norm_eps: f32,
-    /// Logit softcapping: `cap * tanh(logits / cap)` before argmax.
-    /// None = no softcapping (default).
-    pub logit_softcapping: Option<f32>,
-    /// Embedding scaling factor applied after Gather.
-    /// Gemma models use sqrt(hidden_size); None = no scaling (default).
-    pub embedding_scale: Option<f32>,
+    // REMOVED (SPEC/39): has_head_rms_norm — now derived from OpKind::HeadRmsNorm topology.
+    // REMOVED (SPEC/39): head_rms_norm_eps — now derived from OpKind::HeadRmsNorm { eps }.
+    // REMOVED (SPEC/39): ffn_activation — now derived from OpKind::SwiGlu/GeGlu/Gelu topology.
+    // REMOVED (SPEC/39): has_qk_norm — now derived from OpKind::QkNorm topology.
+    // REMOVED (SPEC/39): has_value_norm — now derived from OpKind::ValueNorm topology.
+    // REMOVED (SPEC/39): value_norm_eps — now derived from OpKind::ValueNorm { eps }.
+    // REMOVED (SPEC/39): logit_softcapping — now derived from OpKind::LogitSoftcap { cap } topology.
+    // REMOVED (SPEC/39): embedding_scale — now derived from OpKind::Gather::scale / OpKind::QuantGather::scale.
     /// Whether to compile session KV cache restore (cross-turn KV reuse).
     /// When enabled, embed phase checks session_position > 0 → skip processed tokens.
+    /// SPEC/39 NOTE: 编译器不读取此字段。SessionSkipProcessed op 存在性由图拓扑推导。
     pub session_enabled: bool,
     /// Whether to compile multimodal fused hidden injection.
     /// When enabled, embed phase reads fused_hidden_ptr → ADD to token embedding.
+    /// SPEC/39 NOTE: 编译器不读取此字段。MultimodalInject op 存在性由图拓扑推导。
     pub multimodal_enabled: bool,
     /// Whether to compile JIT debug instrumentation (INT3 breakpoints + source map).
     /// When disabled (default): zero instruction overhead, no source map generated.
     /// When enabled: DebugBreakpoint/DebugMarker VmInstr inserted at key points,
     ///   INT3 instructions in machine code, JitSourceMap attached to compile output.
+    /// SPEC/39 NOTE: 此字段是唯一合法的编译器直接读取参数——debug_jit 影响全局
+    /// codegen 行为（INT3 插入、source map 生成），不是 OpKind 可表达的。
     pub debug_jit: bool,
-    /// MTP (Multi-Token Prediction) configuration.
-    /// When enabled, mega-kernel generates K candidate tokens per decode step
-    /// via depth additional projection passes after the main lm_head.
-    pub mtp_config: Option<MtpKernelConfig>,
+    // REMOVED (SPEC/39): mtp_config — now derived from topology.mtp_config (OpKind::MtpDraft).
 }
 
-impl Default for MegaKernelBusinessConfig {
+impl Default for BusinessConfig {
     fn default() -> Self {
         Self {
             output_modes: vec![OutputMode::Generate {
@@ -143,18 +132,9 @@ impl Default for MegaKernelBusinessConfig {
             semantic_gatekeeper: None,
             intent_anchor_layer: None,
             cot_step_hook: None,
-            has_head_rms_norm: false,
-            head_rms_norm_eps: 1e-6,
-            ffn_activation: FfnActivation::SwiGLU,
-            has_qk_norm: false,
-            has_value_norm: false,
-            value_norm_eps: 1e-6,
-            logit_softcapping: None,
-            embedding_scale: None,
             session_enabled: false,
             multimodal_enabled: false,
             debug_jit: false,
-            mtp_config: None,
         }
     }
 }
@@ -172,14 +152,10 @@ impl Default for MegaKernelBusinessConfig {
 ///    aux_ptr, batch_size,    ← register params (rdi..r9)
 ///    prompt_len, scratchpad_ptr, output_tokens_ptr,
 ///    temperature_u32, top_k, top_p_u32, max_new_tokens, eos_token_id,
-///    output_mode_selector, hook_ctx_ptr, telemetry_ptr)
-///    ← stack params ([rbp+16]..[rbp+96])
+///    hook_ctx_ptr, telemetry_ptr)
+///    ← stack params ([rbp+16]..[rbp+88])
 ///    → rax: generated token count (generate) | 0 (classify/encode)
 /// ```
-///
-/// `output_mode_selector` drives the JMP table at the tail of the mega-kernel:
-///   0 = Generate (default), 1 = ClassifyBinary, 2 = ClassifyMultiway, 3 = EncodeToLayer.
-/// Old callers passing 16 params have NULL (0) at [rbp+80] → interpreted as Generate → compatible.
 pub type MegaKernelFn = unsafe extern "C" fn(
     *const u32,   // arg 0: input_ids_ptr         → rdi  (prompt token ID array)
     *const u8,    // arg 1: weight_blob_ptr        → rsi  (all weights contiguous)
@@ -196,15 +172,14 @@ pub type MegaKernelFn = unsafe extern "C" fn(
     usize,        // arg 11: top_p_u32             → [rbp+56] (f32::to_bits() as usize)
     usize,        // arg 12: max_new_tokens        → [rbp+64]
     usize,        // arg 13: eos_token_id          → [rbp+72]
-    usize,        // arg 14: output_mode_selector  → [rbp+80] (0=Generate, 1=ClassifyBinary, 2=ClassifyMultiway, 3=EncodeToLayer)
-    *const u8,    // arg 15: hook_ctx_ptr          → [rbp+88]
-    *mut u8,      // arg 16: telemetry_ptr         → [rbp+96]
-    usize,        // arg 17: session_position      → [rbp+104] (0 = new session, >0 = resume position)
-    *const u8,    // arg 18: fused_hidden_ptr      → [rbp+112] (NULL = no multimodal injection)
-    usize,        // arg 19: num_mm_tokens          → [rbp+120] (number of multimodal tokens to inject)
-    *const u8,    // arg 20: callback_table_ptr    → [rbp+128] (NULL = no callbacks, C-style fn_ptr array)
-    *const u32,   // arg 21: page_table_ptr        → [rbp+136] (NULL = contiguous KV, u32[] = paged KV)
-    *const u8,    // arg 22: batch_ctx_ptr         → [rbp+144] (NULL = single-seq legacy, non-NULL = batch mode)
+    *const u8,    // arg 14: hook_ctx_ptr          → [rbp+80]
+    *mut u8,      // arg 15: telemetry_ptr         → [rbp+88]
+    usize,        // arg 16: session_position      → [rbp+96] (0 = new session, >0 = resume position)
+    *const u8,    // arg 17: fused_hidden_ptr      → [rbp+104] (NULL = no multimodal injection)
+    usize,        // arg 18: num_mm_tokens          → [rbp+112] (number of multimodal tokens to inject)
+    *const u8,    // arg 19: callback_table_ptr    → [rbp+120] (NULL = no callbacks, C-style fn_ptr array)
+    *const u32,   // arg 20: page_table_ptr        → [rbp+128] (NULL = contiguous KV, u32[] = paged KV)
+    *const u8,    // arg 21: batch_ctx_ptr         → [rbp+136] (NULL = single-seq legacy, non-NULL = batch mode)
 ) -> usize;      // → rax: generated token count (generate) | 0 (classify/encode)
 
 /// ABI parameter names in order. Used by SymDimSlotMap to resolve
@@ -224,15 +199,14 @@ pub const MEGA_KERNEL_PARAMS: &[&str] = &[
     "top_p_u32",            // arg 11 → [rbp+56] (f32::to_bits())
     "max_new_tokens",       // arg 12 → [rbp+64]
     "eos_token_id",         // arg 13 → [rbp+72]
-    "output_mode_selector", // arg 14 → [rbp+80] (0=Generate, 1=ClassifyBinary, 2=ClassifyMultiway, 3=EncodeToLayer)
-    "hook_ctx_ptr",         // arg 15 → [rbp+88]
-    "telemetry_ptr",        // arg 16 → [rbp+96]
-    "session_position",     // arg 17 → [rbp+104] (0 = new session, >0 = resume position)
-    "fused_hidden_ptr",     // arg 18 → [rbp+112] (NULL = no multimodal injection)
-    "num_mm_tokens",        // arg 19 → [rbp+120] (number of multimodal tokens to inject)
-    "callback_table_ptr",   // arg 20 → [rbp+128] (NULL = no callbacks)
-    "page_table_ptr",       // arg 21 → [rbp+136] (NULL = contiguous KV, u32[] = paged KV)
-    "batch_ctx_ptr",        // arg 22 → [rbp+144] (NULL = single-seq legacy mode, non-NULL = batch mode)
+    "hook_ctx_ptr",         // arg 14 → [rbp+80]
+    "telemetry_ptr",        // arg 15 → [rbp+88]
+    "session_position",     // arg 16 → [rbp+96] (0 = new session, >0 = resume position)
+    "fused_hidden_ptr",     // arg 17 → [rbp+104] (NULL = no multimodal injection)
+    "num_mm_tokens",        // arg 18 → [rbp+112] (number of multimodal tokens to inject)
+    "callback_table_ptr",   // arg 19 → [rbp+120] (NULL = no callbacks)
+    "page_table_ptr",       // arg 20 → [rbp+128] (NULL = contiguous KV, u32[] = paged KV)
+    "batch_ctx_ptr",        // arg 21 → [rbp+136] (NULL = single-seq legacy mode, non-NULL = batch mode)
 ];
 
 /// Stack parameter byte offsets (relative to [rbp+16] after standard prologue).
@@ -247,15 +221,14 @@ pub const MEGA_KERNEL_STACK_OFFSETS: &[i32] = &[
     56,  // top_p_u32              → [rbp+56]
     64,  // max_new_tokens         → [rbp+64]
     72,  // eos_token_id           → [rbp+72]
-    80,  // output_mode_selector   → [rbp+80]
-    88,  // hook_ctx_ptr           → [rbp+88]
-    96,  // telemetry_ptr          → [rbp+96]
-    104, // session_position       → [rbp+104]
-    112, // fused_hidden_ptr       → [rbp+112]
-    120, // num_mm_tokens          → [rbp+120]
-    128, // callback_table_ptr     → [rbp+128]
-    136, // page_table_ptr         → [rbp+136]
-    144, // batch_ctx_ptr          → [rbp+144]
+    80,  // hook_ctx_ptr           → [rbp+80]
+    88,  // telemetry_ptr          → [rbp+88]
+    96,  // session_position       → [rbp+96]
+    104, // fused_hidden_ptr       → [rbp+104]
+    112, // num_mm_tokens          → [rbp+112]
+    120, // callback_table_ptr     → [rbp+120]
+    128, // page_table_ptr         → [rbp+128]
+    136, // batch_ctx_ptr          → [rbp+136]
 ];
 
 // ── Model geometry config ──────────────────────────────────────────
@@ -266,14 +239,22 @@ pub const MEGA_KERNEL_STACK_OFFSETS: &[i32] = &[
 /// Slim runtime configuration for graph-driven mega-kernel compilation.
 /// Geometry (hidden, num_heads, etc.) is derived from the CompilerGraph.
 /// Only non-derivable fields remain here.
+///
+/// SPEC/39: BusinessConfig has been removed from CompileConfig — the compiler
+/// reads no business parameters except `debug_jit`, which is the sole field
+/// that affects global codegen behavior (INT3 insertion, source map generation)
+/// and cannot be expressed as an OpKind. All other business fields (output_modes,
+/// guardrail_enabled, etc.) affect BUILD-stage graph construction only, and are
+/// not read by the compiler at all.
 #[derive(Debug, Clone)]
-pub struct MegaKernelConfig {
+pub struct CompileConfig {
     /// Maximum sequence length (buffer allocation, NOT in tensor shapes).
     pub max_seq_len: usize,
-    /// Number of EOS token IDs.
-    pub num_eos_tokens: usize,
-    /// Business configuration (output modes, guardrail, SG, intent, CoT).
-    pub business_config: MegaKernelBusinessConfig,
+    /// Enable JIT debug instrumentation (INT3 breakpoints + source map).
+    /// This is the only "business" parameter the compiler reads directly —
+    /// debug_jit affects global codegen behavior, not something OpKind can express.
+    /// Promoted from BusinessConfig to CompileConfig top level (SPEC/39).
+    pub debug_jit: bool,
     /// Heterogeneous layer configuration.
     pub hetero: Option<HeteroLayerConfig>,
 }
@@ -291,10 +272,14 @@ pub struct HeteroLayerConfig {
     pub sliding_per_segment: usize,
     /// Head dimension for sliding attention layers.
     pub sliding_head_dim: usize,
+    /// Number of Q heads for sliding layers (Gemma 4 E2B: 4, derived from q_dim / head_dim).
+    pub sliding_num_q_heads: usize,
     /// Number of KV heads for sliding layers.
     pub sliding_num_kv_heads: usize,
     /// Head dimension for full attention layers.
     pub full_head_dim: usize,
+    /// Number of Q heads for full layers (Gemma 4 E2B: 8, derived from q_dim / head_dim).
+    pub full_num_q_heads: usize,
     /// Number of KV heads for full layers (same as sliding for Gemma-4).
     pub full_num_kv_heads: usize,
     /// Original layer indices for full attention layers (for weight packing / KV cache mapping).
@@ -311,29 +296,29 @@ pub struct HeteroLayerConfig {
 
 /// Layout of the contiguous weight blob for mega-kernel execution.
 ///
-/// Weights are packed in order: embed → layer_0 → layer_1 → ... → lm_head.
+/// Weights are packed in order: embed → layer_0 → layer_1 → ... → logits_producer.
 /// Each layer's weights follow a fixed internal order.
 /// Byte offsets are baked as immediates in JIT code.
 #[derive(Debug, Clone)]
-pub struct MegaKernelWeightLayout {
+pub struct KernelWeightLayout {
     /// Byte offset of the embedding weight matrix.
     pub embed_offset: usize,
     /// Byte size of the embedding weight matrix.
     pub embed_bytes: usize,
-    /// Byte offset of the first decoder layer's weights.
+    /// Byte offset of the first layer's weights.
     pub layer_0_offset: usize,
     /// Byte stride between consecutive layers (all layers have identical weight shapes).
     pub layer_stride: usize,
     /// Per-layer weight breakdown (offsets relative to layer base).
     pub per_layer: PerLayerWeightLayout,
-    /// Byte offset of the final RMSNorm weight (between last layer and lm_head).
+    /// Byte offset of the final RMSNorm weight (between last layer and logits producer).
     pub final_norm_offset: usize,
     /// Byte size of the final RMSNorm weight.
     pub final_norm_bytes: usize,
-    /// Byte offset of the lm_head weight matrix.
-    pub lm_head_offset: usize,
-    /// Byte size of the lm_head weight matrix.
-    pub lm_head_bytes: usize,
+    /// Byte offset of the logits producer weight matrix.
+    pub logits_producer_offset: usize,
+    /// Byte size of the logits producer weight matrix.
+    pub logits_producer_bytes: usize,
     /// Total weight blob size in bytes.
     pub total_bytes: usize,
 }
@@ -367,7 +352,7 @@ pub struct PerLayerWeightLayout {
     pub w_down_bytes: usize,
 }
 
-impl MegaKernelWeightLayout {
+impl KernelWeightLayout {
     /// Compute weight layout from graph-derived geometry.
     pub fn from_graph_geometry(geo: &super::graph_geometry::GraphDerivedGeometry) -> Self {
         Self::build(
@@ -415,9 +400,9 @@ impl MegaKernelWeightLayout {
         let final_norm_bytes = hidden * elem_bytes;
         let final_norm_offset = layer_0_offset + num_layers * layer_stride;
 
-        let lm_head_offset = final_norm_offset + final_norm_bytes;
-        let lm_head_bytes = vocab_size * hidden * elem_bytes;
-        let total_bytes = lm_head_offset + lm_head_bytes;
+        let logits_producer_offset = final_norm_offset + final_norm_bytes;
+        let logits_producer_bytes = vocab_size * hidden * elem_bytes;
+        let total_bytes = logits_producer_offset + logits_producer_bytes;
 
         let o0 = 0;
         let o1 = o0 + attn_norm_bytes;
@@ -464,8 +449,8 @@ impl MegaKernelWeightLayout {
             per_layer,
             final_norm_offset,
             final_norm_bytes,
-            lm_head_offset,
-            lm_head_bytes,
+            logits_producer_offset,
+            logits_producer_bytes,
             total_bytes,
         }
     }
@@ -482,7 +467,7 @@ impl MegaKernelWeightLayout {
 /// Supports 4 layer types (Gemma-4 E2B): sliding_small, full_small, sliding_large, full_large.
 /// "small" vs "large" refers to FFN intermediate size, which differs by segment.
 #[derive(Debug, Clone)]
-pub struct HeteroWeightLayout {
+pub struct HeteroKernelWeightLayout {
     pub embed_offset: usize,
     pub embed_bytes: usize,
     pub layer_0_offset: usize,
@@ -510,12 +495,12 @@ pub struct HeteroWeightLayout {
     pub large_ffn_start_segment: usize,
     pub final_norm_offset: usize,
     pub final_norm_bytes: usize,
-    pub lm_head_offset: usize,
-    pub lm_head_bytes: usize,
+    pub logits_producer_offset: usize,
+    pub logits_producer_bytes: usize,
     pub total_bytes: usize,
 }
 
-impl HeteroWeightLayout {
+impl HeteroKernelWeightLayout {
     /// Build from graph-derived geometry instead of ModelMegaConfig.
     pub fn from_geometry_and_config(
         geo: &super::graph_geometry::GraphDerivedGeometry,
@@ -585,27 +570,27 @@ impl HeteroWeightLayout {
         };
 
         let (sliding_small_pl, sliding_small_total) = compute_wl(
-            h, num_heads * hetero.sliding_head_dim,
+            h, hetero.sliding_num_q_heads * hetero.sliding_head_dim,
             hetero.sliding_num_kv_heads * hetero.sliding_head_dim,
-            num_heads * hetero.sliding_head_dim,
+            hetero.sliding_num_q_heads * hetero.sliding_head_dim,
             hetero.sliding_head_dim, hetero.small_intermediate, elem_bytes,
         );
         let (full_small_pl, full_small_total) = compute_wl(
-            h, num_heads * hetero.full_head_dim,
+            h, hetero.full_num_q_heads * hetero.full_head_dim,
             hetero.full_num_kv_heads * hetero.full_head_dim,
-            num_heads * hetero.full_head_dim,
+            hetero.full_num_q_heads * hetero.full_head_dim,
             hetero.full_head_dim, hetero.small_intermediate, elem_bytes,
         );
         let (sliding_large_pl, sliding_large_total) = compute_wl(
-            h, num_heads * hetero.sliding_head_dim,
+            h, hetero.sliding_num_q_heads * hetero.sliding_head_dim,
             hetero.sliding_num_kv_heads * hetero.sliding_head_dim,
-            num_heads * hetero.sliding_head_dim,
+            hetero.sliding_num_q_heads * hetero.sliding_head_dim,
             hetero.sliding_head_dim, hetero.large_intermediate, elem_bytes,
         );
         let (full_large_pl, full_large_total) = compute_wl(
-            h, num_heads * hetero.full_head_dim,
+            h, hetero.full_num_q_heads * hetero.full_head_dim,
             hetero.full_num_kv_heads * hetero.full_head_dim,
-            num_heads * hetero.full_head_dim,
+            hetero.full_num_q_heads * hetero.full_head_dim,
             hetero.full_head_dim, hetero.large_intermediate, elem_bytes,
         );
 
@@ -618,8 +603,8 @@ impl HeteroWeightLayout {
 
         let final_norm_bytes = h * elem_bytes;
         let final_norm_offset = layer_0_offset + layers_blob_bytes;
-        let lm_head_bytes = vocab_size * h * elem_bytes;
-        let lm_head_offset = final_norm_offset + final_norm_bytes;
+        let logits_producer_bytes = vocab_size * h * elem_bytes;
+        let logits_producer_offset = final_norm_offset + final_norm_bytes;
 
         Self {
             embed_offset: 0,
@@ -638,9 +623,9 @@ impl HeteroWeightLayout {
             large_ffn_start_segment: hetero.large_ffn_start_segment,
             final_norm_offset,
             final_norm_bytes,
-            lm_head_offset,
-            lm_head_bytes,
-            total_bytes: lm_head_offset + lm_head_bytes,
+            logits_producer_offset,
+            logits_producer_bytes,
+            total_bytes: logits_producer_offset + logits_producer_bytes,
         }
     }
 }
@@ -652,7 +637,7 @@ impl HeteroWeightLayout {
 /// All offsets are relative to the scratchpad pointer (arg 7).
 /// Activation ping/pong buffers alternate between layers.
 #[derive(Debug, Clone)]
-pub struct MegaKernelBufferLayout {
+pub struct BufferLayout {
     /// Activation buffer A (ping): max_seq_len × hidden × elem_bytes
     pub activation_a_offset: usize,
     /// Activation buffer B (pong): same size
@@ -677,7 +662,7 @@ pub struct MegaKernelBufferLayout {
     pub total_scratchpad_bytes: usize,
 }
 
-impl MegaKernelBufferLayout {
+impl BufferLayout {
     /// Compute buffer layout from graph-derived geometry + max_seq_len.
     ///
     /// Single-sequence mode: activation_dim == max_seq_len (M = 1 × seq_len).
@@ -811,20 +796,11 @@ mod tests {
         assert_eq!(modes.len(), 3);
     }
 
-    // ── FfnActivation ─────────────────────────────────────────────────
-
-    #[test]
-    fn ffn_activation_equality() {
-        assert_eq!(FfnActivation::SwiGLU, FfnActivation::SwiGLU);
-        assert_ne!(FfnActivation::SwiGLU, FfnActivation::GeGLU);
-        assert_ne!(FfnActivation::GeGLU, FfnActivation::Gelu);
-    }
-
-    // ── MegaKernelBusinessConfig default ──────────────────────────────
+    // ── BusinessConfig default ──────────────────────────────
 
     #[test]
     fn business_config_default_output_mode() {
-        let cfg = MegaKernelBusinessConfig::default();
+        let cfg = BusinessConfig::default();
         assert_eq!(cfg.output_modes.len(), 1);
         match &cfg.output_modes[0] {
             OutputMode::Generate { max_new_tokens, eos_token_id } => {
@@ -837,35 +813,21 @@ mod tests {
 
     #[test]
     fn business_config_default_flags_off() {
-        let cfg = MegaKernelBusinessConfig::default();
+        let cfg = BusinessConfig::default();
         assert!(!cfg.guardrail_enabled);
         assert!(cfg.semantic_gatekeeper.is_none());
         assert!(cfg.intent_anchor_layer.is_none());
         assert!(cfg.cot_step_hook.is_none());
-        assert!(!cfg.has_head_rms_norm);
-        assert!(!cfg.has_qk_norm);
-        assert!(!cfg.has_value_norm);
-        assert!(cfg.logit_softcapping.is_none());
-        assert!(cfg.embedding_scale.is_none());
         assert!(!cfg.session_enabled);
         assert!(!cfg.multimodal_enabled);
         assert!(!cfg.debug_jit);
-        assert!(cfg.mtp_config.is_none());
-    }
-
-    #[test]
-    fn business_config_default_values() {
-        let cfg = MegaKernelBusinessConfig::default();
-        assert!((cfg.head_rms_norm_eps - 1e-6).abs() < 1e-10);
-        assert_eq!(cfg.ffn_activation, FfnActivation::SwiGLU);
-        assert!((cfg.value_norm_eps - 1e-6).abs() < 1e-10);
     }
 
     // ── ABI constants ─────────────────────────────────────────────────
 
     #[test]
     fn mega_kernel_params_count() {
-        assert_eq!(MEGA_KERNEL_PARAMS.len(), 23);
+        assert_eq!(MEGA_KERNEL_PARAMS.len(), 22);
     }
 
     #[test]
@@ -885,12 +847,12 @@ mod tests {
 
     #[test]
     fn mega_kernel_params_last() {
-        assert_eq!(MEGA_KERNEL_PARAMS[22], "batch_ctx_ptr");
+        assert_eq!(MEGA_KERNEL_PARAMS[21], "batch_ctx_ptr");
     }
 
     #[test]
     fn mega_kernel_stack_offsets_count() {
-        assert_eq!(MEGA_KERNEL_STACK_OFFSETS.len(), 17);
+        assert_eq!(MEGA_KERNEL_STACK_OFFSETS.len(), 16);
     }
 
     #[test]
@@ -906,8 +868,8 @@ mod tests {
     }
 
     #[test]
-    fn mega_kernel_stack_offsets_end_at_144() {
-        assert_eq!(*MEGA_KERNEL_STACK_OFFSETS.last().unwrap(), 144);
+    fn mega_kernel_stack_offsets_end_at_136() {
+        assert_eq!(*MEGA_KERNEL_STACK_OFFSETS.last().unwrap(), 136);
     }
 
     #[test]
@@ -917,11 +879,11 @@ mod tests {
         }
     }
 
-    // ── MegaKernelWeightLayout ────────────────────────────────────────
+    // ── WeightLayout ────────────────────────────────────────
 
     #[test]
     fn weight_layout_build_symmetric_qkv() {
-        let wl = MegaKernelWeightLayout::build(
+        let wl = KernelWeightLayout::build(
             2,    // elem_bytes (BF16)
             4096, // hidden
             11008, // intermediate
@@ -945,7 +907,7 @@ mod tests {
 
     #[test]
     fn weight_layout_gqa_smaller_kv() {
-        let wl = MegaKernelWeightLayout::build(
+        let wl = KernelWeightLayout::build(
             2, 4096, 11008, 32, 32, 8, 128, 32000,
         );
         let q_bytes = wl.per_layer.w_q_bytes;
@@ -959,7 +921,7 @@ mod tests {
 
     #[test]
     fn weight_layout_layer_base_offset() {
-        let wl = MegaKernelWeightLayout::build(2, 4096, 11008, 2, 32, 32, 128, 32000);
+        let wl = KernelWeightLayout::build(2, 4096, 11008, 2, 32, 32, 128, 32000);
 
         assert_eq!(wl.layer_base_offset(0), wl.layer_0_offset);
         assert_eq!(wl.layer_base_offset(1), wl.layer_0_offset + wl.layer_stride);
@@ -967,7 +929,7 @@ mod tests {
 
     #[test]
     fn weight_layout_per_layer_offsets_contiguous() {
-        let wl = MegaKernelWeightLayout::build(2, 4096, 11008, 1, 32, 8, 128, 32000);
+        let wl = KernelWeightLayout::build(2, 4096, 11008, 1, 32, 8, 128, 32000);
         let pl = &wl.per_layer;
 
         assert_eq!(pl.w_q_offset, pl.attn_norm_offset + pl.attn_norm_bytes);
@@ -984,17 +946,17 @@ mod tests {
 
     #[test]
     fn weight_layout_total_bytes_consistent() {
-        let wl = MegaKernelWeightLayout::build(2, 4096, 11008, 4, 32, 8, 128, 32000);
-        let expected = wl.lm_head_offset + wl.lm_head_bytes;
+        let wl = KernelWeightLayout::build(2, 4096, 11008, 4, 32, 8, 128, 32000);
+        let expected = wl.logits_producer_offset + wl.logits_producer_bytes;
         assert_eq!(wl.total_bytes, expected);
         assert!(wl.total_bytes > 0);
     }
 
-    // ── MegaKernelBufferLayout ────────────────────────────────────────
+    // ── BufferLayout ────────────────────────────────────────
 
     #[test]
     fn buffer_layout_activation_ping_pong() {
-        let bl = MegaKernelBufferLayout::build(2, 512, 4096, 32000);
+        let bl = BufferLayout::build(2, 512, 4096, 32000);
         assert_eq!(bl.activation_a_offset, 0);
         assert_eq!(bl.activation_b_offset, bl.activation_bytes);
         assert_eq!(bl.activation_bytes, 512 * 4096 * 2);
@@ -1002,21 +964,21 @@ mod tests {
 
     #[test]
     fn buffer_layout_logits_after_activations() {
-        let bl = MegaKernelBufferLayout::build(2, 512, 4096, 32000);
+        let bl = BufferLayout::build(2, 512, 4096, 32000);
         assert_eq!(bl.logits_offset, bl.activation_b_offset + bl.activation_bytes);
         assert_eq!(bl.logits_bytes, 512 * 32000 * 2);
     }
 
     #[test]
     fn buffer_layout_sampling_after_logits() {
-        let bl = MegaKernelBufferLayout::build(2, 512, 4096, 32000);
+        let bl = BufferLayout::build(2, 512, 4096, 32000);
         assert_eq!(bl.sampling_workspace_offset, bl.logits_offset + bl.logits_bytes);
         assert_eq!(bl.sampling_workspace_bytes, 32000 * 2 * 4);
     }
 
     #[test]
     fn buffer_layout_sg_data() {
-        let bl = MegaKernelBufferLayout::build(2, 128, 768, 50000);
+        let bl = BufferLayout::build(2, 128, 768, 50000);
         let sg_hidden = 768 * 2;
         assert_eq!(bl.sg_detect_offset, bl.sampling_workspace_offset + bl.sampling_workspace_bytes);
         assert_eq!(bl.sg_knowledge_offset, bl.sg_detect_offset + sg_hidden);
@@ -1025,7 +987,7 @@ mod tests {
 
     #[test]
     fn buffer_layout_total_scratchpad() {
-        let bl = MegaKernelBufferLayout::build(4, 256, 1024, 5000);
+        let bl = BufferLayout::build(4, 256, 1024, 5000);
         assert_eq!(bl.total_scratchpad_bytes, bl.sg_knowledge_offset + 1024 * 4);
     }
 
@@ -1037,8 +999,10 @@ mod tests {
             num_segments: 7,
             sliding_per_segment: 4,
             sliding_head_dim: 256,
+            sliding_num_q_heads: 4,
             sliding_num_kv_heads: 1,
             full_head_dim: 256,
+            full_num_q_heads: 8,
             full_num_kv_heads: 1,
             full_layer_indices: vec![4, 9, 14, 19, 24, 29, 34],
             small_intermediate: 4096,
@@ -1082,17 +1046,17 @@ mod tests {
         assert_eq!(cfg.hidden_size, 4096);
     }
 
-    // ── MegaKernelConfig ──────────────────────────────────────────────
+    // ── CompileConfig ──────────────────────────────────────────────
 
     #[test]
     fn mega_kernel_config_fields() {
-        let cfg = MegaKernelConfig {
+        let cfg = CompileConfig {
             max_seq_len: 4096,
-            num_eos_tokens: 1,
-            business_config: MegaKernelBusinessConfig::default(),
+            debug_jit: false,
             hetero: None,
         };
         assert_eq!(cfg.max_seq_len, 4096);
+        assert!(!cfg.debug_jit);
         assert!(cfg.hetero.is_none());
     }
 }

@@ -1,6 +1,6 @@
 //! Loop body symbolic execution and reduction detection.
 //!
-//! Phase 2 of the control-flow upgrade: symbolically executes a single loop
+//! Step 2 of the control-flow upgrade: symbolically executes a single loop
 //! iteration to identify accumulator patterns (Sum, Max, Min reductions)
 //! and per-element transforms.
 
@@ -475,7 +475,7 @@ fn symvalue_to_reduce_body(expr: &SymValue) -> Vec<TraceOp> {
 }
 
 // ---------------------------------------------------------------------------
-// Nested loop analysis (Phase 5)
+// Nested loop analysis
 // ---------------------------------------------------------------------------
 
 /// Result of analyzing a nested loop structure.

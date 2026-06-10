@@ -1,8 +1,49 @@
-//! Fusion types — FusionGroup, FusionMode, FusionPlan, FusionCost.
+//! Fusion types — FusionGroup, FusionMode, FusionPlan, FusionCost, GroupMarker, HeteroLayerType.
 
 use std::collections::HashMap;
 use crate::compiler::graph::{CompilerGraph, MultiOutputConfig, OpId};
 use crate::compiler::trace::QuantPrecision;
+
+/// REQ-UMK-012: 异构层类型枚举 (Gemma 4 风格: sliding/full × small/large FFN).
+/// 携带在 FusionGroup.hetero_layer_type 上，从图拓扑推导而非 label 前缀。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum HeteroLayerType {
+    /// Sliding attention + small FFN
+    SlidingSmall,
+    /// Full attention + small FFN
+    FullSmall,
+    /// Sliding attention + large FFN
+    SlidingLarge,
+    /// Full attention + large FFN
+    FullLarge,
+}
+
+/// Fusion 融合引擎在组序列中插入的结构标记 (REQ-UMK-012)。
+///
+/// 标记位置由 CompilerGraph 的层拓扑推导，不由编译器假设。
+/// 替代 pipeline.inc.rs 中 `anchor_op.label.starts_with("layer.")` 的 label 约定。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum GroupMarker {
+    /// 同构层循环开始。num_iterations 从图拓扑推导（如 35 层 → LayerLoopBegin { num_iterations: 35 }）。
+    LayerLoopBegin { num_iterations: usize },
+    /// 同构层循环结束。
+    LayerLoopEnd,
+    /// 异构层循环开始（Gemma 4 E2B: sliding/full 交替）。
+    /// 4 种层类型模板按段循环，num_segments 从图拓扑推导。
+    HeteroLayerLoopBegin { num_segments: usize },
+    /// 异构层循环结束。
+    HeteroLayerLoopEnd,
+    /// ForwardPhaseDispatch 三路分支（仅多步生成图：含 Argmax 的图）。
+    PhaseDispatch,
+    /// 无标记——普通融合组。
+    None,
+}
+
+impl Default for GroupMarker {
+    fn default() -> Self {
+        GroupMarker::None
+    }
+}
 
 /// A group of fused operations that will be compiled as a single unit.
 #[derive(Debug, Clone)]
@@ -26,6 +67,16 @@ pub struct FusionGroup {
     /// 从 anchor op 的第一个输入 tensor 的 dtype 推导。
     /// None = 无法推导（使用默认 F32）。
     pub dominant_dtype: Option<QuantPrecision>,
+    /// REQ-UMK-012: 融合引擎插入的结构标记（LayerLoopBegin/End, PhaseDispatch, etc.）。
+    /// 默认 GroupMarker::None。编译器从 marker 读取层循环信息，不搜索 op.label。
+    pub marker: GroupMarker,
+    /// REQ-UMK-012: 此融合组属于层循环体（由 assign_group_markers 从图拓扑推导）。
+    /// 替代 pipeline.inc.rs 中 `anchor_op.label.starts_with("layer.")` 的 label 约定。
+    pub is_layer_group: bool,
+    /// REQ-UMK-012: 异构层子类型（从 OpKind 签名推导，非 label 前缀）。
+    /// 替代 hetero_emit.rs/pipeline.inc.rs 中 `anchor_op.label.starts_with("layer_sliding_small.")` 等。
+    /// None = 非异构层组或非层组。
+    pub hetero_layer_type: Option<HeteroLayerType>,
 }
 
 impl FusionGroup {
@@ -152,10 +203,11 @@ impl std::fmt::Display for FusionPlan {
             let ops_str: Vec<String> = g.ops.iter().map(|o| format!("{}", o.0)).collect();
             writeln!(
                 f,
-                "  [{}] {:?} anchor=Op({}) ops=[{}]",
+                "  [{}] {:?} anchor=Op({}) marker={:?} ops=[{}]",
                 g.id,
                 g.mode,
                 g.anchor.0,
+                g.marker,
                 ops_str.join(", ")
             )?;
         }
@@ -191,6 +243,9 @@ mod tests {
             ops,
             multi_output: MultiOutputConfig::default(),
             dominant_dtype: None,
+            marker: GroupMarker::None,
+            is_layer_group: false,
+            hetero_layer_type: None,
         }
     }
 
@@ -303,6 +358,9 @@ mod tests {
             ops: vec![op0, op1],
             multi_output: MultiOutputConfig::default(),
             dominant_dtype: Some(QuantPrecision::BF16),
+            marker: GroupMarker::None,
+            is_layer_group: false,
+            hetero_layer_type: None,
         };
         assert_eq!(g.id, 42);
         assert_eq!(g.ops.len(), 2);
@@ -523,6 +581,9 @@ mod tests {
             ops: vec![op0],
             multi_output: MultiOutputConfig::default(),
             dominant_dtype: None,
+            marker: GroupMarker::None,
+            is_layer_group: false,
+            hetero_layer_type: None,
         };
         assert!(g.dominant_dtype.is_none());
     }

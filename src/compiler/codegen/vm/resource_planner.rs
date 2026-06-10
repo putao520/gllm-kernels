@@ -24,7 +24,7 @@ use crate::compiler::graph::{CompilerGraph, OpKind};
 
 /// Scratchpad 内存布局 — 扩展现有 BufferAllocation 增加生命周期感知和 ping-pong。
 ///
-/// 由 Phase 2 (内存区间图着色) 生成，plan_lower 在发射代码时查询
+/// 由 Fusion (内存区间图着色) 生成，plan_lower 在发射代码时查询
 /// tensor→offset 映射和 ping-pong buffer 位置。
 #[derive(Debug, Clone)]
 pub struct BufferLayout {
@@ -83,7 +83,7 @@ impl BufferLayout {
 
 /// 循环不变量 — 在层循环外计算一次，循环内只读。
 ///
-/// 由 Phase 5 (循环不变量推导) 从 CompilerGraph 推导：
+/// 由 LoopInvariant (循环不变量推导) 从 CompilerGraph 推导：
 /// - 哪些值在所有层都相同 (如 cos/sin 表)
 /// - 哪些权重偏移是常量 (如 PackMap 索引)
 /// - 哪些标量参数每层相同 (如 eps, hidden_dim)
@@ -314,7 +314,7 @@ pub struct GraphResourcePlan {
 }
 
 // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-// §2.5 Phase 4: StackBlueprint — 栈帧蓝图计算 (REQ-GRP-004)
+// §2.5 Step 4: StackBlueprint — 栈帧蓝图计算 (REQ-GRP-004)
 // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 /// 从寄存器压力曲线推导 spill slot 需求，统一规划栈帧。
@@ -407,7 +407,7 @@ pub fn plan_stack_blueprint(
 }
 
 // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-// §2.4 Phase 3: GroupPressure — 融合组寄存器压力估计 (REQ-GRP-003)
+// §2.4 Step 3: GroupPressure — 融合组寄存器压力估计 (REQ-GRP-003)
 // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 /// 融合组内寄存器需求估计
@@ -474,7 +474,7 @@ pub fn estimate_register_pressure(
 }
 
 // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-// §2.7 Phase 6: ConcurrencyPartition — 并发资源分区 (REQ-GRP-006)
+// §2.7 Step 6: ConcurrencyPartition — 并发资源分区 (REQ-GRP-006)
 // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 /// 根据 batch_size 决定资源分区策略。
@@ -562,7 +562,7 @@ pub struct ResourcePlanInput {
 /// 4. ConcurrencyPartition (per-sequence vs shared)
 /// 5. ResourceSummary (aggregated stats)
 pub fn build_resource_plan(input: ResourcePlanInput) -> GraphResourcePlan {
-    // Phase 1: BufferLayout
+    // Step 1: BufferLayout
     let ping_pong = if input.batch_size <= 1 {
         Some(PingPongLayout {
             ping_offset: 0,
@@ -581,7 +581,7 @@ pub fn build_resource_plan(input: ResourcePlanInput) -> GraphResourcePlan {
         total_bytes,
     };
 
-    // Phase 2: GroupPressure
+    // Step 2: GroupPressure
     let pressure = estimate_register_pressure(
         input.num_groups,
         &input.ops_per_group,
@@ -590,7 +590,7 @@ pub fn build_resource_plan(input: ResourcePlanInput) -> GraphResourcePlan {
         input.total_gpr_regs,
     );
 
-    // Phase 3: StackBlueprint
+    // Step 3: StackBlueprint
     let stack = plan_stack_blueprint(
         &pressure,
         input.num_abi_args,
@@ -598,7 +598,7 @@ pub fn build_resource_plan(input: ResourcePlanInput) -> GraphResourcePlan {
         input.has_debug_probe,
     );
 
-    // Phase 4: ConcurrencyPartition
+    // Step 4: ConcurrencyPartition
     let concurrency = partition_concurrency(
         &buffers,
         &stack,
@@ -607,7 +607,7 @@ pub fn build_resource_plan(input: ResourcePlanInput) -> GraphResourcePlan {
         input.kv_bytes,
     );
 
-    // Phase 5: Summary
+    // Step 5: Summary
     let bytes_saved_by_reuse = buffers.memory_map.iter().map(|r| r.size_bytes).sum::<usize>();
     let summary = ResourceSummary {
         total_scratchpad_bytes: buffers.total_bytes,
@@ -761,6 +761,7 @@ impl GraphResourcePlan {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::compiler::fusion::GroupMarker;
 
     #[test]
     fn test_build_resource_plan_single_sequence() {
@@ -842,6 +843,7 @@ mod tests {
                 table_rows: 32000, embed_dim: hidden,
                 index_dim: SymDim::Concrete(1),
                 indices_kind: crate::compiler::graph::GatherIndicesKind::default(),
+                scale: None,
             },
             vec![ids_tok, embed_w], vec![embed_out], "embed",
         );
@@ -864,11 +866,17 @@ mod tests {
                     id: 0, anchor: embed, epilogue: vec![],
                     mode: crate::compiler::fusion::FusionMode::Standalone,
                     ops: vec![embed], multi_output: Default::default(), dominant_dtype: None,
+                    marker: GroupMarker::None,
+                    is_layer_group: false,
+            hetero_layer_type: None,
                 },
                 crate::compiler::fusion::FusionGroup {
                     id: 1, anchor: q_proj, epilogue: vec![rope],
                     mode: crate::compiler::fusion::FusionMode::EpilogueInjection,
                     ops: vec![q_proj, rope], multi_output: Default::default(), dominant_dtype: None,
+                    marker: GroupMarker::None,
+                    is_layer_group: false,
+            hetero_layer_type: None,
                 },
             ],
             op_to_group: [(embed, 0), (q_proj, 1), (rope, 1)].into_iter().collect(),
@@ -1704,7 +1712,7 @@ mod data_structure_tests {
     #[test]
     fn plan_mega_kernel_quant_gemm_produces_pack_map_invariant() {
         use crate::compiler::graph::{CompilerGraph, OpKind, SymDim};
-        use crate::compiler::fusion::{FusionGroup, FusionMode};
+        use crate::compiler::fusion::{FusionGroup, FusionMode, GroupMarker};
         use crate::compiler::codegen::vm::isa_profile::IsaProfile;
         use crate::dispatch::device_profile::DeviceProfile;
         use crate::types::DType;
@@ -1740,6 +1748,9 @@ mod data_structure_tests {
                 ops: vec![qgemm],
                 multi_output: Default::default(),
                 dominant_dtype: None,
+                marker: GroupMarker::None,
+                is_layer_group: false,
+            hetero_layer_type: None,
             }],
             op_to_group: [(qgemm, 0)].into_iter().collect(),
         };
@@ -1875,7 +1886,7 @@ mod data_structure_tests {
     fn derive_invariants_gather_produces_pack_map_base() {
         use crate::compiler::graph::{CompilerGraph, OpKind, SymDim};
         use crate::compiler::codegen::vm::isa_profile::IsaProfile;
-        use crate::compiler::fusion::{FusionGroup, FusionMode};
+        use crate::compiler::fusion::{FusionGroup, FusionMode, GroupMarker};
         use crate::dispatch::device_profile::DeviceProfile;
         use crate::types::DType;
 
@@ -1894,6 +1905,7 @@ mod data_structure_tests {
                 embed_dim: hidden,
                 index_dim: SymDim::Concrete(1),
                 indices_kind: crate::compiler::graph::GatherIndicesKind::default(),
+                scale: None,
             },
             vec![ids, embed_w],
             vec![embed_out],
@@ -1909,6 +1921,9 @@ mod data_structure_tests {
                 ops: vec![gather],
                 multi_output: Default::default(),
                 dominant_dtype: None,
+                marker: GroupMarker::None,
+                is_layer_group: false,
+            hetero_layer_type: None,
             }],
             op_to_group: [(gather, 0)].into_iter().collect(),
         };
@@ -2005,7 +2020,7 @@ mod data_structure_tests {
     #[test]
     fn plan_mega_kernel_rope_and_gather_produces_all_invariant_types() {
         use crate::compiler::graph::{CompilerGraph, OpKind, SymDim};
-        use crate::compiler::fusion::{FusionGroup, FusionMode};
+        use crate::compiler::fusion::{FusionGroup, FusionMode, GroupMarker};
         use crate::compiler::codegen::vm::isa_profile::IsaProfile;
         use crate::dispatch::device_profile::DeviceProfile;
         use crate::types::DType;
@@ -2027,6 +2042,7 @@ mod data_structure_tests {
                 embed_dim: hidden,
                 index_dim: SymDim::Concrete(1),
                 indices_kind: crate::compiler::graph::GatherIndicesKind::default(),
+                scale: None,
             },
             vec![ids, embed_w],
             vec![embed_out],
@@ -2048,6 +2064,9 @@ mod data_structure_tests {
                 ops: vec![gather, rope],
                 multi_output: Default::default(),
                 dominant_dtype: None,
+                marker: GroupMarker::None,
+                is_layer_group: false,
+            hetero_layer_type: None,
             }],
             op_to_group: [(gather, 0), (rope, 0)].into_iter().collect(),
         };

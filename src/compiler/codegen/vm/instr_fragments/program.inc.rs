@@ -274,6 +274,7 @@ impl VmProgram {
             VmInstr::VecLoad { dst, base, offset, width, dtype } => VmInstr::VecLoad { dst: r(dst, map, next_vreg), base: r(base, map, next_vreg), offset: remap_offset(offset, map, next_vreg), width, dtype },
             VmInstr::VecStore { base, offset, src, width, dtype } => VmInstr::VecStore { base: r(base, map, next_vreg), offset: remap_offset(offset, map, next_vreg), src: r(src, map, next_vreg), width, dtype },
             VmInstr::VecNarrow { dst, src, dst_dtype, src_dtype, width } => VmInstr::VecNarrow { dst: r(dst, map, next_vreg), src: r(src, map, next_vreg), dst_dtype, src_dtype, width },
+            VmInstr::VecWiden { dst, src, dst_dtype, src_dtype, width } => VmInstr::VecWiden { dst: r(dst, map, next_vreg), src: r(src, map, next_vreg), dst_dtype, src_dtype, width },
             VmInstr::Mov { dst, src, dtype } => VmInstr::Mov { dst: r(dst, map, next_vreg), src: r(src, map, next_vreg), dtype },
             VmInstr::Broadcast { dst, src, width, dtype } => VmInstr::Broadcast { dst: r(dst, map, next_vreg), src: remap_scalar(src, map, next_vreg), width, dtype },
             VmInstr::LoadPtr { dst, src } => VmInstr::LoadPtr { dst: r(dst, map, next_vreg), src: remap_ptr(src, map, next_vreg) },
@@ -333,7 +334,6 @@ impl VmProgram {
             VmInstr::CheckStopCondition { token_id, counter, eos_ptr, max_tokens_ptr } => VmInstr::CheckStopCondition { token_id: r(token_id, map, next_vreg), counter: r(counter, map, next_vreg), eos_ptr: r(eos_ptr, map, next_vreg), max_tokens_ptr: r(max_tokens_ptr, map, next_vreg) },
             VmInstr::AddPtr { dst, base, offset } => VmInstr::AddPtr { dst: r(dst, map, next_vreg), base: r(base, map, next_vreg), offset },
             VmInstr::StoreConstToStack { rbp_offset, value, elem_width } => VmInstr::StoreConstToStack { rbp_offset, value, elem_width },
-            VmInstr::OutputModeDispatch { selector, paths } => VmInstr::OutputModeDispatch { selector: r(selector, map, next_vreg), paths },
             VmInstr::BreakLoop { return_value } => VmInstr::BreakLoop {
                 return_value: match return_value {
                     ReturnValue::Const(v) => ReturnValue::Const(v),
@@ -517,6 +517,7 @@ impl VmProgram {
             VmInstr::VecLoad { dst, base, offset, width, dtype } => VmInstr::VecLoad { dst: r(dst), base: r(base), offset: remap_offset(offset), width, dtype },
             VmInstr::VecStore { base, offset, src, width, dtype } => VmInstr::VecStore { base: r(base), offset: remap_offset(offset), src: r(src), width, dtype },
             VmInstr::VecNarrow { dst, src, dst_dtype, src_dtype, width } => VmInstr::VecNarrow { dst: r(dst), src: r(src), dst_dtype, src_dtype, width },
+            VmInstr::VecWiden { dst, src, dst_dtype, src_dtype, width } => VmInstr::VecWiden { dst: r(dst), src: r(src), dst_dtype, src_dtype, width },
             VmInstr::Mov { dst, src, dtype } => VmInstr::Mov { dst: r(dst), src: r(src), dtype },
             VmInstr::Broadcast { dst, src, width, dtype } => VmInstr::Broadcast { dst: r(dst), src: remap_scalar(src), width, dtype },
             VmInstr::LoadPtr { dst, src } => VmInstr::LoadPtr { dst: r(dst), src: remap_ptr(src) },
@@ -564,7 +565,6 @@ impl VmProgram {
             VmInstr::CheckStopCondition { token_id, counter, eos_ptr, max_tokens_ptr } => VmInstr::CheckStopCondition { token_id: r(token_id), counter: r(counter), eos_ptr: r(eos_ptr), max_tokens_ptr: r(max_tokens_ptr) },
             VmInstr::AddPtr { dst, base, offset } => VmInstr::AddPtr { dst: r(dst), base: r(base), offset },
             VmInstr::StoreConstToStack { rbp_offset, value, elem_width } => VmInstr::StoreConstToStack { rbp_offset, value, elem_width },
-            VmInstr::OutputModeDispatch { selector, paths } => VmInstr::OutputModeDispatch { selector: r(selector), paths },
             VmInstr::BreakLoop { return_value } => VmInstr::BreakLoop {
                 return_value: match return_value {
                     ReturnValue::Const(v) => ReturnValue::Const(v),
@@ -725,6 +725,7 @@ impl VmProgram {
             VmInstr::VecLoad { dst, base, .. } => vec![*dst, *base],
             VmInstr::VecStore { base, src, .. } => vec![*base, *src],
             VmInstr::VecNarrow { dst, src, .. } => vec![*dst, *src],
+            VmInstr::VecWiden { dst, src, .. } => vec![*dst, *src],
             VmInstr::Mov { dst, src, .. } => vec![*dst, *src],
             VmInstr::VecBinOp { dst, a, b, .. } => vec![*dst, *a, *b],
             VmInstr::VecShiftImm { dst, a, .. } => vec![*dst, *a],
@@ -747,7 +748,6 @@ impl VmProgram {
             VmInstr::CheckStopCondition { token_id, counter, eos_ptr, max_tokens_ptr } => vec![*token_id, *counter, *eos_ptr, *max_tokens_ptr],
             VmInstr::AddPtr { dst, base, .. } => vec![*dst, *base],
             VmInstr::StoreConstToStack { .. } => vec![],
-            VmInstr::OutputModeDispatch { selector, .. } => vec![*selector],
             VmInstr::BreakLoop { return_value } => match return_value {
                 ReturnValue::Const(_) => vec![],
                 ReturnValue::VReg(v) => vec![*v],
@@ -912,6 +912,7 @@ impl VmProgram {
                 VmInstr::VecLoad { dst, base, .. } => format!("VecLoad dst=v{} base=v{}", dst.0, base.0),
                 VmInstr::VecStore { base, src, .. } => format!("VecStore base=v{} src=v{}", base.0, src.0),
                 VmInstr::VecNarrow { dst, src, .. } => format!("VecNarrow dst=v{} src=v{}", dst.0, src.0),
+                VmInstr::VecWiden { dst, src, .. } => format!("VecWiden dst=v{} src=v{}", dst.0, src.0),
                 VmInstr::Mov { dst, src, .. } => format!("Mov dst=v{} src=v{}", dst.0, src.0),
                 VmInstr::Fma { dst, acc, a, b, .. } => format!("Fma dst=v{} acc=v{} a=v{} b=v{}", dst.0, acc.0, a.0, b.0),
                 VmInstr::LoadPtr { dst, .. } => format!("LoadPtr dst=v{}", dst.0),
@@ -959,6 +960,10 @@ impl VmProgram {
                     if let Some(e) = check(*src, false, "src") { return Err(e); }
                 }
                 VmInstr::VecNarrow { dst, src, .. } => {
+                    if let Some(e) = check(*dst, false, "dst") { return Err(e); }
+                    if let Some(e) = check(*src, false, "src") { return Err(e); }
+                }
+                VmInstr::VecWiden { dst, src, .. } => {
                     if let Some(e) = check(*dst, false, "dst") { return Err(e); }
                     if let Some(e) = check(*src, false, "src") { return Err(e); }
                 }
@@ -1098,9 +1103,6 @@ impl VmProgram {
                 VmInstr::GprLoadImm { dst, .. } => {
                     if let Some(e) = check(*dst, true, "dst") { return Err(e); }
                 }
-                VmInstr::OutputModeDispatch { selector, .. } => {
-                    if let Some(e) = check(*selector, true, "selector") { return Err(e); }
-                }
                 VmInstr::AtomicAdd { base, .. } => {
                     if let Some(e) = check(*base, true, "base") { return Err(e); }
                 }
@@ -1221,6 +1223,22 @@ impl VmProgram {
                         if sw != width {
                             return Err(format!(
                                 "instr[{i}] VecNarrow: src v{} width {:?} != instruction width {:?}",
+                                src.0, sw, width));
+                        }
+                    }
+                }
+                VmInstr::VecWiden { dst, src, width, .. } => {
+                    if let Some(sw) = widths.get(dst) {
+                        if sw != width {
+                            return Err(format!(
+                                "instr[{i}] VecWiden: dst v{} width {:?} != instruction width {:?}",
+                                dst.0, sw, width));
+                        }
+                    }
+                    if let Some(sw) = widths.get(src) {
+                        if sw != width {
+                            return Err(format!(
+                                "instr[{i}] VecWiden: src v{} width {:?} != instruction width {:?}",
                                 src.0, sw, width));
                         }
                     }
@@ -1413,6 +1431,9 @@ impl VmProgram {
                     domains.insert(*dst, Domain::VecData);
                 }
                 VmInstr::VecNarrow { dst, .. } => {
+                    domains.insert(*dst, Domain::VecData);
+                }
+                VmInstr::VecWiden { dst, .. } => {
                     domains.insert(*dst, Domain::VecData);
                 }
                 VmInstr::Mov { dst, .. } => {
@@ -1649,7 +1670,6 @@ impl VmProgram {
                 | VmInstr::MemFence { .. } | VmInstr::StoreConstToStack { .. }
                 | VmInstr::BreakLoop { .. } | VmInstr::ConditionalSkip { .. }
                 | VmInstr::GprCondAction { .. }
-                | VmInstr::OutputModeDispatch { .. }
                 | VmInstr::WarpSync | VmInstr::AsyncCopy { .. } | VmInstr::AsyncWait { .. }
                 | VmInstr::TileConfig { .. } | VmInstr::TileMma { .. } | VmInstr::TileRelease
                 | VmInstr::Vp2Intersect { .. } | VmInstr::HotpatchSlot { .. }

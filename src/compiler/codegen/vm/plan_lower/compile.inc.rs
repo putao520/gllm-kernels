@@ -5,12 +5,28 @@
 /// Register VM 全管线编译入口。
 ///
 /// Graph → FusionPlan → lower → OptPass → RegAlloc → StackFrame → IsaLower → 物理代码
+///
+/// SPEC/39 REQ-UMK-001: All compilation produces MegaKernelFn ABI code.
 pub fn compile_layer(
     plan: &FusionPlan,
     graph: &CompilerGraph,
     alloc: &BufferAllocation,
     exec_plan: &crate::compiler::planner::ExecutionPlan,
     registry: Option<&ScalarOpRegistry>,
+) -> Result<CodegenOutput, CompilerError> {
+    let sym_map = SymDimSlotMap::mega_kernel_abi();
+    compile_layer_with_sym_map(plan, graph, alloc, exec_plan, registry, &sym_map)
+}
+
+/// Same as `compile_layer` but accepts an explicit `SymDimSlotMap`.
+/// Used internally when callers need to pass a custom ABI layout.
+pub fn compile_layer_with_sym_map(
+    plan: &FusionPlan,
+    graph: &CompilerGraph,
+    alloc: &BufferAllocation,
+    exec_plan: &crate::compiler::planner::ExecutionPlan,
+    registry: Option<&ScalarOpRegistry>,
+    sym_map: &SymDimSlotMap,
 ) -> Result<CodegenOutput, CompilerError> {
     let dtype = graph_dtype(graph);
     let profile = IsaProfile::from_device_profile(&exec_plan.profile);
@@ -27,8 +43,8 @@ pub fn compile_layer(
     let dwc_req = compute_dwc_requirement(plan, graph, alloc, rope_req.as_ref(), ple_req.as_ref())?;
 
     // Stage 1: FusionPlan → VmProgram (IsaHook 驱动多算法选择)
-    let mut program = lower_fusion_plan_inner(plan, graph, alloc, registry, &profile,
-        Some(hook.as_ref()), rope_req.as_ref(), ple_req.as_ref(), dwc_req.as_ref(), false)?;
+    let mut program = lower_fusion_plan_inner_with_sym_map(plan, graph, alloc, registry, &profile,
+        Some(hook.as_ref()), rope_req.as_ref(), ple_req.as_ref(), dwc_req.as_ref(), false, Some(sym_map), None)?;
 
     // Stage 1.5: 符号验证 — catch 低级错误 (栈对齐, 寄存器配对, 嵌套 skip)
     // 在 ISA lowering 前运行, 违规返回 Err 而非产生错误机器码。
@@ -150,8 +166,7 @@ pub fn compile_layer(
     // ARCH-CODEGEN-DISPATCH: X86_64 → X86Lower, AArch64 → AArch64Lower, GPU → GpuLower
     let (code, format) = match &profile.platform {
         super::isa_profile::Platform::X86_64 { has_avx512, .. } => {
-            let sym_slot_map_for_lower = SymDimSlotMap::default_abi();
-            let mut lowerer = X86Lower::with_sym_map(*has_avx512, sym_slot_map_for_lower);
+            let mut lowerer = X86Lower::with_sym_map(*has_avx512, sym_map.clone());
             lowerer.set_scratch_gprs(&profile.scratch_gprs)?;
             lowerer.set_scratch_vec_regs(&profile.scratch_vec_regs)?;
             lowerer.precompute_zero_vregs(&program);
@@ -252,7 +267,7 @@ fn compile_gpu(
 
 /// 从 ScalarOpRegistry 获取算子的 TraceOp body。
 ///
-/// **铁律 (§14.1)**: trace 必须从 registry 获取 (Phase 0 SymExec 产出)。
+/// **铁律 (§14.1)**: trace 必须从 registry 获取 (SymExec 阶段 产出)。
 /// 不允许 hardcode。如果 registry 没有该算子的 trace → 返回 Err (NO_SCALAR)。
 pub(crate) fn extract_op_trace(
     op: &crate::compiler::graph::CompilerOp,
@@ -277,7 +292,7 @@ pub(crate) fn extract_op_trace(
             //   Scalar (scalar_swiglu_clipped) → SymExec 模板 trace
             //   → IR (per-op Const 重写) → ISA Lowering
             //
-            // 不是 fallback, 是 Phase 2 IR 层的合法常量折叠。
+            // 不是 fallback, 是 ComputePattern 自动分发 IR 层的合法常量折叠。
             if let OpKind::SwiGluClipped { limit } = &op.kind {
                 rewrite_swiglu_clipped_limit(&mut body, *limit);
             }
@@ -438,7 +453,7 @@ fn extract_body_from_pattern(pattern: &ComputePattern) -> Vec<TraceOp> {
     }
 }
 
-/// Phase 2: ComputePattern-driven auto dispatch.
+/// ComputePattern 自动分发: ComputePattern-driven auto dispatch.
 ///
 /// 如果 ScalarOpRegistry 中有该 OpKind 的 trace 且 ComputePattern 是
 /// Elementwise 或 BinaryElementwise，自动通过 `emit_elementwise_inline`
@@ -824,16 +839,16 @@ fn emit_injective_inline(
 ///   覆盖: Silu, Gelu, Tanh, Sigmoid, Relu, Add, Mul, SwiGlu, GeGlu, MeanPool,
 ///   Residual (no telemetry), LogitSoftcap 等。
 ///
-/// Layer 2: `dispatch_compute_pattern` — NormLike/Gemm/Softmax 通用处理器 + Phase 4 结构算子。
+/// Layer 2: `dispatch_compute_pattern` — NormLike/Gemm/Softmax 通用处理器 + 手写 lower 委托 结构算子。
 ///   Auto-driven: RmsNorm, LayerNorm, ValueNorm, QkNorm, HeadRmsNorm, Softmax, L2Normalize,
 ///   LearnedPos2D, MoEGate/MoERouter (softmax 部分), Gemm/GemmBias。
-///   Phase 4 (hand-written lower::* delegates): QuantGemm, MHA, RoPE, MoEDispatchPacked,
+///   手写 lower 委托 (hand-written lower::* delegates): QuantGemm, MHA, RoPE, MoEDispatchPacked,
 ///   PerLayerEmbed, DepthwiseConv1D, PatchEmbed, SessionKvRestore, MmHiddenInject。
 ///
-/// Layer 3: `dispatch_structural` — D 类永久控制流 + C 类 Phase 4 结构算子。
+/// Layer 3: `dispatch_structural` — D 类永久控制流 + C 类 手写 lower 委托 结构算子。
 ///   D 类: Residual+telemetry, Argmax, StoreToken, WriteLogits, CheckStopCondition,
 ///   GuardrailCheck, CotStepCheck, SgInject, SgDetect, EarlyExit, MegaKernelDispatch, NOP。
-///   Phase 4: Gather, ColumnSlice, QTapSTG。
+///   手写 lower 委托: Gather, ColumnSlice, QTapSTG。
 pub(super) fn emit_standalone_op(
     prog: &mut VmProgram,
     op: &crate::compiler::graph::CompilerOp,
@@ -852,7 +867,7 @@ pub(super) fn emit_standalone_op(
     // Elementwise seq_bound_override: reuse resolve_dim logic for outer Symbolic dim.
     let seq_bound_override: Option<BoundExpr> = abi.mega_decode_seq_len.map(BoundExpr::DynamicVReg);
 
-    // ── Phase 2: ComputePattern 自动指令选择 ──
+    // ── ComputePattern 自动分发: ComputePattern 自动指令选择 ──
     // 纯 Elementwise/BinaryElementwise 算子自动通过 registry trace pipeline dispatch，
     // 不需要手写 match arm。GELU/Tanh/Sigmoid/Relu/Add/Mul/SwiGLU 等全走此路径。
     if try_auto_dispatch_elementwise(
@@ -893,7 +908,7 @@ pub(super) fn emit_standalone_op(
 
 /// Structural op dispatch (ARCH-AUTO-INSTR-SELECT Category C/D).
 ///
-/// **Category C** (Phase 4, awaiting TraceOp extension for auto_select migration):
+/// **Category C** (手写 lower 委托, awaiting TraceOp extension for auto_select migration):
 /// Gather, ColumnSlice, QTapSTG.
 ///
 /// **Category D** (permanent, cannot use auto_select):

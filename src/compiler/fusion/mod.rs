@@ -1,4 +1,4 @@
-//! Fusion pass — Phase 2 of the JIT compiler pipeline.
+//! Fusion pass — Fusion phase of the JIT compiler pipeline.
 //!
 //! Walks the CompilerGraph in topological order and groups adjacent ops
 //! into `FusionGroup`s based on semantic compatibility rules.
@@ -22,7 +22,7 @@ pub mod quant_aware;
 pub mod quant_aware_fusion;
 
 // ── Public re-exports ───────────────────────────────────────────────
-pub use types::{FusionGroup, FusionMode, FusionPlan, FusionCost};
+pub use types::{FusionGroup, FusionMode, FusionPlan, FusionCost, GroupMarker, HeteroLayerType};
 pub use cost_model::{estimate_fusion_cost, Cost, FusionCostModel};
 pub use pass::{fuse_with_dag, fuse_with_dag_prebuilt};
 pub use quant_aware_fusion::{FusionRule, FusionEngine};
@@ -1109,6 +1109,9 @@ mod tests {
             ops: vec![OpId(0)],
             multi_output: MultiOutputConfig::single(),
             dominant_dtype: None,
+            marker: GroupMarker::None,
+            is_layer_group: false,
+            hetero_layer_type: None,
         };
         assert!(!group.multi_output.is_multi_output());
         assert_eq!(group.multi_output.num_outputs, 1);
@@ -1129,6 +1132,9 @@ mod tests {
             ops: vec![OpId(0)],
             multi_output: MultiOutputConfig::multi(tensors.clone()),
             dominant_dtype: None,
+            marker: GroupMarker::None,
+            is_layer_group: false,
+            hetero_layer_type: None,
         };
         assert!(group.multi_output.is_multi_output());
         assert_eq!(group.multi_output.num_outputs, 3);
@@ -1174,6 +1180,9 @@ mod tests {
             ops: vec![op1],
             multi_output: MultiOutputConfig::single(),
             dominant_dtype: None,
+            marker: GroupMarker::None,
+            is_layer_group: false,
+            hetero_layer_type: None,
         };
 
         // Compute-bound: large GEMM
@@ -1191,6 +1200,9 @@ mod tests {
             ops: vec![op2],
             multi_output: MultiOutputConfig::single(),
             dominant_dtype: None,
+            marker: GroupMarker::None,
+            is_layer_group: false,
+            hetero_layer_type: None,
         };
 
         let scale_mem = compute_group_roofline_scale(&group_mem, &g1, &exec_plan, None);
@@ -2387,6 +2399,9 @@ mod tests {
             ops: vec![OpId(3), OpId(4)],
             multi_output: MultiOutputConfig::single(),
             dominant_dtype: Some(crate::compiler::trace::QuantPrecision::BF16),
+            marker: GroupMarker::None,
+            is_layer_group: false,
+            hetero_layer_type: None,
         };
 
         // Act & Assert

@@ -63,7 +63,7 @@ impl ScalarOpRegistry {
 
     /// Auto-register a multi-loop scalar function using structured CFG analysis.
     ///
-    /// This is the Phase 3 upgrade path: instead of linear symexec (which only
+    /// This is the ISA Lowering upgrade path: instead of linear symexec (which only
     /// handles single-loop elementwise ops), this uses CFG → loop detection →
     /// multi-pass combination to classify NormLike and Reduction patterns.
     ///

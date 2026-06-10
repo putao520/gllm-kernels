@@ -1,10 +1,10 @@
 //! JIT compilation performance counters.
 //!
 //! Tracks statistics for the compilation pipeline phases:
-//! - Phase 0: Scalar + SymExec (trace extraction)
-//! - Phase 1: SemanticDAG (OpClass derivation)
-//! - Phase 2: Fusion + HW constraints
-//! - Phase 3: ISA Lowering (codegen)
+//! - Scalar + SymExec (trace extraction)
+//! - SemanticDAG (OpClass derivation)
+//! - Fusion + HW constraints
+//! - ISA Lowering (codegen)
 //!
 //! Counters are used for profiling and optimization of the compiler itself.
 
@@ -82,13 +82,13 @@ impl fmt::Display for PhaseCounters {
 /// Aggregate counters for the entire compilation pipeline.
 #[derive(Debug, Clone, Default)]
 pub struct CompileCounters {
-    /// Phase 0: Scalar + SymExec counters.
+    /// Scalar + SymExec counters.
     pub phase0: PhaseCounters,
-    /// Phase 1: SemanticDAG counters.
+    /// SemanticDAG counters.
     pub phase1: PhaseCounters,
-    /// Phase 2: Fusion + HW constraints counters.
+    /// Fusion + HW constraints counters.
     pub phase2: PhaseCounters,
-    /// Phase 3: ISA Lowering counters.
+    /// ISA Lowering counters.
     pub phase3: PhaseCounters,
     /// Total compiled layers.
     pub layers_compiled: u64,

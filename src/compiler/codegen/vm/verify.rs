@@ -1069,6 +1069,7 @@ fn collect_src_vregs(instr: &VmInstr) -> Vec<VRegId> {
             v
         }
         VmInstr::VecNarrow { dst: _, src, .. } => vec![*src],
+        VmInstr::VecWiden { dst: _, src, .. } => vec![*src],
         VmInstr::Mov { dst: _, src, .. } => vec![*src],
         VmInstr::VecBinOp { dst: _, a, b, .. } => vec![*a, *b],
         VmInstr::VecShiftImm { dst: _, a, .. } => vec![*a],
@@ -1204,7 +1205,6 @@ fn collect_src_vregs(instr: &VmInstr) -> Vec<VRegId> {
         | VmInstr::ReleaseVReg { .. }
         | VmInstr::Comment(_)
         | VmInstr::DeclareVReg { .. }
-        | VmInstr::OutputModeDispatch { .. }
         | VmInstr::BreakLoop { .. }
         | VmInstr::HotpatchSlot { .. }
         | VmInstr::ActivationSwap { .. } | VmInstr::PageTableAddr { .. } | VmInstr::PageTableKVWrite { .. } | VmInstr::PageTableKVWriteQuant { .. }

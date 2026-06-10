@@ -394,6 +394,9 @@ pub fn enforce_constraints(
                     ops: vec![op_id],
                     multi_output: MultiOutputConfig::single(),
                     dominant_dtype: old.dominant_dtype,
+                    marker: old.marker.clone(),
+                    is_layer_group: old.is_layer_group,
+                    hetero_layer_type: old.hetero_layer_type,
                 });
             }
             i += old.ops.len();
@@ -552,7 +555,7 @@ fn estimate_l1_working_set(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::compiler::fusion;
+    use crate::compiler::fusion::{self, GroupMarker};
     use crate::compiler::graph::{CompilerGraph, OpId};
     use crate::compiler::ir::LayerIR;
     use crate::compiler::planner::ExecutionPlan;
@@ -664,6 +667,9 @@ mod tests {
             ops: vec![OpId(0)],
             multi_output: MultiOutputConfig::single(),
             dominant_dtype: None,
+            marker: GroupMarker::None,
+            is_layer_group: false,
+            hetero_layer_type: None,
         };
 
         let with_epilogue = FusionGroup {
@@ -674,6 +680,9 @@ mod tests {
             ops: vec![OpId(0), OpId(1), OpId(2)],
             multi_output: MultiOutputConfig::single(),
             dominant_dtype: None,
+            marker: GroupMarker::None,
+            is_layer_group: false,
+            hetero_layer_type: None,
         };
 
         let mut g = CompilerGraph::new();
@@ -757,6 +766,9 @@ mod tests {
             ops: all_ops,
             multi_output: MultiOutputConfig::single(),
             dominant_dtype: None,
+            marker: GroupMarker::None,
+            is_layer_group: false,
+            hetero_layer_type: None,
         };
 
         let result = checker.validate_epilogue_depth(&group);
@@ -790,6 +802,9 @@ mod tests {
             ops: all_ops,
             multi_output: MultiOutputConfig::single(),
             dominant_dtype: None,
+            marker: GroupMarker::None,
+            is_layer_group: false,
+            hetero_layer_type: None,
         };
 
         assert!(checker.validate_epilogue_depth(&group).is_ok());
@@ -825,6 +840,9 @@ mod tests {
             ops: vec![OpId(0)],
             multi_output: MultiOutputConfig::single(),
             dominant_dtype: None,
+            marker: GroupMarker::None,
+            is_layer_group: false,
+            hetero_layer_type: None,
         };
         let base_pressure = estimate_register_pressure(&standalone, &g, &exec_plan);
         assert!(
@@ -843,6 +861,9 @@ mod tests {
             ops: vec![OpId(0), OpId(1), OpId(2), OpId(3)],
             multi_output: MultiOutputConfig::single(),
             dominant_dtype: None,
+            marker: GroupMarker::None,
+            is_layer_group: false,
+            hetero_layer_type: None,
         };
         let epi_pressure = estimate_register_pressure(&with_epilogue, &g, &exec_plan);
         assert!(
@@ -885,6 +906,9 @@ mod tests {
             ops: vec![OpId(0)],
             multi_output: MultiOutputConfig::single(),
             dominant_dtype: None,
+            marker: GroupMarker::None,
+            is_layer_group: false,
+            hetero_layer_type: None,
         };
 
         let profile = DeviceProfile::detect();
@@ -939,6 +963,9 @@ mod tests {
             ops: vec![OpId(0)],
             multi_output: MultiOutputConfig::single(),
             dominant_dtype: None,
+            marker: GroupMarker::None,
+            is_layer_group: false,
+            hetero_layer_type: None,
         };
 
         assert!(checker.validate_l1_working_set(&group, &g).is_ok());
@@ -989,6 +1016,9 @@ mod tests {
             ops: all_ops,
             multi_output: MultiOutputConfig::single(),
             dominant_dtype: None,
+            marker: GroupMarker::None,
+            is_layer_group: false,
+            hetero_layer_type: None,
         }];
 
         let profile = DeviceProfile::detect();
@@ -1097,6 +1127,9 @@ mod tests {
             ops: vec![OpId(0), OpId(1), OpId(2)],
             multi_output: MultiOutputConfig::single(),
             dominant_dtype: None,
+            marker: GroupMarker::None,
+            is_layer_group: false,
+            hetero_layer_type: None,
         };
 
         // Act
@@ -1143,6 +1176,9 @@ mod tests {
             ops: vec![OpId(0)],
             multi_output: MultiOutputConfig::single(),
             dominant_dtype: None,
+            marker: GroupMarker::None,
+            is_layer_group: false,
+            hetero_layer_type: None,
         };
         let norm_group = FusionGroup {
             id: 1,
@@ -1152,6 +1188,9 @@ mod tests {
             ops: vec![OpId(0)],
             multi_output: MultiOutputConfig::single(),
             dominant_dtype: None,
+            marker: GroupMarker::None,
+            is_layer_group: false,
+            hetero_layer_type: None,
         };
 
         // Act
@@ -1199,6 +1238,9 @@ mod tests {
             ops: vec![OpId(0)],
             multi_output: MultiOutputConfig::single(),
             dominant_dtype: None,
+            marker: GroupMarker::None,
+            is_layer_group: false,
+            hetero_layer_type: None,
         };
         let tile_group = FusionGroup {
             id: 1,
@@ -1211,6 +1253,9 @@ mod tests {
             ops: vec![OpId(0)],
             multi_output: MultiOutputConfig::single(),
             dominant_dtype: None,
+            marker: GroupMarker::None,
+            is_layer_group: false,
+            hetero_layer_type: None,
         };
 
         // Act
@@ -1250,6 +1295,9 @@ mod tests {
             ops: vec![OpId(0), OpId(1)],
             multi_output: MultiOutputConfig::single(),
             dominant_dtype: None,
+            marker: GroupMarker::None,
+            is_layer_group: false,
+            hetero_layer_type: None,
         };
 
         // Act
@@ -1293,6 +1341,9 @@ mod tests {
             ops: vec![OpId(0)],
             multi_output: MultiOutputConfig::single(),
             dominant_dtype: None,
+            marker: GroupMarker::None,
+            is_layer_group: false,
+            hetero_layer_type: None,
         };
 
         let profile = DeviceProfile::detect();
@@ -1355,6 +1406,9 @@ mod tests {
             ops: all_ops,
             multi_output: MultiOutputConfig::single(),
             dominant_dtype: None,
+            marker: GroupMarker::None,
+            is_layer_group: false,
+            hetero_layer_type: None,
         };
 
         // Act
@@ -1449,6 +1503,9 @@ mod tests {
             ops: vec![OpId(0)],
             multi_output: MultiOutputConfig::single(),
             dominant_dtype: None,
+            marker: GroupMarker::None,
+            is_layer_group: false,
+            hetero_layer_type: None,
         };
 
         // Act
@@ -1481,6 +1538,9 @@ mod tests {
             ops: vec![OpId(0)],
             multi_output: MultiOutputConfig::single(),
             dominant_dtype: None,
+            marker: GroupMarker::None,
+            is_layer_group: false,
+            hetero_layer_type: None,
         };
 
         // Act
@@ -1657,6 +1717,9 @@ mod tests {
             ops: vec![OpId(0)],
             multi_output: crate::compiler::graph::MultiOutputConfig::single(),
             dominant_dtype: None,
+            marker: GroupMarker::None,
+            is_layer_group: false,
+            hetero_layer_type: None,
         };
 
         // Act
@@ -1684,6 +1747,9 @@ mod tests {
             mode: FusionMode::Standalone, ops: vec![OpId(0)],
             multi_output: crate::compiler::graph::MultiOutputConfig::single(),
             dominant_dtype: None,
+            marker: GroupMarker::None,
+            is_layer_group: false,
+            hetero_layer_type: None,
         };
 
         // Assert — passing with empty epilogue proves max >= 0
@@ -1754,6 +1820,9 @@ mod tests {
             ops: vec![OpId(0)],
             multi_output: MultiOutputConfig::single(),
             dominant_dtype: None,
+            marker: GroupMarker::None,
+            is_layer_group: false,
+            hetero_layer_type: None,
         };
 
         let mut groups = vec![group];
@@ -1802,6 +1871,9 @@ mod tests {
             id: 0, anchor: OpId(0), epilogue: vec![],
             mode: FusionMode::LoopFusion, ops: vec![OpId(0)],
             multi_output: MultiOutputConfig::single(), dominant_dtype: None,
+            marker: GroupMarker::None,
+            is_layer_group: false,
+            hetero_layer_type: None,
         };
         assert!(extract_gemm_dims(&group, &g).is_none());
     }
@@ -1838,11 +1910,17 @@ mod tests {
             id: 0, anchor: OpId(0), epilogue: vec![],
             mode: FusionMode::LoopFusion, ops: vec![OpId(0), OpId(1)],
             multi_output: MultiOutputConfig::single(), dominant_dtype: None,
+            marker: GroupMarker::None,
+            is_layer_group: false,
+            hetero_layer_type: None,
         };
         let large = FusionGroup {
             id: 1, anchor: OpId(0), epilogue: vec![],
             mode: FusionMode::LoopFusion, ops: vec![OpId(0), OpId(1), OpId(2), OpId(3)],
             multi_output: MultiOutputConfig::single(), dominant_dtype: None,
+            marker: GroupMarker::None,
+            is_layer_group: false,
+            hetero_layer_type: None,
         };
         let small_rp = estimate_register_pressure(&small, &g, &exec_plan);
         let large_rp = estimate_register_pressure(&large, &g, &exec_plan);
@@ -1899,6 +1977,9 @@ mod tests {
             ops: vec![OpId(0)],
             multi_output: MultiOutputConfig::single(),
             dominant_dtype: None,
+            marker: GroupMarker::None,
+            is_layer_group: false,
+            hetero_layer_type: None,
         };
 
         // Act
@@ -1939,6 +2020,9 @@ mod tests {
             ops: vec![OpId(0)],
             multi_output: MultiOutputConfig::single(),
             dominant_dtype: None,
+            marker: GroupMarker::None,
+            is_layer_group: false,
+            hetero_layer_type: None,
         };
 
         // Act
@@ -1982,6 +2066,9 @@ mod tests {
             ops: vec![OpId(0)],
             multi_output: MultiOutputConfig::single(),
             dominant_dtype: None,
+            marker: GroupMarker::None,
+            is_layer_group: false,
+            hetero_layer_type: None,
         };
         let ffn_group = FusionGroup {
             id: 1,
@@ -1996,6 +2083,9 @@ mod tests {
             ops: vec![OpId(0)],
             multi_output: MultiOutputConfig::single(),
             dominant_dtype: None,
+            marker: GroupMarker::None,
+            is_layer_group: false,
+            hetero_layer_type: None,
         };
 
         // Act
@@ -2043,6 +2133,9 @@ mod tests {
             ops: vec![OpId(0)],
             multi_output: MultiOutputConfig::single(),
             dominant_dtype: None,
+            marker: GroupMarker::None,
+            is_layer_group: false,
+            hetero_layer_type: None,
         };
         let compute_root = FusionGroup {
             id: 1,
@@ -2052,6 +2145,9 @@ mod tests {
             ops: vec![OpId(0)],
             multi_output: MultiOutputConfig::single(),
             dominant_dtype: None,
+            marker: GroupMarker::None,
+            is_layer_group: false,
+            hetero_layer_type: None,
         };
 
         // Act
@@ -2099,6 +2195,9 @@ mod tests {
             ops: vec![OpId(0)],
             multi_output: MultiOutputConfig::single(),
             dominant_dtype: None,
+            marker: GroupMarker::None,
+            is_layer_group: false,
+            hetero_layer_type: None,
         };
         let qkv_group = FusionGroup {
             id: 1,
@@ -2108,6 +2207,9 @@ mod tests {
             ops: vec![OpId(0)],
             multi_output: MultiOutputConfig::single(),
             dominant_dtype: None,
+            marker: GroupMarker::None,
+            is_layer_group: false,
+            hetero_layer_type: None,
         };
 
         // Act
@@ -2213,6 +2315,9 @@ mod tests {
             ops: vec![OpId(0)],
             multi_output: MultiOutputConfig::single(),
             dominant_dtype: None,
+            marker: GroupMarker::None,
+            is_layer_group: false,
+            hetero_layer_type: None,
         };
 
         // Act
@@ -2256,6 +2361,9 @@ mod tests {
             ops: vec![OpId(0)],
             multi_output: MultiOutputConfig::single(),
             dominant_dtype: None,
+            marker: GroupMarker::None,
+            is_layer_group: false,
+            hetero_layer_type: None,
         };
 
         // Act
@@ -2302,6 +2410,9 @@ mod tests {
             ops: vec![OpId(0)],
             multi_output: MultiOutputConfig::single(),
             dominant_dtype: None,
+            marker: GroupMarker::None,
+            is_layer_group: false,
+            hetero_layer_type: None,
         };
         let fused_group = FusionGroup {
             id: 1,
@@ -2320,6 +2431,9 @@ mod tests {
             ops: vec![OpId(0)],
             multi_output: MultiOutputConfig::single(),
             dominant_dtype: None,
+            marker: GroupMarker::None,
+            is_layer_group: false,
+            hetero_layer_type: None,
         };
 
         // Act
@@ -2364,6 +2478,9 @@ mod tests {
             ops: vec![OpId(0)],
             multi_output: MultiOutputConfig::single(),
             dominant_dtype: None,
+            marker: GroupMarker::None,
+            is_layer_group: false,
+            hetero_layer_type: None,
         };
 
         // Act
@@ -2394,6 +2511,9 @@ mod tests {
             ops: vec![OpId(99)],
             multi_output: MultiOutputConfig::single(),
             dominant_dtype: None,
+            marker: GroupMarker::None,
+            is_layer_group: false,
+            hetero_layer_type: None,
         };
 
         // Act
@@ -2447,6 +2567,9 @@ mod tests {
             ops: all_ops,
             multi_output: MultiOutputConfig::single(),
             dominant_dtype: None,
+            marker: GroupMarker::None,
+            is_layer_group: false,
+            hetero_layer_type: None,
         };
 
         // Act
@@ -2508,6 +2631,9 @@ mod tests {
             ops: vec![OpId(0)],
             multi_output: MultiOutputConfig::single(),
             dominant_dtype: None,
+            marker: GroupMarker::None,
+            is_layer_group: false,
+            hetero_layer_type: None,
         };
 
         // Act: jit_ctx=None, on CPU smem will be 0
@@ -2540,6 +2666,9 @@ mod tests {
             ops: vec![OpId(0), OpId(1), OpId(2), OpId(3), OpId(4)],
             multi_output: MultiOutputConfig::single(),
             dominant_dtype: None,
+            marker: GroupMarker::None,
+            is_layer_group: false,
+            hetero_layer_type: None,
         };
 
         // Act
@@ -2576,6 +2705,9 @@ mod tests {
             ops: all_ops,
             multi_output: MultiOutputConfig::single(),
             dominant_dtype: None,
+            marker: GroupMarker::None,
+            is_layer_group: false,
+            hetero_layer_type: None,
         };
 
         // Act
@@ -2650,6 +2782,9 @@ mod tests {
             ops: vec![OpId(0)],
             multi_output: MultiOutputConfig::single(),
             dominant_dtype: None,
+            marker: GroupMarker::None,
+            is_layer_group: false,
+            hetero_layer_type: None,
         };
 
         // Act
@@ -2698,6 +2833,9 @@ mod tests {
             ops: vec![OpId(0)],
             multi_output: MultiOutputConfig::single(),
             dominant_dtype: None,
+            marker: GroupMarker::None,
+            is_layer_group: false,
+            hetero_layer_type: None,
         };
 
         let epilogue_ops: Vec<OpId> = (1..=50).map(OpId).collect();
@@ -2711,6 +2849,9 @@ mod tests {
             ops: invalid_ops,
             multi_output: MultiOutputConfig::single(),
             dominant_dtype: None,
+            marker: GroupMarker::None,
+            is_layer_group: false,
+            hetero_layer_type: None,
         };
 
         let profile = DeviceProfile::detect();
@@ -2792,6 +2933,9 @@ mod tests {
             ops: all_ops,
             multi_output: MultiOutputConfig::single(),
             dominant_dtype: None,
+            marker: GroupMarker::None,
+            is_layer_group: false,
+            hetero_layer_type: None,
         };
 
         // Act
@@ -2837,6 +2981,9 @@ mod tests {
             ops: vec![OpId(0)],
             multi_output: MultiOutputConfig::single(),
             dominant_dtype: None,
+            marker: GroupMarker::None,
+            is_layer_group: false,
+            hetero_layer_type: None,
         };
 
         let profile = DeviceProfile::detect();
@@ -2874,6 +3021,9 @@ mod tests {
             ops: vec![OpId(0)],
             multi_output: MultiOutputConfig::single(),
             dominant_dtype: None,
+            marker: GroupMarker::None,
+            is_layer_group: false,
+            hetero_layer_type: None,
         };
 
         // Act
@@ -2926,6 +3076,9 @@ mod tests {
             ops: all_ops,
             multi_output: MultiOutputConfig::single(),
             dominant_dtype: None,
+            marker: GroupMarker::None,
+            is_layer_group: false,
+            hetero_layer_type: None,
         }];
 
         let profile = DeviceProfile::detect();
@@ -2976,6 +3129,9 @@ mod tests {
             ops: vec![OpId(0)],
             multi_output: MultiOutputConfig::single(),
             dominant_dtype: None,
+            marker: GroupMarker::None,
+            is_layer_group: false,
+            hetero_layer_type: None,
         };
 
         let profile = DeviceProfile::detect();
@@ -3027,6 +3183,9 @@ mod tests {
             ops: vec![OpId(0)],
             multi_output: MultiOutputConfig::single(),
             dominant_dtype: None,
+            marker: GroupMarker::None,
+            is_layer_group: false,
+            hetero_layer_type: None,
         };
         let base = estimate_register_pressure(&base_group, &g, &exec_plan);
         let available = profile.num_simd_regs();
@@ -3045,6 +3204,9 @@ mod tests {
             ops: all_ops,
             multi_output: MultiOutputConfig::single(),
             dominant_dtype: None,
+            marker: GroupMarker::None,
+            is_layer_group: false,
+            hetero_layer_type: None,
         };
 
         // Act
@@ -3081,6 +3243,9 @@ mod tests {
             ops: vec![OpId(0)],
             multi_output: MultiOutputConfig::single(),
             dominant_dtype: None,
+            marker: GroupMarker::None,
+            is_layer_group: false,
+            hetero_layer_type: None,
         };
 
         let profile = DeviceProfile::detect();
@@ -3126,6 +3291,9 @@ mod tests {
             ops: vec![OpId(0)],
             multi_output: MultiOutputConfig::single(),
             dominant_dtype: None,
+            marker: GroupMarker::None,
+            is_layer_group: false,
+            hetero_layer_type: None,
         };
 
         // Act
@@ -3179,6 +3347,9 @@ mod tests {
             ops: vec![OpId(0), OpId(1), OpId(2)],
             multi_output: MultiOutputConfig::single(),
             dominant_dtype: None,
+            marker: GroupMarker::None,
+            is_layer_group: false,
+            hetero_layer_type: None,
         };
 
         let profile = DeviceProfile::detect();
@@ -3301,6 +3472,9 @@ mod tests {
             ops: vec![OpId(0)],
             multi_output: MultiOutputConfig::single(),
             dominant_dtype: None,
+            marker: GroupMarker::None,
+            is_layer_group: false,
+            hetero_layer_type: None,
         };
 
         let profile = DeviceProfile::detect();
@@ -3344,6 +3518,9 @@ mod tests {
             id: 0, anchor: OpId(0), epilogue: vec![],
             mode: FusionMode::Standalone, ops: vec![OpId(0)],
             multi_output: MultiOutputConfig::single(), dominant_dtype: None,
+            marker: GroupMarker::None,
+            is_layer_group: false,
+            hetero_layer_type: None,
         };
 
         let profile = DeviceProfile::detect();
@@ -3437,6 +3614,9 @@ mod tests {
             id: 0, anchor: OpId(0), epilogue: vec![],
             mode: FusionMode::Standalone, ops: vec![OpId(0)],
             multi_output: MultiOutputConfig::single(), dominant_dtype: None,
+            marker: GroupMarker::None,
+            is_layer_group: false,
+            hetero_layer_type: None,
         };
 
         let profile = DeviceProfile::detect();
@@ -3493,6 +3673,9 @@ mod tests {
             ops: vec![OpId(0), OpId(1)],
             multi_output: MultiOutputConfig::single(),
             dominant_dtype: None,
+            marker: GroupMarker::None,
+            is_layer_group: false,
+            hetero_layer_type: None,
         };
 
         // Act
@@ -3536,6 +3719,9 @@ mod tests {
             mode: FusionMode::EpilogueInjection,
             ops: vec![OpId(0), OpId(1)],
             multi_output: MultiOutputConfig::single(), dominant_dtype: None,
+            marker: GroupMarker::None,
+            is_layer_group: false,
+            hetero_layer_type: None,
         };
         let g2 = FusionGroup {
             id: 1, anchor: OpId(0),
@@ -3543,6 +3729,9 @@ mod tests {
             mode: FusionMode::EpilogueInjection,
             ops: vec![OpId(0), OpId(1), OpId(2)],
             multi_output: MultiOutputConfig::single(), dominant_dtype: None,
+            marker: GroupMarker::None,
+            is_layer_group: false,
+            hetero_layer_type: None,
         };
 
         // Act
@@ -3580,6 +3769,9 @@ mod tests {
             id: 0, anchor: OpId(0), epilogue: vec![],
             mode: FusionMode::Standalone, ops: vec![OpId(0)],
             multi_output: MultiOutputConfig::single(), dominant_dtype: None,
+            marker: GroupMarker::None,
+            is_layer_group: false,
+            hetero_layer_type: None,
         };
 
         let profile = DeviceProfile::detect();
@@ -3620,6 +3812,9 @@ mod tests {
             id: 0, anchor: OpId(0), epilogue: vec![],
             mode: FusionMode::Standalone, ops: vec![OpId(0)],
             multi_output: MultiOutputConfig::single(), dominant_dtype: None,
+            marker: GroupMarker::None,
+            is_layer_group: false,
+            hetero_layer_type: None,
         };
 
         let profile = DeviceProfile::detect();
@@ -3653,6 +3848,9 @@ mod tests {
             ops: vec![OpId(0)],
             multi_output: MultiOutputConfig::single(),
             dominant_dtype: None,
+            marker: GroupMarker::None,
+            is_layer_group: false,
+            hetero_layer_type: None,
         };
 
         // Act
@@ -3690,6 +3888,9 @@ mod tests {
             id: 0, anchor: OpId(0), epilogue: vec![],
             mode: FusionMode::Standalone, ops: vec![OpId(0)],
             multi_output: MultiOutputConfig::single(), dominant_dtype: None,
+            marker: GroupMarker::None,
+            is_layer_group: false,
+            hetero_layer_type: None,
         };
         let result = check_group(&group, &g, &exec_plan);
 
@@ -3739,6 +3940,9 @@ mod tests {
             ops: all_ops,
             multi_output: MultiOutputConfig::single(),
             dominant_dtype: None,
+            marker: GroupMarker::None,
+            is_layer_group: false,
+            hetero_layer_type: None,
         };
 
         let profile = DeviceProfile::detect();
@@ -3780,6 +3984,9 @@ mod tests {
             ops: all_ops,
             multi_output: MultiOutputConfig::single(),
             dominant_dtype: None,
+            marker: GroupMarker::None,
+            is_layer_group: false,
+            hetero_layer_type: None,
         };
 
         // Act
@@ -3824,6 +4031,9 @@ mod tests {
             ops: all_ops,
             multi_output: MultiOutputConfig::single(),
             dominant_dtype: None,
+            marker: GroupMarker::None,
+            is_layer_group: false,
+            hetero_layer_type: None,
         };
 
         let profile = DeviceProfile::detect();
@@ -3896,11 +4106,17 @@ mod tests {
             id: 0, anchor: OpId(0), epilogue: vec![],
             mode: FusionMode::Standalone, ops: vec![OpId(0)],
             multi_output: MultiOutputConfig::single(), dominant_dtype: None,
+            marker: GroupMarker::None,
+            is_layer_group: false,
+            hetero_layer_type: None,
         };
         let group16 = FusionGroup {
             id: 0, anchor: OpId(0), epilogue: vec![],
             mode: FusionMode::Standalone, ops: vec![OpId(0)],
             multi_output: MultiOutputConfig::single(), dominant_dtype: None,
+            marker: GroupMarker::None,
+            is_layer_group: false,
+            hetero_layer_type: None,
         };
 
         // Act
@@ -3934,6 +4150,9 @@ mod tests {
             ops: vec![OpId(0)],
             multi_output: MultiOutputConfig::single(),
             dominant_dtype: None,
+            marker: GroupMarker::None,
+            is_layer_group: false,
+            hetero_layer_type: None,
         };
 
         let profile = DeviceProfile::detect();
@@ -3965,6 +4184,9 @@ mod tests {
             ops: vec![OpId(999)],
             multi_output: MultiOutputConfig::single(),
             dominant_dtype: None,
+            marker: GroupMarker::None,
+            is_layer_group: false,
+            hetero_layer_type: None,
         };
 
         // Act
@@ -4083,6 +4305,9 @@ mod tests {
             ops: vec![OpId(0)],
             multi_output: MultiOutputConfig::single(),
             dominant_dtype: None,
+            marker: GroupMarker::None,
+            is_layer_group: false,
+            hetero_layer_type: None,
         };
 
         let profile = DeviceProfile::detect();
@@ -4120,6 +4345,9 @@ mod tests {
             ops: vec![OpId(0)],
             multi_output: MultiOutputConfig::single(),
             dominant_dtype: None,
+            marker: GroupMarker::None,
+            is_layer_group: false,
+            hetero_layer_type: None,
         }];
 
         let profile = DeviceProfile::detect();
@@ -4167,6 +4395,9 @@ mod tests {
             ops: vec![OpId(0)],
             multi_output: MultiOutputConfig::single(),
             dominant_dtype: Some(crate::compiler::trace::QuantPrecision::BF16),
+            marker: GroupMarker::None,
+            is_layer_group: false,
+            hetero_layer_type: None,
         };
 
         let profile = DeviceProfile::detect();
@@ -4205,6 +4436,9 @@ mod tests {
             ops: vec![OpId(999)],
             multi_output: MultiOutputConfig::single(),
             dominant_dtype: None,
+            marker: GroupMarker::None,
+            is_layer_group: false,
+            hetero_layer_type: None,
         };
 
         // Act
@@ -4242,11 +4476,17 @@ mod tests {
             id: 0, anchor: OpId(0), epilogue: vec![],
             mode: FusionMode::Standalone, ops: vec![OpId(0)],
             multi_output: MultiOutputConfig::single(), dominant_dtype: None,
+            marker: GroupMarker::None,
+            is_layer_group: false,
+            hetero_layer_type: None,
         };
         let group_with_epi = FusionGroup {
             id: 1, anchor: OpId(0), epilogue: vec![OpId(1), OpId(2)],
             mode: FusionMode::EpilogueInjection, ops: vec![OpId(0), OpId(1), OpId(2)],
             multi_output: MultiOutputConfig::single(), dominant_dtype: None,
+            marker: GroupMarker::None,
+            is_layer_group: false,
+            hetero_layer_type: None,
         };
 
         let profile = DeviceProfile::detect();
@@ -4323,6 +4563,9 @@ mod tests {
             ops: vec![OpId(0)],
             multi_output: MultiOutputConfig::single(),
             dominant_dtype: None,
+            marker: GroupMarker::None,
+            is_layer_group: false,
+            hetero_layer_type: None,
         };
 
         let profile = DeviceProfile::detect();
@@ -4369,6 +4612,9 @@ mod tests {
             id: 0, anchor: OpId(0), epilogue: vec![],
             mode: FusionMode::Standalone, ops: vec![OpId(0)],
             multi_output: MultiOutputConfig::single(), dominant_dtype: None,
+            marker: GroupMarker::None,
+            is_layer_group: false,
+            hetero_layer_type: None,
         };
 
         let profile = DeviceProfile::detect();
@@ -4410,6 +4656,9 @@ mod tests {
                     ops: (0..n).map(|i| OpId(i as u32)).collect(),
                     multi_output: MultiOutputConfig::single(),
                     dominant_dtype: None,
+                    marker: GroupMarker::None,
+                    is_layer_group: false,
+            hetero_layer_type: None,
                 };
                 estimate_register_pressure(&group, &g, &exec_plan)
             })
@@ -4453,6 +4702,9 @@ mod tests {
             ops: vec![OpId(0)],
             multi_output: MultiOutputConfig::single(),
             dominant_dtype: None,
+            marker: GroupMarker::None,
+            is_layer_group: false,
+            hetero_layer_type: None,
         };
 
         let profile = DeviceProfile::detect();
@@ -4513,6 +4765,9 @@ mod tests {
             id: 0, anchor: OpId(0), epilogue: vec![],
             mode: FusionMode::Standalone, ops: vec![OpId(0)],
             multi_output: MultiOutputConfig::single(), dominant_dtype: None,
+            marker: GroupMarker::None,
+            is_layer_group: false,
+            hetero_layer_type: None,
         };
 
         // Act
@@ -4571,6 +4826,9 @@ mod tests {
             ops: all_ops,
             multi_output: MultiOutputConfig::single(),
             dominant_dtype: None,
+            marker: GroupMarker::None,
+            is_layer_group: false,
+            hetero_layer_type: None,
         };
 
         // Act
@@ -4610,6 +4868,9 @@ mod tests {
             id: 0, anchor: OpId(0), epilogue: vec![],
             mode: FusionMode::Standalone, ops: vec![OpId(0)],
             multi_output: MultiOutputConfig::single(), dominant_dtype: None,
+            marker: GroupMarker::None,
+            is_layer_group: false,
+            hetero_layer_type: None,
         };
 
         let profile = DeviceProfile::detect();
@@ -4733,11 +4994,17 @@ mod tests {
             id: 0, anchor: OpId(0), epilogue: vec![],
             mode: FusionMode::Standalone, ops: vec![OpId(0)],
             multi_output: MultiOutputConfig::single(), dominant_dtype: None,
+            marker: GroupMarker::None,
+            is_layer_group: false,
+            hetero_layer_type: None,
         };
         let with_one = FusionGroup {
             id: 1, anchor: OpId(0), epilogue: vec![OpId(1)],
             mode: FusionMode::EpilogueInjection, ops: vec![OpId(0), OpId(1)],
             multi_output: MultiOutputConfig::single(), dominant_dtype: None,
+            marker: GroupMarker::None,
+            is_layer_group: false,
+            hetero_layer_type: None,
         };
 
         // Act
@@ -4782,6 +5049,9 @@ mod tests {
             id: 0, anchor: OpId(0), epilogue: vec![],
             mode: FusionMode::Standalone, ops: vec![OpId(0)],
             multi_output: MultiOutputConfig::single(), dominant_dtype: None,
+            marker: GroupMarker::None,
+            is_layer_group: false,
+            hetero_layer_type: None,
         };
         assert_eq!(extract_gemm_dims(&grp1, &g1), Some((8, 64, 32)));
 
@@ -4801,6 +5071,9 @@ mod tests {
             id: 0, anchor: OpId(0), epilogue: vec![],
             mode: FusionMode::Standalone, ops: vec![OpId(0)],
             multi_output: MultiOutputConfig::single(), dominant_dtype: None,
+            marker: GroupMarker::None,
+            is_layer_group: false,
+            hetero_layer_type: None,
         };
         assert_eq!(extract_gemm_dims(&grp2, &g2), Some((4, 32, 16)));
 
@@ -4820,6 +5093,9 @@ mod tests {
             id: 0, anchor: OpId(0), epilogue: vec![],
             mode: FusionMode::Standalone, ops: vec![OpId(0)],
             multi_output: MultiOutputConfig::single(), dominant_dtype: None,
+            marker: GroupMarker::None,
+            is_layer_group: false,
+            hetero_layer_type: None,
         };
         assert_eq!(extract_gemm_dims(&grp3, &g3), Some((2, 16, 8)));
     }

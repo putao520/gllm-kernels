@@ -41,7 +41,7 @@ use crate::types::CompilerError;
 
 /// Structural op dispatch (ARCH-AUTO-INSTR-SELECT Category C/D).
 ///
-/// **Category C** (Phase 4, awaiting TraceOp extension for auto_select migration):
+/// **Category C** (手写 lower 委托, awaiting TraceOp extension for auto_select migration):
 /// Gather, ColumnSlice, QTapSTG.
 ///
 /// **Category D** (permanent, cannot use auto_select):
@@ -95,7 +95,7 @@ pub(crate) fn dispatch_structural(
             )
         }
 
-        // ── QTapSTG — ARCH-AUTO-INSTR-SELECT Phase 4: structural (Q vector ring
+        // ── QTapSTG — ARCH-AUTO-INSTR-SELECT 手写 lower 委托: structural (Q vector ring
         //    buffer store + step index bump), awaiting TraceOp extension ──
         // ARCH-SG-QTAP: Semantic Gatekeeper Q-Tap STG.
         OpKind::QTapSTG {
@@ -352,10 +352,10 @@ pub(crate) fn dispatch_structural(
             Ok(())
         }
 
-        // ── Gather — ARCH-AUTO-INSTR-SELECT Phase 4: auto_select driven
+        // ── Gather — ARCH-AUTO-INSTR-SELECT 手写 lower 委托: auto_select driven
         //    (TraceOp body + auto_lower_trace_raw for scale/telemetry).
         // + §13.10 telemetry. Arithmetic (embedding_scale, L2 norm) via TraceOp.
-        OpKind::Gather { embed_dim, index_dim, indices_kind, .. } => {
+        OpKind::Gather { embed_dim, index_dim, indices_kind, scale, .. } => {
             // Mega-kernel decode: embed one token per iteration (gen_input_ptr).
             // Without this override, the gather would process all prompt+generated
             // tokens but the GEMM layers (M=1) only read row 0 → always the first
@@ -380,14 +380,14 @@ pub(crate) fn dispatch_structural(
                 .map(|t| t.dtype.to_quant_precision())
                 .unwrap_or(ctx.dtype);
             emit_gather_inline(prog, seq_bound, *embed_dim, ctx.width,
-                input_ptr, weight_ptr, output_ptr, telemetry_ptr, graph.embedding_scale,
+                input_ptr, weight_ptr, output_ptr, telemetry_ptr, *scale,
                 *indices_kind, ctx.dtype, weight_dtype)?;
             Ok(())
         }
 
         // ── QuantGather — ARCH-RUST-IS-CODEGEN §4.2 REQ-QCG-005:
         //    JIT on-the-fly dequantize per token_id, no Rust dequantize pass.
-        OpKind::QuantGather { quant_type, vocab_size, hidden_dim, index_dim } => {
+        OpKind::QuantGather { quant_type, vocab_size, hidden_dim, index_dim, scale } => {
             // Mega-kernel decode: embed one token per iteration (same as Gather).
             let seq_bound = if abi.mega_decode_seq_len.is_some() {
                 BoundExpr::Const(1)
@@ -397,12 +397,12 @@ pub(crate) fn dispatch_structural(
             emit_quant_gather_inline(
                 prog, seq_bound, *vocab_size, *hidden_dim, *quant_type,
                 ctx.width, input_ptr, weight_ptr, output_ptr, ctx.dtype,
-                graph.embedding_scale,
+                *scale,
             )?;
             Ok(())
         }
 
-        // ── ColumnSlice — ARCH-AUTO-INSTR-SELECT Phase 4: auto_select driven
+        // ── ColumnSlice — ARCH-AUTO-INSTR-SELECT 手写 lower 委托: auto_select driven
         //    (TraceOp identity body + auto_lower_trace_raw for memory copy).
         // Gemma 4 PLE ple_full → ple_slice. No arithmetic.
         OpKind::ColumnSlice { seq_len, input_inner, start, slice_dim } => {
@@ -891,10 +891,10 @@ fn emit_altup_copy_loop(
 use super::instr::BoundExpr;
 use super::instr::OffsetExpr;
 
-/// **Phase 1** (`try_dispatch_by_compute_pattern`): Auto-driven ops dispatched
+/// **ComputePattern 自动分发** (`try_dispatch_by_compute_pattern`): Auto-driven ops dispatched
 ///   by ComputePattern from registry — NormLike, Reduction, BinaryElementwise.
 ///
-/// **Phase 2** (match &op.kind): Composite ops with OpKind-specific lowering:
+/// **OpKind 专用分发** (match &op.kind): Composite ops with OpKind-specific lowering:
 ///   Gemm/GemmBias, QuantGemm, MHA, RoPE, MoEGate/MoERouter/MoEDispatchPacked,
 ///   AltUpPredict/AltUpCorrect/AltUpInject, DepthwiseConv1D, PatchEmbed, SessionKvRestore, MmHiddenInject.
 ///
@@ -923,7 +923,7 @@ pub(crate) fn dispatch_compute_pattern(
     };
     let seq_bound_override: Option<BoundExpr> = abi.mega_decode_seq_len.map(BoundExpr::DynamicVReg);
 
-    // ── Phase 1: ComputePattern-driven dispatch (ARCH-AUTO-INSTR-SELECT) ──
+    // ── ComputePattern 自动分发 (ARCH-AUTO-INSTR-SELECT) ──
     // Trace-lookup: 如果 registry 有该 OpKind 的 trace，按 ComputePattern 路由。
     {
         let key = ScalarOpRegistry::key_from_op_kind(&op.kind);
@@ -949,7 +949,12 @@ pub(crate) fn dispatch_compute_pattern(
                                     } else { SymDim::Concrete(1) }
                                 }
                             };
-                            let seq_bound = resolve_sym_dim(&seq_dim, abi, sym_map);
+                            // Mega-kernel decode: each iteration processes 1 token.
+                            let seq_bound = if abi.mega_decode_seq_len.is_some() {
+                                BoundExpr::Const(1)
+                            } else {
+                                resolve_sym_dim(&seq_dim, abi, sym_map)
+                            };
                             let has_weight = !matches!(op.kind, OpKind::ValueNorm { .. });
                             let pattern = build_norm_pattern(op)?;
                             emit_normlike_inline(
@@ -979,7 +984,12 @@ pub(crate) fn dispatch_compute_pattern(
                                     } else { SymDim::Concrete(1) }
                                 }
                             };
-                            let seq_bound = resolve_sym_dim(&seq_dim, abi, sym_map);
+                            // Mega-kernel decode: each iteration processes 1 token.
+                            let seq_bound = if abi.mega_decode_seq_len.is_some() {
+                                BoundExpr::Const(1)
+                            } else {
+                                resolve_sym_dim(&seq_dim, abi, sym_map)
+                            };
                             emit_layernorm_auto(prog, feature_dim, *eps, width, seq_bound,
                                 input_ptr, weight_ptr, output_ptr, ctx.dtype)?;
                             return Ok(true);
@@ -1002,7 +1012,12 @@ pub(crate) fn dispatch_compute_pattern(
                             }
                             let num_heads = total_concrete / head_dim_v;
                             let outer_seq = out_tensor.shape.first().cloned().unwrap_or(SymDim::Concrete(1));
-                            let seq_bound = resolve_sym_dim(&outer_seq, abi, sym_map);
+                            // Mega-kernel decode: each iteration processes 1 token.
+                            let seq_bound = if abi.mega_decode_seq_len.is_some() {
+                                BoundExpr::Const(1)
+                            } else {
+                                resolve_sym_dim(&outer_seq, abi, sym_map)
+                            };
                             let pattern = build_norm_pattern_qk(*eps, head_dim_v)?;
                             emit_normlike_inline(
                                 prog, &pattern, head_dim_v, num_heads,
@@ -1031,7 +1046,12 @@ pub(crate) fn dispatch_compute_pattern(
                             let num_heads = total_concrete / head_dim_v;
                             let sym_dim = out_tensor.shape.iter().find(|d| d.is_symbolic()).cloned();
                             let outer_seq = sym_dim.unwrap_or(SymDim::Concrete(1));
-                            let seq_bound = resolve_sym_dim(&outer_seq, abi, sym_map);
+                            // Mega-kernel decode: each iteration processes 1 token.
+                            let seq_bound = if abi.mega_decode_seq_len.is_some() {
+                                BoundExpr::Const(1)
+                            } else {
+                                resolve_sym_dim(&outer_seq, abi, sym_map)
+                            };
                             let pattern = build_norm_pattern_head_rms(*eps)?;
                             emit_normlike_inline(
                                 prog, &pattern, head_dim_v, num_heads,
@@ -1052,7 +1072,7 @@ pub(crate) fn dispatch_compute_pattern(
                             )?;
                             return Ok(true);
                         }
-                        _ => {} // fall through to Phase 2
+                        _ => {} // fall through to OpKind 专用分发
                     }
                 }
                 // ── Reduction → Softmax / MeanPool ──
@@ -1077,7 +1097,7 @@ pub(crate) fn dispatch_compute_pattern(
                         )?;
                         return Ok(true);
                     }
-                    // else fall through to Phase 2
+                    // else fall through to OpKind 专用分发
                 }
                 // ── BinaryElementwise → emit_elementwise_inline ──
                 ComputePattern::BinaryElementwise { .. } => {
@@ -1098,14 +1118,14 @@ pub(crate) fn dispatch_compute_pattern(
                             input_ptr, weight_ptr, output_ptr, sym_map, seq_bound_override.as_ref(), ctx.dtype)?;
                         return Ok(true);
                     }
-                    // else fall through to Phase 2
+                    // else fall through to OpKind 专用分发
                 }
-                _ => {} // Gemm, QuantDecode, etc. → fall through to Phase 2
+                _ => {} // Gemm, QuantDecode, etc. → fall through to OpKind 专用分发
             }
         }
     }
 
-    // ── Phase 2: Composite op dispatch ──
+    // ── OpKind 专用分发: Composite op dispatch ──
     match &op.kind {
         // ── GEMM (非量化) — M 维度穿透 SymDim ──
         OpKind::Gemm { m, n, k, trans_b, .. } | OpKind::GemmBias { m, n, k, trans_b, .. } => {
@@ -1166,7 +1186,7 @@ pub(crate) fn dispatch_compute_pattern(
         }
 
 
-        // ── QuantGemm — ARCH-AUTO-INSTR-SELECT Phase 4: structural (QuantBlockLoad { unpack: Mxfp4 }),
+        // ── QuantGemm — ARCH-AUTO-INSTR-SELECT 手写 lower 委托: structural (QuantBlockLoad { unpack: Mxfp4 }),
         //    awaiting TraceOp LoadIndexed/StoreIndexed extension for auto_select migration ──
         OpKind::QuantGemm { m, n, k, quant_type } => {
             // For mega-kernel decode, M is always 1 (single-token hidden state).
@@ -1186,9 +1206,10 @@ pub(crate) fn dispatch_compute_pattern(
         }
 
 
-        // ── MHA — ARCH-AUTO-INSTR-SELECT Phase 4: structural (tiled attention with
+        // ── MHA — ARCH-AUTO-INSTR-SELECT 手写 lower 委托: structural (tiled attention with
         //    runtime seq_len, hook), awaiting TraceOp semantic extension for auto_select ──
         OpKind::MultiHeadAttention { seq_len, num_heads, num_kv_heads, head_dim, causal, attention_sinks } => {
+            eprintln!("[MHA-LOWER] label={} num_heads={} num_kv_heads={} head_dim={} causal={}", op.label, num_heads, num_kv_heads, head_dim, causal);
             // Mega-kernel decode: Q loop = Const(1) (single decode token),
             // KV loop = DynamicVReg(decode_seq_len) (all cached + current).
             // Otherwise both use graph-level SymDim bound.
@@ -1230,9 +1251,16 @@ pub(crate) fn dispatch_compute_pattern(
             // KV cache integration for mega-kernel:
             // After K/V GEMM, write current K/V row to the persistent KV cache buffer.
             // Then use KV cache pointers for attention reads.
-            let (k_attn_ptr, v_attn_ptr) = if let (Some(kv_cache_ptr), Some(layer_ctr), Some(gen_ctr)) =
-                (abi.kv_cache_ptr, abi.layer_loop_counter, abi.gen_loop_counter)
+            // Prefill: gen_loop_counter is None → use 0 (write to cache start).
+            // Decode: gen_loop_counter tracks position → write to current position.
+            let (k_attn_ptr, v_attn_ptr) = if let (Some(kv_cache_ptr), Some(layer_ctr)) =
+                (abi.kv_cache_ptr, abi.layer_loop_counter)
             {
+                let gen_ctr = abi.gen_loop_counter.unwrap_or_else(|| {
+                    let zero = prog.alloc_vreg(VRegKind::Counter, SimdWidth::Scalar);
+                    prog.emit(VmInstr::GprLoadImm { dst: zero, value: 0 });
+                    zero
+                });
                 let kv_row_stride = *num_kv_heads * *head_dim * ctx.dtype.elem_bytes();
                 let max_seq = graph.max_seq_len;
                 let kv_layer_stride = 2 * max_seq * kv_row_stride;
@@ -1245,20 +1273,32 @@ pub(crate) fn dispatch_compute_pattern(
                 prog.emit(VmInstr::GprBinOp { dst: k_cache_base, a: kv_cache_ptr, b: GprOperand::VReg(layer_off), op: GprOp::Add });
                 let pos_off = prog.alloc_vreg(VRegKind::ByteOffset, SimdWidth::Scalar);
                 prog.emit(VmInstr::GprBinOp { dst: pos_off, a: gen_ctr, b: GprOperand::Imm(kv_row_stride as i64), op: GprOp::Mul });
-                let k_write_addr = prog.alloc_vreg(VRegKind::Ptr, SimdWidth::Scalar);
-                prog.emit(VmInstr::GprBinOp { dst: k_write_addr, a: k_cache_base, b: GprOperand::VReg(pos_off), op: GprOp::Add });
-                // MemCopy K row
-                prog.emit(VmInstr::MemCopy { dst: k_write_addr, src: k_ptr, bytes: kv_row_stride });
+                // Copy all K rows to KV cache (prefill: seq_len rows, decode: 1 row)
+                let k_copy_dst = prog.alloc_vreg(VRegKind::Ptr, SimdWidth::Scalar);
+                let k_copy_src = prog.alloc_vreg(VRegKind::Ptr, SimdWidth::Scalar);
+                let k_off_tmp = prog.alloc_vreg(VRegKind::ByteOffset, SimdWidth::Scalar);
+                prog.emit_loop(q_bound.clone(), kv_row_stride, |prog, _ctr, byte_off| {
+                    prog.emit(VmInstr::GprBinOp { dst: k_copy_src, a: k_ptr, b: GprOperand::VReg(byte_off), op: GprOp::Add });
+                    prog.emit(VmInstr::GprBinOp { dst: k_off_tmp, a: pos_off, b: GprOperand::VReg(byte_off), op: GprOp::Add });
+                    prog.emit(VmInstr::GprBinOp { dst: k_copy_dst, a: k_cache_base, b: GprOperand::VReg(k_off_tmp), op: GprOp::Add });
+                    prog.emit(VmInstr::MemCopy { dst: k_copy_dst, src: k_copy_src, bytes: kv_row_stride });
+                });
 
                 // V cache base = K cache base + max_seq * kv_row_stride
                 let v_offset_gpr = prog.alloc_vreg(VRegKind::ByteOffset, SimdWidth::Scalar);
                 prog.emit(VmInstr::GprLoadImm { dst: v_offset_gpr, value: max_seq * kv_row_stride });
                 let v_cache_base = prog.alloc_vreg(VRegKind::Ptr, SimdWidth::Scalar);
                 prog.emit(VmInstr::GprBinOp { dst: v_cache_base, a: k_cache_base, b: GprOperand::VReg(v_offset_gpr), op: GprOp::Add });
-                let v_write_addr = prog.alloc_vreg(VRegKind::Ptr, SimdWidth::Scalar);
-                prog.emit(VmInstr::GprBinOp { dst: v_write_addr, a: v_cache_base, b: GprOperand::VReg(pos_off), op: GprOp::Add });
-                // MemCopy V row
-                prog.emit(VmInstr::MemCopy { dst: v_write_addr, src: v_ptr, bytes: kv_row_stride });
+                // Copy all V rows to KV cache
+                let v_copy_dst = prog.alloc_vreg(VRegKind::Ptr, SimdWidth::Scalar);
+                let v_copy_src = prog.alloc_vreg(VRegKind::Ptr, SimdWidth::Scalar);
+                let v_off_tmp = prog.alloc_vreg(VRegKind::ByteOffset, SimdWidth::Scalar);
+                prog.emit_loop(q_bound.clone(), kv_row_stride, |prog, _ctr, byte_off| {
+                    prog.emit(VmInstr::GprBinOp { dst: v_copy_src, a: v_ptr, b: GprOperand::VReg(byte_off), op: GprOp::Add });
+                    prog.emit(VmInstr::GprBinOp { dst: v_off_tmp, a: pos_off, b: GprOperand::VReg(byte_off), op: GprOp::Add });
+                    prog.emit(VmInstr::GprBinOp { dst: v_copy_dst, a: v_cache_base, b: GprOperand::VReg(v_off_tmp), op: GprOp::Add });
+                    prog.emit(VmInstr::MemCopy { dst: v_copy_dst, src: v_copy_src, bytes: kv_row_stride });
+                });
 
                 // Attention reads from KV cache: k_cache_base and v_cache_base
                 (k_cache_base, v_cache_base)
@@ -1290,7 +1330,7 @@ pub(crate) fn dispatch_compute_pattern(
         }
 
 
-        // ── RoPE — ARCH-AUTO-INSTR-SELECT Phase 4: auto_select driven
+        // ── RoPE — ARCH-AUTO-INSTR-SELECT 手写 lower 委托: auto_select driven
         //    (rotation via auto_lower_trace_multi, passthrough via auto_lower_trace_raw).
         OpKind::RoPE { num_heads, head_dim, theta, partial, rope_scaling } => {
             let out_tid = op.outputs.first().copied().ok_or_else(|| CompilerError::CodegenViolation(
@@ -1490,19 +1530,19 @@ pub(crate) fn dispatch_compute_pattern(
             let logits_off = *top_k * 2 * ctx.dtype.elem_bytes();
             let logits_ptr = prog.alloc_vreg(VRegKind::Ptr, SimdWidth::Scalar);
             prog.emit(VmInstr::LoadPtr { dst: logits_ptr, src: PtrExpr::VRegPlusConst(output_ptr, logits_off) });
-            // Phase 1: GEMV (structural)
+            // GEMV 阶段 (structural)
             emit_moe_router_gemv_inline(prog, *num_experts, *hidden, width,
                 input_ptr, weight_vreg, logits_ptr, ctx.dtype)?;
-            // Phase 2: Softmax (auto-driven via emit_softmax_inline)
+            // Softmax 阶段 (auto-driven via emit_softmax_inline)
             emit_softmax_inline(prog, *num_experts, width, logits_ptr, logits_ptr, ctx.dtype)?;
-            // Phase 3: Top-K + dispatch (structural, reuses MoEGate top-k logic)
+            // Top-K 分发阶段 (structural, reuses MoEGate top-k logic)
             emit_moe_topk_dispatch_inline(prog, *num_experts, *top_k, width,
                 logits_ptr, output_ptr, hook, None, ctx.dtype)?;
             Ok(true)
         }
 
 
-        // ── MoEDispatchPacked — ARCH-AUTO-INSTR-SELECT Phase 4: structural (fused MoE
+        // ── MoEDispatchPacked — ARCH-AUTO-INSTR-SELECT 手写 lower 委托: structural (fused MoE
         //    GEMV + softmax + top-k + dequant + SwiGLU + down), all arithmetic in
         //    emit_loop closures, awaiting TraceOp extension for auto_select migration ──
         OpKind::MoEDispatchPacked { num_experts, top_k, mxfp4_block_size, swiglu_limit,
@@ -1595,7 +1635,7 @@ pub(crate) fn dispatch_compute_pattern(
         }
 
 
-        // ── DepthwiseConv1D — ARCH-AUTO-INSTR-SELECT Phase 4: structural (per-channel
+        // ── DepthwiseConv1D — ARCH-AUTO-INSTR-SELECT 手写 lower 委托: structural (per-channel
         //    1D conv with padding), awaiting TraceOp extension for auto_select migration ──
         // USM Conformer convolution module (T55).
         // Per-channel 1D conv: output[t, c] = Σ_k x[t - pad + k, c] * w[c, k]。
@@ -1617,7 +1657,7 @@ pub(crate) fn dispatch_compute_pattern(
         }
 
 
-        // ── PatchEmbed — ARCH-AUTO-INSTR-SELECT Phase 4: structural (Conv2D sliding
+        // ── PatchEmbed — ARCH-AUTO-INSTR-SELECT 手写 lower 委托: structural (Conv2D sliding
         //    window with nested loops), awaiting TraceOp extension for auto_select ──
         // SigLIP / ViT vision tower (T44/T65).
         // Conv2D 滑动窗口 (stride=patch_size), 输出 [num_patches, embed_dim]。
@@ -1658,7 +1698,7 @@ pub(crate) fn dispatch_compute_pattern(
             ).map(|_| true)
         }
 
-        // ── SessionKvRestore — ARCH-AUTO-INSTR-SELECT Phase 4: structural (session
+        // ── SessionKvRestore — ARCH-AUTO-INSTR-SELECT 手写 lower 委托: structural (session
         //    position check + pointer adjustment), awaiting TraceOp extension ──
         OpKind::SessionKvRestore => {
             // session_position is ABI stack param at offset 104 ([rbp+104]).
@@ -1701,7 +1741,7 @@ pub(crate) fn dispatch_compute_pattern(
             Ok(true)
         }
 
-        // ── MmHiddenInject — ARCH-AUTO-INSTR-SELECT Phase 4: structural (ADD fused
+        // ── MmHiddenInject — ARCH-AUTO-INSTR-SELECT 手写 lower 委托: structural (ADD fused
         //    hidden to token embedding), awaiting TraceOp extension ──
         OpKind::MmHiddenInject { hidden_dim } => {
             // fused_hidden_ptr is ABI stack param at offset 112 ([rbp+112])

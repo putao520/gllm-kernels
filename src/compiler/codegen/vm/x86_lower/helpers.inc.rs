@@ -16,7 +16,7 @@ impl X86Lower {
             stack_layout: StackLayout::default(),
             amx_tile_dtype: None,
             jit_ctx,
-            sym_slot_map: super::plan_lower::SymDimSlotMap::default_abi(),
+            sym_slot_map: super::plan_lower::SymDimSlotMap::mega_kernel_abi(),
             // 默认 scratch (x86 SysV): rax (eval_offset), r10/r11 (spill load/store)
             scratch_gprs: vec![rax, r10, r11],
             // 默认 vec scratch (与 IsaProfile 一致): ymm15..10 共 6 条

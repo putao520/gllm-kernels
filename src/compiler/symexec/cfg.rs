@@ -1,6 +1,6 @@
 //! CFG construction and natural loop detection for symexec.
 //!
-//! Phase 1 of the control-flow upgrade: builds a control-flow graph from
+//! Step 1 of the control-flow upgrade: builds a control-flow graph from
 //! a compiled `extern "C"` function's machine code, then identifies natural
 //! loops via dominator-tree analysis.
 
@@ -144,7 +144,7 @@ pub unsafe fn build_cfg_from_fn(fn_ptr: *const u8, max_bytes: usize) -> Result<C
     let mut decoder = Decoder::new(64, bytes, DecoderOptions::NONE);
     decoder.set_ip(base_addr);
 
-    // Phase 1: Linear scan — collect all instructions and jump targets.
+    // Linear scan — collect all instructions and jump targets.
     let mut all_insns: Vec<(u64, Instruction)> = Vec::new();
     let mut branch_targets: BTreeSet<u64> = BTreeSet::new();
     let mut func_end: Option<u64> = None;
@@ -180,7 +180,7 @@ pub unsafe fn build_cfg_from_fn(fn_ptr: *const u8, max_bytes: usize) -> Result<C
         last.next_ip()
     });
 
-    // Phase 2: Determine block boundaries.
+    // Determine block boundaries.
     // A new block starts at: (a) the function entry, (b) any branch target,
     // (c) the instruction after a branch/ret.
     let mut block_starts: BTreeSet<u64> = BTreeSet::new();
@@ -202,7 +202,7 @@ pub unsafe fn build_cfg_from_fn(fn_ptr: *const u8, max_bytes: usize) -> Result<C
         addr_to_block.get(&addr).copied()
     };
 
-    // Phase 3: Build basic blocks.
+    // Build basic blocks.
     let block_start_vec: Vec<u64> = block_starts.iter().copied().collect();
     let mut blocks: BTreeMap<BlockId, BasicBlock> = BTreeMap::new();
     let mut successors: BTreeMap<BlockId, Vec<BlockId>> = BTreeMap::new();

@@ -42,27 +42,6 @@ impl ArgLocation {
 }
 
 // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-// §2 CompiledLayerFn 参数名序列
-// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-
-/// CompiledLayerFn 的参数名序列——与函数签名一一对应。
-///
-/// 这是 VmState 初始化的输入。参数顺序由 `executable.rs` 的
-/// `CompiledLayerFn` 类型定义决定。
-pub const COMPILED_LAYER_PARAMS: &[&str] = &[
-    "input",       // arg 0
-    "weights",     // arg 1
-    "kv_cache",    // arg 2
-    "positions",   // arg 3
-    "seq_lens",    // arg 4
-    "batch_size",  // arg 5
-    "seq_len",     // arg 6
-    "output",      // arg 7
-    "scratchpad",  // arg 8
-    "telemetry",   // arg 9
-];
-
-// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 // §3 VmState
 // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
@@ -73,10 +52,10 @@ pub const COMPILED_LAYER_PARAMS: &[&str] = &[
 ///
 /// ## 使用流程
 /// ```text
-/// let vm_state = VmState::init_x86_sysv();     // Phase 1: ABI 初始化
-/// lowerer.emit_prologue(&mut vm_state, ...);     // Phase 2: prologue 更新状态
-/// let sym_map = SymDimSlotMap::from_vm_state(&vm_state);  // Phase 3: 构建 SlotMap
-/// // Phase 4: lower 函数通过 sym_map 查询参数位置
+/// let vm_state = VmState::init_mega_kernel_x86();     // ABI 初始化
+/// lowerer.emit_prologue(&mut vm_state, ...);     // prologue 更新状态
+/// let sym_map = SymDimSlotMap::from_vm_state(&vm_state);  // 构建 SlotMap
+/// // lower 函数通过 sym_map 查询参数位置
 /// ```
 #[derive(Debug, Clone)]
 pub struct VmState {
@@ -125,51 +104,10 @@ impl VmState {
         }
     }
 
-    /// 从 x86-64 System V ABI 规则初始化。
-    ///
-    /// 前 6 个整数/指针参数 → 寄存器 (rdi/rsi/rdx/rcx/r8/r9)
-    /// 第 7+ 个参数 → 栈上 [rbp + stack_arg_base + (idx - 6) * 8]
-    ///
-    /// `stack_arg_base` = 16 = ret_addr(8) + saved_rbp(8)
-    /// 这不是硬编码——是 `call` + `push rbp` 后的数学推导结果。
-    pub fn init_x86_sysv() -> Self {
-        let param_names = COMPILED_LAYER_PARAMS;
-
-        // x86 SysV ABI: 前 6 个整数/指针参数在寄存器中
-        // rdi(0), rsi(1), rdx(2), rcx(3), r8(4), r9(5)
-        let num_reg_args: usize = 6;
-
-        // 栈参数基址 = return_address(8) + saved_rbp(8) = 16
-        // 这是 `call` 指令压栈 + prologue `push rbp` 的结果
-        let ret_addr_size: i32 = 8;
-        let saved_rbp_size: i32 = 8;
-        let stack_arg_base: i32 = ret_addr_size + saved_rbp_size;
-
-        let mut arg_locations = HashMap::new();
-        for (i, &name) in param_names.iter().enumerate() {
-            let loc = if i < num_reg_args {
-                ArgLocation::Register(i as u8)
-            } else {
-                // 第 7+ 个参数在栈上，偏移递增 8 bytes (指针大小)
-                let stack_index = (i - num_reg_args) as i32;
-                ArgLocation::Stack(stack_arg_base + stack_index * 8)
-            };
-            arg_locations.insert(name.to_string(), loc);
-        }
-
-        Self {
-            arg_locations,
-            rsp_offset: 0,
-            callee_save_locations: Vec::new(),
-            spill_base: 0,
-        }
-    }
-
-    /// 从 MegaKernelFn ABI 初始化 (17 参数: 6 寄存器 + 11 栈参数)。
+    /// 从 MegaKernelFn ABI 初始化 (16 参数: 6 寄存器 + 10 栈参数)。
     ///
     /// 栈参数严格 8 字节对齐 (SysV ABI: 每个参数占一个 eightbyte 槽位)。
     /// f32 已改为 u32 传递 (避免 SSE 寄存器传参导致 JIT 无法从栈读取)。
-    /// output_mode_selector 在 [rbp+80] 驱动 JMP table 多头分发。
     pub fn init_mega_kernel_x86() -> Self {
         let param_names: &[&str] = &[
             "input_ids_ptr",        // arg 0 → AbiArg(0)
@@ -186,14 +124,13 @@ impl VmState {
             "top_p_u32",            // arg 11 → StackArg(56)
             "max_new_tokens",       // arg 12 → StackArg(64)
             "eos_token_id",         // arg 13 → StackArg(72)
-            "output_mode_selector", // arg 14 → StackArg(80)
-            "hook_ctx_ptr",         // arg 15 → StackArg(88)
-            "telemetry_ptr",        // arg 16 → StackArg(96)
-            "session_position",     // arg 17 → StackArg(104)
-            "fused_hidden_ptr",     // arg 18 → StackArg(112)
-            "num_mm_tokens",        // arg 19 → StackArg(120)
-            "callback_table_ptr",   // arg 20 → StackArg(128)
-            "page_table_ptr",       // arg 21 → StackArg(136)
+            "hook_ctx_ptr",         // arg 14 → StackArg(80)
+            "telemetry_ptr",        // arg 15 → StackArg(88)
+            "session_position",     // arg 16 → StackArg(96)
+            "fused_hidden_ptr",     // arg 17 → StackArg(104)
+            "num_mm_tokens",        // arg 18 → StackArg(112)
+            "callback_table_ptr",   // arg 19 → StackArg(120)
+            "page_table_ptr",       // arg 20 → StackArg(128)
         ];
 
         let num_reg_args: usize = 6;
@@ -236,7 +173,7 @@ impl VmState {
         self.arg_locations.get(name).map(|loc| loc.to_ptr_expr())
     }
 
-    // ── Prologue 状态跟踪 (Phase 2) ──
+    // ── Prologue 状态跟踪 ──
 
     /// 记录一次 push 操作。rsp -= 8。
     pub fn track_push(&mut self, reg: PhysGpr) {
@@ -261,7 +198,7 @@ impl VmState {
 
 impl VmState {
     /// 符号维度名称的别名映射。
-    /// "total_seq" 复用 "seq_len" 的位置（Decoder 模式）。
+    /// "total_seq" 复用 "seq_len" 的位置（生成循环模式）。
     pub fn sym_dim_aliases() -> Vec<(&'static str, &'static str)> {
         vec![
             ("total_seq", "seq_len"),
@@ -369,6 +306,8 @@ pub struct EmitState {
     pub hetero_seg_weight_base: Option<super::instr::VRegId>,
     /// 全局 layer_idx VReg（异构层中用于 GprCondAction）
     pub hetero_global_layer_idx: Option<super::instr::VRegId>,
+    /// 外层段循环 counter VReg（异构层 full body 需要从段索引推导全局 layer_idx）
+    pub hetero_outer_seg_counter: Option<super::instr::VRegId>,
     /// Current active layer guard (for guard run merging).
     /// `Always` = no guard active. When consecutive ops share the same guard,
     /// only one GprCondAction is emitted covering all of them.
@@ -383,53 +322,26 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_init_x86_sysv_register_args() {
-        let state = VmState::init_x86_sysv();
+    fn test_init_mega_kernel_x86_register_args() {
+        let state = VmState::init_mega_kernel_x86();
         // 前 6 个参数在寄存器
-        assert_eq!(state.arg_ptr_expr("input").unwrap(), PtrExpr::AbiArg(0));
-        assert_eq!(state.arg_ptr_expr("weights").unwrap(), PtrExpr::AbiArg(1));
-        assert_eq!(state.arg_ptr_expr("kv_cache").unwrap(), PtrExpr::AbiArg(2));
-        assert_eq!(state.arg_ptr_expr("positions").unwrap(), PtrExpr::AbiArg(3));
-        assert_eq!(state.arg_ptr_expr("seq_lens").unwrap(), PtrExpr::AbiArg(4));
+        assert_eq!(state.arg_ptr_expr("input_ids_ptr").unwrap(), PtrExpr::AbiArg(0));
+        assert_eq!(state.arg_ptr_expr("weight_blob_ptr").unwrap(), PtrExpr::AbiArg(1));
+        assert_eq!(state.arg_ptr_expr("kv_cache_ptr").unwrap(), PtrExpr::AbiArg(2));
+        assert_eq!(state.arg_ptr_expr("positions_ptr").unwrap(), PtrExpr::AbiArg(3));
+        assert_eq!(state.arg_ptr_expr("aux_ptr").unwrap(), PtrExpr::AbiArg(4));
         assert_eq!(state.arg_ptr_expr("batch_size").unwrap(), PtrExpr::AbiArg(5));
     }
 
     #[test]
-    fn test_init_x86_sysv_stack_args() {
-        let state = VmState::init_x86_sysv();
-        // 第 7+ 个参数在栈上: [rbp + 16 + (idx-6)*8]
-        assert_eq!(state.arg_ptr_expr("seq_len").unwrap(), PtrExpr::StackArg(16));      // 16 + 0*8
-        assert_eq!(state.arg_ptr_expr("output").unwrap(), PtrExpr::StackArg(24));       // 16 + 1*8
-        assert_eq!(state.arg_ptr_expr("scratchpad").unwrap(), PtrExpr::StackArg(32));   // 16 + 2*8
-        assert_eq!(state.arg_ptr_expr("telemetry").unwrap(), PtrExpr::StackArg(40));    // 16 + 3*8
-    }
-
-    #[test]
-    fn test_stack_arg_offsets_are_computed_not_hardcoded() {
-        let state = VmState::init_x86_sysv();
-        // 验证偏移是 stack_arg_base + (idx-6)*8 的计算结果
-        // stack_arg_base = ret_addr(8) + saved_rbp(8) = 16
-        for (i, &name) in COMPILED_LAYER_PARAMS.iter().enumerate() {
-            if i >= 6 {
-                let expected_offset = 16 + ((i - 6) as i32) * 8;
-                assert_eq!(
-                    state.arg_ptr_expr(name).unwrap(),
-                    PtrExpr::StackArg(expected_offset),
-                    "param '{}' (index {}) offset mismatch", name, i
-                );
-            }
-        }
-    }
-
-    #[test]
     fn test_unknown_param_returns_error() {
-        let state = VmState::init_x86_sysv();
+        let state = VmState::init_mega_kernel_x86();
         assert!(state.arg_ptr_expr("nonexistent").is_err());
     }
 
     #[test]
     fn test_prologue_tracking() {
-        let mut state = VmState::init_x86_sysv();
+        let mut state = VmState::init_mega_kernel_x86();
         assert_eq!(state.rsp_offset, 0);
 
         state.track_push(PhysGpr(3)); // rbx
@@ -443,7 +355,7 @@ mod tests {
         assert_eq!(state.rsp_offset, -80);
 
         // 参数位置不受 prologue 操作影响（相对 rbp）
-        assert_eq!(state.arg_ptr_expr("output").unwrap(), PtrExpr::StackArg(24));
+        assert_eq!(state.arg_ptr_expr("scratchpad_ptr").unwrap(), PtrExpr::StackArg(24));
     }
 
     // ── New tests (TEST-VMS-06 .. TEST-VMS-18) ──
@@ -528,14 +440,13 @@ mod tests {
         assert_eq!(state.arg_ptr_expr("top_p_u32").unwrap(), PtrExpr::StackArg(56));
         assert_eq!(state.arg_ptr_expr("max_new_tokens").unwrap(), PtrExpr::StackArg(64));
         assert_eq!(state.arg_ptr_expr("eos_token_id").unwrap(), PtrExpr::StackArg(72));
-        assert_eq!(state.arg_ptr_expr("output_mode_selector").unwrap(), PtrExpr::StackArg(80));
-        assert_eq!(state.arg_ptr_expr("hook_ctx_ptr").unwrap(), PtrExpr::StackArg(88));
-        assert_eq!(state.arg_ptr_expr("telemetry_ptr").unwrap(), PtrExpr::StackArg(96));
-        assert_eq!(state.arg_ptr_expr("session_position").unwrap(), PtrExpr::StackArg(104));
-        assert_eq!(state.arg_ptr_expr("fused_hidden_ptr").unwrap(), PtrExpr::StackArg(112));
-        assert_eq!(state.arg_ptr_expr("num_mm_tokens").unwrap(), PtrExpr::StackArg(120));
-        assert_eq!(state.arg_ptr_expr("callback_table_ptr").unwrap(), PtrExpr::StackArg(128));
-        assert_eq!(state.arg_ptr_expr("page_table_ptr").unwrap(), PtrExpr::StackArg(136));
+        assert_eq!(state.arg_ptr_expr("hook_ctx_ptr").unwrap(), PtrExpr::StackArg(80));
+        assert_eq!(state.arg_ptr_expr("telemetry_ptr").unwrap(), PtrExpr::StackArg(88));
+        assert_eq!(state.arg_ptr_expr("session_position").unwrap(), PtrExpr::StackArg(96));
+        assert_eq!(state.arg_ptr_expr("fused_hidden_ptr").unwrap(), PtrExpr::StackArg(104));
+        assert_eq!(state.arg_ptr_expr("num_mm_tokens").unwrap(), PtrExpr::StackArg(112));
+        assert_eq!(state.arg_ptr_expr("callback_table_ptr").unwrap(), PtrExpr::StackArg(120));
+        assert_eq!(state.arg_ptr_expr("page_table_ptr").unwrap(), PtrExpr::StackArg(128));
     }
 
     /// @trace TEST-VMS-10 [req:REQ-VR] [level:unit]
@@ -543,7 +454,7 @@ mod tests {
     #[test]
     fn test_arg_ptr_expr_error_contains_param_name() {
         // Arrange
-        let state = VmState::init_x86_sysv();
+        let state = VmState::init_mega_kernel_x86();
 
         // Act
         let result = state.arg_ptr_expr("bogus_param_xyz");
@@ -561,11 +472,11 @@ mod tests {
     #[test]
     fn test_try_arg_found_and_not_found() {
         // Arrange
-        let state = VmState::init_x86_sysv();
+        let state = VmState::init_mega_kernel_x86();
 
         // Act & Assert — known params
-        assert_eq!(state.try_arg("input"), Some(PtrExpr::AbiArg(0)));
-        assert_eq!(state.try_arg("telemetry"), Some(PtrExpr::StackArg(40)));
+        assert_eq!(state.try_arg("input_ids_ptr"), Some(PtrExpr::AbiArg(0)));
+        assert_eq!(state.try_arg("telemetry_ptr"), Some(PtrExpr::StackArg(88)));
 
         // Unknown param returns None (not an error)
         assert_eq!(state.try_arg("does_not_exist"), None);
@@ -576,7 +487,7 @@ mod tests {
     #[test]
     fn test_track_push_multiple_callee_saves() {
         // Arrange
-        let mut state = VmState::init_x86_sysv();
+        let mut state = VmState::init_mega_kernel_x86();
 
         // Act — push rbx, r12, r13
         state.track_push(PhysGpr(3));  // rbx
@@ -596,7 +507,7 @@ mod tests {
     #[test]
     fn test_set_spill_base_with_callee_save_count() {
         // Arrange
-        let mut state = VmState::init_x86_sysv();
+        let mut state = VmState::init_mega_kernel_x86();
         state.track_push(PhysGpr(3));
         state.track_push(PhysGpr(12));
 
@@ -613,7 +524,7 @@ mod tests {
     #[test]
     fn test_track_sub_rsp_combined_with_push() {
         // Arrange
-        let mut state = VmState::init_x86_sysv();
+        let mut state = VmState::init_mega_kernel_x86();
         state.track_push(PhysGpr(3));  // rsp = -8
         state.track_push(PhysGpr(12)); // rsp = -16
 
@@ -624,8 +535,8 @@ mod tests {
         assert_eq!(state.rsp_offset, -272);
 
         // Arg locations are still relative to rbp, unaffected
-        assert_eq!(state.arg_ptr_expr("input").unwrap(), PtrExpr::AbiArg(0));
-        assert_eq!(state.arg_ptr_expr("telemetry").unwrap(), PtrExpr::StackArg(40));
+        assert_eq!(state.arg_ptr_expr("input_ids_ptr").unwrap(), PtrExpr::AbiArg(0));
+        assert_eq!(state.arg_ptr_expr("telemetry_ptr").unwrap(), PtrExpr::StackArg(88));
     }
 
     /// @trace TEST-VMS-15 [req:REQ-VR] [level:unit]
@@ -703,7 +614,7 @@ mod tests {
     #[test]
     fn test_vm_state_clone_independence() {
         // Arrange
-        let mut original = VmState::init_x86_sysv();
+        let mut original = VmState::init_mega_kernel_x86();
         original.track_push(PhysGpr(3));
         original.track_sub_rsp(64);
         original.set_spill_base(1);
@@ -729,7 +640,7 @@ mod tests {
     #[test]
     fn test_track_sub_rsp_zero_is_noop() {
         // Arrange
-        let mut state = VmState::init_x86_sysv();
+        let mut state = VmState::init_mega_kernel_x86();
         assert_eq!(state.rsp_offset, 0);
 
         // Act — subtract zero
@@ -737,7 +648,7 @@ mod tests {
 
         // Assert — unchanged
         assert_eq!(state.rsp_offset, 0);
-        assert_eq!(state.arg_ptr_expr("input").unwrap(), PtrExpr::AbiArg(0));
+        assert_eq!(state.arg_ptr_expr("input_ids_ptr").unwrap(), PtrExpr::AbiArg(0));
     }
 
     /// @trace TEST-VMS-20 [req:REQ-VR] [level:unit]
@@ -745,7 +656,7 @@ mod tests {
     #[test]
     fn test_set_spill_base_zero_count() {
         // Arrange
-        let mut state = VmState::init_x86_sysv();
+        let mut state = VmState::init_mega_kernel_x86();
 
         // Act — zero callee-saved regs
         state.set_spill_base(0);
@@ -819,7 +730,7 @@ mod tests {
     #[test]
     fn test_interleaved_push_and_sub_rsp() {
         // Arrange
-        let mut state = VmState::init_x86_sysv();
+        let mut state = VmState::init_mega_kernel_x86();
 
         // Act — push, sub, push, sub
         state.track_push(PhysGpr(3));   // rsp = -8
@@ -868,29 +779,6 @@ mod tests {
         assert_eq!(original.transitions.len(), 2);
         assert_eq!(cloned.transitions.len(), 3);
         assert_eq!(cloned.transitions[2], (10, HeteroPhase::Done));
-    }
-
-    /// @trace TEST-VMS-27 [req:REQ-VR] [level:unit]
-    /// VmState::init_x86_sysv arg_ptr_expr queries every COMPILED_LAYER_PARAMS
-    /// entry without error, confirming zero missing mappings.
-    #[test]
-    fn test_x86_sysv_all_compiled_params_resolvable() {
-        // Arrange
-        let state = VmState::init_x86_sysv();
-
-        // Act & Assert — every entry in COMPILED_LAYER_PARAMS must resolve
-        for &name in COMPILED_LAYER_PARAMS {
-            let result = state.arg_ptr_expr(name);
-            assert!(
-                result.is_ok(),
-                "COMPILED_LAYER_PARAMS entry '{}' should resolve but got error: {:?}",
-                name,
-                result.err()
-            );
-        }
-
-        // Assert — exactly COMPILED_LAYER_PARAMS.len() entries in arg_locations
-        assert_eq!(COMPILED_LAYER_PARAMS.len(), 10);
     }
 
     /// @trace TEST-VMS-28 [req:REQ-VR] [level:unit]

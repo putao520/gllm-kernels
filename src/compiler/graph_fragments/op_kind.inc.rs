@@ -167,7 +167,7 @@ pub enum OpKind {
     LogitSoftcap { cap: f32 },
 
     /// Argmax over logits to find the token with highest logit.
-    /// OpClass: Reduction — scans entire vector. May fuse with preceding lm_head GEMM
+    /// OpClass: Reduction — scans entire vector. May fuse with preceding logits-producer GEMM
     /// as EpilogueInjection (max computed in GEMM accumulator registers).
     ///
     /// Input: `logits[1, vocab_size]` (f32 row-major)
@@ -371,6 +371,10 @@ pub enum OpKind {
         index_dim: SymDim,
         /// How the lookup indices are obtained.
         indices_kind: GatherIndicesKind,
+        /// Scaling factor applied after gather: out = scale * table[indices[i]].
+        /// Gemma models use sqrt(hidden_size); None = no scaling (default).
+        /// SPEC/39: per-op topology-driven, replaces graph.embedding_scale config.
+        scale: Option<f32>,
     },
     /// Quantized embedding lookup: output[i] = dequantize(table_quant[indices[i]]).
     ///
@@ -393,6 +397,9 @@ pub enum OpKind {
         hidden_dim: usize,
         /// Number of indices to look up (seq_len, may be Symbolic).
         index_dim: SymDim,
+        /// Scaling factor applied after dequantize: out = scale * dequant(table[indices[i]]).
+        /// SPEC/39: per-op topology-driven, replaces graph.embedding_scale config.
+        scale: Option<f32>,
     },
     /// Zero-copy sub-tensor view (pointer offset, no data movement).
     /// JIT codegen: NOP (authorized SPEC exception, same as Reshape/Transpose).
@@ -921,8 +928,9 @@ pub struct CompilerGraph {
     /// Heterogeneous layer loop config for models with alternating layer types
     /// (e.g., Gemma-4 E2B). When present, takes precedence over layer_loop_config.
     pub hetero_layer_loop_config: Option<HeteroLayerLoopConfig>,
-    /// Embedding scale factor applied after Gather (e.g., Gemma models: sqrt(hidden_size)).
-    /// None = no scaling (most models). Consumed by lower_gather during codegen.
+    /// SPEC/39 NOTE: 编译器不再读取此字段。embedding_scale 已迁移到 OpKind::Gather::scale
+    /// 和 OpKind::QuantGather::scale（per-op 拓扑驱动）。此字段仅保留供 gllm 侧
+    /// build_graph 构建 OpKind 时读取，编译器路径不使用。
     pub embedding_scale: Option<f32>,
     /// Custom weight layout override. When present, weight_layout() returns this
     /// instead of computing from inputs. Used by mega-kernel where layer weights

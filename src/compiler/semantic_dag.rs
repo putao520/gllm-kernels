@@ -1,6 +1,6 @@
-//! SemanticDAG — Phase 1 output: CompilerGraph enriched with OpTrace and OpClass.
+//! SemanticDAG — SemanticDAG output: CompilerGraph enriched with OpTrace and OpClass.
 //!
-//! Each node carries its OpTrace (from Phase 0) and auto-derived OpClass
+//! Each node carries its OpTrace (from Scalar + SymExec) and auto-derived OpClass
 //! (from ComputePattern). This replaces the old hand-maintained OpSemantics mapping.
 
 use crate::compiler::graph::{CompilerGraph, CompilerOp, OpKind, OpId, TensorId};
@@ -71,7 +71,7 @@ pub struct SemanticNode {
     pub node_id: OpId,
     /// Operator kind (from CompilerGraph)
     pub op_kind: OpKind,
-    /// Computation structure (from Phase 0 / registry)
+    /// Computation structure (from Scalar + SymExec / registry)
     pub op_trace: Option<OpTrace>,
     /// TVM operator class (auto-derived from op_trace.pattern)
     pub op_class: OpClass,
@@ -795,6 +795,7 @@ mod tests {
                 embed_dim: 4096,
                 index_dim: SymDim::Concrete(1),
                 indices_kind: crate::compiler::graph::GatherIndicesKind::Tensor,
+                scale: None,
             }),
             OpClass::Injective
         );
@@ -804,6 +805,7 @@ mod tests {
                 vocab_size: 32000,
                 hidden_dim: 4096,
                 index_dim: SymDim::Concrete(1),
+                scale: None,
             }),
             OpClass::Injective
         );

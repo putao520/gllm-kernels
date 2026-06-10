@@ -1,4 +1,4 @@
-//! AArch64 instruction decoder for Phase 0 binary symbolic execution.
+//! AArch64 instruction decoder for Scalar + SymExec binary symbolic execution.
 //!
 //! Decodes compiled `extern "C"` scalar functions on AArch64 by reading
 //! fixed-width 32-bit instructions and feeding them to the SymbolicExecutor.
@@ -1064,7 +1064,7 @@ pub fn build_cfg_from_fn_aarch64(
     let base_addr = fn_ptr as u64;
     let bytes = unsafe { std::slice::from_raw_parts(fn_ptr, max_bytes) };
 
-    // Phase 1: Linear scan — collect all instructions and branch targets.
+    // Linear scan — collect all instructions and branch targets.
     let mut all_insns: Vec<A64Insn> = Vec::new();
     let mut branch_targets: BTreeSet<u64> = BTreeSet::new();
     let mut func_end: Option<u64> = None;
@@ -1094,7 +1094,7 @@ pub fn build_cfg_from_fn_aarch64(
         all_insns.last().map(|i| i.addr + 4).unwrap_or(base_addr)
     });
 
-    // Phase 2: Determine block boundaries.
+    // Determine block boundaries.
     let mut block_starts: BTreeSet<u64> = BTreeSet::new();
     block_starts.insert(base_addr);
     for &target in &branch_targets {
@@ -1112,7 +1112,7 @@ pub fn build_cfg_from_fn_aarch64(
         addr_to_block.get(&addr).copied()
     };
 
-    // Phase 3: Build basic blocks.
+    // Build basic blocks.
     let block_start_vec: Vec<u64> = block_starts.iter().copied().collect();
     let mut blocks: BTreeMap<BlockId, BasicBlock> = BTreeMap::new();
     let mut successors: BTreeMap<BlockId, Vec<BlockId>> = BTreeMap::new();

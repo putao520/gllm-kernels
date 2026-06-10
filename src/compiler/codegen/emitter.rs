@@ -1,8 +1,8 @@
-//! Emitter — Phase 3 trait abstraction.
+//! Emitter — ISA Lowering trait abstraction.
 //!
 //! ## Trait Architecture (SPEC §8.6)
 //!
-//! Platform differences in Phase 3 code generation are encapsulated via two traits:
+//! Platform differences in ISA Lowering code generation are encapsulated via two traits:
 //!
 //! - `MachineCodeEmitter`: the code-generation interface (emit_plan, simd_width).
 //!   Implemented by `X86CodeGen` (jit-x86) and `DynasmAArch64CodeGen` (jit-aarch64).
@@ -61,7 +61,7 @@ impl Platform {
     }
 }
 
-/// Phase 3 code-generation interface.
+/// ISA Lowering code-generation interface.
 ///
 /// Implemented by each platform's JIT backend. The compiler pipeline calls
 /// `emit_plan` to produce native machine code for a complete fusion plan.
@@ -86,7 +86,7 @@ pub trait MachineCodeEmitter {
 /// Platform backend factory — provides platform metadata and constructs emitters.
 ///
 /// The compiler pipeline depends only on this trait, not on the concrete emitter
-/// type, keeping Phase 1-2 (DAG construction, fusion decisions) platform-agnostic.
+/// type, keeping SemanticDAG + Fusion (DAG construction, fusion decisions) platform-agnostic.
 pub trait PlatformBackend {
     /// The concrete emitter type produced by this backend.
     type Emitter: MachineCodeEmitter;
@@ -249,7 +249,7 @@ mod tests {
     fn test_emitter_emit_plan_standalone_silu() {
         use super::X86CodeGen;
         use crate::compiler::graph::{CompilerGraph, MultiOutputConfig, OpKind};
-        use crate::compiler::fusion::{FusionGroup, FusionMode, FusionPlan};
+        use crate::compiler::fusion::{FusionGroup, FusionMode, FusionPlan, GroupMarker};
         use crate::compiler::buffer_alloc::BufferAllocation;
         use crate::types::DType;
         use std::collections::HashMap;
@@ -272,6 +272,9 @@ mod tests {
                 ops: vec![op_id],
                 multi_output: MultiOutputConfig::single(),
             dominant_dtype: None,
+            marker: GroupMarker::None,
+            is_layer_group: false,
+            hetero_layer_type: None,
             }],
             op_to_group,
         };
@@ -290,7 +293,7 @@ mod tests {
     fn test_emitter_emit_plan_with_registry() {
         use super::X86CodeGen;
         use crate::compiler::graph::{CompilerGraph, MultiOutputConfig, OpKind};
-        use crate::compiler::fusion::{FusionGroup, FusionMode, FusionPlan};
+        use crate::compiler::fusion::{FusionGroup, FusionMode, FusionPlan, GroupMarker};
         use crate::compiler::buffer_alloc::BufferAllocation;
         use crate::compiler::registry::ScalarOpRegistry;
         use crate::types::DType;
@@ -314,6 +317,9 @@ mod tests {
                 ops: vec![op_id],
                 multi_output: MultiOutputConfig::single(),
             dominant_dtype: None,
+            marker: GroupMarker::None,
+            is_layer_group: false,
+            hetero_layer_type: None,
             }],
             op_to_group,
         };

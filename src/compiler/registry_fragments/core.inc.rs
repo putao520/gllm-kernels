@@ -28,7 +28,7 @@ impl ScalarOpRegistry {
         self.entries.get(key)
     }
 
-    /// Manually inject an OpTrace (temporary until Phase 0 symexec is implemented).
+    /// Manually inject an OpTrace (temporary until Scalar + SymExec symexec is implemented).
     pub fn inject_trace(&mut self, key: OpKindKey, trace: OpTrace) {
         self.trace_cache.insert(key, trace);
     }

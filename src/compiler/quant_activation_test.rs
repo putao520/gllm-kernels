@@ -2,7 +2,8 @@
 
 #[cfg(test)]
 mod tests {
-    use crate::compiler::{CompilerGraph, OpKind, QuantFormat};
+    use crate::compiler::{CompilerGraph, OpKind};
+    use crate::compiler::quant_ir::QuantFormat;
     use crate::compiler::quant_convert;
     use crate::types::DType;
 

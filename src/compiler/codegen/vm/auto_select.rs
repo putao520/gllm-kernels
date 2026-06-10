@@ -484,7 +484,7 @@ fn dispatch_trace_op(
             Ok(r)
         }
 
-        // ── 结构型内存操作 (ARCH-AUTO-INSTR-SELECT Phase 4) ──
+        // ── 结构型内存操作 (ARCH-AUTO-INSTR-SELECT structural) ──
 
         TraceOp::ScalarLoad { base, offset } => {
             let r = prog.alloc_vreg(VRegKind::Scalar, SimdWidth::Scalar);

@@ -175,7 +175,7 @@ pub(crate) fn lower_depthwise_conv1d(
 // §4 PatchEmbed lower (SigLIP / ViT vision tower, T65)
 // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 //
-// 参考实现: scalar-ops/src/patch_embed.rs::scalar_patch_embed (Phase 0 ground
+// 参考实现: scalar-ops/src/patch_embed.rs::scalar_patch_embed (Scalar + SymExec ground
 // truth, 禁止运行时调用 — NO_SCALAR 铁律)。
 //
 // 算法:

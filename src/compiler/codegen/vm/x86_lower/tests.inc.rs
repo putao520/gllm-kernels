@@ -408,8 +408,8 @@ mod tests {
 
     #[test]
     fn x86_lower_with_sym_map_preserves_custom_map() {
-        // Arrange: build a custom SymDimSlotMap via default_abi
-        let custom_map = super::super::plan_lower::SymDimSlotMap::default_abi();
+        // Arrange: build a custom SymDimSlotMap via mega_kernel_abi
+        let custom_map = super::super::plan_lower::SymDimSlotMap::mega_kernel_abi();
 
         // Act: construct with custom map, then build and finalize a minimal program
         let dp = DeviceProfile::detect();

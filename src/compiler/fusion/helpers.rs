@@ -7,7 +7,7 @@ use std::collections::HashSet;
 use crate::compiler::graph::{CompilerGraph, CompilerOp, OpKind, OpId, TensorId};
 use crate::compiler::semantic_dag::{SemanticDAG, OpClass};
 use crate::compiler::semantics;
-use super::types::{FusionGroup, FusionMode};
+use super::types::{FusionGroup, FusionMode, GroupMarker};
 use super::quant_aware::can_fuse_quant_aware;
 use crate::compiler::graph::MultiOutputConfig;
 use crate::quant::QuantType;
@@ -196,6 +196,9 @@ pub(crate) fn detect_qkv_norm_rope(graph: &CompilerGraph, topo: &[OpId]) -> Vec<
             ops: all_ops,
             multi_output: MultiOutputConfig::single(),
             dominant_dtype: None,
+            marker: GroupMarker::None,
+            is_layer_group: false,
+            hetero_layer_type: None,
         });
     }
 
@@ -255,6 +258,9 @@ pub(crate) fn detect_qkv_shared_input(graph: &CompilerGraph, topo: &[OpId]) -> V
                 ops: all_ops,
                 multi_output: MultiOutputConfig::single(),
                 dominant_dtype: None,
+                marker: GroupMarker::None,
+                is_layer_group: false,
+                hetero_layer_type: None,
             });
         }
     }
@@ -365,6 +371,9 @@ pub(crate) fn detect_ffn_block(graph: &CompilerGraph, topo: &[OpId]) -> Vec<Fusi
             ops: vec![gate_gemm_op.id, up_gemm_op.id, activation_op.id, mul_op.id],
             multi_output: MultiOutputConfig::single(),
             dominant_dtype: None,
+            marker: GroupMarker::None,
+            is_layer_group: false,
+            hetero_layer_type: None,
         });
     }
 

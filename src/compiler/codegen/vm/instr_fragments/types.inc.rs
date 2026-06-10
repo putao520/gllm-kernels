@@ -419,7 +419,7 @@ impl GprCondition {
 pub enum GprBranchAction {
     Skip(usize),
     Exit(VRegId),
-    /// Jump to a MarkLabel with the given label_id (SPEC 32 Phase 0.7 ForwardPhaseDispatch).
+    /// Jump to a MarkLabel with the given label_id (SPEC 32 ForwardPhaseDispatch).
     JumpToLabel(usize),
 }
 

@@ -7,18 +7,18 @@
 //! # Pipeline
 //!
 //! ```text
-//! LayerIR → CompilerGraph → Phase 0 (ScalarOpRegistry + OpTrace via SymbolicExecutor)
-//!         → Phase 1 (SemanticDAG: OpClass auto-derivation from OpTrace::ComputePattern)
-//!         → Phase 2 (Fusion: fuse_with_dag + HW constraints + Parallel strategy + Buffer alloc)
-//!         → Phase 3 (CodeGen: x86_64/aarch64 JIT via iced-x86/dynasm-rs)
+//! LayerIR → CompilerGraph → Scalar + SymExec (ScalarOpRegistry + OpTrace via SymbolicExecutor)
+//!         → SemanticDAG (OpClass auto-derivation from OpTrace::ComputePattern)
+//!         → Fusion (fuse_with_dag + HW constraints + Parallel strategy + Buffer alloc)
+//!         → ISA Lowering (CodeGen: x86_64/aarch64 JIT via iced-x86/dynasm-rs)
 //!         → CompiledLayer (cached)
 //! ```
 //!
-//! Phase 0 extracts `OpTrace` from `extern "C"` scalar functions via binary
-//! symbolic execution. Phase 1 builds a `SemanticDAG` with auto-derived
-//! `OpClass`. Phase 2 performs fusion decisions with HW constraint checks,
+//! Scalar + SymExec extracts `OpTrace` from `extern "C"` scalar functions via binary
+//! symbolic execution. SemanticDAG builds a `SemanticDAG` with auto-derived
+//! `OpClass`. Fusion performs fusion decisions with HW constraint checks,
 //! parallel strategy selection, and interval-graph buffer allocation.
-//! Phase 3 generates native machine code from `TraceOp` sequences.
+//! ISA Lowering generates native machine code from `TraceOp` sequences.
 
 pub mod ir;
 pub mod planner;
@@ -59,26 +59,26 @@ pub mod quant_pipeline;
 mod quant_activation_test;
 
 // ── Public API re-exports (used by external consumers: gllm) ───────────
-pub use executable::{CompiledLayer, CompiledLayerFn};
+pub use executable::CompiledLayer;
 pub use mega_kernel_abi::{
-    MegaKernelFn, MegaKernelWeightLayout, MegaKernelBufferLayout,
+    MegaKernelFn, KernelWeightLayout, BufferLayout,
     PerLayerWeightLayout,
-    MegaKernelBusinessConfig, MtpKernelConfig, OutputMode, PoolMode, SgConfig, CotStepConfig,
+    BusinessConfig, MtpKernelConfig, OutputMode, PoolMode, SgConfig, CotStepConfig,
     MEGA_KERNEL_PARAMS, MEGA_KERNEL_STACK_OFFSETS,
 };
 
 /// Output of `compile_mega_kernel()`: compiled layer code + layout metadata.
 pub struct MegaKernelCompileOutput {
-    /// JIT-compiled code for a single decoder layer template.
-    /// Will be wrapped in a layer loop at codegen time (Phase 3).
+    /// JIT-compiled code for a single layer template.
+    /// Will be wrapped in a layer loop at codegen time (ISA Lowering).
     pub layer_code: CompiledLayer,
     /// Weight blob layout for the full model.
-    pub weight_layout: MegaKernelWeightLayout,
+    pub weight_layout: KernelWeightLayout,
     /// Runtime buffer layout (activations, logits, sampling workspace).
-    pub buffer_layout: MegaKernelBufferLayout,
-    /// Number of decoder layers (layer loop bound).
+    pub buffer_layout: BufferLayout,
+    /// Number of layers (layer loop bound).
     pub num_layers: usize,
-    /// Vocabulary size (embedding + lm_head dimensions).
+    /// Vocabulary size (embedding + logits-producer dimensions).
     pub vocab_size: usize,
     /// Hidden dimension.
     pub hidden: usize,
@@ -91,7 +91,7 @@ pub struct MegaKernelCompileOutput {
     pub logits_scratch_offset: usize,
     /// Heterogeneous layer weight layout (for models like Gemma-4 E2B with
     /// alternating sliding/full attention layers). None for homogeneous models.
-    pub hetero_layout: Option<mega_kernel_abi::HeteroWeightLayout>,
+    pub hetero_layout: Option<mega_kernel_abi::HeteroKernelWeightLayout>,
     /// JIT source map — 仅当 debug_jit=true 时生成。
     /// 包含 VmInstr → 机器码偏移 → Op 标签的映射，供 DAP 调试器使用。
     pub source_map: Option<codegen::vm::debug_map::JitSourceMap>,
@@ -141,8 +141,6 @@ pub use crate::types::CompilerError;
 // ── Internal re-exports (pub within crate, not part of public API) ────
 pub(crate) use ir::{LayerIR, LayerArch};
 pub(crate) use cache::{CompilationCache, CacheSource, IncrementalCompileResult};
-pub(crate) use semantic_dag::CodegenHints;
-pub(crate) use quant_ir::QuantFormat;
 
 use crate::dispatch::{DeviceProfile, device_profile};
 use crate::types::{InferenceError, ModelConfig};
@@ -195,7 +193,7 @@ impl InferenceCompiler {
     /// Compile all layers for a model. Returns one `CompiledLayer` per layer.
     ///
     /// Layers with identical shapes share the same compiled code (common case:
-    /// all decoder layers are identical except for weight pointers).
+    /// all layers are identical except for weight pointers).
     pub fn compile_model(
         &mut self,
         config: &ModelConfig,
@@ -268,7 +266,7 @@ impl InferenceCompiler {
         let mut disk_hits: usize = 0;
         let mut compiled: usize = 0;
 
-        // All decoder layers share the same IR shape, so one lookup decides.
+        // All layers share the same IR shape, so one lookup decides.
         match self.cache.lookup(hash) {
             Some((_, CacheSource::Memory)) => {
                 memory_hits = config.num_layers;
@@ -381,131 +379,47 @@ impl InferenceCompiler {
     }
 
     /// Full JIT compilation pipeline:
-    /// LayerIR → CompilerGraph → Phase 0 (registry) → Phase 1 (SemanticDAG)
-    ///         → Phase 2 (fusion + HW + parallel + buffer) → Phase 3 (codegen)
+    /// LayerIR → CompilerGraph → Scalar + SymExec (registry) → SemanticDAG
+    ///         → Fusion + HW + parallel + buffer → ISA Lowering (codegen)
     ///         → CodegenOutput
     ///
-    /// Phase 3 has an MVP implementation under the `jit-x86` feature flag
+    /// ISA Lowering has an MVP implementation under the `jit-x86` feature flag
     /// (see `codegen::emitter::X86CodeGen`). Without the feature flag,
     /// an error is returned.
     fn jit_compile(&self, ir: &LayerIR) -> Result<codegen::CodegenOutput, InferenceError> {
         // Build ExecutionPlan (HwOptPlan) — the single source of strategy decisions
         let exec_plan = planner::ExecutionPlan::build(ir, &self.profile, &planner::StrategyBias::default());
 
-        // Phase 1: Build CompilerGraph DAG
+        // Build CompilerGraph DAG
         let graph = CompilerGraph::from_layer_ir(ir, &self.profile)
             .map_err(InferenceError::CompileError)?;
 
-        // Phase 0 + 1: ScalarOpRegistry (OpTrace cache) + SemanticDAG (OpClass auto-derivation)
+        // ScalarOpRegistry (OpTrace cache) + SemanticDAG (OpClass auto-derivation)
         let registry = ScalarOpRegistry::with_defaults();
         let semantic_dag = SemanticDAG::from_graph(&graph, &registry);
 
-        // Phase 2: Fusion decisions + HW constraint validation + buffer allocation
+        // Fusion decisions + HW constraint validation + buffer allocation
         let mut fusion_plan = fusion::fuse_with_dag_prebuilt(&graph, &semantic_dag, &exec_plan, None);
         hw_constraints::enforce_constraints(&mut fusion_plan.groups, &graph, &exec_plan);
         let lifetimes = buffer_alloc::analyze_lifetimes(&graph, &fusion_plan, None, None);
         let alloc = buffer_alloc::allocate_buffers_aligned(&lifetimes, self.profile.hw_info.cacheline_bytes, None, None, &graph, None);
 
-        // Phase 3: Code generation
+        // SPEC/39 REQ-UMK-001: All compilation produces MegaKernelFn ABI code.
+        // The 10-param ABI (CompiledLayerFn) is physically deleted.
+        let sym_map = codegen::vm::plan_lower::SymDimSlotMap::mega_kernel_abi();
+
+        // ISA Lowering: Code generation
         #[cfg(feature = "jit-x86")]
         {
-            let hints = CodegenHints::from_semantic_dag(&semantic_dag);
-            let dtype = graph.infer_computation_dtype();
-            let mut cg = codegen::X86CodeGen::new(&self.profile, dtype);
-            cg.set_codegen_hints(hints);
-            cg.emit_plan(&fusion_plan, &graph, &alloc, &exec_plan, Some(&registry))
-                .map_err(InferenceError::CompileError)
+            codegen::vm::plan_lower::compile_layer_with_sym_map(
+                &fusion_plan, &graph, &alloc, &exec_plan, Some(&registry), &sym_map,
+            ).map_err(InferenceError::CompileError)
         }
 
         #[cfg(not(feature = "jit-x86"))]
         {
-            let _ = (fusion_plan, alloc, graph);
+            let _ = (fusion_plan, alloc, graph, sym_map);
             Err(InferenceError::CompileError("JIT backend not enabled (feature jit-x86 required)".into()))
-        }
-    }
-
-    /// Compile a CompilerGraph directly.
-    ///
-    /// This is the primary entry point for GLLM integration: GLLM expands
-    /// its high-level FusedGraph into an atomic-op DAG (`CompilerGraph`)
-    /// and passes it here for JIT compilation.
-    pub fn compile_graph(
-        &mut self,
-        graph: &CompilerGraph,
-    ) -> Result<CompiledLayer, InferenceError> {
-        self.compile_graph_with_quant(graph, None)
-    }
-
-    /// Compile a CompilerGraph with optional quantization.
-    pub fn compile_graph_with_quant(
-        &mut self,
-        graph: &CompilerGraph,
-        quant_format: Option<QuantFormat>,
-    ) -> Result<CompiledLayer, InferenceError> {
-        let _lock = COMPILE_LOCK.lock().unwrap();
-        let mut graph_owned = graph.clone();
-
-        // Apply quantization if requested
-        if let Some(format) = quant_format {
-            quant_convert::apply_quantization(&mut graph_owned, format)
-                .map_err(InferenceError::CompileError)?;
-        }
-
-        let graph = &graph_owned;
-
-        // Build ExecutionPlan from profile-only (no LayerIR available for CompilerGraph path)
-        let exec_plan = planner::ExecutionPlan::from_profile(&self.profile);
-
-        let registry = ScalarOpRegistry::with_defaults();
-        let semantic_dag = SemanticDAG::from_graph(graph, &registry);
-        let mut fusion_plan = fusion::fuse_with_dag_prebuilt(graph, &semantic_dag, &exec_plan, None);
-        hw_constraints::enforce_constraints(&mut fusion_plan.groups, graph, &exec_plan);
-        let lifetimes = buffer_alloc::analyze_lifetimes(graph, &fusion_plan, None, None);
-        let alloc = buffer_alloc::allocate_buffers_aligned(&lifetimes, self.profile.hw_info.cacheline_bytes, None, None, graph, None);
-
-        // DEBUG: 检查 BufferAllocation 是否有重叠
-        if std::env::var("GLLM_DEBUG_BUFFER_ALLOC").is_ok() {
-            eprintln!("[BufferAllocation] total_bytes={}", alloc.total_bytes);
-            for slot in &alloc.slots {
-                eprintln!("  tensor {:?}: offset={}, size={}", slot.tensor_id, slot.offset, slot.size_bytes);
-                if slot.offset + slot.size_bytes > alloc.total_bytes {
-                    panic!("tensor {:?} exceeds scratchpad: offset={} + size={} > total={}",
-                        slot.tensor_id, slot.offset, slot.size_bytes, alloc.total_bytes);
-                }
-            }
-        }
-
-        let weight_layout = graph.weight_layout();
-
-        #[cfg(feature = "jit-x86")]
-        let output = {
-            let hints = CodegenHints::from_semantic_dag(&semantic_dag);
-            let dtype = graph.infer_computation_dtype();
-            let mut cg = codegen::X86CodeGen::new(&self.profile, dtype);
-            cg.set_weight_layout(weight_layout.clone());
-            cg.set_codegen_hints(hints);
-            cg.emit_plan(&fusion_plan, graph, &alloc, &exec_plan, Some(&registry))
-                .map_err(InferenceError::CompileError)?
-        };
-
-        #[cfg(not(feature = "jit-x86"))]
-        {
-            let _ = (fusion_plan, alloc, weight_layout);
-            return Err(InferenceError::CompileError("JIT backend not enabled (feature jit-x86 required)".into()));
-        }
-
-        #[cfg(feature = "jit-x86")]
-        {
-            let hash = self.graph_content_hash(graph);
-            if output.code.is_empty() {
-                return Err(InferenceError::CompileError(
-                    "compile_graph_with_quant: output.code is empty (zero-length machine code)".into(),
-                ));
-            }
-            let mut layer = CompiledLayer::from_code(&output.code, output.scratchpad_bytes, hash)?;
-            layer.weight_layout = Some(weight_layout);
-            layer.rope_cache = output.rope_cache;
-            Ok(layer)
         }
     }
 
@@ -515,18 +429,26 @@ impl InferenceCompiler {
     /// via `ArchTemplate::to_compiler_graph()` and passes it here directly.
     /// All model geometry (hidden, num_heads, vocab_size, etc.) is derived from
     /// the graph's OpKind variants and tensor shapes. Only non-derivable fields
-    /// are passed via `MegaKernelConfig`.
+    /// are passed via `CompileConfig`.
     pub fn compile_mega_kernel_from_graph(
         &mut self,
         graph: CompilerGraph,
-        config: &mega_kernel_abi::MegaKernelConfig,
-        hetero_layout: Option<mega_kernel_abi::HeteroWeightLayout>,
+        config: &mega_kernel_abi::CompileConfig,
+        hetero_layout: Option<mega_kernel_abi::HeteroKernelWeightLayout>,
     ) -> Result<MegaKernelCompileOutput, InferenceError> {
         let t0 = std::time::Instant::now();
+        static COMPILE_COUNTER: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+        let compile_id = COMPILE_COUNTER.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        eprintln!("[COMPILE-MEGA] compile_mega_kernel_from_graph #{}, ops={}",
+            compile_id, graph.ops.len());
+
+        // SPEC/39 REQ-UMK-001: single compilation entry point handles all graph topologies.
+        // All graphs (with or without layer loops) go through compile_mega_kernel_vm.
+        // Simple graphs use LoopBegin { bound: Const(1) } + LoopEnd — single iteration, zero overhead.
         let geometry = graph_geometry::GraphDerivedGeometry::from_graph(&graph)
             .map_err(|e| InferenceError::CompileError(format!("GraphDerivedGeometry: {}", e).into()))?;
 
-        let buffer_layout = mega_kernel_abi::MegaKernelBufferLayout::from_graph_geometry(
+        let buffer_layout = mega_kernel_abi::BufferLayout::from_graph_geometry(
             &geometry, config.max_seq_len,
         );
 
@@ -585,6 +507,30 @@ impl InferenceCompiler {
 
         #[cfg(feature = "jit-x86")]
         {
+            // DIAG: Dump alloc buffer composition
+            {
+                let mut sorted_slots: Vec<_> = alloc.slots.iter().collect();
+                sorted_slots.sort_by_key(|s| s.offset);
+                eprintln!("[VAM-DIAG] alloc.total_bytes={} ({} slots)", alloc.total_bytes, alloc.slots.len());
+                for s in sorted_slots.iter().take(20) {
+                    let name = graph.tensor(s.tensor_id)
+                        .map(|t| t.name.as_str())
+                        .unwrap_or("?");
+                    eprintln!("[VAM-DIAG]   tid={} name={} off={} size={}", s.tensor_id.0, name, s.offset, s.size_bytes);
+                }
+                let top5_by_size: Vec<_> = {
+                    let mut v: Vec<_> = alloc.slots.iter().collect();
+                    v.sort_by(|a, b| b.size_bytes.cmp(&a.size_bytes));
+                    v.into_iter().take(5).collect()
+                };
+                eprintln!("[VAM-DIAG] top 5 by size:");
+                for s in &top5_by_size {
+                    let name = graph.tensor(s.tensor_id)
+                        .map(|t| t.name.as_str())
+                        .unwrap_or("?");
+                    eprintln!("[VAM-DIAG]   tid={} name={} off={} size={}", s.tensor_id.0, name, s.offset, s.size_bytes);
+                }
+            }
             use codegen::vm::mega_kernel_emit::compile_mega_kernel_vm;
             use codegen::vm::{isa_profile::IsaProfile, isa_hook, reg_alloc::RegAllocator,
                               stack_frame::StackFrame, x86_lower::X86Lower,
@@ -610,22 +556,18 @@ impl InferenceCompiler {
                     resource_plan.summary.peak_gpr_regs);
             }
 
-            let needs_kv = config.business_config.output_modes.iter().any(|m| {
-                matches!(m, crate::compiler::mega_kernel_abi::OutputMode::Generate { .. })
-            });
-            let is_encoder = !config.business_config.output_modes.iter().any(|m| {
-                matches!(m, crate::compiler::mega_kernel_abi::OutputMode::Generate { .. })
-            });
+            let topology = codegen::vm::topology::GraphTopologyAnalysis::analyze(
+                &graph,
+            );
             let t4 = std::time::Instant::now();
             let (mut program, rope_cache, logits_scratch_offset) = compile_mega_kernel_vm(
                 &fusion_plan, &graph, &alloc, Some(&registry), &profile,
-                hook_ref, geometry.vocab_size, &buffer_layout, Some(bottleneck_map), Some(&virtual_activation),
+                hook_ref, &buffer_layout, Some(bottleneck_map), Some(&virtual_activation),
                 Some(&virtual_tensor_map), Some(&layout_assignment),
-                config.business_config.debug_jit,
-                config.business_config.mtp_config.as_ref(),
+                config.debug_jit,
+                None, // mtp_config now derived from topology.mtp_config (SPEC/39)
                 Some(&resource_plan),
-                needs_kv,
-                is_encoder,
+                topology,
             ).map_err(InferenceError::CompileError)?;
             eprintln!("[JIT-TIME] compile_mega_kernel_vm: {:.2}ms ({} VmInstrs)", t4.elapsed().as_secs_f64() * 1000.0, program.len());
             // Dump VmProgram for debugging
@@ -648,7 +590,7 @@ impl InferenceCompiler {
             // Dump reg alloc for debugging
             {
                 use std::io::Write;
-                let mut f = std::fs::File::create("/tmp/gllm_regalloc_dump.txt").unwrap();
+                let mut f = std::fs::File::create(format!("/tmp/gllm_regalloc_dump_{}.txt", compile_id)).unwrap();
                 for spill in &alloc_result.spills {
                     writeln!(f, "SPILL v{} offset={} size={}", spill.vreg.0, spill.offset, spill.size).unwrap();
                 }
@@ -716,7 +658,7 @@ impl InferenceCompiler {
             let mut layer = CompiledLayer::from_code(&code, total_scratch, hash)?;
             layer.weight_layout = Some(graph.weight_layout());
 
-            let source_map = if config.business_config.debug_jit {
+            let source_map = if config.debug_jit {
                 let mut map = lowerer_source_map;
                 map.sort_by_offset();
                 Some(map)
@@ -726,7 +668,7 @@ impl InferenceCompiler {
 
             Ok(MegaKernelCompileOutput {
                 layer_code: layer,
-                weight_layout: mega_kernel_abi::MegaKernelWeightLayout::from_graph_geometry(&geometry),
+                weight_layout: mega_kernel_abi::KernelWeightLayout::from_graph_geometry(&geometry),
                 buffer_layout,
                 num_layers: geometry.num_layers,
                 vocab_size: geometry.vocab_size,
@@ -748,13 +690,13 @@ impl InferenceCompiler {
 
     /// Compile mega-kernel to GPU PTX/HIP/MSL code.
     ///
-    /// Same Phase 0-2 pipeline as CPU, but uses GpuLower for Phase 3.
+    /// Same Scalar + SymExec → Fusion pipeline as CPU, but uses GpuLower for ISA Lowering.
     /// Returns the GPU kernel source code string.
     #[cfg(any(feature = "jit-cuda", feature = "jit-hip"))]
     pub fn compile_mega_kernel_to_gpu(
         &mut self,
         graph: CompilerGraph,
-        config: &mega_kernel_abi::MegaKernelConfig,
+        config: &mega_kernel_abi::CompileConfig,
         sm_version: u32,
     ) -> Result<GpuMegaKernelOutput, InferenceError> {
         use codegen::vm::gpu_lower::{GpuLower, GpuDialect};
@@ -766,7 +708,7 @@ impl InferenceCompiler {
         let geometry = graph_geometry::GraphDerivedGeometry::from_graph(&graph)
             .map_err(|e| InferenceError::CompileError(format!("GraphDerivedGeometry: {}", e).into()))?;
 
-        let buffer_layout = mega_kernel_abi::MegaKernelBufferLayout::from_graph_geometry(
+        let buffer_layout = mega_kernel_abi::BufferLayout::from_graph_geometry(
             &geometry, config.max_seq_len,
         );
 
@@ -803,20 +745,16 @@ impl InferenceCompiler {
             &graph, &fusion_plan, &profile, &alloc,
             geometry.hidden, activation_bytes, kv_bytes,
         );
-        let needs_kv = config.business_config.output_modes.iter().any(|m| {
-            matches!(m, crate::compiler::mega_kernel_abi::OutputMode::Generate { .. })
-        });
-        let is_encoder = !config.business_config.output_modes.iter().any(|m| {
-            matches!(m, crate::compiler::mega_kernel_abi::OutputMode::Generate { .. })
-        });
+        let topology = codegen::vm::topology::GraphTopologyAnalysis::analyze(
+            &graph,
+        );
         let (mut program, rope_cache, logits_scratch_offset) =
             codegen::vm::mega_kernel_emit::compile_mega_kernel_vm(
                 &fusion_plan, &graph, &alloc, Some(&registry), &profile,
-                None, geometry.vocab_size, &buffer_layout, Some(bottleneck_map),
+                None, &buffer_layout, Some(bottleneck_map),
                 Some(&virtual_activation), Some(&virtual_tensor_map), Some(&layout_assignment),
                 false, None, Some(&resource_plan),
-                needs_kv,
-                is_encoder,
+                topology,
             ).map_err(|e| InferenceError::CompileError(e.into()))?;
 
         let pass_registry = PassRegistry::with_defaults();
@@ -864,80 +802,6 @@ impl InferenceCompiler {
     }
 
     /// Compile a forward-only CompilerGraph to GPU PTX/HIP/MSL code.
-    ///
-    /// Uses the same Phase 0-2 pipeline as `compile_graph` (forward-only),
-    /// but replaces the CPU Phase 3 (X86CodeGen) with GpuLower.
-    /// Used by encoder paths (embedding / rerank / classify).
-    #[cfg(any(feature = "jit-cuda", feature = "jit-hip"))]
-    pub fn compile_graph_to_gpu(
-        &mut self,
-        graph: &CompilerGraph,
-        sm_version: u32,
-    ) -> Result<GpuForwardOutput, InferenceError> {
-        use codegen::vm::gpu_lower::{GpuLower, GpuDialect};
-        use codegen::vm::reg_alloc::RegAllocator;
-        use codegen::vm::stack_frame::StackFrame;
-        use codegen::vm::isa_profile::IsaProfile;
-        use codegen::vm::opt_pass::PassRegistry;
-
-        let exec_plan = planner::ExecutionPlan::from_profile(&self.profile);
-        let registry = ScalarOpRegistry::with_defaults();
-        let semantic_dag = SemanticDAG::from_graph(graph, &registry);
-        let mut fusion_plan = fusion::fuse_with_dag_prebuilt(graph, &semantic_dag, &exec_plan, None);
-        hw_constraints::enforce_constraints(&mut fusion_plan.groups, graph, &exec_plan);
-        let lifetimes = buffer_alloc::analyze_lifetimes(graph, &fusion_plan, None, None);
-        let alloc = buffer_alloc::allocate_buffers_aligned(
-            &lifetimes, self.profile.hw_info.cacheline_bytes, None, None, graph, None,
-        );
-
-        let profile = IsaProfile::from_device_profile(&self.profile);
-        let hook = codegen::vm::isa_hook::select_hook(&profile);
-
-        // Phase 2 → VmProgram (same as compile_layer)
-        let rope_req = codegen::vm::plan_lower::compute_rope_requirement(&fusion_plan, graph, &alloc)
-            .map_err(|e| InferenceError::CompileError(format!("rope_req: {e}").into()))?;
-        let ple_req = codegen::vm::plan_lower::compute_ple_requirement(&fusion_plan, graph, &alloc, rope_req.as_ref())
-            .map_err(|e| InferenceError::CompileError(format!("ple_req: {e}").into()))?;
-        let dwc_req = codegen::vm::plan_lower::compute_dwc_requirement(&fusion_plan, graph, &alloc, rope_req.as_ref(), ple_req.as_ref())
-            .map_err(|e| InferenceError::CompileError(format!("dwc_req: {e}").into()))?;
-
-        let mut program = codegen::vm::plan_lower::lower_fusion_plan_inner(
-            &fusion_plan, graph, &alloc, Some(&registry), &profile,
-            Some(hook.as_ref()), rope_req.as_ref(), ple_req.as_ref(), dwc_req.as_ref(), false,
-        ).map_err(|e| InferenceError::CompileError(e.into()))?;
-
-        let pass_registry = PassRegistry::with_defaults();
-        pass_registry.run_all(&mut program, &profile, &*hook);
-
-        let alloc_result = RegAllocator::new(&profile).allocate(&program)
-            .map_err(|e| InferenceError::CompileError(format!("RegAlloc: {}", e).into()))?;
-        let frame = StackFrame::compute(&alloc_result, &profile, 0);
-
-        let dialect = if cfg!(feature = "jit-cuda") {
-            GpuDialect::Ptx { sm_version }
-        } else {
-            GpuDialect::Hip { gfx_arch: 942, wave_size: 64 }
-        };
-        let mut lowerer = GpuLower::new(dialect);
-        let vreg_counts = program.vreg_counts_by_kind();
-        lowerer.emit_mega_kernel_prologue(&frame, &alloc_result, vreg_counts)
-            .map_err(|e| InferenceError::CompileError(e.into()))?;
-        lowerer.set_vreg_kind_map(&program);
-
-        for instr in &program.instrs {
-            lowerer.lower_instr(instr, &alloc_result)
-                .map_err(|e| InferenceError::CompileError(e.into()))?;
-        }
-        lowerer.emit_epilogue(&frame, &alloc_result)
-            .map_err(|e| InferenceError::CompileError(e.into()))?;
-        let gpu_code = lowerer.finalize()
-            .map_err(|e| InferenceError::CompileError(e.into()))?;
-
-        Ok(GpuForwardOutput {
-            gpu_code: gpu_code.into_bytes(),
-            total_scratchpad_bytes: alloc.total_bytes,
-        })
-    }
 
     /// Compute a deterministic content hash for a CompilerGraph.
     ///
@@ -1100,16 +964,16 @@ mod tests {
         let profile = DeviceProfile::detect();
         let exec_plan = ExecutionPlan::from_profile(&profile);
 
-        // Phase 1: DAG
+        // Build CompilerGraph DAG
         let graph = CompilerGraph::from_layer_ir(&ir, &profile).expect("from_layer_ir failed");
         assert!(graph.num_ops() >= 14);
 
-        // Phase 2: Fusion
+        // Fusion
         let registry = registry::ScalarOpRegistry::with_defaults();
         let fplan = fusion::fuse_with_dag(&graph, &registry, &exec_plan);
         assert!(fplan.num_groups() < graph.num_ops());
 
-        // Phase 3: Codegen
+        // ISA Lowering (Codegen)
         #[cfg(feature = "jit-x86")]
         {
             let dag = semantic_dag::SemanticDAG::from_graph(&graph, &registry);
@@ -1236,9 +1100,14 @@ mod tests {
         let profile = DeviceProfile::detect();
         let graph = CompilerGraph::from_layer_ir(&ir, &profile).expect("from_layer_ir failed");
 
+        let mk_config = mega_kernel_abi::CompileConfig {
+            max_seq_len: 512,
+            debug_jit: false,
+            hetero: None,
+        };
         let mut compiler = InferenceCompiler::with_profile(profile);
-        let layer = compiler.compile_graph(&graph).unwrap();
-        assert_ne!(layer.config_hash, 0, "compile_graph should produce a non-zero hash");
+        let output = compiler.compile_mega_kernel_from_graph(graph, &mk_config, None).unwrap();
+        assert_ne!(output.layer_code.config_hash, 0, "compile_mega_kernel_from_graph should produce a non-zero hash");
     }
 
     // ── 13 new tests (+9 existing = 22 total) ──────────────────────────
@@ -1270,15 +1139,15 @@ mod tests {
             w_up_offset: 0, w_up_bytes: 0,
             w_down_offset: 0, w_down_bytes: 0,
         };
-        let weight_layout = mega_kernel_abi::MegaKernelWeightLayout {
+        let weight_layout = mega_kernel_abi::KernelWeightLayout {
             embed_offset: 0, embed_bytes: 0,
             layer_0_offset: 0, layer_stride: 0,
             per_layer: zero_per_layer,
             final_norm_offset: 0, final_norm_bytes: 0,
-            lm_head_offset: 0, lm_head_bytes: 0,
+            logits_producer_offset: 0, logits_producer_bytes: 0,
             total_bytes: 0,
         };
-        let buffer_layout = mega_kernel_abi::MegaKernelBufferLayout {
+        let buffer_layout = mega_kernel_abi::BufferLayout {
             activation_a_offset: 0, activation_b_offset: 0,
             activation_bytes: 0,
             logits_offset: 0, logits_bytes: 0,
@@ -1708,7 +1577,7 @@ mod tests {
 
         let output = MegaKernelCompileOutput {
             layer_code: layer,
-            weight_layout: mega_kernel_abi::MegaKernelWeightLayout {
+            weight_layout: mega_kernel_abi::KernelWeightLayout {
                 embed_offset: 0, embed_bytes: 0,
                 layer_0_offset: 0, layer_stride: 0,
                 per_layer: mega_kernel_abi::PerLayerWeightLayout {
@@ -1725,10 +1594,10 @@ mod tests {
                     w_down_offset: 0, w_down_bytes: 0,
                 },
                 final_norm_offset: 0, final_norm_bytes: 0,
-                lm_head_offset: 0, lm_head_bytes: 0,
+                logits_producer_offset: 0, logits_producer_bytes: 0,
                 total_bytes: 0,
             },
-            buffer_layout: mega_kernel_abi::MegaKernelBufferLayout {
+            buffer_layout: mega_kernel_abi::BufferLayout {
                 activation_a_offset: 0, activation_b_offset: 0,
                 activation_bytes: 0,
                 logits_offset: 0, logits_bytes: 0,
@@ -1756,7 +1625,7 @@ mod tests {
 
     #[test]
     fn test_buffer_layout_default_values() {
-        let layout = mega_kernel_abi::MegaKernelBufferLayout {
+        let layout = mega_kernel_abi::BufferLayout {
             activation_a_offset: 0, activation_b_offset: 0,
             activation_bytes: 0,
             logits_offset: 0, logits_bytes: 0,
@@ -2250,35 +2119,12 @@ mod tests {
         assert!(plan.occupancy_target > 0.0 && plan.occupancy_target <= 1.0);
     }
 
-    /// Verify FfnActivation variants are distinct, Copy-able, and Debug-able.
-    #[test]
-    fn test_ffn_activation_variants_distinct() {
-        // Arrange
-        let swiglu = mega_kernel_abi::FfnActivation::SwiGLU;
-        let geglu = mega_kernel_abi::FfnActivation::GeGLU;
-        let gelu = mega_kernel_abi::FfnActivation::Gelu;
-
-        // Assert: all pairwise distinct
-        assert_ne!(swiglu, geglu);
-        assert_ne!(geglu, gelu);
-        assert_ne!(swiglu, gelu);
-
-        // Assert: Copy semantics
-        let swiglu_copy = swiglu;
-        assert_eq!(swiglu, swiglu_copy);
-
-        // Assert: Debug formatting
-        assert!(format!("{:?}", swiglu).contains("SwiGLU"));
-        assert!(format!("{:?}", geglu).contains("GeGLU"));
-        assert!(format!("{:?}", gelu).contains("Gelu"));
-    }
-
-    /// Verify MegaKernelBusinessConfig default has sensible values and
+    /// Verify BusinessConfig default has sensible values and
     /// all boolean flags default to false.
     #[test]
     fn test_mega_kernel_business_config_defaults() {
         // Act
-        let config = mega_kernel_abi::MegaKernelBusinessConfig::default();
+        let config = mega_kernel_abi::BusinessConfig::default();
 
         // Assert: output_modes has default Generate
         assert_eq!(config.output_modes.len(), 1);
@@ -2290,18 +2136,9 @@ mod tests {
         assert!(config.semantic_gatekeeper.is_none());
         assert!(config.intent_anchor_layer.is_none());
         assert!(config.cot_step_hook.is_none());
-        assert!(!config.has_head_rms_norm);
-        assert!(!config.has_qk_norm);
-        assert!(!config.has_value_norm);
-        assert!(config.logit_softcapping.is_none());
-        assert!(config.embedding_scale.is_none());
         assert!(!config.session_enabled);
         assert!(!config.multimodal_enabled);
         assert!(!config.debug_jit);
-        assert!(config.mtp_config.is_none());
-
-        // Assert: FFN activation default is SwiGLU
-        assert_eq!(config.ffn_activation, mega_kernel_abi::FfnActivation::SwiGLU);
     }
 
     /// Verify CotStepConfig construction and field access.

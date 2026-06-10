@@ -93,7 +93,7 @@ pub struct SecondaryRopeCache {
 /// - `ple_ctx`    : `[max_seq, dim_per_layer]` f32
 /// - `post_mlp`   : `[max_seq, hidden]` f32
 ///
-/// Symbolic seq_len 场景按 `max_value` (= `SYMDIM_MAX_SEQ_LEN`) 预留上界。
+/// Symbolic seq_len 场景按 `max_value` (= `graph.max_seq_len`) 预留上界。
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct PleScratchRequirement {
     /// `ple_ctx` 在 scratchpad 内的起始 offset (字节)。

@@ -282,7 +282,7 @@ fn trace_op_flops(op: &TraceOp) -> u64 {
         TraceOp::MaskedOp { .. } => 2,
         TraceOp::AtomicAdd { .. } => 3,
         TraceOp::FWHT { .. } => 8,
-        // Structural memory operations (Phase 4): memory access, not compute.
+        // Structural memory operations (structural): memory access, not compute.
         TraceOp::ScalarLoad { .. } => 0,
         TraceOp::StrideMul { .. } => 1,
         TraceOp::PtrAdd { .. } => 0,
@@ -561,6 +561,7 @@ impl FusionCostModel {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::compiler::fusion::GroupMarker;
     use crate::compiler::graph::{CompilerGraph, OpId, OpKind, SymDim, MultiOutputConfig};
     use crate::compiler::planner::ExecutionPlan;
     use crate::compiler::hardware_profile::HardwareProfile;
@@ -590,6 +591,9 @@ mod tests {
             ops,
             multi_output: MultiOutputConfig::single(),
             dominant_dtype: None,
+            marker: GroupMarker::None,
+            is_layer_group: false,
+            hetero_layer_type: None,
         }
     }
 
@@ -604,6 +608,9 @@ mod tests {
             ops,
             multi_output: MultiOutputConfig::single(),
             dominant_dtype: None,
+            marker: GroupMarker::None,
+            is_layer_group: false,
+            hetero_layer_type: None,
         }
     }
 
@@ -616,6 +623,9 @@ mod tests {
             ops: vec![op],
             multi_output: MultiOutputConfig::single(),
             dominant_dtype: None,
+            marker: GroupMarker::None,
+            is_layer_group: false,
+            hetero_layer_type: None,
         }
     }
 
@@ -628,6 +638,9 @@ mod tests {
             ops: vec![predecessor, anchor],
             multi_output: MultiOutputConfig::single(),
             dominant_dtype: None,
+            marker: GroupMarker::None,
+            is_layer_group: false,
+            hetero_layer_type: None,
         }
     }
 
@@ -996,6 +1009,9 @@ mod tests {
             ops: vec![],
             multi_output: MultiOutputConfig::single(),
             dominant_dtype: None,
+            marker: GroupMarker::None,
+            is_layer_group: false,
+            hetero_layer_type: None,
         };
         let g = CompilerGraph::new();
         let ai = compute_group_ai(&group, &g);

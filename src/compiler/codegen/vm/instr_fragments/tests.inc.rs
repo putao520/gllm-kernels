@@ -21,9 +21,9 @@ mod tests {
         let output = prog.alloc_vreg(VRegKind::Ptr, SimdWidth::Scalar);
         let acc = prog.alloc_vreg(VRegKind::Vec, SimdWidth::W256);
 
-        let vm_state = crate::compiler::codegen::vm::vm_state::VmState::init_x86_sysv();
-        prog.emit(VmInstr::LoadPtr { dst: input, src: vm_state.arg_ptr_expr("input").unwrap() });
-        prog.emit(VmInstr::LoadPtr { dst: output, src: vm_state.arg_ptr_expr("output").unwrap() });
+        let vm_state = crate::compiler::codegen::vm::vm_state::VmState::init_mega_kernel_x86();
+        prog.emit(VmInstr::LoadPtr { dst: input, src: vm_state.arg_ptr_expr("input_ids_ptr").unwrap() });
+        prog.emit(VmInstr::LoadPtr { dst: output, src: vm_state.arg_ptr_expr("scratchpad_ptr").unwrap() });
 
         prog.emit_loop(BoundExpr::Const(8), 32, |prog, _counter, byte_off| {
             prog.emit(VmInstr::VecLoad {
@@ -69,10 +69,10 @@ mod tests {
         let a_broadcast = prog.alloc_vreg(VRegKind::Vec, SimdWidth::W256);
         let b_vec = prog.alloc_vreg(VRegKind::Vec, SimdWidth::W256);
 
-        let vm_state = crate::compiler::codegen::vm::vm_state::VmState::init_x86_sysv();
-        prog.emit(VmInstr::LoadPtr { dst: a_ptr, src: vm_state.arg_ptr_expr("input").unwrap() });
-        prog.emit(VmInstr::LoadPtr { dst: b_ptr, src: vm_state.arg_ptr_expr("weights").unwrap() });
-        prog.emit(VmInstr::LoadPtr { dst: c_ptr, src: vm_state.arg_ptr_expr("output").unwrap() });
+        let vm_state = crate::compiler::codegen::vm::vm_state::VmState::init_mega_kernel_x86();
+        prog.emit(VmInstr::LoadPtr { dst: a_ptr, src: vm_state.arg_ptr_expr("input_ids_ptr").unwrap() });
+        prog.emit(VmInstr::LoadPtr { dst: b_ptr, src: vm_state.arg_ptr_expr("weight_blob_ptr").unwrap() });
+        prog.emit(VmInstr::LoadPtr { dst: c_ptr, src: vm_state.arg_ptr_expr("scratchpad_ptr").unwrap() });
 
         // Simple GEMM: C[m,n] = A[m,k] × B[k,n]
         let (m, n, k) = (4, 8, 16);

@@ -567,8 +567,29 @@ impl<'a> RegAllocator<'a> {
             }
         }
 
+        // DIAG: Check VReg 3188 entry in map before conversion
+        if let Some(&(kind, width, def, last)) = map.get(&VRegId(3188)) {
+            eprintln!("[REGALLOC-DBG] VReg 3188 in HashMap BEFORE conversion: kind={:?}, width={:?}, def={}, last={}", kind, width, def, last);
+        }
+        // DIAG: Count DeclareVReg for id=3188 in the program
+        {
+            let decl_count = program.instrs.iter().filter(|instr| {
+                if let VmInstr::DeclareVReg { id, kind, width } = instr {
+                    if id.0 == 3188 {
+                        eprintln!("[REGALLOC-DBG] DeclareVReg found: id=3188, kind={:?}, width={:?}", kind, width);
+                        return true;
+                    }
+                }
+                false
+            }).count();
+            eprintln!("[REGALLOC-DBG] DeclareVReg count for VRegId(3188): {}", decl_count);
+        }
+
         let mut intervals: Vec<LiveInterval> = map.into_iter()
             .map(|(vreg, (kind, width, def_point, last_use))| {
+                if vreg.0 == 3188 {
+                    eprintln!("[REGALLOC-DBG] VReg 3188 converting to LiveInterval: kind={:?}, width={:?}", kind, width);
+                }
                 LiveInterval { vreg, kind, width, def_point, last_use, lifecycle: LifecycleTag::BodyLocal }
             })
             .collect();
@@ -692,6 +713,7 @@ impl<'a> RegAllocator<'a> {
                 v
             }
             VmInstr::VecNarrow { dst, src, .. } => vec![*dst, *src],
+            VmInstr::VecWiden { dst, src, .. } => vec![*dst, *src],
             VmInstr::Mov { dst, src, .. } => vec![*dst, *src],
             VmInstr::Broadcast { dst, src, .. } => {
                 let mut v = vec![*dst];
@@ -760,7 +782,6 @@ impl<'a> RegAllocator<'a> {
             VmInstr::CheckStopCondition { token_id, counter, eos_ptr, max_tokens_ptr } => vec![*token_id, *counter, *eos_ptr, *max_tokens_ptr],
             VmInstr::AddPtr { dst, base, .. } => vec![*dst, *base],
             VmInstr::StoreConstToStack { .. } => vec![],
-            VmInstr::OutputModeDispatch { selector, .. } => vec![*selector],
             VmInstr::BreakLoop { return_value } => match return_value {
                 ReturnValue::Const(_) => vec![],
                 ReturnValue::VReg(v) => vec![*v],
@@ -974,6 +995,11 @@ impl<'a> RegAllocator<'a> {
         let intervals = Self::compute_intervals(program);
         let interference = InterferenceGraph::build(&intervals);
 
+        // DIAG: unique ID for each allocate_impl call
+        static ALLOC_COUNTER: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+        let alloc_id = ALLOC_COUNTER.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        eprintln!("[ALLOC-ID] allocate_impl #{}: {} instrs, {} intervals", alloc_id, program.instrs.len(), intervals.len());
+
         // REQ-LC-004~006: 使用 ScopedSpillAllocator 替代顺序单调分配。
         // 预扫描 VmProgram 构建 scope 位置表，用于在 spill 分配时确定归属 scope。
         let scope_positions = Self::build_scope_positions(program);
@@ -1035,6 +1061,9 @@ impl<'a> RegAllocator<'a> {
                         // 做 load→cmp→inc→store (见 x86_lower/aarch64_lower LoopBegin/LoopEnd)。
                         let scope_id = Self::scope_at_position(&scope_positions, iv.def_point);
                         let (slot_id, _offset) = scoped_alloc.alloc(iv.vreg, 8, scope_id);
+                        if iv.vreg.0 == 3188 {
+                            eprintln!("[REGALLOC-DBG] VReg 3188 SPILLED via GPR path (kind={:?}), slot_id={}, size=8", iv.kind, slot_id);
+                        }
                         mapping.insert(iv.vreg, PhysReg::Spilled(slot_id as u32));
                     }
                 }
@@ -1051,6 +1080,9 @@ impl<'a> RegAllocator<'a> {
                         // REQ-LC-004~006: ScopedSpillAllocator scope-aware slot。
                         let size = iv.width.bytes().max(32);
                         let scope_id = Self::scope_at_position(&scope_positions, iv.def_point);
+                        if iv.vreg.0 == 3188 {
+                            eprintln!("[REGALLOC-DBG] VReg 3188 SPILLED via Vec path (width={:?}), size={}", iv.width, size);
+                        }
                         let (slot_id, _offset) = scoped_alloc.alloc(iv.vreg, size, scope_id);
                         mapping.insert(iv.vreg, PhysReg::Spilled(slot_id as u32));
                     }
@@ -1113,6 +1145,25 @@ impl<'a> RegAllocator<'a> {
 
         // REQ-LC-012: Post-allocation completeness check
         Self::post_alloc_verify(&mapping, &intervals, &spills)?;
+
+        // DIAG: dump ping/pong VReg allocation
+        for &diag_id in &[13842u32, 13843u32] {
+            if let Some(phys) = mapping.get(&VRegId(diag_id)) {
+                match phys {
+                    PhysReg::Gpr(r) => eprintln!("[DIAG-PINGPONG] VReg {} -> GPR {:?}", diag_id, r),
+                    PhysReg::Spilled(slot) => {
+                        if let Some(ss) = spills.iter().find(|s| s.vreg == VRegId(diag_id)) {
+                            eprintln!("[DIAG-PINGPONG] VReg {} -> Spilled(slot={}, offset={}, size={})", diag_id, slot, ss.offset, ss.size);
+                        } else {
+                            eprintln!("[DIAG-PINGPONG] VReg {} -> Spilled(slot={}) BUT NO SpillSlot found!", diag_id, slot);
+                        }
+                    }
+                    other => eprintln!("[DIAG-PINGPONG] VReg {} -> {:?}", diag_id, other),
+                }
+            } else {
+                eprintln!("[DIAG-PINGPONG] VReg {} NOT in mapping", diag_id);
+            }
+        }
 
         // REQ-LC-010: Post-hoc consistency verification (rules 6/7/9)
         let alloc = RegAllocation { mapping, spills, callee_saved_used };
@@ -1258,6 +1309,13 @@ impl<'a> RegAllocator<'a> {
                 VmInstr::BatchPerSeqArgmax { dst, seq_id, logits_flat_ptr, .. } => {
                     *dst == vreg && *seq_id != vreg && *logits_flat_ptr != vreg
                 }
+                // §20 BCI cumsum search: dst is pure write (seq_id lookup result).
+                VmInstr::SeqIdLookup { dst, token_index, seq_meta_base, num_seqs, .. } => {
+                    *dst == vreg && *token_index != vreg && *seq_meta_base != vreg && *num_seqs != vreg
+                }
+                VmInstr::BatchSeqIdLookup { dst, pt_offset_out, token_index, batch_ctx_ptr } => {
+                    *dst == vreg && *pt_offset_out != vreg && *token_index != vreg && *batch_ctx_ptr != vreg
+                }
                 VmInstr::SoftmaxNormalize { logits_ptr, sum_val, .. } => false, // in-place, no VReg dst
                 VmInstr::SampleTopKFilter { .. } => false, // in-place, no VReg dst
                 VmInstr::SampleTopPFilter { .. } => false, // in-place, no VReg dst
@@ -1338,6 +1396,7 @@ impl<'a> RegAllocator<'a> {
             VmInstr::VecLoad { .. } => "VecLoad",
             VmInstr::VecStore { .. } => "VecStore",
             VmInstr::VecNarrow { .. } => "VecNarrow",
+            VmInstr::VecWiden { .. } => "VecWiden",
             VmInstr::Mov { .. } => "Mov",
             VmInstr::Broadcast { .. } => "Broadcast",
             VmInstr::LoadPtr { .. } => "LoadPtr",

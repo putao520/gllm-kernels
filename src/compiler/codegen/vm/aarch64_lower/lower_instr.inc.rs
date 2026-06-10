@@ -200,6 +200,28 @@ impl AArch64Lower {
                 Ok(())
             }
 
+            VmInstr::VecWiden { dst, src, dst_dtype, src_dtype, .. } => {
+                // REQ-DTYPE-003: 向量宽化。策略驱动决策。
+                if dst_dtype.kind == src_dtype.kind && dst_dtype.packing == src_dtype.packing {
+                    // Same dtype: no-op copy.
+                    let vs = self.resolve_vreg(*src, alloc)?;
+                    let vd = self.resolve_vreg(*dst, alloc)?;
+                    if vd != vs { self.emit32(self.enc_orr_vv(vd, vs, vs)); }
+                } else if dst_dtype.elem_bytes() > src_dtype.elem_bytes() {
+                    // Widen: narrow → wide. AArch64: fcvtl (F16→F32) or bf16 → f32 via bfcvt.
+                    let src_strategy = src_dtype.aarch64_elem_strategy();
+                    return Err(crate::types::CompilerError::CodegenViolation(
+                        format!("VecWiden: {:?}→{:?} (strategy {src_strategy:?}) not yet implemented in AArch64 ISA lowering",
+                            src_dtype.kind, dst_dtype.kind)
+                    ));
+                } else {
+                    return Err(crate::types::CompilerError::CodegenViolation(
+                        format!("VecWiden: {:?}→{:?} is not a widening conversion", src_dtype.kind, dst_dtype.kind)
+                    ));
+                }
+                Ok(())
+            }
+
             VmInstr::Mov { dst, src, dtype: _ } => {
                 // dtype 由调用者传播，mov 本身对 dtype 无感 (REQ-VR10)。
                 let vd = self.resolve_vreg(*dst, alloc)?;
@@ -916,30 +938,6 @@ impl AArch64Lower {
             }
 
             // ── Mega-Kernel 控制流指令 ──
-
-            VmInstr::OutputModeDispatch { selector, paths } => {
-                // OutputModeDispatch: 根据 selector 值分发到不同路径
-                // 编译时已知 paths 列表，运行时根据 selector 值跳转
-                let sel_reg = self.resolve_gpr(*selector, alloc)?;
-
-                // 对每种模式（除最后一个）进行比较和条件跳转
-                for (i, &path_offset) in paths.iter().enumerate() {
-                    // CMP selector, #i
-                    self.emit32(self.enc_cmp_imm(sel_reg, i as u32));
-                    // B.EQ target
-                    // 计算跳转偏移（指令数）
-                    let current = self.current_offset();
-                    let target_offset = if path_offset > current {
-                        (path_offset - current) / 4
-                    } else {
-                        // 向后跳转（罕见，但支持）
-                        0x7FFFF // 占位符，实际需要更复杂的计算
-                    };
-                    self.emit32(0x54000000 | (((target_offset as u32) & 0x7FFFF) << 5) ); // B.EQ
-                }
-                // 最后一个模式为默认路径（fall-through）
-                Ok(())
-            }
 
             VmInstr::BreakLoop { return_value } => {
                 // BreakLoop: 跳出 generate loop 到函数 epilogue

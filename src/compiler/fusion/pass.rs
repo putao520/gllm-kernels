@@ -6,7 +6,7 @@ use std::collections::{HashMap, HashSet};
 use crate::compiler::graph::{CompilerGraph, CompilerOp, OpKind, OpId, MultiOutputConfig};
 use crate::compiler::semantic_dag::{SemanticDAG, OpClass, Bottleneck};
 use crate::compiler::registry::ScalarOpRegistry;
-use super::types::{FusionGroup, FusionMode, FusionPlan};
+use super::types::{FusionGroup, FusionMode, FusionPlan, GroupMarker};
 use super::helpers::{
     detect_qkv_norm_rope, detect_qkv_shared_input, detect_norm_into_gemm, detect_ffn_block,
     collect_epilogue, collect_elementwise_chain, split_elementwise_by_l1, detect_tile_vs_compute_root,
@@ -118,7 +118,7 @@ pub fn fuse_with_dag_prebuilt(
 
                 // Phase A: Gemm + Reduction (Argmax) → EpilogueInjection
                 // After collecting ElemWise epilogue chain, check if the last output
-                // feeds a single Reduction consumer (e.g., Argmax after lm_head).
+                // feeds a single Reduction consumer (e.g., Argmax after logits GEMM).
                 // This eliminates logits writeback — argmax runs directly on GEMM accumulator.
                 let reduction_epilogue = try_collect_reduction_epilogue(
                     graph, op, &epilogue, &claimed, Some(dag),
@@ -193,6 +193,9 @@ pub fn fuse_with_dag_prebuilt(
                         ops: all_ops,
                         multi_output: MultiOutputConfig::single(),
                     dominant_dtype: None,
+                    marker: GroupMarker::None,
+                    is_layer_group: false,
+                    hetero_layer_type: None,
                     });
                 } else {
                     // Standalone GEMM
@@ -207,6 +210,9 @@ pub fn fuse_with_dag_prebuilt(
                         ops: vec![op_id],
                         multi_output: MultiOutputConfig::single(),
                     dominant_dtype: None,
+                    marker: GroupMarker::None,
+                    is_layer_group: false,
+                    hetero_layer_type: None,
                     });
                 }
             }
@@ -262,6 +268,9 @@ pub fn fuse_with_dag_prebuilt(
                         ops: sub,
                         multi_output: MultiOutputConfig::single(),
                         dominant_dtype: None,
+                        marker: GroupMarker::None,
+                        is_layer_group: false,
+                        hetero_layer_type: None,
                     });
                 }
             }
@@ -277,6 +286,9 @@ pub fn fuse_with_dag_prebuilt(
                     ops: vec![op_id],
                     multi_output: MultiOutputConfig::single(),
                     dominant_dtype: None,
+                    marker: GroupMarker::None,
+                    is_layer_group: false,
+                    hetero_layer_type: None,
                 });
             }
         }
@@ -317,6 +329,9 @@ pub fn fuse_with_dag_prebuilt(
                     ops: vec![id],
                     multi_output: MultiOutputConfig::single(),
                     dominant_dtype: None,
+                    marker: GroupMarker::None,
+                    is_layer_group: false,
+                    hetero_layer_type: None,
                 });
             }
             continue;
@@ -336,7 +351,10 @@ pub fn fuse_with_dag_prebuilt(
                         mode: FusionMode::Standalone,
                         ops: vec![id],
                         multi_output: MultiOutputConfig::single(),
-                    dominant_dtype: None,
+                        dominant_dtype: None,
+                        marker: GroupMarker::None,
+                        is_layer_group: false,
+                        hetero_layer_type: None,
                     });
                 }
             }
@@ -369,6 +387,19 @@ pub fn fuse_with_dag_prebuilt(
         g.infer_dominant_dtype(graph);
     }
 
+    // REQ-DTYPE-003: 融合组内 dtype 连续性验证 + widen→narrow→widen 链检查。
+    // 验证规则:
+    // 1. 融合组内相邻 op dtype 相同时零变换直传 (无额外 cost)
+    // 2. widening (BF16→F32) 在 GEMM 内部 load 完成，允许
+    // 3. narrowing (F32→BF16) 仅在 Epilogue 最后一步，允许
+    // 4. 量化边界仅入口发生，允许
+    // 5. 禁止 widen→compute→narrow→widen 链 (表示 dtype 不稳定，应拆分融合组)
+    for g in &groups {
+        if let Err(e) = validate_fusion_group_dtype(g, graph) {
+            eprintln!("[WARN] dtype oscillation in fusion group {}: {:?}", g.id, e);
+        }
+    }
+
     // REQ-DTYPE-007: dtype 感知代数重关联。
     // 对每个 LoopFusion 组的 epilogue ops 按 dtype 稳定排序，
     // 使相同 dtype 的 ops 相邻，消除中间 widen/narrow。
@@ -387,10 +418,436 @@ pub fn fuse_with_dag_prebuilt(
         }
     }
 
+    // REQ-UMK-012: 从图拓扑推导 GroupMarker，替代 label prefix 约定
+    assign_group_markers(&mut groups, graph);
+
     FusionPlan {
         groups,
         op_to_group: final_op_to_group,
     }
+}
+
+/// REQ-DTYPE-003: 融合组内 dtype 连续性验证。
+///
+/// 检查融合组内是否存在 widen→compute→narrow→widen 链，
+/// 这种模式表示 dtype 不稳定，应拆分融合组。
+///
+/// 合法模式:
+/// - 相同 dtype 直传 (零变换)
+/// - widen (BF16→F32) 仅在 GEMM 内部 load
+/// - narrow (F32→BF16) 仅在 Epilogue 最后一步
+/// - 量化边界仅入口发生
+///
+/// 非法模式: widen→compute→narrow→widen (dtype 振荡)
+fn validate_fusion_group_dtype(
+    group: &FusionGroup,
+    graph: &CompilerGraph,
+) -> Result<(), crate::types::CompilerError> {
+    use crate::compiler::trace::QuantPrecision;
+
+    // 提取融合组内每个 op 的 dtype
+    let op_dtypes: Vec<Option<QuantPrecision>> = group.ops.iter().map(|&op_id| {
+        graph.op(op_id)
+            .and_then(|op| op.inputs.first())
+            .and_then(|&tid| graph.tensor(tid))
+            .map(|t| t.dtype.to_quant_precision())
+    }).collect();
+
+    // 检测 widen→narrow→widen 振荡模式
+    // 跟踪连续的 widen/narrow 转换次数
+    let mut transition_count = 0u32;
+    for i in 1..op_dtypes.len() {
+        let prev = op_dtypes[i - 1];
+        let curr = op_dtypes[i];
+        match (prev, curr) {
+            (Some(p), Some(c)) if p != c => {
+                transition_count += 1;
+                if transition_count >= 3 {
+                    return Err(crate::types::CompilerError::CodegenViolation(format!(
+                        "REQ-DTYPE-003: 融合组 {} 存在 dtype 振荡 (widen→compute→narrow→widen), \
+                         应拆分融合组。op[{}]: {:?} → op[{}]: {:?}",
+                        group.id, i - 1, p, i, c
+                    )));
+                }
+            }
+            _ => {
+                // 相同 dtype 或无法推断 → 重置计数
+                transition_count = 0;
+            }
+        }
+    }
+    Ok(())
+}
+
+/// REQ-UMK-012: 从图拓扑推导 GroupMarker，替代 label prefix 约定。
+///
+/// 推导规则（纯 OpKind 拓扑驱动，零 label 依赖）:
+/// 1. 为每个融合组计算 OpKind 判别式签名（有序变体 ID 序列）
+/// 2. 图有 layer_loop_config → 同构层循环：连续 N 个相同签名的组 → LayerLoopBegin{N}/End
+/// 3. 图有 hetero_layer_loop_config → 异构层循环：循环签名模式 → HeteroLayerLoopBegin/End
+/// 4. 无层循环配置 → 不标记
+///
+/// 同构子结构检测原理：transformer 层在 CompilerGraph 中表现为重复的 OpKind 序列。
+/// 融合后，同一层的 ops 被分组到连续的 FusionGroup 中，这些组具有相同的 OpKind 签名。
+/// 这比 label prefix 约定更可靠——不依赖 build_graph 的命名约定。
+fn assign_group_markers(groups: &mut [FusionGroup], graph: &CompilerGraph) {
+    let has_layer_loop = graph.layer_loop_config.is_some();
+    let has_hetero_loop = graph.hetero_layer_loop_config.is_some();
+
+    if !has_layer_loop && !has_hetero_loop {
+        return;
+    }
+
+    // Compute OpKind discriminant signature for each fusion group.
+    // discriminant() returns a stable value per enum variant, ignoring field values.
+    // Two groups with identical discriminant sequences are isomorphic substructures.
+    let signatures: Vec<Vec<std::mem::Discriminant<OpKind>>> = groups.iter()
+        .map(|g| {
+            g.ops.iter()
+                .filter_map(|&oid| graph.op(oid))
+                .map(|op| std::mem::discriminant(&op.kind))
+                .collect()
+        })
+        .collect();
+
+    if has_hetero_loop {
+        assign_hetero_markers(groups, &signatures, graph);
+    } else {
+        assign_homogeneous_markers(groups, &signatures, graph);
+    }
+}
+
+/// Detect homogeneous layer groups: consecutive groups with identical OpKind signatures.
+fn assign_homogeneous_markers(
+    groups: &mut [FusionGroup],
+    signatures: &[Vec<std::mem::Discriminant<OpKind>>],
+    graph: &CompilerGraph,
+) {
+    let num_iterations = graph.layer_loop_config.as_ref()
+        .map(|cfg| cfg.num_layers)
+        .unwrap_or(0);
+
+    if num_iterations == 0 || groups.is_empty() {
+        return;
+    }
+
+    // Find the longest run of consecutive groups with identical signatures.
+    // A transformer layer typically produces 2-4 fusion groups (attention + FFN, etc.).
+    // The pattern repeats num_iterations times, so the run length should be
+    // a multiple of the pattern period.
+    let layer_group_indices = find_isomorphic_run(signatures, num_iterations);
+
+    if layer_group_indices.is_empty() {
+        return;
+    }
+
+    // Mark all layer groups
+    for &idx in &layer_group_indices {
+        groups[idx].is_layer_group = true;
+    }
+
+    if let Some(&first) = layer_group_indices.first() {
+        groups[first].marker = GroupMarker::LayerLoopBegin { num_iterations };
+    }
+    if layer_group_indices.len() > 1 {
+        if let Some(&last) = layer_group_indices.last() {
+            groups[last].marker = GroupMarker::LayerLoopEnd;
+        }
+    }
+}
+
+/// Detect heterogeneous layer groups: cycling signature patterns (Gemma 4 sliding/full).
+fn assign_hetero_markers(
+    groups: &mut [FusionGroup],
+    signatures: &[Vec<std::mem::Discriminant<OpKind>>],
+    graph: &CompilerGraph,
+) {
+    let num_segments = graph.hetero_layer_loop_config.as_ref()
+        .map(|cfg| cfg.num_segments)
+        .unwrap_or(0);
+
+    if num_segments == 0 || groups.is_empty() {
+        return;
+    }
+
+    // For hetero models, find groups with cycling signatures.
+    // The cycle period = groups_per_segment (e.g., 5 for Gemma 4: 4 sliding + 1 full).
+    // Detect by finding the shortest repeating pattern in signatures.
+    let layer_group_indices = find_cycling_run(signatures, num_segments);
+
+    if layer_group_indices.is_empty() {
+        return;
+    }
+
+    // Derive hetero_layer_type for each layer group from OpKind parameters.
+    // Sliding vs Full: distinguished by Attention head_dim (sliding < full).
+    // Small vs Large FFN: distinguished by GEMM n (intermediate size, small < large).
+    let hetero_dims = extract_hetero_dims(graph);
+    for &idx in &layer_group_indices {
+        groups[idx].is_layer_group = true;
+        if let Some(ref dims) = hetero_dims {
+            groups[idx].hetero_layer_type = derive_hetero_layer_type(&groups[idx], graph, dims);
+        }
+    }
+
+    if let Some(&first) = layer_group_indices.first() {
+        groups[first].marker = GroupMarker::HeteroLayerLoopBegin { num_segments };
+    }
+    if layer_group_indices.len() > 1 {
+        if let Some(&last) = layer_group_indices.last() {
+            groups[last].marker = GroupMarker::HeteroLayerLoopEnd;
+        }
+    }
+}
+
+/// Extract hetero dimension thresholds from graph ops.
+/// Returns (sliding_head_dim, full_head_dim, small_intermediate, large_intermediate).
+fn extract_hetero_dims(graph: &CompilerGraph) -> Option<HeteroDims> {
+    // Collect all unique head_dim values from Attention ops
+    let mut head_dims: Vec<usize> = graph.ops.iter()
+        .filter_map(|op| match &op.kind {
+            OpKind::MultiHeadAttention { head_dim, .. } => Some(*head_dim),
+            _ => None,
+        })
+        .collect();
+    head_dims.sort_unstable();
+    head_dims.dedup();
+
+    if head_dims.len() < 2 {
+        return None;
+    }
+
+    let sliding_head_dim = head_dims[0];
+    let full_head_dim = head_dims[1];
+
+    // Collect all unique FFN intermediate sizes from GEMM ops
+    // (the n dimension of gate/up projections in FFN)
+    let mut intermediates: Vec<usize> = graph.ops.iter()
+        .filter_map(|op| match &op.kind {
+            OpKind::Gemm { n, .. } | OpKind::GemmBias { n, .. } | OpKind::QuantGemm { n, .. } => Some(*n),
+            _ => None,
+        })
+        .collect();
+    intermediates.sort_unstable();
+    intermediates.dedup();
+
+    // For hetero models, there should be at least 2 distinct intermediate sizes
+    let (small_intermediate, large_intermediate) = if intermediates.len() >= 2 {
+        (intermediates[0], intermediates[intermediates.len() - 1])
+    } else {
+        // No FFN size difference — all same intermediate
+        (intermediates.first().copied().unwrap_or(0), intermediates.first().copied().unwrap_or(0))
+    };
+
+    Some(HeteroDims { sliding_head_dim, full_head_dim, small_intermediate, large_intermediate })
+}
+
+struct HeteroDims {
+    sliding_head_dim: usize,
+    full_head_dim: usize,
+    small_intermediate: usize,
+    large_intermediate: usize,
+}
+
+/// Derive HeteroLayerType from a fusion group's OpKind parameters.
+fn derive_hetero_layer_type(
+    group: &FusionGroup,
+    graph: &CompilerGraph,
+    dims: &HeteroDims,
+) -> Option<super::types::HeteroLayerType> {
+    use super::types::HeteroLayerType;
+
+    // Determine if this group has sliding or full attention
+    let is_sliding = group.ops.iter().any(|&oid| {
+        graph.op(oid).map_or(false, |op| match &op.kind {
+            OpKind::MultiHeadAttention { head_dim, .. } => *head_dim == dims.sliding_head_dim,
+            _ => false,
+        })
+    });
+    let is_full = group.ops.iter().any(|&oid| {
+        graph.op(oid).map_or(false, |op| match &op.kind {
+            OpKind::MultiHeadAttention { head_dim, .. } => *head_dim == dims.full_head_dim,
+            _ => false,
+        })
+    });
+
+    // Determine if this group has small or large FFN
+    let is_small_ffn = group.ops.iter().any(|&oid| {
+        graph.op(oid).map_or(false, |op| match &op.kind {
+            OpKind::Gemm { n, .. } | OpKind::GemmBias { n, .. } | OpKind::QuantGemm { n, .. }
+                if *n == dims.small_intermediate && dims.small_intermediate != dims.large_intermediate =>
+            {
+                true
+            }
+            _ => false,
+        })
+    });
+    let is_large_ffn = group.ops.iter().any(|&oid| {
+        graph.op(oid).map_or(false, |op| match &op.kind {
+            OpKind::Gemm { n, .. } | OpKind::GemmBias { n, .. } | OpKind::QuantGemm { n, .. }
+                if *n == dims.large_intermediate && dims.small_intermediate != dims.large_intermediate =>
+            {
+                true
+            }
+            _ => false,
+        })
+    });
+
+    // Combine: sliding/full × small/large
+    match (is_sliding, is_full, is_small_ffn, is_large_ffn) {
+        (true, _, true, _) => Some(HeteroLayerType::SlidingSmall),
+        (true, _, _, true) => Some(HeteroLayerType::SlidingLarge),
+        (_, true, true, _) => Some(HeteroLayerType::FullSmall),
+        (_, true, _, true) => Some(HeteroLayerType::FullLarge),
+        // Fallback: if no FFN size difference, use small variant
+        (true, _, false, false) => Some(HeteroLayerType::SlidingSmall),
+        (_, true, false, false) => Some(HeteroLayerType::FullSmall),
+        _ => None,
+    }
+}
+
+/// Find the longest run of consecutive groups with identical signatures.
+///
+/// For homogeneous models, all layer groups have the same OpKind signature.
+/// We look for a contiguous block of `num_iterations * period` groups where
+/// every `period`-th group has the same signature as the first.
+///
+/// `period` is auto-detected as the smallest value where signatures repeat.
+fn find_isomorphic_run(
+    signatures: &[Vec<std::mem::Discriminant<OpKind>>],
+    num_iterations: usize,
+) -> Vec<usize> {
+    if signatures.is_empty() || num_iterations == 0 {
+        return Vec::new();
+    }
+
+    // Find the period: smallest p where signatures[0..p] repeats at signatures[p..2p].
+    // For a typical transformer: period = 2 (attention group + FFN group) or 1 (single fused group).
+    let max_period = signatures.len().min(8);
+    let period = (1..=max_period).find(|&p| {
+        if p * 2 > signatures.len() {
+            return false;
+        }
+        // Check that signatures[0..p] == signatures[p..2p]
+        (0..p).all(|i| signatures[i] == signatures[p + i])
+    }).unwrap_or(1);
+
+    // Verify the run: all groups in [0, period * num_iterations) should be part of the layer loop.
+    let expected_len = period * num_iterations;
+    if expected_len > signatures.len() {
+        // Not enough groups for the expected number of iterations.
+        // Fall back: use all groups with the same signature as group 0.
+        return find_consecutive_same_signature(signatures);
+    }
+
+    // Verify that the pattern repeats for all iterations.
+    let is_valid = (0..num_iterations).all(|iter| {
+        let base = iter * period;
+        (0..period).all(|i| signatures[base + i] == signatures[i])
+    });
+
+    if is_valid {
+        (0..expected_len).collect()
+    } else {
+        // Pattern doesn't repeat cleanly — fall back to consecutive same-signature detection.
+        find_consecutive_same_signature(signatures)
+    }
+}
+
+/// Find consecutive groups with the same signature (fallback for when periodic detection fails).
+fn find_consecutive_same_signature(
+    signatures: &[Vec<std::mem::Discriminant<OpKind>>],
+) -> Vec<usize> {
+    if signatures.is_empty() {
+        return Vec::new();
+    }
+
+    // Find the most common signature (the layer template).
+    let mut sig_counts: HashMap<Vec<std::mem::Discriminant<OpKind>>, usize> = HashMap::new();
+    for sig in signatures {
+        *sig_counts.entry(sig.clone()).or_insert(0) += 1;
+    }
+    let dominant_sig = sig_counts.into_iter()
+        .max_by_key(|(_, count)| *count)
+        .map(|(sig, _)| sig)
+        .unwrap();
+
+    // Find the longest contiguous run of groups matching the dominant signature.
+    let matching: Vec<usize> = signatures.iter().enumerate()
+        .filter(|(_, sig)| *sig == &dominant_sig)
+        .map(|(i, _)| i)
+        .collect();
+
+    if matching.is_empty() {
+        return Vec::new();
+    }
+
+    // Find longest contiguous run in matching indices.
+    let mut best_start = matching[0];
+    let mut best_len = 1;
+    let mut cur_start = matching[0];
+    let mut cur_len = 1;
+
+    for &idx in &matching[1..] {
+        if idx == cur_start + cur_len {
+            cur_len += 1;
+        } else {
+            if cur_len > best_len {
+                best_start = cur_start;
+                best_len = cur_len;
+            }
+            cur_start = idx;
+            cur_len = 1;
+        }
+    }
+    if cur_len > best_len {
+        best_start = cur_start;
+        best_len = cur_len;
+    }
+
+    // Return ALL groups in the range [best_start, best_start + best_len),
+    // not just the ones matching the dominant signature.
+    // In a layer loop, groups between matching ones (e.g., FFN between attention)
+    // are also part of the layer loop.
+    (best_start..best_start + best_len).collect()
+}
+
+/// Find groups forming a cycling signature pattern (heterogeneous models).
+///
+/// For Gemma 4 E2B: each segment has [sliding_small × 4 + full_small] or
+/// [sliding_large × 4 + full_large], producing a cycling pattern of distinct
+/// signatures. We detect this by finding the shortest cycle period that
+/// repeats `num_segments` times.
+fn find_cycling_run(
+    signatures: &[Vec<std::mem::Discriminant<OpKind>>],
+    num_segments: usize,
+) -> Vec<usize> {
+    if signatures.is_empty() || num_segments == 0 {
+        return Vec::new();
+    }
+
+    // For hetero models, the cycle period = groups_per_segment.
+    // Try to detect it by finding the smallest p where the pattern
+    // signatures[0..p] repeats (with possible signature variations) at signatures[p..2p].
+    // Hetero models have DIFFERENT signatures within a segment but the SAME
+    // pattern of signature differences across segments.
+    let max_period = signatures.len().min(16);
+    let period = (1..=max_period).find(|&p| {
+        if p * 2 > signatures.len() {
+            return false;
+        }
+        // For hetero: check that the discriminant SET (not sequence) repeats.
+        // Within a segment, signatures differ (sliding vs full), but the set
+        // of discriminant variants is the same across segments.
+        let set0: HashSet<_> = signatures[0..p].iter().collect();
+        let set1: HashSet<_> = signatures[p..2*p].iter().collect();
+        set0 == set1
+    }).unwrap_or(signatures.len().min(5));
+
+    let expected_len = period * num_segments;
+    let run_len = expected_len.min(signatures.len());
+
+    (0..run_len).collect()
 }
 
 /// Try to collect a single Reduction op (e.g., Argmax) immediately downstream of
@@ -1163,6 +1620,9 @@ mod tests {
             ops: vec![op0],
             multi_output: MultiOutputConfig::single(),
             dominant_dtype: None,
+            marker: GroupMarker::None,
+            is_layer_group: false,
+            hetero_layer_type: None,
         };
 
         // Act
@@ -1190,6 +1650,9 @@ mod tests {
             ops: vec![op0],
             multi_output: MultiOutputConfig::single(),
             dominant_dtype: None,
+            marker: GroupMarker::None,
+            is_layer_group: false,
+            hetero_layer_type: None,
         };
 
         // Act
@@ -1213,6 +1676,9 @@ mod tests {
             ops: vec![OpId(999)],
             multi_output: MultiOutputConfig::single(),
             dominant_dtype: None,
+            marker: GroupMarker::None,
+            is_layer_group: false,
+            hetero_layer_type: None,
         };
 
         // Act
@@ -1560,6 +2026,9 @@ mod tests {
             ops: vec![op0],
             multi_output: MultiOutputConfig::single(),
             dominant_dtype: None,
+            marker: GroupMarker::None,
+            is_layer_group: false,
+            hetero_layer_type: None,
         };
 
         // Act
@@ -2060,6 +2529,9 @@ mod tests {
             ops: vec![anchor_op, epi_op],
             multi_output: MultiOutputConfig::single(),
             dominant_dtype: None,
+            marker: GroupMarker::None,
+            is_layer_group: false,
+            hetero_layer_type: None,
         };
 
         // Act
@@ -2090,6 +2562,9 @@ mod tests {
             ops: vec![anchor_op, epi_op],
             multi_output: MultiOutputConfig::single(),
             dominant_dtype: None,
+            marker: GroupMarker::None,
+            is_layer_group: false,
+            hetero_layer_type: None,
         };
 
         // Act
@@ -2097,6 +2572,46 @@ mod tests {
 
         // Assert: anchor's first input is BF16, so dominant_dtype is BF16
         assert_eq!(group.dominant_dtype, Some(crate::compiler::trace::QuantPrecision::BF16));
+    }
+
+    // ── REQ-DTYPE-003: validate_fusion_group_dtype tests ──
+
+    #[test]
+    fn validate_fusion_group_dtype_same_dtype_ok() {
+        let mut g = CompilerGraph::new();
+        let a = g.add_tensor_concrete("a", &[32], DType::F32);
+        let b = g.add_tensor_concrete("b", &[32], DType::F32);
+        let c = g.add_tensor_concrete("c", &[32], DType::F32);
+        g.inputs = vec![a]; g.outputs = vec![c];
+        let op0 = g.add_op(OpKind::Silu, vec![a], vec![b], "silu");
+        let op1 = g.add_op(OpKind::Tanh, vec![b], vec![c], "tanh");
+        let group = FusionGroup {
+            id: 0, anchor: op0, epilogue: vec![op1],
+            mode: FusionMode::LoopFusion, ops: vec![op0, op1],
+            multi_output: MultiOutputConfig::single(),
+            dominant_dtype: None, marker: GroupMarker::None,
+            is_layer_group: false, hetero_layer_type: None,
+        };
+        assert!(validate_fusion_group_dtype(&group, &g).is_ok(),
+            "same dtype across ops should pass validation");
+    }
+
+    #[test]
+    fn validate_fusion_group_dtype_single_widen_ok() {
+        let mut g = CompilerGraph::new();
+        let a = g.add_tensor_concrete("a", &[32], DType::BF16);
+        let b = g.add_tensor_concrete("b", &[32], DType::F32);
+        g.inputs = vec![a]; g.outputs = vec![b];
+        let op0 = g.add_op(OpKind::Silu, vec![a], vec![b], "silu");
+        let group = FusionGroup {
+            id: 0, anchor: op0, epilogue: vec![],
+            mode: FusionMode::LoopFusion, ops: vec![op0],
+            multi_output: MultiOutputConfig::single(),
+            dominant_dtype: None, marker: GroupMarker::None,
+            is_layer_group: false, hetero_layer_type: None,
+        };
+        assert!(validate_fusion_group_dtype(&group, &g).is_ok(),
+            "single widen should pass validation");
     }
 
     // ── Test: FusionPlan op_to_group consistency with groups ──

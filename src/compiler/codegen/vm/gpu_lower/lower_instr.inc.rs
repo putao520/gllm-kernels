@@ -33,6 +33,30 @@ impl GpuLower {
                 Ok(())
             }
 
+            VmInstr::VecWiden { dst, src, dst_dtype, src_dtype, .. } => {
+                // REQ-DTYPE-003: GPU 向量宽化。BF16→F32 使用 cvt.rn.f32.bf16。
+                if dst_dtype.elem_bytes() > src_dtype.elem_bytes() {
+                    let d = self.reg_name_with_kind(*dst, alloc);
+                    let s = self.reg_name_with_kind(*src, alloc);
+                    match self.dialect {
+                        GpuDialect::Ptx { .. } => {
+                            self.emit_line(&format!("cvt.rn.f32.bf16 {d}, {s};  // VecWiden BF16→F32"));
+                        }
+                        GpuDialect::Hip { .. } => {
+                            self.emit_line(&format!("v_cvt_f32_bf16 {d}, {s};  // VecWiden BF16→F32"));
+                        }
+                        GpuDialect::Metal { .. } => {
+                            self.emit_line(&format!("{d} = convert_float({s});  // VecWiden BF16→F32"));
+                        }
+                    }
+                } else {
+                    let d = self.reg_name_with_kind(*dst, alloc);
+                    let s = self.reg_name_with_kind(*src, alloc);
+                    self.emit_line(&format!("mov.v4.f32 {d}, {s};  // VecWiden (no-op for same dtype)"));
+                }
+                Ok(())
+            }
+
             VmInstr::Mov { dst, src, .. } => {
                 let d = self.reg_name_with_kind(*dst, alloc);
                 let s = self.reg_name_with_kind(*src, alloc);
@@ -1769,25 +1793,6 @@ impl GpuLower {
                 Ok(())
             }
 
-            // REQ-CG-011: OutputModeDispatch — JMP table for mega-kernel output modes
-            VmInstr::OutputModeDispatch { selector, paths } => {
-                let sel = self.reg_name_with_kind(*selector, alloc);
-                let ps0 = self.scratch_pred_names[0];
-                for (i, path_idx) in paths.iter().enumerate() {
-                    let label = format!("PATH_{}", self.path_label_counter + i as u32);
-                    self.path_labels.insert(*path_idx, label.clone());
-                    match self.dialect {
-                        GpuDialect::Ptx { .. } => {
-                            self.emit_line(&format!("setp.eq.u32 {ps0}, {sel}, {i};"));
-                            self.emit_line(&format!("@{ps0} bra {label};"));
-                        }
-                        _ => self.emit_line(&format!("if ({sel} == {i}) goto {label};")),
-                    }
-                }
-                self.path_label_counter += paths.len() as u32;
-                Ok(())
-            }
-
             // REQ-CG-011: BreakLoop — exit generate loop, jump to epilogue
             VmInstr::BreakLoop { return_value } => {
                 match self.dialect {
@@ -1821,7 +1826,7 @@ impl GpuLower {
                 Ok(())
             }
 
-            // REQ-CG-012: MarkLabel — emit label for OutputModeDispatch / JumpToLabel targets
+            // REQ-CG-012: MarkLabel — emit label for JumpToLabel targets
             VmInstr::MarkLabel { label_id } => {
                 let label = self.path_labels.get(label_id)
                     .cloned()

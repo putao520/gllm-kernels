@@ -1,4 +1,4 @@
-//! Phase 0: Binary symbolic execution engine.
+//! Binary symbolic execution engine (Scalar + SymExec phase).
 //!
 //! Analyzes `extern "C"` scalar functions by disassembling their compiled
 //! binary and symbolically executing each instruction to extract the

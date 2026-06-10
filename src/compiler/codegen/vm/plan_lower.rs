@@ -23,7 +23,7 @@ use super::x86_lower::X86Lower;
 use super::vm_state::{HeteroPhase, EmitState, AbiPtrs};
 
 use crate::compiler::codegen::{CodegenOutput, DwcScratchRequirement, PleScratchRequirement, RopeCacheRequirement};
-use crate::compiler::fusion::{FusionPlan, FusionMode};
+use crate::compiler::fusion::{FusionPlan, FusionMode, HeteroLayerType};
 use crate::compiler::graph::{CompilerGraph, LayerCondition, OpKind, SymDim, TensorId};
 use crate::compiler::buffer_alloc::{BufferAllocation, TensorPtrSource};
 use crate::compiler::registry::ScalarOpRegistry;
@@ -38,6 +38,7 @@ use super::telemetry_emit::emit_silu_dead_neuron_telemetry;
 use super::norm_softmax_emit::emit_normlike_inline;
 use super::dispatch_emit::{dispatch_structural, dispatch_compute_pattern};
 use super::fusion_group_emit::emit_fusion_group_by_mode;
+use super::gemm_emit::emit_gemm_inline_with_hook;
 use super::hetero_emit::compile_hetero_templates_parallel;
 
 /// Re-export KvLoadMode from instr.rs

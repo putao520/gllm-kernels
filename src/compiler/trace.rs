@@ -2,7 +2,7 @@ use crate::compiler::graph::OpKind;
 use crate::quant::QuantType;
 use crate::quant_format::ZeroLayout;
 
-/// Phase 0 output: an operator's complete computational structure.
+/// Scalar + SymExec output: an operator's complete computational structure.
 #[derive(Debug, Clone)]
 pub struct OpTrace {
     /// Which graph-level operation this trace describes.
@@ -26,7 +26,7 @@ pub struct ReductionSecondPass {
     pub combine: Vec<TraceOp>,
 }
 
-/// Computational pattern — determines how Phase 3 vectorizes the operator.
+/// Computational pattern — determines how ISA Lowering vectorizes the operator.
 #[derive(Debug, Clone)]
 pub enum ComputePattern {
     /// `out[i] = f(in[i])` — single-input elementwise.
@@ -289,7 +289,7 @@ pub enum TraceOp {
     },
 
     // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-    // 结构型内存操作 (ARCH-AUTO-INSTR-SELECT Phase 4)
+    // 结构型内存操作 (ARCH-AUTO-INSTR-SELECT structural)
     // Gather/Attention/MoE 等结构型算子的索引内存访问语义。
     // 不再绕过 auto_select 走手写 lower_*，全部纳入自动指令选择。
     // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━

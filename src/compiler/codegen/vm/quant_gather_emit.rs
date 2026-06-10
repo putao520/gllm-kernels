@@ -9,7 +9,7 @@ use crate::types::CompilerError;
 /// QuantGather: embedding lookup on quantized weight table (ARCH-RUST-IS-CODEGEN §4.2 REQ-QCG-005).
 ///
 /// Unified path using `DecodeTraceBuilder` for all quantization formats.
-/// SPEC 24-QUANT-PIPELINE-JIT §5 Phase 2: replaces per-format hand-written VmInstr emission
+/// SPEC 24-QUANT-PIPELINE-JIT §5 Fusion: replaces per-format hand-written VmInstr emission
 /// with parameterized trace templates driven by `QuantFormatDescriptor`.
 ///
 /// Loop structure (all emit_loop_try for ARCH-NO-LOOP-UNROLL):

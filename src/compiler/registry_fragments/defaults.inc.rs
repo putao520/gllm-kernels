@@ -782,7 +782,7 @@ impl ScalarOpRegistry {
         // Trace shape: Permute(nibble, e2m1_lut) → BlockScale(scale, block_size=32) → Mul.
         // The `Permute` TraceOp captures the 16-entry e2m1 LUT lookup; downstream codegen
         // can lower this to vpshufb (x86) / tbl (ARM) / prmt (PTX). The trace is intentionally
-        // schematic — Phase 3 ISA lowering reads the actual LUT from a constant pool emitted
+        // schematic — ISA Lowering reads the actual LUT from a constant pool emitted
         // during codegen, not from this trace.
         //
         // SymExec ground truth: `crate::quant_mxfp4::dequant_mxfp4_scalar` (function pointer
@@ -814,7 +814,7 @@ impl ScalarOpRegistry {
                         TraceOp::Input(0),                          // [0] packed nibble byte
                         TraceOp::Input(1),                          // [1] e2m1 LUT (16 × f32)
                         TraceOp::Permute { src: ValueId(0), indices: ValueId(1) },    // [2] LUT[nibble] → f32 value
-                        TraceOp::Input(2),                          // [3] e8m0 scale (already decoded to f32 by Phase 0 prologue)
+                        TraceOp::Input(2),                          // [3] e8m0 scale (already decoded to f32 by ABI prologue)
                         TraceOp::BlockScale { data: ValueId(2), scale: ValueId(3), block_size: 32 }, // [4] apply per-block scale
                     ],
                 },
@@ -1464,7 +1464,7 @@ impl ScalarOpRegistry {
         // SymExec 对 `causal: u32` 分支 + 三层循环 (t, c, k) 处理精度不足,
         // 直接注入 manual Injective trace (标记 2 输入 1 输出),
         // codegen lower 路径待真实 SIMD 实现后续补齐 (当前 Err 占位)。
-        // fn_ptr 指向 scalar_depthwise_conv1d — 仅供 Phase 0 数值 ground truth / 测试,
+        // fn_ptr 指向 scalar_depthwise_conv1d — 仅供 Scalar + SymExec 数值 ground truth / 测试,
         // 禁止运行时调用 (CLAUDE.md NO_SCALAR)。
         let dw_sig = ScalarFnSignature {
             fn_ptr: crate::scalar_ops::depthwise_conv1d::scalar_depthwise_conv1d as *const u8,
@@ -1506,7 +1506,7 @@ impl ScalarOpRegistry {
         // SymExec 对五层嵌套循环 (p_row × p_col × e × c × kr × kc) 无法提取
         // 结构化 trace, 直接注入 manual Injective trace (标记 2 输入 1 输出);
         // codegen lower 路径待真实 SIMD 实现后续补齐 (当前 Err 占位)。
-        // fn_ptr 指向 scalar_patch_embed — 仅供 Phase 0 数值 ground truth / 测试,
+        // fn_ptr 指向 scalar_patch_embed — 仅供 Scalar + SymExec 数值 ground truth / 测试,
         // 禁止运行时调用 (CLAUDE.md NO_SCALAR)。
         let pe_sig = ScalarFnSignature {
             fn_ptr: crate::scalar_ops::patch_embed::scalar_patch_embed as *const u8,
@@ -1549,7 +1549,7 @@ impl ScalarOpRegistry {
         // 注入 BinaryElementwise trace 以便 codegen fallback 走通用 elementwise
         // 路径 (复用 emit_elementwise_inline); 本任务阶段仍在 emit_standalone_op
         // 显式返回 Err 占位 (待后续任务打通真实 lower 路径)。
-        // fn_ptr 指向 scalar_learned_pos_2d — 仅供 Phase 0 数值 ground truth / 测试,
+        // fn_ptr 指向 scalar_learned_pos_2d — 仅供 Scalar + SymExec 数值 ground truth / 测试,
         // 禁止运行时调用 (CLAUDE.md NO_SCALAR)。
         let lp_sig = ScalarFnSignature {
             fn_ptr: crate::scalar_ops::learned_pos_2d::scalar_learned_pos_2d as *const u8,
@@ -1585,7 +1585,7 @@ impl ScalarOpRegistry {
         // ── MoEDispatchPacked (OpenAI gpt-oss-20b packed-expert + mxfp4 MoE) ──
         // Composite opaque op: index dispatch + mxfp4 dequant + clipped SwiGLU +
         // down GEMV + weighted accumulate。registry 只挂标量参考 `scalar_moe_dispatch_packed`
-        // 作为 Phase 0 ground truth (NOT runtime callable — CLAUDE.md NO_SCALAR)。
+        // 作为 Scalar + SymExec ground truth (NOT runtime callable — CLAUDE.md NO_SCALAR)。
         // JIT codegen 走 plan_lower::lower_moe_dispatch_packed 专用分支 (类似
         // MultiHeadAttention / Gather / AltUp),不依赖 OpTrace。
         let moe_dp_sig = ScalarFnSignature {
@@ -1699,6 +1699,7 @@ impl ScalarOpRegistry {
                     embed_dim: 0,
                     index_dim: SymDim::Concrete(0),
                     indices_kind: crate::compiler::graph::GatherIndicesKind::Tensor,
+                    scale: None,
                 },
                 pattern: ComputePattern::Injective {
                     body: vec![
@@ -1774,7 +1775,7 @@ impl ScalarOpRegistry {
         reg.inject_trace(
             OpKindKey::QuantGather,
             OpTrace {
-                op_kind: OpKind::QuantGather { quant_type: crate::quant::QuantType::Q4_0, vocab_size: 0, hidden_dim: 0, index_dim: crate::compiler::graph::SymDim::Concrete(1) },
+                op_kind: OpKind::QuantGather { quant_type: crate::quant::QuantType::Q4_0, vocab_size: 0, hidden_dim: 0, index_dim: crate::compiler::graph::SymDim::Concrete(1), scale: None },
                 pattern: ComputePattern::Injective {
                     body: build_quant_gather_trace(crate::quant::QuantType::Q4_0, 0, 0),
                     num_inputs: 3,

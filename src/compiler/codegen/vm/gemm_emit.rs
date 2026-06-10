@@ -185,7 +185,8 @@ pub(crate) fn emit_gemm_inline_with_hook<'a>(
 /// GEMM BLIS 内联 (mr×nr 微内核)。
 ///
 /// 仅在 m 为 Concrete (非 Symbolic) 时调用。M 维度编译时展开。
-/// `pack_map`: B-matrix 权重的虚拟 pack 映射 (§0.2.7)，None = RowMajor 直读。
+/// `pack_map`: 预留参数，未来物理重打包 (QuantGather) 实现后用于 B-matrix stride。
+/// 当前 B-matrix 始终按 row-major stride (n * elem_bytes) 寻址。
 pub(crate) fn emit_gemm_blis_inline(
     prog: &mut VmProgram,
     m: usize, n: usize, k: usize,
@@ -204,16 +205,11 @@ pub(crate) fn emit_gemm_blis_inline(
 
     // mr×nr 累加器
     let num_acc = mr * nr;
-    let accs: Vec<VRegId> = (0..num_acc.min(12))
+    let accs: Vec<VRegId> = (0..num_acc)
         .map(|_| prog.alloc_vreg(VRegKind::Vec, width))
         .collect();
     let a_broadcast = prog.alloc_vreg(VRegKind::Vec, width);
     let b_vec = prog.alloc_vreg(VRegKind::Vec, width);
-
-    let blis_fma_body: Vec<TraceOp> = vec![
-        TraceOp::Input(0), TraceOp::Input(1), TraceOp::Input(2),
-        TraceOp::Fma(ValueId(0), ValueId(1), ValueId(2)),
-    ];
 
     // IR loop: i in 0..m step mr (M is Concrete, compile-time unroll)
     for i_block in (0..m).step_by(mr) {
@@ -228,9 +224,11 @@ pub(crate) fn emit_gemm_blis_inline(
             let k_unroll = unroll_factor.max(1).min(k);
             let k_step = elem * k_unroll;
             let k_iters = (k + k_unroll - 1) / k_unroll;
-            let b_row_stride: usize = if trans_b { elem } else {
-                pack_map.map(|pm| pm.blis_k_stride_bytes(n, elem)).unwrap_or_else(|| n * elem)
-            };
+            // B-matrix row stride in bytes. Row-major: n * elem_bytes.
+            // pack_map stride (e.g. PanelPack nr*elem) applies only when B has been
+            // physically repacked — which no runtime step currently does.
+            // Until a QuantGather-style repack is implemented, always use n * elem.
+            let b_row_stride: usize = if trans_b { elem } else { n * elem };
             let b_col_stride: usize = if trans_b { k * elem } else { elem };
             prog.emit_loop(BoundExpr::Const(k_iters), k_step, |prog, k_ctr, k_off| {
                 for u in 0..k_unroll {
@@ -258,9 +256,14 @@ pub(crate) fn emit_gemm_blis_inline(
                                     ),
                                     width, dtype,
                                 });
-                                super::auto_select::auto_lower_trace_into(
-                                    prog, &blis_fma_body, &[a_broadcast, b_vec, accs[acc_idx]], accs[acc_idx], width, QuantPrecision::F32,
-                                ).expect("emit_gemm_blis_inline: FMA auto_lower invariant violation");
+                                // Direct FMA: dst = acc + a * b (in-place accumulate)
+                                prog.emit(VmInstr::Fma {
+                                    dst: accs[acc_idx],
+                                    acc: accs[acc_idx],
+                                    a: a_broadcast,
+                                    b: b_vec,
+                                    dtype,
+                                });
                             }
                         }
                     }
@@ -887,10 +890,6 @@ pub(crate) fn emit_gemm_trans_b_inline(
     let s_acc = prog.alloc_vreg(VRegKind::Vec, s_width);
     let s_tail = prog.alloc_vreg(VRegKind::Vec, s_width);
 
-    let fma_body: Vec<TraceOp> = vec![
-        TraceOp::Input(0), TraceOp::Input(1), TraceOp::Input(2),
-        TraceOp::Fma(ValueId(0), ValueId(1), ValueId(2)),
-    ];
 
     // j loop uses emit_loop to avoid compile-time unrolling (n can be 576/1536).
     let emit_j_loop = |prog: &mut VmProgram, m_off: OffsetExpr| {
@@ -930,9 +929,8 @@ pub(crate) fn emit_gemm_trans_b_inline(
                         ),
                         width, dtype,
                     });
-                    super::auto_select::auto_lower_trace_into(
-                        prog, &fma_body, &[a_vec, b_vec, acc_vec], acc_vec, width, QuantPrecision::F32,
-                    ).expect("trans_b GEMM FMA");
+                    // Direct FMA: dst = acc + a * b (in-place accumulate)
+                    prog.emit(VmInstr::Fma { dst: acc_vec, acc: acc_vec, a: a_vec, b: b_vec, dtype });
                 });
             }
 
@@ -960,13 +958,8 @@ pub(crate) fn emit_gemm_trans_b_inline(
                         )),
                         width: s_width, dtype,
                     });
-                    let tail_fma: Vec<TraceOp> = vec![
-                        TraceOp::Input(0), TraceOp::Input(1), TraceOp::Input(2),
-                        TraceOp::Fma(ValueId(0), ValueId(1), ValueId(2)),
-                    ];
-                    super::auto_select::auto_lower_trace_into(
-                        prog, &tail_fma, &[s_acc, s_b, s_tail], s_tail, s_width, QuantPrecision::F32,
-                    ).expect("trans_b GEMM tail FMA");
+                    // Direct FMA: s_tail = s_tail + s_acc * s_b
+                    prog.emit(VmInstr::Fma { dst: s_tail, acc: s_tail, a: s_acc, b: s_b, dtype });
                 }
             }
 
@@ -979,7 +972,7 @@ pub(crate) fn emit_gemm_trans_b_inline(
                     TraceOp::Input(0), TraceOp::Input(1), TraceOp::Add(ValueId(0), ValueId(1)),
                 ];
                 super::auto_select::auto_lower_trace_into(
-                    prog, &add_body, &[reduced, s_tail], sum, s_width, QuantPrecision::F32,
+                    prog, &add_body, &[reduced, s_tail], sum, s_width, dtype,
                 ).expect("trans_b GEMM add tail");
                 sum
             } else {
@@ -1089,14 +1082,6 @@ pub(crate) fn emit_gemm_inline_with_epilogue(
         (acc, a_broadcast, b_vec) // 未使用时复用,避免 alloc
     };
 
-    // TraceOp body for GEMM inner FMA: acc = a * b + acc
-    let gemm_fma_body: Vec<TraceOp> = vec![
-        TraceOp::Input(0),  // [0] a_broadcast
-        TraceOp::Input(1),  // [1] b_vec
-        TraceOp::Input(2),  // [2] acc
-        TraceOp::Fma(ValueId(0), ValueId(1), ValueId(2)), // [3] new_acc = a * b + acc
-    ];
-
     // Unified M-loop body shared by both Symbolic and Concrete M dimensions.
     // Only the outer loop bound differs; inner j/k loops + tail handling identical.
     let m_bound = if m_dim.is_symbolic() {
@@ -1122,8 +1107,8 @@ pub(crate) fn emit_gemm_inline_with_epilogue(
                         offset: b_offset_expr(k_ctr, k_off, j_off, b_row_stride, elem, n, k, trans_b, lanes),
                         width, dtype,
                     });
-                    super::auto_select::auto_lower_trace_into(prog, &gemm_fma_body, &[a_broadcast, b_vec, acc], acc, width, QuantPrecision::F32)
-                        .expect("emit_gemm_inline_with_epilogue: FMA auto_lower invariant violation");
+                    // Direct FMA: dst = acc + a * b (in-place accumulate)
+                    prog.emit(VmInstr::Fma { dst: acc, acc, a: a_broadcast, b: b_vec, dtype });
                 });
                 if !epilogue.is_empty() && do_epilogue_inline {
                     lower::lower_trace_body_compat(prog, epilogue, acc, None, width)
@@ -1173,8 +1158,8 @@ pub(crate) fn emit_gemm_inline_with_epilogue(
                         },
                         width: s_width, dtype,
                     });
-                    super::auto_select::auto_lower_trace_into(prog, &gemm_fma_body, &[s_a, s_b, s_acc], s_acc, s_width, QuantPrecision::F32)
-                        .expect("emit_gemm_inline_with_epilogue: tail FMA auto_lower invariant violation");
+                    // Direct FMA: dst = s_acc + s_a * s_b (in-place accumulate)
+                    prog.emit(VmInstr::Fma { dst: s_acc, acc: s_acc, a: s_a, b: s_b, dtype });
                 });
                 if !epilogue.is_empty() && do_epilogue_inline {
                     lower::lower_trace_body_compat(prog, epilogue, s_acc, None, s_width)
@@ -1409,7 +1394,7 @@ mod template_tests {
         let a = prog.alloc_vreg(VRegKind::Ptr, width);
         let b = prog.alloc_vreg(VRegKind::Ptr, width);
         let c = prog.alloc_vreg(VRegKind::Ptr, width);
-        let sym_map = SymDimSlotMap::default_abi();
+        let sym_map = SymDimSlotMap::mega_kernel_abi();
 
         let result = emit_gemm_inline_with_epilogue(
             &mut prog, &SymDim::Concrete(0), 4, 4, width, a, b, c, &[], &sym_map, false, None, dtype, false, crate::compiler::codegen::vm::isa_hook::EpiloguePlace::OnAccumulators,
@@ -1425,7 +1410,7 @@ mod template_tests {
         let a = prog.alloc_vreg(VRegKind::Ptr, width);
         let b = prog.alloc_vreg(VRegKind::Ptr, width);
         let c = prog.alloc_vreg(VRegKind::Ptr, width);
-        let sym_map = SymDimSlotMap::default_abi();
+        let sym_map = SymDimSlotMap::mega_kernel_abi();
 
         let result = emit_gemm_inline_with_epilogue(
             &mut prog, &SymDim::Concrete(4), 0, 4, width, a, b, c, &[], &sym_map, false, None, dtype, false, crate::compiler::codegen::vm::isa_hook::EpiloguePlace::OnAccumulators,
@@ -1441,7 +1426,7 @@ mod template_tests {
         let a = prog.alloc_vreg(VRegKind::Ptr, width);
         let b = prog.alloc_vreg(VRegKind::Ptr, width);
         let c = prog.alloc_vreg(VRegKind::Ptr, width);
-        let sym_map = SymDimSlotMap::default_abi();
+        let sym_map = SymDimSlotMap::mega_kernel_abi();
 
         let result = emit_gemm_inline_with_epilogue(
             &mut prog, &SymDim::Concrete(4), 4, 0, width, a, b, c, &[], &sym_map, false, None, dtype, false, crate::compiler::codegen::vm::isa_hook::EpiloguePlace::OnAccumulators,
@@ -1490,7 +1475,7 @@ mod template_tests {
         let a = prog.alloc_vreg(VRegKind::Ptr, width);
         let b = prog.alloc_vreg(VRegKind::Ptr, width);
         let c = prog.alloc_vreg(VRegKind::Ptr, width);
-        let sym_map = SymDimSlotMap::default_abi();
+        let sym_map = SymDimSlotMap::mega_kernel_abi();
 
         let result = emit_gemm_inline_with_epilogue(
             &mut prog, &SymDim::Concrete(2), 8, 8, width, a, b, c, &[], &sym_map, false, None, dtype, false, crate::compiler::codegen::vm::isa_hook::EpiloguePlace::OnAccumulators,
@@ -1805,7 +1790,7 @@ mod template_tests {
         let a = prog.alloc_vreg(VRegKind::Ptr, width);
         let b = prog.alloc_vreg(VRegKind::Ptr, width);
         let c = prog.alloc_vreg(VRegKind::Ptr, width);
-        let sym_map = SymDimSlotMap::default_abi();
+        let sym_map = SymDimSlotMap::mega_kernel_abi();
 
         let result = emit_gemm_trans_b_inline(
             &mut prog, &SymDim::Concrete(4), 8, 0, width, a, b, c, &[], &sym_map, None, QuantPrecision::F32,
@@ -1881,7 +1866,7 @@ mod template_tests {
         let a = prog.alloc_vreg(VRegKind::Ptr, width);
         let b = prog.alloc_vreg(VRegKind::Ptr, width);
         let c = prog.alloc_vreg(VRegKind::Ptr, width);
-        let sym_map = SymDimSlotMap::default_abi();
+        let sym_map = SymDimSlotMap::mega_kernel_abi();
 
         // Act
         let result = emit_gemm_trans_b_inline(
@@ -1900,7 +1885,7 @@ mod template_tests {
         let a = prog.alloc_vreg(VRegKind::Ptr, width);
         let b = prog.alloc_vreg(VRegKind::Ptr, width);
         let c = prog.alloc_vreg(VRegKind::Ptr, width);
-        let sym_map = SymDimSlotMap::default_abi();
+        let sym_map = SymDimSlotMap::mega_kernel_abi();
 
         // Act
         let result = emit_gemm_trans_b_inline(
@@ -1919,7 +1904,7 @@ mod template_tests {
         let a = prog.alloc_vreg(VRegKind::Ptr, width);
         let b = prog.alloc_vreg(VRegKind::Ptr, width);
         let c = prog.alloc_vreg(VRegKind::Ptr, width);
-        let sym_map = SymDimSlotMap::default_abi();
+        let sym_map = SymDimSlotMap::mega_kernel_abi();
 
         // Act: M=2, N=8, K=16 with trans_b path
         let result = emit_gemm_trans_b_inline(
@@ -1962,7 +1947,7 @@ mod template_tests {
         let a = prog.alloc_vreg(VRegKind::Ptr, width);
         let b = prog.alloc_vreg(VRegKind::Ptr, width);
         let c = prog.alloc_vreg(VRegKind::Ptr, width);
-        let sym_map = SymDimSlotMap::default_abi();
+        let sym_map = SymDimSlotMap::mega_kernel_abi();
         let m_dim = SymDim::Symbolic { name: "seq_len".into(), max_value: Some(512) };
 
         // Act: symbolic M with concrete N=8, K=16
@@ -2261,9 +2246,9 @@ mod template_tests {
     }
 
     #[test]
-    fn test_sym_dim_slot_map_default_abi_has_seq_len_slot() {
+    fn test_sym_dim_slot_map_mega_kernel_abi_has_seq_len_slot() {
         // Arrange: default ABI slot map (standard calling convention slots)
-        let map = SymDimSlotMap::default_abi();
+        let map = SymDimSlotMap::mega_kernel_abi();
 
         // Act: look up "seq_len" — the most fundamental symbolic dimension
         let dim = SymDim::Symbolic { name: "seq_len".into(), max_value: Some(512) };
@@ -2292,7 +2277,7 @@ mod template_tests {
         let a = prog.alloc_vreg(VRegKind::Ptr, width);
         let b = prog.alloc_vreg(VRegKind::Ptr, width);
         let c = prog.alloc_vreg(VRegKind::Ptr, width);
-        let sym_map = SymDimSlotMap::default_abi();
+        let sym_map = SymDimSlotMap::mega_kernel_abi();
 
         // Act
         let result = emit_gemm_inline_with_epilogue(
@@ -2316,7 +2301,7 @@ mod template_tests {
         let a = prog.alloc_vreg(VRegKind::Ptr, width);
         let b = prog.alloc_vreg(VRegKind::Ptr, width);
         let c = prog.alloc_vreg(VRegKind::Ptr, width);
-        let sym_map = SymDimSlotMap::default_abi();
+        let sym_map = SymDimSlotMap::mega_kernel_abi();
         let m_dim = SymDim::Symbolic { name: "seq_len".into(), max_value: Some(128) };
 
         // Act
@@ -2347,7 +2332,7 @@ mod template_tests {
         let a = prog.alloc_vreg(VRegKind::Ptr, width);
         let b = prog.alloc_vreg(VRegKind::Ptr, width);
         let c = prog.alloc_vreg(VRegKind::Ptr, width);
-        let sym_map = SymDimSlotMap::default_abi();
+        let sym_map = SymDimSlotMap::mega_kernel_abi();
 
         // Act: K=13 not divisible by lanes=8, so k_tail=5
         let result = emit_gemm_trans_b_inline(
@@ -2368,7 +2353,7 @@ mod template_tests {
         let a = prog.alloc_vreg(VRegKind::Ptr, width);
         let b = prog.alloc_vreg(VRegKind::Ptr, width);
         let c = prog.alloc_vreg(VRegKind::Ptr, width);
-        let sym_map = SymDimSlotMap::default_abi();
+        let sym_map = SymDimSlotMap::mega_kernel_abi();
         let epilogue: Vec<TraceOp> = vec![
             TraceOp::Input(0),
             TraceOp::Const(1.0),
@@ -2415,7 +2400,7 @@ mod template_tests {
         let a = prog.alloc_vreg(VRegKind::Ptr, width);
         let b = prog.alloc_vreg(VRegKind::Ptr, width);
         let c = prog.alloc_vreg(VRegKind::Ptr, width);
-        let sym_map = SymDimSlotMap::default_abi();
+        let sym_map = SymDimSlotMap::mega_kernel_abi();
 
         // Act: trans_b=true triggers the trans-B routing path
         let result = emit_gemm_inline_with_epilogue(
@@ -2438,7 +2423,7 @@ mod template_tests {
         let a = prog.alloc_vreg(VRegKind::Ptr, width);
         let b = prog.alloc_vreg(VRegKind::Ptr, width);
         let c = prog.alloc_vreg(VRegKind::Ptr, width);
-        let sym_map = SymDimSlotMap::default_abi();
+        let sym_map = SymDimSlotMap::mega_kernel_abi();
 
         // Act: N=3 < lanes=8, only scalar tail path runs
         let result = emit_gemm_inline_with_epilogue(
@@ -2502,7 +2487,7 @@ mod template_tests {
         let a = prog.alloc_vreg(VRegKind::Ptr, width);
         let b = prog.alloc_vreg(VRegKind::Ptr, width);
         let c = prog.alloc_vreg(VRegKind::Ptr, width);
-        let sym_map = SymDimSlotMap::default_abi();
+        let sym_map = SymDimSlotMap::mega_kernel_abi();
         let epilogue: Vec<TraceOp> = vec![
             TraceOp::Input(0),
             TraceOp::Const(1.0),
@@ -2605,7 +2590,7 @@ mod template_tests {
         let a = prog.alloc_vreg(VRegKind::Ptr, width);
         let b = prog.alloc_vreg(VRegKind::Ptr, width);
         let c = prog.alloc_vreg(VRegKind::Ptr, width);
-        let sym_map = SymDimSlotMap::default_abi();
+        let sym_map = SymDimSlotMap::mega_kernel_abi();
 
         // Act: K=16 / lanes=8 = 2 exactly, no k_tail
         let result = emit_gemm_trans_b_inline(
@@ -2630,7 +2615,7 @@ mod template_tests {
         let a = prog.alloc_vreg(VRegKind::Ptr, width);
         let b = prog.alloc_vreg(VRegKind::Ptr, width);
         let c = prog.alloc_vreg(VRegKind::Ptr, width);
-        let sym_map = SymDimSlotMap::default_abi();
+        let sym_map = SymDimSlotMap::mega_kernel_abi();
 
         // Act: M=1 single-row decode GEMM
         let result = emit_gemm_inline_with_epilogue(
@@ -2784,7 +2769,7 @@ mod template_tests {
         let a = prog.alloc_vreg(VRegKind::Ptr, width);
         let b = prog.alloc_vreg(VRegKind::Ptr, width);
         let c = prog.alloc_vreg(VRegKind::Ptr, width);
-        let sym_map = SymDimSlotMap::default_abi();
+        let sym_map = SymDimSlotMap::mega_kernel_abi();
 
         // Act: BF16 with N=16 -> n_vecs=2, n_tail=0; BF16 accumulator widens to F32
         let result = emit_gemm_inline_with_epilogue(
@@ -2885,7 +2870,7 @@ mod template_tests {
         let a = prog.alloc_vreg(VRegKind::Ptr, width);
         let b = prog.alloc_vreg(VRegKind::Ptr, width);
         let c = prog.alloc_vreg(VRegKind::Ptr, width);
-        let sym_map = SymDimSlotMap::default_abi();
+        let sym_map = SymDimSlotMap::mega_kernel_abi();
 
         // Act: BF16 with N=12 produces both vectorized + scalar tail paths
         let result = emit_gemm_inline_with_epilogue(
@@ -2978,7 +2963,7 @@ mod template_tests {
         let a = prog.alloc_vreg(VRegKind::Ptr, width);
         let b = prog.alloc_vreg(VRegKind::Ptr, width);
         let c = prog.alloc_vreg(VRegKind::Ptr, width);
-        let sym_map = SymDimSlotMap::default_abi();
+        let sym_map = SymDimSlotMap::mega_kernel_abi();
 
         // Act: 1×1×1 GEMV (single dot product)
         let result = emit_gemm_trans_b_inline(
@@ -3053,7 +3038,7 @@ mod template_tests {
         let a2 = prog_w256.alloc_vreg(VRegKind::Ptr, width_256);
         let b2 = prog_w256.alloc_vreg(VRegKind::Ptr, width_256);
         let c2 = prog_w256.alloc_vreg(VRegKind::Ptr, width_256);
-        let sym_map = SymDimSlotMap::default_abi();
+        let sym_map = SymDimSlotMap::mega_kernel_abi();
 
         // Act: M=2, N=16, K=8 with both widths
         let r128 = emit_gemm_inline_with_epilogue(
@@ -3101,7 +3086,7 @@ mod template_tests {
         let a2 = prog_bf16.alloc_vreg(VRegKind::Ptr, width);
         let b2 = prog_bf16.alloc_vreg(VRegKind::Ptr, width);
         let c2 = prog_bf16.alloc_vreg(VRegKind::Ptr, width);
-        let sym_map = SymDimSlotMap::default_abi();
+        let sym_map = SymDimSlotMap::mega_kernel_abi();
 
         // Act: M=2, N=8, K=8
         let r_f32 = emit_gemm_inline_with_epilogue(
@@ -3186,7 +3171,7 @@ mod template_tests {
         let a = prog.alloc_vreg(VRegKind::Ptr, width);
         let b = prog.alloc_vreg(VRegKind::Ptr, width);
         let c = prog.alloc_vreg(VRegKind::Ptr, width);
-        let sym_map = SymDimSlotMap::default_abi();
+        let sym_map = SymDimSlotMap::mega_kernel_abi();
         let m_dim = SymDim::Symbolic { name: "seq_len".into(), max_value: Some(1024) };
         let override_bound = BoundExpr::Const(64);
 
@@ -3254,7 +3239,7 @@ mod template_tests {
         let a = prog.alloc_vreg(VRegKind::Ptr, width);
         let b = prog.alloc_vreg(VRegKind::Ptr, width);
         let c = prog.alloc_vreg(VRegKind::Ptr, width);
-        let sym_map = SymDimSlotMap::default_abi();
+        let sym_map = SymDimSlotMap::mega_kernel_abi();
 
         // Act: N=8 = lanes=8 -> n_vecs=1, n_tail=0
         let result = emit_gemm_inline_with_epilogue(
@@ -3333,7 +3318,7 @@ mod template_tests {
         let a = prog.alloc_vreg(VRegKind::Ptr, width);
         let b = prog.alloc_vreg(VRegKind::Ptr, width);
         let c = prog.alloc_vreg(VRegKind::Ptr, width);
-        let sym_map = SymDimSlotMap::default_abi();
+        let sym_map = SymDimSlotMap::mega_kernel_abi();
         let epilogue: Vec<TraceOp> = vec![
             TraceOp::Input(0),
             TraceOp::Const(0.5),
@@ -3406,7 +3391,7 @@ mod template_tests {
         let a = prog.alloc_vreg(VRegKind::Ptr, width);
         let b = prog.alloc_vreg(VRegKind::Ptr, width);
         let c = prog.alloc_vreg(VRegKind::Ptr, width);
-        let sym_map = SymDimSlotMap::default_abi();
+        let sym_map = SymDimSlotMap::mega_kernel_abi();
         let m_dim = SymDim::Symbolic { name: "seq_len".into(), max_value: Some(256) };
 
         // Act: no seq_bound_override — must use sym_map.to_bound()
@@ -3550,7 +3535,7 @@ mod template_tests {
         let a = prog.alloc_vreg(VRegKind::Ptr, width);
         let b = prog.alloc_vreg(VRegKind::Ptr, width);
         let c = prog.alloc_vreg(VRegKind::Ptr, width);
-        let sym_map = SymDimSlotMap::default_abi();
+        let sym_map = SymDimSlotMap::mega_kernel_abi();
         let m_dim = SymDim::Symbolic { name: "seq_len".into(), max_value: Some(2048) };
         let override_bound = BoundExpr::Const(1); // Override to M=1 (decode path)
 

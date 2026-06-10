@@ -34,7 +34,7 @@ pub enum BottleneckType {
 ///
 /// 编码计算策略的意图，由 DeviceProfile 决定具体物化方式。
 /// R0 PainPointAnalyzer 根据 (GemmShape × BottleneckType × DeviceProfile) 推导，
-/// Phase 3 codegen 消费此字段选择物化策略。
+/// ISA Lowering codegen 消费此字段选择物化策略。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ExecPattern {
     /// 分块 GEMM: 最大化计算吞吐 (compute-bound 大矩阵)

@@ -45,6 +45,7 @@ pub mod algo_interpreter;
 pub mod algo_registry;
 pub mod debug_map;
 pub mod mega_kernel_emit;
+pub mod topology;
 pub mod dispatch_emit;
 pub mod vision_audio_emit;
 pub mod hetero_emit;

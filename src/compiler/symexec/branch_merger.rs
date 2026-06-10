@@ -1,6 +1,6 @@
 //! Diamond-branch detection and Select-node merging.
 //!
-//! Phase 4 of the control-flow upgrade: detects "diamond" patterns in the CFG
+//! Step 4 of the control-flow upgrade: detects "diamond" patterns in the CFG
 //! (compare → conditional branch → two short paths → merge point) and merges
 //! them into `SymValue::Select` nodes. The simplifier then reduces
 //! `Select(a > b, a, b) → Max(a, b)` etc.

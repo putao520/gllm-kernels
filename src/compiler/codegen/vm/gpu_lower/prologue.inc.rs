@@ -292,7 +292,7 @@ impl GpuLower {
                 self.emit_line(".address_size 64");
                 self.emit_line("");
                 self.emit_line(".visible .entry mega_kernel(");
-                // 21 ABI parameters matching the mega-kernel ABI
+                // 20 ABI parameters matching the mega-kernel ABI
                 self.emit_line("  .param .u64 input_ids_ptr,");
                 self.emit_line("  .param .u64 weight_blob_ptr,");
                 self.emit_line("  .param .u64 kv_cache_ptr,");
@@ -307,7 +307,6 @@ impl GpuLower {
                 self.emit_line("  .param .u32 top_p_bits,");
                 self.emit_line("  .param .u32 max_new_tokens,");
                 self.emit_line("  .param .u32 eos_token_id,");
-                self.emit_line("  .param .u32 output_mode_selector,");
                 self.emit_line("  .param .u64 hook_ctx_ptr,");
                 self.emit_line("  .param .u64 telemetry_ptr,");
                 self.emit_line("  .param .u32 session_position,");
@@ -331,7 +330,6 @@ impl GpuLower {
                 self.emit_line("ld.param.u32 %r_topp, [top_p_bits];");
                 self.emit_line("ld.param.u32 %r_maxnew, [max_new_tokens];");
                 self.emit_line("ld.param.u32 %r_eos, [eos_token_id];");
-                self.emit_line("ld.param.u32 %r_mode, [output_mode_selector];");
                 self.emit_line("ld.param.u64 %rd_hook, [hook_ctx_ptr];");
                 self.emit_line("ld.param.u64 %rd_telem, [telemetry_ptr];");
                 self.emit_line("ld.param.u32 %r_session, [session_position];");
@@ -363,7 +361,6 @@ impl GpuLower {
                 self.emit_line("  unsigned int top_p_bits,");
                 self.emit_line("  unsigned int max_new_tokens,");
                 self.emit_line("  unsigned int eos_token_id,");
-                self.emit_line("  unsigned int output_mode_selector,");
                 self.emit_line("  unsigned char* __restrict__ hook_ctx_ptr,");
                 self.emit_line("  unsigned char* __restrict__ telemetry_ptr,");
                 self.emit_line("  unsigned int session_position,");
@@ -394,13 +391,12 @@ impl GpuLower {
                 self.emit_line("  constant unsigned int& top_p_bits [[buffer(11)]],");
                 self.emit_line("  constant unsigned int& max_new_tokens [[buffer(12)]],");
                 self.emit_line("  constant unsigned int& eos_token_id [[buffer(13)]],");
-                self.emit_line("  constant unsigned int& output_mode_selector [[buffer(14)]],");
-                self.emit_line("  device unsigned char* hook_ctx_ptr [[buffer(15)]],");
-                self.emit_line("  device unsigned char* telemetry_ptr [[buffer(16)]],");
-                self.emit_line("  constant unsigned int& session_position [[buffer(17)]],");
-                self.emit_line("  device unsigned char* fused_hidden_ptr [[buffer(18)]],");
-                self.emit_line("  constant unsigned int& num_mm_tokens [[buffer(19)]],");
-                self.emit_line("  device unsigned char* callback_table_ptr [[buffer(20)]]");
+                self.emit_line("  device unsigned char* hook_ctx_ptr [[buffer(14)]],");
+                self.emit_line("  device unsigned char* telemetry_ptr [[buffer(15)]],");
+                self.emit_line("  constant unsigned int& session_position [[buffer(16)]],");
+                self.emit_line("  device unsigned char* fused_hidden_ptr [[buffer(17)]],");
+                self.emit_line("  constant unsigned int& num_mm_tokens [[buffer(18)]],");
+                self.emit_line("  device unsigned char* callback_table_ptr [[buffer(19)]]");
                 self.emit_line(") {");
                 self.indent += 1;
                 self.emit_hip_cxx_var_decls(vreg_counts);
@@ -414,7 +410,7 @@ impl GpuLower {
             "input_ids_ptr", "weight_blob_ptr", "kv_cache_ptr", "positions_ptr",
             "aux_ptr", "batch_size", "seq_len", "scratchpad_ptr", "output_tokens_ptr",
             "temperature_bits", "top_k", "top_p_bits", "max_new_tokens", "eos_token_id",
-            "output_mode_selector", "hook_ctx_ptr", "telemetry_ptr", "session_position",
+            "hook_ctx_ptr", "telemetry_ptr", "session_position",
             "fused_hidden_ptr", "num_mm_tokens", "callback_table_ptr",
         ];
         Ok(())

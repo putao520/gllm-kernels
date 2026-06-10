@@ -54,7 +54,7 @@ impl FwhtEpilogueFusion {
         out.push_str("    }\n");
     }
 
-    /// 生成 x86_64 scalar FWHT（Phase 0 参考实现，供 SymExec trace 提取）
+    /// 生成 x86_64 scalar FWHT（Scalar + SymExec 参考实现，供 SymExec trace 提取）
     pub fn scalar_fwht_inplace(data: &mut [f32]) {
         let n = data.len();
         debug_assert!(n.is_power_of_two());
