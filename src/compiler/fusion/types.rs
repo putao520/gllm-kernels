@@ -194,6 +194,25 @@ impl FusionPlan {
             .map(|g| g.ops.len())
             .sum()
     }
+
+    /// Validate that no fusion group exceeds the register pressure limit
+    /// (REQ-FUSION-DEEP-001).
+    ///
+    /// Returns `Err` with the violating group ID if any group's estimated
+    /// register pressure exceeds `register_limit`. Otherwise returns `Ok(())`.
+    pub fn validate_register_pressure(
+        &self,
+        register_pressure_fn: &dyn Fn(&FusionGroup) -> usize,
+        register_limit: usize,
+    ) -> Result<(), usize> {
+        for group in &self.groups {
+            let pressure = register_pressure_fn(group);
+            if pressure > register_limit {
+                return Err(group.id);
+            }
+        }
+        Ok(())
+    }
 }
 
 impl std::fmt::Display for FusionPlan {
@@ -228,6 +247,50 @@ pub struct FusionCost {
     /// `benefit = bytes_saved - penalty`, where penalty accounts for register
     /// spill cost and scratch buffer overhead.
     pub benefit: i64,
+}
+
+/// Compute density classification for a fusion group (REQ-FUSION-DEEP-001).
+///
+/// Ratio = FLOPs / bytes_accessed. Determines whether a group is
+/// compute-bound (high density, benefits from wide SIMD + register tiling)
+/// or memory-bound (low density, benefits from software prefetch + L1 tiling).
+///
+/// Formula: `density = total_flops / max(input_bytes, output_bytes)`
+///
+/// - `>= 10.0`: ComputeBound — fusion adds register pressure but saves memory traffic
+/// - `1.0..10.0`: Balanced — fusion profitable when bytes_saved > register_spill_cost
+/// - `< 1.0`: MemoryBound — fusion is always profitable (eliminates writeback)
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct ComputeDensity {
+    /// FLOPs per byte accessed.
+    pub ratio: f64,
+}
+
+impl ComputeDensity {
+    /// Compute from raw FLOP and byte counts.
+    pub fn from_flops_and_bytes(flops: u64, bytes_accessed: u64) -> Self {
+        let ratio = if bytes_accessed == 0 {
+            f64::INFINITY
+        } else {
+            flops as f64 / bytes_accessed as f64
+        };
+        Self { ratio }
+    }
+
+    /// Classify as compute-bound (ratio >= 10.0).
+    pub fn is_compute_bound(&self) -> bool {
+        self.ratio >= 10.0
+    }
+
+    /// Classify as memory-bound (ratio < 1.0).
+    pub fn is_memory_bound(&self) -> bool {
+        self.ratio < 1.0
+    }
+
+    /// Classify as balanced (1.0 <= ratio < 10.0).
+    pub fn is_balanced(&self) -> bool {
+        self.ratio >= 1.0 && self.ratio < 10.0
+    }
 }
 
 #[cfg(test)]

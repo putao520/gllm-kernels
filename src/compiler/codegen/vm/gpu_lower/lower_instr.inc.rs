@@ -404,24 +404,30 @@ impl GpuLower {
                         self.emit_line(&format!("tcgen05.alloc.cta_group::1.sync.aligned.shared::cta.b32 [%smem_tmem_addr], {tmem_cols};"));
                         self.emit_line("mov.b32 %tmem_addr, %smem_tmem_addr;");
                         self.tmem_allocated = true;
-                        // SPEC 15 REQ-JCTX-012: TMEM 资源追踪
-                        let _ = self.jit_ctx.allocate(
+                        // SPEC 15 REQ-JCTX-012: TMEM alloc 通过 JitContext, 超限返回 ResourceBudgetExceeded
+                        self.jit_ctx.allocate(
                             crate::compiler::jit_context::ResourceKind::Tile,
                             "tmem_sm100",
-                        );
+                        ).map_err(|e| CompilerError::CodegenViolation(
+                            format!("GPU TileConfig TMEM: {}", e)
+                        ))?;
                     } else if v >= 90 {
                         // SM90 Hopper: mbarrier 初始化
                         self.emit_line("// §SM90 WGMMA: init mbarrier for async pipeline");
                         self.emit_line("mbarrier.init.shared.b64 [mbar], 1;");
-                        // SPEC 15 REQ-JCTX-012: Barrier + TileAccumulator 追踪
-                        let _ = self.jit_ctx.allocate(
+                        // SPEC 15 REQ-JCTX-012: Barrier + TileAccumulator alloc 通过 JitContext
+                        self.jit_ctx.allocate(
                             crate::compiler::jit_context::ResourceKind::Barrier,
                             "mbarrier_wgmma",
-                        );
-                        let _ = self.jit_ctx.allocate(
+                        ).map_err(|e| CompilerError::CodegenViolation(
+                            format!("GPU TileConfig Barrier: {}", e)
+                        ))?;
+                        self.jit_ctx.allocate(
                             crate::compiler::jit_context::ResourceKind::TileAccumulator,
                             "wgmma_fragment",
-                        );
+                        ).map_err(|e| CompilerError::CodegenViolation(
+                            format!("GPU TileConfig TileAccumulator: {}", e)
+                        ))?;
                     } else if v >= 70 {
                         self.emit_line(&format!("// §SM{v} TileConfig {rows}×{cols} {dtype:?}"));
                     }

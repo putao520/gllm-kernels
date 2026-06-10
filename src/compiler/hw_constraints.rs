@@ -196,7 +196,7 @@ impl<'a> HwConstraintChecker<'a> {
     /// Validate GPU shared memory constraints for tensor core GEMM fusion.
     ///
     /// When a JitContext is provided (SPEC 15 REQ-JCTX-014), uses its
-    /// available(SharedMem) as the budget instead of re-reading from
+    /// mem_available(SharedMem) as the budget instead of re-reading from
     /// HardwareProfile.
     pub fn validate_gpu_shared_mem(
         &self,
@@ -205,8 +205,8 @@ impl<'a> HwConstraintChecker<'a> {
         jit_ctx: Option<&crate::compiler::jit_context::JitContext>,
     ) -> Result<(), ConstraintViolation> {
         let smem = if let Some(ctx) = jit_ctx {
-            // SPEC 15 REQ-JCTX-014: 从 JitContext 查询可用共享内存
-            ctx.available(crate::compiler::jit_context::ResourceKind::SharedMem)
+            // SPEC 15 REQ-JCTX-014: 从 JitContext 查询可用共享内存（字节）
+            ctx.mem_available(crate::compiler::jit_context::ResourceKind::SharedMem)
         } else {
             use crate::compiler::hardware_profile::HardwareProfile;
             let hw = HardwareProfile::detect(&self.plan.profile);

@@ -15,6 +15,7 @@ use super::cost_model::{chain_eliminated_bytes, estimate_fusion_cost, Cost};
 use super::pdt;
 use crate::compiler::hardware_profile::HardwareProfile;
 use crate::compiler::pain_point::OpBottleneckMap;
+use crate::compiler::jit_context::JitContext;
 
 /// Fusion pass based on SemanticDAG (convenience wrapper).
 ///
@@ -23,15 +24,17 @@ use crate::compiler::pain_point::OpBottleneckMap;
 /// the caller already has a SemanticDAG to avoid redundant construction.
 pub fn fuse_with_dag(graph: &CompilerGraph, registry: &ScalarOpRegistry, plan: &crate::compiler::planner::ExecutionPlan) -> FusionPlan {
     let dag = SemanticDAG::from_graph(graph, registry);
-    fuse_with_dag_prebuilt(graph, &dag, plan, None)
+    fuse_with_dag_prebuilt(graph, &dag, plan, None, None)
 }
 
-/// Fusion pass using a pre-built SemanticDAG + optional R0 bottleneck map.
+/// Fusion pass using a pre-built SemanticDAG + optional R0 bottleneck map
+/// + optional JitContext for resource-aware fusion decisions (SPEC 15 REQ-JCTX-014).
 pub fn fuse_with_dag_prebuilt(
     graph: &CompilerGraph,
     dag: &SemanticDAG,
     plan: &crate::compiler::planner::ExecutionPlan,
     bottleneck_map: Option<&OpBottleneckMap>,
+    jit_ctx: Option<&JitContext>,
 ) -> FusionPlan {
     let topo = graph.topological_sort();
 

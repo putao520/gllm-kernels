@@ -1170,27 +1170,27 @@ impl<'a> RegAllocator<'a> {
         super::verify::verify_after_alloc(program, &alloc, &intervals)
             .map_err(|e| format!("verify_after_alloc: {}", e))?;
 
-        // SPEC 15 REQ-JCTX-013: 预算门控 — 验证分配结果不超硬件预算
+        // SPEC 15 REQ-JCTX-013: 预算门控 — 分配上限从 JitContext.budget().capacity() 读取
         if let Some(ctx) = budget_ctx {
             use crate::compiler::jit_context::ResourceKind;
-            let gpr_budget = ctx.available(ResourceKind::Gpr);
-            let vec_budget = ctx.available(ResourceKind::SimdVec);
+            let gpr_capacity = ctx.budget().capacity(ResourceKind::Gpr);
+            let vec_capacity = ctx.budget().capacity(ResourceKind::SimdVec);
             let gpr_used_count = alloc.mapping.values()
                 .filter(|p| matches!(p, PhysReg::Gpr(_)))
                 .count();
             let vec_used_count = alloc.mapping.values()
                 .filter(|p| matches!(p, PhysReg::Vec(_)))
                 .count();
-            if gpr_used_count > gpr_budget && gpr_budget > 0 {
+            if gpr_used_count > gpr_capacity && gpr_capacity > 0 {
                 return Err(format!(
-                    "RegAllocator: GPR budget exceeded: used {} > budget {} (REQ-JCTX-013)",
-                    gpr_used_count, gpr_budget
+                    "RegAllocator: GPR budget exceeded: used {} > capacity {} (REQ-JCTX-013)",
+                    gpr_used_count, gpr_capacity
                 ));
             }
-            if vec_used_count > vec_budget && vec_budget > 0 {
+            if vec_used_count > vec_capacity && vec_capacity > 0 {
                 return Err(format!(
-                    "RegAllocator: Vec budget exceeded: used {} > budget {} (REQ-JCTX-013)",
-                    vec_used_count, vec_budget
+                    "RegAllocator: Vec budget exceeded: used {} > capacity {} (REQ-JCTX-013)",
+                    vec_used_count, vec_capacity
                 ));
             }
         }

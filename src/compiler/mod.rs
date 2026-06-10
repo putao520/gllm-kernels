@@ -400,7 +400,7 @@ impl InferenceCompiler {
         let semantic_dag = SemanticDAG::from_graph(&graph, &registry);
 
         // Fusion decisions + HW constraint validation + buffer allocation
-        let mut fusion_plan = fusion::fuse_with_dag_prebuilt(&graph, &semantic_dag, &exec_plan, None);
+        let mut fusion_plan = fusion::fuse_with_dag_prebuilt(&graph, &semantic_dag, &exec_plan, None, None);
         hw_constraints::enforce_constraints(&mut fusion_plan.groups, &graph, &exec_plan);
         let lifetimes = buffer_alloc::analyze_lifetimes(&graph, &fusion_plan, None, None);
         let alloc = buffer_alloc::allocate_buffers_aligned(&lifetimes, self.profile.hw_info.cacheline_bytes, None, None, &graph, None);
@@ -443,6 +443,21 @@ impl InferenceCompiler {
         eprintln!("[COMPILE-MEGA] compile_mega_kernel_from_graph #{}, ops={}",
             compile_id, graph.ops.len());
 
+        // REQ-DTYPE-CHAIN-005: Dtype chain validation gate.
+        // Blocks Mega-Kernel generation if dtype breakpoints are detected.
+        let dtype_validation = dtype_chain::DtypeChainValidation::validate(&graph, &DeviceProfile::detect());
+        if !dtype_validation.is_valid {
+            let details: Vec<String> = dtype_validation.breakpoints.iter()
+                .take(5)
+                .map(|bp| format!("  op '{}' tensor {:?}: expected {:?}, got {:?} — {}",
+                    bp.op_label, bp.tensor_id, bp.expected_dtype, bp.actual_dtype, bp.suggestion))
+                .collect();
+            return Err(InferenceError::CompileError(format!(
+                "DTYPE-CHAIN validation failed: {} breakpoint(s).\n{}",
+                dtype_validation.num_breakpoints, details.join("\n")
+            ).into()));
+        }
+
         // SPEC/39 REQ-UMK-001: single compilation entry point handles all graph topologies.
         // All graphs (with or without layer loops) go through compile_mega_kernel_vm.
         // Simple graphs use LoopBegin { bound: Const(1) } + LoopEnd — single iteration, zero overhead.
@@ -470,7 +485,7 @@ impl InferenceCompiler {
         let registry = ScalarOpRegistry::with_defaults();
         let semantic_dag = SemanticDAG::from_graph(&graph, &registry);
 
-        let mut fusion_plan = fusion::fuse_with_dag_prebuilt(&graph, &semantic_dag, &exec_plan, Some(bottleneck_map));
+        let mut fusion_plan = fusion::fuse_with_dag_prebuilt(&graph, &semantic_dag, &exec_plan, Some(bottleneck_map), None);
         hw_constraints::enforce_constraints(&mut fusion_plan.groups, &graph, &exec_plan);
 
         let accel_registry = accel_registry::AccelerationRegistry::new();

@@ -1353,11 +1353,13 @@ impl AArch64Lower {
                     // SME2: 初始化 PTRUE p0.s 用于后续 MOVA slice 读取
                     self.emit32(self.enc_ptrue_s(0));
                 }
-                // SPEC 15 REQ-JCTX-011: SME ZA Tile 资源追踪
-                let _ = self.jit_ctx.allocate(
+                // SPEC 15 REQ-JCTX-011: SME ZA Tile alloc 通过 JitContext, 超限返回 ResourceBudgetExceeded
+                self.jit_ctx.allocate(
                     crate::compiler::jit_context::ResourceKind::Tile,
                     "sme_za_tile",
-                );
+                ).map_err(|e| CompilerError::CodegenViolation(
+                    format!("SME TileConfig: {}", e)
+                ))?;
                 let _ = (rows, cols, dtype);
                 Ok(())
             }

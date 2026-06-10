@@ -1173,11 +1173,13 @@ impl X86Lower {
             VmInstr::TileConfig { rows, cols, dtype } => {
                 // 记录 tile dtype 供后续 TileMma 选择正确的 TDP* 指令
                 self.amx_tile_dtype = Some(*dtype);
-                // SPEC 15 REQ-JCTX-010: AMX Tile 资源追踪
-                let _ = self.jit_ctx.allocate(
+                // SPEC 15 REQ-JCTX-010: AMX Tile alloc 通过 JitContext, 超限返回 ResourceBudgetExceeded
+                self.jit_ctx.allocate(
                     crate::compiler::jit_context::ResourceKind::Tile,
                     "amx_tile",
-                );
+                ).map_err(|e| CompilerError::CodegenViolation(
+                    format!("AMX TileConfig: {}", e)
+                ))?;
 
                 // AMX palette_entry: 64 字节配置块
                 // [0]: palette = 1
