@@ -1248,7 +1248,7 @@ mod tests {
         let plan = make_plan();
 
         // Act
-        let fusion_plan = fuse_with_dag_prebuilt(&g, &dag, &plan, None);
+        let fusion_plan = fuse_with_dag_prebuilt(&g, &dag, &plan, None, None);
 
         // Assert
         assert_eq!(fusion_plan.groups.len(), 0);
@@ -1272,7 +1272,7 @@ mod tests {
         let plan = make_plan();
 
         // Act
-        let fusion_plan = fuse_with_dag_prebuilt(&g, &dag, &plan, None);
+        let fusion_plan = fuse_with_dag_prebuilt(&g, &dag, &plan, None, None);
 
         // Assert: single group, Standalone mode, contains our op
         assert_eq!(fusion_plan.num_groups(), 1);
@@ -1304,7 +1304,7 @@ mod tests {
         let plan = make_plan();
 
         // Act
-        let fusion_plan = fuse_with_dag_prebuilt(&g, &dag, &plan, None);
+        let fusion_plan = fuse_with_dag_prebuilt(&g, &dag, &plan, None, None);
 
         // Assert: single group, Standalone GEMM
         assert_eq!(fusion_plan.num_groups(), 1);
@@ -1332,7 +1332,7 @@ mod tests {
         let plan = make_plan();
 
         // Act
-        let fusion_plan = fuse_with_dag_prebuilt(&g, &dag, &plan, None);
+        let fusion_plan = fuse_with_dag_prebuilt(&g, &dag, &plan, None, None);
 
         // Assert: both ops are in the plan, each in its own group
         assert!(fusion_plan.group_of(op0).is_some());
@@ -1540,7 +1540,7 @@ mod tests {
         let dag = SemanticDAG::from_graph(&g, &reg);
         let plan = make_plan();
 
-        let fusion_plan = fuse_with_dag_prebuilt(&g, &dag, &plan, None);
+        let fusion_plan = fuse_with_dag_prebuilt(&g, &dag, &plan, None, None);
         assert_eq!(fusion_plan.num_groups(), 1);
         let group = fusion_plan.group_of(op0).unwrap();
         assert_eq!(group.mode, FusionMode::Standalone);
@@ -1561,7 +1561,7 @@ mod tests {
         let dag = SemanticDAG::from_graph(&g, &reg);
         let plan = make_plan();
 
-        let fusion_plan = fuse_with_dag_prebuilt(&g, &dag, &plan, None);
+        let fusion_plan = fuse_with_dag_prebuilt(&g, &dag, &plan, None, None);
         assert!(fusion_plan.group_of(op0).is_some());
         assert!(fusion_plan.group_of(op1).is_some());
         assert_eq!(fusion_plan.op_to_group.len(), 2);
@@ -1713,7 +1713,7 @@ mod tests {
         let plan = make_plan();
 
         // Act
-        let fusion_plan = fuse_with_dag_prebuilt(&g, &dag, &plan, None);
+        let fusion_plan = fuse_with_dag_prebuilt(&g, &dag, &plan, None, None);
 
         // Assert: single group containing the GemmBias op
         assert_eq!(fusion_plan.num_groups(), 1);
@@ -1776,7 +1776,7 @@ mod tests {
         let plan = make_plan();
 
         // Act
-        let fusion_plan = fuse_with_dag_prebuilt(&g, &dag, &plan, None);
+        let fusion_plan = fuse_with_dag_prebuilt(&g, &dag, &plan, None, None);
 
         // Assert: both ops should be present in the plan, each mapped to a group
         assert!(fusion_plan.group_of(norm).is_some());
@@ -1851,7 +1851,7 @@ mod tests {
         let plan = make_plan();
 
         // Act
-        let fusion_plan = fuse_with_dag_prebuilt(&g, &dag, &plan, None);
+        let fusion_plan = fuse_with_dag_prebuilt(&g, &dag, &plan, None, None);
 
         // Assert
         assert_eq!(fusion_plan.num_groups(), 1);
@@ -1942,7 +1942,7 @@ mod tests {
         let plan = make_plan();
 
         // Act
-        let fusion_plan = fuse_with_dag_prebuilt(&g, &dag, &plan, None);
+        let fusion_plan = fuse_with_dag_prebuilt(&g, &dag, &plan, None, None);
 
         // Assert: Opaque ops land in the Reduction|Opaque arm → Standalone
         assert_eq!(fusion_plan.num_groups(), 1);
@@ -1972,7 +1972,7 @@ mod tests {
         let plan = make_plan();
 
         // Act
-        let fusion_plan = fuse_with_dag_prebuilt(&g, &dag, &plan, None);
+        let fusion_plan = fuse_with_dag_prebuilt(&g, &dag, &plan, None, None);
 
         // Assert: RoPE is Injective, so it enters the ElemWise|Injective arm
         assert!(fusion_plan.group_of(op0).is_some());
@@ -2063,7 +2063,7 @@ mod tests {
         let plan = make_plan();
 
         // Act
-        let fusion_plan = fuse_with_dag_prebuilt(&g, &dag, &plan, None);
+        let fusion_plan = fuse_with_dag_prebuilt(&g, &dag, &plan, None, None);
 
         // Assert: 3 groups with sequential IDs 0, 1, 2
         assert_eq!(fusion_plan.num_groups(), 3);
@@ -2091,7 +2091,7 @@ mod tests {
         let plan = make_plan();
 
         // Act
-        let fusion_plan = fuse_with_dag_prebuilt(&g, &dag, &plan, None);
+        let fusion_plan = fuse_with_dag_prebuilt(&g, &dag, &plan, None, None);
 
         // Assert: Transpose is Opaque → Standalone group
         assert_eq!(fusion_plan.num_groups(), 1);
@@ -2138,7 +2138,7 @@ mod tests {
         let plan = make_plan();
 
         // Act
-        let fusion_plan = fuse_with_dag_prebuilt(&g, &dag, &plan, None);
+        let fusion_plan = fuse_with_dag_prebuilt(&g, &dag, &plan, None, None);
 
         // Assert: 4 groups, all ops mapped
         assert_eq!(fusion_plan.num_groups(), 4);
@@ -2187,7 +2187,7 @@ mod tests {
         let dag = SemanticDAG::from_graph(&g, &reg);
         let plan = make_plan();
 
-        let fusion_plan = fuse_with_dag_prebuilt(&g, &dag, &plan, None);
+        let fusion_plan = fuse_with_dag_prebuilt(&g, &dag, &plan, None, None);
 
         // Act
         let display = format!("{}", fusion_plan);
@@ -2222,7 +2222,7 @@ mod tests {
         let plan = make_plan();
 
         // Act
-        let fusion_plan = fuse_with_dag_prebuilt(&g, &dag, &plan, None);
+        let fusion_plan = fuse_with_dag_prebuilt(&g, &dag, &plan, None, None);
 
         // Assert: both ops are assigned to groups (2 groups total, each Standalone)
         assert_eq!(fusion_plan.num_groups(), 2, "RmsNorm (Reduction) and GEMM form 2 groups");
@@ -2260,7 +2260,7 @@ mod tests {
         let plan = make_plan();
 
         // Act
-        let fusion_plan = fuse_with_dag_prebuilt(&g, &dag, &plan, None);
+        let fusion_plan = fuse_with_dag_prebuilt(&g, &dag, &plan, None, None);
 
         // Assert: all three ops should be assigned to a group
         assert!(fusion_plan.group_of(gemm).is_some(), "GEMM must be in a group");
@@ -2331,7 +2331,7 @@ mod tests {
         let plan = make_plan();
 
         // Act
-        let fusion_plan = fuse_with_dag_prebuilt(&g, &dag, &plan, None);
+        let fusion_plan = fuse_with_dag_prebuilt(&g, &dag, &plan, None, None);
 
         // Assert: 2 groups, each GEMM in its own group
         assert_eq!(fusion_plan.num_groups(), 2, "two independent GEMMs must produce two groups");
@@ -2355,7 +2355,7 @@ mod tests {
         let plan = make_plan();
 
         // Act
-        let fusion_plan = fuse_with_dag_prebuilt(&g, &dag, &plan, None);
+        let fusion_plan = fuse_with_dag_prebuilt(&g, &dag, &plan, None, None);
 
         // Assert: bogus OpId is not in any group
         assert!(fusion_plan.group_of(OpId(999)).is_none());
@@ -2376,7 +2376,7 @@ mod tests {
         let plan = make_plan();
 
         // Act
-        let fusion_plan = fuse_with_dag_prebuilt(&g, &dag, &plan, None);
+        let fusion_plan = fuse_with_dag_prebuilt(&g, &dag, &plan, None, None);
 
         // Assert: single Standalone group for the Gelu op
         assert_eq!(fusion_plan.num_groups(), 1);
@@ -2401,7 +2401,7 @@ mod tests {
         let plan = make_plan();
 
         // Act
-        let fusion_plan = fuse_with_dag_prebuilt(&g, &dag, &plan, None);
+        let fusion_plan = fuse_with_dag_prebuilt(&g, &dag, &plan, None, None);
 
         // Assert: Opaque/Reduction → Standalone group
         assert_eq!(fusion_plan.num_groups(), 1);
@@ -2425,7 +2425,7 @@ mod tests {
         let plan = make_plan();
 
         // Act
-        let fusion_plan = fuse_with_dag_prebuilt(&g, &dag, &plan, None);
+        let fusion_plan = fuse_with_dag_prebuilt(&g, &dag, &plan, None, None);
 
         // Assert: SwiGlu is ElemWise → Standalone (no chain to fuse with)
         assert_eq!(fusion_plan.num_groups(), 1);
@@ -2477,7 +2477,7 @@ mod tests {
         let plan = make_plan();
 
         // Act
-        let fusion_plan = fuse_with_dag_prebuilt(&g, &dag, &plan, None);
+        let fusion_plan = fuse_with_dag_prebuilt(&g, &dag, &plan, None, None);
 
         // Assert: Add is ElemWise, standalone (no chain)
         assert_eq!(fusion_plan.num_groups(), 1);
@@ -2502,7 +2502,7 @@ mod tests {
         let plan = make_plan();
 
         // Act
-        let fusion_plan = fuse_with_dag_prebuilt(&g, &dag, &plan, None);
+        let fusion_plan = fuse_with_dag_prebuilt(&g, &dag, &plan, None, None);
 
         // Assert: Mul is ElemWise, standalone (no chain to fuse with)
         assert_eq!(fusion_plan.num_groups(), 1);
@@ -2637,7 +2637,7 @@ mod tests {
         let plan = make_plan();
 
         // Act
-        let fusion_plan = fuse_with_dag_prebuilt(&g, &dag, &plan, None);
+        let fusion_plan = fuse_with_dag_prebuilt(&g, &dag, &plan, None, None);
 
         // Assert: every op in the plan's groups has a corresponding op_to_group entry
         for group in &fusion_plan.groups {
@@ -2677,7 +2677,7 @@ mod tests {
         let plan = make_plan();
 
         // Act
-        let fusion_plan = fuse_with_dag_prebuilt(&g, &dag, &plan, None);
+        let fusion_plan = fuse_with_dag_prebuilt(&g, &dag, &plan, None, None);
 
         // Assert: GEMM should be Standalone (Reshape is Opaque, not eligible for epilogue)
         let gemm_group = fusion_plan.group_of(gemm).unwrap();
@@ -2779,7 +2779,7 @@ mod tests {
         let plan = make_plan();
 
         // Act
-        let fusion_plan = fuse_with_dag_prebuilt(&g, &dag, &plan, None);
+        let fusion_plan = fuse_with_dag_prebuilt(&g, &dag, &plan, None, None);
 
         // Assert: the group's dominant_dtype should be BF16
         let group = fusion_plan.group_of(op0).unwrap();
@@ -2813,7 +2813,7 @@ mod tests {
         let bottleneck_map = crate::compiler::pain_point::PainPointAnalyzer::analyze(&g, &plan.profile);
 
         // Act: pass bottleneck_map to the fusion pass
-        let fusion_plan = fuse_with_dag_prebuilt(&g, &dag, &plan, Some(&bottleneck_map));
+        let fusion_plan = fuse_with_dag_prebuilt(&g, &dag, &plan, Some(&bottleneck_map), None);
 
         // Assert: all ops are assigned to groups (plan is structurally valid)
         assert!(fusion_plan.group_of(gemm).is_some(), "GEMM must be in a group");
@@ -2837,7 +2837,7 @@ mod tests {
         let plan = make_plan();
 
         // Act
-        let fusion_plan = fuse_with_dag_prebuilt(&g, &dag, &plan, None);
+        let fusion_plan = fuse_with_dag_prebuilt(&g, &dag, &plan, None, None);
 
         // Assert: GeGlu is ElemWise, standalone (no chain to fuse with)
         assert_eq!(fusion_plan.num_groups(), 1);
@@ -2880,7 +2880,7 @@ mod tests {
         let plan = make_plan();
 
         // Act
-        let fusion_plan = fuse_with_dag_prebuilt(&g, &dag, &plan, None);
+        let fusion_plan = fuse_with_dag_prebuilt(&g, &dag, &plan, None, None);
 
         // Assert: 3 groups, one per op, all ops covered
         assert_eq!(fusion_plan.num_groups(), 3);
@@ -2910,7 +2910,7 @@ mod tests {
         let plan = make_plan();
 
         // Act
-        let fusion_plan = fuse_with_dag_prebuilt(&g, &dag, &plan, None);
+        let fusion_plan = fuse_with_dag_prebuilt(&g, &dag, &plan, None, None);
 
         // Assert: SwiGluClipped is ElemWise, standalone (no chain)
         assert_eq!(fusion_plan.num_groups(), 1);
@@ -2935,7 +2935,7 @@ mod tests {
         let plan = make_plan();
 
         // Act
-        let fusion_plan = fuse_with_dag_prebuilt(&g, &dag, &plan, None);
+        let fusion_plan = fuse_with_dag_prebuilt(&g, &dag, &plan, None, None);
 
         // Assert: Residual is ElemWise, assigned to a group
         assert!(fusion_plan.group_of(op0).is_some());
@@ -2966,7 +2966,7 @@ mod tests {
         let plan = make_plan();
 
         // Act
-        let fusion_plan = fuse_with_dag_prebuilt(&g, &dag, &plan, None);
+        let fusion_plan = fuse_with_dag_prebuilt(&g, &dag, &plan, None, None);
 
         // Assert: all four ops are mapped
         assert!(fusion_plan.group_of(op0).is_some(), "op0 must be mapped");
@@ -2996,7 +2996,7 @@ mod tests {
         let plan = make_plan();
 
         // Act
-        let fusion_plan = fuse_with_dag_prebuilt(&g, &dag, &plan, None);
+        let fusion_plan = fuse_with_dag_prebuilt(&g, &dag, &plan, None, None);
 
         // Assert: QkNorm is classified as Reduction → Standalone
         assert_eq!(fusion_plan.num_groups(), 1);
@@ -3020,7 +3020,7 @@ mod tests {
         let plan = make_plan();
 
         // Act
-        let fusion_plan = fuse_with_dag_prebuilt(&g, &dag, &plan, None);
+        let fusion_plan = fuse_with_dag_prebuilt(&g, &dag, &plan, None, None);
 
         // Assert: LogitSoftcap is ElemWise, standalone
         assert_eq!(fusion_plan.num_groups(), 1);
@@ -3054,7 +3054,7 @@ mod tests {
         let plan = make_plan();
 
         // Act
-        let fusion_plan = fuse_with_dag_prebuilt(&g, &dag, &plan, None);
+        let fusion_plan = fuse_with_dag_prebuilt(&g, &dag, &plan, None, None);
 
         // Assert: both ops are in groups
         assert!(fusion_plan.group_of(gemm).is_some());
@@ -3085,7 +3085,7 @@ mod tests {
         let plan = make_plan();
 
         // Act
-        let fusion_plan = fuse_with_dag_prebuilt(&g, &dag, &plan, None);
+        let fusion_plan = fuse_with_dag_prebuilt(&g, &dag, &plan, None, None);
 
         // Assert: SliceView is Opaque → Standalone group
         assert_eq!(fusion_plan.num_groups(), 1);
@@ -3120,7 +3120,7 @@ mod tests {
         let plan = make_plan();
 
         // Act
-        let fusion_plan = fuse_with_dag_prebuilt(&g, &dag, &plan, None);
+        let fusion_plan = fuse_with_dag_prebuilt(&g, &dag, &plan, None, None);
 
         // Assert: group IDs are 0, 1, 2, ... in order
         assert_eq!(fusion_plan.num_groups(), 5, "5 independent ops must produce 5 groups");

@@ -1045,7 +1045,6 @@ mod tests {
     }
 
     /// Verify non-transposed GEMM still works: C = A * B where B is [K,N] row-major.
-    #[test]
     /// Verify non-trans GEMM (trans_b=false) compiles successfully through the
     /// BLIS tiled path. Numerical correctness is verified by lower-level GEMM
     /// unit tests; this test ensures the full compilation pipeline produces a

@@ -37,6 +37,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "requires SM100 (Blackwell) hardware for TMEM tile allocation"]
     fn test_ptx_sm100_tcgen05() {
         let mut l = GpuLower::new(GpuDialect::Ptx { sm_version: 100 });
         l.emit_prologue(&empty_frame(), &empty_alloc(), Default::default()).unwrap();

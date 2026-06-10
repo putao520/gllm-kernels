@@ -993,7 +993,7 @@ mod tests {
         #[cfg(feature = "jit-x86")]
         {
             let dag = semantic_dag::SemanticDAG::from_graph(&graph, &registry);
-            let fusion_plan = fusion::fuse_with_dag_prebuilt(&graph, &dag, &exec_plan, None);
+            let fusion_plan = fusion::fuse_with_dag_prebuilt(&graph, &dag, &exec_plan, None, None);
             let lifetimes = buffer_alloc::analyze_lifetimes(&graph, &fusion_plan, None, None);
             let alloc = buffer_alloc::allocate_buffers(&lifetimes);
             let mut cg = codegen::X86CodeGen::new(&profile, graph.infer_computation_dtype());
