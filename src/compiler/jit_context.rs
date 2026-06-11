@@ -63,6 +63,34 @@ impl ResourceKind {
         ResourceKind::Barrier,
     ];
 
+    /// Whether this resource kind is available on the given platform.
+    ///
+    /// Based on JitResourceBudget::from_isa_profile semantics: a resource
+    /// is "available" if `from_isa_profile` would produce a non-zero budget
+    /// for it on the given platform.
+    pub fn is_available_on(&self, platform: &Platform) -> bool {
+        match self {
+            Self::Gpr | Self::SimdVec => !platform.is_gpu(),
+            Self::Stack => !platform.is_gpu(),
+            Self::Predicate => matches!(platform,
+                Platform::X86_64 { has_avx512: true, .. }
+                | Platform::AArch64 { has_sve: true, .. }),
+            Self::Tile => matches!(platform,
+                Platform::X86_64 { has_amx: true, .. }
+                | Platform::AArch64 { has_sme: true, .. }),
+            Self::TileAccumulator => match platform {
+                Platform::Cuda { sm_version, .. } => *sm_version >= 90,
+                Platform::Hip { .. } => true,
+                _ => false,
+            },
+            Self::SharedMem => matches!(platform,
+                Platform::Cuda { .. } | Platform::Hip { .. } | Platform::Metal { .. }),
+            Self::TensorMem => matches!(platform, Platform::Cuda { has_tmem: true, .. }),
+            Self::Barrier => matches!(platform,
+                Platform::Cuda { has_warp_spec: true, .. }),
+        }
+    }
+
     /// Whether this resource kind is tracked in bytes (memory-type).
     pub fn is_memory(&self) -> bool {
         matches!(self, ResourceKind::Stack | ResourceKind::SharedMem | ResourceKind::TensorMem)
@@ -153,7 +181,7 @@ impl JitResourceBudget {
             predicate_total: profile.mask_regs.len(),
             tile_total: profile.tile_regs.len(),
             tile_accumulator_total: tile_acc,
-            stack_bytes: 4096,
+            stack_bytes: if profile.platform.is_gpu() { 0 } else { 4096 },
             shared_mem_bytes: shared_mem,
             tensor_mem_bytes: tmem,
             barrier_total: barriers,
@@ -1542,5 +1570,387 @@ mod tests {
         ctx.declare_tmem_usage(1024);
         assert_eq!(ctx.mem_used(ResourceKind::TensorMem), 5120);
         assert_eq!(ctx.mem_available(ResourceKind::TensorMem), tmem_cap - 5120);
+    }
+
+    // ── JCTX-023: HardwareProfile × ResourceKind cross-matrix tests ──
+
+    fn make_cuda_profile(sm: u32) -> IsaProfile {
+        IsaProfile::cuda(sm)
+    }
+
+    fn make_hip_profile(gfx: u32) -> IsaProfile {
+        IsaProfile::hip(gfx)
+    }
+
+    fn make_aarch64_profile() -> IsaProfile {
+        IsaProfile::aarch64(true, true, 128, true, true, true)
+    }
+
+    fn make_x86_avx2_profile() -> IsaProfile {
+        IsaProfile::from_device_profile(&DeviceProfile::detect())
+    }
+
+    /// Construct IsaProfile from HardwareProfile via its platform() mapping.
+    /// For CPU profiles, we use the real DeviceProfile and rely on HardwareProfile::ALL
+    /// for GPU/ARM profiles that require constructed IsaProfiles.
+    fn isa_profile_for_hw(hw: &super::super::hardware_profile::HardwareProfile) -> IsaProfile {
+        use super::super::hardware_profile::HardwareProfile;
+        match hw {
+            HardwareProfile::CudaSM80 => make_cuda_profile(80),
+            HardwareProfile::CudaSM90 => make_cuda_profile(90),
+            HardwareProfile::CudaSM100 => make_cuda_profile(100),
+            HardwareProfile::RocmMI200 => make_hip_profile(908),
+            HardwareProfile::RocmMI300 => make_hip_profile(942),
+            HardwareProfile::CpuAvx2 | HardwareProfile::CpuAvx512 | HardwareProfile::CpuAvx10_2 => {
+                let dp = DeviceProfile::detect();
+                IsaProfile::from_device_profile(&dp)
+            }
+            HardwareProfile::AppleM1 | HardwareProfile::AppleM2 | HardwareProfile::AppleM3 => {
+                // Metal profile: construct via platform() for budget derivation
+                let platform = hw.platform();
+                IsaProfile {
+                    platform,
+                    gpr_regs: vec![],
+                    scratch_gprs: vec![],
+                    vec_regs: vec![],
+                    scratch_vec_regs: vec![],
+                    tile_regs: vec![],
+                    mask_regs: vec![],
+                    abi: super::super::codegen::vm::isa_profile::AbiConvention {
+                        arg_regs: vec![], stack_arg_offset: 0, callee_saved: vec![],
+                        caller_saved: vec![], callee_saved_vec: vec![],
+                        stack_alignment: 0, red_zone_bytes: 0,
+                    },
+                    cache: super::super::codegen::vm::isa_profile::CacheHierarchy {
+                        l1d_bytes: 0, l1i_bytes: 0, l2_bytes: 0, l3_bytes: 0,
+                        cacheline_bytes: 128, tmem_bytes: 0, smem_bytes: 32 * 1024, lds_bytes: 0,
+                    },
+                    features: vec![],
+                    k_unroll_factor: 4,
+                    dot_cap: crate::dispatch::device_profile::DotProductCap::SimdAssisted,
+                }
+            }
+            HardwareProfile::ArmNeoverse => make_aarch64_profile(),
+            HardwareProfile::Generic => {
+                let dp = DeviceProfile::detect();
+                IsaProfile::from_device_profile(&dp)
+            }
+        }
+    }
+
+    #[test]
+    fn test_resource_budget_matrix_all_profiles() {
+        use super::super::hardware_profile::HardwareProfile;
+
+        let mut tested = 0;
+        for hw in &HardwareProfile::ALL {
+            let profile = isa_profile_for_hw(hw);
+            let platform = &profile.platform;
+            let ctx = JitContext::new(&profile);
+            let budget = ctx.budget();
+
+            for &kind in &ResourceKind::ALL {
+                if !kind.is_available_on(platform) {
+                    // Unavailable resources should have 0 capacity
+                    assert_eq!(
+                        budget.capacity(kind), 0,
+                        "{hw:?} × {kind:?}: unavailable resource should have 0 capacity"
+                    );
+                    continue;
+                }
+                // Available resources should have positive capacity
+                let cap = budget.capacity(kind);
+                assert!(
+                    cap > 0,
+                    "{hw:?} × {kind:?}: available resource must have budget > 0, got {}",
+                    cap
+                );
+                tested += 1;
+            }
+        }
+        // Sanity: we should have tested a meaningful number of combinations
+        assert!(tested >= 25, "expected >= 25 valid combinations, got {}", tested);
+    }
+
+    #[test]
+    fn test_resource_kind_is_available_on_smoke() {
+        use super::super::codegen::vm::isa_profile::Platform;
+
+        // Gpr/SimdVec/Stack available on CPU only
+        let x86 = Platform::X86_64 { has_avx512: false, has_bf16: false, has_vnni: false,
+            has_avx512fp16: false, has_amx: false, has_amx_fp16: false,
+            has_amx_complex: false, has_amx_transpose: false, has_amx_fp8: false,
+            has_avx10_2: false, has_apx: false, has_vp2intersect: false };
+        assert!(ResourceKind::Gpr.is_available_on(&x86));
+        assert!(ResourceKind::SimdVec.is_available_on(&x86));
+        assert!(ResourceKind::Stack.is_available_on(&x86));
+
+        let cuda90 = Platform::Cuda { sm_version: 90, warp_size: 32, shared_mem_kb: 228,
+            reg_file_per_sm: 65536, max_regs_per_thread: 255,
+            has_wgmma: true, has_tma: true, has_warp_spec: true, has_fp8: true,
+            has_tmem: false, has_block_scaled: false, has_native_fp4: false,
+            has_native_fp6: false, has_cluster: false, has_2cta_mma: false, tmem_size_kb: 0 };
+        assert!(!ResourceKind::Gpr.is_available_on(&cuda90));
+        assert!(!ResourceKind::SimdVec.is_available_on(&cuda90));
+        assert!(!ResourceKind::Stack.is_available_on(&cuda90));
+
+        // SharedMem: GPU-only
+        let x86 = Platform::X86_64 { has_avx512: false, has_bf16: false, has_vnni: false,
+            has_avx512fp16: false, has_amx: false, has_amx_fp16: false,
+            has_amx_complex: false, has_amx_transpose: false, has_amx_fp8: false,
+            has_avx10_2: false, has_apx: false, has_vp2intersect: false };
+        assert!(!ResourceKind::SharedMem.is_available_on(&x86));
+
+        // TensorMem: SM100+ only
+        let cuda90 = Platform::Cuda { sm_version: 90, warp_size: 32, shared_mem_kb: 228,
+            reg_file_per_sm: 65536, max_regs_per_thread: 255,
+            has_wgmma: true, has_tma: true, has_warp_spec: true, has_fp8: true,
+            has_tmem: false, has_block_scaled: false, has_native_fp4: false,
+            has_native_fp6: false, has_cluster: false, has_2cta_mma: false, tmem_size_kb: 0 };
+        assert!(!ResourceKind::TensorMem.is_available_on(&cuda90));
+
+        let cuda100 = Platform::Cuda { sm_version: 100, warp_size: 32, shared_mem_kb: 228,
+            reg_file_per_sm: 65536, max_regs_per_thread: 255,
+            has_wgmma: true, has_tma: true, has_warp_spec: true, has_fp8: true,
+            has_tmem: true, has_block_scaled: true, has_native_fp4: true,
+            has_native_fp6: true, has_cluster: true, has_2cta_mma: true, tmem_size_kb: 256 };
+        assert!(ResourceKind::TensorMem.is_available_on(&cuda100));
+    }
+
+    #[test]
+    fn test_matrix_cuda_sm80_budget() {
+        let profile = make_cuda_profile(80);
+        let budget = JitResourceBudget::from_isa_profile(&profile);
+
+        // SM80: SMEM >= 164KB, no TMEM, no barriers (no warp_spec)
+        assert!(budget.shared_mem_bytes >= 164 * 1024, "SM80 SMEM >= 164KB");
+        assert_eq!(budget.tensor_mem_bytes, 0, "SM80 no TMEM");
+        // SM80 has no warp_spec so no barriers
+        assert_eq!(budget.barrier_total, 0, "SM80 no barriers");
+    }
+
+    #[test]
+    fn test_matrix_cuda_sm90_budget() {
+        let profile = make_cuda_profile(90);
+        let budget = JitResourceBudget::from_isa_profile(&profile);
+
+        // SM90: SMEM >= 228KB, no TMEM, has barriers (warp_spec), 4 tile accumulators
+        assert!(budget.shared_mem_bytes >= 228 * 1024, "SM90 SMEM >= 228KB");
+        assert_eq!(budget.tensor_mem_bytes, 0, "SM90 no TMEM");
+        assert!(budget.barrier_total >= 2, "SM90 has warp_spec barriers");
+        assert!(budget.tile_accumulator_total >= 4, "SM90 has WGMMA accumulators");
+    }
+
+    #[test]
+    fn test_matrix_cuda_sm100_budget() {
+        let profile = make_cuda_profile(100);
+        let budget = JitResourceBudget::from_isa_profile(&profile);
+
+        // SM100: SMEM >= 228KB, TMEM >= 256KB/SM, barriers, 4 tile accumulators
+        assert!(budget.shared_mem_bytes >= 228 * 1024, "SM100 SMEM >= 228KB");
+        assert!(budget.tensor_mem_bytes >= 256 * 1024, "SM100 TMEM >= 256KB");
+        assert!(budget.barrier_total >= 2, "SM100 has barriers");
+        assert!(budget.tile_accumulator_total >= 4, "SM100 has tcgen05 accumulators");
+    }
+
+    #[test]
+    fn test_matrix_rocm_mi200_budget() {
+        let profile = make_hip_profile(908);
+        let budget = JitResourceBudget::from_isa_profile(&profile);
+
+        // MI200: LDS = 64KB, no TMEM, 4 MFMA accumulators, no barriers
+        assert_eq!(budget.shared_mem_bytes, 64 * 1024, "MI200 LDS = 64KB");
+        assert_eq!(budget.tensor_mem_bytes, 0, "MI200 no TMEM");
+        assert!(budget.tile_accumulator_total >= 4, "MI200 has MFMA accumulators");
+    }
+
+    #[test]
+    fn test_matrix_rocm_mi300_budget() {
+        let profile = make_hip_profile(942);
+        let budget = JitResourceBudget::from_isa_profile(&profile);
+
+        // MI300: LDS = 64KB, no TMEM, 4 MFMA accumulators
+        assert_eq!(budget.shared_mem_bytes, 64 * 1024, "MI300 LDS = 64KB");
+        assert_eq!(budget.tensor_mem_bytes, 0, "MI300 no TMEM");
+        assert!(budget.tile_accumulator_total >= 4, "MI300 has MFMA accumulators");
+    }
+
+    #[test]
+    fn test_matrix_aarch64_sme2_budget() {
+        let profile = make_aarch64_profile();
+        let budget = JitResourceBudget::from_isa_profile(&profile);
+
+        // AArch64 with SME2: 29 allocatable GPRs (31 - scratch), 21 allocatable vec regs,
+        // 7 predicate masks, 4 tile regs
+        assert!(budget.gpr_total > 0, "AArch64 has GPRs");
+        assert!(budget.simd_vec_total > 0, "AArch64 has vec regs");
+        assert!(budget.predicate_total >= 7, "AArch64 SVE has >= 7 mask regs");
+        assert!(budget.tile_total >= 4, "AArch64 SME has >= 4 tile regs");
+        // No GPU resources
+        assert_eq!(budget.shared_mem_bytes, 0, "AArch64 no SMEM");
+        assert_eq!(budget.tensor_mem_bytes, 0, "AArch64 no TMEM");
+    }
+
+    #[test]
+    fn test_matrix_cpu_gpr_budget() {
+        let profile = make_x86_avx2_profile();
+        let budget = JitResourceBudget::from_isa_profile(&profile);
+
+        // x86: GPR >= 11 (16 - 2 frame - 3 scratch), SimdVec >= 10 (16 - 6 scratch)
+        assert!(budget.gpr_total >= 11, "x86 GPR >= 11, got {}", budget.gpr_total);
+        assert!(budget.simd_vec_total >= 10, "x86 SimdVec >= 10, got {}", budget.simd_vec_total);
+        assert!(budget.stack_bytes > 0, "x86 stack must be > 0");
+        // No GPU resources
+        assert_eq!(budget.shared_mem_bytes, 0, "x86 no SMEM");
+        assert_eq!(budget.tensor_mem_bytes, 0, "x86 no TMEM");
+        assert_eq!(budget.barrier_total, 0, "x86 no barriers");
+    }
+
+    #[test]
+    fn test_matrix_predicate_avx512_vs_avx2() {
+        // AVX-512 has predicate (mask) registers; AVX2 does not
+        let profile = make_x86_avx2_profile();
+        let budget = JitResourceBudget::from_isa_profile(&profile);
+
+        if matches!(&profile.platform, Platform::X86_64 { has_avx512: true, .. }) {
+            assert!(budget.predicate_total >= 8, "AVX-512 has 8 mask regs");
+        } else {
+            assert_eq!(budget.predicate_total, 0, "AVX2 has no mask regs");
+        }
+    }
+
+    #[test]
+    fn test_matrix_tile_amx_vs_non_amx() {
+        let profile = make_x86_avx2_profile();
+        let budget = JitResourceBudget::from_isa_profile(&profile);
+
+        if matches!(&profile.platform, Platform::X86_64 { has_amx: true, .. }) {
+            assert!(budget.tile_total >= 8, "AMX has 8 tile regs");
+        } else {
+            assert_eq!(budget.tile_total, 0, "No AMX = no tile regs");
+        }
+    }
+
+    #[test]
+    fn test_matrix_shared_mem_sm90_allocate_release() {
+        let profile = make_cuda_profile(90);
+        let mut ctx = JitContext::new(&profile);
+        let smem_cap = ctx.capacity(ResourceKind::SharedMem);
+        if smem_cap == 0 { return; }
+
+        // Declare SMEM usage and verify tracking
+        ctx.declare_smem_usage(64 * 1024);
+        assert_eq!(ctx.mem_used(ResourceKind::SharedMem), 64 * 1024);
+        assert!(ctx.mem_available(ResourceKind::SharedMem) >= smem_cap - 64 * 1024);
+    }
+
+    #[test]
+    fn test_matrix_tmem_sm100_allocate_declare() {
+        let profile = make_cuda_profile(100);
+        let mut ctx = JitContext::new(&profile);
+        let tmem_cap = ctx.capacity(ResourceKind::TensorMem);
+        if tmem_cap == 0 { return; }
+
+        // TMEM should be >= 256KB on SM100
+        assert!(tmem_cap >= 256 * 1024, "SM100 TMEM >= 256KB, got {}", tmem_cap);
+
+        ctx.declare_tmem_usage(128 * 1024);
+        assert_eq!(ctx.mem_used(ResourceKind::TensorMem), 128 * 1024);
+        assert_eq!(ctx.mem_available(ResourceKind::TensorMem), tmem_cap - 128 * 1024);
+    }
+
+    #[test]
+    fn test_matrix_barrier_cuda_sm90() {
+        let profile = make_cuda_profile(90);
+        let mut ctx = JitContext::new(&profile);
+        let barrier_cap = ctx.capacity(ResourceKind::Barrier);
+        if barrier_cap == 0 { return; }
+
+        // SM90 has warp_spec barriers — should be allocatable
+        let idx = ctx.allocate(ResourceKind::Barrier, "sync_point").unwrap();
+        assert_eq!(ctx.live_count(ResourceKind::Barrier), 1);
+        ctx.release(ResourceKind::Barrier, idx);
+        assert_eq!(ctx.live_count(ResourceKind::Barrier), 0);
+    }
+
+    #[test]
+    fn test_matrix_unavailable_kinds_have_zero_budget() {
+        use super::super::hardware_profile::HardwareProfile;
+
+        for hw in &HardwareProfile::ALL {
+            let profile = isa_profile_for_hw(hw);
+            let budget = JitResourceBudget::from_isa_profile(&profile);
+
+            for &kind in &ResourceKind::ALL {
+                if !kind.is_available_on(&profile.platform) {
+                    assert_eq!(
+                        budget.capacity(kind), 0,
+                        "{hw:?} × {kind:?}: unavailable kind should have 0 budget"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn test_matrix_no_double_allocate_beyond_budget() {
+        // Verify that each available resource kind correctly rejects allocation beyond capacity
+        let profile = make_cuda_profile(90);
+        let mut ctx = JitContext::new(&profile);
+
+        for &kind in &ResourceKind::ALL {
+            if !kind.is_available_on(&profile.platform) { continue; }
+            let cap = ctx.capacity(kind);
+            if cap == 0 || kind.is_memory() { continue; } // Skip memory-type resources
+
+            // Exhaust all instances
+            let mut allocated = Vec::new();
+            for _ in 0..cap {
+                allocated.push(ctx.allocate(kind, "exhaust").unwrap());
+            }
+
+            // One more should fail
+            let result = ctx.allocate(kind, "overflow");
+            assert!(result.is_err(), "{kind:?}: allocation beyond capacity should fail");
+
+            // Release all
+            for idx in allocated {
+                ctx.release(kind, idx);
+            }
+        }
+    }
+
+    #[test]
+    fn test_hardware_profile_all_count() {
+        use super::super::hardware_profile::HardwareProfile;
+        assert_eq!(HardwareProfile::ALL.len(), 12);
+    }
+
+    #[test]
+    fn test_hardware_profile_platform_mapping_consistency() {
+        use super::super::hardware_profile::HardwareProfile;
+
+        for hw in &HardwareProfile::ALL {
+            let platform = hw.platform();
+            // GPU profiles should map to GPU platforms
+            match hw {
+                HardwareProfile::CudaSM80 | HardwareProfile::CudaSM90 | HardwareProfile::CudaSM100 => {
+                    assert!(matches!(platform, Platform::Cuda { .. }), "{hw:?} should map to Cuda");
+                }
+                HardwareProfile::RocmMI200 | HardwareProfile::RocmMI300 => {
+                    assert!(matches!(platform, Platform::Hip { .. }), "{hw:?} should map to Hip");
+                }
+                HardwareProfile::CpuAvx2 | HardwareProfile::CpuAvx512 | HardwareProfile::CpuAvx10_2 => {
+                    assert!(matches!(platform, Platform::X86_64 { .. }), "{hw:?} should map to X86_64");
+                }
+                HardwareProfile::AppleM1 | HardwareProfile::AppleM2 | HardwareProfile::AppleM3 => {
+                    assert!(matches!(platform, Platform::Metal { .. }), "{hw:?} should map to Metal");
+                }
+                HardwareProfile::ArmNeoverse => {
+                    assert!(matches!(platform, Platform::AArch64 { .. }), "{hw:?} should map to AArch64");
+                }
+                HardwareProfile::Generic => {} // fallback, no strong assertion
+            }
+        }
     }
 }

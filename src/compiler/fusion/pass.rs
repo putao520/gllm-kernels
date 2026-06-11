@@ -16,6 +16,10 @@ use super::pdt;
 use crate::compiler::hardware_profile::HardwareProfile;
 use crate::compiler::pain_point::OpBottleneckMap;
 use crate::compiler::jit_context::JitContext;
+use crate::compiler::resource_estimator::{
+    can_fuse_with_budget, can_extend_group_with_budget,
+    can_inject_epilogue_with_budget, can_tile_fuse_with_budget,
+};
 
 /// Fusion pass based on SemanticDAG (convenience wrapper).
 ///
@@ -143,26 +147,58 @@ pub fn fuse_with_dag_prebuilt(
                     });
                 }
 
+                // REQ-JCTX-014: Budget-aware epilogue filtering.
+                // When JitContext is available, gate each epilogue op on register budget.
+                if jit_ctx.is_some() && !epilogue.is_empty() {
+                    epilogue.retain(|ep| {
+                        can_fuse_with_budget(jit_ctx, graph, op, ep, Some(dag))
+                    });
+                }
+
                 if norm_prefix.is_some() || !epilogue.is_empty() {
                     let gid = groups.len();
                     let mut all_ops = Vec::new();
                     let anchor_bottleneck = dag.node(op_id).map(|n| n.bottleneck);
                     let mode = if let Some(norm_id) = norm_prefix {
                         if !epilogue.is_empty() {
-                            // Roofline-guided: compute-bound with deep epilogue -> Standalone
-                            // (deep epilogue increases I-cache pressure in compute-bound kernels)
-                            if anchor_bottleneck == Some(Bottleneck::Compute) && epilogue.len() > 2 {
+                            // REQ-JCTX-014: Check epilogue injection budget
+                            let epilogue_bytes: usize = epilogue.iter()
+                                .filter_map(|ep| ep.outputs.first())
+                                .filter_map(|&tid| graph.tensor(tid))
+                                .map(|t| t.shape.iter().map(|d| d.max_for_allocation(0)).product::<usize>() * t.dtype.size_bytes())
+                                .sum();
+                            if !can_inject_epilogue_with_budget(jit_ctx, epilogue_bytes) {
+                                FusionMode::Standalone
+                            } else if anchor_bottleneck == Some(Bottleneck::Compute) && epilogue.len() > 2 {
                                 FusionMode::Standalone
                             } else {
                                 FusionMode::EpilogueInjection
                             }
                         } else {
                             // Decide TileLevelFusion vs ComputeRoot based on L1 capacity
-                            detect_tile_vs_compute_root(graph, op, norm_id, plan)
+                            let candidate_mode = detect_tile_vs_compute_root(graph, op, norm_id, plan);
+                            // REQ-JCTX-014: TileLevelFusion must fit within budget
+                            if matches!(candidate_mode, FusionMode::TileLevelFusion { .. }) {
+                                if !can_tile_fuse_with_budget(jit_ctx, graph, op_id, norm_id) {
+                                    FusionMode::ComputeRoot { predecessor: norm_id }
+                                } else {
+                                    candidate_mode
+                                }
+                            } else {
+                                candidate_mode
+                            }
                         }
                     } else {
                         // No norm prefix: roofline-guided epilogue decision
-                        if anchor_bottleneck == Some(Bottleneck::Compute) && epilogue.len() > 2 {
+                        // REQ-JCTX-014: Check epilogue injection budget
+                        let epilogue_bytes: usize = epilogue.iter()
+                            .filter_map(|ep| ep.outputs.first())
+                            .filter_map(|&tid| graph.tensor(tid))
+                            .map(|t| t.shape.iter().map(|d| d.max_for_allocation(0)).product::<usize>() * t.dtype.size_bytes())
+                            .sum();
+                        if !can_inject_epilogue_with_budget(jit_ctx, epilogue_bytes) {
+                            FusionMode::Standalone
+                        } else if anchor_bottleneck == Some(Bottleneck::Compute) && epilogue.len() > 2 {
                             FusionMode::Standalone
                         } else {
                             FusionMode::EpilogueInjection
@@ -248,6 +284,27 @@ pub fn fuse_with_dag_prebuilt(
 
                 // Split chain by L1 budget to avoid thrashing
                 let sub_chains = split_elementwise_by_l1(graph, &all_ops, plan);
+
+                // REQ-JCTX-014: Budget-aware chain splitting.
+                // Further limit sub-chains if JitContext register budget is tight.
+                let sub_chains = if jit_ctx.is_some() {
+                    let mut budget_limited = Vec::new();
+                    for sub in sub_chains {
+                        if sub.len() <= 1 {
+                            budget_limited.push(sub);
+                        } else if can_extend_group_with_budget(jit_ctx, 2, sub.len() - 1, Some(dag)) {
+                            budget_limited.push(sub);
+                        } else {
+                            // Budget exceeded: split into individual ops
+                            for oid in sub {
+                                budget_limited.push(vec![oid]);
+                            }
+                        }
+                    }
+                    budget_limited
+                } else {
+                    sub_chains
+                };
 
                 for sub in sub_chains {
                     let gid = groups.len();

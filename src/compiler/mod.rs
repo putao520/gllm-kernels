@@ -48,6 +48,7 @@ pub mod group_dep;
 pub mod virtual_activation;
 pub mod pack_map;
 pub mod counters;
+pub mod resource_estimator;
 
 pub mod dtype_chain;
 pub mod graph_geometry;

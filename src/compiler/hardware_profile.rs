@@ -5,6 +5,7 @@
 //! compute throughput, and instruction set capabilities.
 
 use crate::dispatch::DeviceProfile;
+use crate::compiler::codegen::vm::isa_profile::Platform;
 
 /// 12 hardware profiles for topology-driven fusion.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -36,6 +37,158 @@ pub enum HardwareProfile {
 }
 
 impl HardwareProfile {
+    /// All 12 hardware profile variants (excluding Generic fallback).
+    pub const ALL: [HardwareProfile; 12] = [
+        HardwareProfile::CudaSM80,
+        HardwareProfile::CudaSM90,
+        HardwareProfile::CudaSM100,
+        HardwareProfile::RocmMI200,
+        HardwareProfile::RocmMI300,
+        HardwareProfile::CpuAvx2,
+        HardwareProfile::CpuAvx512,
+        HardwareProfile::CpuAvx10_2,
+        HardwareProfile::AppleM1,
+        HardwareProfile::AppleM2,
+        HardwareProfile::AppleM3,
+        HardwareProfile::ArmNeoverse,
+    ];
+
+    /// Map to IsaProfile Platform (many-to-one).
+    pub fn platform(&self) -> Platform {
+        match self {
+            Self::CpuAvx2 | Self::CpuAvx512 | Self::CpuAvx10_2 => Platform::X86_64 {
+                has_avx512: matches!(self, Self::CpuAvx512),
+                has_bf16: matches!(self, Self::CpuAvx512 | Self::CpuAvx10_2),
+                has_vnni: matches!(self, Self::CpuAvx512 | Self::CpuAvx10_2),
+                has_avx512fp16: false,
+                has_amx: matches!(self, Self::CpuAvx512),
+                has_amx_fp16: false,
+                has_amx_complex: false,
+                has_amx_transpose: false,
+                has_amx_fp8: false,
+                has_avx10_2: matches!(self, Self::CpuAvx10_2),
+                has_apx: matches!(self, Self::CpuAvx10_2),
+                has_vp2intersect: false,
+            },
+            Self::ArmNeoverse => Platform::AArch64 {
+                has_bf16: true,
+                has_dotprod: true,
+                has_i8mm: true,
+                has_sve: true,
+                has_sve2: true,
+                sve_vl: 128,
+                has_sme: true,
+                has_sme2: true,
+                has_sme_f16f16: true,
+                has_sme_i16i64: true,
+                sme_vl: 128,
+            },
+            Self::AppleM1 | Self::AppleM2 | Self::AppleM3 => {
+                let gpu_family = match self {
+                    Self::AppleM1 => 7,
+                    Self::AppleM2 => 8,
+                    _ => 9,
+                };
+                Platform::Metal {
+                    simd_width: 32,
+                    gpu_family,
+                    has_simdgroup_matrix: true,
+                    threadgroup_mem_kb: 32,
+                }
+            }
+            Self::CudaSM80 => Platform::Cuda {
+                sm_version: 80,
+                warp_size: 32,
+                shared_mem_kb: 164,
+                reg_file_per_sm: 65536,
+                max_regs_per_thread: 255,
+                has_wgmma: false,
+                has_tma: false,
+                has_warp_spec: false,
+                has_fp8: false,
+                has_tmem: false,
+                has_block_scaled: false,
+                has_native_fp4: false,
+                has_native_fp6: false,
+                has_cluster: false,
+                has_2cta_mma: false,
+                tmem_size_kb: 0,
+            },
+            Self::CudaSM90 => Platform::Cuda {
+                sm_version: 90,
+                warp_size: 32,
+                shared_mem_kb: 228,
+                reg_file_per_sm: 65536,
+                max_regs_per_thread: 255,
+                has_wgmma: true,
+                has_tma: true,
+                has_warp_spec: true,
+                has_fp8: true,
+                has_tmem: false,
+                has_block_scaled: false,
+                has_native_fp4: false,
+                has_native_fp6: false,
+                has_cluster: false,
+                has_2cta_mma: false,
+                tmem_size_kb: 0,
+            },
+            Self::CudaSM100 => Platform::Cuda {
+                sm_version: 100,
+                warp_size: 32,
+                shared_mem_kb: 228,
+                reg_file_per_sm: 65536,
+                max_regs_per_thread: 255,
+                has_wgmma: true,
+                has_tma: true,
+                has_warp_spec: true,
+                has_fp8: true,
+                has_tmem: true,
+                has_block_scaled: true,
+                has_native_fp4: true,
+                has_native_fp6: true,
+                has_cluster: true,
+                has_2cta_mma: true,
+                tmem_size_kb: 256,
+            },
+            Self::RocmMI200 => Platform::Hip {
+                gfx_arch: 908,
+                wave_size: 64,
+                has_mfma: true,
+                has_mfma_v2: false,
+                has_fp8_mfma: false,
+                has_fp4_mfma: false,
+                vgpr_per_cu: 256,
+                lds_size_kb: 64,
+                infinity_cache_mb: 0,
+            },
+            Self::RocmMI300 => Platform::Hip {
+                gfx_arch: 942,
+                wave_size: 64,
+                has_mfma: true,
+                has_mfma_v2: false,
+                has_fp8_mfma: false,
+                has_fp4_mfma: false,
+                vgpr_per_cu: 512,
+                lds_size_kb: 64,
+                infinity_cache_mb: 128,
+            },
+            Self::Generic => Platform::X86_64 {
+                has_avx512: false,
+                has_bf16: false,
+                has_vnni: false,
+                has_avx512fp16: false,
+                has_amx: false,
+                has_amx_fp16: false,
+                has_amx_complex: false,
+                has_amx_transpose: false,
+                has_amx_fp8: false,
+                has_avx10_2: false,
+                has_apx: false,
+                has_vp2intersect: false,
+            },
+        }
+    }
+
     /// Detect hardware profile from DeviceProfile.
     pub fn detect(profile: &DeviceProfile) -> Self {
         #[cfg(feature = "jit-cuda")]
