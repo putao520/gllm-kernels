@@ -623,9 +623,10 @@ fn try_dispatch_normlike(
         .cloned()
         .or_else(|| out_shape.first().map(|d| ctx.sym_map.to_bound(d)))
         .unwrap_or(BoundExpr::Const(1));
+    let has_weight = matches!(op.kind, OpKind::RmsNorm { .. } | OpKind::HeadRmsNorm { .. });
     emit_normlike_inline(
         prog, pattern, feature_dim, /*groups_per_row=*/1,
-        /*broadcast_weight=*/false, /*has_weight=*/false,
+        /*broadcast_weight=*/false, has_weight,
         ctx.width, seq_bound, input_ptr, weight_ptr, output_ptr,
         ctx.dtype,
     )?;
