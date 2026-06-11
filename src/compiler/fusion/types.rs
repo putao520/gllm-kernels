@@ -291,6 +291,55 @@ impl ComputeDensity {
     pub fn is_balanced(&self) -> bool {
         self.ratio >= 1.0 && self.ratio < 10.0
     }
+
+    /// Classify as compute-bound above a custom threshold.
+    /// Useful when the fusion pass needs a density gate that differs from
+    /// the default 10.0 ridge (e.g., TileLevelFusion may tolerate a lower
+    /// threshold because tiling already reduces register pressure).
+    pub fn is_compute_bound_above(&self, threshold: f64) -> bool {
+        self.ratio >= threshold
+    }
+
+    /// True when the group is memory-bound enough that fusion is always
+    /// profitable — the primary benefit is eliminating intermediate
+    /// writeback, not reducing compute overhead.
+    pub fn is_memory_bound_below(&self, threshold: f64) -> bool {
+        self.ratio < threshold
+    }
+
+    /// Compute from a FusionGroup's ops by summing FLOPs and byte traffic.
+    /// Returns None if neither FLOPs nor bytes can be estimated.
+    pub fn from_group(group: &FusionGroup, graph: &CompilerGraph) -> Option<Self> {
+        let mut total_flops: u64 = 0;
+        let mut total_bytes: u64 = 0;
+        for &op_id in &group.ops {
+            let op = graph.op(op_id)?;
+            total_flops += estimate_group_op_flops(op);
+            for &tid in op.inputs.iter().chain(op.outputs.iter()) {
+                if let Some(t) = graph.tensor(tid) {
+                    total_bytes += t.concrete_bytes() as u64;
+                }
+            }
+        }
+        if total_bytes == 0 && total_flops == 0 {
+            return None;
+        }
+        Some(Self::from_flops_and_bytes(total_flops, total_bytes))
+    }
+}
+
+/// Estimate FLOPs for a single op within a fusion group.
+/// GEMM variants: 2*M*N*K. Others: 0 (negligible for roofline classification).
+fn estimate_group_op_flops(op: &crate::compiler::graph::CompilerOp) -> u64 {
+    use crate::compiler::graph::OpKind;
+    match &op.kind {
+        OpKind::Gemm { m, n, k, .. }
+        | OpKind::GemmBias { m, n, k, .. }
+        | OpKind::QuantGemm { m, n, k, .. } => {
+            2 * (m.max_for_allocation(0) as u64) * (*n as u64) * (*k as u64)
+        }
+        _ => 0,
+    }
 }
 
 #[cfg(test)]

@@ -6,7 +6,7 @@ use std::collections::{HashMap, HashSet};
 use crate::compiler::graph::{CompilerGraph, CompilerOp, OpKind, OpId, MultiOutputConfig};
 use crate::compiler::semantic_dag::{SemanticDAG, OpClass, Bottleneck};
 use crate::compiler::registry::ScalarOpRegistry;
-use super::types::{FusionGroup, FusionMode, FusionPlan, GroupMarker};
+use super::types::{FusionGroup, FusionMode, FusionPlan, GroupMarker, ComputeDensity};
 use super::helpers::{
     detect_qkv_norm_rope, detect_qkv_shared_input, detect_norm_into_gemm, detect_ffn_block,
     collect_epilogue, collect_elementwise_chain, split_elementwise_by_l1, detect_tile_vs_compute_root,
@@ -159,7 +159,7 @@ pub fn fuse_with_dag_prebuilt(
                     let gid = groups.len();
                     let mut all_ops = Vec::new();
                     let anchor_bottleneck = dag.node(op_id).map(|n| n.bottleneck);
-                    let mode = if let Some(norm_id) = norm_prefix {
+                    let mut mode = if let Some(norm_id) = norm_prefix {
                         if !epilogue.is_empty() {
                             // REQ-JCTX-014: Check epilogue injection budget
                             let epilogue_bytes: usize = epilogue.iter()
@@ -204,6 +204,67 @@ pub fn fuse_with_dag_prebuilt(
                             FusionMode::EpilogueInjection
                         }
                     };
+
+                    // ComputeDensity gate (REQ-FUSION-DEEP-001): if the candidate
+                    // fusion group is deeply compute-bound (density >= 10.0), epilogue
+                    // fusion adds register pressure without saving meaningful memory
+                    // traffic — demote to Standalone. Memory-bound groups (density < 1.0)
+                    // always benefit from fusion (eliminates writeback). Balanced groups
+                    // (1.0..10.0) are kept as-is.
+                    if mode == FusionMode::EpilogueInjection && !epilogue.is_empty() {
+                        let candidate_ops: Vec<OpId> = {
+                            let mut v = Vec::new();
+                            if let Some(norm_id) = norm_prefix {
+                                v.push(norm_id);
+                            }
+                            v.push(op_id);
+                            for ep in &epilogue { v.push(ep.id); }
+                            v
+                        };
+                        let candidate_group = FusionGroup {
+                            id: 0,
+                            anchor: op_id,
+                            epilogue: epilogue.iter().map(|o| o.id).collect(),
+                            mode: FusionMode::EpilogueInjection,
+                            ops: candidate_ops,
+                            multi_output: MultiOutputConfig::single(),
+                            dominant_dtype: None,
+                            marker: GroupMarker::None,
+                            is_layer_group: false,
+                            hetero_layer_type: None,
+                        };
+                        if let Some(density) = ComputeDensity::from_group(&candidate_group, graph) {
+                            if density.is_compute_bound() {
+                                mode = FusionMode::Standalone;
+                            }
+                        }
+                    }
+
+                    // ComputeDensity gate for TileLevelFusion (REQ-FUSION-DEEP-001):
+                    // tiling is profitable only when the predecessor output fits in L1,
+                    // which implies the combined density should not be deeply compute-bound.
+                    // Demote to ComputeRoot when density >= 8.0 (lower threshold than
+                    // epilogue because tiling has higher setup overhead).
+                    if let FusionMode::TileLevelFusion { predecessor, .. } = mode {
+                        let tile_ops = vec![predecessor, op_id];
+                        let tile_group = FusionGroup {
+                            id: 0,
+                            anchor: op_id,
+                            epilogue: vec![predecessor],
+                            mode: FusionMode::TileLevelFusion { predecessor, tile_rows: 0 },
+                            ops: tile_ops,
+                            multi_output: MultiOutputConfig::single(),
+                            dominant_dtype: None,
+                            marker: GroupMarker::None,
+                            is_layer_group: false,
+                            hetero_layer_type: None,
+                        };
+                        if let Some(density) = ComputeDensity::from_group(&tile_group, graph) {
+                            if density.is_compute_bound_above(8.0) {
+                                mode = FusionMode::ComputeRoot { predecessor };
+                            }
+                        }
+                    }
 
                     if let Some(norm_id) = norm_prefix {
                         if !claimed.contains(&norm_id) {
@@ -416,6 +477,33 @@ pub fn fuse_with_dag_prebuilt(
                         is_layer_group: false,
                         hetero_layer_type: None,
                     });
+                }
+            }
+        }
+        // ComputeDensity post-filter (REQ-FUSION-DEEP-001): LoopFusion groups
+        // that are compute-bound (density >= 10.0) get no memory benefit from
+        // fusing — the bottleneck is compute, not memory traffic. Demote to
+        // Standalone to reduce register pressure.
+        if groups[gi].mode == FusionMode::LoopFusion {
+            if let Some(density) = ComputeDensity::from_group(&groups[gi], graph) {
+                if density.is_compute_bound() {
+                    let dropped: Vec<OpId> = groups[gi].epilogue.drain(..).collect();
+                    groups[gi].ops.retain(|id| !dropped.contains(id));
+                    groups[gi].mode = FusionMode::Standalone;
+                    for id in dropped {
+                        orphaned_groups.push(FusionGroup {
+                            id: 0,
+                            anchor: id,
+                            epilogue: Vec::new(),
+                            mode: FusionMode::Standalone,
+                            ops: vec![id],
+                            multi_output: MultiOutputConfig::single(),
+                            dominant_dtype: None,
+                            marker: GroupMarker::None,
+                            is_layer_group: false,
+                            hetero_layer_type: None,
+                        });
+                    }
                 }
             }
         }
