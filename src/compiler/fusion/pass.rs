@@ -679,11 +679,37 @@ fn assign_homogeneous_markers(
         return;
     }
 
-    // Find the longest run of consecutive groups with identical signatures.
-    // A transformer layer typically produces 2-4 fusion groups (attention + FFN, etc.).
-    // The pattern repeats num_iterations times, so the run length should be
-    // a multiple of the pattern period.
-    let layer_group_indices = find_isomorphic_run(signatures, num_iterations);
+    // For single-template graphs (ops exist once, layer loop repeats N times),
+    // find_isomorphic_run can't detect periodic patterns because there's only
+    // one copy of the template. Fall back to marking all groups whose anchor op
+    // has a "layer." label prefix — these are the per-layer ops that should
+    // execute inside the layer loop.
+    let layer_group_indices = {
+        let iso = find_isomorphic_run(signatures, num_iterations);
+        if !iso.is_empty() && iso.len() > 2 {
+            iso
+        } else {
+            // Fallback: mark all consecutive groups whose anchor op label starts
+            // with "layer." as layer groups. This handles single-template graphs
+            // where the isomorphic pattern detection fails.
+            let mut layer_indices = Vec::new();
+            let mut in_layer_run = false;
+            for (i, group) in groups.iter().enumerate() {
+                let anchor_label = graph.op(group.ops[0])
+                    .map(|op| op.label.as_str())
+                    .unwrap_or("");
+                if anchor_label.starts_with("layer.") {
+                    layer_indices.push(i);
+                    in_layer_run = true;
+                } else if in_layer_run {
+                    // Once we exit the layer run, stop — don't include global ops
+                    // (final_norm, lm_head) that appear after the layer template.
+                    break;
+                }
+            }
+            layer_indices
+        }
+    };
 
     if layer_group_indices.is_empty() {
         return;

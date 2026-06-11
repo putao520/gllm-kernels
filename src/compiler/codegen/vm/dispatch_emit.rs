@@ -1253,8 +1253,18 @@ pub(crate) fn dispatch_compute_pattern(
             // Then use KV cache pointers for attention reads.
             // Prefill: gen_loop_counter is None → use 0 (write to cache start).
             // Decode: gen_loop_counter tracks position → write to current position.
+            // When layer_loop_counter is None (MHA outside layer loop), use 0 as layer index.
+            let effective_layer_ctr = abi.layer_loop_counter.or_else(|| {
+                if abi.kv_cache_ptr.is_some() {
+                    let zero = prog.alloc_vreg(VRegKind::Counter, SimdWidth::Scalar);
+                    prog.emit(VmInstr::GprLoadImm { dst: zero, value: 0 });
+                    Some(zero)
+                } else {
+                    None
+                }
+            });
             let (k_attn_ptr, v_attn_ptr) = if let (Some(kv_cache_ptr), Some(layer_ctr)) =
-                (abi.kv_cache_ptr, abi.layer_loop_counter)
+                (abi.kv_cache_ptr, effective_layer_ctr)
             {
                 let gen_ctr = abi.gen_loop_counter.unwrap_or_else(|| {
                     let zero = prog.alloc_vreg(VRegKind::Counter, SimdWidth::Scalar);
