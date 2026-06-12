@@ -18,6 +18,16 @@ pub enum LayerArch {
     Encoder,
 }
 
+/// MoE configuration — derived from graph topology, not a bool flag.
+///
+/// ARCH-JIT-DATA-YIELDS: MoE presence is derived from OpKind existence in the graph.
+/// This struct carries the expert topology parameters needed by the runtime.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct MoeConfig {
+    pub num_experts: usize,
+    pub top_k: usize,
+}
+
 /// Complete description of a transformer layer for JIT compilation.
 ///
 /// All shape and configuration parameters needed to generate machine code

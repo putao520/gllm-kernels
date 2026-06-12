@@ -12,10 +12,10 @@
 //! SPEC: gllm-kernels/SPEC/25-JIT-LIFECYCLE-INFRASTRUCTURE.md REQ-LC-011
 
 use crate::compiler::trace::{
-    TraceOp, ValueId, ReduceKind, CmpOp,
+    TraceOp, ValueId, ReduceKind, CmpOp, Fp8Format, ScaleSelector,
 };
 use crate::quant_format::{
-    QuantFormatDescriptor, QuantDataKind, ZeroLayout,
+    PackedScaleAlgorithm, QuantFormatDescriptor, QuantDataKind, ZeroLayout,
 };
 use crate::types::CompilerError;
 use std::collections::HashMap;
@@ -633,14 +633,13 @@ impl NumericalSimulator {
                 Ok(Some(id))
             }
 
-            TraceOp::QuantCastFp8toF32 { src, is_e4m3 } => {
+            TraceOp::QuantCastFp8toF32 { src, format } => {
                 let src_val = state.get(*src).as_integer()?;
                 let addr = src_val;
                 let byte = state.load_u8(addr)?;
-                let f32_val = if *is_e4m3 {
-                    Self::fp8_e4m3_to_f32(byte)
-                } else {
-                    Self::fp8_e5m2_to_f32(byte)
+                let f32_val = match format {
+                    Fp8Format::E4M3 => Self::fp8_e4m3_to_f32(byte),
+                    Fp8Format::E5M2 => Self::fp8_e5m2_to_f32(byte),
                 };
                 let id = ValueId(trace_pos);
                 state.set(id, SimValue::Float(f32_val));
@@ -1159,38 +1158,44 @@ impl NumericalSimulator {
             }
 
             // ── QuantKQuantPackedScaleLookup (修正实现) ──
-            TraceOp::QuantKQuantPackedScaleLookup { scales_base, sub_block_idx, is_q3k_extended, is_min } => {
+            TraceOp::QuantKQuantPackedScaleLookup { scales_base, sub_block_idx, scale_algo, selector } => {
                 let base_addr = state.get(*scales_base).as_integer()?;
                 let idx = state.get(*sub_block_idx).as_integer()?;
                 let j = idx as usize;
                 // K-Quant 6-bit packed scale 解码
-                let result = if *is_q3k_extended {
-                    // Q3_K extended 格式: 不同的位布局
-                    // 简化实现: 从 scales[j] 读取
-                    let byte_val = state.load_u8(base_addr + j as i64)?;
-                    byte_val as f32
-                } else if *is_min {
-                    // min 值: scales[j+4] & 0x3F (j<4)
-                    //          (scales[j+4] >> 4) | ((scales[j] >> 6) << 4) (j>=4)
-                    if j < 4 {
-                        let byte_val = state.load_u8(base_addr + (j + 4) as i64)?;
-                        (byte_val & 0x3F) as f32
-                    } else {
-                        let b_low = state.load_u8(base_addr + (j + 4) as i64)?;
-                        let b_high = state.load_u8(base_addr + j as i64)?;
-                        ((b_low >> 4) | ((b_high >> 6) << 4)) as f32
-                    }
-                } else {
-                    // scale 值: scales[j] & 0x3F (j<4)
-                    //           (scales[j+4] & 0xF) | ((scales[j-4] >> 6) << 4) (j>=4)
-                    if j < 4 {
+                let result = match scale_algo {
+                    PackedScaleAlgorithm::Q3KExtended => {
+                        // Q3_K extended 格式: 不同的位布局
+                        // 简化实现: 从 scales[j] 读取
                         let byte_val = state.load_u8(base_addr + j as i64)?;
-                        (byte_val & 0x3F) as f32
-                    } else {
-                        let b_low = state.load_u8(base_addr + (j + 4) as i64)?;
-                        let b_high = state.load_u8(base_addr + (j - 4) as i64)?;
-                        ((b_low & 0x0F) | ((b_high >> 6) << 4)) as f32
+                        byte_val as f32
                     }
+                    PackedScaleAlgorithm::KQuant6Bit => match selector {
+                        ScaleSelector::Min => {
+                            // min 值: scales[j+4] & 0x3F (j<4)
+                            //          (scales[j+4] >> 4) | ((scales[j] >> 6) << 4) (j>=4)
+                            if j < 4 {
+                                let byte_val = state.load_u8(base_addr + (j + 4) as i64)?;
+                                (byte_val & 0x3F) as f32
+                            } else {
+                                let b_low = state.load_u8(base_addr + (j + 4) as i64)?;
+                                let b_high = state.load_u8(base_addr + j as i64)?;
+                                ((b_low >> 4) | ((b_high >> 6) << 4)) as f32
+                            }
+                        }
+                        ScaleSelector::Scale => {
+                            // scale 值: scales[j] & 0x3F (j<4)
+                            //           (scales[j+4] & 0xF) | ((scales[j-4] >> 6) << 4) (j>=4)
+                            if j < 4 {
+                                let byte_val = state.load_u8(base_addr + j as i64)?;
+                                (byte_val & 0x3F) as f32
+                            } else {
+                                let b_low = state.load_u8(base_addr + (j + 4) as i64)?;
+                                let b_high = state.load_u8(base_addr + (j - 4) as i64)?;
+                                ((b_low & 0x0F) | ((b_high >> 6) << 4)) as f32
+                            }
+                        }
+                    },
                 };
                 let id = ValueId(trace_pos);
                 state.set(id, SimValue::Float(result));

@@ -268,7 +268,7 @@ pub struct PackedScaleLayout {
     pub algorithm: PackedScaleAlgorithm,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PackedScaleAlgorithm {
     /// Q4_K / Q5_K: 12-byte scales[12] decoded into 8 (sc, m) pairs.
     KQuant6Bit,

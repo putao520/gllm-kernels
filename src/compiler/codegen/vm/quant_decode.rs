@@ -29,8 +29,7 @@
 //! the `Vec<TraceOp>` at the time of emission.  `push_op` appends and returns the
 //! slot index of the newly-pushed op.
 
-use crate::compiler::trace::TraceOp;
-use crate::compiler::trace::ValueId;
+use crate::compiler::trace::{TraceOp, ValueId, Fp8Format, ScaleSelector};
 use crate::quant::QuantType;
 use crate::quant_format::{
     DataLayout, PackedScaleAlgorithm, QuantDataKind, QuantFormatDescriptor, ScaleDType, ScaleLayout, ZeroLayout,
@@ -561,8 +560,8 @@ impl<'a> DecodeTraceBuilder<'a> {
                     TraceOp::QuantKQuantPackedScaleLookup {
                         scales_base: sub_m_base,
                         sub_block_idx: sub_idx_slot,
-                        is_q3k_extended: false,
-                        is_min: true,
+                        scale_algo: PackedScaleAlgorithm::KQuant6Bit,
+                        selector: ScaleSelector::Min,
                     },
                 );
 
@@ -616,8 +615,8 @@ impl<'a> DecodeTraceBuilder<'a> {
                     },
                 );
                 if matches!(self.desc.data_kind, QuantDataKind::Float8) {
-                    let is_e4m3 = matches!(self.desc.quant_type, QuantType::Fp8E4M3);
-                    push_op(trace, TraceOp::QuantCastFp8toF32 { src: raw, is_e4m3 })
+                    let format = if matches!(self.desc.quant_type, QuantType::Fp8E4M3) { Fp8Format::E4M3 } else { Fp8Format::E5M2 };
+                    push_op(trace, TraceOp::QuantCastFp8toF32 { src: raw, format })
                 } else {
                     push_op(trace, TraceOp::QuantCastI8toF32 { src: raw })
                 }
@@ -831,8 +830,8 @@ impl<'a> DecodeTraceBuilder<'a> {
             TraceOp::QuantKQuantPackedScaleLookup {
                 scales_base: sub_scales_base_slot,
                 sub_block_idx: sub_idx_slot,
-                is_q3k_extended: is_q3k,
-                is_min: false,
+                scale_algo: if is_q3k { PackedScaleAlgorithm::Q3KExtended } else { PackedScaleAlgorithm::KQuant6Bit },
+                selector: ScaleSelector::Scale,
             },
         )
     }
@@ -1064,7 +1063,7 @@ mod tests {
             .build(&mut trace);
         assert_trace_valid(&trace);
         assert!(final_slot.0 < trace.len() as u32);
-        let has_fp8_cast = trace.iter().any(|op| matches!(op, TraceOp::QuantCastFp8toF32 { is_e4m3: true, .. }));
+        let has_fp8_cast = trace.iter().any(|op| matches!(op, TraceOp::QuantCastFp8toF32 { format: Fp8Format::E4M3, .. }));
         assert!(has_fp8_cast, "FP8 E4M3 should use QuantCastFp8toF32");
         let has_i8_cast = trace.iter().any(|op| matches!(op, TraceOp::QuantCastI8toF32 { .. }));
         assert!(!has_i8_cast, "FP8 E4M3 should NOT use QuantCastI8toF32");
@@ -1079,7 +1078,7 @@ mod tests {
             .build(&mut trace);
         assert_trace_valid(&trace);
         assert!(final_slot.0 < trace.len() as u32);
-        let has_fp8_cast = trace.iter().any(|op| matches!(op, TraceOp::QuantCastFp8toF32 { is_e4m3: false, .. }));
+        let has_fp8_cast = trace.iter().any(|op| matches!(op, TraceOp::QuantCastFp8toF32 { format: Fp8Format::E5M2, .. }));
         assert!(has_fp8_cast, "FP8 E5M2 should use QuantCastFp8toF32 with is_e4m3=false");
     }
 
@@ -2473,7 +2472,7 @@ mod tests {
         // Assert: E5M2 uses QuantCastFp8toF32 with is_e4m3=false
         let has_fp8_e5m2 = trace.iter().any(|op| matches!(
             op,
-            TraceOp::QuantCastFp8toF32 { is_e4m3: false, .. }
+            TraceOp::QuantCastFp8toF32 { format: Fp8Format::E5M2, .. }
         ));
         assert!(has_fp8_e5m2, "FP8 E5M2 should use QuantCastFp8toF32 with is_e4m3=false");
 
@@ -2994,7 +2993,7 @@ mod tests {
         // Assert: Q2_K has QuantKQuantPackedScaleLookup with is_min=true for sub_m
         let has_min_lookup = trace.iter().any(|op| matches!(
             op,
-            TraceOp::QuantKQuantPackedScaleLookup { is_min: true, .. }
+            TraceOp::QuantKQuantPackedScaleLookup { selector: ScaleSelector::Min, .. }
         ));
         assert!(has_min_lookup, "Q2_K should have QuantKQuantPackedScaleLookup with is_min=true for sub_m");
     }
@@ -3071,7 +3070,7 @@ mod tests {
         // Assert: sub-scale lookup via QuantKQuantPackedScaleLookup
         let has_packed = trace.iter().any(|op| matches!(
             op,
-            TraceOp::QuantKQuantPackedScaleLookup { is_q3k_extended: false, is_min: false, .. }
+            TraceOp::QuantKQuantPackedScaleLookup { scale_algo: PackedScaleAlgorithm::KQuant6Bit, selector: ScaleSelector::Scale, .. }
         ));
         assert!(has_packed, "Q4_K should have QuantKQuantPackedScaleLookup for sub-scale");
 
@@ -3103,14 +3102,14 @@ mod tests {
         // Assert: has QuantKQuantPackedScaleLookup for scale (not is_min)
         let has_scale_lookup = trace.iter().any(|op| matches!(
             op,
-            TraceOp::QuantKQuantPackedScaleLookup { is_min: false, .. }
+            TraceOp::QuantKQuantPackedScaleLookup { selector: ScaleSelector::Scale, .. }
         ));
         assert!(has_scale_lookup, "Q5_K should have packed scale lookup for sub-scale");
 
         // Assert: has QuantKQuantPackedScaleLookup for min (is_min=true)
         let has_min_lookup = trace.iter().any(|op| matches!(
             op,
-            TraceOp::QuantKQuantPackedScaleLookup { is_min: true, .. }
+            TraceOp::QuantKQuantPackedScaleLookup { selector: ScaleSelector::Min, .. }
         ));
         assert!(has_min_lookup, "Q5_K should have packed scale lookup for sub_m (is_min=true)");
 

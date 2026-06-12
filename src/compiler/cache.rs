@@ -428,7 +428,8 @@ pub struct IncrementalCompileResult {
 
 // ── OpTrace persistence ─────────────────────────────────────────────
 
-use crate::compiler::trace::{TraceOp, ValueId};
+use crate::compiler::trace::{TraceOp, ValueId, Fp8Format, ScaleSelector};
+use crate::quant_format::PackedScaleAlgorithm;
 
 /// Compact binary representation of a TraceOp.
 /// Internal to cache — not exposed publicly.
@@ -491,7 +492,7 @@ impl SerializedTraceOp {
             TraceOp::QuantBroadcast { src, lanes } => Self { tag: 52, operands: [src.0, *lanes as u32, 0, 0], float_val: 0.0 },
             TraceOp::QuantCastF16toF32 { src } => Self { tag: 53, operands: [src.0, 0, 0, 0], float_val: 0.0 },
             TraceOp::QuantCastI8toF32 { src } => Self { tag: 54, operands: [src.0, 0, 0, 0], float_val: 0.0 },
-            TraceOp::QuantCastFp8toF32 { src, is_e4m3 } => Self { tag: if *is_e4m3 { 98 } else { 99 }, operands: [src.0, 0, 0, 0], float_val: 0.0 },
+            TraceOp::QuantCastFp8toF32 { src, format } => Self { tag: match format { Fp8Format::E4M3 => 98, Fp8Format::E5M2 => 99 }, operands: [src.0, 0, 0, 0], float_val: 0.0 },
             TraceOp::QuantCodebookLookup { indices, vector_size, bits_per_entry, .. } =>
                 Self { tag: 55, operands: [indices.0, *vector_size as u32, *bits_per_entry as u32, 0], float_val: 0.0 },
             TraceOp::QuantExtractBits { src, bit_offset, bit_width } =>
@@ -517,7 +518,7 @@ impl SerializedTraceOp {
             TraceOp::QuantCodebookDequant { indices, codebook_ptr, vector_size, bits_per_entry } => Self { tag: 71, operands: [indices.0, codebook_ptr.0, *vector_size as u32, *bits_per_entry as u32], float_val: 0.0 },
             TraceOp::QuantE2m1LutDecode { packed_data_ptr, scale_byte, nvfp4_mode } => Self { tag: 72, operands: [packed_data_ptr.0, scale_byte.0, *nvfp4_mode as u32, 0], float_val: 0.0 },
             TraceOp::QuantLoadBytesVec { ptr, offset_bytes, count, signed } => Self { tag: 73, operands: [ptr.0, *signed as u32, *count as u32, 0], float_val: *offset_bytes as f64 },
-            TraceOp::QuantKQuantPackedScaleLookup { scales_base, sub_block_idx, is_q3k_extended, is_min } => Self { tag: 74, operands: [scales_base.0, sub_block_idx.0, *is_q3k_extended as u32, *is_min as u32], float_val: 0.0 },
+            TraceOp::QuantKQuantPackedScaleLookup { scales_base, sub_block_idx, scale_algo, selector } => Self { tag: 74, operands: [scales_base.0, sub_block_idx.0, matches!(scale_algo, PackedScaleAlgorithm::Q3KExtended) as u32, matches!(selector, ScaleSelector::Min) as u32], float_val: 0.0 },
             TraceOp::Loop { .. } => Self { tag: 80, operands: [0, 0, 0, 0], float_val: 0.0 },
             TraceOp::PanelLoad { base, offset, rows, cols } => Self { tag: 81, operands: [base.0, offset.0, *rows as u32, *cols as u32], float_val: 0.0 },
             TraceOp::PanelStore { base, offset, rows, cols } => Self { tag: 82, operands: [base.0, offset.0, *rows as u32, *cols as u32], float_val: 0.0 },
@@ -591,14 +592,14 @@ impl SerializedTraceOp {
             74 => Some(TraceOp::QuantKQuantPackedScaleLookup {
                 scales_base: ValueId(o[0]),
                 sub_block_idx: ValueId(o[1]),
-                is_q3k_extended: o[2] != 0,
-                is_min: o[3] != 0,
+                scale_algo: if o[2] != 0 { PackedScaleAlgorithm::Q3KExtended } else { PackedScaleAlgorithm::KQuant6Bit },
+                selector: if o[3] != 0 { ScaleSelector::Min } else { ScaleSelector::Scale },
             }),
             95 => Some(TraceOp::MtpDraft { depth: 1, hidden_size: 1, vocab_size: 1 }),
             96 => Some(TraceOp::MlaAttnScore { num_heads: 1, head_dim: 1, d_c: 1, d_rope: 1 }),
             97 => Some(TraceOp::MlaRopeMerge { d_c: 1, d_rope: 1 }),
-            98 => Some(TraceOp::QuantCastFp8toF32 { src: ValueId(o[0]), is_e4m3: true }),
-            99 => Some(TraceOp::QuantCastFp8toF32 { src: ValueId(o[0]), is_e4m3: false }),
+            98 => Some(TraceOp::QuantCastFp8toF32 { src: ValueId(o[0]), format: Fp8Format::E4M3 }),
+            99 => Some(TraceOp::QuantCastFp8toF32 { src: ValueId(o[0]), format: Fp8Format::E5M2 }),
             128 => Some(TraceOp::Tma2DCopy { desc: String::new(), coord_x: ValueId(0), coord_y: ValueId(0), bytes: 0 }),
             130 => Some(TraceOp::QuantQ3KDecode {
                 block_base: ValueId(o[0]),
@@ -951,7 +952,8 @@ mod tests {
 
     #[test]
     fn test_serialize_trace_ops_roundtrip() {
-        use crate::compiler::trace::{TraceOp, ValueId};
+        use crate::compiler::trace::{TraceOp, ValueId, Fp8Format, ScaleSelector};
+use crate::quant_format::PackedScaleAlgorithm;
 
         let ops = vec![
             TraceOp::Input(0),
@@ -990,7 +992,8 @@ mod tests {
 
     #[test]
     fn test_trace_aware_hash_differs() {
-        use crate::compiler::trace::{TraceOp, ValueId};
+        use crate::compiler::trace::{TraceOp, ValueId, Fp8Format, ScaleSelector};
+use crate::quant_format::PackedScaleAlgorithm;
 
         let ops1 = vec![TraceOp::Input(0), TraceOp::Neg(ValueId(0))];
         let ops2 = vec![TraceOp::Input(0), TraceOp::Exp(ValueId(0))];
@@ -1003,7 +1006,8 @@ mod tests {
 
     #[test]
     fn test_trace_aware_hash_deterministic() {
-        use crate::compiler::trace::{TraceOp, ValueId};
+        use crate::compiler::trace::{TraceOp, ValueId, Fp8Format, ScaleSelector};
+use crate::quant_format::PackedScaleAlgorithm;
 
         let ops = vec![TraceOp::Input(0), TraceOp::Const(3.14), TraceOp::Mul(ValueId(0), ValueId(1))];
 
@@ -1030,7 +1034,8 @@ mod tests {
 
     #[test]
     fn test_serialized_trace_op_all_variants() {
-        use crate::compiler::trace::{TraceOp, ValueId};
+        use crate::compiler::trace::{TraceOp, ValueId, Fp8Format, ScaleSelector};
+use crate::quant_format::PackedScaleAlgorithm;
 
         let all_ops = vec![
             TraceOp::Input(42),

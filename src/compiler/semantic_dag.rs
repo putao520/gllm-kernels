@@ -215,6 +215,7 @@ impl SemanticDAG {
             OpKind::TopK { .. } => OpClass::Reduction,
             OpKind::WeightedSum { .. } => OpClass::ElemWise,
             OpKind::KvScatterWrite { .. } => OpClass::Opaque,
+            OpKind::KvCacheWrite { .. } => OpClass::Opaque,
             // P4/P5 stub variants: treat as opaque
             OpKind::VariableLengthBatch
             | OpKind::AttentionSkipMask { .. }

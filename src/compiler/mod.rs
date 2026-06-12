@@ -128,6 +128,7 @@ pub struct GpuForwardOutput {
 }
 
 pub use graph::{CompilerGraph, OpKind, RopeScaling, TensorId, WeightLayout, SymDim, ShapeBinding};
+pub use ir::MoeConfig;
 pub use rope_scaling::{compute_attention_scaling, compute_inv_freq, fill_cos_sin_table, fill_cos_sin_table_partial};
 pub use registry::ScalarOpRegistry;
 pub use semantic_dag::SemanticDAG;

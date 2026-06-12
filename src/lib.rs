@@ -64,6 +64,7 @@ mod tests_amx;
 
 pub use quant_format::QuantFormatDescriptor;
 pub use compiler::quant_format::coverage_matrix;
+pub use compiler::quant_format::QuantFamily;
 pub use traits::{Element, Backend, Kernels};
 
 /// Re-export distributed paging types from gllm-nccl (REQ-DP-014, §11.2).

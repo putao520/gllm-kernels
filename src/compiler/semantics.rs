@@ -98,6 +98,8 @@ pub fn classify(kind: &OpKind) -> OpSemantics {
 
         // KV scatter write: pure memory op (no compute)
         OpKind::KvScatterWrite { .. } => OpSemantics::Opaque,
+        // KV cache write: pure memory op (no compute)
+        OpKind::KvCacheWrite { .. } => OpSemantics::Opaque,
 
         // P4/P5 stub variants: treat as opaque for now
         OpKind::VariableLengthBatch
@@ -303,6 +305,8 @@ pub fn arithmetic_intensity(kind: &OpKind, graph_dtype: crate::types::DType) -> 
         OpKind::ColumnSlice { .. } => 0.0,
         // KV scatter write: pure memory movement, 0 compute
         OpKind::KvScatterWrite { .. } => 0.0,
+        // KV cache write: pure memory movement, 0 compute
+        OpKind::KvCacheWrite { .. } => 0.0,
         // ARCH-SG-QTAP: pure side-effect memcpy + atomic — zero FLOPs, all memory.
         OpKind::QTapSTG { .. } => 0.0,
         // Mega-kernel generate loop ops (GRAPH-SHAPE-DRIVEN-MEGA-KERNEL §2.2)

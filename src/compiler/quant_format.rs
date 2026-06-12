@@ -47,6 +47,57 @@ pub use crate::quant_format::{
 
 use crate::quant::QuantType;
 
+/// Quantization family classifier — replaces 5 independent `is_*` bool parameters
+/// with a single exhaustive enum.
+///
+/// Every [`QuantType`] maps to exactly one `QuantFamily`, and the coverage matrix
+/// decision logic uses `match quant_family { ... }` instead of `if is_float { ... }
+/// else if is_int8 { ... }` chains.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum QuantFamily {
+    /// FP32 / BF16 / FP16 — native float compute.
+    Float,
+    /// Q8_0 / Q8_1 / Q8K — 8-bit integer with native dot-product support.
+    Int8,
+    /// Q4_0 / Q4_1 / Q5_0 / Q5_1 / Q4K / Q5K / AWQ4 / GPTQ4 — 4-5 bit integer packed.
+    Int4,
+    /// NVFP4 (NVIDIA Blackwell native E2M1 + UE4M3).
+    NvFp4,
+    /// MXFP4 (OCP Microscaling E2M1 + E8M0).
+    MxFp4,
+    /// Sub-4-bit / codebook / exotic formats with no native ISA support
+    /// (SqueezeLLM, IQ series, Q2K, Q3K, Q6K, Fp8E4M3, etc.).
+    Other,
+}
+
+impl QuantFamily {
+    /// Classify a [`QuantType`] into its [`QuantFamily`].
+    pub fn from_quant_type(quant_type: QuantType) -> Self {
+        match quant_type {
+            _ if matches!(quant_type, QuantType::F32 | QuantType::Bf16 | QuantType::F16) => {
+                QuantFamily::Float
+            }
+            _ if matches!(quant_type, QuantType::Q8_0 | QuantType::Q8_1 | QuantType::Q8K) => {
+                QuantFamily::Int8
+            }
+            _ if matches!(
+                quant_type,
+                QuantType::Q4_0
+                    | QuantType::Q4_1
+                    | QuantType::Q5_0
+                    | QuantType::Q5_1
+                    | QuantType::Q4K
+                    | QuantType::Q5K
+                    | QuantType::AWQ4
+                    | QuantType::GPTQ4
+            ) => QuantFamily::Int4,
+            QuantType::Nvfp4 => QuantFamily::NvFp4,
+            QuantType::Mxfp4 { .. } => QuantFamily::MxFp4,
+            _ => QuantFamily::Other,
+        }
+    }
+}
+
 /// Compiler-side algorithmic quantization format kind.
 ///
 /// Each variant corresponds to a SPEC-defined quantization algorithm and
@@ -413,20 +464,12 @@ impl CoverageMatrix {
     /// `CoveragePath::DequantFMA`. Native or Assisted paths are selected
     /// when the ISA provides dedicated support for the format.
     pub fn new(quant_type: QuantType) -> Self {
-        let is_float = matches!(quant_type, QuantType::F32 | QuantType::Bf16 | QuantType::F16);
-        let is_int8 = matches!(quant_type, QuantType::Q8_0 | QuantType::Q8_1 | QuantType::Q8K);
-        let is_int4 = matches!(
-            quant_type,
-            QuantType::Q4_0 | QuantType::Q4_1 | QuantType::Q5_0 | QuantType::Q5_1
-                | QuantType::Q4K | QuantType::Q5K | QuantType::AWQ4 | QuantType::GPTQ4
-        );
-        let is_nvfp4 = matches!(quant_type, QuantType::Nvfp4);
-        let is_mxfp4 = matches!(quant_type, QuantType::Mxfp4 { .. });
+        let quant_family = QuantFamily::from_quant_type(quant_type);
 
         let mut entries = Vec::with_capacity(25);
         for &isa in IsaKind::all() {
             for &op in OpCategory::all() {
-                let path = best_path(quant_type, isa, op, is_float, is_int8, is_int4, is_nvfp4, is_mxfp4);
+                let path = best_path(quant_type, isa, op, quant_family);
                 entries.push(CoverageEntry { isa, op, path });
             }
         }
@@ -527,108 +570,61 @@ fn best_path(
     quant_type: QuantType,
     isa: IsaKind,
     op: OpCategory,
-    is_float: bool,
-    is_int8: bool,
-    is_int4: bool,
-    is_nvfp4: bool,
-    is_mxfp4: bool,
+    quant_family: QuantFamily,
 ) -> CoveragePath {
     match op {
-        OpCategory::Gemm => gemm_path(quant_type, isa, is_float, is_int8, is_int4, is_nvfp4, is_mxfp4),
-        OpCategory::Attention => attention_path(isa, is_float),
+        OpCategory::Gemm => gemm_path(isa, quant_family),
+        OpCategory::Attention => attention_path(isa, quant_family),
         OpCategory::Norm => norm_path(isa),
         OpCategory::Activation => CoveragePath::Native,
-        OpCategory::Quant => quant_path(quant_type, isa, is_float, is_int8, is_int4),
+        OpCategory::Quant => quant_path(isa, quant_family, quant_type),
     }
 }
 
-/// Best GEMM path per (QuantType, ISA).
-fn gemm_path(
-    _qt: QuantType,
-    isa: IsaKind,
-    is_float: bool,
-    is_int8: bool,
-    is_int4: bool,
-    is_nvfp4: bool,
-    is_mxfp4: bool,
-) -> CoveragePath {
+/// Best GEMM path per (QuantFamily, ISA).
+fn gemm_path(isa: IsaKind, quant_family: QuantFamily) -> CoveragePath {
     match isa {
-        IsaKind::X86 => {
-            if is_float {
-                CoveragePath::Native
-            } else if is_int8 {
-                CoveragePath::Native
-            } else if is_nvfp4 {
-                CoveragePath::DequantFMA
-            } else if is_mxfp4 {
-                CoveragePath::DequantFMA
-            } else if is_int4 {
-                CoveragePath::Assisted
-            } else {
-                CoveragePath::DequantFMA
-            }
-        }
-        IsaKind::Arm => {
-            if is_float {
-                CoveragePath::Native
-            } else if is_int8 {
-                CoveragePath::Native
-            } else if is_int4 {
-                CoveragePath::Assisted
-            } else {
-                CoveragePath::DequantFMA
-            }
-        }
-        IsaKind::GpuPtx => {
-            if is_float {
-                CoveragePath::Native
-            } else if is_nvfp4 {
-                CoveragePath::Native
-            } else if is_mxfp4 {
-                CoveragePath::Native
-            } else if is_int8 {
-                CoveragePath::Native
-            } else if is_int4 {
-                CoveragePath::Assisted
-            } else {
-                CoveragePath::DequantFMA
-            }
-        }
-        IsaKind::GpuHip => {
-            if is_float {
-                CoveragePath::Native
-            } else if is_int8 {
-                CoveragePath::Native
-            } else if is_int4 {
-                CoveragePath::Assisted
-            } else {
-                CoveragePath::DequantFMA
-            }
-        }
-        IsaKind::GpuMsl => {
-            if is_float {
-                CoveragePath::Native
-            } else if is_int8 {
-                CoveragePath::Assisted
-            } else {
-                CoveragePath::DequantFMA
-            }
-        }
+        IsaKind::X86 => match quant_family {
+            QuantFamily::Float => CoveragePath::Native,
+            QuantFamily::Int8 => CoveragePath::Native,
+            QuantFamily::Int4 => CoveragePath::Assisted,
+            QuantFamily::NvFp4 | QuantFamily::MxFp4 | QuantFamily::Other => CoveragePath::DequantFMA,
+        },
+        IsaKind::Arm => match quant_family {
+            QuantFamily::Float => CoveragePath::Native,
+            QuantFamily::Int8 => CoveragePath::Native,
+            QuantFamily::Int4 => CoveragePath::Assisted,
+            QuantFamily::NvFp4 | QuantFamily::MxFp4 | QuantFamily::Other => CoveragePath::DequantFMA,
+        },
+        IsaKind::GpuPtx => match quant_family {
+            QuantFamily::Float => CoveragePath::Native,
+            QuantFamily::NvFp4 | QuantFamily::MxFp4 => CoveragePath::Native,
+            QuantFamily::Int8 => CoveragePath::Native,
+            QuantFamily::Int4 => CoveragePath::Assisted,
+            QuantFamily::Other => CoveragePath::DequantFMA,
+        },
+        IsaKind::GpuHip => match quant_family {
+            QuantFamily::Float => CoveragePath::Native,
+            QuantFamily::Int8 => CoveragePath::Native,
+            QuantFamily::Int4 => CoveragePath::Assisted,
+            QuantFamily::NvFp4 | QuantFamily::MxFp4 | QuantFamily::Other => CoveragePath::DequantFMA,
+        },
+        IsaKind::GpuMsl => match quant_family {
+            QuantFamily::Float => CoveragePath::Native,
+            QuantFamily::Int8 => CoveragePath::Assisted,
+            QuantFamily::Int4 | QuantFamily::NvFp4 | QuantFamily::MxFp4 | QuantFamily::Other => CoveragePath::DequantFMA,
+        },
     }
 }
 
 /// Best attention path: attention operates on dequantized activations.
-fn attention_path(isa: IsaKind, is_float: bool) -> CoveragePath {
-    if is_float {
-        CoveragePath::Native
-    } else {
-        match isa {
-            IsaKind::X86 => CoveragePath::Assisted,
-            IsaKind::Arm => CoveragePath::Assisted,
-            IsaKind::GpuPtx => CoveragePath::Assisted,
-            IsaKind::GpuHip => CoveragePath::Assisted,
+fn attention_path(isa: IsaKind, quant_family: QuantFamily) -> CoveragePath {
+    match quant_family {
+        QuantFamily::Float => CoveragePath::Native,
+        _ => match isa {
+            IsaKind::X86 | IsaKind::Arm | IsaKind::GpuPtx | IsaKind::GpuHip => CoveragePath::Assisted,
             IsaKind::GpuMsl => CoveragePath::DequantFMA,
-        }
+        },
     }
 }
 
@@ -644,56 +640,22 @@ fn norm_path(isa: IsaKind) -> CoveragePath {
 }
 
 /// Best quantization/dequantization path.
-fn quant_path(
-    _qt: QuantType,
-    isa: IsaKind,
-    is_float: bool,
-    is_int8: bool,
-    is_int4: bool,
-) -> CoveragePath {
-    if is_float {
-        return CoveragePath::Native;
-    }
-    match isa {
-        IsaKind::X86 => {
-            if is_int8 {
-                CoveragePath::Native
-            } else if is_int4 {
-                CoveragePath::Assisted
-            } else {
-                CoveragePath::DequantFMA
-            }
-        }
-        IsaKind::Arm => {
-            if is_int8 {
-                CoveragePath::Native
-            } else if is_int4 {
-                CoveragePath::Assisted
-            } else {
-                CoveragePath::DequantFMA
-            }
-        }
-        IsaKind::GpuPtx => {
-            if is_int8 {
-                CoveragePath::Native
-            } else {
-                CoveragePath::Assisted
-            }
-        }
-        IsaKind::GpuHip => {
-            if is_int8 {
-                CoveragePath::Native
-            } else {
-                CoveragePath::Assisted
-            }
-        }
-        IsaKind::GpuMsl => {
-            if is_int8 {
-                CoveragePath::Assisted
-            } else {
-                CoveragePath::DequantFMA
-            }
-        }
+fn quant_path(isa: IsaKind, quant_family: QuantFamily, _qt: QuantType) -> CoveragePath {
+    match quant_family {
+        QuantFamily::Float => CoveragePath::Native,
+        QuantFamily::Int8 => match isa {
+            IsaKind::X86 | IsaKind::Arm | IsaKind::GpuPtx | IsaKind::GpuHip => CoveragePath::Native,
+            IsaKind::GpuMsl => CoveragePath::Assisted,
+        },
+        QuantFamily::Int4 => match isa {
+            IsaKind::X86 | IsaKind::Arm => CoveragePath::Assisted,
+            IsaKind::GpuPtx | IsaKind::GpuHip => CoveragePath::Assisted,
+            IsaKind::GpuMsl => CoveragePath::DequantFMA,
+        },
+        QuantFamily::NvFp4 | QuantFamily::MxFp4 | QuantFamily::Other => match isa {
+            IsaKind::X86 | IsaKind::Arm | IsaKind::GpuMsl => CoveragePath::DequantFMA,
+            IsaKind::GpuPtx | IsaKind::GpuHip => CoveragePath::Assisted,
+        },
     }
 }
 

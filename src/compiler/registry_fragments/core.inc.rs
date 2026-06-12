@@ -108,6 +108,7 @@ impl ScalarOpRegistry {
             OpKind::TopK { .. } => OpKindKey::TopK,
             OpKind::WeightedSum { .. } => OpKindKey::WeightedSum,
             OpKind::KvScatterWrite { .. } => OpKindKey::KvScatterWrite,
+            OpKind::KvCacheWrite { .. } => OpKindKey::KvCacheWrite,
             // P4/P5 stub variants
             OpKind::VariableLengthBatch => OpKindKey::VariableLengthBatch,
             OpKind::AttentionSkipMask { .. } => OpKindKey::AttentionSkipMask,

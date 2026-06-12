@@ -49,6 +49,7 @@ pub enum OpKindKey {
     TopK,
     WeightedSum,
     KvScatterWrite,
+    KvCacheWrite,
     // P4/P5 stub variants
     VariableLengthBatch,
     AttentionSkipMask,

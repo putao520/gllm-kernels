@@ -460,6 +460,11 @@ pub enum OpKind {
         dtype_size: usize,
     },
 
+    /// CPU-side KV cache write: store K/V projections to paged KV cache.
+    /// Used by generate graphs where MHA writes K/V to the KV cache for future decoding.
+    /// Inputs: [k_proj, v_proj]
+    KvCacheWrite { num_kv_heads: usize, head_dim: usize, seq_len: SymDim },
+
     // ── P4/P5 features ──
     /// Variable-length batching for ragged inputs.
     VariableLengthBatch,

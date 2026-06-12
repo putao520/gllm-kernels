@@ -1,6 +1,6 @@
 use crate::compiler::graph::OpKind;
 use crate::quant::QuantType;
-use crate::quant_format::ZeroLayout;
+use crate::quant_format::{PackedScaleAlgorithm, ZeroLayout};
 
 /// Scalar + SymExec output: an operator's complete computational structure.
 #[derive(Debug, Clone)]
@@ -122,6 +122,24 @@ pub fn classify_pattern(body: &[TraceOp]) -> ComputePattern {
             num_outputs: 1,
         },
     }
+}
+
+/// FP8 format variant — determines exponent bias and mantissa width.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum Fp8Format {
+    /// E4M3: bias=7, 3 mantissa bits, no Inf/NaN.
+    E4M3,
+    /// E5M2: bias=15, 2 mantissa bits, supports Inf/NaN.
+    E5M2,
+}
+
+/// K-Quant scale selector — determines which value is extracted from the packed `scales[]` array.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum ScaleSelector {
+    /// Extract the sub-block scale (d × scale factor).
+    Scale,
+    /// Extract the sub-block min/zero-point value.
+    Min,
 }
 
 /// SSA value handle — stable, name-based reference to a TraceOp result.
@@ -432,9 +450,9 @@ pub enum TraceOp {
 
     /// FP8 → F32 float-to-float conversion: result = fp8_to_f32(src).
     /// Unlike QuantCastI8toF32 (integer→float), this performs proper FP8 IEEE decode.
-    /// `is_e4m3`: true = E4M3 (bias=7, 3 mantissa bits), false = E5M2 (bias=15, 2 mantissa bits).
+    /// `format`: E4M3 (bias=7, 3 mantissa bits) or E5M2 (bias=15, 2 mantissa bits).
     /// 后端映射: VmInstr::VecUnaryOp { op: Fp8E4M3ToFloat / Fp8E5M2ToFloat }
-    QuantCastFp8toF32 { src: ValueId, is_e4m3: bool },
+    QuantCastFp8toF32 { src: ValueId, format: Fp8Format },
 
     /// Codebook 查表: indices → f32 values via static codebook。
     /// 用于 IQ 系列 (IQ4_NL 等) 的 codebook 反量化。
@@ -495,10 +513,10 @@ pub enum TraceOp {
 
     /// K-Quant (Q3_K/Q4_K/Q5_K) packed 6-bit scale/min lookup for one sub-block.
     /// Decodes the packed scale from `scales[12]` array indexed by sub_block_idx.
-    /// When is_min=false (scale):
+    /// scale_algo=KQuant6Bit, selector=Scale:
     ///   if j<4: sc = scales[j] & 0x3F
     ///   if j>=4: sc = (scales[j+4] & 0xF) | ((scales[j-4] >> 6) << 4)
-    /// When is_min=true (min/zero):
+    /// scale_algo=KQuant6Bit, selector=Min:
     ///   if j<4: m = scales[j+4] & 0x3F
     ///   if j>=4: m = (scales[j+4] >> 4) | ((scales[j] >> 6) << 4)
     /// Result: (f32)sc/m broadcast to all SIMD lanes.
@@ -506,8 +524,8 @@ pub enum TraceOp {
     QuantKQuantPackedScaleLookup {
         scales_base: ValueId,
         sub_block_idx: ValueId,
-        is_q3k_extended: bool,
-        is_min: bool,
+        scale_algo: PackedScaleAlgorithm,
+        selector: ScaleSelector,
     },
 
     /// 标量内存加载 (带字节偏移): result = *(f16_or_i8*)(base_ptr + offset_bytes)。
@@ -1531,7 +1549,7 @@ impl TraceOp {
             TraceOp::QuantBroadcast { src, lanes } => TraceOp::QuantBroadcast { src: m(src), lanes },
             TraceOp::QuantCastF16toF32 { src } => TraceOp::QuantCastF16toF32 { src: m(src) },
             TraceOp::QuantCastI8toF32 { src } => TraceOp::QuantCastI8toF32 { src: m(src) },
-            TraceOp::QuantCastFp8toF32 { src, is_e4m3 } => TraceOp::QuantCastFp8toF32 { src: m(src), is_e4m3 },
+            TraceOp::QuantCastFp8toF32 { src, format } => TraceOp::QuantCastFp8toF32 { src: m(src), format },
             TraceOp::QuantCodebookLookup { indices, codebook_data, vector_size, bits_per_entry } =>
                 TraceOp::QuantCodebookLookup { indices: m(indices), codebook_data, vector_size, bits_per_entry },
             TraceOp::QuantExtractBits { src, bit_offset, bit_width } =>
@@ -1544,8 +1562,8 @@ impl TraceOp {
             TraceOp::QuantPtrAddOffset { base, offset_bytes } => TraceOp::QuantPtrAddOffset { base: m(base), offset_bytes },
             TraceOp::QuantPtrAddDynamic { base, index } => TraceOp::QuantPtrAddDynamic { base: m(base), index: m(index) },
             TraceOp::QuantAndMask { src, mask } => TraceOp::QuantAndMask { src: m(src), mask },
-            TraceOp::QuantKQuantPackedScaleLookup { scales_base, sub_block_idx, is_q3k_extended, is_min } =>
-                TraceOp::QuantKQuantPackedScaleLookup { scales_base: m(scales_base), sub_block_idx: m(sub_block_idx), is_q3k_extended, is_min },
+            TraceOp::QuantKQuantPackedScaleLookup { scales_base, sub_block_idx, scale_algo, selector } =>
+                TraceOp::QuantKQuantPackedScaleLookup { scales_base: m(scales_base), sub_block_idx: m(sub_block_idx), scale_algo, selector },
             TraceOp::QuantScalarLoad { ptr, offset_bytes } => TraceOp::QuantScalarLoad { ptr: m(ptr), offset_bytes },
             TraceOp::QuantLoadF16toF32 { ptr, offset_bytes } => TraceOp::QuantLoadF16toF32 { ptr: m(ptr), offset_bytes },
             TraceOp::QuantLoadI8toF32 { ptr, offset_bytes } => TraceOp::QuantLoadI8toF32 { ptr: m(ptr), offset_bytes },

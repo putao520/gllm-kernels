@@ -31,9 +31,9 @@
 
 use super::instr::*;
 use super::trace_opt::TracePassPipeline;
-use crate::compiler::trace::{CmpOp, ComputePattern, QuantPrecision, ReduceKind, TraceOp, TypedSlot, infer_result_dtype, ValueId};
+use crate::compiler::trace::{CmpOp, ComputePattern, Fp8Format, QuantPrecision, ReduceKind, ScaleSelector, TraceOp, TypedSlot, infer_result_dtype, ValueId};
 use crate::quant::QuantType;
-use crate::quant_format::{QuantDataKind, ZeroLayout};
+use crate::quant_format::{PackedScaleAlgorithm, QuantDataKind, ZeroLayout};
 use crate::types::CompilerError;
 
 static TRACE_OPT_PIPELINE: std::sync::OnceLock<TracePassPipeline> = std::sync::OnceLock::new();
@@ -923,9 +923,9 @@ fn dispatch_trace_op(
             Ok(r)
         }
 
-        TraceOp::QuantCastFp8toF32 { src, is_e4m3 } => {
+        TraceOp::QuantCastFp8toF32 { src, format } => {
             let r = prog.alloc_vreg(VRegKind::Vec, width);
-            let op = if *is_e4m3 { VecUnaryOp::Fp8E4M3ToFloat } else { VecUnaryOp::Fp8E5M2ToFloat };
+            let op = match format { Fp8Format::E4M3 => VecUnaryOp::Fp8E4M3ToFloat, Fp8Format::E5M2 => VecUnaryOp::Fp8E5M2ToFloat };
             prog.emit(VmInstr::VecUnaryOp { dst: r, a: slots[src.0 as usize], op });
             Ok(r)
         }
@@ -1029,15 +1029,15 @@ fn dispatch_trace_op(
             Ok(r)
         }
 
-        TraceOp::QuantKQuantPackedScaleLookup { scales_base, sub_block_idx, is_q3k_extended, is_min } => {
+        TraceOp::QuantKQuantPackedScaleLookup { scales_base, sub_block_idx, scale_algo, selector } => {
             let r = prog.alloc_vreg(VRegKind::Vec, width);
             prog.emit(VmInstr::GgufKQuantScaleLoad {
                 dst: r,
                 scales_base: slots[scales_base.0 as usize],
                 sub_block_idx: slots[sub_block_idx.0 as usize],
                 scales_count: 8,
-                is_q3k_extended: *is_q3k_extended,
-                is_min: *is_min,
+                is_q3k_extended: matches!(scale_algo, PackedScaleAlgorithm::Q3KExtended),
+                is_min: matches!(selector, ScaleSelector::Min),
                 width,
             });
             Ok(r)
