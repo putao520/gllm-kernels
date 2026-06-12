@@ -151,6 +151,20 @@ pub enum QuantType {
 // §0.5.8 SideEffect — 副作用标记
 // ============================================================================
 
+/// Classification of a VM instruction's side effect.
+///
+/// ARCH-JIT-DATA-YIELDS: replaces `is_control_flow: bool` with a semantic enum.
+/// The effect family drives scheduling and fence decisions, not a bool flag.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum EffectFamily {
+    /// Pure computation — no side effects, freely reorderable.
+    Pure,
+    /// Memory side effect — writes to memory, needs ordering but not control flow.
+    Memory,
+    /// Control flow — alters execution path (branches, loops, conditional jumps).
+    ControlFlow,
+}
+
 /// VmInstr 副作用标记 — 标记融合边界约束。
 #[derive(Clone, Debug)]
 pub struct SideEffect {
@@ -162,8 +176,8 @@ pub struct SideEffect {
     pub writes_shared_mem: bool,
     /// 读取共享状态 → 允许融合但需保留屏障
     pub reads_shared_state: bool,
-    /// 控制流指令 → 强制融合边界
-    pub is_control_flow: bool,
+    /// 副作用族 — 驱动调度和屏障决策
+    pub effect_family: EffectFamily,
 }
 
 impl SideEffect {
@@ -174,7 +188,7 @@ impl SideEffect {
             writes_output_buffer: false,
             writes_shared_mem: false,
             reads_shared_state: false,
-            is_control_flow: false,
+            effect_family: EffectFamily::Pure,
         }
     }
 
@@ -182,7 +196,7 @@ impl SideEffect {
     pub fn is_fusion_barrier(&self) -> bool {
         self.writes_kv_cache
             || self.writes_output_buffer
-            || self.is_control_flow
+            || self.effect_family == EffectFamily::ControlFlow
     }
 }
 
@@ -341,6 +355,7 @@ pub fn meta_vec_store(working_set_bytes: usize) -> VmInstrMeta {
         quant_boundary: QuantBoundary::none(),
         side_effect: SideEffect {
             writes_output_buffer: true,
+            effect_family: EffectFamily::Memory,
             ..SideEffect::none()
         },
     }
@@ -399,7 +414,7 @@ pub fn meta_control_flow() -> VmInstrMeta {
         working_set_bytes: 0,
         quant_boundary: QuantBoundary::none(),
         side_effect: SideEffect {
-            is_control_flow: true,
+            effect_family: EffectFamily::ControlFlow,
             ..SideEffect::none()
         },
     }
@@ -416,6 +431,7 @@ pub fn meta_kv_write(working_set_bytes: usize) -> VmInstrMeta {
         quant_boundary: QuantBoundary::none(),
         side_effect: SideEffect {
             writes_kv_cache: true,
+            effect_family: EffectFamily::Memory,
             ..SideEffect::none()
         },
     }
@@ -495,7 +511,7 @@ mod tests {
         assert!(kv_write.is_fusion_barrier());
 
         let control = SideEffect {
-            is_control_flow: true,
+            effect_family: EffectFamily::ControlFlow,
             ..SideEffect::none()
         };
         assert!(control.is_fusion_barrier());
@@ -539,7 +555,7 @@ mod tests {
         assert!(gemm.arithmetic_intensity > 1.0);
 
         let ctrl = meta_control_flow();
-        assert!(ctrl.side_effect.is_control_flow);
+        assert_eq!(ctrl.side_effect.effect_family, EffectFamily::ControlFlow);
         assert!(ctrl.side_effect.is_fusion_barrier());
     }
 
@@ -679,7 +695,7 @@ mod tests {
         assert!(!se.writes_output_buffer);
         assert!(!se.writes_shared_mem);
         assert!(!se.reads_shared_state);
-        assert!(!se.is_control_flow);
+        assert_eq!(se.effect_family, EffectFamily::Pure);
         assert!(!se.is_fusion_barrier());
     }
 

@@ -303,19 +303,10 @@ pub(super) fn emit_fusion_groups(
             continue;
         }
 
-        // REQ-UMK-012: 从 FusionGroup.hetero_layer_type 推导异构层子类型（OpKind 参数驱动），非 label 前缀
-        let is_sliding_small_op = group.hetero_layer_type == Some(HeteroLayerType::SlidingSmall);
-        let is_full_small_op = group.hetero_layer_type == Some(HeteroLayerType::FullSmall);
-        let is_sliding_large_op = group.hetero_layer_type == Some(HeteroLayerType::SlidingLarge);
-        let is_full_large_op = group.hetero_layer_type == Some(HeteroLayerType::FullLarge);
-        let is_sliding_op = is_sliding_small_op || is_sliding_large_op;
-        let is_full_op = is_full_small_op || is_full_large_op;
-        // REQ-UMK-012: is_layer_group 替代 anchor_op.label.starts_with("layer.")
-        let is_layer_op = group.is_layer_group;
         let group_op_labels: Vec<String> = group.ops.iter()
             .filter_map(|&oid| graph.op(oid).map(|o| o.label.clone()))
             .collect();
-        eprintln!("[LAYER-DETECT] gi={gi} label='{}' is_layer={is_layer_op} ops=[{}] mode={:?}", anchor_op.label, group_op_labels.join(", "), group.mode);
+        eprintln!("[LAYER-DETECT] gi={gi} label='{}' is_layer={} ops=[{}] mode={:?}", anchor_op.label, group.is_layer_group, group_op_labels.join(", "), group.mode);
 
         // ── Heterogeneous layer loop handling (4-type: sliding/full × small/large FFN) ──
         //
@@ -341,7 +332,7 @@ pub(super) fn emit_fusion_groups(
             let layers_per_seg = hcfg.sliding_per_segment + 1;
 
             // ── Small segment entry (sliding+small ops) ──
-            if is_sliding_small_op && state.hetero_phase == HeteroPhase::BeforeLayers {
+            if group.hetero_layer_type == Some(HeteroLayerType::SlidingSmall) && state.hetero_phase == HeteroPhase::BeforeLayers {
                 // Outer loop for small segments
                 let seg_counter = prog.alloc_vreg(VRegKind::Counter, SimdWidth::Scalar);
                 let seg_byte_off = prog.alloc_vreg(VRegKind::ByteOffset, SimdWidth::Scalar);
@@ -381,7 +372,7 @@ pub(super) fn emit_fusion_groups(
                 state.hetero_phase = HeteroPhase::InSlidingLoop;
             }
             // ── Sliding→Full transition within small segment ──
-            if is_full_small_op && state.hetero_phase == HeteroPhase::InSlidingLoop {
+            if group.hetero_layer_type == Some(HeteroLayerType::FullSmall) && state.hetero_phase == HeteroPhase::InSlidingLoop {
                 // ActivationSwap before inner LoopEnd: each sliding iteration swaps ping-pong
                 if let Some((ping, pong)) = activation_swap_vregs {
                     prog.emit(VmInstr::ActivationSwap { ptr_a: ping, ptr_b: pong });
@@ -448,7 +439,7 @@ pub(super) fn emit_fusion_groups(
                 state.hetero_phase = HeteroPhase::InFullBody;
             }
             // ── Small→Large segment transition (end small outer loop, start large outer loop) ──
-            if is_sliding_large_op && state.hetero_phase == HeteroPhase::InFullBody {
+            if group.hetero_layer_type == Some(HeteroLayerType::SlidingLarge) && state.hetero_phase == HeteroPhase::InFullBody {
                 // ActivationSwap before outer small segment LoopEnd
                 if let Some((ping, pong)) = activation_swap_vregs {
                     prog.emit(VmInstr::ActivationSwap { ptr_a: ping, ptr_b: pong });
@@ -508,7 +499,7 @@ pub(super) fn emit_fusion_groups(
                 state.hetero_phase = HeteroPhase::InLargeSlidingLoop;
             }
             // ── Large sliding→Full transition ──
-            if is_full_large_op && state.hetero_phase == HeteroPhase::InLargeSlidingLoop {
+            if group.hetero_layer_type == Some(HeteroLayerType::FullLarge) && state.hetero_phase == HeteroPhase::InLargeSlidingLoop {
                 // ActivationSwap before inner sliding LoopEnd
                 if let Some((ping, pong)) = activation_swap_vregs {
                     prog.emit(VmInstr::ActivationSwap { ptr_a: ping, ptr_b: pong });
@@ -552,7 +543,7 @@ pub(super) fn emit_fusion_groups(
             // If we're in a full body phase (InFullBody/InLargeFullBody),
             // the inner loop was already closed by the phase transition,
             // so we only need to close the outer segment loop (1 LoopEnd).
-            if !is_layer_op && matches!(state.hetero_phase,
+            if !group.is_layer_group && matches!(state.hetero_phase,
                 HeteroPhase::InSlidingLoop | HeteroPhase::InFullBody
                 | HeteroPhase::InLargeSlidingLoop | HeteroPhase::InLargeFullBody
             ) {
@@ -578,7 +569,7 @@ pub(super) fn emit_fusion_groups(
         } else {
             // ── Standard (homogeneous) layer loop ──
             // ── Layer loop entry: emit LoopBegin + compute layer_weight_base ──
-            if is_layer_op && !state.in_layer_loop {
+            if group.is_layer_group && !state.in_layer_loop {
                 if let Some(cfg) = layer_loop_cfg {
                     let counter = prog.alloc_vreg(VRegKind::Counter, SimdWidth::Scalar);
                     let byte_offset = prog.alloc_vreg(VRegKind::ByteOffset, SimdWidth::Scalar);
@@ -646,7 +637,7 @@ pub(super) fn emit_fusion_groups(
             }
 
             // ── Layer loop exit: emit ActivationSwap + LoopEnd, adjust weight_ptr for globals ──
-            if !is_layer_op && state.in_layer_loop {
+            if !group.is_layer_group && state.in_layer_loop {
                 // §0.2.8 ActivationSwap: 每层迭代末尾交换 ping-pong buffer 指针
                 if let Some((ping, pong)) = activation_swap_vregs {
                     prog.emit(VmInstr::ActivationSwap { ptr_a: ping, ptr_b: pong });

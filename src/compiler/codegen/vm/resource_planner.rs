@@ -134,6 +134,18 @@ pub enum InvariantComputation {
 // §1.3 GroupPressure — 融合组寄存器压力 (REQ-GRP-003, Wave 3 实现)
 // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
+/// Spill/fence policy for a fusion group.
+///
+/// ARCH-JIT-DATA-YIELDS: replaces `needs_spill_fence: bool` with a semantic enum.
+/// Derived from register pressure vs available register count.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SpillPolicy {
+    /// No spill needed — register pressure within budget.
+    NoSpill,
+    /// Spill fence required — register pressure exceeds available registers.
+    FenceRequired,
+}
+
 /// 融合组的寄存器压力估计 — 指导代码发射策略。
 ///
 /// 在发射每个融合组的代码之前查询此结构，决定：
@@ -154,8 +166,8 @@ pub struct GroupPressure {
     pub available_gpr_regs: usize,
     /// 建议的 GEMM 展开策略
     pub suggested_blocking: Option<GemmBlocking>,
-    /// 是否需要该组前后插入 spill/reload
-    pub needs_spill_fence: bool,
+    /// Spill/fence policy — derived from register pressure vs available registers.
+    pub spill_policy: SpillPolicy,
 }
 
 // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -450,7 +462,11 @@ pub fn estimate_register_pressure(
         let available_vec = total_vec_regs.saturating_sub(4); // 预留 callee-save
         let available_gpr = total_gpr_regs.saturating_sub(4);
 
-        let needs_spill_fence = vec_regs > available_vec || gpr_regs > available_gpr;
+        let spill_policy = if vec_regs > available_vec || gpr_regs > available_gpr {
+            SpillPolicy::FenceRequired
+        } else {
+            SpillPolicy::NoSpill
+        };
 
         let suggested_blocking = if is_gemm {
             // 简化: 从可用 vec regs 推导 blocking
@@ -468,7 +484,7 @@ pub fn estimate_register_pressure(
             available_vec_regs: available_vec,
             available_gpr_regs: available_gpr,
             suggested_blocking,
-            needs_spill_fence,
+            spill_policy,
         }
     }).collect()
 }
@@ -742,7 +758,7 @@ impl GraphResourcePlan {
     /// 查询指定融合组是否需要 spill fence。
     pub fn group_needs_spill(&self, group_id: usize) -> bool {
         self.pressure.get(group_id)
-            .map(|g| g.needs_spill_fence)
+            .map(|g| g.spill_policy == SpillPolicy::FenceRequired)
             .unwrap_or(false)
     }
 
@@ -1125,7 +1141,7 @@ mod data_structure_tests {
             available_vec_regs: 28,
             available_gpr_regs: 12,
             suggested_blocking: Some(blocking.clone()),
-            needs_spill_fence: false,
+            spill_policy: SpillPolicy::NoSpill,
         };
 
         assert_eq!(gp.group_id, 2);
@@ -1135,7 +1151,7 @@ mod data_structure_tests {
         assert_eq!(gp.available_gpr_regs, 12);
         assert!(gp.suggested_blocking.is_some());
         assert_eq!(gp.suggested_blocking.as_ref().unwrap().mr, 4);
-        assert!(!gp.needs_spill_fence);
+        assert_eq!(gp.spill_policy, SpillPolicy::NoSpill);
     }
 
     // ── 9. StackBlueprint ─────────────────────────────────────────────
@@ -1355,7 +1371,7 @@ mod data_structure_tests {
             16,
             8,
         );
-        assert!(result[0].needs_spill_fence, "oversubscribed group should need spill fence");
+        assert_eq!(result[0].spill_policy, SpillPolicy::FenceRequired, "oversubscribed group should need spill fence");
     }
 
     // ── 20. plan_stack_blueprint — no args, no debug probe ────────────
@@ -1381,7 +1397,7 @@ mod data_structure_tests {
             available_vec_regs: 28,
             available_gpr_regs: 12,
             suggested_blocking: None,
-            needs_spill_fence: false,
+            spill_policy: SpillPolicy::NoSpill,
         }];
         let bp = plan_stack_blueprint(&pressure, 6, 4, true);
         assert!(bp.debug_probe_region.is_some());
@@ -1577,7 +1593,7 @@ mod data_structure_tests {
                 available_vec_regs: 16,
                 available_gpr_regs: 8,
                 suggested_blocking: None,
-                needs_spill_fence: true,
+                spill_policy: SpillPolicy::FenceRequired,
             },
             GroupPressure {
                 group_id: 1,
@@ -1586,7 +1602,7 @@ mod data_structure_tests {
                 available_vec_regs: 16,
                 available_gpr_regs: 8,
                 suggested_blocking: None,
-                needs_spill_fence: false,
+                spill_policy: SpillPolicy::NoSpill,
             },
         ];
 
@@ -1877,7 +1893,7 @@ mod data_structure_tests {
 
         // group 2: same as group 1
         assert_eq!(result[2].peak_vec_regs, 4);
-        assert!(!result[2].needs_spill_fence);
+        assert_eq!(result[2].spill_policy, SpillPolicy::NoSpill);
     }
 
     // ── 39. derive_loop_invariants_from_graph — graph with Gather produces PackMapBase ─
@@ -2134,7 +2150,7 @@ mod data_structure_tests {
             available_vec_regs: 16,
             available_gpr_regs: 8,
             suggested_blocking: None,
-            needs_spill_fence: true,
+            spill_policy: SpillPolicy::FenceRequired,
         }];
 
         // Act
@@ -2208,7 +2224,7 @@ mod data_structure_tests {
         assert_eq!(result[0].peak_vec_regs, 4);
         assert_eq!(result[0].peak_gpr_regs, 6);
         assert!(result[0].suggested_blocking.is_none());
-        assert!(!result[0].needs_spill_fence, "minimum defaults should not trigger spill");
+        assert_eq!(result[0].spill_policy, SpillPolicy::NoSpill, "minimum defaults should not trigger spill");
     }
 
     // ── 48. build_resource_plan — loop_invariant_by_index returns correct kinds ──
@@ -2287,7 +2303,7 @@ mod data_structure_tests {
             available_vec_regs: 28,
             available_gpr_regs: 12,
             suggested_blocking: None,
-            needs_spill_fence: false,
+            spill_policy: SpillPolicy::NoSpill,
         }];
         let bp1 = plan_stack_blueprint(&pressure, 5, 3, true);
 
@@ -2342,7 +2358,7 @@ mod data_structure_tests {
             available_vec_regs: 28,
             available_gpr_regs: 12,
             suggested_blocking: None,
-            needs_spill_fence: false,
+            spill_policy: SpillPolicy::NoSpill,
         }];
 
         // Act
@@ -2461,7 +2477,7 @@ mod data_structure_tests {
             available_vec_regs: 16,
             available_gpr_regs: 8,
             suggested_blocking: None,
-            needs_spill_fence: true,
+            spill_policy: SpillPolicy::FenceRequired,
         }];
 
         // Act
@@ -2514,7 +2530,7 @@ mod data_structure_tests {
         // Assert: 50 ops → 50*2=100 vec regs, 50*3=150 gpr regs (no minimum clamp needed)
         assert_eq!(result[0].peak_vec_regs, 100, "50 ops * 2 vec per op = 100");
         assert_eq!(result[0].peak_gpr_regs, 150, "50 ops * 3 gpr per op = 150");
-        assert!(result[0].needs_spill_fence, "100 vec >> 28 available, needs spill");
+        assert_eq!(result[0].spill_policy, SpillPolicy::FenceRequired, "100 vec >> 28 available, needs spill");
     }
 
     // ── 60. build_resource_plan — empty graph (zero groups, zero ops) ──
@@ -2562,7 +2578,7 @@ mod data_structure_tests {
         assert_eq!(result[0].available_gpr_regs, 4);
         assert!(result[0].suggested_blocking.is_none());
         // 4 vec <= 12 available and 6 gpr > 4 available => needs spill
-        assert!(result[0].needs_spill_fence, "6 gpr > 4 available gpr => spill fence");
+        assert_eq!(result[0].spill_policy, SpillPolicy::FenceRequired, "6 gpr > 4 available gpr => spill fence");
     }
 
     // ── 62. BufferLayout coloring — memory_map with multiple tenants ──
@@ -2630,7 +2646,7 @@ mod data_structure_tests {
         // Assert: available = 0-4 = saturating_sub => 0; peak > available => spill
         assert_eq!(result[0].available_vec_regs, 0);
         assert_eq!(result[0].available_gpr_regs, 0);
-        assert!(result[0].needs_spill_fence, "any demand > 0 available => spill");
+        assert_eq!(result[0].spill_policy, SpillPolicy::FenceRequired, "any demand > 0 available => spill");
         assert_eq!(result[0].peak_vec_regs, 4);
         assert_eq!(result[0].peak_gpr_regs, 6);
     }
@@ -2647,7 +2663,7 @@ mod data_structure_tests {
             available_vec_regs: 28,
             available_gpr_regs: 12,
             suggested_blocking: None,
-            needs_spill_fence: true,
+            spill_policy: SpillPolicy::FenceRequired,
         }];
 
         // Act
@@ -2732,7 +2748,7 @@ mod data_structure_tests {
             available_vec_regs: 16,
             available_gpr_regs: 12,
             suggested_blocking: None,
-            needs_spill_fence: true,
+            spill_policy: SpillPolicy::FenceRequired,
         }];
 
         // Act
@@ -2878,11 +2894,11 @@ mod data_structure_tests {
             available_vec_regs: 16,
             available_gpr_regs: 12,
             suggested_blocking: None,
-            needs_spill_fence: true,
+            spill_policy: SpillPolicy::FenceRequired,
         };
 
         // Assert: spill fence triggered by vec alone
-        assert!(gp.needs_spill_fence);
+        assert_eq!(gp.spill_policy, SpillPolicy::FenceRequired);
         assert!(gp.peak_vec_regs > gp.available_vec_regs, "vec oversubscribed");
         assert!(gp.peak_gpr_regs <= gp.available_gpr_regs, "gpr not oversubscribed");
     }
@@ -2899,7 +2915,7 @@ mod data_structure_tests {
             available_vec_regs: 16,
             available_gpr_regs: 12,
             suggested_blocking: None,
-            needs_spill_fence: true,
+            spill_policy: SpillPolicy::FenceRequired,
         }];
 
         // Act
@@ -3059,7 +3075,7 @@ mod data_structure_tests {
         // Assert: 1000 ops -> 2000 vec regs + 8 GEMM = 2008; 3000 gpr + 4 GEMM = 3004
         assert_eq!(result[0].peak_vec_regs, 2008, "1000 ops * 2 + 8 GEMM = 2008");
         assert_eq!(result[0].peak_gpr_regs, 3004, "1000 ops * 3 + 4 GEMM = 3004");
-        assert!(result[0].needs_spill_fence, "massive oversubscription requires spill");
+        assert_eq!(result[0].spill_policy, SpillPolicy::FenceRequired, "massive oversubscription requires spill");
         assert!(result[0].suggested_blocking.is_some(), "GEMM group has blocking");
     }
 
@@ -3134,7 +3150,7 @@ mod data_structure_tests {
             available_vec_regs: 12,
             available_gpr_regs: 8,
             suggested_blocking: None,
-            needs_spill_fence: true,
+            spill_policy: SpillPolicy::FenceRequired,
         }];
 
         // Act
@@ -3255,7 +3271,7 @@ mod data_structure_tests {
             available_vec_regs: 12,
             available_gpr_regs: 8,
             suggested_blocking: None,
-            needs_spill_fence: true,
+            spill_policy: SpillPolicy::FenceRequired,
         }];
         let bp3 = plan_stack_blueprint(&pressure, 4, 3, false);
         assert!(bp3.total_frame_bytes >= bp2.total_frame_bytes + 8 * 64, "8 vec spills * 64 bytes");
