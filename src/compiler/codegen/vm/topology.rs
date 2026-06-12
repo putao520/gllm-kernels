@@ -33,14 +33,42 @@ pub enum TopologyBound {
     DynamicTotalIters,
 }
 
+/// Loop topology — 从图 ops 推导.
+///
+/// ARCH-JIT-DATA-YIELDS: replaces `has_generate_loop: bool` with a semantic enum.
+/// The compiler should not store intermediate bool flags — topology drives code paths.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum LoopTopology {
+    /// Single-pass: no Argmax+StoreToken+CheckStopCondition → one pass, no generate loop.
+    SinglePass,
+    /// Generate loop: Argmax+StoreToken+CheckStopCondition → iterative token generation.
+    GenerateLoop,
+}
+
+/// KV cache source — 从图 ops 推导.
+///
+/// ARCH-JIT-DATA-YIELDS: replaces `has_mha: bool` with a semantic enum.
+/// The attention variant in the graph determines what KV cache pointer to load.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum KvCacheSource {
+    /// No KV cache ops in the graph (e.g. embedding/rerank).
+    NoCache,
+    /// Standard MHA: MultiHeadAttention ops → load kv_cache_ptr.
+    StandardMha,
+    /// Cached GQA: CachedGQA ops → load kv_cache_ptr + layer_ctr.
+    CachedGqa,
+    /// MLA compressed: MlaAttention ops → load kv_cache_ptr (compressed layout).
+    MlaAttention,
+}
+
 /// 从 CompilerGraph 推导的编译控制流信息
 ///
 /// 编译器只看图 ops，不读任何外部配置。
 /// 每个字段都从图中的 OpKind 存在性/参数推导。
 #[derive(Debug, Clone)]
 pub struct GraphTopologyAnalysis {
-    /// 图有 Argmax + StoreToken + CheckStopCondition → 生成循环
-    pub has_generate_loop: bool,
+    /// Loop topology — from graph ops (Argmax+StoreToken+CheckStopCondition).
+    pub loop_topology: LoopTopology,
     /// Const(1) (图无 Argmax) vs DynamicTotalIters (图有 Argmax)
     pub outer_loop_bound: TopologyBound,
     /// PromptLen (图无 Argmax) vs LoopCounterPlusOne (图有 Argmax)
@@ -48,8 +76,8 @@ pub struct GraphTopologyAnalysis {
 
     // ── 从图 OpKind 存在性推导的属性 ──
 
-    /// 图有 MHA ops → 加载 kv_cache_ptr
-    pub has_mha: bool,
+    /// KV cache source — from graph ops (MHA/CachedGQA/MLA presence).
+    pub kv_cache_source: KvCacheSource,
 
     /// 词表大小 — 从 OpKind::Argmax { vocab_size } 推导。
     /// 图无 Argmax 时为 None。
@@ -81,22 +109,34 @@ impl GraphTopologyAnalysis {
         let has_store_token = graph.ops.iter().any(|op| matches!(op.kind, OpKind::StoreToken));
         let has_check_stop = graph.ops.iter().any(|op| matches!(op.kind, OpKind::CheckStopCondition));
 
-        let has_generate_loop = has_argmax && has_store_token && has_check_stop;
+        let is_generate = has_argmax && has_store_token && has_check_stop;
+        let loop_topology = if is_generate { LoopTopology::GenerateLoop } else { LoopTopology::SinglePass };
 
-        let outer_loop_bound = if has_generate_loop {
+        let outer_loop_bound = if is_generate {
             TopologyBound::DynamicTotalIters
         } else {
             TopologyBound::Const(1)
         };
 
-        let seq_len_source = if has_generate_loop {
+        let seq_len_source = if is_generate {
             SeqLenSource::LoopCounterPlusOne
         } else {
             SeqLenSource::PromptLen
         };
 
-        // has_mha: 图有 MHA ops → 加载 kv_cache_ptr
+        // kv_cache_source: from attention op presence
         let has_mha = graph.ops.iter().any(|op| matches!(op.kind, OpKind::MultiHeadAttention { .. }));
+        let has_cached_gqa = graph.ops.iter().any(|op| matches!(op.kind, OpKind::CachedGQA { .. }));
+        let has_mla = graph.ops.iter().any(|op| matches!(op.kind, OpKind::MlaAttention { .. }));
+        let kv_cache_source = if has_cached_gqa {
+            KvCacheSource::CachedGqa
+        } else if has_mla {
+            KvCacheSource::MlaAttention
+        } else if has_mha {
+            KvCacheSource::StandardMha
+        } else {
+            KvCacheSource::NoCache
+        };
 
         let vocab_size = graph.ops.iter().find_map(|op| {
             match op.kind {
@@ -138,10 +178,10 @@ impl GraphTopologyAnalysis {
             .and_then(|cfg| cfg.activation_alias);
 
         Self {
-            has_generate_loop,
+            loop_topology,
             outer_loop_bound,
             seq_len_source,
-            has_mha,
+            kv_cache_source,
             vocab_size,
             logits_producer_op_idx,
             logits_output_tid,
@@ -186,7 +226,7 @@ mod tests {
         ]);
         let topo = GraphTopologyAnalysis::analyze(&graph);
 
-        assert!(topo.has_generate_loop);
+        assert_eq!(topo.loop_topology, LoopTopology::GenerateLoop);
         assert_eq!(topo.outer_loop_bound, TopologyBound::DynamicTotalIters);
         assert_eq!(topo.seq_len_source, SeqLenSource::LoopCounterPlusOne);
         assert_eq!(topo.vocab_size, Some(32000));
@@ -200,7 +240,7 @@ mod tests {
         ]);
         let topo = GraphTopologyAnalysis::analyze(&graph);
 
-        assert!(!topo.has_generate_loop);
+        assert_eq!(topo.loop_topology, LoopTopology::SinglePass);
         assert_eq!(topo.outer_loop_bound, TopologyBound::Const(1));
         assert_eq!(topo.seq_len_source, SeqLenSource::PromptLen);
         assert_eq!(topo.vocab_size, None);
@@ -213,7 +253,7 @@ mod tests {
         ]);
         let topo = GraphTopologyAnalysis::analyze(&graph);
 
-        assert!(!topo.has_generate_loop);
+        assert_eq!(topo.loop_topology, LoopTopology::SinglePass);
     }
 
     #[test]

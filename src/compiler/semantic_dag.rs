@@ -342,14 +342,28 @@ impl SemanticDAG {
     }
 }
 
+/// Compute boundness classification for a workload.
+///
+/// ARCH-JIT-DATA-YIELDS: replaces `is_memory_bound: bool` with a semantic enum.
+/// Derived from the majority bottleneck across all ops in the DAG.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Boundness {
+    /// Majority of ops are memory-bound — bandwidth-limited.
+    MemoryBound,
+    /// Majority of ops are compute-bound — FMA-throughput-limited.
+    ComputeBound,
+    /// Mixed — no clear majority bottleneck.
+    Balanced,
+}
+
 /// Hints derived from SemanticDAG analysis, passed to codegen.
 ///
 /// Aggregates bottleneck and arithmetic intensity information across all ops
 /// to guide code generation decisions (prefetch strategy, store type, etc.).
 #[derive(Debug, Clone)]
 pub struct CodegenHints {
-    /// Whether the overall workload is memory-bound (majority of ops).
-    pub is_memory_bound: bool,
+    /// Compute boundness of the overall workload.
+    pub boundness: Boundness,
     /// Average arithmetic intensity across all ops.
     pub arithmetic_intensity: f32,
     /// Suggested prefetch hint (0=T0, 1=T1, 2=T2, 3=NTA).
@@ -361,7 +375,7 @@ pub struct CodegenHints {
 impl Default for CodegenHints {
     fn default() -> Self {
         CodegenHints {
-            is_memory_bound: false,
+            boundness: Boundness::Balanced,
             arithmetic_intensity: 0.0,
             prefetch_hint: 0,
             use_nt_stores: false,
@@ -388,13 +402,19 @@ impl CodegenHints {
         }
 
         let avg_ai = total_ai / n as f32;
-        let is_memory_bound = memory_count > n / 2;
+        let boundness = if memory_count > n / 2 {
+            Boundness::MemoryBound
+        } else if memory_count * 2 > n {
+            Boundness::Balanced
+        } else {
+            Boundness::ComputeBound
+        };
         // NTA for memory-bound (streaming, no cache pollution), T0 for compute-bound
-        let prefetch_hint = if is_memory_bound { 3 } else { 0 };
-        let use_nt_stores = is_memory_bound && avg_ai < 1.0;
+        let prefetch_hint = match boundness { Boundness::MemoryBound => 3, _ => 0 };
+        let use_nt_stores = boundness == Boundness::MemoryBound && avg_ai < 1.0;
 
         CodegenHints {
-            is_memory_bound,
+            boundness,
             arithmetic_intensity: avg_ai,
             prefetch_hint,
             use_nt_stores,
@@ -1430,7 +1450,7 @@ mod tests {
         // Arrange
         let hints = CodegenHints::default();
         // Assert
-        assert!(!hints.is_memory_bound);
+        assert!(hints.boundness != Boundness::MemoryBound);
         assert_eq!(hints.arithmetic_intensity, 0.0);
         assert_eq!(hints.prefetch_hint, 0);
         assert!(!hints.use_nt_stores);
@@ -1445,7 +1465,7 @@ mod tests {
         // Act
         let hints = CodegenHints::from_semantic_dag(&dag);
         // Assert
-        assert!(!hints.is_memory_bound);
+        assert!(hints.boundness != Boundness::MemoryBound);
         assert_eq!(hints.arithmetic_intensity, 0.0);
         assert_eq!(hints.prefetch_hint, 0);
         assert!(!hints.use_nt_stores);
@@ -1475,7 +1495,7 @@ mod tests {
         // Act
         let hints = CodegenHints::from_semantic_dag(&dag);
         // Assert
-        assert!(!hints.is_memory_bound);
+        assert!(hints.boundness != Boundness::MemoryBound);
         assert!(hints.arithmetic_intensity > 8.0);
         assert_eq!(hints.prefetch_hint, 0, "compute-bound should use T0 prefetch");
         assert!(!hints.use_nt_stores);
@@ -1496,7 +1516,7 @@ mod tests {
         // Act
         let hints = CodegenHints::from_semantic_dag(&dag);
         // Assert
-        assert!(hints.is_memory_bound, "all memory-bound ops should make DAG memory-bound");
+        assert_eq!(hints.boundness, Boundness::MemoryBound, "all memory-bound ops should make DAG memory-bound");
         assert_eq!(hints.prefetch_hint, 3, "memory-bound should use NTA prefetch");
     }
 
@@ -1515,7 +1535,7 @@ mod tests {
         // Assert: Silu [2,2]: flops = 2*2*10=40, bytes = (2*2*4)*2=32, AI=1.25
         // With a single op, memory_count = 1, n = 1, 1 > 0 → memory_bound.
         // But AI 1.25 >= 1.0 → use_nt_stores = false
-        assert!(hints.is_memory_bound);
+        assert_eq!(hints.boundness, Boundness::MemoryBound);
         // AI for Silu [2,2] with 10 FLOPs/elem is ~1.25, not < 1.0
     }
 
@@ -1789,7 +1809,7 @@ mod tests {
         // Act
         let hints = CodegenHints::from_semantic_dag(&dag);
         // Assert: 2 memory ops out of 3 → 2 > 3/2 = 1 → memory_bound
-        assert!(hints.is_memory_bound, "2 of 3 memory-bound should make DAG memory-bound");
+        assert_eq!(hints.boundness, Boundness::MemoryBound, "2 of 3 memory-bound should make DAG memory-bound");
     }
 
     #[test]
@@ -1826,7 +1846,7 @@ mod tests {
         // Act
         let hints = CodegenHints::from_semantic_dag(&dag);
         // Assert: 1 memory out of 3 → 1 ≤ 3/2 = 1 → NOT memory_bound
-        assert!(!hints.is_memory_bound, "1 of 3 memory-bound should NOT make DAG memory-bound");
+        assert!(hints.boundness != Boundness::MemoryBound, "1 of 3 memory-bound should NOT make DAG memory-bound");
     }
 
     // ── RmsNorm flops model (5 flops/elem) ──
@@ -1893,7 +1913,7 @@ mod tests {
         // Act
         let hints = CodegenHints::from_semantic_dag(&dag);
         // Assert
-        assert!(hints.is_memory_bound);
+        assert_eq!(hints.boundness, Boundness::MemoryBound);
         assert!(hints.arithmetic_intensity < 1.0, "AI should be < 1.0, got {}", hints.arithmetic_intensity);
         assert!(hints.use_nt_stores, "use_nt_stores should be true when memory_bound and avg AI < 1.0");
     }
@@ -1918,7 +1938,7 @@ mod tests {
         // Act
         let hints = CodegenHints::from_semantic_dag(&dag);
         // Assert: all ops are memory-bound, 3 > 3/2 = 1
-        assert!(hints.is_memory_bound);
+        assert_eq!(hints.boundness, Boundness::MemoryBound);
         assert_eq!(hints.prefetch_hint, 3, "memory-bound should use NTA (3)");
         assert!(!hints.use_nt_stores, "AI ~ 1.25 >= 1.0 -> no nt_stores");
     }

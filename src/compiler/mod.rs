@@ -131,7 +131,7 @@ pub use graph::{CompilerGraph, OpKind, RopeScaling, TensorId, WeightLayout, SymD
 pub use ir::MoeConfig;
 pub use rope_scaling::{compute_attention_scaling, compute_inv_freq, fill_cos_sin_table, fill_cos_sin_table_partial};
 pub use registry::ScalarOpRegistry;
-pub use semantic_dag::SemanticDAG;
+pub use semantic_dag::{SemanticDAG, Boundness};
 pub use fusion::FusionPlan;
 pub use planner::ExecutionPlan;
 pub use planner::HwOptPlan;

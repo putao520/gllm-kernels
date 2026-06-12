@@ -462,7 +462,7 @@ mod tests {
         let profile = DeviceProfile::detect();
         let mut emitter = X86CodeGen::new(&profile, DType::F32);
         let hints = CodegenHints {
-            is_memory_bound: true,
+            boundness: crate::compiler::semantic_dag::Boundness::MemoryBound,
             arithmetic_intensity: 5.0,
             prefetch_hint: 2,
             use_nt_stores: true,

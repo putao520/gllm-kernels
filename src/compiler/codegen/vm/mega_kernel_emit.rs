@@ -12,6 +12,7 @@ use super::plan_lower::{
 use crate::compiler::codegen::RopeCacheRequirement;
 use crate::compiler::fusion::{FusionPlan, FusionMode};
 use crate::compiler::graph::{CompilerGraph, OpKind};
+use crate::compiler::codegen::vm::topology::{LoopTopology, KvCacheSource};
 use crate::compiler::buffer_alloc::{BufferAllocation, TensorPtrSource};
 use crate::compiler::mega_kernel_abi::MtpKernelConfig;
 use crate::compiler::registry::ScalarOpRegistry;
@@ -1018,7 +1019,7 @@ pub fn compile_mega_kernel_vm(
     // Generate graphs: scratchpad + logits_scratch_offset (sampling pipeline reads logits from there).
     // Non-generate graphs: output_tokens_ptr (caller-provided output buffer, ABI arg 8).
     let output_ptr = prog.alloc_vreg(VRegKind::Ptr, SimdWidth::Scalar);
-    if topology.has_generate_loop {
+    if topology.loop_topology == LoopTopology::GenerateLoop {
         prog.emit(VmInstr::LoadPtr { dst: output_ptr, src: PtrExpr::VRegPlusConst(scratchpad_ptr, logits_scratch_offset) });
     } else {
         prog.emit(VmInstr::LoadPtr { dst: output_ptr, src: PtrExpr::StackArg(MEGA_KERNEL_STACK_OFFSETS[2]) });
@@ -1073,7 +1074,7 @@ pub fn compile_mega_kernel_vm(
     // 无 Argmax 的图: 全量 input_ids（所有 token 一次处理）。
     // 含 Argmax 的图: 当前位置的单一 token。
     let gen_input_ptr = prog.alloc_vreg(VRegKind::Ptr, SimdWidth::Scalar);
-    if topology.has_generate_loop {
+    if topology.loop_topology == LoopTopology::GenerateLoop {
         prog.emit(VmInstr::LoadPtr { dst: gen_input_ptr, src: PtrExpr::VRegPlusVReg(input_base, gen_byte_offset) });
     } else {
         prog.emit(VmInstr::LoadPtr { dst: gen_input_ptr, src: PtrExpr::VRegPlusConst(input_base, 0) });
@@ -1091,7 +1092,7 @@ pub fn compile_mega_kernel_vm(
     });
     // Also reload output_ptr: generate graphs from scratchpad, non-generate from ABI stack
     let output_reloaded = prog.alloc_vreg(VRegKind::Ptr, SimdWidth::Scalar);
-    if topology.has_generate_loop {
+    if topology.loop_topology == LoopTopology::GenerateLoop {
         prog.emit(VmInstr::LoadPtr {
             dst: output_reloaded,
             src: PtrExpr::VRegPlusConst(scratchpad_reloaded, logits_scratch_offset),
@@ -1176,7 +1177,7 @@ pub fn compile_mega_kernel_vm(
         scratch_ptr: if needs_scratch { Some(scratchpad_reloaded) } else { None },  // Reloaded each iteration
         gen_loop_counter: Some(gen_counter),
         layer_loop_counter: None,
-        mega_decode_seq_len: if topology.has_generate_loop { Some(decode_seq_len) } else { None },
+        mega_decode_seq_len: if topology.loop_topology == LoopTopology::GenerateLoop { Some(decode_seq_len) } else { None },
         hook_ctx_ptr: {
             let hook_ptr = prog.alloc_vreg(VRegKind::Ptr, SimdWidth::Scalar);
             prog.emit(VmInstr::LoadPtr {
@@ -1262,7 +1263,7 @@ pub fn compile_mega_kernel_vm(
             // 拓扑驱动: 图有 MHA ops → 加载 kv_cache_ptr。
             // 无 Argmax 的图（EncodeToLayer/Classify*）有 MHA 也需要 KV cache
             // （prefill 阶段 MHA 仍需 K/V 投影指针）。
-            if topology.has_mha {
+            if topology.kv_cache_source != KvCacheSource::NoCache {
                 let kv_ptr = prog.alloc_vreg(VRegKind::Ptr, SimdWidth::Scalar);
                 prog.emit(VmInstr::LoadPtr {
                     dst: kv_ptr,
@@ -1323,7 +1324,7 @@ pub fn compile_mega_kernel_vm(
     // 编译时写死唯一路径：has_generate_loop 决定走采样还是直接退出。
     // 不再需要运行时 JMP table（OutputModeDispatch 已删除）。
     // Head Routing 场景编译多个 MegaKernel，每个 MegaKernel 走唯一路径。
-    let has_generate_loop = topology.has_generate_loop;
+    let has_generate_loop = topology.loop_topology == LoopTopology::GenerateLoop;
 
 
     // ── .generate_path: 采样管线 ──
@@ -1676,7 +1677,7 @@ pub fn compile_mega_kernel_vm(
         // but input points to flat batch input_ids and seq_len = total_prefill_tokens.
         // 拓扑驱动: generate 图用 scratchpad + logits_scratch_offset，非 generate 图用 output_tokens_ptr
         let batch_output_ptr = prog.alloc_vreg(VRegKind::Ptr, SimdWidth::Scalar);
-        if topology.has_generate_loop {
+        if topology.loop_topology == LoopTopology::GenerateLoop {
             prog.emit(VmInstr::LoadPtr { dst: batch_output_ptr, src: PtrExpr::VRegPlusConst(scratchpad_ptr, logits_scratch_offset) });
         } else {
             prog.emit(VmInstr::LoadPtr { dst: batch_output_ptr, src: PtrExpr::StackArg(MEGA_KERNEL_STACK_OFFSETS[2]) });
@@ -2018,7 +2019,7 @@ pub fn compile_mega_kernel_vm(
             // Build decode AbiPtrs: same weights/scratch/output, but input = decode_input, M = num_active.
             // 拓扑驱动: generate 图用 scratchpad + logits_scratch_offset，非 generate 图用 output_tokens_ptr
             let decode_output_ptr = prog.alloc_vreg(VRegKind::Ptr, SimdWidth::Scalar);
-            if topology.has_generate_loop {
+            if topology.loop_topology == LoopTopology::GenerateLoop {
                 prog.emit(VmInstr::LoadPtr { dst: decode_output_ptr, src: PtrExpr::VRegPlusConst(scratchpad_ptr, logits_scratch_offset) });
             } else {
                 prog.emit(VmInstr::LoadPtr { dst: decode_output_ptr, src: PtrExpr::StackArg(MEGA_KERNEL_STACK_OFFSETS[2]) });
