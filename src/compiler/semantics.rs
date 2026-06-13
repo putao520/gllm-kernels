@@ -167,6 +167,8 @@ pub fn bottleneck(kind: &OpKind, graph_dtype: crate::types::DType) -> Bottleneck
     match kind {
         // GEMM: compute-bound when K is large enough (typical for transformer layers)
         OpKind::Gemm { m, n, k, dtype, .. } | OpKind::GemmBias { m, n, k, dtype, .. } => {
+            // ARCH-SYMDIM-DEGRADE: cost model uses max_for_allocation for conservative estimate.
+            // TODO(G-2): preserve symbolic form for tighter bounds.
             let m_val = m.max_for_allocation_strict().expect("ARCH-SYMDIM: Symbolic dim must have max_value in cost model");
             let elem_bytes = dtype.size_bytes();
             let flops = 2 * m_val * n * k;
@@ -179,6 +181,8 @@ pub fn bottleneck(kind: &OpKind, graph_dtype: crate::types::DType) -> Bottleneck
         }
         // Quantized GEMM: fewer bytes for weights, activation dtype from graph context
         OpKind::QuantGemm { m, n, k, quant_type } => {
+            // ARCH-SYMDIM-DEGRADE: cost model uses max_for_allocation for conservative estimate.
+            // TODO(G-2): preserve symbolic form for tighter bounds.
             let m_val = m.max_for_allocation_strict().expect("ARCH-SYMDIM: Symbolic dim must have max_value in cost model");
             let act_bytes = graph_dtype.size_bytes(); // activation/output dtype
             let bits = quant_type.bits() as usize;
@@ -213,6 +217,8 @@ pub fn arithmetic_intensity(kind: &OpKind, graph_dtype: crate::types::DType) -> 
     let eb = graph_dtype.size_bytes() as f64;
     match kind {
         OpKind::Gemm { m, n, k, dtype, .. } | OpKind::GemmBias { m, n, k, dtype, .. } => {
+            // ARCH-SYMDIM-DEGRADE: cost model uses max_for_allocation for conservative estimate.
+            // TODO(G-2): preserve symbolic form for tighter bounds.
             let m_val = m.max_for_allocation_strict().expect("ARCH-SYMDIM: Symbolic dim must have max_value in cost model");
             let elem_bytes = dtype.size_bytes() as f64;
             let flops = (2 * m_val * n * k) as f64;
@@ -220,6 +226,8 @@ pub fn arithmetic_intensity(kind: &OpKind, graph_dtype: crate::types::DType) -> 
             if bytes > 0.0 { flops / bytes } else { 0.0 }
         }
         OpKind::QuantGemm { m, n, k, quant_type } => {
+            // ARCH-SYMDIM-DEGRADE: cost model uses max_for_allocation for conservative estimate.
+            // TODO(G-2): preserve symbolic form for tighter bounds.
             let m_val = m.max_for_allocation_strict().expect("ARCH-SYMDIM: Symbolic dim must have max_value in cost model");
             let bits = quant_type.bits() as usize;
             let flops = (2 * m_val * n * k) as f64;
@@ -265,6 +273,8 @@ pub fn arithmetic_intensity(kind: &OpKind, graph_dtype: crate::types::DType) -> 
         }
         // Multi-head attention: O(s^2 * d * h) compute, dominated by QK^T and attn@V
         OpKind::MultiHeadAttention { seq_len, num_heads, num_kv_heads: _, head_dim, causal: _, attention_sinks: _ } => {
+            // ARCH-SYMDIM-DEGRADE: cost model uses max_for_allocation for conservative estimate.
+            // TODO(G-2): preserve symbolic form for tighter bounds.
             let s = seq_len.max_for_allocation_strict().expect("ARCH-SYMDIM: Symbolic dim must have max_value in cost model") as f64;
             let h = *num_heads as f64;
             let d = *head_dim as f64;
@@ -348,6 +358,8 @@ pub fn arithmetic_intensity(kind: &OpKind, graph_dtype: crate::types::DType) -> 
         | OpKind::SoftmaxWithEntropy { .. }
         | OpKind::MegaKernelDispatch { .. } => 0.0,
         OpKind::AltUpPredict { seq_len, num_preds, hidden } => {
+            // ARCH-SYMDIM-DEGRADE: cost model uses max_for_allocation for conservative estimate.
+            // TODO(G-2): preserve symbolic form for tighter bounds.
             let s = seq_len.max_for_allocation_strict()
                 .expect("ARCH-SYMDIM: AltUpPredict seq_len must have max_value") as f64;
             let p = *num_preds as f64;
@@ -359,6 +371,8 @@ pub fn arithmetic_intensity(kind: &OpKind, graph_dtype: crate::types::DType) -> 
             if bytes > 0.0 { flops / bytes } else { 0.0 }
         }
         OpKind::AltUpCorrect { seq_len, num_preds, hidden } => {
+            // ARCH-SYMDIM-DEGRADE: cost model uses max_for_allocation for conservative estimate.
+            // TODO(G-2): preserve symbolic form for tighter bounds.
             let s = seq_len.max_for_allocation_strict()
                 .expect("ARCH-SYMDIM: AltUpCorrect seq_len must have max_value") as f64;
             let p = *num_preds as f64;
@@ -370,6 +384,8 @@ pub fn arithmetic_intensity(kind: &OpKind, graph_dtype: crate::types::DType) -> 
             if bytes > 0.0 { flops / bytes } else { 0.0 }
         }
         OpKind::AltUpInject { seq_len, num_preds, hidden } => {
+            // ARCH-SYMDIM-DEGRADE: cost model uses max_for_allocation for conservative estimate.
+            // TODO(G-2): preserve symbolic form for tighter bounds.
             let s = seq_len.max_for_allocation_strict()
                 .expect("ARCH-SYMDIM: AltUpInject seq_len must have max_value") as f64;
             let p = *num_preds as f64;
@@ -418,6 +434,8 @@ pub fn arithmetic_intensity(kind: &OpKind, graph_dtype: crate::types::DType) -> 
         }
         // MoERouter: hidden @ weight.T + bias → softmax → top-k。
         OpKind::MoERouter { num_experts, top_k, hidden, seq_len } => {
+            // ARCH-SYMDIM-DEGRADE: cost model uses max_for_allocation for conservative estimate.
+            // TODO(G-2): preserve symbolic form for tighter bounds.
             let s = seq_len.max_for_allocation_strict()
                 .expect("ARCH-SYMDIM: MoERouter seq_len must have max_value") as f64;
             let e = *num_experts as f64;
@@ -434,6 +452,8 @@ pub fn arithmetic_intensity(kind: &OpKind, graph_dtype: crate::types::DType) -> 
         // Bytes ≈ top_k × (hidden · intermediate_size / 2 + intermediate_size)  weight
         //         + activation I/O。
         OpKind::MoEDispatchPacked { top_k, intermediate_size, hidden, seq_len, mxfp4_block_size, .. } => {
+            // ARCH-SYMDIM-DEGRADE: cost model uses max_for_allocation for conservative estimate.
+            // TODO(G-2): preserve symbolic form for tighter bounds.
             let s = seq_len.max_for_allocation_strict()
                 .expect("ARCH-SYMDIM: MoEDispatchPacked seq_len must have max_value") as f64;
             let k = *top_k as f64;
@@ -450,12 +470,16 @@ pub fn arithmetic_intensity(kind: &OpKind, graph_dtype: crate::types::DType) -> 
         }
         // MLA GEMM variants: use same roofline model as standard GEMM
         OpKind::MlaKvCompress { m, d_c, hidden } => {
+            // ARCH-SYMDIM-DEGRADE: cost model uses max_for_allocation for conservative estimate.
+            // TODO(G-2): preserve symbolic form for tighter bounds.
             let m_val = m.max_for_allocation_strict().expect("ARCH-SYMDIM: MlaKvCompress m must have max_value") as f64;
             let flops = 2.0 * m_val * (*d_c as f64) * (*hidden as f64);
             let bytes = eb * (m_val * (*hidden as f64) + (*hidden as f64) * (*d_c as f64) + m_val * (*d_c as f64));
             if bytes > 0.0 { flops / bytes } else { 0.0 }
         }
         OpKind::MlaQAbsorb { seq_len, num_heads, head_dim, d_c } | OpKind::MlaVRestore { seq_len, num_heads, head_dim, d_c } => {
+            // ARCH-SYMDIM-DEGRADE: cost model uses max_for_allocation for conservative estimate.
+            // TODO(G-2): preserve symbolic form for tighter bounds.
             let s = seq_len.max_for_allocation_strict().expect("ARCH-SYMDIM: MLA GEMM seq_len must have max_value") as f64;
             let h = *num_heads as f64;
             let d = *head_dim as f64;
@@ -465,6 +489,8 @@ pub fn arithmetic_intensity(kind: &OpKind, graph_dtype: crate::types::DType) -> 
             if bytes > 0.0 { flops / bytes } else { 0.0 }
         }
         OpKind::MlaAttention { seq_len, num_heads, head_dim, d_c, .. } => {
+            // ARCH-SYMDIM-DEGRADE: cost model uses max_for_allocation for conservative estimate.
+            // TODO(G-2): preserve symbolic form for tighter bounds.
             let s = seq_len.max_for_allocation_strict().expect("ARCH-SYMDIM: MlaAttention seq_len must have max_value") as f64;
             let h = *num_heads as f64;
             let d = *head_dim as f64;
