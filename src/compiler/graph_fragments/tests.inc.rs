@@ -515,4 +515,67 @@ mod tests {
             panic!("expected Op::Dequantize");
         }
     }
+
+    // ── Phase 6: Attention/MoE from_op_kind 测试 ──
+
+    #[test]
+    fn op_v2_from_op_kind_mha_kv_source_propagation() {
+        let mut g = CompilerGraph::new();
+        let q = g.add_tensor_concrete("q", &[1, 4096], DType::F32);
+        let k = g.add_tensor_concrete("k", &[1, 4096], DType::F32);
+        let v = g.add_tensor_concrete("v", &[1, 4096], DType::F32);
+        let out = g.add_tensor_concrete("out", &[1, 4096], DType::F32);
+        let op = g.add_op(
+            OpKind::MultiHeadAttention {
+                seq_len: SymDim::Concrete(1), num_heads: 32, num_kv_heads: 8, head_dim: 128,
+                causal: true, attention_sinks: false, kv_source: KvSource::FromCache,
+            },
+            vec![q, k, v], vec![out], "mha",
+        );
+
+        let op_v2 = Op::from_op_kind_attention_moe(g.op(op).unwrap(), &g);
+        if let Some(Op::MultiHeadAttention(spec)) = op_v2 {
+            assert_eq!(spec.kv_source, KvSource::FromCache);
+            assert!(matches!(spec.mask, AttentionMask::Causal));
+            assert!(matches!(spec.sinks, SinksSpec::None));
+        } else {
+            panic!("expected Op::MultiHeadAttention");
+        }
+    }
+
+    #[test]
+    fn op_v2_from_op_kind_mla_attention() {
+        let mut g = CompilerGraph::new();
+        let q = g.add_tensor_concrete("q", &[1, 4096], DType::F32);
+        let out = g.add_tensor_concrete("out", &[1, 4096], DType::F32);
+        let op = g.add_op(
+            OpKind::MlaAttention {
+                seq_len: SymDim::Concrete(1), num_heads: 32, head_dim: 128,
+                d_c: 512, d_rope: 64, causal: true, kv_source: KvSource::FromTensor,
+            },
+            vec![q], vec![out], "mla",
+        );
+
+        let op_v2 = Op::from_op_kind_attention_moe(g.op(op).unwrap(), &g);
+        assert!(matches!(op_v2, Some(Op::MlaAttention(_))));
+    }
+
+    #[test]
+    fn op_v2_from_op_kind_moe_gate() {
+        let mut g = CompilerGraph::new();
+        let input = g.add_tensor_concrete("input", &[1, 4096], DType::F32);
+        let out = g.add_tensor_concrete("out", &[1, 8], DType::F32);
+        let op = g.add_op(
+            OpKind::MoEGate { seq_len: 1, num_experts: 8, hidden: 4096, top_k: 2 },
+            vec![input], vec![out], "moegate",
+        );
+
+        let op_v2 = Op::from_op_kind_attention_moe(g.op(op).unwrap(), &g);
+        if let Some(Op::MoEGate { num_experts, top_k, .. }) = op_v2 {
+            assert_eq!(num_experts, 8);
+            assert_eq!(top_k, 2);
+        } else {
+            panic!("expected Op::MoEGate");
+        }
+    }
 }

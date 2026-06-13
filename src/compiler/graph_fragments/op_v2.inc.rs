@@ -165,10 +165,10 @@ pub enum Op {
     MultiHeadAttention(AttentionSpec),
     CachedGqa(CachedGqaSpec),
     MlaAttention(MlaSpec),
-    MlaKvCompress { seq_len: SymDim, num_heads: usize, head_dim: usize, d_c: usize },
+    MlaKvCompress { m: SymDim, d_c: usize, hidden: usize },
     MlaQAbsorb { seq_len: SymDim, num_heads: usize, d_c: usize, head_dim: usize },
     MlaVRestore { seq_len: SymDim, num_heads: usize, d_c: usize, head_dim: usize },
-    MlaRopeMerge { seq_len: SymDim, num_heads: usize, head_dim: usize, d_rope: usize },
+    MlaRopeMerge { seq_len: SymDim, d_c: usize, d_rope: usize },
 
     // ── Position encoding ──
     RoPE(RopeSpec),
@@ -210,11 +210,11 @@ pub enum Op {
     // ── MoE ──
     MoEGate { seq_len: SymDim, num_experts: usize, hidden: usize, top_k: usize },
     TopK { seq_len: SymDim, num_experts: usize, top_k: usize },
-    WeightedSum { seq_len: SymDim, num_experts: usize, top_k: usize, hidden: usize },
+    WeightedSum { seq_len: SymDim, hidden: usize, top_k: usize },
     MoERouter { num_experts: usize, top_k: usize, hidden: usize, seq_len: SymDim },
     MoEDispatchPacked {
         seq_len: SymDim, num_experts: usize, top_k: usize,
-        mxfp4_block_size: usize, swiglu_limit: f32, hidden: usize, intermediate: usize,
+        mxfp4_block_size: usize, swiglu_limit: f32, hidden: usize, intermediate_size: usize,
     },
     MoEConditionalAdd { seq_len: SymDim, hidden: usize, num_experts: usize, expert_idx: usize },
 
@@ -392,6 +392,87 @@ impl Op {
             OpKind::QTapSTG { sink_ptr, step_index_ptr, dtype, q_dim, position, num_slots } => Some(Op::QTapSTG {
                 sink_ptr: *sink_ptr, step_index_ptr: *step_index_ptr, dtype: *dtype,
                 q_dim: q_dim.clone(), position: *position, num_slots: *num_slots,
+            }),
+
+            _ => None,
+        }
+    }
+
+    /// Phase 6: Attention/MoE/MLA 类别的 from_op_kind 转换。
+    pub fn from_op_kind_attention_moe(
+        op: &CompilerOp,
+        _graph: &CompilerGraph,
+    ) -> Option<Self> {
+        match &op.kind {
+            // Attention
+            OpKind::MultiHeadAttention { seq_len, num_heads, num_kv_heads, head_dim, causal, attention_sinks, kv_source } => {
+                Some(Op::MultiHeadAttention(AttentionSpec {
+                    geometry: AttentionGeometry {
+                        num_q_heads: *num_heads, num_kv_heads: *num_kv_heads, head_dim: *head_dim,
+                    },
+                    mask: if *causal { AttentionMask::Causal } else { AttentionMask::Full },
+                    kv_source: *kv_source,
+                    sinks: if *attention_sinks { SinksSpec::Learnable } else { SinksSpec::None },
+                    seq_len: seq_len.clone(),
+                    dtype: DType::F32,
+                }))
+            }
+            OpKind::CachedGQA { seq_len, total_seq, num_heads, num_kv_heads, head_dim, strategy, kv_dtype, kv_source } => {
+                Some(Op::CachedGqa(CachedGqaSpec {
+                    geometry: AttentionGeometry {
+                        num_q_heads: *num_heads, num_kv_heads: *num_kv_heads, head_dim: *head_dim,
+                    },
+                    mask: AttentionMask::Causal,
+                    kv_source: *kv_source,
+                    seq_len: SymDim::Concrete(*seq_len),
+                    total_seq: *total_seq,
+                    kv_dtype: *kv_dtype,
+                    strategy: strategy.clone(),
+                }))
+            }
+            OpKind::MlaAttention { seq_len, num_heads, head_dim, d_c, d_rope, causal, kv_source } => {
+                Some(Op::MlaAttention(MlaSpec {
+                    seq_len: seq_len.clone(), num_heads: *num_heads, head_dim: *head_dim,
+                    d_c: *d_c, d_rope: *d_rope, causal: *causal, kv_source: *kv_source,
+                }))
+            }
+
+            // MLA sub-ops
+            OpKind::MlaKvCompress { m, d_c, hidden } => Some(Op::MlaKvCompress {
+                m: m.clone(), d_c: *d_c, hidden: *hidden,
+            }),
+            OpKind::MlaQAbsorb { seq_len, num_heads, head_dim, d_c } => Some(Op::MlaQAbsorb {
+                seq_len: seq_len.clone(), num_heads: *num_heads, head_dim: *head_dim, d_c: *d_c,
+            }),
+            OpKind::MlaVRestore { seq_len, num_heads, head_dim, d_c } => Some(Op::MlaVRestore {
+                seq_len: seq_len.clone(), num_heads: *num_heads, head_dim: *head_dim, d_c: *d_c,
+            }),
+            OpKind::MlaRopeMerge { seq_len, d_c, d_rope } => Some(Op::MlaRopeMerge {
+                seq_len: seq_len.clone(), d_c: *d_c, d_rope: *d_rope,
+            }),
+
+            // MoE
+            OpKind::MoEGate { seq_len, num_experts, hidden, top_k } => Some(Op::MoEGate {
+                seq_len: SymDim::Concrete(*seq_len), num_experts: *num_experts, hidden: *hidden, top_k: *top_k,
+            }),
+            OpKind::TopK { seq_len, num_experts, top_k } => Some(Op::TopK {
+                seq_len: SymDim::Concrete(*seq_len), num_experts: *num_experts, top_k: *top_k,
+            }),
+            OpKind::WeightedSum { seq_len, hidden, top_k } => Some(Op::WeightedSum {
+                seq_len: SymDim::Concrete(*seq_len), hidden: *hidden, top_k: *top_k,
+            }),
+            OpKind::MoERouter { num_experts, top_k, hidden, seq_len } => Some(Op::MoERouter {
+                num_experts: *num_experts, top_k: *top_k, hidden: *hidden, seq_len: seq_len.clone(),
+            }),
+            OpKind::MoEDispatchPacked {
+                seq_len, num_experts, top_k, mxfp4_block_size, swiglu_limit, intermediate_size, hidden,
+            } => Some(Op::MoEDispatchPacked {
+                seq_len: seq_len.clone(), num_experts: *num_experts, top_k: *top_k,
+                mxfp4_block_size: *mxfp4_block_size, swiglu_limit: *swiglu_limit,
+                hidden: *hidden, intermediate_size: *intermediate_size,
+            }),
+            OpKind::MoEConditionalAdd { seq_len, hidden, num_experts, expert_idx } => Some(Op::MoEConditionalAdd {
+                seq_len: seq_len.clone(), hidden: *hidden, num_experts: *num_experts, expert_idx: *expert_idx,
             }),
 
             _ => None,
