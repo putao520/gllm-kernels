@@ -1056,8 +1056,14 @@ fn lower_norm_v2(
     spec: &NormSpec,
     norm_kind: NormKind,
 ) -> Result<bool, CompilerError> {
-    // 从 registry 获取 NormLike pattern（trace 驱动，auto_select 架构）
-    let key = ScalarOpRegistry::key_from_op_kind(&op.kind);
+    // 从 NormKind 直接推导 OpKindKey（消除 op.kind 反查，胖 opcode 自描述）
+    use crate::compiler::registry::OpKindKey;
+    let key = match norm_kind {
+        NormKind::RmsNorm => OpKindKey::RmsNorm,
+        NormKind::LayerNorm => OpKindKey::LayerNorm,
+        NormKind::ValueNorm => OpKindKey::ValueNorm,
+        NormKind::HeadRmsNorm => OpKindKey::HeadRmsNorm,
+    };
     let trace = ctx.session.registry
         .and_then(|r| r.get_trace(&key))
         .ok_or_else(|| CompilerError::CodegenViolation(format!(
