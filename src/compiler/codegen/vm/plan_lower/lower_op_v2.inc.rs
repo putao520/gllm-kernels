@@ -194,6 +194,75 @@ pub(crate) fn lower_op_v2(
             prog.emit(VmInstr::LoopEnd);
             Ok(true)
         }
+        Op::ColumnSlice { seq_len, input_inner, start, slice_dim } => {
+            let input_ptr = resolver.materialize(prog, op.inputs[0], abi).ok_or_else(|| {
+                CompilerError::CodegenViolation(format!("ColumnSlice op {:?}: input 无法 materialize", op.id))
+            })?;
+            let output_ptr = resolver.materialize(prog, op.outputs[0], abi).ok_or_else(|| {
+                CompilerError::CodegenViolation(format!("ColumnSlice op {:?}: output 无法 materialize", op.id))
+            })?;
+            let seq_bound = resolve_sym_dim(&seq_len, abi, ctx.session.sym_map);
+            super::structural_emit::emit_column_slice_inline(
+                prog, seq_bound, input_inner, start, slice_dim,
+                ctx.session.width, input_ptr, output_ptr, ctx.dtype,
+            )?;
+            Ok(true)
+        }
+        Op::Gather { table_rows: _, embed_dim, ref index_dim, ref indices_kind, scale } => {
+            let input_ptr = resolver.materialize(prog, op.inputs[0], abi).ok_or_else(|| {
+                CompilerError::CodegenViolation(format!("Gather op {:?}: input 无法 materialize", op.id))
+            })?;
+            let weight_ptr = op.inputs.get(1).copied()
+                .and_then(|tid| resolver.materialize(prog, tid, abi))
+                .unwrap_or(input_ptr);
+            let output_ptr = resolver.materialize(prog, op.outputs[0], abi).ok_or_else(|| {
+                CompilerError::CodegenViolation(format!("Gather op {:?}: output 无法 materialize", op.id))
+            })?;
+            let seq_bound = if abi.mega_decode_seq_len.is_some() {
+                BoundExpr::Const(1)
+            } else {
+                resolve_sym_dim(index_dim, abi, ctx.session.sym_map)
+            };
+            let telemetry_ptr = if graph.telemetry.embed_l2_norm {
+                ctx.session.sym_map.resolve("telemetry").map(|expr| {
+                    let ptr_vreg = prog.alloc_vreg(VRegKind::Ptr, SimdWidth::Scalar);
+                    prog.emit(VmInstr::LoadPtr { dst: ptr_vreg, src: expr.clone() });
+                    ptr_vreg
+                })
+            } else { None };
+            let weight_dtype = op.inputs.get(1)
+                .and_then(|&tid| graph.tensor(tid))
+                .map(|t| t.dtype.to_quant_precision())
+                .unwrap_or(ctx.dtype);
+            super::structural_emit::emit_gather_inline(
+                prog, seq_bound, embed_dim, ctx.session.width,
+                input_ptr, weight_ptr, output_ptr, telemetry_ptr, scale,
+                indices_kind.clone(), ctx.dtype, weight_dtype,
+            )?;
+            Ok(true)
+        }
+        Op::QuantGather { vocab_size, hidden_dim, ref index_dim, quant_type, scale } => {
+            let input_ptr = resolver.materialize(prog, op.inputs[0], abi).ok_or_else(|| {
+                CompilerError::CodegenViolation(format!("QuantGather op {:?}: input 无法 materialize", op.id))
+            })?;
+            let weight_ptr = op.inputs.get(1).copied()
+                .and_then(|tid| resolver.materialize(prog, tid, abi))
+                .unwrap_or(input_ptr);
+            let output_ptr = resolver.materialize(prog, op.outputs[0], abi).ok_or_else(|| {
+                CompilerError::CodegenViolation(format!("QuantGather op {:?}: output 无法 materialize", op.id))
+            })?;
+            let seq_bound = if abi.mega_decode_seq_len.is_some() {
+                BoundExpr::Const(1)
+            } else {
+                resolve_sym_dim(index_dim, abi, ctx.session.sym_map)
+            };
+            super::quant_gather_emit::emit_quant_gather_inline(
+                prog, seq_bound, vocab_size, hidden_dim, quant_type,
+                ctx.session.width, input_ptr, weight_ptr, output_ptr,
+                ctx.dtype, scale,
+            )?;
+            Ok(true)
+        }
         Op::RoPE(ref spec) => {
             // rope_cache_offset 从 ctx.rope_req 获取（op-level 自描述替代外部参数）
             let rope_req = ctx.rope_req.ok_or_else(|| CompilerError::CodegenViolation(
