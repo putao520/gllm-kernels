@@ -150,6 +150,50 @@ pub(crate) fn lower_op_v2(
             });
             Ok(true)
         }
+        Op::ScaleConst { value } => {
+            let input_ptr = resolver.materialize(prog, op.inputs[0], abi).ok_or_else(|| {
+                CompilerError::CodegenViolation(format!("ScaleConst op {:?}: input 无法 materialize", op.id))
+            })?;
+            let output_ptr = resolver.materialize(prog, op.outputs[0], abi).ok_or_else(|| {
+                CompilerError::CodegenViolation(format!("ScaleConst op {:?}: output 无法 materialize", op.id))
+            })?;
+            super::dispatch_emit::lower_scale_const(prog, op, graph, ctx,
+                input_ptr, output_ptr, resolver, abi, value)?;
+            Ok(true)
+        }
+        Op::SessionKvRestore => {
+            let out_tid = op.outputs.first().ok_or_else(|| CompilerError::CodegenViolation(
+                "SessionKvRestore: no output tensor".into()))?;
+            let out_shape = &graph.tensor(*out_tid).unwrap().shape;
+            let feature_dim: usize = out_shape.iter().filter_map(|d| d.as_concrete()).sum();
+            let elem_b = ctx.dtype.elem_bytes();
+            let width = ctx.session.width;
+            let step = width.f32_lanes() * elem_b;
+            let iters = (feature_dim * elem_b + step - 1) / step;
+            let input_ptr = resolver.materialize(prog, op.inputs[0], abi).ok_or_else(|| {
+                CompilerError::CodegenViolation(format!("SessionKvRestore op {:?}: input 无法 materialize", op.id))
+            })?;
+            let output_ptr = resolver.materialize(prog, *out_tid, abi).ok_or_else(|| {
+                CompilerError::CodegenViolation(format!("SessionKvRestore op {:?}: output 无法 materialize", op.id))
+            })?;
+            let ctr = prog.alloc_vreg(VRegKind::Counter, SimdWidth::Scalar);
+            let byte_off = prog.alloc_vreg(VRegKind::ByteOffset, SimdWidth::Scalar);
+            prog.emit(VmInstr::LoopBegin {
+                counter: ctr, byte_offset: byte_off,
+                bound: BoundExpr::Const(iters), step_bytes: step,
+            });
+            let vec = prog.alloc_vreg(VRegKind::Vec, width);
+            prog.emit(VmInstr::VecLoad {
+                dst: vec, base: input_ptr,
+                offset: OffsetExpr::LoopOffset(byte_off), width, dtype: ctx.dtype,
+            });
+            prog.emit(VmInstr::VecStore {
+                base: output_ptr, src: vec,
+                offset: OffsetExpr::LoopOffset(byte_off), width, dtype: ctx.dtype,
+            });
+            prog.emit(VmInstr::LoopEnd);
+            Ok(true)
+        }
         Op::RoPE(ref spec) => {
             // rope_cache_offset 从 ctx.rope_req 获取（op-level 自描述替代外部参数）
             let rope_req = ctx.rope_req.ok_or_else(|| CompilerError::CodegenViolation(

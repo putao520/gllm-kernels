@@ -757,7 +757,7 @@ fn lower_altup_inject(
 }
 
 /// ScaleConst: out = x * value. Broadcast scalar constant to SIMD vector, multiply.
-fn lower_scale_const(
+pub(crate) fn lower_scale_const(
     prog: &mut VmProgram,
     op: &crate::compiler::graph::CompilerOp,
     graph: &CompilerGraph,
