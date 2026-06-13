@@ -839,6 +839,9 @@ impl InferenceCompiler {
 
         let mut hasher = DefaultHasher::new();
 
+        // Phase 8: OPCODE_VERSION — Op enum 结构变更时 bump，自动失效旧 cache。
+        crate::compiler::graph::OPCODE_VERSION.hash(&mut hasher);
+
         // Ops in topological order for determinism
         let topo = graph.topological_sort();
         topo.len().hash(&mut hasher);

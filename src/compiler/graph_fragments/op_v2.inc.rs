@@ -9,6 +9,12 @@
 // 共享作用域。KvSource/RopeScaling/AttentionStrategy/GatherIndicesKind/SymDim/DType
 // 等类型直接可见，无需 use。
 
+/// Op v2 架构版本号 — 用于 JIT cache hash 失效管理。
+///
+/// 当 Op enum 结构变更（新增/删除变体、Spec 字段变更）时 bump 此版本号。
+/// graph_content_hash 包含此常量，版本变更自动失效旧 JIT cache。
+pub const OPCODE_VERSION: u32 = 1;
+
 // ── Attention Specs ──
 
 /// MHA 几何参数（Q/K/V 维度）。
