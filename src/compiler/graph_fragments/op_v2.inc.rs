@@ -301,4 +301,51 @@ impl Op {
             Op::MtpDraft { .. } => "mtp",
         }
     }
+
+    /// Phase 4: Norm/Activation 类别的 from_op_kind 转换。
+    ///
+    /// dtype 从 op.inputs[0] 的 tensor 推导（ARCH-DTYPE-JIT-TYPED）。
+    /// 其余类别（Gemm/Attention/MoE/Structural）在 Phase 5-7 实现。
+    pub fn from_op_kind_norm_activation(
+        op: &CompilerOp,
+        graph: &CompilerGraph,
+    ) -> Option<Self> {
+        // 从 op 第一个输入 tensor 推导 dtype
+        let input_dtype = op.inputs.first()
+            .and_then(|&tid| graph.tensor(tid))
+            .map(|t| t.dtype)
+            .unwrap_or(DType::F32);
+
+        match &op.kind {
+            // ── Activation（无参数 + 简单参数）──
+            OpKind::Silu => Some(Op::Silu),
+            OpKind::Gelu => Some(Op::Gelu),
+            OpKind::Tanh => Some(Op::Tanh),
+            OpKind::SwiGlu => Some(Op::SwiGlu),
+            OpKind::GeGlu => Some(Op::GeGlu),
+            OpKind::SwiGluClipped { limit } => Some(Op::SwiGluClipped { limit: *limit }),
+
+            // ── Elementwise binary ──
+            OpKind::Add => Some(Op::Add),
+            OpKind::Mul => Some(Op::Mul),
+            OpKind::ScaleConst { value } => Some(Op::ScaleConst { value: *value }),
+            OpKind::Residual => Some(Op::Residual),
+
+            // ── Norm（dtype 自描述）──
+            OpKind::RmsNorm { feature_dim, eps } => Some(Op::RmsNorm(NormSpec {
+                feature_dim: *feature_dim, eps: *eps, dtype: input_dtype, has_weight: true,
+            })),
+            OpKind::LayerNorm { feature_dim, eps } => Some(Op::LayerNorm(NormSpec {
+                feature_dim: *feature_dim, eps: *eps, dtype: input_dtype, has_weight: true,
+            })),
+            OpKind::ValueNorm { feature_dim, eps } => Some(Op::ValueNorm(NormSpec {
+                feature_dim: *feature_dim, eps: *eps, dtype: input_dtype, has_weight: false,
+            })),
+            OpKind::HeadRmsNorm { head_dim, eps } => Some(Op::HeadRmsNorm {
+                head_dim: *head_dim, eps: *eps, dtype: input_dtype,
+            }),
+
+            _ => None, // 非 Norm/Activation 类别，Phase 5-7 处理
+        }
+    }
 }

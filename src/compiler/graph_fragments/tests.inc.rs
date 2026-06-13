@@ -371,4 +371,71 @@ mod tests {
         let sources = [KvSource::FromTensor, KvSource::FromCache];
         assert_ne!(sources[0], sources[1]);
     }
+
+    #[test]
+    fn op_v2_from_op_kind_norm_activation_silu() {
+        let mut g = CompilerGraph::new();
+        let input = g.add_tensor_concrete("input", &[4], DType::F32);
+        let output = g.add_tensor_concrete("output", &[4], DType::F32);
+        let op = g.add_op(OpKind::Silu, vec![input], vec![output], "silu");
+
+        let op_v2 = Op::from_op_kind_norm_activation(g.op(op).unwrap(), &g);
+        assert_eq!(op_v2, Some(Op::Silu));
+    }
+
+    #[test]
+    fn op_v2_from_op_kind_rmsnorm_dtype_propagation() {
+        let mut g = CompilerGraph::new();
+        let input = g.add_tensor_concrete("input", &[4096], DType::BF16);
+        let weight = g.add_tensor_concrete("weight", &[4096], DType::BF16);
+        let output = g.add_tensor_concrete("output", &[4096], DType::BF16);
+        let op = g.add_op(
+            OpKind::RmsNorm { feature_dim: 4096, eps: 1e-5 },
+            vec![input, weight], vec![output], "rms",
+        );
+
+        let op_v2 = Op::from_op_kind_norm_activation(g.op(op).unwrap(), &g);
+        if let Some(Op::RmsNorm(spec)) = op_v2 {
+            assert_eq!(spec.feature_dim, 4096);
+            assert_eq!(spec.eps, 1e-5);
+            assert_eq!(spec.dtype, DType::BF16); // dtype 从输入 tensor 推导
+            assert!(spec.has_weight);
+        } else {
+            panic!("expected Op::RmsNorm");
+        }
+    }
+
+    #[test]
+    fn op_v2_from_op_kind_valuenorm_has_weight_false() {
+        let mut g = CompilerGraph::new();
+        let input = g.add_tensor_concrete("input", &[4096], DType::F32);
+        let output = g.add_tensor_concrete("output", &[4096], DType::F32);
+        let op = g.add_op(
+            OpKind::ValueNorm { feature_dim: 4096, eps: 1e-6 },
+            vec![input], vec![output], "vn",
+        );
+
+        let op_v2 = Op::from_op_kind_norm_activation(g.op(op).unwrap(), &g);
+        if let Some(Op::ValueNorm(spec)) = op_v2 {
+            assert!(!spec.has_weight); // ValueNorm 无学习参数
+        } else {
+            panic!("expected Op::ValueNorm");
+        }
+    }
+
+    #[test]
+    fn op_v2_from_op_kind_gem_returns_none_for_non_norm_activation() {
+        let mut g = CompilerGraph::new();
+        let input = g.add_tensor_concrete("input", &[4096], DType::F32);
+        let weight = g.add_tensor_concrete("weight", &[4096, 4096], DType::F32);
+        let output = g.add_tensor_concrete("output", &[4096], DType::F32);
+        let op = g.add_op(
+            OpKind::Gemm { m: SymDim::Concrete(1), n: 4096, k: 4096, dtype: DType::F32, trans_b: false },
+            vec![input, weight], vec![output], "gemm",
+        );
+
+        // Gemm 不是 Norm/Activation，应返回 None（Phase 5 处理）
+        let op_v2 = Op::from_op_kind_norm_activation(g.op(op).unwrap(), &g);
+        assert_eq!(op_v2, None);
+    }
 }
