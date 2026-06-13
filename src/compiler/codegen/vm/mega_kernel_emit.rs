@@ -1677,10 +1677,8 @@ pub fn compile_mega_kernel_vm(
 
         // page_table_flat_ptr from batch_ctx + 40
         let batch_pt_ptr = {
-            let has_mha = graph.ops.iter().any(|op| {
-                matches!(op.kind, OpKind::MultiHeadAttention { .. })
-            });
-            if has_mha {
+            let needs_page_table = topology.kv_cache_source != KvCacheSource::NoCache;
+            if needs_page_table {
                 let pt = prog.alloc_vreg(VRegKind::Ptr, SimdWidth::Scalar);
                 prog.emit(VmInstr::LoadPtr {
                     dst: pt,
@@ -1703,10 +1701,7 @@ pub fn compile_mega_kernel_vm(
             Some(hook_ptr)
         };
         let batch_cb_ptr = {
-            let has_sg = graph.ops.iter().any(|op| {
-                matches!(op.kind, OpKind::SgDetect { .. } | OpKind::SgInject { .. })
-            });
-            if has_sg {
+            if topology.has_sg_ops {
                 let cb_ptr = prog.alloc_vreg(VRegKind::Ptr, SimdWidth::Scalar);
                 prog.emit(VmInstr::LoadPtr {
                     dst: cb_ptr,

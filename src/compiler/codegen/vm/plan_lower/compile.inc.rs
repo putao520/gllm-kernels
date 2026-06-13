@@ -32,6 +32,9 @@ pub fn compile_layer_with_sym_map(
     let profile = IsaProfile::from_device_profile(&exec_plan.profile);
     let hook = isa_hook::select_hook(&profile);
 
+    // Topology analysis: single-pass derivation replacing per-site graph.ops scans.
+    let topology = super::topology::GraphTopologyAnalysis::analyze(graph);
+
     // ARCH-ROPE-CACHE: 预先扫描 plan 推导 RoPE cos/sin 表需求,
     // 再把 cache_offset 传入 lower_fusion_plan_inner (供 lower_rope_full 使用)。
     let rope_req = compute_rope_requirement(plan, graph, alloc)?;
@@ -44,7 +47,7 @@ pub fn compile_layer_with_sym_map(
 
     // Stage 1: FusionPlan → VmProgram (IsaHook 驱动多算法选择)
     let mut program = lower_fusion_plan_inner_with_sym_map(plan, graph, alloc, registry, &profile,
-        Some(hook.as_ref()), rope_req.as_ref(), ple_req.as_ref(), dwc_req.as_ref(), false, Some(sym_map), None)?;
+        Some(hook.as_ref()), rope_req.as_ref(), ple_req.as_ref(), dwc_req.as_ref(), false, Some(sym_map), Some(&topology))?;
 
     // Stage 1.5: 符号验证 — catch 低级错误 (栈对齐, 寄存器配对, 嵌套 skip)
     // 在 ISA lowering 前运行, 违规返回 Err 而非产生错误机器码。
