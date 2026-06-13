@@ -905,6 +905,12 @@ pub(crate) fn dispatch_compute_pattern(
     resolver: &TensorPtrResolver,
     abi: &AbiPtrs,
 ) -> Result<bool, CompilerError> {
+    // Phase 4+: Op v2 lowering 入口（胖 opcode 驱动，Norm 类已迁移）。
+    // 返回 true 表示已处理，跳过现有 OpKind 反查路径。
+    if super::plan_lower::lower_op_v2(prog, op, graph, ctx, resolver, abi)? {
+        return Ok(true);
+    }
+
     let width = ctx.session.width;
     let sym_map = ctx.session.sym_map;
     let hook = ctx.session.hook;

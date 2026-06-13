@@ -48,5 +48,6 @@ include!("plan_lower/context.inc.rs");
 include!("plan_lower/pipeline.inc.rs");
 include!("plan_lower/compile.inc.rs");
 include!("plan_lower/template.inc.rs");
+include!("plan_lower/lower_op_v2.inc.rs");
 
 include!("plan_lower/tests.inc.rs");
