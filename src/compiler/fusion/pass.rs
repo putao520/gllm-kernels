@@ -776,14 +776,22 @@ fn assign_hetero_markers(
 
 /// Extract hetero dimension thresholds from graph ops.
 /// Returns (sliding_head_dim, full_head_dim, small_intermediate, large_intermediate).
+///
+/// ARCH-JIT-DATA-YIELDS: single-pass collection — both head_dim and intermediate size
+/// extracted in one traversal, replacing two separate full-graph scans.
 fn extract_hetero_dims(graph: &CompilerGraph) -> Option<HeteroDims> {
-    // Collect all unique head_dim values from Attention ops
-    let mut head_dims: Vec<usize> = graph.ops.iter()
-        .filter_map(|op| match &op.kind {
-            OpKind::MultiHeadAttention { head_dim, .. } => Some(*head_dim),
-            _ => None,
-        })
-        .collect();
+    // Single-pass: collect head_dim from Attention and intermediate from GEMM together
+    let mut head_dims: Vec<usize> = Vec::new();
+    let mut intermediates: Vec<usize> = Vec::new();
+    for op in &graph.ops {
+        match &op.kind {
+            OpKind::MultiHeadAttention { head_dim, .. } => head_dims.push(*head_dim),
+            OpKind::Gemm { n, .. } | OpKind::GemmBias { n, .. } | OpKind::QuantGemm { n, .. } => {
+                intermediates.push(*n);
+            }
+            _ => {}
+        }
+    }
     head_dims.sort_unstable();
     head_dims.dedup();
 
@@ -794,14 +802,6 @@ fn extract_hetero_dims(graph: &CompilerGraph) -> Option<HeteroDims> {
     let sliding_head_dim = head_dims[0];
     let full_head_dim = head_dims[1];
 
-    // Collect all unique FFN intermediate sizes from GEMM ops
-    // (the n dimension of gate/up projections in FFN)
-    let mut intermediates: Vec<usize> = graph.ops.iter()
-        .filter_map(|op| match &op.kind {
-            OpKind::Gemm { n, .. } | OpKind::GemmBias { n, .. } | OpKind::QuantGemm { n, .. } => Some(*n),
-            _ => None,
-        })
-        .collect();
     intermediates.sort_unstable();
     intermediates.dedup();
 

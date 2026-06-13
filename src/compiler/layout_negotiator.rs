@@ -408,6 +408,8 @@ fn model_aware_layout_overrides(
 }
 
 /// 检查 op 是否为 QKV 投影（三兄弟共享同一输入）
+///
+/// ARCH-JIT-DATA-YIELDS: 使用 tensor.consumers 索引替代全图扫描。
 fn is_qkv_op(op_id: OpId, graph: &CompilerGraph) -> bool {
     let op = match graph.op(op_id) {
         Some(o) => o,
@@ -417,17 +419,20 @@ fn is_qkv_op(op_id: OpId, graph: &CompilerGraph) -> bool {
         return false;
     }
     let Some(&input_tid) = op.inputs.first() else { return false };
-    // 统计共享同一输入的 GEMM 数量
-    let sibling_count = graph.ops.iter()
-        .filter(|other| {
-            other.inputs.first() == Some(&input_tid) &&
-            matches!(other.kind, OpKind::Gemm { .. } | OpKind::GemmBias { .. } | OpKind::QuantGemm { .. })
-        })
-        .count();
+    // 统计共享同一输入的 GEMM 数量（通过 tensor.consumers 索引）
+    let sibling_count = graph.tensor(input_tid)
+        .map(|t| t.consumers.iter()
+            .filter(|&&c| graph.op(c).is_some_and(|o| matches!(o.kind,
+                OpKind::Gemm { .. } | OpKind::GemmBias { .. } | OpKind::QuantGemm { .. })))
+            .count())
+        .unwrap_or(0);
     sibling_count >= 3
 }
 
 /// 从图中提取 head_dim — 通过查找 MHA op 的参数
+///
+/// ARCH-JIT-DATA-YIELDS: short-circuit find_map — stops at first match.
+/// This is a single targeted lookup, not a pre-scan bool flag.
 fn extract_head_dim_from_graph(graph: &CompilerGraph) -> Option<usize> {
     graph.ops.iter()
         .find_map(|op| match &op.kind {
@@ -3030,21 +3035,13 @@ mod tests {
         graph.add_op(OpKind::Gemm { m: SymDim::Concrete(1), n: 256, k: 256, dtype: DType::F32, trans_b: false }, vec![input, w1], vec![o1], "q_proj");
         graph.add_op(OpKind::Gemm { m: SymDim::Concrete(1), n: 256, k: 256, dtype: DType::F32, trans_b: false }, vec![input, w2], vec![o2], "k_proj");
 
-        // Third sibling is a QuantGemm
-        let quant_gemm_op = CompilerOp {
-            id: OpId(2),
-            kind: OpKind::QuantGemm {
-                m: SymDim::Concrete(1),
-                n: 256,
-                k: 256,
-                quant_type: crate::quant::QuantType::F32,
-            },
-            inputs: vec![input, w3],
-            outputs: vec![o3],
-            label: "v_proj".to_string(),
-    guard: LayerCondition::Always,
-        };
-        graph.ops.push(quant_gemm_op);
+        // Third sibling is a QuantGemm — added via graph.add_op to maintain tensor.consumers index.
+        graph.add_op(OpKind::QuantGemm {
+            m: SymDim::Concrete(1),
+            n: 256,
+            k: 256,
+            quant_type: crate::quant::QuantType::F32,
+        }, vec![input, w3], vec![o3], "v_proj");
 
         // Act: check the first Gemm (OpId(0)) — should see 3 siblings (2 Gemm + 1 QuantGemm)
         let result = is_qkv_op(OpId(0), &graph);

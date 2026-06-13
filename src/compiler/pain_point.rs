@@ -251,6 +251,16 @@ impl PainPointAnalyzer {
 
         let mut gemm_bottlenecks = HashMap::new();
 
+        // ARCH-JIT-DATA-YIELDS: pre-compute GEMM op list in topological order
+        // to avoid per-call full-graph scans in classify_gemm_role.
+        let all_gemms_in_order: Vec<OpId> = graph.topological_sort()
+            .into_iter()
+            .filter(|&op_id| {
+                graph.op(op_id).is_some_and(|op| matches!(op.kind,
+                    OpKind::Gemm { .. } | OpKind::GemmBias { .. } | OpKind::QuantGemm { .. }))
+            })
+            .collect();
+
         for op_id in graph.topological_sort() {
             let op = match graph.op(op_id) {
                 Some(o) => o,
@@ -270,7 +280,7 @@ impl PainPointAnalyzer {
                 _ => continue,
             };
 
-            let role = classify_gemm_role(op_id, graph);
+            let role = classify_gemm_role(op_id, graph, &all_gemms_in_order);
             let flops = 2.0 * m as f64 * n as f64 * k as f64;
             let bytes = (m * k + k * n + m * n) as f64 * 4.0; // F32
             let ai = if bytes > 0.0 { flops / bytes } else { 0.0 };
@@ -315,20 +325,30 @@ impl PainPointAnalyzer {
 /// 从图拓扑推导 GEMM 语义角色。
 /// 优先使用结构特征（共享输入 = QKV，紧跟 attention 输出 = Output），
 /// label 匹配作为 fallback。
-fn classify_gemm_role(op_id: OpId, graph: &CompilerGraph) -> GemmRole {
+///
+/// ARCH-JIT-DATA-YIELDS: 全部基于 tensor.consumers / tensor.producer 索引和预计算的
+/// `all_gemms_in_order` 列表，零全图扫描。
+fn classify_gemm_role(
+    op_id: OpId,
+    graph: &CompilerGraph,
+    all_gemms_in_order: &[OpId],
+) -> GemmRole {
     let op = match graph.op(op_id) {
         Some(o) => o,
         None => return GemmRole::Other,
     };
 
+    let is_gemm_kind = |kind: &OpKind| matches!(kind,
+        OpKind::Gemm { .. } | OpKind::GemmBias { .. } | OpKind::QuantGemm { .. });
+
     // 拓扑推导 1: 共享输入的 GEMM 三兄弟 → QkvProjection
+    // ARCH-JIT-DATA-YIELDS: 使用 tensor.consumers 索引替代全图扫描。
     if let Some(&input_tid) = op.inputs.first() {
-        let shared_count = graph.ops.iter()
-            .filter(|other_op| {
-                other_op.inputs.first() == Some(&input_tid) &&
-                matches!(other_op.kind, OpKind::Gemm { .. } | OpKind::GemmBias { .. } | OpKind::QuantGemm { .. })
-            })
-            .count();
+        let shared_count = graph.tensor(input_tid)
+            .map(|t| t.consumers.iter()
+                .filter(|&&c| graph.op(c).is_some_and(|o| is_gemm_kind(&o.kind)))
+                .count())
+            .unwrap_or(0);
         if shared_count >= 3 {
             return GemmRole::QkvProjection;
         }
@@ -336,7 +356,8 @@ fn classify_gemm_role(op_id: OpId, graph: &CompilerGraph) -> GemmRole {
 
     // 拓扑推导 2: 此 GEMM 的输出被 softmax 或 attention 算子消费 → OutputProjection
     for &output_tid in &op.outputs {
-        for consumer_id in &graph.tensor(output_tid).map(|t| t.consumers.clone()).unwrap_or_default() {
+        let consumers = graph.tensor(output_tid).map(|t| &t.consumers).cloned().unwrap_or_default();
+        for consumer_id in &consumers {
             if let Some(consumer) = graph.op(*consumer_id) {
                 if matches!(consumer.kind,
                     OpKind::Softmax | OpKind::MultiHeadAttention { .. }
@@ -349,17 +370,16 @@ fn classify_gemm_role(op_id: OpId, graph: &CompilerGraph) -> GemmRole {
 
     // 拓扑推导 3: 共享输入的 GEMM 两兄弟 + 后接 SiLU/SwiGLU → GateUpProjection
     if let Some(&input_tid) = op.inputs.first() {
-        let sibling_gemm_count = graph.ops.iter()
-            .filter(|other_op| {
-                other_op.inputs.first() == Some(&input_tid) &&
-                other_op.id != op.id &&
-                matches!(other_op.kind, OpKind::Gemm { .. } | OpKind::GemmBias { .. } | OpKind::QuantGemm { .. })
-            })
-            .count();
+        let sibling_gemm_count = graph.tensor(input_tid)
+            .map(|t| t.consumers.iter()
+                .filter(|&&c| c != op_id && graph.op(c).is_some_and(|o| is_gemm_kind(&o.kind)))
+                .count())
+            .unwrap_or(0);
         if sibling_gemm_count == 1 {
             // 检查输出是否被 SwiGLU 或 SiLU 消费
             for &output_tid in &op.outputs {
-                for consumer_id in &graph.tensor(output_tid).map(|t| t.consumers.clone()).unwrap_or_default() {
+                let consumers = graph.tensor(output_tid).map(|t| &t.consumers).cloned().unwrap_or_default();
+                for consumer_id in &consumers {
                     if let Some(consumer) = graph.op(*consumer_id) {
                         if matches!(consumer.kind,
                             OpKind::SwiGlu | OpKind::Silu | OpKind::SwiGluClipped { .. } | OpKind::GeGlu
@@ -388,12 +408,9 @@ fn classify_gemm_role(op_id: OpId, graph: &CompilerGraph) -> GemmRole {
     }
 
     // 拓扑推导 5: 图中最后一个 GEMM + 无后续 GEMM → LmHead
-    let all_gemms: Vec<_> = graph.ops.iter()
-        .filter(|o| matches!(o.kind, OpKind::Gemm { .. } | OpKind::GemmBias { .. } | OpKind::QuantGemm { .. }))
-        .collect();
-    if all_gemms.len() >= 3 {
-        let last_gemm = all_gemms.last().unwrap();
-        if last_gemm.id == op.id {
+    // ARCH-JIT-DATA-YIELDS: 使用预计算的 all_gemms_in_order 列表，零全图扫描。
+    if all_gemms_in_order.len() >= 3 {
+        if all_gemms_in_order.last() == Some(&op_id) {
             return GemmRole::LmHead;
         }
     }
@@ -550,7 +567,7 @@ mod tests {
             vec![inp, wk], vec![ok_], "k");
         g.add_op(OpKind::Gemm { m: SymDim::Concrete(1), n: 4096, k: 4096, dtype: DType::F32, trans_b: false },
             vec![inp, wv], vec![ov], "v");
-        assert_eq!(classify_gemm_role(q_op, &g), GemmRole::QkvProjection);
+        assert_eq!(classify_gemm_role(q_op, &g, &[q_op]), GemmRole::QkvProjection);
 
         // OutputProjection: GEMM 输出被 Softmax 消费
         let mut g2 = CompilerGraph::new();
@@ -561,7 +578,7 @@ mod tests {
         let o_proj = g2.add_op(OpKind::Gemm { m: SymDim::Concrete(1), n: 4096, k: 4096, dtype: DType::F32, trans_b: false },
             vec![inp2, w2], vec![gemm_out2], "o");
         g2.add_op(OpKind::Softmax, vec![gemm_out2], vec![soft_out], "soft");
-        assert_eq!(classify_gemm_role(o_proj, &g2), GemmRole::OutputProjection);
+        assert_eq!(classify_gemm_role(o_proj, &g2, &[o_proj]), GemmRole::OutputProjection);
 
         // 孤立 GEMM: Other
         let mut g3 = CompilerGraph::new();
@@ -570,7 +587,7 @@ mod tests {
         let out3 = g3.add_tensor_concrete("o", &[1, 4096], DType::F32);
         let isolated = g3.add_op(OpKind::Gemm { m: SymDim::Concrete(1), n: 4096, k: 4096, dtype: DType::F32, trans_b: false },
             vec![inp3, w3], vec![out3], "generic");
-        assert_eq!(classify_gemm_role(isolated, &g3), GemmRole::Other);
+        assert_eq!(classify_gemm_role(isolated, &g3, &[isolated]), GemmRole::Other);
     }
 
     #[test]
@@ -726,7 +743,7 @@ mod tests {
             dtype: DType::F32, trans_b: false,
         }, vec![silu_out, w_down], vec![down_out], "down_proj");
 
-        assert_eq!(classify_gemm_role(down_op, &g), GemmRole::DownProjection);
+        assert_eq!(classify_gemm_role(down_op, &g, &[down_op]), GemmRole::DownProjection);
     }
 
     #[test]
@@ -735,6 +752,7 @@ mod tests {
         // (no shared-input topology that would trigger QKV classification).
         let mut g = CompilerGraph::new();
         let mut last_id = None;
+        let mut gemm_ids_in_order: Vec<OpId> = Vec::new();
         for i in 0..3 {
             let inp = g.add_tensor_concrete(&format!("x{}", i), &[1, 256], DType::F32);
             let w = g.add_tensor_concrete(&format!("w{}", i), &[256, 256], DType::F32);
@@ -744,8 +762,9 @@ mod tests {
                 dtype: DType::F32, trans_b: false,
             }, vec![inp, w], vec![out], &format!("gemm{}", i));
             last_id = Some(op_id);
+            gemm_ids_in_order.push(op_id);
         }
-        assert_eq!(classify_gemm_role(last_id.unwrap(), &g), GemmRole::LmHead);
+        assert_eq!(classify_gemm_role(last_id.unwrap(), &g, &gemm_ids_in_order), GemmRole::LmHead);
     }
 
     #[test]
@@ -859,7 +878,7 @@ mod tests {
         g.add_op(OpKind::GeGlu, vec![gate_out, up_out], vec![geglu_out], "geglu");
 
         // Act
-        let role = classify_gemm_role(gate_op, &g);
+        let role = classify_gemm_role(gate_op, &g, &[gate_op]);
 
         // Assert: GateUpProjection via GeGlu topology.
         assert_eq!(role, GemmRole::GateUpProjection);
@@ -888,7 +907,7 @@ mod tests {
             vec![gate_out, up_out], vec![clipped_out], "clipped");
 
         // Act
-        let role = classify_gemm_role(gate_op, &g);
+        let role = classify_gemm_role(gate_op, &g, &[gate_op]);
 
         // Assert: GateUpProjection via SwiGluClipped topology.
         assert_eq!(role, GemmRole::GateUpProjection);
@@ -914,7 +933,7 @@ mod tests {
         }, vec![gemm_out], vec![mha_out], "mha");
 
         // Act
-        let role = classify_gemm_role(o_proj, &g);
+        let role = classify_gemm_role(o_proj, &g, &[o_proj]);
 
         // Assert: OutputProjection via MHA consumer.
         assert_eq!(role, GemmRole::OutputProjection);

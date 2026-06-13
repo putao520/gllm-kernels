@@ -158,9 +158,9 @@ pub fn select_dequant_path(
 ) -> DequantStrategy {
     // 1D tensors consumed by norm/bias ops → immediate dequant
     if tensor.shape.len() == 1 {
-        // Check if consumed by a norm op
-        let consumed_by_norm = graph.ops.iter()
-            .filter(|op| op.inputs.contains(&tensor.id))
+        // ARCH-JIT-DATA-YIELDS: use tensor.consumers index instead of graph.ops.iter()
+        let consumed_by_norm = tensor.consumers.iter()
+            .filter_map(|&op_id| graph.op(op_id))
             .any(|op| matches!(op.kind, OpKind::RmsNorm { .. } | OpKind::LayerNorm { .. }));
         if consumed_by_norm {
             return DequantStrategy::Immediate;
@@ -168,8 +168,8 @@ pub fn select_dequant_path(
     }
 
     // 2D tensors consumed by GEMM ops → deferred dequant
-    let consumed_by_gemm = graph.ops.iter()
-        .filter(|op| op.inputs.contains(&tensor.id))
+    let consumed_by_gemm = tensor.consumers.iter()
+        .filter_map(|&op_id| graph.op(op_id))
         .any(|op| matches!(op.kind, OpKind::Gemm { .. } | OpKind::GemmBias { .. } | OpKind::QuantGemm { .. }));
 
     if consumed_by_gemm {
