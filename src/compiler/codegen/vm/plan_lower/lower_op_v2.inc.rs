@@ -39,6 +39,25 @@ pub(crate) fn lower_op_v2(
         Op::Gemm(ref spec) | Op::GemmBias(ref spec) => {
             lower_gemm_v2(prog, op, graph, ctx, resolver, abi, spec)
         }
+        Op::QuantGemm(ref spec) => {
+            let m_bound = if abi.mega_decode_seq_len.is_some() {
+                BoundExpr::Const(1)
+            } else {
+                resolve_sym_dim(&spec.m, abi, ctx.session.sym_map)
+            };
+            let a_ptr = resolver.materialize(prog, op.inputs[0], abi).ok_or_else(|| {
+                CompilerError::CodegenViolation(format!("QuantGemm op {:?}: input 无法 materialize", op.id))
+            })?;
+            let b_ptr = resolver.materialize(prog, op.inputs[1], abi).ok_or_else(|| {
+                CompilerError::CodegenViolation(format!("QuantGemm op {:?}: weight 无法 materialize", op.id))
+            })?;
+            let c_ptr = resolver.materialize(prog, op.outputs[0], abi).ok_or_else(|| {
+                CompilerError::CodegenViolation(format!("QuantGemm op {:?}: output 无法 materialize", op.id))
+            })?;
+            super::moe_quant_emit::emit_quant_gemm_inline(prog, m_bound, spec.n, spec.k, spec.quant_type,
+                ctx.session.width, a_ptr, b_ptr, c_ptr, ctx.dtype, ctx.session.dot_cap)?;
+            Ok(true)
+        }
         Op::MultiHeadAttention(ref spec) => lower_attention_v2(prog, op, graph, ctx, resolver, abi, spec),
         // NOP variants — 元数据 op，不生成 VmInstr（与 dispatch_structural:236 等价）
         Op::Transpose { .. } | Op::Reshape { .. } | Op::SliceView { .. } => Ok(true),
