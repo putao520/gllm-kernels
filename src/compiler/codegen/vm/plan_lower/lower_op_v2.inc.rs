@@ -102,6 +102,44 @@ pub(crate) fn lower_op_v2(
             });
             Ok(true)
         }
+        Op::RoPE(ref spec) => {
+            // rope_cache_offset 从 ctx.rope_req 获取（op-level 自描述替代外部参数）
+            let rope_req = ctx.rope_req.ok_or_else(|| CompilerError::CodegenViolation(
+                format!("RoPE op {:?}: ctx.rope_req 未配置", op.id)))?;
+            let cos_sin_offset = rope_req.cache_offset;
+
+            let out_tid = op.outputs.first().copied().ok_or_else(|| CompilerError::CodegenViolation(
+                format!("RoPE op {:?}: 无输出张量", op.id)))?;
+            let out_tensor = graph.tensor(out_tid).ok_or_else(|| CompilerError::CodegenViolation(
+                format!("RoPE op {:?}: 输出张量不存在", op.id)))?;
+            let seq_dim = out_tensor.shape.iter().find(|d| d.is_symbolic()).cloned()
+                .or_else(|| out_tensor.shape.first().cloned())
+                .ok_or_else(|| CompilerError::CodegenViolation(format!(
+                    "RoPE op {:?}: 输出 shape 为空", op.id)))?;
+            let seq_bound = resolve_sym_dim(&seq_dim, abi, ctx.session.sym_map);
+
+            let input_ptr = resolver.materialize(prog, op.inputs[0], abi).ok_or_else(|| {
+                CompilerError::CodegenViolation(format!("RoPE op {:?}: input 无法 materialize", op.id))
+            })?;
+            let output_ptr = resolver.materialize(prog, out_tid, abi).ok_or_else(|| {
+                CompilerError::CodegenViolation(format!("RoPE op {:?}: output 无法 materialize", op.id))
+            })?;
+
+            // Mega-kernel: RoPE processes 1 token (current position)
+            let (rope_seq_bound, rope_pos_offset) = if let Some(gen_ctr) = abi.gen_loop_counter {
+                (BoundExpr::Const(1), Some(gen_ctr))
+            } else {
+                (seq_bound, None)
+            };
+
+            super::structural_emit::emit_rope_inline(
+                prog, rope_seq_bound, spec.num_heads, spec.head_dim,
+                spec.partial, ctx.session.width,
+                input_ptr, output_ptr, cos_sin_offset, ctx.session.sym_map,
+                ctx.dtype, rope_pos_offset,
+            )?;
+            Ok(true)
+        }
         Op::MultiHeadAttention(ref spec) => lower_attention_v2(prog, op, graph, ctx, resolver, abi, spec),
         // NOP variants — 元数据 op，不生成 VmInstr（与 dispatch_structural:236 等价）
         Op::Transpose { .. } | Op::Reshape { .. } | Op::SliceView { .. } => Ok(true),
