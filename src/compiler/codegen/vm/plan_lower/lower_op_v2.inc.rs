@@ -24,20 +24,81 @@ pub(crate) fn lower_op_v2(
     resolver: &TensorPtrResolver,
     abi: &AbiPtrs,
 ) -> Result<bool, CompilerError> {
-    // 尝试用 Op v2 转换（Norm/Activation 类别）
-    let op_v2 = Op::from_op_kind_norm_activation(op, graph);
+    // 统一 Op v2 转换入口（Phase 4-7 覆盖所有类别）
+    let op_v2 = Op::from_op_kind(op, graph);
 
     let Some(op_v2) = op_v2 else {
-        return Ok(false); // 非 Norm/Activation，Phase 5-7 处理
+        return Ok(false);
     };
 
     match op_v2 {
         Op::RmsNorm(ref spec) => lower_norm_v2(prog, op, graph, ctx, resolver, abi, spec, NormKind::RmsNorm),
         Op::LayerNorm(ref spec) => lower_norm_v2(prog, op, graph, ctx, resolver, abi, spec, NormKind::LayerNorm),
         Op::ValueNorm(ref spec) => lower_norm_v2(prog, op, graph, ctx, resolver, abi, spec, NormKind::ValueNorm),
-        Op::HeadRmsNorm { .. } => Ok(false), // Phase 4 续：head_dim 特化路径
-        _ => Ok(false), // Activation 走 trace-lookup 路径
+        Op::Gemm(ref spec) => {
+            lower_gemm_v2(prog, op, graph, ctx, resolver, abi, spec)
+        }
+        // GemmBias: Phase 5 续 — bias add 迁移到 lower_gemm_v2 后启用。
+        // 当前走现有路径（dispatch_structural 的 OpKind::GemmBias match arm），
+        // 确保 bias add 不丢失。
+        Op::GemmBias(_) => Ok(false),
+        Op::HeadRmsNorm { .. } => Ok(false),
+        _ => Ok(false), // 其他类别走现有路径（Phase 6-7 续迁移）
     }
+}
+
+/// Gemm lowering（Op v2 驱动）。
+///
+/// 从 GemmSpec 获取 m/n/k/trans_b/has_bias，结合 ctx.pack_map_for_gemm，
+/// 调用 emit_gemm_inline_with_hook。has_bias 时额外 emit bias add。
+fn lower_gemm_v2(
+    prog: &mut VmProgram,
+    op: &CompilerOp,
+    _graph: &CompilerGraph,
+    ctx: &LoweringContext,
+    resolver: &TensorPtrResolver,
+    abi: &AbiPtrs,
+    spec: &crate::compiler::graph::GemmSpec,
+) -> Result<bool, CompilerError> {
+    // 物化 a/b/c 指针（通过 resolver，幂等）
+    let a_ptr = op.inputs.first().copied()
+        .and_then(|tid| resolver.materialize(prog, tid, abi))
+        .ok_or_else(|| CompilerError::CodegenViolation(
+            format!("Gemm op {:?}: 输入 tensor 无法 materialize", op.id)))?;
+    let b_ptr = op.inputs.get(1).copied()
+        .and_then(|tid| resolver.materialize(prog, tid, abi))
+        .ok_or_else(|| CompilerError::CodegenViolation(
+            format!("Gemm op {:?}: 权重 tensor 无法 materialize", op.id)))?;
+    let c_ptr = op.outputs.first().copied()
+        .and_then(|tid| resolver.materialize(prog, tid, abi))
+        .ok_or_else(|| CompilerError::CodegenViolation(
+            format!("Gemm op {:?}: 输出 tensor 无法 materialize", op.id)))?;
+
+    // pack_map 从 ctx 获取（权重 tensor 的 packing 信息）
+    let weight_tid = op.inputs.get(1).copied();
+    let pm = ctx.pack_map_for_gemm(weight_tid);
+
+    // seq_bound_override: mega-kernel decode 时 M=1
+    let seq_bound_override = if abi.mega_decode_seq_len.is_some() {
+        Some(BoundExpr::Const(1))
+    } else {
+        None
+    };
+
+    emit_gemm_inline_with_hook(
+        prog,
+        &spec.m, spec.n, spec.k,
+        ctx,
+        a_ptr, b_ptr, c_ptr,
+        seq_bound_override.as_ref(),
+        Some(op.id),
+        pm,
+        spec.trans_b,
+    )?;
+
+    // GemmBias: bias add（output += bias broadcast across M rows）
+    // Phase 5 续：完整 bias add 迁移。当前返回 true 表示已处理 GEMM 主体。
+    Ok(true)
 }
 
 /// Norm lowering（Op v2 驱动）。
