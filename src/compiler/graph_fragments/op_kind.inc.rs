@@ -1,12 +1,14 @@
 /// KV cache 来源 — op-level 自描述，替代 graph-level topology 推导。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum KvSource {
-    /// K/V 来自当前图的 tensor（self-attention prefill、conformer encoder 等）。
+    /// K/V 来自当前图的 tensor（self-attention prefill、conformer encoder、
+    /// vision attention、intent tracker 等无持久化 KV cache 的场景）。
     /// 不读写持久化 KV cache，zero cache copy overhead。
     FromTensor,
     /// K/V 来自持久化 KV cache（LLM decoder generate loop）。
-    /// layer_idx 标识读写哪一层。
-    FromCache { layer_idx: usize },
+    /// 层索引用运行时 layer_loop_counter（mega-kernel ABI 提供），
+    /// 而非编译时常量——因为层循环中每层 layer_idx 不同。
+    FromCache,
 }
 
 /// The set of operations the compiler graph can represent.

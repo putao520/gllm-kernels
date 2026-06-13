@@ -1248,13 +1248,16 @@ pub(crate) fn dispatch_compute_pattern(
             // FromCache: 写入/读取持久化 KV cache（LLM decoder generate loop）。
             // FromTensor: 直接使用 GEMM 产出的 K/V tensor，zero cache copy（conformer encoder 等）。
             let (k_attn_ptr, v_attn_ptr) = match kv_source {
-                crate::compiler::graph::KvSource::FromCache { layer_idx } => {
+                crate::compiler::graph::KvSource::FromCache => {
                     let kv_cache_ptr = abi.kv_cache_ptr.ok_or_else(|| CompilerError::CodegenViolation(
                         format!("MHA op {:?}: kv_source=FromCache 但 ABI 中无 kv_cache_ptr", op.id)))?;
 
-                    // 加载 layer_idx 到寄存器
-                    let layer_ctr = prog.alloc_vreg(VRegKind::Counter, SimdWidth::Scalar);
-                    prog.emit(VmInstr::GprLoadImm { dst: layer_ctr, value: *layer_idx });
+                    // 层索引用运行时 layer_loop_counter（mega-kernel ABI 提供层循环计数器）
+                    let layer_ctr = abi.layer_loop_counter.unwrap_or_else(|| {
+                        let zero = prog.alloc_vreg(VRegKind::Counter, SimdWidth::Scalar);
+                        prog.emit(VmInstr::GprLoadImm { dst: zero, value: 0 });
+                        zero
+                    });
 
                     let gen_ctr = abi.gen_loop_counter.unwrap_or_else(|| {
                         let zero = prog.alloc_vreg(VRegKind::Counter, SimdWidth::Scalar);

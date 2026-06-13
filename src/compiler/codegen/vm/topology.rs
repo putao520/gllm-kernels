@@ -153,9 +153,9 @@ impl GraphTopologyAnalysis {
         let mut has_argmax = false;
         let mut has_store_token = false;
         let mut has_check_stop = false;
-        let mut has_mha = false;
-        let mut has_cached_gqa = false;
-        let mut has_mla = false;
+        let mut has_mha_from_cache = false;
+        let mut has_cached_gqa_from_cache = false;
+        let mut has_mla_from_cache = false;
         let mut has_sg_ops = false;
         let mut has_weight_ops = false;
         let mut has_qk_norm = false;
@@ -173,9 +173,11 @@ impl GraphTopologyAnalysis {
                 }
                 OpKind::StoreToken => has_store_token = true,
                 OpKind::CheckStopCondition => has_check_stop = true,
-                OpKind::MultiHeadAttention { .. } => has_mha = true,
-                OpKind::CachedGQA { .. } => has_cached_gqa = true,
-                OpKind::MlaAttention { .. } => has_mla = true,
+                // kv_cache_source 由 op.kv_source 驱动（op-level 自描述）。
+                // 只有 FromCache 的 attention 才需要加载 kv_cache_ptr。
+                OpKind::MultiHeadAttention { kv_source: crate::compiler::graph::KvSource::FromCache, .. } => has_mha_from_cache = true,
+                OpKind::CachedGQA { kv_source: crate::compiler::graph::KvSource::FromCache, .. } => has_cached_gqa_from_cache = true,
+                OpKind::MlaAttention { kv_source: crate::compiler::graph::KvSource::FromCache, .. } => has_mla_from_cache = true,
                 OpKind::SgDetect { hidden_dim, .. } => {
                     has_sg_ops = true;
                     if sg_detect_hidden_dim.is_none() {
@@ -212,14 +214,14 @@ impl GraphTopologyAnalysis {
             SeqLenSource::PromptLen
         };
 
-        // kv_cache_source: MHA/CachedGQA/MLA 仅在 generate loop 图（有 Argmax+StoreToken+CheckStopCondition）
-        // 中需要持久化 KV cache。纯 prefill/encode 图（conformer self-attention、BERT encoder 等）
-        // 直接使用当前 K/V，无需缓存——此时 kv_cache_ptr 可为 NULL，跳过 KV cache copy 路径。
-        let kv_cache_source = if has_cached_gqa && is_generate {
+        // kv_cache_source: 由 op.kv_source 驱动（op-level 自描述，ARCH-JIT-DATA-YIELDS）。
+        // 只有 attention op 显式声明 FromCache 时才加载 kv_cache_ptr。
+        // conformer self-attention (FromTensor) 不触发 KV cache 加载。
+        let kv_cache_source = if has_cached_gqa_from_cache {
             KvCacheSource::CachedGqa
-        } else if has_mla && is_generate {
+        } else if has_mla_from_cache {
             KvCacheSource::MlaAttention
-        } else if has_mha && is_generate {
+        } else if has_mha_from_cache {
             KvCacheSource::StandardMha
         } else {
             KvCacheSource::NoCache
