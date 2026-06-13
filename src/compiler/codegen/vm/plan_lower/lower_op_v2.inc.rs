@@ -58,6 +58,33 @@ pub(crate) fn lower_op_v2(
                 ctx.session.width, a_ptr, b_ptr, c_ptr, ctx.dtype, ctx.session.dot_cap)?;
             Ok(true)
         }
+        Op::Residual => {
+            let (out_shape, feature_dim) = infer_output_shape_sym(op, graph)?;
+            let in_ptr = resolver.materialize(prog, op.inputs[0], abi).ok_or_else(|| {
+                CompilerError::CodegenViolation(format!("Residual op {:?}: input 无法 materialize", op.id))
+            })?;
+            let w_ptr = op.inputs.get(1).copied()
+                .and_then(|tid| resolver.materialize(prog, tid, abi))
+                .unwrap_or(in_ptr);
+            let out_ptr = resolver.materialize(prog, op.outputs[0], abi).ok_or_else(|| {
+                CompilerError::CodegenViolation(format!("Residual op {:?}: output 无法 materialize", op.id))
+            })?;
+            let telemetry_ptr = if graph.telemetry.residual_cosine_sim {
+                ctx.session.sym_map.resolve("telemetry").map(|expr| {
+                    let ptr_vreg = prog.alloc_vreg(VRegKind::Ptr, SimdWidth::Scalar);
+                    prog.emit(VmInstr::LoadPtr { dst: ptr_vreg, src: expr.clone() });
+                    ptr_vreg
+                })
+            } else {
+                None
+            };
+            super::telemetry_emit::emit_residual_with_telemetry(
+                prog, &out_shape, feature_dim, ctx.session.width,
+                in_ptr, w_ptr, out_ptr, ctx.session.sym_map, telemetry_ptr,
+                None, ctx.dtype,
+            )?;
+            Ok(true)
+        }
         Op::MultiHeadAttention(ref spec) => lower_attention_v2(prog, op, graph, ctx, resolver, abi, spec),
         // NOP variants — 元数据 op，不生成 VmInstr（与 dispatch_structural:236 等价）
         Op::Transpose { .. } | Op::Reshape { .. } | Op::SliceView { .. } => Ok(true),
