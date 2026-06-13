@@ -1129,7 +1129,7 @@ pub fn compile_mega_kernel_vm(
         alloc.total_bytes, ple_req.is_some(), dwc_req.is_some(), plan,
     );
 
-    let mut resolver = TensorPtrResolver::build(graph, alloc, Some(&topology));
+    let mut resolver = TensorPtrResolver::build(graph, alloc, &topology);
 
     let original_weight_vreg = Some(weight_reloaded);
 
@@ -1305,7 +1305,7 @@ pub fn compile_mega_kernel_vm(
     emit_fusion_groups(
         &mut prog, plan, graph, alloc, &ctx,
         rope_req.as_ref().map(|r| r.cache_offset),
-        &mut current_abi, original_weight_vreg, &resolver, Some(&topology),
+        &mut current_abi, original_weight_vreg, &resolver, &topology,
     )?;
 
     // L6 debug: embed + all layers done, before sampling pipeline
@@ -1731,7 +1731,7 @@ pub fn compile_mega_kernel_vm(
         activation_pong_ptr: None,
         };
 
-        let mut batch_resolver = TensorPtrResolver::build(graph, alloc, Some(&topology));
+        let mut batch_resolver = TensorPtrResolver::build(graph, alloc, &topology);
         // Redirect logits output for batch — topology-driven
         if let Some(logits_tid) = topology.logits_output_tid {
             batch_resolver.override_source(logits_tid, TensorPtrSource::Output { offset: 0 });
@@ -1770,7 +1770,7 @@ pub fn compile_mega_kernel_vm(
         emit_fusion_groups(
             &mut prog, plan, graph, alloc, &batch_ctx,
             rope_req.as_ref().map(|r| r.cache_offset),
-            &mut batch_current_abi, Some(weight_ptr), &batch_resolver, Some(&topology),
+            &mut batch_current_abi, Some(weight_ptr), &batch_resolver, &topology,
         )?;
 
         // ── iteration setup post: Per-seq argmax on last token of each prompt (BCI-006) ──
@@ -2032,7 +2032,7 @@ pub fn compile_mega_kernel_vm(
             emit_fusion_groups(
                 &mut prog, plan, graph, alloc, &batch_ctx,
                 rope_req.as_ref().map(|r| r.cache_offset),
-                &mut decode_abi, Some(weight_ptr), &batch_resolver, Some(&topology),
+                &mut decode_abi, Some(weight_ptr), &batch_resolver, &topology,
             )?;
 
             // ── Step 3e: Per-seq argmax + stop condition ──

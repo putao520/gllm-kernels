@@ -166,7 +166,7 @@ pub struct TensorPtrResolver {
 impl TensorPtrResolver {
     /// 从 BufferAllocation 的预计算 tensor_sources 构建。
     /// 当 R3 未预计算 tensor_sources（简单 allocate_buffers 路径）时 fallback 到自行构建。
-    pub fn build(graph: &CompilerGraph, alloc: &BufferAllocation, topology: Option<&super::topology::GraphTopologyAnalysis>) -> Self {
+    pub fn build(graph: &CompilerGraph, alloc: &BufferAllocation, topology: &super::topology::GraphTopologyAnalysis) -> Self {
         let map = if !alloc.tensor_sources.is_empty() {
             alloc.tensor_sources.clone()
         } else {
@@ -211,10 +211,8 @@ impl TensorPtrResolver {
                 ping_count, pong_count, inter_count, activation_count);
             // Dump activation_alias pairs
             // SPEC/39: activation_alias 从 topology 推导，替代 graph.layer_loop_config 读取
-            if let Some(topo) = topology {
-                if let Some((in_tid, out_tid)) = &topo.layer_activation_alias {
-                    eprintln!("[resolver] HOMO activation_alias: input_tid={} output_tid={}", in_tid.0, out_tid.0);
-                }
+            if let Some((in_tid, out_tid)) = &topology.layer_activation_alias {
+                eprintln!("[resolver] HOMO activation_alias: input_tid={} output_tid={}", in_tid.0, out_tid.0);
             }
             // HETERO: hetero_layer_loop_config.activation_aliases 仍保留在 graph 上
             // (hetero 拓扑尚未迁移到 GraphTopologyAnalysis)
@@ -272,7 +270,7 @@ impl TensorPtrResolver {
 fn build_tensor_sources_fallback(
     graph: &CompilerGraph,
     alloc: &BufferAllocation,
-    topology: Option<&super::topology::GraphTopologyAnalysis>,
+    topology: &super::topology::GraphTopologyAnalysis,
 ) -> HashMap<TensorId, TensorPtrSource> {
     let dtype = graph_dtype(graph);
     let mut map: HashMap<TensorId, TensorPtrSource> = HashMap::new();
@@ -320,11 +318,9 @@ fn build_tensor_sources_fallback(
     let has_ping_pong_slots = alloc.slots.iter().any(|s| s.tensor_id.0 == 0xFFFF_FF00);
     if has_ping_pong_slots {
         // SPEC/39: activation_alias 从 topology 推导，替代 graph.layer_loop_config 读取
-        if let Some(topo) = topology {
-            if let Some((ref input_tid, ref output_tid)) = topo.layer_activation_alias {
-                map.insert(*input_tid, TensorPtrSource::ActivationPing);
-                map.insert(*output_tid, TensorPtrSource::ActivationPong);
-            }
+        if let Some((ref input_tid, ref output_tid)) = topology.layer_activation_alias {
+            map.insert(*input_tid, TensorPtrSource::ActivationPing);
+            map.insert(*output_tid, TensorPtrSource::ActivationPong);
         }
         // HETERO: hetero_layer_loop_config.activation_aliases 仍保留在 graph 上
         if let Some(ref cfg) = graph.hetero_layer_loop_config {
@@ -337,11 +333,9 @@ fn build_tensor_sources_fallback(
         // Forward-only path (compile_graph): alias output inherits activation input's source
         // so that post-loop ops (e.g. MeanPool) can read the final layer's output.
         // SPEC/39: activation_alias 从 topology 推导，替代 graph.layer_loop_config 读取
-        if let Some(topo) = topology {
-            if let Some((ref input_tid, ref output_tid)) = topo.layer_activation_alias {
-                if let Some(src) = map.get(input_tid).copied() {
-                    map.insert(*output_tid, src);
-                }
+        if let Some((ref input_tid, ref output_tid)) = topology.layer_activation_alias {
+            if let Some(src) = map.get(input_tid).copied() {
+                map.insert(*output_tid, src);
             }
         }
         // HETERO: hetero_layer_loop_config.activation_aliases 仍保留在 graph 上

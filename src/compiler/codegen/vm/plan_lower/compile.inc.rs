@@ -47,7 +47,7 @@ pub fn compile_layer_with_sym_map(
 
     // Stage 1: FusionPlan → VmProgram (IsaHook 驱动多算法选择)
     let mut program = lower_fusion_plan_inner_with_sym_map(plan, graph, alloc, registry, &profile,
-        Some(hook.as_ref()), rope_req.as_ref(), ple_req.as_ref(), dwc_req.as_ref(), false, Some(sym_map), Some(&topology))?;
+        Some(hook.as_ref()), rope_req.as_ref(), ple_req.as_ref(), dwc_req.as_ref(), false, Some(sym_map), &topology)?;
 
     // Stage 1.5: 符号验证 — catch 低级错误 (栈对齐, 寄存器配对, 嵌套 skip)
     // 在 ISA lowering 前运行, 违规返回 Err 而非产生错误机器码。

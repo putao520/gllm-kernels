@@ -534,7 +534,7 @@ mod tests {
         let isa_profile = crate::compiler::codegen::vm::isa_profile::IsaProfile::from_device_profile(&profile);
         let registry = ScalarOpRegistry::with_defaults();
         let hook = super::super::isa_hook::select_hook(&isa_profile);
-        let resolver = TensorPtrResolver::build(&graph, &alloc, None);
+        let resolver = TensorPtrResolver::build(&graph, &alloc, &super::super::topology::GraphTopologyAnalysis::analyze(&graph));
         let ctx = LoweringContext {
             width: isa_profile.optimal_simd_width(),
             dtype: graph_dtype(&graph),
@@ -774,7 +774,7 @@ mod tests {
         let out = g.add_tensor_concrete("output", &[32], DType::F32);
         g.inputs = vec![inp, wt]; g.outputs = vec![out];
         let alloc = BufferAllocation::default();
-        let resolver = TensorPtrResolver::build(&g, &alloc, None);
+        let resolver = TensorPtrResolver::build(&g, &alloc, &super::super::topology::GraphTopologyAnalysis::analyze(&g));
         let inp_src = resolver.source(inp).expect("input must have source");
         assert!(matches!(inp_src, TensorPtrSource::Activation), "input must be Activation");
         let wt_src = resolver.source(wt).expect("weight must have source");
@@ -836,7 +836,7 @@ mod tests {
         let out = g.add_tensor_concrete("output", &[32], DType::F32);
         g.inputs = vec![inp, wt]; g.outputs = vec![out];
         let alloc = BufferAllocation::default();
-        let mut resolver = TensorPtrResolver::build(&g, &alloc, None);
+        let mut resolver = TensorPtrResolver::build(&g, &alloc, &super::super::topology::GraphTopologyAnalysis::analyze(&g));
         // Verify initial mapping
         let original = resolver.source(inp);
         assert!(original.is_some(), "input must have initial source");

@@ -771,7 +771,7 @@ mod tests {
     fn make_test_resolver() -> TensorPtrResolver {
         let graph = CompilerGraph::new();
         let alloc = BufferAllocation::default();
-        TensorPtrResolver::build(&graph, &alloc, None)
+        TensorPtrResolver::build(&graph, &alloc, &super::super::topology::GraphTopologyAnalysis::analyze(&graph))
     }
 
     // ── emit_layout_transform: all layout pairs return Ok and emit nothing ──
@@ -1902,7 +1902,7 @@ mod tests {
             is_layer_group: false, hetero_layer_type: None,
         };
         let alloc = BufferAllocation::default();
-        let resolver = TensorPtrResolver::build(&graph, &alloc, None);
+        let resolver = TensorPtrResolver::build(&graph, &alloc, &super::super::topology::GraphTopologyAnalysis::analyze(&graph));
         let mut prog = VmProgram::new();
         let width = SimdWidth::W256;
         let sym_map = super::super::plan_lower::SymDimSlotMap::mega_kernel_abi();

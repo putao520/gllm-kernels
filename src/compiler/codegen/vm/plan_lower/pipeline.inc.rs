@@ -29,9 +29,10 @@ pub(crate) fn lower_fusion_plan_inner(
     dwc_req: Option<&DwcScratchRequirement>,
     debug_jit: bool,
 ) -> Result<VmProgram, CompilerError> {
+    let topology = super::topology::GraphTopologyAnalysis::analyze(graph);
     lower_fusion_plan_inner_with_sym_map(
         plan, graph, alloc, registry, profile, hook,
-        rope_req, ple_req, dwc_req, debug_jit, None, None,
+        rope_req, ple_req, dwc_req, debug_jit, None, &topology,
     )
 }
 
@@ -47,7 +48,7 @@ pub(crate) fn lower_fusion_plan_inner_with_sym_map(
     dwc_req: Option<&DwcScratchRequirement>,
     debug_jit: bool,
     sym_map_override: Option<&SymDimSlotMap>,
-    topology: Option<&super::topology::GraphTopologyAnalysis>,
+    topology: &super::topology::GraphTopologyAnalysis,
 ) -> Result<VmProgram, CompilerError> {
     let width = profile.optimal_simd_width();
     // ARCH-CODEGEN-DISPATCH: 按 platform 选择 ABI SymDimSlotMap
@@ -105,10 +106,7 @@ pub(crate) fn lower_fusion_plan_inner_with_sym_map(
     // 按需分配，只分配实际使用的 VReg。
     let input_ptr = prog.alloc_vreg(VRegKind::Ptr, SimdWidth::Scalar);
 
-    let needs_weight = topology.map_or_else(
-        || plan.groups.iter().any(|g| graph.op(g.anchor).is_some_and(|op| op.inputs.len() > 1)),
-        |t| t.weight_source == super::topology::WeightSource::WeightRequired,
-    );
+    let needs_weight = topology.weight_source == super::topology::WeightSource::WeightRequired;
     let weight_ptr = if needs_weight {
         prog.alloc_vreg(VRegKind::Ptr, SimdWidth::Scalar)
     } else {
@@ -200,7 +198,7 @@ pub(super) fn emit_fusion_groups(
     current_abi: &mut AbiPtrs,
     original_weight_vreg: Option<VRegId>,
     resolver: &TensorPtrResolver,
-    topology: Option<&super::topology::GraphTopologyAnalysis>,
+    topology: &super::topology::GraphTopologyAnalysis,
 ) -> Result<(), CompilerError> {
     let width = ctx.width;
     let dtype = ctx.dtype;
@@ -565,7 +563,7 @@ pub(super) fn emit_fusion_groups(
                     let byte_offset = prog.alloc_vreg(VRegKind::ByteOffset, SimdWidth::Scalar);
                     // DEBUG: configurable layer count via GLLM_DEBUG_LAYERS env var
                     // SPEC/39: num_layers 从 topology 推导，替代 cfg.num_layers 读取
-                    let topology_num_layers = topology.and_then(|t| t.layer_num_layers).unwrap_or(cfg.num_layers);
+                    let topology_num_layers = topology.layer_num_layers.unwrap_or(cfg.num_layers);
                     let layer_bound = if let Ok(n) = std::env::var("GLLM_DEBUG_LAYERS") {
                         if let Ok(count) = n.parse::<usize>() {
                             eprintln!("[DEBUG-LAYERS] Overriding num_layers {} -> {}", topology_num_layers, count);
