@@ -778,8 +778,11 @@ pub(crate) fn lower_op_v2(
             prog.emit(VmInstr::MarkLabel { label_id: label_end });
             Ok(true)
         }
-        Op::HeadRmsNorm { .. } => Ok(false),
-        _ => Ok(false), // 其他类别走现有路径（Phase 6-7 续迁移）
+        Op::HeadRmsNorm { head_dim, eps, dtype } => {
+            let spec = NormSpec { feature_dim: head_dim, eps, dtype, has_weight: true };
+            lower_norm_v2(prog, op, graph, ctx, resolver, abi, &spec, NormKind::HeadRmsNorm)
+        }
+        _ => Ok(false), // trace-lookup 路径（Softmax/QkNorm/L2Normalize/elementwise — registry trace 最优）
     }
 }
 
