@@ -313,4 +313,62 @@ mod tests {
         let layout = WeightLayout { offsets: vec![], total_bytes: 0 };
         assert_eq!(layout.offset_of(TensorId(99)), None);
     }
+
+    // ── Op v2 (胖 opcode 自描述架构) 测试 ──
+
+    #[test]
+    fn op_v2_category_returns_correct_category() {
+        // Activation
+        assert_eq!(Op::Silu.category(), "activation");
+        assert_eq!(Op::Gelu.category(), "activation");
+        assert_eq!(Op::SwiGluClipped { limit: 7.0 }.category(), "activation");
+
+        // Norm
+        let norm = Op::RmsNorm(NormSpec {
+            feature_dim: 4096, eps: 1e-5, dtype: DType::F32, has_weight: true,
+        });
+        assert_eq!(norm.category(), "norm");
+
+        // Gemm
+        let gemm = Op::Gemm(GemmSpec {
+            m: SymDim::Concrete(1), n: 4096, k: 4096,
+            dtype: DType::F32, trans_b: false, has_bias: false,
+        });
+        assert_eq!(gemm.category(), "gemm");
+
+        // Attention
+        let attn = Op::MultiHeadAttention(AttentionSpec {
+            geometry: AttentionGeometry { num_q_heads: 32, num_kv_heads: 8, head_dim: 128 },
+            mask: AttentionMask::Causal,
+            kv_source: KvSource::FromCache,
+            sinks: SinksSpec::None,
+            seq_len: SymDim::Concrete(1),
+            dtype: DType::F32,
+        });
+        assert_eq!(attn.category(), "attention");
+    }
+
+    #[test]
+    fn op_v2_attention_mask_causal_vs_full() {
+        assert_ne!(AttentionMask::Causal, AttentionMask::Full);
+        assert_eq!(AttentionMask::Sliding { window: 512 }, AttentionMask::Sliding { window: 512 });
+    }
+
+    #[test]
+    fn op_v2_norm_spec_has_weight_distinct() {
+        let with_weight = NormSpec {
+            feature_dim: 4096, eps: 1e-5, dtype: DType::F32, has_weight: true,
+        };
+        let without_weight = NormSpec {
+            feature_dim: 4096, eps: 1e-5, dtype: DType::F32, has_weight: false,
+        };
+        assert_ne!(with_weight, without_weight);
+    }
+
+    #[test]
+    fn op_v2_kv_source_serializable() {
+        // KvSource 是 Copy + Hash，可用于 JIT cache key
+        let sources = [KvSource::FromTensor, KvSource::FromCache];
+        assert_ne!(sources[0], sources[1]);
+    }
 }

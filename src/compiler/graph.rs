@@ -12,6 +12,7 @@
 
 include!("graph_fragments/types.inc.rs");
 include!("graph_fragments/op_kind.inc.rs");
+include!("graph_fragments/op_v2.inc.rs");
 include!("graph_fragments/graph_impl.inc.rs");
 
 #[cfg(test)]
