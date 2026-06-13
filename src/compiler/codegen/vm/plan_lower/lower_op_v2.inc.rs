@@ -1107,20 +1107,29 @@ fn lower_norm_v2(
         input_ptr
     };
 
-    emit_normlike_inline(
-        prog,
-        &trace.pattern,
-        feature_dim,
-        1, // groups_per_row
-        spec.has_weight, // broadcast_weight
-        norm_kind,
-        ctx.session.width,
-        seq_bound,
-        input_ptr,
-        weight_ptr,
-        output_ptr,
-        dtype,
-    )?;
+    // LayerNorm 用 emit_layernorm_auto（独立实现，不依赖 trace，避免 Input(3) bias 越界）
+    // RmsNorm/ValueNorm/HeadRmsNorm 用 emit_normlike_inline（trace 驱动 NormLike）
+    if matches!(norm_kind, NormKind::LayerNorm) {
+        super::norm_softmax_emit::emit_layernorm_auto(
+            prog, feature_dim, spec.eps, ctx.session.width, seq_bound,
+            input_ptr, weight_ptr, output_ptr, dtype,
+        )?;
+    } else {
+        emit_normlike_inline(
+            prog,
+            &trace.pattern,
+            feature_dim,
+            1, // groups_per_row
+            spec.has_weight, // broadcast_weight
+            norm_kind,
+            ctx.session.width,
+            seq_bound,
+            input_ptr,
+            weight_ptr,
+            output_ptr,
+            dtype,
+        )?;
+    }
 
     Ok(true)
 }
