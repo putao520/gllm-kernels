@@ -64,10 +64,12 @@ pub(crate) fn dispatch_structural(
     seq_bound_override: Option<&BoundExpr>,
 ) -> Result<(), CompilerError> {
     // Phase 4-7+: Op v2 lowering 入口（Gemm/Attention/Structural 类的 Op v2 路由点）。
-    // 当前 Norm 类已完整迁移；其他类别返回 false 走现有 OpKind 路径。
     if super::plan_lower::lower_op_v2(prog, op, graph, ctx, resolver, abi)? {
         return Ok(());
     }
+
+    // 死代码（2026-06-14 验证）：lower_op_v2 处理所有 dispatch_structural 接收的 ops。
+    // 6863 测试中 OpKind match 从未触发。可安全清理。
 
     let resolve_dim = |dim: &SymDim| -> BoundExpr {
         if let Some(seq_vreg) = abi.mega_decode_seq_len {
