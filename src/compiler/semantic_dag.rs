@@ -3,7 +3,7 @@
 //! Each node carries its OpTrace (from Scalar + SymExec) and auto-derived OpClass
 //! (from ComputePattern). This replaces the old hand-maintained OpSemantics mapping.
 
-use crate::compiler::graph::{CompilerGraph, CompilerOp, OpKind, KvSource, OpId, TensorId};
+use crate::compiler::graph::{CompilerGraph, CompilerOp, OpKind, OpId, TensorId};
 use crate::compiler::trace::{OpTrace, ComputePattern};
 use crate::compiler::registry::ScalarOpRegistry;
 
@@ -427,7 +427,7 @@ impl CodegenHints {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::compiler::graph::{CompilerGraph, SymDim};
+    use crate::compiler::graph::{CompilerGraph, KvSource, SymDim};
     use crate::compiler::ir::LayerIR;
     use crate::compiler::registry::ScalarOpRegistry;
     use crate::compiler::trace::{ComputePattern, QuantPrecision, TraceOp};

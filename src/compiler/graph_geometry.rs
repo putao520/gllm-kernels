@@ -9,7 +9,7 @@
 //! (max_seq_len, business_config) in the external config.
 
 use crate::types::{DType, InferenceError};
-use super::graph::{CompilerGraph, OpKind, KvSource, RopeScaling, SymDim};
+use super::graph::{CompilerGraph, OpKind, RopeScaling, SymDim};
 use super::dtype_chain::derive_compute_dtype;
 use crate::dispatch::device_profile::DeviceProfile;
 

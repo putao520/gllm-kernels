@@ -7,7 +7,7 @@
 //! 每个自然数据搬运点都是"免费变换窗口"，协商器识别并利用这些窗口。
 
 use std::collections::HashMap;
-use crate::compiler::graph::{CompilerGraph, OpId, OpKind, KvSource};
+use crate::compiler::graph::{CompilerGraph, OpId, OpKind};
 use crate::compiler::fusion::{FusionGroup, FusionMode};
 use crate::compiler::semantic_dag::{SemanticDAG, OpClass};
 use crate::compiler::accel_registry::{AccelerationRegistry, LayoutConstraint};

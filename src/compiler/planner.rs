@@ -12,7 +12,7 @@
 //! immutable `ExecutionPlan` consumed by codegen, fusion, and scheduling.
 
 use std::collections::HashMap;
-use crate::compiler::ir::{LayerIR, MoeConfig};
+use crate::compiler::ir::LayerIR;
 use crate::compiler::pain_point::OpBottleneckMap;
 use crate::dispatch::device_profile::DeviceProfile;
 use crate::traits::Activation;

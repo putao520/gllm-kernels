@@ -3,7 +3,7 @@
 use super::instr::*;
 use super::vm_state::AbiPtrs;
 use super::plan_lower::{
-    LoweringContext, CompileSession, TensorPtrResolver,
+    LoweringContext, TensorPtrResolver,
     emit_standalone_op, emit_elementwise_inline,
     extract_gemm_dims_sym, collect_epilogue_trace,
     load_op_scratch_ptr, extract_op_trace, infer_output_shape_sym,
@@ -735,6 +735,7 @@ pub(super) fn emit_fusion_group_by_mode(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use super::super::plan_lower::CompileSession;
     use crate::compiler::fusion::GroupMarker;
     use crate::compiler::layout_negotiator::{
         LayoutTransform, InterOpTransform, MovementType, GroupLayoutAssignment,

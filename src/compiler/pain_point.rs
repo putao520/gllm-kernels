@@ -5,7 +5,7 @@
 //! 零运行时依赖 — 所有输入在编译时已知。
 
 use std::collections::HashMap;
-use crate::compiler::graph::{CompilerGraph, OpId, OpKind, KvSource};
+use crate::compiler::graph::{CompilerGraph, OpId, OpKind};
 use crate::dispatch::device_profile::DeviceProfile;
 
 /// GEMM 在模型中的角色 (影响融合策略选择)
@@ -498,7 +498,7 @@ fn compute_fusion_benefits(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::compiler::graph::{CompilerGraph, SymDim};
+    use crate::compiler::graph::{CompilerGraph, KvSource, SymDim};
     use crate::types::DType;
     use crate::dispatch::device_profile::DeviceProfile;
 

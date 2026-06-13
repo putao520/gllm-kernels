@@ -10,7 +10,7 @@
 //! provides a richer classification derived from `OpTrace::ComputePattern`
 //! and is preferred in new code paths.
 
-use crate::compiler::graph::{OpKind, KvSource};
+use crate::compiler::graph::OpKind;
 #[cfg(test)]
 use crate::compiler::graph::SymDim;
 
@@ -518,6 +518,7 @@ pub fn fusable_as_gemm_epilogue(kind: &OpKind) -> bool {
 
 #[cfg(test)]
 mod tests {
+    use crate::compiler::graph::KvSource;
     use super::*;
     use crate::types::DType;
 
