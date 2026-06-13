@@ -422,6 +422,36 @@ pub(crate) fn lower_op_v2(
             )?;
             Ok(true)
         }
+        Op::DepthwiseConv1D { channels, kernel_size, causal } => {
+            let req = ctx.dwc_req.ok_or_else(|| CompilerError::CodegenViolation(
+                format!("DepthwiseConv1D op {:?}: ctx.dwc_req 未配置", op.id)))?;
+            if req.channels != channels || req.kernel_size != kernel_size || req.causal != causal {
+                return Err(CompilerError::CodegenViolation(format!(
+                    "DepthwiseConv1D: 签名与 dwc_req 不一致")));
+            }
+            super::vision_audio_emit::lower_depthwise_conv1d(
+                prog, op, graph, ctx.session.width, channels, kernel_size, causal,
+                ctx.session.sym_map, resolver, abi, req, ctx.dtype,
+            )?;
+            Ok(true)
+        }
+        Op::PatchEmbed { patch_size, embed_dim, in_channels, image_size } => {
+            let image_ptr = resolver.materialize(prog, op.inputs[0], abi).ok_or_else(|| {
+                CompilerError::CodegenViolation(format!("PatchEmbed op {:?}: image 无法 materialize", op.id))
+            })?;
+            let kernel_ptr = op.inputs.get(1).copied()
+                .and_then(|tid| resolver.materialize(prog, tid, abi))
+                .ok_or_else(|| CompilerError::CodegenViolation(
+                    format!("PatchEmbed op {:?}: kernel 无法 materialize", op.id)))?;
+            let patches_ptr = resolver.materialize(prog, op.outputs[0], abi).ok_or_else(|| {
+                CompilerError::CodegenViolation(format!("PatchEmbed op {:?}: output 无法 materialize", op.id))
+            })?;
+            super::vision_audio_emit::lower_patch_embed(
+                prog, patch_size, embed_dim, in_channels, image_size,
+                image_ptr, kernel_ptr, patches_ptr, ctx.dtype,
+            )?;
+            Ok(true)
+        }
         Op::HeadRmsNorm { .. } => Ok(false),
         _ => Ok(false), // 其他类别走现有路径（Phase 6-7 续迁移）
     }
