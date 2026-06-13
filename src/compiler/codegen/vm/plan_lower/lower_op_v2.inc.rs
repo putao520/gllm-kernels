@@ -157,19 +157,12 @@ fn lower_gemm_v2(
 fn lower_attention_v2(
     prog: &mut VmProgram,
     op: &CompilerOp,
-    _graph: &CompilerGraph,
+    graph: &CompilerGraph,
     ctx: &LoweringContext,
     resolver: &TensorPtrResolver,
     abi: &AbiPtrs,
     spec: &AttentionSpec,
 ) -> Result<bool, CompilerError> {
-    // FromCache 走现有路径（KV cache copy 逻辑复杂）
-    if spec.kv_source == KvSource::FromCache {
-        return Ok(false);
-    }
-
-    // FromTensor: 直接用 Q/K/V tensor（conformer/vision self-attention）
-
     // Q/K/V 指针
     let q_ptr = op.inputs.first().copied()
         .and_then(|tid| resolver.materialize(prog, tid, abi))
@@ -204,7 +197,6 @@ fn lower_attention_v2(
         (bound.clone(), bound)
     };
 
-    // dtype
     let dtype = spec.dtype.to_quant_precision();
 
     // TMA/TMEM detection (GPU only)
@@ -221,11 +213,71 @@ fn lower_attention_v2(
 
     let causal = matches!(spec.mask, crate::compiler::graph::AttentionMask::Causal);
 
+    // KV cache copy（FromCache 路径）— 从 AttentionSpec 获取参数（胖 opcode）
+    let (k_attn_ptr, v_attn_ptr) = match spec.kv_source {
+        KvSource::FromCache => {
+            let kv_cache_ptr = abi.kv_cache_ptr.ok_or_else(|| CompilerError::CodegenViolation(
+                format!("MHA op {:?}: kv_source=FromCache 但 ABI 中无 kv_cache_ptr", op.id)))?;
+
+            let layer_ctr = abi.layer_loop_counter.unwrap_or_else(|| {
+                let zero = prog.alloc_vreg(VRegKind::Counter, SimdWidth::Scalar);
+                prog.emit(VmInstr::GprLoadImm { dst: zero, value: 0 });
+                zero
+            });
+            let gen_ctr = abi.gen_loop_counter.unwrap_or_else(|| {
+                let zero = prog.alloc_vreg(VRegKind::Counter, SimdWidth::Scalar);
+                prog.emit(VmInstr::GprLoadImm { dst: zero, value: 0 });
+                zero
+            });
+
+            let kv_row_stride = spec.geometry.num_kv_heads * spec.geometry.head_dim * dtype.elem_bytes();
+            let max_seq = graph.max_seq_len;
+            let kv_layer_stride = 2 * max_seq * kv_row_stride;
+
+            // K cache base = kv_cache_ptr + layer_ctr * kv_layer_stride
+            let layer_off = prog.alloc_vreg(VRegKind::ByteOffset, SimdWidth::Scalar);
+            prog.emit(VmInstr::GprBinOp { dst: layer_off, a: layer_ctr, b: GprOperand::Imm(kv_layer_stride as i64), op: GprOp::Mul });
+            let k_cache_base = prog.alloc_vreg(VRegKind::Ptr, SimdWidth::Scalar);
+            prog.emit(VmInstr::GprBinOp { dst: k_cache_base, a: kv_cache_ptr, b: GprOperand::VReg(layer_off), op: GprOp::Add });
+            let pos_off = prog.alloc_vreg(VRegKind::ByteOffset, SimdWidth::Scalar);
+            prog.emit(VmInstr::GprBinOp { dst: pos_off, a: gen_ctr, b: GprOperand::Imm(kv_row_stride as i64), op: GprOp::Mul });
+
+            // Copy K rows to cache
+            let k_copy_dst = prog.alloc_vreg(VRegKind::Ptr, SimdWidth::Scalar);
+            let k_copy_src = prog.alloc_vreg(VRegKind::Ptr, SimdWidth::Scalar);
+            let k_off_tmp = prog.alloc_vreg(VRegKind::ByteOffset, SimdWidth::Scalar);
+            prog.emit_loop(q_bound.clone(), kv_row_stride, |prog, _ctr, byte_off| {
+                prog.emit(VmInstr::GprBinOp { dst: k_copy_src, a: k_ptr, b: GprOperand::VReg(byte_off), op: GprOp::Add });
+                prog.emit(VmInstr::GprBinOp { dst: k_off_tmp, a: pos_off, b: GprOperand::VReg(byte_off), op: GprOp::Add });
+                prog.emit(VmInstr::GprBinOp { dst: k_copy_dst, a: k_cache_base, b: GprOperand::VReg(k_off_tmp), op: GprOp::Add });
+                prog.emit(VmInstr::MemCopy { dst: k_copy_dst, src: k_copy_src, bytes: kv_row_stride });
+            });
+
+            // V cache base = K cache base + max_seq * kv_row_stride
+            let v_offset_gpr = prog.alloc_vreg(VRegKind::ByteOffset, SimdWidth::Scalar);
+            prog.emit(VmInstr::GprLoadImm { dst: v_offset_gpr, value: max_seq * kv_row_stride });
+            let v_cache_base = prog.alloc_vreg(VRegKind::Ptr, SimdWidth::Scalar);
+            prog.emit(VmInstr::GprBinOp { dst: v_cache_base, a: k_cache_base, b: GprOperand::VReg(v_offset_gpr), op: GprOp::Add });
+            let v_copy_dst = prog.alloc_vreg(VRegKind::Ptr, SimdWidth::Scalar);
+            let v_copy_src = prog.alloc_vreg(VRegKind::Ptr, SimdWidth::Scalar);
+            let v_off_tmp = prog.alloc_vreg(VRegKind::ByteOffset, SimdWidth::Scalar);
+            prog.emit_loop(q_bound.clone(), kv_row_stride, |prog, _ctr, byte_off| {
+                prog.emit(VmInstr::GprBinOp { dst: v_copy_src, a: v_ptr, b: GprOperand::VReg(byte_off), op: GprOp::Add });
+                prog.emit(VmInstr::GprBinOp { dst: v_off_tmp, a: pos_off, b: GprOperand::VReg(byte_off), op: GprOp::Add });
+                prog.emit(VmInstr::GprBinOp { dst: v_copy_dst, a: v_cache_base, b: GprOperand::VReg(k_off_tmp), op: GprOp::Add });
+                prog.emit(VmInstr::MemCopy { dst: v_copy_dst, src: v_copy_src, bytes: kv_row_stride });
+            });
+
+            (k_cache_base, v_cache_base)
+        }
+        KvSource::FromTensor => (k_ptr, v_ptr),
+    };
+
     emit_tiled_attention_inline(
         prog, q_bound, kv_bound,
         spec.geometry.num_q_heads, spec.geometry.num_kv_heads, spec.geometry.head_dim,
         ctx.session.width,
-        q_ptr, k_ptr, v_ptr, output_ptr,
+        q_ptr, k_attn_ptr, v_attn_ptr, output_ptr,
         ctx.session.hook, causal, sinks_ptr, dtype,
         abi.page_table_ptr, ctx.session.page_size,
         abi.kv_load_mode.unwrap_or_default(), None,
