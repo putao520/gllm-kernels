@@ -633,6 +633,35 @@ pub(crate) fn lower_op_v2(
             )?;
             Ok(true)
         }
+        Op::MmHiddenInject { hidden_dim } => {
+            let input_ptr = resolver.materialize(prog, op.inputs[0], abi).ok_or_else(|| {
+                CompilerError::CodegenViolation(format!("MmHiddenInject op {:?}: input 无法 materialize", op.id))
+            })?;
+            let output_ptr = resolver.materialize(prog, op.outputs[0], abi).ok_or_else(|| {
+                CompilerError::CodegenViolation(format!("MmHiddenInject op {:?}: output 无法 materialize", op.id))
+            })?;
+            let width = ctx.session.width;
+            let total_bytes = hidden_dim * ctx.dtype.elem_bytes();
+            let step = width.f32_lanes() * 4;
+            let iters = (total_bytes + step - 1) / step;
+            let ctr = prog.alloc_vreg(VRegKind::Counter, SimdWidth::Scalar);
+            let byte_off = prog.alloc_vreg(VRegKind::ByteOffset, SimdWidth::Scalar);
+            prog.emit(VmInstr::LoopBegin { counter: ctr, byte_offset: byte_off, bound: BoundExpr::Const(iters), step_bytes: step });
+            let src_vec = prog.alloc_vreg(VRegKind::Vec, width);
+            prog.emit(VmInstr::VecLoad { dst: src_vec, base: input_ptr, offset: OffsetExpr::LoopOffset(byte_off), width, dtype: ctx.dtype });
+            let mm_vec = prog.alloc_vreg(VRegKind::Vec, width);
+            prog.emit(VmInstr::VecLoad { dst: mm_vec, base: input_ptr, offset: OffsetExpr::LoopOffset(byte_off), width, dtype: ctx.dtype });
+            let result = prog.alloc_vreg(VRegKind::Vec, width);
+            let ple_add_body: Vec<TraceOp> = vec![
+                TraceOp::Input(0), TraceOp::Input(1),
+                TraceOp::Add(ValueId(0), ValueId(1)),
+            ];
+            super::auto_select::auto_lower_trace_into(prog, &ple_add_body, &[src_vec, mm_vec], result, width, QuantPrecision::F32)
+                .map_err(|e| CompilerError::CodegenViolation(format!("MmHiddenInject auto_lower: {e}")))?;
+            prog.emit(VmInstr::VecStore { base: output_ptr, src: result, offset: OffsetExpr::LoopOffset(byte_off), width, dtype: ctx.dtype });
+            prog.emit(VmInstr::LoopEnd);
+            Ok(true)
+        }
         Op::HeadRmsNorm { .. } => Ok(false),
         _ => Ok(false), // 其他类别走现有路径（Phase 6-7 续迁移）
     }
