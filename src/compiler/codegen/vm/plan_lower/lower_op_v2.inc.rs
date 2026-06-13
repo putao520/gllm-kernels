@@ -102,6 +102,42 @@ pub(crate) fn lower_op_v2(
             });
             Ok(true)
         }
+        Op::GuardrailCheck { probe_offset } => {
+            let scratch = match abi.scratch_ptr {
+                Some(v) => v, None => return Ok(true),
+            };
+            let input_ptr = resolver.materialize(prog, op.inputs[0], abi).ok_or_else(|| {
+                CompilerError::CodegenViolation(format!("GuardrailCheck op {:?}: input 无法 materialize", op.id))
+            })?;
+            super::structural_builder::StructuralOpBuilder::emit_conditional_guard(
+                prog, scratch, probe_offset, input_ptr,
+            )?;
+            Ok(true)
+        }
+        Op::CotStepCheck { shared_mem_offset } => {
+            let scratch = match abi.scratch_ptr {
+                Some(v) => v, None => return Ok(true),
+            };
+            let input_ptr = resolver.materialize(prog, op.inputs[0], abi).ok_or_else(|| {
+                CompilerError::CodegenViolation(format!("CotStepCheck op {:?}: input 无法 materialize", op.id))
+            })?;
+            super::structural_builder::StructuralOpBuilder::emit_conditional_guard(
+                prog, scratch, shared_mem_offset, input_ptr,
+            )?;
+            Ok(true)
+        }
+        Op::WriteLogits { ref target_indices } => {
+            let input_ptr = resolver.materialize(prog, op.inputs[0], abi).ok_or_else(|| {
+                CompilerError::CodegenViolation(format!("WriteLogits op {:?}: input 无法 materialize", op.id))
+            })?;
+            let output_ptr = resolver.materialize(prog, op.outputs[0], abi).ok_or_else(|| {
+                CompilerError::CodegenViolation(format!("WriteLogits op {:?}: output 无法 materialize", op.id))
+            })?;
+            super::structural_builder::StructuralOpBuilder::emit_scalar_writeback(
+                prog, input_ptr, output_ptr, target_indices,
+            )?;
+            Ok(true)
+        }
         Op::RoPE(ref spec) => {
             // rope_cache_offset 从 ctx.rope_req 获取（op-level 自描述替代外部参数）
             let rope_req = ctx.rope_req.ok_or_else(|| CompilerError::CodegenViolation(
