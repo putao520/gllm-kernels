@@ -666,9 +666,17 @@ impl InferenceCompiler {
             } else {
                 0
             };
+            // DWC padded buffer must fit within scratchpad (compute_dwc_requirement mirrors mega_kernel_emit).
+            let dwc_end = match codegen::vm::plan_lower::compute_dwc_requirement(
+                &fusion_plan, &graph, &alloc, rope_cache.as_ref(), None,
+            ) {
+                Ok(Some(req)) => req.padded_offset + req.total_bytes,
+                _ => 0,
+            };
             let total_scratch = logits_end
                 .max(buffer_layout.total_scratchpad_bytes)
                 .max(sg_end)
+                .max(dwc_end)
                 .max(64);
 
             let hash = self.graph_content_hash(&graph);

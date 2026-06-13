@@ -191,6 +191,7 @@ impl GraphTopologyAnalysis {
                 OpKind::QkNorm { .. } => has_qk_norm = true,
                 OpKind::Gemm { .. } | OpKind::GemmBias { .. } | OpKind::QuantGemm { .. }
                 | OpKind::RmsNorm { .. } | OpKind::LayerNorm { .. } | OpKind::HeadRmsNorm { .. }
+                | OpKind::DepthwiseConv1D { .. } | OpKind::PatchEmbed { .. }
                 => has_weight_ops = true,
                 _ => {}
             }
@@ -211,12 +212,14 @@ impl GraphTopologyAnalysis {
             SeqLenSource::PromptLen
         };
 
-        // kv_cache_source: from attention op presence (single-pass derived)
-        let kv_cache_source = if has_cached_gqa {
+        // kv_cache_source: MHA/CachedGQA/MLA 仅在 generate loop 图（有 Argmax+StoreToken+CheckStopCondition）
+        // 中需要持久化 KV cache。纯 prefill/encode 图（conformer self-attention、BERT encoder 等）
+        // 直接使用当前 K/V，无需缓存——此时 kv_cache_ptr 可为 NULL，跳过 KV cache copy 路径。
+        let kv_cache_source = if has_cached_gqa && is_generate {
             KvCacheSource::CachedGqa
-        } else if has_mla {
+        } else if has_mla && is_generate {
             KvCacheSource::MlaAttention
-        } else if has_mha {
+        } else if has_mha && is_generate {
             KvCacheSource::StandardMha
         } else {
             KvCacheSource::NoCache
