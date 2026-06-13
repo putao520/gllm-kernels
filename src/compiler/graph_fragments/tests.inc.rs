@@ -578,4 +578,46 @@ mod tests {
             panic!("expected Op::MoEGate");
         }
     }
+
+    // ── Phase 7: 统一 from_op_kind 入口测试 ──
+
+    #[test]
+    fn op_v2_unified_from_op_kind_all_categories() {
+        let mut g = CompilerGraph::new();
+
+        // Norm
+        let input = g.add_tensor_concrete("in", &[4096], DType::F32);
+        let weight = g.add_tensor_concrete("w", &[4096], DType::F32);
+        let out = g.add_tensor_concrete("out", &[4096], DType::F32);
+        let norm_op = g.add_op(
+            OpKind::RmsNorm { feature_dim: 4096, eps: 1e-5 },
+            vec![input, weight], vec![out], "norm",
+        );
+        assert!(Op::from_op_kind(g.op(norm_op).unwrap(), &g).is_some());
+
+        // Gemm
+        let g_in = g.add_tensor_concrete("gin", &[1, 4096], DType::F32);
+        let g_w = g.add_tensor_concrete("gw", &[4096, 4096], DType::F32);
+        let g_out = g.add_tensor_concrete("gout", &[1, 4096], DType::F32);
+        let gemm_op = g.add_op(
+            OpKind::Gemm { m: SymDim::Concrete(1), n: 4096, k: 4096, dtype: DType::F32, trans_b: false },
+            vec![g_in, g_w], vec![g_out], "gemm",
+        );
+        assert!(Op::from_op_kind(g.op(gemm_op).unwrap(), &g).is_some());
+
+        // Activation
+        let a_in = g.add_tensor_concrete("ain", &[4096], DType::F32);
+        let a_out = g.add_tensor_concrete("aout", &[4096], DType::F32);
+        let act_op = g.add_op(OpKind::Silu, vec![a_in], vec![a_out], "silu");
+        assert!(Op::from_op_kind(g.op(act_op).unwrap(), &g).is_some());
+
+        // Structural
+        let t_in = g.add_tensor_concrete("tin", &[4096], DType::F32);
+        let t_out = g.add_tensor_concrete("tout", &[4096], DType::F32);
+        let struct_op = g.add_op(
+            OpKind::Transpose { perm: vec![1, 0] },
+            vec![t_in], vec![t_out], "transpose",
+        );
+        assert!(Op::from_op_kind(g.op(struct_op).unwrap(), &g).is_some());
+    }
 }

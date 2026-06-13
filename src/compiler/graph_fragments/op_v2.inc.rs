@@ -269,6 +269,17 @@ pub enum Op {
 }
 
 impl Op {
+    /// 统一 from_op_kind 入口 — 组合 Phase 4-7 的 4 个类别方法。
+    ///
+    /// 调用方无需知道 op 类别，自动路由到对应的转换方法。
+    /// 返回 None 表示无匹配（理论上不会发生，因为 4 个方法覆盖所有 OpKind 变体）。
+    pub fn from_op_kind(op: &CompilerOp, graph: &CompilerGraph) -> Option<Self> {
+        Self::from_op_kind_norm_activation(op, graph)
+            .or_else(|| Self::from_op_kind_gemm_quant(op, graph))
+            .or_else(|| Self::from_op_kind_attention_moe(op, graph))
+            .or_else(|| Self::from_op_kind_structural(op, graph))
+    }
+
     /// 返回 op 的类别名称（用于 JIT 日志、调试、profiling）。
     pub fn category(&self) -> &'static str {
         match self {
