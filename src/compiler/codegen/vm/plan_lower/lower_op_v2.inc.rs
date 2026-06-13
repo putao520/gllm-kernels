@@ -8,7 +8,8 @@
 // include! 模式：plan_lower.rs 已 use 大部分类型。本文件补 import Op v2 类型。
 // emit_normlike_inline/NormKind 已在 plan_lower.rs use，不重复。
 
-use crate::compiler::graph::{CompilerOp, Op, NormSpec};
+use crate::compiler::graph::{CompilerOp, Op, NormSpec, AttentionSpec, KvSource};
+use super::attention_emit::emit_tiled_attention_inline;
 
 /// Phase 4+: Op v2 驱动的 lowering 入口。
 ///
@@ -38,6 +39,7 @@ pub(crate) fn lower_op_v2(
         Op::Gemm(ref spec) | Op::GemmBias(ref spec) => {
             lower_gemm_v2(prog, op, graph, ctx, resolver, abi, spec)
         }
+        Op::MultiHeadAttention(ref spec) => lower_attention_v2(prog, op, graph, ctx, resolver, abi, spec),
         Op::HeadRmsNorm { .. } => Ok(false),
         _ => Ok(false), // 其他类别走现有路径（Phase 6-7 续迁移）
     }
@@ -141,6 +143,95 @@ fn lower_gemm_v2(
             });
         }
     }
+
+    Ok(true)
+}
+
+/// Attention lowering（Op v2 驱动）。
+///
+/// 从 AttentionSpec 获取 geometry/mask/kv_source/sinks/dtype，
+/// 调用 emit_tiled_attention_inline。
+///
+/// kv_source=FromCache 走现有路径（KV cache copy 逻辑复杂，Phase 6 续迁移）。
+/// kv_source=FromTensor 直接处理（conformer/vision self-attention）。
+fn lower_attention_v2(
+    prog: &mut VmProgram,
+    op: &CompilerOp,
+    _graph: &CompilerGraph,
+    ctx: &LoweringContext,
+    resolver: &TensorPtrResolver,
+    abi: &AbiPtrs,
+    spec: &AttentionSpec,
+) -> Result<bool, CompilerError> {
+    // FromCache 走现有路径（KV cache copy 逻辑复杂）
+    if spec.kv_source == KvSource::FromCache {
+        return Ok(false);
+    }
+
+    // FromTensor: 直接用 Q/K/V tensor（conformer/vision self-attention）
+
+    // Q/K/V 指针
+    let q_ptr = op.inputs.first().copied()
+        .and_then(|tid| resolver.materialize(prog, tid, abi))
+        .ok_or_else(|| CompilerError::CodegenViolation(
+            format!("MHA op {:?}: Q tensor 无法 materialize", op.id)))?;
+    let k_ptr = op.inputs.get(1).copied()
+        .and_then(|tid| resolver.materialize(prog, tid, abi))
+        .ok_or_else(|| CompilerError::CodegenViolation(
+            format!("MHA op {:?}: K tensor 无法 materialize", op.id)))?;
+    let v_ptr = op.inputs.get(2).copied()
+        .and_then(|tid| resolver.materialize(prog, tid, abi))
+        .ok_or_else(|| CompilerError::CodegenViolation(
+            format!("MHA op {:?}: V tensor 无法 materialize", op.id)))?;
+    let output_ptr = op.outputs.first().copied()
+        .and_then(|tid| resolver.materialize(prog, tid, abi))
+        .ok_or_else(|| CompilerError::CodegenViolation(
+            format!("MHA op {:?}: output tensor 无法 materialize", op.id)))?;
+
+    // sinks
+    let sinks_ptr = if matches!(spec.sinks, crate::compiler::graph::SinksSpec::Learnable) {
+        op.inputs.get(3).copied()
+            .and_then(|tid| resolver.materialize(prog, tid, abi))
+    } else {
+        None
+    };
+
+    // seq bound
+    let (q_bound, kv_bound) = if let Some(seq_vreg) = abi.mega_decode_seq_len {
+        (BoundExpr::Const(1), BoundExpr::DynamicVReg(seq_vreg))
+    } else {
+        let bound = resolve_sym_dim(&spec.seq_len, abi, ctx.session.sym_map);
+        (bound.clone(), bound)
+    };
+
+    // dtype
+    let dtype = spec.dtype.to_quant_precision();
+
+    // TMA/TMEM detection (GPU only)
+    let use_tma = {
+        use crate::compiler::hardware_profile::HardwareProfile;
+        use crate::dispatch::DeviceProfile;
+        HardwareProfile::detect(&DeviceProfile::detect()).has_tma()
+    };
+    let use_tmem = {
+        use crate::compiler::hardware_profile::HardwareProfile;
+        use crate::dispatch::DeviceProfile;
+        HardwareProfile::detect(&DeviceProfile::detect()).has_tmem()
+    };
+
+    let causal = matches!(spec.mask, crate::compiler::graph::AttentionMask::Causal);
+
+    emit_tiled_attention_inline(
+        prog, q_bound, kv_bound,
+        spec.geometry.num_q_heads, spec.geometry.num_kv_heads, spec.geometry.head_dim,
+        ctx.session.width,
+        q_ptr, k_ptr, v_ptr, output_ptr,
+        ctx.session.hook, causal, sinks_ptr, dtype,
+        abi.page_table_ptr, ctx.session.page_size,
+        abi.kv_load_mode.unwrap_or_default(), None,
+        ctx.session.batch_ctx_ptr, abi.kv_cache_ptr,
+        use_tma, use_tmem,
+    )?;
 
     Ok(true)
 }
