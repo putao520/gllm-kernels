@@ -1481,6 +1481,8 @@ fn collect_gemm_shapes(ir: &LayerIR) -> Vec<GemmShape> {
         GemmShape { m: ir.max_batch, n: h, k: q },     // O
     ];
 
+    // ARCH-BUILD-COMPILE-BOUNDARY: LayerArch drives BUILD-stage FFN shape selection.
+    // TODO(H-2): derive FFN GEMM shapes from graph Gemm ops instead of LayerArch.
     match &ir.arch {
         LayerArch::Decoder | LayerArch::DecoderMoE { .. } => {
             // FFN: gate, up, down
@@ -1552,6 +1554,8 @@ fn plan_fusions(ir: &LayerIR) -> Vec<FusionDecision> {
     // QKV shared input is always beneficial
     fusions.push(FusionDecision::QkvSharedInput);
 
+    // ARCH-BUILD-COMPILE-BOUNDARY: LayerArch drives BUILD-stage fusion strategy selection.
+    // TODO(H-2): derive fusion decisions from graph ops (SwiGLU/GeGLU/GELU) instead of LayerArch.
     match &ir.arch {
         LayerArch::Decoder | LayerArch::DecoderMoE { .. } => {
             // Gated FFN fusion: SwiGLU or GeGLU depending on activation

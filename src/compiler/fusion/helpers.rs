@@ -667,6 +667,8 @@ pub(crate) fn detect_tile_vs_compute_root(
 
     if norm_output_bytes > l1_budget {
         // Norm output doesn't fit in L1 -> tile into GEMM MC loop
+        // ARCH-SYMDIM-DEGRADE: cost model uses max_for_allocation for conservative estimate.
+        // TODO(G-2): preserve symbolic form for tighter bounds.
         let (m, n, k, gemm_dtype) = match &gemm_op.kind {
             OpKind::Gemm { m, n, k, dtype, .. } => (m.max_for_allocation_strict().expect("ARCH-SYMDIM: Symbolic dim must have max_value in cost model"), *n, *k, *dtype),
             OpKind::GemmBias { m, n, k, dtype, .. } => (m.max_for_allocation_strict().expect("ARCH-SYMDIM: Symbolic dim must have max_value in cost model"), *n, *k, *dtype),

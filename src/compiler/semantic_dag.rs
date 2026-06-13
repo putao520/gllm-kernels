@@ -280,6 +280,8 @@ impl SemanticDAG {
         }
 
         // Estimate FLOPs
+        // ARCH-SYMDIM-DEGRADE: cost model uses max_for_allocation for conservative estimate.
+        // TODO(G-2): preserve symbolic form for tighter bounds.
         let flops: usize = match &op.kind {
             OpKind::Gemm { m, n, k, .. } => 2 * m.max_for_allocation_strict().expect("ARCH-SYMDIM: Symbolic dim must have max_value in cost model") * n * k,
             OpKind::GemmBias { m, n, k, .. } => {

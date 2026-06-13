@@ -261,8 +261,10 @@ impl PainPointAnalyzer {
                 OpKind::Gemm { m, n, k, .. }
                 | OpKind::GemmBias { m, n, k, .. }
                 | OpKind::QuantGemm { m, n, k, .. } => {
+                    // ARCH-SYMDIM-DEGRADE: cost model uses max_for_allocation for conservative estimate.
+                    // TODO(G-2): preserve symbolic form for tighter bounds.
                     let m_val = m.max_for_allocation_strict()
-                        .unwrap_or(1);
+                        .expect("ARCH-SYMDIM: SymDim must have max_value in pain_point analysis");
                     (m_val, *n, *k)
                 }
                 _ => continue,

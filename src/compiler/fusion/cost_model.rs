@@ -65,6 +65,8 @@ pub(crate) fn compute_group_ai(group: &FusionGroup, graph: &CompilerGraph) -> f3
 /// Estimate FLOPs for a single CompilerOp based on its OpKind.
 /// For GEMM variants, returns 2*M*N*K. For other ops, returns 0
 /// (their FLOP contribution is negligible for roofline classification).
+// ARCH-SYMDIM-DEGRADE: cost model uses max_for_allocation for conservative estimate.
+// TODO(G-2): preserve symbolic form for tighter bounds.
 fn estimate_op_flops(op: &CompilerOp) -> usize {
     match &op.kind {
         OpKind::Gemm { m, n, k, .. }
@@ -99,6 +101,8 @@ fn extract_anchor_dtype(group: &FusionGroup, graph: &CompilerGraph) -> crate::ty
 }
 
 /// Extract GEMM (m, n, k) from the anchor op of a fusion group.
+// ARCH-SYMDIM-DEGRADE: cost model uses max_for_allocation for conservative estimate.
+// TODO(G-2): preserve symbolic form for tighter bounds.
 fn extract_anchor_gemm_dims(group: &FusionGroup, graph: &CompilerGraph) -> (usize, usize, usize) {
     graph.op(group.anchor)
         .and_then(|op| match &op.kind {

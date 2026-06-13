@@ -411,6 +411,8 @@ pub fn enforce_constraints(
 // ---------------------------------------------------------------------------
 
 /// Extract GEMM (m, n, k) from the anchor op, if it is a GEMM variant.
+// ARCH-SYMDIM-DEGRADE: cost model uses max_for_allocation for conservative estimate.
+// TODO(G-2): preserve symbolic form for tighter bounds.
 fn extract_gemm_dims(group: &FusionGroup, graph: &CompilerGraph) -> Option<(usize, usize, usize)> {
     let op = graph.op(group.anchor)?;
     match &op.kind {

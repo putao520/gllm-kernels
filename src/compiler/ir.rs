@@ -8,6 +8,11 @@ use crate::quant::QuantType;
 use crate::traits::Activation;
 
 /// Architecture of a single transformer layer.
+///
+/// BUILD-stage layer architecture classification — drives fusion strategy selection.
+/// ARCH-BUILD-COMPILE-BOUNDARY: this is a BUILD-stage strategy decision.
+/// The JIT compiler processes whatever graph it receives, regardless of LayerArch.
+/// TODO(H-1): derive fusion decisions from graph ops instead of LayerArch.
 #[derive(Debug, Clone, PartialEq)]
 pub enum LayerArch {
     /// Standard decoder: RMSNorm → Attn(QKV+RoPE+GQA+O) → Residual → RMSNorm → FFN(gate+up+SiLU+down) → Residual

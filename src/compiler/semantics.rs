@@ -161,6 +161,8 @@ pub fn classify(kind: &OpKind) -> OpSemantics {
 /// Uses the roofline model: if arithmetic intensity > ridge point,
 /// the op is compute-bound; otherwise memory-bound.
 /// ARCH-DTYPE-FULLCHAIN-ORCH: `graph_dtype` used for QuantGemm activation/output byte estimation.
+// ARCH-SYMDIM-DEGRADE: cost model uses max_for_allocation for conservative estimate.
+// TODO(G-2): preserve symbolic form for tighter bounds.
 pub fn bottleneck(kind: &OpKind, graph_dtype: crate::types::DType) -> BottleneckType {
     match kind {
         // GEMM: compute-bound when K is large enough (typical for transformer layers)
@@ -205,6 +207,8 @@ pub fn bottleneck(kind: &OpKind, graph_dtype: crate::types::DType) -> Bottleneck
 /// Used by the roofline model to predict whether an op benefits from
 /// fusion (memory-bound ops benefit most from eliminating round-trips).
 /// ARCH-DTYPE-FULLCHAIN-ORCH: `graph_dtype` used for non-GEMM ops and QuantGemm activation bytes.
+// ARCH-SYMDIM-DEGRADE: cost model uses max_for_allocation for conservative estimate.
+// TODO(G-2): preserve symbolic form for tighter bounds.
 pub fn arithmetic_intensity(kind: &OpKind, graph_dtype: crate::types::DType) -> f64 {
     let eb = graph_dtype.size_bytes() as f64;
     match kind {
