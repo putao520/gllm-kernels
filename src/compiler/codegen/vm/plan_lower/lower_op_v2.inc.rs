@@ -85,6 +85,23 @@ pub(crate) fn lower_op_v2(
             )?;
             Ok(true)
         }
+        Op::Argmax { vocab_size } => {
+            let logits_ptr = resolver.materialize(prog, op.inputs[0], abi).ok_or_else(|| {
+                CompilerError::CodegenViolation(format!("Argmax op {:?}: logits 无法 materialize", op.id))
+            })?;
+            let argmax_dst = prog.alloc_vreg(VRegKind::Scalar, SimdWidth::Scalar);
+            let vocab_bytes = vocab_size * ctx.dtype.elem_bytes();
+            prog.emit(VmInstr::Argmax {
+                dst: argmax_dst, logits_ptr, vocab_bytes, width: ctx.session.width,
+            });
+            let out_ptr = resolver.materialize(prog, op.outputs[0], abi).ok_or_else(|| {
+                CompilerError::CodegenViolation(format!("Argmax op {:?}: output 无法 materialize", op.id))
+            })?;
+            prog.emit(VmInstr::ScalarStore {
+                base: out_ptr, src: argmax_dst, offset: OffsetExpr::Const(0),
+            });
+            Ok(true)
+        }
         Op::MultiHeadAttention(ref spec) => lower_attention_v2(prog, op, graph, ctx, resolver, abi, spec),
         // NOP variants — 元数据 op，不生成 VmInstr（与 dispatch_structural:236 等价）
         Op::Transpose { .. } | Op::Reshape { .. } | Op::SliceView { .. } => Ok(true),
