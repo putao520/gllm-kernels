@@ -662,6 +662,41 @@ pub(crate) fn lower_op_v2(
             prog.emit(VmInstr::LoopEnd);
             Ok(true)
         }
+        Op::MlaAttention(ref spec) => {
+            let q_absorbed_ptr = resolver.materialize(prog, op.inputs[0], abi).ok_or_else(|| {
+                CompilerError::CodegenViolation(format!("MlaAttention op {:?}: q_absorbed 无法 materialize", op.id))
+            })?;
+            let kv_cache_ptr = op.inputs.get(1).copied()
+                .and_then(|tid| resolver.materialize(prog, tid, abi))
+                .ok_or_else(|| CompilerError::CodegenViolation(
+                    format!("MlaAttention op {:?}: kv_cache 无法 materialize", op.id)))?;
+            let w_uv_ptr = op.inputs.get(2).copied()
+                .and_then(|tid| resolver.materialize(prog, tid, abi))
+                .ok_or_else(|| CompilerError::CodegenViolation(
+                    format!("MlaAttention op {:?}: w_uv 无法 materialize", op.id)))?;
+            let output_ptr = resolver.materialize(prog, op.outputs[0], abi).ok_or_else(|| {
+                CompilerError::CodegenViolation(format!("MlaAttention op {:?}: output 无法 materialize", op.id))
+            })?;
+            let kv_len_vreg = prog.alloc_vreg(VRegKind::Scalar, SimdWidth::Scalar);
+            if let Some(gen_ctr) = abi.gen_loop_counter {
+                prog.emit(VmInstr::GprBinOp { dst: kv_len_vreg, a: gen_ctr, b: GprOperand::Imm(1), op: GprOp::Add });
+            } else {
+                let seq_val = resolve_sym_dim(&spec.seq_len, abi, ctx.session.sym_map);
+                match seq_val {
+                    BoundExpr::Const(c) => { prog.emit(VmInstr::GprLoadImm { dst: kv_len_vreg, value: c }); },
+                    BoundExpr::DynamicVReg(vr) => {
+                        prog.emit(VmInstr::GprBinOp { dst: kv_len_vreg, a: vr, b: GprOperand::Imm(1), op: GprOp::Add });
+                    },
+                    _ => return Err(CompilerError::CodegenViolation("MlaAttention: unsupported seq_len bound".into())),
+                }
+            }
+            super::mla_emit::emit_mla_attn_score_inline(
+                prog, spec.num_heads, spec.head_dim, spec.d_c, spec.d_rope,
+                &[q_absorbed_ptr, kv_cache_ptr, w_uv_ptr, output_ptr],
+                kv_len_vreg, ctx.session.width, ctx.dtype,
+            )?;
+            Ok(true)
+        }
         Op::DualRoPE(ref spec) => {
             let rope_req = ctx.rope_req.ok_or_else(|| CompilerError::CodegenViolation(
                 format!("DualRoPE op {:?}: ctx.rope_req 未配置", op.id)))?;
