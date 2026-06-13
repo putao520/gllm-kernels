@@ -452,6 +452,29 @@ pub(crate) fn lower_op_v2(
             )?;
             Ok(true)
         }
+        Op::MoEGate { seq_len: _, num_experts, hidden: _, top_k } => {
+            let input_ptr = resolver.materialize(prog, op.inputs[0], abi).ok_or_else(|| {
+                CompilerError::CodegenViolation(format!("MoEGate op {:?}: input 无法 materialize", op.id))
+            })?;
+            let output_ptr = resolver.materialize(prog, op.outputs[0], abi).ok_or_else(|| {
+                CompilerError::CodegenViolation(format!("MoEGate op {:?}: output 无法 materialize", op.id))
+            })?;
+            let telemetry_ptr = if graph.telemetry.moe_hit_counter {
+                ctx.session.sym_map.resolve("telemetry").map(|expr| {
+                    let ptr_vreg = prog.alloc_vreg(VRegKind::Ptr, SimdWidth::Scalar);
+                    prog.emit(VmInstr::LoadPtr { dst: ptr_vreg, src: expr.clone() });
+                    ptr_vreg
+                })
+            } else { None };
+            super::norm_softmax_emit::emit_softmax_inline(
+                prog, num_experts, ctx.session.width, input_ptr, input_ptr, ctx.dtype,
+            )?;
+            super::moe_quant_emit::emit_moe_topk_dispatch_inline(
+                prog, num_experts, top_k, ctx.session.width,
+                input_ptr, output_ptr, ctx.session.hook, telemetry_ptr, ctx.dtype,
+            )?;
+            Ok(true)
+        }
         Op::HeadRmsNorm { .. } => Ok(false),
         _ => Ok(false), // 其他类别走现有路径（Phase 6-7 续迁移）
     }
