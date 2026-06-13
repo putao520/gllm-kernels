@@ -104,7 +104,7 @@ pub(crate) fn emit_normlike_inline(
             emit_normlike_one_group(
                 prog, reduce, finalize, transform,
                 feature_dim, vec_count, step_bytes, elem, lanes, width,
-                norm_kind.has_weight(), acc, temp, scale, dim_bc,
+                norm_kind, acc, temp, scale, dim_bc,
                 row_input, row_weight, row_output, dtype,
             );
         };
@@ -120,7 +120,7 @@ pub(crate) fn emit_normlike_inline(
             emit_normlike_one_group(
                 prog, reduce, finalize, transform,
                 feature_dim, vec_count, step_bytes, elem, lanes, width,
-                norm_kind.has_weight(), acc, temp, scale, dim_bc,
+                norm_kind, acc, temp, scale, dim_bc,
                 row_input, row_weight, row_output, dtype,
             );
         }
@@ -148,7 +148,7 @@ pub(crate) fn emit_normlike_one_group(
     elem: usize,
     lanes: usize,
     width: SimdWidth,
-    has_weight: bool,
+    norm_kind: NormKind,
     acc: VRegId,
     temp: VRegId,
     scale: VRegId,
@@ -158,6 +158,7 @@ pub(crate) fn emit_normlike_one_group(
     row_output: VRegId,
     dtype: QuantPrecision,
 ) {
+    let has_weight = norm_kind.has_weight();
     let tail = feature_dim % lanes;
     let tail_off = vec_count * step_bytes;
     let s1 = SimdWidth::Scalar;
@@ -1042,7 +1043,7 @@ mod tests {
         emit_normlike_one_group(
             &mut prog, &reduce, &finalize, &transform,
             feature_dim, vec_count, step_bytes, elem, lanes, width,
-            true, acc, temp, scale, dim_bc,
+            NormKind::RmsNorm, acc, temp, scale, dim_bc,
             row_input, weight_ptr, row_output, dtype,
         );
 
@@ -1084,7 +1085,7 @@ mod tests {
         emit_normlike_one_group(
             &mut prog, &reduce, &finalize, &transform,
             feature_dim, vec_count, step_bytes, elem, lanes, width,
-            false, acc, temp, scale, dim_bc,
+            NormKind::ValueNorm, acc, temp, scale, dim_bc,
             row_input, weight_ptr, row_output, dtype,
         );
 
@@ -1371,7 +1372,7 @@ mod tests {
         emit_normlike_one_group(
             &mut prog, &reduce, &finalize, &transform,
             feature_dim, vec_count, step_bytes, elem, lanes, width,
-            true, acc, temp, scale, dim_bc,
+            NormKind::RmsNorm, acc, temp, scale, dim_bc,
             row_input, weight_ptr, row_output, QuantPrecision::F32,
         );
 
@@ -1553,7 +1554,7 @@ mod tests {
         emit_normlike_one_group(
             &mut prog, &reduce, &finalize, &transform,
             feature_dim, vec_count, step_bytes, elem, lanes, width,
-            true, acc, temp, scale, dim_bc,
+            NormKind::RmsNorm, acc, temp, scale, dim_bc,
             row_input, weight_ptr, row_output, dtype,
         );
 
@@ -1665,7 +1666,7 @@ mod tests {
         emit_normlike_one_group(
             &mut prog, &reduce, &finalize, &transform,
             feature_dim, vec_count, step_bytes, elem, lanes, width,
-            false, acc, temp, scale, dim_bc,
+            NormKind::ValueNorm, acc, temp, scale, dim_bc,
             row_input, weight_ptr, row_output, QuantPrecision::F32,
         );
 
@@ -1881,7 +1882,7 @@ mod tests {
         emit_normlike_one_group(
             &mut prog, &reduce, &finalize, &transform,
             feature_dim, vec_count, step_bytes, elem, lanes, width,
-            true, acc, temp, scale, dim_bc,
+            NormKind::RmsNorm, acc, temp, scale, dim_bc,
             row_input, weight_ptr, row_output, QuantPrecision::F32,
         );
 
@@ -2490,7 +2491,7 @@ mod tests {
         emit_normlike_one_group(
             &mut prog, &reduce, &finalize, &transform,
             feature_dim, vec_count, step_bytes, elem, lanes, width,
-            true, acc, temp, scale, dim_bc,
+            NormKind::RmsNorm, acc, temp, scale, dim_bc,
             row_input, weight_ptr, row_output, QuantPrecision::F32,
         );
 

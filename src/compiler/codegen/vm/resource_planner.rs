@@ -710,23 +710,30 @@ pub fn plan_mega_kernel_resources(
 /// - 模型配置常量 (hidden_dim, num_heads)
 fn derive_loop_invariants_from_graph(graph: &CompilerGraph, hidden_dim: usize) -> Vec<LoopInvariant> {
     let mut invariants = Vec::new();
-    let mut has_rope = false;
-    let mut has_packed = false;
 
+    // Single-pass: collect invariants directly from op kinds
+    let mut rope_added = false;
+    let mut packed_added = false;
     for op in &graph.ops {
         match &op.kind {
-            OpKind::RoPE { .. } => has_rope = true,
-            OpKind::QuantGemm { .. } | OpKind::Gather { .. } => has_packed = true,
+            OpKind::RoPE { .. } if !rope_added => {
+                invariants.push(LoopInvariant {
+                    kind: InvariantKind::RopeTablePtr,
+                    location: InvariantLocation::Stack(-256),
+                    computation: InvariantComputation::LoadAbiArg(0),
+                });
+                rope_added = true;
+            }
+            OpKind::QuantGemm { .. } | OpKind::Gather { .. } if !packed_added => {
+                invariants.push(LoopInvariant {
+                    kind: InvariantKind::PackMapBase,
+                    location: InvariantLocation::Gpr(0),
+                    computation: InvariantComputation::LoadAbiArg(1),
+                });
+                packed_added = true;
+            }
             _ => {}
         }
-    }
-
-    if has_rope {
-        invariants.push(LoopInvariant {
-            kind: InvariantKind::RopeTablePtr,
-            location: InvariantLocation::Stack(-256),
-            computation: InvariantComputation::LoadAbiArg(0),
-        });
     }
 
     invariants.push(LoopInvariant {
@@ -737,14 +744,6 @@ fn derive_loop_invariants_from_graph(graph: &CompilerGraph, hidden_dim: usize) -
         location: InvariantLocation::Stack(-264),
         computation: InvariantComputation::LoadImm(hidden_dim as u64),
     });
-
-    if has_packed {
-        invariants.push(LoopInvariant {
-            kind: InvariantKind::PackMapBase,
-            location: InvariantLocation::Gpr(0),
-            computation: InvariantComputation::LoadAbiArg(1),
-        });
-    }
 
     invariants
 }
