@@ -547,6 +547,63 @@ pub(crate) fn lower_op_v2(
             )?;
             Ok(true)
         }
+        Op::MlaKvCompress { ref m, d_c, hidden } => {
+            let input_ptr = resolver.materialize(prog, op.inputs[0], abi).ok_or_else(|| {
+                CompilerError::CodegenViolation(format!("MlaKvCompress op {:?}: input 无法 materialize", op.id))
+            })?;
+            let weight_ptr = op.inputs.get(1).copied()
+                .and_then(|tid| resolver.materialize(prog, tid, abi))
+                .ok_or_else(|| CompilerError::CodegenViolation(
+                    format!("MlaKvCompress op {:?}: weight 无法 materialize", op.id)))?;
+            let output_ptr = resolver.materialize(prog, op.outputs[0], abi).ok_or_else(|| {
+                CompilerError::CodegenViolation(format!("MlaKvCompress op {:?}: output 无法 materialize", op.id))
+            })?;
+            let m_bound = if abi.mega_decode_seq_len.is_some() {
+                BoundExpr::Const(1)
+            } else {
+                resolve_sym_dim(m, abi, ctx.session.sym_map)
+            };
+            emit_gemm_inline_with_hook(prog, m, d_c, hidden, ctx,
+                input_ptr, weight_ptr, output_ptr,
+                Some(&m_bound), Some(op.id), None, false)?;
+            Ok(true)
+        }
+        Op::MlaQAbsorb { ref seq_len, num_heads, head_dim, d_c } => {
+            let input_ptr = resolver.materialize(prog, op.inputs[0], abi).ok_or_else(|| {
+                CompilerError::CodegenViolation(format!("MlaQAbsorb op {:?}: input 无法 materialize", op.id))
+            })?;
+            let weight_ptr = op.inputs.get(1).copied()
+                .and_then(|tid| resolver.materialize(prog, tid, abi))
+                .ok_or_else(|| CompilerError::CodegenViolation(
+                    format!("MlaQAbsorb op {:?}: weight 无法 materialize", op.id)))?;
+            let output_ptr = resolver.materialize(prog, op.outputs[0], abi).ok_or_else(|| {
+                CompilerError::CodegenViolation(format!("MlaQAbsorb op {:?}: output 无法 materialize", op.id))
+            })?;
+            let m_for_gemm = if abi.mega_decode_seq_len.is_some() {
+                SymDim::Concrete(num_heads)
+            } else { seq_len.clone() };
+            emit_gemm_inline_with_hook(prog, &m_for_gemm, d_c, head_dim, ctx,
+                input_ptr, weight_ptr, output_ptr, None, Some(op.id), None, true)?;
+            Ok(true)
+        }
+        Op::MlaVRestore { ref seq_len, num_heads, head_dim, d_c } => {
+            let input_ptr = resolver.materialize(prog, op.inputs[0], abi).ok_or_else(|| {
+                CompilerError::CodegenViolation(format!("MlaVRestore op {:?}: input 无法 materialize", op.id))
+            })?;
+            let weight_ptr = op.inputs.get(1).copied()
+                .and_then(|tid| resolver.materialize(prog, tid, abi))
+                .ok_or_else(|| CompilerError::CodegenViolation(
+                    format!("MlaVRestore op {:?}: weight 无法 materialize", op.id)))?;
+            let output_ptr = resolver.materialize(prog, op.outputs[0], abi).ok_or_else(|| {
+                CompilerError::CodegenViolation(format!("MlaVRestore op {:?}: output 无法 materialize", op.id))
+            })?;
+            let m_for_gemm = if abi.mega_decode_seq_len.is_some() {
+                SymDim::Concrete(num_heads)
+            } else { seq_len.clone() };
+            emit_gemm_inline_with_hook(prog, &m_for_gemm, head_dim, d_c, ctx,
+                input_ptr, weight_ptr, output_ptr, None, Some(op.id), None, false)?;
+            Ok(true)
+        }
         Op::HeadRmsNorm { .. } => Ok(false),
         _ => Ok(false), // 其他类别走现有路径（Phase 6-7 续迁移）
     }
