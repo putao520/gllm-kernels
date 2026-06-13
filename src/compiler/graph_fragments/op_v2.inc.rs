@@ -103,7 +103,6 @@ pub struct QuantGemmSpec {
     pub m: SymDim,
     pub n: usize,
     pub k: usize,
-    pub trans_b: bool,
     pub quant_type: crate::quant::QuantType,
 }
 
@@ -187,7 +186,7 @@ pub enum Op {
     L2Normalize,
 
     // ── Quantization ──
-    Dequantize { quant_type: crate::quant::QuantType },
+    Dequantize { num_elements: usize, block_size: usize, bits: usize },
     LogitSoftcap { cap: f32 },
 
     // ── Generation control ──
@@ -255,7 +254,10 @@ pub enum Op {
     LearnedPos2D { num_patches: usize, embed_dim: usize },
 
     // ── Quant pipeline ──
-    QTapSTG { ring_offset: usize, dim: usize, dtype: DType },
+    QTapSTG {
+        sink_ptr: u64, step_index_ptr: u64, dtype: DType,
+        q_dim: SymDim, position: QTapPosition, num_slots: usize,
+    },
 
     // ── MTP ──
     MtpDraft { depth: usize, hidden_size: usize, vocab_size: usize },
@@ -346,6 +348,53 @@ impl Op {
             }),
 
             _ => None, // 非 Norm/Activation 类别，Phase 5-7 处理
+        }
+    }
+
+    /// Phase 5: Gemm/Quant 类别的 from_op_kind 转换。
+    ///
+    /// dtype 从 op.inputs[0] tensor 推导（Gemm 的 activation dtype）。
+    pub fn from_op_kind_gemm_quant(
+        op: &CompilerOp,
+        graph: &CompilerGraph,
+    ) -> Option<Self> {
+        let input_dtype = op.inputs.first()
+            .and_then(|&tid| graph.tensor(tid))
+            .map(|t| t.dtype)
+            .unwrap_or(DType::F32);
+
+        match &op.kind {
+            // Gemm
+            OpKind::Gemm { m, n, k, dtype, trans_b } => Some(Op::Gemm(GemmSpec {
+                m: m.clone(), n: *n, k: *k, dtype: *dtype, trans_b: *trans_b, has_bias: false,
+            })),
+            OpKind::GemmBias { m, n, k, dtype, trans_b } => Some(Op::GemmBias(GemmSpec {
+                m: m.clone(), n: *n, k: *k, dtype: *dtype, trans_b: *trans_b, has_bias: true,
+            })),
+            OpKind::QuantGemm { m, n, k, quant_type } => Some(Op::QuantGemm(QuantGemmSpec {
+                m: m.clone(), n: *n, k: *k, quant_type: *quant_type,
+            })),
+            OpKind::FusedRmsNormGemm { m, n, k, eps, dtype, trans_b } => Some(Op::FusedRmsNormGemm {
+                m: m.clone(), n: *n, k: *k, eps: *eps, dtype: *dtype, trans_b: *trans_b,
+            }),
+            OpKind::MaskedGemm { m, n, k, dtype, trans_b } => Some(Op::MaskedGemm {
+                m: m.clone(), n: *n, k: *k, dtype: *dtype, trans_b: *trans_b,
+            }),
+
+            // Quant
+            OpKind::Dequantize { num_elements, block_size, bits } => Some(Op::Dequantize {
+                num_elements: *num_elements, block_size: *block_size, bits: *bits,
+            }),
+            OpKind::VRangeQuant { seq_len, kv_dim, block_size, range_threshold } => Some(Op::VRangeQuant {
+                seq_len: seq_len.clone(), kv_dim: *kv_dim,
+                block_size: *block_size, range_threshold: *range_threshold,
+            }),
+            OpKind::QTapSTG { sink_ptr, step_index_ptr, dtype, q_dim, position, num_slots } => Some(Op::QTapSTG {
+                sink_ptr: *sink_ptr, step_index_ptr: *step_index_ptr, dtype: *dtype,
+                q_dim: q_dim.clone(), position: *position, num_slots: *num_slots,
+            }),
+
+            _ => None,
         }
     }
 }

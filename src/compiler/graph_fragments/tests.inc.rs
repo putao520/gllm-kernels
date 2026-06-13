@@ -438,4 +438,81 @@ mod tests {
         let op_v2 = Op::from_op_kind_norm_activation(g.op(op).unwrap(), &g);
         assert_eq!(op_v2, None);
     }
+
+    // ── Phase 5: Gemm/Quant from_op_kind 测试 ──
+
+    #[test]
+    fn op_v2_from_op_kind_gemm_basic() {
+        let mut g = CompilerGraph::new();
+        let input = g.add_tensor_concrete("input", &[1, 4096], DType::F32);
+        let weight = g.add_tensor_concrete("weight", &[4096, 4096], DType::F32);
+        let output = g.add_tensor_concrete("output", &[1, 4096], DType::F32);
+        let op = g.add_op(
+            OpKind::Gemm { m: SymDim::Concrete(1), n: 4096, k: 4096, dtype: DType::F32, trans_b: false },
+            vec![input, weight], vec![output], "gemm",
+        );
+
+        let op_v2 = Op::from_op_kind_gemm_quant(g.op(op).unwrap(), &g);
+        if let Some(Op::Gemm(spec)) = op_v2 {
+            assert_eq!(spec.n, 4096);
+            assert_eq!(spec.k, 4096);
+            assert!(!spec.has_bias);
+        } else {
+            panic!("expected Op::Gemm");
+        }
+    }
+
+    #[test]
+    fn op_v2_from_op_kind_gemmbias_has_bias_true() {
+        let mut g = CompilerGraph::new();
+        let input = g.add_tensor_concrete("input", &[1, 4096], DType::F32);
+        let weight = g.add_tensor_concrete("weight", &[4096, 4096], DType::F32);
+        let output = g.add_tensor_concrete("output", &[1, 4096], DType::F32);
+        let op = g.add_op(
+            OpKind::GemmBias { m: SymDim::Concrete(1), n: 4096, k: 4096, dtype: DType::F32, trans_b: false },
+            vec![input, weight], vec![output], "gemmbias",
+        );
+
+        let op_v2 = Op::from_op_kind_gemm_quant(g.op(op).unwrap(), &g);
+        if let Some(Op::GemmBias(spec)) = op_v2 {
+            assert!(spec.has_bias);
+        } else {
+            panic!("expected Op::GemmBias");
+        }
+    }
+
+    #[test]
+    fn op_v2_from_op_kind_quantgemm_no_trans_b() {
+        let mut g = CompilerGraph::new();
+        let input = g.add_tensor_concrete("input", &[1, 4096], DType::F32);
+        let weight = g.add_tensor_concrete("weight", &[4096, 4096], DType::F32);
+        let output = g.add_tensor_concrete("output", &[1, 4096], DType::F32);
+        let op = g.add_op(
+            OpKind::QuantGemm { m: SymDim::Concrete(1), n: 4096, k: 4096, quant_type: crate::quant::QuantType::Q4_0 },
+            vec![input, weight], vec![output], "qgemm",
+        );
+
+        let op_v2 = Op::from_op_kind_gemm_quant(g.op(op).unwrap(), &g);
+        assert!(matches!(op_v2, Some(Op::QuantGemm(_))));
+    }
+
+    #[test]
+    fn op_v2_from_op_kind_dequantize_fields() {
+        let mut g = CompilerGraph::new();
+        let input = g.add_tensor_concrete("input", &[1024], DType::F32);
+        let output = g.add_tensor_concrete("output", &[1024], DType::F32);
+        let op = g.add_op(
+            OpKind::Dequantize { num_elements: 1024, block_size: 32, bits: 4 },
+            vec![input], vec![output], "deq",
+        );
+
+        let op_v2 = Op::from_op_kind_gemm_quant(g.op(op).unwrap(), &g);
+        if let Some(Op::Dequantize { num_elements, block_size, bits }) = op_v2 {
+            assert_eq!(num_elements, 1024);
+            assert_eq!(block_size, 32);
+            assert_eq!(bits, 4);
+        } else {
+            panic!("expected Op::Dequantize");
+        }
+    }
 }
