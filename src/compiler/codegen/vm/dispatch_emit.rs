@@ -1137,6 +1137,8 @@ pub(crate) fn dispatch_compute_pattern(
     }
 
     // ── OpKind 专用分发: Composite op dispatch ──
+    // 死代码（2026-06-14 验证）：lower_op_v2 + trace-lookup 处理所有 ops。
+    // 6863 测试中此 match 从未触发。可安全清理。
     match &op.kind {
         // ── GEMM (非量化) — M 维度穿透 SymDim ──
         OpKind::Gemm { m, n, k, trans_b, .. } | OpKind::GemmBias { m, n, k, trans_b, .. } => {
