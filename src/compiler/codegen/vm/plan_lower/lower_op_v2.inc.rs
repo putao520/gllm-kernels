@@ -40,6 +40,8 @@ pub(crate) fn lower_op_v2(
             lower_gemm_v2(prog, op, graph, ctx, resolver, abi, spec)
         }
         Op::MultiHeadAttention(ref spec) => lower_attention_v2(prog, op, graph, ctx, resolver, abi, spec),
+        // NOP variants — 元数据 op，不生成 VmInstr（与 dispatch_structural:236 等价）
+        Op::Transpose { .. } | Op::Reshape { .. } | Op::SliceView { .. } => Ok(true),
         Op::HeadRmsNorm { .. } => Ok(false),
         _ => Ok(false), // 其他类别走现有路径（Phase 6-7 续迁移）
     }
