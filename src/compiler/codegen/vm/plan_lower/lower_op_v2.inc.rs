@@ -358,6 +358,70 @@ pub(crate) fn lower_op_v2(
             });
             Ok(true)
         }
+        Op::SgInject { knowledge_offset: _, dim } => {
+            let sg_base = abi.hook_ctx_ptr.ok_or_else(|| CompilerError::CodegenViolation(
+                "SgInject: hook_ctx_ptr is None".into()))?;
+            let input_ptr = resolver.materialize(prog, op.inputs[0], abi).ok_or_else(|| {
+                CompilerError::CodegenViolation(format!("SgInject op {:?}: input 无法 materialize", op.id))
+            })?;
+            super::structural_builder::StructuralOpBuilder::emit_simd_injection(
+                prog, input_ptr, sg_base,
+                12, 16 + dim * 4, dim, ctx.session.width,
+            )?;
+            Ok(true)
+        }
+        Op::SgDetect { detect_offset: _, hidden_dim } => {
+            let sg_base = abi.hook_ctx_ptr.ok_or_else(|| CompilerError::CodegenViolation(
+                "SgDetect: hook_ctx_ptr is None".into()))?;
+            let input_ptr = resolver.materialize(prog, op.inputs[0], abi).ok_or_else(|| {
+                CompilerError::CodegenViolation(format!("SgDetect op {:?}: input 无法 materialize", op.id))
+            })?;
+            let detect_ptr = prog.alloc_vreg(VRegKind::Ptr, SimdWidth::Scalar);
+            prog.emit(VmInstr::LoadPtr {
+                dst: detect_ptr, src: PtrExpr::VRegPlusConst(sg_base, 16),
+            });
+            super::structural_builder::StructuralOpBuilder::emit_side_channel_copy(
+                prog, input_ptr, detect_ptr, 0, hidden_dim, ctx.session.width,
+            )?;
+            if abi.callback_table_ptr.is_some() {
+                let cb_table = prog.alloc_vreg(VRegKind::Ptr, SimdWidth::Scalar);
+                prog.emit(VmInstr::LoadPtr {
+                    dst: cb_table,
+                    src: ctx.session.sym_map.resolve("callback_table_ptr").cloned().expect("ABI: callback_table_ptr"),
+                });
+                prog.emit(VmInstr::GprCondAction { cond: GprCondition::IsNull(cb_table), action: GprBranchAction::Skip(4) });
+                let fn_ptr = prog.alloc_vreg(VRegKind::Ptr, SimdWidth::Scalar);
+                let ctx_ptr = prog.alloc_vreg(VRegKind::Ptr, SimdWidth::Scalar);
+                prog.emit(VmInstr::LoadCallbackEntry { table_ptr: cb_table, slot_id: 0, fn_ptr_out: fn_ptr, ctx_out: ctx_ptr });
+                prog.emit(VmInstr::MemFence { order: crate::compiler::codegen::vm::instr::MemFenceOrder::Release });
+                let ret_val = prog.alloc_vreg(VRegKind::Scalar, SimdWidth::Scalar);
+                prog.emit(VmInstr::NativeCall { ret_val, fn_ptr, ctx_ptr });
+                prog.emit(VmInstr::MemFence { order: crate::compiler::codegen::vm::instr::MemFenceOrder::Acquire });
+            }
+            Ok(true)
+        }
+        Op::QTapSTG { sink_ptr, step_index_ptr, dtype, ref q_dim, position, num_slots } => {
+            let q_ptr = resolver.materialize(prog, op.inputs[0], abi).ok_or_else(|| {
+                CompilerError::CodegenViolation(format!("QTapSTG op {:?}: Q tensor 无法 materialize", op.id))
+            })?;
+            let q_dim_concrete = match q_dim {
+                SymDim::Concrete(v) => *v,
+                SymDim::Symbolic { max_value, .. } => max_value.ok_or_else(|| {
+                    CompilerError::CodegenViolation(format!("QTapSTG op {:?}: q_dim Symbolic 无 max_value", op.id))
+                })?,
+            };
+            let q_tensor = graph.tensor(op.inputs[0]).ok_or_else(|| CompilerError::CodegenViolation(
+                format!("QTapSTG op {:?}: Q tensor 不存在", op.id)))?;
+            let seq_dim = q_tensor.shape.iter().find(|d| d.is_symbolic()).cloned()
+                .or_else(|| q_tensor.shape.first().cloned())
+                .ok_or_else(|| CompilerError::CodegenViolation(format!("QTapSTG op {:?}: Q shape 为空", op.id)))?;
+            let seq_bound = resolve_sym_dim(&seq_dim, abi, ctx.session.sym_map);
+            super::lower::lower_qtap_stg(
+                prog, sink_ptr, step_index_ptr, dtype,
+                q_dim_concrete, seq_bound, position, num_slots, ctx.session.width, q_ptr,
+            )?;
+            Ok(true)
+        }
         Op::HeadRmsNorm { .. } => Ok(false),
         _ => Ok(false), // 其他类别走现有路径（Phase 6-7 续迁移）
     }
