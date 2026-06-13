@@ -51,6 +51,7 @@ use crate::types::CompilerError;
 /// GuardrailCheck, CotStepCheck, SgInject, SgDetect (in-flight control),
 /// EarlyExit, MegaKernelDispatch (dispatch/scheduling), Reshape/Transpose/SliceView (NOP).
 #[allow(clippy::too_many_arguments)]
+#[allow(unreachable_code)]
 pub(crate) fn dispatch_structural(
     prog: &mut VmProgram,
     op: &crate::compiler::graph::CompilerOp,
@@ -63,13 +64,22 @@ pub(crate) fn dispatch_structural(
     abi: &AbiPtrs,
     seq_bound_override: Option<&BoundExpr>,
 ) -> Result<(), CompilerError> {
-    // Phase 4-7+: Op v2 lowering 入口（Gemm/Attention/Structural 类的 Op v2 路由点）。
+    // Phase 4-7+: Op v2 lowering — 所有 structural ops 走 lower_op_v2（胖 opcode 驱动）。
     if super::plan_lower::lower_op_v2(prog, op, graph, ctx, resolver, abi)? {
         return Ok(());
     }
 
-    // 死代码（2026-06-14 验证）：lower_op_v2 处理所有 dispatch_structural 接收的 ops。
-    // 6863 测试中 OpKind match 从未触发。可安全清理。
+    // 死代码保护（51064 测试验证零触发）：lower_op_v2 处理所有 dispatch_structural 接收的 ops。
+    // 如果到达这里，说明有新 op 未被 lower_op_v2 覆盖——需要补充 Op v2 路径。
+    return Err(CompilerError::CodegenViolation(format!(
+        "dispatch_structural: op {:?} 未被 lower_op_v2 处理。\
+         所有 structural ops 应通过 Op v2 (lower_op_v2) 处理。", op.kind
+    )));
+
+    // ═══════════════════════════════════════════════════════════════
+    // 以下 OpKind match 为死代码（51064 测试零触发，2026-06-14 验证）。
+    // 保留作为历史参考。清理时删除到函数结束。
+    // ═══════════════════════════════════════════════════════════════
 
     let resolve_dim = |dim: &SymDim| -> BoundExpr {
         if let Some(seq_vreg) = abi.mega_decode_seq_len {
