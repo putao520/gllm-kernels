@@ -8,7 +8,7 @@
 // Pipeline: LayerIR → CompilerGraph → (Fusion) → (ISA Lowering: codegen)
 
 use std::collections::HashMap;
-use crate::compiler::ir::{LayerArch, LayerIR};
+use crate::compiler::ir::LayerIR;
 use crate::dispatch::device_profile::DeviceProfile;
 use crate::types::DType;
 use crate::traits::Activation;

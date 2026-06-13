@@ -7,22 +7,6 @@ use crate::types::DType;
 use crate::quant::QuantType;
 use crate::traits::Activation;
 
-/// Architecture of a single transformer layer.
-///
-/// BUILD-stage layer architecture classification — drives fusion strategy selection.
-/// ARCH-BUILD-COMPILE-BOUNDARY: this is a BUILD-stage strategy decision.
-/// The JIT compiler processes whatever graph it receives, regardless of LayerArch.
-/// TODO(H-1): derive fusion decisions from graph ops instead of LayerArch.
-#[derive(Debug, Clone, PartialEq)]
-pub enum LayerArch {
-    /// Standard decoder: RMSNorm → Attn(QKV+RoPE+GQA+O) → Residual → RMSNorm → FFN(gate+up+SiLU+down) → Residual
-    Decoder,
-    /// MoE decoder: same as Decoder but FFN replaced by Router → TopK experts
-    DecoderMoE { num_experts: usize, top_k: usize },
-    /// Encoder: LayerNorm → SelfAttn(QKV+O) → Residual → LayerNorm → FFN(up+GELU+down) → Residual
-    Encoder,
-}
-
 /// MoE configuration — derived from graph topology, not a bool flag.
 ///
 /// ARCH-JIT-DATA-YIELDS: MoE presence is derived from OpKind existence in the graph.
@@ -40,8 +24,8 @@ pub struct MoeConfig {
 /// opportunities, and buffer layouts.
 #[derive(Debug, Clone)]
 pub struct LayerIR {
-    /// Layer architecture variant
-    pub arch: LayerArch,
+    /// MoE configuration — None for dense layers.
+    pub moe: Option<MoeConfig>,
     /// Hidden dimension
     pub hidden: usize,
     /// Number of attention heads
@@ -76,24 +60,14 @@ impl LayerIR {
         config: &crate::types::ModelConfig,
         max_batch: usize,
     ) -> Self {
-        use crate::types::ModelArch;
-
-        let arch = match config.arch {
-            ModelArch::Llama | ModelArch::Mistral | ModelArch::Qwen | ModelArch::Gemma => {
-                LayerArch::Decoder
-            }
-            ModelArch::Gpt2 => LayerArch::Encoder, // GPT-2 uses encoder-style blocks
-            ModelArch::Phi => LayerArch::Decoder,
-        };
-
         let activation = match config.arch {
-            ModelArch::Gemma => Activation::GeGlu,
-            ModelArch::Gpt2 => Activation::Gelu,
+            crate::types::ModelArch::Gemma => Activation::GeGlu,
+            crate::types::ModelArch::Gpt2 => Activation::Gelu,
             _ => Activation::Silu, // LLaMA, Mistral, Qwen, Phi use SwiGLU
         };
 
         LayerIR {
-            arch,
+            moe: None,
             hidden: config.hidden_size,
             num_heads: config.num_heads,
             num_kv_heads: config.num_kv_heads,
@@ -139,8 +113,8 @@ impl LayerIR {
         let qkv_flops = 2 * h * (q + 2 * kv);
         // Output projection: 2*q*h
         let o_flops = 2 * q * h;
-        // FFN: gate(2*h*inter) + up(2*h*inter) + down(2*inter*h) = 6*h*inter
-        let ffn_flops = 6 * h * inter;
+        // FFN: gated (3 GEMM) = 6*h*inter, non-gated (2 GEMM) = 4*h*inter
+        let ffn_flops = if self.activation.is_gated() { 6 * h * inter } else { 4 * h * inter };
         // Attention: ~4*seq*head_dim per head (approximate for seq=1)
         let attn_flops = 4 * self.head_dim as u64 * self.num_heads as u64;
 
@@ -155,8 +129,15 @@ impl LayerIR {
         let kv = self.kv_dim();
         let inter = self.intermediate;
 
-        // QKV + O + gate + up + down + 2 norms
-        (h * q + h * kv + h * kv + q * h + h * inter + h * inter + inter * h) * elem
+        // QKV + O + FFN projections + 2 norms
+        let ffn_weights = if self.activation.is_gated() {
+            // gated: gate + up + down
+            h * inter + h * inter + inter * h
+        } else {
+            // non-gated: up + down
+            h * inter + inter * h
+        };
+        (h * q + h * kv + h * kv + q * h + ffn_weights) * elem
             + 2 * h * elem
     }
 }
@@ -177,7 +158,8 @@ mod tests {
         assert_eq!(ir.gqa_groups(), 1);
         assert!(ir.flops_per_token() > 0);
         assert!(ir.weight_bytes() > 0);
-        assert_eq!(ir.arch, LayerArch::Decoder);
+        assert!(ir.moe.is_none());
+        assert!(ir.activation.is_gated()); // SiLU = gated SwiGLU
     }
 
     #[test]
@@ -189,30 +171,20 @@ mod tests {
         assert_eq!(ir.kv_dim(), 1024); // 8 * 128
     }
 
-    // ── LayerArch ────────────────────────────────────────────────────────
+    // ── MoeConfig ────────────────────────────────────────────────────────
 
     #[test]
-    fn layer_arch_equality() {
-        assert_eq!(LayerArch::Decoder, LayerArch::Decoder);
-        assert_ne!(LayerArch::Decoder, LayerArch::Encoder);
+    fn moe_config_fields() {
+        let moe = MoeConfig { num_experts: 8, top_k: 2 };
+        assert_eq!(moe.num_experts, 8);
+        assert_eq!(moe.top_k, 2);
     }
 
     #[test]
-    fn layer_arch_moe() {
-        let moe = LayerArch::DecoderMoE { num_experts: 8, top_k: 2 };
-        if let LayerArch::DecoderMoE { num_experts, top_k } = moe {
-            assert_eq!(num_experts, 8);
-            assert_eq!(top_k, 2);
-        } else {
-            panic!("expected DecoderMoE");
-        }
-    }
-
-    #[test]
-    fn layer_arch_clone() {
-        let arch = LayerArch::DecoderMoE { num_experts: 4, top_k: 1 };
-        let cloned = arch.clone();
-        assert_eq!(cloned, arch);
+    fn moe_config_clone() {
+        let moe = MoeConfig { num_experts: 4, top_k: 1 };
+        let cloned = moe;
+        assert_eq!(cloned.num_experts, moe.num_experts);
     }
 
     // ── LayerIR dimension methods ────────────────────────────────────────
@@ -263,8 +235,8 @@ mod tests {
         let mut config = ModelConfig::llama_7b();
         config.arch = crate::types::ModelArch::Gpt2;
         let ir = LayerIR::from_model_config(&config, 4);
-        assert_eq!(ir.arch, LayerArch::Encoder);
         assert_eq!(ir.activation, Activation::Gelu);
+        assert!(!ir.activation.is_gated()); // GELU = non-gated
     }
 
     #[test]
@@ -304,7 +276,7 @@ mod tests {
         let debug = format!("{:?}", ir);
         // Debug should contain key fields
         assert!(debug.contains("4096"), "should contain hidden dim: {debug}");
-        assert!(debug.contains("Decoder"), "should contain arch: {debug}");
+        assert!(debug.contains("moe"), "should contain moe field: {debug}");
     }
 
     #[test]
@@ -351,8 +323,8 @@ mod tests {
     }
 
     #[test]
-    fn layer_arch_moe_debug_format() {
-        let moe = LayerArch::DecoderMoE { num_experts: 64, top_k: 8 };
+    fn moe_config_debug_format() {
+        let moe = MoeConfig { num_experts: 64, top_k: 8 };
         let debug = format!("{:?}", moe);
         assert!(debug.contains("64"), "should contain num_experts: {debug}");
         assert!(debug.contains("8"), "should contain top_k: {debug}");
@@ -390,10 +362,10 @@ mod tests {
     }
 
     #[test]
-    fn qwen_architecture_maps_to_decoder() {
+    fn qwen_architecture_maps_to_gated_silu() {
         let config = ModelConfig::qwen_7b();
         let ir = LayerIR::from_model_config(&config, 1);
-        assert_eq!(ir.arch, LayerArch::Decoder);
+        assert!(ir.moe.is_none());
         assert_eq!(ir.activation, Activation::Silu);
     }
 

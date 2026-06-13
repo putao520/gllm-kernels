@@ -338,12 +338,13 @@ impl CompilerGraph {
     /// - Decoder: RmsNorm → Attn(QKV+RoPE+GQA+O) → Residual → RmsNorm → FFN(gate+up+SiLU+down) → Residual
     /// - Encoder: LayerNorm → Attn(QKV+O) → Residual → LayerNorm → FFN(up+GELU+down) → Residual → MeanPool → L2Normalize
     pub fn from_layer_ir(ir: &LayerIR, _profile: &DeviceProfile) -> Result<Self, CompilerError> {
-        match &ir.arch {
-            LayerArch::Encoder => return Self::from_layer_ir_encoder(ir),
-            LayerArch::DecoderMoE { .. } => {
-                return Err("MoE decoder not yet supported in from_layer_ir".into());
-            }
-            LayerArch::Decoder => {} // fall through to existing decoder logic
+        // Dispatch based on activation + MoE, not LayerArch.
+        // Non-gated GELU = encoder-style; gated = decoder-style.
+        if ir.moe.is_some() {
+            return Err("MoE decoder not yet supported in from_layer_ir".into());
+        }
+        if !ir.activation.is_gated() && matches!(ir.activation, Activation::Gelu) {
+            return Self::from_layer_ir_encoder(ir);
         }
         let mut g = CompilerGraph::new();
         let dt = ir.dtype;

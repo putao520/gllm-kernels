@@ -12,7 +12,7 @@
 //! immutable `ExecutionPlan` consumed by codegen, fusion, and scheduling.
 
 use std::collections::HashMap;
-use crate::compiler::ir::{LayerIR, LayerArch};
+use crate::compiler::ir::{LayerIR, MoeConfig};
 use crate::compiler::pain_point::OpBottleneckMap;
 use crate::dispatch::device_profile::DeviceProfile;
 use crate::traits::Activation;
@@ -816,7 +816,7 @@ impl HwOptEngine {
     pub fn solve_profile_only_with_bias(profile: &DeviceProfile, bias: &StrategyBias) -> ExecutionPlan {
         // Synthesize a minimal IR with conservative defaults
         let default_ir = LayerIR {
-            arch: LayerArch::Decoder,
+            moe: None,
             hidden: 4096,
             num_heads: 32,
             num_kv_heads: 32,
@@ -1481,18 +1481,15 @@ fn collect_gemm_shapes(ir: &LayerIR) -> Vec<GemmShape> {
         GemmShape { m: ir.max_batch, n: h, k: q },     // O
     ];
 
-    // ARCH-BUILD-COMPILE-BOUNDARY: LayerArch drives BUILD-stage FFN shape selection.
-    // TODO(H-2): derive FFN GEMM shapes from graph Gemm ops instead of LayerArch.
-    match &ir.arch {
-        LayerArch::Decoder | LayerArch::DecoderMoE { .. } => {
-            // FFN: gate, up, down
-            shapes.push(GemmShape { m: ir.max_batch, n: inter, k: h });  // gate, up
-            shapes.push(GemmShape { m: ir.max_batch, n: h, k: inter }); // down
-        }
-        LayerArch::Encoder => {
-            shapes.push(GemmShape { m: ir.max_batch, n: inter, k: h });
-            shapes.push(GemmShape { m: ir.max_batch, n: h, k: inter });
-        }
+    // FFN GEMM shapes derived from activation type.
+    if ir.activation.is_gated() {
+        // Gated FFN (SwiGLU/GeGLU): gate, up, down
+        shapes.push(GemmShape { m: ir.max_batch, n: inter, k: h });  // gate, up
+        shapes.push(GemmShape { m: ir.max_batch, n: h, k: inter }); // down
+    } else {
+        // Non-gated FFN (GELU/ReLU): up, down
+        shapes.push(GemmShape { m: ir.max_batch, n: inter, k: h });
+        shapes.push(GemmShape { m: ir.max_batch, n: h, k: inter });
     }
 
     shapes.sort_by_key(|s| (s.m, s.n, s.k));
@@ -1554,20 +1551,12 @@ fn plan_fusions(ir: &LayerIR) -> Vec<FusionDecision> {
     // QKV shared input is always beneficial
     fusions.push(FusionDecision::QkvSharedInput);
 
-    // ARCH-BUILD-COMPILE-BOUNDARY: LayerArch drives BUILD-stage fusion strategy selection.
-    // TODO(H-2): derive fusion decisions from graph ops (SwiGLU/GeGLU/GELU) instead of LayerArch.
-    match &ir.arch {
-        LayerArch::Decoder | LayerArch::DecoderMoE { .. } => {
-            // Gated FFN fusion: SwiGLU or GeGLU depending on activation
-            match ir.activation {
-                Activation::GeGlu => fusions.push(FusionDecision::GeGluFusion),
-                _ => fusions.push(FusionDecision::SwiGluFusion),
-            }
-        }
-        LayerArch::Encoder => {
-            // GELU fusion for encoder FFN
-            fusions.push(FusionDecision::GemmBiasAct(Activation::Gelu));
-        }
+    // FFN fusion strategy derived from activation type.
+    match ir.activation {
+        Activation::GeGlu => fusions.push(FusionDecision::GeGluFusion),
+        Activation::Silu => fusions.push(FusionDecision::SwiGluFusion),
+        Activation::Gelu => fusions.push(FusionDecision::GemmBiasAct(Activation::Gelu)),
+        _ => {} // Relu/None: no FFN fusion
     }
 
     // FlashAttention tiling for long sequences
@@ -1584,7 +1573,7 @@ fn plan_fusions(ir: &LayerIR) -> Vec<FusionDecision> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::compiler::ir::LayerIR;
+    use crate::compiler::ir::{LayerIR, MoeConfig};
     use crate::types::ModelConfig;
     use crate::dispatch::DeviceProfile;
 
@@ -1917,7 +1906,7 @@ mod tests {
     #[test]
     fn collect_gemm_shapes_deduplicates() {
         let ir = LayerIR {
-            arch: LayerArch::Encoder,
+            moe: None,
             hidden: 64,
             num_heads: 2,
             num_kv_heads: 2,
@@ -1940,7 +1929,7 @@ mod tests {
     #[test]
     fn plan_fusions_encoder_uses_gelu() {
         let ir = LayerIR {
-            arch: LayerArch::Encoder,
+            moe: None,
             hidden: 64,
             num_heads: 2,
             num_kv_heads: 2,
@@ -1964,7 +1953,7 @@ mod tests {
     #[test]
     fn plan_fusions_short_seq_no_flash_attention() {
         let ir = LayerIR {
-            arch: LayerArch::Decoder,
+            moe: None,
             hidden: 64,
             num_heads: 2,
             num_kv_heads: 2,
@@ -2220,7 +2209,7 @@ mod tests {
     fn plan_fusions_always_includes_rmsnorm_into_gemm() {
         // Arrange: decoder IR with long sequence
         let ir = LayerIR {
-            arch: LayerArch::Decoder,
+            moe: None,
             hidden: 64,
             num_heads: 2,
             num_kv_heads: 2,
@@ -2293,8 +2282,8 @@ mod tests {
     #[test]
     fn compute_scratchpad_encoder_vs_decoder() {
         // Arrange: two IRs with identical dimensions but different arch
-        let make_ir = |arch: LayerArch, act: Activation| LayerIR {
-            arch,
+        let make_ir = |act: Activation| LayerIR {
+            moe: None,
             hidden: 256,
             num_heads: 4,
             num_kv_heads: 4,
@@ -2309,8 +2298,8 @@ mod tests {
             partial_rotary_factor: 1.0,
             activation: act,
         };
-        let dec_ir = make_ir(LayerArch::Decoder, Activation::Silu);
-        let enc_ir = make_ir(LayerArch::Encoder, Activation::Gelu);
+        let dec_ir = make_ir(Activation::Silu);
+        let enc_ir = make_ir(Activation::Gelu);
         // Act
         let dec_scratch = compute_scratchpad(&dec_ir);
         let enc_scratch = compute_scratchpad(&enc_ir);
@@ -2345,7 +2334,7 @@ mod tests {
     fn collect_gemm_shapes_decoder_has_ffn_shapes() {
         // Arrange: decoder IR with distinct hidden/intermediate
         let ir = LayerIR {
-            arch: LayerArch::Decoder,
+            moe: None,
             hidden: 128,
             num_heads: 4,
             num_kv_heads: 2,
@@ -2373,7 +2362,7 @@ mod tests {
     fn collect_gemm_shapes_moe_uses_decoder_path() {
         // Arrange: DecoderMoE with a small expert count
         let ir = LayerIR {
-            arch: LayerArch::DecoderMoE { num_experts: 8, top_k: 2 },
+            moe: Some(MoeConfig { num_experts: 8, top_k: 2 }),
             hidden: 64,
             num_heads: 2,
             num_kv_heads: 2,
@@ -2398,7 +2387,7 @@ mod tests {
     fn plan_fusions_moe_decoder_uses_swiglu() {
         // Arrange
         let ir = LayerIR {
-            arch: LayerArch::DecoderMoE { num_experts: 4, top_k: 1 },
+            moe: Some(MoeConfig { num_experts: 4, top_k: 1 }),
             hidden: 64,
             num_heads: 2,
             num_kv_heads: 2,
@@ -2444,7 +2433,7 @@ mod tests {
     fn compute_scratchpad_scales_with_batch() {
         // Arrange: same model config, different batch sizes
         let ir_b1 = LayerIR {
-            arch: LayerArch::Decoder,
+            moe: None,
             hidden: 256,
             num_heads: 4,
             num_kv_heads: 4,
@@ -2607,7 +2596,7 @@ mod tests {
         // Arrange: IR with max_seq = 8, which is less than the starting golden size of 16.
         // This triggers the fallback branch (lines 1347-1348: golden_sizes empty -> push 64).
         let ir = LayerIR {
-            arch: LayerArch::Decoder,
+            moe: None,
             hidden: 64,
             num_heads: 2,
             num_kv_heads: 2,
@@ -2638,7 +2627,7 @@ mod tests {
         // Arrange: very small max_seq so tile_q >= max_seq, disabling online softmax.
         // The default L1 budget is large enough that max_tile >> small max_seq.
         let ir = LayerIR {
-            arch: LayerArch::Decoder,
+            moe: None,
             hidden: 64,
             num_heads: 2,
             num_kv_heads: 2,
@@ -2780,7 +2769,7 @@ mod tests {
     fn compute_scratchpad_attention_phase_dominates_for_large_seq() {
         // Arrange: IR with very large max_seq makes attention scores dominate
         let ir = LayerIR {
-            arch: LayerArch::Decoder,
+            moe: None,
             hidden: 64,
             num_heads: 4,
             num_kv_heads: 4,
@@ -2884,7 +2873,7 @@ mod tests {
     fn collect_gemm_shapes_encoder_has_ffn_shapes() {
         // Arrange: encoder IR with distinct hidden and intermediate dimensions
         let ir = LayerIR {
-            arch: LayerArch::Encoder,
+            moe: None,
             hidden: 128,
             num_heads: 4,
             num_kv_heads: 4,
@@ -2912,7 +2901,7 @@ mod tests {
     fn compute_scratchpad_bf16_is_half_of_f32() {
         // Arrange: two identical IRs with different dtypes
         let f32_ir = LayerIR {
-            arch: LayerArch::Decoder,
+            moe: None,
             hidden: 256,
             num_heads: 4,
             num_kv_heads: 4,
@@ -3282,7 +3271,7 @@ mod tests {
     fn collect_gemm_shapes_qkv_dimensions_derived_from_ir() {
         // Arrange: IR with specific hidden, num_heads, num_kv_heads, head_dim
         let ir = LayerIR {
-            arch: LayerArch::Decoder,
+            moe: None,
             hidden: 512,
             num_heads: 8,
             num_kv_heads: 2,  // GQA: fewer KV heads
@@ -3317,7 +3306,7 @@ mod tests {
     fn compute_scratchpad_scales_linearly_with_batch_size() {
         // Arrange: two IRs with batch=1 and batch=8
         let ir_b1 = LayerIR {
-            arch: LayerArch::Decoder,
+            moe: None,
             hidden: 256,
             num_heads: 4,
             num_kv_heads: 4,
@@ -3349,7 +3338,7 @@ mod tests {
     fn plan_fusions_decoder_with_geglu_activation() {
         // Arrange: decoder with GeGlu activation (not Silu)
         let ir = LayerIR {
-            arch: LayerArch::Decoder,
+            moe: None,
             hidden: 64,
             num_heads: 2,
             num_kv_heads: 2,

@@ -13,6 +13,17 @@ pub enum Activation {
     GeGlu,
 }
 
+impl Activation {
+    /// Whether this activation uses a gated FFN (3 GEMM: gate+up+down).
+    ///
+    /// SwiGLU/GeGLU are gated: `f(gate(x)) * up(x)`, requiring 3 projections.
+    /// GELU/ReLU/SiLU/None are non-gated: `f(up(x))`, requiring 2 projections.
+    #[inline]
+    pub fn is_gated(self) -> bool {
+        matches!(self, Activation::Silu | Activation::GeGlu)
+    }
+}
+
 /// Represents a device-specific representation of a tensor or buffer.
 pub trait DeviceRepr: Debug + Clone + Send + Sync + 'static {}
 

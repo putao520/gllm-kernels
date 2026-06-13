@@ -109,7 +109,7 @@ mod tests {
         // Override to make it an encoder-style model
         config.arch = crate::types::ModelArch::Gpt2;
         let ir = LayerIR::from_model_config(&config, 4); // seq_len=4
-        assert_eq!(ir.arch, crate::compiler::ir::LayerArch::Encoder);
+        assert!(!ir.activation.is_gated()); // GELU = non-gated (encoder-style)
 
         let profile = DeviceProfile::detect();
         let g = CompilerGraph::from_layer_ir(&ir, &profile).expect("from_layer_ir encoder failed");

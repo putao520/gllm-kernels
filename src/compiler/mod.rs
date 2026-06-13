@@ -142,7 +142,7 @@ pub use planner::{
 pub use crate::types::CompilerError;
 
 // ── Internal re-exports (pub within crate, not part of public API) ────
-pub(crate) use ir::{LayerIR, LayerArch};
+pub(crate) use ir::LayerIR;
 pub(crate) use cache::{CompilationCache, CacheSource, IncrementalCompileResult};
 
 use crate::dispatch::{DeviceProfile, device_profile};
@@ -335,11 +335,10 @@ impl InferenceCompiler {
 
         let mut hasher = DefaultHasher::new();
 
-        // Architecture variant (discriminant + inner fields for MoE)
-        std::mem::discriminant(&ir.arch).hash(&mut hasher);
-        if let LayerArch::DecoderMoE { num_experts, top_k } = &ir.arch {
-            num_experts.hash(&mut hasher);
-            top_k.hash(&mut hasher);
+        // MoE configuration
+        if let Some(moe) = &ir.moe {
+            moe.num_experts.hash(&mut hasher);
+            moe.top_k.hash(&mut hasher);
         }
 
         // Shape parameters
@@ -1403,29 +1402,23 @@ mod tests {
         assert_eq!(decisions[0], cloned);
     }
 
-    /// Verify LayerArch variants: Decoder, DecoderMoE, Encoder —
-    /// Debug, Clone, and PartialEq all work correctly.
+    /// Verify MoeConfig: fields, Clone, Copy, Debug all work correctly.
     #[test]
-    fn test_layer_arch_variants_and_derives() {
-        let decoder = ir::LayerArch::Decoder;
-        let encoder = ir::LayerArch::Encoder;
-        let moe = ir::LayerArch::DecoderMoE { num_experts: 8, top_k: 2 };
+    fn test_moe_config_and_derives() {
+        let moe = ir::MoeConfig { num_experts: 8, top_k: 2 };
 
-        // Assert: distinct variants
-        assert_ne!(decoder, encoder);
-        assert_ne!(decoder, moe);
-        assert_ne!(encoder, moe);
+        // Assert: fields
+        assert_eq!(moe.num_experts, 8);
+        assert_eq!(moe.top_k, 2);
 
-        // Assert: Clone
-        let moe_clone = moe.clone();
-        assert_eq!(moe, moe_clone);
+        // Assert: Copy
+        let moe_copy = moe;
+        assert_eq!(moe_copy.num_experts, moe.num_experts);
 
-        // Assert: Debug contains variant name
-        assert!(format!("{:?}", decoder).contains("Decoder"));
-        assert!(format!("{:?}", encoder).contains("Encoder"));
+        // Assert: Debug contains fields
         let moe_debug = format!("{:?}", moe);
-        assert!(moe_debug.contains("DecoderMoE"));
         assert!(moe_debug.contains("num_experts"));
+        assert!(moe_debug.contains("8"));
     }
 
     /// Verify CacheSource enum variants are distinct, Copy-able, and Debug-able.
