@@ -111,6 +111,10 @@ pub struct GraphTopologyAnalysis {
     /// Used by prologue to decide whether to load weight_ptr.
     pub weight_source: WeightSource,
 
+    /// QkNorm presence — from graph ops (OpKind::QkNorm).
+    /// Used by BUILD stage to derive Gemma norm residual convention.
+    pub has_qk_norm: bool,
+
     /// 词表大小 — 从 OpKind::Argmax { vocab_size } 推导。
     /// 图无 Argmax 时为 None。
     pub vocab_size: Option<usize>,
@@ -148,6 +152,7 @@ impl GraphTopologyAnalysis {
         let mut has_mla = false;
         let mut has_sg_ops = false;
         let mut has_weight_ops = false;
+        let mut has_qk_norm = false;
         let mut vocab_size: Option<usize> = None;
         let mut argmax_input_tid: Option<TensorId> = None;
 
@@ -164,6 +169,7 @@ impl GraphTopologyAnalysis {
                 OpKind::CachedGQA { .. } => has_cached_gqa = true,
                 OpKind::MlaAttention { .. } => has_mla = true,
                 OpKind::SgDetect { .. } | OpKind::SgInject { .. } => has_sg_ops = true,
+                OpKind::QkNorm { .. } => has_qk_norm = true,
                 OpKind::Gemm { .. } | OpKind::GemmBias { .. } | OpKind::QuantGemm { .. }
                 | OpKind::RmsNorm { .. } | OpKind::LayerNorm { .. } | OpKind::HeadRmsNorm { .. }
                 => has_weight_ops = true,
@@ -229,6 +235,7 @@ impl GraphTopologyAnalysis {
             kv_cache_source,
             sg_ops: if has_sg_ops { SgOpsPresence::Present } else { SgOpsPresence::None },
             weight_source: if has_weight_ops { WeightSource::WeightRequired } else { WeightSource::NoWeight },
+            has_qk_norm,
             vocab_size,
             logits_producer_op_idx,
             logits_output_tid,
