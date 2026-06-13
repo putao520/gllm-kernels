@@ -194,7 +194,7 @@ pub fn fuse_with_dag_prebuilt(
                         let epilogue_bytes: usize = epilogue.iter()
                             .filter_map(|ep| ep.outputs.first())
                             .filter_map(|&tid| graph.tensor(tid))
-                            .map(|t| t.shape.iter().map(|d| d.max_for_allocation(0)).product::<usize>() * t.dtype.size_bytes())
+                            .map(|t| t.shape.iter().map(|d| d.max_for_allocation_strict().unwrap_or(graph.max_seq_len)).product::<usize>() * t.dtype.size_bytes())
                             .sum();
                         if !can_inject_epilogue_with_budget(jit_ctx, epilogue_bytes) {
                             FusionMode::Standalone

@@ -273,10 +273,6 @@ impl HeteroPhasePlan {
 pub struct AbiPtrs {
     pub input_ptr: super::instr::VRegId,
     pub weight_ptr: Option<super::instr::VRegId>,
-    /// Weight ABI PtrExpr — always available regardless of weight_ptr VReg state.
-    /// Used by materialize to emit fresh LoadPtr from ABI stack slot for Weight sources,
-    /// avoiding stale physical register values after long loops.
-    pub weight_abi_expr: Option<super::instr::PtrExpr>,
     pub output_ptr: super::instr::VRegId,
     pub scratch_ptr: Option<super::instr::VRegId>,
     /// Generate loop counter VReg (mega-kernel only).

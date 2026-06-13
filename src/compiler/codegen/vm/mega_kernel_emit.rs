@@ -1170,7 +1170,6 @@ pub fn compile_mega_kernel_vm(
         // The embed gather reads this single token ID (not the full input_ids array).
         input_ptr: gen_input_ptr,
         weight_ptr: original_weight_vreg,
-        weight_abi_expr: original_weight_vreg.map(|original_weight_vreg| sym_map.resolve("weights").cloned().expect("ABI: weights")),
         output_ptr: output_reloaded,  // Reloaded each iteration from ABI stack
         scratch_ptr: if needs_scratch { Some(scratchpad_reloaded) } else { None },  // Reloaded each iteration
         gen_loop_counter: Some(gen_counter),
@@ -1225,7 +1224,7 @@ pub fn compile_mega_kernel_vm(
         callback_table_ptr: {
             // 拓扑驱动: 图有 SG ops (SgDetect/SgInject) → 加载 callback_table_ptr。
             // 无 SG ops → 无回调代码生成 → 无需加载 ABI 参数。
-            if topology.has_sg_ops {
+            if topology.sg_ops == super::topology::SgOpsPresence::Present {
                 let cb_ptr = prog.alloc_vreg(VRegKind::Ptr, SimdWidth::Scalar);
                 prog.emit(VmInstr::LoadPtr {
                     dst: cb_ptr,
@@ -1701,7 +1700,7 @@ pub fn compile_mega_kernel_vm(
             Some(hook_ptr)
         };
         let batch_cb_ptr = {
-            if topology.has_sg_ops {
+            if topology.sg_ops == super::topology::SgOpsPresence::Present {
                 let cb_ptr = prog.alloc_vreg(VRegKind::Ptr, SimdWidth::Scalar);
                 prog.emit(VmInstr::LoadPtr {
                     dst: cb_ptr,
@@ -1716,7 +1715,6 @@ pub fn compile_mega_kernel_vm(
         let mut batch_current_abi = AbiPtrs {
             input_ptr: batch_input_ptr,
             weight_ptr: Some(weight_ptr),
-            weight_abi_expr: Some(sym_map.resolve("weights").cloned().expect("ABI: weights")),
             output_ptr: batch_output_ptr,
             scratch_ptr: if needs_scratch { Some(scratchpad_ptr) } else { None },
             gen_loop_counter: None, // no generate loop in prefill
@@ -2015,7 +2013,6 @@ pub fn compile_mega_kernel_vm(
             let mut decode_abi = AbiPtrs {
                 input_ptr: decode_input_ptr,
                 weight_ptr: Some(weight_ptr),
-                weight_abi_expr: Some(sym_map.resolve("weights").cloned().expect("ABI: weights")),
                 output_ptr: decode_output_ptr,
                 scratch_ptr: if needs_scratch { Some(scratchpad_ptr) } else { None },
                 gen_loop_counter: None,

@@ -107,7 +107,7 @@ pub(crate) fn lower_fusion_plan_inner_with_sym_map(
 
     let needs_weight = topology.map_or_else(
         || plan.groups.iter().any(|g| graph.op(g.anchor).is_some_and(|op| op.inputs.len() > 1)),
-        |t| t.has_weight_ops,
+        |t| t.weight_source == super::topology::WeightSource::WeightRequired,
     );
     let weight_ptr = if needs_weight {
         prog.alloc_vreg(VRegKind::Ptr, SimdWidth::Scalar)
@@ -155,11 +155,6 @@ pub(crate) fn lower_fusion_plan_inner_with_sym_map(
     let mut current_abi = AbiPtrs {
         input_ptr,
         weight_ptr: original_weight_vreg,
-        weight_abi_expr: if needs_weight {
-            Some(ctx.sym_map.resolve("weights").cloned().expect("ABI: weights"))
-        } else {
-            None
-        },
         output_ptr,
         scratch_ptr: if needs_scratch { Some(scratch_base) } else { None },
         gen_loop_counter: None,

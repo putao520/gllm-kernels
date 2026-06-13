@@ -39,7 +39,6 @@ pub fn compile_layer_type_body(
     let tpl_abi = AbiPtrs {
         input_ptr: tpl_input,
         weight_ptr: Some(tpl_weight),
-        weight_abi_expr: None, // Template: no sym_map available; weight_ptr VReg is a placeholder
         output_ptr: tpl_output,
         scratch_ptr: Some(tpl_scratch),
         gen_loop_counter: None,

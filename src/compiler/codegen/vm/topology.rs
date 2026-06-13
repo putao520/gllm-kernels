@@ -61,6 +61,30 @@ pub enum KvCacheSource {
     MlaAttention,
 }
 
+/// SG ops presence — 从图 ops 推导.
+///
+/// ARCH-JIT-DATA-YIELDS: replaces `has_sg_ops: bool` with a semantic enum.
+/// Determines whether prologue emits callback_table_ptr load.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SgOpsPresence {
+    /// No SgDetect/SgInject ops in the graph — no callback_table_ptr needed.
+    None,
+    /// SgDetect/SgInject ops present — prologue must load callback_table_ptr.
+    Present,
+}
+
+/// Weight source — 从图 ops 推导.
+///
+/// ARCH-JIT-DATA-YIELDS: replaces `has_weight_ops: bool` with a semantic enum.
+/// Determines whether prologue emits weight_ptr load.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum WeightSource {
+    /// No weight-consuming ops (Gemm/Norm with weight) in the graph.
+    NoWeight,
+    /// Weight-consuming ops present — prologue must load weight_ptr.
+    WeightRequired,
+}
+
 /// 从 CompilerGraph 推导的编译控制流信息
 ///
 /// 编译器只看图 ops，不读任何外部配置。
@@ -81,11 +105,11 @@ pub struct GraphTopologyAnalysis {
 
     /// SG ops presence — from graph ops (SgDetect/SgInject).
     /// Used by prologue to decide whether to load callback_table_ptr.
-    pub has_sg_ops: bool,
+    pub sg_ops: SgOpsPresence,
 
-    /// Weight-consuming ops presence — from graph ops (Gemm/GemmBias/QuantGemm/RmsNorm/LayerNorm/HeadRmsNorm).
-    /// Used by prologue to decide whether to load weight_blob_ptr.
-    pub has_weight_ops: bool,
+    /// Weight source — from graph ops (Gemm/GemmBias/QuantGemm/RmsNorm/LayerNorm/HeadRmsNorm).
+    /// Used by prologue to decide whether to load weight_ptr.
+    pub weight_source: WeightSource,
 
     /// 词表大小 — 从 OpKind::Argmax { vocab_size } 推导。
     /// 图无 Argmax 时为 None。
@@ -203,8 +227,8 @@ impl GraphTopologyAnalysis {
             outer_loop_bound,
             seq_len_source,
             kv_cache_source,
-            has_sg_ops,
-            has_weight_ops,
+            sg_ops: if has_sg_ops { SgOpsPresence::Present } else { SgOpsPresence::None },
+            weight_source: if has_weight_ops { WeightSource::WeightRequired } else { WeightSource::NoWeight },
             vocab_size,
             logits_producer_op_idx,
             logits_output_tid,
@@ -315,7 +339,7 @@ mod tests {
 
         assert_eq!(topo.logits_producer_op_idx, Some(0));
         assert_eq!(topo.logits_output_tid, Some(gemm_out));
-        assert!(!topo.has_sg_ops);
+        assert_eq!(topo.sg_ops, SgOpsPresence::None);
     }
 
     #[test]
@@ -326,7 +350,7 @@ mod tests {
         ]);
         let topo = GraphTopologyAnalysis::analyze(&graph);
 
-        assert!(topo.has_sg_ops);
+        assert_eq!(topo.sg_ops, SgOpsPresence::Present);
         assert_eq!(topo.loop_topology, LoopTopology::SinglePass);
     }
 
@@ -337,16 +361,16 @@ mod tests {
         ]);
         let topo = GraphTopologyAnalysis::analyze(&graph);
 
-        assert!(!topo.has_sg_ops);
+        assert_eq!(topo.sg_ops, SgOpsPresence::None);
     }
 
     #[test]
-    fn has_weight_ops_detected_from_graph() {
+    fn weight_source_detected_from_graph() {
         let graph = make_test_graph(vec![
             OpKind::Gemm { m: SymDim::Concrete(1), n: 4096, k: 4096, dtype: DType::F32, trans_b: false },
         ]);
         let topo = GraphTopologyAnalysis::analyze(&graph);
-        assert!(topo.has_weight_ops);
+        assert_eq!(topo.weight_source, WeightSource::WeightRequired);
     }
 
     #[test]
@@ -355,6 +379,6 @@ mod tests {
             OpKind::ValueNorm { eps: 1e-6 },
         ]);
         let topo = GraphTopologyAnalysis::analyze(&graph);
-        assert!(!topo.has_weight_ops);
+        assert_eq!(topo.weight_source, WeightSource::NoWeight);
     }
 }

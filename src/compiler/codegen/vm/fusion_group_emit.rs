@@ -750,7 +750,6 @@ mod tests {
         AbiPtrs {
             input_ptr: VRegId(0),
             weight_ptr: Some(VRegId(1)),
-            weight_abi_expr: None,
             output_ptr: VRegId(2),
             scratch_ptr: Some(VRegId(3)),
             gen_loop_counter: None,
