@@ -42,6 +42,60 @@ pub(crate) fn lower_op_v2(
         Op::MultiHeadAttention(ref spec) => lower_attention_v2(prog, op, graph, ctx, resolver, abi, spec),
         // NOP variants — 元数据 op，不生成 VmInstr（与 dispatch_structural:236 等价）
         Op::Transpose { .. } | Op::Reshape { .. } | Op::SliceView { .. } => Ok(true),
+
+        // Generation control flow — 从 Op v2 路由，逻辑等价（unit 变体，无 Spec 参数）
+        Op::StoreToken => {
+            let token_ptr = resolver.materialize(prog, op.inputs[0], abi).ok_or_else(|| {
+                CompilerError::CodegenViolation(format!(
+                    "StoreToken op {:?}: token tensor 无法 materialize", op.id))
+            })?;
+            let counter = abi.gen_loop_counter.ok_or_else(|| {
+                CompilerError::CodegenViolation("StoreToken: gen_loop_counter is None".into())
+            })?;
+            let output_tokens_ptr = prog.alloc_vreg(VRegKind::Ptr, SimdWidth::Scalar);
+            prog.emit(VmInstr::LoadPtr {
+                dst: output_tokens_ptr,
+                src: ctx.session.sym_map.resolve("output_tokens_ptr").cloned().unwrap(),
+            });
+            let input_ids_ptr = prog.alloc_vreg(VRegKind::Ptr, SimdWidth::Scalar);
+            prog.emit(VmInstr::LoadPtr {
+                dst: input_ids_ptr,
+                src: ctx.session.sym_map.resolve("prompt_len").cloned().unwrap(),
+            });
+            let prompt_len_bytes = prog.alloc_vreg(VRegKind::Ptr, SimdWidth::Scalar);
+            prog.emit(VmInstr::LoadPtr {
+                dst: prompt_len_bytes,
+                src: ctx.session.sym_map.resolve("scratchpad").cloned().unwrap(),
+            });
+            prog.emit(VmInstr::StoreToken {
+                token_id: token_ptr, output_buf: output_tokens_ptr,
+                counter, input_ids_ptr, prompt_len_bytes,
+            });
+            Ok(true)
+        }
+        Op::CheckStopCondition => {
+            let token_ptr = resolver.materialize(prog, op.inputs[0], abi).ok_or_else(|| {
+                CompilerError::CodegenViolation(format!(
+                    "CheckStopCondition op {:?}: token tensor 无法 materialize", op.id))
+            })?;
+            let counter = abi.gen_loop_counter.ok_or_else(|| {
+                CompilerError::CodegenViolation("CheckStopCondition: gen_loop_counter is None".into())
+            })?;
+            let eos_ptr = prog.alloc_vreg(VRegKind::Ptr, SimdWidth::Scalar);
+            prog.emit(VmInstr::LoadPtr {
+                dst: eos_ptr,
+                src: ctx.session.sym_map.resolve("eos_token_id").cloned().unwrap(),
+            });
+            let max_tokens_ptr = prog.alloc_vreg(VRegKind::Ptr, SimdWidth::Scalar);
+            prog.emit(VmInstr::LoadPtr {
+                dst: max_tokens_ptr,
+                src: ctx.session.sym_map.resolve("max_new_tokens").cloned().unwrap(),
+            });
+            prog.emit(VmInstr::CheckStopCondition {
+                token_id: token_ptr, counter, eos_ptr, max_tokens_ptr,
+            });
+            Ok(true)
+        }
         Op::HeadRmsNorm { .. } => Ok(false),
         _ => Ok(false), // 其他类别走现有路径（Phase 6-7 续迁移）
     }
