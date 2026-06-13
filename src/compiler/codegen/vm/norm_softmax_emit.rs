@@ -6,6 +6,21 @@ use crate::compiler::trace::{ComputePattern, QuantPrecision, ReduceKind, TraceOp
 use crate::compiler::graph;
 use crate::types::CompilerError;
 
+/// Norm variant — derived from OpKind, replaces `has_weight: bool`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NormKind {
+    RmsNorm,
+    LayerNorm,
+    HeadRmsNorm,
+    ValueNorm,
+}
+
+impl NormKind {
+    pub fn has_weight(&self) -> bool {
+        *self != NormKind::ValueNorm
+    }
+}
+
 // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 // §13.N NormLike 自动指令选择 (ARCH-AUTO-INSTR-SELECT Phase A)
 // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -18,7 +33,7 @@ use crate::types::CompilerError;
 /// `groups_per_row` = 1 时退化为标准 RmsNorm/ValueNorm。
 /// `groups_per_row` > 1 时为 HeadRmsNorm/QkNorm 的 per-head 归一化。
 ///
-/// `has_weight` = false 时 transform 不读 weight_ptr（ValueNorm/QkNorm 语义）。
+/// `norm_kind` = ValueNorm 时 transform 不读 weight_ptr。
 /// `broadcast_weight` = true 时所有 group 共享同一份 weight[feature_dim]。
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn emit_normlike_inline(
@@ -27,7 +42,7 @@ pub(crate) fn emit_normlike_inline(
     feature_dim: usize,
     groups_per_row: usize,
     broadcast_weight: bool,
-    has_weight: bool,
+    norm_kind: NormKind,
     width: SimdWidth,
     seq_bound: BoundExpr,
     input_ptr: VRegId,
@@ -79,7 +94,7 @@ pub(crate) fn emit_normlike_inline(
         let body = |prog: &mut VmProgram, _g_ctr: VRegId, group_off: VRegId| {
             prog.emit(VmInstr::LoadPtr { dst: row_input, src: PtrExpr::VRegPlusVReg(outer_input, group_off) });
             prog.emit(VmInstr::LoadPtr { dst: row_output, src: PtrExpr::VRegPlusVReg(outer_output, group_off) });
-            if has_weight {
+            if norm_kind.has_weight() {
                 if broadcast_weight {
                     prog.emit(VmInstr::LoadPtr { dst: row_weight, src: PtrExpr::VRegPlusConst(weight_ptr, 0) });
                 } else {
@@ -89,7 +104,7 @@ pub(crate) fn emit_normlike_inline(
             emit_normlike_one_group(
                 prog, reduce, finalize, transform,
                 feature_dim, vec_count, step_bytes, elem, lanes, width,
-                has_weight, acc, temp, scale, dim_bc,
+                norm_kind.has_weight(), acc, temp, scale, dim_bc,
                 row_input, row_weight, row_output, dtype,
             );
         };
@@ -97,16 +112,15 @@ pub(crate) fn emit_normlike_inline(
         if groups_per_row > 1 {
             prog.emit_loop(BoundExpr::Const(groups_per_row), row_bytes, body);
         } else {
-            // groups_per_row=1: avoid extra LoopBegin/LoopEnd, direct call with group_off=0
             prog.emit(VmInstr::LoadPtr { dst: row_input, src: PtrExpr::VRegPlusConst(outer_input, 0) });
             prog.emit(VmInstr::LoadPtr { dst: row_output, src: PtrExpr::VRegPlusConst(outer_output, 0) });
-            if has_weight {
+            if norm_kind.has_weight() {
                 prog.emit(VmInstr::LoadPtr { dst: row_weight, src: PtrExpr::VRegPlusConst(weight_ptr, 0) });
             }
             emit_normlike_one_group(
                 prog, reduce, finalize, transform,
                 feature_dim, vec_count, step_bytes, elem, lanes, width,
-                has_weight, acc, temp, scale, dim_bc,
+                norm_kind.has_weight(), acc, temp, scale, dim_bc,
                 row_input, row_weight, row_output, dtype,
             );
         }
@@ -606,7 +620,7 @@ mod tests {
 
         // Act
         let result = emit_normlike_inline(
-            &mut prog, &pattern, 64, 1, false, true,
+            &mut prog, &pattern, 64, 1, false, NormKind::RmsNorm,
             SimdWidth::W256, BoundExpr::Const(1),
             input_ptr, weight_ptr, output_ptr, QuantPrecision::F32,
         );
@@ -631,7 +645,7 @@ mod tests {
 
         // Act: SimdWidth::Scalable has f32_lanes() == 0
         let result = emit_normlike_inline(
-            &mut prog, &pattern, 64, 1, false, true,
+            &mut prog, &pattern, 64, 1, false, NormKind::RmsNorm,
             SimdWidth::Scalable, BoundExpr::Const(1),
             input_ptr, weight_ptr, output_ptr, QuantPrecision::F32,
         );
@@ -655,7 +669,7 @@ mod tests {
 
         // Act: feature_dim = 0
         let result = emit_normlike_inline(
-            &mut prog, &pattern, 0, 1, false, true,
+            &mut prog, &pattern, 0, 1, false, NormKind::RmsNorm,
             SimdWidth::W256, BoundExpr::Const(1),
             input_ptr, weight_ptr, output_ptr, QuantPrecision::F32,
         );
@@ -679,7 +693,7 @@ mod tests {
 
         // Act: groups_per_row = 0
         let result = emit_normlike_inline(
-            &mut prog, &pattern, 64, 0, false, true,
+            &mut prog, &pattern, 64, 0, false, NormKind::RmsNorm,
             SimdWidth::W256, BoundExpr::Const(1),
             input_ptr, weight_ptr, output_ptr, QuantPrecision::F32,
         );
@@ -704,7 +718,7 @@ mod tests {
 
         // Act
         let result = emit_normlike_inline(
-            &mut prog, &pattern, 64, 1, false, true,
+            &mut prog, &pattern, 64, 1, false, NormKind::RmsNorm,
             SimdWidth::W256, BoundExpr::Const(2),
             input_ptr, weight_ptr, output_ptr, QuantPrecision::F32,
         );
@@ -730,7 +744,7 @@ mod tests {
 
         // Act: groups_per_row=4 simulates per-head normalization (e.g., QkNorm)
         let result = emit_normlike_inline(
-            &mut prog, &pattern, 64, 4, false, false,
+            &mut prog, &pattern, 64, 4, false, NormKind::ValueNorm,
             SimdWidth::W256, BoundExpr::Const(1),
             input_ptr, weight_ptr, output_ptr, QuantPrecision::F32,
         );
@@ -910,7 +924,7 @@ mod tests {
 
         // Act: groups_per_row=4, broadcast_weight=true, has_weight=true
         let result = emit_normlike_inline(
-            &mut prog, &pattern, 32, 4, true, true,
+            &mut prog, &pattern, 32, 4, true, NormKind::HeadRmsNorm,
             SimdWidth::W256, BoundExpr::Const(1),
             input_ptr, weight_ptr, output_ptr, QuantPrecision::F32,
         );
@@ -935,7 +949,7 @@ mod tests {
 
         // Act: has_weight=false, groups_per_row=1
         let result = emit_normlike_inline(
-            &mut prog, &pattern, 64, 1, false, false,
+            &mut prog, &pattern, 64, 1, false, NormKind::ValueNorm,
             SimdWidth::W256, BoundExpr::Const(1),
             input_ptr, weight_ptr, output_ptr, QuantPrecision::F32,
         );
@@ -960,7 +974,7 @@ mod tests {
 
         // Act: feature_dim=3 is less than 8 lanes, vec_count=0
         let result = emit_normlike_inline(
-            &mut prog, &pattern, 3, 1, false, true,
+            &mut prog, &pattern, 3, 1, false, NormKind::RmsNorm,
             SimdWidth::W256, BoundExpr::Const(1),
             input_ptr, weight_ptr, output_ptr, QuantPrecision::F32,
         );
@@ -984,7 +998,7 @@ mod tests {
 
         // Act: feature_dim=10, W128 => vec_count=2, tail=2
         let result = emit_normlike_inline(
-            &mut prog, &pattern, 10, 1, false, true,
+            &mut prog, &pattern, 10, 1, false, NormKind::RmsNorm,
             SimdWidth::W128, BoundExpr::Const(1),
             input_ptr, weight_ptr, output_ptr, QuantPrecision::F32,
         );
@@ -1213,7 +1227,7 @@ mod tests {
 
         // Act: Symbolic bound tests dynamic seq_len code path
         let result = emit_normlike_inline(
-            &mut prog, &pattern, 64, 1, false, true,
+            &mut prog, &pattern, 64, 1, false, NormKind::RmsNorm,
             SimdWidth::W256, sym_bound,
             input_ptr, weight_ptr, output_ptr, QuantPrecision::F32,
         );
@@ -1262,7 +1276,7 @@ mod tests {
 
         // Act: BF16 dtype with non-aligned feature_dim
         let result = emit_normlike_inline(
-            &mut prog, &pattern, 12, 1, false, true,
+            &mut prog, &pattern, 12, 1, false, NormKind::RmsNorm,
             SimdWidth::W256, BoundExpr::Const(1),
             input_ptr, weight_ptr, output_ptr, QuantPrecision::BF16,
         );
@@ -1403,7 +1417,7 @@ mod tests {
 
         // Act: groups_per_row=3, broadcast_weight=false, has_weight=true
         let result = emit_normlike_inline(
-            &mut prog, &pattern, 24, 3, false, true,
+            &mut prog, &pattern, 24, 3, false, NormKind::RmsNorm,
             SimdWidth::W256, BoundExpr::Const(2),
             input_ptr, weight_ptr, output_ptr, QuantPrecision::F32,
         );
@@ -1495,7 +1509,7 @@ mod tests {
 
         // Act
         let result = emit_normlike_inline(
-            &mut prog, &pattern, 1, 1, false, true,
+            &mut prog, &pattern, 1, 1, false, NormKind::RmsNorm,
             SimdWidth::W256, BoundExpr::Const(1),
             input_ptr, weight_ptr, output_ptr, QuantPrecision::F32,
         );
@@ -1698,7 +1712,7 @@ mod tests {
 
         // Act: groups_per_row=1, has_weight=false → direct path, no group loop, no weight loads
         let result = emit_normlike_inline(
-            &mut prog, &pattern, 64, 1, false, false,
+            &mut prog, &pattern, 64, 1, false, NormKind::ValueNorm,
             SimdWidth::W256, BoundExpr::Const(3),
             input_ptr, weight_ptr, output_ptr, QuantPrecision::F32,
         );
@@ -1798,7 +1812,7 @@ mod tests {
 
         // Act: Symbolic outer + 2 groups per row
         let result = emit_normlike_inline(
-            &mut prog, &pattern, 16, 2, false, false,
+            &mut prog, &pattern, 16, 2, false, NormKind::ValueNorm,
             SimdWidth::W256, sym_bound,
             input_ptr, weight_ptr, output_ptr, QuantPrecision::F32,
         );
@@ -1824,7 +1838,7 @@ mod tests {
 
         // Act: groups=1, broadcast_weight=true, has_weight=true, direct code path
         let result = emit_normlike_inline(
-            &mut prog, &pattern, 32, 1, true, true,
+            &mut prog, &pattern, 32, 1, true, NormKind::HeadRmsNorm,
             SimdWidth::W256, BoundExpr::Const(2),
             input_ptr, weight_ptr, output_ptr, QuantPrecision::F32,
         );
@@ -2011,7 +2025,7 @@ mod tests {
 
         // Act
         let result = emit_normlike_inline(
-            &mut prog, &pattern, 24, 1, false, true,
+            &mut prog, &pattern, 24, 1, false, NormKind::RmsNorm,
             SimdWidth::W512, BoundExpr::Const(2),
             input_ptr, weight_ptr, output_ptr, QuantPrecision::F32,
         );
@@ -2037,7 +2051,7 @@ mod tests {
 
         // Act: broadcast_weight=true but has_weight=false, groups=1 direct path
         let result = emit_normlike_inline(
-            &mut prog, &pattern, 16, 1, true, false,
+            &mut prog, &pattern, 16, 1, true, NormKind::ValueNorm,
             SimdWidth::W256, BoundExpr::Const(1),
             input_ptr, weight_ptr, output_ptr, QuantPrecision::F32,
         );
@@ -2062,7 +2076,7 @@ mod tests {
 
         // Act: feature_dim=3 => vec_count=0, only outer seq loop + scalar tail ops
         emit_normlike_inline(
-            &mut prog, &pattern, 3, 1, false, true,
+            &mut prog, &pattern, 3, 1, false, NormKind::RmsNorm,
             SimdWidth::W256, BoundExpr::Const(1),
             input_ptr, weight_ptr, output_ptr, QuantPrecision::F32,
         ).unwrap();
@@ -2087,7 +2101,7 @@ mod tests {
         let w256 = prog_256.alloc_vreg(VRegKind::Ptr, SimdWidth::Scalar);
         let o256 = prog_256.alloc_vreg(VRegKind::Ptr, SimdWidth::Scalar);
         emit_normlike_inline(
-            &mut prog_256, &pattern, feature_dim, 1, false, true,
+            &mut prog_256, &pattern, feature_dim, 1, false, NormKind::RmsNorm,
             SimdWidth::W256, BoundExpr::Const(1),
             i256, w256, o256, QuantPrecision::F32,
         ).unwrap();
@@ -2097,7 +2111,7 @@ mod tests {
         let w512 = prog_512.alloc_vreg(VRegKind::Ptr, SimdWidth::Scalar);
         let o512 = prog_512.alloc_vreg(VRegKind::Ptr, SimdWidth::Scalar);
         emit_normlike_inline(
-            &mut prog_512, &pattern, feature_dim, 1, false, true,
+            &mut prog_512, &pattern, feature_dim, 1, false, NormKind::RmsNorm,
             SimdWidth::W512, BoundExpr::Const(1),
             i512, w512, o512, QuantPrecision::F32,
         ).unwrap();
@@ -2138,7 +2152,7 @@ mod tests {
 
         // Act: feature_dim=64, W256 => vec_count=8, requires inner vec loop
         emit_normlike_inline(
-            &mut prog, &pattern, 64, 1, false, true,
+            &mut prog, &pattern, 64, 1, false, NormKind::RmsNorm,
             SimdWidth::W256, BoundExpr::Const(2),
             input_ptr, weight_ptr, output_ptr, QuantPrecision::F32,
         ).unwrap();
@@ -2185,7 +2199,7 @@ mod tests {
 
         // Act
         emit_normlike_inline(
-            &mut prog, &pattern, 32, 1, false, true,
+            &mut prog, &pattern, 32, 1, false, NormKind::RmsNorm,
             SimdWidth::W256, BoundExpr::Const(1),
             input_ptr, weight_ptr, output_ptr, QuantPrecision::F32,
         ).unwrap();
@@ -2209,7 +2223,7 @@ mod tests {
 
         // Act: BF16 dtype with aligned feature_dim=16
         emit_normlike_inline(
-            &mut prog, &pattern, 16, 1, false, true,
+            &mut prog, &pattern, 16, 1, false, NormKind::RmsNorm,
             SimdWidth::W256, BoundExpr::Const(1),
             input_ptr, weight_ptr, output_ptr, QuantPrecision::BF16,
         ).unwrap();
@@ -2292,7 +2306,7 @@ mod tests {
 
         // Act: groups_per_row=3, feature_dim=24, Const(1) seq bound
         emit_normlike_inline(
-            &mut prog, &pattern, 24, 3, false, true,
+            &mut prog, &pattern, 24, 3, false, NormKind::RmsNorm,
             SimdWidth::W256, BoundExpr::Const(1),
             input_ptr, weight_ptr, output_ptr, QuantPrecision::F32,
         ).unwrap();
@@ -2306,7 +2320,7 @@ mod tests {
         let w1 = prog_g1.alloc_vreg(VRegKind::Ptr, SimdWidth::Scalar);
         let o1 = prog_g1.alloc_vreg(VRegKind::Ptr, SimdWidth::Scalar);
         emit_normlike_inline(
-            &mut prog_g1, &pattern, 24, 1, false, true,
+            &mut prog_g1, &pattern, 24, 1, false, NormKind::RmsNorm,
             SimdWidth::W256, BoundExpr::Const(1),
             i1, w1, o1, QuantPrecision::F32,
         ).unwrap();
@@ -2357,7 +2371,7 @@ mod tests {
 
         // Act: feature_dim=32, W256 => vec_count=4, tail=0
         emit_normlike_inline(
-            &mut prog, &pattern, 32, 1, false, true,
+            &mut prog, &pattern, 32, 1, false, NormKind::RmsNorm,
             SimdWidth::W256, BoundExpr::Const(1),
             input_ptr, weight_ptr, output_ptr, QuantPrecision::F32,
         ).unwrap();
@@ -2544,7 +2558,7 @@ mod tests {
 
         // Act: groups_per_row=8, feature_dim=64 (8 bytes per group), exercises per-group LoadPtr
         emit_normlike_inline(
-            &mut prog, &pattern, 64, 8, false, true,
+            &mut prog, &pattern, 64, 8, false, NormKind::RmsNorm,
             SimdWidth::W256, BoundExpr::Const(1),
             input_ptr, weight_ptr, output_ptr, QuantPrecision::F32,
         ).unwrap();

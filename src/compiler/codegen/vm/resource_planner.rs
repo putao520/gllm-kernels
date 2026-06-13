@@ -710,10 +710,17 @@ pub fn plan_mega_kernel_resources(
 /// - 模型配置常量 (hidden_dim, num_heads)
 fn derive_loop_invariants_from_graph(graph: &CompilerGraph, hidden_dim: usize) -> Vec<LoopInvariant> {
     let mut invariants = Vec::new();
+    let mut has_rope = false;
+    let mut has_packed = false;
 
-    let has_rope = graph.ops.iter().any(|op| {
-        matches!(op.kind, OpKind::RoPE { .. })
-    });
+    for op in &graph.ops {
+        match &op.kind {
+            OpKind::RoPE { .. } => has_rope = true,
+            OpKind::QuantGemm { .. } | OpKind::Gather { .. } => has_packed = true,
+            _ => {}
+        }
+    }
+
     if has_rope {
         invariants.push(LoopInvariant {
             kind: InvariantKind::RopeTablePtr,
@@ -731,12 +738,6 @@ fn derive_loop_invariants_from_graph(graph: &CompilerGraph, hidden_dim: usize) -
         computation: InvariantComputation::LoadImm(hidden_dim as u64),
     });
 
-    let has_packed = graph.ops.iter().any(|op| {
-        matches!(op.kind,
-            OpKind::QuantGemm { .. }
-            | OpKind::Gather { .. }
-        )
-    });
     if has_packed {
         invariants.push(LoopInvariant {
             kind: InvariantKind::PackMapBase,

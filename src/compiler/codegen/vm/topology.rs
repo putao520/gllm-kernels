@@ -79,6 +79,10 @@ pub struct GraphTopologyAnalysis {
     /// KV cache source — from graph ops (MHA/CachedGQA/MLA presence).
     pub kv_cache_source: KvCacheSource,
 
+    /// SG ops presence — from graph ops (SgDetect/SgInject).
+    /// Used by prologue to decide whether to load callback_table_ptr.
+    pub has_sg_ops: bool,
+
     /// 词表大小 — 从 OpKind::Argmax { vocab_size } 推导。
     /// 图无 Argmax 时为 None。
     pub vocab_size: Option<usize>,
@@ -104,10 +108,36 @@ pub struct GraphTopologyAnalysis {
 
 impl GraphTopologyAnalysis {
     /// 从 CompilerGraph 推导拓扑信息。
+    ///
+    /// 单遍遍历：一次扫描收集所有拓扑属性，替代多次 `graph.ops.iter().any()`。
     pub fn analyze(graph: &CompilerGraph) -> Self {
-        let has_argmax = graph.ops.iter().any(|op| matches!(op.kind, OpKind::Argmax { .. }));
-        let has_store_token = graph.ops.iter().any(|op| matches!(op.kind, OpKind::StoreToken));
-        let has_check_stop = graph.ops.iter().any(|op| matches!(op.kind, OpKind::CheckStopCondition));
+        // ── 单遍遍历收集所有 OpKind 存在性标记 ──
+        let mut has_argmax = false;
+        let mut has_store_token = false;
+        let mut has_check_stop = false;
+        let mut has_mha = false;
+        let mut has_cached_gqa = false;
+        let mut has_mla = false;
+        let mut has_sg_ops = false;
+        let mut vocab_size: Option<usize> = None;
+        let mut argmax_input_tid: Option<TensorId> = None;
+
+        for op in &graph.ops {
+            match &op.kind {
+                OpKind::Argmax { vocab_size: vs } => {
+                    has_argmax = true;
+                    vocab_size = Some(*vs);
+                    argmax_input_tid = op.inputs.first().copied();
+                }
+                OpKind::StoreToken => has_store_token = true,
+                OpKind::CheckStopCondition => has_check_stop = true,
+                OpKind::MultiHeadAttention { .. } => has_mha = true,
+                OpKind::CachedGQA { .. } => has_cached_gqa = true,
+                OpKind::MlaAttention { .. } => has_mla = true,
+                OpKind::SgDetect { .. } | OpKind::SgInject { .. } => has_sg_ops = true,
+                _ => {}
+            }
+        }
 
         let is_generate = has_argmax && has_store_token && has_check_stop;
         let loop_topology = if is_generate { LoopTopology::GenerateLoop } else { LoopTopology::SinglePass };
@@ -124,10 +154,7 @@ impl GraphTopologyAnalysis {
             SeqLenSource::PromptLen
         };
 
-        // kv_cache_source: from attention op presence
-        let has_mha = graph.ops.iter().any(|op| matches!(op.kind, OpKind::MultiHeadAttention { .. }));
-        let has_cached_gqa = graph.ops.iter().any(|op| matches!(op.kind, OpKind::CachedGQA { .. }));
-        let has_mla = graph.ops.iter().any(|op| matches!(op.kind, OpKind::MlaAttention { .. }));
+        // kv_cache_source: from attention op presence (single-pass derived)
         let kv_cache_source = if has_cached_gqa {
             KvCacheSource::CachedGqa
         } else if has_mla {
@@ -138,23 +165,9 @@ impl GraphTopologyAnalysis {
             KvCacheSource::NoCache
         };
 
-        let vocab_size = graph.ops.iter().find_map(|op| {
-            match op.kind {
-                OpKind::Argmax { vocab_size } => Some(vocab_size),
-                _ => None,
-            }
-        });
-
         // logits_producer: Argmax 的直接前驱 op 索引
-        let logits_producer_op_idx = if has_argmax {
-            let argmax_idx = graph.ops.iter().position(|op| matches!(op.kind, OpKind::Argmax { .. }));
-            argmax_idx.and_then(|ai| {
-                if let Some(&argmax_input_tid) = graph.ops.get(ai)?.inputs.first() {
-                    graph.ops.iter().position(|op| op.outputs.contains(&argmax_input_tid))
-                } else {
-                    None
-                }
-            })
+        let logits_producer_op_idx = if let Some(target_tid) = argmax_input_tid {
+            graph.ops.iter().position(|op| op.outputs.contains(&target_tid))
         } else {
             None
         };
@@ -182,6 +195,7 @@ impl GraphTopologyAnalysis {
             outer_loop_bound,
             seq_len_source,
             kv_cache_source,
+            has_sg_ops,
             vocab_size,
             logits_producer_op_idx,
             logits_output_tid,
@@ -292,5 +306,28 @@ mod tests {
 
         assert_eq!(topo.logits_producer_op_idx, Some(0));
         assert_eq!(topo.logits_output_tid, Some(gemm_out));
+        assert!(!topo.has_sg_ops);
+    }
+
+    #[test]
+    fn sg_ops_detected_from_graph() {
+        let graph = make_test_graph(vec![
+            OpKind::SgDetect { detect_offset: 0 },
+            OpKind::SgInject { knowledge_offset: 0, dim: 256 },
+        ]);
+        let topo = GraphTopologyAnalysis::analyze(&graph);
+
+        assert!(topo.has_sg_ops);
+        assert_eq!(topo.loop_topology, LoopTopology::SinglePass);
+    }
+
+    #[test]
+    fn no_sg_ops_in_plain_graph() {
+        let graph = make_test_graph(vec![
+            OpKind::Gemm { m: SymDim::Concrete(1), n: 4096, k: 4096, dtype: DType::F32, trans_b: false },
+        ]);
+        let topo = GraphTopologyAnalysis::analyze(&graph);
+
+        assert!(!topo.has_sg_ops);
     }
 }

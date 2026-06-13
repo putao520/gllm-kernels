@@ -314,7 +314,7 @@ impl ComputeDensity {
         let mut total_bytes: u64 = 0;
         for &op_id in &group.ops {
             let op = graph.op(op_id)?;
-            total_flops += estimate_group_op_flops(op);
+            total_flops += estimate_group_op_flops(op, graph.max_seq_len);
             for &tid in op.inputs.iter().chain(op.outputs.iter()) {
                 if let Some(t) = graph.tensor(tid) {
                     total_bytes += t.concrete_bytes() as u64;
@@ -330,13 +330,13 @@ impl ComputeDensity {
 
 /// Estimate FLOPs for a single op within a fusion group.
 /// GEMM variants: 2*M*N*K. Others: 0 (negligible for roofline classification).
-fn estimate_group_op_flops(op: &crate::compiler::graph::CompilerOp) -> u64 {
+fn estimate_group_op_flops(op: &crate::compiler::graph::CompilerOp, max_seq_len: usize) -> u64 {
     use crate::compiler::graph::OpKind;
     match &op.kind {
         OpKind::Gemm { m, n, k, .. }
         | OpKind::GemmBias { m, n, k, .. }
         | OpKind::QuantGemm { m, n, k, .. } => {
-            2 * (m.max_for_allocation(0) as u64) * (*n as u64) * (*k as u64)
+            2 * (m.max_for_allocation_strict().unwrap_or(max_seq_len) as u64) * (*n as u64) * (*k as u64)
         }
         _ => 0,
     }

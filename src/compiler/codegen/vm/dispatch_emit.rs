@@ -16,6 +16,7 @@ use super::quant_gather_emit::emit_quant_gather_inline;
 use super::norm_softmax_emit::{
     emit_normlike_inline, emit_layernorm_auto,
     emit_softmax_inline, emit_softmax_telemetry,
+    NormKind,
 };
 use super::vision_audio_emit::{
     lower_depthwise_conv1d, lower_patch_embed,
@@ -955,11 +956,15 @@ pub(crate) fn dispatch_compute_pattern(
                             } else {
                                 resolve_sym_dim(&seq_dim, abi, sym_map)
                             };
-                            let has_weight = !matches!(op.kind, OpKind::ValueNorm { .. });
+                            let norm_kind = match op.kind {
+                                OpKind::RmsNorm { .. } => NormKind::RmsNorm,
+                                OpKind::ValueNorm { .. } => NormKind::ValueNorm,
+                                _ => unreachable!(),
+                            };
                             let pattern = build_norm_pattern(op)?;
                             emit_normlike_inline(
                                 prog, &pattern, feature_dim, /*groups_per_row=*/1,
-                                /*broadcast_weight=*/false, has_weight,
+                                /*broadcast_weight=*/false, norm_kind,
                                 width, seq_bound, input_ptr, weight_ptr, output_ptr,
                                 ctx.dtype,
                             )?;
@@ -1021,7 +1026,7 @@ pub(crate) fn dispatch_compute_pattern(
                             let pattern = build_norm_pattern_qk(*eps, head_dim_v)?;
                             emit_normlike_inline(
                                 prog, &pattern, head_dim_v, num_heads,
-                                /*broadcast_weight=*/false, /*has_weight=*/false,
+                                /*broadcast_weight=*/false, NormKind::ValueNorm,
                                 width, seq_bound, input_ptr, weight_ptr, output_ptr,
                                 ctx.dtype,
                             )?;
@@ -1055,7 +1060,7 @@ pub(crate) fn dispatch_compute_pattern(
                             let pattern = build_norm_pattern_head_rms(*eps)?;
                             emit_normlike_inline(
                                 prog, &pattern, head_dim_v, num_heads,
-                                /*broadcast_weight=*/true, /*has_weight=*/true,
+                                /*broadcast_weight=*/true, NormKind::HeadRmsNorm,
                                 width, seq_bound, input_ptr, weight_ptr, output_ptr,
                                 ctx.dtype,
                             )?;
@@ -1066,7 +1071,7 @@ pub(crate) fn dispatch_compute_pattern(
                                 .clone()
                                 .unwrap_or(BoundExpr::Const(1));
                             emit_normlike_inline(
-                                prog, &trace.pattern, *hidden, 1, false, false,
+                                prog, &trace.pattern, *hidden, 1, false, NormKind::ValueNorm,
                                 width, seq_bound, input_ptr, weight_ptr, output_ptr,
                                 ctx.dtype,
                             )?;

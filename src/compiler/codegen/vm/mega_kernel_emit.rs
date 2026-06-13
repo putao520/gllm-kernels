@@ -1225,12 +1225,9 @@ pub fn compile_mega_kernel_vm(
             }
         },
         callback_table_ptr: {
-            // Only load callback_table_ptr if the graph has SG ops (SgDetect/SgInject).
-            // Without SG, no callback code is emitted → no need to load the ABI arg.
-            let has_sg = graph.ops.iter().any(|op| {
-                matches!(op.kind, OpKind::SgDetect { .. } | OpKind::SgInject { .. })
-            });
-            if has_sg {
+            // 拓扑驱动: 图有 SG ops (SgDetect/SgInject) → 加载 callback_table_ptr。
+            // 无 SG ops → 无回调代码生成 → 无需加载 ABI 参数。
+            if topology.has_sg_ops {
                 let cb_ptr = prog.alloc_vreg(VRegKind::Ptr, SimdWidth::Scalar);
                 prog.emit(VmInstr::LoadPtr {
                     dst: cb_ptr,
@@ -1242,12 +1239,9 @@ pub fn compile_mega_kernel_vm(
             }
         },
         page_table_ptr: {
-            // Load page_table_ptr from ABI arg 21 ([rbp+136]).
+            // 拓扑驱动: 图有 KV cache ops (MHA/CachedGQA/MLA) → 加载 page_table_ptr。
             // NULL = contiguous KV, u32[] = paged KV.
-            let has_mha = graph.ops.iter().any(|op| {
-                matches!(op.kind, OpKind::MultiHeadAttention { .. })
-            });
-            if has_mha {
+            if topology.kv_cache_source != KvCacheSource::NoCache {
                 let pt_ptr = prog.alloc_vreg(VRegKind::Ptr, SimdWidth::Scalar);
                 prog.emit(VmInstr::LoadPtr {
                     dst: pt_ptr,

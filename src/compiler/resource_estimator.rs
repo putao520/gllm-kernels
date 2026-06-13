@@ -60,7 +60,7 @@ pub fn estimate_tile_resource_bytes(
             if let Some(tensor) = graph.tensor(out_tid) {
                 let elem_bytes = tensor.dtype.size_bytes();
                 let total_elems: usize = tensor.shape.iter()
-                    .map(|d| d.max_for_allocation(0))
+                    .map(|d| d.max_for_allocation_strict().unwrap_or(graph.max_seq_len))
                     .product();
                 return total_elems * elem_bytes;
             }
@@ -71,7 +71,7 @@ pub fn estimate_tile_resource_bytes(
     if let Some(anchor_op) = graph.op(anchor) {
         match &anchor_op.kind {
             OpKind::Gemm { m, n, .. } | OpKind::GemmBias { m, n, .. } | OpKind::QuantGemm { m, n, .. } => {
-                let m_val = m.max_for_allocation(0);
+                let m_val = m.max_for_allocation_strict().unwrap_or(graph.max_seq_len);
                 let tile_rows = m_val.min(64);
                 return tile_rows * n * 4;
             }
@@ -228,7 +228,7 @@ fn estimate_tile_rows(graph: &CompilerGraph, anchor: OpId) -> usize {
         match &op.kind {
             OpKind::Gemm { m, .. } | OpKind::GemmBias { m, .. } | OpKind::QuantGemm { m, .. } => {
                 // MC = min(m, 64) — typical L1 blocking factor
-                return m.max_for_allocation(0).min(64);
+                return m.max_for_allocation_strict().unwrap_or(graph.max_seq_len).min(64);
             }
             _ => {}
         }

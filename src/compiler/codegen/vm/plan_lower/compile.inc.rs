@@ -623,10 +623,16 @@ fn try_dispatch_normlike(
         .cloned()
         .or_else(|| out_shape.first().map(|d| ctx.sym_map.to_bound(d)))
         .unwrap_or(BoundExpr::Const(1));
-    let has_weight = matches!(op.kind, OpKind::RmsNorm { .. } | OpKind::HeadRmsNorm { .. });
+    let norm_kind = match &op.kind {
+        OpKind::RmsNorm { .. } => NormKind::RmsNorm,
+        OpKind::HeadRmsNorm { .. } => NormKind::HeadRmsNorm,
+        OpKind::LayerNorm { .. } => NormKind::LayerNorm,
+        OpKind::ValueNorm { .. } => NormKind::ValueNorm,
+        _ => NormKind::RmsNorm,
+    };
     emit_normlike_inline(
         prog, pattern, feature_dim, /*groups_per_row=*/1,
-        /*broadcast_weight=*/false, has_weight,
+        /*broadcast_weight=*/false, norm_kind,
         ctx.width, seq_bound, input_ptr, weight_ptr, output_ptr,
         ctx.dtype,
     )?;
