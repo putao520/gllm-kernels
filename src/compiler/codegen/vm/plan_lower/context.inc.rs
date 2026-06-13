@@ -3,48 +3,59 @@
 // §0.1 编译会话共享状态
 // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
-/// 编译会话共享状态 — 持有 lowering 过程中不变的硬件/配置信息。
+/// 编译会话级共享状态 — 持有 lowering 过程中不变的硬件/配置信息。
+///
+/// 从 LoweringContext 中提取出来的全局常量字段。
+/// 注意：AbiPtrs 不在此处，因为它包含运行时分配的 VReg，
+/// 需要在 VmProgram 分配 VReg 之后才能构造。
+pub struct CompileSession<'a> {
+    /// SIMD 宽度（硬件全局）
+    pub width: SimdWidth,
+    /// SymDim slot 映射（编译会话级）
+    pub sym_map: &'a SymDimSlotMap,
+    /// 标量算子注册表
+    pub registry: Option<&'a ScalarOpRegistry>,
+    /// ISA hook
+    pub hook: Option<&'a dyn super::isa_hook::IsaHook>,
+    /// 资源预算
+    pub budget: Option<super::isa_hook::ResourceBudget>,
+    /// PagedAttention page size
+    pub page_size: usize,
+    /// Hardware dot-product capability
+    pub dot_cap: DotProductCap,
+    /// KV cache element bytes
+    pub kv_elem_bytes: usize,
+    /// JIT debug instrumentation
+    pub debug_jit: bool,
+    /// 虚拟化映射
+    pub virtual_activation: Option<&'a VirtualActivationMap>,
+    pub virtual_tensor_map: Option<&'a VirtualTensorMap>,
+    pub layout: Option<&'a crate::compiler::layout_negotiator::LayoutAssignment>,
+    /// §20 BCI batch_ctx_ptr
+    pub batch_ctx_ptr: Option<VRegId>,
+}
+
+/// Op-local 状态 — 持有每个 op 不同的局部状态 + 引用 CompileSession。
 ///
 /// 替代 emit_fusion_groups/emit_standalone_op 中 16+ 参数的重复传递。
 /// 局部参数（prog, op, input_ptr, weight_ptr, output_ptr 等）仍作为函数参数。
+///
+/// 通过 &'a CompileSession<'a> 引用会话级状态，保持单生命周期 'a。
 pub struct LoweringContext<'a> {
-    pub width: SimdWidth,
-    /// 当前图/融合组的计算 dtype
+    /// 编译会话级共享状态（全局常量）
+    pub session: &'a CompileSession<'a>,
+    /// 当前图/融合组的计算 dtype（op-local）
     pub dtype: QuantPrecision,
-    pub sym_map: &'a SymDimSlotMap,
-    pub registry: Option<&'a ScalarOpRegistry>,
-    pub hook: Option<&'a dyn super::isa_hook::IsaHook>,
-    pub budget: Option<super::isa_hook::ResourceBudget>,
-    pub rope_req: Option<&'a RopeCacheRequirement>,
-    pub ple_req: Option<&'a PleScratchRequirement>,
-    pub dwc_req: Option<&'a DwcScratchRequirement>,
     /// §0.2.9 虚拟执行模式: 当前 op 的 ExecPattern (from R0 PainPointAnalyzer)
     pub exec_pattern: Option<ExecPattern>,
     /// §0.2.9 R0 PainPointAnalyzer 输出: per-GEMM 瓶颈分析 (含 ExecPattern)
     pub bottleneck_map: Option<&'a OpBottleneckMap>,
-    /// §0.2.8 VirtualActivationMap: 层间 activation ping-pong 映射
-    pub virtual_activation: Option<&'a VirtualActivationMap>,
+    /// RoPE/PLE/DWC scratchpad 需求（op-local，按 op 关联）
+    pub rope_req: Option<&'a RopeCacheRequirement>,
+    pub ple_req: Option<&'a PleScratchRequirement>,
+    pub dwc_req: Option<&'a DwcScratchRequirement>,
     /// §0.2.10 虚拟并行: SIMD/warp 并行度描述 (from DeviceProfile)
     pub parallelism: Option<ParallelismDesc>,
-    /// §0.2.7 虚拟权重: PackMap 索引映射 (from VirtualTensorMap)
-    pub virtual_tensor_map: Option<&'a VirtualTensorMap>,
-    /// §0.2.11 虚拟布局: LayoutAssignment (from layout_negotiator)
-    pub layout: Option<&'a crate::compiler::layout_negotiator::LayoutAssignment>,
-    /// PagedAttention page size (tokens per page). 0 = contiguous KV (no paging).
-    pub page_size: usize,
-    /// Hardware dot-product capability (from DeviceProfile), drives quant microkernel selection.
-    pub dot_cap: DotProductCap,
-    /// §20 BCI: batch_ctx_ptr VReg — non-NULL when compiling in batch mode.
-    /// When Some, attention lowering uses BatchSeqIdLookup for per-token seq_id lookup
-    /// and seq_pt_offset for PageTableAddr.
-    pub batch_ctx_ptr: Option<VRegId>,
-    /// Layer 6: JIT debug instrumentation enabled.
-    /// When true, plan_lower inserts DebugBreakpoint/DebugMarker VmInstr at key points.
-    pub debug_jit: bool,
-    /// KV cache element bytes — derived from graph weight tensors (majority vote).
-    /// Must match executor's KV cache allocation stride. Differs from dtype.elem_bytes()
-    /// when the model uses quantized weights (Q8_0 → F32 compute) but BF16 KV cache.
-    pub kv_elem_bytes: usize,
 }
 
 impl<'a> LoweringContext<'a> {
@@ -67,7 +78,7 @@ impl<'a> LoweringContext<'a> {
     /// §0.2.7: 查找 GEMM op 权重 (inputs[1]) 的 PackMap。
     pub fn pack_map_for_gemm(&self, weight_tid: Option<TensorId>) -> Option<&'a crate::compiler::pack_map::PackMap> {
         let tid = weight_tid?;
-        self.virtual_tensor_map?.pack_maps.get(&tid)
+        self.session.virtual_tensor_map?.pack_maps.get(&tid)
     }
 }
 
@@ -75,8 +86,8 @@ impl<'a> LoweringContext<'a> {
 // Layer 6: Debug instrumentation helpers
 // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
-pub(super) fn maybe_debug_bp(prog: &mut VmProgram, ctx: &LoweringContext, label: &str) {
-    if ctx.debug_jit {
+pub(super) fn maybe_debug_bp(prog: &mut VmProgram, ctx: &LoweringContext<'_>, label: &str) {
+    if ctx.session.debug_jit {
         prog.emit(VmInstr::DebugBreakpoint { label: label.to_string() });
     }
 }

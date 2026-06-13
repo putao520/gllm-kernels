@@ -9,7 +9,7 @@
 //! (max_seq_len, business_config) in the external config.
 
 use crate::types::{DType, InferenceError};
-use super::graph::{CompilerGraph, OpKind, RopeScaling, SymDim};
+use super::graph::{CompilerGraph, OpKind, KvSource, RopeScaling, SymDim};
 use super::dtype_chain::derive_compute_dtype;
 use crate::dispatch::device_profile::DeviceProfile;
 
@@ -267,7 +267,7 @@ fn derive_intermediate(graph: &CompilerGraph, hidden: usize) -> Result<usize, In
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::compiler::graph::{CompilerGraph, HeteroLayerLoopConfig, LayerLoopConfig, OpKind, RopeScaling, SymDim};
+    use crate::compiler::graph::{CompilerGraph, HeteroLayerLoopConfig, LayerLoopConfig, OpKind, KvSource, RopeScaling, SymDim};
     use crate::types::DType;
 
     #[test]
@@ -299,6 +299,7 @@ mod tests {
         g.add_op(OpKind::MultiHeadAttention {
             seq_len: SymDim::Concrete(512), num_heads: 16, num_kv_heads: 8,
             head_dim: 64, causal: true, attention_sinks: false,
+            kv_source: KvSource::FromTensor,
         }, vec![q_out, k_out, v_out], vec![attn_out], "attn");
 
         let rope_out = g.add_tensor_concrete("rope_out", &[512, 1024], dt);
@@ -957,6 +958,7 @@ mod tests {
         g.add_op(OpKind::MultiHeadAttention {
             seq_len: SymDim::Concrete(1), num_heads: 8, num_kv_heads: 8,
             head_dim: 64, causal: true, attention_sinks: false,
+            kv_source: KvSource::FromTensor,
         }, vec![q_out, k_out, v_out], vec![attn_out], "attn");
 
         // Act
@@ -1217,6 +1219,7 @@ mod tests {
         g.add_op(OpKind::MultiHeadAttention {
             seq_len: SymDim::Concrete(1), num_heads: 16, num_kv_heads: 4,
             head_dim: 64, causal: true, attention_sinks: false,
+            kv_source: KvSource::FromTensor,
         }, vec![q_out, k_out, v_out], vec![attn_out], "attn");
 
         // Act

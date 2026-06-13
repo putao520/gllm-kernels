@@ -69,7 +69,7 @@ pub(crate) fn dispatch_structural(
                 return BoundExpr::DynamicVReg(seq_vreg);
             }
         }
-        ctx.sym_map.to_bound(dim)
+        ctx.session.sym_map.to_bound(dim)
     };
 
     match &op.kind {
@@ -80,7 +80,7 @@ pub(crate) fn dispatch_structural(
         OpKind::Residual => {
             let (out_shape, feature_dim) = infer_output_shape_sym(op, graph)?;
             let telemetry_ptr = if graph.telemetry.residual_cosine_sim {
-                ctx.sym_map.resolve("telemetry").map(|expr| {
+                ctx.session.sym_map.resolve("telemetry").map(|expr| {
                     let ptr_vreg = prog.alloc_vreg(VRegKind::Ptr, SimdWidth::Scalar);
                     prog.emit(VmInstr::LoadPtr { dst: ptr_vreg, src: expr.clone() });
                     ptr_vreg
@@ -89,8 +89,8 @@ pub(crate) fn dispatch_structural(
                 None
             };
             emit_residual_with_telemetry(
-                prog, &out_shape, feature_dim, ctx.width,
-                input_ptr, weight_ptr, output_ptr, ctx.sym_map, telemetry_ptr,
+                prog, &out_shape, feature_dim, ctx.session.width,
+                input_ptr, weight_ptr, output_ptr, ctx.session.sym_map, telemetry_ptr,
                 seq_bound_override,
             ctx.dtype,
             )
@@ -140,7 +140,7 @@ pub(crate) fn dispatch_structural(
             };
             super::lower::lower_qtap_stg(
                 prog, *sink_ptr, *step_index_ptr, *dtype,
-                q_dim_concrete, seq_bound, *position, *num_slots, ctx.width, q_ptr,
+                q_dim_concrete, seq_bound, *position, *num_slots, ctx.session.width, q_ptr,
             )?;
             Ok(())
         }
@@ -153,7 +153,7 @@ pub(crate) fn dispatch_structural(
             let argmax_dst = prog.alloc_vreg(VRegKind::Scalar, SimdWidth::Scalar);
             let vocab_bytes = vocab_size * ctx.dtype.elem_bytes();
             prog.emit(VmInstr::Argmax {
-                dst: argmax_dst, logits_ptr, vocab_bytes, width: ctx.width,
+                dst: argmax_dst, logits_ptr, vocab_bytes, width: ctx.session.width,
             });
             let out_ptr = resolver.materialize(prog, op.outputs[0], abi).ok_or_else(|| {
                 CompilerError::CodegenViolation(format!(
@@ -182,17 +182,17 @@ pub(crate) fn dispatch_structural(
             let output_tokens_ptr = prog.alloc_vreg(VRegKind::Ptr, SimdWidth::Scalar);
             prog.emit(VmInstr::LoadPtr {
                 dst: output_tokens_ptr,
-                src: ctx.sym_map.resolve("output_tokens_ptr").cloned().unwrap(),
+                src: ctx.session.sym_map.resolve("output_tokens_ptr").cloned().unwrap(),
             });
             let input_ids_ptr = prog.alloc_vreg(VRegKind::Ptr, SimdWidth::Scalar);
             prog.emit(VmInstr::LoadPtr {
                 dst: input_ids_ptr,
-                src: ctx.sym_map.resolve("prompt_len").cloned().unwrap(),
+                src: ctx.session.sym_map.resolve("prompt_len").cloned().unwrap(),
             });
             let prompt_len_bytes = prog.alloc_vreg(VRegKind::Ptr, SimdWidth::Scalar);
             prog.emit(VmInstr::LoadPtr {
                 dst: prompt_len_bytes,
-                src: ctx.sym_map.resolve("scratchpad").cloned().unwrap(),
+                src: ctx.session.sym_map.resolve("scratchpad").cloned().unwrap(),
             });
             prog.emit(VmInstr::StoreToken {
                 token_id: token_ptr, output_buf: output_tokens_ptr,
@@ -214,12 +214,12 @@ pub(crate) fn dispatch_structural(
             let eos_ptr = prog.alloc_vreg(VRegKind::Ptr, SimdWidth::Scalar);
             prog.emit(VmInstr::LoadPtr {
                 dst: eos_ptr,
-                src: ctx.sym_map.resolve("eos_token_id").cloned().unwrap(),
+                src: ctx.session.sym_map.resolve("eos_token_id").cloned().unwrap(),
             });
             let max_tokens_ptr = prog.alloc_vreg(VRegKind::Ptr, SimdWidth::Scalar);
             prog.emit(VmInstr::LoadPtr {
                 dst: max_tokens_ptr,
-                src: ctx.sym_map.resolve("max_new_tokens").cloned().unwrap(),
+                src: ctx.session.sym_map.resolve("max_new_tokens").cloned().unwrap(),
             });
             prog.emit(VmInstr::CheckStopCondition {
                 token_id: token_ptr, counter, eos_ptr, max_tokens_ptr,
@@ -268,7 +268,7 @@ pub(crate) fn dispatch_structural(
                 prog, input_ptr, sg_base,
                 12,                 // confidence offset
                 16 + hidden_dim * 4, // knowledge_vector offset
-                hidden_dim, ctx.width,
+                hidden_dim, ctx.session.width,
             )?;
             Ok(())
         }
@@ -283,7 +283,7 @@ pub(crate) fn dispatch_structural(
                 dst: detect_ptr, src: PtrExpr::VRegPlusConst(sg_base, 16),
             });
             StructuralOpBuilder::emit_side_channel_copy(
-                prog, input_ptr, detect_ptr, 0, *hidden_dim, ctx.width,
+                prog, input_ptr, detect_ptr, 0, *hidden_dim, ctx.session.width,
             )?;
 
             // ── Callback table: SG_KNOWLEDGE_RETRIEVE (slot 0) ──
@@ -293,7 +293,7 @@ pub(crate) fn dispatch_structural(
                 let cb_table = prog.alloc_vreg(VRegKind::Ptr, SimdWidth::Scalar);
                 prog.emit(VmInstr::LoadPtr {
                     dst: cb_table,
-                    src: ctx.sym_map.resolve("callback_table_ptr").cloned().expect("ABI: callback_table_ptr"),
+                    src: ctx.session.sym_map.resolve("callback_table_ptr").cloned().expect("ABI: callback_table_ptr"),
                 });
                 // skip_count=4: LoadCallbackEntry + MemFence(Rel) + NativeCall + MemFence(Acq)
                 prog.emit(VmInstr::GprCondAction { cond: GprCondition::IsNull(cb_table), action: GprBranchAction::Skip(4) });
@@ -332,7 +332,7 @@ pub(crate) fn dispatch_structural(
 
         OpKind::MegaKernelDispatch { prefill_fn, decode_fn, chunked_fn, .. } => {
             let mode_reg = prog.alloc_vreg(VRegKind::Scalar, SimdWidth::Scalar);
-            prog.emit(VmInstr::LoadPtr { dst: mode_reg, src: ctx.sym_map.resolve("batch_size").cloned().expect("ABI: batch_size") });
+            prog.emit(VmInstr::LoadPtr { dst: mode_reg, src: ctx.session.sym_map.resolve("batch_size").cloned().expect("ABI: batch_size") });
             prog.emit(VmInstr::IndirectJump {
                 index: mode_reg,
                 targets: vec![
@@ -359,7 +359,7 @@ pub(crate) fn dispatch_structural(
                 resolve_dim(index_dim)
             };
             let telemetry_ptr = if graph.telemetry.embed_l2_norm {
-                ctx.sym_map.resolve("telemetry").map(|expr| {
+                ctx.session.sym_map.resolve("telemetry").map(|expr| {
                     let ptr_vreg = prog.alloc_vreg(VRegKind::Ptr, SimdWidth::Scalar);
                     prog.emit(VmInstr::LoadPtr { dst: ptr_vreg, src: expr.clone() });
                     ptr_vreg
@@ -372,7 +372,7 @@ pub(crate) fn dispatch_structural(
                 .and_then(|&tid| graph.tensor(tid))
                 .map(|t| t.dtype.to_quant_precision())
                 .unwrap_or(ctx.dtype);
-            emit_gather_inline(prog, seq_bound, *embed_dim, ctx.width,
+            emit_gather_inline(prog, seq_bound, *embed_dim, ctx.session.width,
                 input_ptr, weight_ptr, output_ptr, telemetry_ptr, *scale,
                 *indices_kind, ctx.dtype, weight_dtype)?;
             Ok(())
@@ -389,7 +389,7 @@ pub(crate) fn dispatch_structural(
             };
             emit_quant_gather_inline(
                 prog, seq_bound, *vocab_size, *hidden_dim, *quant_type,
-                ctx.width, input_ptr, weight_ptr, output_ptr, ctx.dtype,
+                ctx.session.width, input_ptr, weight_ptr, output_ptr, ctx.dtype,
                 *scale,
             )?;
             Ok(())
@@ -401,7 +401,7 @@ pub(crate) fn dispatch_structural(
         OpKind::ColumnSlice { seq_len, input_inner, start, slice_dim } => {
             let seq_bound = resolve_dim(seq_len);
             emit_column_slice_inline(prog, seq_bound, *input_inner, *start, *slice_dim,
-                ctx.width, input_ptr, output_ptr, ctx.dtype)?;
+                ctx.session.width, input_ptr, output_ptr, ctx.dtype)?;
             Ok(())
         }
 
@@ -446,8 +446,8 @@ fn lower_altup_predict(
     num_preds: usize,
     hidden: usize,
 ) -> Result<(), CompilerError> {
-    let seq_bound = ctx.sym_map.to_bound(&seq_len);
-    let width = ctx.width.f32_lanes();
+    let seq_bound = ctx.session.sym_map.to_bound(&seq_len);
+    let width = ctx.session.width.f32_lanes();
     let p = num_preds;
     let elem_bytes = 4usize;
     let row_bytes = p * hidden * elem_bytes;
@@ -467,14 +467,14 @@ fn lower_altup_predict(
                     Box::new(OffsetExpr::LoopOffset(seq_off)),
                     Box::new(OffsetExpr::Const(off)),
                 );
-                let data = prog.alloc_vreg(VRegKind::Vec, ctx.width);
+                let data = prog.alloc_vreg(VRegKind::Vec, ctx.session.width);
                 prog.emit(VmInstr::VecLoad {
                     dst: data, base: input_ptr, offset: off_expr.clone(),
-                    width: ctx.width, dtype: QuantPrecision::F32,
+                    width: ctx.session.width, dtype: QuantPrecision::F32,
                 });
                 prog.emit(VmInstr::VecStore {
                     base: output_ptr, offset: off_expr, src: data,
-                    width: ctx.width, dtype: QuantPrecision::F32,
+                    width: ctx.session.width, dtype: QuantPrecision::F32,
                 });
             }
 
@@ -482,14 +482,14 @@ fn lower_altup_predict(
             for q in 0..p {
                 // Broadcast scalar coef[p_out, q] to vector
                 let coef_byte_off = (p_out * p + q) * elem_bytes;
-                let coef_bc = prog.alloc_vreg(VRegKind::Vec, ctx.width);
+                let coef_bc = prog.alloc_vreg(VRegKind::Vec, ctx.session.width);
                 prog.emit(VmInstr::Broadcast {
                     dst: coef_bc,
                     src: ScalarExpr::MemLoad(coefs_ptr, OffsetExpr::Add(
                         Box::new(OffsetExpr::LoopOffset(seq_off)),
                         Box::new(OffsetExpr::Const(coef_byte_off)),
                     )),
-                    width: ctx.width,
+                    width: ctx.session.width,
                     dtype: QuantPrecision::F32,
                 });
 
@@ -506,32 +506,32 @@ fn lower_altup_predict(
                     );
 
                     // Load hidden[q] chunk
-                    let h_q = prog.alloc_vreg(VRegKind::Vec, ctx.width);
+                    let h_q = prog.alloc_vreg(VRegKind::Vec, ctx.session.width);
                     prog.emit(VmInstr::VecLoad {
                         dst: h_q, base: input_ptr, offset: q_off_expr,
-                        width: ctx.width, dtype: QuantPrecision::F32,
+                        width: ctx.session.width, dtype: QuantPrecision::F32,
                     });
                     // scaled = coef * hidden[q]
-                    let scaled = prog.alloc_vreg(VRegKind::Vec, ctx.width);
+                    let scaled = prog.alloc_vreg(VRegKind::Vec, ctx.session.width);
                     prog.emit(VmInstr::VecBinOp {
                         dst: scaled, a: h_q, b: coef_bc,
                         op: VecOp::Mul, dtype: QuantPrecision::F32,
                     });
                     // acc = load output[p_out]
-                    let acc = prog.alloc_vreg(VRegKind::Vec, ctx.width);
+                    let acc = prog.alloc_vreg(VRegKind::Vec, ctx.session.width);
                     prog.emit(VmInstr::VecLoad {
                         dst: acc, base: output_ptr, offset: out_off_expr.clone(),
-                        width: ctx.width, dtype: QuantPrecision::F32,
+                        width: ctx.session.width, dtype: QuantPrecision::F32,
                     });
                     // acc += scaled
-                    let new_acc = prog.alloc_vreg(VRegKind::Vec, ctx.width);
+                    let new_acc = prog.alloc_vreg(VRegKind::Vec, ctx.session.width);
                     prog.emit(VmInstr::VecBinOp {
                         dst: new_acc, a: acc, b: scaled,
                         op: VecOp::Add, dtype: QuantPrecision::F32,
                     });
                     prog.emit(VmInstr::VecStore {
                         base: output_ptr, offset: out_off_expr, src: new_acc,
-                        width: ctx.width, dtype: QuantPrecision::F32,
+                        width: ctx.session.width, dtype: QuantPrecision::F32,
                     });
                 }
             }
@@ -559,8 +559,8 @@ fn lower_altup_correct(
     num_preds: usize,
     hidden: usize,
 ) -> Result<(), CompilerError> {
-    let seq_bound = ctx.sym_map.to_bound(&seq_len);
-    let width = ctx.width.f32_lanes();
+    let seq_bound = ctx.session.sym_map.to_bound(&seq_len);
+    let width = ctx.session.width.f32_lanes();
     let p = num_preds;
     let elem_bytes = 4usize;
     let row_bytes = p * hidden * elem_bytes;
@@ -579,28 +579,28 @@ fn lower_altup_correct(
                 Box::new(OffsetExpr::LoopOffset(seq_off)),
                 Box::new(OffsetExpr::Const(off)),
             );
-            let data = prog.alloc_vreg(VRegKind::Vec, ctx.width);
+            let data = prog.alloc_vreg(VRegKind::Vec, ctx.session.width);
             prog.emit(VmInstr::VecLoad {
                 dst: data, base: gated_ptr, offset: off_expr.clone(),
-                width: ctx.width, dtype: QuantPrecision::F32,
+                width: ctx.session.width, dtype: QuantPrecision::F32,
             });
             prog.emit(VmInstr::VecStore {
                 base: output_ptr, offset: off_expr, src: data,
-                width: ctx.width, dtype: QuantPrecision::F32,
+                width: ctx.session.width, dtype: QuantPrecision::F32,
             });
         }
 
         // Step 2: corrected[p] = predictions[p] + coef[p] · (gated - predictions[0]) for p > 0
         for p_out in 1..p {
             // Broadcast scalar coef[p_out]
-            let coef_bc = prog.alloc_vreg(VRegKind::Vec, ctx.width);
+            let coef_bc = prog.alloc_vreg(VRegKind::Vec, ctx.session.width);
             prog.emit(VmInstr::Broadcast {
                 dst: coef_bc,
                 src: ScalarExpr::MemLoad(coefs_ptr, OffsetExpr::Add(
                     Box::new(OffsetExpr::LoopOffset(seq_off)),
                     Box::new(OffsetExpr::Const(p_out * elem_bytes)),
                 )),
-                width: ctx.width,
+                width: ctx.session.width,
                 dtype: QuantPrecision::F32,
             });
 
@@ -616,37 +616,37 @@ fn lower_altup_correct(
                     Box::new(OffsetExpr::LoopOffset(seq_off)),
                     Box::new(OffsetExpr::Const(p_out * hidden * elem_bytes + chunk_off)),
                 );
-                let pred_v = prog.alloc_vreg(VRegKind::Vec, ctx.width);
+                let pred_v = prog.alloc_vreg(VRegKind::Vec, ctx.session.width);
                 prog.emit(VmInstr::VecLoad {
                     dst: pred_v, base: input_ptr, offset: pred_off,
-                    width: ctx.width, dtype: QuantPrecision::F32,
+                    width: ctx.session.width, dtype: QuantPrecision::F32,
                 });
                 // Load gated chunk
-                let gated_v = prog.alloc_vreg(VRegKind::Vec, ctx.width);
+                let gated_v = prog.alloc_vreg(VRegKind::Vec, ctx.session.width);
                 prog.emit(VmInstr::VecLoad {
                     dst: gated_v, base: gated_ptr, offset: base_off.clone(),
-                    width: ctx.width, dtype: QuantPrecision::F32,
+                    width: ctx.session.width, dtype: QuantPrecision::F32,
                 });
                 // Load predictions[0] chunk
-                let pred0_v = prog.alloc_vreg(VRegKind::Vec, ctx.width);
+                let pred0_v = prog.alloc_vreg(VRegKind::Vec, ctx.session.width);
                 prog.emit(VmInstr::VecLoad {
                     dst: pred0_v, base: input_ptr, offset: base_off,
-                    width: ctx.width, dtype: QuantPrecision::F32,
+                    width: ctx.session.width, dtype: QuantPrecision::F32,
                 });
                 // innovation = gated - predictions[0]
-                let innov = prog.alloc_vreg(VRegKind::Vec, ctx.width);
+                let innov = prog.alloc_vreg(VRegKind::Vec, ctx.session.width);
                 prog.emit(VmInstr::VecBinOp {
                     dst: innov, a: gated_v, b: pred0_v,
                     op: VecOp::Sub, dtype: QuantPrecision::F32,
                 });
                 // scaled = coef * innovation
-                let scaled = prog.alloc_vreg(VRegKind::Vec, ctx.width);
+                let scaled = prog.alloc_vreg(VRegKind::Vec, ctx.session.width);
                 prog.emit(VmInstr::VecBinOp {
                     dst: scaled, a: coef_bc, b: innov,
                     op: VecOp::Mul, dtype: QuantPrecision::F32,
                 });
                 // corrected[p_out] = predictions[p_out] + scaled
-                let result = prog.alloc_vreg(VRegKind::Vec, ctx.width);
+                let result = prog.alloc_vreg(VRegKind::Vec, ctx.session.width);
                 prog.emit(VmInstr::VecBinOp {
                     dst: result, a: pred_v, b: scaled,
                     op: VecOp::Add, dtype: QuantPrecision::F32,
@@ -657,7 +657,7 @@ fn lower_altup_correct(
                 );
                 prog.emit(VmInstr::VecStore {
                     base: output_ptr, offset: out_off, src: result,
-                    width: ctx.width, dtype: QuantPrecision::F32,
+                    width: ctx.session.width, dtype: QuantPrecision::F32,
                 });
             }
         }
@@ -683,8 +683,8 @@ fn lower_altup_inject(
     num_preds: usize,
     hidden: usize,
 ) -> Result<(), CompilerError> {
-    let seq_bound = ctx.sym_map.to_bound(&seq_len);
-    let width = ctx.width.f32_lanes();
+    let seq_bound = ctx.session.sym_map.to_bound(&seq_len);
+    let width = ctx.session.width.f32_lanes();
     let p = num_preds;
     let elem_bytes = 4usize;
     let row_bytes = p * hidden * elem_bytes;
@@ -702,14 +702,14 @@ fn lower_altup_inject(
                 Box::new(OffsetExpr::LoopOffset(seq_off)),
                 Box::new(OffsetExpr::Const(off)),
             );
-            let data = prog.alloc_vreg(VRegKind::Vec, ctx.width);
+            let data = prog.alloc_vreg(VRegKind::Vec, ctx.session.width);
             prog.emit(VmInstr::VecLoad {
                 dst: data, base: input_ptr, offset: off_expr.clone(),
-                width: ctx.width, dtype: QuantPrecision::F32,
+                width: ctx.session.width, dtype: QuantPrecision::F32,
             });
             prog.emit(VmInstr::VecStore {
                 base: output_ptr, offset: off_expr, src: data,
-                width: ctx.width, dtype: QuantPrecision::F32,
+                width: ctx.session.width, dtype: QuantPrecision::F32,
             });
         }
 
@@ -721,28 +721,28 @@ fn lower_altup_inject(
                     Box::new(OffsetExpr::LoopOffset(seq_off)),
                     Box::new(OffsetExpr::Const(chunk_off)),
                 );
-                let norm_v = prog.alloc_vreg(VRegKind::Vec, ctx.width);
+                let norm_v = prog.alloc_vreg(VRegKind::Vec, ctx.session.width);
                 prog.emit(VmInstr::VecLoad {
                     dst: norm_v, base: norm_ptr, offset: norm_off,
-                    width: ctx.width, dtype: QuantPrecision::F32,
+                    width: ctx.session.width, dtype: QuantPrecision::F32,
                 });
                 let out_off = OffsetExpr::Add(
                     Box::new(OffsetExpr::LoopOffset(seq_off)),
                     Box::new(OffsetExpr::Const(p_out * hidden * elem_bytes + chunk_off)),
                 );
-                let out_v = prog.alloc_vreg(VRegKind::Vec, ctx.width);
+                let out_v = prog.alloc_vreg(VRegKind::Vec, ctx.session.width);
                 prog.emit(VmInstr::VecLoad {
                     dst: out_v, base: output_ptr, offset: out_off.clone(),
-                    width: ctx.width, dtype: QuantPrecision::F32,
+                    width: ctx.session.width, dtype: QuantPrecision::F32,
                 });
-                let sum = prog.alloc_vreg(VRegKind::Vec, ctx.width);
+                let sum = prog.alloc_vreg(VRegKind::Vec, ctx.session.width);
                 prog.emit(VmInstr::VecBinOp {
                     dst: sum, a: out_v, b: norm_v,
                     op: VecOp::Add, dtype: QuantPrecision::F32,
                 });
                 prog.emit(VmInstr::VecStore {
                     base: output_ptr, offset: out_off, src: sum,
-                    width: ctx.width, dtype: QuantPrecision::F32,
+                    width: ctx.session.width, dtype: QuantPrecision::F32,
                 });
             }
         }
@@ -773,23 +773,23 @@ fn lower_scale_const(
         .product::<usize>()
         .max(1);
 
-    let width = ctx.width.f32_lanes();
+    let width = ctx.session.width.f32_lanes();
     let elem_bytes = 4usize;
     let num_vec = (feature_dim + width - 1) / width;
     let row_bytes = feature_dim * elem_bytes;
 
     // Broadcast constant to vector register
-    let const_bc = prog.alloc_vreg(VRegKind::Vec, ctx.width);
+    let const_bc = prog.alloc_vreg(VRegKind::Vec, ctx.session.width);
     prog.emit(VmInstr::Broadcast {
         dst: const_bc,
         src: ScalarExpr::Const(value),
-        width: ctx.width,
+        width: ctx.session.width,
         dtype: QuantPrecision::F32,
     });
 
     if let Some(sym_dim) = seq_dim {
         // Symbolic seq dimension → outer loop
-        let seq_bound = ctx.sym_map.to_bound(&sym_dim);
+        let seq_bound = ctx.session.sym_map.to_bound(&sym_dim);
         prog.emit_loop_try(seq_bound, row_bytes, |prog, _ctr, seq_off| {
             for v in 0..num_vec {
                 let off = v * width * elem_bytes;
@@ -797,19 +797,19 @@ fn lower_scale_const(
                     Box::new(OffsetExpr::LoopOffset(seq_off)),
                     Box::new(OffsetExpr::Const(off)),
                 );
-                let data = prog.alloc_vreg(VRegKind::Vec, ctx.width);
+                let data = prog.alloc_vreg(VRegKind::Vec, ctx.session.width);
                 prog.emit(VmInstr::VecLoad {
                     dst: data, base: input_ptr, offset: off_expr.clone(),
-                    width: ctx.width, dtype: QuantPrecision::F32,
+                    width: ctx.session.width, dtype: QuantPrecision::F32,
                 });
-                let scaled = prog.alloc_vreg(VRegKind::Vec, ctx.width);
+                let scaled = prog.alloc_vreg(VRegKind::Vec, ctx.session.width);
                 prog.emit(VmInstr::VecBinOp {
                     dst: scaled, a: data, b: const_bc,
                     op: VecOp::Mul, dtype: QuantPrecision::F32,
                 });
                 prog.emit(VmInstr::VecStore {
                     base: output_ptr, offset: off_expr, src: scaled,
-                    width: ctx.width, dtype: QuantPrecision::F32,
+                    width: ctx.session.width, dtype: QuantPrecision::F32,
                 });
             }
             Ok(())
@@ -819,19 +819,19 @@ fn lower_scale_const(
         for v in 0..num_vec {
             let off = v * width * elem_bytes;
             let off_expr = OffsetExpr::Const(off);
-            let data = prog.alloc_vreg(VRegKind::Vec, ctx.width);
+            let data = prog.alloc_vreg(VRegKind::Vec, ctx.session.width);
             prog.emit(VmInstr::VecLoad {
                 dst: data, base: input_ptr, offset: off_expr.clone(),
-                width: ctx.width, dtype: QuantPrecision::F32,
+                width: ctx.session.width, dtype: QuantPrecision::F32,
             });
-            let scaled = prog.alloc_vreg(VRegKind::Vec, ctx.width);
+            let scaled = prog.alloc_vreg(VRegKind::Vec, ctx.session.width);
             prog.emit(VmInstr::VecBinOp {
                 dst: scaled, a: data, b: const_bc,
                 op: VecOp::Mul, dtype: QuantPrecision::F32,
             });
             prog.emit(VmInstr::VecStore {
                 base: output_ptr, offset: off_expr, src: scaled,
-                width: ctx.width, dtype: QuantPrecision::F32,
+                width: ctx.session.width, dtype: QuantPrecision::F32,
             });
         }
         Ok(())
@@ -849,7 +849,7 @@ fn emit_altup_copy_loop(
     ctx: &LoweringContext,
 ) -> Result<(), CompilerError> {
     let elem_bytes = 4usize; // f32
-    let width_val = ctx.width.f32_lanes();
+    let width_val = ctx.session.width.f32_lanes();
     let vec_bytes = width_val * elem_bytes;
     let num_vec_iters = (total_elem + width_val - 1) / width_val;
     let step_bytes = total_elem * elem_bytes;
@@ -857,7 +857,7 @@ fn emit_altup_copy_loop(
     prog.emit_loop_try(seq_bound, step_bytes, |prog, _ctr, seq_off| {
         for v in 0..num_vec_iters {
             let off = v * vec_bytes;
-            let data = prog.alloc_vreg(VRegKind::Vec, ctx.width);
+            let data = prog.alloc_vreg(VRegKind::Vec, ctx.session.width);
             let offset_expr = OffsetExpr::Add(
                 Box::new(OffsetExpr::LoopOffset(seq_off)),
                 Box::new(OffsetExpr::Const(off)),
@@ -866,14 +866,14 @@ fn emit_altup_copy_loop(
                 dst: data,
                 base: input_ptr,
                 offset: offset_expr.clone(),
-                width: ctx.width,
+                width: ctx.session.width,
                 dtype: QuantPrecision::F32,
             });
             prog.emit(VmInstr::VecStore {
                 base: output_ptr,
                 offset: offset_expr,
                 src: data,
-                width: ctx.width,
+                width: ctx.session.width,
                 dtype: QuantPrecision::F32,
             });
         }
@@ -905,9 +905,9 @@ pub(crate) fn dispatch_compute_pattern(
     resolver: &TensorPtrResolver,
     abi: &AbiPtrs,
 ) -> Result<bool, CompilerError> {
-    let width = ctx.width;
-    let sym_map = ctx.sym_map;
-    let hook = ctx.hook;
+    let width = ctx.session.width;
+    let sym_map = ctx.session.sym_map;
+    let hook = ctx.session.hook;
     let rope_req = ctx.rope_req;
     let ple_req = ctx.ple_req;
     let dwc_req = ctx.dwc_req;
@@ -920,7 +920,7 @@ pub(crate) fn dispatch_compute_pattern(
     // Trace-lookup: 如果 registry 有该 OpKind 的 trace，按 ComputePattern 路由。
     {
         let key = ScalarOpRegistry::key_from_op_kind(&op.kind);
-        let op_trace = ctx.registry.and_then(|r| r.get_trace(&key));
+        let op_trace = ctx.session.registry.and_then(|r| r.get_trace(&key));
         if let Some(trace) = op_trace {
             match &trace.pattern {
                 // ── NormLike → emit_normlike_inline / emit_layernorm_auto ──
@@ -1099,7 +1099,7 @@ pub(crate) fn dispatch_compute_pattern(
                 // ── BinaryElementwise → emit_elementwise_inline ──
                 ComputePattern::BinaryElementwise { .. } => {
                     if matches!(op.kind, OpKind::LearnedPos2D { .. }) {
-                        let trace_body = extract_op_trace(op, ctx.registry)?;
+                        let trace_body = extract_op_trace(op, ctx.session.registry)?;
                         if trace_body.is_empty() {
                             return Err(CompilerError::CodegenViolation(
                                 "LearnedPos2D: 空 trace (registry 未注册或 pattern 提取失败)".into(),
@@ -1198,15 +1198,15 @@ pub(crate) fn dispatch_compute_pattern(
             eprintln!("[QUANT-GEMM] op={} n={} k={} qt={:?} m_bound={:?} input_ptr=v{} weight_ptr=v{} output_ptr=v{} abi.wp={:?} w_src={:?}",
                 op.label, n, k, quant_type, m_bound, input_ptr.0, weight_ptr.0, output_ptr.0, abi.weight_ptr, w_src);
             emit_quant_gemm_inline(prog, m_bound, *n, *k, *quant_type,
-                width, input_ptr, weight_ptr, output_ptr, ctx.dtype, ctx.dot_cap)?;
+                width, input_ptr, weight_ptr, output_ptr, ctx.dtype, ctx.session.dot_cap)?;
             Ok(true)
         }
 
 
         // ── MHA — ARCH-AUTO-INSTR-SELECT 手写 lower 委托: structural (tiled attention with
         //    runtime seq_len, hook), awaiting TraceOp semantic extension for auto_select ──
-        OpKind::MultiHeadAttention { seq_len, num_heads, num_kv_heads, head_dim, causal, attention_sinks } => {
-            eprintln!("[MHA-LOWER] label={} num_heads={} num_kv_heads={} head_dim={} causal={}", op.label, num_heads, num_kv_heads, head_dim, causal);
+        OpKind::MultiHeadAttention { seq_len, num_heads, num_kv_heads, head_dim, causal, attention_sinks, kv_source } => {
+            eprintln!("[MHA-LOWER] label={} num_heads={} num_kv_heads={} head_dim={} causal={} kv_source={:?}", op.label, num_heads, num_kv_heads, head_dim, causal, kv_source);
             // Mega-kernel decode: Q loop = Const(1) (single decode token),
             // KV loop = DynamicVReg(decode_seq_len) (all cached + current).
             // Otherwise both use graph-level SymDim bound.
@@ -1244,75 +1244,70 @@ pub(crate) fn dispatch_compute_pattern(
             } else {
                 None
             };
+            // KV cache integration: 由 op.kv_source 驱动，而非 graph-level topology 推导。
+            // FromCache: 写入/读取持久化 KV cache（LLM decoder generate loop）。
+            // FromTensor: 直接使用 GEMM 产出的 K/V tensor，zero cache copy（conformer encoder 等）。
+            let (k_attn_ptr, v_attn_ptr) = match kv_source {
+                crate::compiler::graph::KvSource::FromCache { layer_idx } => {
+                    let kv_cache_ptr = abi.kv_cache_ptr.ok_or_else(|| CompilerError::CodegenViolation(
+                        format!("MHA op {:?}: kv_source=FromCache 但 ABI 中无 kv_cache_ptr", op.id)))?;
 
-            // KV cache integration for mega-kernel:
-            // After K/V GEMM, write current K/V row to the persistent KV cache buffer.
-            // Then use KV cache pointers for attention reads.
-            // Prefill: gen_loop_counter is None → use 0 (write to cache start).
-            // Decode: gen_loop_counter tracks position → write to current position.
-            // When layer_loop_counter is None (MHA outside layer loop), use 0 as layer index.
-            let effective_layer_ctr = abi.layer_loop_counter.or_else(|| {
-                if abi.kv_cache_ptr.is_some() {
-                    let zero = prog.alloc_vreg(VRegKind::Counter, SimdWidth::Scalar);
-                    prog.emit(VmInstr::GprLoadImm { dst: zero, value: 0 });
-                    Some(zero)
-                } else {
-                    None
+                    // 加载 layer_idx 到寄存器
+                    let layer_ctr = prog.alloc_vreg(VRegKind::Counter, SimdWidth::Scalar);
+                    prog.emit(VmInstr::GprLoadImm { dst: layer_ctr, value: *layer_idx });
+
+                    let gen_ctr = abi.gen_loop_counter.unwrap_or_else(|| {
+                        let zero = prog.alloc_vreg(VRegKind::Counter, SimdWidth::Scalar);
+                        prog.emit(VmInstr::GprLoadImm { dst: zero, value: 0 });
+                        zero
+                    });
+                    let kv_row_stride = *num_kv_heads * *head_dim * ctx.dtype.elem_bytes();
+                    let max_seq = graph.max_seq_len;
+                    let kv_layer_stride = 2 * max_seq * kv_row_stride;
+
+                    // Write current K row to KV cache:
+                    // dst = kv_cache_ptr + layer_ctr * kv_layer_stride + gen_ctr * kv_row_stride
+                    let layer_off = prog.alloc_vreg(VRegKind::ByteOffset, SimdWidth::Scalar);
+                    prog.emit(VmInstr::GprBinOp { dst: layer_off, a: layer_ctr, b: GprOperand::Imm(kv_layer_stride as i64), op: GprOp::Mul });
+                    let k_cache_base = prog.alloc_vreg(VRegKind::Ptr, SimdWidth::Scalar);
+                    prog.emit(VmInstr::GprBinOp { dst: k_cache_base, a: kv_cache_ptr, b: GprOperand::VReg(layer_off), op: GprOp::Add });
+                    let pos_off = prog.alloc_vreg(VRegKind::ByteOffset, SimdWidth::Scalar);
+                    prog.emit(VmInstr::GprBinOp { dst: pos_off, a: gen_ctr, b: GprOperand::Imm(kv_row_stride as i64), op: GprOp::Mul });
+                    // Copy all K rows to KV cache (prefill: seq_len rows, decode: 1 row)
+                    let k_copy_dst = prog.alloc_vreg(VRegKind::Ptr, SimdWidth::Scalar);
+                    let k_copy_src = prog.alloc_vreg(VRegKind::Ptr, SimdWidth::Scalar);
+                    let k_off_tmp = prog.alloc_vreg(VRegKind::ByteOffset, SimdWidth::Scalar);
+                    prog.emit_loop(q_bound.clone(), kv_row_stride, |prog, _ctr, byte_off| {
+                        prog.emit(VmInstr::GprBinOp { dst: k_copy_src, a: k_ptr, b: GprOperand::VReg(byte_off), op: GprOp::Add });
+                        prog.emit(VmInstr::GprBinOp { dst: k_off_tmp, a: pos_off, b: GprOperand::VReg(byte_off), op: GprOp::Add });
+                        prog.emit(VmInstr::GprBinOp { dst: k_copy_dst, a: k_cache_base, b: GprOperand::VReg(k_off_tmp), op: GprOp::Add });
+                        prog.emit(VmInstr::MemCopy { dst: k_copy_dst, src: k_copy_src, bytes: kv_row_stride });
+                    });
+
+                    // V cache base = K cache base + max_seq * kv_row_stride
+                    let v_offset_gpr = prog.alloc_vreg(VRegKind::ByteOffset, SimdWidth::Scalar);
+                    prog.emit(VmInstr::GprLoadImm { dst: v_offset_gpr, value: max_seq * kv_row_stride });
+                    let v_cache_base = prog.alloc_vreg(VRegKind::Ptr, SimdWidth::Scalar);
+                    prog.emit(VmInstr::GprBinOp { dst: v_cache_base, a: k_cache_base, b: GprOperand::VReg(v_offset_gpr), op: GprOp::Add });
+                    // Copy all V rows to KV cache
+                    let v_copy_dst = prog.alloc_vreg(VRegKind::Ptr, SimdWidth::Scalar);
+                    let v_copy_src = prog.alloc_vreg(VRegKind::Ptr, SimdWidth::Scalar);
+                    let v_off_tmp = prog.alloc_vreg(VRegKind::ByteOffset, SimdWidth::Scalar);
+                    prog.emit_loop(q_bound.clone(), kv_row_stride, |prog, _ctr, byte_off| {
+                        prog.emit(VmInstr::GprBinOp { dst: v_copy_src, a: v_ptr, b: GprOperand::VReg(byte_off), op: GprOp::Add });
+                        prog.emit(VmInstr::GprBinOp { dst: v_off_tmp, a: pos_off, b: GprOperand::VReg(byte_off), op: GprOp::Add });
+                        prog.emit(VmInstr::GprBinOp { dst: v_copy_dst, a: v_cache_base, b: GprOperand::VReg(k_off_tmp), op: GprOp::Add });
+                        prog.emit(VmInstr::MemCopy { dst: v_copy_dst, src: v_copy_src, bytes: kv_row_stride });
+                    });
+
+                    // Attention reads from KV cache: k_cache_base and v_cache_base
+                    (k_cache_base, v_cache_base)
                 }
-            });
-            let (k_attn_ptr, v_attn_ptr) = if let (Some(kv_cache_ptr), Some(layer_ctr)) =
-                (abi.kv_cache_ptr, effective_layer_ctr)
-            {
-                let gen_ctr = abi.gen_loop_counter.unwrap_or_else(|| {
-                    let zero = prog.alloc_vreg(VRegKind::Counter, SimdWidth::Scalar);
-                    prog.emit(VmInstr::GprLoadImm { dst: zero, value: 0 });
-                    zero
-                });
-                let kv_row_stride = *num_kv_heads * *head_dim * ctx.dtype.elem_bytes();
-                let max_seq = graph.max_seq_len;
-                let kv_layer_stride = 2 * max_seq * kv_row_stride;
-
-                // Write current K row to KV cache:
-                // dst = kv_cache_ptr + layer_ctr * kv_layer_stride + gen_ctr * kv_row_stride
-                let layer_off = prog.alloc_vreg(VRegKind::ByteOffset, SimdWidth::Scalar);
-                prog.emit(VmInstr::GprBinOp { dst: layer_off, a: layer_ctr, b: GprOperand::Imm(kv_layer_stride as i64), op: GprOp::Mul });
-                let k_cache_base = prog.alloc_vreg(VRegKind::Ptr, SimdWidth::Scalar);
-                prog.emit(VmInstr::GprBinOp { dst: k_cache_base, a: kv_cache_ptr, b: GprOperand::VReg(layer_off), op: GprOp::Add });
-                let pos_off = prog.alloc_vreg(VRegKind::ByteOffset, SimdWidth::Scalar);
-                prog.emit(VmInstr::GprBinOp { dst: pos_off, a: gen_ctr, b: GprOperand::Imm(kv_row_stride as i64), op: GprOp::Mul });
-                // Copy all K rows to KV cache (prefill: seq_len rows, decode: 1 row)
-                let k_copy_dst = prog.alloc_vreg(VRegKind::Ptr, SimdWidth::Scalar);
-                let k_copy_src = prog.alloc_vreg(VRegKind::Ptr, SimdWidth::Scalar);
-                let k_off_tmp = prog.alloc_vreg(VRegKind::ByteOffset, SimdWidth::Scalar);
-                prog.emit_loop(q_bound.clone(), kv_row_stride, |prog, _ctr, byte_off| {
-                    prog.emit(VmInstr::GprBinOp { dst: k_copy_src, a: k_ptr, b: GprOperand::VReg(byte_off), op: GprOp::Add });
-                    prog.emit(VmInstr::GprBinOp { dst: k_off_tmp, a: pos_off, b: GprOperand::VReg(byte_off), op: GprOp::Add });
-                    prog.emit(VmInstr::GprBinOp { dst: k_copy_dst, a: k_cache_base, b: GprOperand::VReg(k_off_tmp), op: GprOp::Add });
-                    prog.emit(VmInstr::MemCopy { dst: k_copy_dst, src: k_copy_src, bytes: kv_row_stride });
-                });
-
-                // V cache base = K cache base + max_seq * kv_row_stride
-                let v_offset_gpr = prog.alloc_vreg(VRegKind::ByteOffset, SimdWidth::Scalar);
-                prog.emit(VmInstr::GprLoadImm { dst: v_offset_gpr, value: max_seq * kv_row_stride });
-                let v_cache_base = prog.alloc_vreg(VRegKind::Ptr, SimdWidth::Scalar);
-                prog.emit(VmInstr::GprBinOp { dst: v_cache_base, a: k_cache_base, b: GprOperand::VReg(v_offset_gpr), op: GprOp::Add });
-                // Copy all V rows to KV cache
-                let v_copy_dst = prog.alloc_vreg(VRegKind::Ptr, SimdWidth::Scalar);
-                let v_copy_src = prog.alloc_vreg(VRegKind::Ptr, SimdWidth::Scalar);
-                let v_off_tmp = prog.alloc_vreg(VRegKind::ByteOffset, SimdWidth::Scalar);
-                prog.emit_loop(q_bound.clone(), kv_row_stride, |prog, _ctr, byte_off| {
-                    prog.emit(VmInstr::GprBinOp { dst: v_copy_src, a: v_ptr, b: GprOperand::VReg(byte_off), op: GprOp::Add });
-                    prog.emit(VmInstr::GprBinOp { dst: v_off_tmp, a: pos_off, b: GprOperand::VReg(byte_off), op: GprOp::Add });
-                    prog.emit(VmInstr::GprBinOp { dst: v_copy_dst, a: v_cache_base, b: GprOperand::VReg(v_off_tmp), op: GprOp::Add });
-                    prog.emit(VmInstr::MemCopy { dst: v_copy_dst, src: v_copy_src, bytes: kv_row_stride });
-                });
-
-                // Attention reads from KV cache: k_cache_base and v_cache_base
-                (k_cache_base, v_cache_base)
-            } else {
-                (k_ptr, v_ptr)
+                crate::compiler::graph::KvSource::FromTensor => {
+                    // 直接使用 GEMM 产出的 K/V tensor，无需 cache copy
+                    (k_ptr, v_ptr)
+                }
             };
-
             // TMA available only on GPU SM90+ (same detection pattern as gemm_emit.rs)
             let use_tma = {
                 use crate::compiler::hardware_profile::HardwareProfile;
@@ -1331,8 +1326,8 @@ pub(crate) fn dispatch_compute_pattern(
             };
             emit_tiled_attention_inline(prog, q_bound, kv_bound, *num_heads, *num_kv_heads, *head_dim,
                 width, q_ptr, k_attn_ptr, v_attn_ptr, output_ptr, hook, *causal, sinks_ptr, ctx.dtype,
-                abi.page_table_ptr, ctx.page_size, abi.kv_load_mode.unwrap_or_default(), None,
-                ctx.batch_ctx_ptr, abi.kv_cache_ptr, use_tma, use_tmem)?;
+                abi.page_table_ptr, ctx.session.page_size, abi.kv_load_mode.unwrap_or_default(), None,
+                ctx.session.batch_ctx_ptr, abi.kv_cache_ptr, use_tma, use_tmem)?;
             Ok(true)
         }
 
@@ -1895,7 +1890,7 @@ pub(crate) fn dispatch_compute_pattern(
         }
 
         // MlaAttention: structural — compressed-space attention + V restore
-        OpKind::MlaAttention { seq_len, num_heads, head_dim, d_c, d_rope, causal: _ } => {
+        OpKind::MlaAttention { seq_len, num_heads, head_dim, d_c, d_rope, causal: _, kv_source: _ } => {
             let q_absorbed_tid = op.inputs.first().copied().ok_or_else(|| CompilerError::CodegenViolation(
                 format!("MlaAttention op {:?}: 缺少 q_absorbed 输入 (inputs[0])", op.id)))?;
             let kv_cache_tid = op.inputs.get(1).copied().ok_or_else(|| CompilerError::CodegenViolation(

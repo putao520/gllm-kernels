@@ -658,9 +658,9 @@ impl ScalarOpRegistry {
         reg.register_with_symexec_fallback(
             OpKindKey::MultiHeadAttention,
             mha_sig.clone(),
-            OpKind::MultiHeadAttention { seq_len: crate::compiler::graph::SymDim::Concrete(1), num_heads: 1, num_kv_heads: 1, head_dim: 1, causal: true, attention_sinks: false },
+            OpKind::MultiHeadAttention { seq_len: crate::compiler::graph::SymDim::Concrete(1), num_heads: 1, num_kv_heads: 1, head_dim: 1, causal: true, attention_sinks: false, kv_source: crate::compiler::graph::KvSource::FromTensor },
             OpTrace {
-                op_kind: OpKind::MultiHeadAttention { seq_len: crate::compiler::graph::SymDim::Concrete(1), num_heads: 1, num_kv_heads: 1, head_dim: 1, causal: true, attention_sinks: false },
+                op_kind: OpKind::MultiHeadAttention { seq_len: crate::compiler::graph::SymDim::Concrete(1), num_heads: 1, num_kv_heads: 1, head_dim: 1, causal: true, attention_sinks: false, kv_source: crate::compiler::graph::KvSource::FromTensor },
                 pattern: ComputePattern::Gemm,
                 signature: mha_sig,
             },
@@ -949,9 +949,9 @@ impl ScalarOpRegistry {
         reg.register_with_symexec_fallback(
             OpKindKey::CachedGQA,
             cached_gqa_sig.clone(),
-            OpKind::CachedGQA { seq_len: 1, total_seq: 1, num_heads: 1, num_kv_heads: 1, head_dim: 1, strategy: crate::compiler::graph::AttentionStrategy::Naive, kv_dtype: crate::types::DType::F32 },
+            OpKind::CachedGQA { seq_len: 1, total_seq: 1, num_heads: 1, num_kv_heads: 1, head_dim: 1, strategy: crate::compiler::graph::AttentionStrategy::Naive, kv_dtype: crate::types::DType::F32, kv_source: crate::compiler::graph::KvSource::FromTensor },
             OpTrace {
-                op_kind: OpKind::CachedGQA { seq_len: 1, total_seq: 1, num_heads: 1, num_kv_heads: 1, head_dim: 1, strategy: crate::compiler::graph::AttentionStrategy::Naive, kv_dtype: crate::types::DType::F32 },
+                op_kind: OpKind::CachedGQA { seq_len: 1, total_seq: 1, num_heads: 1, num_kv_heads: 1, head_dim: 1, strategy: crate::compiler::graph::AttentionStrategy::Naive, kv_dtype: crate::types::DType::F32, kv_source: crate::compiler::graph::KvSource::FromTensor },
                 pattern: ComputePattern::Gemm,
                 signature: cached_gqa_sig,
             },

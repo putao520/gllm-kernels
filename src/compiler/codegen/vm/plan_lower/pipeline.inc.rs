@@ -70,30 +70,33 @@ pub(crate) fn lower_fusion_plan_inner_with_sym_map(
         }
     };
 
-    let ctx = LoweringContext {
+    let sess = CompileSession {
         width,
-        dtype: graph_dtype(graph),
         sym_map,
         registry,
         hook,
         budget: None,
+        page_size: 0,
+        dot_cap: profile.dot_cap,
+        kv_elem_bytes: kv_cache_elem_bytes(graph),
+        debug_jit,
+        virtual_activation: None,
+        virtual_tensor_map: None,
+        layout: None,
+        batch_ctx_ptr: None,
+    };
+    let ctx = LoweringContext {
+        session: &sess,
+        dtype: graph_dtype(graph),
         rope_req,
         ple_req,
         dwc_req,
         exec_pattern: None,
         bottleneck_map: None,
-        virtual_activation: None,
         parallelism: Some(ParallelismDesc::SimdVectorize {
             element_width: width.f32_lanes().max(1),
             unroll_factor: profile.k_unroll_factor,
         }),
-        virtual_tensor_map: None,
-        layout: None,
-        page_size: 0,
-        dot_cap: profile.dot_cap,
-        batch_ctx_ptr: None,
-        debug_jit,
-        kv_elem_bytes: kv_cache_elem_bytes(graph),
     };
 
     let mut prog = VmProgram::new();
@@ -115,13 +118,13 @@ pub(crate) fn lower_fusion_plan_inner_with_sym_map(
     let output_ptr = prog.alloc_vreg(VRegKind::Ptr, SimdWidth::Scalar);
 
     // AbiArg sources (input, weight) — load from physical ABI registers
-    prog.emit(VmInstr::LoadPtr { dst: input_ptr, src: ctx.sym_map.resolve("input").cloned().expect("ABI: input") });
+    prog.emit(VmInstr::LoadPtr { dst: input_ptr, src: ctx.session.sym_map.resolve("input").cloned().expect("ABI: input") });
     if needs_weight {
-        prog.emit(VmInstr::LoadPtr { dst: weight_ptr, src: ctx.sym_map.resolve("weights").cloned().expect("ABI: weights") });
+        prog.emit(VmInstr::LoadPtr { dst: weight_ptr, src: ctx.session.sym_map.resolve("weights").cloned().expect("ABI: weights") });
     }
 
     // StackArg/other sources (output, scratchpad)
-    prog.emit(VmInstr::LoadPtr { dst: output_ptr, src: ctx.sym_map.resolve("output").cloned().expect("ABI: output") });
+    prog.emit(VmInstr::LoadPtr { dst: output_ptr, src: ctx.session.sym_map.resolve("output").cloned().expect("ABI: output") });
 
     // scratchpad_ptr: 在需要 scratch 的融合模式（NormIntoGemm/QkvSharedInput/FFNBlock/
     // TileLevelFusion/ComputeRoot/CrossLayerResidual/FusedQkvNormRope）使用。
@@ -135,7 +138,7 @@ pub(crate) fn lower_fusion_plan_inner_with_sym_map(
         let sp = prog.alloc_vreg(VRegKind::Ptr, SimdWidth::Scalar);
         prog.emit(VmInstr::LoadPtr {
             dst: sp,
-            src: ctx.sym_map.resolve("scratchpad").cloned().expect("ABI: scratchpad"),
+            src: ctx.session.sym_map.resolve("scratchpad").cloned().expect("ABI: scratchpad"),
         });
         sp
     } else {
@@ -200,11 +203,11 @@ pub(super) fn emit_fusion_groups(
     resolver: &TensorPtrResolver,
     topology: &super::topology::GraphTopologyAnalysis,
 ) -> Result<(), CompilerError> {
-    let width = ctx.width;
+    let width = ctx.session.width;
     let dtype = ctx.dtype;
-    let sym_map = ctx.sym_map;
-    let registry = ctx.registry;
-    let hook = ctx.hook;
+    let sym_map = ctx.session.sym_map;
+    let registry = ctx.session.registry;
+    let hook = ctx.session.hook;
     let rope_req = ctx.rope_req;
     let ple_req = ctx.ple_req;
     let dwc_req = ctx.dwc_req;
@@ -605,7 +608,7 @@ pub(super) fn emit_fusion_groups(
                     let fresh_weight = prog.alloc_vreg(VRegKind::Ptr, SimdWidth::Scalar);
                     prog.emit(VmInstr::LoadPtr {
                         dst: fresh_weight,
-                        src: ctx.sym_map.resolve("weights").cloned().expect("ABI: weights"),
+                        src: ctx.session.sym_map.resolve("weights").cloned().expect("ABI: weights"),
                     });
 
                     // §0.2.8 WeightPrefetchWait: wait for the prefetch issued at the
@@ -662,7 +665,7 @@ pub(super) fn emit_fusion_groups(
                 let fresh_weight_base = prog.alloc_vreg(VRegKind::Ptr, SimdWidth::Scalar);
                 prog.emit(VmInstr::LoadPtr {
                     dst: fresh_weight_base,
-                    src: ctx.sym_map.resolve("weights").cloned().expect("ABI: weights"),
+                    src: ctx.session.sym_map.resolve("weights").cloned().expect("ABI: weights"),
                 });
                 state.abi.weight_ptr = Some(fresh_weight_base);
                 state.abi.layer_loop_counter = None;

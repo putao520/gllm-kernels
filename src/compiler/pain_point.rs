@@ -5,7 +5,7 @@
 //! 零运行时依赖 — 所有输入在编译时已知。
 
 use std::collections::HashMap;
-use crate::compiler::graph::{CompilerGraph, OpId, OpKind};
+use crate::compiler::graph::{CompilerGraph, OpId, OpKind, KvSource};
 use crate::dispatch::device_profile::DeviceProfile;
 
 /// GEMM 在模型中的角色 (影响融合策略选择)
@@ -930,6 +930,7 @@ mod tests {
             seq_len: SymDim::Concrete(1),
             num_heads: 4, num_kv_heads: 2, head_dim: 64,
             causal: true, attention_sinks: false,
+            kv_source: KvSource::FromTensor,
         }, vec![gemm_out], vec![mha_out], "mha");
 
         // Act

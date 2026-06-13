@@ -503,7 +503,7 @@ fn try_auto_dispatch_elementwise(
         return Ok(false);
     }
 
-    let reg = match ctx.registry {
+    let reg = match ctx.session.registry {
         Some(r) => r,
         None => return Ok(false),
     };
@@ -590,9 +590,9 @@ fn try_auto_dispatch_elementwise(
         false
     };
 
-    let _acc = emit_elementwise_inline(prog, &body, &out_shape, ctx.width, is_binary,
+    let _acc = emit_elementwise_inline(prog, &body, &out_shape, ctx.session.width, is_binary,
         weight_is_broadcast,
-        resolved_input, resolved_weight, resolved_output, ctx.sym_map, seq_bound_override, ctx.dtype)?;
+        resolved_input, resolved_weight, resolved_output, ctx.session.sym_map, seq_bound_override, ctx.dtype)?;
 
     Ok(true)
 }
@@ -624,7 +624,7 @@ fn try_dispatch_normlike(
     }
     let seq_bound = seq_bound_override
         .cloned()
-        .or_else(|| out_shape.first().map(|d| ctx.sym_map.to_bound(d)))
+        .or_else(|| out_shape.first().map(|d| ctx.session.sym_map.to_bound(d)))
         .unwrap_or(BoundExpr::Const(1));
     let norm_kind = match &op.kind {
         OpKind::RmsNorm { .. } => NormKind::RmsNorm,
@@ -636,7 +636,7 @@ fn try_dispatch_normlike(
     emit_normlike_inline(
         prog, pattern, feature_dim, /*groups_per_row=*/1,
         /*broadcast_weight=*/false, norm_kind,
-        ctx.width, seq_bound, input_ptr, weight_ptr, output_ptr,
+        ctx.session.width, seq_bound, input_ptr, weight_ptr, output_ptr,
         ctx.dtype,
     )?;
     Ok(true)
@@ -702,7 +702,7 @@ pub(crate) fn try_dispatch_reduction(
             "try_dispatch_reduction: zero feature_dim".into()));
     }
 
-    let width = ctx.width;
+    let width = ctx.session.width;
     let dtype = ctx.dtype;
     let lanes = width.f32_lanes().max(1);
     let elem = dtype.elem_bytes();
@@ -714,7 +714,7 @@ pub(crate) fn try_dispatch_reduction(
     // so that 1/N uses the actual runtime seq_len, not 1/max_alloc.
     let seq_bound = match &seq_bound {
         BoundExpr::Symbolic(_sb) => {
-            let resolved = ctx.sym_map.resolve("seq_len").cloned();
+            let resolved = ctx.session.sym_map.resolve("seq_len").cloned();
             eprintln!("[MEANPOOL-SYMDIM] Symbolic seq_bound, sym_map.resolve('seq_len') = {:?}", resolved);
             resolved
                 .map(BoundExpr::Runtime)
@@ -871,9 +871,9 @@ pub(super) fn emit_standalone_op(
     resolver: &TensorPtrResolver,
     abi: &AbiPtrs,
 ) -> Result<(), CompilerError> {
-    let width = ctx.width;
-    let sym_map = ctx.sym_map;
-    let registry = ctx.registry;
+    let width = ctx.session.width;
+    let sym_map = ctx.session.sym_map;
+    let registry = ctx.session.registry;
     // Elementwise seq_bound_override: reuse resolve_dim logic for outer Symbolic dim.
     let seq_bound_override: Option<BoundExpr> = abi.mega_decode_seq_len.map(BoundExpr::DynamicVReg);
 

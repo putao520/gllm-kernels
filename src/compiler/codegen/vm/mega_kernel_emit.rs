@@ -4,7 +4,7 @@ use super::instr::*;
 use super::isa_profile::IsaProfile;
 use super::vm_state::AbiPtrs;
 use super::plan_lower::{
-    LoweringContext, SymDimSlotMap, TensorPtrResolver,
+    CompileSession, LoweringContext, SymDimSlotMap, TensorPtrResolver,
     emit_fusion_groups, compute_rope_requirement, compute_ple_requirement,
     compute_dwc_requirement, graph_dtype, kv_cache_elem_bytes, maybe_debug_bp,
 };
@@ -1257,32 +1257,35 @@ pub fn compile_mega_kernel_vm(
         activation_pong_ptr: None,
     };
 
-    let ctx = LoweringContext {
+    let sess = CompileSession {
         width,
-        dtype: graph_dtype(graph),
         sym_map: &sym_map,
         registry,
         hook,
         budget: None,
+        page_size: 0,
+        dot_cap: profile.dot_cap,
+        kv_elem_bytes: kv_cache_elem_bytes(graph),
+        debug_jit,
+        virtual_activation,
+        virtual_tensor_map,
+        layout,
+        batch_ctx_ptr: None,
+    };
+    let ctx = LoweringContext {
+        session: &sess,
+        dtype: graph_dtype(graph),
         rope_req: rope_req.as_ref(),
         ple_req: ple_req.as_ref(),
         dwc_req: dwc_req.as_ref(),
         exec_pattern: None,
         bottleneck_map,
-        virtual_activation,
         parallelism: Some(ParallelismDesc::SimdVectorize {
             element_width: width.f32_lanes().max(1),
             unroll_factor: profile.k_unroll_factor,
         }),
-        virtual_tensor_map,
-        layout,
-        page_size: 0,
-        dot_cap: profile.dot_cap,
-        batch_ctx_ptr: None, // ARCH-LEGACY-NO-BCI: legacy path is non-batch (v5=NULL at runtime).
-        debug_jit,
-        kv_elem_bytes: kv_cache_elem_bytes(graph),
     };
-    let kv_eb = ctx.kv_elem_bytes;
+    let kv_eb = sess.kv_elem_bytes;
     let dtype_eb = ctx.dtype.elem_bytes();
     if kv_eb != dtype_eb {
         eprintln!("[DIAG-KV-DTYPE] kv_elem_bytes={} != dtype.elem_bytes={} — KV cache stride mismatch!", kv_eb, dtype_eb);
@@ -1725,30 +1728,34 @@ pub fn compile_mega_kernel_vm(
             batch_resolver.override_source(logits_tid, TensorPtrSource::Output { offset: 0 });
         }
 
-        let batch_ctx = LoweringContext {
+        let batch_session = CompileSession {
             width,
-            dtype: graph_dtype(graph),
             sym_map: &sym_map,
             registry,
             hook,
             budget: None,
+            page_size: 0,
+            dot_cap: profile.dot_cap,
+            debug_jit,
+            kv_elem_bytes: kv_cache_elem_bytes(graph),
+            virtual_activation,
+            virtual_tensor_map,
+            layout,
+            batch_ctx_ptr: Some(batch_ctx_ptr),
+        };
+
+        let batch_ctx = LoweringContext {
+            session: &batch_session,
+            dtype: graph_dtype(graph),
             rope_req: rope_req.as_ref(),
             ple_req: ple_req.as_ref(),
             dwc_req: dwc_req.as_ref(),
             exec_pattern: None,
             bottleneck_map,
-            virtual_activation,
             parallelism: Some(ParallelismDesc::SimdVectorize {
                 element_width: width.f32_lanes().max(1),
                 unroll_factor: profile.k_unroll_factor,
             }),
-            virtual_tensor_map,
-            layout,
-            page_size: 0,
-            dot_cap: profile.dot_cap,
-            batch_ctx_ptr: Some(batch_ctx_ptr),
-            debug_jit,
-            kv_elem_bytes: kv_cache_elem_bytes(graph),
         };
 
         // Emit batch prefill forward pass: embed → N layers → logits producer

@@ -1,3 +1,14 @@
+/// KV cache 来源 — op-level 自描述，替代 graph-level topology 推导。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum KvSource {
+    /// K/V 来自当前图的 tensor（self-attention prefill、conformer encoder 等）。
+    /// 不读写持久化 KV cache，zero cache copy overhead。
+    FromTensor,
+    /// K/V 来自持久化 KV cache（LLM decoder generate loop）。
+    /// layer_idx 标识读写哪一层。
+    FromCache { layer_idx: usize },
+}
+
 /// The set of operations the compiler graph can represent.
 #[derive(Debug, Clone, PartialEq)]
 pub enum OpKind {
@@ -57,7 +68,7 @@ pub enum OpKind {
     ///     running_sum ← running_sum * corr + weight
     ///     running_max ← new_max
     ///   o[qi,h,d] ← o_acc[d] / running_sum          (sink does **not** contribute to output)
-    MultiHeadAttention { seq_len: SymDim, num_heads: usize, num_kv_heads: usize, head_dim: usize, causal: bool, attention_sinks: bool },
+    MultiHeadAttention { seq_len: SymDim, num_heads: usize, num_kv_heads: usize, head_dim: usize, causal: bool, attention_sinks: bool, kv_source: KvSource },
     /// Rotary position embedding (non-interleaved).
     /// `partial` controls what fraction of head_dim dimensions are rotated (0.0~1.0).
     /// 1.0 = standard full RoPE. Gemma 4 global layers use 0.25 (p-RoPE).
@@ -272,6 +283,7 @@ pub enum OpKind {
         head_dim: usize,
         strategy: AttentionStrategy,
         kv_dtype: DType,
+        kv_source: KvSource,
     },
     /// MoE gate: hidden[seq_len, hidden] @ router_w[hidden, num_experts] → softmax → top_k gate selection
     MoEGate {
@@ -720,6 +732,7 @@ pub enum OpKind {
         d_c: usize,
         d_rope: usize,
         causal: bool,
+        kv_source: KvSource,
     },
 
     /// MLA decoupled RoPE merge: replace c_KV[d_c-d_rope..d_c] with RoPE(k_pe).

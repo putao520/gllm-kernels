@@ -10,7 +10,7 @@
 //! provides a richer classification derived from `OpTrace::ComputePattern`
 //! and is preferred in new code paths.
 
-use crate::compiler::graph::OpKind;
+use crate::compiler::graph::{OpKind, KvSource};
 #[cfg(test)]
 use crate::compiler::graph::SymDim;
 
@@ -272,7 +272,7 @@ pub fn arithmetic_intensity(kind: &OpKind, graph_dtype: crate::types::DType) -> 
             6.0 / (4.0 * eb)
         }
         // Multi-head attention: O(s^2 * d * h) compute, dominated by QK^T and attn@V
-        OpKind::MultiHeadAttention { seq_len, num_heads, num_kv_heads: _, head_dim, causal: _, attention_sinks: _ } => {
+        OpKind::MultiHeadAttention { seq_len, num_heads, num_kv_heads: _, head_dim, causal: _, attention_sinks: _, kv_source: _ } => {
             // ARCH-SYMDIM-DEGRADE: cost model uses max_for_allocation for conservative estimate.
             // TODO(G-2): preserve symbolic form for tighter bounds.
             let s = seq_len.max_for_allocation_strict().expect("ARCH-SYMDIM: Symbolic dim must have max_value in cost model") as f64;
@@ -633,7 +633,7 @@ mod tests {
     fn test_classify_attention() {
         use crate::compiler::graph::AttentionStrategy;
         assert_eq!(
-            classify(&OpKind::MultiHeadAttention { seq_len: SymDim::Concrete(32), num_heads: 32, num_kv_heads: 32, head_dim: 128, causal: true, attention_sinks: false }),
+            classify(&OpKind::MultiHeadAttention { seq_len: SymDim::Concrete(32), num_heads: 32, num_kv_heads: 32, head_dim: 128, causal: true, attention_sinks: false, kv_source: KvSource::FromTensor }),
             OpSemantics::Attention,
         );
         assert_eq!(
@@ -641,6 +641,7 @@ mod tests {
                 seq_len: 1, total_seq: 128, num_heads: 32,
                 num_kv_heads: 8, head_dim: 128,
                 strategy: AttentionStrategy::Naive, kv_dtype: DType::F32,
+                kv_source: KvSource::FromTensor,
             }),
             OpSemantics::Attention,
         );
@@ -700,7 +701,7 @@ mod tests {
         );
         // MLA Attention should classify as Attention
         assert_eq!(
-            classify(&OpKind::MlaAttention { seq_len: SymDim::Concrete(32), num_heads: 32, head_dim: 128, d_c: 512, d_rope: 64, causal: true }),
+            classify(&OpKind::MlaAttention { seq_len: SymDim::Concrete(32), num_heads: 32, head_dim: 128, d_c: 512, d_rope: 64, causal: true, kv_source: KvSource::FromTensor }),
             OpSemantics::Attention,
         );
         // MLA RoPE merge is elementwise

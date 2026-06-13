@@ -7,7 +7,7 @@
 //! 每个自然数据搬运点都是"免费变换窗口"，协商器识别并利用这些窗口。
 
 use std::collections::HashMap;
-use crate::compiler::graph::{CompilerGraph, OpId, OpKind};
+use crate::compiler::graph::{CompilerGraph, OpId, OpKind, KvSource};
 use crate::compiler::fusion::{FusionGroup, FusionMode};
 use crate::compiler::semantic_dag::{SemanticDAG, OpClass};
 use crate::compiler::accel_registry::{AccelerationRegistry, LayoutConstraint};
@@ -906,7 +906,7 @@ mod tests {
     #[test]
     fn test_model_aware_mha_overrides_headsplit() {
         // Arrange
-        use crate::compiler::graph::{CompilerGraph, OpKind, LayerCondition, SymDim};
+        use crate::compiler::graph::{CompilerGraph, OpKind, KvSource, LayerCondition, SymDim};
         use crate::types::DType;
 
         let mut graph = CompilerGraph::new();
@@ -920,6 +920,7 @@ mod tests {
                 head_dim: 128,
                 causal: true,
                 attention_sinks: false,
+            kv_source: KvSource::FromTensor,
             },
             vec![tin],
             vec![tout],
@@ -944,7 +945,7 @@ mod tests {
     #[test]
     fn test_model_aware_non_qkv_gemm_unchanged() {
         // Arrange
-        use crate::compiler::graph::{CompilerGraph, OpKind, LayerCondition, SymDim};
+        use crate::compiler::graph::{CompilerGraph, OpKind, KvSource, LayerCondition, SymDim};
         use crate::types::DType;
 
         let mut graph = CompilerGraph::new();
@@ -983,7 +984,7 @@ mod tests {
     #[test]
     fn test_model_aware_gemm_panel_packed_weight_override() {
         // Arrange
-        use crate::compiler::graph::{CompilerGraph, OpKind, LayerCondition, SymDim};
+        use crate::compiler::graph::{CompilerGraph, OpKind, KvSource, LayerCondition, SymDim};
         use crate::types::DType;
 
         let mut graph = CompilerGraph::new();
@@ -1181,7 +1182,7 @@ mod tests {
     #[test]
     fn test_model_aware_mha_any_promoted_to_headsplit() {
         // Arrange
-        use crate::compiler::graph::{CompilerGraph, OpKind, LayerCondition, SymDim};
+        use crate::compiler::graph::{CompilerGraph, OpKind, KvSource, LayerCondition, SymDim};
         use crate::types::DType;
 
         let mut graph = CompilerGraph::new();
@@ -1195,6 +1196,7 @@ mod tests {
                 head_dim: 256,
                 causal: false,
                 attention_sinks: false,
+            kv_source: KvSource::FromTensor,
             },
             vec![tin],
             vec![tout],
@@ -1218,7 +1220,7 @@ mod tests {
     #[test]
     fn test_is_qkv_op_three_sibling_gemms() {
         // Arrange
-        use crate::compiler::graph::{CompilerGraph, OpKind, LayerCondition, SymDim};
+        use crate::compiler::graph::{CompilerGraph, OpKind, KvSource, LayerCondition, SymDim};
         use crate::types::DType;
 
         let mut graph = CompilerGraph::new();
@@ -1246,7 +1248,7 @@ mod tests {
     #[test]
     fn test_is_qkv_op_single_gemm_returns_false() {
         // Arrange
-        use crate::compiler::graph::{CompilerGraph, OpKind, LayerCondition, SymDim};
+        use crate::compiler::graph::{CompilerGraph, OpKind, KvSource, LayerCondition, SymDim};
         use crate::types::DType;
 
         let mut graph = CompilerGraph::new();
@@ -1273,7 +1275,7 @@ mod tests {
     #[test]
     fn test_extract_head_dim_from_rope() {
         // Arrange
-        use crate::compiler::graph::{CompilerGraph, OpKind};
+        use crate::compiler::graph::{CompilerGraph, OpKind, KvSource};
         use crate::types::DType;
 
         let mut graph = CompilerGraph::new();
@@ -1304,7 +1306,7 @@ mod tests {
     #[test]
     fn test_extract_head_dim_missing_returns_none() {
         // Arrange
-        use crate::compiler::graph::{CompilerGraph, OpKind, LayerCondition, SymDim};
+        use crate::compiler::graph::{CompilerGraph, OpKind, KvSource, LayerCondition, SymDim};
         use crate::types::DType;
 
         let mut graph = CompilerGraph::new();
@@ -1516,7 +1518,7 @@ mod tests {
     #[test]
     fn test_is_qkv_op_two_sibling_gemms_returns_false() {
         // Arrange
-        use crate::compiler::graph::{CompilerGraph, OpKind, LayerCondition, SymDim};
+        use crate::compiler::graph::{CompilerGraph, OpKind, KvSource, LayerCondition, SymDim};
         use crate::types::DType;
 
         let mut graph = CompilerGraph::new();
@@ -1542,7 +1544,7 @@ mod tests {
     #[test]
     fn test_model_aware_mha_preserves_existing_headsplit() {
         // Arrange
-        use crate::compiler::graph::{CompilerGraph, OpKind, LayerCondition, SymDim};
+        use crate::compiler::graph::{CompilerGraph, OpKind, KvSource, LayerCondition, SymDim};
         use crate::types::DType;
 
         let mut graph = CompilerGraph::new();
@@ -1556,6 +1558,7 @@ mod tests {
                 head_dim: 128,
                 causal: true,
                 attention_sinks: false,
+            kv_source: KvSource::FromTensor,
             },
             vec![tin],
             vec![tout],
@@ -1581,7 +1584,7 @@ mod tests {
     #[test]
     fn test_extract_head_dim_from_mha() {
         // Arrange
-        use crate::compiler::graph::{CompilerGraph, OpKind, LayerCondition, SymDim};
+        use crate::compiler::graph::{CompilerGraph, OpKind, KvSource, LayerCondition, SymDim};
         use crate::types::DType;
 
         let mut graph = CompilerGraph::new();
@@ -1595,6 +1598,7 @@ mod tests {
                 head_dim: 128,
                 causal: true,
                 attention_sinks: false,
+            kv_source: KvSource::FromTensor,
             },
             vec![tin],
             vec![tout],
@@ -1616,7 +1620,7 @@ mod tests {
     #[test]
     fn test_model_aware_gemmbias_non_qkv_preserves_layout() {
         // Arrange
-        use crate::compiler::graph::{CompilerGraph, OpKind, LayerCondition, SymDim};
+        use crate::compiler::graph::{CompilerGraph, OpKind, KvSource, LayerCondition, SymDim};
         use crate::types::DType;
 
         let mut graph = CompilerGraph::new();
@@ -1659,7 +1663,7 @@ mod tests {
     fn test_model_aware_gemmbias_qkv_gets_headsplit() {
         // Arrange: build a graph with an MHA to extract head_dim, then 3 GemmBias
         // sharing the same input tensor.
-        use crate::compiler::graph::{CompilerGraph, OpKind, LayerCondition, SymDim};
+        use crate::compiler::graph::{CompilerGraph, OpKind, KvSource, LayerCondition, SymDim};
         use crate::types::DType;
 
         let mut graph = CompilerGraph::new();
@@ -1674,6 +1678,7 @@ mod tests {
                 head_dim: 64,
                 causal: true,
                 attention_sinks: false,
+            kv_source: KvSource::FromTensor,
             },
             vec![mq],
             vec![mo],
@@ -1714,7 +1719,7 @@ mod tests {
     #[test]
     fn test_model_aware_gemmbias_panel_packed_weight() {
         // Arrange
-        use crate::compiler::graph::{CompilerGraph, OpKind, LayerCondition, SymDim};
+        use crate::compiler::graph::{CompilerGraph, OpKind, KvSource, LayerCondition, SymDim};
         use crate::types::DType;
 
         let mut graph = CompilerGraph::new();
@@ -1754,7 +1759,7 @@ mod tests {
     #[test]
     fn test_model_aware_rmsnorm_passthrough() {
         // Arrange
-        use crate::compiler::graph::{CompilerGraph, OpKind};
+        use crate::compiler::graph::{CompilerGraph, OpKind, KvSource};
         use crate::types::DType;
 
         let mut graph = CompilerGraph::new();
@@ -1802,7 +1807,7 @@ mod tests {
     #[test]
     fn test_is_qkv_op_non_gemm_returns_false() {
         // Arrange
-        use crate::compiler::graph::{CompilerGraph, OpKind};
+        use crate::compiler::graph::{CompilerGraph, OpKind, KvSource};
         use crate::types::DType;
 
         let mut graph = CompilerGraph::new();
@@ -1827,7 +1832,7 @@ mod tests {
     #[test]
     fn test_is_qkv_op_gemm_no_inputs() {
         // Arrange: manually construct a graph with a Gemm that has no inputs
-        use crate::compiler::graph::{CompilerGraph, CompilerOp, LayerCondition, OpKind, SymDim};
+        use crate::compiler::graph::{CompilerGraph, CompilerOp, LayerCondition, OpKind, KvSource, SymDim};
         use crate::types::DType;
 
         let mut graph = CompilerGraph::new();
@@ -1862,7 +1867,7 @@ mod tests {
     #[test]
     fn test_extract_head_dim_mha_priority_over_rope() {
         // Arrange: graph with MHA first, then RoPE with different head_dim
-        use crate::compiler::graph::{CompilerGraph, OpKind, LayerCondition, SymDim};
+        use crate::compiler::graph::{CompilerGraph, OpKind, KvSource, LayerCondition, SymDim};
         use crate::types::DType;
 
         let mut graph = CompilerGraph::new();
@@ -1877,6 +1882,7 @@ mod tests {
                 head_dim: 96,
                 causal: false,
                 attention_sinks: false,
+            kv_source: KvSource::FromTensor,
             },
             vec![mq],
             vec![mo],
@@ -1985,7 +1991,7 @@ mod tests {
     fn test_model_aware_gemm_qkv_head_dim_extraction() {
         // Arrange: graph with MHA head_dim=80, then 3 Gemm ops (QKV) with n=640
         // num_heads = 640 / 80 = 8
-        use crate::compiler::graph::{CompilerGraph, OpKind, LayerCondition, SymDim};
+        use crate::compiler::graph::{CompilerGraph, OpKind, KvSource, LayerCondition, SymDim};
         use crate::types::DType;
 
         let mut graph = CompilerGraph::new();
@@ -2001,6 +2007,7 @@ mod tests {
                 head_dim: 80,
                 causal: false,
                 attention_sinks: false,
+            kv_source: KvSource::FromTensor,
             },
             vec![mq],
             vec![mo],
@@ -2121,7 +2128,7 @@ mod tests {
     #[test]
     fn test_model_aware_gemm_non_panel_weight_passthrough() {
         // Arrange
-        use crate::compiler::graph::{CompilerGraph, OpKind, LayerCondition, SymDim};
+        use crate::compiler::graph::{CompilerGraph, OpKind, KvSource, LayerCondition, SymDim};
         use crate::types::DType;
 
         let mut graph = CompilerGraph::new();
@@ -2186,7 +2193,7 @@ mod tests {
     #[test]
     fn test_is_qkv_op_first_sibling_detected() {
         // Arrange
-        use crate::compiler::graph::{CompilerGraph, OpKind, LayerCondition, SymDim};
+        use crate::compiler::graph::{CompilerGraph, OpKind, KvSource, LayerCondition, SymDim};
         use crate::types::DType;
 
         let mut graph = CompilerGraph::new();
@@ -2566,7 +2573,7 @@ mod tests {
     #[test]
     fn test_model_aware_gemmbias_colmajor_weight_passthrough() {
         // Arrange
-        use crate::compiler::graph::{CompilerGraph, OpKind, LayerCondition, SymDim};
+        use crate::compiler::graph::{CompilerGraph, OpKind, KvSource, LayerCondition, SymDim};
         use crate::types::DType;
 
         let mut graph = CompilerGraph::new();
@@ -2730,7 +2737,7 @@ mod tests {
     #[test]
     fn test_model_aware_gemm_qkv_without_mha_fallback_head_dim() {
         // Arrange: 3 Gemm ops sharing input, but no MHA/RoPE in the graph
-        use crate::compiler::graph::{CompilerGraph, OpKind, LayerCondition, SymDim};
+        use crate::compiler::graph::{CompilerGraph, OpKind, KvSource, LayerCondition, SymDim};
         use crate::types::DType;
 
         let mut graph = CompilerGraph::new();
@@ -2883,7 +2890,7 @@ mod tests {
     #[test]
     fn test_model_aware_gemm_any_output_non_qkv() {
         // Arrange
-        use crate::compiler::graph::{CompilerGraph, OpKind, LayerCondition, SymDim};
+        use crate::compiler::graph::{CompilerGraph, OpKind, KvSource, LayerCondition, SymDim};
         use crate::types::DType;
 
         let mut graph = CompilerGraph::new();
@@ -3020,7 +3027,7 @@ mod tests {
     #[test]
     fn test_is_qkv_op_quant_gemm_siblings_counted() {
         // Arrange: 2 regular Gemm + 1 QuantGemm sharing the same input
-        use crate::compiler::graph::{CompilerGraph, CompilerOp, LayerCondition, OpKind, SymDim};
+        use crate::compiler::graph::{CompilerGraph, CompilerOp, LayerCondition, OpKind, KvSource, SymDim};
         use crate::types::DType;
 
         let mut graph = CompilerGraph::new();
@@ -3056,7 +3063,7 @@ mod tests {
     #[test]
     fn test_extract_head_dim_silu_rmsnorm_returns_none() {
         // Arrange
-        use crate::compiler::graph::{CompilerGraph, OpKind};
+        use crate::compiler::graph::{CompilerGraph, OpKind, KvSource};
         use crate::types::DType;
 
         let mut graph = CompilerGraph::new();

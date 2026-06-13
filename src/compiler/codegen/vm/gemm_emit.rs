@@ -37,9 +37,9 @@ pub(crate) fn emit_gemm_inline_with_hook<'a>(
     trans_b: bool,
 ) -> Result<(), CompilerError> {
     use super::isa_hook::FmaStrategy;
-    let width = ctx.width;
-    let sym_map = &ctx.sym_map;
-    let budget = ctx.budget.as_ref();
+    let width = ctx.session.width;
+    let sym_map = &ctx.session.sym_map;
+    let budget = ctx.session.budget.as_ref();
     // §0.2.10: per-op ParallelismDesc — decode (M=1) unroll=1, prefill unroll=k_unroll
     let k_unroll = gemm_op_id
         .and_then(|id| ctx.parallelism_for_op(id))
@@ -56,7 +56,7 @@ pub(crate) fn emit_gemm_inline_with_hook<'a>(
                 })
                 .unwrap_or(1)
         });
-    let hook = ctx.hook.ok_or_else(|| CompilerError::CodegenViolation(
+    let hook = ctx.session.hook.ok_or_else(|| CompilerError::CodegenViolation(
         "emit_gemm_inline_with_hook: IsaHook is mandatory (ARCH-ISA-HOOK-MANDATORY)".into(),
     ))?;
     let m = match m_dim {

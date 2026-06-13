@@ -535,27 +535,30 @@ mod tests {
         let registry = ScalarOpRegistry::with_defaults();
         let hook = super::super::isa_hook::select_hook(&isa_profile);
         let resolver = TensorPtrResolver::build(&graph, &alloc, &super::super::topology::GraphTopologyAnalysis::analyze(&graph));
-        let ctx = LoweringContext {
+        let sess = CompileSession {
             width: isa_profile.optimal_simd_width(),
-            dtype: graph_dtype(&graph),
             sym_map: &SymDimSlotMap::mega_kernel_abi(),
             registry: Some(&registry),
             hook: Some(hook.as_ref()),
             budget: Some(super::super::isa_hook::ResourceBudget::from_isa_profile(&isa_profile)),
+            page_size: 0,
+            dot_cap: isa_profile.dot_cap,
+            kv_elem_bytes: 4,
+            debug_jit: false,
+            virtual_activation: None,
+            virtual_tensor_map: None,
+            layout: None,
+            batch_ctx_ptr: None,
+        };
+        let ctx = LoweringContext {
+            session: &sess,
+            dtype: graph_dtype(&graph),
             rope_req: None,
             ple_req: None,
             dwc_req: None,
             exec_pattern: None,
             bottleneck_map: None,
-            virtual_activation: None,
             parallelism: None,
-            virtual_tensor_map: None,
-            layout: None,
-            page_size: 0,
-            dot_cap: isa_profile.dot_cap,
-            batch_ctx_ptr: None,
-            debug_jit: false,
-            kv_elem_bytes: 4,
         };
 
         let template = compile_layer_type_body(&ctx, 0..1, &plan, &graph, &alloc, &resolver).unwrap();

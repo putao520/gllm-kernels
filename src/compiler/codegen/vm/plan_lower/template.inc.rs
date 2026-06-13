@@ -84,7 +84,7 @@ pub fn compile_layer_type_body(
             resolver, &tpl_abi,
         )?;
 
-        emit_inter_group_casts(&mut template_prog, group, graph, ctx.width, &tpl_abi, resolver)?;
+        emit_inter_group_casts(&mut template_prog, group, graph, ctx.session.width, &tpl_abi, resolver)?;
     }
 
     Ok(super::instr::LayerTemplate {

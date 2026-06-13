@@ -3,7 +3,7 @@
 use super::instr::*;
 use super::vm_state::AbiPtrs;
 use super::plan_lower::{
-    LoweringContext, TensorPtrResolver,
+    LoweringContext, CompileSession, TensorPtrResolver,
     emit_standalone_op, emit_elementwise_inline,
     extract_gemm_dims_sym, collect_epilogue_trace,
     load_op_scratch_ptr, extract_op_trace, infer_output_shape_sym,
@@ -134,7 +134,7 @@ pub(super) fn verify_and_emit_dtype_casts(
 ) -> Result<usize, CompilerError> {
     use super::plan_lower::op_input_dtype;
 
-    let width = ctx.width;
+    let width = ctx.session.width;
     let mut cast_count = 0usize;
 
     // 收集组内所有 op（按执行顺序）
@@ -269,12 +269,12 @@ pub(super) fn emit_fusion_group_by_mode(
     resolver: &TensorPtrResolver,
     abi: &AbiPtrs,
 ) -> Result<(), CompilerError> {
-    let width = ctx.width;
-    let sym_map = ctx.sym_map;
-    let registry = ctx.registry;
+    let width = ctx.session.width;
+    let sym_map = ctx.session.sym_map;
+    let registry = ctx.session.registry;
 
     // §0.2.11: 获取当前融合组的布局协商结果
-    let group_layout = ctx.layout
+    let group_layout = ctx.session.layout
         .and_then(|la| la.group_assignments.iter().find(|ga| ga.group_id == group.id));
 
     // §0.2.11: 处理 InterOpTransform — 在 op 间插入布局变换 VmInstr
@@ -448,7 +448,7 @@ pub(super) fn emit_fusion_group_by_mode(
                         if let Some(bias_ptr) = resolver.materialize(p, bias_tid, abi) {
                             let m_bound = seq_bound_override.cloned()
                                 .unwrap_or_else(|| sym_map.to_bound(&m_dim));
-                            emit_bias_add(p, group_output_ptr, bias_ptr, n, m_bound, ctx.width, ctx.dtype, sym_map);
+                            emit_bias_add(p, group_output_ptr, bias_ptr, n, m_bound, ctx.session.width, ctx.dtype, sym_map);
                         }
                     }
                 }
@@ -480,7 +480,7 @@ pub(super) fn emit_fusion_group_by_mode(
                                     if let Some(bias_ptr) = resolver.materialize(p, bias_tid, abi) {
                                         let m_bound = seq_bound_override.cloned()
                                             .unwrap_or_else(|| sym_map.to_bound(&m_dim));
-                                        emit_bias_add(p, out_ptr, bias_ptr, n, m_bound, ctx.width, ctx.dtype, sym_map);
+                                        emit_bias_add(p, out_ptr, bias_ptr, n, m_bound, ctx.session.width, ctx.dtype, sym_map);
                                     }
                                 }
                             }
@@ -520,7 +520,7 @@ pub(super) fn emit_fusion_group_by_mode(
                     if let Some(bias_ptr) = resolver.materialize(prog, bias_tid, abi) {
                         let m_bound = seq_bound_override.cloned()
                             .unwrap_or_else(|| sym_map.to_bound(&m_dim));
-                        emit_bias_add(prog, group_output_ptr, bias_ptr, n, m_bound, ctx.width, ctx.dtype, sym_map);
+                        emit_bias_add(prog, group_output_ptr, bias_ptr, n, m_bound, ctx.session.width, ctx.dtype, sym_map);
                     }
                 }
             }
@@ -558,7 +558,7 @@ pub(super) fn emit_fusion_group_by_mode(
                     if let Some(bias_ptr) = resolver.materialize(prog, bias_tid, abi) {
                         let m_bound = seq_bound_override.cloned()
                             .unwrap_or_else(|| sym_map.to_bound(&m_dim));
-                        emit_bias_add(prog, group_output_ptr, bias_ptr, n, m_bound, ctx.width, ctx.dtype, sym_map);
+                        emit_bias_add(prog, group_output_ptr, bias_ptr, n, m_bound, ctx.session.width, ctx.dtype, sym_map);
                     }
                 }
             }
@@ -591,7 +591,7 @@ pub(super) fn emit_fusion_group_by_mode(
                             if let Some(bias_ptr) = resolver.materialize(p, bias_tid, abi) {
                                 let m_bound = seq_bound_override.cloned()
                                     .unwrap_or_else(|| sym_map.to_bound(&m_dim));
-                                emit_bias_add(p, gate_scratch, bias_ptr, n, m_bound, ctx.width, ctx.dtype, sym_map);
+                                emit_bias_add(p, gate_scratch, bias_ptr, n, m_bound, ctx.session.width, ctx.dtype, sym_map);
                             }
                         }
                     }
@@ -618,7 +618,7 @@ pub(super) fn emit_fusion_group_by_mode(
                             if let Some(bias_ptr) = resolver.materialize(p, bias_tid, abi) {
                                 let m_bound = seq_bound_override.cloned()
                                     .unwrap_or_else(|| sym_map.to_bound(&m_dim));
-                                emit_bias_add(p, up_scratch, bias_ptr, n, m_bound, ctx.width, ctx.dtype, sym_map);
+                                emit_bias_add(p, up_scratch, bias_ptr, n, m_bound, ctx.session.width, ctx.dtype, sym_map);
                             }
                         }
                     }
@@ -1906,14 +1906,20 @@ mod tests {
         let mut prog = VmProgram::new();
         let width = SimdWidth::W256;
         let sym_map = super::super::plan_lower::SymDimSlotMap::mega_kernel_abi();
-        let ctx = LoweringContext {
-            width, dtype: QuantPrecision::BF16, sym_map: &sym_map,
+        let sess = CompileSession {
+            width, sym_map: &sym_map,
             registry: None, hook: None, budget: None,
+            page_size: 0, dot_cap: crate::dispatch::device_profile::DotProductCap::None,
+            kv_elem_bytes: 2, debug_jit: false,
+            virtual_activation: None, virtual_tensor_map: None, layout: None,
+            batch_ctx_ptr: None,
+        };
+        let ctx = LoweringContext {
+            session: &sess,
+            dtype: QuantPrecision::BF16,
             rope_req: None, ple_req: None, dwc_req: None,
-            exec_pattern: None, bottleneck_map: None, virtual_activation: None,
-            parallelism: None, virtual_tensor_map: None, layout: None,
-            page_size: 0, dot_cap: crate::dispatch::device_profile::DotProductCap::None, batch_ctx_ptr: None, debug_jit: false,
-            kv_elem_bytes: 2,
+            exec_pattern: None, bottleneck_map: None,
+            parallelism: None,
         };
         let abi = make_test_abi();
 

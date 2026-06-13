@@ -630,6 +630,7 @@ impl CompilerGraph {
                 head_dim: ir.head_dim,
                 causal: false, // encoder: bidirectional attention
                 attention_sinks: false,
+                kv_source: crate::compiler::graph::KvSource::FromTensor,
             },
             vec![q_out, k_out, v_out],
             vec![attn_out],

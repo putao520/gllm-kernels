@@ -3,7 +3,7 @@
 //! Each node carries its OpTrace (from Scalar + SymExec) and auto-derived OpClass
 //! (from ComputePattern). This replaces the old hand-maintained OpSemantics mapping.
 
-use crate::compiler::graph::{CompilerGraph, CompilerOp, OpKind, OpId, TensorId};
+use crate::compiler::graph::{CompilerGraph, CompilerOp, OpKind, KvSource, OpId, TensorId};
 use crate::compiler::trace::{OpTrace, ComputePattern};
 use crate::compiler::registry::ScalarOpRegistry;
 
@@ -964,6 +964,7 @@ mod tests {
                 head_dim: 128,
                 causal: true,
                 attention_sinks: false,
+            kv_source: KvSource::FromTensor,
             }),
             OpClass::Opaque
         );
@@ -976,7 +977,7 @@ mod tests {
                 head_dim: 128,
                 strategy: crate::compiler::graph::AttentionStrategy::Naive,
                 kv_dtype: DType::F32,
-            }),
+                kv_source: KvSource::FromTensor }),
             OpClass::Opaque
         );
         assert_eq!(
@@ -1050,7 +1051,7 @@ mod tests {
                 d_c: 512,
                 d_rope: 64,
                 causal: true,
-            }),
+                kv_source: KvSource::FromTensor }),
             OpClass::Opaque
         );
     }
