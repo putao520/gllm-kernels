@@ -662,6 +662,56 @@ pub(crate) fn lower_op_v2(
             prog.emit(VmInstr::LoopEnd);
             Ok(true)
         }
+        Op::DualRoPE(ref spec) => {
+            let rope_req = ctx.rope_req.ok_or_else(|| CompilerError::CodegenViolation(
+                format!("DualRoPE op {:?}: ctx.rope_req 未配置", op.id)))?;
+            let base_offset = rope_req.cache_offset;
+            let (sliding_cos_offset, global_cos_offset) = if let Some(ref sec) = rope_req.secondary_cache {
+                (base_offset, sec.cache_offset)
+            } else {
+                return Err(CompilerError::CodegenViolation(
+                    "DualRoPE: requires RopeCacheRequirement with secondary_cache".into()));
+            };
+            let out_tid = op.outputs.first().copied().ok_or_else(|| CompilerError::CodegenViolation(
+                format!("DualRoPE op {:?}: 无输出张量", op.id)))?;
+            let out_tensor = graph.tensor(out_tid).ok_or_else(|| CompilerError::CodegenViolation(
+                format!("DualRoPE op {:?}: 输出张量不存在", op.id)))?;
+            let seq_dim = out_tensor.shape.iter().find(|d| d.is_symbolic()).cloned()
+                .or_else(|| out_tensor.shape.first().cloned())
+                .ok_or_else(|| CompilerError::CodegenViolation(format!("DualRoPE op {:?}: shape 为空", op.id)))?;
+            let seq_bound = resolve_sym_dim(&seq_dim, abi, ctx.session.sym_map);
+            let input_ptr = resolver.materialize(prog, op.inputs[0], abi).ok_or_else(|| {
+                CompilerError::CodegenViolation(format!("DualRoPE op {:?}: input 无法 materialize", op.id))
+            })?;
+            let output_ptr = resolver.materialize(prog, out_tid, abi).ok_or_else(|| {
+                CompilerError::CodegenViolation(format!("DualRoPE op {:?}: output 无法 materialize", op.id))
+            })?;
+            let width = ctx.session.width;
+            let (rope_seq_bound, rope_pos_offset) = if let Some(gen_ctr) = abi.gen_loop_counter {
+                (BoundExpr::Const(1), Some(gen_ctr))
+            } else { (seq_bound, None) };
+            let layer_ctr = abi.layer_loop_counter.ok_or_else(|| CompilerError::CodegenViolation(
+                "DualRoPE: layer_loop_counter is None".into()))?;
+            let label_global = prog.alloc_label();
+            let label_end = prog.alloc_label();
+            let temp_add = prog.alloc_vreg(VRegKind::Scalar, SimdWidth::Scalar);
+            prog.emit(VmInstr::GprBinOp { dst: temp_add, a: layer_ctr, b: GprOperand::Imm(spec.layer_offset as i64), op: GprOp::Add });
+            let quotient = prog.alloc_vreg(VRegKind::Scalar, SimdWidth::Scalar);
+            prog.emit(VmInstr::GprBinOp { dst: quotient, a: temp_add, b: GprOperand::Imm(spec.layer_divisor as i64), op: GprOp::Div });
+            let product = prog.alloc_vreg(VRegKind::Scalar, SimdWidth::Scalar);
+            prog.emit(VmInstr::GprBinOp { dst: product, a: quotient, b: GprOperand::Imm(spec.layer_divisor as i64), op: GprOp::Mul });
+            let remainder = prog.alloc_vreg(VRegKind::Scalar, SimdWidth::Scalar);
+            prog.emit(VmInstr::GprBinOp { dst: remainder, a: temp_add, b: GprOperand::VReg(product), op: GprOp::Sub });
+            prog.emit(VmInstr::GprCondAction { cond: GprCondition::CmpEq(remainder, spec.layer_remainder as u64), action: GprBranchAction::JumpToLabel(label_global) });
+            super::structural_emit::emit_rope_inline(prog, rope_seq_bound.clone(), spec.num_heads, spec.head_dim,
+                spec.sliding_partial, width, input_ptr, output_ptr, sliding_cos_offset, ctx.session.sym_map, ctx.dtype, rope_pos_offset)?;
+            prog.emit(VmInstr::GprCondAction { cond: GprCondition::IsNonNull(layer_ctr), action: GprBranchAction::JumpToLabel(label_end) });
+            prog.emit(VmInstr::MarkLabel { label_id: label_global });
+            super::structural_emit::emit_rope_inline(prog, rope_seq_bound, spec.num_heads, spec.head_dim,
+                spec.global_partial, width, input_ptr, output_ptr, global_cos_offset, ctx.session.sym_map, ctx.dtype, rope_pos_offset)?;
+            prog.emit(VmInstr::MarkLabel { label_id: label_end });
+            Ok(true)
+        }
         Op::HeadRmsNorm { .. } => Ok(false),
         _ => Ok(false), // 其他类别走现有路径（Phase 6-7 续迁移）
     }
