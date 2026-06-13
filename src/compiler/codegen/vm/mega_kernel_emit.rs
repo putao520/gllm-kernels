@@ -10,7 +10,7 @@ use super::plan_lower::{
 };
 
 use crate::compiler::codegen::RopeCacheRequirement;
-use crate::compiler::fusion::{FusionPlan, FusionMode};
+use crate::compiler::fusion::FusionPlan;
 use crate::compiler::graph::{CompilerGraph, OpKind};
 use crate::compiler::codegen::vm::topology::{LoopTopology, KvCacheSource};
 use crate::compiler::buffer_alloc::{BufferAllocation, TensorPtrSource};
@@ -1125,11 +1125,9 @@ pub fn compile_mega_kernel_vm(
     // ── layer loop + fusion groups: Forward pass (embed → N 个同构子结构 → logits producer) ──
     // (rope_req, ple_req, dwc_req already computed in logits scratch offset section above)
 
-    let needs_scratch = alloc.total_bytes > 0 || ple_req.is_some() || dwc_req.is_some() || plan.groups.iter().any(|g| matches!(&g.mode,
-        FusionMode::NormIntoGemm | FusionMode::QkvSharedInput | FusionMode::FFNBlock { .. }
-        | FusionMode::TileLevelFusion { .. } | FusionMode::ComputeRoot { .. }
-        | FusionMode::CrossLayerResidual { .. } | FusionMode::FusedQkvNormRope { .. }
-    ));
+    let needs_scratch = super::vm_state::needs_scratch_for_plan(
+        alloc.total_bytes, ple_req.is_some(), dwc_req.is_some(), plan,
+    );
 
     let mut resolver = TensorPtrResolver::build(graph, alloc, Some(&topology));
 

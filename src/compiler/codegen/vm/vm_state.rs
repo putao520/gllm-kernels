@@ -12,6 +12,25 @@ use super::instr::PtrExpr;
 use super::isa_profile::PhysGpr;
 use crate::types::CompilerError;
 
+/// Whether the compilation plan requires a scratchpad buffer.
+/// Single computation replacing duplicated logic in pipeline.inc.rs and mega_kernel_emit.rs.
+pub fn needs_scratch_for_plan(
+    alloc_total_bytes: usize,
+    has_ple: bool,
+    has_dwc: bool,
+    plan: &crate::compiler::fusion::FusionPlan,
+) -> bool {
+    alloc_total_bytes > 0 || has_ple || has_dwc || plan.groups.iter().any(|g| matches!(&g.mode,
+        crate::compiler::fusion::FusionMode::NormIntoGemm
+        | crate::compiler::fusion::FusionMode::QkvSharedInput
+        | crate::compiler::fusion::FusionMode::FFNBlock { .. }
+        | crate::compiler::fusion::FusionMode::TileLevelFusion { .. }
+        | crate::compiler::fusion::FusionMode::ComputeRoot { .. }
+        | crate::compiler::fusion::FusionMode::CrossLayerResidual { .. }
+        | crate::compiler::fusion::FusionMode::FusedQkvNormRope { .. }
+    ))
+}
+
 // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 // §1 参数物理位置
 // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━

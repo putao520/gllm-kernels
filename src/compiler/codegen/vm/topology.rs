@@ -83,6 +83,10 @@ pub struct GraphTopologyAnalysis {
     /// Used by prologue to decide whether to load callback_table_ptr.
     pub has_sg_ops: bool,
 
+    /// Weight-consuming ops presence — from graph ops (Gemm/GemmBias/QuantGemm/RmsNorm/LayerNorm/HeadRmsNorm).
+    /// Used by prologue to decide whether to load weight_blob_ptr.
+    pub has_weight_ops: bool,
+
     /// 词表大小 — 从 OpKind::Argmax { vocab_size } 推导。
     /// 图无 Argmax 时为 None。
     pub vocab_size: Option<usize>,
@@ -119,6 +123,7 @@ impl GraphTopologyAnalysis {
         let mut has_cached_gqa = false;
         let mut has_mla = false;
         let mut has_sg_ops = false;
+        let mut has_weight_ops = false;
         let mut vocab_size: Option<usize> = None;
         let mut argmax_input_tid: Option<TensorId> = None;
 
@@ -135,6 +140,9 @@ impl GraphTopologyAnalysis {
                 OpKind::CachedGQA { .. } => has_cached_gqa = true,
                 OpKind::MlaAttention { .. } => has_mla = true,
                 OpKind::SgDetect { .. } | OpKind::SgInject { .. } => has_sg_ops = true,
+                OpKind::Gemm { .. } | OpKind::GemmBias { .. } | OpKind::QuantGemm { .. }
+                | OpKind::RmsNorm { .. } | OpKind::LayerNorm { .. } | OpKind::HeadRmsNorm { .. }
+                => has_weight_ops = true,
                 _ => {}
             }
         }
@@ -196,6 +204,7 @@ impl GraphTopologyAnalysis {
             seq_len_source,
             kv_cache_source,
             has_sg_ops,
+            has_weight_ops,
             vocab_size,
             logits_producer_op_idx,
             logits_output_tid,
@@ -329,5 +338,23 @@ mod tests {
         let topo = GraphTopologyAnalysis::analyze(&graph);
 
         assert!(!topo.has_sg_ops);
+    }
+
+    #[test]
+    fn has_weight_ops_detected_from_graph() {
+        let graph = make_test_graph(vec![
+            OpKind::Gemm { m: SymDim::Concrete(1), n: 4096, k: 4096, dtype: DType::F32, trans_b: false },
+        ]);
+        let topo = GraphTopologyAnalysis::analyze(&graph);
+        assert!(topo.has_weight_ops);
+    }
+
+    #[test]
+    fn no_weight_ops_in_value_norm_only_graph() {
+        let graph = make_test_graph(vec![
+            OpKind::ValueNorm { eps: 1e-6 },
+        ]);
+        let topo = GraphTopologyAnalysis::analyze(&graph);
+        assert!(!topo.has_weight_ops);
     }
 }

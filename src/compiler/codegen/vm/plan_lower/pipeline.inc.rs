@@ -105,9 +105,10 @@ pub(crate) fn lower_fusion_plan_inner_with_sym_map(
     // 按需分配，只分配实际使用的 VReg。
     let input_ptr = prog.alloc_vreg(VRegKind::Ptr, SimdWidth::Scalar);
 
-    let needs_weight = plan.groups.iter().any(|g| {
-        graph.op(g.anchor).is_some_and(|op| op.inputs.len() > 1)
-    });
+    let needs_weight = topology.map_or_else(
+        || plan.groups.iter().any(|g| graph.op(g.anchor).is_some_and(|op| op.inputs.len() > 1)),
+        |t| t.has_weight_ops,
+    );
     let weight_ptr = if needs_weight {
         prog.alloc_vreg(VRegKind::Ptr, SimdWidth::Scalar)
     } else {
@@ -129,15 +130,9 @@ pub(crate) fn lower_fusion_plan_inner_with_sym_map(
     // ARCH-DATA-FLOW-CONTRACT §3.1: Standalone/LoopFusion 组的 op 若 input/output
     // 是图内 intermediate (非 graph.inputs/outputs), 需要从 scratchpad 读写。
     // 因此当图存在 intermediate 张量 (alloc.total_bytes > 0) 时一律加载 scratchpad。
-    let needs_scratch = alloc.total_bytes > 0 || ple_req.is_some() || dwc_req.is_some() || plan.groups.iter().any(|g| matches!(&g.mode,
-        FusionMode::NormIntoGemm
-        | FusionMode::QkvSharedInput
-        | FusionMode::FFNBlock { .. }
-        | FusionMode::TileLevelFusion { .. }
-        | FusionMode::ComputeRoot { .. }
-        | FusionMode::CrossLayerResidual { .. }
-        | FusionMode::FusedQkvNormRope { .. }
-    ));
+    let needs_scratch = crate::compiler::codegen::vm::vm_state::needs_scratch_for_plan(
+        alloc.total_bytes, ple_req.is_some(), dwc_req.is_some(), plan,
+    );
     let scratch_base = if needs_scratch {
         let sp = prog.alloc_vreg(VRegKind::Ptr, SimdWidth::Scalar);
         prog.emit(VmInstr::LoadPtr {
