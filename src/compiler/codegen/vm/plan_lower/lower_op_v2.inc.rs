@@ -604,6 +604,35 @@ pub(crate) fn lower_op_v2(
                 input_ptr, weight_ptr, output_ptr, None, Some(op.id), None, false)?;
             Ok(true)
         }
+        Op::MlaRopeMerge { ref seq_len, d_c, d_rope } => {
+            let c_kv_ptr = resolver.materialize(prog, op.inputs[0], abi).ok_or_else(|| {
+                CompilerError::CodegenViolation(format!("MlaRopeMerge op {:?}: c_kv 无法 materialize", op.id))
+            })?;
+            let k_pe_ptr = op.inputs.get(1).copied()
+                .and_then(|tid| resolver.materialize(prog, tid, abi))
+                .ok_or_else(|| CompilerError::CodegenViolation(
+                    format!("MlaRopeMerge op {:?}: k_pe 无法 materialize", op.id)))?;
+            let output_ptr = resolver.materialize(prog, op.outputs[0], abi).ok_or_else(|| {
+                CompilerError::CodegenViolation(format!("MlaRopeMerge op {:?}: output 无法 materialize", op.id))
+            })?;
+            let _ = seq_len;
+            let cos_ptr = prog.alloc_vreg(VRegKind::Ptr, SimdWidth::Scalar);
+            prog.emit(VmInstr::LoadPtr {
+                dst: cos_ptr,
+                src: ctx.session.sym_map.resolve("rope_cos_sin_table").cloned().ok_or_else(|| CompilerError::CodegenViolation(
+                    "MlaRopeMerge: rope_cos_sin_table not in sym_map".into()))?,
+            });
+            let sin_ptr = cos_ptr;
+            let position = abi.gen_loop_counter.unwrap_or_else(|| {
+                prog.alloc_vreg(VRegKind::Scalar, SimdWidth::Scalar)
+            });
+            super::mla_emit::emit_mla_rope_merge_inline(
+                prog, d_c, d_rope,
+                &[c_kv_ptr, k_pe_ptr, output_ptr, cos_ptr, sin_ptr, position],
+                ctx.session.width, ctx.dtype,
+            )?;
+            Ok(true)
+        }
         Op::HeadRmsNorm { .. } => Ok(false),
         _ => Ok(false), // 其他类别走现有路径（Phase 6-7 续迁移）
     }
