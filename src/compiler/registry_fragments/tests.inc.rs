@@ -108,9 +108,9 @@ mod tests {
             (OpKind::Mul, OpKindKey::Mul),
             (OpKind::Residual, OpKindKey::Residual),
             (OpKind::Softmax, OpKindKey::Softmax),
-            (OpKind::RmsNorm { eps: 1e-6 }, OpKindKey::RmsNorm),
-            (OpKind::LayerNorm { eps: 1e-5 }, OpKindKey::LayerNorm),
-            (OpKind::ValueNorm { eps: 1e-6 }, OpKindKey::ValueNorm),
+            (OpKind::RmsNorm { feature_dim: 4096, eps: 1e-6 }, OpKindKey::RmsNorm),
+            (OpKind::LayerNorm { feature_dim: 4096, eps: 1e-5 }, OpKindKey::LayerNorm),
+            (OpKind::ValueNorm { feature_dim: 4096, eps: 1e-6 }, OpKindKey::ValueNorm),
             (OpKind::Gemm { m: crate::compiler::graph::SymDim::Concrete(1), n: 4096, k: 4096, dtype: DType::F32, trans_b: false }, OpKindKey::Gemm),
             (OpKind::GemmBias { m: crate::compiler::graph::SymDim::Concrete(1), n: 4096, k: 4096, dtype: DType::F32, trans_b: false }, OpKindKey::GemmBias),
             (OpKind::RoPE { num_heads: 0, head_dim: 128, theta: 10000.0, partial: 1.0, rope_scaling: None }, OpKindKey::RoPE),
@@ -222,7 +222,7 @@ mod tests {
             (OpKindKey::Gelu, OpKind::Gelu),
             (OpKindKey::Add, OpKind::Add),
             (OpKindKey::Mul, OpKind::Mul),
-            (OpKindKey::RmsNorm, OpKind::RmsNorm { eps: 1e-5 }),
+            (OpKindKey::RmsNorm, OpKind::RmsNorm { feature_dim: 4096, eps: 1e-5 }),
             (OpKindKey::Softmax, OpKind::Softmax),
         ];
 

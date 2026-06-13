@@ -1435,7 +1435,7 @@ mod tests {
         let silu_out = g.add_tensor_concrete("silu_out", &[1, 64], dt);
         let weight = g.add_tensor_concrete("weight", &[64], dt);
 
-        g.add_op(OpKind::RmsNorm { eps: 1e-5 }, vec![input, weight], vec![norm_out], "rmsnorm");
+        g.add_op(OpKind::RmsNorm { feature_dim: 4096, eps: 1e-5 }, vec![input, weight], vec![norm_out], "rmsnorm");
         g.add_op(OpKind::Silu, vec![norm_out], vec![silu_out], "silu");
 
         let registry = ScalarOpRegistry::with_defaults();

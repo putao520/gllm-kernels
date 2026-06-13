@@ -1431,7 +1431,7 @@ mod tests {
         let tid = graph.add_tensor_concrete("hidden", &[1, 512], DType::BF16);
         let out_tid = graph.add_tensor_concrete("output", &[1, 512], DType::BF16);
         let op_id = graph.add_op(
-            OpKind::RmsNorm { eps: 1e-5 },
+            OpKind::RmsNorm { feature_dim: 4096, eps: 1e-5 },
             vec![tid],
             vec![out_tid],
             "norm",
@@ -1719,7 +1719,7 @@ mod tests {
         let tid = graph.add_tensor_concrete("hidden_f32", &[1, 256], DType::F32);
         let out_tid = graph.add_tensor_concrete("output_f32", &[1, 256], DType::F32);
         let op_id = graph.add_op(
-            OpKind::RmsNorm { eps: 1e-6 },
+            OpKind::RmsNorm { feature_dim: 4096, eps: 1e-6 },
             vec![tid],
             vec![out_tid],
             "norm_f32",
@@ -1753,7 +1753,7 @@ mod tests {
         let tid = graph.add_tensor_concrete("hidden_f16", &[2, 128], DType::F16);
         let out_tid = graph.add_tensor_concrete("output_f16", &[2, 128], DType::F16);
         let op_id = graph.add_op(
-            OpKind::RmsNorm { eps: 1e-5 },
+            OpKind::RmsNorm { feature_dim: 4096, eps: 1e-5 },
             vec![tid],
             vec![out_tid],
             "norm_f16",
@@ -1893,8 +1893,8 @@ mod tests {
         let t0 = graph.add_tensor_concrete("in", &[1, 64], DType::BF16);
         let t1 = graph.add_tensor_concrete("mid", &[1, 64], DType::BF16);
         let t2 = graph.add_tensor_concrete("out", &[1, 64], DType::BF16);
-        let op0 = graph.add_op(OpKind::RmsNorm { eps: 1e-5 }, vec![t0], vec![t1], "norm");
-        let op1 = graph.add_op(OpKind::RmsNorm { eps: 1e-5 }, vec![t1], vec![t2], "norm2");
+        let op0 = graph.add_op(OpKind::RmsNorm { feature_dim: 4096, eps: 1e-5 }, vec![t0], vec![t1], "norm");
+        let op1 = graph.add_op(OpKind::RmsNorm { feature_dim: 4096, eps: 1e-5 }, vec![t1], vec![t2], "norm2");
         let group = FusionGroup {
             id: 0, anchor: op0, epilogue: vec![op1], mode: FusionMode::LoopFusion,
             ops: vec![op0, op1], multi_output: MultiOutputConfig::single(),

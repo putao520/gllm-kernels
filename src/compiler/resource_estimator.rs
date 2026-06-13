@@ -453,7 +453,7 @@ mod tests {
         let norm_out = g.add_tensor_concrete("norm_out", &[1, 16], DType::F32);
         let w = g.add_tensor_concrete("w", &[16, 16], DType::F32);
         let out = g.add_tensor_concrete("out", &[1, 16], DType::F32);
-        let norm = g.add_op(OpKind::RmsNorm { eps: 1e-5 }, vec![a], vec![norm_out], "norm");
+        let norm = g.add_op(OpKind::RmsNorm { feature_dim: 4096, eps: 1e-5 }, vec![a], vec![norm_out], "norm");
         let gemm = g.add_op(
             OpKind::Gemm { m: SymDim::Concrete(1), n: 16, k: 16, dtype: DType::F32, trans_b: false },
             vec![norm_out, w], vec![out], "gemm",
@@ -474,7 +474,7 @@ mod tests {
         let norm_out = g.add_tensor_concrete("norm_out", &[1, 16], DType::F32);
         let w = g.add_tensor_concrete("w", &[16, 16], DType::F32);
         let out = g.add_tensor_concrete("out", &[1, 16], DType::F32);
-        let norm = g.add_op(OpKind::RmsNorm { eps: 1e-5 }, vec![a], vec![norm_out], "norm");
+        let norm = g.add_op(OpKind::RmsNorm { feature_dim: 4096, eps: 1e-5 }, vec![a], vec![norm_out], "norm");
         let gemm = g.add_op(
             OpKind::Gemm { m: SymDim::Concrete(1), n: 16, k: 16, dtype: DType::F32, trans_b: false },
             vec![norm_out, w], vec![out], "gemm",

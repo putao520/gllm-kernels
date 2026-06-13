@@ -841,7 +841,7 @@ impl InferenceCompiler {
                 // Op kind discriminant + parameters
                 std::mem::discriminant(&op.kind).hash(&mut hasher);
                 match &op.kind {
-                    OpKind::RmsNorm { eps } | OpKind::LayerNorm { eps } => {
+                    OpKind::RmsNorm { eps, .. } | OpKind::LayerNorm { eps, .. } => {
                         eps.to_bits().hash(&mut hasher);
                     }
                     OpKind::Gemm { m, n, k, .. } | OpKind::GemmBias { m, n, k, .. } => {
@@ -2469,7 +2469,7 @@ mod tests {
         graph.inputs.extend_from_slice(&[t0, t2, t_skip]);
 
         let op_norm = graph.add_op(
-            OpKind::RmsNorm { eps: 1e-5 }, vec![t0], vec![t1], "norm",
+            OpKind::RmsNorm { feature_dim: 4096, eps: 1e-5 }, vec![t0], vec![t1], "norm",
         );
         let op_gemm = graph.add_op(
             OpKind::Gemm { m: SymDim::Concrete(1), n: 512, k: 128, dtype: DType::F32, trans_b: false },
@@ -2971,7 +2971,7 @@ mod tests {
         let t_out = graph.add_tensor_concrete("output", &[4, 64], DType::F32);
         graph.inputs.push(t_in);
 
-        let op_norm = graph.add_op(OpKind::RmsNorm { eps: 1e-5 }, vec![t_in], vec![t_mid], "norm");
+        let op_norm = graph.add_op(OpKind::RmsNorm { feature_dim: 4096, eps: 1e-5 }, vec![t_in], vec![t_mid], "norm");
         let _op_silu = graph.add_op(OpKind::Silu, vec![t_mid], vec![t_out], "silu");
 
         // Act

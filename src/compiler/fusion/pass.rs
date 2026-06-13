@@ -1201,7 +1201,7 @@ mod tests {
         let a = g.add_tensor_concrete("a", &[1, 4], DType::F32);
         let mid = g.add_tensor_concrete("mid", &[1, 4], DType::F32);
         let out = g.add_tensor_concrete("out", &[1, 4], DType::F32);
-        let norm_op = g.add_op(OpKind::RmsNorm { eps: 1e-5 }, vec![a], vec![mid], "norm");
+        let norm_op = g.add_op(OpKind::RmsNorm { feature_dim: 4096, eps: 1e-5 }, vec![a], vec![mid], "norm");
         g.add_op(OpKind::Tanh, vec![mid], vec![out], "tanh");
 
         let reg = make_registry();
@@ -1224,7 +1224,7 @@ mod tests {
         let mid = g.add_tensor_concrete("mid", &[1, 4], DType::F32);
         let out1 = g.add_tensor_concrete("out1", &[1, 4], DType::F32);
         let out2 = g.add_tensor_concrete("out2", &[1, 4], DType::F32);
-        let norm_op = g.add_op(OpKind::RmsNorm { eps: 1e-5 }, vec![a], vec![mid], "norm");
+        let norm_op = g.add_op(OpKind::RmsNorm { feature_dim: 4096, eps: 1e-5 }, vec![a], vec![mid], "norm");
         g.add_op(OpKind::Tanh, vec![mid], vec![out1], "tanh1");
         g.add_op(OpKind::Tanh, vec![mid], vec![out2], "tanh2");
 
@@ -1266,7 +1266,7 @@ mod tests {
         let out1 = g.add_tensor_concrete("out1", &[1, 4], DType::F32);
         let out2 = g.add_tensor_concrete("out2", &[1, 4], DType::F32);
         // RmsNorm with two outputs
-        let norm_op = g.add_op(OpKind::RmsNorm { eps: 1e-5 }, vec![a], vec![out1, out2], "norm");
+        let norm_op = g.add_op(OpKind::RmsNorm { feature_dim: 4096, eps: 1e-5 }, vec![a], vec![out1, out2], "norm");
 
         let reg = make_registry();
         let dag = SemanticDAG::from_graph(&g, &reg);
@@ -1523,7 +1523,7 @@ mod tests {
         let mid = g.add_tensor_concrete("mid", &[1, 4], DType::F32);
         let w = g.add_tensor_concrete("w", &[4, 4], DType::F32);
         let out = g.add_tensor_concrete("out", &[1, 4], DType::F32);
-        let norm_op = g.add_op(OpKind::RmsNorm { eps: 1e-5 }, vec![a], vec![mid], "norm");
+        let norm_op = g.add_op(OpKind::RmsNorm { feature_dim: 4096, eps: 1e-5 }, vec![a], vec![mid], "norm");
         g.add_op(
             OpKind::Gemm { m: SymDim::Concrete(1), n: 4, k: 4, dtype: DType::F32, trans_b: false },
             vec![mid, w],
@@ -1545,7 +1545,7 @@ mod tests {
         let mid = g.add_tensor_concrete("mid", &[1, 4], DType::F32);
         let w = g.add_tensor_concrete("w", &[4, 4], DType::F32);
         let out = g.add_tensor_concrete("out", &[1, 4], DType::F32);
-        let norm_op = g.add_op(OpKind::LayerNorm { eps: 1e-5 }, vec![a], vec![mid], "norm");
+        let norm_op = g.add_op(OpKind::LayerNorm { feature_dim: 4096, eps: 1e-5 }, vec![a], vec![mid], "norm");
         g.add_op(
             OpKind::Gemm { m: SymDim::Concrete(1), n: 4, k: 4, dtype: DType::F32, trans_b: false },
             vec![mid, w],
@@ -1567,7 +1567,7 @@ mod tests {
         let mid = g.add_tensor_concrete("mid", &[1, 4], DType::F32);
         let w = g.add_tensor_concrete("w", &[4, 4], DType::F32);
         let out = g.add_tensor_concrete("out", &[1, 4], DType::F32);
-        let vnorm_op = g.add_op(OpKind::ValueNorm { eps: 1e-5 }, vec![a], vec![mid], "vnorm");
+        let vnorm_op = g.add_op(OpKind::ValueNorm { feature_dim: 4096, eps: 1e-5 }, vec![a], vec![mid], "vnorm");
         g.add_op(
             OpKind::Gemm { m: SymDim::Concrete(1), n: 4, k: 4, dtype: DType::F32, trans_b: false },
             vec![mid, w],
@@ -1590,7 +1590,7 @@ mod tests {
         let w = g.add_tensor_concrete("w", &[4, 4], DType::F32);
         let b = g.add_tensor_concrete("b", &[4], DType::F32);
         let out = g.add_tensor_concrete("out", &[1, 4], DType::F32);
-        let norm_op = g.add_op(OpKind::RmsNorm { eps: 1e-5 }, vec![a], vec![mid], "norm");
+        let norm_op = g.add_op(OpKind::RmsNorm { feature_dim: 4096, eps: 1e-5 }, vec![a], vec![mid], "norm");
         g.add_op(
             OpKind::GemmBias { m: SymDim::Concrete(1), n: 4, k: 4, dtype: DType::F32, trans_b: false },
             vec![mid, w, b],
@@ -1761,7 +1761,7 @@ mod tests {
         let mid = g.add_tensor_concrete("mid", &[1, 4], DType::F32);
         let w = g.add_tensor_concrete("w", &[4, 4], DType::F32);
         let out = g.add_tensor_concrete("out", &[1, 4], DType::F32);
-        let norm_op = g.add_op(OpKind::RmsNorm { eps: 1e-5 }, vec![a], vec![mid], "norm");
+        let norm_op = g.add_op(OpKind::RmsNorm { feature_dim: 4096, eps: 1e-5 }, vec![a], vec![mid], "norm");
         g.add_op(
             OpKind::MoEGate { seq_len: 1, num_experts: 8, hidden: 4, top_k: 2 },
             vec![mid, w],
@@ -1939,7 +1939,7 @@ mod tests {
         let mid = g.add_tensor_concrete("mid", &[1, 64], DType::F32);
         let out = g.add_tensor_concrete("out", &[1, 64], DType::F32);
 
-        let norm = g.add_op(OpKind::RmsNorm { eps: 1e-5 }, vec![a], vec![mid], "norm");
+        let norm = g.add_op(OpKind::RmsNorm { feature_dim: 4096, eps: 1e-5 }, vec![a], vec![mid], "norm");
         let tanh = g.add_op(OpKind::Tanh, vec![mid], vec![out], "tanh");
 
         let reg = make_registry();
@@ -2042,7 +2042,7 @@ mod tests {
         let w = g.add_tensor_concrete("w", &[4, 4], DType::F32);
         let scale = g.add_tensor_concrete("scale", &[4], DType::F32);
         let out = g.add_tensor_concrete("out", &[1, 4], DType::F32);
-        let norm_op = g.add_op(OpKind::RmsNorm { eps: 1e-5 }, vec![a], vec![mid], "norm");
+        let norm_op = g.add_op(OpKind::RmsNorm { feature_dim: 4096, eps: 1e-5 }, vec![a], vec![mid], "norm");
         g.add_op(
             OpKind::QuantGemm {
                 m: SymDim::Concrete(1), n: 4, k: 4,
@@ -2336,7 +2336,7 @@ mod tests {
         let mut g = CompilerGraph::new();
         let a = g.add_tensor_concrete("a", &[1, 4], DType::F32);
         let mid = g.add_tensor_concrete("mid", &[1, 4], DType::F32);
-        let norm_op = g.add_op(OpKind::RmsNorm { eps: 1e-5 }, vec![a], vec![mid], "norm");
+        let norm_op = g.add_op(OpKind::RmsNorm { feature_dim: 4096, eps: 1e-5 }, vec![a], vec![mid], "norm");
 
         let reg = make_registry();
         let dag = SemanticDAG::from_graph(&g, &reg);
@@ -2380,7 +2380,7 @@ mod tests {
         let w = g.add_tensor_concrete("w", &[64, 64], DType::F32);
         let out = g.add_tensor_concrete("out", &[1, 64], DType::F32);
 
-        let norm_op = g.add_op(OpKind::RmsNorm { eps: 1e-5 }, vec![a], vec![norm_out], "norm");
+        let norm_op = g.add_op(OpKind::RmsNorm { feature_dim: 4096, eps: 1e-5 }, vec![a], vec![norm_out], "norm");
         let gemm_op = g.add_op(
             OpKind::Gemm { m: SymDim::Concrete(1), n: 64, k: 64, dtype: DType::F32, trans_b: false },
             vec![norm_out, w],

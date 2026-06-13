@@ -96,7 +96,7 @@ impl GraphDerivedGeometry {
                     if num_kv_heads.is_none() { num_kv_heads = Some(*nkv); }
                     if head_dim.is_none() { head_dim = Some(*hd); }
                 }
-                OpKind::RmsNorm { eps } | OpKind::LayerNorm { eps } | OpKind::ValueNorm { eps } => {
+                OpKind::RmsNorm { eps, .. } | OpKind::LayerNorm { eps, .. } | OpKind::ValueNorm { eps, .. } => {
                     if rms_eps.is_none() { rms_eps = Some(*eps); }
                 }
                 OpKind::Gather { table_rows, .. } => {
@@ -285,7 +285,7 @@ mod tests {
         g.inputs = vec![input, embed_w, norm_w, q_w, k_w, gate_w];
 
         let normed = g.add_tensor_concrete("normed", &[512, 1024], dt);
-        g.add_op(OpKind::RmsNorm { eps: 1e-6 }, vec![input, norm_w], vec![normed], "norm");
+        g.add_op(OpKind::RmsNorm { feature_dim: 4096, eps: 1e-6 }, vec![input, norm_w], vec![normed], "norm");
 
         let q_out = g.add_tensor_concrete("q_out", &[512, 1024], dt);
         g.add_op(OpKind::Gemm { m: SymDim::Concrete(512), n: 1024, k: 1024, dtype: dt, trans_b: false }, vec![normed, q_w], vec![q_out], "q_proj");
@@ -640,7 +640,7 @@ mod tests {
         g.add_op(OpKind::Gemm { m: SymDim::Concrete(1), n: 512, k: 512, dtype: dt, trans_b: false }, vec![a, w], vec![c], "gemm");
         g.inputs = vec![a, w];
         let normed = g.add_tensor_concrete("normed", &[1, 512], dt);
-        g.add_op(OpKind::LayerNorm { eps: 1e-12 }, vec![a], vec![normed], "layernorm");
+        g.add_op(OpKind::LayerNorm { feature_dim: 4096, eps: 1e-12 }, vec![a], vec![normed], "layernorm");
 
         // Act
         let geo = GraphDerivedGeometry::from_graph(&g, &DeviceProfile::detect()).unwrap();
@@ -660,7 +660,7 @@ mod tests {
         g.add_op(OpKind::Gemm { m: SymDim::Concrete(1), n: 256, k: 256, dtype: dt, trans_b: false }, vec![a, w], vec![c], "gemm");
         g.inputs = vec![a, w];
         let vnormed = g.add_tensor_concrete("vnormed", &[1, 256], dt);
-        g.add_op(OpKind::ValueNorm { eps: 1e-4 }, vec![a], vec![vnormed], "value_norm");
+        g.add_op(OpKind::ValueNorm { feature_dim: 4096, eps: 1e-4 }, vec![a], vec![vnormed], "value_norm");
 
         // Act
         let geo = GraphDerivedGeometry::from_graph(&g, &DeviceProfile::detect()).unwrap();
@@ -904,7 +904,7 @@ mod tests {
         g.add_op(OpKind::Gemm { m: SymDim::Concrete(1), n: 512, k: 512, dtype: dt, trans_b: false }, vec![a, w], vec![c], "gemm");
         g.inputs = vec![a, w];
         let normed = g.add_tensor_concrete("normed", &[1, 512], dt);
-        g.add_op(OpKind::RmsNorm { eps: 1e-4 }, vec![a], vec![normed], "rmsnorm");
+        g.add_op(OpKind::RmsNorm { feature_dim: 4096, eps: 1e-4 }, vec![a], vec![normed], "rmsnorm");
 
         // Act
         let geo = GraphDerivedGeometry::from_graph(&g, &DeviceProfile::detect()).unwrap();
@@ -1058,7 +1058,7 @@ mod tests {
         g.add_op(OpKind::Gemm { m: SymDim::Concrete(1), n: 256, k: 256, dtype: dt, trans_b: false }, vec![a, w], vec![c], "gemm");
         g.inputs = vec![a, w];
         let normed = g.add_tensor_concrete("normed", &[1, 256], dt);
-        g.add_op(OpKind::RmsNorm { eps: 1e-6 }, vec![a], vec![normed], "norm");
+        g.add_op(OpKind::RmsNorm { feature_dim: 4096, eps: 1e-6 }, vec![a], vec![normed], "norm");
 
         let geo = GraphDerivedGeometry::from_graph(&g, &DeviceProfile::detect()).unwrap();
 

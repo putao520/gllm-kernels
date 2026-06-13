@@ -2,12 +2,12 @@
 #[derive(Debug, Clone, PartialEq)]
 pub enum OpKind {
     // ── Normalization ──
-    RmsNorm { eps: f32 },
-    LayerNorm { eps: f32 },
+    RmsNorm { feature_dim: usize, eps: f32 },
+    LayerNorm { feature_dim: usize, eps: f32 },
     /// Value-Normalization: RMSNorm without learned scale (no weight multiplication).
     /// Used by Gemma 4 for Value vector normalization.
     /// `V_out = V / sqrt(mean(V^2) + eps)`
-    ValueNorm { eps: f32 },
+    ValueNorm { feature_dim: usize, eps: f32 },
 
     // ── Linear algebra ──
     /// C = A × B  (row-major, A is [M,K], B is [K,N], C is [M,N])
@@ -224,7 +224,7 @@ pub enum OpKind {
     /// Inserted at detect_layer GEMM output when SG is enabled.
     ///
     /// OpClass: Opaque. Always Standalone.
-    SgDetect { detect_offset: usize },
+    SgDetect { detect_offset: usize, hidden_dim: usize },
 
     /// CoT Step Hook: read step control flag from shared memory → conditional JMP.
     /// Inserted at end of layer loop when CoT step hook is enabled.

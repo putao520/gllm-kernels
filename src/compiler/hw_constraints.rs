@@ -3399,7 +3399,7 @@ mod tests {
         );
         g.add_op(OpKind::Silu, vec![gemm_out], vec![silu_out], "silu");
         g.add_op(OpKind::Add, vec![silu_out, b], vec![add_out], "add");
-        g.add_op(OpKind::RmsNorm { eps: 1e-5 }, vec![add_out], vec![norm_out], "norm");
+        g.add_op(OpKind::RmsNorm { feature_dim: 4096, eps: 1e-5 }, vec![add_out], vec![norm_out], "norm");
 
         let profile = DeviceProfile::detect();
         let exec_plan = ExecutionPlan::from_profile(&profile);
@@ -4142,7 +4142,7 @@ mod tests {
         let dt = DType::F32;
         let a = g.add_tensor_concrete("a", &[128], dt);
         let out = g.add_tensor_concrete("out", &[128], dt);
-        g.add_op(OpKind::RmsNorm { eps: 1e-5 }, vec![a], vec![out], "norm");
+        g.add_op(OpKind::RmsNorm { feature_dim: 4096, eps: 1e-5 }, vec![a], vec![out], "norm");
 
         let group = FusionGroup {
             id: 0,

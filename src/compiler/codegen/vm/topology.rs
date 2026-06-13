@@ -129,7 +129,7 @@ pub struct GraphTopologyAnalysis {
     /// MTP 配置 — 从 OpKind::MtpDraft { depth, hidden_size, vocab_size } 推导。
     pub mtp_config: Option<MtpKernelConfig>,
 
-    /// SgDetect hidden_dim — 从 SgDetect input tensor shape last dim 推导。
+    /// SgDetect hidden_dim — 从 OpKind::SgDetect { hidden_dim, .. } 直接读取。
     pub sg_detect_hidden_dim: Option<usize>,
 
     /// SgInject dim — 从 OpKind::SgInject { dim } 推导。
@@ -176,13 +176,10 @@ impl GraphTopologyAnalysis {
                 OpKind::MultiHeadAttention { .. } => has_mha = true,
                 OpKind::CachedGQA { .. } => has_cached_gqa = true,
                 OpKind::MlaAttention { .. } => has_mla = true,
-                OpKind::SgDetect { .. } => {
+                OpKind::SgDetect { hidden_dim, .. } => {
                     has_sg_ops = true;
                     if sg_detect_hidden_dim.is_none() {
-                        sg_detect_hidden_dim = op.inputs.first()
-                            .and_then(|&tid| graph.tensor(tid))
-                            .and_then(|t| t.shape.last())
-                            .and_then(|d| d.as_concrete());
+                        sg_detect_hidden_dim = Some(*hidden_dim);
                     }
                 }
                 OpKind::SgInject { dim, .. } => {
@@ -376,7 +373,7 @@ mod tests {
     #[test]
     fn sg_ops_detected_from_graph() {
         let graph = make_test_graph(vec![
-            OpKind::SgDetect { detect_offset: 0 },
+            OpKind::SgDetect { detect_offset: 0, hidden_dim: 0 },
             OpKind::SgInject { knowledge_offset: 0, dim: 256 },
         ]);
         let topo = GraphTopologyAnalysis::analyze(&graph);
@@ -407,7 +404,7 @@ mod tests {
     #[test]
     fn no_weight_ops_in_value_norm_only_graph() {
         let graph = make_test_graph(vec![
-            OpKind::ValueNorm { eps: 1e-6 },
+            OpKind::ValueNorm { feature_dim: 4096, eps: 1e-6 },
         ]);
         let topo = GraphTopologyAnalysis::analyze(&graph);
         assert_eq!(topo.weight_source, WeightSource::NoWeight);

@@ -707,7 +707,7 @@ mod tests {
         let weight = g.add_tensor_concrete("weight", &[256, 512], DType::F32);
 
         let norm_id = g.add_op(
-            OpKind::RmsNorm { eps: 1e-5 },
+            OpKind::RmsNorm { feature_dim: 4096, eps: 1e-5 },
             vec![input],
             vec![norm_out],
             "rms_norm",
@@ -885,7 +885,7 @@ mod tests {
         let w2 = graph.add_tensor_concrete("w2", &[256, 512], DType::F32);
 
         let _norm_id = graph.add_op(
-            OpKind::RmsNorm { eps: 1e-5 },
+            OpKind::RmsNorm { feature_dim: 4096, eps: 1e-5 },
             vec![input],
             vec![norm_out],
             "norm",
@@ -1176,7 +1176,7 @@ mod tests {
         let weight = graph.add_tensor_concrete("weight", &[256, 512], DType::F32);
 
         let norm_id = graph.add_op(
-            OpKind::LayerNorm { eps: 1e-5 },
+            OpKind::LayerNorm { feature_dim: 4096, eps: 1e-5 },
             vec![input],
             vec![norm_out],
             "layer_norm",
@@ -1390,7 +1390,7 @@ mod tests {
         let wv = graph.add_tensor_concrete("wv", &[256, 512], DType::F32);
 
         let _norm_id = graph.add_op(
-            OpKind::RmsNorm { eps: 1e-5 },
+            OpKind::RmsNorm { feature_dim: 4096, eps: 1e-5 },
             vec![input],
             vec![norm_out],
             "norm",
@@ -1879,7 +1879,7 @@ mod tests {
         let wa = graph.add_tensor_concrete("wa", &[256, 512], DType::F32);
         let wb = graph.add_tensor_concrete("wb", &[256, 512], DType::F32);
 
-        graph.add_op(OpKind::RmsNorm { eps: 1e-5 }, vec![input], vec![norm_out], "norm");
+        graph.add_op(OpKind::RmsNorm { feature_dim: 4096, eps: 1e-5 }, vec![input], vec![norm_out], "norm");
         graph.add_op(OpKind::Gemm {
             m: SymDim::Concrete(64), n: 512, k: 256,
             dtype: DType::F32, trans_b: false,
@@ -2117,7 +2117,7 @@ mod tests {
         let weight = graph.add_tensor_concrete("weight", &[256, 512], DType::F32);
 
         let norm_id = graph.add_op(
-            OpKind::LayerNorm { eps: 1e-5 },
+            OpKind::LayerNorm { feature_dim: 4096, eps: 1e-5 },
             vec![input], vec![norm_out], "layernorm",
         );
         let gemm_id = graph.add_op(
@@ -2265,7 +2265,7 @@ mod tests {
         let wk = graph.add_tensor_concrete("wk", &[256, 512], DType::F32);
         let wv = graph.add_tensor_concrete("wv", &[256, 512], DType::F32);
 
-        graph.add_op(OpKind::RmsNorm { eps: 1e-5 }, vec![input], vec![norm_out], "norm");
+        graph.add_op(OpKind::RmsNorm { feature_dim: 4096, eps: 1e-5 }, vec![input], vec![norm_out], "norm");
         let gemm_q = graph.add_op(OpKind::Gemm {
             m: SymDim::Concrete(64), n: 512, k: 256, dtype: DType::F32, trans_b: false,
         }, vec![norm_out, wq], vec![q_out], "q_proj");
@@ -2279,7 +2279,7 @@ mod tests {
             vec![q_out], vec![qk_norm_q_out], "qk_norm_q");
         let qk_norm_k = graph.add_op(OpKind::QkNorm { head_dim: 512, eps: 1e-5 },
             vec![k_out], vec![qk_norm_k_out], "qk_norm_k");
-        let value_norm = graph.add_op(OpKind::ValueNorm { eps: 1e-5 },
+        let value_norm = graph.add_op(OpKind::ValueNorm { feature_dim: 4096, eps: 1e-5 },
             vec![v_out], vec![value_norm_out], "value_norm");
         let rope_q = graph.add_op(OpKind::RoPE { num_heads: 8, head_dim: 64, theta: 10000.0, partial: 1.0, rope_scaling: None },
             vec![qk_norm_q_out], vec![rope_q_out], "rope_q");
@@ -2370,7 +2370,7 @@ mod tests {
         let wk = graph.add_tensor_concrete("wk", &[256, 512], DType::F32);
         let wv = graph.add_tensor_concrete("wv", &[256, 512], DType::F32);
 
-        graph.add_op(OpKind::RmsNorm { eps: 1e-5 }, vec![input], vec![norm_out], "norm");
+        graph.add_op(OpKind::RmsNorm { feature_dim: 4096, eps: 1e-5 }, vec![input], vec![norm_out], "norm");
         graph.add_op(OpKind::GemmBias {
             m: SymDim::Concrete(64), n: 512, k: 256, dtype: DType::F32, trans_b: false,
         }, vec![norm_out, wq], vec![q_out], "q_proj");
@@ -2430,7 +2430,7 @@ mod tests {
         let gemm_out = graph.add_tensor_concrete("gemm_out", &[64, 512], DType::F32);
         let weight = graph.add_tensor_concrete("weight", &[256, 512], DType::F32);
 
-        let norm_id = graph.add_op(OpKind::RmsNorm { eps: 1e-5 },
+        let norm_id = graph.add_op(OpKind::RmsNorm { feature_dim: 4096, eps: 1e-5 },
             vec![input], vec![norm_out], "norm");
         let gemm_id = graph.add_op(OpKind::GemmBias {
             m: SymDim::Concrete(64), n: 512, k: 256, dtype: DType::F32, trans_b: false,
@@ -2460,7 +2460,7 @@ mod tests {
         let wk = graph.add_tensor_concrete("wk", &[256, 512], DType::F32);
         let wv = graph.add_tensor_concrete("wv", &[256, 512], DType::F32);
 
-        graph.add_op(OpKind::RmsNorm { eps: 1e-5 }, vec![input], vec![norm_out], "norm");
+        graph.add_op(OpKind::RmsNorm { feature_dim: 4096, eps: 1e-5 }, vec![input], vec![norm_out], "norm");
         graph.add_op(OpKind::QuantGemm {
             m: SymDim::Concrete(64), n: 512, k: 256, quant_type: QuantType::Q4_0,
         }, vec![norm_out, wq], vec![q_out], "q_proj");
@@ -2581,7 +2581,7 @@ mod tests {
         let wk = graph.add_tensor_concrete("wk", &[256, 512], DType::F32);
         let wv = graph.add_tensor_concrete("wv", &[256, 512], DType::F32);
 
-        graph.add_op(OpKind::RmsNorm { eps: 1e-5 }, vec![input], vec![norm_out], "norm");
+        graph.add_op(OpKind::RmsNorm { feature_dim: 4096, eps: 1e-5 }, vec![input], vec![norm_out], "norm");
         graph.add_op(OpKind::Gemm {
             m: SymDim::Concrete(64), n: 512, k: 256, dtype: DType::F32, trans_b: false,
         }, vec![norm_out, wq], vec![q_out], "q_proj");
@@ -2594,7 +2594,7 @@ mod tests {
         // QkNorm present but NO RoPE after them
         graph.add_op(OpKind::QkNorm { head_dim: 512, eps: 1e-5 }, vec![q_out], vec![qk_norm_q_out], "qk_norm_q");
         graph.add_op(OpKind::QkNorm { head_dim: 512, eps: 1e-5 }, vec![k_out], vec![qk_norm_k_out], "qk_norm_k");
-        graph.add_op(OpKind::ValueNorm { eps: 1e-5 }, vec![v_out], vec![value_norm_out], "value_norm");
+        graph.add_op(OpKind::ValueNorm { feature_dim: 4096, eps: 1e-5 }, vec![v_out], vec![value_norm_out], "value_norm");
 
         let topo: Vec<OpId> = graph.ops.iter().map(|o| o.id).collect();
 
@@ -2621,7 +2621,7 @@ mod tests {
         let weight = graph.add_tensor_concrete("weight", &[256, 512], DType::F32);
 
         let norm_id = graph.add_op(
-            OpKind::RmsNorm { eps: 1e-5 },
+            OpKind::RmsNorm { feature_dim: 4096, eps: 1e-5 },
             vec![input],
             vec![norm_out],
             "norm",
@@ -2674,7 +2674,7 @@ mod tests {
         let weight = graph.add_tensor_concrete("weight", &[256, 512], DType::F32);
 
         let norm_id = graph.add_op(
-            OpKind::RmsNorm { eps: 1e-5 },
+            OpKind::RmsNorm { feature_dim: 4096, eps: 1e-5 },
             vec![input],
             vec![norm_out],
             "norm",
@@ -2727,7 +2727,7 @@ mod tests {
         let wk = graph.add_tensor_concrete("wk", &[256, 512], DType::F32);
         let wv = graph.add_tensor_concrete("wv", &[256, 512], DType::F32);
 
-        graph.add_op(OpKind::RmsNorm { eps: 1e-5 }, vec![input], vec![norm_out], "norm");
+        graph.add_op(OpKind::RmsNorm { feature_dim: 4096, eps: 1e-5 }, vec![input], vec![norm_out], "norm");
         graph.add_op(OpKind::Gemm {
             m: SymDim::Concrete(64), n: 512, k: 256, dtype: DType::F32, trans_b: false,
         }, vec![norm_out, wq], vec![q_out], "q_proj");
@@ -2770,7 +2770,7 @@ mod tests {
         let wk = graph.add_tensor_concrete("wk", &[256, 512], DType::F32);
         let wv = graph.add_tensor_concrete("wv", &[256, 512], DType::F32);
 
-        graph.add_op(OpKind::RmsNorm { eps: 1e-5 }, vec![input], vec![norm_out], "norm");
+        graph.add_op(OpKind::RmsNorm { feature_dim: 4096, eps: 1e-5 }, vec![input], vec![norm_out], "norm");
         graph.add_op(OpKind::Gemm {
             m: SymDim::Concrete(64), n: 512, k: 256, dtype: DType::F32, trans_b: false,
         }, vec![norm_out, wq], vec![q_out], "q_proj");
@@ -2938,7 +2938,7 @@ mod tests {
         let wk = graph.add_tensor_concrete("wk", &[256, 512], DType::F32);
         let wv = graph.add_tensor_concrete("wv", &[256, 512], DType::F32);
 
-        graph.add_op(OpKind::RmsNorm { eps: 1e-5 }, vec![input], vec![norm_out], "norm");
+        graph.add_op(OpKind::RmsNorm { feature_dim: 4096, eps: 1e-5 }, vec![input], vec![norm_out], "norm");
         graph.add_op(OpKind::Gemm {
             m: SymDim::Concrete(64), n: 512, k: 256, dtype: DType::F32, trans_b: false,
         }, vec![norm_out, wq], vec![q_out], "q_proj");
@@ -2989,7 +2989,7 @@ mod tests {
         let wk = graph.add_tensor_concrete("wk", &[256, 512], DType::F32);
         let wv = graph.add_tensor_concrete("wv", &[256, 512], DType::F32);
 
-        graph.add_op(OpKind::RmsNorm { eps: 1e-5 }, vec![input], vec![norm_out], "norm");
+        graph.add_op(OpKind::RmsNorm { feature_dim: 4096, eps: 1e-5 }, vec![input], vec![norm_out], "norm");
         graph.add_op(OpKind::QuantGemm {
             m: SymDim::Concrete(64), n: 512, k: 256, quant_type: QuantType::Q4_0,
         }, vec![norm_out, wq], vec![q_out], "q_proj");
@@ -3004,7 +3004,7 @@ mod tests {
             vec![q_out], vec![qkn_q_out], "qkn_q");
         graph.add_op(OpKind::QkNorm { head_dim: 512, eps: 1e-5 },
             vec![k_out], vec![qkn_k_out], "qkn_k");
-        graph.add_op(OpKind::ValueNorm { eps: 1e-5 }, vec![v_out], vec![vn_out], "vn");
+        graph.add_op(OpKind::ValueNorm { feature_dim: 4096, eps: 1e-5 }, vec![v_out], vec![vn_out], "vn");
         graph.add_op(OpKind::RoPE { num_heads: 8, head_dim: 64, theta: 10000.0, partial: 1.0, rope_scaling: None },
             vec![qkn_q_out], vec![rope_q_out], "rope_q");
         graph.add_op(OpKind::RoPE { num_heads: 8, head_dim: 64, theta: 10000.0, partial: 1.0, rope_scaling: None },
@@ -3066,7 +3066,7 @@ mod tests {
         let weight = graph.add_tensor_concrete("weight", &[8192, 512], DType::F32);
 
         let norm_id = graph.add_op(
-            OpKind::RmsNorm { eps: 1e-5 },
+            OpKind::RmsNorm { feature_dim: 4096, eps: 1e-5 },
             vec![input],
             vec![norm_out],
             "norm",
@@ -3150,7 +3150,7 @@ mod tests {
         let wk = graph.add_tensor_concrete("wk", &[256, 512], DType::F32);
         let wv = graph.add_tensor_concrete("wv", &[256, 512], DType::F32);
 
-        graph.add_op(OpKind::RmsNorm { eps: 1e-5 }, vec![input], vec![norm_out], "norm");
+        graph.add_op(OpKind::RmsNorm { feature_dim: 4096, eps: 1e-5 }, vec![input], vec![norm_out], "norm");
         graph.add_op(OpKind::Gemm {
             m: SymDim::Concrete(64), n: 512, k: 256, dtype: DType::F32, trans_b: false,
         }, vec![norm_out, wq], vec![q_out], "q_proj");
@@ -3164,7 +3164,7 @@ mod tests {
             vec![q_out], vec![qkn_q_out], "qkn_q");
         graph.add_op(OpKind::QkNorm { head_dim: 512, eps: 1e-5 },
             vec![k_out], vec![qkn_k_out], "qkn_k");
-        graph.add_op(OpKind::ValueNorm { eps: 1e-5 }, vec![v_out], vec![vn_out], "vn");
+        graph.add_op(OpKind::ValueNorm { feature_dim: 4096, eps: 1e-5 }, vec![v_out], vec![vn_out], "vn");
         // QkNorm q output has 2 consumers: RoPE + extra Silu -> RoPE trace will find
         // qkn_q_out has 2 consumers, so norm_out_t.consumers.len() != 1 for the RoPE lookup
         graph.add_op(OpKind::RoPE { num_heads: 8, head_dim: 64, theta: 10000.0, partial: 1.0, rope_scaling: None },
@@ -3233,7 +3233,7 @@ mod tests {
         let wk = graph.add_tensor_concrete("wk", &[256, 512], DType::F32);
         let wv = graph.add_tensor_concrete("wv", &[256, 512], DType::F32);
 
-        graph.add_op(OpKind::RmsNorm { eps: 1e-5 }, vec![input], vec![norm_out], "norm");
+        graph.add_op(OpKind::RmsNorm { feature_dim: 4096, eps: 1e-5 }, vec![input], vec![norm_out], "norm");
         graph.add_op(OpKind::Gemm {
             m: SymDim::Concrete(64), n: 512, k: 256, dtype: DType::F32, trans_b: false,
         }, vec![norm_out, wq], vec![q_out], "q_proj");
@@ -3267,7 +3267,7 @@ mod tests {
         let weight = graph.add_tensor_concrete("weight", &[256, 512], DType::F32);
 
         let norm_id = graph.add_op(
-            OpKind::LayerNorm { eps: 1e-5 },
+            OpKind::LayerNorm { feature_dim: 4096, eps: 1e-5 },
             vec![input], vec![norm_out], "layernorm",
         );
         let gemm_id = graph.add_op(
@@ -3402,7 +3402,7 @@ mod tests {
         graph.inputs.push(input);
         let out = graph.add_tensor_concrete("out", &[64], DType::F32);
 
-        let norm_id = graph.add_op(OpKind::RmsNorm { eps: 1e-5 }, vec![input], vec![out], "norm");
+        let norm_id = graph.add_op(OpKind::RmsNorm { feature_dim: 4096, eps: 1e-5 }, vec![input], vec![out], "norm");
         // Create a Silu op (non-GEMM) that reads norm output
         let silu_out = graph.add_tensor_concrete("silu_out", &[64], DType::F32);
         let silu_id = graph.add_op(OpKind::Silu, vec![out], vec![silu_out], "silu");
@@ -3443,7 +3443,7 @@ mod tests {
         let wk = graph.add_tensor_concrete("wk", &[256, 512], DType::F32);
         let wv = graph.add_tensor_concrete("wv", &[256, 512], DType::F32);
 
-        graph.add_op(OpKind::RmsNorm { eps: 1e-5 }, vec![input], vec![norm_out], "norm");
+        graph.add_op(OpKind::RmsNorm { feature_dim: 4096, eps: 1e-5 }, vec![input], vec![norm_out], "norm");
         graph.add_op(OpKind::QuantGemm {
             m: SymDim::Concrete(64), n: 512, k: 256, quant_type: QuantType::Q4_0,
         }, vec![norm_out, wq], vec![q_out], "q_proj");
@@ -3626,7 +3626,7 @@ mod tests {
         let wk = graph.add_tensor_concrete("wk", &[256, 512], DType::F32);
         let wv = graph.add_tensor_concrete("wv", &[256, 512], DType::F32);
 
-        graph.add_op(OpKind::RmsNorm { eps: 1e-5 }, vec![input], vec![norm_out], "norm");
+        graph.add_op(OpKind::RmsNorm { feature_dim: 4096, eps: 1e-5 }, vec![input], vec![norm_out], "norm");
         graph.add_op(OpKind::Gemm {
             m: SymDim::Concrete(64), n: 512, k: 256, dtype: DType::F32, trans_b: false,
         }, vec![norm_out, wq], vec![q_out], "q_proj");
@@ -3642,7 +3642,7 @@ mod tests {
         graph.add_op(OpKind::Silu, vec![q_out], vec![extra_out], "extra");
         graph.add_op(OpKind::QkNorm { head_dim: 512, eps: 1e-5 },
             vec![k_out], vec![qkn_k_out], "qkn_k");
-        graph.add_op(OpKind::ValueNorm { eps: 1e-5 }, vec![v_out], vec![vn_out], "vn");
+        graph.add_op(OpKind::ValueNorm { feature_dim: 4096, eps: 1e-5 }, vec![v_out], vec![vn_out], "vn");
         graph.add_op(OpKind::RoPE { num_heads: 8, head_dim: 64, theta: 10000.0, partial: 1.0, rope_scaling: None },
             vec![qkn_q_out], vec![rope_q_out], "rope_q");
         graph.add_op(OpKind::RoPE { num_heads: 8, head_dim: 64, theta: 10000.0, partial: 1.0, rope_scaling: None },
@@ -3711,7 +3711,7 @@ mod tests {
         let wa = graph.add_tensor_concrete("wa", &[256, 512], DType::F32);
         let wb = graph.add_tensor_concrete("wb", &[256, 512], DType::F32);
 
-        graph.add_op(OpKind::RmsNorm { eps: 1e-5 }, vec![input], vec![norm_out], "norm");
+        graph.add_op(OpKind::RmsNorm { feature_dim: 4096, eps: 1e-5 }, vec![input], vec![norm_out], "norm");
         graph.add_op(OpKind::Gemm {
             m: SymDim::Concrete(64), n: 512, k: 256, dtype: DType::F32, trans_b: false,
         }, vec![norm_out, wa], vec![a_out], "gemm_a");
@@ -3861,7 +3861,7 @@ mod tests {
         let silu_out = graph.add_tensor_concrete("silu_out", &[32, 256], DType::F32);
         let weight = graph.add_tensor_concrete("weight", &[128, 256], DType::F32);
 
-        let norm_id = graph.add_op(OpKind::RmsNorm { eps: 1e-5 },
+        let norm_id = graph.add_op(OpKind::RmsNorm { feature_dim: 4096, eps: 1e-5 },
             vec![input], vec![norm_out], "norm");
         let gemm_id = graph.add_op(OpKind::Gemm {
             m: SymDim::Concrete(32), n: 256, k: 128, dtype: DType::F32, trans_b: false,
@@ -3954,7 +3954,7 @@ mod tests {
         let wv = graph.add_tensor_concrete("wv", &[256, 512], DType::F32);
         let we = graph.add_tensor_concrete("we", &[256, 512], DType::F32);
 
-        graph.add_op(OpKind::RmsNorm { eps: 1e-5 }, vec![input], vec![norm_out], "norm");
+        graph.add_op(OpKind::RmsNorm { feature_dim: 4096, eps: 1e-5 }, vec![input], vec![norm_out], "norm");
         graph.add_op(OpKind::Gemm {
             m: SymDim::Concrete(64), n: 512, k: 256, dtype: DType::F32, trans_b: false,
         }, vec![norm_out, wq], vec![q_out], "q_proj");
@@ -4058,7 +4058,7 @@ mod tests {
             m: SymDim::Concrete(1), n: 64, k: 64, dtype: DType::F32, trans_b: false,
         }, vec![input], vec![gemm_out], "gemm");
         let silu_id = graph.add_op(OpKind::Silu, vec![gemm_out], vec![silu_out], "silu");
-        let _norm_id = graph.add_op(OpKind::RmsNorm { eps: 1e-5 },
+        let _norm_id = graph.add_op(OpKind::RmsNorm { feature_dim: 4096, eps: 1e-5 },
             vec![silu_out], vec![norm_out], "norm");
 
         // Act
@@ -4086,7 +4086,7 @@ mod tests {
         let wa = graph.add_tensor_concrete("wa", &[256, 512], DType::F32);
         let wb = graph.add_tensor_concrete("wb", &[256, 256], DType::F32);
 
-        graph.add_op(OpKind::RmsNorm { eps: 1e-5 }, vec![input], vec![norm_out], "norm");
+        graph.add_op(OpKind::RmsNorm { feature_dim: 4096, eps: 1e-5 }, vec![input], vec![norm_out], "norm");
         let gemm_a_id = graph.add_op(OpKind::Gemm {
             m: SymDim::Concrete(64), n: 512, k: 256, dtype: DType::F32, trans_b: false,
         }, vec![norm_out, wa], vec![gemm_a_out], "gemm_a");
@@ -4176,7 +4176,7 @@ mod tests {
         let wk = graph.add_tensor_concrete("wk", &[256, 512], DType::F32);
         let wv = graph.add_tensor_concrete("wv", &[256, 512], DType::F32);
 
-        graph.add_op(OpKind::RmsNorm { eps: 1e-5 }, vec![input], vec![norm_out], "norm");
+        graph.add_op(OpKind::RmsNorm { feature_dim: 4096, eps: 1e-5 }, vec![input], vec![norm_out], "norm");
         graph.add_op(OpKind::Gemm {
             m: SymDim::Concrete(64), n: 512, k: 256, dtype: DType::F32, trans_b: false,
         }, vec![norm_out, wq], vec![q_out], "q_proj");
@@ -4190,9 +4190,9 @@ mod tests {
         graph.add_op(OpKind::QkNorm { head_dim: 512, eps: 1e-5 },
             vec![q_out], vec![qkn_q_out], "qkn_q");
         // K and V both go to ValueNorm (instead of K->QkNorm+RoPE)
-        graph.add_op(OpKind::ValueNorm { eps: 1e-5 },
+        graph.add_op(OpKind::ValueNorm { feature_dim: 4096, eps: 1e-5 },
             vec![k_out], vec![vn_k_out], "vn_k");
-        graph.add_op(OpKind::ValueNorm { eps: 1e-5 },
+        graph.add_op(OpKind::ValueNorm { feature_dim: 4096, eps: 1e-5 },
             vec![v_out], vec![vn_v_out], "vn_v");
         graph.add_op(OpKind::RoPE { num_heads: 8, head_dim: 64, theta: 10000.0, partial: 1.0, rope_scaling: None },
             vec![qkn_q_out], vec![rope_q_out], "rope_q");
@@ -4274,7 +4274,7 @@ mod tests {
             m: SymDim::Concrete(64), n: 512, k: 256, dtype: DType::F32, trans_b: false,
         }, vec![input, w_gate], vec![gate_out], "gate_gemm");
         // "up" producer is RmsNorm, not a GEMM
-        graph.add_op(OpKind::RmsNorm { eps: 1e-5 }, vec![input], vec![norm_out], "norm_up");
+        graph.add_op(OpKind::RmsNorm { feature_dim: 4096, eps: 1e-5 }, vec![input], vec![norm_out], "norm_up");
         graph.add_op(OpKind::Silu, vec![gate_out], vec![silu_out], "silu");
         graph.add_op(OpKind::Mul, vec![silu_out, norm_out], vec![mul_out], "mul");
 
@@ -4354,7 +4354,7 @@ mod tests {
             vec![q_out], vec![qkn_q_out], "qkn_q");
         graph.add_op(OpKind::QkNorm { head_dim: 512, eps: 1e-5 },
             vec![k_out], vec![qkn_k_out], "qkn_k");
-        graph.add_op(OpKind::ValueNorm { eps: 1e-5 }, vec![v_out], vec![vn_out], "vn");
+        graph.add_op(OpKind::ValueNorm { feature_dim: 4096, eps: 1e-5 }, vec![v_out], vec![vn_out], "vn");
         graph.add_op(OpKind::RoPE { num_heads: 8, head_dim: 64, theta: 10000.0, partial: 1.0, rope_scaling: None },
             vec![qkn_q_out], vec![rope_q_out], "rope_q");
         graph.add_op(OpKind::RoPE { num_heads: 8, head_dim: 64, theta: 10000.0, partial: 1.0, rope_scaling: None },

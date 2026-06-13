@@ -177,7 +177,7 @@ mod tests {
         let t_2 = graph.add_tensor("t2", vec![SymDim::Concrete(4)], DType::F32);
 
         let op0 = graph.add_op(OpKind::Silu, vec![t_input], vec![t_0], "silu");
-        let op1 = graph.add_op(OpKind::RmsNorm { eps: 1e-5 }, vec![t_0], vec![t_1], "norm");
+        let op1 = graph.add_op(OpKind::RmsNorm { feature_dim: 4096, eps: 1e-5 }, vec![t_0], vec![t_1], "norm");
         let op2 = graph.add_op(OpKind::Gemm { m: SymDim::Concrete(1), n: 64, k: 4, dtype: DType::F32, trans_b: false }, vec![t_1, t_w1], vec![t_2], "gemm");
 
         let plan = FusionPlan {
@@ -317,7 +317,7 @@ mod tests {
         let t_out = graph.add_tensor("out", vec![SymDim::Concrete(4)], DType::F32);
 
         let op0 = graph.add_op(OpKind::Silu, vec![t_in], vec![t_mid], "silu");
-        let op1 = graph.add_op(OpKind::RmsNorm { eps: 1e-5 }, vec![t_mid], vec![t_a], "norm");
+        let op1 = graph.add_op(OpKind::RmsNorm { feature_dim: 4096, eps: 1e-5 }, vec![t_mid], vec![t_a], "norm");
         let op2 = graph.add_op(OpKind::Silu, vec![t_a], vec![t_out], "silu2");
 
         let plan = FusionPlan {
@@ -554,7 +554,7 @@ mod tests {
         let t_b = graph.add_tensor("b", vec![SymDim::Concrete(8)], DType::F32);
 
         let op0 = graph.add_op(
-            OpKind::RmsNorm { eps: 1e-6 },
+            OpKind::RmsNorm { feature_dim: 4096, eps: 1e-6 },
             vec![t_in],
             vec![t_a],
             "norm",
@@ -1434,7 +1434,7 @@ mod tests {
         let t_out = graph.add_tensor("out", vec![SymDim::Concrete(4)], DType::F32);
 
         let op0 = graph.add_op(OpKind::Silu, vec![t_in], vec![t_mid1], "inner0");
-        let op1 = graph.add_op(OpKind::RmsNorm { eps: 1e-5 }, vec![t_mid1], vec![t_mid2], "inner1");
+        let op1 = graph.add_op(OpKind::RmsNorm { feature_dim: 4096, eps: 1e-5 }, vec![t_mid1], vec![t_mid2], "inner1");
         let op2 = graph.add_op(OpKind::Silu, vec![t_mid2], vec![t_out], "inner2");
 
         let plan = FusionPlan {
@@ -1888,7 +1888,7 @@ mod tests {
         let t_out = graph.add_tensor("out", vec![SymDim::Concrete(4)], DType::F32);
 
         let op0 = graph.add_op(OpKind::Silu, vec![t_in], vec![t_m1], "a");
-        let op1 = graph.add_op(OpKind::RmsNorm { eps: 1e-6 }, vec![t_m1], vec![t_m2], "b");
+        let op1 = graph.add_op(OpKind::RmsNorm { feature_dim: 4096, eps: 1e-6 }, vec![t_m1], vec![t_m2], "b");
         let op2 = graph.add_op(OpKind::Silu, vec![t_m2], vec![t_m3], "c");
         let op3 = graph.add_op(OpKind::Silu, vec![t_m3], vec![t_out], "d");
 
@@ -2249,7 +2249,7 @@ mod tests {
         let o2 = graph.add_tensor("o2", vec![SymDim::Concrete(4)], DType::F32);
 
         let op0 = graph.add_op(OpKind::Silu, vec![t0], vec![o0], "silu");
-        let op1 = graph.add_op(OpKind::RmsNorm { eps: 1e-5 }, vec![t1], vec![o1], "norm");
+        let op1 = graph.add_op(OpKind::RmsNorm { feature_dim: 4096, eps: 1e-5 }, vec![t1], vec![o1], "norm");
         let op2 = graph.add_op(OpKind::Mul, vec![t2, t3], vec![o2], "mul");
         let op3 = graph.add_op(OpKind::Add, vec![t4, t0], vec![o0], "add");
 
@@ -3127,7 +3127,7 @@ mod tests {
         let t_indep = graph.add_tensor("indep_out", vec![SymDim::Concrete(4)], DType::F32);
 
         let op0a = graph.add_op(OpKind::Silu, vec![t_in], vec![t_mid], "fused_a");
-        let op0b = graph.add_op(OpKind::RmsNorm { eps: 1e-5 }, vec![t_mid], vec![t_a], "fused_b");
+        let op0b = graph.add_op(OpKind::RmsNorm { feature_dim: 4096, eps: 1e-5 }, vec![t_mid], vec![t_a], "fused_b");
         let op1 = graph.add_op(OpKind::Silu, vec![t_a], vec![t_out], "downstream");
         let op2 = graph.add_op(OpKind::Silu, vec![t_ext], vec![t_indep], "independent");
 
@@ -3298,7 +3298,7 @@ mod tests {
         let t_indep = graph.add_tensor("indep_out", vec![SymDim::Concrete(4)], DType::F32);
 
         let op0a = graph.add_op(OpKind::Silu, vec![t_in], vec![t_mid0], "g0a");
-        let op0b = graph.add_op(OpKind::RmsNorm { eps: 1e-5 }, vec![t_mid0], vec![t_a], "g0b");
+        let op0b = graph.add_op(OpKind::RmsNorm { feature_dim: 4096, eps: 1e-5 }, vec![t_mid0], vec![t_a], "g0b");
         let op1a = graph.add_op(OpKind::Silu, vec![t_a], vec![t_mid1], "g1a");
         let op1b = graph.add_op(OpKind::Mul, vec![t_mid1, t_w], vec![t_b], "g1b");
         let op2 = graph.add_op(OpKind::Silu, vec![t_ext], vec![t_indep], "indep");

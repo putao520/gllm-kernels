@@ -7,7 +7,7 @@ use super::instr::*;
 use super::vm_state::AbiPtrs;
 use super::plan_lower::{
     LoweringContext, TensorPtrResolver,
-    resolve_sym_dim, infer_output_shape_sym, infer_feature_dim,
+    resolve_sym_dim, infer_output_shape_sym,
     build_norm_pattern, build_norm_pattern_head_rms, build_norm_pattern_qk,
     emit_elementwise_inline,
     try_dispatch_reduction, extract_op_trace,
@@ -273,7 +273,7 @@ pub(crate) fn dispatch_structural(
             Ok(())
         }
 
-        OpKind::SgDetect { .. } => {
+        OpKind::SgDetect { hidden_dim, .. } => {
             // Symbolic copy: hidden → SgSharedMemory.detect_hidden (offset 16).
             // StructuralOpBuilder::emit_simd_copy handles loop bounds, alignment.
             let sg_base = abi.hook_ctx_ptr.ok_or_else(|| CompilerError::CodegenViolation(
@@ -282,16 +282,8 @@ pub(crate) fn dispatch_structural(
             prog.emit(VmInstr::LoadPtr {
                 dst: detect_ptr, src: PtrExpr::VRegPlusConst(sg_base, 16),
             });
-            let in_tid = op.inputs.first().ok_or_else(|| CompilerError::CodegenViolation(
-                "SgDetect: no input tensor".into()))?;
-            let in_tensor = graph.tensor(*in_tid).ok_or_else(|| CompilerError::CodegenViolation(
-                "SgDetect: input tensor not found".into()))?;
-            let hidden_dim = in_tensor.shape.last()
-                .and_then(|d| d.as_concrete())
-                .ok_or_else(|| CompilerError::CodegenViolation(
-                    "SgDetect: cannot determine hidden dim from input shape".into()))?;
             StructuralOpBuilder::emit_side_channel_copy(
-                prog, input_ptr, detect_ptr, 0, hidden_dim, ctx.width,
+                prog, input_ptr, detect_ptr, 0, *hidden_dim, ctx.width,
             )?;
 
             // ── Callback table: SG_KNOWLEDGE_RETRIEVE (slot 0) ──
@@ -934,8 +926,8 @@ pub(crate) fn dispatch_compute_pattern(
                 // ── NormLike → emit_normlike_inline / emit_layernorm_auto ──
                 ComputePattern::NormLike { .. } => {
                     match &op.kind {
-                        OpKind::RmsNorm { eps: _ } | OpKind::ValueNorm { eps: _ } => {
-                            let feature_dim = infer_feature_dim(op, graph)?;
+                        OpKind::RmsNorm { feature_dim, .. } | OpKind::ValueNorm { feature_dim, .. } => {
+                            let feature_dim_v = *feature_dim;
                             let out_tid = op.outputs.first().copied().ok_or_else(|| CompilerError::CodegenViolation(
                                 format!("Norm op {:?}: 无输出张量", op.id)))?;
                             let out_tensor = graph.tensor(out_tid).ok_or_else(|| CompilerError::CodegenViolation(
@@ -963,18 +955,18 @@ pub(crate) fn dispatch_compute_pattern(
                             };
                             let pattern = build_norm_pattern(op)?;
                             emit_normlike_inline(
-                                prog, &pattern, feature_dim, /*groups_per_row=*/1,
+                                prog, &pattern, feature_dim_v, /*groups_per_row=*/1,
                                 /*broadcast_weight=*/false, norm_kind,
                                 width, seq_bound, input_ptr, weight_ptr, output_ptr,
                                 ctx.dtype,
                             )?;
                             if graph.telemetry.rmsnorm_channel_scale {
-                                emit_rmsnorm_channel_scale_telemetry(prog, input_ptr, feature_dim, width, sym_map, ctx.dtype)?;
+                                emit_rmsnorm_channel_scale_telemetry(prog, input_ptr, feature_dim_v, width, sym_map, ctx.dtype)?;
                             }
                             return Ok(true);
                         }
-                        OpKind::LayerNorm { eps } => {
-                            let feature_dim = infer_feature_dim(op, graph)?;
+                        OpKind::LayerNorm { feature_dim, eps } => {
+                            let feature_dim_v = *feature_dim;
                             let out_tid = op.outputs.first().copied().ok_or_else(|| CompilerError::CodegenViolation(
                                 format!("LayerNorm op {:?}: 无输出张量", op.id)))?;
                             let out_tensor = graph.tensor(out_tid).ok_or_else(|| CompilerError::CodegenViolation(
@@ -995,7 +987,7 @@ pub(crate) fn dispatch_compute_pattern(
                             } else {
                                 resolve_sym_dim(&seq_dim, abi, sym_map)
                             };
-                            emit_layernorm_auto(prog, feature_dim, *eps, width, seq_bound,
+                            emit_layernorm_auto(prog, feature_dim_v, *eps, width, seq_bound,
                                 input_ptr, weight_ptr, output_ptr, ctx.dtype)?;
                             return Ok(true);
                         }

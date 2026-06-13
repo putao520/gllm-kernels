@@ -855,15 +855,15 @@ mod tests {
     fn test_fallback_op_class_reduction_variants() {
         // Arrange & Act & Assert
         assert_eq!(
-            invoke_fallback(&OpKind::RmsNorm { eps: 1e-5 }),
+            invoke_fallback(&OpKind::RmsNorm { feature_dim: 4096, eps: 1e-5 }),
             OpClass::Reduction
         );
         assert_eq!(
-            invoke_fallback(&OpKind::LayerNorm { eps: 1e-5 }),
+            invoke_fallback(&OpKind::LayerNorm { feature_dim: 4096, eps: 1e-5 }),
             OpClass::Reduction
         );
         assert_eq!(
-            invoke_fallback(&OpKind::ValueNorm { eps: 1e-6 }),
+            invoke_fallback(&OpKind::ValueNorm { feature_dim: 4096, eps: 1e-6 }),
             OpClass::Reduction
         );
         assert_eq!(invoke_fallback(&OpKind::Softmax), OpClass::Reduction);
@@ -1151,7 +1151,7 @@ mod tests {
         let normed = graph.add_tensor_concrete("normed", &[4, 32], DType::F32);
         let activated = graph.add_tensor_concrete("activated", &[4, 32], DType::F32);
         graph.add_op(
-            OpKind::RmsNorm { eps: 1e-5 },
+            OpKind::RmsNorm { feature_dim: 4096, eps: 1e-5 },
             vec![input, weight],
             vec![normed],
             "rms_norm",
@@ -1760,7 +1760,7 @@ mod tests {
         let weight = graph.add_tensor_concrete("w", &[4], DType::F32);
         let output = graph.add_tensor_concrete("y", &[2, 4], DType::F32);
         let op_id = graph.add_op(
-            OpKind::RmsNorm { eps: 1e-6 },
+            OpKind::RmsNorm { feature_dim: 4096, eps: 1e-6 },
             vec![input, weight],
             vec![output],
             "norm",
@@ -1772,7 +1772,7 @@ mod tests {
         let node = dag.node(op_id).expect("node should exist");
         // Assert
         assert_eq!(node.node_id, op_id);
-        assert_eq!(node.op_kind, OpKind::RmsNorm { eps: 1e-6 });
+        assert_eq!(node.op_kind, OpKind::RmsNorm { feature_dim: 4096, eps: 1e-6 });
         assert_eq!(node.op_class, OpClass::Reduction);
         assert_eq!(node.inputs, vec![input, weight]);
         assert_eq!(node.outputs, vec![output]);
@@ -1863,7 +1863,7 @@ mod tests {
         let weight = graph.add_tensor_concrete("w", &[32], DType::F32);
         let output = graph.add_tensor_concrete("y", &[2, 32], DType::F32);
         graph.add_op(
-            OpKind::RmsNorm { eps: 1e-5 },
+            OpKind::RmsNorm { feature_dim: 4096, eps: 1e-5 },
             vec![input, weight],
             vec![output],
             "rms_norm",
@@ -2080,7 +2080,7 @@ mod tests {
         assert_eq!(invoke_fallback(&OpKind::EarlyExit { anchor_layer: 16 }), OpClass::Opaque);
         assert_eq!(invoke_fallback(&OpKind::GuardrailCheck { probe_offset: 0 }), OpClass::Opaque);
         assert_eq!(invoke_fallback(&OpKind::SgInject { knowledge_offset: 0, dim: 4096 }), OpClass::Opaque);
-        assert_eq!(invoke_fallback(&OpKind::SgDetect { detect_offset: 0 }), OpClass::Opaque);
+        assert_eq!(invoke_fallback(&OpKind::SgDetect { detect_offset: 0, hidden_dim: 0 }), OpClass::Opaque);
         assert_eq!(invoke_fallback(&OpKind::CotStepCheck { shared_mem_offset: 0 }), OpClass::Opaque);
         assert_eq!(invoke_fallback(&OpKind::SessionKvRestore), OpClass::Opaque);
         assert_eq!(invoke_fallback(&OpKind::MmHiddenInject { hidden_dim: 4096 }), OpClass::Opaque);

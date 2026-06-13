@@ -995,16 +995,11 @@ pub(crate) fn infer_output_shape_sym(op: &crate::compiler::graph::CompilerOp, gr
     Ok((tensor.shape.clone(), feature_dim))
 }
 
-pub(crate) fn infer_feature_dim(op: &crate::compiler::graph::CompilerOp, graph: &CompilerGraph) -> Result<usize, CompilerError> {
-    let (_, feature_dim) = infer_output_shape_sym(op, graph)?;
-    Ok(feature_dim)
-}
-
 /// RmsNorm / ValueNorm 的标量 pattern。LayerNorm 不用此 pattern — 它走
 /// RmsNorm/ValueNorm NormLike pattern builder (LayerNorm uses emit_layernorm_auto)。
 pub(crate) fn build_norm_pattern(op: &crate::compiler::graph::CompilerOp) -> Result<ComputePattern, CompilerError> {
     let eps = match &op.kind {
-        OpKind::RmsNorm { eps } | OpKind::ValueNorm { eps } => *eps,
+        OpKind::RmsNorm { eps, .. } | OpKind::ValueNorm { eps, .. } => *eps,
         other => return Err(CompilerError::CodegenViolation(
             format!("build_norm_pattern: expected RmsNorm/ValueNorm, got {:?}", other),
         )),

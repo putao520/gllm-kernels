@@ -767,7 +767,7 @@ mod tests {
         ]);
         // NormLike: reduce + finalize + transform
         let trace = OpTrace {
-            op_kind: OpKind::RmsNorm { eps: 1e-5 },
+            op_kind: OpKind::RmsNorm { feature_dim: 4096, eps: 1e-5 },
             pattern: ComputePattern::NormLike {
                 reduce: vec![TraceOp::Mul(vid(0), vid(0))],
                 finalize: vec![TraceOp::Sqrt(vid(0))],
@@ -1330,7 +1330,7 @@ mod tests {
         let norm_out = g.add_tensor_concrete("norm_out", &[1, 4096], dt);
         let gemm_out = g.add_tensor_concrete("gemm_out", &[1, 4096], dt);
 
-        let norm = g.add_op(OpKind::RmsNorm { eps: 1e-5 }, vec![norm_in], vec![norm_out], "norm");
+        let norm = g.add_op(OpKind::RmsNorm { feature_dim: 4096, eps: 1e-5 }, vec![norm_in], vec![norm_out], "norm");
         let gemm = g.add_op(
             OpKind::Gemm { m: SymDim::Concrete(1), n: 4096, k: 4096, dtype: DType::F32, trans_b: false },
             vec![a, w],

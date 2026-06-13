@@ -322,7 +322,7 @@ mod tests {
             let w = g.add_tensor_concrete("w", &[k_large, k_large], dt);
             let gemm_out = g.add_tensor_concrete("gemm_out", &[1, k_large], dt);
 
-            g.add_op(crate::compiler::graph::OpKind::RmsNorm { eps: 1e-5 }, vec![x], vec![norm_out], "rms_norm");
+            g.add_op(crate::compiler::graph::OpKind::RmsNorm { feature_dim: 4096, eps: 1e-5 }, vec![x], vec![norm_out], "rms_norm");
             g.add_op(
                 crate::compiler::graph::OpKind::Gemm { m: crate::compiler::graph::SymDim::Concrete(1), n: k_large, k: k_large, dtype: DType::F32, trans_b: false },
                 vec![norm_out, w],
@@ -356,7 +356,7 @@ mod tests {
                 "Test setup error: norm output {norm_bytes}B should be <= l1_budget {l1_budget}B"
             );
 
-            g.add_op(crate::compiler::graph::OpKind::RmsNorm { eps: 1e-5 }, vec![x], vec![norm_out], "rms_norm");
+            g.add_op(crate::compiler::graph::OpKind::RmsNorm { feature_dim: 4096, eps: 1e-5 }, vec![x], vec![norm_out], "rms_norm");
             g.add_op(
                 crate::compiler::graph::OpKind::Gemm { m: crate::compiler::graph::SymDim::Concrete(1), n: n_small, k: k_small, dtype: DType::F32, trans_b: false },
                 vec![norm_out, w],
@@ -453,7 +453,7 @@ mod tests {
         let k_out = g.add_tensor_concrete("k_out", &[1, dim], dt);
         let v_out = g.add_tensor_concrete("v_out", &[1, dim], dt);
 
-        g.add_op(crate::compiler::graph::OpKind::RmsNorm { eps: 1e-5 }, vec![x], vec![norm_out], "rms_norm");
+        g.add_op(crate::compiler::graph::OpKind::RmsNorm { feature_dim: 4096, eps: 1e-5 }, vec![x], vec![norm_out], "rms_norm");
         g.add_op(
             crate::compiler::graph::OpKind::Gemm { m: crate::compiler::graph::SymDim::Concrete(1), n: dim, k: dim, dtype: DType::F32, trans_b: false },
             vec![norm_out, wq],
@@ -577,7 +577,7 @@ mod tests {
 
         // RmsNorm → shared input for QKV
         g.add_op(
-            crate::compiler::graph::OpKind::RmsNorm { eps: 1e-5 },
+            crate::compiler::graph::OpKind::RmsNorm { feature_dim: 4096, eps: 1e-5 },
             vec![x],
             vec![norm_out],
             "rms_norm",
@@ -631,7 +631,7 @@ mod tests {
         // ValueNorm on V
         let v_normed = g.add_tensor_concrete("v_normed", &[1, dim], dt);
         g.add_op(
-            crate::compiler::graph::OpKind::ValueNorm { eps: 1e-6 },
+            crate::compiler::graph::OpKind::ValueNorm { feature_dim: 4096, eps: 1e-6 },
             vec![v_out],
             vec![v_normed],
             "valuenorm_v",
@@ -695,7 +695,7 @@ mod tests {
         let k_out = g.add_tensor_concrete("k_out", &[1, dim], dt);
         let v_out = g.add_tensor_concrete("v_out", &[1, dim], dt);
 
-        g.add_op(crate::compiler::graph::OpKind::RmsNorm { eps: 1e-5 }, vec![x], vec![norm_out], "rms_norm");
+        g.add_op(crate::compiler::graph::OpKind::RmsNorm { feature_dim: 4096, eps: 1e-5 }, vec![x], vec![norm_out], "rms_norm");
         g.add_op(
             crate::compiler::graph::OpKind::Gemm { m: crate::compiler::graph::SymDim::Concrete(1), n: dim, k: dim, dtype: dt, trans_b: false },
             vec![norm_out, wq], vec![q_out], "gemm_q",
@@ -737,7 +737,7 @@ mod tests {
         let w = g.add_tensor_concrete("w", &[512, 512], dt);
         let gemm_out = g.add_tensor_concrete("gemm_out", &[1, 512], dt);
 
-        g.add_op(crate::compiler::graph::OpKind::RmsNorm { eps: 1e-5 }, vec![x], vec![norm_out], "rms_norm");
+        g.add_op(crate::compiler::graph::OpKind::RmsNorm { feature_dim: 4096, eps: 1e-5 }, vec![x], vec![norm_out], "rms_norm");
         g.add_op(
             crate::compiler::graph::OpKind::Gemm { m: crate::compiler::graph::SymDim::Concrete(1), n: 512, k: 512, dtype: DType::F32, trans_b: false },
             vec![norm_out, w],
@@ -862,7 +862,7 @@ mod tests {
         let w = g.add_tensor_concrete("w", &[k, k], dt);
         let gemm_out = g.add_tensor_concrete("gemm_out", &[1, k], dt);
 
-        g.add_op(crate::compiler::graph::OpKind::RmsNorm { eps: 1e-5 }, vec![x], vec![norm_out], "rms_norm");
+        g.add_op(crate::compiler::graph::OpKind::RmsNorm { feature_dim: 4096, eps: 1e-5 }, vec![x], vec![norm_out], "rms_norm");
         g.add_op(
             crate::compiler::graph::OpKind::Gemm { m: crate::compiler::graph::SymDim::Concrete(1), n: k, k, dtype: DType::F32, trans_b: false },
             vec![norm_out, w],
@@ -909,7 +909,7 @@ mod tests {
         let w = g.add_tensor_concrete("w", &[k, n], dt);
         let gemm_out = g.add_tensor_concrete("gemm_out", &[1, n], dt);
 
-        g.add_op(crate::compiler::graph::OpKind::RmsNorm { eps: 1e-5 }, vec![x], vec![norm_out], "rms_norm");
+        g.add_op(crate::compiler::graph::OpKind::RmsNorm { feature_dim: 4096, eps: 1e-5 }, vec![x], vec![norm_out], "rms_norm");
         g.add_op(
             crate::compiler::graph::OpKind::Gemm { m: crate::compiler::graph::SymDim::Concrete(1), n, k, dtype: DType::F32, trans_b: false },
             vec![norm_out, w],
@@ -1597,7 +1597,7 @@ mod tests {
         let k_out = g.add_tensor_concrete("k_out", &[1, dim], dt);
         let v_out = g.add_tensor_concrete("v_out", &[1, dim], dt);
 
-        g.add_op(crate::compiler::graph::OpKind::RmsNorm { eps: 1e-5 }, vec![x], vec![norm_out], "rms_norm");
+        g.add_op(crate::compiler::graph::OpKind::RmsNorm { feature_dim: 4096, eps: 1e-5 }, vec![x], vec![norm_out], "rms_norm");
         // Q: Q4_0
         g.add_op(
             crate::compiler::graph::OpKind::QuantGemm { m: crate::compiler::graph::SymDim::Concrete(1), n: dim, k: dim, quant_type: crate::quant::QuantType::Q4_0 },
@@ -1678,7 +1678,7 @@ mod tests {
         let k_out = g.add_tensor_concrete("k_out", &[1, dim], dt);
         let v_out = g.add_tensor_concrete("v_out", &[1, dim], dt);
 
-        g.add_op(crate::compiler::graph::OpKind::RmsNorm { eps: 1e-5 }, vec![x], vec![norm_out], "rms_norm");
+        g.add_op(crate::compiler::graph::OpKind::RmsNorm { feature_dim: 4096, eps: 1e-5 }, vec![x], vec![norm_out], "rms_norm");
         // All Q4_0
         g.add_op(
             crate::compiler::graph::OpKind::QuantGemm { m: crate::compiler::graph::SymDim::Concrete(1), n: dim, k: dim, quant_type: crate::quant::QuantType::Q4_0 },
@@ -1907,7 +1907,7 @@ mod tests {
         let w = g.add_tensor_concrete("w", &[512, 512], dt);
         let gemm_out = g.add_tensor_concrete("gemm_out", &[1, 512], dt);
 
-        g.add_op(crate::compiler::graph::OpKind::LayerNorm { eps: 1e-5 }, vec![x], vec![norm_out], "layer_norm");
+        g.add_op(crate::compiler::graph::OpKind::LayerNorm { feature_dim: 4096, eps: 1e-5 }, vec![x], vec![norm_out], "layer_norm");
         g.add_op(
             crate::compiler::graph::OpKind::Gemm { m: crate::compiler::graph::SymDim::Concrete(1), n: 512, k: 512, dtype: DType::F32, trans_b: false },
             vec![norm_out, w], vec![gemm_out], "gemm",
@@ -1999,7 +1999,7 @@ mod tests {
         let mut g = CompilerGraph::new();
         let x = g.add_tensor_concrete("x", &[1, 512], dt);
         let norm_out = g.add_tensor_concrete("norm_out", &[1, 512], dt);
-        g.add_op(crate::compiler::graph::OpKind::RmsNorm { eps: 1e-5 }, vec![x], vec![norm_out], "rms_norm");
+        g.add_op(crate::compiler::graph::OpKind::RmsNorm { feature_dim: 4096, eps: 1e-5 }, vec![x], vec![norm_out], "rms_norm");
 
         let plan = fuse_with_dag(&g, &registry, &exec_plan);
 
@@ -2182,8 +2182,8 @@ mod tests {
         let norm1_out = g.add_tensor_concrete("norm1_out", &[1, 256], dt);
         let norm2_out = g.add_tensor_concrete("norm2_out", &[1, 256], dt);
 
-        g.add_op(crate::compiler::graph::OpKind::RmsNorm { eps: 1e-5 }, vec![x], vec![norm1_out], "norm1");
-        g.add_op(crate::compiler::graph::OpKind::RmsNorm { eps: 1e-5 }, vec![norm1_out], vec![norm2_out], "norm2");
+        g.add_op(crate::compiler::graph::OpKind::RmsNorm { feature_dim: 4096, eps: 1e-5 }, vec![x], vec![norm1_out], "norm1");
+        g.add_op(crate::compiler::graph::OpKind::RmsNorm { feature_dim: 4096, eps: 1e-5 }, vec![norm1_out], vec![norm2_out], "norm2");
 
         let plan = fuse_with_dag(&g, &registry, &exec_plan);
 

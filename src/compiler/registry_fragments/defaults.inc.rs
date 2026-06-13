@@ -399,9 +399,9 @@ impl ScalarOpRegistry {
         reg.register_with_symexec_fallback(
             OpKindKey::RmsNorm,
             rms_sig.clone(),
-            OpKind::RmsNorm { eps: default_eps },
+            OpKind::RmsNorm { feature_dim: 0, eps: default_eps },
             OpTrace {
-                op_kind: OpKind::RmsNorm { eps: 1e-5 }, // default eps; actual value comes from graph OpKind at compile time
+                op_kind: OpKind::RmsNorm { feature_dim: 0, eps: 1e-5 }, // default eps; actual value comes from graph OpKind at compile time
                 pattern: ComputePattern::NormLike {
                     reduce: vec![
                         TraceOp::Input(0),  // [0] x
@@ -485,9 +485,9 @@ impl ScalarOpRegistry {
         reg.register_with_symexec_fallback(
             OpKindKey::ValueNorm,
             vnorm_sig.clone(),
-            OpKind::ValueNorm { eps: default_eps },
+            OpKind::ValueNorm { feature_dim: 0, eps: default_eps },
             OpTrace {
-                op_kind: OpKind::ValueNorm { eps: 1e-5 },
+                op_kind: OpKind::ValueNorm { feature_dim: 0, eps: 1e-5 },
                 pattern: ComputePattern::NormLike {
                     reduce: vec![
                         TraceOp::Input(0),  // [0] x
@@ -526,9 +526,9 @@ impl ScalarOpRegistry {
         reg.register_with_symexec_fallback(
             OpKindKey::LayerNorm,
             ln_sig.clone(),
-            OpKind::LayerNorm { eps: default_eps },
+            OpKind::LayerNorm { feature_dim: 0, eps: default_eps },
             OpTrace {
-                op_kind: OpKind::LayerNorm { eps: 1e-5 }, // default eps; actual value comes from graph OpKind at compile time
+                op_kind: OpKind::LayerNorm { feature_dim: 0, eps: 1e-5 }, // default eps; actual value comes from graph OpKind at compile time
                 pattern: ComputePattern::NormLike {
                     reduce: vec![
                         TraceOp::Input(0), // [0] x  (used for both mean and variance)
@@ -1914,7 +1914,7 @@ impl ScalarOpRegistry {
         reg.inject_trace(
             OpKindKey::SgDetect,
             OpTrace {
-                op_kind: OpKind::SgDetect { detect_offset: 0 },
+                op_kind: OpKind::SgDetect { detect_offset: 0, hidden_dim: 0 },
                 pattern: ComputePattern::Injective {
                     body: vec![TraceOp::Input(0)],
                     num_inputs: 1,

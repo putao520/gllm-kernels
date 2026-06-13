@@ -416,7 +416,7 @@ mod tests {
         let x = g.add_tensor_concrete("x", &[1, 64], DType::F32);
         let norm_w = g.add_tensor_concrete("norm_w", &[64], DType::U8);
         let out = g.add_tensor_concrete("out", &[1, 64], DType::F32);
-        g.add_op(OpKind::RmsNorm { eps: 1e-6 }, vec![x, norm_w], vec![out], "norm");
+        g.add_op(OpKind::RmsNorm { feature_dim: 4096, eps: 1e-6 }, vec![x, norm_w], vec![out], "norm");
 
         let tensor = g.tensor(norm_w).unwrap();
         let strategy = select_dequant_path(tensor, &g);
@@ -560,7 +560,7 @@ mod tests {
         g.inputs = vec![input, norm_w, gemm_w];
 
         let normed = g.add_tensor_concrete("normed", &[1, 512], DType::F32);
-        g.add_op(OpKind::RmsNorm { eps: 1e-6 }, vec![input, norm_w], vec![normed], "norm");
+        g.add_op(OpKind::RmsNorm { feature_dim: 4096, eps: 1e-6 }, vec![input, norm_w], vec![normed], "norm");
 
         let out = g.add_tensor_concrete("out", &[1, 2048], DType::F32);
         g.add_op(

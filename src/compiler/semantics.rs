@@ -518,7 +518,7 @@ mod tests {
     #[test]
     fn test_classify_reduction() {
         assert_eq!(classify(&OpKind::Softmax), OpSemantics::Reduction);
-        assert_eq!(classify(&OpKind::RmsNorm { eps: 1e-5 }), OpSemantics::Reduction);
+        assert_eq!(classify(&OpKind::RmsNorm { feature_dim: 4096, eps: 1e-5 }), OpSemantics::Reduction);
     }
 
     #[test]
@@ -638,7 +638,7 @@ mod tests {
     #[test]
     fn test_classify_reduction_ops() {
         // Multiple reduction-classified ops: LayerNorm, MeanPool, L2Normalize, QkNorm, Argmax
-        assert_eq!(classify(&OpKind::LayerNorm { eps: 1e-5 }), OpSemantics::Reduction);
+        assert_eq!(classify(&OpKind::LayerNorm { feature_dim: 4096, eps: 1e-5 }), OpSemantics::Reduction);
         assert_eq!(
             classify(&OpKind::MeanPool { seq_len: 128, hidden: 768, cls_mode: false }),
             OpSemantics::Reduction,
@@ -737,7 +737,7 @@ mod tests {
     fn test_fusable_epilogue_excludes_non_elementwise() {
         // Ops that are not fusable as GEMM epilogue (Gelu IS fusable, so excluded)
         assert!(!fusable_as_gemm_epilogue(&OpKind::Softmax));
-        assert!(!fusable_as_gemm_epilogue(&OpKind::RmsNorm { eps: 1e-5 }));
+        assert!(!fusable_as_gemm_epilogue(&OpKind::RmsNorm { feature_dim: 4096, eps: 1e-5 }));
         assert!(!fusable_as_gemm_epilogue(&OpKind::Mul));
         assert!(!fusable_as_gemm_epilogue(&OpKind::SwiGlu));
         assert!(!fusable_as_gemm_epilogue(&OpKind::RoPE { num_heads: 32, head_dim: 128, theta: 10000.0, partial: 1.0, rope_scaling: None }));

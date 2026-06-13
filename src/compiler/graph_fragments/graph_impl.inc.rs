@@ -373,7 +373,7 @@ impl CompilerGraph {
         // RmsNorm₁
         let normed1 = g.add_tensor_concrete("normed1", &[b, h], dt);
         g.add_op(
-            OpKind::RmsNorm { eps: ir.rms_eps },
+            OpKind::RmsNorm { feature_dim: h, eps: ir.rms_eps },
             vec![input, w_norm1],
             vec![normed1],
             "rms_norm_1",
@@ -480,7 +480,7 @@ impl CompilerGraph {
         // RmsNorm₂
         let normed2 = g.add_tensor_concrete("normed2", &[b, h], dt);
         g.add_op(
-            OpKind::RmsNorm { eps: ir.rms_eps },
+            OpKind::RmsNorm { feature_dim: h, eps: ir.rms_eps },
             vec![resid1, w_norm2],
             vec![normed2],
             "rms_norm_2",
@@ -586,7 +586,7 @@ impl CompilerGraph {
         // LayerNorm₁ (with bias, unlike RmsNorm)
         let normed1 = g.add_tensor_concrete("normed1", &[seq, h], dt);
         g.add_op(
-            OpKind::LayerNorm { eps: ir.rms_eps },
+            OpKind::LayerNorm { feature_dim: h, eps: ir.rms_eps },
             vec![input, w_norm1, w_norm1_b],
             vec![normed1],
             "layer_norm_1",
@@ -658,7 +658,7 @@ impl CompilerGraph {
         // LayerNorm₂
         let normed2 = g.add_tensor_concrete("normed2", &[seq, h], dt);
         g.add_op(
-            OpKind::LayerNorm { eps: ir.rms_eps },
+            OpKind::LayerNorm { feature_dim: h, eps: ir.rms_eps },
             vec![resid1, w_norm2, w_norm2_b],
             vec![normed2],
             "layer_norm_2",
