@@ -520,6 +520,33 @@ pub(crate) fn lower_op_v2(
             )?;
             Ok(true)
         }
+        Op::MoERouter { num_experts, top_k, hidden, seq_len: _ } => {
+            let input_ptr = resolver.materialize(prog, op.inputs[0], abi).ok_or_else(|| {
+                CompilerError::CodegenViolation(format!("MoERouter op {:?}: input 无法 materialize", op.id))
+            })?;
+            let weight_vreg = op.inputs.get(1).copied()
+                .and_then(|tid| resolver.materialize(prog, tid, abi))
+                .ok_or_else(|| CompilerError::CodegenViolation(
+                    format!("MoERouter op {:?}: weight 无法 materialize", op.id)))?;
+            let output_ptr = resolver.materialize(prog, op.outputs[0], abi).ok_or_else(|| {
+                CompilerError::CodegenViolation(format!("MoERouter op {:?}: output 无法 materialize", op.id))
+            })?;
+            let logits_off = top_k * 2 * ctx.dtype.elem_bytes();
+            let logits_ptr = prog.alloc_vreg(VRegKind::Ptr, SimdWidth::Scalar);
+            prog.emit(VmInstr::LoadPtr { dst: logits_ptr, src: PtrExpr::VRegPlusConst(output_ptr, logits_off) });
+            super::moe_quant_emit::emit_moe_router_gemv_inline(
+                prog, num_experts, hidden, ctx.session.width,
+                input_ptr, weight_vreg, logits_ptr, ctx.dtype,
+            )?;
+            super::norm_softmax_emit::emit_softmax_inline(
+                prog, num_experts, ctx.session.width, logits_ptr, logits_ptr, ctx.dtype,
+            )?;
+            super::moe_quant_emit::emit_moe_topk_dispatch_inline(
+                prog, num_experts, top_k, ctx.session.width,
+                logits_ptr, output_ptr, ctx.session.hook, None, ctx.dtype,
+            )?;
+            Ok(true)
+        }
         Op::HeadRmsNorm { .. } => Ok(false),
         _ => Ok(false), // 其他类别走现有路径（Phase 6-7 续迁移）
     }
