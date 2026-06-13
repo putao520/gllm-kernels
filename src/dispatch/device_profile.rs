@@ -7,8 +7,6 @@
 use crate::microarch::{MicroArch, KernelConfig};
 use crate::numa::NumaTopology;
 use crate::autotuning::HwInfo;
-#[allow(unused_imports)]
-use crate::isv::IsvGemm;
 
 /// GEMM BLIS three-level blocking parameters.
 #[derive(Debug, Clone, Copy)]

@@ -21,9 +21,6 @@ pub type Sel = *const c_void;
 pub type Class = *mut c_void;
 /// NSUInteger (platform-sized unsigned integer).
 pub type NSUInteger = usize;
-/// NSInteger (platform-sized signed integer).
-#[allow(dead_code)]
-pub type NSInteger = isize;
 
 /// Null object pointer.
 pub const NIL: Id = std::ptr::null_mut();
