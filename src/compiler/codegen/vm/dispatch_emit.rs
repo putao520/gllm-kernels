@@ -438,7 +438,7 @@ pub(crate) fn dispatch_structural(
 ///   predictions[p] = hidden[p] + Σ_q coefs[p,q] · hidden[q]
 /// where hidden[p] = fat_buffer[s, p*H..(p+1)*H] and coefs[p,q] = pred_coefs[s, p*P+q].
 #[allow(clippy::too_many_arguments)]
-fn lower_altup_predict(
+pub(crate) fn lower_altup_predict(
     prog: &mut VmProgram,
     op: &crate::compiler::graph::CompilerOp,
     _graph: &CompilerGraph,
@@ -551,7 +551,7 @@ fn lower_altup_predict(
 /// corrected[0] = gated (active path direct update)
 /// corrected[p] = predictions[p] + corr_coefs[p] · (gated - predictions[0])  for p > 0
 #[allow(clippy::too_many_arguments)]
-fn lower_altup_correct(
+pub(crate) fn lower_altup_correct(
     prog: &mut VmProgram,
     op: &crate::compiler::graph::CompilerOp,
     _graph: &CompilerGraph,
@@ -675,7 +675,7 @@ fn lower_altup_correct(
 ///
 /// Copy corrected to output, then: output[p] += normalized for p > 0.
 #[allow(clippy::too_many_arguments)]
-fn lower_altup_inject(
+pub(crate) fn lower_altup_inject(
     prog: &mut VmProgram,
     op: &crate::compiler::graph::CompilerOp,
     _graph: &CompilerGraph,

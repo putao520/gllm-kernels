@@ -475,6 +475,51 @@ pub(crate) fn lower_op_v2(
             )?;
             Ok(true)
         }
+        Op::AltUpPredict { ref seq_len, num_preds, hidden } => {
+            let input_ptr = resolver.materialize(prog, op.inputs[0], abi).ok_or_else(|| {
+                CompilerError::CodegenViolation(format!("AltUpPredict op {:?}: input 无法 materialize", op.id))
+            })?;
+            let weight_ptr = op.inputs.get(1).copied()
+                .and_then(|tid| resolver.materialize(prog, tid, abi)).unwrap_or(input_ptr);
+            let output_ptr = resolver.materialize(prog, op.outputs[0], abi).ok_or_else(|| {
+                CompilerError::CodegenViolation(format!("AltUpPredict op {:?}: output 无法 materialize", op.id))
+            })?;
+            super::dispatch_emit::lower_altup_predict(
+                prog, op, graph, ctx, input_ptr, weight_ptr, output_ptr, resolver, abi,
+                seq_len.clone(), num_preds, hidden,
+            )?;
+            Ok(true)
+        }
+        Op::AltUpCorrect { ref seq_len, num_preds, hidden } => {
+            let input_ptr = resolver.materialize(prog, op.inputs[0], abi).ok_or_else(|| {
+                CompilerError::CodegenViolation(format!("AltUpCorrect op {:?}: input 无法 materialize", op.id))
+            })?;
+            let weight_ptr = op.inputs.get(1).copied()
+                .and_then(|tid| resolver.materialize(prog, tid, abi)).unwrap_or(input_ptr);
+            let output_ptr = resolver.materialize(prog, op.outputs[0], abi).ok_or_else(|| {
+                CompilerError::CodegenViolation(format!("AltUpCorrect op {:?}: output 无法 materialize", op.id))
+            })?;
+            super::dispatch_emit::lower_altup_correct(
+                prog, op, graph, ctx, input_ptr, weight_ptr, output_ptr, resolver, abi,
+                seq_len.clone(), num_preds, hidden,
+            )?;
+            Ok(true)
+        }
+        Op::AltUpInject { ref seq_len, num_preds, hidden } => {
+            let input_ptr = resolver.materialize(prog, op.inputs[0], abi).ok_or_else(|| {
+                CompilerError::CodegenViolation(format!("AltUpInject op {:?}: input 无法 materialize", op.id))
+            })?;
+            let weight_ptr = op.inputs.get(1).copied()
+                .and_then(|tid| resolver.materialize(prog, tid, abi)).unwrap_or(input_ptr);
+            let output_ptr = resolver.materialize(prog, op.outputs[0], abi).ok_or_else(|| {
+                CompilerError::CodegenViolation(format!("AltUpInject op {:?}: output 无法 materialize", op.id))
+            })?;
+            super::dispatch_emit::lower_altup_inject(
+                prog, op, graph, ctx, input_ptr, weight_ptr, output_ptr, resolver, abi,
+                seq_len.clone(), num_preds, hidden,
+            )?;
+            Ok(true)
+        }
         Op::HeadRmsNorm { .. } => Ok(false),
         _ => Ok(false), // 其他类别走现有路径（Phase 6-7 续迁移）
     }
