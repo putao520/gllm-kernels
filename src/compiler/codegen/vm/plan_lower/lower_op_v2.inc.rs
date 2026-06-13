@@ -782,6 +782,19 @@ pub(crate) fn lower_op_v2(
             let spec = NormSpec { feature_dim: head_dim, eps, dtype, has_weight: true };
             lower_norm_v2(prog, op, graph, ctx, resolver, abi, &spec, NormKind::HeadRmsNorm)
         }
+        Op::MegaKernelDispatch { prefill_fn: _, decode_fn: _, chunked_fn: _, .. } => {
+            let mode_reg = prog.alloc_vreg(VRegKind::Scalar, SimdWidth::Scalar);
+            prog.emit(VmInstr::LoadPtr { dst: mode_reg, src: ctx.session.sym_map.resolve("batch_size").cloned().expect("ABI: batch_size") });
+            prog.emit(VmInstr::IndirectJump {
+                index: mode_reg,
+                targets: vec![
+                    super::instr::JumpTarget { expert_id: 0, instr_index: 0 },
+                    super::instr::JumpTarget { expert_id: 1, instr_index: 0 },
+                    super::instr::JumpTarget { expert_id: 2, instr_index: 0 },
+                ],
+            });
+            Ok(true)
+        }
         _ => Ok(false), // trace-lookup 路径（Softmax/QkNorm/L2Normalize/elementwise — registry trace 最优）
     }
 }
