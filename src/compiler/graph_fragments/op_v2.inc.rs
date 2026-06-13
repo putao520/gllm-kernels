@@ -183,7 +183,7 @@ pub enum Op {
     // ── Pooling / normalize ──
     MeanPool { seq_len: usize, hidden: usize, cls_mode: bool },
     QkNorm { head_dim: usize, eps: f32 },
-    L2Normalize,
+    L2Normalize { hidden: usize },
 
     // ── Quantization ──
     Dequantize { num_elements: usize, block_size: usize, bits: usize },
@@ -205,7 +205,7 @@ pub enum Op {
     MmHiddenInject { hidden_dim: usize },
 
     // ── Dispatch ──
-    MegaKernelDispatch,
+    MegaKernelDispatch { num_requests: usize, rst_ptr: u64, prefill_fn: u64, decode_fn: u64, chunked_fn: u64 },
 
     // ── MoE ──
     MoEGate { seq_len: SymDim, num_experts: usize, hidden: usize, top_k: usize },
@@ -219,15 +219,19 @@ pub enum Op {
     MoEConditionalAdd { seq_len: SymDim, hidden: usize, num_experts: usize, expert_idx: usize },
 
     // ── Structural ──
-    Gather { seq_len: SymDim, index_len: usize, index_kind: GatherIndicesKind },
-    QuantGather { seq_len: SymDim, index_len: usize, quant_type: crate::quant::QuantType },
-    SliceView { start: usize, end: usize, stride: usize },
-    ColumnSlice { start: usize, end: usize },
+    Gather { table_rows: usize, embed_dim: usize, index_dim: SymDim, indices_kind: GatherIndicesKind, scale: Option<f32> },
+    QuantGather { vocab_size: usize, hidden_dim: usize, index_dim: SymDim, quant_type: crate::quant::QuantType, scale: Option<f32> },
+    SliceView { axis: usize, start: usize, end: usize },
+    ColumnSlice { seq_len: SymDim, input_inner: usize, start: usize, slice_dim: usize },
     Transpose { perm: Vec<usize> },
     Reshape { target_shape: Vec<usize> },
 
     // ── KV cache ──
-    KvScatterWrite { seq_len: SymDim, num_kv_heads: usize, head_dim: usize },
+    KvScatterWrite {
+        seq_len: usize, num_kv_heads: usize, head_dim: usize, kv_dim: usize,
+        write_start: usize, layer_offset: usize, half_offset: usize,
+        head_stride: usize, dtype_size: usize,
+    },
     KvCacheWrite { num_kv_heads: usize, head_dim: usize, seq_len: SymDim },
 
     // ── P4/P5 advanced ──
@@ -244,9 +248,9 @@ pub enum Op {
     SoftmaxWithEntropy { vocab_size: usize },
 
     // ── Gemma 4 AltUp+PLE ──
-    AltUpPredict { num_preds: usize, hidden: usize },
-    AltUpCorrect { num_preds: usize, hidden: usize },
-    AltUpInject { num_preds: usize, hidden: usize },
+    AltUpPredict { seq_len: SymDim, num_preds: usize, hidden: usize },
+    AltUpCorrect { seq_len: SymDim, num_preds: usize, hidden: usize },
+    AltUpInject { seq_len: SymDim, num_preds: usize, hidden: usize },
 
     // ── Vision/Audio ──
     DepthwiseConv1D { channels: usize, kernel_size: usize, causal: bool },
@@ -262,9 +266,6 @@ pub enum Op {
     // ── MTP ──
     MtpDraft { depth: usize, hidden_size: usize, vocab_size: usize },
 
-    // ── Last token / all tokens (sampling) ──
-    LastToken,
-    AllTokens,
 }
 
 impl Op {
@@ -272,7 +273,7 @@ impl Op {
     pub fn category(&self) -> &'static str {
         match self {
             Op::RmsNorm(_) | Op::LayerNorm(_) | Op::ValueNorm(_) | Op::HeadRmsNorm { .. }
-            | Op::QkNorm { .. } | Op::L2Normalize => "norm",
+            | Op::QkNorm { .. } | Op::L2Normalize { .. } => "norm",
             Op::Gemm(_) | Op::GemmBias(_) | Op::QuantGemm(_)
             | Op::FusedRmsNormGemm { .. } | Op::MaskedGemm { .. } => "gemm",
             Op::Silu | Op::Gelu | Op::Tanh | Op::SwiGlu | Op::SwiGluClipped { .. } | Op::GeGlu
@@ -287,12 +288,12 @@ impl Op {
             Op::DepthwiseConv1D { .. } | Op::PatchEmbed { .. } | Op::LearnedPos2D { .. } => "vision_audio",
             Op::AltUpPredict { .. } | Op::AltUpCorrect { .. } | Op::AltUpInject { .. } => "altup",
             Op::Argmax { .. } | Op::StoreToken | Op::CheckStopCondition
-            | Op::WriteLogits { .. } | Op::EarlyExit { .. } | Op::LastToken | Op::AllTokens => "sampling",
+            | Op::WriteLogits { .. } | Op::EarlyExit { .. } => "sampling",
             Op::GuardrailCheck { .. } | Op::SgInject { .. } | Op::SgDetect { .. }
             | Op::CotStepCheck { .. } | Op::SessionKvRestore | Op::MmHiddenInject { .. } => "business",
             Op::Gather { .. } | Op::QuantGather { .. } | Op::SliceView { .. }
             | Op::ColumnSlice { .. } | Op::Transpose { .. } | Op::Reshape { .. }
-            | Op::MegaKernelDispatch => "structural",
+            | Op::MegaKernelDispatch { .. } => "structural",
             Op::Dequantize { .. } | Op::QTapSTG { .. } | Op::VRangeQuant { .. } => "quant",
             Op::MeanPool { .. } | Op::LogitSoftcap { .. } => "misc",
             Op::KvScatterWrite { .. } | Op::KvCacheWrite { .. } => "kv_cache",
@@ -475,6 +476,77 @@ impl Op {
                 seq_len: seq_len.clone(), hidden: *hidden, num_experts: *num_experts, expert_idx: *expert_idx,
             }),
 
+            _ => None,
+        }
+    }
+
+    /// Phase 7: Structural/Embed/Vision-Audio/Generation/Business 类别的 from_op_kind 转换。
+    pub fn from_op_kind_structural(
+        op: &CompilerOp,
+        _graph: &CompilerGraph,
+    ) -> Option<Self> {
+        match &op.kind {
+            OpKind::RoPE { num_heads, head_dim, theta, partial, rope_scaling } => Some(Op::RoPE(RopeSpec {
+                num_heads: *num_heads, head_dim: *head_dim, theta: *theta,
+                partial: *partial, rope_scaling: rope_scaling.clone(),
+            })),
+            OpKind::DualRoPE { num_heads, head_dim, sliding_theta, sliding_partial, global_theta, global_partial, rope_scaling, layer_offset, layer_divisor, layer_remainder } => Some(Op::DualRoPE(DualRopeSpec {
+                num_heads: *num_heads, head_dim: *head_dim,
+                sliding_theta: *sliding_theta, sliding_partial: *sliding_partial,
+                global_theta: *global_theta, global_partial: *global_partial,
+                rope_scaling: rope_scaling.clone(),
+                layer_offset: *layer_offset, layer_divisor: *layer_divisor, layer_remainder: *layer_remainder,
+            })),
+            OpKind::MeanPool { seq_len, hidden, cls_mode } => Some(Op::MeanPool { seq_len: *seq_len, hidden: *hidden, cls_mode: *cls_mode }),
+            OpKind::QkNorm { head_dim, eps } => Some(Op::QkNorm { head_dim: *head_dim, eps: *eps }),
+            OpKind::L2Normalize { hidden } => Some(Op::L2Normalize { hidden: *hidden }),
+            OpKind::Argmax { vocab_size } => Some(Op::Argmax { vocab_size: *vocab_size }),
+            OpKind::StoreToken => Some(Op::StoreToken),
+            OpKind::CheckStopCondition => Some(Op::CheckStopCondition),
+            OpKind::WriteLogits { target_indices } => Some(Op::WriteLogits { target_indices: target_indices.clone() }),
+            OpKind::EarlyExit { anchor_layer } => Some(Op::EarlyExit { anchor_layer: *anchor_layer }),
+            OpKind::GuardrailCheck { probe_offset } => Some(Op::GuardrailCheck { probe_offset: *probe_offset }),
+            OpKind::SgInject { knowledge_offset, dim } => Some(Op::SgInject { knowledge_offset: *knowledge_offset, dim: *dim }),
+            OpKind::SgDetect { detect_offset, hidden_dim } => Some(Op::SgDetect { detect_offset: *detect_offset, hidden_dim: *hidden_dim }),
+            OpKind::CotStepCheck { shared_mem_offset } => Some(Op::CotStepCheck { shared_mem_offset: *shared_mem_offset }),
+            OpKind::SessionKvRestore => Some(Op::SessionKvRestore),
+            OpKind::MmHiddenInject { hidden_dim } => Some(Op::MmHiddenInject { hidden_dim: *hidden_dim }),
+            OpKind::MegaKernelDispatch { num_requests, rst_ptr, prefill_fn, decode_fn, chunked_fn } => Some(Op::MegaKernelDispatch {
+                num_requests: *num_requests, rst_ptr: *rst_ptr, prefill_fn: *prefill_fn, decode_fn: *decode_fn, chunked_fn: *chunked_fn,
+            }),
+            OpKind::Gather { table_rows, embed_dim, index_dim, indices_kind, scale } => Some(Op::Gather {
+                table_rows: *table_rows, embed_dim: *embed_dim, index_dim: index_dim.clone(), indices_kind: indices_kind.clone(), scale: *scale,
+            }),
+            OpKind::QuantGather { vocab_size, hidden_dim, index_dim, quant_type, scale } => Some(Op::QuantGather {
+                vocab_size: *vocab_size, hidden_dim: *hidden_dim, index_dim: index_dim.clone(), quant_type: *quant_type, scale: *scale,
+            }),
+            OpKind::SliceView { axis, start, end } => Some(Op::SliceView { axis: *axis, start: *start, end: *end }),
+            OpKind::ColumnSlice { seq_len, input_inner, start, slice_dim } => Some(Op::ColumnSlice { seq_len: seq_len.clone(), input_inner: *input_inner, start: *start, slice_dim: *slice_dim }),
+            OpKind::Transpose { perm } => Some(Op::Transpose { perm: perm.clone() }),
+            OpKind::Reshape { target_shape } => Some(Op::Reshape { target_shape: target_shape.clone() }),
+            OpKind::KvScatterWrite { seq_len, num_kv_heads, head_dim, kv_dim, write_start, layer_offset, half_offset, head_stride, dtype_size } => Some(Op::KvScatterWrite {
+                seq_len: *seq_len, num_kv_heads: *num_kv_heads, head_dim: *head_dim, kv_dim: *kv_dim,
+                write_start: *write_start, layer_offset: *layer_offset, half_offset: *half_offset,
+                head_stride: *head_stride, dtype_size: *dtype_size,
+            }),
+            OpKind::KvCacheWrite { num_kv_heads, head_dim, seq_len } => Some(Op::KvCacheWrite {
+                num_kv_heads: *num_kv_heads, head_dim: *head_dim, seq_len: seq_len.clone(),
+            }),
+            OpKind::VariableLengthBatch => Some(Op::VariableLengthBatch),
+            OpKind::AttentionSkipMask { seq_len, threshold } => Some(Op::AttentionSkipMask { seq_len: seq_len.clone(), threshold: *threshold }),
+            OpKind::ResidualWithTelemetry { hidden } => Some(Op::ResidualWithTelemetry { hidden: *hidden }),
+            OpKind::EntropyGate { seq_len, vocab_size, entropy_threshold } => Some(Op::EntropyGate { seq_len: seq_len.clone(), vocab_size: *vocab_size, entropy_threshold: *entropy_threshold }),
+            OpKind::KvCentroidPrefetch { seq_len, num_heads, head_dim, prefetch_distance } => Some(Op::KvCentroidPrefetch { seq_len: seq_len.clone(), num_heads: *num_heads, head_dim: *head_dim, prefetch_distance: *prefetch_distance }),
+            OpKind::LayerBypass { threshold } => Some(Op::LayerBypass { threshold: *threshold }),
+            OpKind::GateMask { hidden } => Some(Op::GateMask { hidden: *hidden }),
+            OpKind::SoftmaxWithEntropy { vocab_size } => Some(Op::SoftmaxWithEntropy { vocab_size: *vocab_size }),
+            OpKind::AltUpPredict { seq_len, num_preds, hidden } => Some(Op::AltUpPredict { seq_len: seq_len.clone(), num_preds: *num_preds, hidden: *hidden }),
+            OpKind::AltUpCorrect { seq_len, num_preds, hidden } => Some(Op::AltUpCorrect { seq_len: seq_len.clone(), num_preds: *num_preds, hidden: *hidden }),
+            OpKind::AltUpInject { seq_len, num_preds, hidden } => Some(Op::AltUpInject { seq_len: seq_len.clone(), num_preds: *num_preds, hidden: *hidden }),
+            OpKind::DepthwiseConv1D { channels, kernel_size, causal } => Some(Op::DepthwiseConv1D { channels: *channels, kernel_size: *kernel_size, causal: *causal }),
+            OpKind::PatchEmbed { patch_size, embed_dim, in_channels, image_size } => Some(Op::PatchEmbed { patch_size: *patch_size, embed_dim: *embed_dim, in_channels: *in_channels, image_size: *image_size }),
+            OpKind::LearnedPos2D { num_patches, embed_dim } => Some(Op::LearnedPos2D { num_patches: *num_patches, embed_dim: *embed_dim }),
+            OpKind::MtpDraft { depth, hidden_size, vocab_size } => Some(Op::MtpDraft { depth: *depth, hidden_size: *hidden_size, vocab_size: *vocab_size }),
             _ => None,
         }
     }
