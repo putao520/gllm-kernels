@@ -129,6 +129,12 @@ pub struct GraphTopologyAnalysis {
     /// MTP 配置 — 从 OpKind::MtpDraft { depth, hidden_size, vocab_size } 推导。
     pub mtp_config: Option<MtpKernelConfig>,
 
+    /// SgDetect hidden_dim — 从 SgDetect input tensor shape last dim 推导。
+    pub sg_detect_hidden_dim: Option<usize>,
+
+    /// SgInject dim — 从 OpKind::SgInject { dim } 推导。
+    pub sg_inject_hidden_dim: Option<usize>,
+
     // ── 层循环拓扑属性 ──
 
     /// 同构层循环的层数
@@ -155,6 +161,8 @@ impl GraphTopologyAnalysis {
         let mut has_qk_norm = false;
         let mut vocab_size: Option<usize> = None;
         let mut argmax_input_tid: Option<TensorId> = None;
+        let mut sg_detect_hidden_dim: Option<usize> = None;
+        let mut sg_inject_hidden_dim: Option<usize> = None;
 
         for op in &graph.ops {
             match &op.kind {
@@ -168,7 +176,21 @@ impl GraphTopologyAnalysis {
                 OpKind::MultiHeadAttention { .. } => has_mha = true,
                 OpKind::CachedGQA { .. } => has_cached_gqa = true,
                 OpKind::MlaAttention { .. } => has_mla = true,
-                OpKind::SgDetect { .. } | OpKind::SgInject { .. } => has_sg_ops = true,
+                OpKind::SgDetect { .. } => {
+                    has_sg_ops = true;
+                    if sg_detect_hidden_dim.is_none() {
+                        sg_detect_hidden_dim = op.inputs.first()
+                            .and_then(|&tid| graph.tensor(tid))
+                            .and_then(|t| t.shape.last())
+                            .and_then(|d| d.as_concrete());
+                    }
+                }
+                OpKind::SgInject { dim, .. } => {
+                    has_sg_ops = true;
+                    if sg_inject_hidden_dim.is_none() {
+                        sg_inject_hidden_dim = Some(*dim);
+                    }
+                }
                 OpKind::QkNorm { .. } => has_qk_norm = true,
                 OpKind::Gemm { .. } | OpKind::GemmBias { .. } | OpKind::QuantGemm { .. }
                 | OpKind::RmsNorm { .. } | OpKind::LayerNorm { .. } | OpKind::HeadRmsNorm { .. }
@@ -240,6 +262,8 @@ impl GraphTopologyAnalysis {
             logits_producer_op_idx,
             logits_output_tid,
             mtp_config,
+            sg_detect_hidden_dim,
+            sg_inject_hidden_dim,
             layer_num_layers,
             layer_activation_alias,
         }

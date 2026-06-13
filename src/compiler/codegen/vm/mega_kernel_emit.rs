@@ -11,7 +11,7 @@ use super::plan_lower::{
 
 use crate::compiler::codegen::RopeCacheRequirement;
 use crate::compiler::fusion::FusionPlan;
-use crate::compiler::graph::{CompilerGraph, OpKind};
+use crate::compiler::graph::CompilerGraph;
 use crate::compiler::codegen::vm::topology::{LoopTopology, KvCacheSource};
 use crate::compiler::buffer_alloc::{BufferAllocation, TensorPtrSource};
 use crate::compiler::mega_kernel_abi::MtpKernelConfig;
@@ -1187,14 +1187,8 @@ pub fn compile_mega_kernel_vm(
         // JIT uses vocab_size * 4 bytes for decode logits (one row), NOT max_seq_len * vocab_size.
         // SG knowledge buffer persists across decode steps (pre-computed before generation).
         sg_detect_scratch_offset: {
-            let sg_hidden_dim = graph.ops.iter()
-                .find(|op| matches!(&op.kind, OpKind::SgDetect { .. }))
-                .and_then(|op| op.inputs.first())
-                .and_then(|&tid| graph.tensor(tid))
-                .and_then(|t| t.shape.last())
-                .and_then(|d| d.as_concrete());
-            match sg_hidden_dim {
-                Some(hdim) => {
+            match topology.sg_detect_hidden_dim {
+                Some(_hdim) => {
                     let vocab_bytes = vocab_size * 4;
                     let sampling_bytes = vocab_bytes * 4;
                     let off = (logits_scratch_offset + vocab_bytes + sampling_bytes + 63) & !63;
@@ -1204,13 +1198,7 @@ pub fn compile_mega_kernel_vm(
             }
         },
         sg_knowledge_scratch_offset: {
-            let sg_hidden_dim = graph.ops.iter()
-                .find(|op| matches!(&op.kind, OpKind::SgDetect { .. }))
-                .and_then(|op| op.inputs.first())
-                .and_then(|&tid| graph.tensor(tid))
-                .and_then(|t| t.shape.last())
-                .and_then(|d| d.as_concrete());
-            match sg_hidden_dim {
+            match topology.sg_detect_hidden_dim {
                 Some(hdim) => {
                     let vocab_bytes = vocab_size * 4;
                     let sampling_bytes = vocab_bytes * 4;
@@ -1899,25 +1887,13 @@ pub fn compile_mega_kernel_vm(
                 let sampling_end = logits_scratch_offset + vb * 5;
                 let sg_end = current_abi.sg_detect_scratch_offset
                     .map(|off| {
-                        let hdim = graph.ops.iter()
-                            .find(|op| matches!(&op.kind, OpKind::SgDetect { .. }))
-                            .and_then(|op| op.inputs.first())
-                            .and_then(|&tid| graph.tensor(tid))
-                            .and_then(|t| t.shape.last())
-                            .and_then(|d| d.as_concrete())
-                            .unwrap_or(0);
+                        let hdim = topology.sg_detect_hidden_dim.unwrap_or(0);
                         (off + hdim * 4 + 63) & !63
                     })
                     .unwrap_or(0);
                 let sgk_end = current_abi.sg_knowledge_scratch_offset
                     .map(|off| {
-                        let hdim = graph.ops.iter()
-                            .find(|op| matches!(&op.kind, OpKind::SgInject { .. }))
-                            .and_then(|op| op.inputs.first())
-                            .and_then(|&tid| graph.tensor(tid))
-                            .and_then(|t| t.shape.last())
-                            .and_then(|d| d.as_concrete())
-                            .unwrap_or(0);
+                        let hdim = topology.sg_inject_hidden_dim.unwrap_or(0);
                         (off + hdim * 4 + 63) & !63
                     })
                     .unwrap_or(0);
