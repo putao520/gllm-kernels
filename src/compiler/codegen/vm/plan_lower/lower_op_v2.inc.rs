@@ -35,13 +35,9 @@ pub(crate) fn lower_op_v2(
         Op::RmsNorm(ref spec) => lower_norm_v2(prog, op, graph, ctx, resolver, abi, spec, NormKind::RmsNorm),
         Op::LayerNorm(ref spec) => lower_norm_v2(prog, op, graph, ctx, resolver, abi, spec, NormKind::LayerNorm),
         Op::ValueNorm(ref spec) => lower_norm_v2(prog, op, graph, ctx, resolver, abi, spec, NormKind::ValueNorm),
-        Op::Gemm(ref spec) => {
+        Op::Gemm(ref spec) | Op::GemmBias(ref spec) => {
             lower_gemm_v2(prog, op, graph, ctx, resolver, abi, spec)
         }
-        // GemmBias: Phase 5 续 — bias add 迁移到 lower_gemm_v2 后启用。
-        // 当前走现有路径（dispatch_structural 的 OpKind::GemmBias match arm），
-        // 确保 bias add 不丢失。
-        Op::GemmBias(_) => Ok(false),
         Op::HeadRmsNorm { .. } => Ok(false),
         _ => Ok(false), // 其他类别走现有路径（Phase 6-7 续迁移）
     }
@@ -97,7 +93,55 @@ fn lower_gemm_v2(
     )?;
 
     // GemmBias: bias add（output += bias broadcast across M rows）
-    // Phase 5 续：完整 bias add 迁移。当前返回 true 表示已处理 GEMM 主体。
+    // GemmBias: bias add（output[i,j] += bias[j]，broadcast across M rows）
+    if spec.has_bias {
+        if let Some(&bias_tid) = op.inputs.get(2) {
+            let bias_ptr = resolver.materialize(prog, bias_tid, abi)
+                .ok_or_else(|| CompilerError::CodegenViolation(
+                    format!("GemmBias op {:?}: bias tensor {:?} 无法 materialize", op.id, bias_tid)
+                ))?;
+
+            let n_elem = spec.n;
+            let elem_bytes = spec.dtype.size_bytes();
+            let m_bound = if abi.mega_decode_seq_len.is_some() {
+                BoundExpr::Const(1)
+            } else {
+                resolve_sym_dim(&spec.m, abi, ctx.session.sym_map)
+            };
+            let row_bytes = n_elem * elem_bytes;
+            let row_ptr = prog.alloc_vreg(VRegKind::Ptr, SimdWidth::Scalar);
+            let width = ctx.session.width;
+            let lanes = width.f32_lanes().max(1);
+            let dtype_qp = spec.dtype.to_quant_precision();
+
+            prog.emit_loop(m_bound, row_bytes, |prog, _row_ctr, row_off| {
+                prog.emit(VmInstr::GprBinOp {
+                    dst: row_ptr, a: c_ptr, b: GprOperand::VReg(row_off), op: GprOp::Add,
+                });
+                let n_vec = n_elem / lanes;
+                for vj in 0..n_vec {
+                    let byte_off = vj * lanes * elem_bytes;
+                    let b_data = prog.alloc_vreg(VRegKind::Vec, width);
+                    let c_data = prog.alloc_vreg(VRegKind::Vec, width);
+                    prog.emit(VmInstr::VecLoad { dst: b_data, base: bias_ptr, offset: OffsetExpr::Const(byte_off), width, dtype: dtype_qp });
+                    prog.emit(VmInstr::VecLoad { dst: c_data, base: row_ptr, offset: OffsetExpr::Const(byte_off), width, dtype: dtype_qp });
+                    prog.emit(VmInstr::VecBinOp { dst: c_data, a: c_data, b: b_data, op: VecOp::Add, dtype: dtype_qp });
+                    prog.emit(VmInstr::VecStore { base: row_ptr, offset: OffsetExpr::Const(byte_off), src: c_data, width, dtype: dtype_qp });
+                }
+                let rem_start = n_vec * lanes;
+                for jj in rem_start..n_elem {
+                    let byte_off = jj * elem_bytes;
+                    let b_s = prog.alloc_vreg(VRegKind::Vec, SimdWidth::Scalar);
+                    let c_s = prog.alloc_vreg(VRegKind::Vec, SimdWidth::Scalar);
+                    prog.emit(VmInstr::VecLoad { dst: b_s, base: bias_ptr, offset: OffsetExpr::Const(byte_off), width: SimdWidth::Scalar, dtype: dtype_qp });
+                    prog.emit(VmInstr::VecLoad { dst: c_s, base: row_ptr, offset: OffsetExpr::Const(byte_off), width: SimdWidth::Scalar, dtype: dtype_qp });
+                    prog.emit(VmInstr::VecBinOp { dst: c_s, a: c_s, b: b_s, op: VecOp::Add, dtype: dtype_qp });
+                    prog.emit(VmInstr::VecStore { base: row_ptr, offset: OffsetExpr::Const(byte_off), src: c_s, width: SimdWidth::Scalar, dtype: dtype_qp });
+                }
+            });
+        }
+    }
+
     Ok(true)
 }
 
