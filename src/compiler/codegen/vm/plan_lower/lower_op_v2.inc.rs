@@ -662,6 +662,37 @@ pub(crate) fn lower_op_v2(
             prog.emit(VmInstr::LoopEnd);
             Ok(true)
         }
+        Op::MoEDispatchPacked { ref seq_len, num_experts, top_k, mxfp4_block_size, swiglu_limit, hidden, intermediate_size } => {
+            let hidden_input_ptr = resolver.materialize(prog, op.inputs[0], abi).ok_or_else(|| CompilerError::CodegenViolation(format!("MoEDispatchPacked op {:?}: input[0]", op.id)))?;
+            let router_weight_ptr = resolver.materialize(prog, op.inputs[1], abi).ok_or_else(|| CompilerError::CodegenViolation(format!("MoEDispatchPacked op {:?}: input[1]", op.id)))?;
+            let router_bias_ptr = resolver.materialize(prog, op.inputs[2], abi).ok_or_else(|| CompilerError::CodegenViolation(format!("MoEDispatchPacked op {:?}: input[2]", op.id)))?;
+            let gate_up_blocks_ptr = resolver.materialize(prog, op.inputs[3], abi).ok_or_else(|| CompilerError::CodegenViolation(format!("MoEDispatchPacked op {:?}: input[3]", op.id)))?;
+            let gate_up_scales_ptr = resolver.materialize(prog, op.inputs[4], abi).ok_or_else(|| CompilerError::CodegenViolation(format!("MoEDispatchPacked op {:?}: input[4]", op.id)))?;
+            let gate_up_bias_ptr = resolver.materialize(prog, op.inputs[5], abi).ok_or_else(|| CompilerError::CodegenViolation(format!("MoEDispatchPacked op {:?}: input[5]", op.id)))?;
+            let down_blocks_ptr = resolver.materialize(prog, op.inputs[6], abi).ok_or_else(|| CompilerError::CodegenViolation(format!("MoEDispatchPacked op {:?}: input[6]", op.id)))?;
+            let down_scales_ptr = resolver.materialize(prog, op.inputs[7], abi).ok_or_else(|| CompilerError::CodegenViolation(format!("MoEDispatchPacked op {:?}: input[7]", op.id)))?;
+            let down_bias_ptr = resolver.materialize(prog, op.inputs[8], abi).ok_or_else(|| CompilerError::CodegenViolation(format!("MoEDispatchPacked op {:?}: input[8]", op.id)))?;
+            let output_ptr = resolver.materialize(prog, op.outputs[0], abi).ok_or_else(|| CompilerError::CodegenViolation(format!("MoEDispatchPacked op {:?}: output", op.id)))?;
+            let seq_bound = if abi.mega_decode_seq_len.is_some() {
+                BoundExpr::Const(1)
+            } else {
+                resolve_sym_dim(seq_len, abi, ctx.session.sym_map)
+            };
+            let scratchpad_vreg = prog.alloc_vreg(VRegKind::Ptr, SimdWidth::Scalar);
+            prog.emit(VmInstr::LoadPtr {
+                dst: scratchpad_vreg,
+                src: ctx.session.sym_map.resolve("scratchpad").cloned().expect("ABI: scratchpad"),
+            });
+            super::moe_quant_emit::emit_moe_packed_inline(
+                prog, seq_bound, num_experts, top_k, mxfp4_block_size, swiglu_limit,
+                intermediate_size, hidden, ctx.session.width,
+                hidden_input_ptr, router_weight_ptr, router_bias_ptr,
+                gate_up_blocks_ptr, gate_up_scales_ptr, gate_up_bias_ptr,
+                down_blocks_ptr, down_scales_ptr, down_bias_ptr,
+                output_ptr, scratchpad_vreg, ctx.dtype,
+            )?;
+            Ok(true)
+        }
         Op::MlaAttention(ref spec) => {
             let q_absorbed_ptr = resolver.materialize(prog, op.inputs[0], abi).ok_or_else(|| {
                 CompilerError::CodegenViolation(format!("MlaAttention op {:?}: q_absorbed 无法 materialize", op.id))
