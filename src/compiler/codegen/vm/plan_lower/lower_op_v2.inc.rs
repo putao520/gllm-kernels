@@ -138,6 +138,18 @@ pub(crate) fn lower_op_v2(
             )?;
             Ok(true)
         }
+        Op::EarlyExit { anchor_layer } => {
+            let layer_ctr = abi.layer_loop_counter.ok_or_else(|| CompilerError::CodegenViolation(
+                "EarlyExit: layer_loop_counter is None".into()))?;
+            let input_ptr = resolver.materialize(prog, op.inputs[0], abi).ok_or_else(|| {
+                CompilerError::CodegenViolation(format!("EarlyExit op {:?}: input 无法 materialize", op.id))
+            })?;
+            prog.emit(VmInstr::GprCondAction {
+                cond: GprCondition::CmpEq(layer_ctr, anchor_layer as u64),
+                action: GprBranchAction::Exit(input_ptr),
+            });
+            Ok(true)
+        }
         Op::RoPE(ref spec) => {
             // rope_cache_offset 从 ctx.rope_req 获取（op-level 自描述替代外部参数）
             let rope_req = ctx.rope_req.ok_or_else(|| CompilerError::CodegenViolation(
