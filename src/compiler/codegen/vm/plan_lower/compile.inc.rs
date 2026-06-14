@@ -487,7 +487,7 @@ fn try_auto_dispatch_elementwise(
 
     // Ops with dedicated dispatch paths must be excluded from auto-dispatch.
     // - Structural ops: Injective traces are skeletal, need dedicated lowering
-    // - NormLike/Reduction ops: dedicated dispatch_compute_pattern paths with
+    // - NormLike/Reduction ops: dedicated lower_op_v2 paths with
     //   specialized weight/bias handling not supported by generic emission
     if matches!(op.kind,
         OpKind::ColumnSlice { .. } | OpKind::Gather { .. } |
@@ -519,7 +519,7 @@ fn try_auto_dispatch_elementwise(
     };
 
     // 仅 dispatch Elementwise / BinaryElementwise / Injective 模式
-    // NormLike/Gemm 由 dispatch_compute_pattern 处理
+    // NormLike/Gemm 由 lower_op_v2 处理
     // Injective 仅支持 num_inputs ≤ 2（emit_injective_inline 最多 2 输入）
     // 和 num_outputs ≤ 1（通用 elementwise 单输出）。
     let body = match &trace.pattern {
@@ -842,23 +842,17 @@ fn emit_injective_inline(
     super::auto_select::auto_lower_trace_raw(prog, body, inputs, width, QuantPrecision::F32)
 }
 
-/// Standalone/LoopFusion: 三层 ComputePattern 驱动的 OpKind dispatch。
+/// Standalone/LoopFusion: 两层 Op lowering dispatch。
 ///
 /// Layer 1: `try_auto_dispatch_elementwise` — 纯 Elementwise/BinaryElementwise/Reduction
 ///   算子自动通过 registry trace pipeline dispatch (auto_lower_trace)。
 ///   覆盖: Silu, Gelu, Tanh, Sigmoid, Relu, Add, Mul, SwiGlu, GeGlu, MeanPool,
 ///   Residual (no telemetry), LogitSoftcap 等。
 ///
-/// Layer 2: `dispatch_compute_pattern` — NormLike/Gemm/Softmax 通用处理器 + 手写 lower 委托 结构算子。
-///   Auto-driven: RmsNorm, LayerNorm, ValueNorm, QkNorm, HeadRmsNorm, Softmax, L2Normalize,
-///   LearnedPos2D, MoEGate/MoERouter (softmax 部分), Gemm/GemmBias。
-///   手写 lower 委托 (hand-written lower::* delegates): QuantGemm, MHA, RoPE, MoEDispatchPacked,
-///   PerLayerEmbed, DepthwiseConv1D, PatchEmbed, SessionKvRestore, MmHiddenInject。
-///
-/// Layer 3: `dispatch_structural` — D 类永久控制流 + C 类 手写 lower 委托 结构算子。
-///   D 类: Residual+telemetry, Argmax, StoreToken, WriteLogits, CheckStopCondition,
-///   GuardrailCheck, CotStepCheck, SgInject, SgDetect, EarlyExit, MegaKernelDispatch, NOP。
-///   手写 lower 委托: Gather, ColumnSlice, QTapSTG。
+/// Layer 2: `lower_op_v2` — 胖 opcode 驱动，所有 NormLike/Gemm/Attention/MoE/Structural
+///   算子通过 Op Spec struct 自描述参数，直接 emit VmInstr。
+///   包括: RmsNorm, LayerNorm, ValueNorm, QkNorm, HeadRmsNorm, Softmax, Gemm/GemmBias,
+///   MHA, CachedGqa, MlaAttention, RoPE, MoE, Argmax, StoreToken, WriteLogits, etc.
 pub(super) fn emit_standalone_op(
     prog: &mut VmProgram,
     op: &crate::compiler::graph::CompilerOp,
@@ -888,7 +882,7 @@ pub(super) fn emit_standalone_op(
         // ── Telemetry post-hooks for elementwise ops ──
         // §13.5 SiLU dead neuron telemetry: post-hook after auto-dispatch.
         // Residual telemetry is NOT a post-hook — it needs fused compute+telemetry loop,
-        // handled by dispatch_structural when graph.telemetry.residual_cosine_sim is true.
+        // handled by lower_op_v2 when graph.telemetry.residual_cosine_sim is true.
         if matches!(op.kind, OpKind::Silu) && graph.telemetry.silu_dead_neuron {
             let (out_shape, _) = infer_output_shape_sym(op, graph)?;
             emit_silu_dead_neuron_telemetry(prog, input_ptr, &out_shape, width, sym_map, ctx.dtype)?;
@@ -897,19 +891,14 @@ pub(super) fn emit_standalone_op(
     }
 
     // ── Op v2 dispatch (胖 opcode 驱动) ──
-    // 所有 compute/structural ops 走 lower_op_v2。
-    if dispatch_compute_pattern(
-        prog, op, graph, ctx,
-        resolver, abi,
-    )? {
+    if lower_op_v2(prog, op, graph, ctx, resolver, abi)? {
         return Ok(());
     }
 
-    // ── Structural ops (lower_op_v2 fallback) ──
-    dispatch_structural(
-        prog, op, graph, ctx,
-        resolver, abi,
-    )
+    // lower_op_v2 未处理 → 报错（所有 ops 应通过 lower_op_v2 处理）
+    Err(CompilerError::CodegenViolation(format!(
+        "emit_standalone_op: op {:?} 未被 lower_op_v2 处理", op.kind
+    )))
 }
 
 /// Structural op dispatch (ARCH-AUTO-INSTR-SELECT Category C/D).

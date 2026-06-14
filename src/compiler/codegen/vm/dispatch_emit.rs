@@ -1,48 +1,11 @@
-//! Op v2 dispatch — all ops handled by lower_op_v2 (胖 opcode 驱动).
-
-use super::instr::*;
-use super::vm_state::AbiPtrs;
-use super::plan_lower::{LoweringContext, TensorPtrResolver};
-
-use crate::compiler::graph::{CompilerGraph, SymDim};
-use crate::compiler::trace::QuantPrecision;
-use crate::types::CompilerError;
-
-/// Structural op dispatch — all ops handled by lower_op_v2.
-pub(crate) fn dispatch_structural(
-    prog: &mut VmProgram,
-    op: &crate::compiler::graph::CompilerOp,
-    graph: &CompilerGraph,
-    ctx: &LoweringContext,
-    resolver: &TensorPtrResolver,
-    abi: &AbiPtrs,
-) -> Result<(), CompilerError> {
-    if super::plan_lower::lower_op_v2(prog, op, graph, ctx, resolver, abi)? {
-        return Ok(());
-    }
-    Err(CompilerError::CodegenViolation(format!(
-        "dispatch_structural: op {:?} 未被 lower_op_v2 处理", op.kind
-    )))
-}
-
-/// Compute pattern dispatch — all ops handled by lower_op_v2.
-pub(crate) fn dispatch_compute_pattern(
-    prog: &mut VmProgram,
-    op: &crate::compiler::graph::CompilerOp,
-    graph: &CompilerGraph,
-    ctx: &LoweringContext,
-    resolver: &TensorPtrResolver,
-    abi: &AbiPtrs,
-) -> Result<bool, CompilerError> {
-    if super::plan_lower::lower_op_v2(prog, op, graph, ctx, resolver, abi)? {
-        return Ok(true);
-    }
-    Ok(false)
-}
+//! VmInstr types + validation tests.
+//! dispatch_structural/dispatch_compute_pattern 已物理删除，
+//! 所有 op lowering 统一走 lower_op_v2（胖 opcode 驱动）。
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use crate::compiler::codegen::vm::instr::*;
+    use crate::compiler::trace::QuantPrecision;
 
     // ── Test 1: VRegId equality and hashing ──
 

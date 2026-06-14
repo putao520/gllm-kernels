@@ -98,7 +98,7 @@ pub(super) fn maybe_debug_bp(prog: &mut VmProgram, ctx: &LoweringContext<'_>, la
 // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 /// Resolve SymDim to BoundExpr, using mega-kernel decode seq_len VReg when available.
-/// Shared by `emit_standalone_op`, `dispatch_compute_pattern`, and category dispatch functions.
+/// Shared by `emit_standalone_op` and `lower_op_v2`.
 pub(crate) fn resolve_sym_dim(dim: &SymDim, abi: &AbiPtrs, sym_map: &SymDimSlotMap) -> BoundExpr {
     if let Some(seq_vreg) = abi.mega_decode_seq_len {
         if dim.is_symbolic() {
@@ -705,7 +705,7 @@ impl SymDimSlotMap {
             state.arg_ptr_expr("callback_table_ptr").unwrap_or(PtrExpr::StackArg(128)));
 
         // Remaining ABI args from MEGA_KERNEL_PARAMS — added symbolically so
-        // dispatch_structural arms can use sym_map.resolve("name") instead of
+        // lower_op_v2 arms can use sym_map.resolve("name") instead of
         // hardcoded StackArg(N).  Eliminates fragile manual offset calculation.
         for name in ["output_tokens_ptr", "max_new_tokens", "eos_token_id", "prompt_len", "page_table_ptr"] {
             if let Ok(expr) = state.arg_ptr_expr(name) {
