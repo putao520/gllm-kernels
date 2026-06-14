@@ -5,22 +5,10 @@
 
 use super::instr::*;
 use super::vm_state::AbiPtrs;
-use super::plan_lower::{
-    LoweringContext, TensorPtrResolver,
-    resolve_sym_dim, infer_output_shape_sym,
-    build_norm_pattern_qk,
-    emit_elementwise_inline,
-    try_dispatch_reduction, extract_op_trace,
-};
-use super::norm_softmax_emit::{
-    emit_normlike_inline,
-    emit_softmax_inline, emit_softmax_telemetry,
-    NormKind,
-};
+use super::plan_lower::{LoweringContext, TensorPtrResolver};
 
-use crate::compiler::graph::{CompilerGraph, OpKind, SymDim};
-use crate::compiler::registry::ScalarOpRegistry;
-use crate::compiler::trace::{ComputePattern, QuantPrecision};
+use crate::compiler::graph::{CompilerGraph, SymDim};
+use crate::compiler::trace::QuantPrecision;
 use crate::types::CompilerError;
 
 /// Structural op dispatch (ARCH-AUTO-INSTR-SELECT Category C/D).
@@ -552,132 +540,14 @@ pub(crate) fn dispatch_compute_pattern(
     resolver: &TensorPtrResolver,
     abi: &AbiPtrs,
 ) -> Result<bool, CompilerError> {
-    // Phase 4+: Op v2 lowering 入口（胖 opcode 驱动，Norm 类已迁移）。
+    // Phase 4+: Op v2 lowering 入口（胖 opcode 驱动）。
     // 返回 true 表示已处理，跳过现有 OpKind 反查路径。
     if super::plan_lower::lower_op_v2(prog, op, graph, ctx, resolver, abi)? {
         return Ok(true);
     }
 
-    let width = ctx.session.width;
-    let sym_map = ctx.session.sym_map;
-    let hook = ctx.session.hook;
-    let rope_req = ctx.rope_req;
-    let ple_req = ctx.ple_req;
-    let dwc_req = ctx.dwc_req;
-    let resolve_dim = |dim: &SymDim| -> BoundExpr {
-        resolve_sym_dim(dim, abi, sym_map)
-    };
-    let seq_bound_override: Option<BoundExpr> = abi.mega_decode_seq_len.map(BoundExpr::DynamicVReg);
-
-    // ── ComputePattern 自动分发 (ARCH-AUTO-INSTR-SELECT) ──
-    // Trace-lookup: 如果 registry 有该 OpKind 的 trace，按 ComputePattern 路由。
-    {
-        let key = ScalarOpRegistry::key_from_op_kind(&op.kind);
-        let op_trace = ctx.session.registry.and_then(|r| r.get_trace(&key));
-        if let Some(trace) = op_trace {
-            match &trace.pattern {
-                // ── NormLike → QkNorm / L2Normalize（RmsNorm/LayerNorm/ValueNorm/HeadRmsNorm 已迁移 lower_op_v2）──
-                ComputePattern::NormLike { .. } => {
-                    match &op.kind {
-                        OpKind::QkNorm { head_dim, eps } => {
-                            let head_dim_v = *head_dim;
-                            if head_dim_v == 0 {
-                                return Err(CompilerError::CodegenViolation("QkNorm: head_dim must be > 0".into()));
-                            }
-                            let out_tid = op.outputs.first().copied().ok_or_else(|| CompilerError::CodegenViolation(
-                                format!("QkNorm op {:?}: 无输出张量", op.id)))?;
-                            let out_tensor = graph.tensor(out_tid).ok_or_else(|| CompilerError::CodegenViolation(
-                                format!("QkNorm op {:?}: 输出张量不存在", op.id)))?;
-                            let total_concrete: usize = out_tensor.shape.iter()
-                                .filter(|d| !d.is_symbolic()).map(|d| d.as_concrete().unwrap_or(1)).product();
-                            if total_concrete % head_dim_v != 0 {
-                                return Err(CompilerError::CodegenViolation(format!(
-                                    "QkNorm op {:?}: total concrete elems {} not divisible by head_dim {}",
-                                    op.id, total_concrete, head_dim_v)));
-                            }
-                            let num_heads = total_concrete / head_dim_v;
-                            let outer_seq = out_tensor.shape.first().cloned().unwrap_or(SymDim::Concrete(1));
-                            // Mega-kernel decode: each iteration processes 1 token.
-                            let seq_bound = if abi.mega_decode_seq_len.is_some() {
-                                BoundExpr::Const(1)
-                            } else {
-                                resolve_sym_dim(&outer_seq, abi, sym_map)
-                            };
-                            let pattern = build_norm_pattern_qk(*eps, head_dim_v)?;
-                            emit_normlike_inline(
-                                prog, &pattern, head_dim_v, num_heads,
-                                /*broadcast_weight=*/false, NormKind::ValueNorm,
-                                width, seq_bound, input_ptr, weight_ptr, output_ptr,
-                                ctx.dtype,
-                            )?;
-                            return Ok(true);
-                        }
-                        OpKind::L2Normalize { hidden } => {
-                            let seq_bound = seq_bound_override
-                                .clone()
-                                .unwrap_or(BoundExpr::Const(1));
-                            emit_normlike_inline(
-                                prog, &trace.pattern, *hidden, 1, false, NormKind::ValueNorm,
-                                width, seq_bound, input_ptr, weight_ptr, output_ptr,
-                                ctx.dtype,
-                            )?;
-                            return Ok(true);
-                        }
-                        _ => {} // fall through to OpKind 专用分发
-                    }
-                }
-                // ── Reduction → Softmax / MeanPool ──
-                ComputePattern::Reduction { .. } => {
-                    if matches!(op.kind, OpKind::Softmax) {
-                        let (_out_shape, feature_dim) = infer_output_shape_sym(op, graph)?;
-                        let (max_val, sum_val) = emit_softmax_inline(
-                            prog, feature_dim, width, input_ptr, output_ptr, ctx.dtype,
-                        )?;
-                        if graph.telemetry.softmax_sharpness {
-                            if let Some(expr) = sym_map.resolve("telemetry") {
-                                let tel_ptr = prog.alloc_vreg(VRegKind::Ptr, SimdWidth::Scalar);
-                                prog.emit(VmInstr::LoadPtr { dst: tel_ptr, src: expr.clone() });
-                                emit_softmax_telemetry(prog, max_val, sum_val, tel_ptr, width, ctx.dtype);
-                            }
-                        }
-                        return Ok(true);
-                    } else if matches!(op.kind, OpKind::MeanPool { .. }) {
-                        try_dispatch_reduction(
-                            prog, op, graph, &trace.pattern, ctx,
-                            input_ptr, output_ptr, seq_bound_override.as_ref(),
-                        )?;
-                        return Ok(true);
-                    }
-                    // else fall through to OpKind 专用分发
-                }
-                // ── BinaryElementwise → emit_elementwise_inline ──
-                ComputePattern::BinaryElementwise { .. } => {
-                    if matches!(op.kind, OpKind::LearnedPos2D { .. }) {
-                        let trace_body = extract_op_trace(op, ctx.session.registry)?;
-                        if trace_body.is_empty() {
-                            return Err(CompilerError::CodegenViolation(
-                                "LearnedPos2D: 空 trace (registry 未注册或 pattern 提取失败)".into(),
-                            ));
-                        }
-                        let (num_patches, embed_dim) = match &op.kind {
-                            OpKind::LearnedPos2D { num_patches, embed_dim } => (*num_patches, *embed_dim),
-                            _ => unreachable!(),
-                        };
-                        let out_shape = vec![SymDim::Concrete(num_patches), SymDim::Concrete(embed_dim)];
-                        let _acc = emit_elementwise_inline(prog, &trace_body, &out_shape, width,
-                            /*is_binary=*/true, /*weight_is_broadcast=*/false,
-                            input_ptr, weight_ptr, output_ptr, sym_map, seq_bound_override.as_ref(), ctx.dtype)?;
-                        return Ok(true);
-                    }
-                    // else fall through to OpKind 专用分发
-                }
-                _ => {} // Gemm, QuantDecode, etc. → fall through to OpKind 专用分发
-            }
-        }
-    }
-
-    // 死代码（51064 测试验证零触发）：lower_op_v2 + trace-lookup 处理所有 ops。
-    // 如果到达这里，返回 false 让调用方 fallback 到 dispatch_structural。
+    // 死代码（51064 测试验证零触发）：lower_op_v2 处理所有 ops。
+    // 如果到达这里，说明有新 op 未被 lower_op_v2 覆盖——需要补充 Op v2 路径。
     Ok(false)
 }
 

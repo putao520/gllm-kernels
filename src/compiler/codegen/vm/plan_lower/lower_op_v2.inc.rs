@@ -10,6 +10,7 @@
 
 use crate::compiler::graph::{CompilerOp, Op, NormSpec, AttentionSpec, KvSource};
 use super::attention_emit::emit_tiled_attention_inline;
+use super::norm_softmax_emit::{emit_softmax_inline, emit_softmax_telemetry};
 
 /// Phase 4+: Op v2 驱动的 lowering 入口。
 ///
@@ -797,7 +798,119 @@ pub(crate) fn lower_op_v2(
             });
             Ok(true)
         }
-        _ => Ok(false), // trace-lookup 路径（Softmax/QkNorm/L2Normalize/elementwise — registry trace 最优）
+        Op::QkNorm { head_dim, eps } => {
+            if head_dim == 0 {
+                return Err(CompilerError::CodegenViolation("QkNorm: head_dim must be > 0".into()));
+            }
+            let out_tid = op.outputs.first().copied().ok_or_else(|| CompilerError::CodegenViolation(
+                format!("QkNorm op {:?}: 无输出张量", op.id)))?;
+            let out_tensor = graph.tensor(out_tid).ok_or_else(|| CompilerError::CodegenViolation(
+                format!("QkNorm op {:?}: 输出张量不存在", op.id)))?;
+            let total_concrete: usize = out_tensor.shape.iter()
+                .filter(|d| !d.is_symbolic()).map(|d| d.as_concrete().unwrap_or(1)).product();
+            if total_concrete % head_dim != 0 {
+                return Err(CompilerError::CodegenViolation(format!(
+                    "QkNorm op {:?}: total concrete elems {} not divisible by head_dim {}",
+                    op.id, total_concrete, head_dim)));
+            }
+            let num_heads = total_concrete / head_dim;
+            let outer_seq = out_tensor.shape.first().cloned().unwrap_or(SymDim::Concrete(1));
+            let width = ctx.session.width;
+            let sym_map = ctx.session.sym_map;
+            let seq_bound = if abi.mega_decode_seq_len.is_some() {
+                BoundExpr::Const(1)
+            } else {
+                resolve_sym_dim(&outer_seq, abi, sym_map)
+            };
+            let input_ptr = resolver.materialize(prog, op.inputs[0], abi).unwrap_or_else(|| prog.alloc_vreg(VRegKind::Ptr, width));
+            let weight_ptr = resolver.materialize(prog, op.inputs[1], abi).unwrap_or_else(|| prog.alloc_vreg(VRegKind::Ptr, width));
+            let output_ptr = resolver.materialize(prog, op.outputs[0], abi)
+                .ok_or_else(|| CompilerError::CodegenViolation(format!("QkNorm op {:?}: 无输出指针", op.id)))?;
+            let pattern = build_norm_pattern_qk(eps, head_dim)?;
+            emit_normlike_inline(
+                prog, &pattern, head_dim, num_heads,
+                /*broadcast_weight=*/false, NormKind::ValueNorm,
+                width, seq_bound, input_ptr, weight_ptr, output_ptr,
+                ctx.dtype,
+            )?;
+            Ok(true)
+        }
+        Op::L2Normalize { hidden } => {
+            let width = ctx.session.width;
+            let sym_map = ctx.session.sym_map;
+            let seq_bound = abi.mega_decode_seq_len.map(BoundExpr::DynamicVReg)
+                .unwrap_or(BoundExpr::Const(1));
+            let input_ptr = resolver.materialize(prog, op.inputs[0], abi).unwrap_or_else(|| prog.alloc_vreg(VRegKind::Ptr, width));
+            let weight_ptr = resolver.materialize(prog, op.inputs[1], abi).unwrap_or_else(|| prog.alloc_vreg(VRegKind::Ptr, width));
+            let output_ptr = resolver.materialize(prog, op.outputs[0], abi)
+                .ok_or_else(|| CompilerError::CodegenViolation(format!("L2Normalize op {:?}: 无输出指针", op.id)))?;
+            let key = ScalarOpRegistry::key_from_op_kind(&op.kind);
+            let op_trace = ctx.session.registry.and_then(|r| r.get_trace(&key));
+            let pattern = op_trace.map(|t| t.pattern.clone())
+                .ok_or_else(|| CompilerError::CodegenViolation("L2Normalize: 无 registry trace".into()))?;
+            emit_normlike_inline(
+                prog, &pattern, hidden, 1, false, NormKind::ValueNorm,
+                width, seq_bound, input_ptr, weight_ptr, output_ptr,
+                ctx.dtype,
+            )?;
+            Ok(true)
+        }
+        Op::Softmax => {
+            let width = ctx.session.width;
+            let (_out_shape, feature_dim) = infer_output_shape_sym(op, graph)?;
+            let input_ptr = resolver.materialize(prog, op.inputs[0], abi).unwrap_or_else(|| prog.alloc_vreg(VRegKind::Ptr, width));
+            let output_ptr = resolver.materialize(prog, op.outputs[0], abi)
+                .ok_or_else(|| CompilerError::CodegenViolation(format!("Softmax op {:?}: 无输出指针", op.id)))?;
+            let (max_val, sum_val) = emit_softmax_inline(
+                prog, feature_dim, width, input_ptr, output_ptr, ctx.dtype,
+            )?;
+            if graph.telemetry.softmax_sharpness {
+                if let Some(expr) = ctx.session.sym_map.resolve("telemetry") {
+                    let tel_ptr = prog.alloc_vreg(VRegKind::Ptr, SimdWidth::Scalar);
+                    prog.emit(VmInstr::LoadPtr { dst: tel_ptr, src: expr.clone() });
+                    emit_softmax_telemetry(prog, max_val, sum_val, tel_ptr, width, ctx.dtype);
+                }
+            }
+            Ok(true)
+        }
+        Op::MeanPool { seq_len: _, hidden: _, cls_mode: _ } => {
+            let width = ctx.session.width;
+            let sym_map = ctx.session.sym_map;
+            let seq_bound_override: Option<BoundExpr> = abi.mega_decode_seq_len.map(BoundExpr::DynamicVReg);
+            let input_ptr = resolver.materialize(prog, op.inputs[0], abi).unwrap_or_else(|| prog.alloc_vreg(VRegKind::Ptr, width));
+            let output_ptr = resolver.materialize(prog, op.outputs[0], abi)
+                .ok_or_else(|| CompilerError::CodegenViolation(format!("MeanPool op {:?}: 无输出指针", op.id)))?;
+            let key = ScalarOpRegistry::key_from_op_kind(&op.kind);
+            let op_trace = ctx.session.registry.and_then(|r| r.get_trace(&key));
+            let trace = op_trace
+                .ok_or_else(|| CompilerError::CodegenViolation("MeanPool: 无 registry trace".into()))?;
+            try_dispatch_reduction(
+                prog, op, graph, &trace.pattern, ctx,
+                input_ptr, output_ptr, seq_bound_override.as_ref(),
+            )?;
+            Ok(true)
+        }
+        Op::LearnedPos2D { num_patches, embed_dim } => {
+            let width = ctx.session.width;
+            let sym_map = ctx.session.sym_map;
+            let seq_bound_override: Option<BoundExpr> = abi.mega_decode_seq_len.map(BoundExpr::DynamicVReg);
+            let trace_body = extract_op_trace(op, ctx.session.registry)?;
+            if trace_body.is_empty() {
+                return Err(CompilerError::CodegenViolation(
+                    "LearnedPos2D: 空 trace (registry 未注册或 pattern 提取失败)".into(),
+                ));
+            }
+            let input_ptr = resolver.materialize(prog, op.inputs[0], abi).unwrap_or_else(|| prog.alloc_vreg(VRegKind::Ptr, width));
+            let weight_ptr = resolver.materialize(prog, op.inputs[1], abi).unwrap_or_else(|| prog.alloc_vreg(VRegKind::Ptr, width));
+            let output_ptr = resolver.materialize(prog, op.outputs[0], abi)
+                .ok_or_else(|| CompilerError::CodegenViolation(format!("LearnedPos2D op {:?}: 无输出指针", op.id)))?;
+            let out_shape = vec![SymDim::Concrete(num_patches), SymDim::Concrete(embed_dim)];
+            let _acc = emit_elementwise_inline(prog, &trace_body, &out_shape, width,
+                /*is_binary=*/true, /*weight_is_broadcast=*/false,
+                input_ptr, weight_ptr, output_ptr, sym_map, seq_bound_override.as_ref(), ctx.dtype)?;
+            Ok(true)
+        }
+        _ => Ok(false) // 无需 lower_op_v2 的 ops（trace-lookup 最优）
     }
 }
 
