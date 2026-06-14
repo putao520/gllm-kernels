@@ -160,8 +160,72 @@ pub(crate) fn lower_op_v2(
             let output_ptr = resolver.materialize(prog, op.outputs[0], abi).ok_or_else(|| {
                 CompilerError::CodegenViolation(format!("ScaleConst op {:?}: output 无法 materialize", op.id))
             })?;
-            super::dispatch_emit::lower_scale_const(prog, op, graph, ctx,
-                input_ptr, output_ptr, resolver, abi, value)?;
+            let out_tid = op.outputs[0];
+            let out_tensor = graph.tensor(out_tid)
+                .ok_or_else(|| CompilerError::CodegenViolation("ScaleConst: no output tensor".into()))?;
+            let seq_dim = out_tensor.shape.iter().find(|d| d.is_symbolic()).cloned();
+            let feature_dim: usize = out_tensor.shape.iter()
+                .filter(|d| !d.is_symbolic())
+                .map(|d| d.as_concrete().unwrap_or(1))
+                .product::<usize>()
+                .max(1);
+            let width = ctx.session.width.f32_lanes();
+            let elem_bytes = 4usize;
+            let num_vec = (feature_dim + width - 1) / width;
+            let row_bytes = feature_dim * elem_bytes;
+            let const_bc = prog.alloc_vreg(VRegKind::Vec, ctx.session.width);
+            prog.emit(VmInstr::Broadcast {
+                dst: const_bc,
+                src: ScalarExpr::Const(value),
+                width: ctx.session.width,
+                dtype: ctx.dtype,
+            });
+            if let Some(sym_dim) = seq_dim {
+                let seq_bound = ctx.session.sym_map.to_bound(&sym_dim);
+                prog.emit_loop_try(seq_bound, row_bytes, |prog, _ctr, seq_off| {
+                    for v in 0..num_vec {
+                        let off = v * width * elem_bytes;
+                        let off_expr = OffsetExpr::Add(
+                            Box::new(OffsetExpr::LoopOffset(seq_off)),
+                            Box::new(OffsetExpr::Const(off)),
+                        );
+                        let data = prog.alloc_vreg(VRegKind::Vec, ctx.session.width);
+                        prog.emit(VmInstr::VecLoad {
+                            dst: data, base: input_ptr, offset: off_expr.clone(),
+                            width: ctx.session.width, dtype: ctx.dtype, predicate: None,
+                        });
+                        let scaled = prog.alloc_vreg(VRegKind::Vec, ctx.session.width);
+                        prog.emit(VmInstr::VecBinOp {
+                            dst: scaled, a: data, b: const_bc,
+                            op: VecOp::Mul, dtype: ctx.dtype,
+                        });
+                        prog.emit(VmInstr::VecStore {
+                            base: output_ptr, offset: off_expr, src: scaled,
+                            width: ctx.session.width, dtype: ctx.dtype, predicate: None,
+                        });
+                    }
+                    Ok::<_, CompilerError>(())
+                })?;
+            } else {
+                for v in 0..num_vec {
+                    let off = v * width * elem_bytes;
+                    let off_expr = OffsetExpr::Const(off);
+                    let data = prog.alloc_vreg(VRegKind::Vec, ctx.session.width);
+                    prog.emit(VmInstr::VecLoad {
+                        dst: data, base: input_ptr, offset: off_expr.clone(),
+                        width: ctx.session.width, dtype: ctx.dtype, predicate: None,
+                    });
+                    let scaled = prog.alloc_vreg(VRegKind::Vec, ctx.session.width);
+                    prog.emit(VmInstr::VecBinOp {
+                        dst: scaled, a: data, b: const_bc,
+                        op: VecOp::Mul, dtype: ctx.dtype,
+                    });
+                    prog.emit(VmInstr::VecStore {
+                        base: output_ptr, offset: off_expr, src: scaled,
+                        width: ctx.session.width, dtype: ctx.dtype, predicate: None,
+                    });
+                }
+            }
             Ok(true)
         }
         Op::SessionKvRestore => {
@@ -482,45 +546,255 @@ pub(crate) fn lower_op_v2(
             let input_ptr = resolver.materialize(prog, op.inputs[0], abi).ok_or_else(|| {
                 CompilerError::CodegenViolation(format!("AltUpPredict op {:?}: input 无法 materialize", op.id))
             })?;
-            let weight_ptr = op.inputs.get(1).copied()
-                .and_then(|tid| resolver.materialize(prog, tid, abi)).unwrap_or(input_ptr);
             let output_ptr = resolver.materialize(prog, op.outputs[0], abi).ok_or_else(|| {
                 CompilerError::CodegenViolation(format!("AltUpPredict op {:?}: output 无法 materialize", op.id))
             })?;
-            super::dispatch_emit::lower_altup_predict(
-                prog, op, graph, ctx, input_ptr, weight_ptr, output_ptr, resolver, abi,
-                seq_len.clone(), num_preds, hidden,
-            )?;
+            let coefs_ptr = resolver.materialize(prog, op.inputs[1], abi)
+                .ok_or_else(|| CompilerError::CodegenViolation("AltUpPredict: pred_coefs ptr".into()))?;
+            let seq_bound = ctx.session.sym_map.to_bound(seq_len);
+            let width = ctx.session.width.f32_lanes();
+            let p = num_preds;
+            let elem_bytes = 4usize;
+            let row_bytes = p * hidden * elem_bytes;
+            let num_vec = (hidden + width - 1) / width;
+            prog.emit_loop_try(seq_bound, row_bytes, |prog, _ctr, seq_off| {
+                for p_out in 0..p {
+                    for v in 0..num_vec {
+                        let off = p_out * hidden * elem_bytes + v * width * elem_bytes;
+                        let off_expr = OffsetExpr::Add(
+                            Box::new(OffsetExpr::LoopOffset(seq_off)),
+                            Box::new(OffsetExpr::Const(off)),
+                        );
+                        let data = prog.alloc_vreg(VRegKind::Vec, ctx.session.width);
+                        prog.emit(VmInstr::VecLoad {
+                            dst: data, base: input_ptr, offset: off_expr.clone(),
+                            width: ctx.session.width, dtype: ctx.dtype, predicate: None,
+                        });
+                        prog.emit(VmInstr::VecStore {
+                            base: output_ptr, offset: off_expr, src: data,
+                            width: ctx.session.width, dtype: ctx.dtype, predicate: None,
+                        });
+                    }
+                    for q in 0..p {
+                        let coef_byte_off = (p_out * p + q) * elem_bytes;
+                        let coef_bc = prog.alloc_vreg(VRegKind::Vec, ctx.session.width);
+                        prog.emit(VmInstr::Broadcast {
+                            dst: coef_bc,
+                            src: ScalarExpr::MemLoad(coefs_ptr, OffsetExpr::Add(
+                                Box::new(OffsetExpr::LoopOffset(seq_off)),
+                                Box::new(OffsetExpr::Const(coef_byte_off)),
+                            )),
+                            width: ctx.session.width,
+                            dtype: ctx.dtype,
+                        });
+                        for v in 0..num_vec {
+                            let q_off = q * hidden * elem_bytes + v * width * elem_bytes;
+                            let out_off = p_out * hidden * elem_bytes + v * width * elem_bytes;
+                            let q_off_expr = OffsetExpr::Add(
+                                Box::new(OffsetExpr::LoopOffset(seq_off)),
+                                Box::new(OffsetExpr::Const(q_off)),
+                            );
+                            let out_off_expr = OffsetExpr::Add(
+                                Box::new(OffsetExpr::LoopOffset(seq_off)),
+                                Box::new(OffsetExpr::Const(out_off)),
+                            );
+                            let h_q = prog.alloc_vreg(VRegKind::Vec, ctx.session.width);
+                            prog.emit(VmInstr::VecLoad {
+                                dst: h_q, base: input_ptr, offset: q_off_expr,
+                                width: ctx.session.width, dtype: ctx.dtype, predicate: None,
+                            });
+                            let scaled = prog.alloc_vreg(VRegKind::Vec, ctx.session.width);
+                            prog.emit(VmInstr::VecBinOp {
+                                dst: scaled, a: h_q, b: coef_bc,
+                                op: VecOp::Mul, dtype: ctx.dtype,
+                            });
+                            let acc = prog.alloc_vreg(VRegKind::Vec, ctx.session.width);
+                            prog.emit(VmInstr::VecLoad {
+                                dst: acc, base: output_ptr, offset: out_off_expr.clone(),
+                                width: ctx.session.width, dtype: ctx.dtype, predicate: None,
+                            });
+                            let new_acc = prog.alloc_vreg(VRegKind::Vec, ctx.session.width);
+                            prog.emit(VmInstr::VecBinOp {
+                                dst: new_acc, a: acc, b: scaled,
+                                op: VecOp::Add, dtype: ctx.dtype,
+                            });
+                            prog.emit(VmInstr::VecStore {
+                                base: output_ptr, offset: out_off_expr, src: new_acc,
+                                width: ctx.session.width, dtype: ctx.dtype, predicate: None,
+                            });
+                        }
+                    }
+                }
+                Ok::<_, CompilerError>(())
+            })?;
             Ok(true)
         }
         Op::AltUpCorrect { ref seq_len, num_preds, hidden } => {
             let input_ptr = resolver.materialize(prog, op.inputs[0], abi).ok_or_else(|| {
                 CompilerError::CodegenViolation(format!("AltUpCorrect op {:?}: input 无法 materialize", op.id))
             })?;
-            let weight_ptr = op.inputs.get(1).copied()
-                .and_then(|tid| resolver.materialize(prog, tid, abi)).unwrap_or(input_ptr);
             let output_ptr = resolver.materialize(prog, op.outputs[0], abi).ok_or_else(|| {
                 CompilerError::CodegenViolation(format!("AltUpCorrect op {:?}: output 无法 materialize", op.id))
             })?;
-            super::dispatch_emit::lower_altup_correct(
-                prog, op, graph, ctx, input_ptr, weight_ptr, output_ptr, resolver, abi,
-                seq_len.clone(), num_preds, hidden,
-            )?;
+            let coefs_ptr = resolver.materialize(prog, op.inputs[1], abi)
+                .ok_or_else(|| CompilerError::CodegenViolation("AltUpCorrect: corr_coefs ptr".into()))?;
+            let gated_ptr = resolver.materialize(prog, op.inputs[2], abi)
+                .ok_or_else(|| CompilerError::CodegenViolation("AltUpCorrect: gated ptr".into()))?;
+            let seq_bound = ctx.session.sym_map.to_bound(seq_len);
+            let width = ctx.session.width.f32_lanes();
+            let p = num_preds;
+            let elem_bytes = 4usize;
+            let row_bytes = p * hidden * elem_bytes;
+            let num_vec = (hidden + width - 1) / width;
+            prog.emit_loop_try(seq_bound, row_bytes, |prog, _ctr, seq_off| {
+                for v in 0..num_vec {
+                    let off = v * width * elem_bytes;
+                    let off_expr = OffsetExpr::Add(
+                        Box::new(OffsetExpr::LoopOffset(seq_off)),
+                        Box::new(OffsetExpr::Const(off)),
+                    );
+                    let data = prog.alloc_vreg(VRegKind::Vec, ctx.session.width);
+                    prog.emit(VmInstr::VecLoad {
+                        dst: data, base: gated_ptr, offset: off_expr.clone(),
+                        width: ctx.session.width, dtype: ctx.dtype, predicate: None,
+                    });
+                    prog.emit(VmInstr::VecStore {
+                        base: output_ptr, offset: off_expr, src: data,
+                        width: ctx.session.width, dtype: ctx.dtype, predicate: None,
+                    });
+                }
+                for p_out in 1..p {
+                    let coef_bc = prog.alloc_vreg(VRegKind::Vec, ctx.session.width);
+                    prog.emit(VmInstr::Broadcast {
+                        dst: coef_bc,
+                        src: ScalarExpr::MemLoad(coefs_ptr, OffsetExpr::Add(
+                            Box::new(OffsetExpr::LoopOffset(seq_off)),
+                            Box::new(OffsetExpr::Const(p_out * elem_bytes)),
+                        )),
+                        width: ctx.session.width,
+                        dtype: ctx.dtype,
+                    });
+                    for v in 0..num_vec {
+                        let chunk_off = v * width * elem_bytes;
+                        let base_off = OffsetExpr::Add(
+                            Box::new(OffsetExpr::LoopOffset(seq_off)),
+                            Box::new(OffsetExpr::Const(chunk_off)),
+                        );
+                        let pred_off = OffsetExpr::Add(
+                            Box::new(OffsetExpr::LoopOffset(seq_off)),
+                            Box::new(OffsetExpr::Const(p_out * hidden * elem_bytes + chunk_off)),
+                        );
+                        let pred_v = prog.alloc_vreg(VRegKind::Vec, ctx.session.width);
+                        prog.emit(VmInstr::VecLoad {
+                            dst: pred_v, base: input_ptr, offset: pred_off,
+                            width: ctx.session.width, dtype: ctx.dtype, predicate: None,
+                        });
+                        let gated_v = prog.alloc_vreg(VRegKind::Vec, ctx.session.width);
+                        prog.emit(VmInstr::VecLoad {
+                            dst: gated_v, base: gated_ptr, offset: base_off.clone(),
+                            width: ctx.session.width, dtype: ctx.dtype, predicate: None,
+                        });
+                        let pred0_v = prog.alloc_vreg(VRegKind::Vec, ctx.session.width);
+                        prog.emit(VmInstr::VecLoad {
+                            dst: pred0_v, base: input_ptr, offset: base_off,
+                            width: ctx.session.width, dtype: ctx.dtype, predicate: None,
+                        });
+                        let innov = prog.alloc_vreg(VRegKind::Vec, ctx.session.width);
+                        prog.emit(VmInstr::VecBinOp {
+                            dst: innov, a: gated_v, b: pred0_v,
+                            op: VecOp::Sub, dtype: ctx.dtype,
+                        });
+                        let scaled = prog.alloc_vreg(VRegKind::Vec, ctx.session.width);
+                        prog.emit(VmInstr::VecBinOp {
+                            dst: scaled, a: coef_bc, b: innov,
+                            op: VecOp::Mul, dtype: ctx.dtype,
+                        });
+                        let result = prog.alloc_vreg(VRegKind::Vec, ctx.session.width);
+                        prog.emit(VmInstr::VecBinOp {
+                            dst: result, a: pred_v, b: scaled,
+                            op: VecOp::Add, dtype: ctx.dtype,
+                        });
+                        let out_off = OffsetExpr::Add(
+                            Box::new(OffsetExpr::LoopOffset(seq_off)),
+                            Box::new(OffsetExpr::Const(p_out * hidden * elem_bytes + chunk_off)),
+                        );
+                        prog.emit(VmInstr::VecStore {
+                            base: output_ptr, offset: out_off, src: result,
+                            width: ctx.session.width, dtype: ctx.dtype, predicate: None,
+                        });
+                    }
+                }
+                Ok::<_, CompilerError>(())
+            })?;
             Ok(true)
         }
         Op::AltUpInject { ref seq_len, num_preds, hidden } => {
             let input_ptr = resolver.materialize(prog, op.inputs[0], abi).ok_or_else(|| {
                 CompilerError::CodegenViolation(format!("AltUpInject op {:?}: input 无法 materialize", op.id))
             })?;
-            let weight_ptr = op.inputs.get(1).copied()
-                .and_then(|tid| resolver.materialize(prog, tid, abi)).unwrap_or(input_ptr);
             let output_ptr = resolver.materialize(prog, op.outputs[0], abi).ok_or_else(|| {
                 CompilerError::CodegenViolation(format!("AltUpInject op {:?}: output 无法 materialize", op.id))
             })?;
-            super::dispatch_emit::lower_altup_inject(
-                prog, op, graph, ctx, input_ptr, weight_ptr, output_ptr, resolver, abi,
-                seq_len.clone(), num_preds, hidden,
-            )?;
+            let norm_ptr = resolver.materialize(prog, op.inputs[1], abi)
+                .ok_or_else(|| CompilerError::CodegenViolation("AltUpInject: normalized ptr".into()))?;
+            let seq_bound = ctx.session.sym_map.to_bound(seq_len);
+            let width = ctx.session.width.f32_lanes();
+            let p = num_preds;
+            let elem_bytes = 4usize;
+            let row_bytes = p * hidden * elem_bytes;
+            let num_vec = (hidden + width - 1) / width;
+            prog.emit_loop_try(seq_bound, row_bytes, |prog, _ctr, seq_off| {
+                let total_vec = (p * hidden + width - 1) / width;
+                for v in 0..total_vec {
+                    let off = v * width * elem_bytes;
+                    let off_expr = OffsetExpr::Add(
+                        Box::new(OffsetExpr::LoopOffset(seq_off)),
+                        Box::new(OffsetExpr::Const(off)),
+                    );
+                    let data = prog.alloc_vreg(VRegKind::Vec, ctx.session.width);
+                    prog.emit(VmInstr::VecLoad {
+                        dst: data, base: input_ptr, offset: off_expr.clone(),
+                        width: ctx.session.width, dtype: ctx.dtype, predicate: None,
+                    });
+                    prog.emit(VmInstr::VecStore {
+                        base: output_ptr, offset: off_expr, src: data,
+                        width: ctx.session.width, dtype: ctx.dtype, predicate: None,
+                    });
+                }
+                for p_out in 1..p {
+                    for v in 0..num_vec {
+                        let chunk_off = v * width * elem_bytes;
+                        let norm_off = OffsetExpr::Add(
+                            Box::new(OffsetExpr::LoopOffset(seq_off)),
+                            Box::new(OffsetExpr::Const(chunk_off)),
+                        );
+                        let norm_v = prog.alloc_vreg(VRegKind::Vec, ctx.session.width);
+                        prog.emit(VmInstr::VecLoad {
+                            dst: norm_v, base: norm_ptr, offset: norm_off,
+                            width: ctx.session.width, dtype: ctx.dtype, predicate: None,
+                        });
+                        let out_off = OffsetExpr::Add(
+                            Box::new(OffsetExpr::LoopOffset(seq_off)),
+                            Box::new(OffsetExpr::Const(p_out * hidden * elem_bytes + chunk_off)),
+                        );
+                        let out_v = prog.alloc_vreg(VRegKind::Vec, ctx.session.width);
+                        prog.emit(VmInstr::VecLoad {
+                            dst: out_v, base: output_ptr, offset: out_off.clone(),
+                            width: ctx.session.width, dtype: ctx.dtype, predicate: None,
+                        });
+                        let sum = prog.alloc_vreg(VRegKind::Vec, ctx.session.width);
+                        prog.emit(VmInstr::VecBinOp {
+                            dst: sum, a: out_v, b: norm_v,
+                            op: VecOp::Add, dtype: ctx.dtype,
+                        });
+                        prog.emit(VmInstr::VecStore {
+                            base: output_ptr, offset: out_off, src: sum,
+                            width: ctx.session.width, dtype: ctx.dtype, predicate: None,
+                        });
+                    }
+                }
+                Ok::<_, CompilerError>(())
+            })?;
             Ok(true)
         }
         Op::MoERouter { num_experts, top_k, hidden, seq_len: _ } => {
