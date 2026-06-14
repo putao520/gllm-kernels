@@ -11,42 +11,24 @@ use crate::compiler::graph::{CompilerGraph, SymDim};
 use crate::compiler::trace::QuantPrecision;
 use crate::types::CompilerError;
 
-/// Structural op dispatch (ARCH-AUTO-INSTR-SELECT Category C/D).
-///
-/// **Category C** (手写 lower 委托, awaiting TraceOp extension for auto_select migration):
-/// Gather, ColumnSlice, QTapSTG.
-///
-/// **Category D** (permanent, cannot use auto_select):
-/// Residual+telemetry (fused compute+telemetry loop), Argmax (specialized VmInstr),
-/// StoreToken, WriteLogits, CheckStopCondition (generation control flow),
-/// GuardrailCheck, CotStepCheck, SgInject, SgDetect (in-flight control),
-/// EarlyExit, MegaKernelDispatch (dispatch/scheduling), Reshape/Transpose/SliceView (NOP).
-#[allow(clippy::too_many_arguments)]
-#[allow(unreachable_code)]
+/// Structural op dispatch — all ops handled by lower_op_v2 (胖 opcode 驱动).
 pub(crate) fn dispatch_structural(
     prog: &mut VmProgram,
     op: &crate::compiler::graph::CompilerOp,
     graph: &CompilerGraph,
     ctx: &LoweringContext,
-    input_ptr: VRegId,
-    weight_ptr: VRegId,
-    output_ptr: VRegId,
     resolver: &TensorPtrResolver,
     abi: &AbiPtrs,
-    seq_bound_override: Option<&BoundExpr>,
 ) -> Result<(), CompilerError> {
-    // Phase 4-7+: Op v2 lowering — 所有 structural ops 走 lower_op_v2（胖 opcode 驱动）。
     if super::plan_lower::lower_op_v2(prog, op, graph, ctx, resolver, abi)? {
         return Ok(());
     }
 
-    // 死代码保护（51064 测试验证零触发）：lower_op_v2 处理所有 dispatch_structural 接收的 ops。
-    // 如果到达这里，说明有新 op 未被 lower_op_v2 覆盖——需要补充 Op v2 路径。
+    // 死代码保护：lower_op_v2 处理所有 structural ops。
     return Err(CompilerError::CodegenViolation(format!(
         "dispatch_structural: op {:?} 未被 lower_op_v2 处理。\
          所有 structural ops 应通过 Op v2 (lower_op_v2) 处理。", op.kind
     )));
-
 }
 
 
@@ -522,32 +504,22 @@ use super::instr::OffsetExpr;
 /// **ComputePattern 自动分发** (`try_dispatch_by_compute_pattern`): Auto-driven ops dispatched
 ///   by ComputePattern from registry — NormLike, Reduction, BinaryElementwise.
 ///
-/// **OpKind 专用分发** (match &op.kind): Composite ops with OpKind-specific lowering:
-///   Gemm/GemmBias, QuantGemm, MHA, RoPE, MoEGate/MoERouter/MoEDispatchPacked,
-///   AltUpPredict/AltUpCorrect/AltUpInject, DepthwiseConv1D, PatchEmbed, SessionKvRestore, MmHiddenInject.
+/// Op v2 dispatch — all ops handled by lower_op_v2 (胖 opcode 驱动).
 ///
-/// Returns Ok(true) if handled, Ok(false) if the op should fall through to structural match.
-#[allow(clippy::too_many_arguments)]
+/// Returns Ok(true) if handled, Ok(false) if the op should fall through.
 pub(crate) fn dispatch_compute_pattern(
     prog: &mut VmProgram,
     op: &crate::compiler::graph::CompilerOp,
     graph: &CompilerGraph,
     ctx: &LoweringContext,
-    input_ptr: VRegId,
-    weight_ptr: VRegId,
-    output_ptr: VRegId,
-    rope_cache_offset: Option<usize>,
     resolver: &TensorPtrResolver,
     abi: &AbiPtrs,
 ) -> Result<bool, CompilerError> {
-    // Phase 4+: Op v2 lowering 入口（胖 opcode 驱动）。
-    // 返回 true 表示已处理，跳过现有 OpKind 反查路径。
     if super::plan_lower::lower_op_v2(prog, op, graph, ctx, resolver, abi)? {
         return Ok(true);
     }
 
-    // 死代码（51064 测试验证零触发）：lower_op_v2 处理所有 ops。
-    // 如果到达这里，说明有新 op 未被 lower_op_v2 覆盖——需要补充 Op v2 路径。
+    // 死代码保护（51064 测试验证零触发）：lower_op_v2 处理所有 ops。
     Ok(false)
 }
 

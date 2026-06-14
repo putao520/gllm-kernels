@@ -896,23 +896,19 @@ pub(super) fn emit_standalone_op(
         return Ok(());
     }
 
-    // ── ComputePattern 自动分发 (Category B/C: Norm/Gemm/Reduction/Injective) ──
-    // ARCH-AUTO-INSTR-SELECT: 由 ComputePattern 驱动的自动路由，
-    // NormLike/Gemm/Reduction/Injective 模式算子路由到专用 lower 函数。
+    // ── Op v2 dispatch (胖 opcode 驱动) ──
+    // 所有 compute/structural ops 走 lower_op_v2。
     if dispatch_compute_pattern(
         prog, op, graph, ctx,
-        input_ptr, weight_ptr, output_ptr, rope_cache_offset,
         resolver, abi,
     )? {
         return Ok(());
     }
 
-    // ── Category D: Structural / Opaque / Telemetry-enhanced ──
-    // 这些算子无标准 ComputePattern 或需要专用 VmInstr 发射。
+    // ── Structural ops (lower_op_v2 fallback) ──
     dispatch_structural(
         prog, op, graph, ctx,
-        input_ptr, weight_ptr, output_ptr,
-        resolver, abi, seq_bound_override.as_ref(),
+        resolver, abi,
     )
 }
 
