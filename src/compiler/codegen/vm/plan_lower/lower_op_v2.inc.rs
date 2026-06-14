@@ -25,8 +25,8 @@ pub(crate) fn lower_op_v2(
     resolver: &TensorPtrResolver,
     abi: &AbiPtrs,
 ) -> Result<bool, CompilerError> {
-    // 统一 Op v2 转换入口（Phase 4-7 覆盖所有类别）
-    let op_v2 = Op::from_op_kind(op, graph);
+    // Phase 9: 优先读 op_v2 缓存（add_op 时已翻译），fallback 到 from_op_kind
+    let op_v2 = op.op_v2.clone().or_else(|| Op::from_op_kind(op, graph));
 
     let Some(op_v2) = op_v2 else {
         return Ok(false);

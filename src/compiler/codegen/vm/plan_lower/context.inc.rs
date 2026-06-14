@@ -380,8 +380,8 @@ pub(crate) fn compute_rope_requirement(
     for group in &plan.groups {
         for &op_id in &group.ops {
             let Some(op) = graph.op(op_id) else { continue };
-            // 从 Op（胖 opcode）读取 RoPE 参数 — 不反查 op.kind。
-            let Some(op_v2) = crate::compiler::graph::Op::from_op_kind(op, graph) else { continue };
+            // 从 Op（胖 opcode）读取 RoPE 参数 — 优先 op_v2 缓存。
+            let Some(op_v2) = op.op_v2.clone().or_else(|| crate::compiler::graph::Op::from_op_kind(op, graph)) else { continue };
             // Collect RoPE params from both standard RoPE and DualRoPE ops.
             // DualRoPE contributes two entries (sliding + global) simultaneously.
             let rope_params: Vec<(usize, f64, f32, Option<RopeScaling>)> = match &op_v2 {
@@ -499,8 +499,8 @@ pub(crate) fn compute_dwc_requirement(
     for group in &plan.groups {
         for &op_id in &group.ops {
             let Some(op) = graph.op(op_id) else { continue };
-            // 从 Op（胖 opcode）读取 DepthwiseConv1D 参数 — 不反查 op.kind。
-            let Some(op_v2) = crate::compiler::graph::Op::from_op_kind(op, graph) else { continue };
+            // 从 Op（胖 opcode）读取 DepthwiseConv1D 参数 — 优先 op_v2 缓存。
+            let Some(op_v2) = op.op_v2.clone().or_else(|| crate::compiler::graph::Op::from_op_kind(op, graph)) else { continue };
             if let crate::compiler::graph::Op::DepthwiseConv1D { channels, kernel_size, causal } = &op_v2 {
                 if *kernel_size == 0 {
                     return Err(CompilerError::CodegenViolation(
@@ -590,8 +590,8 @@ fn compute_moe_packed_requirement(
     for group in &plan.groups {
         for &op_id in &group.ops {
             let Some(op) = graph.op(op_id) else { continue };
-            // 从 Op（胖 opcode）读取 MoEDispatchPacked 参数 — 不反查 op.kind。
-            let Some(op_v2) = crate::compiler::graph::Op::from_op_kind(op, graph) else { continue };
+            // 从 Op（胖 opcode）读取 MoEDispatchPacked 参数 — 优先 op_v2 缓存。
+            let Some(op_v2) = op.op_v2.clone().or_else(|| crate::compiler::graph::Op::from_op_kind(op, graph)) else { continue };
             if let crate::compiler::graph::Op::MoEDispatchPacked { num_experts, top_k, intermediate_size, .. } = &op_v2 {
                 let routing_overhead = (2 * top_k + num_experts) * elem;
                 let compute_buffers = 3 * intermediate_size * elem;

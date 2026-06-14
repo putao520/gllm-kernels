@@ -287,9 +287,9 @@ pub(super) fn emit_fusion_groups(
         // duplicate instructions with WRONG ABI parameters (CompiledLayerFn offsets
         // instead of MegaKernelFn offsets), causing memory corruption and wrong
         // control flow.
-        // 从 Op（胖 opcode）识别采样 op — 不反查 op.kind。
+        // 从 Op（胖 opcode）识别采样 op — 优先 op_v2 缓存。
         let is_sampling_op = matches!(
-            crate::compiler::graph::Op::from_op_kind(anchor_op, graph),
+            anchor_op.op_v2.clone().or_else(|| crate::compiler::graph::Op::from_op_kind(anchor_op, graph)),
             Some(crate::compiler::graph::Op::Argmax { .. })
             | Some(crate::compiler::graph::Op::StoreToken)
             | Some(crate::compiler::graph::Op::CheckStopCondition)
@@ -765,8 +765,8 @@ pub(super) fn emit_fusion_groups(
                 if let Ok((m_dim, n, k)) = extract_gemm_dims_sym(op) {
                     let out_ptr = load_op_scratch_ptr(prog, scratch_base, op, alloc, resolver, current_abi)?;
                     let pm = ctx.pack_map_for_gemm(op.inputs.get(1).copied());
-                    // 从 Op（胖 opcode）读取 trans_b — 不反查 op.kind。
-                    let trans_b = match crate::compiler::graph::Op::from_op_kind(op, graph) {
+                    // 从 Op（胖 opcode）读取 trans_b — 优先 op_v2 缓存。
+                    let trans_b = match op.op_v2.clone().or_else(|| crate::compiler::graph::Op::from_op_kind(op, graph)) {
                         Some(crate::compiler::graph::Op::Gemm(spec))
                         | Some(crate::compiler::graph::Op::GemmBias(spec)) => spec.trans_b,
                         _ => false,
