@@ -1020,7 +1020,7 @@ fn lower_attention_v2(
             prog.emit_loop(q_bound.clone(), kv_row_stride, |prog, _ctr, byte_off| {
                 prog.emit(VmInstr::GprBinOp { dst: v_copy_src, a: v_ptr, b: GprOperand::VReg(byte_off), op: GprOp::Add });
                 prog.emit(VmInstr::GprBinOp { dst: v_off_tmp, a: pos_off, b: GprOperand::VReg(byte_off), op: GprOp::Add });
-                prog.emit(VmInstr::GprBinOp { dst: v_copy_dst, a: v_cache_base, b: GprOperand::VReg(k_off_tmp), op: GprOp::Add });
+                prog.emit(VmInstr::GprBinOp { dst: v_copy_dst, a: v_cache_base, b: GprOperand::VReg(v_off_tmp), op: GprOp::Add });
                 prog.emit(VmInstr::MemCopy { dst: v_copy_dst, src: v_copy_src, bytes: kv_row_stride, dtype, guard: None, effect: MemEffect::ReadWrite });
             });
 
