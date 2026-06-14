@@ -369,7 +369,7 @@ pub(crate) fn lower_op_v2(
             Ok(true)
         }
         Op::MultiHeadAttention(ref spec) => lower_attention_v2(prog, op, graph, ctx, resolver, abi, spec),
-        // NOP variants — 元数据 op，不生成 VmInstr（与 dispatch_structural:236 等价）
+        // NOP variants — 元数据 op，不生成 VmInstr
         Op::Transpose { .. } | Op::Reshape { .. } | Op::SliceView { .. } => Ok(true),
 
         // Generation control flow — 从 Op v2 路由，逻辑等价（unit 变体，无 Spec 参数）

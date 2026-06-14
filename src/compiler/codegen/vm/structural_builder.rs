@@ -1,4 +1,4 @@
-//! StructuralOpBuilder — 符号化替代 dispatch_structural 手写 emit。
+//! StructuralOpBuilder — 符号化 structural op emit（lower_op_v2 驱动）。
 //!
 //! 提供 side-channel copy、SIMD injection、logit write-back 等
 //! 常见模式的符号化构造方法，消除手工 VmInstr 序列中的计算错误。

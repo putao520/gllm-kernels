@@ -1498,7 +1498,7 @@ fn dispatch_trace_op(
             let embed_ptr = slots[1];
             let output_ptr = slots[2];
             // Default to single-token decode (mega-kernel); the higher-level
-            // plan_lower / dispatch_structural overrides seq_bound when more
+            // plan_lower / lower_op_v2 overrides seq_bound when more
             // context is available.
             let seq_bound = BoundExpr::Const(1);
             super::quant_gather_emit::emit_quant_gather_inline(
