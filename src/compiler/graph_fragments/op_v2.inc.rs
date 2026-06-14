@@ -15,7 +15,13 @@
 ///
 /// 当 Op enum 结构变更（新增/删除变体、Spec 字段变更）时 bump 此版本号。
 /// graph_content_hash 包含此常量，版本变更自动失效旧 JIT cache。
-pub const OPCODE_VERSION: u32 = 1;
+///
+/// v1: 初始版本（Phase 0-7 完成，41 类别 from_op_kind 100% 覆盖）
+/// v2: Phase 8 — VmInstr 复合指令加 dtype/guard/effect 字段（Predicate + MemEffect 新类型）
+///     VecLoad/VecStore +predicate；GatherLoad/ScatterStore +dtype +predicate；
+///     MemCopy +dtype +guard +effect。JIT 输出 VmInstr 结构变化，缓存必须失效。
+pub const OPCODE_VERSION: u32 = 2;
+// @trace REQ-FATOP-003 [entity:Op] OPCODE_VERSION JIT cache 版本管理
 
 // ── Attention Specs ──
 
@@ -47,6 +53,8 @@ pub enum SinksSpec {
 }
 
 /// MultiHeadAttention 完整自描述 spec。
+// @trace REQ-FATOP-004 [entity:AttentionSpec] AttentionSpec kv_source 自描述
+// @trace REQ-FATOP-005 [entity:AttentionSpec] AttentionSpec sinks 配置
 #[derive(Debug, Clone, PartialEq)]
 pub struct AttentionSpec {
     pub geometry: AttentionGeometry,
@@ -84,6 +92,7 @@ pub struct MlaSpec {
 // ── Norm Specs ──
 
 /// Norm 类 op 自描述 spec（RmsNorm/LayerNorm/ValueNorm/HeadRmsNorm 共用）。
+// @trace REQ-FATOP-006 [entity:NormSpec] NormSpec dtype 自描述
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct NormSpec {
     pub feature_dim: usize,
@@ -95,6 +104,7 @@ pub struct NormSpec {
 // ── Gemm Specs ──
 
 /// Gemm 自描述 spec。
+// @trace REQ-FATOP-007 [entity:GemmSpec] GemmSpec 完整自描述
 #[derive(Debug, Clone, PartialEq)]
 pub struct GemmSpec {
     pub m: SymDim,
@@ -147,6 +157,8 @@ pub struct DualRopeSpec {
 ///
 /// 每个变体携带完整语义，lowering 签名目标：`(prog, op, sess) -> Result`。
 /// 无参数变体保持 unit；复杂变体用 Spec struct。
+// @trace REQ-FATOP-001 [entity:Op] Op 枚举扁平结构（81 变体）
+// @trace REQ-FATOP-002 [entity:AttentionSpec] [entity:NormSpec] [entity:GemmSpec] Spec struct 携带完整自描述元数据
 #[derive(Debug, Clone, PartialEq)]
 pub enum Op {
     // ── Normalization ──
@@ -281,6 +293,7 @@ impl Op {
     ///
     /// 调用方无需知道 op 类别，自动路由到对应的转换方法。
     /// 返回 None 表示无匹配（理论上不会发生，因为 4 个方法覆盖所有 OpKind 变体）。
+    // @trace REQ-FATOP-013 [entity:Op] [entity:OpKind] from_op_kind IR Translator
     pub fn from_op_kind(op: &CompilerOp, graph: &CompilerGraph) -> Option<Self> {
         Self::from_op_kind_norm_activation(op, graph)
             .or_else(|| Self::from_op_kind_gemm_quant(op, graph))

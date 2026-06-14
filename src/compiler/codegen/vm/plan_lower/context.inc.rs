@@ -8,6 +8,7 @@
 /// 从 LoweringContext 中提取出来的全局常量字段。
 /// 注意：AbiPtrs 不在此处，因为它包含运行时分配的 VReg，
 /// 需要在 VmProgram 分配 VReg 之后才能构造。
+// @trace REQ-FATOP-008 [entity:CompileSession] CompileSession 提取 13 字段
 pub struct CompileSession<'a> {
     /// SIMD 宽度（硬件全局）
     pub width: SimdWidth,

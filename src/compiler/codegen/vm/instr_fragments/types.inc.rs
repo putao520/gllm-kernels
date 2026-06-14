@@ -453,6 +453,7 @@ impl GprBranchAction {
 /// - Some(cond): 仅当条件成立时执行（x86: TEST+JZ skip; ARM: CBZ skip）
 ///
 /// 替代旧"前置 GprCondAction + 内存指令"模式，简化 lowering 路径。
+// @trace REQ-FATOP-011 [entity:Predicate] Predicate 类型（基于 GprCondition）
 #[derive(Debug, Clone)]
 pub struct Predicate(pub GprCondition);
 
@@ -480,6 +481,7 @@ impl Predicate {
 /// 1. 寄存器分配的内存依赖分析
 /// 2. 指令调度的重排序边界
 /// 3. alias analysis（多指针别名推理）
+// @trace REQ-FATOP-012 [entity:MemEffect] MemEffect 类型（Read/Write/ReadWrite）
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MemEffect {
     /// 纯读操作（如 GatherLoad）

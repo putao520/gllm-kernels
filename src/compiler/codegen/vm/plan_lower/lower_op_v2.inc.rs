@@ -17,6 +17,8 @@ use super::attention_emit::emit_tiled_attention_inline;
 ///
 /// Norm 类：从 NormSpec.feature_dim/dtype 直接获取参数，不反查 OpKind。
 /// 其他类别：Phase 5-7 扩展。
+// @trace REQ-FATOP-014 [entity:Op] [entity:OpKind] lower_op_v2 41 类别零 OpKind 反查
+// @trace REQ-FATOP-018 lowering 路径优先读 op_v2 缓存
 pub(crate) fn lower_op_v2(
     prog: &mut VmProgram,
     op: &CompilerOp,
