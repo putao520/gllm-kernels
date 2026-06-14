@@ -113,7 +113,7 @@ pub(crate) fn emit_gather_inline(
                 prog.emit(VmInstr::VecLoad {
                     dst: data, base: table_row,
                     offset: OffsetExpr::LoopOffset(d_off), width,
-                    dtype: weight_dtype,
+                    dtype: weight_dtype, predicate: None,
                 });
                 let slots = super::auto_select::auto_lower_trace_raw(
                     prog, &scale_body, &[data], width, compute_dtype).expect("gather scale trace auto_lower failed");
@@ -122,7 +122,7 @@ pub(crate) fn emit_gather_inline(
                 prog.emit(VmInstr::VecStore {
                     base: out_row, offset: OffsetExpr::LoopOffset(d_off),
                     src: result, width,
-                    dtype: compute_dtype,
+                    dtype: compute_dtype, predicate: None,
                 });
                 if let Some(acc) = norm_sq_acc {
                     let l2_body = vec![TraceOp::Input(0), TraceOp::Mul(ValueId(0), ValueId(0)), TraceOp::Input(1), TraceOp::Add(ValueId(1), ValueId(2))];
@@ -151,7 +151,7 @@ pub(crate) fn emit_gather_inline(
                 base: tel_ptr,
                 offset: OffsetExpr::Const(telemetry_offsets::EMBED_L2_NORM_OFFSET),
                 src: l2_norm, width: SimdWidth::Scalar,
-                dtype: compute_dtype,
+                dtype: compute_dtype, predicate: None,
             });
         }
     }
@@ -223,7 +223,7 @@ pub(crate) fn emit_column_slice_inline(
                 prog.emit(VmInstr::VecLoad {
                     dst: data, base: in_row,
                     offset: OffsetExpr::LoopOffset(col_off), width,
-                    dtype,
+                    dtype, predicate: None,
                 });
                 // Apply identity trace via auto_lower_trace_raw
                 let slots = super::auto_select::auto_lower_trace_raw(
@@ -232,7 +232,7 @@ pub(crate) fn emit_column_slice_inline(
                 prog.emit(VmInstr::VecStore {
                     base: out_row, offset: OffsetExpr::LoopOffset(col_off),
                     src: result, width,
-                    dtype,
+                    dtype, predicate: None,
                 });
             });
         }
@@ -247,12 +247,12 @@ pub(crate) fn emit_column_slice_inline(
                 prog.emit(VmInstr::VecLoad {
                     dst: s_data, base: in_row,
                     offset: OffsetExpr::Const(col_off_const), width: s_width,
-                    dtype,
+                    dtype, predicate: None,
                 });
                 prog.emit(VmInstr::VecStore {
                     base: out_row, offset: OffsetExpr::Const(col_off_const),
                     src: s_data, width: s_width,
-                    dtype,
+                    dtype, predicate: None,
                 });
             }
         }
@@ -388,17 +388,17 @@ pub(crate) fn emit_rope_inline(
             // Part 1: Rotation via auto_lower_trace_multi
             if vec_count > 0 {
                 prog.emit_loop(BoundExpr::Const(vec_count), vec_step, |prog, _pair_ctr, pair_off| {
-                    prog.emit(VmInstr::VecLoad { dst: x_even, base: head_input, offset: OffsetExpr::LoopOffset(pair_off), width, dtype, });
+                    prog.emit(VmInstr::VecLoad { dst: x_even, base: head_input, offset: OffsetExpr::LoopOffset(pair_off), width, dtype, predicate: None, });
                     prog.emit(VmInstr::VecLoad {
                         dst: x_odd, base: head_input,
                         offset: OffsetExpr::loop_plus_const(pair_off, half_rot * dtype.elem_bytes()), width,
-                        dtype,
+                        dtype, predicate: None,
                     });
                     let p_bytes = OffsetExpr::Mul(Box::new(OffsetExpr::ScalarVReg(pos_vreg)), cos_row_bytes);
                     let cos_off = OffsetExpr::Add(Box::new(p_bytes.clone()), Box::new(OffsetExpr::LoopOffset(pair_off)));
                     let sin_off = OffsetExpr::Add(Box::new(cos_off.clone()), Box::new(OffsetExpr::Const(half * dtype.elem_bytes())));
-                    prog.emit(VmInstr::VecLoad { dst: cos_val, base: cos_sin_base, offset: cos_off, width, dtype, });
-                    prog.emit(VmInstr::VecLoad { dst: sin_val, base: cos_sin_base, offset: sin_off, width, dtype, });
+                    prog.emit(VmInstr::VecLoad { dst: cos_val, base: cos_sin_base, offset: cos_off, width, dtype, predicate: None, });
+                    prog.emit(VmInstr::VecLoad { dst: sin_val, base: cos_sin_base, offset: sin_off, width, dtype, predicate: None, });
 
                     let out_even = prog.alloc_vreg(VRegKind::Vec, width);
                     let out_odd = prog.alloc_vreg(VRegKind::Vec, width);
@@ -407,12 +407,12 @@ pub(crate) fn emit_rope_inline(
                         &[(out_even, 6), (out_odd, 9)], width, dtype)
                         .expect("emit_rope_inline: rotation trace auto_lower failed");
 
-                    prog.emit(VmInstr::VecStore { base: head_output, offset: OffsetExpr::LoopOffset(pair_off), src: out_even, width, dtype, });
+                    prog.emit(VmInstr::VecStore { base: head_output, offset: OffsetExpr::LoopOffset(pair_off), src: out_even, width, dtype, predicate: None, });
                     prog.emit(VmInstr::VecStore {
                         base: head_output,
                         offset: OffsetExpr::loop_plus_const(pair_off, half_rot * dtype.elem_bytes()),
                         src: out_odd, width,
-                        dtype,
+                        dtype, predicate: None,
                     });
                 });
             }
@@ -426,13 +426,13 @@ pub(crate) fn emit_rope_inline(
                 let sx_odd = prog.alloc_vreg(VRegKind::Vec, s1);
                 let scos = prog.alloc_vreg(VRegKind::Vec, s1);
                 let ssin = prog.alloc_vreg(VRegKind::Vec, s1);
-                prog.emit(VmInstr::VecLoad { dst: sx_even, base: head_input, offset: OffsetExpr::Const(off_even), width: s1, dtype, });
-                prog.emit(VmInstr::VecLoad { dst: sx_odd, base: head_input, offset: OffsetExpr::Const(off_even + half_rot * dtype.elem_bytes()), width: s1, dtype, });
+                prog.emit(VmInstr::VecLoad { dst: sx_even, base: head_input, offset: OffsetExpr::Const(off_even), width: s1, dtype, predicate: None, });
+                prog.emit(VmInstr::VecLoad { dst: sx_odd, base: head_input, offset: OffsetExpr::Const(off_even + half_rot * dtype.elem_bytes()), width: s1, dtype, predicate: None, });
                 let p_bytes = OffsetExpr::Mul(Box::new(OffsetExpr::ScalarVReg(p_ctr)), cos_row_bytes);
                 let cos_off = OffsetExpr::Add(Box::new(p_bytes.clone()), Box::new(OffsetExpr::Const(off_even)));
                 let sin_off = OffsetExpr::Add(Box::new(cos_off.clone()), Box::new(OffsetExpr::Const(half * dtype.elem_bytes())));
-                prog.emit(VmInstr::VecLoad { dst: scos, base: cos_sin_base, offset: cos_off, width: s1, dtype, });
-                prog.emit(VmInstr::VecLoad { dst: ssin, base: cos_sin_base, offset: sin_off, width: s1, dtype, });
+                prog.emit(VmInstr::VecLoad { dst: scos, base: cos_sin_base, offset: cos_off, width: s1, dtype, predicate: None, });
+                prog.emit(VmInstr::VecLoad { dst: ssin, base: cos_sin_base, offset: sin_off, width: s1, dtype, predicate: None, });
 
                 let s_out_even = prog.alloc_vreg(VRegKind::Vec, s1);
                 let s_out_odd = prog.alloc_vreg(VRegKind::Vec, s1);
@@ -440,11 +440,11 @@ pub(crate) fn emit_rope_inline(
                     &[sx_even, sx_odd, scos, ssin],
                     &[(s_out_even, 6), (s_out_odd, 9)], s1, dtype)
                     .expect("emit_rope_inline: scalar rotation trace auto_lower failed");
-                prog.emit(VmInstr::VecStore { base: head_output, offset: OffsetExpr::Const(off_even), src: s_out_even, width: s1, dtype, });
+                prog.emit(VmInstr::VecStore { base: head_output, offset: OffsetExpr::Const(off_even), src: s_out_even, width: s1, dtype, predicate: None, });
                 prog.emit(VmInstr::VecStore {
                     base: head_output, offset: OffsetExpr::Const(off_even + half_rot * dtype.elem_bytes()),
                     src: s_out_odd, width: s1,
-                    dtype,
+                    dtype, predicate: None,
                 });
             }
 
@@ -457,7 +457,7 @@ pub(crate) fn emit_rope_inline(
                         prog.emit(VmInstr::VecLoad {
                             dst: data, base: head_input,
                             offset: OffsetExpr::loop_plus_const(byte_off, pt_base_off), width,
-                            dtype,
+                            dtype, predicate: None,
                         });
                         let slots = super::auto_select::auto_lower_trace_raw(
                             prog, &passthrough_body, &[data], width, dtype).expect("emit_rope_inline: passthrough trace auto_lower failed");
@@ -465,7 +465,7 @@ pub(crate) fn emit_rope_inline(
                             base: head_output,
                             offset: OffsetExpr::loop_plus_const(byte_off, pt_base_off),
                             src: slots[0], width,
-                            dtype,
+                            dtype, predicate: None,
                         });
                     });
                 }
@@ -475,10 +475,10 @@ pub(crate) fn emit_rope_inline(
                     let off = pt_base_off + pt_vecs * vec_step + t * elem;
                     let s1 = SimdWidth::Scalar;
                     let s_data = prog.alloc_vreg(VRegKind::Vec, s1);
-                    prog.emit(VmInstr::VecLoad { dst: s_data, base: head_input, offset: OffsetExpr::Const(off), width: s1, dtype, });
+                    prog.emit(VmInstr::VecLoad { dst: s_data, base: head_input, offset: OffsetExpr::Const(off), width: s1, dtype, predicate: None, });
                     let slots = super::auto_select::auto_lower_trace_raw(
                         prog, &passthrough_body, &[s_data], s1, dtype).expect("emit_rope_inline: scalar passthrough trace auto_lower failed");
-                    prog.emit(VmInstr::VecStore { base: head_output, offset: OffsetExpr::Const(off), src: slots[0], width: s1, dtype, });
+                    prog.emit(VmInstr::VecStore { base: head_output, offset: OffsetExpr::Const(off), src: slots[0], width: s1, dtype, predicate: None, });
                 }
             }
         }); // head
@@ -1089,10 +1089,10 @@ mod tests {
 
         // Verify BF16 VecLoad and VecStore are emitted
         let bf16_loads = prog.instrs.iter().filter(|i| {
-            matches!(i, VmInstr::VecLoad { dtype: QuantPrecision::BF16, .. })
+            matches!(i, VmInstr::VecLoad { dtype: QuantPrecision::BF16, predicate: None, .. })
         }).count();
         let bf16_stores = prog.instrs.iter().filter(|i| {
-            matches!(i, VmInstr::VecStore { dtype: QuantPrecision::BF16, .. })
+            matches!(i, VmInstr::VecStore { dtype: QuantPrecision::BF16, predicate: None, .. })
         }).count();
         assert!(bf16_loads > 0, "BF16 ColumnSlice must emit BF16 VecLoad");
         assert!(bf16_stores > 0, "BF16 ColumnSlice must emit BF16 VecStore");
@@ -1374,7 +1374,7 @@ mod tests {
         ).unwrap();
 
         let has_bf16_load = prog.instrs.iter().any(|i| {
-            matches!(i, VmInstr::VecLoad { dtype: QuantPrecision::BF16, .. })
+            matches!(i, VmInstr::VecLoad { dtype: QuantPrecision::BF16, predicate: None, .. })
         });
         assert!(has_bf16_load, "BF16 RoPE must emit BF16 VecLoad");
     }
@@ -1860,7 +1860,7 @@ mod tests {
 
         // VecLoad dtype must be BF16 (reading from weight table)
         let bf16_loads = prog.instrs.iter().filter(|i| {
-            matches!(i, VmInstr::VecLoad { dtype: QuantPrecision::BF16, .. })
+            matches!(i, VmInstr::VecLoad { dtype: QuantPrecision::BF16, predicate: None, .. })
         }).count();
         assert!(bf16_loads > 0, "BF16 weight gather must emit BF16 VecLoad");
     }
@@ -2098,7 +2098,7 @@ mod tests {
 
         // All VecLoad must be BF16 W256
         let bf16_vec_loads = prog.instrs.iter().filter(|i| {
-            matches!(i, VmInstr::VecLoad { width: SimdWidth::W256, dtype: QuantPrecision::BF16, .. })
+            matches!(i, VmInstr::VecLoad { width: SimdWidth::W256, dtype: QuantPrecision::BF16, predicate: None, .. })
         }).count();
         assert!(bf16_vec_loads > 0,
             "BF16 ColumnSlice with aligned dims must emit BF16 W256 VecLoad");
@@ -2266,7 +2266,7 @@ mod tests {
         ).unwrap();
 
         let bf16_stores = prog.instrs.iter().filter(|i| {
-            matches!(i, VmInstr::VecStore { dtype: QuantPrecision::BF16, .. })
+            matches!(i, VmInstr::VecStore { dtype: QuantPrecision::BF16, predicate: None, .. })
         }).count();
         assert!(bf16_stores > 0, "BF16 compute gather must emit BF16 VecStore");
     }
@@ -2285,7 +2285,7 @@ mod tests {
         ).unwrap();
 
         let w128_bf16_loads = prog.instrs.iter().filter(|i| {
-            matches!(i, VmInstr::VecLoad { width: SimdWidth::W128, dtype: QuantPrecision::BF16, .. })
+            matches!(i, VmInstr::VecLoad { width: SimdWidth::W128, dtype: QuantPrecision::BF16, predicate: None, .. })
         }).count();
         assert!(w128_bf16_loads > 0, "W128 BF16 ColumnSlice must emit W128 BF16 VecLoad");
         let scalar_loads = prog.instrs.iter().filter(|i| {
@@ -2315,7 +2315,7 @@ mod tests {
         });
         assert!(has_gpr_add, "BF16 RoPE with position_offset must emit GprBinOp(Add)");
         let has_bf16_load = prog.instrs.iter().any(|i| {
-            matches!(i, VmInstr::VecLoad { dtype: QuantPrecision::BF16, .. })
+            matches!(i, VmInstr::VecLoad { dtype: QuantPrecision::BF16, predicate: None, .. })
         });
         assert!(has_bf16_load, "BF16 RoPE must emit BF16 VecLoad");
     }

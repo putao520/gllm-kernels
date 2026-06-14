@@ -272,7 +272,7 @@ fn emit_quant_gather_trace_driven(
                             offset: out_offset,
                             src: store_src,
                             width,
-                            dtype,
+                            dtype, predicate: None,
                         });
 
                         // REQ-LC-009 position 5: data_ptr 步进 = data_byte_advance (输入偏移)

@@ -634,7 +634,7 @@ fn dispatch_trace_op(
                 base: slots[base.0 as usize],
                 offset: OffsetExpr::LoopOffset(slots[offset.0 as usize]),
                 width,
-                dtype: default_dtype,
+                dtype: default_dtype, predicate: None,
             });
             Ok(r)
         }
@@ -645,7 +645,7 @@ fn dispatch_trace_op(
                 offset: OffsetExpr::LoopOffset(slots[offset.0 as usize]),
                 src: slots[value.0 as usize],
                 width,
-                dtype: default_dtype,
+                dtype: default_dtype, predicate: None,
             });
             // Store doesn't produce a new value; return the value slot.
             Ok(slots[value.0 as usize])
@@ -812,7 +812,7 @@ fn dispatch_trace_op(
                 base: slots[base.0 as usize],
                 indices: slots[indices.0 as usize],
                 stride: *stride,
-                width,
+                width, dtype: default_dtype, predicate: None,
             });
             Ok(r)
         }
@@ -824,7 +824,7 @@ fn dispatch_trace_op(
                 indices: slots[indices.0 as usize],
                 src: slots[value.0 as usize],
                 stride: *stride,
-                width,
+                width, dtype: default_dtype, predicate: None,
             });
             // Store doesn't produce a new value; return the value slot.
             Ok(slots[value.0 as usize])
@@ -1359,7 +1359,7 @@ fn dispatch_trace_op(
                 base: slots[base.0 as usize],
                 offset: OffsetExpr::ScalarVReg(slots[offset.0 as usize]),
                 width,
-                dtype: default_dtype,
+                dtype: default_dtype, predicate: None,
             });
             Ok(r)
         }
@@ -1371,7 +1371,7 @@ fn dispatch_trace_op(
                 offset: OffsetExpr::ScalarVReg(slots[offset.0 as usize]),
                 src: r,
                 width,
-                dtype: default_dtype,
+                dtype: default_dtype, predicate: None,
             });
             Ok(r)
         }
@@ -3009,7 +3009,7 @@ mod tests {
         assert!(result.is_ok());
         assert!(prog.instrs.iter().any(|i| matches!(
             i,
-            VmInstr::VecLoad { dtype: QuantPrecision::BF16, .. }
+            VmInstr::VecLoad { dtype: QuantPrecision::BF16, predicate: None, .. }
         )));
     }
 

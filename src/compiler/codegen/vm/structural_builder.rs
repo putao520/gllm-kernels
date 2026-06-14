@@ -36,7 +36,7 @@ impl StructuralOpBuilder {
         prog.emit(VmInstr::VecLoad {
             dst: vec, base: src_base,
             offset: OffsetExpr::LoopOffset(byte_off), width,
-            dtype: QuantPrecision::F32,
+            dtype: QuantPrecision::F32, predicate: None,
         });
         prog.emit(VmInstr::VecStore {
             base: dst_base, src: vec,
@@ -45,7 +45,7 @@ impl StructuralOpBuilder {
                 Box::new(OffsetExpr::LoopOffset(byte_off)),
             ),
             width,
-            dtype: QuantPrecision::F32,
+            dtype: QuantPrecision::F32, predicate: None,
         });
         prog.emit(VmInstr::LoopEnd);
         Ok(())
@@ -80,7 +80,7 @@ impl StructuralOpBuilder {
                 Box::new(OffsetExpr::LoopOffset(byte_off)),
             ),
             width,
-            dtype: QuantPrecision::F32,
+            dtype: QuantPrecision::F32, predicate: None,
         });
         // Broadcast confidence
         let conf_bc = prog.alloc_vreg(VRegKind::Vec, width);
@@ -95,7 +95,7 @@ impl StructuralOpBuilder {
         prog.emit(VmInstr::VecLoad {
             dst: hidden_vec, base: hidden_base,
             offset: OffsetExpr::LoopOffset(byte_off), width,
-            dtype: QuantPrecision::F32,
+            dtype: QuantPrecision::F32, predicate: None,
         });
         let fma_body = [
             TraceOp::Input(0),  // conf_bc (slot 0)
@@ -112,7 +112,7 @@ impl StructuralOpBuilder {
         prog.emit(VmInstr::VecStore {
             base: hidden_base, src: result,
             offset: OffsetExpr::LoopOffset(byte_off), width,
-            dtype: QuantPrecision::F32,
+            dtype: QuantPrecision::F32, predicate: None,
         });
         prog.emit(VmInstr::LoopEnd);
         Ok(())

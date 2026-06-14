@@ -22,16 +22,16 @@ pub(crate) fn emit_moe_router_gemv_inline(
         let weight_row_off = ei * hidden * elem;
         prog.emit_loop(BoundExpr::Const(hidden), elem, |prog, _d_ctr, d_off| {
             let h_val = prog.alloc_vreg(VRegKind::Vec, SimdWidth::Scalar);
-            prog.emit(VmInstr::VecLoad { dst: h_val, base: input_ptr, offset: OffsetExpr::LoopOffset(d_off), width: SimdWidth::Scalar, dtype, });
+            prog.emit(VmInstr::VecLoad { dst: h_val, base: input_ptr, offset: OffsetExpr::LoopOffset(d_off), width: SimdWidth::Scalar, dtype, predicate: None, });
             let w_val = prog.alloc_vreg(VRegKind::Vec, SimdWidth::Scalar);
             prog.emit(VmInstr::VecLoad { dst: w_val, base: weight_ptr,
                 offset: OffsetExpr::Add(Box::new(OffsetExpr::Const(weight_row_off)), Box::new(OffsetExpr::LoopOffset(d_off))),
-                width: SimdWidth::Scalar, dtype, });
+                width: SimdWidth::Scalar, dtype, predicate: None, });
             super::auto_select::auto_lower_trace_into(
                 prog, &dot_body, &[h_val, w_val, acc_reg], acc_reg, SimdWidth::Scalar, QuantPrecision::F32,
             ).expect("moe gemv: dot_body auto_lower failed");
         });
-        prog.emit(VmInstr::VecStore { base: logits_ptr, offset: OffsetExpr::Const(ei * elem), src: acc_reg, width: SimdWidth::Scalar, dtype, });
+        prog.emit(VmInstr::VecStore { base: logits_ptr, offset: OffsetExpr::Const(ei * elem), src: acc_reg, width: SimdWidth::Scalar, dtype, predicate: None, });
     }
     Ok(())
 }
@@ -109,7 +109,7 @@ pub(crate) fn emit_moe_topk_dispatch_inline(
         for ei in 0..num_experts {
             // Control flow: load current expert value
             let cur_val = prog.alloc_vreg(VRegKind::Vec, scalar_w);
-            prog.emit(VmInstr::VecLoad { dst: cur_val, base: gate_ptr, offset: OffsetExpr::Const(ei * elem), width: scalar_w, dtype, });
+            prog.emit(VmInstr::VecLoad { dst: cur_val, base: gate_ptr, offset: OffsetExpr::Const(ei * elem), width: scalar_w, dtype, predicate: None, });
             // Control flow: set up expert index scalar
             let ei_scalar = prog.alloc_vreg(VRegKind::Vec, scalar_w);
             prog.emit(VmInstr::Broadcast { dst: ei_scalar, src: ScalarExpr::Const(ei as f32), width: scalar_w, dtype, });
@@ -126,8 +126,8 @@ pub(crate) fn emit_moe_topk_dispatch_inline(
         }
 
         // Control flow: store results
-        prog.emit(VmInstr::VecStore { base: output_ptr, offset: OffsetExpr::Const(ki * elem), src: best_val, width: scalar_w, dtype, });
-        prog.emit(VmInstr::VecStore { base: output_ptr, offset: OffsetExpr::Const(indices_offset + ki * elem), src: best_idx, width: scalar_w, dtype, });
+        prog.emit(VmInstr::VecStore { base: output_ptr, offset: OffsetExpr::Const(ki * elem), src: best_val, width: scalar_w, dtype, predicate: None, });
+        prog.emit(VmInstr::VecStore { base: output_ptr, offset: OffsetExpr::Const(indices_offset + ki * elem), src: best_idx, width: scalar_w, dtype, predicate: None, });
 
         // Telemetry: expert hit counts (control flow + arithmetic via TraceOp)
         if let Some(tel_ptr) = telemetry_ptr {
@@ -153,12 +153,12 @@ pub(crate) fn emit_moe_topk_dispatch_inline(
         // Mask out selected expert (control flow + arithmetic via TraceOp)
         for ei in 0..num_experts {
             let cur_val = prog.alloc_vreg(VRegKind::Vec, scalar_w);
-            prog.emit(VmInstr::VecLoad { dst: cur_val, base: gate_ptr, offset: OffsetExpr::Const(ei * elem), width: scalar_w, dtype, });
+            prog.emit(VmInstr::VecLoad { dst: cur_val, base: gate_ptr, offset: OffsetExpr::Const(ei * elem), width: scalar_w, dtype, predicate: None, });
             let slots = super::auto_select::auto_lower_trace_raw(
                 prog, &mask_body, &[cur_val, best_val], scalar_w, QuantPrecision::F32)?;
             // Control flow: conditional skip (if match, overwrite with -inf)
             prog.emit(VmInstr::ConditionalSkip { mask: slots[5], skip_count: 1 });
-            prog.emit(VmInstr::VecStore { base: gate_ptr, offset: OffsetExpr::Const(ei * elem), src: neg_inf, width: scalar_w, dtype, });
+            prog.emit(VmInstr::VecStore { base: gate_ptr, offset: OffsetExpr::Const(ei * elem), src: neg_inf, width: scalar_w, dtype, predicate: None, });
         }
     }
 
@@ -333,11 +333,11 @@ pub(crate) fn emit_moe_packed_inline(
                 let h_val = prog.alloc_vreg(VRegKind::Vec, scalar_w);
                 prog.emit(VmInstr::VecLoad { dst: h_val, base: hidden_input_ptr, offset: OffsetExpr::Add(
                     Box::new(OffsetExpr::LoopOffset(seq_off)), Box::new(OffsetExpr::LoopOffset(d_off)),
-                ), width: scalar_w, dtype, });
+                ), width: scalar_w, dtype, predicate: None, });
                 let w_val = prog.alloc_vreg(VRegKind::Vec, scalar_w);
                 prog.emit(VmInstr::VecLoad { dst: w_val, base: router_weight_ptr, offset: OffsetExpr::Add(
                     Box::new(OffsetExpr::LoopOffset(e_off)), Box::new(OffsetExpr::LoopOffset(d_off)),
-                ), width: scalar_w, dtype, });
+                ), width: scalar_w, dtype, predicate: None, });
                 super::auto_select::auto_lower_trace_into(prog, &gemv_dot_body, &[h_val, w_val, acc_reg], acc_reg, scalar_w, QuantPrecision::F32)?;
                 Ok(())
             })?;
@@ -345,12 +345,12 @@ pub(crate) fn emit_moe_packed_inline(
             let bias_val = prog.alloc_vreg(VRegKind::Vec, scalar_w);
             prog.emit(VmInstr::VecLoad { dst: bias_val, base: router_bias_ptr,
                 offset: OffsetExpr::Mul(Box::new(OffsetExpr::LoopOffset(e_ctr)), elem),
-                width: scalar_w, dtype, });
+                width: scalar_w, dtype, predicate: None, });
             let slots = super::auto_select::auto_lower_trace_raw(prog, &dequant_bias_body, &[acc_reg, bias_val], scalar_w, QuantPrecision::F32)?;
             prog.emit(VmInstr::VecStore { base: scratchpad_ptr, offset: OffsetExpr::Add(
                 Box::new(OffsetExpr::Const(logits_off)),
                 Box::new(OffsetExpr::Mul(Box::new(OffsetExpr::LoopOffset(e_ctr)), elem)),
-            ), src: slots[2], width: scalar_w, dtype, });
+            ), src: slots[2], width: scalar_w, dtype, predicate: None, });
             Ok(())
         })?;
 
@@ -361,7 +361,7 @@ pub(crate) fn emit_moe_packed_inline(
             let cur = prog.alloc_vreg(VRegKind::Vec, scalar_w);
             prog.emit(VmInstr::VecLoad { dst: cur, base: scratchpad_ptr, offset: OffsetExpr::Add(
                 Box::new(OffsetExpr::Const(logits_off)), Box::new(OffsetExpr::LoopOffset(e_off)),
-            ), width: scalar_w, dtype, });
+            ), width: scalar_w, dtype, predicate: None, });
             super::auto_select::auto_lower_trace_into(prog, &softmax_max_body, &[max_acc, cur], max_acc, scalar_w, QuantPrecision::F32)?;
             Ok(())
         })?;
@@ -372,12 +372,12 @@ pub(crate) fn emit_moe_packed_inline(
             let cur = prog.alloc_vreg(VRegKind::Vec, scalar_w);
             prog.emit(VmInstr::VecLoad { dst: cur, base: scratchpad_ptr, offset: OffsetExpr::Add(
                 Box::new(OffsetExpr::Const(logits_off)), Box::new(OffsetExpr::LoopOffset(e_off)),
-            ), width: scalar_w, dtype, });
+            ), width: scalar_w, dtype, predicate: None, });
             let slots = super::auto_select::auto_lower_trace_raw(prog, &softmax_exp_body, &[cur, max_acc], scalar_w, QuantPrecision::F32)?;
             let exp_val = slots[3];
             prog.emit(VmInstr::VecStore { base: scratchpad_ptr, offset: OffsetExpr::Add(
                 Box::new(OffsetExpr::Const(logits_off)), Box::new(OffsetExpr::LoopOffset(e_off)),
-            ), src: exp_val, width: scalar_w, dtype, });
+            ), src: exp_val, width: scalar_w, dtype, predicate: None, });
             super::auto_select::auto_lower_trace_into(prog, &softmax_sum_body, &[sum_acc, exp_val], sum_acc, scalar_w, QuantPrecision::F32)?;
             Ok(())
         })?;
@@ -389,11 +389,11 @@ pub(crate) fn emit_moe_packed_inline(
             let cur = prog.alloc_vreg(VRegKind::Vec, scalar_w);
             prog.emit(VmInstr::VecLoad { dst: cur, base: scratchpad_ptr, offset: OffsetExpr::Add(
                 Box::new(OffsetExpr::Const(logits_off)), Box::new(OffsetExpr::LoopOffset(e_off)),
-            ), width: scalar_w, dtype, });
+            ), width: scalar_w, dtype, predicate: None, });
             let slots = super::auto_select::auto_lower_trace_raw(prog, &softmax_norm_body, &[cur, sum_acc], scalar_w, QuantPrecision::F32)?;
             prog.emit(VmInstr::VecStore { base: scratchpad_ptr, offset: OffsetExpr::Add(
                 Box::new(OffsetExpr::Const(logits_off)), Box::new(OffsetExpr::LoopOffset(e_off)),
-            ), src: slots[2], width: scalar_w, dtype, });
+            ), src: slots[2], width: scalar_w, dtype, predicate: None, });
             Ok(())
         })?;
 
@@ -412,7 +412,7 @@ pub(crate) fn emit_moe_packed_inline(
             for ei in 0..num_experts {
                 // Control flow: load current expert value
                 let cur_val = prog.alloc_vreg(VRegKind::Vec, scalar_w);
-                prog.emit(VmInstr::VecLoad { dst: cur_val, base: scratchpad_ptr, offset: OffsetExpr::Const(logits_off + ei * elem), width: scalar_w, dtype, });
+                prog.emit(VmInstr::VecLoad { dst: cur_val, base: scratchpad_ptr, offset: OffsetExpr::Const(logits_off + ei * elem), width: scalar_w, dtype, predicate: None, });
                 // Arithmetic: compare via auto_lower_trace_raw
                 let slots = super::auto_select::auto_lower_trace_raw(prog, &topk_compare_body, &[cur_val, best_val], scalar_w, QuantPrecision::F32)?;
                 // Control flow: conditional update
@@ -422,8 +422,8 @@ pub(crate) fn emit_moe_packed_inline(
                 super::auto_select::auto_lower_trace_into(prog, &identity, &[cur_val], best_val, scalar_w, QuantPrecision::F32).expect("best_val copy auto_lower failed");
             }
 
-            prog.emit(VmInstr::VecStore { base: scratchpad_ptr, offset: OffsetExpr::Const(router_weights_off + ki * elem), src: best_val, width: scalar_w, dtype, });
-            prog.emit(VmInstr::VecStore { base: scratchpad_ptr, offset: OffsetExpr::Const(router_indices_off + ki * elem), src: best_idx, width: scalar_w, dtype, });
+            prog.emit(VmInstr::VecStore { base: scratchpad_ptr, offset: OffsetExpr::Const(router_weights_off + ki * elem), src: best_val, width: scalar_w, dtype, predicate: None, });
+            prog.emit(VmInstr::VecStore { base: scratchpad_ptr, offset: OffsetExpr::Const(router_indices_off + ki * elem), src: best_idx, width: scalar_w, dtype, predicate: None, });
 
             // Mask out selected expert
             for ei in 0..num_experts {
@@ -431,7 +431,7 @@ pub(crate) fn emit_moe_packed_inline(
                 prog.emit(VmInstr::Broadcast { dst: ei_scalar, src: ScalarExpr::Const(ei as f32), width: scalar_w, dtype, });
                 let slots = super::auto_select::auto_lower_trace_raw(prog, &topk_mask_body, &[ei_scalar, best_idx, half_v], scalar_w, QuantPrecision::F32)?;
                 prog.emit(VmInstr::ConditionalSkip { mask: slots[6], skip_count: 1 });
-                prog.emit(VmInstr::VecStore { base: scratchpad_ptr, offset: OffsetExpr::Const(logits_off + ei * elem), src: neg_inf, width: scalar_w, dtype, });
+                prog.emit(VmInstr::VecStore { base: scratchpad_ptr, offset: OffsetExpr::Const(logits_off + ei * elem), src: neg_inf, width: scalar_w, dtype, predicate: None, });
             }
         }
 
@@ -444,7 +444,7 @@ pub(crate) fn emit_moe_packed_inline(
             prog.emit(VmInstr::ScalarToIndex { dst: expert_id_gpr, src: idx_scalar, stride: 1 });
 
             let weight_scalar = prog.alloc_vreg(VRegKind::Vec, SimdWidth::Scalar);
-            prog.emit(VmInstr::VecLoad { dst: weight_scalar, base: scratchpad_ptr, offset: OffsetExpr::Const(router_weights_off + k * elem), width: SimdWidth::Scalar, dtype, });
+            prog.emit(VmInstr::VecLoad { dst: weight_scalar, base: scratchpad_ptr, offset: OffsetExpr::Const(router_weights_off + k * elem), width: SimdWidth::Scalar, dtype, predicate: None, });
             let weight_vec = prog.alloc_vreg(VRegKind::Vec, width);
             prog.emit(VmInstr::Broadcast { dst: weight_vec, src: ScalarExpr::ExtractLane0(weight_scalar), width, dtype, });
 
@@ -490,7 +490,7 @@ pub(crate) fn emit_moe_packed_inline(
                         offset: OffsetExpr::Add(
                             Box::new(OffsetExpr::Mul(Box::new(OffsetExpr::LoopOffset(blk_off)), mxfp4_block_size * elem)),
                             Box::new(OffsetExpr::Const(vec_idx * lanes * elem)),
-                        ), width, dtype, });
+                        ), width, dtype, predicate: None, });
                     // Arithmetic: dequant + bias via auto_lower_trace_raw
                     let slots = super::auto_select::auto_lower_trace_raw(prog, &dequant_bias_body, &[dequant_vec, bias_vec], width, QuantPrecision::F32).expect("dequant_bias_body auto_lower failed");
 
@@ -501,7 +501,7 @@ pub(crate) fn emit_moe_packed_inline(
                                 Box::new(OffsetExpr::Mul(Box::new(OffsetExpr::LoopOffset(blk_off)), mxfp4_block_size * elem)),
                                 Box::new(OffsetExpr::Const(vec_idx * lanes * elem)),
                             )),
-                        ), src: slots[2], width, dtype, });
+                        ), src: slots[2], width, dtype, predicate: None, });
                 }
             });
 
@@ -509,11 +509,11 @@ pub(crate) fn emit_moe_packed_inline(
             prog.emit_loop(BoundExpr::Const(intermediate_vecs), lanes * elem, |prog, _v_ctr, v_off| {
                 let gate_vec = prog.alloc_vreg(VRegKind::Vec, width);
                 prog.emit(VmInstr::VecLoad { dst: gate_vec, base: scratchpad_ptr,
-                    offset: OffsetExpr::Add(Box::new(OffsetExpr::Const(gu_off)), Box::new(OffsetExpr::LoopOffset(v_off))), width, dtype, });
+                    offset: OffsetExpr::Add(Box::new(OffsetExpr::Const(gu_off)), Box::new(OffsetExpr::LoopOffset(v_off))), width, dtype, predicate: None, });
 
                 let up_vec = prog.alloc_vreg(VRegKind::Vec, width);
                 prog.emit(VmInstr::VecLoad { dst: up_vec, base: scratchpad_ptr,
-                    offset: OffsetExpr::Add(Box::new(OffsetExpr::Const(gu_off + intermediate_size * elem)), Box::new(OffsetExpr::LoopOffset(v_off))), width, dtype, });
+                    offset: OffsetExpr::Add(Box::new(OffsetExpr::Const(gu_off + intermediate_size * elem)), Box::new(OffsetExpr::LoopOffset(v_off))), width, dtype, predicate: None, });
 
                 // Arithmetic: full SwiGLU (clamp + sigmoid + gate*scaled + silu*up) via auto_lower_trace_raw
                 let slots = super::auto_select::auto_lower_trace_raw(
@@ -521,7 +521,7 @@ pub(crate) fn emit_moe_packed_inline(
 
                 prog.emit(VmInstr::VecStore { base: scratchpad_ptr,
                     offset: OffsetExpr::Add(Box::new(OffsetExpr::Const(activ_offset)), Box::new(OffsetExpr::LoopOffset(v_off))),
-                    src: slots[10], width, dtype, });
+                    src: slots[10], width, dtype, predicate: None, });
             });
 
             // B5: Down GEMV + bias + weighted accumulate
@@ -573,7 +573,7 @@ pub(crate) fn emit_moe_packed_inline(
                             offset: OffsetExpr::Add(
                                 Box::new(OffsetExpr::Const(activ_offset)),
                                 Box::new(OffsetExpr::Mul(Box::new(OffsetExpr::LoopOffset(sv_off)), lanes * elem / dot_step)),
-                            ), width, dtype, });
+                            ), width, dtype, predicate: None, });
 
                         // Arithmetic: FMA via auto_lower_trace_raw
                         let fma_body: Vec<TraceOp> = vec![
@@ -595,7 +595,7 @@ pub(crate) fn emit_moe_packed_inline(
                         offset: OffsetExpr::Add(
                             Box::new(OffsetExpr::Mul(Box::new(OffsetExpr::LoopOffset(blk_off)), mxfp4_block_size * elem)),
                             Box::new(OffsetExpr::LoopOffset(row_off)),
-                        ), width: SimdWidth::Scalar, dtype, });
+                        ), width: SimdWidth::Scalar, dtype, predicate: None, });
                     let bias_broadcast = prog.alloc_vreg(VRegKind::Vec, width);
                     prog.emit(VmInstr::Broadcast { dst: bias_broadcast, src: ScalarExpr::ExtractLane0(bias_val), width, dtype, });
 
@@ -608,7 +608,7 @@ pub(crate) fn emit_moe_packed_inline(
                         )),
                     );
                     let old_out = prog.alloc_vreg(VRegKind::Vec, SimdWidth::Scalar);
-                    prog.emit(VmInstr::VecLoad { dst: old_out, base: output_ptr, offset: out_offset.clone(), width: SimdWidth::Scalar, dtype, });
+                    prog.emit(VmInstr::VecLoad { dst: old_out, base: output_ptr, offset: out_offset.clone(), width: SimdWidth::Scalar, dtype, predicate: None, });
                     let old_out_broadcast = prog.alloc_vreg(VRegKind::Vec, width);
                     prog.emit(VmInstr::Broadcast { dst: old_out_broadcast, src: ScalarExpr::ExtractLane0(old_out), width, dtype, });
 
@@ -617,7 +617,7 @@ pub(crate) fn emit_moe_packed_inline(
                         prog, &down_accumulate_body, &[acc_reduced, bias_broadcast, weight_vec, old_out_broadcast], width, QuantPrecision::F32).expect("down accumulate auto_lower failed");
                     let new_out_scalar = prog.alloc_vreg(VRegKind::Vec, SimdWidth::Scalar);
                     prog.emit(VmInstr::Broadcast { dst: new_out_scalar, src: ScalarExpr::ExtractLane0(slots[6]), width: SimdWidth::Scalar, dtype, });
-                    prog.emit(VmInstr::VecStore { base: output_ptr, offset: out_offset, src: new_out_scalar, width: SimdWidth::Scalar, dtype, });
+                    prog.emit(VmInstr::VecStore { base: output_ptr, offset: out_offset, src: new_out_scalar, width: SimdWidth::Scalar, dtype, predicate: None, });
                 });
             });
         }

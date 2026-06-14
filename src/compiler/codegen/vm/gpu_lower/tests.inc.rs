@@ -686,7 +686,7 @@ mod tests {
         let mut l = GpuLower::new(GpuDialect::Ptx { sm_version: 80 });
         let alloc = empty_alloc();
         l.lower_instr(&VmInstr::GatherLoad {
-            dst: VRegId(4), base: VRegId(0), indices: VRegId(1), stride: 4, width: SimdWidth::Warp(32),
+            dst: VRegId(4), base: VRegId(0), indices: VRegId(1), stride: 4, width: SimdWidth::Warp(32), dtype: crate::compiler::trace::QuantPrecision::F32, predicate: None,
         }, &alloc).unwrap();
         let ir = l.finalize().unwrap();
         assert!(ir.contains("ld.global.u32"), "PTX GatherLoad should read index: {ir}");
@@ -699,7 +699,7 @@ mod tests {
         let mut l = GpuLower::new(GpuDialect::Hip { gfx_arch: 908, wave_size: 64 });
         let alloc = empty_alloc();
         l.lower_instr(&VmInstr::GatherLoad {
-            dst: VRegId(4), base: VRegId(0), indices: VRegId(1), stride: 4, width: SimdWidth::Warp(64),
+            dst: VRegId(4), base: VRegId(0), indices: VRegId(1), stride: 4, width: SimdWidth::Warp(64), dtype: crate::compiler::trace::QuantPrecision::F32, predicate: None,
         }, &alloc).unwrap();
         let ir = l.finalize().unwrap();
         assert!(ir.contains("_idx"), "HIP GatherLoad should read _idx: {ir}");
@@ -711,7 +711,7 @@ mod tests {
         let mut l = GpuLower::new(GpuDialect::Metal { gpu_family: 9 });
         let alloc = empty_alloc();
         l.lower_instr(&VmInstr::GatherLoad {
-            dst: VRegId(4), base: VRegId(0), indices: VRegId(1), stride: 4, width: SimdWidth::Warp(32),
+            dst: VRegId(4), base: VRegId(0), indices: VRegId(1), stride: 4, width: SimdWidth::Warp(32), dtype: crate::compiler::trace::QuantPrecision::F32, predicate: None,
         }, &alloc).unwrap();
         let ir = l.finalize().unwrap();
         assert!(ir.contains("_idx"), "Metal GatherLoad should read _idx: {ir}");
@@ -723,7 +723,7 @@ mod tests {
         let mut l = GpuLower::new(GpuDialect::Ptx { sm_version: 80 });
         let alloc = empty_alloc();
         l.lower_instr(&VmInstr::ScatterStore {
-            base: VRegId(0), indices: VRegId(1), src: VRegId(4), stride: 4, width: SimdWidth::Warp(32),
+            base: VRegId(0), indices: VRegId(1), src: VRegId(4), stride: 4, width: SimdWidth::Warp(32), dtype: crate::compiler::trace::QuantPrecision::F32, predicate: None,
         }, &alloc).unwrap();
         let ir = l.finalize().unwrap();
         assert!(ir.contains("ld.global.u32"), "PTX ScatterStore should read index: {ir}");
@@ -735,7 +735,7 @@ mod tests {
         let mut l = GpuLower::new(GpuDialect::Hip { gfx_arch: 908, wave_size: 64 });
         let alloc = empty_alloc();
         l.lower_instr(&VmInstr::ScatterStore {
-            base: VRegId(0), indices: VRegId(1), src: VRegId(4), stride: 4, width: SimdWidth::Warp(64),
+            base: VRegId(0), indices: VRegId(1), src: VRegId(4), stride: 4, width: SimdWidth::Warp(64), dtype: crate::compiler::trace::QuantPrecision::F32, predicate: None,
         }, &alloc).unwrap();
         let ir = l.finalize().unwrap();
         assert!(ir.contains("_idx"), "HIP ScatterStore should read _idx: {ir}");
@@ -783,7 +783,7 @@ mod tests {
         let mut l = GpuLower::new(GpuDialect::Ptx { sm_version: 80 });
         let alloc = empty_alloc();
         l.lower_instr(&VmInstr::GatherLoad {
-            dst: VRegId(4), base: VRegId(0), indices: VRegId(1), stride: 1, width: SimdWidth::Warp(32),
+            dst: VRegId(4), base: VRegId(0), indices: VRegId(1), stride: 1, width: SimdWidth::Warp(32), dtype: crate::compiler::trace::QuantPrecision::F32, predicate: None,
         }, &alloc).unwrap();
         let ir = l.finalize().unwrap();
         assert!(!ir.contains("mul.lo.s32"), "PTX GatherLoad stride=1 should NOT emit mul: {ir}");
@@ -941,6 +941,9 @@ mod tests {
         // Act
         l.lower_instr(&VmInstr::MemCopy {
             dst: VRegId(0), src: VRegId(1), bytes: 16,
+            dtype: crate::compiler::trace::QuantPrecision::F32,
+            guard: None,
+            effect: MemEffect::ReadWrite,
         }, &alloc).unwrap();
         let ir = l.finalize().unwrap();
         // Assert: 16 bytes = 2 × 8-byte copies (ld.global.u64 + st.global.u64)
@@ -1110,7 +1113,7 @@ mod tests {
         l.lower_instr(&VmInstr::VecLoad {
             dst: vec_v, base: ptr_v, offset: OffsetExpr::Const(0),
             width: SimdWidth::Warp(32),
-            dtype: crate::compiler::trace::QuantPrecision::F32,
+            dtype: crate::compiler::trace::QuantPrecision::F32, predicate: None,
         }, &alloc).unwrap();
         l.lower_instr(&VmInstr::ScalarLoad {
             dst: scalar_v, base: ptr_v, offset: OffsetExpr::Const(0),

@@ -185,11 +185,11 @@ pub(crate) fn lower_op_v2(
             let vec = prog.alloc_vreg(VRegKind::Vec, width);
             prog.emit(VmInstr::VecLoad {
                 dst: vec, base: input_ptr,
-                offset: OffsetExpr::LoopOffset(byte_off), width, dtype: ctx.dtype,
+                offset: OffsetExpr::LoopOffset(byte_off), width, dtype: ctx.dtype, predicate: None,
             });
             prog.emit(VmInstr::VecStore {
                 base: output_ptr, src: vec,
-                offset: OffsetExpr::LoopOffset(byte_off), width, dtype: ctx.dtype,
+                offset: OffsetExpr::LoopOffset(byte_off), width, dtype: ctx.dtype, predicate: None,
             });
             prog.emit(VmInstr::LoopEnd);
             Ok(true)
@@ -648,9 +648,9 @@ pub(crate) fn lower_op_v2(
             let byte_off = prog.alloc_vreg(VRegKind::ByteOffset, SimdWidth::Scalar);
             prog.emit(VmInstr::LoopBegin { counter: ctr, byte_offset: byte_off, bound: BoundExpr::Const(iters), step_bytes: step });
             let src_vec = prog.alloc_vreg(VRegKind::Vec, width);
-            prog.emit(VmInstr::VecLoad { dst: src_vec, base: input_ptr, offset: OffsetExpr::LoopOffset(byte_off), width, dtype: ctx.dtype });
+            prog.emit(VmInstr::VecLoad { dst: src_vec, base: input_ptr, offset: OffsetExpr::LoopOffset(byte_off), width, dtype: ctx.dtype , predicate: None,});
             let mm_vec = prog.alloc_vreg(VRegKind::Vec, width);
-            prog.emit(VmInstr::VecLoad { dst: mm_vec, base: input_ptr, offset: OffsetExpr::LoopOffset(byte_off), width, dtype: ctx.dtype });
+            prog.emit(VmInstr::VecLoad { dst: mm_vec, base: input_ptr, offset: OffsetExpr::LoopOffset(byte_off), width, dtype: ctx.dtype , predicate: None,});
             let result = prog.alloc_vreg(VRegKind::Vec, width);
             let ple_add_body: Vec<TraceOp> = vec![
                 TraceOp::Input(0), TraceOp::Input(1),
@@ -658,7 +658,7 @@ pub(crate) fn lower_op_v2(
             ];
             super::auto_select::auto_lower_trace_into(prog, &ple_add_body, &[src_vec, mm_vec], result, width, QuantPrecision::F32)
                 .map_err(|e| CompilerError::CodegenViolation(format!("MmHiddenInject auto_lower: {e}")))?;
-            prog.emit(VmInstr::VecStore { base: output_ptr, src: result, offset: OffsetExpr::LoopOffset(byte_off), width, dtype: ctx.dtype });
+            prog.emit(VmInstr::VecStore { base: output_ptr, src: result, offset: OffsetExpr::LoopOffset(byte_off), width, dtype: ctx.dtype , predicate: None,});
             prog.emit(VmInstr::LoopEnd);
             Ok(true)
         }
@@ -879,20 +879,20 @@ fn lower_gemm_v2(
                     let byte_off = vj * lanes * elem_bytes;
                     let b_data = prog.alloc_vreg(VRegKind::Vec, width);
                     let c_data = prog.alloc_vreg(VRegKind::Vec, width);
-                    prog.emit(VmInstr::VecLoad { dst: b_data, base: bias_ptr, offset: OffsetExpr::Const(byte_off), width, dtype: dtype_qp });
-                    prog.emit(VmInstr::VecLoad { dst: c_data, base: row_ptr, offset: OffsetExpr::Const(byte_off), width, dtype: dtype_qp });
+                    prog.emit(VmInstr::VecLoad { dst: b_data, base: bias_ptr, offset: OffsetExpr::Const(byte_off), width, dtype: dtype_qp , predicate: None,});
+                    prog.emit(VmInstr::VecLoad { dst: c_data, base: row_ptr, offset: OffsetExpr::Const(byte_off), width, dtype: dtype_qp , predicate: None,});
                     prog.emit(VmInstr::VecBinOp { dst: c_data, a: c_data, b: b_data, op: VecOp::Add, dtype: dtype_qp });
-                    prog.emit(VmInstr::VecStore { base: row_ptr, offset: OffsetExpr::Const(byte_off), src: c_data, width, dtype: dtype_qp });
+                    prog.emit(VmInstr::VecStore { base: row_ptr, offset: OffsetExpr::Const(byte_off), src: c_data, width, dtype: dtype_qp , predicate: None,});
                 }
                 let rem_start = n_vec * lanes;
                 for jj in rem_start..n_elem {
                     let byte_off = jj * elem_bytes;
                     let b_s = prog.alloc_vreg(VRegKind::Vec, SimdWidth::Scalar);
                     let c_s = prog.alloc_vreg(VRegKind::Vec, SimdWidth::Scalar);
-                    prog.emit(VmInstr::VecLoad { dst: b_s, base: bias_ptr, offset: OffsetExpr::Const(byte_off), width: SimdWidth::Scalar, dtype: dtype_qp });
-                    prog.emit(VmInstr::VecLoad { dst: c_s, base: row_ptr, offset: OffsetExpr::Const(byte_off), width: SimdWidth::Scalar, dtype: dtype_qp });
+                    prog.emit(VmInstr::VecLoad { dst: b_s, base: bias_ptr, offset: OffsetExpr::Const(byte_off), width: SimdWidth::Scalar, dtype: dtype_qp , predicate: None,});
+                    prog.emit(VmInstr::VecLoad { dst: c_s, base: row_ptr, offset: OffsetExpr::Const(byte_off), width: SimdWidth::Scalar, dtype: dtype_qp , predicate: None,});
                     prog.emit(VmInstr::VecBinOp { dst: c_s, a: c_s, b: b_s, op: VecOp::Add, dtype: dtype_qp });
-                    prog.emit(VmInstr::VecStore { base: row_ptr, offset: OffsetExpr::Const(byte_off), src: c_s, width: SimdWidth::Scalar, dtype: dtype_qp });
+                    prog.emit(VmInstr::VecStore { base: row_ptr, offset: OffsetExpr::Const(byte_off), src: c_s, width: SimdWidth::Scalar, dtype: dtype_qp , predicate: None,});
                 }
             });
         }
@@ -1004,7 +1004,7 @@ fn lower_attention_v2(
                 prog.emit(VmInstr::GprBinOp { dst: k_copy_src, a: k_ptr, b: GprOperand::VReg(byte_off), op: GprOp::Add });
                 prog.emit(VmInstr::GprBinOp { dst: k_off_tmp, a: pos_off, b: GprOperand::VReg(byte_off), op: GprOp::Add });
                 prog.emit(VmInstr::GprBinOp { dst: k_copy_dst, a: k_cache_base, b: GprOperand::VReg(k_off_tmp), op: GprOp::Add });
-                prog.emit(VmInstr::MemCopy { dst: k_copy_dst, src: k_copy_src, bytes: kv_row_stride });
+                prog.emit(VmInstr::MemCopy { dst: k_copy_dst, src: k_copy_src, bytes: kv_row_stride, dtype, guard: None, effect: MemEffect::ReadWrite });
             });
 
             // V cache base = K cache base + max_seq * kv_row_stride
@@ -1019,7 +1019,7 @@ fn lower_attention_v2(
                 prog.emit(VmInstr::GprBinOp { dst: v_copy_src, a: v_ptr, b: GprOperand::VReg(byte_off), op: GprOp::Add });
                 prog.emit(VmInstr::GprBinOp { dst: v_off_tmp, a: pos_off, b: GprOperand::VReg(byte_off), op: GprOp::Add });
                 prog.emit(VmInstr::GprBinOp { dst: v_copy_dst, a: v_cache_base, b: GprOperand::VReg(k_off_tmp), op: GprOp::Add });
-                prog.emit(VmInstr::MemCopy { dst: v_copy_dst, src: v_copy_src, bytes: kv_row_stride });
+                prog.emit(VmInstr::MemCopy { dst: v_copy_dst, src: v_copy_src, bytes: kv_row_stride, dtype, guard: None, effect: MemEffect::ReadWrite });
             });
 
             (k_cache_base, v_cache_base)

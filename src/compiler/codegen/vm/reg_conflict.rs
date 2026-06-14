@@ -153,7 +153,7 @@ mod tests {
             base: v0,
             offset: OffsetExpr::Const(0),
             width: SimdWidth::W256,
-            dtype: QuantPrecision::F32,
+            dtype: QuantPrecision::F32, predicate: None,
         });
         prog
     }
@@ -218,7 +218,7 @@ mod tests {
             base,
             offset: OffsetExpr::Const(0),
             width: SimdWidth::W256,
-            dtype: QuantPrecision::F32,
+            dtype: QuantPrecision::F32, predicate: None,
         });
         // v0 最后使用点 = 此 Mov
         prog.emit(VmInstr::Mov {
@@ -233,7 +233,7 @@ mod tests {
             base,
             offset: OffsetExpr::Const(32),
             width: SimdWidth::W256,
-            dtype: QuantPrecision::F32,
+            dtype: QuantPrecision::F32, predicate: None,
         });
 
         let intervals = RegAllocator::compute_intervals(&prog);
@@ -269,7 +269,7 @@ mod tests {
             base,
             offset: OffsetExpr::Const(0),
             width: SimdWidth::W256,
-            dtype: QuantPrecision::F32,
+            dtype: QuantPrecision::F32, predicate: None,
         });
         // instr[3]: VecLoad v1 (v1 live starts here, v0 still live)
         prog.emit(VmInstr::VecLoad {
@@ -277,7 +277,7 @@ mod tests {
             base,
             offset: OffsetExpr::Const(32),
             width: SimdWidth::W256,
-            dtype: QuantPrecision::F32,
+            dtype: QuantPrecision::F32, predicate: None,
         });
         // instr[4]: VecBinOp uses v0 — extends v0's last_use past v1's def,
         // creating a true overlap when both map to the same physical register.
@@ -332,7 +332,7 @@ mod tests {
             base,
             offset: OffsetExpr::Const(0),
             width: SimdWidth::W256,
-            dtype: QuantPrecision::F32,
+            dtype: QuantPrecision::F32, predicate: None,
         });
 
         let intervals = RegAllocator::compute_intervals(&prog);
@@ -519,7 +519,7 @@ mod tests {
         let mut prog = VmProgram::new();
         let v0 = prog.alloc_vreg(VRegKind::Vec, SimdWidth::W256);
         let base = prog.alloc_vreg(VRegKind::Ptr, SimdWidth::Scalar);
-        prog.emit(VmInstr::VecLoad { dst: v0, base, offset: OffsetExpr::Const(0), width: SimdWidth::W256, dtype: QuantPrecision::F32 });
+        prog.emit(VmInstr::VecLoad { dst: v0, base, offset: OffsetExpr::Const(0), width: SimdWidth::W256, dtype: QuantPrecision::F32 , predicate: None,});
 
         let intervals = RegAllocator::compute_intervals(&prog);
         // Only one vec vreg (v0) mapped to Vec(0) — can't conflict with itself
@@ -619,11 +619,11 @@ mod tests {
 
         // instr[2]: VecLoad v0
         prog.emit(VmInstr::VecLoad {
-            dst: v0, base, offset: OffsetExpr::Const(0), width: SimdWidth::W256, dtype: QuantPrecision::F32,
+            dst: v0, base, offset: OffsetExpr::Const(0), width: SimdWidth::W256, dtype: QuantPrecision::F32, predicate: None,
         });
         // instr[3]: VecLoad v1 (v0 still live)
         prog.emit(VmInstr::VecLoad {
-            dst: v1, base, offset: OffsetExpr::Const(32), width: SimdWidth::W256, dtype: QuantPrecision::F32,
+            dst: v1, base, offset: OffsetExpr::Const(32), width: SimdWidth::W256, dtype: QuantPrecision::F32, predicate: None,
         });
         // instr[4]: VecBinOp uses both v0 and v1 — they overlap here
         let v2 = prog.alloc_vreg(VRegKind::Vec, SimdWidth::W256);

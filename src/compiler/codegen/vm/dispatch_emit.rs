@@ -134,11 +134,11 @@ pub(crate) fn lower_altup_predict(
                 let data = prog.alloc_vreg(VRegKind::Vec, ctx.session.width);
                 prog.emit(VmInstr::VecLoad {
                     dst: data, base: input_ptr, offset: off_expr.clone(),
-                    width: ctx.session.width, dtype: QuantPrecision::F32,
+                    width: ctx.session.width, dtype: QuantPrecision::F32, predicate: None,
                 });
                 prog.emit(VmInstr::VecStore {
                     base: output_ptr, offset: off_expr, src: data,
-                    width: ctx.session.width, dtype: QuantPrecision::F32,
+                    width: ctx.session.width, dtype: QuantPrecision::F32, predicate: None,
                 });
             }
 
@@ -173,7 +173,7 @@ pub(crate) fn lower_altup_predict(
                     let h_q = prog.alloc_vreg(VRegKind::Vec, ctx.session.width);
                     prog.emit(VmInstr::VecLoad {
                         dst: h_q, base: input_ptr, offset: q_off_expr,
-                        width: ctx.session.width, dtype: QuantPrecision::F32,
+                        width: ctx.session.width, dtype: QuantPrecision::F32, predicate: None,
                     });
                     // scaled = coef * hidden[q]
                     let scaled = prog.alloc_vreg(VRegKind::Vec, ctx.session.width);
@@ -185,7 +185,7 @@ pub(crate) fn lower_altup_predict(
                     let acc = prog.alloc_vreg(VRegKind::Vec, ctx.session.width);
                     prog.emit(VmInstr::VecLoad {
                         dst: acc, base: output_ptr, offset: out_off_expr.clone(),
-                        width: ctx.session.width, dtype: QuantPrecision::F32,
+                        width: ctx.session.width, dtype: QuantPrecision::F32, predicate: None,
                     });
                     // acc += scaled
                     let new_acc = prog.alloc_vreg(VRegKind::Vec, ctx.session.width);
@@ -195,7 +195,7 @@ pub(crate) fn lower_altup_predict(
                     });
                     prog.emit(VmInstr::VecStore {
                         base: output_ptr, offset: out_off_expr, src: new_acc,
-                        width: ctx.session.width, dtype: QuantPrecision::F32,
+                        width: ctx.session.width, dtype: QuantPrecision::F32, predicate: None,
                     });
                 }
             }
@@ -246,11 +246,11 @@ pub(crate) fn lower_altup_correct(
             let data = prog.alloc_vreg(VRegKind::Vec, ctx.session.width);
             prog.emit(VmInstr::VecLoad {
                 dst: data, base: gated_ptr, offset: off_expr.clone(),
-                width: ctx.session.width, dtype: QuantPrecision::F32,
+                width: ctx.session.width, dtype: QuantPrecision::F32, predicate: None,
             });
             prog.emit(VmInstr::VecStore {
                 base: output_ptr, offset: off_expr, src: data,
-                width: ctx.session.width, dtype: QuantPrecision::F32,
+                width: ctx.session.width, dtype: QuantPrecision::F32, predicate: None,
             });
         }
 
@@ -283,19 +283,19 @@ pub(crate) fn lower_altup_correct(
                 let pred_v = prog.alloc_vreg(VRegKind::Vec, ctx.session.width);
                 prog.emit(VmInstr::VecLoad {
                     dst: pred_v, base: input_ptr, offset: pred_off,
-                    width: ctx.session.width, dtype: QuantPrecision::F32,
+                    width: ctx.session.width, dtype: QuantPrecision::F32, predicate: None,
                 });
                 // Load gated chunk
                 let gated_v = prog.alloc_vreg(VRegKind::Vec, ctx.session.width);
                 prog.emit(VmInstr::VecLoad {
                     dst: gated_v, base: gated_ptr, offset: base_off.clone(),
-                    width: ctx.session.width, dtype: QuantPrecision::F32,
+                    width: ctx.session.width, dtype: QuantPrecision::F32, predicate: None,
                 });
                 // Load predictions[0] chunk
                 let pred0_v = prog.alloc_vreg(VRegKind::Vec, ctx.session.width);
                 prog.emit(VmInstr::VecLoad {
                     dst: pred0_v, base: input_ptr, offset: base_off,
-                    width: ctx.session.width, dtype: QuantPrecision::F32,
+                    width: ctx.session.width, dtype: QuantPrecision::F32, predicate: None,
                 });
                 // innovation = gated - predictions[0]
                 let innov = prog.alloc_vreg(VRegKind::Vec, ctx.session.width);
@@ -321,7 +321,7 @@ pub(crate) fn lower_altup_correct(
                 );
                 prog.emit(VmInstr::VecStore {
                     base: output_ptr, offset: out_off, src: result,
-                    width: ctx.session.width, dtype: QuantPrecision::F32,
+                    width: ctx.session.width, dtype: QuantPrecision::F32, predicate: None,
                 });
             }
         }
@@ -369,11 +369,11 @@ pub(crate) fn lower_altup_inject(
             let data = prog.alloc_vreg(VRegKind::Vec, ctx.session.width);
             prog.emit(VmInstr::VecLoad {
                 dst: data, base: input_ptr, offset: off_expr.clone(),
-                width: ctx.session.width, dtype: QuantPrecision::F32,
+                width: ctx.session.width, dtype: QuantPrecision::F32, predicate: None,
             });
             prog.emit(VmInstr::VecStore {
                 base: output_ptr, offset: off_expr, src: data,
-                width: ctx.session.width, dtype: QuantPrecision::F32,
+                width: ctx.session.width, dtype: QuantPrecision::F32, predicate: None,
             });
         }
 
@@ -388,7 +388,7 @@ pub(crate) fn lower_altup_inject(
                 let norm_v = prog.alloc_vreg(VRegKind::Vec, ctx.session.width);
                 prog.emit(VmInstr::VecLoad {
                     dst: norm_v, base: norm_ptr, offset: norm_off,
-                    width: ctx.session.width, dtype: QuantPrecision::F32,
+                    width: ctx.session.width, dtype: QuantPrecision::F32, predicate: None,
                 });
                 let out_off = OffsetExpr::Add(
                     Box::new(OffsetExpr::LoopOffset(seq_off)),
@@ -397,7 +397,7 @@ pub(crate) fn lower_altup_inject(
                 let out_v = prog.alloc_vreg(VRegKind::Vec, ctx.session.width);
                 prog.emit(VmInstr::VecLoad {
                     dst: out_v, base: output_ptr, offset: out_off.clone(),
-                    width: ctx.session.width, dtype: QuantPrecision::F32,
+                    width: ctx.session.width, dtype: QuantPrecision::F32, predicate: None,
                 });
                 let sum = prog.alloc_vreg(VRegKind::Vec, ctx.session.width);
                 prog.emit(VmInstr::VecBinOp {
@@ -406,7 +406,7 @@ pub(crate) fn lower_altup_inject(
                 });
                 prog.emit(VmInstr::VecStore {
                     base: output_ptr, offset: out_off, src: sum,
-                    width: ctx.session.width, dtype: QuantPrecision::F32,
+                    width: ctx.session.width, dtype: QuantPrecision::F32, predicate: None,
                 });
             }
         }
@@ -464,7 +464,7 @@ pub(crate) fn lower_scale_const(
                 let data = prog.alloc_vreg(VRegKind::Vec, ctx.session.width);
                 prog.emit(VmInstr::VecLoad {
                     dst: data, base: input_ptr, offset: off_expr.clone(),
-                    width: ctx.session.width, dtype: QuantPrecision::F32,
+                    width: ctx.session.width, dtype: QuantPrecision::F32, predicate: None,
                 });
                 let scaled = prog.alloc_vreg(VRegKind::Vec, ctx.session.width);
                 prog.emit(VmInstr::VecBinOp {
@@ -473,7 +473,7 @@ pub(crate) fn lower_scale_const(
                 });
                 prog.emit(VmInstr::VecStore {
                     base: output_ptr, offset: off_expr, src: scaled,
-                    width: ctx.session.width, dtype: QuantPrecision::F32,
+                    width: ctx.session.width, dtype: QuantPrecision::F32, predicate: None,
                 });
             }
             Ok(())
@@ -486,7 +486,7 @@ pub(crate) fn lower_scale_const(
             let data = prog.alloc_vreg(VRegKind::Vec, ctx.session.width);
             prog.emit(VmInstr::VecLoad {
                 dst: data, base: input_ptr, offset: off_expr.clone(),
-                width: ctx.session.width, dtype: QuantPrecision::F32,
+                width: ctx.session.width, dtype: QuantPrecision::F32, predicate: None,
             });
             let scaled = prog.alloc_vreg(VRegKind::Vec, ctx.session.width);
             prog.emit(VmInstr::VecBinOp {
@@ -495,7 +495,7 @@ pub(crate) fn lower_scale_const(
             });
             prog.emit(VmInstr::VecStore {
                 base: output_ptr, offset: off_expr, src: scaled,
-                width: ctx.session.width, dtype: QuantPrecision::F32,
+                width: ctx.session.width, dtype: QuantPrecision::F32, predicate: None,
             });
         }
         Ok(())
@@ -531,14 +531,14 @@ fn emit_altup_copy_loop(
                 base: input_ptr,
                 offset: offset_expr.clone(),
                 width: ctx.session.width,
-                dtype: QuantPrecision::F32,
+                dtype: QuantPrecision::F32, predicate: None,
             });
             prog.emit(VmInstr::VecStore {
                 base: output_ptr,
                 offset: offset_expr,
                 src: data,
                 width: ctx.session.width,
-                dtype: QuantPrecision::F32,
+                dtype: QuantPrecision::F32, predicate: None,
             });
         }
         Ok(())
@@ -1081,7 +1081,7 @@ mod tests {
             base,
             offset: OffsetExpr::Const(0),
             width: SimdWidth::W256,
-            dtype: QuantPrecision::F32,
+            dtype: QuantPrecision::F32, predicate: None,
         });
 
         // Act
@@ -1785,7 +1785,7 @@ mod tests {
         prog.emit(VmInstr::VecLoad {
             dst: vec_dst, base: vec_base,
             offset: OffsetExpr::Const(0), width: SimdWidth::W256,
-            dtype: QuantPrecision::F32,
+            dtype: QuantPrecision::F32, predicate: None,
         });
 
         // Act
@@ -1869,7 +1869,7 @@ mod tests {
         prog.emit(VmInstr::VecLoad {
             dst: VRegId(99), base,
             offset: OffsetExpr::Const(0), width: SimdWidth::W256,
-            dtype: QuantPrecision::F32,
+            dtype: QuantPrecision::F32, predicate: None,
         });
         // Late declare (should have been before the VecLoad)
         prog.emit(VmInstr::DeclareVReg { id: VRegId(99), kind: VRegKind::Vec, width: SimdWidth::W256 });
@@ -1900,7 +1900,7 @@ mod tests {
         prog.emit(VmInstr::VecLoad {
             dst, base: vec_a,
             offset: OffsetExpr::Const(0), width: SimdWidth::W256,
-            dtype: QuantPrecision::F32,
+            dtype: QuantPrecision::F32, predicate: None,
         });
 
         // Act
@@ -1999,12 +1999,12 @@ mod tests {
         prog.emit(VmInstr::VecLoad {
             dst, base,
             offset: OffsetExpr::Const(0), width: SimdWidth::W256,
-            dtype: QuantPrecision::F32,
+            dtype: QuantPrecision::F32, predicate: None,
         });
         prog.emit(VmInstr::VecStore {
             base: out_base, src: dst,
             offset: OffsetExpr::Const(0), width: SimdWidth::W256,
-            dtype: QuantPrecision::F32,
+            dtype: QuantPrecision::F32, predicate: None,
         });
 
         // Act
@@ -2109,7 +2109,7 @@ mod tests {
                 let v2 = inner2.alloc_vreg(VRegKind::Vec, SimdWidth::W256);
                 inner2.emit(VmInstr::VecStore {
                     base: v2, src: v2, offset: OffsetExpr::Const(0),
-                    width: SimdWidth::W256, dtype: QuantPrecision::F32,
+                    width: SimdWidth::W256, dtype: QuantPrecision::F32, predicate: None,
                 });
                 Ok(())
             });
@@ -2246,7 +2246,7 @@ mod tests {
             let v = prog_alloc_vec(p);
             p.emit(VmInstr::VecStore {
                 base: v, src: v, offset: OffsetExpr::Const(0),
-                width: SimdWidth::W256, dtype: QuantPrecision::F32,
+                width: SimdWidth::W256, dtype: QuantPrecision::F32, predicate: None,
             });
         });
 
@@ -2293,7 +2293,7 @@ mod tests {
         let vec_load = VmInstr::VecLoad {
             dst: VRegId(2), base: VRegId(0),
             offset: OffsetExpr::Const(0), width: SimdWidth::W256,
-            dtype: QuantPrecision::F32,
+            dtype: QuantPrecision::F32, predicate: None,
         };
 
         // Act & Assert
@@ -2334,7 +2334,7 @@ mod tests {
                 base, src,
                 offset: OffsetExpr::Const(0),
                 width: SimdWidth::W256,
-                dtype: QuantPrecision::F32,
+                dtype: QuantPrecision::F32, predicate: None,
             });
         });
 
@@ -2419,7 +2419,7 @@ mod tests {
             VmInstr::VecLoad {
                 dst: VRegId(0), base: VRegId(1),
                 offset: OffsetExpr::Const(0), width: SimdWidth::W256,
-                dtype: QuantPrecision::F32,
+                dtype: QuantPrecision::F32, predicate: None,
             },
             VmInstr::Fma {
                 dst: VRegId(0), acc: VRegId(1), a: VRegId(2), b: VRegId(3),
@@ -2483,7 +2483,7 @@ mod tests {
             let v = prog_alloc_vec(p);
             p.emit(VmInstr::VecStore {
                 base: v, src: v, offset: OffsetExpr::Const(0),
-                width: SimdWidth::W256, dtype: QuantPrecision::F32,
+                width: SimdWidth::W256, dtype: QuantPrecision::F32, predicate: None,
             });
         });
 
@@ -2504,14 +2504,14 @@ mod tests {
             let v = prog_alloc_vec(p);
             p.emit(VmInstr::VecLoad {
                 dst: v, base: v, offset: OffsetExpr::Const(0),
-                width: SimdWidth::W256, dtype: QuantPrecision::F32,
+                width: SimdWidth::W256, dtype: QuantPrecision::F32, predicate: None,
             });
         });
         prog.emit_loop(BoundExpr::Const(8), 64, |p, _ctr, _off| {
             let v = prog_alloc_vec(p);
             p.emit(VmInstr::VecStore {
                 base: v, src: v, offset: OffsetExpr::Const(0),
-                width: SimdWidth::W256, dtype: QuantPrecision::F32,
+                width: SimdWidth::W256, dtype: QuantPrecision::F32, predicate: None,
             });
         });
 

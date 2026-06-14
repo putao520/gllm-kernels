@@ -971,19 +971,19 @@ pub(crate) fn emit_elementwise_inline(
                 prog.emit_loop(BoundExpr::Const(feature_vecs), step_bytes, |prog, _ctr, col_off| {
                     prog.emit(VmInstr::VecLoad {
                         dst: acc, base: row_input, offset: OffsetExpr::LoopOffset(col_off), width,
-                        dtype,
+                        dtype, predicate: None,
                     });
                     if let Some(s) = sec {
                         prog.emit(VmInstr::VecLoad {
                             dst: s, base: row_weight, offset: OffsetExpr::LoopOffset(col_off), width,
-                            dtype,
+                            dtype, predicate: None,
                         });
                     }
                     lower::lower_trace_body_compat(prog, body, acc, sec, width)
                         .expect("lower_trace_body: OpTrace invariant violation");
                     prog.emit(VmInstr::VecStore {
                         base: row_output, offset: OffsetExpr::LoopOffset(col_off), src: acc, width,
-                        dtype,
+                        dtype, predicate: None,
                     });
                 });
             }
@@ -1002,19 +1002,19 @@ pub(crate) fn emit_elementwise_inline(
                     let col_off_const = tail_base_bytes + t * elem;
                     prog.emit(VmInstr::VecLoad {
                         dst: s_acc, base: row_input, offset: OffsetExpr::Const(col_off_const), width: s_width,
-                        dtype,
+                        dtype, predicate: None,
                     });
                     if let Some(s) = s_sec {
                         prog.emit(VmInstr::VecLoad {
                             dst: s, base: row_weight, offset: OffsetExpr::Const(col_off_const), width: s_width,
-                            dtype,
+                            dtype, predicate: None,
                         });
                     }
                     lower::lower_trace_body_compat(prog, body, s_acc, s_sec, s_width)
                         .expect("lower_trace_body: OpTrace invariant violation (scalar tail)");
                     prog.emit(VmInstr::VecStore {
                         base: row_output, offset: OffsetExpr::Const(col_off_const), src: s_acc, width: s_width,
-                        dtype,
+                        dtype, predicate: None,
                     });
                 }
             }
@@ -1027,20 +1027,20 @@ pub(crate) fn emit_elementwise_inline(
                 prog.emit(VmInstr::VecLoad {
                     dst: acc, base: input_ptr,
                     offset: OffsetExpr::LoopOffset(byte_off), width,
-                    dtype,
+                    dtype, predicate: None,
                 });
                 if let Some(s) = sec {
                     prog.emit(VmInstr::VecLoad {
                         dst: s, base: weight_ptr,
                         offset: OffsetExpr::LoopOffset(byte_off), width,
-                        dtype,
+                        dtype, predicate: None,
                     });
                 }
                 lower::lower_trace_body_compat(prog, body, acc, sec, width)
                     .expect("lower_trace_body: OpTrace invariant violation");
                 prog.emit(VmInstr::VecStore {
                     base: output_ptr, offset: OffsetExpr::LoopOffset(byte_off), src: acc, width,
-                    dtype,
+                    dtype, predicate: None,
                 });
             });
         }
@@ -1057,13 +1057,13 @@ pub(crate) fn emit_elementwise_inline(
                 prog.emit(VmInstr::VecLoad {
                     dst: s_acc, base: input_ptr,
                     offset: OffsetExpr::Const(col_off_const), width: s_width,
-                    dtype,
+                    dtype, predicate: None,
                 });
                 if let Some(s) = s_sec {
                     prog.emit(VmInstr::VecLoad {
                         dst: s, base: weight_ptr,
                         offset: OffsetExpr::Const(col_off_const), width: s_width,
-                        dtype,
+                        dtype, predicate: None,
                     });
                 }
                 lower::lower_trace_body_compat(prog, body, s_acc, s_sec, s_width)
@@ -1071,7 +1071,7 @@ pub(crate) fn emit_elementwise_inline(
                 prog.emit(VmInstr::VecStore {
                     base: output_ptr, offset: OffsetExpr::Const(col_off_const),
                     src: s_acc, width: s_width,
-                    dtype,
+                    dtype, predicate: None,
                 });
             }
         }

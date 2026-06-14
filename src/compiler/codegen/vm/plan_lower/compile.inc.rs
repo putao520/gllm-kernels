@@ -795,7 +795,7 @@ pub(crate) fn try_dispatch_reduction(
                 });
                 prog.emit(VmInstr::VecLoad {
                     dst: tmp, base: row_base, offset: OffsetExpr::LoopOffset(col_off), width,
-                    dtype: ctx.dtype,
+                    dtype: ctx.dtype, predicate: None,
                 });
                 if combine_is_simple_add {
                     // Simple Add: Accumulate handles acc += tmp directly
@@ -814,7 +814,7 @@ pub(crate) fn try_dispatch_reduction(
 
             prog.emit(VmInstr::VecStore {
                 base: output_ptr, offset: OffsetExpr::LoopOffset(col_off), src: acc, width,
-                dtype: ctx.dtype,
+                dtype: ctx.dtype, predicate: None,
             });
         });
     }

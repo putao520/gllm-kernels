@@ -41,10 +41,10 @@ fn emit_bias_add(
             let byte_off = vj * lanes * elem;
             let b_data = prog.alloc_vreg(VRegKind::Vec, width);
             let c_data = prog.alloc_vreg(VRegKind::Vec, width);
-            prog.emit(VmInstr::VecLoad { dst: b_data, base: bias_ptr, offset: OffsetExpr::Const(byte_off), width, dtype });
-            prog.emit(VmInstr::VecLoad { dst: c_data, base: row_ptr, offset: OffsetExpr::Const(byte_off), width, dtype });
+            prog.emit(VmInstr::VecLoad { dst: b_data, base: bias_ptr, offset: OffsetExpr::Const(byte_off), width, dtype , predicate: None });
+            prog.emit(VmInstr::VecLoad { dst: c_data, base: row_ptr, offset: OffsetExpr::Const(byte_off), width, dtype , predicate: None });
             prog.emit(VmInstr::VecBinOp { dst: c_data, a: c_data, b: b_data, op: VecOp::Add, dtype });
-            prog.emit(VmInstr::VecStore { base: row_ptr, offset: OffsetExpr::Const(byte_off), src: c_data, width, dtype });
+            prog.emit(VmInstr::VecStore { base: row_ptr, offset: OffsetExpr::Const(byte_off), src: c_data, width, dtype , predicate: None });
         }
         if n_tail > 0 {
             let tail_base = n_vec * lanes * elem;
@@ -52,10 +52,10 @@ fn emit_bias_add(
                 let byte_off = tail_base + jj * elem;
                 let b_s = prog.alloc_vreg(VRegKind::Vec, SimdWidth::Scalar);
                 let c_s = prog.alloc_vreg(VRegKind::Vec, SimdWidth::Scalar);
-                prog.emit(VmInstr::VecLoad { dst: b_s, base: bias_ptr, offset: OffsetExpr::Const(byte_off), width: SimdWidth::Scalar, dtype });
-                prog.emit(VmInstr::VecLoad { dst: c_s, base: row_ptr, offset: OffsetExpr::Const(byte_off), width: SimdWidth::Scalar, dtype });
+                prog.emit(VmInstr::VecLoad { dst: b_s, base: bias_ptr, offset: OffsetExpr::Const(byte_off), width: SimdWidth::Scalar, dtype , predicate: None });
+                prog.emit(VmInstr::VecLoad { dst: c_s, base: row_ptr, offset: OffsetExpr::Const(byte_off), width: SimdWidth::Scalar, dtype , predicate: None });
                 prog.emit(VmInstr::VecBinOp { dst: c_s, a: c_s, b: b_s, op: VecOp::Add, dtype });
-                prog.emit(VmInstr::VecStore { base: row_ptr, offset: OffsetExpr::Const(byte_off), src: c_s, width: SimdWidth::Scalar, dtype });
+                prog.emit(VmInstr::VecStore { base: row_ptr, offset: OffsetExpr::Const(byte_off), src: c_s, width: SimdWidth::Scalar, dtype , predicate: None });
             }
         }
     });

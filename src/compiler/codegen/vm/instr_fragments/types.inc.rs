@@ -441,6 +441,65 @@ impl GprBranchAction {
     }
 }
 
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+// §Predicate + MemEffect (FAT-OPCODE-ARCHITECTURE-V2 §3 — VmInstr 自描述)
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+/// 内存指令条件谓词 (REQ-VR Phase 8)。
+///
+/// 复合 VmInstr (MemCopy/VecLoad/VecStore/GatherLoad/ScatterStore) 内化
+/// 条件谓词，使每条内存指令自描述执行条件。
+/// - None: 无条件执行（默认）
+/// - Some(cond): 仅当条件成立时执行（x86: TEST+JZ skip; ARM: CBZ skip）
+///
+/// 替代旧"前置 GprCondAction + 内存指令"模式，简化 lowering 路径。
+#[derive(Debug, Clone)]
+pub struct Predicate(pub GprCondition);
+
+impl Predicate {
+    pub fn new(cond: GprCondition) -> Self {
+        Self(cond)
+    }
+
+    pub fn inner(&self) -> &GprCondition {
+        &self.0
+    }
+
+    pub fn remap<F: Fn(VRegId) -> VRegId>(&self, f: F) -> Self {
+        Self(self.0.clone().remap(f))
+    }
+
+    pub fn vregs(&self) -> Vec<VRegId> {
+        self.0.vregs()
+    }
+}
+
+/// 内存效应类型 (REQ-VR Phase 8)。
+///
+/// 描述内存指令对内存的访问模式，用于：
+/// 1. 寄存器分配的内存依赖分析
+/// 2. 指令调度的重排序边界
+/// 3. alias analysis（多指针别名推理）
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MemEffect {
+    /// 纯读操作（如 GatherLoad）
+    Read,
+    /// 纯写操作（如 ScatterStore）
+    Write,
+    /// 读写操作（如 MemCopy 既是读 src 又是写 dst）
+    ReadWrite,
+}
+
+impl MemEffect {
+    pub fn reads(self) -> bool {
+        matches!(self, MemEffect::Read | MemEffect::ReadWrite)
+    }
+
+    pub fn writes(self) -> bool {
+        matches!(self, MemEffect::Write | MemEffect::ReadWrite)
+    }
+}
+
 /// Dot-product 输入 dtype (REQ-VR-002)。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DotDtype {

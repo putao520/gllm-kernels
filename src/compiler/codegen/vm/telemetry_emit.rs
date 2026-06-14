@@ -31,7 +31,7 @@ pub(crate) fn emit_gemm_row_stats_telemetry(
     // Helper: build body, run auto_lower, store result at offset
     let hreduce_store = |prog: &mut VmProgram, body: &[TraceOp], result_idx: usize, offset: usize| -> Result<(), CompilerError> {
         let slots = super::auto_select::auto_lower_trace_raw(prog, body, &[acc], width, QuantPrecision::F32)?;
-        prog.emit(VmInstr::VecStore { base: telemetry_ptr, offset: OffsetExpr::Const(offset), src: slots[result_idx], width: SimdWidth::Scalar, dtype });
+        prog.emit(VmInstr::VecStore { base: telemetry_ptr, offset: OffsetExpr::Const(offset), src: slots[result_idx], width: SimdWidth::Scalar, dtype , predicate: None });
         Ok(())
     };
     // L1 norm: abs(acc) → HReduce(Sum)
@@ -122,7 +122,7 @@ pub(crate) fn emit_rmsnorm_channel_scale_telemetry(
         prog.emit(VmInstr::VecLoad {
             dst: input_val, base: input_ptr,
             offset: OffsetExpr::LoopOffset(byte_off), width,
-            dtype,
+            dtype, predicate: None,
         });
         super::auto_select::auto_lower_trace_into(
             prog, &ch_scale_body, &[input_val, running_max], running_max, width, QuantPrecision::F32,
@@ -136,7 +136,7 @@ pub(crate) fn emit_rmsnorm_channel_scale_telemetry(
         offset: OffsetExpr::Const(0),
         src: running_max,
         width,
-        dtype,
+        dtype, predicate: None,
     });
 
     Ok(())
@@ -237,7 +237,7 @@ pub(crate) fn emit_silu_dead_neuron_telemetry(
         prog.emit(VmInstr::LoadPtr { dst: scan_base, src: PtrExpr::VRegPlusVReg(input_ptr, row_off) });
         if feature_vecs > 0 {
             prog.emit_loop(BoundExpr::Const(feature_vecs), step_bytes, |prog, _ctr, col_off| {
-                prog.emit(VmInstr::VecLoad { dst: input_val, base: scan_base, offset: OffsetExpr::LoopOffset(col_off), width, dtype });
+                prog.emit(VmInstr::VecLoad { dst: input_val, base: scan_base, offset: OffsetExpr::LoopOffset(col_off), width, dtype , predicate: None });
                 super::auto_select::auto_lower_trace_into(
                     prog, &dead_detect_body, &[threshold, input_val, ones, dead_count], dead_count, width, QuantPrecision::F32,
                 ).expect("dead neuron detect auto_lower failed");
@@ -259,7 +259,7 @@ pub(crate) fn emit_silu_dead_neuron_telemetry(
         offset: OffsetExpr::Const(crate::compiler::graph::telemetry_offsets::SILU_DEAD_NEURON_COUNT),
         src: dead_count_scalar,
         width: SimdWidth::Scalar,
-        dtype,
+        dtype, predicate: None,
     });
 
     Ok(())
@@ -365,11 +365,11 @@ pub(crate) fn emit_residual_with_telemetry(
 
                 prog.emit(VmInstr::VecLoad {
                     dst: a_vec, base: row_in, offset: OffsetExpr::LoopOffset(col_off), width,
-                    dtype,
+                    dtype, predicate: None,
                 });
                 prog.emit(VmInstr::VecLoad {
                     dst: b_vec, base: row_out, offset: OffsetExpr::LoopOffset(col_off), width,
-                    dtype,
+                    dtype, predicate: None,
                 });
 
                 // Residual add: sum = a + b (via auto_select)
@@ -383,7 +383,7 @@ pub(crate) fn emit_residual_with_telemetry(
                 ).expect("emit_residual_with_telemetry: residual add auto_lower_trace_into");
                 prog.emit(VmInstr::VecStore {
                     base: row_res, offset: OffsetExpr::LoopOffset(col_off), src: sum_vec, width,
-                    dtype,
+                    dtype, predicate: None,
                 });
 
                 // §13.11 telemetry accumulation (in-register, no extra loads, via auto_select)
@@ -433,11 +433,11 @@ pub(crate) fn emit_residual_with_telemetry(
                 );
                 prog.emit(VmInstr::VecLoad {
                     dst: s_a, base: row_in, offset: off.clone(), width: s_width,
-                    dtype,
+                    dtype, predicate: None,
                 });
                 prog.emit(VmInstr::VecLoad {
                     dst: s_b, base: row_out, offset: off.clone(), width: s_width,
-                    dtype,
+                    dtype, predicate: None,
                 });
                 // Tail residual add: s_sum = s_a + s_b (via auto_select)
                 super::auto_select::auto_lower_trace_into(
@@ -450,7 +450,7 @@ pub(crate) fn emit_residual_with_telemetry(
                 ).expect("emit_residual_with_telemetry: tail residual add auto_lower_trace_into");
                 prog.emit(VmInstr::VecStore {
                     base: row_res, offset: off, src: s_sum, width: s_width,
-                    dtype,
+                    dtype, predicate: None,
                 });
 
                 // §13.11 telemetry for tail elements (via auto_select)
@@ -557,7 +557,7 @@ pub(crate) fn emit_residual_with_telemetry(
             offset: OffsetExpr::Const(telemetry_offsets::RESIDUAL_DELTA_OFFSET),
             src: delta,
             width: SimdWidth::Scalar,
-            dtype,
+            dtype, predicate: None,
         });
 
         // cosine = dot / (norm_in * norm_out) (with epsilon guard on denominator)
@@ -599,7 +599,7 @@ pub(crate) fn emit_residual_with_telemetry(
             offset: OffsetExpr::Const(telemetry_offsets::COSINE_SIMILARITY_OFFSET),
             src: cosine,
             width: SimdWidth::Scalar,
-            dtype,
+            dtype, predicate: None,
         });
     }
 

@@ -167,7 +167,7 @@ pub(crate) fn emit_normlike_one_group(
     prog.emit(VmInstr::Broadcast { dst: acc, src: ScalarExpr::Const(0.0), width, dtype });
     if vec_count > 0 {
         prog.emit_loop(BoundExpr::Const(vec_count), step_bytes, |prog, _counter, byte_off| {
-            prog.emit(VmInstr::VecLoad { dst: temp, base: row_input, offset: OffsetExpr::LoopOffset(byte_off), width, dtype });
+            prog.emit(VmInstr::VecLoad { dst: temp, base: row_input, offset: OffsetExpr::LoopOffset(byte_off), width, dtype , predicate: None });
             auto_select::auto_lower_trace(prog, reduce, &[temp, acc], width, dtype).expect("normlike reduce");
             prog.emit(VmInstr::Accumulate { acc, src: temp });
         });
@@ -175,7 +175,7 @@ pub(crate) fn emit_normlike_one_group(
     if tail > 0 {
         let s_tmp = prog.alloc_vreg(VRegKind::Vec, s1);
         for t in 0..tail {
-            prog.emit(VmInstr::VecLoad { dst: s_tmp, base: row_input, offset: OffsetExpr::Const(tail_off + t * elem), width: s1, dtype });
+            prog.emit(VmInstr::VecLoad { dst: s_tmp, base: row_input, offset: OffsetExpr::Const(tail_off + t * elem), width: s1, dtype , predicate: None });
             auto_select::auto_lower_trace(prog, reduce, &[s_tmp, acc], s1, dtype).expect("normlike reduce tail");
             prog.emit(VmInstr::Accumulate { acc, src: s_tmp });
         }
@@ -194,30 +194,30 @@ pub(crate) fn emit_normlike_one_group(
     prog.emit(VmInstr::Broadcast { dst: scale, src: ScalarExpr::ExtractLane0(acc), width, dtype });
     if vec_count > 0 {
         prog.emit_loop(BoundExpr::Const(vec_count), step_bytes, |prog, _counter, byte_off| {
-            prog.emit(VmInstr::VecLoad { dst: temp, base: row_input, offset: OffsetExpr::LoopOffset(byte_off), width, dtype });
+            prog.emit(VmInstr::VecLoad { dst: temp, base: row_input, offset: OffsetExpr::LoopOffset(byte_off), width, dtype , predicate: None });
             if has_weight {
                 let w = prog.alloc_vreg(VRegKind::Vec, width);
-                prog.emit(VmInstr::VecLoad { dst: w, base: weight_ptr, offset: OffsetExpr::LoopOffset(byte_off), width, dtype });
+                prog.emit(VmInstr::VecLoad { dst: w, base: weight_ptr, offset: OffsetExpr::LoopOffset(byte_off), width, dtype , predicate: None });
                 auto_select::auto_lower_trace(prog, transform, &[temp, scale, w], width, dtype).expect("normlike transform");
             } else {
                 auto_select::auto_lower_trace(prog, transform, &[temp, scale], width, dtype).expect("normlike transform");
             }
-            prog.emit(VmInstr::VecStore { base: row_output, offset: OffsetExpr::LoopOffset(byte_off), src: temp, width, dtype });
+            prog.emit(VmInstr::VecStore { base: row_output, offset: OffsetExpr::LoopOffset(byte_off), src: temp, width, dtype , predicate: None });
         });
     }
     if tail > 0 {
         let s_temp = prog.alloc_vreg(VRegKind::Vec, s1);
         for t in 0..tail {
             let off = tail_off + t * elem;
-            prog.emit(VmInstr::VecLoad { dst: s_temp, base: row_input, offset: OffsetExpr::Const(off), width: s1, dtype });
+            prog.emit(VmInstr::VecLoad { dst: s_temp, base: row_input, offset: OffsetExpr::Const(off), width: s1, dtype , predicate: None });
             if has_weight {
                 let s_w = prog.alloc_vreg(VRegKind::Vec, s1);
-                prog.emit(VmInstr::VecLoad { dst: s_w, base: weight_ptr, offset: OffsetExpr::Const(off), width: s1, dtype });
+                prog.emit(VmInstr::VecLoad { dst: s_w, base: weight_ptr, offset: OffsetExpr::Const(off), width: s1, dtype , predicate: None });
                 auto_select::auto_lower_trace(prog, transform, &[s_temp, scale, s_w], s1, dtype).expect("normlike transform tail");
             } else {
                 auto_select::auto_lower_trace(prog, transform, &[s_temp, scale], s1, dtype).expect("normlike transform tail");
             }
-            prog.emit(VmInstr::VecStore { base: row_output, offset: OffsetExpr::Const(off), src: s_temp, width: s1, dtype });
+            prog.emit(VmInstr::VecStore { base: row_output, offset: OffsetExpr::Const(off), src: s_temp, width: s1, dtype , predicate: None });
         }
     }
 }
@@ -300,7 +300,7 @@ pub(crate) fn emit_layernorm_auto(
         prog.emit(VmInstr::Broadcast { dst: acc_sq, src: ScalarExpr::Const(0.0), width, dtype });
         if vec_count > 0 {
             prog.emit_loop(BoundExpr::Const(vec_count), step_bytes, |prog, _ctr, byte_off| {
-                prog.emit(VmInstr::VecLoad { dst: temp, base: row_input, offset: OffsetExpr::LoopOffset(byte_off), width, dtype });
+                prog.emit(VmInstr::VecLoad { dst: temp, base: row_input, offset: OffsetExpr::LoopOffset(byte_off), width, dtype , predicate: None });
                 prog.emit(VmInstr::Accumulate { acc: acc_sum, src: temp });
                 auto_select::auto_lower_trace(prog, &mul_sq_body, &[temp], width, dtype).expect("layernorm sq");
                 prog.emit(VmInstr::Accumulate { acc: acc_sq, src: temp });
@@ -308,7 +308,7 @@ pub(crate) fn emit_layernorm_auto(
         }
         if tail > 0 {
             for t in 0..tail {
-                prog.emit(VmInstr::VecLoad { dst: temp, base: row_input, offset: OffsetExpr::Const(tail_off + t * elem), width: s1, dtype });
+                prog.emit(VmInstr::VecLoad { dst: temp, base: row_input, offset: OffsetExpr::Const(tail_off + t * elem), width: s1, dtype , predicate: None });
                 prog.emit(VmInstr::Accumulate { acc: acc_sum, src: temp });
                 auto_select::auto_lower_trace(prog, &mul_sq_body, &[temp], s1, dtype).expect("layernorm sq tail");
                 prog.emit(VmInstr::Accumulate { acc: acc_sq, src: temp });
@@ -331,27 +331,27 @@ pub(crate) fn emit_layernorm_auto(
         // Phase 3: Transform (x - mean) * inv_std * weight + bias
         if vec_count > 0 {
             prog.emit_loop(BoundExpr::Const(vec_count), step_bytes, |prog, _ctr, byte_off| {
-                prog.emit(VmInstr::VecLoad { dst: temp, base: row_input, offset: OffsetExpr::LoopOffset(byte_off), width, dtype });
+                prog.emit(VmInstr::VecLoad { dst: temp, base: row_input, offset: OffsetExpr::LoopOffset(byte_off), width, dtype , predicate: None });
                 let w = prog.alloc_vreg(VRegKind::Vec, width);
-                prog.emit(VmInstr::VecLoad { dst: w, base: weight_ptr, offset: OffsetExpr::LoopOffset(byte_off), width, dtype });
+                prog.emit(VmInstr::VecLoad { dst: w, base: weight_ptr, offset: OffsetExpr::LoopOffset(byte_off), width, dtype , predicate: None });
                 let b = prog.alloc_vreg(VRegKind::Vec, width);
                 prog.emit(VmInstr::VecLoad { dst: b, base: weight_ptr,
                     offset: OffsetExpr::Add(Box::new(OffsetExpr::Const(bias_offset)), Box::new(OffsetExpr::LoopOffset(byte_off))),
-                    width, dtype });
+                    width, dtype , predicate: None });
                 auto_select::auto_lower_trace(prog, &transform_body, &[temp, scale, mean_bc, w, b], width, dtype).expect("layernorm transform");
-                prog.emit(VmInstr::VecStore { base: row_output, offset: OffsetExpr::LoopOffset(byte_off), src: temp, width, dtype });
+                prog.emit(VmInstr::VecStore { base: row_output, offset: OffsetExpr::LoopOffset(byte_off), src: temp, width, dtype , predicate: None });
             });
         }
         if tail > 0 {
             for t in 0..tail {
                 let off = tail_off + t * elem;
-                prog.emit(VmInstr::VecLoad { dst: temp, base: row_input, offset: OffsetExpr::Const(off), width: s1, dtype });
+                prog.emit(VmInstr::VecLoad { dst: temp, base: row_input, offset: OffsetExpr::Const(off), width: s1, dtype , predicate: None });
                 let s_w = prog.alloc_vreg(VRegKind::Vec, s1);
-                prog.emit(VmInstr::VecLoad { dst: s_w, base: weight_ptr, offset: OffsetExpr::Const(off), width: s1, dtype });
+                prog.emit(VmInstr::VecLoad { dst: s_w, base: weight_ptr, offset: OffsetExpr::Const(off), width: s1, dtype , predicate: None });
                 let s_b = prog.alloc_vreg(VRegKind::Vec, s1);
-                prog.emit(VmInstr::VecLoad { dst: s_b, base: weight_ptr, offset: OffsetExpr::Const(bias_offset + off), width: s1, dtype });
+                prog.emit(VmInstr::VecLoad { dst: s_b, base: weight_ptr, offset: OffsetExpr::Const(bias_offset + off), width: s1, dtype , predicate: None });
                 auto_select::auto_lower_trace(prog, &transform_body, &[temp, scale, mean_bc, s_w, s_b], s1, dtype).expect("layernorm transform tail");
-                prog.emit(VmInstr::VecStore { base: row_output, offset: OffsetExpr::Const(off), src: temp, width: s1, dtype });
+                prog.emit(VmInstr::VecStore { base: row_output, offset: OffsetExpr::Const(off), src: temp, width: s1, dtype , predicate: None });
             }
         }
     });
@@ -400,7 +400,7 @@ pub(crate) fn emit_softmax_inline(
     prog.emit(VmInstr::Broadcast { dst: max_val, src: ScalarExpr::Const(f32::NEG_INFINITY), width, dtype });
     if vec_count > 0 {
         prog.emit_loop(BoundExpr::Const(vec_count), step, |prog, _ctr, byte_off| {
-            prog.emit(VmInstr::VecLoad { dst: tmp, base: input_ptr, offset: OffsetExpr::LoopOffset(byte_off), width, dtype });
+            prog.emit(VmInstr::VecLoad { dst: tmp, base: input_ptr, offset: OffsetExpr::LoopOffset(byte_off), width, dtype , predicate: None });
             auto_select::auto_lower_trace(prog, &combine_max, &[tmp, max_val], width, dtype).expect("softmax max");
             prog.emit(VmInstr::Accumulate { acc: max_val, src: tmp });
         });
@@ -410,7 +410,7 @@ pub(crate) fn emit_softmax_inline(
         let s_max = prog.alloc_vreg(VRegKind::Vec, s1);
         prog.emit(VmInstr::Broadcast { dst: s_max, src: ScalarExpr::ExtractLane0(max_val), width: s1, dtype });
         for t in 0..tail {
-            prog.emit(VmInstr::VecLoad { dst: s_tmp, base: input_ptr, offset: OffsetExpr::Const(tail_off + t * elem), width: s1, dtype });
+            prog.emit(VmInstr::VecLoad { dst: s_tmp, base: input_ptr, offset: OffsetExpr::Const(tail_off + t * elem), width: s1, dtype , predicate: None });
             auto_select::auto_lower_trace(prog, &combine_max, &[s_tmp, s_max], s1, dtype).expect("softmax max tail");
             prog.emit(VmInstr::Accumulate { acc: max_val, src: s_tmp });
         }
@@ -425,9 +425,9 @@ pub(crate) fn emit_softmax_inline(
     prog.emit(VmInstr::Broadcast { dst: sum_val, src: ScalarExpr::Const(0.0), width, dtype });
     if vec_count > 0 {
         prog.emit_loop(BoundExpr::Const(vec_count), step, |prog, _ctr, byte_off| {
-            prog.emit(VmInstr::VecLoad { dst: tmp, base: input_ptr, offset: OffsetExpr::LoopOffset(byte_off), width, dtype });
+            prog.emit(VmInstr::VecLoad { dst: tmp, base: input_ptr, offset: OffsetExpr::LoopOffset(byte_off), width, dtype , predicate: None });
             auto_select::auto_lower_trace(prog, &exp_sub, &[tmp, max_val], width, dtype).expect("softmax exp");
-            prog.emit(VmInstr::VecStore { base: output_ptr, offset: OffsetExpr::LoopOffset(byte_off), src: tmp, width, dtype });
+            prog.emit(VmInstr::VecStore { base: output_ptr, offset: OffsetExpr::LoopOffset(byte_off), src: tmp, width, dtype , predicate: None });
             auto_select::auto_lower_trace(prog, &combine_sum, &[sum_val, tmp], width, dtype).expect("softmax sum");
             prog.emit(VmInstr::Accumulate { acc: sum_val, src: tmp });
         });
@@ -440,9 +440,9 @@ pub(crate) fn emit_softmax_inline(
         prog.emit(VmInstr::Broadcast { dst: s_sum, src: ScalarExpr::ExtractLane0(sum_val), width: s1, dtype });
         for t in 0..tail {
             let off = tail_off + t * elem;
-            prog.emit(VmInstr::VecLoad { dst: s_tmp, base: input_ptr, offset: OffsetExpr::Const(off), width: s1, dtype });
+            prog.emit(VmInstr::VecLoad { dst: s_tmp, base: input_ptr, offset: OffsetExpr::Const(off), width: s1, dtype , predicate: None });
             auto_select::auto_lower_trace_into(prog, &exp_sub, &[s_tmp, s_max_bc], s_tmp, s1, dtype).expect("softmax tail exp");
-            prog.emit(VmInstr::VecStore { base: output_ptr, offset: OffsetExpr::Const(off), src: s_tmp, width: s1, dtype });
+            prog.emit(VmInstr::VecStore { base: output_ptr, offset: OffsetExpr::Const(off), src: s_tmp, width: s1, dtype , predicate: None });
             auto_select::auto_lower_trace_into(prog, &combine_sum, &[s_sum, s_tmp], s_sum, s1, dtype).expect("softmax tail sum");
         }
         prog.emit(VmInstr::Accumulate { acc: sum_val, src: s_sum });
@@ -456,9 +456,9 @@ pub(crate) fn emit_softmax_inline(
     auto_select::auto_lower_trace_into(prog, &[TraceOp::Input(0), TraceOp::Recip(ValueId(0))], &[sum_val], sum_val, width, dtype).expect("softmax recip");
     if vec_count > 0 {
         prog.emit_loop(BoundExpr::Const(vec_count), step, |prog, _ctr, byte_off| {
-            prog.emit(VmInstr::VecLoad { dst: tmp, base: output_ptr, offset: OffsetExpr::LoopOffset(byte_off), width, dtype });
+            prog.emit(VmInstr::VecLoad { dst: tmp, base: output_ptr, offset: OffsetExpr::LoopOffset(byte_off), width, dtype , predicate: None });
             auto_select::auto_lower_trace(prog, &normalize, &[tmp, sum_val], width, dtype).expect("softmax normalize");
-            prog.emit(VmInstr::VecStore { base: output_ptr, offset: OffsetExpr::LoopOffset(byte_off), src: tmp, width, dtype });
+            prog.emit(VmInstr::VecStore { base: output_ptr, offset: OffsetExpr::LoopOffset(byte_off), src: tmp, width, dtype , predicate: None });
         });
     }
     if tail > 0 {
@@ -467,9 +467,9 @@ pub(crate) fn emit_softmax_inline(
         prog.emit(VmInstr::Broadcast { dst: s_inv, src: ScalarExpr::ExtractLane0(sum_val), width: s1, dtype });
         for t in 0..tail {
             let off = tail_off + t * elem;
-            prog.emit(VmInstr::VecLoad { dst: s_tmp, base: output_ptr, offset: OffsetExpr::Const(off), width: s1, dtype });
+            prog.emit(VmInstr::VecLoad { dst: s_tmp, base: output_ptr, offset: OffsetExpr::Const(off), width: s1, dtype , predicate: None });
             auto_select::auto_lower_trace_into(prog, &normalize, &[s_tmp, s_inv], s_tmp, s1, dtype).expect("softmax tail normalize");
-            prog.emit(VmInstr::VecStore { base: output_ptr, offset: OffsetExpr::Const(off), src: s_tmp, width: s1, dtype });
+            prog.emit(VmInstr::VecStore { base: output_ptr, offset: OffsetExpr::Const(off), src: s_tmp, width: s1, dtype , predicate: None });
         }
     }
 
@@ -498,7 +498,7 @@ pub(crate) fn emit_softmax_telemetry(
         offset: OffsetExpr::Const(telemetry_offsets::SOFTMAX_MAX_OFFSET),
         src: max_val,
         width: SimdWidth::Scalar,
-        dtype,
+        dtype, predicate: None,
     });
 
     // sharpness = 1/sum
@@ -513,7 +513,7 @@ pub(crate) fn emit_softmax_telemetry(
         offset: OffsetExpr::Const(telemetry_offsets::SOFTMAX_SHARPNESS_OFFSET),
         src: sharpness,
         width: SimdWidth::Scalar,
-        dtype,
+        dtype, predicate: None,
     });
 
     // is_sink = (sharpness > SOFTMAX_SINK_THRESHOLD) ? 1.0 : 0.0
@@ -539,7 +539,7 @@ pub(crate) fn emit_softmax_telemetry(
         offset: OffsetExpr::Const(telemetry_offsets::IS_ATTENTION_SINK_OFFSET),
         src: clamped,
         width: SimdWidth::Scalar,
-        dtype,
+        dtype, predicate: None,
     });
 }
 
@@ -2231,10 +2231,10 @@ mod tests {
 
         // Assert: should contain VecLoad/VecStore with dtype=BF16
         let has_bf16_load = prog.instrs.iter().any(|i| matches!(
-            i, VmInstr::VecLoad { dtype: QuantPrecision::BF16, .. }
+            i, VmInstr::VecLoad { dtype: QuantPrecision::BF16, predicate: None, .. }
         ));
         let has_bf16_store = prog.instrs.iter().any(|i| matches!(
-            i, VmInstr::VecStore { dtype: QuantPrecision::BF16, .. }
+            i, VmInstr::VecStore { dtype: QuantPrecision::BF16, predicate: None, .. }
         ));
         assert!(has_bf16_load, "Should contain VecLoad with BF16 dtype");
         assert!(has_bf16_store, "Should contain VecStore with BF16 dtype");
@@ -2258,10 +2258,10 @@ mod tests {
 
         // Assert: should contain VecLoad/VecStore with dtype=F32
         let has_f32_load = prog.instrs.iter().any(|i| matches!(
-            i, VmInstr::VecLoad { dtype: QuantPrecision::F32, .. }
+            i, VmInstr::VecLoad { dtype: QuantPrecision::F32, predicate: None, .. }
         ));
         let has_f32_store = prog.instrs.iter().any(|i| matches!(
-            i, VmInstr::VecStore { dtype: QuantPrecision::F32, .. }
+            i, VmInstr::VecStore { dtype: QuantPrecision::F32, predicate: None, .. }
         ));
         assert!(has_f32_load, "Should contain VecLoad with F32 dtype");
         assert!(has_f32_store, "Should contain VecStore with F32 dtype");

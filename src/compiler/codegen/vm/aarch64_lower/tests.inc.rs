@@ -565,7 +565,7 @@ mod tests {
             base: VRegId(1),
             offset: OffsetExpr::LoopOffset(VRegId(2)),
             width: SimdWidth::W128,
-            dtype: QuantPrecision::F32,
+            dtype: QuantPrecision::F32, predicate: None,
         }, &alloc);
 
         // Assert: Should produce ADD + LD1 sequence
@@ -741,7 +741,7 @@ mod tests {
             base: VRegId(1),
             offset: OffsetExpr::Const(64),
             width: SimdWidth::W128,
-            dtype: QuantPrecision::F32,
+            dtype: QuantPrecision::F32, predicate: None,
         }, &alloc);
 
         // Assert: Should produce ADD + LD1 (2 instructions = 8 bytes)
@@ -776,7 +776,7 @@ mod tests {
             src: VRegId(0),
             offset: OffsetExpr::Const(0),
             width: SimdWidth::W128,
-            dtype: QuantPrecision::F32,
+            dtype: QuantPrecision::F32, predicate: None,
         }, &alloc);
 
         // Assert: Should produce exactly ST1 (4 bytes)

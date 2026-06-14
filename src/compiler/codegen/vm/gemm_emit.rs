@@ -254,7 +254,7 @@ pub(crate) fn emit_gemm_blis_inline(
                                         )),
                                         Box::new(OffsetExpr::Const(b_off)),
                                     ),
-                                    width, dtype,
+                                    width, dtype, predicate: None,
                                 });
                                 // Direct FMA: dst = acc + a * b (in-place accumulate)
                                 prog.emit(VmInstr::Fma {
@@ -285,7 +285,7 @@ pub(crate) fn emit_gemm_blis_inline(
                         };
                         prog.emit(VmInstr::VecStore {
                             base: c_ptr, offset: OffsetExpr::Const(c_off), src: store_src, width,
-                            dtype,
+                            dtype, predicate: None,
                         });
                     }
                 }
@@ -358,7 +358,7 @@ pub(crate) fn emit_gemm_gpu_tiled_inline(
                                 prog.emit(VmInstr::VecLoad {
                                     dst: a_vec, base: a_ptr,
                                     offset: OffsetExpr::Const(a_row_off),
-                                    width, dtype,
+                                    width, dtype, predicate: None,
                                 });
 
                                 for col in 0..wj {
@@ -367,7 +367,7 @@ pub(crate) fn emit_gemm_gpu_tiled_inline(
                                     prog.emit(VmInstr::VecLoad {
                                         dst: b_vec, base: b_ptr,
                                         offset: OffsetExpr::Const(b_col_off),
-                                        width, dtype,
+                                        width, dtype, predicate: None,
                                     });
 
                                     // FMA: acc[row * wj + col] += a_vec * b_vec
@@ -406,7 +406,7 @@ pub(crate) fn emit_gemm_gpu_tiled_inline(
                             offset: OffsetExpr::Const(c_off),
                             src: store_src,
                             width,
-                            dtype,
+                            dtype, predicate: None,
                         });
                     }
                 }
@@ -617,7 +617,7 @@ pub(crate) fn emit_gemm_gpu_pipelined(
                             offset: OffsetExpr::Const(c_off),
                             src: store_src,
                             width,
-                            dtype,
+                            dtype, predicate: None,
                         });
                     }
                 }
@@ -702,7 +702,7 @@ pub(crate) fn emit_async_load_tile(
                 base: _a_ptr,
                 offset: OffsetExpr::Const(global_offset),
                 width,
-                dtype,
+                dtype, predicate: None,
             });
             prog.emit(VmInstr::SharedMemAsyncStore {
                 name: smem_a_name.to_string(),
@@ -723,7 +723,7 @@ pub(crate) fn emit_async_load_tile(
                 base: _b_ptr,
                 offset: OffsetExpr::Const(global_offset),
                 width,
-                dtype,
+                dtype, predicate: None,
             });
             prog.emit(VmInstr::SharedMemAsyncStore {
                 name: smem_b_name.to_string(),
@@ -914,7 +914,7 @@ pub(crate) fn emit_gemm_trans_b_inline(
                             )),
                             Box::new(OffsetExpr::LoopOffset(p_off)),
                         ),
-                        width, dtype,
+                        width, dtype, predicate: None,
                     });
                     // Load B[j][p*lanes .. (p+1)*lanes]
                     // B row offset = j * k * elem = j_off * k (since j_off is in bytes, j_off / elem * k * elem = j_off * k)
@@ -927,7 +927,7 @@ pub(crate) fn emit_gemm_trans_b_inline(
                             Box::new(OffsetExpr::Mul(Box::new(OffsetExpr::LoopOffset(j_off)), k)),
                             Box::new(OffsetExpr::LoopOffset(p_off)),
                         ),
-                        width, dtype,
+                        width, dtype, predicate: None,
                     });
                     // Direct FMA: dst = acc + a * b (in-place accumulate)
                     prog.emit(VmInstr::Fma { dst: acc_vec, acc: acc_vec, a: a_vec, b: b_vec, dtype });
@@ -1000,7 +1000,7 @@ pub(crate) fn emit_gemm_trans_b_inline(
                     Box::new(OffsetExpr::Mul(Box::new(m_off.clone()), c_row_stride)),
                     Box::new(OffsetExpr::LoopOffset(j_off)),
                 ),
-                src: store_src, width: s_width, dtype,
+                src: store_src, width: s_width, dtype, predicate: None,
             });
         });
     };
@@ -1105,7 +1105,7 @@ pub(crate) fn emit_gemm_inline_with_epilogue(
                     prog.emit(VmInstr::VecLoad {
                         dst: b_vec, base: b_ptr,
                         offset: b_offset_expr(k_ctr, k_off, j_off, b_row_stride, elem, n, k, trans_b, lanes),
-                        width, dtype,
+                        width, dtype, predicate: None,
                     });
                     // Direct FMA: dst = acc + a * b (in-place accumulate)
                     prog.emit(VmInstr::Fma { dst: acc, acc, a: a_broadcast, b: b_vec, dtype });
@@ -1125,7 +1125,7 @@ pub(crate) fn emit_gemm_inline_with_epilogue(
                         Box::new(OffsetExpr::Mul(Box::new(OffsetExpr::LoopOffset(m_off)), c_row_stride)),
                         Box::new(OffsetExpr::LoopOffset(j_off)),
                     ),
-                    src: store_src, width, dtype,
+                    src: store_src, width, dtype, predicate: None,
                 });
             });
         }
@@ -1156,7 +1156,7 @@ pub(crate) fn emit_gemm_inline_with_epilogue(
                                 Box::new(OffsetExpr::Const(j_off_const)),
                             )
                         },
-                        width: s_width, dtype,
+                        width: s_width, dtype, predicate: None,
                     });
                     // Direct FMA: dst = s_acc + s_a * s_b (in-place accumulate)
                     prog.emit(VmInstr::Fma { dst: s_acc, acc: s_acc, a: s_a, b: s_b, dtype });
@@ -1177,7 +1177,7 @@ pub(crate) fn emit_gemm_inline_with_epilogue(
                         Box::new(OffsetExpr::Mul(Box::new(OffsetExpr::LoopOffset(m_off)), c_row_stride)),
                         Box::new(OffsetExpr::Const(j_off_const)),
                     ),
-                    src: s_store_src, width: s_width, dtype,
+                    src: s_store_src, width: s_width, dtype, predicate: None,
                 });
             }
         }
@@ -1196,7 +1196,7 @@ pub(crate) fn emit_gemm_inline_with_epilogue(
             dst: row_stats_vec, base: c_ptr,
             offset: OffsetExpr::Const(last_row_offset),
             width,
-            dtype,
+            dtype, predicate: None,
         });
         emit_gemm_row_stats_telemetry(prog, row_stats_vec, width, sym_map, dtype)?;
     }

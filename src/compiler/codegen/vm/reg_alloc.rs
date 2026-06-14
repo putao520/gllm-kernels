@@ -1580,7 +1580,7 @@ mod tests {
         let mut prog = VmProgram::new();
         let input_ptr = prog.alloc_vreg(VRegKind::Ptr, SimdWidth::Scalar);
         let vec_reg = prog.alloc_vreg(VRegKind::Vec, SimdWidth::W256);
-        prog.emit(VmInstr::VecLoad { dst: vec_reg, base: input_ptr, offset: OffsetExpr::Const(0), width: SimdWidth::W256, dtype: QuantPrecision::F32, });
+        prog.emit(VmInstr::VecLoad { dst: vec_reg, base: input_ptr, offset: OffsetExpr::Const(0), width: SimdWidth::W256, dtype: QuantPrecision::F32, predicate: None, });
         let _slots = auto_select::auto_lower_trace_raw(&mut prog, &body, &[vec_reg], SimdWidth::W256, QuantPrecision::F32).unwrap();
         let profile = test_profile();
         let alloc = RegAllocator::new(&profile).allocate(&prog).unwrap();
@@ -1601,10 +1601,10 @@ mod tests {
         let b_v = prog.alloc_vreg(VRegKind::Vec, SimdWidth::W256);
         prog.emit(VmInstr::Broadcast { dst: acc, src: ScalarExpr::Const(0.0), width: SimdWidth::W256, dtype: QuantPrecision::F32, });
         prog.emit(VmInstr::Broadcast { dst: a_bc, src: ScalarExpr::MemLoad(a_ptr, OffsetExpr::Const(0)), width: SimdWidth::W256, dtype: QuantPrecision::F32, });
-        prog.emit(VmInstr::VecLoad { dst: b_v, base: b_ptr, offset: OffsetExpr::Const(0), width: SimdWidth::W256, dtype: QuantPrecision::F32, });
+        prog.emit(VmInstr::VecLoad { dst: b_v, base: b_ptr, offset: OffsetExpr::Const(0), width: SimdWidth::W256, dtype: QuantPrecision::F32, predicate: None, });
         let fma_body = [TraceOp::Input(0), TraceOp::Input(1), TraceOp::Fma(ValueId(0), ValueId(0), ValueId(1))];
         let slots = auto_select::auto_lower_trace_raw(&mut prog, &fma_body, &[acc, a_bc, b_v], SimdWidth::W256, QuantPrecision::F32).unwrap();
-        prog.emit(VmInstr::VecStore { base: c_ptr, src: slots[0], offset: OffsetExpr::Const(0), width: SimdWidth::W256, dtype: QuantPrecision::F32, });
+        prog.emit(VmInstr::VecStore { base: c_ptr, src: slots[0], offset: OffsetExpr::Const(0), width: SimdWidth::W256, dtype: QuantPrecision::F32, predicate: None, });
         let profile = test_profile();
         let alloc = RegAllocator::new(&profile).allocate(&prog).unwrap();
 
@@ -1630,7 +1630,7 @@ mod tests {
         let mut prog = VmProgram::new();
         let input_ptr = prog.alloc_vreg(VRegKind::Ptr, SimdWidth::Scalar);
         let vec_reg = prog.alloc_vreg(VRegKind::Vec, SimdWidth::W256);
-        prog.emit(VmInstr::VecLoad { dst: vec_reg, base: input_ptr, offset: OffsetExpr::Const(0), width: SimdWidth::W256, dtype: QuantPrecision::F32, });
+        prog.emit(VmInstr::VecLoad { dst: vec_reg, base: input_ptr, offset: OffsetExpr::Const(0), width: SimdWidth::W256, dtype: QuantPrecision::F32, predicate: None, });
         let _slots = auto_select::auto_lower_trace_raw(&mut prog, &body, &[vec_reg], SimdWidth::W256, QuantPrecision::F32).unwrap();
         let profile = test_profile();
         let alloc = RegAllocator::new(&profile).allocate(&prog).unwrap();
@@ -2065,11 +2065,11 @@ mod tests {
         let vec0 = prog.alloc_vreg(VRegKind::Vec, SimdWidth::W256);
         prog.emit(VmInstr::VecLoad {
             dst: vec0, base: ptr, offset: OffsetExpr::Const(0),
-            width: SimdWidth::W256, dtype: QuantPrecision::F32,
+            width: SimdWidth::W256, dtype: QuantPrecision::F32, predicate: None,
         });
         prog.emit(VmInstr::VecStore {
             base: ptr, src: vec0, offset: OffsetExpr::Const(16),
-            width: SimdWidth::W256, dtype: QuantPrecision::F32,
+            width: SimdWidth::W256, dtype: QuantPrecision::F32, predicate: None,
         });
         let intervals = RegAllocator::compute_intervals(&prog);
         let ptr_iv = intervals.iter().find(|iv| iv.vreg == ptr).unwrap();
@@ -2086,11 +2086,11 @@ mod tests {
         let vec0 = prog.alloc_vreg(VRegKind::Vec, SimdWidth::W256);
         prog.emit(VmInstr::VecLoad {
             dst: vec0, base: ptr, offset: OffsetExpr::Const(0),
-            width: SimdWidth::W256, dtype: QuantPrecision::F32,
+            width: SimdWidth::W256, dtype: QuantPrecision::F32, predicate: None,
         });
         prog.emit(VmInstr::VecStore {
             base: ptr, src: vec0, offset: OffsetExpr::Const(0),
-            width: SimdWidth::W256, dtype: QuantPrecision::F32,
+            width: SimdWidth::W256, dtype: QuantPrecision::F32, predicate: None,
         });
         let counter = prog.alloc_vreg(VRegKind::Counter, SimdWidth::Scalar);
         let byte_off = prog.alloc_vreg(VRegKind::ByteOffset, SimdWidth::Scalar);
@@ -2101,7 +2101,7 @@ mod tests {
         });
         prog.emit(VmInstr::VecLoad {
             dst: vec1, base: ptr, offset: OffsetExpr::LoopOffset(byte_off),
-            width: SimdWidth::W256, dtype: QuantPrecision::F32,
+            width: SimdWidth::W256, dtype: QuantPrecision::F32, predicate: None,
         });
         prog.emit(VmInstr::LoopEnd);
         prog.emit(VmInstr::Comment("after loop".to_string()));
@@ -2398,14 +2398,14 @@ mod tests {
         let vec1 = prog.alloc_vreg(VRegKind::Vec, SimdWidth::W256);
         prog.emit(VmInstr::VecLoad {
             dst: vec0, base: ptr, offset: OffsetExpr::Const(0),
-            width: SimdWidth::W256, dtype: QuantPrecision::F32,
+            width: SimdWidth::W256, dtype: QuantPrecision::F32, predicate: None,
         });
         prog.emit(VmInstr::VecUnaryOp {
             dst: vec1, a: vec0, op: VecUnaryOp::Neg,
         });
         prog.emit(VmInstr::VecStore {
             base: ptr, src: vec1, offset: OffsetExpr::Const(0),
-            width: SimdWidth::W256, dtype: QuantPrecision::F32,
+            width: SimdWidth::W256, dtype: QuantPrecision::F32, predicate: None,
         });
         let alloc = RegAllocator::new(&profile).allocate(&prog).unwrap();
         assert!(alloc.get(ptr).is_some());
@@ -2422,11 +2422,11 @@ mod tests {
         let vec1 = prog.alloc_vreg(VRegKind::Vec, SimdWidth::W256);
         prog.emit(VmInstr::VecLoad {
             dst: vec0, base: ptr, offset: OffsetExpr::Const(0),
-            width: SimdWidth::W256, dtype: QuantPrecision::F32,
+            width: SimdWidth::W256, dtype: QuantPrecision::F32, predicate: None,
         });
         prog.emit(VmInstr::VecLoad {
             dst: vec1, base: ptr, offset: OffsetExpr::Const(32),
-            width: SimdWidth::W256, dtype: QuantPrecision::F32,
+            width: SimdWidth::W256, dtype: QuantPrecision::F32, predicate: None,
         });
         prog.emit(VmInstr::VecBinOp {
             dst: vec0, a: vec0, b: vec1, op: VecOp::Add, dtype: QuantPrecision::F32,
@@ -2447,11 +2447,11 @@ mod tests {
         let vec0 = prog.alloc_vreg(VRegKind::Vec, SimdWidth::W256);
         prog.emit(VmInstr::VecLoad {
             dst: vec0, base: ptr, offset: OffsetExpr::Const(0),
-            width: SimdWidth::W256, dtype: QuantPrecision::F32,
+            width: SimdWidth::W256, dtype: QuantPrecision::F32, predicate: None,
         });
         prog.emit(VmInstr::VecStore {
             base: ptr, src: vec0, offset: OffsetExpr::Const(0),
-            width: SimdWidth::W256, dtype: QuantPrecision::F32,
+            width: SimdWidth::W256, dtype: QuantPrecision::F32, predicate: None,
         });
         let alloc = RegAllocator::new(&profile).allocate(&prog).unwrap();
         assert!(alloc.get_gpr(ptr).is_some());
@@ -2466,7 +2466,7 @@ mod tests {
         let vec0 = prog.alloc_vreg(VRegKind::Vec, SimdWidth::W256);
         prog.emit(VmInstr::VecLoad {
             dst: vec0, base: ptr, offset: OffsetExpr::Const(0),
-            width: SimdWidth::W256, dtype: QuantPrecision::F32,
+            width: SimdWidth::W256, dtype: QuantPrecision::F32, predicate: None,
         });
         let alloc = RegAllocator::new(&gpu_profile).allocate(&prog).unwrap();
         assert!(alloc.mapping.is_empty());
@@ -2489,11 +2489,11 @@ mod tests {
         let vec0 = prog.alloc_vreg(VRegKind::Vec, SimdWidth::W256);
         prog.emit(VmInstr::VecLoad {
             dst: vec0, base: ptr, offset: OffsetExpr::Const(0),
-            width: SimdWidth::W256, dtype: QuantPrecision::F32,
+            width: SimdWidth::W256, dtype: QuantPrecision::F32, predicate: None,
         });
         prog.emit(VmInstr::VecStore {
             base: ptr, src: vec0, offset: OffsetExpr::Const(0),
-            width: SimdWidth::W256, dtype: QuantPrecision::F32,
+            width: SimdWidth::W256, dtype: QuantPrecision::F32, predicate: None,
         });
         let mut mapping = HashMap::new();
         mapping.insert(vec0, PhysReg::Spilled(0));
@@ -2555,7 +2555,7 @@ mod tests {
     fn test_instr_brief_known_variants() {
         assert_eq!(RegAllocator::instr_brief(&VmInstr::VecLoad {
             dst: VRegId(0), base: VRegId(1), offset: OffsetExpr::Const(0),
-            width: SimdWidth::W256, dtype: QuantPrecision::F32,
+            width: SimdWidth::W256, dtype: QuantPrecision::F32, predicate: None,
         }), "VecLoad");
         assert_eq!(RegAllocator::instr_brief(&VmInstr::LoopEnd), "LoopEnd");
         assert_eq!(RegAllocator::instr_brief(&VmInstr::Fma {

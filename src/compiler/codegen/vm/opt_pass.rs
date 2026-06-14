@@ -314,9 +314,9 @@ fn substitute_loop_offset_in_instr(instr: &VmInstr, vreg: VRegId, value: usize) 
     };
     match instr {
         VmInstr::VecLoad { dst, base, ref offset, width, .. } =>
-            VmInstr::VecLoad { dst: *dst, base: *base, offset: sub(offset), width: *width, dtype: QuantPrecision::F32, },
+            VmInstr::VecLoad { dst: *dst, base: *base, offset: sub(offset), width: *width, dtype: QuantPrecision::F32, predicate: None, },
         VmInstr::VecStore { base, ref offset, src, width, .. } =>
-            VmInstr::VecStore { base: *base, offset: sub(offset), src: *src, width: *width, dtype: QuantPrecision::F32, },
+            VmInstr::VecStore { base: *base, offset: sub(offset), src: *src, width: *width, dtype: QuantPrecision::F32, predicate: None, },
         VmInstr::Broadcast { dst, ref src, width, .. } => {
             let new_src = match src {
                 ScalarExpr::MemLoad(base, ref off) => ScalarExpr::MemLoad(*base, sub(off)),
@@ -542,7 +542,7 @@ impl VmOptPass for EpilogueFusionPass {
                             // 1. 先插入 use 指令到 i+1 / i+2 (Declare 暂时还在末尾)
                             program.instrs.insert(i + 1, VmInstr::VecLoad {
                                 dst: reload, base, offset: offset.clone(), width: w,
-                                dtype: QuantPrecision::F32,
+                                dtype: QuantPrecision::F32, predicate: None,
                             });
                             program.instrs.insert(i + 2, VmInstr::HReduce {
                                 dst: stat, src: reload, op: ReduceOp::Max,
@@ -719,7 +719,7 @@ impl VmOptPass for ResidualBusPass {
                         offset: OffsetExpr::Const(0),
                         src,
                         width: SimdWidth::W256,
-                        dtype: QuantPrecision::F32,
+                        dtype: QuantPrecision::F32, predicate: None,
                     });
                     added += 2;
                 }
@@ -887,7 +887,7 @@ mod tests {
             dst: vec, base: ptr,
             offset: OffsetExpr::LoopOffset(off),
             width: SimdWidth::W256,
-            dtype: QuantPrecision::F32,
+            dtype: QuantPrecision::F32, predicate: None,
         });
         prog.emit(VmInstr::LoopEnd);
 
@@ -1088,7 +1088,7 @@ mod data_structure_tests {
         });
         prog.emit(VmInstr::VecStore {
             base: ptr, offset: OffsetExpr::Const(0), src: vec0,
-            width: SimdWidth::W256, dtype: QuantPrecision::F32,
+            width: SimdWidth::W256, dtype: QuantPrecision::F32, predicate: None,
         });
 
         let results = reg.run_all(&mut prog, &profile, hook.as_ref());
@@ -1170,17 +1170,17 @@ mod data_structure_tests {
         // But make src == dst to test non-matching
         prog.emit(VmInstr::VecStore {
             base: ptr, offset: OffsetExpr::Const(0), src: vec0,
-            width: SimdWidth::W256, dtype: QuantPrecision::F32,
+            width: SimdWidth::W256, dtype: QuantPrecision::F32, predicate: None,
         });
         // Load from same ptr into vec1 (different from store src vec0) → should forward
         prog.emit(VmInstr::VecLoad {
             dst: vec1, base: ptr, offset: OffsetExpr::Const(0),
-            width: SimdWidth::W256, dtype: QuantPrecision::F32,
+            width: SimdWidth::W256, dtype: QuantPrecision::F32, predicate: None,
         });
         // Now test a truly non-matching pair: Store vec2, then a non-Load instruction
         prog.emit(VmInstr::VecStore {
             base: ptr, offset: OffsetExpr::Const(64), src: vec2,
-            width: SimdWidth::W256, dtype: QuantPrecision::F32,
+            width: SimdWidth::W256, dtype: QuantPrecision::F32, predicate: None,
         });
         prog.emit(VmInstr::Broadcast {
             dst: vec0, src: ScalarExpr::Const(0.0),
@@ -1207,7 +1207,7 @@ mod data_structure_tests {
         // Use vec0 in a VecStore so it is referenced
         prog.emit(VmInstr::VecStore {
             base: ptr, offset: OffsetExpr::Const(0), src: vec0,
-            width: SimdWidth::W256, dtype: QuantPrecision::F32,
+            width: SimdWidth::W256, dtype: QuantPrecision::F32, predicate: None,
         });
 
         let (profile, hook) = make_hook();
@@ -1228,11 +1228,11 @@ mod data_structure_tests {
         // Create dead vreg (vec1 never used), plus store-load pair
         prog.emit(VmInstr::VecStore {
             base: ptr, offset: OffsetExpr::Const(0), src: vec0,
-            width: SimdWidth::W256, dtype: QuantPrecision::F32,
+            width: SimdWidth::W256, dtype: QuantPrecision::F32, predicate: None,
         });
         prog.emit(VmInstr::VecLoad {
             dst: vec1, base: ptr, offset: OffsetExpr::Const(0),
-            width: SimdWidth::W256, dtype: QuantPrecision::F32,
+            width: SimdWidth::W256, dtype: QuantPrecision::F32, predicate: None,
         });
 
         let (profile, hook) = make_hook();
@@ -1378,7 +1378,7 @@ mod data_structure_tests {
         });
         prog.emit(VmInstr::VecStore {
             base: ptr, offset: OffsetExpr::Const(0), src: vec0,
-            width: SimdWidth::W256, dtype: QuantPrecision::F32,
+            width: SimdWidth::W256, dtype: QuantPrecision::F32, predicate: None,
         });
         let before = prog.len();
 
@@ -1411,7 +1411,7 @@ mod data_structure_tests {
         });
         prog.emit(VmInstr::VecStore {
             base: ptr, offset: OffsetExpr::Const(0), src: vec0,
-            width: SimdWidth::W256, dtype: QuantPrecision::F32,
+            width: SimdWidth::W256, dtype: QuantPrecision::F32, predicate: None,
         });
         let before = prog.len();
 
@@ -1555,20 +1555,20 @@ mod data_structure_tests {
         // Pair 1: Store vec0 → Load vec1
         prog.emit(VmInstr::VecStore {
             base: ptr0, offset: OffsetExpr::Const(0), src: vec0,
-            width: SimdWidth::W256, dtype: QuantPrecision::F32,
+            width: SimdWidth::W256, dtype: QuantPrecision::F32, predicate: None,
         });
         prog.emit(VmInstr::VecLoad {
             dst: vec1, base: ptr0, offset: OffsetExpr::Const(0),
-            width: SimdWidth::W256, dtype: QuantPrecision::F32,
+            width: SimdWidth::W256, dtype: QuantPrecision::F32, predicate: None,
         });
         // Pair 2: Store vec2 → Load vec3
         prog.emit(VmInstr::VecStore {
             base: ptr1, offset: OffsetExpr::Const(0), src: vec2,
-            width: SimdWidth::W256, dtype: QuantPrecision::F32,
+            width: SimdWidth::W256, dtype: QuantPrecision::F32, predicate: None,
         });
         prog.emit(VmInstr::VecLoad {
             dst: vec3, base: ptr1, offset: OffsetExpr::Const(0),
-            width: SimdWidth::W256, dtype: QuantPrecision::F32,
+            width: SimdWidth::W256, dtype: QuantPrecision::F32, predicate: None,
         });
 
         // Act
@@ -1594,11 +1594,11 @@ mod data_structure_tests {
 
         prog.emit(VmInstr::VecStore {
             base: ptr, offset: OffsetExpr::Const(0), src: vec0,
-            width: SimdWidth::W256, dtype: QuantPrecision::F32,
+            width: SimdWidth::W256, dtype: QuantPrecision::F32, predicate: None,
         });
         prog.emit(VmInstr::VecLoad {
             dst: vec0, base: ptr, offset: OffsetExpr::Const(0),
-            width: SimdWidth::W256, dtype: QuantPrecision::F32,
+            width: SimdWidth::W256, dtype: QuantPrecision::F32, predicate: None,
         });
         let before = prog.len();
 
@@ -1726,7 +1726,7 @@ mod data_structure_tests {
         });
         prog.emit(VmInstr::VecStore {
             base: ptr, offset: OffsetExpr::Const(0), src: vec0,
-            width: SimdWidth::W256, dtype: QuantPrecision::F32,
+            width: SimdWidth::W256, dtype: QuantPrecision::F32, predicate: None,
         });
         let before = prog.len();
 
@@ -1754,7 +1754,7 @@ mod data_structure_tests {
 
         prog.emit(VmInstr::VecLoad {
             dst: vec0, base: ptr, offset: OffsetExpr::Const(0),
-            width: SimdWidth::W256, dtype: QuantPrecision::F32,
+            width: SimdWidth::W256, dtype: QuantPrecision::F32, predicate: None,
         });
         let before = prog.len();
 
@@ -1907,11 +1907,11 @@ mod data_structure_tests {
         let load = VmInstr::VecLoad {
             dst: vec0, base: ptr,
             offset: OffsetExpr::LoopOffset(off_vreg),
-            width: SimdWidth::W256, dtype: QuantPrecision::F32,
+            width: SimdWidth::W256, dtype: QuantPrecision::F32, predicate: None,
         };
         let store = VmInstr::VecStore {
             base: ptr, offset: OffsetExpr::LoopOffset(off_vreg),
-            src: vec0, width: SimdWidth::W256, dtype: QuantPrecision::F32,
+            src: vec0, width: SimdWidth::W256, dtype: QuantPrecision::F32, predicate: None,
         };
 
         // Act: substitute LoopOffset(off_vreg) → Const(64)
@@ -2022,7 +2022,7 @@ mod data_structure_tests {
         let load = VmInstr::VecLoad {
             dst: vec0, base: ptr,
             offset: OffsetExpr::LoopOffset(vreg_a),
-            width: SimdWidth::W256, dtype: QuantPrecision::F32,
+            width: SimdWidth::W256, dtype: QuantPrecision::F32, predicate: None,
         };
 
         // Act: substitute wrong vreg
@@ -2141,7 +2141,7 @@ mod data_structure_tests {
         });
         prog.emit(VmInstr::VecStore {
             base: ptr, offset: OffsetExpr::Const(0), src: vec0,
-            width: SimdWidth::W256, dtype: QuantPrecision::F32,
+            width: SimdWidth::W256, dtype: QuantPrecision::F32, predicate: None,
         });
         let before = prog.len();
 
@@ -2528,11 +2528,11 @@ mod data_structure_tests {
 
         prog.emit(VmInstr::VecStore {
             base: ptr, offset: OffsetExpr::Const(0), src: vec0,
-            width: SimdWidth::W256, dtype: QuantPrecision::F32,
+            width: SimdWidth::W256, dtype: QuantPrecision::F32, predicate: None,
         });
         prog.emit(VmInstr::VecLoad {
             dst: vec1, base: ptr, offset: OffsetExpr::Const(0),
-            width: SimdWidth::W256, dtype: QuantPrecision::F32,
+            width: SimdWidth::W256, dtype: QuantPrecision::F32, predicate: None,
         });
 
         // Act
@@ -2630,7 +2630,7 @@ mod data_structure_tests {
         });
         prog.emit(VmInstr::VecStore {
             base: ptr, offset: OffsetExpr::Const(0), src: vec0,
-            width: SimdWidth::W256, dtype: QuantPrecision::F32,
+            width: SimdWidth::W256, dtype: QuantPrecision::F32, predicate: None,
         });
 
         // Act

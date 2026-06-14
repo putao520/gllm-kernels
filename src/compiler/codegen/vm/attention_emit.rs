@@ -119,7 +119,7 @@ fn emit_tier_dispatch_k_load(
     let kivi3_check_patch = prog.instrs.len() - 1;
 
     // ── Default path: Direct VecLoad (FP16=0, FP8=1, or unknown) ──
-    prog.emit(VmInstr::VecLoad { dst, base: k_row, offset: d_off.clone(), width, dtype });
+    prog.emit(VmInstr::VecLoad { dst, base: k_row, offset: d_off.clone(), width, dtype , predicate: None });
     prog.emit(VmInstr::UnconditionalBranch { target_label: done_label });
 
     // ── Sparse path (tier == 4) ──
@@ -204,7 +204,7 @@ fn emit_tier_dispatch_v_load(
     let kivi3_check_patch = prog.instrs.len() - 1;
 
     // Default: Direct VecLoad
-    prog.emit(VmInstr::VecLoad { dst, base: v_row, offset: d_off.clone(), width, dtype });
+    prog.emit(VmInstr::VecLoad { dst, base: v_row, offset: d_off.clone(), width, dtype , predicate: None });
     prog.emit(VmInstr::UnconditionalBranch { target_label: done_label });
 
     // Sparse path
@@ -286,7 +286,7 @@ fn emit_sparse_masked_load(
                 action: GprBranchAction::Skip(0), // patched below
             });
             // Active path: load the channel data
-            prog.emit(VmInstr::VecLoad { dst, base, offset, width, dtype });
+            prog.emit(VmInstr::VecLoad { dst, base, offset, width, dtype , predicate: None });
             // Jump past the zero-fill to done_label
             let done_label = prog.alloc_label();
             prog.emit(VmInstr::UnconditionalBranch { target_label: done_label });
@@ -299,7 +299,7 @@ fn emit_sparse_masked_load(
             }
         }
         None => {
-            prog.emit(VmInstr::VecLoad { dst, base, offset, width, dtype });
+            prog.emit(VmInstr::VecLoad { dst, base, offset, width, dtype , predicate: None });
         }
     }
 }
@@ -442,7 +442,7 @@ fn emit_score_dot_cpu(
                 let d_off = d * vec_step;
                 let q_vec = prog.alloc_vreg(VRegKind::Vec, width);
                 let k_vec = prog.alloc_vreg(VRegKind::Vec, width);
-                prog.emit(VmInstr::VecLoad { dst: q_vec, base: q_row, offset: OffsetExpr::Const(d_off), width, dtype });
+                prog.emit(VmInstr::VecLoad { dst: q_vec, base: q_row, offset: OffsetExpr::Const(d_off), width, dtype , predicate: None });
                 emit_sparse_masked_load(
                     prog, k_vec, k_row, OffsetExpr::Const(d_off),
                     sparse_bitmap_val, d, width, dtype,
@@ -456,7 +456,7 @@ fn emit_score_dot_cpu(
                 let d_off = d * vec_step;
                 let q_vec = prog.alloc_vreg(VRegKind::Vec, width);
                 let k_vec = prog.alloc_vreg(VRegKind::Vec, width);
-                prog.emit(VmInstr::VecLoad { dst: q_vec, base: q_row, offset: OffsetExpr::Const(d_off), width, dtype });
+                prog.emit(VmInstr::VecLoad { dst: q_vec, base: q_row, offset: OffsetExpr::Const(d_off), width, dtype , predicate: None });
                 emit_tier_dispatch_k_load(
                     prog, k_vec, k_row, OffsetExpr::Const(d_off),
                     width, dtype, lanes, sparse_bitmap_val, d, ph,
@@ -468,7 +468,7 @@ fn emit_score_dot_cpu(
             prog.emit_loop(BoundExpr::Const(hd_vecs), vec_step, |prog, _d_ctr, d_off| {
                 let q_vec = prog.alloc_vreg(VRegKind::Vec, width);
                 let k_vec = prog.alloc_vreg(VRegKind::Vec, width);
-                prog.emit(VmInstr::VecLoad { dst: q_vec, base: q_row, offset: OffsetExpr::LoopOffset(d_off), width, dtype });
+                prog.emit(VmInstr::VecLoad { dst: q_vec, base: q_row, offset: OffsetExpr::LoopOffset(d_off), width, dtype , predicate: None });
                 match kv_load_mode {
                     KvLoadMode::Kivi4 | KvLoadMode::Kivi2 => {
                         let sc = prog.alloc_vreg(VRegKind::Ptr, SimdWidth::Scalar);
@@ -476,7 +476,7 @@ fn emit_score_dot_cpu(
                     }
                     KvLoadMode::Sparse => { unreachable!("Sparse handled above") }
                     KvLoadMode::Auto | KvLoadMode::Direct => {
-                        prog.emit(VmInstr::VecLoad { dst: k_vec, base: k_row, offset: OffsetExpr::LoopOffset(d_off), width, dtype });
+                        prog.emit(VmInstr::VecLoad { dst: k_vec, base: k_row, offset: OffsetExpr::LoopOffset(d_off), width, dtype , predicate: None });
                     }
                 }
                 super::auto_select::auto_lower_trace_into(prog, &dot_body, &[q_vec, k_vec, dot_acc], dot_acc, width, QuantPrecision::F32)
@@ -529,10 +529,10 @@ fn emit_v_accumulate_cpu(
             }
             KvLoadMode::Auto => {
                 // Auto without paged KV (no page header to read) → direct load
-                prog.emit(VmInstr::VecLoad { dst: v_vec, base: v_row, offset: OffsetExpr::Const(d_off), width, dtype });
+                prog.emit(VmInstr::VecLoad { dst: v_vec, base: v_row, offset: OffsetExpr::Const(d_off), width, dtype , predicate: None });
             }
             KvLoadMode::Direct => {
-                prog.emit(VmInstr::VecLoad { dst: v_vec, base: v_row, offset: OffsetExpr::Const(d_off), width, dtype });
+                prog.emit(VmInstr::VecLoad { dst: v_vec, base: v_row, offset: OffsetExpr::Const(d_off), width, dtype , predicate: None });
             }
         }
         super::auto_select::auto_lower_trace_into(
@@ -553,7 +553,7 @@ fn emit_normalize_store(
     for d in 0..hd_vecs {
         let norm_slots = super::auto_select::auto_lower_trace_raw(prog, &norm_body, &[o_acc[d], running_sum], width, QuantPrecision::F32)
             .expect("MHA norm auto_lower failed");
-        prog.emit(VmInstr::VecStore { base: o_row, offset: OffsetExpr::Const(d * vec_step), src: norm_slots[2], width, dtype });
+        prog.emit(VmInstr::VecStore { base: o_row, offset: OffsetExpr::Const(d * vec_step), src: norm_slots[2], width, dtype , predicate: None });
     }
 }
 
@@ -606,10 +606,10 @@ fn emit_smem_stage_row(
             }
             KvLoadMode::Auto => {
                 // Auto without paged KV (no page header to read) → direct load
-                prog.emit(VmInstr::VecLoad { dst: k_vec, base: k_row, offset: OffsetExpr::Const(d_off), width, dtype });
+                prog.emit(VmInstr::VecLoad { dst: k_vec, base: k_row, offset: OffsetExpr::Const(d_off), width, dtype , predicate: None });
             }
             KvLoadMode::Direct => {
-                prog.emit(VmInstr::VecLoad { dst: k_vec, base: k_row, offset: OffsetExpr::Const(d_off), width, dtype });
+                prog.emit(VmInstr::VecLoad { dst: k_vec, base: k_row, offset: OffsetExpr::Const(d_off), width, dtype , predicate: None });
             }
         }
         if use_async {
@@ -638,10 +638,10 @@ fn emit_smem_stage_row(
             }
             KvLoadMode::Auto => {
                 // Auto without paged KV (no page header to read) → direct load
-                prog.emit(VmInstr::VecLoad { dst: v_vec, base: v_row, offset: OffsetExpr::Const(d_off), width, dtype });
+                prog.emit(VmInstr::VecLoad { dst: v_vec, base: v_row, offset: OffsetExpr::Const(d_off), width, dtype , predicate: None });
             }
             KvLoadMode::Direct => {
-                prog.emit(VmInstr::VecLoad { dst: v_vec, base: v_row, offset: OffsetExpr::Const(d_off), width, dtype });
+                prog.emit(VmInstr::VecLoad { dst: v_vec, base: v_row, offset: OffsetExpr::Const(d_off), width, dtype , predicate: None });
             }
         }
         if use_async {
@@ -858,7 +858,7 @@ pub(crate) fn emit_tiled_attention_inline(
                 let global_sum = prog.alloc_vreg(VRegKind::Vec, width);
                 prog.emit(VmInstr::WarpReduce { op: ReduceOp::Sum, src: corrected_sum, dst: global_sum, width });
                 for &d in &o_acc { prog.emit(VmInstr::VecBinOp { dst: d, a: d, b: global_sum, op: VecOp::Div, dtype }); }
-                for d in 0..hd_vecs { prog.emit(VmInstr::VecStore { base: o_row, offset: OffsetExpr::Const(d * vec_step), src: o_acc[d], width, dtype }); }
+                for d in 0..hd_vecs { prog.emit(VmInstr::VecStore { base: o_row, offset: OffsetExpr::Const(d * vec_step), src: o_acc[d], width, dtype , predicate: None }); }
 
             } else if use_gpu_flash {
                 // ═══ GPU FlashAttention: tiled + double buffer ═══
@@ -927,7 +927,7 @@ pub(crate) fn emit_tiled_attention_inline(
                             let dot_body = vec![TraceOp::Input(0), TraceOp::Input(1), TraceOp::Input(2), TraceOp::Fma(ValueId(0), ValueId(1), ValueId(2))];
                             prog.emit_loop(BoundExpr::Const(hd_vecs), vec_step, |prog, _d_ctr, d_off| {
                                 let (q_vec, k_vec) = (prog.alloc_vreg(VRegKind::Vec, width), prog.alloc_vreg(VRegKind::Vec, width));
-                                prog.emit(VmInstr::VecLoad { dst: q_vec, base: q_row, offset: OffsetExpr::LoopOffset(d_off), width, dtype });
+                                prog.emit(VmInstr::VecLoad { dst: q_vec, base: q_row, offset: OffsetExpr::LoopOffset(d_off), width, dtype , predicate: None });
                                 prog.emit(VmInstr::SharedMemLoad { dst: k_vec, name: smem_k.clone(), src_offset: smem_kv_off(read_buf, ki_inner_off, head_bytes, k_stride, d_off.0 as usize * vec_step / lanes * lanes * elem), width, dtype });
                                 super::auto_select::auto_lower_trace_into(prog, &dot_body, &[q_vec, k_vec, dot_acc], dot_acc, width, QuantPrecision::F32).expect("dot FMA failed");
                             });
@@ -4727,13 +4727,13 @@ mod tests {
 
         // Assert: VecLoad instructions should carry BF16 dtype
         let bf16_loads = prog.instrs.iter()
-            .filter(|i| matches!(i, VmInstr::VecLoad { dtype: QuantPrecision::BF16, .. }))
+            .filter(|i| matches!(i, VmInstr::VecLoad { dtype: QuantPrecision::BF16, predicate: None, .. }))
             .count();
         assert!(bf16_loads > 0, "BF16 mode should emit VecLoad with BF16 dtype, got {}", bf16_loads);
 
         // Assert: VecStore instructions should carry BF16 dtype
         let bf16_stores = prog.instrs.iter()
-            .filter(|i| matches!(i, VmInstr::VecStore { dtype: QuantPrecision::BF16, .. }))
+            .filter(|i| matches!(i, VmInstr::VecStore { dtype: QuantPrecision::BF16, predicate: None, .. }))
             .count();
         assert!(bf16_stores > 0, "BF16 mode should emit VecStore with BF16 dtype, got {}", bf16_stores);
     }
@@ -5047,7 +5047,7 @@ mod tests {
 
         // Assert: VecLoad for V should carry BF16 dtype
         let bf16_loads = added.iter()
-            .filter(|i| matches!(i, VmInstr::VecLoad { dtype: QuantPrecision::BF16, .. }))
+            .filter(|i| matches!(i, VmInstr::VecLoad { dtype: QuantPrecision::BF16, predicate: None, .. }))
             .count();
         assert!(bf16_loads > 0,
             "BF16 v_accumulate should emit VecLoad with BF16 dtype, got {}", bf16_loads);
@@ -5273,14 +5273,14 @@ mod tests {
 
         // Assert: VecStore should carry BF16 dtype
         let bf16_stores = added.iter()
-            .filter(|i| matches!(i, VmInstr::VecStore { dtype: QuantPrecision::BF16, .. }))
+            .filter(|i| matches!(i, VmInstr::VecStore { dtype: QuantPrecision::BF16, predicate: None, .. }))
             .count();
         assert!(bf16_stores > 0,
             "BF16 normalize_store should emit VecStore with BF16 dtype, got {}", bf16_stores);
 
         // Assert: no F32 VecStore should be emitted
         let f32_stores = added.iter()
-            .filter(|i| matches!(i, VmInstr::VecStore { dtype: QuantPrecision::F32, .. }))
+            .filter(|i| matches!(i, VmInstr::VecStore { dtype: QuantPrecision::F32, predicate: None, .. }))
             .count();
         assert_eq!(f32_stores, 0, "BF16 normalize_store should not emit F32 VecStore");
     }

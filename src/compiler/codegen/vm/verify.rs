@@ -1055,15 +1055,13 @@ fn verify_vreg_def_before_use(prog: &VmProgram) -> Result<(), CompilerError> {
 fn collect_src_vregs(instr: &VmInstr) -> Vec<VRegId> {
     match instr {
         VmInstr::VecLoad {
-            base, offset, ..
-        } => {
+            base, offset, .. } => {
             let mut v = vec![*base];
             v.extend(offset_vregs(offset));
             v
         }
         VmInstr::VecStore {
-            base, src, offset, ..
-        } => {
+            base, src, offset, .. } => {
             let mut v = vec![*base, *src];
             v.extend(offset_vregs(offset));
             v
@@ -1155,7 +1153,7 @@ fn collect_src_vregs(instr: &VmInstr) -> Vec<VRegId> {
             v
         }
         VmInstr::GprLoadImm { .. } => vec![],
-        VmInstr::MemCopy { dst: _, src, bytes: _ } => vec![*src],
+        VmInstr::MemCopy { dst: _, src, bytes: _, dtype: _, guard: _, effect: _ } => vec![*src],
         VmInstr::IndirectJump { index, targets: _ } => vec![*index],
         VmInstr::ConditionalExit {
             condition,
@@ -1662,8 +1660,8 @@ mod tests {
         let a = prog.alloc_vreg(VRegKind::Vec, SimdWidth::W256);
         let b = prog.alloc_vreg(VRegKind::Vec, SimdWidth::W256);
         let dst = prog.alloc_vreg(VRegKind::Vec, SimdWidth::W256);
-        prog.emit(VmInstr::VecLoad { dst: a, base: VRegId(0), offset: OffsetExpr::Const(0), width: SimdWidth::W256, dtype: QuantPrecision::F32, });
-        prog.emit(VmInstr::VecLoad { dst: b, base: VRegId(0), offset: OffsetExpr::Const(32), width: SimdWidth::W256, dtype: QuantPrecision::F32, });
+        prog.emit(VmInstr::VecLoad { dst: a, base: VRegId(0), offset: OffsetExpr::Const(0), width: SimdWidth::W256, dtype: QuantPrecision::F32, predicate: None, });
+        prog.emit(VmInstr::VecLoad { dst: b, base: VRegId(0), offset: OffsetExpr::Const(32), width: SimdWidth::W256, dtype: QuantPrecision::F32, predicate: None, });
         prog.emit(VmInstr::VecBinOp { dst, a, b, op: VecOp::Add, dtype: QuantPrecision::F32, });
         assert!(verify_vreg_def_before_use(&prog).is_ok());
     }
@@ -1674,7 +1672,7 @@ mod tests {
         let base = prog.alloc_vreg(VRegKind::Ptr, SimdWidth::Scalar);
         prog.emit_loop(BoundExpr::Const(4), 32, |prog, _, byte_off| {
             let dst = prog.alloc_vreg(VRegKind::Vec, SimdWidth::W256);
-            prog.emit(VmInstr::VecLoad { dst, base, offset: OffsetExpr::LoopOffset(byte_off), width: SimdWidth::W256, dtype: QuantPrecision::F32, });
+            prog.emit(VmInstr::VecLoad { dst, base, offset: OffsetExpr::LoopOffset(byte_off), width: SimdWidth::W256, dtype: QuantPrecision::F32, predicate: None, });
         });
         assert!(verify_loop_offset_scope(&prog).is_ok());
     }
@@ -1736,7 +1734,7 @@ mod tests {
         // ptr defined outside loop, used inside — LoopInvariant
         prog.emit_loop(BoundExpr::Const(4), 32, |prog, _, _| {
             let dst = prog.alloc_vreg(VRegKind::Vec, SimdWidth::W256);
-            prog.emit(VmInstr::VecLoad { dst, base: ptr, offset: OffsetExpr::Const(0), width: SimdWidth::W256, dtype: QuantPrecision::F32 });
+            prog.emit(VmInstr::VecLoad { dst, base: ptr, offset: OffsetExpr::Const(0), width: SimdWidth::W256, dtype: QuantPrecision::F32 , predicate: None,});
         });
 
         // Compute intervals manually to tag ptr as LoopInvariant
@@ -1964,7 +1962,7 @@ mod tests {
                 base: ptr,
                 offset: OffsetExpr::Const(0),
                 width: SimdWidth::W256,
-                dtype: QuantPrecision::F32,
+                dtype: QuantPrecision::F32, predicate: None,
             });
             // Writing to ptr inside the loop — this makes it structurally LoopCarried,
             // not LoopInvariant. But verify_loop_lifecycle checks for InvariantWritten
@@ -2063,7 +2061,7 @@ mod tests {
             base,
             offset: OffsetExpr::Const(0),
             width: SimdWidth::W256,
-            dtype: QuantPrecision::F32,
+            dtype: QuantPrecision::F32, predicate: None,
         });
         prog.emit(VmInstr::LoopEnd);
 
@@ -2144,7 +2142,7 @@ mod tests {
             base,
             offset: OffsetExpr::LoopOffset(fake_loop_vreg),
             width: SimdWidth::W256,
-            dtype: QuantPrecision::F32,
+            dtype: QuantPrecision::F32, predicate: None,
         });
 
         // Act
@@ -2164,8 +2162,8 @@ mod tests {
         let a = prog.alloc_vreg(VRegKind::Vec, SimdWidth::W256);
         let b = prog.alloc_vreg(VRegKind::Vec, SimdWidth::W256);
         let dst = prog.alloc_vreg(VRegKind::Vec, SimdWidth::W256);
-        prog.emit(VmInstr::VecLoad { dst: a, base: ptr, offset: OffsetExpr::Const(0), width: SimdWidth::W256, dtype: QuantPrecision::F32 });
-        prog.emit(VmInstr::VecLoad { dst: b, base: ptr, offset: OffsetExpr::Const(32), width: SimdWidth::W256, dtype: QuantPrecision::F32 });
+        prog.emit(VmInstr::VecLoad { dst: a, base: ptr, offset: OffsetExpr::Const(0), width: SimdWidth::W256, dtype: QuantPrecision::F32 , predicate: None,});
+        prog.emit(VmInstr::VecLoad { dst: b, base: ptr, offset: OffsetExpr::Const(32), width: SimdWidth::W256, dtype: QuantPrecision::F32 , predicate: None,});
         prog.emit(VmInstr::VecBinOp { dst, a, b, op: VecOp::Add, dtype: QuantPrecision::F32 });
 
         // Act
@@ -2333,7 +2331,7 @@ mod tests {
                     dst, base,
                     offset: OffsetExpr::Const(0),
                     width: SimdWidth::W256,
-                    dtype: QuantPrecision::F32,
+                    dtype: QuantPrecision::F32, predicate: None,
                 });
             });
         });
@@ -2534,7 +2532,7 @@ mod tests {
             let dst = prog.alloc_vreg(VRegKind::Vec, SimdWidth::W256);
             prog.emit(VmInstr::VecLoad {
                 dst, base, offset: OffsetExpr::Const(0),
-                width: SimdWidth::W256, dtype: QuantPrecision::F32,
+                width: SimdWidth::W256, dtype: QuantPrecision::F32, predicate: None,
             });
         });
         let violations = verify_loop_lifecycle(&prog);
@@ -2612,7 +2610,7 @@ mod tests {
             base, src,
             offset: OffsetExpr::ScalarVReg(off_vreg),
             width: SimdWidth::W256,
-            dtype: QuantPrecision::F32,
+            dtype: QuantPrecision::F32, predicate: None,
         };
 
         // Act
@@ -2714,7 +2712,7 @@ mod tests {
             dst, base,
             offset: OffsetExpr::Const(0),
             width: SimdWidth::W256,
-            dtype: QuantPrecision::F32,
+            dtype: QuantPrecision::F32, predicate: None,
         };
 
         // Act & Assert
@@ -2743,8 +2741,8 @@ mod tests {
     #[test]
     fn test_instr_name_known_variants() {
         // Arrange & Act & Assert
-        assert_eq!(instr_name(&VmInstr::VecLoad { dst: VRegId(0), base: VRegId(0), offset: OffsetExpr::Const(0), width: SimdWidth::W256, dtype: QuantPrecision::F32 }), "VecLoad");
-        assert_eq!(instr_name(&VmInstr::VecStore { base: VRegId(0), src: VRegId(0), offset: OffsetExpr::Const(0), width: SimdWidth::W256, dtype: QuantPrecision::F32 }), "VecStore");
+        assert_eq!(instr_name(&VmInstr::VecLoad { dst: VRegId(0), base: VRegId(0), offset: OffsetExpr::Const(0), width: SimdWidth::W256, dtype: QuantPrecision::F32 , predicate: None,}), "VecLoad");
+        assert_eq!(instr_name(&VmInstr::VecStore { base: VRegId(0), src: VRegId(0), offset: OffsetExpr::Const(0), width: SimdWidth::W256, dtype: QuantPrecision::F32 , predicate: None,}), "VecStore");
         assert_eq!(instr_name(&VmInstr::LoopEnd), "LoopEnd");
         assert_eq!(instr_name(&VmInstr::MemFence { order: MemFenceOrder::Release }), "Other");
     }
@@ -2939,7 +2937,7 @@ mod tests {
             dst, base,
             offset: OffsetExpr::LoopOffset(wrong_loop_vreg),
             width: SimdWidth::W256,
-            dtype: QuantPrecision::F32,
+            dtype: QuantPrecision::F32, predicate: None,
         });
         prog.emit(VmInstr::LoopEnd);
 
@@ -3212,7 +3210,7 @@ mod tests {
             prog.emit(VmInstr::VecLoad {
                 dst: loaded, base,
                 offset: OffsetExpr::LoopOffset(byte_off),
-                width: SimdWidth::W256, dtype: QuantPrecision::F32,
+                width: SimdWidth::W256, dtype: QuantPrecision::F32, predicate: None,
             });
             // acc is read (as 'a') and written (as dst) → LoopCarried with phi
             prog.emit(VmInstr::VecBinOp {
@@ -3333,7 +3331,7 @@ mod tests {
                 dst, base,
                 offset: OffsetExpr::LoopOffset(byte_off),
                 width: SimdWidth::W256,
-                dtype: QuantPrecision::F32,
+                dtype: QuantPrecision::F32, predicate: None,
             });
         });
 
@@ -3755,14 +3753,14 @@ mod tests {
             dst, base,
             offset: OffsetExpr::Const(0),
             width: SimdWidth::W256,
-            dtype: QuantPrecision::F32,
+            dtype: QuantPrecision::F32, predicate: None,
         });
         prog.emit(VmInstr::VecStore {
             base,
             src: undefined_src,
             offset: OffsetExpr::Const(0),
             width: SimdWidth::W256,
-            dtype: QuantPrecision::F32,
+            dtype: QuantPrecision::F32, predicate: None,
         });
 
         // Act
@@ -3820,7 +3818,7 @@ mod tests {
             dst: inner_val, base,
             offset: OffsetExpr::Const(0),
             width: SimdWidth::W256,
-            dtype: QuantPrecision::F32,
+            dtype: QuantPrecision::F32, predicate: None,
         });
         prog.emit(VmInstr::LoopEnd);
         // Use inner_val after loop — BodyLocalEscape
@@ -3888,7 +3886,7 @@ mod tests {
                 dst: a, base,
                 offset: OffsetExpr::Const(0),
                 width: SimdWidth::W256,
-                dtype: QuantPrecision::F32,
+                dtype: QuantPrecision::F32, predicate: None,
             });
             let _: Result<(), std::convert::Infallible> = p.emit_scope(|p2| {
                 let b = p2.alloc_vreg(VRegKind::Vec, SimdWidth::W256);
@@ -3896,7 +3894,7 @@ mod tests {
                     dst: b, base,
                     offset: OffsetExpr::Const(32),
                     width: SimdWidth::W256,
-                    dtype: QuantPrecision::F32,
+                    dtype: QuantPrecision::F32, predicate: None,
                 });
                 Ok(())
             });
@@ -3930,7 +3928,7 @@ mod tests {
                 dst: loaded, base,
                 offset: OffsetExpr::LoopOffset(byte_off),
                 width: SimdWidth::W256,
-                dtype: QuantPrecision::F32,
+                dtype: QuantPrecision::F32, predicate: None,
             });
             prog.emit(VmInstr::VecBinOp {
                 dst: acc, a: acc, b: loaded,

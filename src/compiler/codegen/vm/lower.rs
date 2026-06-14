@@ -171,12 +171,12 @@ pub fn lower_qtap_stg(
                 prog.emit(VmInstr::VecLoad {
                     dst: acc, base: src_row_ptr,
                     offset: OffsetExpr::LoopOffset(byte_off), width,
-                    dtype: QuantPrecision::F32,
+                    dtype: QuantPrecision::F32, predicate: None,
                 });
                 prog.emit(VmInstr::VecStore {
                     base: dst_base, offset: OffsetExpr::LoopOffset(byte_off),
                     src: acc, width,
-                    dtype: QuantPrecision::F32,
+                    dtype: QuantPrecision::F32, predicate: None,
                 });
             });
         }
@@ -198,12 +198,12 @@ pub fn lower_qtap_stg(
                     prog.emit(VmInstr::VecLoad {
                         dst: acc, base: src_row,
                         offset: OffsetExpr::LoopOffset(off), width,
-                        dtype: QuantPrecision::F32,
+                        dtype: QuantPrecision::F32, predicate: None,
                     });
                     prog.emit(VmInstr::VecStore {
                         base: dst_row, offset: OffsetExpr::LoopOffset(off),
                         src: acc, width,
-                        dtype: QuantPrecision::F32,
+                        dtype: QuantPrecision::F32, predicate: None,
                     });
                 });
             });

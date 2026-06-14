@@ -11,10 +11,10 @@ mod tests {
         let input_ptr = prog.alloc_vreg(VRegKind::Ptr, SimdWidth::Scalar);
         let output_ptr = prog.alloc_vreg(VRegKind::Ptr, SimdWidth::Scalar);
         let vec_reg = prog.alloc_vreg(VRegKind::Vec, SimdWidth::W256);
-        prog.emit(VmInstr::VecLoad { dst: vec_reg, base: input_ptr, offset: OffsetExpr::Const(0), width: SimdWidth::W256, dtype: QuantPrecision::F32, });
+        prog.emit(VmInstr::VecLoad { dst: vec_reg, base: input_ptr, offset: OffsetExpr::Const(0), width: SimdWidth::W256, dtype: QuantPrecision::F32, predicate: None, });
         let slots = auto_select::auto_lower_trace_raw(&mut prog, body, &[vec_reg], SimdWidth::W256, QuantPrecision::F32).unwrap();
         let last = *slots.last().unwrap();
-        prog.emit(VmInstr::VecStore { base: output_ptr, src: last, offset: OffsetExpr::Const(0), width: SimdWidth::W256, dtype: QuantPrecision::F32, });
+        prog.emit(VmInstr::VecStore { base: output_ptr, src: last, offset: OffsetExpr::Const(0), width: SimdWidth::W256, dtype: QuantPrecision::F32, predicate: None, });
         prog
     }
 

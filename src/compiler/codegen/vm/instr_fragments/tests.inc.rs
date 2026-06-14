@@ -30,7 +30,7 @@ mod tests {
                 dst: acc, base: input,
                 offset: OffsetExpr::LoopOffset(byte_off),
                 width: SimdWidth::W256,
-                dtype: QuantPrecision::F32,
+                dtype: QuantPrecision::F32, predicate: None,
             });
             // SiLU: x * sigmoid(x) = x / (1 + exp(-x))
             let neg = prog.alloc_vreg(VRegKind::Vec, SimdWidth::W256);
@@ -50,7 +50,7 @@ mod tests {
                 offset: OffsetExpr::LoopOffset(byte_off),
                 src: acc,
                 width: SimdWidth::W256,
-                dtype: QuantPrecision::F32,
+                dtype: QuantPrecision::F32, predicate: None,
             });
         });
 
@@ -99,7 +99,7 @@ mod tests {
                         dst: b_vec, base: b_ptr,
                         offset: OffsetExpr::Const(b_off),
                         width: SimdWidth::W256,
-                        dtype: QuantPrecision::F32,
+                        dtype: QuantPrecision::F32, predicate: None,
                     });
                     prog.emit(VmInstr::Fma { dst: acc, acc, a: a_broadcast, b: b_vec, dtype: QuantPrecision::F32, });
                 }
@@ -107,7 +107,7 @@ mod tests {
                 prog.emit(VmInstr::VecStore {
                     base: c_ptr, offset: OffsetExpr::Const(c_off),
                     src: acc, width: SimdWidth::W256,
-                    dtype: QuantPrecision::F32,
+                    dtype: QuantPrecision::F32, predicate: None,
                 });
             }
         }

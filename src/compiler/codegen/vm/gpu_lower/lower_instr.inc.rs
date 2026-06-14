@@ -3431,7 +3431,7 @@ impl GpuLower {
 
             // GatherLoad: 从 base + indices[i]*stride 加载 lanes 个 f32 到 dst 向量。
             // GPU SIMT 模型：每个 thread 处理一个 lane。
-            VmInstr::GatherLoad { dst, base, indices, stride, width } => {
+            VmInstr::GatherLoad { dst, base, indices, stride, width , dtype: _dtype, predicate: _predicate, } => {
                 let d = self.reg_name_with_kind(*dst, alloc);
                 let b = self.reg_name_with_kind(*base, alloc);
                 let idx_base = self.reg_name_with_kind(*indices, alloc);
@@ -3479,7 +3479,7 @@ impl GpuLower {
             }
 
             // ScatterStore: 将 src 向量的 lanes 个 f32 按 indices 写入 base + indices[i]*stride。
-            VmInstr::ScatterStore { base, indices, src, stride, width } => {
+            VmInstr::ScatterStore { base, indices, src, stride, width , dtype: _dtype, predicate: _predicate, } => {
                 let s = self.reg_name_with_kind(*src, alloc);
                 let b = self.reg_name_with_kind(*base, alloc);
                 let idx_base = self.reg_name_with_kind(*indices, alloc);
@@ -4419,7 +4419,7 @@ impl GpuLower {
                 Ok(())
             }
 
-            VmInstr::MemCopy { dst, src, bytes } => {
+            VmInstr::MemCopy { dst, src, bytes, dtype: _, guard: _, effect: _ } => {
                 let d = self.reg_name_with_kind(*dst, alloc);
                 let s = self.reg_name_with_kind(*src, alloc);
                 for off in (0..*bytes).step_by(8) {

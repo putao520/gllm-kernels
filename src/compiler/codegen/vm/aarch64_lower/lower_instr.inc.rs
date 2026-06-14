@@ -65,7 +65,7 @@ impl AArch64Lower {
                 Ok(())
             }
 
-            VmInstr::VecLoad { dst, base, offset, width, dtype } => {
+            VmInstr::VecLoad { dst, base, offset, width, dtype , predicate: _predicate } => {
                 let vd = self.resolve_vreg(*dst, alloc)?;
                 let xn = self.resolve_gpr(*base, alloc)?;
 
@@ -2301,7 +2301,7 @@ impl AArch64Lower {
             // AArch64: 标量循环逐元素加载。读 u32 索引, 计算地址, LDR S 加载,
             // INS 插入到目标向量寄存器对应 lane。
             // GPR scratch: x16(addr), x17(idx_val). FPR scratch: s0(v0 scalar).
-            VmInstr::GatherLoad { dst, base, indices, stride, width } => {
+            VmInstr::GatherLoad { dst, base, indices, stride, width , dtype: _dtype, predicate: _predicate, } => {
                 let lanes = width.f32_lanes();
                 let base_reg = self.resolve_gpr(*base, alloc)?;
                 let idx_base = self.resolve_gpr(*indices, alloc)?;
@@ -2361,7 +2361,7 @@ impl AArch64Lower {
             // ScatterStore: 将 src 向量的 lanes 个 f32 按 indices 写入 base + indices[i]*stride。
             // AArch64: 标量循环逐元素存储。读 u32 索引, 计算地址, DUP 提取标量 lane, STR S 存储。
             // GPR scratch: x16(addr), x17(idx_val). FPR scratch: s0(v0 scalar).
-            VmInstr::ScatterStore { base, indices, src, stride, width } => {
+            VmInstr::ScatterStore { base, indices, src, stride, width , dtype: _dtype, predicate: _predicate, } => {
                 let lanes = width.f32_lanes();
                 let base_reg = self.resolve_gpr(*base, alloc)?;
                 let idx_base = self.resolve_gpr(*indices, alloc)?;

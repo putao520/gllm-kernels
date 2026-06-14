@@ -298,7 +298,7 @@ pub(crate) fn emit_mla_attn_score_inline(
                         base: q_row,
                         offset: OffsetExpr::LoopOffset(d_off),
                         width,
-                        dtype: default_dtype,
+                        dtype: default_dtype, predicate: None,
                     });
                     let k_vec = prog.alloc_vreg(VRegKind::Vec, width);
                     prog.emit(VmInstr::VecLoad {
@@ -306,7 +306,7 @@ pub(crate) fn emit_mla_attn_score_inline(
                         base: key_row,
                         offset: OffsetExpr::LoopOffset(d_off),
                         width,
-                        dtype: default_dtype,
+                        dtype: default_dtype, predicate: None,
                     });
                     super::auto_select::auto_lower_trace_into(
                         prog, &dot_body, &[dot_acc, q_vec, k_vec], dot_acc, width, default_dtype,
@@ -355,7 +355,7 @@ pub(crate) fn emit_mla_attn_score_inline(
                 offset: OffsetExpr::LoopOffset(pos_off),
                 src: weight,
                 width: SimdWidth::Scalar, // store single scalar
-                dtype: default_dtype,
+                dtype: default_dtype, predicate: None,
             });
 
             // V accumulation: for each head_dim vector, rescale o_acc by correction and add weight*v
@@ -380,7 +380,7 @@ pub(crate) fn emit_mla_attn_score_inline(
                             base: key_row, // key_row points to c_KV (first d_c elements of KV cache row)
                             offset: OffsetExpr::LoopOffset(c_off),
                             width,
-                            dtype: default_dtype,
+                            dtype: default_dtype, predicate: None,
                         });
                         // W_UV offset: d * hd_vec_step + c_off (row-major: [d_c, head_dim])
                         // Actually W_UV is [d_c, head_dim], so for output dim chunk d:
@@ -473,7 +473,7 @@ pub(crate) fn emit_mla_attn_score_inline(
                             base: w_addr,
                             offset: OffsetExpr::Const(wuv_d_offset),
                             width,
-                            dtype: default_dtype,
+                            dtype: default_dtype, predicate: None,
                         });
                         super::auto_select::auto_lower_trace_into(
                             prog, &dot_body, &[v_acc, ckv_vec, w_vec], v_acc, width, default_dtype,
@@ -515,7 +515,7 @@ pub(crate) fn emit_mla_attn_score_inline(
                 offset: OffsetExpr::Const(d * hd_vec_step),
                 src: norm_slots[2],
                 width,
-                dtype: default_dtype,
+                dtype: default_dtype, predicate: None,
             });
         }
     });
@@ -598,7 +598,7 @@ pub(crate) fn emit_mla_rope_merge_inline(
                 base: c_kv_ptr,
                 offset: OffsetExpr::LoopOffset(byte_off),
                 width,
-                dtype: default_dtype,
+                dtype: default_dtype, predicate: None,
             });
             let slots = super::auto_select::auto_lower_trace_raw(
                 prog, &copy_body, &[data], width, default_dtype,
@@ -608,7 +608,7 @@ pub(crate) fn emit_mla_rope_merge_inline(
                 offset: OffsetExpr::LoopOffset(byte_off),
                 src: slots[0],
                 width,
-                dtype: default_dtype,
+                dtype: default_dtype, predicate: None,
             });
         });
     }
@@ -630,7 +630,7 @@ pub(crate) fn emit_mla_rope_merge_inline(
                 base: k_pe_ptr,
                 offset: OffsetExpr::LoopOffset(byte_off),
                 width,
-                dtype: default_dtype,
+                dtype: default_dtype, predicate: None,
             });
             // Load k_pe odd components: k_pe[2i+1] (offset by d_rope_half)
             let x_odd = prog.alloc_vreg(VRegKind::Vec, width);
@@ -639,7 +639,7 @@ pub(crate) fn emit_mla_rope_merge_inline(
                 base: k_pe_ptr,
                 offset: OffsetExpr::loop_plus_const(byte_off, d_rope_half * elem_bytes),
                 width,
-                dtype: default_dtype,
+                dtype: default_dtype, predicate: None,
             });
             // Load cos/sin
             let cos_val = prog.alloc_vreg(VRegKind::Vec, width);
@@ -648,7 +648,7 @@ pub(crate) fn emit_mla_rope_merge_inline(
                 base: cos_ptr,
                 offset: OffsetExpr::LoopOffset(byte_off),
                 width,
-                dtype: default_dtype,
+                dtype: default_dtype, predicate: None,
             });
             let sin_val = prog.alloc_vreg(VRegKind::Vec, width);
             prog.emit(VmInstr::VecLoad {
@@ -656,7 +656,7 @@ pub(crate) fn emit_mla_rope_merge_inline(
                 base: sin_ptr,
                 offset: OffsetExpr::LoopOffset(byte_off),
                 width,
-                dtype: default_dtype,
+                dtype: default_dtype, predicate: None,
             });
             // Apply RoPE rotation
             let rope_slots = super::auto_select::auto_lower_trace_raw(
@@ -670,7 +670,7 @@ pub(crate) fn emit_mla_rope_merge_inline(
                 offset: OffsetExpr::loop_plus_const(byte_off, d_main_bytes),
                 src: out_even,
                 width,
-                dtype: default_dtype,
+                dtype: default_dtype, predicate: None,
             });
             // Store odd result at output[d_main + 2i + d_rope_half]
             prog.emit(VmInstr::VecStore {
@@ -678,7 +678,7 @@ pub(crate) fn emit_mla_rope_merge_inline(
                 offset: OffsetExpr::loop_plus_const(byte_off, d_main_bytes + d_rope_half * elem_bytes),
                 src: out_odd,
                 width,
-                dtype: default_dtype,
+                dtype: default_dtype, predicate: None,
             });
         });
     } else {
@@ -1571,8 +1571,8 @@ mod tests {
         // All Broadcast and VecLoad instructions should use BF16 dtype
         let bf16_instrs = prog.instrs.iter().filter(|instr| {
             matches!(instr, VmInstr::Broadcast { dtype: QuantPrecision::BF16, .. }
-                     | VmInstr::VecLoad { dtype: QuantPrecision::BF16, .. }
-                     | VmInstr::VecStore { dtype: QuantPrecision::BF16, .. })
+                     | VmInstr::VecLoad { dtype: QuantPrecision::BF16, predicate: None, .. }
+                     | VmInstr::VecStore { dtype: QuantPrecision::BF16, predicate: None, .. })
         }).count();
         assert!(bf16_instrs > 0, "should emit BF16-typed instructions, got 0");
     }
@@ -1601,7 +1601,7 @@ mod tests {
         // Assert
         assert!(result.is_ok(), "BF16 rope merge should compile: {:?}", result.err());
         let bf16_stores = prog.instrs.iter().filter(|instr| {
-            matches!(instr, VmInstr::VecStore { dtype: QuantPrecision::BF16, .. })
+            matches!(instr, VmInstr::VecStore { dtype: QuantPrecision::BF16, predicate: None, .. })
         }).count();
         assert!(bf16_stores > 0, "should emit BF16-typed VecStore instructions");
     }
@@ -3857,8 +3857,7 @@ mod tests {
             matches!(instr, VmInstr::VecStore {
                 offset: OffsetExpr::Const(0),
                 width: SimdWidth::W256,
-                ..
-            })
+                .. })
         }).count();
         assert!(const_0_vec_stores >= 1,
             "normalize phase should emit VecStore with Const(0) offset and W256 width, got {}",

@@ -67,7 +67,7 @@ impl X86Lower {
                 Ok(())
             }
 
-            VmInstr::VecLoad { dst, base, offset, width, dtype } => {
+            VmInstr::VecLoad { dst, base, offset, width, dtype , predicate: _predicate } => {
                 // ARCH-ISA-SCRATCH: base 走 scratch slot 2 (r11), 避开
                 // eval_offset_to_rax 使用的 slot 0/1 (rax/r10)。否则
                 // offset 是嵌套 Add 时 `mov s1, s0` 会覆盖 base 值。
@@ -154,7 +154,7 @@ impl X86Lower {
                 Ok(())
             }
 
-            VmInstr::VecStore { base, offset, src, width, dtype } => {
+            VmInstr::VecStore { base, offset, src, width, dtype , predicate: _predicate } => {
                 // ARCH-ISA-SCRATCH: base 走 slot 2 (r11), 避开 eval_offset_to_rax
                 // 的 s0/s1 (rax/r10)。嵌套 Add offset 会 `mov s1, s0`, 若 base 在
                 // slot 1 则被覆盖 → store 到错误地址。
@@ -2401,12 +2401,12 @@ impl X86Lower {
             // GatherLoad: 向量索引加载 — 生成标量循环（每次加载一个元素）。
             // x86 AVX2 vgatherdps 孈在复杂且语义不一致（需要 mask scratch），
             // 标量循环更可靠。AVX-512 可以用 vpgatherdd 但当前统一标量路径。
-            VmInstr::GatherLoad { dst, base, indices, stride, width } => {
+            VmInstr::GatherLoad { dst, base, indices, stride, width , dtype: _dtype, predicate: _predicate, } => {
                 self.emit_gather_load(*dst, *base, *indices, *stride, *width, alloc)
             }
 
             // ScatterStore: 向量索引存储 — 生成标量循环（每次存储一个元素）。
-            VmInstr::ScatterStore { base, indices, src, stride, width } => {
+            VmInstr::ScatterStore { base, indices, src, stride, width , dtype: _dtype, predicate: _predicate, } => {
                 self.emit_scatter_store(*base, *indices, *src, *stride, *width, alloc)
             }
 
@@ -3322,7 +3322,9 @@ impl X86Lower {
                 Ok(())
             }
 
-            VmInstr::MemCopy { dst, src, bytes } => {
+            VmInstr::MemCopy { dst, src, bytes, dtype: _, guard, effect } => {
+                let _effect = effect; // MemEffect::ReadWrite — 内存依赖追踪
+                let _guard = guard;   // 条件谓词 — 未来用于 conditional copy
                 let src_reg = self.resolve_gpr_read(*src, alloc, 0)?;
                 let dst_reg = self.resolve_gpr_read(*dst, alloc, 1)?;
                 let b = *bytes;

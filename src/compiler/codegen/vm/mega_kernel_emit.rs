@@ -2631,7 +2631,7 @@ fn emit_mtp_gemv(
             base: input_ptr,
             offset: OffsetExpr::LoopOffset(h_off),
             width,
-            dtype,
+            dtype, predicate: None,
         });
 
         // Load weight[v_off + h_off..v_off + h_off+lanes]
@@ -2645,7 +2645,7 @@ fn emit_mtp_gemv(
             base: weight_ptr,
             offset: OffsetExpr::ScalarVReg(combined_off),
             width,
-            dtype,
+            dtype, predicate: None,
         });
 
         // acc += hidden_vec * weight_vec

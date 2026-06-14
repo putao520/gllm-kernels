@@ -4,20 +4,30 @@ pub enum VmInstr {
     // ── 内存操作 ──
 
     /// SIMD 向量加载: dst = [base + offset]
+    ///
+    /// FAT-OPCODE-ARCHITECTURE-V2 §3 自描述：
+    /// - `predicate`: 条件谓词（None=无条件，Some=masked load）
     VecLoad {
         dst: VRegId,
         base: VRegId,
         offset: OffsetExpr,
         width: SimdWidth,
         dtype: crate::compiler::trace::QuantPrecision,
+        /// 条件谓词：None=无条件加载，Some=masked load (x86: vpmovmask2m + vmovups)
+        predicate: Option<Predicate>,
     },
     /// SIMD 向量存储: [base + offset] = src
+    ///
+    /// FAT-OPCODE-ARCHITECTURE-V2 §3 自描述：
+    /// - `predicate`: 条件谓词（None=无条件，Some=masked store）
     VecStore {
         base: VRegId,
         offset: OffsetExpr,
         src: VRegId,
         width: SimdWidth,
         dtype: crate::compiler::trace::QuantPrecision,
+        /// 条件谓词：None=无条件存储，Some=masked store (x86: vpmovmask2m + vmovups)
+        predicate: Option<Predicate>,
     },
     /// 累加器窄化: dst = narrow(src) (REQ-DTYPE-006)
     /// 将 acc_dtype 的向量窄化为 dtype（如 F32→BF16）。
@@ -109,23 +119,39 @@ pub enum VmInstr {
     /// 向量索引加载: 从 base + indices[i]*stride 加载 lanes 个元素到 dst 向量。
     /// indices 是一个 VReg 指向 u32 索引数组。
     /// 后端映射: x86 vgatherdps (AVX2/AVX-512) / ARM scalar loop
+    ///
+    /// FAT-OPCODE-ARCHITECTURE-V2 §3 自描述：
+    /// - `dtype`: 加载元素类型（影响 gather 指令选择）
+    /// - `predicate`: masked gather
     GatherLoad {
         dst: VRegId,
         base: VRegId,
         indices: VRegId,
         stride: usize,
         width: SimdWidth,
+        /// 元素 dtype（影响指令选择 vpgatherdd vs vpgatherqd）
+        dtype: crate::compiler::trace::QuantPrecision,
+        /// masked gather 谓词
+        predicate: Option<Predicate>,
     },
 
     /// 向量索引存储: 将 src 向量的 lanes 个元素按 indices 写入 base + indices[i]*stride。
     /// indices 是一个 VReg 指向 u32 索引数组。
     /// 后端映射: x86 vscatterdps (AVX-512) / ARM scalar loop
+    ///
+    /// FAT-OPCODE-ARCHITECTURE-V2 §3 自描述：
+    /// - `dtype`: 存储元素类型
+    /// - `predicate`: masked scatter
     ScatterStore {
         base: VRegId,
         indices: VRegId,
         src: VRegId,
         stride: usize,
         width: SimdWidth,
+        /// 元素 dtype
+        dtype: crate::compiler::trace::QuantPrecision,
+        /// masked scatter 谓词
+        predicate: Option<Predicate>,
     },
 
     /// 行查表: 从 base + row_index * row_bytes 加载一行 SIMD 向量。
@@ -831,6 +857,11 @@ pub enum VmInstr {
     },
     /// Memory copy: copies `bytes` bytes from src to dst pointer.
     /// Used for KV cache writes: copy current K/V row to persistent KV cache.
+    ///
+    /// FAT-OPCODE-ARCHITECTURE-V2 §3 自描述：
+    /// - `dtype`: 元素类型（影响 strided copy 的优化路径）
+    /// - `guard`: 条件谓词（None=无条件，Some=条件成立时执行）
+    /// - `effect`: ReadWrite（既读 src 又写 dst）
     MemCopy {
         /// Destination pointer (VRegKind::Ptr).
         dst: VRegId,
@@ -838,6 +869,12 @@ pub enum VmInstr {
         src: VRegId,
         /// Number of bytes to copy (compile-time constant).
         bytes: usize,
+        /// 元素 dtype（编译时已知，影响 memmove 优化）
+        dtype: crate::compiler::trace::QuantPrecision,
+        /// 条件谓词：None=无条件，Some=仅当条件成立时拷贝
+        guard: Option<Predicate>,
+        /// 内存效应：MemCopy 是 ReadWrite
+        effect: MemEffect,
     },
 
     /// 跳出 generate loop 到函数 epilogue。

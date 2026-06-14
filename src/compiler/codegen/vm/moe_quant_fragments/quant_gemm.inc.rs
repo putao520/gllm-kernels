@@ -85,8 +85,8 @@ pub(crate) fn emit_gemm_float_from_plan(
                     Box::new(OffsetExpr::Mul(Box::new(OffsetExpr::LoopOffset(i_cnt)), a_row_stride)),
                     Box::new(OffsetExpr::ScalarVReg(k_act_off)),
                 );
-                prog.emit(VmInstr::VecLoad { dst: a_val, base: input_ptr, offset: act_off, width, dtype });
-                prog.emit(VmInstr::VecLoad { dst: b_val, base: w_col_ptr, offset: OffsetExpr::LoopOffset(kk_off), width, dtype });
+                prog.emit(VmInstr::VecLoad { dst: a_val, base: input_ptr, offset: act_off, width, dtype , predicate: None });
+                prog.emit(VmInstr::VecLoad { dst: b_val, base: w_col_ptr, offset: OffsetExpr::LoopOffset(kk_off), width, dtype , predicate: None });
 
                 match desc.data_kind {
                     crate::quant_format::QuantDataKind::Bfloat16 => {
@@ -193,7 +193,7 @@ pub(crate) fn emit_gemm_int8_from_plan(
                                 )),
                                 Box::new(OffsetExpr::LoopOffset(ei_off)),
                             );
-                            prog.emit(VmInstr::VecLoad { dst: a_val, base: input_ptr, offset: act_off, width, dtype });
+                            prog.emit(VmInstr::VecLoad { dst: a_val, base: input_ptr, offset: act_off, width, dtype , predicate: None });
                             prog.emit(VmInstr::QuantBlockLoad { dst: w_raw, base: data_ptr, offset: OffsetExpr::Const(0), unpack: BlockUnpackMode::Int8, width });
                             prog.emit(VmInstr::DotProduct { acc, a: a_val, b: w_raw, input_dtype: DotDtype::Int8, width });
                             prog.emit(VmInstr::GprBinOp { dst: data_ptr, a: data_ptr, b: GprOperand::VReg(data_step_reg ), op: GprOp::Add });
@@ -325,7 +325,7 @@ pub(crate) fn emit_gemm_assisted_from_plan(
                                 )),
                                 Box::new(OffsetExpr::LoopOffset(ei_off)),
                             );
-                            prog.emit(VmInstr::VecLoad { dst: a_val, base: input_ptr, offset: lo_act_off, width, dtype });
+                            prog.emit(VmInstr::VecLoad { dst: a_val, base: input_ptr, offset: lo_act_off, width, dtype , predicate: None });
 
                             let low_unpack = if use_signed {
                                 BlockUnpackMode::SignedNibbleLow
@@ -350,7 +350,7 @@ pub(crate) fn emit_gemm_assisted_from_plan(
                                 )),
                                 Box::new(OffsetExpr::LoopOffset(ei_off)),
                             );
-                            prog.emit(VmInstr::VecLoad { dst: a_val, base: input_ptr, offset: hi_act_off, width, dtype });
+                            prog.emit(VmInstr::VecLoad { dst: a_val, base: input_ptr, offset: hi_act_off, width, dtype , predicate: None });
 
                             let high_unpack = if use_signed {
                                 BlockUnpackMode::SignedNibbleHigh
@@ -557,7 +557,7 @@ pub(crate) fn emit_gemm_highbit_from_plan(
                                 )),
                                 Box::new(OffsetExpr::LoopOffset(ei_off)),
                             );
-                            prog.emit(VmInstr::VecLoad { dst: a_val, base: input_ptr, offset: lo_act_off, width, dtype });
+                            prog.emit(VmInstr::VecLoad { dst: a_val, base: input_ptr, offset: lo_act_off, width, dtype , predicate: None });
 
                             prog.emit(VmInstr::QuantBlockLoad {
                                 dst: nibble_vec, base: qs_ptr,
@@ -589,7 +589,7 @@ pub(crate) fn emit_gemm_highbit_from_plan(
                                 )),
                                 Box::new(OffsetExpr::LoopOffset(ei_off)),
                             );
-                            prog.emit(VmInstr::VecLoad { dst: a_val, base: input_ptr, offset: hi_act_off, width, dtype });
+                            prog.emit(VmInstr::VecLoad { dst: a_val, base: input_ptr, offset: hi_act_off, width, dtype , predicate: None });
 
                             prog.emit(VmInstr::QuantBlockLoad {
                                 dst: nibble_vec, base: qs_ptr,
@@ -853,7 +853,7 @@ pub(crate) fn emit_gemm_dequant_from_plan(
                                     Box::new(OffsetExpr::ScalarVReg(k_act_base)),
                                     Box::new(OffsetExpr::LoopOffset(ei_off)),
                                 );
-                                prog.emit(VmInstr::VecLoad { dst: a_val, base: input_ptr, offset: act_off, width, dtype });
+                                prog.emit(VmInstr::VecLoad { dst: a_val, base: input_ptr, offset: act_off, width, dtype , predicate: None });
 
                                 super::auto_select::auto_lower_trace_into(
                                     prog, &fma_trace, &[a_val, b_decoded, acc], acc, width, QuantPrecision::F32,
@@ -937,7 +937,7 @@ pub(crate) fn emit_gemm_dequant_from_plan(
                                         )),
                                         Box::new(OffsetExpr::LoopOffset(ei_off)),
                                     );
-                                    prog.emit(VmInstr::VecLoad { dst: a_val, base: input_ptr, offset: act_off, width, dtype });
+                                    prog.emit(VmInstr::VecLoad { dst: a_val, base: input_ptr, offset: act_off, width, dtype , predicate: None });
 
                                     super::auto_select::auto_lower_trace_into(
                                         prog, &fma_trace, &[a_val, b_decoded, acc], acc, width, QuantPrecision::F32,

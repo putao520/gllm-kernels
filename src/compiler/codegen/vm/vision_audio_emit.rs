@@ -128,7 +128,7 @@ pub(crate) fn lower_depthwise_conv1d(
                 );
                 prog.emit(VmInstr::VecLoad {
                     dst: x_val, base: padded_ptr, offset: padded_off, width: s_width,
-                    dtype,
+                    dtype, predicate: None,
                 });
                 // w_val = broadcast w[c, k] = broadcast *(w_ptr + c_off * kernel_size + k * 4)
                 // w[c, k] byte offset = c * K * 4 + k * 4 = c_off * K + k * 4
@@ -163,7 +163,7 @@ pub(crate) fn lower_depthwise_conv1d(
             );
             prog.emit(VmInstr::VecStore {
                 base: out_ptr, offset: out_off, src: acc, width: s_width,
-                dtype,
+                dtype, predicate: None,
             });
         });
     });
@@ -289,7 +289,7 @@ pub(crate) fn lower_patch_embed(
                             ]);
                             prog.emit(VmInstr::VecLoad {
                                 dst: x_val, base: image_ptr, offset: image_off, width: s_width,
-                                dtype,
+                                dtype, predicate: None,
                             });
 
                             // kernel[e, c, kr, kc] byte offset:
@@ -308,7 +308,7 @@ pub(crate) fn lower_patch_embed(
                             // vfmadd231ps 对 xmm 下位 f32 lane 运算即可 (等价 vfmadd231ss)。
                             prog.emit(VmInstr::VecLoad {
                                 dst: w_val, base: kernel_ptr, offset: kernel_off, width: s_width,
-                                dtype,
+                                dtype, predicate: None,
                             });
                             // acc = acc + x_val · w_val via auto_lower_trace_into
                             {
@@ -334,7 +334,7 @@ pub(crate) fn lower_patch_embed(
                 ]);
                 prog.emit(VmInstr::VecStore {
                     base: patches_ptr, offset: out_off, src: acc, width: s_width,
-                    dtype,
+                    dtype, predicate: None,
                 });
             });
         });
@@ -384,7 +384,7 @@ pub(crate) fn emit_zero_fill_bytes(
         prog.emit_loop(BoundExpr::Const(vec_count), step_bytes, |prog, _ctr, off| {
             prog.emit(VmInstr::VecStore {
                 base: ptr, offset: OffsetExpr::LoopOffset(off), src: zero_vec, width,
-                dtype,
+                dtype, predicate: None,
             });
         });
     }
@@ -404,7 +404,7 @@ pub(crate) fn emit_zero_fill_bytes(
                 );
                 prog.emit(VmInstr::VecStore {
                     base: ptr, offset: full_off, src: zero_scalar, width: s_width,
-                    dtype,
+                    dtype, predicate: None,
                 });
             });
         }
@@ -441,11 +441,11 @@ pub(crate) fn emit_row_copy(
             prog.emit_loop(BoundExpr::Const(vec_count), step_bytes, |prog, _c_ctr, c_off| {
                 prog.emit(VmInstr::VecLoad {
                     dst: tmp, base: row_src, offset: OffsetExpr::LoopOffset(c_off), width,
-                    dtype,
+                    dtype, predicate: None,
                 });
                 prog.emit(VmInstr::VecStore {
                     base: row_dst, offset: OffsetExpr::LoopOffset(c_off), src: tmp, width,
-                    dtype,
+                    dtype, predicate: None,
                 });
             });
         }
@@ -460,11 +460,11 @@ pub(crate) fn emit_row_copy(
                 );
                 prog.emit(VmInstr::VecLoad {
                     dst: s_tmp, base: row_src, offset: off.clone(), width: s_width,
-                    dtype,
+                    dtype, predicate: None,
                 });
                 prog.emit(VmInstr::VecStore {
                     base: row_dst, offset: off, src: s_tmp, width: s_width,
-                    dtype,
+                    dtype, predicate: None,
                 });
             });
         }
