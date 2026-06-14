@@ -294,7 +294,10 @@ impl Op {
     /// 调用方无需知道 op 类别，自动路由到对应的转换方法。
     /// 返回 None 表示无匹配（理论上不会发生，因为 4 个方法覆盖所有 OpKind 变体）。
     // @trace REQ-FATOP-013 [entity:Op] [entity:OpKind] from_op_kind IR Translator
-    pub fn from_op_kind(op: &CompilerOp, graph: &CompilerGraph) -> Option<Self> {
+    ///
+    /// FAT-OPCODE §Phase 9: pub(crate) 限制 — 仅 add_op 内部和 lowering fallback 使用。
+    /// 外部代码必须通过 CompilerOp.op_v2 缓存访问 Op（add_op 时已翻译）。
+    pub(crate) fn from_op_kind(op: &CompilerOp, graph: &CompilerGraph) -> Option<Self> {
         Self::from_op_kind_norm_activation(op, graph)
             .or_else(|| Self::from_op_kind_gemm_quant(op, graph))
             .or_else(|| Self::from_op_kind_attention_moe(op, graph))
