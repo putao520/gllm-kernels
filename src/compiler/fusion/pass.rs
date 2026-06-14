@@ -1678,6 +1678,7 @@ mod tests {
             label: "empty_gemm".into(),
             id: gemm,
     guard: LayerCondition::Always,
+            op_v2: None,
         };
         let claimed = HashSet::new();
 

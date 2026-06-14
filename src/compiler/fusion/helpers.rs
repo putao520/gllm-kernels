@@ -742,6 +742,7 @@ mod tests {
             outputs: vec![],
             label: "qgemm".to_string(),
     guard: LayerCondition::Always,
+            op_v2: None,
         };
         let result = extract_quant_type(&op);
         assert_eq!(result, Some(QuantType::Q4_0));
@@ -763,6 +764,7 @@ mod tests {
             outputs: vec![],
             label: "gemm".to_string(),
     guard: LayerCondition::Always,
+            op_v2: None,
         };
         let result = extract_quant_type(&op);
         assert!(result.is_none());
@@ -783,6 +785,7 @@ mod tests {
             outputs: vec![],
             label: "qgemm1".to_string(),
     guard: LayerCondition::Always,
+            op_v2: None,
         };
         let op2 = CompilerOp {
             id: OpId(1),
@@ -796,6 +799,7 @@ mod tests {
             outputs: vec![],
             label: "qgemm2".to_string(),
     guard: LayerCondition::Always,
+            op_v2: None,
         };
         let ops: Vec<&CompilerOp> = vec![&op1, &op2];
         assert!(all_gemm_quant_compatible(&ops));
@@ -816,6 +820,7 @@ mod tests {
             outputs: vec![],
             label: "qgemm1".to_string(),
     guard: LayerCondition::Always,
+            op_v2: None,
         };
         let op2 = CompilerOp {
             id: OpId(1),
@@ -829,6 +834,7 @@ mod tests {
             outputs: vec![],
             label: "qgemm2".to_string(),
     guard: LayerCondition::Always,
+            op_v2: None,
         };
         let ops: Vec<&CompilerOp> = vec![&op1, &op2];
         // Q4_0 and Q6K are different quant types -> Split -> not compatible
@@ -1072,6 +1078,7 @@ mod tests {
             outputs: vec![],
             label: "gemm_bias".to_string(),
     guard: LayerCondition::Always,
+            op_v2: None,
         };
         // Act
         let result = extract_quant_type(&op);
@@ -1091,6 +1098,7 @@ mod tests {
             outputs: vec![],
             label: "silu".to_string(),
     guard: LayerCondition::Always,
+            op_v2: None,
         };
         // Act
         let result = extract_quant_type(&op);
@@ -1116,6 +1124,7 @@ mod tests {
             outputs: vec![],
             label: "qgemm".to_string(),
     guard: LayerCondition::Always,
+            op_v2: None,
         };
         let op2 = CompilerOp {
             id: OpId(1),
@@ -1130,6 +1139,7 @@ mod tests {
             outputs: vec![],
             label: "plain_gemm".to_string(),
     guard: LayerCondition::Always,
+            op_v2: None,
         };
         let ops: Vec<&CompilerOp> = vec![&op1, &op2];
         // Act
@@ -1155,6 +1165,7 @@ mod tests {
             outputs: vec![],
             label: "qgemm".to_string(),
     guard: LayerCondition::Always,
+            op_v2: None,
         };
         let ops: Vec<&CompilerOp> = vec![&op];
         // Act
@@ -1733,6 +1744,7 @@ mod tests {
             },
             inputs: vec![], outputs: vec![], label: "q1".to_string(),
     guard: LayerCondition::Always,
+            op_v2: None,
         };
         let op2 = CompilerOp {
             id: OpId(1),
@@ -1742,6 +1754,7 @@ mod tests {
             },
             inputs: vec![], outputs: vec![], label: "q2".to_string(),
     guard: LayerCondition::Always,
+            op_v2: None,
         };
         let op3 = CompilerOp {
             id: OpId(2),
@@ -1751,6 +1764,7 @@ mod tests {
             },
             inputs: vec![], outputs: vec![], label: "q3".to_string(),
     guard: LayerCondition::Always,
+            op_v2: None,
         };
         let ops: Vec<&CompilerOp> = vec![&op1, &op2, &op3];
         // Act
@@ -1775,6 +1789,7 @@ mod tests {
             outputs: vec![],
             label: "gemm_no_inputs".to_string(),
     guard: LayerCondition::Always,
+            op_v2: None,
         };
         // Act
         let result = detect_norm_into_gemm(&graph, &op, None);
@@ -1909,6 +1924,7 @@ mod tests {
             outputs: vec![],
             label: "empty_anchor".to_string(),
     guard: LayerCondition::Always,
+            op_v2: None,
         };
         let claimed = HashSet::new();
         // Act
@@ -2028,6 +2044,7 @@ mod tests {
             outputs: vec![],
             label: "silu".to_string(),
     guard: LayerCondition::Always,
+            op_v2: None,
         };
         assert!(extract_quant_type(&op).is_none());
     }
@@ -2046,6 +2063,7 @@ mod tests {
             outputs: vec![],
             label: "gemm".to_string(),
     guard: LayerCondition::Always,
+            op_v2: None,
         };
         assert!(all_gemm_quant_compatible(&[&op]));
     }
@@ -2064,6 +2082,7 @@ mod tests {
             outputs: vec![],
             label: "plain_gemm".to_string(),
     guard: LayerCondition::Always,
+            op_v2: None,
         };
         let op2 = CompilerOp {
             id: OpId(1),
@@ -2075,6 +2094,7 @@ mod tests {
             outputs: vec![],
             label: "quant_gemm".to_string(),
     guard: LayerCondition::Always,
+            op_v2: None,
         };
         // None vs Q4_0: depends on can_fuse_quant_aware(None, Some(Q4_0))
         let ops: Vec<&CompilerOp> = vec![&op1, &op2];
@@ -3118,6 +3138,7 @@ mod tests {
             outputs: vec![],
             label: "empty_start".to_string(),
     guard: LayerCondition::Always,
+            op_v2: None,
         };
         let claimed = HashSet::new();
 
@@ -3588,6 +3609,7 @@ mod tests {
             },
             inputs: vec![], outputs: vec![], label: "q1".to_string(),
     guard: LayerCondition::Always,
+            op_v2: None,
         };
         let op2 = CompilerOp {
             id: OpId(1),
@@ -3596,6 +3618,7 @@ mod tests {
             },
             inputs: vec![], outputs: vec![], label: "q2".to_string(),
     guard: LayerCondition::Always,
+            op_v2: None,
         };
         let ops: Vec<&CompilerOp> = vec![&op1, &op2];
         // Act
@@ -3667,6 +3690,7 @@ mod tests {
             },
             inputs: vec![], outputs: vec![], label: "qgemm_q4k".to_string(),
     guard: LayerCondition::Always,
+            op_v2: None,
         };
         // Act
         let result = extract_quant_type(&op);
@@ -4023,6 +4047,7 @@ mod tests {
             },
             inputs: vec![], outputs: vec![], label: "q4_0".to_string(),
     guard: LayerCondition::Always,
+            op_v2: None,
         };
         let op2 = CompilerOp {
             id: OpId(1),
@@ -4031,6 +4056,7 @@ mod tests {
             },
             inputs: vec![], outputs: vec![], label: "q4k".to_string(),
     guard: LayerCondition::Always,
+            op_v2: None,
         };
         let ops: Vec<&CompilerOp> = vec![&op1, &op2];
 
@@ -4218,6 +4244,7 @@ mod tests {
             },
             inputs: vec![], outputs: vec![], label: "qgemm_q2k".to_string(),
     guard: LayerCondition::Always,
+            op_v2: None,
         };
         // Act
         let result = extract_quant_type(&op);
@@ -4381,6 +4408,7 @@ mod tests {
             },
             inputs: vec![], outputs: vec![], label: "gemm_bias_1".to_string(),
     guard: LayerCondition::Always,
+            op_v2: None,
         };
         let op2 = CompilerOp {
             id: OpId(1),
@@ -4389,6 +4417,7 @@ mod tests {
             },
             inputs: vec![], outputs: vec![], label: "gemm_bias_2".to_string(),
     guard: LayerCondition::Always,
+            op_v2: None,
         };
         let ops: Vec<&CompilerOp> = vec![&op1, &op2];
         // Act

@@ -77,14 +77,21 @@ impl CompilerGraph {
             }
         }
 
-        self.ops.push(CompilerOp {
+        // FAT-OPCODE-ARCHITECTURE-V2 §Phase 9: 构造临时 CompilerOp 用于 op_v2 翻译。
+        // 翻译完成后 op_v2 字段填充，最终存入 self.ops。
+        let temp = CompilerOp {
             id,
-            kind,
-            inputs,
-            outputs,
+            kind: kind.clone(),
+            inputs: inputs.clone(),
+            outputs: outputs.clone(),
             label: label.to_string(),
             guard: LayerCondition::Always,
-        });
+            op_v2: None,
+        };
+        let op_v2 = crate::compiler::graph::Op::from_op_kind(&temp, self);
+        let mut final_op = temp;
+        final_op.op_v2 = op_v2;
+        self.ops.push(final_op);
         id
     }
 
@@ -113,14 +120,19 @@ impl CompilerGraph {
             }
         }
 
-        self.ops.push(CompilerOp {
+        let temp = CompilerOp {
             id,
-            kind,
-            inputs,
-            outputs,
+            kind: kind.clone(),
+            inputs: inputs.clone(),
+            outputs: outputs.clone(),
             label: label.to_string(),
             guard,
-        });
+            op_v2: None,
+        };
+        let op_v2 = crate::compiler::graph::Op::from_op_kind(&temp, self);
+        let mut final_op = temp;
+        final_op.op_v2 = op_v2;
+        self.ops.push(final_op);
         id
     }
 

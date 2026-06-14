@@ -923,6 +923,12 @@ pub struct CompilerOp {
     pub label: String,
     /// Layer loop execution guard. `Always` = no guard (zero overhead).
     pub guard: LayerCondition,
+    /// FAT-OPCODE-ARCHITECTURE-V2 §Phase 9: 胖 opcode 缓存。
+    ///
+    /// add_op 时一次性从 OpKind + graph context 翻译并缓存。
+    /// 所有 lowering 路径直接读 op_v2，不调用 Op::from_op_kind（消除重复翻译）。
+    /// None 表示尚未翻译（如测试 fixture 或部分构造路径）。
+    pub op_v2: Option<crate::compiler::graph::Op>,
 }
 
 // ── CompilerGraph ──────────────────────────────────────────────────

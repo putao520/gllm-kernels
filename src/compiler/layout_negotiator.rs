@@ -1850,6 +1850,7 @@ mod tests {
             outputs: vec![],
             label: "orphan_gemm".to_string(),
     guard: LayerCondition::Always,
+            op_v2: None,
         };
         graph.ops.push(op_node);
         let op_id = OpId(0);
