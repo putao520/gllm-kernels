@@ -2,8 +2,10 @@
 // §1 Op v2 — 胖 opcode 自描述架构 (FAT-OPCODE-ARCHITECTURE-V2)
 // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 //
-// 与 OpKind（贫血 enum）共存。Phase 4-7 按类别迁移 lowering 到 Op。
-// Phase 8 后 OpKind 删除。
+// 与 OpKind（前端 IR）永久共存——类比 LLVM IR（前端）与 SelectionDAG（后端）。
+// from_op_kind = IR Translator（compile pipeline 入口一次性翻译）。
+// OpKind 服务于 graph 构建层（fusion/semantic_dag/registry），Op 服务于 lowering 层。
+// 两者均为 SSOT 在各自层级，不是"待删除"代码。
 //
 // include! 模式：本文件被 include 到 graph.rs，与 op_kind.inc.rs / types.inc.rs
 // 共享作用域。KvSource/RopeScaling/AttentionStrategy/GatherIndicesKind/SymDim/DType

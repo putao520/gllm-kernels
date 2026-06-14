@@ -287,10 +287,16 @@ pub(super) fn emit_fusion_groups(
         // duplicate instructions with WRONG ABI parameters (CompiledLayerFn offsets
         // instead of MegaKernelFn offsets), causing memory corruption and wrong
         // control flow.
-        if matches!(anchor_op.kind,
-            OpKind::Argmax { .. } | OpKind::StoreToken | OpKind::CheckStopCondition
-            | OpKind::WriteLogits { .. } | OpKind::MtpDraft { .. }
-        ) {
+        // 从 Op（胖 opcode）识别采样 op — 不反查 op.kind。
+        let is_sampling_op = matches!(
+            crate::compiler::graph::Op::from_op_kind(anchor_op, graph),
+            Some(crate::compiler::graph::Op::Argmax { .. })
+            | Some(crate::compiler::graph::Op::StoreToken)
+            | Some(crate::compiler::graph::Op::CheckStopCondition)
+            | Some(crate::compiler::graph::Op::WriteLogits { .. })
+            | Some(crate::compiler::graph::Op::MtpDraft { .. })
+        );
+        if is_sampling_op {
             continue;
         }
 
@@ -759,8 +765,10 @@ pub(super) fn emit_fusion_groups(
                 if let Ok((m_dim, n, k)) = extract_gemm_dims_sym(op) {
                     let out_ptr = load_op_scratch_ptr(prog, scratch_base, op, alloc, resolver, current_abi)?;
                     let pm = ctx.pack_map_for_gemm(op.inputs.get(1).copied());
-                    let trans_b = match &op.kind {
-                        OpKind::Gemm { trans_b, .. } | OpKind::GemmBias { trans_b, .. } => *trans_b,
+                    // 从 Op（胖 opcode）读取 trans_b — 不反查 op.kind。
+                    let trans_b = match crate::compiler::graph::Op::from_op_kind(op, graph) {
+                        Some(crate::compiler::graph::Op::Gemm(spec))
+                        | Some(crate::compiler::graph::Op::GemmBias(spec)) => spec.trans_b,
                         _ => false,
                     };
                     prog.emit_scope(|p| -> Result<(), CompilerError> {

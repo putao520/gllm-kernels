@@ -380,16 +380,18 @@ pub(crate) fn compute_rope_requirement(
     for group in &plan.groups {
         for &op_id in &group.ops {
             let Some(op) = graph.op(op_id) else { continue };
+            // 从 Op（胖 opcode）读取 RoPE 参数 — 不反查 op.kind。
+            let Some(op_v2) = crate::compiler::graph::Op::from_op_kind(op, graph) else { continue };
             // Collect RoPE params from both standard RoPE and DualRoPE ops.
             // DualRoPE contributes two entries (sliding + global) simultaneously.
-            let rope_params: Vec<(usize, f64, f32, Option<RopeScaling>)> = match &op.kind {
-                OpKind::RoPE { head_dim, theta, partial, rope_scaling, .. } => {
-                    vec![(*head_dim, *theta, *partial, rope_scaling.clone())]
+            let rope_params: Vec<(usize, f64, f32, Option<RopeScaling>)> = match &op_v2 {
+                crate::compiler::graph::Op::RoPE(spec) => {
+                    vec![(spec.head_dim, spec.theta, spec.partial, spec.rope_scaling.clone())]
                 }
-                OpKind::DualRoPE { head_dim, sliding_theta, sliding_partial, global_theta, global_partial, rope_scaling, .. } => {
+                crate::compiler::graph::Op::DualRoPE(spec) => {
                     vec![
-                        (*head_dim, *sliding_theta, *sliding_partial, rope_scaling.clone()),
-                        (*head_dim, *global_theta, *global_partial, rope_scaling.clone()),
+                        (spec.head_dim, spec.sliding_theta, spec.sliding_partial, spec.rope_scaling.clone()),
+                        (spec.head_dim, spec.global_theta, spec.global_partial, spec.rope_scaling.clone()),
                     ]
                 }
                 _ => continue,
@@ -497,7 +499,9 @@ pub(crate) fn compute_dwc_requirement(
     for group in &plan.groups {
         for &op_id in &group.ops {
             let Some(op) = graph.op(op_id) else { continue };
-            if let OpKind::DepthwiseConv1D { channels, kernel_size, causal } = &op.kind {
+            // 从 Op（胖 opcode）读取 DepthwiseConv1D 参数 — 不反查 op.kind。
+            let Some(op_v2) = crate::compiler::graph::Op::from_op_kind(op, graph) else { continue };
+            if let crate::compiler::graph::Op::DepthwiseConv1D { channels, kernel_size, causal } = &op_v2 {
                 if *kernel_size == 0 {
                     return Err(CompilerError::CodegenViolation(
                         "DepthwiseConv1D: kernel_size=0 非法".into()));
@@ -586,7 +590,9 @@ fn compute_moe_packed_requirement(
     for group in &plan.groups {
         for &op_id in &group.ops {
             let Some(op) = graph.op(op_id) else { continue };
-            if let OpKind::MoEDispatchPacked { num_experts, top_k, intermediate_size, .. } = &op.kind {
+            // 从 Op（胖 opcode）读取 MoEDispatchPacked 参数 — 不反查 op.kind。
+            let Some(op_v2) = crate::compiler::graph::Op::from_op_kind(op, graph) else { continue };
+            if let crate::compiler::graph::Op::MoEDispatchPacked { num_experts, top_k, intermediate_size, .. } = &op_v2 {
                 let routing_overhead = (2 * top_k + num_experts) * elem;
                 let compute_buffers = 3 * intermediate_size * elem;
                 return routing_overhead + compute_buffers;
