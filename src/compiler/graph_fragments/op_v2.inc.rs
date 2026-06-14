@@ -574,6 +574,7 @@ impl Op {
             OpKind::KvCentroidPrefetch { seq_len, num_heads, head_dim, prefetch_distance } => Some(Op::KvCentroidPrefetch { seq_len: seq_len.clone(), num_heads: *num_heads, head_dim: *head_dim, prefetch_distance: *prefetch_distance }),
             OpKind::LayerBypass { threshold } => Some(Op::LayerBypass { threshold: *threshold }),
             OpKind::GateMask { hidden } => Some(Op::GateMask { hidden: *hidden }),
+            OpKind::LogitSoftcap { cap } => Some(Op::LogitSoftcap { cap: *cap }),
             OpKind::Softmax => Some(Op::Softmax),
             OpKind::SoftmaxWithEntropy { vocab_size } => Some(Op::SoftmaxWithEntropy { vocab_size: *vocab_size }),
             OpKind::AltUpPredict { seq_len, num_preds, hidden } => Some(Op::AltUpPredict { seq_len: seq_len.clone(), num_preds: *num_preds, hidden: *hidden }),
