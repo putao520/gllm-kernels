@@ -8,36 +8,19 @@ use super::vm_state::AbiPtrs;
 use super::plan_lower::{
     LoweringContext, TensorPtrResolver,
     resolve_sym_dim, infer_output_shape_sym,
-    build_norm_pattern, build_norm_pattern_head_rms, build_norm_pattern_qk,
+    build_norm_pattern_qk,
     emit_elementwise_inline,
     try_dispatch_reduction, extract_op_trace,
 };
-use super::quant_gather_emit::emit_quant_gather_inline;
 use super::norm_softmax_emit::{
-    emit_normlike_inline, emit_layernorm_auto,
+    emit_normlike_inline,
     emit_softmax_inline, emit_softmax_telemetry,
     NormKind,
 };
-use super::vision_audio_emit::{
-    lower_depthwise_conv1d, lower_patch_embed,
-};
-use super::auto_select;
-use super::attention_emit::emit_tiled_attention_inline;
-use super::gemm_emit::emit_gemm_inline_with_hook;
-use super::moe_quant_emit::{
-    emit_moe_router_gemv_inline, emit_moe_topk_dispatch_inline,
-    emit_moe_packed_inline, emit_quant_gemm_inline,
-};
-use super::structural_emit::{emit_gather_inline, emit_column_slice_inline, emit_rope_inline};
-use super::telemetry_emit::{
-    emit_rmsnorm_channel_scale_telemetry,
-    emit_residual_with_telemetry,
-};
-use super::structural_builder::StructuralOpBuilder;
 
 use crate::compiler::graph::{CompilerGraph, OpKind, SymDim};
 use crate::compiler::registry::ScalarOpRegistry;
-use crate::compiler::trace::{ComputePattern, QuantPrecision, TraceOp, ValueId};
+use crate::compiler::trace::{ComputePattern, QuantPrecision};
 use crate::types::CompilerError;
 
 /// Structural op dispatch (ARCH-AUTO-INSTR-SELECT Category C/D).
@@ -593,74 +576,9 @@ pub(crate) fn dispatch_compute_pattern(
         let op_trace = ctx.session.registry.and_then(|r| r.get_trace(&key));
         if let Some(trace) = op_trace {
             match &trace.pattern {
-                // ── NormLike → emit_normlike_inline / emit_layernorm_auto ──
+                // ── NormLike → QkNorm / L2Normalize（RmsNorm/LayerNorm/ValueNorm/HeadRmsNorm 已迁移 lower_op_v2）──
                 ComputePattern::NormLike { .. } => {
                     match &op.kind {
-                        OpKind::RmsNorm { feature_dim, .. } | OpKind::ValueNorm { feature_dim, .. } => {
-                            let feature_dim_v = *feature_dim;
-                            let out_tid = op.outputs.first().copied().ok_or_else(|| CompilerError::CodegenViolation(
-                                format!("Norm op {:?}: 无输出张量", op.id)))?;
-                            let out_tensor = graph.tensor(out_tid).ok_or_else(|| CompilerError::CodegenViolation(
-                                format!("Norm op {:?}: 输出张量 {:?} 不存在", op.id, out_tid)))?;
-                            let seq_dim = match out_tensor.shape.iter().find(|d| d.is_symbolic()).cloned() {
-                                Some(sym) => sym,
-                                None => {
-                                    if out_tensor.shape.len() >= 2 {
-                                        let outer: usize = out_tensor.shape[..out_tensor.shape.len() - 1]
-                                            .iter().map(|d| d.as_concrete().unwrap_or(1)).product();
-                                        SymDim::Concrete(outer)
-                                    } else { SymDim::Concrete(1) }
-                                }
-                            };
-                            // Mega-kernel decode: each iteration processes 1 token.
-                            let seq_bound = if abi.mega_decode_seq_len.is_some() {
-                                BoundExpr::Const(1)
-                            } else {
-                                resolve_sym_dim(&seq_dim, abi, sym_map)
-                            };
-                            let norm_kind = match op.kind {
-                                OpKind::RmsNorm { .. } => NormKind::RmsNorm,
-                                OpKind::ValueNorm { .. } => NormKind::ValueNorm,
-                                _ => unreachable!(),
-                            };
-                            let pattern = build_norm_pattern(op)?;
-                            emit_normlike_inline(
-                                prog, &pattern, feature_dim_v, /*groups_per_row=*/1,
-                                /*broadcast_weight=*/false, norm_kind,
-                                width, seq_bound, input_ptr, weight_ptr, output_ptr,
-                                ctx.dtype,
-                            )?;
-                            if graph.telemetry.rmsnorm_channel_scale {
-                                emit_rmsnorm_channel_scale_telemetry(prog, input_ptr, feature_dim_v, width, sym_map, ctx.dtype)?;
-                            }
-                            return Ok(true);
-                        }
-                        OpKind::LayerNorm { feature_dim, eps } => {
-                            let feature_dim_v = *feature_dim;
-                            let out_tid = op.outputs.first().copied().ok_or_else(|| CompilerError::CodegenViolation(
-                                format!("LayerNorm op {:?}: 无输出张量", op.id)))?;
-                            let out_tensor = graph.tensor(out_tid).ok_or_else(|| CompilerError::CodegenViolation(
-                                format!("LayerNorm op {:?}: 输出张量 {:?} 不存在", op.id, out_tid)))?;
-                            let seq_dim = match out_tensor.shape.iter().find(|d| d.is_symbolic()).cloned() {
-                                Some(sym) => sym,
-                                None => {
-                                    if out_tensor.shape.len() >= 2 {
-                                        let outer: usize = out_tensor.shape[..out_tensor.shape.len() - 1]
-                                            .iter().map(|d| d.as_concrete().unwrap_or(1)).product();
-                                        SymDim::Concrete(outer)
-                                    } else { SymDim::Concrete(1) }
-                                }
-                            };
-                            // Mega-kernel decode: each iteration processes 1 token.
-                            let seq_bound = if abi.mega_decode_seq_len.is_some() {
-                                BoundExpr::Const(1)
-                            } else {
-                                resolve_sym_dim(&seq_dim, abi, sym_map)
-                            };
-                            emit_layernorm_auto(prog, feature_dim_v, *eps, width, seq_bound,
-                                input_ptr, weight_ptr, output_ptr, ctx.dtype)?;
-                            return Ok(true);
-                        }
                         OpKind::QkNorm { head_dim, eps } => {
                             let head_dim_v = *head_dim;
                             if head_dim_v == 0 {
@@ -689,40 +607,6 @@ pub(crate) fn dispatch_compute_pattern(
                             emit_normlike_inline(
                                 prog, &pattern, head_dim_v, num_heads,
                                 /*broadcast_weight=*/false, NormKind::ValueNorm,
-                                width, seq_bound, input_ptr, weight_ptr, output_ptr,
-                                ctx.dtype,
-                            )?;
-                            return Ok(true);
-                        }
-                        OpKind::HeadRmsNorm { head_dim, eps } => {
-                            let head_dim_v = *head_dim;
-                            if head_dim_v == 0 {
-                                return Err(CompilerError::CodegenViolation("HeadRmsNorm: head_dim must be > 0".into()));
-                            }
-                            let out_tid = op.outputs.first().copied().ok_or_else(|| CompilerError::CodegenViolation(
-                                format!("HeadRmsNorm op {:?}: 无输出张量", op.id)))?;
-                            let out_tensor = graph.tensor(out_tid).ok_or_else(|| CompilerError::CodegenViolation(
-                                format!("HeadRmsNorm op {:?}: 输出张量不存在", op.id)))?;
-                            let total_concrete: usize = out_tensor.shape.iter()
-                                .filter(|d| !d.is_symbolic()).map(|d| d.as_concrete().unwrap_or(1)).product();
-                            if total_concrete % head_dim_v != 0 {
-                                return Err(CompilerError::CodegenViolation(format!(
-                                    "HeadRmsNorm op {:?}: total concrete elems {} not divisible by head_dim {}",
-                                    op.id, total_concrete, head_dim_v)));
-                            }
-                            let num_heads = total_concrete / head_dim_v;
-                            let sym_dim = out_tensor.shape.iter().find(|d| d.is_symbolic()).cloned();
-                            let outer_seq = sym_dim.unwrap_or(SymDim::Concrete(1));
-                            // Mega-kernel decode: each iteration processes 1 token.
-                            let seq_bound = if abi.mega_decode_seq_len.is_some() {
-                                BoundExpr::Const(1)
-                            } else {
-                                resolve_sym_dim(&outer_seq, abi, sym_map)
-                            };
-                            let pattern = build_norm_pattern_head_rms(*eps)?;
-                            emit_normlike_inline(
-                                prog, &pattern, head_dim_v, num_heads,
-                                /*broadcast_weight=*/true, NormKind::HeadRmsNorm,
                                 width, seq_bound, input_ptr, weight_ptr, output_ptr,
                                 ctx.dtype,
                             )?;
