@@ -139,7 +139,7 @@ impl GraphDerivedGeometry {
             num_kv_heads: num_kv_heads.unwrap_or(num_heads.unwrap_or(1)),
             head_dim: head_dim.unwrap_or(hidden / num_heads.unwrap_or(1).max(1)),
             intermediate,
-            vocab_size: vocab_size.unwrap_or(hidden),
+            vocab_size: vocab_size.unwrap_or(0),
             compute_dtype,
             storage_dtype,
             rms_eps: rms_eps.unwrap_or(1e-5),
@@ -393,7 +393,7 @@ mod tests {
         assert_eq!(geo.rms_eps, 1e-5);
         assert_eq!(geo.rope_theta, 10000.0);
         assert_eq!(geo.rope_partial, 1.0);
-        assert_eq!(geo.vocab_size, 256); // falls back to hidden
+        assert_eq!(geo.vocab_size, 0); // no Argmax/Gather → 0
         assert!(geo.rope_scaling.is_none());
     }
 
@@ -1344,7 +1344,7 @@ mod tests {
     }
 
     #[test]
-    fn vocab_size_falls_back_to_hidden_when_no_gather_or_argmax() {
+    fn vocab_size_is_zero_when_no_gather_or_argmax() {
         // Arrange: graph with no Gather, QuantGather, or Argmax ops.
         let mut g = CompilerGraph::new();
         let dt = DType::F32;
@@ -1357,8 +1357,8 @@ mod tests {
         // Act
         let geo = GraphDerivedGeometry::from_graph(&g, &DeviceProfile::detect()).unwrap();
 
-        // Assert: vocab_size falls back to hidden.
-        assert_eq!(geo.vocab_size, 1024);
+        // Assert: vocab_size is 0 when no logits-producing op exists.
+        assert_eq!(geo.vocab_size, 0);
     }
 
     #[test]

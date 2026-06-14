@@ -842,6 +842,16 @@ pub(super) fn emit_fusion_groups(
                 .unwrap_or(weight_ptr);
             let group_output_ptr = anchor_op.outputs.first()
                 .and_then(|&tid| resolver.materialize(prog, tid, current_abi))
+                .or_else(|| {
+                    // Fallback: for EpilogueInjection, the anchor's output tensor
+                    // may not be in the resolver map (it's an intermediate consumed
+                    // by the epilogue op). Try the terminal op's output instead,
+                    // since GEMM+epilogue share the same physical buffer.
+                    group.epilogue.last()
+                        .and_then(|&oid| graph.op(oid))
+                        .and_then(|op| op.outputs.first().copied())
+                        .and_then(|tid| resolver.materialize(prog, tid, current_abi))
+                })
                 .unwrap_or(output_ptr);
 
             // §4 CompoundExecution: 先按 FusionMode dispatch，再按 OpKind
