@@ -302,9 +302,26 @@ impl InferenceBackend for CpuInferenceBackend {
                     for t in 0..cached_len {
                         let pid = seq_pages[t / PAGE_SIZE];
                         let off = t % PAGE_SIZE;
-                        let vp = kv_cache.page_ptr(pid) as *const f32;
+                        let vp = kv_cache.page_ptr(pid);
                         let v_off = v_base + kv_h * PAGE_SIZE * head_dim + off * head_dim + d;
-                        val += scores[t] * unsafe { *vp.add(v_off) };
+                        let byte_off = v_off * elem_bytes;
+                        let v_val = unsafe {
+                            match kv_dtype {
+                                DType::F32 => *(vp.add(byte_off) as *const f32),
+                                DType::BF16 => {
+                                    (*(vp.add(byte_off) as *const half::bf16)).to_f32()
+                                }
+                                DType::F16 => {
+                                    (*(vp.add(byte_off) as *const half::f16)).to_f32()
+                                }
+                                other => {
+                                    return Err(InferenceError::Unsupported(format!(
+                                        "dtype {other:?} for KV cache V read"
+                                    )));
+                                }
+                            }
+                        };
+                        val += scores[t] * v_val;
                     }
                     attn_out[q_off + d] = val;
                 }
