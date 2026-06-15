@@ -16,7 +16,7 @@ use crate::compiler::buffer_alloc::BufferAllocation;
 use crate::compiler::codegen::vm::isa_profile::IsaProfile;
 use crate::compiler::codegen::vm::stack_frame::GemmBlocking;
 use crate::compiler::fusion::FusionPlan;
-use crate::compiler::graph::{CompilerGraph, OpKind};
+use crate::compiler::graph::{CompilerGraph, Op};
 
 // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 // §1.2 BufferLayout — 内存区间图着色 (REQ-GRP-002)
@@ -673,9 +673,7 @@ pub fn plan_mega_kernel_resources(
         .map(|g| {
             g.ops.iter().any(|&op_id| {
                 graph.op(op_id).is_some_and(|op| {
-                    matches!(op.kind, OpKind::Gemm { .. }
-                        | OpKind::GemmBias { .. }
-                        | OpKind::QuantGemm { .. })
+                    matches!(op.op_v2_resolved(graph), Some(Op::Gemm(_)) | Some(Op::GemmBias(_)) | Some(Op::QuantGemm(_)))
                 })
             })
         })
@@ -715,8 +713,9 @@ fn derive_loop_invariants_from_graph(graph: &CompilerGraph, hidden_dim: usize) -
     let mut rope_added = false;
     let mut packed_added = false;
     for op in &graph.ops {
-        match &op.kind {
-            OpKind::RoPE { .. } if !rope_added => {
+        let op_v2 = op.op_v2_resolved(graph);
+        match &op_v2 {
+            Some(Op::RoPE(_)) if !rope_added => {
                 invariants.push(LoopInvariant {
                     kind: InvariantKind::RopeTablePtr,
                     location: InvariantLocation::Stack(-256),
@@ -724,7 +723,7 @@ fn derive_loop_invariants_from_graph(graph: &CompilerGraph, hidden_dim: usize) -
                 });
                 rope_added = true;
             }
-            OpKind::QuantGemm { .. } | OpKind::Gather { .. } if !packed_added => {
+            Some(o) if (o.is_quant_gemm() || matches!(o, Op::Gather { .. })) && !packed_added => {
                 invariants.push(LoopInvariant {
                     kind: InvariantKind::PackMapBase,
                     location: InvariantLocation::Gpr(0),
