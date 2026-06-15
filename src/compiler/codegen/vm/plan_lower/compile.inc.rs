@@ -58,7 +58,7 @@ pub fn compile_layer_with_sym_map(
     // 从 plan 中找到第一个 GEMM op 的真实维度 (无 GEMM 则跳过策略查询)
     if let Some((m_dim, n, k)) = plan.groups.iter()
         .filter_map(|g| graph.op(g.anchor))
-        .filter_map(|op| extract_gemm_dims_sym(op).ok())
+        .filter_map(|op| extract_gemm_dims_sym(op, graph).ok())
         .next()
     {
         let m_alloc = match &m_dim {
@@ -909,16 +909,8 @@ pub(super) fn emit_standalone_op(
 /// **Category D** (permanent, cannot use auto_select):
 /// GEMM 维度提取——保留完整 SymDim（ARCH-SYMDIM-NO-UNWRAP）。
 /// 返回 (m_sym, n, k)。调用方通过 sym_map.to_bound(&m_sym) 获取循环 bound。
-pub(super) fn extract_gemm_dims_sym(op: &crate::compiler::graph::CompilerOp) -> Result<(SymDim, usize, usize), CompilerError> {
-    match &op.kind {
-        OpKind::Gemm { m, n, k, .. } | OpKind::GemmBias { m, n, k, .. } | OpKind::QuantGemm { m, n, k, .. } => {
-            Ok((m.clone(), *n, *k))
-        }
-        OpKind::FusedRmsNormGemm { m, n, k, .. } | OpKind::MaskedGemm { m, n, k, .. } => {
-            Ok((m.clone(), *n, *k))
-        }
-        _ => Err(CompilerError::CodegenViolation(format!("not a GEMM op: {:?}", op.kind))),
-    }
+pub(super) fn extract_gemm_dims_sym(op: &crate::compiler::graph::CompilerOp, graph: &CompilerGraph) -> Result<(SymDim, usize, usize), CompilerError> {
+    op.op_v2_gemm_dims(graph).ok_or_else(|| CompilerError::CodegenViolation(format!("not a GEMM op: {:?}", op.kind)))
 }
 
 /// 从 FusionGroup 的 epilogue ops 收集合并的 TraceOp 链。

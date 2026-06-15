@@ -377,6 +377,19 @@ impl Op {
         matches!(self, Op::QuantGemm(_))
     }
 
+    /// 提取 GEMM 维度（胖 opcode 自描述）。
+    /// 替代 `extract_gemm_dims_sym` 中
+    /// `match op.kind { OpKind::Gemm{m,n,k,..} | OpKind::GemmBias{m,n,k,..} | ... => (m,n,k) }`。
+    /// 返回 None 表示非 GEMM 类 op。
+    pub fn gemm_dims(&self) -> Option<(SymDim, usize, usize)> {
+        match self {
+            Op::Gemm(spec) | Op::GemmBias(spec) => Some((spec.m.clone(), spec.n, spec.k)),
+            Op::QuantGemm(spec) => Some((spec.m.clone(), spec.n, spec.k)),
+            Op::FusedRmsNormGemm { m, n, k, .. } | Op::MaskedGemm { m, n, k, .. } => Some((m.clone(), *n, *k)),
+            _ => None,
+        }
+    }
+
 
     ///
     /// dtype 从 op.inputs[0] 的 tensor 推导（ARCH-DTYPE-JIT-TYPED）。

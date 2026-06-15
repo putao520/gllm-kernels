@@ -334,7 +334,7 @@ pub(super) fn emit_fusion_group_by_mode(
         }
 
         FusionMode::EpilogueInjection => {
-            let (m_dim, n, k) = extract_gemm_dims_sym(anchor_op)?;
+            let (m_dim, n, k) = extract_gemm_dims_sym(anchor_op, graph)?;
             let epi_trace = collect_epilogue_trace(group, graph, registry)?;
             for op in &epi_trace {
                 if let crate::compiler::trace::TraceOp::Input(n) = op {
@@ -430,7 +430,7 @@ pub(super) fn emit_fusion_group_by_mode(
                 emit_standalone_op(p, norm_op, graph, ctx,
                     norm_input_ptr, norm_weight_ptr, scratch_ptr, rope_cache_offset,
                     resolver, abi)?;
-                let (m_dim, n, k) = extract_gemm_dims_sym(anchor_op)?;
+                let (m_dim, n, k) = extract_gemm_dims_sym(anchor_op, graph)?;
                 let pm = ctx.pack_map_for_gemm(anchor_op.inputs.get(1).copied());
                 let norm_into_gemm_trans_b = anchor_op.op_v2_gemm_trans_b(graph);
                 emit_gemm_inline_with_hook(p, &m_dim, n, k, ctx,
@@ -452,7 +452,7 @@ pub(super) fn emit_fusion_group_by_mode(
         FusionMode::QkvSharedInput => {
             for &op_id in &group.ops {
                 if let Some(op) = graph.op(op_id) {
-                    if let Ok((m_dim, n, k)) = extract_gemm_dims_sym(op) {
+                    if let Ok((m_dim, n, k)) = extract_gemm_dims_sym(op, graph) {
                         let out_ptr = load_op_scratch_ptr(prog, scratch_base, op, alloc, resolver, abi)?;
                         let gemm_input = op.inputs.first().copied()
                             .and_then(|tid| resolver.materialize(prog, tid, abi))
@@ -496,7 +496,7 @@ pub(super) fn emit_fusion_group_by_mode(
                 pre_input_ptr, pre_weight_ptr, pre_scratch, rope_cache_offset,
                 resolver, abi)?;
 
-            let (m_dim, n, k) = extract_gemm_dims_sym(anchor_op)?;
+            let (m_dim, n, k) = extract_gemm_dims_sym(anchor_op, graph)?;
             let pm = ctx.pack_map_for_gemm(anchor_op.inputs.get(1).copied());
             let pre_fusion_trans_b = anchor_op.op_v2_gemm_trans_b(graph);
             emit_gemm_inline_with_hook(prog, &m_dim, n, k, ctx,
@@ -531,7 +531,7 @@ pub(super) fn emit_fusion_group_by_mode(
                 Ok(())
             })?;
 
-            let (m_dim, n, k) = extract_gemm_dims_sym(anchor_op)?;
+            let (m_dim, n, k) = extract_gemm_dims_sym(anchor_op, graph)?;
             let pm = ctx.pack_map_for_gemm(anchor_op.inputs.get(1).copied());
             let pre_fusion_trans_b = anchor_op.op_v2_gemm_trans_b(graph);
             emit_gemm_inline_with_hook(prog, &m_dim, n, k, ctx,
@@ -562,7 +562,7 @@ pub(super) fn emit_fusion_group_by_mode(
             let gate_weight = gate_op.inputs.get(1).copied()
                 .and_then(|tid| resolver.materialize(prog, tid, abi))
                 .unwrap_or(weight_ptr);
-            if let Ok((m_dim, n, k)) = extract_gemm_dims_sym(gate_op) {
+            if let Ok((m_dim, n, k)) = extract_gemm_dims_sym(gate_op, graph) {
                 let pm = ctx.pack_map_for_gemm(gate_op.inputs.get(1).copied());
                 let gate_trans_b = gate_op.op_v2_gemm_trans_b(graph);
                 prog.emit_scope(|p| -> Result<(), CompilerError> {
@@ -586,7 +586,7 @@ pub(super) fn emit_fusion_group_by_mode(
             let up_weight = up_op.inputs.get(1).copied()
                 .and_then(|tid| resolver.materialize(prog, tid, abi))
                 .unwrap_or(weight_ptr);
-            if let Ok((m_dim, n, k)) = extract_gemm_dims_sym(up_op) {
+            if let Ok((m_dim, n, k)) = extract_gemm_dims_sym(up_op, graph) {
                 let pm = ctx.pack_map_for_gemm(up_op.inputs.get(1).copied());
                 let up_trans_b = up_op.op_v2_gemm_trans_b(graph);
                 prog.emit_scope(|p| -> Result<(), CompilerError> {
@@ -666,7 +666,7 @@ pub(super) fn emit_fusion_group_by_mode(
         FusionMode::FusedQkvNormRope { gemm_q, gemm_k, gemm_v, .. } => {
             for &op_id in &[*gemm_q, *gemm_k, *gemm_v] {
                 if let Some(op) = graph.op(op_id) {
-                    if let Ok((m_dim, n, k)) = extract_gemm_dims_sym(op) {
+                    if let Ok((m_dim, n, k)) = extract_gemm_dims_sym(op, graph) {
                         let out_ptr = load_op_scratch_ptr(prog, scratch_base, op, alloc, resolver, abi)?;
                         let gemm_input = op.inputs.first().copied()
                             .and_then(|tid| resolver.materialize(prog, tid, abi))

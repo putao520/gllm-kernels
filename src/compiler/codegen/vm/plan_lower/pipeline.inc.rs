@@ -762,7 +762,7 @@ pub(super) fn emit_fusion_groups(
                     .unwrap_or(weight_ptr);
 
                 // Emit single GEMM for this op
-                if let Ok((m_dim, n, k)) = extract_gemm_dims_sym(op) {
+                if let Ok((m_dim, n, k)) = extract_gemm_dims_sym(op, graph) {
                     let out_ptr = load_op_scratch_ptr(prog, scratch_base, op, alloc, resolver, current_abi)?;
                     let pm = ctx.pack_map_for_gemm(op.inputs.get(1).copied());
                     // 从 Op（胖 opcode）读取 trans_b — 优先 op_v2 缓存。

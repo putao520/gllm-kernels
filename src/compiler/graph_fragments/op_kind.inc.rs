@@ -970,6 +970,13 @@ impl CompilerOp {
     pub fn op_v2_gemm_trans_b(&self, graph: &CompilerGraph) -> bool {
         self.op_v2_resolved(graph).and_then(|o| o.gemm_trans_b()).unwrap_or(false)
     }
+
+    /// 提取 GEMM 维度（胖 opcode 自描述）。
+    /// 替代 `extract_gemm_dims_sym` 中
+    /// `match op.kind { OpKind::Gemm{m,n,k,..} | ... => (m.clone(),*n,*k), _ => Err(...) }`。
+    pub fn op_v2_gemm_dims(&self, graph: &CompilerGraph) -> Option<(crate::compiler::graph::SymDim, usize, usize)> {
+        self.op_v2_resolved(graph).and_then(|o| o.gemm_dims())
+    }
 }
 
 // ── CompilerGraph ──────────────────────────────────────────────────
