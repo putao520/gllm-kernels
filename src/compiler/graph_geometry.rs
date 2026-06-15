@@ -9,7 +9,7 @@
 //! (max_seq_len, business_config) in the external config.
 
 use crate::types::{DType, InferenceError};
-use super::graph::{CompilerGraph, OpKind, RopeScaling, SymDim};
+use super::graph::{CompilerGraph, Op, RopeScaling, SymDim};
 use super::dtype_chain::derive_compute_dtype;
 use crate::dispatch::device_profile::DeviceProfile;
 
@@ -72,41 +72,35 @@ impl GraphDerivedGeometry {
         let mut vocab_size = None;
 
         let mut rope_found = false;
-        // Scan ops for OpKind-embedded parameters.
+        // Scan ops for Op v2 Spec 参数（胖 opcode 自描述）。
         for op in &graph.ops {
-            match &op.kind {
-                OpKind::RoPE {
-                    num_heads: nh,
-                    head_dim: hd,
-                    theta,
-                    partial,
-                    rope_scaling: rs,
-                } => {
-                    if num_heads.is_none() { num_heads = Some(*nh); }
-                    if head_dim.is_none() { head_dim = Some(*hd); }
+            match op.op_v2_resolved(graph) {
+                Some(Op::RoPE(spec)) => {
+                    if num_heads.is_none() { num_heads = Some(spec.num_heads); }
+                    if head_dim.is_none() { head_dim = Some(spec.head_dim); }
                     if !rope_found {
-                        rope_theta = Some(*theta);
-                        rope_partial = Some(*partial);
-                        rope_scaling = *rs;
+                        rope_theta = Some(spec.theta);
+                        rope_partial = Some(spec.partial);
+                        rope_scaling = spec.rope_scaling;
                         rope_found = true;
                     }
                 }
-                OpKind::MultiHeadAttention { num_heads: nh, num_kv_heads: nkv, head_dim: hd, .. } => {
-                    if num_heads.is_none() { num_heads = Some(*nh); }
-                    if num_kv_heads.is_none() { num_kv_heads = Some(*nkv); }
-                    if head_dim.is_none() { head_dim = Some(*hd); }
+                Some(Op::MultiHeadAttention(spec)) => {
+                    if num_heads.is_none() { num_heads = Some(spec.geometry.num_q_heads); }
+                    if num_kv_heads.is_none() { num_kv_heads = Some(spec.geometry.num_kv_heads); }
+                    if head_dim.is_none() { head_dim = Some(spec.geometry.head_dim); }
                 }
-                OpKind::RmsNorm { eps, .. } | OpKind::LayerNorm { eps, .. } | OpKind::ValueNorm { eps, .. } => {
-                    if rms_eps.is_none() { rms_eps = Some(*eps); }
+                Some(Op::RmsNorm(spec)) | Some(Op::LayerNorm(spec)) | Some(Op::ValueNorm(spec)) => {
+                    if rms_eps.is_none() { rms_eps = Some(spec.eps); }
                 }
-                OpKind::Gather { table_rows, .. } => {
-                    if vocab_size.is_none() { vocab_size = Some(*table_rows); }
+                Some(Op::Gather { table_rows, .. }) => {
+                    if vocab_size.is_none() { vocab_size = Some(table_rows); }
                 }
-                OpKind::QuantGather { vocab_size: vs, .. } => {
-                    if vocab_size.is_none() { vocab_size = Some(*vs); }
+                Some(Op::QuantGather { vocab_size: vs, .. }) => {
+                    if vocab_size.is_none() { vocab_size = Some(vs); }
                 }
-                OpKind::Argmax { vocab_size: vs }
-                    if vocab_size.is_none() => { vocab_size = Some(*vs); }
+                Some(Op::Argmax { vocab_size: vs })
+                    if vocab_size.is_none() => { vocab_size = Some(vs); }
                 _ => {}
             }
         }
@@ -174,19 +168,13 @@ fn derive_hidden(graph: &CompilerGraph) -> Result<usize, InferenceError> {
     }
     // Fallback: scan ops for hidden dimension indicators.
     for op in &graph.ops {
-        if let OpKind::Gemm { k, .. } = op.kind {
+        if let Some((_, _, k)) = op.op_v2_gemm_dims(graph) {
             return Ok(k);
         }
-        if let OpKind::GemmBias { k, .. } = op.kind {
-            return Ok(k);
-        }
-        if let OpKind::QuantGemm { k, .. } = op.kind {
-            return Ok(k);
-        }
-        if let OpKind::Gather { embed_dim, .. } = op.kind {
+        if let Some(Op::Gather { embed_dim, .. }) = op.op_v2_resolved(graph) {
             return Ok(embed_dim);
         }
-        if let OpKind::PatchEmbed { embed_dim, .. } = op.kind {
+        if let Some(Op::PatchEmbed { embed_dim, .. }) = op.op_v2_resolved(graph) {
             return Ok(embed_dim);
         }
         // Elementwise ops (Residual, BinaryElementwise, etc.) don't carry
@@ -231,10 +219,9 @@ fn derive_storage_dtype(graph: &CompilerGraph) -> DType {
 fn derive_intermediate(graph: &CompilerGraph, hidden: usize) -> Result<usize, InferenceError> {
     let mut max_n_not_hidden = 0usize;
     for op in &graph.ops {
-        let n = match &op.kind {
-            OpKind::Gemm { n, k, .. } if *k == hidden => *n,
-            OpKind::GemmBias { n, k, .. } if *k == hidden => *n,
-            OpKind::QuantGemm { n, k, .. } if *k == hidden => *n,
+        // 胖 opcode 自描述：从 Op v2 Spec 读 GEMM 维度
+        let (n, k) = match op.op_v2_gemm_dims(graph) {
+            Some((_, n, k)) if k == hidden => (n, k),
             _ => continue,
         };
         // Skip attention projections (n == hidden * num_heads / head related).
@@ -246,9 +233,9 @@ fn derive_intermediate(graph: &CompilerGraph, hidden: usize) -> Result<usize, In
     // If no GEMM with n > hidden found, check for any GEMM with n != hidden.
     if max_n_not_hidden == 0 {
         for op in &graph.ops {
-            let n = match &op.kind {
-                OpKind::Gemm { n, k, .. } if *k == hidden => *n,
-                OpKind::GemmBias { n, k, .. } if *k == hidden => *n,
+            let (n, k) = match op.op_v2_gemm_dims(graph) {
+                // 仅 Gemm/GemmBias（不含 QuantGemm）
+                Some((_, n, k)) if k == hidden && matches!(op.op_v2_resolved(graph), Some(Op::Gemm(_)) | Some(Op::GemmBias(_))) => (n, k),
                 _ => continue,
             };
             if n != hidden && n > max_n_not_hidden {

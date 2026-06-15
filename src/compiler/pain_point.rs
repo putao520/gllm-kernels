@@ -5,7 +5,7 @@
 //! 零运行时依赖 — 所有输入在编译时已知。
 
 use std::collections::HashMap;
-use crate::compiler::graph::{CompilerGraph, OpId, OpKind};
+use crate::compiler::graph::{CompilerGraph, Op, OpId, OpKind};
 use crate::dispatch::device_profile::DeviceProfile;
 
 /// GEMM 在模型中的角色 (影响融合策略选择)
@@ -256,8 +256,8 @@ impl PainPointAnalyzer {
         let all_gemms_in_order: Vec<OpId> = graph.topological_sort()
             .into_iter()
             .filter(|&op_id| {
-                graph.op(op_id).is_some_and(|op| matches!(op.kind,
-                    OpKind::Gemm { .. } | OpKind::GemmBias { .. } | OpKind::QuantGemm { .. }))
+                graph.op(op_id).is_some_and(|op| matches!(op.op_v2_resolved(graph),
+                    Some(Op::Gemm(_)) | Some(Op::GemmBias(_)) | Some(Op::QuantGemm(_))))
             })
             .collect();
 
@@ -267,17 +267,16 @@ impl PainPointAnalyzer {
                 None => continue,
             };
 
-            let (m, n, k) = match &op.kind {
-                OpKind::Gemm { m, n, k, .. }
-                | OpKind::GemmBias { m, n, k, .. }
-                | OpKind::QuantGemm { m, n, k, .. } => {
+            // 胖 opcode 自描述：从 Op v2 Spec 读 GEMM 维度
+            let (m, n, k) = match op.op_v2_gemm_dims(graph) {
+                Some((m_dim, n_val, k_val)) => {
                     // ARCH-SYMDIM-DEGRADE: cost model uses max_for_allocation for conservative estimate.
                     // TODO(G-2): preserve symbolic form for tighter bounds.
-                    let m_val = m.max_for_allocation_strict()
+                    let m_val = m_dim.max_for_allocation_strict()
                         .expect("ARCH-SYMDIM: SymDim must have max_value in pain_point analysis");
-                    (m_val, *n, *k)
+                    (m_val, n_val, k_val)
                 }
-                _ => continue,
+                None => continue,
             };
 
             let role = classify_gemm_role(op_id, graph, &all_gemms_in_order);
