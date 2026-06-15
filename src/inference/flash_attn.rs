@@ -362,6 +362,8 @@ pub fn flash_attn_decode_paged(
     let seq_pages = kv_cache.seq_pages(layer, seq_idx);
     let v_base = num_kv_heads * PAGE_SIZE * hd;
     let tile_kv = config.tile_kv.min(cached_len);
+    let kv_dtype = kv_cache.dtype();
+    let elem_bytes = kv_dtype.size_bytes();
 
     if cached_len == 0 {
         for v in output.iter_mut() {
@@ -408,11 +410,24 @@ pub fn flash_attn_decode_paged(
 
                 let pid = seq_pages[t / PAGE_SIZE];
                 let off = t % PAGE_SIZE;
-                let kp = kv_cache.page_ptr(pid) as *const f32;
+                let kp = kv_cache.page_ptr(pid);
                 let k_base = kv_h * PAGE_SIZE * hd + off * hd;
                 let mut dot = 0.0f32;
                 for d in 0..hd {
-                    dot += q[q_off + d] * unsafe { *kp.add(k_base + d) };
+                    let byte_off = (k_base + d) * elem_bytes;
+                    let k_val = unsafe {
+                        match kv_dtype {
+                            crate::types::DType::F32 => *(kp.add(byte_off) as *const f32),
+                            crate::types::DType::BF16 => {
+                                (*(kp.add(byte_off) as *const half::bf16)).to_f32()
+                            }
+                            crate::types::DType::F16 => {
+                                (*(kp.add(byte_off) as *const half::f16)).to_f32()
+                            }
+                            other => panic!("unsupported KV cache dtype for K read: {other:?}"),
+                        }
+                    };
+                    dot += q[q_off + d] * k_val;
                 }
                 tile_scores[ti] = dot * scale;
             }
@@ -438,10 +453,23 @@ pub fn flash_attn_decode_paged(
                 let t = kv_start + ti;
                 let pid = seq_pages[t / PAGE_SIZE];
                 let off = t % PAGE_SIZE;
-                let vp = kv_cache.page_ptr(pid) as *const f32;
+                let vp = kv_cache.page_ptr(pid);
                 let v_page_off = v_base + kv_h * PAGE_SIZE * hd + off * hd;
                 for d in 0..hd {
-                    output[o_off + d] += w * unsafe { *vp.add(v_page_off + d) };
+                    let byte_off = (v_page_off + d) * elem_bytes;
+                    let v_val = unsafe {
+                        match kv_dtype {
+                            crate::types::DType::F32 => *(vp.add(byte_off) as *const f32),
+                            crate::types::DType::BF16 => {
+                                (*(vp.add(byte_off) as *const half::bf16)).to_f32()
+                            }
+                            crate::types::DType::F16 => {
+                                (*(vp.add(byte_off) as *const half::f16)).to_f32()
+                            }
+                            other => panic!("unsupported KV cache dtype for V read: {other:?}"),
+                        }
+                    };
+                    output[o_off + d] += w * v_val;
                 }
                 row_sum += w;
             }
