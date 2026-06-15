@@ -189,15 +189,42 @@ impl InferenceBackend for CpuInferenceBackend {
             let (page_id, offset_in_page) = kv_positions[0];
 
             // Write K/V into cache page
-            // Page layout: [2 (K+V), num_kv_heads, PAGE_SIZE, head_dim] as f32
+            // Page layout: [2 (K+V), num_kv_heads, PAGE_SIZE, head_dim] in kv_dtype
             let v_base = num_kv_heads * PAGE_SIZE * head_dim;
-            let page_ptr = kv_cache.page_mut_ptr(page_id) as *mut f32;
+            let kv_dtype = kv_cache.dtype();
+            let elem_bytes = kv_dtype.size_bytes();
+            let page_ptr = kv_cache.page_mut_ptr(page_id);
             for kv_h in 0..num_kv_heads {
                 let head_base = kv_h * PAGE_SIZE * head_dim + offset_in_page * head_dim;
                 for d in 0..head_dim {
+                    let k_val = k[kv_h * head_dim + d];
+                    let v_val = v[kv_h * head_dim + d];
+                    let k_byte_off = (head_base + d) * elem_bytes;
+                    let v_byte_off = (v_base + head_base + d) * elem_bytes;
                     unsafe {
-                        *page_ptr.add(head_base + d) = k[kv_h * head_dim + d];
-                        *page_ptr.add(v_base + head_base + d) = v[kv_h * head_dim + d];
+                        match kv_dtype {
+                            DType::F32 => {
+                                *(page_ptr.add(k_byte_off) as *mut f32) = k_val;
+                                *(page_ptr.add(v_byte_off) as *mut f32) = v_val;
+                            }
+                            DType::BF16 => {
+                                *(page_ptr.add(k_byte_off) as *mut half::bf16) =
+                                    half::bf16::from_f32(k_val);
+                                *(page_ptr.add(v_byte_off) as *mut half::bf16) =
+                                    half::bf16::from_f32(v_val);
+                            }
+                            DType::F16 => {
+                                *(page_ptr.add(k_byte_off) as *mut half::f16) =
+                                    half::f16::from_f32(k_val);
+                                *(page_ptr.add(v_byte_off) as *mut half::f16) =
+                                    half::f16::from_f32(v_val);
+                            }
+                            other => {
+                                return Err(InferenceError::Unsupported(format!(
+                                    "dtype {other:?} for KV cache write"
+                                )));
+                            }
+                        }
                     }
                 }
             }
