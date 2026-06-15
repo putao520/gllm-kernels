@@ -3,7 +3,7 @@
 //! Each node carries its OpTrace (from Scalar + SymExec) and auto-derived OpClass
 //! (from ComputePattern). This replaces the old hand-maintained OpSemantics mapping.
 
-use crate::compiler::graph::{CompilerGraph, CompilerOp, OpKind, OpId, TensorId};
+use crate::compiler::graph::{CompilerGraph, CompilerOp, Op, OpKind, OpId, TensorId};
 use crate::compiler::trace::{OpTrace, ComputePattern};
 use crate::compiler::registry::ScalarOpRegistry;
 
@@ -129,12 +129,16 @@ impl SemanticDAG {
             // producers — downstream elementwise consumers must not be chained
             // into the same LoopFusion group (the anchor-only lower path would
             // silently drop them). Force Opaque in that case.
-            let op_class = match &op.kind {
-                OpKind::PatchEmbed { .. } | OpKind::DepthwiseConv1D { .. } => OpClass::Opaque,
+            let op_class = match op.op_v2_resolved(graph) {
+                Some(Op::PatchEmbed { .. }) | Some(Op::DepthwiseConv1D { .. }) => OpClass::Opaque,
                 _ => op_trace
                     .as_ref()
                     .map(|t| Self::derive_op_class(&t.pattern))
-                    .unwrap_or_else(|| Self::fallback_op_class(&op.kind)),
+                    .unwrap_or_else(|| {
+                        // graph 层不依赖 semantic_dag OpClass，传递 Op v2 由本函数内部映射
+                        let op_v2 = op.op_v2_resolved(graph);
+                        Self::fallback_op_class_from_op(&op_v2, &op.kind)
+                    }),
             };
 
             let (ai, bottleneck) = Self::compute_arithmetic_intensity(op, graph);
@@ -188,7 +192,36 @@ impl SemanticDAG {
     }
 
     /// Fallback classification when no OpTrace is available.
-    fn fallback_op_class(kind: &OpKind) -> OpClass {
+    /// 胖 opcode 自描述 OpClass 分类（替代旧版 fallback_op_class）。
+    /// 优先使用 Op v2；Op v2 不可用时回退到 OpKind。
+    fn fallback_op_class_from_op(op_v2: &Option<Op>, kind: &OpKind) -> OpClass {
+        if let Some(o) = op_v2 {
+            return Self::fallback_op_class_from_op_v2(o);
+        }
+        // 兼容路径：测试 fixture 未缓存 op_v2 时走 OpKind
+        Self::fallback_op_class_legacy(kind)
+    }
+
+    fn fallback_op_class_from_op_v2(op: &Op) -> OpClass {
+        match op {
+            Op::Silu | Op::Gelu | Op::Tanh | Op::Add | Op::Mul | Op::ScaleConst { .. }
+            | Op::Residual | Op::LogitSoftcap { .. } | Op::SwiGlu | Op::SwiGluClipped { .. }
+            | Op::GeGlu | Op::Dequantize { .. } | Op::WeightedSum { .. }
+            | Op::LearnedPos2D { .. } => OpClass::ElemWise,
+            Op::RoPE(_) | Op::DualRoPE(_) | Op::Transpose { .. } | Op::Reshape { .. }
+            | Op::SliceView { .. } | Op::Gather { .. } | Op::QuantGather { .. }
+            | Op::ColumnSlice { .. } | Op::MlaRopeMerge { .. } => OpClass::Injective,
+            Op::Softmax | Op::RmsNorm(_) | Op::LayerNorm(_) | Op::ValueNorm(_)
+            | Op::MeanPool { .. } | Op::L2Normalize { .. } | Op::QkNorm { .. }
+            | Op::HeadRmsNorm { .. } | Op::Argmax { .. } | Op::TopK { .. } => OpClass::Reduction,
+            Op::Gemm(_) | Op::GemmBias(_) | Op::QuantGemm(_) | Op::MoEGate { .. }
+            | Op::MlaKvCompress { .. } | Op::MlaQAbsorb { .. }
+            | Op::MlaVRestore { .. } => OpClass::Gemm,
+            _ => OpClass::Opaque,
+        }
+    }
+
+    fn fallback_op_class_legacy(kind: &OpKind) -> OpClass {
         match kind {
             OpKind::Silu | OpKind::Gelu | OpKind::Tanh | OpKind::Add | OpKind::Mul | OpKind::ScaleConst { .. } | OpKind::Residual | OpKind::LogitSoftcap { .. } => {
                 OpClass::ElemWise
@@ -282,14 +315,17 @@ impl SemanticDAG {
         // Estimate FLOPs
         // ARCH-SYMDIM-DEGRADE: cost model uses max_for_allocation for conservative estimate.
         // TODO(G-2): preserve symbolic form for tighter bounds.
-        let flops: usize = match &op.kind {
-            OpKind::Gemm { m, n, k, .. } => 2 * m.max_for_allocation_strict().expect("ARCH-SYMDIM: Symbolic dim must have max_value in cost model") * n * k,
-            OpKind::GemmBias { m, n, k, .. } => {
+        let flops: usize = match op.op_v2_resolved(graph) {
+            Some(Op::Gemm(_)) | Some(Op::QuantGemm(_)) => {
+                let (m, n, k) = op.op_v2_gemm_dims(graph).expect("Gemm/QuantGemm 必有 dims");
+                2 * m.max_for_allocation_strict().expect("ARCH-SYMDIM: Symbolic dim must have max_value in cost model") * n * k
+            }
+            Some(Op::GemmBias(_)) => {
+                let (m, n, k) = op.op_v2_gemm_dims(graph).expect("GemmBias 必有 dims");
                 let m_val = m.max_for_allocation_strict().expect("ARCH-SYMDIM: Symbolic dim must have max_value in cost model");
                 2 * m_val * n * k + m_val * n
             }
-            OpKind::QuantGemm { m, n, k, .. } => 2 * m.max_for_allocation_strict().expect("ARCH-SYMDIM: Symbolic dim must have max_value in cost model") * n * k,
-            OpKind::Silu | OpKind::Gelu | OpKind::Tanh => {
+            Some(Op::Silu) | Some(Op::Gelu) | Some(Op::Tanh) => {
                 // ~10 FLOPs per element (exp + div + mul)
                 op.outputs
                     .iter()
@@ -297,7 +333,7 @@ impl SemanticDAG {
                     .map(|t| t.concrete_numel() * 10)
                     .sum()
             }
-            OpKind::RmsNorm { .. } | OpKind::ValueNorm { .. } => {
+            Some(Op::RmsNorm(_)) | Some(Op::ValueNorm(_)) => {
                 // 2 passes: sum_sq (2 flops/elem) + scale (2 flops/elem for ValueNorm, 3 for RmsNorm) + sqrt
                 // ValueNorm skips weight mul but same order of magnitude
                 op.outputs
