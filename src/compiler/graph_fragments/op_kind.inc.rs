@@ -781,24 +781,6 @@ pub struct QTapGraphConfig {
 }
 
 impl OpKind {
-    /// Returns the input index that output[0] aliases (shares the same physical slot).
-    ///
-    /// Ops like SgDetect are side-channel: they read input, copy to a side buffer,
-    /// and the main-path data passes through unchanged. Their output tensor occupies
-    /// the same scratchpad slot as the aliased input — no separate allocation needed.
-    ///
-    /// Returns `None` when the output needs its own scratchpad slot (normal case).
-    pub fn output_aliases_input(&self) -> Option<usize> {
-        match self {
-            // Side-channel ops: main data passes through unchanged
-            OpKind::SgDetect { .. } => Some(0),
-            // In-place modification: output overwrites input (add knowledge vector)
-            OpKind::SgInject { .. } => Some(0),
-            // All other ops: output needs independent allocation
-            _ => None,
-        }
-    }
-
     /// Replace all `SymDim::Symbolic` dimensions in this OpKind with
     /// `SymDim::Concrete(resolve(name))` using the provided resolver closure.
     ///
@@ -976,6 +958,12 @@ impl CompilerOp {
     /// `match op.kind { OpKind::Gemm{m,n,k,..} | ... => (m.clone(),*n,*k), _ => Err(...) }`。
     pub fn op_v2_gemm_dims(&self, graph: &CompilerGraph) -> Option<(crate::compiler::graph::SymDim, usize, usize)> {
         self.op_v2_resolved(graph).and_then(|o| o.gemm_dims())
+    }
+
+    /// 输出别名到输入的 IR 元数据（胖 opcode 自描述）。
+    /// 替代 `op.kind.output_aliases_input()`。
+    pub fn op_v2_output_aliases_input(&self, graph: &CompilerGraph) -> Option<usize> {
+        self.op_v2_resolved(graph).and_then(|o| o.output_aliases_input())
     }
 }
 

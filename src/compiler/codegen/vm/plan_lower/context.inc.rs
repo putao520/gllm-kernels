@@ -314,7 +314,7 @@ fn build_tensor_sources_fallback(
     }
 
     for op in &graph.ops {
-        if let Some(input_idx) = op.kind.output_aliases_input() {
+        if let Some(input_idx) = op.op_v2_output_aliases_input(graph) {
             if let (Some(&in_tid), Some(&out_tid)) =
                 (op.inputs.get(input_idx), op.outputs.first())
             {

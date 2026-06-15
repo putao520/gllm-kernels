@@ -377,6 +377,21 @@ impl Op {
         matches!(self, Op::QuantGemm(_))
     }
 
+    /// 输出别名到输入的 IR 元数据（胖 opcode 自描述）。
+    ///
+    /// 替代 OpKind::output_aliases_input。返回 Some(input_idx) 表示 output[0] 与
+    /// input[input_idx] 共享同一物理 slot（side-channel/in-place op），返回 None
+    /// 表示 output 需要独立分配。
+    ///
+    /// - SgDetect/SgInject：side-channel op，main-path data 透传，输出别名到 input[0]
+    /// - 其他 op：输出独立 scratchpad slot
+    pub fn output_aliases_input(&self) -> Option<usize> {
+        match self {
+            Op::SgDetect { .. } | Op::SgInject { .. } => Some(0),
+            _ => None,
+        }
+    }
+
     /// 提取 GEMM 维度（胖 opcode 自描述）。
     /// 替代 `extract_gemm_dims_sym` 中
     /// `match op.kind { OpKind::Gemm{m,n,k,..} | OpKind::GemmBias{m,n,k,..} | ... => (m,n,k) }`。

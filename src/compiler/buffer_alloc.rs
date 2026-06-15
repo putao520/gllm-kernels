@@ -55,7 +55,7 @@ fn resolve_alias_to_physical(
             break; // cycle detection
         }
         let producer_op = graph.ops.iter().find(|op| op.outputs.contains(&current))?;
-        let alias_input = producer_op.kind.output_aliases_input()?;
+        let alias_input = producer_op.op_v2_output_aliases_input(graph)?;
         current = *producer_op.inputs.get(alias_input)?;
     }
     Some(current)
@@ -179,7 +179,7 @@ pub fn analyze_lifetimes(
     // TensorPtrSource aliasing (see TensorPtrResolver::build).
     for op_id in &schedule {
         if let Some(op) = graph.op(*op_id) {
-            if op.kind.output_aliases_input().is_some() {
+            if op.op_v2_output_aliases_input(graph).is_some() {
                 if let Some(&out_tid) = op.outputs.first() {
                     alias_outputs.insert(out_tid);
                 }
@@ -571,7 +571,7 @@ fn build_tensor_sources(
 
     // Generic output-alias
     for op in &graph.ops {
-        if let Some(input_idx) = op.kind.output_aliases_input() {
+        if let Some(input_idx) = op.op_v2_output_aliases_input(graph) {
             if let (Some(&in_tid), Some(&out_tid)) =
                 (op.inputs.get(input_idx), op.outputs.first())
             {
