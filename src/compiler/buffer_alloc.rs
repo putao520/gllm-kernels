@@ -245,7 +245,8 @@ pub fn analyze_lifetimes(
             // Use max_for_allocation to account for symbolic dimensions (SymDim).
             // concrete_bytes() treats Symbolic as 1, causing massive under-allocation
             // for intermediate tensors with symbolic seq_len (e.g. FusedQkvRope Q/K outputs).
-            // 中间张量（有 producer）统一按 F32 分配（TurboQuant 计算层恒 F32）。
+            // 中间张量（有 producer）按计算精度 dtype 分配。当前默认按 F32,
+            // 真实 dtype 应走 op_input_dtype(op, graph).elem_bytes() (ARCH-DTYPE-JIT-TYPED)。
             // ARCH-DATA-FLOW-CONTRACT §2.2: 禁止裸 4，用 DType::F32.size_bytes()。
             let elem_bytes = if tensor.producer.is_some() {
                 crate::types::DType::F32.size_bytes()

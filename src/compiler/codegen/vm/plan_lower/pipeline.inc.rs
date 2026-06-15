@@ -219,7 +219,7 @@ pub(super) fn emit_fusion_groups(
         let _boundaries = compile_hetero_templates_parallel(
             ctx, plan, graph, alloc, resolver,
         )?;
-        // TODO: 用预编译的模板替代逐 group emit — Phase D 深化
+        // PERF: 后续可引入预编译模板替代逐 group emit,降低 JIT 编译时延(非功能项)
     }
 
     let mut state = EmitState {
@@ -989,7 +989,7 @@ pub(crate) fn emit_elementwise_inline(
                             dtype, predicate: None,
                         });
                     }
-                    lower::lower_trace_body_compat(prog, body, acc, sec, width)
+                    lower::lower_trace_body_compat(prog, body, acc, sec, width, dtype)
                         .expect("lower_trace_body: OpTrace invariant violation");
                     prog.emit(VmInstr::VecStore {
                         base: row_output, offset: OffsetExpr::LoopOffset(col_off), src: acc, width,
@@ -1020,7 +1020,7 @@ pub(crate) fn emit_elementwise_inline(
                             dtype, predicate: None,
                         });
                     }
-                    lower::lower_trace_body_compat(prog, body, s_acc, s_sec, s_width)
+                    lower::lower_trace_body_compat(prog, body, s_acc, s_sec, s_width, dtype)
                         .expect("lower_trace_body: OpTrace invariant violation (scalar tail)");
                     prog.emit(VmInstr::VecStore {
                         base: row_output, offset: OffsetExpr::Const(col_off_const), src: s_acc, width: s_width,
@@ -1046,7 +1046,7 @@ pub(crate) fn emit_elementwise_inline(
                         dtype, predicate: None,
                     });
                 }
-                lower::lower_trace_body_compat(prog, body, acc, sec, width)
+                lower::lower_trace_body_compat(prog, body, acc, sec, width, dtype)
                     .expect("lower_trace_body: OpTrace invariant violation");
                 prog.emit(VmInstr::VecStore {
                     base: output_ptr, offset: OffsetExpr::LoopOffset(byte_off), src: acc, width,
@@ -1076,7 +1076,7 @@ pub(crate) fn emit_elementwise_inline(
                         dtype, predicate: None,
                     });
                 }
-                lower::lower_trace_body_compat(prog, body, s_acc, s_sec, s_width)
+                lower::lower_trace_body_compat(prog, body, s_acc, s_sec, s_width, dtype)
                     .expect("lower_trace_body: OpTrace invariant violation (scalar tail)");
                 prog.emit(VmInstr::VecStore {
                     base: output_ptr, offset: OffsetExpr::Const(col_off_const),

@@ -68,7 +68,7 @@ impl CompiledLayer {
     ///
     /// # Safety
     /// The caller must ensure the compiled code was emitted by `emit_mega_kernel_x86()`
-    /// and follows the MegaKernelFn ABI (16 params → usize return).
+    /// and follows the MegaKernelFn ABI (22 params → usize return).
     #[inline]
     pub unsafe fn entry_point_as_mega_kernel(&self) -> super::MegaKernelFn {
         let ptr = self.code.ptr.add(self.entry_offset);
@@ -88,7 +88,7 @@ impl CompiledLayer {
         unsafe { std::slice::from_raw_parts(self.code.ptr, self.code.len) }
     }
 
-    /// Execute via MegaKernelFn ABI (23-param). All graphs now use the unified
+    /// Execute via MegaKernelFn ABI (22-param). All graphs now use the unified
     /// `compile_mega_kernel_vm` entry point (SPEC/39).
     ///
     /// # Safety

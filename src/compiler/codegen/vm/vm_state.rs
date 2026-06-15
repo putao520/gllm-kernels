@@ -123,7 +123,7 @@ impl VmState {
         }
     }
 
-    /// 从 MegaKernelFn ABI 初始化 (16 参数: 6 寄存器 + 10 栈参数)。
+    /// 从 MegaKernelFn ABI 初始化 (22 参数: 6 寄存器 + 16 栈参数)。
     ///
     /// 栈参数严格 8 字节对齐 (SysV ABI: 每个参数占一个 eightbyte 槽位)。
     /// f32 已改为 u32 传递 (避免 SSE 寄存器传参导致 JIT 无法从栈读取)。
@@ -150,6 +150,7 @@ impl VmState {
             "num_mm_tokens",        // arg 18 → StackArg(112)
             "callback_table_ptr",   // arg 19 → StackArg(120)
             "page_table_ptr",       // arg 20 → StackArg(128)
+            "batch_ctx_ptr",        // arg 21 → StackArg(136) (NULL = single-seq legacy, non-NULL = batch mode)
         ];
 
         let num_reg_args: usize = 6;
@@ -443,7 +444,7 @@ mod tests {
 
     /// @trace TEST-VMS-09 [req:REQ-VR] [level:unit]
     /// init_mega_kernel_x86 last stack args at correct offsets, including
-    /// page_table_ptr at arg 21 → StackArg(136).
+    /// page_table_ptr at arg 20 → StackArg(128) and batch_ctx_ptr at arg 21 → StackArg(136).
     #[test]
     fn test_init_mega_kernel_x86_last_stack_args() {
         // Arrange
@@ -462,6 +463,7 @@ mod tests {
         assert_eq!(state.arg_ptr_expr("num_mm_tokens").unwrap(), PtrExpr::StackArg(112));
         assert_eq!(state.arg_ptr_expr("callback_table_ptr").unwrap(), PtrExpr::StackArg(120));
         assert_eq!(state.arg_ptr_expr("page_table_ptr").unwrap(), PtrExpr::StackArg(128));
+        assert_eq!(state.arg_ptr_expr("batch_ctx_ptr").unwrap(), PtrExpr::StackArg(136));
     }
 
     /// @trace TEST-VMS-10 [req:REQ-VR] [level:unit]

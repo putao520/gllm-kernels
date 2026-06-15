@@ -55,7 +55,7 @@ impl X86Lower {
             None => {
                 // dst 未 spill：使用 spill scratch slot 0 (ymm12) 作为临时存储
                 // 但这里需要栈地址，所以分配一个临时栈槽
-                // TODO: 未来可以优化为直接使用 ymm12 而非栈
+                // PERF: 可优化为直接使用 ymm12 寄存器避免栈访问(后续 ISA 调优)
                 let scratch_stack_size = 32; // 8 floats × 4 bytes
                 self.stack_layout.spill_rbp_offset(0, scratch_stack_size)
             }

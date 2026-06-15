@@ -980,7 +980,7 @@ pub(crate) fn emit_gemm_trans_b_inline(
             };
 
             if !epilogue.is_empty() {
-                lower::lower_trace_body_compat(prog, epilogue, result, None, s_width)
+                lower::lower_trace_body_compat(prog, epilogue, result, None, s_width, dtype)
                     .expect("lower_trace_body: OpTrace invariant violation");
             }
 
@@ -1111,7 +1111,7 @@ pub(crate) fn emit_gemm_inline_with_epilogue(
                     prog.emit(VmInstr::Fma { dst: acc, acc, a: a_broadcast, b: b_vec, dtype });
                 });
                 if !epilogue.is_empty() && do_epilogue_inline {
-                    lower::lower_trace_body_compat(prog, epilogue, acc, None, width)
+                    lower::lower_trace_body_compat(prog, epilogue, acc, None, width, dtype)
                         .expect("lower_trace_body: OpTrace invariant violation");
                 }
                 let store_src = if needs_narrow {
@@ -1162,7 +1162,7 @@ pub(crate) fn emit_gemm_inline_with_epilogue(
                     prog.emit(VmInstr::Fma { dst: s_acc, acc: s_acc, a: s_a, b: s_b, dtype });
                 });
                 if !epilogue.is_empty() && do_epilogue_inline {
-                    lower::lower_trace_body_compat(prog, epilogue, s_acc, None, s_width)
+                    lower::lower_trace_body_compat(prog, epilogue, s_acc, None, s_width, dtype)
                         .expect("lower_trace_body: OpTrace invariant violation");
                 }
                 // REQ-DTYPE-006: 窄化写回 (scalar tail path)

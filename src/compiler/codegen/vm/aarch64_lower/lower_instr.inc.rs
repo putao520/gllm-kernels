@@ -237,8 +237,9 @@ impl AArch64Lower {
             }
 
             VmInstr::VecBinOp { dst, a, b, op, dtype } => {
-                // dtype 驱动指令选择 (REQ-VR10): 所有路径当前为 F32 操作，
-                // 数据已在 load 边界完成 widen。DequantCompute 应使用量化专用 VmInstr。
+                // dtype 驱动指令选择 (REQ-VR10): 多精度混合(BF16/F16/F32 等),
+                // dtype 从 tensor metadata 推导(ARCH-DTYPE-JIT-TYPED),按权重 dtype 和
+                // 用户编译参数为准。aarch64_elem_strategy() 决定 Native/WidenCompute 路径。
                 let _strategy = dtype.aarch64_elem_strategy();
                 let vd = self.resolve_vreg(*dst, alloc)?;
                 let vn = self.resolve_vreg(*a, alloc)?;
@@ -2259,8 +2260,11 @@ impl AArch64Lower {
             VmInstr::VecCast { dst, src, from_bits, to_bits } => {
                 let vd = self.resolve_vreg(*dst, alloc)?;
                 let vn = self.resolve_vreg(*src, alloc)?;
-                // 当前只支持 f32 ↔ f32 的 no-op 转换
-                // TODO: 实现实际的类型转换 (如 f16 ↔ f32, int ↔ float)
+                // AArch64 NEON 类型转换(多精度混合):
+                // - 同位宽(32↔32/16↔16/8↔8):identity copy
+                // - f16 ↔ f32 (16↔32):FCVTL/FCVTN
+                // - bf16 ↔ f32:复用 (16↔32) 位宽路径,dtype 区分由调用方 TraceOp 元数据维护
+                // - int ↔ float:目前不支持(返回 Err,避免静默降级)
                 match (*from_bits, *to_bits) {
                     // Same bit-width: identity copy (covers 32→32, 16→16, 8→8, etc.)
                     (fb, tb) if fb == tb => {

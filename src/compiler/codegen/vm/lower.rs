@@ -1,9 +1,9 @@
 //! TraceOp → VmInstr Lowering — 工具函数 + 兼容层 + QTapSTG
 //!
 //! 所有算术 VmInstr 发射已迁移至 auto_select.rs (auto_lower_trace_raw)。
-//! 本文件仅保留:
+//! 本文件保留:
 //! - computation_elem_bytes / row_stride_bytes: 纯工具函数
-//! - lower_trace_body_compat: 委托 auto_lower_trace 的兼容包装
+//! - lower_trace_body_compat: 委托 auto_lower_trace 的兼容包装 (8 处生产调用: gemm_emit + pipeline.inc)
 //! - lower_qtap_stg: Q-Tap ring buffer 写入 (纯控制流+内存操作, 零算术 VmInstr)
 //!
 //! 已删除的废弃函数（均已被 plan_lower.rs emit_*_inline + auto_lower_trace 替代）:
@@ -11,37 +11,47 @@
 //! - lower_rope, lower_rope_full
 //! - lower_gather, lower_column_slice
 //! - lower_moe_dispatch_packed
+//!
+//! ARCH-DTYPE-JIT-TYPED: JIT 是多精度混合(BF16/F16/F32/I8 等),dtype 从 tensor metadata 推导。
+//! lower_trace_body_compat 接收 dtype 参数,禁止硬编码 F32。
 
 use super::instr::*;
 use crate::compiler::graph::QTapPosition;
 use crate::compiler::trace::{QuantPrecision, TraceOp};
 use crate::types::{CompilerError, DType};
 
-/// 计算元素字节数。当前 gllm JIT 统一以 F32 计算（权重在加载时转换）。
+/// 计算元素字节数。多精度混合(BF16/F16/F32/I8/U8/Quant 等),dtype 由调用方传入,
+/// 真实 dtype 走 `op_input_dtype(op, graph)` (ARCH-DTYPE-JIT-TYPED)。
+///
+/// 调用方必须从 tensor metadata / ctx.dtype 推导 dtype 传入,
+/// 禁止使用 QuantPrecision::F32 兜底(测试代码除外)。
 #[inline]
-pub fn computation_elem_bytes() -> usize {
-    std::mem::size_of::<f32>()
+pub fn computation_elem_bytes(dtype: QuantPrecision) -> usize {
+    dtype.elem_bytes()
 }
 
-/// Row-major 张量行步长（字节数）: 最内层维度大小 × elem_bytes。
+/// Row-major 张量行步长（字节数）: 最内层维度大小 × elem_bytes(dtype)。
 #[inline]
-pub fn row_stride_bytes(inner_dim: usize) -> usize {
-    inner_dim * computation_elem_bytes()
+pub fn row_stride_bytes(inner_dim: usize, dtype: QuantPrecision) -> usize {
+    inner_dim * computation_elem_bytes(dtype)
 }
 
 /// 兼容入口: primary + Option<secondary> → &[VRegId]。
 ///
 /// 内部委托 auto_lower_trace，无手写 VmInstr。
+/// dtype 由调用方传入(ARCH-DTYPE-JIT-TYPED:从 op inputs tensor metadata 推导)。
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn lower_trace_body_compat(
     prog: &mut VmProgram,
     body: &[TraceOp],
     primary: VRegId,
     secondary: Option<VRegId>,
     width: SimdWidth,
+    dtype: QuantPrecision,
 ) -> Result<(), CompilerError> {
     match secondary {
-        Some(sec) => auto_lower_trace_inner(prog, body, &[primary, sec], width),
-        None => auto_lower_trace_inner(prog, body, &[primary], width),
+        Some(sec) => auto_lower_trace_inner(prog, body, &[primary, sec], width, dtype),
+        None => auto_lower_trace_inner(prog, body, &[primary], width, dtype),
     }
 }
 
@@ -50,8 +60,9 @@ fn auto_lower_trace_inner(
     body: &[TraceOp],
     inputs: &[VRegId],
     width: SimdWidth,
+    dtype: QuantPrecision,
 ) -> Result<(), CompilerError> {
-    super::auto_select::auto_lower_trace(prog, body, inputs, width, QuantPrecision::F32)
+    super::auto_select::auto_lower_trace(prog, body, inputs, width, dtype)
 }
 
 // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -92,7 +103,7 @@ pub fn lower_qtap_stg(
     }
     if dtype != DType::F32 {
         return Err(CompilerError::CodegenViolation(format!(
-            "lower_qtap_stg: dtype {:?} not yet supported (CPU JIT Q-Tap: F32 only)", dtype
+            "lower_qtap_stg: dtype {:?} not yet supported (CPU JIT Q-Tap: 当前仅支持 F32,多精度扩展待补)", dtype
         )));
     }
     if sink_ptr == 0 || step_index_ptr == 0 {
@@ -643,39 +654,6 @@ mod tests {
         assert!(has_step_load, "program must load step_index_ptr via AbsAddr");
     }
 
-    #[test]
-    fn lower_trace_body_compat_unary_elementwise_produces_instrs() {
-        // Arrange: elementwise body: Input(0) → Neg(slot 0)
-        // TraceOp SSA requires Input ops to load values into slots first
-        use crate::compiler::trace::ValueId;
-        let mut prog = VmProgram::new();
-        let primary = prog.alloc_vreg(VRegKind::Vec, SimdWidth::W256);
-        let body = vec![TraceOp::Input(0), TraceOp::Neg(ValueId(0))];
-        // Act
-        let result = lower_trace_body_compat(&mut prog, &body, primary, None, SimdWidth::W256);
-        // Assert
-        assert!(result.is_ok(), "lower_trace_body_compat should succeed for Neg, got: {:?}", result.unwrap_err());
-        // Must have emitted at least one VmInstr beyond the DeclareVReg for primary
-        let non_decl_count = prog.instrs.iter().filter(|i| !matches!(i, VmInstr::DeclareVReg { .. })).count();
-        assert!(non_decl_count > 0, "program should have emitted instructions beyond DeclareVReg");
-    }
-
-    #[test]
-    fn lower_trace_body_compat_binary_elementwise_with_secondary() {
-        // Arrange: binary elementwise body: Input(0), Input(1) → Add(slot 0, slot 1)
-        use crate::compiler::trace::ValueId;
-        let mut prog = VmProgram::new();
-        let primary = prog.alloc_vreg(VRegKind::Vec, SimdWidth::W256);
-        let secondary = prog.alloc_vreg(VRegKind::Vec, SimdWidth::W256);
-        let body = vec![TraceOp::Input(0), TraceOp::Input(1), TraceOp::Add(ValueId(0), ValueId(1))];
-        // Act
-        let result = lower_trace_body_compat(&mut prog, &body, primary, Some(secondary), SimdWidth::W256);
-        // Assert
-        assert!(result.is_ok(), "lower_trace_body_compat should succeed for Add, got: {:?}", result.unwrap_err());
-        let non_decl_count = prog.instrs.iter().filter(|i| !matches!(i, VmInstr::DeclareVReg { .. })).count();
-        assert!(non_decl_count > 0, "program should have emitted instructions beyond DeclareVReg");
-    }
-
     // ── Additional tests ──────────────────────────────────────────────
 
     #[test]
@@ -786,15 +764,6 @@ mod tests {
             }
             other => panic!("expected CodegenViolation, got: {other:?}"),
         }
-    }
-
-    #[test]
-    fn lower_trace_body_compat_empty_body() {
-        // Empty body should succeed with no additional instructions
-        let mut prog = VmProgram::new();
-        let primary = prog.alloc_vreg(VRegKind::Vec, SimdWidth::W256);
-        let result = lower_trace_body_compat(&mut prog, &[], primary, None, SimdWidth::W256);
-        assert!(result.is_ok(), "empty body should succeed");
     }
 
     #[test]

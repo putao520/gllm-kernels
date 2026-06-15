@@ -268,13 +268,18 @@ impl X86Lower {
                             let (d, dst_spilled) = self.resolve_zmm_or_spill_write(*dst, alloc, 1)?;
                             let dst_ymm = Self::zmm_to_ymm(d);
                             // Narrow instruction selected by dst_dtype properties (REQ-DTYPE-006).
-                            // BF16: vcvtneps2bf16; F16: vcvtps2ph (TODO: add F16 path).
-                            if dst_dtype.kind == crate::compiler::trace::DTypeKind::BF16 {
-                                self.asm.vcvtneps2bf16(dst_ymm, s).map_err(Self::err)?;
-                            } else {
-                                return Err(CompilerError::CodegenViolation(
+                            // 多精度混合:BF16/F16 各有专用指令。
+                            match dst_dtype.kind {
+                                crate::compiler::trace::DTypeKind::BF16 => {
+                                    self.asm.vcvtneps2bf16(dst_ymm, s).map_err(Self::err)?;
+                                }
+                                crate::compiler::trace::DTypeKind::F16 => {
+                                    // F16C: vcvtps2ph ymm_dst, zmm_src, imm8(round-to-nearest=0)
+                                    self.asm.vcvtps2ph(dst_ymm, s, 0i32).map_err(Self::err)?;
+                                }
+                                _ => return Err(CompilerError::CodegenViolation(
                                     format!("VecNarrow: {src_dtype:?} → {dst_dtype:?} narrow instruction not yet implemented")
-                                ));
+                                )),
                             }
                             if dst_spilled { self.spill_store_zmm(*dst, alloc, 1)?; }
                         }
@@ -283,12 +288,17 @@ impl X86Lower {
                             let (s, _) = self.resolve_ymm_or_spill(*src, alloc, 0)?;
                             let (d, dst_spilled) = self.resolve_ymm_or_spill_write(*dst, alloc, 1)?;
                             let dst_xmm = Self::ymm_to_xmm(d);
-                            if dst_dtype.kind == crate::compiler::trace::DTypeKind::BF16 {
-                                self.asm.vcvtneps2bf16(dst_xmm, s).map_err(Self::err)?;
-                            } else {
-                                return Err(CompilerError::CodegenViolation(
+                            match dst_dtype.kind {
+                                crate::compiler::trace::DTypeKind::BF16 => {
+                                    self.asm.vcvtneps2bf16(dst_xmm, s).map_err(Self::err)?;
+                                }
+                                crate::compiler::trace::DTypeKind::F16 => {
+                                    // F16C: vcvtps2ph xmm_dst, ymm_src, imm8(round-to-nearest=0)
+                                    self.asm.vcvtps2ph(dst_xmm, s, 0i32).map_err(Self::err)?;
+                                }
+                                _ => return Err(CompilerError::CodegenViolation(
                                     format!("VecNarrow: {src_dtype:?} → {dst_dtype:?} narrow instruction not yet implemented")
-                                ));
+                                )),
                             }
                             if dst_spilled { self.spill_store_ymm(*dst, alloc, 1)?; }
                         }

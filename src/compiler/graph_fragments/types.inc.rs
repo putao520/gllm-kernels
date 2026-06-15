@@ -14,13 +14,9 @@ use crate::types::DType;
 use crate::traits::Activation;
 use crate::types::CompilerError;
 
-/// SymDim::Symbolic 维度的编译时上界默认值。
-///
-/// **已弃用** — 使用 `CompilerGraph.max_seq_len` 替代。新代码应通过模型配置
-/// `max_position_embeddings` 设置 `CompilerGraph::max_seq_len`，不再引用此常量。
-/// 保留用于迁移期，所有引用点应迁移到 `graph.max_seq_len`。
-#[deprecated(since = "0.1.0", note = "使用 CompilerGraph.max_seq_len 替代")]
-pub const SYMDIM_MAX_SEQ_LEN: usize = 2048;
+// SymDim::Symbolic 维度的编译时上界通过 `CompilerGraph.max_seq_len` 字段传递,
+// 该字段从模型配置 `max_position_embeddings` 正向传播(REQ-SYMDIM-PAGED-KV §2.1)。
+// 历史 `SYMDIM_MAX_SEQ_LEN = 2048` 硬编码常量已物理删除。
 
 // ── Symbolic shape ─────────────────────────────────────────────────
 
