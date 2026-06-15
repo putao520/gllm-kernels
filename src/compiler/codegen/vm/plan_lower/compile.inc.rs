@@ -626,12 +626,14 @@ fn try_dispatch_normlike(
         .cloned()
         .or_else(|| out_shape.first().map(|d| ctx.session.sym_map.to_bound(d)))
         .unwrap_or(BoundExpr::Const(1));
-    let norm_kind = match &op.kind {
-        OpKind::RmsNorm { .. } => NormKind::RmsNorm,
-        OpKind::HeadRmsNorm { .. } => NormKind::HeadRmsNorm,
-        OpKind::LayerNorm { .. } => NormKind::LayerNorm,
-        OpKind::ValueNorm { .. } => NormKind::ValueNorm,
-        _ => NormKind::RmsNorm,
+    let norm_kind = match op.op_v2_resolved(graph).and_then(|o| o.norm_meta()) {
+        Some(meta) => match meta.variant {
+            crate::compiler::graph::NormVariant::RmsNorm => NormKind::RmsNorm,
+            crate::compiler::graph::NormVariant::HeadRmsNorm => NormKind::HeadRmsNorm,
+            crate::compiler::graph::NormVariant::LayerNorm => NormKind::LayerNorm,
+            crate::compiler::graph::NormVariant::ValueNorm => NormKind::ValueNorm,
+        },
+        None => NormKind::RmsNorm,
     };
     emit_normlike_inline(
         prog, pattern, feature_dim, /*groups_per_row=*/1,
@@ -666,35 +668,31 @@ pub(crate) fn try_dispatch_reduction(
         _ => return Ok(false),
     };
 
-    // 从 OpKind 提取几何参数
-    let (seq_bound, feature_dim) = match &op.kind {
-        OpKind::MeanPool { seq_len, hidden, cls_mode } => {
-            let bound = if *cls_mode {
-                BoundExpr::Const(1)
-            } else if let Some(override_bound) = seq_bound_override.cloned() {
-                override_bound
-            } else {
-                let input_dim = op.inputs.first()
-                    .and_then(|&tid| graph.tensor(tid))
-                    .and_then(|t| t.shape.first());
-                match input_dim {
-                    Some(SymDim::Symbolic { name, max_value }) => {
-                        BoundExpr::Symbolic(SymBound {
-                            name: name.clone(),
-                            max_alloc: max_value.expect("Symbolic dim needs max_value"),
-                        })
-                    }
-                    _ => BoundExpr::Const(*seq_len),
-                }
-            };
-            (bound, *hidden)
+    // 从 Op v2 提取几何参数（胖 opcode 自描述）
+    let geom = match op.op_v2_resolved(graph).and_then(|o| o.reduction_geometry()) {
+        Some(g) => g,
+        None => return Ok(false),
+    };
+    let feature_dim = geom.hidden;
+    let seq_bound = if geom.cls_mode {
+        BoundExpr::Const(1)
+    } else if let Some(override_bound) = seq_bound_override.cloned() {
+        override_bound
+    } else if matches!(op.op_v2_resolved(graph), Some(Op::L2Normalize { .. })) {
+        BoundExpr::Const(1)
+    } else {
+        let input_dim = op.inputs.first()
+            .and_then(|&tid| graph.tensor(tid))
+            .and_then(|t| t.shape.first());
+        match input_dim {
+            Some(SymDim::Symbolic { name, max_value }) => {
+                BoundExpr::Symbolic(SymBound {
+                    name: name.clone(),
+                    max_alloc: max_value.expect("Symbolic dim needs max_value"),
+                })
+            }
+            _ => BoundExpr::Const(geom.seq_len),
         }
-        OpKind::L2Normalize { hidden } => {
-            let bound = seq_bound_override.cloned()
-                .unwrap_or(BoundExpr::Const(1));
-            (bound, *hidden)
-        }
-        _ => return Ok(false),
     };
 
     if feature_dim == 0 {
@@ -974,14 +972,19 @@ pub(crate) fn infer_output_shape_sym(op: &crate::compiler::graph::CompilerOp, gr
 
 /// RmsNorm / ValueNorm 的标量 pattern。LayerNorm 不用此 pattern — 它走
 /// RmsNorm/ValueNorm NormLike pattern builder (LayerNorm uses emit_layernorm_auto)。
-pub(crate) fn build_norm_pattern(op: &crate::compiler::graph::CompilerOp) -> Result<ComputePattern, CompilerError> {
-    let eps = match &op.kind {
-        OpKind::RmsNorm { eps, .. } | OpKind::ValueNorm { eps, .. } => *eps,
-        other => return Err(CompilerError::CodegenViolation(
-            format!("build_norm_pattern: expected RmsNorm/ValueNorm, got {:?}", other),
-        )),
-    };
-    let has_weight = matches!(op.kind, OpKind::RmsNorm { .. });
+pub(crate) fn build_norm_pattern(op: &crate::compiler::graph::CompilerOp, graph: &CompilerGraph) -> Result<ComputePattern, CompilerError> {
+    let meta = op.op_v2_resolved(graph).and_then(|o| o.norm_meta())
+        .ok_or_else(|| CompilerError::CodegenViolation(
+            format!("build_norm_pattern: expected NormLike op, got op {:?}", op.kind)
+        ))?;
+    // 仅 RmsNorm/ValueNorm 走 build_norm_pattern（LayerNorm 走 emit_layernorm_auto）
+    if !matches!(meta.variant, crate::compiler::graph::NormVariant::RmsNorm | crate::compiler::graph::NormVariant::ValueNorm) {
+        return Err(CompilerError::CodegenViolation(
+            format!("build_norm_pattern: only RmsNorm/ValueNorm supported, got {:?}", op.kind)
+        ));
+    }
+    let eps = meta.eps;
+    let has_weight = meta.has_weight;
     let transform = if has_weight {
         vec![
             TraceOp::Input(0), TraceOp::Input(1), TraceOp::Input(2),

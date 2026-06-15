@@ -389,6 +389,68 @@ impl Op {
             _ => None,
         }
     }
+}
+
+/// Reduction 类 op 几何参数（胖 opcode 自描述）。
+/// 替代 fusion/lowering 路径中
+/// `match op.kind { OpKind::MeanPool{seq_len,hidden,cls_mode} | OpKind::L2Normalize{hidden} => ... }`。
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct ReductionGeometry {
+    pub seq_len: usize,
+    pub hidden: usize,
+    pub cls_mode: bool,
+}
+
+/// Norm variant tag（graph 层不依赖 codegen 层 NormKind，调用方做映射）。
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum NormVariant {
+    RmsNorm,
+    ValueNorm,
+    LayerNorm,
+    HeadRmsNorm,
+}
+
+/// NormLike op 元数据（胖 opcode 自描述）。
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct NormMeta {
+    pub variant: NormVariant,
+    pub eps: f32,
+    pub has_weight: bool,
+}
+
+impl Op {
+    /// Reduction 类 op 几何参数（胖 opcode 自描述）。
+    /// 替代 `try_dispatch_reduction` 中
+    /// `match op.kind { OpKind::MeanPool{seq_len,hidden,cls_mode} | OpKind::L2Normalize{hidden} => (seq_bound, hidden) }`。
+    pub fn reduction_geometry(&self) -> Option<ReductionGeometry> {
+        match self {
+            Op::MeanPool { seq_len, hidden, cls_mode } => Some(ReductionGeometry {
+                seq_len: *seq_len,
+                hidden: *hidden,
+                cls_mode: *cls_mode,
+            }),
+            Op::L2Normalize { hidden } => Some(ReductionGeometry {
+                seq_len: 1,
+                hidden: *hidden,
+                cls_mode: false,
+            }),
+            _ => None,
+        }
+    }
+
+    /// 提取 NormLike op 的 eps + has_weight + variant name（胖 opcode 自描述）。
+    /// variant name 用于调用方映射到对应 NormKind（避免 graph 层依赖 codegen 层）。
+    /// 替代 `build_norm_pattern` / `emit_normlike_inline` 中的
+    /// `match op.kind { OpKind::RmsNorm{eps,..} | OpKind::ValueNorm{eps,..} => eps, ... }`。
+    pub fn norm_meta(&self) -> Option<NormMeta> {
+        match self {
+            Op::RmsNorm(spec) => Some(NormMeta { variant: NormVariant::RmsNorm, eps: spec.eps, has_weight: true }),
+            Op::ValueNorm(spec) => Some(NormMeta { variant: NormVariant::ValueNorm, eps: spec.eps, has_weight: false }),
+            Op::LayerNorm(spec) => Some(NormMeta { variant: NormVariant::LayerNorm, eps: spec.eps, has_weight: true }),
+            Op::HeadRmsNorm { eps, .. } => Some(NormMeta { variant: NormVariant::HeadRmsNorm, eps: *eps, has_weight: true }),
+            _ => None,
+        }
+    }
 
 
     ///
