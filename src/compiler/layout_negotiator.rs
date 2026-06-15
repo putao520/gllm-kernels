@@ -7,7 +7,7 @@
 //! 每个自然数据搬运点都是"免费变换窗口"，协商器识别并利用这些窗口。
 
 use std::collections::HashMap;
-use crate::compiler::graph::{CompilerGraph, OpId, OpKind};
+use crate::compiler::graph::{CompilerGraph, Op, OpId};
 use crate::compiler::fusion::{FusionGroup, FusionMode};
 use crate::compiler::semantic_dag::{SemanticDAG, OpClass};
 use crate::compiler::accel_registry::{AccelerationRegistry, LayoutConstraint};
@@ -367,23 +367,23 @@ fn model_aware_layout_overrides(
         None => return (output_layout, weight_layout),
     };
 
-    let out = match &op.kind {
-        // MHA 的输出是 HeadSplit — 从 OpKind 提取真实参数
-        OpKind::MultiHeadAttention { num_heads, head_dim, .. } => {
+    let out = match op.op_v2_resolved(graph) {
+        // MHA 的输出是 HeadSplit — 从 Op v2 AttentionSpec 提取真实参数
+        Some(Op::MultiHeadAttention(spec)) => {
             match output_layout {
                 LayoutConstraint::HeadSplit { num_heads: 0, head_dim: 0 } |
                 LayoutConstraint::Any => {
-                    LayoutConstraint::HeadSplit { num_heads: *num_heads, head_dim: *head_dim }
+                    LayoutConstraint::HeadSplit { num_heads: spec.geometry.num_q_heads, head_dim: spec.geometry.head_dim }
                 }
                 other => other,
             }
         }
         // QKV 投影 GEMM: 如果是 QKV 三兄弟，输出应该是 HeadSplit
-        OpKind::Gemm { n, .. } | OpKind::GemmBias { n, .. } => {
+        Some(Op::Gemm(_)) | Some(Op::GemmBias(_)) => {
             if is_qkv_op(op_id, graph) {
-                let head_dim = extract_head_dim_from_graph(graph)
-                    .unwrap_or(*n);
-                let num_heads = *n / head_dim.max(1);
+                let (_, n, _) = op.op_v2_gemm_dims(graph).unwrap_or((crate::compiler::graph::SymDim::Concrete(1), 0, 0));
+                let head_dim = extract_head_dim_from_graph(graph).unwrap_or(n);
+                let num_heads = n / head_dim.max(1);
                 LayoutConstraint::HeadSplit { num_heads, head_dim }
             } else {
                 output_layout
@@ -394,11 +394,12 @@ fn model_aware_layout_overrides(
 
     // weight_layout: PanelPacked 的 kc 应从 op 的 K 维度推导
     let wl = weight_layout.map(|wl| {
-        match (&op.kind, &wl) {
-            (OpKind::Gemm { k, .. } | OpKind::GemmBias { k, .. },
-             LayoutConstraint::PanelPacked { mr, nr: _ }) => {
+        let is_gemm_like = matches!(op.op_v2_resolved(graph), Some(Op::Gemm(_)) | Some(Op::GemmBias(_)));
+        let k_dim = op.op_v2_gemm_dims(graph).map(|(_, _, k)| k);
+        match (is_gemm_like, k_dim, &wl) {
+            (true, Some(k), LayoutConstraint::PanelPacked { mr, nr: _ }) => {
                 // kc = 实际 K 维度（用于 BLIS stride 计算）
-                LayoutConstraint::PanelPacked { mr: *mr, nr: *k }
+                LayoutConstraint::PanelPacked { mr: *mr, nr: k }
             }
             _ => wl,
         }
@@ -415,15 +416,15 @@ fn is_qkv_op(op_id: OpId, graph: &CompilerGraph) -> bool {
         Some(o) => o,
         None => return false,
     };
-    if !matches!(op.kind, OpKind::Gemm { .. } | OpKind::GemmBias { .. }) {
+    if !matches!(op.op_v2_resolved(graph), Some(Op::Gemm(_)) | Some(Op::GemmBias(_))) {
         return false;
     }
     let Some(&input_tid) = op.inputs.first() else { return false };
     // 统计共享同一输入的 GEMM 数量（通过 tensor.consumers 索引）
     let sibling_count = graph.tensor(input_tid)
         .map(|t| t.consumers.iter()
-            .filter(|&&c| graph.op(c).is_some_and(|o| matches!(o.kind,
-                OpKind::Gemm { .. } | OpKind::GemmBias { .. } | OpKind::QuantGemm { .. })))
+            .filter(|&&c| graph.op(c).is_some_and(|o| matches!(o.op_v2_resolved(graph),
+                Some(Op::Gemm(_)) | Some(Op::GemmBias(_)) | Some(Op::QuantGemm(_)))))
             .count())
         .unwrap_or(0);
     sibling_count >= 3
@@ -435,9 +436,9 @@ fn is_qkv_op(op_id: OpId, graph: &CompilerGraph) -> bool {
 /// This is a single targeted lookup, not a pre-scan bool flag.
 fn extract_head_dim_from_graph(graph: &CompilerGraph) -> Option<usize> {
     graph.ops.iter()
-        .find_map(|op| match &op.kind {
-            OpKind::MultiHeadAttention { head_dim, .. } => Some(*head_dim),
-            OpKind::RoPE { head_dim, .. } => Some(*head_dim),
+        .find_map(|op| match op.op_v2_resolved(graph) {
+            Some(Op::MultiHeadAttention(spec)) => Some(spec.geometry.head_dim),
+            Some(Op::RoPE(spec)) => Some(spec.head_dim),
             _ => None,
         })
 }
