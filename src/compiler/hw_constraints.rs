@@ -1,5 +1,5 @@
 use crate::compiler::fusion::{FusionGroup, FusionMode};
-use crate::compiler::graph::{CompilerGraph, MultiOutputConfig, OpKind};
+use crate::compiler::graph::{CompilerGraph, MultiOutputConfig, Op};
 use crate::compiler::planner::ExecutionPlan;
 use crate::types::DType;
 
@@ -415,24 +415,24 @@ pub fn enforce_constraints(
 // TODO(G-2): preserve symbolic form for tighter bounds.
 fn extract_gemm_dims(group: &FusionGroup, graph: &CompilerGraph) -> Option<(usize, usize, usize)> {
     let op = graph.op(group.anchor)?;
-    match &op.kind {
-        OpKind::Gemm { m, n, k, .. }
-        | OpKind::GemmBias { m, n, k, .. }
-        | OpKind::QuantGemm { m, n, k, .. } => Some((m.max_for_allocation_strict().expect("ARCH-SYMDIM: Symbolic dim must have max_value in cost model"), *n, *k)),
-        _ => None,
-    }
+    op.op_v2_gemm_dims(graph).map(|(m, n, k)| {
+        (m.max_for_allocation_strict().expect("ARCH-SYMDIM: Symbolic dim must have max_value in cost model"), n, k)
+    })
 }
+
+
 
 /// Extract GEMM dtype from the anchor op.
 /// ARCH-DTYPE-FULLCHAIN-ORCH: uses graph-level dtype inference for QuantGemm and non-GEMM ops.
 fn extract_gemm_dtype(group: &FusionGroup, graph: &CompilerGraph) -> crate::types::DType {
-    graph.op(group.anchor)
-        .and_then(|op| match &op.kind {
-            OpKind::Gemm { dtype, .. } | OpKind::GemmBias { dtype, .. } => Some(*dtype),
-            OpKind::QuantGemm { .. } => Some(graph.infer_computation_dtype()),
-            _ => None,
-        })
-        .unwrap_or_else(|| graph.infer_computation_dtype())
+    let op = graph.op(group.anchor);
+    op.and_then(|op| {
+        if op.op_v2_is_quant_gemm(graph) {
+            Some(graph.infer_computation_dtype())
+        } else {
+            op.op_v2_gemm_dtype(graph)
+        }
+    }).unwrap_or_else(|| graph.infer_computation_dtype())
 }
 
 /// Estimate register pressure for a fusion group.
@@ -454,11 +454,11 @@ fn estimate_register_pressure(
     match group.mode {
         FusionMode::Standalone => {
             if let Some(op) = graph.op(group.anchor) {
-                match &op.kind {
-                    OpKind::Gemm { .. } | OpKind::GemmBias { .. } | OpKind::QuantGemm { .. } => {
-                        gemm_base_regs(plan, dtype)
-                    }
-                    _ => 2, // input + output
+                let op_v2 = op.op_v2_resolved(graph);
+                if matches!(op_v2, Some(Op::Gemm(_)) | Some(Op::GemmBias(_)) | Some(Op::QuantGemm(_))) {
+                    gemm_base_regs(plan, dtype)
+                } else {
+                    2 // input + output
                 }
             } else {
                 2
@@ -558,7 +558,7 @@ fn estimate_l1_working_set(
 mod tests {
     use super::*;
     use crate::compiler::fusion::{self, GroupMarker};
-    use crate::compiler::graph::{CompilerGraph, OpId};
+    use crate::compiler::graph::{CompilerGraph, OpId, OpKind};
     use crate::compiler::ir::LayerIR;
     use crate::compiler::planner::ExecutionPlan;
     use crate::compiler::registry::ScalarOpRegistry;

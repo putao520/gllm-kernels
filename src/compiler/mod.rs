@@ -127,7 +127,7 @@ pub struct GpuForwardOutput {
     pub total_scratchpad_bytes: usize,
 }
 
-pub use graph::{CompilerGraph, OpKind, RopeScaling, TensorId, WeightLayout, SymDim, ShapeBinding};
+pub use graph::{CompilerGraph, Op, OpKind, RopeScaling, TensorId, WeightLayout, SymDim, ShapeBinding};
 pub use ir::MoeConfig;
 pub use rope_scaling::{compute_attention_scaling, compute_inv_freq, fill_cos_sin_table, fill_cos_sin_table_partial};
 pub use registry::ScalarOpRegistry;
@@ -2370,7 +2370,7 @@ mod tests {
         let mut gemm_count = 0;
         for &op_id in &topo {
             if let Some(op) = graph.op(op_id) {
-                if matches!(op.kind, OpKind::Gemm { .. }) {
+                if matches!(op.op_v2_resolved(&graph), Some(Op::Gemm(_))) {
                     gemm_count += 1;
                 }
             }

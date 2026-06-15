@@ -50,7 +50,7 @@ pub(crate) fn compute_group_ai(group: &FusionGroup, graph: &CompilerGraph) -> f3
     let mut total_bytes = 0usize;
     for &op_id in &group.ops {
         if let Some(op) = graph.op(op_id) {
-            total_flops += estimate_op_flops(op);
+            total_flops += estimate_op_flops(op, graph);
             for &tid in op.inputs.iter().chain(op.outputs.iter()) {
                 if let Some(t) = graph.tensor(tid) {
                     total_bytes += t.concrete_bytes();
@@ -67,12 +67,10 @@ pub(crate) fn compute_group_ai(group: &FusionGroup, graph: &CompilerGraph) -> f3
 /// (their FLOP contribution is negligible for roofline classification).
 // ARCH-SYMDIM-DEGRADE: cost model uses max_for_allocation for conservative estimate.
 // TODO(G-2): preserve symbolic form for tighter bounds.
-fn estimate_op_flops(op: &CompilerOp) -> usize {
-    match &op.kind {
-        OpKind::Gemm { m, n, k, .. }
-        | OpKind::GemmBias { m, n, k, .. }
-        | OpKind::QuantGemm { m, n, k, .. } => 2 * m.max_for_allocation_strict().expect("ARCH-SYMDIM: Symbolic dim must have max_value in cost model") * n * k,
-        _ => 0,
+fn estimate_op_flops(op: &CompilerOp, graph: &CompilerGraph) -> usize {
+    match op.op_v2_gemm_dims(graph) {
+        Some((m, n, k)) => 2 * m.max_for_allocation_strict().expect("ARCH-SYMDIM: Symbolic dim must have max_value in cost model") * n * k,
+        None => 0,
     }
 }
 

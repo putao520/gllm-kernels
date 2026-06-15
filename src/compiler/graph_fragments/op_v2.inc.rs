@@ -404,6 +404,17 @@ impl Op {
             _ => None,
         }
     }
+
+    /// 提取 GEMM dtype（胖 opcode 自描述）。
+    /// 仅 Gemm/GemmBias/FusedRmsNormGemm/MaskedGemm 携带 dtype；
+    /// QuantGemm 返回 None（调用方通过 graph.infer_computation_dtype 推导）。
+    pub fn gemm_dtype(&self) -> Option<DType> {
+        match self {
+            Op::Gemm(spec) | Op::GemmBias(spec) => Some(spec.dtype),
+            Op::FusedRmsNormGemm { dtype, .. } | Op::MaskedGemm { dtype, .. } => Some(*dtype),
+            _ => None,
+        }
+    }
 }
 
 /// Reduction 类 op 几何参数（胖 opcode 自描述）。

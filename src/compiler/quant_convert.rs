@@ -3,7 +3,7 @@
 //! REQ-JIT-QUANT-001: Format conversion via FP32 intermediate + graph-level quantization.
 
 use crate::compiler::quant_ir::{QuantFormat, QuantIR};
-use crate::compiler::graph::{CompilerGraph, OpKind};
+use crate::compiler::graph::{CompilerGraph, Op, OpKind};
 // QuantCodegen/PtxQuantCodegen 已迁移到 Register VM。
 // 量化 codegen 将通过 VmInstr::Transcendental(Dequant) + IsaLower 实现。
 use crate::types::CompilerError;
@@ -245,19 +245,16 @@ pub fn apply_quantization(
     graph: &mut CompilerGraph,
     format: QuantFormat,
 ) -> Result<(), CompilerError> {
-    // Find all weight tensors that should be quantized
-    for op in &mut graph.ops {
-        if should_quantize_op(&op.kind) {
-            let ir = QuantIR::new(format.clone(), vec![1024]); // Placeholder shape
-
-            // 量化 kernel 生成已迁移到 Register VM (VmInstr 路径)
-            let _ = ir;
-
-            // Mark op as quantized (would store kernel in real implementation)
-            // op.set_quantized(quant_kernel);
-        }
+    // 收集需要量化的 op id（胖 opcode 自描述，避免借用冲突）
+    let quantize_op_ids: Vec<_> = graph.ops.iter()
+        .filter(|op| op.op_v2_is_gemm_with_bias(graph) || matches!(op.op_v2_resolved(graph), Some(Op::Gemm(_))))
+        .map(|op| op.id)
+        .collect();
+    for _op_id in quantize_op_ids {
+        let _ir = QuantIR::new(format.clone(), vec![1024]); // Placeholder shape
+        // 量化 kernel 生成已迁移到 Register VM (VmInstr 路径)
+        // Mark op as quantized (would store kernel in real implementation)
     }
-
     Ok(())
 }
 

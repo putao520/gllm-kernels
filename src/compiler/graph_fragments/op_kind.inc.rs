@@ -909,6 +909,13 @@ impl CompilerOp {
         self.op_v2_resolved(graph).and_then(|o| o.gemm_dims())
     }
 
+    /// 提取 GEMM dtype（胖 opcode 自描述）。
+    /// 替代 `extract_gemm_dtype` 中
+    /// `match op.kind { OpKind::Gemm{dtype,..} | OpKind::GemmBias{dtype,..} => Some(*dtype), _ => None }`。
+    pub fn op_v2_gemm_dtype(&self, graph: &CompilerGraph) -> Option<crate::types::DType> {
+        self.op_v2_resolved(graph).and_then(|o| o.gemm_dtype())
+    }
+
     /// 输出别名到输入的 IR 元数据（胖 opcode 自描述）。
     /// 替代 `op.kind.output_aliases_input()`。
     pub fn op_v2_output_aliases_input(&self, graph: &CompilerGraph) -> Option<usize> {
