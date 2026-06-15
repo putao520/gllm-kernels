@@ -1168,7 +1168,7 @@ pub(crate) fn lower_op_v2(
             let width = ctx.session.width;
             let sym_map = ctx.session.sym_map;
             let seq_bound_override: Option<BoundExpr> = abi.mega_decode_seq_len.map(BoundExpr::DynamicVReg);
-            let trace_body = extract_op_trace(op, ctx.session.registry)?;
+            let trace_body = extract_op_trace(op, ctx.session.registry, graph)?;
             if trace_body.is_empty() {
                 return Err(CompilerError::CodegenViolation(
                     "LearnedPos2D: 空 trace (registry 未注册或 pattern 提取失败)".into(),

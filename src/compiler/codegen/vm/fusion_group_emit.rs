@@ -607,14 +607,14 @@ pub(super) fn emit_fusion_group_by_mode(
             let act_op = graph.op(*activation).ok_or_else(|| CompilerError::CodegenViolation(
                 format!("FFNBlock activation op {:?} not found", activation)))?;
             let act_scratch = load_op_scratch_ptr(prog, scratch_base, act_op, alloc, resolver, abi)?;
-            let act_trace = extract_op_trace(act_op, registry)?;
+            let act_trace = extract_op_trace(act_op, registry, graph)?;
             let (act_shape, _) = infer_output_shape_sym(act_op, graph)?;
             emit_elementwise_inline(prog, &act_trace, &act_shape, width, false,
                 false,
                 gate_scratch, weight_ptr, act_scratch, sym_map, seq_bound_override, ctx.dtype)?;
             let combine_op = graph.op(*combine).ok_or_else(|| CompilerError::CodegenViolation(
                 format!("FFNBlock combine op {:?} not found", combine)))?;
-            let combine_trace = extract_op_trace(combine_op, registry)?;
+            let combine_trace = extract_op_trace(combine_op, registry, graph)?;
             let (combine_shape, _) = infer_output_shape_sym(combine_op, graph)?;
             let combine_output = combine_op.outputs.first().copied()
                 .and_then(|tid| resolver.materialize(prog, tid, abi))
@@ -638,7 +638,7 @@ pub(super) fn emit_fusion_group_by_mode(
                 .and_then(|tid| resolver.materialize(prog, tid, abi))
                 .unwrap_or(weight_ptr);
 
-            let res_trace = extract_op_trace(res_op, registry)?;
+            let res_trace = extract_op_trace(res_op, registry, graph)?;
             let (res_shape, _) = infer_output_shape_sym(res_op, graph)?;
             let res_is_binary = res_op.inputs.len() > 1;
             emit_elementwise_inline(prog, &res_trace, &res_shape, width, res_is_binary,
@@ -655,7 +655,7 @@ pub(super) fn emit_fusion_group_by_mode(
                 .and_then(|tid| resolver.materialize(prog, tid, abi))
                 .unwrap_or(output_ptr);
 
-            let norm_trace = extract_op_trace(norm_op, registry)?;
+            let norm_trace = extract_op_trace(norm_op, registry, graph)?;
             let (norm_shape, _) = infer_output_shape_sym(norm_op, graph)?;
             let norm_is_binary = norm_op.inputs.len() > 1;
             emit_elementwise_inline(prog, &norm_trace, &norm_shape, width, norm_is_binary,

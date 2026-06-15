@@ -275,6 +275,7 @@ fn compile_gpu(
 pub(crate) fn extract_op_trace(
     op: &crate::compiler::graph::CompilerOp,
     registry: Option<&ScalarOpRegistry>,
+    graph: &CompilerGraph,
 ) -> Result<Vec<TraceOp>, CompilerError> {
     // 从 OpKind 映射到 OpKindKey
     let key = op_kind_to_key(&op.kind);
@@ -296,8 +297,8 @@ pub(crate) fn extract_op_trace(
             //   → IR (per-op Const 重写) → ISA Lowering
             //
             // 不是 fallback, 是 ComputePattern 自动分发 IR 层的合法常量折叠。
-            if let OpKind::SwiGluClipped { limit } = &op.kind {
-                rewrite_swiglu_clipped_limit(&mut body, *limit);
+            if let Some(Op::SwiGluClipped { limit }) = op.op_v2_resolved(graph) {
+                rewrite_swiglu_clipped_limit(&mut body, limit);
             }
 
             return Ok(body);
@@ -306,30 +307,30 @@ pub(crate) fn extract_op_trace(
 
     // 没有 registry 或 registry 中没有该算子 → 返回 Err
     // (除了 Reshape/Transpose 是元数据操作，不需要 trace)
-    match &op.kind {
-        OpKind::Reshape { .. } | OpKind::Transpose { .. } | OpKind::SliceView { .. } => Ok(vec![]),
+    match op.op_v2_resolved(graph) {
+        Some(Op::Reshape { .. }) | Some(Op::Transpose { .. }) | Some(Op::SliceView { .. }) => Ok(vec![]),
         // Gather has its own dedicated lower path, no scalar trace needed
-        OpKind::Gather { .. } => Ok(vec![]),
+        Some(Op::Gather { .. }) => Ok(vec![]),
         // QuantGather has its own dedicated lower path (emit_quant_gather_inline), no scalar trace needed
-        OpKind::QuantGather { .. } => Ok(vec![]),
+        Some(Op::QuantGather { .. }) => Ok(vec![]),
         // ColumnSlice: memory-bound row-major copy, dedicated lower path (lower_column_slice)
-        OpKind::ColumnSlice { .. } => Ok(vec![]),
+        Some(Op::ColumnSlice { .. }) => Ok(vec![]),
         // AltUp ops: Injective, dispatched via emit_injective_inline
-        OpKind::AltUpPredict { .. } | OpKind::AltUpCorrect { .. } | OpKind::AltUpInject { .. } => Ok(vec![]),
+        Some(Op::AltUpPredict { .. }) | Some(Op::AltUpCorrect { .. }) | Some(Op::AltUpInject { .. }) => Ok(vec![]),
         // MoERouter: opaque composite op (GEMM + softmax + top-k), specialized dispatch
-        OpKind::MoERouter { .. } => Ok(vec![]),
+        Some(Op::MoERouter { .. }) => Ok(vec![]),
         // MoEDispatchPacked: opaque 复合算子 (mxfp4 dequant + SwiGLU + GEMV), 专用分发
-        OpKind::MoEDispatchPacked { .. } => Ok(vec![]),
+        Some(Op::MoEDispatchPacked { .. }) => Ok(vec![]),
         // ARCH-SG-QTAP: pure side-effect op, 无 scalar trace (直接由 lower_qtap_stg 发射)
-        OpKind::QTapSTG { .. } => Ok(vec![]),
+        Some(Op::QTapSTG { .. }) => Ok(vec![]),
         // Argmax: 独立 lowering (VmInstr::Argmax), 无需 scalar trace
-        OpKind::Argmax { .. } => Ok(vec![]),
+        Some(Op::Argmax { .. }) => Ok(vec![]),
         // MtpDraft: structural op lowered via TraceOp::MtpDraft → auto_select
-        OpKind::MtpDraft { .. } => Ok(vec![]),
+        Some(Op::MtpDraft { .. }) => Ok(vec![]),
         // LogitSoftcap: 生成 per-cap 的 elementwise trace (cap * tanh(x / cap))
         // 用于 GEMM EpilogueInjection 融合。
-        OpKind::LogitSoftcap { cap } => {
-            let cap_val = *cap as f64;
+        Some(Op::LogitSoftcap { cap }) => {
+            let cap_val = cap as f64;
             let inv_cap = 1.0 / cap_val;
             Ok(vec![
                 TraceOp::Input(0),       // [0] x
@@ -342,7 +343,7 @@ pub(crate) fn extract_op_trace(
         }
         _ => Err(CompilerError::CodegenViolation(
             format!(
-                "extract_op_trace: OpKind {:?} 没有在 ScalarOpRegistry 中注册。\
+                "extract_op_trace: Op {:?} 没有在 ScalarOpRegistry 中注册。\
                  违反 §14.1 四阶段管线铁律——所有算子必须走 Scalar→SymExec→TraceOp 管线。",
                 op.kind
             )
@@ -931,7 +932,7 @@ pub(super) fn collect_epilogue_trace(
         })
         .collect();
     let trace_bodies: Vec<Vec<TraceOp>> = trace_ops.iter()
-        .map(|(_, op)| extract_op_trace(op, registry))
+        .map(|(_, op)| extract_op_trace(op, registry, graph))
         .collect::<Result<Vec<_>, _>>()?;
     let trace_bearing_count = trace_bodies.iter().filter(|b| !b.is_empty()).count();
     if trace_bearing_count > 1 {
