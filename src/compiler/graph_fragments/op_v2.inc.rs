@@ -340,7 +340,44 @@ impl Op {
         }
     }
 
-    /// Phase 4: Norm/Activation 类别的 from_op_kind 转换。
+    /// 是否为 GEMM 类 op（Gemm/GemmBias/FusedRmsNormGemm/MaskedGemm，不含 QuantGemm）。
+    /// 替代 fusion pass 中的 `matches!(op.kind, OpKind::Gemm{..} | OpKind::GemmBias{..})`。
+    pub fn is_gemm_like(&self) -> bool {
+        matches!(self,
+            Op::Gemm(_) | Op::GemmBias(_) | Op::FusedRmsNormGemm { .. } | Op::MaskedGemm { .. })
+    }
+
+    /// GEMM trans_b 参数（胖 opcode 自描述，无需 op.kind 反查）。
+    /// None 表示非 GEMM 类 op。替代 fusion pass 中的
+    /// `match op.kind { OpKind::Gemm{trans_b,..} | OpKind::GemmBias{trans_b,..} => *trans_b, _ => false }`。
+    pub fn gemm_trans_b(&self) -> Option<bool> {
+        match self {
+            Op::Gemm(spec) | Op::GemmBias(spec) => Some(spec.trans_b),
+            Op::FusedRmsNormGemm { trans_b, .. } | Op::MaskedGemm { trans_b, .. } => Some(*trans_b),
+            _ => None,
+        }
+    }
+
+    /// 是否为带 bias 的 GEMM（GemmBias）。
+    /// 替代 fusion pass 中的 `matches!(op.kind, OpKind::GemmBias{..})`。
+    pub fn is_gemm_with_bias(&self) -> bool {
+        matches!(self, Op::GemmBias(_))
+    }
+
+    /// 是否为 Norm 类 op（RmsNorm/LayerNorm/ValueNorm/HeadRmsNorm）。
+    /// 替代 fusion pass 中的 `matches!(op.kind, OpKind::RmsNorm{..} | ...)`。
+    pub fn is_norm_like(&self) -> bool {
+        matches!(self,
+            Op::RmsNorm(_) | Op::LayerNorm(_) | Op::ValueNorm(_) | Op::HeadRmsNorm { .. })
+    }
+
+    /// 是否为 QuantGemm。
+    /// 替代 fusion pass 中的 `matches!(op.kind, OpKind::QuantGemm{..})`。
+    pub fn is_quant_gemm(&self) -> bool {
+        matches!(self, Op::QuantGemm(_))
+    }
+
+
     ///
     /// dtype 从 op.inputs[0] 的 tensor 推导（ARCH-DTYPE-JIT-TYPED）。
     /// 其余类别（Gemm/Attention/MoE/Structural）在 Phase 5-7 实现。

@@ -931,6 +931,47 @@ pub struct CompilerOp {
     pub op_v2: Option<crate::compiler::graph::Op>,
 }
 
+impl CompilerOp {
+    /// 获取已缓存的 Op v2，或在未缓存时按 graph 上下文即时翻译并返回。
+    ///
+    /// 正常生产路径下，add_op 已缓存 op_v2，本方法零翻译开销。
+    /// 测试 fixture / 部分构造路径下，op_v2 为 None，本方法按需翻译。
+    pub fn op_v2_resolved(&self, graph: &CompilerGraph) -> Option<crate::compiler::graph::Op> {
+        self.op_v2.clone().or_else(|| crate::compiler::graph::Op::from_op_kind(self, graph))
+    }
+
+    /// 检查 Op v2 是否为 GEMM 类（胖 opcode 自描述）。
+    /// 替代 fusion pass 中的 `matches!(op.kind, OpKind::Gemm{..} | OpKind::GemmBias{..})`。
+    pub fn op_v2_is_gemm_like(&self, graph: &CompilerGraph) -> bool {
+        self.op_v2_resolved(graph).map(|o| o.is_gemm_like()).unwrap_or(false)
+    }
+
+    /// 检查 Op v2 是否为 GemmBias（带 bias 的 GEMM）。
+    /// 替代 fusion pass 中的 `matches!(op.kind, OpKind::GemmBias{..})`。
+    pub fn op_v2_is_gemm_with_bias(&self, graph: &CompilerGraph) -> bool {
+        self.op_v2_resolved(graph).map(|o| o.is_gemm_with_bias()).unwrap_or(false)
+    }
+
+    /// 检查 Op v2 是否为 QuantGemm。
+    /// 替代 fusion pass 中的 `matches!(op.kind, OpKind::QuantGemm{..})`。
+    pub fn op_v2_is_quant_gemm(&self, graph: &CompilerGraph) -> bool {
+        self.op_v2_resolved(graph).map(|o| o.is_quant_gemm()).unwrap_or(false)
+    }
+
+    /// 检查 Op v2 是否为 Norm 类（RmsNorm/LayerNorm/ValueNorm/HeadRmsNorm）。
+    /// 替代 fusion pass 中的 `matches!(op.kind, OpKind::RmsNorm{..} | ...)`。
+    pub fn op_v2_is_norm_like(&self, graph: &CompilerGraph) -> bool {
+        self.op_v2_resolved(graph).map(|o| o.is_norm_like()).unwrap_or(false)
+    }
+
+    /// 提取 GEMM trans_b 参数（胖 opcode 自描述）。
+    /// 替代 fusion pass 中的
+    /// `match op.kind { OpKind::Gemm{trans_b,..} | OpKind::GemmBias{trans_b,..} => *trans_b, _ => false }`。
+    pub fn op_v2_gemm_trans_b(&self, graph: &CompilerGraph) -> bool {
+        self.op_v2_resolved(graph).and_then(|o| o.gemm_trans_b()).unwrap_or(false)
+    }
+}
+
 // ── CompilerGraph ──────────────────────────────────────────────────
 
 /// DAG of operations for a single transformer layer (or full model for mega-kernel).
