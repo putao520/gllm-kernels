@@ -780,57 +780,6 @@ pub struct QTapGraphConfig {
     pub num_slots: usize,
 }
 
-impl OpKind {
-    /// Replace all `SymDim::Symbolic` dimensions in this OpKind with
-    /// `SymDim::Concrete(resolve(name))` using the provided resolver closure.
-    ///
-    /// This is used during JIT compilation to concretize symbolic dims
-    /// before passing to codegen (which requires concrete dimensions).
-    pub fn concretize_symbolic_dims<F: Fn(&str) -> Option<usize>>(&mut self, resolve: F) {
-        match self {
-            OpKind::Gemm { m, .. }
-            | OpKind::GemmBias { m, .. }
-            | OpKind::QuantGemm { m, .. }
-            | OpKind::FusedRmsNormGemm { m, .. }
-            | OpKind::MaskedGemm { m, .. } => {
-                if let SymDim::Symbolic { name, .. } = m {
-                    if let Some(val) = resolve(name) {
-                        *m = SymDim::Concrete(val);
-                    }
-                }
-            }
-            OpKind::Gather { index_dim: seq_len, .. }
-            | OpKind::QuantGather { index_dim: seq_len, .. }
-            | OpKind::MultiHeadAttention { seq_len, .. }
-            | OpKind::AttentionSkipMask { seq_len, .. }
-            | OpKind::EntropyGate { seq_len, .. }
-            | OpKind::VRangeQuant { seq_len, .. }
-            | OpKind::KvCentroidPrefetch { seq_len, .. }
-            | OpKind::MoEConditionalAdd { seq_len, .. }
-            | OpKind::AltUpPredict { seq_len, .. }
-            | OpKind::AltUpCorrect { seq_len, .. }
-            | OpKind::AltUpInject { seq_len, .. }
-            | OpKind::MoERouter { seq_len, .. }
-            | OpKind::MoEDispatchPacked { seq_len, .. }
-            | OpKind::ColumnSlice { seq_len, .. } => {
-                if let SymDim::Symbolic { name, .. } = seq_len {
-                    if let Some(val) = resolve(name) {
-                        *seq_len = SymDim::Concrete(val);
-                    }
-                }
-            }
-            OpKind::QTapSTG { q_dim, .. } => {
-                if let SymDim::Symbolic { name, .. } = q_dim {
-                    if let Some(val) = resolve(name) {
-                        *q_dim = SymDim::Concrete(val);
-                    }
-                }
-            }
-            _ => {}
-        }
-    }
-}
-
 // ── Telemetry offsets ──────────────────────────────────────────────
 
 /// Telemetry buffer offsets for epilogue probes (SPEC §9.5).
