@@ -1052,16 +1052,39 @@ mod tests {
 
         // Append tokens and write K/V into cache pages
         let v_base = num_kv_heads * PAGE_SIZE * head_dim;
+        let kv_dtype = kv_cache.dtype();
+        let elem_bytes = kv_dtype.size_bytes();
         let positions = kv_cache.append(0, 0, cached_len).unwrap();
         for (t, &(pid, off)) in positions.iter().enumerate() {
-            let page_ptr = kv_cache.page_mut_ptr(pid) as *mut f32;
+            let page_ptr = kv_cache.page_mut_ptr(pid);
             for kv_h in 0..num_kv_heads {
                 let k_base = kv_h * PAGE_SIZE * head_dim + off * head_dim;
                 let v_off = v_base + kv_h * PAGE_SIZE * head_dim + off * head_dim;
                 for d in 0..head_dim {
+                    let k_val = make_val(t * head_dim + d, kv_h * 100);
+                    let v_val = make_val(t * head_dim + d, kv_h * 100 + 500);
+                    let k_byte_off = (k_base + d) * elem_bytes;
+                    let v_byte_off = (v_off + d) * elem_bytes;
                     unsafe {
-                        *page_ptr.add(k_base + d) = make_val(t * head_dim + d, kv_h * 100);
-                        *page_ptr.add(v_off + d) = make_val(t * head_dim + d, kv_h * 100 + 500);
+                        match kv_dtype {
+                            crate::types::DType::F32 => {
+                                *(page_ptr.add(k_byte_off) as *mut f32) = k_val;
+                                *(page_ptr.add(v_byte_off) as *mut f32) = v_val;
+                            }
+                            crate::types::DType::BF16 => {
+                                *(page_ptr.add(k_byte_off) as *mut half::bf16) =
+                                    half::bf16::from_f32(k_val);
+                                *(page_ptr.add(v_byte_off) as *mut half::bf16) =
+                                    half::bf16::from_f32(v_val);
+                            }
+                            crate::types::DType::F16 => {
+                                *(page_ptr.add(k_byte_off) as *mut half::f16) =
+                                    half::f16::from_f32(k_val);
+                                *(page_ptr.add(v_byte_off) as *mut half::f16) =
+                                    half::f16::from_f32(v_val);
+                            }
+                            other => panic!("unsupported KV cache dtype for write: {other:?}"),
+                        }
                     }
                 }
             }
@@ -1181,11 +1204,13 @@ mod tests {
         }
 
         let num_steps = 8;
+        let kv_dtype = kv_cache.dtype();
+        let elem_bytes = kv_dtype.size_bytes();
         for step in 0..num_steps {
             // Append one token to cache
             let positions = kv_cache.append(0, 0, 1).unwrap();
             let (pid, off) = positions[0];
-            let page_ptr = kv_cache.page_mut_ptr(pid) as *mut f32;
+            let page_ptr = kv_cache.page_mut_ptr(pid);
 
             for kv_h in 0..num_kv_heads {
                 let k_base = kv_h * PAGE_SIZE * head_dim + off * head_dim;
@@ -1193,9 +1218,28 @@ mod tests {
                 for d in 0..head_dim {
                     let kval = make_val(step * head_dim + d, kv_h * 100);
                     let vval = make_val(step * head_dim + d, kv_h * 100 + 500);
+                    let k_byte_off = (k_base + d) * elem_bytes;
+                    let v_byte_off = (v_off + d) * elem_bytes;
                     unsafe {
-                        *page_ptr.add(k_base + d) = kval;
-                        *page_ptr.add(v_off + d) = vval;
+                        match kv_dtype {
+                            crate::types::DType::F32 => {
+                                *(page_ptr.add(k_byte_off) as *mut f32) = kval;
+                                *(page_ptr.add(v_byte_off) as *mut f32) = vval;
+                            }
+                            crate::types::DType::BF16 => {
+                                *(page_ptr.add(k_byte_off) as *mut half::bf16) =
+                                    half::bf16::from_f32(kval);
+                                *(page_ptr.add(v_byte_off) as *mut half::bf16) =
+                                    half::bf16::from_f32(vval);
+                            }
+                            crate::types::DType::F16 => {
+                                *(page_ptr.add(k_byte_off) as *mut half::f16) =
+                                    half::f16::from_f32(kval);
+                                *(page_ptr.add(v_byte_off) as *mut half::f16) =
+                                    half::f16::from_f32(vval);
+                            }
+                            other => panic!("unsupported KV cache dtype for write: {other:?}"),
+                        }
                     }
                     all_k[kv_h].push(kval);
                     all_v[kv_h].push(vval);
@@ -1378,18 +1422,39 @@ mod tests {
 
         // Write all K/V into paged cache
         let mut kv_cache = KvCache::new(&cfg, 1, cfg.max_seq_len).unwrap();
+        let kv_dtype = kv_cache.dtype();
+        let elem_bytes = kv_dtype.size_bytes();
         let positions = kv_cache.append(0, 0, total_len).unwrap();
         for (t, &(pid, off)) in positions.iter().enumerate() {
-            let page_ptr = kv_cache.page_mut_ptr(pid) as *mut f32;
+            let page_ptr = kv_cache.page_mut_ptr(pid);
             for kv_h in 0..num_kv_heads {
                 let k_base = kv_h * PAGE_SIZE * head_dim + off * head_dim;
                 let v_off = v_base + kv_h * PAGE_SIZE * head_dim + off * head_dim;
                 for d in 0..head_dim {
+                    let k_val = all_k_flat[kv_h][t * head_dim + d];
+                    let v_val = all_v_flat[kv_h][t * head_dim + d];
+                    let k_byte_off = (k_base + d) * elem_bytes;
+                    let v_byte_off = (v_off + d) * elem_bytes;
                     unsafe {
-                        *page_ptr.add(k_base + d) =
-                            all_k_flat[kv_h][t * head_dim + d];
-                        *page_ptr.add(v_off + d) =
-                            all_v_flat[kv_h][t * head_dim + d];
+                        match kv_dtype {
+                            crate::types::DType::F32 => {
+                                *(page_ptr.add(k_byte_off) as *mut f32) = k_val;
+                                *(page_ptr.add(v_byte_off) as *mut f32) = v_val;
+                            }
+                            crate::types::DType::BF16 => {
+                                *(page_ptr.add(k_byte_off) as *mut half::bf16) =
+                                    half::bf16::from_f32(k_val);
+                                *(page_ptr.add(v_byte_off) as *mut half::bf16) =
+                                    half::bf16::from_f32(v_val);
+                            }
+                            crate::types::DType::F16 => {
+                                *(page_ptr.add(k_byte_off) as *mut half::f16) =
+                                    half::f16::from_f32(k_val);
+                                *(page_ptr.add(v_byte_off) as *mut half::f16) =
+                                    half::f16::from_f32(v_val);
+                            }
+                            other => panic!("unsupported KV cache dtype for write: {other:?}"),
+                        }
                     }
                 }
             }
