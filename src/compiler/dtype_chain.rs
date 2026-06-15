@@ -5,7 +5,7 @@
 //! and gates compilation on chain validity.
 
 use crate::types::{CompilerError, DType, InferenceError};
-use crate::compiler::graph::{CompilerGraph, OpId, OpKind, TensorId, TensorMeta};
+use crate::compiler::graph::{CompilerGraph, Op, OpId, TensorId, TensorMeta};
 use crate::dispatch::device_profile::DeviceProfile;
 
 // ── REQ-DTYPE-CHAIN-001: DType chain end-to-end tracking ─────────────
@@ -86,7 +86,7 @@ pub fn detect_dtype_breakpoints(graph: &CompilerGraph) -> Vec<DtypeBreakpoint> {
 
     for op in &graph.ops {
         // Check each input tensor's dtype against the op's expected dtype.
-        let expected = op_expected_dtype(&op.kind, graph);
+        let expected = op_expected_dtype(op, graph);
 
         for &input_tid in &op.inputs {
             let Some(tensor) = graph.tensor(input_tid) else { continue };
@@ -112,14 +112,11 @@ pub fn detect_dtype_breakpoints(graph: &CompilerGraph) -> Vec<DtypeBreakpoint> {
 }
 
 /// Derive the expected dtype for an op from its OpKind.
-fn op_expected_dtype(kind: &OpKind, _graph: &CompilerGraph) -> Option<DType> {
-    match kind {
-        OpKind::Gemm { dtype, .. } | OpKind::GemmBias { dtype, .. } => Some(*dtype),
-        OpKind::QuantGemm { .. } => Some(DType::F32), // QuantGemm always outputs F32
-        OpKind::RmsNorm { .. } | OpKind::LayerNorm { .. } => {
-            // Norm ops expect the same dtype as their first input
-            None // defer to actual input dtype
-        }
+fn op_expected_dtype(op: &crate::compiler::graph::CompilerOp, graph: &CompilerGraph) -> Option<DType> {
+    match op.op_v2_resolved(graph) {
+        Some(Op::Gemm(_)) | Some(Op::GemmBias(_)) => op.op_v2_gemm_dtype(graph),
+        Some(Op::QuantGemm(_)) => Some(DType::F32), // QuantGemm always outputs F32
+        // Norm ops expect the same dtype as their first input
         _ => None,
     }
 }
@@ -161,7 +158,7 @@ pub fn select_dequant_path(
         // ARCH-JIT-DATA-YIELDS: use tensor.consumers index instead of graph.ops.iter()
         let consumed_by_norm = tensor.consumers.iter()
             .filter_map(|&op_id| graph.op(op_id))
-            .any(|op| matches!(op.kind, OpKind::RmsNorm { .. } | OpKind::LayerNorm { .. }));
+            .any(|op| matches!(op.op_v2_resolved(graph), Some(Op::RmsNorm(_)) | Some(Op::LayerNorm(_))));
         if consumed_by_norm {
             return DequantStrategy::Immediate;
         }
@@ -170,7 +167,7 @@ pub fn select_dequant_path(
     // 2D tensors consumed by GEMM ops → deferred dequant
     let consumed_by_gemm = tensor.consumers.iter()
         .filter_map(|&op_id| graph.op(op_id))
-        .any(|op| matches!(op.kind, OpKind::Gemm { .. } | OpKind::GemmBias { .. } | OpKind::QuantGemm { .. }));
+        .any(|op| matches!(op.op_v2_resolved(graph), Some(Op::Gemm(_)) | Some(Op::GemmBias(_)) | Some(Op::QuantGemm(_))));
 
     if consumed_by_gemm {
         return DequantStrategy::DeferredInKernel;
