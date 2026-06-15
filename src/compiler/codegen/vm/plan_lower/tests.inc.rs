@@ -976,7 +976,7 @@ mod tests {
     #[test]
     fn test_gemm_trans_b_correctness() {
         use crate::compiler::InferenceCompiler;
-        use crate::compiler::mega_kernel_abi::{CompileConfig, BusinessConfig};
+        use crate::compiler::mega_kernel_abi::{CompileConfig, BusinessConfig, CompileTarget};
         use crate::types::DType;
 
         let m = 5usize;   // seq_len
@@ -999,10 +999,12 @@ mod tests {
             max_seq_len: m,
             debug_jit: false,
             hetero: None,
+            target: CompileTarget::Cpu,
         };
         let mut compiler = InferenceCompiler::new();
-        let compiled = compiler.compile_mega_kernel_from_graph(g, &config, None)
+        let compiled = compiler.compile(g, &config, None)
             .expect("trans_b GEMM compilation failed")
+            .expect_cpu()
             .layer_code;
 
         // Prepare input data
@@ -1055,7 +1057,7 @@ mod tests {
     #[test]
     fn test_gemm_no_trans_b_compiles() {
         use crate::compiler::InferenceCompiler;
-        use crate::compiler::mega_kernel_abi::{CompileConfig, BusinessConfig};
+        use crate::compiler::mega_kernel_abi::{CompileConfig, BusinessConfig, CompileTarget};
 
         use crate::types::DType;
 
@@ -1078,10 +1080,12 @@ mod tests {
             max_seq_len: m,
             debug_jit: false,
             hetero: None,
+            target: CompileTarget::Cpu,
         };
         let mut compiler = InferenceCompiler::new();
-        let compiled = compiler.compile_mega_kernel_from_graph(g, &config, None)
+        let compiled = compiler.compile(g, &config, None)
             .expect("non-trans GEMM compilation failed")
+            .expect_cpu()
             .layer_code;
 
         assert_ne!(compiled.config_hash, 0, "non-trans GEMM should produce non-zero hash");
@@ -1091,7 +1095,7 @@ mod tests {
     #[test]
     fn test_gemm_no_trans_b_m2_n16_k8_correctness() {
         use crate::compiler::InferenceCompiler;
-        use crate::compiler::mega_kernel_abi::{CompileConfig, BusinessConfig};
+        use crate::compiler::mega_kernel_abi::{CompileConfig, BusinessConfig, CompileTarget};
         use crate::types::DType;
 
         let m = 2usize;
@@ -1109,10 +1113,10 @@ mod tests {
             vec![a, b], vec![c], "gemm_m2_n16",
         );
 
-        let config = CompileConfig { max_seq_len: m, debug_jit: false, hetero: None };
+        let config = CompileConfig { max_seq_len: m, debug_jit: false, hetero: None, target: CompileTarget::Cpu };
         let mut compiler = InferenceCompiler::new();
-        let compiled = compiler.compile_mega_kernel_from_graph(g, &config, None)
-            .expect("GEMM compilation failed").layer_code;
+        let compiled = compiler.compile(g, &config, None)
+            .expect("GEMM compilation failed").expect_cpu().layer_code;
 
         let a_data: Vec<f32> = (0..m*k).map(|i| (i as f32 * 0.1).sin()).collect();
         let b_data: Vec<f32> = (0..k*n).map(|i| (i as f32 * 0.2).cos()).collect();
@@ -1183,7 +1187,7 @@ mod tests {
     #[test]
     fn test_blis_gem_k1_unroll_m4_n16_k32() {
         use crate::compiler::InferenceCompiler;
-        use crate::compiler::mega_kernel_abi::{CompileConfig, BusinessConfig};
+        use crate::compiler::mega_kernel_abi::{CompileConfig, BusinessConfig, CompileTarget};
         use crate::compiler::codegen::vm::gemm_emit::emit_gemm_blis_inline;
         use crate::compiler::codegen::vm::instr::{VmProgram, VRegKind, SimdWidth, VmInstr};
         use crate::compiler::trace::QuantPrecision;
@@ -1209,7 +1213,7 @@ mod tests {
     #[test]
     fn test_gemm_no_trans_b_m4_n16_k32_correctness() {
         use crate::compiler::InferenceCompiler;
-        use crate::compiler::mega_kernel_abi::{CompileConfig, BusinessConfig};
+        use crate::compiler::mega_kernel_abi::{CompileConfig, BusinessConfig, CompileTarget};
         use crate::types::DType;
 
         let m = 4usize;
@@ -1227,10 +1231,10 @@ mod tests {
             vec![a, b], vec![c], "gemm_m4_n16",
         );
 
-        let config = CompileConfig { max_seq_len: m, debug_jit: false, hetero: None };
+        let config = CompileConfig { max_seq_len: m, debug_jit: false, hetero: None, target: CompileTarget::Cpu };
         let mut compiler = InferenceCompiler::new();
-        let compiled = compiler.compile_mega_kernel_from_graph(g, &config, None)
-            .expect("GEMM compilation failed").layer_code;
+        let compiled = compiler.compile(g, &config, None)
+            .expect("GEMM compilation failed").expect_cpu().layer_code;
 
         // Dump machine code for disassembly
         let code = compiled.code_bytes();
@@ -1261,7 +1265,7 @@ mod tests {
     #[test]
     fn test_gemm_no_trans_b_m4_n16_k4_correctness() {
         use crate::compiler::InferenceCompiler;
-        use crate::compiler::mega_kernel_abi::{CompileConfig, BusinessConfig};
+        use crate::compiler::mega_kernel_abi::{CompileConfig, BusinessConfig, CompileTarget};
         use crate::types::DType;
 
         let m = 4usize;
@@ -1279,10 +1283,10 @@ mod tests {
             vec![a, b], vec![c], "gemm_m4_n16_k4",
         );
 
-        let config = CompileConfig { max_seq_len: m, debug_jit: false, hetero: None };
+        let config = CompileConfig { max_seq_len: m, debug_jit: false, hetero: None, target: CompileTarget::Cpu };
         let mut compiler = InferenceCompiler::new();
-        let compiled = compiler.compile_mega_kernel_from_graph(g, &config, None)
-            .expect("GEMM compilation failed").layer_code;
+        let compiled = compiler.compile(g, &config, None)
+            .expect("GEMM compilation failed").expect_cpu().layer_code;
 
         let a_data: Vec<f32> = (0..m*k).map(|i| (i as f32 * 0.01 - 0.5).sin()).collect();
         let b_data: Vec<f32> = (0..k*n).map(|i| (i as f32 * 0.02 - 0.3).cos()).collect();
@@ -1309,7 +1313,7 @@ mod tests {
     #[test]
     fn test_gemm_no_trans_b_m4_n16_k8_correctness() {
         use crate::compiler::InferenceCompiler;
-        use crate::compiler::mega_kernel_abi::{CompileConfig, BusinessConfig};
+        use crate::compiler::mega_kernel_abi::{CompileConfig, BusinessConfig, CompileTarget};
         use crate::types::DType;
 
         let m = 4usize;
@@ -1327,10 +1331,10 @@ mod tests {
             vec![a, b], vec![c], "gemm_m4_n16_k8",
         );
 
-        let config = CompileConfig { max_seq_len: m, debug_jit: false, hetero: None };
+        let config = CompileConfig { max_seq_len: m, debug_jit: false, hetero: None, target: CompileTarget::Cpu };
         let mut compiler = InferenceCompiler::new();
-        let compiled = compiler.compile_mega_kernel_from_graph(g, &config, None)
-            .expect("GEMM compilation failed").layer_code;
+        let compiled = compiler.compile(g, &config, None)
+            .expect("GEMM compilation failed").expect_cpu().layer_code;
 
         let a_data: Vec<f32> = (0..m*k).map(|i| (i as f32 * 0.01 - 0.5).sin()).collect();
         let b_data: Vec<f32> = (0..k*n).map(|i| (i as f32 * 0.02 - 0.3).cos()).collect();
@@ -1357,7 +1361,7 @@ mod tests {
     #[test]
     fn test_gemm_no_trans_b_m4_n16_k16_correctness() {
         use crate::compiler::InferenceCompiler;
-        use crate::compiler::mega_kernel_abi::{CompileConfig, BusinessConfig};
+        use crate::compiler::mega_kernel_abi::{CompileConfig, BusinessConfig, CompileTarget};
         use crate::types::DType;
 
         let m = 4usize; let n = 16usize; let k = 16usize;
@@ -1367,9 +1371,9 @@ mod tests {
         let c = g.add_tensor_concrete("C", &[m, n], DType::F32);
         g.inputs = vec![a, b]; g.outputs = vec![c];
         g.add_op(OpKind::Gemm { m: SymDim::Concrete(m), n, k, dtype: DType::F32, trans_b: false }, vec![a, b], vec![c], "gemm_m4_n16_k16");
-        let config = CompileConfig { max_seq_len: m, debug_jit: false, hetero: None };
+        let config = CompileConfig { max_seq_len: m, debug_jit: false, hetero: None, target: CompileTarget::Cpu };
         let mut compiler = InferenceCompiler::new();
-        let compiled = compiler.compile_mega_kernel_from_graph(g, &config, None).expect("GEMM compilation failed").layer_code;
+        let compiled = compiler.compile(g, &config, None).expect("GEMM compilation failed").expect_cpu().layer_code;
         let a_data: Vec<f32> = (0..m*k).map(|i| (i as f32 * 0.01 - 0.5).sin()).collect();
         let b_data: Vec<f32> = (0..k*n).map(|i| (i as f32 * 0.02 - 0.3).cos()).collect();
         let mut c_ref = vec![0.0f32; m * n];
@@ -1386,7 +1390,7 @@ mod tests {
     #[test]
     fn test_gemm_no_trans_b_m4_n16_k24_correctness() {
         use crate::compiler::InferenceCompiler;
-        use crate::compiler::mega_kernel_abi::{CompileConfig, BusinessConfig};
+        use crate::compiler::mega_kernel_abi::{CompileConfig, BusinessConfig, CompileTarget};
         use crate::types::DType;
 
         let m = 4usize; let n = 16usize; let k = 24usize;
@@ -1396,9 +1400,9 @@ mod tests {
         let c = g.add_tensor_concrete("C", &[m, n], DType::F32);
         g.inputs = vec![a, b]; g.outputs = vec![c];
         g.add_op(OpKind::Gemm { m: SymDim::Concrete(m), n, k, dtype: DType::F32, trans_b: false }, vec![a, b], vec![c], "gemm_m4_n16_k24");
-        let config = CompileConfig { max_seq_len: m, debug_jit: false, hetero: None };
+        let config = CompileConfig { max_seq_len: m, debug_jit: false, hetero: None, target: CompileTarget::Cpu };
         let mut compiler = InferenceCompiler::new();
-        let compiled = compiler.compile_mega_kernel_from_graph(g, &config, None).expect("GEMM compilation failed").layer_code;
+        let compiled = compiler.compile(g, &config, None).expect("GEMM compilation failed").expect_cpu().layer_code;
         let a_data: Vec<f32> = (0..m*k).map(|i| (i as f32 * 0.01 - 0.5).sin()).collect();
         let b_data: Vec<f32> = (0..k*n).map(|i| (i as f32 * 0.02 - 0.3).cos()).collect();
         let mut c_ref = vec![0.0f32; m * n];
@@ -1415,7 +1419,7 @@ mod tests {
     #[test]
     fn test_gemm_no_trans_b_m4_n16_k28_correctness() {
         use crate::compiler::InferenceCompiler;
-        use crate::compiler::mega_kernel_abi::{CompileConfig, BusinessConfig};
+        use crate::compiler::mega_kernel_abi::{CompileConfig, BusinessConfig, CompileTarget};
         use crate::types::DType;
 
         let m = 4usize; let n = 16usize; let k = 28usize;
@@ -1425,9 +1429,9 @@ mod tests {
         let c = g.add_tensor_concrete("C", &[m, n], DType::F32);
         g.inputs = vec![a, b]; g.outputs = vec![c];
         g.add_op(OpKind::Gemm { m: SymDim::Concrete(m), n, k, dtype: DType::F32, trans_b: false }, vec![a, b], vec![c], "gemm_m4_n16_k28");
-        let config = CompileConfig { max_seq_len: m, debug_jit: false, hetero: None };
+        let config = CompileConfig { max_seq_len: m, debug_jit: false, hetero: None, target: CompileTarget::Cpu };
         let mut compiler = InferenceCompiler::new();
-        let compiled = compiler.compile_mega_kernel_from_graph(g, &config, None).expect("GEMM compilation failed").layer_code;
+        let compiled = compiler.compile(g, &config, None).expect("GEMM compilation failed").expect_cpu().layer_code;
         let a_data: Vec<f32> = (0..m*k).map(|i| (i as f32 * 0.01 - 0.5).sin()).collect();
         let b_data: Vec<f32> = (0..k*n).map(|i| (i as f32 * 0.02 - 0.3).cos()).collect();
         let mut c_ref = vec![0.0f32; m * n];
@@ -1444,7 +1448,7 @@ mod tests {
     #[test]
     fn test_gemm_no_trans_b_m2_n8_k4_correctness() {
         use crate::compiler::InferenceCompiler;
-        use crate::compiler::mega_kernel_abi::{CompileConfig, BusinessConfig};
+        use crate::compiler::mega_kernel_abi::{CompileConfig, BusinessConfig, CompileTarget};
         use crate::types::DType;
 
         let m = 2usize;
@@ -1462,10 +1466,10 @@ mod tests {
             vec![a, b], vec![c], "gemm_tiny",
         );
 
-        let config = CompileConfig { max_seq_len: m, debug_jit: false, hetero: None };
+        let config = CompileConfig { max_seq_len: m, debug_jit: false, hetero: None, target: CompileTarget::Cpu };
         let mut compiler = InferenceCompiler::new();
-        let compiled = compiler.compile_mega_kernel_from_graph(g, &config, None)
-            .expect("tiny GEMM compilation failed").layer_code;
+        let compiled = compiler.compile(g, &config, None)
+            .expect("tiny GEMM compilation failed").expect_cpu().layer_code;
 
         // Simple deterministic data
         let a_data: Vec<f32> = vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0];
@@ -1509,7 +1513,7 @@ mod tests {
     #[test]
     fn test_gemm_no_trans_b_m4_n64_k128_correctness() {
         use crate::compiler::InferenceCompiler;
-        use crate::compiler::mega_kernel_abi::{CompileConfig, BusinessConfig};
+        use crate::compiler::mega_kernel_abi::{CompileConfig, BusinessConfig, CompileTarget};
         use crate::types::DType;
 
         let m = 4usize;
@@ -1531,10 +1535,12 @@ mod tests {
             max_seq_len: m,
             debug_jit: false,
             hetero: None,
+            target: CompileTarget::Cpu,
         };
         let mut compiler = InferenceCompiler::new();
-        let compiled = compiler.compile_mega_kernel_from_graph(g, &config, None)
+        let compiled = compiler.compile(g, &config, None)
             .expect("non-trans GEMM m=4 compilation failed")
+            .expect_cpu()
             .layer_code;
 
         let a_data: Vec<f32> = (0..m*k).map(|i| (i as f32 * 0.01 - 0.5).sin()).collect();
@@ -1586,7 +1592,7 @@ mod tests {
     #[test]
     fn test_gemm_no_trans_b_m8_n64_k128_correctness() {
         use crate::compiler::InferenceCompiler;
-        use crate::compiler::mega_kernel_abi::{CompileConfig, BusinessConfig};
+        use crate::compiler::mega_kernel_abi::{CompileConfig, BusinessConfig, CompileTarget};
         use crate::types::DType;
 
         let m = 8usize;
@@ -1608,10 +1614,12 @@ mod tests {
             max_seq_len: m,
             debug_jit: false,
             hetero: None,
+            target: CompileTarget::Cpu,
         };
         let mut compiler = InferenceCompiler::new();
-        let compiled = compiler.compile_mega_kernel_from_graph(g, &config, None)
+        let compiled = compiler.compile(g, &config, None)
             .expect("non-trans GEMM m=8 compilation failed")
+            .expect_cpu()
             .layer_code;
 
         // Prepare input data
@@ -1679,7 +1687,7 @@ mod tests {
     #[test]
     fn test_gemm_trans_b_small() {
         use crate::compiler::InferenceCompiler;
-        use crate::compiler::mega_kernel_abi::{CompileConfig, BusinessConfig};
+        use crate::compiler::mega_kernel_abi::{CompileConfig, BusinessConfig, CompileTarget};
 
         use crate::types::DType;
 
@@ -1702,10 +1710,12 @@ mod tests {
             max_seq_len: m,
             debug_jit: false,
             hetero: None,
+            target: CompileTarget::Cpu,
         };
         let mut compiler = InferenceCompiler::new();
-        let compiled = compiler.compile_mega_kernel_from_graph(g, &config, None)
+        let compiled = compiler.compile(g, &config, None)
             .expect("small trans_b GEMM compilation failed")
+            .expect_cpu()
             .layer_code;
 
         // Simple input data
@@ -1756,7 +1766,7 @@ mod tests {
     #[test]
     fn test_gemm_trans_b_medium_identity() {
         use crate::compiler::InferenceCompiler;
-        use crate::compiler::mega_kernel_abi::{CompileConfig, BusinessConfig};
+        use crate::compiler::mega_kernel_abi::{CompileConfig, BusinessConfig, CompileTarget};
 
         use crate::types::DType;
 
@@ -1779,10 +1789,12 @@ mod tests {
             max_seq_len: m,
             debug_jit: false,
             hetero: None,
+            target: CompileTarget::Cpu,
         };
         let mut compiler = InferenceCompiler::new();
-        let compiled = compiler.compile_mega_kernel_from_graph(g, &config, None)
+        let compiled = compiler.compile(g, &config, None)
             .expect("medium trans_b GEMM compilation failed")
+            .expect_cpu()
             .layer_code;
 
         // A = simple values
@@ -1837,7 +1849,7 @@ mod tests {
     #[test]
     fn test_gemm_no_trans_tiny() {
         use crate::compiler::InferenceCompiler;
-        use crate::compiler::mega_kernel_abi::{CompileConfig, BusinessConfig};
+        use crate::compiler::mega_kernel_abi::{CompileConfig, BusinessConfig, CompileTarget};
         use crate::types::DType;
 
         let m = 4usize;
@@ -1859,10 +1871,12 @@ mod tests {
             max_seq_len: m,
             debug_jit: false,
             hetero: None,
+            target: CompileTarget::Cpu,
         };
         let mut compiler = InferenceCompiler::new();
-        let compiled = compiler.compile_mega_kernel_from_graph(g, &config, None)
+        let compiled = compiler.compile(g, &config, None)
             .expect("tiny GEMM compilation failed")
+            .expect_cpu()
             .layer_code;
 
         let a_data: Vec<f32> = (0..m*k).map(|i| i as f32 * 0.5 - 1.0).collect();

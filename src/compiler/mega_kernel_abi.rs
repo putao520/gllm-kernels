@@ -257,6 +257,39 @@ pub struct CompileConfig {
     pub debug_jit: bool,
     /// Heterogeneous layer configuration.
     pub hetero: Option<HeteroLayerConfig>,
+    /// SPEC REQ-UMK-001: Compilation target — selects between CPU (native JIT
+    /// machine code) and GPU (PTX/HIP/MSL source) codegen paths inside
+    /// `InferenceCompiler::compile()`. Defaults to `Cpu` when constructed via
+    /// `Default::default()`.
+    pub target: CompileTarget,
+}
+
+impl Default for CompileConfig {
+    fn default() -> Self {
+        CompileConfig {
+            max_seq_len: 0,
+            debug_jit: false,
+            hetero: None,
+            target: CompileTarget::default(),
+        }
+    }
+}
+
+/// SPEC REQ-UMK-001: Target backend for the unified `compile()` entry point.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CompileTarget {
+    /// CPU native JIT — produces `CompileOutput::Cpu(MegaKernelCompileOutput)`.
+    Cpu,
+    /// GPU PTX/HIP/MSL — produces `CompileOutput::Gpu(GpuMegaKernelOutput)`.
+    /// `sm_version` selects the PTX target SM version (e.g. 600, 800, 1200).
+    /// Ignored for HIP backend (uses MI300 defaults internally).
+    Gpu { sm_version: u32 },
+}
+
+impl Default for CompileTarget {
+    fn default() -> Self {
+        CompileTarget::Cpu
+    }
 }
 
 /// Configuration for models with heterogeneous layer types.
@@ -1054,10 +1087,12 @@ mod tests {
             max_seq_len: 4096,
             debug_jit: false,
             hetero: None,
+            target: CompileTarget::Cpu,
         };
         assert_eq!(cfg.max_seq_len, 4096);
         assert!(!cfg.debug_jit);
         assert!(cfg.hetero.is_none());
+        assert_eq!(cfg.target, CompileTarget::Cpu);
     }
 }
 

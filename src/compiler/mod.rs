@@ -66,6 +66,7 @@ pub use mega_kernel_abi::{
     MegaKernelFn, KernelWeightLayout, BufferLayout,
     PerLayerWeightLayout,
     BusinessConfig, MtpKernelConfig, OutputMode, PoolMode, SgConfig, CotStepConfig,
+    CompileConfig, CompileTarget,
     MEGA_KERNEL_PARAMS, MEGA_KERNEL_STACK_OFFSETS,
 };
 
@@ -127,6 +128,48 @@ pub struct GpuForwardOutput {
     pub total_scratchpad_bytes: usize,
 }
 
+/// SPEC REQ-UMK-001: Unified compilation output.
+///
+/// `InferenceCompiler::compile()` returns this enum, with the variant selected
+/// by `CompileConfig::target`. CPU target produces `Cpu` (mega-kernel native
+/// code + layouts); GPU target produces `Gpu` (PTX/HIP/MSL source).
+pub enum CompileOutput {
+    /// CPU mega-kernel compilation result (JIT-compiled native code + layouts).
+    Cpu(MegaKernelCompileOutput),
+    /// GPU mega-kernel compilation result (PTX/HIP/MSL source).
+    Gpu(GpuMegaKernelOutput),
+}
+
+impl CompileOutput {
+    /// Unwrap the CPU variant. Panics with a descriptive message if this is
+    /// a GPU output.
+    pub fn expect_cpu(self) -> MegaKernelCompileOutput {
+        match self {
+            CompileOutput::Cpu(out) => out,
+            CompileOutput::Gpu(_) => panic!("expected CompileOutput::Cpu, got Gpu"),
+        }
+    }
+
+    /// Unwrap the GPU variant. Panics with a descriptive message if this is
+    /// a CPU output.
+    pub fn expect_gpu(self) -> GpuMegaKernelOutput {
+        match self {
+            CompileOutput::Gpu(out) => out,
+            CompileOutput::Cpu(_) => panic!("expected CompileOutput::Gpu, got Cpu"),
+        }
+    }
+
+    /// Returns true if this is the CPU variant.
+    pub fn is_cpu(&self) -> bool {
+        matches!(self, CompileOutput::Cpu(_))
+    }
+
+    /// Returns true if this is the GPU variant.
+    pub fn is_gpu(&self) -> bool {
+        matches!(self, CompileOutput::Gpu(_))
+    }
+}
+
 pub use graph::{CompilerGraph, Op, OpKind, RopeScaling, TensorId, WeightLayout, SymDim, ShapeBinding};
 pub use ir::MoeConfig;
 pub use rope_scaling::{compute_attention_scaling, compute_inv_freq, fill_cos_sin_table, fill_cos_sin_table_partial};
@@ -143,10 +186,10 @@ pub use crate::types::CompilerError;
 
 // ── Internal re-exports (pub within crate, not part of public API) ────
 pub(crate) use ir::LayerIR;
-pub(crate) use cache::{CompilationCache, CacheSource, IncrementalCompileResult};
+pub(crate) use cache::CompilationCache;
 
 use crate::dispatch::{DeviceProfile, device_profile};
-use crate::types::{InferenceError, ModelConfig};
+use crate::types::InferenceError;
 
 /// Global lock serializing JIT compilation and execution.
 ///
@@ -163,7 +206,10 @@ static COMPILE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 pub struct CompileGuard<'a>(std::sync::MutexGuard<'a, ()>);
 
 /// Acquire the global JIT compile+execute lock.
-pub fn compile_lock() -> CompileGuard<'static> {
+///
+/// SPEC REQ-UMK-001: This is now `pub(crate)` — the unified `compile()` entry
+/// point acquires it internally. External callers must not call this directly.
+pub(crate) fn compile_lock() -> CompileGuard<'static> {
     CompileGuard(COMPILE_LOCK.lock().unwrap())
 }
 
@@ -191,115 +237,6 @@ impl InferenceCompiler {
             profile,
             cache: CompilationCache::new(),
         }
-    }
-
-    /// Compile all layers for a model. Returns one `CompiledLayer` per layer.
-    ///
-    /// Layers with identical shapes share the same compiled code (common case:
-    /// all layers are identical except for weight pointers).
-    pub fn compile_model(
-        &mut self,
-        config: &ModelConfig,
-        max_batch: usize,
-    ) -> Result<Vec<CompiledLayer>, InferenceError> {
-        let ir = LayerIR::from_model_config(config, max_batch);
-        let hash = self.compute_hash(&ir);
-
-        // Check cache — first hit is reused directly, remaining layers
-        // are fetched individually (each `get` constructs a fresh
-        // `CompiledLayer` from the cached bytes).
-        if let Some(first) = self.cache.get(hash) {
-            let mut layers = Vec::with_capacity(config.num_layers);
-            layers.push(first);
-            for _ in 1..config.num_layers {
-                let layer = self.cache.get(hash).ok_or_else(|| {
-                    InferenceError::CompileError("cache inconsistency".into())
-                })?;
-                layers.push(layer);
-            }
-            return Ok(layers);
-        }
-
-        // Full JIT pipeline: LayerIR → Graph → Fuse → Emit → Code
-        let output = self.jit_compile(&ir)?;
-
-        // Cache the compiled code
-        self.cache.put(hash, &output.code, output.scratchpad_bytes);
-
-        // Create CompiledLayer instances for each layer
-        let mut layers = Vec::with_capacity(config.num_layers);
-        for _ in 0..config.num_layers {
-            let layer = CompiledLayer::from_code(&output.code, output.scratchpad_bytes, hash)?;
-            layers.push(layer);
-        }
-
-        Ok(layers)
-    }
-
-    /// Compile a single layer (for testing or incremental compilation).
-    pub fn compile_layer(
-        &mut self,
-        ir: &LayerIR,
-    ) -> Result<CompiledLayer, InferenceError> {
-        let hash = self.compute_hash(ir);
-
-        if let Some(cached) = self.cache.get(hash) {
-            return Ok(cached);
-        }
-
-        let output = self.jit_compile(ir)?;
-
-        self.cache.put(hash, &output.code, output.scratchpad_bytes);
-
-        CompiledLayer::from_code(&output.code, output.scratchpad_bytes, hash)
-    }
-
-    /// Compile a model incrementally — only recompile layers whose hash
-    /// is not already in the cache (memory or disk). Returns per-layer
-    /// compiled code plus hit/miss statistics for logging.
-    pub fn compile_model_incremental(
-        &mut self,
-        config: &ModelConfig,
-        max_batch: usize,
-    ) -> Result<IncrementalCompileResult, InferenceError> {
-        let ir = LayerIR::from_model_config(config, max_batch);
-        let hash = self.compute_hash(&ir);
-
-        let mut memory_hits: usize = 0;
-        let mut disk_hits: usize = 0;
-        let mut compiled: usize = 0;
-
-        // All layers share the same IR shape, so one lookup decides.
-        match self.cache.lookup(hash) {
-            Some((_, CacheSource::Memory)) => {
-                memory_hits = config.num_layers;
-            }
-            Some((_, CacheSource::Disk)) => {
-                // First hit loaded from disk (now promoted to memory).
-                disk_hits = 1;
-                memory_hits = config.num_layers.saturating_sub(1);
-            }
-            None => {
-                let output = self.jit_compile(&ir)?;
-                self.cache.put(hash, &output.code, output.scratchpad_bytes);
-                compiled = config.num_layers;
-            }
-        }
-
-        let mut layers = Vec::with_capacity(config.num_layers);
-        for _ in 0..config.num_layers {
-            let layer = self.cache.get(hash).ok_or_else(|| {
-                InferenceError::CompileError("cache inconsistency after compilation".into())
-            })?;
-            layers.push(layer);
-        }
-
-        Ok(IncrementalCompileResult {
-            layers,
-            memory_hits,
-            disk_hits,
-            compiled,
-        })
     }
 
     /// Clear the compilation cache (memory + disk).
@@ -425,14 +362,60 @@ impl InferenceCompiler {
         }
     }
 
-    /// Compile a mega-kernel from a pre-built CompilerGraph (REQ-UGS-001).
+    /// SPEC REQ-UMK-001: Unified compilation entry point.
     ///
-    /// This is the YAML-template-driven path: the caller builds a `CompilerGraph`
-    /// via `ArchTemplate::to_compiler_graph()` and passes it here directly.
+    /// This is the **sole** public compilation method on `InferenceCompiler`.
+    /// Replaces the former 6-entry-point API (`compile_mega_kernel_from_graph`,
+    /// `compile_mega_kernel_to_gpu`, `compile_model`, `compile_layer`,
+    /// `compile_model_incremental`, `compile_lock`).
+    ///
+    /// Behavior is fully driven by `CompileConfig`:
+    /// - `target: CompileTarget::Cpu` (default) → JIT-compile native code,
+    ///   returns `CompileOutput::Cpu(MegaKernelCompileOutput)`.
+    /// - `target: CompileTarget::Gpu { sm_version }` → emit PTX/HIP/MSL source,
+    ///   returns `CompileOutput::Gpu(GpuMegaKernelOutput)`. Requires
+    ///   `jit-cuda` or `jit-hip` feature flag.
+    ///
     /// All model geometry (hidden, num_heads, vocab_size, etc.) is derived from
     /// the graph's OpKind variants and tensor shapes. Only non-derivable fields
-    /// are passed via `CompileConfig`.
-    pub fn compile_mega_kernel_from_graph(
+    /// are passed via `CompileConfig`. The internal `compile_lock()` is acquired
+    /// automatically; callers do not need to (and cannot) take it.
+    pub fn compile(
+        &mut self,
+        graph: CompilerGraph,
+        config: &mega_kernel_abi::CompileConfig,
+        hetero_layout: Option<mega_kernel_abi::HeteroKernelWeightLayout>,
+    ) -> Result<CompileOutput, InferenceError> {
+        // SPEC REQ-UMK-001: compile_lock is now pub(crate) and acquired inside
+        // compile() — callers no longer need to (and cannot) take it manually.
+        let _guard = compile_lock();
+
+        match config.target {
+            mega_kernel_abi::CompileTarget::Cpu => {
+                self.compile_cpu(graph, config, hetero_layout)
+                    .map(CompileOutput::Cpu)
+            }
+            mega_kernel_abi::CompileTarget::Gpu { sm_version } => {
+                #[cfg(any(feature = "jit-cuda", feature = "jit-hip"))]
+                {
+                    self.compile_gpu(graph, config, sm_version)
+                        .map(CompileOutput::Gpu)
+                }
+                #[cfg(not(any(feature = "jit-cuda", feature = "jit-hip")))]
+                {
+                    let _ = (graph, sm_version);
+                    Err(InferenceError::CompileError(
+                        "GPU compilation requested (CompileTarget::Gpu) but neither jit-cuda nor jit-hip feature is enabled".into(),
+                    ))
+                }
+            }
+        }
+    }
+
+    /// CPU codegen path — emits native JIT machine code (x86_64/aarch64).
+    ///
+    /// Internal helper called by `compile()` when `config.target == Cpu`.
+    fn compile_cpu(
         &mut self,
         graph: CompilerGraph,
         config: &mega_kernel_abi::CompileConfig,
@@ -441,7 +424,7 @@ impl InferenceCompiler {
         let t0 = std::time::Instant::now();
         static COMPILE_COUNTER: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
         let compile_id = COMPILE_COUNTER.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-        eprintln!("[COMPILE-MEGA] compile_mega_kernel_from_graph #{}, ops={}",
+        eprintln!("[COMPILE-MEGA] compile(cpu) #{}, ops={}",
             compile_id, graph.ops.len());
 
         // REQ-DTYPE-CHAIN-005: Dtype chain validation gate.
@@ -713,12 +696,12 @@ impl InferenceCompiler {
         }
     }
 
-    /// Compile mega-kernel to GPU PTX/HIP/MSL code.
+    /// GPU codegen path — emits PTX/HIP/MSL source.
     ///
+    /// Internal helper called by `compile()` when `config.target == Gpu`.
     /// Same Scalar + SymExec → Fusion pipeline as CPU, but uses GpuLower for ISA Lowering.
-    /// Returns the GPU kernel source code string.
     #[cfg(any(feature = "jit-cuda", feature = "jit-hip"))]
-    pub fn compile_mega_kernel_to_gpu(
+    fn compile_gpu(
         &mut self,
         graph: CompilerGraph,
         config: &mega_kernel_abi::CompileConfig,
@@ -890,34 +873,6 @@ mod tests {
         assert_eq!(compiler.cache_size(), 0);
     }
 
-    #[test]
-    fn test_compile_layer() {
-        let config = ModelConfig::llama_7b();
-        let ir = LayerIR::from_model_config(&config, 1);
-        let mut compiler = InferenceCompiler::new();
-
-        let layer = compiler.compile_layer(&ir).unwrap();
-        assert!(layer.code_size() > 0);
-        assert!(layer.scratchpad_bytes > 0);
-        assert_eq!(compiler.cache_size(), 1);
-
-        // Second compile should hit cache
-        let layer2 = compiler.compile_layer(&ir).unwrap();
-        assert_eq!(layer.config_hash, layer2.config_hash);
-    }
-
-    #[test]
-    fn test_compile_model() {
-        let mut config = ModelConfig::llama_7b();
-        config.num_layers = 2;
-        let mut compiler = InferenceCompiler::new();
-
-        let layers = compiler.compile_model(&config, 1).unwrap();
-        assert_eq!(layers.len(), 2);
-        assert_eq!(layers[0].config_hash, layers[1].config_hash);
-        assert!(layers[0].scratchpad_bytes > 0);
-    }
-
     /// End-to-end: full JIT pipeline for LLaMA-7B decoder layer.
     #[test]
     fn test_e2e_llama_7b() {
@@ -980,14 +935,22 @@ mod tests {
 
         #[cfg(feature = "jit-x86")]
         {
+            let mk_config = mega_kernel_abi::CompileConfig {
+                max_seq_len: 512,
+                debug_jit: false,
+                hetero: None,
+                target: mega_kernel_abi::CompileTarget::Cpu,
+            };
             let mut compiler = InferenceCompiler::with_profile(profile);
-            let layer = compiler.compile_layer(&ir).unwrap();
-            assert!(layer.code_size() > 0);
+            let output = compiler.compile(graph.clone(), &mk_config, None)
+                .expect("compile (Cpu) failed")
+                .expect_cpu();
+            assert!(output.layer_code.code_size() > 0);
             eprintln!(
                 "E2E Gemma-2B: {} ops → {} groups → {} bytes code",
                 graph.num_ops(),
                 fplan.num_groups(),
-                layer.code_size(),
+                output.layer_code.code_size(),
             );
         }
         #[cfg(not(feature = "jit-x86"))]
@@ -998,28 +961,6 @@ mod tests {
                 fplan.num_groups(),
             );
         }
-    }
-
-    #[test]
-    fn test_compile_model_incremental_cold() {
-        let mut config = ModelConfig::llama_7b();
-        config.num_layers = 3;
-        let profile = DeviceProfile::detect();
-        let mut compiler = InferenceCompiler::with_profile(profile);
-
-        // First call: everything is a fresh compile
-        let result = compiler.compile_model_incremental(&config, 1).unwrap();
-        assert_eq!(result.layers.len(), 3);
-        assert_eq!(result.compiled, 3);
-        assert_eq!(result.memory_hits, 0);
-        assert_eq!(result.disk_hits, 0);
-
-        // Second call: all from memory
-        let result2 = compiler.compile_model_incremental(&config, 1).unwrap();
-        assert_eq!(result2.layers.len(), 3);
-        assert_eq!(result2.compiled, 0);
-        assert_eq!(result2.memory_hits, 3);
-        assert_eq!(result2.disk_hits, 0);
     }
 
     #[test]
@@ -1067,10 +1008,13 @@ mod tests {
             max_seq_len: 512,
             debug_jit: false,
             hetero: None,
+            target: mega_kernel_abi::CompileTarget::Cpu,
         };
         let mut compiler = InferenceCompiler::with_profile(profile);
-        let output = compiler.compile_mega_kernel_from_graph(graph, &mk_config, None).unwrap();
-        assert_ne!(output.layer_code.config_hash, 0, "compile_mega_kernel_from_graph should produce a non-zero hash");
+        let output = compiler.compile(graph, &mk_config, None)
+            .expect("compile (Cpu) failed")
+            .expect_cpu();
+        assert_ne!(output.layer_code.config_hash, 0, "compile should produce a non-zero hash");
     }
 
     // ── 13 new tests (+9 existing = 22 total) ──────────────────────────
@@ -1081,12 +1025,22 @@ mod tests {
     /// the full JIT pipeline.
     #[test]
     fn test_mega_kernel_compile_output_struct_constructor() {
-        // Arrange: build a minimal CompiledLayer via compile_layer
+        // Arrange: build a minimal CompiledLayer via compile (Cpu target).
         let config = ModelConfig::llama_7b();
         let ir = LayerIR::from_model_config(&config, 1);
         let profile = DeviceProfile::detect();
+        let graph = CompilerGraph::from_layer_ir(&ir, &profile).expect("from_layer_ir failed");
+        let mk_config = mega_kernel_abi::CompileConfig {
+            max_seq_len: 512,
+            debug_jit: false,
+            hetero: None,
+            target: mega_kernel_abi::CompileTarget::Cpu,
+        };
         let mut compiler = InferenceCompiler::with_profile(profile);
-        let layer = compiler.compile_layer(&ir).expect("compile_layer failed");
+        let compiled = compiler.compile(graph, &mk_config, None)
+            .expect("compile (Cpu) failed")
+            .expect_cpu();
+        let layer = compiled.layer_code;
 
         // Act: construct MegaKernelCompileOutput manually with explicit layouts
         let zero_per_layer = mega_kernel_abi::PerLayerWeightLayout {
@@ -1385,31 +1339,6 @@ mod tests {
         assert!(format!("{:?}", disk).contains("Disk"));
     }
 
-    /// Verify cache clear operations: clear_cache empties the in-memory
-    /// cache and cache_size reports 0 afterward.
-    #[test]
-    fn test_compiler_cache_clear_empties_entries() {
-        let config = ModelConfig::llama_7b();
-        let profile = DeviceProfile::detect();
-        let mut compiler = InferenceCompiler::with_profile(profile);
-
-        // Arrange: compile one layer to populate cache
-        let ir = LayerIR::from_model_config(&config, 1);
-        let _ = compiler.compile_layer(&ir).unwrap();
-        assert_eq!(compiler.cache_size(), 1, "cache should have 1 entry after compile");
-
-        // Act: clear cache
-        compiler.clear_cache();
-
-        // Assert: cache is empty
-        assert_eq!(compiler.cache_size(), 0, "cache should be empty after clear");
-
-        // Assert: recompile succeeds (fresh compile, not cached)
-        let layer = compiler.compile_layer(&ir).unwrap();
-        assert!(layer.code_size() > 0);
-        assert_eq!(compiler.cache_size(), 1, "cache should have 1 entry after recompile");
-    }
-
     /// Verify usize overflow safety in GemmPlan field arithmetic:
     /// mr * nr * nr_vecs should not overflow for realistic values.
     #[test]
@@ -1529,8 +1458,18 @@ mod tests {
         let config = ModelConfig::llama_7b();
         let ir = LayerIR::from_model_config(&config, 1);
         let profile = DeviceProfile::detect();
+        let graph = CompilerGraph::from_layer_ir(&ir, &profile).expect("from_layer_ir failed");
+        let mk_config = mega_kernel_abi::CompileConfig {
+            max_seq_len: 512,
+            debug_jit: false,
+            hetero: None,
+            target: mega_kernel_abi::CompileTarget::Cpu,
+        };
         let mut compiler = InferenceCompiler::with_profile(profile);
-        let layer = compiler.compile_layer(&ir).expect("compile_layer failed");
+        let compiled = compiler.compile(graph, &mk_config, None)
+            .expect("compile (Cpu) failed")
+            .expect_cpu();
+        let layer = compiled.layer_code;
 
         let output = MegaKernelCompileOutput {
             layer_code: layer,
@@ -2146,40 +2085,6 @@ mod tests {
         assert!(debug.contains("4096"));
     }
 
-    /// Verify IncrementalCompileResult construction and field access
-    /// (without requiring actual compilation).
-    #[test]
-    fn test_incremental_compile_result_field_access() {
-        // Arrange: compile a small model to get real CompiledLayer instances
-        let mut config = ModelConfig::llama_7b();
-        config.num_layers = 2;
-        let profile = DeviceProfile::detect();
-        let mut compiler = InferenceCompiler::with_profile(profile);
-        let layers = compiler.compile_model(&config, 1).unwrap();
-
-        // Act: construct IncrementalCompileResult manually
-        let result = cache::IncrementalCompileResult {
-            layers,
-            memory_hits: 2,
-            disk_hits: 0,
-            compiled: 0,
-        };
-
-        // Assert: field values preserved
-        assert_eq!(result.layers.len(), 2);
-        assert_eq!(result.memory_hits, 2);
-        assert_eq!(result.disk_hits, 0);
-        assert_eq!(result.compiled, 0);
-
-        // Assert: all layers have valid code
-        for layer in &result.layers {
-            assert!(layer.code_size() > 0);
-        }
-
-        // Assert: consistency — total layers == hits + compiled
-        assert_eq!(result.layers.len(), result.memory_hits + result.disk_hits + result.compiled);
-    }
-
     // ── 10 additional tests (wave-12x88) ──────────────────────────────────
 
     /// Verify CompilerGraph produces a substantial tensor count for LLaMA-7B.
@@ -2224,24 +2129,6 @@ mod tests {
             "head_dim must equal hidden / num_heads",
         );
         assert_eq!(ir.head_dim, 128, "LLaMA-7B head_dim should be 128");
-    }
-
-    /// Verify all layers in a multi-layer compile have identical code size.
-    #[test]
-    fn test_compile_model_all_layers_same_code_size() {
-        let mut config = ModelConfig::llama_7b();
-        config.num_layers = 3;
-        let mut compiler = InferenceCompiler::new();
-
-        let layers = compiler.compile_model(&config, 1).unwrap();
-        let size0 = layers[0].code_size();
-        assert!(size0 > 0, "code size must be positive");
-        for (i, layer) in layers.iter().enumerate() {
-            assert_eq!(
-                layer.code_size(), size0,
-                "layer {} should have same code size as layer 0", i,
-            );
-        }
     }
 
     /// Verify fusion plan produces fewer groups than raw ops.
@@ -2665,37 +2552,19 @@ mod tests {
         // Assert: cache starts empty
         assert_eq!(compiler.cache_size(), 0);
 
-        // Assert: can compile with this profile
+        // Assert: can compile with this profile (REQ-UMK-001: unified compile() entry point)
         let config = ModelConfig::llama_7b();
         let ir = LayerIR::from_model_config(&config, 1);
+        let graph = CompilerGraph::from_layer_ir(&ir, &profile).expect("from_layer_ir failed");
+        let mk_config = mega_kernel_abi::CompileConfig {
+            max_seq_len: 512,
+            debug_jit: false,
+            hetero: None,
+            target: mega_kernel_abi::CompileTarget::Cpu,
+        };
         let mut compiler_mut = InferenceCompiler::with_profile(profile);
-        let layer = compiler_mut.compile_layer(&ir);
-        assert!(layer.is_ok(), "compile_layer should succeed with provided profile");
-    }
-
-    /// Verify compile_model_incremental returns correct stats after cache clear.
-    #[test]
-    fn test_compile_incremental_after_clear_is_cold() {
-        // Arrange
-        let mut config = ModelConfig::llama_7b();
-        config.num_layers = 2;
-        let profile = DeviceProfile::detect();
-        let mut compiler = InferenceCompiler::with_profile(profile);
-
-        // Act: first compile (cold)
-        let result1 = compiler.compile_model_incremental(&config, 1).unwrap();
-        assert_eq!(result1.compiled, 2, "first compile should compile all layers");
-
-        // Act: clear cache
-        compiler.clear_cache();
-
-        // Act: second compile (should be cold again)
-        let result2 = compiler.compile_model_incremental(&config, 1).unwrap();
-
-        // Assert: after clear, it's a fresh compile
-        assert_eq!(result2.compiled, 2, "after clear, should recompile all layers");
-        assert_eq!(result2.memory_hits, 0, "after clear, no memory hits");
-        assert_eq!(result2.disk_hits, 0, "after clear, no disk hits");
+        let result = compiler_mut.compile(graph, &mk_config, None);
+        assert!(result.is_ok(), "compile should succeed with provided profile");
     }
 
     /// Verify CompilerGraph with single Gemm op has correct topology.
