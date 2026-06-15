@@ -10,6 +10,8 @@
 //! - `graph_fragments/graph_impl.inc.rs` — impl CompilerGraph + Default + Display
 //! - `graph_fragments/tests.inc.rs`    — test module
 
+use std::hash::Hash;
+
 include!("graph_fragments/types.inc.rs");
 include!("graph_fragments/op_kind.inc.rs");
 include!("graph_fragments/op_v2.inc.rs");

@@ -848,77 +848,12 @@ impl InferenceCompiler {
 
         for &op_id in &topo {
             if let Some(op) = graph.op(op_id) {
-                // Op kind discriminant + parameters
-                std::mem::discriminant(&op.kind).hash(&mut hasher);
-                match &op.kind {
-                    OpKind::RmsNorm { eps, .. } | OpKind::LayerNorm { eps, .. } => {
-                        eps.to_bits().hash(&mut hasher);
-                    }
-                    OpKind::Gemm { m, n, k, .. } | OpKind::GemmBias { m, n, k, .. } => {
-                        m.hash(&mut hasher);
-                        n.hash(&mut hasher);
-                        k.hash(&mut hasher);
-                    }
-                    OpKind::QuantGemm { m, n, k, quant_type } => {
-                        m.hash(&mut hasher);
-                        n.hash(&mut hasher);
-                        k.hash(&mut hasher);
-                        std::mem::discriminant(quant_type).hash(&mut hasher);
-                    }
-                    OpKind::Dequantize { num_elements, block_size, bits } => {
-                        num_elements.hash(&mut hasher);
-                        block_size.hash(&mut hasher);
-                        bits.hash(&mut hasher);
-                    }
-                    OpKind::RoPE { num_heads, head_dim, theta, partial, rope_scaling } => {
-                        num_heads.hash(&mut hasher);
-                        head_dim.hash(&mut hasher);
-                        theta.to_bits().hash(&mut hasher);
-                        partial.to_bits().hash(&mut hasher);
-                        // Encode the scaling family + parameters as a stable byte fingerprint.
-                        // None hashes as a tag-only sentinel; Yarn / Linear hash their full params.
-                        match rope_scaling {
-                            None => 0u8.hash(&mut hasher),
-                            Some(s) => {
-                                1u8.hash(&mut hasher);
-                                s.fingerprint_bytes().hash(&mut hasher);
-                            }
-                        }
-                    }
-                    OpKind::Transpose { perm } => {
-                        perm.hash(&mut hasher);
-                    }
-                    OpKind::Reshape { target_shape } => {
-                        target_shape.hash(&mut hasher);
-                    }
-                    OpKind::MeanPool { seq_len, hidden, cls_mode: _ } => {
-                        seq_len.hash(&mut hasher);
-                        hidden.hash(&mut hasher);
-                    }
-                    // Clipped SwiGLU (gpt-oss-20b style) — the limit is an
-                    // op-parameterised constant that gets baked into trace
-                    // body at codegen time, so different limits must produce
-                    // different cache keys.
-                    OpKind::SwiGluClipped { limit } => {
-                        limit.to_bits().hash(&mut hasher);
-                    }
-                    // Packed-expert MoE (gpt-oss-20b): all integer params + f32 limit
-                    // + SymDim seq_len drive distinct compilation artifacts.
-                    OpKind::MoEDispatchPacked {
-                        num_experts, top_k, mxfp4_block_size, swiglu_limit,
-                        intermediate_size, hidden, seq_len,
-                    } => {
-                        num_experts.hash(&mut hasher);
-                        top_k.hash(&mut hasher);
-                        mxfp4_block_size.hash(&mut hasher);
-                        swiglu_limit.to_bits().hash(&mut hasher);
-                        intermediate_size.hash(&mut hasher);
-                        hidden.hash(&mut hasher);
-                        seq_len.hash(&mut hasher);
-                    }
-                    // Silu, Gelu, SwiGlu, GeGlu, Softmax, Add, Mul, Residual
-                    // — discriminant alone is sufficient
-                    _ => {}
+                // Op v2 内容指纹（胖 opcode 自描述，替代 OpKind discriminant + 参数 hash）
+                if let Some(op_v2) = op.op_v2_resolved(graph) {
+                    op_v2.content_hash(&mut hasher);
+                } else {
+                    // Fallback: 测试 fixture 或未缓存路径，用 OpKind discriminant
+                    std::mem::discriminant(&op.kind).hash(&mut hasher);
                 }
                 // Edge connections
                 for &tid in &op.inputs {

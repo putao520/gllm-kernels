@@ -418,6 +418,97 @@ impl Op {
         }
     }
 
+    /// 计算用于 JIT cache hash 的内容指纹（胖 opcode 自描述）。
+    /// 替代 mod.rs::graph_content_hash 中
+    /// `std::mem::discriminant(&op.kind).hash() + match OpKind { 参数 hash }`。
+    ///
+    /// 包含：Op discriminant + 关键参数（eps/维度/dtype/trans_b/limit 等）。
+    /// 不同参数组合产生不同 hash，确保 JIT cache 正确失效。
+    pub fn content_hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        std::mem::discriminant(self).hash(state);
+        match self {
+            Op::RmsNorm(spec) | Op::LayerNorm(spec) | Op::ValueNorm(spec) => {
+                spec.eps.to_bits().hash(state);
+                spec.feature_dim.hash(state);
+            }
+            Op::HeadRmsNorm { head_dim, eps, .. } => {
+                head_dim.hash(state);
+                eps.to_bits().hash(state);
+            }
+            Op::QkNorm { head_dim, eps } => {
+                head_dim.hash(state);
+                eps.to_bits().hash(state);
+            }
+            Op::L2Normalize { hidden } => { hidden.hash(state); }
+            Op::Gemm(spec) | Op::GemmBias(spec) => {
+                spec.m.hash(state);
+                spec.n.hash(state);
+                spec.k.hash(state);
+                std::mem::discriminant(&spec.dtype).hash(state);
+                spec.trans_b.hash(state);
+            }
+            Op::QuantGemm(spec) => {
+                spec.m.hash(state);
+                spec.n.hash(state);
+                spec.k.hash(state);
+                std::mem::discriminant(&spec.quant_type).hash(state);
+            }
+            Op::Dequantize { num_elements, block_size, bits } => {
+                num_elements.hash(state);
+                block_size.hash(state);
+                bits.hash(state);
+            }
+            Op::RoPE(spec) => {
+                spec.num_heads.hash(state);
+                spec.head_dim.hash(state);
+                spec.theta.to_bits().hash(state);
+                spec.partial.to_bits().hash(state);
+                match &spec.rope_scaling {
+                    None => 0u8.hash(state),
+                    Some(s) => {
+                        1u8.hash(state);
+                        s.fingerprint_bytes().hash(state);
+                    }
+                }
+            }
+            Op::DualRoPE(spec) => {
+                spec.num_heads.hash(state);
+                spec.head_dim.hash(state);
+                spec.sliding_theta.to_bits().hash(state);
+                spec.sliding_partial.to_bits().hash(state);
+                match &spec.rope_scaling {
+                    None => 0u8.hash(state),
+                    Some(s) => {
+                        1u8.hash(state);
+                        s.fingerprint_bytes().hash(state);
+                    }
+                }
+            }
+            Op::Transpose { perm } => { perm.hash(state); }
+            Op::Reshape { target_shape } => { target_shape.hash(state); }
+            Op::SliceView { axis, start, end } => {
+                axis.hash(state); start.hash(state); end.hash(state);
+            }
+            Op::MeanPool { seq_len, hidden, .. } => {
+                seq_len.hash(state);
+                hidden.hash(state);
+            }
+            Op::SwiGluClipped { limit } => { limit.to_bits().hash(state); }
+            Op::MoEDispatchPacked { num_experts, top_k, mxfp4_block_size, swiglu_limit,
+                                    intermediate_size, hidden, seq_len } => {
+                num_experts.hash(state);
+                top_k.hash(state);
+                mxfp4_block_size.hash(state);
+                swiglu_limit.to_bits().hash(state);
+                intermediate_size.hash(state);
+                hidden.hash(state);
+                seq_len.hash(state);
+            }
+            // 其他 op discriminant 已经足够（unit 或参数不影响 JIT cache）
+            _ => {}
+        }
+    }
+
 
     /// 仅 Gemm/GemmBias/FusedRmsNormGemm/MaskedGemm 携带 dtype；
     /// QuantGemm 返回 None（调用方通过 graph.infer_computation_dtype 推导）。
