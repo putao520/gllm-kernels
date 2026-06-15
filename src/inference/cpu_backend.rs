@@ -232,6 +232,8 @@ impl InferenceBackend for CpuInferenceBackend {
             // Multi-head attention with causal mask
             let cached_len = kv_cache.seq_len(layer_idx, 0);
             let seq_pages = kv_cache.seq_pages(layer_idx, 0);
+            let kv_dtype = kv_cache.dtype();
+            let elem_bytes = kv_dtype.size_bytes();
 
             for ah in 0..num_heads {
                 let kv_h = ah / heads_per_kv;
@@ -242,11 +244,28 @@ impl InferenceBackend for CpuInferenceBackend {
                 for t in 0..cached_len {
                     let pid = seq_pages[t / PAGE_SIZE];
                     let off = t % PAGE_SIZE;
-                    let kp = kv_cache.page_ptr(pid) as *const f32;
+                    let kp = kv_cache.page_ptr(pid);
                     let k_base = kv_h * PAGE_SIZE * head_dim + off * head_dim;
                     let mut dot = 0.0f32;
                     for d in 0..head_dim {
-                        dot += q[q_off + d] * unsafe { *kp.add(k_base + d) };
+                        let byte_off = (k_base + d) * elem_bytes;
+                        let k_val = unsafe {
+                            match kv_dtype {
+                                DType::F32 => *(kp.add(byte_off) as *const f32),
+                                DType::BF16 => {
+                                    (*(kp.add(byte_off) as *const half::bf16)).to_f32()
+                                }
+                                DType::F16 => {
+                                    (*(kp.add(byte_off) as *const half::f16)).to_f32()
+                                }
+                                other => {
+                                    return Err(InferenceError::Unsupported(format!(
+                                        "dtype {other:?} for KV cache K read"
+                                    )));
+                                }
+                            }
+                        };
+                        dot += q[q_off + d] * k_val;
                     }
                     scores[t] = dot * scale;
                 }
