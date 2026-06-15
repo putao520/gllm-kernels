@@ -12,7 +12,7 @@
 //! - decoder 裁剪为 EncodeToLayer: 裁掉 lm_head 及后续
 //! - 编译器看裁剪后的图 ops 推导一切，完全不读 output_modes
 
-use crate::compiler::graph::{CompilerGraph, OpKind, TensorId};
+use crate::compiler::graph::{CompilerGraph, Op, TensorId};
 use crate::compiler::mega_kernel_abi::MtpKernelConfig;
 
 /// seq_len 的来源 — 从图 ops 推导
@@ -165,35 +165,35 @@ impl GraphTopologyAnalysis {
         let mut sg_inject_hidden_dim: Option<usize> = None;
 
         for op in &graph.ops {
-            match &op.kind {
-                OpKind::Argmax { vocab_size: vs } => {
+            match op.op_v2_resolved(graph) {
+                Some(Op::Argmax { vocab_size: vs }) => {
                     has_argmax = true;
-                    vocab_size = Some(*vs);
+                    vocab_size = Some(vs);
                     argmax_input_tid = op.inputs.first().copied();
                 }
-                OpKind::StoreToken => has_store_token = true,
-                OpKind::CheckStopCondition => has_check_stop = true,
+                Some(Op::StoreToken) => has_store_token = true,
+                Some(Op::CheckStopCondition) => has_check_stop = true,
                 // kv_cache_source 由 op.kv_source 驱动（op-level 自描述）。
                 // 只有 FromCache 的 attention 才需要加载 kv_cache_ptr。
-                OpKind::MultiHeadAttention { kv_source: crate::compiler::graph::KvSource::FromCache, .. } => has_mha_from_cache = true,
-                OpKind::CachedGQA { kv_source: crate::compiler::graph::KvSource::FromCache, .. } => has_cached_gqa_from_cache = true,
-                OpKind::MlaAttention { kv_source: crate::compiler::graph::KvSource::FromCache, .. } => has_mla_from_cache = true,
-                OpKind::SgDetect { hidden_dim, .. } => {
+                Some(Op::MultiHeadAttention(spec)) if spec.kv_source == crate::compiler::graph::KvSource::FromCache => has_mha_from_cache = true,
+                Some(Op::CachedGqa(spec)) if spec.kv_source == crate::compiler::graph::KvSource::FromCache => has_cached_gqa_from_cache = true,
+                Some(Op::MlaAttention(spec)) if spec.kv_source == crate::compiler::graph::KvSource::FromCache => has_mla_from_cache = true,
+                Some(Op::SgDetect { hidden_dim, .. }) => {
                     has_sg_ops = true;
                     if sg_detect_hidden_dim.is_none() {
-                        sg_detect_hidden_dim = Some(*hidden_dim);
+                        sg_detect_hidden_dim = Some(hidden_dim);
                     }
                 }
-                OpKind::SgInject { dim, .. } => {
+                Some(Op::SgInject { dim, .. }) => {
                     has_sg_ops = true;
                     if sg_inject_hidden_dim.is_none() {
-                        sg_inject_hidden_dim = Some(*dim);
+                        sg_inject_hidden_dim = Some(dim);
                     }
                 }
-                OpKind::QkNorm { .. } => has_qk_norm = true,
-                OpKind::Gemm { .. } | OpKind::GemmBias { .. } | OpKind::QuantGemm { .. }
-                | OpKind::RmsNorm { .. } | OpKind::LayerNorm { .. } | OpKind::HeadRmsNorm { .. }
-                | OpKind::DepthwiseConv1D { .. } | OpKind::PatchEmbed { .. }
+                Some(Op::QkNorm { .. }) => has_qk_norm = true,
+                Some(ref o) if o.is_gemm_like() || o.is_quant_gemm()
+                    || matches!(o, Op::RmsNorm(_) | Op::LayerNorm(_) | Op::HeadRmsNorm { .. }
+                        | Op::DepthwiseConv1D { .. } | Op::PatchEmbed { .. })
                 => has_weight_ops = true,
                 _ => {}
             }
@@ -238,10 +238,10 @@ impl GraphTopologyAnalysis {
             graph.ops.get(idx)?.outputs.first().copied()
         });
 
-        // MTP 配置从 OpKind::MtpDraft 推导
+        // MTP 配置从 Op::MtpDraft 推导（胖 opcode 自描述）
         let mtp_config = graph.ops.iter().find_map(|op| {
-            match op.kind {
-                OpKind::MtpDraft { depth, hidden_size, vocab_size } =>
+            match op.op_v2_resolved(graph) {
+                Some(Op::MtpDraft { depth, hidden_size, vocab_size }) =>
                     Some(MtpKernelConfig { depth, hidden_size, vocab_size }),
                 _ => None,
             }
