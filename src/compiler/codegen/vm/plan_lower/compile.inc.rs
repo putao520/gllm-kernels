@@ -481,7 +481,7 @@ fn try_auto_dispatch_elementwise(
 
     // Residual with telemetry needs fused compute+telemetry loop (emit_residual_with_telemetry),
     // not separate elementwise + post-hook. Skip auto-dispatch in that case.
-    if matches!(op.kind, OpKind::Residual) && graph.telemetry.residual_cosine_sim {
+    if matches!(op.op_v2_resolved(graph), Some(Op::Residual)) && graph.telemetry.residual_cosine_sim {
         return Ok(false);
     }
 
@@ -489,16 +489,16 @@ fn try_auto_dispatch_elementwise(
     // - Structural ops: Injective traces are skeletal, need dedicated lowering
     // - NormLike/Reduction ops: dedicated lower_op_v2 paths with
     //   specialized weight/bias handling not supported by generic emission
-    if matches!(op.kind,
-        OpKind::ColumnSlice { .. } | OpKind::Gather { .. } |
-        OpKind::DepthwiseConv1D { .. } | OpKind::PatchEmbed { .. } |
-        OpKind::LearnedPos2D { .. } |
-        OpKind::AltUpPredict { .. } | OpKind::AltUpCorrect { .. } | OpKind::AltUpInject { .. } |
-        OpKind::RmsNorm { .. } | OpKind::LayerNorm { .. } |
-        OpKind::ValueNorm { .. } | OpKind::QkNorm { .. } |
-        OpKind::HeadRmsNorm { .. } | OpKind::Softmax |
-        OpKind::L2Normalize { .. } | OpKind::MeanPool { .. } |
-        OpKind::Argmax { .. } | OpKind::MtpDraft { .. }
+    if matches!(op.op_v2_resolved(graph),
+        Some(Op::ColumnSlice { .. }) | Some(Op::Gather { .. }) |
+        Some(Op::DepthwiseConv1D { .. }) | Some(Op::PatchEmbed { .. }) |
+        Some(Op::LearnedPos2D { .. }) |
+        Some(Op::AltUpPredict { .. }) | Some(Op::AltUpCorrect { .. }) | Some(Op::AltUpInject { .. }) |
+        Some(Op::RmsNorm(_)) | Some(Op::LayerNorm(_)) |
+        Some(Op::ValueNorm(_)) | Some(Op::QkNorm { .. }) |
+        Some(Op::HeadRmsNorm { .. }) | Some(Op::Softmax) |
+        Some(Op::L2Normalize { .. }) | Some(Op::MeanPool { .. }) |
+        Some(Op::Argmax { .. }) | Some(Op::MtpDraft { .. })
     ) {
         return Ok(false);
     }
@@ -881,7 +881,7 @@ pub(super) fn emit_standalone_op(
         // §13.5 SiLU dead neuron telemetry: post-hook after auto-dispatch.
         // Residual telemetry is NOT a post-hook — it needs fused compute+telemetry loop,
         // handled by lower_op_v2 when graph.telemetry.residual_cosine_sim is true.
-        if matches!(op.kind, OpKind::Silu) && graph.telemetry.silu_dead_neuron {
+        if matches!(op.op_v2_resolved(graph), Some(Op::Silu)) && graph.telemetry.silu_dead_neuron {
             let (out_shape, _) = infer_output_shape_sym(op, graph)?;
             emit_silu_dead_neuron_telemetry(prog, input_ptr, &out_shape, width, sym_map, ctx.dtype)?;
         }
