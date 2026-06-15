@@ -4,7 +4,7 @@
 //! The old duplicated `_dag` variants have been merged into these.
 
 use std::collections::HashSet;
-use crate::compiler::graph::{CompilerGraph, CompilerOp, OpKind, OpId, TensorId};
+use crate::compiler::graph::{CompilerGraph, CompilerOp, Op, OpKind, OpId, TensorId};
 use crate::compiler::semantic_dag::{SemanticDAG, OpClass};
 use crate::compiler::semantics;
 use super::types::{FusionGroup, FusionMode, GroupMarker};
@@ -13,17 +13,17 @@ use crate::compiler::graph::MultiOutputConfig;
 use crate::quant::QuantType;
 
 /// Extract QuantType from a GEMM-family op, if applicable.
-fn extract_quant_type(op: &CompilerOp) -> Option<QuantType> {
-    match &op.kind {
-        OpKind::QuantGemm { quant_type, .. } => Some(*quant_type),
+fn extract_quant_type(op: &CompilerOp, graph: &CompilerGraph) -> Option<QuantType> {
+    match op.op_v2_resolved(graph) {
+        Some(Op::QuantGemm(spec)) => Some(spec.quant_type),
         _ => None,
     }
 }
 
 /// Check that all GEMMs in a group have quant-compatible types.
 /// Returns true if all GEMMs can be fused together under quant-aware rules.
-fn all_gemm_quant_compatible(ops: &[&CompilerOp]) -> bool {
-    let quant_types: Vec<Option<QuantType>> = ops.iter().map(|op| extract_quant_type(op)).collect();
+fn all_gemm_quant_compatible(ops: &[&CompilerOp], graph: &CompilerGraph) -> bool {
+    let quant_types: Vec<Option<QuantType>> = ops.iter().map(|op| extract_quant_type(op, graph)).collect();
     for i in 1..quant_types.len() {
         if can_fuse_quant_aware(quant_types[i - 1], quant_types[i])
             == super::quant_aware::QuantFusionDecision::Split
@@ -49,7 +49,7 @@ pub(crate) fn detect_qkv_norm_rope(graph: &CompilerGraph, topo: &[OpId]) -> Vec<
     let gemm_ops: Vec<&CompilerOp> = topo
         .iter()
         .filter_map(|&id| graph.op(id))
-        .filter(|op| matches!(op.kind, OpKind::Gemm { .. } | OpKind::GemmBias { .. } | OpKind::QuantGemm { .. }))
+        .filter(|op| matches!(op.op_v2_resolved(graph), Some(Op::Gemm(_)) | Some(Op::GemmBias(_)) | Some(Op::QuantGemm(_))))
         .collect();
 
     // Group by first input tensor
@@ -72,7 +72,7 @@ pub(crate) fn detect_qkv_norm_rope(graph: &CompilerGraph, topo: &[OpId]) -> Vec<
             .and_then(|t| t.producer)
             .is_some_and(|prod_id| {
                 graph.op(prod_id).is_some_and(|prod_op| {
-                    matches!(prod_op.kind, OpKind::RmsNorm { .. } | OpKind::LayerNorm { .. })
+                    matches!(prod_op.op_v2_resolved(graph), Some(Op::RmsNorm(_)) | Some(Op::LayerNorm(_)))
                 })
             });
 
@@ -81,7 +81,7 @@ pub(crate) fn detect_qkv_norm_rope(graph: &CompilerGraph, topo: &[OpId]) -> Vec<
         }
 
         // Quant-aware check: all GEMMs must have compatible quant types
-        if !all_gemm_quant_compatible(ops) {
+        if !all_gemm_quant_compatible(ops, graph) {
             continue;
         }
 
@@ -136,7 +136,7 @@ pub(crate) fn detect_qkv_norm_rope(graph: &CompilerGraph, topo: &[OpId]) -> Vec<
                         if let Some(norm_out_t) = graph.tensor(consumer.outputs[0]) {
                             if norm_out_t.consumers.len() == 1 {
                                 if let Some(rope_op) = graph.op(norm_out_t.consumers[0]) {
-                                    if matches!(rope_op.kind, OpKind::RoPE { .. }) {
+                                    if matches!(rope_op.op_v2_resolved(graph), Some(Op::RoPE(_))) {
                                         trace.rope_id = Some(rope_op.id);
                                     }
                                 }
@@ -213,7 +213,7 @@ pub(crate) fn detect_qkv_shared_input(graph: &CompilerGraph, topo: &[OpId]) -> V
     let gemm_ops: Vec<&CompilerOp> = topo
         .iter()
         .filter_map(|&id| graph.op(id))
-        .filter(|op| matches!(op.kind, OpKind::Gemm { .. } | OpKind::GemmBias { .. } | OpKind::QuantGemm { .. }))
+        .filter(|op| matches!(op.op_v2_resolved(graph), Some(Op::Gemm(_)) | Some(Op::GemmBias(_)) | Some(Op::QuantGemm(_))))
         .collect();
 
     // Group by first input tensor (BTreeMap for deterministic iteration order)
@@ -235,7 +235,7 @@ pub(crate) fn detect_qkv_shared_input(graph: &CompilerGraph, topo: &[OpId]) -> V
                     graph
                         .op(prod_id)
                         .is_some_and(|prod_op| {
-                            matches!(prod_op.kind, OpKind::RmsNorm { .. } | OpKind::LayerNorm { .. })
+                            matches!(prod_op.op_v2_resolved(graph), Some(Op::RmsNorm(_)) | Some(Op::LayerNorm(_)))
                         })
                 },
             );
@@ -245,7 +245,7 @@ pub(crate) fn detect_qkv_shared_input(graph: &CompilerGraph, topo: &[OpId]) -> V
             }
 
             // Quant-aware check: all GEMMs must have compatible quant types
-            if !all_gemm_quant_compatible(ops) {
+            if !all_gemm_quant_compatible(ops, graph) {
                 continue;
             }
 
@@ -286,7 +286,7 @@ pub(crate) fn detect_ffn_block(graph: &CompilerGraph, topo: &[OpId]) -> Vec<Fusi
     // 1. 找所有 Mul ops
     let mul_ops: Vec<&CompilerOp> = topo.iter()
         .filter_map(|&id| graph.op(id))
-        .filter(|op| matches!(op.kind, OpKind::Mul))
+        .filter(|op| matches!(op.op_v2_resolved(graph), Some(Op::Mul)))
         .collect();
 
     for mul_op in mul_ops {
@@ -303,13 +303,14 @@ pub(crate) fn detect_ffn_block(graph: &CompilerGraph, topo: &[OpId]) -> Vec<Fusi
         let pa = match graph.op(pa_id) { Some(o) => o, None => continue };
         let pb = match graph.op(pb_id) { Some(o) => o, None => continue };
 
-        // 识别哪个是 activation，哪个是 up_gemm
-        let is_activation = |k: &OpKind| matches!(k, OpKind::Silu | OpKind::Gelu);
-        let is_gemm = |k: &OpKind| matches!(k, OpKind::Gemm { .. } | OpKind::GemmBias { .. } | OpKind::QuantGemm { .. });
+        // 识别哪个是 activation，哪个是 up_gemm（胖 opcode 自描述）
+        let is_activation = |op: &CompilerOp| matches!(op.op_v2_resolved(graph), Some(Op::Silu) | Some(Op::Gelu));
+        let is_gemm = |op: &CompilerOp| matches!(op.op_v2_resolved(graph),
+            Some(Op::Gemm(_)) | Some(Op::GemmBias(_)) | Some(Op::QuantGemm(_)));
 
-        let (activation_op, up_gemm_op) = if is_activation(&pa.kind) && is_gemm(&pb.kind) {
+        let (activation_op, up_gemm_op) = if is_activation(pa) && is_gemm(pb) {
             (pa, pb)
-        } else if is_activation(&pb.kind) && is_gemm(&pa.kind) {
+        } else if is_activation(pb) && is_gemm(pa) {
             (pb, pa)
         } else {
             continue;
@@ -325,7 +326,7 @@ pub(crate) fn detect_ffn_block(graph: &CompilerGraph, topo: &[OpId]) -> Vec<Fusi
             None => continue,
         };
         let gate_gemm_op = match graph.op(gate_gemm_id) {
-            Some(o) if is_gemm(&o.kind) => o,
+            Some(o) if is_gemm(o) => o,
             _ => continue,
         };
 
@@ -336,23 +337,16 @@ pub(crate) fn detect_ffn_block(graph: &CompilerGraph, topo: &[OpId]) -> Vec<Fusi
             continue;
         }
 
-        // Shape 兼容性校验（ARCH-FFN-SHAPE）
-        fn shape_of(k: &OpKind) -> Option<(&crate::compiler::graph::SymDim, usize, usize)> {
-            match k {
-                OpKind::Gemm { m, n, k, .. } | OpKind::GemmBias { m, n, k, .. } => Some((m, *n, *k)),
-                OpKind::QuantGemm { m, n, k, .. } => Some((m, *n, *k)),
-                _ => None,
-            }
-        }
-        let (gate_m, gate_n, gate_k) = match shape_of(&gate_gemm_op.kind) { Some(v) => v, None => continue };
-        let (up_m, up_n, up_k) = match shape_of(&up_gemm_op.kind) { Some(v) => v, None => continue };
+        // Shape 兼容性校验（ARCH-FFN-SHAPE）— 胖 opcode 自描述
+        let (gate_m, gate_n, gate_k) = match gate_gemm_op.op_v2_gemm_dims(graph) { Some(v) => v, None => continue };
+        let (up_m, up_n, up_k) = match up_gemm_op.op_v2_gemm_dims(graph) { Some(v) => v, None => continue };
         if gate_n != up_n || gate_k != up_k || gate_m != up_m {
             // Shape 不匹配 → 跳过融合，让它们作为独立算子
             continue;
         }
 
         // Quant-aware check: gate and up GEMMs must have compatible quant types
-        if can_fuse_quant_aware(extract_quant_type(gate_gemm_op), extract_quant_type(up_gemm_op))
+        if can_fuse_quant_aware(extract_quant_type(gate_gemm_op, graph), extract_quant_type(up_gemm_op, graph))
             == super::quant_aware::QuantFusionDecision::Split
         {
             continue;
@@ -669,11 +663,14 @@ pub(crate) fn detect_tile_vs_compute_root(
         // Norm output doesn't fit in L1 -> tile into GEMM MC loop
         // ARCH-SYMDIM-DEGRADE: cost model uses max_for_allocation for conservative estimate.
         // TODO(G-2): preserve symbolic form for tighter bounds.
-        let (m, n, k, gemm_dtype) = match &gemm_op.kind {
-            OpKind::Gemm { m, n, k, dtype, .. } => (m.max_for_allocation_strict().expect("ARCH-SYMDIM: Symbolic dim must have max_value in cost model"), *n, *k, *dtype),
-            OpKind::GemmBias { m, n, k, dtype, .. } => (m.max_for_allocation_strict().expect("ARCH-SYMDIM: Symbolic dim must have max_value in cost model"), *n, *k, *dtype),
-            OpKind::QuantGemm { m, n, k, .. } => (m.max_for_allocation_strict().expect("ARCH-SYMDIM: Symbolic dim must have max_value in cost model"), *n, *k, graph.infer_computation_dtype()),
-            _ => (0, 0, 0, graph.infer_computation_dtype()),
+        // 胖 opcode 自描述：GEMM 维度 + dtype
+        let (m, n, k, gemm_dtype) = match gemm_op.op_v2_gemm_dims(graph) {
+            Some((m_dim, n_val, k_val)) => {
+                let m_val = m_dim.max_for_allocation_strict().expect("ARCH-SYMDIM: Symbolic dim must have max_value in cost model");
+                let dtype = gemm_op.op_v2_gemm_dtype(graph).unwrap_or_else(|| graph.infer_computation_dtype());
+                (m_val, n_val, k_val, dtype)
+            }
+            None => (0, 0, 0, graph.infer_computation_dtype()),
         };
         let blocking = plan.profile.gemm_blocking(m, n, k, gemm_dtype);
         FusionMode::TileLevelFusion {
@@ -744,7 +741,8 @@ mod tests {
     guard: LayerCondition::Always,
             op_v2: None,
         };
-        let result = extract_quant_type(&op);
+        let g = CompilerGraph::new();
+        let result = extract_quant_type(&op, &g);
         assert_eq!(result, Some(QuantType::Q4_0));
     }
 
@@ -766,7 +764,8 @@ mod tests {
     guard: LayerCondition::Always,
             op_v2: None,
         };
-        let result = extract_quant_type(&op);
+        let g = CompilerGraph::new();
+        let result = extract_quant_type(&op, &g);
         assert!(result.is_none());
     }
 
@@ -802,7 +801,7 @@ mod tests {
             op_v2: None,
         };
         let ops: Vec<&CompilerOp> = vec![&op1, &op2];
-        assert!(all_gemm_quant_compatible(&ops));
+        assert!({ let g = CompilerGraph::new(); all_gemm_quant_compatible(&ops, &g) });
     }
 
     // ── Test 4: all_gemm_quant_compatible with incompatible quant types returns false ──
@@ -838,7 +837,7 @@ mod tests {
         };
         let ops: Vec<&CompilerOp> = vec![&op1, &op2];
         // Q4_0 and Q6K are different quant types -> Split -> not compatible
-        assert!(!all_gemm_quant_compatible(&ops));
+        assert!(!{ let g = CompilerGraph::new(); all_gemm_quant_compatible(&ops, &g) });
     }
 
     // ── Test 5: detect_norm_into_gemm returns Some when norm feeds single-consumer GEMM ──
@@ -1081,7 +1080,8 @@ mod tests {
             op_v2: None,
         };
         // Act
-        let result = extract_quant_type(&op);
+        let g = CompilerGraph::new();
+        let result = extract_quant_type(&op, &g);
         // Assert: GemmBias is not a QuantGemm, so no QuantType can be extracted
         assert!(result.is_none());
     }
@@ -1101,7 +1101,8 @@ mod tests {
             op_v2: None,
         };
         // Act
-        let result = extract_quant_type(&op);
+        let g = CompilerGraph::new();
+        let result = extract_quant_type(&op, &g);
         // Assert: Silu is not a GEMM variant at all
         assert!(result.is_none());
     }
@@ -1143,7 +1144,7 @@ mod tests {
         };
         let ops: Vec<&CompilerOp> = vec![&op1, &op2];
         // Act
-        let compatible = all_gemm_quant_compatible(&ops);
+        let compatible = { let g = CompilerGraph::new(); all_gemm_quant_compatible(&ops, &g) };
         // Assert: Some(Q4_0) -> None => Fuse, so compatible
         assert!(compatible);
     }
@@ -1169,7 +1170,7 @@ mod tests {
         };
         let ops: Vec<&CompilerOp> = vec![&op];
         // Act
-        let compatible = all_gemm_quant_compatible(&ops);
+        let compatible = { let g = CompilerGraph::new(); all_gemm_quant_compatible(&ops, &g) };
         // Assert: single op has no pairs, loop body never executes, returns true
         assert!(compatible);
     }
@@ -1726,7 +1727,7 @@ mod tests {
         // Arrange: empty slice, no pairs to compare
         let ops: Vec<&CompilerOp> = vec![];
         // Act
-        let compatible = all_gemm_quant_compatible(&ops);
+        let compatible = { let g = CompilerGraph::new(); all_gemm_quant_compatible(&ops, &g) };
         // Assert: vacuously true (no incompatible pair exists)
         assert!(compatible);
     }
@@ -1768,7 +1769,7 @@ mod tests {
         };
         let ops: Vec<&CompilerOp> = vec![&op1, &op2, &op3];
         // Act
-        let compatible = all_gemm_quant_compatible(&ops);
+        let compatible = { let g = CompilerGraph::new(); all_gemm_quant_compatible(&ops, &g) };
         // Assert: all same -> Fuse between every pair -> true
         assert!(compatible);
     }
@@ -2046,7 +2047,8 @@ mod tests {
     guard: LayerCondition::Always,
             op_v2: None,
         };
-        assert!(extract_quant_type(&op).is_none());
+        let g = CompilerGraph::new();
+        assert!(extract_quant_type(&op, &g).is_none());
     }
 
     // ── Test 41: all_gemm_quant_compatible with single plain Gemm ──
@@ -2065,7 +2067,7 @@ mod tests {
     guard: LayerCondition::Always,
             op_v2: None,
         };
-        assert!(all_gemm_quant_compatible(&[&op]));
+        assert!({ let g = CompilerGraph::new(); all_gemm_quant_compatible(&[&op], &g) });
     }
 
     // ── Test 42: all_gemm_quant_compatible with mixed QuantGemm and plain Gemm ──
@@ -2099,7 +2101,7 @@ mod tests {
         // None vs Q4_0: depends on can_fuse_quant_aware(None, Some(Q4_0))
         let ops: Vec<&CompilerOp> = vec![&op1, &op2];
         // Should not panic
-        let _ = all_gemm_quant_compatible(&ops);
+        let _ = { let g = CompilerGraph::new(); all_gemm_quant_compatible(&ops, &g) };
     }
 
     // ── Test 43: detect_norm_into_gemm returns None for Silu→GEMM ──
@@ -3622,7 +3624,7 @@ mod tests {
         };
         let ops: Vec<&CompilerOp> = vec![&op1, &op2];
         // Act
-        let compatible = all_gemm_quant_compatible(&ops);
+        let compatible = { let g = CompilerGraph::new(); all_gemm_quant_compatible(&ops, &g) };
         // Assert: same quant type -> compatible
         assert!(compatible);
     }
@@ -3693,7 +3695,8 @@ mod tests {
             op_v2: None,
         };
         // Act
-        let result = extract_quant_type(&op);
+        let g = CompilerGraph::new();
+        let result = extract_quant_type(&op, &g);
         // Assert
         assert_eq!(result, Some(QuantType::Q4K));
     }
@@ -4061,7 +4064,7 @@ mod tests {
         let ops: Vec<&CompilerOp> = vec![&op1, &op2];
 
         // Act
-        let compatible = all_gemm_quant_compatible(&ops);
+        let compatible = { let g = CompilerGraph::new(); all_gemm_quant_compatible(&ops, &g) };
 
         // Assert: result depends on can_fuse_quant_aware(Q4_0, Q4K); should not panic
         // Q4_0 and Q4K are different quant types -> likely Split -> not compatible
@@ -4247,7 +4250,8 @@ mod tests {
             op_v2: None,
         };
         // Act
-        let result = extract_quant_type(&op);
+        let g = CompilerGraph::new();
+        let result = extract_quant_type(&op, &g);
         // Assert
         assert_eq!(result, Some(QuantType::Q2K));
     }
@@ -4421,7 +4425,7 @@ mod tests {
         };
         let ops: Vec<&CompilerOp> = vec![&op1, &op2];
         // Act
-        let compatible = all_gemm_quant_compatible(&ops);
+        let compatible = { let g = CompilerGraph::new(); all_gemm_quant_compatible(&ops, &g) };
         // Assert: both extract None -> can_fuse_quant_aware(None, None) = Fuse -> compatible
         assert!(compatible);
     }
