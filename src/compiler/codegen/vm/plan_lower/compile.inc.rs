@@ -546,13 +546,13 @@ fn try_auto_dispatch_elementwise(
         return Ok(false);
     }
 
-    // OpKind 参数化 trace 重写 (与 extract_op_trace 逻辑一致)
+    // Op v2 参数化 trace 重写 (与 extract_op_trace 逻辑一致)
     let mut body = body;
-    if let OpKind::SwiGluClipped { limit } = &op.kind {
-        rewrite_swiglu_clipped_limit(&mut body, *limit);
+    if let Some(Op::SwiGluClipped { limit }) = op.op_v2_resolved(graph) {
+        rewrite_swiglu_clipped_limit(&mut body, limit);
     }
-    if let OpKind::LogitSoftcap { cap } = &op.kind {
-        rewrite_logit_softcap_cap(&mut body, *cap);
+    if let Some(Op::LogitSoftcap { cap }) = op.op_v2_resolved(graph) {
+        rewrite_logit_softcap_cap(&mut body, cap);
     }
 
     // ── Auto dispatch: trace + pointer resolution + emit ──
