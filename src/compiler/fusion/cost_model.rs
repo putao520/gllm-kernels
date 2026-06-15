@@ -90,10 +90,12 @@ pub(crate) fn is_memory_bound_group(
 /// ARCH-DTYPE-FULLCHAIN-ORCH: QuantGemm and non-GEMM anchors use graph-level dtype inference.
 fn extract_anchor_dtype(group: &FusionGroup, graph: &CompilerGraph) -> crate::types::DType {
     graph.op(group.anchor)
-        .and_then(|op| match &op.kind {
-            OpKind::Gemm { dtype, .. } | OpKind::GemmBias { dtype, .. } => Some(*dtype),
-            OpKind::QuantGemm { .. } => Some(graph.infer_computation_dtype()),
-            _ => None,
+        .and_then(|op| {
+            if op.op_v2_is_quant_gemm(graph) {
+                Some(graph.infer_computation_dtype())
+            } else {
+                op.op_v2_gemm_dtype(graph)
+            }
         })
         .unwrap_or_else(|| graph.infer_computation_dtype())
 }
@@ -103,11 +105,9 @@ fn extract_anchor_dtype(group: &FusionGroup, graph: &CompilerGraph) -> crate::ty
 // TODO(G-2): preserve symbolic form for tighter bounds.
 fn extract_anchor_gemm_dims(group: &FusionGroup, graph: &CompilerGraph) -> (usize, usize, usize) {
     graph.op(group.anchor)
-        .and_then(|op| match &op.kind {
-            OpKind::Gemm { m, n, k, .. }
-            | OpKind::GemmBias { m, n, k, .. }
-            | OpKind::QuantGemm { m, n, k, .. } => Some((m.max_for_allocation_strict().expect("ARCH-SYMDIM: Symbolic dim must have max_value in cost model"), *n, *k)),
-            _ => None,
+        .and_then(|op| op.op_v2_gemm_dims(graph))
+        .map(|(m, n, k)| {
+            (m.max_for_allocation_strict().expect("ARCH-SYMDIM: Symbolic dim must have max_value in cost model"), n, k)
         })
         .unwrap_or((0, 0, 0))
 }

@@ -916,6 +916,11 @@ impl CompilerOp {
         self.op_v2_resolved(graph).and_then(|o| o.gemm_dtype())
     }
 
+    /// 提取 Attention head_dim（胖 opcode 自描述）。
+    pub fn op_v2_attention_head_dim(&self, graph: &CompilerGraph) -> Option<usize> {
+        self.op_v2_resolved(graph).and_then(|o| o.attention_head_dim())
+    }
+
     /// 输出别名到输入的 IR 元数据（胖 opcode 自描述）。
     /// 替代 `op.kind.output_aliases_input()`。
     pub fn op_v2_output_aliases_input(&self, graph: &CompilerGraph) -> Option<usize> {

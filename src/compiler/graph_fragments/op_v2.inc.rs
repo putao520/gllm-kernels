@@ -405,7 +405,20 @@ impl Op {
         }
     }
 
-    /// 提取 GEMM dtype（胖 opcode 自描述）。
+    /// 提取 Attention head_dim（胖 opcode 自描述）。
+    /// 替代 `match op.kind { OpKind::MultiHeadAttention{head_dim,..} | OpKind::RoPE{head_dim,..} => *head_dim }`。
+    pub fn attention_head_dim(&self) -> Option<usize> {
+        match self {
+            Op::MultiHeadAttention(spec) => Some(spec.geometry.head_dim),
+            Op::CachedGqa(spec) => Some(spec.geometry.head_dim),
+            Op::MlaAttention(spec) => Some(spec.head_dim),
+            Op::RoPE(spec) => Some(spec.head_dim),
+            Op::DualRoPE(spec) => Some(spec.head_dim),
+            _ => None,
+        }
+    }
+
+
     /// 仅 Gemm/GemmBias/FusedRmsNormGemm/MaskedGemm 携带 dtype；
     /// QuantGemm 返回 None（调用方通过 graph.infer_computation_dtype 推导）。
     pub fn gemm_dtype(&self) -> Option<DType> {

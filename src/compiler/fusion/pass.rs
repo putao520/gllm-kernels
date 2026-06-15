@@ -3,7 +3,7 @@
 //! Uses SemanticDAG OpClass for classification instead of hand-maintained OpSemantics.
 
 use std::collections::{HashMap, HashSet};
-use crate::compiler::graph::{CompilerGraph, CompilerOp, OpKind, OpId, MultiOutputConfig};
+use crate::compiler::graph::{CompilerGraph, CompilerOp, Op, OpKind, OpId, MultiOutputConfig};
 use crate::compiler::semantic_dag::{SemanticDAG, OpClass, Bottleneck};
 use crate::compiler::registry::ScalarOpRegistry;
 use super::types::{FusionGroup, FusionMode, FusionPlan, GroupMarker, ComputeDensity};
@@ -649,11 +649,12 @@ fn assign_group_markers(groups: &mut [FusionGroup], graph: &CompilerGraph) {
     // Compute OpKind discriminant signature for each fusion group.
     // discriminant() returns a stable value per enum variant, ignoring field values.
     // Two groups with identical discriminant sequences are isomorphic substructures.
-    let signatures: Vec<Vec<std::mem::Discriminant<OpKind>>> = groups.iter()
+    let signatures: Vec<Vec<std::mem::Discriminant<Op>>> = groups.iter()
         .map(|g| {
             g.ops.iter()
                 .filter_map(|&oid| graph.op(oid))
-                .map(|op| std::mem::discriminant(&op.kind))
+                .filter_map(|op| op.op_v2_resolved(graph))
+                .map(|op_v2| std::mem::discriminant(&op_v2))
                 .collect()
         })
         .collect();
@@ -668,7 +669,7 @@ fn assign_group_markers(groups: &mut [FusionGroup], graph: &CompilerGraph) {
 /// Detect homogeneous layer groups: consecutive groups with identical OpKind signatures.
 fn assign_homogeneous_markers(
     groups: &mut [FusionGroup],
-    signatures: &[Vec<std::mem::Discriminant<OpKind>>],
+    signatures: &[Vec<std::mem::Discriminant<Op>>],
     graph: &CompilerGraph,
 ) {
     let num_iterations = graph.layer_loop_config.as_ref()
@@ -733,7 +734,7 @@ fn assign_homogeneous_markers(
 /// Detect heterogeneous layer groups: cycling signature patterns (Gemma 4 sliding/full).
 fn assign_hetero_markers(
     groups: &mut [FusionGroup],
-    signatures: &[Vec<std::mem::Discriminant<OpKind>>],
+    signatures: &[Vec<std::mem::Discriminant<Op>>],
     graph: &CompilerGraph,
 ) {
     let num_segments = graph.hetero_layer_loop_config.as_ref()
@@ -784,12 +785,12 @@ fn extract_hetero_dims(graph: &CompilerGraph) -> Option<HeteroDims> {
     let mut head_dims: Vec<usize> = Vec::new();
     let mut intermediates: Vec<usize> = Vec::new();
     for op in &graph.ops {
-        match &op.kind {
-            OpKind::MultiHeadAttention { head_dim, .. } => head_dims.push(*head_dim),
-            OpKind::Gemm { n, .. } | OpKind::GemmBias { n, .. } | OpKind::QuantGemm { n, .. } => {
-                intermediates.push(*n);
-            }
-            _ => {}
+        let op_v2 = op.op_v2_resolved(graph);
+        if let Some(hd) = op_v2.as_ref().and_then(|o| o.attention_head_dim()) {
+            head_dims.push(hd);
+        }
+        if let Some((_, n, _)) = op.op_v2_gemm_dims(graph) {
+            intermediates.push(n);
         }
     }
     head_dims.sort_unstable();
@@ -833,37 +834,29 @@ fn derive_hetero_layer_type(
 
     // Determine if this group has sliding or full attention
     let is_sliding = group.ops.iter().any(|&oid| {
-        graph.op(oid).map_or(false, |op| match &op.kind {
-            OpKind::MultiHeadAttention { head_dim, .. } => *head_dim == dims.sliding_head_dim,
-            _ => false,
+        graph.op(oid).map_or(false, |op| {
+            op.op_v2_attention_head_dim(graph) == Some(dims.sliding_head_dim)
         })
     });
     let is_full = group.ops.iter().any(|&oid| {
-        graph.op(oid).map_or(false, |op| match &op.kind {
-            OpKind::MultiHeadAttention { head_dim, .. } => *head_dim == dims.full_head_dim,
-            _ => false,
+        graph.op(oid).map_or(false, |op| {
+            op.op_v2_attention_head_dim(graph) == Some(dims.full_head_dim)
         })
     });
 
     // Determine if this group has small or large FFN
     let is_small_ffn = group.ops.iter().any(|&oid| {
-        graph.op(oid).map_or(false, |op| match &op.kind {
-            OpKind::Gemm { n, .. } | OpKind::GemmBias { n, .. } | OpKind::QuantGemm { n, .. }
-                if *n == dims.small_intermediate && dims.small_intermediate != dims.large_intermediate =>
-            {
-                true
-            }
-            _ => false,
+        graph.op(oid).map_or(false, |op| {
+            op.op_v2_gemm_dims(graph).map_or(false, |(_, n, _)| {
+                n == dims.small_intermediate && dims.small_intermediate != dims.large_intermediate
+            })
         })
     });
     let is_large_ffn = group.ops.iter().any(|&oid| {
-        graph.op(oid).map_or(false, |op| match &op.kind {
-            OpKind::Gemm { n, .. } | OpKind::GemmBias { n, .. } | OpKind::QuantGemm { n, .. }
-                if *n == dims.large_intermediate && dims.small_intermediate != dims.large_intermediate =>
-            {
-                true
-            }
-            _ => false,
+        graph.op(oid).map_or(false, |op| {
+            op.op_v2_gemm_dims(graph).map_or(false, |(_, n, _)| {
+                n == dims.large_intermediate && dims.small_intermediate != dims.large_intermediate
+            })
         })
     });
 
@@ -888,7 +881,7 @@ fn derive_hetero_layer_type(
 ///
 /// `period` is auto-detected as the smallest value where signatures repeat.
 fn find_isomorphic_run(
-    signatures: &[Vec<std::mem::Discriminant<OpKind>>],
+    signatures: &[Vec<std::mem::Discriminant<Op>>],
     num_iterations: usize,
 ) -> Vec<usize> {
     if signatures.is_empty() || num_iterations == 0 {
@@ -930,14 +923,14 @@ fn find_isomorphic_run(
 
 /// Find consecutive groups with the same signature (fallback for when periodic detection fails).
 fn find_consecutive_same_signature(
-    signatures: &[Vec<std::mem::Discriminant<OpKind>>],
+    signatures: &[Vec<std::mem::Discriminant<Op>>],
 ) -> Vec<usize> {
     if signatures.is_empty() {
         return Vec::new();
     }
 
     // Find the most common signature (the layer template).
-    let mut sig_counts: HashMap<Vec<std::mem::Discriminant<OpKind>>, usize> = HashMap::new();
+    let mut sig_counts: HashMap<Vec<std::mem::Discriminant<Op>>, usize> = HashMap::new();
     for sig in signatures {
         *sig_counts.entry(sig.clone()).or_insert(0) += 1;
     }
@@ -993,7 +986,7 @@ fn find_consecutive_same_signature(
 /// signatures. We detect this by finding the shortest cycle period that
 /// repeats `num_segments` times.
 fn find_cycling_run(
-    signatures: &[Vec<std::mem::Discriminant<OpKind>>],
+    signatures: &[Vec<std::mem::Discriminant<Op>>],
     num_segments: usize,
 ) -> Vec<usize> {
     if signatures.is_empty() || num_segments == 0 {
@@ -1099,10 +1092,12 @@ fn norm_feeds_single_gemm_consumer(
         Some(o) => o,
         None => return false,
     };
-    // Must match detect_norm_into_gemm's accepted norms (not ValueNorm).
-    match op.kind {
-        OpKind::RmsNorm { .. } | OpKind::LayerNorm { .. } => {}
-        _ => return false,
+    // Must match detect_norm_into_gemm's accepted norms (RmsNorm/LayerNorm, NOT ValueNorm).
+    // ValueNorm lacks learnable weight — not eligible for NormIntoGemm fusion.
+    let is_norm_into_gemm_eligible = matches!(op.op_v2_resolved(graph),
+        Some(Op::RmsNorm(_)) | Some(Op::LayerNorm(_)));
+    if !is_norm_into_gemm_eligible {
+        return false;
     }
     // Norm must produce exactly one output with exactly one consumer.
     let out_tid = match op.outputs.as_slice() {

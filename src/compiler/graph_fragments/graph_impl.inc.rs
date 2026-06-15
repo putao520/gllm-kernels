@@ -213,11 +213,8 @@ impl CompilerGraph {
     /// the dtype of the first input tensor if no GEMM ops exist.
     /// ARCH-DTYPE-FULLCHAIN-ORCH: replaces `unwrap_or(DType::F32)` pattern.
     pub fn infer_computation_dtype(&self) -> DType {
-        // Priority 1: explicit dtype from GEMM ops
-        if let Some(dt) = self.ops.iter().find_map(|op| match &op.kind {
-            OpKind::Gemm { dtype, .. } | OpKind::GemmBias { dtype, .. } => Some(*dtype),
-            _ => None,
-        }) {
+        // Priority 1: explicit dtype from GEMM ops (胖 opcode 自描述)
+        if let Some(dt) = self.ops.iter().find_map(|op| op.op_v2_gemm_dtype(self)) {
             return dt;
         }
         // Priority 2: dtype of first input tensor
