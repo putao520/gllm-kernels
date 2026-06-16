@@ -51,7 +51,7 @@ pub fn fuse_with_dag_prebuilt(
                 let out_names: Vec<String> = op.outputs.iter()
                     .filter_map(|&tid| graph.tensor(tid).map(|t| t.name.clone()))
                     .collect();
-                eprintln!("[fusion]   topo[{:3}] {:?} {:?} → {}", i, oc, op.kind, out_names.join(", "));
+                eprintln!("[fusion]   topo[{:3}] {:?} {:?} → {}", i, oc, op.op_v2, out_names.join(", "));
                 if i > 10 { break; }
             }
         }
@@ -1060,8 +1060,8 @@ fn try_collect_reduction_epilogue<'a>(
         dag.node(consumer_id).map(|n| n.op_class) == Some(OpClass::Reduction)
     } else {
         matches!(
-            consumer.kind,
-            OpKind::Argmax { .. } | OpKind::MeanPool { .. } | OpKind::L2Normalize { .. }
+            &consumer.op_v2,
+            Op::Argmax { .. } | Op::MeanPool { .. } | Op::L2Normalize { .. }
         )
     };
     if !is_reduction {
@@ -1087,15 +1087,14 @@ fn norm_feeds_single_gemm_consumer(
     op_id: OpId,
     dag: &SemanticDAG,
 ) -> bool {
-    use crate::compiler::graph::OpKind;
     let op = match graph.op(op_id) {
         Some(o) => o,
         None => return false,
     };
     // Must match detect_norm_into_gemm's accepted norms (RmsNorm/LayerNorm, NOT ValueNorm).
     // ValueNorm lacks learnable weight — not eligible for NormIntoGemm fusion.
-    let is_norm_into_gemm_eligible = matches!(op.op_v2_resolved(graph),
-        Some(Op::RmsNorm(_)) | Some(Op::LayerNorm(_)));
+    let is_norm_into_gemm_eligible = matches!(&op.op_v2,
+        Op::RmsNorm(_) | Op::LayerNorm(_));
     if !is_norm_into_gemm_eligible {
         return false;
     }
@@ -1122,10 +1121,10 @@ fn norm_feeds_single_gemm_consumer(
     // The consumer must be a plain GEMM kind (not MoEGate, which shares Gemm
     // class but does not participate in Norm-prefix fusion).
     matches!(
-        graph.op(consumer_id).map(|o| &o.kind),
-        Some(OpKind::Gemm { .. })
-            | Some(OpKind::GemmBias { .. })
-            | Some(OpKind::QuantGemm { .. })
+        graph.op(consumer_id).map(|o| &o.op_v2),
+        Some(Op::Gemm(_))
+            | Some(Op::GemmBias(_))
+            | Some(Op::QuantGemm(_))
     )
 }
 
