@@ -95,13 +95,13 @@ pub struct BusinessConfig {
     /// SPEC/39 NOTE: 编译器不读取此字段。CotStepHook op 存在性由图拓扑推导。
     pub cot_step_hook: Option<CotStepConfig>,
     /// Whether model uses HeadRmsNorm on Q/K after projection (Qwen3 q_norm/k_norm).
-    // REMOVED (SPEC/39): has_head_rms_norm — now derived from OpKind::HeadRmsNorm topology.
-    // REMOVED (SPEC/39): head_rms_norm_eps — now derived from OpKind::HeadRmsNorm { eps }.
-    // REMOVED (SPEC/39): ffn_activation — now derived from OpKind::SwiGlu/GeGlu/Gelu topology.
-    // REMOVED (SPEC/39): has_qk_norm — now derived from OpKind::QkNorm topology.
-    // REMOVED (SPEC/39): has_value_norm — now derived from OpKind::ValueNorm topology.
-    // REMOVED (SPEC/39): value_norm_eps — now derived from OpKind::ValueNorm { eps }.
-    // REMOVED (SPEC/39): logit_softcapping — now derived from OpKind::LogitSoftcap { cap } topology.
+    // REMOVED (SPEC/39): has_head_rms_norm — now derived from Op::HeadRmsNorm topology.
+    // REMOVED (SPEC/39): head_rms_norm_eps — now derived from Op::HeadRmsNorm { eps: , dtype: DType::F32 }.
+    // REMOVED (SPEC/39): ffn_activation — now derived from Op::SwiGlu/GeGlu/Gelu topology.
+    // REMOVED (SPEC/39): has_qk_norm — now derived from Op::QkNorm topology.
+    // REMOVED (SPEC/39): has_value_norm — now derived from Op::ValueNorm topology.
+    // REMOVED (SPEC/39): value_norm_eps — now derived from Op::ValueNorm(NormSpec { feature_dim: feature_dim, eps: , dtype: DType::F32, has_weight: false }).
+    // REMOVED (SPEC/39): logit_softcapping — now derived from Op::LogitSoftcap { cap:  } topology.
     // REMOVED (SPEC/39): embedding_scale — now derived from OpKind::Gather::scale / OpKind::QuantGather::scale.
     /// Whether to compile session KV cache restore (cross-turn KV reuse).
     /// When enabled, embed phase checks session_position > 0 → skip processed tokens.
@@ -118,7 +118,7 @@ pub struct BusinessConfig {
     /// SPEC/39 NOTE: 此字段是唯一合法的编译器直接读取参数——debug_jit 影响全局
     /// codegen 行为（INT3 插入、source map 生成），不是 OpKind 可表达的。
     pub debug_jit: bool,
-    // REMOVED (SPEC/39): mtp_config — now derived from topology.mtp_config (OpKind::MtpDraft).
+    // REMOVED (SPEC/39): mtp_config — now derived from topology.mtp_config (Op::MtpDraft).
 }
 
 impl Default for BusinessConfig {

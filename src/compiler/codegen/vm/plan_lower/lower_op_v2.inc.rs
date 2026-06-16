@@ -1114,7 +1114,7 @@ pub(crate) fn lower_op_v2(
             let weight_ptr = resolver.materialize(prog, op.inputs[1], abi).unwrap_or_else(|| prog.alloc_vreg(VRegKind::Ptr, width));
             let output_ptr = resolver.materialize(prog, op.outputs[0], abi)
                 .ok_or_else(|| CompilerError::CodegenViolation(format!("L2Normalize op {:?}: 无输出指针", op.id)))?;
-            let key = ScalarOpRegistry::key_from_op_kind(&op.kind);
+            let key = ScalarOpRegistry::key_from_op(&op.op_v2);
             let op_trace = ctx.session.registry.and_then(|r| r.get_trace(&key));
             let pattern = op_trace.map(|t| t.pattern.clone())
                 .ok_or_else(|| CompilerError::CodegenViolation("L2Normalize: 无 registry trace".into()))?;
@@ -1150,7 +1150,7 @@ pub(crate) fn lower_op_v2(
             let input_ptr = resolver.materialize(prog, op.inputs[0], abi).unwrap_or_else(|| prog.alloc_vreg(VRegKind::Ptr, width));
             let output_ptr = resolver.materialize(prog, op.outputs[0], abi)
                 .ok_or_else(|| CompilerError::CodegenViolation(format!("MeanPool op {:?}: 无输出指针", op.id)))?;
-            let key = ScalarOpRegistry::key_from_op_kind(&op.kind);
+            let key = ScalarOpRegistry::key_from_op(&op.op_v2);
             let op_trace = ctx.session.registry.and_then(|r| r.get_trace(&key));
             let trace = op_trace
                 .ok_or_else(|| CompilerError::CodegenViolation("MeanPool: 无 registry trace".into()))?;
@@ -1430,7 +1430,7 @@ fn lower_attention_v2(
 /// Norm lowering（Op v2 驱动）。
 ///
 /// 从 NormSpec 获取 feature_dim/dtype/has_weight，结合 registry 的 NormLike pattern，
-/// 调用 emit_normlike_inline。消除 dispatch_emit.rs 的 OpKind::RmsNorm 反查。
+/// 调用 emit_normlike_inline。消除 dispatch_emit.rs 的 Op::RmsNorm 反查。
 fn lower_norm_v2(
     prog: &mut VmProgram,
     op: &CompilerOp,

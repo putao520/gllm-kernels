@@ -3,7 +3,7 @@
 //! Each node carries its OpTrace (from Scalar + SymExec) and auto-derived OpClass
 //! (from ComputePattern). This replaces the old hand-maintained OpSemantics mapping.
 
-use crate::compiler::graph::{CompilerGraph, CompilerOp, Op, OpKind, OpId, TensorId};
+use crate::compiler::graph::{CompilerGraph, CompilerOp, Op, OpId, TensorId};
 use crate::compiler::trace::{OpTrace, ComputePattern};
 use crate::compiler::registry::ScalarOpRegistry;
 
@@ -70,7 +70,7 @@ pub struct SemanticNode {
     /// Node ID (matches CompilerGraph op index)
     pub node_id: OpId,
     /// Operator kind (from CompilerGraph)
-    pub op_kind: OpKind,
+    pub op_v2: Op,
     /// Computation structure (from Scalar + SymExec / registry)
     pub op_trace: Option<OpTrace>,
     /// TVM operator class (auto-derived from op_trace.pattern)
@@ -120,7 +120,7 @@ impl SemanticDAG {
         for &op_id in &topo_order {
             // SAFETY: topological_sort only returns OpIds that exist in the graph
             let op = graph.op(op_id).expect("SAFETY: topological_sort returned invalid OpId");
-            let key = ScalarOpRegistry::key_from_op_kind(&op.kind);
+            let key = ScalarOpRegistry::key_from_op(&op.op_v2);
             let op_trace = registry.get_trace(&key).cloned();
             // Pattern-derived classification: trust the registered OpTrace.
             // OpKind override: some complex composite ops (PatchEmbed Conv2D,
@@ -141,7 +141,7 @@ impl SemanticDAG {
 
             nodes.push(SemanticNode {
                 node_id: op.id,
-                op_kind: op.kind.clone(),
+                op_v2: op.op_v2.clone(),
                 op_trace,
                 op_class,
                 bottleneck,
@@ -705,33 +705,29 @@ mod tests {
     #[test]
     fn test_fallback_op_class_elementwise_variants() {
         // Arrange & Act & Assert — all OpKinds that map to ElemWise in fallback
-        assert_eq!(invoke_fallback(&OpKind::Silu), OpClass::ElemWise);
-        assert_eq!(invoke_fallback(&OpKind::Gelu), OpClass::ElemWise);
-        assert_eq!(invoke_fallback(&OpKind::Tanh), OpClass::ElemWise);
-        assert_eq!(invoke_fallback(&OpKind::Add), OpClass::ElemWise);
-        assert_eq!(invoke_fallback(&OpKind::Mul), OpClass::ElemWise);
-        assert_eq!(invoke_fallback(&OpKind::Residual), OpClass::ElemWise);
-        assert_eq!(invoke_fallback(&OpKind::SwiGlu), OpClass::ElemWise);
-        assert_eq!(invoke_fallback(&OpKind::GeGlu), OpClass::ElemWise);
+        assert_eq!(invoke_fallback(&Op::Silu), OpClass::ElemWise);
+        assert_eq!(invoke_fallback(&Op::Gelu), OpClass::ElemWise);
+        assert_eq!(invoke_fallback(&Op::Tanh), OpClass::ElemWise);
+        assert_eq!(invoke_fallback(&Op::Add), OpClass::ElemWise);
+        assert_eq!(invoke_fallback(&Op::Mul), OpClass::ElemWise);
+        assert_eq!(invoke_fallback(&Op::Residual), OpClass::ElemWise);
+        assert_eq!(invoke_fallback(&Op::SwiGlu), OpClass::ElemWise);
+        assert_eq!(invoke_fallback(&Op::GeGlu), OpClass::ElemWise);
         assert_eq!(
-            invoke_fallback(&OpKind::SwiGluClipped { limit: 7.0 }),
+            invoke_fallback(&Op::SwiGluClipped { limit: 7.0 }),
             OpClass::ElemWise
         );
-        assert_eq!(invoke_fallback(&OpKind::WeightedSum { seq_len: 1, hidden: 4096, top_k: 8 }), OpClass::ElemWise);
+        assert_eq!(invoke_fallback(&Op::WeightedSum { seq_len: SymDim::Concrete(1), hidden: 4096, top_k: 8 }), OpClass::ElemWise);
         assert_eq!(
-            invoke_fallback(&OpKind::Dequantize {
-                num_elements: 1024,
-                block_size: 32,
-                bits: 4,
-            }),
+            invoke_fallback(&Op::Dequantize { num_elements: 1024, block_size: 32, bits: 4 }),
             OpClass::ElemWise
         );
         assert_eq!(
-            invoke_fallback(&OpKind::LogitSoftcap { cap: 50.0 }),
+            invoke_fallback(&Op::LogitSoftcap { cap: 50.0 }),
             OpClass::ElemWise
         );
         assert_eq!(
-            invoke_fallback(&OpKind::LearnedPos2D { num_patches: 256, embed_dim: 1152 }),
+            invoke_fallback(&Op::LearnedPos2D { num_patches: 256, embed_dim: 1152 }),
             OpClass::ElemWise
         );
     }
@@ -740,62 +736,45 @@ mod tests {
     fn test_fallback_op_class_injective_variants() {
         // Arrange & Act & Assert
         assert_eq!(
-            invoke_fallback(&OpKind::RoPE {
-                num_heads: 32,
-                head_dim: 128,
-                theta: 10000.0,
-                partial: 1.0,
-                rope_scaling: None,
-            }),
+            invoke_fallback(&Op::RoPE(RopeSpec { num_heads: 32, head_dim: 128, theta: 10000.0, partial: 1.0, rope_scaling: None })),
             OpClass::Injective
         );
         assert_eq!(
-            invoke_fallback(&OpKind::Transpose { perm: vec![0, 2, 1] }),
+            invoke_fallback(&Op::Transpose { perm: vec![0, 2, 1] }),
             OpClass::Injective
         );
         assert_eq!(
-            invoke_fallback(&OpKind::Reshape { target_shape: vec![] }),
+            invoke_fallback(&Op::Reshape { target_shape: vec![] }),
             OpClass::Injective
         );
         assert_eq!(
-            invoke_fallback(&OpKind::SliceView { axis: 1, start: 0, end: 128 }),
+            invoke_fallback(&Op::SliceView { axis: 1, start: 0, end: 128 }),
             OpClass::Injective
         );
         assert_eq!(
-            invoke_fallback(&OpKind::Gather {
-                table_rows: 32000,
+            invoke_fallback(&Op::Gather { table_rows: 32000,
                 embed_dim: 4096,
                 index_dim: SymDim::Concrete(1),
                 indices_kind: crate::compiler::graph::GatherIndicesKind::Tensor,
-                scale: None,
-            }),
+                scale: None, }),
             OpClass::Injective
         );
         assert_eq!(
-            invoke_fallback(&OpKind::QuantGather {
-                quant_type: QuantType::Q8_0,
+            invoke_fallback(&Op::QuantGather { quant_type: QuantType::Q8_0,
                 vocab_size: 32000,
                 hidden_dim: 4096,
                 index_dim: SymDim::Concrete(1),
-                scale: None,
-            }),
+                scale: None, }),
             OpClass::Injective
         );
         assert_eq!(
-            invoke_fallback(&OpKind::ColumnSlice {
-                seq_len: SymDim::Concrete(1),
-                input_inner: 256,
-                start: 0,
-                slice_dim: 128,
-            }),
+            invoke_fallback(&Op::ColumnSlice { seq_len: SymDim::Concrete(1), input_inner: 256, start: 0, slice_dim: 128 }),
             OpClass::Injective
         );
         assert_eq!(
-            invoke_fallback(&OpKind::MlaRopeMerge {
-                seq_len: SymDim::Concrete(1),
+            invoke_fallback(&Op::MlaRopeMerge { seq_len: SymDim::Concrete(1),
                 d_c: 512,
-                d_rope: 64,
-            }),
+                d_rope: 64, }),
             OpClass::Injective
         );
     }
@@ -804,40 +783,40 @@ mod tests {
     fn test_fallback_op_class_reduction_variants() {
         // Arrange & Act & Assert
         assert_eq!(
-            invoke_fallback(&OpKind::RmsNorm { feature_dim: 4096, eps: 1e-5 }),
+            invoke_fallback(&Op::RmsNorm(NormSpec { feature_dim: 4096, eps: 1e-5, dtype: DType::F32, has_weight: true })),
             OpClass::Reduction
         );
         assert_eq!(
-            invoke_fallback(&OpKind::LayerNorm { feature_dim: 4096, eps: 1e-5 }),
+            invoke_fallback(&Op::LayerNorm(NormSpec { feature_dim: 4096, eps: 1e-5, dtype: DType::F32, has_weight: true })),
             OpClass::Reduction
         );
         assert_eq!(
-            invoke_fallback(&OpKind::ValueNorm { feature_dim: 4096, eps: 1e-6 }),
+            invoke_fallback(&Op::ValueNorm(NormSpec { feature_dim: 4096, eps: 1e-6, dtype: DType::F32, has_weight: false })),
             OpClass::Reduction
         );
-        assert_eq!(invoke_fallback(&OpKind::Softmax), OpClass::Reduction);
+        assert_eq!(invoke_fallback(&Op::Softmax), OpClass::Reduction);
         assert_eq!(
-            invoke_fallback(&OpKind::MeanPool { seq_len: 128, hidden: 768, cls_mode: false }),
-            OpClass::Reduction
-        );
-        assert_eq!(
-            invoke_fallback(&OpKind::L2Normalize { hidden: 768 }),
+            invoke_fallback(&Op::MeanPool { seq_len: 128, hidden: 768, cls_mode: false }),
             OpClass::Reduction
         );
         assert_eq!(
-            invoke_fallback(&OpKind::QkNorm { head_dim: 128, eps: 1e-6 }),
+            invoke_fallback(&Op::L2Normalize { hidden: 768 }),
             OpClass::Reduction
         );
         assert_eq!(
-            invoke_fallback(&OpKind::HeadRmsNorm { head_dim: 128, eps: 1e-6 }),
+            invoke_fallback(&Op::QkNorm { head_dim: 128, eps: 1e-6 }),
             OpClass::Reduction
         );
         assert_eq!(
-            invoke_fallback(&OpKind::Argmax { vocab_size: 32000 }),
+            invoke_fallback(&Op::HeadRmsNorm { head_dim: 128, eps: 1e-6, dtype: DType::F32 }),
             OpClass::Reduction
         );
         assert_eq!(
-            invoke_fallback(&OpKind::TopK { seq_len: 1, num_experts: 64, top_k: 8 }),
+            invoke_fallback(&Op::Argmax { vocab_size: 32000 }),
+            OpClass::Reduction
+        );
+        assert_eq!(
+            invoke_fallback(&Op::TopK { seq_len: SymDim::Concrete(1), num_experts: 64, top_k: 8 }),
             OpClass::Reduction
         );
     }
@@ -846,58 +825,38 @@ mod tests {
     fn test_fallback_op_class_gemm_variants() {
         // Arrange & Act & Assert
         assert_eq!(
-            invoke_fallback(&OpKind::Gemm {
-                m: SymDim::Concrete(1),
-                n: 4096,
-                k: 4096,
-                dtype: DType::F32,
-                trans_b: false,
-            }),
+            invoke_fallback(&Op::Gemm(GemmSpec { m: SymDim::Concrete(1), n: 4096, k: 4096, dtype: DType::F32, trans_b: false, has_bias: false })),
             OpClass::Gemm
         );
         assert_eq!(
-            invoke_fallback(&OpKind::GemmBias {
-                m: SymDim::Concrete(1),
-                n: 4096,
-                k: 4096,
-                dtype: DType::F32,
-                trans_b: false,
-            }),
+            invoke_fallback(&Op::GemmBias(GemmSpec { m: SymDim::Concrete(1), n: 4096, k: 4096, dtype: DType::F32, trans_b: false, has_bias: true })),
             OpClass::Gemm
         );
         assert_eq!(
-            invoke_fallback(&OpKind::MoEGate {
-                seq_len: 1,
+            invoke_fallback(&Op::MoEGate { seq_len: SymDim::Concrete(1),
                 num_experts: 64,
                 hidden: 4096,
-                top_k: 8,
-            }),
+                top_k: 8, }),
             OpClass::Gemm
         );
         assert_eq!(
-            invoke_fallback(&OpKind::MlaKvCompress {
-                m: SymDim::Concrete(1),
+            invoke_fallback(&Op::MlaKvCompress { m: SymDim::Concrete(1),
                 d_c: 512,
-                hidden: 4096,
-            }),
+                hidden: 4096, }),
             OpClass::Gemm
         );
         assert_eq!(
-            invoke_fallback(&OpKind::MlaQAbsorb {
-                seq_len: SymDim::Concrete(1),
+            invoke_fallback(&Op::MlaQAbsorb { seq_len: SymDim::Concrete(1),
                 num_heads: 32,
                 head_dim: 128,
-                d_c: 512,
-            }),
+                d_c: 512, }),
             OpClass::Gemm
         );
         assert_eq!(
-            invoke_fallback(&OpKind::MlaVRestore {
-                seq_len: SymDim::Concrete(1),
+            invoke_fallback(&Op::MlaVRestore { seq_len: SymDim::Concrete(1),
                 num_heads: 32,
                 head_dim: 128,
-                d_c: 512,
-            }),
+                d_c: 512, }),
             OpClass::Gemm
         );
     }
@@ -906,32 +865,15 @@ mod tests {
     fn test_fallback_op_class_opaque_variants() {
         // Arrange & Act & Assert — key opaque OpKinds
         assert_eq!(
-            invoke_fallback(&OpKind::MultiHeadAttention {
-                seq_len: SymDim::Concrete(128),
-                num_heads: 32,
-                num_kv_heads: 8,
-                head_dim: 128,
-                causal: true,
-                attention_sinks: false,
-            kv_source: KvSource::FromTensor,
-            }),
+            invoke_fallback(&Op::MultiHeadAttention(AttentionSpec { geometry: AttentionGeometry { num_q_heads: 32, num_kv_heads: 8, head_dim: 128 }, mask: if true { AttentionMask::Causal } else { AttentionMask::Full }, kv_source: KvSource::FromTensor, sinks: if false { SinksSpec::Learnable } else { SinksSpec::None }, seq_len: SymDim::Concrete(128), dtype: DType::F32 })),
             OpClass::Opaque
         );
         assert_eq!(
-            invoke_fallback(&OpKind::CachedGQA {
-                seq_len: 128,
-                total_seq: 256,
-                num_heads: 32,
-                num_kv_heads: 8,
-                head_dim: 128,
-                strategy: crate::compiler::graph::AttentionStrategy::Naive,
-                kv_dtype: DType::F32,
-                kv_source: KvSource::FromTensor }),
+            invoke_fallback(&Op::CachedGqa(CachedGqaSpec { geometry: AttentionGeometry { num_q_heads: 32, num_kv_heads: 8, head_dim: 128 }, mask: AttentionMask::Causal, kv_source: KvSource::FromTensor, seq_len: SymDim::Concrete(128), total_seq: 256, kv_dtype: DType::F32, strategy: crate::compiler::graph::AttentionStrategy::Naive })),
             OpClass::Opaque
         );
         assert_eq!(
-            invoke_fallback(&OpKind::KvScatterWrite {
-                seq_len: 128,
+            invoke_fallback(&Op::KvScatterWrite { seq_len: 128,
                 num_kv_heads: 8,
                 head_dim: 128,
                 kv_dim: 1024,
@@ -939,79 +881,64 @@ mod tests {
                 layer_offset: 0,
                 half_offset: 0,
                 head_stride: 0,
-                dtype_size: 4,
-            }),
+                dtype_size: 4, }),
             OpClass::Opaque
         );
         assert_eq!(
-            invoke_fallback(&OpKind::PatchEmbed {
-                patch_size: 14,
-                in_channels: 3,
-                embed_dim: 1152,
-                image_size: 224,
-            }),
+            invoke_fallback(&Op::PatchEmbed { patch_size: 14, in_channels: 3, embed_dim: 1152, image_size: 224 }),
             OpClass::Opaque
         );
         assert_eq!(
-            invoke_fallback(&OpKind::DepthwiseConv1D {
-                channels: 512,
-                kernel_size: 7,
-                causal: true,
-            }),
+            invoke_fallback(&Op::DepthwiseConv1D { channels: 512, kernel_size: 7, causal: true }),
             OpClass::Opaque
         );
         assert_eq!(
-            invoke_fallback(&OpKind::MoERouter {
-                num_experts: 64,
+            invoke_fallback(&Op::MoERouter { num_experts: 64,
                 top_k: 8,
                 hidden: 4096,
-                seq_len: SymDim::Concrete(1),
-            }),
+                seq_len: SymDim::Concrete(1), }),
             OpClass::Opaque
         );
         assert_eq!(
-            invoke_fallback(&OpKind::QTapSTG {
-                sink_ptr: 0,
+            invoke_fallback(&Op::QTapSTG { sink_ptr: 0,
                 step_index_ptr: 0,
                 dtype: DType::F32,
                 q_dim: SymDim::Concrete(4096),
                 position: crate::compiler::graph::QTapPosition::LastToken,
-                num_slots: 4,
-            }),
+                num_slots: 4, }),
             OpClass::Opaque
         );
         assert_eq!(
-            invoke_fallback(&OpKind::StoreToken),
+            invoke_fallback(&Op::StoreToken),
             OpClass::Opaque
         );
         assert_eq!(
-            invoke_fallback(&OpKind::CheckStopCondition),
+            invoke_fallback(&Op::CheckStopCondition),
             OpClass::Opaque
         );
         assert_eq!(
-            invoke_fallback(&OpKind::WriteLogits { target_indices: vec![] }),
+            invoke_fallback(&Op::WriteLogits { target_indices: vec![] }),
             OpClass::Opaque
         );
         assert_eq!(
-            invoke_fallback(&OpKind::MlaAttention {
-                seq_len: SymDim::Concrete(128),
+            invoke_fallback(&Op::MlaAttention(MlaSpec { seq_len: SymDim::Concrete(128),
                 num_heads: 32,
                 head_dim: 128,
                 d_c: 512,
                 d_rope: 64,
                 causal: true,
-                kv_source: KvSource::FromTensor }),
+                kv_source: KvSource::FromTensor })),
             OpClass::Opaque
         );
     }
 
     /// Helper to call the private fallback_op_class method.
-    fn invoke_fallback(kind: &OpKind) -> OpClass {
+    fn invoke_fallback(op: &Op) -> OpClass {
         // Use from_graph with an empty registry so it hits the fallback path.
         let mut graph = CompilerGraph::new();
         let tin = graph.add_tensor_concrete("in", &[4, 4], DType::F32);
         let tout = graph.add_tensor_concrete("out", &[4, 4], DType::F32);
-        graph.add_op(kind.clone(), vec![tin], vec![tout], "test_op");
+        graph.add_op(op.clone(), vec![tin], vec![tout], "test_op");
 
         let registry = ScalarOpRegistry::new(); // empty — no traces registered
         let dag = SemanticDAG::from_graph(&graph, &registry);
@@ -1043,14 +970,14 @@ mod tests {
         let mut graph = CompilerGraph::new();
         let input = graph.add_tensor_concrete("x", &[4, 8], DType::F32);
         let output = graph.add_tensor_concrete("y", &[4, 8], DType::F32);
-        graph.add_op_with_op(Op::Silu, OpKind::Silu, vec![input], vec![output], "silu");
+        graph.add_op(Op::Silu, vec![input], vec![output], "silu");
         let registry = ScalarOpRegistry::with_defaults();
         // Act
         let dag = SemanticDAG::from_graph(&graph, &registry);
         // Assert
         assert_eq!(dag.num_nodes(), 1);
         let node = dag.node(OpId(0)).expect("node should exist");
-        assert_eq!(node.op_kind, OpKind::Silu);
+        assert_eq!(node.op_v2, Op::Silu);
         assert_eq!(node.op_class, OpClass::ElemWise);
         assert!(node.op_trace.is_some(), "registry should have Silu trace");
         assert_eq!(node.inputs, vec![input]);
@@ -1065,13 +992,7 @@ mod tests {
         let a = graph.add_tensor_concrete("A", &[4, 8], DType::F32);
         let b = graph.add_tensor_concrete("B", &[8, 16], DType::F32);
         let c = graph.add_tensor_concrete("C", &[4, 16], DType::F32);
-        graph.add_op_with_op(Op::Gemm(GemmSpec { m: SymDim::Concrete(4), n: 16, k: 8, dtype: DType::F32, trans_b: false, has_bias: false }), OpKind::Gemm {
-                m: SymDim::Concrete(4),
-                n: 16,
-                k: 8,
-                dtype: DType::F32,
-                trans_b: false,
-            },
+        graph.add_op(Op::Gemm(GemmSpec { m: SymDim::Concrete(4), n: 16, k: 8, dtype: DType::F32, trans_b: false, has_bias: false }),
             vec![a, b],
             vec![c],
             "gemm",
@@ -1099,12 +1020,12 @@ mod tests {
         let weight = graph.add_tensor_concrete("w", &[32], DType::F32);
         let normed = graph.add_tensor_concrete("normed", &[4, 32], DType::F32);
         let activated = graph.add_tensor_concrete("activated", &[4, 32], DType::F32);
-        graph.add_op_with_op(Op::RmsNorm(NormSpec { feature_dim: 4096, eps: 1e-5, dtype: DType::F32, has_weight: true }), OpKind::RmsNorm { feature_dim: 4096, eps: 1e-5 },
+        graph.add_op(Op::RmsNorm(NormSpec { feature_dim: 4096, eps: 1e-5, dtype: DType::F32, has_weight: true }),
             vec![input, weight],
             vec![normed],
             "rms_norm",
         );
-        graph.add_op_with_op(Op::Silu, OpKind::Silu, vec![normed], vec![activated], "silu");
+        graph.add_op(Op::Silu, vec![normed], vec![activated], "silu");
 
         let registry = ScalarOpRegistry::with_defaults();
         // Act
@@ -1128,14 +1049,14 @@ mod tests {
         let mut graph = CompilerGraph::new();
         let tin = graph.add_tensor_concrete("in", &[4], DType::F32);
         let tout = graph.add_tensor_concrete("out", &[4], DType::F32);
-        let op_id = graph.add_op_with_op(Op::Tanh, OpKind::Tanh, vec![tin], vec![tout], "tanh");
+        let op_id = graph.add_op(Op::Tanh, vec![tin], vec![tout], "tanh");
         let registry = ScalarOpRegistry::with_defaults();
         let dag = SemanticDAG::from_graph(&graph, &registry);
         // Act
         let node = dag.node(op_id);
         // Assert
         assert!(node.is_some());
-        assert_eq!(node.unwrap().op_kind, OpKind::Tanh);
+        assert_eq!(node.unwrap().op_v2, Op::Tanh);
     }
 
     #[test]
@@ -1160,8 +1081,8 @@ mod tests {
         let b = graph.add_tensor_concrete("b", &[4, 8], DType::F32);
         let sum = graph.add_tensor_concrete("sum", &[4, 8], DType::F32);
         let sm_out = graph.add_tensor_concrete("sm_out", &[4, 8], DType::F32);
-        graph.add_op_with_op(Op::Add, OpKind::Add, vec![a, b], vec![sum], "add");
-        graph.add_op_with_op(Op::Softmax, OpKind::Softmax, vec![sum], vec![sm_out], "softmax");
+        graph.add_op(Op::Add, vec![a, b], vec![sum], "add");
+        graph.add_op(Op::Softmax, vec![sum], vec![sm_out], "softmax");
 
         let registry = ScalarOpRegistry::with_defaults();
         let dag = SemanticDAG::from_graph(&graph, &registry);
@@ -1198,12 +1119,7 @@ mod tests {
         let input = graph.add_tensor_concrete("img", &[3, 224, 224], DType::F32);
         let weight = graph.add_tensor_concrete("patch_w", &[1152, 3 * 14 * 14], DType::F32);
         let output = graph.add_tensor_concrete("patches", &[256, 1152], DType::F32);
-        graph.add_op_with_op(Op::PatchEmbed { patch_size: 14, embed_dim: 1152, in_channels: 3, image_size: 224 }, OpKind::PatchEmbed {
-                patch_size: 14,
-                in_channels: 3,
-                embed_dim: 1152,
-                image_size: 224,
-            },
+        graph.add_op(Op::PatchEmbed { patch_size: 14, embed_dim: 1152, in_channels: 3, image_size: 224 },
             vec![input, weight],
             vec![output],
             "patch_embed",
@@ -1223,11 +1139,7 @@ mod tests {
         let input = graph.add_tensor_concrete("audio", &[128, 512], DType::F32);
         let weight = graph.add_tensor_concrete("dw_w", &[512, 7], DType::F32);
         let output = graph.add_tensor_concrete("conv_out", &[128, 512], DType::F32);
-        graph.add_op_with_op(Op::DepthwiseConv1D { channels: 512, kernel_size: 7, causal: false }, OpKind::DepthwiseConv1D {
-                channels: 512,
-                kernel_size: 7,
-                causal: false,
-            },
+        graph.add_op(Op::DepthwiseConv1D { channels: 512, kernel_size: 7, causal: false },
             vec![input, weight],
             vec![output],
             "dw_conv",
@@ -1249,8 +1161,8 @@ mod tests {
         let shared = graph.add_tensor_concrete("shared", &[4, 8], DType::F32);
         let out_a = graph.add_tensor_concrete("out_a", &[4, 8], DType::F32);
         let out_b = graph.add_tensor_concrete("out_b", &[4, 8], DType::F32);
-        graph.add_op_with_op(Op::Silu, OpKind::Silu, vec![shared], vec![out_a], "consumer_a");
-        graph.add_op_with_op(Op::Gelu, OpKind::Gelu, vec![shared], vec![out_b], "consumer_b");
+        graph.add_op(Op::Silu, vec![shared], vec![out_a], "consumer_a");
+        graph.add_op(Op::Gelu, vec![shared], vec![out_b], "consumer_b");
 
         let registry = ScalarOpRegistry::with_defaults();
         let dag = SemanticDAG::from_graph(&graph, &registry);
@@ -1268,7 +1180,7 @@ mod tests {
         let input = graph.add_tensor_concrete("graph_in", &[4, 8], DType::F32);
         let output = graph.add_tensor_concrete("graph_out", &[4, 8], DType::F32);
         graph.inputs.push(input);
-        graph.add_op_with_op(Op::Silu, OpKind::Silu, vec![input], vec![output], "silu");
+        graph.add_op(Op::Silu, vec![input], vec![output], "silu");
 
         let registry = ScalarOpRegistry::with_defaults();
         let dag = SemanticDAG::from_graph(&graph, &registry);
@@ -1289,13 +1201,7 @@ mod tests {
         let a = graph.add_tensor_concrete("A", &[1, 4], DType::F32);
         let b = graph.add_tensor_concrete("B", &[4, 4], DType::F32);
         let c = graph.add_tensor_concrete("C", &[1, 4], DType::F32);
-        graph.add_op_with_op(Op::Gemm(GemmSpec { m: SymDim::Concrete(1), n: 4, k: 4, dtype: DType::F32, trans_b: false, has_bias: false }), OpKind::Gemm {
-                m: SymDim::Concrete(1),
-                n: 4,
-                k: 4,
-                dtype: DType::F32,
-                trans_b: false,
-            },
+        graph.add_op(Op::Gemm(GemmSpec { m: SymDim::Concrete(1), n: 4, k: 4, dtype: DType::F32, trans_b: false, has_bias: false }),
             vec![a, b],
             vec![c],
             "tiny_gemm",
@@ -1318,13 +1224,7 @@ mod tests {
         let a = graph.add_tensor_concrete("A", &[512, 512], DType::F32);
         let b = graph.add_tensor_concrete("B", &[512, 1024], DType::F32);
         let c = graph.add_tensor_concrete("C", &[512, 1024], DType::F32);
-        graph.add_op_with_op(Op::Gemm(GemmSpec { m: SymDim::Concrete(512), n: 1024, k: 512, dtype: DType::F32, trans_b: false, has_bias: false }), OpKind::Gemm {
-                m: SymDim::Concrete(512),
-                n: 1024,
-                k: 512,
-                dtype: DType::F32,
-                trans_b: false,
-            },
+        graph.add_op(Op::Gemm(GemmSpec { m: SymDim::Concrete(512), n: 1024, k: 512, dtype: DType::F32, trans_b: false, has_bias: false }),
             vec![a, b],
             vec![c],
             "large_gemm",
@@ -1345,7 +1245,7 @@ mod tests {
         let mut graph = CompilerGraph::new();
         let input = graph.add_tensor_concrete("x", &[4, 8], DType::F32);
         let output = graph.add_tensor_concrete("y", &[4, 8], DType::F32);
-        graph.add_op_with_op(Op::Silu, OpKind::Silu, vec![input], vec![output], "silu");
+        graph.add_op(Op::Silu, vec![input], vec![output], "silu");
         let registry = ScalarOpRegistry::with_defaults();
         // Act
         let dag = SemanticDAG::from_graph(&graph, &registry);
@@ -1367,13 +1267,7 @@ mod tests {
         let a = graph.add_tensor_concrete("A", &[16, 128], DType::F32);
         let b = graph.add_tensor_concrete("B", &[128, 64], DType::F32);
         let c = graph.add_tensor_concrete("C", &[16, 64], DType::F32);
-        graph.add_op_with_op(Op::Gemm(GemmSpec { m: SymDim::Concrete(16), n: 64, k: 128, dtype: DType::F32, trans_b: false, has_bias: false }), OpKind::Gemm {
-                m: SymDim::Concrete(16),
-                n: 64,
-                k: 128,
-                dtype: DType::F32,
-                trans_b: false,
-            },
+        graph.add_op(Op::Gemm(GemmSpec { m: SymDim::Concrete(16), n: 64, k: 128, dtype: DType::F32, trans_b: false, has_bias: false }),
             vec![a, b],
             vec![c],
             "medium_gemm",
@@ -1423,13 +1317,7 @@ mod tests {
         let a = graph.add_tensor_concrete("A", &[512, 512], DType::F32);
         let b = graph.add_tensor_concrete("B", &[512, 1024], DType::F32);
         let c = graph.add_tensor_concrete("C", &[512, 1024], DType::F32);
-        graph.add_op_with_op(Op::Gemm(GemmSpec { m: SymDim::Concrete(512), n: 1024, k: 512, dtype: DType::F32, trans_b: false, has_bias: false }), OpKind::Gemm {
-                m: SymDim::Concrete(512),
-                n: 1024,
-                k: 512,
-                dtype: DType::F32,
-                trans_b: false,
-            },
+        graph.add_op(Op::Gemm(GemmSpec { m: SymDim::Concrete(512), n: 1024, k: 512, dtype: DType::F32, trans_b: false, has_bias: false }),
             vec![a, b],
             vec![c],
             "gemm",
@@ -1452,8 +1340,8 @@ mod tests {
         let x = graph.add_tensor_concrete("x", &[4, 8], DType::F32);
         let y = graph.add_tensor_concrete("y", &[4, 8], DType::F32);
         let z = graph.add_tensor_concrete("z", &[4, 8], DType::F32);
-        graph.add_op_with_op(Op::Silu, OpKind::Silu, vec![x], vec![y], "silu");
-        graph.add_op_with_op(Op::Tanh, OpKind::Tanh, vec![y], vec![z], "tanh");
+        graph.add_op(Op::Silu, vec![x], vec![y], "silu");
+        graph.add_op(Op::Tanh, vec![y], vec![z], "tanh");
 
         let registry = ScalarOpRegistry::with_defaults();
         let dag = SemanticDAG::from_graph(&graph, &registry);
@@ -1470,7 +1358,7 @@ mod tests {
         let mut graph = CompilerGraph::new();
         let x = graph.add_tensor_concrete("x", &[2, 2], DType::F32);
         let y = graph.add_tensor_concrete("y", &[2, 2], DType::F32);
-        graph.add_op_with_op(Op::Silu, OpKind::Silu, vec![x], vec![y], "silu");
+        graph.add_op(Op::Silu, vec![x], vec![y], "silu");
 
         let registry = ScalarOpRegistry::with_defaults();
         let dag = SemanticDAG::from_graph(&graph, &registry);
@@ -1493,7 +1381,7 @@ mod tests {
         let output = graph.add_tensor_concrete("y", &[4, 8], DType::F32);
         graph.inputs.push(input);
         graph.outputs.push(output);
-        graph.add_op_with_op(Op::Silu, OpKind::Silu, vec![input], vec![output], "silu");
+        graph.add_op(Op::Silu, vec![input], vec![output], "silu");
 
         let registry = ScalarOpRegistry::with_defaults();
         // Act
@@ -1513,9 +1401,9 @@ mod tests {
         let t1 = graph.add_tensor_concrete("t1", &[4], DType::F32);
         let t2 = graph.add_tensor_concrete("t2", &[4], DType::F32);
         let t3 = graph.add_tensor_concrete("t3", &[4], DType::F32);
-        graph.add_op_with_op(Op::Tanh, OpKind::Tanh, vec![t0], vec![t1], "a");
-        graph.add_op_with_op(Op::Silu, OpKind::Silu, vec![t1], vec![t2], "b");
-        graph.add_op_with_op(Op::Gelu, OpKind::Gelu, vec![t2], vec![t3], "c");
+        graph.add_op(Op::Tanh, vec![t0], vec![t1], "a");
+        graph.add_op(Op::Silu, vec![t1], vec![t2], "b");
+        graph.add_op(Op::Gelu, vec![t2], vec![t3], "c");
 
         let registry = ScalarOpRegistry::with_defaults();
         // Act
@@ -1537,8 +1425,8 @@ mod tests {
         let a1 = graph.add_tensor_concrete("a1", &[4], DType::F32);
         let b0 = graph.add_tensor_concrete("b0", &[4], DType::F32);
         let b1 = graph.add_tensor_concrete("b1", &[4], DType::F32);
-        graph.add_op_with_op(Op::Tanh, OpKind::Tanh, vec![a0], vec![a1], "chain_a");
-        graph.add_op_with_op(Op::Silu, OpKind::Silu, vec![b0], vec![b1], "chain_b");
+        graph.add_op(Op::Tanh, vec![a0], vec![a1], "chain_a");
+        graph.add_op(Op::Silu, vec![b0], vec![b1], "chain_b");
 
         let registry = ScalarOpRegistry::with_defaults();
         // Act
@@ -1559,9 +1447,9 @@ mod tests {
         let branch_a = graph.add_tensor_concrete("a", &[4, 8], DType::F32);
         let branch_b = graph.add_tensor_concrete("b", &[4, 8], DType::F32);
         let merged = graph.add_tensor_concrete("out", &[4, 8], DType::F32);
-        graph.add_op_with_op(Op::Tanh, OpKind::Tanh, vec![input], vec![branch_a], "branch_a");
-        graph.add_op_with_op(Op::Silu, OpKind::Silu, vec![input], vec![branch_b], "branch_b");
-        graph.add_op_with_op(Op::Add, OpKind::Add, vec![branch_a, branch_b], vec![merged], "merge");
+        graph.add_op(Op::Tanh, vec![input], vec![branch_a], "branch_a");
+        graph.add_op(Op::Silu, vec![input], vec![branch_b], "branch_b");
+        graph.add_op(Op::Add, vec![branch_a, branch_b], vec![merged], "merge");
 
         let registry = ScalarOpRegistry::with_defaults();
         // Act
@@ -1586,12 +1474,7 @@ mod tests {
         let a = graph.add_tensor_concrete("A", &[16, 128], DType::F32);
         let b = graph.add_tensor_concrete("B", &[128, 64], DType::F32);
         let c = graph.add_tensor_concrete("C", &[16, 64], DType::F32);
-        graph.add_op_with_op(Op::QuantGemm(QuantGemmSpec { m: SymDim::Concrete(16), n: 64, k: 128, quant_type: QuantType::Q4_0 }), OpKind::QuantGemm {
-                m: SymDim::Concrete(16),
-                n: 64,
-                k: 128,
-                quant_type: QuantType::Q4_0,
-            },
+        graph.add_op(Op::QuantGemm(QuantGemmSpec { m: SymDim::Concrete(16), n: 64, k: 128, quant_type: QuantType::Q4_0 }),
             vec![a, b],
             vec![c],
             "qgemm",
@@ -1619,7 +1502,7 @@ mod tests {
         let b = graph.add_tensor_concrete("B", &[k, n], DType::F32);
         let bias = graph.add_tensor_concrete("bias", &[n], DType::F32);
         let c = graph.add_tensor_concrete("C", &[m, n], DType::F32);
-        graph.add_op_with_op(Op::GemmBias(GemmSpec { m: SymDim::Concrete(m), n: n, k: k, dtype: DType::F32, trans_b: false, has_bias: true }), OpKind::GemmBias { m: SymDim::Concrete(m), n, k, dtype: DType::F32, trans_b: false },
+        graph.add_op(Op::GemmBias(GemmSpec { m: SymDim::Concrete(m), n: n, k: k, dtype: DType::F32, trans_b: false, has_bias: true }),
             vec![a, b, bias],
             vec![c],
             "gemm_bias",
@@ -1644,7 +1527,7 @@ mod tests {
         let mut graph = CompilerGraph::new();
         let tin = graph.add_tensor_concrete("in", &[4], DType::F32);
         let tout = graph.add_tensor_concrete("out", &[4], DType::F32);
-        graph.add_op_with_op(Op::Silu, OpKind::Silu, vec![tin], vec![tout], "silu");
+        graph.add_op(Op::Silu, vec![tin], vec![tout], "silu");
         let registry = ScalarOpRegistry::with_defaults();
         // Act
         let dag = SemanticDAG::from_graph(&graph, &registry);
@@ -1658,7 +1541,7 @@ mod tests {
         let mut graph = CompilerGraph::new();
         let tin = graph.add_tensor_concrete("in", &[4], DType::F32);
         let tout = graph.add_tensor_concrete("out", &[4], DType::F32);
-        graph.add_op_with_op(Op::Silu, OpKind::Silu, vec![tin], vec![tout], "silu");
+        graph.add_op(Op::Silu, vec![tin], vec![tout], "silu");
         let registry = ScalarOpRegistry::new(); // empty registry
         // Act
         let dag = SemanticDAG::from_graph(&graph, &registry);
@@ -1699,7 +1582,7 @@ mod tests {
         let input = graph.add_tensor_concrete("x", &[2, 4], DType::F32);
         let weight = graph.add_tensor_concrete("w", &[4], DType::F32);
         let output = graph.add_tensor_concrete("y", &[2, 4], DType::F32);
-        let op_id = graph.add_op_with_op(Op::RmsNorm(NormSpec { feature_dim: 4096, eps: 1e-6, dtype: DType::F32, has_weight: true }), OpKind::RmsNorm { feature_dim: 4096, eps: 1e-6 },
+        let op_id = graph.add_op(Op::RmsNorm(NormSpec { feature_dim: 4096, eps: 1e-6, dtype: DType::F32, has_weight: true }),
             vec![input, weight],
             vec![output],
             "norm",
@@ -1711,7 +1594,7 @@ mod tests {
         let node = dag.node(op_id).expect("node should exist");
         // Assert
         assert_eq!(node.node_id, op_id);
-        assert_eq!(node.op_kind, OpKind::RmsNorm { feature_dim: 4096, eps: 1e-6 });
+        assert_eq!(node.op_v2, Op::RmsNorm(NormSpec { feature_dim: 4096, eps: 1e-6, dtype: DType::F32, has_weight: true }));
         assert_eq!(node.op_class, OpClass::Reduction);
         assert_eq!(node.inputs, vec![input, weight]);
         assert_eq!(node.outputs, vec![output]);
@@ -1736,9 +1619,9 @@ mod tests {
 
         let w = graph.add_tensor_concrete("w", &[4, 8], DType::F32);
 
-        graph.add_op_with_op(Op::Silu, OpKind::Silu, vec![x], vec![y], "silu");
-        graph.add_op_with_op(Op::Tanh, OpKind::Tanh, vec![y], vec![z], "tanh");
-        graph.add_op_with_op(Op::Gemm(GemmSpec { m: SymDim::Concrete(512), n: 1024, k: 512, dtype: DType::F32, trans_b: false, has_bias: false }), OpKind::Gemm { m: SymDim::Concrete(512), n: 1024, k: 512, dtype: DType::F32, trans_b: false },
+        graph.add_op(Op::Silu, vec![x], vec![y], "silu");
+        graph.add_op(Op::Tanh, vec![y], vec![z], "tanh");
+        graph.add_op(Op::Gemm(GemmSpec { m: SymDim::Concrete(512), n: 1024, k: 512, dtype: DType::F32, trans_b: false, has_bias: false }),
             vec![a, b],
             vec![c],
             "gemm",
@@ -1759,12 +1642,12 @@ mod tests {
 
         let x = graph.add_tensor_concrete("x", &[4, 8], DType::F32);
         let y = graph.add_tensor_concrete("y", &[4, 8], DType::F32);
-        graph.add_op_with_op(Op::Silu, OpKind::Silu, vec![x], vec![y], "silu");
+        graph.add_op(Op::Silu, vec![x], vec![y], "silu");
 
         let a1 = graph.add_tensor_concrete("A1", &[512, 512], DType::F32);
         let b1 = graph.add_tensor_concrete("B1", &[512, 1024], DType::F32);
         let c1 = graph.add_tensor_concrete("C1", &[512, 1024], DType::F32);
-        graph.add_op_with_op(Op::Gemm(GemmSpec { m: SymDim::Concrete(512), n: 1024, k: 512, dtype: DType::F32, trans_b: false, has_bias: false }), OpKind::Gemm { m: SymDim::Concrete(512), n: 1024, k: 512, dtype: DType::F32, trans_b: false },
+        graph.add_op(Op::Gemm(GemmSpec { m: SymDim::Concrete(512), n: 1024, k: 512, dtype: DType::F32, trans_b: false, has_bias: false }),
             vec![a1, b1],
             vec![c1],
             "gemm1",
@@ -1773,7 +1656,7 @@ mod tests {
         let a2 = graph.add_tensor_concrete("A2", &[512, 512], DType::F32);
         let b2 = graph.add_tensor_concrete("B2", &[512, 1024], DType::F32);
         let c2 = graph.add_tensor_concrete("C2", &[512, 1024], DType::F32);
-        graph.add_op_with_op(Op::Gemm(GemmSpec { m: SymDim::Concrete(512), n: 1024, k: 512, dtype: DType::F32, trans_b: false, has_bias: false }), OpKind::Gemm { m: SymDim::Concrete(512), n: 1024, k: 512, dtype: DType::F32, trans_b: false },
+        graph.add_op(Op::Gemm(GemmSpec { m: SymDim::Concrete(512), n: 1024, k: 512, dtype: DType::F32, trans_b: false, has_bias: false }),
             vec![a2, b2],
             vec![c2],
             "gemm2",
@@ -1798,7 +1681,7 @@ mod tests {
         let input = graph.add_tensor_concrete("x", &[2, 32], DType::F32);
         let weight = graph.add_tensor_concrete("w", &[32], DType::F32);
         let output = graph.add_tensor_concrete("y", &[2, 32], DType::F32);
-        graph.add_op_with_op(Op::RmsNorm(NormSpec { feature_dim: 4096, eps: 1e-5, dtype: DType::F32, has_weight: true }), OpKind::RmsNorm { feature_dim: 4096, eps: 1e-5 },
+        graph.add_op(Op::RmsNorm(NormSpec { feature_dim: 4096, eps: 1e-5, dtype: DType::F32, has_weight: true }),
             vec![input, weight],
             vec![output],
             "rms_norm",
@@ -1843,7 +1726,7 @@ mod tests {
         let a = graph.add_tensor_concrete("a", &[1, 1], DType::F32);
         let b = graph.add_tensor_concrete("b", &[1, 1], DType::F32);
         let c = graph.add_tensor_concrete("c", &[1, 1], DType::F32);
-        graph.add_op_with_op(Op::Mul, OpKind::Mul, vec![a, b], vec![c], "mul");
+        graph.add_op(Op::Mul, vec![a, b], vec![c], "mul");
 
         let registry = ScalarOpRegistry::with_defaults();
         let dag = SemanticDAG::from_graph(&graph, &registry);
@@ -1866,9 +1749,9 @@ mod tests {
         let y = graph.add_tensor_concrete("y", &[4, 32], DType::F32);
         let z = graph.add_tensor_concrete("z", &[4, 32], DType::F32);
         let w = graph.add_tensor_concrete("w", &[4, 32], DType::F32);
-        graph.add_op_with_op(Op::Silu, OpKind::Silu, vec![x], vec![y], "silu1");
-        graph.add_op_with_op(Op::Silu, OpKind::Silu, vec![y], vec![z], "silu2");
-        graph.add_op_with_op(Op::Silu, OpKind::Silu, vec![z], vec![w], "silu3");
+        graph.add_op(Op::Silu, vec![x], vec![y], "silu1");
+        graph.add_op(Op::Silu, vec![y], vec![z], "silu2");
+        graph.add_op(Op::Silu, vec![z], vec![w], "silu3");
 
         let registry = ScalarOpRegistry::with_defaults();
         let dag = SemanticDAG::from_graph(&graph, &registry);
@@ -1890,7 +1773,7 @@ mod tests {
         let mut graph = CompilerGraph::new();
         let input = graph.add_tensor_concrete("x", &[8, 16], DType::F32);
         let output = graph.add_tensor_concrete("y", &[8, 16], DType::F32);
-        graph.add_op_with_op(Op::Gelu, OpKind::Gelu, vec![input], vec![output], "gelu");
+        graph.add_op(Op::Gelu, vec![input], vec![output], "gelu");
         let registry = ScalarOpRegistry::with_defaults();
         // Act
         let dag = SemanticDAG::from_graph(&graph, &registry);
@@ -1917,7 +1800,7 @@ mod tests {
         let a = graph.add_tensor_concrete("a", &[4, 16], DType::F32);
         let b = graph.add_tensor_concrete("b", &[4, 16], DType::F32);
         let out = graph.add_tensor_concrete("out", &[4, 16], DType::F32);
-        graph.add_op_with_op(Op::Residual, OpKind::Residual, vec![a, b], vec![out], "residual");
+        graph.add_op(Op::Residual, vec![a, b], vec![out], "residual");
         let registry = ScalarOpRegistry::with_defaults();
         // Act
         let dag = SemanticDAG::from_graph(&graph, &registry);
@@ -1941,9 +1824,9 @@ mod tests {
         let t1 = graph.add_tensor_concrete("t1", &[4], DType::F32);
         let t2 = graph.add_tensor_concrete("t2", &[4], DType::F32);
         let t3 = graph.add_tensor_concrete("t3", &[4], DType::F32);
-        let op0 = graph.add_op_with_op(Op::Silu, OpKind::Silu, vec![t0], vec![t1], "op0");
-        let op1 = graph.add_op_with_op(Op::Gelu, OpKind::Gelu, vec![t1], vec![t2], "op1");
-        let op2 = graph.add_op_with_op(Op::Tanh, OpKind::Tanh, vec![t2], vec![t3], "op2");
+        let op0 = graph.add_op(Op::Silu, vec![t0], vec![t1], "op0");
+        let op1 = graph.add_op(Op::Gelu, vec![t1], vec![t2], "op1");
+        let op2 = graph.add_op(Op::Tanh, vec![t2], vec![t3], "op2");
         let registry = ScalarOpRegistry::with_defaults();
         // Act
         let dag = SemanticDAG::from_graph(&graph, &registry);
@@ -1965,7 +1848,7 @@ mod tests {
         let mut graph = CompilerGraph::new();
         let input = graph.add_tensor_concrete("x", &[8, 16], DType::F32);
         let output = graph.add_tensor_concrete("y", &[8, 16], DType::F32);
-        graph.add_op_with_op(Op::Silu, OpKind::Silu, vec![input], vec![output], "silu");
+        graph.add_op(Op::Silu, vec![input], vec![output], "silu");
         let registry = ScalarOpRegistry::with_defaults();
         // Act
         let dag = SemanticDAG::from_graph(&graph, &registry);
@@ -1987,10 +1870,10 @@ mod tests {
         let c = graph.add_tensor_concrete("c", &[4], DType::F32);
         let d = graph.add_tensor_concrete("d", &[4], DType::F32);
         let sm = graph.add_tensor_concrete("sm", &[4], DType::F32);
-        graph.add_op_with_op(Op::Silu, OpKind::Silu, vec![a], vec![b], "silu");
-        graph.add_op_with_op(Op::Tanh, OpKind::Tanh, vec![b], vec![c], "tanh");
-        graph.add_op_with_op(Op::Gelu, OpKind::Gelu, vec![c], vec![d], "gelu");
-        graph.add_op_with_op(Op::Softmax, OpKind::Softmax, vec![d], vec![sm], "softmax");
+        graph.add_op(Op::Silu, vec![a], vec![b], "silu");
+        graph.add_op(Op::Tanh, vec![b], vec![c], "tanh");
+        graph.add_op(Op::Gelu, vec![c], vec![d], "gelu");
+        graph.add_op(Op::Softmax, vec![d], vec![sm], "softmax");
 
         let registry = ScalarOpRegistry::with_defaults();
         let dag = SemanticDAG::from_graph(&graph, &registry);
@@ -2011,15 +1894,15 @@ mod tests {
     #[test]
     fn test_fallback_op_class_business_config_ops() {
         // Arrange & Act & Assert -- side-effect / control ops all map to Opaque
-        assert_eq!(invoke_fallback(&OpKind::WriteLogits { target_indices: vec![0, 2] }), OpClass::Opaque);
-        assert_eq!(invoke_fallback(&OpKind::EarlyExit { anchor_layer: 16 }), OpClass::Opaque);
-        assert_eq!(invoke_fallback(&OpKind::GuardrailCheck { probe_offset: 0 }), OpClass::Opaque);
-        assert_eq!(invoke_fallback(&OpKind::SgInject { knowledge_offset: 0, dim: 4096 }), OpClass::Opaque);
-        assert_eq!(invoke_fallback(&OpKind::SgDetect { detect_offset: 0, hidden_dim: 0 }), OpClass::Opaque);
-        assert_eq!(invoke_fallback(&OpKind::CotStepCheck { shared_mem_offset: 0 }), OpClass::Opaque);
-        assert_eq!(invoke_fallback(&OpKind::SessionKvRestore), OpClass::Opaque);
-        assert_eq!(invoke_fallback(&OpKind::MmHiddenInject { hidden_dim: 4096 }), OpClass::Opaque);
-        assert_eq!(invoke_fallback(&OpKind::MtpDraft { depth: 4, hidden_size: 4096, vocab_size: 32000 }), OpClass::Opaque);
+        assert_eq!(invoke_fallback(&Op::WriteLogits { target_indices: vec![0, 2] }), OpClass::Opaque);
+        assert_eq!(invoke_fallback(&Op::EarlyExit { anchor_layer: 16 }), OpClass::Opaque);
+        assert_eq!(invoke_fallback(&Op::GuardrailCheck { probe_offset: 0 }), OpClass::Opaque);
+        assert_eq!(invoke_fallback(&Op::SgInject { knowledge_offset: 0, dim: 4096 }), OpClass::Opaque);
+        assert_eq!(invoke_fallback(&Op::SgDetect { detect_offset: 0, hidden_dim: 0 }), OpClass::Opaque);
+        assert_eq!(invoke_fallback(&Op::CotStepCheck { shared_mem_offset: 0 }), OpClass::Opaque);
+        assert_eq!(invoke_fallback(&Op::SessionKvRestore), OpClass::Opaque);
+        assert_eq!(invoke_fallback(&Op::MmHiddenInject { hidden_dim: 4096 }), OpClass::Opaque);
+        assert_eq!(invoke_fallback(&Op::MtpDraft { depth: 4, hidden_size: 4096, vocab_size: 32000 }), OpClass::Opaque);
     }
 
     // ── can_register_pass heuristic: single consumer ──
@@ -2031,8 +1914,8 @@ mod tests {
         let a = graph.add_tensor_concrete("a", &[4, 8], DType::F32);
         let b = graph.add_tensor_concrete("b", &[4, 8], DType::F32);
         let c = graph.add_tensor_concrete("c", &[4, 8], DType::F32);
-        graph.add_op_with_op(Op::Silu, OpKind::Silu, vec![a], vec![b], "silu");
-        graph.add_op_with_op(Op::Tanh, OpKind::Tanh, vec![b], vec![c], "tanh");
+        graph.add_op(Op::Silu, vec![a], vec![b], "silu");
+        graph.add_op(Op::Tanh, vec![b], vec![c], "tanh");
 
         let registry = ScalarOpRegistry::with_defaults();
         let dag = SemanticDAG::from_graph(&graph, &registry);
@@ -2048,15 +1931,15 @@ mod tests {
     #[test]
     fn test_num_nodes_consistent_with_vec_len() {
         // Arrange: build a graph with varying numbers of ops
-        let cases: Vec<Vec<OpKind>> = vec![
+        let cases: Vec<Vec<Op>> = vec![
             vec![],
-            vec![OpKind::Silu],
-            vec![OpKind::Silu, OpKind::Gelu, OpKind::Tanh],
+            vec![Op::Silu],
+            vec![Op::Silu, Op::Gelu, Op::Tanh],
         ];
         for ops in cases {
             let mut graph = CompilerGraph::new();
             let mut prev = None;
-            for (i, kind) in ops.iter().enumerate() {
+            for (i, op) in ops.iter().enumerate() {
                 let out_name = format!("out_{}", i);
                 let out = graph.add_tensor_concrete(&out_name, &[4], DType::F32);
                 let inputs: Vec<TensorId> = if let Some(p) = prev {
@@ -2064,7 +1947,7 @@ mod tests {
                 } else {
                     vec![graph.add_tensor_concrete("start", &[4], DType::F32)]
                 };
-                graph.add_op(kind.clone(), inputs, vec![out], &format!("op{}", i));
+                graph.add_op(op.clone(), inputs, vec![out], &format!("op{}", i));
                 prev = Some(out);
             }
             let registry = ScalarOpRegistry::new();

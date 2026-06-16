@@ -11,13 +11,13 @@ mod tests {
     use crate::types::DType;
     use std::collections::HashMap;
 
-    fn build_unary(kind: OpKind) -> (CompilerGraph, FusionPlan, BufferAllocation) {
+    fn build_unary(op: Op) -> (CompilerGraph, FusionPlan, BufferAllocation) {
         let mut g = CompilerGraph::new();
         let inp = g.add_tensor_concrete("input", &[32], DType::F32);
         let out = g.add_tensor_concrete("output", &[32], DType::F32);
         g.inputs = vec![inp];
         g.outputs = vec![out];
-        let op = g.add_op(kind, vec![inp], vec![out], "op");
+        let op = g.add_op(op, vec![inp], vec![out], "op");
         let mut m = HashMap::new();
         m.insert(op, 0);
         let plan = FusionPlan {
@@ -38,7 +38,7 @@ mod tests {
 
     #[test]
     fn test_vm_compile_layer_code_size() {
-        let (g, p, a) = build_unary(OpKind::Silu);
+        let (g, p, a) = build_unary(Op::Silu);
         let profile = DeviceProfile::detect();
         let exec_plan = crate::compiler::planner::ExecutionPlan::from_profile(&profile);
         let registry = ScalarOpRegistry::with_defaults();

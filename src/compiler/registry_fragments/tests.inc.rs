@@ -1,6 +1,6 @@
 mod tests {
     use super::*;
-    use crate::compiler::graph::OpKind;
+    use crate::compiler::graph::{Op, GemmSpec, NormSpec, RopeSpec};
 
     #[test]
     fn registry_with_defaults_has_all_ops() {
@@ -97,31 +97,32 @@ mod tests {
     }
 
     #[test]
-    fn registry_key_from_op_kind_roundtrip() {
-        let cases: Vec<(OpKind, OpKindKey)> = vec![
-            (OpKind::Silu, OpKindKey::Silu),
-            (OpKind::Gelu, OpKindKey::Gelu),
-            (OpKind::SwiGlu, OpKindKey::SwiGlu),
-            (OpKind::SwiGluClipped { limit: 7.0 }, OpKindKey::SwiGluClipped),
-            (OpKind::GeGlu, OpKindKey::GeGlu),
-            (OpKind::Add, OpKindKey::Add),
-            (OpKind::Mul, OpKindKey::Mul),
-            (OpKind::Residual, OpKindKey::Residual),
-            (OpKind::Softmax, OpKindKey::Softmax),
-            (OpKind::RmsNorm { feature_dim: 4096, eps: 1e-6 }, OpKindKey::RmsNorm),
-            (OpKind::LayerNorm { feature_dim: 4096, eps: 1e-5 }, OpKindKey::LayerNorm),
-            (OpKind::ValueNorm { feature_dim: 4096, eps: 1e-6 }, OpKindKey::ValueNorm),
-            (OpKind::Gemm { m: crate::compiler::graph::SymDim::Concrete(1), n: 4096, k: 4096, dtype: DType::F32, trans_b: false }, OpKindKey::Gemm),
-            (OpKind::GemmBias { m: crate::compiler::graph::SymDim::Concrete(1), n: 4096, k: 4096, dtype: DType::F32, trans_b: false }, OpKindKey::GemmBias),
-            (OpKind::RoPE { num_heads: 0, head_dim: 128, theta: 10000.0, partial: 1.0, rope_scaling: None }, OpKindKey::RoPE),
-            (OpKind::Transpose { perm: vec![1, 0] }, OpKindKey::Transpose),
-            (OpKind::Reshape { target_shape: vec![1, 4096] }, OpKindKey::Reshape),
+    fn registry_key_from_op_roundtrip() {
+        // OE-4: OpKind enum 已删除，从 Op 派生 OpKindKey。
+        let cases: Vec<(Op, OpKindKey)> = vec![
+            (Op::Silu, OpKindKey::Silu),
+            (Op::Gelu, OpKindKey::Gelu),
+            (Op::SwiGlu, OpKindKey::SwiGlu),
+            (Op::SwiGluClipped { limit: 7.0 }, OpKindKey::SwiGluClipped),
+            (Op::GeGlu, OpKindKey::GeGlu),
+            (Op::Add, OpKindKey::Add),
+            (Op::Mul, OpKindKey::Mul),
+            (Op::Residual, OpKindKey::Residual),
+            (Op::Softmax, OpKindKey::Softmax),
+            (Op::RmsNorm(NormSpec { feature_dim: 4096, eps: 1e-6, dtype: DType::F32, has_weight: true }), OpKindKey::RmsNorm),
+            (Op::LayerNorm(NormSpec { feature_dim: 4096, eps: 1e-5, dtype: DType::F32, has_weight: true }), OpKindKey::LayerNorm),
+            (Op::ValueNorm(NormSpec { feature_dim: 4096, eps: 1e-6, dtype: DType::F32, has_weight: false }), OpKindKey::ValueNorm),
+            (Op::Gemm(GemmSpec { m: crate::compiler::graph::SymDim::Concrete(1), n: 4096, k: 4096, dtype: DType::F32, trans_b: false, has_bias: false }), OpKindKey::Gemm),
+            (Op::GemmBias(GemmSpec { m: crate::compiler::graph::SymDim::Concrete(1), n: 4096, k: 4096, dtype: DType::F32, trans_b: false, has_bias: true }), OpKindKey::GemmBias),
+            (Op::RoPE(RopeSpec { num_heads: 0, head_dim: 128, theta: 10000.0, partial: 1.0, rope_scaling: None }), OpKindKey::RoPE),
+            (Op::Transpose { perm: vec![1, 0] }, OpKindKey::Transpose),
+            (Op::Reshape { target_shape: vec![1, 4096] }, OpKindKey::Reshape),
         ];
 
-        let reg = ScalarOpRegistry::with_defaults();
-        for (kind, expected_key) in &cases {
-            let key = ScalarOpRegistry::key_from_op_kind(kind);
-            assert_eq!(&key, expected_key, "key mismatch for {kind:?}");
+        let _reg = ScalarOpRegistry::with_defaults();
+        for (op, expected_key) in &cases {
+            let key = ScalarOpRegistry::key_from_op(op);
+            assert_eq!(&key, expected_key, "key mismatch for {op:?}");
         }
     }
 

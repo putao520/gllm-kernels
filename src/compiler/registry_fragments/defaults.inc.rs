@@ -119,7 +119,7 @@ impl ScalarOpRegistry {
         // The registry template trace bakes the canonical limit=7.0 clamp
         // constants into the body. At lower time,
         // `plan_lower::extract_op_trace` rewrites the two `Const(±limit)`
-        // slots to match the `OpKind::SwiGluClipped { limit }` carried by
+        // slots to match the `Op::SwiGluClipped { limit:  }` carried by
         // each individual op, so different layers / models can share the
         // same `OpKindKey` while producing distinct clamp thresholds.
         //
@@ -288,7 +288,7 @@ impl ScalarOpRegistry {
         );
 
         // ── LogitSoftcap: cap * tanh(x / cap) ──
-        // cap is a compile-time constant from OpKind::LogitSoftcap { cap }.
+        // cap is a compile-time constant from Op::LogitSoftcap { cap:  }.
         // The trace uses placeholder constants; `try_auto_dispatch_elementwise`
         // rewrites them via parameterized trace rewrite (like SwiGluClipped).
         // Trace: x / cap → tanh → * cap
@@ -388,7 +388,7 @@ impl ScalarOpRegistry {
                         TraceOp::Input(0),    // [0] sum_sq
                         TraceOp::Input(1),    // [1] n (as float)
                         TraceOp::Div(ValueId(0), ValueId(1)),   // [2] mean = sum_sq / n
-                        TraceOp::Const(1e-5), // [3] default eps; codegen uses actual value from OpKind::RmsNorm { eps }
+                        TraceOp::Const(1e-5), // [3] default eps; codegen uses actual value from Op::RmsNorm(NormSpec { feature_dim: feature_dim, eps: , dtype: DType::F32, has_weight: true })
                         TraceOp::Add(ValueId(2), ValueId(3)),   // [4] mean + eps
                         TraceOp::Rsqrt(ValueId(4)),    // [5] rsqrt(mean + eps)
                     ],
@@ -470,7 +470,7 @@ impl ScalarOpRegistry {
                         TraceOp::Input(0),    // [0] sum_sq
                         TraceOp::Input(1),    // [1] n (as float)
                         TraceOp::Div(ValueId(0), ValueId(1)),   // [2] mean = sum_sq / n
-                        TraceOp::Const(1e-5), // [3] default eps; codegen uses actual value from OpKind::ValueNorm { eps }
+                        TraceOp::Const(1e-5), // [3] default eps; codegen uses actual value from Op::ValueNorm(NormSpec { feature_dim: feature_dim, eps: , dtype: DType::F32, has_weight: false })
                         TraceOp::Add(ValueId(2), ValueId(3)),   // [4] mean + eps
                         TraceOp::Rsqrt(ValueId(4)),    // [5] rsqrt(mean + eps)
                     ],
@@ -507,7 +507,7 @@ impl ScalarOpRegistry {
                     finalize: vec![
                         TraceOp::Input(0),    // [0] mean
                         TraceOp::Input(1),    // [1] var
-                        TraceOp::Const(1e-5), // [2] default eps; codegen uses actual value from OpKind::LayerNorm { eps }
+                        TraceOp::Const(1e-5), // [2] default eps; codegen uses actual value from Op::LayerNorm(NormSpec { feature_dim: feature_dim, eps: , dtype: DType::F32, has_weight: true })
                         TraceOp::Add(ValueId(1), ValueId(2)),   // [3] var + eps
                         TraceOp::Rsqrt(ValueId(3)),    // [4] rsqrt(var + eps)
                     ],

@@ -24,7 +24,7 @@ use super::vm_state::{HeteroPhase, EmitState, AbiPtrs};
 
 use crate::compiler::codegen::{CodegenOutput, DwcScratchRequirement, PleScratchRequirement, RopeCacheRequirement};
 use crate::compiler::fusion::{FusionPlan, FusionMode, HeteroLayerType};
-use crate::compiler::graph::{CompilerGraph, LayerCondition, OpKind, SymDim, TensorId};
+use crate::compiler::graph::{CompilerGraph, LayerCondition, SymDim, TensorId};
 use crate::compiler::buffer_alloc::{BufferAllocation, TensorPtrSource};
 use crate::compiler::registry::ScalarOpRegistry;
 use crate::compiler::trace::{QuantPrecision, TraceOp, ComputePattern, ValueId};

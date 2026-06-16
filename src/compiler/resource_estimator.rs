@@ -234,7 +234,7 @@ fn estimate_tile_rows(graph: &CompilerGraph, anchor: OpId) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::compiler::graph::{CompilerGraph, OpId, OpKind, SymDim, Op, GemmSpec, NormSpec, QuantGemmSpec, RopeSpec, AttentionSpec, AttentionGeometry, AttentionMask, SinksSpec, CachedGqaSpec, MlaSpec, DualRopeSpec};
+    use crate::compiler::graph::{CompilerGraph, OpId, SymDim, Op, GemmSpec, NormSpec, QuantGemmSpec, RopeSpec, AttentionSpec, AttentionGeometry, AttentionMask, SinksSpec, CachedGqaSpec, MlaSpec, DualRopeSpec};
     use crate::compiler::registry::ScalarOpRegistry;
     use crate::compiler::semantic_dag::SemanticDAG;
     use crate::compiler::planner::ExecutionPlan;
@@ -260,10 +260,10 @@ mod tests {
         let w = g.add_tensor_concrete("w", &[16, 16], DType::F32);
         let mid = g.add_tensor_concrete("mid", &[1, 16], DType::F32);
         let out = g.add_tensor_concrete("out", &[1, 16], DType::F32);
-        let gemm = g.add_op_with_op(Op::Gemm(GemmSpec { m: SymDim::Concrete(1), n: 16, k: 16, dtype: DType::F32, trans_b: false, has_bias: false }), OpKind::Gemm { m: SymDim::Concrete(1), n: 16, k: 16, dtype: DType::F32, trans_b: false },
+        let gemm = g.add_op(Op::Gemm(GemmSpec { m: SymDim::Concrete(1), n: 16, k: 16, dtype: DType::F32, trans_b: false, has_bias: false }),
             vec![a, w], vec![mid], "gemm",
         );
-        let silu = g.add_op_with_op(Op::Silu, OpKind::Silu, vec![mid], vec![out], "silu");
+        let silu = g.add_op(Op::Silu, vec![mid], vec![out], "silu");
 
         let reg = ScalarOpRegistry::new();
         let dag = SemanticDAG::from_graph(&g, &reg);
@@ -281,8 +281,8 @@ mod tests {
         let a = g.add_tensor_concrete("a", &[1, 64], DType::F32);
         let mid = g.add_tensor_concrete("mid", &[1, 64], DType::F32);
         let out = g.add_tensor_concrete("out", &[1, 64], DType::F32);
-        let tanh = g.add_op_with_op(Op::Tanh, OpKind::Tanh, vec![a], vec![mid], "tanh");
-        let silu = g.add_op_with_op(Op::Silu, OpKind::Silu, vec![mid], vec![out], "silu");
+        let tanh = g.add_op(Op::Tanh, vec![a], vec![mid], "tanh");
+        let silu = g.add_op(Op::Silu, vec![mid], vec![out], "silu");
 
         let reg = ScalarOpRegistry::new();
         let dag = SemanticDAG::from_graph(&g, &reg);
@@ -300,8 +300,8 @@ mod tests {
         let a = g.add_tensor_concrete("a", &[1, 4], DType::F32);
         let mid = g.add_tensor_concrete("mid", &[1, 4], DType::F32);
         let out = g.add_tensor_concrete("out", &[1, 4], DType::F32);
-        let tanh = g.add_op_with_op(Op::Tanh, OpKind::Tanh, vec![a], vec![mid], "tanh");
-        let silu = g.add_op_with_op(Op::Silu, OpKind::Silu, vec![mid], vec![out], "silu");
+        let tanh = g.add_op(Op::Tanh, vec![a], vec![mid], "tanh");
+        let silu = g.add_op(Op::Silu, vec![mid], vec![out], "silu");
 
         let tanh_op = g.op(tanh).unwrap();
         let silu_op = g.op(silu).unwrap();
@@ -318,8 +318,8 @@ mod tests {
         let a = g.add_tensor_concrete("a", &[1, 4], DType::F32);
         let mid = g.add_tensor_concrete("mid", &[1, 4], DType::F32);
         let out = g.add_tensor_concrete("out", &[1, 4], DType::F32);
-        let tanh = g.add_op_with_op(Op::Tanh, OpKind::Tanh, vec![a], vec![mid], "tanh");
-        let silu = g.add_op_with_op(Op::Silu, OpKind::Silu, vec![mid], vec![out], "silu");
+        let tanh = g.add_op(Op::Tanh, vec![a], vec![mid], "tanh");
+        let silu = g.add_op(Op::Silu, vec![mid], vec![out], "silu");
 
         let tanh_op = g.op(tanh).unwrap();
         let silu_op = g.op(silu).unwrap();
@@ -332,8 +332,8 @@ mod tests {
         let a = g.add_tensor_concrete("a", &[1, 4], DType::F32);
         let mid = g.add_tensor_concrete("mid", &[1, 4], DType::F32);
         let out = g.add_tensor_concrete("out", &[1, 4], DType::F32);
-        let tanh = g.add_op_with_op(Op::Tanh, OpKind::Tanh, vec![a], vec![mid], "tanh");
-        let silu = g.add_op_with_op(Op::Silu, OpKind::Silu, vec![mid], vec![out], "silu");
+        let tanh = g.add_op(Op::Tanh, vec![a], vec![mid], "tanh");
+        let silu = g.add_op(Op::Silu, vec![mid], vec![out], "silu");
 
         let profile = make_profile();
         let ctx = JitContext::new(&profile);
@@ -362,8 +362,8 @@ mod tests {
         let a = g.add_tensor_concrete("a", &[1, 4], DType::F32);
         let mid = g.add_tensor_concrete("mid", &[1, 4], DType::F32);
         let out = g.add_tensor_concrete("out", &[1, 4], DType::F32);
-        let tanh = g.add_op_with_op(Op::Tanh, OpKind::Tanh, vec![a], vec![mid], "tanh");
-        let silu = g.add_op_with_op(Op::Silu, OpKind::Silu, vec![mid], vec![out], "silu");
+        let tanh = g.add_op(Op::Tanh, vec![a], vec![mid], "tanh");
+        let silu = g.add_op(Op::Silu, vec![mid], vec![out], "silu");
 
         let tanh_op = g.op(tanh).unwrap();
         let silu_op = g.op(silu).unwrap();
@@ -432,7 +432,7 @@ mod tests {
         let a = g.add_tensor_concrete("a", &[1, 16], DType::F32);
         let w = g.add_tensor_concrete("w", &[16, 16], DType::F32);
         let out = g.add_tensor_concrete("out", &[1, 16], DType::F32);
-        let gemm = g.add_op_with_op(Op::Gemm(GemmSpec { m: SymDim::Concrete(1), n: 16, k: 16, dtype: DType::F32, trans_b: false, has_bias: false }), OpKind::Gemm { m: SymDim::Concrete(1), n: 16, k: 16, dtype: DType::F32, trans_b: false },
+        let gemm = g.add_op(Op::Gemm(GemmSpec { m: SymDim::Concrete(1), n: 16, k: 16, dtype: DType::F32, trans_b: false, has_bias: false }),
             vec![a, w], vec![out], "gemm",
         );
 
@@ -446,8 +446,8 @@ mod tests {
         let norm_out = g.add_tensor_concrete("norm_out", &[1, 16], DType::F32);
         let w = g.add_tensor_concrete("w", &[16, 16], DType::F32);
         let out = g.add_tensor_concrete("out", &[1, 16], DType::F32);
-        let norm = g.add_op_with_op(Op::RmsNorm(NormSpec { feature_dim: 4096, eps: 1e-5, dtype: DType::F32, has_weight: true }), OpKind::RmsNorm { feature_dim: 4096, eps: 1e-5 }, vec![a], vec![norm_out], "norm");
-        let gemm = g.add_op_with_op(Op::Gemm(GemmSpec { m: SymDim::Concrete(1), n: 16, k: 16, dtype: DType::F32, trans_b: false, has_bias: false }), OpKind::Gemm { m: SymDim::Concrete(1), n: 16, k: 16, dtype: DType::F32, trans_b: false },
+        let norm = g.add_op(Op::RmsNorm(NormSpec { feature_dim: 4096, eps: 1e-5, dtype: DType::F32, has_weight: true }), vec![a], vec![norm_out], "norm");
+        let gemm = g.add_op(Op::Gemm(GemmSpec { m: SymDim::Concrete(1), n: 16, k: 16, dtype: DType::F32, trans_b: false, has_bias: false }),
             vec![norm_out, w], vec![out], "gemm",
         );
 
@@ -466,8 +466,8 @@ mod tests {
         let norm_out = g.add_tensor_concrete("norm_out", &[1, 16], DType::F32);
         let w = g.add_tensor_concrete("w", &[16, 16], DType::F32);
         let out = g.add_tensor_concrete("out", &[1, 16], DType::F32);
-        let norm = g.add_op_with_op(Op::RmsNorm(NormSpec { feature_dim: 4096, eps: 1e-5, dtype: DType::F32, has_weight: true }), OpKind::RmsNorm { feature_dim: 4096, eps: 1e-5 }, vec![a], vec![norm_out], "norm");
-        let gemm = g.add_op_with_op(Op::Gemm(GemmSpec { m: SymDim::Concrete(1), n: 16, k: 16, dtype: DType::F32, trans_b: false, has_bias: false }), OpKind::Gemm { m: SymDim::Concrete(1), n: 16, k: 16, dtype: DType::F32, trans_b: false },
+        let norm = g.add_op(Op::RmsNorm(NormSpec { feature_dim: 4096, eps: 1e-5, dtype: DType::F32, has_weight: true }), vec![a], vec![norm_out], "norm");
+        let gemm = g.add_op(Op::Gemm(GemmSpec { m: SymDim::Concrete(1), n: 16, k: 16, dtype: DType::F32, trans_b: false, has_bias: false }),
             vec![norm_out, w], vec![out], "gemm",
         );
 
@@ -482,7 +482,7 @@ mod tests {
         let a = g.add_tensor_concrete("a", &[1, 16], DType::F32);
         let w = g.add_tensor_concrete("w", &[16, 16], DType::F32);
         let out = g.add_tensor_concrete("out", &[1, 16], DType::F32);
-        let gemm = g.add_op_with_op(Op::Gemm(GemmSpec { m: SymDim::Concrete(1), n: 16, k: 16, dtype: DType::F32, trans_b: false, has_bias: false }), OpKind::Gemm { m: SymDim::Concrete(1), n: 16, k: 16, dtype: DType::F32, trans_b: false },
+        let gemm = g.add_op(Op::Gemm(GemmSpec { m: SymDim::Concrete(1), n: 16, k: 16, dtype: DType::F32, trans_b: false, has_bias: false }),
             vec![a, w], vec![out], "gemm",
         );
 

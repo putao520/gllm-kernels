@@ -17,7 +17,7 @@ pub enum OpKindKey {
     Tanh,
     SwiGlu,
     /// Clipped SwiGLU (OpenAI gpt-oss-20b).
-    /// The `limit` value lives on `OpKind::SwiGluClipped` itself; the
+    /// The `limit` value lives on `Op::SwiGluClipped` itself; the
     /// registry stores a single template trace and
     /// `plan_lower::extract_op_trace` rewrites the clamp constants per-op.
     SwiGluClipped,
@@ -68,7 +68,7 @@ pub enum OpKindKey {
     /// Quantized embedding lookup (ARCH-RUST-IS-CODEGEN): dequantize-on-the-fly per token.
     QuantGather,
     SliceView,
-    /// Row-major column slice (真实 copy, row_stride 变化, 详见 OpKind::ColumnSlice).
+    /// Row-major column slice (真实 copy, row_stride 变化, 详见 Op::ColumnSlice).
     ColumnSlice,
     /// AltUp Predict (Gemma 4 E2B/E4B): multi-path prediction.
     AltUpPredict,

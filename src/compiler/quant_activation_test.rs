@@ -2,7 +2,7 @@
 
 #[cfg(test)]
 mod tests {
-    use crate::compiler::{CompilerGraph, OpKind};
+    use crate::compiler::CompilerGraph;
     use crate::compiler::graph::{Op, GemmSpec};
     use crate::compiler::quant_ir::QuantFormat;
     use crate::compiler::quant_convert;
@@ -15,11 +15,7 @@ mod tests {
         let input = graph.add_tensor_concrete("input", &[1, 1024], DType::F32);
         let weight = graph.add_tensor_concrete("weight", &[1024, 512], DType::F32);
         let output = graph.add_tensor_concrete("output", &[1, 512], DType::F32);
-        let _op = graph.add_op_with_op(Op::Gemm(GemmSpec { m: crate::compiler::graph::SymDim::Concrete(1), n: 512, k: 1024, dtype: DType::F32, trans_b: false, has_bias: false }), OpKind::Gemm {
-                m: crate::compiler::graph::SymDim::Concrete(1),
-                n: 512,
-                k: 1024,
-                dtype: DType::F32, trans_b: false },
+        let _op = graph.add_op(Op::Gemm(GemmSpec { m: crate::compiler::graph::SymDim::Concrete(1), n: 512, k: 1024, dtype: DType::F32, trans_b: false, has_bias: false }),
             vec![input, weight],
             vec![output],
             "gemm",
@@ -39,11 +35,7 @@ mod tests {
         let input = graph.add_tensor_concrete("input", &[1, 2048], DType::F32);
         let weight = graph.add_tensor_concrete("weight", &[2048, 1024], DType::F32);
         let output = graph.add_tensor_concrete("output", &[1, 1024], DType::F32);
-        let _op = graph.add_op_with_op(Op::Gemm(GemmSpec { m: crate::compiler::graph::SymDim::Concrete(1), n: 1024, k: 2048, dtype: DType::F32, trans_b: false, has_bias: false }), OpKind::Gemm {
-                m: crate::compiler::graph::SymDim::Concrete(1),
-                n: 1024,
-                k: 2048,
-                dtype: DType::F32, trans_b: false },
+        let _op = graph.add_op(Op::Gemm(GemmSpec { m: crate::compiler::graph::SymDim::Concrete(1), n: 1024, k: 2048, dtype: DType::F32, trans_b: false, has_bias: false }),
             vec![input, weight],
             vec![output],
             "gemm",
@@ -65,11 +57,7 @@ mod tests {
         let input1 = graph.add_tensor_concrete("input1", &[1, 512], DType::F32);
         let weight1 = graph.add_tensor_concrete("weight1", &[512, 256], DType::F32);
         let output1 = graph.add_tensor_concrete("output1", &[1, 256], DType::F32);
-        let _op1 = graph.add_op_with_op(Op::Gemm(GemmSpec { m: crate::compiler::graph::SymDim::Concrete(1), n: 256, k: 512, dtype: DType::F32, trans_b: false, has_bias: false }), OpKind::Gemm {
-                m: crate::compiler::graph::SymDim::Concrete(1),
-                n: 256,
-                k: 512,
-                dtype: DType::F32, trans_b: false },
+        let _op1 = graph.add_op(Op::Gemm(GemmSpec { m: crate::compiler::graph::SymDim::Concrete(1), n: 256, k: 512, dtype: DType::F32, trans_b: false, has_bias: false }),
             vec![input1, weight1],
             vec![output1],
             "gemm1",
@@ -79,11 +67,7 @@ mod tests {
         let input2 = graph.add_tensor_concrete("input2", &[1, 256], DType::F32);
         let weight2 = graph.add_tensor_concrete("weight2", &[256, 128], DType::F32);
         let output2 = graph.add_tensor_concrete("output2", &[1, 128], DType::F32);
-        let _op2 = graph.add_op_with_op(Op::Gemm(GemmSpec { m: crate::compiler::graph::SymDim::Concrete(1), n: 128, k: 256, dtype: DType::F32, trans_b: false, has_bias: false }), OpKind::Gemm {
-                m: crate::compiler::graph::SymDim::Concrete(1),
-                n: 128,
-                k: 256,
-                dtype: DType::F32, trans_b: false },
+        let _op2 = graph.add_op(Op::Gemm(GemmSpec { m: crate::compiler::graph::SymDim::Concrete(1), n: 128, k: 256, dtype: DType::F32, trans_b: false, has_bias: false }),
             vec![input2, weight2],
             vec![output2],
             "gemm2",

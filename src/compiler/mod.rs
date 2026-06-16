@@ -170,7 +170,7 @@ impl CompileOutput {
     }
 }
 
-pub use graph::{CompilerGraph, Op, OpKind, RopeScaling, TensorId, WeightLayout, SymDim, ShapeBinding};
+pub use graph::{CompilerGraph, Op, RopeScaling, TensorId, WeightLayout, SymDim, ShapeBinding};
 pub use ir::MoeConfig;
 pub use rope_scaling::{compute_attention_scaling, compute_inv_freq, fill_cos_sin_table, fill_cos_sin_table_partial};
 pub use registry::ScalarOpRegistry;
@@ -831,13 +831,8 @@ impl InferenceCompiler {
 
         for &op_id in &topo {
             if let Some(op) = graph.op(op_id) {
-                // Op v2 内容指纹（胖 opcode 自描述，替代 OpKind discriminant + 参数 hash）
-                if let Some(op_v2) = op.op_v2_resolved(graph) {
-                    op_v2.content_hash(&mut hasher);
-                } else {
-                    // Fallback: 测试 fixture 或未缓存路径，用 OpKind discriminant
-                    std::mem::discriminant(&op.kind).hash(&mut hasher);
-                }
+                // Op v2 内容指纹（胖 opcode 自描述，OE-4 单 IR）
+                op.op_v2.content_hash(&mut hasher);
                 // Edge connections
                 for &tid in &op.inputs {
                     tid.0.hash(&mut hasher);
@@ -2269,7 +2264,7 @@ mod tests {
         graph.inputs.push(t_in);
 
         // Act
-        let op_id = graph.add_op_with_op(Op::Silu, OpKind::Silu, vec![t_in], vec![t_out], "silu");
+        let op_id = graph.add_op(Op::Silu, vec![t_in], vec![t_out], "silu");
 
         // Assert: producer set on output
         let out_meta = graph.tensor(t_out).expect("output tensor must exist");
@@ -2295,13 +2290,13 @@ mod tests {
         let t_skip = graph.add_tensor_concrete("skip", &[1, 512], DType::F32);
         graph.inputs.extend_from_slice(&[t0, t2, t_skip]);
 
-        let op_norm = graph.add_op_with_op(Op::RmsNorm(NormSpec { feature_dim: 4096, eps: 1e-5, dtype: DType::F32, has_weight: true }), OpKind::RmsNorm { feature_dim: 4096, eps: 1e-5 }, vec![t0], vec![t1], "norm",
+        let op_norm = graph.add_op(Op::RmsNorm(NormSpec { feature_dim: 4096, eps: 1e-5, dtype: DType::F32, has_weight: true }), vec![t0], vec![t1], "norm",
         );
-        let op_gemm = graph.add_op_with_op(Op::Gemm(GemmSpec { m: SymDim::Concrete(1), n: 512, k: 128, dtype: DType::F32, trans_b: false, has_bias: false }), OpKind::Gemm { m: SymDim::Concrete(1), n: 512, k: 128, dtype: DType::F32, trans_b: false },
+        let op_gemm = graph.add_op(Op::Gemm(GemmSpec { m: SymDim::Concrete(1), n: 512, k: 128, dtype: DType::F32, trans_b: false, has_bias: false }),
             vec![t1, t2], vec![t3], "gemm",
         );
-        let op_silu = graph.add_op_with_op(Op::Silu, OpKind::Silu, vec![t3], vec![t4], "silu");
-        let op_res = graph.add_op_with_op(Op::Residual, OpKind::Residual, vec![t4, t_skip], vec![t5], "residual");
+        let op_silu = graph.add_op(Op::Silu, vec![t3], vec![t4], "silu");
+        let op_res = graph.add_op(Op::Residual, vec![t4, t_skip], vec![t5], "residual");
 
         // Act
         let topo = graph.topological_sort();
@@ -2474,8 +2469,8 @@ mod tests {
         let t2 = graph.add_tensor_concrete("c", &[4, 4], DType::F32);
 
         // Act
-        let op0 = graph.add_op_with_op(Op::Silu, OpKind::Silu, vec![t0], vec![t1], "silu0");
-        let op1 = graph.add_op_with_op(Op::Silu, OpKind::Silu, vec![t1], vec![t2], "silu1");
+        let op0 = graph.add_op(Op::Silu, vec![t0], vec![t1], "silu0");
+        let op1 = graph.add_op(Op::Silu, vec![t1], vec![t2], "silu1");
 
         // Assert: all op IDs are unique
         assert_ne!(op0, op1, "op IDs must be unique");
@@ -2577,13 +2572,7 @@ mod tests {
         graph.inputs.extend_from_slice(&[t_in, t_w]);
 
         // Act
-        let _op_id = graph.add_op_with_op(Op::Gemm(GemmSpec { m: SymDim::Concrete(1), n: 256, k: 128, dtype: DType::F32, trans_b: false, has_bias: false }), OpKind::Gemm {
-                m: SymDim::Concrete(1),
-                n: 256,
-                k: 128,
-                dtype: DType::F32,
-                trans_b: false,
-            },
+        let _op_id = graph.add_op(Op::Gemm(GemmSpec { m: SymDim::Concrete(1), n: 256, k: 128, dtype: DType::F32, trans_b: false, has_bias: false }),
             vec![t_in, t_w],
             vec![t_out],
             "gemm",
@@ -2777,8 +2766,8 @@ mod tests {
         let t_out = graph.add_tensor_concrete("output", &[4, 64], DType::F32);
         graph.inputs.push(t_in);
 
-        let op_norm = graph.add_op_with_op(Op::RmsNorm(NormSpec { feature_dim: 4096, eps: 1e-5, dtype: DType::F32, has_weight: true }), OpKind::RmsNorm { feature_dim: 4096, eps: 1e-5 }, vec![t_in], vec![t_mid], "norm");
-        let _op_silu = graph.add_op_with_op(Op::Silu, OpKind::Silu, vec![t_mid], vec![t_out], "silu");
+        let op_norm = graph.add_op(Op::RmsNorm(NormSpec { feature_dim: 4096, eps: 1e-5, dtype: DType::F32, has_weight: true }), vec![t_in], vec![t_mid], "norm");
+        let _op_silu = graph.add_op(Op::Silu, vec![t_mid], vec![t_out], "silu");
 
         // Act
         let chains = graph.def_use_chains();

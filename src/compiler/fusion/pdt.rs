@@ -525,7 +525,7 @@ impl PdtFusionEngine {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::compiler::graph::{CompilerGraph, OpKind, Op, GemmSpec, NormSpec, QuantGemmSpec, RopeSpec, SymDim};
+    use crate::compiler::graph::{CompilerGraph, Op, GemmSpec, NormSpec, QuantGemmSpec, RopeSpec, SymDim};
     use crate::compiler::registry::ScalarOpRegistry;
     use crate::types::DType;
 
@@ -539,12 +539,12 @@ mod tests {
         let gemm_out = g.add_tensor_concrete("gemm_out", &[1, 64], dt);
         let silu_out = g.add_tensor_concrete("silu_out", &[1, 64], dt);
 
-        g.add_op_with_op(Op::Gemm(GemmSpec { m: SymDim::Concrete(1), n: 64, k: 64, dtype: dt, trans_b: false, has_bias: false }), OpKind::Gemm { m: SymDim::Concrete(1), n: 64, k: 64, dtype: dt, trans_b: false },
+        g.add_op(Op::Gemm(GemmSpec { m: SymDim::Concrete(1), n: 64, k: 64, dtype: dt, trans_b: false, has_bias: false }),
             vec![a, w],
             vec![gemm_out],
             "gemm",
         );
-        g.add_op_with_op(Op::Silu, OpKind::Silu, vec![gemm_out], vec![silu_out], "silu");
+        g.add_op(Op::Silu, vec![gemm_out], vec![silu_out], "silu");
 
         let registry = ScalarOpRegistry::with_defaults();
         let dag = SemanticDAG::from_graph(&g, &registry);
@@ -600,8 +600,8 @@ mod tests {
         let b = g.add_tensor_concrete("b", &[1, 64], dt);
         let c = g.add_tensor_concrete("c", &[1, 64], dt);
 
-        g.add_op_with_op(Op::Gemm(GemmSpec { m: SymDim::Concrete(1), n: 64, k: 64, dtype: dt, trans_b: false, has_bias: false }), OpKind::Gemm { m: SymDim::Concrete(1), n: 64, k: 64, dtype: dt, trans_b: false }, vec![a, w], vec![out], "gemm");
-        g.add_op_with_op(Op::Silu, OpKind::Silu, vec![b], vec![c], "silu_unrelated");
+        g.add_op(Op::Gemm(GemmSpec { m: SymDim::Concrete(1), n: 64, k: 64, dtype: dt, trans_b: false, has_bias: false }), vec![a, w], vec![out], "gemm");
+        g.add_op(Op::Silu, vec![b], vec![c], "silu_unrelated");
 
         let registry = ScalarOpRegistry::with_defaults();
         let dag = SemanticDAG::from_graph(&g, &registry);
@@ -633,9 +633,9 @@ mod tests {
         let c = g.add_tensor_concrete("c", &[1, 64], dt);
         let d_out = g.add_tensor_concrete("d_out", &[1, 64], dt);
 
-        g.add_op_with_op(Op::Silu, OpKind::Silu, vec![a], vec![b], "silu_b");
-        g.add_op_with_op(Op::Silu, OpKind::Silu, vec![a], vec![c], "silu_c");
-        g.add_op_with_op(Op::Add, OpKind::Add, vec![b, c], vec![d_out], "add_d");
+        g.add_op(Op::Silu, vec![a], vec![b], "silu_b");
+        g.add_op(Op::Silu, vec![a], vec![c], "silu_c");
+        g.add_op(Op::Add, vec![b, c], vec![d_out], "add_d");
 
         let registry = ScalarOpRegistry::with_defaults();
         let dag = SemanticDAG::from_graph(&g, &registry);
@@ -689,9 +689,9 @@ mod tests {
         let c = g.add_tensor_concrete("c", &[1, 64], dt);
         let d_out = g.add_tensor_concrete("d_out", &[1, 64], dt);
 
-        g.add_op_with_op(Op::Silu, OpKind::Silu, vec![a], vec![b], "silu_b");
-        g.add_op_with_op(Op::Silu, OpKind::Silu, vec![a], vec![c], "silu_c");
-        g.add_op_with_op(Op::Add, OpKind::Add, vec![b, c], vec![d_out], "add_d");
+        g.add_op(Op::Silu, vec![a], vec![b], "silu_b");
+        g.add_op(Op::Silu, vec![a], vec![c], "silu_c");
+        g.add_op(Op::Add, vec![b, c], vec![d_out], "add_d");
 
         let registry = ScalarOpRegistry::with_defaults();
         let dag = SemanticDAG::from_graph(&g, &registry);
@@ -764,10 +764,10 @@ mod tests {
         let b = g.add_tensor_concrete("b", &[1, 64], dt);
         let out2 = g.add_tensor_concrete("out2", &[1, 64], dt);
 
-        g.add_op_with_op(Op::Gemm(GemmSpec { m: SymDim::Concrete(1), n: 64, k: 64, dtype: dt, trans_b: false, has_bias: false }), OpKind::Gemm { m: SymDim::Concrete(1), n: 64, k: 64, dtype: dt, trans_b: false },
+        g.add_op(Op::Gemm(GemmSpec { m: SymDim::Concrete(1), n: 64, k: 64, dtype: dt, trans_b: false, has_bias: false }),
             vec![a, w], vec![out1], "gemm",
         );
-        g.add_op_with_op(Op::Silu, OpKind::Silu, vec![b], vec![out2], "silu");
+        g.add_op(Op::Silu, vec![b], vec![out2], "silu");
 
         // Act
         let bytes = compute_bytes_saved(OpId(0), OpId(1), &g);
@@ -802,11 +802,11 @@ mod tests {
         let bias = g.add_tensor_concrete("bias", &[1, 64], dt);
         let add_out = g.add_tensor_concrete("add_out", &[1, 64], dt);
 
-        g.add_op_with_op(Op::Gemm(GemmSpec { m: SymDim::Concrete(1), n: 64, k: 64, dtype: dt, trans_b: false, has_bias: false }), OpKind::Gemm { m: SymDim::Concrete(1), n: 64, k: 64, dtype: dt, trans_b: false },
+        g.add_op(Op::Gemm(GemmSpec { m: SymDim::Concrete(1), n: 64, k: 64, dtype: dt, trans_b: false, has_bias: false }),
             vec![a, w], vec![gemm_out], "gemm",
         );
-        g.add_op_with_op(Op::Silu, OpKind::Silu, vec![gemm_out], vec![silu_out], "silu");
-        g.add_op_with_op(Op::Add, OpKind::Add, vec![silu_out, bias], vec![add_out], "add");
+        g.add_op(Op::Silu, vec![gemm_out], vec![silu_out], "silu");
+        g.add_op(Op::Add, vec![silu_out, bias], vec![add_out], "add");
 
         let registry = ScalarOpRegistry::with_defaults();
         let dag = SemanticDAG::from_graph(&g, &registry);
@@ -833,7 +833,7 @@ mod tests {
         let logits = g.add_tensor_concrete("logits", &[1, 100], dt);
         let token_out = g.add_tensor_concrete("token_out", &[1], dt);
 
-        g.add_op_with_op(Op::CheckStopCondition, OpKind::CheckStopCondition, vec![logits], vec![token_out], "stop_check");
+        g.add_op(Op::CheckStopCondition, vec![logits], vec![token_out], "stop_check");
 
         let registry = ScalarOpRegistry::with_defaults();
         let dag = SemanticDAG::from_graph(&g, &registry);
@@ -975,7 +975,7 @@ mod tests {
         let a = g.add_tensor_concrete("a", &[1, 64], dt);
         let out = g.add_tensor_concrete("out", &[1, 64], dt);
 
-        g.add_op_with_op(Op::Silu, OpKind::Silu, vec![a], vec![out], "silu");
+        g.add_op(Op::Silu, vec![a], vec![out], "silu");
 
         let registry = ScalarOpRegistry::with_defaults();
         let dag = SemanticDAG::from_graph(&g, &registry);
@@ -1002,9 +1002,9 @@ mod tests {
         let b = g.add_tensor_concrete("b", &[1, 64], dt);
         let add_out = g.add_tensor_concrete("add_out", &[1, 64], dt);
 
-        g.add_op_with_op(Op::Silu, OpKind::Silu, vec![a], vec![silu_out], "silu");
-        g.add_op_with_op(Op::Mul, OpKind::Mul, vec![silu_out], vec![mul_out], "mul");
-        g.add_op_with_op(Op::Add, OpKind::Add, vec![mul_out, b], vec![add_out], "add");
+        g.add_op(Op::Silu, vec![a], vec![silu_out], "silu");
+        g.add_op(Op::Mul, vec![silu_out], vec![mul_out], "mul");
+        g.add_op(Op::Add, vec![mul_out, b], vec![add_out], "add");
 
         let registry = ScalarOpRegistry::with_defaults();
         let dag = SemanticDAG::from_graph(&g, &registry);
@@ -1034,9 +1034,9 @@ mod tests {
         let sc_out = g.add_tensor_concrete("sc_out", &[1], dt);
         let gelu_out = g.add_tensor_concrete("gelu_out", &[1, 64], dt);
 
-        g.add_op_with_op(Op::Silu, OpKind::Silu, vec![a], vec![silu_out], "silu");
-        g.add_op_with_op(Op::CheckStopCondition, OpKind::CheckStopCondition, vec![logits], vec![sc_out], "stop");
-        g.add_op_with_op(Op::Gelu, OpKind::Gelu, vec![silu_out], vec![gelu_out], "gelu");
+        g.add_op(Op::Silu, vec![a], vec![silu_out], "silu");
+        g.add_op(Op::CheckStopCondition, vec![logits], vec![sc_out], "stop");
+        g.add_op(Op::Gelu, vec![silu_out], vec![gelu_out], "gelu");
 
         let registry = ScalarOpRegistry::with_defaults();
         let dag = SemanticDAG::from_graph(&g, &registry);
@@ -1166,8 +1166,8 @@ mod tests {
         let silu_out = g.add_tensor_concrete("silu_out", &[1, 64], dt);
         let mul_out = g.add_tensor_concrete("mul_out", &[1, 64], dt);
 
-        g.add_op_with_op(Op::Silu, OpKind::Silu, vec![a], vec![silu_out], "silu");
-        g.add_op_with_op(Op::Mul, OpKind::Mul, vec![silu_out], vec![mul_out], "mul");
+        g.add_op(Op::Silu, vec![a], vec![silu_out], "silu");
+        g.add_op(Op::Mul, vec![silu_out], vec![mul_out], "mul");
 
         let registry = ScalarOpRegistry::with_defaults();
         let dag = SemanticDAG::from_graph(&g, &registry);
@@ -1222,8 +1222,8 @@ mod tests {
         let b_out = g.add_tensor_concrete("b_out", &[1, 64], dt);
         let c_out = g.add_tensor_concrete("c_out", &[1, 64], dt);
 
-        g.add_op_with_op(Op::Silu, OpKind::Silu, vec![a], vec![b_out], "silu_b");
-        g.add_op_with_op(Op::Silu, OpKind::Silu, vec![a], vec![c_out], "silu_c");
+        g.add_op(Op::Silu, vec![a], vec![b_out], "silu_b");
+        g.add_op(Op::Silu, vec![a], vec![c_out], "silu_c");
 
         let registry = ScalarOpRegistry::with_defaults();
         let dag = SemanticDAG::from_graph(&g, &registry);
@@ -1254,10 +1254,10 @@ mod tests {
         let add_out = g.add_tensor_concrete("add_out", &[1, 64], dt);
         let silu2_out = g.add_tensor_concrete("silu2_out", &[1, 64], dt);
 
-        g.add_op_with_op(Op::Silu, OpKind::Silu, vec![a], vec![silu_out], "silu");
-        g.add_op_with_op(Op::Mul, OpKind::Mul, vec![silu_out], vec![mul_out], "mul");
-        g.add_op_with_op(Op::Add, OpKind::Add, vec![mul_out, b], vec![add_out], "add");
-        g.add_op_with_op(Op::Silu, OpKind::Silu, vec![add_out], vec![silu2_out], "silu2");
+        g.add_op(Op::Silu, vec![a], vec![silu_out], "silu");
+        g.add_op(Op::Mul, vec![silu_out], vec![mul_out], "mul");
+        g.add_op(Op::Add, vec![mul_out, b], vec![add_out], "add");
+        g.add_op(Op::Silu, vec![add_out], vec![silu2_out], "silu2");
 
         let registry = ScalarOpRegistry::with_defaults();
         let dag = SemanticDAG::from_graph(&g, &registry);
@@ -1285,20 +1285,20 @@ mod tests {
         let w_s = g_small.add_tensor_concrete("w", &[16, 16], dt);
         let gemm_out_s = g_small.add_tensor_concrete("gemm_out", &[1, 16], dt);
         let silu_out_s = g_small.add_tensor_concrete("silu_out", &[1, 16], dt);
-        g_small.add_op_with_op(Op::Gemm(GemmSpec { m: SymDim::Concrete(1), n: 16, k: 16, dtype: dt, trans_b: false, has_bias: false }), OpKind::Gemm { m: SymDim::Concrete(1), n: 16, k: 16, dtype: dt, trans_b: false },
+        g_small.add_op(Op::Gemm(GemmSpec { m: SymDim::Concrete(1), n: 16, k: 16, dtype: dt, trans_b: false, has_bias: false }),
             vec![a_s, w_s], vec![gemm_out_s], "gemm",
         );
-        g_small.add_op_with_op(Op::Silu, OpKind::Silu, vec![gemm_out_s], vec![silu_out_s], "silu");
+        g_small.add_op(Op::Silu, vec![gemm_out_s], vec![silu_out_s], "silu");
 
         // Large: [1, 256] intermediate = 1024 bytes
         let a_l = g_large.add_tensor_concrete("a", &[1, 256], dt);
         let w_l = g_large.add_tensor_concrete("w", &[256, 256], dt);
         let gemm_out_l = g_large.add_tensor_concrete("gemm_out", &[1, 256], dt);
         let silu_out_l = g_large.add_tensor_concrete("silu_out", &[1, 256], dt);
-        g_large.add_op_with_op(Op::Gemm(GemmSpec { m: SymDim::Concrete(1), n: 256, k: 256, dtype: dt, trans_b: false, has_bias: false }), OpKind::Gemm { m: SymDim::Concrete(1), n: 256, k: 256, dtype: dt, trans_b: false },
+        g_large.add_op(Op::Gemm(GemmSpec { m: SymDim::Concrete(1), n: 256, k: 256, dtype: dt, trans_b: false, has_bias: false }),
             vec![a_l, w_l], vec![gemm_out_l], "gemm",
         );
-        g_large.add_op_with_op(Op::Silu, OpKind::Silu, vec![gemm_out_l], vec![silu_out_l], "silu");
+        g_large.add_op(Op::Silu, vec![gemm_out_l], vec![silu_out_l], "silu");
 
         let registry = ScalarOpRegistry::with_defaults();
         let dag_small = SemanticDAG::from_graph(&g_small, &registry);
@@ -1331,9 +1331,9 @@ mod tests {
         let b = g.add_tensor_concrete("b", &[1, 64], dt);
         let add_out = g.add_tensor_concrete("add_out", &[1, 64], dt);
 
-        g.add_op_with_op(Op::Silu, OpKind::Silu, vec![a], vec![silu_out], "silu");
-        g.add_op_with_op(Op::Mul, OpKind::Mul, vec![silu_out], vec![mul_out], "mul");
-        g.add_op_with_op(Op::Add, OpKind::Add, vec![mul_out, b], vec![add_out], "add");
+        g.add_op(Op::Silu, vec![a], vec![silu_out], "silu");
+        g.add_op(Op::Mul, vec![silu_out], vec![mul_out], "mul");
+        g.add_op(Op::Add, vec![mul_out, b], vec![add_out], "add");
 
         let registry = ScalarOpRegistry::with_defaults();
         let dag = SemanticDAG::from_graph(&g, &registry);
@@ -1368,10 +1368,10 @@ mod tests {
         let s2 = g.add_tensor_concrete("s2", &[1, 64], dt);
         let m2 = g.add_tensor_concrete("m2", &[1, 64], dt);
 
-        g.add_op_with_op(Op::Silu, OpKind::Silu, vec![a1], vec![s1], "silu_1");
-        g.add_op_with_op(Op::Mul, OpKind::Mul, vec![s1], vec![m1], "mul_1");
-        g.add_op_with_op(Op::Silu, OpKind::Silu, vec![a2], vec![s2], "silu_2");
-        g.add_op_with_op(Op::Mul, OpKind::Mul, vec![s2], vec![m2], "mul_2");
+        g.add_op(Op::Silu, vec![a1], vec![s1], "silu_1");
+        g.add_op(Op::Mul, vec![s1], vec![m1], "mul_1");
+        g.add_op(Op::Silu, vec![a2], vec![s2], "silu_2");
+        g.add_op(Op::Mul, vec![s2], vec![m2], "mul_2");
 
         let registry = ScalarOpRegistry::with_defaults();
         let dag = SemanticDAG::from_graph(&g, &registry);
@@ -1398,8 +1398,8 @@ mod tests {
         let silu_out = g.add_tensor_concrete("silu_out", &[1, 64], dt);
         let freq = g.add_tensor_concrete("freq", &[32], dt);
 
-        g.add_op_with_op(Op::RoPE(RopeSpec { num_heads: 4, head_dim: 16, theta: 10000.0, partial: 1.0, rope_scaling: None }), OpKind::RoPE { num_heads: 4, head_dim: 16, theta: 10000.0, partial: 1.0, rope_scaling: None }, vec![input, freq], vec![rope_out], "rope");
-        g.add_op_with_op(Op::Silu, OpKind::Silu, vec![rope_out], vec![silu_out], "silu");
+        g.add_op(Op::RoPE(RopeSpec { num_heads: 4, head_dim: 16, theta: 10000.0, partial: 1.0, rope_scaling: None }), vec![input, freq], vec![rope_out], "rope");
+        g.add_op(Op::Silu, vec![rope_out], vec![silu_out], "silu");
 
         let registry = ScalarOpRegistry::with_defaults();
         let dag = SemanticDAG::from_graph(&g, &registry);
@@ -1430,8 +1430,8 @@ mod tests {
         let silu_out = g.add_tensor_concrete("silu_out", &[1, 64], dt);
         let weight = g.add_tensor_concrete("weight", &[64], dt);
 
-        g.add_op_with_op(Op::RmsNorm(NormSpec { feature_dim: 4096, eps: 1e-5, dtype: DType::F32, has_weight: true }), OpKind::RmsNorm { feature_dim: 4096, eps: 1e-5 }, vec![input, weight], vec![norm_out], "rmsnorm");
-        g.add_op_with_op(Op::Silu, OpKind::Silu, vec![norm_out], vec![silu_out], "silu");
+        g.add_op(Op::RmsNorm(NormSpec { feature_dim: 4096, eps: 1e-5, dtype: DType::F32, has_weight: true }), vec![input, weight], vec![norm_out], "rmsnorm");
+        g.add_op(Op::Silu, vec![norm_out], vec![silu_out], "silu");
 
         let registry = ScalarOpRegistry::with_defaults();
         let dag = SemanticDAG::from_graph(&g, &registry);
@@ -1468,10 +1468,10 @@ mod tests {
         let w2 = g.add_tensor_concrete("w2", &[64, 64], dt);
         let gemm2_out = g.add_tensor_concrete("gemm2_out", &[1, 64], dt);
 
-        g.add_op_with_op(Op::Gemm(GemmSpec { m: SymDim::Concrete(1), n: 64, k: 64, dtype: dt, trans_b: false, has_bias: false }), OpKind::Gemm { m: SymDim::Concrete(1), n: 64, k: 64, dtype: dt, trans_b: false },
+        g.add_op(Op::Gemm(GemmSpec { m: SymDim::Concrete(1), n: 64, k: 64, dtype: dt, trans_b: false, has_bias: false }),
             vec![a, w1], vec![gemm1_out], "gemm1",
         );
-        g.add_op_with_op(Op::Gemm(GemmSpec { m: SymDim::Concrete(1), n: 64, k: 64, dtype: dt, trans_b: false, has_bias: false }), OpKind::Gemm { m: SymDim::Concrete(1), n: 64, k: 64, dtype: dt, trans_b: false },
+        g.add_op(Op::Gemm(GemmSpec { m: SymDim::Concrete(1), n: 64, k: 64, dtype: dt, trans_b: false, has_bias: false }),
             vec![gemm1_out, w2], vec![gemm2_out], "gemm2",
         );
 
@@ -1508,10 +1508,10 @@ mod tests {
         let add_out = g.add_tensor_concrete("add_out", &[1, 64], dt);
         let silu2_out = g.add_tensor_concrete("silu2_out", &[1, 64], dt);
 
-        g.add_op_with_op(Op::Silu, OpKind::Silu, vec![a], vec![silu_out], "silu");
-        g.add_op_with_op(Op::Mul, OpKind::Mul, vec![silu_out], vec![mul_out], "mul");
-        g.add_op_with_op(Op::Add, OpKind::Add, vec![mul_out, b], vec![add_out], "add");
-        g.add_op_with_op(Op::Silu, OpKind::Silu, vec![add_out], vec![silu2_out], "silu2");
+        g.add_op(Op::Silu, vec![a], vec![silu_out], "silu");
+        g.add_op(Op::Mul, vec![silu_out], vec![mul_out], "mul");
+        g.add_op(Op::Add, vec![mul_out, b], vec![add_out], "add");
+        g.add_op(Op::Silu, vec![add_out], vec![silu2_out], "silu2");
 
         let registry = ScalarOpRegistry::with_defaults();
         let dag = SemanticDAG::from_graph(&g, &registry);
@@ -1547,20 +1547,20 @@ mod tests {
         let w_s = g_small.add_tensor_concrete("w", &[32, 32], DType::F32);
         let out_s = g_small.add_tensor_concrete("out", &[1, 32], DType::F32);
         let silu_s = g_small.add_tensor_concrete("silu", &[1, 32], DType::F32);
-        g_small.add_op_with_op(Op::Gemm(GemmSpec { m: SymDim::Concrete(1), n: 32, k: 32, dtype: DType::F32, trans_b: false, has_bias: false }), OpKind::Gemm { m: SymDim::Concrete(1), n: 32, k: 32, dtype: DType::F32, trans_b: false },
+        g_small.add_op(Op::Gemm(GemmSpec { m: SymDim::Concrete(1), n: 32, k: 32, dtype: DType::F32, trans_b: false, has_bias: false }),
             vec![a_s, w_s], vec![out_s], "gemm",
         );
-        g_small.add_op_with_op(Op::Silu, OpKind::Silu, vec![out_s], vec![silu_s], "silu");
+        g_small.add_op(Op::Silu, vec![out_s], vec![silu_s], "silu");
 
         // Large: [1, 128] intermediate = 512 bytes (4x the elements)
         let a_l = g_large.add_tensor_concrete("a", &[1, 128], DType::F32);
         let w_l = g_large.add_tensor_concrete("w", &[128, 128], DType::F32);
         let out_l = g_large.add_tensor_concrete("out", &[1, 128], DType::F32);
         let silu_l = g_large.add_tensor_concrete("silu", &[1, 128], DType::F32);
-        g_large.add_op_with_op(Op::Gemm(GemmSpec { m: SymDim::Concrete(1), n: 128, k: 128, dtype: DType::F32, trans_b: false, has_bias: false }), OpKind::Gemm { m: SymDim::Concrete(1), n: 128, k: 128, dtype: DType::F32, trans_b: false },
+        g_large.add_op(Op::Gemm(GemmSpec { m: SymDim::Concrete(1), n: 128, k: 128, dtype: DType::F32, trans_b: false, has_bias: false }),
             vec![a_l, w_l], vec![out_l], "gemm",
         );
-        g_large.add_op_with_op(Op::Silu, OpKind::Silu, vec![out_l], vec![silu_l], "silu");
+        g_large.add_op(Op::Silu, vec![out_l], vec![silu_l], "silu");
 
         // Act
         let bytes_small = compute_bytes_saved(OpId(0), OpId(1), &g_small);

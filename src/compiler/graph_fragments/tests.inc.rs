@@ -20,8 +20,8 @@ mod tests {
         let b = g.add_tensor_concrete("b", &[1, 4096], dt);
         let c = g.add_tensor_concrete("c", &[1, 4096], dt);
 
-        let op0 = g.add_op_with_op(Op::Silu, OpKind::Silu, vec![a], vec![b], "silu");
-        let op1 = g.add_op_with_op(Op::Silu, OpKind::Silu, vec![b], vec![c], "silu2");
+        let op0 = g.add_op(Op::Silu, vec![a], vec![b], "silu");
+        let op1 = g.add_op(Op::Silu, vec![b], vec![c], "silu2");
 
         let sorted = g.topological_sort();
         assert_eq!(sorted, vec![op0, op1]);
@@ -36,9 +36,9 @@ mod tests {
         let right = g.add_tensor_concrete("right", &[1, 4096], dt);
         let out = g.add_tensor_concrete("out", &[1, 4096], dt);
 
-        let op_l = g.add_op_with_op(Op::Silu, OpKind::Silu, vec![input], vec![left], "left");
-        let op_r = g.add_op_with_op(Op::Gelu, OpKind::Gelu, vec![input], vec![right], "right");
-        let op_add = g.add_op_with_op(Op::Add, OpKind::Add, vec![left, right], vec![out], "add");
+        let op_l = g.add_op(Op::Silu, vec![input], vec![left], "left");
+        let op_r = g.add_op(Op::Gelu, vec![input], vec![right], "right");
+        let op_add = g.add_op(Op::Add, vec![left, right], vec![out], "add");
 
         let sorted = g.topological_sort();
         // op_l and op_r must come before op_add
@@ -57,8 +57,8 @@ mod tests {
         let b = g.add_tensor_concrete("b", &[1, 4096], dt);
         let c = g.add_tensor_concrete("c", &[1, 4096], dt);
 
-        let op0 = g.add_op_with_op(Op::Silu, OpKind::Silu, vec![a], vec![b], "silu");
-        let op1 = g.add_op_with_op(Op::Silu, OpKind::Silu, vec![b], vec![c], "silu2");
+        let op0 = g.add_op(Op::Silu, vec![a], vec![b], "silu");
+        let op1 = g.add_op(Op::Silu, vec![b], vec![c], "silu2");
 
         let chains = g.def_use_chains();
         // 'a' is a graph input (no producer), consumed by op0
@@ -99,7 +99,7 @@ mod tests {
         let g = CompilerGraph::from_layer_ir(&ir, &profile).expect("from_layer_ir failed");
 
         // Should contain a GeGlu op
-        let has_geglu = g.ops.iter().any(|op| matches!(op.kind, OpKind::GeGlu));
+        let has_geglu = g.ops.iter().any(|op| matches!(&op.op_v2, Op::GeGlu));
         assert!(has_geglu, "Gemma graph should have GeGlu op");
     }
 
@@ -122,22 +122,22 @@ mod tests {
         assert!(!g.outputs.is_empty());
 
         // Should have LayerNorm (not RmsNorm)
-        let has_ln = g.ops.iter().any(|op| matches!(op.kind, OpKind::LayerNorm { .. }));
+        let has_ln = g.ops.iter().any(|op| matches!(&op.op_v2, Op::LayerNorm(_)));
         assert!(has_ln, "Encoder graph should have LayerNorm");
 
         // Should have MHA
-        let has_mha = g.ops.iter().any(|op| matches!(op.kind, OpKind::MultiHeadAttention { .. }));
+        let has_mha = g.ops.iter().any(|op| matches!(&op.op_v2, Op::MultiHeadAttention(_)));
         assert!(has_mha, "Encoder graph should have MultiHeadAttention");
 
         // Should have MeanPool and L2Normalize
-        let has_pool = g.ops.iter().any(|op| matches!(op.kind, OpKind::MeanPool { .. }));
-        let has_l2 = g.ops.iter().any(|op| matches!(op.kind, OpKind::L2Normalize { .. }));
+        let has_pool = g.ops.iter().any(|op| matches!(&op.op_v2, Op::MeanPool { .. }));
+        let has_l2 = g.ops.iter().any(|op| matches!(&op.op_v2, Op::L2Normalize { .. }));
         assert!(has_pool, "Encoder graph should have MeanPool");
         assert!(has_l2, "Encoder graph should have L2Normalize");
 
         // Should NOT have RoPE or RmsNorm
-        let has_rope = g.ops.iter().any(|op| matches!(op.kind, OpKind::RoPE { .. }));
-        let has_rms = g.ops.iter().any(|op| matches!(op.kind, OpKind::RmsNorm { .. }));
+        let has_rope = g.ops.iter().any(|op| matches!(&op.op_v2, Op::RoPE(_)));
+        let has_rms = g.ops.iter().any(|op| matches!(&op.op_v2, Op::RmsNorm(_)));
         assert!(!has_rope, "Encoder graph should NOT have RoPE");
         assert!(!has_rms, "Encoder graph should NOT have RmsNorm");
 
@@ -372,239 +372,4 @@ mod tests {
         assert_ne!(sources[0], sources[1]);
     }
 
-    #[test]
-    fn op_v2_from_op_kind_norm_activation_silu() {
-        let mut g = CompilerGraph::new();
-        let input = g.add_tensor_concrete("input", &[4], DType::F32);
-        let output = g.add_tensor_concrete("output", &[4], DType::F32);
-        let op = g.add_op_with_op(Op::Silu, OpKind::Silu, vec![input], vec![output], "silu");
-
-        let op_v2 = Op::from_op_kind_norm_activation(g.op(op).unwrap(), &g);
-        assert_eq!(op_v2, Some(Op::Silu));
-    }
-
-    #[test]
-    fn op_v2_from_op_kind_rmsnorm_dtype_propagation() {
-        let mut g = CompilerGraph::new();
-        let input = g.add_tensor_concrete("input", &[4096], DType::BF16);
-        let weight = g.add_tensor_concrete("weight", &[4096], DType::BF16);
-        let output = g.add_tensor_concrete("output", &[4096], DType::BF16);
-        let op = g.add_op_with_op(Op::RmsNorm(NormSpec { feature_dim: 4096, eps: 1e-5, dtype: DType::F32, has_weight: true }), OpKind::RmsNorm { feature_dim: 4096, eps: 1e-5 },
-            vec![input, weight], vec![output], "rms",
-        );
-
-        let op_v2 = Op::from_op_kind_norm_activation(g.op(op).unwrap(), &g);
-        if let Some(Op::RmsNorm(spec)) = op_v2 {
-            assert_eq!(spec.feature_dim, 4096);
-            assert_eq!(spec.eps, 1e-5);
-            assert_eq!(spec.dtype, DType::BF16); // dtype 从输入 tensor 推导
-            assert!(spec.has_weight);
-        } else {
-            panic!("expected Op::RmsNorm");
-        }
-    }
-
-    #[test]
-    fn op_v2_from_op_kind_valuenorm_has_weight_false() {
-        let mut g = CompilerGraph::new();
-        let input = g.add_tensor_concrete("input", &[4096], DType::F32);
-        let output = g.add_tensor_concrete("output", &[4096], DType::F32);
-        let op = g.add_op_with_op(Op::ValueNorm(NormSpec { feature_dim: 4096, eps: 1e-6, dtype: DType::F32, has_weight: false }), OpKind::ValueNorm { feature_dim: 4096, eps: 1e-6 },
-            vec![input], vec![output], "vn",
-        );
-
-        let op_v2 = Op::from_op_kind_norm_activation(g.op(op).unwrap(), &g);
-        if let Some(Op::ValueNorm(spec)) = op_v2 {
-            assert!(!spec.has_weight); // ValueNorm 无学习参数
-        } else {
-            panic!("expected Op::ValueNorm");
-        }
-    }
-
-    #[test]
-    fn op_v2_from_op_kind_gem_returns_none_for_non_norm_activation() {
-        let mut g = CompilerGraph::new();
-        let input = g.add_tensor_concrete("input", &[4096], DType::F32);
-        let weight = g.add_tensor_concrete("weight", &[4096, 4096], DType::F32);
-        let output = g.add_tensor_concrete("output", &[4096], DType::F32);
-        let op = g.add_op_with_op(Op::Gemm(GemmSpec { m: SymDim::Concrete(1), n: 4096, k: 4096, dtype: DType::F32, trans_b: false, has_bias: false }), OpKind::Gemm { m: SymDim::Concrete(1), n: 4096, k: 4096, dtype: DType::F32, trans_b: false },
-            vec![input, weight], vec![output], "gemm",
-        );
-
-        // Gemm 不是 Norm/Activation，应返回 None（Phase 5 处理）
-        let op_v2 = Op::from_op_kind_norm_activation(g.op(op).unwrap(), &g);
-        assert_eq!(op_v2, None);
-    }
-
-    // ── Phase 5: Gemm/Quant from_op_kind 测试 ──
-
-    #[test]
-    fn op_v2_from_op_kind_gemm_basic() {
-        let mut g = CompilerGraph::new();
-        let input = g.add_tensor_concrete("input", &[1, 4096], DType::F32);
-        let weight = g.add_tensor_concrete("weight", &[4096, 4096], DType::F32);
-        let output = g.add_tensor_concrete("output", &[1, 4096], DType::F32);
-        let op = g.add_op_with_op(Op::Gemm(GemmSpec { m: SymDim::Concrete(1), n: 4096, k: 4096, dtype: DType::F32, trans_b: false, has_bias: false }), OpKind::Gemm { m: SymDim::Concrete(1), n: 4096, k: 4096, dtype: DType::F32, trans_b: false },
-            vec![input, weight], vec![output], "gemm",
-        );
-
-        let op_v2 = Op::from_op_kind_gemm_quant(g.op(op).unwrap(), &g);
-        if let Some(Op::Gemm(spec)) = op_v2 {
-            assert_eq!(spec.n, 4096);
-            assert_eq!(spec.k, 4096);
-            assert!(!spec.has_bias);
-        } else {
-            panic!("expected Op::Gemm");
-        }
-    }
-
-    #[test]
-    fn op_v2_from_op_kind_gemmbias_has_bias_true() {
-        let mut g = CompilerGraph::new();
-        let input = g.add_tensor_concrete("input", &[1, 4096], DType::F32);
-        let weight = g.add_tensor_concrete("weight", &[4096, 4096], DType::F32);
-        let output = g.add_tensor_concrete("output", &[1, 4096], DType::F32);
-        let op = g.add_op_with_op(Op::GemmBias(GemmSpec { m: SymDim::Concrete(1), n: 4096, k: 4096, dtype: DType::F32, trans_b: false, has_bias: true }), OpKind::GemmBias { m: SymDim::Concrete(1), n: 4096, k: 4096, dtype: DType::F32, trans_b: false },
-            vec![input, weight], vec![output], "gemmbias",
-        );
-
-        let op_v2 = Op::from_op_kind_gemm_quant(g.op(op).unwrap(), &g);
-        if let Some(Op::GemmBias(spec)) = op_v2 {
-            assert!(spec.has_bias);
-        } else {
-            panic!("expected Op::GemmBias");
-        }
-    }
-
-    #[test]
-    fn op_v2_from_op_kind_quantgemm_no_trans_b() {
-        let mut g = CompilerGraph::new();
-        let input = g.add_tensor_concrete("input", &[1, 4096], DType::F32);
-        let weight = g.add_tensor_concrete("weight", &[4096, 4096], DType::F32);
-        let output = g.add_tensor_concrete("output", &[1, 4096], DType::F32);
-        let op = g.add_op_with_op(Op::QuantGemm(QuantGemmSpec { m: SymDim::Concrete(1), n: 4096, k: 4096, quant_type: crate::quant::QuantType::Q4_0 }), OpKind::QuantGemm { m: SymDim::Concrete(1), n: 4096, k: 4096, quant_type: crate::quant::QuantType::Q4_0 },
-            vec![input, weight], vec![output], "qgemm",
-        );
-
-        let op_v2 = Op::from_op_kind_gemm_quant(g.op(op).unwrap(), &g);
-        assert!(matches!(op_v2, Some(Op::QuantGemm(_))));
-    }
-
-    #[test]
-    fn op_v2_from_op_kind_dequantize_fields() {
-        let mut g = CompilerGraph::new();
-        let input = g.add_tensor_concrete("input", &[1024], DType::F32);
-        let output = g.add_tensor_concrete("output", &[1024], DType::F32);
-        let op = g.add_op_with_op(Op::Dequantize { num_elements: 1024, block_size: 32, bits: 4 }, OpKind::Dequantize { num_elements: 1024, block_size: 32, bits: 4 },
-            vec![input], vec![output], "deq",
-        );
-
-        let op_v2 = Op::from_op_kind_gemm_quant(g.op(op).unwrap(), &g);
-        if let Some(Op::Dequantize { num_elements, block_size, bits }) = op_v2 {
-            assert_eq!(num_elements, 1024);
-            assert_eq!(block_size, 32);
-            assert_eq!(bits, 4);
-        } else {
-            panic!("expected Op::Dequantize");
-        }
-    }
-
-    // ── Phase 6: Attention/MoE from_op_kind 测试 ──
-
-    #[test]
-    fn op_v2_from_op_kind_mha_kv_source_propagation() {
-        let mut g = CompilerGraph::new();
-        let q = g.add_tensor_concrete("q", &[1, 4096], DType::F32);
-        let k = g.add_tensor_concrete("k", &[1, 4096], DType::F32);
-        let v = g.add_tensor_concrete("v", &[1, 4096], DType::F32);
-        let out = g.add_tensor_concrete("out", &[1, 4096], DType::F32);
-        let op = g.add_op_with_op(Op::MultiHeadAttention(AttentionSpec { geometry: AttentionGeometry { num_q_heads: 32, num_kv_heads: 8, head_dim: 128 }, mask: if true { AttentionMask::Causal } else { AttentionMask::Full }, kv_source: KvSource::FromCache, sinks: if false { SinksSpec::Learnable } else { SinksSpec::None }, seq_len: SymDim::Concrete(1), dtype: DType::F32 }), OpKind::MultiHeadAttention {
-                seq_len: SymDim::Concrete(1), num_heads: 32, num_kv_heads: 8, head_dim: 128,
-                causal: true, attention_sinks: false, kv_source: KvSource::FromCache,
-            },
-            vec![q, k, v], vec![out], "mha",
-        );
-
-        let op_v2 = Op::from_op_kind_attention_moe(g.op(op).unwrap(), &g);
-        if let Some(Op::MultiHeadAttention(spec)) = op_v2 {
-            assert_eq!(spec.kv_source, KvSource::FromCache);
-            assert!(matches!(spec.mask, AttentionMask::Causal));
-            assert!(matches!(spec.sinks, SinksSpec::None));
-        } else {
-            panic!("expected Op::MultiHeadAttention");
-        }
-    }
-
-    #[test]
-    fn op_v2_from_op_kind_mla_attention() {
-        let mut g = CompilerGraph::new();
-        let q = g.add_tensor_concrete("q", &[1, 4096], DType::F32);
-        let out = g.add_tensor_concrete("out", &[1, 4096], DType::F32);
-        let op = g.add_op_with_op(Op::MlaAttention(MlaSpec { seq_len: SymDim::Concrete(1), num_heads: 32, head_dim: 128, d_c: 512, d_rope: 64, causal: true, kv_source: KvSource::FromTensor }), OpKind::MlaAttention {
-                seq_len: SymDim::Concrete(1), num_heads: 32, head_dim: 128,
-                d_c: 512, d_rope: 64, causal: true, kv_source: KvSource::FromTensor,
-            },
-            vec![q], vec![out], "mla",
-        );
-
-        let op_v2 = Op::from_op_kind_attention_moe(g.op(op).unwrap(), &g);
-        assert!(matches!(op_v2, Some(Op::MlaAttention(_))));
-    }
-
-    #[test]
-    fn op_v2_from_op_kind_moe_gate() {
-        let mut g = CompilerGraph::new();
-        let input = g.add_tensor_concrete("input", &[1, 4096], DType::F32);
-        let out = g.add_tensor_concrete("out", &[1, 8], DType::F32);
-        let op = g.add_op_with_op(Op::MoEGate { seq_len: SymDim::Concrete(1), num_experts: 8, hidden: 4096, top_k: 2 }, OpKind::MoEGate { seq_len: 1, num_experts: 8, hidden: 4096, top_k: 2 },
-            vec![input], vec![out], "moegate",
-        );
-
-        let op_v2 = Op::from_op_kind_attention_moe(g.op(op).unwrap(), &g);
-        if let Some(Op::MoEGate { num_experts, top_k, .. }) = op_v2 {
-            assert_eq!(num_experts, 8);
-            assert_eq!(top_k, 2);
-        } else {
-            panic!("expected Op::MoEGate");
-        }
-    }
-
-    // ── Phase 7: 统一 from_op_kind 入口测试 ──
-
-    #[test]
-    fn op_v2_unified_from_op_kind_all_categories() {
-        let mut g = CompilerGraph::new();
-
-        // Norm
-        let input = g.add_tensor_concrete("in", &[4096], DType::F32);
-        let weight = g.add_tensor_concrete("w", &[4096], DType::F32);
-        let out = g.add_tensor_concrete("out", &[4096], DType::F32);
-        let norm_op = g.add_op_with_op(Op::RmsNorm(NormSpec { feature_dim: 4096, eps: 1e-5, dtype: DType::F32, has_weight: true }), OpKind::RmsNorm { feature_dim: 4096, eps: 1e-5 },
-            vec![input, weight], vec![out], "norm",
-        );
-        assert!(Op::from_op_kind(g.op(norm_op).unwrap(), &g).is_some());
-
-        // Gemm
-        let g_in = g.add_tensor_concrete("gin", &[1, 4096], DType::F32);
-        let g_w = g.add_tensor_concrete("gw", &[4096, 4096], DType::F32);
-        let g_out = g.add_tensor_concrete("gout", &[1, 4096], DType::F32);
-        let gemm_op = g.add_op_with_op(Op::Gemm(GemmSpec { m: SymDim::Concrete(1), n: 4096, k: 4096, dtype: DType::F32, trans_b: false, has_bias: false }), OpKind::Gemm { m: SymDim::Concrete(1), n: 4096, k: 4096, dtype: DType::F32, trans_b: false },
-            vec![g_in, g_w], vec![g_out], "gemm",
-        );
-        assert!(Op::from_op_kind(g.op(gemm_op).unwrap(), &g).is_some());
-
-        // Activation
-        let a_in = g.add_tensor_concrete("ain", &[4096], DType::F32);
-        let a_out = g.add_tensor_concrete("aout", &[4096], DType::F32);
-        let act_op = g.add_op_with_op(Op::Silu, OpKind::Silu, vec![a_in], vec![a_out], "silu");
-        assert!(Op::from_op_kind(g.op(act_op).unwrap(), &g).is_some());
-
-        // Structural
-        let t_in = g.add_tensor_concrete("tin", &[4096], DType::F32);
-        let t_out = g.add_tensor_concrete("tout", &[4096], DType::F32);
-        let struct_op = g.add_op_with_op(Op::Transpose { perm: vec![1, 0] }, OpKind::Transpose { perm: vec![1, 0] },
-            vec![t_in], vec![t_out], "transpose",
-        );
-        assert!(Op::from_op_kind(g.op(struct_op).unwrap(), &g).is_some());
-    }
 }

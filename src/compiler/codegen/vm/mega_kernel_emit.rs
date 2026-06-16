@@ -940,7 +940,7 @@ pub fn compile_mega_kernel_vm(
 ) -> Result<(VmProgram, Option<RopeCacheRequirement>, usize), CompilerError> {
     use crate::compiler::mega_kernel_abi::MEGA_KERNEL_STACK_OFFSETS;
 
-    // vocab_size 从图拓扑推导（OpKind::Argmax { vocab_size }），不作为外部参数。
+    // vocab_size 从图拓扑推导（Op::Argmax { vocab_size:  }），不作为外部参数。
     // 无 Argmax 的图 vocab_size=0：不分配 logits buffer，不 emit 采样管线。
     let vocab_size = topology.vocab_size.unwrap_or(0);
 

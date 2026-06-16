@@ -8,7 +8,7 @@
 //! and `CrossLayerLifetime` for single mega-kernel resource planning.
 
 use std::collections::{HashMap, HashSet};
-use crate::compiler::graph::{CompilerGraph, TensorId, OpId, OpKind};
+use crate::compiler::graph::{CompilerGraph, TensorId, OpId};
 use crate::compiler::fusion::{FusionPlan, FusionMode};
 use crate::compiler::virtual_tensor::VirtualTensorMap;
 use crate::compiler::virtual_activation::VirtualActivationMap;
@@ -220,7 +220,7 @@ pub fn analyze_lifetimes(
                     .filter_map(|&tid| graph.tensor(tid).map(|t| format!("{}({:?})", t.name, tid)))
                     .collect();
                 eprintln!("[buf-alloc]   step {:3}: {:?} inputs=[{}] outputs=[{}]",
-                    step, op.kind, in_names.join(", "), out_names.join(", "));
+                    step, op.op_v2, in_names.join(", "), out_names.join(", "));
             }
         }
     }
@@ -833,14 +833,9 @@ pub fn compute_scratch_requirements(
         .iter()
         .filter_map(|group| {
             if let FusionMode::TileLevelFusion { tile_rows, .. } = group.mode {
-                // Find the GEMM op to get K dimension
+                // Find the GEMM op to get K dimension (胖 opcode 自描述)
                 let k = group.ops.iter().find_map(|&oid| {
-                    graph.op(oid).and_then(|o| match &o.kind {
-                        OpKind::Gemm { k, .. }
-                        | OpKind::GemmBias { k, .. }
-                        | OpKind::QuantGemm { k, .. } => Some(*k),
-                        _ => None,
-                    })
+                    graph.op(oid).and_then(|o| o.op_v2_gemm_dims(graph).map(|(_, _, k)| k))
                 }).unwrap_or(0);
 
                 let elem_size = group.ops.iter().find_map(|&oid| {

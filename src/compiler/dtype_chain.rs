@@ -312,7 +312,7 @@ impl DtypeChainValidation {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::compiler::graph::{CompilerGraph, OpKind, SymDim, Op, GemmSpec, NormSpec, QuantGemmSpec, RopeSpec, AttentionSpec, AttentionGeometry, AttentionMask, SinksSpec, CachedGqaSpec, MlaSpec, DualRopeSpec};
+    use crate::compiler::graph::{CompilerGraph, SymDim, Op, GemmSpec, NormSpec, QuantGemmSpec, RopeSpec, AttentionSpec, AttentionGeometry, AttentionMask, SinksSpec, CachedGqaSpec, MlaSpec, DualRopeSpec};
 
     // ── REQ-DTYPE-CHAIN-001 tests ────────────────────────────────
 
@@ -380,7 +380,7 @@ mod tests {
         let a = g.add_tensor_concrete("a", &[1, 64], dt);
         let b = g.add_tensor_concrete("b", &[64, 128], dt);
         let c = g.add_tensor_concrete("c", &[1, 128], dt);
-        g.add_op_with_op(Op::Gemm(GemmSpec { m: SymDim::Concrete(1), n: 128, k: 64, dtype: dt, trans_b: false, has_bias: false }), OpKind::Gemm { m: SymDim::Concrete(1), n: 128, k: 64, dtype: dt, trans_b: false },
+        g.add_op(Op::Gemm(GemmSpec { m: SymDim::Concrete(1), n: 128, k: 64, dtype: dt, trans_b: false, has_bias: false }),
             vec![a, b], vec![c], "gemm"
         );
         let breakpoints = detect_dtype_breakpoints(&g);
@@ -394,7 +394,7 @@ mod tests {
         let a = g.add_tensor_concrete("a", &[1, 64], DType::BF16);
         let b = g.add_tensor_concrete("b", &[64, 128], DType::BF16);
         let c = g.add_tensor_concrete("c", &[1, 128], DType::F32);
-        g.add_op_with_op(Op::Gemm(GemmSpec { m: SymDim::Concrete(1), n: 128, k: 64, dtype: DType::F32, trans_b: false, has_bias: false }), OpKind::Gemm { m: SymDim::Concrete(1), n: 128, k: 64, dtype: DType::F32, trans_b: false },
+        g.add_op(Op::Gemm(GemmSpec { m: SymDim::Concrete(1), n: 128, k: 64, dtype: DType::F32, trans_b: false, has_bias: false }),
             vec![a, b], vec![c], "gemm"
         );
         // BF16→F32 is a legal WideAccumulate transition — should not be a breakpoint
@@ -411,7 +411,7 @@ mod tests {
         let x = g.add_tensor_concrete("x", &[1, 64], DType::F32);
         let norm_w = g.add_tensor_concrete("norm_w", &[64], DType::U8);
         let out = g.add_tensor_concrete("out", &[1, 64], DType::F32);
-        g.add_op_with_op(Op::RmsNorm(NormSpec { feature_dim: 4096, eps: 1e-6, dtype: DType::F32, has_weight: true }), OpKind::RmsNorm { feature_dim: 4096, eps: 1e-6 }, vec![x, norm_w], vec![out], "norm");
+        g.add_op(Op::RmsNorm(NormSpec { feature_dim: 4096, eps: 1e-6, dtype: DType::F32, has_weight: true }), vec![x, norm_w], vec![out], "norm");
 
         let tensor = g.tensor(norm_w).unwrap();
         let strategy = select_dequant_path(tensor, &g);
@@ -424,7 +424,7 @@ mod tests {
         let a = g.add_tensor_concrete("a", &[1, 64], DType::F32);
         let b = g.add_tensor_concrete("b", &[64, 128], DType::U8);
         let c = g.add_tensor_concrete("c", &[1, 128], DType::F32);
-        g.add_op_with_op(Op::QuantGemm(QuantGemmSpec { m: SymDim::Concrete(1), n: 128, k: 64, quant_type: crate::quant::QuantType::Q4K }), OpKind::QuantGemm { m: SymDim::Concrete(1), n: 128, k: 64, quant_type: crate::quant::QuantType::Q4K },
+        g.add_op(Op::QuantGemm(QuantGemmSpec { m: SymDim::Concrete(1), n: 128, k: 64, quant_type: crate::quant::QuantType::Q4K }),
             vec![a, b], vec![c], "qgemm"
         );
 
@@ -441,7 +441,7 @@ mod tests {
         let a = g.add_tensor_concrete("a", &[1, 64], DType::F32);
         let b = g.add_tensor_concrete("b", &[64, 128], DType::BF16);
         let c = g.add_tensor_concrete("c", &[1, 128], DType::F32);
-        g.add_op_with_op(Op::GemmBias(GemmSpec { m: SymDim::Concrete(1), n: 128, k: 64, dtype: DType::F32, trans_b: false, has_bias: true }), OpKind::GemmBias { m: SymDim::Concrete(1), n: 128, k: 64, dtype: DType::F32, trans_b: false },
+        g.add_op(Op::GemmBias(GemmSpec { m: SymDim::Concrete(1), n: 128, k: 64, dtype: DType::F32, trans_b: false, has_bias: true }),
             vec![a, b, bias], vec![c], "gemm_bias"
         );
 
@@ -486,7 +486,7 @@ mod tests {
         let w = g.add_tensor_concrete("weight", &[512, 512], dt);
         let out = g.add_tensor_concrete("out", &[1, 512], DType::F32);
         g.inputs = vec![a, w];
-        g.add_op_with_op(Op::Gemm(GemmSpec { m: SymDim::Concrete(1), n: 512, k: 512, dtype: DType::F32, trans_b: false, has_bias: false }), OpKind::Gemm { m: SymDim::Concrete(1), n: 512, k: 512, dtype: DType::F32, trans_b: false },
+        g.add_op(Op::Gemm(GemmSpec { m: SymDim::Concrete(1), n: 512, k: 512, dtype: DType::F32, trans_b: false, has_bias: false }),
             vec![a, w], vec![out], "gemm"
         );
 
@@ -506,7 +506,7 @@ mod tests {
         let w = g.add_tensor_concrete("weight", &[64, 128], dt);
         let out = g.add_tensor_concrete("out", &[1, 128], dt);
         g.inputs = vec![a, w];
-        g.add_op_with_op(Op::Gemm(GemmSpec { m: SymDim::Concrete(1), n: 128, k: 64, dtype: dt, trans_b: false, has_bias: false }), OpKind::Gemm { m: SymDim::Concrete(1), n: 128, k: 64, dtype: dt, trans_b: false },
+        g.add_op(Op::Gemm(GemmSpec { m: SymDim::Concrete(1), n: 128, k: 64, dtype: dt, trans_b: false, has_bias: false }),
             vec![a, w], vec![out], "gemm"
         );
 
@@ -525,7 +525,7 @@ mod tests {
         let w = g.add_tensor_concrete("weight", &[512, 512], DType::BF16);
         let out = g.add_tensor_concrete("out", &[1, 512], DType::F32);
         g.inputs = vec![a, w];
-        g.add_op_with_op(Op::Gemm(GemmSpec { m: SymDim::Concrete(1), n: 512, k: 512, dtype: DType::F32, trans_b: false, has_bias: false }), OpKind::Gemm { m: SymDim::Concrete(1), n: 512, k: 512, dtype: DType::F32, trans_b: false },
+        g.add_op(Op::Gemm(GemmSpec { m: SymDim::Concrete(1), n: 512, k: 512, dtype: DType::F32, trans_b: false, has_bias: false }),
             vec![a, w], vec![out], "gemm"
         );
 
@@ -550,10 +550,10 @@ mod tests {
         g.inputs = vec![input, norm_w, gemm_w];
 
         let normed = g.add_tensor_concrete("normed", &[1, 512], DType::F32);
-        g.add_op_with_op(Op::RmsNorm(NormSpec { feature_dim: 4096, eps: 1e-6, dtype: DType::F32, has_weight: true }), OpKind::RmsNorm { feature_dim: 4096, eps: 1e-6 }, vec![input, norm_w], vec![normed], "norm");
+        g.add_op(Op::RmsNorm(NormSpec { feature_dim: 4096, eps: 1e-6, dtype: DType::F32, has_weight: true }), vec![input, norm_w], vec![normed], "norm");
 
         let out = g.add_tensor_concrete("out", &[1, 2048], DType::F32);
-        g.add_op_with_op(Op::Gemm(GemmSpec { m: SymDim::Concrete(1), n: 2048, k: 512, dtype: DType::F32, trans_b: false, has_bias: false }), OpKind::Gemm { m: SymDim::Concrete(1), n: 2048, k: 512, dtype: DType::F32, trans_b: false },
+        g.add_op(Op::Gemm(GemmSpec { m: SymDim::Concrete(1), n: 2048, k: 512, dtype: DType::F32, trans_b: false, has_bias: false }),
             vec![normed, gemm_w], vec![out], "gemm"
         );
 

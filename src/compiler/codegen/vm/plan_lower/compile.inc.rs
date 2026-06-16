@@ -116,7 +116,7 @@ pub fn compile_layer_with_sym_map(
         let _ = std::fs::create_dir_all(&dir);
         let anchor = plan.groups.first()
             .and_then(|g| graph.op(g.anchor))
-            .map(|op| format!("{:?}", op.kind).chars().take(30).collect::<String>())
+            .map(|op| format!("{:?}", op.op_v2).chars().take(30).collect::<String>())
             .unwrap_or_else(|| "unknown".to_string())
             .replace(|c: char| !c.is_alphanumeric(), "_");
         let path = format!("{}/{:04}_{}.pre.txt", dir, idx, anchor);
@@ -142,7 +142,7 @@ pub fn compile_layer_with_sym_map(
         let _ = std::fs::create_dir_all(&dir);
         let anchor = plan.groups.first()
             .and_then(|g| graph.op(g.anchor))
-            .map(|op| format!("{:?}", op.kind).chars().take(30).collect::<String>())
+            .map(|op| format!("{:?}", op.op_v2).chars().take(30).collect::<String>())
             .unwrap_or_else(|| "unknown".to_string())
             .replace(|c: char| !c.is_alphanumeric(), "_");
         let path = format!("{}/{:04}_{}.txt", dir, idx, anchor);
@@ -277,8 +277,8 @@ pub(crate) fn extract_op_trace(
     registry: Option<&ScalarOpRegistry>,
     graph: &CompilerGraph,
 ) -> Result<Vec<TraceOp>, CompilerError> {
-    // 从 OpKind 映射到 OpKindKey
-    let key = op_kind_to_key(&op.kind);
+    // OE-4: 从 Op (单 IR) 派生 OpKindKey
+    let key = Some(ScalarOpRegistry::key_from_op(&op.op_v2));
 
     // 从 registry 查询 SymExec trace
     if let (Some(reg), Some(k)) = (registry, &key) {
@@ -288,7 +288,7 @@ pub(crate) fn extract_op_trace(
 
             // ── OpKind 参数化 trace 重写 ──
             // 某些 OpKind 变体在单个 OpKindKey 下承载 per-op 数值参数
-            // (例如 OpKind::SwiGluClipped { limit })。registry 存储的是
+            // (例如 Op::SwiGluClipped { limit:  })。registry 存储的是
             // 规范模板 trace (canonical limit=7.0), codegen 时按 OpKind
             // 的实际参数重写对应 Const 槽。
             //
@@ -345,13 +345,13 @@ pub(crate) fn extract_op_trace(
             format!(
                 "extract_op_trace: Op {:?} 没有在 ScalarOpRegistry 中注册。\
                  违反 §14.1 四阶段管线铁律——所有算子必须走 Scalar→SymExec→TraceOp 管线。",
-                op.kind
+                op.op_v2
             )
         )),
     }
 }
 
-/// 按 `OpKind::SwiGluClipped { limit }` 的实际 `limit` 值重写 trace body。
+/// 按 `Op::SwiGluClipped { limit:  }` 的实际 `limit` 值重写 trace body。
 ///
 /// 模板 trace 使用 canonical `Const(+7.0)` / `Const(-7.0)` 表达 ±limit 钳位。
 /// 调用方为每个 op 实例把这两个常量换成真实的 `±limit`。
@@ -399,50 +399,7 @@ fn rewrite_logit_softcap_cap(body: &mut [TraceOp], cap: f32) {
     body[4] = TraceOp::Const(cap as f64);
 }
 
-/// OpKind → OpKindKey 映射。
-fn op_kind_to_key(kind: &OpKind) -> Option<crate::compiler::registry::OpKindKey> {
-    use crate::compiler::registry::OpKindKey;
-    match kind {
-        OpKind::RmsNorm { .. } => Some(OpKindKey::RmsNorm),
-        OpKind::LayerNorm { .. } => Some(OpKindKey::LayerNorm),
-        OpKind::ValueNorm { .. } => Some(OpKindKey::ValueNorm),
-        OpKind::Gemm { .. } => Some(OpKindKey::Gemm),
-        OpKind::GemmBias { .. } => Some(OpKindKey::GemmBias),
-        OpKind::Silu => Some(OpKindKey::Silu),
-        OpKind::Gelu => Some(OpKindKey::Gelu),
-        OpKind::Tanh => Some(OpKindKey::Tanh),
-        OpKind::SwiGlu => Some(OpKindKey::SwiGlu),
-        OpKind::SwiGluClipped { .. } => Some(OpKindKey::SwiGluClipped),
-        OpKind::GeGlu => Some(OpKindKey::GeGlu),
-        OpKind::Softmax => Some(OpKindKey::Softmax),
-        OpKind::RoPE { .. } => Some(OpKindKey::RoPE),
-        OpKind::DualRoPE { .. } => Some(OpKindKey::DualRoPE),
-        OpKind::Add => Some(OpKindKey::Add),
-        OpKind::Mul => Some(OpKindKey::Mul),
-        OpKind::Residual => Some(OpKindKey::Residual),
-        OpKind::QuantGemm { .. } => Some(OpKindKey::QuantGemm),
-        OpKind::MultiHeadAttention { .. } => Some(OpKindKey::MultiHeadAttention),
-        OpKind::MeanPool { .. } => Some(OpKindKey::MeanPool),
-        OpKind::L2Normalize { .. } => Some(OpKindKey::L2Normalize),
-        OpKind::QkNorm { .. } => Some(OpKindKey::QkNorm),
-        OpKind::CachedGQA { .. } => Some(OpKindKey::CachedGQA),
-        OpKind::MoEGate { .. } => Some(OpKindKey::MoEGate),
-        OpKind::MoEDispatchPacked { .. } => Some(OpKindKey::MoEDispatchPacked),
-        OpKind::MoERouter { .. } => Some(OpKindKey::MoERouter),
-        OpKind::Gather { .. } => Some(OpKindKey::Gather),
-        OpKind::QuantGather { .. } => Some(OpKindKey::QuantGather),
-        OpKind::SliceView { .. } => Some(OpKindKey::SliceView),
-        OpKind::ColumnSlice { .. } => Some(OpKindKey::ColumnSlice),
-        OpKind::AltUpPredict { .. } => Some(OpKindKey::AltUpPredict),
-        OpKind::AltUpCorrect { .. } => Some(OpKindKey::AltUpCorrect),
-        OpKind::AltUpInject { .. } => Some(OpKindKey::AltUpInject),
-        OpKind::LogitSoftcap { .. } => Some(OpKindKey::LogitSoftcap),
-        OpKind::DepthwiseConv1D { .. } => Some(OpKindKey::DepthwiseConv1D),
-        OpKind::PatchEmbed { .. } => Some(OpKindKey::PatchEmbed),
-        OpKind::LearnedPos2D { .. } => Some(OpKindKey::LearnedPos2D),
-        _ => None,
-    }
-}
+
 
 /// 从 ComputePattern 提取主体 TraceOp 序列。
 fn extract_body_from_pattern(pattern: &ComputePattern) -> Vec<TraceOp> {
@@ -509,10 +466,8 @@ fn try_auto_dispatch_elementwise(
         None => return Ok(false),
     };
 
-    let key = match op_kind_to_key(&op.kind) {
-        Some(k) => k,
-        None => return Ok(false),
-    };
+    // OE-4: 从 Op (单 IR) 派生 OpKindKey
+    let key = ScalarOpRegistry::key_from_op(&op.op_v2);
 
     let trace = match reg.get_trace(&key) {
         Some(t) => t,
@@ -897,7 +852,7 @@ pub(super) fn emit_standalone_op(
 
     // lower_op_v2 未处理 → 报错（所有 ops 应通过 lower_op_v2 处理）
     Err(CompilerError::CodegenViolation(format!(
-        "emit_standalone_op: op {:?} 未被 lower_op_v2 处理", op.kind
+        "emit_standalone_op: op {:?} 未被 lower_op_v2 处理", op.op_v2
     )))
 }
 
@@ -910,7 +865,7 @@ pub(super) fn emit_standalone_op(
 /// GEMM 维度提取——保留完整 SymDim（ARCH-SYMDIM-NO-UNWRAP）。
 /// 返回 (m_sym, n, k)。调用方通过 sym_map.to_bound(&m_sym) 获取循环 bound。
 pub(super) fn extract_gemm_dims_sym(op: &crate::compiler::graph::CompilerOp, graph: &CompilerGraph) -> Result<(SymDim, usize, usize), CompilerError> {
-    op.op_v2_gemm_dims(graph).ok_or_else(|| CompilerError::CodegenViolation(format!("not a GEMM op: {:?}", op.kind)))
+    op.op_v2_gemm_dims(graph).ok_or_else(|| CompilerError::CodegenViolation(format!("not a GEMM op: {:?}", op.op_v2)))
 }
 
 /// 从 FusionGroup 的 epilogue ops 收集合并的 TraceOp 链。
@@ -977,12 +932,12 @@ pub(crate) fn infer_output_shape_sym(op: &crate::compiler::graph::CompilerOp, gr
 pub(crate) fn build_norm_pattern(op: &crate::compiler::graph::CompilerOp, graph: &CompilerGraph) -> Result<ComputePattern, CompilerError> {
     let meta = op.op_v2_resolved(graph).and_then(|o| o.norm_meta())
         .ok_or_else(|| CompilerError::CodegenViolation(
-            format!("build_norm_pattern: expected NormLike op, got op {:?}", op.kind)
+            format!("build_norm_pattern: expected NormLike op, got op {:?}", op.op_v2)
         ))?;
     // 仅 RmsNorm/ValueNorm 走 build_norm_pattern（LayerNorm 走 emit_layernorm_auto）
     if !matches!(meta.variant, crate::compiler::graph::NormVariant::RmsNorm | crate::compiler::graph::NormVariant::ValueNorm) {
         return Err(CompilerError::CodegenViolation(
-            format!("build_norm_pattern: only RmsNorm/ValueNorm supported, got {:?}", op.kind)
+            format!("build_norm_pattern: only RmsNorm/ValueNorm supported, got {:?}", op.op_v2)
         ));
     }
     let eps = meta.eps;

@@ -54,9 +54,12 @@ impl CompilerGraph {
     }
 
     /// Add an operation to the graph. Updates def-use chains automatically.
+    ///
+    /// OE-4 终点：单 IR (Op) 直接构造，OpKind enum 已物理删除。
+    /// `op` 携带完整自描述元数据（dtype/Spec struct），无需任何 fallback。
     pub fn add_op(
         &mut self,
-        kind: OpKind,
+        op: crate::compiler::graph::Op,
         inputs: Vec<TensorId>,
         outputs: Vec<TensorId>,
         label: &str,
@@ -77,59 +80,10 @@ impl CompilerGraph {
             }
         }
 
-        // FAT-OPCODE-ARCHITECTURE-V2 §Phase 9: 构造临时 CompilerOp 用于 op_v2 翻译。
-        // OE-3 必填化：先用占位 Op 翻译，再回填字段（避免 self-borrow）。
-        let placeholder_op = crate::compiler::graph::Op::Silu; // 占位，下方立即覆盖
-        let temp = CompilerOp {
-            id,
-            kind: kind.clone(),
-            inputs: inputs.clone(),
-            outputs: outputs.clone(),
-            label: label.to_string(),
-            guard: LayerCondition::Always,
-            op_v2: placeholder_op,
-        };
-        let op_v2 = crate::compiler::graph::Op::from_op_kind(&temp, self)
-            .unwrap_or_else(|| panic!("OpKind {:?} has no Op mapping (OE-3 invariant)", kind));
-        let mut final_op = temp;
-        final_op.op_v2 = op_v2;
-        self.ops.push(final_op);
-        id
-    }
-
-    /// Add an operation with pre-constructed `Op` (OE-2 single-IR migration target).
-    ///
-    /// 直接接受 Op（带 dtype 字段），跳过 from_op_kind Translator。
-    /// graph builder 迁移到此 API 后，OpKind enum 可物理删除。
-    ///
-    /// `kind_fallback` 仅用于过渡期保留 CompilerOp.kind 字段（OE-4 删除字段时移除）。
-    pub fn add_op_with_op(
-        &mut self,
-        op: crate::compiler::graph::Op,
-        kind_fallback: OpKind,
-        inputs: Vec<TensorId>,
-        outputs: Vec<TensorId>,
-        label: &str,
-    ) -> OpId {
-        let id = OpId(self.next_op_id);
-        self.next_op_id += 1;
-
-        for &tid in &outputs {
-            if let Some(t) = self.tensor_mut(tid) {
-                t.producer = Some(id);
-            }
-        }
-        for &tid in &inputs {
-            if let Some(t) = self.tensor_mut(tid) {
-                t.consumers.push(id);
-            }
-        }
-
         let final_op = CompilerOp {
             id,
-            kind: kind_fallback,
-            inputs: inputs.clone(),
-            outputs: outputs.clone(),
+            inputs,
+            outputs,
             label: label.to_string(),
             guard: LayerCondition::Always,
             op_v2: op,
@@ -141,55 +95,11 @@ impl CompilerGraph {
     /// Add an operation with a layer execution guard.
     /// Ops inside a layer template can be conditionally skipped at runtime
     /// based on `layer_loop_counter`. See `LayerCondition` for semantics.
+    ///
+    /// OE-4 终点：单 IR (Op) 直接构造，OpKind enum 已物理删除。
     pub fn add_op_guarded(
         &mut self,
-        kind: OpKind,
-        inputs: Vec<TensorId>,
-        outputs: Vec<TensorId>,
-        label: &str,
-        guard: LayerCondition,
-    ) -> OpId {
-        let id = OpId(self.next_op_id);
-        self.next_op_id += 1;
-
-        for &tid in &outputs {
-            if let Some(t) = self.tensor_mut(tid) {
-                t.producer = Some(id);
-            }
-        }
-        for &tid in &inputs {
-            if let Some(t) = self.tensor_mut(tid) {
-                t.consumers.push(id);
-            }
-        }
-
-        // OE-3 必填化：占位 + 翻译 + 回填（避免 self-borrow）。
-        let placeholder_op = crate::compiler::graph::Op::Silu;
-        let temp = CompilerOp {
-            id,
-            kind: kind.clone(),
-            inputs: inputs.clone(),
-            outputs: outputs.clone(),
-            label: label.to_string(),
-            guard,
-            op_v2: placeholder_op,
-        };
-        let op_v2 = crate::compiler::graph::Op::from_op_kind(&temp, self)
-            .unwrap_or_else(|| panic!("OpKind {:?} has no Op mapping (OE-3 invariant)", kind));
-        let mut final_op = temp;
-        final_op.op_v2 = op_v2;
-        self.ops.push(final_op);
-        id
-    }
-
-    /// Add a guarded operation with pre-constructed `Op` (OE-2 single-IR migration target).
-    ///
-    /// 与 `add_op_with_op` 对应的 guarded 版本，用于 layer 模板内带 LayerCondition 的 op。
-    /// `kind_fallback` 仅用于过渡期保留 CompilerOp.kind 字段（OE-4 删除字段时移除）。
-    pub fn add_op_guarded_with_op(
-        &mut self,
         op: crate::compiler::graph::Op,
-        kind_fallback: OpKind,
         inputs: Vec<TensorId>,
         outputs: Vec<TensorId>,
         label: &str,
@@ -211,9 +121,8 @@ impl CompilerGraph {
 
         let final_op = CompilerOp {
             id,
-            kind: kind_fallback,
-            inputs: inputs.clone(),
-            outputs: outputs.clone(),
+            inputs,
+            outputs,
             label: label.to_string(),
             guard,
             op_v2: op,
@@ -468,7 +377,7 @@ impl CompilerGraph {
 
         // RmsNorm₁
         let normed1 = g.add_tensor_concrete("normed1", &[b, h], dt);
-        g.add_op_with_op(Op::RmsNorm(NormSpec { feature_dim: h, eps: ir.rms_eps, dtype: DType::F32, has_weight: true }), OpKind::RmsNorm { feature_dim: h, eps: ir.rms_eps },
+        g.add_op(Op::RmsNorm(NormSpec { feature_dim: h, eps: ir.rms_eps, dtype: DType::F32, has_weight: true }),
             vec![input, w_norm1],
             vec![normed1],
             "rms_norm_1",
@@ -476,7 +385,7 @@ impl CompilerGraph {
 
         // Q projection: [B, H] × [H, Q] → [B, Q]
         let q_out = g.add_tensor_concrete("q", &[b, q_dim], dt);
-        g.add_op_with_op(Op::Gemm(GemmSpec { m: SymDim::Concrete(b), n: q_dim, k: h, dtype: dt, trans_b: false, has_bias: false }), OpKind::Gemm { m: SymDim::Concrete(b), n: q_dim, k: h, dtype: dt, trans_b: false },
+        g.add_op(Op::Gemm(GemmSpec { m: SymDim::Concrete(b), n: q_dim, k: h, dtype: dt, trans_b: false, has_bias: false }),
             vec![normed1, w_q],
             vec![q_out],
             "gemm_q",
@@ -484,7 +393,7 @@ impl CompilerGraph {
 
         // K projection: [B, H] × [H, KV] → [B, KV]
         let k_out = g.add_tensor_concrete("k", &[b, kv_dim], dt);
-        g.add_op_with_op(Op::Gemm(GemmSpec { m: SymDim::Concrete(b), n: kv_dim, k: h, dtype: dt, trans_b: false, has_bias: false }), OpKind::Gemm { m: SymDim::Concrete(b), n: kv_dim, k: h, dtype: dt, trans_b: false },
+        g.add_op(Op::Gemm(GemmSpec { m: SymDim::Concrete(b), n: kv_dim, k: h, dtype: dt, trans_b: false, has_bias: false }),
             vec![normed1, w_k],
             vec![k_out],
             "gemm_k",
@@ -492,7 +401,7 @@ impl CompilerGraph {
 
         // V projection: [B, H] × [H, KV] → [B, KV]
         let v_out = g.add_tensor_concrete("v", &[b, kv_dim], dt);
-        g.add_op_with_op(Op::Gemm(GemmSpec { m: SymDim::Concrete(b), n: kv_dim, k: h, dtype: dt, trans_b: false, has_bias: false }), OpKind::Gemm { m: SymDim::Concrete(b), n: kv_dim, k: h, dtype: dt, trans_b: false },
+        g.add_op(Op::Gemm(GemmSpec { m: SymDim::Concrete(b), n: kv_dim, k: h, dtype: dt, trans_b: false, has_bias: false }),
             vec![normed1, w_v],
             vec![v_out],
             "gemm_v",
@@ -500,7 +409,7 @@ impl CompilerGraph {
 
         // RoPE on Q
         let q_rope = g.add_tensor_concrete("q_rope", &[b, q_dim], dt);
-        g.add_op_with_op(Op::RoPE(RopeSpec { num_heads: ir.num_heads, head_dim: ir.head_dim, theta: ir.rope_theta, partial: ir.partial_rotary_factor, rope_scaling: None }), OpKind::RoPE { num_heads: ir.num_heads, head_dim: ir.head_dim, theta: ir.rope_theta, partial: ir.partial_rotary_factor, rope_scaling: None },
+        g.add_op(Op::RoPE(RopeSpec { num_heads: ir.num_heads, head_dim: ir.head_dim, theta: ir.rope_theta, partial: ir.partial_rotary_factor, rope_scaling: None }),
             vec![q_out, cos_sin],
             vec![q_rope],
             "rope_q",
@@ -508,7 +417,7 @@ impl CompilerGraph {
 
         // RoPE on K
         let k_rope = g.add_tensor_concrete("k_rope", &[b, kv_dim], dt);
-        g.add_op_with_op(Op::RoPE(RopeSpec { num_heads: ir.num_kv_heads, head_dim: ir.head_dim, theta: ir.rope_theta, partial: ir.partial_rotary_factor, rope_scaling: None }), OpKind::RoPE { num_heads: ir.num_kv_heads, head_dim: ir.head_dim, theta: ir.rope_theta, partial: ir.partial_rotary_factor, rope_scaling: None },
+        g.add_op(Op::RoPE(RopeSpec { num_heads: ir.num_kv_heads, head_dim: ir.head_dim, theta: ir.rope_theta, partial: ir.partial_rotary_factor, rope_scaling: None }),
             vec![k_out, cos_sin],
             vec![k_rope],
             "rope_k",
@@ -524,21 +433,21 @@ impl CompilerGraph {
         // Multi-head parallelism is implicit (num_heads independent heads).
         // Fusion will expand this into FlashAttention tiling.
         let attn_scores = g.add_tensor_concrete("attn_scores", &[b, ir.num_heads, b], dt);
-        g.add_op_with_op(Op::Gemm(GemmSpec { m: SymDim::Concrete(b), n: b, k: ir.head_dim, dtype: dt, trans_b: false, has_bias: false }), OpKind::Gemm { m: SymDim::Concrete(b), n: b, k: ir.head_dim, dtype: dt, trans_b: false },
+        g.add_op(Op::Gemm(GemmSpec { m: SymDim::Concrete(b), n: b, k: ir.head_dim, dtype: dt, trans_b: false, has_bias: false }),
             vec![q_rope, k_rope],
             vec![attn_scores],
             "attn_qk",
         );
 
         let attn_probs = g.add_tensor_concrete("attn_probs", &[b, ir.num_heads, b], dt);
-        g.add_op_with_op(Op::Softmax, OpKind::Softmax,
+        g.add_op(Op::Softmax,
             vec![attn_scores],
             vec![attn_probs],
             "attn_softmax",
         );
 
         let attn_out = g.add_tensor_concrete("attn_out", &[b, q_dim], dt);
-        g.add_op_with_op(Op::Gemm(GemmSpec { m: SymDim::Concrete(b), n: ir.head_dim, k: b, dtype: dt, trans_b: false, has_bias: false }), OpKind::Gemm { m: SymDim::Concrete(b), n: ir.head_dim, k: b, dtype: dt, trans_b: false },
+        g.add_op(Op::Gemm(GemmSpec { m: SymDim::Concrete(b), n: ir.head_dim, k: b, dtype: dt, trans_b: false, has_bias: false }),
             vec![attn_probs, v_out],
             vec![attn_out],
             "attn_v",
@@ -546,7 +455,7 @@ impl CompilerGraph {
 
         // O projection: [B, Q] × [Q, H] → [B, H]
         let o_out = g.add_tensor_concrete("o_proj", &[b, h], dt);
-        g.add_op_with_op(Op::Gemm(GemmSpec { m: SymDim::Concrete(b), n: h, k: q_dim, dtype: dt, trans_b: false, has_bias: false }), OpKind::Gemm { m: SymDim::Concrete(b), n: h, k: q_dim, dtype: dt, trans_b: false },
+        g.add_op(Op::Gemm(GemmSpec { m: SymDim::Concrete(b), n: h, k: q_dim, dtype: dt, trans_b: false, has_bias: false }),
             vec![attn_out, w_o],
             vec![o_out],
             "gemm_o",
@@ -554,7 +463,7 @@ impl CompilerGraph {
 
         // Residual₁: input + o_out
         let resid1 = g.add_tensor_concrete("residual1", &[b, h], dt);
-        g.add_op_with_op(Op::Residual, OpKind::Residual,
+        g.add_op(Op::Residual,
             vec![input, o_out],
             vec![resid1],
             "residual_1",
@@ -564,7 +473,7 @@ impl CompilerGraph {
 
         // RmsNorm₂
         let normed2 = g.add_tensor_concrete("normed2", &[b, h], dt);
-        g.add_op_with_op(Op::RmsNorm(NormSpec { feature_dim: h, eps: ir.rms_eps, dtype: DType::F32, has_weight: true }), OpKind::RmsNorm { feature_dim: h, eps: ir.rms_eps },
+        g.add_op(Op::RmsNorm(NormSpec { feature_dim: h, eps: ir.rms_eps, dtype: DType::F32, has_weight: true }),
             vec![resid1, w_norm2],
             vec![normed2],
             "rms_norm_2",
@@ -572,7 +481,7 @@ impl CompilerGraph {
 
         // Gate GEMM: [B, H] × [H, Inter] → [B, Inter]
         let gate_out = g.add_tensor_concrete("gate", &[b, inter], dt);
-        g.add_op_with_op(Op::Gemm(GemmSpec { m: SymDim::Concrete(b), n: inter, k: h, dtype: dt, trans_b: false, has_bias: false }), OpKind::Gemm { m: SymDim::Concrete(b), n: inter, k: h, dtype: dt, trans_b: false },
+        g.add_op(Op::Gemm(GemmSpec { m: SymDim::Concrete(b), n: inter, k: h, dtype: dt, trans_b: false, has_bias: false }),
             vec![normed2, w_gate],
             vec![gate_out],
             "gemm_gate",
@@ -580,7 +489,7 @@ impl CompilerGraph {
 
         // Up GEMM: [B, H] × [H, Inter] → [B, Inter]
         let up_out = g.add_tensor_concrete("up", &[b, inter], dt);
-        g.add_op_with_op(Op::Gemm(GemmSpec { m: SymDim::Concrete(b), n: inter, k: h, dtype: dt, trans_b: false, has_bias: false }), OpKind::Gemm { m: SymDim::Concrete(b), n: inter, k: h, dtype: dt, trans_b: false },
+        g.add_op(Op::Gemm(GemmSpec { m: SymDim::Concrete(b), n: inter, k: h, dtype: dt, trans_b: false, has_bias: false }),
             vec![normed2, w_up],
             vec![up_out],
             "gemm_up",
@@ -588,10 +497,10 @@ impl CompilerGraph {
 
         // Gated activation fusion: activation(gate) * up
         let ffn_act = g.add_tensor_concrete("ffn_act", &[b, inter], dt);
-        let (act_kind, act_label) = match ir.activation {
-            Activation::Silu => (OpKind::SwiGlu, "swiglu"),
-            Activation::Gelu => (OpKind::GeGlu, "geglu"),
-            Activation::GeGlu => (OpKind::GeGlu, "geglu"),
+        let (act_op, act_label) = match ir.activation {
+            Activation::Silu => (Op::SwiGlu, "swiglu"),
+            Activation::Gelu => (Op::GeGlu, "geglu"),
+            Activation::GeGlu => (Op::GeGlu, "geglu"),
             Activation::None | Activation::Relu => {
                 return Err(format!(
                     "Unsupported gated activation {:?} in FFN — \
@@ -601,7 +510,7 @@ impl CompilerGraph {
             }
         };
         g.add_op(
-            act_kind,
+            act_op,
             vec![gate_out, up_out],
             vec![ffn_act],
             act_label,
@@ -609,7 +518,7 @@ impl CompilerGraph {
 
         // Down GEMM: [B, Inter] × [Inter, H] → [B, H]
         let down_out = g.add_tensor_concrete("down", &[b, h], dt);
-        g.add_op_with_op(Op::Gemm(GemmSpec { m: SymDim::Concrete(b), n: h, k: inter, dtype: dt, trans_b: false, has_bias: false }), OpKind::Gemm { m: SymDim::Concrete(b), n: h, k: inter, dtype: dt, trans_b: false },
+        g.add_op(Op::Gemm(GemmSpec { m: SymDim::Concrete(b), n: h, k: inter, dtype: dt, trans_b: false, has_bias: false }),
             vec![ffn_act, w_down],
             vec![down_out],
             "gemm_down",
@@ -617,7 +526,7 @@ impl CompilerGraph {
 
         // Residual₂: resid1 + down_out
         let output = g.add_tensor_concrete("output", &[b, h], dt);
-        g.add_op_with_op(Op::Residual, OpKind::Residual,
+        g.add_op(Op::Residual,
             vec![resid1, down_out],
             vec![output],
             "residual_2",
@@ -665,7 +574,7 @@ impl CompilerGraph {
 
         // LayerNorm₁ (with bias, unlike RmsNorm)
         let normed1 = g.add_tensor_concrete("normed1", &[seq, h], dt);
-        g.add_op_with_op(Op::LayerNorm(NormSpec { feature_dim: h, eps: ir.rms_eps, dtype: DType::F32, has_weight: true }), OpKind::LayerNorm { feature_dim: h, eps: ir.rms_eps },
+        g.add_op(Op::LayerNorm(NormSpec { feature_dim: h, eps: ir.rms_eps, dtype: DType::F32, has_weight: true }),
             vec![input, w_norm1, w_norm1_b],
             vec![normed1],
             "layer_norm_1",
@@ -673,7 +582,7 @@ impl CompilerGraph {
 
         // Q projection: [seq, H] × [H, Q] → [seq, Q]
         let q_out = g.add_tensor_concrete("q", &[seq, q_dim], dt);
-        g.add_op_with_op(Op::Gemm(GemmSpec { m: SymDim::Concrete(seq), n: q_dim, k: h, dtype: dt, trans_b: false, has_bias: false }), OpKind::Gemm { m: SymDim::Concrete(seq), n: q_dim, k: h, dtype: dt, trans_b: false },
+        g.add_op(Op::Gemm(GemmSpec { m: SymDim::Concrete(seq), n: q_dim, k: h, dtype: dt, trans_b: false, has_bias: false }),
             vec![normed1, w_q],
             vec![q_out],
             "gemm_q",
@@ -681,7 +590,7 @@ impl CompilerGraph {
 
         // K projection: [seq, H] × [H, KV] → [seq, KV]
         let k_out = g.add_tensor_concrete("k", &[seq, kv_dim], dt);
-        g.add_op_with_op(Op::Gemm(GemmSpec { m: SymDim::Concrete(seq), n: kv_dim, k: h, dtype: dt, trans_b: false, has_bias: false }), OpKind::Gemm { m: SymDim::Concrete(seq), n: kv_dim, k: h, dtype: dt, trans_b: false },
+        g.add_op(Op::Gemm(GemmSpec { m: SymDim::Concrete(seq), n: kv_dim, k: h, dtype: dt, trans_b: false, has_bias: false }),
             vec![normed1, w_k],
             vec![k_out],
             "gemm_k",
@@ -689,7 +598,7 @@ impl CompilerGraph {
 
         // V projection: [seq, H] × [H, KV] → [seq, KV]
         let v_out = g.add_tensor_concrete("v", &[seq, kv_dim], dt);
-        g.add_op_with_op(Op::Gemm(GemmSpec { m: SymDim::Concrete(seq), n: kv_dim, k: h, dtype: dt, trans_b: false, has_bias: false }), OpKind::Gemm { m: SymDim::Concrete(seq), n: kv_dim, k: h, dtype: dt, trans_b: false },
+        g.add_op(Op::Gemm(GemmSpec { m: SymDim::Concrete(seq), n: kv_dim, k: h, dtype: dt, trans_b: false, has_bias: false }),
             vec![normed1, w_v],
             vec![v_out],
             "gemm_v",
@@ -697,15 +606,7 @@ impl CompilerGraph {
 
         // Multi-head attention (no RoPE for encoder, bidirectional)
         let attn_out = g.add_tensor_concrete("attn_out", &[seq, q_dim], dt);
-        g.add_op_with_op(Op::MultiHeadAttention(AttentionSpec { geometry: AttentionGeometry { num_q_heads: ir.num_heads, num_kv_heads: ir.num_heads, head_dim: ir.head_dim }, mask: if false { AttentionMask::Causal } else { AttentionMask::Full }, kv_source: crate::compiler::graph::KvSource::FromTensor, sinks: if false { SinksSpec::Learnable } else { SinksSpec::None }, seq_len: SymDim::Concrete(seq), dtype: DType::F32 }), OpKind::MultiHeadAttention {
-                seq_len: SymDim::Concrete(seq),
-                num_heads: ir.num_heads,
-                num_kv_heads: ir.num_heads, // encoder: num_kv_heads == num_heads
-                head_dim: ir.head_dim,
-                causal: false, // encoder: bidirectional attention
-                attention_sinks: false,
-                kv_source: crate::compiler::graph::KvSource::FromTensor,
-            },
+        g.add_op(Op::MultiHeadAttention(AttentionSpec { geometry: AttentionGeometry { num_q_heads: ir.num_heads, num_kv_heads: ir.num_heads, head_dim: ir.head_dim }, mask: if false { AttentionMask::Causal } else { AttentionMask::Full }, kv_source: crate::compiler::graph::KvSource::FromTensor, sinks: if false { SinksSpec::Learnable } else { SinksSpec::None }, seq_len: SymDim::Concrete(seq), dtype: DType::F32 }),
             vec![q_out, k_out, v_out],
             vec![attn_out],
             "mha",
@@ -713,7 +614,7 @@ impl CompilerGraph {
 
         // O projection: [seq, Q] × [Q, H] → [seq, H]
         let o_out = g.add_tensor_concrete("o_proj", &[seq, h], dt);
-        g.add_op_with_op(Op::Gemm(GemmSpec { m: SymDim::Concrete(seq), n: h, k: q_dim, dtype: dt, trans_b: false, has_bias: false }), OpKind::Gemm { m: SymDim::Concrete(seq), n: h, k: q_dim, dtype: dt, trans_b: false },
+        g.add_op(Op::Gemm(GemmSpec { m: SymDim::Concrete(seq), n: h, k: q_dim, dtype: dt, trans_b: false, has_bias: false }),
             vec![attn_out, w_o],
             vec![o_out],
             "gemm_o",
@@ -721,7 +622,7 @@ impl CompilerGraph {
 
         // Residual₁: input + o_out
         let resid1 = g.add_tensor_concrete("residual1", &[seq, h], dt);
-        g.add_op_with_op(Op::Residual, OpKind::Residual,
+        g.add_op(Op::Residual,
             vec![input, o_out],
             vec![resid1],
             "residual_1",
@@ -731,7 +632,7 @@ impl CompilerGraph {
 
         // LayerNorm₂
         let normed2 = g.add_tensor_concrete("normed2", &[seq, h], dt);
-        g.add_op_with_op(Op::LayerNorm(NormSpec { feature_dim: h, eps: ir.rms_eps, dtype: DType::F32, has_weight: true }), OpKind::LayerNorm { feature_dim: h, eps: ir.rms_eps },
+        g.add_op(Op::LayerNorm(NormSpec { feature_dim: h, eps: ir.rms_eps, dtype: DType::F32, has_weight: true }),
             vec![resid1, w_norm2, w_norm2_b],
             vec![normed2],
             "layer_norm_2",
@@ -739,7 +640,7 @@ impl CompilerGraph {
 
         // Up GEMM: [seq, H] × [H, Inter] → [seq, Inter]
         let up_out = g.add_tensor_concrete("up", &[seq, inter], dt);
-        g.add_op_with_op(Op::Gemm(GemmSpec { m: SymDim::Concrete(seq), n: inter, k: h, dtype: dt, trans_b: false, has_bias: false }), OpKind::Gemm { m: SymDim::Concrete(seq), n: inter, k: h, dtype: dt, trans_b: false },
+        g.add_op(Op::Gemm(GemmSpec { m: SymDim::Concrete(seq), n: inter, k: h, dtype: dt, trans_b: false, has_bias: false }),
             vec![normed2, w_up],
             vec![up_out],
             "gemm_up",
@@ -747,7 +648,7 @@ impl CompilerGraph {
 
         // GELU activation
         let gelu_out = g.add_tensor_concrete("gelu", &[seq, inter], dt);
-        g.add_op_with_op(Op::Gelu, OpKind::Gelu,
+        g.add_op(Op::Gelu,
             vec![up_out],
             vec![gelu_out],
             "gelu",
@@ -755,7 +656,7 @@ impl CompilerGraph {
 
         // Down GEMM: [seq, Inter] × [Inter, H] → [seq, H]
         let down_out = g.add_tensor_concrete("down", &[seq, h], dt);
-        g.add_op_with_op(Op::Gemm(GemmSpec { m: SymDim::Concrete(seq), n: h, k: inter, dtype: dt, trans_b: false, has_bias: false }), OpKind::Gemm { m: SymDim::Concrete(seq), n: h, k: inter, dtype: dt, trans_b: false },
+        g.add_op(Op::Gemm(GemmSpec { m: SymDim::Concrete(seq), n: h, k: inter, dtype: dt, trans_b: false, has_bias: false }),
             vec![gelu_out, w_down],
             vec![down_out],
             "gemm_down",
@@ -763,7 +664,7 @@ impl CompilerGraph {
 
         // Residual₂: resid1 + down_out
         let resid2 = g.add_tensor_concrete("residual2", &[seq, h], dt);
-        g.add_op_with_op(Op::Residual, OpKind::Residual,
+        g.add_op(Op::Residual,
             vec![resid1, down_out],
             vec![resid2],
             "residual_2",
@@ -773,7 +674,7 @@ impl CompilerGraph {
 
         // Mean pooling across sequence dimension → [1, H]
         let pooled = g.add_tensor_concrete("pooled", &[1, h], dt);
-        g.add_op_with_op(Op::MeanPool { seq_len: seq, hidden: h, cls_mode: false }, OpKind::MeanPool { seq_len: seq, hidden: h, cls_mode: false },
+        g.add_op(Op::MeanPool { seq_len: seq, hidden: h, cls_mode: false },
             vec![resid2],
             vec![pooled],
             "mean_pool",
@@ -781,7 +682,7 @@ impl CompilerGraph {
 
         // L2 normalize the embedding
         let normalized = g.add_tensor_concrete("normalized", &[1, h], dt);
-        g.add_op_with_op(Op::L2Normalize { hidden: h }, OpKind::L2Normalize { hidden: h },
+        g.add_op(Op::L2Normalize { hidden: h },
             vec![pooled],
             vec![normalized],
             "l2_normalize",

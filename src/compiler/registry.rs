@@ -1,5 +1,4 @@
 use std::collections::HashMap;
-use crate::compiler::graph::OpKind;
 use crate::compiler::trace::{build_quant_gather_trace, classify_pattern, ComputePattern, OpTrace, ReductionSecondPass, ScalarFnSignature, ScalarParam, TraceOp, ValueId};
 use crate::compiler::symexec::SymExecError;
 use crate::types::DType;

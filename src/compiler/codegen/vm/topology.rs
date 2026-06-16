@@ -111,11 +111,11 @@ pub struct GraphTopologyAnalysis {
     /// Used by prologue to decide whether to load weight_ptr.
     pub weight_source: WeightSource,
 
-    /// QkNorm presence — from graph ops (OpKind::QkNorm).
+    /// QkNorm presence — from graph ops (Op::QkNorm).
     /// Used by BUILD stage to derive Gemma norm residual convention.
     pub has_qk_norm: bool,
 
-    /// 词表大小 — 从 OpKind::Argmax { vocab_size } 推导。
+    /// 词表大小 — 从 Op::Argmax { vocab_size:  } 推导。
     /// 图无 Argmax 时为 None。
     pub vocab_size: Option<usize>,
 
@@ -126,13 +126,13 @@ pub struct GraphTopologyAnalysis {
     /// logits 产出的 tensor ID — logits_producer_op_idx 对应 op 的 output[0]。
     pub logits_output_tid: Option<TensorId>,
 
-    /// MTP 配置 — 从 OpKind::MtpDraft { depth, hidden_size, vocab_size } 推导。
+    /// MTP 配置 — 从 Op::MtpDraft { depth: , hidden_size: , vocab_size:  } 推导。
     pub mtp_config: Option<MtpKernelConfig>,
 
-    /// SgDetect hidden_dim — 从 OpKind::SgDetect { hidden_dim, .. } 直接读取。
+    /// SgDetect hidden_dim — 从 Op::SgDetect { hidden_dim: , ..:  } 直接读取。
     pub sg_detect_hidden_dim: Option<usize>,
 
-    /// SgInject dim — 从 OpKind::SgInject { dim } 推导。
+    /// SgInject dim — 从 Op::SgInject { dim:  } 推导。
     pub sg_inject_hidden_dim: Option<usize>,
 
     // ── 层循环拓扑属性 ──
@@ -275,12 +275,12 @@ impl GraphTopologyAnalysis {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::compiler::graph::{CompilerGraph, OpKind, SymDim, Op, GemmSpec, NormSpec, QuantGemmSpec, RopeSpec, AttentionSpec, AttentionGeometry, AttentionMask, SinksSpec, CachedGqaSpec, MlaSpec, DualRopeSpec};
+    use crate::compiler::graph::{CompilerGraph, SymDim, Op, GemmSpec, NormSpec, QuantGemmSpec, RopeSpec, AttentionSpec, AttentionGeometry, AttentionMask, SinksSpec, CachedGqaSpec, MlaSpec, DualRopeSpec};
     use crate::types::DType;
 
-    fn make_test_graph(ops: Vec<OpKind>) -> CompilerGraph {
+    fn make_test_graph(ops: Vec<Op>) -> CompilerGraph {
         let mut graph = CompilerGraph::default();
-        for (i, kind) in ops.into_iter().enumerate() {
+        for (i, op) in ops.into_iter().enumerate() {
             let input_tid = graph.add_tensor_concrete(
                 &format!("input_{}", i),
                 &[1],
@@ -291,7 +291,7 @@ mod tests {
                 &[1],
                 DType::F32,
             );
-            graph.add_op(kind, vec![input_tid], vec![output_tid], &format!("op_{}", i));
+            graph.add_op(op, vec![input_tid], vec![output_tid], &format!("op_{}", i));
         }
         graph
     }
@@ -299,10 +299,10 @@ mod tests {
     #[test]
     fn generate_loop_detected_from_ops() {
         let graph = make_test_graph(vec![
-            OpKind::Gemm { m: SymDim::Concrete(1), n: 4096, k: 4096, dtype: DType::F32, trans_b: false },
-            OpKind::Argmax { vocab_size: 32000 },
-            OpKind::StoreToken,
-            OpKind::CheckStopCondition,
+            Op::Gemm(GemmSpec { m: SymDim::Concrete(1), n: 4096, k: 4096, dtype: DType::F32, trans_b: false, has_bias: false }),
+            Op::Argmax { vocab_size: 32000 },
+            Op::StoreToken,
+            Op::CheckStopCondition,
         ]);
         let topo = GraphTopologyAnalysis::analyze(&graph);
 
@@ -315,8 +315,8 @@ mod tests {
     #[test]
     fn no_generate_loop_without_argmax() {
         let graph = make_test_graph(vec![
-            OpKind::Gemm { m: SymDim::Concrete(1), n: 4096, k: 4096, dtype: DType::F32, trans_b: false },
-            OpKind::MeanPool { seq_len: 128, hidden: 768, cls_mode: false },
+            Op::Gemm(GemmSpec { m: SymDim::Concrete(1), n: 4096, k: 4096, dtype: DType::F32, trans_b: false, has_bias: false }),
+            Op::MeanPool { seq_len: 128, hidden: 768, cls_mode: false },
         ]);
         let topo = GraphTopologyAnalysis::analyze(&graph);
 
@@ -329,7 +329,7 @@ mod tests {
     #[test]
     fn partial_argmax_without_store_token() {
         let graph = make_test_graph(vec![
-            OpKind::Argmax { vocab_size: 32000 },
+            Op::Argmax { vocab_size: 32000 },
         ]);
         let topo = GraphTopologyAnalysis::analyze(&graph);
 
@@ -339,10 +339,10 @@ mod tests {
     #[test]
     fn vocab_size_derived_from_argmax() {
         let graph = make_test_graph(vec![
-            OpKind::Gemm { m: SymDim::Concrete(1), n: 4096, k: 4096, dtype: DType::F32, trans_b: false },
-            OpKind::Argmax { vocab_size: 152344 },
-            OpKind::StoreToken,
-            OpKind::CheckStopCondition,
+            Op::Gemm(GemmSpec { m: SymDim::Concrete(1), n: 4096, k: 4096, dtype: DType::F32, trans_b: false, has_bias: false }),
+            Op::Argmax { vocab_size: 152344 },
+            Op::StoreToken,
+            Op::CheckStopCondition,
         ]);
         let topo = GraphTopologyAnalysis::analyze(&graph);
 
@@ -354,17 +354,17 @@ mod tests {
         let mut graph = CompilerGraph::default();
         let gemm_in = graph.add_tensor_concrete("gemm_in", &[1], DType::F32);
         let gemm_out = graph.add_tensor_concrete("gemm_out", &[1], DType::F32);
-        graph.add_op_with_op(Op::Gemm(GemmSpec { m: SymDim::Concrete(1), n: 4096, k: 4096, dtype: DType::F32, trans_b: false, has_bias: false }), OpKind::Gemm { m: SymDim::Concrete(1), n: 4096, k: 4096, dtype: DType::F32, trans_b: false },
+        graph.add_op(Op::Gemm(GemmSpec { m: SymDim::Concrete(1), n: 4096, k: 4096, dtype: DType::F32, trans_b: false, has_bias: false }),
             vec![gemm_in], vec![gemm_out], "final_proj",
         );
         let argmax_out = graph.add_tensor_concrete("argmax_out", &[1], DType::F32);
-        graph.add_op_with_op(Op::Argmax { vocab_size: 32000 }, OpKind::Argmax { vocab_size: 32000 },
+        graph.add_op(Op::Argmax { vocab_size: 32000 },
             vec![gemm_out], vec![argmax_out], "argmax",
         );
         let store_out = graph.add_tensor_concrete("store_out", &[1], DType::F32);
-        graph.add_op_with_op(Op::StoreToken, OpKind::StoreToken, vec![argmax_out], vec![store_out], "store");
+        graph.add_op(Op::StoreToken, vec![argmax_out], vec![store_out], "store");
         let check_out = graph.add_tensor_concrete("check_out", &[1], DType::F32);
-        graph.add_op_with_op(Op::CheckStopCondition, OpKind::CheckStopCondition, vec![store_out], vec![check_out], "check");
+        graph.add_op(Op::CheckStopCondition, vec![store_out], vec![check_out], "check");
 
         let topo = GraphTopologyAnalysis::analyze(&graph);
 
@@ -376,8 +376,8 @@ mod tests {
     #[test]
     fn sg_ops_detected_from_graph() {
         let graph = make_test_graph(vec![
-            OpKind::SgDetect { detect_offset: 0, hidden_dim: 0 },
-            OpKind::SgInject { knowledge_offset: 0, dim: 256 },
+            Op::SgDetect { detect_offset: 0, hidden_dim: 0 },
+            Op::SgInject { knowledge_offset: 0, dim: 256 },
         ]);
         let topo = GraphTopologyAnalysis::analyze(&graph);
 
@@ -388,7 +388,7 @@ mod tests {
     #[test]
     fn no_sg_ops_in_plain_graph() {
         let graph = make_test_graph(vec![
-            OpKind::Gemm { m: SymDim::Concrete(1), n: 4096, k: 4096, dtype: DType::F32, trans_b: false },
+            Op::Gemm(GemmSpec { m: SymDim::Concrete(1), n: 4096, k: 4096, dtype: DType::F32, trans_b: false, has_bias: false }),
         ]);
         let topo = GraphTopologyAnalysis::analyze(&graph);
 
@@ -398,7 +398,7 @@ mod tests {
     #[test]
     fn weight_source_detected_from_graph() {
         let graph = make_test_graph(vec![
-            OpKind::Gemm { m: SymDim::Concrete(1), n: 4096, k: 4096, dtype: DType::F32, trans_b: false },
+            Op::Gemm(GemmSpec { m: SymDim::Concrete(1), n: 4096, k: 4096, dtype: DType::F32, trans_b: false, has_bias: false }),
         ]);
         let topo = GraphTopologyAnalysis::analyze(&graph);
         assert_eq!(topo.weight_source, WeightSource::WeightRequired);
@@ -407,7 +407,7 @@ mod tests {
     #[test]
     fn no_weight_ops_in_value_norm_only_graph() {
         let graph = make_test_graph(vec![
-            OpKind::ValueNorm { feature_dim: 4096, eps: 1e-6 },
+            Op::ValueNorm(NormSpec { feature_dim: 4096, eps: 1e-6, dtype: DType::F32, has_weight: false }),
         ]);
         let topo = GraphTopologyAnalysis::analyze(&graph);
         assert_eq!(topo.weight_source, WeightSource::NoWeight);

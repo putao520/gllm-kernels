@@ -3,7 +3,7 @@
 //! REQ-JIT-QUANT-001: Format conversion via FP32 intermediate + graph-level quantization.
 
 use crate::compiler::quant_ir::{QuantFormat, QuantIR};
-use crate::compiler::graph::{CompilerGraph, Op, OpKind};
+use crate::compiler::graph::{CompilerGraph, Op};
 // QuantCodegen/PtxQuantCodegen 已迁移到 Register VM。
 // 量化 codegen 将通过 VmInstr::Transcendental(Dequant) + IsaLower 实现。
 use crate::types::CompilerError;
@@ -258,8 +258,9 @@ pub fn apply_quantization(
     Ok(())
 }
 
-fn should_quantize_op(kind: &OpKind) -> bool {
-    matches!(kind, OpKind::Gemm { .. } | OpKind::GemmBias { .. })
+fn should_quantize_op(op: &Op) -> bool {
+    // OE-4: 胖 opcode 自描述 — Gemm/GemmBias 是可量化目标，QuantGemm 已量化。
+    matches!(op, Op::Gemm(_) | Op::GemmBias(_))
 }
 
 #[cfg(test)]
@@ -409,11 +410,11 @@ mod tests {
     #[test]
     fn should_quantize_op_gemm_only() {
         use crate::compiler::graph::{SymDim, GemmSpec};
-        assert!(should_quantize_op(&OpKind::Gemm {
-            m: SymDim::Concrete(1), n: 64, k: 64, dtype: crate::types::DType::F32, trans_b: false
-        }));
-        assert!(!should_quantize_op(&OpKind::Silu));
-        assert!(!should_quantize_op(&OpKind::Add));
+        assert!(should_quantize_op(&Op::Gemm(GemmSpec {
+            m: SymDim::Concrete(1), n: 64, k: 64, dtype: crate::types::DType::F32, trans_b: false, has_bias: false
+        })));
+        assert!(!should_quantize_op(&Op::Silu));
+        assert!(!should_quantize_op(&Op::Add));
     }
 
     // ── Test 13: quantize_from_fp32 Int8 single element ──
@@ -513,10 +514,10 @@ mod tests {
     #[test]
     fn should_quantize_op_gemm_bias() {
         use crate::compiler::graph::{SymDim, GemmSpec};
-        assert!(should_quantize_op(&OpKind::GemmBias {
+        assert!(should_quantize_op(&Op::GemmBias(GemmSpec {
             m: SymDim::Concrete(1), n: 64, k: 64,
-            dtype: crate::types::DType::F32, trans_b: false,
-        }));
+            dtype: crate::types::DType::F32, trans_b: false, has_bias: true,
+        })));
     }
 
     #[test]
@@ -569,7 +570,7 @@ mod tests {
         let input = graph.add_tensor_concrete("input", &[16], DType::F32);
         let weight = graph.add_tensor_concrete("weight", &[16, 16], DType::F32);
         let output = graph.add_tensor_concrete("output", &[16], DType::F32);
-        graph.add_op_with_op(Op::Gemm(GemmSpec { m: SymDim::Concrete(1), n: 16, k: 16, dtype: DType::F32, trans_b: false, has_bias: false }), OpKind::Gemm { m: SymDim::Concrete(1), n: 16, k: 16, dtype: DType::F32, trans_b: false },
+        graph.add_op(Op::Gemm(GemmSpec { m: SymDim::Concrete(1), n: 16, k: 16, dtype: DType::F32, trans_b: false, has_bias: false }),
             vec![input, weight],
             vec![output],
             "gemm",

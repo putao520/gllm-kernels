@@ -341,7 +341,7 @@ pub(super) fn emit_fusion_group_by_mode(
                     if *n >= 1 {
                         let epi_kinds: Vec<_> = group.epilogue.iter()
                             .filter_map(|&oid| graph.op(oid))
-                            .map(|o| format!("{:?}(inputs={})", o.kind, o.inputs.len()))
+                            .map(|o| format!("{:?}(inputs={})", o.op_v2, o.inputs.len()))
                             .collect();
                         return Err(CompilerError::CodegenViolation(format!(
                             "EpilogueInjection: GEMM epilogue trace 引用 Input({}) — \
@@ -712,8 +712,7 @@ mod tests {
     use super::*;
     use super::super::plan_lower::CompileSession;
     use crate::compiler::fusion::GroupMarker;
-    use crate::compiler::graph::OpKind;
-    use crate::compiler::layout_negotiator::{
+        use crate::compiler::layout_negotiator::{
         LayoutTransform, InterOpTransform, MovementType, GroupLayoutAssignment,
         LayoutAssignment,
     };
@@ -1407,7 +1406,7 @@ mod tests {
         let mut graph = CompilerGraph::new();
         let tid = graph.add_tensor_concrete("hidden", &[1, 512], DType::BF16);
         let out_tid = graph.add_tensor_concrete("output", &[1, 512], DType::BF16);
-        let op_id = graph.add_op_with_op(Op::RmsNorm(NormSpec { feature_dim: 4096, eps: 1e-5, dtype: DType::F32, has_weight: true }), OpKind::RmsNorm { feature_dim: 4096, eps: 1e-5 },
+        let op_id = graph.add_op(Op::RmsNorm(NormSpec { feature_dim: 4096, eps: 1e-5, dtype: DType::F32, has_weight: true }),
             vec![tid],
             vec![out_tid],
             "norm",
@@ -1694,7 +1693,7 @@ mod tests {
         let mut graph = CompilerGraph::new();
         let tid = graph.add_tensor_concrete("hidden_f32", &[1, 256], DType::F32);
         let out_tid = graph.add_tensor_concrete("output_f32", &[1, 256], DType::F32);
-        let op_id = graph.add_op_with_op(Op::RmsNorm(NormSpec { feature_dim: 4096, eps: 1e-6, dtype: DType::F32, has_weight: true }), OpKind::RmsNorm { feature_dim: 4096, eps: 1e-6 },
+        let op_id = graph.add_op(Op::RmsNorm(NormSpec { feature_dim: 4096, eps: 1e-6, dtype: DType::F32, has_weight: true }),
             vec![tid],
             vec![out_tid],
             "norm_f32",
@@ -1727,7 +1726,7 @@ mod tests {
         let mut graph = CompilerGraph::new();
         let tid = graph.add_tensor_concrete("hidden_f16", &[2, 128], DType::F16);
         let out_tid = graph.add_tensor_concrete("output_f16", &[2, 128], DType::F16);
-        let op_id = graph.add_op_with_op(Op::RmsNorm(NormSpec { feature_dim: 4096, eps: 1e-5, dtype: DType::F32, has_weight: true }), OpKind::RmsNorm { feature_dim: 4096, eps: 1e-5 },
+        let op_id = graph.add_op(Op::RmsNorm(NormSpec { feature_dim: 4096, eps: 1e-5, dtype: DType::F32, has_weight: true }),
             vec![tid],
             vec![out_tid],
             "norm_f16",
@@ -1867,8 +1866,8 @@ mod tests {
         let t0 = graph.add_tensor_concrete("in", &[1, 64], DType::BF16);
         let t1 = graph.add_tensor_concrete("mid", &[1, 64], DType::BF16);
         let t2 = graph.add_tensor_concrete("out", &[1, 64], DType::BF16);
-        let op0 = graph.add_op_with_op(Op::RmsNorm(NormSpec { feature_dim: 4096, eps: 1e-5, dtype: DType::F32, has_weight: true }), OpKind::RmsNorm { feature_dim: 4096, eps: 1e-5 }, vec![t0], vec![t1], "norm");
-        let op1 = graph.add_op_with_op(Op::RmsNorm(NormSpec { feature_dim: 4096, eps: 1e-5, dtype: DType::F32, has_weight: true }), OpKind::RmsNorm { feature_dim: 4096, eps: 1e-5 }, vec![t1], vec![t2], "norm2");
+        let op0 = graph.add_op(Op::RmsNorm(NormSpec { feature_dim: 4096, eps: 1e-5, dtype: DType::F32, has_weight: true }), vec![t0], vec![t1], "norm");
+        let op1 = graph.add_op(Op::RmsNorm(NormSpec { feature_dim: 4096, eps: 1e-5, dtype: DType::F32, has_weight: true }), vec![t1], vec![t2], "norm2");
         let group = FusionGroup {
             id: 0, anchor: op0, epilogue: vec![op1], mode: FusionMode::LoopFusion,
             ops: vec![op0, op1], multi_output: MultiOutputConfig::single(),

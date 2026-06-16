@@ -13,7 +13,7 @@ mod tests {
         let out = g.add_tensor_concrete("output", &[32], DType::F32);
         g.inputs = vec![inp];
         g.outputs = vec![out];
-        let op_id = g.add_op_with_op(Op::Silu, OpKind::Silu, vec![inp], vec![out], "silu");
+        let op_id = g.add_op(Op::Silu, vec![inp], vec![out], "silu");
 
         let mut op_to_group = HashMap::new();
         op_to_group.insert(op_id, 0);
@@ -53,7 +53,7 @@ mod tests {
         let c = g.add_tensor_concrete("C", &[4, 8], DType::F32);
         g.inputs = vec![a, b];
         g.outputs = vec![c];
-        let op_id = g.add_op_with_op(Op::Gemm(crate::compiler::graph::GemmSpec { m: SymDim::Concrete(4), n: 8, k: 16, dtype: DType::F32, trans_b: false, has_bias: false }), OpKind::Gemm { m: SymDim::Concrete(4), n: 8, k: 16, dtype: DType::F32, trans_b: false },
+        let op_id = g.add_op(Op::Gemm(crate::compiler::graph::GemmSpec { m: SymDim::Concrete(4), n: 8, k: 16, dtype: DType::F32, trans_b: false, has_bias: false }),
             vec![a, b], vec![c], "gemm",
         );
 
@@ -94,7 +94,7 @@ mod tests {
         let out = g.add_tensor_concrete("out", &[32], DType::F32);
         g.inputs = vec![input];
         g.outputs = vec![out];
-        let op_id = g.add_op_with_op(Op::Silu, OpKind::Silu, vec![input], vec![out], "silu");
+        let op_id = g.add_op(Op::Silu, vec![input], vec![out], "silu");
         let mut op_to_group = HashMap::new();
         op_to_group.insert(op_id, 0);
         let plan = FusionPlan {
@@ -162,7 +162,7 @@ mod tests {
         let out = g.add_tensor_concrete("out", &[num_patches, embed_dim], dt);
         g.inputs = vec![patches, pos];
         g.outputs = vec![out];
-        let op = g.add_op_with_op(Op::LearnedPos2D { num_patches: num_patches, embed_dim: embed_dim }, OpKind::LearnedPos2D { num_patches, embed_dim },
+        let op = g.add_op(Op::LearnedPos2D { num_patches: num_patches, embed_dim: embed_dim },
             vec![patches, pos], vec![out], "learned_pos2d",
         );
         let mut op_to_group = HashMap::new();
@@ -194,7 +194,7 @@ mod tests {
         let out = g.add_tensor_concrete("out", &[seq, channels], dt);
         g.inputs = vec![x, w];
         g.outputs = vec![out];
-        let op = g.add_op_with_op(Op::DepthwiseConv1D { channels: channels, kernel_size: kernel_size, causal: causal }, OpKind::DepthwiseConv1D { channels, kernel_size, causal },
+        let op = g.add_op(Op::DepthwiseConv1D { channels: channels, kernel_size: kernel_size, causal: causal },
             vec![x, w], vec![out], "dwc_gpu",
         );
         let mut op_to_group = HashMap::new();
@@ -228,7 +228,7 @@ mod tests {
         let out = g.add_tensor_concrete("out", &[num_patches, embed_dim], dt);
         g.inputs = vec![x, w];
         g.outputs = vec![out];
-        let op = g.add_op_with_op(Op::PatchEmbed { patch_size: patch_size, embed_dim: embed_dim, in_channels: in_channels, image_size: image_size }, OpKind::PatchEmbed { patch_size, embed_dim, in_channels, image_size },
+        let op = g.add_op(Op::PatchEmbed { patch_size: patch_size, embed_dim: embed_dim, in_channels: in_channels, image_size: image_size },
             vec![x, w], vec![out], "patch_embed",
         );
         let mut op_to_group = HashMap::new();
@@ -478,9 +478,9 @@ mod tests {
         let t3 = g.add_tensor_concrete("t3", &[32], DType::F32);
         g.inputs = vec![t0];
         g.outputs = vec![t3];
-        let op0 = g.add_op_with_op(Op::Silu, OpKind::Silu, vec![t0], vec![t1], "op0");
-        let op1 = g.add_op_with_op(Op::Gelu, OpKind::Gelu, vec![t1], vec![t2], "op1");
-        let op2 = g.add_op_with_op(Op::Silu, OpKind::Silu, vec![t2], vec![t3], "op2");
+        let op0 = g.add_op(Op::Silu, vec![t0], vec![t1], "op0");
+        let op1 = g.add_op(Op::Gelu, vec![t1], vec![t2], "op1");
+        let op2 = g.add_op(Op::Silu, vec![t2], vec![t3], "op2");
 
         let plan = FusionPlan {
             groups: vec![
@@ -507,8 +507,8 @@ mod tests {
         let t2 = g.add_tensor_concrete("t2", &[32], DType::F32);
         g.inputs = vec![t0];
         g.outputs = vec![t1, t2];
-        let op0 = g.add_op_with_op(Op::Silu, OpKind::Silu, vec![t0], vec![t1], "op0");
-        let op1 = g.add_op_with_op(Op::Gelu, OpKind::Gelu, vec![t0], vec![t2], "op1");
+        let op0 = g.add_op(Op::Silu, vec![t0], vec![t1], "op0");
+        let op1 = g.add_op(Op::Gelu, vec![t0], vec![t2], "op1");
 
         let plan = FusionPlan {
             groups: vec![
@@ -608,8 +608,8 @@ mod tests {
         let t1 = g.add_tensor_concrete("t1", &[32], DType::F32);
         let t2 = g.add_tensor_concrete("t2", &[32], DType::F32);
         g.inputs = vec![t0]; g.outputs = vec![t2];
-        let op0 = g.add_op_with_op(Op::Silu, OpKind::Silu, vec![t0], vec![t1], "silu");
-        let op1 = g.add_op_with_op(Op::Gelu, OpKind::Gelu, vec![t1], vec![t2], "gelu");
+        let op0 = g.add_op(Op::Silu, vec![t0], vec![t1], "silu");
+        let op1 = g.add_op(Op::Gelu, vec![t1], vec![t2], "gelu");
         let plan = FusionPlan {
             groups: vec![
                 FusionGroup { id: 0, anchor: op0, epilogue: vec![], mode: FusionMode::Standalone, ops: vec![op0], multi_output: MultiOutputConfig::single(), dominant_dtype: None, marker: GroupMarker::None, is_layer_group: false, hetero_layer_type: None },
@@ -659,7 +659,7 @@ mod tests {
         let inp = g.add_tensor("input", vec![seq_sym.clone(), SymDim::Concrete(32)], DType::F32);
         let out = g.add_tensor("output", vec![seq_sym, SymDim::Concrete(32)], DType::F32);
         g.inputs = vec![inp]; g.outputs = vec![out];
-        let op_id = g.add_op_with_op(Op::Silu, OpKind::Silu, vec![inp], vec![out], "silu_sym");
+        let op_id = g.add_op(Op::Silu, vec![inp], vec![out], "silu_sym");
         let mut op_to_group = HashMap::new();
         op_to_group.insert(op_id, 0);
         let plan = FusionPlan {
@@ -706,10 +706,10 @@ mod tests {
         let t3 = g.add_tensor_concrete("t3", &[16], DType::F32);
         let t4 = g.add_tensor_concrete("t4", &[16], DType::F32);
         g.inputs = vec![t0]; g.outputs = vec![t4];
-        let op0 = g.add_op_with_op(Op::Silu, OpKind::Silu, vec![t0], vec![t1], "op0");
-        let op1 = g.add_op_with_op(Op::Gelu, OpKind::Gelu, vec![t1], vec![t2], "op1");
-        let op2 = g.add_op_with_op(Op::Gelu, OpKind::Gelu, vec![t1], vec![t3], "op2");
-        let op3 = g.add_op_with_op(Op::Mul, OpKind::Mul, vec![t2, t3], vec![t4], "op3");
+        let op0 = g.add_op(Op::Silu, vec![t0], vec![t1], "op0");
+        let op1 = g.add_op(Op::Gelu, vec![t1], vec![t2], "op1");
+        let op2 = g.add_op(Op::Gelu, vec![t1], vec![t3], "op2");
+        let op3 = g.add_op(Op::Mul, vec![t2, t3], vec![t4], "op3");
         let plan = FusionPlan {
             groups: vec![
                 FusionGroup { id: 0, anchor: op0, epilogue: vec![], mode: FusionMode::Standalone, ops: vec![op0], multi_output: MultiOutputConfig::single(), dominant_dtype: None, marker: GroupMarker::None, is_layer_group: false, hetero_layer_type: None },
@@ -736,7 +736,7 @@ mod tests {
         let b = g.add_tensor_concrete("B", &[16, 8], DType::F32);
         let c = g.add_tensor_concrete("C", &[8, 8], DType::F32);
         g.inputs = vec![a, b]; g.outputs = vec![c];
-        let op_id = g.add_op_with_op(Op::Gemm(crate::compiler::graph::GemmSpec { m: SymDim::Concrete(8), n: 8, k: 16, dtype: DType::F32, trans_b: false, has_bias: false }), OpKind::Gemm { m: SymDim::Concrete(8), n: 8, k: 16, dtype: DType::F32, trans_b: false },
+        let op_id = g.add_op(Op::Gemm(crate::compiler::graph::GemmSpec { m: SymDim::Concrete(8), n: 8, k: 16, dtype: DType::F32, trans_b: false, has_bias: false }),
             vec![a, b], vec![c], "gemm",
         );
         let mut op_to_group = HashMap::new();
@@ -939,7 +939,7 @@ mod tests {
         let w = g.add_tensor_concrete("weight", &[32, 64], DType::BF16);
         let out = g.add_tensor_concrete("output", &[64], DType::BF16);
         g.inputs = vec![inp, w]; g.outputs = vec![out];
-        let op = g.add_op_with_op(Op::Silu, OpKind::Silu, vec![inp], vec![out], "silu");
+        let op = g.add_op(Op::Silu, vec![inp], vec![out], "silu");
         let dtype = op_input_dtype(g.op(op).unwrap(), &g);
         assert_eq!(dtype, QuantPrecision::BF16, "op_input_dtype must derive from first input tensor");
     }
@@ -949,7 +949,7 @@ mod tests {
         let mut g = CompilerGraph::new();
         let out = g.add_tensor_concrete("output", &[1], DType::F32);
         g.outputs = vec![out];
-        let op = g.add_op_with_op(Op::Reshape { target_shape: vec![1] }, OpKind::Reshape { target_shape: vec![1] }, vec![], vec![out], "reshape");
+        let op = g.add_op(Op::Reshape { target_shape: vec![1] }, vec![], vec![out], "reshape");
         let dtype = op_input_dtype(g.op(op).unwrap(), &g);
         assert_eq!(dtype, QuantPrecision::F32, "op_input_dtype must fall back to F32 when op has no inputs");
     }
@@ -960,7 +960,7 @@ mod tests {
         let inp = g.add_tensor_concrete("input", &[128], DType::F16);
         let out = g.add_tensor_concrete("output", &[128], DType::F16);
         g.inputs = vec![inp]; g.outputs = vec![out];
-        let op = g.add_op_with_op(Op::Silu, OpKind::Silu, vec![inp], vec![out], "silu");
+        let op = g.add_op(Op::Silu, vec![inp], vec![out], "silu");
         let dtype = op_input_dtype(g.op(op).unwrap(), &g);
         assert_eq!(dtype, QuantPrecision::F16, "op_input_dtype must propagate F16");
     }
@@ -985,7 +985,7 @@ mod tests {
         let c = g.add_tensor_concrete("C", &[m, n], DType::F32);
         g.inputs = vec![a, b];
         g.outputs = vec![c];
-        g.add_op_with_op(Op::Gemm(crate::compiler::graph::GemmSpec { m: SymDim::Concrete(m), n: n, k: k, dtype: DType::F32, trans_b: true, has_bias: false }), OpKind::Gemm { m: SymDim::Concrete(m), n, k, dtype: DType::F32, trans_b: true },
+        g.add_op(Op::Gemm(crate::compiler::graph::GemmSpec { m: SymDim::Concrete(m), n: n, k: k, dtype: DType::F32, trans_b: true, has_bias: false }),
             vec![a, b], vec![c], "gemm_trans_b",
         );
 
@@ -1065,7 +1065,7 @@ mod tests {
         let c = g.add_tensor_concrete("C", &[m, n], DType::F32);
         g.inputs = vec![a, b];
         g.outputs = vec![c];
-        g.add_op_with_op(Op::Gemm(crate::compiler::graph::GemmSpec { m: SymDim::Concrete(m), n: n, k: k, dtype: DType::F32, trans_b: false, has_bias: false }), OpKind::Gemm { m: SymDim::Concrete(m), n, k, dtype: DType::F32, trans_b: false },
+        g.add_op(Op::Gemm(crate::compiler::graph::GemmSpec { m: SymDim::Concrete(m), n: n, k: k, dtype: DType::F32, trans_b: false, has_bias: false }),
             vec![a, b], vec![c], "gemm_no_trans",
         );
 
@@ -1101,7 +1101,7 @@ mod tests {
         let c = g.add_tensor_concrete("C", &[m, n], DType::F32);
         g.inputs = vec![a, b];
         g.outputs = vec![c];
-        g.add_op_with_op(Op::Gemm(crate::compiler::graph::GemmSpec { m: SymDim::Concrete(m), n: n, k: k, dtype: DType::F32, trans_b: false, has_bias: false }), OpKind::Gemm { m: SymDim::Concrete(m), n, k, dtype: DType::F32, trans_b: false },
+        g.add_op(Op::Gemm(crate::compiler::graph::GemmSpec { m: SymDim::Concrete(m), n: n, k: k, dtype: DType::F32, trans_b: false, has_bias: false }),
             vec![a, b], vec![c], "gemm_m2_n16",
         );
 
@@ -1218,7 +1218,7 @@ mod tests {
         let c = g.add_tensor_concrete("C", &[m, n], DType::F32);
         g.inputs = vec![a, b];
         g.outputs = vec![c];
-        g.add_op_with_op(Op::Gemm(crate::compiler::graph::GemmSpec { m: SymDim::Concrete(m), n: n, k: k, dtype: DType::F32, trans_b: false, has_bias: false }), OpKind::Gemm { m: SymDim::Concrete(m), n, k, dtype: DType::F32, trans_b: false },
+        g.add_op(Op::Gemm(crate::compiler::graph::GemmSpec { m: SymDim::Concrete(m), n: n, k: k, dtype: DType::F32, trans_b: false, has_bias: false }),
             vec![a, b], vec![c], "gemm_m4_n16",
         );
 
@@ -1269,7 +1269,7 @@ mod tests {
         let c = g.add_tensor_concrete("C", &[m, n], DType::F32);
         g.inputs = vec![a, b];
         g.outputs = vec![c];
-        g.add_op_with_op(Op::Gemm(crate::compiler::graph::GemmSpec { m: SymDim::Concrete(m), n: n, k: k, dtype: DType::F32, trans_b: false, has_bias: false }), OpKind::Gemm { m: SymDim::Concrete(m), n, k, dtype: DType::F32, trans_b: false },
+        g.add_op(Op::Gemm(crate::compiler::graph::GemmSpec { m: SymDim::Concrete(m), n: n, k: k, dtype: DType::F32, trans_b: false, has_bias: false }),
             vec![a, b], vec![c], "gemm_m4_n16_k4",
         );
 
@@ -1316,7 +1316,7 @@ mod tests {
         let c = g.add_tensor_concrete("C", &[m, n], DType::F32);
         g.inputs = vec![a, b];
         g.outputs = vec![c];
-        g.add_op_with_op(Op::Gemm(crate::compiler::graph::GemmSpec { m: SymDim::Concrete(m), n: n, k: k, dtype: DType::F32, trans_b: false, has_bias: false }), OpKind::Gemm { m: SymDim::Concrete(m), n, k, dtype: DType::F32, trans_b: false },
+        g.add_op(Op::Gemm(crate::compiler::graph::GemmSpec { m: SymDim::Concrete(m), n: n, k: k, dtype: DType::F32, trans_b: false, has_bias: false }),
             vec![a, b], vec![c], "gemm_m4_n16_k8",
         );
 
@@ -1359,7 +1359,7 @@ mod tests {
         let b = g.add_tensor_concrete("B", &[k, n], DType::F32);
         let c = g.add_tensor_concrete("C", &[m, n], DType::F32);
         g.inputs = vec![a, b]; g.outputs = vec![c];
-        g.add_op_with_op(Op::Gemm(crate::compiler::graph::GemmSpec { m: SymDim::Concrete(m), n: n, k: k, dtype: DType::F32, trans_b: false, has_bias: false }), OpKind::Gemm { m: SymDim::Concrete(m), n, k, dtype: DType::F32, trans_b: false }, vec![a, b], vec![c], "gemm_m4_n16_k16");
+        g.add_op(Op::Gemm(crate::compiler::graph::GemmSpec { m: SymDim::Concrete(m), n: n, k: k, dtype: DType::F32, trans_b: false, has_bias: false }), vec![a, b], vec![c], "gemm_m4_n16_k16");
         let config = CompileConfig { max_seq_len: m, debug_jit: false, hetero: None, target: CompileTarget::Cpu };
         let mut compiler = InferenceCompiler::new();
         let compiled = compiler.compile(g, &config, None).expect("GEMM compilation failed").expect_cpu().layer_code;
@@ -1388,7 +1388,7 @@ mod tests {
         let b = g.add_tensor_concrete("B", &[k, n], DType::F32);
         let c = g.add_tensor_concrete("C", &[m, n], DType::F32);
         g.inputs = vec![a, b]; g.outputs = vec![c];
-        g.add_op_with_op(Op::Gemm(crate::compiler::graph::GemmSpec { m: SymDim::Concrete(m), n: n, k: k, dtype: DType::F32, trans_b: false, has_bias: false }), OpKind::Gemm { m: SymDim::Concrete(m), n, k, dtype: DType::F32, trans_b: false }, vec![a, b], vec![c], "gemm_m4_n16_k24");
+        g.add_op(Op::Gemm(crate::compiler::graph::GemmSpec { m: SymDim::Concrete(m), n: n, k: k, dtype: DType::F32, trans_b: false, has_bias: false }), vec![a, b], vec![c], "gemm_m4_n16_k24");
         let config = CompileConfig { max_seq_len: m, debug_jit: false, hetero: None, target: CompileTarget::Cpu };
         let mut compiler = InferenceCompiler::new();
         let compiled = compiler.compile(g, &config, None).expect("GEMM compilation failed").expect_cpu().layer_code;
@@ -1417,7 +1417,7 @@ mod tests {
         let b = g.add_tensor_concrete("B", &[k, n], DType::F32);
         let c = g.add_tensor_concrete("C", &[m, n], DType::F32);
         g.inputs = vec![a, b]; g.outputs = vec![c];
-        g.add_op_with_op(Op::Gemm(crate::compiler::graph::GemmSpec { m: SymDim::Concrete(m), n: n, k: k, dtype: DType::F32, trans_b: false, has_bias: false }), OpKind::Gemm { m: SymDim::Concrete(m), n, k, dtype: DType::F32, trans_b: false }, vec![a, b], vec![c], "gemm_m4_n16_k28");
+        g.add_op(Op::Gemm(crate::compiler::graph::GemmSpec { m: SymDim::Concrete(m), n: n, k: k, dtype: DType::F32, trans_b: false, has_bias: false }), vec![a, b], vec![c], "gemm_m4_n16_k28");
         let config = CompileConfig { max_seq_len: m, debug_jit: false, hetero: None, target: CompileTarget::Cpu };
         let mut compiler = InferenceCompiler::new();
         let compiled = compiler.compile(g, &config, None).expect("GEMM compilation failed").expect_cpu().layer_code;
@@ -1450,7 +1450,7 @@ mod tests {
         let c = g.add_tensor_concrete("C", &[m, n], DType::F32);
         g.inputs = vec![a, b];
         g.outputs = vec![c];
-        g.add_op_with_op(Op::Gemm(crate::compiler::graph::GemmSpec { m: SymDim::Concrete(m), n: n, k: k, dtype: DType::F32, trans_b: false, has_bias: false }), OpKind::Gemm { m: SymDim::Concrete(m), n, k, dtype: DType::F32, trans_b: false },
+        g.add_op(Op::Gemm(crate::compiler::graph::GemmSpec { m: SymDim::Concrete(m), n: n, k: k, dtype: DType::F32, trans_b: false, has_bias: false }),
             vec![a, b], vec![c], "gemm_tiny",
         );
 
@@ -1514,7 +1514,7 @@ mod tests {
         let c = g.add_tensor_concrete("C", &[m, n], DType::F32);
         g.inputs = vec![a, b];
         g.outputs = vec![c];
-        g.add_op_with_op(Op::Gemm(crate::compiler::graph::GemmSpec { m: SymDim::Concrete(m), n: n, k: k, dtype: DType::F32, trans_b: false, has_bias: false }), OpKind::Gemm { m: SymDim::Concrete(m), n, k, dtype: DType::F32, trans_b: false },
+        g.add_op(Op::Gemm(crate::compiler::graph::GemmSpec { m: SymDim::Concrete(m), n: n, k: k, dtype: DType::F32, trans_b: false, has_bias: false }),
             vec![a, b], vec![c], "gemm_no_trans_m4",
         );
 
@@ -1592,7 +1592,7 @@ mod tests {
         let c = g.add_tensor_concrete("C", &[m, n], DType::F32);
         g.inputs = vec![a, b];
         g.outputs = vec![c];
-        g.add_op_with_op(Op::Gemm(crate::compiler::graph::GemmSpec { m: SymDim::Concrete(m), n: n, k: k, dtype: DType::F32, trans_b: false, has_bias: false }), OpKind::Gemm { m: SymDim::Concrete(m), n, k, dtype: DType::F32, trans_b: false },
+        g.add_op(Op::Gemm(crate::compiler::graph::GemmSpec { m: SymDim::Concrete(m), n: n, k: k, dtype: DType::F32, trans_b: false, has_bias: false }),
             vec![a, b], vec![c], "gemm_no_trans_m8",
         );
 
@@ -1687,7 +1687,7 @@ mod tests {
         let c = g.add_tensor_concrete("C", &[m, n], DType::F32);
         g.inputs = vec![a, b];
         g.outputs = vec![c];
-        g.add_op_with_op(Op::Gemm(crate::compiler::graph::GemmSpec { m: SymDim::Concrete(m), n: n, k: k, dtype: DType::F32, trans_b: true, has_bias: false }), OpKind::Gemm { m: SymDim::Concrete(m), n, k, dtype: DType::F32, trans_b: true },
+        g.add_op(Op::Gemm(crate::compiler::graph::GemmSpec { m: SymDim::Concrete(m), n: n, k: k, dtype: DType::F32, trans_b: true, has_bias: false }),
             vec![a, b], vec![c], "gemm_trans_b_small",
         );
 
@@ -1765,7 +1765,7 @@ mod tests {
         let c = g.add_tensor_concrete("C", &[m, n], DType::F32);
         g.inputs = vec![a, b];
         g.outputs = vec![c];
-        g.add_op_with_op(Op::Gemm(crate::compiler::graph::GemmSpec { m: SymDim::Concrete(m), n: n, k: k, dtype: DType::F32, trans_b: true, has_bias: false }), OpKind::Gemm { m: SymDim::Concrete(m), n, k, dtype: DType::F32, trans_b: true },
+        g.add_op(Op::Gemm(crate::compiler::graph::GemmSpec { m: SymDim::Concrete(m), n: n, k: k, dtype: DType::F32, trans_b: true, has_bias: false }),
             vec![a, b], vec![c], "gemm_trans_b_med",
         );
 
@@ -1846,7 +1846,7 @@ mod tests {
         let c = g.add_tensor_concrete("C", &[m, n], DType::F32);
         g.inputs = vec![a, b];
         g.outputs = vec![c];
-        g.add_op_with_op(Op::Gemm(crate::compiler::graph::GemmSpec { m: SymDim::Concrete(m), n: n, k: k, dtype: DType::F32, trans_b: false, has_bias: false }), OpKind::Gemm { m: SymDim::Concrete(m), n, k, dtype: DType::F32, trans_b: false },
+        g.add_op(Op::Gemm(crate::compiler::graph::GemmSpec { m: SymDim::Concrete(m), n: n, k: k, dtype: DType::F32, trans_b: false, has_bias: false }),
             vec![a, b], vec![c], "gemm_no_trans_tiny",
         );
 

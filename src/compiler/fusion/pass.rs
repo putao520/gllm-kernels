@@ -1131,7 +1131,7 @@ fn norm_feeds_single_gemm_consumer(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::compiler::graph::{CompilerGraph, OpId, OpKind, Op, GemmSpec, NormSpec, QuantGemmSpec, RopeSpec, LayerCondition, SymDim, TensorId};
+    use crate::compiler::graph::{ CompilerGraph, OpId, Op, GemmSpec, NormSpec, QuantGemmSpec, RopeSpec, LayerCondition, SymDim, TensorId, AttentionSpec, AttentionGeometry, AttentionMask, SinksSpec, MlaSpec };
     use crate::compiler::registry::ScalarOpRegistry;
     use crate::compiler::semantic_dag::SemanticDAG;
     use crate::compiler::planner::ExecutionPlan;
@@ -1150,11 +1150,11 @@ mod tests {
     }
 
     /// Build a minimal graph: input_a → op → output.
-    fn make_single_op_graph(kind: OpKind) -> (CompilerGraph, OpId, TensorId, TensorId) {
+    fn make_single_op_graph(op: Op) -> (CompilerGraph, OpId, TensorId, TensorId) {
         let mut g = CompilerGraph::new();
         let a = g.add_tensor_concrete("a", &[1, 4], DType::F32);
         let out = g.add_tensor_concrete("out", &[1, 4], DType::F32);
-        let op = g.add_op(kind, vec![a], vec![out], "op");
+        let op = g.add_op(op, vec![a], vec![out], "op");
         (g, op, a, out)
     }
 
@@ -1168,8 +1168,8 @@ mod tests {
         let mid = g.add_tensor_concrete("mid", &[1, 4], DType::F32);
         let w = g.add_tensor_concrete("w", &[4, 4], DType::F32);
         let out = g.add_tensor_concrete("out", &[1, 4], DType::F32);
-        let tanh_op = g.add_op_with_op(Op::Tanh, OpKind::Tanh, vec![a], vec![mid], "tanh");
-        g.add_op_with_op(Op::Gemm(GemmSpec { m: SymDim::Concrete(1), n: 4, k: 4, dtype: DType::F32, trans_b: false, has_bias: false }), OpKind::Gemm { m: SymDim::Concrete(1), n: 4, k: 4, dtype: DType::F32, trans_b: false },
+        let tanh_op = g.add_op(Op::Tanh, vec![a], vec![mid], "tanh");
+        g.add_op(Op::Gemm(GemmSpec { m: SymDim::Concrete(1), n: 4, k: 4, dtype: DType::F32, trans_b: false, has_bias: false }),
             vec![mid, w],
             vec![out],
             "gemm",
@@ -1194,8 +1194,8 @@ mod tests {
         let a = g.add_tensor_concrete("a", &[1, 4], DType::F32);
         let mid = g.add_tensor_concrete("mid", &[1, 4], DType::F32);
         let out = g.add_tensor_concrete("out", &[1, 4], DType::F32);
-        let norm_op = g.add_op_with_op(Op::RmsNorm(NormSpec { feature_dim: 4096, eps: 1e-5, dtype: DType::F32, has_weight: true }), OpKind::RmsNorm { feature_dim: 4096, eps: 1e-5 }, vec![a], vec![mid], "norm");
-        g.add_op_with_op(Op::Tanh, OpKind::Tanh, vec![mid], vec![out], "tanh");
+        let norm_op = g.add_op(Op::RmsNorm(NormSpec { feature_dim: 4096, eps: 1e-5, dtype: DType::F32, has_weight: true }), vec![a], vec![mid], "norm");
+        g.add_op(Op::Tanh, vec![mid], vec![out], "tanh");
 
         let reg = make_registry();
         let dag = SemanticDAG::from_graph(&g, &reg);
@@ -1217,9 +1217,9 @@ mod tests {
         let mid = g.add_tensor_concrete("mid", &[1, 4], DType::F32);
         let out1 = g.add_tensor_concrete("out1", &[1, 4], DType::F32);
         let out2 = g.add_tensor_concrete("out2", &[1, 4], DType::F32);
-        let norm_op = g.add_op_with_op(Op::RmsNorm(NormSpec { feature_dim: 4096, eps: 1e-5, dtype: DType::F32, has_weight: true }), OpKind::RmsNorm { feature_dim: 4096, eps: 1e-5 }, vec![a], vec![mid], "norm");
-        g.add_op_with_op(Op::Tanh, OpKind::Tanh, vec![mid], vec![out1], "tanh1");
-        g.add_op_with_op(Op::Tanh, OpKind::Tanh, vec![mid], vec![out2], "tanh2");
+        let norm_op = g.add_op(Op::RmsNorm(NormSpec { feature_dim: 4096, eps: 1e-5, dtype: DType::F32, has_weight: true }), vec![a], vec![mid], "norm");
+        g.add_op(Op::Tanh, vec![mid], vec![out1], "tanh1");
+        g.add_op(Op::Tanh, vec![mid], vec![out2], "tanh2");
 
         let reg = make_registry();
         let dag = SemanticDAG::from_graph(&g, &reg);
@@ -1259,7 +1259,7 @@ mod tests {
         let out1 = g.add_tensor_concrete("out1", &[1, 4], DType::F32);
         let out2 = g.add_tensor_concrete("out2", &[1, 4], DType::F32);
         // RmsNorm with two outputs
-        let norm_op = g.add_op_with_op(Op::RmsNorm(NormSpec { feature_dim: 4096, eps: 1e-5, dtype: DType::F32, has_weight: true }), OpKind::RmsNorm { feature_dim: 4096, eps: 1e-5 }, vec![a], vec![out1, out2], "norm");
+        let norm_op = g.add_op(Op::RmsNorm(NormSpec { feature_dim: 4096, eps: 1e-5, dtype: DType::F32, has_weight: true }), vec![a], vec![out1, out2], "norm");
 
         let reg = make_registry();
         let dag = SemanticDAG::from_graph(&g, &reg);
@@ -1282,12 +1282,12 @@ mod tests {
         let gemm_out = g.add_tensor_concrete("gemm_out", &[1, 4], DType::F32);
         let silu_out = g.add_tensor_concrete("silu_out", &[1, 4], DType::F32);
 
-        let gemm = g.add_op_with_op(Op::Gemm(GemmSpec { m: SymDim::Concrete(1), n: 4, k: 4, dtype: DType::F32, trans_b: false, has_bias: false }), OpKind::Gemm { m: SymDim::Concrete(1), n: 4, k: 4, dtype: DType::F32, trans_b: false },
+        let gemm = g.add_op(Op::Gemm(GemmSpec { m: SymDim::Concrete(1), n: 4, k: 4, dtype: DType::F32, trans_b: false, has_bias: false }),
             vec![a, w],
             vec![gemm_out],
             "gemm",
         );
-        g.add_op_with_op(Op::Silu, OpKind::Silu, vec![gemm_out], vec![silu_out], "silu");
+        g.add_op(Op::Silu, vec![gemm_out], vec![silu_out], "silu");
 
         let gemm_op = g.op(gemm).unwrap().clone();
         let claimed = HashSet::new();
@@ -1312,12 +1312,12 @@ mod tests {
         let gemm_out = g.add_tensor_concrete("gemm_out", &[1, 4], DType::F32);
         let argmax_out = g.add_tensor_concrete("argmax_out", &[1], DType::F32);
 
-        let gemm = g.add_op_with_op(Op::Gemm(GemmSpec { m: SymDim::Concrete(1), n: 4, k: 4, dtype: DType::F32, trans_b: false, has_bias: false }), OpKind::Gemm { m: SymDim::Concrete(1), n: 4, k: 4, dtype: DType::F32, trans_b: false },
+        let gemm = g.add_op(Op::Gemm(GemmSpec { m: SymDim::Concrete(1), n: 4, k: 4, dtype: DType::F32, trans_b: false, has_bias: false }),
             vec![a, w],
             vec![gemm_out],
             "gemm",
         );
-        let argmax = g.add_op_with_op(Op::Argmax { vocab_size: 4 }, OpKind::Argmax { vocab_size: 4 }, vec![gemm_out], vec![argmax_out], "argmax");
+        let argmax = g.add_op(Op::Argmax { vocab_size: 4 }, vec![gemm_out], vec![argmax_out], "argmax");
 
         let gemm_op = g.op(gemm).unwrap().clone();
         let mut claimed = HashSet::new();
@@ -1344,13 +1344,13 @@ mod tests {
         let extra = g.add_tensor_concrete("extra", &[1, 4], DType::F32);
         let out = g.add_tensor_concrete("out", &[1, 4], DType::F32);
 
-        let gemm = g.add_op_with_op(Op::Gemm(GemmSpec { m: SymDim::Concrete(1), n: 4, k: 4, dtype: DType::F32, trans_b: false, has_bias: false }), OpKind::Gemm { m: SymDim::Concrete(1), n: 4, k: 4, dtype: DType::F32, trans_b: false },
+        let gemm = g.add_op(Op::Gemm(GemmSpec { m: SymDim::Concrete(1), n: 4, k: 4, dtype: DType::F32, trans_b: false, has_bias: false }),
             vec![a, w],
             vec![gemm_out],
             "gemm",
         );
         // Add uses 2 inputs, so consumer.inputs.len() != 1
-        g.add_op_with_op(Op::Add, OpKind::Add, vec![gemm_out, extra], vec![out], "add");
+        g.add_op(Op::Add, vec![gemm_out, extra], vec![out], "add");
 
         let gemm_op = g.op(gemm).unwrap().clone();
         let claimed = HashSet::new();
@@ -1376,14 +1376,14 @@ mod tests {
         let out1 = g.add_tensor_concrete("out1", &[1], DType::F32);
         let out2 = g.add_tensor_concrete("out2", &[1, 4], DType::F32);
 
-        let gemm = g.add_op_with_op(Op::Gemm(GemmSpec { m: SymDim::Concrete(1), n: 4, k: 4, dtype: DType::F32, trans_b: false, has_bias: false }), OpKind::Gemm { m: SymDim::Concrete(1), n: 4, k: 4, dtype: DType::F32, trans_b: false },
+        let gemm = g.add_op(Op::Gemm(GemmSpec { m: SymDim::Concrete(1), n: 4, k: 4, dtype: DType::F32, trans_b: false, has_bias: false }),
             vec![a, w],
             vec![gemm_out],
             "gemm",
         );
         // Two consumers of gemm_out
-        g.add_op_with_op(Op::Argmax { vocab_size: 4 }, OpKind::Argmax { vocab_size: 4 }, vec![gemm_out], vec![out1], "argmax");
-        g.add_op_with_op(Op::Tanh, OpKind::Tanh, vec![gemm_out], vec![out2], "tanh");
+        g.add_op(Op::Argmax { vocab_size: 4 }, vec![gemm_out], vec![out1], "argmax");
+        g.add_op(Op::Tanh, vec![gemm_out], vec![out2], "tanh");
 
         let gemm_op = g.op(gemm).unwrap().clone();
         let claimed = HashSet::new();
@@ -1425,7 +1425,7 @@ mod tests {
         let mut g = CompilerGraph::new();
         let a = g.add_tensor_concrete("a", &[1, 64], DType::F32);
         let out = g.add_tensor_concrete("out", &[1, 64], DType::F32);
-        let op0 = g.add_op_with_op(Op::Tanh, OpKind::Tanh, vec![a], vec![out], "tanh");
+        let op0 = g.add_op(Op::Tanh, vec![a], vec![out], "tanh");
 
         let reg = make_registry();
         let dag = SemanticDAG::from_graph(&g, &reg);
@@ -1452,7 +1452,7 @@ mod tests {
         let a = g.add_tensor_concrete("a", &[1, 16], DType::F32);
         let w = g.add_tensor_concrete("w", &[16, 16], DType::F32);
         let out = g.add_tensor_concrete("out", &[1, 16], DType::F32);
-        let op0 = g.add_op_with_op(Op::Gemm(GemmSpec { m: SymDim::Concrete(1), n: 16, k: 16, dtype: DType::F32, trans_b: false, has_bias: false }), OpKind::Gemm { m: SymDim::Concrete(1), n: 16, k: 16, dtype: DType::F32, trans_b: false },
+        let op0 = g.add_op(Op::Gemm(GemmSpec { m: SymDim::Concrete(1), n: 16, k: 16, dtype: DType::F32, trans_b: false, has_bias: false }),
             vec![a, w],
             vec![out],
             "gemm",
@@ -1483,8 +1483,8 @@ mod tests {
         let a2 = g.add_tensor_concrete("a2", &[1, 4], DType::F32);
         let out2 = g.add_tensor_concrete("out2", &[1, 4], DType::F32);
 
-        let op0 = g.add_op_with_op(Op::Tanh, OpKind::Tanh, vec![a1], vec![out1], "tanh1");
-        let op1 = g.add_op_with_op(Op::Silu, OpKind::Silu, vec![a2], vec![out2], "silu1");
+        let op0 = g.add_op(Op::Tanh, vec![a1], vec![out1], "tanh1");
+        let op1 = g.add_op(Op::Silu, vec![a2], vec![out2], "silu1");
 
         let reg = make_registry();
         let dag = SemanticDAG::from_graph(&g, &reg);
@@ -1511,8 +1511,8 @@ mod tests {
         let mid = g.add_tensor_concrete("mid", &[1, 4], DType::F32);
         let w = g.add_tensor_concrete("w", &[4, 4], DType::F32);
         let out = g.add_tensor_concrete("out", &[1, 4], DType::F32);
-        let norm_op = g.add_op_with_op(Op::RmsNorm(NormSpec { feature_dim: 4096, eps: 1e-5, dtype: DType::F32, has_weight: true }), OpKind::RmsNorm { feature_dim: 4096, eps: 1e-5 }, vec![a], vec![mid], "norm");
-        g.add_op_with_op(Op::Gemm(GemmSpec { m: SymDim::Concrete(1), n: 4, k: 4, dtype: DType::F32, trans_b: false, has_bias: false }), OpKind::Gemm { m: SymDim::Concrete(1), n: 4, k: 4, dtype: DType::F32, trans_b: false },
+        let norm_op = g.add_op(Op::RmsNorm(NormSpec { feature_dim: 4096, eps: 1e-5, dtype: DType::F32, has_weight: true }), vec![a], vec![mid], "norm");
+        g.add_op(Op::Gemm(GemmSpec { m: SymDim::Concrete(1), n: 4, k: 4, dtype: DType::F32, trans_b: false, has_bias: false }),
             vec![mid, w],
             vec![out],
             "gemm",
@@ -1532,8 +1532,8 @@ mod tests {
         let mid = g.add_tensor_concrete("mid", &[1, 4], DType::F32);
         let w = g.add_tensor_concrete("w", &[4, 4], DType::F32);
         let out = g.add_tensor_concrete("out", &[1, 4], DType::F32);
-        let norm_op = g.add_op_with_op(Op::LayerNorm(NormSpec { feature_dim: 4096, eps: 1e-5, dtype: DType::F32, has_weight: true }), OpKind::LayerNorm { feature_dim: 4096, eps: 1e-5 }, vec![a], vec![mid], "norm");
-        g.add_op_with_op(Op::Gemm(GemmSpec { m: SymDim::Concrete(1), n: 4, k: 4, dtype: DType::F32, trans_b: false, has_bias: false }), OpKind::Gemm { m: SymDim::Concrete(1), n: 4, k: 4, dtype: DType::F32, trans_b: false },
+        let norm_op = g.add_op(Op::LayerNorm(NormSpec { feature_dim: 4096, eps: 1e-5, dtype: DType::F32, has_weight: true }), vec![a], vec![mid], "norm");
+        g.add_op(Op::Gemm(GemmSpec { m: SymDim::Concrete(1), n: 4, k: 4, dtype: DType::F32, trans_b: false, has_bias: false }),
             vec![mid, w],
             vec![out],
             "gemm",
@@ -1553,8 +1553,8 @@ mod tests {
         let mid = g.add_tensor_concrete("mid", &[1, 4], DType::F32);
         let w = g.add_tensor_concrete("w", &[4, 4], DType::F32);
         let out = g.add_tensor_concrete("out", &[1, 4], DType::F32);
-        let vnorm_op = g.add_op_with_op(Op::ValueNorm(NormSpec { feature_dim: 4096, eps: 1e-5, dtype: DType::F32, has_weight: false }), OpKind::ValueNorm { feature_dim: 4096, eps: 1e-5 }, vec![a], vec![mid], "vnorm");
-        g.add_op_with_op(Op::Gemm(GemmSpec { m: SymDim::Concrete(1), n: 4, k: 4, dtype: DType::F32, trans_b: false, has_bias: false }), OpKind::Gemm { m: SymDim::Concrete(1), n: 4, k: 4, dtype: DType::F32, trans_b: false },
+        let vnorm_op = g.add_op(Op::ValueNorm(NormSpec { feature_dim: 4096, eps: 1e-5, dtype: DType::F32, has_weight: false }), vec![a], vec![mid], "vnorm");
+        g.add_op(Op::Gemm(GemmSpec { m: SymDim::Concrete(1), n: 4, k: 4, dtype: DType::F32, trans_b: false, has_bias: false }),
             vec![mid, w],
             vec![out],
             "gemm",
@@ -1575,8 +1575,8 @@ mod tests {
         let w = g.add_tensor_concrete("w", &[4, 4], DType::F32);
         let b = g.add_tensor_concrete("b", &[4], DType::F32);
         let out = g.add_tensor_concrete("out", &[1, 4], DType::F32);
-        let norm_op = g.add_op_with_op(Op::RmsNorm(NormSpec { feature_dim: 4096, eps: 1e-5, dtype: DType::F32, has_weight: true }), OpKind::RmsNorm { feature_dim: 4096, eps: 1e-5 }, vec![a], vec![mid], "norm");
-        g.add_op_with_op(Op::GemmBias(GemmSpec { m: SymDim::Concrete(1), n: 4, k: 4, dtype: DType::F32, trans_b: false, has_bias: true }), OpKind::GemmBias { m: SymDim::Concrete(1), n: 4, k: 4, dtype: DType::F32, trans_b: false },
+        let norm_op = g.add_op(Op::RmsNorm(NormSpec { feature_dim: 4096, eps: 1e-5, dtype: DType::F32, has_weight: true }), vec![a], vec![mid], "norm");
+        g.add_op(Op::GemmBias(GemmSpec { m: SymDim::Concrete(1), n: 4, k: 4, dtype: DType::F32, trans_b: false, has_bias: true }),
             vec![mid, w, b],
             vec![out],
             "gemm_bias",
@@ -1597,12 +1597,12 @@ mod tests {
         let gemm_out = g.add_tensor_concrete("gemm_out", &[1, 4], DType::F32);
         let argmax_out = g.add_tensor_concrete("argmax_out", &[1], DType::F32);
 
-        let gemm = g.add_op_with_op(Op::Gemm(GemmSpec { m: SymDim::Concrete(1), n: 4, k: 4, dtype: DType::F32, trans_b: false, has_bias: false }), OpKind::Gemm { m: SymDim::Concrete(1), n: 4, k: 4, dtype: DType::F32, trans_b: false },
+        let gemm = g.add_op(Op::Gemm(GemmSpec { m: SymDim::Concrete(1), n: 4, k: 4, dtype: DType::F32, trans_b: false, has_bias: false }),
             vec![a, w],
             vec![gemm_out],
             "gemm",
         );
-        let argmax = g.add_op_with_op(Op::Argmax { vocab_size: 4 }, OpKind::Argmax { vocab_size: 4 }, vec![gemm_out], vec![argmax_out], "argmax");
+        let argmax = g.add_op(Op::Argmax { vocab_size: 4 }, vec![gemm_out], vec![argmax_out], "argmax");
 
         let gemm_op = g.op(gemm).unwrap().clone();
         let claimed = HashSet::new();
@@ -1621,13 +1621,13 @@ mod tests {
         let silu_out = g.add_tensor_concrete("silu_out", &[1, 4], DType::F32);
         let argmax_out = g.add_tensor_concrete("argmax_out", &[1], DType::F32);
 
-        let gemm = g.add_op_with_op(Op::Gemm(GemmSpec { m: SymDim::Concrete(1), n: 4, k: 4, dtype: DType::F32, trans_b: false, has_bias: false }), OpKind::Gemm { m: SymDim::Concrete(1), n: 4, k: 4, dtype: DType::F32, trans_b: false },
+        let gemm = g.add_op(Op::Gemm(GemmSpec { m: SymDim::Concrete(1), n: 4, k: 4, dtype: DType::F32, trans_b: false, has_bias: false }),
             vec![a, w],
             vec![gemm_out],
             "gemm",
         );
-        let silu = g.add_op_with_op(Op::Silu, OpKind::Silu, vec![gemm_out], vec![silu_out], "silu");
-        let argmax = g.add_op_with_op(Op::Argmax { vocab_size: 4 }, OpKind::Argmax { vocab_size: 4 }, vec![silu_out], vec![argmax_out], "argmax");
+        let silu = g.add_op(Op::Silu, vec![gemm_out], vec![silu_out], "silu");
+        let argmax = g.add_op(Op::Argmax { vocab_size: 4 }, vec![silu_out], vec![argmax_out], "argmax");
 
         let gemm_op = g.op(gemm).unwrap().clone();
         let silu_op = g.op(silu).unwrap();
@@ -1646,13 +1646,13 @@ mod tests {
         let a = g.add_tensor_concrete("a", &[1, 4], DType::F32);
         let w = g.add_tensor_concrete("w", &[4, 4], DType::F32);
         let out = g.add_tensor_concrete("out", &[1, 4], DType::F32);
-        let gemm = g.add_op_with_op(Op::Gemm(GemmSpec { m: SymDim::Concrete(1), n: 4, k: 4, dtype: DType::F32, trans_b: false, has_bias: false }), OpKind::Gemm { m: SymDim::Concrete(1), n: 4, k: 4, dtype: DType::F32, trans_b: false },
+        let gemm = g.add_op(Op::Gemm(GemmSpec { m: SymDim::Concrete(1), n: 4, k: 4, dtype: DType::F32, trans_b: false, has_bias: false }),
             vec![a, w],
             vec![out],
             "gemm",
         );
 
-        let gemm_op = CompilerOp::new_from_op(gemm, Op::Gemm(GemmSpec { m: SymDim::Concrete(1), n: 4, k: 4, dtype: DType::F32, trans_b: false, has_bias: false }), OpKind::Gemm { m: SymDim::Concrete(1), n: 4, k: 4, dtype: DType::F32, trans_b: false },
+        let gemm_op = CompilerOp::new_from_op(gemm, Op::Gemm(GemmSpec { m: SymDim::Concrete(1), n: 4, k: 4, dtype: DType::F32, trans_b: false, has_bias: false }),
             vec![a, w],
             vec![],
             "empty_gemm",
@@ -1669,7 +1669,7 @@ mod tests {
         let mut g = CompilerGraph::new();
         let a = g.add_tensor_concrete("a", &[1, 16], DType::F32);
         let out = g.add_tensor_concrete("out", &[1, 16], DType::F32);
-        let op0 = g.add_op_with_op(Op::Tanh, OpKind::Tanh, vec![a], vec![out], "tanh");
+        let op0 = g.add_op(Op::Tanh, vec![a], vec![out], "tanh");
 
         let reg = make_registry();
         let plan = make_plan();
@@ -1684,7 +1684,7 @@ mod tests {
         let mut g = CompilerGraph::new();
         let a = g.add_tensor_concrete("a", &[1, 16], DType::F32);
         let out = g.add_tensor_concrete("out", &[1], DType::F32);
-        let op0 = g.add_op_with_op(Op::Argmax { vocab_size: 16 }, OpKind::Argmax { vocab_size: 16 }, vec![a], vec![out], "argmax");
+        let op0 = g.add_op(Op::Argmax { vocab_size: 16 }, vec![a], vec![out], "argmax");
 
         let reg = make_registry();
         let dag = SemanticDAG::from_graph(&g, &reg);
@@ -1704,8 +1704,8 @@ mod tests {
         let mid = g.add_tensor_concrete("mid", &[1, 64], DType::F32);
         let out = g.add_tensor_concrete("out", &[1, 64], DType::F32);
 
-        let op0 = g.add_op_with_op(Op::Tanh, OpKind::Tanh, vec![a], vec![mid], "tanh");
-        let op1 = g.add_op_with_op(Op::Silu, OpKind::Silu, vec![mid], vec![out], "silu");
+        let op0 = g.add_op(Op::Tanh, vec![a], vec![mid], "tanh");
+        let op1 = g.add_op(Op::Silu, vec![mid], vec![out], "silu");
 
         let reg = make_registry();
         let dag = SemanticDAG::from_graph(&g, &reg);
@@ -1722,7 +1722,7 @@ mod tests {
         let mut g = CompilerGraph::new();
         let a = g.add_tensor_concrete("a", &[1, 4], DType::F32);
         let out = g.add_tensor_concrete("out", &[1, 4], DType::F32);
-        g.add_op_with_op(Op::Tanh, OpKind::Tanh, vec![a], vec![out], "tanh");
+        g.add_op(Op::Tanh, vec![a], vec![out], "tanh");
 
         let reg = make_registry();
         let plan = make_plan();
@@ -1740,8 +1740,8 @@ mod tests {
         let mid = g.add_tensor_concrete("mid", &[1, 4], DType::F32);
         let w = g.add_tensor_concrete("w", &[4, 4], DType::F32);
         let out = g.add_tensor_concrete("out", &[1, 4], DType::F32);
-        let norm_op = g.add_op_with_op(Op::RmsNorm(NormSpec { feature_dim: 4096, eps: 1e-5, dtype: DType::F32, has_weight: true }), OpKind::RmsNorm { feature_dim: 4096, eps: 1e-5 }, vec![a], vec![mid], "norm");
-        g.add_op_with_op(Op::MoEGate { seq_len: SymDim::Concrete(1), num_experts: 8, hidden: 4, top_k: 2 }, OpKind::MoEGate { seq_len: 1, num_experts: 8, hidden: 4, top_k: 2 },
+        let norm_op = g.add_op(Op::RmsNorm(NormSpec { feature_dim: 4096, eps: 1e-5, dtype: DType::F32, has_weight: true }), vec![a], vec![mid], "norm");
+        g.add_op(Op::MoEGate { seq_len: SymDim::Concrete(1), num_experts: 8, hidden: 4, top_k: 2 },
             vec![mid, w],
             vec![out],
             "moe_gate",
@@ -1762,7 +1762,7 @@ mod tests {
         let mut g = CompilerGraph::new();
         let a = g.add_tensor_concrete("a", &[1, 4], DType::F32);
         let out = g.add_tensor_concrete("out", &[1, 4], DType::F32);
-        let op0 = g.add_op_with_op(Op::Tanh, OpKind::Tanh, vec![a], vec![out], "tanh");
+        let op0 = g.add_op(Op::Tanh, vec![a], vec![out], "tanh");
 
         let mut group = FusionGroup {
             id: 0,
@@ -1792,7 +1792,7 @@ mod tests {
         let mut g = CompilerGraph::new();
         let a = g.add_tensor_concrete("a", &[1, 4], DType::BF16);
         let out = g.add_tensor_concrete("out", &[1, 4], DType::BF16);
-        let op0 = g.add_op_with_op(Op::Silu, OpKind::Silu, vec![a], vec![out], "silu");
+        let op0 = g.add_op(Op::Silu, vec![a], vec![out], "silu");
 
         let mut group = FusionGroup {
             id: 0,
@@ -1850,7 +1850,7 @@ mod tests {
         let w = g.add_tensor_concrete("w", &[16, 16], DType::F32);
         let b = g.add_tensor_concrete("bias", &[16], DType::F32);
         let out = g.add_tensor_concrete("out", &[1, 16], DType::F32);
-        let op0 = g.add_op_with_op(Op::GemmBias(GemmSpec { m: SymDim::Concrete(1), n: 16, k: 16, dtype: DType::F32, trans_b: false, has_bias: true }), OpKind::GemmBias { m: SymDim::Concrete(1), n: 16, k: 16, dtype: DType::F32, trans_b: false },
+        let op0 = g.add_op(Op::GemmBias(GemmSpec { m: SymDim::Concrete(1), n: 16, k: 16, dtype: DType::F32, trans_b: false, has_bias: true }),
             vec![a, w, b],
             vec![out],
             "gemm_bias",
@@ -1882,12 +1882,12 @@ mod tests {
         let gemm_out = g.add_tensor_concrete("gemm_out", &[1, 4], DType::F32);
         let out = g.add_tensor_concrete("out", &[1], DType::F32);
 
-        let gemm = g.add_op_with_op(Op::Gemm(GemmSpec { m: SymDim::Concrete(1), n: 4, k: 4, dtype: DType::F32, trans_b: false, has_bias: false }), OpKind::Gemm { m: SymDim::Concrete(1), n: 4, k: 4, dtype: DType::F32, trans_b: false },
+        let gemm = g.add_op(Op::Gemm(GemmSpec { m: SymDim::Concrete(1), n: 4, k: 4, dtype: DType::F32, trans_b: false, has_bias: false }),
             vec![a, w],
             vec![gemm_out],
             "gemm",
         );
-        let meanpool = g.add_op_with_op(Op::MeanPool { seq_len: 1, hidden: 4, cls_mode: false }, OpKind::MeanPool { seq_len: 1, hidden: 4, cls_mode: false },
+        let meanpool = g.add_op(Op::MeanPool { seq_len: 1, hidden: 4, cls_mode: false },
             vec![gemm_out],
             vec![out],
             "meanpool",
@@ -1914,8 +1914,8 @@ mod tests {
         let mid = g.add_tensor_concrete("mid", &[1, 64], DType::F32);
         let out = g.add_tensor_concrete("out", &[1, 64], DType::F32);
 
-        let norm = g.add_op_with_op(Op::RmsNorm(NormSpec { feature_dim: 4096, eps: 1e-5, dtype: DType::F32, has_weight: true }), OpKind::RmsNorm { feature_dim: 4096, eps: 1e-5 }, vec![a], vec![mid], "norm");
-        let tanh = g.add_op_with_op(Op::Tanh, OpKind::Tanh, vec![mid], vec![out], "tanh");
+        let norm = g.add_op(Op::RmsNorm(NormSpec { feature_dim: 4096, eps: 1e-5, dtype: DType::F32, has_weight: true }), vec![a], vec![mid], "norm");
+        let tanh = g.add_op(Op::Tanh, vec![mid], vec![out], "tanh");
 
         let reg = make_registry();
         let dag = SemanticDAG::from_graph(&g, &reg);
@@ -1958,8 +1958,8 @@ mod tests {
         let a2 = g.add_tensor_concrete("a2", &[1, 4], DType::F32);
         let out2 = g.add_tensor_concrete("out2", &[1, 4], DType::F32);
 
-        g.add_op_with_op(Op::Tanh, OpKind::Tanh, vec![a1], vec![out1], "tanh");
-        g.add_op_with_op(Op::Silu, OpKind::Silu, vec![a2], vec![out2], "silu");
+        g.add_op(Op::Tanh, vec![a1], vec![out1], "tanh");
+        g.add_op(Op::Silu, vec![a2], vec![out2], "silu");
 
         let reg = make_registry();
         let plan = make_plan();
@@ -1982,10 +1982,7 @@ mod tests {
         let w = g.add_tensor_concrete("w", &[8, 8], DType::F32);
         let scale = g.add_tensor_concrete("scale", &[8], DType::F32);
         let out = g.add_tensor_concrete("out", &[1, 8], DType::F32);
-        let op0 = g.add_op_with_op(Op::QuantGemm(QuantGemmSpec { m: SymDim::Concrete(1), n: 8, k: 8, quant_type: crate::quant::QuantType::Q4_0 }), OpKind::QuantGemm {
-                m: SymDim::Concrete(1), n: 8, k: 8,
-                quant_type: crate::quant::QuantType::Q4_0,
-            },
+        let op0 = g.add_op(Op::QuantGemm(QuantGemmSpec { m: SymDim::Concrete(1), n: 8, k: 8, quant_type: crate::quant::QuantType::Q4_0 }),
             vec![a, w, scale],
             vec![out],
             "qgemm",
@@ -2016,11 +2013,8 @@ mod tests {
         let w = g.add_tensor_concrete("w", &[4, 4], DType::F32);
         let scale = g.add_tensor_concrete("scale", &[4], DType::F32);
         let out = g.add_tensor_concrete("out", &[1, 4], DType::F32);
-        let norm_op = g.add_op_with_op(Op::RmsNorm(NormSpec { feature_dim: 4096, eps: 1e-5, dtype: DType::F32, has_weight: true }), OpKind::RmsNorm { feature_dim: 4096, eps: 1e-5 }, vec![a], vec![mid], "norm");
-        g.add_op_with_op(Op::QuantGemm(QuantGemmSpec { m: SymDim::Concrete(1), n: 4, k: 4, quant_type: crate::quant::QuantType::Q4_0 }), OpKind::QuantGemm {
-                m: SymDim::Concrete(1), n: 4, k: 4,
-                quant_type: crate::quant::QuantType::Q4_0,
-            },
+        let norm_op = g.add_op(Op::RmsNorm(NormSpec { feature_dim: 4096, eps: 1e-5, dtype: DType::F32, has_weight: true }), vec![a], vec![mid], "norm");
+        g.add_op(Op::QuantGemm(QuantGemmSpec { m: SymDim::Concrete(1), n: 4, k: 4, quant_type: crate::quant::QuantType::Q4_0 }),
             vec![mid, w, scale],
             vec![out],
             "qgemm",
@@ -2047,12 +2041,12 @@ mod tests {
         let gemm_out = g.add_tensor_concrete("gemm_out", &[1, 4], DType::F32);
         let out = g.add_tensor_concrete("out", &[1, 4], DType::F32);
 
-        let gemm = g.add_op_with_op(Op::Gemm(GemmSpec { m: SymDim::Concrete(1), n: 4, k: 4, dtype: DType::F32, trans_b: false, has_bias: false }), OpKind::Gemm { m: SymDim::Concrete(1), n: 4, k: 4, dtype: DType::F32, trans_b: false },
+        let gemm = g.add_op(Op::Gemm(GemmSpec { m: SymDim::Concrete(1), n: 4, k: 4, dtype: DType::F32, trans_b: false, has_bias: false }),
             vec![a, w],
             vec![gemm_out],
             "gemm",
         );
-        let l2norm = g.add_op_with_op(Op::L2Normalize { hidden: 4 }, OpKind::L2Normalize { hidden: 4 },
+        let l2norm = g.add_op(Op::L2Normalize { hidden: 4 },
             vec![gemm_out],
             vec![out],
             "l2norm",
@@ -2077,7 +2071,7 @@ mod tests {
         let mut g = CompilerGraph::new();
         let a = g.add_tensor_concrete("a", &[1, 4], DType::F32);
         let out = g.add_tensor_concrete("out", &[4, 1], DType::F32);
-        let op0 = g.add_op_with_op(Op::Reshape { target_shape: vec![4, 1] }, OpKind::Reshape { target_shape: vec![4, 1] }, vec![a], vec![out], "reshape");
+        let op0 = g.add_op(Op::Reshape { target_shape: vec![4, 1] }, vec![a], vec![out], "reshape");
 
         let reg = make_registry();
         let dag = SemanticDAG::from_graph(&g, &reg);
@@ -2102,7 +2096,7 @@ mod tests {
         let mut g = CompilerGraph::new();
         let a = g.add_tensor_concrete("a", &[1, 4], DType::F32);
         let out = g.add_tensor_concrete("out", &[1, 4], DType::F32);
-        let op0 = g.add_op_with_op(Op::RoPE(RopeSpec { num_heads: 1, head_dim: 4, theta: 10000.0, partial: 1.0, rope_scaling: None }), OpKind::RoPE { num_heads: 1, head_dim: 4, theta: 10000.0, partial: 1.0, rope_scaling: None },
+        let op0 = g.add_op(Op::RoPE(RopeSpec { num_heads: 1, head_dim: 4, theta: 10000.0, partial: 1.0, rope_scaling: None }),
             vec![a],
             vec![out],
             "rope",
@@ -2132,8 +2126,8 @@ mod tests {
         let a2 = g.add_tensor_concrete("a2", &[1, 4], DType::F32);
         let out2 = g.add_tensor_concrete("out2", &[1, 4], DType::F32);
 
-        g.add_op_with_op(Op::Tanh, OpKind::Tanh, vec![a1], vec![out1], "tanh");
-        g.add_op_with_op(Op::Silu, OpKind::Silu, vec![a2], vec![out2], "silu");
+        g.add_op(Op::Tanh, vec![a1], vec![out1], "tanh");
+        g.add_op(Op::Silu, vec![a2], vec![out2], "silu");
 
         let reg = make_registry();
         let plan = make_plan();
@@ -2155,7 +2149,7 @@ mod tests {
         let a = g.add_tensor_concrete("a", &[1, 8], DType::BF16);
         let w = g.add_tensor_concrete("w", &[8, 8], DType::BF16);
         let out = g.add_tensor_concrete("out", &[1, 8], DType::BF16);
-        let op0 = g.add_op_with_op(Op::Gemm(GemmSpec { m: SymDim::Concrete(1), n: 8, k: 8, dtype: DType::BF16, trans_b: false, has_bias: false }), OpKind::Gemm { m: SymDim::Concrete(1), n: 8, k: 8, dtype: DType::BF16, trans_b: false },
+        let op0 = g.add_op(Op::Gemm(GemmSpec { m: SymDim::Concrete(1), n: 8, k: 8, dtype: DType::BF16, trans_b: false, has_bias: false }),
             vec![a, w],
             vec![out],
             "gemm",
@@ -2194,9 +2188,9 @@ mod tests {
         let a3 = g.add_tensor_concrete("a3", &[1, 4], DType::F32);
         let out3 = g.add_tensor_concrete("out3", &[1, 4], DType::F32);
 
-        let op0 = g.add_op_with_op(Op::Tanh, OpKind::Tanh, vec![a1], vec![out1], "tanh");
-        let op1 = g.add_op_with_op(Op::Silu, OpKind::Silu, vec![a2], vec![out2], "silu");
-        let op2 = g.add_op_with_op(Op::Gelu, OpKind::Gelu, vec![a3], vec![out3], "gelu");
+        let op0 = g.add_op(Op::Tanh, vec![a1], vec![out1], "tanh");
+        let op1 = g.add_op(Op::Silu, vec![a2], vec![out2], "silu");
+        let op2 = g.add_op(Op::Gelu, vec![a3], vec![out3], "gelu");
 
         let reg = make_registry();
         let dag = SemanticDAG::from_graph(&g, &reg);
@@ -2224,7 +2218,7 @@ mod tests {
         let mut g = CompilerGraph::new();
         let a = g.add_tensor_concrete("a", &[2, 4], DType::F32);
         let out = g.add_tensor_concrete("out", &[4, 2], DType::F32);
-        let op0 = g.add_op_with_op(Op::Transpose { perm: vec![1, 0] }, OpKind::Transpose { perm: vec![1, 0] }, vec![a], vec![out], "transpose");
+        let op0 = g.add_op(Op::Transpose { perm: vec![1, 0] }, vec![a], vec![out], "transpose");
 
         let reg = make_registry();
         let dag = SemanticDAG::from_graph(&g, &reg);
@@ -2251,7 +2245,7 @@ mod tests {
         let a = g.add_tensor_concrete("a", &[1, 4], DType::F32);
         let w = g.add_tensor_concrete("w", &[4, 4], DType::F32);
         let gemm_out = g.add_tensor_concrete("gemm_out", &[1, 4], DType::F32);
-        let gemm_op = g.add_op_with_op(Op::Gemm(GemmSpec { m: SymDim::Concrete(1), n: 4, k: 4, dtype: DType::F32, trans_b: false, has_bias: false }), OpKind::Gemm { m: SymDim::Concrete(1), n: 4, k: 4, dtype: DType::F32, trans_b: false },
+        let gemm_op = g.add_op(Op::Gemm(GemmSpec { m: SymDim::Concrete(1), n: 4, k: 4, dtype: DType::F32, trans_b: false, has_bias: false }),
             vec![a, w],
             vec![gemm_out],
             "gemm",
@@ -2260,17 +2254,17 @@ mod tests {
         // ElemWise branch (independent)
         let b = g.add_tensor_concrete("b", &[1, 4], DType::F32);
         let tanh_out = g.add_tensor_concrete("tanh_out", &[1, 4], DType::F32);
-        let tanh_op = g.add_op_with_op(Op::Tanh, OpKind::Tanh, vec![b], vec![tanh_out], "tanh");
+        let tanh_op = g.add_op(Op::Tanh, vec![b], vec![tanh_out], "tanh");
 
         // Reduction branch (independent)
         let c = g.add_tensor_concrete("c", &[1, 4], DType::F32);
         let argmax_out = g.add_tensor_concrete("argmax_out", &[1], DType::F32);
-        let argmax_op = g.add_op_with_op(Op::Argmax { vocab_size: 4 }, OpKind::Argmax { vocab_size: 4 }, vec![c], vec![argmax_out], "argmax");
+        let argmax_op = g.add_op(Op::Argmax { vocab_size: 4 }, vec![c], vec![argmax_out], "argmax");
 
         // Opaque branch (independent)
         let d = g.add_tensor_concrete("d", &[2, 2], DType::F32);
         let reshape_out = g.add_tensor_concrete("reshape_out", &[4, 1], DType::F32);
-        let reshape_op = g.add_op_with_op(Op::Reshape { target_shape: vec![4, 1] }, OpKind::Reshape { target_shape: vec![4, 1] }, vec![d], vec![reshape_out], "reshape");
+        let reshape_op = g.add_op(Op::Reshape { target_shape: vec![4, 1] }, vec![d], vec![reshape_out], "reshape");
 
         let reg = make_registry();
         let dag = SemanticDAG::from_graph(&g, &reg);
@@ -2304,7 +2298,7 @@ mod tests {
         let mut g = CompilerGraph::new();
         let a = g.add_tensor_concrete("a", &[1, 4], DType::F32);
         let mid = g.add_tensor_concrete("mid", &[1, 4], DType::F32);
-        let norm_op = g.add_op_with_op(Op::RmsNorm(NormSpec { feature_dim: 4096, eps: 1e-5, dtype: DType::F32, has_weight: true }), OpKind::RmsNorm { feature_dim: 4096, eps: 1e-5 }, vec![a], vec![mid], "norm");
+        let norm_op = g.add_op(Op::RmsNorm(NormSpec { feature_dim: 4096, eps: 1e-5, dtype: DType::F32, has_weight: true }), vec![a], vec![mid], "norm");
 
         let reg = make_registry();
         let dag = SemanticDAG::from_graph(&g, &reg);
@@ -2348,8 +2342,8 @@ mod tests {
         let w = g.add_tensor_concrete("w", &[64, 64], DType::F32);
         let out = g.add_tensor_concrete("out", &[1, 64], DType::F32);
 
-        let norm_op = g.add_op_with_op(Op::RmsNorm(NormSpec { feature_dim: 4096, eps: 1e-5, dtype: DType::F32, has_weight: true }), OpKind::RmsNorm { feature_dim: 4096, eps: 1e-5 }, vec![a], vec![norm_out], "norm");
-        let gemm_op = g.add_op_with_op(Op::Gemm(GemmSpec { m: SymDim::Concrete(1), n: 64, k: 64, dtype: DType::F32, trans_b: false, has_bias: false }), OpKind::Gemm { m: SymDim::Concrete(1), n: 64, k: 64, dtype: DType::F32, trans_b: false },
+        let norm_op = g.add_op(Op::RmsNorm(NormSpec { feature_dim: 4096, eps: 1e-5, dtype: DType::F32, has_weight: true }), vec![a], vec![norm_out], "norm");
+        let gemm_op = g.add_op(Op::Gemm(GemmSpec { m: SymDim::Concrete(1), n: 64, k: 64, dtype: DType::F32, trans_b: false, has_bias: false }),
             vec![norm_out, w],
             vec![out],
             "gemm",
@@ -2384,13 +2378,13 @@ mod tests {
         let silu_out = g.add_tensor_concrete("silu_out", &[1, 64], DType::F32);
         let tanh_out = g.add_tensor_concrete("tanh_out", &[1, 64], DType::F32);
 
-        let gemm = g.add_op_with_op(Op::Gemm(GemmSpec { m: SymDim::Concrete(1), n: 64, k: 64, dtype: DType::F32, trans_b: false, has_bias: false }), OpKind::Gemm { m: SymDim::Concrete(1), n: 64, k: 64, dtype: DType::F32, trans_b: false },
+        let gemm = g.add_op(Op::Gemm(GemmSpec { m: SymDim::Concrete(1), n: 64, k: 64, dtype: DType::F32, trans_b: false, has_bias: false }),
             vec![a, w],
             vec![gemm_out],
             "gemm",
         );
-        let silu = g.add_op_with_op(Op::Silu, OpKind::Silu, vec![gemm_out], vec![silu_out], "silu");
-        let tanh = g.add_op_with_op(Op::Tanh, OpKind::Tanh, vec![silu_out], vec![tanh_out], "tanh");
+        let silu = g.add_op(Op::Silu, vec![gemm_out], vec![silu_out], "silu");
+        let tanh = g.add_op(Op::Tanh, vec![silu_out], vec![tanh_out], "tanh");
 
         let reg = make_registry();
         let dag = SemanticDAG::from_graph(&g, &reg);
@@ -2450,12 +2444,12 @@ mod tests {
         let w2 = g.add_tensor_concrete("w2", &[4, 4], DType::F32);
         let out2 = g.add_tensor_concrete("out2", &[1, 4], DType::F32);
 
-        let gemm1 = g.add_op_with_op(Op::Gemm(GemmSpec { m: SymDim::Concrete(1), n: 4, k: 4, dtype: DType::F32, trans_b: false, has_bias: false }), OpKind::Gemm { m: SymDim::Concrete(1), n: 4, k: 4, dtype: DType::F32, trans_b: false },
+        let gemm1 = g.add_op(Op::Gemm(GemmSpec { m: SymDim::Concrete(1), n: 4, k: 4, dtype: DType::F32, trans_b: false, has_bias: false }),
             vec![a1, w1],
             vec![out1],
             "gemm1",
         );
-        let gemm2 = g.add_op_with_op(Op::Gemm(GemmSpec { m: SymDim::Concrete(1), n: 4, k: 4, dtype: DType::F32, trans_b: false, has_bias: false }), OpKind::Gemm { m: SymDim::Concrete(1), n: 4, k: 4, dtype: DType::F32, trans_b: false },
+        let gemm2 = g.add_op(Op::Gemm(GemmSpec { m: SymDim::Concrete(1), n: 4, k: 4, dtype: DType::F32, trans_b: false, has_bias: false }),
             vec![a2, w2],
             vec![out2],
             "gemm2",
@@ -2483,7 +2477,7 @@ mod tests {
         let mut g = CompilerGraph::new();
         let a = g.add_tensor_concrete("a", &[1, 16], DType::F32);
         let out = g.add_tensor_concrete("out", &[1, 16], DType::F32);
-        g.add_op_with_op(Op::Tanh, OpKind::Tanh, vec![a], vec![out], "tanh");
+        g.add_op(Op::Tanh, vec![a], vec![out], "tanh");
 
         let reg = make_registry();
         let dag = SemanticDAG::from_graph(&g, &reg);
@@ -2504,7 +2498,7 @@ mod tests {
         let mut g = CompilerGraph::new();
         let a = g.add_tensor_concrete("a", &[1, 32], DType::F32);
         let out = g.add_tensor_concrete("out", &[1, 32], DType::F32);
-        let op0 = g.add_op_with_op(Op::Gelu, OpKind::Gelu, vec![a], vec![out], "gelu");
+        let op0 = g.add_op(Op::Gelu, vec![a], vec![out], "gelu");
 
         let reg = make_registry();
         let dag = SemanticDAG::from_graph(&g, &reg);
@@ -2529,7 +2523,7 @@ mod tests {
         let mut g = CompilerGraph::new();
         let a = g.add_tensor_concrete("a", &[1, 16], DType::F32);
         let out = g.add_tensor_concrete("out", &[1, 16], DType::F32);
-        let op0 = g.add_op_with_op(Op::Softmax, OpKind::Softmax, vec![a], vec![out], "softmax");
+        let op0 = g.add_op(Op::Softmax, vec![a], vec![out], "softmax");
 
         let reg = make_registry();
         let dag = SemanticDAG::from_graph(&g, &reg);
@@ -2553,7 +2547,7 @@ mod tests {
         let mut g = CompilerGraph::new();
         let a = g.add_tensor_concrete("a", &[1, 16], DType::F32);
         let out = g.add_tensor_concrete("out", &[1, 16], DType::F32);
-        let op0 = g.add_op_with_op(Op::SwiGlu, OpKind::SwiGlu, vec![a], vec![out], "swiglu");
+        let op0 = g.add_op(Op::SwiGlu, vec![a], vec![out], "swiglu");
 
         let reg = make_registry();
         let dag = SemanticDAG::from_graph(&g, &reg);
@@ -2605,7 +2599,7 @@ mod tests {
         let a = g.add_tensor_concrete("a", &[1, 16], DType::F32);
         let b = g.add_tensor_concrete("b", &[1, 16], DType::F32);
         let out = g.add_tensor_concrete("out", &[1, 16], DType::F32);
-        let op0 = g.add_op_with_op(Op::Add, OpKind::Add, vec![a, b], vec![out], "add");
+        let op0 = g.add_op(Op::Add, vec![a, b], vec![out], "add");
 
         let reg = make_registry();
         let dag = SemanticDAG::from_graph(&g, &reg);
@@ -2630,7 +2624,7 @@ mod tests {
         let a = g.add_tensor_concrete("a", &[1, 16], DType::F32);
         let b = g.add_tensor_concrete("b", &[1, 16], DType::F32);
         let out = g.add_tensor_concrete("out", &[1, 16], DType::F32);
-        let op0 = g.add_op_with_op(Op::Mul, OpKind::Mul, vec![a, b], vec![out], "mul");
+        let op0 = g.add_op(Op::Mul, vec![a, b], vec![out], "mul");
 
         let reg = make_registry();
         let dag = SemanticDAG::from_graph(&g, &reg);
@@ -2656,8 +2650,8 @@ mod tests {
         let a = g.add_tensor_concrete("a", &[1, 16], DType::F32);
         let mid = g.add_tensor_concrete("mid", &[1, 16], DType::F32);
         let out = g.add_tensor_concrete("out", &[1, 16], DType::F32);
-        let anchor_op = g.add_op_with_op(Op::Tanh, OpKind::Tanh, vec![a], vec![mid], "tanh");
-        let epi_op = g.add_op_with_op(Op::Silu, OpKind::Silu, vec![mid], vec![out], "silu");
+        let anchor_op = g.add_op(Op::Tanh, vec![a], vec![mid], "tanh");
+        let epi_op = g.add_op(Op::Silu, vec![mid], vec![out], "silu");
 
         let mut group = FusionGroup {
             id: 0,
@@ -2689,8 +2683,8 @@ mod tests {
         let a = g.add_tensor_concrete("a", &[1, 8], DType::BF16);
         let mid = g.add_tensor_concrete("mid", &[1, 8], DType::F32);
         let out = g.add_tensor_concrete("out", &[1, 8], DType::F32);
-        let anchor_op = g.add_op_with_op(Op::Silu, OpKind::Silu, vec![a], vec![mid], "silu");
-        let epi_op = g.add_op_with_op(Op::Tanh, OpKind::Tanh, vec![mid], vec![out], "tanh");
+        let anchor_op = g.add_op(Op::Silu, vec![a], vec![mid], "silu");
+        let epi_op = g.add_op(Op::Tanh, vec![mid], vec![out], "tanh");
 
         let mut group = FusionGroup {
             id: 0,
@@ -2721,8 +2715,8 @@ mod tests {
         let b = g.add_tensor_concrete("b", &[32], DType::F32);
         let c = g.add_tensor_concrete("c", &[32], DType::F32);
         g.inputs = vec![a]; g.outputs = vec![c];
-        let op0 = g.add_op_with_op(Op::Silu, OpKind::Silu, vec![a], vec![b], "silu");
-        let op1 = g.add_op_with_op(Op::Tanh, OpKind::Tanh, vec![b], vec![c], "tanh");
+        let op0 = g.add_op(Op::Silu, vec![a], vec![b], "silu");
+        let op1 = g.add_op(Op::Tanh, vec![b], vec![c], "tanh");
         let group = FusionGroup {
             id: 0, anchor: op0, epilogue: vec![op1],
             mode: FusionMode::LoopFusion, ops: vec![op0, op1],
@@ -2740,7 +2734,7 @@ mod tests {
         let a = g.add_tensor_concrete("a", &[32], DType::BF16);
         let b = g.add_tensor_concrete("b", &[32], DType::F32);
         g.inputs = vec![a]; g.outputs = vec![b];
-        let op0 = g.add_op_with_op(Op::Silu, OpKind::Silu, vec![a], vec![b], "silu");
+        let op0 = g.add_op(Op::Silu, vec![a], vec![b], "silu");
         let group = FusionGroup {
             id: 0, anchor: op0, epilogue: vec![],
             mode: FusionMode::LoopFusion, ops: vec![op0],
@@ -2763,9 +2757,9 @@ mod tests {
         let mid2 = g.add_tensor_concrete("mid2", &[1, 4], DType::F32);
         let out = g.add_tensor_concrete("out", &[1, 4], DType::F32);
 
-        let op0 = g.add_op_with_op(Op::Tanh, OpKind::Tanh, vec![a], vec![mid1], "tanh");
-        let op1 = g.add_op_with_op(Op::Silu, OpKind::Silu, vec![mid1], vec![mid2], "silu");
-        let op2 = g.add_op_with_op(Op::Gelu, OpKind::Gelu, vec![mid2], vec![out], "gelu");
+        let op0 = g.add_op(Op::Tanh, vec![a], vec![mid1], "tanh");
+        let op1 = g.add_op(Op::Silu, vec![mid1], vec![mid2], "silu");
+        let op2 = g.add_op(Op::Gelu, vec![mid2], vec![out], "gelu");
 
         let reg = make_registry();
         let dag = SemanticDAG::from_graph(&g, &reg);
@@ -2799,12 +2793,12 @@ mod tests {
         let gemm_out = g.add_tensor_concrete("gemm_out", &[1, 4], DType::F32);
         let reshape_out = g.add_tensor_concrete("reshape_out", &[4, 1], DType::F32);
 
-        let gemm = g.add_op_with_op(Op::Gemm(GemmSpec { m: SymDim::Concrete(1), n: 4, k: 4, dtype: DType::F32, trans_b: false, has_bias: false }), OpKind::Gemm { m: SymDim::Concrete(1), n: 4, k: 4, dtype: DType::F32, trans_b: false },
+        let gemm = g.add_op(Op::Gemm(GemmSpec { m: SymDim::Concrete(1), n: 4, k: 4, dtype: DType::F32, trans_b: false, has_bias: false }),
             vec![a, w],
             vec![gemm_out],
             "gemm",
         );
-        g.add_op_with_op(Op::Reshape { target_shape: vec![4, 1] }, OpKind::Reshape { target_shape: vec![4, 1] }, vec![gemm_out], vec![reshape_out], "reshape");
+        g.add_op(Op::Reshape { target_shape: vec![4, 1] }, vec![gemm_out], vec![reshape_out], "reshape");
 
         let reg = make_registry();
         let dag = SemanticDAG::from_graph(&g, &reg);
@@ -2830,12 +2824,12 @@ mod tests {
         let gemm_out = g.add_tensor_concrete("gemm_out", &[1, 4], DType::F32);
         let argmax_out = g.add_tensor_concrete("argmax_out", &[1], DType::F32);
 
-        let gemm = g.add_op_with_op(Op::Gemm(GemmSpec { m: SymDim::Concrete(1), n: 4, k: 4, dtype: DType::F32, trans_b: false, has_bias: false }), OpKind::Gemm { m: SymDim::Concrete(1), n: 4, k: 4, dtype: DType::F32, trans_b: false },
+        let gemm = g.add_op(Op::Gemm(GemmSpec { m: SymDim::Concrete(1), n: 4, k: 4, dtype: DType::F32, trans_b: false, has_bias: false }),
             vec![a, w],
             vec![gemm_out],
             "gemm",
         );
-        let argmax = g.add_op_with_op(Op::Argmax { vocab_size: 4 }, OpKind::Argmax { vocab_size: 4 }, vec![gemm_out], vec![argmax_out], "argmax");
+        let argmax = g.add_op(Op::Argmax { vocab_size: 4 }, vec![gemm_out], vec![argmax_out], "argmax");
 
         let gemm_op = g.op(gemm).unwrap().clone();
         let claimed = HashSet::new();
@@ -2905,7 +2899,7 @@ mod tests {
         let mut g = CompilerGraph::new();
         let a = g.add_tensor_concrete("a", &[1, 32], DType::BF16);
         let out = g.add_tensor_concrete("out", &[1, 32], DType::BF16);
-        let op0 = g.add_op_with_op(Op::Tanh, OpKind::Tanh, vec![a], vec![out], "tanh");
+        let op0 = g.add_op(Op::Tanh, vec![a], vec![out], "tanh");
 
         let reg = make_registry();
         let dag = SemanticDAG::from_graph(&g, &reg);
@@ -2930,12 +2924,12 @@ mod tests {
         let gemm_out = g.add_tensor_concrete("gemm_out", &[1, 32], DType::F32);
         let silu_out = g.add_tensor_concrete("silu_out", &[1, 32], DType::F32);
 
-        let gemm = g.add_op_with_op(Op::Gemm(GemmSpec { m: SymDim::Concrete(1), n: 32, k: 32, dtype: DType::F32, trans_b: false, has_bias: false }), OpKind::Gemm { m: SymDim::Concrete(1), n: 32, k: 32, dtype: DType::F32, trans_b: false },
+        let gemm = g.add_op(Op::Gemm(GemmSpec { m: SymDim::Concrete(1), n: 32, k: 32, dtype: DType::F32, trans_b: false, has_bias: false }),
             vec![a, w],
             vec![gemm_out],
             "gemm",
         );
-        let silu = g.add_op_with_op(Op::Silu, OpKind::Silu, vec![gemm_out], vec![silu_out], "silu");
+        let silu = g.add_op(Op::Silu, vec![gemm_out], vec![silu_out], "silu");
 
         let reg = make_registry();
         let dag = SemanticDAG::from_graph(&g, &reg);
@@ -2962,7 +2956,7 @@ mod tests {
         let mut g = CompilerGraph::new();
         let a = g.add_tensor_concrete("a", &[1, 32], DType::F32);
         let out = g.add_tensor_concrete("out", &[1, 32], DType::F32);
-        let op0 = g.add_op_with_op(Op::GeGlu, OpKind::GeGlu, vec![a], vec![out], "geglu");
+        let op0 = g.add_op(Op::GeGlu, vec![a], vec![out], "geglu");
 
         let reg = make_registry();
         let dag = SemanticDAG::from_graph(&g, &reg);
@@ -2990,7 +2984,7 @@ mod tests {
         let a = g.add_tensor_concrete("a", &[1, 8], DType::F32);
         let w = g.add_tensor_concrete("w", &[8, 8], DType::F32);
         let gemm_out = g.add_tensor_concrete("gemm_out", &[1, 8], DType::F32);
-        let gemm_op = g.add_op_with_op(Op::Gemm(GemmSpec { m: SymDim::Concrete(1), n: 8, k: 8, dtype: DType::F32, trans_b: false, has_bias: false }), OpKind::Gemm { m: SymDim::Concrete(1), n: 8, k: 8, dtype: DType::F32, trans_b: false },
+        let gemm_op = g.add_op(Op::Gemm(GemmSpec { m: SymDim::Concrete(1), n: 8, k: 8, dtype: DType::F32, trans_b: false, has_bias: false }),
             vec![a, w],
             vec![gemm_out],
             "gemm",
@@ -2999,12 +2993,12 @@ mod tests {
         // Reshape (Opaque) on separate input
         let r = g.add_tensor_concrete("r", &[2, 4], DType::F32);
         let reshape_out = g.add_tensor_concrete("reshape_out", &[8, 1], DType::F32);
-        let reshape_op = g.add_op_with_op(Op::Reshape { target_shape: vec![8, 1] }, OpKind::Reshape { target_shape: vec![8, 1] }, vec![r], vec![reshape_out], "reshape");
+        let reshape_op = g.add_op(Op::Reshape { target_shape: vec![8, 1] }, vec![r], vec![reshape_out], "reshape");
 
         // Argmax (Reduction) on separate input
         let c = g.add_tensor_concrete("c", &[1, 8], DType::F32);
         let argmax_out = g.add_tensor_concrete("argmax_out", &[1], DType::F32);
-        let argmax_op = g.add_op_with_op(Op::Argmax { vocab_size: 8 }, OpKind::Argmax { vocab_size: 8 }, vec![c], vec![argmax_out], "argmax");
+        let argmax_op = g.add_op(Op::Argmax { vocab_size: 8 }, vec![c], vec![argmax_out], "argmax");
 
         let reg = make_registry();
         let dag = SemanticDAG::from_graph(&g, &reg);
@@ -3034,7 +3028,7 @@ mod tests {
         let mut g = CompilerGraph::new();
         let a = g.add_tensor_concrete("a", &[1, 16], DType::F32);
         let out = g.add_tensor_concrete("out", &[1, 16], DType::F32);
-        let op0 = g.add_op_with_op(Op::SwiGluClipped { limit: 5.0 }, OpKind::SwiGluClipped { limit: 5.0 }, vec![a], vec![out], "swiglu_clipped");
+        let op0 = g.add_op(Op::SwiGluClipped { limit: 5.0 }, vec![a], vec![out], "swiglu_clipped");
 
         let reg = make_registry();
         let dag = SemanticDAG::from_graph(&g, &reg);
@@ -3059,7 +3053,7 @@ mod tests {
         let a = g.add_tensor_concrete("a", &[1, 16], DType::F32);
         let b = g.add_tensor_concrete("b", &[1, 16], DType::F32);
         let out = g.add_tensor_concrete("out", &[1, 16], DType::F32);
-        let op0 = g.add_op_with_op(Op::Residual, OpKind::Residual, vec![a, b], vec![out], "residual");
+        let op0 = g.add_op(Op::Residual, vec![a, b], vec![out], "residual");
 
         let reg = make_registry();
         let dag = SemanticDAG::from_graph(&g, &reg);
@@ -3087,10 +3081,10 @@ mod tests {
         let mid3 = g.add_tensor_concrete("mid3", &[1, 64], DType::F32);
         let out = g.add_tensor_concrete("out", &[1, 64], DType::F32);
 
-        let op0 = g.add_op_with_op(Op::Tanh, OpKind::Tanh, vec![a], vec![mid1], "tanh1");
-        let op1 = g.add_op_with_op(Op::Silu, OpKind::Silu, vec![mid1], vec![mid2], "silu1");
-        let op2 = g.add_op_with_op(Op::Gelu, OpKind::Gelu, vec![mid2], vec![mid3], "gelu1");
-        let op3 = g.add_op_with_op(Op::Tanh, OpKind::Tanh, vec![mid3], vec![out], "tanh2");
+        let op0 = g.add_op(Op::Tanh, vec![a], vec![mid1], "tanh1");
+        let op1 = g.add_op(Op::Silu, vec![mid1], vec![mid2], "silu1");
+        let op2 = g.add_op(Op::Gelu, vec![mid2], vec![mid3], "gelu1");
+        let op3 = g.add_op(Op::Tanh, vec![mid3], vec![out], "tanh2");
 
         let reg = make_registry();
         let dag = SemanticDAG::from_graph(&g, &reg);
@@ -3120,7 +3114,7 @@ mod tests {
         let mut g = CompilerGraph::new();
         let a = g.add_tensor_concrete("a", &[1, 4], DType::F32);
         let out = g.add_tensor_concrete("out", &[1, 4], DType::F32);
-        let op0 = g.add_op_with_op(Op::QkNorm { head_dim: 4, eps: 1e-5 }, OpKind::QkNorm { head_dim: 4, eps: 1e-5 }, vec![a], vec![out], "qk_norm");
+        let op0 = g.add_op(Op::QkNorm { head_dim: 4, eps: 1e-5 }, vec![a], vec![out], "qk_norm");
 
         let reg = make_registry();
         let dag = SemanticDAG::from_graph(&g, &reg);
@@ -3144,7 +3138,7 @@ mod tests {
         let mut g = CompilerGraph::new();
         let a = g.add_tensor_concrete("a", &[1, 16], DType::F32);
         let out = g.add_tensor_concrete("out", &[1, 16], DType::F32);
-        let op0 = g.add_op_with_op(Op::LogitSoftcap { cap: 30.0 }, OpKind::LogitSoftcap { cap: 30.0 }, vec![a], vec![out], "logit_softcap");
+        let op0 = g.add_op(Op::LogitSoftcap { cap: 30.0 }, vec![a], vec![out], "logit_softcap");
 
         let reg = make_registry();
         let dag = SemanticDAG::from_graph(&g, &reg);
@@ -3172,12 +3166,12 @@ mod tests {
         let gemm_out = g.add_tensor_concrete("gemm_out", &[1, 32], DType::F32);
         let silu_out = g.add_tensor_concrete("silu_out", &[1, 32], DType::F32);
 
-        let gemm = g.add_op_with_op(Op::GemmBias(GemmSpec { m: SymDim::Concrete(1), n: 32, k: 32, dtype: DType::F32, trans_b: false, has_bias: true }), OpKind::GemmBias { m: SymDim::Concrete(1), n: 32, k: 32, dtype: DType::F32, trans_b: false },
+        let gemm = g.add_op(Op::GemmBias(GemmSpec { m: SymDim::Concrete(1), n: 32, k: 32, dtype: DType::F32, trans_b: false, has_bias: true }),
             vec![a, w, b],
             vec![gemm_out],
             "gemm_bias",
         );
-        let silu = g.add_op_with_op(Op::Silu, OpKind::Silu, vec![gemm_out], vec![silu_out], "silu");
+        let silu = g.add_op(Op::Silu, vec![gemm_out], vec![silu_out], "silu");
 
         let reg = make_registry();
         let dag = SemanticDAG::from_graph(&g, &reg);
@@ -3203,7 +3197,7 @@ mod tests {
         let mut g = CompilerGraph::new();
         let a = g.add_tensor_concrete("a", &[1, 16], DType::F32);
         let out = g.add_tensor_concrete("out", &[1, 8], DType::F32);
-        let op0 = g.add_op_with_op(Op::SliceView { axis: 1, start: 0, end: 8 }, OpKind::SliceView { axis: 1, start: 0, end: 8 },
+        let op0 = g.add_op(Op::SliceView { axis: 1, start: 0, end: 8 },
             vec![a],
             vec![out],
             "slice_view",
@@ -3233,7 +3227,7 @@ mod tests {
         let mut g = CompilerGraph::new();
         let mut op_ids = Vec::new();
         let kinds = [
-            OpKind::Tanh, OpKind::Silu, OpKind::Gelu, OpKind::Tanh, OpKind::Silu,
+            Op::Tanh, Op::Silu, Op::Gelu, Op::Tanh, Op::Silu,
         ];
         for (i, kind) in kinds.into_iter().enumerate() {
             let inp_name = format!("a{}", i);

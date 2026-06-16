@@ -835,7 +835,7 @@ mod tests {
 
     #[test]
     fn test_plan_mega_kernel_resources_from_graph() {
-        use crate::compiler::graph::{CompilerGraph, OpKind, Op, GemmSpec, QuantGemmSpec, RopeSpec, SymDim};
+        use crate::compiler::graph::{CompilerGraph, Op, GemmSpec, QuantGemmSpec, RopeSpec, SymDim};
         use crate::compiler::fusion::FusionPlan;
         use crate::compiler::codegen::vm::isa_profile::IsaProfile;
         use crate::dispatch::device_profile::DeviceProfile;
@@ -853,22 +853,13 @@ mod tests {
         let q_out = graph.add_tensor_concrete("q_out", &[1, hidden], DType::F32);
         let rope_out = graph.add_tensor_concrete("rope_out", &[1, hidden], DType::F32);
 
-        let embed = graph.add_op_with_op(Op::Gather { table_rows: 32000, embed_dim: hidden, index_dim: SymDim::Concrete(1).clone(), indices_kind: crate::compiler::graph::GatherIndicesKind::default().clone(), scale: None }, OpKind::Gather {
-                table_rows: 32000, embed_dim: hidden,
-                index_dim: SymDim::Concrete(1),
-                indices_kind: crate::compiler::graph::GatherIndicesKind::default(),
-                scale: None,
-            },
+        let embed = graph.add_op(Op::Gather { table_rows: 32000, embed_dim: hidden, index_dim: SymDim::Concrete(1).clone(), indices_kind: crate::compiler::graph::GatherIndicesKind::default().clone(), scale: None },
             vec![ids_tok, embed_w], vec![embed_out], "embed",
         );
-        let q_proj = graph.add_op_with_op(Op::Gemm(GemmSpec { m: SymDim::Concrete(1), n: hidden, k: hidden, dtype: crate::types::DType::F32, trans_b: true, has_bias: false }), OpKind::Gemm {
-                m: SymDim::Concrete(1), n: hidden, k: hidden,
-                dtype: crate::types::DType::F32,
-                trans_b: true,
-            },
+        let q_proj = graph.add_op(Op::Gemm(GemmSpec { m: SymDim::Concrete(1), n: hidden, k: hidden, dtype: crate::types::DType::F32, trans_b: true, has_bias: false }),
             vec![embed_out, q_w], vec![q_out], "q_proj",
         );
-        let rope = graph.add_op_with_op(Op::RoPE(RopeSpec { num_heads: 8, head_dim: 64, theta: 10000.0, partial: 1.0, rope_scaling: None }), OpKind::RoPE { num_heads: 8, head_dim: 64, theta: 10000.0, partial: 1.0, rope_scaling: None },
+        let rope = graph.add_op(Op::RoPE(RopeSpec { num_heads: 8, head_dim: 64, theta: 10000.0, partial: 1.0, rope_scaling: None }),
             vec![q_out], vec![rope_out], "rope",
         );
 
@@ -1723,7 +1714,7 @@ mod data_structure_tests {
 
     #[test]
     fn plan_mega_kernel_quant_gemm_produces_pack_map_invariant() {
-        use crate::compiler::graph::{CompilerGraph, OpKind, Op, GemmSpec, QuantGemmSpec, RopeSpec, SymDim};
+        use crate::compiler::graph::{CompilerGraph, Op, GemmSpec, QuantGemmSpec, RopeSpec, SymDim};
         use crate::compiler::fusion::{FusionGroup, FusionMode, GroupMarker};
         use crate::compiler::codegen::vm::isa_profile::IsaProfile;
         use crate::dispatch::device_profile::DeviceProfile;
@@ -1739,12 +1730,7 @@ mod data_structure_tests {
         let q_weight = graph.add_tensor_concrete("q_weight", &[hidden, hidden], DType::F32);
         let q_out = graph.add_tensor_concrete("q_out", &[1, hidden], DType::F32);
 
-        let qgemm = graph.add_op_with_op(Op::QuantGemm(QuantGemmSpec { m: SymDim::Concrete(1), n: hidden, k: hidden, quant_type: QuantType::Q4K }), OpKind::QuantGemm {
-                m: SymDim::Concrete(1),
-                n: hidden,
-                k: hidden,
-                quant_type: QuantType::Q4K,
-            },
+        let qgemm = graph.add_op(Op::QuantGemm(QuantGemmSpec { m: SymDim::Concrete(1), n: hidden, k: hidden, quant_type: QuantType::Q4K }),
             vec![input_t, q_weight],
             vec![q_out],
             "qgemm",
@@ -1895,7 +1881,7 @@ mod data_structure_tests {
 
     #[test]
     fn derive_invariants_gather_produces_pack_map_base() {
-        use crate::compiler::graph::{CompilerGraph, OpKind, Op, GemmSpec, QuantGemmSpec, RopeSpec, SymDim};
+        use crate::compiler::graph::{CompilerGraph, Op, GemmSpec, QuantGemmSpec, RopeSpec, SymDim};
         use crate::compiler::codegen::vm::isa_profile::IsaProfile;
         use crate::compiler::fusion::{FusionGroup, FusionMode, GroupMarker};
         use crate::dispatch::device_profile::DeviceProfile;
@@ -1910,13 +1896,7 @@ mod data_structure_tests {
         let embed_w = graph.add_tensor_concrete("embed_w", &[32000, hidden], DType::F32);
         let embed_out = graph.add_tensor_concrete("embed_out", &[1, hidden], DType::F32);
 
-        let gather = graph.add_op_with_op(Op::Gather { table_rows: 32000, embed_dim: hidden, index_dim: SymDim::Concrete(1).clone(), indices_kind: crate::compiler::graph::GatherIndicesKind::default().clone(), scale: None }, OpKind::Gather {
-                table_rows: 32000,
-                embed_dim: hidden,
-                index_dim: SymDim::Concrete(1),
-                indices_kind: crate::compiler::graph::GatherIndicesKind::default(),
-                scale: None,
-            },
+        let gather = graph.add_op(Op::Gather { table_rows: 32000, embed_dim: hidden, index_dim: SymDim::Concrete(1).clone(), indices_kind: crate::compiler::graph::GatherIndicesKind::default().clone(), scale: None },
             vec![ids, embed_w],
             vec![embed_out],
             "embed",
@@ -2029,7 +2009,7 @@ mod data_structure_tests {
 
     #[test]
     fn plan_mega_kernel_rope_and_gather_produces_all_invariant_types() {
-        use crate::compiler::graph::{CompilerGraph, OpKind, Op, GemmSpec, QuantGemmSpec, RopeSpec, SymDim};
+        use crate::compiler::graph::{CompilerGraph, Op, GemmSpec, QuantGemmSpec, RopeSpec, SymDim};
         use crate::compiler::fusion::{FusionGroup, FusionMode, GroupMarker};
         use crate::compiler::codegen::vm::isa_profile::IsaProfile;
         use crate::dispatch::device_profile::DeviceProfile;
@@ -2046,18 +2026,12 @@ mod data_structure_tests {
         let q_out = graph.add_tensor_concrete("q_out", &[1, hidden], DType::F32);
         let rope_out = graph.add_tensor_concrete("rope_out", &[1, hidden], DType::F32);
 
-        let gather = graph.add_op_with_op(Op::Gather { table_rows: 32000, embed_dim: hidden, index_dim: SymDim::Concrete(1).clone(), indices_kind: crate::compiler::graph::GatherIndicesKind::default().clone(), scale: None }, OpKind::Gather {
-                table_rows: 32000,
-                embed_dim: hidden,
-                index_dim: SymDim::Concrete(1),
-                indices_kind: crate::compiler::graph::GatherIndicesKind::default(),
-                scale: None,
-            },
+        let gather = graph.add_op(Op::Gather { table_rows: 32000, embed_dim: hidden, index_dim: SymDim::Concrete(1).clone(), indices_kind: crate::compiler::graph::GatherIndicesKind::default().clone(), scale: None },
             vec![ids, embed_w],
             vec![embed_out],
             "embed",
         );
-        let rope = graph.add_op_with_op(Op::RoPE(RopeSpec { num_heads: 4, head_dim: 64, theta: 10000.0, partial: 1.0, rope_scaling: None }), OpKind::RoPE { num_heads: 4, head_dim: 64, theta: 10000.0, partial: 1.0, rope_scaling: None },
+        let rope = graph.add_op(Op::RoPE(RopeSpec { num_heads: 4, head_dim: 64, theta: 10000.0, partial: 1.0, rope_scaling: None }),
             vec![q_out],
             vec![rope_out],
             "rope",

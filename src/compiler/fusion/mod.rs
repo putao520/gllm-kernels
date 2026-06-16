@@ -34,7 +34,7 @@ pub(crate) use cost_model::is_memory_bound_group;
 mod tests {
     use super::*;
     use super::cost_model::{chain_eliminated_bytes, compute_group_roofline_scale};
-    use crate::compiler::graph::{CompilerGraph, OpId, Op, GemmSpec, MultiOutputConfig};
+    use crate::compiler::graph::{ CompilerGraph, OpId, Op, GemmSpec, MultiOutputConfig, NormSpec, QuantGemmSpec, RopeSpec, AttentionSpec, AttentionGeometry, AttentionMask, SinksSpec, MlaSpec };
     use crate::compiler::ir::LayerIR;
     use crate::compiler::planner::ExecutionPlan;
     use crate::dispatch::DeviceProfile;
@@ -85,12 +85,12 @@ mod tests {
         let silu_out = g.add_tensor_concrete("silu_out", &[1, 4096], dt);
 
         g.add_op(
-            crate::compiler::graph::OpKind::Gemm { m: crate::compiler::graph::SymDim::Concrete(1), n: 4096, k: 4096, dtype: DType::F32, trans_b: false },
+            crate::compiler::graph::Op::Gemm(GemmSpec { m: crate::compiler::graph::SymDim::Concrete(1), n: 4096, k: 4096, dtype: DType::F32, trans_b: false, has_bias: false }),
             vec![a, w],
             vec![gemm_out],
             "gemm",
         );
-        g.add_op(crate::compiler::graph::OpKind::Silu, vec![gemm_out], vec![silu_out], "silu");
+        g.add_op(Op::Silu, vec![gemm_out], vec![silu_out], "silu");
 
         let registry = crate::compiler::registry::ScalarOpRegistry::with_defaults();
         let profile = DeviceProfile::detect();
@@ -112,12 +112,12 @@ mod tests {
         let silu_out = g.add_tensor_concrete("silu_out", &[1, 128], dt);
 
         g.add_op(
-            crate::compiler::graph::OpKind::RoPE { num_heads: 32, head_dim: 128, theta: 10000.0, partial: 1.0, rope_scaling: None },
+            crate::compiler::graph::Op::RoPE(RopeSpec { num_heads: 32, head_dim: 128, theta: 10000.0, partial: 1.0, rope_scaling: None }),
             vec![a, cos],
             vec![rope_out],
             "rope",
         );
-        g.add_op(crate::compiler::graph::OpKind::Silu, vec![rope_out], vec![silu_out], "silu");
+        g.add_op(Op::Silu, vec![rope_out], vec![silu_out], "silu");
 
         let registry = crate::compiler::registry::ScalarOpRegistry::with_defaults();
         let profile = DeviceProfile::detect();
@@ -142,12 +142,12 @@ mod tests {
         let silu_out = g.add_tensor_concrete("silu_out", &[1, 4096], dt);
 
         g.add_op(
-            crate::compiler::graph::OpKind::QuantGemm { m: crate::compiler::graph::SymDim::Concrete(1), n: 4096, k: 4096, quant_type: crate::quant::QuantType::Q4_0 },
+            crate::compiler::graph::Op::QuantGemm(QuantGemmSpec { m: crate::compiler::graph::SymDim::Concrete(1), n: 4096, k: 4096, quant_type: crate::quant::QuantType::Q4_0 }),
             vec![a, w],
             vec![gemm_out],
             "qgemm",
         );
-        g.add_op(crate::compiler::graph::OpKind::Silu, vec![gemm_out], vec![silu_out], "silu");
+        g.add_op(Op::Silu, vec![gemm_out], vec![silu_out], "silu");
 
         let registry = crate::compiler::registry::ScalarOpRegistry::with_defaults();
         let profile = DeviceProfile::detect();
@@ -166,7 +166,7 @@ mod tests {
         let out = g.add_tensor_concrete("out", &[1, 4096], dt);
 
         g.add_op(
-            crate::compiler::graph::OpKind::QuantGemm { m: crate::compiler::graph::SymDim::Concrete(1), n: 4096, k: 4096, quant_type: crate::quant::QuantType::Q4_0 },
+            crate::compiler::graph::Op::QuantGemm(QuantGemmSpec { m: crate::compiler::graph::SymDim::Concrete(1), n: 4096, k: 4096, quant_type: crate::quant::QuantType::Q4_0 }),
             vec![a, w],
             vec![out],
             "qgemm",
@@ -188,7 +188,7 @@ mod tests {
         let b = g.add_tensor_concrete("b_f32", &[4096], dt);
 
         g.add_op(
-            crate::compiler::graph::OpKind::Dequantize { num_elements: 4096, block_size: 32, bits: 4 },
+            crate::compiler::graph::Op::Dequantize { num_elements: 4096, block_size: 32, bits: 4 },
             vec![a],
             vec![b],
             "dequant",
@@ -214,9 +214,9 @@ mod tests {
         let w = g.add_tensor_concrete("w", &[4096, 4096], dt);
         let gemm_out = g.add_tensor_concrete("gemm_out", &[1, 4096], dt);
 
-        g.add_op(crate::compiler::graph::OpKind::Softmax, vec![a], vec![softmax_out], "softmax");
+        g.add_op(Op::Softmax, vec![a], vec![softmax_out], "softmax");
         g.add_op(
-            crate::compiler::graph::OpKind::Gemm { m: crate::compiler::graph::SymDim::Concrete(1), n: 4096, k: 4096, dtype: DType::F32, trans_b: false },
+            crate::compiler::graph::Op::Gemm(GemmSpec { m: crate::compiler::graph::SymDim::Concrete(1), n: 4096, k: 4096, dtype: DType::F32, trans_b: false, has_bias: false }),
             vec![softmax_out, w],
             vec![gemm_out],
             "gemm",
@@ -251,19 +251,18 @@ mod tests {
         let swiglu_out = g.add_tensor_concrete("swiglu_out", &[1, 4096], dt);
 
         g.add_op(
-            crate::compiler::graph::OpKind::Gemm { m: crate::compiler::graph::SymDim::Concrete(1), n: 4096, k: 4096, dtype: DType::F32, trans_b: false },
+            crate::compiler::graph::Op::Gemm(GemmSpec { m: crate::compiler::graph::SymDim::Concrete(1), n: 4096, k: 4096, dtype: DType::F32, trans_b: false, has_bias: false }),
             vec![a, w],
             vec![other_out],
             "gemm_other",
         );
         g.add_op(
-            crate::compiler::graph::OpKind::Gemm { m: crate::compiler::graph::SymDim::Concrete(1), n: 4096, k: 4096, dtype: DType::F32, trans_b: false },
+            crate::compiler::graph::Op::Gemm(GemmSpec { m: crate::compiler::graph::SymDim::Concrete(1), n: 4096, k: 4096, dtype: DType::F32, trans_b: false, has_bias: false }),
             vec![a, w],
             vec![gemm_out],
             "gemm_main",
         );
-        g.add_op(
-            crate::compiler::graph::OpKind::SwiGlu,
+        g.add_op(Op::SwiGlu,
             vec![gemm_out, other_out],
             vec![swiglu_out],
             "swiglu",
@@ -322,9 +321,9 @@ mod tests {
             let w = g.add_tensor_concrete("w", &[k_large, k_large], dt);
             let gemm_out = g.add_tensor_concrete("gemm_out", &[1, k_large], dt);
 
-            g.add_op(crate::compiler::graph::OpKind::RmsNorm { feature_dim: 4096, eps: 1e-5 }, vec![x], vec![norm_out], "rms_norm");
+            g.add_op(Op::RmsNorm(NormSpec { feature_dim: 4096, eps: 1e-5 , dtype: DType::F32, has_weight: true }), vec![x], vec![norm_out], "rms_norm");
             g.add_op(
-                crate::compiler::graph::OpKind::Gemm { m: crate::compiler::graph::SymDim::Concrete(1), n: k_large, k: k_large, dtype: DType::F32, trans_b: false },
+                crate::compiler::graph::Op::Gemm(GemmSpec { m: crate::compiler::graph::SymDim::Concrete(1), n: k_large, k: k_large, dtype: DType::F32, trans_b: false, has_bias: false }),
                 vec![norm_out, w],
                 vec![gemm_out],
                 "gemm",
@@ -356,9 +355,9 @@ mod tests {
                 "Test setup error: norm output {norm_bytes}B should be <= l1_budget {l1_budget}B"
             );
 
-            g.add_op(crate::compiler::graph::OpKind::RmsNorm { feature_dim: 4096, eps: 1e-5 }, vec![x], vec![norm_out], "rms_norm");
+            g.add_op(Op::RmsNorm(NormSpec { feature_dim: 4096, eps: 1e-5 , dtype: DType::F32, has_weight: true }), vec![x], vec![norm_out], "rms_norm");
             g.add_op(
-                crate::compiler::graph::OpKind::Gemm { m: crate::compiler::graph::SymDim::Concrete(1), n: n_small, k: k_small, dtype: DType::F32, trans_b: false },
+                crate::compiler::graph::Op::Gemm(GemmSpec { m: crate::compiler::graph::SymDim::Concrete(1), n: n_small, k: k_small, dtype: DType::F32, trans_b: false, has_bias: false }),
                 vec![norm_out, w],
                 vec![gemm_out],
                 "gemm",
@@ -390,12 +389,12 @@ mod tests {
         let gelu_out = g.add_tensor_concrete("gelu_out", &[4, 4096], dt);
 
         g.add_op(
-            crate::compiler::graph::OpKind::Gemm { m: crate::compiler::graph::SymDim::Concrete(4), n: 4096, k: 4096, dtype: DType::F32, trans_b: false },
+            crate::compiler::graph::Op::Gemm(GemmSpec { m: crate::compiler::graph::SymDim::Concrete(4), n: 4096, k: 4096, dtype: DType::F32, trans_b: false, has_bias: false }),
             vec![a, w],
             vec![gemm_out],
             "gemm",
         );
-        g.add_op(crate::compiler::graph::OpKind::Gelu, vec![gemm_out], vec![gelu_out], "gelu");
+        g.add_op(Op::Gelu, vec![gemm_out], vec![gelu_out], "gelu");
 
         let plan = fuse_with_dag(&g, &registry, &exec_plan);
         assert_eq!(plan.num_groups(), 1);
@@ -421,8 +420,8 @@ mod tests {
         let add_out = g.add_tensor_concrete("add_out", &[1, 4096], dt);
         let mul_out = g.add_tensor_concrete("mul_out", &[1, 4096], dt);
 
-        g.add_op(crate::compiler::graph::OpKind::Add, vec![a, b], vec![add_out], "add");
-        g.add_op(crate::compiler::graph::OpKind::Silu, vec![add_out], vec![mul_out], "silu");
+        g.add_op(Op::Add, vec![a, b], vec![add_out], "add");
+        g.add_op(Op::Silu, vec![add_out], vec![mul_out], "silu");
 
         let plan = fuse_with_dag(&g, &registry, &exec_plan);
         assert_eq!(plan.num_groups(), 1);
@@ -453,21 +452,21 @@ mod tests {
         let k_out = g.add_tensor_concrete("k_out", &[1, dim], dt);
         let v_out = g.add_tensor_concrete("v_out", &[1, dim], dt);
 
-        g.add_op(crate::compiler::graph::OpKind::RmsNorm { feature_dim: 4096, eps: 1e-5 }, vec![x], vec![norm_out], "rms_norm");
+        g.add_op(Op::RmsNorm(NormSpec { feature_dim: 4096, eps: 1e-5 , dtype: DType::F32, has_weight: true }), vec![x], vec![norm_out], "rms_norm");
         g.add_op(
-            crate::compiler::graph::OpKind::Gemm { m: crate::compiler::graph::SymDim::Concrete(1), n: dim, k: dim, dtype: DType::F32, trans_b: false },
+            crate::compiler::graph::Op::Gemm(GemmSpec { m: crate::compiler::graph::SymDim::Concrete(1), n: dim, k: dim, dtype: DType::F32, trans_b: false, has_bias: false }),
             vec![norm_out, wq],
             vec![q_out],
             "gemm_q",
         );
         g.add_op(
-            crate::compiler::graph::OpKind::Gemm { m: crate::compiler::graph::SymDim::Concrete(1), n: dim, k: dim, dtype: DType::F32, trans_b: false },
+            crate::compiler::graph::Op::Gemm(GemmSpec { m: crate::compiler::graph::SymDim::Concrete(1), n: dim, k: dim, dtype: DType::F32, trans_b: false, has_bias: false }),
             vec![norm_out, wk],
             vec![k_out],
             "gemm_k",
         );
         g.add_op(
-            crate::compiler::graph::OpKind::Gemm { m: crate::compiler::graph::SymDim::Concrete(1), n: dim, k: dim, dtype: DType::F32, trans_b: false },
+            crate::compiler::graph::Op::Gemm(GemmSpec { m: crate::compiler::graph::SymDim::Concrete(1), n: dim, k: dim, dtype: DType::F32, trans_b: false, has_bias: false }),
             vec![norm_out, wv],
             vec![v_out],
             "gemm_v",
@@ -504,15 +503,15 @@ mod tests {
         let mul_out = g.add_tensor_concrete("mul_out", &[1, inter], dt);
 
         g.add_op(
-            crate::compiler::graph::OpKind::Gemm { m: crate::compiler::graph::SymDim::Concrete(1), n: inter, k: hidden, dtype: DType::F32, trans_b: false },
+            crate::compiler::graph::Op::Gemm(GemmSpec { m: crate::compiler::graph::SymDim::Concrete(1), n: inter, k: hidden, dtype: DType::F32, trans_b: false, has_bias: false }),
             vec![x, w_gate], vec![gate_out], "gate_gemm",
         );
         g.add_op(
-            crate::compiler::graph::OpKind::Gemm { m: crate::compiler::graph::SymDim::Concrete(1), n: inter, k: hidden, dtype: DType::F32, trans_b: false },
+            crate::compiler::graph::Op::Gemm(GemmSpec { m: crate::compiler::graph::SymDim::Concrete(1), n: inter, k: hidden, dtype: DType::F32, trans_b: false, has_bias: false }),
             vec![x, w_up], vec![up_out], "up_gemm",
         );
-        g.add_op(crate::compiler::graph::OpKind::Silu, vec![gate_out], vec![act_out], "silu");
-        g.add_op(crate::compiler::graph::OpKind::Mul, vec![act_out, up_out], vec![mul_out], "mul");
+        g.add_op(Op::Silu, vec![gate_out], vec![act_out], "silu");
+        g.add_op(Op::Mul, vec![act_out, up_out], vec![mul_out], "mul");
 
         let plan = fuse_with_dag(&g, &registry, &exec_plan);
         let ffn = plan.groups.iter().find(|grp| matches!(grp.mode, FusionMode::FFNBlock { .. }));
@@ -539,15 +538,15 @@ mod tests {
         let mul_out = g.add_tensor_concrete("mul_out", &[1, 11008], dt);
 
         g.add_op(
-            crate::compiler::graph::OpKind::Gemm { m: crate::compiler::graph::SymDim::Concrete(1), n: 11008, k: hidden, dtype: DType::F32, trans_b: false },
+            crate::compiler::graph::Op::Gemm(GemmSpec { m: crate::compiler::graph::SymDim::Concrete(1), n: 11008, k: hidden, dtype: DType::F32, trans_b: false, has_bias: false }),
             vec![x, w_gate], vec![gate_out], "gate_gemm",
         );
         g.add_op(
-            crate::compiler::graph::OpKind::Gemm { m: crate::compiler::graph::SymDim::Concrete(1), n: 8192, k: hidden, dtype: DType::F32, trans_b: false },
+            crate::compiler::graph::Op::Gemm(GemmSpec { m: crate::compiler::graph::SymDim::Concrete(1), n: 8192, k: hidden, dtype: DType::F32, trans_b: false, has_bias: false }),
             vec![x, w_up], vec![up_out], "up_gemm",
         );
-        g.add_op(crate::compiler::graph::OpKind::Silu, vec![gate_out], vec![act_out], "silu");
-        g.add_op(crate::compiler::graph::OpKind::Mul, vec![act_out, up_out], vec![mul_out], "mul");
+        g.add_op(Op::Silu, vec![gate_out], vec![act_out], "silu");
+        g.add_op(Op::Mul, vec![act_out, up_out], vec![mul_out], "mul");
 
         let plan = fuse_with_dag(&g, &registry, &exec_plan);
         let ffn = plan.groups.iter().find(|grp| matches!(grp.mode, FusionMode::FFNBlock { .. }));
@@ -576,8 +575,7 @@ mod tests {
         let cos_sin = g.add_tensor_concrete("cos_sin", &[head_dim / 2], dt);
 
         // RmsNorm → shared input for QKV
-        g.add_op(
-            crate::compiler::graph::OpKind::RmsNorm { feature_dim: 4096, eps: 1e-5 },
+        g.add_op(Op::RmsNorm(NormSpec { feature_dim: 4096, eps: 1e-5 , dtype: DType::F32, has_weight: true }),
             vec![x],
             vec![norm_out],
             "rms_norm",
@@ -586,7 +584,7 @@ mod tests {
         // Q projection
         let q_out = g.add_tensor_concrete("q_out", &[1, dim], dt);
         g.add_op(
-            crate::compiler::graph::OpKind::Gemm { m: crate::compiler::graph::SymDim::Concrete(1), n: dim, k: dim, dtype: dt, trans_b: false },
+            crate::compiler::graph::Op::Gemm(GemmSpec { m: crate::compiler::graph::SymDim::Concrete(1), n: dim, k: dim, dtype: dt, trans_b: false, has_bias: false }),
             vec![norm_out, wq],
             vec![q_out],
             "gemm_q",
@@ -595,7 +593,7 @@ mod tests {
         // K projection
         let k_out = g.add_tensor_concrete("k_out", &[1, dim], dt);
         g.add_op(
-            crate::compiler::graph::OpKind::Gemm { m: crate::compiler::graph::SymDim::Concrete(1), n: dim, k: dim, dtype: dt, trans_b: false },
+            crate::compiler::graph::Op::Gemm(GemmSpec { m: crate::compiler::graph::SymDim::Concrete(1), n: dim, k: dim, dtype: dt, trans_b: false, has_bias: false }),
             vec![norm_out, wk],
             vec![k_out],
             "gemm_k",
@@ -604,7 +602,7 @@ mod tests {
         // V projection
         let v_out = g.add_tensor_concrete("v_out", &[1, dim], dt);
         g.add_op(
-            crate::compiler::graph::OpKind::Gemm { m: crate::compiler::graph::SymDim::Concrete(1), n: dim, k: dim, dtype: dt, trans_b: false },
+            crate::compiler::graph::Op::Gemm(GemmSpec { m: crate::compiler::graph::SymDim::Concrete(1), n: dim, k: dim, dtype: dt, trans_b: false, has_bias: false }),
             vec![norm_out, wv],
             vec![v_out],
             "gemm_v",
@@ -613,7 +611,7 @@ mod tests {
         // QkNorm on Q
         let q_normed = g.add_tensor_concrete("q_normed", &[1, dim], dt);
         g.add_op(
-            crate::compiler::graph::OpKind::QkNorm { head_dim, eps: 1e-6 },
+            crate::compiler::graph::Op::QkNorm { head_dim, eps: 1e-6 },
             vec![q_out],
             vec![q_normed],
             "qknorm_q",
@@ -622,7 +620,7 @@ mod tests {
         // QkNorm on K
         let k_normed = g.add_tensor_concrete("k_normed", &[1, dim], dt);
         g.add_op(
-            crate::compiler::graph::OpKind::QkNorm { head_dim, eps: 1e-6 },
+            crate::compiler::graph::Op::QkNorm { head_dim, eps: 1e-6 },
             vec![k_out],
             vec![k_normed],
             "qknorm_k",
@@ -631,7 +629,7 @@ mod tests {
         // ValueNorm on V
         let v_normed = g.add_tensor_concrete("v_normed", &[1, dim], dt);
         g.add_op(
-            crate::compiler::graph::OpKind::ValueNorm { feature_dim: 4096, eps: 1e-6 },
+            crate::compiler::graph::Op::ValueNorm(NormSpec { feature_dim: 4096, eps: 1e-6, dtype: DType::F32, has_weight: false }),
             vec![v_out],
             vec![v_normed],
             "valuenorm_v",
@@ -640,7 +638,7 @@ mod tests {
         // RoPE on normalized Q
         let q_rope = g.add_tensor_concrete("q_rope", &[1, dim], dt);
         g.add_op(
-            crate::compiler::graph::OpKind::RoPE { num_heads: dim / head_dim, head_dim, theta: 10000.0, partial: 1.0, rope_scaling: None },
+            crate::compiler::graph::Op::RoPE(RopeSpec { num_heads: dim / head_dim, head_dim, theta: 10000.0, partial: 1.0, rope_scaling: None }),
             vec![q_normed, cos_sin],
             vec![q_rope],
             "rope_q",
@@ -649,7 +647,7 @@ mod tests {
         // RoPE on normalized K
         let k_rope = g.add_tensor_concrete("k_rope", &[1, dim], dt);
         g.add_op(
-            crate::compiler::graph::OpKind::RoPE { num_heads: dim / head_dim, head_dim, theta: 10000.0, partial: 1.0, rope_scaling: None },
+            crate::compiler::graph::Op::RoPE(RopeSpec { num_heads: dim / head_dim, head_dim, theta: 10000.0, partial: 1.0, rope_scaling: None }),
             vec![k_normed, cos_sin],
             vec![k_rope],
             "rope_k",
@@ -695,17 +693,17 @@ mod tests {
         let k_out = g.add_tensor_concrete("k_out", &[1, dim], dt);
         let v_out = g.add_tensor_concrete("v_out", &[1, dim], dt);
 
-        g.add_op(crate::compiler::graph::OpKind::RmsNorm { feature_dim: 4096, eps: 1e-5 }, vec![x], vec![norm_out], "rms_norm");
+        g.add_op(Op::RmsNorm(NormSpec { feature_dim: 4096, eps: 1e-5 , dtype: DType::F32, has_weight: true }), vec![x], vec![norm_out], "rms_norm");
         g.add_op(
-            crate::compiler::graph::OpKind::Gemm { m: crate::compiler::graph::SymDim::Concrete(1), n: dim, k: dim, dtype: dt, trans_b: false },
+            crate::compiler::graph::Op::Gemm(GemmSpec { m: crate::compiler::graph::SymDim::Concrete(1), n: dim, k: dim, dtype: dt, trans_b: false, has_bias: false }),
             vec![norm_out, wq], vec![q_out], "gemm_q",
         );
         g.add_op(
-            crate::compiler::graph::OpKind::Gemm { m: crate::compiler::graph::SymDim::Concrete(1), n: dim, k: dim, dtype: dt, trans_b: false },
+            crate::compiler::graph::Op::Gemm(GemmSpec { m: crate::compiler::graph::SymDim::Concrete(1), n: dim, k: dim, dtype: dt, trans_b: false, has_bias: false }),
             vec![norm_out, wk], vec![k_out], "gemm_k",
         );
         g.add_op(
-            crate::compiler::graph::OpKind::Gemm { m: crate::compiler::graph::SymDim::Concrete(1), n: dim, k: dim, dtype: dt, trans_b: false },
+            crate::compiler::graph::Op::Gemm(GemmSpec { m: crate::compiler::graph::SymDim::Concrete(1), n: dim, k: dim, dtype: dt, trans_b: false, has_bias: false }),
             vec![norm_out, wv], vec![v_out], "gemm_v",
         );
 
@@ -737,9 +735,9 @@ mod tests {
         let w = g.add_tensor_concrete("w", &[512, 512], dt);
         let gemm_out = g.add_tensor_concrete("gemm_out", &[1, 512], dt);
 
-        g.add_op(crate::compiler::graph::OpKind::RmsNorm { feature_dim: 4096, eps: 1e-5 }, vec![x], vec![norm_out], "rms_norm");
+        g.add_op(Op::RmsNorm(NormSpec { feature_dim: 4096, eps: 1e-5 , dtype: DType::F32, has_weight: true }), vec![x], vec![norm_out], "rms_norm");
         g.add_op(
-            crate::compiler::graph::OpKind::Gemm { m: crate::compiler::graph::SymDim::Concrete(1), n: 512, k: 512, dtype: DType::F32, trans_b: false },
+            crate::compiler::graph::Op::Gemm(GemmSpec { m: crate::compiler::graph::SymDim::Concrete(1), n: 512, k: 512, dtype: DType::F32, trans_b: false, has_bias: false }),
             vec![norm_out, w],
             vec![gemm_out],
             "gemm",
@@ -862,9 +860,9 @@ mod tests {
         let w = g.add_tensor_concrete("w", &[k, k], dt);
         let gemm_out = g.add_tensor_concrete("gemm_out", &[1, k], dt);
 
-        g.add_op(crate::compiler::graph::OpKind::RmsNorm { feature_dim: 4096, eps: 1e-5 }, vec![x], vec![norm_out], "rms_norm");
+        g.add_op(Op::RmsNorm(NormSpec { feature_dim: 4096, eps: 1e-5 , dtype: DType::F32, has_weight: true }), vec![x], vec![norm_out], "rms_norm");
         g.add_op(
-            crate::compiler::graph::OpKind::Gemm { m: crate::compiler::graph::SymDim::Concrete(1), n: k, k, dtype: DType::F32, trans_b: false },
+            crate::compiler::graph::Op::Gemm(GemmSpec { m: crate::compiler::graph::SymDim::Concrete(1), n: k, k, dtype: DType::F32, trans_b: false, has_bias: false }),
             vec![norm_out, w],
             vec![gemm_out],
             "gemm",
@@ -909,9 +907,9 @@ mod tests {
         let w = g.add_tensor_concrete("w", &[k, n], dt);
         let gemm_out = g.add_tensor_concrete("gemm_out", &[1, n], dt);
 
-        g.add_op(crate::compiler::graph::OpKind::RmsNorm { feature_dim: 4096, eps: 1e-5 }, vec![x], vec![norm_out], "rms_norm");
+        g.add_op(Op::RmsNorm(NormSpec { feature_dim: 4096, eps: 1e-5 , dtype: DType::F32, has_weight: true }), vec![x], vec![norm_out], "rms_norm");
         g.add_op(
-            crate::compiler::graph::OpKind::Gemm { m: crate::compiler::graph::SymDim::Concrete(1), n, k, dtype: DType::F32, trans_b: false },
+            crate::compiler::graph::Op::Gemm(GemmSpec { m: crate::compiler::graph::SymDim::Concrete(1), n, k, dtype: DType::F32, trans_b: false, has_bias: false }),
             vec![norm_out, w],
             vec![gemm_out],
             "gemm",
@@ -951,9 +949,9 @@ mod tests {
         let c = g.add_tensor_concrete("c", &[1, dim], dt);
         let d = g.add_tensor_concrete("d", &[1, dim], dt);
 
-        g.add_op(crate::compiler::graph::OpKind::Silu, vec![a], vec![b], "silu1");
-        g.add_op(crate::compiler::graph::OpKind::Silu, vec![b], vec![c], "silu2");
-        g.add_op(crate::compiler::graph::OpKind::Silu, vec![c], vec![d], "silu3");
+        g.add_op(Op::Silu, vec![a], vec![b], "silu1");
+        g.add_op(Op::Silu, vec![b], vec![c], "silu2");
+        g.add_op(Op::Silu, vec![c], vec![d], "silu3");
 
         let plan = fuse_with_dag(&g, &registry, &exec_plan);
 
@@ -1062,9 +1060,9 @@ mod tests {
         let c = g.add_tensor_concrete("c", &[1, 4096], dt);
         let d = g.add_tensor_concrete("d", &[1, 4096], dt);
 
-        g.add_op(crate::compiler::graph::OpKind::Silu, vec![a], vec![b], "silu1");
-        g.add_op(crate::compiler::graph::OpKind::Silu, vec![b], vec![c], "silu2");
-        g.add_op(crate::compiler::graph::OpKind::Silu, vec![c], vec![d], "silu3");
+        g.add_op(Op::Silu, vec![a], vec![b], "silu1");
+        g.add_op(Op::Silu, vec![b], vec![c], "silu2");
+        g.add_op(Op::Silu, vec![c], vec![d], "silu3");
 
         let anchor = g.op(OpId(0)).unwrap();
         let chain: Vec<&crate::compiler::graph::CompilerOp> = vec![
@@ -1085,8 +1083,8 @@ mod tests {
         let b = g.add_tensor_concrete("b", &[1, 4096], dt);
         let c = g.add_tensor_concrete("c", &[1, 4096], dt);
 
-        g.add_op(crate::compiler::graph::OpKind::Silu, vec![a], vec![b], "silu1");
-        g.add_op(crate::compiler::graph::OpKind::Silu, vec![b], vec![c], "silu2");
+        g.add_op(Op::Silu, vec![a], vec![b], "silu1");
+        g.add_op(Op::Silu, vec![b], vec![c], "silu2");
 
         let registry = crate::compiler::registry::ScalarOpRegistry::with_defaults();
         let profile = DeviceProfile::detect();
@@ -1161,8 +1159,7 @@ mod tests {
 
     #[test]
     fn test_memory_bound_higher_fusion_benefit() {
-        use crate::compiler::graph::OpKind;
-
+        
         let profile = DeviceProfile::detect();
         let exec_plan = ExecutionPlan::from_profile(&profile);
 
@@ -1171,7 +1168,7 @@ mod tests {
         let a1 = g1.add_tensor_concrete("A", &[1024], DType::F32);
         let b1 = g1.add_tensor_concrete("B", &[1024], DType::F32);
         let c1 = g1.add_tensor_concrete("C", &[1024], DType::F32);
-        let op1 = g1.add_op_with_op(Op::Add, OpKind::Add, vec![a1, b1], vec![c1], "add");
+        let op1 = g1.add_op(Op::Add, vec![a1, b1], vec![c1], "add");
         let group_mem = FusionGroup {
             id: 0, anchor: op1, epilogue: vec![],
             mode: FusionMode::LoopFusion,
@@ -1188,7 +1185,7 @@ mod tests {
         let a2 = g2.add_tensor_concrete("A", &[512, 512], DType::F32);
         let b2 = g2.add_tensor_concrete("B", &[512, 512], DType::F32);
         let c2 = g2.add_tensor_concrete("C", &[512, 512], DType::F32);
-        let op2 = g2.add_op_with_op(Op::Gemm(GemmSpec { m: crate::compiler::graph::SymDim::Concrete(512), n: 512, k: 512, dtype: DType::F32, trans_b: false, has_bias: false }), OpKind::Gemm { m: crate::compiler::graph::SymDim::Concrete(512), n: 512, k: 512, dtype: DType::F32, trans_b: false },
+        let op2 = g2.add_op(Op::Gemm(GemmSpec { m: crate::compiler::graph::SymDim::Concrete(512), n: 512, k: 512, dtype: DType::F32, trans_b: false, has_bias: false }),
             vec![a2, b2], vec![c2], "gemm",
         );
         let group_compute = FusionGroup {
@@ -1255,12 +1252,12 @@ mod tests {
         let silu_out = g.add_tensor_concrete("silu_out", &[1, 4096], dt);
 
         g.add_op(
-            crate::compiler::graph::OpKind::Gemm { m: crate::compiler::graph::SymDim::Concrete(1), n: 4096, k: 4096, dtype: DType::F32, trans_b: false },
+            crate::compiler::graph::Op::Gemm(GemmSpec { m: crate::compiler::graph::SymDim::Concrete(1), n: 4096, k: 4096, dtype: DType::F32, trans_b: false, has_bias: false }),
             vec![a, w],
             vec![gemm_out],
             "gemm",
         );
-        g.add_op(crate::compiler::graph::OpKind::Silu, vec![gemm_out], vec![silu_out], "silu");
+        g.add_op(Op::Silu, vec![gemm_out], vec![silu_out], "silu");
 
         let registry = crate::compiler::registry::ScalarOpRegistry::with_defaults();
         let profile = DeviceProfile::detect();
@@ -1280,7 +1277,7 @@ mod tests {
         let a = g.add_tensor_concrete("a", &[1, 4096], dt);
         let b = g.add_tensor_concrete("b", &[1, 4096], dt);
 
-        g.add_op(crate::compiler::graph::OpKind::Softmax, vec![a], vec![b], "softmax");
+        g.add_op(Op::Softmax, vec![a], vec![b], "softmax");
 
         let registry = crate::compiler::registry::ScalarOpRegistry::with_defaults();
         let profile = DeviceProfile::detect();
@@ -1299,9 +1296,9 @@ mod tests {
         let c = g.add_tensor_concrete("c", &[1, 256], dt);
         let d = g.add_tensor_concrete("d", &[1, 256], dt);
 
-        g.add_op(crate::compiler::graph::OpKind::Silu, vec![a], vec![b], "silu");
-        g.add_op(crate::compiler::graph::OpKind::Silu, vec![b], vec![c], "silu2");
-        g.add_op(crate::compiler::graph::OpKind::Silu, vec![c], vec![d], "silu3");
+        g.add_op(Op::Silu, vec![a], vec![b], "silu");
+        g.add_op(Op::Silu, vec![b], vec![c], "silu2");
+        g.add_op(Op::Silu, vec![c], vec![d], "silu3");
 
         let registry = crate::compiler::registry::ScalarOpRegistry::with_defaults();
         let profile = DeviceProfile::detect();
@@ -1320,8 +1317,8 @@ mod tests {
         let b = g.add_tensor_concrete("b", &[1, 4096], dt);
         let c = g.add_tensor_concrete("c", &[1, 4096], dt);
 
-        g.add_op(crate::compiler::graph::OpKind::Silu, vec![a], vec![b], "silu");
-        g.add_op(crate::compiler::graph::OpKind::Softmax, vec![b], vec![c], "softmax");
+        g.add_op(Op::Silu, vec![a], vec![b], "silu");
+        g.add_op(Op::Softmax, vec![b], vec![c], "softmax");
 
         let registry = crate::compiler::registry::ScalarOpRegistry::with_defaults();
         let profile = DeviceProfile::detect();
@@ -1358,19 +1355,18 @@ mod tests {
         let swiglu_out = g.add_tensor_concrete("swiglu_out", &[1, 4096], dt);
 
         g.add_op(
-            crate::compiler::graph::OpKind::Gemm { m: crate::compiler::graph::SymDim::Concrete(1), n: 4096, k: 4096, dtype: DType::F32, trans_b: false },
+            crate::compiler::graph::Op::Gemm(GemmSpec { m: crate::compiler::graph::SymDim::Concrete(1), n: 4096, k: 4096, dtype: DType::F32, trans_b: false, has_bias: false }),
             vec![a, w],
             vec![other_out],
             "gemm_other",
         );
         g.add_op(
-            crate::compiler::graph::OpKind::Gemm { m: crate::compiler::graph::SymDim::Concrete(1), n: 4096, k: 4096, dtype: DType::F32, trans_b: false },
+            crate::compiler::graph::Op::Gemm(GemmSpec { m: crate::compiler::graph::SymDim::Concrete(1), n: 4096, k: 4096, dtype: DType::F32, trans_b: false, has_bias: false }),
             vec![a, w],
             vec![gemm_out],
             "gemm_main",
         );
-        g.add_op(
-            crate::compiler::graph::OpKind::SwiGlu,
+        g.add_op(Op::SwiGlu,
             vec![gemm_out, other_out],
             vec![swiglu_out],
             "swiglu",
@@ -1411,17 +1407,13 @@ mod tests {
         let token_id = g.add_tensor_concrete("token_id", &[1], dt);
 
         g.add_op(
-            crate::compiler::graph::OpKind::Gemm {
-                m: crate::compiler::graph::SymDim::Concrete(1),
-                n: 32000,
-                k: 4096,
-                dtype: DType::F32, trans_b: false },
+            crate::compiler::graph::Op::Gemm(GemmSpec { m: crate::compiler::graph::SymDim::Concrete(1), n: 32000, k: 4096, dtype: DType::F32, trans_b: false, has_bias: false }),
             vec![hidden, w_lm],
             vec![logits],
             "lm_head",
         );
         g.add_op(
-            crate::compiler::graph::OpKind::Argmax { vocab_size: 32000 },
+            crate::compiler::graph::Op::Argmax { vocab_size: 32000 },
             vec![logits],
             vec![token_id],
             "argmax",
@@ -1465,18 +1457,14 @@ mod tests {
         let token_id = g.add_tensor_concrete("token_id", &[1], dt);
 
         g.add_op(
-            crate::compiler::graph::OpKind::Gemm {
-                m: crate::compiler::graph::SymDim::Concrete(1),
-                n: 32000,
-                k: 4096,
-                dtype: DType::F32, trans_b: false },
+            crate::compiler::graph::Op::Gemm(GemmSpec { m: crate::compiler::graph::SymDim::Concrete(1), n: 32000, k: 4096, dtype: DType::F32, trans_b: false, has_bias: false }),
             vec![hidden, w_lm],
             vec![logits],
             "lm_head",
         );
-        g.add_op(crate::compiler::graph::OpKind::Silu, vec![logits], vec![silu_out], "silu");
+        g.add_op(Op::Silu, vec![logits], vec![silu_out], "silu");
         g.add_op(
-            crate::compiler::graph::OpKind::Argmax { vocab_size: 32000 },
+            crate::compiler::graph::Op::Argmax { vocab_size: 32000 },
             vec![silu_out],
             vec![token_id],
             "argmax",
@@ -1506,17 +1494,13 @@ mod tests {
         let consumer_b = g.add_tensor_concrete("consumer_b", &[1], dt);
 
         g.add_op(
-            crate::compiler::graph::OpKind::Gemm {
-                m: crate::compiler::graph::SymDim::Concrete(1),
-                n: 1000,
-                k: 4096,
-                dtype: DType::F32, trans_b: false },
+            crate::compiler::graph::Op::Gemm(GemmSpec { m: crate::compiler::graph::SymDim::Concrete(1), n: 1000, k: 4096, dtype: DType::F32, trans_b: false, has_bias: false }),
             vec![hidden, w_lm],
             vec![logits],
             "lm_head",
         );
         g.add_op(
-            crate::compiler::graph::OpKind::Argmax { vocab_size: 1000 },
+            crate::compiler::graph::Op::Argmax { vocab_size: 1000 },
             vec![logits],
             vec![token_id],
             "argmax",
@@ -1538,23 +1522,19 @@ mod tests {
         let other_out = g2.add_tensor_concrete("other_out", &[1, 1000], dt);
 
         g2.add_op(
-            crate::compiler::graph::OpKind::Gemm {
-                m: crate::compiler::graph::SymDim::Concrete(1),
-                n: 1000,
-                k: 4096,
-                dtype: DType::F32, trans_b: false },
+            crate::compiler::graph::Op::Gemm(GemmSpec { m: crate::compiler::graph::SymDim::Concrete(1), n: 1000, k: 4096, dtype: DType::F32, trans_b: false, has_bias: false }),
             vec![hidden2, w_lm2],
             vec![logits2],
             "lm_head",
         );
         // logits consumed by both argmax AND another op → multiple consumers
         g2.add_op(
-            crate::compiler::graph::OpKind::Argmax { vocab_size: 1000 },
+            crate::compiler::graph::Op::Argmax { vocab_size: 1000 },
             vec![logits2],
             vec![token_id2],
             "argmax",
         );
-        g2.add_op(crate::compiler::graph::OpKind::Silu, vec![logits2], vec![other_out], "other_consumer");
+        g2.add_op(Op::Silu, vec![logits2], vec![other_out], "other_consumer");
 
         let plan = fuse_with_dag(&g2, &registry, &exec_plan);
 
@@ -1594,20 +1574,20 @@ mod tests {
         let k_out = g.add_tensor_concrete("k_out", &[1, dim], dt);
         let v_out = g.add_tensor_concrete("v_out", &[1, dim], dt);
 
-        g.add_op(crate::compiler::graph::OpKind::RmsNorm { feature_dim: 4096, eps: 1e-5 }, vec![x], vec![norm_out], "rms_norm");
+        g.add_op(Op::RmsNorm(NormSpec { feature_dim: 4096, eps: 1e-5 , dtype: DType::F32, has_weight: true }), vec![x], vec![norm_out], "rms_norm");
         // Q: Q4_0
         g.add_op(
-            crate::compiler::graph::OpKind::QuantGemm { m: crate::compiler::graph::SymDim::Concrete(1), n: dim, k: dim, quant_type: crate::quant::QuantType::Q4_0 },
+            crate::compiler::graph::Op::QuantGemm(QuantGemmSpec { m: crate::compiler::graph::SymDim::Concrete(1), n: dim, k: dim, quant_type: crate::quant::QuantType::Q4_0 }),
             vec![norm_out, wq], vec![q_out], "gemm_q",
         );
         // K: Q6K (different quant type)
         g.add_op(
-            crate::compiler::graph::OpKind::QuantGemm { m: crate::compiler::graph::SymDim::Concrete(1), n: dim, k: dim, quant_type: crate::quant::QuantType::Q6K },
+            crate::compiler::graph::Op::QuantGemm(QuantGemmSpec { m: crate::compiler::graph::SymDim::Concrete(1), n: dim, k: dim, quant_type: crate::quant::QuantType::Q6K }),
             vec![norm_out, wk], vec![k_out], "gemm_k",
         );
         // V: Q4_0 (same as Q)
         g.add_op(
-            crate::compiler::graph::OpKind::QuantGemm { m: crate::compiler::graph::SymDim::Concrete(1), n: dim, k: dim, quant_type: crate::quant::QuantType::Q4_0 },
+            crate::compiler::graph::Op::QuantGemm(QuantGemmSpec { m: crate::compiler::graph::SymDim::Concrete(1), n: dim, k: dim, quant_type: crate::quant::QuantType::Q4_0 }),
             vec![norm_out, wv], vec![v_out], "gemm_v",
         );
 
@@ -1640,16 +1620,16 @@ mod tests {
         let mul_out = g.add_tensor_concrete("mul_out", &[1, inter], dt);
 
         g.add_op(
-            crate::compiler::graph::OpKind::QuantGemm { m: crate::compiler::graph::SymDim::Concrete(1), n: inter, k: hidden, quant_type: crate::quant::QuantType::Q4_0 },
+            crate::compiler::graph::Op::QuantGemm(QuantGemmSpec { m: crate::compiler::graph::SymDim::Concrete(1), n: inter, k: hidden, quant_type: crate::quant::QuantType::Q4_0 }),
             vec![x, w_gate], vec![gate_out], "gate_gemm",
         );
         // Up GEMM: Q6K (different from Gate's Q4_0)
         g.add_op(
-            crate::compiler::graph::OpKind::QuantGemm { m: crate::compiler::graph::SymDim::Concrete(1), n: inter, k: hidden, quant_type: crate::quant::QuantType::Q6K },
+            crate::compiler::graph::Op::QuantGemm(QuantGemmSpec { m: crate::compiler::graph::SymDim::Concrete(1), n: inter, k: hidden, quant_type: crate::quant::QuantType::Q6K }),
             vec![x, w_up], vec![up_out], "up_gemm",
         );
-        g.add_op(crate::compiler::graph::OpKind::Silu, vec![gate_out], vec![act_out], "silu");
-        g.add_op(crate::compiler::graph::OpKind::Mul, vec![act_out, up_out], vec![mul_out], "mul");
+        g.add_op(Op::Silu, vec![gate_out], vec![act_out], "silu");
+        g.add_op(Op::Mul, vec![act_out, up_out], vec![mul_out], "mul");
 
         let plan = fuse_with_dag(&g, &registry, &exec_plan);
         let ffn = plan.groups.iter().find(|grp| matches!(grp.mode, FusionMode::FFNBlock { .. }));
@@ -1675,18 +1655,18 @@ mod tests {
         let k_out = g.add_tensor_concrete("k_out", &[1, dim], dt);
         let v_out = g.add_tensor_concrete("v_out", &[1, dim], dt);
 
-        g.add_op(crate::compiler::graph::OpKind::RmsNorm { feature_dim: 4096, eps: 1e-5 }, vec![x], vec![norm_out], "rms_norm");
+        g.add_op(Op::RmsNorm(NormSpec { feature_dim: 4096, eps: 1e-5 , dtype: DType::F32, has_weight: true }), vec![x], vec![norm_out], "rms_norm");
         // All Q4_0
         g.add_op(
-            crate::compiler::graph::OpKind::QuantGemm { m: crate::compiler::graph::SymDim::Concrete(1), n: dim, k: dim, quant_type: crate::quant::QuantType::Q4_0 },
+            crate::compiler::graph::Op::QuantGemm(QuantGemmSpec { m: crate::compiler::graph::SymDim::Concrete(1), n: dim, k: dim, quant_type: crate::quant::QuantType::Q4_0 }),
             vec![norm_out, wq], vec![q_out], "gemm_q",
         );
         g.add_op(
-            crate::compiler::graph::OpKind::QuantGemm { m: crate::compiler::graph::SymDim::Concrete(1), n: dim, k: dim, quant_type: crate::quant::QuantType::Q4_0 },
+            crate::compiler::graph::Op::QuantGemm(QuantGemmSpec { m: crate::compiler::graph::SymDim::Concrete(1), n: dim, k: dim, quant_type: crate::quant::QuantType::Q4_0 }),
             vec![norm_out, wk], vec![k_out], "gemm_k",
         );
         g.add_op(
-            crate::compiler::graph::OpKind::QuantGemm { m: crate::compiler::graph::SymDim::Concrete(1), n: dim, k: dim, quant_type: crate::quant::QuantType::Q4_0 },
+            crate::compiler::graph::Op::QuantGemm(QuantGemmSpec { m: crate::compiler::graph::SymDim::Concrete(1), n: dim, k: dim, quant_type: crate::quant::QuantType::Q4_0 }),
             vec![norm_out, wv], vec![v_out], "gemm_v",
         );
 
@@ -1715,10 +1695,10 @@ mod tests {
         let silu_out = g.add_tensor_concrete("silu_out", &[1, 4096], dt);
 
         g.add_op(
-            crate::compiler::graph::OpKind::Gemm { m: crate::compiler::graph::SymDim::Concrete(1), n: 4096, k: 4096, dtype: DType::F32, trans_b: false },
+            crate::compiler::graph::Op::Gemm(GemmSpec { m: crate::compiler::graph::SymDim::Concrete(1), n: 4096, k: 4096, dtype: DType::F32, trans_b: false, has_bias: false }),
             vec![a, w], vec![gemm_out], "gemm",
         );
-        g.add_op(crate::compiler::graph::OpKind::Silu, vec![gemm_out], vec![silu_out], "silu");
+        g.add_op(Op::Silu, vec![gemm_out], vec![silu_out], "silu");
 
         let plan = fuse_with_dag(&g, &registry, &exec_plan);
         assert_eq!(plan.num_groups(), 1);
@@ -1776,7 +1756,7 @@ mod tests {
         let out = g.add_tensor_concrete("out", &[1, 512], dt);
 
         g.add_op(
-            crate::compiler::graph::OpKind::Gemm { m: crate::compiler::graph::SymDim::Concrete(1), n: 512, k: 512, dtype: DType::F32, trans_b: false },
+            crate::compiler::graph::Op::Gemm(GemmSpec { m: crate::compiler::graph::SymDim::Concrete(1), n: 512, k: 512, dtype: DType::F32, trans_b: false, has_bias: false }),
             vec![a, w], vec![out], "gemm",
         );
 
@@ -1802,11 +1782,11 @@ mod tests {
         let silu_out = g.add_tensor_concrete("silu_out", &[1, 256], dt);
 
         g.add_op(
-            crate::compiler::graph::OpKind::Gemm { m: crate::compiler::graph::SymDim::Concrete(1), n: 256, k: 256, dtype: DType::F32, trans_b: false },
+            crate::compiler::graph::Op::Gemm(GemmSpec { m: crate::compiler::graph::SymDim::Concrete(1), n: 256, k: 256, dtype: DType::F32, trans_b: false, has_bias: false }),
             vec![a, w], vec![gemm_out], "gemm",
         );
-        g.add_op(crate::compiler::graph::OpKind::Tanh, vec![gemm_out], vec![tanh_out], "tanh");
-        g.add_op(crate::compiler::graph::OpKind::Silu, vec![tanh_out], vec![silu_out], "silu");
+        g.add_op(Op::Tanh, vec![gemm_out], vec![tanh_out], "tanh");
+        g.add_op(Op::Silu, vec![tanh_out], vec![silu_out], "silu");
 
         let plan = fuse_with_dag(&g, &registry, &exec_plan);
         assert_eq!(plan.num_groups(), 1);
@@ -1831,11 +1811,11 @@ mod tests {
         let out2 = g.add_tensor_concrete("out2", &[1, 128], dt);
 
         g.add_op(
-            crate::compiler::graph::OpKind::Gemm { m: crate::compiler::graph::SymDim::Concrete(1), n: 128, k: 128, dtype: DType::F32, trans_b: false },
+            crate::compiler::graph::Op::Gemm(GemmSpec { m: crate::compiler::graph::SymDim::Concrete(1), n: 128, k: 128, dtype: DType::F32, trans_b: false, has_bias: false }),
             vec![a1, w1], vec![out1], "gemm1",
         );
         g.add_op(
-            crate::compiler::graph::OpKind::Gemm { m: crate::compiler::graph::SymDim::Concrete(1), n: 128, k: 128, dtype: DType::F32, trans_b: false },
+            crate::compiler::graph::Op::Gemm(GemmSpec { m: crate::compiler::graph::SymDim::Concrete(1), n: 128, k: 128, dtype: DType::F32, trans_b: false, has_bias: false }),
             vec![a2, w2], vec![out2], "gemm2",
         );
 
@@ -1879,10 +1859,10 @@ mod tests {
         let c = g.add_tensor_concrete("c_out", &[4096], dt);
 
         g.add_op(
-            crate::compiler::graph::OpKind::Dequantize { num_elements: 4096, block_size: 32, bits: 4 },
+            crate::compiler::graph::Op::Dequantize { num_elements: 4096, block_size: 32, bits: 4 },
             vec![a], vec![b], "dequant",
         );
-        g.add_op(crate::compiler::graph::OpKind::Silu, vec![b], vec![c], "silu");
+        g.add_op(Op::Silu, vec![b], vec![c], "silu");
 
         let plan = fuse_with_dag(&g, &registry, &exec_plan);
         assert_eq!(plan.num_groups(), 2, "Dequantize and SiLU form separate groups");
@@ -1904,9 +1884,9 @@ mod tests {
         let w = g.add_tensor_concrete("w", &[512, 512], dt);
         let gemm_out = g.add_tensor_concrete("gemm_out", &[1, 512], dt);
 
-        g.add_op(crate::compiler::graph::OpKind::LayerNorm { feature_dim: 4096, eps: 1e-5 }, vec![x], vec![norm_out], "layer_norm");
+        g.add_op(Op::LayerNorm(NormSpec { feature_dim: 4096, eps: 1e-5 , dtype: DType::F32, has_weight: true }), vec![x], vec![norm_out], "layer_norm");
         g.add_op(
-            crate::compiler::graph::OpKind::Gemm { m: crate::compiler::graph::SymDim::Concrete(1), n: 512, k: 512, dtype: DType::F32, trans_b: false },
+            crate::compiler::graph::Op::Gemm(GemmSpec { m: crate::compiler::graph::SymDim::Concrete(1), n: 512, k: 512, dtype: DType::F32, trans_b: false, has_bias: false }),
             vec![norm_out, w], vec![gemm_out], "gemm",
         );
 
@@ -1935,10 +1915,10 @@ mod tests {
         let silu_out = g.add_tensor_concrete("silu_out", &[1, 256], dt);
 
         g.add_op(
-            crate::compiler::graph::OpKind::Gemm { m: crate::compiler::graph::SymDim::Concrete(1), n: 256, k: 256, dtype: DType::F32, trans_b: false },
+            crate::compiler::graph::Op::Gemm(GemmSpec { m: crate::compiler::graph::SymDim::Concrete(1), n: 256, k: 256, dtype: DType::F32, trans_b: false, has_bias: false }),
             vec![a, w], vec![gemm_out], "gemm",
         );
-        g.add_op(crate::compiler::graph::OpKind::Silu, vec![gemm_out], vec![silu_out], "silu");
+        g.add_op(Op::Silu, vec![gemm_out], vec![silu_out], "silu");
 
         let plan = fuse_with_dag(&g, &registry, &exec_plan);
         let display = format!("{plan}");
@@ -1975,7 +1955,7 @@ mod tests {
         let mut g = CompilerGraph::new();
         let a = g.add_tensor_concrete("a", &[1, 256], dt);
         let b = g.add_tensor_concrete("b", &[1, 256], dt);
-        g.add_op(crate::compiler::graph::OpKind::Silu, vec![a], vec![b], "silu");
+        g.add_op(Op::Silu, vec![a], vec![b], "silu");
 
         let plan = fuse_with_dag(&g, &registry, &exec_plan);
 
@@ -1996,7 +1976,7 @@ mod tests {
         let mut g = CompilerGraph::new();
         let x = g.add_tensor_concrete("x", &[1, 512], dt);
         let norm_out = g.add_tensor_concrete("norm_out", &[1, 512], dt);
-        g.add_op(crate::compiler::graph::OpKind::RmsNorm { feature_dim: 4096, eps: 1e-5 }, vec![x], vec![norm_out], "rms_norm");
+        g.add_op(Op::RmsNorm(NormSpec { feature_dim: 4096, eps: 1e-5 , dtype: DType::F32, has_weight: true }), vec![x], vec![norm_out], "rms_norm");
 
         let plan = fuse_with_dag(&g, &registry, &exec_plan);
 
@@ -2024,10 +2004,10 @@ mod tests {
         let d = g.add_tensor_concrete("d", &[1, 4096], dt);
         let e = g.add_tensor_concrete("e", &[1, 4096], dt);
 
-        g.add_op(crate::compiler::graph::OpKind::Silu, vec![a], vec![b], "silu1");
-        g.add_op(crate::compiler::graph::OpKind::Silu, vec![b], vec![c], "silu2");
-        g.add_op(crate::compiler::graph::OpKind::Silu, vec![c], vec![d], "silu3");
-        g.add_op(crate::compiler::graph::OpKind::Silu, vec![d], vec![e], "silu4");
+        g.add_op(Op::Silu, vec![a], vec![b], "silu1");
+        g.add_op(Op::Silu, vec![b], vec![c], "silu2");
+        g.add_op(Op::Silu, vec![c], vec![d], "silu3");
+        g.add_op(Op::Silu, vec![d], vec![e], "silu4");
 
         let plan = fuse_with_dag(&g, &registry, &exec_plan);
 
@@ -2060,11 +2040,11 @@ mod tests {
         let silu_out = g.add_tensor_concrete("silu_out", &[1, 256], dt);
 
         g.add_op(
-            crate::compiler::graph::OpKind::Gemm { m: crate::compiler::graph::SymDim::Concrete(1), n: 256, k: 256, dtype: DType::F32, trans_b: false },
+            crate::compiler::graph::Op::Gemm(GemmSpec { m: crate::compiler::graph::SymDim::Concrete(1), n: 256, k: 256, dtype: DType::F32, trans_b: false, has_bias: false }),
             vec![a, w], vec![gemm_out], "gemm",
         );
-        g.add_op(crate::compiler::graph::OpKind::Tanh, vec![gemm_out], vec![tanh_out], "tanh");
-        g.add_op(crate::compiler::graph::OpKind::Silu, vec![tanh_out], vec![silu_out], "silu");
+        g.add_op(Op::Tanh, vec![gemm_out], vec![tanh_out], "tanh");
+        g.add_op(Op::Silu, vec![tanh_out], vec![silu_out], "silu");
 
         let plan = fuse_with_dag(&g, &registry, &exec_plan);
 
@@ -2091,12 +2071,12 @@ mod tests {
         let add_out = g.add_tensor_concrete("add_out", &[1, 256], dt);
 
         g.add_op(
-            crate::compiler::graph::OpKind::Gemm { m: crate::compiler::graph::SymDim::Concrete(1), n: 256, k: 256, dtype: DType::F32, trans_b: false },
+            crate::compiler::graph::Op::Gemm(GemmSpec { m: crate::compiler::graph::SymDim::Concrete(1), n: 256, k: 256, dtype: DType::F32, trans_b: false, has_bias: false }),
             vec![a, w], vec![gemm_out], "gemm",
         );
         // gemm_out has two consumers
-        g.add_op(crate::compiler::graph::OpKind::Silu, vec![gemm_out], vec![silu_out], "silu");
-        g.add_op(crate::compiler::graph::OpKind::Tanh, vec![gemm_out], vec![add_out], "tanh");
+        g.add_op(Op::Silu, vec![gemm_out], vec![silu_out], "silu");
+        g.add_op(Op::Tanh, vec![gemm_out], vec![add_out], "tanh");
 
         let plan = fuse_with_dag(&g, &registry, &exec_plan);
 
@@ -2123,10 +2103,10 @@ mod tests {
         let silu_out = g.add_tensor_concrete("silu_out", &[1, 128], dt);
 
         g.add_op(
-            crate::compiler::graph::OpKind::Gemm { m: crate::compiler::graph::SymDim::Concrete(1), n: 128, k: 128, dtype: DType::F32, trans_b: false },
+            crate::compiler::graph::Op::Gemm(GemmSpec { m: crate::compiler::graph::SymDim::Concrete(1), n: 128, k: 128, dtype: DType::F32, trans_b: false, has_bias: false }),
             vec![a, w], vec![gemm_out], "gemm",
         );
-        g.add_op(crate::compiler::graph::OpKind::Silu, vec![gemm_out], vec![silu_out], "silu");
+        g.add_op(Op::Silu, vec![gemm_out], vec![silu_out], "silu");
 
         let plan = fuse_with_dag(&g, &registry, &exec_plan);
         let cloned = plan.clone();
@@ -2154,9 +2134,9 @@ mod tests {
         let tanh_out = g.add_tensor_concrete("tanh_out", &[1, 4096], dt);
         let silu2_out = g.add_tensor_concrete("silu2_out", &[1, 4096], dt);
 
-        g.add_op(crate::compiler::graph::OpKind::Silu, vec![a], vec![silu_out], "silu");
-        g.add_op(crate::compiler::graph::OpKind::Tanh, vec![silu_out], vec![tanh_out], "tanh");
-        g.add_op(crate::compiler::graph::OpKind::Silu, vec![tanh_out], vec![silu2_out], "silu2");
+        g.add_op(Op::Silu, vec![a], vec![silu_out], "silu");
+        g.add_op(Op::Tanh, vec![silu_out], vec![tanh_out], "tanh");
+        g.add_op(Op::Silu, vec![tanh_out], vec![silu2_out], "silu2");
 
         let plan = fuse_with_dag(&g, &registry, &exec_plan);
 
@@ -2179,8 +2159,8 @@ mod tests {
         let norm1_out = g.add_tensor_concrete("norm1_out", &[1, 256], dt);
         let norm2_out = g.add_tensor_concrete("norm2_out", &[1, 256], dt);
 
-        g.add_op(crate::compiler::graph::OpKind::RmsNorm { feature_dim: 4096, eps: 1e-5 }, vec![x], vec![norm1_out], "norm1");
-        g.add_op(crate::compiler::graph::OpKind::RmsNorm { feature_dim: 4096, eps: 1e-5 }, vec![norm1_out], vec![norm2_out], "norm2");
+        g.add_op(Op::RmsNorm(NormSpec { feature_dim: 4096, eps: 1e-5 , dtype: DType::F32, has_weight: true }), vec![x], vec![norm1_out], "norm1");
+        g.add_op(Op::RmsNorm(NormSpec { feature_dim: 4096, eps: 1e-5 , dtype: DType::F32, has_weight: true }), vec![norm1_out], vec![norm2_out], "norm2");
 
         let plan = fuse_with_dag(&g, &registry, &exec_plan);
 
@@ -2206,8 +2186,8 @@ mod tests {
         let softmax_out = g.add_tensor_concrete("softmax_out", &[1, 256], dt);
         let silu_out = g.add_tensor_concrete("silu_out", &[1, 256], dt);
 
-        g.add_op(crate::compiler::graph::OpKind::Softmax, vec![a], vec![softmax_out], "softmax");
-        g.add_op(crate::compiler::graph::OpKind::Silu, vec![softmax_out], vec![silu_out], "silu");
+        g.add_op(Op::Softmax, vec![a], vec![softmax_out], "softmax");
+        g.add_op(Op::Silu, vec![softmax_out], vec![silu_out], "silu");
 
         let plan = fuse_with_dag(&g, &registry, &exec_plan);
 
@@ -2235,11 +2215,11 @@ mod tests {
         let tanh_out = g.add_tensor_concrete("tanh_out", &[1, 256], dt);
 
         g.add_op(
-            crate::compiler::graph::OpKind::Gemm { m: crate::compiler::graph::SymDim::Concrete(1), n: 256, k: 256, dtype: DType::F32, trans_b: false },
+            crate::compiler::graph::Op::Gemm(GemmSpec { m: crate::compiler::graph::SymDim::Concrete(1), n: 256, k: 256, dtype: DType::F32, trans_b: false, has_bias: false }),
             vec![a, w], vec![gemm_out], "gemm",
         );
-        g.add_op(crate::compiler::graph::OpKind::Silu, vec![gemm_out], vec![silu_out], "silu");
-        g.add_op(crate::compiler::graph::OpKind::Tanh, vec![silu_out], vec![tanh_out], "tanh");
+        g.add_op(Op::Silu, vec![gemm_out], vec![silu_out], "silu");
+        g.add_op(Op::Tanh, vec![silu_out], vec![tanh_out], "tanh");
 
         // Act
         let plan = fuse_with_dag(&g, &registry, &exec_plan);
@@ -2371,8 +2351,8 @@ mod tests {
         let silu_out = g.add_tensor_concrete("silu_out", &[1, 256], dt);
         let softmax_out = g.add_tensor_concrete("softmax_out", &[1, 256], dt);
 
-        g.add_op(crate::compiler::graph::OpKind::Silu, vec![a], vec![silu_out], "silu");
-        g.add_op(crate::compiler::graph::OpKind::Softmax, vec![silu_out], vec![softmax_out], "softmax");
+        g.add_op(Op::Silu, vec![a], vec![silu_out], "silu");
+        g.add_op(Op::Softmax, vec![silu_out], vec![softmax_out], "softmax");
 
         // Act
         let plan = fuse_with_dag(&g, &registry, &exec_plan);
@@ -2457,7 +2437,7 @@ mod tests {
         let mut g = CompilerGraph::new();
         let a = g.add_tensor_concrete("a", &[1, 256], dt);
         let b = g.add_tensor_concrete("b", &[1, 256], dt);
-        let softmax_op = g.add_op(crate::compiler::graph::OpKind::Softmax, vec![a], vec![b], "softmax");
+        let softmax_op = g.add_op(Op::Softmax, vec![a], vec![b], "softmax");
 
         // Act
         let plan = fuse_with_dag(&g, &registry, &exec_plan);

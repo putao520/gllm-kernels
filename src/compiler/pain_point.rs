@@ -5,7 +5,7 @@
 //! 零运行时依赖 — 所有输入在编译时已知。
 
 use std::collections::HashMap;
-use crate::compiler::graph::{CompilerGraph, Op, OpId, OpKind, GemmSpec, NormSpec, QuantGemmSpec, RopeSpec, AttentionSpec, AttentionGeometry, AttentionMask, SinksSpec, CachedGqaSpec, MlaSpec, DualRopeSpec};
+use crate::compiler::graph::{CompilerGraph, CompilerOp, Op, OpId, GemmSpec, NormSpec, QuantGemmSpec, RopeSpec, AttentionSpec, AttentionGeometry, AttentionMask, SinksSpec, CachedGqaSpec, MlaSpec, DualRopeSpec};
 use crate::dispatch::device_profile::DeviceProfile;
 
 /// GEMM 在模型中的角色 (影响融合策略选择)
@@ -339,15 +339,16 @@ fn classify_gemm_role(
         None => return GemmRole::Other,
     };
 
-    let is_gemm_kind = |kind: &OpKind| matches!(kind,
-        OpKind::Gemm { .. } | OpKind::GemmBias { .. } | OpKind::QuantGemm { .. });
+    // OE-4: 胖 opcode 自描述 — Gemm/GemmBias/QuantGemm 分类。
+    let is_gemm_op = |op: &CompilerOp| matches!(&op.op_v2,
+        Op::Gemm(_) | Op::GemmBias(_) | Op::QuantGemm(_));
 
     // 拓扑推导 1: 共享输入的 GEMM 三兄弟 → QkvProjection
     // ARCH-JIT-DATA-YIELDS: 使用 tensor.consumers 索引替代全图扫描。
     if let Some(&input_tid) = op.inputs.first() {
         let shared_count = graph.tensor(input_tid)
             .map(|t| t.consumers.iter()
-                .filter(|&&c| graph.op(c).is_some_and(|o| is_gemm_kind(&o.kind)))
+                .filter(|&&c| graph.op(c).is_some_and(is_gemm_op))
                 .count())
             .unwrap_or(0);
         if shared_count >= 3 {
@@ -360,8 +361,8 @@ fn classify_gemm_role(
         let consumers = graph.tensor(output_tid).map(|t| &t.consumers).cloned().unwrap_or_default();
         for consumer_id in &consumers {
             if let Some(consumer) = graph.op(*consumer_id) {
-                if matches!(consumer.kind,
-                    OpKind::Softmax | OpKind::MultiHeadAttention { .. }
+                if matches!(&consumer.op_v2,
+                    Op::Softmax | Op::MultiHeadAttention(_)
                 ) {
                     return GemmRole::OutputProjection;
                 }
@@ -373,7 +374,7 @@ fn classify_gemm_role(
     if let Some(&input_tid) = op.inputs.first() {
         let sibling_gemm_count = graph.tensor(input_tid)
             .map(|t| t.consumers.iter()
-                .filter(|&&c| c != op_id && graph.op(c).is_some_and(|o| is_gemm_kind(&o.kind)))
+                .filter(|&&c| c != op_id && graph.op(c).is_some_and(is_gemm_op))
                 .count())
             .unwrap_or(0);
         if sibling_gemm_count == 1 {
@@ -382,8 +383,8 @@ fn classify_gemm_role(
                 let consumers = graph.tensor(output_tid).map(|t| &t.consumers).cloned().unwrap_or_default();
                 for consumer_id in &consumers {
                     if let Some(consumer) = graph.op(*consumer_id) {
-                        if matches!(consumer.kind,
-                            OpKind::SwiGlu | OpKind::Silu | OpKind::SwiGluClipped { .. } | OpKind::GeGlu
+                        if matches!(&consumer.op_v2,
+                            Op::SwiGlu | Op::Silu | Op::SwiGluClipped { .. } | Op::GeGlu
                         ) {
                             return GemmRole::GateUpProjection;
                         }
@@ -398,8 +399,8 @@ fn classify_gemm_role(
         if let Some(input_tensor) = graph.tensor(input_tid) {
             if let Some(producer_id) = input_tensor.producer {
                 if let Some(producer) = graph.op(producer_id) {
-                    if matches!(producer.kind,
-                        OpKind::SwiGlu | OpKind::Silu | OpKind::SwiGluClipped { .. } | OpKind::GeGlu
+                    if matches!(&producer.op_v2,
+                        Op::SwiGlu | Op::Silu | Op::SwiGluClipped { .. } | Op::GeGlu
                     ) {
                         return GemmRole::DownProjection;
                     }
@@ -513,13 +514,9 @@ mod tests {
         let gate_out = g.add_tensor_concrete("gate_out", &[1, 11008], DType::F32);
         let up_out = g.add_tensor_concrete("up_out", &[1, 11008], DType::F32);
         let swiglu_out = g.add_tensor_concrete("swiglu_out", &[1, 11008], DType::F32);
-        g.add_op_with_op(Op::Gemm(GemmSpec { m: SymDim::Concrete(1), n: 11008, k: 4096, dtype: DType::F32, trans_b: false, has_bias: false }), OpKind::Gemm {
-            m: SymDim::Concrete(1), n: 11008, k: 4096,
-            dtype: DType::F32, trans_b: false }, vec![inp, w_gate], vec![gate_out], "gate_proj");
-        g.add_op_with_op(Op::Gemm(GemmSpec { m: SymDim::Concrete(1), n: 11008, k: 4096, dtype: DType::F32, trans_b: false, has_bias: false }), OpKind::Gemm {
-            m: SymDim::Concrete(1), n: 11008, k: 4096,
-            dtype: DType::F32, trans_b: false }, vec![inp, w_up], vec![up_out], "up_proj");
-        g.add_op_with_op(Op::SwiGlu, OpKind::SwiGlu, vec![gate_out, up_out], vec![swiglu_out], "swiglu");
+        g.add_op(Op::Gemm(GemmSpec { m: SymDim::Concrete(1), n: 11008, k: 4096, dtype: DType::F32, trans_b: false, has_bias: false }), vec![inp, w_gate], vec![gate_out], "gate_proj");
+        g.add_op(Op::Gemm(GemmSpec { m: SymDim::Concrete(1), n: 11008, k: 4096, dtype: DType::F32, trans_b: false, has_bias: false }), vec![inp, w_up], vec![up_out], "up_proj");
+        g.add_op(Op::SwiGlu, vec![gate_out, up_out], vec![swiglu_out], "swiglu");
 
         let device = DeviceProfile::detect();
         let map = PainPointAnalyzer::analyze(&g, &device);
@@ -539,10 +536,8 @@ mod tests {
         let w = g.add_tensor_concrete("weight", &[4096, 4096], DType::F32);
         let gemm_out = g.add_tensor_concrete("gemm_out", &[512, 4096], DType::F32);
         let soft_out = g.add_tensor_concrete("soft_out", &[512, 4096], DType::F32);
-        g.add_op_with_op(Op::Gemm(GemmSpec { m: SymDim::Concrete(512), n: 4096, k: 4096, dtype: DType::F32, trans_b: false, has_bias: false }), OpKind::Gemm {
-            m: SymDim::Concrete(512), n: 4096, k: 4096,
-            dtype: DType::F32, trans_b: false }, vec![inp, w], vec![gemm_out], "o_proj");
-        g.add_op_with_op(Op::Softmax, OpKind::Softmax, vec![gemm_out], vec![soft_out], "attn_softmax");
+        g.add_op(Op::Gemm(GemmSpec { m: SymDim::Concrete(512), n: 4096, k: 4096, dtype: DType::F32, trans_b: false, has_bias: false }), vec![inp, w], vec![gemm_out], "o_proj");
+        g.add_op(Op::Softmax, vec![gemm_out], vec![soft_out], "attn_softmax");
 
         let device = DeviceProfile::detect();
         let map = PainPointAnalyzer::analyze(&g, &device);
@@ -563,11 +558,11 @@ mod tests {
         let oq = g.add_tensor_concrete("oq", &[1, 4096], DType::F32);
         let ok_ = g.add_tensor_concrete("ok", &[1, 4096], DType::F32);
         let ov = g.add_tensor_concrete("ov", &[1, 4096], DType::F32);
-        let q_op = g.add_op_with_op(Op::Gemm(GemmSpec { m: SymDim::Concrete(1), n: 4096, k: 4096, dtype: DType::F32, trans_b: false, has_bias: false }), OpKind::Gemm { m: SymDim::Concrete(1), n: 4096, k: 4096, dtype: DType::F32, trans_b: false },
+        let q_op = g.add_op(Op::Gemm(GemmSpec { m: SymDim::Concrete(1), n: 4096, k: 4096, dtype: DType::F32, trans_b: false, has_bias: false }),
             vec![inp, wq], vec![oq], "q");
-        g.add_op_with_op(Op::Gemm(GemmSpec { m: SymDim::Concrete(1), n: 4096, k: 4096, dtype: DType::F32, trans_b: false, has_bias: false }), OpKind::Gemm { m: SymDim::Concrete(1), n: 4096, k: 4096, dtype: DType::F32, trans_b: false },
+        g.add_op(Op::Gemm(GemmSpec { m: SymDim::Concrete(1), n: 4096, k: 4096, dtype: DType::F32, trans_b: false, has_bias: false }),
             vec![inp, wk], vec![ok_], "k");
-        g.add_op_with_op(Op::Gemm(GemmSpec { m: SymDim::Concrete(1), n: 4096, k: 4096, dtype: DType::F32, trans_b: false, has_bias: false }), OpKind::Gemm { m: SymDim::Concrete(1), n: 4096, k: 4096, dtype: DType::F32, trans_b: false },
+        g.add_op(Op::Gemm(GemmSpec { m: SymDim::Concrete(1), n: 4096, k: 4096, dtype: DType::F32, trans_b: false, has_bias: false }),
             vec![inp, wv], vec![ov], "v");
         assert_eq!(classify_gemm_role(q_op, &g, &[q_op]), GemmRole::QkvProjection);
 
@@ -577,9 +572,9 @@ mod tests {
         let w2 = g2.add_tensor_concrete("w", &[4096, 4096], DType::F32);
         let gemm_out2 = g2.add_tensor_concrete("go", &[1, 4096], DType::F32);
         let soft_out = g2.add_tensor_concrete("so", &[1, 4096], DType::F32);
-        let o_proj = g2.add_op_with_op(Op::Gemm(GemmSpec { m: SymDim::Concrete(1), n: 4096, k: 4096, dtype: DType::F32, trans_b: false, has_bias: false }), OpKind::Gemm { m: SymDim::Concrete(1), n: 4096, k: 4096, dtype: DType::F32, trans_b: false },
+        let o_proj = g2.add_op(Op::Gemm(GemmSpec { m: SymDim::Concrete(1), n: 4096, k: 4096, dtype: DType::F32, trans_b: false, has_bias: false }),
             vec![inp2, w2], vec![gemm_out2], "o");
-        g2.add_op_with_op(Op::Softmax, OpKind::Softmax, vec![gemm_out2], vec![soft_out], "soft");
+        g2.add_op(Op::Softmax, vec![gemm_out2], vec![soft_out], "soft");
         assert_eq!(classify_gemm_role(o_proj, &g2, &[o_proj]), GemmRole::OutputProjection);
 
         // 孤立 GEMM: Other
@@ -587,7 +582,7 @@ mod tests {
         let inp3 = g3.add_tensor_concrete("x", &[1, 4096], DType::F32);
         let w3 = g3.add_tensor_concrete("w", &[4096, 4096], DType::F32);
         let out3 = g3.add_tensor_concrete("o", &[1, 4096], DType::F32);
-        let isolated = g3.add_op_with_op(Op::Gemm(GemmSpec { m: SymDim::Concrete(1), n: 4096, k: 4096, dtype: DType::F32, trans_b: false, has_bias: false }), OpKind::Gemm { m: SymDim::Concrete(1), n: 4096, k: 4096, dtype: DType::F32, trans_b: false },
+        let isolated = g3.add_op(Op::Gemm(GemmSpec { m: SymDim::Concrete(1), n: 4096, k: 4096, dtype: DType::F32, trans_b: false, has_bias: false }),
             vec![inp3, w3], vec![out3], "generic");
         assert_eq!(classify_gemm_role(isolated, &g3, &[isolated]), GemmRole::Other);
     }
@@ -736,14 +731,11 @@ mod tests {
         let mut g = CompilerGraph::new();
         let silu_in = g.add_tensor_concrete("silu_in", &[1, 4096], DType::F32);
         let silu_out = g.add_tensor_concrete("silu_out", &[1, 4096], DType::F32);
-        g.add_op_with_op(Op::Silu, OpKind::Silu, vec![silu_in], vec![silu_out], "silu");
+        g.add_op(Op::Silu, vec![silu_in], vec![silu_out], "silu");
 
         let w_down = g.add_tensor_concrete("w_down", &[4096, 4096], DType::F32);
         let down_out = g.add_tensor_concrete("down_out", &[1, 4096], DType::F32);
-        let down_op = g.add_op_with_op(Op::Gemm(GemmSpec { m: SymDim::Concrete(1), n: 4096, k: 4096, dtype: DType::F32, trans_b: false, has_bias: false }), OpKind::Gemm {
-            m: SymDim::Concrete(1), n: 4096, k: 4096,
-            dtype: DType::F32, trans_b: false,
-        }, vec![silu_out, w_down], vec![down_out], "down_proj");
+        let down_op = g.add_op(Op::Gemm(GemmSpec { m: SymDim::Concrete(1), n: 4096, k: 4096, dtype: DType::F32, trans_b: false, has_bias: false }), vec![silu_out, w_down], vec![down_out], "down_proj");
 
         assert_eq!(classify_gemm_role(down_op, &g, &[down_op]), GemmRole::DownProjection);
     }
@@ -759,10 +751,7 @@ mod tests {
             let inp = g.add_tensor_concrete(&format!("x{}", i), &[1, 256], DType::F32);
             let w = g.add_tensor_concrete(&format!("w{}", i), &[256, 256], DType::F32);
             let out = g.add_tensor_concrete(&format!("o{}", i), &[1, 256], DType::F32);
-            let op_id = g.add_op_with_op(Op::Gemm(GemmSpec { m: SymDim::Concrete(1), n: 256, k: 256, dtype: DType::F32, trans_b: false, has_bias: false }), OpKind::Gemm {
-                m: SymDim::Concrete(1), n: 256, k: 256,
-                dtype: DType::F32, trans_b: false,
-            }, vec![inp, w], vec![out], &format!("gemm{}", i));
+            let op_id = g.add_op(Op::Gemm(GemmSpec { m: SymDim::Concrete(1), n: 256, k: 256, dtype: DType::F32, trans_b: false, has_bias: false }), vec![inp, w], vec![out], &format!("gemm{}", i));
             last_id = Some(op_id);
             gemm_ids_in_order.push(op_id);
         }
@@ -776,10 +765,7 @@ mod tests {
         let inp = g.add_tensor_concrete("x", &[1, 256], DType::F32);
         let w = g.add_tensor_concrete("w", &[256, 256], DType::F32);
         let out = g.add_tensor_concrete("o", &[1, 256], DType::F32);
-        g.add_op_with_op(Op::Gemm(GemmSpec { m: SymDim::Concrete(1), n: 256, k: 256, dtype: DType::F32, trans_b: false, has_bias: false }), OpKind::Gemm {
-            m: SymDim::Concrete(1), n: 256, k: 256,
-            dtype: DType::F32, trans_b: false,
-        }, vec![inp, w], vec![out], "gemm");
+        g.add_op(Op::Gemm(GemmSpec { m: SymDim::Concrete(1), n: 256, k: 256, dtype: DType::F32, trans_b: false, has_bias: false }), vec![inp, w], vec![out], "gemm");
 
         let device = DeviceProfile::detect();
         let map = PainPointAnalyzer::analyze(&g, &device);
@@ -801,10 +787,7 @@ mod tests {
         let inp = g.add_tensor_concrete("x", &[1, 256], DType::F32);
         let w = g.add_tensor_concrete("w", &[256, 256], DType::F32);
         let out = g.add_tensor_concrete("o", &[1, 256], DType::F32);
-        g.add_op_with_op(Op::GemmBias(GemmSpec { m: SymDim::Concrete(1), n: 256, k: 256, dtype: DType::F32, trans_b: false, has_bias: true }), OpKind::GemmBias {
-            m: SymDim::Concrete(1), n: 256, k: 256,
-            dtype: DType::F32, trans_b: false,
-        }, vec![inp, w], vec![out], "gemm_bias");
+        g.add_op(Op::GemmBias(GemmSpec { m: SymDim::Concrete(1), n: 256, k: 256, dtype: DType::F32, trans_b: false, has_bias: true }), vec![inp, w], vec![out], "gemm_bias");
 
         let device = DeviceProfile::detect();
         let map = PainPointAnalyzer::analyze(&g, &device);
@@ -822,10 +805,7 @@ mod tests {
         let inp = g.add_tensor_concrete("x", &[1, 256], DType::F32);
         let w = g.add_tensor_concrete("w", &[256, 256], DType::F32);
         let out = g.add_tensor_concrete("o", &[1, 256], DType::F32);
-        g.add_op_with_op(Op::QuantGemm(QuantGemmSpec { m: SymDim::Concrete(1), n: 256, k: 256, quant_type: crate::quant::QuantType::Q4K }), OpKind::QuantGemm {
-            m: SymDim::Concrete(1), n: 256, k: 256,
-            quant_type: crate::quant::QuantType::Q4K,
-        }, vec![inp, w], vec![out], "qgemm");
+        g.add_op(Op::QuantGemm(QuantGemmSpec { m: SymDim::Concrete(1), n: 256, k: 256, quant_type: crate::quant::QuantType::Q4K }), vec![inp, w], vec![out], "qgemm");
 
         let device = DeviceProfile::detect();
         let map = PainPointAnalyzer::analyze(&g, &device);
@@ -844,11 +824,7 @@ mod tests {
         let inp = g.add_tensor_concrete("x", &[512, 256], DType::F32);
         let w = g.add_tensor_concrete("w", &[256, 256], DType::F32);
         let out = g.add_tensor_concrete("o", &[512, 256], DType::F32);
-        g.add_op_with_op(Op::Gemm(GemmSpec { m: SymDim::Symbolic { name: "seq_len".to_string(), max_value: Some(1024) }, n: 256, k: 256, dtype: DType::F32, trans_b: false, has_bias: false }), OpKind::Gemm {
-            m: SymDim::Symbolic { name: "seq_len".to_string(), max_value: Some(1024) },
-            n: 256, k: 256,
-            dtype: DType::F32, trans_b: false,
-        }, vec![inp, w], vec![out], "sym_gemm");
+        g.add_op(Op::Gemm(GemmSpec { m: SymDim::Symbolic { name: "seq_len".to_string(), max_value: Some(1024) }, n: 256, k: 256, dtype: DType::F32, trans_b: false, has_bias: false }), vec![inp, w], vec![out], "sym_gemm");
 
         let device = DeviceProfile::detect();
         let map = PainPointAnalyzer::analyze(&g, &device);
@@ -869,15 +845,9 @@ mod tests {
         let up_out = g.add_tensor_concrete("up_out", &[1, 1024], DType::F32);
         let geglu_out = g.add_tensor_concrete("geglu_out", &[1, 1024], DType::F32);
 
-        let gate_op = g.add_op_with_op(Op::Gemm(GemmSpec { m: SymDim::Concrete(1), n: 1024, k: 512, dtype: DType::F32, trans_b: false, has_bias: false }), OpKind::Gemm {
-            m: SymDim::Concrete(1), n: 1024, k: 512,
-            dtype: DType::F32, trans_b: false,
-        }, vec![inp, w_gate], vec![gate_out], "gate");
-        g.add_op_with_op(Op::Gemm(GemmSpec { m: SymDim::Concrete(1), n: 1024, k: 512, dtype: DType::F32, trans_b: false, has_bias: false }), OpKind::Gemm {
-            m: SymDim::Concrete(1), n: 1024, k: 512,
-            dtype: DType::F32, trans_b: false,
-        }, vec![inp, w_up], vec![up_out], "up");
-        g.add_op_with_op(Op::GeGlu, OpKind::GeGlu, vec![gate_out, up_out], vec![geglu_out], "geglu");
+        let gate_op = g.add_op(Op::Gemm(GemmSpec { m: SymDim::Concrete(1), n: 1024, k: 512, dtype: DType::F32, trans_b: false, has_bias: false }), vec![inp, w_gate], vec![gate_out], "gate");
+        g.add_op(Op::Gemm(GemmSpec { m: SymDim::Concrete(1), n: 1024, k: 512, dtype: DType::F32, trans_b: false, has_bias: false }), vec![inp, w_up], vec![up_out], "up");
+        g.add_op(Op::GeGlu, vec![gate_out, up_out], vec![geglu_out], "geglu");
 
         // Act
         let role = classify_gemm_role(gate_op, &g, &[gate_op]);
@@ -897,15 +867,9 @@ mod tests {
         let up_out = g.add_tensor_concrete("up_out", &[1, 512], DType::F32);
         let clipped_out = g.add_tensor_concrete("clipped_out", &[1, 512], DType::F32);
 
-        let gate_op = g.add_op_with_op(Op::Gemm(GemmSpec { m: SymDim::Concrete(1), n: 512, k: 256, dtype: DType::F32, trans_b: false, has_bias: false }), OpKind::Gemm {
-            m: SymDim::Concrete(1), n: 512, k: 256,
-            dtype: DType::F32, trans_b: false,
-        }, vec![inp, w_gate], vec![gate_out], "gate");
-        g.add_op_with_op(Op::Gemm(GemmSpec { m: SymDim::Concrete(1), n: 512, k: 256, dtype: DType::F32, trans_b: false, has_bias: false }), OpKind::Gemm {
-            m: SymDim::Concrete(1), n: 512, k: 256,
-            dtype: DType::F32, trans_b: false,
-        }, vec![inp, w_up], vec![up_out], "up");
-        g.add_op_with_op(Op::SwiGluClipped { limit: 7.0 }, OpKind::SwiGluClipped { limit: 7.0 },
+        let gate_op = g.add_op(Op::Gemm(GemmSpec { m: SymDim::Concrete(1), n: 512, k: 256, dtype: DType::F32, trans_b: false, has_bias: false }), vec![inp, w_gate], vec![gate_out], "gate");
+        g.add_op(Op::Gemm(GemmSpec { m: SymDim::Concrete(1), n: 512, k: 256, dtype: DType::F32, trans_b: false, has_bias: false }), vec![inp, w_up], vec![up_out], "up");
+        g.add_op(Op::SwiGluClipped { limit: 7.0 },
             vec![gate_out, up_out], vec![clipped_out], "clipped");
 
         // Act
@@ -924,16 +888,8 @@ mod tests {
         let gemm_out = g.add_tensor_concrete("go", &[1, 256], DType::F32);
         let mha_out = g.add_tensor_concrete("mha_o", &[1, 256], DType::F32);
 
-        let o_proj = g.add_op_with_op(Op::Gemm(GemmSpec { m: SymDim::Concrete(1), n: 256, k: 256, dtype: DType::F32, trans_b: false, has_bias: false }), OpKind::Gemm {
-            m: SymDim::Concrete(1), n: 256, k: 256,
-            dtype: DType::F32, trans_b: false,
-        }, vec![inp, w], vec![gemm_out], "o_proj");
-        g.add_op_with_op(Op::MultiHeadAttention(AttentionSpec { geometry: AttentionGeometry { num_q_heads: 4, num_kv_heads: 2, head_dim: 64 }, mask: if true { AttentionMask::Causal } else { AttentionMask::Full }, kv_source: KvSource::FromTensor, sinks: if false { SinksSpec::Learnable } else { SinksSpec::None }, seq_len: SymDim::Concrete(1), dtype: DType::F32 }), OpKind::MultiHeadAttention {
-            seq_len: SymDim::Concrete(1),
-            num_heads: 4, num_kv_heads: 2, head_dim: 64,
-            causal: true, attention_sinks: false,
-            kv_source: KvSource::FromTensor,
-        }, vec![gemm_out], vec![mha_out], "mha");
+        let o_proj = g.add_op(Op::Gemm(GemmSpec { m: SymDim::Concrete(1), n: 256, k: 256, dtype: DType::F32, trans_b: false, has_bias: false }), vec![inp, w], vec![gemm_out], "o_proj");
+        g.add_op(Op::MultiHeadAttention(AttentionSpec { geometry: AttentionGeometry { num_q_heads: 4, num_kv_heads: 2, head_dim: 64 }, mask: if true { AttentionMask::Causal } else { AttentionMask::Full }, kv_source: KvSource::FromTensor, sinks: if false { SinksSpec::Learnable } else { SinksSpec::None }, seq_len: SymDim::Concrete(1), dtype: DType::F32 }), vec![gemm_out], vec![mha_out], "mha");
 
         // Act
         let role = classify_gemm_role(o_proj, &g, &[o_proj]);
@@ -1164,10 +1120,7 @@ mod tests {
         let inp = g.add_tensor_concrete("x", &[64, 256], DType::F32);
         let w = g.add_tensor_concrete("w", &[256, 512], DType::F32);
         let out = g.add_tensor_concrete("o", &[64, 512], DType::F32);
-        g.add_op_with_op(Op::Gemm(GemmSpec { m: SymDim::Concrete(64), n: 512, k: 256, dtype: DType::F32, trans_b: false, has_bias: false }), OpKind::Gemm {
-            m: SymDim::Concrete(64), n: 512, k: 256,
-            dtype: DType::F32, trans_b: false,
-        }, vec![inp, w], vec![out], "gemm");
+        g.add_op(Op::Gemm(GemmSpec { m: SymDim::Concrete(64), n: 512, k: 256, dtype: DType::F32, trans_b: false, has_bias: false }), vec![inp, w], vec![out], "gemm");
 
         let device = DeviceProfile::detect();
         let map = PainPointAnalyzer::analyze(&g, &device);
