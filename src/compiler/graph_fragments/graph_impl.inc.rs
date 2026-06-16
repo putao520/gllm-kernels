@@ -95,6 +95,47 @@ impl CompilerGraph {
         id
     }
 
+    /// Add an operation with pre-constructed `Op` (OE-2 single-IR migration target).
+    ///
+    /// 直接接受 Op（带 dtype 字段），跳过 from_op_kind Translator。
+    /// graph builder 迁移到此 API 后，OpKind enum 可物理删除。
+    ///
+    /// `kind_fallback` 仅用于过渡期保留 CompilerOp.kind 字段（OE-4 删除字段时移除）。
+    pub fn add_op_with_op(
+        &mut self,
+        op: crate::compiler::graph::Op,
+        kind_fallback: OpKind,
+        inputs: Vec<TensorId>,
+        outputs: Vec<TensorId>,
+        label: &str,
+    ) -> OpId {
+        let id = OpId(self.next_op_id);
+        self.next_op_id += 1;
+
+        for &tid in &outputs {
+            if let Some(t) = self.tensor_mut(tid) {
+                t.producer = Some(id);
+            }
+        }
+        for &tid in &inputs {
+            if let Some(t) = self.tensor_mut(tid) {
+                t.consumers.push(id);
+            }
+        }
+
+        let final_op = CompilerOp {
+            id,
+            kind: kind_fallback,
+            inputs: inputs.clone(),
+            outputs: outputs.clone(),
+            label: label.to_string(),
+            guard: LayerCondition::Always,
+            op_v2: Some(op),
+        };
+        self.ops.push(final_op);
+        id
+    }
+
     /// Add an operation with a layer execution guard.
     /// Ops inside a layer template can be conditionally skipped at runtime
     /// based on `layer_loop_counter`. See `LayerCondition` for semantics.
