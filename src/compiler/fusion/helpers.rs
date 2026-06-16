@@ -128,15 +128,15 @@ pub(crate) fn detect_qkv_norm_rope(graph: &CompilerGraph, topo: &[OpId]) -> Vec<
                 None => { traces.push(trace); continue; }
             };
 
-            match &consumer.kind {
-                OpKind::QkNorm { .. } => {
+            match &consumer.op_v2 {
+                Op::QkNorm { .. } => {
                     trace.qk_norm_id = Some(consumer_id);
                     // Expect RoPE after QkNorm
                     if consumer.outputs.len() == 1 {
                         if let Some(norm_out_t) = graph.tensor(consumer.outputs[0]) {
                             if norm_out_t.consumers.len() == 1 {
                                 if let Some(rope_op) = graph.op(norm_out_t.consumers[0]) {
-                                    if matches!(rope_op.op_v2_resolved(graph), Some(Op::RoPE(_))) {
+                                    if matches!(&rope_op.op_v2, Op::RoPE(_)) {
                                         trace.rope_id = Some(rope_op.id);
                                     }
                                 }
@@ -144,7 +144,7 @@ pub(crate) fn detect_qkv_norm_rope(graph: &CompilerGraph, topo: &[OpId]) -> Vec<
                         }
                     }
                 }
-                OpKind::ValueNorm { .. } => {
+                Op::ValueNorm(_) => {
                     trace.value_norm_id = Some(consumer_id);
                 }
                 _ => {}
@@ -398,7 +398,7 @@ pub(crate) fn detect_norm_into_gemm(
 
     // Must be a norm op (not Softmax, which is also Reduction)
     let producer = graph.op(producer_id)?;
-    if !matches!(producer.kind, OpKind::RmsNorm { .. } | OpKind::LayerNorm { .. }) {
+    if !matches!(&producer.op_v2, Op::RmsNorm(_) | Op::LayerNorm(_)) {
         return None;
     }
 
