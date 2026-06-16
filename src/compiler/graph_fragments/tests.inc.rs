@@ -20,8 +20,8 @@ mod tests {
         let b = g.add_tensor_concrete("b", &[1, 4096], dt);
         let c = g.add_tensor_concrete("c", &[1, 4096], dt);
 
-        let op0 = g.add_op(OpKind::Silu, vec![a], vec![b], "silu");
-        let op1 = g.add_op(OpKind::Silu, vec![b], vec![c], "silu2");
+        let op0 = g.add_op_with_op(Op::Silu, OpKind::Silu, vec![a], vec![b], "silu");
+        let op1 = g.add_op_with_op(Op::Silu, OpKind::Silu, vec![b], vec![c], "silu2");
 
         let sorted = g.topological_sort();
         assert_eq!(sorted, vec![op0, op1]);
@@ -36,9 +36,9 @@ mod tests {
         let right = g.add_tensor_concrete("right", &[1, 4096], dt);
         let out = g.add_tensor_concrete("out", &[1, 4096], dt);
 
-        let op_l = g.add_op(OpKind::Silu, vec![input], vec![left], "left");
-        let op_r = g.add_op(OpKind::Gelu, vec![input], vec![right], "right");
-        let op_add = g.add_op(OpKind::Add, vec![left, right], vec![out], "add");
+        let op_l = g.add_op_with_op(Op::Silu, OpKind::Silu, vec![input], vec![left], "left");
+        let op_r = g.add_op_with_op(Op::Gelu, OpKind::Gelu, vec![input], vec![right], "right");
+        let op_add = g.add_op_with_op(Op::Add, OpKind::Add, vec![left, right], vec![out], "add");
 
         let sorted = g.topological_sort();
         // op_l and op_r must come before op_add
@@ -57,8 +57,8 @@ mod tests {
         let b = g.add_tensor_concrete("b", &[1, 4096], dt);
         let c = g.add_tensor_concrete("c", &[1, 4096], dt);
 
-        let op0 = g.add_op(OpKind::Silu, vec![a], vec![b], "silu");
-        let op1 = g.add_op(OpKind::Silu, vec![b], vec![c], "silu2");
+        let op0 = g.add_op_with_op(Op::Silu, OpKind::Silu, vec![a], vec![b], "silu");
+        let op1 = g.add_op_with_op(Op::Silu, OpKind::Silu, vec![b], vec![c], "silu2");
 
         let chains = g.def_use_chains();
         // 'a' is a graph input (no producer), consumed by op0
@@ -377,7 +377,7 @@ mod tests {
         let mut g = CompilerGraph::new();
         let input = g.add_tensor_concrete("input", &[4], DType::F32);
         let output = g.add_tensor_concrete("output", &[4], DType::F32);
-        let op = g.add_op(OpKind::Silu, vec![input], vec![output], "silu");
+        let op = g.add_op_with_op(Op::Silu, OpKind::Silu, vec![input], vec![output], "silu");
 
         let op_v2 = Op::from_op_kind_norm_activation(g.op(op).unwrap(), &g);
         assert_eq!(op_v2, Some(Op::Silu));
@@ -389,8 +389,7 @@ mod tests {
         let input = g.add_tensor_concrete("input", &[4096], DType::BF16);
         let weight = g.add_tensor_concrete("weight", &[4096], DType::BF16);
         let output = g.add_tensor_concrete("output", &[4096], DType::BF16);
-        let op = g.add_op(
-            OpKind::RmsNorm { feature_dim: 4096, eps: 1e-5 },
+        let op = g.add_op_with_op(Op::RmsNorm(NormSpec { feature_dim: 4096, eps: 1e-5, dtype: DType::F32, has_weight: true }), OpKind::RmsNorm { feature_dim: 4096, eps: 1e-5 },
             vec![input, weight], vec![output], "rms",
         );
 
@@ -410,8 +409,7 @@ mod tests {
         let mut g = CompilerGraph::new();
         let input = g.add_tensor_concrete("input", &[4096], DType::F32);
         let output = g.add_tensor_concrete("output", &[4096], DType::F32);
-        let op = g.add_op(
-            OpKind::ValueNorm { feature_dim: 4096, eps: 1e-6 },
+        let op = g.add_op_with_op(Op::ValueNorm(NormSpec { feature_dim: 4096, eps: 1e-6, dtype: DType::F32, has_weight: false }), OpKind::ValueNorm { feature_dim: 4096, eps: 1e-6 },
             vec![input], vec![output], "vn",
         );
 
@@ -429,8 +427,7 @@ mod tests {
         let input = g.add_tensor_concrete("input", &[4096], DType::F32);
         let weight = g.add_tensor_concrete("weight", &[4096, 4096], DType::F32);
         let output = g.add_tensor_concrete("output", &[4096], DType::F32);
-        let op = g.add_op(
-            OpKind::Gemm { m: SymDim::Concrete(1), n: 4096, k: 4096, dtype: DType::F32, trans_b: false },
+        let op = g.add_op_with_op(Op::Gemm(GemmSpec { m: SymDim::Concrete(1), n: 4096, k: 4096, dtype: DType::F32, trans_b: false, has_bias: false }), OpKind::Gemm { m: SymDim::Concrete(1), n: 4096, k: 4096, dtype: DType::F32, trans_b: false },
             vec![input, weight], vec![output], "gemm",
         );
 
@@ -447,8 +444,7 @@ mod tests {
         let input = g.add_tensor_concrete("input", &[1, 4096], DType::F32);
         let weight = g.add_tensor_concrete("weight", &[4096, 4096], DType::F32);
         let output = g.add_tensor_concrete("output", &[1, 4096], DType::F32);
-        let op = g.add_op(
-            OpKind::Gemm { m: SymDim::Concrete(1), n: 4096, k: 4096, dtype: DType::F32, trans_b: false },
+        let op = g.add_op_with_op(Op::Gemm(GemmSpec { m: SymDim::Concrete(1), n: 4096, k: 4096, dtype: DType::F32, trans_b: false, has_bias: false }), OpKind::Gemm { m: SymDim::Concrete(1), n: 4096, k: 4096, dtype: DType::F32, trans_b: false },
             vec![input, weight], vec![output], "gemm",
         );
 
@@ -468,8 +464,7 @@ mod tests {
         let input = g.add_tensor_concrete("input", &[1, 4096], DType::F32);
         let weight = g.add_tensor_concrete("weight", &[4096, 4096], DType::F32);
         let output = g.add_tensor_concrete("output", &[1, 4096], DType::F32);
-        let op = g.add_op(
-            OpKind::GemmBias { m: SymDim::Concrete(1), n: 4096, k: 4096, dtype: DType::F32, trans_b: false },
+        let op = g.add_op_with_op(Op::GemmBias(GemmSpec { m: SymDim::Concrete(1), n: 4096, k: 4096, dtype: DType::F32, trans_b: false, has_bias: true }), OpKind::GemmBias { m: SymDim::Concrete(1), n: 4096, k: 4096, dtype: DType::F32, trans_b: false },
             vec![input, weight], vec![output], "gemmbias",
         );
 
@@ -487,8 +482,7 @@ mod tests {
         let input = g.add_tensor_concrete("input", &[1, 4096], DType::F32);
         let weight = g.add_tensor_concrete("weight", &[4096, 4096], DType::F32);
         let output = g.add_tensor_concrete("output", &[1, 4096], DType::F32);
-        let op = g.add_op(
-            OpKind::QuantGemm { m: SymDim::Concrete(1), n: 4096, k: 4096, quant_type: crate::quant::QuantType::Q4_0 },
+        let op = g.add_op_with_op(Op::QuantGemm(QuantGemmSpec { m: SymDim::Concrete(1), n: 4096, k: 4096, quant_type: crate::quant::QuantType::Q4_0 }), OpKind::QuantGemm { m: SymDim::Concrete(1), n: 4096, k: 4096, quant_type: crate::quant::QuantType::Q4_0 },
             vec![input, weight], vec![output], "qgemm",
         );
 
@@ -501,8 +495,7 @@ mod tests {
         let mut g = CompilerGraph::new();
         let input = g.add_tensor_concrete("input", &[1024], DType::F32);
         let output = g.add_tensor_concrete("output", &[1024], DType::F32);
-        let op = g.add_op(
-            OpKind::Dequantize { num_elements: 1024, block_size: 32, bits: 4 },
+        let op = g.add_op_with_op(Op::Dequantize { num_elements: 1024, block_size: 32, bits: 4 }, OpKind::Dequantize { num_elements: 1024, block_size: 32, bits: 4 },
             vec![input], vec![output], "deq",
         );
 
@@ -525,8 +518,7 @@ mod tests {
         let k = g.add_tensor_concrete("k", &[1, 4096], DType::F32);
         let v = g.add_tensor_concrete("v", &[1, 4096], DType::F32);
         let out = g.add_tensor_concrete("out", &[1, 4096], DType::F32);
-        let op = g.add_op(
-            OpKind::MultiHeadAttention {
+        let op = g.add_op_with_op(Op::MultiHeadAttention(AttentionSpec { geometry: AttentionGeometry { num_q_heads: 32, num_kv_heads: 8, head_dim: 128 }, mask: if true { AttentionMask::Causal } else { AttentionMask::Full }, kv_source: KvSource::FromCache, sinks: if false { SinksSpec::Learnable } else { SinksSpec::None }, seq_len: SymDim::Concrete(1), dtype: DType::F32 }), OpKind::MultiHeadAttention {
                 seq_len: SymDim::Concrete(1), num_heads: 32, num_kv_heads: 8, head_dim: 128,
                 causal: true, attention_sinks: false, kv_source: KvSource::FromCache,
             },
@@ -548,8 +540,7 @@ mod tests {
         let mut g = CompilerGraph::new();
         let q = g.add_tensor_concrete("q", &[1, 4096], DType::F32);
         let out = g.add_tensor_concrete("out", &[1, 4096], DType::F32);
-        let op = g.add_op(
-            OpKind::MlaAttention {
+        let op = g.add_op_with_op(Op::MlaAttention(MlaSpec { seq_len: SymDim::Concrete(1), num_heads: 32, head_dim: 128, d_c: 512, d_rope: 64, causal: true, kv_source: KvSource::FromTensor }), OpKind::MlaAttention {
                 seq_len: SymDim::Concrete(1), num_heads: 32, head_dim: 128,
                 d_c: 512, d_rope: 64, causal: true, kv_source: KvSource::FromTensor,
             },
@@ -565,8 +556,7 @@ mod tests {
         let mut g = CompilerGraph::new();
         let input = g.add_tensor_concrete("input", &[1, 4096], DType::F32);
         let out = g.add_tensor_concrete("out", &[1, 8], DType::F32);
-        let op = g.add_op(
-            OpKind::MoEGate { seq_len: 1, num_experts: 8, hidden: 4096, top_k: 2 },
+        let op = g.add_op_with_op(Op::MoEGate { seq_len: SymDim::Concrete(1), num_experts: 8, hidden: 4096, top_k: 2 }, OpKind::MoEGate { seq_len: 1, num_experts: 8, hidden: 4096, top_k: 2 },
             vec![input], vec![out], "moegate",
         );
 
@@ -589,8 +579,7 @@ mod tests {
         let input = g.add_tensor_concrete("in", &[4096], DType::F32);
         let weight = g.add_tensor_concrete("w", &[4096], DType::F32);
         let out = g.add_tensor_concrete("out", &[4096], DType::F32);
-        let norm_op = g.add_op(
-            OpKind::RmsNorm { feature_dim: 4096, eps: 1e-5 },
+        let norm_op = g.add_op_with_op(Op::RmsNorm(NormSpec { feature_dim: 4096, eps: 1e-5, dtype: DType::F32, has_weight: true }), OpKind::RmsNorm { feature_dim: 4096, eps: 1e-5 },
             vec![input, weight], vec![out], "norm",
         );
         assert!(Op::from_op_kind(g.op(norm_op).unwrap(), &g).is_some());
@@ -599,8 +588,7 @@ mod tests {
         let g_in = g.add_tensor_concrete("gin", &[1, 4096], DType::F32);
         let g_w = g.add_tensor_concrete("gw", &[4096, 4096], DType::F32);
         let g_out = g.add_tensor_concrete("gout", &[1, 4096], DType::F32);
-        let gemm_op = g.add_op(
-            OpKind::Gemm { m: SymDim::Concrete(1), n: 4096, k: 4096, dtype: DType::F32, trans_b: false },
+        let gemm_op = g.add_op_with_op(Op::Gemm(GemmSpec { m: SymDim::Concrete(1), n: 4096, k: 4096, dtype: DType::F32, trans_b: false, has_bias: false }), OpKind::Gemm { m: SymDim::Concrete(1), n: 4096, k: 4096, dtype: DType::F32, trans_b: false },
             vec![g_in, g_w], vec![g_out], "gemm",
         );
         assert!(Op::from_op_kind(g.op(gemm_op).unwrap(), &g).is_some());
@@ -608,14 +596,13 @@ mod tests {
         // Activation
         let a_in = g.add_tensor_concrete("ain", &[4096], DType::F32);
         let a_out = g.add_tensor_concrete("aout", &[4096], DType::F32);
-        let act_op = g.add_op(OpKind::Silu, vec![a_in], vec![a_out], "silu");
+        let act_op = g.add_op_with_op(Op::Silu, OpKind::Silu, vec![a_in], vec![a_out], "silu");
         assert!(Op::from_op_kind(g.op(act_op).unwrap(), &g).is_some());
 
         // Structural
         let t_in = g.add_tensor_concrete("tin", &[4096], DType::F32);
         let t_out = g.add_tensor_concrete("tout", &[4096], DType::F32);
-        let struct_op = g.add_op(
-            OpKind::Transpose { perm: vec![1, 0] },
+        let struct_op = g.add_op_with_op(Op::Transpose { perm: vec![1, 0] }, OpKind::Transpose { perm: vec![1, 0] },
             vec![t_in], vec![t_out], "transpose",
         );
         assert!(Op::from_op_kind(g.op(struct_op).unwrap(), &g).is_some());

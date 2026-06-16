@@ -248,7 +248,7 @@ mod tests {
     #[test]
     fn test_emitter_emit_plan_standalone_silu() {
         use super::X86CodeGen;
-        use crate::compiler::graph::{CompilerGraph, MultiOutputConfig, OpKind};
+        use crate::compiler::graph::{CompilerGraph, MultiOutputConfig, OpKind, Op, GemmSpec, NormSpec, QuantGemmSpec, RopeSpec, AttentionSpec, AttentionGeometry, AttentionMask, SinksSpec, CachedGqaSpec, MlaSpec, DualRopeSpec};
         use crate::compiler::fusion::{FusionGroup, FusionMode, FusionPlan, GroupMarker};
         use crate::compiler::buffer_alloc::BufferAllocation;
         use crate::types::DType;
@@ -259,7 +259,7 @@ mod tests {
         let output = g.add_tensor_concrete("output", &[16], DType::F32);
         g.inputs = vec![input];
         g.outputs = vec![output];
-        let op_id = g.add_op(OpKind::Silu, vec![input], vec![output], "silu");
+        let op_id = g.add_op_with_op(Op::Silu, OpKind::Silu, vec![input], vec![output], "silu");
 
         let mut op_to_group = HashMap::new();
         op_to_group.insert(op_id, 0);
@@ -292,7 +292,7 @@ mod tests {
     #[test]
     fn test_emitter_emit_plan_with_registry() {
         use super::X86CodeGen;
-        use crate::compiler::graph::{CompilerGraph, MultiOutputConfig, OpKind};
+        use crate::compiler::graph::{CompilerGraph, MultiOutputConfig, OpKind, Op, GemmSpec, NormSpec, QuantGemmSpec, RopeSpec, AttentionSpec, AttentionGeometry, AttentionMask, SinksSpec, CachedGqaSpec, MlaSpec, DualRopeSpec};
         use crate::compiler::fusion::{FusionGroup, FusionMode, FusionPlan, GroupMarker};
         use crate::compiler::buffer_alloc::BufferAllocation;
         use crate::compiler::registry::ScalarOpRegistry;
@@ -304,7 +304,7 @@ mod tests {
         let output = g.add_tensor_concrete("output", &[16], DType::F32);
         g.inputs = vec![input];
         g.outputs = vec![output];
-        let op_id = g.add_op(OpKind::Silu, vec![input], vec![output], "silu");
+        let op_id = g.add_op_with_op(Op::Silu, OpKind::Silu, vec![input], vec![output], "silu");
 
         let mut op_to_group = HashMap::new();
         op_to_group.insert(op_id, 0);

@@ -11,7 +11,7 @@ use super::plan_lower::{
 use super::gemm_emit::{emit_gemm_inline_with_hook, emit_gemm_inline_with_epilogue};
 
 use crate::compiler::fusion::{FusionGroup, FusionMode};
-use crate::compiler::graph::{CompilerGraph, CompilerOp};
+use crate::compiler::graph::{CompilerGraph, CompilerOp, Op, GemmSpec, NormSpec, QuantGemmSpec, RopeSpec, AttentionSpec, AttentionGeometry, AttentionMask, SinksSpec, CachedGqaSpec, MlaSpec, DualRopeSpec};
 use crate::compiler::buffer_alloc::BufferAllocation;
 use crate::compiler::layout_negotiator::MovementType;
 use crate::compiler::trace::QuantPrecision;
@@ -719,7 +719,7 @@ mod tests {
     };
     use crate::compiler::accel_registry::LayoutConstraint;
     use crate::compiler::fusion::{FusionGroup, FusionMode, FusionCost};
-    use crate::compiler::graph::{OpId, MultiOutputConfig};
+    use crate::compiler::graph::{OpId, MultiOutputConfig, Op, GemmSpec, NormSpec, QuantGemmSpec, RopeSpec, AttentionSpec, AttentionGeometry, AttentionMask, SinksSpec, CachedGqaSpec, MlaSpec, DualRopeSpec};
     use std::collections::HashMap;
 
     /// Helper: build a minimal AbiPtrs with dummy VRegIds for emit_layout_transform tests.
@@ -1407,8 +1407,7 @@ mod tests {
         let mut graph = CompilerGraph::new();
         let tid = graph.add_tensor_concrete("hidden", &[1, 512], DType::BF16);
         let out_tid = graph.add_tensor_concrete("output", &[1, 512], DType::BF16);
-        let op_id = graph.add_op(
-            OpKind::RmsNorm { feature_dim: 4096, eps: 1e-5 },
+        let op_id = graph.add_op_with_op(Op::RmsNorm(NormSpec { feature_dim: 4096, eps: 1e-5, dtype: DType::F32, has_weight: true }), OpKind::RmsNorm { feature_dim: 4096, eps: 1e-5 },
             vec![tid],
             vec![out_tid],
             "norm",
@@ -1695,8 +1694,7 @@ mod tests {
         let mut graph = CompilerGraph::new();
         let tid = graph.add_tensor_concrete("hidden_f32", &[1, 256], DType::F32);
         let out_tid = graph.add_tensor_concrete("output_f32", &[1, 256], DType::F32);
-        let op_id = graph.add_op(
-            OpKind::RmsNorm { feature_dim: 4096, eps: 1e-6 },
+        let op_id = graph.add_op_with_op(Op::RmsNorm(NormSpec { feature_dim: 4096, eps: 1e-6, dtype: DType::F32, has_weight: true }), OpKind::RmsNorm { feature_dim: 4096, eps: 1e-6 },
             vec![tid],
             vec![out_tid],
             "norm_f32",
@@ -1729,8 +1727,7 @@ mod tests {
         let mut graph = CompilerGraph::new();
         let tid = graph.add_tensor_concrete("hidden_f16", &[2, 128], DType::F16);
         let out_tid = graph.add_tensor_concrete("output_f16", &[2, 128], DType::F16);
-        let op_id = graph.add_op(
-            OpKind::RmsNorm { feature_dim: 4096, eps: 1e-5 },
+        let op_id = graph.add_op_with_op(Op::RmsNorm(NormSpec { feature_dim: 4096, eps: 1e-5, dtype: DType::F32, has_weight: true }), OpKind::RmsNorm { feature_dim: 4096, eps: 1e-5 },
             vec![tid],
             vec![out_tid],
             "norm_f16",
@@ -1870,8 +1867,8 @@ mod tests {
         let t0 = graph.add_tensor_concrete("in", &[1, 64], DType::BF16);
         let t1 = graph.add_tensor_concrete("mid", &[1, 64], DType::BF16);
         let t2 = graph.add_tensor_concrete("out", &[1, 64], DType::BF16);
-        let op0 = graph.add_op(OpKind::RmsNorm { feature_dim: 4096, eps: 1e-5 }, vec![t0], vec![t1], "norm");
-        let op1 = graph.add_op(OpKind::RmsNorm { feature_dim: 4096, eps: 1e-5 }, vec![t1], vec![t2], "norm2");
+        let op0 = graph.add_op_with_op(Op::RmsNorm(NormSpec { feature_dim: 4096, eps: 1e-5, dtype: DType::F32, has_weight: true }), OpKind::RmsNorm { feature_dim: 4096, eps: 1e-5 }, vec![t0], vec![t1], "norm");
+        let op1 = graph.add_op_with_op(Op::RmsNorm(NormSpec { feature_dim: 4096, eps: 1e-5, dtype: DType::F32, has_weight: true }), OpKind::RmsNorm { feature_dim: 4096, eps: 1e-5 }, vec![t1], vec![t2], "norm2");
         let group = FusionGroup {
             id: 0, anchor: op0, epilogue: vec![op1], mode: FusionMode::LoopFusion,
             ops: vec![op0, op1], multi_output: MultiOutputConfig::single(),

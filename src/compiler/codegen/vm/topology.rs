@@ -12,7 +12,7 @@
 //! - decoder 裁剪为 EncodeToLayer: 裁掉 lm_head 及后续
 //! - 编译器看裁剪后的图 ops 推导一切，完全不读 output_modes
 
-use crate::compiler::graph::{CompilerGraph, Op, TensorId};
+use crate::compiler::graph::{CompilerGraph, Op, TensorId, GemmSpec, NormSpec, QuantGemmSpec, RopeSpec, AttentionSpec, AttentionGeometry, AttentionMask, SinksSpec, CachedGqaSpec, MlaSpec, DualRopeSpec};
 use crate::compiler::mega_kernel_abi::MtpKernelConfig;
 
 /// seq_len 的来源 — 从图 ops 推导
@@ -275,7 +275,7 @@ impl GraphTopologyAnalysis {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::compiler::graph::{CompilerGraph, OpKind, SymDim};
+    use crate::compiler::graph::{CompilerGraph, OpKind, SymDim, Op, GemmSpec, NormSpec, QuantGemmSpec, RopeSpec, AttentionSpec, AttentionGeometry, AttentionMask, SinksSpec, CachedGqaSpec, MlaSpec, DualRopeSpec};
     use crate::types::DType;
 
     fn make_test_graph(ops: Vec<OpKind>) -> CompilerGraph {
@@ -354,19 +354,17 @@ mod tests {
         let mut graph = CompilerGraph::default();
         let gemm_in = graph.add_tensor_concrete("gemm_in", &[1], DType::F32);
         let gemm_out = graph.add_tensor_concrete("gemm_out", &[1], DType::F32);
-        graph.add_op(
-            OpKind::Gemm { m: SymDim::Concrete(1), n: 4096, k: 4096, dtype: DType::F32, trans_b: false },
+        graph.add_op_with_op(Op::Gemm(GemmSpec { m: SymDim::Concrete(1), n: 4096, k: 4096, dtype: DType::F32, trans_b: false, has_bias: false }), OpKind::Gemm { m: SymDim::Concrete(1), n: 4096, k: 4096, dtype: DType::F32, trans_b: false },
             vec![gemm_in], vec![gemm_out], "final_proj",
         );
         let argmax_out = graph.add_tensor_concrete("argmax_out", &[1], DType::F32);
-        graph.add_op(
-            OpKind::Argmax { vocab_size: 32000 },
+        graph.add_op_with_op(Op::Argmax { vocab_size: 32000 }, OpKind::Argmax { vocab_size: 32000 },
             vec![gemm_out], vec![argmax_out], "argmax",
         );
         let store_out = graph.add_tensor_concrete("store_out", &[1], DType::F32);
-        graph.add_op(OpKind::StoreToken, vec![argmax_out], vec![store_out], "store");
+        graph.add_op_with_op(Op::StoreToken, OpKind::StoreToken, vec![argmax_out], vec![store_out], "store");
         let check_out = graph.add_tensor_concrete("check_out", &[1], DType::F32);
-        graph.add_op(OpKind::CheckStopCondition, vec![store_out], vec![check_out], "check");
+        graph.add_op_with_op(Op::CheckStopCondition, OpKind::CheckStopCondition, vec![store_out], vec![check_out], "check");
 
         let topo = GraphTopologyAnalysis::analyze(&graph);
 
