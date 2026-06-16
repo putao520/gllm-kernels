@@ -101,11 +101,8 @@ pub fn lower_qtap_stg(
             "lower_qtap_stg: q_dim must be > 0".into(),
         ));
     }
-    if dtype != DType::F32 {
-        return Err(CompilerError::CodegenViolation(format!(
-            "lower_qtap_stg: dtype {:?} not yet supported (CPU JIT Q-Tap: 当前仅支持 F32,多精度扩展待补)", dtype
-        )));
-    }
+    // dtype 从调用方传入，通过 to_quant_precision() 转换为 VmInstr 层面的 QuantPrecision
+    // 禁止硬编码 F32 限制，遵循 ARCH-DTYPE-JIT-TYPED 铁律
     if sink_ptr == 0 || step_index_ptr == 0 {
         return Err(CompilerError::CodegenViolation(
             "lower_qtap_stg: sink_ptr / step_index_ptr must be non-zero".into(),
@@ -113,6 +110,7 @@ pub fn lower_qtap_stg(
     }
 
     let elem = dtype.size_bytes();
+    let vp_dtype = dtype.to_quant_precision();
     let lanes = width.f32_lanes().max(1);
     let vec_step_bytes = lanes * elem;
     if q_dim % lanes != 0 {
@@ -182,12 +180,12 @@ pub fn lower_qtap_stg(
                 prog.emit(VmInstr::VecLoad {
                     dst: acc, base: src_row_ptr,
                     offset: OffsetExpr::LoopOffset(byte_off), width,
-                    dtype: QuantPrecision::F32, predicate: None,
+                    dtype: vp_dtype, predicate: None,
                 });
                 prog.emit(VmInstr::VecStore {
                     base: dst_base, offset: OffsetExpr::LoopOffset(byte_off),
                     src: acc, width,
-                    dtype: QuantPrecision::F32, predicate: None,
+                    dtype: vp_dtype, predicate: None,
                 });
             });
         }
@@ -209,12 +207,12 @@ pub fn lower_qtap_stg(
                     prog.emit(VmInstr::VecLoad {
                         dst: acc, base: src_row,
                         offset: OffsetExpr::LoopOffset(off), width,
-                        dtype: QuantPrecision::F32, predicate: None,
+                        dtype: vp_dtype, predicate: None,
                     });
                     prog.emit(VmInstr::VecStore {
                         base: dst_row, offset: OffsetExpr::LoopOffset(off),
                         src: acc, width,
-                        dtype: QuantPrecision::F32, predicate: None,
+                        dtype: vp_dtype, predicate: None,
                     });
                 });
             });
@@ -275,7 +273,7 @@ mod tests {
     #[test]
     fn computation_elem_bytes_returns_4() {
         // Arrange & Act
-        let bytes = computation_elem_bytes();
+        let bytes = computation_elem_bytes(QuantPrecision::F32);
         // Assert: f32 is 4 bytes
         assert_eq!(bytes, 4);
     }
@@ -283,7 +281,7 @@ mod tests {
     #[test]
     fn computation_elem_bytes_matches_sizeof_f32() {
         // Arrange & Act
-        let bytes = computation_elem_bytes();
+        let bytes = computation_elem_bytes(QuantPrecision::F32);
         // Assert: must always equal std::mem::size_of::<f32>()
         assert_eq!(bytes, std::mem::size_of::<f32>());
     }
@@ -295,7 +293,7 @@ mod tests {
         // Arrange
         let inner_dim = 1;
         // Act
-        let stride = row_stride_bytes(inner_dim);
+        let stride = row_stride_bytes(inner_dim, QuantPrecision::F32);
         // Assert: 1 * 4 = 4
         assert_eq!(stride, 4);
     }
@@ -305,7 +303,7 @@ mod tests {
         // Arrange
         let inner_dim = 256;
         // Act
-        let stride = row_stride_bytes(inner_dim);
+        let stride = row_stride_bytes(inner_dim, QuantPrecision::F32);
         // Assert: 256 * 4 = 1024
         assert_eq!(stride, 1024);
     }
@@ -315,7 +313,7 @@ mod tests {
         // Arrange
         let inner_dim = 0;
         // Act
-        let stride = row_stride_bytes(inner_dim);
+        let stride = row_stride_bytes(inner_dim, QuantPrecision::F32);
         // Assert: 0 * 4 = 0
         assert_eq!(stride, 0);
     }
@@ -392,28 +390,6 @@ mod tests {
         match err {
             CompilerError::CodegenViolation(msg) => {
                 assert!(msg.contains("q_dim must be > 0"), "unexpected message: {msg}");
-            }
-            other => panic!("expected CodegenViolation, got: {other:?}"),
-        }
-    }
-
-    #[test]
-    fn lower_qtap_stg_rejects_non_f32_dtype() {
-        // Arrange
-        let mut prog = VmProgram::new();
-        let q_input = prog.alloc_vreg(VRegKind::Ptr, SimdWidth::Scalar);
-        // Act: BF16 is not F32
-        let result = lower_qtap_stg(
-            &mut prog, 0x1000, 0x2000, DType::BF16, 8,
-            BoundExpr::Const(1), QTapPosition::LastToken, 2,
-            SimdWidth::W256, q_input,
-        );
-        // Assert
-        assert!(result.is_err());
-        let err = result.unwrap_err();
-        match err {
-            CompilerError::CodegenViolation(msg) => {
-                assert!(msg.contains("not yet supported"), "unexpected message: {msg}");
             }
             other => panic!("expected CodegenViolation, got: {other:?}"),
         }
@@ -612,28 +588,6 @@ mod tests {
     }
 
     #[test]
-    fn lower_qtap_stg_rejects_f16_dtype() {
-        // Arrange: F16 dtype is not F32
-        let mut prog = VmProgram::new();
-        let q_input = prog.alloc_vreg(VRegKind::Ptr, SimdWidth::Scalar);
-        // Act
-        let result = lower_qtap_stg(
-            &mut prog, 0x1000, 0x2000, DType::F16, 8,
-            BoundExpr::Const(1), QTapPosition::LastToken, 2,
-            SimdWidth::W256, q_input,
-        );
-        // Assert
-        assert!(result.is_err());
-        let err = result.unwrap_err();
-        match err {
-            CompilerError::CodegenViolation(msg) => {
-                assert!(msg.contains("not yet supported"), "unexpected message: {msg}");
-            }
-            other => panic!("expected CodegenViolation, got: {other:?}"),
-        }
-    }
-
-    #[test]
     fn lower_qtap_stg_last_token_emits_abs_addr_loadptr() {
         // Arrange: verify that AbsAddr(sink_ptr) and AbsAddr(step_index_ptr) appear in LoadPtr
         let mut prog = VmProgram::new();
@@ -658,14 +612,14 @@ mod tests {
 
     #[test]
     fn row_stride_bytes_large_inner_dim() {
-        let stride = row_stride_bytes(16384);
+        let stride = row_stride_bytes(16384, QuantPrecision::F32);
         assert_eq!(stride, 65536); // 16384 * 4
     }
 
     #[test]
     fn computation_elem_bytes_is_constexpr_f32() {
-        assert_eq!(computation_elem_bytes(), 4);
-        assert_eq!(computation_elem_bytes(), core::mem::size_of::<f32>());
+        assert_eq!(computation_elem_bytes(QuantPrecision::F32), 4);
+        assert_eq!(computation_elem_bytes(QuantPrecision::F32), core::mem::size_of::<f32>());
     }
 
     #[test]
@@ -698,24 +652,6 @@ mod tests {
         let stores = prog.instrs.iter().filter(|i| matches!(i, VmInstr::VecStore { .. })).count();
         assert!(loads > 0, "should have VecLoad instructions");
         assert!(stores > 0, "should have VecStore instructions");
-    }
-
-    #[test]
-    fn lower_qtap_stg_rejects_u8_dtype() {
-        let mut prog = VmProgram::new();
-        let q_input = prog.alloc_vreg(VRegKind::Ptr, SimdWidth::Scalar);
-        let result = lower_qtap_stg(
-            &mut prog, 0x1000, 0x2000, DType::U8, 8,
-            BoundExpr::Const(1), QTapPosition::LastToken, 2,
-            SimdWidth::W256, q_input,
-        );
-        assert!(result.is_err());
-        match result.unwrap_err() {
-            CompilerError::CodegenViolation(msg) => {
-                assert!(msg.contains("not yet supported"));
-            }
-            other => panic!("expected CodegenViolation, got: {other:?}"),
-        }
     }
 
     #[test]
