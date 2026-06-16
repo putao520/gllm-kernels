@@ -177,6 +177,46 @@ impl CompilerGraph {
         id
     }
 
+    /// Add a guarded operation with pre-constructed `Op` (OE-2 single-IR migration target).
+    ///
+    /// 与 `add_op_with_op` 对应的 guarded 版本，用于 layer 模板内带 LayerCondition 的 op。
+    /// `kind_fallback` 仅用于过渡期保留 CompilerOp.kind 字段（OE-4 删除字段时移除）。
+    pub fn add_op_guarded_with_op(
+        &mut self,
+        op: crate::compiler::graph::Op,
+        kind_fallback: OpKind,
+        inputs: Vec<TensorId>,
+        outputs: Vec<TensorId>,
+        label: &str,
+        guard: LayerCondition,
+    ) -> OpId {
+        let id = OpId(self.next_op_id);
+        self.next_op_id += 1;
+
+        for &tid in &outputs {
+            if let Some(t) = self.tensor_mut(tid) {
+                t.producer = Some(id);
+            }
+        }
+        for &tid in &inputs {
+            if let Some(t) = self.tensor_mut(tid) {
+                t.consumers.push(id);
+            }
+        }
+
+        let final_op = CompilerOp {
+            id,
+            kind: kind_fallback,
+            inputs: inputs.clone(),
+            outputs: outputs.clone(),
+            label: label.to_string(),
+            guard,
+            op_v2: Some(op),
+        };
+        self.ops.push(final_op);
+        id
+    }
+
     /// Get tensor metadata by ID.
     pub fn tensor(&self, id: TensorId) -> Option<&TensorMeta> {
         self.tensors.iter().find(|t| t.id == id)
