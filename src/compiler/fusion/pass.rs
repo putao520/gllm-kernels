@@ -3,7 +3,7 @@
 //! Uses SemanticDAG OpClass for classification instead of hand-maintained OpSemantics.
 
 use std::collections::{HashMap, HashSet};
-use crate::compiler::graph::{CompilerGraph, CompilerOp, Op, OpKind, OpId, MultiOutputConfig};
+use crate::compiler::graph::{CompilerGraph, CompilerOp, Op, OpId, MultiOutputConfig};
 use crate::compiler::semantic_dag::{SemanticDAG, OpClass, Bottleneck};
 use crate::compiler::registry::ScalarOpRegistry;
 use super::types::{FusionGroup, FusionMode, FusionPlan, GroupMarker, ComputeDensity};

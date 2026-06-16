@@ -977,7 +977,6 @@ mod tests {
         let profile = DeviceProfile::detect();
         let exec_plan = ExecutionPlan::from_profile(&profile);
         let trace = OpTrace {
-            op_kind: crate::compiler::graph::OpKind::Gemm { m: crate::compiler::graph::SymDim::Concrete(1024), n: 1024, k: 1024, dtype: DType::F32, trans_b: false },
             pattern: ComputePattern::Gemm,
             signature: ScalarFnSignature {
                 fn_ptr: std::ptr::null(),
@@ -1015,7 +1014,6 @@ mod tests {
             TraceOp::Div(ValueId(0), ValueId(4)),
         ];
         let trace = OpTrace {
-            op_kind: crate::compiler::graph::OpKind::Silu,
             pattern: ComputePattern::Elementwise { body },
             signature: ScalarFnSignature {
                 fn_ptr: std::ptr::null(),

@@ -17,9 +17,7 @@ impl ScalarOpRegistry {
         reg.register_with_symexec_fallback(
             OpKindKey::Silu,
             silu_sig.clone(),
-            OpKind::Silu,
             OpTrace {
-                op_kind: OpKind::Silu,
                 pattern: ComputePattern::Elementwise {
                     body: vec![
                         TraceOp::Input(0),   // [0] v
@@ -44,9 +42,7 @@ impl ScalarOpRegistry {
         reg.register_with_symexec_fallback(
             OpKindKey::Gelu,
             gelu_sig.clone(),
-            OpKind::Gelu,
             OpTrace {
-                op_kind: OpKind::Gelu,
                 pattern: ComputePattern::Elementwise {
                     body: vec![
                         TraceOp::Input(0),
@@ -77,9 +73,7 @@ impl ScalarOpRegistry {
         reg.register_with_symexec_fallback(
             OpKindKey::Tanh,
             tanh_sig.clone(),
-            OpKind::Tanh,
             OpTrace {
-                op_kind: OpKind::Tanh,
                 pattern: ComputePattern::Elementwise {
                     body: vec![
                         TraceOp::Input(0), // [0] x
@@ -103,9 +97,7 @@ impl ScalarOpRegistry {
         reg.register_with_symexec_fallback(
             OpKindKey::SwiGlu,
             swiglu_sig.clone(),
-            OpKind::SwiGlu,
             OpTrace {
-                op_kind: OpKind::SwiGlu,
                 pattern: ComputePattern::BinaryElementwise {
                     body: vec![
                         TraceOp::Input(0),   // [0] gate
@@ -160,7 +152,6 @@ impl ScalarOpRegistry {
         reg.inject_trace(
             OpKindKey::SwiGluClipped,
             OpTrace {
-                op_kind: OpKind::SwiGluClipped { limit: 7.0 },
                 pattern: ComputePattern::BinaryElementwise {
                     body: vec![
                         TraceOp::Input(0),     // [0] gate_raw
@@ -196,9 +187,7 @@ impl ScalarOpRegistry {
         reg.register_with_symexec_fallback(
             OpKindKey::GeGlu,
             geglu_sig.clone(),
-            OpKind::GeGlu,
             OpTrace {
-                op_kind: OpKind::GeGlu,
                 pattern: ComputePattern::BinaryElementwise {
                     body: vec![
                         TraceOp::Input(0),            // [0] gate
@@ -236,9 +225,7 @@ impl ScalarOpRegistry {
         reg.register_with_symexec_fallback(
             OpKindKey::Add,
             add_sig.clone(),
-            OpKind::Add,
             OpTrace {
-                op_kind: OpKind::Add,
                 pattern: ComputePattern::BinaryElementwise {
                     body: vec![
                         TraceOp::Input(0),  // [0] a
@@ -263,9 +250,7 @@ impl ScalarOpRegistry {
         reg.register_with_symexec_fallback(
             OpKindKey::Mul,
             mul_sig.clone(),
-            OpKind::Mul,
             OpTrace {
-                op_kind: OpKind::Mul,
                 pattern: ComputePattern::BinaryElementwise {
                     body: vec![
                         TraceOp::Input(0),  // [0] a
@@ -290,9 +275,7 @@ impl ScalarOpRegistry {
         reg.register_with_symexec_fallback(
             OpKindKey::Residual,
             residual_sig.clone(),
-            OpKind::Residual,
             OpTrace {
-                op_kind: OpKind::Residual,
                 pattern: ComputePattern::BinaryElementwise {
                     body: vec![
                         TraceOp::Input(0),  // [0] x
@@ -322,9 +305,7 @@ impl ScalarOpRegistry {
             reg.register_with_symexec_fallback(
                 OpKindKey::LogitSoftcap,
                 softcap_sig.clone(),
-                OpKind::LogitSoftcap { cap: cap_placeholder_f32 },
                 OpTrace {
-                    op_kind: OpKind::LogitSoftcap { cap: cap_placeholder_f32 },
                     pattern: ComputePattern::Elementwise {
                         body: vec![
                             TraceOp::Input(0),                   // [0] x
@@ -350,9 +331,7 @@ impl ScalarOpRegistry {
         reg.register_with_symexec_fallback(
             OpKindKey::Softmax,
             softmax_sig.clone(),
-            OpKind::Softmax,
             OpTrace {
-                op_kind: OpKind::Softmax,
                 pattern: ComputePattern::Reduction {
                     identity: f64::NEG_INFINITY,
                     combine: vec![
@@ -399,9 +378,7 @@ impl ScalarOpRegistry {
         reg.register_with_symexec_fallback(
             OpKindKey::RmsNorm,
             rms_sig.clone(),
-            OpKind::RmsNorm { feature_dim: 0, eps: default_eps },
             OpTrace {
-                op_kind: OpKind::RmsNorm { feature_dim: 0, eps: 1e-5 }, // default eps; actual value comes from graph OpKind at compile time
                 pattern: ComputePattern::NormLike {
                     reduce: vec![
                         TraceOp::Input(0),  // [0] x
@@ -444,9 +421,7 @@ impl ScalarOpRegistry {
         reg.register_with_symexec_fallback(
             OpKindKey::HeadRmsNorm,
             head_rms_sig.clone(),
-            OpKind::HeadRmsNorm { head_dim: 0, eps: default_eps },
             OpTrace {
-                op_kind: OpKind::HeadRmsNorm { head_dim: 0, eps: 1e-5 },
                 pattern: ComputePattern::NormLike {
                     reduce: vec![
                         TraceOp::Input(0),
@@ -485,9 +460,7 @@ impl ScalarOpRegistry {
         reg.register_with_symexec_fallback(
             OpKindKey::ValueNorm,
             vnorm_sig.clone(),
-            OpKind::ValueNorm { feature_dim: 0, eps: default_eps },
             OpTrace {
-                op_kind: OpKind::ValueNorm { feature_dim: 0, eps: 1e-5 },
                 pattern: ComputePattern::NormLike {
                     reduce: vec![
                         TraceOp::Input(0),  // [0] x
@@ -526,9 +499,7 @@ impl ScalarOpRegistry {
         reg.register_with_symexec_fallback(
             OpKindKey::LayerNorm,
             ln_sig.clone(),
-            OpKind::LayerNorm { feature_dim: 0, eps: default_eps },
             OpTrace {
-                op_kind: OpKind::LayerNorm { feature_dim: 0, eps: 1e-5 }, // default eps; actual value comes from graph OpKind at compile time
                 pattern: ComputePattern::NormLike {
                     reduce: vec![
                         TraceOp::Input(0), // [0] x  (used for both mean and variance)
@@ -571,9 +542,7 @@ impl ScalarOpRegistry {
         reg.register_with_symexec_fallback(
             OpKindKey::Gemm,
             gemm_sig.clone(),
-            OpKind::Gemm { m: crate::compiler::graph::SymDim::Concrete(0), n: 0, k: 0, dtype: DType::F32, trans_b: false },
             OpTrace {
-                op_kind: OpKind::Gemm { m: crate::compiler::graph::SymDim::Concrete(0), n: 0, k: 0, dtype: DType::F32, trans_b: false },
                 pattern: ComputePattern::Gemm,
                 signature: gemm_sig,
             },
@@ -595,9 +564,7 @@ impl ScalarOpRegistry {
         reg.register_with_symexec_fallback(
             OpKindKey::RoPE,
             rope_sig.clone(),
-            OpKind::RoPE { num_heads: 0, head_dim: 0, theta: 0.0, partial: 1.0, rope_scaling: None },
             OpTrace {
-                op_kind: OpKind::RoPE { num_heads: 0, head_dim: 0, theta: 0.0, partial: 1.0, rope_scaling: None },
                 pattern: ComputePattern::Injective {
                     body: vec![
                         TraceOp::Input(0),  // [0] x0
@@ -634,9 +601,7 @@ impl ScalarOpRegistry {
         reg.register_with_symexec_fallback(
             OpKindKey::GemmBias,
             gemm_bias_sig.clone(),
-            OpKind::GemmBias { m: crate::compiler::graph::SymDim::Concrete(0), n: 0, k: 0, dtype: DType::F32, trans_b: false },
             OpTrace {
-                op_kind: OpKind::GemmBias { m: crate::compiler::graph::SymDim::Concrete(0), n: 0, k: 0, dtype: DType::F32, trans_b: false },
                 pattern: ComputePattern::Gemm,
                 signature: gemm_bias_sig,
             },
@@ -658,9 +623,7 @@ impl ScalarOpRegistry {
         reg.register_with_symexec_fallback(
             OpKindKey::MultiHeadAttention,
             mha_sig.clone(),
-            OpKind::MultiHeadAttention { seq_len: crate::compiler::graph::SymDim::Concrete(1), num_heads: 1, num_kv_heads: 1, head_dim: 1, causal: true, attention_sinks: false, kv_source: crate::compiler::graph::KvSource::FromTensor },
             OpTrace {
-                op_kind: OpKind::MultiHeadAttention { seq_len: crate::compiler::graph::SymDim::Concrete(1), num_heads: 1, num_kv_heads: 1, head_dim: 1, causal: true, attention_sinks: false, kv_source: crate::compiler::graph::KvSource::FromTensor },
                 pattern: ComputePattern::Gemm,
                 signature: mha_sig,
             },
@@ -679,9 +642,7 @@ impl ScalarOpRegistry {
         reg.register_with_symexec_fallback(
             OpKindKey::Transpose,
             transpose_sig.clone(),
-            OpKind::Transpose { perm: vec![1, 0] },
             OpTrace {
-                op_kind: OpKind::Transpose { perm: vec![1, 0] },
                 pattern: ComputePattern::Injective {
                     body: vec![],
                     num_inputs: 1,
@@ -703,9 +664,7 @@ impl ScalarOpRegistry {
         reg.register_with_symexec_fallback(
             OpKindKey::Reshape,
             reshape_sig.clone(),
-            OpKind::Reshape { target_shape: vec![] },
             OpTrace {
-                op_kind: OpKind::Reshape { target_shape: vec![] },
                 pattern: ComputePattern::Injective {
                     body: vec![],
                     num_inputs: 1,
@@ -732,9 +691,7 @@ impl ScalarOpRegistry {
         reg.register_with_symexec_fallback(
             OpKindKey::QuantGemm,
             quant_gemm_sig.clone(),
-            OpKind::QuantGemm { m: crate::compiler::graph::SymDim::Concrete(0), n: 0, k: 0, quant_type: crate::quant::QuantType::Q4_0 },
             OpTrace {
-                op_kind: OpKind::QuantGemm { m: crate::compiler::graph::SymDim::Concrete(0), n: 0, k: 0, quant_type: crate::quant::QuantType::Q4_0 },
                 pattern: ComputePattern::Gemm,
                 signature: quant_gemm_sig,
             },
@@ -758,9 +715,7 @@ impl ScalarOpRegistry {
         reg.register_with_symexec_fallback(
             OpKindKey::Dequantize,
             dequant_sig.clone(),
-            OpKind::Dequantize { num_elements: 0, block_size: 32, bits: 4 },
             OpTrace {
-                op_kind: OpKind::Dequantize { num_elements: 0, block_size: 32, bits: 4 },
                 pattern: ComputePattern::QuantDecode {
                     block_size: 32,
                     decode: vec![
@@ -807,7 +762,6 @@ impl ScalarOpRegistry {
         reg.inject_trace(
             OpKindKey::DequantizeMxfp4,
             OpTrace {
-                op_kind: OpKind::Dequantize { num_elements: 0, block_size: 32, bits: 4 },
                 pattern: ComputePattern::QuantDecode {
                     block_size: 32,
                     decode: vec![
@@ -836,9 +790,7 @@ impl ScalarOpRegistry {
         reg.register_with_symexec_fallback(
             OpKindKey::MeanPool,
             meanpool_sig.clone(),
-            OpKind::MeanPool { seq_len: 1, hidden: 1, cls_mode: false },
             OpTrace {
-                op_kind: OpKind::MeanPool { seq_len: 1, hidden: 1, cls_mode: false },
                 pattern: ComputePattern::Reduction {
                     identity: 0.0,
                     combine: vec![
@@ -865,9 +817,7 @@ impl ScalarOpRegistry {
         reg.register_with_symexec_fallback(
             OpKindKey::L2Normalize,
             l2norm_sig.clone(),
-            OpKind::L2Normalize { hidden: 0 },
             OpTrace {
-                op_kind: OpKind::L2Normalize { hidden: 0 },
                 pattern: ComputePattern::NormLike {
                     reduce: vec![
                         TraceOp::Input(0),  // [0] x
@@ -903,9 +853,7 @@ impl ScalarOpRegistry {
         reg.register_with_symexec_fallback(
             OpKindKey::QkNorm,
             qk_norm_sig.clone(),
-            OpKind::QkNorm { head_dim: 0, eps: 1e-6 },
             OpTrace {
-                op_kind: OpKind::QkNorm { head_dim: 0, eps: 1e-6 },
                 pattern: ComputePattern::NormLike {
                     reduce: vec![
                         TraceOp::Input(0),  // [0] x
@@ -949,9 +897,7 @@ impl ScalarOpRegistry {
         reg.register_with_symexec_fallback(
             OpKindKey::CachedGQA,
             cached_gqa_sig.clone(),
-            OpKind::CachedGQA { seq_len: 1, total_seq: 1, num_heads: 1, num_kv_heads: 1, head_dim: 1, strategy: crate::compiler::graph::AttentionStrategy::Naive, kv_dtype: crate::types::DType::F32, kv_source: crate::compiler::graph::KvSource::FromTensor },
             OpTrace {
-                op_kind: OpKind::CachedGQA { seq_len: 1, total_seq: 1, num_heads: 1, num_kv_heads: 1, head_dim: 1, strategy: crate::compiler::graph::AttentionStrategy::Naive, kv_dtype: crate::types::DType::F32, kv_source: crate::compiler::graph::KvSource::FromTensor },
                 pattern: ComputePattern::Gemm,
                 signature: cached_gqa_sig,
             },
@@ -972,9 +918,7 @@ impl ScalarOpRegistry {
         reg.register_with_symexec_fallback(
             OpKindKey::MoEGate,
             moe_gate_sig.clone(),
-            OpKind::MoEGate { seq_len: 1, num_experts: 1, hidden: 1, top_k: 2 },
             OpTrace {
-                op_kind: OpKind::MoEGate { seq_len: 1, num_experts: 1, hidden: 1, top_k: 2 },
                 pattern: ComputePattern::Gemm,
                 signature: moe_gate_sig,
             },
@@ -994,9 +938,7 @@ impl ScalarOpRegistry {
         reg.register_with_symexec_fallback(
             OpKindKey::TopK,
             topk_sig.clone(),
-            OpKind::TopK { seq_len: 1, num_experts: 1, top_k: 1 },
             OpTrace {
-                op_kind: OpKind::TopK { seq_len: 1, num_experts: 1, top_k: 1 },
                 pattern: ComputePattern::Reduction {
                     identity: f64::NEG_INFINITY,
                     combine: vec![
@@ -1031,9 +973,7 @@ impl ScalarOpRegistry {
         reg.register_with_symexec_fallback(
             OpKindKey::WeightedSum,
             wsum_sig.clone(),
-            OpKind::WeightedSum { seq_len: 1, hidden: 1, top_k: 1 },
             OpTrace {
-                op_kind: OpKind::WeightedSum { seq_len: 1, hidden: 1, top_k: 1 },
                 pattern: ComputePattern::Injective {
                     body: vec![
                         TraceOp::Input(0),  // weight
@@ -1065,9 +1005,7 @@ impl ScalarOpRegistry {
         reg.register_with_symexec_fallback(
             OpKindKey::GateMask,
             gate_mask_sig.clone(),
-            OpKind::GateMask { hidden: 1 },
             OpTrace {
-                op_kind: OpKind::GateMask { hidden: 1 },
                 pattern: ComputePattern::Elementwise {
                     body: vec![
                         TraceOp::Input(0),    // gate logit
@@ -1093,9 +1031,7 @@ impl ScalarOpRegistry {
         reg.register_with_symexec_fallback(
             OpKindKey::AttentionSkipMask,
             attn_skip_sig.clone(),
-            OpKind::AttentionSkipMask { seq_len: SymDim::Concrete(1), threshold: 0.0 },
             OpTrace {
-                op_kind: OpKind::AttentionSkipMask { seq_len: SymDim::Concrete(1), threshold: 0.0 },
                 pattern: ComputePattern::Elementwise {
                     body: vec![
                         TraceOp::Input(0),    // entropy value
@@ -1121,9 +1057,7 @@ impl ScalarOpRegistry {
         reg.register_with_symexec_fallback(
             OpKindKey::LayerBypass,
             layer_bypass_sig.clone(),
-            OpKind::LayerBypass { threshold: 0.001 },
             OpTrace {
-                op_kind: OpKind::LayerBypass { threshold: 0.001 },
                 pattern: ComputePattern::Elementwise {
                     body: vec![
                         TraceOp::Input(0),    // delta_rho
@@ -1147,9 +1081,7 @@ impl ScalarOpRegistry {
         reg.register_with_symexec_fallback(
             OpKindKey::ResidualWithTelemetry,
             residual_tel_sig.clone(),
-            OpKind::ResidualWithTelemetry { hidden: 1 },
             OpTrace {
-                op_kind: OpKind::ResidualWithTelemetry { hidden: 1 },
                 pattern: ComputePattern::BinaryElementwise {
                     body: vec![
                         TraceOp::Input(0),  // x_in
@@ -1172,9 +1104,7 @@ impl ScalarOpRegistry {
         reg.register_with_symexec_fallback(
             OpKindKey::MoEConditionalAdd,
             moe_cond_sig.clone(),
-            OpKind::MoEConditionalAdd { seq_len: SymDim::Concrete(1), hidden: 1, num_experts: 1, expert_idx: 0 },
             OpTrace {
-                op_kind: OpKind::MoEConditionalAdd { seq_len: SymDim::Concrete(1), hidden: 1, num_experts: 1, expert_idx: 0 },
                 pattern: ComputePattern::BinaryElementwise {
                     body: vec![
                         TraceOp::Input(0),  // accumulator
@@ -1198,9 +1128,7 @@ impl ScalarOpRegistry {
         reg.register_with_symexec_fallback(
             OpKindKey::SoftmaxWithEntropy,
             softmax_ent_sig.clone(),
-            OpKind::SoftmaxWithEntropy { vocab_size: 1 },
             OpTrace {
-                op_kind: OpKind::SoftmaxWithEntropy { vocab_size: 1 },
                 pattern: ComputePattern::NormLike {
                     reduce: vec![
                         TraceOp::Input(0),  // x
@@ -1232,9 +1160,7 @@ impl ScalarOpRegistry {
         reg.register_with_symexec_fallback(
             OpKindKey::FusedRmsNormGemm,
             fused_rn_gemm_sig.clone(),
-            OpKind::FusedRmsNormGemm { m: SymDim::Concrete(1), n: 1, k: 1, eps: 1e-6, dtype: DType::F32, trans_b: false },
             OpTrace {
-                op_kind: OpKind::FusedRmsNormGemm { m: SymDim::Concrete(1), n: 1, k: 1, eps: 1e-6, dtype: DType::F32, trans_b: false },
                 pattern: ComputePattern::Gemm,
                 signature: fused_rn_gemm_sig,
             },
@@ -1252,9 +1178,7 @@ impl ScalarOpRegistry {
         reg.register_with_symexec_fallback(
             OpKindKey::MaskedGemm,
             masked_gemm_sig.clone(),
-            OpKind::MaskedGemm { m: SymDim::Concrete(1), n: 1, k: 1, dtype: DType::F32, trans_b: false },
             OpTrace {
-                op_kind: OpKind::MaskedGemm { m: SymDim::Concrete(1), n: 1, k: 1, dtype: DType::F32, trans_b: false },
                 pattern: ComputePattern::Gemm,
                 signature: masked_gemm_sig,
             },
@@ -1273,9 +1197,7 @@ impl ScalarOpRegistry {
         reg.register_with_symexec_fallback(
             OpKindKey::EntropyGate,
             entropy_gate_sig.clone(),
-            OpKind::EntropyGate { seq_len: SymDim::Concrete(1), vocab_size: 1, entropy_threshold: 0.0 },
             OpTrace {
-                op_kind: OpKind::EntropyGate { seq_len: SymDim::Concrete(1), vocab_size: 1, entropy_threshold: 0.0 },
                 pattern: ComputePattern::Elementwise {
                     body: vec![
                         TraceOp::Input(0),    // entropy
@@ -1303,9 +1225,7 @@ impl ScalarOpRegistry {
         reg.register_with_symexec_fallback(
             OpKindKey::VRangeQuant,
             vrange_sig.clone(),
-            OpKind::VRangeQuant { seq_len: SymDim::Concrete(1), kv_dim: 1, block_size: 32, range_threshold: 0.0 },
             OpTrace {
-                op_kind: OpKind::VRangeQuant { seq_len: SymDim::Concrete(1), kv_dim: 1, block_size: 32, range_threshold: 0.0 },
                 pattern: ComputePattern::Injective {
                     body: vec![
                         TraceOp::Input(0),    // value
@@ -1332,9 +1252,7 @@ impl ScalarOpRegistry {
         reg.register_with_symexec_fallback(
             OpKindKey::KvCentroidPrefetch,
             prefetch_sig.clone(),
-            OpKind::KvCentroidPrefetch { seq_len: SymDim::Concrete(1), num_heads: 1, head_dim: 1, prefetch_distance: 1 },
             OpTrace {
-                op_kind: OpKind::KvCentroidPrefetch { seq_len: SymDim::Concrete(1), num_heads: 1, head_dim: 1, prefetch_distance: 1 },
                 pattern: ComputePattern::Injective {
                     body: vec![
                         TraceOp::Input(0),  // centroid position
@@ -1360,9 +1278,7 @@ impl ScalarOpRegistry {
         reg.register_with_symexec_fallback(
             OpKindKey::VariableLengthBatch,
             vlb_sig.clone(),
-            OpKind::VariableLengthBatch,
             OpTrace {
-                op_kind: OpKind::VariableLengthBatch,
                 pattern: ComputePattern::Injective {
                     body: vec![
                         TraceOp::Input(0),  // ragged input
@@ -1389,12 +1305,10 @@ impl ScalarOpRegistry {
                 ScalarParam::Dim(2),    // hidden
             ],
         };
-        let altup_pred_kind = OpKind::AltUpPredict { seq_len: SymDim::Concrete(1), num_preds: 2, hidden: 1 };
         reg.register(OpKindKey::AltUpPredict, altup_pred_sig);
         reg.inject_trace(
             OpKindKey::AltUpPredict,
             OpTrace {
-                op_kind: altup_pred_kind,
                 pattern: ComputePattern::Injective {
                     body: vec![TraceOp::Input(0), TraceOp::Input(1)],
                     num_inputs: 2,
@@ -1417,12 +1331,10 @@ impl ScalarOpRegistry {
                 ScalarParam::Dim(2),    // hidden
             ],
         };
-        let altup_corr_kind = OpKind::AltUpCorrect { seq_len: SymDim::Concrete(1), num_preds: 2, hidden: 1 };
         reg.register(OpKindKey::AltUpCorrect, altup_corr_sig);
         reg.inject_trace(
             OpKindKey::AltUpCorrect,
             OpTrace {
-                op_kind: altup_corr_kind,
                 pattern: ComputePattern::Injective {
                     body: vec![TraceOp::Input(0), TraceOp::Input(1), TraceOp::Input(2)],
                     num_inputs: 3,
@@ -1444,12 +1356,10 @@ impl ScalarOpRegistry {
                 ScalarParam::Dim(2),    // hidden
             ],
         };
-        let altup_inj_kind = OpKind::AltUpInject { seq_len: SymDim::Concrete(1), num_preds: 2, hidden: 1 };
         reg.register(OpKindKey::AltUpInject, altup_inj_sig);
         reg.inject_trace(
             OpKindKey::AltUpInject,
             OpTrace {
-                op_kind: altup_inj_kind,
                 pattern: ComputePattern::Injective {
                     body: vec![TraceOp::Input(0), TraceOp::Input(1)],
                     num_inputs: 2,
@@ -1478,17 +1388,10 @@ impl ScalarOpRegistry {
                 ScalarParam::Scalar(1.0), // causal flag (u32 作为 f32 占位;真实传参由 JIT ABI 决定)
             ],
         };
-        let dw_default_kind = OpKind::DepthwiseConv1D {
-            channels: 1,
-            kernel_size: 1,
-            causal: true,
-        };
         reg.register_with_symexec_fallback(
             OpKindKey::DepthwiseConv1D,
             dw_sig.clone(),
-            dw_default_kind.clone(),
             OpTrace {
-                op_kind: dw_default_kind,
                 pattern: ComputePattern::Injective {
                     body: vec![
                         TraceOp::Input(0), // x
@@ -1520,18 +1423,10 @@ impl ScalarOpRegistry {
                 ScalarParam::Dim(3),    // image_size
             ],
         };
-        let pe_default_kind = OpKind::PatchEmbed {
-            patch_size: 1,
-            embed_dim: 1,
-            in_channels: 1,
-            image_size: 1,
-        };
         reg.register_with_symexec_fallback(
             OpKindKey::PatchEmbed,
             pe_sig.clone(),
-            pe_default_kind.clone(),
             OpTrace {
-                op_kind: pe_default_kind,
                 pattern: ComputePattern::Injective {
                     body: vec![
                         TraceOp::Input(0), // image
@@ -1561,16 +1456,10 @@ impl ScalarOpRegistry {
                 ScalarParam::Dim(1),    // embed_dim
             ],
         };
-        let lp_default_kind = OpKind::LearnedPos2D {
-            num_patches: 1,
-            embed_dim: 1,
-        };
         reg.register_with_symexec_fallback(
             OpKindKey::LearnedPos2D,
             lp_sig.clone(),
-            lp_default_kind.clone(),
             OpTrace {
-                op_kind: lp_default_kind,
                 pattern: ComputePattern::BinaryElementwise {
                     body: vec![
                         TraceOp::Input(0),   // [0] patches[p, d]
@@ -1603,15 +1492,6 @@ impl ScalarOpRegistry {
         reg.inject_trace(
             OpKindKey::MoEDispatchPacked,
             OpTrace {
-                op_kind: OpKind::MoEDispatchPacked {
-                    num_experts: 1,
-                    top_k: 1,
-                    mxfp4_block_size: 32,
-                    swiglu_limit: 7.0,
-                    intermediate_size: 1,
-                    hidden: 1,
-                    seq_len: SymDim::Concrete(1),
-                },
                 // Opaque 复合算子,这里用 Gemm 占位 (表示有 heavy compute),真正 lower
                 // 走 plan_lower 专用分支,不读取此 pattern。
                 pattern: ComputePattern::Gemm,
@@ -1639,12 +1519,6 @@ impl ScalarOpRegistry {
         reg.inject_trace(
             OpKindKey::MoERouter,
             OpTrace {
-                op_kind: OpKind::MoERouter {
-                    num_experts: 1,
-                    top_k: 1,
-                    hidden: 1,
-                    seq_len: SymDim::Concrete(1),
-                },
                 pattern: ComputePattern::Gemm,
                 signature: moe_router_sig,
             },
@@ -1660,7 +1534,6 @@ impl ScalarOpRegistry {
         reg.inject_trace(
             OpKindKey::Argmax,
             OpTrace {
-                op_kind: OpKind::Argmax { vocab_size: 0 },
                 pattern: ComputePattern::Reduction {
                     identity: f64::NEG_INFINITY,
                     combine: vec![
@@ -1694,13 +1567,6 @@ impl ScalarOpRegistry {
         reg.inject_trace(
             OpKindKey::Gather,
             OpTrace {
-                op_kind: OpKind::Gather {
-                    table_rows: 0,
-                    embed_dim: 0,
-                    index_dim: SymDim::Concrete(0),
-                    indices_kind: crate::compiler::graph::GatherIndicesKind::Tensor,
-                    scale: None,
-                },
                 pattern: ComputePattern::Injective {
                     body: vec![
                         TraceOp::Input(0), // indices
@@ -1732,12 +1598,6 @@ impl ScalarOpRegistry {
         reg.inject_trace(
             OpKindKey::ColumnSlice,
             OpTrace {
-                op_kind: OpKind::ColumnSlice {
-                    seq_len: SymDim::Concrete(0),
-                    input_inner: 0,
-                    start: 0,
-                    slice_dim: 0,
-                },
                 pattern: ComputePattern::Injective {
                     body: vec![
                         TraceOp::Input(0), // input
@@ -1775,7 +1635,6 @@ impl ScalarOpRegistry {
         reg.inject_trace(
             OpKindKey::QuantGather,
             OpTrace {
-                op_kind: OpKind::QuantGather { quant_type: crate::quant::QuantType::Q4_0, vocab_size: 0, hidden_dim: 0, index_dim: crate::compiler::graph::SymDim::Concrete(1), scale: None },
                 pattern: ComputePattern::Injective {
                     body: build_quant_gather_trace(crate::quant::QuantType::Q4_0, 0, 0),
                     num_inputs: 3,
@@ -1800,7 +1659,6 @@ impl ScalarOpRegistry {
         reg.inject_trace(
             OpKindKey::StoreToken,
             OpTrace {
-                op_kind: OpKind::StoreToken,
                 pattern: ComputePattern::Injective {
                     body: vec![TraceOp::Input(0)],
                     num_inputs: 1,
@@ -1819,7 +1677,6 @@ impl ScalarOpRegistry {
         reg.inject_trace(
             OpKindKey::CheckStopCondition,
             OpTrace {
-                op_kind: OpKind::CheckStopCondition,
                 pattern: ComputePattern::Injective {
                     body: vec![TraceOp::Input(0)],
                     num_inputs: 1,
@@ -1838,7 +1695,6 @@ impl ScalarOpRegistry {
         reg.inject_trace(
             OpKindKey::WriteLogits,
             OpTrace {
-                op_kind: OpKind::WriteLogits { target_indices: vec![] },
                 pattern: ComputePattern::Injective {
                     body: vec![TraceOp::Input(0)],
                     num_inputs: 1,
@@ -1857,7 +1713,6 @@ impl ScalarOpRegistry {
         reg.inject_trace(
             OpKindKey::EarlyExit,
             OpTrace {
-                op_kind: OpKind::EarlyExit { anchor_layer: 0 },
                 pattern: ComputePattern::Injective {
                     body: vec![TraceOp::Input(0)],
                     num_inputs: 1,
@@ -1876,7 +1731,6 @@ impl ScalarOpRegistry {
         reg.inject_trace(
             OpKindKey::GuardrailCheck,
             OpTrace {
-                op_kind: OpKind::GuardrailCheck { probe_offset: 0 },
                 pattern: ComputePattern::Injective {
                     body: vec![TraceOp::Input(0)],
                     num_inputs: 1,
@@ -1895,7 +1749,6 @@ impl ScalarOpRegistry {
         reg.inject_trace(
             OpKindKey::SgInject,
             OpTrace {
-                op_kind: OpKind::SgInject { knowledge_offset: 0, dim: 0 },
                 pattern: ComputePattern::Injective {
                     body: vec![TraceOp::Input(0)],
                     num_inputs: 1,
@@ -1914,7 +1767,6 @@ impl ScalarOpRegistry {
         reg.inject_trace(
             OpKindKey::SgDetect,
             OpTrace {
-                op_kind: OpKind::SgDetect { detect_offset: 0, hidden_dim: 0 },
                 pattern: ComputePattern::Injective {
                     body: vec![TraceOp::Input(0)],
                     num_inputs: 1,
@@ -1933,7 +1785,6 @@ impl ScalarOpRegistry {
         reg.inject_trace(
             OpKindKey::CotStepCheck,
             OpTrace {
-                op_kind: OpKind::CotStepCheck { shared_mem_offset: 0 },
                 pattern: ComputePattern::Injective {
                     body: vec![TraceOp::Input(0)],
                     num_inputs: 1,
@@ -1952,7 +1803,6 @@ impl ScalarOpRegistry {
         reg.inject_trace(
             OpKindKey::SessionKvRestore,
             OpTrace {
-                op_kind: OpKind::SessionKvRestore,
                 pattern: ComputePattern::Injective {
                     body: vec![TraceOp::Input(0)],
                     num_inputs: 1,
@@ -1971,7 +1821,6 @@ impl ScalarOpRegistry {
         reg.inject_trace(
             OpKindKey::MmHiddenInject,
             OpTrace {
-                op_kind: OpKind::MmHiddenInject { hidden_dim: 0 },
                 pattern: ComputePattern::Injective {
                     body: vec![TraceOp::Input(0)],
                     num_inputs: 1,
@@ -1993,7 +1842,6 @@ impl ScalarOpRegistry {
         reg.inject_trace(
             OpKindKey::MtpDraft,
             OpTrace {
-                op_kind: OpKind::MtpDraft { depth: 1, hidden_size: 1, vocab_size: 1 },
                 pattern: ComputePattern::Injective {
                     body: vec![
                         TraceOp::Input(0),  // hidden_ptr

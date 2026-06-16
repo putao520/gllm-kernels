@@ -218,15 +218,15 @@ mod tests {
         let reg = ScalarOpRegistry::with_defaults();
 
         let test_keys = [
-            (OpKindKey::Silu, OpKind::Silu),
-            (OpKindKey::Gelu, OpKind::Gelu),
-            (OpKindKey::Add, OpKind::Add),
-            (OpKindKey::Mul, OpKind::Mul),
-            (OpKindKey::RmsNorm, OpKind::RmsNorm { feature_dim: 4096, eps: 1e-5 }),
-            (OpKindKey::Softmax, OpKind::Softmax),
+            OpKindKey::Silu,
+            OpKindKey::Gelu,
+            OpKindKey::Add,
+            OpKindKey::Mul,
+            OpKindKey::RmsNorm,
+            OpKindKey::Softmax,
         ];
 
-        for (key, op_kind) in &test_keys {
+        for key in &test_keys {
             let sig = reg.get_signature(key).expect("missing signature");
 
             // Try symexec path on a fresh registry
@@ -234,15 +234,14 @@ mod tests {
             let result = fresh.auto_register_from_symexec(
                 key.clone(),
                 sig.clone(),
-                op_kind.clone(),
             );
 
             // Either succeeds or returns a well-formed error (no panic)
             match result {
-                Ok(pattern) => {
+                Ok(_pattern) => {
                     assert!(fresh.get_trace(key).is_some());
                 }
-                Err(e) => {
+                Err(_e) => {
                     // Expected: symexec stub returns empty/error
                 }
             }
@@ -257,12 +256,10 @@ mod tests {
             params: vec![],
         };
         let trace1 = OpTrace {
-            op_kind: OpKind::Silu,
             pattern: ComputePattern::Elementwise { body: vec![TraceOp::Input(0)] },
             signature: sig.clone(),
         };
         let trace2 = OpTrace {
-            op_kind: OpKind::Silu,
             pattern: ComputePattern::Elementwise {
                 body: vec![TraceOp::Input(0), TraceOp::Neg(ValueId(0))],
             },

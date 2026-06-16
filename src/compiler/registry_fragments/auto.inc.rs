@@ -12,7 +12,6 @@ impl ScalarOpRegistry {
         &mut self,
         key: OpKindKey,
         fn_sig: ScalarFnSignature,
-        op_kind: OpKind,
     ) -> Result<ComputePattern, RegistryError> {
         let trace_ops = self.run_symexec(&fn_sig)?;
 
@@ -29,7 +28,6 @@ impl ScalarOpRegistry {
 
         let pattern = classify_pattern(&trace_ops);
         let trace = OpTrace {
-            op_kind,
             pattern: pattern.clone(),
             signature: fn_sig.clone(),
         };
@@ -74,7 +72,6 @@ impl ScalarOpRegistry {
         &mut self,
         key: OpKindKey,
         fn_sig: ScalarFnSignature,
-        op_kind: OpKind,
     ) -> Result<Option<ComputePattern>, RegistryError> {
         #[cfg(feature = "jit-x86")]
         {
@@ -86,7 +83,6 @@ impl ScalarOpRegistry {
                 Some(analysis) => {
                     let pattern = analysis.pattern.clone();
                     let trace = OpTrace {
-                        op_kind,
                         pattern: pattern.clone(),
                         signature: fn_sig.clone(),
                     };
@@ -100,7 +96,7 @@ impl ScalarOpRegistry {
 
         #[cfg(not(feature = "jit-x86"))]
         {
-            let _ = (key, fn_sig, op_kind);
+            let _ = (key, fn_sig);
             Ok(None)
         }
     }

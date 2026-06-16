@@ -43,12 +43,11 @@ impl ScalarOpRegistry {
         &mut self,
         key: OpKindKey,
         sig: ScalarFnSignature,
-        op_kind: OpKind,
         manual_trace: OpTrace,
     ) {
         // Level 1: structured CFG analysis (handles NormLike, Reduction with multiple loops)
         if let Ok(Some(_)) = self.auto_register_structured(
-            key.clone(), sig.clone(), op_kind.clone(),
+            key.clone(), sig.clone(),
         ) {
             return;
         }
@@ -65,7 +64,7 @@ impl ScalarOpRegistry {
 
         // Level 2: linear symexec — skip when manual trace has higher precision
         if manual_num_outputs <= 1 && !is_binary
-            && self.auto_register_from_symexec(key.clone(), sig.clone(), op_kind).is_ok() {
+            && self.auto_register_from_symexec(key.clone(), sig.clone()).is_ok() {
                 return;
             }
 

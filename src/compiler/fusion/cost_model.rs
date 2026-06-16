@@ -1,7 +1,7 @@
 //! Fusion cost model — roofline-based benefit estimation.
 
 use std::collections::HashSet;
-use crate::compiler::graph::{CompilerGraph, CompilerOp, Op, OpKind, OpId};
+use crate::compiler::graph::{CompilerGraph, CompilerOp, Op, OpId};
 use crate::compiler::trace::{OpTrace, TraceOp, ComputePattern, ScalarParam};
 use crate::types::DType;
 use crate::compiler::pain_point::OpBottleneckMap;
@@ -722,7 +722,6 @@ mod tests {
             ScalarParam::Dim(1024),
         ]);
         let trace = OpTrace {
-            op_kind: OpKind::Silu,
             pattern: ComputePattern::Elementwise { body: vec![TraceOp::Exp(vid(0))] },
             signature: sig,
         };
@@ -744,7 +743,6 @@ mod tests {
             ScalarParam::Dim(16),
         ]);
         let trace = OpTrace {
-            op_kind: OpKind::Gemm { m: SymDim::Concrete(4), n: 8, k: 16, dtype: DType::F32, trans_b: false },
             pattern: ComputePattern::Gemm,
             signature: sig,
         };
@@ -765,7 +763,6 @@ mod tests {
         ]);
         // NormLike: reduce + finalize + transform
         let trace = OpTrace {
-            op_kind: OpKind::RmsNorm { feature_dim: 4096, eps: 1e-5 },
             pattern: ComputePattern::NormLike {
                 reduce: vec![TraceOp::Mul(vid(0), vid(0))],
                 finalize: vec![TraceOp::Sqrt(vid(0))],
@@ -789,7 +786,6 @@ mod tests {
             ScalarParam::Dim(256),
         ]);
         let trace = OpTrace {
-            op_kind: OpKind::Tanh,
             pattern: ComputePattern::Reduction {
                 identity: 0.0,
                 combine: vec![TraceOp::Add(vid(0), vid(1))],
@@ -812,7 +808,6 @@ mod tests {
             ScalarParam::Dim(128),
         ]);
         let trace = OpTrace {
-            op_kind: OpKind::Tanh,
             pattern: ComputePattern::Elementwise { body: vec![] },
             signature: sig,
         };
@@ -829,7 +824,6 @@ mod tests {
             ScalarParam::OutputPtr,
         ]);
         let trace = OpTrace {
-            op_kind: OpKind::Tanh,
             pattern: ComputePattern::Elementwise { body: vec![TraceOp::Exp(vid(0))] },
             signature: sig,
         };
@@ -849,7 +843,6 @@ mod tests {
             ScalarParam::Dim(8),
         ]);
         let trace = OpTrace {
-            op_kind: OpKind::Gemm { m: SymDim::Concrete(4), n: 8, k: 8, dtype: DType::F32, trans_b: false },
             pattern: ComputePattern::Gemm,
             signature: sig,
         };
@@ -1446,7 +1439,6 @@ mod tests {
             TraceOp::Add(vid(2), vid(3)),    // 1
         ];
         let trace = OpTrace {
-            op_kind: OpKind::Tanh,
             pattern: ComputePattern::Injective { body, num_inputs: 2, num_outputs: 2 },
             signature: sig,
         };
@@ -1469,7 +1461,6 @@ mod tests {
             TraceOp::QuantDequantFma { acc: vid(1), a: vid(0), b: vid(0) }, // 2
         ];
         let trace = OpTrace {
-            op_kind: OpKind::Tanh,
             pattern: ComputePattern::QuantDecode { block_size: 32, decode: body },
             signature: sig,
         };

@@ -1,12 +1,9 @@
-use crate::compiler::graph::OpKind;
 use crate::quant::QuantType;
 use crate::quant_format::{PackedScaleAlgorithm, ZeroLayout};
 
 /// Scalar + SymExec output: an operator's complete computational structure.
 #[derive(Debug, Clone)]
 pub struct OpTrace {
-    /// Which graph-level operation this trace describes.
-    pub op_kind: OpKind,
     /// Structural classification + SSA body.
     pub pattern: ComputePattern,
     /// Original scalar function pointer and parameter layout.
@@ -1780,7 +1777,6 @@ pub fn build_quant_gemm_trace(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::compiler::graph::OpKind;
 
     #[test]
     fn trace_silu_body_is_valid_ssa() {
@@ -1794,7 +1790,6 @@ mod tests {
         ];
 
         let trace = OpTrace {
-            op_kind: OpKind::Silu,
             pattern: ComputePattern::Elementwise { body: body.clone() },
             signature: ScalarFnSignature {
                 fn_ptr: std::ptr::null(),
@@ -2380,7 +2375,6 @@ mod tests {
     #[test]
     fn op_trace_empty_body_constructs() {
         let trace = OpTrace {
-            op_kind: OpKind::Silu,
             pattern: ComputePattern::Injective {
                 body: vec![],
                 num_inputs: 0,
@@ -2544,19 +2538,17 @@ mod tests {
     }
 
     #[test]
-    fn op_trace_fields_correspond_correctly() {
-        // Arrange: construct OpTrace with consistent op_kind and pattern
+    fn op_trace_pattern_and_signature_correspond() {
+        // Arrange: construct OpTrace with pattern and signature
         let body = vec![TraceOp::Input(0), TraceOp::Input(1), TraceOp::Mul(ValueId(0), ValueId(1))];
         let trace = OpTrace {
-            op_kind: OpKind::Mul,
             pattern: ComputePattern::BinaryElementwise { body: body.clone() },
             signature: ScalarFnSignature {
                 fn_ptr: std::ptr::null(),
                 params: vec![ScalarParam::InputPtr, ScalarParam::OutputPtr, ScalarParam::Dim(4)],
             },
         };
-        // Act & Assert: op_kind matches, pattern has 3 ops, signature has 3 params
-        assert!(matches!(trace.op_kind, OpKind::Mul));
+        // Act & Assert: pattern has 3 ops, signature has 3 params
         assert_eq!(trace.pattern.body().unwrap().len(), 3);
         assert_eq!(trace.signature.params.len(), 3);
     }
