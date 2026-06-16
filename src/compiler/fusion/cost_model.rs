@@ -564,7 +564,7 @@ impl FusionCostModel {
 mod tests {
     use super::*;
     use crate::compiler::fusion::GroupMarker;
-    use crate::compiler::graph::{CompilerGraph, OpId, OpKind, SymDim, MultiOutputConfig};
+    use crate::compiler::graph::{CompilerGraph, OpId, OpKind, Op, GemmSpec, NormSpec, SymDim, MultiOutputConfig};
     use crate::compiler::planner::ExecutionPlan;
     use crate::compiler::hardware_profile::HardwareProfile;
     use crate::compiler::trace::{OpTrace, ComputePattern, ScalarFnSignature, ScalarParam, TraceOp, ValueId};
@@ -981,8 +981,7 @@ mod tests {
         let w = g.add_tensor_concrete("w", &[4096, 4096], dt);
         let out = g.add_tensor_concrete("out", &[1, 4096], dt);
 
-        let op0 = g.add_op(
-            OpKind::Gemm { m: SymDim::Concrete(1), n: 4096, k: 4096, dtype: DType::F32, trans_b: false },
+        let op0 = g.add_op_with_op(Op::Gemm(GemmSpec { m: SymDim::Concrete(1), n: 4096, k: 4096, dtype: DType::F32, trans_b: false, has_bias: false }), OpKind::Gemm { m: SymDim::Concrete(1), n: 4096, k: 4096, dtype: DType::F32, trans_b: false },
             vec![a, w],
             vec![out],
             "gemm",
@@ -1019,7 +1018,7 @@ mod tests {
         let dt = DType::F32;
         let a = g.add_tensor_concrete("a", &[1, 4096], dt);
         let out = g.add_tensor_concrete("out", &[1, 4096], dt);
-        let op0 = g.add_op(OpKind::Tanh, vec![a], vec![out], "tanh");
+        let op0 = g.add_op_with_op(Op::Tanh, OpKind::Tanh, vec![a], vec![out], "tanh");
 
         let group = make_standalone_group(op0);
         let ai = compute_group_ai(&group, &g);
@@ -1037,8 +1036,7 @@ mod tests {
         let a = g.add_tensor_concrete("a", &[1, 4096], dt);
         let w = g.add_tensor_concrete("w", &[4096, 4096], dt);
         let out = g.add_tensor_concrete("out", &[1, 4096], dt);
-        let op0 = g.add_op(
-            OpKind::Gemm { m: SymDim::Concrete(1), n: 4096, k: 4096, dtype: DType::F32, trans_b: false },
+        let op0 = g.add_op_with_op(Op::Gemm(GemmSpec { m: SymDim::Concrete(1), n: 4096, k: 4096, dtype: DType::F32, trans_b: false, has_bias: false }), OpKind::Gemm { m: SymDim::Concrete(1), n: 4096, k: 4096, dtype: DType::F32, trans_b: false },
             vec![a, w],
             vec![out],
             "gemm",
@@ -1058,8 +1056,7 @@ mod tests {
         let a = g.add_tensor_concrete("a", &[1, 4096], dt);
         let w = g.add_tensor_concrete("w", &[4096, 4096], dt);
         let out = g.add_tensor_concrete("out", &[1, 4096], dt);
-        let op0 = g.add_op(
-            OpKind::Gemm { m: SymDim::Concrete(1), n: 4096, k: 4096, dtype: DType::F32, trans_b: false },
+        let op0 = g.add_op_with_op(Op::Gemm(GemmSpec { m: SymDim::Concrete(1), n: 4096, k: 4096, dtype: DType::F32, trans_b: false, has_bias: false }), OpKind::Gemm { m: SymDim::Concrete(1), n: 4096, k: 4096, dtype: DType::F32, trans_b: false },
             vec![a, w],
             vec![out],
             "gemm",
@@ -1079,8 +1076,7 @@ mod tests {
         let a = g.add_tensor_concrete("a", &[1, 4096], dt);
         let w = g.add_tensor_concrete("w", &[4096, 4096], dt);
         let out = g.add_tensor_concrete("out", &[1, 4096], dt);
-        let op0 = g.add_op(
-            OpKind::Gemm { m: SymDim::Concrete(1), n: 4096, k: 4096, dtype: DType::F32, trans_b: false },
+        let op0 = g.add_op_with_op(Op::Gemm(GemmSpec { m: SymDim::Concrete(1), n: 4096, k: 4096, dtype: DType::F32, trans_b: false, has_bias: false }), OpKind::Gemm { m: SymDim::Concrete(1), n: 4096, k: 4096, dtype: DType::F32, trans_b: false },
             vec![a, w],
             vec![out],
             "gemm",
@@ -1100,8 +1096,7 @@ mod tests {
         let a = g.add_tensor_concrete("a", &[1, 4096], dt);
         let w = g.add_tensor_concrete("w", &[4096, 4096], dt);
         let out = g.add_tensor_concrete("out", &[1, 4096], dt);
-        let op0 = g.add_op(
-            OpKind::Gemm { m: SymDim::Concrete(1), n: 4096, k: 4096, dtype: DType::F32, trans_b: false },
+        let op0 = g.add_op_with_op(Op::Gemm(GemmSpec { m: SymDim::Concrete(1), n: 4096, k: 4096, dtype: DType::F32, trans_b: false, has_bias: false }), OpKind::Gemm { m: SymDim::Concrete(1), n: 4096, k: 4096, dtype: DType::F32, trans_b: false },
             vec![a, w],
             vec![out],
             "gemm",
@@ -1120,7 +1115,7 @@ mod tests {
         let dt = DType::F32;
         let a = g.add_tensor_concrete("a", &[1, 4096], dt);
         let out = g.add_tensor_concrete("out", &[1, 4096], dt);
-        let op0 = g.add_op(OpKind::Tanh, vec![a], vec![out], "tanh");
+        let op0 = g.add_op_with_op(Op::Tanh, OpKind::Tanh, vec![a], vec![out], "tanh");
 
         let group = make_standalone_group(op0);
         let plan = make_plan();
@@ -1139,7 +1134,7 @@ mod tests {
         let dt = DType::F32;
         let a = g.add_tensor_concrete("a", &[1, 4096], dt);
         let out = g.add_tensor_concrete("out", &[1, 4096], dt);
-        let op0 = g.add_op(OpKind::Tanh, vec![a], vec![out], "tanh");
+        let op0 = g.add_op_with_op(Op::Tanh, OpKind::Tanh, vec![a], vec![out], "tanh");
 
         let group = make_standalone_group(op0);
         let plan = make_plan();
@@ -1155,8 +1150,7 @@ mod tests {
         let a = g.add_tensor_concrete("a", &[1, 4], dt);
         let w = g.add_tensor_concrete("w", &[4, 4], dt);
         let out = g.add_tensor_concrete("out", &[1, 4], dt);
-        let op0 = g.add_op(
-            OpKind::Gemm { m: SymDim::Concrete(1), n: 4, k: 4, dtype: DType::F32, trans_b: false },
+        let op0 = g.add_op_with_op(Op::Gemm(GemmSpec { m: SymDim::Concrete(1), n: 4, k: 4, dtype: DType::F32, trans_b: false, has_bias: false }), OpKind::Gemm { m: SymDim::Concrete(1), n: 4, k: 4, dtype: DType::F32, trans_b: false },
             vec![a, w],
             vec![out],
             "gemm",
@@ -1178,8 +1172,7 @@ mod tests {
         let a = g.add_tensor_concrete("a", &[4096, 4096], dt);
         let w = g.add_tensor_concrete("w", &[4096, 4096], dt);
         let out = g.add_tensor_concrete("out", &[4096, 4096], dt);
-        let op0 = g.add_op(
-            OpKind::Gemm { m: SymDim::Concrete(4096), n: 4096, k: 4096, dtype: DType::F32, trans_b: false },
+        let op0 = g.add_op_with_op(Op::Gemm(GemmSpec { m: SymDim::Concrete(4096), n: 4096, k: 4096, dtype: DType::F32, trans_b: false, has_bias: false }), OpKind::Gemm { m: SymDim::Concrete(4096), n: 4096, k: 4096, dtype: DType::F32, trans_b: false },
             vec![a, w],
             vec![out],
             "gemm",
@@ -1203,13 +1196,12 @@ mod tests {
         let gemm_out = g.add_tensor_concrete("gemm_out", &[1, 128], dt);
         let silu_out = g.add_tensor_concrete("silu_out", &[1, 128], dt);
 
-        let gemm = g.add_op(
-            OpKind::Gemm { m: SymDim::Concrete(1), n: 128, k: 128, dtype: DType::F32, trans_b: false },
+        let gemm = g.add_op_with_op(Op::Gemm(GemmSpec { m: SymDim::Concrete(1), n: 128, k: 128, dtype: DType::F32, trans_b: false, has_bias: false }), OpKind::Gemm { m: SymDim::Concrete(1), n: 128, k: 128, dtype: DType::F32, trans_b: false },
             vec![a, w],
             vec![gemm_out],
             "gemm",
         );
-        let silu = g.add_op(OpKind::Silu, vec![gemm_out], vec![silu_out], "silu");
+        let silu = g.add_op_with_op(Op::Silu, OpKind::Silu, vec![gemm_out], vec![silu_out], "silu");
 
         let group = make_epilogue_group(gemm, vec![silu]);
         let plan = make_plan();
@@ -1231,10 +1223,10 @@ mod tests {
         let tanh_out = g.add_tensor_concrete("tanh_out", &[1, 128], dt);
         let ext_out = g.add_tensor_concrete("ext_out", &[1, 128], dt);
 
-        let add_op = g.add_op(OpKind::Add, vec![a, b], vec![add_out], "add");
-        let tanh_op = g.add_op(OpKind::Tanh, vec![add_out], vec![tanh_out], "tanh");
+        let add_op = g.add_op_with_op(Op::Add, OpKind::Add, vec![a, b], vec![add_out], "add");
+        let tanh_op = g.add_op_with_op(Op::Tanh, OpKind::Tanh, vec![add_out], vec![tanh_out], "tanh");
         // External consumer of tanh_out
-        g.add_op(OpKind::Tanh, vec![tanh_out], vec![ext_out], "external");
+        g.add_op_with_op(Op::Tanh, OpKind::Tanh, vec![tanh_out], vec![ext_out], "external");
 
         let group = make_loop_fusion_group(vec![add_op, tanh_op]);
         let plan = make_plan();
@@ -1255,8 +1247,8 @@ mod tests {
         let mid = g.add_tensor_concrete("mid", &[1, 64], dt);
         let out = g.add_tensor_concrete("out", &[1, 64], dt);
 
-        let op0 = g.add_op(OpKind::Tanh, vec![a], vec![mid], "tanh");
-        let op1 = g.add_op(OpKind::Silu, vec![mid], vec![out], "silu");
+        let op0 = g.add_op_with_op(Op::Tanh, OpKind::Tanh, vec![a], vec![mid], "tanh");
+        let op1 = g.add_op_with_op(Op::Silu, OpKind::Silu, vec![mid], vec![out], "silu");
 
         let group = make_loop_fusion_group(vec![op0, op1]);
         let plan = make_plan();
@@ -1274,7 +1266,7 @@ mod tests {
         let dt = DType::F32;
         let a = g.add_tensor_concrete("a", &[1, 128], dt);
         let out = g.add_tensor_concrete("out", &[1, 128], dt);
-        let op0 = g.add_op(OpKind::Tanh, vec![a], vec![out], "tanh");
+        let op0 = g.add_op_with_op(Op::Tanh, OpKind::Tanh, vec![a], vec![out], "tanh");
 
         let group = make_standalone_group(op0);
         let plan = make_plan();
@@ -1294,13 +1286,12 @@ mod tests {
         let gemm_out = g.add_tensor_concrete("gemm_out", &[1, 128], dt);
         let silu_out = g.add_tensor_concrete("silu_out", &[1, 128], dt);
 
-        let gemm = g.add_op(
-            OpKind::Gemm { m: SymDim::Concrete(1), n: 128, k: 128, dtype: DType::F32, trans_b: false },
+        let gemm = g.add_op_with_op(Op::Gemm(GemmSpec { m: SymDim::Concrete(1), n: 128, k: 128, dtype: DType::F32, trans_b: false, has_bias: false }), OpKind::Gemm { m: SymDim::Concrete(1), n: 128, k: 128, dtype: DType::F32, trans_b: false },
             vec![a, w],
             vec![gemm_out],
             "gemm",
         );
-        let silu = g.add_op(OpKind::Silu, vec![gemm_out], vec![silu_out], "silu");
+        let silu = g.add_op_with_op(Op::Silu, OpKind::Silu, vec![gemm_out], vec![silu_out], "silu");
 
         let group = make_epilogue_group(gemm, vec![silu]);
         let plan = make_plan();
@@ -1321,9 +1312,8 @@ mod tests {
         let norm_out = g.add_tensor_concrete("norm_out", &[1, 4096], dt);
         let gemm_out = g.add_tensor_concrete("gemm_out", &[1, 4096], dt);
 
-        let norm = g.add_op(OpKind::RmsNorm { feature_dim: 4096, eps: 1e-5 }, vec![norm_in], vec![norm_out], "norm");
-        let gemm = g.add_op(
-            OpKind::Gemm { m: SymDim::Concrete(1), n: 4096, k: 4096, dtype: DType::F32, trans_b: false },
+        let norm = g.add_op_with_op(Op::RmsNorm(NormSpec { feature_dim: 4096, eps: 1e-5, dtype: DType::F32, has_weight: true }), OpKind::RmsNorm { feature_dim: 4096, eps: 1e-5 }, vec![norm_in], vec![norm_out], "norm");
+        let gemm = g.add_op_with_op(Op::Gemm(GemmSpec { m: SymDim::Concrete(1), n: 4096, k: 4096, dtype: DType::F32, trans_b: false, has_bias: false }), OpKind::Gemm { m: SymDim::Concrete(1), n: 4096, k: 4096, dtype: DType::F32, trans_b: false },
             vec![a, w],
             vec![gemm_out],
             "gemm",
@@ -1348,7 +1338,7 @@ mod tests {
         let mut g = CompilerGraph::new();
         let a = g.add_tensor_concrete("a", &[1, 64], dt);
         let out = g.add_tensor_concrete("out", &[1, 64], dt);
-        let anchor = g.add_op(OpKind::Tanh, vec![a], vec![out], "tanh");
+        let anchor = g.add_op_with_op(Op::Tanh, OpKind::Tanh, vec![a], vec![out], "tanh");
         let anchor_op = g.op(anchor).unwrap().clone();
         let eliminated = chain_eliminated_bytes(&g, &anchor_op, &[]);
         assert_eq!(eliminated, 0);
@@ -1362,8 +1352,8 @@ mod tests {
         let mid = g.add_tensor_concrete("mid", &[1, 64], dt);
         let out = g.add_tensor_concrete("out", &[1, 64], dt);
 
-        let anchor = g.add_op(OpKind::Tanh, vec![a], vec![mid], "tanh");
-        let chain_op = g.add_op(OpKind::Silu, vec![mid], vec![out], "silu");
+        let anchor = g.add_op_with_op(Op::Tanh, OpKind::Tanh, vec![a], vec![mid], "tanh");
+        let chain_op = g.add_op_with_op(Op::Silu, OpKind::Silu, vec![mid], vec![out], "silu");
 
         let anchor_op = g.op(anchor).unwrap().clone();
         let chain_ref = g.op(chain_op).unwrap();
@@ -1383,10 +1373,10 @@ mod tests {
         let out1 = g.add_tensor_concrete("out1", &[1, 64], dt);
         let out2 = g.add_tensor_concrete("out2", &[1, 64], dt);
 
-        let anchor = g.add_op(OpKind::Tanh, vec![a], vec![mid], "tanh");
-        let chain_op = g.add_op(OpKind::Silu, vec![mid], vec![out1], "silu");
+        let anchor = g.add_op_with_op(Op::Tanh, OpKind::Tanh, vec![a], vec![mid], "tanh");
+        let chain_op = g.add_op_with_op(Op::Silu, OpKind::Silu, vec![mid], vec![out1], "silu");
         // Second consumer of mid => mid is NOT eliminated
-        g.add_op(OpKind::Silu, vec![mid], vec![out2], "silu2");
+        g.add_op_with_op(Op::Silu, OpKind::Silu, vec![mid], vec![out2], "silu2");
 
         let anchor_op = g.op(anchor).unwrap().clone();
         let chain_ref = g.op(chain_op).unwrap();
@@ -1405,9 +1395,9 @@ mod tests {
         let mid2 = g.add_tensor_concrete("mid2", &[1, 64], dt);
         let out = g.add_tensor_concrete("out", &[1, 64], dt);
 
-        let anchor = g.add_op(OpKind::Tanh, vec![a], vec![mid1], "tanh");
-        let c0 = g.add_op(OpKind::Silu, vec![mid1], vec![mid2], "silu");
-        let c1 = g.add_op(OpKind::Tanh, vec![mid2], vec![out], "tanh2");
+        let anchor = g.add_op_with_op(Op::Tanh, OpKind::Tanh, vec![a], vec![mid1], "tanh");
+        let c0 = g.add_op_with_op(Op::Silu, OpKind::Silu, vec![mid1], vec![mid2], "silu");
+        let c1 = g.add_op_with_op(Op::Tanh, OpKind::Tanh, vec![mid2], vec![out], "tanh2");
 
         let anchor_op = g.op(anchor).unwrap().clone();
         let c0_ref = g.op(c0).unwrap();

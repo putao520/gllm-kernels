@@ -688,7 +688,7 @@ pub(crate) fn detect_tile_vs_compute_root(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::compiler::graph::{CompilerGraph, CompilerOp, LayerCondition, OpKind, OpId, SymDim};
+    use crate::compiler::graph::{CompilerGraph, CompilerOp, LayerCondition, OpKind, Op, GemmSpec, NormSpec, QuantGemmSpec, RopeSpec, OpId, SymDim};
     use crate::types::DType;
     use crate::quant::QuantType;
     use std::collections::HashSet;
@@ -703,14 +703,12 @@ mod tests {
         let gemm_out = g.add_tensor_concrete("gemm_out", &[64, 512], DType::F32);
         let weight = g.add_tensor_concrete("weight", &[256, 512], DType::F32);
 
-        let norm_id = g.add_op(
-            OpKind::RmsNorm { feature_dim: 4096, eps: 1e-5 },
+        let norm_id = g.add_op_with_op(Op::RmsNorm(NormSpec { feature_dim: 4096, eps: 1e-5, dtype: DType::F32, has_weight: true }), OpKind::RmsNorm { feature_dim: 4096, eps: 1e-5 },
             vec![input],
             vec![norm_out],
             "rms_norm",
         );
-        let gemm_id = g.add_op(
-            OpKind::Gemm {
+        let gemm_id = g.add_op_with_op(Op::Gemm(GemmSpec { m: SymDim::Concrete(64), n: 512, k: 256, dtype: DType::F32, trans_b: false, has_bias: false }), OpKind::Gemm {
                 m: SymDim::Concrete(64),
                 n: 512,
                 k: 256,
@@ -727,14 +725,11 @@ mod tests {
     // ── Test 1: extract_quant_type returns Some for QuantGemm ──
     #[test]
     fn test_extract_quant_type_quant_gemm() {
-        let op = CompilerOp::new_from_kind(
-            OpId(0),
-            OpKind::QuantGemm { m: SymDim::Concrete(1), n: 512, k: 256, quant_type: QuantType::Q4_0, },
+        let op = CompilerOp::new_from_op(OpId(0), Op::QuantGemm(QuantGemmSpec { m: SymDim::Concrete(1), n: 512, k: 256, quant_type: QuantType::Q4_0 }), OpKind::QuantGemm { m: SymDim::Concrete(1), n: 512, k: 256, quant_type: QuantType::Q4_0, },
             vec![],
             vec![],
             "qgemm".to_string(),
-            LayerCondition::Always,
-            &CompilerGraph::new(),
+            LayerCondition::Always
         );
         let g = CompilerGraph::new();
         let result = extract_quant_type(&op, &g);
@@ -744,14 +739,11 @@ mod tests {
     // ── Test 2: extract_quant_type returns None for plain Gemm ──
     #[test]
     fn test_extract_quant_type_plain_gemm_returns_none() {
-        let op = CompilerOp::new_from_kind(
-            OpId(0),
-            OpKind::Gemm { m: SymDim::Concrete(64), n: 512, k: 256, dtype: DType::F32, trans_b: false, },
+        let op = CompilerOp::new_from_op(OpId(0), Op::Gemm(GemmSpec { m: SymDim::Concrete(64), n: 512, k: 256, dtype: DType::F32, trans_b: false, has_bias: false }), OpKind::Gemm { m: SymDim::Concrete(64), n: 512, k: 256, dtype: DType::F32, trans_b: false, },
             vec![],
             vec![],
             "gemm".to_string(),
-            LayerCondition::Always,
-            &CompilerGraph::new(),
+            LayerCondition::Always
         );
         let g = CompilerGraph::new();
         let result = extract_quant_type(&op, &g);
@@ -761,23 +753,17 @@ mod tests {
     // ── Test 3: all_gemm_quant_compatible with same quant types ──
     #[test]
     fn test_all_gemm_quant_compatible_same_quant() {
-        let op1 = CompilerOp::new_from_kind(
-            OpId(0),
-            OpKind::QuantGemm { m: SymDim::Concrete(1), n: 512, k: 256, quant_type: QuantType::Q4_0, },
+        let op1 = CompilerOp::new_from_op(OpId(0), Op::QuantGemm(QuantGemmSpec { m: SymDim::Concrete(1), n: 512, k: 256, quant_type: QuantType::Q4_0 }), OpKind::QuantGemm { m: SymDim::Concrete(1), n: 512, k: 256, quant_type: QuantType::Q4_0, },
             vec![],
             vec![],
             "qgemm1".to_string(),
-            LayerCondition::Always,
-            &CompilerGraph::new(),
+            LayerCondition::Always
         );
-        let op2 = CompilerOp::new_from_kind(
-            OpId(1),
-            OpKind::QuantGemm { m: SymDim::Concrete(1), n: 512, k: 256, quant_type: QuantType::Q4_0, },
+        let op2 = CompilerOp::new_from_op(OpId(1), Op::QuantGemm(QuantGemmSpec { m: SymDim::Concrete(1), n: 512, k: 256, quant_type: QuantType::Q4_0 }), OpKind::QuantGemm { m: SymDim::Concrete(1), n: 512, k: 256, quant_type: QuantType::Q4_0, },
             vec![],
             vec![],
             "qgemm2".to_string(),
-            LayerCondition::Always,
-            &CompilerGraph::new(),
+            LayerCondition::Always
         );
         let ops: Vec<&CompilerOp> = vec![&op1, &op2];
         assert!({ let g = CompilerGraph::new(); all_gemm_quant_compatible(&ops, &g) });
@@ -786,23 +772,17 @@ mod tests {
     // ── Test 4: all_gemm_quant_compatible with incompatible quant types returns false ──
     #[test]
     fn test_all_gemm_quant_compatible_incompatible_types() {
-        let op1 = CompilerOp::new_from_kind(
-            OpId(0),
-            OpKind::QuantGemm { m: SymDim::Concrete(1), n: 512, k: 256, quant_type: QuantType::Q4_0, },
+        let op1 = CompilerOp::new_from_op(OpId(0), Op::QuantGemm(QuantGemmSpec { m: SymDim::Concrete(1), n: 512, k: 256, quant_type: QuantType::Q4_0 }), OpKind::QuantGemm { m: SymDim::Concrete(1), n: 512, k: 256, quant_type: QuantType::Q4_0, },
             vec![],
             vec![],
             "qgemm1".to_string(),
-            LayerCondition::Always,
-            &CompilerGraph::new(),
+            LayerCondition::Always
         );
-        let op2 = CompilerOp::new_from_kind(
-            OpId(1),
-            OpKind::QuantGemm { m: SymDim::Concrete(1), n: 512, k: 256, quant_type: QuantType::Q6K, },
+        let op2 = CompilerOp::new_from_op(OpId(1), Op::QuantGemm(QuantGemmSpec { m: SymDim::Concrete(1), n: 512, k: 256, quant_type: QuantType::Q6K }), OpKind::QuantGemm { m: SymDim::Concrete(1), n: 512, k: 256, quant_type: QuantType::Q6K, },
             vec![],
             vec![],
             "qgemm2".to_string(),
-            LayerCondition::Always,
-            &CompilerGraph::new(),
+            LayerCondition::Always
         );
         let ops: Vec<&CompilerOp> = vec![&op1, &op2];
         // Q4_0 and Q6K are different quant types -> Split -> not compatible
@@ -829,8 +809,7 @@ mod tests {
         // We need the GEMM to have an input without a norm producer
         let raw_input = graph.add_tensor_concrete("raw_input", &[64, 256], DType::F32);
         graph.inputs.push(raw_input);
-        let gemm_id = graph.add_op(
-            OpKind::Gemm {
+        let gemm_id = graph.add_op_with_op(Op::Gemm(GemmSpec { m: SymDim::Concrete(64), n: 512, k: 256, dtype: DType::F32, trans_b: false, has_bias: false }), OpKind::Gemm {
                 m: SymDim::Concrete(64),
                 n: 512,
                 k: 256,
@@ -858,14 +837,12 @@ mod tests {
         let w1 = graph.add_tensor_concrete("w1", &[256, 512], DType::F32);
         let w2 = graph.add_tensor_concrete("w2", &[256, 512], DType::F32);
 
-        let _norm_id = graph.add_op(
-            OpKind::RmsNorm { feature_dim: 4096, eps: 1e-5 },
+        let _norm_id = graph.add_op_with_op(Op::RmsNorm(NormSpec { feature_dim: 4096, eps: 1e-5, dtype: DType::F32, has_weight: true }), OpKind::RmsNorm { feature_dim: 4096, eps: 1e-5 },
             vec![input],
             vec![norm_out],
             "norm",
         );
-        let gemm1_id = graph.add_op(
-            OpKind::Gemm {
+        let gemm1_id = graph.add_op_with_op(Op::Gemm(GemmSpec { m: SymDim::Concrete(64), n: 512, k: 256, dtype: DType::F32, trans_b: false, has_bias: false }), OpKind::Gemm {
                 m: SymDim::Concrete(64),
                 n: 512,
                 k: 256,
@@ -876,8 +853,7 @@ mod tests {
             vec![gemm_out1],
             "gemm1",
         );
-        let _gemm2_id = graph.add_op(
-            OpKind::Gemm {
+        let _gemm2_id = graph.add_op_with_op(Op::Gemm(GemmSpec { m: SymDim::Concrete(64), n: 512, k: 256, dtype: DType::F32, trans_b: false, has_bias: false }), OpKind::Gemm {
                 m: SymDim::Concrete(64),
                 n: 512,
                 k: 256,
@@ -904,8 +880,7 @@ mod tests {
         let gemm_out = graph.add_tensor_concrete("gemm_out", &[64], DType::F32);
         let silu_out = graph.add_tensor_concrete("silu_out", &[64], DType::F32);
 
-        let gemm_id = graph.add_op(
-            OpKind::Gemm {
+        let gemm_id = graph.add_op_with_op(Op::Gemm(GemmSpec { m: SymDim::Concrete(1), n: 64, k: 64, dtype: DType::F32, trans_b: false, has_bias: false }), OpKind::Gemm {
                 m: SymDim::Concrete(1),
                 n: 64,
                 k: 64,
@@ -916,8 +891,7 @@ mod tests {
             vec![gemm_out],
             "gemm",
         );
-        let silu_id = graph.add_op(
-            OpKind::Silu,
+        let silu_id = graph.add_op_with_op(Op::Silu, OpKind::Silu,
             vec![gemm_out],
             vec![silu_out],
             "silu",
@@ -942,8 +916,7 @@ mod tests {
         let bias = graph.add_tensor_concrete("bias", &[64], DType::F32);
         graph.inputs.push(bias);
 
-        let gemm_id = graph.add_op(
-            OpKind::Gemm {
+        let gemm_id = graph.add_op_with_op(Op::Gemm(GemmSpec { m: SymDim::Concrete(1), n: 64, k: 64, dtype: DType::F32, trans_b: false, has_bias: false }), OpKind::Gemm {
                 m: SymDim::Concrete(1),
                 n: 64,
                 k: 64,
@@ -954,8 +927,7 @@ mod tests {
             vec![gemm_out],
             "gemm",
         );
-        let _add_id = graph.add_op(
-            OpKind::Add,
+        let _add_id = graph.add_op_with_op(Op::Add, OpKind::Add,
             vec![gemm_out, bias],
             vec![add_out],
             "add",
@@ -978,14 +950,12 @@ mod tests {
         let silu_out = graph.add_tensor_concrete("silu_out", &[64], DType::F32);
         let mul_out = graph.add_tensor_concrete("mul_out", &[64], DType::F32);
 
-        let silu_id = graph.add_op(
-            OpKind::Silu,
+        let silu_id = graph.add_op_with_op(Op::Silu, OpKind::Silu,
             vec![input],
             vec![silu_out],
             "silu",
         );
-        let _mul_id = graph.add_op(
-            OpKind::Mul,
+        let _mul_id = graph.add_op_with_op(Op::Mul, OpKind::Mul,
             vec![silu_out, input], // both inputs available (input is graph input)
             vec![mul_out],
             "mul",
@@ -1033,14 +1003,11 @@ mod tests {
     #[test]
     fn test_extract_quant_type_gemm_bias_returns_none() {
         // Arrange
-        let op = CompilerOp::new_from_kind(
-            OpId(0),
-            OpKind::GemmBias { m: SymDim::Concrete(32), n: 128, k: 64, dtype: DType::F32, trans_b: false, },
+        let op = CompilerOp::new_from_op(OpId(0), Op::GemmBias(GemmSpec { m: SymDim::Concrete(32), n: 128, k: 64, dtype: DType::F32, trans_b: false, has_bias: true }), OpKind::GemmBias { m: SymDim::Concrete(32), n: 128, k: 64, dtype: DType::F32, trans_b: false, },
             vec![],
             vec![],
             "gemm_bias".to_string(),
-            LayerCondition::Always,
-            &CompilerGraph::new(),
+            LayerCondition::Always
         );
         // Act
         let g = CompilerGraph::new();
@@ -1054,14 +1021,11 @@ mod tests {
     #[test]
     fn test_extract_quant_type_non_gemm_op() {
         // Arrange
-        let op = CompilerOp::new_from_kind(
-            OpId(0),
-            OpKind::Silu,
+        let op = CompilerOp::new_from_op(OpId(0), Op::Silu, OpKind::Silu,
             vec![],
             vec![],
             "silu".to_string(),
-            LayerCondition::Always,
-            &CompilerGraph::new(),
+            LayerCondition::Always
         );
         // Act
         let g = CompilerGraph::new();
@@ -1076,23 +1040,17 @@ mod tests {
     fn test_all_gemm_quant_compatible_mixed_quant_and_plain() {
         // Arrange: one QuantGemm (Q4_0) and one plain Gemm (no quant)
         // QuantGemm output is always F32 after dequant, so QuantGemm -> plain ElemWise is Fuse
-        let op1 = CompilerOp::new_from_kind(
-            OpId(0),
-            OpKind::QuantGemm { m: SymDim::Concrete(1), n: 512, k: 256, quant_type: QuantType::Q4_0, },
+        let op1 = CompilerOp::new_from_op(OpId(0), Op::QuantGemm(QuantGemmSpec { m: SymDim::Concrete(1), n: 512, k: 256, quant_type: QuantType::Q4_0 }), OpKind::QuantGemm { m: SymDim::Concrete(1), n: 512, k: 256, quant_type: QuantType::Q4_0, },
             vec![],
             vec![],
             "qgemm".to_string(),
-            LayerCondition::Always,
-            &CompilerGraph::new(),
+            LayerCondition::Always
         );
-        let op2 = CompilerOp::new_from_kind(
-            OpId(1),
-            OpKind::Gemm { m: SymDim::Concrete(1), n: 512, k: 256, dtype: DType::F32, trans_b: false, },
+        let op2 = CompilerOp::new_from_op(OpId(1), Op::Gemm(GemmSpec { m: SymDim::Concrete(1), n: 512, k: 256, dtype: DType::F32, trans_b: false, has_bias: false }), OpKind::Gemm { m: SymDim::Concrete(1), n: 512, k: 256, dtype: DType::F32, trans_b: false, },
             vec![],
             vec![],
             "plain_gemm".to_string(),
-            LayerCondition::Always,
-            &CompilerGraph::new(),
+            LayerCondition::Always
         );
         let ops: Vec<&CompilerOp> = vec![&op1, &op2];
         // Act
@@ -1106,14 +1064,11 @@ mod tests {
     #[test]
     fn test_all_gemm_quant_compatible_single_op() {
         // Arrange: only one op in the list, no pair to compare
-        let op = CompilerOp::new_from_kind(
-            OpId(0),
-            OpKind::QuantGemm { m: SymDim::Concrete(1), n: 512, k: 256, quant_type: QuantType::Q4_0, },
+        let op = CompilerOp::new_from_op(OpId(0), Op::QuantGemm(QuantGemmSpec { m: SymDim::Concrete(1), n: 512, k: 256, quant_type: QuantType::Q4_0 }), OpKind::QuantGemm { m: SymDim::Concrete(1), n: 512, k: 256, quant_type: QuantType::Q4_0, },
             vec![],
             vec![],
             "qgemm".to_string(),
-            LayerCondition::Always,
-            &CompilerGraph::new(),
+            LayerCondition::Always
         );
         let ops: Vec<&CompilerOp> = vec![&op];
         // Act
@@ -1134,14 +1089,12 @@ mod tests {
         let gemm_out = graph.add_tensor_concrete("gemm_out", &[64, 512], DType::F32);
         let weight = graph.add_tensor_concrete("weight", &[256, 512], DType::F32);
 
-        let norm_id = graph.add_op(
-            OpKind::LayerNorm { feature_dim: 4096, eps: 1e-5 },
+        let norm_id = graph.add_op_with_op(Op::LayerNorm(NormSpec { feature_dim: 4096, eps: 1e-5, dtype: DType::F32, has_weight: true }), OpKind::LayerNorm { feature_dim: 4096, eps: 1e-5 },
             vec![input],
             vec![norm_out],
             "layer_norm",
         );
-        let gemm_id = graph.add_op(
-            OpKind::Gemm {
+        let gemm_id = graph.add_op_with_op(Op::Gemm(GemmSpec { m: SymDim::Concrete(64), n: 512, k: 256, dtype: DType::F32, trans_b: false, has_bias: false }), OpKind::Gemm {
                 m: SymDim::Concrete(64),
                 n: 512,
                 k: 256,
@@ -1171,14 +1124,12 @@ mod tests {
         let gemm_out = graph.add_tensor_concrete("gemm_out", &[64, 512], DType::F32);
         let weight = graph.add_tensor_concrete("weight", &[256, 512], DType::F32);
 
-        let _softmax_id = graph.add_op(
-            OpKind::Softmax,
+        let _softmax_id = graph.add_op_with_op(Op::Softmax, OpKind::Softmax,
             vec![input],
             vec![softmax_out],
             "softmax",
         );
-        let gemm_id = graph.add_op(
-            OpKind::Gemm {
+        let gemm_id = graph.add_op_with_op(Op::Gemm(GemmSpec { m: SymDim::Concrete(64), n: 512, k: 256, dtype: DType::F32, trans_b: false, has_bias: false }), OpKind::Gemm {
                 m: SymDim::Concrete(64),
                 n: 512,
                 k: 256,
@@ -1207,8 +1158,7 @@ mod tests {
         let gemm_out = graph.add_tensor_concrete("gemm_out", &[64], DType::F32);
         let silu_out = graph.add_tensor_concrete("silu_out", &[64], DType::F32);
 
-        let gemm_id = graph.add_op(
-            OpKind::Gemm {
+        let gemm_id = graph.add_op_with_op(Op::Gemm(GemmSpec { m: SymDim::Concrete(1), n: 64, k: 64, dtype: DType::F32, trans_b: false, has_bias: false }), OpKind::Gemm {
                 m: SymDim::Concrete(1),
                 n: 64,
                 k: 64,
@@ -1219,8 +1169,7 @@ mod tests {
             vec![gemm_out],
             "gemm",
         );
-        let silu_id = graph.add_op(
-            OpKind::Silu,
+        let silu_id = graph.add_op_with_op(Op::Silu, OpKind::Silu,
             vec![gemm_out],
             vec![silu_out],
             "silu",
@@ -1247,8 +1196,7 @@ mod tests {
         let out_a = graph.add_tensor_concrete("out_a", &[32], DType::F32);
         let out_b = graph.add_tensor_concrete("out_b", &[32], DType::F32);
 
-        let anchor_id = graph.add_op(
-            OpKind::Silu,
+        let anchor_id = graph.add_op_with_op(Op::Silu, OpKind::Silu,
             vec![input],
             vec![out_a, out_b],
             "multi_out",
@@ -1272,14 +1220,12 @@ mod tests {
         let silu_out = graph.add_tensor_concrete("silu_out", &[64], DType::F32);
         let tanh_out = graph.add_tensor_concrete("tanh_out", &[64], DType::F32);
 
-        let silu_id = graph.add_op(
-            OpKind::Silu,
+        let silu_id = graph.add_op_with_op(Op::Silu, OpKind::Silu,
             vec![input],
             vec![silu_out],
             "silu",
         );
-        let tanh_id = graph.add_op(
-            OpKind::Tanh,
+        let tanh_id = graph.add_op_with_op(Op::Tanh, OpKind::Tanh,
             vec![silu_out],
             vec![tanh_out],
             "tanh",
@@ -1306,14 +1252,12 @@ mod tests {
         let silu_out = graph.add_tensor_concrete("silu_out", &[64], DType::F32);
         let gemm_out = graph.add_tensor_concrete("gemm_out", &[64], DType::F32);
 
-        let silu_id = graph.add_op(
-            OpKind::Silu,
+        let silu_id = graph.add_op_with_op(Op::Silu, OpKind::Silu,
             vec![input],
             vec![silu_out],
             "silu",
         );
-        let _gemm_id = graph.add_op(
-            OpKind::Gemm {
+        let _gemm_id = graph.add_op_with_op(Op::Gemm(GemmSpec { m: SymDim::Concrete(1), n: 64, k: 64, dtype: DType::F32, trans_b: false, has_bias: false }), OpKind::Gemm {
                 m: SymDim::Concrete(1),
                 n: 64,
                 k: 64,
@@ -1348,14 +1292,12 @@ mod tests {
         let wk = graph.add_tensor_concrete("wk", &[256, 512], DType::F32);
         let wv = graph.add_tensor_concrete("wv", &[256, 512], DType::F32);
 
-        let _norm_id = graph.add_op(
-            OpKind::RmsNorm { feature_dim: 4096, eps: 1e-5 },
+        let _norm_id = graph.add_op_with_op(Op::RmsNorm(NormSpec { feature_dim: 4096, eps: 1e-5, dtype: DType::F32, has_weight: true }), OpKind::RmsNorm { feature_dim: 4096, eps: 1e-5 },
             vec![input],
             vec![norm_out],
             "norm",
         );
-        graph.add_op(
-            OpKind::Gemm {
+        graph.add_op_with_op(Op::Gemm(GemmSpec { m: SymDim::Concrete(64), n: 512, k: 256, dtype: DType::F32, trans_b: false, has_bias: false }), OpKind::Gemm {
                 m: SymDim::Concrete(64),
                 n: 512,
                 k: 256,
@@ -1366,8 +1308,7 @@ mod tests {
             vec![q_out],
             "q_proj",
         );
-        graph.add_op(
-            OpKind::Gemm {
+        graph.add_op_with_op(Op::Gemm(GemmSpec { m: SymDim::Concrete(64), n: 512, k: 256, dtype: DType::F32, trans_b: false, has_bias: false }), OpKind::Gemm {
                 m: SymDim::Concrete(64),
                 n: 512,
                 k: 256,
@@ -1378,8 +1319,7 @@ mod tests {
             vec![k_out],
             "k_proj",
         );
-        graph.add_op(
-            OpKind::Gemm {
+        graph.add_op_with_op(Op::Gemm(GemmSpec { m: SymDim::Concrete(64), n: 512, k: 256, dtype: DType::F32, trans_b: false, has_bias: false }), OpKind::Gemm {
                 m: SymDim::Concrete(64),
                 n: 512,
                 k: 256,
@@ -1415,8 +1355,7 @@ mod tests {
         let w_gate = graph.add_tensor_concrete("w_gate", &[256, 1024], DType::F32);
         let w_up = graph.add_tensor_concrete("w_up", &[256, 1024], DType::F32);
 
-        let gate_gemm_id = graph.add_op(
-            OpKind::Gemm {
+        let gate_gemm_id = graph.add_op_with_op(Op::Gemm(GemmSpec { m: SymDim::Concrete(64), n: 1024, k: 256, dtype: DType::F32, trans_b: false, has_bias: false }), OpKind::Gemm {
                 m: SymDim::Concrete(64),
                 n: 1024,
                 k: 256,
@@ -1427,8 +1366,7 @@ mod tests {
             vec![gate_out],
             "gate_gemm",
         );
-        let up_gemm_id = graph.add_op(
-            OpKind::Gemm {
+        let up_gemm_id = graph.add_op_with_op(Op::Gemm(GemmSpec { m: SymDim::Concrete(64), n: 1024, k: 256, dtype: DType::F32, trans_b: false, has_bias: false }), OpKind::Gemm {
                 m: SymDim::Concrete(64),
                 n: 1024,
                 k: 256,
@@ -1439,14 +1377,12 @@ mod tests {
             vec![up_out],
             "up_gemm",
         );
-        let silu_id = graph.add_op(
-            OpKind::Silu,
+        let silu_id = graph.add_op_with_op(Op::Silu, OpKind::Silu,
             vec![gate_out],
             vec![silu_out],
             "silu",
         );
-        let mul_id = graph.add_op(
-            OpKind::Mul,
+        let mul_id = graph.add_op_with_op(Op::Mul, OpKind::Mul,
             vec![silu_out, up_out],
             vec![mul_out],
             "mul",
@@ -1487,8 +1423,7 @@ mod tests {
         let w_gate = graph.add_tensor_concrete("w_gate", &[256, 1024], DType::F32);
         let w_up = graph.add_tensor_concrete("w_up", &[256, 512], DType::F32);
 
-        graph.add_op(
-            OpKind::Gemm {
+        graph.add_op_with_op(Op::Gemm(GemmSpec { m: SymDim::Concrete(64), n: 1024, k: 256, dtype: DType::F32, trans_b: false, has_bias: false }), OpKind::Gemm {
                 m: SymDim::Concrete(64),
                 n: 1024,
                 k: 256,
@@ -1499,8 +1434,7 @@ mod tests {
             vec![gate_out],
             "gate_gemm",
         );
-        graph.add_op(
-            OpKind::Gemm {
+        graph.add_op_with_op(Op::Gemm(GemmSpec { m: SymDim::Concrete(64), n: 512, k: 256, dtype: DType::F32, trans_b: false, has_bias: false }), OpKind::Gemm {
                 m: SymDim::Concrete(64),
                 n: 512,
                 k: 256,
@@ -1511,14 +1445,12 @@ mod tests {
             vec![up_out],
             "up_gemm",
         );
-        graph.add_op(
-            OpKind::Silu,
+        graph.add_op_with_op(Op::Silu, OpKind::Silu,
             vec![gate_out],
             vec![silu_out],
             "silu",
         );
-        graph.add_op(
-            OpKind::Mul,
+        graph.add_op_with_op(Op::Mul, OpKind::Mul,
             vec![silu_out, up_out],
             vec![mul_out],
             "mul",
@@ -1543,8 +1475,7 @@ mod tests {
         let silu_out = graph.add_tensor_concrete("silu_out", &[64], DType::F32);
         let tanh_out = graph.add_tensor_concrete("tanh_out", &[64], DType::F32);
 
-        let gemm_id = graph.add_op(
-            OpKind::Gemm {
+        let gemm_id = graph.add_op_with_op(Op::Gemm(GemmSpec { m: SymDim::Concrete(1), n: 64, k: 64, dtype: DType::F32, trans_b: false, has_bias: false }), OpKind::Gemm {
                 m: SymDim::Concrete(1),
                 n: 64,
                 k: 64,
@@ -1555,14 +1486,12 @@ mod tests {
             vec![gemm_out],
             "gemm",
         );
-        let silu_id = graph.add_op(
-            OpKind::Silu,
+        let silu_id = graph.add_op_with_op(Op::Silu, OpKind::Silu,
             vec![gemm_out],
             vec![silu_out],
             "silu",
         );
-        let tanh_id = graph.add_op(
-            OpKind::Tanh,
+        let tanh_id = graph.add_op_with_op(Op::Tanh, OpKind::Tanh,
             vec![silu_out],
             vec![tanh_out],
             "tanh",
@@ -1592,8 +1521,7 @@ mod tests {
         let out_a = graph.add_tensor_concrete("out_a", &[64], DType::F32);
         let out_b = graph.add_tensor_concrete("out_b", &[64], DType::F32);
 
-        let gemm_id = graph.add_op(
-            OpKind::Gemm {
+        let gemm_id = graph.add_op_with_op(Op::Gemm(GemmSpec { m: SymDim::Concrete(1), n: 64, k: 64, dtype: DType::F32, trans_b: false, has_bias: false }), OpKind::Gemm {
                 m: SymDim::Concrete(1),
                 n: 64,
                 k: 64,
@@ -1604,15 +1532,14 @@ mod tests {
             vec![gemm_out],
             "gemm",
         );
-        let _silu_id = graph.add_op(
-            OpKind::Silu,
+        let _silu_id = graph.add_op_with_op(Op::Silu, OpKind::Silu,
             vec![gemm_out],
             vec![silu_out],
             "silu",
         );
         // Silu output has 2 consumers -> epilogue cannot extend past Silu
-        graph.add_op(OpKind::Tanh, vec![silu_out], vec![out_a], "tanh_a");
-        graph.add_op(OpKind::SwiGlu, vec![silu_out], vec![out_b], "swiglu_b");
+        graph.add_op_with_op(Op::Tanh, OpKind::Tanh, vec![silu_out], vec![out_a], "tanh_a");
+        graph.add_op_with_op(Op::SwiGlu, OpKind::SwiGlu, vec![silu_out], vec![out_b], "swiglu_b");
 
         // Act
         let gemm_op = graph.op(gemm_id).unwrap();
@@ -1637,22 +1564,19 @@ mod tests {
         let external_out = graph.add_tensor_concrete("external_out", &[64], DType::F32);
         let add_out = graph.add_tensor_concrete("add_out", &[64], DType::F32);
 
-        let silu_id = graph.add_op(
-            OpKind::Silu,
+        let silu_id = graph.add_op_with_op(Op::Silu, OpKind::Silu,
             vec![input],
             vec![silu_out],
             "silu",
         );
         // external_out produced by a Tanh (not a graph input, not in chain)
-        let _external_id = graph.add_op(
-            OpKind::Tanh,
+        let _external_id = graph.add_op_with_op(Op::Tanh, OpKind::Tanh,
             vec![input],
             vec![external_out],
             "external_tanh",
         );
         // Add consumes silu_out (from chain) and external_out (not in chain, not graph input)
-        let _add_id = graph.add_op(
-            OpKind::Add,
+        let _add_id = graph.add_op_with_op(Op::Add, OpKind::Add,
             vec![silu_out, external_out],
             vec![add_out],
             "add",
@@ -1684,32 +1608,23 @@ mod tests {
     #[test]
     fn test_all_gemm_quant_compatible_three_ops_same() {
         // Arrange: 3 QuantGemm ops all using Q4_0
-        let op1 = CompilerOp::new_from_kind(
-            OpId(0),
-            OpKind::QuantGemm { m: SymDim::Concrete(1), n: 256, k: 128, quant_type: QuantType::Q4_0, },
+        let op1 = CompilerOp::new_from_op(OpId(0), Op::QuantGemm(QuantGemmSpec { m: SymDim::Concrete(1), n: 256, k: 128, quant_type: QuantType::Q4_0 }), OpKind::QuantGemm { m: SymDim::Concrete(1), n: 256, k: 128, quant_type: QuantType::Q4_0, },
             vec![],
             vec![],
             "q1".to_string(),
-            LayerCondition::Always,
-            &CompilerGraph::new(),
+            LayerCondition::Always
         );
-        let op2 = CompilerOp::new_from_kind(
-            OpId(1),
-            OpKind::QuantGemm { m: SymDim::Concrete(1), n: 256, k: 128, quant_type: QuantType::Q4_0, },
+        let op2 = CompilerOp::new_from_op(OpId(1), Op::QuantGemm(QuantGemmSpec { m: SymDim::Concrete(1), n: 256, k: 128, quant_type: QuantType::Q4_0 }), OpKind::QuantGemm { m: SymDim::Concrete(1), n: 256, k: 128, quant_type: QuantType::Q4_0, },
             vec![],
             vec![],
             "q2".to_string(),
-            LayerCondition::Always,
-            &CompilerGraph::new(),
+            LayerCondition::Always
         );
-        let op3 = CompilerOp::new_from_kind(
-            OpId(2),
-            OpKind::QuantGemm { m: SymDim::Concrete(1), n: 256, k: 128, quant_type: QuantType::Q4_0, },
+        let op3 = CompilerOp::new_from_op(OpId(2), Op::QuantGemm(QuantGemmSpec { m: SymDim::Concrete(1), n: 256, k: 128, quant_type: QuantType::Q4_0 }), OpKind::QuantGemm { m: SymDim::Concrete(1), n: 256, k: 128, quant_type: QuantType::Q4_0, },
             vec![],
             vec![],
             "q3".to_string(),
-            LayerCondition::Always,
-            &CompilerGraph::new(),
+            LayerCondition::Always
         );
         let ops: Vec<&CompilerOp> = vec![&op1, &op2, &op3];
         // Act
@@ -1724,14 +1639,11 @@ mod tests {
     fn test_detect_norm_into_gemm_no_inputs() {
         // Arrange: a GEMM op with empty inputs vector
         let graph = CompilerGraph::new();
-        let op = CompilerOp::new_from_kind(
-            OpId(0),
-            OpKind::Gemm { m: SymDim::Concrete(64), n: 512, k: 256, dtype: DType::F32, trans_b: false, },
+        let op = CompilerOp::new_from_op(OpId(0), Op::Gemm(GemmSpec { m: SymDim::Concrete(64), n: 512, k: 256, dtype: DType::F32, trans_b: false, has_bias: false }), OpKind::Gemm { m: SymDim::Concrete(64), n: 512, k: 256, dtype: DType::F32, trans_b: false, },
             vec![],
             vec![],
             "gemm_no_inputs".to_string(),
-            LayerCondition::Always,
-            &CompilerGraph::new(),
+            LayerCondition::Always
         );
         // Act
         let result = detect_norm_into_gemm(&graph, &op, None);
@@ -1756,8 +1668,7 @@ mod tests {
         let w_gate = graph.add_tensor_concrete("w_gate", &[256, 512], DType::F32);
         let w_up = graph.add_tensor_concrete("w_up", &[256, 512], DType::F32);
 
-        graph.add_op(
-            OpKind::Gemm {
+        graph.add_op_with_op(Op::Gemm(GemmSpec { m: SymDim::Concrete(64), n: 512, k: 256, dtype: DType::F32, trans_b: false, has_bias: false }), OpKind::Gemm {
                 m: SymDim::Concrete(64), n: 512, k: 256,
                 dtype: DType::F32, trans_b: false,
             },
@@ -1765,8 +1676,7 @@ mod tests {
             vec![gate_out],
             "gate_gemm",
         );
-        graph.add_op(
-            OpKind::Gemm {
+        graph.add_op_with_op(Op::Gemm(GemmSpec { m: SymDim::Concrete(64), n: 512, k: 256, dtype: DType::F32, trans_b: false, has_bias: false }), OpKind::Gemm {
                 m: SymDim::Concrete(64), n: 512, k: 256,
                 dtype: DType::F32, trans_b: false,
             },
@@ -1774,8 +1684,8 @@ mod tests {
             vec![up_out],
             "up_gemm",
         );
-        graph.add_op(OpKind::Silu, vec![gate_out], vec![silu_out], "silu");
-        graph.add_op(OpKind::Mul, vec![silu_out, up_out], vec![mul_out], "mul");
+        graph.add_op_with_op(Op::Silu, OpKind::Silu, vec![gate_out], vec![silu_out], "silu");
+        graph.add_op_with_op(Op::Mul, OpKind::Mul, vec![silu_out, up_out], vec![mul_out], "mul");
 
         let topo: Vec<OpId> = graph.ops.iter().map(|o| o.id).collect();
         // Act
@@ -1801,16 +1711,16 @@ mod tests {
         let wv = graph.add_tensor_concrete("wv", &[256, 512], DType::F32);
 
         // Silu feeds the 3 GEMMs (not RmsNorm/LayerNorm)
-        graph.add_op(OpKind::Silu, vec![input], vec![silu_out], "silu");
-        graph.add_op(OpKind::Gemm {
+        graph.add_op_with_op(Op::Silu, OpKind::Silu, vec![input], vec![silu_out], "silu");
+        graph.add_op_with_op(Op::Gemm(GemmSpec { m: SymDim::Concrete(64), n: 512, k: 256, dtype: DType::F32, trans_b: false, has_bias: false }), OpKind::Gemm {
             m: SymDim::Concrete(64), n: 512, k: 256,
             dtype: DType::F32, trans_b: false,
         }, vec![silu_out, wq], vec![q_out], "q_proj");
-        graph.add_op(OpKind::Gemm {
+        graph.add_op_with_op(Op::Gemm(GemmSpec { m: SymDim::Concrete(64), n: 512, k: 256, dtype: DType::F32, trans_b: false, has_bias: false }), OpKind::Gemm {
             m: SymDim::Concrete(64), n: 512, k: 256,
             dtype: DType::F32, trans_b: false,
         }, vec![silu_out, wk], vec![k_out], "k_proj");
-        graph.add_op(OpKind::Gemm {
+        graph.add_op_with_op(Op::Gemm(GemmSpec { m: SymDim::Concrete(64), n: 512, k: 256, dtype: DType::F32, trans_b: false, has_bias: false }), OpKind::Gemm {
             m: SymDim::Concrete(64), n: 512, k: 256,
             dtype: DType::F32, trans_b: false,
         }, vec![silu_out, wv], vec![v_out], "v_proj");
@@ -1836,12 +1746,12 @@ mod tests {
         let wa = graph.add_tensor_concrete("wa", &[256, 512], DType::F32);
         let wb = graph.add_tensor_concrete("wb", &[256, 512], DType::F32);
 
-        graph.add_op(OpKind::RmsNorm { feature_dim: 4096, eps: 1e-5 }, vec![input], vec![norm_out], "norm");
-        graph.add_op(OpKind::Gemm {
+        graph.add_op_with_op(Op::RmsNorm(NormSpec { feature_dim: 4096, eps: 1e-5, dtype: DType::F32, has_weight: true }), OpKind::RmsNorm { feature_dim: 4096, eps: 1e-5 }, vec![input], vec![norm_out], "norm");
+        graph.add_op_with_op(Op::Gemm(GemmSpec { m: SymDim::Concrete(64), n: 512, k: 256, dtype: DType::F32, trans_b: false, has_bias: false }), OpKind::Gemm {
             m: SymDim::Concrete(64), n: 512, k: 256,
             dtype: DType::F32, trans_b: false,
         }, vec![norm_out, wa], vec![a_out], "gemm_a");
-        graph.add_op(OpKind::Gemm {
+        graph.add_op_with_op(Op::Gemm(GemmSpec { m: SymDim::Concrete(64), n: 512, k: 256, dtype: DType::F32, trans_b: false, has_bias: false }), OpKind::Gemm {
             m: SymDim::Concrete(64), n: 512, k: 256,
             dtype: DType::F32, trans_b: false,
         }, vec![norm_out, wb], vec![b_out], "gemm_b");
@@ -1859,14 +1769,11 @@ mod tests {
     fn test_collect_epilogue_empty_outputs() {
         // Arrange: anchor op with empty outputs vector
         let graph = CompilerGraph::new();
-        let anchor = CompilerOp::new_from_kind(
-            OpId(0),
-            OpKind::Silu,
+        let anchor = CompilerOp::new_from_op(OpId(0), Op::Silu, OpKind::Silu,
             vec![],
             vec![],
             "empty_anchor".to_string(),
-            LayerCondition::Always,
-            &CompilerGraph::new(),
+            LayerCondition::Always
         );
         let claimed = HashSet::new();
         // Act
@@ -1894,17 +1801,17 @@ mod tests {
         let w_up = graph.add_tensor_concrete("w_up", &[256, 512], DType::F32);
 
         // gate_gemm -> Add(gate_out, bias) — Add is not an activation op
-        graph.add_op(OpKind::Gemm {
+        graph.add_op_with_op(Op::Gemm(GemmSpec { m: SymDim::Concrete(64), n: 512, k: 256, dtype: DType::F32, trans_b: false, has_bias: false }), OpKind::Gemm {
             m: SymDim::Concrete(64), n: 512, k: 256,
             dtype: DType::F32, trans_b: false,
         }, vec![input, w_gate], vec![gate_out], "gate_gemm");
-        graph.add_op(OpKind::Gemm {
+        graph.add_op_with_op(Op::Gemm(GemmSpec { m: SymDim::Concrete(64), n: 512, k: 256, dtype: DType::F32, trans_b: false, has_bias: false }), OpKind::Gemm {
             m: SymDim::Concrete(64), n: 512, k: 256,
             dtype: DType::F32, trans_b: false,
         }, vec![input, w_up], vec![up_out], "up_gemm");
         // Add is not recognized as activation (Silu/Gelu)
-        graph.add_op(OpKind::Add, vec![gate_out, bias], vec![add_out], "add");
-        graph.add_op(OpKind::Mul, vec![add_out, up_out], vec![mul_out], "mul");
+        graph.add_op_with_op(Op::Add, OpKind::Add, vec![gate_out, bias], vec![add_out], "add");
+        graph.add_op_with_op(Op::Mul, OpKind::Mul, vec![add_out, up_out], vec![mul_out], "mul");
 
         let topo: Vec<OpId> = graph.ops.iter().map(|o| o.id).collect();
         // Act
@@ -1926,14 +1833,12 @@ mod tests {
         let silu_out = graph.add_tensor_concrete("silu_out", &[64], DType::F32);
         let mul_out = graph.add_tensor_concrete("mul_out", &[64], DType::F32);
 
-        let silu_id = graph.add_op(
-            OpKind::Silu,
+        let silu_id = graph.add_op_with_op(Op::Silu, OpKind::Silu,
             vec![input],
             vec![silu_out],
             "silu",
         );
-        let mul_id = graph.add_op(
-            OpKind::Mul,
+        let mul_id = graph.add_op_with_op(Op::Mul, OpKind::Mul,
             vec![silu_out, scale],  // scale is a graph input -> allowed
             vec![mul_out],
             "mul",
@@ -1961,7 +1866,7 @@ mod tests {
         let input = graph.add_tensor_concrete("input", &[64], DType::F32);
         graph.inputs.push(input);
         let silu_out = graph.add_tensor_concrete("silu_out", &[64], DType::F32);
-        let silu_id = graph.add_op(OpKind::Silu, vec![input], vec![silu_out], "silu");
+        let silu_id = graph.add_op_with_op(Op::Silu, OpKind::Silu, vec![input], vec![silu_out], "silu");
 
         let profile = DeviceProfile::detect();
         let plan = ExecutionPlan::from_profile(&profile);
@@ -1979,14 +1884,11 @@ mod tests {
 
     #[test]
     fn test_extract_quant_type_non_gemm() {
-        let op = CompilerOp::new_from_kind(
-            OpId(0),
-            OpKind::Silu,
+        let op = CompilerOp::new_from_op(OpId(0), Op::Silu, OpKind::Silu,
             vec![],
             vec![],
             "silu".to_string(),
-            LayerCondition::Always,
-            &CompilerGraph::new(),
+            LayerCondition::Always
         );
         let g = CompilerGraph::new();
         assert!(extract_quant_type(&op, &g).is_none());
@@ -1996,14 +1898,11 @@ mod tests {
 
     #[test]
     fn test_all_gemm_quant_compatible_single_plain_gemm() {
-        let op = CompilerOp::new_from_kind(
-            OpId(0),
-            OpKind::Gemm { m: SymDim::Concrete(1), n: 64, k: 64, dtype: DType::F32, trans_b: false, },
+        let op = CompilerOp::new_from_op(OpId(0), Op::Gemm(GemmSpec { m: SymDim::Concrete(1), n: 64, k: 64, dtype: DType::F32, trans_b: false, has_bias: false }), OpKind::Gemm { m: SymDim::Concrete(1), n: 64, k: 64, dtype: DType::F32, trans_b: false, },
             vec![],
             vec![],
             "gemm".to_string(),
-            LayerCondition::Always,
-            &CompilerGraph::new(),
+            LayerCondition::Always
         );
         assert!({ let g = CompilerGraph::new(); all_gemm_quant_compatible(&[&op], &g) });
     }
@@ -2012,23 +1911,17 @@ mod tests {
 
     #[test]
     fn test_all_gemm_quant_compatible_mixed_none_and_quant() {
-        let op1 = CompilerOp::new_from_kind(
-            OpId(0),
-            OpKind::Gemm { m: SymDim::Concrete(1), n: 64, k: 64, dtype: DType::F32, trans_b: false, },
+        let op1 = CompilerOp::new_from_op(OpId(0), Op::Gemm(GemmSpec { m: SymDim::Concrete(1), n: 64, k: 64, dtype: DType::F32, trans_b: false, has_bias: false }), OpKind::Gemm { m: SymDim::Concrete(1), n: 64, k: 64, dtype: DType::F32, trans_b: false, },
             vec![],
             vec![],
             "plain_gemm".to_string(),
-            LayerCondition::Always,
-            &CompilerGraph::new(),
+            LayerCondition::Always
         );
-        let op2 = CompilerOp::new_from_kind(
-            OpId(1),
-            OpKind::QuantGemm { m: SymDim::Concrete(1), n: 64, k: 64, quant_type: QuantType::Q4_0, },
+        let op2 = CompilerOp::new_from_op(OpId(1), Op::QuantGemm(QuantGemmSpec { m: SymDim::Concrete(1), n: 64, k: 64, quant_type: QuantType::Q4_0 }), OpKind::QuantGemm { m: SymDim::Concrete(1), n: 64, k: 64, quant_type: QuantType::Q4_0, },
             vec![],
             vec![],
             "quant_gemm".to_string(),
-            LayerCondition::Always,
-            &CompilerGraph::new(),
+            LayerCondition::Always
         );
         // None vs Q4_0: depends on can_fuse_quant_aware(None, Some(Q4_0))
         let ops: Vec<&CompilerOp> = vec![&op1, &op2];
@@ -2047,9 +1940,8 @@ mod tests {
         let gemm_out = graph.add_tensor_concrete("gemm_out", &[64, 512], DType::F32);
         let weight = graph.add_tensor_concrete("weight", &[256, 512], DType::F32);
 
-        let silu_id = graph.add_op(OpKind::Silu, vec![input], vec![silu_out], "silu");
-        let gemm_id = graph.add_op(
-            OpKind::Gemm { m: SymDim::Concrete(64), n: 512, k: 256, dtype: DType::F32, trans_b: false },
+        let silu_id = graph.add_op_with_op(Op::Silu, OpKind::Silu, vec![input], vec![silu_out], "silu");
+        let gemm_id = graph.add_op_with_op(Op::Gemm(GemmSpec { m: SymDim::Concrete(64), n: 512, k: 256, dtype: DType::F32, trans_b: false, has_bias: false }), OpKind::Gemm { m: SymDim::Concrete(64), n: 512, k: 256, dtype: DType::F32, trans_b: false },
             vec![silu_out, weight], vec![gemm_out], "gemm",
         );
 
@@ -2070,12 +1962,10 @@ mod tests {
         let gemm_out = graph.add_tensor_concrete("gemm_out", &[64, 512], DType::F32);
         let weight = graph.add_tensor_concrete("weight", &[256, 512], DType::F32);
 
-        let norm_id = graph.add_op(
-            OpKind::LayerNorm { feature_dim: 4096, eps: 1e-5 },
+        let norm_id = graph.add_op_with_op(Op::LayerNorm(NormSpec { feature_dim: 4096, eps: 1e-5, dtype: DType::F32, has_weight: true }), OpKind::LayerNorm { feature_dim: 4096, eps: 1e-5 },
             vec![input], vec![norm_out], "layernorm",
         );
-        let gemm_id = graph.add_op(
-            OpKind::Gemm { m: SymDim::Concrete(64), n: 512, k: 256, dtype: DType::F32, trans_b: false },
+        let gemm_id = graph.add_op_with_op(Op::Gemm(GemmSpec { m: SymDim::Concrete(64), n: 512, k: 256, dtype: DType::F32, trans_b: false, has_bias: false }), OpKind::Gemm { m: SymDim::Concrete(64), n: 512, k: 256, dtype: DType::F32, trans_b: false },
             vec![norm_out, weight], vec![gemm_out], "gemm",
         );
 
@@ -2094,8 +1984,8 @@ mod tests {
         let silu_out = graph.add_tensor_concrete("silu_out", &[64], DType::F32);
         let gelu_out = graph.add_tensor_concrete("gelu_out", &[64], DType::F32);
 
-        let silu_id = graph.add_op(OpKind::Silu, vec![input], vec![silu_out], "silu");
-        let _gelu_id = graph.add_op(OpKind::Gelu, vec![silu_out], vec![gelu_out], "gelu");
+        let silu_id = graph.add_op_with_op(Op::Silu, OpKind::Silu, vec![input], vec![silu_out], "silu");
+        let _gelu_id = graph.add_op_with_op(Op::Gelu, OpKind::Gelu, vec![silu_out], vec![gelu_out], "gelu");
 
         let silu_op = graph.op(silu_id).unwrap();
         let mut claimed = HashSet::new();
@@ -2116,10 +2006,10 @@ mod tests {
         let a = graph.add_tensor_concrete("a", &[64], DType::F32);
         let b = graph.add_tensor_concrete("b", &[64], DType::F32);
 
-        let silu_id = graph.add_op(OpKind::Silu, vec![input], vec![silu_out], "silu");
+        let silu_id = graph.add_op_with_op(Op::Silu, OpKind::Silu, vec![input], vec![silu_out], "silu");
         // Two consumers of silu_out
-        graph.add_op(OpKind::Gelu, vec![silu_out], vec![a], "gelu_a");
-        graph.add_op(OpKind::Gelu, vec![silu_out], vec![b], "gelu_b");
+        graph.add_op_with_op(Op::Gelu, OpKind::Gelu, vec![silu_out], vec![a], "gelu_a");
+        graph.add_op_with_op(Op::Gelu, OpKind::Gelu, vec![silu_out], vec![b], "gelu_b");
 
         let silu_op = graph.op(silu_id).unwrap();
         let claimed = HashSet::new();
@@ -2186,12 +2076,12 @@ mod tests {
         let w_gate = graph.add_tensor_concrete("w_gate", &[256, 512], DType::F32);
         let w_up = graph.add_tensor_concrete("w_up", &[128, 512], DType::F32); // different k=128
 
-        graph.add_op(OpKind::Gemm { m: SymDim::Concrete(64), n: 512, k: 256, dtype: DType::F32, trans_b: false },
+        graph.add_op_with_op(Op::Gemm(GemmSpec { m: SymDim::Concrete(64), n: 512, k: 256, dtype: DType::F32, trans_b: false, has_bias: false }), OpKind::Gemm { m: SymDim::Concrete(64), n: 512, k: 256, dtype: DType::F32, trans_b: false },
             vec![input, w_gate], vec![gate_out], "gate_gemm");
-        graph.add_op(OpKind::Gemm { m: SymDim::Concrete(64), n: 512, k: 128, dtype: DType::F32, trans_b: false },
+        graph.add_op_with_op(Op::Gemm(GemmSpec { m: SymDim::Concrete(64), n: 512, k: 128, dtype: DType::F32, trans_b: false, has_bias: false }), OpKind::Gemm { m: SymDim::Concrete(64), n: 512, k: 128, dtype: DType::F32, trans_b: false },
             vec![input, w_up], vec![up_out], "up_gemm"); // k mismatch
-        graph.add_op(OpKind::Silu, vec![gate_out], vec![silu_out], "silu");
-        graph.add_op(OpKind::Mul, vec![silu_out, up_out], vec![mul_out], "mul");
+        graph.add_op_with_op(Op::Silu, OpKind::Silu, vec![gate_out], vec![silu_out], "silu");
+        graph.add_op_with_op(Op::Mul, OpKind::Mul, vec![silu_out, up_out], vec![mul_out], "mul");
 
         let topo: Vec<OpId> = graph.ops.iter().map(|o| o.id).collect();
         let result = detect_ffn_block(&graph, &topo);
@@ -2219,25 +2109,25 @@ mod tests {
         let wk = graph.add_tensor_concrete("wk", &[256, 512], DType::F32);
         let wv = graph.add_tensor_concrete("wv", &[256, 512], DType::F32);
 
-        graph.add_op(OpKind::RmsNorm { feature_dim: 4096, eps: 1e-5 }, vec![input], vec![norm_out], "norm");
-        let gemm_q = graph.add_op(OpKind::Gemm {
+        graph.add_op_with_op(Op::RmsNorm(NormSpec { feature_dim: 4096, eps: 1e-5, dtype: DType::F32, has_weight: true }), OpKind::RmsNorm { feature_dim: 4096, eps: 1e-5 }, vec![input], vec![norm_out], "norm");
+        let gemm_q = graph.add_op_with_op(Op::Gemm(GemmSpec { m: SymDim::Concrete(64), n: 512, k: 256, dtype: DType::F32, trans_b: false, has_bias: false }), OpKind::Gemm {
             m: SymDim::Concrete(64), n: 512, k: 256, dtype: DType::F32, trans_b: false,
         }, vec![norm_out, wq], vec![q_out], "q_proj");
-        let gemm_k = graph.add_op(OpKind::Gemm {
+        let gemm_k = graph.add_op_with_op(Op::Gemm(GemmSpec { m: SymDim::Concrete(64), n: 512, k: 256, dtype: DType::F32, trans_b: false, has_bias: false }), OpKind::Gemm {
             m: SymDim::Concrete(64), n: 512, k: 256, dtype: DType::F32, trans_b: false,
         }, vec![norm_out, wk], vec![k_out], "k_proj");
-        let gemm_v = graph.add_op(OpKind::Gemm {
+        let gemm_v = graph.add_op_with_op(Op::Gemm(GemmSpec { m: SymDim::Concrete(64), n: 512, k: 256, dtype: DType::F32, trans_b: false, has_bias: false }), OpKind::Gemm {
             m: SymDim::Concrete(64), n: 512, k: 256, dtype: DType::F32, trans_b: false,
         }, vec![norm_out, wv], vec![v_out], "v_proj");
-        let qk_norm_q = graph.add_op(OpKind::QkNorm { head_dim: 512, eps: 1e-5 },
+        let qk_norm_q = graph.add_op_with_op(Op::QkNorm { head_dim: 512, eps: 1e-5 }, OpKind::QkNorm { head_dim: 512, eps: 1e-5 },
             vec![q_out], vec![qk_norm_q_out], "qk_norm_q");
-        let qk_norm_k = graph.add_op(OpKind::QkNorm { head_dim: 512, eps: 1e-5 },
+        let qk_norm_k = graph.add_op_with_op(Op::QkNorm { head_dim: 512, eps: 1e-5 }, OpKind::QkNorm { head_dim: 512, eps: 1e-5 },
             vec![k_out], vec![qk_norm_k_out], "qk_norm_k");
-        let value_norm = graph.add_op(OpKind::ValueNorm { feature_dim: 4096, eps: 1e-5 },
+        let value_norm = graph.add_op_with_op(Op::ValueNorm(NormSpec { feature_dim: 4096, eps: 1e-5, dtype: DType::F32, has_weight: false }), OpKind::ValueNorm { feature_dim: 4096, eps: 1e-5 },
             vec![v_out], vec![value_norm_out], "value_norm");
-        let rope_q = graph.add_op(OpKind::RoPE { num_heads: 8, head_dim: 64, theta: 10000.0, partial: 1.0, rope_scaling: None },
+        let rope_q = graph.add_op_with_op(Op::RoPE(RopeSpec { num_heads: 8, head_dim: 64, theta: 10000.0, partial: 1.0, rope_scaling: None }), OpKind::RoPE { num_heads: 8, head_dim: 64, theta: 10000.0, partial: 1.0, rope_scaling: None },
             vec![qk_norm_q_out], vec![rope_q_out], "rope_q");
-        let rope_k = graph.add_op(OpKind::RoPE { num_heads: 8, head_dim: 64, theta: 10000.0, partial: 1.0, rope_scaling: None },
+        let rope_k = graph.add_op_with_op(Op::RoPE(RopeSpec { num_heads: 8, head_dim: 64, theta: 10000.0, partial: 1.0, rope_scaling: None }), OpKind::RoPE { num_heads: 8, head_dim: 64, theta: 10000.0, partial: 1.0, rope_scaling: None },
             vec![qk_norm_k_out], vec![rope_k_out], "rope_k");
 
         let topo: Vec<OpId> = graph.ops.iter().map(|o| o.id).collect();
@@ -2281,14 +2171,14 @@ mod tests {
         let w_gate = graph.add_tensor_concrete("w_gate", &[256, 512], DType::F32);
         let w_up = graph.add_tensor_concrete("w_up", &[256, 512], DType::F32);
 
-        let gate_gemm_id = graph.add_op(OpKind::Gemm {
+        let gate_gemm_id = graph.add_op_with_op(Op::Gemm(GemmSpec { m: SymDim::Concrete(64), n: 512, k: 256, dtype: DType::F32, trans_b: false, has_bias: false }), OpKind::Gemm {
             m: SymDim::Concrete(64), n: 512, k: 256, dtype: DType::F32, trans_b: false,
         }, vec![input, w_gate], vec![gate_out], "gate_gemm");
-        let up_gemm_id = graph.add_op(OpKind::Gemm {
+        let up_gemm_id = graph.add_op_with_op(Op::Gemm(GemmSpec { m: SymDim::Concrete(64), n: 512, k: 256, dtype: DType::F32, trans_b: false, has_bias: false }), OpKind::Gemm {
             m: SymDim::Concrete(64), n: 512, k: 256, dtype: DType::F32, trans_b: false,
         }, vec![input, w_up], vec![up_out], "up_gemm");
-        let gelu_id = graph.add_op(OpKind::Gelu, vec![gate_out], vec![gelu_out], "gelu");
-        let mul_id = graph.add_op(OpKind::Mul, vec![gelu_out, up_out], vec![mul_out], "mul");
+        let gelu_id = graph.add_op_with_op(Op::Gelu, OpKind::Gelu, vec![gate_out], vec![gelu_out], "gelu");
+        let mul_id = graph.add_op_with_op(Op::Mul, OpKind::Mul, vec![gelu_out, up_out], vec![mul_out], "mul");
 
         let topo: Vec<OpId> = graph.ops.iter().map(|o| o.id).collect();
 
@@ -2324,14 +2214,14 @@ mod tests {
         let wk = graph.add_tensor_concrete("wk", &[256, 512], DType::F32);
         let wv = graph.add_tensor_concrete("wv", &[256, 512], DType::F32);
 
-        graph.add_op(OpKind::RmsNorm { feature_dim: 4096, eps: 1e-5 }, vec![input], vec![norm_out], "norm");
-        graph.add_op(OpKind::GemmBias {
+        graph.add_op_with_op(Op::RmsNorm(NormSpec { feature_dim: 4096, eps: 1e-5, dtype: DType::F32, has_weight: true }), OpKind::RmsNorm { feature_dim: 4096, eps: 1e-5 }, vec![input], vec![norm_out], "norm");
+        graph.add_op_with_op(Op::GemmBias(GemmSpec { m: SymDim::Concrete(64), n: 512, k: 256, dtype: DType::F32, trans_b: false, has_bias: true }), OpKind::GemmBias {
             m: SymDim::Concrete(64), n: 512, k: 256, dtype: DType::F32, trans_b: false,
         }, vec![norm_out, wq], vec![q_out], "q_proj");
-        graph.add_op(OpKind::GemmBias {
+        graph.add_op_with_op(Op::GemmBias(GemmSpec { m: SymDim::Concrete(64), n: 512, k: 256, dtype: DType::F32, trans_b: false, has_bias: true }), OpKind::GemmBias {
             m: SymDim::Concrete(64), n: 512, k: 256, dtype: DType::F32, trans_b: false,
         }, vec![norm_out, wk], vec![k_out], "k_proj");
-        graph.add_op(OpKind::GemmBias {
+        graph.add_op_with_op(Op::GemmBias(GemmSpec { m: SymDim::Concrete(64), n: 512, k: 256, dtype: DType::F32, trans_b: false, has_bias: true }), OpKind::GemmBias {
             m: SymDim::Concrete(64), n: 512, k: 256, dtype: DType::F32, trans_b: false,
         }, vec![norm_out, wv], vec![v_out], "v_proj");
 
@@ -2357,10 +2247,10 @@ mod tests {
         let gemm_out = graph.add_tensor_concrete("gemm_out", &[64], DType::F32);
         let gelu_out = graph.add_tensor_concrete("gelu_out", &[64], DType::F32);
 
-        let gemm_id = graph.add_op(OpKind::Gemm {
+        let gemm_id = graph.add_op_with_op(Op::Gemm(GemmSpec { m: SymDim::Concrete(1), n: 64, k: 64, dtype: DType::F32, trans_b: false, has_bias: false }), OpKind::Gemm {
             m: SymDim::Concrete(1), n: 64, k: 64, dtype: DType::F32, trans_b: false,
         }, vec![input], vec![gemm_out], "gemm");
-        let gelu_id = graph.add_op(OpKind::Gelu, vec![gemm_out], vec![gelu_out], "gelu");
+        let gelu_id = graph.add_op_with_op(Op::Gelu, OpKind::Gelu, vec![gemm_out], vec![gelu_out], "gelu");
 
         // Act
         let gemm_op = graph.op(gemm_id).unwrap();
@@ -2384,9 +2274,9 @@ mod tests {
         let gemm_out = graph.add_tensor_concrete("gemm_out", &[64, 512], DType::F32);
         let weight = graph.add_tensor_concrete("weight", &[256, 512], DType::F32);
 
-        let norm_id = graph.add_op(OpKind::RmsNorm { feature_dim: 4096, eps: 1e-5 },
+        let norm_id = graph.add_op_with_op(Op::RmsNorm(NormSpec { feature_dim: 4096, eps: 1e-5, dtype: DType::F32, has_weight: true }), OpKind::RmsNorm { feature_dim: 4096, eps: 1e-5 },
             vec![input], vec![norm_out], "norm");
-        let gemm_id = graph.add_op(OpKind::GemmBias {
+        let gemm_id = graph.add_op_with_op(Op::GemmBias(GemmSpec { m: SymDim::Concrete(64), n: 512, k: 256, dtype: DType::F32, trans_b: false, has_bias: true }), OpKind::GemmBias {
             m: SymDim::Concrete(64), n: 512, k: 256, dtype: DType::F32, trans_b: false,
         }, vec![norm_out, weight], vec![gemm_out], "gemm_bias");
 
@@ -2414,15 +2304,15 @@ mod tests {
         let wk = graph.add_tensor_concrete("wk", &[256, 512], DType::F32);
         let wv = graph.add_tensor_concrete("wv", &[256, 512], DType::F32);
 
-        graph.add_op(OpKind::RmsNorm { feature_dim: 4096, eps: 1e-5 }, vec![input], vec![norm_out], "norm");
-        graph.add_op(OpKind::QuantGemm {
+        graph.add_op_with_op(Op::RmsNorm(NormSpec { feature_dim: 4096, eps: 1e-5, dtype: DType::F32, has_weight: true }), OpKind::RmsNorm { feature_dim: 4096, eps: 1e-5 }, vec![input], vec![norm_out], "norm");
+        graph.add_op_with_op(Op::QuantGemm(QuantGemmSpec { m: SymDim::Concrete(64), n: 512, k: 256, quant_type: QuantType::Q4_0 }), OpKind::QuantGemm {
             m: SymDim::Concrete(64), n: 512, k: 256, quant_type: QuantType::Q4_0,
         }, vec![norm_out, wq], vec![q_out], "q_proj");
-        graph.add_op(OpKind::QuantGemm {
+        graph.add_op_with_op(Op::QuantGemm(QuantGemmSpec { m: SymDim::Concrete(64), n: 512, k: 256, quant_type: QuantType::Q4_0 }), OpKind::QuantGemm {
             m: SymDim::Concrete(64), n: 512, k: 256, quant_type: QuantType::Q4_0,
         }, vec![norm_out, wk], vec![k_out], "k_proj");
         // V uses Q6K which is incompatible with Q4_0
-        graph.add_op(OpKind::QuantGemm {
+        graph.add_op_with_op(Op::QuantGemm(QuantGemmSpec { m: SymDim::Concrete(64), n: 512, k: 256, quant_type: QuantType::Q6K }), OpKind::QuantGemm {
             m: SymDim::Concrete(64), n: 512, k: 256, quant_type: QuantType::Q6K,
         }, vec![norm_out, wv], vec![v_out], "v_proj");
 
@@ -2446,7 +2336,7 @@ mod tests {
         let out_a = graph.add_tensor_concrete("out_a", &[32], DType::F32);
         let out_b = graph.add_tensor_concrete("out_b", &[32], DType::F32);
 
-        let start_id = graph.add_op(OpKind::Silu, vec![input], vec![out_a, out_b], "multi_silu");
+        let start_id = graph.add_op_with_op(Op::Silu, OpKind::Silu, vec![input], vec![out_a, out_b], "multi_silu");
 
         // Act
         let start_op = graph.op(start_id).unwrap();
@@ -2472,14 +2362,14 @@ mod tests {
         let w_gate = graph.add_tensor_concrete("w_gate", &[256, 512], DType::F32);
         let w_up = graph.add_tensor_concrete("w_up", &[256, 512], DType::F32);
 
-        graph.add_op(OpKind::Gemm {
+        graph.add_op_with_op(Op::Gemm(GemmSpec { m: SymDim::Concrete(64), n: 512, k: 256, dtype: DType::F32, trans_b: false, has_bias: false }), OpKind::Gemm {
             m: SymDim::Concrete(64), n: 512, k: 256, dtype: DType::F32, trans_b: false,
         }, vec![input, w_gate], vec![gate_out], "gate_gemm");
-        graph.add_op(OpKind::Gemm {
+        graph.add_op_with_op(Op::Gemm(GemmSpec { m: SymDim::Concrete(32), n: 512, k: 256, dtype: DType::F32, trans_b: false, has_bias: false }), OpKind::Gemm {
             m: SymDim::Concrete(32), n: 512, k: 256, dtype: DType::F32, trans_b: false,
         }, vec![input, w_up], vec![up_out], "up_gemm");
-        graph.add_op(OpKind::Silu, vec![gate_out], vec![silu_out], "silu");
-        graph.add_op(OpKind::Mul, vec![silu_out, up_out], vec![mul_out], "mul");
+        graph.add_op_with_op(Op::Silu, OpKind::Silu, vec![gate_out], vec![silu_out], "silu");
+        graph.add_op_with_op(Op::Mul, OpKind::Mul, vec![silu_out, up_out], vec![mul_out], "mul");
 
         let topo: Vec<OpId> = graph.ops.iter().map(|o| o.id).collect();
 
@@ -2501,10 +2391,10 @@ mod tests {
         let gemm_out = graph.add_tensor_concrete("gemm_out", &[64], DType::F32);
         let softmax_out = graph.add_tensor_concrete("softmax_out", &[64], DType::F32);
 
-        let gemm_id = graph.add_op(OpKind::Gemm {
+        let gemm_id = graph.add_op_with_op(Op::Gemm(GemmSpec { m: SymDim::Concrete(1), n: 64, k: 64, dtype: DType::F32, trans_b: false, has_bias: false }), OpKind::Gemm {
             m: SymDim::Concrete(1), n: 64, k: 64, dtype: DType::F32, trans_b: false,
         }, vec![input], vec![gemm_out], "gemm");
-        let _softmax_id = graph.add_op(OpKind::Softmax,
+        let _softmax_id = graph.add_op_with_op(Op::Softmax, OpKind::Softmax,
             vec![gemm_out], vec![softmax_out], "softmax");
 
         // Act
@@ -2535,20 +2425,20 @@ mod tests {
         let wk = graph.add_tensor_concrete("wk", &[256, 512], DType::F32);
         let wv = graph.add_tensor_concrete("wv", &[256, 512], DType::F32);
 
-        graph.add_op(OpKind::RmsNorm { feature_dim: 4096, eps: 1e-5 }, vec![input], vec![norm_out], "norm");
-        graph.add_op(OpKind::Gemm {
+        graph.add_op_with_op(Op::RmsNorm(NormSpec { feature_dim: 4096, eps: 1e-5, dtype: DType::F32, has_weight: true }), OpKind::RmsNorm { feature_dim: 4096, eps: 1e-5 }, vec![input], vec![norm_out], "norm");
+        graph.add_op_with_op(Op::Gemm(GemmSpec { m: SymDim::Concrete(64), n: 512, k: 256, dtype: DType::F32, trans_b: false, has_bias: false }), OpKind::Gemm {
             m: SymDim::Concrete(64), n: 512, k: 256, dtype: DType::F32, trans_b: false,
         }, vec![norm_out, wq], vec![q_out], "q_proj");
-        graph.add_op(OpKind::Gemm {
+        graph.add_op_with_op(Op::Gemm(GemmSpec { m: SymDim::Concrete(64), n: 512, k: 256, dtype: DType::F32, trans_b: false, has_bias: false }), OpKind::Gemm {
             m: SymDim::Concrete(64), n: 512, k: 256, dtype: DType::F32, trans_b: false,
         }, vec![norm_out, wk], vec![k_out], "k_proj");
-        graph.add_op(OpKind::Gemm {
+        graph.add_op_with_op(Op::Gemm(GemmSpec { m: SymDim::Concrete(64), n: 512, k: 256, dtype: DType::F32, trans_b: false, has_bias: false }), OpKind::Gemm {
             m: SymDim::Concrete(64), n: 512, k: 256, dtype: DType::F32, trans_b: false,
         }, vec![norm_out, wv], vec![v_out], "v_proj");
         // QkNorm present but NO RoPE after them
-        graph.add_op(OpKind::QkNorm { head_dim: 512, eps: 1e-5 }, vec![q_out], vec![qk_norm_q_out], "qk_norm_q");
-        graph.add_op(OpKind::QkNorm { head_dim: 512, eps: 1e-5 }, vec![k_out], vec![qk_norm_k_out], "qk_norm_k");
-        graph.add_op(OpKind::ValueNorm { feature_dim: 4096, eps: 1e-5 }, vec![v_out], vec![value_norm_out], "value_norm");
+        graph.add_op_with_op(Op::QkNorm { head_dim: 512, eps: 1e-5 }, OpKind::QkNorm { head_dim: 512, eps: 1e-5 }, vec![q_out], vec![qk_norm_q_out], "qk_norm_q");
+        graph.add_op_with_op(Op::QkNorm { head_dim: 512, eps: 1e-5 }, OpKind::QkNorm { head_dim: 512, eps: 1e-5 }, vec![k_out], vec![qk_norm_k_out], "qk_norm_k");
+        graph.add_op_with_op(Op::ValueNorm(NormSpec { feature_dim: 4096, eps: 1e-5, dtype: DType::F32, has_weight: false }), OpKind::ValueNorm { feature_dim: 4096, eps: 1e-5 }, vec![v_out], vec![value_norm_out], "value_norm");
 
         let topo: Vec<OpId> = graph.ops.iter().map(|o| o.id).collect();
 
@@ -2574,14 +2464,12 @@ mod tests {
         let gemm_out = graph.add_tensor_concrete("gemm_out", &[64, 512], DType::F32);
         let weight = graph.add_tensor_concrete("weight", &[256, 512], DType::F32);
 
-        let norm_id = graph.add_op(
-            OpKind::RmsNorm { feature_dim: 4096, eps: 1e-5 },
+        let norm_id = graph.add_op_with_op(Op::RmsNorm(NormSpec { feature_dim: 4096, eps: 1e-5, dtype: DType::F32, has_weight: true }), OpKind::RmsNorm { feature_dim: 4096, eps: 1e-5 },
             vec![input],
             vec![norm_out],
             "norm",
         );
-        let gemm_id = graph.add_op(
-            OpKind::GemmBias {
+        let gemm_id = graph.add_op_with_op(Op::GemmBias(GemmSpec { m: SymDim::Concrete(64), n: 512, k: 256, dtype: DType::F32, trans_b: false, has_bias: true }), OpKind::GemmBias {
                 m: SymDim::Concrete(64),
                 n: 512,
                 k: 256,
@@ -2627,14 +2515,12 @@ mod tests {
         let gemm_out = graph.add_tensor_concrete("gemm_out", &[64, 512], DType::F32);
         let weight = graph.add_tensor_concrete("weight", &[256, 512], DType::F32);
 
-        let norm_id = graph.add_op(
-            OpKind::RmsNorm { feature_dim: 4096, eps: 1e-5 },
+        let norm_id = graph.add_op_with_op(Op::RmsNorm(NormSpec { feature_dim: 4096, eps: 1e-5, dtype: DType::F32, has_weight: true }), OpKind::RmsNorm { feature_dim: 4096, eps: 1e-5 },
             vec![input],
             vec![norm_out],
             "norm",
         );
-        let gemm_id = graph.add_op(
-            OpKind::QuantGemm {
+        let gemm_id = graph.add_op_with_op(Op::QuantGemm(QuantGemmSpec { m: SymDim::Concrete(64), n: 512, k: 256, quant_type: QuantType::Q4_0 }), OpKind::QuantGemm {
                 m: SymDim::Concrete(64),
                 n: 512,
                 k: 256,
@@ -2681,15 +2567,15 @@ mod tests {
         let wk = graph.add_tensor_concrete("wk", &[256, 512], DType::F32);
         let wv = graph.add_tensor_concrete("wv", &[256, 512], DType::F32);
 
-        graph.add_op(OpKind::RmsNorm { feature_dim: 4096, eps: 1e-5 }, vec![input], vec![norm_out], "norm");
-        graph.add_op(OpKind::Gemm {
+        graph.add_op_with_op(Op::RmsNorm(NormSpec { feature_dim: 4096, eps: 1e-5, dtype: DType::F32, has_weight: true }), OpKind::RmsNorm { feature_dim: 4096, eps: 1e-5 }, vec![input], vec![norm_out], "norm");
+        graph.add_op_with_op(Op::Gemm(GemmSpec { m: SymDim::Concrete(64), n: 512, k: 256, dtype: DType::F32, trans_b: false, has_bias: false }), OpKind::Gemm {
             m: SymDim::Concrete(64), n: 512, k: 256, dtype: DType::F32, trans_b: false,
         }, vec![norm_out, wq], vec![q_out], "q_proj");
         // K GEMM has 2 outputs -> trace will skip it (gemm_op.outputs.len() != 1)
-        graph.add_op(OpKind::Gemm {
+        graph.add_op_with_op(Op::Gemm(GemmSpec { m: SymDim::Concrete(64), n: 512, k: 256, dtype: DType::F32, trans_b: false, has_bias: false }), OpKind::Gemm {
             m: SymDim::Concrete(64), n: 512, k: 256, dtype: DType::F32, trans_b: false,
         }, vec![norm_out, wk], vec![k_out_a, k_out_b], "k_proj");
-        graph.add_op(OpKind::Gemm {
+        graph.add_op_with_op(Op::Gemm(GemmSpec { m: SymDim::Concrete(64), n: 512, k: 256, dtype: DType::F32, trans_b: false, has_bias: false }), OpKind::Gemm {
             m: SymDim::Concrete(64), n: 512, k: 256, dtype: DType::F32, trans_b: false,
         }, vec![norm_out, wv], vec![v_out], "v_proj");
 
@@ -2724,28 +2610,28 @@ mod tests {
         let wk = graph.add_tensor_concrete("wk", &[256, 512], DType::F32);
         let wv = graph.add_tensor_concrete("wv", &[256, 512], DType::F32);
 
-        graph.add_op(OpKind::RmsNorm { feature_dim: 4096, eps: 1e-5 }, vec![input], vec![norm_out], "norm");
-        graph.add_op(OpKind::Gemm {
+        graph.add_op_with_op(Op::RmsNorm(NormSpec { feature_dim: 4096, eps: 1e-5, dtype: DType::F32, has_weight: true }), OpKind::RmsNorm { feature_dim: 4096, eps: 1e-5 }, vec![input], vec![norm_out], "norm");
+        graph.add_op_with_op(Op::Gemm(GemmSpec { m: SymDim::Concrete(64), n: 512, k: 256, dtype: DType::F32, trans_b: false, has_bias: false }), OpKind::Gemm {
             m: SymDim::Concrete(64), n: 512, k: 256, dtype: DType::F32, trans_b: false,
         }, vec![norm_out, wq], vec![q_out], "q_proj");
-        graph.add_op(OpKind::Gemm {
+        graph.add_op_with_op(Op::Gemm(GemmSpec { m: SymDim::Concrete(64), n: 512, k: 256, dtype: DType::F32, trans_b: false, has_bias: false }), OpKind::Gemm {
             m: SymDim::Concrete(64), n: 512, k: 256, dtype: DType::F32, trans_b: false,
         }, vec![norm_out, wk], vec![k_out], "k_proj");
-        graph.add_op(OpKind::Gemm {
+        graph.add_op_with_op(Op::Gemm(GemmSpec { m: SymDim::Concrete(64), n: 512, k: 256, dtype: DType::F32, trans_b: false, has_bias: false }), OpKind::Gemm {
             m: SymDim::Concrete(64), n: 512, k: 256, dtype: DType::F32, trans_b: false,
         }, vec![norm_out, wv], vec![v_out], "v_proj");
         // All 3 go to QkNorm -> RoPE, no ValueNorm path
-        graph.add_op(OpKind::QkNorm { head_dim: 512, eps: 1e-5 },
+        graph.add_op_with_op(Op::QkNorm { head_dim: 512, eps: 1e-5 }, OpKind::QkNorm { head_dim: 512, eps: 1e-5 },
             vec![q_out], vec![qkn1_out], "qkn1");
-        graph.add_op(OpKind::QkNorm { head_dim: 512, eps: 1e-5 },
+        graph.add_op_with_op(Op::QkNorm { head_dim: 512, eps: 1e-5 }, OpKind::QkNorm { head_dim: 512, eps: 1e-5 },
             vec![k_out], vec![qkn2_out], "qkn2");
-        graph.add_op(OpKind::QkNorm { head_dim: 512, eps: 1e-5 },
+        graph.add_op_with_op(Op::QkNorm { head_dim: 512, eps: 1e-5 }, OpKind::QkNorm { head_dim: 512, eps: 1e-5 },
             vec![v_out], vec![qkn3_out], "qkn3");
-        graph.add_op(OpKind::RoPE { num_heads: 8, head_dim: 64, theta: 10000.0, partial: 1.0, rope_scaling: None },
+        graph.add_op_with_op(Op::RoPE(RopeSpec { num_heads: 8, head_dim: 64, theta: 10000.0, partial: 1.0, rope_scaling: None }), OpKind::RoPE { num_heads: 8, head_dim: 64, theta: 10000.0, partial: 1.0, rope_scaling: None },
             vec![qkn1_out], vec![rope1_out], "rope1");
-        graph.add_op(OpKind::RoPE { num_heads: 8, head_dim: 64, theta: 10000.0, partial: 1.0, rope_scaling: None },
+        graph.add_op_with_op(Op::RoPE(RopeSpec { num_heads: 8, head_dim: 64, theta: 10000.0, partial: 1.0, rope_scaling: None }), OpKind::RoPE { num_heads: 8, head_dim: 64, theta: 10000.0, partial: 1.0, rope_scaling: None },
             vec![qkn2_out], vec![rope2_out], "rope2");
-        graph.add_op(OpKind::RoPE { num_heads: 8, head_dim: 64, theta: 10000.0, partial: 1.0, rope_scaling: None },
+        graph.add_op_with_op(Op::RoPE(RopeSpec { num_heads: 8, head_dim: 64, theta: 10000.0, partial: 1.0, rope_scaling: None }), OpKind::RoPE { num_heads: 8, head_dim: 64, theta: 10000.0, partial: 1.0, rope_scaling: None },
             vec![qkn3_out], vec![rope3_out], "rope3");
 
         let topo: Vec<OpId> = graph.ops.iter().map(|o| o.id).collect();
@@ -2772,14 +2658,14 @@ mod tests {
         let w_gate = graph.add_tensor_concrete("w_gate", &[256, 512], DType::F32);
         let w_up = graph.add_tensor_concrete("w_up", &[256, 512], DType::F32);
 
-        let gate_gemm_id = graph.add_op(OpKind::QuantGemm {
+        let gate_gemm_id = graph.add_op_with_op(Op::QuantGemm(QuantGemmSpec { m: SymDim::Concrete(64), n: 512, k: 256, quant_type: QuantType::Q4_0 }), OpKind::QuantGemm {
             m: SymDim::Concrete(64), n: 512, k: 256, quant_type: QuantType::Q4_0,
         }, vec![input, w_gate], vec![gate_out], "gate_qgemm");
-        let up_gemm_id = graph.add_op(OpKind::QuantGemm {
+        let up_gemm_id = graph.add_op_with_op(Op::QuantGemm(QuantGemmSpec { m: SymDim::Concrete(64), n: 512, k: 256, quant_type: QuantType::Q4_0 }), OpKind::QuantGemm {
             m: SymDim::Concrete(64), n: 512, k: 256, quant_type: QuantType::Q4_0,
         }, vec![input, w_up], vec![up_out], "up_qgemm");
-        let silu_id = graph.add_op(OpKind::Silu, vec![gate_out], vec![silu_out], "silu");
-        let mul_id = graph.add_op(OpKind::Mul, vec![silu_out, up_out], vec![mul_out], "mul");
+        let silu_id = graph.add_op_with_op(Op::Silu, OpKind::Silu, vec![gate_out], vec![silu_out], "silu");
+        let mul_id = graph.add_op_with_op(Op::Mul, OpKind::Mul, vec![silu_out, up_out], vec![mul_out], "mul");
 
         let topo: Vec<OpId> = graph.ops.iter().map(|o| o.id).collect();
 
@@ -2813,14 +2699,14 @@ mod tests {
         let w_up = graph.add_tensor_concrete("w_up", &[256, 512], DType::F32);
 
         // gate_gemm -> gate_out, Silu applied to up_out (not gate_out)
-        graph.add_op(OpKind::Gemm {
+        graph.add_op_with_op(Op::Gemm(GemmSpec { m: SymDim::Concrete(64), n: 512, k: 256, dtype: DType::F32, trans_b: false, has_bias: false }), OpKind::Gemm {
             m: SymDim::Concrete(64), n: 512, k: 256, dtype: DType::F32, trans_b: false,
         }, vec![input, w_gate], vec![gate_out], "gate_gemm");
-        graph.add_op(OpKind::Gemm {
+        graph.add_op_with_op(Op::Gemm(GemmSpec { m: SymDim::Concrete(64), n: 512, k: 256, dtype: DType::F32, trans_b: false, has_bias: false }), OpKind::Gemm {
             m: SymDim::Concrete(64), n: 512, k: 256, dtype: DType::F32, trans_b: false,
         }, vec![input, w_up], vec![up_out], "up_gemm");
         // Silu takes up_out (not gate_out), so activation producer is up_gemm not gate_gemm
-        graph.add_op(OpKind::Silu, vec![up_out], vec![silu_out], "silu");
+        graph.add_op_with_op(Op::Silu, OpKind::Silu, vec![up_out], vec![silu_out], "silu");
         // Mul: gate_out + silu_out — gate_gemm is GEMM, silu producer is up_gemm (also GEMM)
         // But gate_gemm and up_gemm don't share input with each other through the activation path
         // In this configuration, is_gemm(pa)=true, is_activation(pb)=true
@@ -2829,7 +2715,7 @@ mod tests {
         // gate_first_input = up_gemm.inputs[0] = input
         // up_first_input = gate_gemm.inputs[0] = input  — they DO share input!
         // This is actually a valid FFN block (just swapped gate/up roles)
-        graph.add_op(OpKind::Mul, vec![gate_out, silu_out], vec![mul_out], "mul");
+        graph.add_op_with_op(Op::Mul, OpKind::Mul, vec![gate_out, silu_out], vec![mul_out], "mul");
 
         let topo: Vec<OpId> = graph.ops.iter().map(|o| o.id).collect();
 
@@ -2855,8 +2741,8 @@ mod tests {
         let silu_out = graph.add_tensor_concrete("silu_out", &[16], DType::F32);
         let tanh_out = graph.add_tensor_concrete("tanh_out", &[16], DType::F32);
 
-        let silu_id = graph.add_op(OpKind::Silu, vec![input], vec![silu_out], "silu");
-        let tanh_id = graph.add_op(OpKind::Tanh, vec![silu_out], vec![tanh_out], "tanh");
+        let silu_id = graph.add_op_with_op(Op::Silu, OpKind::Silu, vec![input], vec![silu_out], "silu");
+        let tanh_id = graph.add_op_with_op(Op::Tanh, OpKind::Tanh, vec![silu_out], vec![tanh_out], "tanh");
 
         let profile = DeviceProfile::detect();
         let plan = ExecutionPlan::from_profile(&profile);
@@ -2892,25 +2778,25 @@ mod tests {
         let wk = graph.add_tensor_concrete("wk", &[256, 512], DType::F32);
         let wv = graph.add_tensor_concrete("wv", &[256, 512], DType::F32);
 
-        graph.add_op(OpKind::RmsNorm { feature_dim: 4096, eps: 1e-5 }, vec![input], vec![norm_out], "norm");
-        graph.add_op(OpKind::Gemm {
+        graph.add_op_with_op(Op::RmsNorm(NormSpec { feature_dim: 4096, eps: 1e-5, dtype: DType::F32, has_weight: true }), OpKind::RmsNorm { feature_dim: 4096, eps: 1e-5 }, vec![input], vec![norm_out], "norm");
+        graph.add_op_with_op(Op::Gemm(GemmSpec { m: SymDim::Concrete(64), n: 512, k: 256, dtype: DType::F32, trans_b: false, has_bias: false }), OpKind::Gemm {
             m: SymDim::Concrete(64), n: 512, k: 256, dtype: DType::F32, trans_b: false,
         }, vec![norm_out, wq], vec![q_out], "q_proj");
-        graph.add_op(OpKind::Gemm {
+        graph.add_op_with_op(Op::Gemm(GemmSpec { m: SymDim::Concrete(64), n: 512, k: 256, dtype: DType::F32, trans_b: false, has_bias: false }), OpKind::Gemm {
             m: SymDim::Concrete(64), n: 512, k: 256, dtype: DType::F32, trans_b: false,
         }, vec![norm_out, wk], vec![k_out], "k_proj");
-        graph.add_op(OpKind::Gemm {
+        graph.add_op_with_op(Op::Gemm(GemmSpec { m: SymDim::Concrete(64), n: 512, k: 256, dtype: DType::F32, trans_b: false, has_bias: false }), OpKind::Gemm {
             m: SymDim::Concrete(64), n: 512, k: 256, dtype: DType::F32, trans_b: false,
         }, vec![norm_out, wv], vec![v_out], "v_proj");
-        graph.add_op(OpKind::QkNorm { head_dim: 512, eps: 1e-5 },
+        graph.add_op_with_op(Op::QkNorm { head_dim: 512, eps: 1e-5 }, OpKind::QkNorm { head_dim: 512, eps: 1e-5 },
             vec![q_out], vec![qkn_q_out], "qkn_q");
-        graph.add_op(OpKind::QkNorm { head_dim: 512, eps: 1e-5 },
+        graph.add_op_with_op(Op::QkNorm { head_dim: 512, eps: 1e-5 }, OpKind::QkNorm { head_dim: 512, eps: 1e-5 },
             vec![k_out], vec![qkn_k_out], "qkn_k");
         // V goes to Silu instead of ValueNorm
-        graph.add_op(OpKind::Silu, vec![v_out], vec![silu_out], "silu_v");
-        graph.add_op(OpKind::RoPE { num_heads: 8, head_dim: 64, theta: 10000.0, partial: 1.0, rope_scaling: None },
+        graph.add_op_with_op(Op::Silu, OpKind::Silu, vec![v_out], vec![silu_out], "silu_v");
+        graph.add_op_with_op(Op::RoPE(RopeSpec { num_heads: 8, head_dim: 64, theta: 10000.0, partial: 1.0, rope_scaling: None }), OpKind::RoPE { num_heads: 8, head_dim: 64, theta: 10000.0, partial: 1.0, rope_scaling: None },
             vec![qkn_q_out], vec![rope_q_out], "rope_q");
-        graph.add_op(OpKind::RoPE { num_heads: 8, head_dim: 64, theta: 10000.0, partial: 1.0, rope_scaling: None },
+        graph.add_op_with_op(Op::RoPE(RopeSpec { num_heads: 8, head_dim: 64, theta: 10000.0, partial: 1.0, rope_scaling: None }), OpKind::RoPE { num_heads: 8, head_dim: 64, theta: 10000.0, partial: 1.0, rope_scaling: None },
             vec![qkn_k_out], vec![rope_k_out], "rope_k");
 
         let topo: Vec<OpId> = graph.ops.iter().map(|o| o.id).collect();
@@ -2943,25 +2829,25 @@ mod tests {
         let wk = graph.add_tensor_concrete("wk", &[256, 512], DType::F32);
         let wv = graph.add_tensor_concrete("wv", &[256, 512], DType::F32);
 
-        graph.add_op(OpKind::RmsNorm { feature_dim: 4096, eps: 1e-5 }, vec![input], vec![norm_out], "norm");
-        graph.add_op(OpKind::QuantGemm {
+        graph.add_op_with_op(Op::RmsNorm(NormSpec { feature_dim: 4096, eps: 1e-5, dtype: DType::F32, has_weight: true }), OpKind::RmsNorm { feature_dim: 4096, eps: 1e-5 }, vec![input], vec![norm_out], "norm");
+        graph.add_op_with_op(Op::QuantGemm(QuantGemmSpec { m: SymDim::Concrete(64), n: 512, k: 256, quant_type: QuantType::Q4_0 }), OpKind::QuantGemm {
             m: SymDim::Concrete(64), n: 512, k: 256, quant_type: QuantType::Q4_0,
         }, vec![norm_out, wq], vec![q_out], "q_proj");
-        graph.add_op(OpKind::QuantGemm {
+        graph.add_op_with_op(Op::QuantGemm(QuantGemmSpec { m: SymDim::Concrete(64), n: 512, k: 256, quant_type: QuantType::Q4_0 }), OpKind::QuantGemm {
             m: SymDim::Concrete(64), n: 512, k: 256, quant_type: QuantType::Q4_0,
         }, vec![norm_out, wk], vec![k_out], "k_proj");
         // V uses incompatible Q6K
-        graph.add_op(OpKind::QuantGemm {
+        graph.add_op_with_op(Op::QuantGemm(QuantGemmSpec { m: SymDim::Concrete(64), n: 512, k: 256, quant_type: QuantType::Q6K }), OpKind::QuantGemm {
             m: SymDim::Concrete(64), n: 512, k: 256, quant_type: QuantType::Q6K,
         }, vec![norm_out, wv], vec![v_out], "v_proj");
-        graph.add_op(OpKind::QkNorm { head_dim: 512, eps: 1e-5 },
+        graph.add_op_with_op(Op::QkNorm { head_dim: 512, eps: 1e-5 }, OpKind::QkNorm { head_dim: 512, eps: 1e-5 },
             vec![q_out], vec![qkn_q_out], "qkn_q");
-        graph.add_op(OpKind::QkNorm { head_dim: 512, eps: 1e-5 },
+        graph.add_op_with_op(Op::QkNorm { head_dim: 512, eps: 1e-5 }, OpKind::QkNorm { head_dim: 512, eps: 1e-5 },
             vec![k_out], vec![qkn_k_out], "qkn_k");
-        graph.add_op(OpKind::ValueNorm { feature_dim: 4096, eps: 1e-5 }, vec![v_out], vec![vn_out], "vn");
-        graph.add_op(OpKind::RoPE { num_heads: 8, head_dim: 64, theta: 10000.0, partial: 1.0, rope_scaling: None },
+        graph.add_op_with_op(Op::ValueNorm(NormSpec { feature_dim: 4096, eps: 1e-5, dtype: DType::F32, has_weight: false }), OpKind::ValueNorm { feature_dim: 4096, eps: 1e-5 }, vec![v_out], vec![vn_out], "vn");
+        graph.add_op_with_op(Op::RoPE(RopeSpec { num_heads: 8, head_dim: 64, theta: 10000.0, partial: 1.0, rope_scaling: None }), OpKind::RoPE { num_heads: 8, head_dim: 64, theta: 10000.0, partial: 1.0, rope_scaling: None },
             vec![qkn_q_out], vec![rope_q_out], "rope_q");
-        graph.add_op(OpKind::RoPE { num_heads: 8, head_dim: 64, theta: 10000.0, partial: 1.0, rope_scaling: None },
+        graph.add_op_with_op(Op::RoPE(RopeSpec { num_heads: 8, head_dim: 64, theta: 10000.0, partial: 1.0, rope_scaling: None }), OpKind::RoPE { num_heads: 8, head_dim: 64, theta: 10000.0, partial: 1.0, rope_scaling: None },
             vec![qkn_k_out], vec![rope_k_out], "rope_k");
 
         let topo: Vec<OpId> = graph.ops.iter().map(|o| o.id).collect();
@@ -2985,11 +2871,11 @@ mod tests {
         let silu_out = graph.add_tensor_concrete("silu_out", &[64], DType::F32);
         let gelu_out = graph.add_tensor_concrete("gelu_out", &[64], DType::F32);
 
-        let gemm_id = graph.add_op(OpKind::Gemm {
+        let gemm_id = graph.add_op_with_op(Op::Gemm(GemmSpec { m: SymDim::Concrete(1), n: 64, k: 64, dtype: DType::F32, trans_b: false, has_bias: false }), OpKind::Gemm {
             m: SymDim::Concrete(1), n: 64, k: 64, dtype: DType::F32, trans_b: false,
         }, vec![input], vec![gemm_out], "gemm");
-        let silu_id = graph.add_op(OpKind::Silu, vec![gemm_out], vec![silu_out], "silu");
-        let gelu_id = graph.add_op(OpKind::Gelu, vec![silu_out], vec![gelu_out], "gelu");
+        let silu_id = graph.add_op_with_op(Op::Silu, OpKind::Silu, vec![gemm_out], vec![silu_out], "silu");
+        let gelu_id = graph.add_op_with_op(Op::Gelu, OpKind::Gelu, vec![silu_out], vec![gelu_out], "gelu");
 
         // Act
         let gemm_op = graph.op(gemm_id).unwrap();
@@ -3019,14 +2905,12 @@ mod tests {
         let gemm_out = graph.add_tensor_concrete("gemm_out", &[8192, 512], DType::F32);
         let weight = graph.add_tensor_concrete("weight", &[8192, 512], DType::F32);
 
-        let norm_id = graph.add_op(
-            OpKind::RmsNorm { feature_dim: 4096, eps: 1e-5 },
+        let norm_id = graph.add_op_with_op(Op::RmsNorm(NormSpec { feature_dim: 4096, eps: 1e-5, dtype: DType::F32, has_weight: true }), OpKind::RmsNorm { feature_dim: 4096, eps: 1e-5 },
             vec![input],
             vec![norm_out],
             "norm",
         );
-        let gemm_id = graph.add_op(
-            OpKind::Gemm {
+        let gemm_id = graph.add_op_with_op(Op::Gemm(GemmSpec { m: SymDim::Concrete(8192), n: 512, k: 8192, dtype: DType::F32, trans_b: false, has_bias: false }), OpKind::Gemm {
                 m: SymDim::Concrete(8192),
                 n: 512,
                 k: 8192,
@@ -3065,14 +2949,11 @@ mod tests {
     fn test_collect_elementwise_chain_empty_outputs_start() {
         // Arrange: start op with no outputs -> chain should be empty
         let graph = CompilerGraph::new();
-        let start = CompilerOp::new_from_kind(
-            OpId(0),
-            OpKind::Silu,
+        let start = CompilerOp::new_from_op(OpId(0), Op::Silu, OpKind::Silu,
             vec![],
             vec![],
             "empty_start".to_string(),
-            LayerCondition::Always,
-            &CompilerGraph::new(),
+            LayerCondition::Always
         );
         let claimed = HashSet::new();
 
@@ -3105,27 +2986,27 @@ mod tests {
         let wk = graph.add_tensor_concrete("wk", &[256, 512], DType::F32);
         let wv = graph.add_tensor_concrete("wv", &[256, 512], DType::F32);
 
-        graph.add_op(OpKind::RmsNorm { feature_dim: 4096, eps: 1e-5 }, vec![input], vec![norm_out], "norm");
-        graph.add_op(OpKind::Gemm {
+        graph.add_op_with_op(Op::RmsNorm(NormSpec { feature_dim: 4096, eps: 1e-5, dtype: DType::F32, has_weight: true }), OpKind::RmsNorm { feature_dim: 4096, eps: 1e-5 }, vec![input], vec![norm_out], "norm");
+        graph.add_op_with_op(Op::Gemm(GemmSpec { m: SymDim::Concrete(64), n: 512, k: 256, dtype: DType::F32, trans_b: false, has_bias: false }), OpKind::Gemm {
             m: SymDim::Concrete(64), n: 512, k: 256, dtype: DType::F32, trans_b: false,
         }, vec![norm_out, wq], vec![q_out], "q_proj");
-        graph.add_op(OpKind::Gemm {
+        graph.add_op_with_op(Op::Gemm(GemmSpec { m: SymDim::Concrete(64), n: 512, k: 256, dtype: DType::F32, trans_b: false, has_bias: false }), OpKind::Gemm {
             m: SymDim::Concrete(64), n: 512, k: 256, dtype: DType::F32, trans_b: false,
         }, vec![norm_out, wk], vec![k_out], "k_proj");
-        graph.add_op(OpKind::Gemm {
+        graph.add_op_with_op(Op::Gemm(GemmSpec { m: SymDim::Concrete(64), n: 512, k: 256, dtype: DType::F32, trans_b: false, has_bias: false }), OpKind::Gemm {
             m: SymDim::Concrete(64), n: 512, k: 256, dtype: DType::F32, trans_b: false,
         }, vec![norm_out, wv], vec![v_out], "v_proj");
-        graph.add_op(OpKind::QkNorm { head_dim: 512, eps: 1e-5 },
+        graph.add_op_with_op(Op::QkNorm { head_dim: 512, eps: 1e-5 }, OpKind::QkNorm { head_dim: 512, eps: 1e-5 },
             vec![q_out], vec![qkn_q_out], "qkn_q");
-        graph.add_op(OpKind::QkNorm { head_dim: 512, eps: 1e-5 },
+        graph.add_op_with_op(Op::QkNorm { head_dim: 512, eps: 1e-5 }, OpKind::QkNorm { head_dim: 512, eps: 1e-5 },
             vec![k_out], vec![qkn_k_out], "qkn_k");
-        graph.add_op(OpKind::ValueNorm { feature_dim: 4096, eps: 1e-5 }, vec![v_out], vec![vn_out], "vn");
+        graph.add_op_with_op(Op::ValueNorm(NormSpec { feature_dim: 4096, eps: 1e-5, dtype: DType::F32, has_weight: false }), OpKind::ValueNorm { feature_dim: 4096, eps: 1e-5 }, vec![v_out], vec![vn_out], "vn");
         // QkNorm q output has 2 consumers: RoPE + extra Silu -> RoPE trace will find
         // qkn_q_out has 2 consumers, so norm_out_t.consumers.len() != 1 for the RoPE lookup
-        graph.add_op(OpKind::RoPE { num_heads: 8, head_dim: 64, theta: 10000.0, partial: 1.0, rope_scaling: None },
+        graph.add_op_with_op(Op::RoPE(RopeSpec { num_heads: 8, head_dim: 64, theta: 10000.0, partial: 1.0, rope_scaling: None }), OpKind::RoPE { num_heads: 8, head_dim: 64, theta: 10000.0, partial: 1.0, rope_scaling: None },
             vec![qkn_q_out], vec![rope_q_out], "rope_q");
-        graph.add_op(OpKind::Silu, vec![qkn_q_out], vec![extra_out], "extra");
-        graph.add_op(OpKind::RoPE { num_heads: 8, head_dim: 64, theta: 10000.0, partial: 1.0, rope_scaling: None },
+        graph.add_op_with_op(Op::Silu, OpKind::Silu, vec![qkn_q_out], vec![extra_out], "extra");
+        graph.add_op_with_op(Op::RoPE(RopeSpec { num_heads: 8, head_dim: 64, theta: 10000.0, partial: 1.0, rope_scaling: None }), OpKind::RoPE { num_heads: 8, head_dim: 64, theta: 10000.0, partial: 1.0, rope_scaling: None },
             vec![qkn_k_out], vec![rope_k_out], "rope_k");
 
         let topo: Vec<OpId> = graph.ops.iter().map(|o| o.id).collect();
@@ -3152,15 +3033,15 @@ mod tests {
         let w_gate = graph.add_tensor_concrete("w_gate", &[256, 512], DType::F32);
         let w_up = graph.add_tensor_concrete("w_up", &[256, 512], DType::F32);
 
-        graph.add_op(OpKind::Gemm {
+        graph.add_op_with_op(Op::Gemm(GemmSpec { m: SymDim::Concrete(64), n: 512, k: 256, dtype: DType::F32, trans_b: false, has_bias: false }), OpKind::Gemm {
             m: SymDim::Concrete(64), n: 512, k: 256, dtype: DType::F32, trans_b: false,
         }, vec![input, w_gate], vec![gate_out], "gate_gemm");
-        graph.add_op(OpKind::Gemm {
+        graph.add_op_with_op(Op::Gemm(GemmSpec { m: SymDim::Concrete(64), n: 512, k: 256, dtype: DType::F32, trans_b: false, has_bias: false }), OpKind::Gemm {
             m: SymDim::Concrete(64), n: 512, k: 256, dtype: DType::F32, trans_b: false,
         }, vec![input, w_up], vec![up_out], "up_gemm");
-        graph.add_op(OpKind::Silu, vec![gate_out], vec![silu_out], "silu");
+        graph.add_op_with_op(Op::Silu, OpKind::Silu, vec![gate_out], vec![silu_out], "silu");
         // Mul with only 1 input (should be 2) — guard at mul_op.inputs.len() != 2
-        graph.add_op(OpKind::Mul, vec![silu_out], vec![mul_out], "mul");
+        graph.add_op_with_op(Op::Mul, OpKind::Mul, vec![silu_out], vec![mul_out], "mul");
 
         let topo: Vec<OpId> = graph.ops.iter().map(|o| o.id).collect();
 
@@ -3188,15 +3069,15 @@ mod tests {
         let wk = graph.add_tensor_concrete("wk", &[256, 512], DType::F32);
         let wv = graph.add_tensor_concrete("wv", &[256, 512], DType::F32);
 
-        graph.add_op(OpKind::RmsNorm { feature_dim: 4096, eps: 1e-5 }, vec![input], vec![norm_out], "norm");
-        graph.add_op(OpKind::Gemm {
+        graph.add_op_with_op(Op::RmsNorm(NormSpec { feature_dim: 4096, eps: 1e-5, dtype: DType::F32, has_weight: true }), OpKind::RmsNorm { feature_dim: 4096, eps: 1e-5 }, vec![input], vec![norm_out], "norm");
+        graph.add_op_with_op(Op::Gemm(GemmSpec { m: SymDim::Concrete(64), n: 512, k: 256, dtype: DType::F32, trans_b: false, has_bias: false }), OpKind::Gemm {
             m: SymDim::Concrete(64), n: 512, k: 256, dtype: DType::F32, trans_b: false,
         }, vec![norm_out, wq], vec![q_out], "q_proj");
-        graph.add_op(OpKind::Gemm {
+        graph.add_op_with_op(Op::Gemm(GemmSpec { m: SymDim::Concrete(64), n: 512, k: 256, dtype: DType::F32, trans_b: false, has_bias: false }), OpKind::Gemm {
             m: SymDim::Concrete(64), n: 512, k: 256, dtype: DType::F32, trans_b: false,
         }, vec![norm_out, wk], vec![k_out], "k_proj");
         // V uses QuantGemm Q4_0: (None, Some(Q4_0)) = Split -> incompatible with plain Gemms
-        graph.add_op(OpKind::QuantGemm {
+        graph.add_op_with_op(Op::QuantGemm(QuantGemmSpec { m: SymDim::Concrete(64), n: 512, k: 256, quant_type: QuantType::Q4_0 }), OpKind::QuantGemm {
             m: SymDim::Concrete(64), n: 512, k: 256, quant_type: QuantType::Q4_0,
         }, vec![norm_out, wv], vec![v_out], "v_proj");
 
@@ -3221,12 +3102,10 @@ mod tests {
         let gemm_out = graph.add_tensor_concrete("gemm_out", &[64, 512], DType::F32);
         let weight = graph.add_tensor_concrete("weight", &[256, 512], DType::F32);
 
-        let norm_id = graph.add_op(
-            OpKind::LayerNorm { feature_dim: 4096, eps: 1e-5 },
+        let norm_id = graph.add_op_with_op(Op::LayerNorm(NormSpec { feature_dim: 4096, eps: 1e-5, dtype: DType::F32, has_weight: true }), OpKind::LayerNorm { feature_dim: 4096, eps: 1e-5 },
             vec![input], vec![norm_out], "layernorm",
         );
-        let gemm_id = graph.add_op(
-            OpKind::GemmBias {
+        let gemm_id = graph.add_op_with_op(Op::GemmBias(GemmSpec { m: SymDim::Concrete(64), n: 512, k: 256, dtype: DType::F32, trans_b: false, has_bias: true }), OpKind::GemmBias {
                 m: SymDim::Concrete(64), n: 512, k: 256, dtype: DType::F32, trans_b: false,
             }, vec![norm_out, weight], vec![gemm_out], "gemm_bias",
         );
@@ -3256,9 +3135,9 @@ mod tests {
         let tanh_out = graph.add_tensor_concrete("tanh_out", &[1048576], DType::F32);
         let gelu_out = graph.add_tensor_concrete("gelu_out", &[1048576], DType::F32);
 
-        let silu_id = graph.add_op(OpKind::Silu, vec![input], vec![silu_out], "silu");
-        let tanh_id = graph.add_op(OpKind::Tanh, vec![silu_out], vec![tanh_out], "tanh");
-        let gelu_id = graph.add_op(OpKind::Gelu, vec![tanh_out], vec![gelu_out], "gelu");
+        let silu_id = graph.add_op_with_op(Op::Silu, OpKind::Silu, vec![input], vec![silu_out], "silu");
+        let tanh_id = graph.add_op_with_op(Op::Tanh, OpKind::Tanh, vec![silu_out], vec![tanh_out], "tanh");
+        let gelu_id = graph.add_op_with_op(Op::Gelu, OpKind::Gelu, vec![tanh_out], vec![gelu_out], "gelu");
 
         let profile = DeviceProfile::detect();
         let plan = ExecutionPlan::from_profile(&profile);
@@ -3292,9 +3171,9 @@ mod tests {
         let tanh_out = graph.add_tensor_concrete("tanh_out", &[64], DType::F32);
         let gelu_out = graph.add_tensor_concrete("gelu_out", &[64], DType::F32);
 
-        let silu_id = graph.add_op(OpKind::Silu, vec![input], vec![silu_out], "silu");
-        let tanh_id = graph.add_op(OpKind::Tanh, vec![silu_out], vec![tanh_out], "tanh");
-        let gelu_id = graph.add_op(OpKind::Gelu, vec![tanh_out], vec![gelu_out], "gelu");
+        let silu_id = graph.add_op_with_op(Op::Silu, OpKind::Silu, vec![input], vec![silu_out], "silu");
+        let tanh_id = graph.add_op_with_op(Op::Tanh, OpKind::Tanh, vec![silu_out], vec![tanh_out], "tanh");
+        let gelu_id = graph.add_op_with_op(Op::Gelu, OpKind::Gelu, vec![tanh_out], vec![gelu_out], "gelu");
 
         // Act
         let silu_op = graph.op(silu_id).unwrap();
@@ -3322,13 +3201,13 @@ mod tests {
         let w_up = graph.add_tensor_concrete("w_up", &[256, 512], DType::F32);
 
         // No gate_gemm: Silu takes raw input (graph input, no producer)
-        graph.add_op(OpKind::Silu, vec![input], vec![gate_out], "silu_gate");
-        graph.add_op(OpKind::Gemm {
+        graph.add_op_with_op(Op::Silu, OpKind::Silu, vec![input], vec![gate_out], "silu_gate");
+        graph.add_op_with_op(Op::Gemm(GemmSpec { m: SymDim::Concrete(64), n: 512, k: 256, dtype: DType::F32, trans_b: false, has_bias: false }), OpKind::Gemm {
             m: SymDim::Concrete(64), n: 512, k: 256, dtype: DType::F32, trans_b: false,
         }, vec![input, w_up], vec![up_out], "up_gemm");
         // Silu on gate_out to simulate activation
-        graph.add_op(OpKind::Silu, vec![gate_out], vec![silu_out], "silu");
-        graph.add_op(OpKind::Mul, vec![silu_out, up_out], vec![mul_out], "mul");
+        graph.add_op_with_op(Op::Silu, OpKind::Silu, vec![gate_out], vec![silu_out], "silu");
+        graph.add_op_with_op(Op::Mul, OpKind::Mul, vec![silu_out, up_out], vec![mul_out], "mul");
 
         let topo: Vec<OpId> = graph.ops.iter().map(|o| o.id).collect();
 
@@ -3357,10 +3236,10 @@ mod tests {
         graph.inputs.push(input);
         let out = graph.add_tensor_concrete("out", &[64], DType::F32);
 
-        let norm_id = graph.add_op(OpKind::RmsNorm { feature_dim: 4096, eps: 1e-5 }, vec![input], vec![out], "norm");
+        let norm_id = graph.add_op_with_op(Op::RmsNorm(NormSpec { feature_dim: 4096, eps: 1e-5, dtype: DType::F32, has_weight: true }), OpKind::RmsNorm { feature_dim: 4096, eps: 1e-5 }, vec![input], vec![out], "norm");
         // Create a Silu op (non-GEMM) that reads norm output
         let silu_out = graph.add_tensor_concrete("silu_out", &[64], DType::F32);
-        let silu_id = graph.add_op(OpKind::Silu, vec![out], vec![silu_out], "silu");
+        let silu_id = graph.add_op_with_op(Op::Silu, OpKind::Silu, vec![out], vec![silu_out], "silu");
 
         let silu_op = graph.op(silu_id).unwrap();
         let profile = DeviceProfile::detect();
@@ -3398,14 +3277,14 @@ mod tests {
         let wk = graph.add_tensor_concrete("wk", &[256, 512], DType::F32);
         let wv = graph.add_tensor_concrete("wv", &[256, 512], DType::F32);
 
-        graph.add_op(OpKind::RmsNorm { feature_dim: 4096, eps: 1e-5 }, vec![input], vec![norm_out], "norm");
-        graph.add_op(OpKind::QuantGemm {
+        graph.add_op_with_op(Op::RmsNorm(NormSpec { feature_dim: 4096, eps: 1e-5, dtype: DType::F32, has_weight: true }), OpKind::RmsNorm { feature_dim: 4096, eps: 1e-5 }, vec![input], vec![norm_out], "norm");
+        graph.add_op_with_op(Op::QuantGemm(QuantGemmSpec { m: SymDim::Concrete(64), n: 512, k: 256, quant_type: QuantType::Q4_0 }), OpKind::QuantGemm {
             m: SymDim::Concrete(64), n: 512, k: 256, quant_type: QuantType::Q4_0,
         }, vec![norm_out, wq], vec![q_out], "q_proj");
-        graph.add_op(OpKind::QuantGemm {
+        graph.add_op_with_op(Op::QuantGemm(QuantGemmSpec { m: SymDim::Concrete(64), n: 512, k: 256, quant_type: QuantType::Q4_0 }), OpKind::QuantGemm {
             m: SymDim::Concrete(64), n: 512, k: 256, quant_type: QuantType::Q4_0,
         }, vec![norm_out, wk], vec![k_out], "k_proj");
-        graph.add_op(OpKind::QuantGemm {
+        graph.add_op_with_op(Op::QuantGemm(QuantGemmSpec { m: SymDim::Concrete(64), n: 512, k: 256, quant_type: QuantType::Q4_0 }), OpKind::QuantGemm {
             m: SymDim::Concrete(64), n: 512, k: 256, quant_type: QuantType::Q4_0,
         }, vec![norm_out, wv], vec![v_out], "v_proj");
 
@@ -3429,11 +3308,11 @@ mod tests {
         let silu_out = graph.add_tensor_concrete("silu_out", &[64], DType::F32);
         let rope_out = graph.add_tensor_concrete("rope_out", &[64], DType::F32);
 
-        let gemm_id = graph.add_op(OpKind::Gemm {
+        let gemm_id = graph.add_op_with_op(Op::Gemm(GemmSpec { m: SymDim::Concrete(1), n: 64, k: 64, dtype: DType::F32, trans_b: false, has_bias: false }), OpKind::Gemm {
             m: SymDim::Concrete(1), n: 64, k: 64, dtype: DType::F32, trans_b: false,
         }, vec![input], vec![gemm_out], "gemm");
-        let silu_id = graph.add_op(OpKind::Silu, vec![gemm_out], vec![silu_out], "silu");
-        graph.add_op(OpKind::RoPE {
+        let silu_id = graph.add_op_with_op(Op::Silu, OpKind::Silu, vec![gemm_out], vec![silu_out], "silu");
+        graph.add_op_with_op(Op::RoPE(RopeSpec { num_heads: 1, head_dim: 64, theta: 10000.0, partial: 1.0, rope_scaling: None }), OpKind::RoPE {
             num_heads: 1, head_dim: 64, theta: 10000.0, partial: 1.0, rope_scaling: None,
         }, vec![silu_out], vec![rope_out], "rope");
 
@@ -3458,7 +3337,7 @@ mod tests {
         let weight = graph.add_tensor_concrete("weight", &[256, 512], DType::F32);
         let gemm_out = graph.add_tensor_concrete("gemm_out", &[64, 512], DType::F32);
 
-        let gemm_id = graph.add_op(OpKind::Gemm {
+        let gemm_id = graph.add_op_with_op(Op::Gemm(GemmSpec { m: SymDim::Concrete(64), n: 512, k: 256, dtype: DType::F32, trans_b: false, has_bias: false }), OpKind::Gemm {
             m: SymDim::Concrete(64), n: 512, k: 256, dtype: DType::F32, trans_b: false,
         }, vec![input, weight], vec![gemm_out], "gemm");
 
@@ -3482,9 +3361,9 @@ mod tests {
         let out_a = graph.add_tensor_concrete("out_a", &[64], DType::F32);
         let out_b = graph.add_tensor_concrete("out_b", &[64], DType::F32);
 
-        let silu_id = graph.add_op(OpKind::Silu, vec![input], vec![out_a], "silu");
+        let silu_id = graph.add_op_with_op(Op::Silu, OpKind::Silu, vec![input], vec![out_a], "silu");
         // GeLU reads from a tensor that is NOT the Silu output -> broken chain
-        let _gelu_id = graph.add_op(OpKind::Gelu, vec![out_b], vec![out_b], "gelu");
+        let _gelu_id = graph.add_op_with_op(Op::Gelu, OpKind::Gelu, vec![out_b], vec![out_b], "gelu");
 
         // Act
         let silu_op = graph.op(silu_id).unwrap();
@@ -3510,14 +3389,14 @@ mod tests {
         let w_gate = graph.add_tensor_concrete("w_gate", &[256, 512], DType::F32);
         let w_up = graph.add_tensor_concrete("w_up", &[256, 512], DType::F32);
 
-        let gate_id = graph.add_op(OpKind::GemmBias {
+        let gate_id = graph.add_op_with_op(Op::GemmBias(GemmSpec { m: SymDim::Concrete(64), n: 512, k: 256, dtype: DType::F32, trans_b: false, has_bias: true }), OpKind::GemmBias {
             m: SymDim::Concrete(64), n: 512, k: 256, dtype: DType::F32, trans_b: false,
         }, vec![input, w_gate], vec![gate_out], "gate");
-        let up_id = graph.add_op(OpKind::GemmBias {
+        let up_id = graph.add_op_with_op(Op::GemmBias(GemmSpec { m: SymDim::Concrete(64), n: 512, k: 256, dtype: DType::F32, trans_b: false, has_bias: true }), OpKind::GemmBias {
             m: SymDim::Concrete(64), n: 512, k: 256, dtype: DType::F32, trans_b: false,
         }, vec![input, w_up], vec![up_out], "up");
-        let silu_id = graph.add_op(OpKind::Silu, vec![gate_out], vec![silu_out], "silu");
-        let mul_id = graph.add_op(OpKind::Mul, vec![silu_out, up_out], vec![mul_out], "mul");
+        let silu_id = graph.add_op_with_op(Op::Silu, OpKind::Silu, vec![gate_out], vec![silu_out], "silu");
+        let mul_id = graph.add_op_with_op(Op::Mul, OpKind::Mul, vec![silu_out, up_out], vec![mul_out], "mul");
 
         let topo: Vec<OpId> = graph.ops.iter().map(|o| o.id).collect();
         // Act
@@ -3536,23 +3415,17 @@ mod tests {
     #[test]
     fn test_all_gemm_quant_compatible_q8_0_pair() {
         // Arrange: two QuantGemm ops both using Q8_0
-        let op1 = CompilerOp::new_from_kind(
-            OpId(0),
-            OpKind::QuantGemm { m: SymDim::Concrete(1), n: 256, k: 128, quant_type: QuantType::Q8_0, },
+        let op1 = CompilerOp::new_from_op(OpId(0), Op::QuantGemm(QuantGemmSpec { m: SymDim::Concrete(1), n: 256, k: 128, quant_type: QuantType::Q8_0 }), OpKind::QuantGemm { m: SymDim::Concrete(1), n: 256, k: 128, quant_type: QuantType::Q8_0, },
             vec![],
             vec![],
             "q1".to_string(),
-            LayerCondition::Always,
-            &CompilerGraph::new(),
+            LayerCondition::Always
         );
-        let op2 = CompilerOp::new_from_kind(
-            OpId(1),
-            OpKind::QuantGemm { m: SymDim::Concrete(1), n: 256, k: 128, quant_type: QuantType::Q8_0, },
+        let op2 = CompilerOp::new_from_op(OpId(1), Op::QuantGemm(QuantGemmSpec { m: SymDim::Concrete(1), n: 256, k: 128, quant_type: QuantType::Q8_0 }), OpKind::QuantGemm { m: SymDim::Concrete(1), n: 256, k: 128, quant_type: QuantType::Q8_0, },
             vec![],
             vec![],
             "q2".to_string(),
-            LayerCondition::Always,
-            &CompilerGraph::new(),
+            LayerCondition::Always
         );
         let ops: Vec<&CompilerOp> = vec![&op1, &op2];
         // Act
@@ -3583,26 +3456,26 @@ mod tests {
         let wk = graph.add_tensor_concrete("wk", &[256, 512], DType::F32);
         let wv = graph.add_tensor_concrete("wv", &[256, 512], DType::F32);
 
-        graph.add_op(OpKind::RmsNorm { feature_dim: 4096, eps: 1e-5 }, vec![input], vec![norm_out], "norm");
-        graph.add_op(OpKind::Gemm {
+        graph.add_op_with_op(Op::RmsNorm(NormSpec { feature_dim: 4096, eps: 1e-5, dtype: DType::F32, has_weight: true }), OpKind::RmsNorm { feature_dim: 4096, eps: 1e-5 }, vec![input], vec![norm_out], "norm");
+        graph.add_op_with_op(Op::Gemm(GemmSpec { m: SymDim::Concrete(64), n: 512, k: 256, dtype: DType::F32, trans_b: false, has_bias: false }), OpKind::Gemm {
             m: SymDim::Concrete(64), n: 512, k: 256, dtype: DType::F32, trans_b: false,
         }, vec![norm_out, wq], vec![q_out], "q_proj");
-        graph.add_op(OpKind::Gemm {
+        graph.add_op_with_op(Op::Gemm(GemmSpec { m: SymDim::Concrete(64), n: 512, k: 256, dtype: DType::F32, trans_b: false, has_bias: false }), OpKind::Gemm {
             m: SymDim::Concrete(64), n: 512, k: 256, dtype: DType::F32, trans_b: false,
         }, vec![norm_out, wk], vec![k_out], "k_proj");
-        graph.add_op(OpKind::Gemm {
+        graph.add_op_with_op(Op::Gemm(GemmSpec { m: SymDim::Concrete(64), n: 512, k: 256, dtype: DType::F32, trans_b: false, has_bias: false }), OpKind::Gemm {
             m: SymDim::Concrete(64), n: 512, k: 256, dtype: DType::F32, trans_b: false,
         }, vec![norm_out, wv], vec![v_out], "v_proj");
         // Q output has 2 consumers: QkNorm and an extra Silu
-        graph.add_op(OpKind::QkNorm { head_dim: 512, eps: 1e-5 },
+        graph.add_op_with_op(Op::QkNorm { head_dim: 512, eps: 1e-5 }, OpKind::QkNorm { head_dim: 512, eps: 1e-5 },
             vec![q_out], vec![qkn_q_out], "qkn_q");
-        graph.add_op(OpKind::Silu, vec![q_out], vec![extra_out], "extra");
-        graph.add_op(OpKind::QkNorm { head_dim: 512, eps: 1e-5 },
+        graph.add_op_with_op(Op::Silu, OpKind::Silu, vec![q_out], vec![extra_out], "extra");
+        graph.add_op_with_op(Op::QkNorm { head_dim: 512, eps: 1e-5 }, OpKind::QkNorm { head_dim: 512, eps: 1e-5 },
             vec![k_out], vec![qkn_k_out], "qkn_k");
-        graph.add_op(OpKind::ValueNorm { feature_dim: 4096, eps: 1e-5 }, vec![v_out], vec![vn_out], "vn");
-        graph.add_op(OpKind::RoPE { num_heads: 8, head_dim: 64, theta: 10000.0, partial: 1.0, rope_scaling: None },
+        graph.add_op_with_op(Op::ValueNorm(NormSpec { feature_dim: 4096, eps: 1e-5, dtype: DType::F32, has_weight: false }), OpKind::ValueNorm { feature_dim: 4096, eps: 1e-5 }, vec![v_out], vec![vn_out], "vn");
+        graph.add_op_with_op(Op::RoPE(RopeSpec { num_heads: 8, head_dim: 64, theta: 10000.0, partial: 1.0, rope_scaling: None }), OpKind::RoPE { num_heads: 8, head_dim: 64, theta: 10000.0, partial: 1.0, rope_scaling: None },
             vec![qkn_q_out], vec![rope_q_out], "rope_q");
-        graph.add_op(OpKind::RoPE { num_heads: 8, head_dim: 64, theta: 10000.0, partial: 1.0, rope_scaling: None },
+        graph.add_op_with_op(Op::RoPE(RopeSpec { num_heads: 8, head_dim: 64, theta: 10000.0, partial: 1.0, rope_scaling: None }), OpKind::RoPE { num_heads: 8, head_dim: 64, theta: 10000.0, partial: 1.0, rope_scaling: None },
             vec![qkn_k_out], vec![rope_k_out], "rope_k");
 
         let topo: Vec<OpId> = graph.ops.iter().map(|o| o.id).collect();
@@ -3617,14 +3490,11 @@ mod tests {
     #[test]
     fn test_extract_quant_type_q4k() {
         // Arrange
-        let op = CompilerOp::new_from_kind(
-            OpId(0),
-            OpKind::QuantGemm { m: SymDim::Concrete(1), n: 512, k: 256, quant_type: QuantType::Q4K, },
+        let op = CompilerOp::new_from_op(OpId(0), Op::QuantGemm(QuantGemmSpec { m: SymDim::Concrete(1), n: 512, k: 256, quant_type: QuantType::Q4K }), OpKind::QuantGemm { m: SymDim::Concrete(1), n: 512, k: 256, quant_type: QuantType::Q4K, },
             vec![],
             vec![],
             "qgemm_q4k".to_string(),
-            LayerCondition::Always,
-            &CompilerGraph::new(),
+            LayerCondition::Always
         );
         // Act
         let g = CompilerGraph::new();
@@ -3643,7 +3513,7 @@ mod tests {
         graph.inputs.push(input);
         let gemm_out = graph.add_tensor_concrete("gemm_out", &[64], DType::F32);
 
-        let gemm_id = graph.add_op(OpKind::Gemm {
+        let gemm_id = graph.add_op_with_op(Op::Gemm(GemmSpec { m: SymDim::Concrete(1), n: 64, k: 64, dtype: DType::F32, trans_b: false, has_bias: false }), OpKind::Gemm {
             m: SymDim::Concrete(1), n: 64, k: 64, dtype: DType::F32, trans_b: false,
         }, vec![input], vec![gemm_out], "gemm");
 
@@ -3670,11 +3540,11 @@ mod tests {
         let wa = graph.add_tensor_concrete("wa", &[256, 512], DType::F32);
         let wb = graph.add_tensor_concrete("wb", &[256, 512], DType::F32);
 
-        graph.add_op(OpKind::RmsNorm { feature_dim: 4096, eps: 1e-5 }, vec![input], vec![norm_out], "norm");
-        graph.add_op(OpKind::Gemm {
+        graph.add_op_with_op(Op::RmsNorm(NormSpec { feature_dim: 4096, eps: 1e-5, dtype: DType::F32, has_weight: true }), OpKind::RmsNorm { feature_dim: 4096, eps: 1e-5 }, vec![input], vec![norm_out], "norm");
+        graph.add_op_with_op(Op::Gemm(GemmSpec { m: SymDim::Concrete(64), n: 512, k: 256, dtype: DType::F32, trans_b: false, has_bias: false }), OpKind::Gemm {
             m: SymDim::Concrete(64), n: 512, k: 256, dtype: DType::F32, trans_b: false,
         }, vec![norm_out, wa], vec![a_out], "gemm_a");
-        graph.add_op(OpKind::Gemm {
+        graph.add_op_with_op(Op::Gemm(GemmSpec { m: SymDim::Concrete(64), n: 512, k: 256, dtype: DType::F32, trans_b: false, has_bias: false }), OpKind::Gemm {
             m: SymDim::Concrete(64), n: 512, k: 256, dtype: DType::F32, trans_b: false,
         }, vec![norm_out, wb], vec![b_out], "gemm_b");
 
@@ -3699,15 +3569,15 @@ mod tests {
         let mul_out = graph.add_tensor_concrete("mul_out", &[64, 512], DType::F32);
         let w_gate = graph.add_tensor_concrete("w_gate", &[256, 512], DType::F32);
 
-        graph.add_op(OpKind::Gemm {
+        graph.add_op_with_op(Op::Gemm(GemmSpec { m: SymDim::Concrete(64), n: 512, k: 256, dtype: DType::F32, trans_b: false, has_bias: false }), OpKind::Gemm {
             m: SymDim::Concrete(64), n: 512, k: 256, dtype: DType::F32, trans_b: false,
         }, vec![input, w_gate], vec![gate_out], "gate_gemm");
         // up_gemm with no inputs -> first() returns None
-        graph.add_op(OpKind::Gemm {
+        graph.add_op_with_op(Op::Gemm(GemmSpec { m: SymDim::Concrete(64), n: 512, k: 256, dtype: DType::F32, trans_b: false, has_bias: false }), OpKind::Gemm {
             m: SymDim::Concrete(64), n: 512, k: 256, dtype: DType::F32, trans_b: false,
         }, vec![], vec![up_out], "up_gemm");
-        graph.add_op(OpKind::Silu, vec![gate_out], vec![silu_out], "silu");
-        graph.add_op(OpKind::Mul, vec![silu_out, up_out], vec![mul_out], "mul");
+        graph.add_op_with_op(Op::Silu, OpKind::Silu, vec![gate_out], vec![silu_out], "silu");
+        graph.add_op_with_op(Op::Mul, OpKind::Mul, vec![silu_out, up_out], vec![mul_out], "mul");
 
         let topo: Vec<OpId> = graph.ops.iter().map(|o| o.id).collect();
         // Act
@@ -3726,7 +3596,7 @@ mod tests {
         graph.inputs.push(input);
         // Create output tensor but don't add any consumer ops
         let gemm_out = graph.add_tensor_concrete("gemm_out", &[64], DType::F32);
-        let gemm_id = graph.add_op(OpKind::Gemm {
+        let gemm_id = graph.add_op_with_op(Op::Gemm(GemmSpec { m: SymDim::Concrete(1), n: 64, k: 64, dtype: DType::F32, trans_b: false, has_bias: false }), OpKind::Gemm {
             m: SymDim::Concrete(1), n: 64, k: 64, dtype: DType::F32, trans_b: false,
         }, vec![input], vec![gemm_out], "gemm");
 
@@ -3753,13 +3623,13 @@ mod tests {
         let gelu_out = graph.add_tensor_concrete("gelu_out", &[64], DType::F32);
         let silu2_out = graph.add_tensor_concrete("silu2_out", &[64], DType::F32);
 
-        let gemm_id = graph.add_op(OpKind::Gemm {
+        let gemm_id = graph.add_op_with_op(Op::Gemm(GemmSpec { m: SymDim::Concrete(1), n: 64, k: 64, dtype: DType::F32, trans_b: false, has_bias: false }), OpKind::Gemm {
             m: SymDim::Concrete(1), n: 64, k: 64, dtype: DType::F32, trans_b: false,
         }, vec![input], vec![gemm_out], "gemm");
-        let silu_id = graph.add_op(OpKind::Silu, vec![gemm_out], vec![silu_out], "silu");
-        let tanh_id = graph.add_op(OpKind::Tanh, vec![silu_out], vec![tanh_out], "tanh");
-        let gelu_id = graph.add_op(OpKind::Gelu, vec![tanh_out], vec![gelu_out], "gelu");
-        let silu2_id = graph.add_op(OpKind::Silu, vec![gelu_out], vec![silu2_out], "silu2");
+        let silu_id = graph.add_op_with_op(Op::Silu, OpKind::Silu, vec![gemm_out], vec![silu_out], "silu");
+        let tanh_id = graph.add_op_with_op(Op::Tanh, OpKind::Tanh, vec![silu_out], vec![tanh_out], "tanh");
+        let gelu_id = graph.add_op_with_op(Op::Gelu, OpKind::Gelu, vec![tanh_out], vec![gelu_out], "gelu");
+        let silu2_id = graph.add_op_with_op(Op::Silu, OpKind::Silu, vec![gelu_out], vec![silu2_out], "silu2");
 
         // Act
         let gemm_op = graph.op(gemm_id).unwrap();
@@ -3787,12 +3657,12 @@ mod tests {
         let tanh_out = graph.add_tensor_concrete("tanh_out", &[64], DType::F32);
         let gelu_out = graph.add_tensor_concrete("gelu_out", &[64], DType::F32);
 
-        let gemm_id = graph.add_op(OpKind::Gemm {
+        let gemm_id = graph.add_op_with_op(Op::Gemm(GemmSpec { m: SymDim::Concrete(1), n: 64, k: 64, dtype: DType::F32, trans_b: false, has_bias: false }), OpKind::Gemm {
             m: SymDim::Concrete(1), n: 64, k: 64, dtype: DType::F32, trans_b: false,
         }, vec![input], vec![gemm_out], "gemm");
-        let silu_id = graph.add_op(OpKind::Silu, vec![gemm_out], vec![silu_out], "silu");
-        let tanh_id = graph.add_op(OpKind::Tanh, vec![silu_out], vec![tanh_out], "tanh");
-        let _gelu_id = graph.add_op(OpKind::Gelu, vec![tanh_out], vec![gelu_out], "gelu");
+        let silu_id = graph.add_op_with_op(Op::Silu, OpKind::Silu, vec![gemm_out], vec![silu_out], "silu");
+        let tanh_id = graph.add_op_with_op(Op::Tanh, OpKind::Tanh, vec![silu_out], vec![tanh_out], "tanh");
+        let _gelu_id = graph.add_op_with_op(Op::Gelu, OpKind::Gelu, vec![tanh_out], vec![gelu_out], "gelu");
 
         // Mark Tanh as claimed
         let mut claimed = HashSet::new();
@@ -3820,12 +3690,12 @@ mod tests {
         let silu_out = graph.add_tensor_concrete("silu_out", &[32, 256], DType::F32);
         let weight = graph.add_tensor_concrete("weight", &[128, 256], DType::F32);
 
-        let norm_id = graph.add_op(OpKind::RmsNorm { feature_dim: 4096, eps: 1e-5 },
+        let norm_id = graph.add_op_with_op(Op::RmsNorm(NormSpec { feature_dim: 4096, eps: 1e-5, dtype: DType::F32, has_weight: true }), OpKind::RmsNorm { feature_dim: 4096, eps: 1e-5 },
             vec![input], vec![norm_out], "norm");
-        let gemm_id = graph.add_op(OpKind::Gemm {
+        let gemm_id = graph.add_op_with_op(Op::Gemm(GemmSpec { m: SymDim::Concrete(32), n: 256, k: 128, dtype: DType::F32, trans_b: false, has_bias: false }), OpKind::Gemm {
             m: SymDim::Concrete(32), n: 256, k: 128, dtype: DType::F32, trans_b: false,
         }, vec![norm_out, weight], vec![gemm_out], "gemm");
-        let _silu_id = graph.add_op(OpKind::Silu, vec![gemm_out], vec![silu_out], "silu");
+        let _silu_id = graph.add_op_with_op(Op::Silu, OpKind::Silu, vec![gemm_out], vec![silu_out], "silu");
 
         // Act: detect that norm feeds into the GEMM anchor
         let gemm_op = graph.op(gemm_id).unwrap();
@@ -3847,10 +3717,10 @@ mod tests {
         let gemm_out = graph.add_tensor_concrete("gemm_out", &[64], DType::F32);
         let silu_out = graph.add_tensor_concrete("silu_out", &[64], DType::F32);
 
-        let gemm_id = graph.add_op(OpKind::Gemm {
+        let gemm_id = graph.add_op_with_op(Op::Gemm(GemmSpec { m: SymDim::Concrete(1), n: 64, k: 64, dtype: DType::F32, trans_b: false, has_bias: false }), OpKind::Gemm {
             m: SymDim::Concrete(1), n: 64, k: 64, dtype: DType::F32, trans_b: false,
         }, vec![input], vec![gemm_out], "gemm");
-        let silu_id = graph.add_op(OpKind::Silu, vec![gemm_out], vec![silu_out], "silu");
+        let silu_id = graph.add_op_with_op(Op::Silu, OpKind::Silu, vec![gemm_out], vec![silu_out], "silu");
 
         // Act
         let gemm_op = graph.op(gemm_id).unwrap();
@@ -3876,11 +3746,11 @@ mod tests {
         let d = graph.add_tensor_concrete("d", &[64], DType::F32);
         let e = graph.add_tensor_concrete("e", &[64], DType::F32);
 
-        let silu_id = graph.add_op(OpKind::Silu, vec![input], vec![a], "silu");
-        let tanh_id = graph.add_op(OpKind::Tanh, vec![a], vec![b], "tanh");
-        let gelu_id = graph.add_op(OpKind::Gelu, vec![b], vec![c], "gelu");
-        let silu2_id = graph.add_op(OpKind::Silu, vec![c], vec![d], "silu2");
-        let tanh2_id = graph.add_op(OpKind::Tanh, vec![d], vec![e], "tanh2");
+        let silu_id = graph.add_op_with_op(Op::Silu, OpKind::Silu, vec![input], vec![a], "silu");
+        let tanh_id = graph.add_op_with_op(Op::Tanh, OpKind::Tanh, vec![a], vec![b], "tanh");
+        let gelu_id = graph.add_op_with_op(Op::Gelu, OpKind::Gelu, vec![b], vec![c], "gelu");
+        let silu2_id = graph.add_op_with_op(Op::Silu, OpKind::Silu, vec![c], vec![d], "silu2");
+        let tanh2_id = graph.add_op_with_op(Op::Tanh, OpKind::Tanh, vec![d], vec![e], "tanh2");
 
         // Act
         let silu_op = graph.op(silu_id).unwrap();
@@ -3913,17 +3783,17 @@ mod tests {
         let wv = graph.add_tensor_concrete("wv", &[256, 512], DType::F32);
         let we = graph.add_tensor_concrete("we", &[256, 512], DType::F32);
 
-        graph.add_op(OpKind::RmsNorm { feature_dim: 4096, eps: 1e-5 }, vec![input], vec![norm_out], "norm");
-        graph.add_op(OpKind::Gemm {
+        graph.add_op_with_op(Op::RmsNorm(NormSpec { feature_dim: 4096, eps: 1e-5, dtype: DType::F32, has_weight: true }), OpKind::RmsNorm { feature_dim: 4096, eps: 1e-5 }, vec![input], vec![norm_out], "norm");
+        graph.add_op_with_op(Op::Gemm(GemmSpec { m: SymDim::Concrete(64), n: 512, k: 256, dtype: DType::F32, trans_b: false, has_bias: false }), OpKind::Gemm {
             m: SymDim::Concrete(64), n: 512, k: 256, dtype: DType::F32, trans_b: false,
         }, vec![norm_out, wq], vec![q_out], "q_proj");
-        graph.add_op(OpKind::Gemm {
+        graph.add_op_with_op(Op::Gemm(GemmSpec { m: SymDim::Concrete(64), n: 512, k: 256, dtype: DType::F32, trans_b: false, has_bias: false }), OpKind::Gemm {
             m: SymDim::Concrete(64), n: 512, k: 256, dtype: DType::F32, trans_b: false,
         }, vec![norm_out, wk], vec![k_out], "k_proj");
-        graph.add_op(OpKind::Gemm {
+        graph.add_op_with_op(Op::Gemm(GemmSpec { m: SymDim::Concrete(64), n: 512, k: 256, dtype: DType::F32, trans_b: false, has_bias: false }), OpKind::Gemm {
             m: SymDim::Concrete(64), n: 512, k: 256, dtype: DType::F32, trans_b: false,
         }, vec![norm_out, wv], vec![v_out], "v_proj");
-        graph.add_op(OpKind::Gemm {
+        graph.add_op_with_op(Op::Gemm(GemmSpec { m: SymDim::Concrete(64), n: 512, k: 256, dtype: DType::F32, trans_b: false, has_bias: false }), OpKind::Gemm {
             m: SymDim::Concrete(64), n: 512, k: 256, dtype: DType::F32, trans_b: false,
         }, vec![norm_out, we], vec![extra_out], "extra_proj");
 
@@ -3952,13 +3822,13 @@ mod tests {
         let w_up = graph.add_tensor_concrete("w_up", &[256, 512], DType::F32);
 
         // Silu0 is NOT a GEMM, feeds into Silu1 (activation)
-        graph.add_op(OpKind::Silu, vec![input], vec![silu0_out], "silu0");
-        graph.add_op(OpKind::Gemm {
+        graph.add_op_with_op(Op::Silu, OpKind::Silu, vec![input], vec![silu0_out], "silu0");
+        graph.add_op_with_op(Op::Gemm(GemmSpec { m: SymDim::Concrete(64), n: 512, k: 256, dtype: DType::F32, trans_b: false, has_bias: false }), OpKind::Gemm {
             m: SymDim::Concrete(64), n: 512, k: 256, dtype: DType::F32, trans_b: false,
         }, vec![input, w_up], vec![up_out], "up_gemm");
         // Silu1 takes silu0_out (activation of non-GEMM output)
-        graph.add_op(OpKind::Silu, vec![silu0_out], vec![silu1_out], "silu1");
-        graph.add_op(OpKind::Mul, vec![silu1_out, up_out], vec![mul_out], "mul");
+        graph.add_op_with_op(Op::Silu, OpKind::Silu, vec![silu0_out], vec![silu1_out], "silu1");
+        graph.add_op_with_op(Op::Mul, OpKind::Mul, vec![silu1_out, up_out], vec![mul_out], "mul");
 
         let topo: Vec<OpId> = graph.ops.iter().map(|o| o.id).collect();
 
@@ -3975,23 +3845,17 @@ mod tests {
     fn test_all_gemm_quant_compatible_two_compatible_types() {
         // Arrange: two QuantGemm ops with Q4_0 and Q4K — these are both 4-bit
         // and may be compatible depending on can_fuse_quant_aware
-        let op1 = CompilerOp::new_from_kind(
-            OpId(0),
-            OpKind::QuantGemm { m: SymDim::Concrete(1), n: 256, k: 128, quant_type: QuantType::Q4_0, },
+        let op1 = CompilerOp::new_from_op(OpId(0), Op::QuantGemm(QuantGemmSpec { m: SymDim::Concrete(1), n: 256, k: 128, quant_type: QuantType::Q4_0 }), OpKind::QuantGemm { m: SymDim::Concrete(1), n: 256, k: 128, quant_type: QuantType::Q4_0, },
             vec![],
             vec![],
             "q4_0".to_string(),
-            LayerCondition::Always,
-            &CompilerGraph::new(),
+            LayerCondition::Always
         );
-        let op2 = CompilerOp::new_from_kind(
-            OpId(1),
-            OpKind::QuantGemm { m: SymDim::Concrete(1), n: 256, k: 128, quant_type: QuantType::Q4K, },
+        let op2 = CompilerOp::new_from_op(OpId(1), Op::QuantGemm(QuantGemmSpec { m: SymDim::Concrete(1), n: 256, k: 128, quant_type: QuantType::Q4K }), OpKind::QuantGemm { m: SymDim::Concrete(1), n: 256, k: 128, quant_type: QuantType::Q4K, },
             vec![],
             vec![],
             "q4k".to_string(),
-            LayerCondition::Always,
-            &CompilerGraph::new(),
+            LayerCondition::Always
         );
         let ops: Vec<&CompilerOp> = vec![&op1, &op2];
 
@@ -4015,11 +3879,11 @@ mod tests {
         let silu_out = graph.add_tensor_concrete("silu_out", &[64], DType::F32);
         let norm_out = graph.add_tensor_concrete("norm_out", &[64], DType::F32);
 
-        let gemm_id = graph.add_op(OpKind::Gemm {
+        let gemm_id = graph.add_op_with_op(Op::Gemm(GemmSpec { m: SymDim::Concrete(1), n: 64, k: 64, dtype: DType::F32, trans_b: false, has_bias: false }), OpKind::Gemm {
             m: SymDim::Concrete(1), n: 64, k: 64, dtype: DType::F32, trans_b: false,
         }, vec![input], vec![gemm_out], "gemm");
-        let silu_id = graph.add_op(OpKind::Silu, vec![gemm_out], vec![silu_out], "silu");
-        let _norm_id = graph.add_op(OpKind::RmsNorm { feature_dim: 4096, eps: 1e-5 },
+        let silu_id = graph.add_op_with_op(Op::Silu, OpKind::Silu, vec![gemm_out], vec![silu_out], "silu");
+        let _norm_id = graph.add_op_with_op(Op::RmsNorm(NormSpec { feature_dim: 4096, eps: 1e-5, dtype: DType::F32, has_weight: true }), OpKind::RmsNorm { feature_dim: 4096, eps: 1e-5 },
             vec![silu_out], vec![norm_out], "norm");
 
         // Act
@@ -4047,11 +3911,11 @@ mod tests {
         let wa = graph.add_tensor_concrete("wa", &[256, 512], DType::F32);
         let wb = graph.add_tensor_concrete("wb", &[256, 256], DType::F32);
 
-        graph.add_op(OpKind::RmsNorm { feature_dim: 4096, eps: 1e-5 }, vec![input], vec![norm_out], "norm");
-        let gemm_a_id = graph.add_op(OpKind::Gemm {
+        graph.add_op_with_op(Op::RmsNorm(NormSpec { feature_dim: 4096, eps: 1e-5, dtype: DType::F32, has_weight: true }), OpKind::RmsNorm { feature_dim: 4096, eps: 1e-5 }, vec![input], vec![norm_out], "norm");
+        let gemm_a_id = graph.add_op_with_op(Op::Gemm(GemmSpec { m: SymDim::Concrete(64), n: 512, k: 256, dtype: DType::F32, trans_b: false, has_bias: false }), OpKind::Gemm {
             m: SymDim::Concrete(64), n: 512, k: 256, dtype: DType::F32, trans_b: false,
         }, vec![norm_out, wa], vec![gemm_a_out], "gemm_a");
-        graph.add_op(OpKind::Gemm {
+        graph.add_op_with_op(Op::Gemm(GemmSpec { m: SymDim::Concrete(64), n: 256, k: 256, dtype: DType::F32, trans_b: false, has_bias: false }), OpKind::Gemm {
             m: SymDim::Concrete(64), n: 256, k: 256, dtype: DType::F32, trans_b: false,
         }, vec![norm_out, wb], vec![gemm_b_out], "gemm_b");
 
@@ -4078,14 +3942,14 @@ mod tests {
         let w_gate = graph.add_tensor_concrete("w_gate", &[256, 1024], DType::F32);
         let w_up = graph.add_tensor_concrete("w_up", &[256, 768], DType::F32);
 
-        graph.add_op(OpKind::Gemm {
+        graph.add_op_with_op(Op::Gemm(GemmSpec { m: SymDim::Concrete(64), n: 1024, k: 256, dtype: DType::F32, trans_b: false, has_bias: false }), OpKind::Gemm {
             m: SymDim::Concrete(64), n: 1024, k: 256, dtype: DType::F32, trans_b: false,
         }, vec![input, w_gate], vec![gate_out], "gate_gemm");
-        graph.add_op(OpKind::Gemm {
+        graph.add_op_with_op(Op::Gemm(GemmSpec { m: SymDim::Concrete(64), n: 768, k: 256, dtype: DType::F32, trans_b: false, has_bias: false }), OpKind::Gemm {
             m: SymDim::Concrete(64), n: 768, k: 256, dtype: DType::F32, trans_b: false,
         }, vec![input, w_up], vec![up_out], "up_gemm");
-        graph.add_op(OpKind::Silu, vec![gate_out], vec![silu_out], "silu");
-        graph.add_op(OpKind::Mul, vec![silu_out, up_out], vec![mul_out], "mul");
+        graph.add_op_with_op(Op::Silu, OpKind::Silu, vec![gate_out], vec![silu_out], "silu");
+        graph.add_op_with_op(Op::Mul, OpKind::Mul, vec![silu_out, up_out], vec![mul_out], "mul");
 
         let topo: Vec<OpId> = graph.ops.iter().map(|o| o.id).collect();
 
@@ -4106,7 +3970,7 @@ mod tests {
         graph.inputs.push(input);
         let silu_out = graph.add_tensor_concrete("silu_out", &[64], DType::F32);
 
-        let silu_id = graph.add_op(OpKind::Silu, vec![input], vec![silu_out], "silu");
+        let silu_id = graph.add_op_with_op(Op::Silu, OpKind::Silu, vec![input], vec![silu_out], "silu");
 
         // Act
         let silu_op = graph.op(silu_id).unwrap();
@@ -4137,25 +4001,25 @@ mod tests {
         let wk = graph.add_tensor_concrete("wk", &[256, 512], DType::F32);
         let wv = graph.add_tensor_concrete("wv", &[256, 512], DType::F32);
 
-        graph.add_op(OpKind::RmsNorm { feature_dim: 4096, eps: 1e-5 }, vec![input], vec![norm_out], "norm");
-        graph.add_op(OpKind::Gemm {
+        graph.add_op_with_op(Op::RmsNorm(NormSpec { feature_dim: 4096, eps: 1e-5, dtype: DType::F32, has_weight: true }), OpKind::RmsNorm { feature_dim: 4096, eps: 1e-5 }, vec![input], vec![norm_out], "norm");
+        graph.add_op_with_op(Op::Gemm(GemmSpec { m: SymDim::Concrete(64), n: 512, k: 256, dtype: DType::F32, trans_b: false, has_bias: false }), OpKind::Gemm {
             m: SymDim::Concrete(64), n: 512, k: 256, dtype: DType::F32, trans_b: false,
         }, vec![norm_out, wq], vec![q_out], "q_proj");
-        graph.add_op(OpKind::Gemm {
+        graph.add_op_with_op(Op::Gemm(GemmSpec { m: SymDim::Concrete(64), n: 512, k: 256, dtype: DType::F32, trans_b: false, has_bias: false }), OpKind::Gemm {
             m: SymDim::Concrete(64), n: 512, k: 256, dtype: DType::F32, trans_b: false,
         }, vec![norm_out, wk], vec![k_out], "k_proj");
-        graph.add_op(OpKind::Gemm {
+        graph.add_op_with_op(Op::Gemm(GemmSpec { m: SymDim::Concrete(64), n: 512, k: 256, dtype: DType::F32, trans_b: false, has_bias: false }), OpKind::Gemm {
             m: SymDim::Concrete(64), n: 512, k: 256, dtype: DType::F32, trans_b: false,
         }, vec![norm_out, wv], vec![v_out], "v_proj");
         // Only 1 QkNorm+RoPE path (Q)
-        graph.add_op(OpKind::QkNorm { head_dim: 512, eps: 1e-5 },
+        graph.add_op_with_op(Op::QkNorm { head_dim: 512, eps: 1e-5 }, OpKind::QkNorm { head_dim: 512, eps: 1e-5 },
             vec![q_out], vec![qkn_q_out], "qkn_q");
         // K and V both go to ValueNorm (instead of K->QkNorm+RoPE)
-        graph.add_op(OpKind::ValueNorm { feature_dim: 4096, eps: 1e-5 },
+        graph.add_op_with_op(Op::ValueNorm(NormSpec { feature_dim: 4096, eps: 1e-5, dtype: DType::F32, has_weight: false }), OpKind::ValueNorm { feature_dim: 4096, eps: 1e-5 },
             vec![k_out], vec![vn_k_out], "vn_k");
-        graph.add_op(OpKind::ValueNorm { feature_dim: 4096, eps: 1e-5 },
+        graph.add_op_with_op(Op::ValueNorm(NormSpec { feature_dim: 4096, eps: 1e-5, dtype: DType::F32, has_weight: false }), OpKind::ValueNorm { feature_dim: 4096, eps: 1e-5 },
             vec![v_out], vec![vn_v_out], "vn_v");
-        graph.add_op(OpKind::RoPE { num_heads: 8, head_dim: 64, theta: 10000.0, partial: 1.0, rope_scaling: None },
+        graph.add_op_with_op(Op::RoPE(RopeSpec { num_heads: 8, head_dim: 64, theta: 10000.0, partial: 1.0, rope_scaling: None }), OpKind::RoPE { num_heads: 8, head_dim: 64, theta: 10000.0, partial: 1.0, rope_scaling: None },
             vec![qkn_q_out], vec![rope_q_out], "rope_q");
 
         let topo: Vec<OpId> = graph.ops.iter().map(|o| o.id).collect();
@@ -4172,14 +4036,11 @@ mod tests {
     #[test]
     fn test_extract_quant_type_q2k() {
         // Arrange
-        let op = CompilerOp::new_from_kind(
-            OpId(0),
-            OpKind::QuantGemm { m: SymDim::Concrete(1), n: 256, k: 128, quant_type: QuantType::Q2K, },
+        let op = CompilerOp::new_from_op(OpId(0), Op::QuantGemm(QuantGemmSpec { m: SymDim::Concrete(1), n: 256, k: 128, quant_type: QuantType::Q2K }), OpKind::QuantGemm { m: SymDim::Concrete(1), n: 256, k: 128, quant_type: QuantType::Q2K, },
             vec![],
             vec![],
             "qgemm_q2k".to_string(),
-            LayerCondition::Always,
-            &CompilerGraph::new(),
+            LayerCondition::Always
         );
         // Act
         let g = CompilerGraph::new();
@@ -4201,11 +4062,11 @@ mod tests {
         let gemm2_out = graph.add_tensor_concrete("gemm2_out", &[64], DType::F32);
         let w2 = graph.add_tensor_concrete("w2", &[64, 64], DType::F32);
 
-        let gemm1_id = graph.add_op(OpKind::Gemm {
+        let gemm1_id = graph.add_op_with_op(Op::Gemm(GemmSpec { m: SymDim::Concrete(1), n: 64, k: 64, dtype: DType::F32, trans_b: false, has_bias: false }), OpKind::Gemm {
             m: SymDim::Concrete(1), n: 64, k: 64, dtype: DType::F32, trans_b: false,
         }, vec![input], vec![gemm1_out], "gemm1");
-        let silu_id = graph.add_op(OpKind::Silu, vec![gemm1_out], vec![silu_out], "silu");
-        graph.add_op(OpKind::Gemm {
+        let silu_id = graph.add_op_with_op(Op::Silu, OpKind::Silu, vec![gemm1_out], vec![silu_out], "silu");
+        graph.add_op_with_op(Op::Gemm(GemmSpec { m: SymDim::Concrete(1), n: 64, k: 64, dtype: DType::F32, trans_b: false, has_bias: false }), OpKind::Gemm {
             m: SymDim::Concrete(1), n: 64, k: 64, dtype: DType::F32, trans_b: false,
         }, vec![silu_out, w2], vec![gemm2_out], "gemm2");
 
@@ -4233,13 +4094,13 @@ mod tests {
         let mul_out = graph.add_tensor_concrete("mul_out", &[64, 512], DType::F32);
         let w_gate = graph.add_tensor_concrete("w_gate", &[256, 512], DType::F32);
 
-        graph.add_op(OpKind::Gemm {
+        graph.add_op_with_op(Op::Gemm(GemmSpec { m: SymDim::Concrete(64), n: 512, k: 256, dtype: DType::F32, trans_b: false, has_bias: false }), OpKind::Gemm {
             m: SymDim::Concrete(64), n: 512, k: 256, dtype: DType::F32, trans_b: false,
         }, vec![input, w_gate], vec![gate_out], "gate_gemm");
         // "up" producer is RmsNorm, not a GEMM
-        graph.add_op(OpKind::RmsNorm { feature_dim: 4096, eps: 1e-5 }, vec![input], vec![norm_out], "norm_up");
-        graph.add_op(OpKind::Silu, vec![gate_out], vec![silu_out], "silu");
-        graph.add_op(OpKind::Mul, vec![silu_out, norm_out], vec![mul_out], "mul");
+        graph.add_op_with_op(Op::RmsNorm(NormSpec { feature_dim: 4096, eps: 1e-5, dtype: DType::F32, has_weight: true }), OpKind::RmsNorm { feature_dim: 4096, eps: 1e-5 }, vec![input], vec![norm_out], "norm_up");
+        graph.add_op_with_op(Op::Silu, OpKind::Silu, vec![gate_out], vec![silu_out], "silu");
+        graph.add_op_with_op(Op::Mul, OpKind::Mul, vec![silu_out, norm_out], vec![mul_out], "mul");
 
         let topo: Vec<OpId> = graph.ops.iter().map(|o| o.id).collect();
 
@@ -4265,8 +4126,8 @@ mod tests {
         let silu_out = graph.add_tensor_concrete("silu_out", &[1], DType::F32);
         let tanh_out = graph.add_tensor_concrete("tanh_out", &[1], DType::F32);
 
-        let silu_id = graph.add_op(OpKind::Silu, vec![input], vec![silu_out], "silu");
-        let tanh_id = graph.add_op(OpKind::Tanh, vec![silu_out], vec![tanh_out], "tanh");
+        let silu_id = graph.add_op_with_op(Op::Silu, OpKind::Silu, vec![input], vec![silu_out], "silu");
+        let tanh_id = graph.add_op_with_op(Op::Tanh, OpKind::Tanh, vec![silu_out], vec![tanh_out], "tanh");
 
         let profile = DeviceProfile::detect();
         let plan = ExecutionPlan::from_profile(&profile);
@@ -4303,24 +4164,24 @@ mod tests {
         let wv = graph.add_tensor_concrete("wv", &[256, 512], DType::F32);
 
         // Tanh feeds 3 GEMMs (not a norm)
-        graph.add_op(OpKind::Tanh, vec![input], vec![tanh_out], "tanh");
-        graph.add_op(OpKind::Gemm {
+        graph.add_op_with_op(Op::Tanh, OpKind::Tanh, vec![input], vec![tanh_out], "tanh");
+        graph.add_op_with_op(Op::Gemm(GemmSpec { m: SymDim::Concrete(64), n: 512, k: 256, dtype: DType::F32, trans_b: false, has_bias: false }), OpKind::Gemm {
             m: SymDim::Concrete(64), n: 512, k: 256, dtype: DType::F32, trans_b: false,
         }, vec![tanh_out, wq], vec![q_out], "q_proj");
-        graph.add_op(OpKind::Gemm {
+        graph.add_op_with_op(Op::Gemm(GemmSpec { m: SymDim::Concrete(64), n: 512, k: 256, dtype: DType::F32, trans_b: false, has_bias: false }), OpKind::Gemm {
             m: SymDim::Concrete(64), n: 512, k: 256, dtype: DType::F32, trans_b: false,
         }, vec![tanh_out, wk], vec![k_out], "k_proj");
-        graph.add_op(OpKind::Gemm {
+        graph.add_op_with_op(Op::Gemm(GemmSpec { m: SymDim::Concrete(64), n: 512, k: 256, dtype: DType::F32, trans_b: false, has_bias: false }), OpKind::Gemm {
             m: SymDim::Concrete(64), n: 512, k: 256, dtype: DType::F32, trans_b: false,
         }, vec![tanh_out, wv], vec![v_out], "v_proj");
-        graph.add_op(OpKind::QkNorm { head_dim: 512, eps: 1e-5 },
+        graph.add_op_with_op(Op::QkNorm { head_dim: 512, eps: 1e-5 }, OpKind::QkNorm { head_dim: 512, eps: 1e-5 },
             vec![q_out], vec![qkn_q_out], "qkn_q");
-        graph.add_op(OpKind::QkNorm { head_dim: 512, eps: 1e-5 },
+        graph.add_op_with_op(Op::QkNorm { head_dim: 512, eps: 1e-5 }, OpKind::QkNorm { head_dim: 512, eps: 1e-5 },
             vec![k_out], vec![qkn_k_out], "qkn_k");
-        graph.add_op(OpKind::ValueNorm { feature_dim: 4096, eps: 1e-5 }, vec![v_out], vec![vn_out], "vn");
-        graph.add_op(OpKind::RoPE { num_heads: 8, head_dim: 64, theta: 10000.0, partial: 1.0, rope_scaling: None },
+        graph.add_op_with_op(Op::ValueNorm(NormSpec { feature_dim: 4096, eps: 1e-5, dtype: DType::F32, has_weight: false }), OpKind::ValueNorm { feature_dim: 4096, eps: 1e-5 }, vec![v_out], vec![vn_out], "vn");
+        graph.add_op_with_op(Op::RoPE(RopeSpec { num_heads: 8, head_dim: 64, theta: 10000.0, partial: 1.0, rope_scaling: None }), OpKind::RoPE { num_heads: 8, head_dim: 64, theta: 10000.0, partial: 1.0, rope_scaling: None },
             vec![qkn_q_out], vec![rope_q_out], "rope_q");
-        graph.add_op(OpKind::RoPE { num_heads: 8, head_dim: 64, theta: 10000.0, partial: 1.0, rope_scaling: None },
+        graph.add_op_with_op(Op::RoPE(RopeSpec { num_heads: 8, head_dim: 64, theta: 10000.0, partial: 1.0, rope_scaling: None }), OpKind::RoPE { num_heads: 8, head_dim: 64, theta: 10000.0, partial: 1.0, rope_scaling: None },
             vec![qkn_k_out], vec![rope_k_out], "rope_k");
 
         let topo: Vec<OpId> = graph.ops.iter().map(|o| o.id).collect();
@@ -4337,23 +4198,17 @@ mod tests {
     #[test]
     fn test_all_gemm_quant_compatible_two_gemm_bias() {
         // Arrange: two GemmBias ops (neither is QuantGemm, both extract None)
-        let op1 = CompilerOp::new_from_kind(
-            OpId(0),
-            OpKind::GemmBias { m: SymDim::Concrete(64), n: 512, k: 256, dtype: DType::F32, trans_b: false, },
+        let op1 = CompilerOp::new_from_op(OpId(0), Op::GemmBias(GemmSpec { m: SymDim::Concrete(64), n: 512, k: 256, dtype: DType::F32, trans_b: false, has_bias: true }), OpKind::GemmBias { m: SymDim::Concrete(64), n: 512, k: 256, dtype: DType::F32, trans_b: false, },
             vec![],
             vec![],
             "gemm_bias_1".to_string(),
-            LayerCondition::Always,
-            &CompilerGraph::new(),
+            LayerCondition::Always
         );
-        let op2 = CompilerOp::new_from_kind(
-            OpId(1),
-            OpKind::GemmBias { m: SymDim::Concrete(64), n: 512, k: 256, dtype: DType::F32, trans_b: false, },
+        let op2 = CompilerOp::new_from_op(OpId(1), Op::GemmBias(GemmSpec { m: SymDim::Concrete(64), n: 512, k: 256, dtype: DType::F32, trans_b: false, has_bias: true }), OpKind::GemmBias { m: SymDim::Concrete(64), n: 512, k: 256, dtype: DType::F32, trans_b: false, },
             vec![],
             vec![],
             "gemm_bias_2".to_string(),
-            LayerCondition::Always,
-            &CompilerGraph::new(),
+            LayerCondition::Always
         );
         let ops: Vec<&CompilerOp> = vec![&op1, &op2];
         // Act

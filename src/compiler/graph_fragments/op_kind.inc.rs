@@ -931,7 +931,7 @@ impl CompilerOp {
     /// OE-3: 测试 fixture / 手工构造路径专用构造器。
     ///
     /// 必填字段 `op_v2` 由 `Op::from_op_kind` 翻译填充；
-    /// 调用方提供 kind + 输入输出 + label + guard + graph context 即可，
+    /// 调用方提供 kind + 输入输出 + label + guard + graph context 即可,
     /// 无需手工构造 Op。生产路径走 `add_op*`；本构造器专供 unit-test fixture
     /// 和 fusion pass 中手工创建独立 CompilerOp 的场景。
     pub fn new_from_kind(
@@ -958,6 +958,34 @@ impl CompilerOp {
         let mut final_op = temp;
         final_op.op_v2 = op_v2;
         final_op
+    }
+
+    /// OE-4: 测试 fixture / 手工构造路径的 Op-first 构造器（过渡期）。
+    ///
+    /// 直接接受 `Op`（带 dtype 字段），跳过 from_op_kind Translator。
+    /// 调用方提供 op_v2 + kind_fallback + 输入输出 + label + guard 即可。
+    /// `kind_fallback` 仅用于过渡期保留 CompilerOp.kind 字段（OE-4 删除字段时移除）。
+    ///
+    /// 用途：与 `add_op_with_op` 对应的 CompilerOp 直构路径，供 unit-test fixture
+    /// 和 fusion pass 中手工创建独立 CompilerOp 的场景使用。
+    pub fn new_from_op(
+        id: OpId,
+        op_v2: crate::compiler::graph::Op,
+        kind_fallback: OpKind,
+        inputs: Vec<TensorId>,
+        outputs: Vec<TensorId>,
+        label: impl Into<String>,
+        guard: LayerCondition,
+    ) -> Self {
+        CompilerOp {
+            id,
+            kind: kind_fallback,
+            inputs,
+            outputs,
+            label: label.into(),
+            guard,
+            op_v2,
+        }
     }
 }
 

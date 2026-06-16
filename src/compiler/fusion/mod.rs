@@ -34,7 +34,7 @@ pub(crate) use cost_model::is_memory_bound_group;
 mod tests {
     use super::*;
     use super::cost_model::{chain_eliminated_bytes, compute_group_roofline_scale};
-    use crate::compiler::graph::{CompilerGraph, OpId, MultiOutputConfig};
+    use crate::compiler::graph::{CompilerGraph, OpId, Op, GemmSpec, MultiOutputConfig};
     use crate::compiler::ir::LayerIR;
     use crate::compiler::planner::ExecutionPlan;
     use crate::dispatch::DeviceProfile;
@@ -1171,7 +1171,7 @@ mod tests {
         let a1 = g1.add_tensor_concrete("A", &[1024], DType::F32);
         let b1 = g1.add_tensor_concrete("B", &[1024], DType::F32);
         let c1 = g1.add_tensor_concrete("C", &[1024], DType::F32);
-        let op1 = g1.add_op(OpKind::Add, vec![a1, b1], vec![c1], "add");
+        let op1 = g1.add_op_with_op(Op::Add, OpKind::Add, vec![a1, b1], vec![c1], "add");
         let group_mem = FusionGroup {
             id: 0, anchor: op1, epilogue: vec![],
             mode: FusionMode::LoopFusion,
@@ -1188,8 +1188,7 @@ mod tests {
         let a2 = g2.add_tensor_concrete("A", &[512, 512], DType::F32);
         let b2 = g2.add_tensor_concrete("B", &[512, 512], DType::F32);
         let c2 = g2.add_tensor_concrete("C", &[512, 512], DType::F32);
-        let op2 = g2.add_op(
-            OpKind::Gemm { m: crate::compiler::graph::SymDim::Concrete(512), n: 512, k: 512, dtype: DType::F32, trans_b: false },
+        let op2 = g2.add_op_with_op(Op::Gemm(GemmSpec { m: crate::compiler::graph::SymDim::Concrete(512), n: 512, k: 512, dtype: DType::F32, trans_b: false, has_bias: false }), OpKind::Gemm { m: crate::compiler::graph::SymDim::Concrete(512), n: 512, k: 512, dtype: DType::F32, trans_b: false },
             vec![a2, b2], vec![c2], "gemm",
         );
         let group_compute = FusionGroup {
