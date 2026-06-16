@@ -28,7 +28,7 @@ pub(crate) fn emit_moe_router_gemv_inline(
                 offset: OffsetExpr::Add(Box::new(OffsetExpr::Const(weight_row_off)), Box::new(OffsetExpr::LoopOffset(d_off))),
                 width: SimdWidth::Scalar, dtype, predicate: None, });
             super::auto_select::auto_lower_trace_into(
-                prog, &dot_body, &[h_val, w_val, acc_reg], acc_reg, SimdWidth::Scalar, QuantPrecision::F32,
+                prog, &dot_body, &[h_val, w_val, acc_reg], acc_reg, SimdWidth::Scalar, dtype,
             ).expect("moe gemv: dot_body auto_lower failed");
         });
         prog.emit(VmInstr::VecStore { base: logits_ptr, offset: OffsetExpr::Const(ei * elem), src: acc_reg, width: SimdWidth::Scalar, dtype, predicate: None, });
@@ -116,13 +116,13 @@ pub(crate) fn emit_moe_topk_dispatch_inline(
 
             // Arithmetic: top-k update via auto_lower_trace_raw
             let slots = super::auto_select::auto_lower_trace_raw(
-                prog, &update_body, &[best_val, cur_val, best_idx, ei_scalar], scalar_w, QuantPrecision::F32)?;
+                prog, &update_body, &[best_val, cur_val, best_idx, ei_scalar], scalar_w, dtype)?;
             let new_best = slots[4];
             let updated_idx = slots[12];
             // Copy results back to accumulators via auto_lower_trace_into
             let identity: Vec<TraceOp> = vec![TraceOp::Input(0)];
-            super::auto_select::auto_lower_trace_into(prog, &identity, &[updated_idx], best_idx, scalar_w, QuantPrecision::F32).expect("best_idx identity auto_lower failed");
-            super::auto_select::auto_lower_trace_into(prog, &identity, &[new_best], best_val, scalar_w, QuantPrecision::F32).expect("best_val identity auto_lower failed");
+            super::auto_select::auto_lower_trace_into(prog, &identity, &[updated_idx], best_idx, scalar_w, dtype).expect("best_idx identity auto_lower failed");
+            super::auto_select::auto_lower_trace_into(prog, &identity, &[new_best], best_val, scalar_w, dtype).expect("best_val identity auto_lower failed");
         }
 
         // Control flow: store results
@@ -143,7 +143,7 @@ pub(crate) fn emit_moe_topk_dispatch_inline(
                 let e_scalar = prog.alloc_vreg(VRegKind::Vec, scalar_w);
                 prog.emit(VmInstr::Broadcast { dst: e_scalar, src: ScalarExpr::Const(e as f32), width: scalar_w, dtype, });
                 let slots = super::auto_select::auto_lower_trace_raw(
-                    prog, &tel_body, &[best_idx, e_scalar], scalar_w, QuantPrecision::F32)?;
+                    prog, &tel_body, &[best_idx, e_scalar], scalar_w, dtype)?;
                 // Control flow: conditional skip + atomic update
                 prog.emit(VmInstr::ConditionalSkip { mask: slots[6], skip_count: 1 });
                 prog.emit(VmInstr::AtomicAdd { base: tel_ptr, offset: OffsetExpr::Const(base_offset + e * elem), value: 1, elem_width: 4 });
@@ -155,7 +155,7 @@ pub(crate) fn emit_moe_topk_dispatch_inline(
             let cur_val = prog.alloc_vreg(VRegKind::Vec, scalar_w);
             prog.emit(VmInstr::VecLoad { dst: cur_val, base: gate_ptr, offset: OffsetExpr::Const(ei * elem), width: scalar_w, dtype, predicate: None, });
             let slots = super::auto_select::auto_lower_trace_raw(
-                prog, &mask_body, &[cur_val, best_val], scalar_w, QuantPrecision::F32)?;
+                prog, &mask_body, &[cur_val, best_val], scalar_w, dtype)?;
             // Control flow: conditional skip (if match, overwrite with -inf)
             prog.emit(VmInstr::ConditionalSkip { mask: slots[5], skip_count: 1 });
             prog.emit(VmInstr::VecStore { base: gate_ptr, offset: OffsetExpr::Const(ei * elem), src: neg_inf, width: scalar_w, dtype, predicate: None, });
@@ -338,7 +338,7 @@ pub(crate) fn emit_moe_packed_inline(
                 prog.emit(VmInstr::VecLoad { dst: w_val, base: router_weight_ptr, offset: OffsetExpr::Add(
                     Box::new(OffsetExpr::LoopOffset(e_off)), Box::new(OffsetExpr::LoopOffset(d_off)),
                 ), width: scalar_w, dtype, predicate: None, });
-                super::auto_select::auto_lower_trace_into(prog, &gemv_dot_body, &[h_val, w_val, acc_reg], acc_reg, scalar_w, QuantPrecision::F32)?;
+                super::auto_select::auto_lower_trace_into(prog, &gemv_dot_body, &[h_val, w_val, acc_reg], acc_reg, scalar_w, dtype)?;
                 Ok(())
             })?;
             // Add bias
@@ -346,7 +346,7 @@ pub(crate) fn emit_moe_packed_inline(
             prog.emit(VmInstr::VecLoad { dst: bias_val, base: router_bias_ptr,
                 offset: OffsetExpr::Mul(Box::new(OffsetExpr::LoopOffset(e_ctr)), elem),
                 width: scalar_w, dtype, predicate: None, });
-            let slots = super::auto_select::auto_lower_trace_raw(prog, &dequant_bias_body, &[acc_reg, bias_val], scalar_w, QuantPrecision::F32)?;
+            let slots = super::auto_select::auto_lower_trace_raw(prog, &dequant_bias_body, &[acc_reg, bias_val], scalar_w, dtype)?;
             prog.emit(VmInstr::VecStore { base: scratchpad_ptr, offset: OffsetExpr::Add(
                 Box::new(OffsetExpr::Const(logits_off)),
                 Box::new(OffsetExpr::Mul(Box::new(OffsetExpr::LoopOffset(e_ctr)), elem)),
@@ -362,7 +362,7 @@ pub(crate) fn emit_moe_packed_inline(
             prog.emit(VmInstr::VecLoad { dst: cur, base: scratchpad_ptr, offset: OffsetExpr::Add(
                 Box::new(OffsetExpr::Const(logits_off)), Box::new(OffsetExpr::LoopOffset(e_off)),
             ), width: scalar_w, dtype, predicate: None, });
-            super::auto_select::auto_lower_trace_into(prog, &softmax_max_body, &[max_acc, cur], max_acc, scalar_w, QuantPrecision::F32)?;
+            super::auto_select::auto_lower_trace_into(prog, &softmax_max_body, &[max_acc, cur], max_acc, scalar_w, dtype)?;
             Ok(())
         })?;
 
@@ -373,24 +373,24 @@ pub(crate) fn emit_moe_packed_inline(
             prog.emit(VmInstr::VecLoad { dst: cur, base: scratchpad_ptr, offset: OffsetExpr::Add(
                 Box::new(OffsetExpr::Const(logits_off)), Box::new(OffsetExpr::LoopOffset(e_off)),
             ), width: scalar_w, dtype, predicate: None, });
-            let slots = super::auto_select::auto_lower_trace_raw(prog, &softmax_exp_body, &[cur, max_acc], scalar_w, QuantPrecision::F32)?;
+            let slots = super::auto_select::auto_lower_trace_raw(prog, &softmax_exp_body, &[cur, max_acc], scalar_w, dtype)?;
             let exp_val = slots[3];
             prog.emit(VmInstr::VecStore { base: scratchpad_ptr, offset: OffsetExpr::Add(
                 Box::new(OffsetExpr::Const(logits_off)), Box::new(OffsetExpr::LoopOffset(e_off)),
             ), src: exp_val, width: scalar_w, dtype, predicate: None, });
-            super::auto_select::auto_lower_trace_into(prog, &softmax_sum_body, &[sum_acc, exp_val], sum_acc, scalar_w, QuantPrecision::F32)?;
+            super::auto_select::auto_lower_trace_into(prog, &softmax_sum_body, &[sum_acc, exp_val], sum_acc, scalar_w, dtype)?;
             Ok(())
         })?;
         // Recip(sum) for normalization — arithmetic via TraceOp
         let recip_body: Vec<TraceOp> = vec![TraceOp::Input(0), TraceOp::Recip(ValueId(0))];
-        super::auto_select::auto_lower_trace_into(prog, &recip_body, &[sum_acc], sum_acc, scalar_w, QuantPrecision::F32)?;
+        super::auto_select::auto_lower_trace_into(prog, &recip_body, &[sum_acc], sum_acc, scalar_w, dtype)?;
 
         prog.emit_loop_try(BoundExpr::Const(num_experts), elem, |prog, _e_ctr, e_off| -> Result<(), CompilerError> {
             let cur = prog.alloc_vreg(VRegKind::Vec, scalar_w);
             prog.emit(VmInstr::VecLoad { dst: cur, base: scratchpad_ptr, offset: OffsetExpr::Add(
                 Box::new(OffsetExpr::Const(logits_off)), Box::new(OffsetExpr::LoopOffset(e_off)),
             ), width: scalar_w, dtype, predicate: None, });
-            let slots = super::auto_select::auto_lower_trace_raw(prog, &softmax_norm_body, &[cur, sum_acc], scalar_w, QuantPrecision::F32)?;
+            let slots = super::auto_select::auto_lower_trace_raw(prog, &softmax_norm_body, &[cur, sum_acc], scalar_w, dtype)?;
             prog.emit(VmInstr::VecStore { base: scratchpad_ptr, offset: OffsetExpr::Add(
                 Box::new(OffsetExpr::Const(logits_off)), Box::new(OffsetExpr::LoopOffset(e_off)),
             ), src: slots[2], width: scalar_w, dtype, predicate: None, });
@@ -414,12 +414,12 @@ pub(crate) fn emit_moe_packed_inline(
                 let cur_val = prog.alloc_vreg(VRegKind::Vec, scalar_w);
                 prog.emit(VmInstr::VecLoad { dst: cur_val, base: scratchpad_ptr, offset: OffsetExpr::Const(logits_off + ei * elem), width: scalar_w, dtype, predicate: None, });
                 // Arithmetic: compare via auto_lower_trace_raw
-                let slots = super::auto_select::auto_lower_trace_raw(prog, &topk_compare_body, &[cur_val, best_val], scalar_w, QuantPrecision::F32)?;
+                let slots = super::auto_select::auto_lower_trace_raw(prog, &topk_compare_body, &[cur_val, best_val], scalar_w, dtype)?;
                 // Control flow: conditional update
                 prog.emit(VmInstr::ConditionalSkip { mask: slots[4], skip_count: 2 });
                 prog.emit(VmInstr::Broadcast { dst: best_idx, src: ScalarExpr::Const(ei as f32), width: scalar_w, dtype, });
                 let identity: Vec<TraceOp> = vec![TraceOp::Input(0)];
-                super::auto_select::auto_lower_trace_into(prog, &identity, &[cur_val], best_val, scalar_w, QuantPrecision::F32).expect("best_val copy auto_lower failed");
+                super::auto_select::auto_lower_trace_into(prog, &identity, &[cur_val], best_val, scalar_w, dtype).expect("best_val copy auto_lower failed");
             }
 
             prog.emit(VmInstr::VecStore { base: scratchpad_ptr, offset: OffsetExpr::Const(router_weights_off + ki * elem), src: best_val, width: scalar_w, dtype, predicate: None, });
@@ -429,7 +429,7 @@ pub(crate) fn emit_moe_packed_inline(
             for ei in 0..num_experts {
                 let ei_scalar = prog.alloc_vreg(VRegKind::Vec, scalar_w);
                 prog.emit(VmInstr::Broadcast { dst: ei_scalar, src: ScalarExpr::Const(ei as f32), width: scalar_w, dtype, });
-                let slots = super::auto_select::auto_lower_trace_raw(prog, &topk_mask_body, &[ei_scalar, best_idx, half_v], scalar_w, QuantPrecision::F32)?;
+                let slots = super::auto_select::auto_lower_trace_raw(prog, &topk_mask_body, &[ei_scalar, best_idx, half_v], scalar_w, dtype)?;
                 prog.emit(VmInstr::ConditionalSkip { mask: slots[6], skip_count: 1 });
                 prog.emit(VmInstr::VecStore { base: scratchpad_ptr, offset: OffsetExpr::Const(logits_off + ei * elem), src: neg_inf, width: scalar_w, dtype, predicate: None, });
             }
@@ -482,7 +482,7 @@ pub(crate) fn emit_moe_packed_inline(
                         },
                     ];
                     let dequant_slots = super::auto_select::auto_lower_trace_raw(
-                        prog, &dequant_body, &[expert_gu_blocks_ptr, scale_byte_gpr, blk_off], width, QuantPrecision::F32).expect("gate_up dequant auto_lower failed");
+                        prog, &dequant_body, &[expert_gu_blocks_ptr, scale_byte_gpr, blk_off], width, dtype).expect("gate_up dequant auto_lower failed");
                     let dequant_vec = dequant_slots[0];
 
                     let bias_vec = prog.alloc_vreg(VRegKind::Vec, width);
@@ -492,7 +492,7 @@ pub(crate) fn emit_moe_packed_inline(
                             Box::new(OffsetExpr::Const(vec_idx * lanes * elem)),
                         ), width, dtype, predicate: None, });
                     // Arithmetic: dequant + bias via auto_lower_trace_raw
-                    let slots = super::auto_select::auto_lower_trace_raw(prog, &dequant_bias_body, &[dequant_vec, bias_vec], width, QuantPrecision::F32).expect("dequant_bias_body auto_lower failed");
+                    let slots = super::auto_select::auto_lower_trace_raw(prog, &dequant_bias_body, &[dequant_vec, bias_vec], width, dtype).expect("dequant_bias_body auto_lower failed");
 
                     prog.emit(VmInstr::VecStore { base: scratchpad_ptr,
                         offset: OffsetExpr::Add(
@@ -517,7 +517,7 @@ pub(crate) fn emit_moe_packed_inline(
 
                 // Arithmetic: full SwiGLU (clamp + sigmoid + gate*scaled + silu*up) via auto_lower_trace_raw
                 let slots = super::auto_select::auto_lower_trace_raw(
-                    prog, &swiglu_body, &[gate_vec, up_vec, limit_neg, limit_pos], width, QuantPrecision::F32).expect("swiglu_body auto_lower failed");
+                    prog, &swiglu_body, &[gate_vec, up_vec, limit_neg, limit_pos], width, dtype).expect("swiglu_body auto_lower failed");
 
                 prog.emit(VmInstr::VecStore { base: scratchpad_ptr,
                     offset: OffsetExpr::Add(Box::new(OffsetExpr::Const(activ_offset)), Box::new(OffsetExpr::LoopOffset(v_off))),
@@ -565,7 +565,7 @@ pub(crate) fn emit_moe_packed_inline(
                         let dq_slots = super::auto_select::auto_lower_trace_raw(
                             prog, &down_dequant_body,
                             &[expert_down_blocks_ptr, scale_byte_gpr, blk_off, row_off, sv_off],
-                            width, QuantPrecision::F32).expect("down dequant auto_lower failed");
+                            width, dtype).expect("down dequant auto_lower failed");
                         let down_vec = dq_slots[0];
 
                         let activ_vec = prog.alloc_vreg(VRegKind::Vec, width);
@@ -580,12 +580,12 @@ pub(crate) fn emit_moe_packed_inline(
                             TraceOp::Input(0), TraceOp::Input(1), TraceOp::Input(2),
                             TraceOp::Fma(ValueId(0), ValueId(1), ValueId(2)), // 3: new_acc = down * activ + acc
                         ];
-                        super::auto_select::auto_lower_trace_into(prog, &fma_body, &[down_vec, activ_vec, acc], acc, width, QuantPrecision::F32).expect("down FMA auto_lower failed");
+                        super::auto_select::auto_lower_trace_into(prog, &fma_body, &[down_vec, activ_vec, acc], acc, width, dtype).expect("down FMA auto_lower failed");
                     });
 
                     // Arithmetic: HReduce via auto_lower_trace_raw (scalar output → broadcast)
                     let mha_hr_body = vec![TraceOp::Input(0), TraceOp::HReduce { src: ValueId(0), op: ReduceKind::Sum }];
-                    let hr_slots = super::auto_select::auto_lower_trace_raw(prog, &mha_hr_body, &[acc], width, QuantPrecision::F32).expect("MoE packed HReduce auto_lower failed");
+                    let hr_slots = super::auto_select::auto_lower_trace_raw(prog, &mha_hr_body, &[acc], width, dtype).expect("MoE packed HReduce auto_lower failed");
                     let acc_reduced = prog.alloc_vreg(VRegKind::Vec, width);
                     prog.emit(VmInstr::Broadcast { dst: acc_reduced, src: ScalarExpr::ExtractLane0(hr_slots[1]), width, dtype, });
 
@@ -614,7 +614,7 @@ pub(crate) fn emit_moe_packed_inline(
 
                     // Arithmetic: bias + weight + accumulate via auto_lower_trace_raw
                     let slots = super::auto_select::auto_lower_trace_raw(
-                        prog, &down_accumulate_body, &[acc_reduced, bias_broadcast, weight_vec, old_out_broadcast], width, QuantPrecision::F32).expect("down accumulate auto_lower failed");
+                        prog, &down_accumulate_body, &[acc_reduced, bias_broadcast, weight_vec, old_out_broadcast], width, dtype).expect("down accumulate auto_lower failed");
                     let new_out_scalar = prog.alloc_vreg(VRegKind::Vec, SimdWidth::Scalar);
                     prog.emit(VmInstr::Broadcast { dst: new_out_scalar, src: ScalarExpr::ExtractLane0(slots[6]), width: SimdWidth::Scalar, dtype, });
                     prog.emit(VmInstr::VecStore { base: output_ptr, offset: out_offset, src: new_out_scalar, width: SimdWidth::Scalar, dtype, predicate: None, });

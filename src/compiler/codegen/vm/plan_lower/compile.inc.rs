@@ -801,13 +801,13 @@ pub(crate) fn try_dispatch_reduction(
                     prog.emit(VmInstr::Accumulate { acc, src: tmp });
                 } else {
                     // Complex combine: let trace handle it, skip redundant Accumulate
-                    super::auto_select::auto_lower_trace(prog, &combine, &[acc, tmp], width, QuantPrecision::F32)
+                    super::auto_select::auto_lower_trace(prog, &combine, &[acc, tmp], width, dtype)
                         .expect("try_dispatch_reduction: combine trace invariant violation");
                 }
             });
 
             if let Some(ref norm_body) = normalize {
-                super::auto_select::auto_lower_trace(prog, norm_body, &[acc, scale], width, QuantPrecision::F32)
+                super::auto_select::auto_lower_trace(prog, norm_body, &[acc, scale], width, dtype)
                     .expect("try_dispatch_reduction: normalize trace invariant violation");
             }
 
@@ -837,8 +837,9 @@ fn emit_injective_inline(
     body: &[TraceOp],
     inputs: &[VRegId],
     width: SimdWidth,
+    dtype: crate::compiler::trace::QuantPrecision,
 ) -> Result<Vec<VRegId>, CompilerError> {
-    super::auto_select::auto_lower_trace_raw(prog, body, inputs, width, QuantPrecision::F32)
+    super::auto_select::auto_lower_trace_raw(prog, body, inputs, width, dtype)
 }
 
 /// Standalone/LoopFusion: 两层 Op lowering dispatch。

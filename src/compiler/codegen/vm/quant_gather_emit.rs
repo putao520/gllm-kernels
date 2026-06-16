@@ -227,7 +227,7 @@ fn emit_quant_gather_trace_driven(
                             gather_inputs.push(hbp);
                         }
                         let slots = auto_select::auto_lower_trace_raw(
-                            prog, &decode_trace, &gather_inputs, width, QuantPrecision::F32).map_err(|e| CompilerError::CodegenViolation(
+                            prog, &decode_trace, &gather_inputs, width, dtype).map_err(|e| CompilerError::CodegenViolation(
                             format!("QuantGather: decode auto_lower failed for {:?}: {:?}", quant_type, e)
                         ))?;
 
@@ -245,7 +245,7 @@ fn emit_quant_gather_trace_driven(
                             ];
                             let scale_inputs = vec![decoded];
                             let scale_slots = auto_select::auto_lower_trace_raw(
-                                prog, &scale_trace, &scale_inputs, width, QuantPrecision::F32,
+                                prog, &scale_trace, &scale_inputs, width, dtype,
                             ).map_err(|e| CompilerError::CodegenViolation(
                                 format!("QuantGather: embedding_scale auto_lower failed: {:?}", e)
                             ))?;
@@ -1109,7 +1109,7 @@ mod tests {
         assert_eq!(len1, len2, "loop-based: same instruction count regardless of seq_len");
     }
 
-    // ── Test 22: BF16 dtype output succeeds ──
+    // ── Test 22: BF16 QuantPrecision::F32 output succeeds ──
 
     #[test]
     fn test_emit_quant_gather_bf16_dtype() {

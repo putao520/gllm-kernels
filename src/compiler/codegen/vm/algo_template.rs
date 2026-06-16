@@ -976,8 +976,8 @@ mod tests {
 
         // Assert: extract fields back via pattern match
         if let AlgoTraceStep::Cast { from, to, .. } = cast_step {
-            assert_eq!(from, QuantPrecision::BF16, "from dtype must be BF16");
-            assert_eq!(to, QuantPrecision::F32, "to dtype must be F32");
+            assert_eq!(from, QuantPrecision::BF16, "from QuantPrecision::F32 must be BF16");
+            assert_eq!(to, QuantPrecision::F32, "to QuantPrecision::F32 must be F32");
         } else {
             panic!("expected Cast variant");
         }

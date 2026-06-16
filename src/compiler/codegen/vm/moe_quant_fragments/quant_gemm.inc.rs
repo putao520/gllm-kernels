@@ -336,7 +336,7 @@ pub(crate) fn emit_gemm_assisted_from_plan(
                                 dst: b_lo, base: data_ptr,
                                 offset: OffsetExpr::Const(0), unpack: low_unpack, width,
                             });
-                            prog.emit(VmInstr::VecBinOp { dst: b_lo, a: b_lo, b: scale_vec, op: VecOp::Mul, dtype: QuantPrecision::F32 });
+                            prog.emit(VmInstr::VecBinOp { dst: b_lo, a: b_lo, b: scale_vec, op: VecOp::Mul, dtype: dtype });
                             prog.emit(VmInstr::Fma { dst: acc, acc, a: a_val, b: b_lo, dtype });
 
                             // --- High nibble FMA: hi nibbles = block positions [16..23] ---
@@ -361,7 +361,7 @@ pub(crate) fn emit_gemm_assisted_from_plan(
                                 dst: b_hi, base: data_ptr,
                                 offset: OffsetExpr::Const(0), unpack: high_unpack, width,
                             });
-                            prog.emit(VmInstr::VecBinOp { dst: b_hi, a: b_hi, b: scale_vec, op: VecOp::Mul, dtype: QuantPrecision::F32 });
+                            prog.emit(VmInstr::VecBinOp { dst: b_hi, a: b_hi, b: scale_vec, op: VecOp::Mul, dtype: dtype });
                             prog.emit(VmInstr::Fma { dst: acc, acc, a: a_val, b: b_hi, dtype });
 
                             // Advance data_ptr
@@ -517,7 +517,7 @@ pub(crate) fn emit_gemm_highbit_from_plan(
                                 offset: OffsetExpr::Const(*m_offset),
                                 unpack: BlockUnpackMode::F16Broadcast, width,
                             });
-                            prog.emit(VmInstr::VecBinOp { dst: scale_vec, a: d_vec, b: m_vec, op: VecOp::Add, dtype: QuantPrecision::F32 });
+                            prog.emit(VmInstr::VecBinOp { dst: scale_vec, a: d_vec, b: m_vec, op: VecOp::Add, dtype: dtype });
                         }
                         _ => unreachable!(
                             "emit_gemm_highbit: Hierarchical/Q6KScales/ExternalArray/SubBlockScalars \
@@ -570,11 +570,11 @@ pub(crate) fn emit_gemm_highbit_from_plan(
                                 unpack: BlockUnpackMode::QhBitExpand { bit_value: qh_bit_value }, width,
                             });
                             // Merge: nibble + qh → INT5 value
-                            prog.emit(VmInstr::VecBinOp { dst: w_merged, a: nibble_vec, b: qh_vec, op: VecOp::Add, dtype: QuantPrecision::F32 });
+                            prog.emit(VmInstr::VecBinOp { dst: w_merged, a: nibble_vec, b: qh_vec, op: VecOp::Add, dtype: dtype });
                             // Subtract bias
-                            prog.emit(VmInstr::VecBinOp { dst: w_merged, a: w_merged, b: bias_vec, op: VecOp::Sub, dtype: QuantPrecision::F32 });
+                            prog.emit(VmInstr::VecBinOp { dst: w_merged, a: w_merged, b: bias_vec, op: VecOp::Sub, dtype: dtype });
                             // Scale
-                            prog.emit(VmInstr::VecBinOp { dst: w_merged, a: w_merged, b: scale_vec, op: VecOp::Mul, dtype: QuantPrecision::F32 });
+                            prog.emit(VmInstr::VecBinOp { dst: w_merged, a: w_merged, b: scale_vec, op: VecOp::Mul, dtype: dtype });
                             // FMA
                             prog.emit(VmInstr::Fma { dst: acc, acc, a: a_val, b: w_merged, dtype });
 
@@ -611,11 +611,11 @@ pub(crate) fn emit_gemm_highbit_from_plan(
                                 unpack: BlockUnpackMode::QhBitExpand { bit_value: qh_bit_value }, width,
                             });
                             // Merge: nibble + qh → INT5 value
-                            prog.emit(VmInstr::VecBinOp { dst: w_merged, a: nibble_vec, b: qh_vec, op: VecOp::Add, dtype: QuantPrecision::F32 });
+                            prog.emit(VmInstr::VecBinOp { dst: w_merged, a: nibble_vec, b: qh_vec, op: VecOp::Add, dtype: dtype });
                             // Subtract bias
-                            prog.emit(VmInstr::VecBinOp { dst: w_merged, a: w_merged, b: bias_vec, op: VecOp::Sub, dtype: QuantPrecision::F32 });
+                            prog.emit(VmInstr::VecBinOp { dst: w_merged, a: w_merged, b: bias_vec, op: VecOp::Sub, dtype: dtype });
                             // Scale
-                            prog.emit(VmInstr::VecBinOp { dst: w_merged, a: w_merged, b: scale_vec, op: VecOp::Mul, dtype: QuantPrecision::F32 });
+                            prog.emit(VmInstr::VecBinOp { dst: w_merged, a: w_merged, b: scale_vec, op: VecOp::Mul, dtype: dtype });
                             // FMA
                             prog.emit(VmInstr::Fma { dst: acc, acc, a: a_val, b: w_merged, dtype });
 
@@ -846,7 +846,7 @@ pub(crate) fn emit_gemm_dequant_from_plan(
                                     decode_inputs.push(hbp);
                                 }
                                 let decode_slots = super::auto_select::auto_lower_trace_raw(
-                                    prog, &decode_trace, &decode_inputs, width, QuantPrecision::F32)?;
+                                    prog, &decode_trace, &decode_inputs, width, dtype)?;
                                 let b_decoded = decode_slots[decode_final_slot.0 as usize];
 
                                 let act_off = OffsetExpr::Add(
@@ -856,7 +856,7 @@ pub(crate) fn emit_gemm_dequant_from_plan(
                                 prog.emit(VmInstr::VecLoad { dst: a_val, base: input_ptr, offset: act_off, width, dtype , predicate: None });
 
                                 super::auto_select::auto_lower_trace_into(
-                                    prog, &fma_trace, &[a_val, b_decoded, acc], acc, width, QuantPrecision::F32,
+                                    prog, &fma_trace, &[a_val, b_decoded, acc], acc, width, dtype,
                                 )?;
 
                                 prog.emit(VmInstr::GprBinOp { dst: data_ptr, a: data_ptr, b: GprOperand::VReg(data_stride_reg ), op: GprOp::Add });
@@ -924,7 +924,7 @@ pub(crate) fn emit_gemm_dequant_from_plan(
                                         decode_inputs.push(hbp);
                                     }
                                     let decode_slots = super::auto_select::auto_lower_trace_raw(
-                                        prog, &decode_trace, &decode_inputs, width, QuantPrecision::F32)?;
+                                        prog, &decode_trace, &decode_inputs, width, dtype)?;
                                     let b_decoded = decode_slots[decode_final_slot.0 as usize];
 
                                     let act_off = OffsetExpr::Add(
@@ -940,7 +940,7 @@ pub(crate) fn emit_gemm_dequant_from_plan(
                                     prog.emit(VmInstr::VecLoad { dst: a_val, base: input_ptr, offset: act_off, width, dtype , predicate: None });
 
                                     super::auto_select::auto_lower_trace_into(
-                                        prog, &fma_trace, &[a_val, b_decoded, acc], acc, width, QuantPrecision::F32,
+                                        prog, &fma_trace, &[a_val, b_decoded, acc], acc, width, dtype,
                                     )?;
 
                                     prog.emit(VmInstr::GprBinOp { dst: data_ptr, a: data_ptr, b: GprOperand::VReg(data_stride_reg ), op: GprOp::Add });

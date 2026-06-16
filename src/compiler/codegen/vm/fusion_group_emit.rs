@@ -1795,7 +1795,7 @@ mod tests {
         assert!(display.contains("0, 1, 2, 3"));
     }
 
-    // ── REQ-DTYPE-003: VecWiden / dtype continuity tests ──
+    // ── REQ-DTYPE-003: VecWiden / QuantPrecision::F32 continuity tests ──
 
     #[test]
     fn vec_widen_emit_produces_instruction() {
@@ -1834,7 +1834,7 @@ mod tests {
             &mut prog, acc,
             QuantPrecision::F32, QuantPrecision::F32, SimdWidth::W256,
         );
-        assert_eq!(result, acc, "same dtype should return same register");
+        assert_eq!(result, acc, "same QuantPrecision::F32 should return same register");
         assert!(!prog.instrs.iter().any(|i| matches!(i, VmInstr::VecWiden { .. })));
     }
 
@@ -1858,7 +1858,7 @@ mod tests {
             &mut prog, acc,
             QuantPrecision::BF16, QuantPrecision::BF16, SimdWidth::W256,
         );
-        assert_eq!(result, acc, "same dtype should return same register");
+        assert_eq!(result, acc, "same QuantPrecision::F32 should return same register");
         assert!(!prog.instrs.iter().any(|i| matches!(i, VmInstr::VecNarrow { .. })));
     }
 
@@ -1903,8 +1903,8 @@ mod tests {
         // Act
         let result = verify_and_emit_dtype_casts(&group, &graph, &ctx, &mut prog, &resolver, &abi);
 
-        // Assert: same dtype group should have zero cast points
+        // Assert: same QuantPrecision::F32 group should have zero cast points
         assert!(result.is_ok());
-        assert_eq!(result.unwrap(), 0, "same-dtype group should have no dtype cast points");
+        assert_eq!(result.unwrap(), 0, "same-QuantPrecision::F32 group should have no QuantPrecision::F32 cast points");
     }
 }

@@ -933,7 +933,7 @@ pub(crate) fn lower_op_v2(
                 TraceOp::Input(0), TraceOp::Input(1),
                 TraceOp::Add(ValueId(0), ValueId(1)),
             ];
-            super::auto_select::auto_lower_trace_into(prog, &ple_add_body, &[src_vec, mm_vec], result, width, QuantPrecision::F32)
+            super::auto_select::auto_lower_trace_into(prog, &ple_add_body, &[src_vec, mm_vec], result, width, ctx.dtype)
                 .map_err(|e| CompilerError::CodegenViolation(format!("MmHiddenInject auto_lower: {e}")))?;
             prog.emit(VmInstr::VecStore { base: output_ptr, src: result, offset: OffsetExpr::LoopOffset(byte_off), width, dtype: ctx.dtype , predicate: None,});
             prog.emit(VmInstr::LoopEnd);
