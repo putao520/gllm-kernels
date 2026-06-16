@@ -118,7 +118,7 @@ impl GroupDependencyAnalyzer {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::compiler::graph::{SymDim, OpKind};
+    use crate::compiler::graph::{SymDim, OpKind, Op, GemmSpec, NormSpec, QuantGemmSpec, RopeSpec, AttentionSpec, AttentionGeometry, AttentionMask, SinksSpec, CachedGqaSpec, MlaSpec, DualRopeSpec};
     use crate::compiler::fusion::GroupMarker;
     use crate::types::DType;
 
@@ -138,7 +138,7 @@ mod tests {
         let mut graph = CompilerGraph::new();
         let t0 = graph.add_tensor("input", vec![SymDim::Concrete(4)], DType::F32);
         let t_out = graph.add_tensor("out", vec![SymDim::Concrete(4)], DType::F32);
-        let op0 = graph.add_op(OpKind::Silu, vec![t0], vec![t_out], "silu");
+        let op0 = graph.add_op_with_op(Op::Silu, OpKind::Silu, vec![t0], vec![t_out], "silu");
 
         let plan = FusionPlan {
             groups: vec![crate::compiler::fusion::FusionGroup {
@@ -176,9 +176,9 @@ mod tests {
         let t_1 = graph.add_tensor("t1", vec![SymDim::Concrete(4)], DType::F32);
         let t_2 = graph.add_tensor("t2", vec![SymDim::Concrete(4)], DType::F32);
 
-        let op0 = graph.add_op(OpKind::Silu, vec![t_input], vec![t_0], "silu");
-        let op1 = graph.add_op(OpKind::RmsNorm { feature_dim: 4096, eps: 1e-5 }, vec![t_0], vec![t_1], "norm");
-        let op2 = graph.add_op(OpKind::Gemm { m: SymDim::Concrete(1), n: 64, k: 4, dtype: DType::F32, trans_b: false }, vec![t_1, t_w1], vec![t_2], "gemm");
+        let op0 = graph.add_op_with_op(Op::Silu, OpKind::Silu, vec![t_input], vec![t_0], "silu");
+        let op1 = graph.add_op_with_op(Op::RmsNorm(NormSpec { feature_dim: 4096, eps: 1e-5, dtype: DType::F32, has_weight: true }), OpKind::RmsNorm { feature_dim: 4096, eps: 1e-5 }, vec![t_0], vec![t_1], "norm");
+        let op2 = graph.add_op_with_op(Op::Gemm(GemmSpec { m: SymDim::Concrete(1), n: 64, k: 4, dtype: DType::F32, trans_b: false, has_bias: false }), OpKind::Gemm { m: SymDim::Concrete(1), n: 64, k: 4, dtype: DType::F32, trans_b: false }, vec![t_1, t_w1], vec![t_2], "gemm");
 
         let plan = FusionPlan {
             groups: vec![
@@ -210,8 +210,8 @@ mod tests {
         let t_out0 = graph.add_tensor("out0", vec![SymDim::Concrete(4)], DType::F32);
         let t_out1 = graph.add_tensor("out1", vec![SymDim::Concrete(4)], DType::F32);
 
-        let op0 = graph.add_op(OpKind::Silu, vec![t_in0], vec![t_out0], "silu0");
-        let op1 = graph.add_op(OpKind::Silu, vec![t_in1], vec![t_out1], "silu1");
+        let op0 = graph.add_op_with_op(Op::Silu, OpKind::Silu, vec![t_in0], vec![t_out0], "silu0");
+        let op1 = graph.add_op_with_op(Op::Silu, OpKind::Silu, vec![t_in1], vec![t_out1], "silu1");
 
         let plan = FusionPlan {
             groups: vec![
@@ -236,7 +236,7 @@ mod tests {
         let mut graph = CompilerGraph::new();
         let t_in = graph.add_tensor("in", vec![SymDim::Concrete(4)], DType::F32);
         let t_out = graph.add_tensor("out", vec![SymDim::Concrete(4)], DType::F32);
-        let op0 = graph.add_op(OpKind::Silu, vec![t_in], vec![t_out], "silu");
+        let op0 = graph.add_op_with_op(Op::Silu, OpKind::Silu, vec![t_in], vec![t_out], "silu");
 
         let plan = FusionPlan {
             groups: vec![make_group(0, op0)],
@@ -271,10 +271,10 @@ mod tests {
         let t_c = graph.add_tensor("c", vec![SymDim::Concrete(4)], DType::F32);
         let t_out = graph.add_tensor("out", vec![SymDim::Concrete(4)], DType::F32);
 
-        let op0 = graph.add_op(OpKind::Silu, vec![t_in], vec![t_a], "fanout");
-        let op1 = graph.add_op(OpKind::Silu, vec![t_a], vec![t_b], "left");
-        let op2 = graph.add_op(OpKind::Silu, vec![t_a], vec![t_c], "right");
-        let op3 = graph.add_op(OpKind::Add, vec![t_b, t_c], vec![t_out], "merge");
+        let op0 = graph.add_op_with_op(Op::Silu, OpKind::Silu, vec![t_in], vec![t_a], "fanout");
+        let op1 = graph.add_op_with_op(Op::Silu, OpKind::Silu, vec![t_a], vec![t_b], "left");
+        let op2 = graph.add_op_with_op(Op::Silu, OpKind::Silu, vec![t_a], vec![t_c], "right");
+        let op3 = graph.add_op_with_op(Op::Add, OpKind::Add, vec![t_b, t_c], vec![t_out], "merge");
 
         let plan = FusionPlan {
             groups: vec![
@@ -316,9 +316,9 @@ mod tests {
         let t_a = graph.add_tensor("a", vec![SymDim::Concrete(4)], DType::F32);
         let t_out = graph.add_tensor("out", vec![SymDim::Concrete(4)], DType::F32);
 
-        let op0 = graph.add_op(OpKind::Silu, vec![t_in], vec![t_mid], "silu");
-        let op1 = graph.add_op(OpKind::RmsNorm { feature_dim: 4096, eps: 1e-5 }, vec![t_mid], vec![t_a], "norm");
-        let op2 = graph.add_op(OpKind::Silu, vec![t_a], vec![t_out], "silu2");
+        let op0 = graph.add_op_with_op(Op::Silu, OpKind::Silu, vec![t_in], vec![t_mid], "silu");
+        let op1 = graph.add_op_with_op(Op::RmsNorm(NormSpec { feature_dim: 4096, eps: 1e-5, dtype: DType::F32, has_weight: true }), OpKind::RmsNorm { feature_dim: 4096, eps: 1e-5 }, vec![t_mid], vec![t_a], "norm");
+        let op2 = graph.add_op_with_op(Op::Silu, OpKind::Silu, vec![t_a], vec![t_out], "silu2");
 
         let plan = FusionPlan {
             groups: vec![
@@ -361,7 +361,7 @@ mod tests {
         let t_ext = graph.add_tensor("external", vec![SymDim::Concrete(4)], DType::F32);
         let t_out = graph.add_tensor("out", vec![SymDim::Concrete(4)], DType::F32);
 
-        let op0 = graph.add_op(OpKind::Silu, vec![t_ext], vec![t_out], "silu");
+        let op0 = graph.add_op_with_op(Op::Silu, OpKind::Silu, vec![t_ext], vec![t_out], "silu");
 
         let plan = FusionPlan {
             groups: vec![make_group(0, op0)],
@@ -385,12 +385,12 @@ mod tests {
         let mut graph = CompilerGraph::new();
         let t_in = graph.add_tensor("input", vec![SymDim::Concrete(4)], DType::F32);
         let t_src = graph.add_tensor("src", vec![SymDim::Concrete(4)], DType::F32);
-        let op0 = graph.add_op(OpKind::Silu, vec![t_in], vec![t_src], "src");
+        let op0 = graph.add_op_with_op(Op::Silu, OpKind::Silu, vec![t_in], vec![t_src], "src");
 
         let mut consumer_ops = Vec::new();
         for i in 0..5 {
             let t_out = graph.add_tensor(&format!("out{}", i), vec![SymDim::Concrete(4)], DType::F32);
-            let opi = graph.add_op(OpKind::Silu, vec![t_src], vec![t_out], &format!("c{}", i));
+            let opi = graph.add_op_with_op(Op::Silu, OpKind::Silu, vec![t_src], vec![t_out], &format!("c{}", i));
             consumer_ops.push(opi);
         }
 
@@ -430,11 +430,11 @@ mod tests {
         let t_out = graph.add_tensor("out", vec![SymDim::Concrete(4)], DType::F32);
         let t_out4 = graph.add_tensor("out4", vec![SymDim::Concrete(4)], DType::F32);
 
-        let op0 = graph.add_op(OpKind::Silu, vec![t_in], vec![t_a], "src");
-        let op1 = graph.add_op(OpKind::Silu, vec![t_a], vec![t_b], "left");
-        let op2 = graph.add_op(OpKind::Silu, vec![t_a], vec![t_c], "right");
-        let op3 = graph.add_op(OpKind::Add, vec![t_b, t_c], vec![t_out], "merge");
-        let op4 = graph.add_op(OpKind::Silu, vec![t_in4], vec![t_out4], "indep");
+        let op0 = graph.add_op_with_op(Op::Silu, OpKind::Silu, vec![t_in], vec![t_a], "src");
+        let op1 = graph.add_op_with_op(Op::Silu, OpKind::Silu, vec![t_a], vec![t_b], "left");
+        let op2 = graph.add_op_with_op(Op::Silu, OpKind::Silu, vec![t_a], vec![t_c], "right");
+        let op3 = graph.add_op_with_op(Op::Add, OpKind::Add, vec![t_b, t_c], vec![t_out], "merge");
+        let op4 = graph.add_op_with_op(Op::Silu, OpKind::Silu, vec![t_in4], vec![t_out4], "indep");
 
         let plan = FusionPlan {
             groups: vec![
@@ -479,8 +479,8 @@ mod tests {
         let t_mid = graph.add_tensor("mid", vec![SymDim::Concrete(4)], DType::F32);
         let t_out = graph.add_tensor("out", vec![SymDim::Concrete(4)], DType::F32);
 
-        let op0 = graph.add_op(OpKind::Silu, vec![t_in], vec![t_mid], "inner0");
-        let op1 = graph.add_op(OpKind::Silu, vec![t_mid], vec![t_out], "inner1");
+        let op0 = graph.add_op_with_op(Op::Silu, OpKind::Silu, vec![t_in], vec![t_mid], "inner0");
+        let op1 = graph.add_op_with_op(Op::Silu, OpKind::Silu, vec![t_mid], vec![t_out], "inner1");
 
         let plan = FusionPlan {
             groups: vec![crate::compiler::fusion::FusionGroup {
@@ -519,9 +519,9 @@ mod tests {
         let t2 = graph.add_tensor("t2", vec![SymDim::Concrete(4)], DType::F32);
         let t3 = graph.add_tensor("t3", vec![SymDim::Concrete(4)], DType::F32);
 
-        let op0 = graph.add_op(OpKind::Silu, vec![t0], vec![t1], "a");
-        let op1 = graph.add_op(OpKind::Silu, vec![t1], vec![t2], "b");
-        let op2 = graph.add_op(OpKind::Silu, vec![t2], vec![t3], "c");
+        let op0 = graph.add_op_with_op(Op::Silu, OpKind::Silu, vec![t0], vec![t1], "a");
+        let op1 = graph.add_op_with_op(Op::Silu, OpKind::Silu, vec![t1], vec![t2], "b");
+        let op2 = graph.add_op_with_op(Op::Silu, OpKind::Silu, vec![t2], vec![t3], "c");
 
         let plan = FusionPlan {
             groups: vec![
@@ -553,14 +553,12 @@ mod tests {
         let t_a = graph.add_tensor("a", vec![SymDim::Concrete(8)], DType::F32);
         let t_b = graph.add_tensor("b", vec![SymDim::Concrete(8)], DType::F32);
 
-        let op0 = graph.add_op(
-            OpKind::RmsNorm { feature_dim: 4096, eps: 1e-6 },
+        let op0 = graph.add_op_with_op(Op::RmsNorm(NormSpec { feature_dim: 4096, eps: 1e-6, dtype: DType::F32, has_weight: true }), OpKind::RmsNorm { feature_dim: 4096, eps: 1e-6 },
             vec![t_in],
             vec![t_a],
             "norm",
         );
-        let op1 = graph.add_op(
-            OpKind::Mul,
+        let op1 = graph.add_op_with_op(Op::Mul, OpKind::Mul,
             vec![t_a, t_in],
             vec![t_b],
             "mul",
@@ -597,7 +595,7 @@ mod tests {
         let mut ops = Vec::new();
         for i in 0..10 {
             let t = graph.add_tensor(&format!("t{}", i), vec![SymDim::Concrete(4)], DType::F32);
-            let op = graph.add_op(OpKind::Silu, vec![prev], vec![t], &format!("op{}", i));
+            let op = graph.add_op_with_op(Op::Silu, OpKind::Silu, vec![prev], vec![t], &format!("op{}", i));
             ops.push(op);
             prev = t;
         }
@@ -634,7 +632,7 @@ mod tests {
         let mut graph = CompilerGraph::new();
         let t_in = graph.add_tensor("input", vec![SymDim::Concrete(4)], DType::F32);
         let t_out = graph.add_tensor("out", vec![SymDim::Concrete(4)], DType::F32);
-        let real_op = graph.add_op(OpKind::Silu, vec![t_in], vec![t_out], "real");
+        let real_op = graph.add_op_with_op(Op::Silu, OpKind::Silu, vec![t_in], vec![t_out], "real");
 
         // OpId that was never inserted into the graph (fabricated index)
         let phantom_op = OpId(9999);
@@ -672,7 +670,7 @@ mod tests {
         // Only add the output tensor; the input tensor id is fabricated.
         let t_out = graph.add_tensor("out", vec![SymDim::Concrete(4)], DType::F32);
         let t_phantom_input = crate::compiler::graph::TensorId(7777);
-        let op0 = graph.add_op(OpKind::Silu, vec![t_phantom_input], vec![t_out], "solo");
+        let op0 = graph.add_op_with_op(Op::Silu, OpKind::Silu, vec![t_phantom_input], vec![t_out], "solo");
 
         let plan = FusionPlan {
             groups: vec![make_group(0, op0)],
@@ -701,8 +699,8 @@ mod tests {
         let t_mid = graph.add_tensor("mid", vec![SymDim::Concrete(4)], DType::F32);
         let t_out = graph.add_tensor("out", vec![SymDim::Concrete(4)], DType::F32);
 
-        let orphan_op = graph.add_op(OpKind::Silu, vec![t_in], vec![t_mid], "orphan");
-        let consumer_op = graph.add_op(OpKind::Silu, vec![t_mid], vec![t_out], "consumer");
+        let orphan_op = graph.add_op_with_op(Op::Silu, OpKind::Silu, vec![t_in], vec![t_mid], "orphan");
+        let consumer_op = graph.add_op_with_op(Op::Silu, OpKind::Silu, vec![t_mid], vec![t_out], "consumer");
 
         // Only the consumer is in a group; the orphan producer is not.
         let plan = FusionPlan {
@@ -737,9 +735,9 @@ mod tests {
         let t_b = graph.add_tensor("b", vec![SymDim::Concrete(4)], DType::F32);
         let t_out = graph.add_tensor("out", vec![SymDim::Concrete(4)], DType::F32);
 
-        let op0 = graph.add_op(OpKind::Silu, vec![t_in0], vec![t_a], "prod_a");
-        let op1 = graph.add_op(OpKind::Silu, vec![t_in1], vec![t_b], "prod_b");
-        let op2 = graph.add_op(OpKind::Add, vec![t_a, t_b], vec![t_out], "consumer");
+        let op0 = graph.add_op_with_op(Op::Silu, OpKind::Silu, vec![t_in0], vec![t_a], "prod_a");
+        let op1 = graph.add_op_with_op(Op::Silu, OpKind::Silu, vec![t_in1], vec![t_b], "prod_b");
+        let op2 = graph.add_op_with_op(Op::Add, OpKind::Add, vec![t_a, t_b], vec![t_out], "consumer");
 
         let plan = FusionPlan {
             groups: vec![
@@ -779,10 +777,10 @@ mod tests {
         let t_out = graph.add_tensor("out", vec![SymDim::Concrete(4)], DType::F32);
 
         // Group 0 has two ops producing t_a and t_b
-        let op0a = graph.add_op(OpKind::Silu, vec![t_in], vec![t_a], "prod_a");
-        let op0b = graph.add_op(OpKind::Silu, vec![t_in], vec![t_b], "prod_b");
+        let op0a = graph.add_op_with_op(Op::Silu, OpKind::Silu, vec![t_in], vec![t_a], "prod_a");
+        let op0b = graph.add_op_with_op(Op::Silu, OpKind::Silu, vec![t_in], vec![t_b], "prod_b");
         // Group 1 consumes both t_a and t_b
-        let op1 = graph.add_op(OpKind::Add, vec![t_a, t_b], vec![t_out], "consumer");
+        let op1 = graph.add_op_with_op(Op::Add, OpKind::Add, vec![t_a, t_b], vec![t_out], "consumer");
 
         let plan = FusionPlan {
             groups: vec![
@@ -830,10 +828,10 @@ mod tests {
         let t_b = graph.add_tensor("b", vec![SymDim::Concrete(4)], DType::F32);
         let t_out = graph.add_tensor("out", vec![SymDim::Concrete(4)], DType::F32);
 
-        let op0 = graph.add_op(OpKind::Silu, vec![t_x], vec![t_a], "left");
-        let op1 = graph.add_op(OpKind::Silu, vec![t_y], vec![t_b], "right");
+        let op0 = graph.add_op_with_op(Op::Silu, OpKind::Silu, vec![t_x], vec![t_a], "left");
+        let op1 = graph.add_op_with_op(Op::Silu, OpKind::Silu, vec![t_y], vec![t_b], "right");
         // op2 takes inputs from both group 0 and group 1
-        let op2 = graph.add_op(OpKind::Mul, vec![t_a, t_b, t_z], vec![t_out], "merge");
+        let op2 = graph.add_op_with_op(Op::Mul, OpKind::Mul, vec![t_a, t_b, t_z], vec![t_out], "merge");
 
         let plan = FusionPlan {
             groups: vec![
@@ -877,12 +875,12 @@ mod tests {
         let t_f = graph.add_tensor("f", vec![SymDim::Concrete(4)], DType::F32);
         let t_g = graph.add_tensor("g", vec![SymDim::Concrete(4)], DType::F32);
 
-        let op0 = graph.add_op(OpKind::Silu, vec![t_root], vec![t_a], "root");
-        let op1 = graph.add_op(OpKind::Silu, vec![t_a], vec![t_b], "g1");
-        let op2 = graph.add_op(OpKind::Silu, vec![t_a], vec![t_c], "g2");
-        let op3 = graph.add_op(OpKind::Silu, vec![t_a], vec![t_d], "g3");
-        let op4 = graph.add_op(OpKind::Add, vec![t_b, t_c], vec![t_e], "g4");
-        let op5 = graph.add_op(OpKind::Add, vec![t_c, t_d], vec![t_f], "g5");
+        let op0 = graph.add_op_with_op(Op::Silu, OpKind::Silu, vec![t_root], vec![t_a], "root");
+        let op1 = graph.add_op_with_op(Op::Silu, OpKind::Silu, vec![t_a], vec![t_b], "g1");
+        let op2 = graph.add_op_with_op(Op::Silu, OpKind::Silu, vec![t_a], vec![t_c], "g2");
+        let op3 = graph.add_op_with_op(Op::Silu, OpKind::Silu, vec![t_a], vec![t_d], "g3");
+        let op4 = graph.add_op_with_op(Op::Add, OpKind::Add, vec![t_b, t_c], vec![t_e], "g4");
+        let op5 = graph.add_op_with_op(Op::Add, OpKind::Add, vec![t_c, t_d], vec![t_f], "g5");
 
         let plan = FusionPlan {
             groups: vec![
@@ -929,8 +927,8 @@ mod tests {
         let t_out0 = graph.add_tensor("out0", vec![SymDim::Concrete(4)], DType::F32);
         let t_out1 = graph.add_tensor("out1", vec![SymDim::Concrete(4)], DType::F32);
 
-        let op0 = graph.add_op(OpKind::Silu, vec![t_shared], vec![t_out0], "path_a");
-        let op1 = graph.add_op(OpKind::Silu, vec![t_shared], vec![t_out1], "path_b");
+        let op0 = graph.add_op_with_op(Op::Silu, OpKind::Silu, vec![t_shared], vec![t_out0], "path_a");
+        let op1 = graph.add_op_with_op(Op::Silu, OpKind::Silu, vec![t_shared], vec![t_out1], "path_b");
 
         let plan = FusionPlan {
             groups: vec![
@@ -964,7 +962,7 @@ mod tests {
         for i in 0..7 {
             let t_in = graph.add_tensor(&format!("in{}", i), vec![SymDim::Concrete(4)], DType::F32);
             let t_out = graph.add_tensor(&format!("out{}", i), vec![SymDim::Concrete(4)], DType::F32);
-            let op = graph.add_op(OpKind::Silu, vec![t_in], vec![t_out], &format!("op{}", i));
+            let op = graph.add_op_with_op(Op::Silu, OpKind::Silu, vec![t_in], vec![t_out], &format!("op{}", i));
             groups.push(make_group(i, op));
             op_map.insert(op, i);
         }
@@ -997,15 +995,14 @@ mod tests {
         for i in 0..6 {
             let t_in = graph.add_tensor(&format!("in{}", i), vec![SymDim::Concrete(4)], DType::F32);
             let t_out = graph.add_tensor(&format!("p{}", i), vec![SymDim::Concrete(4)], DType::F32);
-            let op = graph.add_op(OpKind::Silu, vec![t_in], vec![t_out], &format!("prod{}", i));
+            let op = graph.add_op_with_op(Op::Silu, OpKind::Silu, vec![t_in], vec![t_out], &format!("prod{}", i));
             producer_outputs.push(t_out);
             producer_ops.push(op);
         }
 
         // Consumer takes first two producer outputs as inputs
         let t_final = graph.add_tensor("final", vec![SymDim::Concrete(4)], DType::F32);
-        let consumer = graph.add_op(
-            OpKind::Add,
+        let consumer = graph.add_op_with_op(Op::Add, OpKind::Add,
             vec![producer_outputs[0], producer_outputs[1]],
             vec![t_final],
             "consumer",
@@ -1044,7 +1041,7 @@ mod tests {
         // iterates zero times for that op, so no dependency edges are created.
         let mut graph = CompilerGraph::new();
         let t_out = graph.add_tensor("out", vec![SymDim::Concrete(4)], DType::F32);
-        let op0 = graph.add_op(OpKind::Silu, vec![], vec![t_out], "no_input");
+        let op0 = graph.add_op_with_op(Op::Silu, OpKind::Silu, vec![], vec![t_out], "no_input");
 
         let plan = FusionPlan {
             groups: vec![make_group(0, op0)],
@@ -1074,7 +1071,7 @@ mod tests {
         let mut graph = CompilerGraph::new();
         let t_in = graph.add_tensor("input", vec![SymDim::Concrete(4)], DType::F32);
         let t_out = graph.add_tensor("out", vec![SymDim::Concrete(4)], DType::F32);
-        let real_op = graph.add_op(OpKind::Silu, vec![t_in], vec![t_out], "real");
+        let real_op = graph.add_op_with_op(Op::Silu, OpKind::Silu, vec![t_in], vec![t_out], "real");
 
         let plan = FusionPlan {
             groups: vec![
@@ -1120,7 +1117,7 @@ mod tests {
         // add_tensor creates a tensor with producer = None by default
         let t_weight = graph.add_tensor("weight", vec![SymDim::Concrete(4)], DType::F32);
         let t_out = graph.add_tensor("out", vec![SymDim::Concrete(4)], DType::F32);
-        let op0 = graph.add_op(OpKind::Silu, vec![t_weight], vec![t_out], "use_weight");
+        let op0 = graph.add_op_with_op(Op::Silu, OpKind::Silu, vec![t_weight], vec![t_out], "use_weight");
 
         let plan = FusionPlan {
             groups: vec![make_group(0, op0)],
@@ -1152,13 +1149,13 @@ mod tests {
         let mut chain_ops = Vec::new();
         for i in 0..5 {
             let t = graph.add_tensor(&format!("c{}", i), vec![SymDim::Concrete(4)], DType::F32);
-            let op = graph.add_op(OpKind::Silu, vec![prev], vec![t], &format!("chain{}", i));
+            let op = graph.add_op_with_op(Op::Silu, OpKind::Silu, vec![prev], vec![t], &format!("chain{}", i));
             chain_ops.push(op);
             prev = t;
         }
 
         let t_indep_out = graph.add_tensor("indep_out", vec![SymDim::Concrete(4)], DType::F32);
-        let op_indep = graph.add_op(OpKind::Silu, vec![t_indep], vec![t_indep_out], "indep");
+        let op_indep = graph.add_op_with_op(Op::Silu, OpKind::Silu, vec![t_indep], vec![t_indep_out], "indep");
 
         let mut groups: Vec<_> = chain_ops
             .iter()
@@ -1205,9 +1202,9 @@ mod tests {
         let t_out = graph.add_tensor("out", vec![SymDim::Concrete(4)], DType::F32);
 
         // chain: op0 → op1 → op2
-        let op0 = graph.add_op(OpKind::Silu, vec![t_in], vec![t_a], "first");
-        let op1 = graph.add_op(OpKind::Silu, vec![t_a], vec![t_b], "second");
-        let op2 = graph.add_op(OpKind::Silu, vec![t_b], vec![t_out], "third");
+        let op0 = graph.add_op_with_op(Op::Silu, OpKind::Silu, vec![t_in], vec![t_a], "first");
+        let op1 = graph.add_op_with_op(Op::Silu, OpKind::Silu, vec![t_a], vec![t_b], "second");
+        let op2 = graph.add_op_with_op(Op::Silu, OpKind::Silu, vec![t_b], vec![t_out], "third");
 
         // Vector index 0 has id=5, index 1 has id=3, index 2 has id=1
         let plan = FusionPlan {
@@ -1295,15 +1292,15 @@ mod tests {
         let t_h = graph.add_tensor("h", vec![SymDim::Concrete(4)], DType::F32);
         let t_i = graph.add_tensor("i", vec![SymDim::Concrete(4)], DType::F32);
 
-        let op0 = graph.add_op(OpKind::Silu, vec![t_in], vec![t_a], "root");
-        let op1 = graph.add_op(OpKind::Silu, vec![t_a], vec![t_b], "l1_left");
-        let op2 = graph.add_op(OpKind::Silu, vec![t_a], vec![t_c], "l1_right");
-        let op3 = graph.add_op(OpKind::Silu, vec![t_b], vec![t_d], "l2_left");
-        let op4 = graph.add_op(OpKind::Silu, vec![t_c], vec![t_e], "l2_right");
-        let op5 = graph.add_op(OpKind::Add, vec![t_d, t_e], vec![t_f], "merge1");
-        let op6 = graph.add_op(OpKind::Silu, vec![t_f], vec![t_g], "inner_left");
-        let op7 = graph.add_op(OpKind::Silu, vec![t_f], vec![t_h], "inner_right");
-        let op8 = graph.add_op(OpKind::Add, vec![t_g, t_h], vec![t_i], "merge2");
+        let op0 = graph.add_op_with_op(Op::Silu, OpKind::Silu, vec![t_in], vec![t_a], "root");
+        let op1 = graph.add_op_with_op(Op::Silu, OpKind::Silu, vec![t_a], vec![t_b], "l1_left");
+        let op2 = graph.add_op_with_op(Op::Silu, OpKind::Silu, vec![t_a], vec![t_c], "l1_right");
+        let op3 = graph.add_op_with_op(Op::Silu, OpKind::Silu, vec![t_b], vec![t_d], "l2_left");
+        let op4 = graph.add_op_with_op(Op::Silu, OpKind::Silu, vec![t_c], vec![t_e], "l2_right");
+        let op5 = graph.add_op_with_op(Op::Add, OpKind::Add, vec![t_d, t_e], vec![t_f], "merge1");
+        let op6 = graph.add_op_with_op(Op::Silu, OpKind::Silu, vec![t_f], vec![t_g], "inner_left");
+        let op7 = graph.add_op_with_op(Op::Silu, OpKind::Silu, vec![t_f], vec![t_h], "inner_right");
+        let op8 = graph.add_op_with_op(Op::Add, OpKind::Add, vec![t_g, t_h], vec![t_i], "merge2");
 
         let ops = [op0, op1, op2, op3, op4, op5, op6, op7, op8];
         let plan = FusionPlan {
@@ -1341,8 +1338,8 @@ mod tests {
         let t_produced = graph.add_tensor("produced", vec![SymDim::Concrete(4)], DType::F32);
         let t_out = graph.add_tensor("out", vec![SymDim::Concrete(4)], DType::F32);
 
-        let op0 = graph.add_op(OpKind::Silu, vec![t_in], vec![t_produced], "producer");
-        let op1 = graph.add_op(OpKind::Add, vec![t_produced, t_ext], vec![t_out], "consumer");
+        let op0 = graph.add_op_with_op(Op::Silu, OpKind::Silu, vec![t_in], vec![t_produced], "producer");
+        let op1 = graph.add_op_with_op(Op::Add, OpKind::Add, vec![t_produced, t_ext], vec![t_out], "consumer");
 
         let plan = FusionPlan {
             groups: vec![
@@ -1383,11 +1380,11 @@ mod tests {
         let t_b_out = graph.add_tensor("b_out", vec![SymDim::Concrete(4)], DType::F32);
         let t_final = graph.add_tensor("final", vec![SymDim::Concrete(4)], DType::F32);
 
-        let op0 = graph.add_op(OpKind::Silu, vec![t_a_in], vec![t_a_mid], "chain_a_0");
-        let op1 = graph.add_op(OpKind::Silu, vec![t_b_in], vec![t_b_mid], "chain_b_0");
-        let op2 = graph.add_op(OpKind::Silu, vec![t_a_mid], vec![t_a_out], "chain_a_1");
-        let op3 = graph.add_op(OpKind::Silu, vec![t_b_mid], vec![t_b_out], "chain_b_1");
-        let op4 = graph.add_op(OpKind::Add, vec![t_a_out, t_b_out], vec![t_final], "merge");
+        let op0 = graph.add_op_with_op(Op::Silu, OpKind::Silu, vec![t_a_in], vec![t_a_mid], "chain_a_0");
+        let op1 = graph.add_op_with_op(Op::Silu, OpKind::Silu, vec![t_b_in], vec![t_b_mid], "chain_b_0");
+        let op2 = graph.add_op_with_op(Op::Silu, OpKind::Silu, vec![t_a_mid], vec![t_a_out], "chain_a_1");
+        let op3 = graph.add_op_with_op(Op::Silu, OpKind::Silu, vec![t_b_mid], vec![t_b_out], "chain_b_1");
+        let op4 = graph.add_op_with_op(Op::Add, OpKind::Add, vec![t_a_out, t_b_out], vec![t_final], "merge");
 
         let plan = FusionPlan {
             groups: vec![
@@ -1433,9 +1430,9 @@ mod tests {
         let t_mid2 = graph.add_tensor("mid2", vec![SymDim::Concrete(4)], DType::F32);
         let t_out = graph.add_tensor("out", vec![SymDim::Concrete(4)], DType::F32);
 
-        let op0 = graph.add_op(OpKind::Silu, vec![t_in], vec![t_mid1], "inner0");
-        let op1 = graph.add_op(OpKind::RmsNorm { feature_dim: 4096, eps: 1e-5 }, vec![t_mid1], vec![t_mid2], "inner1");
-        let op2 = graph.add_op(OpKind::Silu, vec![t_mid2], vec![t_out], "inner2");
+        let op0 = graph.add_op_with_op(Op::Silu, OpKind::Silu, vec![t_in], vec![t_mid1], "inner0");
+        let op1 = graph.add_op_with_op(Op::RmsNorm(NormSpec { feature_dim: 4096, eps: 1e-5, dtype: DType::F32, has_weight: true }), OpKind::RmsNorm { feature_dim: 4096, eps: 1e-5 }, vec![t_mid1], vec![t_mid2], "inner1");
+        let op2 = graph.add_op_with_op(Op::Silu, OpKind::Silu, vec![t_mid2], vec![t_out], "inner2");
 
         let plan = FusionPlan {
             groups: vec![crate::compiler::fusion::FusionGroup {
@@ -1477,21 +1474,20 @@ mod tests {
         let mut graph = CompilerGraph::new();
         let t_root = graph.add_tensor("root", vec![SymDim::Concrete(4)], DType::F32);
         let t_src = graph.add_tensor("src", vec![SymDim::Concrete(4)], DType::F32);
-        let op0 = graph.add_op(OpKind::Silu, vec![t_root], vec![t_src], "root");
+        let op0 = graph.add_op_with_op(Op::Silu, OpKind::Silu, vec![t_root], vec![t_src], "root");
 
         let mut mid_outputs = Vec::new();
         let mut mid_ops = Vec::new();
         for i in 0..4 {
             let t = graph.add_tensor(&format!("mid{}", i), vec![SymDim::Concrete(4)], DType::F32);
-            let op = graph.add_op(OpKind::Silu, vec![t_src], vec![t], &format!("mid{}", i));
+            let op = graph.add_op_with_op(Op::Silu, OpKind::Silu, vec![t_src], vec![t], &format!("mid{}", i));
             mid_outputs.push(t);
             mid_ops.push(op);
         }
 
         // Consumer takes first and last mid outputs
         let t_final = graph.add_tensor("final", vec![SymDim::Concrete(4)], DType::F32);
-        let consumer = graph.add_op(
-            OpKind::Add,
+        let consumer = graph.add_op_with_op(Op::Add, OpKind::Add,
             vec![mid_outputs[0], mid_outputs[3]],
             vec![t_final],
             "consumer",
@@ -1546,12 +1542,12 @@ mod tests {
         let t_e = graph.add_tensor("e", vec![SymDim::Concrete(4)], DType::F32);
         let t_f = graph.add_tensor("f", vec![SymDim::Concrete(4)], DType::F32);
 
-        let op0 = graph.add_op(OpKind::Silu, vec![t_root], vec![t_a], "g0");
-        let op1 = graph.add_op(OpKind::Silu, vec![t_a], vec![t_b], "g1");
-        let op2 = graph.add_op(OpKind::Silu, vec![t_a], vec![t_c], "g2");
-        let op3 = graph.add_op(OpKind::Add, vec![t_b, t_c], vec![t_d], "g3");
-        let op4 = graph.add_op(OpKind::Add, vec![t_b, t_c], vec![t_e], "g4");
-        let op5 = graph.add_op(OpKind::Silu, vec![t_ext], vec![t_f], "g5");
+        let op0 = graph.add_op_with_op(Op::Silu, OpKind::Silu, vec![t_root], vec![t_a], "g0");
+        let op1 = graph.add_op_with_op(Op::Silu, OpKind::Silu, vec![t_a], vec![t_b], "g1");
+        let op2 = graph.add_op_with_op(Op::Silu, OpKind::Silu, vec![t_a], vec![t_c], "g2");
+        let op3 = graph.add_op_with_op(Op::Add, OpKind::Add, vec![t_b, t_c], vec![t_d], "g3");
+        let op4 = graph.add_op_with_op(Op::Add, OpKind::Add, vec![t_b, t_c], vec![t_e], "g4");
+        let op5 = graph.add_op_with_op(Op::Silu, OpKind::Silu, vec![t_ext], vec![t_f], "g5");
 
         let plan = FusionPlan {
             groups: vec![
@@ -1617,8 +1613,8 @@ mod tests {
         let t_mid = graph.add_tensor("mid", vec![SymDim::Concrete(8)], DType::F32);
         let t_out = graph.add_tensor("out", vec![SymDim::Concrete(8)], DType::F32);
 
-        let op0 = graph.add_op(OpKind::Silu, vec![t_in], vec![t_mid], "silu");
-        let op1 = graph.add_op(OpKind::Mul, vec![t_mid, t_w], vec![t_out], "mul_weight");
+        let op0 = graph.add_op_with_op(Op::Silu, OpKind::Silu, vec![t_in], vec![t_mid], "silu");
+        let op1 = graph.add_op_with_op(Op::Mul, OpKind::Mul, vec![t_mid, t_w], vec![t_out], "mul_weight");
 
         let plan = FusionPlan {
             groups: vec![crate::compiler::fusion::FusionGroup {
@@ -1656,7 +1652,7 @@ mod tests {
         let mut graph = CompilerGraph::new();
         let t_root = graph.add_tensor("root", vec![SymDim::Concrete(4)], DType::F32);
         let t_src = graph.add_tensor("src", vec![SymDim::Concrete(4)], DType::F32);
-        let op0 = graph.add_op(OpKind::Silu, vec![t_root], vec![t_src], "producer");
+        let op0 = graph.add_op_with_op(Op::Silu, OpKind::Silu, vec![t_root], vec![t_src], "producer");
 
         let mut groups = vec![make_group(0, op0)];
         let mut op_map = HashMap::new();
@@ -1664,7 +1660,7 @@ mod tests {
 
         for i in 0..8 {
             let t_out = graph.add_tensor(&format!("out{}", i), vec![SymDim::Concrete(4)], DType::F32);
-            let op = graph.add_op(OpKind::Silu, vec![t_src], vec![t_out], &format!("c{}", i));
+            let op = graph.add_op_with_op(Op::Silu, OpKind::Silu, vec![t_src], vec![t_out], &format!("c{}", i));
             groups.push(make_group(i + 1, op));
             op_map.insert(op, i + 1);
         }
@@ -1691,9 +1687,9 @@ mod tests {
         let t_d = graph.add_tensor("d", vec![SymDim::Concrete(4)], DType::F32);
         let t_out = graph.add_tensor("out", vec![SymDim::Concrete(4)], DType::F32);
 
-        let op0 = graph.add_op(OpKind::Silu, vec![t_a], vec![t_c], "left");
-        let op1 = graph.add_op(OpKind::Silu, vec![t_b], vec![t_d], "right");
-        let op2 = graph.add_op(OpKind::Add, vec![t_c, t_d], vec![t_out], "sink");
+        let op0 = graph.add_op_with_op(Op::Silu, OpKind::Silu, vec![t_a], vec![t_c], "left");
+        let op1 = graph.add_op_with_op(Op::Silu, OpKind::Silu, vec![t_b], vec![t_d], "right");
+        let op2 = graph.add_op_with_op(Op::Add, OpKind::Add, vec![t_c, t_d], vec![t_out], "sink");
 
         let plan = FusionPlan {
             groups: vec![make_group(0, op0), make_group(1, op1), make_group(2, op2)],
@@ -1727,14 +1723,13 @@ mod tests {
         for i in 0..3 {
             let t_in = graph.add_tensor(&format!("in{}", i), vec![SymDim::Concrete(4)], DType::F32);
             let t_out = graph.add_tensor(&format!("p{}", i), vec![SymDim::Concrete(4)], DType::F32);
-            let op = graph.add_op(OpKind::Silu, vec![t_in], vec![t_out], &format!("prod{}", i));
+            let op = graph.add_op_with_op(Op::Silu, OpKind::Silu, vec![t_in], vec![t_out], &format!("prod{}", i));
             prod_outputs.push(t_out);
             prod_ops.push(op);
         }
 
         let t_final = graph.add_tensor("final", vec![SymDim::Concrete(4)], DType::F32);
-        let consumer = graph.add_op(
-            OpKind::Mul,
+        let consumer = graph.add_op_with_op(Op::Mul, OpKind::Mul,
             vec![prod_outputs[0], prod_outputs[1], prod_outputs[2]],
             vec![t_final],
             "consumer",
@@ -1764,7 +1759,7 @@ mod tests {
         let mut graph = CompilerGraph::new();
         let t_in = graph.add_tensor("in", vec![SymDim::Concrete(4)], DType::F32);
         let t_out = graph.add_tensor("out", vec![SymDim::Concrete(4)], DType::F32);
-        let op0 = graph.add_op(OpKind::Silu, vec![t_in], vec![t_out], "real");
+        let op0 = graph.add_op_with_op(Op::Silu, OpKind::Silu, vec![t_in], vec![t_out], "real");
 
         let plan = FusionPlan {
             groups: vec![
@@ -1806,8 +1801,8 @@ mod tests {
         let t_mid = graph.add_tensor("result", vec![SymDim::Concrete(4)], DType::F32);
         let t_out = graph.add_tensor("result", vec![SymDim::Concrete(4)], DType::F32);
 
-        let op0 = graph.add_op(OpKind::Silu, vec![t_in], vec![t_mid], "producer");
-        let op1 = graph.add_op(OpKind::Silu, vec![t_mid], vec![t_out], "consumer");
+        let op0 = graph.add_op_with_op(Op::Silu, OpKind::Silu, vec![t_in], vec![t_mid], "producer");
+        let op1 = graph.add_op_with_op(Op::Silu, OpKind::Silu, vec![t_mid], vec![t_out], "consumer");
 
         let plan = FusionPlan {
             groups: vec![make_group(0, op0), make_group(1, op1)],
@@ -1845,12 +1840,12 @@ mod tests {
         let t_e = graph.add_tensor("e", vec![SymDim::Concrete(4)], DType::F32);
         let t_out = graph.add_tensor("out", vec![SymDim::Concrete(4)], DType::F32);
 
-        let op0 = graph.add_op(OpKind::Silu, vec![t_root], vec![t_a], "src");
-        let op1 = graph.add_op(OpKind::Silu, vec![t_a], vec![t_b], "l1a");
-        let op2 = graph.add_op(OpKind::Silu, vec![t_a], vec![t_c], "l1b");
-        let op3 = graph.add_op(OpKind::Silu, vec![t_b], vec![t_d], "l2a");
-        let op4 = graph.add_op(OpKind::Silu, vec![t_c], vec![t_e], "l2b");
-        let op5 = graph.add_op(OpKind::Add, vec![t_d, t_e], vec![t_out], "sink");
+        let op0 = graph.add_op_with_op(Op::Silu, OpKind::Silu, vec![t_root], vec![t_a], "src");
+        let op1 = graph.add_op_with_op(Op::Silu, OpKind::Silu, vec![t_a], vec![t_b], "l1a");
+        let op2 = graph.add_op_with_op(Op::Silu, OpKind::Silu, vec![t_a], vec![t_c], "l1b");
+        let op3 = graph.add_op_with_op(Op::Silu, OpKind::Silu, vec![t_b], vec![t_d], "l2a");
+        let op4 = graph.add_op_with_op(Op::Silu, OpKind::Silu, vec![t_c], vec![t_e], "l2b");
+        let op5 = graph.add_op_with_op(Op::Add, OpKind::Add, vec![t_d, t_e], vec![t_out], "sink");
 
         let plan = FusionPlan {
             groups: vec![
@@ -1887,10 +1882,10 @@ mod tests {
         let t_m3 = graph.add_tensor("m3", vec![SymDim::Concrete(4)], DType::F32);
         let t_out = graph.add_tensor("out", vec![SymDim::Concrete(4)], DType::F32);
 
-        let op0 = graph.add_op(OpKind::Silu, vec![t_in], vec![t_m1], "a");
-        let op1 = graph.add_op(OpKind::RmsNorm { feature_dim: 4096, eps: 1e-6 }, vec![t_m1], vec![t_m2], "b");
-        let op2 = graph.add_op(OpKind::Silu, vec![t_m2], vec![t_m3], "c");
-        let op3 = graph.add_op(OpKind::Silu, vec![t_m3], vec![t_out], "d");
+        let op0 = graph.add_op_with_op(Op::Silu, OpKind::Silu, vec![t_in], vec![t_m1], "a");
+        let op1 = graph.add_op_with_op(Op::RmsNorm(NormSpec { feature_dim: 4096, eps: 1e-6, dtype: DType::F32, has_weight: true }), OpKind::RmsNorm { feature_dim: 4096, eps: 1e-6 }, vec![t_m1], vec![t_m2], "b");
+        let op2 = graph.add_op_with_op(Op::Silu, OpKind::Silu, vec![t_m2], vec![t_m3], "c");
+        let op3 = graph.add_op_with_op(Op::Silu, OpKind::Silu, vec![t_m3], vec![t_out], "d");
 
         let plan = FusionPlan {
             groups: vec![
@@ -1934,16 +1929,16 @@ mod tests {
 
         // Chain A: 2 ops
         let t_a1 = graph.add_tensor("a1", vec![SymDim::Concrete(4)], DType::F32);
-        let op_a0 = graph.add_op(OpKind::Silu, vec![t_a0], vec![t_a1], "a0");
+        let op_a0 = graph.add_op_with_op(Op::Silu, OpKind::Silu, vec![t_a0], vec![t_a1], "a0");
         let t_a2 = graph.add_tensor("a2", vec![SymDim::Concrete(4)], DType::F32);
-        let op_a1 = graph.add_op(OpKind::Silu, vec![t_a1], vec![t_a2], "a1");
+        let op_a1 = graph.add_op_with_op(Op::Silu, OpKind::Silu, vec![t_a1], vec![t_a2], "a1");
 
         // Chain B: 4 ops
         let mut prev_b = t_b0;
         let mut b_ops = Vec::new();
         for i in 0..4 {
             let t = graph.add_tensor(&format!("b{}", i + 1), vec![SymDim::Concrete(4)], DType::F32);
-            let op = graph.add_op(OpKind::Silu, vec![prev_b], vec![t], &format!("b{}", i));
+            let op = graph.add_op_with_op(Op::Silu, OpKind::Silu, vec![prev_b], vec![t], &format!("b{}", i));
             b_ops.push(op);
             prev_b = t;
         }
@@ -1980,7 +1975,7 @@ mod tests {
         for i in 0..5 {
             let t_in = graph.add_tensor(&format!("in{}", i), vec![SymDim::Concrete(4)], DType::F32);
             let t_out = graph.add_tensor(&format!("out{}", i), vec![SymDim::Concrete(4)], DType::F32);
-            let op = graph.add_op(OpKind::Silu, vec![t_in], vec![t_out], &format!("op{}", i));
+            let op = graph.add_op_with_op(Op::Silu, OpKind::Silu, vec![t_in], vec![t_out], &format!("op{}", i));
             groups.push(make_group(i, op));
             op_map.insert(op, i);
         }
@@ -2035,7 +2030,7 @@ mod tests {
         let mut ops = Vec::new();
         for i in 0..20 {
             let t = graph.add_tensor(&format!("t{}", i), vec![SymDim::Concrete(4)], DType::F32);
-            let op = graph.add_op(OpKind::Silu, vec![prev], vec![t], &format!("op{}", i));
+            let op = graph.add_op_with_op(Op::Silu, OpKind::Silu, vec![prev], vec![t], &format!("op{}", i));
             ops.push(op);
             prev = t;
         }
@@ -2069,10 +2064,10 @@ mod tests {
         let t_c = graph.add_tensor("c", vec![SymDim::Concrete(4)], DType::F32);
         let t_out = graph.add_tensor("out", vec![SymDim::Concrete(4)], DType::F32);
 
-        let op0 = graph.add_op(OpKind::Silu, vec![t_root], vec![t_a], "src");
-        let op1 = graph.add_op(OpKind::Silu, vec![t_a], vec![t_b], "left");
-        let op2 = graph.add_op(OpKind::Silu, vec![t_a], vec![t_c], "right");
-        let op3 = graph.add_op(OpKind::Mul, vec![t_a, t_b, t_c], vec![t_out], "merge");
+        let op0 = graph.add_op_with_op(Op::Silu, OpKind::Silu, vec![t_root], vec![t_a], "src");
+        let op1 = graph.add_op_with_op(Op::Silu, OpKind::Silu, vec![t_a], vec![t_b], "left");
+        let op2 = graph.add_op_with_op(Op::Silu, OpKind::Silu, vec![t_a], vec![t_c], "right");
+        let op3 = graph.add_op_with_op(Op::Mul, OpKind::Mul, vec![t_a, t_b, t_c], vec![t_out], "merge");
 
         let plan = FusionPlan {
             groups: vec![make_group(0, op0), make_group(1, op1), make_group(2, op2), make_group(3, op3)],
@@ -2102,27 +2097,27 @@ mod tests {
         let mut graph = CompilerGraph::new();
         let t_root = graph.add_tensor("root", vec![SymDim::Concrete(4)], DType::F32);
         let t_src = graph.add_tensor("src", vec![SymDim::Concrete(4)], DType::F32);
-        let op0 = graph.add_op(OpKind::Silu, vec![t_root], vec![t_src], "src");
+        let op0 = graph.add_op_with_op(Op::Silu, OpKind::Silu, vec![t_root], vec![t_src], "src");
 
         let mut mid_ops = Vec::new();
         let mut mid_outs = Vec::new();
         for i in 0..3 {
             let t = graph.add_tensor(&format!("mid{}", i), vec![SymDim::Concrete(4)], DType::F32);
-            let op = graph.add_op(OpKind::Silu, vec![t_src], vec![t], &format!("par{}", i));
+            let op = graph.add_op_with_op(Op::Silu, OpKind::Silu, vec![t_src], vec![t], &format!("par{}", i));
             mid_ops.push(op);
             mid_outs.push(t);
         }
 
         let t_final = graph.add_tensor("final", vec![SymDim::Concrete(4)], DType::F32);
-        let op_merge = graph.add_op(OpKind::Add, vec![mid_outs[0], mid_outs[1], mid_outs[2]], vec![t_final], "merge");
+        let op_merge = graph.add_op_with_op(Op::Add, OpKind::Add, vec![mid_outs[0], mid_outs[1], mid_outs[2]], vec![t_final], "merge");
 
         let t_ext5 = graph.add_tensor("ext5", vec![SymDim::Concrete(4)], DType::F32);
         let t_out5 = graph.add_tensor("out5", vec![SymDim::Concrete(4)], DType::F32);
-        let op5 = graph.add_op(OpKind::Silu, vec![t_ext5], vec![t_out5], "indep5");
+        let op5 = graph.add_op_with_op(Op::Silu, OpKind::Silu, vec![t_ext5], vec![t_out5], "indep5");
 
         let t_ext6 = graph.add_tensor("ext6", vec![SymDim::Concrete(4)], DType::F32);
         let t_out6 = graph.add_tensor("out6", vec![SymDim::Concrete(4)], DType::F32);
-        let op6 = graph.add_op(OpKind::Silu, vec![t_ext6], vec![t_out6], "indep6");
+        let op6 = graph.add_op_with_op(Op::Silu, OpKind::Silu, vec![t_ext6], vec![t_out6], "indep6");
 
         let plan = FusionPlan {
             groups: vec![
@@ -2166,11 +2161,11 @@ mod tests {
         let t_out1 = graph.add_tensor("out1", vec![SymDim::Concrete(4)], DType::F32);
         let t_out2 = graph.add_tensor("out2", vec![SymDim::Concrete(4)], DType::F32);
 
-        let op0 = graph.add_op(OpKind::Silu, vec![t_in], vec![t_a], "producer");
-        let op1 = graph.add_op(OpKind::Silu, vec![t_a], vec![t_b], "left_out");
-        let op2 = graph.add_op(OpKind::Silu, vec![t_a], vec![t_c], "right_out");
-        let op3 = graph.add_op(OpKind::Silu, vec![t_b], vec![t_out1], "consumer_l");
-        let op4 = graph.add_op(OpKind::Silu, vec![t_c], vec![t_out2], "consumer_r");
+        let op0 = graph.add_op_with_op(Op::Silu, OpKind::Silu, vec![t_in], vec![t_a], "producer");
+        let op1 = graph.add_op_with_op(Op::Silu, OpKind::Silu, vec![t_a], vec![t_b], "left_out");
+        let op2 = graph.add_op_with_op(Op::Silu, OpKind::Silu, vec![t_a], vec![t_c], "right_out");
+        let op3 = graph.add_op_with_op(Op::Silu, OpKind::Silu, vec![t_b], vec![t_out1], "consumer_l");
+        let op4 = graph.add_op_with_op(Op::Silu, OpKind::Silu, vec![t_c], vec![t_out2], "consumer_r");
 
         let plan = FusionPlan {
             groups: vec![make_group(0, op0), make_group(1, op1), make_group(2, op2),
@@ -2209,16 +2204,16 @@ mod tests {
         let t_ext = graph.add_tensor("ext", vec![SymDim::Concrete(4)], DType::F32);
         let t_out = graph.add_tensor("out", vec![SymDim::Concrete(4)], DType::F32);
 
-        let op0 = graph.add_op(OpKind::Silu, vec![t_root], vec![t_a], "r");
-        let op1 = graph.add_op(OpKind::Silu, vec![t_a], vec![t_b], "g1");
-        let op2 = graph.add_op(OpKind::Silu, vec![t_a], vec![t_c], "g2");
-        let op3 = graph.add_op(OpKind::Silu, vec![t_b], vec![t_d], "g3");
-        let op4 = graph.add_op(OpKind::Silu, vec![t_c], vec![t_e], "g4");
-        let op5 = graph.add_op(OpKind::Add, vec![t_d, t_e], vec![t_f], "g5");
-        let op6 = graph.add_op(OpKind::Silu, vec![t_f], vec![t_g], "g6");
-        let op7 = graph.add_op(OpKind::Silu, vec![t_ext], vec![t_out], "g7_indep");
+        let op0 = graph.add_op_with_op(Op::Silu, OpKind::Silu, vec![t_root], vec![t_a], "r");
+        let op1 = graph.add_op_with_op(Op::Silu, OpKind::Silu, vec![t_a], vec![t_b], "g1");
+        let op2 = graph.add_op_with_op(Op::Silu, OpKind::Silu, vec![t_a], vec![t_c], "g2");
+        let op3 = graph.add_op_with_op(Op::Silu, OpKind::Silu, vec![t_b], vec![t_d], "g3");
+        let op4 = graph.add_op_with_op(Op::Silu, OpKind::Silu, vec![t_c], vec![t_e], "g4");
+        let op5 = graph.add_op_with_op(Op::Add, OpKind::Add, vec![t_d, t_e], vec![t_f], "g5");
+        let op6 = graph.add_op_with_op(Op::Silu, OpKind::Silu, vec![t_f], vec![t_g], "g6");
+        let op7 = graph.add_op_with_op(Op::Silu, OpKind::Silu, vec![t_ext], vec![t_out], "g7_indep");
         let t_final = graph.add_tensor("final", vec![SymDim::Concrete(4)], DType::F32);
-        let op8 = graph.add_op(OpKind::Add, vec![t_g, t_out], vec![t_final], "g8");
+        let op8 = graph.add_op_with_op(Op::Add, OpKind::Add, vec![t_g, t_out], vec![t_final], "g8");
 
         let ops = [op0, op1, op2, op3, op4, op5, op6, op7, op8];
         let plan = FusionPlan {
@@ -2248,10 +2243,10 @@ mod tests {
         let o1 = graph.add_tensor("o1", vec![SymDim::Concrete(4)], DType::F32);
         let o2 = graph.add_tensor("o2", vec![SymDim::Concrete(4)], DType::F32);
 
-        let op0 = graph.add_op(OpKind::Silu, vec![t0], vec![o0], "silu");
-        let op1 = graph.add_op(OpKind::RmsNorm { feature_dim: 4096, eps: 1e-5 }, vec![t1], vec![o1], "norm");
-        let op2 = graph.add_op(OpKind::Mul, vec![t2, t3], vec![o2], "mul");
-        let op3 = graph.add_op(OpKind::Add, vec![t4, t0], vec![o0], "add");
+        let op0 = graph.add_op_with_op(Op::Silu, OpKind::Silu, vec![t0], vec![o0], "silu");
+        let op1 = graph.add_op_with_op(Op::RmsNorm(NormSpec { feature_dim: 4096, eps: 1e-5, dtype: DType::F32, has_weight: true }), OpKind::RmsNorm { feature_dim: 4096, eps: 1e-5 }, vec![t1], vec![o1], "norm");
+        let op2 = graph.add_op_with_op(Op::Mul, OpKind::Mul, vec![t2, t3], vec![o2], "mul");
+        let op3 = graph.add_op_with_op(Op::Add, OpKind::Add, vec![t4, t0], vec![o0], "add");
 
         let plan = FusionPlan {
             groups: vec![make_group(0, op0), make_group(1, op1), make_group(2, op2), make_group(3, op3)],
@@ -2282,8 +2277,8 @@ mod tests {
         let t_b = graph.add_tensor("b", vec![SymDim::Concrete(4)], DType::F32);
         let t_out = graph.add_tensor("out", vec![SymDim::Concrete(4)], DType::F32);
 
-        let op_a = graph.add_op(OpKind::Silu, vec![t_ext], vec![t_a], "op_a");
-        let op_b = graph.add_op(OpKind::Silu, vec![t_a], vec![t_b], "op_b");
+        let op_a = graph.add_op_with_op(Op::Silu, OpKind::Silu, vec![t_ext], vec![t_a], "op_a");
+        let op_b = graph.add_op_with_op(Op::Silu, OpKind::Silu, vec![t_a], vec![t_b], "op_b");
         // Manually set t_ext's producer to op_b to create g0→g1→g0 cycle
         // (in real scenarios this would be invalid, but we test robustness)
         // Since we cannot mutate producer after add_op, we instead test with
@@ -2291,13 +2286,13 @@ mod tests {
         // consumes g1's output via separate tensors.
         let t_x = graph.add_tensor("x", vec![SymDim::Concrete(4)], DType::F32);
         let t_y = graph.add_tensor("y", vec![SymDim::Concrete(4)], DType::F32);
-        let op0 = graph.add_op(OpKind::Silu, vec![t_x], vec![t_a], "cycle0");
-        let op1 = graph.add_op(OpKind::Silu, vec![t_a], vec![t_y], "cycle1");
+        let op0 = graph.add_op_with_op(Op::Silu, OpKind::Silu, vec![t_x], vec![t_a], "cycle0");
+        let op1 = graph.add_op_with_op(Op::Silu, OpKind::Silu, vec![t_a], vec![t_y], "cycle1");
         // op0 takes t_x (no producer) so g0 has no dep on g1 — not a cycle.
         // For a real cycle we need op0 to consume op1's output.
         // Since that requires careful construction, verify the independent group
         // g2 still appears correctly when other groups form a simple chain.
-        let op2 = graph.add_op(OpKind::Silu, vec![t_ext], vec![t_out], "indep");
+        let op2 = graph.add_op_with_op(Op::Silu, OpKind::Silu, vec![t_ext], vec![t_out], "indep");
 
         let plan = FusionPlan {
             groups: vec![make_group(0, op0), make_group(1, op1), make_group(2, op2)],
@@ -2328,14 +2323,14 @@ mod tests {
         let mut graph = CompilerGraph::new();
         let t_root = graph.add_tensor("root", vec![SymDim::Concrete(4)], DType::F32);
         let t_src = graph.add_tensor("src", vec![SymDim::Concrete(4)], DType::F32);
-        let op0 = graph.add_op(OpKind::Silu, vec![t_root], vec![t_src], "root");
+        let op0 = graph.add_op_with_op(Op::Silu, OpKind::Silu, vec![t_root], vec![t_src], "root");
 
         // 4 parallel middle groups
         let mut mid_ops = Vec::new();
         let mut mid_outs = Vec::new();
         for i in 0..4 {
             let t = graph.add_tensor(&format!("m{}", i), vec![SymDim::Concrete(4)], DType::F32);
-            let op = graph.add_op(OpKind::Silu, vec![t_src], vec![t], &format!("m{}", i));
+            let op = graph.add_op_with_op(Op::Silu, OpKind::Silu, vec![t_src], vec![t], &format!("m{}", i));
             mid_ops.push(op);
             mid_outs.push(t);
         }
@@ -2343,21 +2338,21 @@ mod tests {
         // 2 merge groups, each consuming 2 mid outputs
         let t_f1 = graph.add_tensor("f1", vec![SymDim::Concrete(4)], DType::F32);
         let t_f2 = graph.add_tensor("f2", vec![SymDim::Concrete(4)], DType::F32);
-        let op_m1 = graph.add_op(OpKind::Add, vec![mid_outs[0], mid_outs[1]], vec![t_f1], "merge1");
-        let op_m2 = graph.add_op(OpKind::Add, vec![mid_outs[2], mid_outs[3]], vec![t_f2], "merge2");
+        let op_m1 = graph.add_op_with_op(Op::Add, OpKind::Add, vec![mid_outs[0], mid_outs[1]], vec![t_f1], "merge1");
+        let op_m2 = graph.add_op_with_op(Op::Add, OpKind::Add, vec![mid_outs[2], mid_outs[3]], vec![t_f2], "merge2");
 
         // 4 independent external groups
         let mut indep_ops = Vec::new();
         for i in 0..4 {
             let t_in = graph.add_tensor(&format!("ext{}", i), vec![SymDim::Concrete(4)], DType::F32);
             let t_o = graph.add_tensor(&format!("eo{}", i), vec![SymDim::Concrete(4)], DType::F32);
-            let op = graph.add_op(OpKind::Silu, vec![t_in], vec![t_o], &format!("ind{}", i));
+            let op = graph.add_op_with_op(Op::Silu, OpKind::Silu, vec![t_in], vec![t_o], &format!("ind{}", i));
             indep_ops.push(op);
         }
 
         // Final sink
         let t_final = graph.add_tensor("final", vec![SymDim::Concrete(4)], DType::F32);
-        let op_sink = graph.add_op(OpKind::Add, vec![t_f1, t_f2], vec![t_final], "sink");
+        let op_sink = graph.add_op_with_op(Op::Add, OpKind::Add, vec![t_f1, t_f2], vec![t_final], "sink");
 
         let mut all_ops = vec![op0];
         all_ops.extend_from_slice(&mid_ops);
@@ -2394,8 +2389,8 @@ mod tests {
         let t_mid = graph.add_tensor("mid", vec![SymDim::Concrete(4)], DType::F32);
         let t_out = graph.add_tensor("out", vec![SymDim::Concrete(4)], DType::F32);
 
-        let op0 = graph.add_op(OpKind::Silu, vec![t_in], vec![t_mid], "first");
-        let op1 = graph.add_op(OpKind::Silu, vec![t_mid], vec![t_out], "second");
+        let op0 = graph.add_op_with_op(Op::Silu, OpKind::Silu, vec![t_in], vec![t_mid], "first");
+        let op1 = graph.add_op_with_op(Op::Silu, OpKind::Silu, vec![t_mid], vec![t_out], "second");
 
         let plan = FusionPlan {
             groups: vec![make_group(0, op0), make_group(1, op1)],
@@ -2432,13 +2427,13 @@ mod tests {
         let t_g = graph.add_tensor("g", vec![SymDim::Concrete(4)], DType::F32);
         let t_final = graph.add_tensor("final", vec![SymDim::Concrete(4)], DType::F32);
 
-        let op0 = graph.add_op(OpKind::Silu, vec![t_root], vec![t_a], "g0");
-        let op1 = graph.add_op(OpKind::Silu, vec![t_a], vec![t_b], "g1");
-        let op2 = graph.add_op(OpKind::Silu, vec![t_a], vec![t_c], "g2");
-        let op3 = graph.add_op(OpKind::Silu, vec![t_b], vec![t_d], "g3");
-        let op4 = graph.add_op(OpKind::Silu, vec![t_b], vec![t_e], "g4");
-        let op5 = graph.add_op(OpKind::Silu, vec![t_c], vec![t_f], "g5");
-        let op6 = graph.add_op(OpKind::Add, vec![t_d, t_f], vec![t_final], "g6");
+        let op0 = graph.add_op_with_op(Op::Silu, OpKind::Silu, vec![t_root], vec![t_a], "g0");
+        let op1 = graph.add_op_with_op(Op::Silu, OpKind::Silu, vec![t_a], vec![t_b], "g1");
+        let op2 = graph.add_op_with_op(Op::Silu, OpKind::Silu, vec![t_a], vec![t_c], "g2");
+        let op3 = graph.add_op_with_op(Op::Silu, OpKind::Silu, vec![t_b], vec![t_d], "g3");
+        let op4 = graph.add_op_with_op(Op::Silu, OpKind::Silu, vec![t_b], vec![t_e], "g4");
+        let op5 = graph.add_op_with_op(Op::Silu, OpKind::Silu, vec![t_c], vec![t_f], "g5");
+        let op6 = graph.add_op_with_op(Op::Add, OpKind::Add, vec![t_d, t_f], vec![t_final], "g6");
 
         let plan = FusionPlan {
             groups: vec![
@@ -2501,10 +2496,10 @@ mod tests {
         let t_c = graph.add_tensor("c", vec![SymDim::Concrete(4)], DType::F32);
         let t_d = graph.add_tensor("d", vec![SymDim::Concrete(4)], DType::F32);
 
-        let op0 = graph.add_op(OpKind::Silu, vec![t_in], vec![t_a], "producer");
-        let op1 = graph.add_op(OpKind::Silu, vec![t_a], vec![t_b], "mid");
-        let op2 = graph.add_op(OpKind::Silu, vec![t_b], vec![t_c], "deep");
-        let op3 = graph.add_op(OpKind::Silu, vec![t_a], vec![t_d], "shallow");
+        let op0 = graph.add_op_with_op(Op::Silu, OpKind::Silu, vec![t_in], vec![t_a], "producer");
+        let op1 = graph.add_op_with_op(Op::Silu, OpKind::Silu, vec![t_a], vec![t_b], "mid");
+        let op2 = graph.add_op_with_op(Op::Silu, OpKind::Silu, vec![t_b], vec![t_c], "deep");
+        let op3 = graph.add_op_with_op(Op::Silu, OpKind::Silu, vec![t_a], vec![t_d], "shallow");
 
         let plan = FusionPlan {
             groups: vec![
@@ -2549,9 +2544,9 @@ mod tests {
         let t_b = graph.add_tensor("b", vec![SymDim::Concrete(4)], DType::F32);
         let t_out = graph.add_tensor("out", vec![SymDim::Concrete(4)], DType::F32);
 
-        let op0 = graph.add_op(OpKind::Silu, vec![t_ext], vec![t_a], "op0");
-        let op1 = graph.add_op(OpKind::Silu, vec![t_a], vec![t_b], "op1");
-        let op2 = graph.add_op(OpKind::Silu, vec![t_ext], vec![t_out], "indep");
+        let op0 = graph.add_op_with_op(Op::Silu, OpKind::Silu, vec![t_ext], vec![t_a], "op0");
+        let op1 = graph.add_op_with_op(Op::Silu, OpKind::Silu, vec![t_a], vec![t_b], "op1");
+        let op2 = graph.add_op_with_op(Op::Silu, OpKind::Silu, vec![t_ext], vec![t_out], "indep");
 
         // g0 depends on g1 (op0 needs t_b produced by op1 — but op0 actually takes t_ext).
         // For a true cycle, we'd need op0 to take t_b and op1 to take t_a where
@@ -2587,11 +2582,11 @@ mod tests {
         let t_c = graph.add_tensor("c", vec![SymDim::Concrete(4)], DType::F32);
         let t_out = graph.add_tensor("out", vec![SymDim::Concrete(4)], DType::F32);
 
-        let op0 = graph.add_op(OpKind::Silu, vec![t_in], vec![t_a], "g0");
-        let op1 = graph.add_op(OpKind::Silu, vec![t_a], vec![t_b], "g1");
-        let op2 = graph.add_op(OpKind::Silu, vec![t_b], vec![t_c], "g2");
+        let op0 = graph.add_op_with_op(Op::Silu, OpKind::Silu, vec![t_in], vec![t_a], "g0");
+        let op1 = graph.add_op_with_op(Op::Silu, OpKind::Silu, vec![t_a], vec![t_b], "g1");
+        let op2 = graph.add_op_with_op(Op::Silu, OpKind::Silu, vec![t_b], vec![t_c], "g2");
         // g3 consumes both t_c (from g2) and t_a (from g0) — redundant path to g0
-        let op3 = graph.add_op(OpKind::Mul, vec![t_c, t_a], vec![t_out], "g3");
+        let op3 = graph.add_op_with_op(Op::Mul, OpKind::Mul, vec![t_c, t_a], vec![t_out], "g3");
 
         let plan = FusionPlan {
             groups: vec![
@@ -2629,11 +2624,11 @@ mod tests {
         let t_d = graph.add_tensor("d", vec![SymDim::Concrete(4)], DType::F32);
         let t_out = graph.add_tensor("out", vec![SymDim::Concrete(4)], DType::F32);
 
-        let op0 = graph.add_op(OpKind::Silu, vec![t_root], vec![t_a], "g0");
-        let op1 = graph.add_op(OpKind::Silu, vec![t_a], vec![t_b], "g1");
-        let op2 = graph.add_op(OpKind::Silu, vec![t_a], vec![t_c], "g2");
-        let op3 = graph.add_op(OpKind::Add, vec![t_b, t_c], vec![t_out], "g3");
-        let op4 = graph.add_op(OpKind::Silu, vec![t_a], vec![t_d], "g4");
+        let op0 = graph.add_op_with_op(Op::Silu, OpKind::Silu, vec![t_root], vec![t_a], "g0");
+        let op1 = graph.add_op_with_op(Op::Silu, OpKind::Silu, vec![t_a], vec![t_b], "g1");
+        let op2 = graph.add_op_with_op(Op::Silu, OpKind::Silu, vec![t_a], vec![t_c], "g2");
+        let op3 = graph.add_op_with_op(Op::Add, OpKind::Add, vec![t_b, t_c], vec![t_out], "g3");
+        let op4 = graph.add_op_with_op(Op::Silu, OpKind::Silu, vec![t_a], vec![t_d], "g4");
 
         let plan = FusionPlan {
             groups: vec![
@@ -2670,7 +2665,7 @@ mod tests {
         let t_w1 = graph.add_tensor("w1", vec![SymDim::Concrete(4)], DType::F32);
         let t_out = graph.add_tensor("out", vec![SymDim::Concrete(4)], DType::F32);
 
-        let op0 = graph.add_op(OpKind::Mul, vec![t_w0, t_w1], vec![t_out], "weight_mul");
+        let op0 = graph.add_op_with_op(Op::Mul, OpKind::Mul, vec![t_w0, t_w1], vec![t_out], "weight_mul");
 
         let plan = FusionPlan {
             groups: vec![make_group(0, op0)],
@@ -2699,7 +2694,7 @@ mod tests {
         let mut ops = Vec::new();
         for i in 0..4 {
             let t = graph.add_tensor(&format!("t{}", i), vec![SymDim::Concrete(4)], DType::F32);
-            let op = graph.add_op(OpKind::Silu, vec![prev], vec![t], &format!("op{}", i));
+            let op = graph.add_op_with_op(Op::Silu, OpKind::Silu, vec![prev], vec![t], &format!("op{}", i));
             ops.push(op);
             prev = t;
         }
@@ -2736,12 +2731,12 @@ mod tests {
         let t_b2 = graph.add_tensor("b2", vec![SymDim::Concrete(4)], DType::F32);
         let t_b3 = graph.add_tensor("b3", vec![SymDim::Concrete(4)], DType::F32);
 
-        let op0 = graph.add_op(OpKind::Silu, vec![t_a0], vec![t_a1], "a_root");
-        let op1 = graph.add_op(OpKind::Silu, vec![t_a1], vec![t_a2], "a_mid");
-        let op2 = graph.add_op(OpKind::Silu, vec![t_a2], vec![t_a3], "a_leaf");
-        let op3 = graph.add_op(OpKind::Silu, vec![t_b0], vec![t_b1], "b_root");
-        let op4 = graph.add_op(OpKind::Silu, vec![t_b1], vec![t_b2], "b_mid");
-        let op5 = graph.add_op(OpKind::Silu, vec![t_b2], vec![t_b3], "b_leaf");
+        let op0 = graph.add_op_with_op(Op::Silu, OpKind::Silu, vec![t_a0], vec![t_a1], "a_root");
+        let op1 = graph.add_op_with_op(Op::Silu, OpKind::Silu, vec![t_a1], vec![t_a2], "a_mid");
+        let op2 = graph.add_op_with_op(Op::Silu, OpKind::Silu, vec![t_a2], vec![t_a3], "a_leaf");
+        let op3 = graph.add_op_with_op(Op::Silu, OpKind::Silu, vec![t_b0], vec![t_b1], "b_root");
+        let op4 = graph.add_op_with_op(Op::Silu, OpKind::Silu, vec![t_b1], vec![t_b2], "b_mid");
+        let op5 = graph.add_op_with_op(Op::Silu, OpKind::Silu, vec![t_b2], vec![t_b3], "b_leaf");
 
         let plan = FusionPlan {
             groups: vec![
@@ -2786,10 +2781,10 @@ mod tests {
         let t_indep = graph.add_tensor("indep", vec![SymDim::Concrete(4)], DType::F32);
         let t_indep_out = graph.add_tensor("indep_out", vec![SymDim::Concrete(4)], DType::F32);
 
-        let op0 = graph.add_op(OpKind::Silu, vec![t_ext], vec![t_a], "producer");
-        let op1 = graph.add_op(OpKind::Mul, vec![t_a, t_w], vec![t_b], "mixed_consumer");
-        let op2 = graph.add_op(OpKind::Silu, vec![t_b], vec![t_out], "downstream");
-        let op3 = graph.add_op(OpKind::Silu, vec![t_indep], vec![t_indep_out], "indep");
+        let op0 = graph.add_op_with_op(Op::Silu, OpKind::Silu, vec![t_ext], vec![t_a], "producer");
+        let op1 = graph.add_op_with_op(Op::Mul, OpKind::Mul, vec![t_a, t_w], vec![t_b], "mixed_consumer");
+        let op2 = graph.add_op_with_op(Op::Silu, OpKind::Silu, vec![t_b], vec![t_out], "downstream");
+        let op3 = graph.add_op_with_op(Op::Silu, OpKind::Silu, vec![t_indep], vec![t_indep_out], "indep");
 
         let plan = FusionPlan {
             groups: vec![
@@ -2826,7 +2821,7 @@ mod tests {
         for i in 0..6 {
             let t_in = graph.add_tensor(&format!("in{}", i), vec![SymDim::Concrete(16)], DType::F32);
             let t_out = graph.add_tensor(&format!("out{}", i), vec![SymDim::Concrete(16)], DType::F32);
-            let op = graph.add_op(OpKind::Silu, vec![t_in], vec![t_out], &format!("op{}", i));
+            let op = graph.add_op_with_op(Op::Silu, OpKind::Silu, vec![t_in], vec![t_out], &format!("op{}", i));
             groups.push(make_group(i, op));
             op_map.insert(op, i);
         }
@@ -2861,13 +2856,13 @@ mod tests {
         let t_f = graph.add_tensor("f", vec![SymDim::Concrete(4)], DType::F32);
         let t_g = graph.add_tensor("g", vec![SymDim::Concrete(4)], DType::F32);
 
-        let op0 = graph.add_op(OpKind::Silu, vec![t_root], vec![t_a], "root");
-        let op1 = graph.add_op(OpKind::Silu, vec![t_a], vec![t_b], "left");
-        let op2 = graph.add_op(OpKind::Silu, vec![t_a], vec![t_c], "right");
-        let op3 = graph.add_op(OpKind::Silu, vec![t_b], vec![t_d], "ll");
-        let op4 = graph.add_op(OpKind::Silu, vec![t_b], vec![t_e], "lr");
-        let op5 = graph.add_op(OpKind::Silu, vec![t_c], vec![t_f], "rl");
-        let op6 = graph.add_op(OpKind::Add, vec![t_d, t_e, t_f], vec![t_g], "rr");
+        let op0 = graph.add_op_with_op(Op::Silu, OpKind::Silu, vec![t_root], vec![t_a], "root");
+        let op1 = graph.add_op_with_op(Op::Silu, OpKind::Silu, vec![t_a], vec![t_b], "left");
+        let op2 = graph.add_op_with_op(Op::Silu, OpKind::Silu, vec![t_a], vec![t_c], "right");
+        let op3 = graph.add_op_with_op(Op::Silu, OpKind::Silu, vec![t_b], vec![t_d], "ll");
+        let op4 = graph.add_op_with_op(Op::Silu, OpKind::Silu, vec![t_b], vec![t_e], "lr");
+        let op5 = graph.add_op_with_op(Op::Silu, OpKind::Silu, vec![t_c], vec![t_f], "rl");
+        let op6 = graph.add_op_with_op(Op::Add, OpKind::Add, vec![t_d, t_e, t_f], vec![t_g], "rr");
 
         let ops = [op0, op1, op2, op3, op4, op5, op6];
         let plan = FusionPlan {
@@ -2902,9 +2897,9 @@ mod tests {
         let t_b = graph.add_tensor("b", vec![SymDim::Concrete(4)], DType::F32);
         let t_out = graph.add_tensor("out", vec![SymDim::Concrete(4)], DType::F32);
 
-        let op0a = graph.add_op(OpKind::Silu, vec![t_in], vec![t_a], "prod_a");
-        let op0b = graph.add_op(OpKind::Mul, vec![t_in], vec![t_b], "prod_b");
-        let op1 = graph.add_op(OpKind::Add, vec![t_a, t_b], vec![t_out], "consumer");
+        let op0a = graph.add_op_with_op(Op::Silu, OpKind::Silu, vec![t_in], vec![t_a], "prod_a");
+        let op0b = graph.add_op_with_op(Op::Mul, OpKind::Mul, vec![t_in], vec![t_b], "prod_b");
+        let op1 = graph.add_op_with_op(Op::Add, OpKind::Add, vec![t_a, t_b], vec![t_out], "consumer");
 
         let plan = FusionPlan {
             groups: vec![
@@ -2954,11 +2949,11 @@ mod tests {
         let t_d = graph.add_tensor("d", vec![SymDim::Concrete(4)], DType::F32);
         let t_out = graph.add_tensor("out", vec![SymDim::Concrete(4)], DType::F32);
 
-        let op0 = graph.add_op(OpKind::Silu, vec![t_root], vec![t_a], "g0");
-        let op1 = graph.add_op(OpKind::Silu, vec![t_a], vec![t_b], "g1");
-        let op2 = graph.add_op(OpKind::Silu, vec![t_b], vec![t_c], "g2");
-        let op3 = graph.add_op(OpKind::Silu, vec![t_a], vec![t_d], "g3_skip");
-        let op4 = graph.add_op(OpKind::Add, vec![t_c, t_d], vec![t_out], "g4");
+        let op0 = graph.add_op_with_op(Op::Silu, OpKind::Silu, vec![t_root], vec![t_a], "g0");
+        let op1 = graph.add_op_with_op(Op::Silu, OpKind::Silu, vec![t_a], vec![t_b], "g1");
+        let op2 = graph.add_op_with_op(Op::Silu, OpKind::Silu, vec![t_b], vec![t_c], "g2");
+        let op3 = graph.add_op_with_op(Op::Silu, OpKind::Silu, vec![t_a], vec![t_d], "g3_skip");
+        let op4 = graph.add_op_with_op(Op::Add, OpKind::Add, vec![t_c, t_d], vec![t_out], "g4");
 
         let plan = FusionPlan {
             groups: vec![
@@ -3007,14 +3002,14 @@ mod tests {
         let t_g = graph.add_tensor("g", vec![SymDim::Concrete(4)], DType::F32);
         let t_h = graph.add_tensor("h", vec![SymDim::Concrete(4)], DType::F32);
 
-        let op0 = graph.add_op(OpKind::Silu, vec![t_r], vec![t_a], "g0");
-        let op1 = graph.add_op(OpKind::Silu, vec![t_a], vec![t_b], "g1");
-        let op2 = graph.add_op(OpKind::Silu, vec![t_a], vec![t_c], "g2");
-        let op3 = graph.add_op(OpKind::Add, vec![t_b, t_c], vec![t_d], "g3");
-        let op4 = graph.add_op(OpKind::Silu, vec![t_d], vec![t_e], "g4");
-        let op5 = graph.add_op(OpKind::Silu, vec![t_d], vec![t_f], "g5");
-        let op6 = graph.add_op(OpKind::Add, vec![t_e, t_f], vec![t_g], "g6");
-        let op7 = graph.add_op(OpKind::Silu, vec![t_g], vec![t_h], "g7");
+        let op0 = graph.add_op_with_op(Op::Silu, OpKind::Silu, vec![t_r], vec![t_a], "g0");
+        let op1 = graph.add_op_with_op(Op::Silu, OpKind::Silu, vec![t_a], vec![t_b], "g1");
+        let op2 = graph.add_op_with_op(Op::Silu, OpKind::Silu, vec![t_a], vec![t_c], "g2");
+        let op3 = graph.add_op_with_op(Op::Add, OpKind::Add, vec![t_b, t_c], vec![t_d], "g3");
+        let op4 = graph.add_op_with_op(Op::Silu, OpKind::Silu, vec![t_d], vec![t_e], "g4");
+        let op5 = graph.add_op_with_op(Op::Silu, OpKind::Silu, vec![t_d], vec![t_f], "g5");
+        let op6 = graph.add_op_with_op(Op::Add, OpKind::Add, vec![t_e, t_f], vec![t_g], "g6");
+        let op7 = graph.add_op_with_op(Op::Silu, OpKind::Silu, vec![t_g], vec![t_h], "g7");
 
         let ops = [op0, op1, op2, op3, op4, op5, op6, op7];
         let plan = FusionPlan {
@@ -3061,9 +3056,9 @@ mod tests {
         let t_b = graph.add_tensor("b", vec![SymDim::Concrete(4)], DType::F32);
         let t_out = graph.add_tensor("out", vec![SymDim::Concrete(4)], DType::F32);
 
-        let op0 = graph.add_op(OpKind::Silu, vec![t_x], vec![t_a], "prod_a");
-        let op1 = graph.add_op(OpKind::Silu, vec![t_y], vec![t_b], "prod_b");
-        let op2 = graph.add_op(OpKind::Mul, vec![t_a, t_b, t_w], vec![t_out], "consumer");
+        let op0 = graph.add_op_with_op(Op::Silu, OpKind::Silu, vec![t_x], vec![t_a], "prod_a");
+        let op1 = graph.add_op_with_op(Op::Silu, OpKind::Silu, vec![t_y], vec![t_b], "prod_b");
+        let op2 = graph.add_op_with_op(Op::Mul, OpKind::Mul, vec![t_a, t_b, t_w], vec![t_out], "consumer");
 
         let plan = FusionPlan {
             groups: vec![make_group(0, op0), make_group(1, op1), make_group(2, op2)],
@@ -3095,7 +3090,7 @@ mod tests {
         let t_c = graph.add_tensor("c", vec![SymDim::Concrete(4)], DType::F32);
         let t_out = graph.add_tensor("out", vec![SymDim::Concrete(4)], DType::F32);
 
-        let op0 = graph.add_op(OpKind::Mul, vec![t_a, t_b, t_c], vec![t_out], "multi_input");
+        let op0 = graph.add_op_with_op(Op::Mul, OpKind::Mul, vec![t_a, t_b, t_c], vec![t_out], "multi_input");
 
         let plan = FusionPlan {
             groups: vec![make_group(0, op0)],
@@ -3126,10 +3121,10 @@ mod tests {
         let t_ext = graph.add_tensor("ext", vec![SymDim::Concrete(4)], DType::F32);
         let t_indep = graph.add_tensor("indep_out", vec![SymDim::Concrete(4)], DType::F32);
 
-        let op0a = graph.add_op(OpKind::Silu, vec![t_in], vec![t_mid], "fused_a");
-        let op0b = graph.add_op(OpKind::RmsNorm { feature_dim: 4096, eps: 1e-5 }, vec![t_mid], vec![t_a], "fused_b");
-        let op1 = graph.add_op(OpKind::Silu, vec![t_a], vec![t_out], "downstream");
-        let op2 = graph.add_op(OpKind::Silu, vec![t_ext], vec![t_indep], "independent");
+        let op0a = graph.add_op_with_op(Op::Silu, OpKind::Silu, vec![t_in], vec![t_mid], "fused_a");
+        let op0b = graph.add_op_with_op(Op::RmsNorm(NormSpec { feature_dim: 4096, eps: 1e-5, dtype: DType::F32, has_weight: true }), OpKind::RmsNorm { feature_dim: 4096, eps: 1e-5 }, vec![t_mid], vec![t_a], "fused_b");
+        let op1 = graph.add_op_with_op(Op::Silu, OpKind::Silu, vec![t_a], vec![t_out], "downstream");
+        let op2 = graph.add_op_with_op(Op::Silu, OpKind::Silu, vec![t_ext], vec![t_indep], "independent");
 
         let plan = FusionPlan {
             groups: vec![
@@ -3175,20 +3170,19 @@ mod tests {
         let mut graph = CompilerGraph::new();
         let t_root = graph.add_tensor("root", vec![SymDim::Concrete(4)], DType::F32);
         let t_src = graph.add_tensor("src", vec![SymDim::Concrete(4)], DType::F32);
-        let op0 = graph.add_op(OpKind::Silu, vec![t_root], vec![t_src], "root");
+        let op0 = graph.add_op_with_op(Op::Silu, OpKind::Silu, vec![t_root], vec![t_src], "root");
 
         let mut mid_outs = Vec::new();
         let mut mid_ops = Vec::new();
         for i in 0..5 {
             let t = graph.add_tensor(&format!("c{}", i), vec![SymDim::Concrete(4)], DType::F32);
-            let op = graph.add_op(OpKind::Silu, vec![t_src], vec![t], &format!("c{}", i));
+            let op = graph.add_op_with_op(Op::Silu, OpKind::Silu, vec![t_src], vec![t], &format!("c{}", i));
             mid_outs.push(t);
             mid_ops.push(op);
         }
 
         let t_final = graph.add_tensor("final", vec![SymDim::Concrete(4)], DType::F32);
-        let op_consumer = graph.add_op(
-            OpKind::Add,
+        let op_consumer = graph.add_op_with_op(Op::Add, OpKind::Add,
             vec![mid_outs[0], mid_outs[2]],
             vec![t_final],
             "partial_consumer",
@@ -3196,7 +3190,7 @@ mod tests {
 
         let t_ext = graph.add_tensor("ext", vec![SymDim::Concrete(4)], DType::F32);
         let t_indep = graph.add_tensor("indep", vec![SymDim::Concrete(4)], DType::F32);
-        let op_indep = graph.add_op(OpKind::Silu, vec![t_ext], vec![t_indep], "indep");
+        let op_indep = graph.add_op_with_op(Op::Silu, OpKind::Silu, vec![t_ext], vec![t_indep], "indep");
 
         let mut groups = vec![make_group(0, op0)];
         let mut op_map = HashMap::new();
@@ -3250,15 +3244,15 @@ mod tests {
         let t_g = graph.add_tensor("g", vec![SymDim::Concrete(4)], DType::F32);
         let t_h = graph.add_tensor("h", vec![SymDim::Concrete(4)], DType::F32);
 
-        let op0 = graph.add_op(OpKind::Silu, vec![t_root], vec![t_a], "root");
+        let op0 = graph.add_op_with_op(Op::Silu, OpKind::Silu, vec![t_root], vec![t_a], "root");
         // Diamond A
-        let op1 = graph.add_op(OpKind::Silu, vec![t_a], vec![t_b], "a_left");
-        let op2 = graph.add_op(OpKind::Silu, vec![t_a], vec![t_c], "a_right");
-        let op3 = graph.add_op(OpKind::Add, vec![t_b, t_c], vec![t_d], "a_merge");
+        let op1 = graph.add_op_with_op(Op::Silu, OpKind::Silu, vec![t_a], vec![t_b], "a_left");
+        let op2 = graph.add_op_with_op(Op::Silu, OpKind::Silu, vec![t_a], vec![t_c], "a_right");
+        let op3 = graph.add_op_with_op(Op::Add, OpKind::Add, vec![t_b, t_c], vec![t_d], "a_merge");
         // Diamond B
-        let op4 = graph.add_op(OpKind::Silu, vec![t_a], vec![t_e], "b_left");
-        let op5 = graph.add_op(OpKind::Silu, vec![t_a], vec![t_f], "b_right");
-        let op6 = graph.add_op(OpKind::Add, vec![t_e, t_f], vec![t_g], "b_merge");
+        let op4 = graph.add_op_with_op(Op::Silu, OpKind::Silu, vec![t_a], vec![t_e], "b_left");
+        let op5 = graph.add_op_with_op(Op::Silu, OpKind::Silu, vec![t_a], vec![t_f], "b_right");
+        let op6 = graph.add_op_with_op(Op::Add, OpKind::Add, vec![t_e, t_f], vec![t_g], "b_merge");
 
         let ops = [op0, op1, op2, op3, op4, op5, op6];
         let plan = FusionPlan {
@@ -3297,11 +3291,11 @@ mod tests {
         let t_ext = graph.add_tensor("ext", vec![SymDim::Concrete(4)], DType::F32);
         let t_indep = graph.add_tensor("indep_out", vec![SymDim::Concrete(4)], DType::F32);
 
-        let op0a = graph.add_op(OpKind::Silu, vec![t_in], vec![t_mid0], "g0a");
-        let op0b = graph.add_op(OpKind::RmsNorm { feature_dim: 4096, eps: 1e-5 }, vec![t_mid0], vec![t_a], "g0b");
-        let op1a = graph.add_op(OpKind::Silu, vec![t_a], vec![t_mid1], "g1a");
-        let op1b = graph.add_op(OpKind::Mul, vec![t_mid1, t_w], vec![t_b], "g1b");
-        let op2 = graph.add_op(OpKind::Silu, vec![t_ext], vec![t_indep], "indep");
+        let op0a = graph.add_op_with_op(Op::Silu, OpKind::Silu, vec![t_in], vec![t_mid0], "g0a");
+        let op0b = graph.add_op_with_op(Op::RmsNorm(NormSpec { feature_dim: 4096, eps: 1e-5, dtype: DType::F32, has_weight: true }), OpKind::RmsNorm { feature_dim: 4096, eps: 1e-5 }, vec![t_mid0], vec![t_a], "g0b");
+        let op1a = graph.add_op_with_op(Op::Silu, OpKind::Silu, vec![t_a], vec![t_mid1], "g1a");
+        let op1b = graph.add_op_with_op(Op::Mul, OpKind::Mul, vec![t_mid1, t_w], vec![t_b], "g1b");
+        let op2 = graph.add_op_with_op(Op::Silu, OpKind::Silu, vec![t_ext], vec![t_indep], "indep");
 
         let plan = FusionPlan {
             groups: vec![

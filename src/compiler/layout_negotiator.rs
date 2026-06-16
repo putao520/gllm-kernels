@@ -907,14 +907,13 @@ mod tests {
     #[test]
     fn test_model_aware_mha_overrides_headsplit() {
         // Arrange
-        use crate::compiler::graph::{CompilerGraph, OpKind, KvSource, LayerCondition, SymDim};
+        use crate::compiler::graph::{CompilerGraph, OpKind, KvSource, LayerCondition, SymDim, Op, GemmSpec, NormSpec, QuantGemmSpec, RopeSpec, AttentionSpec, AttentionGeometry, AttentionMask, SinksSpec, CachedGqaSpec, MlaSpec, DualRopeSpec};
         use crate::types::DType;
 
         let mut graph = CompilerGraph::new();
         let tin = graph.add_tensor_concrete("q", &[1, 4096], DType::F32);
         let tout = graph.add_tensor_concrete("out", &[1, 4096], DType::F32);
-        let _op_id = graph.add_op(
-            OpKind::MultiHeadAttention {
+        let _op_id = graph.add_op_with_op(Op::MultiHeadAttention(AttentionSpec { geometry: AttentionGeometry { num_q_heads: 32, num_kv_heads: 32, head_dim: 128 }, mask: if true { AttentionMask::Causal } else { AttentionMask::Full }, kv_source: KvSource::FromTensor, sinks: if false { SinksSpec::Learnable } else { SinksSpec::None }, seq_len: SymDim::Concrete(1), dtype: DType::F32 }), OpKind::MultiHeadAttention {
                 seq_len: SymDim::Concrete(1),
                 num_heads: 32,
                 num_kv_heads: 32,
@@ -946,15 +945,14 @@ mod tests {
     #[test]
     fn test_model_aware_non_qkv_gemm_unchanged() {
         // Arrange
-        use crate::compiler::graph::{CompilerGraph, OpKind, KvSource, LayerCondition, SymDim};
+        use crate::compiler::graph::{CompilerGraph, OpKind, KvSource, LayerCondition, SymDim, Op, GemmSpec, NormSpec, QuantGemmSpec, RopeSpec, AttentionSpec, AttentionGeometry, AttentionMask, SinksSpec, CachedGqaSpec, MlaSpec, DualRopeSpec};
         use crate::types::DType;
 
         let mut graph = CompilerGraph::new();
         let a = graph.add_tensor_concrete("a", &[1, 64], DType::F32);
         let b = graph.add_tensor_concrete("b", &[64, 128], DType::F32);
         let c = graph.add_tensor_concrete("c", &[1, 128], DType::F32);
-        let _op_id = graph.add_op(
-            OpKind::Gemm {
+        let _op_id = graph.add_op_with_op(Op::Gemm(GemmSpec { m: SymDim::Concrete(1), n: 128, k: 64, dtype: DType::F32, trans_b: false, has_bias: false }), OpKind::Gemm {
                 m: SymDim::Concrete(1),
                 n: 128,
                 k: 64,
@@ -985,15 +983,14 @@ mod tests {
     #[test]
     fn test_model_aware_gemm_panel_packed_weight_override() {
         // Arrange
-        use crate::compiler::graph::{CompilerGraph, OpKind, KvSource, LayerCondition, SymDim};
+        use crate::compiler::graph::{CompilerGraph, OpKind, KvSource, LayerCondition, SymDim, Op, GemmSpec, NormSpec, QuantGemmSpec, RopeSpec, AttentionSpec, AttentionGeometry, AttentionMask, SinksSpec, CachedGqaSpec, MlaSpec, DualRopeSpec};
         use crate::types::DType;
 
         let mut graph = CompilerGraph::new();
         let a = graph.add_tensor_concrete("a", &[1, 256], DType::F32);
         let b = graph.add_tensor_concrete("b", &[256, 512], DType::F32);
         let c = graph.add_tensor_concrete("c", &[1, 512], DType::F32);
-        let _op_id = graph.add_op(
-            OpKind::Gemm {
+        let _op_id = graph.add_op_with_op(Op::Gemm(GemmSpec { m: SymDim::Concrete(1), n: 512, k: 256, dtype: DType::F32, trans_b: false, has_bias: false }), OpKind::Gemm {
                 m: SymDim::Concrete(1),
                 n: 512,
                 k: 256,
@@ -1183,14 +1180,13 @@ mod tests {
     #[test]
     fn test_model_aware_mha_any_promoted_to_headsplit() {
         // Arrange
-        use crate::compiler::graph::{CompilerGraph, OpKind, KvSource, LayerCondition, SymDim};
+        use crate::compiler::graph::{CompilerGraph, OpKind, KvSource, LayerCondition, SymDim, Op, GemmSpec, NormSpec, QuantGemmSpec, RopeSpec, AttentionSpec, AttentionGeometry, AttentionMask, SinksSpec, CachedGqaSpec, MlaSpec, DualRopeSpec};
         use crate::types::DType;
 
         let mut graph = CompilerGraph::new();
         let tin = graph.add_tensor_concrete("q", &[1, 2048], DType::F32);
         let tout = graph.add_tensor_concrete("out", &[1, 2048], DType::F32);
-        let _op_id = graph.add_op(
-            OpKind::MultiHeadAttention {
+        let _op_id = graph.add_op_with_op(Op::MultiHeadAttention(AttentionSpec { geometry: AttentionGeometry { num_q_heads: 8, num_kv_heads: 8, head_dim: 256 }, mask: if false { AttentionMask::Causal } else { AttentionMask::Full }, kv_source: KvSource::FromTensor, sinks: if false { SinksSpec::Learnable } else { SinksSpec::None }, seq_len: SymDim::Concrete(1), dtype: DType::F32 }), OpKind::MultiHeadAttention {
                 seq_len: SymDim::Concrete(1),
                 num_heads: 8,
                 num_kv_heads: 8,
@@ -1221,7 +1217,7 @@ mod tests {
     #[test]
     fn test_is_qkv_op_three_sibling_gemms() {
         // Arrange
-        use crate::compiler::graph::{CompilerGraph, OpKind, KvSource, LayerCondition, SymDim};
+        use crate::compiler::graph::{CompilerGraph, OpKind, KvSource, LayerCondition, SymDim, Op, GemmSpec, NormSpec, QuantGemmSpec, RopeSpec, AttentionSpec, AttentionGeometry, AttentionMask, SinksSpec, CachedGqaSpec, MlaSpec, DualRopeSpec};
         use crate::types::DType;
 
         let mut graph = CompilerGraph::new();
@@ -1233,9 +1229,9 @@ mod tests {
         let ok_ = graph.add_tensor_concrete("ok", &[1, 512], DType::F32);
         let ov = graph.add_tensor_concrete("ov", &[1, 512], DType::F32);
 
-        graph.add_op(OpKind::Gemm { m: SymDim::Concrete(1), n: 512, k: 512, dtype: DType::F32, trans_b: false }, vec![input, wq], vec![oq], "q_proj");
-        graph.add_op(OpKind::Gemm { m: SymDim::Concrete(1), n: 512, k: 512, dtype: DType::F32, trans_b: false }, vec![input, wk], vec![ok_], "k_proj");
-        let v_op = graph.add_op(OpKind::Gemm { m: SymDim::Concrete(1), n: 512, k: 512, dtype: DType::F32, trans_b: false }, vec![input, wv], vec![ov], "v_proj");
+        graph.add_op_with_op(Op::Gemm(GemmSpec { m: SymDim::Concrete(1), n: 512, k: 512, dtype: DType::F32, trans_b: false, has_bias: false }), OpKind::Gemm { m: SymDim::Concrete(1), n: 512, k: 512, dtype: DType::F32, trans_b: false }, vec![input, wq], vec![oq], "q_proj");
+        graph.add_op_with_op(Op::Gemm(GemmSpec { m: SymDim::Concrete(1), n: 512, k: 512, dtype: DType::F32, trans_b: false, has_bias: false }), OpKind::Gemm { m: SymDim::Concrete(1), n: 512, k: 512, dtype: DType::F32, trans_b: false }, vec![input, wk], vec![ok_], "k_proj");
+        let v_op = graph.add_op_with_op(Op::Gemm(GemmSpec { m: SymDim::Concrete(1), n: 512, k: 512, dtype: DType::F32, trans_b: false, has_bias: false }), OpKind::Gemm { m: SymDim::Concrete(1), n: 512, k: 512, dtype: DType::F32, trans_b: false }, vec![input, wv], vec![ov], "v_proj");
 
         // Act
         let result = is_qkv_op(v_op, &graph);
@@ -1249,7 +1245,7 @@ mod tests {
     #[test]
     fn test_is_qkv_op_single_gemm_returns_false() {
         // Arrange
-        use crate::compiler::graph::{CompilerGraph, OpKind, KvSource, LayerCondition, SymDim};
+        use crate::compiler::graph::{CompilerGraph, OpKind, KvSource, LayerCondition, SymDim, Op, GemmSpec, NormSpec, QuantGemmSpec, RopeSpec, AttentionSpec, AttentionGeometry, AttentionMask, SinksSpec, CachedGqaSpec, MlaSpec, DualRopeSpec};
         use crate::types::DType;
 
         let mut graph = CompilerGraph::new();
@@ -1257,8 +1253,7 @@ mod tests {
         let weight = graph.add_tensor_concrete("weight", &[64, 128], DType::F32);
         let output = graph.add_tensor_concrete("output", &[1, 128], DType::F32);
 
-        let op_id = graph.add_op(
-            OpKind::Gemm { m: SymDim::Concrete(1), n: 128, k: 64, dtype: DType::F32, trans_b: false },
+        let op_id = graph.add_op_with_op(Op::Gemm(GemmSpec { m: SymDim::Concrete(1), n: 128, k: 64, dtype: DType::F32, trans_b: false, has_bias: false }), OpKind::Gemm { m: SymDim::Concrete(1), n: 128, k: 64, dtype: DType::F32, trans_b: false },
             vec![input, weight],
             vec![output],
             "single_gemm",
@@ -1276,14 +1271,13 @@ mod tests {
     #[test]
     fn test_extract_head_dim_from_rope() {
         // Arrange
-        use crate::compiler::graph::{CompilerGraph, OpKind, KvSource};
+        use crate::compiler::graph::{CompilerGraph, OpKind, KvSource, Op, GemmSpec, NormSpec, QuantGemmSpec, RopeSpec, AttentionSpec, AttentionGeometry, AttentionMask, SinksSpec, CachedGqaSpec, MlaSpec, DualRopeSpec};
         use crate::types::DType;
 
         let mut graph = CompilerGraph::new();
         let q = graph.add_tensor_concrete("q", &[1, 8, 64], DType::F32);
         let oq = graph.add_tensor_concrete("oq", &[1, 8, 64], DType::F32);
-        graph.add_op(
-            OpKind::RoPE {
+        graph.add_op_with_op(Op::RoPE(RopeSpec { num_heads: 8, head_dim: 64, theta: 10000.0, partial: 1.0, rope_scaling: None }), OpKind::RoPE {
                 num_heads: 8,
                 head_dim: 64,
                 theta: 10000.0,
@@ -1307,15 +1301,14 @@ mod tests {
     #[test]
     fn test_extract_head_dim_missing_returns_none() {
         // Arrange
-        use crate::compiler::graph::{CompilerGraph, OpKind, KvSource, LayerCondition, SymDim};
+        use crate::compiler::graph::{CompilerGraph, OpKind, KvSource, LayerCondition, SymDim, Op, GemmSpec, NormSpec, QuantGemmSpec, RopeSpec, AttentionSpec, AttentionGeometry, AttentionMask, SinksSpec, CachedGqaSpec, MlaSpec, DualRopeSpec};
         use crate::types::DType;
 
         let mut graph = CompilerGraph::new();
         let a = graph.add_tensor_concrete("a", &[1, 64], DType::F32);
         let b = graph.add_tensor_concrete("b", &[64, 128], DType::F32);
         let c = graph.add_tensor_concrete("c", &[1, 128], DType::F32);
-        graph.add_op(
-            OpKind::Gemm { m: SymDim::Concrete(1), n: 128, k: 64, dtype: DType::F32, trans_b: false },
+        graph.add_op_with_op(Op::Gemm(GemmSpec { m: SymDim::Concrete(1), n: 128, k: 64, dtype: DType::F32, trans_b: false, has_bias: false }), OpKind::Gemm { m: SymDim::Concrete(1), n: 128, k: 64, dtype: DType::F32, trans_b: false },
             vec![a, b],
             vec![c],
             "gemm_only",
@@ -1519,7 +1512,7 @@ mod tests {
     #[test]
     fn test_is_qkv_op_two_sibling_gemms_returns_false() {
         // Arrange
-        use crate::compiler::graph::{CompilerGraph, OpKind, KvSource, LayerCondition, SymDim};
+        use crate::compiler::graph::{CompilerGraph, OpKind, KvSource, LayerCondition, SymDim, Op, GemmSpec, NormSpec, QuantGemmSpec, RopeSpec, AttentionSpec, AttentionGeometry, AttentionMask, SinksSpec, CachedGqaSpec, MlaSpec, DualRopeSpec};
         use crate::types::DType;
 
         let mut graph = CompilerGraph::new();
@@ -1529,8 +1522,8 @@ mod tests {
         let o1 = graph.add_tensor_concrete("o1", &[1, 256], DType::F32);
         let o2 = graph.add_tensor_concrete("o2", &[1, 256], DType::F32);
 
-        graph.add_op(OpKind::Gemm { m: SymDim::Concrete(1), n: 256, k: 256, dtype: DType::F32, trans_b: false }, vec![input, w1], vec![o1], "proj1");
-        let op2 = graph.add_op(OpKind::Gemm { m: SymDim::Concrete(1), n: 256, k: 256, dtype: DType::F32, trans_b: false }, vec![input, w2], vec![o2], "proj2");
+        graph.add_op_with_op(Op::Gemm(GemmSpec { m: SymDim::Concrete(1), n: 256, k: 256, dtype: DType::F32, trans_b: false, has_bias: false }), OpKind::Gemm { m: SymDim::Concrete(1), n: 256, k: 256, dtype: DType::F32, trans_b: false }, vec![input, w1], vec![o1], "proj1");
+        let op2 = graph.add_op_with_op(Op::Gemm(GemmSpec { m: SymDim::Concrete(1), n: 256, k: 256, dtype: DType::F32, trans_b: false, has_bias: false }), OpKind::Gemm { m: SymDim::Concrete(1), n: 256, k: 256, dtype: DType::F32, trans_b: false }, vec![input, w2], vec![o2], "proj2");
 
         // Act
         let result = is_qkv_op(op2, &graph);
@@ -1545,14 +1538,13 @@ mod tests {
     #[test]
     fn test_model_aware_mha_preserves_existing_headsplit() {
         // Arrange
-        use crate::compiler::graph::{CompilerGraph, OpKind, KvSource, LayerCondition, SymDim};
+        use crate::compiler::graph::{CompilerGraph, OpKind, KvSource, LayerCondition, SymDim, Op, GemmSpec, NormSpec, QuantGemmSpec, RopeSpec, AttentionSpec, AttentionGeometry, AttentionMask, SinksSpec, CachedGqaSpec, MlaSpec, DualRopeSpec};
         use crate::types::DType;
 
         let mut graph = CompilerGraph::new();
         let tin = graph.add_tensor_concrete("q", &[1, 4096], DType::F32);
         let tout = graph.add_tensor_concrete("out", &[1, 4096], DType::F32);
-        let _op_id = graph.add_op(
-            OpKind::MultiHeadAttention {
+        let _op_id = graph.add_op_with_op(Op::MultiHeadAttention(AttentionSpec { geometry: AttentionGeometry { num_q_heads: 32, num_kv_heads: 32, head_dim: 128 }, mask: if true { AttentionMask::Causal } else { AttentionMask::Full }, kv_source: KvSource::FromTensor, sinks: if false { SinksSpec::Learnable } else { SinksSpec::None }, seq_len: SymDim::Concrete(1), dtype: DType::F32 }), OpKind::MultiHeadAttention {
                 seq_len: SymDim::Concrete(1),
                 num_heads: 32,
                 num_kv_heads: 32,
@@ -1585,14 +1577,13 @@ mod tests {
     #[test]
     fn test_extract_head_dim_from_mha() {
         // Arrange
-        use crate::compiler::graph::{CompilerGraph, OpKind, KvSource, LayerCondition, SymDim};
+        use crate::compiler::graph::{CompilerGraph, OpKind, KvSource, LayerCondition, SymDim, Op, GemmSpec, NormSpec, QuantGemmSpec, RopeSpec, AttentionSpec, AttentionGeometry, AttentionMask, SinksSpec, CachedGqaSpec, MlaSpec, DualRopeSpec};
         use crate::types::DType;
 
         let mut graph = CompilerGraph::new();
         let tin = graph.add_tensor_concrete("q", &[1, 4096], DType::F32);
         let tout = graph.add_tensor_concrete("out", &[1, 4096], DType::F32);
-        graph.add_op(
-            OpKind::MultiHeadAttention {
+        graph.add_op_with_op(Op::MultiHeadAttention(AttentionSpec { geometry: AttentionGeometry { num_q_heads: 32, num_kv_heads: 8, head_dim: 128 }, mask: if true { AttentionMask::Causal } else { AttentionMask::Full }, kv_source: KvSource::FromTensor, sinks: if false { SinksSpec::Learnable } else { SinksSpec::None }, seq_len: SymDim::Concrete(1), dtype: DType::F32 }), OpKind::MultiHeadAttention {
                 seq_len: SymDim::Concrete(1),
                 num_heads: 32,
                 num_kv_heads: 8,
@@ -1621,7 +1612,7 @@ mod tests {
     #[test]
     fn test_model_aware_gemmbias_non_qkv_preserves_layout() {
         // Arrange
-        use crate::compiler::graph::{CompilerGraph, OpKind, KvSource, LayerCondition, SymDim};
+        use crate::compiler::graph::{CompilerGraph, OpKind, KvSource, LayerCondition, SymDim, Op, GemmSpec, NormSpec, QuantGemmSpec, RopeSpec, AttentionSpec, AttentionGeometry, AttentionMask, SinksSpec, CachedGqaSpec, MlaSpec, DualRopeSpec};
         use crate::types::DType;
 
         let mut graph = CompilerGraph::new();
@@ -1629,8 +1620,7 @@ mod tests {
         let b = graph.add_tensor_concrete("b", &[128, 256], DType::F32);
         let bias = graph.add_tensor_concrete("bias", &[256], DType::F32);
         let c = graph.add_tensor_concrete("c", &[1, 256], DType::F32);
-        graph.add_op(
-            OpKind::GemmBias {
+        graph.add_op_with_op(Op::GemmBias(GemmSpec { m: SymDim::Concrete(1), n: 256, k: 128, dtype: DType::F32, trans_b: false, has_bias: true }), OpKind::GemmBias {
                 m: SymDim::Concrete(1),
                 n: 256,
                 k: 128,
@@ -1664,15 +1654,14 @@ mod tests {
     fn test_model_aware_gemmbias_qkv_gets_headsplit() {
         // Arrange: build a graph with an MHA to extract head_dim, then 3 GemmBias
         // sharing the same input tensor.
-        use crate::compiler::graph::{CompilerGraph, OpKind, KvSource, LayerCondition, SymDim};
+        use crate::compiler::graph::{CompilerGraph, OpKind, KvSource, LayerCondition, SymDim, Op, GemmSpec, NormSpec, QuantGemmSpec, RopeSpec, AttentionSpec, AttentionGeometry, AttentionMask, SinksSpec, CachedGqaSpec, MlaSpec, DualRopeSpec};
         use crate::types::DType;
 
         let mut graph = CompilerGraph::new();
         // MHA provides head_dim=64 for extract_head_dim_from_graph
         let mq = graph.add_tensor_concrete("mq", &[1, 512], DType::F32);
         let mo = graph.add_tensor_concrete("mo", &[1, 512], DType::F32);
-        graph.add_op(
-            OpKind::MultiHeadAttention {
+        graph.add_op_with_op(Op::MultiHeadAttention(AttentionSpec { geometry: AttentionGeometry { num_q_heads: 8, num_kv_heads: 8, head_dim: 64 }, mask: if true { AttentionMask::Causal } else { AttentionMask::Full }, kv_source: KvSource::FromTensor, sinks: if false { SinksSpec::Learnable } else { SinksSpec::None }, seq_len: SymDim::Concrete(1), dtype: DType::F32 }), OpKind::MultiHeadAttention {
                 seq_len: SymDim::Concrete(1),
                 num_heads: 8,
                 num_kv_heads: 8,
@@ -1698,9 +1687,9 @@ mod tests {
         let o2 = graph.add_tensor_concrete("o2", &[1, 512], DType::F32);
         let o3 = graph.add_tensor_concrete("o3", &[1, 512], DType::F32);
 
-        graph.add_op(OpKind::GemmBias { m: SymDim::Concrete(1), n: 512, k: 512, dtype: DType::F32, trans_b: false }, vec![input, w1, b1], vec![o1], "q_proj");
-        graph.add_op(OpKind::GemmBias { m: SymDim::Concrete(1), n: 512, k: 512, dtype: DType::F32, trans_b: false }, vec![input, w2, b2], vec![o2], "k_proj");
-        let v_op = graph.add_op(OpKind::GemmBias { m: SymDim::Concrete(1), n: 512, k: 512, dtype: DType::F32, trans_b: false }, vec![input, w3, b3], vec![o3], "v_proj");
+        graph.add_op_with_op(Op::GemmBias(GemmSpec { m: SymDim::Concrete(1), n: 512, k: 512, dtype: DType::F32, trans_b: false, has_bias: true }), OpKind::GemmBias { m: SymDim::Concrete(1), n: 512, k: 512, dtype: DType::F32, trans_b: false }, vec![input, w1, b1], vec![o1], "q_proj");
+        graph.add_op_with_op(Op::GemmBias(GemmSpec { m: SymDim::Concrete(1), n: 512, k: 512, dtype: DType::F32, trans_b: false, has_bias: true }), OpKind::GemmBias { m: SymDim::Concrete(1), n: 512, k: 512, dtype: DType::F32, trans_b: false }, vec![input, w2, b2], vec![o2], "k_proj");
+        let v_op = graph.add_op_with_op(Op::GemmBias(GemmSpec { m: SymDim::Concrete(1), n: 512, k: 512, dtype: DType::F32, trans_b: false, has_bias: true }), OpKind::GemmBias { m: SymDim::Concrete(1), n: 512, k: 512, dtype: DType::F32, trans_b: false }, vec![input, w3, b3], vec![o3], "v_proj");
 
         // Act
         let (out_layout, _) = model_aware_layout_overrides(
@@ -1720,7 +1709,7 @@ mod tests {
     #[test]
     fn test_model_aware_gemmbias_panel_packed_weight() {
         // Arrange
-        use crate::compiler::graph::{CompilerGraph, OpKind, KvSource, LayerCondition, SymDim};
+        use crate::compiler::graph::{CompilerGraph, OpKind, KvSource, LayerCondition, SymDim, Op, GemmSpec, NormSpec, QuantGemmSpec, RopeSpec, AttentionSpec, AttentionGeometry, AttentionMask, SinksSpec, CachedGqaSpec, MlaSpec, DualRopeSpec};
         use crate::types::DType;
 
         let mut graph = CompilerGraph::new();
@@ -1728,8 +1717,7 @@ mod tests {
         let b = graph.add_tensor_concrete("b", &[192, 384], DType::F32);
         let bias = graph.add_tensor_concrete("bias", &[384], DType::F32);
         let c = graph.add_tensor_concrete("c", &[1, 384], DType::F32);
-        graph.add_op(
-            OpKind::GemmBias {
+        graph.add_op_with_op(Op::GemmBias(GemmSpec { m: SymDim::Concrete(1), n: 384, k: 192, dtype: DType::F32, trans_b: false, has_bias: true }), OpKind::GemmBias {
                 m: SymDim::Concrete(1),
                 n: 384,
                 k: 192,
@@ -1760,14 +1748,13 @@ mod tests {
     #[test]
     fn test_model_aware_rmsnorm_passthrough() {
         // Arrange
-        use crate::compiler::graph::{CompilerGraph, OpKind, KvSource};
+        use crate::compiler::graph::{CompilerGraph, OpKind, KvSource, Op, GemmSpec, NormSpec, QuantGemmSpec, RopeSpec, AttentionSpec, AttentionGeometry, AttentionMask, SinksSpec, CachedGqaSpec, MlaSpec, DualRopeSpec};
         use crate::types::DType;
 
         let mut graph = CompilerGraph::new();
         let input = graph.add_tensor_concrete("x", &[1, 256], DType::F32);
         let output = graph.add_tensor_concrete("out", &[1, 256], DType::F32);
-        graph.add_op(
-            OpKind::RmsNorm { feature_dim: 4096, eps: 1e-6 },
+        graph.add_op_with_op(Op::RmsNorm(NormSpec { feature_dim: 4096, eps: 1e-6, dtype: DType::F32, has_weight: true }), OpKind::RmsNorm { feature_dim: 4096, eps: 1e-6 },
             vec![input],
             vec![output],
             "rms_norm",
@@ -1808,14 +1795,13 @@ mod tests {
     #[test]
     fn test_is_qkv_op_non_gemm_returns_false() {
         // Arrange
-        use crate::compiler::graph::{CompilerGraph, OpKind, KvSource};
+        use crate::compiler::graph::{CompilerGraph, OpKind, KvSource, Op, GemmSpec, NormSpec, QuantGemmSpec, RopeSpec, AttentionSpec, AttentionGeometry, AttentionMask, SinksSpec, CachedGqaSpec, MlaSpec, DualRopeSpec};
         use crate::types::DType;
 
         let mut graph = CompilerGraph::new();
         let input = graph.add_tensor_concrete("x", &[1, 64], DType::F32);
         let output = graph.add_tensor_concrete("out", &[1, 64], DType::F32);
-        let op_id = graph.add_op(
-            OpKind::Silu,
+        let op_id = graph.add_op_with_op(Op::Silu, OpKind::Silu,
             vec![input],
             vec![output],
             "silu",
@@ -1833,14 +1819,12 @@ mod tests {
     #[test]
     fn test_is_qkv_op_gemm_no_inputs() {
         // Arrange: manually construct a graph with a Gemm that has no inputs
-        use crate::compiler::graph::{CompilerGraph, CompilerOp, LayerCondition, OpKind, KvSource, SymDim};
+        use crate::compiler::graph::{CompilerGraph, CompilerOp, LayerCondition, OpKind, KvSource, SymDim, Op, GemmSpec, NormSpec, QuantGemmSpec, RopeSpec, AttentionSpec, AttentionGeometry, AttentionMask, SinksSpec, CachedGqaSpec, MlaSpec, DualRopeSpec};
         use crate::types::DType;
 
         let mut graph = CompilerGraph::new();
         // Add a Gemm with no inputs (edge case)
-        let op_node = CompilerOp::new_from_kind(
-            OpId(0),
-            OpKind::Gemm {
+        let op_node = CompilerOp::new_from_op(OpId(0), Op::Gemm(GemmSpec { m: SymDim::Concrete(1), n: 64, k: 64, dtype: DType::F32, trans_b: false, has_bias: false }), OpKind::Gemm {
                 m: SymDim::Concrete(1),
                 n: 64,
                 k: 64,
@@ -1850,8 +1834,7 @@ mod tests {
             vec![], // no inputs
             vec![],
             "orphan_gemm",
-            LayerCondition::Always,
-            &graph,
+            LayerCondition::Always
         );
         graph.ops.push(op_node);
         let op_id = OpId(0);
@@ -1869,15 +1852,14 @@ mod tests {
     #[test]
     fn test_extract_head_dim_mha_priority_over_rope() {
         // Arrange: graph with MHA first, then RoPE with different head_dim
-        use crate::compiler::graph::{CompilerGraph, OpKind, KvSource, LayerCondition, SymDim};
+        use crate::compiler::graph::{CompilerGraph, OpKind, KvSource, LayerCondition, SymDim, Op, GemmSpec, NormSpec, QuantGemmSpec, RopeSpec, AttentionSpec, AttentionGeometry, AttentionMask, SinksSpec, CachedGqaSpec, MlaSpec, DualRopeSpec};
         use crate::types::DType;
 
         let mut graph = CompilerGraph::new();
         // MHA with head_dim=96
         let mq = graph.add_tensor_concrete("mq", &[1, 768], DType::F32);
         let mo = graph.add_tensor_concrete("mo", &[1, 768], DType::F32);
-        graph.add_op(
-            OpKind::MultiHeadAttention {
+        graph.add_op_with_op(Op::MultiHeadAttention(AttentionSpec { geometry: AttentionGeometry { num_q_heads: 8, num_kv_heads: 8, head_dim: 96 }, mask: if false { AttentionMask::Causal } else { AttentionMask::Full }, kv_source: KvSource::FromTensor, sinks: if false { SinksSpec::Learnable } else { SinksSpec::None }, seq_len: SymDim::Concrete(1), dtype: DType::F32 }), OpKind::MultiHeadAttention {
                 seq_len: SymDim::Concrete(1),
                 num_heads: 8,
                 num_kv_heads: 8,
@@ -1894,8 +1876,7 @@ mod tests {
         // RoPE with head_dim=64 (different from MHA)
         let rq = graph.add_tensor_concrete("rq", &[1, 512], DType::F32);
         let ro = graph.add_tensor_concrete("ro", &[1, 512], DType::F32);
-        graph.add_op(
-            OpKind::RoPE {
+        graph.add_op_with_op(Op::RoPE(RopeSpec { num_heads: 8, head_dim: 64, theta: 10000.0, partial: 1.0, rope_scaling: None }), OpKind::RoPE {
                 num_heads: 8,
                 head_dim: 64,
                 theta: 10000.0,
@@ -1993,7 +1974,7 @@ mod tests {
     fn test_model_aware_gemm_qkv_head_dim_extraction() {
         // Arrange: graph with MHA head_dim=80, then 3 Gemm ops (QKV) with n=640
         // num_heads = 640 / 80 = 8
-        use crate::compiler::graph::{CompilerGraph, OpKind, KvSource, LayerCondition, SymDim};
+        use crate::compiler::graph::{CompilerGraph, OpKind, KvSource, LayerCondition, SymDim, Op, GemmSpec, NormSpec, QuantGemmSpec, RopeSpec, AttentionSpec, AttentionGeometry, AttentionMask, SinksSpec, CachedGqaSpec, MlaSpec, DualRopeSpec};
         use crate::types::DType;
 
         let mut graph = CompilerGraph::new();
@@ -2001,8 +1982,7 @@ mod tests {
         // MHA provides head_dim=80
         let mq = graph.add_tensor_concrete("mq", &[1, 640], DType::F32);
         let mo = graph.add_tensor_concrete("mo", &[1, 640], DType::F32);
-        graph.add_op(
-            OpKind::MultiHeadAttention {
+        graph.add_op_with_op(Op::MultiHeadAttention(AttentionSpec { geometry: AttentionGeometry { num_q_heads: 8, num_kv_heads: 8, head_dim: 80 }, mask: if false { AttentionMask::Causal } else { AttentionMask::Full }, kv_source: KvSource::FromTensor, sinks: if false { SinksSpec::Learnable } else { SinksSpec::None }, seq_len: SymDim::Concrete(1), dtype: DType::F32 }), OpKind::MultiHeadAttention {
                 seq_len: SymDim::Concrete(1),
                 num_heads: 8,
                 num_kv_heads: 8,
@@ -2025,9 +2005,9 @@ mod tests {
         let o2 = graph.add_tensor_concrete("o2", &[1, 640], DType::F32);
         let o3 = graph.add_tensor_concrete("o3", &[1, 640], DType::F32);
 
-        let q_op = graph.add_op(OpKind::Gemm { m: SymDim::Concrete(1), n: 640, k: 512, dtype: DType::F32, trans_b: false }, vec![input, w1], vec![o1], "q_proj");
-        graph.add_op(OpKind::Gemm { m: SymDim::Concrete(1), n: 640, k: 512, dtype: DType::F32, trans_b: false }, vec![input, w2], vec![o2], "k_proj");
-        graph.add_op(OpKind::Gemm { m: SymDim::Concrete(1), n: 640, k: 512, dtype: DType::F32, trans_b: false }, vec![input, w3], vec![o3], "v_proj");
+        let q_op = graph.add_op_with_op(Op::Gemm(GemmSpec { m: SymDim::Concrete(1), n: 640, k: 512, dtype: DType::F32, trans_b: false, has_bias: false }), OpKind::Gemm { m: SymDim::Concrete(1), n: 640, k: 512, dtype: DType::F32, trans_b: false }, vec![input, w1], vec![o1], "q_proj");
+        graph.add_op_with_op(Op::Gemm(GemmSpec { m: SymDim::Concrete(1), n: 640, k: 512, dtype: DType::F32, trans_b: false, has_bias: false }), OpKind::Gemm { m: SymDim::Concrete(1), n: 640, k: 512, dtype: DType::F32, trans_b: false }, vec![input, w2], vec![o2], "k_proj");
+        graph.add_op_with_op(Op::Gemm(GemmSpec { m: SymDim::Concrete(1), n: 640, k: 512, dtype: DType::F32, trans_b: false, has_bias: false }), OpKind::Gemm { m: SymDim::Concrete(1), n: 640, k: 512, dtype: DType::F32, trans_b: false }, vec![input, w3], vec![o3], "v_proj");
 
         // Act: query the first QKV gemm
         let (out_layout, _) = model_aware_layout_overrides(
@@ -2130,15 +2110,14 @@ mod tests {
     #[test]
     fn test_model_aware_gemm_non_panel_weight_passthrough() {
         // Arrange
-        use crate::compiler::graph::{CompilerGraph, OpKind, KvSource, LayerCondition, SymDim};
+        use crate::compiler::graph::{CompilerGraph, OpKind, KvSource, LayerCondition, SymDim, Op, GemmSpec, NormSpec, QuantGemmSpec, RopeSpec, AttentionSpec, AttentionGeometry, AttentionMask, SinksSpec, CachedGqaSpec, MlaSpec, DualRopeSpec};
         use crate::types::DType;
 
         let mut graph = CompilerGraph::new();
         let a = graph.add_tensor_concrete("a", &[1, 64], DType::F32);
         let b = graph.add_tensor_concrete("b", &[64, 128], DType::F32);
         let c = graph.add_tensor_concrete("c", &[1, 128], DType::F32);
-        graph.add_op(
-            OpKind::Gemm {
+        graph.add_op_with_op(Op::Gemm(GemmSpec { m: SymDim::Concrete(1), n: 128, k: 64, dtype: DType::F32, trans_b: false, has_bias: false }), OpKind::Gemm {
                 m: SymDim::Concrete(1),
                 n: 128,
                 k: 64,
@@ -2195,7 +2174,7 @@ mod tests {
     #[test]
     fn test_is_qkv_op_first_sibling_detected() {
         // Arrange
-        use crate::compiler::graph::{CompilerGraph, OpKind, KvSource, LayerCondition, SymDim};
+        use crate::compiler::graph::{CompilerGraph, OpKind, KvSource, LayerCondition, SymDim, Op, GemmSpec, NormSpec, QuantGemmSpec, RopeSpec, AttentionSpec, AttentionGeometry, AttentionMask, SinksSpec, CachedGqaSpec, MlaSpec, DualRopeSpec};
         use crate::types::DType;
 
         let mut graph = CompilerGraph::new();
@@ -2207,9 +2186,9 @@ mod tests {
         let o2 = graph.add_tensor_concrete("o2", &[1, 256], DType::F32);
         let o3 = graph.add_tensor_concrete("o3", &[1, 256], DType::F32);
 
-        let q_op = graph.add_op(OpKind::Gemm { m: SymDim::Concrete(1), n: 256, k: 256, dtype: DType::F32, trans_b: false }, vec![input, w1], vec![o1], "q_proj");
-        graph.add_op(OpKind::Gemm { m: SymDim::Concrete(1), n: 256, k: 256, dtype: DType::F32, trans_b: false }, vec![input, w2], vec![o2], "k_proj");
-        graph.add_op(OpKind::Gemm { m: SymDim::Concrete(1), n: 256, k: 256, dtype: DType::F32, trans_b: false }, vec![input, w3], vec![o3], "v_proj");
+        let q_op = graph.add_op_with_op(Op::Gemm(GemmSpec { m: SymDim::Concrete(1), n: 256, k: 256, dtype: DType::F32, trans_b: false, has_bias: false }), OpKind::Gemm { m: SymDim::Concrete(1), n: 256, k: 256, dtype: DType::F32, trans_b: false }, vec![input, w1], vec![o1], "q_proj");
+        graph.add_op_with_op(Op::Gemm(GemmSpec { m: SymDim::Concrete(1), n: 256, k: 256, dtype: DType::F32, trans_b: false, has_bias: false }), OpKind::Gemm { m: SymDim::Concrete(1), n: 256, k: 256, dtype: DType::F32, trans_b: false }, vec![input, w2], vec![o2], "k_proj");
+        graph.add_op_with_op(Op::Gemm(GemmSpec { m: SymDim::Concrete(1), n: 256, k: 256, dtype: DType::F32, trans_b: false, has_bias: false }), OpKind::Gemm { m: SymDim::Concrete(1), n: 256, k: 256, dtype: DType::F32, trans_b: false }, vec![input, w3], vec![o3], "v_proj");
 
         // Act
         let result = is_qkv_op(q_op, &graph);
@@ -2575,7 +2554,7 @@ mod tests {
     #[test]
     fn test_model_aware_gemmbias_colmajor_weight_passthrough() {
         // Arrange
-        use crate::compiler::graph::{CompilerGraph, OpKind, KvSource, LayerCondition, SymDim};
+        use crate::compiler::graph::{CompilerGraph, OpKind, KvSource, LayerCondition, SymDim, Op, GemmSpec, NormSpec, QuantGemmSpec, RopeSpec, AttentionSpec, AttentionGeometry, AttentionMask, SinksSpec, CachedGqaSpec, MlaSpec, DualRopeSpec};
         use crate::types::DType;
 
         let mut graph = CompilerGraph::new();
@@ -2583,8 +2562,7 @@ mod tests {
         let b = graph.add_tensor_concrete("b", &[64, 128], DType::F32);
         let bias = graph.add_tensor_concrete("bias", &[128], DType::F32);
         let c = graph.add_tensor_concrete("c", &[1, 128], DType::F32);
-        graph.add_op(
-            OpKind::GemmBias {
+        graph.add_op_with_op(Op::GemmBias(GemmSpec { m: SymDim::Concrete(1), n: 128, k: 64, dtype: DType::F32, trans_b: false, has_bias: true }), OpKind::GemmBias {
                 m: SymDim::Concrete(1),
                 n: 128,
                 k: 64,
@@ -2739,7 +2717,7 @@ mod tests {
     #[test]
     fn test_model_aware_gemm_qkv_without_mha_fallback_head_dim() {
         // Arrange: 3 Gemm ops sharing input, but no MHA/RoPE in the graph
-        use crate::compiler::graph::{CompilerGraph, OpKind, KvSource, LayerCondition, SymDim};
+        use crate::compiler::graph::{CompilerGraph, OpKind, KvSource, LayerCondition, SymDim, Op, GemmSpec, NormSpec, QuantGemmSpec, RopeSpec, AttentionSpec, AttentionGeometry, AttentionMask, SinksSpec, CachedGqaSpec, MlaSpec, DualRopeSpec};
         use crate::types::DType;
 
         let mut graph = CompilerGraph::new();
@@ -2751,9 +2729,9 @@ mod tests {
         let o2 = graph.add_tensor_concrete("o2", &[1, 512], DType::F32);
         let o3 = graph.add_tensor_concrete("o3", &[1, 512], DType::F32);
 
-        let q_op = graph.add_op(OpKind::Gemm { m: SymDim::Concrete(1), n: 512, k: 256, dtype: DType::F32, trans_b: false }, vec![input, w1], vec![o1], "q_proj");
-        graph.add_op(OpKind::Gemm { m: SymDim::Concrete(1), n: 512, k: 256, dtype: DType::F32, trans_b: false }, vec![input, w2], vec![o2], "k_proj");
-        graph.add_op(OpKind::Gemm { m: SymDim::Concrete(1), n: 512, k: 256, dtype: DType::F32, trans_b: false }, vec![input, w3], vec![o3], "v_proj");
+        let q_op = graph.add_op_with_op(Op::Gemm(GemmSpec { m: SymDim::Concrete(1), n: 512, k: 256, dtype: DType::F32, trans_b: false, has_bias: false }), OpKind::Gemm { m: SymDim::Concrete(1), n: 512, k: 256, dtype: DType::F32, trans_b: false }, vec![input, w1], vec![o1], "q_proj");
+        graph.add_op_with_op(Op::Gemm(GemmSpec { m: SymDim::Concrete(1), n: 512, k: 256, dtype: DType::F32, trans_b: false, has_bias: false }), OpKind::Gemm { m: SymDim::Concrete(1), n: 512, k: 256, dtype: DType::F32, trans_b: false }, vec![input, w2], vec![o2], "k_proj");
+        graph.add_op_with_op(Op::Gemm(GemmSpec { m: SymDim::Concrete(1), n: 512, k: 256, dtype: DType::F32, trans_b: false, has_bias: false }), OpKind::Gemm { m: SymDim::Concrete(1), n: 512, k: 256, dtype: DType::F32, trans_b: false }, vec![input, w3], vec![o3], "v_proj");
 
         // Act: no MHA/RoPE => extract_head_dim_from_graph returns None
         // => head_dim = n = 512, num_heads = 512 / 512 = 1
@@ -2892,15 +2870,14 @@ mod tests {
     #[test]
     fn test_model_aware_gemm_any_output_non_qkv() {
         // Arrange
-        use crate::compiler::graph::{CompilerGraph, OpKind, KvSource, LayerCondition, SymDim};
+        use crate::compiler::graph::{CompilerGraph, OpKind, KvSource, LayerCondition, SymDim, Op, GemmSpec, NormSpec, QuantGemmSpec, RopeSpec, AttentionSpec, AttentionGeometry, AttentionMask, SinksSpec, CachedGqaSpec, MlaSpec, DualRopeSpec};
         use crate::types::DType;
 
         let mut graph = CompilerGraph::new();
         let a = graph.add_tensor_concrete("a", &[1, 64], DType::F32);
         let b = graph.add_tensor_concrete("b", &[64, 128], DType::F32);
         let c = graph.add_tensor_concrete("c", &[1, 128], DType::F32);
-        let op_id = graph.add_op(
-            OpKind::Gemm {
+        let op_id = graph.add_op_with_op(Op::Gemm(GemmSpec { m: SymDim::Concrete(1), n: 128, k: 64, dtype: DType::F32, trans_b: false, has_bias: false }), OpKind::Gemm {
                 m: SymDim::Concrete(1),
                 n: 128,
                 k: 64,
@@ -3029,7 +3006,7 @@ mod tests {
     #[test]
     fn test_is_qkv_op_quant_gemm_siblings_counted() {
         // Arrange: 2 regular Gemm + 1 QuantGemm sharing the same input
-        use crate::compiler::graph::{CompilerGraph, CompilerOp, LayerCondition, OpKind, KvSource, SymDim};
+        use crate::compiler::graph::{CompilerGraph, CompilerOp, LayerCondition, OpKind, KvSource, SymDim, Op, GemmSpec, NormSpec, QuantGemmSpec, RopeSpec, AttentionSpec, AttentionGeometry, AttentionMask, SinksSpec, CachedGqaSpec, MlaSpec, DualRopeSpec};
         use crate::types::DType;
 
         let mut graph = CompilerGraph::new();
@@ -3041,11 +3018,11 @@ mod tests {
         let o2 = graph.add_tensor_concrete("o2", &[1, 256], DType::F32);
         let o3 = graph.add_tensor_concrete("o3", &[1, 256], DType::F32);
 
-        graph.add_op(OpKind::Gemm { m: SymDim::Concrete(1), n: 256, k: 256, dtype: DType::F32, trans_b: false }, vec![input, w1], vec![o1], "q_proj");
-        graph.add_op(OpKind::Gemm { m: SymDim::Concrete(1), n: 256, k: 256, dtype: DType::F32, trans_b: false }, vec![input, w2], vec![o2], "k_proj");
+        graph.add_op_with_op(Op::Gemm(GemmSpec { m: SymDim::Concrete(1), n: 256, k: 256, dtype: DType::F32, trans_b: false, has_bias: false }), OpKind::Gemm { m: SymDim::Concrete(1), n: 256, k: 256, dtype: DType::F32, trans_b: false }, vec![input, w1], vec![o1], "q_proj");
+        graph.add_op_with_op(Op::Gemm(GemmSpec { m: SymDim::Concrete(1), n: 256, k: 256, dtype: DType::F32, trans_b: false, has_bias: false }), OpKind::Gemm { m: SymDim::Concrete(1), n: 256, k: 256, dtype: DType::F32, trans_b: false }, vec![input, w2], vec![o2], "k_proj");
 
         // Third sibling is a QuantGemm — added via graph.add_op to maintain tensor.consumers index.
-        graph.add_op(OpKind::QuantGemm {
+        graph.add_op_with_op(Op::QuantGemm(QuantGemmSpec { m: SymDim::Concrete(1), n: 256, k: 256, quant_type: crate::quant::QuantType::F32 }), OpKind::QuantGemm {
             m: SymDim::Concrete(1),
             n: 256,
             k: 256,
@@ -3065,17 +3042,17 @@ mod tests {
     #[test]
     fn test_extract_head_dim_silu_rmsnorm_returns_none() {
         // Arrange
-        use crate::compiler::graph::{CompilerGraph, OpKind, KvSource};
+        use crate::compiler::graph::{CompilerGraph, OpKind, KvSource, Op, GemmSpec, NormSpec, QuantGemmSpec, RopeSpec, AttentionSpec, AttentionGeometry, AttentionMask, SinksSpec, CachedGqaSpec, MlaSpec, DualRopeSpec};
         use crate::types::DType;
 
         let mut graph = CompilerGraph::new();
         let x = graph.add_tensor_concrete("x", &[1, 256], DType::F32);
         let y = graph.add_tensor_concrete("y", &[1, 256], DType::F32);
-        graph.add_op(OpKind::Silu, vec![x], vec![y], "silu");
+        graph.add_op_with_op(Op::Silu, OpKind::Silu, vec![x], vec![y], "silu");
 
         let z = graph.add_tensor_concrete("z", &[1, 256], DType::F32);
         let w = graph.add_tensor_concrete("w", &[1, 256], DType::F32);
-        graph.add_op(OpKind::RmsNorm { feature_dim: 4096, eps: 1e-6 }, vec![z], vec![w], "norm");
+        graph.add_op_with_op(Op::RmsNorm(NormSpec { feature_dim: 4096, eps: 1e-6, dtype: DType::F32, has_weight: true }), OpKind::RmsNorm { feature_dim: 4096, eps: 1e-6 }, vec![z], vec![w], "norm");
 
         // Act
         let head_dim = extract_head_dim_from_graph(&graph);

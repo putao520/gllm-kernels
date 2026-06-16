@@ -376,7 +376,7 @@ impl CodegenHints {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::compiler::graph::{CompilerGraph, KvSource, SymDim};
+    use crate::compiler::graph::{CompilerGraph, KvSource, SymDim, Op, GemmSpec, NormSpec, QuantGemmSpec, RopeSpec, AttentionSpec, AttentionGeometry, AttentionMask, SinksSpec, CachedGqaSpec, MlaSpec, DualRopeSpec};
     use crate::compiler::ir::LayerIR;
     use crate::compiler::registry::ScalarOpRegistry;
     use crate::compiler::trace::{ComputePattern, QuantPrecision, TraceOp};
@@ -1043,7 +1043,7 @@ mod tests {
         let mut graph = CompilerGraph::new();
         let input = graph.add_tensor_concrete("x", &[4, 8], DType::F32);
         let output = graph.add_tensor_concrete("y", &[4, 8], DType::F32);
-        graph.add_op(OpKind::Silu, vec![input], vec![output], "silu");
+        graph.add_op_with_op(Op::Silu, OpKind::Silu, vec![input], vec![output], "silu");
         let registry = ScalarOpRegistry::with_defaults();
         // Act
         let dag = SemanticDAG::from_graph(&graph, &registry);
@@ -1065,8 +1065,7 @@ mod tests {
         let a = graph.add_tensor_concrete("A", &[4, 8], DType::F32);
         let b = graph.add_tensor_concrete("B", &[8, 16], DType::F32);
         let c = graph.add_tensor_concrete("C", &[4, 16], DType::F32);
-        graph.add_op(
-            OpKind::Gemm {
+        graph.add_op_with_op(Op::Gemm(GemmSpec { m: SymDim::Concrete(4), n: 16, k: 8, dtype: DType::F32, trans_b: false, has_bias: false }), OpKind::Gemm {
                 m: SymDim::Concrete(4),
                 n: 16,
                 k: 8,
@@ -1100,13 +1099,12 @@ mod tests {
         let weight = graph.add_tensor_concrete("w", &[32], DType::F32);
         let normed = graph.add_tensor_concrete("normed", &[4, 32], DType::F32);
         let activated = graph.add_tensor_concrete("activated", &[4, 32], DType::F32);
-        graph.add_op(
-            OpKind::RmsNorm { feature_dim: 4096, eps: 1e-5 },
+        graph.add_op_with_op(Op::RmsNorm(NormSpec { feature_dim: 4096, eps: 1e-5, dtype: DType::F32, has_weight: true }), OpKind::RmsNorm { feature_dim: 4096, eps: 1e-5 },
             vec![input, weight],
             vec![normed],
             "rms_norm",
         );
-        graph.add_op(OpKind::Silu, vec![normed], vec![activated], "silu");
+        graph.add_op_with_op(Op::Silu, OpKind::Silu, vec![normed], vec![activated], "silu");
 
         let registry = ScalarOpRegistry::with_defaults();
         // Act
@@ -1130,7 +1128,7 @@ mod tests {
         let mut graph = CompilerGraph::new();
         let tin = graph.add_tensor_concrete("in", &[4], DType::F32);
         let tout = graph.add_tensor_concrete("out", &[4], DType::F32);
-        let op_id = graph.add_op(OpKind::Tanh, vec![tin], vec![tout], "tanh");
+        let op_id = graph.add_op_with_op(Op::Tanh, OpKind::Tanh, vec![tin], vec![tout], "tanh");
         let registry = ScalarOpRegistry::with_defaults();
         let dag = SemanticDAG::from_graph(&graph, &registry);
         // Act
@@ -1162,8 +1160,8 @@ mod tests {
         let b = graph.add_tensor_concrete("b", &[4, 8], DType::F32);
         let sum = graph.add_tensor_concrete("sum", &[4, 8], DType::F32);
         let sm_out = graph.add_tensor_concrete("sm_out", &[4, 8], DType::F32);
-        graph.add_op(OpKind::Add, vec![a, b], vec![sum], "add");
-        graph.add_op(OpKind::Softmax, vec![sum], vec![sm_out], "softmax");
+        graph.add_op_with_op(Op::Add, OpKind::Add, vec![a, b], vec![sum], "add");
+        graph.add_op_with_op(Op::Softmax, OpKind::Softmax, vec![sum], vec![sm_out], "softmax");
 
         let registry = ScalarOpRegistry::with_defaults();
         let dag = SemanticDAG::from_graph(&graph, &registry);
@@ -1200,8 +1198,7 @@ mod tests {
         let input = graph.add_tensor_concrete("img", &[3, 224, 224], DType::F32);
         let weight = graph.add_tensor_concrete("patch_w", &[1152, 3 * 14 * 14], DType::F32);
         let output = graph.add_tensor_concrete("patches", &[256, 1152], DType::F32);
-        graph.add_op(
-            OpKind::PatchEmbed {
+        graph.add_op_with_op(Op::PatchEmbed { patch_size: 14, embed_dim: 1152, in_channels: 3, image_size: 224 }, OpKind::PatchEmbed {
                 patch_size: 14,
                 in_channels: 3,
                 embed_dim: 1152,
@@ -1226,8 +1223,7 @@ mod tests {
         let input = graph.add_tensor_concrete("audio", &[128, 512], DType::F32);
         let weight = graph.add_tensor_concrete("dw_w", &[512, 7], DType::F32);
         let output = graph.add_tensor_concrete("conv_out", &[128, 512], DType::F32);
-        graph.add_op(
-            OpKind::DepthwiseConv1D {
+        graph.add_op_with_op(Op::DepthwiseConv1D { channels: 512, kernel_size: 7, causal: false }, OpKind::DepthwiseConv1D {
                 channels: 512,
                 kernel_size: 7,
                 causal: false,
@@ -1253,8 +1249,8 @@ mod tests {
         let shared = graph.add_tensor_concrete("shared", &[4, 8], DType::F32);
         let out_a = graph.add_tensor_concrete("out_a", &[4, 8], DType::F32);
         let out_b = graph.add_tensor_concrete("out_b", &[4, 8], DType::F32);
-        graph.add_op(OpKind::Silu, vec![shared], vec![out_a], "consumer_a");
-        graph.add_op(OpKind::Gelu, vec![shared], vec![out_b], "consumer_b");
+        graph.add_op_with_op(Op::Silu, OpKind::Silu, vec![shared], vec![out_a], "consumer_a");
+        graph.add_op_with_op(Op::Gelu, OpKind::Gelu, vec![shared], vec![out_b], "consumer_b");
 
         let registry = ScalarOpRegistry::with_defaults();
         let dag = SemanticDAG::from_graph(&graph, &registry);
@@ -1272,7 +1268,7 @@ mod tests {
         let input = graph.add_tensor_concrete("graph_in", &[4, 8], DType::F32);
         let output = graph.add_tensor_concrete("graph_out", &[4, 8], DType::F32);
         graph.inputs.push(input);
-        graph.add_op(OpKind::Silu, vec![input], vec![output], "silu");
+        graph.add_op_with_op(Op::Silu, OpKind::Silu, vec![input], vec![output], "silu");
 
         let registry = ScalarOpRegistry::with_defaults();
         let dag = SemanticDAG::from_graph(&graph, &registry);
@@ -1293,8 +1289,7 @@ mod tests {
         let a = graph.add_tensor_concrete("A", &[1, 4], DType::F32);
         let b = graph.add_tensor_concrete("B", &[4, 4], DType::F32);
         let c = graph.add_tensor_concrete("C", &[1, 4], DType::F32);
-        graph.add_op(
-            OpKind::Gemm {
+        graph.add_op_with_op(Op::Gemm(GemmSpec { m: SymDim::Concrete(1), n: 4, k: 4, dtype: DType::F32, trans_b: false, has_bias: false }), OpKind::Gemm {
                 m: SymDim::Concrete(1),
                 n: 4,
                 k: 4,
@@ -1323,8 +1318,7 @@ mod tests {
         let a = graph.add_tensor_concrete("A", &[512, 512], DType::F32);
         let b = graph.add_tensor_concrete("B", &[512, 1024], DType::F32);
         let c = graph.add_tensor_concrete("C", &[512, 1024], DType::F32);
-        graph.add_op(
-            OpKind::Gemm {
+        graph.add_op_with_op(Op::Gemm(GemmSpec { m: SymDim::Concrete(512), n: 1024, k: 512, dtype: DType::F32, trans_b: false, has_bias: false }), OpKind::Gemm {
                 m: SymDim::Concrete(512),
                 n: 1024,
                 k: 512,
@@ -1351,7 +1345,7 @@ mod tests {
         let mut graph = CompilerGraph::new();
         let input = graph.add_tensor_concrete("x", &[4, 8], DType::F32);
         let output = graph.add_tensor_concrete("y", &[4, 8], DType::F32);
-        graph.add_op(OpKind::Silu, vec![input], vec![output], "silu");
+        graph.add_op_with_op(Op::Silu, OpKind::Silu, vec![input], vec![output], "silu");
         let registry = ScalarOpRegistry::with_defaults();
         // Act
         let dag = SemanticDAG::from_graph(&graph, &registry);
@@ -1373,8 +1367,7 @@ mod tests {
         let a = graph.add_tensor_concrete("A", &[16, 128], DType::F32);
         let b = graph.add_tensor_concrete("B", &[128, 64], DType::F32);
         let c = graph.add_tensor_concrete("C", &[16, 64], DType::F32);
-        graph.add_op(
-            OpKind::Gemm {
+        graph.add_op_with_op(Op::Gemm(GemmSpec { m: SymDim::Concrete(16), n: 64, k: 128, dtype: DType::F32, trans_b: false, has_bias: false }), OpKind::Gemm {
                 m: SymDim::Concrete(16),
                 n: 64,
                 k: 128,
@@ -1430,8 +1423,7 @@ mod tests {
         let a = graph.add_tensor_concrete("A", &[512, 512], DType::F32);
         let b = graph.add_tensor_concrete("B", &[512, 1024], DType::F32);
         let c = graph.add_tensor_concrete("C", &[512, 1024], DType::F32);
-        graph.add_op(
-            OpKind::Gemm {
+        graph.add_op_with_op(Op::Gemm(GemmSpec { m: SymDim::Concrete(512), n: 1024, k: 512, dtype: DType::F32, trans_b: false, has_bias: false }), OpKind::Gemm {
                 m: SymDim::Concrete(512),
                 n: 1024,
                 k: 512,
@@ -1460,8 +1452,8 @@ mod tests {
         let x = graph.add_tensor_concrete("x", &[4, 8], DType::F32);
         let y = graph.add_tensor_concrete("y", &[4, 8], DType::F32);
         let z = graph.add_tensor_concrete("z", &[4, 8], DType::F32);
-        graph.add_op(OpKind::Silu, vec![x], vec![y], "silu");
-        graph.add_op(OpKind::Tanh, vec![y], vec![z], "tanh");
+        graph.add_op_with_op(Op::Silu, OpKind::Silu, vec![x], vec![y], "silu");
+        graph.add_op_with_op(Op::Tanh, OpKind::Tanh, vec![y], vec![z], "tanh");
 
         let registry = ScalarOpRegistry::with_defaults();
         let dag = SemanticDAG::from_graph(&graph, &registry);
@@ -1478,7 +1470,7 @@ mod tests {
         let mut graph = CompilerGraph::new();
         let x = graph.add_tensor_concrete("x", &[2, 2], DType::F32);
         let y = graph.add_tensor_concrete("y", &[2, 2], DType::F32);
-        graph.add_op(OpKind::Silu, vec![x], vec![y], "silu");
+        graph.add_op_with_op(Op::Silu, OpKind::Silu, vec![x], vec![y], "silu");
 
         let registry = ScalarOpRegistry::with_defaults();
         let dag = SemanticDAG::from_graph(&graph, &registry);
@@ -1501,7 +1493,7 @@ mod tests {
         let output = graph.add_tensor_concrete("y", &[4, 8], DType::F32);
         graph.inputs.push(input);
         graph.outputs.push(output);
-        graph.add_op(OpKind::Silu, vec![input], vec![output], "silu");
+        graph.add_op_with_op(Op::Silu, OpKind::Silu, vec![input], vec![output], "silu");
 
         let registry = ScalarOpRegistry::with_defaults();
         // Act
@@ -1521,9 +1513,9 @@ mod tests {
         let t1 = graph.add_tensor_concrete("t1", &[4], DType::F32);
         let t2 = graph.add_tensor_concrete("t2", &[4], DType::F32);
         let t3 = graph.add_tensor_concrete("t3", &[4], DType::F32);
-        graph.add_op(OpKind::Tanh, vec![t0], vec![t1], "a");
-        graph.add_op(OpKind::Silu, vec![t1], vec![t2], "b");
-        graph.add_op(OpKind::Gelu, vec![t2], vec![t3], "c");
+        graph.add_op_with_op(Op::Tanh, OpKind::Tanh, vec![t0], vec![t1], "a");
+        graph.add_op_with_op(Op::Silu, OpKind::Silu, vec![t1], vec![t2], "b");
+        graph.add_op_with_op(Op::Gelu, OpKind::Gelu, vec![t2], vec![t3], "c");
 
         let registry = ScalarOpRegistry::with_defaults();
         // Act
@@ -1545,8 +1537,8 @@ mod tests {
         let a1 = graph.add_tensor_concrete("a1", &[4], DType::F32);
         let b0 = graph.add_tensor_concrete("b0", &[4], DType::F32);
         let b1 = graph.add_tensor_concrete("b1", &[4], DType::F32);
-        graph.add_op(OpKind::Tanh, vec![a0], vec![a1], "chain_a");
-        graph.add_op(OpKind::Silu, vec![b0], vec![b1], "chain_b");
+        graph.add_op_with_op(Op::Tanh, OpKind::Tanh, vec![a0], vec![a1], "chain_a");
+        graph.add_op_with_op(Op::Silu, OpKind::Silu, vec![b0], vec![b1], "chain_b");
 
         let registry = ScalarOpRegistry::with_defaults();
         // Act
@@ -1567,9 +1559,9 @@ mod tests {
         let branch_a = graph.add_tensor_concrete("a", &[4, 8], DType::F32);
         let branch_b = graph.add_tensor_concrete("b", &[4, 8], DType::F32);
         let merged = graph.add_tensor_concrete("out", &[4, 8], DType::F32);
-        graph.add_op(OpKind::Tanh, vec![input], vec![branch_a], "branch_a");
-        graph.add_op(OpKind::Silu, vec![input], vec![branch_b], "branch_b");
-        graph.add_op(OpKind::Add, vec![branch_a, branch_b], vec![merged], "merge");
+        graph.add_op_with_op(Op::Tanh, OpKind::Tanh, vec![input], vec![branch_a], "branch_a");
+        graph.add_op_with_op(Op::Silu, OpKind::Silu, vec![input], vec![branch_b], "branch_b");
+        graph.add_op_with_op(Op::Add, OpKind::Add, vec![branch_a, branch_b], vec![merged], "merge");
 
         let registry = ScalarOpRegistry::with_defaults();
         // Act
@@ -1594,8 +1586,7 @@ mod tests {
         let a = graph.add_tensor_concrete("A", &[16, 128], DType::F32);
         let b = graph.add_tensor_concrete("B", &[128, 64], DType::F32);
         let c = graph.add_tensor_concrete("C", &[16, 64], DType::F32);
-        graph.add_op(
-            OpKind::QuantGemm {
+        graph.add_op_with_op(Op::QuantGemm(QuantGemmSpec { m: SymDim::Concrete(16), n: 64, k: 128, quant_type: QuantType::Q4_0 }), OpKind::QuantGemm {
                 m: SymDim::Concrete(16),
                 n: 64,
                 k: 128,
@@ -1628,8 +1619,7 @@ mod tests {
         let b = graph.add_tensor_concrete("B", &[k, n], DType::F32);
         let bias = graph.add_tensor_concrete("bias", &[n], DType::F32);
         let c = graph.add_tensor_concrete("C", &[m, n], DType::F32);
-        graph.add_op(
-            OpKind::GemmBias { m: SymDim::Concrete(m), n, k, dtype: DType::F32, trans_b: false },
+        graph.add_op_with_op(Op::GemmBias(GemmSpec { m: SymDim::Concrete(m), n: n, k: k, dtype: DType::F32, trans_b: false, has_bias: true }), OpKind::GemmBias { m: SymDim::Concrete(m), n, k, dtype: DType::F32, trans_b: false },
             vec![a, b, bias],
             vec![c],
             "gemm_bias",
@@ -1654,7 +1644,7 @@ mod tests {
         let mut graph = CompilerGraph::new();
         let tin = graph.add_tensor_concrete("in", &[4], DType::F32);
         let tout = graph.add_tensor_concrete("out", &[4], DType::F32);
-        graph.add_op(OpKind::Silu, vec![tin], vec![tout], "silu");
+        graph.add_op_with_op(Op::Silu, OpKind::Silu, vec![tin], vec![tout], "silu");
         let registry = ScalarOpRegistry::with_defaults();
         // Act
         let dag = SemanticDAG::from_graph(&graph, &registry);
@@ -1668,7 +1658,7 @@ mod tests {
         let mut graph = CompilerGraph::new();
         let tin = graph.add_tensor_concrete("in", &[4], DType::F32);
         let tout = graph.add_tensor_concrete("out", &[4], DType::F32);
-        graph.add_op(OpKind::Silu, vec![tin], vec![tout], "silu");
+        graph.add_op_with_op(Op::Silu, OpKind::Silu, vec![tin], vec![tout], "silu");
         let registry = ScalarOpRegistry::new(); // empty registry
         // Act
         let dag = SemanticDAG::from_graph(&graph, &registry);
@@ -1709,8 +1699,7 @@ mod tests {
         let input = graph.add_tensor_concrete("x", &[2, 4], DType::F32);
         let weight = graph.add_tensor_concrete("w", &[4], DType::F32);
         let output = graph.add_tensor_concrete("y", &[2, 4], DType::F32);
-        let op_id = graph.add_op(
-            OpKind::RmsNorm { feature_dim: 4096, eps: 1e-6 },
+        let op_id = graph.add_op_with_op(Op::RmsNorm(NormSpec { feature_dim: 4096, eps: 1e-6, dtype: DType::F32, has_weight: true }), OpKind::RmsNorm { feature_dim: 4096, eps: 1e-6 },
             vec![input, weight],
             vec![output],
             "norm",
@@ -1747,10 +1736,9 @@ mod tests {
 
         let w = graph.add_tensor_concrete("w", &[4, 8], DType::F32);
 
-        graph.add_op(OpKind::Silu, vec![x], vec![y], "silu");
-        graph.add_op(OpKind::Tanh, vec![y], vec![z], "tanh");
-        graph.add_op(
-            OpKind::Gemm { m: SymDim::Concrete(512), n: 1024, k: 512, dtype: DType::F32, trans_b: false },
+        graph.add_op_with_op(Op::Silu, OpKind::Silu, vec![x], vec![y], "silu");
+        graph.add_op_with_op(Op::Tanh, OpKind::Tanh, vec![y], vec![z], "tanh");
+        graph.add_op_with_op(Op::Gemm(GemmSpec { m: SymDim::Concrete(512), n: 1024, k: 512, dtype: DType::F32, trans_b: false, has_bias: false }), OpKind::Gemm { m: SymDim::Concrete(512), n: 1024, k: 512, dtype: DType::F32, trans_b: false },
             vec![a, b],
             vec![c],
             "gemm",
@@ -1771,13 +1759,12 @@ mod tests {
 
         let x = graph.add_tensor_concrete("x", &[4, 8], DType::F32);
         let y = graph.add_tensor_concrete("y", &[4, 8], DType::F32);
-        graph.add_op(OpKind::Silu, vec![x], vec![y], "silu");
+        graph.add_op_with_op(Op::Silu, OpKind::Silu, vec![x], vec![y], "silu");
 
         let a1 = graph.add_tensor_concrete("A1", &[512, 512], DType::F32);
         let b1 = graph.add_tensor_concrete("B1", &[512, 1024], DType::F32);
         let c1 = graph.add_tensor_concrete("C1", &[512, 1024], DType::F32);
-        graph.add_op(
-            OpKind::Gemm { m: SymDim::Concrete(512), n: 1024, k: 512, dtype: DType::F32, trans_b: false },
+        graph.add_op_with_op(Op::Gemm(GemmSpec { m: SymDim::Concrete(512), n: 1024, k: 512, dtype: DType::F32, trans_b: false, has_bias: false }), OpKind::Gemm { m: SymDim::Concrete(512), n: 1024, k: 512, dtype: DType::F32, trans_b: false },
             vec![a1, b1],
             vec![c1],
             "gemm1",
@@ -1786,8 +1773,7 @@ mod tests {
         let a2 = graph.add_tensor_concrete("A2", &[512, 512], DType::F32);
         let b2 = graph.add_tensor_concrete("B2", &[512, 1024], DType::F32);
         let c2 = graph.add_tensor_concrete("C2", &[512, 1024], DType::F32);
-        graph.add_op(
-            OpKind::Gemm { m: SymDim::Concrete(512), n: 1024, k: 512, dtype: DType::F32, trans_b: false },
+        graph.add_op_with_op(Op::Gemm(GemmSpec { m: SymDim::Concrete(512), n: 1024, k: 512, dtype: DType::F32, trans_b: false, has_bias: false }), OpKind::Gemm { m: SymDim::Concrete(512), n: 1024, k: 512, dtype: DType::F32, trans_b: false },
             vec![a2, b2],
             vec![c2],
             "gemm2",
@@ -1812,8 +1798,7 @@ mod tests {
         let input = graph.add_tensor_concrete("x", &[2, 32], DType::F32);
         let weight = graph.add_tensor_concrete("w", &[32], DType::F32);
         let output = graph.add_tensor_concrete("y", &[2, 32], DType::F32);
-        graph.add_op(
-            OpKind::RmsNorm { feature_dim: 4096, eps: 1e-5 },
+        graph.add_op_with_op(Op::RmsNorm(NormSpec { feature_dim: 4096, eps: 1e-5, dtype: DType::F32, has_weight: true }), OpKind::RmsNorm { feature_dim: 4096, eps: 1e-5 },
             vec![input, weight],
             vec![output],
             "rms_norm",
@@ -1858,7 +1843,7 @@ mod tests {
         let a = graph.add_tensor_concrete("a", &[1, 1], DType::F32);
         let b = graph.add_tensor_concrete("b", &[1, 1], DType::F32);
         let c = graph.add_tensor_concrete("c", &[1, 1], DType::F32);
-        graph.add_op(OpKind::Mul, vec![a, b], vec![c], "mul");
+        graph.add_op_with_op(Op::Mul, OpKind::Mul, vec![a, b], vec![c], "mul");
 
         let registry = ScalarOpRegistry::with_defaults();
         let dag = SemanticDAG::from_graph(&graph, &registry);
@@ -1881,9 +1866,9 @@ mod tests {
         let y = graph.add_tensor_concrete("y", &[4, 32], DType::F32);
         let z = graph.add_tensor_concrete("z", &[4, 32], DType::F32);
         let w = graph.add_tensor_concrete("w", &[4, 32], DType::F32);
-        graph.add_op(OpKind::Silu, vec![x], vec![y], "silu1");
-        graph.add_op(OpKind::Silu, vec![y], vec![z], "silu2");
-        graph.add_op(OpKind::Silu, vec![z], vec![w], "silu3");
+        graph.add_op_with_op(Op::Silu, OpKind::Silu, vec![x], vec![y], "silu1");
+        graph.add_op_with_op(Op::Silu, OpKind::Silu, vec![y], vec![z], "silu2");
+        graph.add_op_with_op(Op::Silu, OpKind::Silu, vec![z], vec![w], "silu3");
 
         let registry = ScalarOpRegistry::with_defaults();
         let dag = SemanticDAG::from_graph(&graph, &registry);
@@ -1905,7 +1890,7 @@ mod tests {
         let mut graph = CompilerGraph::new();
         let input = graph.add_tensor_concrete("x", &[8, 16], DType::F32);
         let output = graph.add_tensor_concrete("y", &[8, 16], DType::F32);
-        graph.add_op(OpKind::Gelu, vec![input], vec![output], "gelu");
+        graph.add_op_with_op(Op::Gelu, OpKind::Gelu, vec![input], vec![output], "gelu");
         let registry = ScalarOpRegistry::with_defaults();
         // Act
         let dag = SemanticDAG::from_graph(&graph, &registry);
@@ -1932,7 +1917,7 @@ mod tests {
         let a = graph.add_tensor_concrete("a", &[4, 16], DType::F32);
         let b = graph.add_tensor_concrete("b", &[4, 16], DType::F32);
         let out = graph.add_tensor_concrete("out", &[4, 16], DType::F32);
-        graph.add_op(OpKind::Residual, vec![a, b], vec![out], "residual");
+        graph.add_op_with_op(Op::Residual, OpKind::Residual, vec![a, b], vec![out], "residual");
         let registry = ScalarOpRegistry::with_defaults();
         // Act
         let dag = SemanticDAG::from_graph(&graph, &registry);
@@ -1956,9 +1941,9 @@ mod tests {
         let t1 = graph.add_tensor_concrete("t1", &[4], DType::F32);
         let t2 = graph.add_tensor_concrete("t2", &[4], DType::F32);
         let t3 = graph.add_tensor_concrete("t3", &[4], DType::F32);
-        let op0 = graph.add_op(OpKind::Silu, vec![t0], vec![t1], "op0");
-        let op1 = graph.add_op(OpKind::Gelu, vec![t1], vec![t2], "op1");
-        let op2 = graph.add_op(OpKind::Tanh, vec![t2], vec![t3], "op2");
+        let op0 = graph.add_op_with_op(Op::Silu, OpKind::Silu, vec![t0], vec![t1], "op0");
+        let op1 = graph.add_op_with_op(Op::Gelu, OpKind::Gelu, vec![t1], vec![t2], "op1");
+        let op2 = graph.add_op_with_op(Op::Tanh, OpKind::Tanh, vec![t2], vec![t3], "op2");
         let registry = ScalarOpRegistry::with_defaults();
         // Act
         let dag = SemanticDAG::from_graph(&graph, &registry);
@@ -1980,7 +1965,7 @@ mod tests {
         let mut graph = CompilerGraph::new();
         let input = graph.add_tensor_concrete("x", &[8, 16], DType::F32);
         let output = graph.add_tensor_concrete("y", &[8, 16], DType::F32);
-        graph.add_op(OpKind::Silu, vec![input], vec![output], "silu");
+        graph.add_op_with_op(Op::Silu, OpKind::Silu, vec![input], vec![output], "silu");
         let registry = ScalarOpRegistry::with_defaults();
         // Act
         let dag = SemanticDAG::from_graph(&graph, &registry);
@@ -2002,10 +1987,10 @@ mod tests {
         let c = graph.add_tensor_concrete("c", &[4], DType::F32);
         let d = graph.add_tensor_concrete("d", &[4], DType::F32);
         let sm = graph.add_tensor_concrete("sm", &[4], DType::F32);
-        graph.add_op(OpKind::Silu, vec![a], vec![b], "silu");
-        graph.add_op(OpKind::Tanh, vec![b], vec![c], "tanh");
-        graph.add_op(OpKind::Gelu, vec![c], vec![d], "gelu");
-        graph.add_op(OpKind::Softmax, vec![d], vec![sm], "softmax");
+        graph.add_op_with_op(Op::Silu, OpKind::Silu, vec![a], vec![b], "silu");
+        graph.add_op_with_op(Op::Tanh, OpKind::Tanh, vec![b], vec![c], "tanh");
+        graph.add_op_with_op(Op::Gelu, OpKind::Gelu, vec![c], vec![d], "gelu");
+        graph.add_op_with_op(Op::Softmax, OpKind::Softmax, vec![d], vec![sm], "softmax");
 
         let registry = ScalarOpRegistry::with_defaults();
         let dag = SemanticDAG::from_graph(&graph, &registry);
@@ -2046,8 +2031,8 @@ mod tests {
         let a = graph.add_tensor_concrete("a", &[4, 8], DType::F32);
         let b = graph.add_tensor_concrete("b", &[4, 8], DType::F32);
         let c = graph.add_tensor_concrete("c", &[4, 8], DType::F32);
-        graph.add_op(OpKind::Silu, vec![a], vec![b], "silu");
-        graph.add_op(OpKind::Tanh, vec![b], vec![c], "tanh");
+        graph.add_op_with_op(Op::Silu, OpKind::Silu, vec![a], vec![b], "silu");
+        graph.add_op_with_op(Op::Tanh, OpKind::Tanh, vec![b], vec![c], "tanh");
 
         let registry = ScalarOpRegistry::with_defaults();
         let dag = SemanticDAG::from_graph(&graph, &registry);
