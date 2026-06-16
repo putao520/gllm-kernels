@@ -1,7 +1,7 @@
 //! Fusion cost model — roofline-based benefit estimation.
 
 use std::collections::HashSet;
-use crate::compiler::graph::{CompilerGraph, CompilerOp, OpKind, OpId};
+use crate::compiler::graph::{CompilerGraph, CompilerOp, Op, OpKind, OpId};
 use crate::compiler::trace::{OpTrace, TraceOp, ComputePattern, ScalarParam};
 use crate::types::DType;
 use crate::compiler::pain_point::OpBottleneckMap;
@@ -189,10 +189,10 @@ pub fn estimate_fusion_cost(
         FusionMode::TileLevelFusion { tile_rows, .. } => {
             // Scratch = tile_rows x K x elem_bytes for the tiled norm output
             let k = group.ops.iter().find_map(|&oid| {
-                graph.op(oid).and_then(|o| match &o.kind {
-                    OpKind::Gemm { k, .. }
-                    | OpKind::GemmBias { k, .. }
-                    | OpKind::QuantGemm { k, .. } => Some(*k),
+                graph.op(oid).and_then(|o| match &o.op_v2 {
+                    Op::Gemm(spec)
+                    | Op::GemmBias(spec) => Some(spec.k),
+                    Op::QuantGemm(spec) => Some(spec.k),
                     _ => None,
                 })
             }).unwrap_or(0);
