@@ -1666,15 +1666,15 @@ mod tests {
             "gemm",
         );
 
-        let gemm_op = CompilerOp {
-            kind: OpKind::Gemm { m: SymDim::Concrete(1), n: 4, k: 4, dtype: DType::F32, trans_b: false },
-            inputs: vec![a, w],
-            outputs: vec![],
-            label: "empty_gemm".into(),
-            id: gemm,
-    guard: LayerCondition::Always,
-            op_v2: None,
-        };
+        let gemm_op = CompilerOp::new_from_kind(
+            gemm,
+            OpKind::Gemm { m: SymDim::Concrete(1), n: 4, k: 4, dtype: DType::F32, trans_b: false },
+            vec![a, w],
+            vec![],
+            "empty_gemm",
+            LayerCondition::Always,
+            &g,
+        );
         let claimed = HashSet::new();
 
         let result = try_collect_reduction_epilogue(&g, &gemm_op, &[], &claimed, None);

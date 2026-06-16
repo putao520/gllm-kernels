@@ -1838,21 +1838,21 @@ mod tests {
 
         let mut graph = CompilerGraph::new();
         // Add a Gemm with no inputs (edge case)
-        let op_node = CompilerOp {
-            id: OpId(0),
-            kind: OpKind::Gemm {
+        let op_node = CompilerOp::new_from_kind(
+            OpId(0),
+            OpKind::Gemm {
                 m: SymDim::Concrete(1),
                 n: 64,
                 k: 64,
                 dtype: DType::F32,
                 trans_b: false,
             },
-            inputs: vec![], // no inputs
-            outputs: vec![],
-            label: "orphan_gemm".to_string(),
-    guard: LayerCondition::Always,
-            op_v2: None,
-        };
+            vec![], // no inputs
+            vec![],
+            "orphan_gemm",
+            LayerCondition::Always,
+            &graph,
+        );
         graph.ops.push(op_node);
         let op_id = OpId(0);
 

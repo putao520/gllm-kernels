@@ -287,14 +287,14 @@ pub(super) fn emit_fusion_groups(
         // duplicate instructions with WRONG ABI parameters (CompiledLayerFn offsets
         // instead of MegaKernelFn offsets), causing memory corruption and wrong
         // control flow.
-        // 从 Op（胖 opcode）识别采样 op — 优先 op_v2 缓存。
+        // OE-3: op_v2 必填，直接读缓存识别采样 op。
         let is_sampling_op = matches!(
-            anchor_op.op_v2.clone().or_else(|| crate::compiler::graph::Op::from_op_kind(anchor_op, graph)),
-            Some(crate::compiler::graph::Op::Argmax { .. })
-            | Some(crate::compiler::graph::Op::StoreToken)
-            | Some(crate::compiler::graph::Op::CheckStopCondition)
-            | Some(crate::compiler::graph::Op::WriteLogits { .. })
-            | Some(crate::compiler::graph::Op::MtpDraft { .. })
+            &anchor_op.op_v2,
+            crate::compiler::graph::Op::Argmax { .. }
+            | crate::compiler::graph::Op::StoreToken
+            | crate::compiler::graph::Op::CheckStopCondition
+            | crate::compiler::graph::Op::WriteLogits { .. }
+            | crate::compiler::graph::Op::MtpDraft { .. }
         );
         if is_sampling_op {
             continue;
@@ -765,10 +765,10 @@ pub(super) fn emit_fusion_groups(
                 if let Ok((m_dim, n, k)) = extract_gemm_dims_sym(op, graph) {
                     let out_ptr = load_op_scratch_ptr(prog, scratch_base, op, alloc, resolver, current_abi)?;
                     let pm = ctx.pack_map_for_gemm(op.inputs.get(1).copied());
-                    // 从 Op（胖 opcode）读取 trans_b — 优先 op_v2 缓存。
-                    let trans_b = match op.op_v2.clone().or_else(|| crate::compiler::graph::Op::from_op_kind(op, graph)) {
-                        Some(crate::compiler::graph::Op::Gemm(spec))
-                        | Some(crate::compiler::graph::Op::GemmBias(spec)) => spec.trans_b,
+                    // OE-3: op_v2 必填，直接读 trans_b。
+                    let trans_b = match &op.op_v2 {
+                        crate::compiler::graph::Op::Gemm(spec)
+                        | crate::compiler::graph::Op::GemmBias(spec) => spec.trans_b,
                         _ => false,
                     };
                     prog.emit_scope(|p| -> Result<(), CompilerError> {

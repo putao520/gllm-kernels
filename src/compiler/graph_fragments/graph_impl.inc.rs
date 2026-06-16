@@ -78,7 +78,8 @@ impl CompilerGraph {
         }
 
         // FAT-OPCODE-ARCHITECTURE-V2 §Phase 9: 构造临时 CompilerOp 用于 op_v2 翻译。
-        // 翻译完成后 op_v2 字段填充，最终存入 self.ops。
+        // OE-3 必填化：先用占位 Op 翻译，再回填字段（避免 self-borrow）。
+        let placeholder_op = crate::compiler::graph::Op::Silu; // 占位，下方立即覆盖
         let temp = CompilerOp {
             id,
             kind: kind.clone(),
@@ -86,9 +87,10 @@ impl CompilerGraph {
             outputs: outputs.clone(),
             label: label.to_string(),
             guard: LayerCondition::Always,
-            op_v2: None,
+            op_v2: placeholder_op,
         };
-        let op_v2 = crate::compiler::graph::Op::from_op_kind(&temp, self);
+        let op_v2 = crate::compiler::graph::Op::from_op_kind(&temp, self)
+            .unwrap_or_else(|| panic!("OpKind {:?} has no Op mapping (OE-3 invariant)", kind));
         let mut final_op = temp;
         final_op.op_v2 = op_v2;
         self.ops.push(final_op);
@@ -130,7 +132,7 @@ impl CompilerGraph {
             outputs: outputs.clone(),
             label: label.to_string(),
             guard: LayerCondition::Always,
-            op_v2: Some(op),
+            op_v2: op,
         };
         self.ops.push(final_op);
         id
@@ -161,6 +163,8 @@ impl CompilerGraph {
             }
         }
 
+        // OE-3 必填化：占位 + 翻译 + 回填（避免 self-borrow）。
+        let placeholder_op = crate::compiler::graph::Op::Silu;
         let temp = CompilerOp {
             id,
             kind: kind.clone(),
@@ -168,9 +172,10 @@ impl CompilerGraph {
             outputs: outputs.clone(),
             label: label.to_string(),
             guard,
-            op_v2: None,
+            op_v2: placeholder_op,
         };
-        let op_v2 = crate::compiler::graph::Op::from_op_kind(&temp, self);
+        let op_v2 = crate::compiler::graph::Op::from_op_kind(&temp, self)
+            .unwrap_or_else(|| panic!("OpKind {:?} has no Op mapping (OE-3 invariant)", kind));
         let mut final_op = temp;
         final_op.op_v2 = op_v2;
         self.ops.push(final_op);
@@ -211,7 +216,7 @@ impl CompilerGraph {
             outputs: outputs.clone(),
             label: label.to_string(),
             guard,
-            op_v2: Some(op),
+            op_v2: op,
         };
         self.ops.push(final_op);
         id

@@ -727,20 +727,15 @@ mod tests {
     // ── Test 1: extract_quant_type returns Some for QuantGemm ──
     #[test]
     fn test_extract_quant_type_quant_gemm() {
-        let op = CompilerOp {
-            id: OpId(0),
-            kind: OpKind::QuantGemm {
-                m: SymDim::Concrete(1),
-                n: 512,
-                k: 256,
-                quant_type: QuantType::Q4_0,
-            },
-            inputs: vec![],
-            outputs: vec![],
-            label: "qgemm".to_string(),
-    guard: LayerCondition::Always,
-            op_v2: None,
-        };
+        let op = CompilerOp::new_from_kind(
+            OpId(0),
+            OpKind::QuantGemm { m: SymDim::Concrete(1), n: 512, k: 256, quant_type: QuantType::Q4_0, },
+            vec![],
+            vec![],
+            "qgemm".to_string(),
+            LayerCondition::Always,
+            &CompilerGraph::new(),
+        );
         let g = CompilerGraph::new();
         let result = extract_quant_type(&op, &g);
         assert_eq!(result, Some(QuantType::Q4_0));
@@ -749,21 +744,15 @@ mod tests {
     // ── Test 2: extract_quant_type returns None for plain Gemm ──
     #[test]
     fn test_extract_quant_type_plain_gemm_returns_none() {
-        let op = CompilerOp {
-            id: OpId(0),
-            kind: OpKind::Gemm {
-                m: SymDim::Concrete(64),
-                n: 512,
-                k: 256,
-                dtype: DType::F32,
-                trans_b: false,
-            },
-            inputs: vec![],
-            outputs: vec![],
-            label: "gemm".to_string(),
-    guard: LayerCondition::Always,
-            op_v2: None,
-        };
+        let op = CompilerOp::new_from_kind(
+            OpId(0),
+            OpKind::Gemm { m: SymDim::Concrete(64), n: 512, k: 256, dtype: DType::F32, trans_b: false, },
+            vec![],
+            vec![],
+            "gemm".to_string(),
+            LayerCondition::Always,
+            &CompilerGraph::new(),
+        );
         let g = CompilerGraph::new();
         let result = extract_quant_type(&op, &g);
         assert!(result.is_none());
@@ -772,34 +761,24 @@ mod tests {
     // ── Test 3: all_gemm_quant_compatible with same quant types ──
     #[test]
     fn test_all_gemm_quant_compatible_same_quant() {
-        let op1 = CompilerOp {
-            id: OpId(0),
-            kind: OpKind::QuantGemm {
-                m: SymDim::Concrete(1),
-                n: 512,
-                k: 256,
-                quant_type: QuantType::Q4_0,
-            },
-            inputs: vec![],
-            outputs: vec![],
-            label: "qgemm1".to_string(),
-    guard: LayerCondition::Always,
-            op_v2: None,
-        };
-        let op2 = CompilerOp {
-            id: OpId(1),
-            kind: OpKind::QuantGemm {
-                m: SymDim::Concrete(1),
-                n: 512,
-                k: 256,
-                quant_type: QuantType::Q4_0,
-            },
-            inputs: vec![],
-            outputs: vec![],
-            label: "qgemm2".to_string(),
-    guard: LayerCondition::Always,
-            op_v2: None,
-        };
+        let op1 = CompilerOp::new_from_kind(
+            OpId(0),
+            OpKind::QuantGemm { m: SymDim::Concrete(1), n: 512, k: 256, quant_type: QuantType::Q4_0, },
+            vec![],
+            vec![],
+            "qgemm1".to_string(),
+            LayerCondition::Always,
+            &CompilerGraph::new(),
+        );
+        let op2 = CompilerOp::new_from_kind(
+            OpId(1),
+            OpKind::QuantGemm { m: SymDim::Concrete(1), n: 512, k: 256, quant_type: QuantType::Q4_0, },
+            vec![],
+            vec![],
+            "qgemm2".to_string(),
+            LayerCondition::Always,
+            &CompilerGraph::new(),
+        );
         let ops: Vec<&CompilerOp> = vec![&op1, &op2];
         assert!({ let g = CompilerGraph::new(); all_gemm_quant_compatible(&ops, &g) });
     }
@@ -807,34 +786,24 @@ mod tests {
     // ── Test 4: all_gemm_quant_compatible with incompatible quant types returns false ──
     #[test]
     fn test_all_gemm_quant_compatible_incompatible_types() {
-        let op1 = CompilerOp {
-            id: OpId(0),
-            kind: OpKind::QuantGemm {
-                m: SymDim::Concrete(1),
-                n: 512,
-                k: 256,
-                quant_type: QuantType::Q4_0,
-            },
-            inputs: vec![],
-            outputs: vec![],
-            label: "qgemm1".to_string(),
-    guard: LayerCondition::Always,
-            op_v2: None,
-        };
-        let op2 = CompilerOp {
-            id: OpId(1),
-            kind: OpKind::QuantGemm {
-                m: SymDim::Concrete(1),
-                n: 512,
-                k: 256,
-                quant_type: QuantType::Q6K,
-            },
-            inputs: vec![],
-            outputs: vec![],
-            label: "qgemm2".to_string(),
-    guard: LayerCondition::Always,
-            op_v2: None,
-        };
+        let op1 = CompilerOp::new_from_kind(
+            OpId(0),
+            OpKind::QuantGemm { m: SymDim::Concrete(1), n: 512, k: 256, quant_type: QuantType::Q4_0, },
+            vec![],
+            vec![],
+            "qgemm1".to_string(),
+            LayerCondition::Always,
+            &CompilerGraph::new(),
+        );
+        let op2 = CompilerOp::new_from_kind(
+            OpId(1),
+            OpKind::QuantGemm { m: SymDim::Concrete(1), n: 512, k: 256, quant_type: QuantType::Q6K, },
+            vec![],
+            vec![],
+            "qgemm2".to_string(),
+            LayerCondition::Always,
+            &CompilerGraph::new(),
+        );
         let ops: Vec<&CompilerOp> = vec![&op1, &op2];
         // Q4_0 and Q6K are different quant types -> Split -> not compatible
         assert!(!{ let g = CompilerGraph::new(); all_gemm_quant_compatible(&ops, &g) });
@@ -1064,21 +1033,15 @@ mod tests {
     #[test]
     fn test_extract_quant_type_gemm_bias_returns_none() {
         // Arrange
-        let op = CompilerOp {
-            id: OpId(0),
-            kind: OpKind::GemmBias {
-                m: SymDim::Concrete(32),
-                n: 128,
-                k: 64,
-                dtype: DType::F32,
-                trans_b: false,
-            },
-            inputs: vec![],
-            outputs: vec![],
-            label: "gemm_bias".to_string(),
-    guard: LayerCondition::Always,
-            op_v2: None,
-        };
+        let op = CompilerOp::new_from_kind(
+            OpId(0),
+            OpKind::GemmBias { m: SymDim::Concrete(32), n: 128, k: 64, dtype: DType::F32, trans_b: false, },
+            vec![],
+            vec![],
+            "gemm_bias".to_string(),
+            LayerCondition::Always,
+            &CompilerGraph::new(),
+        );
         // Act
         let g = CompilerGraph::new();
         let result = extract_quant_type(&op, &g);
@@ -1091,15 +1054,15 @@ mod tests {
     #[test]
     fn test_extract_quant_type_non_gemm_op() {
         // Arrange
-        let op = CompilerOp {
-            id: OpId(0),
-            kind: OpKind::Silu,
-            inputs: vec![],
-            outputs: vec![],
-            label: "silu".to_string(),
-    guard: LayerCondition::Always,
-            op_v2: None,
-        };
+        let op = CompilerOp::new_from_kind(
+            OpId(0),
+            OpKind::Silu,
+            vec![],
+            vec![],
+            "silu".to_string(),
+            LayerCondition::Always,
+            &CompilerGraph::new(),
+        );
         // Act
         let g = CompilerGraph::new();
         let result = extract_quant_type(&op, &g);
@@ -1113,35 +1076,24 @@ mod tests {
     fn test_all_gemm_quant_compatible_mixed_quant_and_plain() {
         // Arrange: one QuantGemm (Q4_0) and one plain Gemm (no quant)
         // QuantGemm output is always F32 after dequant, so QuantGemm -> plain ElemWise is Fuse
-        let op1 = CompilerOp {
-            id: OpId(0),
-            kind: OpKind::QuantGemm {
-                m: SymDim::Concrete(1),
-                n: 512,
-                k: 256,
-                quant_type: QuantType::Q4_0,
-            },
-            inputs: vec![],
-            outputs: vec![],
-            label: "qgemm".to_string(),
-    guard: LayerCondition::Always,
-            op_v2: None,
-        };
-        let op2 = CompilerOp {
-            id: OpId(1),
-            kind: OpKind::Gemm {
-                m: SymDim::Concrete(1),
-                n: 512,
-                k: 256,
-                dtype: DType::F32,
-                trans_b: false,
-            },
-            inputs: vec![],
-            outputs: vec![],
-            label: "plain_gemm".to_string(),
-    guard: LayerCondition::Always,
-            op_v2: None,
-        };
+        let op1 = CompilerOp::new_from_kind(
+            OpId(0),
+            OpKind::QuantGemm { m: SymDim::Concrete(1), n: 512, k: 256, quant_type: QuantType::Q4_0, },
+            vec![],
+            vec![],
+            "qgemm".to_string(),
+            LayerCondition::Always,
+            &CompilerGraph::new(),
+        );
+        let op2 = CompilerOp::new_from_kind(
+            OpId(1),
+            OpKind::Gemm { m: SymDim::Concrete(1), n: 512, k: 256, dtype: DType::F32, trans_b: false, },
+            vec![],
+            vec![],
+            "plain_gemm".to_string(),
+            LayerCondition::Always,
+            &CompilerGraph::new(),
+        );
         let ops: Vec<&CompilerOp> = vec![&op1, &op2];
         // Act
         let compatible = { let g = CompilerGraph::new(); all_gemm_quant_compatible(&ops, &g) };
@@ -1154,20 +1106,15 @@ mod tests {
     #[test]
     fn test_all_gemm_quant_compatible_single_op() {
         // Arrange: only one op in the list, no pair to compare
-        let op = CompilerOp {
-            id: OpId(0),
-            kind: OpKind::QuantGemm {
-                m: SymDim::Concrete(1),
-                n: 512,
-                k: 256,
-                quant_type: QuantType::Q4_0,
-            },
-            inputs: vec![],
-            outputs: vec![],
-            label: "qgemm".to_string(),
-    guard: LayerCondition::Always,
-            op_v2: None,
-        };
+        let op = CompilerOp::new_from_kind(
+            OpId(0),
+            OpKind::QuantGemm { m: SymDim::Concrete(1), n: 512, k: 256, quant_type: QuantType::Q4_0, },
+            vec![],
+            vec![],
+            "qgemm".to_string(),
+            LayerCondition::Always,
+            &CompilerGraph::new(),
+        );
         let ops: Vec<&CompilerOp> = vec![&op];
         // Act
         let compatible = { let g = CompilerGraph::new(); all_gemm_quant_compatible(&ops, &g) };
@@ -1737,36 +1684,33 @@ mod tests {
     #[test]
     fn test_all_gemm_quant_compatible_three_ops_same() {
         // Arrange: 3 QuantGemm ops all using Q4_0
-        let op1 = CompilerOp {
-            id: OpId(0),
-            kind: OpKind::QuantGemm {
-                m: SymDim::Concrete(1), n: 256, k: 128,
-                quant_type: QuantType::Q4_0,
-            },
-            inputs: vec![], outputs: vec![], label: "q1".to_string(),
-    guard: LayerCondition::Always,
-            op_v2: None,
-        };
-        let op2 = CompilerOp {
-            id: OpId(1),
-            kind: OpKind::QuantGemm {
-                m: SymDim::Concrete(1), n: 256, k: 128,
-                quant_type: QuantType::Q4_0,
-            },
-            inputs: vec![], outputs: vec![], label: "q2".to_string(),
-    guard: LayerCondition::Always,
-            op_v2: None,
-        };
-        let op3 = CompilerOp {
-            id: OpId(2),
-            kind: OpKind::QuantGemm {
-                m: SymDim::Concrete(1), n: 256, k: 128,
-                quant_type: QuantType::Q4_0,
-            },
-            inputs: vec![], outputs: vec![], label: "q3".to_string(),
-    guard: LayerCondition::Always,
-            op_v2: None,
-        };
+        let op1 = CompilerOp::new_from_kind(
+            OpId(0),
+            OpKind::QuantGemm { m: SymDim::Concrete(1), n: 256, k: 128, quant_type: QuantType::Q4_0, },
+            vec![],
+            vec![],
+            "q1".to_string(),
+            LayerCondition::Always,
+            &CompilerGraph::new(),
+        );
+        let op2 = CompilerOp::new_from_kind(
+            OpId(1),
+            OpKind::QuantGemm { m: SymDim::Concrete(1), n: 256, k: 128, quant_type: QuantType::Q4_0, },
+            vec![],
+            vec![],
+            "q2".to_string(),
+            LayerCondition::Always,
+            &CompilerGraph::new(),
+        );
+        let op3 = CompilerOp::new_from_kind(
+            OpId(2),
+            OpKind::QuantGemm { m: SymDim::Concrete(1), n: 256, k: 128, quant_type: QuantType::Q4_0, },
+            vec![],
+            vec![],
+            "q3".to_string(),
+            LayerCondition::Always,
+            &CompilerGraph::new(),
+        );
         let ops: Vec<&CompilerOp> = vec![&op1, &op2, &op3];
         // Act
         let compatible = { let g = CompilerGraph::new(); all_gemm_quant_compatible(&ops, &g) };
@@ -1780,18 +1724,15 @@ mod tests {
     fn test_detect_norm_into_gemm_no_inputs() {
         // Arrange: a GEMM op with empty inputs vector
         let graph = CompilerGraph::new();
-        let op = CompilerOp {
-            id: OpId(0),
-            kind: OpKind::Gemm {
-                m: SymDim::Concrete(64), n: 512, k: 256,
-                dtype: DType::F32, trans_b: false,
-            },
-            inputs: vec![],
-            outputs: vec![],
-            label: "gemm_no_inputs".to_string(),
-    guard: LayerCondition::Always,
-            op_v2: None,
-        };
+        let op = CompilerOp::new_from_kind(
+            OpId(0),
+            OpKind::Gemm { m: SymDim::Concrete(64), n: 512, k: 256, dtype: DType::F32, trans_b: false, },
+            vec![],
+            vec![],
+            "gemm_no_inputs".to_string(),
+            LayerCondition::Always,
+            &CompilerGraph::new(),
+        );
         // Act
         let result = detect_norm_into_gemm(&graph, &op, None);
         // Assert: no first input -> returns None
@@ -1918,15 +1859,15 @@ mod tests {
     fn test_collect_epilogue_empty_outputs() {
         // Arrange: anchor op with empty outputs vector
         let graph = CompilerGraph::new();
-        let anchor = CompilerOp {
-            id: OpId(0),
-            kind: OpKind::Silu,
-            inputs: vec![],
-            outputs: vec![],
-            label: "empty_anchor".to_string(),
-    guard: LayerCondition::Always,
-            op_v2: None,
-        };
+        let anchor = CompilerOp::new_from_kind(
+            OpId(0),
+            OpKind::Silu,
+            vec![],
+            vec![],
+            "empty_anchor".to_string(),
+            LayerCondition::Always,
+            &CompilerGraph::new(),
+        );
         let claimed = HashSet::new();
         // Act
         let epilogue = collect_epilogue(&graph, &anchor, &claimed, None);
@@ -2038,15 +1979,15 @@ mod tests {
 
     #[test]
     fn test_extract_quant_type_non_gemm() {
-        let op = CompilerOp {
-            id: OpId(0),
-            kind: OpKind::Silu,
-            inputs: vec![],
-            outputs: vec![],
-            label: "silu".to_string(),
-    guard: LayerCondition::Always,
-            op_v2: None,
-        };
+        let op = CompilerOp::new_from_kind(
+            OpId(0),
+            OpKind::Silu,
+            vec![],
+            vec![],
+            "silu".to_string(),
+            LayerCondition::Always,
+            &CompilerGraph::new(),
+        );
         let g = CompilerGraph::new();
         assert!(extract_quant_type(&op, &g).is_none());
     }
@@ -2055,18 +1996,15 @@ mod tests {
 
     #[test]
     fn test_all_gemm_quant_compatible_single_plain_gemm() {
-        let op = CompilerOp {
-            id: OpId(0),
-            kind: OpKind::Gemm {
-                m: SymDim::Concrete(1), n: 64, k: 64,
-                dtype: DType::F32, trans_b: false,
-            },
-            inputs: vec![],
-            outputs: vec![],
-            label: "gemm".to_string(),
-    guard: LayerCondition::Always,
-            op_v2: None,
-        };
+        let op = CompilerOp::new_from_kind(
+            OpId(0),
+            OpKind::Gemm { m: SymDim::Concrete(1), n: 64, k: 64, dtype: DType::F32, trans_b: false, },
+            vec![],
+            vec![],
+            "gemm".to_string(),
+            LayerCondition::Always,
+            &CompilerGraph::new(),
+        );
         assert!({ let g = CompilerGraph::new(); all_gemm_quant_compatible(&[&op], &g) });
     }
 
@@ -2074,30 +2012,24 @@ mod tests {
 
     #[test]
     fn test_all_gemm_quant_compatible_mixed_none_and_quant() {
-        let op1 = CompilerOp {
-            id: OpId(0),
-            kind: OpKind::Gemm {
-                m: SymDim::Concrete(1), n: 64, k: 64,
-                dtype: DType::F32, trans_b: false,
-            },
-            inputs: vec![],
-            outputs: vec![],
-            label: "plain_gemm".to_string(),
-    guard: LayerCondition::Always,
-            op_v2: None,
-        };
-        let op2 = CompilerOp {
-            id: OpId(1),
-            kind: OpKind::QuantGemm {
-                m: SymDim::Concrete(1), n: 64, k: 64,
-                quant_type: QuantType::Q4_0,
-            },
-            inputs: vec![],
-            outputs: vec![],
-            label: "quant_gemm".to_string(),
-    guard: LayerCondition::Always,
-            op_v2: None,
-        };
+        let op1 = CompilerOp::new_from_kind(
+            OpId(0),
+            OpKind::Gemm { m: SymDim::Concrete(1), n: 64, k: 64, dtype: DType::F32, trans_b: false, },
+            vec![],
+            vec![],
+            "plain_gemm".to_string(),
+            LayerCondition::Always,
+            &CompilerGraph::new(),
+        );
+        let op2 = CompilerOp::new_from_kind(
+            OpId(1),
+            OpKind::QuantGemm { m: SymDim::Concrete(1), n: 64, k: 64, quant_type: QuantType::Q4_0, },
+            vec![],
+            vec![],
+            "quant_gemm".to_string(),
+            LayerCondition::Always,
+            &CompilerGraph::new(),
+        );
         // None vs Q4_0: depends on can_fuse_quant_aware(None, Some(Q4_0))
         let ops: Vec<&CompilerOp> = vec![&op1, &op2];
         // Should not panic
@@ -3133,15 +3065,15 @@ mod tests {
     fn test_collect_elementwise_chain_empty_outputs_start() {
         // Arrange: start op with no outputs -> chain should be empty
         let graph = CompilerGraph::new();
-        let start = CompilerOp {
-            id: OpId(0),
-            kind: OpKind::Silu,
-            inputs: vec![],
-            outputs: vec![],
-            label: "empty_start".to_string(),
-    guard: LayerCondition::Always,
-            op_v2: None,
-        };
+        let start = CompilerOp::new_from_kind(
+            OpId(0),
+            OpKind::Silu,
+            vec![],
+            vec![],
+            "empty_start".to_string(),
+            LayerCondition::Always,
+            &CompilerGraph::new(),
+        );
         let claimed = HashSet::new();
 
         // Act
@@ -3604,24 +3536,24 @@ mod tests {
     #[test]
     fn test_all_gemm_quant_compatible_q8_0_pair() {
         // Arrange: two QuantGemm ops both using Q8_0
-        let op1 = CompilerOp {
-            id: OpId(0),
-            kind: OpKind::QuantGemm {
-                m: SymDim::Concrete(1), n: 256, k: 128, quant_type: QuantType::Q8_0,
-            },
-            inputs: vec![], outputs: vec![], label: "q1".to_string(),
-    guard: LayerCondition::Always,
-            op_v2: None,
-        };
-        let op2 = CompilerOp {
-            id: OpId(1),
-            kind: OpKind::QuantGemm {
-                m: SymDim::Concrete(1), n: 256, k: 128, quant_type: QuantType::Q8_0,
-            },
-            inputs: vec![], outputs: vec![], label: "q2".to_string(),
-    guard: LayerCondition::Always,
-            op_v2: None,
-        };
+        let op1 = CompilerOp::new_from_kind(
+            OpId(0),
+            OpKind::QuantGemm { m: SymDim::Concrete(1), n: 256, k: 128, quant_type: QuantType::Q8_0, },
+            vec![],
+            vec![],
+            "q1".to_string(),
+            LayerCondition::Always,
+            &CompilerGraph::new(),
+        );
+        let op2 = CompilerOp::new_from_kind(
+            OpId(1),
+            OpKind::QuantGemm { m: SymDim::Concrete(1), n: 256, k: 128, quant_type: QuantType::Q8_0, },
+            vec![],
+            vec![],
+            "q2".to_string(),
+            LayerCondition::Always,
+            &CompilerGraph::new(),
+        );
         let ops: Vec<&CompilerOp> = vec![&op1, &op2];
         // Act
         let compatible = { let g = CompilerGraph::new(); all_gemm_quant_compatible(&ops, &g) };
@@ -3685,15 +3617,15 @@ mod tests {
     #[test]
     fn test_extract_quant_type_q4k() {
         // Arrange
-        let op = CompilerOp {
-            id: OpId(0),
-            kind: OpKind::QuantGemm {
-                m: SymDim::Concrete(1), n: 512, k: 256, quant_type: QuantType::Q4K,
-            },
-            inputs: vec![], outputs: vec![], label: "qgemm_q4k".to_string(),
-    guard: LayerCondition::Always,
-            op_v2: None,
-        };
+        let op = CompilerOp::new_from_kind(
+            OpId(0),
+            OpKind::QuantGemm { m: SymDim::Concrete(1), n: 512, k: 256, quant_type: QuantType::Q4K, },
+            vec![],
+            vec![],
+            "qgemm_q4k".to_string(),
+            LayerCondition::Always,
+            &CompilerGraph::new(),
+        );
         // Act
         let g = CompilerGraph::new();
         let result = extract_quant_type(&op, &g);
@@ -4043,24 +3975,24 @@ mod tests {
     fn test_all_gemm_quant_compatible_two_compatible_types() {
         // Arrange: two QuantGemm ops with Q4_0 and Q4K — these are both 4-bit
         // and may be compatible depending on can_fuse_quant_aware
-        let op1 = CompilerOp {
-            id: OpId(0),
-            kind: OpKind::QuantGemm {
-                m: SymDim::Concrete(1), n: 256, k: 128, quant_type: QuantType::Q4_0,
-            },
-            inputs: vec![], outputs: vec![], label: "q4_0".to_string(),
-    guard: LayerCondition::Always,
-            op_v2: None,
-        };
-        let op2 = CompilerOp {
-            id: OpId(1),
-            kind: OpKind::QuantGemm {
-                m: SymDim::Concrete(1), n: 256, k: 128, quant_type: QuantType::Q4K,
-            },
-            inputs: vec![], outputs: vec![], label: "q4k".to_string(),
-    guard: LayerCondition::Always,
-            op_v2: None,
-        };
+        let op1 = CompilerOp::new_from_kind(
+            OpId(0),
+            OpKind::QuantGemm { m: SymDim::Concrete(1), n: 256, k: 128, quant_type: QuantType::Q4_0, },
+            vec![],
+            vec![],
+            "q4_0".to_string(),
+            LayerCondition::Always,
+            &CompilerGraph::new(),
+        );
+        let op2 = CompilerOp::new_from_kind(
+            OpId(1),
+            OpKind::QuantGemm { m: SymDim::Concrete(1), n: 256, k: 128, quant_type: QuantType::Q4K, },
+            vec![],
+            vec![],
+            "q4k".to_string(),
+            LayerCondition::Always,
+            &CompilerGraph::new(),
+        );
         let ops: Vec<&CompilerOp> = vec![&op1, &op2];
 
         // Act
@@ -4240,15 +4172,15 @@ mod tests {
     #[test]
     fn test_extract_quant_type_q2k() {
         // Arrange
-        let op = CompilerOp {
-            id: OpId(0),
-            kind: OpKind::QuantGemm {
-                m: SymDim::Concrete(1), n: 256, k: 128, quant_type: QuantType::Q2K,
-            },
-            inputs: vec![], outputs: vec![], label: "qgemm_q2k".to_string(),
-    guard: LayerCondition::Always,
-            op_v2: None,
-        };
+        let op = CompilerOp::new_from_kind(
+            OpId(0),
+            OpKind::QuantGemm { m: SymDim::Concrete(1), n: 256, k: 128, quant_type: QuantType::Q2K, },
+            vec![],
+            vec![],
+            "qgemm_q2k".to_string(),
+            LayerCondition::Always,
+            &CompilerGraph::new(),
+        );
         // Act
         let g = CompilerGraph::new();
         let result = extract_quant_type(&op, &g);
@@ -4405,24 +4337,24 @@ mod tests {
     #[test]
     fn test_all_gemm_quant_compatible_two_gemm_bias() {
         // Arrange: two GemmBias ops (neither is QuantGemm, both extract None)
-        let op1 = CompilerOp {
-            id: OpId(0),
-            kind: OpKind::GemmBias {
-                m: SymDim::Concrete(64), n: 512, k: 256, dtype: DType::F32, trans_b: false,
-            },
-            inputs: vec![], outputs: vec![], label: "gemm_bias_1".to_string(),
-    guard: LayerCondition::Always,
-            op_v2: None,
-        };
-        let op2 = CompilerOp {
-            id: OpId(1),
-            kind: OpKind::GemmBias {
-                m: SymDim::Concrete(64), n: 512, k: 256, dtype: DType::F32, trans_b: false,
-            },
-            inputs: vec![], outputs: vec![], label: "gemm_bias_2".to_string(),
-    guard: LayerCondition::Always,
-            op_v2: None,
-        };
+        let op1 = CompilerOp::new_from_kind(
+            OpId(0),
+            OpKind::GemmBias { m: SymDim::Concrete(64), n: 512, k: 256, dtype: DType::F32, trans_b: false, },
+            vec![],
+            vec![],
+            "gemm_bias_1".to_string(),
+            LayerCondition::Always,
+            &CompilerGraph::new(),
+        );
+        let op2 = CompilerOp::new_from_kind(
+            OpId(1),
+            OpKind::GemmBias { m: SymDim::Concrete(64), n: 512, k: 256, dtype: DType::F32, trans_b: false, },
+            vec![],
+            vec![],
+            "gemm_bias_2".to_string(),
+            LayerCondition::Always,
+            &CompilerGraph::new(),
+        );
         let ops: Vec<&CompilerOp> = vec![&op1, &op2];
         // Act
         let compatible = { let g = CompilerGraph::new(); all_gemm_quant_compatible(&ops, &g) };

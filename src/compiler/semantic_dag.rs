@@ -129,16 +129,12 @@ impl SemanticDAG {
             // producers — downstream elementwise consumers must not be chained
             // into the same LoopFusion group (the anchor-only lower path would
             // silently drop them). Force Opaque in that case.
-            let op_class = match op.op_v2_resolved(graph) {
-                Some(Op::PatchEmbed { .. }) | Some(Op::DepthwiseConv1D { .. }) => OpClass::Opaque,
+            let op_class = match &op.op_v2 {
+                Op::PatchEmbed { .. } | Op::DepthwiseConv1D { .. } => OpClass::Opaque,
                 _ => op_trace
                     .as_ref()
                     .map(|t| Self::derive_op_class(&t.pattern))
-                    .unwrap_or_else(|| {
-                        // graph 层不依赖 semantic_dag OpClass，传递 Op v2 由本函数内部映射
-                        let op_v2 = op.op_v2_resolved(graph);
-                        Self::fallback_op_class_from_op(&op_v2, &op.kind)
-                    }),
+                    .unwrap_or_else(|| Self::fallback_op_class_from_op_v2(&op.op_v2)),
             };
 
             let (ai, bottleneck) = Self::compute_arithmetic_intensity(op, graph);
@@ -192,16 +188,7 @@ impl SemanticDAG {
     }
 
     /// Fallback classification when no OpTrace is available.
-    /// 胖 opcode 自描述 OpClass 分类（替代旧版 fallback_op_class）。
-    /// 优先使用 Op v2；Op v2 不可用时回退到 OpKind。
-    fn fallback_op_class_from_op(op_v2: &Option<Op>, kind: &OpKind) -> OpClass {
-        if let Some(o) = op_v2 {
-            return Self::fallback_op_class_from_op_v2(o);
-        }
-        // 兼容路径：测试 fixture 未缓存 op_v2 时走 OpKind
-        Self::fallback_op_class_legacy(kind)
-    }
-
+    /// OE-3: 胖 opcode 自描述 OpClass 分类（OpKind legacy 已删除）。
     fn fallback_op_class_from_op_v2(op: &Op) -> OpClass {
         match op {
             Op::Silu | Op::Gelu | Op::Tanh | Op::Add | Op::Mul | Op::ScaleConst { .. }
@@ -221,80 +208,6 @@ impl SemanticDAG {
         }
     }
 
-    fn fallback_op_class_legacy(kind: &OpKind) -> OpClass {
-        match kind {
-            OpKind::Silu | OpKind::Gelu | OpKind::Tanh | OpKind::Add | OpKind::Mul | OpKind::ScaleConst { .. } | OpKind::Residual | OpKind::LogitSoftcap { .. } => {
-                OpClass::ElemWise
-            }
-            OpKind::SwiGlu | OpKind::SwiGluClipped { .. } | OpKind::GeGlu => OpClass::ElemWise,
-            OpKind::RoPE { .. } | OpKind::DualRoPE { .. } | OpKind::Transpose { .. } | OpKind::Reshape { .. } | OpKind::SliceView { .. } => {
-                OpClass::Injective
-            }
-            // Gather: memory-bound indexed lookup (Injective — out[i] = table[indices[i]])
-            OpKind::Gather { .. } => OpClass::Injective,
-            // QuantGather: indexed dequantize (Injective — out[i] = dequant(quant_table[indices[i]]))
-            OpKind::QuantGather { .. } => OpClass::Injective,
-            // ColumnSlice: memory-bound row-major column slice copy (out[s,j] = in[s, start+j])
-            OpKind::ColumnSlice { .. } => OpClass::Injective,
-            OpKind::Softmax | OpKind::RmsNorm { .. } | OpKind::LayerNorm { .. } | OpKind::ValueNorm { .. } | OpKind::MeanPool { .. } | OpKind::L2Normalize { .. } | OpKind::QkNorm { .. } | OpKind::HeadRmsNorm { .. } | OpKind::Argmax { .. } => {
-                OpClass::Reduction
-            }
-            OpKind::Gemm { .. } | OpKind::GemmBias { .. } | OpKind::QuantGemm { .. } => {
-                OpClass::Gemm
-            }
-            OpKind::Dequantize { .. } => OpClass::ElemWise,
-            OpKind::MultiHeadAttention { .. } | OpKind::CachedGQA { .. } => OpClass::Opaque,
-            OpKind::MoEGate { .. } => OpClass::Gemm,
-            OpKind::TopK { .. } => OpClass::Reduction,
-            OpKind::WeightedSum { .. } => OpClass::ElemWise,
-            OpKind::KvScatterWrite { .. } => OpClass::Opaque,
-            OpKind::KvCacheWrite { .. } => OpClass::Opaque,
-            // P4/P5 stub variants: treat as opaque
-            OpKind::VariableLengthBatch
-            | OpKind::AttentionSkipMask { .. }
-            | OpKind::FusedRmsNormGemm { .. }
-            | OpKind::ResidualWithTelemetry { .. }
-            | OpKind::EntropyGate { .. }
-            | OpKind::VRangeQuant { .. }
-            | OpKind::KvCentroidPrefetch { .. }
-            | OpKind::LayerBypass { .. }
-            | OpKind::GateMask { .. }
-            | OpKind::MaskedGemm { .. }
-            | OpKind::MoEConditionalAdd { .. }
-            | OpKind::SoftmaxWithEntropy { .. }
-            | OpKind::MegaKernelDispatch { .. }
-            | OpKind::AltUpPredict { .. }
-            | OpKind::AltUpCorrect { .. }
-            | OpKind::AltUpInject { .. }
-            // DepthwiseConv1D: per-channel 1D conv (USM Conformer), Opaque 复合算子
-            | OpKind::DepthwiseConv1D { .. }
-            // PatchEmbed: Conv2D sliding window (SigLIP/ViT), Opaque 复合算子
-            | OpKind::PatchEmbed { .. }
-            // MoEDispatchPacked: packed-expert + mxfp4 MoE (gpt-oss-20b), Opaque 复合算子
-            | OpKind::MoERouter { .. }
-            | OpKind::MoEDispatchPacked { .. } => OpClass::Opaque,
-            // LearnedPos2D: pure binary elementwise add (SigLIP/ViT)
-            OpKind::LearnedPos2D { .. } => OpClass::ElemWise,
-            // ARCH-SG-QTAP: side-effect store, treated as Opaque so fusion passes skip it.
-            OpKind::QTapSTG { .. } => OpClass::Opaque,
-            // GRAPH-SHAPE-DRIVEN-MEGA-KERNEL §2.2: generate loop side-effect ops
-            OpKind::StoreToken | OpKind::CheckStopCondition => OpClass::Opaque,
-            // Business config ops (§1.5 conditional graph construction): all side-effect / control
-            OpKind::WriteLogits { .. }
-            | OpKind::EarlyExit { .. }
-            | OpKind::GuardrailCheck { .. }
-            | OpKind::SgInject { .. }
-            | OpKind::SgDetect { .. }
-            | OpKind::CotStepCheck { .. }
-            | OpKind::SessionKvRestore
-            | OpKind::MmHiddenInject { .. }
-            | OpKind::MtpDraft { .. } => OpClass::Opaque,
-            // MLA: Gemm variants use standard GEMM path, Attention/RopeMerge are Opaque/Injective
-            OpKind::MlaKvCompress { .. } | OpKind::MlaQAbsorb { .. } | OpKind::MlaVRestore { .. } => OpClass::Gemm,
-            OpKind::MlaAttention { .. } => OpClass::Opaque,
-            OpKind::MlaRopeMerge { .. } => OpClass::Injective,
-        }
-    }
 
     /// Compute arithmetic intensity and bottleneck classification.
     fn compute_arithmetic_intensity(

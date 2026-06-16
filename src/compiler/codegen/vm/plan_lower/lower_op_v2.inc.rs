@@ -28,12 +28,8 @@ pub(crate) fn lower_op_v2(
     resolver: &TensorPtrResolver,
     abi: &AbiPtrs,
 ) -> Result<bool, CompilerError> {
-    // Phase 9: 优先读 op_v2 缓存（add_op 时已翻译），fallback 到 from_op_kind
-    let op_v2 = op.op_v2.clone().or_else(|| Op::from_op_kind(op, graph));
-
-    let Some(op_v2) = op_v2 else {
-        return Ok(false);
-    };
+    // OE-3: op_v2 必填，直接读缓存（add_op 时已翻译）。clone 保持原 match-by-value 模式。
+    let op_v2 = op.op_v2.clone();
 
     match op_v2 {
         Op::RmsNorm(ref spec) => lower_norm_v2(prog, op, graph, ctx, resolver, abi, spec, NormKind::RmsNorm),
