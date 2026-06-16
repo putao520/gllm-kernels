@@ -1235,6 +1235,14 @@ impl QuantPrecision {
             _ => crate::types::DType::F32,
         }
     }
+
+    /// 累加器精度 (FIX-15: 替代硬编码 F32)。
+    ///
+    /// 所有 dtype 的累加操作都使用 F32 精度（数值稳定性保证）。
+    /// 替代硬编码 `QuantPrecision::F32`，遵循 ARCH-DTYPE-JIT-TYPED 铁律。
+    pub fn accumulator_precision(&self) -> Self {
+        QuantPrecision::F32
+    }
 }
 
 /// 类型提升规则 (SPEC 00-PHILOSOPHY §4.2)。

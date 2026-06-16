@@ -34,7 +34,7 @@ pub enum GroupMarker {
     /// 异构层循环结束。
     HeteroLayerLoopEnd,
     /// ForwardPhaseDispatch 三路分支（仅多步生成图：含 Argmax 的图）。
-    PhaseDispatch,
+    ForwardPhaseDispatch,
     /// 无标记——普通融合组。
     None,
 }
@@ -67,7 +67,7 @@ pub struct FusionGroup {
     /// 从 anchor op 的第一个输入 tensor 的 dtype 推导。
     /// None = 无法推导（使用默认 F32）。
     pub dominant_dtype: Option<QuantPrecision>,
-    /// REQ-UMK-012: 融合引擎插入的结构标记（LayerLoopBegin/End, PhaseDispatch, etc.）。
+    /// REQ-UMK-012: 融合引擎插入的结构标记（LayerLoopBegin/End, ForwardPhaseDispatch, etc.）。
     /// 默认 GroupMarker::None。编译器从 marker 读取层循环信息，不搜索 op.label。
     pub marker: GroupMarker,
     /// REQ-UMK-012: 此融合组属于层循环体（由 assign_group_markers 从图拓扑推导）。
