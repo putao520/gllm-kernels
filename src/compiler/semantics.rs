@@ -1,6 +1,6 @@
 //! Operation semantics — classifies ops for fusion and scheduling decisions.
 //!
-//! Each `OpKind` is classified by:
+//! Each `Op` (fat opcode v2) is classified by:
 //! - `OpSemantics`: elementwise / gemm / reduction / opaque
 //! - `BottleneckType`: compute-bound or memory-bound
 //! - Arithmetic intensity (FLOP/byte) for roofline analysis
@@ -10,7 +10,9 @@
 //! provides a richer classification derived from `OpTrace::ComputePattern`
 //! and is preferred in new code paths.
 
-use crate::compiler::graph::OpKind;
+use crate::compiler::graph::{
+    Op, GemmSpec, QuantGemmSpec, AttentionSpec, CachedGqaSpec, MlaSpec,
+};
 #[cfg(test)]
 use crate::compiler::graph::SymDim;
 
@@ -43,116 +45,116 @@ pub enum BottleneckType {
     MemoryBound,
 }
 
-/// Classify an `OpKind` into its semantic category.
-pub fn classify(kind: &OpKind) -> OpSemantics {
-    match kind {
+/// Classify an `Op` (fat opcode v2) into its semantic category.
+pub fn classify(op: &Op) -> OpSemantics {
+    match op {
         // Elementwise ops
-        OpKind::Silu | OpKind::Gelu | OpKind::Tanh | OpKind::Add | OpKind::Mul | OpKind::ScaleConst { .. } | OpKind::Residual | OpKind::LogitSoftcap { .. } => {
+        Op::Silu | Op::Gelu | Op::Tanh | Op::Add | Op::Mul | Op::ScaleConst { .. } | Op::Residual | Op::LogitSoftcap { .. } => {
             OpSemantics::Elementwise
         }
         // Gated activations: elementwise (two inputs, one output, no reduction)
-        OpKind::SwiGlu | OpKind::SwiGluClipped { .. } | OpKind::GeGlu => OpSemantics::Elementwise,
+        Op::SwiGlu | Op::SwiGluClipped { .. } | Op::GeGlu => OpSemantics::Elementwise,
 
         // GEMM variants
-        OpKind::Gemm { .. } | OpKind::GemmBias { .. } | OpKind::QuantGemm { .. } => {
+        Op::Gemm(_) | Op::GemmBias(_) | Op::QuantGemm(_) => {
             OpSemantics::Gemm
         }
 
         // Dequantize: elementwise decode
-        OpKind::Dequantize { .. } => OpSemantics::Elementwise,
+        Op::Dequantize { .. } => OpSemantics::Elementwise,
 
         // Reductions (need full input before output)
-        OpKind::Softmax | OpKind::RmsNorm { .. } | OpKind::LayerNorm { .. } | OpKind::MeanPool { .. } | OpKind::L2Normalize { .. } | OpKind::QkNorm { .. } | OpKind::HeadRmsNorm { .. } | OpKind::ValueNorm { .. } => {
+        Op::Softmax | Op::RmsNorm(_) | Op::LayerNorm(_) | Op::MeanPool { .. } | Op::L2Normalize { .. } | Op::QkNorm { .. } | Op::HeadRmsNorm { .. } | Op::ValueNorm(_) => {
             OpSemantics::Reduction
         }
 
         // RoPE: elementwise rotation (x*cos - y*sin, x*sin + y*cos)
-        OpKind::RoPE { .. } | OpKind::DualRoPE { .. } => OpSemantics::Elementwise,
+        Op::RoPE(_) | Op::DualRoPE(_) => OpSemantics::Elementwise,
 
         // Attention: can fuse with pre/post projections
-        OpKind::MultiHeadAttention { .. } | OpKind::CachedGQA { .. } => {
+        Op::MultiHeadAttention(_) | Op::CachedGqa(_) => {
             OpSemantics::Attention
         }
 
         // Gather: memory-bound indexed lookup, not fusable
-        OpKind::Gather { .. } => OpSemantics::Opaque,
+        Op::Gather { .. } => OpSemantics::Opaque,
         // QuantGather: memory-bound indexed dequantize, not fusable
-        OpKind::QuantGather { .. } => OpSemantics::Opaque,
+        Op::QuantGather { .. } => OpSemantics::Opaque,
 
         // ColumnSlice: memory-bound row-major column slice (row_stride changes, real copy)
-        OpKind::ColumnSlice { .. } => OpSemantics::Opaque,
+        Op::ColumnSlice { .. } => OpSemantics::Opaque,
 
         // Opaque: metadata-only ops (zero cost)
-        OpKind::Transpose { .. } | OpKind::Reshape { .. } | OpKind::SliceView { .. } => {
+        Op::Transpose { .. } | Op::Reshape { .. } | Op::SliceView { .. } => {
             OpSemantics::Opaque
         }
 
         // MoE ops
-        OpKind::MoEGate { .. } => OpSemantics::Gemm,
-        OpKind::TopK { .. } => OpSemantics::Reduction,
-        OpKind::WeightedSum { .. } => OpSemantics::Elementwise,
+        Op::MoEGate { .. } => OpSemantics::Gemm,
+        Op::TopK { .. } => OpSemantics::Reduction,
+        Op::WeightedSum { .. } => OpSemantics::Elementwise,
 
         // Packed-expert MoE (gpt-oss-20b): composite op, Opaque (no fusion)。
-        OpKind::MoERouter { .. }
-        | OpKind::MoEDispatchPacked { .. } => OpSemantics::Opaque,
+        Op::MoERouter { .. }
+        | Op::MoEDispatchPacked { .. } => OpSemantics::Opaque,
 
         // KV scatter write: pure memory op (no compute)
-        OpKind::KvScatterWrite { .. } => OpSemantics::Opaque,
+        Op::KvScatterWrite { .. } => OpSemantics::Opaque,
         // KV cache write: pure memory op (no compute)
-        OpKind::KvCacheWrite { .. } => OpSemantics::Opaque,
+        Op::KvCacheWrite { .. } => OpSemantics::Opaque,
 
         // P4/P5 stub variants: treat as opaque for now
-        OpKind::VariableLengthBatch
-        | OpKind::AttentionSkipMask { .. }
-        | OpKind::FusedRmsNormGemm { .. }
-        | OpKind::ResidualWithTelemetry { .. }
-        | OpKind::EntropyGate { .. }
-        | OpKind::VRangeQuant { .. }
-        | OpKind::KvCentroidPrefetch { .. }
-        | OpKind::LayerBypass { .. }
-        | OpKind::GateMask { .. }
-        | OpKind::MaskedGemm { .. }
-        | OpKind::MoEConditionalAdd { .. }
-        | OpKind::SoftmaxWithEntropy { .. }
-        | OpKind::MegaKernelDispatch { .. }
+        Op::VariableLengthBatch
+        | Op::AttentionSkipMask { .. }
+        | Op::FusedRmsNormGemm { .. }
+        | Op::ResidualWithTelemetry { .. }
+        | Op::EntropyGate { .. }
+        | Op::VRangeQuant { .. }
+        | Op::KvCentroidPrefetch { .. }
+        | Op::LayerBypass { .. }
+        | Op::GateMask { .. }
+        | Op::MaskedGemm { .. }
+        | Op::MoEConditionalAdd { .. }
+        | Op::SoftmaxWithEntropy { .. }
+        | Op::MegaKernelDispatch { .. }
         // AltUpPredict/AltUpCorrect/AltUpInject: Injective composite ops (Gemma 4 E2B/E4B)
-        | OpKind::AltUpPredict { .. }
-        | OpKind::AltUpCorrect { .. }
-        | OpKind::AltUpInject { .. }
+        | Op::AltUpPredict { .. }
+        | Op::AltUpCorrect { .. }
+        | Op::AltUpInject { .. }
         // DepthwiseConv1D: per-channel 1D conv,组合算子(USM Conformer),Opaque
-        | OpKind::DepthwiseConv1D { .. }
+        | Op::DepthwiseConv1D { .. }
         // PatchEmbed: Conv2D 滑动窗口 (SigLIP/ViT),Opaque 复合算子
-        | OpKind::PatchEmbed { .. } => OpSemantics::Opaque,
+        | Op::PatchEmbed { .. } => OpSemantics::Opaque,
 
         // LearnedPos2D: pure binary elementwise add (SigLIP/ViT)
-        OpKind::LearnedPos2D { .. } => OpSemantics::Elementwise,
+        Op::LearnedPos2D { .. } => OpSemantics::Elementwise,
 
         // ARCH-SG-QTAP: Q-Tap is a pure side-effect store (ring buffer write + atomic bump).
         // Classify as Opaque so no fusion pass attempts to merge it with neighbours —
         // keeping the tap strictly post-GEMM preserves the semantics in SPEC §4.
-        OpKind::QTapSTG { .. } => OpSemantics::Opaque,
+        Op::QTapSTG { .. } => OpSemantics::Opaque,
 
         // Mega-kernel generate loop ops (GRAPH-SHAPE-DRIVEN-MEGA-KERNEL §2.2)
-        OpKind::Argmax { .. } => OpSemantics::Reduction,
-        OpKind::StoreToken | OpKind::CheckStopCondition => OpSemantics::Opaque,
+        Op::Argmax { .. } => OpSemantics::Reduction,
+        Op::StoreToken | Op::CheckStopCondition => OpSemantics::Opaque,
 
         // Business config ops (§1.5 conditional graph construction): side-effect / control, Opaque
-        OpKind::WriteLogits { .. }
-        | OpKind::EarlyExit { .. }
-        | OpKind::GuardrailCheck { .. }
-        | OpKind::SgInject { .. }
-        | OpKind::SgDetect { .. }
-        | OpKind::CotStepCheck { .. }
-        | OpKind::SessionKvRestore
-        | OpKind::MmHiddenInject { .. }
-        | OpKind::MtpDraft { .. } => OpSemantics::Opaque,
+        Op::WriteLogits { .. }
+        | Op::EarlyExit { .. }
+        | Op::GuardrailCheck { .. }
+        | Op::SgInject { .. }
+        | Op::SgDetect { .. }
+        | Op::CotStepCheck { .. }
+        | Op::SessionKvRestore
+        | Op::MmHiddenInject { .. }
+        | Op::MtpDraft { .. } => OpSemantics::Opaque,
 
         // MLA (Multi-head Latent Attention) — DeepSeek V3/R1, Kimi-K2
-        OpKind::MlaKvCompress { .. } | OpKind::MlaQAbsorb { .. } | OpKind::MlaVRestore { .. } => {
+        Op::MlaKvCompress { .. } | Op::MlaQAbsorb { .. } | Op::MlaVRestore { .. } => {
             OpSemantics::Gemm
         }
-        OpKind::MlaAttention { .. } => OpSemantics::Attention,
-        OpKind::MlaRopeMerge { .. } => OpSemantics::Elementwise,
+        Op::MlaAttention(_) => OpSemantics::Attention,
+        Op::MlaRopeMerge { .. } => OpSemantics::Elementwise,
     }
 }
 
@@ -163,10 +165,11 @@ pub fn classify(kind: &OpKind) -> OpSemantics {
 /// ARCH-DTYPE-FULLCHAIN-ORCH: `graph_dtype` used for QuantGemm activation/output byte estimation.
 // ARCH-SYMDIM-DEGRADE: cost model uses max_for_allocation for conservative estimate.
 // TODO(G-2): preserve symbolic form for tighter bounds.
-pub fn bottleneck(kind: &OpKind, graph_dtype: crate::types::DType) -> BottleneckType {
-    match kind {
+pub fn bottleneck(op: &Op, graph_dtype: crate::types::DType) -> BottleneckType {
+    match op {
         // GEMM: compute-bound when K is large enough (typical for transformer layers)
-        OpKind::Gemm { m, n, k, dtype, .. } | OpKind::GemmBias { m, n, k, dtype, .. } => {
+        Op::Gemm(spec) | Op::GemmBias(spec) => {
+            let GemmSpec { m, n, k, dtype, .. } = spec;
             // ARCH-SYMDIM-DEGRADE: cost model uses max_for_allocation for conservative estimate.
             // TODO(G-2): preserve symbolic form for tighter bounds.
             let m_val = m.max_for_allocation_strict().expect("ARCH-SYMDIM: Symbolic dim must have max_value in cost model");
@@ -180,7 +183,8 @@ pub fn bottleneck(kind: &OpKind, graph_dtype: crate::types::DType) -> Bottleneck
             }
         }
         // Quantized GEMM: fewer bytes for weights, activation dtype from graph context
-        OpKind::QuantGemm { m, n, k, quant_type } => {
+        Op::QuantGemm(spec) => {
+            let QuantGemmSpec { m, n, k, quant_type } = spec;
             // ARCH-SYMDIM-DEGRADE: cost model uses max_for_allocation for conservative estimate.
             // TODO(G-2): preserve symbolic form for tighter bounds.
             let m_val = m.max_for_allocation_strict().expect("ARCH-SYMDIM: Symbolic dim must have max_value in cost model");
@@ -198,9 +202,9 @@ pub fn bottleneck(kind: &OpKind, graph_dtype: crate::types::DType) -> Bottleneck
             }
         }
         // Dequantize: pure memory-bound
-        OpKind::Dequantize { .. } => BottleneckType::MemoryBound,
+        Op::Dequantize { .. } => BottleneckType::MemoryBound,
         // QuantGather: indexed dequantize, memory-bound (read quant blocks → decode → write f32)
-        OpKind::QuantGather { .. } => BottleneckType::MemoryBound,
+        Op::QuantGather { .. } => BottleneckType::MemoryBound,
         // Everything else is memory-bound (bandwidth-limited)
         _ => BottleneckType::MemoryBound,
     }
@@ -213,10 +217,11 @@ pub fn bottleneck(kind: &OpKind, graph_dtype: crate::types::DType) -> Bottleneck
 /// ARCH-DTYPE-FULLCHAIN-ORCH: `graph_dtype` used for non-GEMM ops and QuantGemm activation bytes.
 // ARCH-SYMDIM-DEGRADE: cost model uses max_for_allocation for conservative estimate.
 // TODO(G-2): preserve symbolic form for tighter bounds.
-pub fn arithmetic_intensity(kind: &OpKind, graph_dtype: crate::types::DType) -> f64 {
+pub fn arithmetic_intensity(op: &Op, graph_dtype: crate::types::DType) -> f64 {
     let eb = graph_dtype.size_bytes() as f64;
-    match kind {
-        OpKind::Gemm { m, n, k, dtype, .. } | OpKind::GemmBias { m, n, k, dtype, .. } => {
+    match op {
+        Op::Gemm(spec) | Op::GemmBias(spec) => {
+            let GemmSpec { m, n, k, dtype, .. } = spec;
             // ARCH-SYMDIM-DEGRADE: cost model uses max_for_allocation for conservative estimate.
             // TODO(G-2): preserve symbolic form for tighter bounds.
             let m_val = m.max_for_allocation_strict().expect("ARCH-SYMDIM: Symbolic dim must have max_value in cost model");
@@ -225,7 +230,8 @@ pub fn arithmetic_intensity(kind: &OpKind, graph_dtype: crate::types::DType) -> 
             let bytes = elem_bytes * (m_val * k + k * n + m_val * n) as f64;
             if bytes > 0.0 { flops / bytes } else { 0.0 }
         }
-        OpKind::QuantGemm { m, n, k, quant_type } => {
+        Op::QuantGemm(spec) => {
+            let QuantGemmSpec { m, n, k, quant_type } = spec;
             // ARCH-SYMDIM-DEGRADE: cost model uses max_for_allocation for conservative estimate.
             // TODO(G-2): preserve symbolic form for tighter bounds.
             let m_val = m.max_for_allocation_strict().expect("ARCH-SYMDIM: Symbolic dim must have max_value in cost model");
@@ -235,49 +241,52 @@ pub fn arithmetic_intensity(kind: &OpKind, graph_dtype: crate::types::DType) -> 
             let io_bytes = (m_val * k + m_val * n) as f64 * eb;
             if (weight_bytes + io_bytes) > 0.0 { flops / (weight_bytes + io_bytes) } else { 0.0 }
         }
-        OpKind::Dequantize { num_elements, bits, .. } => {
+        Op::Dequantize { num_elements, bits, .. } => {
             let flops = (*num_elements * 2) as f64;
             let input_bytes = *num_elements as f64 * (*bits as f64 / 8.0);
             let output_bytes = *num_elements as f64 * eb;
             let bytes = input_bytes + output_bytes;
             if bytes > 0.0 { flops / bytes } else { 0.0 }
         }
-        OpKind::Silu | OpKind::Gelu | OpKind::Tanh | OpKind::LogitSoftcap { .. } => {
+        Op::Silu | Op::Gelu | Op::Tanh | Op::LogitSoftcap { .. } => {
             // ~10 FLOPs per element, 2*eb bytes (read + write)
             10.0 / (2.0 * eb)
         }
-        OpKind::Add | OpKind::Mul | OpKind::ScaleConst { .. } | OpKind::Residual => {
+        Op::Add | Op::Mul | Op::ScaleConst { .. } | Op::Residual => {
             // 1 FLOP, 3*eb bytes (2 reads + 1 write)
             1.0 / (3.0 * eb)
         }
-        OpKind::SwiGlu | OpKind::GeGlu => {
+        Op::SwiGlu | Op::GeGlu => {
             // ~12 FLOPs (silu/gelu + mul), 3*eb bytes (2 reads + 1 write)
             12.0 / (3.0 * eb)
         }
-        OpKind::SwiGluClipped { .. } => {
+        Op::SwiGluClipped { .. } => {
             // ~16 FLOPs (4 clamps + silu + mul), 3*eb bytes (2 reads + 1 write).
             // Same memory profile as SwiGLU, marginally higher compute.
             16.0 / (3.0 * eb)
         }
-        OpKind::Softmax => {
+        Op::Softmax => {
             // 3-pass: ~5N FLOPs, ~3*eb*N bytes
             5.0 / (3.0 * eb)
         }
-        OpKind::RmsNorm { .. } | OpKind::LayerNorm { .. } | OpKind::L2Normalize { .. } | OpKind::QkNorm { .. } | OpKind::HeadRmsNorm { .. } | OpKind::ValueNorm { .. } => {
+        Op::RmsNorm(_) | Op::LayerNorm(_) | Op::L2Normalize { .. } | Op::QkNorm { .. } | Op::HeadRmsNorm { .. } | Op::ValueNorm(_) => {
             // 2-pass: ~5N FLOPs, ~3*eb*N bytes
             5.0 / (3.0 * eb)
         }
-        OpKind::RoPE { .. } | OpKind::DualRoPE { .. } => {
+        Op::RoPE(_) | Op::DualRoPE(_) => {
             // 6 FLOPs per pair, 4*eb bytes (2 reads + 2 writes) + cos/sin overhead
             6.0 / (4.0 * eb)
         }
         // Multi-head attention: O(s^2 * d * h) compute, dominated by QK^T and attn@V
-        OpKind::MultiHeadAttention { seq_len, num_heads, num_kv_heads: _, head_dim, causal: _, attention_sinks: _, kv_source: _ } => {
+        Op::MultiHeadAttention(spec) => {
+            let AttentionSpec { seq_len, geometry, .. } = spec;
+            let num_heads = geometry.num_q_heads;
+            let head_dim = geometry.head_dim;
             // ARCH-SYMDIM-DEGRADE: cost model uses max_for_allocation for conservative estimate.
             // TODO(G-2): preserve symbolic form for tighter bounds.
             let s = seq_len.max_for_allocation_strict().expect("ARCH-SYMDIM: Symbolic dim must have max_value in cost model") as f64;
-            let h = *num_heads as f64;
-            let d = *head_dim as f64;
+            let h = num_heads as f64;
+            let d = head_dim as f64;
             let hidden = h * d;
             // FLOPs: 2*s*s*d*h (QK^T) + 3*s*s*h (softmax) + 2*s*s*d*h (attn@V)
             let flops = 4.0 * s * s * d * h + 3.0 * s * s * h;
@@ -286,11 +295,16 @@ pub fn arithmetic_intensity(kind: &OpKind, graph_dtype: crate::types::DType) -> 
             let bytes = 4.0 * s * hidden * f32_bytes;
             if bytes > 0.0 { flops / bytes } else { 0.0 }
         }
-        OpKind::CachedGQA { seq_len, total_seq, num_heads, head_dim, kv_dtype, .. } => {
-            let s = *seq_len as f64;
+        Op::CachedGqa(spec) => {
+            let CachedGqaSpec { seq_len, total_seq, geometry, kv_dtype, .. } = spec;
+            let num_heads = geometry.num_q_heads;
+            let head_dim = geometry.head_dim;
+            // ARCH-SYMDIM-DEGRADE: cost model uses max_for_allocation for conservative estimate.
+            // TODO(G-2): preserve symbolic form for tighter bounds.
+            let s = seq_len.max_for_allocation_strict().expect("ARCH-SYMDIM: CachedGqa seq_len must have max_value") as f64;
             let t = *total_seq as f64;
-            let h = *num_heads as f64;
-            let d = *head_dim as f64;
+            let h = num_heads as f64;
+            let d = head_dim as f64;
             let kv_elem = kv_dtype.size_bytes() as f64;
             let flops = 2.0 * s * t * d * h + 3.0 * s * t * h + 2.0 * s * t * d * h;
             // Q: f32, K/V: kv_dtype bytes, output: f32
@@ -298,66 +312,69 @@ pub fn arithmetic_intensity(kind: &OpKind, graph_dtype: crate::types::DType) -> 
             let bytes = s * h * d * f32_bytes + 2.0 * t * h * d * kv_elem + s * h * d * f32_bytes;
             if bytes > 0.0 { flops / bytes } else { 0.0 }
         }
-        OpKind::MoEGate { seq_len, num_experts, hidden, .. } => {
-            let flops = (2 * seq_len * num_experts * hidden) as f64;
-            let bytes = (4 * (seq_len * hidden + hidden * num_experts + seq_len * num_experts)) as f64;
+        Op::MoEGate { seq_len, num_experts, hidden, .. } => {
+            let s = seq_len.max_for_allocation_strict().expect("ARCH-SYMDIM: MoEGate seq_len must have max_value") as f64;
+            let e = *num_experts as f64;
+            let h = *hidden as f64;
+            let flops = 2.0 * s * e * h;
+            let bytes = 4.0 * (s * h + h * e + s * e);
             if bytes > 0.0 { flops / bytes } else { 0.0 }
         }
-        OpKind::TopK { .. } | OpKind::WeightedSum { .. } => {
+        Op::TopK { .. } | Op::WeightedSum { .. } => {
             // Control-flow heavy, memory-bound
             1.0 / 8.0
         }
-        OpKind::MeanPool { .. } | OpKind::Transpose { .. } | OpKind::Reshape { .. } | OpKind::SliceView { .. } => {
+        Op::MeanPool { .. } | Op::Transpose { .. } | Op::Reshape { .. } | Op::SliceView { .. } => {
             // Pure data movement, 0 compute
             0.0
         }
         // Gather: memory-bound indexed copy, 0 FLOPs (pure memcpy)
-        OpKind::Gather { .. } => 0.0,
+        Op::Gather { .. } => 0.0,
         // QuantGather: memory-bound indexed dequantize, ~1 FLOP/elem (scale * nibble) — treat as 0
-        OpKind::QuantGather { .. } => 0.0,
+        Op::QuantGather { .. } => 0.0,
         // ColumnSlice: memory-bound row-major column slice, 0 FLOPs (pure copy)
-        OpKind::ColumnSlice { .. } => 0.0,
+        Op::ColumnSlice { .. } => 0.0,
         // KV scatter write: pure memory movement, 0 compute
-        OpKind::KvScatterWrite { .. } => 0.0,
+        Op::KvScatterWrite { .. } => 0.0,
         // KV cache write: pure memory movement, 0 compute
-        OpKind::KvCacheWrite { .. } => 0.0,
+        Op::KvCacheWrite { .. } => 0.0,
         // ARCH-SG-QTAP: pure side-effect memcpy + atomic — zero FLOPs, all memory.
-        OpKind::QTapSTG { .. } => 0.0,
+        Op::QTapSTG { .. } => 0.0,
         // Mega-kernel generate loop ops (GRAPH-SHAPE-DRIVEN-MEGA-KERNEL §2.2)
         // Argmax: ~2 FLOPs/elem (compare + update max), memory-bound scan
-        OpKind::Argmax { vocab_size } => {
+        Op::Argmax { vocab_size } => {
             let v = *vocab_size as f64;
             let flops = 2.0 * v;
             let bytes = eb * (v + 1.0); // logits read + token_id write
             if bytes > 0.0 { flops / bytes } else { 0.0 }
         }
         // StoreToken / CheckStopCondition: pure memory/control, 0 compute
-        OpKind::StoreToken | OpKind::CheckStopCondition => 0.0,
+        Op::StoreToken | Op::CheckStopCondition => 0.0,
         // Business config ops (§1.5): side-effect / control, 0 compute
-        OpKind::WriteLogits { .. }
-        | OpKind::EarlyExit { .. }
-        | OpKind::GuardrailCheck { .. }
-        | OpKind::SgInject { .. }
-        | OpKind::SgDetect { .. }
-        | OpKind::CotStepCheck { .. }
-        | OpKind::SessionKvRestore
-        | OpKind::MmHiddenInject { .. }
-        | OpKind::MtpDraft { .. } => 0.0,
+        Op::WriteLogits { .. }
+        | Op::EarlyExit { .. }
+        | Op::GuardrailCheck { .. }
+        | Op::SgInject { .. }
+        | Op::SgDetect { .. }
+        | Op::CotStepCheck { .. }
+        | Op::SessionKvRestore
+        | Op::MmHiddenInject { .. }
+        | Op::MtpDraft { .. } => 0.0,
         // P4/P5 stub variants: treat as memory-bound (0 compute)
-        OpKind::VariableLengthBatch
-        | OpKind::AttentionSkipMask { .. }
-        | OpKind::FusedRmsNormGemm { .. }
-        | OpKind::ResidualWithTelemetry { .. }
-        | OpKind::EntropyGate { .. }
-        | OpKind::VRangeQuant { .. }
-        | OpKind::KvCentroidPrefetch { .. }
-        | OpKind::LayerBypass { .. }
-        | OpKind::GateMask { .. }
-        | OpKind::MaskedGemm { .. }
-        | OpKind::MoEConditionalAdd { .. }
-        | OpKind::SoftmaxWithEntropy { .. }
-        | OpKind::MegaKernelDispatch { .. } => 0.0,
-        OpKind::AltUpPredict { seq_len, num_preds, hidden } => {
+        Op::VariableLengthBatch
+        | Op::AttentionSkipMask { .. }
+        | Op::FusedRmsNormGemm { .. }
+        | Op::ResidualWithTelemetry { .. }
+        | Op::EntropyGate { .. }
+        | Op::VRangeQuant { .. }
+        | Op::KvCentroidPrefetch { .. }
+        | Op::LayerBypass { .. }
+        | Op::GateMask { .. }
+        | Op::MaskedGemm { .. }
+        | Op::MoEConditionalAdd { .. }
+        | Op::SoftmaxWithEntropy { .. }
+        | Op::MegaKernelDispatch { .. } => 0.0,
+        Op::AltUpPredict { seq_len, num_preds, hidden } => {
             // ARCH-SYMDIM-DEGRADE: cost model uses max_for_allocation for conservative estimate.
             // TODO(G-2): preserve symbolic form for tighter bounds.
             let s = seq_len.max_for_allocation_strict()
@@ -370,7 +387,7 @@ pub fn arithmetic_intensity(kind: &OpKind, graph_dtype: crate::types::DType) -> 
             let bytes = eb * (p * s * h + s * p * p);
             if bytes > 0.0 { flops / bytes } else { 0.0 }
         }
-        OpKind::AltUpCorrect { seq_len, num_preds, hidden } => {
+        Op::AltUpCorrect { seq_len, num_preds, hidden } => {
             // ARCH-SYMDIM-DEGRADE: cost model uses max_for_allocation for conservative estimate.
             // TODO(G-2): preserve symbolic form for tighter bounds.
             let s = seq_len.max_for_allocation_strict()
@@ -383,7 +400,7 @@ pub fn arithmetic_intensity(kind: &OpKind, graph_dtype: crate::types::DType) -> 
             let bytes = eb * (p * s * h + s * p + s * h);
             if bytes > 0.0 { flops / bytes } else { 0.0 }
         }
-        OpKind::AltUpInject { seq_len, num_preds, hidden } => {
+        Op::AltUpInject { seq_len, num_preds, hidden } => {
             // ARCH-SYMDIM-DEGRADE: cost model uses max_for_allocation for conservative estimate.
             // TODO(G-2): preserve symbolic form for tighter bounds.
             let s = seq_len.max_for_allocation_strict()
@@ -400,7 +417,7 @@ pub fn arithmetic_intensity(kind: &OpKind, graph_dtype: crate::types::DType) -> 
         // 共享同一权重列),seq_len 外循环 → roofline 看作 memory-bound。
         // FLOPs = 2 × kernel × channels × seq (近似,不计 boundary pad),
         // Bytes ≈ eb × (2 × seq × channels + channels × kernel)。
-        OpKind::DepthwiseConv1D { channels, kernel_size, .. } => {
+        Op::DepthwiseConv1D { channels, kernel_size, .. } => {
             // 用典型 seq=128 作为 representative 估算 (roofline 近似)
             let s = 128.0_f64;
             let c = *channels as f64;
@@ -414,7 +431,7 @@ pub fn arithmetic_intensity(kind: &OpKind, graph_dtype: crate::types::DType) -> 
         // Bytes ≈ eb × (image_elems + kernel_elems + patches_elems)
         //        = eb × (in_channels × image_size² + embed × in_channels × patch²
         //               + num_patches × embed)
-        OpKind::PatchEmbed { patch_size, embed_dim, in_channels, image_size } => {
+        Op::PatchEmbed { patch_size, embed_dim, in_channels, image_size } => {
             let ps = *patch_size as f64;
             let ed = *embed_dim as f64;
             let ic = *in_channels as f64;
@@ -429,11 +446,11 @@ pub fn arithmetic_intensity(kind: &OpKind, graph_dtype: crate::types::DType) -> 
             if bytes > 0.0 { flops / bytes } else { 0.0 }
         }
         // LearnedPos2D: 1 FLOP per element, 3*eb bytes (2 reads + 1 write)
-        OpKind::LearnedPos2D { .. } => {
+        Op::LearnedPos2D { .. } => {
             1.0 / (3.0 * eb)
         }
         // MoERouter: hidden @ weight.T + bias → softmax → top-k。
-        OpKind::MoERouter { num_experts, top_k, hidden, seq_len } => {
+        Op::MoERouter { num_experts, top_k, hidden, seq_len } => {
             // ARCH-SYMDIM-DEGRADE: cost model uses max_for_allocation for conservative estimate.
             // TODO(G-2): preserve symbolic form for tighter bounds.
             let s = seq_len.max_for_allocation_strict()
@@ -451,7 +468,7 @@ pub fn arithmetic_intensity(kind: &OpKind, graph_dtype: crate::types::DType) -> 
         // FLOPs ≈ top_k × (4 · hidden · intermediate + 8 · intermediate)  per token。
         // Bytes ≈ top_k × (hidden · intermediate_size / 2 + intermediate_size)  weight
         //         + activation I/O。
-        OpKind::MoEDispatchPacked { top_k, intermediate_size, hidden, seq_len, mxfp4_block_size, .. } => {
+        Op::MoEDispatchPacked { top_k, intermediate_size, hidden, seq_len, mxfp4_block_size, .. } => {
             // ARCH-SYMDIM-DEGRADE: cost model uses max_for_allocation for conservative estimate.
             // TODO(G-2): preserve symbolic form for tighter bounds.
             let s = seq_len.max_for_allocation_strict()
@@ -469,7 +486,7 @@ pub fn arithmetic_intensity(kind: &OpKind, graph_dtype: crate::types::DType) -> 
             if bytes > 0.0 { flops / bytes } else { 0.0 }
         }
         // MLA GEMM variants: use same roofline model as standard GEMM
-        OpKind::MlaKvCompress { m, d_c, hidden } => {
+        Op::MlaKvCompress { m, d_c, hidden } => {
             // ARCH-SYMDIM-DEGRADE: cost model uses max_for_allocation for conservative estimate.
             // TODO(G-2): preserve symbolic form for tighter bounds.
             let m_val = m.max_for_allocation_strict().expect("ARCH-SYMDIM: MlaKvCompress m must have max_value") as f64;
@@ -477,7 +494,7 @@ pub fn arithmetic_intensity(kind: &OpKind, graph_dtype: crate::types::DType) -> 
             let bytes = eb * (m_val * (*hidden as f64) + (*hidden as f64) * (*d_c as f64) + m_val * (*d_c as f64));
             if bytes > 0.0 { flops / bytes } else { 0.0 }
         }
-        OpKind::MlaQAbsorb { seq_len, num_heads, head_dim, d_c } | OpKind::MlaVRestore { seq_len, num_heads, head_dim, d_c } => {
+        Op::MlaQAbsorb { seq_len, num_heads, head_dim, d_c } | Op::MlaVRestore { seq_len, num_heads, head_dim, d_c } => {
             // ARCH-SYMDIM-DEGRADE: cost model uses max_for_allocation for conservative estimate.
             // TODO(G-2): preserve symbolic form for tighter bounds.
             let s = seq_len.max_for_allocation_strict().expect("ARCH-SYMDIM: MLA GEMM seq_len must have max_value") as f64;
@@ -488,7 +505,8 @@ pub fn arithmetic_intensity(kind: &OpKind, graph_dtype: crate::types::DType) -> 
             let bytes = eb * (s * h * d + h * dc * d + s * h * dc);
             if bytes > 0.0 { flops / bytes } else { 0.0 }
         }
-        OpKind::MlaAttention { seq_len, num_heads, head_dim, d_c, .. } => {
+        Op::MlaAttention(spec) => {
+            let MlaSpec { seq_len, num_heads, head_dim, d_c, .. } = spec;
             // ARCH-SYMDIM-DEGRADE: cost model uses max_for_allocation for conservative estimate.
             // TODO(G-2): preserve symbolic form for tighter bounds.
             let s = seq_len.max_for_allocation_strict().expect("ARCH-SYMDIM: MlaAttention seq_len must have max_value") as f64;
@@ -499,7 +517,7 @@ pub fn arithmetic_intensity(kind: &OpKind, graph_dtype: crate::types::DType) -> 
             let bytes = eb * (s * h * dc + s * dc + s * h * d);
             if bytes > 0.0 { flops / bytes } else { 0.0 }
         }
-        OpKind::MlaRopeMerge { .. } => {
+        Op::MlaRopeMerge { .. } => {
             6.0 / (4.0 * eb)
         }
     }
@@ -509,102 +527,102 @@ pub fn arithmetic_intensity(kind: &OpKind, graph_dtype: crate::types::DType) -> 
 ///
 /// The GEMM microkernel can absorb certain elementwise ops into its
 /// store phase (bias add, activation) without extra memory traffic.
-pub fn fusable_as_gemm_epilogue(kind: &OpKind) -> bool {
+pub fn fusable_as_gemm_epilogue(op: &Op) -> bool {
     matches!(
-        kind,
-        OpKind::Add | OpKind::Silu | OpKind::Gelu | OpKind::Tanh | OpKind::Residual
+        op,
+        Op::Add | Op::Silu | Op::Gelu | Op::Tanh | Op::Residual
     )
 }
 
 #[cfg(test)]
 mod tests {
-    use crate::compiler::graph::KvSource;
+    use crate::compiler::graph::{KvSource, AttentionGeometry, AttentionMask, AttentionStrategy, SinksSpec, NormSpec, RopeSpec};
     use super::*;
     use crate::types::DType;
 
     #[test]
     fn test_classify_elementwise() {
-        assert_eq!(classify(&OpKind::Silu), OpSemantics::Elementwise);
-        assert_eq!(classify(&OpKind::Add), OpSemantics::Elementwise);
-        assert_eq!(classify(&OpKind::SwiGlu), OpSemantics::Elementwise);
-        assert_eq!(classify(&OpKind::Residual), OpSemantics::Elementwise);
+        assert_eq!(classify(&Op::Silu), OpSemantics::Elementwise);
+        assert_eq!(classify(&Op::Add), OpSemantics::Elementwise);
+        assert_eq!(classify(&Op::SwiGlu), OpSemantics::Elementwise);
+        assert_eq!(classify(&Op::Residual), OpSemantics::Elementwise);
     }
 
     #[test]
     fn test_classify_gemm() {
         assert_eq!(
-            classify(&OpKind::Gemm { m: SymDim::Concrete(1), n: 4096, k: 4096, dtype: DType::F32, trans_b: false }),
+            classify(&Op::Gemm(GemmSpec { m: SymDim::Concrete(1), n: 4096, k: 4096, dtype: DType::F32, trans_b: false, has_bias: false })),
             OpSemantics::Gemm
         );
         assert_eq!(
-            classify(&OpKind::GemmBias { m: SymDim::Concrete(1), n: 4096, k: 4096, dtype: DType::F32, trans_b: false }),
+            classify(&Op::GemmBias(GemmSpec { m: SymDim::Concrete(1), n: 4096, k: 4096, dtype: DType::F32, trans_b: false, has_bias: true })),
             OpSemantics::Gemm
         );
     }
 
     #[test]
     fn test_classify_reduction() {
-        assert_eq!(classify(&OpKind::Softmax), OpSemantics::Reduction);
-        assert_eq!(classify(&OpKind::RmsNorm { feature_dim: 4096, eps: 1e-5 }), OpSemantics::Reduction);
+        assert_eq!(classify(&Op::Softmax), OpSemantics::Reduction);
+        assert_eq!(classify(&Op::RmsNorm(NormSpec { feature_dim: 4096, eps: 1e-5, dtype: DType::F32, has_weight: true })), OpSemantics::Reduction);
     }
 
     #[test]
     fn test_bottleneck_large_gemm() {
-        let kind = OpKind::Gemm { m: SymDim::Concrete(128), n: 4096, k: 4096, dtype: DType::F32, trans_b: false };
+        let kind = Op::Gemm(GemmSpec { m: SymDim::Concrete(128), n: 4096, k: 4096, dtype: DType::F32, trans_b: false, has_bias: false });
         assert_eq!(bottleneck(&kind, DType::F32), BottleneckType::ComputeBound);
     }
 
     #[test]
     fn test_bottleneck_small_gemm() {
         // M=1 GEMV: memory-bound
-        let kind = OpKind::Gemm { m: SymDim::Concrete(1), n: 4096, k: 4096, dtype: DType::F32, trans_b: false };
+        let kind = Op::Gemm(GemmSpec { m: SymDim::Concrete(1), n: 4096, k: 4096, dtype: DType::F32, trans_b: false, has_bias: false });
         assert_eq!(bottleneck(&kind, DType::F32), BottleneckType::MemoryBound);
     }
 
     #[test]
     fn test_bottleneck_elementwise() {
-        assert_eq!(bottleneck(&OpKind::Silu, DType::F32), BottleneckType::MemoryBound);
-        assert_eq!(bottleneck(&OpKind::Add, DType::F32), BottleneckType::MemoryBound);
+        assert_eq!(bottleneck(&Op::Silu, DType::F32), BottleneckType::MemoryBound);
+        assert_eq!(bottleneck(&Op::Add, DType::F32), BottleneckType::MemoryBound);
     }
 
     #[test]
     fn test_arithmetic_intensity_gemm() {
-        let ai = arithmetic_intensity(&OpKind::Gemm { m: SymDim::Concrete(128), n: 4096, k: 4096, dtype: DType::F32, trans_b: false }, DType::F32);
+        let ai = arithmetic_intensity(&Op::Gemm(GemmSpec { m: SymDim::Concrete(128), n: 4096, k: 4096, dtype: DType::F32, trans_b: false, has_bias: false }), DType::F32);
         // Should be high (compute-bound)
         assert!(ai > 10.0, "GEMM AI={ai}, expected >10");
     }
 
     #[test]
     fn test_arithmetic_intensity_add() {
-        let ai = arithmetic_intensity(&OpKind::Add, DType::F32);
+        let ai = arithmetic_intensity(&Op::Add, DType::F32);
         assert!(ai < 1.0, "Add AI={ai}, expected <1");
     }
 
     #[test]
     fn test_fusable_as_gemm_epilogue() {
-        assert!(fusable_as_gemm_epilogue(&OpKind::Add));
-        assert!(fusable_as_gemm_epilogue(&OpKind::Silu));
-        assert!(!fusable_as_gemm_epilogue(&OpKind::SwiGlu));
-        assert!(!fusable_as_gemm_epilogue(&OpKind::Softmax));
+        assert!(fusable_as_gemm_epilogue(&Op::Add));
+        assert!(fusable_as_gemm_epilogue(&Op::Silu));
+        assert!(!fusable_as_gemm_epilogue(&Op::SwiGlu));
+        assert!(!fusable_as_gemm_epilogue(&Op::Softmax));
     }
 
     // ── QuantGemm / Dequantize tests ──
 
     #[test]
     fn test_quant_gemm_classify() {
-        let kind = OpKind::QuantGemm { m: SymDim::Concrete(1), n: 4096, k: 4096, quant_type: crate::quant::QuantType::Q4_0 };
+        let kind = Op::QuantGemm(QuantGemmSpec { m: SymDim::Concrete(1), n: 4096, k: 4096, quant_type: crate::quant::QuantType::Q4_0 });
         assert_eq!(classify(&kind), OpSemantics::Gemm);
     }
 
     #[test]
     fn test_quant_gemm_bottleneck() {
-        let kind = OpKind::QuantGemm { m: SymDim::Concrete(128), n: 4096, k: 4096, quant_type: crate::quant::QuantType::Q4_0 };
+        let kind = Op::QuantGemm(QuantGemmSpec { m: SymDim::Concrete(128), n: 4096, k: 4096, quant_type: crate::quant::QuantType::Q4_0 });
         assert_eq!(bottleneck(&kind, DType::F32), BottleneckType::ComputeBound);
     }
 
     #[test]
     fn test_quant_gemm_arithmetic_intensity() {
-        let kind = OpKind::QuantGemm { m: SymDim::Concrete(128), n: 4096, k: 4096, quant_type: crate::quant::QuantType::Q4_0 };
+        let kind = Op::QuantGemm(QuantGemmSpec { m: SymDim::Concrete(128), n: 4096, k: 4096, quant_type: crate::quant::QuantType::Q4_0 });
         let ai = arithmetic_intensity(&kind, DType::F32);
         // Q4 weights are 4x smaller → higher AI than F32 GEMM
         assert!(ai > 20.0, "Q4 GEMM AI={ai}, expected >20");
@@ -612,20 +630,20 @@ mod tests {
 
     #[test]
     fn test_dequantize_classify() {
-        let kind = OpKind::Dequantize { num_elements: 4096, block_size: 32, bits: 4 };
+        let kind = Op::Dequantize { num_elements: 4096, block_size: 32, bits: 4 };
         assert_eq!(classify(&kind), OpSemantics::Elementwise);
     }
 
     #[test]
     fn test_dequantize_bottleneck() {
-        let kind = OpKind::Dequantize { num_elements: 4096, block_size: 32, bits: 4 };
+        let kind = Op::Dequantize { num_elements: 4096, block_size: 32, bits: 4 };
         assert_eq!(bottleneck(&kind, DType::F32), BottleneckType::MemoryBound);
     }
 
     #[test]
     fn test_classify_rope_elementwise() {
         assert_eq!(
-            classify(&OpKind::RoPE { num_heads: 32, head_dim: 128, theta: 10000.0, partial: 1.0, rope_scaling: None }),
+            classify(&Op::RoPE(RopeSpec { num_heads: 32, head_dim: 128, theta: 10000.0, partial: 1.0, rope_scaling: None })),
             OpSemantics::Elementwise,
         );
     }
@@ -634,24 +652,19 @@ mod tests {
     fn test_classify_attention() {
         use crate::compiler::graph::AttentionStrategy;
         assert_eq!(
-            classify(&OpKind::MultiHeadAttention { seq_len: SymDim::Concrete(32), num_heads: 32, num_kv_heads: 32, head_dim: 128, causal: true, attention_sinks: false, kv_source: KvSource::FromTensor }),
+            classify(&Op::MultiHeadAttention(AttentionSpec { geometry: AttentionGeometry { num_q_heads: 32, num_kv_heads: 32, head_dim: 128 }, mask: AttentionMask::Causal, kv_source: KvSource::FromTensor, sinks: SinksSpec::None, seq_len: SymDim::Concrete(32), dtype: DType::F32 })),
             OpSemantics::Attention,
         );
         assert_eq!(
-            classify(&OpKind::CachedGQA {
-                seq_len: 1, total_seq: 128, num_heads: 32,
-                num_kv_heads: 8, head_dim: 128,
-                strategy: AttentionStrategy::Naive, kv_dtype: DType::F32,
-                kv_source: KvSource::FromTensor,
-            }),
+            classify(&Op::CachedGqa(CachedGqaSpec { geometry: AttentionGeometry { num_q_heads: 32, num_kv_heads: 8, head_dim: 128 }, mask: AttentionMask::Causal, kv_source: KvSource::FromTensor, seq_len: SymDim::Concrete(1), total_seq: 128, kv_dtype: DType::F32, strategy: AttentionStrategy::Naive })),
             OpSemantics::Attention,
         );
     }
 
     #[test]
     fn test_classify_opaque_only_metadata() {
-        assert_eq!(classify(&OpKind::Transpose { perm: vec![0, 2, 1, 3] }), OpSemantics::Opaque);
-        assert_eq!(classify(&OpKind::Reshape { target_shape: vec![1, 4096] }), OpSemantics::Opaque);
+        assert_eq!(classify(&Op::Transpose { perm: vec![0, 2, 1, 3] }), OpSemantics::Opaque);
+        assert_eq!(classify(&Op::Reshape { target_shape: vec![1, 4096] }), OpSemantics::Opaque);
     }
 
     // ── Additional tests for semantic classification coverage ──
@@ -659,28 +672,28 @@ mod tests {
     #[test]
     fn test_classify_moe_gate_as_gemm() {
         // MoE gate is semantically a GEMM (hidden @ router_weight)
-        let kind = OpKind::MoEGate { seq_len: 1, num_experts: 8, hidden: 4096, top_k: 2 };
+        let kind = Op::MoEGate { seq_len: SymDim::Concrete(1), num_experts: 8, hidden: 4096, top_k: 2 };
         assert_eq!(classify(&kind), OpSemantics::Gemm);
     }
 
     #[test]
     fn test_classify_reduction_ops() {
         // Multiple reduction-classified ops: LayerNorm, MeanPool, L2Normalize, QkNorm, Argmax
-        assert_eq!(classify(&OpKind::LayerNorm { feature_dim: 4096, eps: 1e-5 }), OpSemantics::Reduction);
+        assert_eq!(classify(&Op::LayerNorm(NormSpec { feature_dim: 4096, eps: 1e-5, dtype: DType::F32, has_weight: true })), OpSemantics::Reduction);
         assert_eq!(
-            classify(&OpKind::MeanPool { seq_len: 128, hidden: 768, cls_mode: false }),
+            classify(&Op::MeanPool { seq_len: 128, hidden: 768, cls_mode: false }),
             OpSemantics::Reduction,
         );
         assert_eq!(
-            classify(&OpKind::L2Normalize { hidden: 768 }),
+            classify(&Op::L2Normalize { hidden: 768 }),
             OpSemantics::Reduction,
         );
         assert_eq!(
-            classify(&OpKind::QkNorm { head_dim: 128, eps: 1e-6 }),
+            classify(&Op::QkNorm { head_dim: 128, eps: 1e-6 }),
             OpSemantics::Reduction,
         );
         assert_eq!(
-            classify(&OpKind::Argmax { vocab_size: 32000 }),
+            classify(&Op::Argmax { vocab_size: 32000 }),
             OpSemantics::Reduction,
         );
     }
@@ -689,25 +702,25 @@ mod tests {
     fn test_classify_mla_variants() {
         // MLA GEMM variants should classify as Gemm
         assert_eq!(
-            classify(&OpKind::MlaKvCompress { m: SymDim::Concrete(1), d_c: 512, hidden: 4096 }),
+            classify(&Op::MlaKvCompress { m: SymDim::Concrete(1), d_c: 512, hidden: 4096 }),
             OpSemantics::Gemm,
         );
         assert_eq!(
-            classify(&OpKind::MlaQAbsorb { seq_len: SymDim::Concrete(1), num_heads: 32, head_dim: 128, d_c: 512 }),
+            classify(&Op::MlaQAbsorb { seq_len: SymDim::Concrete(1), num_heads: 32, head_dim: 128, d_c: 512 }),
             OpSemantics::Gemm,
         );
         assert_eq!(
-            classify(&OpKind::MlaVRestore { seq_len: SymDim::Concrete(1), num_heads: 32, head_dim: 128, d_c: 512 }),
+            classify(&Op::MlaVRestore { seq_len: SymDim::Concrete(1), num_heads: 32, head_dim: 128, d_c: 512 }),
             OpSemantics::Gemm,
         );
         // MLA Attention should classify as Attention
         assert_eq!(
-            classify(&OpKind::MlaAttention { seq_len: SymDim::Concrete(32), num_heads: 32, head_dim: 128, d_c: 512, d_rope: 64, causal: true, kv_source: KvSource::FromTensor }),
+            classify(&Op::MlaAttention(MlaSpec { seq_len: SymDim::Concrete(32), num_heads: 32, head_dim: 128, d_c: 512, d_rope: 64, causal: true, kv_source: KvSource::FromTensor })),
             OpSemantics::Attention,
         );
         // MLA RoPE merge is elementwise
         assert_eq!(
-            classify(&OpKind::MlaRopeMerge { seq_len: SymDim::Concrete(1), d_c: 512, d_rope: 64 }),
+            classify(&Op::MlaRopeMerge { seq_len: SymDim::Concrete(1), d_c: 512, d_rope: 64 }),
             OpSemantics::Elementwise,
         );
     }
@@ -715,10 +728,10 @@ mod tests {
     #[test]
     fn test_arithmetic_intensity_elementwise_ops_low() {
         // Elementwise ops should have low arithmetic intensity (memory-bound)
-        let silu_ai = arithmetic_intensity(&OpKind::Silu, DType::F32);
-        let add_ai = arithmetic_intensity(&OpKind::Add, DType::F32);
-        let mul_ai = arithmetic_intensity(&OpKind::Mul, DType::F32);
-        let residual_ai = arithmetic_intensity(&OpKind::Residual, DType::F32);
+        let silu_ai = arithmetic_intensity(&Op::Silu, DType::F32);
+        let add_ai = arithmetic_intensity(&Op::Add, DType::F32);
+        let mul_ai = arithmetic_intensity(&Op::Mul, DType::F32);
+        let residual_ai = arithmetic_intensity(&Op::Residual, DType::F32);
 
         assert!(silu_ai > 0.0, "Silu AI should be positive, got {silu_ai}");
         assert!(add_ai > 0.0, "Add AI should be positive, got {add_ai}");
@@ -736,11 +749,11 @@ mod tests {
     fn test_arithmetic_intensity_quant_gemm_higher_than_f32() {
         // QuantGemm with 4-bit weights should have higher AI than F32 GEMM (smaller weights)
         let f32_gemv = arithmetic_intensity(
-            &OpKind::Gemm { m: SymDim::Concrete(1), n: 4096, k: 4096, dtype: DType::F32, trans_b: false },
+            &Op::Gemm(GemmSpec { m: SymDim::Concrete(1), n: 4096, k: 4096, dtype: DType::F32, trans_b: false, has_bias: false }),
             DType::F32,
         );
         let q4_gemv = arithmetic_intensity(
-            &OpKind::QuantGemm { m: SymDim::Concrete(1), n: 4096, k: 4096, quant_type: crate::quant::QuantType::Q4_0 },
+            &Op::QuantGemm(QuantGemmSpec { m: SymDim::Concrete(1), n: 4096, k: 4096, quant_type: crate::quant::QuantType::Q4_0 }),
             DType::F32,
         );
         assert!(q4_gemv > f32_gemv, "Q4 GEMM AI={q4_gemv} should be > F32 GEMM AI={f32_gemv}");
@@ -749,45 +762,45 @@ mod tests {
     #[test]
     fn test_bottleneck_quant_gemm_memory_bound_small() {
         // Small M=1 QuantGemm should be memory-bound (GEMV)
-        let kind = OpKind::QuantGemm { m: SymDim::Concrete(1), n: 4096, k: 4096, quant_type: crate::quant::QuantType::Q4_0 };
+        let kind = Op::QuantGemm(QuantGemmSpec { m: SymDim::Concrete(1), n: 4096, k: 4096, quant_type: crate::quant::QuantType::Q4_0 });
         assert_eq!(bottleneck(&kind, DType::F32), BottleneckType::MemoryBound);
     }
 
     #[test]
     fn test_arithmetic_intensity_zero_for_pure_memory_ops() {
         // Pure memory/data-movement ops should have zero arithmetic intensity
-        assert_eq!(arithmetic_intensity(&OpKind::Gather { table_rows: 32000, embed_dim: 4096, index_dim: SymDim::Concrete(1), indices_kind: crate::compiler::graph::GatherIndicesKind::Tensor, scale: None }, DType::F32), 0.0);
-        assert_eq!(arithmetic_intensity(&OpKind::Reshape { target_shape: vec![1, 4096] }, DType::F32), 0.0);
-        assert_eq!(arithmetic_intensity(&OpKind::Transpose { perm: vec![0, 2, 1, 3] }, DType::F32), 0.0);
+        assert_eq!(arithmetic_intensity(&Op::Gather { table_rows: 32000, embed_dim: 4096, index_dim: SymDim::Concrete(1), indices_kind: crate::compiler::graph::GatherIndicesKind::Tensor, scale: None }, DType::F32), 0.0);
+        assert_eq!(arithmetic_intensity(&Op::Reshape { target_shape: vec![1, 4096] }, DType::F32), 0.0);
+        assert_eq!(arithmetic_intensity(&Op::Transpose { perm: vec![0, 2, 1, 3] }, DType::F32), 0.0);
     }
 
     #[test]
     fn test_fusable_epilogue_excludes_non_elementwise() {
         // Ops that are not fusable as GEMM epilogue (Gelu IS fusable, so excluded)
-        assert!(!fusable_as_gemm_epilogue(&OpKind::Softmax));
-        assert!(!fusable_as_gemm_epilogue(&OpKind::RmsNorm { feature_dim: 4096, eps: 1e-5 }));
-        assert!(!fusable_as_gemm_epilogue(&OpKind::Mul));
-        assert!(!fusable_as_gemm_epilogue(&OpKind::SwiGlu));
-        assert!(!fusable_as_gemm_epilogue(&OpKind::RoPE { num_heads: 32, head_dim: 128, theta: 10000.0, partial: 1.0, rope_scaling: None }));
+        assert!(!fusable_as_gemm_epilogue(&Op::Softmax));
+        assert!(!fusable_as_gemm_epilogue(&Op::RmsNorm(NormSpec { feature_dim: 4096, eps: 1e-5, dtype: DType::F32, has_weight: true })));
+        assert!(!fusable_as_gemm_epilogue(&Op::Mul));
+        assert!(!fusable_as_gemm_epilogue(&Op::SwiGlu));
+        assert!(!fusable_as_gemm_epilogue(&Op::RoPE(RopeSpec { num_heads: 32, head_dim: 128, theta: 10000.0, partial: 1.0, rope_scaling: None })));
     }
 
     #[test]
     fn test_classify_gated_activations_as_elementwise() {
         // All gated activations (SwiGlu, GeGlu, clipped SwiGlu) are elementwise
-        assert_eq!(classify(&OpKind::SwiGlu), OpSemantics::Elementwise);
-        assert_eq!(classify(&OpKind::GeGlu), OpSemantics::Elementwise);
-        assert_eq!(classify(&OpKind::SwiGluClipped { limit: 7.0 }), OpSemantics::Elementwise);
+        assert_eq!(classify(&Op::SwiGlu), OpSemantics::Elementwise);
+        assert_eq!(classify(&Op::GeGlu), OpSemantics::Elementwise);
+        assert_eq!(classify(&Op::SwiGluClipped { limit: 7.0 }), OpSemantics::Elementwise);
     }
 
     #[test]
     fn test_classify_moe_router_and_dispatch_as_opaque() {
         // MoE router and dispatch packed are composite opaque ops
         assert_eq!(
-            classify(&OpKind::MoERouter { num_experts: 64, top_k: 8, hidden: 4096, seq_len: SymDim::Concrete(1) }),
+            classify(&Op::MoERouter { num_experts: 64, top_k: 8, hidden: 4096, seq_len: SymDim::Concrete(1) }),
             OpSemantics::Opaque,
         );
         assert_eq!(
-            classify(&OpKind::MoEDispatchPacked {
+            classify(&Op::MoEDispatchPacked {
                 num_experts: 64, top_k: 8, mxfp4_block_size: 32,
                 swiglu_limit: 7.0, intermediate_size: 1408, hidden: 4096,
                 seq_len: SymDim::Concrete(1),
