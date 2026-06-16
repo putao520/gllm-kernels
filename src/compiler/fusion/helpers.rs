@@ -4,7 +4,7 @@
 //! The old duplicated `_dag` variants have been merged into these.
 
 use std::collections::HashSet;
-use crate::compiler::graph::{CompilerGraph, CompilerOp, Op, OpKind, OpId, TensorId};
+use crate::compiler::graph::{CompilerGraph, CompilerOp, Op, OpId, TensorId};
 use crate::compiler::semantic_dag::{SemanticDAG, OpClass};
 use crate::compiler::semantics;
 use super::types::{FusionGroup, FusionMode, GroupMarker};
@@ -464,7 +464,7 @@ pub(crate) fn collect_epilogue<'a>(
                 .unwrap_or(OpClass::Opaque);
             matches!(consumer_class, OpClass::ElemWise)
         } else {
-            semantics::classify(&consumer.kind) == semantics::OpSemantics::Elementwise
+            semantics::classify(&consumer.op_v2) == semantics::OpSemantics::Elementwise
         };
 
         if !is_elementwise {
@@ -557,7 +557,7 @@ pub(crate) fn collect_elementwise_chain<'a>(
                 .unwrap_or(OpClass::Opaque);
             matches!(consumer_class, OpClass::ElemWise | OpClass::Injective)
         } else {
-            semantics::classify(&consumer.kind) == semantics::OpSemantics::Elementwise
+            semantics::classify(&consumer.op_v2) == semantics::OpSemantics::Elementwise
         };
 
         if !is_elementwise {
