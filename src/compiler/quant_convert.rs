@@ -408,7 +408,7 @@ mod tests {
 
     #[test]
     fn should_quantize_op_gemm_only() {
-        use crate::compiler::graph::SymDim;
+        use crate::compiler::graph::{SymDim, GemmSpec};
         assert!(should_quantize_op(&OpKind::Gemm {
             m: SymDim::Concrete(1), n: 64, k: 64, dtype: crate::types::DType::F32, trans_b: false
         }));
@@ -512,7 +512,7 @@ mod tests {
 
     #[test]
     fn should_quantize_op_gemm_bias() {
-        use crate::compiler::graph::SymDim;
+        use crate::compiler::graph::{SymDim, GemmSpec};
         assert!(should_quantize_op(&OpKind::GemmBias {
             m: SymDim::Concrete(1), n: 64, k: 64,
             dtype: crate::types::DType::F32, trans_b: false,
@@ -561,7 +561,7 @@ mod tests {
 
     #[test]
     fn apply_quantization_with_gemm_ops() {
-        use crate::compiler::graph::SymDim;
+        use crate::compiler::graph::{SymDim, GemmSpec};
         use crate::types::DType;
 
         // Arrange: create a graph with a Gemm op
@@ -569,8 +569,7 @@ mod tests {
         let input = graph.add_tensor_concrete("input", &[16], DType::F32);
         let weight = graph.add_tensor_concrete("weight", &[16, 16], DType::F32);
         let output = graph.add_tensor_concrete("output", &[16], DType::F32);
-        graph.add_op(
-            OpKind::Gemm { m: SymDim::Concrete(1), n: 16, k: 16, dtype: DType::F32, trans_b: false },
+        graph.add_op_with_op(Op::Gemm(GemmSpec { m: SymDim::Concrete(1), n: 16, k: 16, dtype: DType::F32, trans_b: false, has_bias: false }), OpKind::Gemm { m: SymDim::Concrete(1), n: 16, k: 16, dtype: DType::F32, trans_b: false },
             vec![input, weight],
             vec![output],
             "gemm",
