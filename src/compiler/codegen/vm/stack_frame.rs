@@ -3,6 +3,7 @@
 use super::isa_profile::*;
 
 use super::reg_alloc::RegAllocation;
+use crate::compiler::trace::QuantPrecision;
 
 // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 // §1 StackFrame — scope-based 栈帧
@@ -466,7 +467,9 @@ impl PressureModel {
     pub fn analyze(profile: &IsaProfile, mode: ExecutionMode) -> Self {
         let cache = &profile.cache;
         // ARCH-DATA-FLOW-CONTRACT §2.2: 元素字节数来自单一来源
-        let elem = super::lower::computation_elem_bytes();
+        // PressureModel 用于 GEMM blocking 估算,F32 作为 buffer sizing 上界
+        // (多精度架构下,BF16/F16 实际 buffer 更小,F32 是保守上界)。
+        let elem = super::lower::computation_elem_bytes(QuantPrecision::F32);
 
         // GEMM blocking 从缓存推导（容量从 IsaProfile 读取，不硬编码）
         let l1 = cache.l1d_bytes.max(8192);

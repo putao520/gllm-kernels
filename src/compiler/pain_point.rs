@@ -281,7 +281,9 @@ impl PainPointAnalyzer {
 
             let role = classify_gemm_role(op_id, graph, &all_gemms_in_order);
             let flops = 2.0 * m as f64 * n as f64 * k as f64;
-            let bytes = (m * k + k * n + m * n) as f64 * 4.0; // F32
+            // PERF: bytes 用 F32 (4 字节) 作为保守估算上界,非统一精度假设
+            // (实际 dtype 从 op inputs 推导,BF16/F16 buffer 更小,F32 是上界)
+            let bytes = (m * k + k * n + m * n) as f64 * 4.0;
             let ai = if bytes > 0.0 { flops / bytes } else { 0.0 };
 
             let bottleneck = if m <= 1 && n * k <= 256 {
@@ -452,6 +454,7 @@ fn compute_fusion_benefits(
     m: usize, n: usize, k: usize,
 ) -> HashMap<FusionPriority, f64> {
     let mut benefits = HashMap::new();
+    // PERF: F32 (4 字节) 作为保守估算上界,非统一精度假设
     let output_bytes = (m * n) as f64 * 4.0;
     let input_bytes = (m * k) as f64 * 4.0;
 

@@ -433,7 +433,7 @@ pub(crate) fn lower_op_v2(
             })?;
             super::structural_builder::StructuralOpBuilder::emit_simd_injection(
                 prog, input_ptr, sg_base,
-                12, 16 + dim * 4, dim, ctx.session.width,
+                12, 16 + dim * 4, dim, ctx.session.width, ctx.dtype,
             )?;
             Ok(true)
         }
@@ -448,7 +448,7 @@ pub(crate) fn lower_op_v2(
                 dst: detect_ptr, src: PtrExpr::VRegPlusConst(sg_base, 16),
             });
             super::structural_builder::StructuralOpBuilder::emit_side_channel_copy(
-                prog, input_ptr, detect_ptr, 0, hidden_dim, ctx.session.width,
+                prog, input_ptr, detect_ptr, 0, hidden_dim, ctx.session.width, ctx.dtype,
             )?;
             if abi.callback_table_ptr.is_some() {
                 let cb_table = prog.alloc_vreg(VRegKind::Ptr, SimdWidth::Scalar);

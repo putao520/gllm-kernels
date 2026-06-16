@@ -19,6 +19,11 @@
 //! **NO_SCALAR rule**: `dequant_mxfp4_scalar` is intended only for SymExec ground truth and
 //! test reference. The runtime hot path must use [`dequant_mxfp4`] (or `dequant_mxfp4_avx2`
 //! directly when AVX2 has been verified at higher level).
+//!
+//! **dtype 设计(REQ-DTYPE-CHAIN-004)**:MXFP4 解码输出固定 F32 是反量化语义合法默认
+//! (4-bit 量化 → 浮点值)。多精度架构下,若需 BF16/F16 输出,由调用方在 wrapper 层做
+//! F32 → 目标 dtype 的 cast,而非 dequant 函数自己处理。`vec![0f32; N]` 仅出现在测试
+//! 代码,验证 F32 解码路径正确性。
 
 /// OCP e2m1 4-bit float lookup table.
 ///

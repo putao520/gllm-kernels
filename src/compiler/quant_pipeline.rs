@@ -28,6 +28,23 @@ use crate::compiler::trace::{
 use crate::quant::QuantType;
 use crate::types::CompilerError;
 
+/// 从 QuantType 推导默认 compute_dtype(REQ-DTYPE-CHAIN-004)。
+///
+/// - Native float (Bf16/F16/F32):保持原 dtype,不转换
+/// - 量化格式 (Q4_K/MXFP4/NVFP4 等):反量化到 F32(标准 dequant 目标)
+///
+/// **不是统一精度假设**:F32 是反量化语义合法默认;调用方可通过
+/// `with_compute_dtype()` 显式覆盖为 BF16/F16 等多精度目标。
+pub fn quant_type_to_compute_dtype(qt: QuantType) -> QuantPrecision {
+    match qt {
+        QuantType::Bf16 => QuantPrecision::BF16,
+        QuantType::F16 => QuantPrecision::F16,
+        QuantType::F32 => QuantPrecision::F32,
+        // 所有量化格式默认反量化到 F32(可被 with_compute_dtype 覆盖)
+        _ => QuantPrecision::F32,
+    }
+}
+
 // ────────────────────────────────────────────────────────────────────────────
 // QuantPipeline: configuration + pipeline builder
 // ────────────────────────────────────────────────────────────────────────────
@@ -49,13 +66,15 @@ pub struct QuantPipeline {
 impl QuantPipeline {
     /// Create a new QuantPipeline for the given quantization format.
     ///
-    /// The SIMD width and compute dtype are derived from the quantization
-    /// format's natural output precision (F32 for all GGUF block formats).
+    /// The SIMD width defaults to W256; compute dtype is derived from the
+    /// quantization format via `quant_type_to_compute_dtype()` (native float
+    /// preserves dtype, quantized formats default to F32 反量化目标).
+    /// Use `with_compute_dtype()` to override for BF16/F16 multi-precision.
     pub fn new(quant_type: QuantType) -> Self {
         Self {
             quant_type,
             width: SimdWidth::W256,
-            compute_dtype: QuantPrecision::F32,
+            compute_dtype: quant_type_to_compute_dtype(quant_type),
         }
     }
 

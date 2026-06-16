@@ -247,6 +247,8 @@ fn derive_intermediate(graph: &CompilerGraph, hidden: usize) -> Result<usize, In
         Ok(max_n_not_hidden)
     } else {
         // Encoder models may not have a separate FFN intermediate.
+        // PERF: F32 (4 字节) 作为 buffer 估算上界,非统一精度假设
+        // (实际 elem_bytes 从 graph tensors dtype 推导,F32 是保守上界)
         Ok(hidden * 4)
     }
 }

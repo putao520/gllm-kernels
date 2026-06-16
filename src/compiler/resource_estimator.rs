@@ -72,6 +72,7 @@ pub fn estimate_tile_resource_bytes(
         if let Some((m, n, _)) = anchor_op.op_v2_gemm_dims(graph) {
             let m_val = m.max_for_allocation_strict().unwrap_or(graph.max_seq_len);
             let tile_rows = m_val.min(64);
+            // PERF: F32 (4 字节) 作为 tile bytes 估算上界,非统一精度假设
             return tile_rows * n * 4;
         }
     }

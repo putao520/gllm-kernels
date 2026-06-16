@@ -1,5 +1,10 @@
 //! NEON GEMM driver using the hand-written 8x12 assembly microkernel.
 //!
+//! **精度范围(REQ-DTYPE-CHAIN-004)**:本模块仅支持 F32 计算路径,作为 F32 模型的
+//! 性能优化快速路径。BF16/F16/I8 等多精度 GEMM 走 JIT codegen 路径
+//! (`aarch64_lower/lower_instr.inc.rs` 中 BFMMLA/BFDOT 指令),不走本模块。
+//! 这是性能 vs 通用性的权衡,不违反 ARCH-DTYPE-JIT-TYPED 铁律。
+//!
 //! This module provides the complete GEMM implementation:
 //! - Pack A into column-major MR-wide panels (r-inner / k-outer order)
 //! - Pack B into row-major NR-wide panels (KC-blocked full-matrix prepacking)

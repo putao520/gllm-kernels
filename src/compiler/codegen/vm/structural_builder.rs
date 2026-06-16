@@ -22,9 +22,11 @@ impl StructuralOpBuilder {
         dst_offset: usize,
         hidden_dim: usize,
         width: SimdWidth,
+        dtype: QuantPrecision,
     ) -> Result<(), CompilerError> {
+        let elem_bytes = dtype.elem_bytes();
         let step = width.f32_lanes();
-        let byte_step = step * 4;
+        let byte_step = step * elem_bytes;
         let iterations = (hidden_dim + step - 1) / step;
         let ctr = prog.alloc_vreg(VRegKind::Counter, SimdWidth::Scalar);
         let byte_off = prog.alloc_vreg(VRegKind::ByteOffset, SimdWidth::Scalar);
@@ -36,16 +38,16 @@ impl StructuralOpBuilder {
         prog.emit(VmInstr::VecLoad {
             dst: vec, base: src_base,
             offset: OffsetExpr::LoopOffset(byte_off), width,
-            dtype: QuantPrecision::F32, predicate: None,
+            dtype, predicate: None,
         });
         prog.emit(VmInstr::VecStore {
             base: dst_base, src: vec,
             offset: OffsetExpr::Add(
-                Box::new(OffsetExpr::Const(dst_offset)),
+                Box::new(OffsetExpr::Const(dst_offset * elem_bytes)),
                 Box::new(OffsetExpr::LoopOffset(byte_off)),
             ),
             width,
-            dtype: QuantPrecision::F32, predicate: None,
+            dtype, predicate: None,
         });
         prog.emit(VmInstr::LoopEnd);
         Ok(())
@@ -61,9 +63,11 @@ impl StructuralOpBuilder {
         kv_offset: usize,
         hidden_dim: usize,
         width: SimdWidth,
+        dtype: QuantPrecision,
     ) -> Result<(), CompilerError> {
+        let elem_bytes = dtype.elem_bytes();
         let step = width.f32_lanes();
-        let byte_step = step * 4;
+        let byte_step = step * elem_bytes;
         let iterations = (hidden_dim + step - 1) / step;
         let ctr = prog.alloc_vreg(VRegKind::Counter, SimdWidth::Scalar);
         let byte_off = prog.alloc_vreg(VRegKind::ByteOffset, SimdWidth::Scalar);
@@ -80,7 +84,7 @@ impl StructuralOpBuilder {
                 Box::new(OffsetExpr::LoopOffset(byte_off)),
             ),
             width,
-            dtype: QuantPrecision::F32, predicate: None,
+            dtype, predicate: None,
         });
         // Broadcast confidence
         let conf_bc = prog.alloc_vreg(VRegKind::Vec, width);
@@ -88,14 +92,14 @@ impl StructuralOpBuilder {
             dst: conf_bc,
             src: ScalarExpr::MemLoad(knowledge_base, OffsetExpr::Const(conf_offset)),
             width,
-            dtype: QuantPrecision::F32,
+            dtype,
         });
         // conf * kv + hidden (FMA via auto_lower_trace_raw)
         let hidden_vec = prog.alloc_vreg(VRegKind::Vec, width);
         prog.emit(VmInstr::VecLoad {
             dst: hidden_vec, base: hidden_base,
             offset: OffsetExpr::LoopOffset(byte_off), width,
-            dtype: QuantPrecision::F32, predicate: None,
+            dtype, predicate: None,
         });
         let fma_body = [
             TraceOp::Input(0),  // conf_bc (slot 0)
@@ -105,14 +109,14 @@ impl StructuralOpBuilder {
             TraceOp::Add(ValueId(2), ValueId(3)), // slot 4 = hidden + conf*kv
         ];
         let fma_slots = auto_select::auto_lower_trace_raw(
-            prog, &fma_body, &[conf_bc, kv_vec, hidden_vec], width, QuantPrecision::F32)?;
+            prog, &fma_body, &[conf_bc, kv_vec, hidden_vec], width, dtype)?;
         let result = *fma_slots.last().ok_or_else(|| CompilerError::CodegenViolation(
             "emit_simd_injection: auto_lower_trace_raw returned empty".into(),
         ))?;
         prog.emit(VmInstr::VecStore {
             base: hidden_base, src: result,
             offset: OffsetExpr::LoopOffset(byte_off), width,
-            dtype: QuantPrecision::F32, predicate: None,
+            dtype, predicate: None,
         });
         prog.emit(VmInstr::LoopEnd);
         Ok(())
@@ -179,7 +183,7 @@ mod tests {
         let dst = prog.alloc_vreg(VRegKind::Ptr, SimdWidth::Scalar);
 
         StructuralOpBuilder::emit_side_channel_copy(
-            &mut prog, src, dst, 0, 16, SimdWidth::W256,
+            &mut prog, src, dst, 0, 16, SimdWidth::W256, QuantPrecision::F32
         ).unwrap();
 
         // Should have: LoopBegin, VecLoad, VecStore, LoopEnd
@@ -203,7 +207,7 @@ mod tests {
         let dst = prog.alloc_vreg(VRegKind::Ptr, SimdWidth::Scalar);
 
         StructuralOpBuilder::emit_side_channel_copy(
-            &mut prog, src, dst, 4096, 32, SimdWidth::W256,
+            &mut prog, src, dst, 4096, 32, SimdWidth::W256, QuantPrecision::F32
         ).unwrap();
 
         let store = prog.instrs.iter().find_map(|i| match i {
@@ -222,7 +226,7 @@ mod tests {
         let dst = prog.alloc_vreg(VRegKind::Ptr, SimdWidth::Scalar);
 
         StructuralOpBuilder::emit_side_channel_copy(
-            &mut prog, src, dst, 0, 1, SimdWidth::Scalar,
+            &mut prog, src, dst, 0, 1, SimdWidth::Scalar, QuantPrecision::F32
         ).unwrap();
 
         // 1 element with scalar width = 1 iteration
@@ -238,7 +242,7 @@ mod tests {
         let knowledge = prog.alloc_vreg(VRegKind::Ptr, SimdWidth::Scalar);
 
         StructuralOpBuilder::emit_simd_injection(
-            &mut prog, hidden, knowledge, 0, 0, 8, SimdWidth::W256,
+            &mut prog, hidden, knowledge, 0, 0, 8, SimdWidth::W256, QuantPrecision::F32
         ).unwrap();
 
         let has_broadcast = prog.instrs.iter().any(|i| matches!(i, VmInstr::Broadcast { .. }));
@@ -256,7 +260,7 @@ mod tests {
         let knowledge = prog.alloc_vreg(VRegKind::Ptr, SimdWidth::Scalar);
 
         StructuralOpBuilder::emit_simd_injection(
-            &mut prog, hidden, knowledge, 1024, 2048, 16, SimdWidth::W256,
+            &mut prog, hidden, knowledge, 1024, 2048, 16, SimdWidth::W256, QuantPrecision::F32
         ).unwrap();
 
         // At least one VecLoad should use an Add offset (for knowledge vector)
@@ -385,10 +389,10 @@ mod tests {
         let dst5 = prog_w512.alloc_vreg(VRegKind::Ptr, SimdWidth::Scalar);
 
         StructuralOpBuilder::emit_side_channel_copy(
-            &mut prog_w256, src2, dst2, 0, 64, SimdWidth::W256,
+            &mut prog_w256, src2, dst2, 0, 64, SimdWidth::W256, QuantPrecision::F32
         ).unwrap();
         StructuralOpBuilder::emit_side_channel_copy(
-            &mut prog_w512, src5, dst5, 0, 64, SimdWidth::W512,
+            &mut prog_w512, src5, dst5, 0, 64, SimdWidth::W512, QuantPrecision::F32
         ).unwrap();
 
         // Same instruction count (only loop bound differs)
@@ -428,10 +432,10 @@ mod tests {
 
         // hidden_dim=16: W128 (4 lanes) => 4 iterations, W256 (8 lanes) => 2 iterations
         StructuralOpBuilder::emit_side_channel_copy(
-            &mut prog_w128, src1, dst1, 0, 16, SimdWidth::W128,
+            &mut prog_w128, src1, dst1, 0, 16, SimdWidth::W128, QuantPrecision::F32
         ).unwrap();
         StructuralOpBuilder::emit_side_channel_copy(
-            &mut prog_w256, src2, dst2, 0, 16, SimdWidth::W256,
+            &mut prog_w256, src2, dst2, 0, 16, SimdWidth::W256, QuantPrecision::F32
         ).unwrap();
 
         let bound_w128 = prog_w128.instrs.iter().find_map(|i| match i {
@@ -456,7 +460,7 @@ mod tests {
         let dst = prog.alloc_vreg(VRegKind::Ptr, SimdWidth::Scalar);
 
         StructuralOpBuilder::emit_side_channel_copy(
-            &mut prog, src, dst, 0, 8, SimdWidth::W256,
+            &mut prog, src, dst, 0, 8, SimdWidth::W256, QuantPrecision::F32
         ).unwrap();
 
         // When dst_offset=0, the store offset should be Add(Const(0), LoopOffset(_))
@@ -479,7 +483,7 @@ mod tests {
         let knowledge = prog.alloc_vreg(VRegKind::Ptr, SimdWidth::Scalar);
 
         StructuralOpBuilder::emit_simd_injection(
-            &mut prog, hidden, knowledge, 0, 0, 8, SimdWidth::W256,
+            &mut prog, hidden, knowledge, 0, 0, 8, SimdWidth::W256, QuantPrecision::F32
         ).unwrap();
 
         // The final VecStore should write back to hidden_base
@@ -500,7 +504,7 @@ mod tests {
 
         // hidden_dim=1 with Scalar width => 1 iteration
         StructuralOpBuilder::emit_simd_injection(
-            &mut prog, hidden, knowledge, 0, 0, 1, SimdWidth::Scalar,
+            &mut prog, hidden, knowledge, 0, 0, 1, SimdWidth::Scalar, QuantPrecision::F32
         ).unwrap();
 
         let bound = prog.instrs.iter().find_map(|i| match i {
@@ -547,7 +551,7 @@ mod tests {
 
         // W512 = 16 f32 lanes = 64 bytes per step
         StructuralOpBuilder::emit_side_channel_copy(
-            &mut prog, src, dst, 0, 64, SimdWidth::W512,
+            &mut prog, src, dst, 0, 64, SimdWidth::W512, QuantPrecision::F32
         ).unwrap();
 
         let step_bytes = prog.instrs.iter().find_map(|i| match i {
@@ -588,7 +592,7 @@ mod tests {
         let dst = prog.alloc_vreg(VRegKind::Ptr, SimdWidth::Scalar);
 
         StructuralOpBuilder::emit_side_channel_copy(
-            &mut prog, src, dst, 0, 8, SimdWidth::W256,
+            &mut prog, src, dst, 0, 8, SimdWidth::W256, QuantPrecision::F32
         ).unwrap();
 
         // Should have DeclareVReg for Counter and ByteOffset kinds
@@ -610,7 +614,7 @@ mod tests {
         let knowledge = prog.alloc_vreg(VRegKind::Ptr, SimdWidth::Scalar);
 
         StructuralOpBuilder::emit_simd_injection(
-            &mut prog, hidden, knowledge, 0, 0, 8, SimdWidth::W256,
+            &mut prog, hidden, knowledge, 0, 0, 8, SimdWidth::W256, QuantPrecision::F32
         ).unwrap();
 
         // Should end with LoopEnd
@@ -658,7 +662,7 @@ mod tests {
 
         // hidden_dim=9 with W128 (4 lanes) => ceil(9/4) = 3 iterations
         StructuralOpBuilder::emit_side_channel_copy(
-            &mut prog, src, dst, 0, 9, SimdWidth::W128,
+            &mut prog, src, dst, 0, 9, SimdWidth::W128, QuantPrecision::F32
         ).unwrap();
 
         let bound = prog.instrs.iter().find_map(|i| match i {
@@ -678,7 +682,7 @@ mod tests {
 
         // hidden_dim=17 with W128 (4 lanes) => ceil(17/4) = 5 iterations
         StructuralOpBuilder::emit_simd_injection(
-            &mut prog, hidden, knowledge, 0, 0, 17, SimdWidth::W128,
+            &mut prog, hidden, knowledge, 0, 0, 17, SimdWidth::W128, QuantPrecision::F32
         ).unwrap();
 
         let bound = prog.instrs.iter().find_map(|i| match i {
@@ -718,7 +722,7 @@ mod tests {
         let dst = prog.alloc_vreg(VRegKind::Ptr, SimdWidth::Scalar);
 
         StructuralOpBuilder::emit_side_channel_copy(
-            &mut prog, src, dst, 0, 8, SimdWidth::W256,
+            &mut prog, src, dst, 0, 8, SimdWidth::W256, QuantPrecision::F32
         ).unwrap();
 
         let load_base = prog.instrs.iter().find_map(|i| match i {
@@ -743,7 +747,7 @@ mod tests {
         let knowledge = prog.alloc_vreg(VRegKind::Ptr, SimdWidth::Scalar);
 
         StructuralOpBuilder::emit_simd_injection(
-            &mut prog, hidden, knowledge, 512, 1024, 8, SimdWidth::W256,
+            &mut prog, hidden, knowledge, 512, 1024, 8, SimdWidth::W256, QuantPrecision::F32
         ).unwrap();
 
         // Broadcast should load confidence from knowledge_base at conf_offset
@@ -765,7 +769,7 @@ mod tests {
         let dst = prog.alloc_vreg(VRegKind::Ptr, SimdWidth::Scalar);
 
         StructuralOpBuilder::emit_side_channel_copy(
-            &mut prog, src, dst, 0, 32, SimdWidth::W512,
+            &mut prog, src, dst, 0, 32, SimdWidth::W512, QuantPrecision::F32
         ).unwrap();
 
         let step_bytes = prog.instrs.iter().find_map(|i| match i {
@@ -827,7 +831,7 @@ mod tests {
         let dst = prog.alloc_vreg(VRegKind::Ptr, SimdWidth::Scalar);
 
         StructuralOpBuilder::emit_side_channel_copy(
-            &mut prog, src, dst, 0, 8, SimdWidth::W256,
+            &mut prog, src, dst, 0, 8, SimdWidth::W256, QuantPrecision::F32
         ).unwrap();
 
         // Find positions: LoopBegin, first VecLoad, first VecStore, LoopEnd
