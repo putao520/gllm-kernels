@@ -331,7 +331,7 @@ impl ComputeDensity {
 /// Estimate FLOPs for a single op within a fusion group.
 /// GEMM variants: 2*M*N*K. Others: 0 (negligible for roofline classification).
 fn estimate_group_op_flops(op: &crate::compiler::graph::CompilerOp, graph: &crate::compiler::graph::CompilerGraph, max_seq_len: usize) -> u64 {
-    match op.op_v2_gemm_dims(graph) {
+    match op.op_gemm_dims(graph) {
         Some((m, n, k)) => {
             2 * (m.max_for_allocation_strict().unwrap_or(max_seq_len) as u64) * (n as u64) * (k as u64)
         }

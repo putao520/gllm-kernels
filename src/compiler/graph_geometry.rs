@@ -72,9 +72,9 @@ impl GraphDerivedGeometry {
         let mut vocab_size = None;
 
         let mut rope_found = false;
-        // Scan ops for Op v2 Spec 参数（胖 opcode 自描述）。
+        // Scan ops for Op Spec 参数（胖 opcode 自描述）。
         for op in &graph.ops {
-            match op.op_v2_resolved(graph) {
+            match op.op_resolved(graph) {
                 Some(Op::RoPE(spec)) => {
                     if num_heads.is_none() { num_heads = Some(spec.num_heads); }
                     if head_dim.is_none() { head_dim = Some(spec.head_dim); }
@@ -168,13 +168,13 @@ fn derive_hidden(graph: &CompilerGraph) -> Result<usize, InferenceError> {
     }
     // Fallback: scan ops for hidden dimension indicators.
     for op in &graph.ops {
-        if let Some((_, _, k)) = op.op_v2_gemm_dims(graph) {
+        if let Some((_, _, k)) = op.op_gemm_dims(graph) {
             return Ok(k);
         }
-        if let Some(Op::Gather { embed_dim, .. }) = op.op_v2_resolved(graph) {
+        if let Some(Op::Gather { embed_dim, .. }) = op.op_resolved(graph) {
             return Ok(embed_dim);
         }
-        if let Some(Op::PatchEmbed { embed_dim, .. }) = op.op_v2_resolved(graph) {
+        if let Some(Op::PatchEmbed { embed_dim, .. }) = op.op_resolved(graph) {
             return Ok(embed_dim);
         }
         // Elementwise ops (Residual, BinaryElementwise, etc.) don't carry
@@ -219,8 +219,8 @@ fn derive_storage_dtype(graph: &CompilerGraph) -> DType {
 fn derive_intermediate(graph: &CompilerGraph, hidden: usize) -> Result<usize, InferenceError> {
     let mut max_n_not_hidden = 0usize;
     for op in &graph.ops {
-        // 胖 opcode 自描述：从 Op v2 Spec 读 GEMM 维度
-        let (n, k) = match op.op_v2_gemm_dims(graph) {
+        // 胖 opcode 自描述：从 Op Spec 读 GEMM 维度
+        let (n, k) = match op.op_gemm_dims(graph) {
             Some((_, n, k)) if k == hidden => (n, k),
             _ => continue,
         };
@@ -233,9 +233,9 @@ fn derive_intermediate(graph: &CompilerGraph, hidden: usize) -> Result<usize, In
     // If no GEMM with n > hidden found, check for any GEMM with n != hidden.
     if max_n_not_hidden == 0 {
         for op in &graph.ops {
-            let (n, k) = match op.op_v2_gemm_dims(graph) {
+            let (n, k) = match op.op_gemm_dims(graph) {
                 // 仅 Gemm/GemmBias（不含 QuantGemm）
-                Some((_, n, k)) if k == hidden && matches!(op.op_v2_resolved(graph), Some(Op::Gemm(_)) | Some(Op::GemmBias(_))) => (n, k),
+                Some((_, n, k)) if k == hidden && matches!(op.op_resolved(graph), Some(Op::Gemm(_)) | Some(Op::GemmBias(_))) => (n, k),
                 _ => continue,
             };
             if n != hidden && n > max_n_not_hidden {

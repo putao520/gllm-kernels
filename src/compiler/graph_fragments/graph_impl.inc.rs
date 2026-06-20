@@ -55,7 +55,7 @@ impl CompilerGraph {
 
     /// Add an operation to the graph. Updates def-use chains automatically.
     ///
-    /// OE-4 终点：单 IR (Op) 直接构造，OpKind enum 已物理删除。
+    /// 终点：单 IR (Op) 直接构造，OpKind enum 已物理删除。
     /// `op` 携带完整自描述元数据（dtype/Spec struct），无需任何 fallback。
     pub fn add_op(
         &mut self,
@@ -86,7 +86,7 @@ impl CompilerGraph {
             outputs,
             label: label.to_string(),
             guard: LayerCondition::Always,
-            op_v2: op,
+            op: op,
         };
         self.ops.push(final_op);
         id
@@ -96,7 +96,7 @@ impl CompilerGraph {
     /// Ops inside a layer template can be conditionally skipped at runtime
     /// based on `layer_loop_counter`. See `LayerCondition` for semantics.
     ///
-    /// OE-4 终点：单 IR (Op) 直接构造，OpKind enum 已物理删除。
+    /// 终点：单 IR (Op) 直接构造，OpKind enum 已物理删除。
     pub fn add_op_guarded(
         &mut self,
         op: crate::compiler::graph::Op,
@@ -125,7 +125,7 @@ impl CompilerGraph {
             outputs,
             label: label.to_string(),
             guard,
-            op_v2: op,
+            op: op,
         };
         self.ops.push(final_op);
         id
@@ -209,7 +209,7 @@ impl CompilerGraph {
     /// ARCH-DTYPE-FULLCHAIN-ORCH: replaces `unwrap_or(DType::F32)` pattern.
     pub fn infer_computation_dtype(&self) -> DType {
         // Priority 1: explicit dtype from GEMM ops (胖 opcode 自描述)
-        if let Some(dt) = self.ops.iter().find_map(|op| op.op_v2_gemm_dtype(self)) {
+        if let Some(dt) = self.ops.iter().find_map(|op| op.op_gemm_dtype(self)) {
             return dt;
         }
         // Priority 2: dtype of first input tensor

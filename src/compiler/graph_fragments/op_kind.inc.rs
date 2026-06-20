@@ -110,8 +110,8 @@ pub enum LayerCondition {
 
 /// A single operation in the compiler graph.
 ///
-/// OE-4 终点：OpKind enum 已物理删除，单 IR (Op) 直接存储为 `op_v2`。
-/// 所有 lowering / fusion / registry 路径直接读 `op_v2`。
+/// 终点：OpKind enum 已物理删除，单 IR (Op) 直接存储为 `op`。
+/// 所有 lowering / fusion / registry 路径直接读 `op`。
 #[derive(Debug, Clone)]
 pub struct CompilerOp {
     pub id: OpId,
@@ -123,70 +123,70 @@ pub struct CompilerOp {
     pub label: String,
     /// Layer loop execution guard. `Always` = no guard (zero overhead).
     pub guard: LayerCondition,
-    /// OE-4: 唯一 IR (Op)。胖 opcode 自描述，携带完整语义元数据（dtype/Spec struct）。
-    pub op_v2: crate::compiler::graph::Op,
+    /// 唯一 IR (Op)。胖 opcode 自描述，携带完整语义元数据（dtype/Spec struct）。
+    pub op: crate::compiler::graph::Op,
 }
 
 impl CompilerOp {
-    /// OE-3: 直接返回已缓存的 Op v2（必填，无需 Option 解包）。
+    /// 直接返回已缓存的 Op（必填，无需 Option 解包）。
     ///
     /// 保留 `_graph` 参数仅为向后兼容调用点签名，方法体零开销直接返回缓存。
-    pub fn op_v2_resolved(&self, _graph: &CompilerGraph) -> Option<crate::compiler::graph::Op> {
-        Some(self.op_v2.clone())
+    pub fn op_resolved(&self, _graph: &CompilerGraph) -> Option<crate::compiler::graph::Op> {
+        Some(self.op.clone())
     }
 
-    /// 检查 Op v2 是否为 GEMM 类（胖 opcode 自描述）。
-    pub fn op_v2_is_gemm_like(&self, _graph: &CompilerGraph) -> bool {
-        self.op_v2.is_gemm_like()
+    /// 检查 Op 是否为 GEMM 类（胖 opcode 自描述）。
+    pub fn op_is_gemm_like(&self, _graph: &CompilerGraph) -> bool {
+        self.op.is_gemm_like()
     }
 
-    /// 检查 Op v2 是否为 GemmBias（带 bias 的 GEMM）。
-    pub fn op_v2_is_gemm_with_bias(&self, _graph: &CompilerGraph) -> bool {
-        self.op_v2.is_gemm_with_bias()
+    /// 检查 Op 是否为 GemmBias（带 bias 的 GEMM）。
+    pub fn op_is_gemm_with_bias(&self, _graph: &CompilerGraph) -> bool {
+        self.op.is_gemm_with_bias()
     }
 
-    /// 检查 Op v2 是否为 QuantGemm。
-    pub fn op_v2_is_quant_gemm(&self, _graph: &CompilerGraph) -> bool {
-        self.op_v2.is_quant_gemm()
+    /// 检查 Op 是否为 QuantGemm。
+    pub fn op_is_quant_gemm(&self, _graph: &CompilerGraph) -> bool {
+        self.op.is_quant_gemm()
     }
 
-    /// 检查 Op v2 是否为 Norm 类（RmsNorm/LayerNorm/ValueNorm/HeadRmsNorm）。
-    pub fn op_v2_is_norm_like(&self, _graph: &CompilerGraph) -> bool {
-        self.op_v2.is_norm_like()
+    /// 检查 Op 是否为 Norm 类（RmsNorm/LayerNorm/ValueNorm/HeadRmsNorm）。
+    pub fn op_is_norm_like(&self, _graph: &CompilerGraph) -> bool {
+        self.op.is_norm_like()
     }
 
     /// 提取 GEMM trans_b 参数（胖 opcode 自描述）。
-    pub fn op_v2_gemm_trans_b(&self, _graph: &CompilerGraph) -> bool {
-        self.op_v2.gemm_trans_b().unwrap_or(false)
+    pub fn op_gemm_trans_b(&self, _graph: &CompilerGraph) -> bool {
+        self.op.gemm_trans_b().unwrap_or(false)
     }
 
     /// 提取 GEMM 维度（胖 opcode 自描述）。
-    pub fn op_v2_gemm_dims(&self, _graph: &CompilerGraph) -> Option<(crate::compiler::graph::SymDim, usize, usize)> {
-        self.op_v2.gemm_dims()
+    pub fn op_gemm_dims(&self, _graph: &CompilerGraph) -> Option<(crate::compiler::graph::SymDim, usize, usize)> {
+        self.op.gemm_dims()
     }
 
     /// 提取 GEMM dtype（胖 opcode 自描述）。
-    pub fn op_v2_gemm_dtype(&self, _graph: &CompilerGraph) -> Option<crate::types::DType> {
-        self.op_v2.gemm_dtype()
+    pub fn op_gemm_dtype(&self, _graph: &CompilerGraph) -> Option<crate::types::DType> {
+        self.op.gemm_dtype()
     }
 
     /// 提取 Attention head_dim（胖 opcode 自描述）。
-    pub fn op_v2_attention_head_dim(&self, _graph: &CompilerGraph) -> Option<usize> {
-        self.op_v2.attention_head_dim()
+    pub fn op_attention_head_dim(&self, _graph: &CompilerGraph) -> Option<usize> {
+        self.op.attention_head_dim()
     }
 
     /// 输出别名到输入的 IR 元数据（胖 opcode 自描述）。
-    pub fn op_v2_output_aliases_input(&self, _graph: &CompilerGraph) -> Option<usize> {
-        self.op_v2.output_aliases_input()
+    pub fn op_output_aliases_input(&self, _graph: &CompilerGraph) -> Option<usize> {
+        self.op.output_aliases_input()
     }
 
-    /// OE-4: 测试 fixture / 手工构造路径的 Op-first 构造器（单 IR）。
+    /// 测试 fixture / 手工构造路径的 Op-first 构造器（单 IR）。
     ///
     /// 直接接受 `Op`（携带 dtype/Spec 自描述元数据），无需 kind_fallback。
     /// 用途：unit-test fixture 和 fusion pass 中手工创建独立 CompilerOp 的场景。
     pub fn new_from_op(
         id: OpId,
-        op_v2: crate::compiler::graph::Op,
+        op: crate::compiler::graph::Op,
         inputs: Vec<TensorId>,
         outputs: Vec<TensorId>,
         label: impl Into<String>,
@@ -198,7 +198,7 @@ impl CompilerOp {
             outputs,
             label: label.into(),
             guard,
-            op_v2,
+            op,
         }
     }
 }

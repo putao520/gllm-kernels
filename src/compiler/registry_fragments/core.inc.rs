@@ -73,7 +73,7 @@ impl ScalarOpRegistry {
         self.inject_trace(key, manual_trace);
     }
 
-    /// Convert an `Op` to its hashable `OpKindKey` (OE-4: OpKind enum 已删除，从 Op 派生)。
+    /// Convert an `Op` to its hashable `OpKindKey` (OpKind enum 已删除，从 Op 派生)。
     ///
     /// OpKindKey 作为 ScalarOpRegistry 的 HashMap key（Op 本身因含 f32/f64 字段无法 Hash）。
     /// 对于 norm/gemm 等 op，key 是参数无关的（eps/trans_b 等参数不影响 trace 模板）。
@@ -111,7 +111,7 @@ impl ScalarOpRegistry {
             Op::TopK { .. } => OpKindKey::TopK,
             Op::WeightedSum { .. } => OpKindKey::WeightedSum,
             Op::KvScatterWrite { .. } => OpKindKey::KvScatterWrite,
-            Op::KvCacheWrite { .. } => OpKindKey::KvCacheWrite,
+            // @trace REQ-FATOP-025: KvCacheWrite 已物理删除
             // P4/P5 stub variants
             Op::VariableLengthBatch => OpKindKey::VariableLengthBatch,
             Op::AttentionSkipMask { .. } => OpKindKey::AttentionSkipMask,

@@ -45,6 +45,10 @@ impl X86Lower {
                     }
                     other => other.clone(),
                 };
+                // ARCH-SPILL-SAFE-ISA: SpillSafeRecipe tracking disabled.
+                // Root cause fix is in ScopedSpillAllocator — it now assigns unique
+                // offsets to each spill slot, preventing corruption. The recipe
+                // approach was incorrect because VRegs can be redefined (non-SSA).
                 // 注意: emit_load_ptr_from_resolved 内部使用 slot 1/2 做 read scratch;
                 // 若 dst 本身被 spilled 且也用 slot 1，会冲突。因此 dst_reg 用 slot 1,
                 // emit_load_ptr 内部 base 用 slot 2, offset 用 slot 1 (可重用 dst_reg 已加载的值前)。
@@ -110,38 +114,78 @@ impl X86Lower {
                     }
                     X86ElemStrategy::WidenCompute => {
                         // REQ-DTYPE-004: Load narrow (BF16/F16) → widen to F32.
-                        // vcvtph2ps: xmm(8×F16) → ymm(8×F32), ymm(16×F16) → zmm(16×F32).
                         let src_ptr = if addr == base_reg { base_reg } else { rax };
-                        match width {
-                            SimdWidth::W512 => {
-                                // Load 32 bytes (16×BF16) into ymm scratch, then vcvtph2ps → zmm
-                                let tmp = self.scratch_ymm(0);
-                                self.asm.vmovups(tmp, ymmword_ptr(src_ptr)).map_err(Self::err)?;
-                                let (d, dst_spilled) = self.resolve_zmm_or_spill_write(*dst, alloc, 2)?;
-                                self.asm.vcvtph2ps(d, tmp).map_err(Self::err)?;
-                                if dst_spilled { self.spill_store_zmm(*dst, alloc, 2)?; }
+
+                        if matches!(dtype.kind, DTypeKind::BF16) {
+                            // BF16 → FP32: zero-extend 16-bit lanes to 32-bit, then shift left 16.
+                            // BF16 is a truncated FP32, so zero-padding the low 16 bits gives FP32.
+                            match width {
+                                SimdWidth::W512 => {
+                                    // Load 32 bytes (16×BF16) → vpmovzxwd zero-extends 16→32 in ymm→zmm
+                                    let tmp = self.scratch_ymm(0);
+                                    self.asm.vmovups(tmp, ymmword_ptr(src_ptr)).map_err(Self::err)?;
+                                    let (d, dst_spilled) = self.resolve_zmm_or_spill_write(*dst, alloc, 2)?;
+                                    // vpmovzxwd zmm, ymm: 16×u16 → 16×u32
+                                    self.asm.vpmovzxwd(d, tmp).map_err(Self::err)?;
+                                    // vpslld zmm, zmm, 16: shift each u32 lane left by 16 bits
+                                    self.asm.vpslld(d, d, 16).map_err(Self::err)?;
+                                    if dst_spilled { self.spill_store_zmm(*dst, alloc, 2)?; }
+                                }
+                                SimdWidth::Scalar => {
+                                    // Load 2 bytes (1×BF16) → movzx → shift → FP32
+                                    let tmp_xmm = self.scratch_xmm(0);
+                                    self.asm.vmovd(tmp_xmm, dword_ptr(src_ptr)).map_err(Self::err)?;
+                                    let tmp_ymm = self.scratch_ymm(0);
+                                    // vpmovzxwd ymm, xmm: 8×u16 → 8×u32 (we only need lane 0)
+                                    self.asm.vpmovzxwd(tmp_ymm, tmp_xmm).map_err(Self::err)?;
+                                    self.asm.vpslld(tmp_ymm, tmp_ymm, 16).map_err(Self::err)?;
+                                    let (d, dst_spilled) = self.resolve_ymm_or_spill_write(*dst, alloc, 2)?;
+                                    let dst_x = Self::ymm_to_xmm(d);
+                                    let src_x = Self::ymm_to_xmm(tmp_ymm);
+                                    self.asm.vmovaps(dst_x, src_x).map_err(Self::err)?;
+                                    if dst_spilled { self.spill_store_ymm(*dst, alloc, 2)?; }
+                                }
+                                _ => {
+                                    // Load 16 bytes (8×BF16) into xmm, vpmovzxwd → ymm, vpslld → ymm
+                                    let tmp_xmm = self.scratch_xmm(0);
+                                    self.asm.vmovups(tmp_xmm, xmmword_ptr(src_ptr)).map_err(Self::err)?;
+                                    let (d, dst_spilled) = self.resolve_ymm_or_spill_write(*dst, alloc, 2)?;
+                                    // vpmovzxwd ymm, xmm: 8×u16 → 8×u32
+                                    self.asm.vpmovzxwd(d, tmp_xmm).map_err(Self::err)?;
+                                    // vpslld ymm, ymm, 16: shift each u32 lane left by 16 bits
+                                    self.asm.vpslld(d, d, 16).map_err(Self::err)?;
+                                    if dst_spilled { self.spill_store_ymm(*dst, alloc, 2)?; }
+                                }
                             }
-                            SimdWidth::Scalar => {
-                                // Load 2 bytes (1×BF16) via movzx + vcvtph2ps xmm, xmm
-                                // Use vmovd (4-byte load, lower 2 bytes = BF16) then vcvtph2ps
-                                let tmp_xmm = self.scratch_xmm(0);
-                                self.asm.vmovd(tmp_xmm, dword_ptr(src_ptr)).map_err(Self::err)?;
-                                let tmp_ymm = self.scratch_ymm(0);
-                                self.asm.vcvtph2ps(tmp_ymm, tmp_xmm).map_err(Self::err)?;
-                                let (d, dst_spilled) = self.resolve_ymm_or_spill_write(*dst, alloc, 2)?;
-                                let dst_x = Self::ymm_to_xmm(d);
-                                let src_x = Self::ymm_to_xmm(tmp_ymm);
-                                // vmovaps xmm,xmm moves the lowest F32 scalar
-                                self.asm.vmovaps(dst_x, src_x).map_err(Self::err)?;
-                                if dst_spilled { self.spill_store_ymm(*dst, alloc, 2)?; }
-                            }
-                            _ => {
-                                // Load 16 bytes (8×BF16) into xmm scratch, then vcvtph2ps → ymm
-                                let tmp_xmm = self.scratch_xmm(0);
-                                self.asm.vmovups(tmp_xmm, xmmword_ptr(src_ptr)).map_err(Self::err)?;
-                                let (d, dst_spilled) = self.resolve_ymm_or_spill_write(*dst, alloc, 2)?;
-                                self.asm.vcvtph2ps(d, tmp_xmm).map_err(Self::err)?;
-                                if dst_spilled { self.spill_store_ymm(*dst, alloc, 2)?; }
+                        } else {
+                            // FP16 → FP32: vcvtph2ps (hardware FP16 convert)
+                            // vcvtph2ps: xmm(8×F16) → ymm(8×F32), ymm(16×F16) → zmm(16×F32).
+                            match width {
+                                SimdWidth::W512 => {
+                                    let tmp = self.scratch_ymm(0);
+                                    self.asm.vmovups(tmp, ymmword_ptr(src_ptr)).map_err(Self::err)?;
+                                    let (d, dst_spilled) = self.resolve_zmm_or_spill_write(*dst, alloc, 2)?;
+                                    self.asm.vcvtph2ps(d, tmp).map_err(Self::err)?;
+                                    if dst_spilled { self.spill_store_zmm(*dst, alloc, 2)?; }
+                                }
+                                SimdWidth::Scalar => {
+                                    let tmp_xmm = self.scratch_xmm(0);
+                                    self.asm.vmovd(tmp_xmm, dword_ptr(src_ptr)).map_err(Self::err)?;
+                                    let tmp_ymm = self.scratch_ymm(0);
+                                    self.asm.vcvtph2ps(tmp_ymm, tmp_xmm).map_err(Self::err)?;
+                                    let (d, dst_spilled) = self.resolve_ymm_or_spill_write(*dst, alloc, 2)?;
+                                    let dst_x = Self::ymm_to_xmm(d);
+                                    let src_x = Self::ymm_to_xmm(tmp_ymm);
+                                    self.asm.vmovaps(dst_x, src_x).map_err(Self::err)?;
+                                    if dst_spilled { self.spill_store_ymm(*dst, alloc, 2)?; }
+                                }
+                                _ => {
+                                    let tmp_xmm = self.scratch_xmm(0);
+                                    self.asm.vmovups(tmp_xmm, xmmword_ptr(src_ptr)).map_err(Self::err)?;
+                                    let (d, dst_spilled) = self.resolve_ymm_or_spill_write(*dst, alloc, 2)?;
+                                    self.asm.vcvtph2ps(d, tmp_xmm).map_err(Self::err)?;
+                                    if dst_spilled { self.spill_store_ymm(*dst, alloc, 2)?; }
+                                }
                             }
                         }
                     }
@@ -1852,6 +1896,7 @@ impl X86Lower {
             }
 
             VmInstr::AddPtr { dst, base, offset } => {
+                // ARCH-SPILL-SAFE-ISA: SpillSafeRecipe tracking disabled (see LoadPtr).
                 let dst_reg = self.resolve_gpr_write(*dst, alloc, 0)?;
                 let base_reg = self.resolve_gpr_read(*base, alloc, 1)?;
                 if *offset == 0 {

@@ -1,15 +1,15 @@
 // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-// §1 Op — 单 IR (OE-4 终点：OpKind enum 已物理删除)
+// §1 Op — 单 IR (终点：OpKind enum 已物理删除)
 // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 //
-// OE-4 收敛完成：Op 是唯一 IR，服务 graph 构建 + lowering + registry 全链路。
+// 收敛完成：Op 是唯一 IR，服务 graph 构建 + lowering + registry 全链路。
 // 历史的 from_op_kind Translator（IR Translator）已随 OpKind enum 一起删除。
 //
 // include! 模式：本文件被 include 到 graph.rs，与 op_kind.inc.rs / types.inc.rs
 // 共享作用域。KvSource/RopeScaling/AttentionStrategy/GatherIndicesKind/SymDim/DType
 // 等类型直接可见，无需 use。
 
-/// Op v2 架构版本号 — 用于 JIT cache hash 失效管理。
+/// Op 架构版本号 — 用于 JIT cache hash 失效管理。
 ///
 /// 当 Op enum 结构变更（新增/删除变体、Spec 字段变更）时 bump 此版本号。
 /// graph_content_hash 包含此常量，版本变更自动失效旧 JIT cache。
@@ -18,7 +18,7 @@
 /// v2: Phase 8 — VmInstr 复合指令加 dtype/guard/effect 字段（Predicate + MemEffect 新类型）
 ///     VecLoad/VecStore +predicate；GatherLoad/ScatterStore +dtype +predicate；
 ///     MemCopy +dtype +guard +effect。JIT 输出 VmInstr 结构变化，缓存必须失效。
-/// v3: OE-4 — OpKind enum 物理删除，Op 成为唯一 IR。from_op_kind Translator 删除。
+/// v3: — OpKind enum 物理删除，Op 成为唯一 IR。from_op_kind Translator 删除。
 pub const OPCODE_VERSION: u32 = 3;
 // @trace REQ-FATOP-003 [entity:Op] OPCODE_VERSION JIT cache 版本管理
 
@@ -149,7 +149,7 @@ pub struct DualRopeSpec {
 }
 
 // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-// §2 Op enum — 单 IR (OE-4 终点)
+// §2 Op enum — 单 IR (终点)
 // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 /// 单 IR — 编译器全链路（graph 构建 + fusion + registry + lowering）的唯一算子枚举。
@@ -251,7 +251,7 @@ pub enum Op {
         write_start: usize, layer_offset: usize, half_offset: usize,
         head_stride: usize, dtype_size: usize,
     },
-    KvCacheWrite { num_kv_heads: usize, head_dim: usize, seq_len: SymDim },
+    // @trace REQ-FATOP-025: KvCacheWrite 已物理删除 — attention FromCache lowering 内部覆盖 KV 写入
 
     // ── P4/P5 advanced ──
     VariableLengthBatch,
@@ -315,7 +315,7 @@ impl Op {
             | Op::MegaKernelDispatch { .. } => "structural",
             Op::Dequantize { .. } | Op::QTapSTG { .. } | Op::VRangeQuant { .. } => "quant",
             Op::MeanPool { .. } | Op::LogitSoftcap { .. } => "misc",
-            Op::KvScatterWrite { .. } | Op::KvCacheWrite { .. } => "kv_cache",
+            Op::KvScatterWrite { .. } => "kv_cache",
             Op::VariableLengthBatch | Op::AttentionSkipMask { .. }
             | Op::ResidualWithTelemetry { .. } | Op::EntropyGate { .. }
             | Op::KvCentroidPrefetch { .. } | Op::LayerBypass { .. }

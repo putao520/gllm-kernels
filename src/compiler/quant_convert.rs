@@ -247,7 +247,7 @@ pub fn apply_quantization(
 ) -> Result<(), CompilerError> {
     // 收集需要量化的 op id（胖 opcode 自描述，避免借用冲突）
     let quantize_op_ids: Vec<_> = graph.ops.iter()
-        .filter(|op| op.op_v2_is_gemm_with_bias(graph) || matches!(op.op_v2_resolved(graph), Some(Op::Gemm(_))))
+        .filter(|op| op.op_is_gemm_with_bias(graph) || matches!(op.op_resolved(graph), Some(Op::Gemm(_))))
         .map(|op| op.id)
         .collect();
     for _op_id in quantize_op_ids {
@@ -259,7 +259,7 @@ pub fn apply_quantization(
 }
 
 fn should_quantize_op(op: &Op) -> bool {
-    // OE-4: 胖 opcode 自描述 — Gemm/GemmBias 是可量化目标，QuantGemm 已量化。
+    // 胖 opcode 自描述 — Gemm/GemmBias 是可量化目标，QuantGemm 已量化。
     matches!(op, Op::Gemm(_) | Op::GemmBias(_))
 }
 

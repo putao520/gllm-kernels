@@ -11,7 +11,7 @@ use super::plan_lower::{
 use super::gemm_emit::{emit_gemm_inline_with_hook, emit_gemm_inline_with_epilogue};
 
 use crate::compiler::fusion::{FusionGroup, FusionMode};
-use crate::compiler::graph::{CompilerGraph, CompilerOp, Op, GemmSpec, NormSpec, QuantGemmSpec, RopeSpec, AttentionSpec, AttentionGeometry, AttentionMask, SinksSpec, CachedGqaSpec, MlaSpec, DualRopeSpec};
+use crate::compiler::graph::{CompilerGraph, CompilerOp};
 use crate::compiler::buffer_alloc::BufferAllocation;
 use crate::compiler::layout_negotiator::MovementType;
 use crate::compiler::trace::QuantPrecision;
@@ -299,7 +299,7 @@ pub(super) fn emit_fusion_group_by_mode(
     // QkvSharedInput, EpilogueInjection, etc. call emit_gemm_inline_with_hook
     // which assumes F32 Gemm.  When the anchor is QuantGemm, break the group
     // into per-op standalone lowering.
-    if anchor_op.op_v2_is_quant_gemm(graph)
+    if anchor_op.op_is_quant_gemm(graph)
         && !matches!(group.mode, FusionMode::Standalone | FusionMode::LoopFusion)
     {
         eprintln!("[QGEM-FALLBACK] anchor='{}' mode={:?} ops_count={} epilogue={:?} abi.wp={:?}",
@@ -341,7 +341,7 @@ pub(super) fn emit_fusion_group_by_mode(
                     if *n >= 1 {
                         let epi_kinds: Vec<_> = group.epilogue.iter()
                             .filter_map(|&oid| graph.op(oid))
-                            .map(|o| format!("{:?}(inputs={})", o.op_v2, o.inputs.len()))
+                            .map(|o| format!("{:?}(inputs={})", o.op, o.inputs.len()))
                             .collect();
                         return Err(CompilerError::CodegenViolation(format!(
                             "EpilogueInjection: GEMM epilogue trace 引用 Input({}) — \
@@ -352,7 +352,7 @@ pub(super) fn emit_fusion_group_by_mode(
                 }
             }
             let terminal_op_id = group.epilogue.last().copied().unwrap_or(anchor_op.id);
-            let gemm_output_ptr = if anchor_op.op_v2_is_gemm_like(graph)
+            let gemm_output_ptr = if anchor_op.op_is_gemm_like(graph)
                 && anchor_op.outputs.first() != graph.op(terminal_op_id).and_then(|op| op.outputs.first())
             {
                 group_output_ptr
@@ -362,11 +362,11 @@ pub(super) fn emit_fusion_group_by_mode(
                     .and_then(|tid| resolver.materialize(prog, tid, abi))
                     .unwrap_or(group_output_ptr)
             };
-            let gemm_trans_b = anchor_op.op_v2_gemm_trans_b(graph);
+            let gemm_trans_b = anchor_op.op_gemm_trans_b(graph);
 
             // GemmBias: bias must be added BEFORE epilogue (e.g. GELU(bias+GEMM) != GELU(GEMM)+bias).
             // Decompose: GEMM(no epilogue) → bias add → elementwise epilogue ops.
-            if anchor_op.op_v2_is_gemm_with_bias(graph) && !epi_trace.is_empty() {
+            if anchor_op.op_is_gemm_with_bias(graph) && !epi_trace.is_empty() {
                 // Step 1: GEMM without epilogue → writes unbiased result to gemm_output_ptr
                 emit_gemm_inline_with_epilogue(prog, &m_dim, n, k, width,
                     group_input_ptr, group_weight_ptr, gemm_output_ptr,
@@ -408,7 +408,7 @@ pub(super) fn emit_fusion_group_by_mode(
         FusionMode::NormIntoGemm => {
             let norm_op = group.ops.iter()
                 .filter_map(|&oid| graph.op(oid))
-                .find(|op| op.op_v2_is_norm_like(graph))
+                .find(|op| op.op_is_norm_like(graph))
                 .ok_or_else(|| CompilerError::CodegenViolation(
                     "NormIntoGemm: group.ops 中未找到 Norm op".into()))?;
             let norm_output_tid = norm_op.outputs.first().copied()
@@ -432,11 +432,11 @@ pub(super) fn emit_fusion_group_by_mode(
                     resolver, abi)?;
                 let (m_dim, n, k) = extract_gemm_dims_sym(anchor_op, graph)?;
                 let pm = ctx.pack_map_for_gemm(anchor_op.inputs.get(1).copied());
-                let norm_into_gemm_trans_b = anchor_op.op_v2_gemm_trans_b(graph);
+                let norm_into_gemm_trans_b = anchor_op.op_gemm_trans_b(graph);
                 emit_gemm_inline_with_hook(p, &m_dim, n, k, ctx,
                     scratch_ptr, group_weight_ptr, group_output_ptr, seq_bound_override, Some(anchor_op.id), pm, norm_into_gemm_trans_b)?;
                 // GemmBias: add bias after GEMM in NormIntoGemm mode
-                if anchor_op.op_v2_is_gemm_with_bias(graph) {
+                if anchor_op.op_is_gemm_with_bias(graph) {
                     if let Some(&bias_tid) = anchor_op.inputs.get(2) {
                         if let Some(bias_ptr) = resolver.materialize(p, bias_tid, abi) {
                             let m_bound = seq_bound_override.cloned()
@@ -461,11 +461,11 @@ pub(super) fn emit_fusion_group_by_mode(
                             .and_then(|tid| resolver.materialize(prog, tid, abi))
                             .unwrap_or(weight_ptr);
                         let pm = ctx.pack_map_for_gemm(op.inputs.get(1).copied());
-                        let qkv_trans_b = op.op_v2_gemm_trans_b(graph);
+                        let qkv_trans_b = op.op_gemm_trans_b(graph);
                         prog.emit_scope(|p| -> Result<(), CompilerError> {
                             emit_gemm_inline_with_hook(p, &m_dim, n, k, ctx, gemm_input, gemm_weight, out_ptr, seq_bound_override, Some(op.id), pm, qkv_trans_b)?;
                             // GemmBias: add bias after GEMM in QkvSharedInput mode
-                            if op.op_v2_is_gemm_with_bias(graph) {
+                            if op.op_is_gemm_with_bias(graph) {
                                 if let Some(&bias_tid) = op.inputs.get(2) {
                                     if let Some(bias_ptr) = resolver.materialize(p, bias_tid, abi) {
                                         let m_bound = seq_bound_override.cloned()
@@ -498,11 +498,11 @@ pub(super) fn emit_fusion_group_by_mode(
 
             let (m_dim, n, k) = extract_gemm_dims_sym(anchor_op, graph)?;
             let pm = ctx.pack_map_for_gemm(anchor_op.inputs.get(1).copied());
-            let pre_fusion_trans_b = anchor_op.op_v2_gemm_trans_b(graph);
+            let pre_fusion_trans_b = anchor_op.op_gemm_trans_b(graph);
             emit_gemm_inline_with_hook(prog, &m_dim, n, k, ctx,
                 pre_scratch, group_weight_ptr, group_output_ptr, seq_bound_override, Some(anchor_op.id), pm, pre_fusion_trans_b)?;
             // GemmBias: add bias after GEMM in TileLevelFusion mode
-            if anchor_op.op_v2_is_gemm_with_bias(graph) {
+            if anchor_op.op_is_gemm_with_bias(graph) {
                 if let Some(&bias_tid) = anchor_op.inputs.get(2) {
                     if let Some(bias_ptr) = resolver.materialize(prog, bias_tid, abi) {
                         let m_bound = seq_bound_override.cloned()
@@ -533,11 +533,11 @@ pub(super) fn emit_fusion_group_by_mode(
 
             let (m_dim, n, k) = extract_gemm_dims_sym(anchor_op, graph)?;
             let pm = ctx.pack_map_for_gemm(anchor_op.inputs.get(1).copied());
-            let pre_fusion_trans_b = anchor_op.op_v2_gemm_trans_b(graph);
+            let pre_fusion_trans_b = anchor_op.op_gemm_trans_b(graph);
             emit_gemm_inline_with_hook(prog, &m_dim, n, k, ctx,
                 pre_scratch, group_weight_ptr, group_output_ptr, seq_bound_override, Some(anchor_op.id), pm, pre_fusion_trans_b)?;
             // GemmBias: add bias after GEMM in ComputeRoot mode
-            if anchor_op.op_v2_is_gemm_with_bias(graph) {
+            if anchor_op.op_is_gemm_with_bias(graph) {
                 if let Some(&bias_tid) = anchor_op.inputs.get(2) {
                     if let Some(bias_ptr) = resolver.materialize(prog, bias_tid, abi) {
                         let m_bound = seq_bound_override.cloned()
@@ -564,10 +564,10 @@ pub(super) fn emit_fusion_group_by_mode(
                 .unwrap_or(weight_ptr);
             if let Ok((m_dim, n, k)) = extract_gemm_dims_sym(gate_op, graph) {
                 let pm = ctx.pack_map_for_gemm(gate_op.inputs.get(1).copied());
-                let gate_trans_b = gate_op.op_v2_gemm_trans_b(graph);
+                let gate_trans_b = gate_op.op_gemm_trans_b(graph);
                 prog.emit_scope(|p| -> Result<(), CompilerError> {
                     emit_gemm_inline_with_hook(p, &m_dim, n, k, ctx, gate_input, gate_weight, gate_scratch, seq_bound_override, Some(gate_op.id), pm, gate_trans_b)?;
-                    if gate_op.op_v2_is_gemm_with_bias(graph) {
+                    if gate_op.op_is_gemm_with_bias(graph) {
                         if let Some(&bias_tid) = gate_op.inputs.get(2) {
                             if let Some(bias_ptr) = resolver.materialize(p, bias_tid, abi) {
                                 let m_bound = seq_bound_override.cloned()
@@ -588,10 +588,10 @@ pub(super) fn emit_fusion_group_by_mode(
                 .unwrap_or(weight_ptr);
             if let Ok((m_dim, n, k)) = extract_gemm_dims_sym(up_op, graph) {
                 let pm = ctx.pack_map_for_gemm(up_op.inputs.get(1).copied());
-                let up_trans_b = up_op.op_v2_gemm_trans_b(graph);
+                let up_trans_b = up_op.op_gemm_trans_b(graph);
                 prog.emit_scope(|p| -> Result<(), CompilerError> {
                     emit_gemm_inline_with_hook(p, &m_dim, n, k, ctx, up_input, up_weight, up_scratch, seq_bound_override, Some(up_op.id), pm, up_trans_b)?;
-                    if up_op.op_v2_is_gemm_with_bias(graph) {
+                    if up_op.op_is_gemm_with_bias(graph) {
                         if let Some(&bias_tid) = up_op.inputs.get(2) {
                             if let Some(bias_ptr) = resolver.materialize(p, bias_tid, abi) {
                                 let m_bound = seq_bound_override.cloned()
@@ -675,7 +675,7 @@ pub(super) fn emit_fusion_group_by_mode(
                             .and_then(|tid| resolver.materialize(prog, tid, abi))
                             .unwrap_or(weight_ptr);
                         let pm = ctx.pack_map_for_gemm(op.inputs.get(1).copied());
-                        let fqnr_trans_b = op.op_v2_gemm_trans_b(graph);
+                        let fqnr_trans_b = op.op_gemm_trans_b(graph);
                         prog.emit_scope(|p| -> Result<(), CompilerError> {
                             emit_gemm_inline_with_hook(p, &m_dim, n, k, ctx, gemm_input, gemm_weight, out_ptr, seq_bound_override, Some(op.id), pm, fqnr_trans_b)?;
                             Ok(())
@@ -685,7 +685,7 @@ pub(super) fn emit_fusion_group_by_mode(
             }
             for &op_id in &group.ops {
                 if let Some(op) = graph.op(op_id) {
-                    if !op.op_v2_is_gemm_like(graph) {
+                    if !op.op_is_gemm_like(graph) {
                         let op_input = op.inputs.first().copied()
                             .and_then(|tid| resolver.materialize(prog, tid, abi))
                             .unwrap_or(input_ptr);

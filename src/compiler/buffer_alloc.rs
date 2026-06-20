@@ -55,7 +55,7 @@ fn resolve_alias_to_physical(
             break; // cycle detection
         }
         let producer_op = graph.ops.iter().find(|op| op.outputs.contains(&current))?;
-        let alias_input = producer_op.op_v2_output_aliases_input(graph)?;
+        let alias_input = producer_op.op_output_aliases_input(graph)?;
         current = *producer_op.inputs.get(alias_input)?;
     }
     Some(current)
@@ -151,6 +151,7 @@ pub fn analyze_lifetimes(
         }
     }
 
+
     // Exclude graph inputs/outputs (externally managed)
     let graph_io: HashSet<TensorId> = graph
         .inputs
@@ -179,7 +180,7 @@ pub fn analyze_lifetimes(
     // TensorPtrSource aliasing (see TensorPtrResolver::build).
     for op_id in &schedule {
         if let Some(op) = graph.op(*op_id) {
-            if op.op_v2_output_aliases_input(graph).is_some() {
+            if op.op_output_aliases_input(graph).is_some() {
                 if let Some(&out_tid) = op.outputs.first() {
                     alias_outputs.insert(out_tid);
                 }
@@ -220,10 +221,36 @@ pub fn analyze_lifetimes(
                     .filter_map(|&tid| graph.tensor(tid).map(|t| format!("{}({:?})", t.name, tid)))
                     .collect();
                 eprintln!("[buf-alloc]   step {:3}: {:?} inputs=[{}] outputs=[{}]",
-                    step, op.op_v2, in_names.join(", "), out_names.join(", "));
+                    step, op.op, in_names.join(", "), out_names.join(", "));
             }
         }
     }
+
+    // §0.2.3: Logits tensor (last GEMM output before Argmax) is managed by
+    // mega-kernel output_ptr (scratchpad logits region), NOT by intermediate
+    // scratchpad allocation.  Exclude it to avoid allocating max_seq_len *
+    // vocab_size bytes (e.g. 32768 * 151669 * 4 = 18.5 GB) in scratchpad.
+    let logits_output_tid: Option<TensorId> = graph.ops.iter().rev()
+        .find_map(|op| {
+            // The logits producer is the last QuantGemm or Gemm op whose output
+            // feeds into Argmax/WriteLogits/StoreToken downstream.
+            if op.op_is_quant_gemm(graph) || op.op_is_gemm_like(graph) {
+                op.outputs.first().copied()
+            } else {
+                None
+            }
+        })
+        .and_then(|tid| {
+            // Only exclude if this tensor is consumed by Argmax or WriteLogits
+            // (i.e. it IS the logits, not a regular GEMM output).
+            let consumer_is_logits_sink = graph.ops.iter().any(|op| {
+                op.inputs.contains(&tid) &&
+                    matches!(op.op_resolved(graph),
+                        Some(crate::compiler::graph::Op::Argmax { .. }) |
+                        Some(crate::compiler::graph::Op::WriteLogits { .. }))
+            });
+            if consumer_is_logits_sink { Some(tid) } else { None }
+        });
 
     let mut lifetimes = Vec::new();
     for tensor in &graph.tensors {
@@ -231,6 +258,10 @@ pub fn analyze_lifetimes(
             continue;
         }
         if alias_outputs.contains(&tensor.id) {
+            continue;
+        }
+        // §0.2.3: Logits tensor managed by mega-kernel output_ptr — skip
+        if logits_output_tid == Some(tensor.id) {
             continue;
         }
         // R2: 跳过虚拟 tensor — 已被 DataFlowOptimizer 消除，不需要物理 buffer
@@ -245,14 +276,9 @@ pub fn analyze_lifetimes(
             // Use max_for_allocation to account for symbolic dimensions (SymDim).
             // concrete_bytes() treats Symbolic as 1, causing massive under-allocation
             // for intermediate tensors with symbolic seq_len (e.g. FusedQkvRope Q/K outputs).
-            // 中间张量（有 producer）按计算精度 dtype 分配。当前默认按 F32,
-            // 真实 dtype 应走 op_input_dtype(op, graph).elem_bytes() (ARCH-DTYPE-JIT-TYPED)。
-            // ARCH-DATA-FLOW-CONTRACT §2.2: 禁止裸 4，用 DType::F32.size_bytes()。
-            let elem_bytes = if tensor.producer.is_some() {
-                crate::types::DType::F32.size_bytes()
-            } else {
-                tensor.dtype.size_bytes()
-            };
+            // ARCH-DTYPE-JIT-TYPED: elem_bytes 始终从 tensor.dtype 推断，禁止硬编码 F32。
+            // 中间张量的 dtype 由 dtype 传播链在图构建时设置，已反映真实计算精度。
+            let elem_bytes = tensor.dtype.size_bytes();
             // ARCH-SYMDIM: buffer 分配用 graph.max_seq_len 作为 Symbolic 维度上界
             let numel: usize = tensor.shape.iter()
                 .map(|d| d.max_for_allocation(graph.max_seq_len))
@@ -434,18 +460,6 @@ pub fn allocate_buffers_aligned(
 
     let naive_total: usize = lifetimes.iter().map(|l| l.size_bytes).sum();
 
-    // TEMP DIAG: dump intermediate buffer allocations for key tensors
-    {
-        let key_names = ["L0_k", "L0_v", "L0_attn", "L0_q", "embedding", "L0_ffn_resid",
-            "L0_q_rope", "L0_k_rope"];
-        for slot in &slots {
-            if let Some(t) = graph.tensor(slot.tensor_id) {
-                if key_names.iter().any(|kn| t.name.contains(kn)) {
-                    eprintln!("[BUFDIAG] tensor '{}' tid={:?} offset={} size={}", t.name, slot.tensor_id, slot.offset, slot.size_bytes);
-                }
-            }
-        }
-    }
 
     if std::env::var("GLLM_DEBUG_BUFFER_ALLOC").is_ok() {
         eprintln!("[buf-alloc] === ALLOCATION RESULTS ===");
@@ -487,6 +501,7 @@ pub fn allocate_buffers_aligned(
     // ISA Lowering codegen 直接消费, 无需独立推导。
     let tensor_sources = build_tensor_sources(graph, &slots, &activation_tids, activation_buffer_size, vam);
 
+
     BufferAllocation {
         num_tensors: slots.len(),
         slots,
@@ -525,13 +540,16 @@ fn build_tensor_sources(
     }
 
     // Outputs: 按 graph.outputs 顺序累加
+    // ARCH-DTYPE-JIT-TYPED: elem_bytes 从输出张量 dtype 推断，禁止硬编码 4。
     {
-        let elem = 4usize; // computation elem bytes
         let mut cursor = 0usize;
         for &tid in &graph.outputs {
             let numel = graph.tensor_numel_for_alloc(tid, graph.max_seq_len).unwrap_or(0);
+            let elem_bytes = graph.tensor(tid)
+                .map(|t| t.dtype.size_bytes())
+                .unwrap_or(DType::F32.size_bytes()); // 安全回退: 无 tensor meta 时默认 F32
             map.insert(tid, TensorPtrSource::Output { offset: cursor });
-            cursor += numel * elem;
+            cursor += numel * elem_bytes;
         }
     }
 
@@ -547,9 +565,33 @@ fn build_tensor_sources(
     // scratchpad offset as the activation input so that post-loop ops (e.g. MeanPool)
     // can read the final layer's output from the correct location.
     if activation_buffer_size > 0 {
-        if let Some(_vam) = vam {
-            for &tid in _vam.activation_assignments.keys() {
-                map.insert(tid, TensorPtrSource::Intermediate { offset: 0 });
+        if let Some(vam_ref) = vam {
+            // Map activation alias tensors to ActivationPing/ActivationPong
+            // based on their VAM buffer_idx assignment (0=ping, 1=pong).
+            // This is critical: post-loop ops (MeanPool, etc.) must read from
+            // the correct pong buffer, not from scratchpad offset 0.
+            if let Some(cfg) = &graph.layer_loop_config {
+                if let Some((in_tid, out_tid)) = cfg.activation_alias {
+                    map.insert(in_tid, TensorPtrSource::ActivationPing);
+                    map.insert(out_tid, TensorPtrSource::ActivationPong);
+                }
+            }
+            if let Some(cfg) = &graph.hetero_layer_loop_config {
+                for &(in_tid, out_tid) in &cfg.activation_aliases {
+                    map.insert(in_tid, TensorPtrSource::ActivationPing);
+                    map.insert(out_tid, TensorPtrSource::ActivationPong);
+                }
+            }
+            // Also map any VAM-assigned tensors not covered by activation_alias
+            // (shouldn't happen in practice, but ensures completeness).
+            for (&tid, slot) in &vam_ref.activation_assignments {
+                if !map.contains_key(&tid) {
+                    match slot.buffer_idx {
+                        0 => { map.insert(tid, TensorPtrSource::ActivationPing); }
+                        1 => { map.insert(tid, TensorPtrSource::ActivationPong); }
+                        _ => { map.insert(tid, TensorPtrSource::Intermediate { offset: 0 }); }
+                    }
+                }
             }
         }
     } else {
@@ -572,7 +614,7 @@ fn build_tensor_sources(
 
     // Generic output-alias
     for op in &graph.ops {
-        if let Some(input_idx) = op.op_v2_output_aliases_input(graph) {
+        if let Some(input_idx) = op.op_output_aliases_input(graph) {
             if let (Some(&in_tid), Some(&out_tid)) =
                 (op.inputs.get(input_idx), op.outputs.first())
             {
@@ -835,7 +877,7 @@ pub fn compute_scratch_requirements(
             if let FusionMode::TileLevelFusion { tile_rows, .. } = group.mode {
                 // Find the GEMM op to get K dimension (胖 opcode 自描述)
                 let k = group.ops.iter().find_map(|&oid| {
-                    graph.op(oid).and_then(|o| o.op_v2_gemm_dims(graph).map(|(_, _, k)| k))
+                    graph.op(oid).and_then(|o| o.op_gemm_dims(graph).map(|(_, _, k)| k))
                 }).unwrap_or(0);
 
                 let elem_size = group.ops.iter().find_map(|&oid| {

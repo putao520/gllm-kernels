@@ -68,7 +68,7 @@ pub(crate) fn compute_group_ai(group: &FusionGroup, graph: &CompilerGraph) -> f3
 // ARCH-SYMDIM-DEGRADE: cost model uses max_for_allocation for conservative estimate.
 // TODO(G-2): preserve symbolic form for tighter bounds.
 fn estimate_op_flops(op: &CompilerOp, graph: &CompilerGraph) -> usize {
-    match op.op_v2_gemm_dims(graph) {
+    match op.op_gemm_dims(graph) {
         Some((m, n, k)) => 2 * m.max_for_allocation_strict().expect("ARCH-SYMDIM: Symbolic dim must have max_value in cost model") * n * k,
         None => 0,
     }
@@ -91,10 +91,10 @@ pub(crate) fn is_memory_bound_group(
 fn extract_anchor_dtype(group: &FusionGroup, graph: &CompilerGraph) -> crate::types::DType {
     graph.op(group.anchor)
         .and_then(|op| {
-            if op.op_v2_is_quant_gemm(graph) {
+            if op.op_is_quant_gemm(graph) {
                 Some(graph.infer_computation_dtype())
             } else {
-                op.op_v2_gemm_dtype(graph)
+                op.op_gemm_dtype(graph)
             }
         })
         .unwrap_or_else(|| graph.infer_computation_dtype())
@@ -105,7 +105,7 @@ fn extract_anchor_dtype(group: &FusionGroup, graph: &CompilerGraph) -> crate::ty
 // TODO(G-2): preserve symbolic form for tighter bounds.
 fn extract_anchor_gemm_dims(group: &FusionGroup, graph: &CompilerGraph) -> (usize, usize, usize) {
     graph.op(group.anchor)
-        .and_then(|op| op.op_v2_gemm_dims(graph))
+        .and_then(|op| op.op_gemm_dims(graph))
         .map(|(m, n, k)| {
             (m.max_for_allocation_strict().expect("ARCH-SYMDIM: Symbolic dim must have max_value in cost model"), n, k)
         })
@@ -189,7 +189,7 @@ pub fn estimate_fusion_cost(
         FusionMode::TileLevelFusion { tile_rows, .. } => {
             // Scratch = tile_rows x K x elem_bytes for the tiled norm output
             let k = group.ops.iter().find_map(|&oid| {
-                graph.op(oid).and_then(|o| match &o.op_v2 {
+                graph.op(oid).and_then(|o| match &o.op {
                     Op::Gemm(spec)
                     | Op::GemmBias(spec) => Some(spec.k),
                     Op::QuantGemm(spec) => Some(spec.k),

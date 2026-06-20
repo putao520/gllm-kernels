@@ -16,12 +16,13 @@ mod tests {
         ).expect("Q5_0 plan derive should succeed");
 
         match &plan.kernel {
-            GemmKernel::HighBitMerge { scale_offset, low_offset, high_offset, bias, high_bits } => {
+            GemmKernel::HighBitMerge { scale_offset, low_offset, high_offset, bias, high_bits, post_scale_add } => {
                 assert_eq!(*scale_offset, 0);
                 assert_eq!(*low_offset, 6);
                 assert_eq!(*high_offset, 2);
                 assert_eq!(*bias, 16.0);
                 assert_eq!(*high_bits, 1);
+                assert!(!post_scale_add, "Q5_0 uses StaticBias, not BlockMin");
             }
             other => panic!("Q5_0 should select HighBitMerge, got {:?}", other),
         }
@@ -36,9 +37,10 @@ mod tests {
         ).expect("Q5_1 plan derive should succeed");
 
         match &plan.kernel {
-            GemmKernel::HighBitMerge { bias, high_bits, .. } => {
+            GemmKernel::HighBitMerge { bias, high_bits, post_scale_add, .. } => {
                 assert_eq!(*bias, 0.0);
                 assert_eq!(*high_bits, 1);
+                assert!(post_scale_add, "Q5_1 uses BlockScalarWithMin → post_scale_add");
             }
             other => panic!("Q5_1 should select HighBitMerge, got {:?}", other),
         }
@@ -111,8 +113,31 @@ mod tests {
         ).expect("Q8_0 plan derive should succeed");
 
         match &plan.kernel {
-            GemmKernel::Int8Native { .. } => {}
+            GemmKernel::Int8Native { scale_offset, data_offset, m_offset } => {
+                assert_eq!(*m_offset, 0, "Q8_0 has no BlockMin");
+            }
             other => panic!("Q8_0 should select Int8Native, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_q8_1_selects_int8native_with_min() {
+        use crate::quant::QuantType;
+        use crate::compiler::quant_format::QuantFormatRegistry;
+        let reg = QuantFormatRegistry::new();
+        let desc = reg.get(&QuantType::Q8_1).expect("Q8_1 should be registered");
+        let plan = QuantGemmPlan::derive(
+            BoundExpr::Const(1), 1, 256, &desc, SimdWidth::W256,
+            QuantPrecision::F32, DotProductCap::NativeInt8Simd,
+        ).expect("Q8_1 plan derive should succeed");
+
+        match &plan.kernel {
+            GemmKernel::Int8Native { scale_offset, data_offset, m_offset } => {
+                assert_eq!(*scale_offset, 0, "Q8_1 d_offset");
+                assert_eq!(*m_offset, 2, "Q8_1 m_offset (BlockMin)");
+                assert_eq!(*data_offset, 4, "Q8_1 data offset");
+            }
+            other => panic!("Q8_1 should select Int8Native, got {:?}", other),
         }
     }
 

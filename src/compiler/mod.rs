@@ -507,30 +507,6 @@ impl InferenceCompiler {
 
         #[cfg(feature = "jit-x86")]
         {
-            // DIAG: Dump alloc buffer composition
-            {
-                let mut sorted_slots: Vec<_> = alloc.slots.iter().collect();
-                sorted_slots.sort_by_key(|s| s.offset);
-                eprintln!("[VAM-DIAG] alloc.total_bytes={} ({} slots)", alloc.total_bytes, alloc.slots.len());
-                for s in sorted_slots.iter().take(20) {
-                    let name = graph.tensor(s.tensor_id)
-                        .map(|t| t.name.as_str())
-                        .unwrap_or("?");
-                    eprintln!("[VAM-DIAG]   tid={} name={} off={} size={}", s.tensor_id.0, name, s.offset, s.size_bytes);
-                }
-                let top5_by_size: Vec<_> = {
-                    let mut v: Vec<_> = alloc.slots.iter().collect();
-                    v.sort_by(|a, b| b.size_bytes.cmp(&a.size_bytes));
-                    v.into_iter().take(5).collect()
-                };
-                eprintln!("[VAM-DIAG] top 5 by size:");
-                for s in &top5_by_size {
-                    let name = graph.tensor(s.tensor_id)
-                        .map(|t| t.name.as_str())
-                        .unwrap_or("?");
-                    eprintln!("[VAM-DIAG]   tid={} name={} off={} size={}", s.tensor_id.0, name, s.offset, s.size_bytes);
-                }
-            }
             use codegen::vm::mega_kernel_emit::compile_mega_kernel_vm;
             use codegen::vm::{isa_profile::IsaProfile, isa_hook, reg_alloc::RegAllocator,
                               stack_frame::StackFrame, x86_lower::X86Lower,
@@ -559,6 +535,25 @@ impl InferenceCompiler {
             let topology = codegen::vm::topology::GraphTopologyAnalysis::analyze(
                 &graph,
             );
+            // Extract output_float_elems before topology is moved into compile_mega_kernel_vm.
+            // For SinglePass (non-generate) graphs, we need to copy output from scratchpad
+            // back to the ABI output arg. The output tensor is determined by:
+            // 1. topology.logits_output_tid (if Argmax is present → its input tensor)
+            // 2. graph.outputs[0] (fallback: no Argmax, e.g. GEMM/embedding/reranker)
+            let output_float_elems = if matches!(topology.loop_topology, crate::compiler::codegen::vm::topology::LoopTopology::SinglePass) {
+                let output_tid = topology.logits_output_tid
+                    .or_else(|| graph.outputs.first().copied());
+                output_tid
+                    .and_then(|tid| graph.tensor(tid))
+                    .map(|t| t.shape.iter().map(|d| match d {
+                        SymDim::Concrete(v) => *v,
+                        SymDim::Symbolic { max_value: Some(m), .. } => *m,
+                        _ => 1,
+                    }).product::<usize>())
+                    .unwrap_or(0)
+            } else {
+                0
+            };
             let t4 = std::time::Instant::now();
             let (mut program, rope_cache, logits_scratch_offset) = compile_mega_kernel_vm(
                 &fusion_plan, &graph, &alloc, Some(&registry), &profile,
@@ -665,6 +660,8 @@ impl InferenceCompiler {
             let hash = self.graph_content_hash(&graph);
             let mut layer = CompiledLayer::from_code(&code, total_scratch, hash)?;
             layer.weight_layout = Some(graph.weight_layout());
+            layer.logits_scratch_offset = logits_scratch_offset;
+            layer.output_float_elems = output_float_elems;
 
             let source_map = if config.debug_jit {
                 let mut map = lowerer_source_map;
@@ -831,8 +828,8 @@ impl InferenceCompiler {
 
         for &op_id in &topo {
             if let Some(op) = graph.op(op_id) {
-                // Op v2 内容指纹（胖 opcode 自描述，OE-4 单 IR）
-                op.op_v2.content_hash(&mut hasher);
+                // Op 内容指纹（胖 opcode 自描述，单 IR）
+                op.op.content_hash(&mut hasher);
                 // Edge connections
                 for &tid in &op.inputs {
                     tid.0.hash(&mut hasher);
@@ -2188,7 +2185,7 @@ mod tests {
         let mut gemm_count = 0;
         for &op_id in &topo {
             if let Some(op) = graph.op(op_id) {
-                if matches!(op.op_v2_resolved(&graph), Some(Op::Gemm(_))) {
+                if matches!(op.op_resolved(&graph), Some(Op::Gemm(_))) {
                     gemm_count += 1;
                 }
             }

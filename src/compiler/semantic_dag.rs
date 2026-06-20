@@ -70,7 +70,7 @@ pub struct SemanticNode {
     /// Node ID (matches CompilerGraph op index)
     pub node_id: OpId,
     /// Operator kind (from CompilerGraph)
-    pub op_v2: Op,
+    pub op: Op,
     /// Computation structure (from Scalar + SymExec / registry)
     pub op_trace: Option<OpTrace>,
     /// TVM operator class (auto-derived from op_trace.pattern)
@@ -120,7 +120,7 @@ impl SemanticDAG {
         for &op_id in &topo_order {
             // SAFETY: topological_sort only returns OpIds that exist in the graph
             let op = graph.op(op_id).expect("SAFETY: topological_sort returned invalid OpId");
-            let key = ScalarOpRegistry::key_from_op(&op.op_v2);
+            let key = ScalarOpRegistry::key_from_op(&op.op);
             let op_trace = registry.get_trace(&key).cloned();
             // Pattern-derived classification: trust the registered OpTrace.
             // OpKind override: some complex composite ops (PatchEmbed Conv2D,
@@ -129,19 +129,19 @@ impl SemanticDAG {
             // producers — downstream elementwise consumers must not be chained
             // into the same LoopFusion group (the anchor-only lower path would
             // silently drop them). Force Opaque in that case.
-            let op_class = match &op.op_v2 {
+            let op_class = match &op.op {
                 Op::PatchEmbed { .. } | Op::DepthwiseConv1D { .. } => OpClass::Opaque,
                 _ => op_trace
                     .as_ref()
                     .map(|t| Self::derive_op_class(&t.pattern))
-                    .unwrap_or_else(|| Self::fallback_op_class_from_op_v2(&op.op_v2)),
+                    .unwrap_or_else(|| Self::fallback_op_class_from_op(&op.op)),
             };
 
             let (ai, bottleneck) = Self::compute_arithmetic_intensity(op, graph);
 
             nodes.push(SemanticNode {
                 node_id: op.id,
-                op_v2: op.op_v2.clone(),
+                op: op.op.clone(),
                 op_trace,
                 op_class,
                 bottleneck,
@@ -188,8 +188,8 @@ impl SemanticDAG {
     }
 
     /// Fallback classification when no OpTrace is available.
-    /// OE-3: 胖 opcode 自描述 OpClass 分类（OpKind legacy 已删除）。
-    fn fallback_op_class_from_op_v2(op: &Op) -> OpClass {
+    /// 胖 opcode 自描述 OpClass 分类（OpKind legacy 已删除）。
+    fn fallback_op_class_from_op(op: &Op) -> OpClass {
         match op {
             Op::Silu | Op::Gelu | Op::Tanh | Op::Add | Op::Mul | Op::ScaleConst { .. }
             | Op::Residual | Op::LogitSoftcap { .. } | Op::SwiGlu | Op::SwiGluClipped { .. }
@@ -228,13 +228,13 @@ impl SemanticDAG {
         // Estimate FLOPs
         // ARCH-SYMDIM-DEGRADE: cost model uses max_for_allocation for conservative estimate.
         // TODO(G-2): preserve symbolic form for tighter bounds.
-        let flops: usize = match op.op_v2_resolved(graph) {
+        let flops: usize = match op.op_resolved(graph) {
             Some(Op::Gemm(_)) | Some(Op::QuantGemm(_)) => {
-                let (m, n, k) = op.op_v2_gemm_dims(graph).expect("Gemm/QuantGemm 必有 dims");
+                let (m, n, k) = op.op_gemm_dims(graph).expect("Gemm/QuantGemm 必有 dims");
                 2 * m.max_for_allocation_strict().expect("ARCH-SYMDIM: Symbolic dim must have max_value in cost model") * n * k
             }
             Some(Op::GemmBias(_)) => {
-                let (m, n, k) = op.op_v2_gemm_dims(graph).expect("GemmBias 必有 dims");
+                let (m, n, k) = op.op_gemm_dims(graph).expect("GemmBias 必有 dims");
                 let m_val = m.max_for_allocation_strict().expect("ARCH-SYMDIM: Symbolic dim must have max_value in cost model");
                 2 * m_val * n * k + m_val * n
             }
@@ -977,7 +977,7 @@ mod tests {
         // Assert
         assert_eq!(dag.num_nodes(), 1);
         let node = dag.node(OpId(0)).expect("node should exist");
-        assert_eq!(node.op_v2, Op::Silu);
+        assert_eq!(node.op, Op::Silu);
         assert_eq!(node.op_class, OpClass::ElemWise);
         assert!(node.op_trace.is_some(), "registry should have Silu trace");
         assert_eq!(node.inputs, vec![input]);
@@ -1056,7 +1056,7 @@ mod tests {
         let node = dag.node(op_id);
         // Assert
         assert!(node.is_some());
-        assert_eq!(node.unwrap().op_v2, Op::Tanh);
+        assert_eq!(node.unwrap().op, Op::Tanh);
     }
 
     #[test]
@@ -1594,7 +1594,7 @@ mod tests {
         let node = dag.node(op_id).expect("node should exist");
         // Assert
         assert_eq!(node.node_id, op_id);
-        assert_eq!(node.op_v2, Op::RmsNorm(NormSpec { feature_dim: 4096, eps: 1e-6, dtype: DType::F32, has_weight: true }));
+        assert_eq!(node.op, Op::RmsNorm(NormSpec { feature_dim: 4096, eps: 1e-6, dtype: DType::F32, has_weight: true }));
         assert_eq!(node.op_class, OpClass::Reduction);
         assert_eq!(node.inputs, vec![input, weight]);
         assert_eq!(node.outputs, vec![output]);

@@ -106,7 +106,7 @@ pub static NORM_RMS: AlgoTemplate = AlgoTemplate {
         ]),
         AlgoStep::Reduce { op: ReduceOp::Sum },
         AlgoStep::TraceBody(&[
-            AlgoTraceStep::LoadConst { value: 1e-6 }, // eps
+            AlgoTraceStep::LoadParam { name: "eps" }, // eps from NormSpec, resolved at instantiation
             AlgoTraceStep::BinOp { op: TraceBinOp::Add, dst: "mean_eps", a: "sum", b: "eps" },
             AlgoTraceStep::UnaryOp { op: TraceUnaryOp::Rsqrt, dst: "inv_rms", src: "mean_eps" },
             AlgoTraceStep::BinOp { op: TraceBinOp::Mul, dst: "norm_out", a: "x", b: "inv_rms" },
@@ -135,7 +135,7 @@ pub static NORM_LAYER: AlgoTemplate = AlgoTemplate {
         ]),
         AlgoStep::Reduce { op: ReduceOp::Sum },
         AlgoStep::TraceBody(&[
-            AlgoTraceStep::LoadConst { value: 1e-5 },
+            AlgoTraceStep::LoadParam { name: "eps" }, // eps from NormSpec, resolved at instantiation
             AlgoTraceStep::BinOp { op: TraceBinOp::Add, dst: "var_eps", a: "var", b: "eps" },
             AlgoTraceStep::UnaryOp { op: TraceUnaryOp::Rsqrt, dst: "inv_std", src: "var_eps" },
             AlgoTraceStep::BinOp { op: TraceBinOp::Mul, dst: "norm_out", a: "centered", b: "inv_std" },
@@ -147,6 +147,7 @@ pub static NORM_LAYER: AlgoTemplate = AlgoTemplate {
     ],
     params: &[
         ("hidden_dim", AlgoParam::FromGraph("hidden_dim")),
+        ("eps", AlgoParam::FromGraph("norm_eps")),
     ],
     micro_kernel: None,
 };

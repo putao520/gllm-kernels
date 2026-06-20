@@ -415,7 +415,7 @@ pub fn enforce_constraints(
 // TODO(G-2): preserve symbolic form for tighter bounds.
 fn extract_gemm_dims(group: &FusionGroup, graph: &CompilerGraph) -> Option<(usize, usize, usize)> {
     let op = graph.op(group.anchor)?;
-    op.op_v2_gemm_dims(graph).map(|(m, n, k)| {
+    op.op_gemm_dims(graph).map(|(m, n, k)| {
         (m.max_for_allocation_strict().expect("ARCH-SYMDIM: Symbolic dim must have max_value in cost model"), n, k)
     })
 }
@@ -427,10 +427,10 @@ fn extract_gemm_dims(group: &FusionGroup, graph: &CompilerGraph) -> Option<(usiz
 fn extract_gemm_dtype(group: &FusionGroup, graph: &CompilerGraph) -> crate::types::DType {
     let op = graph.op(group.anchor);
     op.and_then(|op| {
-        if op.op_v2_is_quant_gemm(graph) {
+        if op.op_is_quant_gemm(graph) {
             Some(graph.infer_computation_dtype())
         } else {
-            op.op_v2_gemm_dtype(graph)
+            op.op_gemm_dtype(graph)
         }
     }).unwrap_or_else(|| graph.infer_computation_dtype())
 }
@@ -454,8 +454,8 @@ fn estimate_register_pressure(
     match group.mode {
         FusionMode::Standalone => {
             if let Some(op) = graph.op(group.anchor) {
-                let op_v2 = op.op_v2_resolved(graph);
-                if matches!(op_v2, Some(Op::Gemm(_)) | Some(Op::GemmBias(_)) | Some(Op::QuantGemm(_))) {
+                let op_resolved = op.op_resolved(graph);
+                if matches!(op_resolved, Some(Op::Gemm(_)) | Some(Op::GemmBias(_)) | Some(Op::QuantGemm(_))) {
                     gemm_base_regs(plan, dtype)
                 } else {
                     2 // input + output
@@ -618,12 +618,18 @@ mod tests {
         let plan = fusion::fuse_with_dag(&g, &registry, &exec_plan);
         let results = check_plan(&plan.groups, &g, &exec_plan);
 
-        assert_eq!(results.len(), 1);
-        assert!(
-            results[0].valid,
-            "GEMM+SiLU epilogue should pass constraints, violations: {:?}",
-            results[0].violations
-        );
+        // After ARCH-ROOT-CAUSE fix: compute-bound GEMM (4096×4096) gets demoted
+        // from EpilogueInjection → Standalone, and SiLU is split into its own
+        // Standalone group. Both groups should pass constraints.
+        for r in &results {
+            assert!(
+                r.valid,
+                "Group {} ({:?}) failed constraints: {:?}",
+                r.group_id,
+                plan.groups[r.group_id].mode,
+                r.violations
+            );
+        }
     }
 
     #[test]

@@ -51,7 +51,7 @@ pub fn fuse_with_dag_prebuilt(
                 let out_names: Vec<String> = op.outputs.iter()
                     .filter_map(|&tid| graph.tensor(tid).map(|t| t.name.clone()))
                     .collect();
-                eprintln!("[fusion]   topo[{:3}] {:?} {:?} → {}", i, oc, op.op_v2, out_names.join(", "));
+                eprintln!("[fusion]   topo[{:3}] {:?} {:?} → {}", i, oc, op.op, out_names.join(", "));
                 if i > 10 { break; }
             }
         }
@@ -159,6 +159,10 @@ pub fn fuse_with_dag_prebuilt(
                     let gid = groups.len();
                     let mut all_ops = Vec::new();
                     let anchor_bottleneck = dag.node(op_id).map(|n| n.bottleneck);
+                    // Track whether epilogue was demoted — if so, epilogue ops
+                    // must be split into separate Standalone groups to prevent
+                    // silent drops in the emit stage (ARCH-ROOT-CAUSE).
+                    let mut epilogue_demoted = false;
                     let mut mode = if let Some(norm_id) = norm_prefix {
                         if !epilogue.is_empty() {
                             // REQ-JCTX-014: Check epilogue injection budget
@@ -168,8 +172,10 @@ pub fn fuse_with_dag_prebuilt(
                                 .map(|t| t.shape.iter().map(|d| d.max_for_allocation_strict().unwrap_or(graph.max_seq_len)).product::<usize>() * t.dtype.size_bytes())
                                 .sum();
                             if !can_inject_epilogue_with_budget(jit_ctx, epilogue_bytes) {
+                                epilogue_demoted = true;
                                 FusionMode::Standalone
                             } else if anchor_bottleneck == Some(Bottleneck::Compute) && epilogue.len() > 2 {
+                                epilogue_demoted = true;
                                 FusionMode::Standalone
                             } else {
                                 FusionMode::EpilogueInjection
@@ -197,8 +203,10 @@ pub fn fuse_with_dag_prebuilt(
                             .map(|t| t.shape.iter().map(|d| d.max_for_allocation_strict().unwrap_or(graph.max_seq_len)).product::<usize>() * t.dtype.size_bytes())
                             .sum();
                         if !can_inject_epilogue_with_budget(jit_ctx, epilogue_bytes) {
+                            epilogue_demoted = true;
                             FusionMode::Standalone
                         } else if anchor_bottleneck == Some(Bottleneck::Compute) && epilogue.len() > 2 {
+                            epilogue_demoted = true;
                             FusionMode::Standalone
                         } else {
                             FusionMode::EpilogueInjection
@@ -211,6 +219,13 @@ pub fn fuse_with_dag_prebuilt(
                     // traffic — demote to Standalone. Memory-bound groups (density < 1.0)
                     // always benefit from fusion (eliminates writeback). Balanced groups
                     // (1.0..10.0) are kept as-is.
+                    //
+                    // ARCH-ROOT-CAUSE: When demoting EpilogueInjection → Standalone,
+                    // epilogue ops must be split into separate Standalone groups.
+                    // Keeping them in the demoted group causes the emit stage to
+                    // silently drop them (Standalone only emits the anchor op),
+                    // which corrupts the computation graph (e.g., GELU dropped
+                    // after up_proj GEMM → down_proj reads uninitialized buffer).
                     if mode == FusionMode::EpilogueInjection && !epilogue.is_empty() {
                         let candidate_ops: Vec<OpId> = {
                             let mut v = Vec::new();
@@ -236,6 +251,7 @@ pub fn fuse_with_dag_prebuilt(
                         if let Some(density) = ComputeDensity::from_group(&candidate_group, graph) {
                             if density.is_compute_bound() {
                                 mode = FusionMode::Standalone;
+                                epilogue_demoted = true;
                             }
                         }
                     }
@@ -278,7 +294,34 @@ pub fn fuse_with_dag_prebuilt(
                     op_to_group.insert(op_id, gid);
                     claimed.insert(op_id);
 
-                    let epilogue_ids: Vec<OpId> = epilogue.iter().map(|o| o.id).collect();
+                    // When any gate demoted EpilogueInjection → Standalone,
+                    // epilogue ops are split into separate Standalone groups instead of
+                    // staying in the anchor group. This ensures the emit stage doesn't
+                    // silently drop them (ARCH-ROOT-CAUSE).
+                    let epilogue_ids: Vec<OpId> = if !epilogue_demoted {
+                        // Normal path: epilogue stays in the anchor group
+                        epilogue.iter().map(|o| o.id).collect()
+                    } else {
+                        // Demoted path: each epilogue op gets its own Standalone group
+                        for ep in &epilogue {
+                            let epi_gid = groups.len();
+                            op_to_group.insert(ep.id, epi_gid);
+                            claimed.insert(ep.id);
+                            groups.push(FusionGroup {
+                                id: epi_gid,
+                                anchor: ep.id,
+                                epilogue: Vec::new(),
+                                mode: FusionMode::Standalone,
+                                ops: vec![ep.id],
+                                multi_output: MultiOutputConfig::single(),
+                                dominant_dtype: None,
+                                marker: GroupMarker::None,
+                                is_layer_group: false,
+                                hetero_layer_type: None,
+                            });
+                        }
+                        Vec::new() // anchor group has no epilogue
+                    };
                     for &eid in &epilogue_ids {
                         all_ops.push(eid);
                         op_to_group.insert(eid, gid);
@@ -653,8 +696,8 @@ fn assign_group_markers(groups: &mut [FusionGroup], graph: &CompilerGraph) {
         .map(|g| {
             g.ops.iter()
                 .filter_map(|&oid| graph.op(oid))
-                .filter_map(|op| op.op_v2_resolved(graph))
-                .map(|op_v2| std::mem::discriminant(&op_v2))
+                .filter_map(|op| op.op_resolved(graph))
+                .map(|op_resolved| std::mem::discriminant(&op_resolved))
                 .collect()
         })
         .collect();
@@ -785,11 +828,11 @@ fn extract_hetero_dims(graph: &CompilerGraph) -> Option<HeteroDims> {
     let mut head_dims: Vec<usize> = Vec::new();
     let mut intermediates: Vec<usize> = Vec::new();
     for op in &graph.ops {
-        let op_v2 = op.op_v2_resolved(graph);
-        if let Some(hd) = op_v2.as_ref().and_then(|o| o.attention_head_dim()) {
+        let op_resolved = op.op_resolved(graph);
+        if let Some(hd) = op_resolved.as_ref().and_then(|o| o.attention_head_dim()) {
             head_dims.push(hd);
         }
-        if let Some((_, n, _)) = op.op_v2_gemm_dims(graph) {
+        if let Some((_, n, _)) = op.op_gemm_dims(graph) {
             intermediates.push(n);
         }
     }
@@ -835,26 +878,26 @@ fn derive_hetero_layer_type(
     // Determine if this group has sliding or full attention
     let is_sliding = group.ops.iter().any(|&oid| {
         graph.op(oid).map_or(false, |op| {
-            op.op_v2_attention_head_dim(graph) == Some(dims.sliding_head_dim)
+            op.op_attention_head_dim(graph) == Some(dims.sliding_head_dim)
         })
     });
     let is_full = group.ops.iter().any(|&oid| {
         graph.op(oid).map_or(false, |op| {
-            op.op_v2_attention_head_dim(graph) == Some(dims.full_head_dim)
+            op.op_attention_head_dim(graph) == Some(dims.full_head_dim)
         })
     });
 
     // Determine if this group has small or large FFN
     let is_small_ffn = group.ops.iter().any(|&oid| {
         graph.op(oid).map_or(false, |op| {
-            op.op_v2_gemm_dims(graph).map_or(false, |(_, n, _)| {
+            op.op_gemm_dims(graph).map_or(false, |(_, n, _)| {
                 n == dims.small_intermediate && dims.small_intermediate != dims.large_intermediate
             })
         })
     });
     let is_large_ffn = group.ops.iter().any(|&oid| {
         graph.op(oid).map_or(false, |op| {
-            op.op_v2_gemm_dims(graph).map_or(false, |(_, n, _)| {
+            op.op_gemm_dims(graph).map_or(false, |(_, n, _)| {
                 n == dims.large_intermediate && dims.small_intermediate != dims.large_intermediate
             })
         })
@@ -1060,7 +1103,7 @@ fn try_collect_reduction_epilogue<'a>(
         dag.node(consumer_id).map(|n| n.op_class) == Some(OpClass::Reduction)
     } else {
         matches!(
-            &consumer.op_v2,
+            &consumer.op,
             Op::Argmax { .. } | Op::MeanPool { .. } | Op::L2Normalize { .. }
         )
     };
@@ -1093,7 +1136,7 @@ fn norm_feeds_single_gemm_consumer(
     };
     // Must match detect_norm_into_gemm's accepted norms (RmsNorm/LayerNorm, NOT ValueNorm).
     // ValueNorm lacks learnable weight — not eligible for NormIntoGemm fusion.
-    let is_norm_into_gemm_eligible = matches!(&op.op_v2,
+    let is_norm_into_gemm_eligible = matches!(&op.op,
         Op::RmsNorm(_) | Op::LayerNorm(_));
     if !is_norm_into_gemm_eligible {
         return false;
@@ -1121,7 +1164,7 @@ fn norm_feeds_single_gemm_consumer(
     // The consumer must be a plain GEMM kind (not MoEGate, which shares Gemm
     // class but does not participate in Norm-prefix fusion).
     matches!(
-        graph.op(consumer_id).map(|o| &o.op_v2),
+        graph.op(consumer_id).map(|o| &o.op),
         Some(Op::Gemm(_))
             | Some(Op::GemmBias(_))
             | Some(Op::QuantGemm(_))

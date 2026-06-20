@@ -5,7 +5,7 @@
 //! Budget不足 → 拒绝融合（降级为原子 op），而非拒绝编译。
 //! jit_ctx=None → 使用 DeviceProfile 保守估计（不阻止融合）。
 
-use crate::compiler::graph::{CompilerGraph, CompilerOp, OpId, Op, GemmSpec, NormSpec, QuantGemmSpec, RopeSpec, AttentionSpec, AttentionGeometry, AttentionMask, SinksSpec, CachedGqaSpec, MlaSpec, DualRopeSpec};
+use crate::compiler::graph::{CompilerGraph, CompilerOp, OpId};
 use crate::compiler::semantic_dag::{SemanticDAG, OpClass};
 use crate::compiler::jit_context::{JitContext, ResourceKind};
 
@@ -69,7 +69,7 @@ pub fn estimate_tile_resource_bytes(
 
     // Fallback: estimate from anchor GEMM dimensions
     if let Some(anchor_op) = graph.op(anchor) {
-        if let Some((m, n, _)) = anchor_op.op_v2_gemm_dims(graph) {
+        if let Some((m, n, _)) = anchor_op.op_gemm_dims(graph) {
             let m_val = m.max_for_allocation_strict().unwrap_or(graph.max_seq_len);
             let tile_rows = m_val.min(64);
             // PERF: F32 (4 字节) 作为 tile bytes 估算上界,非统一精度假设
@@ -223,7 +223,7 @@ pub fn can_tile_fuse_with_budget(
 /// Estimate tile rows from the anchor GEMM's MC blocking factor.
 fn estimate_tile_rows(graph: &CompilerGraph, anchor: OpId) -> usize {
     if let Some(op) = graph.op(anchor) {
-        if let Some((m, _, _)) = op.op_v2_gemm_dims(graph) {
+        if let Some((m, _, _)) = op.op_gemm_dims(graph) {
             // MC = min(m, 64) — typical L1 blocking factor
             return m.max_for_allocation_strict().unwrap_or(graph.max_seq_len).min(64);
         }

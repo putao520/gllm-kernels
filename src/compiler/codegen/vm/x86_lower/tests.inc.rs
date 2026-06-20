@@ -243,9 +243,13 @@ mod tests {
         sa.scope_end();
         assert_eq!(sa.active_count(), 0, "scope end should free all slots");
 
+        // ARCH-SPILL-SAFE: after scope recycle, the freed slot INDEX is reused
+        // but the offset is FRESH (never reused) to prevent two VRegs from
+        // sharing the same spill memory location.
         let (idx2, off2) = sa.alloc(VRegId(2), 32, None);
         assert_eq!(idx2, idx0, "after scope recycle, should reuse freed slot index");
-        assert_eq!(off2, off0, "offset should match the recycled slot");
+        assert_ne!(off2, off0, "offset must be fresh — never reuse spill offsets (ARCH-SPILL-SAFE)");
+        assert_ne!(off2, off1, "offset must be fresh — never reuse spill offsets (ARCH-SPILL-SAFE)");
     }
 
     #[test]
@@ -263,8 +267,9 @@ mod tests {
         sa.scope_end();
         assert_eq!(sa.active_count(), 1, "inner scope end frees only inner slots");
 
+        // ARCH-SPILL-SAFE: the freed slot INDEX is reused but offset is fresh.
         let (_recycled_idx, recycled_off) = sa.alloc(VRegId(2), 16, None);
-        assert_eq!(recycled_off, inner_off, "should reuse inner scope's freed slot offset");
+        assert_ne!(recycled_off, inner_off, "offset must be fresh — never reuse spill offsets (ARCH-SPILL-SAFE)");
 
         sa.scope_end();
         assert_eq!(sa.active_count(), 1, "outer scope end frees outer slots, global slot remains");

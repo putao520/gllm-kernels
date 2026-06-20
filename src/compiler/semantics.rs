@@ -100,8 +100,7 @@ pub fn classify(op: &Op) -> OpSemantics {
 
         // KV scatter write: pure memory op (no compute)
         Op::KvScatterWrite { .. } => OpSemantics::Opaque,
-        // KV cache write: pure memory op (no compute)
-        Op::KvCacheWrite { .. } => OpSemantics::Opaque,
+        // @trace REQ-FATOP-025: KvCacheWrite 已物理删除 — attention FromCache lowering 内部覆盖 KV 写入
 
         // P4/P5 stub variants: treat as opaque for now
         Op::VariableLengthBatch
@@ -336,8 +335,7 @@ pub fn arithmetic_intensity(op: &Op, graph_dtype: crate::types::DType) -> f64 {
         Op::ColumnSlice { .. } => 0.0,
         // KV scatter write: pure memory movement, 0 compute
         Op::KvScatterWrite { .. } => 0.0,
-        // KV cache write: pure memory movement, 0 compute
-        Op::KvCacheWrite { .. } => 0.0,
+        // @trace REQ-FATOP-025: KvCacheWrite 已物理删除 — attention FromCache lowering 内部覆盖 KV 写入
         // ARCH-SG-QTAP: pure side-effect memcpy + atomic — zero FLOPs, all memory.
         Op::QTapSTG { .. } => 0.0,
         // Mega-kernel generate loop ops (GRAPH-SHAPE-DRIVEN-MEGA-KERNEL §2.2)

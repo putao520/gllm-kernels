@@ -12,7 +12,7 @@
 //! - decoder 裁剪为 EncodeToLayer: 裁掉 lm_head 及后续
 //! - 编译器看裁剪后的图 ops 推导一切，完全不读 output_modes
 
-use crate::compiler::graph::{CompilerGraph, Op, TensorId, GemmSpec, NormSpec, QuantGemmSpec, RopeSpec, AttentionSpec, AttentionGeometry, AttentionMask, SinksSpec, CachedGqaSpec, MlaSpec, DualRopeSpec};
+use crate::compiler::graph::{CompilerGraph, Op, TensorId};
 use crate::compiler::mega_kernel_abi::MtpKernelConfig;
 
 /// seq_len 的来源 — 从图 ops 推导
@@ -165,7 +165,7 @@ impl GraphTopologyAnalysis {
         let mut sg_inject_hidden_dim: Option<usize> = None;
 
         for op in &graph.ops {
-            match op.op_v2_resolved(graph) {
+            match op.op_resolved(graph) {
                 Some(Op::Argmax { vocab_size: vs }) => {
                     has_argmax = true;
                     vocab_size = Some(vs);
@@ -240,7 +240,7 @@ impl GraphTopologyAnalysis {
 
         // MTP 配置从 Op::MtpDraft 推导（胖 opcode 自描述）
         let mtp_config = graph.ops.iter().find_map(|op| {
-            match op.op_v2_resolved(graph) {
+            match op.op_resolved(graph) {
                 Some(Op::MtpDraft { depth, hidden_size, vocab_size }) =>
                     Some(MtpKernelConfig { depth, hidden_size, vocab_size }),
                 _ => None,

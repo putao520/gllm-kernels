@@ -87,6 +87,28 @@ pub struct X86Lower {
     dispatch_labels: HashMap<usize, CodeLabel>,
     source_map: super::debug_map::JitSourceMap,
     zero_vregs: HashSet<VRegId>,
+    /// ARCH-SPILL-SAFE-ISA: Maps VRegId → immutable reload recipe.
+    /// Under extreme register pressure (4120+ spills), spill slots can be corrupted by other VReg
+    /// writes due to ScopedSpillAllocator slot reuse. When `resolve_gpr_read` encounters a spilled
+    /// VReg present in this map, it recomputes the value from the immutable ABI stack slot instead
+    /// of reading the potentially-corrupted spill slot. This is the ISA-level fix — the VmInstr-level
+    /// ARCH-SPILL-SAFE reloads in materialize()/load_op_scratch_ptr() are insufficient because
+    /// regalloc also spills the freshly-allocated VReg.
+    stack_arg_vregs: HashMap<VRegId, SpillSafeRecipe>,
+}
+
+/// Recipe for recomputing a VReg's value from immutable ABI stack slots.
+/// ARCH-SPILL-SAFE-ISA: When a VReg is spilled and its spill slot may be corrupted,
+/// we use this recipe to reload from the immutable source instead.
+#[derive(Debug, Clone)]
+enum SpillSafeRecipe {
+    /// VReg = *(rbp + offset) — direct load from immutable stack slot.
+    /// Used for LoadPtr { src: StackArg(off) } and LoadPtr { src: AbiArg(idx) }.
+    StackLoad { rbp_offset: i32 },
+    /// VReg = *(rbp + base_offset) + const_offset — load base from immutable slot, add offset.
+    /// Used for LoadPtr { src: VRegPlusConst(base, off) } where base is StackArg-derived,
+    /// and for AddPtr { base, offset } where base is StackArg-derived.
+    StackLoadPlusConst { rbp_offset: i32, const_offset: usize },
 }
 
 include!("x86_lower/helpers.inc.rs");

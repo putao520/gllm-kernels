@@ -34,7 +34,15 @@ impl StackFrame {
         scratchpad_bytes: usize,
     ) -> Self {
         let callee_save_area = alloc.callee_saved_used.len() * 8; // 每个 GPR push 8 bytes
-        let spill_area: usize = alloc.spills.iter().map(|s| s.size).sum();
+        // ARCH-SPILL-SAFE: spill_area must cover the maximum (offset + size) across all
+        // spill slots, not the sum of sizes. After fixing ScopedSpillAllocator to never
+        // reuse offsets, each slot gets a unique offset, and the total area is determined
+        // by the highest-addressed slot. Using size-sum would undercount when slots are
+        // freed and re-allocated with fresh (larger) offsets.
+        let spill_area: usize = alloc.spills.iter()
+            .map(|s| s.offset + s.size)
+            .max()
+            .unwrap_or(0);
         // ARCH-SCRATCH-NOT-ON-STACK: scratchpad 是外部 buffer (ABI arg 8 = [rbp+32]),
         // 由调用方分配传入,不应计入 CPU 栈帧的 sub rsp 大小。否则 352MB 分类器
         // 模型导致 sub rsp 立即 SIGSEGV (Linux 默认栈 8MB)。
@@ -67,11 +75,13 @@ impl StackFrame {
     }
 
     /// Spill slot 在栈帧中的偏移 (相对于 rbp)。
-    /// 布局: [rbp] → callee_saves → spills → scratchpad → [rsp]
+    /// ARCH-SPILL-SAFE: Uses spill.offset (from ScopedSpillAllocator) directly,
+    /// not cumulative size-sum, to correctly handle slots with non-contiguous offsets
+    /// (after fix: freed+reallocated slots get fresh offsets beyond the size-sum range).
     pub fn spill_offset(&self, spill_index: usize, alloc: &RegAllocation) -> i32 {
         let base = self.callee_save_area;
-        let offset = alloc.spills.iter().take(spill_index).map(|s| s.size).sum::<usize>();
-        -((base + offset + 8) as i32) // 负偏移 (栈向下增长)
+        let spill = &alloc.spills[spill_index];
+        -((base + spill.offset + spill.size) as i32) // 负偏移 (栈向下增长)
     }
 }
 
@@ -118,14 +128,10 @@ pub struct ScopedSpillAllocator {
     scope_slots: std::collections::HashMap<ScopeId, Vec<usize>>,
     next_scope_id: ScopeId,
     next_offset: usize,
-    /// DIAG: unique allocator instance ID
-    diag_id: usize,
 }
 
 impl ScopedSpillAllocator {
     pub fn new() -> Self {
-        static COUNTER: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
-        let id = COUNTER.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         Self {
             slots: Vec::new(),
             free_list: Vec::new(),
@@ -133,7 +139,6 @@ impl ScopedSpillAllocator {
             scope_slots: std::collections::HashMap::new(),
             next_scope_id: 0,
             next_offset: 0,
-            diag_id: id,
         }
     }
 
@@ -147,43 +152,49 @@ impl ScopedSpillAllocator {
         size: usize,
         scope_id: Option<ScopeId>,
     ) -> (usize, usize) {
-        // 优先从 free_list 找 size 完全匹配的 slot
-        if let Some(pos) = self.free_list.iter().position(|&idx| self.slots[idx].size == size) {
+        // ARCH-SPILL-SAFE: Do NOT reuse freed slot offsets. Each VReg must have
+        // a unique spill offset to prevent two VRegs from sharing the same stack
+        // memory location. When a slot is freed and its index is reused for a new
+        // VReg, the new VReg MUST get a fresh offset — otherwise, writes to the
+        // new VReg's spill slot will overwrite the old VReg's data at the same
+        // [rbp+offset] location, and vice versa. This was the root cause of the
+        // embedding E2E SIGSEGV: with 4119 spills and ScopedSpillAllocator slot
+        // reuse, two VRegs with overlapping lifetimes could share the same spill
+        // offset, causing spill slot corruption.
+        //
+        // The free_list is now used ONLY to reuse slot indices (to keep the
+        // spills vector compact), but each reuse gets a brand-new offset.
+        let (idx, offset) = if let Some(pos) = self.free_list.iter().position(|&idx| self.slots[idx].size == size) {
             let idx = self.free_list.remove(pos);
-            // DIAG: track slot reuse at offset 3720 (0xe88)
-            if self.slots[idx].offset == 3720 {
-                eprintln!("[SPILL-REUSE] alloc={} offset=3720 slot_idx={}: old_vreg={:?} -> new_vreg={:?} scope={:?}",
-                    self.diag_id, idx, self.slots[idx].vreg, vreg, scope_id);
-            }
+            // Reuse the slot INDEX but allocate a FRESH offset
+            let offset = self.next_offset;
+            self.next_offset += size;
+            self.slots[idx].offset = offset;
             self.slots[idx].state = SlotState::Occupied;
             self.slots[idx].vreg = Some(vreg);
             self.slots[idx].owner = scope_id;
             if let Some(sid) = scope_id {
                 self.scope_slots.entry(sid).or_default().push(idx);
             }
-            return (idx, self.slots[idx].offset);
-        }
-
-        // 无匹配：分配新 slot
-        let offset = self.next_offset;
-        self.next_offset += size;
-        // DIAG: track new allocation at offset 3720
-        if offset <= 3720 && offset + size > 3720 {
-            eprintln!("[SPILL-NEW] alloc={} overlap with 3720: offset={} size={} vreg={:?} scope={:?} slots_len={} next_offset={}",
-                self.diag_id, offset, size, vreg, scope_id, self.slots.len(), self.next_offset);
-        }
-        let info = SpillSlotInfo {
-            offset,
-            size,
-            owner: scope_id,
-            vreg: Some(vreg),
-            state: SlotState::Occupied,
+            (idx, offset)
+        } else {
+            // Allocate new slot with new offset
+            let offset = self.next_offset;
+            self.next_offset += size;
+            let info = SpillSlotInfo {
+                offset,
+                size,
+                owner: scope_id,
+                vreg: Some(vreg),
+                state: SlotState::Occupied,
+            };
+            let idx = self.slots.len();
+            self.slots.push(info);
+            if let Some(sid) = scope_id {
+                self.scope_slots.entry(sid).or_default().push(idx);
+            }
+            (idx, offset)
         };
-        let idx = self.slots.len();
-        self.slots.push(info);
-        if let Some(sid) = scope_id {
-            self.scope_slots.entry(sid).or_default().push(idx);
-        }
         (idx, offset)
     }
 
@@ -981,18 +992,17 @@ mod tests {
         };
         let frame = StackFrame::compute(&alloc, &profile, 0);
 
-        // spill_offset(0): base=callee_save_area(8), offset=0, result = -(8+0+8) = -16
+        // spill_offset(0): base=callee_save_area(8), offset=0, size=8, result = -(8+0+8) = -16
         let off0 = frame.spill_offset(0, &alloc);
         assert_eq!(off0, -16);
 
-        // spill_offset(1): base=8, offset=spills[0].size=8, result = -(8+8+8) = -24
+        // spill_offset(1): base=8, offset=8, size=16, result = -(8+8+16) = -32
         let off1 = frame.spill_offset(1, &alloc);
-        assert_eq!(off1, -24);
+        assert_eq!(off1, -32);
 
-        // spill_offset(2): base=8, offset=spills[0].size + spills[1].size = 8+16=24,
-        // result = -(8+24+8) = -40
+        // spill_offset(2): base=8, offset=24, size=4, result = -(8+24+4) = -36
         let off2 = frame.spill_offset(2, &alloc);
-        assert_eq!(off2, -40);
+        assert_eq!(off2, -36);
     }
 
     // ── 32. StackFrame with callee_saves and zero spills ─────────────
@@ -1047,6 +1057,42 @@ mod tests {
     }
 
     // ── 34. ExecutionMode decode batch_size>1 always SmallBatch ──────
+
+    // ── ARCH-SPILL-SAFE: Verify that freed+reallocated slots get unique offsets ──
+
+    #[test]
+    fn scoped_spill_freed_reallocated_gets_unique_offset() {
+        let mut allocator = ScopedSpillAllocator::new();
+        let scope = allocator.scope_begin();
+        let (idx0, off0) = allocator.alloc(VRegId(0), 8, Some(scope));
+        let (idx1, off1) = allocator.alloc(VRegId(1), 8, Some(scope));
+        allocator.scope_end(); // both freed
+
+        // Reallocate — should get same index but NEW offset
+        let (idx2, off2) = allocator.alloc(VRegId(2), 8, None);
+        let (idx3, off3) = allocator.alloc(VRegId(3), 8, None);
+
+        // Same indices reused
+        assert!((idx2 == 0 || idx2 == 1), "should reuse freed index");
+        assert!((idx3 == 0 || idx3 == 1) && idx3 != idx2, "should reuse other freed index");
+
+        // But offsets are unique and NOT reused from freed slots
+        assert_ne!(off2, off0, "reallocated slot must get a new unique offset, not old off0={}", off0);
+        assert_ne!(off2, off1, "reallocated slot must get a new unique offset, not old off1={}", off1);
+        assert_ne!(off3, off0, "reallocated slot must get a new unique offset");
+        assert_ne!(off3, off1, "reallocated slot must get a new unique offset");
+        assert_ne!(off2, off3, "two simultaneously active slots must have different offsets");
+
+        // Verify into_spills doesn't produce duplicate offsets for occupied slots
+        let spills = allocator.into_spills();
+        let occupied_offsets: Vec<_> = spills.iter()
+            .filter(|s| s.vreg != VRegId(u32::MAX))
+            .map(|s| s.offset)
+            .collect();
+        let unique_offsets: std::collections::HashSet<_> = occupied_offsets.iter().collect();
+        assert_eq!(occupied_offsets.len(), unique_offsets.len(),
+            "occupied spill slots must have unique offsets, got duplicates: {:?}", occupied_offsets);
+    }
 
     #[test]
     fn execution_mode_decode_large_batch_still_small_batch() {

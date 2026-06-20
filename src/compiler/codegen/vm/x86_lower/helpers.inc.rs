@@ -33,6 +33,7 @@ impl X86Lower {
             dispatch_labels: HashMap::new(),
             source_map: super::debug_map::JitSourceMap::new(),
             zero_vregs: HashSet::new(),
+            stack_arg_vregs: HashMap::new(),
         }
     }
 
@@ -52,13 +53,6 @@ impl X86Lower {
                     self.zero_vregs.insert(*dst);
                 }
             }
-        }
-        if !self.zero_vregs.is_empty() {
-            use std::io::Write;
-            let mut f = std::fs::OpenOptions::new().create(true).append(true).open("/tmp/peephole_debug.log").unwrap();
-            writeln!(f, "[PRECOMPUTE-ZERO] found {} zero VRegs out of {} instrs, first few: {:?}",
-                self.zero_vregs.len(), program.instrs.len(),
-                self.zero_vregs.iter().take(5).collect::<Vec<_>>()).unwrap();
         }
     }
 
@@ -188,6 +182,13 @@ impl X86Lower {
                         "resolve_gpr_read: scratch_slot {} out of range (scratch_gprs.len={})",
                         scratch_slot, self.scratch_gprs.len(),
                     )))?;
+                // ARCH-SPILL-SAFE-ISA: Disabled. The root cause fix is in
+                // ScopedSpillAllocator — it now assigns unique offsets to each
+                // spill slot, preventing two VRegs from sharing the same stack
+                // memory location. The SpillSafeRecipe approach was incorrect
+                // because VRegs can be redefined (non-SSA), causing stale
+                // recipes to load wrong values.
+                // if let Some(recipe) = self.stack_arg_vregs.get(&vreg) { ... }
                 let spill = alloc.spills.get(slot_id as usize)
                     .ok_or_else(|| CompilerError::CodegenViolation(format!(
                         "resolve_gpr_read: spill slot {} missing for v{}", slot_id, vreg.0,
@@ -270,6 +271,8 @@ impl X86Lower {
                     .ok_or_else(|| CompilerError::CodegenViolation(format!(
                         "gpr_read_auto: slot {} out of range", slot,
                     )))?;
+                // ARCH-SPILL-SAFE-ISA: Disabled (see resolve_gpr_read for explanation).
+                // Root cause fix is in ScopedSpillAllocator — unique offsets per VReg.
                 let spill = alloc.spills.get(slot_id as usize)
                     .ok_or_else(|| CompilerError::CodegenViolation(format!(
                         "gpr_read_auto: spill slot {} missing for v{}", slot_id, vreg.0,
@@ -381,10 +384,6 @@ impl X86Lower {
             }
             PtrExpr::VRegPlusConst(base, off) => {
                 let base_reg = self.resolve_gpr_read(*base, alloc, 1)?;
-                // DIAG: trace VRegPlusConst for large offsets (likely weight tensor access)
-                if *off > 0x1000_000 {
-                    eprintln!("[VREG+CONST-DIAG] base=v{} → {:?} off={:#x} dst={:?}", base.0, base_reg, off, dst_reg);
-                }
                 if *off <= i32::MAX as usize {
                     self.asm.lea(dst_reg, qword_ptr(base_reg + *off as i32)).map_err(Self::err)?;
                 } else {

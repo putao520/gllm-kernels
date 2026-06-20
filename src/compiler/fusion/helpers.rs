@@ -14,7 +14,7 @@ use crate::quant::QuantType;
 
 /// Extract QuantType from a GEMM-family op, if applicable.
 fn extract_quant_type(op: &CompilerOp, graph: &CompilerGraph) -> Option<QuantType> {
-    match op.op_v2_resolved(graph) {
+    match op.op_resolved(graph) {
         Some(Op::QuantGemm(spec)) => Some(spec.quant_type),
         _ => None,
     }
@@ -49,7 +49,7 @@ pub(crate) fn detect_qkv_norm_rope(graph: &CompilerGraph, topo: &[OpId]) -> Vec<
     let gemm_ops: Vec<&CompilerOp> = topo
         .iter()
         .filter_map(|&id| graph.op(id))
-        .filter(|op| matches!(op.op_v2_resolved(graph), Some(Op::Gemm(_)) | Some(Op::GemmBias(_)) | Some(Op::QuantGemm(_))))
+        .filter(|op| matches!(op.op_resolved(graph), Some(Op::Gemm(_)) | Some(Op::GemmBias(_)) | Some(Op::QuantGemm(_))))
         .collect();
 
     // Group by first input tensor
@@ -72,7 +72,7 @@ pub(crate) fn detect_qkv_norm_rope(graph: &CompilerGraph, topo: &[OpId]) -> Vec<
             .and_then(|t| t.producer)
             .is_some_and(|prod_id| {
                 graph.op(prod_id).is_some_and(|prod_op| {
-                    matches!(prod_op.op_v2_resolved(graph), Some(Op::RmsNorm(_)) | Some(Op::LayerNorm(_)))
+                    matches!(prod_op.op_resolved(graph), Some(Op::RmsNorm(_)) | Some(Op::LayerNorm(_)))
                 })
             });
 
@@ -128,7 +128,7 @@ pub(crate) fn detect_qkv_norm_rope(graph: &CompilerGraph, topo: &[OpId]) -> Vec<
                 None => { traces.push(trace); continue; }
             };
 
-            match &consumer.op_v2 {
+            match &consumer.op {
                 Op::QkNorm { .. } => {
                     trace.qk_norm_id = Some(consumer_id);
                     // Expect RoPE after QkNorm
@@ -136,7 +136,7 @@ pub(crate) fn detect_qkv_norm_rope(graph: &CompilerGraph, topo: &[OpId]) -> Vec<
                         if let Some(norm_out_t) = graph.tensor(consumer.outputs[0]) {
                             if norm_out_t.consumers.len() == 1 {
                                 if let Some(rope_op) = graph.op(norm_out_t.consumers[0]) {
-                                    if matches!(&rope_op.op_v2, Op::RoPE(_)) {
+                                    if matches!(&rope_op.op, Op::RoPE(_)) {
                                         trace.rope_id = Some(rope_op.id);
                                     }
                                 }
@@ -213,7 +213,7 @@ pub(crate) fn detect_qkv_shared_input(graph: &CompilerGraph, topo: &[OpId]) -> V
     let gemm_ops: Vec<&CompilerOp> = topo
         .iter()
         .filter_map(|&id| graph.op(id))
-        .filter(|op| matches!(op.op_v2_resolved(graph), Some(Op::Gemm(_)) | Some(Op::GemmBias(_)) | Some(Op::QuantGemm(_))))
+        .filter(|op| matches!(op.op_resolved(graph), Some(Op::Gemm(_)) | Some(Op::GemmBias(_)) | Some(Op::QuantGemm(_))))
         .collect();
 
     // Group by first input tensor (BTreeMap for deterministic iteration order)
@@ -235,7 +235,7 @@ pub(crate) fn detect_qkv_shared_input(graph: &CompilerGraph, topo: &[OpId]) -> V
                     graph
                         .op(prod_id)
                         .is_some_and(|prod_op| {
-                            matches!(prod_op.op_v2_resolved(graph), Some(Op::RmsNorm(_)) | Some(Op::LayerNorm(_)))
+                            matches!(prod_op.op_resolved(graph), Some(Op::RmsNorm(_)) | Some(Op::LayerNorm(_)))
                         })
                 },
             );
@@ -286,7 +286,7 @@ pub(crate) fn detect_ffn_block(graph: &CompilerGraph, topo: &[OpId]) -> Vec<Fusi
     // 1. 找所有 Mul ops
     let mul_ops: Vec<&CompilerOp> = topo.iter()
         .filter_map(|&id| graph.op(id))
-        .filter(|op| matches!(op.op_v2_resolved(graph), Some(Op::Mul)))
+        .filter(|op| matches!(op.op_resolved(graph), Some(Op::Mul)))
         .collect();
 
     for mul_op in mul_ops {
@@ -304,8 +304,8 @@ pub(crate) fn detect_ffn_block(graph: &CompilerGraph, topo: &[OpId]) -> Vec<Fusi
         let pb = match graph.op(pb_id) { Some(o) => o, None => continue };
 
         // 识别哪个是 activation，哪个是 up_gemm（胖 opcode 自描述）
-        let is_activation = |op: &CompilerOp| matches!(op.op_v2_resolved(graph), Some(Op::Silu) | Some(Op::Gelu));
-        let is_gemm = |op: &CompilerOp| matches!(op.op_v2_resolved(graph),
+        let is_activation = |op: &CompilerOp| matches!(op.op_resolved(graph), Some(Op::Silu) | Some(Op::Gelu));
+        let is_gemm = |op: &CompilerOp| matches!(op.op_resolved(graph),
             Some(Op::Gemm(_)) | Some(Op::GemmBias(_)) | Some(Op::QuantGemm(_)));
 
         let (activation_op, up_gemm_op) = if is_activation(pa) && is_gemm(pb) {
@@ -338,8 +338,8 @@ pub(crate) fn detect_ffn_block(graph: &CompilerGraph, topo: &[OpId]) -> Vec<Fusi
         }
 
         // Shape 兼容性校验（ARCH-FFN-SHAPE）— 胖 opcode 自描述
-        let (gate_m, gate_n, gate_k) = match gate_gemm_op.op_v2_gemm_dims(graph) { Some(v) => v, None => continue };
-        let (up_m, up_n, up_k) = match up_gemm_op.op_v2_gemm_dims(graph) { Some(v) => v, None => continue };
+        let (gate_m, gate_n, gate_k) = match gate_gemm_op.op_gemm_dims(graph) { Some(v) => v, None => continue };
+        let (up_m, up_n, up_k) = match up_gemm_op.op_gemm_dims(graph) { Some(v) => v, None => continue };
         if gate_n != up_n || gate_k != up_k || gate_m != up_m {
             // Shape 不匹配 → 跳过融合，让它们作为独立算子
             continue;
@@ -398,7 +398,7 @@ pub(crate) fn detect_norm_into_gemm(
 
     // Must be a norm op (not Softmax, which is also Reduction)
     let producer = graph.op(producer_id)?;
-    if !matches!(&producer.op_v2, Op::RmsNorm(_) | Op::LayerNorm(_)) {
+    if !matches!(&producer.op, Op::RmsNorm(_) | Op::LayerNorm(_)) {
         return None;
     }
 
@@ -464,7 +464,7 @@ pub(crate) fn collect_epilogue<'a>(
                 .unwrap_or(OpClass::Opaque);
             matches!(consumer_class, OpClass::ElemWise)
         } else {
-            semantics::classify(&consumer.op_v2) == semantics::OpSemantics::Elementwise
+            semantics::classify(&consumer.op) == semantics::OpSemantics::Elementwise
         };
 
         if !is_elementwise {
@@ -557,7 +557,7 @@ pub(crate) fn collect_elementwise_chain<'a>(
                 .unwrap_or(OpClass::Opaque);
             matches!(consumer_class, OpClass::ElemWise | OpClass::Injective)
         } else {
-            semantics::classify(&consumer.op_v2) == semantics::OpSemantics::Elementwise
+            semantics::classify(&consumer.op) == semantics::OpSemantics::Elementwise
         };
 
         if !is_elementwise {
@@ -664,10 +664,10 @@ pub(crate) fn detect_tile_vs_compute_root(
         // ARCH-SYMDIM-DEGRADE: cost model uses max_for_allocation for conservative estimate.
         // TODO(G-2): preserve symbolic form for tighter bounds.
         // 胖 opcode 自描述：GEMM 维度 + dtype
-        let (m, n, k, gemm_dtype) = match gemm_op.op_v2_gemm_dims(graph) {
+        let (m, n, k, gemm_dtype) = match gemm_op.op_gemm_dims(graph) {
             Some((m_dim, n_val, k_val)) => {
                 let m_val = m_dim.max_for_allocation_strict().expect("ARCH-SYMDIM: Symbolic dim must have max_value in cost model");
-                let dtype = gemm_op.op_v2_gemm_dtype(graph).unwrap_or_else(|| graph.infer_computation_dtype());
+                let dtype = gemm_op.op_gemm_dtype(graph).unwrap_or_else(|| graph.infer_computation_dtype());
                 (m_val, n_val, k_val, dtype)
             }
             None => (0, 0, 0, graph.infer_computation_dtype()),

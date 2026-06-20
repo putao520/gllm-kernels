@@ -98,7 +98,7 @@ pub(super) fn maybe_debug_bp(prog: &mut VmProgram, ctx: &LoweringContext<'_>, la
 // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 /// Resolve SymDim to BoundExpr, using mega-kernel decode seq_len VReg when available.
-/// Shared by `emit_standalone_op` and `lower_op_v2`.
+/// Shared by `emit_standalone_op` and `lower_op`.
 pub(crate) fn resolve_sym_dim(dim: &SymDim, abi: &AbiPtrs, sym_map: &SymDimSlotMap) -> BoundExpr {
     if let Some(seq_vreg) = abi.mega_decode_seq_len {
         if dim.is_symbolic() {
@@ -259,20 +259,43 @@ impl TensorPtrResolver {
         abi: &AbiPtrs,
     ) -> Option<VRegId> {
         let src = self.map.get(&tid)?;
-        let (base, offset) = match src {
-            TensorPtrSource::Activation => (abi.input_ptr, 0),
-            TensorPtrSource::ActivationPing => (abi.activation_ping_ptr?, 0),
-            TensorPtrSource::ActivationPong => (abi.activation_pong_ptr?, 0),
-            TensorPtrSource::Weight { offset } => (abi.weight_ptr?, *offset),
-            TensorPtrSource::Intermediate { offset } => (abi.scratch_ptr?, *offset),
-            TensorPtrSource::Output { offset } => (abi.output_ptr, *offset),
-        };
-        if offset == 0 {
-            Some(base)
-        } else {
-            let ptr = prog.alloc_vreg(VRegKind::Ptr, SimdWidth::Scalar);
-            prog.emit(VmInstr::LoadPtr { dst: ptr, src: PtrExpr::VRegPlusConst(base, offset) });
-            Some(ptr)
+        match src {
+            TensorPtrSource::Activation => Some(abi.input_ptr),
+            TensorPtrSource::ActivationPing => Some(abi.activation_ping_ptr?),
+            TensorPtrSource::ActivationPong => Some(abi.activation_pong_ptr?),
+            TensorPtrSource::Weight { offset } => {
+                let base = abi.weight_ptr?;
+                if *offset == 0 {
+                    Some(base)
+                } else {
+                    let ptr = prog.alloc_vreg(VRegKind::Ptr, SimdWidth::Scalar);
+                    prog.emit(VmInstr::LoadPtr { dst: ptr, src: PtrExpr::VRegPlusConst(base, *offset) });
+                    Some(ptr)
+                }
+            }
+            TensorPtrSource::Intermediate { offset } => {
+                // ARCH-SPILL-SAFE: Root cause fixed in ScopedSpillAllocator —
+                // each VReg now gets a unique spill offset, preventing corruption.
+                // No longer need to reload scratchpad base from StackArg(24) here.
+                let base = abi.scratch_ptr?;
+                if *offset == 0 {
+                    Some(base)
+                } else {
+                    let ptr = prog.alloc_vreg(VRegKind::Ptr, SimdWidth::Scalar);
+                    prog.emit(VmInstr::LoadPtr { dst: ptr, src: PtrExpr::VRegPlusConst(base, *offset) });
+                    Some(ptr)
+                }
+            }
+            TensorPtrSource::Output { offset } => {
+                let base = abi.output_ptr;
+                if *offset == 0 {
+                    Some(base)
+                } else {
+                    let ptr = prog.alloc_vreg(VRegKind::Ptr, SimdWidth::Scalar);
+                    prog.emit(VmInstr::LoadPtr { dst: ptr, src: PtrExpr::VRegPlusConst(base, *offset) });
+                    Some(ptr)
+                }
+            }
         }
     }
 }
@@ -314,7 +337,7 @@ fn build_tensor_sources_fallback(
     }
 
     for op in &graph.ops {
-        if let Some(input_idx) = op.op_v2_output_aliases_input(graph) {
+        if let Some(input_idx) = op.op_output_aliases_input(graph) {
             if let (Some(&in_tid), Some(&out_tid)) =
                 (op.inputs.get(input_idx), op.outputs.first())
             {
@@ -381,11 +404,11 @@ pub(crate) fn compute_rope_requirement(
     for group in &plan.groups {
         for &op_id in &group.ops {
             let Some(op) = graph.op(op_id) else { continue };
-            // 从 Op（胖 opcode）读取 RoPE 参数 — 优先 op_v2 缓存。
-            let op_v2 = &op.op_v2;
+            // 从 Op（胖 opcode）读取 RoPE 参数 — 从 Op 读取。
+            let op_resolved = &op.op;
             // Collect RoPE params from both standard RoPE and DualRoPE ops.
             // DualRoPE contributes two entries (sliding + global) simultaneously.
-            let rope_params: Vec<(usize, f64, f32, Option<RopeScaling>)> = match op_v2 {
+            let rope_params: Vec<(usize, f64, f32, Option<RopeScaling>)> = match op_resolved {
                 crate::compiler::graph::Op::RoPE(spec) => {
                     vec![(spec.head_dim, spec.theta, spec.partial, spec.rope_scaling.clone())]
                 }
@@ -500,9 +523,9 @@ pub(crate) fn compute_dwc_requirement(
     for group in &plan.groups {
         for &op_id in &group.ops {
             let Some(op) = graph.op(op_id) else { continue };
-            // 从 Op（胖 opcode）读取 DepthwiseConv1D 参数 — 优先 op_v2 缓存。
-            let op_v2 = &op.op_v2;
-            if let crate::compiler::graph::Op::DepthwiseConv1D { channels, kernel_size, causal } = op_v2 {
+            // 从 Op（胖 opcode）读取 DepthwiseConv1D 参数 — 从 Op 读取。
+            let op_resolved = &op.op;
+            if let crate::compiler::graph::Op::DepthwiseConv1D { channels, kernel_size, causal } = op_resolved {
                 if *kernel_size == 0 {
                     return Err(CompilerError::CodegenViolation(
                         "DepthwiseConv1D: kernel_size=0 非法".into()));
@@ -591,9 +614,9 @@ fn compute_moe_packed_requirement(
     for group in &plan.groups {
         for &op_id in &group.ops {
             let Some(op) = graph.op(op_id) else { continue };
-            // 从 Op（胖 opcode）读取 MoEDispatchPacked 参数 — 优先 op_v2 缓存。
-            let op_v2 = &op.op_v2;
-            if let crate::compiler::graph::Op::MoEDispatchPacked { num_experts, top_k, intermediate_size, .. } = op_v2 {
+            // 从 Op（胖 opcode）读取 MoEDispatchPacked 参数 — 从 Op 读取。
+            let op_resolved = &op.op;
+            if let crate::compiler::graph::Op::MoEDispatchPacked { num_experts, top_k, intermediate_size, .. } = op_resolved {
                 let routing_overhead = (2 * top_k + num_experts) * elem;
                 let compute_buffers = 3 * intermediate_size * elem;
                 return routing_overhead + compute_buffers;
@@ -705,7 +728,7 @@ impl SymDimSlotMap {
             state.arg_ptr_expr("callback_table_ptr").unwrap_or(PtrExpr::StackArg(128)));
 
         // Remaining ABI args from MEGA_KERNEL_PARAMS — added symbolically so
-        // lower_op_v2 arms can use sym_map.resolve("name") instead of
+        // lower_op arms can use sym_map.resolve("name") instead of
         // hardcoded StackArg(N).  Eliminates fragile manual offset calculation.
         for name in ["output_tokens_ptr", "max_new_tokens", "eos_token_id", "prompt_len", "page_table_ptr"] {
             if let Ok(expr) = state.arg_ptr_expr(name) {
@@ -786,10 +809,16 @@ pub(super) fn load_op_scratch_ptr(
         }
     }
     if let Some(offset) = alloc.offset_of(out_tid) {
+        // ARCH-SPILL-SAFE: Root cause fixed in ScopedSpillAllocator —
+        // each VReg now gets a unique spill offset, preventing corruption.
+        // No longer need to reload scratchpad base from StackArg(24) here.
+        let base = abi.scratch_ptr
+            .ok_or_else(|| CompilerError::CodegenViolation(
+                "load_op_scratch_ptr: scratch_ptr not available".into()))?;
         let ptr = prog.alloc_vreg(VRegKind::Ptr, SimdWidth::Scalar);
         prog.emit(VmInstr::LoadPtr {
             dst: ptr,
-            src: PtrExpr::VRegPlusConst(scratch_base, offset),
+            src: PtrExpr::VRegPlusConst(base, offset),
         });
         Ok(ptr)
     } else if let Some(ptr) = resolver.materialize(prog, out_tid, abi) {

@@ -116,8 +116,8 @@ impl std::fmt::Display for OffsetViolation {
                     instr_name, instr_idx, expected_offset, actual_offset, block_bytes, elem_bytes)
             }
             Self::MisalignedBlock { instr_idx, offset, block_bytes, elem_bytes } => {
-                write!(f, "verify: QuantBlockLoad at instr[{}] offset={} not aligned to block_bytes={} (elem_bytes={})",
-                    instr_idx, offset, block_bytes, elem_bytes)
+                write!(f, "verify: QuantBlockLoad at instr[{}] offset={} not aligned to elem_bytes={} (within-block offset, block_bytes={})",
+                    instr_idx, offset, elem_bytes, block_bytes)
             }
             Self::BlockElemConfusion { instr_idx, offset, block_bytes, elem_bytes } => {
                 write!(f, "verify: QuantBlockLoad at instr[{}] offset={} aligns to elem_bytes={} but should align to block_bytes={}",
@@ -616,19 +616,32 @@ fn reads_vreg(instr: &VmInstr, vreg: VRegId) -> bool {
 
 /// 验证量化数据加载指令的偏移量合理性 (REQ-LC-008/010):
 ///
-/// 1. QuantBlockLoad: OffsetExpr::Const 值必须对齐到 block_bytes (输入偏移)
+/// 1. QuantBlockLoad: OffsetExpr::Const 值必须对齐到 elem_bytes (访问粒度)
+///    - QuantBlockLoad offset 是块内字节偏移 (e.g., skip scale/zero bytes),
+///      NOT a between-block stride, 因此不需要对齐到 block_bytes
 /// 2. QuantLoadBytesVec: offset_bytes 不应为负数（字节级访问，语义正确即可）
 /// 3. VecStore 写回解量化结果: 输出偏移使用 elem_bytes 对齐 (输出偏移)
 ///
 /// REQ-LC-008 核心约束:
-/// - 量化数据加载 (QuantBlockLoad/QuantLoadBytesVec) 使用 block_bytes 对齐 (输入)
+/// - 量化数据加载 (QuantBlockLoad) 使用 elem_bytes 对齐 (访问粒度)
 /// - 解量化结果写回 (VecStore after decode) 使用 compute_elem_bytes 对齐 (输出)
 fn verify_quant_offset_sanity(prog: &VmProgram) -> Result<(), CompilerError> {
     for (i, instr) in prog.instrs.iter().enumerate() {
         match instr {
             VmInstr::QuantBlockLoad { base: _, offset, unpack, .. } => {
-                // 输入偏移: Const 必须对齐到 block_bytes
-                verify_offset_alignment(offset, unpack.block_bytes(), i, "QuantBlockLoad")?;
+                // Compute elem_bytes from unpack mode (storage element size in bytes)
+                let elem_bytes = match unpack {
+                    BlockUnpackMode::Int8 => 1,
+                    BlockUnpackMode::F16Broadcast => 2,
+                    BlockUnpackMode::SignedNibbleLow | BlockUnpackMode::UnsignedNibbleLow
+                    | BlockUnpackMode::SignedNibbleHigh | BlockUnpackMode::UnsignedNibbleHigh => 1,
+                    BlockUnpackMode::Bitpack2 { .. } => 1,
+                    BlockUnpackMode::Mxfp4 { .. } | BlockUnpackMode::Nvfp4 { .. } => 1,
+                    BlockUnpackMode::QhBitExpand { .. } => 1,
+                };
+                // QuantBlockLoad offset is a within-block byte offset, NOT a between-block stride.
+                // It must be aligned to elem_bytes (access granularity), not block_bytes.
+                verify_offset_alignment(offset, elem_bytes, i, "QuantBlockLoad")?;
             }
             VmInstr::QuantLoadBytesVec { offset, count, .. } => {
                 // 输入偏移: byte-level access within a block, verify count is reasonable
@@ -654,34 +667,34 @@ fn verify_quant_offset_sanity(prog: &VmProgram) -> Result<(), CompilerError> {
     Ok(())
 }
 
-/// 检查 OffsetExpr 中的 Const 值是否对齐到指定的 block_bytes。
+/// 检查 OffsetExpr 中的 Const 值是否对齐到指定的对齐粒度 (elem_bytes 或 block_bytes)。
 fn verify_offset_alignment(
     expr: &OffsetExpr,
-    block_bytes: usize,
+    alignment: usize,
     instr_idx: usize,
     instr_name: &str,
 ) -> Result<(), CompilerError> {
     match expr {
         OffsetExpr::Const(val) => {
-            if *val > 0 && *val % block_bytes != 0 {
+            if *val > 0 && *val % alignment != 0 {
                 return Err(CompilerError::CodegenViolation(format!(
-                    "verify: {} at instr[{}] has Const offset={} not aligned to block_bytes={}. \
-                     Quantized data must be accessed at block-aligned offsets.",
-                    instr_name, instr_idx, val, block_bytes
+                    "verify: {} at instr[{}] has Const offset={} not aligned to alignment={}. \
+                     Quantized data must be accessed at properly aligned offsets.",
+                    instr_name, instr_idx, val, alignment
                 )));
             }
         }
         OffsetExpr::Add(a, b) => {
-            verify_offset_alignment(a, block_bytes, instr_idx, instr_name)?;
-            verify_offset_alignment(b, block_bytes, instr_idx, instr_name)?;
+            verify_offset_alignment(a, alignment, instr_idx, instr_name)?;
+            verify_offset_alignment(b, alignment, instr_idx, instr_name)?;
         }
         OffsetExpr::Mul(inner, factor) => {
             // Mul by a factor: the inner must be aligned, the product may shift alignment
             let inner_factor = *factor;
-            if inner_factor > 0 && inner_factor % block_bytes == 0 {
-                // Factor is a multiple of block_bytes, inner alignment doesn't matter
+            if inner_factor > 0 && inner_factor % alignment == 0 {
+                // Factor is a multiple of alignment, inner alignment doesn't matter
             } else {
-                verify_offset_alignment(inner, block_bytes, instr_idx, instr_name)?;
+                verify_offset_alignment(inner, alignment, instr_idx, instr_name)?;
             }
         }
         OffsetExpr::LoopOffset(_) | OffsetExpr::ScalarVReg(_) => {
@@ -726,27 +739,19 @@ pub fn verify_quant_offsets(
                     BlockUnpackMode::QhBitExpand { .. } => 1,
                 };
 
-                // Check Const offset alignment to block_bytes (not elem_bytes)
+                // Check Const offset alignment to elem_bytes (access granularity).
+                // QuantBlockLoad offset is a within-block byte offset (e.g., skip scale/zero bytes),
+                // NOT a between-block stride. It does NOT need to be aligned to block_bytes.
                 if let OffsetExpr::Const(val) = offset {
                     let offset_val = *val;
 
-                    if offset_val > 0 && offset_val % block_bytes != 0 {
-                        if offset_val % elem_bytes == 0 {
-                            // Offset aligns to elem_bytes but NOT block_bytes — confusion
-                            violations.push(OffsetViolation::BlockElemConfusion {
-                                instr_idx: i,
-                                offset: offset_val,
-                                block_bytes,
-                                elem_bytes,
-                            });
-                        } else {
-                            violations.push(OffsetViolation::MisalignedBlock {
-                                instr_idx: i,
-                                offset: offset_val,
-                                block_bytes,
-                                elem_bytes,
-                            });
-                        }
+                    if offset_val > 0 && offset_val % elem_bytes != 0 {
+                        violations.push(OffsetViolation::MisalignedBlock {
+                            instr_idx: i,
+                            offset: offset_val,
+                            block_bytes,
+                            elem_bytes,
+                        });
                     }
 
                     // Check against spec values
@@ -1699,11 +1704,11 @@ mod tests {
         let mut prog = VmProgram::new();
         let base = prog.alloc_vreg(VRegKind::Ptr, SimdWidth::Scalar);
         let dst = prog.alloc_vreg(VRegKind::Vec, SimdWidth::W256);
-        // Q4_0 block_bytes=18, offset 10 is NOT aligned
+        // F16Broadcast: elem_bytes=2, offset 7 is NOT aligned to elem_bytes
         prog.emit(VmInstr::QuantBlockLoad {
             dst, base,
-            offset: OffsetExpr::Const(10),
-            unpack: BlockUnpackMode::SignedNibbleLow,
+            offset: OffsetExpr::Const(7),
+            unpack: BlockUnpackMode::F16Broadcast,
             width: SimdWidth::W256,
         });
         let result = verify_quant_offset_sanity(&prog);
@@ -1917,34 +1922,27 @@ mod tests {
     }
 
     #[test]
-    fn test_verify_quant_offsets_block_elem_confusion() {
-        // Arrange: offset=4 not aligned to block_bytes=18, but aligned to elem_bytes=1
+    fn test_verify_quant_offsets_within_block_offset_aligned_to_elem_bytes() {
+        // Arrange: offset=4 within a block of block_bytes=18, elem_bytes=1
         // SignedNibbleLow: block_bytes=18, elem_bytes=1
-        // 4 % 18 != 0 AND 4 % 1 == 0 → BlockElemConfusion
+        // offset is within-block (e.g., skip scale/zero bytes), NOT a block stride.
+        // 4 % 1 == 0 → no violation (aligned to elem_bytes)
         let mut prog = VmProgram::new();
         let base = prog.alloc_vreg(VRegKind::Ptr, SimdWidth::Scalar);
         let dst = prog.alloc_vreg(VRegKind::Vec, SimdWidth::W256);
         prog.emit(VmInstr::QuantBlockLoad {
             dst,
             base,
-            offset: OffsetExpr::Const(4), // 4 % 18 != 0, 4 % 1 == 0
+            offset: OffsetExpr::Const(4), // 4 % 1 == 0, within-block offset
             unpack: BlockUnpackMode::SignedNibbleLow,
             width: SimdWidth::W256,
         });
-        let qbl_idx = prog.instrs.iter().position(|i| matches!(i, VmInstr::QuantBlockLoad { .. })).unwrap();
 
         // Act
         let violations = verify_quant_offsets(&prog, &[]);
 
-        // Assert: BlockElemConfusion detected among violations
-        let confusion = violations.iter().find(|v| matches!(v, OffsetViolation::BlockElemConfusion { .. }));
-        assert!(confusion.is_some(), "expected BlockElemConfusion, got {} violations", violations.len());
-        if let Some(OffsetViolation::BlockElemConfusion { instr_idx, offset, block_bytes, elem_bytes }) = confusion {
-            assert_eq!(*instr_idx, qbl_idx);
-            assert_eq!(*offset, 4);
-            assert_eq!(*block_bytes, 18);
-            assert_eq!(*elem_bytes, 1);
-        }
+        // Assert: no violations — within-block offset aligned to elem_bytes is valid
+        assert!(violations.is_empty(), "expected no violations for within-block offset aligned to elem_bytes, got {:?}", violations);
     }
 
     #[test]
@@ -3411,7 +3409,7 @@ mod tests {
     // @trace TEST-12x59
     #[test]
     fn test_verify_quant_offsets_multiple_blocks_mixed_violations() {
-        // Arrange: two QuantBlockLoad instructions, one aligned and one misaligned
+        // Arrange: two QuantBlockLoad instructions, one aligned and one misaligned to elem_bytes
         let mut prog = VmProgram::new();
         let base = prog.alloc_vreg(VRegKind::Ptr, SimdWidth::Scalar);
         let dst1 = prog.alloc_vreg(VRegKind::Vec, SimdWidth::W256);
@@ -3420,14 +3418,14 @@ mod tests {
         prog.emit(VmInstr::QuantBlockLoad {
             dst: dst1, base,
             offset: OffsetExpr::Const(0),
-            unpack: BlockUnpackMode::SignedNibbleLow, // block_bytes=18
+            unpack: BlockUnpackMode::SignedNibbleLow, // block_bytes=18, elem_bytes=1
             width: SimdWidth::W256,
         });
-        // Second: misaligned (offset 5, 5 % 18 != 0, 5 % 1 == 0 → BlockElemConfusion)
+        // Second: misaligned to elem_bytes (offset 5, F16Broadcast: elem_bytes=2, 5 % 2 != 0 → MisalignedBlock)
         prog.emit(VmInstr::QuantBlockLoad {
             dst: dst2, base,
             offset: OffsetExpr::Const(5),
-            unpack: BlockUnpackMode::SignedNibbleLow,
+            unpack: BlockUnpackMode::F16Broadcast, // block_bytes=34, elem_bytes=2
             width: SimdWidth::W256,
         });
 
@@ -3436,8 +3434,8 @@ mod tests {
 
         // Assert: exactly one violation for the second instruction
         assert_eq!(violations.len(), 1, "expected exactly 1 violation for misaligned second block: {:?}", violations);
-        assert!(matches!(violations[0], OffsetViolation::BlockElemConfusion { .. }),
-            "violation should be BlockElemConfusion");
+        assert!(matches!(violations[0], OffsetViolation::MisalignedBlock { .. }),
+            "violation should be MisalignedBlock");
     }
 
     // ── Wave 12x60: 10 additional tests ────────────────────────────────────
@@ -3782,8 +3780,8 @@ mod tests {
         let dst = prog.alloc_vreg(VRegKind::Vec, SimdWidth::W256);
         prog.emit(VmInstr::QuantBlockLoad {
             dst, base,
-            offset: OffsetExpr::Const(7), // 7 % 18 != 0, misaligned
-            unpack: BlockUnpackMode::Int8, // block_bytes=32
+            offset: OffsetExpr::Const(7), // 7 % 2 != 0, misaligned to elem_bytes
+            unpack: BlockUnpackMode::F16Broadcast, // elem_bytes=2
             width: SimdWidth::W256,
         });
 

@@ -758,8 +758,8 @@ mod tests {
             FusionMode::TileLevelFusion { predecessor, .. } => {
                 let pred_op = g.op(*predecessor).expect("predecessor op should exist");
                 assert!(
-                    matches!(&pred_op.op_v2, crate::compiler::graph::Op::RmsNorm(_)),
-                    "predecessor should be RmsNorm, got {:?}", pred_op.op_v2,
+                    matches!(&pred_op.op, crate::compiler::graph::Op::RmsNorm(_)),
+                    "predecessor should be RmsNorm, got {:?}", pred_op.op,
                 );
             }
             _ => unreachable!(),
@@ -875,7 +875,7 @@ mod tests {
         match &gemm_group.mode {
             FusionMode::TileLevelFusion { predecessor, tile_rows } => {
                 let pred_op = g.op(*predecessor).expect("predecessor should exist");
-                assert!(matches!(&pred_op.op_v2, crate::compiler::graph::Op::RmsNorm(_)));
+                assert!(matches!(&pred_op.op, crate::compiler::graph::Op::RmsNorm(_)));
                 let blocking = profile.gemm_blocking(1, k, k, DType::F32);
                 assert_eq!(*tile_rows, blocking.mc, "tile_rows should equal MC from GEMM blocking");
             }
@@ -922,7 +922,7 @@ mod tests {
         match &gemm_group.mode {
             FusionMode::ComputeRoot { predecessor } => {
                 let pred_op = g.op(*predecessor).expect("predecessor should exist");
-                assert!(matches!(&pred_op.op_v2, crate::compiler::graph::Op::RmsNorm(_)));
+                assert!(matches!(&pred_op.op, crate::compiler::graph::Op::RmsNorm(_)));
             }
             other => panic!(
                 "Expected ComputeRoot for norm output ({} B) <= 75% L1 ({} B), got {:?}",
@@ -1435,9 +1435,9 @@ mod tests {
         // Verify the epilogue op is Argmax
         let epilogue_op = g.op(group.epilogue[0]).expect("epilogue op should exist");
         assert!(
-            matches!(&epilogue_op.op_v2, crate::compiler::graph::Op::Argmax { .. }),
+            matches!(&epilogue_op.op, crate::compiler::graph::Op::Argmax { .. }),
             "Epilogue should be Argmax, got {:?}",
-            epilogue_op.op_v2,
+            epilogue_op.op,
         );
     }
 
@@ -1547,7 +1547,7 @@ mod tests {
 
         assert!(
             !gemm_group.ops.iter().any(|&oid| {
-                g2.op(oid).map_or(false, |o| matches!(&o.op_v2, crate::compiler::graph::Op::Argmax { .. }))
+                g2.op(oid).map_or(false, |o| matches!(&o.op, crate::compiler::graph::Op::Argmax { .. }))
             }),
             "Argmax must NOT be fused when logits has multiple consumers"
         );

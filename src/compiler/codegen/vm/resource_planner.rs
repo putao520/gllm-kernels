@@ -673,7 +673,7 @@ pub fn plan_mega_kernel_resources(
         .map(|g| {
             g.ops.iter().any(|&op_id| {
                 graph.op(op_id).is_some_and(|op| {
-                    matches!(op.op_v2_resolved(graph), Some(Op::Gemm(_)) | Some(Op::GemmBias(_)) | Some(Op::QuantGemm(_)))
+                    matches!(op.op_resolved(graph), Some(Op::Gemm(_)) | Some(Op::GemmBias(_)) | Some(Op::QuantGemm(_)))
                 })
             })
         })
@@ -713,8 +713,8 @@ fn derive_loop_invariants_from_graph(graph: &CompilerGraph, hidden_dim: usize) -
     let mut rope_added = false;
     let mut packed_added = false;
     for op in &graph.ops {
-        let op_v2 = op.op_v2_resolved(graph);
-        match &op_v2 {
+        let op_resolved = op.op_resolved(graph);
+        match &op_resolved {
             Some(Op::RoPE(_)) if !rope_added => {
                 invariants.push(LoopInvariant {
                     kind: InvariantKind::RopeTablePtr,

@@ -99,7 +99,7 @@ mod tests {
         let g = CompilerGraph::from_layer_ir(&ir, &profile).expect("from_layer_ir failed");
 
         // Should contain a GeGlu op
-        let has_geglu = g.ops.iter().any(|op| matches!(&op.op_v2, Op::GeGlu));
+        let has_geglu = g.ops.iter().any(|op| matches!(&op.op, Op::GeGlu));
         assert!(has_geglu, "Gemma graph should have GeGlu op");
     }
 
@@ -122,22 +122,22 @@ mod tests {
         assert!(!g.outputs.is_empty());
 
         // Should have LayerNorm (not RmsNorm)
-        let has_ln = g.ops.iter().any(|op| matches!(&op.op_v2, Op::LayerNorm(_)));
+        let has_ln = g.ops.iter().any(|op| matches!(&op.op, Op::LayerNorm(_)));
         assert!(has_ln, "Encoder graph should have LayerNorm");
 
         // Should have MHA
-        let has_mha = g.ops.iter().any(|op| matches!(&op.op_v2, Op::MultiHeadAttention(_)));
+        let has_mha = g.ops.iter().any(|op| matches!(&op.op, Op::MultiHeadAttention(_)));
         assert!(has_mha, "Encoder graph should have MultiHeadAttention");
 
         // Should have MeanPool and L2Normalize
-        let has_pool = g.ops.iter().any(|op| matches!(&op.op_v2, Op::MeanPool { .. }));
-        let has_l2 = g.ops.iter().any(|op| matches!(&op.op_v2, Op::L2Normalize { .. }));
+        let has_pool = g.ops.iter().any(|op| matches!(&op.op, Op::MeanPool { .. }));
+        let has_l2 = g.ops.iter().any(|op| matches!(&op.op, Op::L2Normalize { .. }));
         assert!(has_pool, "Encoder graph should have MeanPool");
         assert!(has_l2, "Encoder graph should have L2Normalize");
 
         // Should NOT have RoPE or RmsNorm
-        let has_rope = g.ops.iter().any(|op| matches!(&op.op_v2, Op::RoPE(_)));
-        let has_rms = g.ops.iter().any(|op| matches!(&op.op_v2, Op::RmsNorm(_)));
+        let has_rope = g.ops.iter().any(|op| matches!(&op.op, Op::RoPE(_)));
+        let has_rms = g.ops.iter().any(|op| matches!(&op.op, Op::RmsNorm(_)));
         assert!(!has_rope, "Encoder graph should NOT have RoPE");
         assert!(!has_rms, "Encoder graph should NOT have RmsNorm");
 
@@ -314,10 +314,10 @@ mod tests {
         assert_eq!(layout.offset_of(TensorId(99)), None);
     }
 
-    // ── Op v2 (胖 opcode 自描述架构) 测试 ──
+    // ── Op (胖 opcode 自描述架构) 测试 ──
 
     #[test]
-    fn op_v2_category_returns_correct_category() {
+    fn op_category_returns_correct_category() {
         // Activation
         assert_eq!(Op::Silu.category(), "activation");
         assert_eq!(Op::Gelu.category(), "activation");
@@ -349,13 +349,13 @@ mod tests {
     }
 
     #[test]
-    fn op_v2_attention_mask_causal_vs_full() {
+    fn op_attention_mask_causal_vs_full() {
         assert_ne!(AttentionMask::Causal, AttentionMask::Full);
         assert_eq!(AttentionMask::Sliding { window: 512 }, AttentionMask::Sliding { window: 512 });
     }
 
     #[test]
-    fn op_v2_norm_spec_has_weight_distinct() {
+    fn op_norm_spec_has_weight_distinct() {
         let with_weight = NormSpec {
             feature_dim: 4096, eps: 1e-5, dtype: DType::F32, has_weight: true,
         };
@@ -366,7 +366,7 @@ mod tests {
     }
 
     #[test]
-    fn op_v2_kv_source_serializable() {
+    fn op_kv_source_serializable() {
         // KvSource 是 Copy + Hash，可用于 JIT cache key
         let sources = [KvSource::FromTensor, KvSource::FromCache];
         assert_ne!(sources[0], sources[1]);

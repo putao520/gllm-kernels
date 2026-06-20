@@ -16,9 +16,9 @@
 //! | [`Gptq4`](QuantAlgoKind::Gptq4) | INT4 packed | FP16 block scalar | StaticBias(1) | ColInterleaved |
 //! | [`SqueezeLlm`](QuantAlgoKind::SqueezeLlm) | 3-bit codebook LUT | FP16 block scalar | — | RowMajor |
 //! | [`Q4_0`](QuantAlgoKind::Q4_0) | INT4 packed | FP16 block scalar | StaticBias(8) | RowMajor |
-//! | [`Q4_1`](QuantAlgoKind::Q4_1) | INT4 packed | FP16 d+m | — | RowMajor |
+//! | [`Q4_1`](QuantAlgoKind::Q4_1) | INT4 packed | FP16 d+m | FP16 BlockMin(m) | RowMajor |
 //! | [`Q5_0`](QuantAlgoKind::Q5_0) | INT5 packed | FP16 block scalar | StaticBias(16) | RowMajor |
-//! | [`Q5_1`](QuantAlgoKind::Q5_1) | INT5 packed | FP16 d+m | — | RowMajor |
+//! | [`Q5_1`](QuantAlgoKind::Q5_1) | INT5 packed | FP16 d+m | FP16 BlockMin(m) | RowMajor |
 //! | [`Q8_0`](QuantAlgoKind::Q8_0) | INT8 signed | FP16 block scalar | — | RowMajor |
 //! | [`Q2K`](QuantAlgoKind::Q2K) | 2-bit packed | hierarchical 4-bit | hierarchical dmin | RowMajor |
 //! | [`Q3K`](QuantAlgoKind::Q3K) | 3-bit packed | hierarchical 6-bit | StaticBias(4) | RowMajor |
@@ -1234,7 +1234,7 @@ mod tests {
     #[test]
     fn zero_layout_static_bias_values() {
         // Q4_0 has StaticBias(8), Q5_0 has StaticBias(16), Q6K has StaticBias(32).
-        // Q4_1 and Q8_0 have no zero-point (ZeroLayout::None).
+        // Q4_1 has BlockMin zero-point (PostScaleAdd), Q8_0 has no zero-point (ZeroLayout::None).
         let q4_0 = q4_0_descriptor();
         assert_eq!(q4_0.zero_layout, ZeroLayout::StaticBias { value: 8 });
 
@@ -1248,7 +1248,7 @@ mod tests {
         assert_eq!(q8_0.zero_layout, ZeroLayout::None);
 
         let q4_1 = q4_1_descriptor();
-        assert_eq!(q4_1.zero_layout, ZeroLayout::None);
+        assert_eq!(q4_1.zero_layout, ZeroLayout::BlockMin { offset_bytes: 2, dtype: ScaleDType::F16 });
     }
 
     #[test]

@@ -248,6 +248,12 @@ pub enum AlgoTraceStep {
     LoadInput { name: &'static str },
     /// Load constant → TraceOp::Const
     LoadConst { value: f64 },
+    /// Load parameter by name → TraceOp::Const(value from ParamTable::resolve_f64).
+    /// Unlike LoadConst which bakes a hardcoded value, LoadParam resolves the value
+    /// at template-instantiation time from the ParamTable, allowing graph metadata
+    /// (e.g. NormSpec.eps) to propagate through the template system.
+    /// Falls back to 0.0 if the parameter is not set in the ParamTable.
+    LoadParam { name: &'static str },
     /// Arithmetic → TraceOp::Add/Sub/Mul/Div/Fma/etc.
     BinOp { op: TraceBinOp, dst: &'static str, a: &'static str, b: &'static str },
     /// Unary → TraceOp::Exp/Sqrt/Rsqrt/Tanh/Sigmoid/etc.

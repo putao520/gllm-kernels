@@ -5,7 +5,7 @@
 //! 零运行时依赖 — 所有输入在编译时已知。
 
 use std::collections::HashMap;
-use crate::compiler::graph::{CompilerGraph, CompilerOp, Op, OpId, GemmSpec, NormSpec, QuantGemmSpec, RopeSpec, AttentionSpec, AttentionGeometry, AttentionMask, SinksSpec, CachedGqaSpec, MlaSpec, DualRopeSpec};
+use crate::compiler::graph::{CompilerGraph, CompilerOp, Op, OpId};
 use crate::dispatch::device_profile::DeviceProfile;
 
 /// GEMM 在模型中的角色 (影响融合策略选择)
@@ -256,7 +256,7 @@ impl PainPointAnalyzer {
         let all_gemms_in_order: Vec<OpId> = graph.topological_sort()
             .into_iter()
             .filter(|&op_id| {
-                graph.op(op_id).is_some_and(|op| matches!(op.op_v2_resolved(graph),
+                graph.op(op_id).is_some_and(|op| matches!(op.op_resolved(graph),
                     Some(Op::Gemm(_)) | Some(Op::GemmBias(_)) | Some(Op::QuantGemm(_))))
             })
             .collect();
@@ -267,8 +267,8 @@ impl PainPointAnalyzer {
                 None => continue,
             };
 
-            // 胖 opcode 自描述：从 Op v2 Spec 读 GEMM 维度
-            let (m, n, k) = match op.op_v2_gemm_dims(graph) {
+            // 胖 opcode 自描述：从 Op Spec 读 GEMM 维度
+            let (m, n, k) = match op.op_gemm_dims(graph) {
                 Some((m_dim, n_val, k_val)) => {
                     // ARCH-SYMDIM-DEGRADE: cost model uses max_for_allocation for conservative estimate.
                     // TODO(G-2): preserve symbolic form for tighter bounds.
@@ -339,8 +339,8 @@ fn classify_gemm_role(
         None => return GemmRole::Other,
     };
 
-    // OE-4: 胖 opcode 自描述 — Gemm/GemmBias/QuantGemm 分类。
-    let is_gemm_op = |op: &CompilerOp| matches!(&op.op_v2,
+    // 胖 opcode 自描述 — Gemm/GemmBias/QuantGemm 分类。
+    let is_gemm_op = |op: &CompilerOp| matches!(&op.op,
         Op::Gemm(_) | Op::GemmBias(_) | Op::QuantGemm(_));
 
     // 拓扑推导 1: 共享输入的 GEMM 三兄弟 → QkvProjection
@@ -361,7 +361,7 @@ fn classify_gemm_role(
         let consumers = graph.tensor(output_tid).map(|t| &t.consumers).cloned().unwrap_or_default();
         for consumer_id in &consumers {
             if let Some(consumer) = graph.op(*consumer_id) {
-                if matches!(&consumer.op_v2,
+                if matches!(&consumer.op,
                     Op::Softmax | Op::MultiHeadAttention(_)
                 ) {
                     return GemmRole::OutputProjection;
@@ -383,7 +383,7 @@ fn classify_gemm_role(
                 let consumers = graph.tensor(output_tid).map(|t| &t.consumers).cloned().unwrap_or_default();
                 for consumer_id in &consumers {
                     if let Some(consumer) = graph.op(*consumer_id) {
-                        if matches!(&consumer.op_v2,
+                        if matches!(&consumer.op,
                             Op::SwiGlu | Op::Silu | Op::SwiGluClipped { .. } | Op::GeGlu
                         ) {
                             return GemmRole::GateUpProjection;
@@ -399,7 +399,7 @@ fn classify_gemm_role(
         if let Some(input_tensor) = graph.tensor(input_tid) {
             if let Some(producer_id) = input_tensor.producer {
                 if let Some(producer) = graph.op(producer_id) {
-                    if matches!(&producer.op_v2,
+                    if matches!(&producer.op,
                         Op::SwiGlu | Op::Silu | Op::SwiGluClipped { .. } | Op::GeGlu
                     ) {
                         return GemmRole::DownProjection;

@@ -276,6 +276,22 @@ pub(super) fn emit_fusion_groups(
         None
     };
 
+    // DEBUG: dump fusion plan groups for e5-small-v2 debugging
+    for (gi, group) in plan.groups.iter().enumerate() {
+        let op_names: Vec<String> = group.ops.iter()
+            .filter_map(|&oid| graph.op(oid).map(|op| {
+                let in_names: Vec<String> = op.inputs.iter()
+                    .filter_map(|&tid| graph.tensor(tid).map(|t| t.name.clone()))
+                    .collect();
+                let out_names: Vec<String> = op.outputs.iter()
+                    .filter_map(|&tid| graph.tensor(tid).map(|t| t.name.clone()))
+                    .collect();
+                format!("{:?} in=[{}] out=[{}]", op.op, in_names.join(","), out_names.join(","))
+            }))
+            .collect();
+        eprintln!("[FUSION-GROUP] gi={} mode={:?} is_layer={} ops=[{}]", gi, group.mode, group.is_layer_group, op_names.join("; "));
+    }
+
     for (gi, group) in plan.groups.iter().enumerate() {
         let anchor_op = graph.op(group.anchor).ok_or_else(|| {
             CompilerError::CodegenViolation(format!("anchor op {:?} not found", group.anchor))
@@ -287,9 +303,9 @@ pub(super) fn emit_fusion_groups(
         // duplicate instructions with WRONG ABI parameters (CompiledLayerFn offsets
         // instead of MegaKernelFn offsets), causing memory corruption and wrong
         // control flow.
-        // OE-3: op_v2 必填，直接读缓存识别采样 op。
+        // Op 必填，直接读缓存识别采样 op。
         let is_sampling_op = matches!(
-            &anchor_op.op_v2,
+            &anchor_op.op,
             crate::compiler::graph::Op::Argmax { .. }
             | crate::compiler::graph::Op::StoreToken
             | crate::compiler::graph::Op::CheckStopCondition
@@ -558,6 +574,11 @@ pub(super) fn emit_fusion_groups(
                 }
                 // Close outer segment loop
                 prog.emit(VmInstr::LoopEnd);
+                // §0.2.8 Parity fix: after the hetero loop, N swaps have occurred.
+                // One more swap restores pong_ptr to the last-written buffer.
+                if let Some((ping, pong)) = activation_swap_vregs {
+                    prog.emit(VmInstr::ActivationSwap { ptr_a: ping, ptr_b: pong });
+                }
                 state.abi.weight_ptr = original_weight_vreg;
                 state.abi.layer_loop_counter = None;
                 state.in_layer_loop = false;
@@ -660,6 +681,14 @@ pub(super) fn emit_fusion_groups(
                     }
                 }
                 prog.emit(VmInstr::LoopEnd);
+                // §0.2.8 Parity fix: after the layer loop, N swaps have occurred.
+                // The last iteration wrote to pong, then swapped — so pong_ptr now
+                // points to the WRONG buffer (the one NOT written by the last layer).
+                // One more swap restores pong_ptr to the last-written buffer, ensuring
+                // post-loop ops (MeanPool, final_norm) read from the correct data.
+                if let Some((ping, pong)) = activation_swap_vregs {
+                    prog.emit(VmInstr::ActivationSwap { ptr_a: ping, ptr_b: pong });
+                }
                 // After the layer loop, reload weight base from ABI args.
                 // original_weight_vreg's spill slot may have been overwritten by the
                 // register allocator during the multi-iteration layer loop. Reloading
@@ -765,8 +794,8 @@ pub(super) fn emit_fusion_groups(
                 if let Ok((m_dim, n, k)) = extract_gemm_dims_sym(op, graph) {
                     let out_ptr = load_op_scratch_ptr(prog, scratch_base, op, alloc, resolver, current_abi)?;
                     let pm = ctx.pack_map_for_gemm(op.inputs.get(1).copied());
-                    // OE-3: op_v2 必填，直接读 trans_b。
-                    let trans_b = match &op.op_v2 {
+                    // Op 必填，直接读 trans_b。
+                    let trans_b = match &op.op {
                         crate::compiler::graph::Op::Gemm(spec)
                         | crate::compiler::graph::Op::GemmBias(spec) => spec.trans_b,
                         _ => false,
@@ -899,6 +928,12 @@ pub(super) fn emit_fusion_groups(
             }
         }
         prog.emit(VmInstr::LoopEnd);
+        // §0.2.8 Parity fix: after the layer loop, N swaps have occurred.
+        // The last iteration wrote to pong, then swapped — so pong_ptr now
+        // points to the WRONG buffer. One more swap restores correctness.
+        if let Some((ping, pong)) = activation_swap_vregs {
+            prog.emit(VmInstr::ActivationSwap { ptr_a: ping, ptr_b: pong });
+        }
         // After the layer loop, reset weight_ptr to original (offset 0).
         // Global weights are at the beginning of the blob with absolute offsets.
         state.abi.weight_ptr = original_weight_vreg;

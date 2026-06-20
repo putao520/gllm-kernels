@@ -106,15 +106,16 @@ fn zero_offset_from_desc(desc: &QuantFormatDescriptor) -> usize {
     match &desc.zero_layout {
         ZeroLayout::None => 0,
         ZeroLayout::BlockScalar { offset_bytes, .. } => *offset_bytes,
+        ZeroLayout::BlockMin { offset_bytes, .. } => *offset_bytes,
         ZeroLayout::Hierarchical { dmin_offset, .. } => *dmin_offset,
         ZeroLayout::StaticBias { .. } => 0,
     }
 }
 
-/// 判断 format 是否有有效的 zero-point（BlockScalar 或 Hierarchical）。
+/// 判断 format 是否有有效的 zero-point（BlockScalar, BlockMin, 或 Hierarchical）。
 fn has_dynamic_zero_point(desc: &QuantFormatDescriptor) -> bool {
     matches!(desc.zero_layout,
-        ZeroLayout::BlockScalar { .. } | ZeroLayout::Hierarchical { .. }
+        ZeroLayout::BlockScalar { .. } | ZeroLayout::BlockMin { .. } | ZeroLayout::Hierarchical { .. }
     )
 }
 

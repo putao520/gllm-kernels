@@ -1242,7 +1242,7 @@ impl NumericalSimulator {
                 let addr = ptr + *offset as i64;
                 let val = match zp_type {
                     ZeroLayout::None | ZeroLayout::StaticBias { .. } => 0.0f32,
-                    ZeroLayout::BlockScalar { .. } | ZeroLayout::Hierarchical { .. } => {
+                    ZeroLayout::BlockScalar { .. } | ZeroLayout::BlockMin { .. } | ZeroLayout::Hierarchical { .. } => {
                         state.load_f16(addr)?
                     }
                 };

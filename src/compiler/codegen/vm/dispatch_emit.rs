@@ -1,6 +1,6 @@
 //! VmInstr types + validation tests.
 //! dispatch_structural/dispatch_compute_pattern 已物理删除，
-//! 所有 op lowering 统一走 lower_op_v2（胖 opcode 驱动）。
+//! 所有 op lowering 统一走 lower_op（胖 opcode 驱动）。
 
 #[cfg(test)]
 mod tests {

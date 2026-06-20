@@ -49,7 +49,7 @@ pub enum OpKindKey {
     TopK,
     WeightedSum,
     KvScatterWrite,
-    KvCacheWrite,
+    // @trace REQ-FATOP-025: KvCacheWrite 已物理删除 — attention FromCache lowering 内部覆盖 KV 写入
     // P4/P5 stub variants
     VariableLengthBatch,
     AttentionSkipMask,

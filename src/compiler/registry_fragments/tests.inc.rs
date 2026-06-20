@@ -1,6 +1,7 @@
 mod tests {
     use super::*;
     use crate::compiler::graph::{Op, GemmSpec, NormSpec, RopeSpec};
+    use crate::types::DType;
 
     #[test]
     fn registry_with_defaults_has_all_ops() {
@@ -98,7 +99,7 @@ mod tests {
 
     #[test]
     fn registry_key_from_op_roundtrip() {
-        // OE-4: OpKind enum 已删除，从 Op 派生 OpKindKey。
+        // OpKind enum 已删除，从 Op 派生 OpKindKey。
         let cases: Vec<(Op, OpKindKey)> = vec![
             (Op::Silu, OpKindKey::Silu),
             (Op::Gelu, OpKindKey::Gelu),

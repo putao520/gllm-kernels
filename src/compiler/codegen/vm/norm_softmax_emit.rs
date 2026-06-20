@@ -550,9 +550,12 @@ pub(crate) fn emit_softmax_telemetry(
 /// 尝试通过模板驱动路径发射 Norm 算子。
 ///
 /// 返回 `Some(())` 表示成功，`None` 表示需要 fallback 到 emit_normlike_inline。
+///
+/// `eps` 从 `NormSpec.eps` 传播，禁止硬编码 — ARCH-JIT-DATA-YIELDS。
 pub(crate) fn emit_norm_template_driven(
     prog: &mut VmProgram,
     feature_dim: usize,
+    eps: f32,
     width: SimdWidth,
     seq_bound: BoundExpr,
     input_ptr: VRegId,
@@ -576,6 +579,7 @@ pub(crate) fn emit_norm_template_driven(
 
     let mut params = ParamTable::new();
     params.set("hidden_dim", feature_dim);
+    params.set_f64("eps", eps as f64); // eps from NormSpec, not hardcoded
 
     // Norm 模板需要 4 个输入: input_ptr, weight_ptr, output_ptr, seq_offset
     let seq_offset = prog.alloc_vreg(VRegKind::ByteOffset, SimdWidth::Scalar);

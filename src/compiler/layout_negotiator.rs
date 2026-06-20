@@ -367,8 +367,8 @@ fn model_aware_layout_overrides(
         None => return (output_layout, weight_layout),
     };
 
-    let out = match op.op_v2_resolved(graph) {
-        // MHA 的输出是 HeadSplit — 从 Op v2 AttentionSpec 提取真实参数
+    let out = match op.op_resolved(graph) {
+        // MHA 的输出是 HeadSplit — 从 Op AttentionSpec 提取真实参数
         Some(Op::MultiHeadAttention(spec)) => {
             match output_layout {
                 LayoutConstraint::HeadSplit { num_heads: 0, head_dim: 0 } |
@@ -381,7 +381,7 @@ fn model_aware_layout_overrides(
         // QKV 投影 GEMM: 如果是 QKV 三兄弟，输出应该是 HeadSplit
         Some(Op::Gemm(_)) | Some(Op::GemmBias(_)) => {
             if is_qkv_op(op_id, graph) {
-                let (_, n, _) = op.op_v2_gemm_dims(graph).unwrap_or((crate::compiler::graph::SymDim::Concrete(1), 0, 0));
+                let (_, n, _) = op.op_gemm_dims(graph).unwrap_or((crate::compiler::graph::SymDim::Concrete(1), 0, 0));
                 let head_dim = extract_head_dim_from_graph(graph).unwrap_or(n);
                 let num_heads = n / head_dim.max(1);
                 LayoutConstraint::HeadSplit { num_heads, head_dim }
@@ -394,8 +394,8 @@ fn model_aware_layout_overrides(
 
     // weight_layout: PanelPacked 的 kc 应从 op 的 K 维度推导
     let wl = weight_layout.map(|wl| {
-        let is_gemm_like = matches!(op.op_v2_resolved(graph), Some(Op::Gemm(_)) | Some(Op::GemmBias(_)));
-        let k_dim = op.op_v2_gemm_dims(graph).map(|(_, _, k)| k);
+        let is_gemm_like = matches!(op.op_resolved(graph), Some(Op::Gemm(_)) | Some(Op::GemmBias(_)));
+        let k_dim = op.op_gemm_dims(graph).map(|(_, _, k)| k);
         match (is_gemm_like, k_dim, &wl) {
             (true, Some(k), LayoutConstraint::PanelPacked { mr, nr: _ }) => {
                 // kc = 实际 K 维度（用于 BLIS stride 计算）
@@ -416,14 +416,14 @@ fn is_qkv_op(op_id: OpId, graph: &CompilerGraph) -> bool {
         Some(o) => o,
         None => return false,
     };
-    if !matches!(op.op_v2_resolved(graph), Some(Op::Gemm(_)) | Some(Op::GemmBias(_))) {
+    if !matches!(op.op_resolved(graph), Some(Op::Gemm(_)) | Some(Op::GemmBias(_))) {
         return false;
     }
     let Some(&input_tid) = op.inputs.first() else { return false };
     // 统计共享同一输入的 GEMM 数量（通过 tensor.consumers 索引）
     let sibling_count = graph.tensor(input_tid)
         .map(|t| t.consumers.iter()
-            .filter(|&&c| graph.op(c).is_some_and(|o| matches!(o.op_v2_resolved(graph),
+            .filter(|&&c| graph.op(c).is_some_and(|o| matches!(o.op_resolved(graph),
                 Some(Op::Gemm(_)) | Some(Op::GemmBias(_)) | Some(Op::QuantGemm(_)))))
             .count())
         .unwrap_or(0);
@@ -436,7 +436,7 @@ fn is_qkv_op(op_id: OpId, graph: &CompilerGraph) -> bool {
 /// This is a single targeted lookup, not a pre-scan bool flag.
 fn extract_head_dim_from_graph(graph: &CompilerGraph) -> Option<usize> {
     graph.ops.iter()
-        .find_map(|op| match op.op_v2_resolved(graph) {
+        .find_map(|op| match op.op_resolved(graph) {
             Some(Op::MultiHeadAttention(spec)) => Some(spec.geometry.head_dim),
             Some(Op::RoPE(spec)) => Some(spec.head_dim),
             _ => None,
@@ -843,7 +843,7 @@ mod tests {
         let mut dag = make_test_dag();
         dag.nodes.push(crate::compiler::semantic_dag::SemanticNode {
             node_id: OpId(0),
-            op_v2: crate::compiler::graph::Op::Gemm(crate::compiler::graph::GemmSpec {
+            op: crate::compiler::graph::Op::Gemm(crate::compiler::graph::GemmSpec {
                 m: crate::compiler::graph::SymDim::Concrete(1),
                 n: 64,
                 k: 64,
@@ -861,7 +861,7 @@ mod tests {
         });
         dag.nodes.push(crate::compiler::semantic_dag::SemanticNode {
             node_id: OpId(1),
-            op_v2: crate::compiler::graph::Op::Silu,
+            op: crate::compiler::graph::Op::Silu,
             op_trace: None,
             op_class: OpClass::ElemWise,
             bottleneck: crate::compiler::semantic_dag::Bottleneck::Memory,
@@ -1006,7 +1006,7 @@ mod tests {
         let mut dag = make_test_dag();
         dag.nodes.push(crate::compiler::semantic_dag::SemanticNode {
             node_id: OpId(0),
-            op_v2: crate::compiler::graph::Op::Silu,
+            op: crate::compiler::graph::Op::Silu,
             op_trace: None,
             op_class: OpClass::ElemWise,
             bottleneck: crate::compiler::semantic_dag::Bottleneck::Memory,
@@ -1017,7 +1017,7 @@ mod tests {
         });
         dag.nodes.push(crate::compiler::semantic_dag::SemanticNode {
             node_id: OpId(1),
-            op_v2: crate::compiler::graph::Op::Gelu,
+            op: crate::compiler::graph::Op::Gelu,
             op_trace: None,
             op_class: OpClass::ElemWise,
             bottleneck: crate::compiler::semantic_dag::Bottleneck::Memory,
@@ -1819,7 +1819,7 @@ mod tests {
         let mut dag = make_test_dag();
         dag.nodes.push(crate::compiler::semantic_dag::SemanticNode {
             node_id: OpId(0),
-            op_v2: crate::compiler::graph::Op::Gemm(crate::compiler::graph::GemmSpec {
+            op: crate::compiler::graph::Op::Gemm(crate::compiler::graph::GemmSpec {
                 m: crate::compiler::graph::SymDim::Concrete(1),
                 n: 128,
                 k: 256,
@@ -2153,7 +2153,7 @@ mod tests {
         let mut dag = make_test_dag();
         dag.nodes.push(crate::compiler::semantic_dag::SemanticNode {
             node_id: OpId(0),
-            op_v2: crate::compiler::graph::Op::Silu,
+            op: crate::compiler::graph::Op::Silu,
             op_trace: None,
             op_class: OpClass::ElemWise,
             bottleneck: crate::compiler::semantic_dag::Bottleneck::Memory,
@@ -2164,7 +2164,7 @@ mod tests {
         });
         dag.nodes.push(crate::compiler::semantic_dag::SemanticNode {
             node_id: OpId(1),
-            op_v2: crate::compiler::graph::Op::Gelu,
+            op: crate::compiler::graph::Op::Gelu,
             op_trace: None,
             op_class: OpClass::ElemWise,
             bottleneck: crate::compiler::semantic_dag::Bottleneck::Memory,
@@ -2175,7 +2175,7 @@ mod tests {
         });
         dag.nodes.push(crate::compiler::semantic_dag::SemanticNode {
             node_id: OpId(2),
-            op_v2: crate::compiler::graph::Op::Tanh,
+            op: crate::compiler::graph::Op::Tanh,
             op_trace: None,
             op_class: OpClass::ElemWise,
             bottleneck: crate::compiler::semantic_dag::Bottleneck::Memory,
@@ -2405,7 +2405,7 @@ mod tests {
         let mut dag = make_test_dag();
         dag.nodes.push(crate::compiler::semantic_dag::SemanticNode {
             node_id: OpId(0),
-            op_v2: crate::compiler::graph::Op::Silu,
+            op: crate::compiler::graph::Op::Silu,
             op_trace: None,
             op_class: OpClass::ElemWise,
             bottleneck: crate::compiler::semantic_dag::Bottleneck::Memory,
@@ -2796,7 +2796,7 @@ mod tests {
         let mut dag = make_test_dag();
         dag.nodes.push(crate::compiler::semantic_dag::SemanticNode {
             node_id: OpId(0),
-            op_v2: crate::compiler::graph::Op::Gelu,
+            op: crate::compiler::graph::Op::Gelu,
             op_trace: None,
             op_class: OpClass::ElemWise,
             bottleneck: crate::compiler::semantic_dag::Bottleneck::Memory,
@@ -2807,7 +2807,7 @@ mod tests {
         });
         dag.nodes.push(crate::compiler::semantic_dag::SemanticNode {
             node_id: OpId(1),
-            op_v2: crate::compiler::graph::Op::Tanh,
+            op: crate::compiler::graph::Op::Tanh,
             op_trace: None,
             op_class: OpClass::ElemWise,
             bottleneck: crate::compiler::semantic_dag::Bottleneck::Memory,

@@ -668,7 +668,8 @@ pub(crate) enum GemmKernel {
     /// 浮点路径: VecLoad A + VecLoad B + DotProduct(Bf16/Fp16)/Fma
     Float,
     /// INT8 硬件原生: Int8Load + DotProduct(Int8) + ScaleApply epilogue
-    Int8Native { scale_offset: usize, data_offset: usize },
+    /// When `m_offset > 0`, ScaleApply uses zero_vec=m (PostScaleAdd: value = d*quantized + m).
+    Int8Native { scale_offset: usize, data_offset: usize, m_offset: usize },
     /// Assisted 半硬件辅助: 寄存器内 nibble unpack + dequant + FMA (REQ-QCG5)
     /// 用于 INT4 weight-only + SimdAssisted/SimdBasic dot_cap:
     ///   1. QuantBlockLoad(UnsignedNibbleLow/High) or (SignedNibbleLow/High)
@@ -689,6 +690,11 @@ pub(crate) enum GemmKernel {
         high_offset: usize,
         bias: f32,
         high_bits: u8,
+        /// ARCH-BLOCK-MIN: when true, the formula is `d * quantized + m` (PostScaleAdd).
+        /// The inner loop emits: Mul(scale_vec) then Add(bias_vec) where bias_vec = m.
+        /// When false (default), the formula is `(quantized - bias) * scale` (PreScaleSubtract).
+        /// The inner loop emits: Sub(bias_vec) then Mul(scale_vec).
+        post_scale_add: bool,
     },
 }
 
@@ -778,8 +784,12 @@ impl QuantGemmPlan {
                 DotProductCap::NativeInt8Tc | DotProductCap::NativeInt8Simd | DotProductCap::NativeInt8Tile)
             {
                 let data_offset = match &desc.data_layout { DataLayout::Bytes { offset, .. } => *offset, _ => 0 };
-                let scale_offset = match &desc.scale_layout { ScaleLayout::BlockScalar { offset_bytes, .. } => *offset_bytes, _ => 0 };
-                GemmKernel::Int8Native { scale_offset, data_offset }
+                let (scale_offset, m_offset) = match &desc.scale_layout {
+                    ScaleLayout::BlockScalar { offset_bytes, .. } => (*offset_bytes, 0),
+                    ScaleLayout::BlockScalarWithMin { d_offset, m_offset, .. } => (*d_offset, *m_offset),
+                    _ => (0, 0),
+                };
+                GemmKernel::Int8Native { scale_offset, data_offset, m_offset }
             } else if is_assisted {
                 let data_offset = match &desc.data_layout { DataLayout::Bytes { offset, .. } | DataLayout::PackedNibbles { offset, .. } => *offset, _ => 0 };
                 let scale_offset = match &desc.scale_layout { ScaleLayout::BlockScalar { offset_bytes, .. } => *offset_bytes, _ => 0 };
@@ -811,7 +821,9 @@ impl QuantGemmPlan {
                     crate::quant_format::ZeroLayout::StaticBias { value } => *value as f32,
                     _ => 0.0,
                 };
-                GemmKernel::HighBitMerge { scale_offset, low_offset, high_offset, bias, high_bits }
+                // ARCH-BLOCK-MIN: BlockScalarWithMin uses PostScaleAdd: value = d * quantized + m
+                let post_scale_add = matches!(&desc.scale_layout, ScaleLayout::BlockScalarWithMin { .. });
+                GemmKernel::HighBitMerge { scale_offset, low_offset, high_offset, bias, high_bits, post_scale_add }
             } else {
                 GemmKernel::DequantFma
             };

@@ -1,26 +1,26 @@
 // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-// lower_op_v2 — Op v2 lowering 入口（胖 opcode 驱动，非 OpKind 反查）
+// lower_op — Op lowering 入口（胖 opcode 驱动，非 OpKind 反查）
 // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 //
 // Phase 4+: 从 Op Spec 直接获取 lowering 参数，消除 dispatch_emit.rs 中
 // `match OpKind { RmsNorm { feature_dim, .. } => ... }` 的 OpKind 反查。
 //
-// include! 模式：plan_lower.rs 已 use 大部分类型。本文件补 import Op v2 类型。
+// include! 模式：plan_lower.rs 已 use 大部分类型。本文件补 import Op 类型。
 // emit_normlike_inline/NormKind 已在 plan_lower.rs use，不重复。
 
 use crate::compiler::graph::{CompilerOp, Op, NormSpec, AttentionSpec, KvSource};
 use super::attention_emit::emit_tiled_attention_inline;
 use super::norm_softmax_emit::{emit_softmax_inline, emit_softmax_telemetry};
 
-/// Phase 4+: Op v2 驱动的 lowering 入口。
+/// Phase 4+: Op 驱动的 lowering 入口。
 ///
 /// 返回 Ok(true) 表示已处理，Ok(false) 表示非本函数处理的类别（调用方 fallback）。
 ///
 /// Norm 类：从 NormSpec.feature_dim/dtype 直接获取参数，不反查 OpKind。
 /// 其他类别：Phase 5-7 扩展。
-// @trace REQ-FATOP-014 [entity:Op] [entity:OpKind] lower_op_v2 41 类别零 OpKind 反查
-// @trace REQ-FATOP-018 lowering 路径优先读 op_v2 缓存
-pub(crate) fn lower_op_v2(
+// @trace REQ-FATOP-014 [entity:Op] [entity:OpKind] lower_op 41 类别零 OpKind 反查
+// @trace REQ-FATOP-018 lowering 路径优先读 Op 缓存
+pub(crate) fn lower_op(
     prog: &mut VmProgram,
     op: &CompilerOp,
     graph: &CompilerGraph,
@@ -28,10 +28,10 @@ pub(crate) fn lower_op_v2(
     resolver: &TensorPtrResolver,
     abi: &AbiPtrs,
 ) -> Result<bool, CompilerError> {
-    // OE-3: op_v2 必填，直接读缓存（add_op 时已翻译）。clone 保持原 match-by-value 模式。
-    let op_v2 = op.op_v2.clone();
+    // Op 必填，直接读缓存（add_op 时已翻译）。clone 保持原 match-by-value 模式。
+    let op_resolved = op.op.clone();
 
-    match op_v2 {
+    match op_resolved {
         Op::RmsNorm(ref spec) => lower_norm_v2(prog, op, graph, ctx, resolver, abi, spec, NormKind::RmsNorm),
         Op::LayerNorm(ref spec) => lower_norm_v2(prog, op, graph, ctx, resolver, abi, spec, NormKind::LayerNorm),
         Op::ValueNorm(ref spec) => lower_norm_v2(prog, op, graph, ctx, resolver, abi, spec, NormKind::ValueNorm),
@@ -166,7 +166,7 @@ pub(crate) fn lower_op_v2(
                 .product::<usize>()
                 .max(1);
             let width = ctx.session.width.f32_lanes();
-            let elem_bytes = 4usize;
+            let elem_bytes = ctx.dtype.elem_bytes();
             let num_vec = (feature_dim + width - 1) / width;
             let row_bytes = feature_dim * elem_bytes;
             let const_bc = prog.alloc_vreg(VRegKind::Vec, ctx.session.width);
@@ -275,6 +275,7 @@ pub(crate) fn lower_op_v2(
             let input_ptr = resolver.materialize(prog, op.inputs[0], abi).ok_or_else(|| {
                 CompilerError::CodegenViolation(format!("Gather op {:?}: input 无法 materialize", op.id))
             })?;
+            let weight_src = op.inputs.get(1).copied().and_then(|tid| resolver.source(tid));
             let weight_ptr = op.inputs.get(1).copied()
                 .and_then(|tid| resolver.materialize(prog, tid, abi))
                 .unwrap_or(input_ptr);
@@ -368,7 +369,7 @@ pub(crate) fn lower_op_v2(
         // NOP variants — 元数据 op，不生成 VmInstr
         Op::Transpose { .. } | Op::Reshape { .. } | Op::SliceView { .. } => Ok(true),
 
-        // Generation control flow — 从 Op v2 路由，逻辑等价（unit 变体，无 Spec 参数）
+        // Generation control flow — 从 Op 路由，逻辑等价（unit 变体，无 Spec 参数）
         Op::StoreToken => {
             let token_ptr = resolver.materialize(prog, op.inputs[0], abi).ok_or_else(|| {
                 CompilerError::CodegenViolation(format!(
@@ -550,7 +551,7 @@ pub(crate) fn lower_op_v2(
             let seq_bound = ctx.session.sym_map.to_bound(seq_len);
             let width = ctx.session.width.f32_lanes();
             let p = num_preds;
-            let elem_bytes = 4usize;
+            let elem_bytes = ctx.dtype.elem_bytes();
             let row_bytes = p * hidden * elem_bytes;
             let num_vec = (hidden + width - 1) / width;
             prog.emit_loop_try(seq_bound, row_bytes, |prog, _ctr, seq_off| {
@@ -639,7 +640,7 @@ pub(crate) fn lower_op_v2(
             let seq_bound = ctx.session.sym_map.to_bound(seq_len);
             let width = ctx.session.width.f32_lanes();
             let p = num_preds;
-            let elem_bytes = 4usize;
+            let elem_bytes = ctx.dtype.elem_bytes();
             let row_bytes = p * hidden * elem_bytes;
             let num_vec = (hidden + width - 1) / width;
             prog.emit_loop_try(seq_bound, row_bytes, |prog, _ctr, seq_off| {
@@ -736,7 +737,7 @@ pub(crate) fn lower_op_v2(
             let seq_bound = ctx.session.sym_map.to_bound(seq_len);
             let width = ctx.session.width.f32_lanes();
             let p = num_preds;
-            let elem_bytes = 4usize;
+            let elem_bytes = ctx.dtype.elem_bytes();
             let row_bytes = p * hidden * elem_bytes;
             let num_vec = (hidden + width - 1) / width;
             prog.emit_loop_try(seq_bound, row_bytes, |prog, _ctr, seq_off| {
@@ -1114,7 +1115,7 @@ pub(crate) fn lower_op_v2(
             let weight_ptr = resolver.materialize(prog, op.inputs[1], abi).unwrap_or_else(|| prog.alloc_vreg(VRegKind::Ptr, width));
             let output_ptr = resolver.materialize(prog, op.outputs[0], abi)
                 .ok_or_else(|| CompilerError::CodegenViolation(format!("L2Normalize op {:?}: 无输出指针", op.id)))?;
-            let key = ScalarOpRegistry::key_from_op(&op.op_v2);
+            let key = ScalarOpRegistry::key_from_op(&op.op);
             let op_trace = ctx.session.registry.and_then(|r| r.get_trace(&key));
             let pattern = op_trace.map(|t| t.pattern.clone())
                 .ok_or_else(|| CompilerError::CodegenViolation("L2Normalize: 无 registry trace".into()))?;
@@ -1150,7 +1151,7 @@ pub(crate) fn lower_op_v2(
             let input_ptr = resolver.materialize(prog, op.inputs[0], abi).unwrap_or_else(|| prog.alloc_vreg(VRegKind::Ptr, width));
             let output_ptr = resolver.materialize(prog, op.outputs[0], abi)
                 .ok_or_else(|| CompilerError::CodegenViolation(format!("MeanPool op {:?}: 无输出指针", op.id)))?;
-            let key = ScalarOpRegistry::key_from_op(&op.op_v2);
+            let key = ScalarOpRegistry::key_from_op(&op.op);
             let op_trace = ctx.session.registry.and_then(|r| r.get_trace(&key));
             let trace = op_trace
                 .ok_or_else(|| CompilerError::CodegenViolation("MeanPool: 无 registry trace".into()))?;
@@ -1180,11 +1181,11 @@ pub(crate) fn lower_op_v2(
                 input_ptr, weight_ptr, output_ptr, sym_map, seq_bound_override.as_ref(), ctx.dtype)?;
             Ok(true)
         }
-        _ => Ok(false) // 无需 lower_op_v2 的 ops（trace-lookup 最优）
+        _ => Ok(false) // 无需 lower_op 的 ops（trace-lookup 最优）
     }
 }
 
-/// Gemm lowering（Op v2 驱动）。
+/// Gemm lowering（Op 驱动）。
 ///
 /// 从 GemmSpec 获取 m/n/k/trans_b/has_bias，结合 ctx.pack_map_for_gemm，
 /// 调用 emit_gemm_inline_with_hook。has_bias 时额外 emit bias add。
@@ -1286,7 +1287,7 @@ fn lower_gemm_v2(
     Ok(true)
 }
 
-/// Attention lowering（Op v2 驱动）。
+/// Attention lowering（Op 驱动）。
 ///
 /// 从 AttentionSpec 获取 geometry/mask/kv_source/sinks/dtype，
 /// 调用 emit_tiled_attention_inline。
@@ -1427,7 +1428,7 @@ fn lower_attention_v2(
     Ok(true)
 }
 
-/// Norm lowering（Op v2 驱动）。
+/// Norm lowering（Op 驱动）。
 ///
 /// 从 NormSpec 获取 feature_dim/dtype/has_weight，结合 registry 的 NormLike pattern，
 /// 调用 emit_normlike_inline。消除 dispatch_emit.rs 的 Op::RmsNorm 反查。
@@ -1459,6 +1460,21 @@ fn lower_norm_v2(
         return Err(CompilerError::CodegenViolation(format!(
             "lower_norm_v2: 期望 NormLike pattern，实际 {:?}", trace.pattern
         )));
+    };
+
+    // ARCH-JIT-DATA-YIELDS: epsilon 必须从 NormSpec（图）获取，而非 registry 默认值。
+    // Registry trace 的 finalize[3] = TraceOp::Const(1e-5) 仅作为 symexec fallback，
+    // codegen 必须用 spec.eps 覆盖，否则不同模型的自定义 eps 会被静默忽略。
+    let pattern = {
+        let mut p = trace.pattern.clone();
+        if let ComputePattern::NormLike { finalize, .. } = &mut p {
+            for op in finalize.iter_mut() {
+                if let TraceOp::Const(_) = op {
+                    *op = TraceOp::Const(spec.eps as f64);
+                }
+            }
+        }
+        p
     };
 
     // 从 NormSpec 直接获取参数（胖 opcode，不反查 OpKind）
@@ -1502,7 +1518,7 @@ fn lower_norm_v2(
     } else {
         emit_normlike_inline(
             prog,
-            &trace.pattern,
+            &pattern,
             feature_dim,
             1, // groups_per_row
             spec.has_weight, // broadcast_weight

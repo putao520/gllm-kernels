@@ -18,9 +18,9 @@ pub(crate) fn emit_quant_gemm_tiled(
         (GemmMode::Float, GemmKernel::Float) => {
             emit_gemm_float_from_plan(prog, &plan, input_ptr, weight_ptr, output_ptr, desc)
         }
-        (_, GemmKernel::Int8Native { scale_offset, data_offset }) => {
+        (_, GemmKernel::Int8Native { scale_offset, data_offset, m_offset }) => {
             emit_gemm_int8_from_plan(prog, &plan, input_ptr, weight_ptr, output_ptr,
-                *scale_offset, *data_offset)
+                *scale_offset, *data_offset, *m_offset)
         }
         (_, GemmKernel::Assisted { scale_offset, data_offset }) => {
             emit_gemm_assisted_from_plan(prog, &plan, input_ptr, weight_ptr, output_ptr, desc,
@@ -29,9 +29,9 @@ pub(crate) fn emit_quant_gemm_tiled(
         (_, GemmKernel::DequantFma) => {
             emit_gemm_dequant_from_plan(prog, &plan, input_ptr, weight_ptr, output_ptr, desc)
         }
-        (_, GemmKernel::HighBitMerge { scale_offset, low_offset, high_offset, bias, high_bits }) => {
+        (_, GemmKernel::HighBitMerge { scale_offset, low_offset, high_offset, bias, high_bits, post_scale_add }) => {
             emit_gemm_highbit_from_plan(prog, &plan, input_ptr, weight_ptr, output_ptr, desc,
-                *scale_offset, *low_offset, *high_offset, *bias, *high_bits)
+                *scale_offset, *low_offset, *high_offset, *bias, *high_bits, *post_scale_add)
         }
         _ => Err(CompilerError::CodegenViolation("quant_gemm: inconsistent mode/kernel".into())),
     }
@@ -54,6 +54,15 @@ pub(crate) fn emit_gemm_float_from_plan(
             format!("gemm_float: k={} not divisible by lanes={}", k, lanes)
         ));
     }
+
+    // ARCH-DTYPE-JIT-TYPED: weight dtype determines VecLoad conversion.
+    // Activation is always F32 (already in scratchpad); weight dtype may be BF16/F16/F32.
+    // VecLoad with BF16 dtype triggers WidenCompute (vpmovzxwd + vpslld 16 → F32).
+    let weight_dtype = match desc.data_kind {
+        crate::quant_format::QuantDataKind::Bfloat16 => QuantPrecision::BF16,
+        crate::quant_format::QuantDataKind::Float16 => QuantPrecision::F16,
+        _ => dtype, // F32 or other: native load
+    };
 
     let acc = prog.alloc_vreg(VRegKind::Vec, width);
     let a_val = prog.alloc_vreg(VRegKind::Vec, width);
@@ -86,7 +95,7 @@ pub(crate) fn emit_gemm_float_from_plan(
                     Box::new(OffsetExpr::ScalarVReg(k_act_off)),
                 );
                 prog.emit(VmInstr::VecLoad { dst: a_val, base: input_ptr, offset: act_off, width, dtype , predicate: None });
-                prog.emit(VmInstr::VecLoad { dst: b_val, base: w_col_ptr, offset: OffsetExpr::LoopOffset(kk_off), width, dtype , predicate: None });
+                prog.emit(VmInstr::VecLoad { dst: b_val, base: w_col_ptr, offset: OffsetExpr::LoopOffset(kk_off), width, dtype: weight_dtype , predicate: None });
 
                 match desc.data_kind {
                     crate::quant_format::QuantDataKind::Bfloat16 => {
@@ -128,6 +137,7 @@ pub(crate) fn emit_gemm_int8_from_plan(
     output_ptr: VRegId,
     scale_offset: usize,
     data_offset: usize,
+    m_offset: usize,
 ) -> Result<(), CompilerError> {
     let QuantGemmPlan {
         n, lanes, elem, width, dtype,
@@ -175,6 +185,14 @@ pub(crate) fn emit_gemm_int8_from_plan(
                         dst: scale_vec, base: blk_ptr,
                         offset: OffsetExpr::Const(scale_offset), unpack: BlockUnpackMode::F16Broadcast, width,
                     });
+                    // ARCH-BLOCK-MIN: load m (min offset) for PostScaleAdd: ScaleApply does acc*scale + zero
+                    // where zero=m gives value = d * dot_product + m
+                    if m_offset > 0 {
+                        prog.emit(VmInstr::QuantBlockLoad {
+                            dst: zero_vec, base: blk_ptr,
+                            offset: OffsetExpr::Const(m_offset), unpack: BlockUnpackMode::F16Broadcast, width,
+                        });
+                    }
                     let data_ptr = prog.alloc_vreg(VRegKind::Ptr, SimdWidth::Scalar);
                     if data_offset > 0 {
                         let off_reg = prog.alloc_vreg(VRegKind::Ptr, SimdWidth::Scalar);
@@ -255,12 +273,20 @@ pub(crate) fn emit_gemm_assisted_from_plan(
     let quant_row_stride = plan.quant_row_stride;
     let use_signed = matches!(desc.data_kind, crate::quant_format::QuantDataKind::SignedPackedInt4);
 
+    // ARCH-BLOCK-MIN: detect BlockScalarWithMin for PostScaleAdd
+    let post_scale_add = matches!(&desc.scale_layout, crate::quant_format::ScaleLayout::BlockScalarWithMin { .. });
+    let m_offset = match &desc.scale_layout {
+        crate::quant_format::ScaleLayout::BlockScalarWithMin { m_offset, .. } => *m_offset,
+        _ => 0,
+    };
+
     let acc = prog.alloc_vreg(VRegKind::Vec, width);
     let a_val = prog.alloc_vreg(VRegKind::Vec, width);
     let b_lo = prog.alloc_vreg(VRegKind::Vec, width);
     let b_hi = prog.alloc_vreg(VRegKind::Vec, width);
     let scale_vec = prog.alloc_vreg(VRegKind::Vec, width);
     let zero_vec = prog.alloc_vreg(VRegKind::Vec, width);
+    let min_vec = prog.alloc_vreg(VRegKind::Vec, width); // ARCH-BLOCK-MIN: m offset per block
     let hreduce_dst = prog.alloc_vreg(VRegKind::Vec, width);
     let zero_gpr = prog.alloc_vreg(VRegKind::Ptr, SimdWidth::Scalar);
     prog.emit(VmInstr::GprLoadImm { dst: zero_gpr, value: 0 });
@@ -297,6 +323,13 @@ pub(crate) fn emit_gemm_assisted_from_plan(
                         dst: scale_vec, base: blk_ptr,
                         offset: OffsetExpr::Const(scale_offset), unpack: BlockUnpackMode::F16Broadcast, width,
                     });
+                    // ARCH-BLOCK-MIN: load m (min offset) for PostScaleAdd: value = d * quantized + m
+                    if post_scale_add {
+                        prog.emit(VmInstr::QuantBlockLoad {
+                            dst: min_vec, base: blk_ptr,
+                            offset: OffsetExpr::Const(m_offset), unpack: BlockUnpackMode::F16Broadcast, width,
+                        });
+                    }
                     let data_ptr = prog.alloc_vreg(VRegKind::Ptr, SimdWidth::Scalar);
                     if data_offset > 0 {
                         let off_reg = prog.alloc_vreg(VRegKind::Ptr, SimdWidth::Scalar);
@@ -337,6 +370,10 @@ pub(crate) fn emit_gemm_assisted_from_plan(
                                 offset: OffsetExpr::Const(0), unpack: low_unpack, width,
                             });
                             prog.emit(VmInstr::VecBinOp { dst: b_lo, a: b_lo, b: scale_vec, op: VecOp::Mul, dtype: dtype });
+                            if post_scale_add {
+                                // ARCH-BLOCK-MIN: value = d * quantized + m
+                                prog.emit(VmInstr::VecBinOp { dst: b_lo, a: b_lo, b: min_vec, op: VecOp::Add, dtype: dtype });
+                            }
                             prog.emit(VmInstr::Fma { dst: acc, acc, a: a_val, b: b_lo, dtype });
 
                             // --- High nibble FMA: hi nibbles = block positions [16..23] ---
@@ -362,6 +399,10 @@ pub(crate) fn emit_gemm_assisted_from_plan(
                                 offset: OffsetExpr::Const(0), unpack: high_unpack, width,
                             });
                             prog.emit(VmInstr::VecBinOp { dst: b_hi, a: b_hi, b: scale_vec, op: VecOp::Mul, dtype: dtype });
+                            if post_scale_add {
+                                // ARCH-BLOCK-MIN: value = d * quantized + m
+                                prog.emit(VmInstr::VecBinOp { dst: b_hi, a: b_hi, b: min_vec, op: VecOp::Add, dtype: dtype });
+                            }
                             prog.emit(VmInstr::Fma { dst: acc, acc, a: a_val, b: b_hi, dtype });
 
                             // Advance data_ptr
@@ -443,6 +484,7 @@ pub(crate) fn emit_gemm_highbit_from_plan(
     high_offset: usize,
     bias: f32,
     high_bits: u8,
+    post_scale_add: bool,
 ) -> Result<(), CompilerError> {
     let QuantGemmPlan {
         n, lanes, elem, width, dtype,
@@ -505,19 +547,19 @@ pub(crate) fn emit_gemm_highbit_from_plan(
                             });
                         }
                         crate::quant_format::ScaleLayout::BlockScalarWithMin { d_offset, m_offset, .. } => {
-                            let d_vec = prog.alloc_vreg(VRegKind::Vec, width);
-                            let m_vec = prog.alloc_vreg(VRegKind::Vec, width);
+                            // ARCH-BLOCK-MIN: value = d * quantized + m (PostScaleAdd)
+                            // scale_vec = d (scale only); bias_vec = m (loaded per-block)
+                            // The inner loop will emit: Mul(scale_vec) then Add(bias_vec)
                             prog.emit(VmInstr::QuantBlockLoad {
-                                dst: d_vec, base: blk_ptr,
+                                dst: scale_vec, base: blk_ptr,
                                 offset: OffsetExpr::Const(*d_offset),
                                 unpack: BlockUnpackMode::F16Broadcast, width,
                             });
                             prog.emit(VmInstr::QuantBlockLoad {
-                                dst: m_vec, base: blk_ptr,
+                                dst: bias_vec, base: blk_ptr,
                                 offset: OffsetExpr::Const(*m_offset),
                                 unpack: BlockUnpackMode::F16Broadcast, width,
                             });
-                            prog.emit(VmInstr::VecBinOp { dst: scale_vec, a: d_vec, b: m_vec, op: VecOp::Add, dtype: dtype });
                         }
                         _ => unreachable!(
                             "emit_gemm_highbit: Hierarchical/Q6KScales/ExternalArray/SubBlockScalars \
@@ -571,10 +613,16 @@ pub(crate) fn emit_gemm_highbit_from_plan(
                             });
                             // Merge: nibble + qh → INT5 value
                             prog.emit(VmInstr::VecBinOp { dst: w_merged, a: nibble_vec, b: qh_vec, op: VecOp::Add, dtype: dtype });
-                            // Subtract bias
-                            prog.emit(VmInstr::VecBinOp { dst: w_merged, a: w_merged, b: bias_vec, op: VecOp::Sub, dtype: dtype });
-                            // Scale
-                            prog.emit(VmInstr::VecBinOp { dst: w_merged, a: w_merged, b: scale_vec, op: VecOp::Mul, dtype: dtype });
+                            if post_scale_add {
+                                // ARCH-BLOCK-MIN: value = d * quantized + m
+                                // Scale first, then add m (bias_vec contains per-block m)
+                                prog.emit(VmInstr::VecBinOp { dst: w_merged, a: w_merged, b: scale_vec, op: VecOp::Mul, dtype: dtype });
+                                prog.emit(VmInstr::VecBinOp { dst: w_merged, a: w_merged, b: bias_vec, op: VecOp::Add, dtype: dtype });
+                            } else {
+                                // PreScaleSubtract: value = (quantized - bias) * scale
+                                prog.emit(VmInstr::VecBinOp { dst: w_merged, a: w_merged, b: bias_vec, op: VecOp::Sub, dtype: dtype });
+                                prog.emit(VmInstr::VecBinOp { dst: w_merged, a: w_merged, b: scale_vec, op: VecOp::Mul, dtype: dtype });
+                            }
                             // FMA
                             prog.emit(VmInstr::Fma { dst: acc, acc, a: a_val, b: w_merged, dtype });
 
@@ -612,10 +660,15 @@ pub(crate) fn emit_gemm_highbit_from_plan(
                             });
                             // Merge: nibble + qh → INT5 value
                             prog.emit(VmInstr::VecBinOp { dst: w_merged, a: nibble_vec, b: qh_vec, op: VecOp::Add, dtype: dtype });
-                            // Subtract bias
-                            prog.emit(VmInstr::VecBinOp { dst: w_merged, a: w_merged, b: bias_vec, op: VecOp::Sub, dtype: dtype });
-                            // Scale
-                            prog.emit(VmInstr::VecBinOp { dst: w_merged, a: w_merged, b: scale_vec, op: VecOp::Mul, dtype: dtype });
+                            if post_scale_add {
+                                // ARCH-BLOCK-MIN: value = d * quantized + m
+                                prog.emit(VmInstr::VecBinOp { dst: w_merged, a: w_merged, b: scale_vec, op: VecOp::Mul, dtype: dtype });
+                                prog.emit(VmInstr::VecBinOp { dst: w_merged, a: w_merged, b: bias_vec, op: VecOp::Add, dtype: dtype });
+                            } else {
+                                // PreScaleSubtract: value = (quantized - bias) * scale
+                                prog.emit(VmInstr::VecBinOp { dst: w_merged, a: w_merged, b: bias_vec, op: VecOp::Sub, dtype: dtype });
+                                prog.emit(VmInstr::VecBinOp { dst: w_merged, a: w_merged, b: scale_vec, op: VecOp::Mul, dtype: dtype });
+                            }
                             // FMA
                             prog.emit(VmInstr::Fma { dst: acc, acc, a: a_val, b: w_merged, dtype });
 

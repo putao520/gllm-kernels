@@ -525,6 +525,12 @@ impl<'a> DecodeTraceBuilder<'a> {
                 ZeroResult::PreScaleSubtract(f32_slot)
             }
 
+            // Q4_1/Q5_1/Q8_1: `value = d × quantized + m` — post-scale addition
+            ZeroLayout::BlockMin { offset_bytes, dtype } => {
+                let f32_slot = self.load_and_cast_scalar(trace, block_ptr_slot, *offset_bytes as i64, *dtype);
+                ZeroResult::PostScaleAdd(f32_slot)
+            }
+
             ZeroLayout::Hierarchical { dmin_offset, sub_m_offset } => {
                 // block_dmin × sub_m   (both f16-derived)
                 let dmin_f32 = push_op(
@@ -1250,8 +1256,8 @@ mod tests {
     }
 
     // @trace TEST-QD-02 [req:REQ-QCG] [level:unit]
-    // Q5_1: NibbleWithHighBits + BlockScalarWithMin scale (d + m) + no zero.
-    // Tests BlockScalarWithMin scale path with high bits.
+    // Q5_1: NibbleWithHighBits + BlockScalarWithMin scale (d + m) + BlockMin zero (m).
+    // Tests BlockScalarWithMin scale path with high bits + post-scale min addition.
     #[test]
     fn test_q5_1_trace() {
         // Arrange
@@ -1274,9 +1280,12 @@ mod tests {
         let has_bytes_load = trace.iter().any(|op| matches!(op, TraceOp::QuantLoadBytesVec { .. }));
         assert!(has_bytes_load, "Q5_1 should load bytes for nibble data");
 
-        // Q5_1: no zero layout → no Sub for bias
+        // Q5_1: BlockMin zero layout → Add for min addition (value = d*quantized + m)
+        let has_add = trace.iter().any(|op| matches!(op, TraceOp::Add(_, _)));
+        assert!(has_add, "Q5_1 should have Add for BlockMin post-scale addition");
+        // Q5_1: no pre-scale subtraction (no AWQ/GPTQ style zero-point)
         let has_sub = trace.iter().any(|op| matches!(op, TraceOp::Sub(_, _)));
-        assert!(!has_sub, "Q5_1 should NOT have Sub (zero_layout is None)");
+        assert!(!has_sub, "Q5_1 should NOT have Sub (no PreScaleSubtract zero-point)");
     }
 
     // @trace TEST-QD-03 [req:REQ-QCG] [level:unit]
@@ -1989,9 +1998,12 @@ mod tests {
         ));
         assert!(has_signed_bytes, "Q8_1 should load signed bytes");
 
-        // Q8_1: ZeroLayout::None → no Sub for bias
+        // Q8_1: BlockMin zero layout → Add for min addition (value = d*quantized + m)
+        let has_add = trace.iter().any(|op| matches!(op, TraceOp::Add(_, _)));
+        assert!(has_add, "Q8_1 should have Add for BlockMin post-scale addition");
+        // Q8_1: no pre-scale subtraction (no AWQ/GPTQ style zero-point)
         let has_sub = trace.iter().any(|op| matches!(op, TraceOp::Sub(_, _)));
-        assert!(!has_sub, "Q8_1 should NOT have Sub (ZeroLayout::None)");
+        assert!(!has_sub, "Q8_1 should NOT have Sub (no PreScaleSubtract zero-point)");
 
         // Q8_1: no high bits pointer needed
         let builder = DecodeTraceBuilder::new(desc, 8);
@@ -2304,6 +2316,7 @@ mod tests {
     // Q4_1 BlockScalarWithMin: verifies the d and m fields are both loaded via
     // QuantLoadF16toF32. Q4_1 uses BlockScalarWithMin (d_offset for scale, m for min)
     // and QuantInterleave for PackedNibbles unpack.
+    // The m field is loaded via ZeroLayout::BlockMin → PostScaleAdd (value = d*quantized + m).
     #[test]
     fn test_q4_1_block_scalar_with_min_structure() {
         // Arrange
@@ -2314,11 +2327,11 @@ mod tests {
         let mut trace = Vec::new();
         let _slot = DecodeTraceBuilder::new(desc, 8).build(&mut trace);
 
-        // Assert: Q4_1 has f16 scale load
+        // Assert: Q4_1 has f16 scale load (d) and f16 min load (m) → 2 QuantLoadF16toF32
         let f16_count = trace.iter()
             .filter(|op| matches!(op, TraceOp::QuantLoadF16toF32 { .. }))
             .count();
-        assert!(f16_count >= 1, "Q4_1 should load at least 1 f16 value (d), got {}", f16_count);
+        assert!(f16_count >= 2, "Q4_1 should load 2 f16 values (d + m), got {}", f16_count);
 
         // Assert: Q4_1 has QuantConcatSeq for PackedNibbles
         let has_concat = trace.iter().any(|op| matches!(op, TraceOp::QuantConcatSeq { .. }));
@@ -2327,6 +2340,10 @@ mod tests {
         // Assert: Q4_1 has QuantBroadcast for scale
         let has_broadcast = trace.iter().any(|op| matches!(op, TraceOp::QuantBroadcast { .. }));
         assert!(has_broadcast, "Q4_1 should have QuantBroadcast for scale vector");
+
+        // Assert: Q4_1 has Add for BlockMin post-scale addition (value = d*quantized + m)
+        let has_add = trace.iter().any(|op| matches!(op, TraceOp::Add(_, _)));
+        assert!(has_add, "Q4_1 should have Add for BlockMin post-scale addition");
     }
 
     // @trace TEST-QD-32 [req:REQ-QCG] [level:unit]
@@ -3204,9 +3221,9 @@ mod tests {
             }
         }
 
-        // Assert: Q4_1 has no post-scale Add
+        // Assert: Q4_1 has post-scale Add for BlockMin (value = d*quantized + m)
         let has_add = trace.iter().any(|op| matches!(op, TraceOp::Add(_, _)));
-        assert!(!has_add, "Q4_1 should NOT have post-scale Add");
+        assert!(has_add, "Q4_1 should have Add for BlockMin post-scale addition (value = d*quantized + m)");
     }
 
     // @trace TEST-QD-61 [req:REQ-QCG] [level:unit]

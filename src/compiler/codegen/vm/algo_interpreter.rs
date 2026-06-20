@@ -24,14 +24,19 @@ use crate::compiler::codegen::vm::instr::BoundExpr;
 use std::collections::HashMap;
 
 /// 模板参数表 — 将参数名解析为具体值
+///
+/// 支持两类参数:
+/// - `usize` 值: 用于维度/循环边界/步长等整数参数
+/// - `f64` 值: 用于浮点常量如 norm epsilon, 从图元数据传播
 #[derive(Debug, Clone)]
 pub struct ParamTable {
     values: HashMap<String, usize>,
+    f64_values: HashMap<String, f64>,
 }
 
 impl ParamTable {
     pub fn new() -> Self {
-        Self { values: HashMap::new() }
+        Self { values: HashMap::new(), f64_values: HashMap::new() }
     }
 
     pub fn from_template(_template: &AlgoTemplate) -> Self {
@@ -48,6 +53,18 @@ impl ParamTable {
 
     pub fn resolve(&self, name: &str) -> usize {
         self.values.get(name).copied().unwrap_or(1)
+    }
+
+    /// Set a floating-point parameter (e.g. norm epsilon from NormSpec.eps).
+    pub fn set_f64(&mut self, name: &str, value: f64) {
+        self.f64_values.insert(name.to_string(), value);
+    }
+
+    /// Resolve a floating-point parameter by name.
+    /// Returns `None` if the parameter is not set — the caller must decide
+    /// whether to error or use a default.
+    pub fn resolve_f64(&self, name: &str) -> Option<f64> {
+        self.f64_values.get(name).copied()
     }
 }
 
@@ -629,6 +646,16 @@ impl TemplateInterpreter {
             AlgoTraceStep::LoadConst { value } => {
                 ops.push(TraceOp::Const(*value));
             }
+            AlgoTraceStep::LoadParam { name } => {
+                let value = self.params.resolve_f64(name).unwrap_or_else(|| {
+                    panic!(
+                        "AlgoTraceStep::LoadParam(\"{}\"): parameter not set in ParamTable. \
+                         Call params.set_f64(\"{}\", value) before template instantiation.",
+                         name, name
+                    )
+                });
+                ops.push(TraceOp::Const(value));
+            }
             AlgoTraceStep::BinOp { op, dst: _, a, b } => {
                 let a_slot = env.get(a);
                 let b_slot = env.get(b);
@@ -740,7 +767,8 @@ mod tests {
 
     #[test]
     fn test_interpret_norm_rms() {
-        let params = ParamTable::new();
+        let mut params = ParamTable::new();
+        params.set_f64("eps", 1e-6); // eps from NormSpec, propagated via ParamTable
         let mut interp = TemplateInterpreter::new(params);
         let inputs = TemplateInputs::norm();
         let ops = interp.instantiate(
@@ -911,7 +939,8 @@ mod tests {
         use crate::compiler::trace::QuantPrecision;
 
         let inputs = TemplateInputs::norm();
-        let params = ParamTable::new();
+        let mut params = ParamTable::new();
+        params.set_f64("eps", 1e-6); // eps from NormSpec, propagated via ParamTable
         let mut interp = TemplateInterpreter::new(params);
         let ops = interp.instantiate(
             &crate::compiler::codegen::vm::algo_templates::attention_norm_rope_moe::NORM_RMS,

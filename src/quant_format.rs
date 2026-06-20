@@ -214,6 +214,14 @@ pub enum ZeroLayout {
     },
     /// Static integer subtraction (e.g. Q4_0: nibble - 8, Q6_K: q - 32).
     StaticBias { value: i32 },
+    /// Q4_1 / Q5_1 / Q8_1: block-level min offset added AFTER scale.
+    /// `value = d * quantized + m` where m is a scalar f16 at `offset_bytes`.
+    /// Unlike `BlockScalar` (which is PreScaleSubtract for AWQ/GPTQ),
+    /// this is PostScaleAdd: the min is added after scaling.
+    BlockMin {
+        offset_bytes: usize,
+        dtype: ScaleDType,
+    },
 }
 
 #[derive(Debug, Clone)]
@@ -358,6 +366,7 @@ impl QuantFormatRegistry {
         });
 
         // Q4_1: d(f16) + m(f16) + qs[16] = 20 bytes
+        // value = d * quantized + m  (BlockScalarWithMin scale + BlockMin zero)
         self.insert(QuantFormatDescriptor {
             name: "Q4_1",
             quant_type: QuantType::Q4_1,
@@ -369,7 +378,7 @@ impl QuantFormatRegistry {
                 m_offset: 2,
                 dtype: ScaleDType::F16,
             },
-            zero_layout: ZeroLayout::None,
+            zero_layout: ZeroLayout::BlockMin { offset_bytes: 2, dtype: ScaleDType::F16 },
             data_layout: DataLayout::PackedNibbles { offset: 4, low_first: true },
             data_kind: QuantDataKind::PackedInt4,
             codebook: None,
@@ -398,6 +407,7 @@ impl QuantFormatRegistry {
         });
 
         // Q5_1: d + m + qh[4] + qs[16] = 24 bytes
+        // value = d * quantized + m  (BlockScalarWithMin scale + BlockMin zero)
         self.insert(QuantFormatDescriptor {
             name: "Q5_1",
             quant_type: QuantType::Q5_1,
@@ -409,7 +419,7 @@ impl QuantFormatRegistry {
                 m_offset: 2,
                 dtype: ScaleDType::F16,
             },
-            zero_layout: ZeroLayout::None,
+            zero_layout: ZeroLayout::BlockMin { offset_bytes: 2, dtype: ScaleDType::F16 },
             data_layout: DataLayout::NibbleWithHighBits {
                 low_offset: 8,
                 high_offset: 4,
@@ -438,6 +448,7 @@ impl QuantFormatRegistry {
         });
 
         // Q8_1: d(f16) + s(f16) + qs[32 i8] = 36 bytes
+        // value = d * quantized + m  (BlockScalarWithMin scale + BlockMin zero)
         self.insert(QuantFormatDescriptor {
             name: "Q8_1",
             quant_type: QuantType::Q8_1,
@@ -449,7 +460,7 @@ impl QuantFormatRegistry {
                 m_offset: 2,
                 dtype: ScaleDType::F16,
             },
-            zero_layout: ZeroLayout::None,
+            zero_layout: ZeroLayout::BlockMin { offset_bytes: 2, dtype: ScaleDType::F16 },
             data_layout: DataLayout::Bytes { offset: 4, signed: true },
             data_kind: QuantDataKind::Int8,
             codebook: None,

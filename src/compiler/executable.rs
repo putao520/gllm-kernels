@@ -36,6 +36,12 @@ pub struct CompiledLayer {
     /// RoPE cos/sin 表需求 (ARCH-ROPE-CACHE)。
     /// Some 表示 kernel 依赖预填 cos/sin 表,caller 必须按 layout 写入 scratchpad。
     pub rope_cache: Option<crate::compiler::codegen::RopeCacheRequirement>,
+    /// Logits region offset within scratchpad. All graphs (generate and non-generate)
+    /// write output to scratchpad[logits_scratch_offset]. Callers must read results from there.
+    pub logits_scratch_offset: usize,
+    /// Number of f32 output elements (for execute_as_mega_kernel post-copy).
+    /// 0 means no post-copy (generate graphs write tokens via StoreToken).
+    pub output_float_elems: usize,
     /// Hot patch registry (optional, for runtime code modification)
     hotpatch_registry: Option<HotPatchRegistry>,
 }
@@ -60,6 +66,8 @@ impl CompiledLayer {
             config_hash,
             weight_layout: None,
             rope_cache: None,
+            logits_scratch_offset: 0,
+            output_float_elems: 0,
             hotpatch_registry,
         })
     }
@@ -130,6 +138,14 @@ impl CompiledLayer {
             std::ptr::null(),      // arg 20: page_table_ptr
             std::ptr::null(),      // arg 21: batch_ctx_ptr
         );
+        // Post-execution: copy output from scratchpad logits region to caller's output buffer.
+        // All graphs write their output tensor to scratchpad[logits_scratch_offset].
+        // For non-generate graphs (output_float_elems > 0), copy back to the ABI output arg.
+        if self.output_float_elems > 0 {
+            let src = scratchpad.add(self.logits_scratch_offset) as *const f32;
+            let dst = output as *mut f32;
+            std::ptr::copy_nonoverlapping(src, dst, self.output_float_elems);
+        }
     }
 
     /// Register a hot-patchable jump point.

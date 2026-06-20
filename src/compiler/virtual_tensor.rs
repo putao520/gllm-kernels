@@ -149,11 +149,8 @@ impl DataFlowOptimizer {
         graph: &CompilerGraph,
         plan: &FusionPlan,
         layout: Option<&LayoutAssignment>,
-        profile: &DeviceProfile,
+        _profile: &DeviceProfile,
     ) -> VirtualTensorMap {
-        let mut opportunities = Vec::new();
-        let mut virtual_map = HashMap::new();
-        let mut physical_set = HashSet::new();
         let mut pack_maps = HashMap::new();
 
         // §0.2.7: 推导 PackMap — 从 LayoutConstraint 转换为虚拟权重索引映射
@@ -184,60 +181,24 @@ impl DataFlowOptimizer {
             }
         }
 
-        // Step 1: 分析每个 tensor 的 def-use 链
-        for tensor in &graph.tensors {
-            let tid = tensor.id;
-
-            // 跳过图输入 (权重/activation — 已经物理化)
-            if tensor.producer.is_none() {
-                physical_set.insert(tid);
-                continue;
-            }
-
-            // 分析消费者情况
-            let consumers = &tensor.consumers;
-
-            // Step 2: 检查是否可虚拟化
-            if let Some(opportunity) = analyze_virtual_opportunity(graph, tid, consumers, plan, layout) {
-                opportunities.push(opportunity);
-            } else {
-                physical_set.insert(tid);
-            }
-        }
-
-        // Step 3: Global Greedy — 按收益排序, 贪心选择
-        opportunities.sort_by(|a, b| b.benefit.cmp(&a.benefit));
-
-        let mut claimed_sources: HashSet<TensorId> = HashSet::new();
-        let mut total_saved = 0;
-
-        for opp in opportunities {
-            // 冲突检测: 一个 tensor 只能有一个虚拟来源
-            // 一个 source 不能被多个虚拟 tensor 引用 (除非 Type I 零成本)
-            if !opp.index_map.is_type_i_for(profile) && claimed_sources.contains(&opp.source) {
-                physical_set.insert(opp.tid);
-                continue;
-            }
-
-            let elem_bytes = graph.tensor(opp.tid)
-                    .map(|t| t.dtype.size_bytes())
-                    .unwrap_or(4);
-            virtual_map.insert(opp.tid, VirtualTensor {
-                source: opp.source,
-                index_map: opp.index_map,
-                byte_offset: 0,
-                num_elements: opp.benefit / (elem_bytes.max(1) * 2),
-                elem_bytes,
-            });
-            claimed_sources.insert(opp.source);
-            total_saved += opp.benefit;
-        }
-
+        // 回归修复 (缺陷 B): VTC 虚拟化的 tensor 被 lower_op 独立
+        // materialize (emit_standalone_op → lower_op), 但 build_tensor_sources
+        // 不处理 vtm (virtual → physical_root source 映射缺失), 导致写入目标
+        // (GEMM/attention 的输出 tensor) 复用只读 physical_root source → GEMM
+        // 把结果写到只读权重/输入 buffer → 堆损坏 (valgrind: Invalid write of
+        // size 8 to block of size 4; addr2line: JIT 写到 aho_corasick 库内存)。
+        //
+        // 治本: 禁用 VTC 虚拟化 (virtual_map 恒空), 所有 tensor 独立物化分配
+        // buffer, 保证写入正确性。pack_maps 保留 — 它是编译时 stride 计算
+        // (§0.2.7 虚拟权重), 不涉及运行时 buffer 复用, 与本回归无关。
+        //
+        // VTC 优化待后续重新正确集成: consumer op 的 lowering 应用 IndexMap +
+        // 可写 buffer 保证, 而非 build_tensor_sources 的简单 source 继承。
+        // 保留 plan 参数供未来重新启用 (analyze_virtual_opportunity 仍存在)。
+        let _ = (graph, plan);
         VirtualTensorMap {
-            virtual_map,
-            physical_set,
-            bytes_saved: total_saved,
             pack_maps,
+            ..VirtualTensorMap::empty()
         }
     }
 }

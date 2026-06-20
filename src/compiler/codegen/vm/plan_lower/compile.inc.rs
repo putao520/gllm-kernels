@@ -116,7 +116,7 @@ pub fn compile_layer_with_sym_map(
         let _ = std::fs::create_dir_all(&dir);
         let anchor = plan.groups.first()
             .and_then(|g| graph.op(g.anchor))
-            .map(|op| format!("{:?}", op.op_v2).chars().take(30).collect::<String>())
+            .map(|op| format!("{:?}", op.op).chars().take(30).collect::<String>())
             .unwrap_or_else(|| "unknown".to_string())
             .replace(|c: char| !c.is_alphanumeric(), "_");
         let path = format!("{}/{:04}_{}.pre.txt", dir, idx, anchor);
@@ -142,7 +142,7 @@ pub fn compile_layer_with_sym_map(
         let _ = std::fs::create_dir_all(&dir);
         let anchor = plan.groups.first()
             .and_then(|g| graph.op(g.anchor))
-            .map(|op| format!("{:?}", op.op_v2).chars().take(30).collect::<String>())
+            .map(|op| format!("{:?}", op.op).chars().take(30).collect::<String>())
             .unwrap_or_else(|| "unknown".to_string())
             .replace(|c: char| !c.is_alphanumeric(), "_");
         let path = format!("{}/{:04}_{}.txt", dir, idx, anchor);
@@ -156,6 +156,19 @@ pub fn compile_layer_with_sym_map(
             pairs.sort_by_key(|(v, _)| v.0);
             for (vreg, phys) in pairs {
                 writeln!(f, "  v{} → {:?}", vreg.0, phys).ok();
+            }
+            writeln!(f, "\n=== Spill Slots ===").ok();
+            writeln!(f, "  total_spills={}", alloc_result.spills.len()).ok();
+            for (i, spill) in alloc_result.spills.iter().enumerate() {
+                writeln!(f, "  slot[{}]: vreg={} offset={} size={}", i, spill.vreg.0, spill.offset, spill.size).ok();
+            }
+            writeln!(f, "\n=== Spill Offset → VReg ===").ok();
+            for (i, spill) in alloc_result.spills.iter().enumerate() {
+                if spill.vreg.0 != u32::MAX {
+                    // Calculate rbp_offset for this spill
+                    let rbp_off = -(88 + spill.offset as i32 + spill.size as i32);
+                    writeln!(f, "  offset={} → slot[{}] vreg={} rbp_off={}", spill.offset, i, spill.vreg.0, rbp_off).ok();
+                }
             }
         }
     }
@@ -277,8 +290,8 @@ pub(crate) fn extract_op_trace(
     registry: Option<&ScalarOpRegistry>,
     graph: &CompilerGraph,
 ) -> Result<Vec<TraceOp>, CompilerError> {
-    // OE-4: 从 Op (单 IR) 派生 OpKindKey
-    let key = Some(ScalarOpRegistry::key_from_op(&op.op_v2));
+    // 从 Op (单 IR) 派生 OpKindKey
+    let key = Some(ScalarOpRegistry::key_from_op(&op.op));
 
     // 从 registry 查询 SymExec trace
     if let (Some(reg), Some(k)) = (registry, &key) {
@@ -297,7 +310,7 @@ pub(crate) fn extract_op_trace(
             //   → IR (per-op Const 重写) → ISA Lowering
             //
             // 不是 fallback, 是 ComputePattern 自动分发 IR 层的合法常量折叠。
-            if let Some(Op::SwiGluClipped { limit }) = op.op_v2_resolved(graph) {
+            if let Some(Op::SwiGluClipped { limit }) = op.op_resolved(graph) {
                 rewrite_swiglu_clipped_limit(&mut body, limit);
             }
 
@@ -307,7 +320,7 @@ pub(crate) fn extract_op_trace(
 
     // 没有 registry 或 registry 中没有该算子 → 返回 Err
     // (除了 Reshape/Transpose 是元数据操作，不需要 trace)
-    match op.op_v2_resolved(graph) {
+    match op.op_resolved(graph) {
         Some(Op::Reshape { .. }) | Some(Op::Transpose { .. }) | Some(Op::SliceView { .. }) => Ok(vec![]),
         // Gather has its own dedicated lower path, no scalar trace needed
         Some(Op::Gather { .. }) => Ok(vec![]),
@@ -345,7 +358,7 @@ pub(crate) fn extract_op_trace(
             format!(
                 "extract_op_trace: Op {:?} 没有在 ScalarOpRegistry 中注册。\
                  违反 §14.1 四阶段管线铁律——所有算子必须走 Scalar→SymExec→TraceOp 管线。",
-                op.op_v2
+                op.op
             )
         )),
     }
@@ -439,15 +452,15 @@ fn try_auto_dispatch_elementwise(
 
     // Residual with telemetry needs fused compute+telemetry loop (emit_residual_with_telemetry),
     // not separate elementwise + post-hook. Skip auto-dispatch in that case.
-    if matches!(op.op_v2_resolved(graph), Some(Op::Residual)) && graph.telemetry.residual_cosine_sim {
+    if matches!(op.op_resolved(graph), Some(Op::Residual)) && graph.telemetry.residual_cosine_sim {
         return Ok(false);
     }
 
     // Ops with dedicated dispatch paths must be excluded from auto-dispatch.
     // - Structural ops: Injective traces are skeletal, need dedicated lowering
-    // - NormLike/Reduction ops: dedicated lower_op_v2 paths with
+    // - NormLike/Reduction ops: dedicated lower_op paths with
     //   specialized weight/bias handling not supported by generic emission
-    if matches!(op.op_v2_resolved(graph),
+    if matches!(op.op_resolved(graph),
         Some(Op::ColumnSlice { .. }) | Some(Op::Gather { .. }) |
         Some(Op::DepthwiseConv1D { .. }) | Some(Op::PatchEmbed { .. }) |
         Some(Op::LearnedPos2D { .. }) |
@@ -466,8 +479,8 @@ fn try_auto_dispatch_elementwise(
         None => return Ok(false),
     };
 
-    // OE-4: 从 Op (单 IR) 派生 OpKindKey
-    let key = ScalarOpRegistry::key_from_op(&op.op_v2);
+    // 从 Op (单 IR) 派生 OpKindKey
+    let key = ScalarOpRegistry::key_from_op(&op.op);
 
     let trace = match reg.get_trace(&key) {
         Some(t) => t,
@@ -475,7 +488,7 @@ fn try_auto_dispatch_elementwise(
     };
 
     // 仅 dispatch Elementwise / BinaryElementwise / Injective 模式
-    // NormLike/Gemm 由 lower_op_v2 处理
+    // NormLike/Gemm 由 lower_op 处理
     // Injective 仅支持 num_inputs ≤ 2（emit_injective_inline 最多 2 输入）
     // 和 num_outputs ≤ 1（通用 elementwise 单输出）。
     let body = match &trace.pattern {
@@ -502,12 +515,12 @@ fn try_auto_dispatch_elementwise(
         return Ok(false);
     }
 
-    // Op v2 参数化 trace 重写 (与 extract_op_trace 逻辑一致)
+    // Op 参数化 trace 重写 (与 extract_op_trace 逻辑一致)
     let mut body = body;
-    if let Some(Op::SwiGluClipped { limit }) = op.op_v2_resolved(graph) {
+    if let Some(Op::SwiGluClipped { limit }) = op.op_resolved(graph) {
         rewrite_swiglu_clipped_limit(&mut body, limit);
     }
-    if let Some(Op::LogitSoftcap { cap }) = op.op_v2_resolved(graph) {
+    if let Some(Op::LogitSoftcap { cap }) = op.op_resolved(graph) {
         rewrite_logit_softcap_cap(&mut body, cap);
     }
 
@@ -582,7 +595,7 @@ fn try_dispatch_normlike(
         .cloned()
         .or_else(|| out_shape.first().map(|d| ctx.session.sym_map.to_bound(d)))
         .unwrap_or(BoundExpr::Const(1));
-    let norm_kind = match op.op_v2_resolved(graph).and_then(|o| o.norm_meta()) {
+    let norm_kind = match op.op_resolved(graph).and_then(|o| o.norm_meta()) {
         Some(meta) => match meta.variant {
             crate::compiler::graph::NormVariant::RmsNorm => NormKind::RmsNorm,
             crate::compiler::graph::NormVariant::HeadRmsNorm => NormKind::HeadRmsNorm,
@@ -624,8 +637,8 @@ pub(crate) fn try_dispatch_reduction(
         _ => return Ok(false),
     };
 
-    // 从 Op v2 提取几何参数（胖 opcode 自描述）
-    let geom = match op.op_v2_resolved(graph).and_then(|o| o.reduction_geometry()) {
+    // 从 Op 提取几何参数（胖 opcode 自描述）
+    let geom = match op.op_resolved(graph).and_then(|o| o.reduction_geometry()) {
         Some(g) => g,
         None => return Ok(false),
     };
@@ -634,7 +647,7 @@ pub(crate) fn try_dispatch_reduction(
         BoundExpr::Const(1)
     } else if let Some(override_bound) = seq_bound_override.cloned() {
         override_bound
-    } else if matches!(op.op_v2_resolved(graph), Some(Op::L2Normalize { .. })) {
+    } else if matches!(op.op_resolved(graph), Some(Op::L2Normalize { .. })) {
         BoundExpr::Const(1)
     } else {
         let input_dim = op.inputs.first()
@@ -696,11 +709,18 @@ pub(crate) fn try_dispatch_reduction(
             prog.emit(VmInstr::Broadcast { dst: scale, src: ScalarExpr::Const(inv_n), width, dtype: ctx.dtype, });
         }
         BoundExpr::Runtime(ptr_expr) => {
-            // Runtime: emit scale = 1.0 (sum only), Rust post-processing divides by seq_len.
-            // This avoids IndexToScalar VReg allocation issues in forward-only compilation.
-            // The normalize trace multiplies acc by scale, so scale=1.0 means acc = sum.
-            let _ = ptr_expr;
-            prog.emit(VmInstr::Broadcast { dst: scale, src: ScalarExpr::Const(1.0), width, dtype: ctx.dtype, });
+            // Runtime: load seq_len from stack/ABI, convert to float, compute 1/N.
+            // ptr_expr points to an integer (i32/u32) in memory — LoadPtr reads it
+            // into a GPR, then IndexToScalar converts to f32 for 1/N division.
+            let n_gpr = prog.alloc_vreg(VRegKind::Ptr, SimdWidth::Scalar);
+            prog.emit(VmInstr::LoadPtr { dst: n_gpr, src: ptr_expr.clone() });
+            let n_float = prog.alloc_vreg(VRegKind::Vec, SimdWidth::Scalar);
+            prog.emit(VmInstr::IndexToScalar { dst: n_float, src: n_gpr });
+            let n_vec = prog.alloc_vreg(VRegKind::Vec, width);
+            prog.emit(VmInstr::Broadcast { dst: n_vec, src: ScalarExpr::VReg(n_float), width, dtype: ctx.dtype, });
+            let ones = prog.alloc_vreg(VRegKind::Vec, width);
+            prog.emit(VmInstr::Broadcast { dst: ones, src: ScalarExpr::Const(1.0), width, dtype: ctx.dtype, });
+            prog.emit(VmInstr::VecBinOp { dst: scale, a: ones, b: n_vec, op: VecOp::Div, dtype: ctx.dtype, });
         }
         BoundExpr::DynamicVReg(vreg) => {
             // DynamicVReg: 外层 loop counter 的 GPR 值通过 IndexToScalar 转为 float,
@@ -804,7 +824,7 @@ fn emit_injective_inline(
 ///   覆盖: Silu, Gelu, Tanh, Sigmoid, Relu, Add, Mul, SwiGlu, GeGlu, MeanPool,
 ///   Residual (no telemetry), LogitSoftcap 等。
 ///
-/// Layer 2: `lower_op_v2` — 胖 opcode 驱动，所有 NormLike/Gemm/Attention/MoE/Structural
+/// Layer 2: `lower_op` — 胖 opcode 驱动，所有 NormLike/Gemm/Attention/MoE/Structural
 ///   算子通过 Op Spec struct 自描述参数，直接 emit VmInstr。
 ///   包括: RmsNorm, LayerNorm, ValueNorm, QkNorm, HeadRmsNorm, Softmax, Gemm/GemmBias,
 ///   MHA, CachedGqa, MlaAttention, RoPE, MoE, Argmax, StoreToken, WriteLogits, etc.
@@ -837,22 +857,22 @@ pub(super) fn emit_standalone_op(
         // ── Telemetry post-hooks for elementwise ops ──
         // §13.5 SiLU dead neuron telemetry: post-hook after auto-dispatch.
         // Residual telemetry is NOT a post-hook — it needs fused compute+telemetry loop,
-        // handled by lower_op_v2 when graph.telemetry.residual_cosine_sim is true.
-        if matches!(op.op_v2_resolved(graph), Some(Op::Silu)) && graph.telemetry.silu_dead_neuron {
+        // handled by lower_op when graph.telemetry.residual_cosine_sim is true.
+        if matches!(op.op_resolved(graph), Some(Op::Silu)) && graph.telemetry.silu_dead_neuron {
             let (out_shape, _) = infer_output_shape_sym(op, graph)?;
             emit_silu_dead_neuron_telemetry(prog, input_ptr, &out_shape, width, sym_map, ctx.dtype)?;
         }
         return Ok(());
     }
 
-    // ── Op v2 dispatch (胖 opcode 驱动) ──
-    if lower_op_v2(prog, op, graph, ctx, resolver, abi)? {
+    // ── Op dispatch (胖 opcode 驱动) ──
+    if lower_op(prog, op, graph, ctx, resolver, abi)? {
         return Ok(());
     }
 
-    // lower_op_v2 未处理 → 报错（所有 ops 应通过 lower_op_v2 处理）
+    // lower_op 未处理 → 报错（所有 ops 应通过 lower_op 处理）
     Err(CompilerError::CodegenViolation(format!(
-        "emit_standalone_op: op {:?} 未被 lower_op_v2 处理", op.op_v2
+        "emit_standalone_op: op {:?} 未被 lower_op 处理", op.op
     )))
 }
 
@@ -865,7 +885,7 @@ pub(super) fn emit_standalone_op(
 /// GEMM 维度提取——保留完整 SymDim（ARCH-SYMDIM-NO-UNWRAP）。
 /// 返回 (m_sym, n, k)。调用方通过 sym_map.to_bound(&m_sym) 获取循环 bound。
 pub(super) fn extract_gemm_dims_sym(op: &crate::compiler::graph::CompilerOp, graph: &CompilerGraph) -> Result<(SymDim, usize, usize), CompilerError> {
-    op.op_v2_gemm_dims(graph).ok_or_else(|| CompilerError::CodegenViolation(format!("not a GEMM op: {:?}", op.op_v2)))
+    op.op_gemm_dims(graph).ok_or_else(|| CompilerError::CodegenViolation(format!("not a GEMM op: {:?}", op.op)))
 }
 
 /// 从 FusionGroup 的 epilogue ops 收集合并的 TraceOp 链。
@@ -930,14 +950,14 @@ pub(crate) fn infer_output_shape_sym(op: &crate::compiler::graph::CompilerOp, gr
 /// RmsNorm / ValueNorm 的标量 pattern。LayerNorm 不用此 pattern — 它走
 /// RmsNorm/ValueNorm NormLike pattern builder (LayerNorm uses emit_layernorm_auto)。
 pub(crate) fn build_norm_pattern(op: &crate::compiler::graph::CompilerOp, graph: &CompilerGraph) -> Result<ComputePattern, CompilerError> {
-    let meta = op.op_v2_resolved(graph).and_then(|o| o.norm_meta())
+    let meta = op.op_resolved(graph).and_then(|o| o.norm_meta())
         .ok_or_else(|| CompilerError::CodegenViolation(
-            format!("build_norm_pattern: expected NormLike op, got op {:?}", op.op_v2)
+            format!("build_norm_pattern: expected NormLike op, got op {:?}", op.op)
         ))?;
     // 仅 RmsNorm/ValueNorm 走 build_norm_pattern（LayerNorm 走 emit_layernorm_auto）
     if !matches!(meta.variant, crate::compiler::graph::NormVariant::RmsNorm | crate::compiler::graph::NormVariant::ValueNorm) {
         return Err(CompilerError::CodegenViolation(
-            format!("build_norm_pattern: only RmsNorm/ValueNorm supported, got {:?}", op.op_v2)
+            format!("build_norm_pattern: only RmsNorm/ValueNorm supported, got {:?}", op.op)
         ));
     }
     let eps = meta.eps;
