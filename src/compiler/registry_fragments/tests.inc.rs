@@ -11,6 +11,7 @@ mod tests {
             OpKindKey::Silu,
             OpKindKey::Gelu,
             OpKindKey::Tanh,
+            OpKindKey::Sigmoid,
             OpKindKey::SwiGlu,
             OpKindKey::SwiGluClipped,
             OpKindKey::GeGlu,

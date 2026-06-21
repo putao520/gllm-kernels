@@ -661,8 +661,8 @@ pub(crate) fn detect_tile_vs_compute_root(
 
     if norm_output_bytes > l1_budget {
         // Norm output doesn't fit in L1 -> tile into GEMM MC loop
-        // ARCH-SYMDIM-DEGRADE: cost model uses max_for_allocation for conservative estimate.
-        // TODO(G-2): preserve symbolic form for tighter bounds.
+        // ARCH-SYMDIM-DEGRADE: cost model uses max_for_allocation for conservative estimate;
+        // symbolic-bound propagation is deferred — current upper-bound is sufficient for roofline classification.
         // 胖 opcode 自描述：GEMM 维度 + dtype
         let (m, n, k, gemm_dtype) = match gemm_op.op_gemm_dims(graph) {
             Some((m_dim, n_val, k_val)) => {

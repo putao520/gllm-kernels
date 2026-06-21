@@ -1,5 +1,6 @@
 impl ScalarOpRegistry {
     /// Create a registry pre-populated with all scalar functions and their OpTraces.
+    // @trace REQ-AIS-007 [entity:ENT-AUTO-INSTR-SELECT] [api:POST /compile/scalar-registry-defaults]
     pub fn with_defaults() -> Self {
         use crate::scalar_ops::activations::*;
         use crate::scalar_ops::argmax::*;
@@ -81,6 +82,25 @@ impl ScalarOpRegistry {
                     ],
                 },
                 signature: tanh_sig,
+            },
+        );
+
+        // ── Sigmoid: 1 / (1 + exp(-x)) ──
+        let sigmoid_sig = ScalarFnSignature {
+            fn_ptr: scalar_tanh as *const u8, // placeholder fn_ptr; trace drives codegen
+            params: vec![ScalarParam::InputPtr, ScalarParam::OutputPtr, ScalarParam::Dim(0)],
+        };
+        reg.register_with_symexec_fallback(
+            OpKindKey::Sigmoid,
+            sigmoid_sig.clone(),
+            OpTrace {
+                pattern: ComputePattern::Elementwise {
+                    body: vec![
+                        TraceOp::Input(0),               // [0] x
+                        TraceOp::Sigmoid(ValueId(0)),     // [1] sigmoid(x) = 1/(1+exp(-x))
+                    ],
+                },
+                signature: sigmoid_sig,
             },
         );
 

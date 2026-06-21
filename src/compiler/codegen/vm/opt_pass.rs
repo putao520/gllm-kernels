@@ -23,6 +23,7 @@ pub struct OptStats {
 ///
 /// `run()` 接收完整的硬件上下文 (IsaProfile + IsaHook)，
 /// §13 EpilogueFusion 等 Pass 通过 IsaHook 查询后端策略。
+// @trace REQ-PASS-INV-001 [entity:ENT-COMPILER-GRAPH] [api:POST /compile]
 pub trait VmOptPass: Send + Sync {
     fn name(&self) -> &'static str;
     fn priority(&self) -> u32;
@@ -41,6 +42,7 @@ pub struct PassRegistry {
 impl PassRegistry {
     pub fn new() -> Self { Self { passes: vec![] } }
 
+    // @trace REQ-PASS-INV-002 [entity:ENT-COMPILER-GRAPH] [api:POST /compile]
     pub fn register(&mut self, pass: Box<dyn VmOptPass>) {
         self.passes.push(pass);
     }
@@ -61,6 +63,8 @@ impl PassRegistry {
         reg
     }
 
+    // @trace REQ-PASS-INV-002 [entity:ENT-COMPILER-GRAPH] [api:POST /compile]
+    // @trace REQ-PASS-INV-003 [entity:ENT-COMPILER-GRAPH] [api:POST /compile]
     pub fn run_all(&self, program: &mut VmProgram, profile: &IsaProfile, hook: &dyn IsaHook) -> Vec<OptStats> {
         let mut sorted: Vec<&dyn VmOptPass> = self.passes.iter()
             .filter(|p| p.is_applicable(profile))

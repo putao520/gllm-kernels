@@ -25,6 +25,7 @@ pub struct ReductionSecondPass {
 
 /// Computational pattern — determines how ISA Lowering vectorizes the operator.
 #[derive(Debug, Clone)]
+// @trace REQ-AIS-002 [entity:ENT-AUTO-INSTR-SELECT] [api:POST /compile/compute-pattern]
 pub enum ComputePattern {
     /// `out[i] = f(in[i])` — single-input elementwise.
     Elementwise { body: Vec<TraceOp> },
@@ -92,6 +93,7 @@ impl ComputePattern {
 /// - Only `Input(0)` + unary/const ops → `Elementwise`
 /// - `Input(0)` + `Input(1)` present → `BinaryElementwise`
 /// - 3+ distinct inputs → `Injective`
+// @trace REQ-AIS-007 [entity:ENT-AUTO-INSTR-SELECT] [api:POST /compile/classify-pattern]
 pub fn classify_pattern(body: &[TraceOp]) -> ComputePattern {
     if body.is_empty() {
         return ComputePattern::Injective {
@@ -199,6 +201,7 @@ pub enum TraceOp {
     Max(ValueId, ValueId),
     Min(ValueId, ValueId),
     /// Conditional select: (mask != 0.0) ? true_val : false_val, per-lane.
+    // @trace REQ-AIS-006 [entity:ENT-AUTO-INSTR-SELECT] [api:POST /compile/conditional-select]
     ConditionalBranch(ValueId, ValueId, ValueId),
 
     // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -226,6 +229,7 @@ pub enum TraceOp {
     },
 
     /// 类型转换: F16C vcvtph2ps / ARM fcvtl / PTX cvt.f32.f16
+    // @trace REQ-AIS-003 [entity:ENT-AUTO-INSTR-SELECT] [api:POST /compile/cast]
     Cast {
         src: ValueId,
         from: QuantPrecision,
@@ -236,6 +240,7 @@ pub enum TraceOp {
 
     /// 水平归约: 将向量寄存器归约为标量。
     /// 后端映射: x86 shuffle+hadd / ARM faddp+addv / GPU shfl.sync warp reduce
+    // @trace REQ-AIS-004 [entity:ENT-AUTO-INSTR-SELECT] [api:POST /compile/hreduce]
     HReduce {
         src: ValueId,
         op: ReduceKind,
@@ -272,6 +277,7 @@ pub enum TraceOp {
 
     /// 比较生成掩码: 逐元素比较 a 和 b。
     /// 后端自动选择: AVX-512 k-mask / SVE predicate / GPU predicate
+    // @trace REQ-AIS-003 [entity:ENT-AUTO-INSTR-SELECT] [api:POST /compile/compare]
     Compare {
         a: ValueId,
         b: ValueId,

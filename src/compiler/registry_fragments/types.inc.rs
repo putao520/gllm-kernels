@@ -15,6 +15,7 @@ pub enum OpKindKey {
     Silu,
     Gelu,
     Tanh,
+    Sigmoid,
     SwiGlu,
     /// Clipped SwiGLU (OpenAI gpt-oss-20b).
     /// The `limit` value lives on `Op::SwiGluClipped` itself; the

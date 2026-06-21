@@ -365,6 +365,14 @@ impl ModelConfig {
 ///
 /// Categorizes compilation failures so that downstream (gllm) can distinguish
 /// between register pressure, unsupported ISA, invalid graph structure, etc.
+///
+/// Three-layer error codes (REQ-FAIL-TRIANG-001/002/003):
+/// - `IrLayer`: IR-ERR prefix — graph structure/dtype/shape precondition violations
+/// - `PassLayer`: PASS-ERR prefix — pass invariant violations
+/// - `CodegenLayer`: CG-ERR prefix — ISA emission failures
+///
+/// Fallback errors (REQ-FALLBACK-001/002):
+/// - `UnauthorizedFallback`: non-whitelisted fallback attempts
 #[derive(Debug, Clone)]
 pub enum CompilerError {
     /// Register overflow: too many accumulators/scratch registers needed
@@ -379,6 +387,63 @@ pub enum CompilerError {
     FeatureDisabled(String),
     /// Generic internal error (should be minimized over time)
     Internal(String),
+    /// IR-layer error (REQ-FAIL-TRIANG-001): IR-ERR prefix
+    /// Precondition violation detected in compile() entry pre_check().
+    IrLayer {
+        /// The violated precondition name.
+        precondition: String,
+        /// Position in the IR (OpKind/slot/edge).
+        position: String,
+        /// Expected value.
+        expected: String,
+        /// Actual value observed.
+        actual: String,
+    },
+    /// PASS-layer error (REQ-FAIL-TRIANG-002): PASS-ERR prefix
+    /// Invariant violation detected after pass execution.
+    PassLayer {
+        /// The violated invariant name.
+        invariant: String,
+        /// The pass where the violation was detected.
+        pass_name: String,
+        /// Input graph state before the pass.
+        input_diff: String,
+        /// Output graph state after the pass.
+        output_diff: String,
+    },
+    /// CODEGEN-layer error (REQ-FAIL-TRIANG-003): CG-ERR prefix
+    /// ISA emission failure during codegen.
+    CodegenLayer {
+        /// The failed VmInstr or ISA instruction.
+        vminstr: String,
+        /// The source TraceOp or OpKind that triggered this emission.
+        source_op: String,
+        /// The DeviceProfile in use at time of failure.
+        device_profile: String,
+        /// Register state snapshot (optional, formatted string).
+        register_state: Option<String>,
+    },
+    /// Unauthorized fallback (REQ-FALLBACK-002): non-whitelisted fallback attempt.
+    UnauthorizedFallback {
+        /// The condition that triggered the fallback attempt.
+        trigger: String,
+        /// The fallback path that was attempted.
+        attempted_path: String,
+        /// Suggested fix direction.
+        suggestion: String,
+    },
+    /// Backend capability gate violation (REQ-BACKEND-CAP-003):
+    /// OpKind not supported on the target DeviceProfile.
+    CapabilityUnsupported {
+        /// The unsupported OpKind name.
+        op_kind: String,
+        /// The DeviceProfile label.
+        device_profile: String,
+        /// The capability strategy (always Unsupported when this error is returned).
+        strategy: String,
+        /// Human-readable reason explaining the missing lowering path.
+        reason: String,
+    },
 }
 
 impl fmt::Display for CompilerError {
@@ -394,6 +459,30 @@ impl fmt::Display for CompilerError {
             Self::CodegenViolation(s) => write!(f, "codegen violation: {s}"),
             Self::FeatureDisabled(s) => write!(f, "feature disabled: {s}"),
             Self::Internal(s) => write!(f, "internal: {s}"),
+            Self::IrLayer { precondition, position, expected, actual } => {
+                write!(f, "IR-ERR: precondition '{}' violated at {}: expected '{}', actual '{}'",
+                    precondition, position, expected, actual)
+            }
+            Self::PassLayer { invariant, pass_name, input_diff, output_diff } => {
+                write!(f, "PASS-ERR: invariant '{}' violated in pass '{}': input='{}', output='{}'",
+                    invariant, pass_name, input_diff, output_diff)
+            }
+            Self::CodegenLayer { vminstr, source_op, device_profile, register_state } => {
+                write!(f, "CG-ERR: vminstr='{}', source_op='{}', device_profile='{}'",
+                    vminstr, source_op, device_profile)?;
+                if let Some(rs) = register_state {
+                    write!(f, ", registers=[{}]", rs)?;
+                }
+                Ok(())
+            }
+            Self::UnauthorizedFallback { trigger, attempted_path, suggestion } => {
+                write!(f, "UNAUTHORIZED-FALLBACK: trigger='{}', attempted='{}', fix='{}'",
+                    trigger, attempted_path, suggestion)
+            }
+            Self::CapabilityUnsupported { op_kind, device_profile, strategy, reason } => {
+                write!(f, "CAP-ERR: OpKind '{}' unsupported on DeviceProfile '{}' (strategy={}): {}",
+                    op_kind, device_profile, strategy, reason)
+            }
         }
     }
 }

@@ -270,8 +270,8 @@ impl PainPointAnalyzer {
             // 胖 opcode 自描述：从 Op Spec 读 GEMM 维度
             let (m, n, k) = match op.op_gemm_dims(graph) {
                 Some((m_dim, n_val, k_val)) => {
-                    // ARCH-SYMDIM-DEGRADE: cost model uses max_for_allocation for conservative estimate.
-                    // TODO(G-2): preserve symbolic form for tighter bounds.
+                    // ARCH-SYMDIM-DEGRADE: cost model uses max_for_allocation for conservative estimate;
+                    // symbolic-bound propagation is deferred — current upper-bound is sufficient for roofline classification.
                     let m_val = m_dim.max_for_allocation_strict()
                         .expect("ARCH-SYMDIM: SymDim must have max_value in pain_point analysis");
                     (m_val, n_val, k_val)

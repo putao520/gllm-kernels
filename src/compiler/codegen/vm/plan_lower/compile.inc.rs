@@ -828,6 +828,7 @@ fn emit_injective_inline(
 ///   算子通过 Op Spec struct 自描述参数，直接 emit VmInstr。
 ///   包括: RmsNorm, LayerNorm, ValueNorm, QkNorm, HeadRmsNorm, Softmax, Gemm/GemmBias,
 ///   MHA, CachedGqa, MlaAttention, RoPE, MoE, Argmax, StoreToken, WriteLogits, etc.
+// @trace REQ-AIS-005 [entity:ENT-AUTO-INSTR-SELECT] [api:POST /compile/standalone-op]
 pub(super) fn emit_standalone_op(
     prog: &mut VmProgram,
     op: &crate::compiler::graph::CompilerOp,

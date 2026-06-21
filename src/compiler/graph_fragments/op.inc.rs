@@ -175,6 +175,7 @@ pub enum Op {
     Silu,
     Gelu,
     Tanh,
+    Sigmoid,
     SwiGlu,
     SwiGluClipped { limit: f32 },
     GeGlu,
@@ -295,7 +296,7 @@ impl Op {
             | Op::QkNorm { .. } | Op::L2Normalize { .. } => "norm",
             Op::Gemm(_) | Op::GemmBias(_) | Op::QuantGemm(_)
             | Op::FusedRmsNormGemm { .. } | Op::MaskedGemm { .. } => "gemm",
-            Op::Silu | Op::Gelu | Op::Tanh | Op::SwiGlu | Op::SwiGluClipped { .. } | Op::GeGlu
+            Op::Silu | Op::Gelu | Op::Tanh | Op::Sigmoid | Op::SwiGlu | Op::SwiGluClipped { .. } | Op::GeGlu
             | Op::Add | Op::Mul | Op::ScaleConst { .. } | Op::Residual => "activation",
             Op::MultiHeadAttention(_) | Op::CachedGqa(_) | Op::MlaAttention(_)
             | Op::Softmax | Op::MlaKvCompress { .. } | Op::MlaQAbsorb { .. }

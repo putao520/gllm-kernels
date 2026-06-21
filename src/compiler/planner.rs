@@ -61,6 +61,8 @@ pub struct StrategyBias {
 
 impl StrategyBias {
     /// Clamp every field to its valid range (SPEC §11.1).
+    // @trace REQ-STRATEGY-INTERACT-002 [entity:ENT-STRATEGY-ARBITER] [api:POST /internal/strategy/arbitrate]
+    // @trace REQ-STRATEGY-INTERACT-003 [entity:ENT-STRATEGY-ARBITER] [api:POST /internal/strategy/arbitrate]
     pub fn validate(&mut self) {
         self.fusion_cost_scale = self.fusion_cost_scale.clamp(0.2, 3.0);
         self.pipeline_cost_scale = self.pipeline_cost_scale.clamp(0.2, 3.0);

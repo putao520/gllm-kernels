@@ -49,6 +49,7 @@ fn get_opt_pipeline() -> &'static TracePassPipeline {
 /// 推断的 dtype 写入 VmInstr 的 dtype 字段（而非硬编码 F32）。
 ///
 /// dtype 传播链：TensorMeta.dtype → TypedSlot.dtype → infer_result_dtype → VmInstr.dtype
+// @trace REQ-AIS-001 [entity:ENT-AUTO-INSTR-SELECT] [api:POST /compile/auto-lower-typed]
 pub fn auto_lower_trace_typed(
     prog: &mut VmProgram,
     body: &[TraceOp],
@@ -122,8 +123,10 @@ fn dispatch_trace_op_typed(
         TraceOp::Log(a) => emit_transcendental(prog, &slots, *a, TranscendentalFn::Log, width),
         TraceOp::Sigmoid(a) => emit_transcendental(prog, &slots, *a, TranscendentalFn::Sigmoid, width),
 
+        // @trace REQ-AIS-003 [entity:ENT-AUTO-INSTR-SELECT] [api:POST /compile/compare]
         TraceOp::Compare { a, b, op: cmp_op } => emit_cmp(prog, &slots, *a, *b, *cmp_op, width),
 
+        // @trace REQ-AIS-003 [entity:ENT-AUTO-INSTR-SELECT] [api:POST /compile/cast]
         TraceOp::Cast { src, from, to } => {
             let from_bits = quant_precision_bits(from);
             let to_bits = quant_precision_bits(to);
@@ -132,6 +135,7 @@ fn dispatch_trace_op_typed(
             Ok(r)
         }
 
+        // @trace REQ-AIS-006 [entity:ENT-AUTO-INSTR-SELECT] [api:POST /compile/conditional-select]
         TraceOp::ConditionalBranch(mask, true_val, false_val) => {
             let r = prog.alloc_vreg(VRegKind::Vec, width);
             prog.emit(VmInstr::ConditionalSelect {
@@ -141,6 +145,7 @@ fn dispatch_trace_op_typed(
             Ok(r)
         }
 
+        // @trace REQ-AIS-004 [entity:ENT-AUTO-INSTR-SELECT] [api:POST /compile/hreduce]
         TraceOp::HReduce { src, op: reduce_op } => {
             let red = match reduce_op {
                 ReduceKind::Sum => ReduceOp::Sum,
@@ -194,6 +199,8 @@ fn emit_binop_dtype(
 ///
 /// 内部调用 `auto_lower_trace_raw` 完成实际的 TraceOp→VmInstr 编译。
 /// dtype 通过 `default_dtype` 参数传播到每条 VmInstr。
+// @trace REQ-AIS-001 [entity:ENT-AUTO-INSTR-SELECT] [api:POST /compile/elementwise]
+// @trace REQ-AIS-002 [entity:ENT-AUTO-INSTR-SELECT] [api:POST /compile/elementwise]
 pub fn auto_lower_elementwise(
     prog: &mut VmProgram,
     body: &[TraceOp],
@@ -224,6 +231,8 @@ pub fn auto_lower_elementwise(
 ///
 /// `combine_body`: 第一阶段归约 trace (如 Sum/Max)
 /// `normalize_body`: 可选的逐元素归一化 trace (如 mul by inv_sum)
+// @trace REQ-AIS-001 [entity:ENT-AUTO-INSTR-SELECT] [api:POST /compile/reduction]
+// @trace REQ-AIS-002 [entity:ENT-AUTO-INSTR-SELECT] [api:POST /compile/reduction]
 pub fn auto_lower_reduction(
     prog: &mut VmProgram,
     combine_body: &[TraceOp],
@@ -270,6 +279,8 @@ pub fn auto_lower_reduction(
 /// 这些操作涉及内存寻址、循环控制、多输出，不能走 elementwise 路径。
 ///
 /// dtype 通过 `default_dtype` 参数传播。
+// @trace REQ-AIS-001 [entity:ENT-AUTO-INSTR-SELECT] [api:POST /compile/structural]
+// @trace REQ-AIS-002 [entity:ENT-AUTO-INSTR-SELECT] [api:POST /compile/structural]
 pub fn auto_lower_structural(
     prog: &mut VmProgram,
     body: &[TraceOp],
@@ -287,6 +298,8 @@ pub fn auto_lower_structural(
 /// 核心编译：将 TraceOp SSA body 编译为 VmInstr 序列，返回所有 slot VRegIds。
 ///
 /// 调用方根据需要选择写回策略（auto_lower_trace 或 auto_lower_trace_multi）。
+// @trace REQ-AIS-001 [entity:ENT-AUTO-INSTR-SELECT] [api:POST /compile/raw]
+// @trace REQ-AIS-007 [entity:ENT-AUTO-INSTR-SELECT] [api:POST /compile/raw]
 pub fn auto_lower_trace_raw(
     prog: &mut VmProgram,
     body: &[TraceOp],
@@ -314,6 +327,7 @@ pub fn auto_lower_trace_raw(
 ///
 /// 中间操作仍分配临时寄存器（SSA），仅最终结果直达 dst。
 /// 默认 dtype = F32（向后兼容）。
+// @trace REQ-AIS-001 [entity:ENT-AUTO-INSTR-SELECT] [api:POST /compile/into]
 pub fn auto_lower_trace_into(
     prog: &mut VmProgram,
     body: &[TraceOp],
@@ -397,6 +411,7 @@ fn dispatch_trace_op_into(
 ///
 /// 语义与旧版 auto_lower_trace 完全一致。
 /// 默认 dtype = F32。
+// @trace REQ-AIS-001 [entity:ENT-AUTO-INSTR-SELECT] [api:POST /compile/trace]
 pub fn auto_lower_trace(
     prog: &mut VmProgram,
     body: &[TraceOp],
@@ -431,6 +446,7 @@ pub fn auto_lower_trace(
 ///     → dst_a = add_result, dst_b = inputs[0]
 ///
 /// 默认 dtype = F32。
+// @trace REQ-AIS-001 [entity:ENT-AUTO-INSTR-SELECT] [api:POST /compile/multi]
 pub fn auto_lower_trace_multi(
     prog: &mut VmProgram,
     body: &[TraceOp],
@@ -471,6 +487,7 @@ fn copy_vreg(prog: &mut VmProgram, target: VRegId, src: VRegId, dtype: QuantPrec
 /// - Fma → 专用 VmInstr
 /// - 超越函数 → emit_transcendental (3 个变体共享)
 /// - 未实现 → Error (NO_SILENT_FALLBACK)
+// @trace REQ-AIS-001 [entity:ENT-AUTO-INSTR-SELECT] [api:POST /compile/dispatch]
 fn dispatch_trace_op(
     prog: &mut VmProgram,
     op: &TraceOp,
@@ -545,9 +562,11 @@ fn dispatch_trace_op(
         }
 
         // ── 比较 → VecCmp ──
+        // @trace REQ-AIS-003 [entity:ENT-AUTO-INSTR-SELECT] [api:POST /compile/compare]
         TraceOp::Compare { a, b, op } => emit_cmp(prog, slots, *a, *b, *op, width),
 
         // ── 类型转换 → VecCast ──
+        // @trace REQ-AIS-003 [entity:ENT-AUTO-INSTR-SELECT] [api:POST /compile/cast]
         TraceOp::Cast { src, from, to } => {
             let from_bits = quant_precision_bits(from);
             let to_bits = quant_precision_bits(to);
@@ -562,6 +581,7 @@ fn dispatch_trace_op(
         }
 
         // Conditional select: dst[i] = (mask[i] != 0) ? true_val[i] : false_val[i]
+        // @trace REQ-AIS-006 [entity:ENT-AUTO-INSTR-SELECT] [api:POST /compile/conditional-select]
         TraceOp::ConditionalBranch(mask, true_val, false_val) => {
             let r = prog.alloc_vreg(VRegKind::Vec, width);
             prog.emit(VmInstr::ConditionalSelect {
@@ -572,6 +592,7 @@ fn dispatch_trace_op(
             });
             Ok(r)
         }
+        // @trace REQ-AIS-004 [entity:ENT-AUTO-INSTR-SELECT] [api:POST /compile/hreduce]
         TraceOp::HReduce { src, op } => {
             let reduce_op = match op {
                 ReduceKind::Sum => ReduceOp::Sum,
@@ -1755,6 +1776,7 @@ fn emit_transcendental_into(
     Ok(())
 }
 
+// @trace REQ-AIS-003 [entity:ENT-AUTO-INSTR-SELECT] [api:POST /compile/compare]
 fn emit_cmp(
     prog: &mut VmProgram,
     slots: &[VRegId],
@@ -2132,6 +2154,7 @@ mod tests {
         assert!(prog.instrs.iter().any(|i| matches!(i, VmInstr::VecBinOp { op: VecOp::Min, .. })));
     }
 
+    // @trace REQ-AIS-003 [req:REQ-AIS-003] [level:unit]
     #[test]
     fn compare_produces_vec_cmp() {
         // Arrange: compare a < b
@@ -2233,6 +2256,7 @@ mod tests {
         assert!(result.is_empty());
     }
 
+    // @trace REQ-AIS-003 [req:REQ-AIS-003] [level:unit]
     #[test]
     fn cast_traceop_produces_vec_cast() {
         // Arrange: cast from F16 (16 bits) to F32 (32 bits)
@@ -2250,6 +2274,7 @@ mod tests {
         )));
     }
 
+    // @trace REQ-AIS-006 [req:REQ-AIS-006] [level:unit]
     #[test]
     fn conditional_branch_produces_conditional_select() {
         // Arrange: mask, true_val, false_val
@@ -2265,6 +2290,7 @@ mod tests {
         assert!(prog.instrs.iter().any(|i| matches!(i, VmInstr::ConditionalSelect { .. })));
     }
 
+    // @trace REQ-AIS-004 [req:REQ-AIS-004] [level:unit]
     #[test]
     fn hreduce_sum_produces_hreduce_instr() {
         // Arrange
@@ -2276,6 +2302,7 @@ mod tests {
         assert!(prog.instrs.iter().any(|i| matches!(i, VmInstr::HReduce { op: ReduceOp::Sum, .. })));
     }
 
+    // @trace REQ-AIS-004 [req:REQ-AIS-004] [level:unit]
     #[test]
     fn hreduce_unsupported_kind_returns_error() {
         // Arrange: ArgMax is not supported in auto_select
@@ -2430,6 +2457,7 @@ mod tests {
         assert_eq!(quant_precision_bits(&QuantPrecision::INT4), 4);
     }
 
+    // @trace REQ-AIS-003 [req:REQ-AIS-003] [level:unit]
     #[test]
     fn emit_cmp_all_predicates() {
         use crate::compiler::trace::CmpOp;
@@ -2845,7 +2873,9 @@ mod tests {
     }
 
     // ── REQ-AIS-001: ComputePattern 驱动路由入口函数测试 ──
+    // ── REQ-AIS-007: 全覆盖验证 ──
 
+    // @trace REQ-AIS-007 [req:REQ-AIS-007] [level:unit]
     #[test]
     fn auto_lower_elementwise_accepts_elementwise_pattern() {
         use crate::compiler::trace::ComputePattern;
@@ -3017,6 +3047,7 @@ mod tests {
         )));
     }
 
+    // @trace REQ-AIS-007 [req:REQ-AIS-007] [level:unit]
     #[test]
     fn compute_pattern_driven_dispatch_end_to_end() {
         // Simulate full AIS flow: classify_pattern → route to correct entry

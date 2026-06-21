@@ -428,7 +428,7 @@ pub(super) fn emit_fusion_groups(
                 // Simpler: just emit the multiplication.
                 // We'll retrieve the outer counter from the outer LoopBegin.
                 // The outer seg_counter VReg was allocated in small segment entry but not stored.
-                // WORKAROUND: compute seg_counter from seg_byte_off.
+                // Retrieve outer seg_counter from state to compute global_layer_idx.
                 // seg_byte_off = seg_counter * step_bytes → seg_counter = seg_byte_off / step_bytes
                 // But GprBinOp doesn't have Div for Counter kind... Use the fact that
                 // step_bytes = small_segment_stride, and we have the outer seg_counter

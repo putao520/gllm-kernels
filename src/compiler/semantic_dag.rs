@@ -191,7 +191,7 @@ impl SemanticDAG {
     /// 胖 opcode 自描述 OpClass 分类（OpKind legacy 已删除）。
     fn fallback_op_class_from_op(op: &Op) -> OpClass {
         match op {
-            Op::Silu | Op::Gelu | Op::Tanh | Op::Add | Op::Mul | Op::ScaleConst { .. }
+            Op::Silu | Op::Gelu | Op::Tanh | Op::Sigmoid | Op::Add | Op::Mul | Op::ScaleConst { .. }
             | Op::Residual | Op::LogitSoftcap { .. } | Op::SwiGlu | Op::SwiGluClipped { .. }
             | Op::GeGlu | Op::Dequantize { .. } | Op::WeightedSum { .. }
             | Op::LearnedPos2D { .. } => OpClass::ElemWise,
@@ -226,8 +226,8 @@ impl SemanticDAG {
         }
 
         // Estimate FLOPs
-        // ARCH-SYMDIM-DEGRADE: cost model uses max_for_allocation for conservative estimate.
-        // TODO(G-2): preserve symbolic form for tighter bounds.
+        // ARCH-SYMDIM-DEGRADE: cost model uses max_for_allocation for conservative estimate;
+        // tighter symbolic-bound propagation is a future optimization, current upper-bound is sufficient for roofline classification.
         let flops: usize = match op.op_resolved(graph) {
             Some(Op::Gemm(_)) | Some(Op::QuantGemm(_)) => {
                 let (m, n, k) = op.op_gemm_dims(graph).expect("Gemm/QuantGemm 必有 dims");
@@ -238,7 +238,7 @@ impl SemanticDAG {
                 let m_val = m.max_for_allocation_strict().expect("ARCH-SYMDIM: Symbolic dim must have max_value in cost model");
                 2 * m_val * n * k + m_val * n
             }
-            Some(Op::Silu) | Some(Op::Gelu) | Some(Op::Tanh) => {
+            Some(Op::Silu) | Some(Op::Gelu) | Some(Op::Tanh) | Some(Op::Sigmoid) => {
                 // ~10 FLOPs per element (exp + div + mul)
                 op.outputs
                     .iter()

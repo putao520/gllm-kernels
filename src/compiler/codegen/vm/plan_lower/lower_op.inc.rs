@@ -20,6 +20,7 @@ use super::norm_softmax_emit::{emit_softmax_inline, emit_softmax_telemetry};
 /// 其他类别：Phase 5-7 扩展。
 // @trace REQ-FATOP-014 [entity:Op] [entity:OpKind] lower_op 41 类别零 OpKind 反查
 // @trace REQ-FATOP-018 lowering 路径优先读 Op 缓存
+// @trace REQ-AIS-005 [entity:ENT-AUTO-INSTR-SELECT] [api:POST /compile/lower-op]
 pub(crate) fn lower_op(
     prog: &mut VmProgram,
     op: &CompilerOp,

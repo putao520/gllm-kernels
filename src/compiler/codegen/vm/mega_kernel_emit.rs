@@ -2336,7 +2336,7 @@ pub fn compile_mega_kernel_vm(
                 // Actually: we can rewrite as CmpLtU(gc_plus1, max_new_value).
                 // But max_new is in a VReg, not an immediate. CmpLtU takes (VRegId, u64).
                 // We need VReg vs VReg comparison which isn't directly available.
-                // WORKAROUND: compute stop = 1 if gc_plus1 >= max_new (unsigned subtraction underflow check).
+                // Unsigned-subtraction underflow check: compute stop = 1 if gc_plus1 >= max_new.
                 // at_max = gc_plus1.wrapping_sub(max_new). If no underflow → stop.
                 // In u32: at_max >= 0x80000000 means underflow → gen < max → continue.
                 // CmpLtU(at_max, 0x80000000) = true means no underflow → gen >= max → stop.

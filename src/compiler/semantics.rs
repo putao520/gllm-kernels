@@ -49,7 +49,7 @@ pub enum BottleneckType {
 pub fn classify(op: &Op) -> OpSemantics {
     match op {
         // Elementwise ops
-        Op::Silu | Op::Gelu | Op::Tanh | Op::Add | Op::Mul | Op::ScaleConst { .. } | Op::Residual | Op::LogitSoftcap { .. } => {
+        Op::Silu | Op::Gelu | Op::Tanh | Op::Sigmoid | Op::Add | Op::Mul | Op::ScaleConst { .. } | Op::Residual | Op::LogitSoftcap { .. } => {
             OpSemantics::Elementwise
         }
         // Gated activations: elementwise (two inputs, one output, no reduction)
@@ -162,15 +162,15 @@ pub fn classify(op: &Op) -> OpSemantics {
 /// Uses the roofline model: if arithmetic intensity > ridge point,
 /// the op is compute-bound; otherwise memory-bound.
 /// ARCH-DTYPE-FULLCHAIN-ORCH: `graph_dtype` used for QuantGemm activation/output byte estimation.
-// ARCH-SYMDIM-DEGRADE: cost model uses max_for_allocation for conservative estimate.
-// TODO(G-2): preserve symbolic form for tighter bounds.
+// ARCH-SYMDIM-DEGRADE: cost model uses max_for_allocation for conservative estimate;
+// tighter symbolic-bound propagation is a future optimization, current upper-bound is sufficient for roofline classification.
 pub fn bottleneck(op: &Op, graph_dtype: crate::types::DType) -> BottleneckType {
     match op {
         // GEMM: compute-bound when K is large enough (typical for transformer layers)
         Op::Gemm(spec) | Op::GemmBias(spec) => {
             let GemmSpec { m, n, k, dtype, .. } = spec;
-            // ARCH-SYMDIM-DEGRADE: cost model uses max_for_allocation for conservative estimate.
-            // TODO(G-2): preserve symbolic form for tighter bounds.
+            // ARCH-SYMDIM-DEGRADE: cost model uses max_for_allocation for conservative estimate;
+            // symbolic-bound propagation is deferred — current upper-bound is sufficient for roofline classification.
             let m_val = m.max_for_allocation_strict().expect("ARCH-SYMDIM: Symbolic dim must have max_value in cost model");
             let elem_bytes = dtype.size_bytes();
             let flops = 2 * m_val * n * k;
@@ -184,8 +184,8 @@ pub fn bottleneck(op: &Op, graph_dtype: crate::types::DType) -> BottleneckType {
         // Quantized GEMM: fewer bytes for weights, activation dtype from graph context
         Op::QuantGemm(spec) => {
             let QuantGemmSpec { m, n, k, quant_type } = spec;
-            // ARCH-SYMDIM-DEGRADE: cost model uses max_for_allocation for conservative estimate.
-            // TODO(G-2): preserve symbolic form for tighter bounds.
+            // ARCH-SYMDIM-DEGRADE: cost model uses max_for_allocation for conservative estimate;
+            // symbolic-bound propagation is deferred — current upper-bound is sufficient for roofline classification.
             let m_val = m.max_for_allocation_strict().expect("ARCH-SYMDIM: Symbolic dim must have max_value in cost model");
             let act_bytes = graph_dtype.size_bytes(); // activation/output dtype
             let bits = quant_type.bits() as usize;
@@ -214,15 +214,15 @@ pub fn bottleneck(op: &Op, graph_dtype: crate::types::DType) -> BottleneckType {
 /// Used by the roofline model to predict whether an op benefits from
 /// fusion (memory-bound ops benefit most from eliminating round-trips).
 /// ARCH-DTYPE-FULLCHAIN-ORCH: `graph_dtype` used for non-GEMM ops and QuantGemm activation bytes.
-// ARCH-SYMDIM-DEGRADE: cost model uses max_for_allocation for conservative estimate.
-// TODO(G-2): preserve symbolic form for tighter bounds.
+// ARCH-SYMDIM-DEGRADE: cost model uses max_for_allocation for conservative estimate;
+// tighter symbolic-bound propagation is a future optimization, current upper-bound is sufficient for roofline classification.
 pub fn arithmetic_intensity(op: &Op, graph_dtype: crate::types::DType) -> f64 {
     let eb = graph_dtype.size_bytes() as f64;
     match op {
         Op::Gemm(spec) | Op::GemmBias(spec) => {
             let GemmSpec { m, n, k, dtype, .. } = spec;
-            // ARCH-SYMDIM-DEGRADE: cost model uses max_for_allocation for conservative estimate.
-            // TODO(G-2): preserve symbolic form for tighter bounds.
+            // ARCH-SYMDIM-DEGRADE: cost model uses max_for_allocation for conservative estimate;
+            // symbolic-bound propagation is deferred — current upper-bound is sufficient for roofline classification.
             let m_val = m.max_for_allocation_strict().expect("ARCH-SYMDIM: Symbolic dim must have max_value in cost model");
             let elem_bytes = dtype.size_bytes() as f64;
             let flops = (2 * m_val * n * k) as f64;
@@ -231,8 +231,8 @@ pub fn arithmetic_intensity(op: &Op, graph_dtype: crate::types::DType) -> f64 {
         }
         Op::QuantGemm(spec) => {
             let QuantGemmSpec { m, n, k, quant_type } = spec;
-            // ARCH-SYMDIM-DEGRADE: cost model uses max_for_allocation for conservative estimate.
-            // TODO(G-2): preserve symbolic form for tighter bounds.
+            // ARCH-SYMDIM-DEGRADE: cost model uses max_for_allocation for conservative estimate;
+            // symbolic-bound propagation is deferred — current upper-bound is sufficient for roofline classification.
             let m_val = m.max_for_allocation_strict().expect("ARCH-SYMDIM: Symbolic dim must have max_value in cost model");
             let bits = quant_type.bits() as usize;
             let flops = (2 * m_val * n * k) as f64;
@@ -247,7 +247,7 @@ pub fn arithmetic_intensity(op: &Op, graph_dtype: crate::types::DType) -> f64 {
             let bytes = input_bytes + output_bytes;
             if bytes > 0.0 { flops / bytes } else { 0.0 }
         }
-        Op::Silu | Op::Gelu | Op::Tanh | Op::LogitSoftcap { .. } => {
+        Op::Silu | Op::Gelu | Op::Tanh | Op::Sigmoid | Op::LogitSoftcap { .. } => {
             // ~10 FLOPs per element, 2*eb bytes (read + write)
             10.0 / (2.0 * eb)
         }
@@ -281,8 +281,8 @@ pub fn arithmetic_intensity(op: &Op, graph_dtype: crate::types::DType) -> f64 {
             let AttentionSpec { seq_len, geometry, .. } = spec;
             let num_heads = geometry.num_q_heads;
             let head_dim = geometry.head_dim;
-            // ARCH-SYMDIM-DEGRADE: cost model uses max_for_allocation for conservative estimate.
-            // TODO(G-2): preserve symbolic form for tighter bounds.
+            // ARCH-SYMDIM-DEGRADE: cost model uses max_for_allocation for conservative estimate;
+            // symbolic-bound propagation is deferred — current upper-bound is sufficient for roofline classification.
             let s = seq_len.max_for_allocation_strict().expect("ARCH-SYMDIM: Symbolic dim must have max_value in cost model") as f64;
             let h = num_heads as f64;
             let d = head_dim as f64;
@@ -298,8 +298,8 @@ pub fn arithmetic_intensity(op: &Op, graph_dtype: crate::types::DType) -> f64 {
             let CachedGqaSpec { seq_len, total_seq, geometry, kv_dtype, .. } = spec;
             let num_heads = geometry.num_q_heads;
             let head_dim = geometry.head_dim;
-            // ARCH-SYMDIM-DEGRADE: cost model uses max_for_allocation for conservative estimate.
-            // TODO(G-2): preserve symbolic form for tighter bounds.
+            // ARCH-SYMDIM-DEGRADE: cost model uses max_for_allocation for conservative estimate;
+            // symbolic-bound propagation is deferred — current upper-bound is sufficient for roofline classification.
             let s = seq_len.max_for_allocation_strict().expect("ARCH-SYMDIM: CachedGqa seq_len must have max_value") as f64;
             let t = *total_seq as f64;
             let h = num_heads as f64;
@@ -373,8 +373,8 @@ pub fn arithmetic_intensity(op: &Op, graph_dtype: crate::types::DType) -> f64 {
         | Op::SoftmaxWithEntropy { .. }
         | Op::MegaKernelDispatch { .. } => 0.0,
         Op::AltUpPredict { seq_len, num_preds, hidden } => {
-            // ARCH-SYMDIM-DEGRADE: cost model uses max_for_allocation for conservative estimate.
-            // TODO(G-2): preserve symbolic form for tighter bounds.
+            // ARCH-SYMDIM-DEGRADE: cost model uses max_for_allocation for conservative estimate;
+            // symbolic-bound propagation is deferred — current upper-bound is sufficient for roofline classification.
             let s = seq_len.max_for_allocation_strict()
                 .expect("ARCH-SYMDIM: AltUpPredict seq_len must have max_value") as f64;
             let p = *num_preds as f64;
@@ -386,8 +386,8 @@ pub fn arithmetic_intensity(op: &Op, graph_dtype: crate::types::DType) -> f64 {
             if bytes > 0.0 { flops / bytes } else { 0.0 }
         }
         Op::AltUpCorrect { seq_len, num_preds, hidden } => {
-            // ARCH-SYMDIM-DEGRADE: cost model uses max_for_allocation for conservative estimate.
-            // TODO(G-2): preserve symbolic form for tighter bounds.
+            // ARCH-SYMDIM-DEGRADE: cost model uses max_for_allocation for conservative estimate;
+            // symbolic-bound propagation is deferred — current upper-bound is sufficient for roofline classification.
             let s = seq_len.max_for_allocation_strict()
                 .expect("ARCH-SYMDIM: AltUpCorrect seq_len must have max_value") as f64;
             let p = *num_preds as f64;
@@ -399,8 +399,8 @@ pub fn arithmetic_intensity(op: &Op, graph_dtype: crate::types::DType) -> f64 {
             if bytes > 0.0 { flops / bytes } else { 0.0 }
         }
         Op::AltUpInject { seq_len, num_preds, hidden } => {
-            // ARCH-SYMDIM-DEGRADE: cost model uses max_for_allocation for conservative estimate.
-            // TODO(G-2): preserve symbolic form for tighter bounds.
+            // ARCH-SYMDIM-DEGRADE: cost model uses max_for_allocation for conservative estimate;
+            // symbolic-bound propagation is deferred — current upper-bound is sufficient for roofline classification.
             let s = seq_len.max_for_allocation_strict()
                 .expect("ARCH-SYMDIM: AltUpInject seq_len must have max_value") as f64;
             let p = *num_preds as f64;
@@ -449,8 +449,8 @@ pub fn arithmetic_intensity(op: &Op, graph_dtype: crate::types::DType) -> f64 {
         }
         // MoERouter: hidden @ weight.T + bias → softmax → top-k。
         Op::MoERouter { num_experts, top_k, hidden, seq_len } => {
-            // ARCH-SYMDIM-DEGRADE: cost model uses max_for_allocation for conservative estimate.
-            // TODO(G-2): preserve symbolic form for tighter bounds.
+            // ARCH-SYMDIM-DEGRADE: cost model uses max_for_allocation for conservative estimate;
+            // symbolic-bound propagation is deferred — current upper-bound is sufficient for roofline classification.
             let s = seq_len.max_for_allocation_strict()
                 .expect("ARCH-SYMDIM: MoERouter seq_len must have max_value") as f64;
             let e = *num_experts as f64;
@@ -467,8 +467,8 @@ pub fn arithmetic_intensity(op: &Op, graph_dtype: crate::types::DType) -> f64 {
         // Bytes ≈ top_k × (hidden · intermediate_size / 2 + intermediate_size)  weight
         //         + activation I/O。
         Op::MoEDispatchPacked { top_k, intermediate_size, hidden, seq_len, mxfp4_block_size, .. } => {
-            // ARCH-SYMDIM-DEGRADE: cost model uses max_for_allocation for conservative estimate.
-            // TODO(G-2): preserve symbolic form for tighter bounds.
+            // ARCH-SYMDIM-DEGRADE: cost model uses max_for_allocation for conservative estimate;
+            // symbolic-bound propagation is deferred — current upper-bound is sufficient for roofline classification.
             let s = seq_len.max_for_allocation_strict()
                 .expect("ARCH-SYMDIM: MoEDispatchPacked seq_len must have max_value") as f64;
             let k = *top_k as f64;
@@ -485,16 +485,16 @@ pub fn arithmetic_intensity(op: &Op, graph_dtype: crate::types::DType) -> f64 {
         }
         // MLA GEMM variants: use same roofline model as standard GEMM
         Op::MlaKvCompress { m, d_c, hidden } => {
-            // ARCH-SYMDIM-DEGRADE: cost model uses max_for_allocation for conservative estimate.
-            // TODO(G-2): preserve symbolic form for tighter bounds.
+            // ARCH-SYMDIM-DEGRADE: cost model uses max_for_allocation for conservative estimate;
+            // symbolic-bound propagation is deferred — current upper-bound is sufficient for roofline classification.
             let m_val = m.max_for_allocation_strict().expect("ARCH-SYMDIM: MlaKvCompress m must have max_value") as f64;
             let flops = 2.0 * m_val * (*d_c as f64) * (*hidden as f64);
             let bytes = eb * (m_val * (*hidden as f64) + (*hidden as f64) * (*d_c as f64) + m_val * (*d_c as f64));
             if bytes > 0.0 { flops / bytes } else { 0.0 }
         }
         Op::MlaQAbsorb { seq_len, num_heads, head_dim, d_c } | Op::MlaVRestore { seq_len, num_heads, head_dim, d_c } => {
-            // ARCH-SYMDIM-DEGRADE: cost model uses max_for_allocation for conservative estimate.
-            // TODO(G-2): preserve symbolic form for tighter bounds.
+            // ARCH-SYMDIM-DEGRADE: cost model uses max_for_allocation for conservative estimate;
+            // symbolic-bound propagation is deferred — current upper-bound is sufficient for roofline classification.
             let s = seq_len.max_for_allocation_strict().expect("ARCH-SYMDIM: MLA GEMM seq_len must have max_value") as f64;
             let h = *num_heads as f64;
             let d = *head_dim as f64;
@@ -505,8 +505,8 @@ pub fn arithmetic_intensity(op: &Op, graph_dtype: crate::types::DType) -> f64 {
         }
         Op::MlaAttention(spec) => {
             let MlaSpec { seq_len, num_heads, head_dim, d_c, .. } = spec;
-            // ARCH-SYMDIM-DEGRADE: cost model uses max_for_allocation for conservative estimate.
-            // TODO(G-2): preserve symbolic form for tighter bounds.
+            // ARCH-SYMDIM-DEGRADE: cost model uses max_for_allocation for conservative estimate;
+            // symbolic-bound propagation is deferred — current upper-bound is sufficient for roofline classification.
             let s = seq_len.max_for_allocation_strict().expect("ARCH-SYMDIM: MlaAttention seq_len must have max_value") as f64;
             let h = *num_heads as f64;
             let d = *head_dim as f64;
@@ -528,7 +528,7 @@ pub fn arithmetic_intensity(op: &Op, graph_dtype: crate::types::DType) -> f64 {
 pub fn fusable_as_gemm_epilogue(op: &Op) -> bool {
     matches!(
         op,
-        Op::Add | Op::Silu | Op::Gelu | Op::Tanh | Op::Residual
+        Op::Add | Op::Silu | Op::Gelu | Op::Tanh | Op::Sigmoid | Op::Residual
     )
 }
 

@@ -1,4 +1,5 @@
 /// Scalar operator registry: fn_ptr + cached OpTrace per operator.
+// @trace REQ-AIS-007 [entity:ENT-AUTO-INSTR-SELECT] [api:POST /compile/scalar-registry]
 pub struct ScalarOpRegistry {
     entries: HashMap<OpKindKey, ScalarFnSignature>,
     trace_cache: HashMap<OpKindKey, OpTrace>,
@@ -87,6 +88,7 @@ impl ScalarOpRegistry {
             Op::Silu => OpKindKey::Silu,
             Op::Gelu => OpKindKey::Gelu,
             Op::Tanh => OpKindKey::Tanh,
+            Op::Sigmoid => OpKindKey::Sigmoid,
             Op::SwiGlu => OpKindKey::SwiGlu,
             Op::SwiGluClipped { .. } => OpKindKey::SwiGluClipped,
             Op::GeGlu => OpKindKey::GeGlu,
@@ -171,6 +173,15 @@ impl ScalarOpRegistry {
     /// Number of cached OpTraces.
     pub fn num_traces(&self) -> usize {
         self.trace_cache.len()
+    }
+
+    /// Return all registered OpKindKeys.
+    ///
+    /// Used by BackendCapMatrix::build() to derive the capability matrix
+    /// from the registry's registration coverage.
+    // @trace REQ-BACKEND-CAP-002 [entity:ENT-BACKEND-CAP-MATRIX]
+    pub fn registered_keys(&self) -> Vec<OpKindKey> {
+        self.entries.keys().cloned().collect()
     }
 
 }

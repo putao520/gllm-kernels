@@ -32,6 +32,7 @@ pub mod fusion;
 pub mod fwht_fusion;
 pub mod trace;
 pub mod registry;
+pub mod backend_cap;
 pub mod semantic_dag;
 pub mod symexec;
 pub mod hw_constraints;
@@ -49,7 +50,10 @@ pub mod virtual_activation;
 pub mod pack_map;
 pub mod counters;
 pub mod resource_estimator;
+pub mod parallel_compile;
 
+pub mod dump;
+pub mod diagnostics;
 pub mod dtype_chain;
 pub mod graph_geometry;
 pub mod mega_kernel_abi;
@@ -67,6 +71,7 @@ pub use mega_kernel_abi::{
     PerLayerWeightLayout,
     BusinessConfig, MtpKernelConfig, OutputMode, PoolMode, SgConfig, CotStepConfig,
     CompileConfig, CompileTarget,
+    HeteroLayerConfig, HeteroKernelWeightLayout,
     MEGA_KERNEL_PARAMS, MEGA_KERNEL_STACK_OFFSETS,
 };
 
@@ -235,11 +240,20 @@ impl InferenceCompiler {
     pub fn with_profile(profile: DeviceProfile) -> Self {
         InferenceCompiler {
             profile,
-            cache: CompilationCache::new(),
+            cache: CompilationCache::default_disk(),
         }
     }
 
-    /// Clear the compilation cache (memory + disk).
+    /// Access the device profile driving compilation decisions.
+    ///
+    /// REQ-API-10: The profile is the single source of hardware dispatch
+    /// information. All ISA-specific code generation is driven by this
+    /// profile — runtime branches on hardware capabilities are prohibited.
+    pub fn device_profile(&self) -> &DeviceProfile {
+        &self.profile
+    }
+
+    /// Clear the in-memory compilation cache.
     pub fn clear_cache(&mut self) {
         self.cache.clear();
     }
@@ -427,6 +441,20 @@ impl InferenceCompiler {
         eprintln!("[COMPILE-MEGA] compile(cpu) #{}, ops={}",
             compile_id, graph.ops.len());
 
+        // REQ-FAIL-TRIANG-001: IR-layer pre_check at compile() entry.
+        // Validates graph structural invariants before any compilation proceeds.
+        let ir_errors = diagnostics::pre_check(&graph);
+        if !ir_errors.is_empty() {
+            let details: Vec<String> = ir_errors.iter()
+                .take(5)
+                .map(|e| format!("{}", e))
+                .collect();
+            return Err(InferenceError::CompileError(
+                format!("IR-ERR: {} precondition violation(s).\n{}",
+                    ir_errors.len(), details.join("\n")).into()
+            ));
+        }
+
         // REQ-DTYPE-CHAIN-005: Dtype chain validation gate.
         // Blocks Mega-Kernel generation if dtype breakpoints are detected.
         let dtype_validation = dtype_chain::DtypeChainValidation::validate(&graph, &DeviceProfile::detect());
@@ -440,6 +468,31 @@ impl InferenceCompiler {
                 "DTYPE-CHAIN validation failed: {} breakpoint(s).\n{}",
                 dtype_validation.num_breakpoints, details.join("\n")
             ).into()));
+        }
+
+        // REQ-BACKEND-CAP-003: Capability matrix gate.
+        // Build the capability matrix from ScalarOpRegistry + DeviceProfile ISV
+        // and validate all graph ops are supported before proceeding to codegen.
+        {
+            let registry = ScalarOpRegistry::with_defaults();
+            let registered_keys = registry.registered_keys();
+            let cap_matrix = backend_cap::BackendCapMatrix::build(&self.profile, &registered_keys);
+
+            // Collect all OpKindKeys from the graph
+            let graph_op_keys: Vec<_> = graph.ops.iter()
+                .map(|cop| ScalarOpRegistry::key_from_op(&cop.op))
+                .collect();
+
+            let profile_label = format!("{:?} {:?}", self.profile.arch, self.profile.isa);
+            cap_matrix.validate_graph_ops(&graph_op_keys, self.profile.isa, &profile_label)
+                .map_err(|cap_err| {
+                    InferenceError::CompileError(CompilerError::CapabilityUnsupported {
+                        op_kind: cap_err.op_kind,
+                        device_profile: cap_err.device_profile,
+                        strategy: cap_err.strategy.to_string(),
+                        reason: cap_err.reason,
+                    })
+                })?;
         }
 
         // SPEC/39 REQ-UMK-001: single compilation entry point handles all graph topologies.
@@ -471,6 +524,15 @@ impl InferenceCompiler {
 
         let mut fusion_plan = fusion::fuse_with_dag_prebuilt(&graph, &semantic_dag, &exec_plan, Some(bottleneck_map), None);
         hw_constraints::enforce_constraints(&mut fusion_plan.groups, &graph, &exec_plan);
+
+        // REQ-UMK-31: Analyze parallel scheduling plan for Phase 2/3.
+        // Same-level fusion groups in TopoLevel have zero data dependency and can
+        // be emitted/lowered in parallel. The scheduler decides parallelism degree.
+        let mut parallel_scheduler = parallel_compile::ParallelCompileScheduler::new();
+        parallel_scheduler.analyze_schedule(&fusion_plan, &graph);
+        if std::env::var("GLLM_DEBUG_RESOURCE").is_ok() {
+            eprintln!("[PARALLEL-SCHED] {}", parallel_scheduler.summary());
+        }
 
         let accel_registry = accel_registry::AccelerationRegistry::new();
         let layout_assignment = layout_negotiator::LayoutNegotiator::negotiate(
