@@ -698,8 +698,14 @@ impl InferenceCompiler {
             let elem_bytes = geometry.compute_dtype.size_bytes();
             let vocab_bytes = geometry.vocab_size * elem_bytes;
             let sampling_bytes = vocab_bytes * 4;
-            let logits_end = logits_scratch_offset
-                + config.max_seq_len * geometry.vocab_size * elem_bytes;
+            // BCE-20260623-001 fix: logits_end must cover both generate-mode (vocab_size)
+            // and single-pass mode (output_float_elems). For non-generate graphs (no Argmax),
+            // output tensor is written to scratchpad[logits_scratch_offset] and
+            // copy_nonoverlapping reads output_float_elems f32 from there — the scratchpad
+            // must be large enough to hold the full output tensor.
+            let generate_logits_bytes = config.max_seq_len * geometry.vocab_size * elem_bytes;
+            let single_pass_output_bytes = output_float_elems * elem_bytes;
+            let logits_end = logits_scratch_offset + generate_logits_bytes.max(single_pass_output_bytes);
             let sg_end = if buffer_layout.sg_data_bytes > 0 {
                 let sg_start = (logits_scratch_offset + vocab_bytes + sampling_bytes + 63) & !63;
                 sg_start + geometry.hidden * elem_bytes * 2
@@ -732,6 +738,16 @@ impl InferenceCompiler {
             } else {
                 None
             };
+
+            // BCE-20260623-001 regression guard: scratchpad must be large enough
+            // for the output copy in execute_as_mega_kernel (copy_nonoverlapping
+            // reads output_float_elems f32 from scratchpad[logits_scratch_offset]).
+            debug_assert!(
+                total_scratch >= logits_scratch_offset + output_float_elems * elem_bytes,
+                "scratchpad too small for output: total={} need offset={} + elems={} * {} = {}",
+                total_scratch, logits_scratch_offset, output_float_elems, elem_bytes,
+                logits_scratch_offset + output_float_elems * elem_bytes,
+            );
 
             Ok(MegaKernelCompileOutput {
                 layer_code: layer,
@@ -815,6 +831,21 @@ impl InferenceCompiler {
         let topology = codegen::vm::topology::GraphTopologyAnalysis::analyze(
             &graph,
         );
+        // BCE-20260623-001: Extract output_float_elems before topology is moved.
+        let gpu_output_float_elems = if matches!(topology.loop_topology, crate::compiler::codegen::vm::topology::LoopTopology::SinglePass) {
+            let output_tid = topology.logits_output_tid
+                .or_else(|| graph.outputs.first().copied());
+            output_tid
+                .and_then(|tid| graph.tensor(tid))
+                .map(|t| t.shape.iter().map(|d| match d {
+                    SymDim::Concrete(v) => *v,
+                    SymDim::Symbolic { max_value: Some(m), .. } => *m,
+                    _ => 1,
+                }).product::<usize>())
+                .unwrap_or(0)
+        } else {
+            0
+        };
         let (mut program, rope_cache, logits_scratch_offset) =
             codegen::vm::mega_kernel_emit::compile_mega_kernel_vm(
                 &fusion_plan, &graph, &alloc, Some(&registry), &profile,
@@ -853,8 +884,12 @@ impl InferenceCompiler {
             .map_err(|e| InferenceError::CompileError(e.into()))?;
 
         let elem_bytes = geometry.compute_dtype.size_bytes();
+        // BCE-20260623-001 fix (GPU path): total_scratch must also cover
+        // single-pass output tensor bytes when output_float_elems > 0.
+        let generate_logits_bytes = config.max_seq_len * geometry.vocab_size * elem_bytes;
+        let single_pass_output_bytes = gpu_output_float_elems * elem_bytes;
         let total_scratch = buffer_layout.total_scratchpad_bytes
-            .max(config.max_seq_len * geometry.vocab_size * elem_bytes)
+            .max(generate_logits_bytes.max(single_pass_output_bytes))
             .max(64);
 
         Ok(GpuMegaKernelOutput {
