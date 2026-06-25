@@ -191,7 +191,7 @@ impl SemanticDAG {
     /// 胖 opcode 自描述 OpClass 分类（OpKind legacy 已删除）。
     fn fallback_op_class_from_op(op: &Op) -> OpClass {
         match op {
-            Op::Silu | Op::Gelu | Op::Tanh | Op::Sigmoid | Op::Add | Op::Mul | Op::ScaleConst { .. }
+            Op::Silu | Op::Gelu | Op::Tanh | Op::Sigmoid | Op::Relu | Op::Exp | Op::Erf | Op::Add | Op::Mul | Op::Sub | Op::Div | Op::Pow | Op::Sqrt | Op::ScaleConst { .. }
             | Op::Residual | Op::LogitSoftcap { .. } | Op::SwiGlu | Op::SwiGluClipped { .. }
             | Op::GeGlu | Op::Dequantize { .. } | Op::WeightedSum { .. }
             | Op::LearnedPos2D { .. } => OpClass::ElemWise,

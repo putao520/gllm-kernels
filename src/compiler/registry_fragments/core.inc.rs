@@ -97,6 +97,10 @@ impl ScalarOpRegistry {
             Op::DualRoPE(_) => OpKindKey::DualRoPE,
             Op::Add => OpKindKey::Add,
             Op::Mul => OpKindKey::Mul,
+            Op::Sub => OpKindKey::Sub,
+            Op::Div => OpKindKey::Div,
+            Op::Pow => OpKindKey::Pow,
+            Op::Sqrt => OpKindKey::Sqrt,
             Op::Residual => OpKindKey::Residual,
             Op::Transpose { .. } => OpKindKey::Transpose,
             Op::Reshape { .. } => OpKindKey::Reshape,
@@ -162,6 +166,9 @@ impl ScalarOpRegistry {
             Op::ScaleConst { .. } => OpKindKey::ScaleConst,
             Op::MlaAttention(_) => OpKindKey::MlaAttention,
             Op::MlaRopeMerge { .. } => OpKindKey::MlaRopeMerge,
+            Op::Relu => OpKindKey::Relu,
+            Op::Exp => OpKindKey::Exp,
+            Op::Erf => OpKindKey::Erf,
         }
     }
 

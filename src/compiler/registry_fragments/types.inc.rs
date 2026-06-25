@@ -28,7 +28,11 @@ pub enum OpKindKey {
     DualRoPE,
     Add,
     Mul,
+    Sub,
+    Div,
+    Pow,
     Residual,
+    Sqrt,
     /// LogitSoftcap: cap * tanh(x / cap). cap is a compile-time constant from OpKind.
     LogitSoftcap,
     Reshape,
@@ -148,6 +152,12 @@ pub enum OpKindKey {
     MlaRopeMerge,
     /// Multiply by compile-time constant (Elementwise).
     ScaleConst,
+    /// ReLU activation: max(0, x).
+    Relu,
+    /// Exponential: e^x.
+    Exp,
+    /// Error function: erf(x).
+    Erf,
 }
 
 #[derive(Debug)]

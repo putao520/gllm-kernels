@@ -49,7 +49,7 @@ pub enum BottleneckType {
 pub fn classify(op: &Op) -> OpSemantics {
     match op {
         // Elementwise ops
-        Op::Silu | Op::Gelu | Op::Tanh | Op::Sigmoid | Op::Add | Op::Mul | Op::ScaleConst { .. } | Op::Residual | Op::LogitSoftcap { .. } => {
+        Op::Silu | Op::Gelu | Op::Tanh | Op::Sigmoid | Op::Relu | Op::Exp | Op::Erf | Op::Add | Op::Sub | Op::Mul | Op::Div | Op::Pow | Op::Sqrt | Op::ScaleConst { .. } | Op::Residual | Op::LogitSoftcap { .. } => {
             OpSemantics::Elementwise
         }
         // Gated activations: elementwise (two inputs, one output, no reduction)
@@ -247,11 +247,11 @@ pub fn arithmetic_intensity(op: &Op, graph_dtype: crate::types::DType) -> f64 {
             let bytes = input_bytes + output_bytes;
             if bytes > 0.0 { flops / bytes } else { 0.0 }
         }
-        Op::Silu | Op::Gelu | Op::Tanh | Op::Sigmoid | Op::LogitSoftcap { .. } => {
+        Op::Silu | Op::Gelu | Op::Tanh | Op::Sigmoid | Op::Relu | Op::Exp | Op::Erf | Op::LogitSoftcap { .. } => {
             // ~10 FLOPs per element, 2*eb bytes (read + write)
             10.0 / (2.0 * eb)
         }
-        Op::Add | Op::Mul | Op::ScaleConst { .. } | Op::Residual => {
+        Op::Add | Op::Sub | Op::Mul | Op::Div | Op::Pow | Op::Sqrt | Op::ScaleConst { .. } | Op::Residual => {
             // 1 FLOP, 3*eb bytes (2 reads + 1 write)
             1.0 / (3.0 * eb)
         }

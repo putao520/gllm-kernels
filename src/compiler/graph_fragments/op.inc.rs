@@ -19,7 +19,8 @@
 ///     VecLoad/VecStore +predicate；GatherLoad/ScatterStore +dtype +predicate；
 ///     MemCopy +dtype +guard +effect。JIT 输出 VmInstr 结构变化，缓存必须失效。
 /// v3: — OpKind enum 物理删除，Op 成为唯一 IR。from_op_kind Translator 删除。
-pub const OPCODE_VERSION: u32 = 3;
+/// v4: — Op::Sub/Div/Pow/Sqrt added for ONNX elementwise ops.
+pub const OPCODE_VERSION: u32 = 4;
 // @trace REQ-FATOP-003 [entity:Op] OPCODE_VERSION JIT cache 版本管理
 
 // ── Attention Specs ──
@@ -176,6 +177,8 @@ pub enum Op {
     Gelu,
     Tanh,
     Sigmoid,
+    Relu,
+    Exp,
     SwiGlu,
     SwiGluClipped { limit: f32 },
     GeGlu,
@@ -197,8 +200,15 @@ pub enum Op {
     // ── Elementwise binary ──
     Add,
     Mul,
+    Sub,
+    Div,
+    Pow,
     ScaleConst { value: f32 },
     Residual,
+
+    // ── Elementwise unary ──
+    Sqrt,
+    Erf,
 
     // ── Pooling / normalize ──
     MeanPool { seq_len: usize, hidden: usize, cls_mode: bool },
@@ -296,8 +306,9 @@ impl Op {
             | Op::QkNorm { .. } | Op::L2Normalize { .. } => "norm",
             Op::Gemm(_) | Op::GemmBias(_) | Op::QuantGemm(_)
             | Op::FusedRmsNormGemm { .. } | Op::MaskedGemm { .. } => "gemm",
-            Op::Silu | Op::Gelu | Op::Tanh | Op::Sigmoid | Op::SwiGlu | Op::SwiGluClipped { .. } | Op::GeGlu
-            | Op::Add | Op::Mul | Op::ScaleConst { .. } | Op::Residual => "activation",
+            Op::Silu | Op::Gelu | Op::Tanh | Op::Sigmoid | Op::Relu | Op::Exp | Op::Erf | Op::SwiGlu | Op::SwiGluClipped { .. } | Op::GeGlu
+            | Op::Add | Op::Mul | Op::Sub | Op::Div | Op::Pow | Op::ScaleConst { .. } | Op::Residual
+            | Op::Sqrt => "activation",
             Op::MultiHeadAttention(_) | Op::CachedGqa(_) | Op::MlaAttention(_)
             | Op::Softmax | Op::MlaKvCompress { .. } | Op::MlaQAbsorb { .. }
             | Op::MlaVRestore { .. } | Op::MlaRopeMerge { .. } => "attention",

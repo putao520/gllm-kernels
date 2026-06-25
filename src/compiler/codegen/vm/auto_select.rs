@@ -101,6 +101,16 @@ fn dispatch_trace_op_typed(
         TraceOp::Sub(a, b) => emit_binop_dtype(prog, &slots, *a, *b, VecOp::Sub, width, dtype),
         TraceOp::Mul(a, b) => emit_binop_dtype(prog, &slots, *a, *b, VecOp::Mul, width, dtype),
         TraceOp::Div(a, b) => emit_binop_dtype(prog, &slots, *a, *b, VecOp::Div, width, dtype),
+        TraceOp::Pow(a, b) => {
+            // pow(base, exp) = exp(log(base) * exp)
+            let log_base = prog.alloc_vreg(VRegKind::Vec, width);
+            prog.emit(VmInstr::Transcendental { dst: log_base, src: slots[a.0 as usize], func: TranscendentalFn::Log });
+            let mul_result = prog.alloc_vreg(VRegKind::Vec, width);
+            prog.emit(VmInstr::VecBinOp { dst: mul_result, a: log_base, b: slots[b.0 as usize], op: VecOp::Mul, dtype });
+            let r = prog.alloc_vreg(VRegKind::Vec, width);
+            prog.emit(VmInstr::Transcendental { dst: r, src: mul_result, func: TranscendentalFn::Exp });
+            Ok(r)
+        }
         TraceOp::Max(a, b) => emit_binop_dtype(prog, &slots, *a, *b, VecOp::Max, width, dtype),
         TraceOp::Min(a, b) => emit_binop_dtype(prog, &slots, *a, *b, VecOp::Min, width, dtype),
 
@@ -379,6 +389,15 @@ fn dispatch_trace_op_into(
         TraceOp::Sub(a, b) => emit_binop_into(prog, slots, *a, *b, VecOp::Sub, dst, width, default_dtype),
         TraceOp::Mul(a, b) => emit_binop_into(prog, slots, *a, *b, VecOp::Mul, dst, width, default_dtype),
         TraceOp::Div(a, b) => emit_binop_into(prog, slots, *a, *b, VecOp::Div, dst, width, default_dtype),
+        TraceOp::Pow(a, b) => {
+            // pow(base, exp) = exp(log(base) * exp) — lower into dst
+            let log_base = prog.alloc_vreg(VRegKind::Vec, width);
+            prog.emit(VmInstr::Transcendental { dst: log_base, src: slots[a.0 as usize], func: TranscendentalFn::Log });
+            let mul_result = prog.alloc_vreg(VRegKind::Vec, width);
+            prog.emit(VmInstr::VecBinOp { dst: mul_result, a: log_base, b: slots[b.0 as usize], op: VecOp::Mul, dtype: default_dtype });
+            prog.emit(VmInstr::Transcendental { dst, src: mul_result, func: TranscendentalFn::Exp });
+            Ok(())
+        }
         TraceOp::Max(a, b) => emit_binop_into(prog, slots, *a, *b, VecOp::Max, dst, width, default_dtype),
         TraceOp::Min(a, b) => emit_binop_into(prog, slots, *a, *b, VecOp::Min, dst, width, default_dtype),
         TraceOp::Fma(a, b, c) => {
@@ -524,6 +543,16 @@ fn dispatch_trace_op(
         TraceOp::Sub(a, b) => emit_binop(prog, slots, *a, *b, VecOp::Sub, width, default_dtype),
         TraceOp::Mul(a, b) => emit_binop(prog, slots, *a, *b, VecOp::Mul, width, default_dtype),
         TraceOp::Div(a, b) => emit_binop(prog, slots, *a, *b, VecOp::Div, width, default_dtype),
+        TraceOp::Pow(a, b) => {
+            // pow(base, exp) = exp(log(base) * exp)
+            let log_base = prog.alloc_vreg(VRegKind::Vec, width);
+            prog.emit(VmInstr::Transcendental { dst: log_base, src: slots[a.0 as usize], func: TranscendentalFn::Log });
+            let mul_result = prog.alloc_vreg(VRegKind::Vec, width);
+            prog.emit(VmInstr::VecBinOp { dst: mul_result, a: log_base, b: slots[b.0 as usize], op: VecOp::Mul, dtype: default_dtype });
+            let r = prog.alloc_vreg(VRegKind::Vec, width);
+            prog.emit(VmInstr::Transcendental { dst: r, src: mul_result, func: TranscendentalFn::Exp });
+            Ok(r)
+        }
         TraceOp::Max(a, b) => emit_binop(prog, slots, *a, *b, VecOp::Max, width, default_dtype),
         TraceOp::Min(a, b) => emit_binop(prog, slots, *a, *b, VecOp::Min, width, default_dtype),
 

@@ -282,6 +282,104 @@ impl ScalarOpRegistry {
             },
         );
 
+        // ── Sub ──
+        let sub_sig = ScalarFnSignature {
+            fn_ptr: scalar_vec_sub as *const u8,
+            params: vec![
+                ScalarParam::InputPtr,
+                ScalarParam::InputPtr,
+                ScalarParam::OutputPtr,
+                ScalarParam::Dim(0),
+            ],
+        };
+        reg.register_with_symexec_fallback(
+            OpKindKey::Sub,
+            sub_sig.clone(),
+            OpTrace {
+                pattern: ComputePattern::BinaryElementwise {
+                    body: vec![
+                        TraceOp::Input(0),  // [0] a
+                        TraceOp::Input(1),  // [1] b
+                        TraceOp::Sub(ValueId(0), ValueId(1)), // [2] a - b
+                    ],
+                },
+                signature: sub_sig,
+            },
+        );
+
+        // ── Div ──
+        let div_sig = ScalarFnSignature {
+            fn_ptr: scalar_vec_div as *const u8,
+            params: vec![
+                ScalarParam::InputPtr,
+                ScalarParam::InputPtr,
+                ScalarParam::OutputPtr,
+                ScalarParam::Dim(0),
+            ],
+        };
+        reg.register_with_symexec_fallback(
+            OpKindKey::Div,
+            div_sig.clone(),
+            OpTrace {
+                pattern: ComputePattern::BinaryElementwise {
+                    body: vec![
+                        TraceOp::Input(0),  // [0] a
+                        TraceOp::Input(1),  // [1] b
+                        TraceOp::Div(ValueId(0), ValueId(1)), // [2] a / b
+                    ],
+                },
+                signature: div_sig,
+            },
+        );
+
+        // ── Pow ──
+        let pow_sig = ScalarFnSignature {
+            fn_ptr: scalar_vec_pow as *const u8,
+            params: vec![
+                ScalarParam::InputPtr,
+                ScalarParam::InputPtr,
+                ScalarParam::OutputPtr,
+                ScalarParam::Dim(0),
+            ],
+        };
+        reg.register_with_symexec_fallback(
+            OpKindKey::Pow,
+            pow_sig.clone(),
+            OpTrace {
+                pattern: ComputePattern::BinaryElementwise {
+                    body: vec![
+                        TraceOp::Input(0),  // [0] base
+                        TraceOp::Input(1),  // [1] exp
+                        TraceOp::Pow(ValueId(0), ValueId(1)), // [2] base ^ exp
+                    ],
+                },
+                signature: pow_sig,
+            },
+        );
+
+        // ── Sqrt ──
+        let sqrt_sig = ScalarFnSignature {
+            fn_ptr: scalar_vec_sqrt as *const u8,
+            params: vec![
+                ScalarParam::InputPtr,
+                ScalarParam::OutputPtr,
+                ScalarParam::Dim(0),
+            ],
+        };
+        reg.register_with_symexec_fallback(
+            OpKindKey::Sqrt,
+            sqrt_sig.clone(),
+            OpTrace {
+                pattern: ComputePattern::Elementwise {
+                    body: vec![
+                        TraceOp::Input(0),  // [0] x
+                        TraceOp::Sqrt(ValueId(0)),  // [1] sqrt(x)
+                    ],
+                },
+                signature: sqrt_sig,
+            },
+        );
+
         // ── Residual (same as Add) ──
         let residual_sig = ScalarFnSignature {
             fn_ptr: scalar_vec_add as *const u8,

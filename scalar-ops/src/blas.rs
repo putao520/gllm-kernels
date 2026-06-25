@@ -20,6 +20,50 @@ pub unsafe extern "C" fn scalar_vec_mul(a: *const f32, b: *const f32, out: *mut 
     }
 }
 
+/// Vector sub: `out[i] = a[i] - b[i]`
+#[no_mangle]
+#[inline(never)]
+pub unsafe extern "C" fn scalar_vec_sub(a: *const f32, b: *const f32, out: *mut f32, n: usize) {
+    for i in 0..n {
+        unsafe {
+            *out.add(i) = *a.add(i) - *b.add(i);
+        }
+    }
+}
+
+/// Vector div: `out[i] = a[i] / b[i]`
+#[no_mangle]
+#[inline(never)]
+pub unsafe extern "C" fn scalar_vec_div(a: *const f32, b: *const f32, out: *mut f32, n: usize) {
+    for i in 0..n {
+        unsafe {
+            *out.add(i) = *a.add(i) / *b.add(i);
+        }
+    }
+}
+
+/// Vector pow: `out[i] = a[i] ^ b[i]`
+#[no_mangle]
+#[inline(never)]
+pub unsafe extern "C" fn scalar_vec_pow(a: *const f32, b: *const f32, out: *mut f32, n: usize) {
+    for i in 0..n {
+        unsafe {
+            *out.add(i) = (*a.add(i)).powf(*b.add(i));
+        }
+    }
+}
+
+/// Vector sqrt: `out[i] = sqrt(x[i])`
+#[no_mangle]
+#[inline(never)]
+pub unsafe extern "C" fn scalar_vec_sqrt(x: *const f32, out: *mut f32, n: usize) {
+    for i in 0..n {
+        unsafe {
+            *out.add(i) = (*x.add(i)).sqrt();
+        }
+    }
+}
+
 /// Exp: `out[i] = exp(x[i])`
 #[no_mangle]
 #[inline(never)]
@@ -236,6 +280,44 @@ mod tests {
         let sum: f32 = out.iter().sum();
         assert!((sum - 1.0).abs() < 1e-5, "softmax sum = {sum}");
         assert!(out.iter().all(|v| v.is_finite()), "softmax produced non-finite");
+    }
+
+    #[test]
+    fn test_scalar_ops_vec_sub() {
+        let a = vec![10.0_f32, 20.0, 30.0, 40.0];
+        let b = vec![1.0_f32, 2.0, 3.0, 4.0];
+        let mut out = vec![0.0_f32; 4];
+        scalar_vec_sub(a.as_ptr(), b.as_ptr(), out.as_mut_ptr(), 4);
+        assert_eq!(out, vec![9.0, 18.0, 27.0, 36.0]);
+    }
+
+    #[test]
+    fn test_scalar_ops_vec_div() {
+        let a = vec![10.0_f32, 20.0, 30.0, 40.0];
+        let b = vec![2.0_f32, 4.0, 5.0, 8.0];
+        let mut out = vec![0.0_f32; 4];
+        scalar_vec_div(a.as_ptr(), b.as_ptr(), out.as_mut_ptr(), 4);
+        assert_eq!(out, vec![5.0, 5.0, 6.0, 5.0]);
+    }
+
+    #[test]
+    fn test_scalar_ops_vec_pow() {
+        let a = vec![2.0_f32, 3.0, 4.0, 5.0];
+        let b = vec![3.0_f32, 2.0, 0.5, 1.0];
+        let mut out = vec![0.0_f32; 4];
+        scalar_vec_pow(a.as_ptr(), b.as_ptr(), out.as_mut_ptr(), 4);
+        assert!((out[0] - 8.0).abs() < 1e-6, "2^3 = {}", out[0]);
+        assert!((out[1] - 9.0).abs() < 1e-6, "3^2 = {}", out[1]);
+        assert!((out[2] - 2.0).abs() < 1e-6, "4^0.5 = {}", out[2]);
+        assert!((out[3] - 5.0).abs() < 1e-6, "5^1 = {}", out[3]);
+    }
+
+    #[test]
+    fn test_scalar_ops_vec_sqrt() {
+        let x = vec![4.0_f32, 9.0, 16.0, 25.0];
+        let mut out = vec![0.0_f32; 4];
+        scalar_vec_sqrt(x.as_ptr(), out.as_mut_ptr(), 4);
+        assert_eq!(out, vec![2.0, 3.0, 4.0, 5.0]);
     }
 
     #[test]

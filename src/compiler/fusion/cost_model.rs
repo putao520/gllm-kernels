@@ -257,7 +257,7 @@ pub struct Cost {
 fn trace_op_flops(op: &TraceOp) -> u64 {
     match op {
         TraceOp::Input(_) | TraceOp::Const(_) => 0,
-        TraceOp::Add(..) | TraceOp::Sub(..) | TraceOp::Mul(..) | TraceOp::Div(..) => 1,
+        TraceOp::Add(..) | TraceOp::Sub(..) | TraceOp::Mul(..) | TraceOp::Div(..) | TraceOp::Pow(..) => 1,
         TraceOp::Neg(..) | TraceOp::Abs(..) | TraceOp::Recip(..) => 1,
         TraceOp::Fma(..) => 2,
         TraceOp::Sqrt(..) | TraceOp::Rsqrt(..) => 2,

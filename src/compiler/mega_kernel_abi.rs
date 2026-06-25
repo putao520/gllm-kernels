@@ -699,11 +699,15 @@ impl BufferLayout {
     /// Compute buffer layout from graph-derived geometry + max_seq_len.
     ///
     /// Single-sequence mode: activation_dim == max_seq_len (M = 1 × seq_len).
+    ///
+    /// `sg_enabled`: when false, sg_data_bytes is 0 and no SG scratchpad space is allocated.
+    /// Caller should scan the graph for SgDetect/SgInject ops to determine this.
     pub fn from_graph_geometry(
         geo: &super::graph_geometry::GraphDerivedGeometry,
         max_seq_len: usize,
+        sg_enabled: bool,
     ) -> Self {
-        Self::build(geo.storage_dtype.size_bytes(), max_seq_len, geo.hidden, geo.vocab_size)
+        Self::build(geo.storage_dtype.size_bytes(), max_seq_len, geo.hidden, geo.vocab_size, sg_enabled)
     }
 
     /// Compute buffer layout for batched inference (SPEC/20 REQ-BCI-010).
@@ -713,25 +717,33 @@ impl BufferLayout {
     /// - `max_seq_len`: upper bound on single-sequence length, driving RoPE cache sizing.
     ///   Note: RoPE cache offset is currently managed by plan_lower's `compute_rope_requirement()`.
     ///   This parameter is reserved for future unification into this layout.
+    ///
+    /// `sg_enabled`: when false, sg_data_bytes is 0 and no SG scratchpad space is allocated.
     #[allow(non_snake_case)] // SPEC/20 REQ-BCI-010: parameter name matches SPEC notation
     pub fn from_graph_geometry_batched(
         geo: &super::graph_geometry::GraphDerivedGeometry,
         max_M: usize,
         max_seq_len: usize,
+        sg_enabled: bool,
     ) -> Self {
         let _ = max_seq_len; // Reserved: will drive RoPE cache sizing when unified from plan_lower
-        Self::build(geo.storage_dtype.size_bytes(), max_M, geo.hidden, geo.vocab_size)
+        Self::build(geo.storage_dtype.size_bytes(), max_M, geo.hidden, geo.vocab_size, sg_enabled)
     }
 
     /// Build buffer layout from raw dimensions.
     ///
     /// `activation_dim` is the M dimension (max_seq_len for single-seq, max_M for batched).
     /// It drives activation ping/pong and logits buffer sizing.
-    fn build(elem_bytes: usize, activation_dim: usize, hidden: usize, vocab_size: usize) -> Self {
+    ///
+    /// [FIX-PSC29] `sg_enabled` controls whether SG detect/knowledge buffers are allocated.
+    /// When false (most models), sg_data_bytes = 0 and no SG space is included in
+    /// total_scratchpad_bytes — saving hidden * elem_bytes * 2 bytes per inference.
+    fn build(elem_bytes: usize, activation_dim: usize, hidden: usize, vocab_size: usize, sg_enabled: bool) -> Self {
         let activation_bytes = activation_dim * hidden * elem_bytes;
         let logits_bytes = activation_dim * vocab_size * elem_bytes;
+        // Sampling workspace: 4x vocab_bytes (indices + PRNG + reserved CDF + reserved temp).
+        // See gllm abi_types.inc.rs SAMPLING_WORKSPACE_MULTIPLIER for LEGAL justification.
         let sampling_workspace_bytes = vocab_size * elem_bytes * 4;
-        let sg_hidden_bytes = hidden * elem_bytes;
 
         let mut off = 0;
 
@@ -747,11 +759,17 @@ impl BufferLayout {
         let sampling_workspace_offset = off;
         off += sampling_workspace_bytes;
 
-        let sg_detect_offset = off;
-        off += sg_hidden_bytes;
-        let sg_knowledge_offset = off;
-        off += sg_hidden_bytes;
-        let sg_data_bytes = sg_hidden_bytes * 2;
+        let (sg_detect_offset, sg_knowledge_offset, sg_data_bytes) = if sg_enabled {
+            let sg_hidden_bytes = hidden * elem_bytes;
+            let detect_off = off;
+            off += sg_hidden_bytes;
+            let knowledge_off = off;
+            off += sg_hidden_bytes;
+            (detect_off, knowledge_off, sg_hidden_bytes * 2)
+        } else {
+            // [FIX-PSC29] No SG ops in graph — zero SG allocation.
+            (off, off, 0)
+        };
 
         Self {
             activation_a_offset,
@@ -989,7 +1007,7 @@ mod tests {
 
     #[test]
     fn buffer_layout_activation_ping_pong() {
-        let bl = BufferLayout::build(2, 512, 4096, 32000);
+        let bl = BufferLayout::build(2, 512, 4096, 32000, true);
         assert_eq!(bl.activation_a_offset, 0);
         assert_eq!(bl.activation_b_offset, bl.activation_bytes);
         assert_eq!(bl.activation_bytes, 512 * 4096 * 2);
@@ -997,21 +1015,21 @@ mod tests {
 
     #[test]
     fn buffer_layout_logits_after_activations() {
-        let bl = BufferLayout::build(2, 512, 4096, 32000);
+        let bl = BufferLayout::build(2, 512, 4096, 32000, true);
         assert_eq!(bl.logits_offset, bl.activation_b_offset + bl.activation_bytes);
         assert_eq!(bl.logits_bytes, 512 * 32000 * 2);
     }
 
     #[test]
     fn buffer_layout_sampling_after_logits() {
-        let bl = BufferLayout::build(2, 512, 4096, 32000);
+        let bl = BufferLayout::build(2, 512, 4096, 32000, true);
         assert_eq!(bl.sampling_workspace_offset, bl.logits_offset + bl.logits_bytes);
         assert_eq!(bl.sampling_workspace_bytes, 32000 * 2 * 4);
     }
 
     #[test]
     fn buffer_layout_sg_data() {
-        let bl = BufferLayout::build(2, 128, 768, 50000);
+        let bl = BufferLayout::build(2, 128, 768, 50000, true);
         let sg_hidden = 768 * 2;
         assert_eq!(bl.sg_detect_offset, bl.sampling_workspace_offset + bl.sampling_workspace_bytes);
         assert_eq!(bl.sg_knowledge_offset, bl.sg_detect_offset + sg_hidden);
@@ -1019,8 +1037,19 @@ mod tests {
     }
 
     #[test]
+    fn buffer_layout_sg_disabled_zero_allocation() {
+        // [FIX-PSC29] When sg_enabled=false, no SG space should be allocated.
+        let bl = BufferLayout::build(2, 128, 768, 50000, false);
+        assert_eq!(bl.sg_data_bytes, 0, "sg_data_bytes should be 0 when SG disabled");
+        let bl_enabled = BufferLayout::build(2, 128, 768, 50000, true);
+        let sg_savings = bl_enabled.sg_data_bytes;
+        assert!(bl.total_scratchpad_bytes + sg_savings == bl_enabled.total_scratchpad_bytes,
+            "SG-disabled scratchpad should be smaller by exactly sg_data_bytes");
+    }
+
+    #[test]
     fn buffer_layout_total_scratchpad() {
-        let bl = BufferLayout::build(4, 256, 1024, 5000);
+        let bl = BufferLayout::build(4, 256, 1024, 5000, true);
         assert_eq!(bl.total_scratchpad_bytes, bl.sg_knowledge_offset + 1024 * 4);
     }
 

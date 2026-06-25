@@ -501,8 +501,14 @@ impl InferenceCompiler {
         let geometry = graph_geometry::GraphDerivedGeometry::from_graph(&graph, &DeviceProfile::detect())
             .map_err(|e| InferenceError::CompileError(format!("GraphDerivedGeometry: {}", e).into()))?;
 
+        // [FIX-PSC29] Determine SG presence from graph ops (SgDetect/SgInject).
+        // When no SG ops exist, BufferLayout skips SG allocation entirely.
+        let sg_enabled = graph.ops.iter().any(|op| {
+            matches!(op.op_resolved(&graph), Some(graph::Op::SgDetect { .. }) | Some(graph::Op::SgInject { .. }))
+        });
+
         let buffer_layout = mega_kernel_abi::BufferLayout::from_graph_geometry(
-            &geometry, config.max_seq_len,
+            &geometry, config.max_seq_len, sg_enabled,
         );
 
         // JIT pipeline
@@ -579,8 +585,17 @@ impl InferenceCompiler {
             let hook = isa_hook::select_hook(&profile);
             let hook_ref: Option<&dyn isa_hook::IsaHook> = Some(&*hook);
 
-            let activation_bytes = config.max_seq_len * geometry.hidden * 4;
-            let kv_bytes = config.max_seq_len * geometry.hidden * 2;
+            let elem_bytes = geometry.compute_dtype.size_bytes();
+            let activation_bytes = config.max_seq_len * geometry.hidden * elem_bytes;
+            // [LEGAL-PSC28] elem_bytes comes from geometry.compute_dtype.size_bytes() (dtype-inferred),
+            // not hardcoded F32. compute_dtype is derived from (storage_dtype, DeviceProfile) per
+            // REQ-DTYPE-CHAIN-005. This satisfies ARCH-DTYPE-JIT-TYPED.
+            // [FIX-PSC27] kv_bytes uses KV-specific dimensions (num_kv_heads * head_dim) instead of
+            // geometry.hidden. For MHA models: num_kv_heads == num_heads, so kv_dim == hidden (no change).
+            // For GQA/MQA models: num_kv_heads < num_heads, so kv_dim < hidden (saves memory).
+            // The *2 accounts for K and V halves of the KV cache.
+            let kv_dim = geometry.num_kv_heads * geometry.head_dim;
+            let kv_bytes = config.max_seq_len * kv_dim * 2;
             let resource_plan = plan_mega_kernel_resources(
                 &graph, &fusion_plan, &profile, &alloc,
                 geometry.hidden, activation_bytes, kv_bytes,
@@ -697,7 +712,10 @@ impl InferenceCompiler {
 
             let elem_bytes = geometry.compute_dtype.size_bytes();
             let vocab_bytes = geometry.vocab_size * elem_bytes;
-            let sampling_bytes = vocab_bytes * 4;
+            /// Sampling workspace: 4x vocab_bytes (indices + PRNG + reserved CDF + reserved temp).
+            /// See gllm abi_types.inc.rs SAMPLING_WORKSPACE_MULTIPLIER for LEGAL justification.
+            const SAMPLING_WORKSPACE_MULTIPLIER: usize = 4;
+            let sampling_bytes = vocab_bytes * SAMPLING_WORKSPACE_MULTIPLIER;
             // BCE-20260623-001 fix: logits_end must cover both generate-mode (vocab_size)
             // and single-pass mode (output_float_elems). For non-generate graphs (no Argmax),
             // output tensor is written to scratchpad[logits_scratch_offset] and
@@ -791,8 +809,14 @@ impl InferenceCompiler {
         let geometry = graph_geometry::GraphDerivedGeometry::from_graph(&graph, &DeviceProfile::detect())
             .map_err(|e| InferenceError::CompileError(format!("GraphDerivedGeometry: {}", e).into()))?;
 
+        // [FIX-PSC29] Determine SG presence from graph ops (SgDetect/SgInject).
+        // When no SG ops exist, BufferLayout skips SG allocation entirely.
+        let sg_enabled = graph.ops.iter().any(|op| {
+            matches!(op.op_resolved(&graph), Some(graph::Op::SgDetect { .. }) | Some(graph::Op::SgInject { .. }))
+        });
+
         let buffer_layout = mega_kernel_abi::BufferLayout::from_graph_geometry(
-            &geometry, config.max_seq_len,
+            &geometry, config.max_seq_len, sg_enabled,
         );
 
         let bottleneck_map = pain_point::PainPointAnalyzer::analyze(&graph, &self.profile);
@@ -822,8 +846,17 @@ impl InferenceCompiler {
         );
 
         let profile = IsaProfile::from_device_profile(&self.profile);
-        let activation_bytes = config.max_seq_len * geometry.hidden * 4;
-        let kv_bytes = config.max_seq_len * geometry.hidden * 2;
+        let elem_bytes = geometry.compute_dtype.size_bytes();
+        // [LEGAL-PSC28] elem_bytes comes from geometry.compute_dtype.size_bytes() (dtype-inferred),
+        // not hardcoded F32. compute_dtype is derived from (storage_dtype, DeviceProfile) per
+        // REQ-DTYPE-CHAIN-005. This satisfies ARCH-DTYPE-JIT-TYPED.
+        let activation_bytes = config.max_seq_len * geometry.hidden * elem_bytes;
+        // [FIX-PSC27] kv_bytes uses KV-specific dimensions (num_kv_heads * head_dim) instead of
+        // geometry.hidden. For MHA models: num_kv_heads == num_heads, so kv_dim == hidden (no change).
+        // For GQA/MQA models: num_kv_heads < num_heads, so kv_dim < hidden (saves memory).
+        // The *2 accounts for K and V halves of the KV cache.
+        let kv_dim = geometry.num_kv_heads * geometry.head_dim;
+        let kv_bytes = config.max_seq_len * kv_dim * 2;
         let resource_plan = codegen::vm::resource_planner::plan_mega_kernel_resources(
             &graph, &fusion_plan, &profile, &alloc,
             geometry.hidden, activation_bytes, kv_bytes,
@@ -884,12 +917,36 @@ impl InferenceCompiler {
             .map_err(|e| InferenceError::CompileError(e.into()))?;
 
         let elem_bytes = geometry.compute_dtype.size_bytes();
+        let vocab_bytes = geometry.vocab_size * elem_bytes;
+        /// Sampling workspace: 4x vocab_bytes (indices + PRNG + reserved CDF + reserved temp).
+        /// See gllm abi_types.inc.rs SAMPLING_WORKSPACE_MULTIPLIER for LEGAL justification.
+        const SAMPLING_WORKSPACE_MULTIPLIER: usize = 4;
+        let sampling_bytes = vocab_bytes * SAMPLING_WORKSPACE_MULTIPLIER;
         // BCE-20260623-001 fix (GPU path): total_scratch must also cover
         // single-pass output tensor bytes when output_float_elems > 0.
         let generate_logits_bytes = config.max_seq_len * geometry.vocab_size * elem_bytes;
         let single_pass_output_bytes = gpu_output_float_elems * elem_bytes;
-        let total_scratch = buffer_layout.total_scratchpad_bytes
-            .max(generate_logits_bytes.max(single_pass_output_bytes))
+        let logits_end = logits_scratch_offset + generate_logits_bytes.max(single_pass_output_bytes);
+        // [FIX-PSC5] GPU path must include sg_end and dwc_end in scratchpad sizing,
+        // mirroring the CPU path (see compile_cpu sg_end/dwc_end calculation).
+        // Without this, models with SG/DWC ops get insufficient scratchpad → OOB access.
+        let sg_end = if buffer_layout.sg_data_bytes > 0 {
+            let sg_start = (logits_scratch_offset + vocab_bytes + sampling_bytes + 63) & !63;
+            sg_start + geometry.hidden * elem_bytes * 2
+        } else {
+            0
+        };
+        // DWC padded buffer must fit within scratchpad (compute_dwc_requirement mirrors mega_kernel_emit).
+        let dwc_end = match codegen::vm::plan_lower::compute_dwc_requirement(
+            &fusion_plan, &graph, &alloc, rope_cache.as_ref(), None,
+        ) {
+            Ok(Some(req)) => req.padded_offset + req.total_bytes,
+            _ => 0,
+        };
+        let total_scratch = logits_end
+            .max(buffer_layout.total_scratchpad_bytes)
+            .max(sg_end)
+            .max(dwc_end)
             .max(64);
 
         Ok(GpuMegaKernelOutput {

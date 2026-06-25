@@ -517,6 +517,20 @@ impl NumericalSimulator {
                 Ok(Some(id))
             }
 
+            TraceOp::Pow(a, b) => {
+                let a_val = state.get(*a).as_float()?;
+                let b_val = state.get(*b).as_float()?;
+                if a_val < 0.0 {
+                    return Err(CompilerError::CodegenViolation(
+                        "Simulation error: pow with negative base".to_string()
+                    ));
+                }
+                let result = a_val.powf(b_val);
+                let id = ValueId(trace_pos);
+                state.set(id, SimValue::Float(result));
+                Ok(Some(id))
+            }
+
             TraceOp::Fma(a, b, c) => {
                 let a_val = state.get(*a).as_float()?;
                 let b_val = state.get(*b).as_float()?;

@@ -182,6 +182,8 @@ pub enum TraceOp {
     Sub(ValueId, ValueId),
     Mul(ValueId, ValueId),
     Div(ValueId, ValueId),
+    /// Power: base ^ exp.
+    Pow(ValueId, ValueId),
     /// Fused multiply-add: a * b + c
     Fma(ValueId, ValueId, ValueId),
 
@@ -1271,6 +1273,7 @@ pub fn infer_result_dtype(op: &TraceOp, slots: &[TypedSlot]) -> QuantPrecision {
         TraceOp::Input(n) => slots.get(*n as usize).map(|s| s.dtype).unwrap_or(QuantPrecision::F32),
         TraceOp::Const(_) => QuantPrecision::F32,
         TraceOp::Add(a, b) | TraceOp::Sub(a, b) | TraceOp::Mul(a, b) | TraceOp::Div(a, b)
+        | TraceOp::Pow(a, b)
         | TraceOp::Max(a, b) | TraceOp::Min(a, b) => promote(slot_dtype(slots, *a), slot_dtype(slots, *b)),
         TraceOp::Fma(a, b, c) => promote(promote(slot_dtype(slots, *a), slot_dtype(slots, *b)), slot_dtype(slots, *c)),
         TraceOp::Neg(a) | TraceOp::Abs(a) | TraceOp::Sqrt(a) | TraceOp::Rsqrt(a) | TraceOp::Recip(a) => slot_dtype(slots, *a),
@@ -1372,7 +1375,8 @@ impl TraceOp {
 
             // Binary (2 ValueId)
             TraceOp::Add(a, b) | TraceOp::Sub(a, b) | TraceOp::Mul(a, b)
-            | TraceOp::Div(a, b) | TraceOp::Max(a, b) | TraceOp::Min(a, b)
+            | TraceOp::Div(a, b) | TraceOp::Pow(a, b)
+            | TraceOp::Max(a, b) | TraceOp::Min(a, b)
             | TraceOp::BitAnd(a, b)
             | TraceOp::QuantBitAnd { lhs: a, rhs: b }
             | TraceOp::QuantBitOr { lhs: a, rhs: b }
@@ -1502,6 +1506,7 @@ impl TraceOp {
             TraceOp::Sub(a, b) => TraceOp::Sub(m(a), m(b)),
             TraceOp::Mul(a, b) => TraceOp::Mul(m(a), m(b)),
             TraceOp::Div(a, b) => TraceOp::Div(m(a), m(b)),
+            TraceOp::Pow(a, b) => TraceOp::Pow(m(a), m(b)),
             TraceOp::Max(a, b) => TraceOp::Max(m(a), m(b)),
             TraceOp::Min(a, b) => TraceOp::Min(m(a), m(b)),
             TraceOp::BitAnd(a, b) => TraceOp::BitAnd(m(a), m(b)),

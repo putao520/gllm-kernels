@@ -940,6 +940,9 @@ pub fn compile_mega_kernel_vm(
 ) -> Result<(VmProgram, Option<RopeCacheRequirement>, usize), CompilerError> {
     use crate::compiler::mega_kernel_abi::MEGA_KERNEL_STACK_OFFSETS;
 
+    /// Sampling workspace needs 4x vocab_bytes: softmax + top-k + top-p + multinomial buffers.
+    const SAMPLING_WORKSPACE_MULTIPLIER: usize = 4;
+
     // vocab_size 从图拓扑推导（Op::Argmax { vocab_size:  }），不作为外部参数。
     // 无 Argmax 的图 vocab_size=0：不分配 logits buffer，不 emit 采样管线。
     let vocab_size = topology.vocab_size.unwrap_or(0);
@@ -1007,6 +1010,8 @@ pub fn compile_mega_kernel_vm(
     let logits_scratch_offset = {
         let after_rope = rope_req.as_ref()
             .map(|rc| {
+                // LEGAL-PSC30: RoPE cos/sin table is always F32 (fill_cos_sin_table writes &[f32]),
+                // so *4 is correct regardless of model weight dtype.
                 let cache_bytes = rc.max_seq_len * rc.head_dim * 4;
                 rc.cache_offset + cache_bytes
             })
@@ -1176,12 +1181,13 @@ pub fn compile_mega_kernel_vm(
             Some(hook_ptr)
         },
         // SG scratch offsets: placed after actual JIT logits + sampling workspace.
-        // JIT uses vocab_size * 4 bytes for decode logits (one row), NOT max_seq_len * vocab_size.
+        // JIT uses vocab_size * elem_bytes for decode logits (one row), NOT max_seq_len * vocab_size.
         // SG knowledge buffer persists across decode steps (pre-computed before generation).
         sg_detect_scratch_offset: {
             match topology.sg_detect_hidden_dim {
                 Some(_hdim) => {
-                    let vocab_bytes = vocab_size * 4;
+                    let elem_bytes = graph_dtype(graph).elem_bytes();
+                    let vocab_bytes = vocab_size * elem_bytes;
                     let sampling_bytes = vocab_bytes * 4;
                     let off = (logits_scratch_offset + vocab_bytes + sampling_bytes + 63) & !63;
                     Some(off)
@@ -1192,10 +1198,11 @@ pub fn compile_mega_kernel_vm(
         sg_knowledge_scratch_offset: {
             match topology.sg_detect_hidden_dim {
                 Some(hdim) => {
-                    let vocab_bytes = vocab_size * 4;
+                    let elem_bytes = graph_dtype(graph).elem_bytes();
+                    let vocab_bytes = vocab_size * elem_bytes;
                     let sampling_bytes = vocab_bytes * 4;
                     let detect_off = (logits_scratch_offset + vocab_bytes + sampling_bytes + 63) & !63;
-                    let off = detect_off + hdim * 4;
+                    let off = detect_off + hdim * elem_bytes;
                     Some(off)
                 }
                 None => None,
@@ -1922,13 +1929,13 @@ pub fn compile_mega_kernel_vm(
                 let sg_end = current_abi.sg_detect_scratch_offset
                     .map(|off| {
                         let hdim = topology.sg_detect_hidden_dim.unwrap_or(0);
-                        (off + hdim * 4 + 63) & !63
+                        (off + hdim * ctx.dtype.elem_bytes() + 63) & !63
                     })
                     .unwrap_or(0);
                 let sgk_end = current_abi.sg_knowledge_scratch_offset
                     .map(|off| {
                         let hdim = topology.sg_inject_hidden_dim.unwrap_or(0);
-                        (off + hdim * 4 + 63) & !63
+                        (off + hdim * ctx.dtype.elem_bytes() + 63) & !63
                     })
                     .unwrap_or(0);
                 let base = sampling_end.max(sg_end).max(sgk_end);
