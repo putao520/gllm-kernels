@@ -20,76 +20,52 @@
 //! | ARM NEON | ArmNeonHook | FMLA v.4s, 128-bit |
 //! | ARM SVE2 | ArmSveHook | predicated FMLA z.s |
 //! | ARM SME2 | ArmSmeHook | FMOPA ZA, outer product |
+//!
+//! ## GEMM-FMA 族已迁移到 OpImpl (CR-TIER-SOVEREIGNTY-001..004)
+//!
+//! `FmaStrategy` / `select_fma` / `select_fma_best` / `select_fma_candidates` /
+//! `estimate_strategy_cost` / `TileConfig` / `WgmmaConfig` / `Tcgen05Config` / `MfmaConfig`
+//! 已全部删除。GEMM-FMA 算子族实现迁移到 `super::op_impl::OpImpl<GemmOpLayout>`
+//! + `super::gemm_impls::select_gemm_impl` (select-then-emit 两阶段)。
+//!
+//! 本 IsaHook trait 仍保留 Attention / Transcendental / MoE 等其他算子族的方法
+//! (它们尚未迁移到 OpImpl 框架, 属于不同算子族的并行演进, 不违反
+//! ARCH-UNCONSTITUTION-CONTAGION)。
 
 use super::isa_profile::{IsaProfile, Platform};
-use crate::types::DType;
-use rayon::prelude::*;
 
 // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-// §1 策略枚举
+// §1.5 硬件资源预算 (供 CompileSession 持有, throughput_refine 用)
 // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
-/// FMA 指令选择策略。
+/// 硬件资源预算 — 用于 GEMM 策略成本微调 (throughput_refine)。
+///
+/// 保留: FmaStrategy 删除时, estimate_strategy_cost 抽成 throughput_refine,
+/// ResourceBudget 仍被 CompileSession.budget 字段持有。
 #[derive(Debug, Clone)]
-pub enum FmaStrategy {
-    /// 2-op: mul + add (无 FMA 硬件)
-    MulAdd,
-    /// 3-op: vfmadd231ps (FMA3)
-    Fma3,
-    /// Tile MMA: AMX / SME / Tensor Core
-    TileMma(TileConfig),
-    /// Warpgroup MMA (SM90 Hopper: wgmma.mma_async)
-    Wgmma(WgmmaConfig),
-    /// tcgen05.mma (SM100+ Blackwell: block-scaled)
-    Tcgen05(Tcgen05Config),
-    /// AMD MFMA (v_mfma_f32_16x16x16_f16)
-    Mfma(MfmaConfig),
+pub struct ResourceBudget {
+    /// L1D 可用字节
+    pub l1d_bytes: usize,
+    /// L2 可用字节
+    pub l2_bytes: usize,
+    /// 可分配向量寄存器数量
+    pub vec_reg_count: usize,
+    /// 可分配 GPR 数量
+    pub gpr_count: usize,
 }
 
-/// Tile GEMM 配置 (AMX/SME)。
-#[derive(Debug, Clone)]
-pub struct TileConfig {
-    pub rows: usize,
-    pub cols: usize,
-    pub k_depth: usize,
-    pub dtype: DType,
+impl ResourceBudget {
+    /// 从 IsaProfile 提取资源预算。
+    pub fn from_isa_profile(profile: &super::isa_profile::IsaProfile) -> Self {
+        Self {
+            l1d_bytes: profile.cache.l1d_bytes,
+            l2_bytes: profile.cache.l2_bytes,
+            vec_reg_count: profile.vec_regs.len(),
+            gpr_count: profile.gpr_regs.len(),
+        }
+    }
 }
 
-/// SM90 WGMMA 配置。
-#[derive(Debug, Clone)]
-pub struct WgmmaConfig {
-    pub m: usize,          // 通常 64
-    pub n: usize,          // 8/16/32
-    pub k: usize,          // 16/32/64
-    pub input_dtype: DType, // FP16/BF16/FP8
-    pub acc_dtype: DType,   // F32
-    pub async_mode: bool,   // wgmma.mma_async
-    pub tma_prefetch: bool, // TMA 2D prefetch
-}
-
-/// SM100+ tcgen05 配置。
-#[derive(Debug, Clone)]
-pub struct Tcgen05Config {
-    pub m: usize,
-    pub n: usize,
-    pub k: usize,
-    pub block_scaled: bool,  // per-block 缩放因子
-    pub input_dtype: DType,  // FP4/FP6/FP8/FP16/BF16
-    pub acc_dtype: DType,
-    pub tmem_backed: bool,   // 使用 TMEM 替代 SMEM
-    pub two_cta: bool,       // 2-CTA 协同
-}
-
-/// AMD MFMA 配置。
-#[derive(Debug, Clone)]
-pub struct MfmaConfig {
-    pub m: usize,           // 16/32
-    pub n: usize,           // 16/32
-    pub k: usize,           // 4/8/16/32
-    pub input_dtype: DType,  // FP16/BF16/FP8/FP4
-    pub acc_dtype: DType,    // F32
-    pub version: u8,         // 1=CDNA2/3, 2=CDNA4
-}
 
 /// 超越函数实现策略。
 #[derive(Debug, Clone)]
@@ -161,13 +137,11 @@ pub struct BusPortConfig {
 }
 
 // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-// §2 IsaHook trait
+// §2 IsaHook trait (GEMM-FMA 族 select_fma/tile_config 已移除)
 // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 pub trait IsaHook: Send + Sync {
-    fn select_fma(&self, m: usize, n: usize, k: usize) -> FmaStrategy;
     fn gemm_microkernel_shape(&self) -> (usize, usize);
-    fn tile_config(&self, m: usize, n: usize, k: usize) -> Option<TileConfig>;
     fn transcendental_impl(&self, func: super::instr::TranscendentalFn) -> TransImpl;
     fn epilogue_strategy(&self, acc_count: usize, epi_ops: usize) -> EpiloguePlace;
     fn prefetch_hint(&self, access: &AccessPattern) -> Option<PrefetchConfig>;
@@ -207,14 +181,12 @@ pub trait IsaHook: Send + Sync {
 
 pub struct X86Avx2Hook;
 impl IsaHook for X86Avx2Hook {
-    fn select_fma(&self, _m: usize, _n: usize, _k: usize) -> FmaStrategy { FmaStrategy::Fma3 }
     // ARCH-AVX2-REGALLOC-BUDGET: AVX2 有 16 YMM — 减去 3 个 scratch (spill/reduce/const
     // broadcast) 剩 13 可分配。BLIS mr×nr 个累加器 + a_broadcast + b_vec = mr*nr + 2
     // 必须 ≤ 13。历史 (6,2) = 14 超池,触发 "v16 not allocated to YMM"。改为 (4,2) = 10
     // + 2 scratch = 12,留 1 slot 缓冲;微内核带宽损失由 AVX2 L1 带宽本身有限
     // (32 B/cycle) 吸收。AVX-512 有 32 ZMM,保持 (14, 2) 不变。
     fn gemm_microkernel_shape(&self) -> (usize, usize) { (4, 2) }
-    fn tile_config(&self, _m: usize, _n: usize, _k: usize) -> Option<TileConfig> { None }
     fn transcendental_impl(&self, _: super::instr::TranscendentalFn) -> TransImpl { TransImpl::Polynomial { degree: 5 } }
     fn epilogue_strategy(&self, acc: usize, epi: usize) -> EpiloguePlace {
         if acc + epi * 2 <= 16 { EpiloguePlace::OnAccumulators } else { EpiloguePlace::AfterStore }
@@ -226,9 +198,7 @@ impl IsaHook for X86Avx2Hook {
 
 pub struct X86Avx512Hook;
 impl IsaHook for X86Avx512Hook {
-    fn select_fma(&self, _m: usize, _n: usize, _k: usize) -> FmaStrategy { FmaStrategy::Fma3 }
     fn gemm_microkernel_shape(&self) -> (usize, usize) { (14, 2) }
-    fn tile_config(&self, _m: usize, _n: usize, _k: usize) -> Option<TileConfig> { None }
     fn transcendental_impl(&self, _: super::instr::TranscendentalFn) -> TransImpl { TransImpl::Polynomial { degree: 5 } }
     fn epilogue_strategy(&self, acc: usize, epi: usize) -> EpiloguePlace {
         if acc + epi * 2 <= 32 { EpiloguePlace::OnAccumulators } else { EpiloguePlace::AfterStore }
@@ -242,6 +212,10 @@ impl IsaHook for X86Avx512Hook {
 }
 
 /// x86_64 AMX+ Hook (SPR / Granite Rapids / Diamond Rapids)。
+///
+/// 保留 `has_amx_fp16` 等字段供 OpImpl selector 之外的诊断/调试使用;
+/// GEMM-FMA 选择已迁移到 `super::gemm_impls::select_gemm_impl`,
+/// 该 hook 不再决定 FmaStrategy。
 pub struct X86AmxHook {
     pub has_amx_fp16: bool,
     pub has_amx_complex: bool,
@@ -250,38 +224,11 @@ pub struct X86AmxHook {
 }
 
 impl IsaHook for X86AmxHook {
-    fn select_fma(&self, m: usize, n: usize, k: usize) -> FmaStrategy {
-        if m >= 16 && n >= 16 && k >= 32 {
-            let (k_depth, dtype) = if self.has_amx_fp8 {
-                (64, DType::F8E4M3) // Diamond Rapids FP8
-            } else if self.has_amx_fp16 {
-                (32, DType::F16) // Granite Rapids FP16
-            } else {
-                (32, DType::BF16) // Sapphire Rapids BF16
-            };
-            FmaStrategy::TileMma(TileConfig { rows: 16, cols: 16, k_depth, dtype })
-        } else {
-            FmaStrategy::Fma3
-        }
-    }
-
     fn gemm_microkernel_shape(&self) -> (usize, usize) { (16, 16) }
-
-    fn tile_config(&self, m: usize, n: usize, _k: usize) -> Option<TileConfig> {
-        if m >= 16 && n >= 16 {
-            let (k_depth, dtype) = if self.has_amx_fp8 { (64, DType::F8E4M3) }
-                else if self.has_amx_fp16 { (32, DType::F16) }
-                else { (32, DType::BF16) };
-            Some(TileConfig { rows: 16, cols: 16, k_depth, dtype })
-        } else { None }
-    }
-
     fn transcendental_impl(&self, _: super::instr::TranscendentalFn) -> TransImpl { TransImpl::Polynomial { degree: 5 } }
-
     fn epilogue_strategy(&self, acc: usize, epi: usize) -> EpiloguePlace {
         if acc + epi * 2 <= 32 { EpiloguePlace::OnAccumulators } else { EpiloguePlace::AfterStore }
     }
-
     fn prefetch_hint(&self, _: &AccessPattern) -> Option<PrefetchConfig> {
         Some(PrefetchConfig { distance: 1024, hint: PrefetchHint::T0 })
     }
@@ -294,15 +241,7 @@ impl IsaHook for X86AmxHook {
 /// SM70 (Volta/Turing): wmma 16×16×16, FP16 TC, 无异步。
 pub struct GpuSm70Hook;
 impl IsaHook for GpuSm70Hook {
-    fn select_fma(&self, m: usize, n: usize, k: usize) -> FmaStrategy {
-        if m >= 16 && n >= 16 && k >= 16 {
-            FmaStrategy::TileMma(TileConfig { rows: 16, cols: 16, k_depth: 16, dtype: DType::F16 })
-        } else { FmaStrategy::Fma3 }
-    }
     fn gemm_microkernel_shape(&self) -> (usize, usize) { (16, 16) }
-    fn tile_config(&self, m: usize, n: usize, _k: usize) -> Option<TileConfig> {
-        if m >= 16 && n >= 16 { Some(TileConfig { rows: 16, cols: 16, k_depth: 16, dtype: DType::F16 }) } else { None }
-    }
     fn transcendental_impl(&self, _: super::instr::TranscendentalFn) -> TransImpl { TransImpl::HardwareInstr }
     fn epilogue_strategy(&self, _: usize, _: usize) -> EpiloguePlace { EpiloguePlace::AfterStore }
     fn prefetch_hint(&self, _: &AccessPattern) -> Option<PrefetchConfig> { None }
@@ -318,15 +257,7 @@ impl IsaHook for GpuSm70Hook {
 /// SM80-89 (Ampere/Ada): mma.sync 16×8×16, cp.async, BF16/TF32。
 pub struct GpuSm80Hook { pub sm_version: u32 }
 impl IsaHook for GpuSm80Hook {
-    fn select_fma(&self, m: usize, n: usize, k: usize) -> FmaStrategy {
-        if m >= 16 && n >= 8 && k >= 16 {
-            FmaStrategy::TileMma(TileConfig { rows: 16, cols: 8, k_depth: 16, dtype: DType::BF16 })
-        } else { FmaStrategy::Fma3 }
-    }
     fn gemm_microkernel_shape(&self) -> (usize, usize) { (16, 8) }
-    fn tile_config(&self, m: usize, n: usize, _k: usize) -> Option<TileConfig> {
-        if m >= 16 && n >= 8 { Some(TileConfig { rows: 16, cols: 8, k_depth: 16, dtype: DType::BF16 }) } else { None }
-    }
     fn transcendental_impl(&self, _: super::instr::TranscendentalFn) -> TransImpl { TransImpl::HardwareInstr }
     fn epilogue_strategy(&self, _: usize, epi: usize) -> EpiloguePlace {
         if epi <= 4 { EpiloguePlace::OnAccumulators } else { EpiloguePlace::AfterStore }
@@ -346,22 +277,7 @@ impl IsaHook for GpuSm80Hook {
 /// SM90 (Hopper H100): WGMMA 16×N×K, TMA 2D/5D, warp specialization。
 pub struct GpuSm90Hook;
 impl IsaHook for GpuSm90Hook {
-    fn select_fma(&self, m: usize, n: usize, k: usize) -> FmaStrategy {
-        if m >= 64 && n >= 8 && k >= 16 {
-            FmaStrategy::Wgmma(WgmmaConfig {
-                m: 64, n: n.min(32), k: k.min(64),
-                input_dtype: DType::BF16, acc_dtype: DType::F32,
-                async_mode: true, tma_prefetch: true,
-            })
-        } else if m >= 16 && n >= 8 {
-            FmaStrategy::TileMma(TileConfig { rows: 16, cols: 8, k_depth: 16, dtype: DType::BF16 })
-        } else { FmaStrategy::Fma3 }
-    }
     fn gemm_microkernel_shape(&self) -> (usize, usize) { (64, 16) } // Warpgroup 64×N
-    fn tile_config(&self, m: usize, n: usize, k: usize) -> Option<TileConfig> {
-        if m >= 64 { Some(TileConfig { rows: 64, cols: n.min(32), k_depth: k.min(64), dtype: DType::BF16 }) }
-        else { None }
-    }
     fn transcendental_impl(&self, _: super::instr::TranscendentalFn) -> TransImpl { TransImpl::HardwareInstr }
     fn epilogue_strategy(&self, _: usize, epi: usize) -> EpiloguePlace {
         if epi <= 6 { EpiloguePlace::OnAccumulators } else { EpiloguePlace::AfterStore }
@@ -381,25 +297,7 @@ impl IsaHook for GpuSm90Hook {
 /// SM100+ (Blackwell B100/B200): tcgen05.mma, TMEM, block-scaled, FP4/FP6。
 pub struct GpuSm100Hook;
 impl IsaHook for GpuSm100Hook {
-    fn select_fma(&self, m: usize, n: usize, k: usize) -> FmaStrategy {
-        if m >= 64 && n >= 16 && k >= 16 {
-            FmaStrategy::Tcgen05(Tcgen05Config {
-                m: 64, n: n.min(64), k: k.min(64),
-                block_scaled: true, input_dtype: DType::F16, acc_dtype: DType::F32,
-                tmem_backed: true, two_cta: m >= 128,
-            })
-        } else {
-            FmaStrategy::Wgmma(WgmmaConfig {
-                m: 64, n: n.min(32), k: k.min(64),
-                input_dtype: DType::BF16, acc_dtype: DType::F32,
-                async_mode: true, tma_prefetch: true,
-            })
-        }
-    }
     fn gemm_microkernel_shape(&self) -> (usize, usize) { (64, 64) }
-    fn tile_config(&self, m: usize, n: usize, k: usize) -> Option<TileConfig> {
-        Some(TileConfig { rows: m.min(64), cols: n.min(64), k_depth: k.min(64), dtype: DType::F16 })
-    }
     fn transcendental_impl(&self, _: super::instr::TranscendentalFn) -> TransImpl { TransImpl::HardwareInstr }
     fn epilogue_strategy(&self, _: usize, epi: usize) -> EpiloguePlace {
         if epi <= 8 { EpiloguePlace::OnAccumulators } else { EpiloguePlace::AfterStore }
@@ -423,15 +321,7 @@ impl IsaHook for GpuSm100Hook {
 /// CDNA2 (gfx908/MI250): MFMA 16×16×16, wave64。
 pub struct GpuCdna2Hook;
 impl IsaHook for GpuCdna2Hook {
-    fn select_fma(&self, m: usize, n: usize, k: usize) -> FmaStrategy {
-        if m >= 16 && n >= 16 && k >= 16 {
-            FmaStrategy::Mfma(MfmaConfig { m: 16, n: 16, k: 16, input_dtype: DType::F16, acc_dtype: DType::F32, version: 1 })
-        } else { FmaStrategy::Fma3 }
-    }
     fn gemm_microkernel_shape(&self) -> (usize, usize) { (16, 16) }
-    fn tile_config(&self, m: usize, n: usize, _k: usize) -> Option<TileConfig> {
-        if m >= 16 && n >= 16 { Some(TileConfig { rows: 16, cols: 16, k_depth: 16, dtype: DType::F16 }) } else { None }
-    }
     fn transcendental_impl(&self, _: super::instr::TranscendentalFn) -> TransImpl { TransImpl::Polynomial { degree: 5 } }
     fn epilogue_strategy(&self, _: usize, epi: usize) -> EpiloguePlace {
         if epi <= 4 { EpiloguePlace::OnAccumulators } else { EpiloguePlace::AfterStore }
@@ -444,15 +334,7 @@ impl IsaHook for GpuCdna2Hook {
 /// CDNA3 (gfx942/MI300): MFMA 16×16×16, XCD 拓扑隔离。
 pub struct GpuCdna3Hook;
 impl IsaHook for GpuCdna3Hook {
-    fn select_fma(&self, m: usize, n: usize, k: usize) -> FmaStrategy {
-        if m >= 16 && n >= 16 && k >= 16 {
-            FmaStrategy::Mfma(MfmaConfig { m: 16, n: 16, k: 16, input_dtype: DType::BF16, acc_dtype: DType::F32, version: 1 })
-        } else { FmaStrategy::Fma3 }
-    }
     fn gemm_microkernel_shape(&self) -> (usize, usize) { (16, 16) }
-    fn tile_config(&self, m: usize, n: usize, _k: usize) -> Option<TileConfig> {
-        if m >= 16 && n >= 16 { Some(TileConfig { rows: 16, cols: 16, k_depth: 16, dtype: DType::BF16 }) } else { None }
-    }
     fn transcendental_impl(&self, _: super::instr::TranscendentalFn) -> TransImpl { TransImpl::Polynomial { degree: 5 } }
     fn epilogue_strategy(&self, _: usize, epi: usize) -> EpiloguePlace {
         if epi <= 4 { EpiloguePlace::OnAccumulators } else { EpiloguePlace::AfterStore }
@@ -465,19 +347,7 @@ impl IsaHook for GpuCdna3Hook {
 /// CDNA4 (gfx950/MI400): MFMA v2 32×32×16, FP8/FP4, wave64, 128KB LDS。
 pub struct GpuCdna4Hook;
 impl IsaHook for GpuCdna4Hook {
-    fn select_fma(&self, m: usize, n: usize, k: usize) -> FmaStrategy {
-        if m >= 32 && n >= 32 && k >= 16 {
-            FmaStrategy::Mfma(MfmaConfig { m: 32, n: 32, k: 16, input_dtype: DType::BF16, acc_dtype: DType::F32, version: 2 })
-        } else if m >= 16 && n >= 16 && k >= 16 {
-            FmaStrategy::Mfma(MfmaConfig { m: 16, n: 16, k: 32, input_dtype: DType::F16, acc_dtype: DType::F32, version: 2 })
-        } else { FmaStrategy::Fma3 }
-    }
     fn gemm_microkernel_shape(&self) -> (usize, usize) { (32, 32) }
-    fn tile_config(&self, m: usize, n: usize, _k: usize) -> Option<TileConfig> {
-        if m >= 32 && n >= 32 { Some(TileConfig { rows: 32, cols: 32, k_depth: 16, dtype: DType::BF16 }) }
-        else if m >= 16 && n >= 16 { Some(TileConfig { rows: 16, cols: 16, k_depth: 32, dtype: DType::F16 }) }
-        else { None }
-    }
     fn transcendental_impl(&self, _: super::instr::TranscendentalFn) -> TransImpl { TransImpl::Polynomial { degree: 5 } }
     fn epilogue_strategy(&self, _: usize, epi: usize) -> EpiloguePlace {
         if epi <= 6 { EpiloguePlace::OnAccumulators } else { EpiloguePlace::AfterStore }
@@ -501,9 +371,7 @@ impl IsaHook for GpuCdna4Hook {
 /// ARM NEON Hook: 128-bit 固定宽度, FMLA v.4s。
 pub struct ArmNeonHook;
 impl IsaHook for ArmNeonHook {
-    fn select_fma(&self, _m: usize, _n: usize, _k: usize) -> FmaStrategy { FmaStrategy::Fma3 }
     fn gemm_microkernel_shape(&self) -> (usize, usize) { (8, 12) }
-    fn tile_config(&self, _m: usize, _n: usize, _k: usize) -> Option<TileConfig> { None }
     fn transcendental_impl(&self, _: super::instr::TranscendentalFn) -> TransImpl { TransImpl::Polynomial { degree: 5 } }
     fn epilogue_strategy(&self, acc: usize, epi: usize) -> EpiloguePlace {
         if acc + epi * 2 <= 32 { EpiloguePlace::OnAccumulators } else { EpiloguePlace::AfterStore }
@@ -516,12 +384,10 @@ impl IsaHook for ArmNeonHook {
 /// ARM SVE2 Hook: scalable vector, predicated ops, BLIS-style GEMM。
 pub struct ArmSveHook { pub sve_vl: usize }
 impl IsaHook for ArmSveHook {
-    fn select_fma(&self, _m: usize, _n: usize, _k: usize) -> FmaStrategy { FmaStrategy::Fma3 }
     fn gemm_microkernel_shape(&self) -> (usize, usize) {
         let lanes = self.sve_vl / 4; // f32 lanes
         (lanes * 2, 2) // 类似 BLIS 但利用 SVE 宽度
     }
-    fn tile_config(&self, _m: usize, _n: usize, _k: usize) -> Option<TileConfig> { None }
     fn transcendental_impl(&self, _: super::instr::TranscendentalFn) -> TransImpl { TransImpl::Polynomial { degree: 5 } }
     fn epilogue_strategy(&self, acc: usize, epi: usize) -> EpiloguePlace {
         if acc + epi * 2 <= 32 { EpiloguePlace::OnAccumulators } else { EpiloguePlace::AfterStore }
@@ -534,23 +400,9 @@ impl IsaHook for ArmSveHook {
 /// ARM SME2 Hook: ZA tile outer product, multi-vec FMLA, streaming SVE。
 pub struct ArmSmeHook { pub sme_vl: usize }
 impl IsaHook for ArmSmeHook {
-    fn select_fma(&self, m: usize, n: usize, k: usize) -> FmaStrategy {
-        let za_dim = self.sme_vl / 4; // ZA 行/列数 (f32)
-        if m >= za_dim && n >= za_dim && k >= 4 {
-            FmaStrategy::TileMma(TileConfig {
-                rows: za_dim, cols: za_dim, k_depth: 4, dtype: DType::F32,
-            })
-        } else { FmaStrategy::Fma3 }
-    }
     fn gemm_microkernel_shape(&self) -> (usize, usize) {
         let za_dim = self.sme_vl / 4;
         (za_dim, za_dim)
-    }
-    fn tile_config(&self, m: usize, n: usize, _k: usize) -> Option<TileConfig> {
-        let za_dim = self.sme_vl / 4;
-        if m >= za_dim && n >= za_dim {
-            Some(TileConfig { rows: za_dim, cols: za_dim, k_depth: 4, dtype: DType::F32 })
-        } else { None }
     }
     fn transcendental_impl(&self, _: super::instr::TranscendentalFn) -> TransImpl { TransImpl::Polynomial { degree: 5 } }
     fn epilogue_strategy(&self, acc: usize, epi: usize) -> EpiloguePlace {
@@ -559,134 +411,6 @@ impl IsaHook for ArmSmeHook {
     fn prefetch_hint(&self, _: &AccessPattern) -> Option<PrefetchConfig> {
         Some(PrefetchConfig { distance: 2048, hint: PrefetchHint::T0 })
     }
-}
-
-// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-// §6.5 自调优: ResourceBudget + FmaCandidate + select_fma_best
-// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-
-/// 硬件资源预算 — 用于 GEMM 策略选择成本模型。
-#[derive(Debug, Clone)]
-pub struct ResourceBudget {
-    /// L1D 可用字节
-    pub l1d_bytes: usize,
-    /// L2 可用字节
-    pub l2_bytes: usize,
-    /// 可分配向量寄存器数量
-    pub vec_reg_count: usize,
-    /// 可分配 GPR 数量
-    pub gpr_count: usize,
-}
-
-impl ResourceBudget {
-    /// 从 IsaProfile 提取资源预算。
-    pub fn from_isa_profile(profile: &super::isa_profile::IsaProfile) -> Self {
-        Self {
-            l1d_bytes: profile.cache.l1d_bytes,
-            l2_bytes: profile.cache.l2_bytes,
-            vec_reg_count: profile.vec_regs.len(),
-            gpr_count: profile.gpr_regs.len(),
-        }
-    }
-}
-
-/// FMA 策略候选 + 估算成本。
-#[derive(Debug, Clone)]
-pub struct FmaCandidate {
-    pub strategy: FmaStrategy,
-    pub estimated_cost: f64,
-}
-
-/// 为给定 GEMM shape 生成候选 FMA 策略列表。
-///
-/// 对 hook 返回的基准策略生成 1-3 个 tiling 变体。
-pub fn select_fma_candidates(
-    hook: &dyn IsaHook,
-    m: usize, n: usize, k: usize,
-    _dtype: DType,
-) -> Vec<FmaCandidate> {
-    let base = hook.select_fma(m, n, k);
-    vec![FmaCandidate { strategy: base, estimated_cost: 0.0 }]
-}
-
-/// 估算 FMA 策略在给定资源预算下的执行成本。
-///
-/// 成本模型:
-/// - 计算吞吐: FMA 单元利用率
-/// - 寄存器压力: 累加器占用 vs 可用寄存器 (spill penalty)
-/// - Cache 友好性: 分块是否 fit L1/L2
-pub fn estimate_strategy_cost(
-    strategy: &FmaStrategy,
-    m: usize, n: usize, k: usize,
-    budget: &ResourceBudget,
-) -> f64 {
-    let compute_cost = (m * n * k) as f64;
-    let reg_penalty = match strategy {
-        FmaStrategy::TileMma(tc) => {
-            let tile_elems = tc.rows * tc.cols;
-            if tile_elems > budget.vec_reg_count * 8 {
-                tile_elems as f64 * 0.5
-            } else {
-                0.0
-            }
-        }
-        FmaStrategy::Wgmma(cfg) => {
-            let tile_elems = cfg.m * cfg.n;
-            if tile_elems > 32 { tile_elems as f64 * 0.3 } else { 0.0 }
-        }
-        FmaStrategy::Tcgen05(cfg) => {
-            let penalty = if cfg.block_scaled { 0.1 } else { 0.0 };
-            let tile_elems = cfg.m * cfg.n;
-            penalty + if tile_elems > 64 { tile_elems as f64 * 0.2 } else { 0.0 }
-        }
-        FmaStrategy::Mfma(cfg) => {
-            let tile_elems = cfg.m * cfg.n;
-            if tile_elems > budget.vec_reg_count * 4 {
-                tile_elems as f64 * 0.4
-            } else {
-                0.0
-            }
-        }
-        FmaStrategy::Fma3 | FmaStrategy::MulAdd => {
-            // Check if accumulator set fits in registers
-            let mr = 4; // conservative estimate
-            let nr = 2;
-            let acc_regs = mr * nr;
-            if acc_regs > budget.vec_reg_count / 2 {
-                acc_regs as f64 * 2.0
-            } else {
-                0.0
-            }
-        }
-    };
-    // L1 cache friendliness: penalize if working set exceeds L1
-    let working_set = (m * k + k * n + m * n) * 4; // F32
-    let cache_penalty = if working_set > budget.l1d_bytes {
-        (working_set as f64 / budget.l1d_bytes.max(1) as f64) * 0.3
-    } else {
-        0.0
-    };
-    compute_cost + reg_penalty + cache_penalty
-}
-
-/// 选择最优 FMA 策略 — 并行评估所有候选，返回成本最低的。
-///
-/// 基于硬件资源预算的成本模型选择最佳 tiling 方案。
-pub fn select_fma_best(
-    hook: &dyn IsaHook,
-    m: usize, n: usize, k: usize,
-    dtype: DType,
-    budget: &ResourceBudget,
-) -> FmaStrategy {
-    let candidates = select_fma_candidates(hook, m, n, k, dtype);
-    candidates.into_par_iter()
-        .map(|mut c| {
-            c.estimated_cost = estimate_strategy_cost(&c.strategy, m, n, k, budget);
-            c
-        })
-        .min_by(|a, b| a.estimated_cost.partial_cmp(&b.estimated_cost).unwrap_or(std::cmp::Ordering::Equal))
-        .map(|c| c.strategy)
-        .unwrap_or_else(|| hook.select_fma(m, n, k))
 }
 
 // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -751,11 +475,6 @@ mod tests {
         let dp = crate::dispatch::DeviceProfile::detect();
         let profile = super::super::isa_profile::IsaProfile::from_device_profile(&dp);
         let hook = select_hook(&profile);
-        match hook.select_fma(64, 64, 64) {
-            FmaStrategy::Fma3 | FmaStrategy::TileMma(_) => {}
-            FmaStrategy::MulAdd => panic!("expected FMA3 or TileMma on modern x86"),
-            _ => {} // Wgmma/Tcgen05/Mfma also valid on GPU
-        }
         let (mr, nr) = hook.gemm_microkernel_shape();
         assert!(mr >= 1 && nr >= 1);
     }
@@ -763,41 +482,23 @@ mod tests {
     #[test]
     fn test_avx2_hook() {
         let h = X86Avx2Hook;
-        assert!(matches!(h.select_fma(4, 8, 16), FmaStrategy::Fma3));
         // ARCH-AVX2-REGALLOC-BUDGET: microkernel 锁定 (4, 2) 以匹配 13-slot YMM 池。
         assert_eq!(h.gemm_microkernel_shape(), (4, 2));
-        assert!(h.tile_config(64, 64, 64).is_none());
     }
 
     #[test]
-    fn test_amx_hook_with_fp16() {
-        let h = X86AmxHook { has_amx_fp16: true, has_amx_complex: false, has_amx_fp8: false, has_amx_transpose: false };
-        match h.select_fma(64, 64, 64) {
-            FmaStrategy::TileMma(tc) => { assert_eq!(tc.dtype, DType::F16); assert_eq!(tc.k_depth, 32); }
-            _ => panic!("expected TileMma with FP16"),
-        }
+    fn test_avx512_hook_microkernel_and_epilogue() {
+        let h = X86Avx512Hook;
+        assert_eq!(h.gemm_microkernel_shape(), (14, 2));
+        assert_eq!(h.epilogue_strategy(10, 4), EpiloguePlace::OnAccumulators);
+        assert_eq!(h.epilogue_strategy(28, 3), EpiloguePlace::AfterStore);
+        let pf = h.prefetch_hint(&AccessPattern { stride: 64, total_bytes: 8192, reuse_count: 2 }).unwrap();
+        assert_eq!(pf.distance, 768);
     }
 
     #[test]
-    fn test_amx_hook_with_fp8() {
-        let h = X86AmxHook { has_amx_fp16: true, has_amx_complex: false, has_amx_fp8: true, has_amx_transpose: false };
-        match h.select_fma(64, 64, 64) {
-            FmaStrategy::TileMma(tc) => { assert_eq!(tc.dtype, DType::F8E4M3); assert_eq!(tc.k_depth, 64); }
-            _ => panic!("expected TileMma with FP8"),
-        }
-    }
-
-    #[test]
-    fn test_sm90_hook_wgmma() {
+    fn test_sm90_hook_attention() {
         let h = GpuSm90Hook;
-        match h.select_fma(128, 64, 64) {
-            FmaStrategy::Wgmma(cfg) => {
-                assert!(cfg.async_mode);
-                assert!(cfg.tma_prefetch);
-                assert_eq!(cfg.m, 64);
-            }
-            _ => panic!("expected Wgmma for large matrix on SM90"),
-        }
         match h.select_attention(2048, 128) {
             AttentionStrategy::FlashV3 { tma, warp_spec, .. } => {
                 assert!(tma);
@@ -808,47 +509,14 @@ mod tests {
     }
 
     #[test]
-    fn test_sm100_hook_tcgen05() {
+    fn test_sm100_hook_attention() {
         let h = GpuSm100Hook;
-        match h.select_fma(128, 64, 64) {
-            FmaStrategy::Tcgen05(cfg) => {
-                assert!(cfg.block_scaled);
-                assert!(cfg.tmem_backed);
-            }
-            _ => panic!("expected Tcgen05 on SM100+"),
-        }
         match h.select_attention(4096, 128) {
             AttentionStrategy::FlashV4 { tmem, block_scaled, .. } => {
                 assert!(tmem);
                 assert!(block_scaled);
             }
             _ => panic!("expected FlashV4 on SM100+"),
-        }
-    }
-
-    #[test]
-    fn test_cdna4_hook_mfma_v2() {
-        let h = GpuCdna4Hook;
-        match h.select_fma(64, 64, 64) {
-            FmaStrategy::Mfma(cfg) => {
-                assert_eq!(cfg.version, 2);
-                assert_eq!(cfg.m, 32);
-                assert_eq!(cfg.n, 32);
-            }
-            _ => panic!("expected MFMA v2 on CDNA4"),
-        }
-    }
-
-    #[test]
-    fn test_arm_sme_hook() {
-        let h = ArmSmeHook { sme_vl: 64 }; // 512-bit SVE → 16 f32 lanes
-        let za_dim = 64 / 4; // 16
-        match h.select_fma(64, 64, 16) {
-            FmaStrategy::TileMma(tc) => {
-                assert_eq!(tc.rows, za_dim);
-                assert_eq!(tc.cols, za_dim);
-            }
-            _ => panic!("expected TileMma for SME"),
         }
     }
 
@@ -869,16 +537,6 @@ mod tests {
     }
 
     #[test]
-    fn test_hook_selection_hip_profiles() {
-        let profile = super::super::isa_profile::IsaProfile::hip(950);
-        let hook = select_hook(&profile);
-        match hook.select_fma(64, 64, 64) {
-            FmaStrategy::Mfma(cfg) => assert_eq!(cfg.version, 2),
-            _ => panic!("expected MFMA v2 for gfx950"),
-        }
-    }
-
-    #[test]
     fn test_all_gpu_hooks_moe_in_kernel() {
         for hook in [
             select_hook(&super::super::isa_profile::IsaProfile::cuda(70)),
@@ -888,73 +546,6 @@ mod tests {
         ] {
             assert!(matches!(hook.moe_dispatch(64), MoeDispatchStrategy::InKernelJmp));
         }
-    }
-
-    #[test]
-    fn test_select_fma_best_returns_valid_strategy() {
-        let dp = crate::dispatch::DeviceProfile::detect();
-        let profile = super::super::isa_profile::IsaProfile::from_device_profile(&dp);
-        let hook = select_hook(&profile);
-        let budget = ResourceBudget::from_isa_profile(&profile);
-        let strategy = select_fma_best(hook.as_ref(), 64, 64, 64, DType::F32, &budget);
-        match strategy {
-            FmaStrategy::Fma3 | FmaStrategy::MulAdd | FmaStrategy::TileMma(_)
-            | FmaStrategy::Wgmma(_) | FmaStrategy::Tcgen05(_) | FmaStrategy::Mfma(_) => {}
-        }
-    }
-
-    #[test]
-    fn test_estimate_strategy_cost_positive() {
-        let budget = ResourceBudget { l1d_bytes: 32768, l2_bytes: 262144, vec_reg_count: 16, gpr_count: 16 };
-        let cost = estimate_strategy_cost(&FmaStrategy::Fma3, 64, 64, 64, &budget);
-        assert!(cost > 0.0, "cost should be positive: got {cost}");
-    }
-
-    #[test]
-    fn test_resource_budget_from_profile() {
-        let dp = crate::dispatch::DeviceProfile::detect();
-        let profile = super::super::isa_profile::IsaProfile::from_device_profile(&dp);
-        let budget = ResourceBudget::from_isa_profile(&profile);
-        assert!(budget.l1d_bytes > 0);
-        assert!(budget.vec_reg_count > 0);
-    }
-
-    #[test]
-    fn test_avx512_hook_microkernel_and_epilogue() {
-        let h = X86Avx512Hook;
-        assert_eq!(h.gemm_microkernel_shape(), (14, 2));
-        assert!(h.tile_config(128, 128, 128).is_none());
-        assert_eq!(h.epilogue_strategy(10, 4), EpiloguePlace::OnAccumulators);
-        assert_eq!(h.epilogue_strategy(28, 3), EpiloguePlace::AfterStore);
-        let pf = h.prefetch_hint(&AccessPattern { stride: 64, total_bytes: 8192, reuse_count: 2 }).unwrap();
-        assert_eq!(pf.distance, 768);
-    }
-
-    #[test]
-    fn test_sm70_hook_flash_decoding_for_decode_step() {
-        let h = GpuSm70Hook;
-        match h.select_attention(1, 128) {
-            AttentionStrategy::FlashDecoding { split_k, tile_kv } => {
-                assert_eq!(split_k, 4);
-                assert_eq!(tile_kv, 512);
-            }
-            other => panic!("expected FlashDecoding for seq_len=1, got {:?}", other),
-        }
-        assert!(h.is_gpu());
-        assert!(matches!(h.moe_dispatch(8), MoeDispatchStrategy::InKernelJmp));
-        assert!(matches!(h.transcendental_impl(super::super::instr::TranscendentalFn::Exp), TransImpl::HardwareInstr));
-    }
-
-    #[test]
-    fn test_sm80_hook_tile_config_and_fallback_fma() {
-        let h = GpuSm80Hook { sm_version: 86 };
-        assert_eq!(h.gemm_microkernel_shape(), (16, 8));
-        let tc = h.tile_config(32, 16, 64).unwrap();
-        assert_eq!(tc.rows, 16);
-        assert_eq!(tc.cols, 8);
-        assert!(matches!(h.select_fma(4, 4, 4), FmaStrategy::Fma3));
-        assert!(h.tile_config(4, 4, 4).is_none());
-        assert!(h.is_gpu());
     }
 
     #[test]
@@ -992,7 +583,6 @@ mod tests {
     fn test_arm_neon_hook_epilogue_and_prefetch() {
         let h = ArmNeonHook;
         assert_eq!(h.gemm_microkernel_shape(), (8, 12));
-        assert!(h.tile_config(64, 64, 64).is_none());
         assert_eq!(h.epilogue_strategy(10, 4), EpiloguePlace::OnAccumulators);
         assert!(h.prefetch_hint(&AccessPattern { stride: 64, total_bytes: 1024, reuse_count: 1 }).is_none());
         let pf = h.prefetch_hint(&AccessPattern { stride: 64, total_bytes: 8192, reuse_count: 2 }).unwrap();
@@ -1025,329 +615,7 @@ mod tests {
     }
 
     #[test]
-    fn test_cdna2_hook_mfma_v1_bf16() {
-        let h = GpuCdna2Hook;
-        match h.select_fma(32, 32, 32) {
-            FmaStrategy::Mfma(cfg) => {
-                assert_eq!(cfg.version, 1);
-                assert_eq!(cfg.m, 16);
-                assert_eq!(cfg.n, 16);
-                assert_eq!(cfg.k, 16);
-                assert_eq!(cfg.input_dtype, DType::F16);
-            }
-            other => panic!("expected MFMA v1 on CDNA2, got {:?}", other),
-        }
-        assert!(matches!(h.select_fma(4, 4, 4), FmaStrategy::Fma3));
-        assert!(h.tile_config(4, 4, 4).is_none());
-        assert!(matches!(h.transcendental_impl(super::super::instr::TranscendentalFn::Tanh), TransImpl::Polynomial { degree: 5 }));
-    }
-
-    #[test]
-    fn test_cdna3_hook_mfma_v1_bf16_input() {
-        let h = GpuCdna3Hook;
-        match h.select_fma(32, 32, 32) {
-            FmaStrategy::Mfma(cfg) => {
-                assert_eq!(cfg.version, 1);
-                assert_eq!(cfg.input_dtype, DType::BF16);
-            }
-            other => panic!("expected MFMA v1 with BF16 on CDNA3, got {:?}", other),
-        }
-        assert!(h.is_gpu());
-        assert!(matches!(h.moe_dispatch(64), MoeDispatchStrategy::InKernelJmp));
-    }
-
-    #[test]
-    fn test_select_fma_candidates_single_base_strategy() {
-        let h = X86Avx2Hook;
-        let candidates = select_fma_candidates(&h, 64, 64, 64, DType::F32);
-        assert_eq!(candidates.len(), 1);
-        assert!(matches!(candidates[0].strategy, FmaStrategy::Fma3));
-    }
-
-    #[test]
-    fn test_amx_hook_fallback_to_fma3_for_small_matrix() {
-        let h = X86AmxHook { has_amx_fp16: true, has_amx_complex: false, has_amx_fp8: false, has_amx_transpose: false };
-        assert!(matches!(h.select_fma(8, 8, 8), FmaStrategy::Fma3));
-        assert!(h.tile_config(8, 8, 32).is_none());
-    }
-
-    #[test]
-    fn test_sm90_small_matrix_falls_back_to_tile_mma() {
-        // Arrange: SM90 with matrix too small for WGMMA (m < 64) but large enough for TileMma
-        let h = GpuSm90Hook;
-
-        // Act: select_fma with m=32 (below WGMMA 64 threshold, above TileMma 16 threshold)
-        let strategy = h.select_fma(32, 16, 32);
-
-        // Assert: should get TileMma, not Wgmma
-        match strategy {
-            FmaStrategy::TileMma(tc) => {
-                assert_eq!(tc.rows, 16);
-                assert_eq!(tc.cols, 8);
-                assert_eq!(tc.dtype, DType::BF16);
-            }
-            other => panic!("expected TileMma for 32x16 on SM90, got {:?}", other),
-        }
-        // tile_config returns None when m < 64 (WGMMA threshold)
-        assert!(h.tile_config(32, 16, 32).is_none());
-    }
-
-    #[test]
-    fn test_sm100_small_matrix_falls_back_to_wgmma() {
-        // Arrange: SM100 with matrix too small for tcgen05 (m < 64 or n < 16)
-        let h = GpuSm100Hook;
-
-        // Act: select_fma with m=32, n=8 (below tcgen05 threshold)
-        let strategy = h.select_fma(32, 8, 32);
-
-        // Assert: should fall back to Wgmma
-        match strategy {
-            FmaStrategy::Wgmma(cfg) => {
-                assert_eq!(cfg.m, 64);
-                assert_eq!(cfg.input_dtype, DType::BF16);
-            }
-            other => panic!("expected Wgmma fallback for small matrix on SM100, got {:?}", other),
-        }
-    }
-
-    #[test]
-    fn test_cdna4_medium_matrix_uses_16x16_mfma_v2() {
-        // Arrange: CDNA4 with 16x16 matrix (too small for 32x32 primary path, fits secondary)
-        let h = GpuCdna4Hook;
-
-        // Act: select_fma with m=16, n=16, k=16
-        let strategy = h.select_fma(16, 16, 16);
-
-        // Assert: secondary MFMA path (16x16x32, F16, v2)
-        match strategy {
-            FmaStrategy::Mfma(cfg) => {
-                assert_eq!(cfg.version, 2);
-                assert_eq!(cfg.m, 16);
-                assert_eq!(cfg.n, 16);
-                assert_eq!(cfg.k, 32);
-                assert_eq!(cfg.input_dtype, DType::F16);
-            }
-            other => panic!("expected MFMA v2 16x16 on CDNA4, got {:?}", other),
-        }
-        // tile_config should also return 16x16 variant
-        let tc = h.tile_config(16, 16, 64).unwrap();
-        assert_eq!(tc.rows, 16);
-        assert_eq!(tc.cols, 16);
-        assert_eq!(tc.k_depth, 32);
-    }
-
-    #[test]
-    fn test_arm_sme_small_matrix_falls_back_to_fma3() {
-        // Arrange: SME hook with 512-bit VL, matrix too small for ZA tile (m < za_dim=16)
-        let h = ArmSmeHook { sme_vl: 64 };
-
-        // Act: select_fma with m=8, n=8 (below za_dim=16)
-        let strategy = h.select_fma(8, 8, 16);
-
-        // Assert: falls back to Fma3, no tile config
-        assert!(matches!(strategy, FmaStrategy::Fma3));
-        assert!(h.tile_config(8, 8, 16).is_none());
-    }
-
-    #[test]
-    fn test_epilogue_place_boundary_on_gpu_hooks() {
-        // Arrange: GPU hooks with varying epilogue op counts
-        let sm80 = GpuSm80Hook { sm_version: 80 };
-        let sm90 = GpuSm90Hook;
-        let sm100 = GpuSm100Hook;
-
-        // Act & Assert: SM80 threshold is epi <= 4
-        assert_eq!(sm80.epilogue_strategy(0, 4), EpiloguePlace::OnAccumulators);
-        assert_eq!(sm80.epilogue_strategy(0, 5), EpiloguePlace::AfterStore);
-
-        // SM90 threshold is epi <= 6
-        assert_eq!(sm90.epilogue_strategy(0, 6), EpiloguePlace::OnAccumulators);
-        assert_eq!(sm90.epilogue_strategy(0, 7), EpiloguePlace::AfterStore);
-
-        // SM100 threshold is epi <= 8
-        assert_eq!(sm100.epilogue_strategy(0, 8), EpiloguePlace::OnAccumulators);
-        assert_eq!(sm100.epilogue_strategy(0, 9), EpiloguePlace::AfterStore);
-    }
-
-    #[test]
-    fn test_estimate_strategy_cost_tile_mma_spill_penalty() {
-        // Arrange: TileMma strategy with tile elements exceeding register budget
-        let budget = ResourceBudget {
-            l1d_bytes: 32768,
-            l2_bytes: 262144,
-            vec_reg_count: 4, // very few regs → guaranteed spill
-            gpr_count: 8,
-        };
-        let tile_strategy = FmaStrategy::TileMma(TileConfig {
-            rows: 16, cols: 16, k_depth: 32, dtype: DType::BF16,
-        });
-
-        // Act: estimate cost
-        let cost_tile = estimate_strategy_cost(&tile_strategy, 64, 64, 64, &budget);
-        let cost_fma3 = estimate_strategy_cost(&FmaStrategy::Fma3, 64, 64, 64, &budget);
-
-        // Assert: TileMma with 256 elements vs 4*8=32 budget → spill penalty applied
-        // cost_tile should be higher than fma3 due to tile_elems > vec_reg_count * 8
-        assert!(cost_tile > cost_fma3, "TileMma spill penalty should increase cost: tile={cost_tile}, fma3={cost_fma3}");
-    }
-
-    #[test]
-    fn test_estimate_strategy_cost_mfma_and_tcgen05_variants() {
-        // Arrange: budgets and strategies for MFMA and Tcgen05
-        let budget = ResourceBudget {
-            l1d_bytes: 32768,
-            l2_bytes: 262144,
-            vec_reg_count: 16,
-            gpr_count: 16,
-        };
-        let mfma = FmaStrategy::Mfma(MfmaConfig {
-            m: 32, n: 32, k: 16, input_dtype: DType::BF16, acc_dtype: DType::F32, version: 2,
-        });
-        let tcgen = FmaStrategy::Tcgen05(Tcgen05Config {
-            m: 64, n: 64, k: 64, block_scaled: true, input_dtype: DType::F16,
-            acc_dtype: DType::F32, tmem_backed: true, two_cta: true,
-        });
-
-        // Act: estimate costs
-        let cost_mfma = estimate_strategy_cost(&mfma, 128, 128, 64, &budget);
-        let cost_tcgen = estimate_strategy_cost(&tcgen, 128, 128, 64, &budget);
-
-        // Assert: both should be positive and finite
-        assert!(cost_mfma > 0.0 && cost_mfma.is_finite(), "MFMA cost should be positive finite: {cost_mfma}");
-        assert!(cost_tcgen > 0.0 && cost_tcgen.is_finite(), "Tcgen05 cost should be positive finite: {cost_tcgen}");
-    }
-
-    #[test]
-    fn test_select_hook_aarch64_neon_sve_sme_profiles() {
-        // Arrange: AArch64 profiles for NEON, SVE, and SME
-        let neon_profile = super::super::isa_profile::IsaProfile::aarch64(false, false, 0, false, false, true);
-        let sve_profile = super::super::isa_profile::IsaProfile::aarch64(true, false, 32, false, false, true);
-        let sme_profile = super::super::isa_profile::IsaProfile::aarch64(true, true, 64, true, true, true);
-
-        // Act: select hooks for each profile
-        let neon_hook = select_hook(&neon_profile);
-        let sve_hook = select_hook(&sve_profile);
-        let sme_hook = select_hook(&sme_profile);
-
-        // Assert: NEON has (8,12) shape, SVE has VL-scaled shape, SME has ZA-square shape
-        assert_eq!(neon_hook.gemm_microkernel_shape(), (8, 12));
-        let (mr_sve, _) = sve_hook.gemm_microkernel_shape();
-        assert_eq!(mr_sve, 16); // vl=32 → 32/4=8 lanes * 2 = 16
-        let (mr_sme, nr_sme) = sme_hook.gemm_microkernel_shape();
-        assert_eq!(mr_sme, 16); // sme_vl=64 → 64/4=16
-        assert_eq!(nr_sme, 16);
-    }
-
-    #[test]
-    fn test_sm80_sm90_flash_decoding_for_decode_step() {
-        // Arrange: SM80 and SM90 hooks
-        let sm80 = GpuSm80Hook { sm_version: 86 };
-        let sm90 = GpuSm90Hook;
-
-        // Act: select_attention with seq_len=1 (decode step)
-        let attn80 = sm80.select_attention(1, 128);
-        let attn90 = sm90.select_attention(1, 128);
-
-        // Assert: both should select FlashDecoding
-        match attn80 {
-            AttentionStrategy::FlashDecoding { split_k, tile_kv } => {
-                assert_eq!(split_k, 4);
-                assert_eq!(tile_kv, 1024);
-            }
-            other => panic!("expected FlashDecoding on SM80 for seq=1, got {:?}", other),
-        }
-        match attn90 {
-            AttentionStrategy::FlashDecoding { split_k, tile_kv } => {
-                assert_eq!(split_k, 8);
-                assert_eq!(tile_kv, 1024);
-            }
-            other => panic!("expected FlashDecoding on SM90 for seq=1, got {:?}", other),
-        }
-    }
-
-    #[test]
-    fn test_resource_budget_cache_penalty_exceeds_l1d() {
-        // Arrange: tiny L1D budget to guarantee cache penalty
-        let tiny_budget = ResourceBudget {
-            l1d_bytes: 1024,
-            l2_bytes: 4096,
-            vec_reg_count: 32,
-            gpr_count: 32,
-        };
-        let large_budget = ResourceBudget {
-            l1d_bytes: 1_048_576,
-            l2_bytes: 4_194_304,
-            vec_reg_count: 32,
-            gpr_count: 32,
-        };
-
-        // Act: estimate cost for same Fma3 strategy with different budgets
-        let cost_tiny = estimate_strategy_cost(&FmaStrategy::Fma3, 128, 128, 128, &tiny_budget);
-        let cost_large = estimate_strategy_cost(&FmaStrategy::Fma3, 128, 128, 128, &large_budget);
-
-        // Assert: tiny L1D should have higher cost due to cache penalty
-        // working_set = (128*128 + 128*128 + 128*128) * 4 = 196608 bytes >> 1024
-        assert!(cost_tiny > cost_large, "tiny L1D should increase cost: tiny={cost_tiny}, large={cost_large}");
-    }
-
-    #[test]
-    fn test_avx2_epilogue_strategy_boundary() {
-        // Arrange: AVX2 has 16 YMM registers; threshold is acc + epi*2 <= 16
-        let h = X86Avx2Hook;
-
-        // Act & Assert: exactly at boundary
-        assert_eq!(h.epilogue_strategy(8, 4), EpiloguePlace::OnAccumulators); // 8 + 4*2 = 16
-        assert_eq!(h.epilogue_strategy(9, 4), EpiloguePlace::AfterStore);     // 9 + 4*2 = 17 > 16
-        assert_eq!(h.epilogue_strategy(14, 1), EpiloguePlace::OnAccumulators); // 14 + 1*2 = 16
-        assert_eq!(h.epilogue_strategy(15, 1), EpiloguePlace::AfterStore);     // 15 + 1*2 = 17 > 16
-    }
-
-    #[test]
-    fn test_amx_hook_tile_config_respects_minimum_dimensions() {
-        // Arrange: AMX hook with BF16 only, testing dimension thresholds
-        let h = X86AmxHook { has_amx_fp16: false, has_amx_complex: false, has_amx_fp8: false, has_amx_transpose: false };
-
-        // Act: tile_config requires m >= 16 AND n >= 16
-        let below_m = h.tile_config(8, 32, 64);
-        let below_n = h.tile_config(32, 8, 64);
-        let both_valid = h.tile_config(32, 32, 64);
-
-        // Assert: partial dimension below threshold returns None
-        assert!(below_m.is_none(), "m < 16 should return None");
-        assert!(below_n.is_none(), "n < 16 should return None");
-        let tc = both_valid.expect("m=32,n=32 should yield tile config");
-        assert_eq!(tc.rows, 16);
-        assert_eq!(tc.cols, 16);
-        assert_eq!(tc.dtype, DType::BF16);
-        assert_eq!(tc.k_depth, 32);
-    }
-
-    #[test]
-    fn test_select_fma_best_prefers_lower_cost_strategy() {
-        // Arrange: a hook and a budget with very few vector registers
-        let h = X86Avx2Hook;
-        let tiny_budget = ResourceBudget {
-            l1d_bytes: 1_048_576,
-            l2_bytes: 4_194_304,
-            vec_reg_count: 2,
-            gpr_count: 4,
-        };
-
-        // Act: estimate_strategy_cost should return different values for different matrix sizes
-        let cost_small = estimate_strategy_cost(&FmaStrategy::Fma3, 4, 4, 4, &tiny_budget);
-        let cost_large = estimate_strategy_cost(&FmaStrategy::Fma3, 128, 128, 128, &tiny_budget);
-
-        // Assert: larger matrix has higher cost due to compute_cost = m*n*k
-        assert!(cost_large > cost_small, "larger matrix should cost more: small={cost_small}, large={cost_large}");
-
-        // Act: select_fma_best should return a valid strategy
-        let best = select_fma_best(&h, 64, 64, 64, DType::F32, &tiny_budget);
-        assert!(matches!(best, FmaStrategy::Fma3), "AVX2 should return Fma3");
-    }
-
-    #[test]
     fn test_gpu_hooks_is_gpu_true_cpu_hooks_false() {
-        // Arrange: all hook types
         let cpu_hooks: Vec<Box<dyn IsaHook>> = vec![
             Box::new(X86Avx2Hook),
             Box::new(X86Avx512Hook),
@@ -1362,8 +630,6 @@ mod tests {
             Box::new(GpuCdna3Hook),
             Box::new(GpuCdna4Hook),
         ];
-
-        // Act & Assert
         for hook in &cpu_hooks {
             assert!(!hook.is_gpu(), "CPU hook should return is_gpu=false");
         }
@@ -1373,24 +639,83 @@ mod tests {
     }
 
     #[test]
-    fn test_cdna4_small_matrix_falls_back_to_fma3() {
-        // Arrange: CDNA4 hook with matrix too small for any MFMA path
-        let h = GpuCdna4Hook;
+    fn test_sm70_hook_flash_decoding_for_decode_step() {
+        let h = GpuSm70Hook;
+        match h.select_attention(1, 128) {
+            AttentionStrategy::FlashDecoding { split_k, tile_kv } => {
+                assert_eq!(split_k, 4);
+                assert_eq!(tile_kv, 512);
+            }
+            other => panic!("expected FlashDecoding for seq_len=1, got {:?}", other),
+        }
+        assert!(h.is_gpu());
+        assert!(matches!(h.moe_dispatch(8), MoeDispatchStrategy::InKernelJmp));
+        assert!(matches!(h.transcendental_impl(super::super::instr::TranscendentalFn::Exp), TransImpl::HardwareInstr));
+    }
 
-        // Act: m=8, n=8, k=4 — below both 32x32x16 and 16x16x16 thresholds
-        let strategy = h.select_fma(8, 8, 4);
+    #[test]
+    fn test_avx2_epilogue_strategy_boundary() {
+        let h = X86Avx2Hook;
+        assert_eq!(h.epilogue_strategy(8, 4), EpiloguePlace::OnAccumulators); // 8 + 4*2 = 16
+        assert_eq!(h.epilogue_strategy(9, 4), EpiloguePlace::AfterStore);     // 9 + 4*2 = 17 > 16
+        assert_eq!(h.epilogue_strategy(14, 1), EpiloguePlace::OnAccumulators); // 14 + 1*2 = 16
+        assert_eq!(h.epilogue_strategy(15, 1), EpiloguePlace::AfterStore);     // 15 + 1*2 = 17 > 16
+    }
 
-        // Assert: falls back to Fma3, no tile config
-        assert!(matches!(strategy, FmaStrategy::Fma3), "small matrix should use Fma3");
-        assert!(h.tile_config(4, 4, 4).is_none(), "no tile config for small matrix");
+    #[test]
+    fn test_epilogue_place_boundary_on_gpu_hooks() {
+        let sm80 = GpuSm80Hook { sm_version: 80 };
+        let sm90 = GpuSm90Hook;
+        let sm100 = GpuSm100Hook;
+        assert_eq!(sm80.epilogue_strategy(0, 4), EpiloguePlace::OnAccumulators);
+        assert_eq!(sm80.epilogue_strategy(0, 5), EpiloguePlace::AfterStore);
+        assert_eq!(sm90.epilogue_strategy(0, 6), EpiloguePlace::OnAccumulators);
+        assert_eq!(sm90.epilogue_strategy(0, 7), EpiloguePlace::AfterStore);
+        assert_eq!(sm100.epilogue_strategy(0, 8), EpiloguePlace::OnAccumulators);
+        assert_eq!(sm100.epilogue_strategy(0, 9), EpiloguePlace::AfterStore);
+    }
+
+    #[test]
+    fn test_sm80_sm90_flash_decoding_for_decode_step() {
+        let sm80 = GpuSm80Hook { sm_version: 86 };
+        let sm90 = GpuSm90Hook;
+        match sm80.select_attention(1, 128) {
+            AttentionStrategy::FlashDecoding { split_k, tile_kv } => {
+                assert_eq!(split_k, 4);
+                assert_eq!(tile_kv, 1024);
+            }
+            other => panic!("expected FlashDecoding on SM80 for seq=1, got {:?}", other),
+        }
+        match sm90.select_attention(1, 128) {
+            AttentionStrategy::FlashDecoding { split_k, tile_kv } => {
+                assert_eq!(split_k, 8);
+                assert_eq!(tile_kv, 1024);
+            }
+            other => panic!("expected FlashDecoding on SM90 for seq=1, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_select_hook_aarch64_neon_sve_sme_profiles() {
+        let neon_profile = super::super::isa_profile::IsaProfile::aarch64(false, false, 0, false, false, true);
+        let sve_profile = super::super::isa_profile::IsaProfile::aarch64(true, false, 32, false, false, true);
+        let sme_profile = super::super::isa_profile::IsaProfile::aarch64(true, true, 64, true, true, true);
+
+        let neon_hook = select_hook(&neon_profile);
+        let sve_hook = select_hook(&sve_profile);
+        let sme_hook = select_hook(&sme_profile);
+
+        assert_eq!(neon_hook.gemm_microkernel_shape(), (8, 12));
+        let (mr_sve, _) = sve_hook.gemm_microkernel_shape();
+        assert_eq!(mr_sve, 16); // vl=32 → 32/4=8 lanes * 2 = 16
+        let (mr_sme, nr_sme) = sme_hook.gemm_microkernel_shape();
+        assert_eq!(mr_sme, 16); // sme_vl=64 → 64/4=16
+        assert_eq!(nr_sme, 16);
     }
 
     #[test]
     fn test_sm100_attention_strategy_thresholds() {
-        // Arrange: SM100 hook
         let h = GpuSm100Hook;
-
-        // Act & Assert: decode step (seq_len <= 1) → FlashDecoding
         match h.select_attention(1, 128) {
             AttentionStrategy::FlashDecoding { split_k, tile_kv } => {
                 assert_eq!(split_k, 8);
@@ -1398,11 +723,7 @@ mod tests {
             }
             other => panic!("expected FlashDecoding for seq=1, got {:?}", other),
         }
-
-        // short sequence (seq_len <= 64) → Naive
         assert!(matches!(h.select_attention(64, 128), AttentionStrategy::Naive));
-
-        // long sequence → FlashV4
         match h.select_attention(1024, 128) {
             AttentionStrategy::FlashV4 { tile_q, tile_kv, tmem, block_scaled } => {
                 assert!(tile_q > 0);
@@ -1411,95 +732,6 @@ mod tests {
                 assert!(block_scaled);
             }
             other => panic!("expected FlashV4 for long seq on SM100, got {:?}", other),
-        }
-    }
-
-    #[test]
-    fn test_wgmma_config_clamps_n_and_k() {
-        // Arrange: SM90 hook with very large n and k
-        let h = GpuSm90Hook;
-
-        // Act: request n=128, k=128 — should be clamped to n<=32, k<=64
-        let strategy = h.select_fma(64, 128, 128);
-
-        // Assert: WGMMA clamps dimensions
-        match strategy {
-            FmaStrategy::Wgmma(cfg) => {
-                assert_eq!(cfg.m, 64);
-                assert_eq!(cfg.n, 32, "n should be clamped to 32");
-                assert_eq!(cfg.k, 64, "k should be clamped to 64");
-            }
-            other => panic!("expected Wgmma for 64x128x128 on SM90, got {:?}", other),
-        }
-    }
-
-    #[test]
-    fn test_tcgen05_two_cta_enabled_for_large_m() {
-        // Arrange: SM100 hook with very large m
-        let h = GpuSm100Hook;
-
-        // Act: m >= 128 should enable two_cta
-        let strategy_large = h.select_fma(128, 64, 64);
-        let strategy_small = h.select_fma(64, 64, 64);
-
-        // Assert: large m enables two_cta, small m disables it
-        match strategy_large {
-            FmaStrategy::Tcgen05(cfg) => {
-                assert!(cfg.two_cta, "two_cta should be true for m >= 128");
-            }
-            other => panic!("expected Tcgen05 for large m on SM100, got {:?}", other),
-        }
-        match strategy_small {
-            FmaStrategy::Tcgen05(cfg) => {
-                assert!(!cfg.two_cta, "two_cta should be false for m < 128");
-            }
-            other => panic!("expected Tcgen05 for 64x64x64 on SM100, got {:?}", other),
-        }
-    }
-
-    #[test]
-    fn test_select_fma_candidates_preserves_hook_strategy_type() {
-        // Arrange: multiple hooks with different base strategies
-        let avx2 = X86Avx2Hook;
-        let sm90 = GpuSm90Hook;
-        let cdna4 = GpuCdna4Hook;
-
-        // Act: get candidates for each hook
-        let cands_avx2 = select_fma_candidates(&avx2, 64, 64, 64, DType::F32);
-        let cands_sm90 = select_fma_candidates(&sm90, 128, 64, 64, DType::BF16);
-        let cands_cdna4 = select_fma_candidates(&cdna4, 64, 64, 64, DType::F16);
-
-        // Assert: each returns exactly 1 candidate matching the hook's base strategy
-        assert_eq!(cands_avx2.len(), 1);
-        assert!(matches!(cands_avx2[0].strategy, FmaStrategy::Fma3));
-
-        assert_eq!(cands_sm90.len(), 1);
-        assert!(matches!(cands_sm90[0].strategy, FmaStrategy::Wgmma(_)));
-
-        assert_eq!(cands_cdna4.len(), 1);
-        assert!(matches!(cands_cdna4[0].strategy, FmaStrategy::Mfma(_)));
-    }
-
-    #[test]
-    fn test_arm_sme_tile_config_matches_select_fma_consistency() {
-        // Arrange: SME hook with 256-bit VL
-        let h = ArmSmeHook { sme_vl: 32 }; // 32 bytes → 8 f32 lanes → za_dim=8
-
-        // Act: both select_fma and tile_config should agree on dimensions
-        let fma_result = h.select_fma(16, 16, 16);
-        let tile_result = h.tile_config(16, 16, 16);
-
-        // Assert: both return za_dim=8 tile configuration
-        match (&fma_result, &tile_result) {
-            (FmaStrategy::TileMma(fma_tc), Some(tile_tc)) => {
-                assert_eq!(fma_tc.rows, tile_tc.rows, "rows should match");
-                assert_eq!(fma_tc.cols, tile_tc.cols, "cols should match");
-                assert_eq!(fma_tc.rows, 8);
-                assert_eq!(fma_tc.cols, 8);
-            }
-            (other_fma, other_tile) => {
-                panic!("expected matching TileMma/Some, got ({:?}, {:?})", other_fma, other_tile)
-            }
         }
     }
 }

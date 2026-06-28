@@ -365,6 +365,15 @@ impl IsaProfile {
         self.features.iter().any(|f| std::mem::discriminant(f) == std::mem::discriminant(feat))
     }
 
+    /// 派生 FeatureSet (CR-002: OpImpl.requires() 谓词子集匹配的能力位)。
+    ///
+    /// 从 self.features 映射为布尔能力位 (super::op_impl::FeatureSet)。
+    /// 带参数据 (TileGemm{m,n,k} 尺寸 / ScalableVector{vl}) 不进 bitflags,
+    /// 它们作为 GemmOpLayout.tile 的输入数据。
+    pub fn feature_set(&self) -> super::op_impl::FeatureSet {
+        super::gemm_impls::derive_feature_set(&self.features)
+    }
+
     /// 最优 SIMD 宽度
     pub fn optimal_simd_width(&self) -> super::instr::SimdWidth {
         match &self.platform {

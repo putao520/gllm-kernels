@@ -55,7 +55,8 @@ pub fn compile_layer_with_sym_map(
 
     // §13 IsaHook 查询: 从实际 FusionPlan 中提取 GEMM 维度驱动 hook 决策
     let (mr, nr) = hook.gemm_microkernel_shape();
-    // 从 plan 中找到第一个 GEMM op 的真实维度 (无 GEMM 则跳过策略查询)
+    let _ = (mr, nr);
+    // 从 plan 中找到第一个 GEMM op 的真实维度 (用于 epi_place 推导)
     if let Some((m_dim, n, k)) = plan.groups.iter()
         .filter_map(|g| graph.op(g.anchor))
         .filter_map(|op| extract_gemm_dims_sym(op, graph).ok())
@@ -65,13 +66,9 @@ pub fn compile_layer_with_sym_map(
             SymDim::Concrete(v) => *v,
             SymDim::Symbolic { max_value, .. } => max_value.expect("GEMM M Symbolic needs max_value"),
         };
-        let _fma_strategy = hook.select_fma(m_alloc, n, k);
         // ARCH-EPILOGUE-PLACE: epilogue_strategy 基于累加器数量和 epilogue 操作数决定执行位置
-        // 大多数 hook 返回 OnAccumulators（累加器放得下时），少数情况返回 AfterStore
-        let epi_place = hook.epilogue_strategy(mr * nr, 2);
-        // 策略已传递到 emit_gemm_inline_with_hook → emit_gemm_inline_with_epilogue
-        // 此处查询仅用于验证/调试（策略决策由 hook 内部逻辑决定）
-        let _ = epi_place;
+        let epi_place = hook.epilogue_strategy(m_alloc * n.min(k), 2);
+        let _ = (m_alloc, epi_place);
     }
 
     // §14.1 管线铁律: validate_provenance + validate_structure

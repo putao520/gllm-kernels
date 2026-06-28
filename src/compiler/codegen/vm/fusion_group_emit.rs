@@ -711,6 +711,7 @@ pub(super) fn emit_fusion_group_by_mode(
 mod tests {
     use super::*;
     use super::super::plan_lower::CompileSession;
+    use super::super::op_impl::FeatureSet as OpFeatureSet;
     use crate::compiler::fusion::GroupMarker;
         use crate::compiler::layout_negotiator::{
         LayoutTransform, InterOpTransform, MovementType, GroupLayoutAssignment,
@@ -1881,7 +1882,9 @@ mod tests {
         let sym_map = super::super::plan_lower::SymDimSlotMap::mega_kernel_abi();
         let sess = CompileSession {
             width, sym_map: &sym_map,
-            registry: None, hook: None, budget: None,
+            registry: None, hook: None,
+            feature_set: OpFeatureSet::EMPTY,
+            budget: None,
             page_size: 0, dot_cap: crate::dispatch::device_profile::DotProductCap::None,
             kv_elem_bytes: 2, debug_jit: false,
             virtual_activation: None, virtual_tensor_map: None, layout: None,

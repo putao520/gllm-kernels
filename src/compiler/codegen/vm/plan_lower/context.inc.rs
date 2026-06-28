@@ -18,6 +18,8 @@ pub struct CompileSession<'a> {
     pub registry: Option<&'a ScalarOpRegistry>,
     /// ISA hook
     pub hook: Option<&'a dyn super::isa_hook::IsaHook>,
+    /// 硬件能力位集合 (CR-002: OpImpl.requires() 谓词子集匹配的源)。
+    pub feature_set: super::op_impl::FeatureSet,
     /// 资源预算
     pub budget: Option<super::isa_hook::ResourceBudget>,
     /// PagedAttention page size

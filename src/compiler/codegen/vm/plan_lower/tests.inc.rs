@@ -536,6 +536,7 @@ mod tests {
             sym_map: &SymDimSlotMap::mega_kernel_abi(),
             registry: Some(&registry),
             hook: Some(hook.as_ref()),
+            feature_set: isa_profile.feature_set(),
             budget: Some(super::super::isa_hook::ResourceBudget::from_isa_profile(&isa_profile)),
             page_size: 0,
             dot_cap: isa_profile.dot_cap,

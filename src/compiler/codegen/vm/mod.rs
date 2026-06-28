@@ -17,6 +17,8 @@
 pub mod instr;
 pub mod isa_profile;
 pub mod isa_hook;
+pub mod op_impl;
+pub mod gemm_impls;
 pub mod auto_select;
 pub mod lower;
 pub mod reg_alloc;

@@ -36,10 +36,8 @@ pub(crate) fn emit_gemm_inline_with_hook<'a>(
     pack_map: Option<&'a crate::compiler::pack_map::PackMap>,
     trans_b: bool,
 ) -> Result<(), CompilerError> {
-    use super::isa_hook::FmaStrategy;
     let width = ctx.session.width;
     let sym_map = &ctx.session.sym_map;
-    let budget = ctx.session.budget.as_ref();
     // §0.2.10: per-op ParallelismDesc — decode (M=1) unroll=1, prefill unroll=k_unroll
     let k_unroll = gemm_op_id
         .and_then(|id| ctx.parallelism_for_op(id))
@@ -145,40 +143,54 @@ pub(crate) fn emit_gemm_inline_with_hook<'a>(
         None => {}
     }
 
-    let strategy = match budget {
-        Some(b) => super::isa_hook::select_fma_best(hook, m, n, k, ctx.dtype.to_dtype(), b),
-        None => hook.select_fma(m, n, k),
+    // ── select-then-emit (CR-TIER-SOVEREIGNTY): OpImpl 选择 + emit 两阶段 ──
+    // dtype × ISA 在 selector 折叠完毕, emit 体内零 dtype/ISA 分支 (CR-001 后置)。
+    let feats = ctx.session.feature_set;
+    let (mr, nr) = hook.gemm_microkernel_shape();
+    let layout = super::op_impl::GemmOpLayout {
+        m, n, k,
+        dtype: ctx.dtype,
+        trans_b,
+        mr, nr,
+        a_ptr, b_ptr, c_ptr,
+        epilogue: super::isa_hook::EpiloguePlace::OnAccumulators,
+        tile: resolve_tile_shape(&feats, ctx.dtype, m, n, k),
     };
+    let im = super::gemm_impls::select_gemm_impl(feats, ctx.dtype, (m, n, k));
+    let mut ectx = super::op_impl::EmitCtx {
+        prog, width,
+        pack_map, k_unroll, debug_jit: ctx.session.debug_jit,
+    };
+    im.emit(&mut ectx, &layout)
+}
 
-    match strategy {
-        FmaStrategy::TileMma(ref cfg) => {
-            let (rows, cols, kd, dt) = (cfg.rows, cfg.cols, cfg.k_depth, cfg.dtype);
-            emit_tile_gemm(prog, width, rows, cols, kd, k, dt)
+/// 从硬件特性 + dtype 解析 tile 形状 (参数化数据, 不进 FeatureSet)。
+///
+/// selector 解析完特性位后, 对 TILE 类 OpImpl 把尺寸填进 GemmOpLayout.tile,
+/// emit 零推导。
+fn resolve_tile_shape(
+    feats: &super::op_impl::FeatureSet,
+    dtype: QuantPrecision,
+    m: usize, n: usize, _k: usize,
+) -> Option<super::op_impl::TileShape> {
+    use super::op_impl::FeatureSet;
+    // AMX/SME/TC tile 路径才需要 tile 形状。
+    if feats.contains(FeatureSet::TILE_GEMM)
+        || feats.contains(FeatureSet::AMX_FP16)
+        || feats.contains(FeatureSet::AMX_FP8)
+        || feats.contains(FeatureSet::SME_TILE)
+    {
+        // 矩阵太小不适合 tile → 不提供, 让 selector 走 GemmFmaBlis
+        if m < 16 || n < 16 {
+            return None;
         }
-        FmaStrategy::Wgmma(ref cfg) => {
-            let (rows, cols, kd, dt) = (cfg.m, cfg.n, cfg.k, cfg.input_dtype);
-            emit_tile_gemm(prog, width, rows, cols, kd, k, dt)
-        }
-        FmaStrategy::Tcgen05(ref cfg) => {
-            let (rows, cols, kd, dt) = (cfg.m, cfg.n, cfg.k, cfg.input_dtype);
-            emit_tile_gemm(prog, width, rows, cols, kd, k, dt)
-        }
-        FmaStrategy::Mfma(ref cfg) => {
-            let (rows, cols, kd, dt) = (cfg.m, cfg.n, cfg.k, cfg.input_dtype);
-            emit_tile_gemm(prog, width, rows, cols, kd, k, dt)
-        }
-        FmaStrategy::Fma3 | FmaStrategy::MulAdd => {
-            let (mr, nr) = hook.gemm_microkernel_shape();
-            let lanes = width.f32_lanes().max(1);
-            // trans_b=true: BLIS tiled access assumes contiguous B rows; non-contiguous
-            // transposed layout requires element-wise addressing → use naive path.
-            let can_blis = !trans_b && !m_dim.is_symbolic() && m >= mr && n >= nr * lanes && k >= 16;
-            if can_blis {
-                emit_gemm_blis_inline(prog, m, n, k, width, a_ptr, b_ptr, c_ptr, mr, nr, pack_map, k_unroll, ctx.dtype, trans_b)
-            } else {
-                emit_gemm_inline_with_epilogue(prog, m_dim, n, k, width, a_ptr, b_ptr, c_ptr, &[], sym_map, false, seq_bound_override, ctx.dtype, trans_b, super::isa_hook::EpiloguePlace::OnAccumulators)
-            }
-        }
+        let k_depth = if feats.contains(FeatureSet::AMX_FP8) { 64 } else { 32 };
+        Some(super::op_impl::TileShape {
+            rows: 16, cols: 16, k_depth,
+            dtype,
+        })
+    } else {
+        None
     }
 }
 

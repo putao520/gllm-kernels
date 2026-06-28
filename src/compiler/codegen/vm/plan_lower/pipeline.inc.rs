@@ -75,6 +75,7 @@ pub(crate) fn lower_fusion_plan_inner_with_sym_map(
         sym_map,
         registry,
         hook,
+        feature_set: profile.feature_set(),
         budget: None,
         page_size: 0,
         dot_cap: profile.dot_cap,

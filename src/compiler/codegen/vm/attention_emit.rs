@@ -1124,15 +1124,14 @@ mod tests {
     #[test]
     fn test_tiled_attention_sparse_mode_smoke() {
         use super::super::isa_hook::{
-            AccessPattern, AttentionStrategy, EpiloguePlace, FmaStrategy, IsaHook,
-            KvQuantImpl, TileConfig, TransImpl,
+            AccessPattern, AttentionStrategy, EpiloguePlace, IsaHook,
+            KvQuantImpl, TransImpl,
         };
 
         struct TestHook;
         impl IsaHook for TestHook {
-            fn select_fma(&self, _m: usize, _n: usize, _k: usize) -> FmaStrategy { FmaStrategy::Fma3 }
+
             fn gemm_microkernel_shape(&self) -> (usize, usize) { (4, 2) }
-            fn tile_config(&self, _m: usize, _n: usize, _k: usize) -> Option<TileConfig> { None }
             fn transcendental_impl(&self, _: super::super::instr::TranscendentalFn) -> TransImpl {
                 TransImpl::Polynomial { degree: 5 }
             }
@@ -1226,15 +1225,14 @@ mod tests {
     #[test]
     fn test_tiled_attention_auto_mode_smoke() {
         use super::super::isa_hook::{
-            AccessPattern, AttentionStrategy, EpiloguePlace, FmaStrategy, IsaHook,
-            KvQuantImpl, TileConfig, TransImpl,
+            AccessPattern, AttentionStrategy, EpiloguePlace, IsaHook,
+            KvQuantImpl, TransImpl,
         };
 
         struct TestHook;
         impl IsaHook for TestHook {
-            fn select_fma(&self, _m: usize, _n: usize, _k: usize) -> FmaStrategy { FmaStrategy::Fma3 }
+
             fn gemm_microkernel_shape(&self) -> (usize, usize) { (4, 2) }
-            fn tile_config(&self, _m: usize, _n: usize, _k: usize) -> Option<TileConfig> { None }
             fn transcendental_impl(&self, _: super::super::instr::TranscendentalFn) -> TransImpl {
                 TransImpl::Polynomial { degree: 5 }
             }
@@ -1279,15 +1277,14 @@ mod tests {
     #[test]
     fn test_tiled_attention_auto_paged_smoke() {
         use super::super::isa_hook::{
-            AccessPattern, AttentionStrategy, EpiloguePlace, FmaStrategy, IsaHook,
-            KvQuantImpl, TileConfig, TransImpl,
+            AccessPattern, AttentionStrategy, EpiloguePlace, IsaHook,
+            KvQuantImpl, TransImpl,
         };
 
         struct TestHook;
         impl IsaHook for TestHook {
-            fn select_fma(&self, _m: usize, _n: usize, _k: usize) -> FmaStrategy { FmaStrategy::Fma3 }
+
             fn gemm_microkernel_shape(&self) -> (usize, usize) { (4, 2) }
-            fn tile_config(&self, _m: usize, _n: usize, _k: usize) -> Option<TileConfig> { None }
             fn transcendental_impl(&self, _: super::super::instr::TranscendentalFn) -> TransImpl {
                 TransImpl::Polynomial { degree: 5 }
             }
@@ -1427,15 +1424,14 @@ mod tests {
     #[test]
     fn test_tiled_attention_head_not_divisible_error() {
         use super::super::isa_hook::{
-            AccessPattern, AttentionStrategy, EpiloguePlace, FmaStrategy, IsaHook,
-            KvQuantImpl, TileConfig, TransImpl,
+            AccessPattern, AttentionStrategy, EpiloguePlace, IsaHook,
+            KvQuantImpl, TransImpl,
         };
 
         struct TestHook;
         impl IsaHook for TestHook {
-            fn select_fma(&self, _m: usize, _n: usize, _k: usize) -> FmaStrategy { FmaStrategy::Fma3 }
+
             fn gemm_microkernel_shape(&self) -> (usize, usize) { (4, 2) }
-            fn tile_config(&self, _m: usize, _n: usize, _k: usize) -> Option<TileConfig> { None }
             fn transcendental_impl(&self, _: super::super::instr::TranscendentalFn) -> TransImpl {
                 TransImpl::Polynomial { degree: 5 }
             }
@@ -1481,15 +1477,14 @@ mod tests {
     #[test]
     fn test_tiled_attention_zero_dim_error() {
         use super::super::isa_hook::{
-            AccessPattern, AttentionStrategy, EpiloguePlace, FmaStrategy, IsaHook,
-            KvQuantImpl, TileConfig, TransImpl,
+            AccessPattern, AttentionStrategy, EpiloguePlace, IsaHook,
+            KvQuantImpl, TransImpl,
         };
 
         struct TestHook;
         impl IsaHook for TestHook {
-            fn select_fma(&self, _m: usize, _n: usize, _k: usize) -> FmaStrategy { FmaStrategy::Fma3 }
+
             fn gemm_microkernel_shape(&self) -> (usize, usize) { (4, 2) }
-            fn tile_config(&self, _m: usize, _n: usize, _k: usize) -> Option<TileConfig> { None }
             fn transcendental_impl(&self, _: super::super::instr::TranscendentalFn) -> TransImpl {
                 TransImpl::Polynomial { degree: 5 }
             }
@@ -1693,15 +1688,14 @@ mod tests {
     #[test]
     fn test_tiled_attention_minimal_dimensions() {
         use super::super::isa_hook::{
-            AccessPattern, AttentionStrategy, EpiloguePlace, FmaStrategy, IsaHook,
-            KvQuantImpl, TileConfig, TransImpl,
+            AccessPattern, AttentionStrategy, EpiloguePlace, IsaHook,
+            KvQuantImpl, TransImpl,
         };
 
         struct TestHook;
         impl IsaHook for TestHook {
-            fn select_fma(&self, _m: usize, _n: usize, _k: usize) -> FmaStrategy { FmaStrategy::Fma3 }
+
             fn gemm_microkernel_shape(&self) -> (usize, usize) { (4, 2) }
-            fn tile_config(&self, _m: usize, _n: usize, _k: usize) -> Option<TileConfig> { None }
             fn transcendental_impl(&self, _: super::super::instr::TranscendentalFn) -> TransImpl {
                 TransImpl::Polynomial { degree: 5 }
             }
@@ -1924,15 +1918,14 @@ mod tests {
     #[test]
     fn test_tiled_attention_kivi4_mode_emits_dequant() {
         use super::super::isa_hook::{
-            AccessPattern, AttentionStrategy, EpiloguePlace, FmaStrategy, IsaHook,
-            KvQuantImpl, TileConfig, TransImpl,
+            AccessPattern, AttentionStrategy, EpiloguePlace, IsaHook,
+            KvQuantImpl, TransImpl,
         };
 
         struct TestHook;
         impl IsaHook for TestHook {
-            fn select_fma(&self, _m: usize, _n: usize, _k: usize) -> FmaStrategy { FmaStrategy::Fma3 }
+
             fn gemm_microkernel_shape(&self) -> (usize, usize) { (4, 2) }
-            fn tile_config(&self, _m: usize, _n: usize, _k: usize) -> Option<TileConfig> { None }
             fn transcendental_impl(&self, _: super::super::instr::TranscendentalFn) -> TransImpl {
                 TransImpl::Polynomial { degree: 5 }
             }
@@ -1978,15 +1971,14 @@ mod tests {
     #[test]
     fn test_tiled_attention_kivi2_mode_emits_dequant() {
         use super::super::isa_hook::{
-            AccessPattern, AttentionStrategy, EpiloguePlace, FmaStrategy, IsaHook,
-            KvQuantImpl, TileConfig, TransImpl,
+            AccessPattern, AttentionStrategy, EpiloguePlace, IsaHook,
+            KvQuantImpl, TransImpl,
         };
 
         struct TestHook;
         impl IsaHook for TestHook {
-            fn select_fma(&self, _m: usize, _n: usize, _k: usize) -> FmaStrategy { FmaStrategy::Fma3 }
+
             fn gemm_microkernel_shape(&self) -> (usize, usize) { (4, 2) }
-            fn tile_config(&self, _m: usize, _n: usize, _k: usize) -> Option<TileConfig> { None }
             fn transcendental_impl(&self, _: super::super::instr::TranscendentalFn) -> TransImpl {
                 TransImpl::Polynomial { degree: 5 }
             }
@@ -2032,15 +2024,14 @@ mod tests {
     #[test]
     fn test_tiled_attention_zero_head_dim_error() {
         use super::super::isa_hook::{
-            AccessPattern, AttentionStrategy, EpiloguePlace, FmaStrategy, IsaHook,
-            KvQuantImpl, TileConfig, TransImpl,
+            AccessPattern, AttentionStrategy, EpiloguePlace, IsaHook,
+            KvQuantImpl, TransImpl,
         };
 
         struct TestHook;
         impl IsaHook for TestHook {
-            fn select_fma(&self, _m: usize, _n: usize, _k: usize) -> FmaStrategy { FmaStrategy::Fma3 }
+
             fn gemm_microkernel_shape(&self) -> (usize, usize) { (4, 2) }
-            fn tile_config(&self, _m: usize, _n: usize, _k: usize) -> Option<TileConfig> { None }
             fn transcendental_impl(&self, _: super::super::instr::TranscendentalFn) -> TransImpl {
                 TransImpl::Polynomial { degree: 5 }
             }
@@ -2084,15 +2075,14 @@ mod tests {
     #[test]
     fn test_tiled_attention_zero_kv_heads_error() {
         use super::super::isa_hook::{
-            AccessPattern, AttentionStrategy, EpiloguePlace, FmaStrategy, IsaHook,
-            KvQuantImpl, TileConfig, TransImpl,
+            AccessPattern, AttentionStrategy, EpiloguePlace, IsaHook,
+            KvQuantImpl, TransImpl,
         };
 
         struct TestHook;
         impl IsaHook for TestHook {
-            fn select_fma(&self, _m: usize, _n: usize, _k: usize) -> FmaStrategy { FmaStrategy::Fma3 }
+
             fn gemm_microkernel_shape(&self) -> (usize, usize) { (4, 2) }
-            fn tile_config(&self, _m: usize, _n: usize, _k: usize) -> Option<TileConfig> { None }
             fn transcendental_impl(&self, _: super::super::instr::TranscendentalFn) -> TransImpl {
                 TransImpl::Polynomial { degree: 5 }
             }
@@ -2136,15 +2126,14 @@ mod tests {
     #[test]
     fn test_tiled_attention_direct_mode_scale_and_output() {
         use super::super::isa_hook::{
-            AccessPattern, AttentionStrategy, EpiloguePlace, FmaStrategy, IsaHook,
-            KvQuantImpl, TileConfig, TransImpl,
+            AccessPattern, AttentionStrategy, EpiloguePlace, IsaHook,
+            KvQuantImpl, TransImpl,
         };
 
         struct TestHook;
         impl IsaHook for TestHook {
-            fn select_fma(&self, _m: usize, _n: usize, _k: usize) -> FmaStrategy { FmaStrategy::Fma3 }
+
             fn gemm_microkernel_shape(&self) -> (usize, usize) { (4, 2) }
-            fn tile_config(&self, _m: usize, _n: usize, _k: usize) -> Option<TileConfig> { None }
             fn transcendental_impl(&self, _: super::super::instr::TranscendentalFn) -> TransImpl {
                 TransImpl::Polynomial { degree: 5 }
             }
@@ -2201,15 +2190,14 @@ mod tests {
     #[test]
     fn test_tiled_attention_gqa_grouped_query() {
         use super::super::isa_hook::{
-            AccessPattern, AttentionStrategy, EpiloguePlace, FmaStrategy, IsaHook,
-            KvQuantImpl, TileConfig, TransImpl,
+            AccessPattern, AttentionStrategy, EpiloguePlace, IsaHook,
+            KvQuantImpl, TransImpl,
         };
 
         struct TestHook;
         impl IsaHook for TestHook {
-            fn select_fma(&self, _m: usize, _n: usize, _k: usize) -> FmaStrategy { FmaStrategy::Fma3 }
+
             fn gemm_microkernel_shape(&self) -> (usize, usize) { (4, 2) }
-            fn tile_config(&self, _m: usize, _n: usize, _k: usize) -> Option<TileConfig> { None }
             fn transcendental_impl(&self, _: super::super::instr::TranscendentalFn) -> TransImpl {
                 TransImpl::Polynomial { degree: 5 }
             }
@@ -2452,15 +2440,14 @@ mod tests {
     #[test]
     fn test_tiled_attention_causal_mode_compiles() {
         use super::super::isa_hook::{
-            AccessPattern, AttentionStrategy, EpiloguePlace, FmaStrategy, IsaHook,
-            KvQuantImpl, TileConfig, TransImpl,
+            AccessPattern, AttentionStrategy, EpiloguePlace, IsaHook,
+            KvQuantImpl, TransImpl,
         };
 
         struct TestHook;
         impl IsaHook for TestHook {
-            fn select_fma(&self, _m: usize, _n: usize, _k: usize) -> FmaStrategy { FmaStrategy::Fma3 }
+
             fn gemm_microkernel_shape(&self) -> (usize, usize) { (4, 2) }
-            fn tile_config(&self, _m: usize, _n: usize, _k: usize) -> Option<TileConfig> { None }
             fn transcendental_impl(&self, _: super::super::instr::TranscendentalFn) -> TransImpl {
                 TransImpl::Polynomial { degree: 5 }
             }
@@ -2512,16 +2499,15 @@ mod tests {
     #[test]
     fn test_tiled_attention_symbolic_kv_bound() {
         use super::super::isa_hook::{
-            AccessPattern, AttentionStrategy, EpiloguePlace, FmaStrategy, IsaHook,
-            KvQuantImpl, TileConfig, TransImpl,
+            AccessPattern, AttentionStrategy, EpiloguePlace, IsaHook,
+            KvQuantImpl, TransImpl,
         };
         use crate::compiler::codegen::vm::instr::SymBound;
 
         struct TestHook;
         impl IsaHook for TestHook {
-            fn select_fma(&self, _m: usize, _n: usize, _k: usize) -> FmaStrategy { FmaStrategy::Fma3 }
+
             fn gemm_microkernel_shape(&self) -> (usize, usize) { (4, 2) }
-            fn tile_config(&self, _m: usize, _n: usize, _k: usize) -> Option<TileConfig> { None }
             fn transcendental_impl(&self, _: super::super::instr::TranscendentalFn) -> TransImpl {
                 TransImpl::Polynomial { degree: 5 }
             }
@@ -2625,15 +2611,14 @@ mod tests {
     #[test]
     fn test_tiled_attention_with_sinks_initializes_from_sink() {
         use super::super::isa_hook::{
-            AccessPattern, AttentionStrategy, EpiloguePlace, FmaStrategy, IsaHook,
-            KvQuantImpl, TileConfig, TransImpl,
+            AccessPattern, AttentionStrategy, EpiloguePlace, IsaHook,
+            KvQuantImpl, TransImpl,
         };
 
         struct TestHook;
         impl IsaHook for TestHook {
-            fn select_fma(&self, _m: usize, _n: usize, _k: usize) -> FmaStrategy { FmaStrategy::Fma3 }
+
             fn gemm_microkernel_shape(&self) -> (usize, usize) { (4, 2) }
-            fn tile_config(&self, _m: usize, _n: usize, _k: usize) -> Option<TileConfig> { None }
             fn transcendental_impl(&self, _: super::super::instr::TranscendentalFn) -> TransImpl {
                 TransImpl::Polynomial { degree: 5 }
             }
@@ -2788,15 +2773,14 @@ mod tests {
     #[test]
     fn test_tiled_attention_runtime_bound_compiles() {
         use super::super::isa_hook::{
-            AccessPattern, AttentionStrategy, EpiloguePlace, FmaStrategy, IsaHook,
-            KvQuantImpl, TileConfig, TransImpl,
+            AccessPattern, AttentionStrategy, EpiloguePlace, IsaHook,
+            KvQuantImpl, TransImpl,
         };
 
         struct TestHook;
         impl IsaHook for TestHook {
-            fn select_fma(&self, _m: usize, _n: usize, _k: usize) -> FmaStrategy { FmaStrategy::Fma3 }
+
             fn gemm_microkernel_shape(&self) -> (usize, usize) { (4, 2) }
-            fn tile_config(&self, _m: usize, _n: usize, _k: usize) -> Option<TileConfig> { None }
             fn transcendental_impl(&self, _: super::super::instr::TranscendentalFn) -> TransImpl {
                 TransImpl::Polynomial { degree: 5 }
             }
@@ -2963,15 +2947,14 @@ mod tests {
     #[test]
     fn test_tiled_attention_mqa_single_head() {
         use super::super::isa_hook::{
-            AccessPattern, AttentionStrategy, EpiloguePlace, FmaStrategy, IsaHook,
-            KvQuantImpl, TileConfig, TransImpl,
+            AccessPattern, AttentionStrategy, EpiloguePlace, IsaHook,
+            KvQuantImpl, TransImpl,
         };
 
         struct TestHook;
         impl IsaHook for TestHook {
-            fn select_fma(&self, _m: usize, _n: usize, _k: usize) -> FmaStrategy { FmaStrategy::Fma3 }
+
             fn gemm_microkernel_shape(&self) -> (usize, usize) { (4, 2) }
-            fn tile_config(&self, _m: usize, _n: usize, _k: usize) -> Option<TileConfig> { None }
             fn transcendental_impl(&self, _: super::super::instr::TranscendentalFn) -> TransImpl {
                 TransImpl::Polynomial { degree: 5 }
             }
@@ -3734,15 +3717,14 @@ mod tests {
     fn test_tiled_attention_dynamic_vreg_bound_compiles() {
         // Arrange
         use super::super::isa_hook::{
-            AccessPattern, AttentionStrategy, EpiloguePlace, FmaStrategy, IsaHook,
-            KvQuantImpl, TileConfig, TransImpl,
+            AccessPattern, AttentionStrategy, EpiloguePlace, IsaHook,
+            KvQuantImpl, TransImpl,
         };
 
         struct TestHook;
         impl IsaHook for TestHook {
-            fn select_fma(&self, _m: usize, _n: usize, _k: usize) -> FmaStrategy { FmaStrategy::Fma3 }
+
             fn gemm_microkernel_shape(&self) -> (usize, usize) { (4, 2) }
-            fn tile_config(&self, _m: usize, _n: usize, _k: usize) -> Option<TileConfig> { None }
             fn transcendental_impl(&self, _: super::super::instr::TranscendentalFn) -> TransImpl {
                 TransImpl::Polynomial { degree: 5 }
             }
@@ -4073,15 +4055,14 @@ mod tests {
     fn test_tiled_attention_decode_mode_single_query_full_kv() {
         // Arrange
         use super::super::isa_hook::{
-            AccessPattern, AttentionStrategy, EpiloguePlace, FmaStrategy, IsaHook,
-            KvQuantImpl, TileConfig, TransImpl,
+            AccessPattern, AttentionStrategy, EpiloguePlace, IsaHook,
+            KvQuantImpl, TransImpl,
         };
 
         struct TestHook;
         impl IsaHook for TestHook {
-            fn select_fma(&self, _m: usize, _n: usize, _k: usize) -> FmaStrategy { FmaStrategy::Fma3 }
+
             fn gemm_microkernel_shape(&self) -> (usize, usize) { (4, 2) }
-            fn tile_config(&self, _m: usize, _n: usize, _k: usize) -> Option<TileConfig> { None }
             fn transcendental_impl(&self, _: super::super::instr::TranscendentalFn) -> TransImpl {
                 TransImpl::Polynomial { degree: 5 }
             }
@@ -4130,15 +4111,14 @@ mod tests {
     fn test_tiled_attention_gqa_8_2_ratio_compiles() {
         // Arrange
         use super::super::isa_hook::{
-            AccessPattern, AttentionStrategy, EpiloguePlace, FmaStrategy, IsaHook,
-            KvQuantImpl, TileConfig, TransImpl,
+            AccessPattern, AttentionStrategy, EpiloguePlace, IsaHook,
+            KvQuantImpl, TransImpl,
         };
 
         struct TestHook;
         impl IsaHook for TestHook {
-            fn select_fma(&self, _m: usize, _n: usize, _k: usize) -> FmaStrategy { FmaStrategy::Fma3 }
+
             fn gemm_microkernel_shape(&self) -> (usize, usize) { (4, 2) }
-            fn tile_config(&self, _m: usize, _n: usize, _k: usize) -> Option<TileConfig> { None }
             fn transcendental_impl(&self, _: super::super::instr::TranscendentalFn) -> TransImpl {
                 TransImpl::Polynomial { degree: 5 }
             }
@@ -4187,15 +4167,14 @@ mod tests {
     fn test_tiled_attention_sliding_window_strategy_compiles() {
         // Arrange
         use super::super::isa_hook::{
-            AccessPattern, AttentionStrategy, EpiloguePlace, FmaStrategy, IsaHook,
-            KvQuantImpl, TileConfig, TransImpl,
+            AccessPattern, AttentionStrategy, EpiloguePlace, IsaHook,
+            KvQuantImpl, TransImpl,
         };
 
         struct SlidingHook;
         impl IsaHook for SlidingHook {
-            fn select_fma(&self, _m: usize, _n: usize, _k: usize) -> FmaStrategy { FmaStrategy::Fma3 }
+
             fn gemm_microkernel_shape(&self) -> (usize, usize) { (4, 2) }
-            fn tile_config(&self, _m: usize, _n: usize, _k: usize) -> Option<TileConfig> { None }
             fn transcendental_impl(&self, _: super::super::instr::TranscendentalFn) -> TransImpl {
                 TransImpl::Polynomial { degree: 5 }
             }
@@ -4243,15 +4222,14 @@ mod tests {
     fn test_tiled_attention_paged_kv_page_size_one_compiles() {
         // Arrange
         use super::super::isa_hook::{
-            AccessPattern, AttentionStrategy, EpiloguePlace, FmaStrategy, IsaHook,
-            KvQuantImpl, TileConfig, TransImpl,
+            AccessPattern, AttentionStrategy, EpiloguePlace, IsaHook,
+            KvQuantImpl, TransImpl,
         };
 
         struct TestHook;
         impl IsaHook for TestHook {
-            fn select_fma(&self, _m: usize, _n: usize, _k: usize) -> FmaStrategy { FmaStrategy::Fma3 }
+
             fn gemm_microkernel_shape(&self) -> (usize, usize) { (4, 2) }
-            fn tile_config(&self, _m: usize, _n: usize, _k: usize) -> Option<TileConfig> { None }
             fn transcendental_impl(&self, _: super::super::instr::TranscendentalFn) -> TransImpl {
                 TransImpl::Polynomial { degree: 5 }
             }
@@ -4306,15 +4284,14 @@ mod tests {
         // We verify by checking that the program compiles and produces VecStore output,
         // confirming the ki_bound path is valid.
         use super::super::isa_hook::{
-            AccessPattern, AttentionStrategy, EpiloguePlace, FmaStrategy, IsaHook,
-            KvQuantImpl, TileConfig, TransImpl,
+            AccessPattern, AttentionStrategy, EpiloguePlace, IsaHook,
+            KvQuantImpl, TransImpl,
         };
 
         struct TestHook;
         impl IsaHook for TestHook {
-            fn select_fma(&self, _m: usize, _n: usize, _k: usize) -> FmaStrategy { FmaStrategy::Fma3 }
+
             fn gemm_microkernel_shape(&self) -> (usize, usize) { (4, 2) }
-            fn tile_config(&self, _m: usize, _n: usize, _k: usize) -> Option<TileConfig> { None }
             fn transcendental_impl(&self, _: super::super::instr::TranscendentalFn) -> TransImpl {
                 TransImpl::Polynomial { degree: 5 }
             }
@@ -4491,15 +4468,14 @@ mod tests {
     fn test_tiled_attention_single_kv_token_prefill_compiles() {
         // Arrange
         use super::super::isa_hook::{
-            AccessPattern, AttentionStrategy, EpiloguePlace, FmaStrategy, IsaHook,
-            KvQuantImpl, TileConfig, TransImpl,
+            AccessPattern, AttentionStrategy, EpiloguePlace, IsaHook,
+            KvQuantImpl, TransImpl,
         };
 
         struct TestHook;
         impl IsaHook for TestHook {
-            fn select_fma(&self, _m: usize, _n: usize, _k: usize) -> FmaStrategy { FmaStrategy::Fma3 }
+
             fn gemm_microkernel_shape(&self) -> (usize, usize) { (4, 2) }
-            fn tile_config(&self, _m: usize, _n: usize, _k: usize) -> Option<TileConfig> { None }
             fn transcendental_impl(&self, _: super::super::instr::TranscendentalFn) -> TransImpl {
                 TransImpl::Polynomial { degree: 5 }
             }
@@ -4549,15 +4525,14 @@ mod tests {
     #[test]
     fn test_tiled_attention_w128_more_stores_than_w256() {
         use super::super::isa_hook::{
-            AccessPattern, AttentionStrategy, EpiloguePlace, FmaStrategy, IsaHook,
-            KvQuantImpl, TileConfig, TransImpl,
+            AccessPattern, AttentionStrategy, EpiloguePlace, IsaHook,
+            KvQuantImpl, TransImpl,
         };
 
         struct TestHook;
         impl IsaHook for TestHook {
-            fn select_fma(&self, _m: usize, _n: usize, _k: usize) -> FmaStrategy { FmaStrategy::Fma3 }
+
             fn gemm_microkernel_shape(&self) -> (usize, usize) { (4, 2) }
-            fn tile_config(&self, _m: usize, _n: usize, _k: usize) -> Option<TileConfig> { None }
             fn transcendental_impl(&self, _: super::super::instr::TranscendentalFn) -> TransImpl {
                 TransImpl::Polynomial { degree: 5 }
             }
@@ -4616,15 +4591,14 @@ mod tests {
     #[test]
     fn test_tiled_attention_w512_fewer_stores_than_w256() {
         use super::super::isa_hook::{
-            AccessPattern, AttentionStrategy, EpiloguePlace, FmaStrategy, IsaHook,
-            KvQuantImpl, TileConfig, TransImpl,
+            AccessPattern, AttentionStrategy, EpiloguePlace, IsaHook,
+            KvQuantImpl, TransImpl,
         };
 
         struct TestHook;
         impl IsaHook for TestHook {
-            fn select_fma(&self, _m: usize, _n: usize, _k: usize) -> FmaStrategy { FmaStrategy::Fma3 }
+
             fn gemm_microkernel_shape(&self) -> (usize, usize) { (4, 2) }
-            fn tile_config(&self, _m: usize, _n: usize, _k: usize) -> Option<TileConfig> { None }
             fn transcendental_impl(&self, _: super::super::instr::TranscendentalFn) -> TransImpl {
                 TransImpl::Polynomial { degree: 5 }
             }
@@ -4683,15 +4657,14 @@ mod tests {
     #[test]
     fn test_tiled_attention_bf16_dtype_emits_bf16_loads_stores() {
         use super::super::isa_hook::{
-            AccessPattern, AttentionStrategy, EpiloguePlace, FmaStrategy, IsaHook,
-            KvQuantImpl, TileConfig, TransImpl,
+            AccessPattern, AttentionStrategy, EpiloguePlace, IsaHook,
+            KvQuantImpl, TransImpl,
         };
 
         struct TestHook;
         impl IsaHook for TestHook {
-            fn select_fma(&self, _m: usize, _n: usize, _k: usize) -> FmaStrategy { FmaStrategy::Fma3 }
+
             fn gemm_microkernel_shape(&self) -> (usize, usize) { (4, 2) }
-            fn tile_config(&self, _m: usize, _n: usize, _k: usize) -> Option<TileConfig> { None }
             fn transcendental_impl(&self, _: super::super::instr::TranscendentalFn) -> TransImpl {
                 TransImpl::Polynomial { degree: 5 }
             }
@@ -4745,15 +4718,14 @@ mod tests {
     #[test]
     fn test_tiled_attention_bf16_vs_f32_different_instruction_count() {
         use super::super::isa_hook::{
-            AccessPattern, AttentionStrategy, EpiloguePlace, FmaStrategy, IsaHook,
-            KvQuantImpl, TileConfig, TransImpl,
+            AccessPattern, AttentionStrategy, EpiloguePlace, IsaHook,
+            KvQuantImpl, TransImpl,
         };
 
         struct TestHook;
         impl IsaHook for TestHook {
-            fn select_fma(&self, _m: usize, _n: usize, _k: usize) -> FmaStrategy { FmaStrategy::Fma3 }
+
             fn gemm_microkernel_shape(&self) -> (usize, usize) { (4, 2) }
-            fn tile_config(&self, _m: usize, _n: usize, _k: usize) -> Option<TileConfig> { None }
             fn transcendental_impl(&self, _: super::super::instr::TranscendentalFn) -> TransImpl {
                 TransImpl::Polynomial { degree: 5 }
             }
@@ -4814,15 +4786,14 @@ mod tests {
     #[test]
     fn test_tiled_attention_unaligned_head_dim_compiles_with_truncation() {
         use super::super::isa_hook::{
-            AccessPattern, AttentionStrategy, EpiloguePlace, FmaStrategy, IsaHook,
-            KvQuantImpl, TileConfig, TransImpl,
+            AccessPattern, AttentionStrategy, EpiloguePlace, IsaHook,
+            KvQuantImpl, TransImpl,
         };
 
         struct TestHook;
         impl IsaHook for TestHook {
-            fn select_fma(&self, _m: usize, _n: usize, _k: usize) -> FmaStrategy { FmaStrategy::Fma3 }
+
             fn gemm_microkernel_shape(&self) -> (usize, usize) { (4, 2) }
-            fn tile_config(&self, _m: usize, _n: usize, _k: usize) -> Option<TileConfig> { None }
             fn transcendental_impl(&self, _: super::super::instr::TranscendentalFn) -> TransImpl {
                 TransImpl::Polynomial { degree: 5 }
             }
@@ -4940,15 +4911,14 @@ mod tests {
     #[test]
     fn test_tiled_attention_zero_seq_len_error() {
         use super::super::isa_hook::{
-            AccessPattern, AttentionStrategy, EpiloguePlace, FmaStrategy, IsaHook,
-            KvQuantImpl, TileConfig, TransImpl,
+            AccessPattern, AttentionStrategy, EpiloguePlace, IsaHook,
+            KvQuantImpl, TransImpl,
         };
 
         struct TestHook;
         impl IsaHook for TestHook {
-            fn select_fma(&self, _m: usize, _n: usize, _k: usize) -> FmaStrategy { FmaStrategy::Fma3 }
+
             fn gemm_microkernel_shape(&self) -> (usize, usize) { (4, 2) }
-            fn tile_config(&self, _m: usize, _n: usize, _k: usize) -> Option<TileConfig> { None }
             fn transcendental_impl(&self, _: super::super::instr::TranscendentalFn) -> TransImpl {
                 TransImpl::Polynomial { degree: 5 }
             }
@@ -5062,15 +5032,14 @@ mod tests {
     #[test]
     fn test_tiled_attention_heads_fewer_than_kv_heads_error() {
         use super::super::isa_hook::{
-            AccessPattern, AttentionStrategy, EpiloguePlace, FmaStrategy, IsaHook,
-            KvQuantImpl, TileConfig, TransImpl,
+            AccessPattern, AttentionStrategy, EpiloguePlace, IsaHook,
+            KvQuantImpl, TransImpl,
         };
 
         struct TestHook;
         impl IsaHook for TestHook {
-            fn select_fma(&self, _m: usize, _n: usize, _k: usize) -> FmaStrategy { FmaStrategy::Fma3 }
+
             fn gemm_microkernel_shape(&self) -> (usize, usize) { (4, 2) }
-            fn tile_config(&self, _m: usize, _n: usize, _k: usize) -> Option<TileConfig> { None }
             fn transcendental_impl(&self, _: super::super::instr::TranscendentalFn) -> TransImpl {
                 TransImpl::Polynomial { degree: 5 }
             }
@@ -5196,15 +5165,14 @@ mod tests {
     fn test_tiled_attention_paged_direct_mode_uses_page_table() {
         // Arrange
         use super::super::isa_hook::{
-            AccessPattern, AttentionStrategy, EpiloguePlace, FmaStrategy, IsaHook,
-            KvQuantImpl, TileConfig, TransImpl,
+            AccessPattern, AttentionStrategy, EpiloguePlace, IsaHook,
+            KvQuantImpl, TransImpl,
         };
 
         struct TestHook;
         impl IsaHook for TestHook {
-            fn select_fma(&self, _m: usize, _n: usize, _k: usize) -> FmaStrategy { FmaStrategy::Fma3 }
+
             fn gemm_microkernel_shape(&self) -> (usize, usize) { (4, 2) }
-            fn tile_config(&self, _m: usize, _n: usize, _k: usize) -> Option<TileConfig> { None }
             fn transcendental_impl(&self, _: super::super::instr::TranscendentalFn) -> TransImpl {
                 TransImpl::Polynomial { degree: 5 }
             }
@@ -5293,15 +5261,14 @@ mod tests {
     fn test_tiled_attention_large_head_count_scales_stores() {
         // Arrange
         use super::super::isa_hook::{
-            AccessPattern, AttentionStrategy, EpiloguePlace, FmaStrategy, IsaHook,
-            KvQuantImpl, TileConfig, TransImpl,
+            AccessPattern, AttentionStrategy, EpiloguePlace, IsaHook,
+            KvQuantImpl, TransImpl,
         };
 
         struct TestHook;
         impl IsaHook for TestHook {
-            fn select_fma(&self, _m: usize, _n: usize, _k: usize) -> FmaStrategy { FmaStrategy::Fma3 }
+
             fn gemm_microkernel_shape(&self) -> (usize, usize) { (4, 2) }
-            fn tile_config(&self, _m: usize, _n: usize, _k: usize) -> Option<TileConfig> { None }
             fn transcendental_impl(&self, _: super::super::instr::TranscendentalFn) -> TransImpl {
                 TransImpl::Polynomial { degree: 5 }
             }
