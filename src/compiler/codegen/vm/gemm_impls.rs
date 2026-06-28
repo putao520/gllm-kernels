@@ -294,6 +294,7 @@ pub fn derive_feature_set(features: &[super::isa_profile::IsaFeature]) -> Featur
             IsaFeature::Sve2 => fs = fs.union(FeatureSet::SVE2),                     // (预留: SVE2 GEMM OpImpl)
             IsaFeature::SmeTileOp => fs = fs.union(FeatureSet::SME_TILE),            // GemmSmeTile
             IsaFeature::HardwareTranscendental => fs = fs.union(FeatureSet::HW_TRANSCEND),
+            IsaFeature::F16c => fs = fs.union(FeatureSet::F16C),                      // F16↔F32 转换 (Task5 BF16 OpImpl 消费)
 
             // ── 无消费方: 显式标注为何不映射到 FeatureSet 位 (审计完整性) ──
             //

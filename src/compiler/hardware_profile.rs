@@ -61,6 +61,7 @@ impl HardwareProfile {
                 has_bf16: matches!(self, Self::CpuAvx512 | Self::CpuAvx10_2),
                 has_vnni: matches!(self, Self::CpuAvx512 | Self::CpuAvx10_2),
                 has_avx512fp16: false,
+                has_f16c: true,
                 has_amx: matches!(self, Self::CpuAvx512),
                 has_amx_fp16: false,
                 has_amx_complex: false,
@@ -174,6 +175,7 @@ impl HardwareProfile {
             },
             Self::Generic => Platform::X86_64 {
                 has_avx512: false,
+                has_f16c: false,
                 has_bf16: false,
                 has_vnni: false,
                 has_avx512fp16: false,

@@ -1678,7 +1678,7 @@ mod tests {
 
         // Gpr/SimdVec/Stack available on CPU only
         let x86 = Platform::X86_64 { has_avx512: false, has_bf16: false, has_vnni: false,
-            has_avx512fp16: false, has_amx: false, has_amx_fp16: false,
+            has_avx512fp16: false, has_f16c: false, has_amx: false, has_amx_fp16: false,
             has_amx_complex: false, has_amx_transpose: false, has_amx_fp8: false,
             has_avx10_2: false, has_apx: false, has_sparse_mask_intersect: false };
         assert!(ResourceKind::Gpr.is_available_on(&x86));
@@ -1696,7 +1696,7 @@ mod tests {
 
         // SharedMem: GPU-only
         let x86 = Platform::X86_64 { has_avx512: false, has_bf16: false, has_vnni: false,
-            has_avx512fp16: false, has_amx: false, has_amx_fp16: false,
+            has_avx512fp16: false, has_f16c: false, has_amx: false, has_amx_fp16: false,
             has_amx_complex: false, has_amx_transpose: false, has_amx_fp8: false,
             has_avx10_2: false, has_apx: false, has_sparse_mask_intersect: false };
         assert!(!ResourceKind::SharedMem.is_available_on(&x86));

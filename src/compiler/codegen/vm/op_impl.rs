@@ -64,6 +64,10 @@ impl FeatureSet {
     pub const SVE2: Self = Self(1 << 15);
     pub const SME_TILE: Self = Self(1 << 16);
     pub const HW_TRANSCEND: Self = Self(1 << 17);
+    /// F16C (vcvtph2ps/vcvtps2ph) — F16↔F32 转换 (Ivy Bridge+ 基线)。
+    /// 与 NATIVE_FP16 (AVX-512 FP16 计算) 不同: F16C 只转换, 不计算 F16。
+    /// REQ-HW-TIER-001: 细粒度 flag, 区分"能转换 F16"和"能计算 F16"。
+    pub const F16C: Self = Self(1 << 18);
 
     /// 并集。
     #[inline]

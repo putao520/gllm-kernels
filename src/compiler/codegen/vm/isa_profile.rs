@@ -78,6 +78,7 @@ pub enum Platform {
         has_bf16: bool,          // AVX-512 BF16 (VDPBF16PS)
         has_vnni: bool,          // VNNI INT8 (vpdpbusd)
         has_avx512fp16: bool,    // AVX-512 FP16
+        has_f16c: bool,          // F16C (vcvtph2ps/vcvtps2ph) — F16↔F32 转换 (Ivy Bridge+ 基线), REQ-HW-TIER-001
         // ── AMX 世代 ──
         has_amx: bool,           // AMX-BF16 + AMX-INT8 (Sapphire Rapids)
         has_amx_fp16: bool,      // AMX-FP16 (Granite Rapids: TDPFP16PS)
@@ -212,6 +213,11 @@ pub enum IsaFeature {
     // ── Intel x86 特性 ──
     /// VNNI INT8 点积 (vpdpbusd)
     Vnni,
+    /// F16C (vcvtph2ps/vcvtps2ph) — F16↔F32 转换指令 (Ivy Bridge+ 基线)。
+    /// 与 NativeFp16 (AVX-512 FP16 计算) 不同: F16C 只做转换, 不做 F16 计算。
+    /// REQ-HW-TIER-001: 细粒度 flag, 区分"能转换 F16"和"能计算 F16"。
+    // @trace REQ-HW-TIER-001 [req:IsaFeature-F16C] F16C 转换指令细粒度 flag
+    F16c,
     /// AMX-TRANSPOSE (Diamond Rapids: T2RPNTLVWZ)
     AmxTranspose,
     /// AMX-FP16 (Granite Rapids: TDPFP16PS)
@@ -456,6 +462,7 @@ impl IsaProfile {
         if kc.use_avx512 { features.push(IsaFeature::PredicatedExec); }
         if kc.has_bf16 { features.push(IsaFeature::NativeBf16); }
         if kc.has_avx512fp16 { features.push(IsaFeature::NativeFp16); }
+        if kc.has_f16c { features.push(IsaFeature::F16c); }
         if kc.has_vnni { features.push(IsaFeature::Vnni); }
         if kc.has_amx {
             features.push(IsaFeature::TileGemm { m: 16, n: 16, k: 32 });
@@ -484,6 +491,7 @@ impl IsaProfile {
                 has_bf16: kc.has_bf16,
                 has_vnni: kc.has_vnni,
                 has_avx512fp16: kc.has_avx512fp16,
+                has_f16c: kc.has_f16c,
                 has_amx: kc.has_amx,
                 has_amx_fp16: kc.has_amx_fp16,
                 has_amx_complex: kc.has_amx_complex,
@@ -1743,7 +1751,7 @@ mod tests {
     fn test_platform_is_gpu_false_for_cpu_variants() {
         // Arrange: x86 and AArch64 platforms
         let x86 = Platform::X86_64 {
-            has_avx512: true, has_bf16: true, has_vnni: true, has_avx512fp16: false,
+            has_avx512: true, has_bf16: true, has_vnni: true, has_avx512fp16: false, has_f16c: true,
             has_amx: false, has_amx_fp16: false, has_amx_complex: false,
             has_amx_transpose: false, has_amx_fp8: false,
             has_avx10_2: false, has_apx: false, has_sparse_mask_intersect: false,
@@ -1937,7 +1945,7 @@ mod tests {
     fn test_x86_platform_cuda_sm_and_hip_gfx_return_none() {
         // Arrange: construct X86_64 platform directly
         let x86 = Platform::X86_64 {
-            has_avx512: true, has_bf16: true, has_vnni: true, has_avx512fp16: false,
+            has_avx512: true, has_bf16: true, has_vnni: true, has_avx512fp16: false, has_f16c: true,
             has_amx: false, has_amx_fp16: false, has_amx_complex: false,
             has_amx_transpose: false, has_amx_fp8: false,
             has_avx10_2: false, has_apx: false, has_sparse_mask_intersect: false,
@@ -2081,7 +2089,7 @@ mod tests {
         // Arrange: construct IsaProfile with an empty features list
         let profile = IsaProfile {
             platform: Platform::X86_64 {
-                has_avx512: false, has_bf16: false, has_vnni: false, has_avx512fp16: false,
+                has_avx512: false, has_bf16: false, has_vnni: false, has_avx512fp16: false, has_f16c: false,
                 has_amx: false, has_amx_fp16: false, has_amx_complex: false,
                 has_amx_transpose: false, has_amx_fp8: false,
                 has_avx10_2: false, has_apx: false, has_sparse_mask_intersect: false,

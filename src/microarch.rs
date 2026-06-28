@@ -148,6 +148,18 @@ impl MicroArch {
         )
     }
 
+    /// Has F16C (vcvtph2ps / vcvtps2ph — F16↔F32 conversion).
+    ///
+    /// F16C 是 Ivy Bridge+ 的基线 x86 指令 (2012), 与 AVX-512 FP16 (has_avx512fp16)
+    /// 不同: F16C 只做转换, 不做 F16 计算; AVX-512 FP16 做 F16 native 计算。
+    /// REQ-HW-TIER-001: 细粒度 flag, 区分"能转换 F16"和"能计算 F16"。
+    // @trace REQ-HW-TIER-001 [req:MicroArch-has_f16c] F16C 转换指令细粒度 flag
+    pub fn has_f16c(self) -> bool {
+        // F16C 自 Ivy Bridge (client) / Haswell (server) 后成为 x86 基线。
+        // Scalar 兜底无 SIMD → false。其余所有 AVX2+ 微架构都有 F16C。
+        !matches!(self, Self::Scalar)
+    }
+
     /// Number of FMA execution ports (pipes) per core.
     ///
     /// Most modern x86 cores have 2 FMA ports. Zen5 is the notable exception
@@ -399,6 +411,7 @@ pub struct KernelConfig {
     pub has_vnni: bool,
     pub has_avx512fp16: bool,
     pub has_bf16: bool,
+    pub has_f16c: bool,
     /// ARM SVE (Scalable Vector Extension) available.
     pub has_sve: bool,
     /// ARM SVE2 available.
@@ -487,6 +500,7 @@ impl KernelConfig {
             has_vnni: arch.has_vnni(),
             has_avx512fp16: arch.has_avx512fp16(),
             has_bf16: arch.has_bf16(),
+            has_f16c: arch.has_f16c(),
             has_sve: false,
             has_sve2: false,
             sve_vl_bytes: 0,
