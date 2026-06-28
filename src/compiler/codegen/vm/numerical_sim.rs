@@ -1477,6 +1477,637 @@ impl Default for NumericalSimulator {
     }
 }
 
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+// §B VmInstr 数值解释器 (REQ-HW-TIER-006 / CR-TIER-SOVEREIGNTY-004)
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+//
+// 与上方 NumericalSimulator (TraceOp 解释器, REQ-LC-011) 正交: 本节解释的是
+// OpImpl::emit() 产出的 VmInstr 序列 (VmProgram), 而非 TraceOp。
+//
+// 用途: 跨硬件等级等价验证。每个 OpImpl 在给定 (FeatureSet, dtype) 下 emit 一段
+// VmInstr 序列; 解释器以纯软件方式 (host 无关, 无需 AMX/AVX-512 硬件) 执行该序列,
+// 产出数值结果, 与 scalar reference oracle 对齐。BF16 容差按 BF16 精度 (~1e-2) 定,
+// 不要求 bit-exact (CR-TIER-SOVEREIGNTY-004)。
+//
+// 解释器覆盖的 VmInstr 子集 (GEMM-FMA 路径所需):
+//   DeclareVReg / Broadcast / VecLoad / VecStore / Fma / VecNarrow / VecWiden /
+//   Mov / LoopBegin / LoopEnd / TileConfig / TileMma / TileRelease
+// 其余指令 (控制流/GPU/通信) 不在 GEMM-FMA 路径, 解释器遇之报错 (NO-SILENT-FALLBACK)。
+
+use super::instr::{VRegId, SimdWidth, VmInstr, VmProgram, OffsetExpr, ScalarExpr, BoundExpr};
+use crate::compiler::trace::QuantPrecision;
+
+/// 解释器寄存器值: 一个 SIMD 向量用 Vec<f32> 表示 (lane 0..lanes-1)。
+/// 标量寄存器 (SimdWidth::Scalar) 用单元素 Vec。
+type RegValue = Vec<f32>;
+
+/// 解释器状态。
+pub struct VmInterpState {
+    /// VRegId → 寄存器值 (f32 lanes)。
+    regs: HashMap<VRegId, RegValue>,
+    /// 循环计数器 VRegId → 当前迭代索引 (0-based)。
+    loop_counters: HashMap<VRegId, i64>,
+    /// 循环字节偏移 VRegId → 当前字节偏移 (= counter × step_bytes)。
+    loop_byte_offsets: HashMap<VRegId, i64>,
+    /// 命名内存缓冲区: ptr_name ("a"/"b"/"c") → 字节 Vec。
+    /// 解释器把 ABI 指针 VReg 映射到这些命名缓冲区, 而非裸地址, 避免与真实地址空间冲突。
+    buffers: HashMap<String, Vec<u8>>,
+    /// ptr VRegId → 缓冲区名 (解释器侧的指针解析)。
+    ptr_names: HashMap<VRegId, String>,
+}
+
+impl VmInterpState {
+    fn new() -> Self {
+        Self {
+            regs: HashMap::new(),
+            loop_counters: HashMap::new(),
+            loop_byte_offsets: HashMap::new(),
+            buffers: HashMap::new(),
+            ptr_names: HashMap::new(),
+        }
+    }
+
+    /// 获取寄存器值 (克隆)。
+    fn get_reg(&self, v: VRegId) -> Result<&[f32], CompilerError> {
+        self.regs.get(&v).map(|v| v.as_slice()).ok_or_else(|| {
+            CompilerError::CodegenViolation(format!(
+                "VmInterp: read of uninitialized VReg v{}", v.0
+            ))
+        })
+    }
+
+    /// 获取寄存器 lane 0 (标量)。
+    fn get_scalar(&self, v: VRegId) -> Result<f32, CompilerError> {
+        let lanes = self.get_reg(v)?;
+        lanes.first().copied().ok_or_else(|| {
+            CompilerError::CodegenViolation(format!(
+                "VmInterp: scalar read of empty VReg v{}", v.0
+            ))
+        })
+    }
+
+    /// 写入寄存器。
+    fn set_reg(&mut self, v: VRegId, val: RegValue) {
+        self.regs.insert(v, val);
+    }
+
+    /// 绑定 ptr VReg → 缓冲区名。
+    fn bind_ptr(&mut self, v: VRegId, name: &str) {
+        self.ptr_names.insert(v, name.to_string());
+    }
+}
+
+/// 求值 OffsetExpr → 字节偏移 (i64)。
+///
+/// 语义对齐 x86_lower::eval_offset_to_rax: `OffsetExpr::LoopOffset(vreg)` 读取 vreg
+/// 物理寄存器的当前值。在 emit_loop 语义下, counter VReg 持有迭代索引 (0-based),
+/// byte_offset VReg 持有迭代索引 × step_bytes。GEMM emit 里两种 VReg 都可能出现在
+/// LoopOffset 位置 (如 `Mul(LoopOffset(k_ctr), b_row_stride)` 取迭代索引再乘行步幅)。
+///
+/// 因此 LoopOffset 解析优先 byte_offsets, 回退 counters (兼容两种 emit 风格)。
+fn eval_offset(off: &OffsetExpr, state: &VmInterpState) -> Result<i64, CompilerError> {
+    match off {
+        OffsetExpr::Const(n) => Ok(*n as i64),
+        OffsetExpr::LoopOffset(v) => {
+            // 优先 byte_offset (标准 emit_loop 风格), 回退 counter (取迭代索引)。
+            if let Some(bo) = state.loop_byte_offsets.get(v) {
+                Ok(*bo)
+            } else if let Some(ct) = state.loop_counters.get(v) {
+                Ok(*ct)
+            } else {
+                Err(CompilerError::CodegenViolation(format!(
+                    "VmInterp: LoopOffset v{} not in active loop scope", v.0
+                )))
+            }
+        }
+        OffsetExpr::Add(a, b) => Ok(eval_offset(a, state)? + eval_offset(b, state)?),
+        OffsetExpr::Mul(inner, scale) => Ok(eval_offset(inner, state)? * *scale as i64),
+        OffsetExpr::ScalarVReg(v) => state.loop_counters.get(v).copied().ok_or_else(|| {
+            CompilerError::CodegenViolation(format!(
+                "VmInterp: ScalarVReg v{} not a loop counter", v.0
+            ))
+        }),
+    }
+}
+
+/// 求值 ScalarExpr → f32 (用于 Broadcast 源)。
+///
+/// `load_dtype`: 当 src=MemLoad 时, 按 load_dtype 解码字节 (广播时按当前元素的 dtype,
+///               而非 buf 的原始存储 dtype; 解释器 buf 已按 encode_matrix_bytes 写入实际 dtype 字节)。
+fn eval_scalar(se: &ScalarExpr, state: &VmInterpState, load_dtype: QuantPrecision) -> Result<f32, CompilerError> {
+    match se {
+        ScalarExpr::Const(c) => Ok(*c),
+        ScalarExpr::MemLoad(base, off) => {
+            let buf_name = state.ptr_names.get(base).ok_or_else(|| {
+                CompilerError::CodegenViolation(format!(
+                    "VmInterp: MemLoad base v{} not bound to a buffer", base.0
+                ))
+            })?;
+            let byte_off = eval_offset(off, state)? as usize;
+            load_elem_from_buffer(state, buf_name, byte_off, load_dtype)
+        }
+        ScalarExpr::ExtractLane0(v) => state.get_scalar(*v),
+        ScalarExpr::VReg(v) => state.get_scalar(*v),
+    }
+}
+
+/// 从命名缓冲区按 dtype 加载单个标量。
+fn load_scalar_from_buffer(
+    state: &VmInterpState,
+    buf_name: &str,
+    byte_off: usize,
+) -> Result<f32, CompilerError> {
+    let buf = state.buffers.get(buf_name).ok_or_else(|| {
+        CompilerError::CodegenViolation(format!("VmInterp: buffer '{}' not set", buf_name))
+    })?;
+    // 默认按 F32 解码 (GEMM A/B 在解释器侧统一存 f32 字节; dtype 由 VecLoad.dtype 决定,
+    // 但 Broadcast.MemLoad 取标量时按 buf 的实际 dtype)。这里用 4 字节 f32 little-endian。
+    if byte_off + 4 > buf.len() {
+        return Err(CompilerError::CodegenViolation(format!(
+            "VmInterp: MemLoad OOB in buf '{}': off {} (len {})", buf_name, byte_off, buf.len()
+        )));
+    }
+    let b = &buf[byte_off..byte_off + 4];
+    Ok(f32::from_le_bytes([b[0], b[1], b[2], b[3]]))
+}
+
+/// 按 dtype 元素宽度从缓冲区加载一个值并转 f32。
+fn load_elem_from_buffer(
+    state: &VmInterpState,
+    buf_name: &str,
+    byte_off: usize,
+    dtype: QuantPrecision,
+) -> Result<f32, CompilerError> {
+    let buf = state.buffers.get(buf_name).ok_or_else(|| {
+        CompilerError::CodegenViolation(format!("VmInterp: buffer '{}' not set", buf_name))
+    })?;
+    match dtype {
+        QuantPrecision::F32 => {
+            if byte_off + 4 > buf.len() {
+                return Err(CompilerError::CodegenViolation(format!(
+                    "VmInterp: VecLoad F32 OOB in '{}': off {} (len {})", buf_name, byte_off, buf.len()
+                )));
+            }
+            let b = &buf[byte_off..byte_off + 4];
+            Ok(f32::from_le_bytes([b[0], b[1], b[2], b[3]]))
+        }
+        QuantPrecision::BF16 => {
+            if byte_off + 2 > buf.len() {
+                return Err(CompilerError::CodegenViolation(format!(
+                    "VmInterp: VecLoad BF16 OOB in '{}': off {} (len {})", buf_name, byte_off, buf.len()
+                )));
+            }
+            let bytes = [buf[byte_off], buf[byte_off + 1]];
+            Ok(half::bf16::from_le_bytes(bytes).to_f32())
+        }
+        QuantPrecision::F16 => {
+            if byte_off + 2 > buf.len() {
+                return Err(CompilerError::CodegenViolation(format!(
+                    "VmInterp: VecLoad F16 OOB in '{}': off {} (len {})", buf_name, byte_off, buf.len()
+                )));
+            }
+            let bytes = [buf[byte_off], buf[byte_off + 1]];
+            Ok(half::f16::from_le_bytes(bytes).to_f32())
+        }
+        _ => Err(CompilerError::CodegenViolation(format!(
+            "VmInterp: VecLoad dtype {:?} not supported by interpreter", dtype
+        ))),
+    }
+}
+
+/// 按 dtype 元素宽度把 f32 值写入缓冲区 (VecStore)。
+fn store_elem_to_buffer(
+    state: &mut VmInterpState,
+    buf_name: &str,
+    byte_off: usize,
+    val: f32,
+    dtype: QuantPrecision,
+) -> Result<(), CompilerError> {
+    let buf = state.buffers.get_mut(buf_name).ok_or_else(|| {
+        CompilerError::CodegenViolation(format!("VmInterp: buffer '{}' not set", buf_name))
+    })?;
+    match dtype {
+        QuantPrecision::F32 => {
+            if byte_off + 4 > buf.len() {
+                return Err(CompilerError::CodegenViolation(format!(
+                    "VmInterp: VecStore F32 OOB in '{}': off {} (len {})", buf_name, byte_off, buf.len()
+                )));
+            }
+            let b = val.to_le_bytes();
+            buf[byte_off..byte_off + 4].copy_from_slice(&b);
+            Ok(())
+        }
+        QuantPrecision::BF16 => {
+            if byte_off + 2 > buf.len() {
+                return Err(CompilerError::CodegenViolation(format!(
+                    "VmInterp: VecStore BF16 OOB in '{}': off {} (len {})", buf_name, byte_off, buf.len()
+                )));
+            }
+            let bf = half::bf16::from_f32(val);
+            let b = bf.to_le_bytes();
+            buf[byte_off..byte_off + 2].copy_from_slice(&b);
+            Ok(())
+        }
+        QuantPrecision::F16 => {
+            if byte_off + 2 > buf.len() {
+                return Err(CompilerError::CodegenViolation(format!(
+                    "VmInterp: VecStore F16 OOB in '{}': off {} (len {})", buf_name, byte_off, buf.len()
+                )));
+            }
+            let f = half::f16::from_f32(val);
+            let b = f.to_le_bytes();
+            buf[byte_off..byte_off + 2].copy_from_slice(&b);
+            Ok(())
+        }
+        _ => Err(CompilerError::CodegenViolation(format!(
+            "VmInterp: VecStore dtype {:?} not supported by interpreter", dtype
+        ))),
+    }
+}
+
+/// 循环上界 → 迭代次数。仅支持 Const (GEMM emit 用 Const 上界)。
+fn bound_to_iters(bound: &BoundExpr) -> Result<usize, CompilerError> {
+    match bound {
+        BoundExpr::Const(n) => Ok(*n),
+        _ => Err(CompilerError::CodegenViolation(format!(
+            "VmInterp: non-Const loop bound {:?} not supported (GEMM emit 用 Const 上界)", bound
+        ))),
+    }
+}
+
+/// 解释单条 VmInstr (在当前循环上下文内)。
+///
+/// `width` 参数保留用于需要全局宽度的兜底路径 (当前 GEMM-FMA 子集指令均自带 width 字段)。
+fn exec_vm_instr(
+    instr: &VmInstr,
+    state: &mut VmInterpState,
+    _width: SimdWidth,
+) -> Result<(), CompilerError> {
+    match instr {
+        VmInstr::DeclareVReg { .. } => Ok(()), // 声明, 解释器无需动作
+
+        VmInstr::Broadcast { dst, src, width: w, dtype, .. } => {
+            let lanes = w.f32_lanes().max(1);
+            let v = eval_scalar(src, state, *dtype)?;
+            state.set_reg(*dst, vec![v; lanes]);
+            Ok(())
+        }
+
+        VmInstr::VecLoad { dst, base, offset, width: w, dtype, predicate: None } => {
+            let lanes = w.f32_lanes().max(1);
+            let buf_name = state.ptr_names.get(base).cloned().ok_or_else(|| {
+                CompilerError::CodegenViolation(format!(
+                    "VmInterp: VecLoad base v{} not bound", base.0
+                ))
+            })?;
+            let base_off = eval_offset(offset, state)? as usize;
+            let elem = dtype.elem_bytes();
+            let mut out = Vec::with_capacity(lanes);
+            for i in 0..lanes {
+                let off = base_off + i * elem;
+                out.push(load_elem_from_buffer(state, &buf_name, off, *dtype)?);
+            }
+            state.set_reg(*dst, out);
+            Ok(())
+        }
+
+        VmInstr::VecLoad { predicate: Some(_), .. } => Err(CompilerError::CodegenViolation(
+            "VmInterp: masked VecLoad not supported in GEMM-FMA cross-tier sim".to_string()
+        )),
+
+        VmInstr::VecStore { base, offset, src, width: w, dtype, predicate: None } => {
+            let lanes = w.f32_lanes().max(1);
+            let buf_name = state.ptr_names.get(base).cloned().ok_or_else(|| {
+                CompilerError::CodegenViolation(format!(
+                    "VmInterp: VecStore base v{} not bound", base.0
+                ))
+            })?;
+            let base_off = eval_offset(offset, state)? as usize;
+            let vals = state.get_reg(*src)?.to_vec();
+            if vals.len() < lanes {
+                return Err(CompilerError::CodegenViolation(format!(
+                    "VmInterp: VecStore src v{} has {} lanes < {}", src.0, vals.len(), lanes
+                )));
+            }
+            let elem = dtype.elem_bytes();
+            for i in 0..lanes {
+                store_elem_to_buffer(state, &buf_name, base_off + i * elem, vals[i], *dtype)?;
+            }
+            Ok(())
+        }
+
+        VmInstr::VecStore { predicate: Some(_), .. } => Err(CompilerError::CodegenViolation(
+            "VmInterp: masked VecStore not supported in GEMM-FMA cross-tier sim".to_string()
+        )),
+
+        VmInstr::Fma { dst, acc, a, b, dtype: _ } => {
+            // dst = acc + a × b (逐 lane)。GEMM 用 F32 累加 (acc_dtype), dtype 字段
+            // 在 naive emit 里 = 输入 dtype (BF16/F32), 但 acc 寄存器始终是 F32 累加值。
+            // 解释器按寄存器实际 f32 值计算, 无需 dtype 分支。
+            let acc_v = state.get_reg(*acc)?.to_vec();
+            let a_v = state.get_reg(*a)?.to_vec();
+            let b_v = state.get_reg(*b)?.to_vec();
+            let n = acc_v.len().min(a_v.len()).min(b_v.len());
+            if n == 0 {
+                return Err(CompilerError::CodegenViolation(format!(
+                    "VmInterp: Fma empty operand (acc v{} len {}, a v{} len {}, b v{} len {})",
+                    acc.0, acc_v.len(), a.0, a_v.len(), b.0, b_v.len()
+                )));
+            }
+            let mut out = Vec::with_capacity(n);
+            for i in 0..n {
+                out.push(acc_v[i] + a_v[i] * b_v[i]);
+            }
+            state.set_reg(*dst, out);
+            Ok(())
+        }
+
+        VmInstr::VecNarrow { dst, src, dst_dtype, src_dtype: _, width: w, .. } => {
+            // F32 累加器 → BF16/F16 存储: 截断到 dst_dtype 精度后, 重新转回 F32 表示
+            // (解释器统一存 f32, 窄化效果用 round-trip 模拟)。
+            let lanes = w.f32_lanes().max(1);
+            let src_v = state.get_reg(*src)?.to_vec();
+            let mut out = Vec::with_capacity(lanes);
+            for i in 0..lanes.min(src_v.len()) {
+                let narrowed = narrow_to_dtype(src_v[i], *dst_dtype);
+                out.push(narrowed);
+            }
+            state.set_reg(*dst, out);
+            Ok(())
+        }
+
+        VmInstr::VecWiden { dst, src, src_dtype, .. } => {
+            // 窄 dtype → F32: 解释器 buf 已统一存 f32 字节, widen 在解释器侧是恒等
+            // (BF16 字节加载时已 to_f32)。但 src 寄存器若已存了窄值, 这里取 lane 0 即可。
+            let src_v = state.get_reg(*src)?.to_vec();
+            // widen: src 的窄值 (BF16/F16 lanes 压在 F32 寄存器里) → F32。解释器直接传递。
+            let _ = src_dtype; // 宽化是无损语义, 无需 round
+            state.set_reg(*dst, src_v);
+            Ok(())
+        }
+
+        VmInstr::Mov { dst, src, .. } => {
+            let v = state.get_reg(*src)?.to_vec();
+            state.set_reg(*dst, v);
+            Ok(())
+        }
+
+        // ── Tile 路径 (AMX/SME/TC): 解释器把 TileMma 当作语义标量 GEMM 标记 ──
+        // TileConfig/TileRelease 在解释器侧是 NOP (tile 寄存器是抽象资源)。
+        // TileMma { c, a, b }: c += a × b — 但 tile 的形状/累加语义由 emit_tile_gemm
+        // 决定, 解释器无法从指令恢复。跨等级等价验证聚焦 GemmFmaBlis/GemmScalar
+        // (naive FMA 路径), tile 路径用结构测试覆盖 (见 gemm_impls.rs tests)。
+        VmInstr::TileConfig { .. } | VmInstr::TileRelease => Ok(()),
+
+        VmInstr::TileMma { .. } => Ok(()), // tile 累加语义解释器侧不模拟 (见上)
+
+        // ── 不在 GEMM-FMA 路径的指令: 报错 (NO-SILENT-FALLBACK) ──
+        _ => Err(CompilerError::CodegenViolation(format!(
+            "VmInterp: VmInstr {:?} not in GEMM-FMA cross-tier sim scope", instr
+        ))),
+    }
+}
+
+/// F32 → dst_dtype round-trip (模拟窄化的精度损失)。
+fn narrow_to_dtype(val: f32, dst_dtype: QuantPrecision) -> f32 {
+    match dst_dtype {
+        QuantPrecision::BF16 => half::bf16::from_f32(val).to_f32(),
+        QuantPrecision::F16 => half::f16::from_f32(val).to_f32(),
+        _ => val, // F32/其他: 无损
+    }
+}
+
+/// 解释 VmProgram: 执行指令序列, LoopBegin/LoopEnd 用迭代展开。
+///
+/// 返回最终状态 (供测试读取 C 缓冲区)。
+// @trace REQ-HW-TIER-006 [req:VmInstr-Interpreter] VmInstr 数值解释器入口, 跨等级等价验证核心
+pub fn interpret_vm_program(
+    prog: &VmProgram,
+    buffers: HashMap<String, Vec<u8>>,
+    ptr_bindings: &[(VRegId, &str)], // (ptr_vreg, buffer_name)
+    width: SimdWidth,
+) -> Result<VmInterpState, CompilerError> {
+    let mut state = VmInterpState::new();
+    state.buffers = buffers;
+    for (vreg, name) in ptr_bindings {
+        state.bind_ptr(*vreg, name);
+    }
+
+    interpret_instr_slice(&prog.instrs, &mut state, width)?;
+    Ok(state)
+}
+
+/// 解释指令切片 (支持嵌套循环)。
+fn interpret_instr_slice(
+    instrs: &[VmInstr],
+    state: &mut VmInterpState,
+    width: SimdWidth,
+) -> Result<(), CompilerError> {
+    let mut pc = 0;
+    while pc < instrs.len() {
+        match &instrs[pc] {
+            VmInstr::LoopBegin { counter, byte_offset, bound, step_bytes } => {
+                let iters = bound_to_iters(bound)?;
+                let loop_end_idx = find_matching_loop_end(instrs, pc)
+                    .ok_or_else(|| CompilerError::CodegenViolation(
+                        format!("VmInterp: unmatched LoopBegin at pc {}", pc)
+                    ))?;
+                let body = &instrs[pc + 1..loop_end_idx];
+                for i in 0..iters as i64 {
+                    state.loop_counters.insert(*counter, i);
+                    state.loop_byte_offsets.insert(*byte_offset, i * *step_bytes as i64);
+                    interpret_instr_slice(body, state, width)?;
+                }
+                state.loop_counters.remove(counter);
+                state.loop_byte_offsets.remove(byte_offset);
+                pc = loop_end_idx + 1;
+            }
+            VmInstr::LoopEnd => {
+                return Err(CompilerError::CodegenViolation(
+                    format!("VmInterp: orphan LoopEnd at pc {}", pc)
+                ));
+            }
+            other => {
+                exec_vm_instr(other, state, width)?;
+                pc += 1;
+            }
+        }
+    }
+    Ok(())
+}
+
+/// 从 pc 处的 LoopBegin 开始, 找到匹配的 LoopEnd 索引 (处理嵌套)。
+fn find_matching_loop_end(instrs: &[VmInstr], loop_begin_pc: usize) -> Option<usize> {
+    let mut depth = 0i32;
+    let mut i = loop_begin_pc;
+    while i < instrs.len() {
+        match &instrs[i] {
+            VmInstr::LoopBegin { .. } => depth += 1,
+            VmInstr::LoopEnd => {
+                depth -= 1;
+                if depth == 0 {
+                    return Some(i);
+                }
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    None
+}
+
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+// §B.2 scalar GEMM reference oracle (CR-TIER-SOVEREIGNTY-004 标尺)
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+/// Scalar GEMM reference: C[m][n] = Σ_p A[m][p] × B[p][n]。
+///
+/// 这是跨等级验证的**正确性 oracle** (标尺), 不是 native benchmark。所有 OpImpl
+/// 等级 (GemmScalar / GemmFmaBlis / tile 路径) 的数值结果都对齐此 oracle (CR-004)。
+///
+/// 输入/输出按 row-major, F32 累加。`acc_dtype` 控制累加精度模拟:
+/// - F32: 全程 f32 (F32 输入的精确标尺)
+/// - BF16: 每次 mul-add 后 round 到 BF16 精度再继续累加 (模拟 BF16 WidenCompute 累加损失)
+///         — 注: 真实 AVX2 BF16 路径用 F32 累加, 所以默认 acc=F32; 此参数仅供容差研究。
+pub fn scalar_gemm_reference(
+    a: &[f32], b: &[f32], m: usize, n: usize, k: usize,
+) -> Vec<f32> {
+    let mut c = vec![0.0f32; m * n];
+    for mi in 0..m {
+        for ni in 0..n {
+            let mut acc = 0.0f32;
+            for pi in 0..k {
+                acc += a[mi * k + pi] * b[pi * n + ni];
+            }
+            c[mi * n + ni] = acc;
+        }
+    }
+    c
+}
+
+/// 把 f32 矩阵按 dtype 编码为字节缓冲区 (row-major)。
+fn encode_matrix_bytes(data: &[f32], dtype: QuantPrecision) -> Vec<u8> {
+    let elem = dtype.elem_bytes();
+    let mut buf = vec![0u8; data.len() * elem];
+    for (i, &v) in data.iter().enumerate() {
+        let off = i * elem;
+        match dtype {
+            QuantPrecision::F32 => buf[off..off + 4].copy_from_slice(&v.to_le_bytes()),
+            QuantPrecision::BF16 => {
+                let bf = half::bf16::from_f32(v);
+                buf[off..off + 2].copy_from_slice(&bf.to_le_bytes());
+            }
+            QuantPrecision::F16 => {
+                let f = half::f16::from_f32(v);
+                buf[off..off + 2].copy_from_slice(&f.to_le_bytes());
+            }
+            _ => {
+                // 解释器仅支持 F32/BF16/F16 GEMM; 其他 dtype 在调用前应被过滤。
+                buf[off..off + 4].copy_from_slice(&v.to_le_bytes());
+            }
+        }
+    }
+    buf
+}
+
+/// 从字节缓冲区按 dtype 解码为 f32 矩阵 (row-major)。
+fn decode_matrix_bytes(buf: &[u8], count: usize, dtype: QuantPrecision) -> Vec<f32> {
+    let elem = dtype.elem_bytes();
+    let mut out = Vec::with_capacity(count);
+    for i in 0..count {
+        let off = i * elem;
+        match dtype {
+            QuantPrecision::F32 => {
+                out.push(f32::from_le_bytes([buf[off], buf[off+1], buf[off+2], buf[off+3]]));
+            }
+            QuantPrecision::BF16 => {
+                out.push(half::bf16::from_le_bytes([buf[off], buf[off+1]]).to_f32());
+            }
+            QuantPrecision::F16 => {
+                out.push(half::f16::from_le_bytes([buf[off], buf[off+1]]).to_f32());
+            }
+            _ => {
+                out.push(f32::from_le_bytes([buf[off], buf[off+1], buf[off+2], buf[off+3]]));
+            }
+        }
+    }
+    out
+}
+
+/// 按 dtype 返回跨等级验证容差 (CR-TIER-SOVEREIGNTY-004: BF16 ~1e-2, F32 ~1e-5)。
+pub fn tolerance_for(dtype: QuantPrecision) -> f32 {
+    match dtype {
+        QuantPrecision::F32 => 1e-5,
+        QuantPrecision::BF16 => 1e-2,  // BF16: 7 mantissa bits → ~0.008 relative
+        QuantPrecision::F16 => 1e-3,   // F16: 10 mantissa bits → ~0.001 relative
+        _ => 1e-2,
+    }
+}
+
+/// 跨等级等价验证: 解释 OpImpl emit 的 VmInstr 序列, 与 scalar oracle 对齐。
+///
+/// 流程:
+/// 1. 构造 A/B 随机矩阵 → scalar_gemm_reference 得 golden C
+/// 2. A/B 按 dtype 编码进 "a"/"b" 缓冲区, "c" 缓冲区清零
+/// 3. 解释 VmProgram (ptr_bindings 指向 a/b/c)
+/// 4. 解码 "c" 缓冲区 → 实际 C
+/// 5. 比对实际 C vs golden C, max abs diff ≤ tolerance_for(dtype)
+///
+/// 返回 (max_abs_diff, passed)。
+// @trace REQ-HW-TIER-006 [req:CrossTier-Equivalence] OpImpl 跨等级等价验证, BF16 容差 ~1e-2
+pub fn verify_op_impl_aligns_scalar(
+    prog: &VmProgram,
+    a: &[f32], b: &[f32],
+    m: usize, n: usize, k: usize,
+    dtype: QuantPrecision,
+    width: SimdWidth,
+    ptr_bindings: &[(VRegId, &str)],
+) -> Result<(f32, bool), CompilerError> {
+    let golden = scalar_gemm_reference(a, b, m, n, k);
+    let a_bytes = encode_matrix_bytes(a, dtype);
+    let b_bytes = encode_matrix_bytes(b, dtype);
+    let c_elem_bytes = dtype.elem_bytes();
+    let c_bytes = vec![0u8; m * n * c_elem_bytes];
+
+    let mut buffers = HashMap::new();
+    buffers.insert("a".to_string(), a_bytes);
+    buffers.insert("b".to_string(), b_bytes);
+    buffers.insert("c".to_string(), c_bytes);
+
+    let state = interpret_vm_program(prog, buffers, ptr_bindings, width)?;
+    // 读取 C
+    let c_buf = state.buffers.get("c").ok_or_else(|| {
+        CompilerError::CodegenViolation("VmInterp: c buffer missing after run".to_string())
+    })?;
+    let actual = decode_matrix_bytes(c_buf, m * n, dtype);
+
+    // 跨等级等价: actual 与 golden 都已按 dtype 存储解码 (BF16 存储的 C 读回就是 BF16
+    // 精度的 f32)。golden 用 f32 精确累加, 但 actual 经 VecNarrow 写成 BF16。两者差异
+    // = 输出 dtype 精度。为公平比较, golden 也 round 到 dtype (模拟输出存储精度)。
+    let mut max_diff = 0.0f32;
+    let mut max_abs = 1.0f32;
+    for i in 0..m * n {
+        let g_rounded = narrow_to_dtype(golden[i], dtype);
+        let d = (actual[i] - g_rounded).abs();
+        if d > max_diff {
+            max_diff = d;
+        }
+        max_abs = max_abs.max(golden[i].abs());
+    }
+    // 相对容差 (CR-TIER-SOVEREIGNTY-004): tol = max(abs_tol, relative_eps × |value|)。
+    // BF16: 7 mantissa bits → eps ≈ 2^-7 ≈ 0.0078; 取 2% 相对 (留累加噪声裕度)。
+    // F32:  23 mantissa bits → eps ≈ 1.2e-7; 纯 f32 路径应近 bit-exact (≤1e-5)。
+    let abs_tol = tolerance_for(dtype);
+    let rel_eps = match dtype {
+        QuantPrecision::F32 => 1e-5,
+        QuantPrecision::BF16 => 2e-2,
+        QuantPrecision::F16 => 2e-3,
+        _ => 2e-2,
+    };
+    let tol = abs_tol.max(rel_eps * max_abs);
+    Ok((max_diff, max_diff <= tol))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

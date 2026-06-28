@@ -783,4 +783,184 @@ mod tests {
         assert_eq!(fs, FeatureSet::EMPTY,
             "无消费方 IsaFeature 变体不应派生任何 FeatureSet 位, got {:?}", fs);
     }
+
+    // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+    // §15 Task #7: numerical_sim 跨等级等价验证 (CR-TIER-SOVEREIGNTY-004)
+    // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+    //
+    // 每个 OpImpl emit 的 VmInstr 序列, 通过 VmInstr 解释器执行, 与 scalar oracle 对齐。
+    // BF16 容差 ~1e-2 (BF16 精度, 不是固定 1e-5), F32 容差 ~1e-5 (CR-004)。
+    // @trace REQ-HW-TIER-006 [req:CrossTier-Equivalence-Tests] 跨等级等价测试集 (BF16×3 + F32×2)
+
+    use crate::compiler::codegen::vm::instr::VRegId;
+    use crate::compiler::codegen::vm::numerical_sim::{
+        verify_op_impl_aligns_scalar, scalar_gemm_reference, tolerance_for,
+    };
+
+    /// 构造 GemmOpLayout + 执行 emit, 返回 VmProgram (供解释器验证)。
+    fn emit_program_for_impl(
+        im: &dyn OpImpl<GemmOpLayout>,
+        dtype: QuantPrecision,
+        m: usize, n: usize, k: usize,
+    ) -> VmProgram {
+        let width = SimdWidth::W256;
+        let mut prog = VmProgram::new();
+        let a_ptr = prog.alloc_vreg(VRegKind::Ptr, width);
+        let b_ptr = prog.alloc_vreg(VRegKind::Ptr, width);
+        let c_ptr = prog.alloc_vreg(VRegKind::Ptr, width);
+        let mut ectx = EmitCtx {
+            prog: &mut prog, width, pack_map: None, k_unroll: 1, debug_jit: false,
+        };
+        let lo = GemmOpLayout {
+            m, n, k, dtype, trans_b: false, mr: 4, nr: 2,
+            a_ptr, b_ptr, c_ptr,
+            epilogue: super::super::isa_hook::EpiloguePlace::OnAccumulators,
+            tile: None,
+        };
+        im.emit(&mut ectx, &lo).expect("emit should succeed");
+        prog
+    }
+
+    /// 生成确定性种子随机测试矩阵 (小规模, 避免溢出)。
+    ///
+    /// 用 `StdRng::seed_from_u64` 保证跨等级等价测试**可复现**: 每次跑同样的矩阵,
+    /// 避免随机扰动导致 BF16 容差边界抖动 (CR-TIER-SOVEREIGNTY-004 数值验证需确定性)。
+    fn seeded_test_matrix(rows: usize, cols: usize, seed: u64) -> Vec<f32> {
+        use rand::SeedableRng;
+        use rand::Rng;
+        let mut rng = rand::rngs::StdRng::seed_from_u64(seed);
+        (0..rows * cols).map(|_| rng.gen_range(-1.0..1.0)).collect()
+    }
+
+    // ── BF16 跨等级等价测试 (≥ 3 组) ──
+
+    #[test]
+    fn bf16_gemm_fma_blis_aligns_scalar_oracle_2x4x8() {
+        // 小矩阵 2×4×8: 验证 BF16 WidenCompute 路径数值对齐。
+        let im = &GemmFmaBlis as &dyn OpImpl<GemmOpLayout>;
+        let dtype = QuantPrecision::BF16;
+        let prog = emit_program_for_impl(im, dtype, 2, 4, 8);
+        let a = seeded_test_matrix(2, 8, 42);
+        let b = seeded_test_matrix(8, 4, 43);
+        // ptr bindings: emit_program_for_impl allocs a_ptr=0, b_ptr=1, c_ptr=2 sequentially
+        let ptr_bindings: [(VRegId, &str); 3] = [
+            (VRegId(0), "a"), (VRegId(1), "b"), (VRegId(2), "c"),
+        ];
+        let (max_diff, passed) = verify_op_impl_aligns_scalar(
+            &prog, &a, &b, 2, 4, 8, dtype, SimdWidth::W256, &ptr_bindings,
+        ).expect("interpreter should run");
+        let tol = tolerance_for(dtype);
+        assert!(passed, "BF16 GemmFmaBlis 2x4x8 vs scalar: max_diff={} > tol={}", max_diff, tol);
+        assert!(max_diff <= tol, "BF16 容差 {} 超标: {}", tol, max_diff);
+    }
+
+    #[test]
+    fn bf16_gemm_fma_blis_aligns_scalar_oracle_4x8x16() {
+        // 中等矩阵 4×8×16: 覆盖 BLIS 微核条件触发。
+        let im = &GemmFmaBlis as &dyn OpImpl<GemmOpLayout>;
+        let dtype = QuantPrecision::BF16;
+        let prog = emit_program_for_impl(im, dtype, 4, 8, 16);
+        let a = seeded_test_matrix(4, 16, 44);
+        let b = seeded_test_matrix(16, 8, 45);
+        let ptr_bindings: [(VRegId, &str); 3] = [
+            (VRegId(0), "a"), (VRegId(1), "b"), (VRegId(2), "c"),
+        ];
+        let (max_diff, passed) = verify_op_impl_aligns_scalar(
+            &prog, &a, &b, 4, 8, 16, dtype, SimdWidth::W256, &ptr_bindings,
+        ).expect("interpreter should run");
+        let tol = tolerance_for(dtype);
+        assert!(passed, "BF16 GemmFmaBlis 4x8x16 vs scalar: max_diff={} > tol={}", max_diff, tol);
+    }
+
+    #[test]
+    fn bf16_gemm_scalar_aligns_oracle_3x5x12() {
+        // GemmScalar (保底) BF16 路径: 验证 scalar 保底实现数值正确。
+        let im = &GemmScalar as &dyn OpImpl<GemmOpLayout>;
+        let dtype = QuantPrecision::BF16;
+        let prog = emit_program_for_impl(im, dtype, 3, 5, 12);
+        let a = seeded_test_matrix(3, 12, 46);
+        let b = seeded_test_matrix(12, 5, 47);
+        let ptr_bindings: [(VRegId, &str); 3] = [
+            (VRegId(0), "a"), (VRegId(1), "b"), (VRegId(2), "c"),
+        ];
+        let (max_diff, passed) = verify_op_impl_aligns_scalar(
+            &prog, &a, &b, 3, 5, 12, dtype, SimdWidth::W256, &ptr_bindings,
+        ).expect("interpreter should run");
+        let tol = tolerance_for(dtype);
+        assert!(passed, "BF16 GemmScalar 3x5x12 vs scalar: max_diff={} > tol={}", max_diff, tol);
+    }
+
+    // ── F32 跨等级等价测试 (≥ 2 组) ──
+
+    #[test]
+    fn f32_gemm_fma_blis_aligns_scalar_oracle_6x10x20() {
+        // F32 短精度容差 ~1e-5: 验证 FMA 路径数值对齐。
+        let im = &GemmFmaBlis as &dyn OpImpl<GemmOpLayout>;
+        let dtype = QuantPrecision::F32;
+        let prog = emit_program_for_impl(im, dtype, 6, 10, 20);
+        let a = seeded_test_matrix(6, 20, 48);
+        let b = seeded_test_matrix(20, 10, 49);
+        let ptr_bindings: [(VRegId, &str); 3] = [
+            (VRegId(0), "a"), (VRegId(1), "b"), (VRegId(2), "c"),
+        ];
+        let (max_diff, passed) = verify_op_impl_aligns_scalar(
+            &prog, &a, &b, 6, 10, 20, dtype, SimdWidth::W256, &ptr_bindings,
+        ).expect("interpreter should run");
+        let tol = tolerance_for(dtype);
+        assert!(passed, "F32 GemmFmaBlis 6x10x20 vs scalar: max_diff={} > tol={}", max_diff, tol);
+        assert!(max_diff <= 1e-5, "F32 容差 1e-5 超标: {}", max_diff);
+    }
+
+    #[test]
+    fn f32_gemm_scalar_aligns_oracle_2x3x6() {
+        // F32 GemmScalar 保底路径: 验证保底数值正确。
+        let im = &GemmScalar as &dyn OpImpl<GemmOpLayout>;
+        let dtype = QuantPrecision::F32;
+        let prog = emit_program_for_impl(im, dtype, 2, 3, 6);
+        let a = seeded_test_matrix(2, 6, 50);
+        let b = seeded_test_matrix(6, 3, 51);
+        let ptr_bindings: [(VRegId, &str); 3] = [
+            (VRegId(0), "a"), (VRegId(1), "b"), (VRegId(2), "c"),
+        ];
+        let (max_diff, passed) = verify_op_impl_aligns_scalar(
+            &prog, &a, &b, 2, 3, 6, dtype, SimdWidth::W256, &ptr_bindings,
+        ).expect("interpreter should run");
+        let tol = tolerance_for(dtype);
+        assert!(passed, "F32 GemmScalar 2x3x6 vs scalar: max_diff={} > tol={}", max_diff, tol);
+    }
+
+    // ── Scalar oracle 自验证 (已知答案矩阵) ──
+
+    #[test]
+    fn scalar_oracle_known_matrix_3x5x4() {
+        // 已知答案: A = [[1,2,3,4],[5,6,7,8],[9,10,11,12]] (3×4)
+        //           B = [[1,0,0,0,1],[0,1,0,1,0],[0,0,1,0,0],[1,1,1,1,1]] (4×5)
+        //           C = Σ_p A[m][p] * B[p][n]
+        let a: Vec<f32> = vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0, 10.0, 11.0, 12.0];
+        let b: Vec<f32> = vec![
+            1.0, 0.0, 0.0, 0.0, 1.0,
+            0.0, 1.0, 0.0, 1.0, 0.0,
+            0.0, 0.0, 1.0, 0.0, 0.0,
+            1.0, 1.0, 1.0, 1.0, 1.0,
+        ];
+        let golden = scalar_gemm_reference(&a, &b, 3, 5, 4);
+        // 预期: C[0][0] = 1*1 + 2*0 + 3*0 + 4*1 = 5; C[0][1] = 1*0 + 2*1 + 3*0 + 4*1 = 6
+        assert_eq!(golden[0], 5.0);
+        assert_eq!(golden[1], 6.0);
+        assert_eq!(golden[2], 3.0 + 4.0); // C[0][2] = 3*1 + 4*1 = 7
+        // C[1][4] = 5*1 + 6*0 + 7*0 + 8*1 = 13 (row-major index = 1*5+4 = 9)
+        assert_eq!(golden[9], 13.0);
+        // C[2][4] = 9*1 + 10*0 + 11*0 + 12*1 = 21 (row-major index = 2*5+4 = 14)
+        assert_eq!(golden[14], 21.0);
+    }
+
+    #[test]
+    fn tolerance_bf16_vs_f32() {
+        // CR-TIER-SOVEREIGNTY-004: BF16 容差 ~1e-2, F32 ~1e-5。
+        let bf16_tol = tolerance_for(QuantPrecision::BF16);
+        let f32_tol = tolerance_for(QuantPrecision::F32);
+        assert!(bf16_tol >= 1e-2, "BF16 容差应 ≥ 1e-2, got {}", bf16_tol);
+        assert!(bf16_tol <= 1e-1, "BF16 容差应 ≤ 1e-1 (保守), got {}", bf16_tol);
+        assert!(f32_tol <= 1e-5, "F32 容差应 ≤ 1e-5, got {}", f32_tol);
+    }
 }
