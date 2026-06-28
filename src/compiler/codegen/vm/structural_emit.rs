@@ -32,9 +32,17 @@ pub(crate) fn emit_gather_inline(
     // Compute-side dimensions (VecStore writes to activation buffer)
     let compute_elem = compute_dtype.elem_bytes();
     let compute_row_bytes = embed_dim * compute_elem;
-    let compute_vec_step = lanes * compute_elem;
+    // VecLoad(dtype=weight_dtype) 在 WidenCompute 策略下已自动把 BF16→F32 widen 到
+    // 寄存器，因此 load 后寄存器已是 compute_dtype 的值。VecStore 直接用 compute_dtype。
+    // 循环步长 = 消耗的**权重字节数**（按 weight_dtype 的 lanes 计），而非 compute 字节，
+    // 否则当 weight≠compute 时会跨步读取权重表越界。
+    //
+    // 关键约束：VecLoad(dtype=BF16, width=W256) 一次读 16 bytes (8×BF16) → widen 成
+    // 8×F32 进 ymm。所以每次迭代消耗 weight_elem*lanes 字节权重（= 2*8 = 16 bytes），
+    // dim_vecs 次迭代覆盖整行 (embed_dim*weight_elem bytes)。
+    let load_vec_step = lanes * weight_elem;
     let dim_vecs = embed_dim / lanes;
-    let index_elem = 4usize;
+    let index_elem = 4usize;  // I32 indices (token_ids are u32)
 
     prog.emit(VmInstr::Comment(match indices_kind {
         GatherIndicesKind::Tensor => "Gather: indexed embedding lookup (auto_select)".into(),
@@ -106,45 +114,39 @@ pub(crate) fn emit_gather_inline(
         }
 
         // Inner dim loop: VecLoad (weight_dtype) + optional scale + VecStore (compute_dtype)
-        // BCE-20260629-003 (CR-DTYPE-SOVEREIGNTY-001/002): weight_blob 保留原始 dtype（宪法1），
-        // gather codegen read-time widen（代码顺从数据，非数据迁就代码）。
-        // 旧违宪前提"weight_blob is F32 — pack converts BF16→F32"已删除：pack 不转换，
-        // widen 责任在 JIT codegen read-time。
-        let needs_widen = weight_dtype != compute_dtype;
+        // BCE-20260629-003 (CR-DTYPE-SOVEREIGNTY-001/002): VecLoad{dtype: weight_dtype}
+        // 在 x86 WidenCompute 策略下已自动把 BF16/F16 widen 到 F32 寄存器
+        // （lower_instr: vpmovzxwd + vpslld 16）。
+        // 禁止再发 VecWiden（双重 widen → 把已 F32 的位当 BF16 再拆 → NaN）。
+        // weight_blob 保留原始 dtype（宪法1），widen 责任在 VecLoad WidenCompute。
         if dim_vecs > 0 {
-            prog.emit_loop(BoundExpr::Const(dim_vecs), compute_vec_step, |prog, _ctr, d_off| {
+            prog.emit_loop(BoundExpr::Const(dim_vecs), load_vec_step, |prog, ctr, d_off| {
                 let data = prog.alloc_vreg(VRegKind::Vec, width);
                 prog.emit(VmInstr::VecLoad {
                     dst: data, base: table_row,
                     offset: OffsetExpr::LoopOffset(d_off), width,
                     dtype: weight_dtype, predicate: None,
                 });
-                // CR-DTYPE-SOVEREIGNTY-001: weight≠compute 时 read-time widen（BF16→F32）
-                // VecLoad 已按 weight_dtype 解码，但寄存器值需 widen 到 compute_dtype
-                // 通过 VecWiden 指令完成（lower 层按 dtype 生成特化 widen 机器码）
-                let widened = if needs_widen {
-                    let w = prog.alloc_vreg(VRegKind::Vec, width);
-                    prog.emit(VmInstr::VecWiden {
-                        dst: w, src: data,
-                        src_dtype: weight_dtype, dst_dtype: compute_dtype, width,
-                    });
-                    w
-                } else {
-                    data
-                };
+                // data 已是 F32（VecLoad WidenCompute 完成 BF16→F32），无需再 widen
                 let slots = super::auto_select::auto_lower_trace_raw(
-                    prog, &scale_body, &[widened], width, compute_dtype).expect("gather scale trace auto_lower failed");
-                let result = slots.last().copied().unwrap_or(widened);
+                    prog, &scale_body, &[data], width, compute_dtype).expect("gather scale trace auto_lower failed");
+                let result = slots.last().copied().unwrap_or(data);
 
+                // Output buffer 偏移 = lane_index * compute_elem = ctr * lanes * compute_elem
+                // （ctr 是循环迭代索引，每次迭代写 lanes 个 compute_dtype 元素）
+                let store_off = OffsetExpr::Mul(
+                    Box::new(OffsetExpr::LoopOffset(ctr)),
+                    lanes * compute_elem,
+                );
                 prog.emit(VmInstr::VecStore {
-                    base: out_row, offset: OffsetExpr::LoopOffset(d_off),
+                    base: out_row, offset: store_off,
                     src: result, width,
                     dtype: compute_dtype, predicate: None,
                 });
                 if let Some(acc) = norm_sq_acc {
                     let l2_body = vec![TraceOp::Input(0), TraceOp::Mul(ValueId(0), ValueId(0)), TraceOp::Input(1), TraceOp::Add(ValueId(1), ValueId(2))];
                     super::auto_select::auto_lower_trace_into(
-                        prog, &l2_body, &[widened, acc], acc, width, compute_dtype,
+                        prog, &l2_body, &[data, acc], acc, width, compute_dtype,
                     ).expect("gather L2 norm auto_lower failed");
                 }
             });

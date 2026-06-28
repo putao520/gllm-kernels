@@ -110,18 +110,30 @@ pub(crate) fn resolve_sym_dim(dim: &SymDim, abi: &AbiPtrs, sym_map: &SymDimSlotM
     sym_map.to_bound(dim)
 }
 
-/// 从图推断激活计算 dtype（REQ-DTYPE-010, CR-DTYPE-SOVEREIGNTY-001）。
+/// 从图推断激活**计算** dtype（REQ-DTYPE-010, CR-DTYPE-SOVEREIGNTY-001）。
 ///
-/// BCE-20260629-003: 禁止取 tensors.first() — token_ids/position_ids 等索引类
-/// tensor 是 I32，若恰为图首 tensor 会污染全图 ctx.dtype。改为跳过整数 dtype（I32/INT*），
-/// 取第一个浮点激活 tensor 的 dtype。无浮点 tensor 时回退 F32。
+/// BCE-20260629-003 第六层: 区分**存储 dtype** 与**计算 dtype**。
+/// 激活 tensor 标的是存储 dtype（BF16），但 JIT 计算精度应该是 F32
+/// （REQ-DTYPE-CHAIN-005: BF16 存储 + F32 计算/累加）。
+/// 旧实现取首个浮点 tensor 的存储 dtype(BF16) 当 compute dtype → 与
+/// MegaKernelAbi.compute_dtype=F32 不同步 → harness 读 NaN。
+///
+/// 正确: graph_dtype 返回**计算精度** F32（激活累加精度），存储 dtype 由各
+/// OpImpl 的 weight_dtype 参数单独传播。BF16/F16 权重在 VecLoad WidenCompute
+/// 时自动 widen 到 F32 寄存器计算。
 pub(super) fn graph_dtype(graph: &CompilerGraph) -> QuantPrecision {
     use crate::compiler::trace::DTypeKind;
-    let result = graph.tensors.iter()
+    // 取第一个浮点 tensor 确认有浮点数据（跳过索引类 I32/U8）
+    let has_float = graph.tensors.iter()
         .map(|t| t.dtype.to_quant_precision())
-        .find(|qp| matches!(qp.kind, DTypeKind::F32 | DTypeKind::BF16 | DTypeKind::F16 | DTypeKind::TF32))
-        .unwrap_or(QuantPrecision::F32);
-    result
+        .any(|qp| matches!(qp.kind, DTypeKind::F32 | DTypeKind::BF16 | DTypeKind::F16 | DTypeKind::TF32));
+    if !has_float {
+        return QuantPrecision::F32;
+    }
+    // 计算精度统一 F32（激活累加）。存储 dtype(BF16/F16) 由 VecLoad WidenCompute
+    // 在寄存器内 widen 到 F32，不在 graph_dtype 层混入存储精度。
+    // 这保证 JIT ctx.dtype(F32) == MegaKernelAbi.compute_dtype(F32) 同步。
+    QuantPrecision::F32
 }
 
 /// 从 op 的第一个输入 tensor 推断计算 dtype (REQ-DTYPE-001)。
