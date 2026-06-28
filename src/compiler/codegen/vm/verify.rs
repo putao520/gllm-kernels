@@ -1199,7 +1199,7 @@ fn collect_src_vregs(instr: &VmInstr) -> Vec<VRegId> {
         | VmInstr::TileConfig { .. }
         | VmInstr::TileRelease
         | VmInstr::TileMma { .. }
-        | VmInstr::Vp2Intersect { .. }
+        | VmInstr::SparseMaskIntersect { .. }
         | VmInstr::WarpSync
         | VmInstr::AsyncCopy { .. }
         | VmInstr::AsyncWait { .. }

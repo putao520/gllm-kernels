@@ -194,7 +194,7 @@ impl MicroArch {
     }
 
     /// VP2INTERSECT: hardware sparse mask intersection.
-    pub fn has_vp2intersect(self) -> bool {
+    pub fn has_sparse_mask_intersect(self) -> bool {
         false // Tiger Lake+ but rarely enabled; CPUID leaf 7 bit TBD
     }
 }
@@ -422,7 +422,7 @@ pub struct KernelConfig {
     /// APX: Advanced Performance Extensions — 31 GPR (r16-r30).
     pub has_apx: bool,
     /// VP2INTERSECT: hardware sparse mask intersection.
-    pub has_vp2intersect: bool,
+    pub has_sparse_mask_intersect: bool,
 }
 
 impl KernelConfig {
@@ -498,7 +498,7 @@ impl KernelConfig {
             // AVX10 / APX
             has_avx10_2: arch.has_avx10_2(),
             has_apx: arch.has_apx(),
-            has_vp2intersect: arch.has_vp2intersect(),
+            has_sparse_mask_intersect: arch.has_sparse_mask_intersect(),
         };
 
         // Detect ARM SVE from HwInfo if on aarch64.
@@ -835,7 +835,7 @@ mod tests {
     }
 
     #[test]
-    fn avx10_apx_vp2intersect_always_false() {
+    fn avx10_apx_sparse_mask_intersect_always_false() {
         // These features are not yet tied to any MicroArch variant.
         for arch in [
             MicroArch::GraniteRapids, MicroArch::SapphireRapids,
@@ -843,7 +843,7 @@ mod tests {
         ] {
             assert!(!arch.has_avx10_2(), "{arch:?} AVX10.2 should be false");
             assert!(!arch.has_apx(), "{arch:?} APX should be false");
-            assert!(!arch.has_vp2intersect(), "{arch:?} VP2INTERSECT should be false");
+            assert!(!arch.has_sparse_mask_intersect(), "{arch:?} VP2INTERSECT should be false");
         }
     }
 

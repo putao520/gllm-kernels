@@ -726,7 +726,7 @@ impl<'a> RegAllocator<'a> {
                 v
             }
             VmInstr::TileMma { c, a, b } => vec![*c, *a, *b],
-            VmInstr::Vp2Intersect { dst_k0, dst_k1, a, b } => vec![*dst_k0, *dst_k1, *a, *b],
+            VmInstr::SparseMaskIntersect { dst_k0, dst_k1, a, b } => vec![*dst_k0, *dst_k1, *a, *b],
             VmInstr::ScalarLoad { dst, base, offset } => {
                 let mut v = vec![*dst, *base];
                 v.extend(Self::offset_vregs(offset));

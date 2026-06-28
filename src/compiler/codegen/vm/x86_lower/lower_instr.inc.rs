@@ -1349,9 +1349,9 @@ impl X86Lower {
                 Ok(())
             }
 
-            // ── VP2INTERSECT: 稀疏掩码硬件交集 (AVX-512 / Granite Rapids+) ──
-            VmInstr::Vp2Intersect { dst_k0, dst_k1, a, b } => {
-                // VP2INTERSECTD k_pair, zmm_a, zmm_b
+            // ── SPARSE_MASK_INTERSECT: 稀疏掩码硬件交集 (AVX-512 / Granite Rapids+) ──
+            VmInstr::SparseMaskIntersect { dst_k0, dst_k1, a, b } => {
+                // SPARSE_MASK_INTERSECT_D k_pair, zmm_a, zmm_b
                 // 输出: k0 = a 中匹配元素掩码, k1 = b 中匹配元素掩码
                 //
                 // EVEX 编码: EVEX.512.F2.0F38.W0 68 /r
@@ -1365,9 +1365,9 @@ impl X86Lower {
                 // vvvv = zmm_a (第一源操作数, 非破坏性)
                 // rm = zmm_b (第二源操作数)
                 let phys_a = alloc.get_vec(*a)
-                    .ok_or_else(|| CompilerError::CodegenViolation(format!("v{} not allocated to VEC for VP2INTERSECT src1", a.0)))?;
+                    .ok_or_else(|| CompilerError::CodegenViolation(format!("v{} not allocated to VEC for SPARSE_MASK_INTERSECT src1", a.0)))?;
                 let phys_b = alloc.get_vec(*b)
-                    .ok_or_else(|| CompilerError::CodegenViolation(format!("v{} not allocated to VEC for VP2INTERSECT src2", b.0)))?;
+                    .ok_or_else(|| CompilerError::CodegenViolation(format!("v{} not allocated to VEC for SPARSE_MASK_INTERSECT src2", b.0)))?;
                 let src1 = phys_a.0; // zmm index for a
                 let src2 = phys_b.0; // zmm index for b
                 // 目标 k 寄存器固定为 k0 (隐式输出 k0, k1)

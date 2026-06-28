@@ -793,16 +793,16 @@ mod tests {
     // ── Error case tests ──
 
     #[test]
-    fn test_gpu_vp2intersect_error() {
-        // Arrange: Vp2Intersect is x86-only, should error on all GPU dialects
+    fn test_gpu_sparse_mask_intersect_error() {
+        // Arrange: SparseMaskIntersect is x86-only, should error on all GPU dialects
         let mut l = GpuLower::new(GpuDialect::Ptx { sm_version: 80 });
         let alloc = empty_alloc();
         // Act
-        let result = l.lower_instr(&VmInstr::Vp2Intersect {
+        let result = l.lower_instr(&VmInstr::SparseMaskIntersect {
             dst_k0: VRegId(0), dst_k1: VRegId(1), a: VRegId(2), b: VRegId(3),
         }, &alloc);
         // Assert
-        assert!(result.is_err(), "Vp2Intersect should error on GPU: {result:?}");
+        assert!(result.is_err(), "SparseMaskIntersect should error on GPU: {result:?}");
         let err_msg = format!("{:?}", result.unwrap_err());
         assert!(err_msg.contains("x86-only"), "Error should mention x86-only: {err_msg}");
     }

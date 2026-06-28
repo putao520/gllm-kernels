@@ -313,10 +313,11 @@ pub enum VmInstr {
     /// 释放 tile 资源
     TileRelease,
 
-    /// VP2INTERSECT: 稀疏掩码硬件交集 (AVX-512 / Granite Rapids+)
-    /// dst_k0/dst_k1 = VP2INTERSECTD/Q(a, b)
+    /// SPARSE_MASK_INTERSECT: 稀疏掩码硬件交集 (AVX-512 / Granite Rapids+)
+    /// dst_k0/dst_k1 = SPARSE_MASK_INTERSECT_D/Q(a, b)
     /// 输出两个 k-mask: 匹配 a 中元素的掩码 + 匹配 b 中元素的掩码
-    Vp2Intersect {
+    // @trace REQ-HW-TIER-005 [req:VmInstr-Semantic] VmInstr 指令名语义化, 禁止泄漏 x86 指令身份
+    SparseMaskIntersect {
         dst_k0: VRegId,
         dst_k1: VRegId,
         a: VRegId,

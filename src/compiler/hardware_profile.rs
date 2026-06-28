@@ -68,7 +68,7 @@ impl HardwareProfile {
                 has_amx_fp8: false,
                 has_avx10_2: matches!(self, Self::CpuAvx10_2),
                 has_apx: matches!(self, Self::CpuAvx10_2),
-                has_vp2intersect: false,
+                has_sparse_mask_intersect: false,
             },
             Self::ArmNeoverse => Platform::AArch64 {
                 has_bf16: true,
@@ -184,7 +184,7 @@ impl HardwareProfile {
                 has_amx_fp8: false,
                 has_avx10_2: false,
                 has_apx: false,
-                has_vp2intersect: false,
+                has_sparse_mask_intersect: false,
             },
         }
     }

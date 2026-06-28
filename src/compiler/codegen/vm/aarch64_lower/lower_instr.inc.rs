@@ -1400,9 +1400,9 @@ impl AArch64Lower {
                 Ok(())
             }
 
-            // x86-specific: VP2INTERSECT has no AArch64 equivalent
-            VmInstr::Vp2Intersect { .. } => {
-                Err(CompilerError::CodegenViolation("AArch64: VP2INTERSECT is x86-only".into()))
+            // x86-specific: SPARSE_MASK_INTERSECT has no AArch64 equivalent
+            VmInstr::SparseMaskIntersect { .. } => {
+                Err(CompilerError::CodegenViolation("AArch64: SPARSE_MASK_INTERSECT is x86-only".into()))
             }
 
             // GPU: AArch64 不支持

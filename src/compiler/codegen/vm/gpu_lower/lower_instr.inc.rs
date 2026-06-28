@@ -1585,9 +1585,9 @@ impl GpuLower {
                 Ok(())
             }
 
-            // x86-specific: VP2INTERSECT has no GPU equivalent
-            VmInstr::Vp2Intersect { .. } => {
-                Err(CompilerError::CodegenViolation("GPU: VP2INTERSECT is x86-only".into()))
+            // x86-specific: SPARSE_MASK_INTERSECT has no GPU equivalent
+            VmInstr::SparseMaskIntersect { .. } => {
+                Err(CompilerError::CodegenViolation("GPU: SPARSE_MASK_INTERSECT is x86-only".into()))
             }
 
             // REQ-CG-008: Scalar ops — GPU lowering (PTX/HIP/Metal)

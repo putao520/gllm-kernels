@@ -23,7 +23,7 @@
 //! | Intel | AVX-512 | 32 zmm, VNNI, BF16 |
 //! | Intel | AMX (SPR) | tile 16×16, BF16, INT8 |
 //! | Intel | AMX+ (GR/DR) | AMX-FP16, AMX-COMPLEX, AMX-Transpose, FP8 |
-//! | Intel | AVX10.2 + APX | 31 GPR, VP2INTERSECT, BF16-256 |
+//! | Intel | AVX10.2 + APX | 31 GPR, SPARSE_MASK_INTERSECT, BF16-256 |
 //! | ARM | NEON | 128-bit fixed |
 //! | ARM | SVE2 (Neoverse V2) | scalable 128-2048 bit |
 //! | ARM | SME2 (Neoverse V3) | ZA tile, outer product, multi-vec |
@@ -87,7 +87,7 @@ pub enum Platform {
         // ── AVX10 / APX ──
         has_avx10_2: bool,       // AVX10.2 (256-bit 统一, VMINMAXPS)
         has_apx: bool,           // APX 31 GPR (Extended GPR)
-        has_vp2intersect: bool,  // VP2INTERSECT (sparse mask 硬件化)
+        has_sparse_mask_intersect: bool,  // SPARSE_MASK_INTERSECT (sparse mask 硬件化)
     },
     AArch64 {
         // ── NEON (基线) ──
@@ -226,8 +226,9 @@ pub enum IsaFeature {
     Avx10_2,
     /// APX 31 GPR (Extended General Purpose Registers)
     Apx31Gpr,
-    /// VP2INTERSECT 稀疏掩码硬件化
-    Vp2Intersect,
+    /// SPARSE_MASK_INTERSECT 稀疏掩码硬件化
+    // @trace REQ-HW-TIER-005 [req:IsaFeature-Semantic] IsaFeature 名语义化, 禁止泄漏 x86 指令身份
+    SparseMaskIntersect,
 
     // ── NVIDIA CUDA 特性 ──
     /// Warpgroup MMA (SM90+: wgmma.mma_async 16×16×64)
@@ -472,7 +473,7 @@ impl IsaProfile {
         if kc.has_apx {
             features.push(IsaFeature::Apx31Gpr);
         }
-        if kc.has_vp2intersect { features.push(IsaFeature::Vp2Intersect); }
+        if kc.has_sparse_mask_intersect { features.push(IsaFeature::SparseMaskIntersect); }
 
         let tile_regs = if kc.has_amx { (0..8).map(PhysTile).collect() } else { vec![] };
         let mask_regs = if kc.use_avx512 { (0..8).map(PhysMask).collect() } else { vec![] };
@@ -490,7 +491,7 @@ impl IsaProfile {
                 has_amx_fp8: kc.has_amx_fp8,
                 has_avx10_2: kc.has_avx10_2,
                 has_apx: kc.has_apx,
-                has_vp2intersect: kc.has_vp2intersect,
+                has_sparse_mask_intersect: kc.has_sparse_mask_intersect,
             },
             gpr_regs,
             scratch_gprs,
@@ -1671,7 +1672,7 @@ mod tests {
             IsaFeature::Sve2,
             IsaFeature::SmeTileOp,
             IsaFeature::AmxFp16,
-            IsaFeature::Vp2Intersect,
+            IsaFeature::SparseMaskIntersect,
             IsaFeature::SiMDGroupMatrix,
         ];
 
@@ -1745,7 +1746,7 @@ mod tests {
             has_avx512: true, has_bf16: true, has_vnni: true, has_avx512fp16: false,
             has_amx: false, has_amx_fp16: false, has_amx_complex: false,
             has_amx_transpose: false, has_amx_fp8: false,
-            has_avx10_2: false, has_apx: false, has_vp2intersect: false,
+            has_avx10_2: false, has_apx: false, has_sparse_mask_intersect: false,
         };
         let aarch64 = Platform::AArch64 {
             has_bf16: false, has_dotprod: true, has_i8mm: false,
@@ -1939,7 +1940,7 @@ mod tests {
             has_avx512: true, has_bf16: true, has_vnni: true, has_avx512fp16: false,
             has_amx: false, has_amx_fp16: false, has_amx_complex: false,
             has_amx_transpose: false, has_amx_fp8: false,
-            has_avx10_2: false, has_apx: false, has_vp2intersect: false,
+            has_avx10_2: false, has_apx: false, has_sparse_mask_intersect: false,
         };
 
         // Act & Assert: CPU platforms return None for GPU-specific queries
@@ -2083,7 +2084,7 @@ mod tests {
                 has_avx512: false, has_bf16: false, has_vnni: false, has_avx512fp16: false,
                 has_amx: false, has_amx_fp16: false, has_amx_complex: false,
                 has_amx_transpose: false, has_amx_fp8: false,
-                has_avx10_2: false, has_apx: false, has_vp2intersect: false,
+                has_avx10_2: false, has_apx: false, has_sparse_mask_intersect: false,
             },
             gpr_regs: vec![],
             scratch_gprs: vec![],

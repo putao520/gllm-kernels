@@ -311,7 +311,7 @@ impl VmProgram {
             VmInstr::TileConfig { rows, cols, dtype } => VmInstr::TileConfig { rows, cols, dtype },
             VmInstr::TileMma { c, a, b } => VmInstr::TileMma { c: r(c, map, next_vreg), a: r(a, map, next_vreg), b: r(b, map, next_vreg) },
             VmInstr::TileRelease => VmInstr::TileRelease,
-            VmInstr::Vp2Intersect { dst_k0, dst_k1, a, b } => VmInstr::Vp2Intersect { dst_k0: r(dst_k0, map, next_vreg), dst_k1: r(dst_k1, map, next_vreg), a: r(a, map, next_vreg), b: r(b, map, next_vreg) },
+            VmInstr::SparseMaskIntersect { dst_k0, dst_k1, a, b } => VmInstr::SparseMaskIntersect { dst_k0: r(dst_k0, map, next_vreg), dst_k1: r(dst_k1, map, next_vreg), a: r(a, map, next_vreg), b: r(b, map, next_vreg) },
             VmInstr::WarpSync => VmInstr::WarpSync,
             VmInstr::AsyncCopy { dst, src, size } => VmInstr::AsyncCopy { dst: r(dst, map, next_vreg), src: r(src, map, next_vreg), size },
             VmInstr::AsyncWait { handle } => VmInstr::AsyncWait { handle },
@@ -542,7 +542,7 @@ impl VmProgram {
             VmInstr::TileConfig { rows, cols, dtype } => VmInstr::TileConfig { rows, cols, dtype },
             VmInstr::TileMma { c, a, b } => VmInstr::TileMma { c: r(c), a: r(a), b: r(b) },
             VmInstr::TileRelease => VmInstr::TileRelease,
-            VmInstr::Vp2Intersect { dst_k0, dst_k1, a, b } => VmInstr::Vp2Intersect { dst_k0: r(dst_k0), dst_k1: r(dst_k1), a: r(a), b: r(b) },
+            VmInstr::SparseMaskIntersect { dst_k0, dst_k1, a, b } => VmInstr::SparseMaskIntersect { dst_k0: r(dst_k0), dst_k1: r(dst_k1), a: r(a), b: r(b) },
             VmInstr::WarpSync => VmInstr::WarpSync,
             VmInstr::AsyncCopy { dst, src, size } => VmInstr::AsyncCopy { dst: r(dst), src: r(src), size },
             VmInstr::AsyncWait { handle } => VmInstr::AsyncWait { handle },
@@ -738,7 +738,7 @@ impl VmProgram {
             VmInstr::Accumulate { acc, src } => vec![*acc, *src],
             VmInstr::Transcendental { dst, src, .. } => vec![*dst, *src],
             VmInstr::Prefetch { base, .. } => vec![*base],
-            VmInstr::Vp2Intersect { dst_k0, dst_k1, a, b } => vec![*dst_k0, *dst_k1, *a, *b],
+            VmInstr::SparseMaskIntersect { dst_k0, dst_k1, a, b } => vec![*dst_k0, *dst_k1, *a, *b],
             VmInstr::LoadPtr { dst, .. } => vec![*dst],
             VmInstr::AtomicAdd { base, .. } => vec![*base],
             VmInstr::MemFence { .. } => vec![],
@@ -1672,7 +1672,7 @@ impl VmProgram {
                 | VmInstr::GprCondAction { .. }
                 | VmInstr::WarpSync | VmInstr::AsyncCopy { .. } | VmInstr::AsyncWait { .. }
                 | VmInstr::TileConfig { .. } | VmInstr::TileMma { .. } | VmInstr::TileRelease
-                | VmInstr::Vp2Intersect { .. } | VmInstr::HotpatchSlot { .. }
+                | VmInstr::SparseMaskIntersect { .. } | VmInstr::HotpatchSlot { .. }
                 | VmInstr::IndirectJump { .. } | VmInstr::ConditionalExit { .. }
                 | VmInstr::BranchIfPtrNonNull { .. }
                 | VmInstr::BranchIfGprZero { .. }
