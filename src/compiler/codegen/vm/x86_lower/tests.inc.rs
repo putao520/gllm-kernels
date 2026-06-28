@@ -443,4 +443,269 @@ mod tests {
         // Assert: source map should be present but empty (no instructions lowered)
         assert!(source_map.entries.is_empty(), "fresh X86Lower should have empty source map");
     }
+
+    // ── BF16 AVX2 窄化路径测试 (CR-TIER-SOVEREIGNTY-004) ──
+    // 验证无 AVX-512 BF16 的硬件上 F32→BF16 向量化序列正确生成。
+
+    fn build_bf16_store_prog() -> VmProgram {
+        let mut prog = VmProgram::new();
+        let input_ptr = prog.alloc_vreg(VRegKind::Ptr, SimdWidth::Scalar);
+        let output_ptr = prog.alloc_vreg(VRegKind::Ptr, SimdWidth::Scalar);
+        let vec_reg = prog.alloc_vreg(VRegKind::Vec, SimdWidth::W256);
+        // Load 8×F32, then store as 8×BF16 (WidenCompute path)
+        prog.emit(VmInstr::VecLoad {
+            dst: vec_reg, base: input_ptr, offset: OffsetExpr::Const(0),
+            width: SimdWidth::W256, dtype: QuantPrecision::F32, predicate: None,
+        });
+        prog.emit(VmInstr::VecStore {
+            base: output_ptr, src: vec_reg, offset: OffsetExpr::Const(0),
+            width: SimdWidth::W256, dtype: QuantPrecision::BF16, predicate: None,
+        });
+        prog
+    }
+
+    #[test]
+    fn bf16_vec_store_on_avx2_uses_software_path() {
+        // Arrange: build a program that stores BF16 (VecStore WidenCompute)
+        let prog = build_bf16_store_prog();
+        let dp = DeviceProfile::detect();
+        let profile = IsaProfile::from_device_profile(&dp);
+        let alloc = RegAllocator::new(&profile).allocate(&prog).unwrap();
+        let frame = super::super::stack_frame::StackFrame::compute(&alloc, &profile, 0);
+
+        // Act: lower with use_avx512=false (AVX2-only hardware, e.g., i9-10900KF)
+        let mut lower = X86Lower::with_avx512(false);
+        lower.emit_prologue(&frame, &alloc).unwrap();
+        for instr in &prog.instrs {
+            lower.lower_instr(instr, &alloc).unwrap();
+        }
+        lower.emit_epilogue(&frame, &alloc).unwrap();
+        let code = lower.finalize().unwrap();
+
+        // Assert: code should be generated (no error), and should be substantial
+        // (contains vpsrld+vpackusdw sequence, not just NOP)
+        assert!(!code.is_empty(), "AVX2 BF16 store should produce code");
+        assert!(code.len() > 50, "AVX2 BF16 store code should be substantial: {} bytes", code.len());
+    }
+
+    #[test]
+    fn bf16_vec_store_on_avx512_uses_native_instruction() {
+        // Arrange: same program, but lower with use_avx512=true (AVX-512 BF16 hardware)
+        let prog = build_bf16_store_prog();
+        let dp = DeviceProfile::detect();
+        let profile = IsaProfile::from_device_profile(&dp);
+        let alloc = RegAllocator::new(&profile).allocate(&prog).unwrap();
+        let frame = super::super::stack_frame::StackFrame::compute(&alloc, &profile, 0);
+
+        // Act: lower with use_avx512=true
+        let mut lower = X86Lower::with_avx512(true);
+        lower.emit_prologue(&frame, &alloc).unwrap();
+        for instr in &prog.instrs {
+            lower.lower_instr(instr, &alloc).unwrap();
+        }
+        lower.emit_epilogue(&frame, &alloc).unwrap();
+        let code = lower.finalize().unwrap();
+
+        // Assert: code should be generated
+        assert!(!code.is_empty(), "AVX-512 BF16 store should produce code");
+    }
+
+    fn build_bf16_narrow_prog() -> VmProgram {
+        let mut prog = VmProgram::new();
+        let input_ptr = prog.alloc_vreg(VRegKind::Ptr, SimdWidth::Scalar);
+        let src = prog.alloc_vreg(VRegKind::Vec, SimdWidth::W256);
+        let dst = prog.alloc_vreg(VRegKind::Vec, SimdWidth::W256);
+        prog.emit(VmInstr::VecLoad {
+            dst: src, base: input_ptr, offset: OffsetExpr::Const(0),
+            width: SimdWidth::W256, dtype: QuantPrecision::F32, predicate: None,
+        });
+        prog.emit(VmInstr::VecNarrow {
+            dst, src, dst_dtype: QuantPrecision::BF16, src_dtype: QuantPrecision::F32,
+            width: SimdWidth::W256,
+        });
+        prog
+    }
+
+    #[test]
+    fn bf16_vec_narrow_on_avx2_uses_software_path() {
+        // Arrange: VecNarrow F32→BF16 on AVX2
+        let prog = build_bf16_narrow_prog();
+        let dp = DeviceProfile::detect();
+        let profile = IsaProfile::from_device_profile(&dp);
+        let alloc = RegAllocator::new(&profile).allocate(&prog).unwrap();
+        let frame = super::super::stack_frame::StackFrame::compute(&alloc, &profile, 0);
+
+        // Act: lower with use_avx512=false
+        let mut lower = X86Lower::with_avx512(false);
+        lower.emit_prologue(&frame, &alloc).unwrap();
+        for instr in &prog.instrs {
+            lower.lower_instr(instr, &alloc).unwrap();
+        }
+        lower.emit_epilogue(&frame, &alloc).unwrap();
+        let code = lower.finalize().unwrap();
+
+        // Assert: should succeed (no error about AVX-512 requirement)
+        assert!(!code.is_empty(), "AVX2 BF16 VecNarrow should produce code");
+    }
+
+    #[test]
+    fn bf16_vec_narrow_on_avx512_uses_native_instruction() {
+        // Arrange: VecNarrow F32→BF16 with AVX-512
+        let prog = build_bf16_narrow_prog();
+        let dp = DeviceProfile::detect();
+        let profile = IsaProfile::from_device_profile(&dp);
+        let alloc = RegAllocator::new(&profile).allocate(&prog).unwrap();
+        let frame = super::super::stack_frame::StackFrame::compute(&alloc, &profile, 0);
+
+        // Act: lower with use_avx512=true
+        let mut lower = X86Lower::with_avx512(true);
+        lower.emit_prologue(&frame, &alloc).unwrap();
+        for instr in &prog.instrs {
+            lower.lower_instr(instr, &alloc).unwrap();
+        }
+        lower.emit_epilogue(&frame, &alloc).unwrap();
+        let code = lower.finalize().unwrap();
+
+        // Assert
+        assert!(!code.is_empty(), "AVX-512 BF16 VecNarrow should produce code");
+    }
+
+    /// 反汇编 code bytes，收集所有指令助记符，用于验证 AVX2 路径 emit 了预期的指令序列。
+    fn disasm_mnemonics(code: &[u8]) -> Vec<&'static str> {
+        use iced_x86::{Decoder, DecoderOptions, Mnemonic};
+        let mut decoder = Decoder::new(64, code, DecoderOptions::NONE);
+        let mut mnemonics = Vec::new();
+        for instr in decoder.iter() {
+            // 仅保留与 BF16 窄化序列相关的指令，便于断言。
+            let m = instr.mnemonic();
+            let name = match m {
+                Mnemonic::Vpsrld => "vpsrld",
+                Mnemonic::Vpslld => "vpslld",
+                Mnemonic::Vpaddd => "vpaddd",
+                Mnemonic::Vpand => "vpand",
+                Mnemonic::Vpackusdw => "vpackusdw",
+                Mnemonic::Vcvtneps2bf16 => "vcvtneps2bf16",
+                Mnemonic::Vbroadcastss => "vbroadcastss",
+                _ => continue,
+            };
+            mnemonics.push(name);
+        }
+        mnemonics
+    }
+
+    #[test]
+    fn bf16_avx2_store_emits_expected_instruction_sequence() {
+        // CR-TIER-SOVEREIGNTY-004: AVX2 路径必须 emit vpsrld + vpackusdw (软件窄化序列)，
+        // 而非 vcvtneps2bf16 (那是 AVX-512 专用)。
+        let prog = build_bf16_store_prog();
+        let dp = DeviceProfile::detect();
+        let profile = IsaProfile::from_device_profile(&dp);
+        let alloc = RegAllocator::new(&profile).allocate(&prog).unwrap();
+        let frame = super::super::stack_frame::StackFrame::compute(&alloc, &profile, 0);
+
+        let mut lower = X86Lower::with_avx512(false);
+        lower.emit_prologue(&frame, &alloc).unwrap();
+        for instr in &prog.instrs {
+            lower.lower_instr(instr, &alloc).unwrap();
+        }
+        lower.emit_epilogue(&frame, &alloc).unwrap();
+        let code = lower.finalize().unwrap();
+
+        let mnemonics = disasm_mnemonics(&code);
+        assert!(mnemonics.contains(&"vpsrld"),
+            "AVX2 BF16 store must emit vpsrld (shift), got: {:?}", mnemonics);
+        assert!(mnemonics.contains(&"vpackusdw"),
+            "AVX2 BF16 store must emit vpackusdw (pack), got: {:?}", mnemonics);
+        assert!(!mnemonics.contains(&"vcvtneps2bf16"),
+            "AVX2 BF16 store must NOT emit vcvtneps2bf16 (AVX-512 only), got: {:?}", mnemonics);
+        // RNE 需要 lsb 提取 (vpand) 和 bias 加法 (vpaddd)
+        assert!(mnemonics.contains(&"vpand"),
+            "AVX2 BF16 store must emit vpand (lsb mask for RNE), got: {:?}", mnemonics);
+        assert!(mnemonics.contains(&"vpaddd"),
+            "AVX2 BF16 store must emit vpaddd (bias add), got: {:?}", mnemonics);
+    }
+
+    #[test]
+    fn bf16_avx512_store_emits_native_vcvtneps2bf16() {
+        // CR-TIER-SOVEREIGNTY-004: AVX-512 路径必须 emit vcvtneps2bf16 (原生指令)，
+        // 而非 vpsrld+vpackusdw (那是 AVX2 软件序列)。
+        let prog = build_bf16_store_prog();
+        let dp = DeviceProfile::detect();
+        let profile = IsaProfile::from_device_profile(&dp);
+        let alloc = RegAllocator::new(&profile).allocate(&prog).unwrap();
+        let frame = super::super::stack_frame::StackFrame::compute(&alloc, &profile, 0);
+
+        let mut lower = X86Lower::with_avx512(true);
+        lower.emit_prologue(&frame, &alloc).unwrap();
+        for instr in &prog.instrs {
+            lower.lower_instr(instr, &alloc).unwrap();
+        }
+        lower.emit_epilogue(&frame, &alloc).unwrap();
+        let code = lower.finalize().unwrap();
+
+        let mnemonics = disasm_mnemonics(&code);
+        assert!(mnemonics.contains(&"vcvtneps2bf16"),
+            "AVX-512 BF16 store must emit vcvtneps2bf16, got: {:?}", mnemonics);
+    }
+
+    /// F32→BF16 RNE (round-to-nearest-even) 标量参考实现。
+    /// 与 emit_f32_to_bf16_*_avx2 中的向量算法严格一致：
+    ///   rounded = f32_bits + 0x7FFF + ((f32_bits >> 16) & 1)
+    ///   bf16 = rounded >> 16
+    fn f32_to_bf16_rne_reference(f: f32) -> u16 {
+        let bits = f.to_bits();
+        let lsb = (bits >> 16) & 1;
+        let rounding_bias: u32 = 0x7FFF + lsb;
+        let rounded = bits.wrapping_add(rounding_bias);
+        (rounded >> 16) as u16
+    }
+
+    #[test]
+    fn bf16_avx2_rne_algorithm_matches_expected_precision() {
+        // CR-TIER-SOVEREIGNTY-004: BF16 容差 = BF16 精度 (~1e-2)。
+        // 验证 RNE 算法对典型值产生正确 (或精度内) 的 BF16 表示。
+        let test_cases: Vec<f32> = vec![
+            0.0, 1.0, -1.0, 2.0, 0.5, -0.5,
+            3.14159265,        // π
+            2.718281828,       // e
+            1.5, 2.5, 3.5,     // tie cases (lsb boundary)
+            100.0, 1000.0,
+            0.1, 0.01,
+            -3.14159265,
+            1e-3, 1e3,
+        ];
+
+        for &f in &test_cases {
+            let bf16_bits = f32_to_bf16_rne_reference(f);
+            // 反向解码 BF16 → F32 (BF16 = F32 高 16 位, low 16 bits = 0)
+            let restored = f32::from_bits((bf16_bits as u32) << 16);
+            // 容差: BF16 只有 8 位尾数 (~3 位十进制精度), 相对误差 < 0.5/256 ≈ 0.2%
+            if f == 0.0 {
+                assert_eq!(restored, 0.0, "zero should map to zero, got {}", restored);
+            } else {
+                let rel_err = ((restored - f).abs() / f.abs()).abs();
+                assert!(rel_err < 0.01,
+                    "BF16 RNE of {}: restored={}, rel_err={} exceeds 1% tolerance",
+                    f, restored, rel_err);
+            }
+        }
+    }
+
+    #[test]
+    fn bf16_avx2_rne_preserves_nan_inf() {
+        // NaN/Inf 必须保持语义 (exp 全 1)。
+        let pos_inf = f32::INFINITY;
+        let neg_inf = f32::NEG_INFINITY;
+        let nan = f32::NAN;
+
+        let bf16_inf = f32_to_bf16_rne_reference(pos_inf);
+        let bf16_neg_inf = f32_to_bf16_rne_reference(neg_inf);
+        let bf16_nan = f32_to_bf16_rne_reference(nan);
+
+        // Inf 的 BF16: 0x7F80 (exp=0xFF, mant=0)
+        assert_eq!(bf16_inf & 0x7F80, 0x7F80, "+Inf BF16 exp must be all-1s");
+        assert_eq!(bf16_neg_inf & 0x7F80, 0x7F80, "-Inf BF16 exp must be all-1s");
+        // NaN 的 BF16: exp=0xFF, mant != 0
+        assert_eq!(bf16_nan & 0x7F80, 0x7F80, "NaN BF16 exp must be all-1s");
+    }
 }

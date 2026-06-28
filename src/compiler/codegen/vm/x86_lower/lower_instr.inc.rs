@@ -229,37 +229,63 @@ impl X86Lower {
                     }
                     X86ElemStrategy::WidenCompute => {
                         // REQ-DTYPE-006: Narrow F32 → BF16, then store half-width.
-                        // vcvtneps2bf16: ymm(8×F32) → xmm(8×BF16), zmm(16×F32) → ymm(16×BF16).
-                        // Requires AVX-512 BF16 (Cooper Lake / Sapphire Rapids+).
-                        if !self.use_avx512 {
-                            return Err(CompilerError::CodegenViolation(
-                                "VecStore WidenCompute (BF16) requires AVX-512 BF16 support".into(),
-                            ));
-                        }
-                        match width {
-                            SimdWidth::W512 => {
-                                // zmm(16×F32) → vcvtneps2bf16 → ymm(16×BF16) → store 32 bytes
-                                let (s, _) = self.resolve_zmm_or_spill(*src, alloc, 0)?;
-                                let tmp = self.scratch_ymm(0);
-                                self.asm.vcvtneps2bf16(tmp, s).map_err(Self::err)?;
-                                self.asm.vmovups(ymmword_ptr(rax), tmp).map_err(Self::err)?;
+                        // AVX-512 BF16 (Cooper Lake / Sapphire Rapids+): vcvtneps2bf16 原生指令。
+                        // AVX2 (i9-10900KF / CometLake 等，无原生 BF16 指令): 向量化软件序列。
+                        //   两条路径都是各自硬件上的最优实现，无"降级"语义 (CR-TIER-SOVEREIGNTY-002)。
+                        // @trace REQ-HW-TIER-004 [req:BF16-Store-HardwareAware] BF16 store 按硬件能力路由: AVX-512 原生 / AVX2 软件
+                        if self.use_avx512 {
+                            match width {
+                                SimdWidth::W512 => {
+                                    // zmm(16×F32) → vcvtneps2bf16 → ymm(16×BF16) → store 32 bytes
+                                    let (s, _) = self.resolve_zmm_or_spill(*src, alloc, 0)?;
+                                    let tmp = self.scratch_ymm(0);
+                                    self.asm.vcvtneps2bf16(tmp, s).map_err(Self::err)?;
+                                    self.asm.vmovups(ymmword_ptr(rax), tmp).map_err(Self::err)?;
+                                }
+                                SimdWidth::Scalar => {
+                                    // ymm(1×F32) → vcvtneps2bf16 → xmm(4×BF16, only lane 0 valid) → vmovss 2 bytes
+                                    // Actually: vcvtneps2bf16 xmm, ymm is not valid. Use xmm src instead.
+                                    let (s, _) = self.resolve_ymm_or_spill(*src, alloc, 0)?;
+                                    let sx = Self::ymm_to_xmm(s);
+                                    let tmp_xmm = self.scratch_xmm(0);
+                                    self.asm.vcvtneps2bf16(tmp_xmm, sx).map_err(Self::err)?;
+                                    // Store 2 bytes (lower BF16 of xmm) via vmovd (4 bytes, overlap OK)
+                                    self.asm.vmovd(dword_ptr(rax), tmp_xmm).map_err(Self::err)?;
+                                }
+                                _ => {
+                                    // ymm(8×F32) → vcvtneps2bf16 → xmm(8×BF16) → store 16 bytes
+                                    let (s, _) = self.resolve_ymm_or_spill(*src, alloc, 0)?;
+                                    let tmp_xmm = self.scratch_xmm(0);
+                                    self.asm.vcvtneps2bf16(tmp_xmm, s).map_err(Self::err)?;
+                                    self.asm.vmovups(xmmword_ptr(rax), tmp_xmm).map_err(Self::err)?;
+                                }
                             }
-                            SimdWidth::Scalar => {
-                                // ymm(1×F32) → vcvtneps2bf16 → xmm(4×BF16, only lane 0 valid) → vmovss 2 bytes
-                                // Actually: vcvtneps2bf16 xmm, ymm is not valid. Use xmm src instead.
-                                let (s, _) = self.resolve_ymm_or_spill(*src, alloc, 0)?;
-                                let sx = Self::ymm_to_xmm(s);
-                                let tmp_xmm = self.scratch_xmm(0);
-                                self.asm.vcvtneps2bf16(tmp_xmm, sx).map_err(Self::err)?;
-                                // Store 2 bytes (lower BF16 of xmm) via vmovd (4 bytes, overlap OK)
-                                self.asm.vmovd(dword_ptr(rax), tmp_xmm).map_err(Self::err)?;
+                        } else {
+                            // AVX2 软件路径 (CR-TIER-SOVEREIGNTY): 无 vcvtneps2bf16 的硬件上，
+                            // 用 vpsrld+vpackusdw 向量化序列完成 F32→BF16 窄化 + 存储。
+                            // 仅 BF16 走此路径；F16 在 AVX2 上走 VecNarrow(F16C vcvtps2ph)。
+                            if dtype.kind != crate::compiler::trace::DTypeKind::BF16 {
+                                return Err(CompilerError::CodegenViolation(
+                                    "VecStore WidenCompute (non-BF16) on AVX2: F16 should use VecNarrow path".into(),
+                                ));
                             }
-                            _ => {
-                                // ymm(8×F32) → vcvtneps2bf16 → xmm(8×BF16) → store 16 bytes
-                                let (s, _) = self.resolve_ymm_or_spill(*src, alloc, 0)?;
-                                let tmp_xmm = self.scratch_xmm(0);
-                                self.asm.vcvtneps2bf16(tmp_xmm, s).map_err(Self::err)?;
-                                self.asm.vmovups(xmmword_ptr(rax), tmp_xmm).map_err(Self::err)?;
+                            match width {
+                                SimdWidth::Scalar => {
+                                    // 1×F32 (xmm lane 0) → BF16 → store 2 bytes
+                                    let (s, _) = self.resolve_ymm_or_spill(*src, alloc, 0)?;
+                                    let sx = Self::ymm_to_xmm(s);
+                                    // 窄化到 xmm(4×BF16)，lane 0 有效。
+                                    let dst_xmm = self.scratch_xmm(0);
+                                    self.emit_f32_to_bf16_xmm_avx2(dst_xmm, sx)?;
+                                    self.asm.vmovd(dword_ptr(rax), dst_xmm).map_err(Self::err)?;
+                                }
+                                _ => {
+                                    // ymm(8×F32) → emit_f32_to_bf16 → xmm(8×BF16) → store 16 bytes
+                                    let (s, _) = self.resolve_ymm_or_spill(*src, alloc, 0)?;
+                                    let tmp_xmm = self.scratch_xmm(0);
+                                    self.emit_f32_to_bf16_ymm_to_xmm_avx2(tmp_xmm, s)?;
+                                    self.asm.vmovups(xmmword_ptr(rax), tmp_xmm).map_err(Self::err)?;
+                                }
                             }
                         }
                     }
@@ -299,53 +325,72 @@ impl X86Lower {
                     }
                 } else if dst_dtype.needs_narrowing_from(*src_dtype) {
                     // REQ-DTYPE-006: 累加器窄化。窄化指令由 dst_dtype.elem_bytes() 属性选择。
-                    // F32→BF16: vcvtneps2bf16 (AVX-512 BF16)。F32→F16: vcvtps2ph (F16C)。
-                    if !self.use_avx512 {
-                        return Err(CompilerError::CodegenViolation(
-                            format!("VecNarrow: {src_dtype:?} → {dst_dtype:?} requires AVX-512"),
-                        ));
-                    }
-                    match width {
-                        SimdWidth::W512 => {
-                            // ZMM(16 F32) → YMM(16 × elem_bytes=2)
-                            let (s, _) = self.resolve_zmm_or_spill(*src, alloc, 0)?;
-                            let (d, dst_spilled) = self.resolve_zmm_or_spill_write(*dst, alloc, 1)?;
-                            let dst_ymm = Self::zmm_to_ymm(d);
-                            // Narrow instruction selected by dst_dtype properties (REQ-DTYPE-006).
-                            // 多精度混合:BF16/F16 各有专用指令。
-                            match dst_dtype.kind {
-                                crate::compiler::trace::DTypeKind::BF16 => {
-                                    self.asm.vcvtneps2bf16(dst_ymm, s).map_err(Self::err)?;
-                                }
-                                crate::compiler::trace::DTypeKind::F16 => {
-                                    // F16C: vcvtps2ph ymm_dst, zmm_src, imm8(round-to-nearest=0)
+                    // F32→BF16: vcvtneps2bf16 (AVX-512 BF16) 或 AVX2 软件序列。
+                    // F32→F16: vcvtps2ph (F16C AVX2, 所有 AVX2+ CPU 都支持)。
+                    // AVX2 软件路径与 AVX-512 原生路径平权，无"降级"语义 (CR-TIER-SOVEREIGNTY-002)。
+                    // @trace REQ-HW-TIER-004 [req:BF16-Narrow-HardwareAware] BF16 累加器窄化按硬件能力路由
+                    match dst_dtype.kind {
+                        crate::compiler::trace::DTypeKind::F16 => {
+                            // F16C vcvtps2ph 在所有 AVX2+ CPU 上可用，无需 AVX-512。
+                            match width {
+                                SimdWidth::W512 => {
+                                    let (s, _) = self.resolve_zmm_or_spill(*src, alloc, 0)?;
+                                    let (d, dst_spilled) = self.resolve_zmm_or_spill_write(*dst, alloc, 1)?;
+                                    let dst_ymm = Self::zmm_to_ymm(d);
                                     self.asm.vcvtps2ph(dst_ymm, s, 0i32).map_err(Self::err)?;
+                                    if dst_spilled { self.spill_store_zmm(*dst, alloc, 1)?; }
                                 }
-                                _ => return Err(CompilerError::CodegenViolation(
-                                    format!("VecNarrow: {src_dtype:?} → {dst_dtype:?} narrow instruction not yet implemented")
-                                )),
-                            }
-                            if dst_spilled { self.spill_store_zmm(*dst, alloc, 1)?; }
-                        }
-                        _ => {
-                            // YMM(8 F32) → XMM(8 × elem_bytes=2) — also works for Scalar
-                            let (s, _) = self.resolve_ymm_or_spill(*src, alloc, 0)?;
-                            let (d, dst_spilled) = self.resolve_ymm_or_spill_write(*dst, alloc, 1)?;
-                            let dst_xmm = Self::ymm_to_xmm(d);
-                            match dst_dtype.kind {
-                                crate::compiler::trace::DTypeKind::BF16 => {
-                                    self.asm.vcvtneps2bf16(dst_xmm, s).map_err(Self::err)?;
-                                }
-                                crate::compiler::trace::DTypeKind::F16 => {
-                                    // F16C: vcvtps2ph xmm_dst, ymm_src, imm8(round-to-nearest=0)
+                                _ => {
+                                    let (s, _) = self.resolve_ymm_or_spill(*src, alloc, 0)?;
+                                    let (d, dst_spilled) = self.resolve_ymm_or_spill_write(*dst, alloc, 1)?;
+                                    let dst_xmm = Self::ymm_to_xmm(d);
                                     self.asm.vcvtps2ph(dst_xmm, s, 0i32).map_err(Self::err)?;
+                                    if dst_spilled { self.spill_store_ymm(*dst, alloc, 1)?; }
                                 }
-                                _ => return Err(CompilerError::CodegenViolation(
-                                    format!("VecNarrow: {src_dtype:?} → {dst_dtype:?} narrow instruction not yet implemented")
-                                )),
                             }
-                            if dst_spilled { self.spill_store_ymm(*dst, alloc, 1)?; }
                         }
+                        crate::compiler::trace::DTypeKind::BF16 => {
+                            if self.use_avx512 {
+                                match width {
+                                    SimdWidth::W512 => {
+                                        let (s, _) = self.resolve_zmm_or_spill(*src, alloc, 0)?;
+                                        let (d, dst_spilled) = self.resolve_zmm_or_spill_write(*dst, alloc, 1)?;
+                                        let dst_ymm = Self::zmm_to_ymm(d);
+                                        self.asm.vcvtneps2bf16(dst_ymm, s).map_err(Self::err)?;
+                                        if dst_spilled { self.spill_store_zmm(*dst, alloc, 1)?; }
+                                    }
+                                    _ => {
+                                        let (s, _) = self.resolve_ymm_or_spill(*src, alloc, 0)?;
+                                        let (d, dst_spilled) = self.resolve_ymm_or_spill_write(*dst, alloc, 1)?;
+                                        let dst_xmm = Self::ymm_to_xmm(d);
+                                        self.asm.vcvtneps2bf16(dst_xmm, s).map_err(Self::err)?;
+                                        if dst_spilled { self.spill_store_ymm(*dst, alloc, 1)?; }
+                                    }
+                                }
+                            } else {
+                                // AVX2 软件路径: F32→BF16 向量化序列
+                                match width {
+                                    SimdWidth::Scalar => {
+                                        let (s, _) = self.resolve_ymm_or_spill(*src, alloc, 0)?;
+                                        let sx = Self::ymm_to_xmm(s);
+                                        let (d, dst_spilled) = self.resolve_ymm_or_spill_write(*dst, alloc, 1)?;
+                                        let dst_xmm = Self::ymm_to_xmm(d);
+                                        self.emit_f32_to_bf16_xmm_avx2(dst_xmm, sx)?;
+                                        if dst_spilled { self.spill_store_ymm(*dst, alloc, 1)?; }
+                                    }
+                                    _ => {
+                                        let (s, _) = self.resolve_ymm_or_spill(*src, alloc, 0)?;
+                                        let (d, dst_spilled) = self.resolve_ymm_or_spill_write(*dst, alloc, 1)?;
+                                        let dst_xmm = Self::ymm_to_xmm(d);
+                                        self.emit_f32_to_bf16_ymm_to_xmm_avx2(dst_xmm, s)?;
+                                        if dst_spilled { self.spill_store_ymm(*dst, alloc, 1)?; }
+                                    }
+                                }
+                            }
+                        }
+                        _ => return Err(CompilerError::CodegenViolation(
+                            format!("VecNarrow: {src_dtype:?} → {dst_dtype:?} narrow instruction not yet implemented")
+                        )),
                     }
                 } else {
                     return Err(CompilerError::CodegenViolation(

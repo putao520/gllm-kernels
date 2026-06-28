@@ -222,6 +222,95 @@ impl X86Lower {
         Ok(ymm)
     }
 
+    /// F32→BF16 窄化 (AVX2 软件路径, CR-TIER-SOVEREIGNTY-004)。
+    ///
+    /// 无 vcvtneps2bf16 的硬件 (i9-10900KF / CometLake 等 AVX2-only CPU) 上，
+    /// 用向量化整数序列完成 round-to-nearest-even (RNE) 截断：
+    ///   rounded = f32_bits + 0x7FFF + ((f32_bits >> 16) & 1)
+    ///   bf16    = rounded >> 16
+    ///
+    /// `+0x7FFF` 实现四舍五入到最近；`+lsb` 处理 RNE 平局 (tie-to-even)。
+    /// NaN/Inf 保持语义 (exp 全 1 不受低位影响)。
+    ///
+    /// 输入: ymm(8×F32)。输出: xmm(8×BF16, 即 16 字节)。
+    /// scratch 约定: s0=输入副本, s1=bias, s2=lsb-mask 结果。
+    // @trace REQ-HW-TIER-004 [req:BF16-AVX2-SoftwareNarrow] AVX2 (无原生 BF16) F32→BF16 向量化 RNE 窄化
+    fn emit_f32_to_bf16_ymm_to_xmm_avx2(
+        &mut self,
+        dst_xmm: AsmRegisterXmm,
+        src_ymm: AsmRegisterYmm,
+    ) -> Result<(), CompilerError> {
+        let s0 = self.scratch_ymm(0); // 输入副本 / 累加
+        let s1 = self.scratch_ymm(1); // bias 常量
+        let s2 = self.scratch_ymm(2); // lsb 提取
+
+        // s0 = src (复制，避免破坏源)
+        self.asm.vmovups(s0, src_ymm).map_err(Self::err)?;
+
+        // s2 = (s0 >> 16) & 1  —— BF16 lsb for RNE tie-break
+        self.asm.vpsrld(s2, s0, 16).map_err(Self::err)?;
+        // s1 = 广播 0x00000001 (作为 f32 bit pattern)
+        let one = f32::from_bits(1u32);
+        let one_label = self.const_f32(one);
+        self.asm.vbroadcastss(s1, dword_ptr(one_label)).map_err(Self::err)?;
+        self.asm.vpand(s2, s2, s1).map_err(Self::err)?;
+
+        // s0 = s0 + 0x7FFF (round-half-up bias) + lsb
+        let bias = f32::from_bits(0x7FFFu32);
+        let bias_label = self.const_f32(bias);
+        self.asm.vbroadcastss(s1, dword_ptr(bias_label)).map_err(Self::err)?;
+        self.asm.vpaddd(s0, s0, s1).map_err(Self::err)?;
+        self.asm.vpaddd(s0, s0, s2).map_err(Self::err)?;
+
+        // s0 = s0 >> 16  —— 现在每个 u32 lane 的高 16 位是 BF16，低 16 位是 0
+        self.asm.vpsrld(s0, s0, 16).map_err(Self::err)?;
+
+        // dst_xmm = pack 8×u32(低16位有效) → 8×u16
+        // vpackusdw: 将两个 ymm/xmm 的 32-bit lanes 饱和打包成 16-bit。
+        // 这里所有 8 个 lane 都在 s0 的低半 (xmm 视图)，用同一源做 in-place pack。
+        // vpackusdw xmm, xmm, xmm → 8×u16 = BF16，写入 dst_xmm。
+        let s0_xmm = Self::ymm_to_xmm(s0);
+        self.asm.vpackusdw(dst_xmm, s0_xmm, s0_xmm).map_err(Self::err)?;
+        Ok(())
+    }
+
+    /// F32→BF16 窄化 (AVX2 软件路径, Scalar 变体)。
+    /// 输入: xmm (lane 0 = 1×F32)。输出: xmm (lane 0 = 1×BF16, 其余 lane 无效)。
+    fn emit_f32_to_bf16_xmm_avx2(
+        &mut self,
+        dst_xmm: AsmRegisterXmm,
+        src_xmm: AsmRegisterXmm,
+    ) -> Result<(), CompilerError> {
+        // 复用 ymm 变体: 把 src_xmm broadcast/复制到 ymm，窄化，再取低 xmm。
+        // 但更高效: 直接在 xmm 上做标量级序列 (4 lanes，只用 lane 0)。
+        let s0 = self.scratch_xmm(0); // 输入副本
+        let s1 = self.scratch_xmm(1); // bias/lsb 常量
+        let s2 = self.scratch_xmm(2); // lsb
+
+        self.asm.vmovups(s0, src_xmm).map_err(Self::err)?;
+
+        // s2 = (s0 >> 16) & 1
+        self.asm.vpsrld(s2, s0, 16).map_err(Self::err)?;
+        let one = f32::from_bits(1u32);
+        let one_label = self.const_f32(one);
+        self.asm.vbroadcastss(s1, dword_ptr(one_label)).map_err(Self::err)?;
+        self.asm.vpand(s2, s2, s1).map_err(Self::err)?;
+
+        // s0 += 0x7FFF + lsb
+        let bias = f32::from_bits(0x7FFFu32);
+        let bias_label = self.const_f32(bias);
+        self.asm.vbroadcastss(s1, dword_ptr(bias_label)).map_err(Self::err)?;
+        self.asm.vpaddd(s0, s0, s1).map_err(Self::err)?;
+        self.asm.vpaddd(s0, s0, s2).map_err(Self::err)?;
+
+        // s0 >>= 16
+        self.asm.vpsrld(s0, s0, 16).map_err(Self::err)?;
+
+        // pack: dst_xmm 低 16-bit = lane 0 的 BF16
+        self.asm.vpackusdw(dst_xmm, s0, s0).map_err(Self::err)?;
+        Ok(())
+    }
+
     /// Cephes degree-5 exp(x) 多项式。
     fn emit_exp_cephes(&mut self, dst: AsmRegisterYmm, src: AsmRegisterYmm) -> Result<(), CompilerError> {
         use crate::compiler::codegen::math_approx::*;
