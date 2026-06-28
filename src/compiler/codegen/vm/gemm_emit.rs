@@ -147,8 +147,12 @@ pub(crate) fn emit_gemm_inline_with_hook<'a>(
     // dtype × ISA 在 selector 折叠完毕, emit 体内零 dtype/ISA 分支 (CR-001 后置)。
     let feats = ctx.session.feature_set;
     let (mr, nr) = hook.gemm_microkernel_shape();
+    // @trace ARCH-SYMDIM-THREADING: m_bound 从 seq_bound_override 或 sym_map 派生,
+    // 禁止退化为 max_value (SIGSEGV 根因修复)
+    let m_bound = seq_bound_override.cloned().unwrap_or_else(|| sym_map.to_bound(m_dim));
     let layout = super::op_impl::GemmOpLayout {
         m, n, k,
+        m_bound,
         dtype: ctx.dtype,
         trans_b,
         mr, nr,
@@ -1017,11 +1021,19 @@ pub(crate) fn emit_gemm_trans_b_inline(
         });
     };
 
-    let m_bound = if m_dim.is_symbolic() {
-        seq_bound_override.cloned().unwrap_or_else(|| sym_map.to_bound(m_dim))
-    } else {
-        BoundExpr::Const(m)
-    };
+    // @trace BCE-20260629-001: seq_bound_override 无条件优先 (override 优先),
+    // 与 emit_gemm_inline_with_epilogue 对齐。即便 m_dim 是 Concrete (被 OpImpl 层
+    // 拍平成 lo.m = max_value), 只要 caller 传了 override (解码 M=1 / prefill M=seq_len),
+    // 必须用 override 作 m_bound, 禁止用 max_value 退化为大循环 (SIGSEGV 根因 —
+    // lm_head M=8192 编译期展开, 运行时不停止在 prompt_len, 输出 store 越界 ~768MB)。
+    // BCE-20260628-001 已修 naive 非 trans_b 路径, 此处补齐 trans_b 路径同类残留。
+    let m_bound = seq_bound_override.cloned().unwrap_or_else(|| {
+        if m_dim.is_symbolic() {
+            sym_map.to_bound(m_dim)
+        } else {
+            BoundExpr::Const(m)
+        }
+    });
     prog.emit_loop(m_bound, 1, |prog, _m_ctr, m_off| {
         emit_j_loop(prog, OffsetExpr::LoopOffset(m_off));
     });
@@ -1096,11 +1108,19 @@ pub(crate) fn emit_gemm_inline_with_epilogue(
 
     // Unified M-loop body shared by both Symbolic and Concrete M dimensions.
     // Only the outer loop bound differs; inner j/k loops + tail handling identical.
-    let m_bound = if m_dim.is_symbolic() {
-        seq_bound_override.cloned().unwrap_or_else(|| sym_map.to_bound(m_dim))
-    } else {
-        BoundExpr::Const(m)
-    };
+    // @trace BCE-20260629-001: seq_bound_override 无条件优先 (override 优先),
+    // 与 emit_gemm_inline_with_epilogue 对齐。即便 m_dim 是 Concrete (被 OpImpl 层
+    // 拍平成 lo.m = max_value), 只要 caller 传了 override (解码 M=1 / prefill M=seq_len),
+    // 必须用 override 作 m_bound, 禁止用 max_value 退化为大循环 (SIGSEGV 根因 —
+    // lm_head M=8192 编译期展开, 运行时不停止在 prompt_len, 输出 store 越界 ~768MB)。
+    // BCE-20260628-001 已修 naive 非 trans_b 路径, 此处补齐 naive(旧) 路径同类残留。
+    let m_bound = seq_bound_override.cloned().unwrap_or_else(|| {
+        if m_dim.is_symbolic() {
+            sym_map.to_bound(m_dim)
+        } else {
+            BoundExpr::Const(m)
+        }
+    });
     prog.emit_loop(m_bound, 1, |prog, _m_ctr, m_off| {
         if n_vecs > 0 {
             prog.emit_loop(BoundExpr::Const(n_vecs), j_step, |prog, _j_ctr, j_off| {
@@ -2339,6 +2359,37 @@ mod template_tests {
     // pipelined multi-K-tile, AfterStore epilogue, TMA async load path,
     // GPU tiled BF16 partial tiles narrowing
     // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+    #[test]
+    fn diag_trans_b_bf16_loop_structure() {
+        let mut prog = VmProgram::new();
+        let width = SimdWidth::W256;
+        let a = prog.alloc_vreg(VRegKind::Ptr, width);
+        let b = prog.alloc_vreg(VRegKind::Ptr, width);
+        let c = prog.alloc_vreg(VRegKind::Ptr, width);
+        let sym_map = SymDimSlotMap::mega_kernel_abi();
+        // Use Symbolic M (max=8192, as in real SmolLM2 lm_head) WITHOUT override
+        // to reproduce the SIGSEGV: m_bound should NOT degrade to max_value.
+        let m_dim = SymDim::Symbolic { name: "seq_len".into(), max_value: Some(8192) };
+        let result = emit_gemm_trans_b_inline(
+            &mut prog, &m_dim, 49152, 576, width, a, b, c, &[], &sym_map, None, QuantPrecision::BF16,
+        );
+        assert!(result.is_ok(), "{:?}", result.err());
+        for (i, instr) in prog.instrs.iter().enumerate() {
+            match instr {
+                VmInstr::LoopBegin { counter, byte_offset, bound, step_bytes } => {
+                    eprintln!("[{}] LoopBegin counter=v{} byte_offset=v{} bound={:?} step={}",
+                        i, counter.0, byte_offset.0, bound, step_bytes);
+                }
+                VmInstr::LoopEnd => { eprintln!("[{}] LoopEnd", i); }
+                VmInstr::VecStore { base, offset, src, width, dtype, .. } => {
+                    eprintln!("[{}] VecStore base=v{} offset={:?} src=v{} width={:?} dtype={:?}",
+                        i, base.0, offset, src.0, width, dtype);
+                }
+                _ => {}
+            }
+        }
+    }
 
     #[test]
     fn test_emit_gemm_trans_b_inline_k_tail_emits_hreduce() {

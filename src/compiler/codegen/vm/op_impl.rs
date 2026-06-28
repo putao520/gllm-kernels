@@ -131,6 +131,11 @@ pub struct GemmOpLayout {
     pub m: usize,
     pub n: usize,
     pub k: usize,
+    /// M 维循环边界表达式 (符号维必须用运行时 bound, 禁止退化为 max_value=8192)。
+    /// @trace ARCH-SYMDIM-THREADING: symbolic M 的运行时边界穿透 (BCE-20260629-001 SIGSEGV 根治)。
+    /// OpImpl emit 必须把 lo.m_bound 作 seq_bound_override 传给 emit_gemm_*,
+    /// 不得传 None 让 m_dim 退化为 Concrete(lo.m) 大循环 (SIGSEGV)。
+    pub m_bound: super::instr::BoundExpr,
     /// emit 不据此分支; 仅作 store/narrow 与 OpImpl 自身 tile dtype 推断用。
     pub dtype: QuantPrecision,
     pub trans_b: bool,

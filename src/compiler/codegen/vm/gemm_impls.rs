@@ -23,12 +23,13 @@ impl OpImpl<GemmOpLayout> for GemmScalar {
 
     fn emit(&self, ctx: &mut EmitCtx<'_, '_>, lo: &GemmOpLayout) -> Result<(), CompilerError> {
         // Naive scalar GEMM: emit_gemm_inline_with_epilogue with mr=1, nr=1
+        // BCE-20260629-001: 用 lo.m_bound 作 seq_bound_override (禁止 Concrete(lo.m) 退化为大循环)
         let sym_map = SymDimSlotMap::mega_kernel_abi();
         let m_dim = crate::compiler::graph::SymDim::Concrete(lo.m);
         emit_gemm_inline_with_epilogue(
             ctx.prog, &m_dim, lo.n, lo.k, ctx.width,
             lo.a_ptr, lo.b_ptr, lo.c_ptr,
-            &[], &sym_map, false, None, lo.dtype, lo.trans_b,
+            &[], &sym_map, false, Some(&lo.m_bound), lo.dtype, lo.trans_b,
             lo.epilogue,
         )
     }
@@ -63,12 +64,13 @@ impl OpImpl<GemmOpLayout> for GemmFmaBlis {
                 lo.dtype, lo.trans_b,
             )
         } else {
+            // BCE-20260629-001: 用 lo.m_bound 作 seq_bound_override (禁止 Concrete(lo.m) 退化为大循环)
             let sym_map = SymDimSlotMap::mega_kernel_abi();
             let m_dim = crate::compiler::graph::SymDim::Concrete(lo.m);
             emit_gemm_inline_with_epilogue(
                 ctx.prog, &m_dim, lo.n, lo.k, ctx.width,
                 lo.a_ptr, lo.b_ptr, lo.c_ptr,
-                &[], &sym_map, false, None, lo.dtype, lo.trans_b,
+                &[], &sym_map, false, Some(&lo.m_bound), lo.dtype, lo.trans_b,
                 lo.epilogue,
             )
         }
@@ -378,6 +380,7 @@ mod tests {
         };
         let lo = GemmOpLayout {
             m, n, k,
+            m_bound: BoundExpr::Const(m),
             dtype,
             trans_b: false,
             mr: 4, nr: 2,
@@ -531,7 +534,9 @@ mod tests {
             pack_map: None, k_unroll: 1, debug_jit: false,
         };
         let lo = GemmOpLayout {
-            m: 8, n: 8, k: 4, dtype: QuantPrecision::F32,
+            m: 8, n: 8, k: 4,
+            m_bound: BoundExpr::Const(8),
+            dtype: QuantPrecision::F32,
             trans_b: false, mr: 4, nr: 2,
             a_ptr, b_ptr, c_ptr,
             epilogue: super::super::isa_hook::EpiloguePlace::OnAccumulators,
@@ -813,7 +818,7 @@ mod tests {
             prog: &mut prog, width, pack_map: None, k_unroll: 1, debug_jit: false,
         };
         let lo = GemmOpLayout {
-            m, n, k, dtype, trans_b: false, mr: 4, nr: 2,
+            m, n, k, m_bound: BoundExpr::Const(m), dtype, trans_b: false, mr: 4, nr: 2,
             a_ptr, b_ptr, c_ptr,
             epilogue: super::super::isa_hook::EpiloguePlace::OnAccumulators,
             tile: None,
