@@ -34,6 +34,11 @@ pub enum OpSemantics {
     /// Opaque / metadata-only (Transpose, Reshape).
     /// Cannot be fused with neighbors in general.
     Opaque,
+    /// Pure side-effect ops (StoreToken, CheckStopCondition, business-config hooks).
+    /// Produce no output tensors — only mutate external state (token slot, eos
+    /// flag, shared memory). Exempt from IR "op_has_output" invariant and from
+    /// fusion (no data output to absorb into an epilogue).
+    SideEffect,
 }
 
 /// Performance bottleneck classification.
@@ -135,9 +140,10 @@ pub fn classify(op: &Op) -> OpSemantics {
 
         // Mega-kernel generate loop ops (GRAPH-SHAPE-DRIVEN-MEGA-KERNEL §2.2)
         Op::Argmax { .. } => OpSemantics::Reduction,
-        Op::StoreToken | Op::CheckStopCondition => OpSemantics::Opaque,
+        Op::StoreToken | Op::CheckStopCondition => OpSemantics::SideEffect,
 
-        // Business config ops (§1.5 conditional graph construction): side-effect / control, Opaque
+        // Business config ops (§1.5 conditional graph construction): pure side-effect / control,
+        // no output tensors. SideEffect: exempt from IR "op_has_output" + fusion.
         Op::WriteLogits { .. }
         | Op::EarlyExit { .. }
         | Op::GuardrailCheck { .. }
@@ -146,7 +152,7 @@ pub fn classify(op: &Op) -> OpSemantics {
         | Op::CotStepCheck { .. }
         | Op::SessionKvRestore
         | Op::MmHiddenInject { .. }
-        | Op::MtpDraft { .. } => OpSemantics::Opaque,
+        | Op::MtpDraft { .. } => OpSemantics::SideEffect,
 
         // MLA (Multi-head Latent Attention) — DeepSeek V3/R1, Kimi-K2
         Op::MlaKvCompress { .. } | Op::MlaQAbsorb { .. } | Op::MlaVRestore { .. } => {

@@ -10,6 +10,7 @@ use std::fmt;
 
 use crate::types::CompilerError;
 use crate::compiler::graph::{CompilerGraph, OpId, TensorId};
+use crate::compiler::semantics;
 use crate::dispatch::device_profile::DeviceProfile;
 
 // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -413,14 +414,27 @@ impl std::error::Error for CodegenError {}
 pub fn pre_check(graph: &CompilerGraph) -> Vec<IrError> {
     let mut errors = Vec::new();
 
-    // Check 1: Every op must have at least one output tensor.
+    // Check 1: Invariant `op_has_output` is bidirectional on side-effect semantics:
+    //   - non-side-effect op MUST have >= 1 output tensor (data producer)
+    //   - side-effect op (StoreToken / CheckStopCondition / business hooks) MUST have 0
+    //     outputs (pure external-state mutation, no data output to consume)
+    // Side-effect ops have no data output and are exempt from the producer invariant.
     for op in &graph.ops {
-        if op.outputs.is_empty() {
+        let is_side_effect = semantics::classify(&op.op) == semantics::OpSemantics::SideEffect;
+        if !is_side_effect && op.outputs.is_empty() {
             errors.push(IrError::new(
                 "op_has_output",
                 IrPosition::Op { op_id: op.id, op_label: op.label.clone() },
                 ">= 1 output tensor",
                 "0 output tensors",
+            ));
+        }
+        if is_side_effect && !op.outputs.is_empty() {
+            errors.push(IrError::new(
+                "side_effect_op_has_no_output",
+                IrPosition::Op { op_id: op.id, op_label: op.label.clone() },
+                "0 output tensors (pure side-effect)",
+                format!("{} output tensor(s)", op.outputs.len()),
             ));
         }
     }
