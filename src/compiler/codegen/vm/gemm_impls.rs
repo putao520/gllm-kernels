@@ -356,7 +356,7 @@ pub fn derive_feature_set(features: &[super::isa_profile::IsaFeature]) -> Featur
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::compiler::codegen::vm::instr::{SimdWidth, VRegKind, VmInstr, VmProgram};
+    use crate::compiler::codegen::vm::instr::{BoundExpr, SimdWidth, VRegKind, VmInstr, VmProgram};
 
     /// 验证 OpImpl emits 了非空指令序列并返回该 VmProgram (供进一步结构断言)。
     fn verify_produces_instrs(

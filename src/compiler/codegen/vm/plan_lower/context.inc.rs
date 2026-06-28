@@ -110,11 +110,16 @@ pub(crate) fn resolve_sym_dim(dim: &SymDim, abi: &AbiPtrs, sym_map: &SymDimSlotM
     sym_map.to_bound(dim)
 }
 
-/// 从图的第一个 tensor 推断计算 dtype。
-/// 合法的默认回退: 无 tensor 时使用 F32 (SPEC §0.8 REQ-DTYPE-001)。
+/// 从图推断激活计算 dtype（REQ-DTYPE-010, CR-DTYPE-SOVEREIGNTY-001）。
+///
+/// BCE-20260629-003: 禁止取 tensors.first() — token_ids/position_ids 等索引类
+/// tensor 是 I32，若恰为图首 tensor 会污染全图 ctx.dtype。改为跳过整数 dtype（I32/INT*），
+/// 取第一个浮点激活 tensor 的 dtype。无浮点 tensor 时回退 F32。
 pub(super) fn graph_dtype(graph: &CompilerGraph) -> QuantPrecision {
-    let result = graph.tensors.first()
+    use crate::compiler::trace::DTypeKind;
+    let result = graph.tensors.iter()
         .map(|t| t.dtype.to_quant_precision())
+        .find(|qp| matches!(qp.kind, DTypeKind::F32 | DTypeKind::BF16 | DTypeKind::F16 | DTypeKind::TF32))
         .unwrap_or(QuantPrecision::F32);
     result
 }

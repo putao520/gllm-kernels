@@ -422,13 +422,21 @@ impl X86Lower {
                     }
                 } else if dst_dtype.elem_bytes() > src_dtype.elem_bytes() {
                     // Widen: narrow → wide
-                    // BF16→F32: vcvtph2ps (F16C). xmm(8×BF16) → ymm(8×F32), ymm(16×BF16) → zmm(16×F32).
+                    // BF16→F32: 位拼接（zero-extend u16→u32 + 左移16位）。
+                    // BF16 是 F32 的高16位截断，widen = 把 BF16 放到 F32 高16位，低16位补0。
+                    // 禁止用 vcvtph2ps（那是 F16→F32，BF16/F16 格式不同 → NaN）。
+                    // (BCE-20260629-003 / CR-DTYPE-SOVEREIGNTY-001)
                     match width {
                         SimdWidth::W512 => {
                             let (s, _) = self.resolve_zmm_or_spill(*src, alloc, 0)?;
                             let (d, dst_spilled) = self.resolve_zmm_or_spill_write(*dst, alloc, 1)?;
                             if src_dtype.kind == crate::compiler::trace::DTypeKind::BF16 {
-                                // ymm(16×BF16) → vcvtph2ps → zmm(16×F32)
+                                // ymm(16×BF16) → vpmovzxwd → zmm(16×u32) → vpslld 16 → zmm(16×F32)
+                                let src_ymm = Self::zmm_to_ymm(s);
+                                self.asm.vpmovzxwd(d, src_ymm).map_err(Self::err)?;
+                                self.asm.vpslld(d, d, 16).map_err(Self::err)?;
+                            } else if src_dtype.kind == crate::compiler::trace::DTypeKind::F16 {
+                                // F16→F32: vcvtph2ps (F16C) 正确（F16 格式）
                                 let src_ymm = Self::zmm_to_ymm(s);
                                 self.asm.vcvtph2ps(d, src_ymm).map_err(Self::err)?;
                             } else {
@@ -442,7 +450,12 @@ impl X86Lower {
                             let (s, _) = self.resolve_ymm_or_spill(*src, alloc, 0)?;
                             let (d, dst_spilled) = self.resolve_ymm_or_spill_write(*dst, alloc, 1)?;
                             if src_dtype.kind == crate::compiler::trace::DTypeKind::BF16 {
-                                // xmm(8×BF16) → vcvtph2ps → ymm(8×F32)
+                                // xmm(8×BF16) → vpmovzxwd → ymm(8×u32) → vpslld 16 → ymm(8×F32)
+                                let src_xmm = Self::ymm_to_xmm(s);
+                                self.asm.vpmovzxwd(d, src_xmm).map_err(Self::err)?;
+                                self.asm.vpslld(d, d, 16).map_err(Self::err)?;
+                            } else if src_dtype.kind == crate::compiler::trace::DTypeKind::F16 {
+                                // F16→F32: vcvtph2ps (F16C) 正确（F16 格式）
                                 let src_xmm = Self::ymm_to_xmm(s);
                                 self.asm.vcvtph2ps(d, src_xmm).map_err(Self::err)?;
                             } else {
