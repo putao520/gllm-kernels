@@ -256,30 +256,91 @@ pub fn select_gemm_impl(
 }
 
 /// 从 IsaProfile.features 派生 FeatureSet。
+///
+/// ## 映射完整性 (REQ-HW-TIER-001, 矩阵细化验证)
+///
+/// `FeatureSet` 是**纯布尔能力位**, 只承载 GEMM-FMA OpImpl `requires()` 谓词需要的位
+/// (CR-002: requires 是 FeatureSet 谓词子集匹配)。带参数据 (TileGemm{m,n,k} 尺寸 /
+/// ScalableVector{vl}) 不进 bitflags——它们是 GemmOpLayout.tile 的输入数据。
+///
+/// 本函数对 `IsaFeature` 全变体做穷举 match (无 `_ => {}` 通配):
+/// - 18 个**有消费方**的变体映射到 FeatureSet 位 (下方 ① ~ ⑱)。
+/// - 其余变体**无 FeatureSet 位**——显式标注「为何不需要位」(每一类都注明: 没有任何
+///   GEMM OpImpl 的 requires() 用到它, 或属于参数化数据/拓扑信息/调度提示而非计算能力位)。
+///   这符合任务铁律: "如果某能力不需要 OpImpl 选择 → 加注释说明, 不强行发明映射"。
+///   强行给无消费方的特性发明位 = 违反 CR-002 (requires 必须有消费方) 且违反 ARCH-ROOT-CAUSE
+///   (不发明无用途的抽象)。
 pub fn derive_feature_set(features: &[super::isa_profile::IsaFeature]) -> FeatureSet {
+    use super::isa_profile::IsaFeature;
     let mut fs = FeatureSet::EMPTY;
     for feat in features {
-        use super::isa_profile::IsaFeature;
         match feat {
-            IsaFeature::Fma => fs = fs.union(FeatureSet::FMA),
-            IsaFeature::NativeBf16 => fs = fs.union(FeatureSet::NATIVE_BF16),
-            IsaFeature::NativeFp16 => fs = fs.union(FeatureSet::NATIVE_FP16),
-            IsaFeature::NativeFp8 => fs = fs.union(FeatureSet::NATIVE_FP8),
-            IsaFeature::TileGemm { .. } => fs = fs.union(FeatureSet::TILE_GEMM),
-            IsaFeature::AmxFp16 => fs = fs.union(FeatureSet::AMX_FP16),
-            IsaFeature::AmxFp8 => fs = fs.union(FeatureSet::AMX_FP8),
-            IsaFeature::Wgmma => fs = fs.union(FeatureSet::WGMMA),
-            IsaFeature::Tma => fs = fs.union(FeatureSet::TMA),
-            IsaFeature::Tmem => fs = fs.union(FeatureSet::TMEM),
-            IsaFeature::BlockScaled => fs = fs.union(FeatureSet::BLOCK_SCALED),
-            IsaFeature::TwoCta => fs = fs.union(FeatureSet::TWO_CTA),
-            IsaFeature::Mfma => fs = fs.union(FeatureSet::MFMA),
-            IsaFeature::MfmaV2 => fs = fs.union(FeatureSet::MFMA_V2),
-            IsaFeature::Fp8Mfma => fs = fs.union(FeatureSet::FP8_MFMA),
-            IsaFeature::Sve2 => fs = fs.union(FeatureSet::SVE2),
-            IsaFeature::SmeTileOp => fs = fs.union(FeatureSet::SME_TILE),
+            // ── ① ~ ⑱ 有消费方: 每个 OpImpl 的 requires() 声明需要的精确能力位 ──
+            IsaFeature::Fma => fs = fs.union(FeatureSet::FMA),                       // GemmFmaBlis
+            IsaFeature::NativeBf16 => fs = fs.union(FeatureSet::NATIVE_BF16),        // dtype 维 (supports_dtype)
+            IsaFeature::NativeFp16 => fs = fs.union(FeatureSet::NATIVE_FP16),        // dtype 维
+            IsaFeature::NativeFp8 => fs = fs.union(FeatureSet::NATIVE_FP8),          // dtype 维
+            IsaFeature::TileGemm { .. } => fs = fs.union(FeatureSet::TILE_GEMM),     // GemmAmxBf16Tile/GemmTcSm70/GemmTcSm80
+            IsaFeature::AmxFp16 => fs = fs.union(FeatureSet::AMX_FP16),              // GemmAmxFp16Tile
+            IsaFeature::AmxFp8 => fs = fs.union(FeatureSet::AMX_FP8),                // GemmAmxFp8Tile
+            IsaFeature::Wgmma => fs = fs.union(FeatureSet::WGMMA),                   // GemmWgmma
+            IsaFeature::Tma => fs = fs.union(FeatureSet::TMA),                       // GemmWgmma
+            IsaFeature::Tmem => fs = fs.union(FeatureSet::TMEM),                     // GemmTcgen05
+            IsaFeature::BlockScaled => fs = fs.union(FeatureSet::BLOCK_SCALED),      // GemmTcgen05
+            IsaFeature::TwoCta => fs = fs.union(FeatureSet::TWO_CTA),                // (预留: 2-CTA GEMM OpImpl)
+            IsaFeature::Mfma => fs = fs.union(FeatureSet::MFMA),                     // GemmMfmaV1
+            IsaFeature::MfmaV2 => fs = fs.union(FeatureSet::MFMA_V2),                // GemmMfmaV2
+            IsaFeature::Fp8Mfma => fs = fs.union(FeatureSet::FP8_MFMA),              // (预留: FP8 MFMA OpImpl)
+            IsaFeature::Sve2 => fs = fs.union(FeatureSet::SVE2),                     // (预留: SVE2 GEMM OpImpl)
+            IsaFeature::SmeTileOp => fs = fs.union(FeatureSet::SME_TILE),            // GemmSmeTile
             IsaFeature::HardwareTranscendental => fs = fs.union(FeatureSet::HW_TRANSCEND),
-            _ => {}
+
+            // ── 无消费方: 显式标注为何不映射到 FeatureSet 位 (审计完整性) ──
+            //
+            // 量化精度变体 (NativeFp4/NativeFp6): 当前无 FP4/FP6 GEMM OpImpl;
+            //   若未来新增 FP4/FP6 tile OpImpl, 此处补 NATIVE_FP4/NATIVE_FP6 位。
+            IsaFeature::NativeFp4 | IsaFeature::NativeFp6 => {}
+            // 异步/调度/拓扑类: 不是计算能力, 不参与 GEMM requires 谓词。
+            //   AsyncCopy/WarpShuffle 用于访存与 warp 内通信; PredicatedExec/ScalableVector
+            //   是执行模型信息 (掩码/可变 VL); WarpSpecialization/CudaBarrier/L2Multicast/
+            //   ThreadBlockCluster 是 SM90+/SM100+ 调度原语; XcdTopology 是 NUMA 拓扑。
+            IsaFeature::AsyncCopy
+            | IsaFeature::PredicatedExec
+            | IsaFeature::ScalableVector { .. }
+            | IsaFeature::WarpShuffle
+            | IsaFeature::WarpSpecialization
+            | IsaFeature::CudaBarrier
+            | IsaFeature::L2Multicast
+            | IsaFeature::ThreadBlockCluster
+            | IsaFeature::XcdTopology => {}
+            // x86 INT8/AMX 辅助指令 (Vnni/AmxTranspose/AmxComplex/Movrs/Avx10_2/Apx31Gpr/
+            //   SparseMaskIntersect): 当前 13 GEMM-FMA OpImpl 无 INT8 tile 后端, 这些指令
+            //   不影响 GEMM requires 谓词。APX(31 GPR)/Avx10.2 影响寄存器池/SIMD 宽度,
+            //   已在 IsaProfile.from_device_profile 的 gpr_regs/vec_regs 分配中消费, 不进能力位。
+            //   SparseMaskIntersect 已是语义化名 (IsaFeature 层不泄漏 x86 指令身份, 见
+            //   isa_profile.rs:230 @trace REQ-HW-TIER-005); VmInstr 层的语义化重命名属 Task #6
+            //   (vminstr.inc.rs), 本域禁碰。它不映射 FeatureSet 位 (无 GEMM OpImpl 消费)。
+            IsaFeature::Vnni
+            | IsaFeature::AmxTranspose
+            | IsaFeature::AmxComplex
+            | IsaFeature::Movrs
+            | IsaFeature::Avx10_2
+            | IsaFeature::Apx31Gpr
+            | IsaFeature::SparseMaskIntersect => {}
+            // AMD FP4 MFMA: gfx950 专有, 当前无 FP4 GEMM OpImpl 消费。
+            IsaFeature::Fp4Mfma => {}
+            // ARM SME 子能力 (Sme2MultiVec/SmeF16F16/SmeI16I64): GemmSmeTile 仅要求 SME_TILE
+            //   (SmeTileOp); 这些 SME2 细分精度不影响当前 GEMM requires 谓词。
+            IsaFeature::Sme2MultiVec
+            | IsaFeature::SmeF16F16
+            | IsaFeature::SmeI16I64 => {}
+            // ARM 计算能力别名 (ArmBf16/ArmDotProd/ArmI8mm): ArmBf16 已与 NativeBf16 同推
+            //   (aarch64() 构造器: has_bf16 → ArmBf16 + NativeBf16), NativeBf16 是统一计算能力位;
+            //   ArmDotProd/ArmI8mm 是 INT8 路径, 无 INT8 GEMM OpImpl 消费。
+            IsaFeature::ArmBf16 | IsaFeature::ArmDotProd | IsaFeature::ArmI8mm => {}
+            // Apple Metal simdgroup_matrix: 当前 GEMM OpImpl 表无 Metal 后端 (CPU/GPU JIT 走
+            //   NVIDIA/AMD 路径); Metal GEMM OpImpl 未来新增时补 SiMDGroupMatrix 位。
+            IsaFeature::SiMDGroupMatrix => {}
         }
     }
     fs
@@ -505,5 +566,221 @@ mod tests {
         assert!(fs.contains(FeatureSet::TILE_GEMM));
         assert!(fs.contains(FeatureSet::EMPTY));
         assert!(!fs.contains(FeatureSet::WGMMA));
+    }
+
+    // ── Task #4: 全链路路由回归测试 (profile → feature_set() → select_gemm_impl) ──
+    // 每个 GPU/tile 后端验证: 真实 IsaProfile 构造 → feature_set 派生 → selector 路由到正确 OpImpl。
+    // 覆盖 13 后端中有 requires() 门控的代表 (SM70/80/90/100, gfx908/950, AMX-BF16, SME)。
+
+    #[test]
+    fn route_sm90_hopper_selects_wgmma() {
+        // SM90 = WGMMA + TMA + NativeBf16 → GemmWgmma (requires=WGMMA|TMA, tput=85)
+        let profile = super::super::isa_profile::IsaProfile::cuda(90);
+        let feats = profile.feature_set();
+        assert!(feats.contains(FeatureSet::WGMMA));
+        assert!(feats.contains(FeatureSet::TMA));
+        assert!(feats.contains(FeatureSet::NATIVE_BF16));
+        let im = select_gemm_impl(feats, QuantPrecision::BF16, (64, 32, 64));
+        assert_eq!(im.name(), "GemmWgmma",
+            "SM90 + BF16 should route to GemmWgmma (got {})", im.name());
+    }
+
+    #[test]
+    fn route_sm100_blackwell_selects_tc_gen05() {
+        // SM100 = TMEM + BLOCK_SCALED + 继承 SM90 → GemmTcgen05 (tput=95) 胜 GemmWgmma (tput=85)
+        let profile = super::super::isa_profile::IsaProfile::cuda(100);
+        let feats = profile.feature_set();
+        assert!(feats.contains(FeatureSet::TMEM));
+        assert!(feats.contains(FeatureSet::BLOCK_SCALED));
+        let im = select_gemm_impl(feats, QuantPrecision::F16, (64, 64, 64));
+        assert_eq!(im.name(), "GemmTcgen05",
+            "SM100 + F16 should route to GemmTcgen05 (got {})", im.name());
+    }
+
+    #[test]
+    fn route_sm80_ampere_selects_higher_tput_tile_impl() {
+        // SM80 = TILE_GEMM + NativeBf16, 无 WGMMA/TMA/TMEM。
+        // BF16 + TILE_GEMM 候选: GemmTcSm80 (tput=70) 与 GemmAmxBf16Tile (tput=60) requires 都满足,
+        // max_by_key 选高 tput → GemmTcSm80 (验证 CR-001 验收点 1: 同 requires 高 tput 胜)。
+        let profile = super::super::isa_profile::IsaProfile::cuda(80);
+        let feats = profile.feature_set();
+        assert!(feats.contains(FeatureSet::TILE_GEMM));
+        assert!(feats.contains(FeatureSet::NATIVE_BF16));
+        assert!(!feats.contains(FeatureSet::WGMMA));
+        let im = select_gemm_impl(feats, QuantPrecision::BF16, (16, 8, 16));
+        assert_eq!(im.name(), "GemmTcSm80",
+            "SM80 + BF16 should route to GemmTcSm80 (got {})", im.name());
+    }
+
+    #[test]
+    fn route_sm70_volta_tc_tile_is_selectable_for_fp16() {
+        // SM70 = TILE_GEMM (wmma), 无 BF16, 无 FP8。
+        // 注意 (设计发现, REQ-HW-TIER-001 验证): GemmTcSm70 与 GemmTcSm80 都只 requires=TILE_GEMM
+        //   且都 supports F16 → TILE_GEMM 在 SM70/SM80 间是**重载位** (同一能力位, 两代 TC)。
+        //   selector 按 throughput_class 仲裁 (GemmTcSm80 tput=70 > GemmTcSm70 tput=65)。
+        //   真实 SM70 硬件无 mma.sync (SM80 才有), 但 FeatureSet 无 SM 版本细分位 —
+        //   这是已知的 requires 粒度限制, 不在本 Task 范围内强行发明 SM-version 位 (遵循
+        //   "无消费方不发明位" 铁律; 真正的 SM 版本区分由 DeviceProfile.sm_version 在更上层处理)。
+        // 本测试验证: SM70 + F16 选到 TILE_GEMM 类 TC 后端 (而非 scalar/FMA), 且 tput >= 65。
+        let profile = super::super::isa_profile::IsaProfile::cuda(70);
+        let feats = profile.feature_set();
+        assert!(feats.contains(FeatureSet::TILE_GEMM));
+        assert!(!feats.contains(FeatureSet::NATIVE_BF16));
+        let im = select_gemm_impl(feats, QuantPrecision::F16, (16, 16, 16));
+        assert!(im.throughput_class() >= 65,
+            "SM70 + F16 should select a TILE_GEMM TC impl (tput>=65), got {} (tput={})",
+            im.name(), im.throughput_class());
+        // 它必须是 TILE_GEMM 类 TC 后端 (GemmTcSm70 或 GemmTcSm80), 不能是 scalar/FMA
+        let name = im.name();
+        assert!(name == "GemmTcSm70" || name == "GemmTcSm80",
+            "SM70 + F16 should route to a TC tile impl, got {}", name);
+    }
+
+    #[test]
+    fn route_gfx950_cdna4_selects_mfma_v2() {
+        // gfx950 = MFMA + MFMA_V2 + NativeBf16 → GemmMfmaV2 (tput=85) 胜 GemmMfmaV1 (tput=75)
+        let profile = super::super::isa_profile::IsaProfile::hip(950);
+        let feats = profile.feature_set();
+        assert!(feats.contains(FeatureSet::MFMA));
+        assert!(feats.contains(FeatureSet::MFMA_V2));
+        let im = select_gemm_impl(feats, QuantPrecision::BF16, (32, 32, 16));
+        assert_eq!(im.name(), "GemmMfmaV2",
+            "gfx950 + BF16 should route to GemmMfmaV2 (got {})", im.name());
+    }
+
+    #[test]
+    fn route_gfx908_cdna2_selects_mfma_v1() {
+        // gfx908 = MFMA only (no MFMA_V2) → GemmMfmaV1
+        let profile = super::super::isa_profile::IsaProfile::hip(908);
+        let feats = profile.feature_set();
+        assert!(feats.contains(FeatureSet::MFMA));
+        assert!(!feats.contains(FeatureSet::MFMA_V2));
+        let im = select_gemm_impl(feats, QuantPrecision::F16, (16, 16, 16));
+        assert_eq!(im.name(), "GemmMfmaV1",
+            "gfx908 + F16 should route to GemmMfmaV1 (got {})", im.name());
+    }
+
+    #[test]
+    fn route_aarch64_sme_selects_sme_tile_for_f32() {
+        // AArch64 SME = SME_TILE + TileGemm + NativeBf16。
+        // F32: 只有 GemmSmeTile (supports F32, requires SME_TILE) 合法,
+        // AMX 路径不支持 F32, GPU TILE_GEMM 后端不支持 F32 → GemmSmeTile 唯一。
+        let profile = super::super::isa_profile::IsaProfile::aarch64(true, true, 64, true, true, true);
+        let feats = profile.feature_set();
+        assert!(feats.contains(FeatureSet::SME_TILE));
+        assert!(feats.contains(FeatureSet::TILE_GEMM));
+        let im = select_gemm_impl(feats, QuantPrecision::F32, (16, 16, 4));
+        assert_eq!(im.name(), "GemmSmeTile",
+            "SME + F32 should route to GemmSmeTile (got {})", im.name());
+    }
+
+    #[test]
+    fn route_amx_bf16_features_select_tput_ge_60() {
+        // AMX-BF16: has_amx → TileGemm{16,16,32}, has_bf16 → NativeBf16。
+        // 用手构 features (x86 AMX profile 从 DeviceProfile::detect 派生, 不可移植)。
+        // BF16 + TILE_GEMM: GemmTcSm80 (tput=70) 与 GemmAmxBf16Tile (tput=60) requires 都满足,
+        // selector 选 tput 高者。本测试验证 TILE_GEMM+BF16 至少选到 tput>=60 的 tile 实现。
+        let feats = FeatureSet::FMA
+            .union(FeatureSet::TILE_GEMM)
+            .union(FeatureSet::NATIVE_BF16);
+        let im = select_gemm_impl(feats, QuantPrecision::BF16, (16, 16, 32));
+        assert!(im.throughput_class() >= 60,
+            "AMX-BF16 features should select tput>=60 impl, got {} (tput={})",
+            im.name(), im.throughput_class());
+    }
+
+    #[test]
+    fn route_scalar_fallback_when_no_features() {
+        // 空特性 + 任意 dtype → GemmScalar (requires=EMPTY, 永远保底)
+        let im = select_gemm_impl(FeatureSet::EMPTY, QuantPrecision::F32, (2, 2, 2));
+        assert_eq!(im.name(), "GemmScalar");
+        assert_eq!(im.throughput_class(), 1);
+    }
+
+    #[test]
+    fn derive_feature_set_exhaustive_all_18_bits() {
+        // 完整性: 每个有 FeatureSet 位的 IsaFeature 变体都能正确派生。
+        // 构造含全部 18 个映射变体的 features 向量, 验证 18 位全部置位。
+        use super::super::isa_profile::IsaFeature;
+        let features = vec![
+            IsaFeature::Fma,
+            IsaFeature::NativeBf16,
+            IsaFeature::NativeFp16,
+            IsaFeature::NativeFp8,
+            IsaFeature::TileGemm { m: 16, n: 16, k: 32 },
+            IsaFeature::AmxFp16,
+            IsaFeature::AmxFp8,
+            IsaFeature::Wgmma,
+            IsaFeature::Tma,
+            IsaFeature::Tmem,
+            IsaFeature::BlockScaled,
+            IsaFeature::TwoCta,
+            IsaFeature::Mfma,
+            IsaFeature::MfmaV2,
+            IsaFeature::Fp8Mfma,
+            IsaFeature::Sve2,
+            IsaFeature::SmeTileOp,
+            IsaFeature::HardwareTranscendental,
+        ];
+        let fs = derive_feature_set(&features);
+        // 18 位全部包含
+        assert!(fs.contains(FeatureSet::FMA));
+        assert!(fs.contains(FeatureSet::NATIVE_BF16));
+        assert!(fs.contains(FeatureSet::NATIVE_FP16));
+        assert!(fs.contains(FeatureSet::NATIVE_FP8));
+        assert!(fs.contains(FeatureSet::TILE_GEMM));
+        assert!(fs.contains(FeatureSet::AMX_FP16));
+        assert!(fs.contains(FeatureSet::AMX_FP8));
+        assert!(fs.contains(FeatureSet::WGMMA));
+        assert!(fs.contains(FeatureSet::TMA));
+        assert!(fs.contains(FeatureSet::TMEM));
+        assert!(fs.contains(FeatureSet::BLOCK_SCALED));
+        assert!(fs.contains(FeatureSet::TWO_CTA));
+        assert!(fs.contains(FeatureSet::MFMA));
+        assert!(fs.contains(FeatureSet::MFMA_V2));
+        assert!(fs.contains(FeatureSet::FP8_MFMA));
+        assert!(fs.contains(FeatureSet::SVE2));
+        assert!(fs.contains(FeatureSet::SME_TILE));
+        assert!(fs.contains(FeatureSet::HW_TRANSCEND));
+    }
+
+    #[test]
+    fn derive_feature_set_no_consumer_variants_dont_invent_bits() {
+        // 无消费方变体 (NativeFp4/AsyncCopy/Vnni/ArmBf16/SiMDGroupMatrix/...) 不发明 FeatureSet 位。
+        // 验证: 这些变体派生后结果 = EMPTY (0 位)。
+        use super::super::isa_profile::IsaFeature;
+        let features = vec![
+            IsaFeature::NativeFp4,
+            IsaFeature::NativeFp6,
+            IsaFeature::AsyncCopy,
+            IsaFeature::PredicatedExec,
+            IsaFeature::ScalableVector { min_vl: 16, max_vl: 256 },
+            IsaFeature::WarpShuffle,
+            IsaFeature::Vnni,
+            IsaFeature::AmxTranspose,
+            IsaFeature::AmxComplex,
+            IsaFeature::Movrs,
+            IsaFeature::Avx10_2,
+            IsaFeature::Apx31Gpr,
+            IsaFeature::SparseMaskIntersect,
+            IsaFeature::WarpSpecialization,
+            IsaFeature::CudaBarrier,
+            IsaFeature::L2Multicast,
+            IsaFeature::ThreadBlockCluster,
+            IsaFeature::Fp4Mfma,
+            IsaFeature::XcdTopology,
+            IsaFeature::Sme2MultiVec,
+            IsaFeature::SmeF16F16,
+            IsaFeature::SmeI16I64,
+            IsaFeature::ArmBf16,
+            IsaFeature::ArmDotProd,
+            IsaFeature::ArmI8mm,
+            IsaFeature::SiMDGroupMatrix,
+        ];
+        let fs = derive_feature_set(&features);
+        // 这些变体全无 FeatureSet 位 → 派生结果 = EMPTY
+        // (ArmBf16 不映射: NativeBf16 才是统一计算能力位, ArmBf16 是架构别名)
+        assert_eq!(fs, FeatureSet::EMPTY,
+            "无消费方 IsaFeature 变体不应派生任何 FeatureSet 位, got {:?}", fs);
     }
 }
