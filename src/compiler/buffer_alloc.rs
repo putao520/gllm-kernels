@@ -383,16 +383,28 @@ pub fn allocate_buffers_aligned(
     let mut sorted: Vec<&Lifetime> = lifetimes.iter().collect();
     sorted.sort_by_key(|l| (l.first_use, std::cmp::Reverse(l.size_bytes)));
 
-    // §0.2.8: Activation ping-pong compression — 将 N 个 activation tensor 压缩为 2 个 buffer
-    // VirtualActivationMap 已经将 activation tensor 映射到 buffer_idx=0 (ping) / 1 (pong)
-    // 这里把它们从 sorted 中移除，单独分配 2 个等大 slot
+    // §0.2.8: Activation ping-pong compression
+    // BCE-20260629-005: 排除 Gather/QuantGather 输出（如 embedding）
+    // Gather 输出是数据加载，不是层间激活交换。
+    let gather_output_tids: HashSet<TensorId> = graph.ops.iter()
+        .filter_map(|op| match &op.op {
+            crate::compiler::graph::Op::Gather { .. } | crate::compiler::graph::Op::QuantGather { .. } => op.outputs.first().copied(),
+            _ => None,
+        })
+        .collect();
     let mut activation_tids: HashSet<TensorId> = HashSet::new();
     let mut activation_buffer_size: usize = 0;
     if let Some(vam) = &vam {
         if vam.num_buffers == 2 && !vam.activation_assignments.is_empty() {
             activation_buffer_size = vam.buffer_size_bytes;
             for &tid in vam.activation_assignments.keys() {
-                activation_tids.insert(tid);
+                if !gather_output_tids.contains(&tid) {
+                    activation_tids.insert(tid);
+                }
+            }
+            // 如果 Gather 输出被排除后 activation_tids 为空，禁用 ping-pong
+            if activation_tids.is_empty() {
+                activation_buffer_size = 0;
             }
         }
     }
@@ -566,22 +578,31 @@ fn build_tensor_sources(
     // can read the final layer's output from the correct location.
     if activation_buffer_size > 0 {
         if let Some(vam_ref) = vam {
-            // Map activation alias tensors to ActivationPing/ActivationPong
-            // based on their VAM buffer_idx assignment (0=ping, 1=pong).
-            // This is critical: post-loop ops (MeanPool, etc.) must read from
-            // the correct pong buffer, not from scratchpad offset 0.
-            // BCE-20260629-005: activation_alias 只影响读路径（layer loop 从哪里读）
-            // 不应覆盖已有 Intermediate 映射（写路径应该写到 scratchpad）
+            // BCE-20260629-005: 跳过 Gather/QuantGather 输出（如 embedding）
+            let gather_outs: HashSet<TensorId> = graph.ops.iter()
+                .filter_map(|op| match &op.op {
+                    crate::compiler::graph::Op::Gather { .. } | crate::compiler::graph::Op::QuantGather { .. } => op.outputs.first().copied(),
+                    _ => None,
+                })
+                .collect();
             if let Some(cfg) = &graph.layer_loop_config {
                 if let Some((in_tid, out_tid)) = cfg.activation_alias {
-                    map.entry(in_tid).or_insert(TensorPtrSource::ActivationPing);
-                    map.entry(out_tid).or_insert(TensorPtrSource::ActivationPong);
+                    if !gather_outs.contains(&in_tid) {
+                        map.entry(in_tid).or_insert(TensorPtrSource::ActivationPing);
+                    }
+                    if !gather_outs.contains(&out_tid) {
+                        map.entry(out_tid).or_insert(TensorPtrSource::ActivationPong);
+                    }
                 }
             }
             if let Some(cfg) = &graph.hetero_layer_loop_config {
                 for &(in_tid, out_tid) in &cfg.activation_aliases {
-                    map.entry(in_tid).or_insert(TensorPtrSource::ActivationPing);
-                    map.entry(out_tid).or_insert(TensorPtrSource::ActivationPong);
+                    if !gather_outs.contains(&in_tid) {
+                        map.entry(in_tid).or_insert(TensorPtrSource::ActivationPing);
+                    }
+                    if !gather_outs.contains(&out_tid) {
+                        map.entry(out_tid).or_insert(TensorPtrSource::ActivationPong);
+                    }
                 }
             }
             // Also map any VAM-assigned tensors not covered by activation_alias

@@ -199,7 +199,18 @@ impl TensorPtrResolver {
     /// 当 R3 未预计算 tensor_sources（简单 allocate_buffers 路径）时 fallback 到自行构建。
     pub fn build(graph: &CompilerGraph, alloc: &BufferAllocation, topology: &super::topology::GraphTopologyAnalysis) -> Self {
         let map = if !alloc.tensor_sources.is_empty() {
-            alloc.tensor_sources.clone()
+            let mut m = alloc.tensor_sources.clone();
+            // BCE-20260629-005: 强制 Gather/QuantGather 输出为 Intermediate{offset}
+            // 从 alloc.slots 查找真实 offset，避免和 ping buffer 冲突。
+            for op in &graph.ops {
+                if let crate::compiler::graph::Op::Gather { .. } | crate::compiler::graph::Op::QuantGather { .. } = &op.op {
+                    if let Some(&out_tid) = op.outputs.first() {
+                        let off = alloc.offset_of(out_tid).unwrap_or(0);
+                        m.insert(out_tid, TensorPtrSource::Intermediate { offset: off });
+                    }
+                }
+            }
+            m
         } else {
             build_tensor_sources_fallback(graph, alloc, topology)
         };
@@ -371,18 +382,30 @@ fn build_tensor_sources_fallback(
     // Per-layer 编译路径没有 VAM 分析 → 无 sentinel slots → 保持原始 Activation 映射。
     let has_ping_pong_slots = alloc.slots.iter().any(|s| s.tensor_id.0 == 0xFFFF_FF00);
     if has_ping_pong_slots {
-        // SPEC/39: activation_alias 从 topology 推导，替代 graph.layer_loop_config 读取
-        // BCE-20260629-005: activation_alias 只影响读路径（layer loop 从哪里读）
-        // 不应覆盖已有 Intermediate 映射（写路径应该写到 scratchpad）
+        // BCE-20260629-005: 跳过 Gather/QuantGather 输出
+        let gather_outs: std::collections::HashSet<TensorId> = graph.ops.iter()
+            .filter_map(|op| match &op.op {
+                crate::compiler::graph::Op::Gather { .. } | crate::compiler::graph::Op::QuantGather { .. } => op.outputs.first().copied(),
+                _ => None,
+            })
+            .collect();
         if let Some((ref input_tid, ref output_tid)) = topology.layer_activation_alias {
-            map.entry(*input_tid).or_insert(TensorPtrSource::ActivationPing);
-            map.entry(*output_tid).or_insert(TensorPtrSource::ActivationPong);
+            if !gather_outs.contains(input_tid) {
+                map.entry(*input_tid).or_insert(TensorPtrSource::ActivationPing);
+            }
+            if !gather_outs.contains(output_tid) {
+                map.entry(*output_tid).or_insert(TensorPtrSource::ActivationPong);
+            }
         }
-        // HETERO: hetero_layer_loop_config.activation_aliases 仍保留在 graph 上
+        // HETERO
         if let Some(ref cfg) = graph.hetero_layer_loop_config {
             for (input_tid, output_tid) in &cfg.activation_aliases {
-                map.entry(*input_tid).or_insert(TensorPtrSource::ActivationPing);
-                map.entry(*output_tid).or_insert(TensorPtrSource::ActivationPong);
+                if !gather_outs.contains(input_tid) {
+                    map.entry(*input_tid).or_insert(TensorPtrSource::ActivationPing);
+                }
+                if !gather_outs.contains(output_tid) {
+                    map.entry(*output_tid).or_insert(TensorPtrSource::ActivationPong);
+                }
             }
         }
     } else {

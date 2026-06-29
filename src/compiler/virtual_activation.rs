@@ -149,20 +149,35 @@ fn find_layer_activations(
     graph: &CompilerGraph,
     _plan: &FusionPlan,
 ) -> Vec<(TensorId, usize)> {
+    use std::collections::HashSet;
+    // BCE-20260629-005: 排除 Gather/QuantGather 输出（如 embedding）。
+    // Gather 输出是数据加载（写入），不是层间激活交换（in-place 读写）。
+    // 如果 Gather 输出被当作 activation tensor，VAM 会把它分配到 ping/pong buffer，
+    // 而 resolver materialize 会返回 activation_ping_ptr → gather 写到 ping buffer
+    // 而非 scratchpad → DIAG 读 scratchpad offset 0 读不到 → NaN。
+    let gather_output_tids: HashSet<TensorId> = graph.ops.iter()
+        .filter_map(|op| match &op.op {
+            crate::compiler::graph::Op::Gather { .. } | crate::compiler::graph::Op::QuantGather { .. } => op.outputs.first().copied(),
+            _ => None,
+        })
+        .collect();
     if let Some(ref cfg) = graph.layer_loop_config {
         if let Some((input_tid, output_tid)) = cfg.activation_alias {
-            return vec![
-                (input_tid, 0),
-                (output_tid, 0),
-            ];
+            // 排除 Gather 输出，返回不含 Gather 输出的 activation tensors
+            let result: Vec<(TensorId, usize)> = [(input_tid, 0), (output_tid, 0)]
+                .into_iter()
+                .filter(|(tid, _)| !gather_output_tids.contains(tid))
+                .collect();
+            return result;
         }
     }
     if let Some(ref cfg) = graph.hetero_layer_loop_config {
         if let Some(&(input_tid, output_tid)) = cfg.activation_aliases.first() {
-            return vec![
-                (input_tid, 0),
-                (output_tid, 0),
-            ];
+            let result: Vec<(TensorId, usize)> = [(input_tid, 0), (output_tid, 0)]
+                .into_iter()
+                .filter(|(tid, _)| !gather_output_tids.contains(tid))
+                .collect();
+            return result;
         }
     }
     Vec::new()
