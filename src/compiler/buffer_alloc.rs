@@ -570,16 +570,18 @@ fn build_tensor_sources(
             // based on their VAM buffer_idx assignment (0=ping, 1=pong).
             // This is critical: post-loop ops (MeanPool, etc.) must read from
             // the correct pong buffer, not from scratchpad offset 0.
+            // BCE-20260629-005: activation_alias 只影响读路径（layer loop 从哪里读）
+            // 不应覆盖已有 Intermediate 映射（写路径应该写到 scratchpad）
             if let Some(cfg) = &graph.layer_loop_config {
                 if let Some((in_tid, out_tid)) = cfg.activation_alias {
-                    map.insert(in_tid, TensorPtrSource::ActivationPing);
-                    map.insert(out_tid, TensorPtrSource::ActivationPong);
+                    map.entry(in_tid).or_insert(TensorPtrSource::ActivationPing);
+                    map.entry(out_tid).or_insert(TensorPtrSource::ActivationPong);
                 }
             }
             if let Some(cfg) = &graph.hetero_layer_loop_config {
                 for &(in_tid, out_tid) in &cfg.activation_aliases {
-                    map.insert(in_tid, TensorPtrSource::ActivationPing);
-                    map.insert(out_tid, TensorPtrSource::ActivationPong);
+                    map.entry(in_tid).or_insert(TensorPtrSource::ActivationPing);
+                    map.entry(out_tid).or_insert(TensorPtrSource::ActivationPong);
                 }
             }
             // Also map any VAM-assigned tensors not covered by activation_alias

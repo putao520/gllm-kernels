@@ -372,15 +372,17 @@ fn build_tensor_sources_fallback(
     let has_ping_pong_slots = alloc.slots.iter().any(|s| s.tensor_id.0 == 0xFFFF_FF00);
     if has_ping_pong_slots {
         // SPEC/39: activation_alias 从 topology 推导，替代 graph.layer_loop_config 读取
+        // BCE-20260629-005: activation_alias 只影响读路径（layer loop 从哪里读）
+        // 不应覆盖已有 Intermediate 映射（写路径应该写到 scratchpad）
         if let Some((ref input_tid, ref output_tid)) = topology.layer_activation_alias {
-            map.insert(*input_tid, TensorPtrSource::ActivationPing);
-            map.insert(*output_tid, TensorPtrSource::ActivationPong);
+            map.entry(*input_tid).or_insert(TensorPtrSource::ActivationPing);
+            map.entry(*output_tid).or_insert(TensorPtrSource::ActivationPong);
         }
         // HETERO: hetero_layer_loop_config.activation_aliases 仍保留在 graph 上
         if let Some(ref cfg) = graph.hetero_layer_loop_config {
             for (input_tid, output_tid) in &cfg.activation_aliases {
-                map.insert(*input_tid, TensorPtrSource::ActivationPing);
-                map.insert(*output_tid, TensorPtrSource::ActivationPong);
+                map.entry(*input_tid).or_insert(TensorPtrSource::ActivationPing);
+                map.entry(*output_tid).or_insert(TensorPtrSource::ActivationPong);
             }
         }
     } else {
