@@ -605,9 +605,15 @@ fn build_tensor_sources(
                     }
                 }
             }
-            // Also map any VAM-assigned tensors not covered by activation_alias
-            // (shouldn't happen in practice, but ensures completeness).
+            // BCE-20260629-005: VAM activation_assignments 仍可能包含 Gather 输出
             for (&tid, slot) in &vam_ref.activation_assignments {
+                if gather_outs.contains(&tid) {
+                    eprintln!("[BUILD-TS] VAM skip gather_outs tid={}", tid.0);
+                    continue;
+                }
+                if gather_outs.contains(&tid) {
+                    continue;
+                }
                 if !map.contains_key(&tid) {
                     match slot.buffer_idx {
                         0 => { map.insert(tid, TensorPtrSource::ActivationPing); }

@@ -20,6 +20,8 @@
 //! parallel strategy selection, and interval-graph buffer allocation.
 //! ISA Lowering generates native machine code from `TraceOp` sequences.
 
+use std::collections::HashMap;
+
 pub mod ir;
 pub mod planner;
 pub mod executable;
@@ -103,6 +105,10 @@ pub struct MegaKernelCompileOutput {
     /// JIT source map — 仅当 debug_jit=true 时生成。
     /// 包含 VmInstr → 机器码偏移 → Op 标签的映射，供 DAP 调试器使用。
     pub source_map: Option<codegen::vm::debug_map::JitSourceMap>,
+    /// BCE-20260629-006: Intermediate tensor sources (TensorId → TensorPtrSource)
+    /// 供 DIAG harness 动态查询 intermediate tensor 的 scratchpad offset。
+    /// 之前 compile 内部丢弃了 BufferAllocation.tensor_sources，现在透出。
+    pub tensor_sources: HashMap<crate::compiler::graph::TensorId, crate::compiler::buffer_alloc::TensorPtrSource>,
 }
 
 /// Output of GPU mega-kernel compilation (PTX/HIP/MSL source).
@@ -779,6 +785,18 @@ impl InferenceCompiler {
                 logits_scratch_offset,
                 hetero_layout,
                 source_map,
+                tensor_sources: {
+                    let mut ts = alloc.tensor_sources.clone();
+                    for op in &graph.ops {
+                        if let crate::compiler::graph::Op::Gather { .. } | crate::compiler::graph::Op::QuantGather { .. } = &op.op {
+                            if let Some(&out_tid) = op.outputs.first() {
+                                let off = alloc.offset_of(out_tid).unwrap_or(0);
+                                ts.insert(out_tid, crate::compiler::buffer_alloc::TensorPtrSource::Intermediate { offset: off });
+                            }
+                        }
+                    }
+                    ts
+                },
             })
         }
 

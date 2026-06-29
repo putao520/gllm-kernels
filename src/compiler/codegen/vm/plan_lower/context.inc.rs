@@ -202,10 +202,12 @@ impl TensorPtrResolver {
             let mut m = alloc.tensor_sources.clone();
             // BCE-20260629-005: 强制 Gather/QuantGather 输出为 Intermediate{offset}
             // 从 alloc.slots 查找真实 offset，避免和 ping buffer 冲突。
+            eprintln!("[RESOLVER] using alloc.tensor_sources ({} entries)", m.len());
             for op in &graph.ops {
                 if let crate::compiler::graph::Op::Gather { .. } | crate::compiler::graph::Op::QuantGather { .. } = &op.op {
                     if let Some(&out_tid) = op.outputs.first() {
                         let off = alloc.offset_of(out_tid).unwrap_or(0);
+                        eprintln!("[RESOLVER] Gather output tid={} → Intermediate{{offset={}}}", out_tid.0, off);
                         m.insert(out_tid, TensorPtrSource::Intermediate { offset: off });
                     }
                 }
