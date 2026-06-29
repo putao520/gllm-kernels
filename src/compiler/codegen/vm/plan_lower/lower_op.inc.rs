@@ -840,7 +840,8 @@ pub(crate) fn lower_op(
             };
             emit_gemm_inline_with_hook(prog, m, d_c, hidden, ctx,
                 input_ptr, weight_ptr, output_ptr,
-                Some(&m_bound), Some(op.id), None, false)?;
+                Some(&m_bound), Some(op.id), None, false,
+                ctx.dtype, ctx.dtype, ctx.dtype)?;
             Ok(true)
         }
         Op::MlaQAbsorb { ref seq_len, num_heads, head_dim, d_c } => {
@@ -858,7 +859,8 @@ pub(crate) fn lower_op(
                 SymDim::Concrete(num_heads)
             } else { seq_len.clone() };
             emit_gemm_inline_with_hook(prog, &m_for_gemm, d_c, head_dim, ctx,
-                input_ptr, weight_ptr, output_ptr, None, Some(op.id), None, true)?;
+                input_ptr, weight_ptr, output_ptr, None, Some(op.id), None, true,
+                ctx.dtype, ctx.dtype, ctx.dtype)?;
             Ok(true)
         }
         Op::MlaVRestore { ref seq_len, num_heads, head_dim, d_c } => {
@@ -876,7 +878,8 @@ pub(crate) fn lower_op(
                 SymDim::Concrete(num_heads)
             } else { seq_len.clone() };
             emit_gemm_inline_with_hook(prog, &m_for_gemm, head_dim, d_c, ctx,
-                input_ptr, weight_ptr, output_ptr, None, Some(op.id), None, false)?;
+                input_ptr, weight_ptr, output_ptr, None, Some(op.id), None, false,
+                ctx.dtype, ctx.dtype, ctx.dtype)?;
             Ok(true)
         }
         Op::MlaRopeMerge { ref seq_len, d_c, d_rope } => {
@@ -1193,7 +1196,7 @@ pub(crate) fn lower_op(
 fn lower_gemm_v2(
     prog: &mut VmProgram,
     op: &CompilerOp,
-    _graph: &CompilerGraph,
+    graph: &CompilerGraph,
     ctx: &LoweringContext,
     resolver: &TensorPtrResolver,
     abi: &AbiPtrs,
@@ -1217,6 +1220,18 @@ fn lower_gemm_v2(
     let weight_tid = op.inputs.get(1).copied();
     let pm = ctx.pack_map_for_gemm(weight_tid);
 
+    // BCE-20260629-003 (Pattern c): 推断各矩阵 dtype
+    // a_dtype/c_dtype = ctx.dtype (激活计算精度，通常 F32)
+    // b_dtype = 权重 tensor 的 dtype (BF16/F16/F32)
+    let a_dtype = ctx.dtype;
+    let c_dtype = ctx.dtype;
+    let b_dtype = weight_tid
+        .and_then(|tid| graph.tensor(tid))
+        .map(|t| t.dtype.to_quant_precision())
+        .unwrap_or(ctx.dtype);
+    // CR-DTYPE-SOVEREIGNTY-001: 当 b_dtype≠a_dtype 时，VecLoad(b_ptr, dtype=b_dtype)
+    // 会自动 WidenCompute（BF16→F32），VecStore(c_ptr, dtype=c_dtype=F32) 正确。
+
     // seq_bound_override: mega-kernel decode 时 M=1
     let seq_bound_override = if abi.mega_decode_seq_len.is_some() {
         Some(BoundExpr::Const(1))
@@ -1233,6 +1248,7 @@ fn lower_gemm_v2(
         Some(op.id),
         pm,
         spec.trans_b,
+        a_dtype, b_dtype, c_dtype,
     )?;
 
     // GemmBias: bias add（output += bias broadcast across M rows）

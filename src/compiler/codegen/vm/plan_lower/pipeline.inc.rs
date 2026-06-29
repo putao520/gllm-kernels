@@ -802,9 +802,15 @@ pub(super) fn emit_fusion_groups(
                         _ => false,
                     };
                     prog.emit_scope(|p| -> Result<(), CompilerError> {
+                        // BCE-20260629-003 (Pattern c): per-matrix dtype — b_dtype 从权重推断
+                        let b_dt = op.inputs.get(1)
+                            .and_then(|&tid| graph.tensor(tid))
+                            .map(|t| t.dtype.to_quant_precision())
+                            .unwrap_or(ctx.dtype);
                         emit_gemm_inline_with_hook(p, &m_dim, n, k, ctx,
                             op_input_ptr, op_weight_ptr, out_ptr,
-                            seq_bound_override.as_ref(), Some(op.id), pm, trans_b)?;
+                            seq_bound_override.as_ref(), Some(op.id), pm, trans_b,
+                            ctx.dtype, b_dt, ctx.dtype)?;
                         Ok(())
                     })?;
                 }

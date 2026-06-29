@@ -29,7 +29,7 @@ impl OpImpl<GemmOpLayout> for GemmScalar {
         emit_gemm_inline_with_epilogue(
             ctx.prog, &m_dim, lo.n, lo.k, ctx.width,
             lo.a_ptr, lo.b_ptr, lo.c_ptr,
-            &[], &sym_map, false, Some(&lo.m_bound), lo.dtype, lo.trans_b,
+            &[], &sym_map, false, Some(&lo.m_bound), lo.a_dtype, lo.b_dtype, lo.c_dtype, lo.trans_b,
             lo.epilogue,
         )
     }
@@ -61,7 +61,7 @@ impl OpImpl<GemmOpLayout> for GemmFmaBlis {
                 ctx.prog, lo.m, lo.n, lo.k, ctx.width,
                 lo.a_ptr, lo.b_ptr, lo.c_ptr,
                 lo.mr, lo.nr, ctx.pack_map, ctx.k_unroll,
-                lo.dtype, lo.trans_b,
+                lo.a_dtype, lo.b_dtype, lo.c_dtype, lo.trans_b,
             )
         } else {
             // BCE-20260629-001: 用 lo.m_bound 作 seq_bound_override (禁止 Concrete(lo.m) 退化为大循环)
@@ -70,7 +70,7 @@ impl OpImpl<GemmOpLayout> for GemmFmaBlis {
             emit_gemm_inline_with_epilogue(
                 ctx.prog, &m_dim, lo.n, lo.k, ctx.width,
                 lo.a_ptr, lo.b_ptr, lo.c_ptr,
-                &[], &sym_map, false, Some(&lo.m_bound), lo.dtype, lo.trans_b,
+                &[], &sym_map, false, Some(&lo.m_bound), lo.a_dtype, lo.b_dtype, lo.c_dtype, lo.trans_b,
                 lo.epilogue,
             )
         }

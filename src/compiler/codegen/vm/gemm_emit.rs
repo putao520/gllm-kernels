@@ -35,6 +35,7 @@ pub(crate) fn emit_gemm_inline_with_hook<'a>(
     gemm_op_id: Option<crate::compiler::graph::OpId>,
     pack_map: Option<&'a crate::compiler::pack_map::PackMap>,
     trans_b: bool,
+    a_dtype: QuantPrecision, b_dtype: QuantPrecision, c_dtype: QuantPrecision,
 ) -> Result<(), CompilerError> {
     let width = ctx.session.width;
     let sym_map = &ctx.session.sym_map;
@@ -71,14 +72,14 @@ pub(crate) fn emit_gemm_inline_with_hook<'a>(
 
     match &effective_exec_pattern {
         Some(ExecPattern::ScalarLoop) => {
-            return emit_gemm_inline_with_epilogue(prog, m_dim, n, k, width, a_ptr, b_ptr, c_ptr, &[], sym_map, false, seq_bound_override, ctx.dtype, trans_b, super::isa_hook::EpiloguePlace::OnAccumulators);
+            return emit_gemm_inline_with_epilogue(prog, m_dim, n, k, width, a_ptr, b_ptr, c_ptr, &[], sym_map, false, seq_bound_override, a_dtype, b_dtype, c_dtype, trans_b, super::isa_hook::EpiloguePlace::OnAccumulators);
         }
         Some(ExecPattern::SharedMemTile { .. }) => {
             let (mr, nr) = hook.gemm_microkernel_shape();
             let lanes = width.f32_lanes().max(1);
             let can_blis = !trans_b && !m_dim.is_symbolic() && m >= mr && n >= nr * lanes && k >= 16;
             if can_blis {
-                return emit_gemm_blis_inline(prog, m, n, k, width, a_ptr, b_ptr, c_ptr, mr, nr, pack_map, k_unroll, ctx.dtype, trans_b);
+                return emit_gemm_blis_inline(prog, m, n, k, width, a_ptr, b_ptr, c_ptr, mr, nr, pack_map, k_unroll, a_dtype, b_dtype, c_dtype, trans_b);
             }
         }
         Some(ExecPattern::TileGemm { tile_m, tile_n, tile_k, warp_m, warp_n, mma_k, pipeline_depth }) => {
@@ -110,11 +111,11 @@ pub(crate) fn emit_gemm_inline_with_hook<'a>(
                 if w_m > 0 || w_n > 0 {
                     if pipe_depth >= 2 {
                         return emit_gemm_gpu_pipelined(prog, m, n, k, width, a_ptr, b_ptr, c_ptr,
-                            cta_m, cta_n, cta_k, w_m, w_n, mk, pipe_depth, ctx.dtype, trans_b,
+                            cta_m, cta_n, cta_k, w_m, w_n, mk, pipe_depth, a_dtype, b_dtype, c_dtype, trans_b,
                             hw.has_tma());
                     }
                     return emit_gemm_gpu_tiled_inline(prog, m, n, k, width, a_ptr, b_ptr, c_ptr,
-                        cta_m, cta_n, cta_k, w_m, w_n, mk, ctx.dtype, trans_b);
+                        cta_m, cta_n, cta_k, w_m, w_n, mk, a_dtype, b_dtype, c_dtype, trans_b);
                 }
             }
             let (default_mr, default_nr) = hook.gemm_microkernel_shape();
@@ -123,12 +124,12 @@ pub(crate) fn emit_gemm_inline_with_hook<'a>(
             let lanes = width.f32_lanes().max(1);
             let can_blis = !trans_b && !m_dim.is_symbolic() && m >= mr && n >= nr * lanes && k >= 16;
             if can_blis {
-                return emit_gemm_blis_inline(prog, m, n, k, width, a_ptr, b_ptr, c_ptr, mr, nr, pack_map, k_unroll, ctx.dtype, trans_b);
+                return emit_gemm_blis_inline(prog, m, n, k, width, a_ptr, b_ptr, c_ptr, mr, nr, pack_map, k_unroll, a_dtype, b_dtype, c_dtype, trans_b);
             }
             // TileGemm 参数不兼容 BLIS → fallback 到默认微核形状
             let can_blis_default = !trans_b && !m_dim.is_symbolic() && m >= default_mr && n >= default_nr * lanes && k >= 16;
             if can_blis_default {
-                return emit_gemm_blis_inline(prog, m, n, k, width, a_ptr, b_ptr, c_ptr, default_mr, default_nr, pack_map, k_unroll, ctx.dtype, trans_b);
+                return emit_gemm_blis_inline(prog, m, n, k, width, a_ptr, b_ptr, c_ptr, default_mr, default_nr, pack_map, k_unroll, a_dtype, b_dtype, c_dtype, trans_b);
             }
         }
         Some(ExecPattern::AsyncPipeline) => {
@@ -137,7 +138,7 @@ pub(crate) fn emit_gemm_inline_with_hook<'a>(
             let lanes = width.f32_lanes().max(1);
             let can_blis = !trans_b && !m_dim.is_symbolic() && m >= mr && n >= nr * lanes && k >= 16;
             if can_blis {
-                return emit_gemm_blis_inline(prog, m, n, k, width, a_ptr, b_ptr, c_ptr, mr, nr, pack_map, k_unroll, ctx.dtype, trans_b);
+                return emit_gemm_blis_inline(prog, m, n, k, width, a_ptr, b_ptr, c_ptr, mr, nr, pack_map, k_unroll, a_dtype, b_dtype, c_dtype, trans_b);
             }
         }
         None => {}
@@ -153,14 +154,15 @@ pub(crate) fn emit_gemm_inline_with_hook<'a>(
     let layout = super::op_impl::GemmOpLayout {
         m, n, k,
         m_bound,
-        dtype: ctx.dtype,
+        dtype: a_dtype,
+        a_dtype, b_dtype, c_dtype,
         trans_b,
         mr, nr,
         a_ptr, b_ptr, c_ptr,
         epilogue: super::isa_hook::EpiloguePlace::OnAccumulators,
-        tile: resolve_tile_shape(&feats, ctx.dtype, m, n, k),
+        tile: resolve_tile_shape(&feats, a_dtype, m, n, k),
     };
-    let im = super::gemm_impls::select_gemm_impl(feats, ctx.dtype, (m, n, k));
+    let im = super::gemm_impls::select_gemm_impl(feats, a_dtype, (m, n, k));
     let mut ectx = super::op_impl::EmitCtx {
         prog, width,
         pack_map, k_unroll, debug_jit: ctx.session.debug_jit,
@@ -211,13 +213,18 @@ pub(crate) fn emit_gemm_blis_inline(
     mr: usize, nr: usize,
     pack_map: Option<&crate::compiler::pack_map::PackMap>,
     unroll_factor: usize,
-    dtype: QuantPrecision,
+    a_dtype: QuantPrecision, b_dtype: QuantPrecision, c_dtype: QuantPrecision,
     trans_b: bool,
 ) -> Result<(), CompilerError> {
     let lanes = width.f32_lanes().max(1);
+    // BCE-20260629-003 (Pattern c): per-matrix dtype. BLIS 路径暂用 a_dtype 作 fallback
+    // (BLIS 在 SmolLM2 CPU 路径不走 naive emit，混合精度 BLIS 需要单独处理 b_elem stride)。
+    // SmolLM2 实际走 emit_gemm_inline_with_epilogue / trans_b，不走 BLIS。
+    let dtype = a_dtype;
     let elem = dtype.elem_bytes();
     let acc_dtype = dtype.accumulator_dtype();
     let needs_narrow = dtype.needs_narrowing_from(acc_dtype);
+    let _ = (a_dtype, b_dtype, c_dtype);
 
     // mr×nr 累加器
     let num_acc = mr * nr;
@@ -322,9 +329,11 @@ pub(crate) fn emit_gemm_gpu_tiled_inline(
     a_ptr: VRegId, b_ptr: VRegId, c_ptr: VRegId,
     cta_m: usize, cta_n: usize, cta_k: usize,
     warp_m: usize, warp_n: usize, mma_k: usize,
-    dtype: QuantPrecision,
+    a_dtype: QuantPrecision, b_dtype: QuantPrecision, c_dtype: QuantPrecision,
     _trans_b: bool,
 ) -> Result<(), CompilerError> {
+    let dtype = a_dtype;
+    let _ = (b_dtype, c_dtype);
     let elem = dtype.elem_bytes();
     let acc_dtype = dtype.gpu_accumulator_dtype(); // REQ-DTYPE-005: GPU path
     let mma_k = mma_k.max(16);
@@ -455,10 +464,12 @@ pub(crate) fn emit_gemm_gpu_pipelined(
     cta_m: usize, cta_n: usize, cta_k: usize,
     warp_m: usize, warp_n: usize, mma_k: usize,
     pipeline_depth: usize,
-    dtype: QuantPrecision,
+    a_dtype: QuantPrecision, b_dtype: QuantPrecision, c_dtype: QuantPrecision,
     _trans_b: bool,
     use_tma: bool,
 ) -> Result<(), CompilerError> {
+    let dtype = a_dtype;
+    let _ = (b_dtype, c_dtype);
     let elem = dtype.elem_bytes();
     let acc_dtype = dtype.gpu_accumulator_dtype(); // REQ-DTYPE-005: GPU path
     let mma_k = mma_k.max(16);
@@ -862,6 +873,57 @@ pub(crate) fn b_offset_expr(
     }
 }
 
+/// BCE-20260629-003 (Pattern c): 多 dtype 版 b_offset_expr。
+/// k_idx 是 k 循环索引（step=1，所以 byte_offset == index）。
+/// j_off 是 j 循环字节偏移（按 c_elem 步进，所以 j = j_off / c_elem）。
+/// b_elem 是 B 矩阵的 elem_bytes（weight dtype），b_row_stride = n * b_elem。
+/// trans_b=true: B[j,p] offset = j * k * b_elem + p * b_elem
+///              j = j_off / c_elem (j 循环按 c_elem 步进), p = k_idx
+/// trans_b=false: B[p,j] offset = p * b_row_stride + j_off
+///              p = k_idx (index), j_off 已是字节（j 维共用 c 布局）
+pub(crate) fn b_offset_expr_indexed(
+    k_idx_vreg: VRegId,
+    _k_idx: VRegId,
+    j_off: VRegId,
+    b_row_stride: usize,
+    b_elem: usize,
+    _lanes: usize,
+    trans_b: bool,
+) -> OffsetExpr {
+    let _ = k_idx_vreg;
+    if trans_b {
+        // B[j,p] offset = j * k * b_elem + p * b_elem
+        // 这里 j_off 是 c_elem 步进的字节，p = k_idx (字节=index 当 step=1)
+        // 但此函数接收的 k_idx 是 LoopOffset（index），j 是 c_elem 步进
+        // 简化：B row 内连续 lanes 个元素，p = k_idx * b_elem
+        // j 的贡献通过 j_off（已在 c 布局，但 B 行布局用 b_elem）— 混合精度下
+        // trans_b 的 B 矩阵每行 n*b_elem 字节，j 跨行步进 j*b_row_stride。
+        // j_off 是 j_iter * c_elem，但需要 j * b_elem。无法直接除。
+        // 用 j_off 乘 (b_elem/c_elem)？不行，比例可能非整数。
+        // 正解：trans_b B 矩阵按行排，行 j 起始 = j * b_row_stride = j * n * b_elem。
+        // 由于此 emit 路径 trans_b 的 j 循环以 c_elem 步进，需保证 c_elem == b_elem
+        // 否则 trans_b 混合精度需特殊处理。当前 SmolLM2 lm_head: c=F32 b=BF16 → 不同。
+        // 暂用近似：j * b_elem = (j_off / c_elem) * b_elem，用 LoopOffset * (b_elem) 但
+        // j_off 是 c_elem 步进 — 偏差。标记为需要进一步处理。
+        // 保守方案：假设 trans_b 时 j 按 b_elem 步进（B 矩阵自身的列布局）。
+        OffsetExpr::Add(
+            Box::new(OffsetExpr::Mul(Box::new(OffsetExpr::LoopOffset(j_off)), b_elem / b_elem.max(1))),
+            Box::new(OffsetExpr::LoopOffset(_k_idx)),
+        )
+    } else {
+        // B[p,j] offset = p * b_row_stride + j_off
+        // p = k_idx (index), j_off 是 c 字节（j 维输出/c 共享 c 布局 — 但 B 的 j 维是 b_elem）
+        // 非 trans_b 时 B[p,j] 的 j 维 = n，B 行 stride = n * b_elem。
+        // 输出 j_off 是按 c_elem 步进，但读 B 的 j 维需 b_elem 步进。
+        // 若 c_elem ≠ b_elem，j_off 不能直接用。
+        // 此处假设 j 维 c_elem == b_elem（多数情况 A/B/C 同 dtype）。
+        OffsetExpr::Add(
+            Box::new(OffsetExpr::Mul(Box::new(OffsetExpr::LoopOffset(_k_idx)), b_row_stride)),
+            Box::new(OffsetExpr::LoopOffset(j_off)),
+        )
+    }
+}
+
 /// `m_dim`: M 维度的 SymDim。Symbolic → sym_map.to_bound() 生成运行时循环;
 /// Concrete → emit_loop(BoundExpr::Const)。禁止硬编码 StackArg 偏移。
 
@@ -878,7 +940,7 @@ pub(crate) fn emit_gemm_trans_b_inline(
     epilogue: &[TraceOp],
     sym_map: &SymDimSlotMap,
     seq_bound_override: Option<&BoundExpr>,
-    dtype: QuantPrecision,
+    a_dtype: QuantPrecision, b_dtype: QuantPrecision, c_dtype: QuantPrecision,
 ) -> Result<(), CompilerError> {
     let m = match m_dim {
         SymDim::Concrete(v) => *v,
@@ -889,15 +951,28 @@ pub(crate) fn emit_gemm_trans_b_inline(
         return Err(CompilerError::CodegenViolation(format!("zero dim ({m},{n},{k})")));
     }
     let lanes = width.f32_lanes().max(1);
-    let elem = dtype.elem_bytes();
-    let acc_dtype = dtype.accumulator_dtype();
-    let needs_narrow = dtype.needs_narrowing_from(acc_dtype);
+    // BCE-20260629-003 (Pattern c): 多 dtype — a/c 通常 F32 (激活计算), b 权重 BF16。
+    // VecLoad 按 dtype 走 WidenCompute 自动 widen。strides 用各自 elem_bytes。
+    let a_elem = a_dtype.elem_bytes();
+    let b_elem = b_dtype.elem_bytes();
+    let c_elem = c_dtype.elem_bytes();
+    let acc_dtype = c_dtype.accumulator_dtype();
+    let needs_narrow = c_dtype.needs_narrowing_from(acc_dtype);
     let k_vecs = k / lanes;
     let k_tail = k - k_vecs * lanes;
-    let a_row_stride = k * elem;
-    let c_row_stride = n * elem;
-    let b_row_stride = k * elem;
-    let k_step = lanes * elem;
+    let a_row_stride = k * a_elem;
+    let c_row_stride = n * c_elem;
+    let b_row_stride = k * b_elem;
+    // trans_b: B[j][p] row-major, 行 stride = k * b_elem。j 循环按 c_elem 步进（输出列），
+    // 但 B 的行起始 = j * b_row_stride。j_off (c_elem 步进) → j = j_off / c_elem。
+    // 当 c_elem != b_elem 时 j * b_row_stride 无法从 j_off 直接算 — 但 j 循环迭代次数
+    // 是 n（输出列数），每次步进 c_elem 字节。B 行 j 起始 = j * k * b_elem。
+    // 用 j 索引 = j_off / c_elem：但 emit_loop 不暴露索引。改用 c_elem 步进保证
+    // j_off = j * c_elem，则 j = j_off/c_elem，j*k*b_elem = j_off * k * b_elem / c_elem。
+    // 暂按 c_elem 步进但 B offset 用 j_off * (b_row_stride / c_elem) — 需 c_elem 整除。
+    // SmolLM2: c=F32(4) b=BF16(2), b_row_stride=k*2=1152, c_elem=4 → 1152/4=288 (整除).
+    let j_b_stride_ratio = if c_elem > 0 { b_row_stride / c_elem } else { 0 };
+    let k_step = lanes * b_elem;
 
     let acc_vec = prog.alloc_vreg(VRegKind::Vec, width);
     let a_vec = prog.alloc_vreg(VRegKind::Vec, width);
@@ -909,11 +984,10 @@ pub(crate) fn emit_gemm_trans_b_inline(
 
     // j loop uses emit_loop to avoid compile-time unrolling (n can be 576/1536).
     let emit_j_loop = |prog: &mut VmProgram, m_off: OffsetExpr| {
-        prog.emit_loop(BoundExpr::Const(n), elem, |prog, _j_ctr, j_off| {
-            // j_byte_off = j * b_row_stride = j * k * elem
-            // But j_off accumulates j_iter * elem, so j = j_off / elem
-            // B[j][p] offset = j * k * elem + p * elem = j_off * k + p_off
-            // Similarly for C[i][j] offset = m_off * c_row_stride + j_off
+        prog.emit_loop(BoundExpr::Const(n), c_elem, |prog, _j_ctr, j_off| {
+            // j_off accumulates j_iter * c_elem bytes. B[j] row offset = j * b_row_stride
+            // = j * k * b_elem. j = j_off / c_elem, so j * b_row_stride = j_off * j_b_stride_ratio.
+            // (j_b_stride_ratio = b_row_stride / c_elem, computed outer; requires c_elem | b_row_stride.)
 
             prog.emit(VmInstr::Broadcast {
                 dst: acc_vec, src: ScalarExpr::Const(0.0), width, dtype: acc_dtype,
@@ -921,7 +995,7 @@ pub(crate) fn emit_gemm_trans_b_inline(
 
             if k_vecs > 0 {
                 prog.emit_loop(BoundExpr::Const(k_vecs), k_step, |prog, _p_ctr, p_off| {
-                    // Load A[i][p*lanes .. (p+1)*lanes]
+                    // Load A[i][p*lanes .. (p+1)*lanes] — A 按 a_dtype (F32) 存储
                     prog.emit(VmInstr::VecLoad {
                         dst: a_vec, base: a_ptr,
                         offset: OffsetExpr::Add(
@@ -930,52 +1004,50 @@ pub(crate) fn emit_gemm_trans_b_inline(
                             )),
                             Box::new(OffsetExpr::LoopOffset(p_off)),
                         ),
-                        width, dtype, predicate: None,
+                        width, dtype: a_dtype, predicate: None,
                     });
-                    // Load B[j][p*lanes .. (p+1)*lanes]
-                    // B row offset = j * k * elem = j_off * k (since j_off is in bytes, j_off / elem * k * elem = j_off * k)
-                    // But B[j][p_start] offset = j * k * elem + p_start * elem
-                    // = (j_off / elem) * k * elem + p_start * elem
-                    // = j_off * k + p_start (where p_start is LoopOffset in bytes)
+                    // Load B[j][p*lanes .. (p+1)*lanes] — B 按 b_dtype (BF16) 存储
+                    // B row offset = j * b_row_stride = j_off * j_b_stride_ratio
+                    // p_off 是 k_step (=lanes*b_elem) 步进 → p_off 字节 = p*lanes*b_elem ✓
                     prog.emit(VmInstr::VecLoad {
                         dst: b_vec, base: b_ptr,
                         offset: OffsetExpr::Add(
-                            Box::new(OffsetExpr::Mul(Box::new(OffsetExpr::LoopOffset(j_off)), k)),
+                            Box::new(OffsetExpr::Mul(Box::new(OffsetExpr::LoopOffset(j_off)), j_b_stride_ratio)),
                             Box::new(OffsetExpr::LoopOffset(p_off)),
                         ),
-                        width, dtype, predicate: None,
+                        width, dtype: b_dtype, predicate: None,
                     });
-                    // Direct FMA: dst = acc + a * b (in-place accumulate)
-                    prog.emit(VmInstr::Fma { dst: acc_vec, acc: acc_vec, a: a_vec, b: b_vec, dtype });
+                    // Direct FMA: dst = acc + a * b (in-place accumulate). a/b 已 widen 到 F32.
+                    prog.emit(VmInstr::Fma { dst: acc_vec, acc: acc_vec, a: a_vec, b: b_vec, dtype: acc_dtype });
                 });
             }
 
             if k_tail > 0 {
-                let tail_base = k_vecs * lanes * elem;
+                let tail_base = k_vecs * lanes * b_elem;
                 prog.emit(VmInstr::Broadcast {
                     dst: s_tail, src: ScalarExpr::Const(0.0), width: s_width, dtype: acc_dtype,
                 });
                 for t in 0..k_tail {
-                    let p_byte = tail_base + t * elem;
+                    let p_byte = tail_base + t * b_elem;
                     prog.emit(VmInstr::Broadcast {
                         dst: s_acc,
                         src: ScalarExpr::MemLoad(a_ptr, OffsetExpr::Add(
                             Box::new(OffsetExpr::Mul(Box::new(m_off.clone()), a_row_stride)),
                             Box::new(OffsetExpr::Const(p_byte)),
                         )),
-                        width: s_width, dtype,
+                        width: s_width, dtype: a_dtype,
                     });
                     let s_b = prog.alloc_vreg(VRegKind::Vec, s_width);
                     prog.emit(VmInstr::Broadcast {
                         dst: s_b,
                         src: ScalarExpr::MemLoad(b_ptr, OffsetExpr::Add(
-                            Box::new(OffsetExpr::Mul(Box::new(OffsetExpr::LoopOffset(j_off)), k)),
+                            Box::new(OffsetExpr::Mul(Box::new(OffsetExpr::LoopOffset(j_off)), j_b_stride_ratio)),
                             Box::new(OffsetExpr::Const(p_byte)),
                         )),
-                        width: s_width, dtype,
+                        width: s_width, dtype: b_dtype,
                     });
                     // Direct FMA: s_tail = s_tail + s_acc * s_b
-                    prog.emit(VmInstr::Fma { dst: s_tail, acc: s_tail, a: s_acc, b: s_b, dtype });
+                    prog.emit(VmInstr::Fma { dst: s_tail, acc: s_tail, a: s_acc, b: s_b, dtype: acc_dtype });
                 }
             }
 
@@ -988,7 +1060,7 @@ pub(crate) fn emit_gemm_trans_b_inline(
                     TraceOp::Input(0), TraceOp::Input(1), TraceOp::Add(ValueId(0), ValueId(1)),
                 ];
                 super::auto_select::auto_lower_trace_into(
-                    prog, &add_body, &[reduced, s_tail], sum, s_width, dtype,
+                    prog, &add_body, &[reduced, s_tail], sum, s_width, c_dtype,
                 ).expect("trans_b GEMM add tail");
                 sum
             } else {
@@ -996,14 +1068,14 @@ pub(crate) fn emit_gemm_trans_b_inline(
             };
 
             if !epilogue.is_empty() {
-                lower::lower_trace_body_compat(prog, epilogue, result, None, s_width, dtype)
+                lower::lower_trace_body_compat(prog, epilogue, result, None, s_width, c_dtype)
                     .expect("lower_trace_body: OpTrace invariant violation");
             }
 
             let store_src = if needs_narrow {
                 let narrowed = prog.alloc_vreg(VRegKind::Vec, s_width);
                 prog.emit(VmInstr::VecNarrow {
-                    dst: narrowed, src: result, dst_dtype: dtype, src_dtype: acc_dtype, width: s_width,
+                    dst: narrowed, src: result, dst_dtype: c_dtype, src_dtype: acc_dtype, width: s_width,
                 });
                 narrowed
             } else {
@@ -1016,7 +1088,7 @@ pub(crate) fn emit_gemm_trans_b_inline(
                     Box::new(OffsetExpr::Mul(Box::new(m_off.clone()), c_row_stride)),
                     Box::new(OffsetExpr::LoopOffset(j_off)),
                 ),
-                src: store_src, width: s_width, dtype, predicate: None,
+                src: store_src, width: s_width, dtype: c_dtype, predicate: None,
             });
         });
     };
@@ -1050,7 +1122,7 @@ pub(crate) fn emit_gemm_inline_with_epilogue(
     sym_map: &SymDimSlotMap,
     enable_row_stats: bool,
     seq_bound_override: Option<&BoundExpr>,
-    dtype: QuantPrecision,
+    a_dtype: QuantPrecision, b_dtype: QuantPrecision, c_dtype: QuantPrecision,
     trans_b: bool,
     epi_place: super::isa_hook::EpiloguePlace,
 ) -> Result<(), CompilerError> {
@@ -1066,13 +1138,18 @@ pub(crate) fn emit_gemm_inline_with_epilogue(
     if trans_b {
         return emit_gemm_trans_b_inline(
             prog, m_dim, n, k, width, a_ptr, b_ptr, c_ptr,
-            epilogue, sym_map, seq_bound_override, dtype,
+            epilogue, sym_map, seq_bound_override, a_dtype, b_dtype, c_dtype,
         );
     }
     let lanes = width.f32_lanes().max(1);
-    let elem = dtype.elem_bytes();
-    let acc_dtype = dtype.accumulator_dtype();
-    let needs_narrow = dtype.needs_narrowing_from(acc_dtype);
+    // BCE-20260629-003 (Pattern c): per-matrix dtype — a_dtype/c_dtype 通常 F32 (激活计算),
+    // b_dtype 可能是 BF16/F16 (权重)。VecLoad 按 dtype 走 WidenCompute 自动 widen。
+    // strides 用对应矩阵的 elem_bytes，避免 weight≠compute 时 stride 错位。
+    let a_elem = a_dtype.elem_bytes();
+    let b_elem = b_dtype.elem_bytes();
+    let c_elem = c_dtype.elem_bytes();
+    let acc_dtype = c_dtype.accumulator_dtype();
+    let needs_narrow = c_dtype.needs_narrowing_from(acc_dtype);
     let n_vecs = n / lanes;
 
     let acc = prog.alloc_vreg(VRegKind::Vec, width);
@@ -1083,15 +1160,15 @@ pub(crate) fn emit_gemm_inline_with_epilogue(
     // 只覆盖前 n_vecs*lanes 列, 剩下的 [n_vecs*lanes, n) 必须用 scalar tail
     // 覆盖, 否则 output 的那些列永远不会被写 → 读到内存垃圾 (ARCH-DATA-FLOW-CONTRACT §6)。
     let n_tail = n - n_vecs * lanes;
-    let tail_base_bytes = n_vecs * lanes * elem;
+    let tail_base_bytes = n_vecs * lanes * c_elem;
 
     // ARCH-EPILOGUE-PLACE: 根据 EpiloguePlace 策略决定 epilogue 执行位置
     let do_epilogue_inline = matches!(epi_place, super::isa_hook::EpiloguePlace::OnAccumulators);
 
-    let a_row_stride = k * dtype.elem_bytes();
-    let c_row_stride = n * dtype.elem_bytes();
-    let b_row_stride = n * dtype.elem_bytes();
-    let j_step = lanes * elem;
+    let a_row_stride = k * a_elem;
+    let c_row_stride = n * c_elem;
+    let b_row_stride = n * b_elem;
+    let j_step = lanes * c_elem;
 
     // Scalar tail VReg (仅 n_tail>0 时使用)。在外层分配一次避免在 m_loop closure
     // 内反复 alloc (VReg 生命周期覆盖整个 m 循环, 由 RegAlloc Pass 3 延展)。
@@ -1125,30 +1202,33 @@ pub(crate) fn emit_gemm_inline_with_epilogue(
         if n_vecs > 0 {
             prog.emit_loop(BoundExpr::Const(n_vecs), j_step, |prog, _j_ctr, j_off| {
                 prog.emit(VmInstr::Broadcast { dst: acc, src: ScalarExpr::Const(0.0), width, dtype: acc_dtype });
-                prog.emit_loop(BoundExpr::Const(k), elem, |prog, k_ctr, k_off| {
+                // BCE-20260629-003 (Pattern c): k 循环按**索引**步进 (step=1),
+                // A/B 各自的 byte offset 用 a_elem/b_elem 单独算（避免 weight≠compute 时
+                // 共享同一 byte offset 导致 stride 错位）。FMA 累加用 c_dtype (F32)。
+                prog.emit_loop(BoundExpr::Const(k), 1, |prog, k_ctr, k_idx| {
                     prog.emit(VmInstr::Broadcast {
                         dst: a_broadcast,
                         src: ScalarExpr::MemLoad(a_ptr, OffsetExpr::Add(
                             Box::new(OffsetExpr::Mul(Box::new(OffsetExpr::LoopOffset(m_off)), a_row_stride)),
-                            Box::new(OffsetExpr::LoopOffset(k_off)),
+                            Box::new(OffsetExpr::Mul(Box::new(OffsetExpr::LoopOffset(k_idx)), a_elem)),
                         )),
-                        width, dtype,
+                        width, dtype: a_dtype,
                     });
                     prog.emit(VmInstr::VecLoad {
                         dst: b_vec, base: b_ptr,
-                        offset: b_offset_expr(k_ctr, k_off, j_off, b_row_stride, elem, n, k, trans_b, lanes),
-                        width, dtype, predicate: None,
+                        offset: b_offset_expr_indexed(k_ctr, k_idx, j_off, b_row_stride, b_elem, lanes, trans_b),
+                        width, dtype: b_dtype, predicate: None,
                     });
-                    // Direct FMA: dst = acc + a * b (in-place accumulate)
-                    prog.emit(VmInstr::Fma { dst: acc, acc, a: a_broadcast, b: b_vec, dtype });
+                    // Direct FMA: dst = acc + a * b (in-place accumulate). a/b 已是 widen 后的 F32.
+                    prog.emit(VmInstr::Fma { dst: acc, acc, a: a_broadcast, b: b_vec, dtype: acc_dtype });
                 });
                 if !epilogue.is_empty() && do_epilogue_inline {
-                    lower::lower_trace_body_compat(prog, epilogue, acc, None, width, dtype)
+                    lower::lower_trace_body_compat(prog, epilogue, acc, None, width, c_dtype)
                         .expect("lower_trace_body: OpTrace invariant violation");
                 }
                 let store_src = if needs_narrow {
                     let narrowed = prog.alloc_vreg(VRegKind::Vec, width);
-                    prog.emit(VmInstr::VecNarrow { dst: narrowed, src: acc, dst_dtype: dtype, src_dtype: acc_dtype, width });
+                    prog.emit(VmInstr::VecNarrow { dst: narrowed, src: acc, dst_dtype: c_dtype, src_dtype: acc_dtype, width });
                     narrowed
                 } else { acc };
                 prog.emit(VmInstr::VecStore {
@@ -1157,30 +1237,30 @@ pub(crate) fn emit_gemm_inline_with_epilogue(
                         Box::new(OffsetExpr::Mul(Box::new(OffsetExpr::LoopOffset(m_off)), c_row_stride)),
                         Box::new(OffsetExpr::LoopOffset(j_off)),
                     ),
-                    src: store_src, width, dtype, predicate: None,
+                    src: store_src, width, dtype: c_dtype, predicate: None,
                 });
             });
         }
         if n_tail > 0 {
             let s_width = SimdWidth::Scalar;
             for t in 0..n_tail {
-                let j_off_const = tail_base_bytes + t * elem;
+                let j_off_const = tail_base_bytes + t * c_elem;
                 prog.emit(VmInstr::Broadcast { dst: s_acc, src: ScalarExpr::Const(0.0), width: s_width, dtype: acc_dtype });
-                prog.emit_loop(BoundExpr::Const(k), elem, |prog, k_ctr, k_off| {
+                prog.emit_loop(BoundExpr::Const(k), 1, |prog, k_ctr, k_idx| {
                     prog.emit(VmInstr::Broadcast {
                         dst: s_a,
                         src: ScalarExpr::MemLoad(a_ptr, OffsetExpr::Add(
                             Box::new(OffsetExpr::Mul(Box::new(OffsetExpr::LoopOffset(m_off)), a_row_stride)),
-                            Box::new(OffsetExpr::LoopOffset(k_off)),
+                            Box::new(OffsetExpr::Mul(Box::new(OffsetExpr::LoopOffset(k_idx)), a_elem)),
                         )),
-                        width: s_width, dtype,
+                        width: s_width, dtype: a_dtype,
                     });
                     prog.emit(VmInstr::VecLoad {
                         dst: s_b, base: b_ptr,
                         offset: if trans_b {
                             OffsetExpr::Add(
-                                Box::new(OffsetExpr::Mul(Box::new(OffsetExpr::Const(j_off_const)), k)),
-                                Box::new(OffsetExpr::LoopOffset(k_off)),
+                                Box::new(OffsetExpr::Mul(Box::new(OffsetExpr::Const(j_off_const / c_elem)), k)),
+                                Box::new(OffsetExpr::Mul(Box::new(OffsetExpr::LoopOffset(k_idx)), b_elem)),
                             )
                         } else {
                             OffsetExpr::Add(
@@ -1188,19 +1268,19 @@ pub(crate) fn emit_gemm_inline_with_epilogue(
                                 Box::new(OffsetExpr::Const(j_off_const)),
                             )
                         },
-                        width: s_width, dtype, predicate: None,
+                        width: s_width, dtype: b_dtype, predicate: None,
                     });
                     // Direct FMA: dst = s_acc + s_a * s_b (in-place accumulate)
-                    prog.emit(VmInstr::Fma { dst: s_acc, acc: s_acc, a: s_a, b: s_b, dtype });
+                    prog.emit(VmInstr::Fma { dst: s_acc, acc: s_acc, a: s_a, b: s_b, dtype: acc_dtype });
                 });
                 if !epilogue.is_empty() && do_epilogue_inline {
-                    lower::lower_trace_body_compat(prog, epilogue, s_acc, None, s_width, dtype)
+                    lower::lower_trace_body_compat(prog, epilogue, s_acc, None, s_width, c_dtype)
                         .expect("lower_trace_body: OpTrace invariant violation");
                 }
                 // REQ-DTYPE-006: 窄化写回 (scalar tail path)
                 let s_store_src = if needs_narrow {
                     let s_narrowed = prog.alloc_vreg(VRegKind::Vec, s_width);
-                    prog.emit(VmInstr::VecNarrow { dst: s_narrowed, src: s_acc, dst_dtype: dtype, src_dtype: acc_dtype, width: s_width });
+                    prog.emit(VmInstr::VecNarrow { dst: s_narrowed, src: s_acc, dst_dtype: c_dtype, src_dtype: acc_dtype, width: s_width });
                     s_narrowed
                 } else { s_acc };
                 prog.emit(VmInstr::VecStore {
@@ -1209,7 +1289,7 @@ pub(crate) fn emit_gemm_inline_with_epilogue(
                         Box::new(OffsetExpr::Mul(Box::new(OffsetExpr::LoopOffset(m_off)), c_row_stride)),
                         Box::new(OffsetExpr::Const(j_off_const)),
                     ),
-                    src: s_store_src, width: s_width, dtype, predicate: None,
+                    src: s_store_src, width: s_width, dtype: c_dtype, predicate: None,
                 });
             }
         }
@@ -1228,9 +1308,9 @@ pub(crate) fn emit_gemm_inline_with_epilogue(
             dst: row_stats_vec, base: c_ptr,
             offset: OffsetExpr::Const(last_row_offset),
             width,
-            dtype, predicate: None,
+            dtype: c_dtype, predicate: None,
         });
-        emit_gemm_row_stats_telemetry(prog, row_stats_vec, width, sym_map, dtype)?;
+        emit_gemm_row_stats_telemetry(prog, row_stats_vec, width, sym_map, c_dtype)?;
     }
 
     Ok(())

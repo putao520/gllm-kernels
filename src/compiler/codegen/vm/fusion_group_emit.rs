@@ -367,10 +367,15 @@ pub(super) fn emit_fusion_group_by_mode(
             // GemmBias: bias must be added BEFORE epilogue (e.g. GELU(bias+GEMM) != GELU(GEMM)+bias).
             // Decompose: GEMM(no epilogue) → bias add → elementwise epilogue ops.
             if anchor_op.op_is_gemm_with_bias(graph) && !epi_trace.is_empty() {
+                // BCE-20260629-003 (Pattern c): per-matrix dtype — b_dtype from weight tensor
+                let b_dt = anchor_op.inputs.get(1)
+                    .and_then(|&tid| graph.tensor(tid))
+                    .map(|t| t.dtype.to_quant_precision())
+                    .unwrap_or(ctx.dtype);
                 // Step 1: GEMM without epilogue → writes unbiased result to gemm_output_ptr
                 emit_gemm_inline_with_epilogue(prog, &m_dim, n, k, width,
                     group_input_ptr, group_weight_ptr, gemm_output_ptr,
-                    &[], sym_map, false, seq_bound_override, ctx.dtype, gemm_trans_b,
+                    &[], sym_map, false, seq_bound_override, ctx.dtype, b_dt, ctx.dtype, gemm_trans_b,
                     super::isa_hook::EpiloguePlace::OnAccumulators)?;
                 // Step 2: Bias add (broadcast across M rows)
                 if let Some(&bias_tid) = anchor_op.inputs.get(2) {
@@ -398,9 +403,13 @@ pub(super) fn emit_fusion_group_by_mode(
                     }
                 }
             } else {
+                let b_dt = anchor_op.inputs.get(1)
+                    .and_then(|&tid| graph.tensor(tid))
+                    .map(|t| t.dtype.to_quant_precision())
+                    .unwrap_or(ctx.dtype);
                 emit_gemm_inline_with_epilogue(prog, &m_dim, n, k, width,
                     group_input_ptr, group_weight_ptr, gemm_output_ptr,
-                    &epi_trace, sym_map, graph.telemetry.gemm_row_stats, seq_bound_override, ctx.dtype, gemm_trans_b,
+                    &epi_trace, sym_map, graph.telemetry.gemm_row_stats, seq_bound_override, ctx.dtype, b_dt, ctx.dtype, gemm_trans_b,
                     super::isa_hook::EpiloguePlace::OnAccumulators)?;
             }
         }
@@ -433,8 +442,13 @@ pub(super) fn emit_fusion_group_by_mode(
                 let (m_dim, n, k) = extract_gemm_dims_sym(anchor_op, graph)?;
                 let pm = ctx.pack_map_for_gemm(anchor_op.inputs.get(1).copied());
                 let norm_into_gemm_trans_b = anchor_op.op_gemm_trans_b(graph);
+                let b_dt = anchor_op.inputs.get(1)
+                    .and_then(|&tid| graph.tensor(tid))
+                    .map(|t| t.dtype.to_quant_precision())
+                    .unwrap_or(ctx.dtype);
                 emit_gemm_inline_with_hook(p, &m_dim, n, k, ctx,
-                    scratch_ptr, group_weight_ptr, group_output_ptr, seq_bound_override, Some(anchor_op.id), pm, norm_into_gemm_trans_b)?;
+                    scratch_ptr, group_weight_ptr, group_output_ptr, seq_bound_override, Some(anchor_op.id), pm, norm_into_gemm_trans_b,
+                    ctx.dtype, b_dt, ctx.dtype)?;
                 // GemmBias: add bias after GEMM in NormIntoGemm mode
                 if anchor_op.op_is_gemm_with_bias(graph) {
                     if let Some(&bias_tid) = anchor_op.inputs.get(2) {
@@ -462,8 +476,13 @@ pub(super) fn emit_fusion_group_by_mode(
                             .unwrap_or(weight_ptr);
                         let pm = ctx.pack_map_for_gemm(op.inputs.get(1).copied());
                         let qkv_trans_b = op.op_gemm_trans_b(graph);
+                        let qkv_b_dt = op.inputs.get(1)
+                            .and_then(|&tid| graph.tensor(tid))
+                            .map(|t| t.dtype.to_quant_precision())
+                            .unwrap_or(ctx.dtype);
                         prog.emit_scope(|p| -> Result<(), CompilerError> {
-                            emit_gemm_inline_with_hook(p, &m_dim, n, k, ctx, gemm_input, gemm_weight, out_ptr, seq_bound_override, Some(op.id), pm, qkv_trans_b)?;
+                            emit_gemm_inline_with_hook(p, &m_dim, n, k, ctx, gemm_input, gemm_weight, out_ptr, seq_bound_override, Some(op.id), pm, qkv_trans_b,
+                                ctx.dtype, qkv_b_dt, ctx.dtype)?;
                             // GemmBias: add bias after GEMM in QkvSharedInput mode
                             if op.op_is_gemm_with_bias(graph) {
                                 if let Some(&bias_tid) = op.inputs.get(2) {
@@ -499,8 +518,13 @@ pub(super) fn emit_fusion_group_by_mode(
             let (m_dim, n, k) = extract_gemm_dims_sym(anchor_op, graph)?;
             let pm = ctx.pack_map_for_gemm(anchor_op.inputs.get(1).copied());
             let pre_fusion_trans_b = anchor_op.op_gemm_trans_b(graph);
+            let b_dt = anchor_op.inputs.get(1)
+                .and_then(|&tid| graph.tensor(tid))
+                .map(|t| t.dtype.to_quant_precision())
+                .unwrap_or(ctx.dtype);
             emit_gemm_inline_with_hook(prog, &m_dim, n, k, ctx,
-                pre_scratch, group_weight_ptr, group_output_ptr, seq_bound_override, Some(anchor_op.id), pm, pre_fusion_trans_b)?;
+                pre_scratch, group_weight_ptr, group_output_ptr, seq_bound_override, Some(anchor_op.id), pm, pre_fusion_trans_b,
+                ctx.dtype, b_dt, ctx.dtype)?;
             // GemmBias: add bias after GEMM in TileLevelFusion mode
             if anchor_op.op_is_gemm_with_bias(graph) {
                 if let Some(&bias_tid) = anchor_op.inputs.get(2) {
@@ -534,8 +558,13 @@ pub(super) fn emit_fusion_group_by_mode(
             let (m_dim, n, k) = extract_gemm_dims_sym(anchor_op, graph)?;
             let pm = ctx.pack_map_for_gemm(anchor_op.inputs.get(1).copied());
             let pre_fusion_trans_b = anchor_op.op_gemm_trans_b(graph);
+            let cr_b_dt = anchor_op.inputs.get(1)
+                .and_then(|&tid| graph.tensor(tid))
+                .map(|t| t.dtype.to_quant_precision())
+                .unwrap_or(ctx.dtype);
             emit_gemm_inline_with_hook(prog, &m_dim, n, k, ctx,
-                pre_scratch, group_weight_ptr, group_output_ptr, seq_bound_override, Some(anchor_op.id), pm, pre_fusion_trans_b)?;
+                pre_scratch, group_weight_ptr, group_output_ptr, seq_bound_override, Some(anchor_op.id), pm, pre_fusion_trans_b,
+                ctx.dtype, cr_b_dt, ctx.dtype)?;
             // GemmBias: add bias after GEMM in ComputeRoot mode
             if anchor_op.op_is_gemm_with_bias(graph) {
                 if let Some(&bias_tid) = anchor_op.inputs.get(2) {
@@ -565,8 +594,13 @@ pub(super) fn emit_fusion_group_by_mode(
             if let Ok((m_dim, n, k)) = extract_gemm_dims_sym(gate_op, graph) {
                 let pm = ctx.pack_map_for_gemm(gate_op.inputs.get(1).copied());
                 let gate_trans_b = gate_op.op_gemm_trans_b(graph);
+                let gate_b_dt = gate_op.inputs.get(1)
+                    .and_then(|&tid| graph.tensor(tid))
+                    .map(|t| t.dtype.to_quant_precision())
+                    .unwrap_or(ctx.dtype);
                 prog.emit_scope(|p| -> Result<(), CompilerError> {
-                    emit_gemm_inline_with_hook(p, &m_dim, n, k, ctx, gate_input, gate_weight, gate_scratch, seq_bound_override, Some(gate_op.id), pm, gate_trans_b)?;
+                    emit_gemm_inline_with_hook(p, &m_dim, n, k, ctx, gate_input, gate_weight, gate_scratch, seq_bound_override, Some(gate_op.id), pm, gate_trans_b,
+                        ctx.dtype, gate_b_dt, ctx.dtype)?;
                     if gate_op.op_is_gemm_with_bias(graph) {
                         if let Some(&bias_tid) = gate_op.inputs.get(2) {
                             if let Some(bias_ptr) = resolver.materialize(p, bias_tid, abi) {
@@ -589,8 +623,13 @@ pub(super) fn emit_fusion_group_by_mode(
             if let Ok((m_dim, n, k)) = extract_gemm_dims_sym(up_op, graph) {
                 let pm = ctx.pack_map_for_gemm(up_op.inputs.get(1).copied());
                 let up_trans_b = up_op.op_gemm_trans_b(graph);
+                let up_b_dt = up_op.inputs.get(1)
+                    .and_then(|&tid| graph.tensor(tid))
+                    .map(|t| t.dtype.to_quant_precision())
+                    .unwrap_or(ctx.dtype);
                 prog.emit_scope(|p| -> Result<(), CompilerError> {
-                    emit_gemm_inline_with_hook(p, &m_dim, n, k, ctx, up_input, up_weight, up_scratch, seq_bound_override, Some(up_op.id), pm, up_trans_b)?;
+                    emit_gemm_inline_with_hook(p, &m_dim, n, k, ctx, up_input, up_weight, up_scratch, seq_bound_override, Some(up_op.id), pm, up_trans_b,
+                        ctx.dtype, up_b_dt, ctx.dtype)?;
                     if up_op.op_is_gemm_with_bias(graph) {
                         if let Some(&bias_tid) = up_op.inputs.get(2) {
                             if let Some(bias_ptr) = resolver.materialize(p, bias_tid, abi) {
@@ -676,8 +715,13 @@ pub(super) fn emit_fusion_group_by_mode(
                             .unwrap_or(weight_ptr);
                         let pm = ctx.pack_map_for_gemm(op.inputs.get(1).copied());
                         let fqnr_trans_b = op.op_gemm_trans_b(graph);
+                        let fqnr_b_dt = op.inputs.get(1)
+                            .and_then(|&tid| graph.tensor(tid))
+                            .map(|t| t.dtype.to_quant_precision())
+                            .unwrap_or(ctx.dtype);
                         prog.emit_scope(|p| -> Result<(), CompilerError> {
-                            emit_gemm_inline_with_hook(p, &m_dim, n, k, ctx, gemm_input, gemm_weight, out_ptr, seq_bound_override, Some(op.id), pm, fqnr_trans_b)?;
+                            emit_gemm_inline_with_hook(p, &m_dim, n, k, ctx, gemm_input, gemm_weight, out_ptr, seq_bound_override, Some(op.id), pm, fqnr_trans_b,
+                                ctx.dtype, fqnr_b_dt, ctx.dtype)?;
                             Ok(())
                         })?;
                     }

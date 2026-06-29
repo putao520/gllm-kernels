@@ -138,6 +138,11 @@ pub struct GemmOpLayout {
     pub m_bound: super::instr::BoundExpr,
     /// emit 不据此分支; 仅作 store/narrow 与 OpImpl 自身 tile dtype 推断用。
     pub dtype: QuantPrecision,
+    /// BCE-20260629-003 (Pattern c): per-matrix dtype. a_dtype/c_dtype 通常 F32 (激活计算),
+    /// b_dtype 可能是 BF16/F16 (权重)。VecLoad 按 dtype 走 WidenCompute 自动 widen。
+    pub a_dtype: QuantPrecision,
+    pub b_dtype: QuantPrecision,
+    pub c_dtype: QuantPrecision,
     pub trans_b: bool,
     /// selector 从 hook.gemm_microkernel_shape() 预填。
     pub mr: usize,
