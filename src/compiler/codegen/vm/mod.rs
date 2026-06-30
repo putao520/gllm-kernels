@@ -15,6 +15,7 @@
 //! - `plan_lower` — FusionPlan → VmProgram 翻译
 
 pub mod instr;
+pub mod vm_instr_category;
 pub mod isa_profile;
 pub mod isa_hook;
 pub mod op_impl;

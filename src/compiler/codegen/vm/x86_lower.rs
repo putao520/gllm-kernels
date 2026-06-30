@@ -3,9 +3,10 @@
 //! VmInstr → iced_x86 物理指令翻译。
 //! 使用 RegAllocation 将 VRegId 映射到物理 ymm/GPR。
 //!
-//! 代码组织 (include! 模式 — 编译为单模块，物理分散到 6 个片段):
+//! 代码组织 (include! 模式 — 编译为单模块，物理分散到 7 个片段):
 //! - `x86_lower/helpers.inc.rs`         — 构造器 + resolve + spill helpers
-//! - `x86_lower/lower_instr.inc.rs`     — lower_instr + lower_instr_inner (巨型 match)
+//! - `x86_lower/lower_instr.inc.rs`     — lower_instr + lower_instr_inner (L0 分类 dispatch)
+//! - `x86_lower/lower_instr_dispatch.inc.rs` — L1 变体路由 + L2 叶子 emit (ARCH-LOWER-DISPATCH-LAYERING)
 //! - `x86_lower/emit_helpers.inc.rs`    — emit_fp4dot + emit_exp + fp8 + log
 //! - `x86_lower/finalize_quant.inc.rs`  — finalize + gather/scatter + kivi + quant_load
 //! - `x86_lower/callframe.inc.rs`       — SymbolicSaveFrame + CallFrame
@@ -113,6 +114,7 @@ enum SpillSafeRecipe {
 
 include!("x86_lower/helpers.inc.rs");
 include!("x86_lower/lower_instr.inc.rs");
+include!("x86_lower/lower_instr_dispatch.inc.rs");
 include!("x86_lower/emit_helpers.inc.rs");
 include!("x86_lower/finalize_quant.inc.rs");
 include!("x86_lower/callframe.inc.rs");
