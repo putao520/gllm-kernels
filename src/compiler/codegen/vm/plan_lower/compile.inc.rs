@@ -601,11 +601,16 @@ fn try_dispatch_normlike(
         },
         None => NormKind::RmsNorm,
     };
+    let weight_dtype = op.inputs.get(1)
+        .and_then(|&tid| graph.tensor(tid))
+        .map(|t| t.dtype.to_quant_precision())
+        .unwrap_or(ctx.dtype);
     emit_normlike_inline(
         prog, pattern, feature_dim, /*groups_per_row=*/1,
         /*broadcast_weight=*/false, norm_kind,
         ctx.session.width, seq_bound, input_ptr, weight_ptr, output_ptr,
         ctx.dtype,
+        weight_dtype, // BCE-20260629-011: 传递 weight dtype
     )?;
     Ok(true)
 }

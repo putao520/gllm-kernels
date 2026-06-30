@@ -49,6 +49,7 @@ pub(crate) fn emit_normlike_inline(
     weight_ptr: VRegId,
     output_ptr: VRegId,
     dtype: QuantPrecision,
+    weight_dtype: QuantPrecision, // BCE-20260629-011: VecLoad weight 用 weight 实际 dtype
 ) -> Result<(), CompilerError> {
     let (reduce, finalize, transform) = match pattern {
         ComputePattern::NormLike { reduce, finalize, transform } => {
@@ -105,7 +106,7 @@ pub(crate) fn emit_normlike_inline(
                 prog, reduce, finalize, transform,
                 feature_dim, vec_count, step_bytes, elem, lanes, width,
                 norm_kind, acc, temp, scale, dim_bc,
-                row_input, row_weight, row_output, dtype,
+                row_input, row_weight, row_output, dtype, weight_dtype,
             );
         };
 
@@ -121,7 +122,7 @@ pub(crate) fn emit_normlike_inline(
                 prog, reduce, finalize, transform,
                 feature_dim, vec_count, step_bytes, elem, lanes, width,
                 norm_kind, acc, temp, scale, dim_bc,
-                row_input, row_weight, row_output, dtype,
+                row_input, row_weight, row_output, dtype, weight_dtype,
             );
         }
     });
@@ -157,6 +158,7 @@ pub(crate) fn emit_normlike_one_group(
     weight_ptr: VRegId,
     row_output: VRegId,
     dtype: QuantPrecision,
+    weight_dtype: QuantPrecision, // BCE-20260629-011
 ) {
     let has_weight = norm_kind.has_weight();
     let tail = feature_dim % lanes;
@@ -197,7 +199,8 @@ pub(crate) fn emit_normlike_one_group(
             prog.emit(VmInstr::VecLoad { dst: temp, base: row_input, offset: OffsetExpr::LoopOffset(byte_off), width, dtype , predicate: None });
             if has_weight {
                 let w = prog.alloc_vreg(VRegKind::Vec, width);
-                prog.emit(VmInstr::VecLoad { dst: w, base: weight_ptr, offset: OffsetExpr::LoopOffset(byte_off), width, dtype , predicate: None });
+                // BCE-20260629-011: VecLoad weight 用 weight 实际 dtype，而非计算 dtype
+                prog.emit(VmInstr::VecLoad { dst: w, base: weight_ptr, offset: OffsetExpr::LoopOffset(byte_off), width, dtype: weight_dtype, predicate: None });
                 auto_select::auto_lower_trace(prog, transform, &[temp, scale, w], width, dtype).expect("normlike transform");
             } else {
                 auto_select::auto_lower_trace(prog, transform, &[temp, scale], width, dtype).expect("normlike transform");
@@ -212,7 +215,7 @@ pub(crate) fn emit_normlike_one_group(
             prog.emit(VmInstr::VecLoad { dst: s_temp, base: row_input, offset: OffsetExpr::Const(off), width: s1, dtype , predicate: None });
             if has_weight {
                 let s_w = prog.alloc_vreg(VRegKind::Vec, s1);
-                prog.emit(VmInstr::VecLoad { dst: s_w, base: weight_ptr, offset: OffsetExpr::Const(off), width: s1, dtype , predicate: None });
+                prog.emit(VmInstr::VecLoad { dst: s_w, base: weight_ptr, offset: OffsetExpr::Const(off), width: s1, dtype: weight_dtype, predicate: None });
                 auto_select::auto_lower_trace(prog, transform, &[s_temp, scale, s_w], s1, dtype).expect("normlike transform tail");
             } else {
                 auto_select::auto_lower_trace(prog, transform, &[s_temp, scale], s1, dtype).expect("normlike transform tail");
@@ -245,6 +248,7 @@ pub(crate) fn emit_layernorm_auto(
     weight_ptr: VRegId,
     output_ptr: VRegId,
     dtype: QuantPrecision,
+    weight_dtype: QuantPrecision, // BCE-20260629-011: weight/bias VecLoad 用 weight 实际 dtype
 ) -> Result<(), CompilerError> {
     let lanes = width.f32_lanes();
     if lanes == 0 || feature_dim == 0 {
@@ -333,11 +337,11 @@ pub(crate) fn emit_layernorm_auto(
             prog.emit_loop(BoundExpr::Const(vec_count), step_bytes, |prog, _ctr, byte_off| {
                 prog.emit(VmInstr::VecLoad { dst: temp, base: row_input, offset: OffsetExpr::LoopOffset(byte_off), width, dtype , predicate: None });
                 let w = prog.alloc_vreg(VRegKind::Vec, width);
-                prog.emit(VmInstr::VecLoad { dst: w, base: weight_ptr, offset: OffsetExpr::LoopOffset(byte_off), width, dtype , predicate: None });
+                prog.emit(VmInstr::VecLoad { dst: w, base: weight_ptr, offset: OffsetExpr::LoopOffset(byte_off), width, dtype: weight_dtype, predicate: None });
                 let b = prog.alloc_vreg(VRegKind::Vec, width);
                 prog.emit(VmInstr::VecLoad { dst: b, base: weight_ptr,
                     offset: OffsetExpr::Add(Box::new(OffsetExpr::Const(bias_offset)), Box::new(OffsetExpr::LoopOffset(byte_off))),
-                    width, dtype , predicate: None });
+                    width, dtype: weight_dtype, predicate: None });
                 auto_select::auto_lower_trace(prog, &transform_body, &[temp, scale, mean_bc, w, b], width, dtype).expect("layernorm transform");
                 prog.emit(VmInstr::VecStore { base: row_output, offset: OffsetExpr::LoopOffset(byte_off), src: temp, width, dtype , predicate: None });
             });
@@ -347,9 +351,9 @@ pub(crate) fn emit_layernorm_auto(
                 let off = tail_off + t * elem;
                 prog.emit(VmInstr::VecLoad { dst: temp, base: row_input, offset: OffsetExpr::Const(off), width: s1, dtype , predicate: None });
                 let s_w = prog.alloc_vreg(VRegKind::Vec, s1);
-                prog.emit(VmInstr::VecLoad { dst: s_w, base: weight_ptr, offset: OffsetExpr::Const(off), width: s1, dtype , predicate: None });
+                prog.emit(VmInstr::VecLoad { dst: s_w, base: weight_ptr, offset: OffsetExpr::Const(off), width: s1, dtype: weight_dtype, predicate: None });
                 let s_b = prog.alloc_vreg(VRegKind::Vec, s1);
-                prog.emit(VmInstr::VecLoad { dst: s_b, base: weight_ptr, offset: OffsetExpr::Const(bias_offset + off), width: s1, dtype , predicate: None });
+                prog.emit(VmInstr::VecLoad { dst: s_b, base: weight_ptr, offset: OffsetExpr::Const(bias_offset + off), width: s1, dtype: weight_dtype, predicate: None });
                 auto_select::auto_lower_trace(prog, &transform_body, &[temp, scale, mean_bc, s_w, s_b], s1, dtype).expect("layernorm transform tail");
                 prog.emit(VmInstr::VecStore { base: row_output, offset: OffsetExpr::Const(off), src: temp, width: s1, dtype , predicate: None });
             }

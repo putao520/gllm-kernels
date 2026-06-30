@@ -1099,6 +1099,7 @@ pub(crate) fn lower_op(
             };
             let input_ptr = resolver.materialize(prog, op.inputs[0], abi).unwrap_or_else(|| prog.alloc_vreg(VRegKind::Ptr, width));
             let weight_ptr = resolver.materialize(prog, op.inputs[1], abi).unwrap_or_else(|| prog.alloc_vreg(VRegKind::Ptr, width));
+            let weight_dtype = graph.tensor(op.inputs[1]).map(|t| t.dtype.to_quant_precision()).unwrap_or(ctx.dtype);
             let output_ptr = resolver.materialize(prog, op.outputs[0], abi)
                 .ok_or_else(|| CompilerError::CodegenViolation(format!("QkNorm op {:?}: 无输出指针", op.id)))?;
             let pattern = build_norm_pattern_qk(eps, head_dim)?;
@@ -1106,7 +1107,7 @@ pub(crate) fn lower_op(
                 prog, &pattern, head_dim, num_heads,
                 /*broadcast_weight=*/false, NormKind::ValueNorm,
                 width, seq_bound, input_ptr, weight_ptr, output_ptr,
-                ctx.dtype,
+                ctx.dtype, weight_dtype,
             )?;
             Ok(true)
         }
@@ -1117,6 +1118,7 @@ pub(crate) fn lower_op(
                 .unwrap_or(BoundExpr::Const(1));
             let input_ptr = resolver.materialize(prog, op.inputs[0], abi).unwrap_or_else(|| prog.alloc_vreg(VRegKind::Ptr, width));
             let weight_ptr = resolver.materialize(prog, op.inputs[1], abi).unwrap_or_else(|| prog.alloc_vreg(VRegKind::Ptr, width));
+            let weight_dtype = graph.tensor(op.inputs[1]).map(|t| t.dtype.to_quant_precision()).unwrap_or(ctx.dtype);
             let output_ptr = resolver.materialize(prog, op.outputs[0], abi)
                 .ok_or_else(|| CompilerError::CodegenViolation(format!("L2Normalize op {:?}: 无输出指针", op.id)))?;
             let key = ScalarOpRegistry::key_from_op(&op.op);
@@ -1126,7 +1128,7 @@ pub(crate) fn lower_op(
             emit_normlike_inline(
                 prog, &pattern, hidden, 1, false, NormKind::ValueNorm,
                 width, seq_bound, input_ptr, weight_ptr, output_ptr,
-                ctx.dtype,
+                ctx.dtype, weight_dtype,
             )?;
             Ok(true)
         }
@@ -1524,13 +1526,22 @@ fn lower_norm_v2(
     } else {
         input_ptr
     };
+    // BCE-20260629-011: weight dtype 从 weight tensor 获取
+    let weight_dtype = if spec.has_weight {
+        op.inputs.get(1)
+            .and_then(|&tid| graph.tensor(tid))
+            .map(|t| t.dtype.to_quant_precision())
+            .unwrap_or(dtype)
+    } else {
+        dtype
+    };
 
     // LayerNorm 用 emit_layernorm_auto（独立实现，不依赖 trace，避免 Input(3) bias 越界）
     // RmsNorm/ValueNorm/HeadRmsNorm 用 emit_normlike_inline（trace 驱动 NormLike）
     if matches!(norm_kind, NormKind::LayerNorm) {
         super::norm_softmax_emit::emit_layernorm_auto(
             prog, feature_dim, spec.eps, ctx.session.width, seq_bound,
-            input_ptr, weight_ptr, output_ptr, dtype,
+            input_ptr, weight_ptr, output_ptr, dtype, weight_dtype,
         )?;
     } else {
         emit_normlike_inline(
@@ -1546,6 +1557,7 @@ fn lower_norm_v2(
             weight_ptr,
             output_ptr,
             dtype,
+            weight_dtype,
         )?;
     }
 
