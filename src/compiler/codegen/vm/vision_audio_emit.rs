@@ -24,7 +24,8 @@ pub(crate) fn lower_depthwise_conv1d(
     resolver: &TensorPtrResolver,
     abi: &AbiPtrs,
     req: &DwcScratchRequirement,
-    dtype: QuantPrecision,
+    input_dtype: QuantPrecision,
+    weight_dtype: QuantPrecision,
 ) -> Result<(), CompilerError> {
     if op.inputs.len() != 2 {
         return Err(CompilerError::CodegenViolation(format!(
@@ -57,8 +58,11 @@ pub(crate) fn lower_depthwise_conv1d(
         src: PtrExpr::VRegPlusConst(scratch_base, req.padded_offset),
     });
 
-    let elem = dtype.elem_bytes();
-    let channel_row_bytes = channels * dtype.elem_bytes(); // channels * 4
+    // BCE-20260630-MIXED-P5 (ARCH-DTYPE-MIXED-PRECISION 三段式):
+    //   load x/input/output→input_dtype, load w(conv weight)→weight_dtype, accumulate→F32, store output→input_dtype
+    let elem = input_dtype.elem_bytes();
+    let weight_elem = weight_dtype.elem_bytes();
+    let channel_row_bytes = channels * input_dtype.elem_bytes();
     let left_pad = req.left_pad;
 
     // ── 推导运行时 seq_bound (Symbolic 或 Concrete) ──
@@ -76,7 +80,7 @@ pub(crate) fn lower_depthwise_conv1d(
     // (主卷积循环只读 0..seq+total_pad 范围)。
     let padded_rows_max = req.max_seq_len + left_pad + (req.kernel_size - 1 - left_pad);
     let total_padded_bytes = padded_rows_max * channel_row_bytes;
-    emit_zero_fill_bytes(prog, padded_ptr, total_padded_bytes, width, dtype)?;
+    emit_zero_fill_bytes(prog, padded_ptr, total_padded_bytes, width, input_dtype)?;
 
     // ── Stage 2: Copy input x[0..seq, :] → padded[left_pad..left_pad+seq, :] ──
     // 起点偏移: left_pad * channel_row_bytes
@@ -90,7 +94,7 @@ pub(crate) fn lower_depthwise_conv1d(
     } else {
         padded_ptr
     };
-    emit_row_copy(prog, x_ptr, copy_dst_ptr, seq_bound.clone(), channels, width, dtype)?;
+    emit_row_copy(prog, x_ptr, copy_dst_ptr, seq_bound.clone(), channels, width, input_dtype)?;
 
     // ── Stage 3: Conv 主循环: output[t, c] = Σ_k padded[t+k, c] * w[c, k] ──
     // 循环结构 (ARCH-NO-LOOP-UNROLL 合规):
@@ -111,14 +115,11 @@ pub(crate) fn lower_depthwise_conv1d(
     let w_val = prog.alloc_vreg(VRegKind::Vec, s_width);
 
     prog.emit_loop(seq_bound, channel_row_bytes, |prog, _t_ctr, t_off| {
-        // 外层每次: 行基址 = padded_ptr + t_off (含 left_pad 偏移), output_row = out_ptr + t_off
-        prog.emit_loop(BoundExpr::Const(channels), elem, |prog, _c_ctr, c_off| {
-            // acc = 0
-            prog.emit(VmInstr::Broadcast { dst: acc, src: ScalarExpr::Const(0.0), width: s_width, dtype, });
-
-            // Rust-unroll k — kernel_size ≤ 15 小常量, 合规 UNROLL_THRESHOLD 合法 Const 展开场景。
+        prog.emit_loop(BoundExpr::Const(channels), elem, |prog, c_ctr, c_off| {
+            // acc = 0 (accumulator 恒 F32)
+            prog.emit(VmInstr::Broadcast { dst: acc, src: ScalarExpr::Const(0.0), width: s_width, dtype: QuantPrecision::F32, });
             for k in 0..kernel_size {
-                // x_val = padded[t + k, c] = *(padded_ptr + t_off + k*channel_row_bytes + c_off)
+                // x_val = padded[t+k, c] (激活链 → input_dtype)
                 let padded_off = OffsetExpr::Add(
                     Box::new(OffsetExpr::LoopOffset(t_off)),
                     Box::new(OffsetExpr::Add(
@@ -128,42 +129,40 @@ pub(crate) fn lower_depthwise_conv1d(
                 );
                 prog.emit(VmInstr::VecLoad {
                     dst: x_val, base: padded_ptr, offset: padded_off, width: s_width,
-                    dtype, predicate: None,
+                    dtype: input_dtype, predicate: None,
                 });
-                // w_val = broadcast w[c, k] = broadcast *(w_ptr + c_off * kernel_size + k * 4)
-                // w[c, k] byte offset = c * K * 4 + k * 4 = c_off * K + k * 4
-                // (c_off 是 byte_offset, 每次迭代加 4B → c_off / 4 == c, 所以 c_off * K = c * K * 4)
+                // w_val = w[c,k] (weight 表 → weight_dtype; 用 c_ctr × weight_elem 解耦 input/weight elem 步进)
                 let w_byte_off = OffsetExpr::Add(
-                    Box::new(OffsetExpr::Mul(Box::new(OffsetExpr::LoopOffset(c_off)), kernel_size)),
-                    Box::new(OffsetExpr::Const(k * elem)),
+                    Box::new(OffsetExpr::Mul(
+                        Box::new(OffsetExpr::ScalarVReg(c_ctr)),
+                        kernel_size * weight_elem,
+                    )),
+                    Box::new(OffsetExpr::Const(k * weight_elem)),
                 );
                 prog.emit(VmInstr::Broadcast {
                     dst: w_val,
                     src: ScalarExpr::MemLoad(w_ptr, w_byte_off),
                     width: s_width,
-                    dtype,
+                    dtype: weight_dtype,
                 });
-                // acc = acc + x_val * w_val via auto_lower_trace_into
+                // acc += x_val * w_val (accumulator F32)
                 {
                     let dwc_fma_body: Vec<TraceOp> = vec![
-                        TraceOp::Input(0),  // [0] x_val
-                        TraceOp::Input(1),  // [1] w_val
-                        TraceOp::Input(2),  // [2] acc
-                        TraceOp::Fma(ValueId(0), ValueId(1), ValueId(2)), // [3] new_acc
+                        TraceOp::Input(0), TraceOp::Input(1), TraceOp::Input(2),
+                        TraceOp::Fma(ValueId(0), ValueId(1), ValueId(2)),
                     ];
                     super::auto_select::auto_lower_trace_into(prog, &dwc_fma_body, &[x_val, w_val, acc], acc, s_width, QuantPrecision::F32)
                         .expect("lower_depthwise_conv1d: FMA auto_lower invariant violation");
                 }
             }
-
-            // output[t, c] = acc (lane 0 only, SimdWidth::Scalar)
+            // output[t,c] = acc → input_dtype
             let out_off = OffsetExpr::Add(
                 Box::new(OffsetExpr::LoopOffset(t_off)),
                 Box::new(OffsetExpr::LoopOffset(c_off)),
             );
             prog.emit(VmInstr::VecStore {
                 base: out_ptr, offset: out_off, src: acc, width: s_width,
-                dtype, predicate: None,
+                dtype: input_dtype, predicate: None,
             });
         });
     });
@@ -224,7 +223,8 @@ pub(crate) fn lower_patch_embed(
     image_ptr: VRegId,
     kernel_ptr: VRegId,
     patches_ptr: VRegId,
-    dtype: QuantPrecision,
+    input_dtype: QuantPrecision,
+    weight_dtype: QuantPrecision,
 ) -> Result<(), CompilerError> {
     if patch_size == 0 || in_channels == 0 || image_size == 0 || embed_dim == 0 {
         return Err(CompilerError::CodegenViolation(format!(
@@ -239,47 +239,42 @@ pub(crate) fn lower_patch_embed(
         )));
     }
     let num_patches_side = image_size / patch_size;
-    let elem = dtype.elem_bytes(); // 4 bytes
+    // BCE-20260630-MIXED-P5 (ARCH-DTYPE-MIXED-PRECISION 三段式):
+    //   load image→input_dtype, load kernel→weight_dtype, accumulate→F32, store patches→input_dtype
+    let elem = input_dtype.elem_bytes();
+    let weight_elem = weight_dtype.elem_bytes();
     let s_width = SimdWidth::Scalar;
 
-    // ── 寄存器规划 (最小化 live 集, 所有 SIMD vreg 均标量 lane 0) ──
-    let acc = prog.alloc_vreg(VRegKind::Vec, s_width);     // scalar f32 accumulator
-    let x_val = prog.alloc_vreg(VRegKind::Vec, s_width);   // image[c, r, kc] 临时
-    let w_val = prog.alloc_vreg(VRegKind::Vec, s_width);   // kernel[e, c, kr, kc] 临时
+    let acc = prog.alloc_vreg(VRegKind::Vec, s_width);
+    let x_val = prog.alloc_vreg(VRegKind::Vec, s_width);
+    let w_val = prog.alloc_vreg(VRegKind::Vec, s_width);
 
-    // 常量缩放因子 (与上方公式对齐, 均为编译时常量):
-    let scale_image_row   = patch_size * image_size;                    // p_row_off × scale
-    let scale_image_col   = patch_size;                                 // p_col_off × scale
-    let scale_image_chan  = image_size * image_size;                    // c_off × scale
-    let scale_image_kr    = image_size;                                 // kr_off × scale
-    let scale_kernel_e    = in_channels * patch_size * patch_size;      // e_off × scale
-    let scale_kernel_c    = patch_size * patch_size;                    // c_off × scale
-    let scale_kernel_kr   = patch_size;                                 // kr_off × scale
-    let scale_out_p_row   = num_patches_side * embed_dim;               // p_row_off × scale
-    let scale_out_p_col   = embed_dim;                                  // p_col_off × scale
+    // image byte-offset 缩放 (input_elem, 配 byte_offset 按 input_elem 步进):
+    let scale_image_row   = patch_size * image_size;
+    let scale_image_col   = patch_size;
+    let scale_image_chan  = image_size * image_size;
+    let scale_image_kr    = image_size;
+    // kernel byte-offset 缩放 (weight_elem, 配 counter — 解耦 input/weight elem):
+    let scale_kernel_e    = in_channels * patch_size * patch_size * weight_elem;
+    let scale_kernel_c    = patch_size * patch_size * weight_elem;
+    let scale_kernel_kr   = patch_size * weight_elem;
+    // patches output 缩放 (input_elem):
+    let scale_out_p_row   = num_patches_side * embed_dim;
+    let scale_out_p_col   = embed_dim;
 
-    // ── 5 层 emit_loop (p_row → p_col → e → c → kr) + Rust unroll kc ──
     prog.emit_loop(BoundExpr::Const(num_patches_side), elem, |prog, _p_row_ctr, p_row_off| {
         prog.emit_loop(BoundExpr::Const(num_patches_side), elem, |prog, _p_col_ctr, p_col_off| {
-            prog.emit_loop(BoundExpr::Const(embed_dim), elem, |prog, _e_ctr, e_off| {
-                // acc = 0
+            prog.emit_loop(BoundExpr::Const(embed_dim), elem, |prog, e_ctr, e_off| {
+                // acc = 0 (accumulator 恒 F32)
                 prog.emit(VmInstr::Broadcast {
                     dst: acc, src: ScalarExpr::Const(0.0), width: s_width,
-                    dtype,
+                    dtype: QuantPrecision::F32,
                 });
 
-                prog.emit_loop(BoundExpr::Const(in_channels), elem, |prog, _c_ctr, c_off| {
-                    prog.emit_loop(BoundExpr::Const(patch_size), elem, |prog, _kr_ctr, kr_off| {
-                        // Rust-unroll kc: patch_size 是编译时常量 (ViT 典型 14/16 ≤ 16,
-                        // 合规 UNROLL_THRESHOLD 的"内层微维度 + 编译时确定且极小的维度"
-                        // 例外)。展开后消除循环开销, vfmadd231ps 可级联。
+                prog.emit_loop(BoundExpr::Const(in_channels), elem, |prog, c_ctr, c_off| {
+                    prog.emit_loop(BoundExpr::Const(patch_size), elem, |prog, kr_ctr, kr_off| {
                         for kc in 0..patch_size {
-                            // image[c, r, col] byte offset:
-                            //   Mul(p_row_off, P·IS)  (p_row · P · IS · elem)
-                            // + Mul(p_col_off, P)     (p_col · P · elem)
-                            // + Mul(c_off,     IS·IS) (c · IS² · elem)
-                            // + Mul(kr_off,    IS)    (kr · IS · elem)
-                            // + Const(kc · elem)
+                            // image[c,r,col] (input_dtype elem)
                             let image_off = add_offsets(vec![
                                 OffsetExpr::Mul(Box::new(OffsetExpr::LoopOffset(p_row_off)), scale_image_row),
                                 OffsetExpr::Mul(Box::new(OffsetExpr::LoopOffset(p_col_off)), scale_image_col),
@@ -289,34 +284,25 @@ pub(crate) fn lower_patch_embed(
                             ]);
                             prog.emit(VmInstr::VecLoad {
                                 dst: x_val, base: image_ptr, offset: image_off, width: s_width,
-                                dtype, predicate: None,
+                                dtype: input_dtype, predicate: None,
                             });
 
-                            // kernel[e, c, kr, kc] byte offset:
-                            //   Mul(e_off,  IC·P²)
-                            // + Mul(c_off,  P²)
-                            // + Mul(kr_off, P)
-                            // + Const(kc · elem)
+                            // kernel[e,c,kr,kc] (weight_dtype elem, 用 counter 解耦)
                             let kernel_off = add_offsets(vec![
-                                OffsetExpr::Mul(Box::new(OffsetExpr::LoopOffset(e_off)),  scale_kernel_e),
-                                OffsetExpr::Mul(Box::new(OffsetExpr::LoopOffset(c_off)),  scale_kernel_c),
-                                OffsetExpr::Mul(Box::new(OffsetExpr::LoopOffset(kr_off)), scale_kernel_kr),
-                                OffsetExpr::Const(kc * elem),
+                                OffsetExpr::Mul(Box::new(OffsetExpr::ScalarVReg(e_ctr)),  scale_kernel_e),
+                                OffsetExpr::Mul(Box::new(OffsetExpr::ScalarVReg(c_ctr)),  scale_kernel_c),
+                                OffsetExpr::Mul(Box::new(OffsetExpr::ScalarVReg(kr_ctr)), scale_kernel_kr),
+                                OffsetExpr::Const(kc * weight_elem),
                             ]);
-                            // kernel 值必须 broadcast 到 w_val (scalar width → lane 0)。
-                            // 采用 VecLoad scalar (width=Scalar → 单 f32 load) 与 x_val 对称,
-                            // vfmadd231ps 对 xmm 下位 f32 lane 运算即可 (等价 vfmadd231ss)。
                             prog.emit(VmInstr::VecLoad {
                                 dst: w_val, base: kernel_ptr, offset: kernel_off, width: s_width,
-                                dtype, predicate: None,
+                                dtype: weight_dtype, predicate: None,
                             });
-                            // acc = acc + x_val · w_val via auto_lower_trace_into
+                            // acc += x_val · w_val (accumulator F32)
                             {
                                 let pe_fma_body: Vec<TraceOp> = vec![
-                                    TraceOp::Input(0),  // [0] x_val
-                                    TraceOp::Input(1),  // [1] w_val
-                                    TraceOp::Input(2),  // [2] acc
-                                    TraceOp::Fma(ValueId(0), ValueId(1), ValueId(2)), // [3] new_acc
+                                    TraceOp::Input(0), TraceOp::Input(1), TraceOp::Input(2),
+                                    TraceOp::Fma(ValueId(0), ValueId(1), ValueId(2)),
                                 ];
                                 super::auto_select::auto_lower_trace_into(prog, &pe_fma_body, &[x_val, w_val, acc], acc, s_width, QuantPrecision::F32)
                                     .expect("lower_patch_embed: FMA auto_lower invariant violation");
@@ -332,9 +318,10 @@ pub(crate) fn lower_patch_embed(
                     OffsetExpr::Mul(Box::new(OffsetExpr::LoopOffset(p_col_off)), scale_out_p_col),
                     OffsetExpr::LoopOffset(e_off),
                 ]);
+                // patches output → input_dtype
                 prog.emit(VmInstr::VecStore {
                     base: patches_ptr, offset: out_off, src: acc, width: s_width,
-                    dtype, predicate: None,
+                    dtype: input_dtype, predicate: None,
                 });
             });
         });
@@ -578,7 +565,7 @@ mod tests {
         let img = prog.alloc_vreg(VRegKind::Ptr, SimdWidth::Scalar);
         let ker = prog.alloc_vreg(VRegKind::Ptr, SimdWidth::Scalar);
         let out = prog.alloc_vreg(VRegKind::Ptr, SimdWidth::Scalar);
-        let result = lower_patch_embed(&mut prog, 0, 64, 3, 224, img, ker, out, QuantPrecision::F32);
+        let result = lower_patch_embed(&mut prog, 0, 64, 3, 224, img, ker, out, QuantPrecision::F32, QuantPrecision::F32);
         assert!(result.is_err());
         let msg = format!("{}", result.unwrap_err());
         assert!(msg.contains("invalid dims"), "expected 'invalid dims' in error, got: {msg}");
@@ -590,7 +577,7 @@ mod tests {
         let img = prog.alloc_vreg(VRegKind::Ptr, SimdWidth::Scalar);
         let ker = prog.alloc_vreg(VRegKind::Ptr, SimdWidth::Scalar);
         let out = prog.alloc_vreg(VRegKind::Ptr, SimdWidth::Scalar);
-        let result = lower_patch_embed(&mut prog, 14, 64, 3, 225, img, ker, out, QuantPrecision::F32);
+        let result = lower_patch_embed(&mut prog, 14, 64, 3, 225, img, ker, out, QuantPrecision::F32, QuantPrecision::F32);
         assert!(result.is_err());
         let msg = format!("{}", result.unwrap_err());
         assert!(msg.contains("patch_size"), "expected patch_size mention in error, got: {msg}");
@@ -605,7 +592,7 @@ mod tests {
         let img = prog.alloc_vreg(VRegKind::Ptr, SimdWidth::Scalar);
         let ker = prog.alloc_vreg(VRegKind::Ptr, SimdWidth::Scalar);
         let out = prog.alloc_vreg(VRegKind::Ptr, SimdWidth::Scalar);
-        let result = lower_patch_embed(&mut prog, 14, 0, 3, 224, img, ker, out, QuantPrecision::F32);
+        let result = lower_patch_embed(&mut prog, 14, 0, 3, 224, img, ker, out, QuantPrecision::F32, QuantPrecision::F32);
         assert!(result.is_err());
         let msg = format!("{}", result.unwrap_err());
         assert!(msg.contains("invalid dims"), "expected 'invalid dims' for zero embed_dim, got: {msg}");
@@ -620,7 +607,7 @@ mod tests {
         let img = prog.alloc_vreg(VRegKind::Ptr, SimdWidth::Scalar);
         let ker = prog.alloc_vreg(VRegKind::Ptr, SimdWidth::Scalar);
         let out = prog.alloc_vreg(VRegKind::Ptr, SimdWidth::Scalar);
-        let result = lower_patch_embed(&mut prog, 14, 64, 0, 224, img, ker, out, QuantPrecision::F32);
+        let result = lower_patch_embed(&mut prog, 14, 64, 0, 224, img, ker, out, QuantPrecision::F32, QuantPrecision::F32);
         assert!(result.is_err());
         let msg = format!("{}", result.unwrap_err());
         assert!(msg.contains("invalid dims"), "expected 'invalid dims' for zero in_channels, got: {msg}");
@@ -635,7 +622,7 @@ mod tests {
         let img = prog.alloc_vreg(VRegKind::Ptr, SimdWidth::Scalar);
         let ker = prog.alloc_vreg(VRegKind::Ptr, SimdWidth::Scalar);
         let out = prog.alloc_vreg(VRegKind::Ptr, SimdWidth::Scalar);
-        let result = lower_patch_embed(&mut prog, 14, 64, 3, 0, img, ker, out, QuantPrecision::F32);
+        let result = lower_patch_embed(&mut prog, 14, 64, 3, 0, img, ker, out, QuantPrecision::F32, QuantPrecision::F32);
         assert!(result.is_err());
         let msg = format!("{}", result.unwrap_err());
         assert!(msg.contains("invalid dims"), "expected 'invalid dims' for zero image_size, got: {msg}");
@@ -651,7 +638,7 @@ mod tests {
         let ker = prog.alloc_vreg(VRegKind::Ptr, SimdWidth::Scalar);
         let out = prog.alloc_vreg(VRegKind::Ptr, SimdWidth::Scalar);
         // patch_size=2, embed_dim=4, in_channels=1, image_size=2 → 1 patch, 4 output elements
-        lower_patch_embed(&mut prog, 2, 4, 1, 2, img, ker, out, QuantPrecision::F32).unwrap();
+        lower_patch_embed(&mut prog, 2, 4, 1, 2, img, ker, out, QuantPrecision::F32, QuantPrecision::F32).unwrap();
         prog.validate_structure().expect("structure should be valid");
         prog.validate_provenance().expect("provenance should be valid");
         assert!(!prog.instrs.is_empty(), "expected instructions to be emitted");
@@ -667,11 +654,60 @@ mod tests {
         let ker = prog.alloc_vreg(VRegKind::Ptr, SimdWidth::Scalar);
         let out = prog.alloc_vreg(VRegKind::Ptr, SimdWidth::Scalar);
         // patch_size=4, image_size=4 → num_patches_side=1, single patch
-        lower_patch_embed(&mut prog, 4, 8, 3, 4, img, ker, out, QuantPrecision::F32).unwrap();
+        lower_patch_embed(&mut prog, 4, 8, 3, 4, img, ker, out, QuantPrecision::F32, QuantPrecision::F32).unwrap();
         prog.validate_structure().expect("structure should be valid");
         // Should have 5 nested loops (p_row, p_col, e, c, kr)
         let loop_begins = prog.instrs.iter().filter(|i| matches!(i, VmInstr::LoopBegin { .. })).count();
         assert_eq!(loop_begins, 5, "expected 5 nested loops for p_row/p_col/e/c/kr");
+    }
+
+    // ── BCE-20260630-MIXED-P5: 混合精度 dtype 感知结构断言（三段式）──
+    // @trace TEST-VAE-MIXED-01 [req:REQ-DTYPE-013] [level:unit]
+    #[test]
+    fn lower_patch_embed_mixed_precision_kernel_loads_bf16() {
+        let mut prog = VmProgram::new();
+        let img = prog.alloc_vreg(VRegKind::Ptr, SimdWidth::Scalar);
+        let ker = prog.alloc_vreg(VRegKind::Ptr, SimdWidth::Scalar);
+        let out = prog.alloc_vreg(VRegKind::Ptr, SimdWidth::Scalar);
+        lower_patch_embed(&mut prog, 2, 4, 1, 2, img, ker, out,
+            QuantPrecision::F32, QuantPrecision::BF16).unwrap();
+        prog.validate_structure().expect("structure should be valid");
+        let kernel_bf16_loads = prog.instrs.iter().filter(|i| {
+            matches!(i, VmInstr::VecLoad { base, dtype: QuantPrecision::BF16, .. } if *base == ker)
+        }).count();
+        assert!(kernel_bf16_loads > 0, "expected kernel VecLoad with BF16 dtype (weight mixed precision)");
+        let image_f32_loads = prog.instrs.iter().filter(|i| {
+            matches!(i, VmInstr::VecLoad { base, dtype: QuantPrecision::F32, .. } if *base == img)
+        }).count();
+        assert!(image_f32_loads > 0, "expected image VecLoad with F32 dtype (input activation)");
+        let patches_f32_stores = prog.instrs.iter().filter(|i| {
+            matches!(i, VmInstr::VecStore { base, dtype: QuantPrecision::F32, .. } if *base == out)
+        }).count();
+        assert!(patches_f32_stores > 0, "expected patches VecStore with F32 dtype (output = input_dtype)");
+        let kernel_f32_loads = prog.instrs.iter().filter(|i| {
+            matches!(i, VmInstr::VecLoad { base, dtype: QuantPrecision::F32, .. } if *base == ker)
+        }).count();
+        assert_eq!(kernel_f32_loads, 0, "kernel VecLoad must NOT use F32 — weight is BF16 (ARCH-BLOB-YIELDS-WEIGHT)");
+    }
+
+    // @trace TEST-VAE-MIXED-02 [req:REQ-DTYPE-013] [level:unit]
+    #[test]
+    fn lower_patch_embed_homogeneous_f32_all_loads_f32() {
+        let mut prog = VmProgram::new();
+        let img = prog.alloc_vreg(VRegKind::Ptr, SimdWidth::Scalar);
+        let ker = prog.alloc_vreg(VRegKind::Ptr, SimdWidth::Scalar);
+        let out = prog.alloc_vreg(VRegKind::Ptr, SimdWidth::Scalar);
+        lower_patch_embed(&mut prog, 2, 4, 1, 2, img, ker, out,
+            QuantPrecision::F32, QuantPrecision::F32).unwrap();
+        prog.validate_structure().expect("structure should be valid");
+        let all_loads_f32 = prog.instrs.iter().filter(|i| {
+            matches!(i, VmInstr::VecLoad { dtype: QuantPrecision::F32, .. })
+        }).count();
+        let any_non_f32_load = prog.instrs.iter().any(|i| {
+            matches!(i, VmInstr::VecLoad { dtype, .. } if *dtype != QuantPrecision::F32)
+        });
+        assert!(all_loads_f32 > 0, "expected F32 VecLoads for homogeneous F32 model");
+        assert!(!any_non_f32_load, "homogeneous F32 must not emit non-F32 loads");
     }
 
     // ── emit_zero_fill_bytes: non-aligned total produces tail ──

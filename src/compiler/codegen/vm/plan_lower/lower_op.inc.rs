@@ -494,9 +494,15 @@ pub(crate) fn lower_op(
                 return Err(CompilerError::CodegenViolation(format!(
                     "DepthwiseConv1D: 签名与 dwc_req 不一致")));
             }
+            // BCE-20260630-MIXED-P5 (三段式 dtype): input=x(激活)→op_input_dtype, weight=conv kernel→inputs[1].dtype
+            let input_dtype = op_input_dtype(op, graph);
+            let weight_dtype = op.inputs.get(1)
+                .and_then(|&tid| graph.tensor(tid))
+                .map(|t| t.dtype.to_quant_precision())
+                .unwrap_or(input_dtype);
             super::vision_audio_emit::lower_depthwise_conv1d(
                 prog, op, graph, ctx.session.width, channels, kernel_size, causal,
-                ctx.session.sym_map, resolver, abi, req, ctx.dtype,
+                ctx.session.sym_map, resolver, abi, req, input_dtype, weight_dtype,
             )?;
             Ok(true)
         }
@@ -511,9 +517,15 @@ pub(crate) fn lower_op(
             let patches_ptr = resolver.materialize(prog, op.outputs[0], abi).ok_or_else(|| {
                 CompilerError::CodegenViolation(format!("PatchEmbed op {:?}: output 无法 materialize", op.id))
             })?;
+            // BCE-20260630-MIXED-P5 (三段式 dtype): input=image(激活)→op_input_dtype, weight=vision kernel→inputs[1].dtype
+            let input_dtype = op_input_dtype(op, graph);
+            let weight_dtype = op.inputs.get(1)
+                .and_then(|&tid| graph.tensor(tid))
+                .map(|t| t.dtype.to_quant_precision())
+                .unwrap_or(input_dtype);
             super::vision_audio_emit::lower_patch_embed(
                 prog, patch_size, embed_dim, in_channels, image_size,
-                image_ptr, kernel_ptr, patches_ptr, ctx.dtype,
+                image_ptr, kernel_ptr, patches_ptr, input_dtype, weight_dtype,
             )?;
             Ok(true)
         }
