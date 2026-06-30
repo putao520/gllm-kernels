@@ -777,7 +777,9 @@ pub enum TraceOp {
     TileConfig { rows: usize, cols: usize },
 
     /// Tile matrix multiply-accumulate: c += a × b (AMX/SME2/GPU).
-    TileMma { c: ValueId, a: ValueId, b: ValueId },
+    /// shape: a=m×k, b=k×n, c=m×n (CR-TIER-SOVEREIGNTY-004, 透传给 VmInstr::TileMma)。
+    /// dtype 由 auto_select 从 graph tensor 推断注入 VmInstr (同 TileConfig 模式)。
+    TileMma { c: ValueId, a: ValueId, b: ValueId, m: usize, n: usize, k: usize },
 
     /// Release hardware tile resources.
     TileRelease,
@@ -1405,7 +1407,7 @@ impl TraceOp {
             TraceOp::Fma(a, b, c)
             | TraceOp::ConditionalBranch(a, b, c)
             | TraceOp::QuantDequantFma { acc: a, a: b, b: c }
-            | TraceOp::TileMma { c: a, a: b, b: c } => {
+            | TraceOp::TileMma { c: a, a: b, b: c, m: _, n: _, k: _ } => {
                 f(*a); f(*b); f(*c);
             }
 
@@ -1624,7 +1626,8 @@ impl TraceOp {
                 TraceOp::AsyncCopyToShared { name, src_offset: m(src_offset), bytes },
             TraceOp::Tma2DCopy { desc, coord_x, coord_y, bytes } =>
                 TraceOp::Tma2DCopy { desc, coord_x: m(coord_x), coord_y: m(coord_y), bytes },
-            TraceOp::TileMma { c, a, b } => TraceOp::TileMma { c: m(c), a: m(a), b: m(b) },
+            TraceOp::TileMma { c, a, b, m: mm, n: nn, k: kk } =>
+                TraceOp::TileMma { c: m(c), a: m(a), b: m(b), m: mm, n: nn, k: kk },
             TraceOp::Softmax { src, dst } => TraceOp::Softmax { src: m(src), dst: m(dst) },
 
             // MTP Draft structural (no ValueId fields)

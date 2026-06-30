@@ -296,21 +296,70 @@ pub enum VmInstr {
         action: GprBranchAction,
     },
 
-    // ── Tile/Matrix 操作 ──
+    // ── Tile/Matrix 操作 (数据流完整版, CR-TIER-SOVEREIGNTY-004) ──
 
-    /// 配置 tile 寄存器 (AMX TILECFG / SME SMSTART)
+    /// 配置 tile 寄存器 (AMX TILECFG / SME SMSTART / GPU fragment decl)。不变。
     TileConfig {
         rows: usize,
         cols: usize,
         dtype: DType,
     },
-    /// Tile MMA: c += a × b
+
+    /// 把内存中的 2D 矩阵块加载进 tile vreg。
+    ///
+    /// 语义: `dst_tile[r][col] = mem[base_ptr + k_offset + r*row_stride + col*elem_bytes]`
+    ///   for r in 0..rows, col in 0..cols
+    ///
+    /// 寻址关键约束 (R1 决定性风险):
+    /// - `k_offset` (K 循环偏移, 循环变量推进 base) 与 `row_stride` (2D tile 内逐行字节跨度)
+    ///   是两个独立量, 禁止合并成单一 offset。合并 → x86 TILELOADD 误寻址, 数值全错。
+    /// - x86 AMX 物理映射: base_ptr→rsi(A)/rdx(B), k_offset→循环变量加到 base,
+    ///   row_stride→rdi (stride reg)。
+    ///
+    /// @trace REQ-HW-TIER-007 [req:VmInstr-TileLoad] tile 数据加载进 IR, 消除 lowering 硬编码寻址
+    TileLoad {
+        dst_tile: VRegId,
+        base_ptr: VRegId,
+        k_offset: VRegId,
+        row_stride: usize,
+        rows: usize,
+        cols: usize,
+        dtype: DType,
+    },
+
+    /// Tile MMA: c += a × b, 带完整 shape 让解释器跑 host FMA 累加。
+    ///
+    /// 形状: a:m×k, b:k×n, c:m×n。dtype 为输入精度, 决定 round-trip 窄化 (R4)。
+    /// 累加器 (AMX/TC) 为 F32, 输入按 dtype 窄化模拟硬件精度。
+    ///
+    /// @trace REQ-HW-TIER-008 [req:VmInstr-TileMma-Shape] TileMma 携带 shape, 解释器可模拟累加语义
     TileMma {
         c: VRegId,
         a: VRegId,
         b: VRegId,
+        m: usize,
+        n: usize,
+        k: usize,
+        dtype: DType,
     },
-    /// 释放 tile 资源
+
+    /// 把 tile vreg 结果写回内存。
+    ///
+    /// 语义: `mem[base_ptr + out_offset + r*row_stride + col*elem_bytes] = src_tile[r][col]`
+    ///   for r in 0..rows, col in 0..cols
+    ///
+    /// @trace REQ-HW-TIER-009 [req:VmInstr-TileStore] tile 结果写回进 IR
+    TileStore {
+        src_tile: VRegId,
+        base_ptr: VRegId,
+        out_offset: VRegId,
+        row_stride: usize,
+        rows: usize,
+        cols: usize,
+        dtype: DType,
+    },
+
+    /// 释放 tile 资源。不变。
     TileRelease,
 
     /// SPARSE_MASK_INTERSECT: 稀疏掩码硬件交集 (AVX-512 / Granite Rapids+)
