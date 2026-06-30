@@ -2,7 +2,7 @@
 //!
 //! 所有算术 VmInstr 发射已迁移至 auto_select.rs (auto_lower_trace_raw)。
 //! 本文件保留:
-//! - computation_elem_bytes / row_stride_bytes: 纯工具函数
+//! - computation_elem_bytes: dtype 参数化的纯工具函数
 //! - lower_trace_body_compat: 委托 auto_lower_trace 的兼容包装 (8 处生产调用: gemm_emit + pipeline.inc)
 //! - lower_qtap_stg: Q-Tap ring buffer 写入 (纯控制流+内存操作, 零算术 VmInstr)
 //!
@@ -28,12 +28,6 @@ use crate::types::{CompilerError, DType};
 #[inline]
 pub fn computation_elem_bytes(dtype: QuantPrecision) -> usize {
     dtype.elem_bytes()
-}
-
-/// Row-major 张量行步长（字节数）: 最内层维度大小 × elem_bytes(dtype)。
-#[inline]
-pub fn row_stride_bytes(inner_dim: usize, dtype: QuantPrecision) -> usize {
-    inner_dim * computation_elem_bytes(dtype)
 }
 
 /// 兼容入口: primary + Option<secondary> → &[VRegId]。
@@ -284,38 +278,6 @@ mod tests {
         let bytes = computation_elem_bytes(QuantPrecision::F32);
         // Assert: must always equal std::mem::size_of::<f32>()
         assert_eq!(bytes, std::mem::size_of::<f32>());
-    }
-
-    // ── row_stride_bytes ──
-
-    #[test]
-    fn row_stride_bytes_inner_dim_1() {
-        // Arrange
-        let inner_dim = 1;
-        // Act
-        let stride = row_stride_bytes(inner_dim, QuantPrecision::F32);
-        // Assert: 1 * 4 = 4
-        assert_eq!(stride, 4);
-    }
-
-    #[test]
-    fn row_stride_bytes_inner_dim_256() {
-        // Arrange
-        let inner_dim = 256;
-        // Act
-        let stride = row_stride_bytes(inner_dim, QuantPrecision::F32);
-        // Assert: 256 * 4 = 1024
-        assert_eq!(stride, 1024);
-    }
-
-    #[test]
-    fn row_stride_bytes_inner_dim_0() {
-        // Arrange
-        let inner_dim = 0;
-        // Act
-        let stride = row_stride_bytes(inner_dim, QuantPrecision::F32);
-        // Assert: 0 * 4 = 0
-        assert_eq!(stride, 0);
     }
 
     // ── lower_qtap_stg validation errors ──
@@ -609,12 +571,6 @@ mod tests {
     }
 
     // ── Additional tests ──────────────────────────────────────────────
-
-    #[test]
-    fn row_stride_bytes_large_inner_dim() {
-        let stride = row_stride_bytes(16384, QuantPrecision::F32);
-        assert_eq!(stride, 65536); // 16384 * 4
-    }
 
     #[test]
     fn computation_elem_bytes_is_constexpr_f32() {

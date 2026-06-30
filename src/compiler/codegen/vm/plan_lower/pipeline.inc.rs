@@ -986,7 +986,7 @@ pub(crate) fn emit_elementwise_inline(
         .max(1);
     let feature_vecs = feature_dim / lanes;
     let step_bytes = width.bytes();
-    // ARCH-DATA-FLOW-CONTRACT §2.3: 行字节数来自 row_stride_bytes，不手工乘 elem
+    // ARCH-DATA-FLOW-CONTRACT §2.3: 行字节数 = feature_dim × dtype.elem_bytes()（dtype 参数化，不硬编码）
     let row_bytes = feature_dim * dtype.elem_bytes();
 
     // 是否有 Symbolic 外层维度
