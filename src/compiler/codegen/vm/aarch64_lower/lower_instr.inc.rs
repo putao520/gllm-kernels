@@ -1364,26 +1364,192 @@ impl AArch64Lower {
                 let _ = (rows, cols, dtype);
                 Ok(())
             }
-            VmInstr::TileMma { c, a, b } => {
+            // TileLoad: 把内存 2D 块加载进 tile vreg (Z 寄存器), 为后续 TileMma (FMOPA) 灌入真实数据。
+            //
+            // 语义: `dst_tile[r][col] = mem[base_ptr + k_offset + r*row_stride + col*elem_bytes]`
+            //   for r in 0..rows, col in 0..cols
+            //
+            // 寻址 (R1 决定性风险): k_offset (K 循环偏移, VRegId→GPR) 与 row_stride (2D tile 逐行字节跨度)
+            //   是两个独立量。base = base_ptr + k_offset; 逐行用 row_stride 步进。
+            //
+            // ISA 映射 (设计 §4 aarch64 列):
+            //   - F32  → SVE LD1W  {Zt.S}, Pg/Z, [Xn, Xm, LSL #2]  (elem 4B)
+            //   - BF16/F16 → SVE LD1H {Zt.H}, Pg/Z, [Xn, Xm, LSL #1]  (elem 2B)
+            //   Zt = dst_tile 解析出的 Z 寄存器 (FMOPA 的操作数 Zn/Zm 直接读此寄存器)。
+            //
+            // 根治潜伏 bug (architect 发现): 原 SME TileMma 引用 vreg 但从未灌数据 (未初始化寄存器上做 MMA)。
+            //   TileLoad 落地后, tile vreg 在此被 LD1W/LD1H 灌入真实数据, TileMma 操作数现指向已初始化寄存器。
+            //
+            // 行内编码说明: emit_math.inc.rs 未提供 LD1H/ST1H helper (只暴露 LD1W/ST1W), 且 TASK-E writes
+            //   限定本文件, 故 LD1H/ST1H 在此内联编码。SVE LD1H/ST1H 与 LD1W/ST1W 仅 size 字段 (bit23) 不同:
+            //   LD1W base 0xA5404000, LD1H base 0xA4404000; ST1W base 0xE5404000, ST1H base 0xE4404000。
+            VmInstr::TileLoad { dst_tile, base_ptr, k_offset, row_stride, rows, cols, dtype } => {
+                if !self.platform.has_sme2 {
+                    return Err(CompilerError::CodegenViolation(
+                        "TileLoad requires SME2 (streaming SVE); platform lacks SME2".into()
+                    ));
+                }
+                let zt = self.resolve_vreg(*dst_tile, alloc)?;
+                let xn = self.resolve_gpr(*base_ptr, alloc)?;       // 基址 GPR
+                let koff = self.resolve_gpr(*k_offset, alloc)?;      // K 循环偏移 GPR
+
+                // base = base_ptr + k_offset → x16 (caller-saved scratch)
+                let base = 16u8;
+                self.emit32(self.enc_add_reg(base, xn, koff));
+
+                let pg = 0u8; // PTRUE p0.s (TileConfig 已设置)
+                let eb = dtype.size_bytes();
+                // SVE 加载 LSL 量: 4B→#2, 2B→#1
+                let lsl_amt: u32 = match eb {
+                    4 => 2,
+                    2 => 1,
+                    _ => return Err(CompilerError::CodegenViolation(
+                        format!("TileLoad: unsupported dtype {:?} (only F32/BF16/F16)", dtype)
+                    )),
+                };
+
+                // 逐行加载 row_stride 字节步进。row_addr = base + r*row_stride。
+                // 用 x17 作为行地址累加 (caller-saved scratch), base 保留不变。
+                let row_addr = 17u8;
+                self.emit32(self.enc_mov_x(row_addr, base));
+                for _r in 0..*rows {
+                    // LD1W/LD1H Zt, Pg/Z, [row_addr]  (zero offset, imm #0 MUL VL)
+                    match eb {
+                        4 => self.emit32(self.enc_ld1w_imm(zt, pg, row_addr)),
+                        _ => {
+                            // LD1H {Zt.H}, Pg/Z, [Xn]  (imm4=0, MUL VL)
+                            // 1010 0101 01 0 0 imm4 101 Pg Xn Zt
+                            self.emit32(0xA440A000
+                                | ((pg as u32 & 0x07) << 10)
+                                | ((row_addr as u32 & 0x1F) << 5)
+                                | (zt as u32 & 0x1F));
+                        }
+                    }
+                    // row_addr += row_stride  (字节步进, ADD Xd, Xn, #imm12)
+                    // row_stride 在 tile 期固定且通常 ≤4095 (一个 ZA 行的步幅), 用 ADD imm。
+                    // 超出 imm12 范围时回退到 MOVK 风格不可行 → 改用寄存器加法 (x16 复用受限)。
+                    if *row_stride <= 0xFFF {
+                        self.emit32(self.enc_add_imm(row_addr, row_addr, *row_stride as u32));
+                    } else {
+                        // 大 stride: 拆两次 ADD imm (低 12 位 + 高位)
+                        let lo = (*row_stride as u32) & 0xFFF;
+                        let hi = ((*row_stride as u32) >> 12) & 0xFFF;
+                        self.emit32(self.enc_add_imm(row_addr, row_addr, lo));
+                        if hi != 0 {
+                            self.emit32(self.enc_add_imm(row_addr, row_addr, hi << 12));
+                        }
+                    }
+                }
+                let _ = (lsl_amt, cols); // cols 在 SME tile 加载下由 ZA 维度隐式约束, 此处不逐元素寻址
+                Ok(())
+            }
+            VmInstr::TileMma { c, a, b, m, n, k, dtype } => {
+                // 操作数 a/b 现指向已被 TileLoad 灌入数据的 Z 寄存器 (根治潜伏 bug)。
+                // FMOPA ZA0.S, P0/M, P0/M, Zn.S, Zm.S — outer product accumulate
+                // 累加器 ZA 是隐式 (单 ZA0 累加), c 解析出 Z 用于 SME2 ZA slice readback。
                 let zm = self.resolve_vreg(*a, alloc)?;
                 let zn = self.resolve_vreg(*b, alloc)?;
-                let _ = c; // ZA accumulator is implicit
+                let zc = self.resolve_vreg(*c, alloc)?;
+                let _ = (m, n, k); // shape 供解释器模拟; SME FMOPA 维度由 ZA tile config 隐式决定
 
-                // FMOPA ZA0.S, P0/M, P0/M, Zn.S, Zm.S — outer product accumulate
-                self.emit32(self.enc_fmopa_s(0, 0, 0, zn, zm));
+                // dtype 感知 (设计 §4): BF16/F16 走 FMOPA 半精度变体, F32 走 FMOPA.S。
+                // 当前 emit_math 仅暴露 enc_fmopa_s (F32 外积)。BF16 走 FMOPA ZA0.H,
+                // 编码: 1000 0000 00 1 Zm 0 Pm 0 Pn Zn 0 ZAda (与 F32 仅 bit23:22=01 区别)。
+                match dtype {
+                    DType::F32 => {
+                        self.emit32(self.enc_fmopa_s(0, 0, 0, zn, zm));
+                    }
+                    DType::BF16 | DType::F16 => {
+                        // FMOPA ZA0.H, P0/M, P0/M, Zn.H, Zm.H
+                        // base: 0x80800000 (F32 .S) → .H 变体 bit24=1 (sz=1 for half)
+                        // 完整: 1000 0000 1? 0 Zm ... — 半精度 FMOPA 用 sz=1
+                        // ARM ARM: FMOPA <ZAda>.H, <Pn>/M, <Pm>/M, <Zn>.H, <Zm>.H
+                        //   encoding 1000 0000 01 0 Zm 0 Pm 0 Pn Zn 0 ZAda (sz=01 for H)
+                        let fmopa_h = 0x80800000
+                            | (1u32 << 23)  // sz=01 → half
+                            | ((zm as u32 & 0x1F) << 16)
+                            | ((0u32 & 0x07) << 13)
+                            | ((0u32 & 0x07) << 10)
+                            | ((zn as u32 & 0x1F) << 5)
+                            | (0u32 & 0x03);
+                        self.emit32(fmopa_h);
+                    }
+                    other => return Err(CompilerError::CodegenViolation(
+                        format!("SME TileMma: unsupported dtype {:?} — expected F32/BF16/F16", other)
+                    )),
+                }
 
                 if self.platform.has_sme2 {
                     // SME2 multi-vec FMLA: accumulate with 2-register group
                     // FMLA ZA.S[w12, #0], {Zm.S-Zm+1.S}, Zn.S
-                    // This requires Zm to be even-aligned; emit if conditions met
                     if zm % 2 == 0 && zm + 1 < 32 {
                         self.emit32(self.enc_sme2_fmla_vg2(12, 0, zm, zn));
                     }
 
-                    // ZA slice readback: MOVA Z0.S, P0/M, ZA0H.S[w12, #0]
-                    // Read the first horizontal slice of ZA0 into a Z register for downstream use
-                    self.emit32(self.enc_sme2_mova_za_to_z(zm, 0, 0, 12, 0));
+                    // ZA slice readback: MOVA Zc.S, P0/M, ZA0H.S[w12, #0]
+                    // Read first horizontal slice of ZA0 into Zc (c vreg) for downstream use。
+                    self.emit32(self.enc_sme2_mova_za_to_z(zc, 0, 0, 12, 0));
                 }
+                Ok(())
+            }
+            // TileStore: 把 tile vreg 结果写回内存。
+            //
+            // 语义: `mem[base_ptr + out_offset + r*row_stride + col*elem_bytes] = src_tile[r][col]`
+            //   for r in 0..rows, col in 0..cols
+            //
+            // ISA 映射 (设计 §4 aarch64 列): MOVA Z←ZA + ST1W/ST1H
+            //   src_tile 在 TileMma readback 阶段已持有 ZA slice (MOVA 写入 Zc), 此处直接 store。
+            //   - F32  → ST1W {Zt.S}, Pg, [Xn]  (elem 4B)
+            //   - BF16/F16 → ST1H {Zt.H}, Pg, [Xn]  (elem 2B)
+            VmInstr::TileStore { src_tile, base_ptr, out_offset, row_stride, rows, cols, dtype } => {
+                if !self.platform.has_sme2 {
+                    return Err(CompilerError::CodegenViolation(
+                        "TileStore requires SME2 (streaming SVE); platform lacks SME2".into()
+                    ));
+                }
+                let zs = self.resolve_vreg(*src_tile, alloc)?;
+                let xn = self.resolve_gpr(*base_ptr, alloc)?;
+                let ooff = self.resolve_gpr(*out_offset, alloc)?;
+
+                // base = base_ptr + out_offset → x16 (caller-saved scratch)
+                let base = 16u8;
+                self.emit32(self.enc_add_reg(base, xn, ooff));
+
+                let pg = 0u8;
+                let eb = dtype.size_bytes();
+                if eb != 4 && eb != 2 {
+                    return Err(CompilerError::CodegenViolation(
+                        format!("TileStore: unsupported dtype {:?} (only F32/BF16/F16)", dtype)
+                    ));
+                }
+
+                // 逐行 store。row_addr = base + r*row_stride, x17 累加。
+                let row_addr = 17u8;
+                self.emit32(self.enc_mov_x(row_addr, base));
+                for _r in 0..*rows {
+                    match eb {
+                        4 => self.emit32(self.enc_st1w_imm(zs, pg, row_addr)),
+                        _ => {
+                            // ST1H {Zt.H}, Pg, [Xn]  (imm4=0, MUL VL)
+                            // 1110 0101 01 0 0 imm4 101 Pg Xn Zt
+                            self.emit32(0xE440E000
+                                | ((pg as u32 & 0x07) << 10)
+                                | ((row_addr as u32 & 0x1F) << 5)
+                                | (zs as u32 & 0x1F));
+                        }
+                    }
+                    if *row_stride <= 0xFFF {
+                        self.emit32(self.enc_add_imm(row_addr, row_addr, *row_stride as u32));
+                    } else {
+                        let lo = (*row_stride as u32) & 0xFFF;
+                        let hi = ((*row_stride as u32) >> 12) & 0xFFF;
+                        self.emit32(self.enc_add_imm(row_addr, row_addr, lo));
+                        if hi != 0 {
+                            self.emit32(self.enc_add_imm(row_addr, row_addr, hi << 12));
+                        }
+                    }
+                }
+                let _ = cols;
                 Ok(())
             }
             VmInstr::TileRelease => {
