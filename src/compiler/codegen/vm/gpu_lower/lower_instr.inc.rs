@@ -559,8 +559,20 @@ impl GpuLower {
                         };
                         let _ = (m, n, k);
                         if gfx_arch >= 950 {
-                            // ── gfx950 CDNA4: MFMA v2 32×32×16 ──
-                            self.emit_line(&format!("{mfma_op}_32 {vc}, {va}, {vb}, {vc};  // §gfx950 {mfma_shape}"));
+                            // ── gfx950 CDNA4: MFMA v2 ──
+                            // BCE-20260630-GFX950-MFMA-V2-NAMING 根治:
+                            // v2 指令名 shape 整串嵌在名中 (非 v1 base + _32 后缀派生)。
+                            // F32(tf32) shape=32x32x8, U8=32x32x32 (精度驱动 K 维, 非 16)。
+                            let mfma_v2 = match dtype {
+                                crate::types::DType::F16  => "v_mfma_f32_32x32x16_f16",
+                                crate::types::DType::BF16 => "v_mfma_f32_32x32x16_bf16",
+                                crate::types::DType::F8E4M3 | crate::types::DType::F8E5M2 => "v_mfma_f32_32x32x16_fp8",
+                                crate::types::DType::F32 => "v_mfma_f32_32x32x8_tf32",
+                                crate::types::DType::U8 => "v_mfma_i32_32x32x32_i8",
+                                // F6/F4 (CDNA4 sub-byte): 退化为 fp8 通道, 上层打包。
+                                _ => "v_mfma_f32_32x32x16_fp8",
+                            };
+                            self.emit_line(&format!("{mfma_v2} {vc}, {va}, {vb}, {vc};  // §gfx950 MFMA v2 32x32x16"));
                         } else if gfx_arch >= 908 {
                             // ── gfx908+ CDNA2/3: MFMA v1 16×16×16 ──
                             self.emit_line(&format!("{mfma_op} {vc}, {va}, {vb}, {vc};  // §gfx908 {mfma_shape}"));
