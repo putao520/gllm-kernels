@@ -1393,8 +1393,8 @@ impl NumericalSimulator {
                 Ok(Some(id))
             }
 
-            // ── TileMma (标量模拟: 标量 FMA) ──
-            TraceOp::TileMma { c, a, b } => {
+            // ── TileMma (标量模拟: 标量 FMA; shape m/n/k 仅用于 VmInstr 透传, 标量模拟忽略) ──
+            TraceOp::TileMma { c, a, b, m: _, n: _, k: _ } => {
                 let c_val = state.get(*c).as_float()?;
                 let a_val = state.get(*a).as_float()?;
                 let b_val = state.get(*b).as_float()?;
@@ -1501,6 +1501,26 @@ use crate::compiler::trace::QuantPrecision;
 /// 标量寄存器 (SimdWidth::Scalar) 用单元素 Vec。
 type RegValue = Vec<f32>;
 
+/// tile vreg 的值 = 2D 矩阵块 (row-major f32 累加器)。
+///
+/// 解释器统一以 f32 累加 (AMX/Tensor Core 累加器均为 F32),
+/// 输入精度 (BF16/F16) 通过 round-trip 窄化在 TileMma 内模拟。
+/// `data[r * cols + c]` 为第 r 行第 c 列元素。
+///
+/// @trace REQ-HW-TIER-007 [req:VmInstr-TileLoad] tile 值模型, 解释器侧 2D 矩阵块表示
+#[derive(Debug, Clone)]
+struct TileVal {
+    rows: usize,
+    cols: usize,
+    data: Vec<f32>,
+}
+
+impl TileVal {
+    fn zeros(rows: usize, cols: usize) -> Self {
+        Self { rows, cols, data: vec![0.0; rows * cols] }
+    }
+}
+
 /// 解释器状态。
 pub struct VmInterpState {
     /// VRegId → 寄存器值 (f32 lanes)。
@@ -1514,6 +1534,8 @@ pub struct VmInterpState {
     buffers: HashMap<String, Vec<u8>>,
     /// ptr VRegId → 缓冲区名 (解释器侧的指针解析)。
     ptr_names: HashMap<VRegId, String>,
+    /// tile vreg VRegId → 2D 矩阵块值 (TileLoad 写入, TileMma 累加, TileStore 读取)。
+    tile_regs: HashMap<VRegId, TileVal>,
 }
 
 impl VmInterpState {
@@ -1524,6 +1546,7 @@ impl VmInterpState {
             loop_byte_offsets: HashMap::new(),
             buffers: HashMap::new(),
             ptr_names: HashMap::new(),
+            tile_regs: HashMap::new(),
         }
     }
 
@@ -1554,6 +1577,23 @@ impl VmInterpState {
     /// 绑定 ptr VReg → 缓冲区名。
     fn bind_ptr(&mut self, v: VRegId, name: &str) {
         self.ptr_names.insert(v, name.to_string());
+    }
+
+    /// 解析 TileLoad/TileStore 的字节偏移 VReg (k_offset / out_offset)。
+    ///
+    /// 这些 VReg 是 emit_loop 分配的 byte_offset VReg (VRegKind::ByteOffset),
+    /// 其值存于 loop_byte_offsets (= counter × step_bytes), 不在 regs 中。
+    /// 优先取 loop_byte_offsets, 回退 loop_counters (取迭代索引, 兼容),
+    /// 再回退 get_scalar (兼容静态偏移存于标量寄存器的场景)。
+    fn resolve_byte_offset(&self, v: VRegId) -> Result<i64, CompilerError> {
+        if let Some(bo) = self.loop_byte_offsets.get(&v) {
+            return Ok(*bo);
+        }
+        if let Some(ct) = self.loop_counters.get(&v) {
+            return Ok(*ct);
+        }
+        // 兼容: 偏移量以标量形式存于普通寄存器 (非循环绑定)。
+        Ok(self.get_scalar(v)? as i64)
     }
 }
 
@@ -1852,14 +1892,115 @@ fn exec_vm_instr(
             Ok(())
         }
 
-        // ── Tile 路径 (AMX/SME/TC): 解释器把 TileMma 当作语义标量 GEMM 标记 ──
-        // TileConfig/TileRelease 在解释器侧是 NOP (tile 寄存器是抽象资源)。
-        // TileMma { c, a, b }: c += a × b — 但 tile 的形状/累加语义由 emit_tile_gemm
-        // 决定, 解释器无法从指令恢复。跨等级等价验证聚焦 GemmFmaBlis/GemmScalar
-        // (naive FMA 路径), tile 路径用结构测试覆盖 (见 gemm_impls.rs tests)。
+        // ── Tile 路径 (AMX/SME/TC): 2D tile 值模型 + host FMA 累加 ──
+        // TileConfig/TileRelease 在解释器侧是 NOP (tile 寄存器是抽象资源, 无数值语义)。
+        // TileLoad/TileMma/TileStore 携带完整 shape, 解释器按 host FMA 模拟累加语义,
+        // 输入按 dtype round-trip 窄化 (R4), 累加器始终 F32 (AMX/TC 累加器为 F32)。
         VmInstr::TileConfig { .. } | VmInstr::TileRelease => Ok(()),
 
-        VmInstr::TileMma { .. } => Ok(()), // tile 累加语义解释器侧不模拟 (见上)
+        VmInstr::TileLoad { dst_tile, base_ptr, k_offset, row_stride, rows, cols, dtype } => {
+            // 语义: dst_tile[r][c] = mem[base_ptr + k_offset + r*row_stride + c*elem_bytes]
+            let buf_name = state.ptr_names.get(base_ptr).cloned().ok_or_else(|| {
+                CompilerError::CodegenViolation(format!(
+                    "VmInterp: TileLoad base v{} not bound", base_ptr.0
+                ))
+            })?;
+            let base_off = state.resolve_byte_offset(*k_offset)? as usize;
+            let qp = dtype.to_quant_precision();
+            let eb = dtype.size_bytes();
+            let mut data = Vec::with_capacity(rows * cols);
+            for r in 0..*rows {
+                for c in 0..*cols {
+                    let byte_off = base_off + r * row_stride + c * eb;
+                    // 按 dtype 解码字节 → f32, 然后做 round-trip 窄化 (R4) 模拟硬件精度。
+                    let v = load_elem_from_buffer(state, &buf_name, byte_off, qp)?;
+                    let narrowed = narrow_to_dtype(v, qp);
+                    data.push(narrowed);
+                }
+            }
+            state.tile_regs.insert(*dst_tile, TileVal { rows: *rows, cols: *cols, data });
+            Ok(())
+        }
+
+        VmInstr::TileMma { c, a, b, m, n, k, dtype } => {
+            // 语义: c[m][n] += sum_k a[m][k] × b[k][n], F32 累加器, 输入按 dtype 窄化。
+            let qp = dtype.to_quant_precision();
+            // 取 a (m×k) 与 b (k×n)。先克隆以避免与 c 的可变借用冲突 (c 可能等于 a/b 的别名场景下需独立拷贝)。
+            let ta = state.tile_regs.get(a).cloned().ok_or_else(|| {
+                CompilerError::CodegenViolation(format!(
+                    "VmInterp: TileMma a v{} not loaded (use TileLoad first)", a.0
+                ))
+            })?;
+            let tb = state.tile_regs.get(b).cloned().ok_or_else(|| {
+                CompilerError::CodegenViolation(format!(
+                    "VmInterp: TileMma b v{} not loaded (use TileLoad first)", b.0
+                ))
+            })?;
+            // 形状校验: a 为 m×k, b 为 k×n。
+            if ta.rows != *m || ta.cols != *k {
+                return Err(CompilerError::CodegenViolation(format!(
+                    "VmInterp: TileMma a shape {}x{} != {}x{}", ta.rows, ta.cols, m, k
+                )));
+            }
+            if tb.rows != *k || tb.cols != *n {
+                return Err(CompilerError::CodegenViolation(format!(
+                    "VmInterp: TileMma b shape {}x{} != {}x{}", tb.rows, tb.cols, k, n
+                )));
+            }
+            // 取/初始化 c (m×n)。累加器 F32, 复用已有 tile 值 (跨 K 块累加), 不存在则 zeros。
+            let tc = state
+                .tile_regs
+                .entry(*c)
+                .or_insert_with(|| TileVal::zeros(*m, *n));
+            if tc.rows != *m || tc.cols != *n {
+                return Err(CompilerError::CodegenViolation(format!(
+                    "VmInterp: TileMma c shape {}x{} != {}x{}", tc.rows, tc.cols, m, n
+                )));
+            }
+            for i in 0..*m {
+                for j in 0..*n {
+                    let mut acc = tc.data[i * n + j];
+                    for kk in 0..*k {
+                        let av = narrow_to_dtype(ta.data[i * k + kk], qp);
+                        let bv = narrow_to_dtype(tb.data[kk * n + j], qp);
+                        acc += av * bv; // F32 累加 (AMX/TC 累加器为 F32)
+                    }
+                    tc.data[i * n + j] = acc;
+                }
+            }
+            Ok(())
+        }
+
+        VmInstr::TileStore { src_tile, base_ptr, out_offset, row_stride, rows, cols, dtype } => {
+            // 语义: mem[base_ptr + out_offset + r*row_stride + c*elem_bytes] = src_tile[r][c]
+            let tile = state.tile_regs.get(src_tile).cloned().ok_or_else(|| {
+                CompilerError::CodegenViolation(format!(
+                    "VmInterp: TileStore src v{} not computed (use TileMma first)", src_tile.0
+                ))
+            })?;
+            if tile.rows != *rows || tile.cols != *cols {
+                return Err(CompilerError::CodegenViolation(format!(
+                    "VmInterp: TileStore src shape {}x{} != {}x{}",
+                    tile.rows, tile.cols, rows, cols
+                )));
+            }
+            let buf_name = state.ptr_names.get(base_ptr).cloned().ok_or_else(|| {
+                CompilerError::CodegenViolation(format!(
+                    "VmInterp: TileStore base v{} not bound", base_ptr.0
+                ))
+            })?;
+            let off = state.resolve_byte_offset(*out_offset)? as usize;
+            let qp = dtype.to_quant_precision();
+            let eb = dtype.size_bytes();
+            for r in 0..*rows {
+                for c in 0..*cols {
+                    // 写回时按 dtype round-trip 窄化 (存储精度)。
+                    let v = narrow_to_dtype(tile.data[r * cols + c], qp);
+                    store_elem_to_buffer(state, &buf_name, off + r * row_stride + c * eb, v, qp)?;
+                }
+            }
+            Ok(())
+        }
 
         // ── 不在 GEMM-FMA 路径的指令: 报错 (NO-SILENT-FALLBACK) ──
         _ => Err(CompilerError::CodegenViolation(format!(
@@ -3176,7 +3317,7 @@ mod tests {
 
         let desc = test_quant_desc();
         let result = sim.exec_op(
-            &TraceOp::TileMma { c: ValueId(0), a: ValueId(1), b: ValueId(2) },
+            &TraceOp::TileMma { c: ValueId(0), a: ValueId(1), b: ValueId(2), m: 1, n: 1, k: 1 },
             &mut state, &desc,
         );
         let id = result.unwrap().unwrap();
