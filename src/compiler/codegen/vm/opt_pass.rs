@@ -194,15 +194,17 @@ impl VmOptPass for StoreLoadForwardPass {
         let mut i = 0;
         while i + 1 < program.instrs.len() {
             let forward = match (&program.instrs[i], &program.instrs[i + 1]) {
-                (VmInstr::VecStore { src, .. }, VmInstr::VecLoad { dst, .. }) => {
-                    if src != dst { Some((*dst, *src)) } else { None }
+                (VmInstr::VecStore { src, dtype, .. }, VmInstr::VecLoad { dst, .. }) => {
+                    if src != dst { Some((*dst, *src, *dtype)) } else { None }
                 }
                 _ => None,
             };
-            if let Some((dst, src)) = forward {
+            if let Some((dst, src, dtype)) = forward {
                 program.instrs.remove(i + 1);
                 program.instrs.remove(i);
-                program.instrs.insert(i, VmInstr::Mov { dst, src, dtype: QuantPrecision::F32 });
+                // BCE-20260630-OPTPASS: 保留原 VecStore dtype（同 tensor 读写 dtype 一致），
+                // 禁止硬编码 F32 — 否则 BF16/F16 寄存器值经 forwarding 后 dtype 丢失
+                program.instrs.insert(i, VmInstr::Mov { dst, src, dtype });
                 removed += 1;
             } else {
                 i += 1;
@@ -317,16 +319,16 @@ fn substitute_loop_offset_in_instr(instr: &VmInstr, vreg: VRegId, value: usize) 
         }
     };
     match instr {
-        VmInstr::VecLoad { dst, base, ref offset, width, .. } =>
-            VmInstr::VecLoad { dst: *dst, base: *base, offset: sub(offset), width: *width, dtype: QuantPrecision::F32, predicate: None, },
-        VmInstr::VecStore { base, ref offset, src, width, .. } =>
-            VmInstr::VecStore { base: *base, offset: sub(offset), src: *src, width: *width, dtype: QuantPrecision::F32, predicate: None, },
-        VmInstr::Broadcast { dst, ref src, width, .. } => {
+        VmInstr::VecLoad { dst, base, ref offset, width, dtype, predicate } =>
+            VmInstr::VecLoad { dst: *dst, base: *base, offset: sub(offset), width: *width, dtype: *dtype, predicate: predicate.clone(), },
+        VmInstr::VecStore { base, ref offset, src, width, dtype, predicate } =>
+            VmInstr::VecStore { base: *base, offset: sub(offset), src: *src, width: *width, dtype: *dtype, predicate: predicate.clone(), },
+        VmInstr::Broadcast { dst, ref src, width, dtype } => {
             let new_src = match src {
                 ScalarExpr::MemLoad(base, ref off) => ScalarExpr::MemLoad(*base, sub(off)),
                 other => other.clone(),
             };
-            VmInstr::Broadcast { dst: *dst, src: new_src, width: *width, dtype: QuantPrecision::F32, }
+            VmInstr::Broadcast { dst: *dst, src: new_src, width: *width, dtype: *dtype, }
         }
         VmInstr::Prefetch { base, ref offset, distance, hint } =>
             VmInstr::Prefetch { base: *base, offset: sub(offset), distance: *distance, hint: *hint },
@@ -824,6 +826,74 @@ mod tests {
     use super::*;
     use crate::dispatch::DeviceProfile;
     use crate::compiler::codegen::vm::isa_profile::IsaProfile;
+
+    // ── BCE-20260630-OPTPASS: dtype 不丢失回归（substitute_loop_offset_in_instr）──
+    // 循环展开替换 LoopOffset 时，VecLoad/VecStore/Broadcast 必须保留原 dtype，
+    // 禁止重置为 F32（否则 BF16/F16 weight load 经展开后 dtype 丢失 → 按错误宽度解码）。
+
+    // @trace TEST-OPTPASS-DTYPE-01 [req:REQ-DTYPE-CHAIN-005] [level:unit]
+    #[test]
+    fn substitute_loop_offset_preserves_vecload_bf16_dtype() {
+        let vreg = VRegId(7);
+        let base = VRegId(1);
+        let dst = VRegId(2);
+        let load = VmInstr::VecLoad {
+            dst, base, offset: OffsetExpr::LoopOffset(vreg),
+            width: SimdWidth::W256, dtype: QuantPrecision::BF16, predicate: None,
+        };
+        let out = substitute_loop_offset_in_instr(&load, vreg, 64);
+        match out {
+            VmInstr::VecLoad { dtype, offset, predicate, .. } => {
+                assert_eq!(dtype, QuantPrecision::BF16, "VecLoad dtype must be preserved (BF16), not reset to F32");
+                assert_eq!(offset, OffsetExpr::Const(64), "LoopOffset substituted to Const");
+                assert!(predicate.is_none(), "predicate preserved (None)");
+            }
+            _ => panic!("expected VecLoad, got {:?}", out),
+        }
+    }
+
+    // @trace TEST-OPTPASS-DTYPE-02 [req:REQ-DTYPE-CHAIN-005] [level:unit]
+    #[test]
+    fn substitute_loop_offset_preserves_vecstore_f16_dtype() {
+        let vreg = VRegId(8);
+        let base = VRegId(1);
+        let src = VRegId(3);
+        let store = VmInstr::VecStore {
+            base, offset: OffsetExpr::LoopOffset(vreg), src,
+            width: SimdWidth::W256, dtype: QuantPrecision::F16, predicate: None,
+        };
+        let out = substitute_loop_offset_in_instr(&store, vreg, 128);
+        match out {
+            VmInstr::VecStore { dtype, offset, .. } => {
+                assert_eq!(dtype, QuantPrecision::F16, "VecStore dtype must be preserved (F16), not reset to F32");
+                assert_eq!(offset, OffsetExpr::Const(128));
+            }
+            _ => panic!("expected VecStore, got {:?}", out),
+        }
+    }
+
+    // @trace TEST-OPTPASS-DTYPE-03 [req:REQ-DTYPE-CHAIN-005] [level:unit]
+    #[test]
+    fn substitute_loop_offset_preserves_broadcast_bf16_dtype() {
+        let vreg = VRegId(9);
+        let base = VRegId(1);
+        let dst = VRegId(4);
+        let bcast = VmInstr::Broadcast {
+            dst, src: ScalarExpr::MemLoad(base, OffsetExpr::LoopOffset(vreg)),
+            width: SimdWidth::Scalar, dtype: QuantPrecision::BF16,
+        };
+        let out = substitute_loop_offset_in_instr(&bcast, vreg, 32);
+        match out {
+            VmInstr::Broadcast { dtype, src, .. } => {
+                assert_eq!(dtype, QuantPrecision::BF16, "Broadcast dtype must be preserved (BF16), not reset to F32");
+                match src {
+                    ScalarExpr::MemLoad(_, off) => assert_eq!(off, OffsetExpr::Const(32)),
+                    _ => panic!("expected MemLoad after substitution"),
+                }
+            }
+            _ => panic!("expected Broadcast, got {:?}", out),
+        }
+    }
 
     #[test]
     fn test_dead_vreg_elimination() {
