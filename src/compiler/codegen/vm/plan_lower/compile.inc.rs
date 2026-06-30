@@ -843,6 +843,14 @@ pub(super) fn emit_standalone_op(
     resolver: &TensorPtrResolver,
     abi: &AbiPtrs,
 ) -> Result<(), CompilerError> {
+    // BCE-20260630-MIXED-P1: per-op ctx（杠杆总闸）。
+    // @trace CTX-PER-OP-DTYPE [req:REQ-DTYPE-006] [level:unit]
+    // 在派发瓶颈点刷新 ctx.dtype = 当前 op 的激活计算精度（op_input_dtype → accumulator_dtype
+    // promote），替代旧 graph_dtype(graph) 全图统一 F32。下游 RoPE/elementwise/softmax/
+    // attention 调用点经 &op_ctx 自动获 per-op 激活 dtype（B1 下激活 F32 → accumulator_dtype
+    // 仍 F32，行为等价；B2-ready）。详见 LoweringContext::for_op。
+    let op_ctx = ctx.for_op(op, graph);
+    let ctx = &op_ctx;
     let width = ctx.session.width;
     let sym_map = ctx.session.sym_map;
     let registry = ctx.session.registry;

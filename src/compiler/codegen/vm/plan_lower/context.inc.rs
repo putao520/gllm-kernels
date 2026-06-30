@@ -70,6 +70,49 @@ impl<'a> LoweringContext<'a> {
             .or(self.exec_pattern)
     }
 
+    /// BCE-20260630-MIXED-P1: 派生 per-op ctx（杠杆总闸，MIXED-PRECISION-OPERATOR-PLAN §2/§3）。
+    ///
+    /// 返回一个 ctx.dtype = **当前 op 的激活计算精度** 的新 LoweringContext（结构体其余
+    /// 字段照抄：session/bottleneck_map/rope_req/ple_req/dwc_req/parallelism/exec_pattern）。
+    ///
+    /// 三段式语义（ARCH-DTYPE-MIXED-PRECISION）：ctx.dtype 承载**激活/计算精度**（accumulate
+    /// 位置），不是原始存储 dtype。所以从 op 激活输入取 dtype 后用 `accumulator_dtype()`
+    /// promote 到计算精度——BF16/F16 激活 → F32 累加器，F32 激活保持 F32。量化/权重类输入
+    /// （DequantCompute/INT8 等）不是激活计算 dtype，promote 到 F32（这些 op 的权重 dtype 经
+    /// inputs[1].tensor.dtype per-weight 传播，见 Norm/GEMM 的 weight_dtype 参数，不进 ctx.dtype）。
+    ///
+    /// 旧实现 ctx.dtype = graph_dtype(graph) 对任何浮点图无条件 F32 → 调用点全焊死 F32。
+    /// 本方法让 dtype 链从 per-op 激活推断（B1 下激活 F32，accumulator_dtype 仍 F32，行为
+    /// 等价；B2-ready：未来 build_graph 喂 BF16 激活时，accumulator_dtype 自动跟到 F32 累加）。
+    pub fn for_op(
+        &self,
+        op: &crate::compiler::graph::CompilerOp,
+        graph: &CompilerGraph,
+    ) -> LoweringContext<'a> {
+        let act_dtype = op_input_dtype(op, graph);
+        // promote 激活存储 dtype → 计算精度（accumulate 位置恒 F32 策略）。
+        // 量化类（INT8/INT4/sub-byte）非激活计算 dtype → F32 计算回退。
+        let compute_dtype = if matches!(act_dtype.kind, crate::compiler::trace::DTypeKind::F32)
+            || matches!(act_dtype.kind, crate::compiler::trace::DTypeKind::BF16)
+            || matches!(act_dtype.kind, crate::compiler::trace::DTypeKind::F16)
+        {
+            act_dtype.accumulator_dtype()
+        } else {
+            QuantPrecision::F32
+        };
+        LoweringContext {
+            session: self.session,
+            dtype: compute_dtype,
+            exec_pattern: self.exec_pattern,
+            bottleneck_map: self.bottleneck_map,
+            rope_req: self.rope_req,
+            ple_req: self.ple_req,
+            dwc_req: self.dwc_req,
+            parallelism: self.parallelism,
+        }
+    }
+
+
     /// §0.2.10: 查找 GEMM op 的 per-op ParallelismDesc (decode vs prefill 差异化)。
     pub fn parallelism_for_op(&self, op_id: crate::compiler::graph::OpId) -> Option<ParallelismDesc> {
         self.bottleneck_map
