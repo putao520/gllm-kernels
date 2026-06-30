@@ -14,6 +14,10 @@ pub(crate) fn emit_gemm_row_stats_telemetry(
     sym_map: &SymDimSlotMap,
     dtype: QuantPrecision,
 ) -> Result<(), CompilerError> {
+    // BCE-20260630-MIXED-P3: telemetry HReduce/accumulator 是 accumulate 位置，
+    // dtype.accumulator_dtype() 显式标注（三段式 accumulate 合法 F32，防 P4 grep 误删）。
+    // @trace TELEMETRY-GEMMROWSTATS-ACC [req:REQ-DTYPE-006] [level:unit]
+    let acc_dtype = dtype.accumulator_dtype();
     let lanes = width.f32_lanes();
     if lanes == 0 {
         return Ok(());
@@ -30,7 +34,7 @@ pub(crate) fn emit_gemm_row_stats_telemetry(
 
     // Helper: build body, run auto_lower, store result at offset
     let hreduce_store = |prog: &mut VmProgram, body: &[TraceOp], result_idx: usize, offset: usize| -> Result<(), CompilerError> {
-        let slots = super::auto_select::auto_lower_trace_raw(prog, body, &[acc], width, QuantPrecision::F32)?;
+        let slots = super::auto_select::auto_lower_trace_raw(prog, body, &[acc], width, acc_dtype)?;
         prog.emit(VmInstr::VecStore { base: telemetry_ptr, offset: OffsetExpr::Const(offset), src: slots[result_idx], width: SimdWidth::Scalar, dtype , predicate: None });
         Ok(())
     };
@@ -75,6 +79,8 @@ pub(crate) fn emit_rmsnorm_channel_scale_telemetry(
     sym_map: &SymDimSlotMap,
     dtype: QuantPrecision,
 ) -> Result<(), CompilerError> {
+    // BCE-20260630-MIXED-P3: running_max/channel scale accumulator → accumulator_dtype() 标注。
+    let acc_dtype = dtype.accumulator_dtype();
     let lanes = width.f32_lanes();
     if lanes == 0 || feature_dim == 0 {
         return Ok(());
@@ -125,7 +131,7 @@ pub(crate) fn emit_rmsnorm_channel_scale_telemetry(
             dtype, predicate: None,
         });
         super::auto_select::auto_lower_trace_into(
-            prog, &ch_scale_body, &[input_val, running_max], running_max, width, QuantPrecision::F32,
+            prog, &ch_scale_body, &[input_val, running_max], running_max, width, acc_dtype,
         ).expect("emit_rmsnorm_channel_scale_telemetry: auto_lower_trace invariant violation");
     });
 
@@ -166,6 +172,8 @@ pub(crate) fn emit_silu_dead_neuron_telemetry(
     sym_map: &SymDimSlotMap,
     dtype: QuantPrecision,
 ) -> Result<(), CompilerError> {
+    // BCE-20260630-MIXED-P3: dead_count/hr_body accumulator → accumulator_dtype() 标注。
+    let acc_dtype = dtype.accumulator_dtype();
     let lanes = width.f32_lanes();
     if lanes == 0 {
         return Ok(());
@@ -239,7 +247,7 @@ pub(crate) fn emit_silu_dead_neuron_telemetry(
             prog.emit_loop(BoundExpr::Const(feature_vecs), step_bytes, |prog, _ctr, col_off| {
                 prog.emit(VmInstr::VecLoad { dst: input_val, base: scan_base, offset: OffsetExpr::LoopOffset(col_off), width, dtype , predicate: None });
                 super::auto_select::auto_lower_trace_into(
-                    prog, &dead_detect_body, &[threshold, input_val, ones, dead_count], dead_count, width, QuantPrecision::F32,
+                    prog, &dead_detect_body, &[threshold, input_val, ones, dead_count], dead_count, width, acc_dtype,
                 ).expect("dead neuron detect auto_lower failed");
             });
         }
@@ -247,7 +255,7 @@ pub(crate) fn emit_silu_dead_neuron_telemetry(
 
     // Horizontal reduce: sum all lanes of dead_count into a single scalar
     let hr_body = vec![TraceOp::Input(0), TraceOp::HReduce { src: ValueId(0), op: ReduceKind::Sum }];
-    let hr_slots = super::auto_select::auto_lower_trace_raw(prog, &hr_body, &[dead_count], width, QuantPrecision::F32)
+    let hr_slots = super::auto_select::auto_lower_trace_raw(prog, &hr_body, &[dead_count], width, acc_dtype)
         .expect("dead neuron HReduce auto_lower failed");
     let dead_count_scalar = prog.alloc_vreg(VRegKind::Vec, SimdWidth::Scalar);
     prog.emit(VmInstr::Broadcast { dst: dead_count_scalar, src: ScalarExpr::ExtractLane0(hr_slots[1]), width: SimdWidth::Scalar, dtype, });
@@ -298,6 +306,8 @@ pub(crate) fn emit_residual_with_telemetry(
     seq_bound_override: Option<&BoundExpr>,
     dtype: QuantPrecision,
 ) -> Result<(), CompilerError> {
+    // BCE-20260630-MIXED-P3: dot/norm_sq/sum/HReduce accumulator → accumulator_dtype() 标注。
+    let acc_dtype = dtype.accumulator_dtype();
     let lanes = width.f32_lanes().max(1);
     let elem = dtype.elem_bytes();
     let row_bytes = feature_dim * dtype.elem_bytes();
@@ -379,7 +389,7 @@ pub(crate) fn emit_residual_with_telemetry(
                     &[a_vec, b_vec],
                     sum_vec,
                     width,
-                    QuantPrecision::F32,
+                    acc_dtype,
                 ).expect("emit_residual_with_telemetry: residual add auto_lower_trace_into");
                 prog.emit(VmInstr::VecStore {
                     base: row_res, offset: OffsetExpr::LoopOffset(col_off), src: sum_vec, width,
@@ -395,7 +405,7 @@ pub(crate) fn emit_residual_with_telemetry(
                         &[dot, a_vec, b_vec],
                         dot,
                         width,
-                        QuantPrecision::F32,
+                        acc_dtype,
                     ).expect("emit_residual_with_telemetry: dot fma auto_lower_trace_into");
                     // norm_sq_in += a²
                     super::auto_select::auto_lower_trace_into(
@@ -404,7 +414,7 @@ pub(crate) fn emit_residual_with_telemetry(
                         &[ni, a_vec],
                         ni,
                         width,
-                        QuantPrecision::F32,
+                        acc_dtype,
                     ).expect("emit_residual_with_telemetry: norm_sq_in fma auto_lower_trace_into");
                     // norm_sq_out += b²
                     super::auto_select::auto_lower_trace_into(
@@ -413,7 +423,7 @@ pub(crate) fn emit_residual_with_telemetry(
                         &[no, b_vec],
                         no,
                         width,
-                        QuantPrecision::F32,
+                        acc_dtype,
                     ).expect("emit_residual_with_telemetry: norm_sq_out fma auto_lower_trace_into");
                 }
             });
@@ -446,7 +456,7 @@ pub(crate) fn emit_residual_with_telemetry(
                     &[s_a, s_b],
                     s_sum,
                     s_width,
-                    QuantPrecision::F32,
+                    acc_dtype,
                 ).expect("emit_residual_with_telemetry: tail residual add auto_lower_trace_into");
                 prog.emit(VmInstr::VecStore {
                     base: row_res, offset: off, src: s_sum, width: s_width,
@@ -461,7 +471,7 @@ pub(crate) fn emit_residual_with_telemetry(
                         &[dot, s_a, s_b],
                         dot,
                         s_width,
-                        QuantPrecision::F32,
+                        acc_dtype,
                     ).expect("emit_residual_with_telemetry: tail dot fma auto_lower_trace_into");
                     super::auto_select::auto_lower_trace_into(
                         prog,
@@ -469,7 +479,7 @@ pub(crate) fn emit_residual_with_telemetry(
                         &[ni, s_a],
                         ni,
                         s_width,
-                        QuantPrecision::F32,
+                        acc_dtype,
                     ).expect("emit_residual_with_telemetry: tail norm_sq_in fma auto_lower_trace_into");
                     super::auto_select::auto_lower_trace_into(
                         prog,
@@ -477,7 +487,7 @@ pub(crate) fn emit_residual_with_telemetry(
                         &[no, s_b],
                         no,
                         s_width,
-                        QuantPrecision::F32,
+                        acc_dtype,
                     ).expect("emit_residual_with_telemetry: tail norm_sq_out fma auto_lower_trace_into");
                 }
             });
@@ -513,7 +523,7 @@ pub(crate) fn emit_residual_with_telemetry(
             &[ni_scalar],
             norm_in,
             width,
-            QuantPrecision::F32,
+            acc_dtype,
         ).expect("emit_residual_with_telemetry: norm_in sqrt auto_lower_trace_into");
 
         // norm_out = sqrt(\xce\xa3 x_out\xc2\xb2) (via auto_select)
@@ -524,7 +534,7 @@ pub(crate) fn emit_residual_with_telemetry(
             &[no_scalar],
             norm_out,
             width,
-            QuantPrecision::F32,
+            acc_dtype,
         ).expect("emit_residual_with_telemetry: norm_out sqrt auto_lower_trace_into");
 
         // delta = norm_out / norm_in (with epsilon guard)
@@ -538,7 +548,7 @@ pub(crate) fn emit_residual_with_telemetry(
             &[norm_in, eps],
             norm_in_safe,
             width,
-            QuantPrecision::F32,
+            acc_dtype,
         ).expect("emit_residual_with_telemetry: norm_in_safe max auto_lower_trace_into");
 
         let delta = prog.alloc_vreg(VRegKind::Vec, width);
@@ -548,7 +558,7 @@ pub(crate) fn emit_residual_with_telemetry(
             &[norm_out, norm_in_safe],
             delta,
             width,
-            QuantPrecision::F32,
+            acc_dtype,
         ).expect("emit_residual_with_telemetry: delta div auto_lower_trace_into");
 
         // Store delta to telemetry[RESIDUAL_DELTA_OFFSET]
@@ -569,7 +579,7 @@ pub(crate) fn emit_residual_with_telemetry(
             &[norm_in, norm_out],
             denom,
             width,
-            QuantPrecision::F32,
+            acc_dtype,
         ).expect("emit_residual_with_telemetry: denom mul auto_lower_trace_into");
         let eps_sq = prog.alloc_vreg(VRegKind::Vec, width);
         prog.emit(VmInstr::Broadcast { dst: eps_sq, src: ScalarExpr::Const(RESIDUAL_NORM_EPSILON * RESIDUAL_NORM_EPSILON), width, dtype, });
@@ -580,7 +590,7 @@ pub(crate) fn emit_residual_with_telemetry(
             &[denom, eps_sq],
             denom_safe,
             width,
-            QuantPrecision::F32,
+            acc_dtype,
         ).expect("emit_residual_with_telemetry: denom_safe max auto_lower_trace_into");
 
         let cosine = prog.alloc_vreg(VRegKind::Vec, width);
@@ -590,7 +600,7 @@ pub(crate) fn emit_residual_with_telemetry(
             &[dot_scalar, denom_safe],
             cosine,
             width,
-            QuantPrecision::F32,
+            acc_dtype,
         ).expect("emit_residual_with_telemetry: cosine div auto_lower_trace_into");
 
         // Store cosine to telemetry[COSINE_SIMILARITY_OFFSET]
