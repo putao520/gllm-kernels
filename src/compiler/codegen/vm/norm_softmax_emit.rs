@@ -164,13 +164,17 @@ pub(crate) fn emit_normlike_one_group(
     let tail = feature_dim % lanes;
     let tail_off = vec_count * step_bytes;
     let s1 = SimdWidth::Scalar;
+    // BCE-20260630-MIXED-P3: acc 是 accumulate 位置（reduce/HReduce），BF16 输入应 promote
+    // 到 F32 累加（数值稳定性）。dtype.accumulator_dtype() 显式标注（防 P4 grep 误删）。
+    // @trace NORM-SOFTMAX-ACC-DTYPE [req:REQ-DTYPE-006] [level:unit]
+    let acc_dtype = dtype.accumulator_dtype();
 
     // Phase 1: Reduce
-    prog.emit(VmInstr::Broadcast { dst: acc, src: ScalarExpr::Const(0.0), width, dtype });
+    prog.emit(VmInstr::Broadcast { dst: acc, src: ScalarExpr::Const(0.0), width, dtype: acc_dtype });
     if vec_count > 0 {
         prog.emit_loop(BoundExpr::Const(vec_count), step_bytes, |prog, _counter, byte_off| {
             prog.emit(VmInstr::VecLoad { dst: temp, base: row_input, offset: OffsetExpr::LoopOffset(byte_off), width, dtype , predicate: None });
-            auto_select::auto_lower_trace(prog, reduce, &[temp, acc], width, dtype).expect("normlike reduce");
+            auto_select::auto_lower_trace(prog, reduce, &[temp, acc], width, acc_dtype).expect("normlike reduce");
             prog.emit(VmInstr::Accumulate { acc, src: temp });
         });
     }
@@ -178,15 +182,15 @@ pub(crate) fn emit_normlike_one_group(
         let s_tmp = prog.alloc_vreg(VRegKind::Vec, s1);
         for t in 0..tail {
             prog.emit(VmInstr::VecLoad { dst: s_tmp, base: row_input, offset: OffsetExpr::Const(tail_off + t * elem), width: s1, dtype , predicate: None });
-            auto_select::auto_lower_trace(prog, reduce, &[s_tmp, acc], s1, dtype).expect("normlike reduce tail");
+            auto_select::auto_lower_trace(prog, reduce, &[s_tmp, acc], s1, acc_dtype).expect("normlike reduce tail");
             prog.emit(VmInstr::Accumulate { acc, src: s_tmp });
         }
     }
 
     // HReduce
     let hr = auto_select::auto_lower_trace_raw(prog,
-        &[TraceOp::Input(0), TraceOp::HReduce { src: ValueId(0), op: ReduceKind::Sum }], &[acc], width, dtype).expect("normlike HReduce");
-    prog.emit(VmInstr::Broadcast { dst: acc, src: ScalarExpr::ExtractLane0(hr[1]), width, dtype });
+        &[TraceOp::Input(0), TraceOp::HReduce { src: ValueId(0), op: ReduceKind::Sum }], &[acc], width, acc_dtype).expect("normlike HReduce");
+    prog.emit(VmInstr::Broadcast { dst: acc, src: ScalarExpr::ExtractLane0(hr[1]), width, dtype: acc_dtype });
 
     // Phase 2: Finalize
     prog.emit(VmInstr::Broadcast { dst: dim_bc, src: ScalarExpr::Const(feature_dim as f32), width, dtype });
@@ -262,6 +266,8 @@ pub(crate) fn emit_layernorm_auto(
     let tail = feature_dim % lanes;
     let tail_off = vec_count * step_bytes;
     let s1 = SimdWidth::Scalar;
+    // BCE-20260630-MIXED-P3: acc_sum/acc_sq 是 accumulate 位置，accumulator_dtype() 标注。
+    let acc_dtype = dtype.accumulator_dtype();
 
     let acc_sum = prog.alloc_vreg(VRegKind::Vec, width);
     let acc_sq = prog.alloc_vreg(VRegKind::Vec, width);
@@ -300,13 +306,13 @@ pub(crate) fn emit_layernorm_auto(
         prog.emit(VmInstr::LoadPtr { dst: row_output, src: PtrExpr::VRegPlusVReg(output_ptr, row_byte_off) });
 
         // Phase 1: Dual Accumulator Reduce (sum_x + sum_x²)
-        prog.emit(VmInstr::Broadcast { dst: acc_sum, src: ScalarExpr::Const(0.0), width, dtype });
-        prog.emit(VmInstr::Broadcast { dst: acc_sq, src: ScalarExpr::Const(0.0), width, dtype });
+        prog.emit(VmInstr::Broadcast { dst: acc_sum, src: ScalarExpr::Const(0.0), width, dtype: acc_dtype });
+        prog.emit(VmInstr::Broadcast { dst: acc_sq, src: ScalarExpr::Const(0.0), width, dtype: acc_dtype });
         if vec_count > 0 {
             prog.emit_loop(BoundExpr::Const(vec_count), step_bytes, |prog, _ctr, byte_off| {
                 prog.emit(VmInstr::VecLoad { dst: temp, base: row_input, offset: OffsetExpr::LoopOffset(byte_off), width, dtype , predicate: None });
                 prog.emit(VmInstr::Accumulate { acc: acc_sum, src: temp });
-                auto_select::auto_lower_trace(prog, &mul_sq_body, &[temp], width, dtype).expect("layernorm sq");
+                auto_select::auto_lower_trace(prog, &mul_sq_body, &[temp], width, acc_dtype).expect("layernorm sq");
                 prog.emit(VmInstr::Accumulate { acc: acc_sq, src: temp });
             });
         }
@@ -314,15 +320,15 @@ pub(crate) fn emit_layernorm_auto(
             for t in 0..tail {
                 prog.emit(VmInstr::VecLoad { dst: temp, base: row_input, offset: OffsetExpr::Const(tail_off + t * elem), width: s1, dtype , predicate: None });
                 prog.emit(VmInstr::Accumulate { acc: acc_sum, src: temp });
-                auto_select::auto_lower_trace(prog, &mul_sq_body, &[temp], s1, dtype).expect("layernorm sq tail");
+                auto_select::auto_lower_trace(prog, &mul_sq_body, &[temp], s1, acc_dtype).expect("layernorm sq tail");
                 prog.emit(VmInstr::Accumulate { acc: acc_sq, src: temp });
             }
         }
         // HReduce both accumulators
-        let hr_s = auto_select::auto_lower_trace_raw(prog, &hr_sum_body, &[acc_sum], width, dtype).expect("layernorm HReduce sum");
-        prog.emit(VmInstr::Broadcast { dst: acc_sum, src: ScalarExpr::ExtractLane0(hr_s[1]), width, dtype });
-        let hr_q = auto_select::auto_lower_trace_raw(prog, &hr_sum_body, &[acc_sq], width, dtype).expect("layernorm HReduce sq");
-        prog.emit(VmInstr::Broadcast { dst: acc_sq, src: ScalarExpr::ExtractLane0(hr_q[1]), width, dtype });
+        let hr_s = auto_select::auto_lower_trace_raw(prog, &hr_sum_body, &[acc_sum], width, acc_dtype).expect("layernorm HReduce sum");
+        prog.emit(VmInstr::Broadcast { dst: acc_sum, src: ScalarExpr::ExtractLane0(hr_s[1]), width, dtype: acc_dtype });
+        let hr_q = auto_select::auto_lower_trace_raw(prog, &hr_sum_body, &[acc_sq], width, acc_dtype).expect("layernorm HReduce sq");
+        prog.emit(VmInstr::Broadcast { dst: acc_sq, src: ScalarExpr::ExtractLane0(hr_q[1]), width, dtype: acc_dtype });
 
         // Phase 2: Finalize → inv_std (slot 9), mean (slot 4)
         auto_select::auto_lower_trace_multi(
@@ -394,6 +400,8 @@ pub(crate) fn emit_softmax_inline(
     let step = width.bytes();
     let tail_off = vec_count * step;
     let s1 = SimdWidth::Scalar;
+    // BCE-20260630-MIXED-P3: max_val/sum_val 是 accumulate 位置，accumulator_dtype() 标注。
+    let acc_dtype = dtype.accumulator_dtype();
 
     let tmp = prog.alloc_vreg(VRegKind::Vec, width);
     let max_val = prog.alloc_vreg(VRegKind::Vec, width);
@@ -401,38 +409,38 @@ pub(crate) fn emit_softmax_inline(
     let combine_max: Vec<TraceOp> = vec![TraceOp::Input(0), TraceOp::Input(1), TraceOp::Max(ValueId(0), ValueId(1))];
 
     // Phase 1: max reduce
-    prog.emit(VmInstr::Broadcast { dst: max_val, src: ScalarExpr::Const(f32::NEG_INFINITY), width, dtype });
+    prog.emit(VmInstr::Broadcast { dst: max_val, src: ScalarExpr::Const(f32::NEG_INFINITY), width, dtype: acc_dtype });
     if vec_count > 0 {
         prog.emit_loop(BoundExpr::Const(vec_count), step, |prog, _ctr, byte_off| {
             prog.emit(VmInstr::VecLoad { dst: tmp, base: input_ptr, offset: OffsetExpr::LoopOffset(byte_off), width, dtype , predicate: None });
-            auto_select::auto_lower_trace(prog, &combine_max, &[tmp, max_val], width, dtype).expect("softmax max");
+            auto_select::auto_lower_trace(prog, &combine_max, &[tmp, max_val], width, acc_dtype).expect("softmax max");
             prog.emit(VmInstr::Accumulate { acc: max_val, src: tmp });
         });
     }
     if tail > 0 {
         let s_tmp = prog.alloc_vreg(VRegKind::Vec, s1);
         let s_max = prog.alloc_vreg(VRegKind::Vec, s1);
-        prog.emit(VmInstr::Broadcast { dst: s_max, src: ScalarExpr::ExtractLane0(max_val), width: s1, dtype });
+        prog.emit(VmInstr::Broadcast { dst: s_max, src: ScalarExpr::ExtractLane0(max_val), width: s1, dtype: acc_dtype });
         for t in 0..tail {
             prog.emit(VmInstr::VecLoad { dst: s_tmp, base: input_ptr, offset: OffsetExpr::Const(tail_off + t * elem), width: s1, dtype , predicate: None });
-            auto_select::auto_lower_trace(prog, &combine_max, &[s_tmp, s_max], s1, dtype).expect("softmax max tail");
+            auto_select::auto_lower_trace(prog, &combine_max, &[s_tmp, s_max], s1, acc_dtype).expect("softmax max tail");
             prog.emit(VmInstr::Accumulate { acc: max_val, src: s_tmp });
         }
     }
     let hr_max = auto_select::auto_lower_trace_raw(prog,
         &[TraceOp::Input(0), TraceOp::HReduce { src: ValueId(0), op: ReduceKind::Max }], &[max_val], width, dtype).expect("softmax HReduce max");
-    prog.emit(VmInstr::Broadcast { dst: max_val, src: ScalarExpr::ExtractLane0(hr_max[1]), width, dtype });
+    prog.emit(VmInstr::Broadcast { dst: max_val, src: ScalarExpr::ExtractLane0(hr_max[1]), width, dtype: acc_dtype });
 
     // Phase 2: exp(x - max) + sum
     let exp_sub: Vec<TraceOp> = vec![TraceOp::Input(0), TraceOp::Input(1), TraceOp::Sub(ValueId(0), ValueId(1)), TraceOp::Exp(ValueId(2))];
     let combine_sum: Vec<TraceOp> = vec![TraceOp::Input(0), TraceOp::Input(1), TraceOp::Add(ValueId(0), ValueId(1))];
-    prog.emit(VmInstr::Broadcast { dst: sum_val, src: ScalarExpr::Const(0.0), width, dtype });
+    prog.emit(VmInstr::Broadcast { dst: sum_val, src: ScalarExpr::Const(0.0), width, dtype: acc_dtype });
     if vec_count > 0 {
         prog.emit_loop(BoundExpr::Const(vec_count), step, |prog, _ctr, byte_off| {
             prog.emit(VmInstr::VecLoad { dst: tmp, base: input_ptr, offset: OffsetExpr::LoopOffset(byte_off), width, dtype , predicate: None });
             auto_select::auto_lower_trace(prog, &exp_sub, &[tmp, max_val], width, dtype).expect("softmax exp");
             prog.emit(VmInstr::VecStore { base: output_ptr, offset: OffsetExpr::LoopOffset(byte_off), src: tmp, width, dtype , predicate: None });
-            auto_select::auto_lower_trace(prog, &combine_sum, &[sum_val, tmp], width, dtype).expect("softmax sum");
+            auto_select::auto_lower_trace(prog, &combine_sum, &[sum_val, tmp], width, acc_dtype).expect("softmax sum");
             prog.emit(VmInstr::Accumulate { acc: sum_val, src: tmp });
         });
     }
@@ -440,20 +448,20 @@ pub(crate) fn emit_softmax_inline(
         let s_max_bc = prog.alloc_vreg(VRegKind::Vec, s1);
         let s_sum = prog.alloc_vreg(VRegKind::Vec, s1);
         let s_tmp = prog.alloc_vreg(VRegKind::Vec, s1);
-        prog.emit(VmInstr::Broadcast { dst: s_max_bc, src: ScalarExpr::ExtractLane0(max_val), width: s1, dtype });
-        prog.emit(VmInstr::Broadcast { dst: s_sum, src: ScalarExpr::ExtractLane0(sum_val), width: s1, dtype });
+        prog.emit(VmInstr::Broadcast { dst: s_max_bc, src: ScalarExpr::ExtractLane0(max_val), width: s1, dtype: acc_dtype });
+        prog.emit(VmInstr::Broadcast { dst: s_sum, src: ScalarExpr::ExtractLane0(sum_val), width: s1, dtype: acc_dtype });
         for t in 0..tail {
             let off = tail_off + t * elem;
             prog.emit(VmInstr::VecLoad { dst: s_tmp, base: input_ptr, offset: OffsetExpr::Const(off), width: s1, dtype , predicate: None });
             auto_select::auto_lower_trace_into(prog, &exp_sub, &[s_tmp, s_max_bc], s_tmp, s1, dtype).expect("softmax tail exp");
             prog.emit(VmInstr::VecStore { base: output_ptr, offset: OffsetExpr::Const(off), src: s_tmp, width: s1, dtype , predicate: None });
-            auto_select::auto_lower_trace_into(prog, &combine_sum, &[s_sum, s_tmp], s_sum, s1, dtype).expect("softmax tail sum");
+            auto_select::auto_lower_trace_into(prog, &combine_sum, &[s_sum, s_tmp], s_sum, s1, acc_dtype).expect("softmax tail sum");
         }
         prog.emit(VmInstr::Accumulate { acc: sum_val, src: s_sum });
     }
     let hr_sum = auto_select::auto_lower_trace_raw(prog,
         &[TraceOp::Input(0), TraceOp::HReduce { src: ValueId(0), op: ReduceKind::Sum }], &[sum_val], width, dtype).expect("softmax HReduce sum");
-    prog.emit(VmInstr::Broadcast { dst: sum_val, src: ScalarExpr::ExtractLane0(hr_sum[1]), width, dtype });
+    prog.emit(VmInstr::Broadcast { dst: sum_val, src: ScalarExpr::ExtractLane0(hr_sum[1]), width, dtype: acc_dtype });
 
     // Phase 3: normalize by sum
     let normalize: Vec<TraceOp> = vec![TraceOp::Input(0), TraceOp::Input(1), TraceOp::Mul(ValueId(0), ValueId(1))];
