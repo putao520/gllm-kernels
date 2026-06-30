@@ -113,11 +113,14 @@ pub(crate) fn lower_depthwise_conv1d(
     let acc = prog.alloc_vreg(VRegKind::Vec, s_width);
     let x_val = prog.alloc_vreg(VRegKind::Vec, s_width);
     let w_val = prog.alloc_vreg(VRegKind::Vec, s_width);
+    // BCE-20260630-MIXED-P3: acc 是 accumulate 位置，input_dtype.accumulator_dtype() 显式标注
+    //（三段式 accumulate 合法 F32，防 P4 grep 误删）。@trace VISION-DWC-ACC-DTYPE [req:REQ-DTYPE-006]
+    let acc_dtype = input_dtype.accumulator_dtype();
 
     prog.emit_loop(seq_bound, channel_row_bytes, |prog, _t_ctr, t_off| {
         prog.emit_loop(BoundExpr::Const(channels), elem, |prog, c_ctr, c_off| {
             // acc = 0 (accumulator 恒 F32)
-            prog.emit(VmInstr::Broadcast { dst: acc, src: ScalarExpr::Const(0.0), width: s_width, dtype: QuantPrecision::F32, });
+            prog.emit(VmInstr::Broadcast { dst: acc, src: ScalarExpr::Const(0.0), width: s_width, dtype: acc_dtype, });
             for k in 0..kernel_size {
                 // x_val = padded[t+k, c] (激活链 → input_dtype)
                 let padded_off = OffsetExpr::Add(
@@ -151,7 +154,7 @@ pub(crate) fn lower_depthwise_conv1d(
                         TraceOp::Input(0), TraceOp::Input(1), TraceOp::Input(2),
                         TraceOp::Fma(ValueId(0), ValueId(1), ValueId(2)),
                     ];
-                    super::auto_select::auto_lower_trace_into(prog, &dwc_fma_body, &[x_val, w_val, acc], acc, s_width, QuantPrecision::F32)
+                    super::auto_select::auto_lower_trace_into(prog, &dwc_fma_body, &[x_val, w_val, acc], acc, s_width, acc_dtype)
                         .expect("lower_depthwise_conv1d: FMA auto_lower invariant violation");
                 }
             }
@@ -248,6 +251,9 @@ pub(crate) fn lower_patch_embed(
     let acc = prog.alloc_vreg(VRegKind::Vec, s_width);
     let x_val = prog.alloc_vreg(VRegKind::Vec, s_width);
     let w_val = prog.alloc_vreg(VRegKind::Vec, s_width);
+    // BCE-20260630-MIXED-P3: acc 是 accumulate 位置，input_dtype.accumulator_dtype() 显式标注
+    //（三段式 accumulate 合法 F32，防 P4 grep 误删）。
+    let acc_dtype = input_dtype.accumulator_dtype();
 
     // image byte-offset 缩放 (input_elem, 配 byte_offset 按 input_elem 步进):
     let scale_image_row   = patch_size * image_size;
@@ -268,7 +274,7 @@ pub(crate) fn lower_patch_embed(
                 // acc = 0 (accumulator 恒 F32)
                 prog.emit(VmInstr::Broadcast {
                     dst: acc, src: ScalarExpr::Const(0.0), width: s_width,
-                    dtype: QuantPrecision::F32,
+                    dtype: acc_dtype,
                 });
 
                 prog.emit_loop(BoundExpr::Const(in_channels), elem, |prog, c_ctr, c_off| {
@@ -304,7 +310,7 @@ pub(crate) fn lower_patch_embed(
                                     TraceOp::Input(0), TraceOp::Input(1), TraceOp::Input(2),
                                     TraceOp::Fma(ValueId(0), ValueId(1), ValueId(2)),
                                 ];
-                                super::auto_select::auto_lower_trace_into(prog, &pe_fma_body, &[x_val, w_val, acc], acc, s_width, QuantPrecision::F32)
+                                super::auto_select::auto_lower_trace_into(prog, &pe_fma_body, &[x_val, w_val, acc], acc, s_width, acc_dtype)
                                     .expect("lower_patch_embed: FMA auto_lower invariant violation");
                             }
                         }
