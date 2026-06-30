@@ -361,12 +361,28 @@ impl TensorMeta {
     /// Intermediate tensors (with a producer op) always use F32 (4 bytes) because
     /// JIT codegen accumulates in f32 regardless of source dtype.
     pub fn concrete_bytes(&self) -> usize {
-        let elem_bytes = if self.producer.is_some() {
-            4 // intermediate tensors: always f32 accumulator
+        self.concrete_numel() * self.elem_bytes()
+    }
+
+    /// Element byte width driving memory layout (ARCH-DTYPE-JIT-TYPED).
+    /// @trace DTYPE-ELEM-BYTES [req:REQ-DTYPE-006] [level:unit]
+    ///
+    /// This is the dtype-aware analogue of the old hardcoded `* 4` for F32
+    /// intermediates. Today the DT2 invariant forces every producer-bearing
+    /// tensor to an F32 accumulator, so this returns `F32.size_bytes()` for
+    /// intermediates and the tensor's declared `dtype.size_bytes()` for graph
+    /// inputs. If the accumulator dtype ever moves off F32, this is the single
+    /// place to update — byte-size callers (`concrete_bytes`, the
+    /// `tensor_numel_for_alloc`-based buffer sizing in `virtual_activation`)
+    /// follow automatically instead of each carrying its own `* 4`.
+    pub fn elem_bytes(&self) -> usize {
+        if self.producer.is_some() {
+            // intermediate tensors: always f32 accumulator (DT2 invariant)
+            DType::F32.size_bytes()
         } else {
-            self.dtype.size_bytes() // weight/input tensors: use declared dtype
-        };
-        self.concrete_numel() * elem_bytes
+            // weight/input tensors: code yields to the declared dtype
+            self.dtype.size_bytes()
+        }
     }
 }
 

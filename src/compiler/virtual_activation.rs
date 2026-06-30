@@ -9,6 +9,7 @@
 use std::collections::HashMap;
 use crate::compiler::graph::{CompilerGraph, TensorId};
 use crate::compiler::fusion::FusionPlan;
+use crate::types::DType;
 
 /// 激活 buffer 角色标识
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -89,10 +90,17 @@ impl VirtualActivationMap {
         // Step 2: 计算 buffer 大小
         // Must use tensor_numel_for_alloc (respects max_seq_len for Symbolic dims)
         // instead of concrete_bytes (which treats Symbolic as 1 element).
+        // @trace VAM-BUFFER-SIZE [req:REQ-DTYPE-006] [level:unit]
+        // elem_bytes is dtype-aware (ARCH-DTYPE-JIT-TYPED): intermediates follow
+        // the DT2 F32-accumulator invariant today, and will track the accumulator
+        // dtype automatically if it ever moves off F32 — no hardcoded `* 4`.
         let max_activation_bytes = layer_activations.iter()
             .map(|(tid, _)| {
+                let elem_bytes = graph.tensor(*tid)
+                    .map(|t| t.elem_bytes())
+                    .unwrap_or(DType::F32.size_bytes());
                 graph.tensor_numel_for_alloc(*tid, graph.max_seq_len)
-                    .map(|numel| numel * 4) // F32 intermediate
+                    .map(|numel| numel * elem_bytes)
                     .unwrap_or(0)
             })
             .max()
