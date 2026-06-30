@@ -206,6 +206,8 @@ mod tests {
             c: VRegId(0),
             a: VRegId(1),
             b: VRegId(2),
+            m: 1, n: 1, k: 1,
+            dtype: DType::F32,
         }, &alloc).unwrap();
 
         let code = lower.finalize().unwrap();

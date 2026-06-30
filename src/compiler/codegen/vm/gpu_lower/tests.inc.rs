@@ -26,6 +26,7 @@ mod tests {
         let alloc = empty_alloc();
         l.lower_instr(&VmInstr::TileMma {
             c: VRegId(0), a: VRegId(1), b: VRegId(2),
+            m: 1, n: 1, k: 1, dtype: crate::types::DType::F32,
         }, &alloc).unwrap();
         l.emit_epilogue(&empty_frame(), &alloc).unwrap();
         let ir = l.finalize().unwrap();
@@ -47,6 +48,7 @@ mod tests {
         }, &alloc).unwrap();
         l.lower_instr(&VmInstr::TileMma {
             c: VRegId(0), a: VRegId(1), b: VRegId(2),
+            m: 1, n: 1, k: 1, dtype: crate::types::DType::F16,
         }, &alloc).unwrap();
         l.emit_epilogue(&empty_frame(), &alloc).unwrap();
         let ir = l.finalize().unwrap();
@@ -77,6 +79,7 @@ mod tests {
         let alloc = empty_alloc();
         l.lower_instr(&VmInstr::TileMma {
             c: VRegId(0), a: VRegId(1), b: VRegId(2),
+            m: 1, n: 1, k: 1, dtype: crate::types::DType::F16,
         }, &alloc).unwrap();
         l.emit_epilogue(&empty_frame(), &alloc).unwrap();
         let ir = l.finalize().unwrap();
@@ -91,6 +94,7 @@ mod tests {
         l.emit_prologue(&empty_frame(), &alloc, Default::default()).unwrap();
         l.lower_instr(&VmInstr::TileMma {
             c: VRegId(0), a: VRegId(1), b: VRegId(2),
+            m: 1, n: 1, k: 1, dtype: crate::types::DType::F16,
         }, &alloc).unwrap();
         let ir = l.finalize().unwrap();
         assert!(ir.contains("v_mfma_f32_16x16x16_f16"), "gfx908 should emit MFMA v1: {ir}");

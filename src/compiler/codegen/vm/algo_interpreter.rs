@@ -4085,7 +4085,7 @@ mod tests {
         if let Some(TraceOp::Loop { body, .. }) = ops.iter().find(|op| matches!(op, TraceOp::Loop { .. })) {
             let tile_mma = body.iter().find(|op| matches!(op, TraceOp::TileMma { .. }));
             assert!(tile_mma.is_some(), "Body TileMma should produce TraceOp::TileMma");
-            if let Some(TraceOp::TileMma { c, a, b }) = tile_mma {
+            if let Some(TraceOp::TileMma { c, a, b, m: _, n: _, k: _ }) = tile_mma {
                 assert_eq!(*c, ValueId(8), "TileMma c should be panel_c = ValueId(8)");
                 assert_eq!(*a, ValueId(6), "TileMma a should be panel_a = ValueId(6)");
                 assert_eq!(*b, ValueId(7), "TileMma b should be panel_b = ValueId(7)");
