@@ -629,7 +629,10 @@ mod tests {
         assert!(prog.instrs.len() > 10, "multi-group plan should emit substantial IR");
     }
 
-    /// dtype propagation: BF16 tensors → graph_dtype must return QuantPrecision::BF16.
+    /// dtype propagation: BF16 tensors → graph_dtype must return QuantPrecision::F32.
+    /// BCE-20260630-DT2 (ARCH-DTYPE-MIXED-PRECISION / B1): graph_dtype 返回**计算精度** F32，
+    /// 不是存储精度。BF16 权重在 VecLoad WidenCompute 时 widen 到 F32 寄存器计算，
+    /// graph_dtype == MegaKernelAbi.compute_dtype == F32（激活累加精度）。
     #[test]
     fn test_graph_dtype_bf16_propagation() {
         let mut g = CompilerGraph::new();
@@ -637,10 +640,11 @@ mod tests {
         let out = g.add_tensor_concrete("output", &[32], DType::BF16);
         g.inputs = vec![inp]; g.outputs = vec![out];
         let dtype = graph_dtype(&g);
-        assert_eq!(dtype, QuantPrecision::BF16, "graph_dtype must reflect BF16");
+        assert_eq!(dtype, QuantPrecision::F32, "graph_dtype must return compute precision F32 even with BF16 storage");
     }
 
-    /// dtype propagation: F16 tensors → graph_dtype must return QuantPrecision::F16.
+    /// dtype propagation: F16 tensors → graph_dtype must return QuantPrecision::F32.
+    /// BCE-20260630-DT2 (B1): 同 BF16，计算精度统一 F32，存储精度不在 graph_dtype 层混入。
     #[test]
     fn test_graph_dtype_f16_propagation() {
         let mut g = CompilerGraph::new();
@@ -648,7 +652,7 @@ mod tests {
         let out = g.add_tensor_concrete("output", &[64], DType::F16);
         g.inputs = vec![inp]; g.outputs = vec![out];
         let dtype = graph_dtype(&g);
-        assert_eq!(dtype, QuantPrecision::F16, "graph_dtype must reflect F16");
+        assert_eq!(dtype, QuantPrecision::F32, "graph_dtype must return compute precision F32 even with F16 storage");
     }
 
     /// Symbolic seq_len lowering: SymDim::Symbolic must produce
@@ -901,8 +905,9 @@ mod tests {
         assert_eq!(v1.0, 1, "second vreg must be id 1");
     }
 
-    /// graph_dtype: when the first tensor is BF16 and second is F32,
-    /// the first tensor's dtype must win (SSOT: first tensor determines graph dtype).
+    /// graph_dtype: compute precision is always F32 regardless of storage dtype mix.
+    /// BCE-20260630-DT2 (B1): graph_dtype 返回计算精度 F32，不取首个 tensor 的存储 dtype。
+    /// 混合存储（BF16 + F32）下计算仍统一 F32，存储精度由各 OpImpl weight_dtype 独立传播。
     #[test]
     fn test_graph_dtype_first_tensor_wins() {
         let mut g = CompilerGraph::new();
@@ -910,7 +915,7 @@ mod tests {
         let f32 = g.add_tensor_concrete("f32_tensor", &[32], DType::F32);
         g.inputs = vec![bf16, f32]; g.outputs = vec![f32];
         let dtype = graph_dtype(&g);
-        assert_eq!(dtype, QuantPrecision::BF16, "graph_dtype must reflect first tensor's BF16");
+        assert_eq!(dtype, QuantPrecision::F32, "graph_dtype must return compute precision F32 regardless of storage mix");
     }
 
     /// lower_fusion_plan with IsaProfile::cuda(80) must produce a VmProgram
