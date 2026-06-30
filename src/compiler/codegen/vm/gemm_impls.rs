@@ -90,7 +90,8 @@ macro_rules! impl_gemm_amx_tile {
             fn supports_dtype(&self, dt: QuantPrecision) -> bool { $supports(dt) }
             fn name(&self) -> &'static str { stringify!($name) }
             fn emit(&self, ctx: &mut EmitCtx<'_, '_>, lo: &GemmOpLayout) -> Result<(), CompilerError> {
-                emit_tile_gemm(ctx.prog, ctx.width, 16, 16, $k_depth, lo.k, $tile_dtype)
+                emit_tile_gemm(ctx.prog, ctx.width, 16, 16, $k_depth, lo.k, $tile_dtype,
+                    lo.a_ptr, lo.b_ptr, lo.c_ptr)
             }
         }
     };
@@ -120,7 +121,8 @@ impl OpImpl<GemmOpLayout> for GemmWgmma {
     fn emit(&self, ctx: &mut EmitCtx<'_, '_>, lo: &GemmOpLayout) -> Result<(), CompilerError> {
         let kd = lo.tile.map(|t| t.k_depth).unwrap_or(64);
         let tile_dt = lo.tile.map(|t| t.dtype).unwrap_or(QuantPrecision::BF16);
-        emit_tile_gemm(ctx.prog, ctx.width, 64, lo.n.min(32), kd, lo.k, tile_dt.to_dtype())
+        emit_tile_gemm(ctx.prog, ctx.width, 64, lo.n.min(32), kd, lo.k, tile_dt.to_dtype(),
+            lo.a_ptr, lo.b_ptr, lo.c_ptr)
     }
 }
 
@@ -141,7 +143,8 @@ impl OpImpl<GemmOpLayout> for GemmTcgen05 {
     fn emit(&self, ctx: &mut EmitCtx<'_, '_>, lo: &GemmOpLayout) -> Result<(), CompilerError> {
         let kd = lo.tile.map(|t| t.k_depth).unwrap_or(64);
         let tile_dt = lo.tile.map(|t| t.dtype).unwrap_or(QuantPrecision::F16);
-        emit_tile_gemm(ctx.prog, ctx.width, 64, lo.n.min(64), kd, lo.k, tile_dt.to_dtype())
+        emit_tile_gemm(ctx.prog, ctx.width, 64, lo.n.min(64), kd, lo.k, tile_dt.to_dtype(),
+            lo.a_ptr, lo.b_ptr, lo.c_ptr)
     }
 }
 
@@ -158,7 +161,8 @@ macro_rules! impl_mfma {
             fn supports_dtype(&self, dt: QuantPrecision) -> bool { $supports(dt) }
             fn name(&self) -> &'static str { stringify!($name) }
             fn emit(&self, ctx: &mut EmitCtx<'_, '_>, lo: &GemmOpLayout) -> Result<(), CompilerError> {
-                emit_tile_gemm(ctx.prog, ctx.width, $m, $n, $kd, lo.k, lo.dtype.to_dtype())
+                emit_tile_gemm(ctx.prog, ctx.width, $m, $n, $kd, lo.k, lo.dtype.to_dtype(),
+                    lo.a_ptr, lo.b_ptr, lo.c_ptr)
             }
         }
     };
@@ -186,7 +190,8 @@ impl OpImpl<GemmOpLayout> for GemmSmeTile {
     fn emit(&self, ctx: &mut EmitCtx<'_, '_>, lo: &GemmOpLayout) -> Result<(), CompilerError> {
         // SME tile 尺寸由 ZA tile VL 决定, 从 GemmOpLayout.tile 获取。
         let (rows, cols, kd) = lo.tile.map(|t| (t.rows, t.cols, t.k_depth)).unwrap_or((16, 16, 4));
-        emit_tile_gemm(ctx.prog, ctx.width, rows, cols, kd, lo.k, lo.dtype.to_dtype())
+        emit_tile_gemm(ctx.prog, ctx.width, rows, cols, kd, lo.k, lo.dtype.to_dtype(),
+            lo.a_ptr, lo.b_ptr, lo.c_ptr)
     }
 }
 
@@ -203,7 +208,8 @@ macro_rules! impl_tc_tile_mma {
             fn supports_dtype(&self, dt: QuantPrecision) -> bool { $supports(dt) }
             fn name(&self) -> &'static str { stringify!($name) }
             fn emit(&self, ctx: &mut EmitCtx<'_, '_>, lo: &GemmOpLayout) -> Result<(), CompilerError> {
-                emit_tile_gemm(ctx.prog, ctx.width, $m, $n, $kd, lo.k, lo.dtype.to_dtype())
+                emit_tile_gemm(ctx.prog, ctx.width, $m, $n, $kd, lo.k, lo.dtype.to_dtype(),
+                    lo.a_ptr, lo.b_ptr, lo.c_ptr)
             }
         }
     };

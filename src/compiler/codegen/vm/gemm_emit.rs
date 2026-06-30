@@ -10,17 +10,75 @@ use crate::compiler::graph::SymDim;
 use crate::compiler::pain_point::ExecPattern;
 use crate::types::CompilerError;
 
+/// Tile GEMM lowering — 把完整 tile 数据流 (TileLoad/TileMma/TileStore) 提回 VmInstr IR。
+///
+/// 设计来源: SPEC/DESIGN-tile-dataflow-ir-completion.md §2.1。
+///
+/// 产出 IR 序列 (让 numerical_sim 可自主模拟 13 后端数值对齐, 不依赖 Intel SDE):
+/// ```text
+/// TileConfig { rows, cols, dtype }
+/// Loop(k_tiles, step=kd*elem_bytes):
+///     off = 当前 K 块字节偏移 (循环变量推进 base)
+///     TileLoad A { dst=tile_a, base=a_ptr, k_offset=off, row_stride=a_stride, rows, cols=kd }
+///     TileLoad B { dst=tile_b, base=b_ptr, k_offset=off, row_stride=b_stride, rows=kd, cols }
+///     TileMma   { c=tile_c, a=tile_a, b=tile_b, m=rows, n=cols, k=kd }
+/// TileStore C { src=tile_c, base=c_ptr, out_offset=0, row_stride=c_stride, rows, cols }
+/// TileRelease
+/// ```
+///
+/// R1 决定性风险: `k_offset` (K 循环偏移, 循环变量推进 base) 与 `row_stride`
+/// (2D tile 内逐行字节跨度) 是两个独立量, 禁止合并成单一 offset
+/// (合并 → x86 TILELOADD 误寻址, 数值全错)。
+///
+/// @trace REQ-HW-TIER-007 [req:VmInstr-TileLoad] tile 数据加载进 IR
+/// @trace REQ-HW-TIER-008 [req:VmInstr-TileMma-Shape] TileMma 携带 shape
+/// @trace REQ-HW-TIER-009 [req:VmInstr-TileStore] tile 结果写回进 IR
 pub(crate) fn emit_tile_gemm(
     prog: &mut VmProgram, width: SimdWidth,
     rows: usize, cols: usize, kd: usize, k: usize, dt: crate::types::DType,
+    a_ptr: VRegId, b_ptr: VRegId, c_ptr: VRegId,
 ) -> Result<(), CompilerError> {
     let tile_c = prog.alloc_vreg(VRegKind::Tile, width);
     let tile_a = prog.alloc_vreg(VRegKind::Tile, width);
     let tile_b = prog.alloc_vreg(VRegKind::Tile, width);
+
+    // 行跨度 = 列数 × 元素字节宽 (2D tile 内逐行字节跨度, 与 K 循环偏移独立)。
+    let a_row_stride = kd * dt.size_bytes();   // A: rows×kd, 行跨 = kd*elem
+    let b_row_stride = cols * dt.size_bytes(); // B: kd×cols, 行跨 = cols*elem
+    let c_row_stride = cols * dt.size_bytes(); // C: rows×cols, 行跨 = cols*elem
+
     prog.emit(VmInstr::TileConfig { rows, cols, dtype: dt });
+
     let k_tiles = (k + kd - 1) / kd;
-    prog.emit_loop(BoundExpr::Const(k_tiles), kd * dt.size_bytes(), |prog, _ctr, _off| {
-        prog.emit(VmInstr::TileMma { c: tile_c, a: tile_a, b: tile_b });
+    // off = 当前 K 块字节偏移 (循环变量推进 base, 每次 += kd*elem_bytes)。
+    prog.emit_loop(
+        BoundExpr::Const(k_tiles),
+        kd * dt.size_bytes(),
+        |prog, _ctr, off| {
+            // A tile: rows×kd, 从 a_ptr + off 加载 (K 维推进)。
+            prog.emit(VmInstr::TileLoad {
+                dst_tile: tile_a, base_ptr: a_ptr, k_offset: off,
+                row_stride: a_row_stride, rows, cols: kd, dtype: dt,
+            });
+            // B tile: kd×cols, 从 b_ptr + off 加载 (K 维推进)。
+            prog.emit(VmInstr::TileLoad {
+                dst_tile: tile_b, base_ptr: b_ptr, k_offset: off,
+                row_stride: b_row_stride, rows: kd, cols, dtype: dt,
+            });
+            // c += a × b  (a: rows×kd, b: kd×cols, c: rows×cols)
+            prog.emit(VmInstr::TileMma {
+                c: tile_c, a: tile_a, b: tile_b,
+                m: rows, n: cols, k: kd, dtype: dt,
+            });
+        },
+    );
+
+    // C tile 写回: 单 tile, out_offset = 0 (M/N 外层循环不在本函数, 由调用方按需复制 tile)。
+    let c_off = prog.alloc_vreg(VRegKind::Scalar, SimdWidth::Scalar);
+    prog.emit(VmInstr::GprLoadImm { dst: c_off, value: 0 });
+    prog.emit(VmInstr::TileStore {
+        src_tile: tile_c, base_ptr: c_ptr, out_offset: c_off,
+        row_stride: c_row_stride, rows, cols, dtype: dt,
     });
     prog.emit(VmInstr::TileRelease);
     Ok(())
@@ -1913,8 +1971,11 @@ mod template_tests {
         let mut prog = VmProgram::new();
         let width = SimdWidth::W256;
         let dt = crate::types::DType::F32;
+        let a_ptr = prog.alloc_vreg(VRegKind::Ptr, width);
+        let b_ptr = prog.alloc_vreg(VRegKind::Ptr, width);
+        let c_ptr = prog.alloc_vreg(VRegKind::Ptr, width);
 
-        let result = emit_tile_gemm(&mut prog, width, 4, 4, 4, 16, dt);
+        let result = emit_tile_gemm(&mut prog, width, 4, 4, 4, 16, dt, a_ptr, b_ptr, c_ptr);
 
         assert!(result.is_ok());
         let instrs: Vec<&VmInstr> = prog.instrs.iter().collect();
@@ -2994,9 +3055,12 @@ mod template_tests {
         let mut prog = VmProgram::new();
         let width = SimdWidth::W256;
         let dt = crate::types::DType::F32;
+        let a_ptr = prog.alloc_vreg(VRegKind::Ptr, width);
+        let b_ptr = prog.alloc_vreg(VRegKind::Ptr, width);
+        let c_ptr = prog.alloc_vreg(VRegKind::Ptr, width);
 
         // Act
-        let result = emit_tile_gemm(&mut prog, width, 2, 8, 4, 32, dt);
+        let result = emit_tile_gemm(&mut prog, width, 2, 8, 4, 32, dt, a_ptr, b_ptr, c_ptr);
 
         // Assert: should still emit TileConfig + TileRelease lifecycle
         assert!(result.is_ok());
@@ -3354,9 +3418,12 @@ mod template_tests {
         let mut prog = VmProgram::new();
         let width = SimdWidth::W256;
         let dt = crate::types::DType::BF16;
+        let a_ptr = prog.alloc_vreg(VRegKind::Ptr, width);
+        let b_ptr = prog.alloc_vreg(VRegKind::Ptr, width);
+        let c_ptr = prog.alloc_vreg(VRegKind::Ptr, width);
 
         // Act: tile GEMM with BF16
-        let result = emit_tile_gemm(&mut prog, width, 4, 4, 4, 16, dt);
+        let result = emit_tile_gemm(&mut prog, width, 4, 4, 4, 16, dt, a_ptr, b_ptr, c_ptr);
 
         // Assert: should succeed and emit TileConfig with BF16 dtype
         assert!(result.is_ok());
