@@ -1398,95 +1398,7 @@ impl<'a> RegAllocator<'a> {
 
         // For each spilled VReg, find first write and first read positions
         let is_pure_write = |instr: &VmInstr, vreg: VRegId| -> bool {
-            match instr {
-                VmInstr::Broadcast { dst, .. } => *dst == vreg,
-                VmInstr::VecLoad { dst, .. } => *dst == vreg,
-                VmInstr::LoadPtr { dst, .. } => *dst == vreg,
-                VmInstr::ScalarLoad { dst, .. } => *dst == vreg,
-                VmInstr::ScalarByteLoad { dst, .. } => *dst == vreg,
-                VmInstr::GgufSubScaleLoad { dst, .. } => *dst == vreg,
-                VmInstr::GgufKQuantScaleLoad { dst, .. } => *dst == vreg,
-                VmInstr::GprBinOp { dst, a, b, .. } => {
-                    let other_inputs_ok = *a != vreg && (b.vreg() != Some(vreg));
-                    *dst == vreg && other_inputs_ok
-                }
-                VmInstr::GprUnaryOp { dst, src, .. } => *dst == vreg && *src != vreg,
-                VmInstr::GprLoadImm { dst, .. } => *dst == vreg,
-                VmInstr::VecUnaryOp { dst, a, .. } => *dst == vreg && *a != vreg,
-                VmInstr::VecBinOp { dst, a, b, .. } => {
-                    *dst == vreg && *a != vreg && *b != vreg
-                }
-                VmInstr::VecCmp { dst, a, b, .. } => {
-                    *dst == vreg && *a != vreg && *b != vreg
-                }
-                VmInstr::VecCast { dst, src, .. } => {
-                    *dst == vreg && *src != vreg
-                }
-                VmInstr::ConditionalSelect { dst, mask, true_val, false_val, .. } => {
-                    *dst == vreg && *mask != vreg && *true_val != vreg && *false_val != vreg
-                }
-                VmInstr::HReduce { dst, src, .. } => *dst == vreg && *src != vreg,
-                VmInstr::Transcendental { dst, src, .. } => *dst == vreg && *src != vreg,
-                VmInstr::Fma { dst, acc, a, b, .. } => {
-                    *dst == vreg && *acc != vreg && *a != vreg && *b != vreg
-                }
-                VmInstr::StoreConstToStack { .. } => false,
-                VmInstr::AddPtr { dst, base, .. } => *dst == vreg && *base != vreg,
-                VmInstr::MemCopy { .. } => false,
-                VmInstr::IntMulStride { dst, src, .. } => *dst == vreg && *src != vreg,
-                VmInstr::DeclareVReg { .. } => false,
-                VmInstr::ScalarStore { src, .. } => *src == vreg, // reads vreg
-                VmInstr::VecScalarStore { src, .. } => *src == vreg, // reads vreg
-                // LoopBegin implicitly initializes counter and byte_offset to 0.
-                // Both are pure writes — no prior value is read.
-                // Quant* instructions that write dst
-                VmInstr::QuantLoadBytesVec { dst, base, .. } => *dst == vreg && *base != vreg,
-                VmInstr::QuantBroadcastInt { dst, .. } => *dst == vreg,
-                VmInstr::QuantExtractBits { dst, src, .. } => *dst == vreg && *src != vreg,
-                VmInstr::QuantCodebookLookup { dst, indices, .. } => *dst == vreg && *indices != vreg,
-                VmInstr::QuantInterleave { dst, lo, hi, .. }
-                | VmInstr::QuantConcatSeq { dst, lo, hi, .. } => {
-                    *dst == vreg && *lo != vreg && *hi != vreg
-                }
-                VmInstr::Q3KDecodeStep { dst, block_base, lane_offset, d_vreg, .. } => {
-                    *dst == vreg && *block_base != vreg && *lane_offset != vreg && *d_vreg != vreg
-                }
-                VmInstr::QuantScalarCvtLoad { dst, base, .. } => *dst == vreg && *base != vreg,
-                VmInstr::QuantDequantFma { dst, weight, activation, scale, zero_point, .. } => {
-                    *dst == vreg && *weight != vreg && *activation != vreg
-                        && *scale != vreg && *zero_point != vreg
-                }
-                VmInstr::LoopBegin { counter, byte_offset, .. } => {
-                    *counter == vreg || *byte_offset == vreg
-                }
-                VmInstr::ScalarToIndex { dst, src, .. } => *dst == vreg && *src != vreg,
-                // Sampling/softmax instructions that write dst
-                VmInstr::SoftmaxReduceMax { dst, logits_ptr, .. } => *dst == vreg && *logits_ptr != vreg,
-                VmInstr::SoftmaxExpSum { sum_dst, logits_ptr, max_val, .. } => {
-                    *sum_dst == vreg && *logits_ptr != vreg && *max_val != vreg
-                }
-                VmInstr::SampleMultinomial { dst, probs_ptr, rng_state_ptr, .. } => {
-                    *dst == vreg && *probs_ptr != vreg && *rng_state_ptr != vreg
-                }
-                VmInstr::WarpPRNG { dst, rng_state_ptr } => {
-                    *dst == vreg && *rng_state_ptr != vreg
-                }
-                VmInstr::Argmax { dst, logits_ptr, .. } => *dst == vreg && *logits_ptr != vreg,
-                VmInstr::BatchPerSeqArgmax { dst, seq_id, logits_flat_ptr, .. } => {
-                    *dst == vreg && *seq_id != vreg && *logits_flat_ptr != vreg
-                }
-                // §20 BCI cumsum search: dst is pure write (seq_id lookup result).
-                VmInstr::SeqIdLookup { dst, token_index, seq_meta_base, num_seqs, .. } => {
-                    *dst == vreg && *token_index != vreg && *seq_meta_base != vreg && *num_seqs != vreg
-                }
-                VmInstr::BatchSeqIdLookup { dst, pt_offset_out, token_index, batch_ctx_ptr } => {
-                    *dst == vreg && *pt_offset_out != vreg && *token_index != vreg && *batch_ctx_ptr != vreg
-                }
-                VmInstr::SoftmaxNormalize { logits_ptr, sum_val, .. } => false, // in-place, no VReg dst
-                VmInstr::SampleTopKFilter { .. } => false, // in-place, no VReg dst
-                VmInstr::SampleTopPFilter { .. } => false, // in-place, no VReg dst
-                _ => false,
-            }
+            validate_spill_is_pure_write(instr, vreg)
         };
 
         let reads_vreg = |instr: &VmInstr, vreg: VRegId| -> bool {
@@ -1799,6 +1711,184 @@ impl<'a> RegAllocator<'a> {
         Ok(())
     }
 }
+
+/// Spill-safety pure-write predicate (hoisted from RegAllocator::validate_spill_safety
+/// for BCE-20260630-LOWER-INSTR-GOD-MATCH P3b — god-match split). Returns true if
+/// `instr` writes `vreg` without reading any prior value of it.
+fn validate_spill_is_pure_write(instr: &VmInstr, vreg: VRegId) -> bool {
+        match instr.category() {
+        super::vm_instr_category::InstrCategory::Memory => validate_spill_is_pure_write_memorya(instr, vreg),
+        super::vm_instr_category::InstrCategory::Arith => validate_spill_is_pure_write_aritha(instr, vreg),
+        super::vm_instr_category::InstrCategory::Control => validate_spill_is_pure_write_controla(instr, vreg),
+        super::vm_instr_category::InstrCategory::Quant => validate_spill_is_pure_write_quanta(instr, vreg),
+        super::vm_instr_category::InstrCategory::Sampling => validate_spill_is_pure_write_samplinga(instr, vreg),
+        super::vm_instr_category::InstrCategory::Misc => validate_spill_is_pure_write_misca(instr, vreg),
+        _ => false,
+    }
+}
+
+fn validate_spill_is_pure_write_memorya(instr: &VmInstr, vreg: VRegId) -> bool {
+    // Memory cluster a (8 arms) — ARCH-LOWER-DISPATCH-LAYERING P3 (机械抽取)
+    match instr {
+        VmInstr::Broadcast { dst, .. } => *dst == vreg,
+        VmInstr::VecLoad { dst, .. } => *dst == vreg,
+        VmInstr::LoadPtr { dst, .. } => *dst == vreg,
+        VmInstr::ScalarLoad { dst, .. } => *dst == vreg,
+        VmInstr::ScalarByteLoad { dst, .. } => *dst == vreg,
+        VmInstr::StoreConstToStack { .. } => false,
+        VmInstr::AddPtr { dst, base, .. } => *dst == vreg && *base != vreg,
+        VmInstr::MemCopy { .. } => false,
+        _ => validate_spill_is_pure_write_memoryb(instr, vreg),
+    }
+}
+
+fn validate_spill_is_pure_write_memoryb(instr: &VmInstr, vreg: VRegId) -> bool {
+    // Memory cluster b (4 arms) — ARCH-LOWER-DISPATCH-LAYERING P3 (机械抽取)
+    match instr {
+        VmInstr::IntMulStride { dst, src, .. } => *dst == vreg && *src != vreg,
+        VmInstr::ScalarStore { src, .. } => *src == vreg,
+        // reads vreg
+        VmInstr::VecScalarStore { src, .. } => *src == vreg,
+        VmInstr::ScalarToIndex { dst, src, .. } => *dst == vreg && *src != vreg,
+        _ => false,
+    }
+}
+
+fn validate_spill_is_pure_write_aritha(instr: &VmInstr, vreg: VRegId) -> bool {
+    // Arith cluster a (8 arms) — ARCH-LOWER-DISPATCH-LAYERING P3 (机械抽取)
+    match instr {
+        VmInstr::GprBinOp { dst, a, b, .. } => {
+                        let other_inputs_ok = *a != vreg && (b.vreg() != Some(vreg));
+                        *dst == vreg && other_inputs_ok
+                    },
+        VmInstr::GprUnaryOp { dst, src, .. } => *dst == vreg && *src != vreg,
+        VmInstr::GprLoadImm { dst, .. } => *dst == vreg,
+        VmInstr::VecUnaryOp { dst, a, .. } => *dst == vreg && *a != vreg,
+        VmInstr::VecBinOp { dst, a, b, .. } => {
+                        *dst == vreg && *a != vreg && *b != vreg
+                    },
+        VmInstr::VecCmp { dst, a, b, .. } => {
+                        *dst == vreg && *a != vreg && *b != vreg
+                    },
+        VmInstr::VecCast { dst, src, .. } => {
+                        *dst == vreg && *src != vreg
+                    },
+        VmInstr::ConditionalSelect { dst, mask, true_val, false_val, .. } => {
+                        *dst == vreg && *mask != vreg && *true_val != vreg && *false_val != vreg
+                    },
+        _ => validate_spill_is_pure_write_arithb(instr, vreg),
+    }
+}
+
+fn validate_spill_is_pure_write_arithb(instr: &VmInstr, vreg: VRegId) -> bool {
+    // Arith cluster b (3 arms) — ARCH-LOWER-DISPATCH-LAYERING P3 (机械抽取)
+    match instr {
+        VmInstr::HReduce { dst, src, .. } => *dst == vreg && *src != vreg,
+        VmInstr::Transcendental { dst, src, .. } => *dst == vreg && *src != vreg,
+        VmInstr::Fma { dst, acc, a, b, .. } => {
+                        *dst == vreg && *acc != vreg && *a != vreg && *b != vreg
+                    },
+        _ => false,
+    }
+}
+
+fn validate_spill_is_pure_write_controla(instr: &VmInstr, vreg: VRegId) -> bool {
+    // Control cluster a (1 arms) — ARCH-LOWER-DISPATCH-LAYERING P3 (机械抽取)
+    match instr {
+        VmInstr::LoopBegin { counter, byte_offset, .. } => {
+                        *counter == vreg || *byte_offset == vreg
+                    },
+        _ => false,
+    }
+}
+
+fn validate_spill_is_pure_write_quanta(instr: &VmInstr, vreg: VRegId) -> bool {
+    // Quant cluster a (8 arms) — ARCH-LOWER-DISPATCH-LAYERING P3 (机械抽取)
+    match instr {
+        VmInstr::GgufSubScaleLoad { dst, .. } => *dst == vreg,
+        VmInstr::GgufKQuantScaleLoad { dst, .. } => *dst == vreg,
+        // reads vreg
+        // LoopBegin implicitly initializes counter and byte_offset to 0.
+        // Both are pure writes — no prior value is read.
+        // Quant* instructions that write dst
+        VmInstr::QuantLoadBytesVec { dst, base, .. } => *dst == vreg && *base != vreg,
+        VmInstr::QuantBroadcastInt { dst, .. } => *dst == vreg,
+        VmInstr::QuantExtractBits { dst, src, .. } => *dst == vreg && *src != vreg,
+        VmInstr::QuantCodebookLookup { dst, indices, .. } => *dst == vreg && *indices != vreg,
+        VmInstr::QuantInterleave { dst, lo, hi, .. } => {
+                        *dst == vreg && *lo != vreg && *hi != vreg
+                    },
+        VmInstr::QuantConcatSeq { dst, lo, hi, .. } => {
+                        *dst == vreg && *lo != vreg && *hi != vreg
+                    },
+        _ => validate_spill_is_pure_write_quantb(instr, vreg),
+    }
+}
+
+fn validate_spill_is_pure_write_quantb(instr: &VmInstr, vreg: VRegId) -> bool {
+    // Quant cluster b (3 arms) — ARCH-LOWER-DISPATCH-LAYERING P3 (机械抽取)
+    match instr {
+        VmInstr::Q3KDecodeStep { dst, block_base, lane_offset, d_vreg, .. } => {
+                        *dst == vreg && *block_base != vreg && *lane_offset != vreg && *d_vreg != vreg
+                    },
+        VmInstr::QuantScalarCvtLoad { dst, base, .. } => *dst == vreg && *base != vreg,
+        VmInstr::QuantDequantFma { dst, weight, activation, scale, zero_point, .. } => {
+                        *dst == vreg && *weight != vreg && *activation != vreg
+                            && *scale != vreg && *zero_point != vreg
+                    },
+        _ => false,
+    }
+}
+
+fn validate_spill_is_pure_write_samplinga(instr: &VmInstr, vreg: VRegId) -> bool {
+    // Sampling cluster a (8 arms) — ARCH-LOWER-DISPATCH-LAYERING P3 (机械抽取)
+    match instr {
+        // Sampling/softmax instructions that write dst
+        VmInstr::SoftmaxReduceMax { dst, logits_ptr, .. } => *dst == vreg && *logits_ptr != vreg,
+        VmInstr::SoftmaxExpSum { sum_dst, logits_ptr, max_val, .. } => {
+                        *sum_dst == vreg && *logits_ptr != vreg && *max_val != vreg
+                    },
+        VmInstr::SampleMultinomial { dst, probs_ptr, rng_state_ptr, .. } => {
+                        *dst == vreg && *probs_ptr != vreg && *rng_state_ptr != vreg
+                    },
+        VmInstr::WarpPRNG { dst, rng_state_ptr } => {
+                        *dst == vreg && *rng_state_ptr != vreg
+                    },
+        VmInstr::Argmax { dst, logits_ptr, .. } => *dst == vreg && *logits_ptr != vreg,
+        VmInstr::BatchPerSeqArgmax { dst, seq_id, logits_flat_ptr, .. } => {
+                        *dst == vreg && *seq_id != vreg && *logits_flat_ptr != vreg
+                    },
+        // §20 BCI cumsum search: dst is pure write (seq_id lookup result).
+        VmInstr::SeqIdLookup { dst, token_index, seq_meta_base, num_seqs, .. } => {
+                        *dst == vreg && *token_index != vreg && *seq_meta_base != vreg && *num_seqs != vreg
+                    },
+        VmInstr::BatchSeqIdLookup { dst, pt_offset_out, token_index, batch_ctx_ptr } => {
+                        *dst == vreg && *pt_offset_out != vreg && *token_index != vreg && *batch_ctx_ptr != vreg
+                    },
+        _ => validate_spill_is_pure_write_samplingb(instr, vreg),
+    }
+}
+
+fn validate_spill_is_pure_write_samplingb(instr: &VmInstr, vreg: VRegId) -> bool {
+    // Sampling cluster b (3 arms) — ARCH-LOWER-DISPATCH-LAYERING P3 (机械抽取)
+    match instr {
+        VmInstr::SoftmaxNormalize { logits_ptr, sum_val, .. } => false,
+        // in-place, no VReg dst
+        VmInstr::SampleTopKFilter { .. } => false,
+        // in-place, no VReg dst
+        VmInstr::SampleTopPFilter { .. } => false,
+        _ => false,
+    }
+}
+
+fn validate_spill_is_pure_write_misca(instr: &VmInstr, vreg: VRegId) -> bool {
+    // Misc cluster a (1 arms) — ARCH-LOWER-DISPATCH-LAYERING P3 (机械抽取)
+    match instr {
+        VmInstr::DeclareVReg { .. } => false,
+        _ => false,
+    }
+}
+
 
 #[cfg(test)]
 mod tests {

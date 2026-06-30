@@ -70,6 +70,18 @@ pub struct VmProgram {
     next_label_id: usize,
 }
 
+/// 值的语义域 — VmProgram::validate_value_domains 使用 (BCE-20260630-LOWER-INSTR-GOD-MATCH P3b hoist)。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Domain {
+    Ptr,
+    ByteOff,
+    Counter,
+    LoopByteOffset,
+    VecData,
+    ScalarData,
+    Unknown,
+}
+
 impl VmProgram {
     pub fn new() -> Self {
         Self { instrs: Vec::new(), next_vreg: 0, next_scope_id: 0, next_label_id: 1000 }
@@ -1414,182 +1426,236 @@ impl VmProgram {
                 None
             };
 
-            match instr {
-                VmInstr::VecLoad { dst, base, .. } => {
-                    if let Some(e) = check(*dst, false, "dst") { return Err(e); }
-                    if let Some(e) = check(*base, true, "base") { return Err(e); }
-                }
-                VmInstr::VecStore { base, src, .. } => {
-                    if let Some(e) = check(*base, true, "base") { return Err(e); }
-                    if let Some(e) = check(*src, false, "src") { return Err(e); }
-                }
-                VmInstr::VecNarrow { dst, src, .. } => {
-                    if let Some(e) = check(*dst, false, "dst") { return Err(e); }
-                    if let Some(e) = check(*src, false, "src") { return Err(e); }
-                }
-                VmInstr::VecWiden { dst, src, .. } => {
-                    if let Some(e) = check(*dst, false, "dst") { return Err(e); }
-                    if let Some(e) = check(*src, false, "src") { return Err(e); }
-                }
-                VmInstr::Mov { dst, src, .. } => {
-                    if let Some(e) = check(*dst, false, "dst") { return Err(e); }
-                    if let Some(e) = check(*src, false, "src") { return Err(e); }
-                }
-                VmInstr::VecBinOp { dst, a, b, .. } => {
-                    if let Some(e) = check(*dst, false, "dst") { return Err(e); }
-                    if let Some(e) = check(*a, false, "a") { return Err(e); }
-                    if let Some(e) = check(*b, false, "b") { return Err(e); }
-                }
-                VmInstr::VecShiftImm { dst, a, .. } => {
-                    if let Some(e) = check(*dst, false, "dst") { return Err(e); }
-                    if let Some(e) = check(*a, false, "a") { return Err(e); }
-                }
-                VmInstr::VecUnaryOp { dst, a, .. } => {
-                    if let Some(e) = check(*dst, false, "dst") { return Err(e); }
-                    if let Some(e) = check(*a, false, "a") { return Err(e); }
-                }
-                VmInstr::Fma { dst, acc, a, b, ..} => {
-                    if let Some(e) = check(*dst, false, "dst") { return Err(e); }
-                    if let Some(e) = check(*acc, false, "acc") { return Err(e); }
-                    if let Some(e) = check(*a, false, "a") { return Err(e); }
-                    if let Some(e) = check(*b, false, "b") { return Err(e); }
-                }
-                VmInstr::HReduce { dst, src, .. } => {
-                    if let Some(e) = check(*dst, false, "dst") { return Err(e); }
-                    if let Some(e) = check(*src, false, "src") { return Err(e); }
-                }
-                VmInstr::Accumulate { acc, src } => {
-                    if let Some(e) = check(*acc, false, "acc") { return Err(e); }
-                    if let Some(e) = check(*src, false, "src") { return Err(e); }
-                }
-                VmInstr::Transcendental { dst, src, .. } => {
-                    if let Some(e) = check(*dst, false, "dst") { return Err(e); }
-                    if let Some(e) = check(*src, false, "src") { return Err(e); }
-                }
-                VmInstr::LoadPtr { dst, .. } => {
-                    if let Some(e) = check(*dst, true, "dst") { return Err(e); }
-                }
-                VmInstr::Argmax { dst, logits_ptr, .. } => {
-                    if let Some(e) = check(*dst, true, "dst") { return Err(e); }
-                    if let Some(e) = check(*logits_ptr, true, "logits_ptr") { return Err(e); }
-                }
-                VmInstr::AddPtr { dst, base, .. } => {
-                    if let Some(e) = check(*dst, true, "dst") { return Err(e); }
-                    if let Some(e) = check(*base, true, "base") { return Err(e); }
-                }
-                VmInstr::ScalarLoad { dst, base, .. } => {
-                    if let Some(e) = check(*dst, true, "dst") { return Err(e); }
-                    if let Some(e) = check(*base, true, "base") { return Err(e); }
-                }
-                VmInstr::ScalarStore { base, src, .. } => {
-                    if let Some(e) = check(*base, true, "base") { return Err(e); }
-                    if let Some(e) = check(*src, true, "src") { return Err(e); }
-                }
-                VmInstr::VecScalarStore { base, src, .. } => {
-                    if let Some(e) = check(*base, true, "base") { return Err(e); }
-                    if let Some(e) = check(*src, false, "src") { return Err(e); }
-                }
-                VmInstr::IntMulStride { dst, src, .. } => {
-                    if let Some(e) = check(*dst, true, "dst") { return Err(e); }
-                    if let Some(e) = check(*src, true, "src") { return Err(e); }
-                }
-                VmInstr::ScalarToIndex { dst, src, .. } => {
-                    if let Some(e) = check(*dst, true, "dst") { return Err(e); }
-                    if let Some(e) = check(*src, true, "src") { return Err(e); }
-                }
-                VmInstr::IndexToScalar { dst, src } => {
-                    // dst holds f32 result (XMM register), src is GPR integer
-                    if let Some(e) = check(*dst, false, "dst") { return Err(e); }
-                    if let Some(e) = check(*src, true, "src") { return Err(e); }
-                }
-                VmInstr::ScalarByteLoad { dst, base, .. } => {
-                    if let Some(e) = check(*dst, true, "dst") { return Err(e); }
-                    if let Some(e) = check(*base, true, "base") { return Err(e); }
-                }
-                VmInstr::Broadcast { dst, src, .. } => {
-                    if let Some(e) = check(*dst, false, "dst") { return Err(e); }
-                    if let ScalarExpr::MemLoad(b, _) = src {
-                        if let Some(e) = check(*b, true, "Broadcast.MemLoad.base") { return Err(e); }
-                    }
-                    if let ScalarExpr::ExtractLane0(s) = src {
-                        if let Some(e) = check(*s, false, "Broadcast.ExtractLane0.src") { return Err(e); }
-                    }
-                    if let ScalarExpr::VReg(s) = src {
-                        // VReg src can be GPR (legacy) or Vec (from IndexToScalar output)
-                        // No strict class check — both are valid
-                        let _ = s;
-                    }
-                }
-                VmInstr::LoopBegin { counter, byte_offset, .. } => {
-                    match kinds.get(counter) {
-                        Some(VRegKind::Counter) => {}
-                        Some(k) => return Err(format!(
-                            "instr[{i}] LoopBegin: counter v{} is {:?}, expected Counter",
-                            counter.0, k)),
-                        None => {}
-                    }
-                    match kinds.get(byte_offset) {
-                        Some(VRegKind::ByteOffset) => {}
-                        Some(k) => return Err(format!(
-                            "instr[{i}] LoopBegin: byte_offset v{} is {:?}, expected ByteOffset",
-                            byte_offset.0, k)),
-                        None => {}
-                    }
-                }
-                VmInstr::TemperatureScale { logits_ptr, temp_ptr, .. } => {
-                    if let Some(e) = check(*logits_ptr, true, "logits_ptr") { return Err(e); }
-                    if let Some(e) = check(*temp_ptr, true, "temp_ptr") { return Err(e); }
-                }
-                VmInstr::StoreToken { token_id, output_buf, counter, input_ids_ptr, prompt_len_bytes } => {
-                    if let Some(e) = check(*token_id, true, "token_id") { return Err(e); }
-                    if let Some(e) = check(*output_buf, true, "output_buf") { return Err(e); }
-                    if let Some(e) = check(*counter, true, "counter") { return Err(e); }
-                    if let Some(e) = check(*input_ids_ptr, true, "input_ids_ptr") { return Err(e); }
-                    if let Some(e) = check(*prompt_len_bytes, true, "prompt_len_bytes") { return Err(e); }
-                }
-                VmInstr::CheckStopCondition { token_id, counter, eos_ptr, max_tokens_ptr } => {
-                    if let Some(e) = check(*token_id, true, "token_id") { return Err(e); }
-                    if let Some(e) = check(*counter, true, "counter") { return Err(e); }
-                    if let Some(e) = check(*eos_ptr, true, "eos_ptr") { return Err(e); }
-                    if let Some(e) = check(*max_tokens_ptr, true, "max_tokens_ptr") { return Err(e); }
-                }
-                VmInstr::GprBinOp { dst, a, b, .. } => {
-                    if let Some(e) = check(*dst, true, "dst") { return Err(e); }
-                    if let Some(e) = check(*a, true, "a") { return Err(e); }
-                    if let Some(v) = b.vreg() {
-                        if let Some(e) = check(v, true, "b") { return Err(e); }
-                    }
-                }
-                VmInstr::GprUnaryOp { dst, src, .. } => {
-                    if let Some(e) = check(*dst, true, "dst") { return Err(e); }
-                    if let Some(e) = check(*src, true, "src") { return Err(e); }
-                }
-                VmInstr::GprLoadImm { dst, .. } => {
-                    if let Some(e) = check(*dst, true, "dst") { return Err(e); }
-                }
-                VmInstr::AtomicAdd { base, .. } => {
-                    if let Some(e) = check(*base, true, "base") { return Err(e); }
-                }
-                VmInstr::GatherLoad { dst, base, indices, .. } => {
-                    if let Some(e) = check(*dst, false, "dst") { return Err(e); }
-                    if let Some(e) = check(*base, true, "base") { return Err(e); }
-                    if let Some(e) = check(*indices, true, "indices") { return Err(e); }
-                }
-                VmInstr::ScatterStore { base, indices, src, .. } => {
-                    if let Some(e) = check(*base, true, "base") { return Err(e); }
-                    if let Some(e) = check(*indices, true, "indices") { return Err(e); }
-                    if let Some(e) = check(*src, false, "src") { return Err(e); }
-                }
-                VmInstr::TableLookup { dst, base, row_index, .. } => {
-                    if let Some(e) = check(*dst, false, "dst") { return Err(e); }
-                    if let Some(e) = check(*base, true, "base") { return Err(e); }
-                    if let Some(e) = check(*row_index, true, "row_index") { return Err(e); }
-                }
-                _ => {}
+                        match instr.category() {
+                super::vm_instr_category::InstrCategory::Memory => Self::validate_type_consistency_memorya(instr, i, &kinds, &check)?,
+                super::vm_instr_category::InstrCategory::Arith => Self::validate_type_consistency_aritha(instr, i, &kinds, &check)?,
+                super::vm_instr_category::InstrCategory::Control => Self::validate_type_consistency_controla(instr, i, &kinds, &check)?,
+                super::vm_instr_category::InstrCategory::Sampling => Self::validate_type_consistency_samplinga(instr, i, &kinds, &check)?,
+                _ => {},
             }
         }
         Ok(())
     }
+
+    fn validate_type_consistency_memorya(instr: &VmInstr, i: usize, kinds: &std::collections::HashMap<VRegId, VRegKind>, check: &impl Fn(VRegId, bool, &str) -> Option<String>) -> Result<(), String> {
+        // Memory cluster a (8 arms) — ARCH-LOWER-DISPATCH-LAYERING P3 (机械抽取)
+        match instr {
+            VmInstr::VecLoad { dst, base, .. } => { 
+                                    if let Some(e) = check(*dst, false, "dst") { return Err(e); }
+                                    if let Some(e) = check(*base, true, "base") { return Err(e); }
+                 Ok(()) },
+            VmInstr::VecStore { base, src, .. } => { 
+                                    if let Some(e) = check(*base, true, "base") { return Err(e); }
+                                    if let Some(e) = check(*src, false, "src") { return Err(e); }
+                 Ok(()) },
+            VmInstr::VecNarrow { dst, src, .. } => { 
+                                    if let Some(e) = check(*dst, false, "dst") { return Err(e); }
+                                    if let Some(e) = check(*src, false, "src") { return Err(e); }
+                 Ok(()) },
+            VmInstr::VecWiden { dst, src, .. } => { 
+                                    if let Some(e) = check(*dst, false, "dst") { return Err(e); }
+                                    if let Some(e) = check(*src, false, "src") { return Err(e); }
+                 Ok(()) },
+            VmInstr::Mov { dst, src, .. } => { 
+                                    if let Some(e) = check(*dst, false, "dst") { return Err(e); }
+                                    if let Some(e) = check(*src, false, "src") { return Err(e); }
+                 Ok(()) },
+            VmInstr::LoadPtr { dst, .. } => { 
+                                    if let Some(e) = check(*dst, true, "dst") { return Err(e); }
+                 Ok(()) },
+            VmInstr::AddPtr { dst, base, .. } => { 
+                                    if let Some(e) = check(*dst, true, "dst") { return Err(e); }
+                                    if let Some(e) = check(*base, true, "base") { return Err(e); }
+                 Ok(()) },
+            VmInstr::ScalarLoad { dst, base, .. } => { 
+                                    if let Some(e) = check(*dst, true, "dst") { return Err(e); }
+                                    if let Some(e) = check(*base, true, "base") { return Err(e); }
+                 Ok(()) },
+            _ => Self::validate_type_consistency_memoryb(instr, i, &kinds, &check),
+        }
+    }
+
+    fn validate_type_consistency_memoryb(instr: &VmInstr, i: usize, kinds: &std::collections::HashMap<VRegId, VRegKind>, check: &impl Fn(VRegId, bool, &str) -> Option<String>) -> Result<(), String> {
+        // Memory cluster b (8 arms) — ARCH-LOWER-DISPATCH-LAYERING P3 (机械抽取)
+        match instr {
+            VmInstr::ScalarStore { base, src, .. } => { 
+                                    if let Some(e) = check(*base, true, "base") { return Err(e); }
+                                    if let Some(e) = check(*src, true, "src") { return Err(e); }
+                 Ok(()) },
+            VmInstr::VecScalarStore { base, src, .. } => { 
+                                    if let Some(e) = check(*base, true, "base") { return Err(e); }
+                                    if let Some(e) = check(*src, false, "src") { return Err(e); }
+                 Ok(()) },
+            VmInstr::IntMulStride { dst, src, .. } => { 
+                                    if let Some(e) = check(*dst, true, "dst") { return Err(e); }
+                                    if let Some(e) = check(*src, true, "src") { return Err(e); }
+                 Ok(()) },
+            VmInstr::ScalarToIndex { dst, src, .. } => { 
+                                    if let Some(e) = check(*dst, true, "dst") { return Err(e); }
+                                    if let Some(e) = check(*src, true, "src") { return Err(e); }
+                 Ok(()) },
+            VmInstr::IndexToScalar { dst, src } => { 
+                                    // dst holds f32 result (XMM register), src is GPR integer
+                                    if let Some(e) = check(*dst, false, "dst") { return Err(e); }
+                                    if let Some(e) = check(*src, true, "src") { return Err(e); }
+                 Ok(()) },
+            VmInstr::ScalarByteLoad { dst, base, .. } => { 
+                                    if let Some(e) = check(*dst, true, "dst") { return Err(e); }
+                                    if let Some(e) = check(*base, true, "base") { return Err(e); }
+                 Ok(()) },
+            VmInstr::Broadcast { dst, src, .. } => { 
+                                    if let Some(e) = check(*dst, false, "dst") { return Err(e); }
+                                    if let ScalarExpr::MemLoad(b, _) = src {
+                                        if let Some(e) = check(*b, true, "Broadcast.MemLoad.base") { return Err(e); }
+                                    }
+                                    if let ScalarExpr::ExtractLane0(s) = src {
+                                        if let Some(e) = check(*s, false, "Broadcast.ExtractLane0.src") { return Err(e); }
+                                    }
+                                    if let ScalarExpr::VReg(s) = src {
+                                        // VReg src can be GPR (legacy) or Vec (from IndexToScalar output)
+                                        // No strict class check — both are valid
+                                        let _ = s;
+                                    }
+                 Ok(()) },
+            VmInstr::AtomicAdd { base, .. } => { 
+                                    if let Some(e) = check(*base, true, "base") { return Err(e); }
+                 Ok(()) },
+            _ => Self::validate_type_consistency_memoryc(instr, i, &kinds, &check),
+        }
+    }
+
+    fn validate_type_consistency_memoryc(instr: &VmInstr, i: usize, kinds: &std::collections::HashMap<VRegId, VRegKind>, check: &impl Fn(VRegId, bool, &str) -> Option<String>) -> Result<(), String> {
+        // Memory cluster c (3 arms) — ARCH-LOWER-DISPATCH-LAYERING P3 (机械抽取)
+        match instr {
+            VmInstr::GatherLoad { dst, base, indices, .. } => { 
+                                    if let Some(e) = check(*dst, false, "dst") { return Err(e); }
+                                    if let Some(e) = check(*base, true, "base") { return Err(e); }
+                                    if let Some(e) = check(*indices, true, "indices") { return Err(e); }
+                 Ok(()) },
+            VmInstr::ScatterStore { base, indices, src, .. } => { 
+                                    if let Some(e) = check(*base, true, "base") { return Err(e); }
+                                    if let Some(e) = check(*indices, true, "indices") { return Err(e); }
+                                    if let Some(e) = check(*src, false, "src") { return Err(e); }
+                 Ok(()) },
+            VmInstr::TableLookup { dst, base, row_index, .. } => { 
+                                    if let Some(e) = check(*dst, false, "dst") { return Err(e); }
+                                    if let Some(e) = check(*base, true, "base") { return Err(e); }
+                                    if let Some(e) = check(*row_index, true, "row_index") { return Err(e); }
+                 Ok(()) },
+            _ => Ok(()),
+        }
+    }
+
+    fn validate_type_consistency_aritha(instr: &VmInstr, i: usize, kinds: &std::collections::HashMap<VRegId, VRegKind>, check: &impl Fn(VRegId, bool, &str) -> Option<String>) -> Result<(), String> {
+        // Arith cluster a (8 arms) — ARCH-LOWER-DISPATCH-LAYERING P3 (机械抽取)
+        match instr {
+            VmInstr::VecBinOp { dst, a, b, .. } => { 
+                                    if let Some(e) = check(*dst, false, "dst") { return Err(e); }
+                                    if let Some(e) = check(*a, false, "a") { return Err(e); }
+                                    if let Some(e) = check(*b, false, "b") { return Err(e); }
+                 Ok(()) },
+            VmInstr::VecShiftImm { dst, a, .. } => { 
+                                    if let Some(e) = check(*dst, false, "dst") { return Err(e); }
+                                    if let Some(e) = check(*a, false, "a") { return Err(e); }
+                 Ok(()) },
+            VmInstr::VecUnaryOp { dst, a, .. } => { 
+                                    if let Some(e) = check(*dst, false, "dst") { return Err(e); }
+                                    if let Some(e) = check(*a, false, "a") { return Err(e); }
+                 Ok(()) },
+            VmInstr::Fma { dst, acc, a, b, ..} => { 
+                                    if let Some(e) = check(*dst, false, "dst") { return Err(e); }
+                                    if let Some(e) = check(*acc, false, "acc") { return Err(e); }
+                                    if let Some(e) = check(*a, false, "a") { return Err(e); }
+                                    if let Some(e) = check(*b, false, "b") { return Err(e); }
+                 Ok(()) },
+            VmInstr::HReduce { dst, src, .. } => { 
+                                    if let Some(e) = check(*dst, false, "dst") { return Err(e); }
+                                    if let Some(e) = check(*src, false, "src") { return Err(e); }
+                 Ok(()) },
+            VmInstr::Accumulate { acc, src } => { 
+                                    if let Some(e) = check(*acc, false, "acc") { return Err(e); }
+                                    if let Some(e) = check(*src, false, "src") { return Err(e); }
+                 Ok(()) },
+            VmInstr::Transcendental { dst, src, .. } => { 
+                                    if let Some(e) = check(*dst, false, "dst") { return Err(e); }
+                                    if let Some(e) = check(*src, false, "src") { return Err(e); }
+                 Ok(()) },
+            VmInstr::GprBinOp { dst, a, b, .. } => { 
+                                    if let Some(e) = check(*dst, true, "dst") { return Err(e); }
+                                    if let Some(e) = check(*a, true, "a") { return Err(e); }
+                                    if let Some(v) = b.vreg() {
+                                        if let Some(e) = check(v, true, "b") { return Err(e); }
+                                    }
+                 Ok(()) },
+            _ => Self::validate_type_consistency_arithb(instr, i, &kinds, &check),
+        }
+    }
+
+    fn validate_type_consistency_arithb(instr: &VmInstr, i: usize, kinds: &std::collections::HashMap<VRegId, VRegKind>, check: &impl Fn(VRegId, bool, &str) -> Option<String>) -> Result<(), String> {
+        // Arith cluster b (2 arms) — ARCH-LOWER-DISPATCH-LAYERING P3 (机械抽取)
+        match instr {
+            VmInstr::GprUnaryOp { dst, src, .. } => { 
+                                    if let Some(e) = check(*dst, true, "dst") { return Err(e); }
+                                    if let Some(e) = check(*src, true, "src") { return Err(e); }
+                 Ok(()) },
+            VmInstr::GprLoadImm { dst, .. } => { 
+                                    if let Some(e) = check(*dst, true, "dst") { return Err(e); }
+                 Ok(()) },
+            _ => Ok(()),
+        }
+    }
+
+    fn validate_type_consistency_controla(instr: &VmInstr, i: usize, kinds: &std::collections::HashMap<VRegId, VRegKind>, check: &impl Fn(VRegId, bool, &str) -> Option<String>) -> Result<(), String> {
+        // Control cluster a (1 arms) — ARCH-LOWER-DISPATCH-LAYERING P3 (机械抽取)
+        match instr {
+            VmInstr::LoopBegin { counter, byte_offset, .. } => { 
+                                    match kinds.get(counter) {
+                                        Some(VRegKind::Counter) => {}
+                                        Some(k) => return Err(format!(
+                                            "instr[{i}] LoopBegin: counter v{} is {:?}, expected Counter",
+                                            counter.0, k)),
+                                        None => {}
+                                    }
+                                    match kinds.get(byte_offset) {
+                                        Some(VRegKind::ByteOffset) => {}
+                                        Some(k) => return Err(format!(
+                                            "instr[{i}] LoopBegin: byte_offset v{} is {:?}, expected ByteOffset",
+                                            byte_offset.0, k)),
+                                        None => {}
+                                    }
+                 Ok(()) },
+            _ => Ok(()),
+        }
+    }
+
+    fn validate_type_consistency_samplinga(instr: &VmInstr, i: usize, kinds: &std::collections::HashMap<VRegId, VRegKind>, check: &impl Fn(VRegId, bool, &str) -> Option<String>) -> Result<(), String> {
+        // Sampling cluster a (4 arms) — ARCH-LOWER-DISPATCH-LAYERING P3 (机械抽取)
+        match instr {
+            VmInstr::Argmax { dst, logits_ptr, .. } => { 
+                                    if let Some(e) = check(*dst, true, "dst") { return Err(e); }
+                                    if let Some(e) = check(*logits_ptr, true, "logits_ptr") { return Err(e); }
+                 Ok(()) },
+            VmInstr::TemperatureScale { logits_ptr, temp_ptr, .. } => { 
+                                    if let Some(e) = check(*logits_ptr, true, "logits_ptr") { return Err(e); }
+                                    if let Some(e) = check(*temp_ptr, true, "temp_ptr") { return Err(e); }
+                 Ok(()) },
+            VmInstr::StoreToken { token_id, output_buf, counter, input_ids_ptr, prompt_len_bytes } => { 
+                                    if let Some(e) = check(*token_id, true, "token_id") { return Err(e); }
+                                    if let Some(e) = check(*output_buf, true, "output_buf") { return Err(e); }
+                                    if let Some(e) = check(*counter, true, "counter") { return Err(e); }
+                                    if let Some(e) = check(*input_ids_ptr, true, "input_ids_ptr") { return Err(e); }
+                                    if let Some(e) = check(*prompt_len_bytes, true, "prompt_len_bytes") { return Err(e); }
+                 Ok(()) },
+            VmInstr::CheckStopCondition { token_id, counter, eos_ptr, max_tokens_ptr } => { 
+                                    if let Some(e) = check(*token_id, true, "token_id") { return Err(e); }
+                                    if let Some(e) = check(*counter, true, "counter") { return Err(e); }
+                                    if let Some(e) = check(*eos_ptr, true, "eos_ptr") { return Err(e); }
+                                    if let Some(e) = check(*max_tokens_ptr, true, "max_tokens_ptr") { return Err(e); }
+                 Ok(()) },
+            _ => Ok(()),
+        }
+    }
+
 
     /// D3: SIMD 宽度一致性验证 (ARCH-VM-WIDTH-CHECK)。
     ///
@@ -1814,25 +1880,6 @@ impl VmProgram {
     pub fn validate_value_domains(&self) -> Result<(), String> {
         use std::collections::HashMap;
 
-        /// 值的语义域
-        #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-        enum Domain {
-            /// 指针 — 来自 LoadPtr 或 AddPtr，可作为内存访问的 base
-            Ptr,
-            /// 字节偏移 — 来自 LoopOffset/IntMulStride，不能直接作 base
-            ByteOff,
-            /// 循环计数器
-            Counter,
-            /// 字节偏移 (LoopBegin 产生的关联偏移)
-            LoopByteOffset,
-            /// SIMD 向量数据
-            VecData,
-            /// 标量数据 (GPR 中的非指针值)
-            ScalarData,
-            /// 未知域
-            Unknown,
-        }
-
         let kinds = self.collect_vreg_kinds();
         let mut domains: HashMap<VRegId, Domain> = HashMap::new();
 
@@ -1848,713 +1895,1020 @@ impl VmProgram {
         }
 
         for (i, instr) in &mut self.instrs.iter().enumerate() {
-            match instr {
-                // LoadPtr: dst becomes Ptr domain
-                VmInstr::LoadPtr { dst, src } => {
-                    domains.insert(*dst, Domain::Ptr);
-                }
-                // AddPtr: dst = base + offset → if base is Ptr, dst is Ptr
-                VmInstr::AddPtr { dst, base, .. } => {
-                    let base_domain = domains.get(base).copied().unwrap_or(Domain::Unknown);
-                    if base_domain == Domain::Ptr {
-                        domains.insert(*dst, Domain::Ptr);
-                    } else {
-                        // Adding offset to non-pointer: result is still non-pointer
-                        domains.insert(*dst, base_domain);
-                    }
-                }
-                // VecLoad: verify base is Ptr/ByteOffset domain
-                VmInstr::VecLoad { dst, base, .. } => {
-                    let base_domain = domains.get(base).copied().unwrap_or(Domain::Unknown);
-                    match base_domain {
-                        Domain::Ptr | Domain::Unknown => {} // Ptr is correct, Unknown may become Ptr later
-                        Domain::ByteOff | Domain::LoopByteOffset | Domain::Counter => {
-                            return Err(format!(
-                                "instr[{i}] VecLoad: base v{} has domain {:?}, \
-                                 expected Ptr. ByteOffset/Counter used as memory base → SIGSEGV",
-                                base.0, base_domain));
-                        }
-                        Domain::VecData | Domain::ScalarData => {
-                            return Err(format!(
-                                "instr[{i}] VecLoad: base v{} has domain {:?}, \
-                                 expected Ptr. Data value used as memory base → SIGSEGV",
-                                base.0, base_domain));
-                        }
-                    }
-                    domains.insert(*dst, Domain::VecData);
-                }
-                // VecStore: verify base is Ptr domain
-                VmInstr::VecStore { base, .. } => {
-                    let base_domain = domains.get(base).copied().unwrap_or(Domain::Unknown);
-                    match base_domain {
-                        Domain::Ptr | Domain::Unknown => {}
-                        Domain::ByteOff | Domain::LoopByteOffset | Domain::Counter => {
-                            return Err(format!(
-                                "instr[{i}] VecStore: base v{} has domain {:?}, \
-                                 expected Ptr. ByteOffset/Counter used as memory base → SIGSEGV",
-                                base.0, base_domain));
-                        }
-                        Domain::VecData | Domain::ScalarData => {
-                            return Err(format!(
-                                "instr[{i}] VecStore: base v{} has domain {:?}, \
-                                 expected Ptr. Data value used as memory base → SIGSEGV",
-                                base.0, base_domain));
-                        }
-                    }
-                }
-                // Vec operations: propagate VecData domain
-                VmInstr::Broadcast { dst, .. } => {
-                    domains.insert(*dst, Domain::VecData);
-                }
-                VmInstr::VecNarrow { dst, .. } => {
-                    domains.insert(*dst, Domain::VecData);
-                }
-                VmInstr::VecWiden { dst, .. } => {
-                    domains.insert(*dst, Domain::VecData);
-                }
-                VmInstr::Mov { dst, .. } => {
-                    domains.insert(*dst, Domain::VecData);
-                }
-                VmInstr::VecBinOp { dst, .. } => {
-                    domains.insert(*dst, Domain::VecData);
-                }
-                VmInstr::VecUnaryOp { dst, .. } => {
-                    domains.insert(*dst, Domain::VecData);
-                }
-                VmInstr::VecCmp { dst, .. } => {
-                    domains.insert(*dst, Domain::VecData);
-                }
-                VmInstr::VecCast { dst, .. } => {
-                    domains.insert(*dst, Domain::VecData);
-                }
-                VmInstr::ConditionalSelect { dst, .. } => {
-                    domains.insert(*dst, Domain::VecData);
-                }
-                VmInstr::Fma { dst, .. } => {
-                    domains.insert(*dst, Domain::VecData);
-                }
-                VmInstr::HReduce { dst, .. } => {
-                    domains.insert(*dst, Domain::VecData);
-                }
-                VmInstr::Accumulate { .. } => {
-                    // acc domain stays the same
-                }
-                VmInstr::Transcendental { dst, .. } => {
-                    domains.insert(*dst, Domain::VecData);
-                }
-                // Scalar operations
-                VmInstr::ScalarLoad { dst, base, .. } => {
-                    let base_domain = domains.get(base).copied().unwrap_or(Domain::Unknown);
-                    if !matches!(base_domain, Domain::Ptr | Domain::Unknown) {
-                        return Err(format!(
-                            "instr[{i}] ScalarLoad: base v{} has domain {:?}, expected Ptr",
-                            base.0, base_domain));
-                    }
-                    // If dst VReg is registered as Ptr kind, propagate Ptr domain;
-                    // otherwise the loaded value is a plain scalar.
-                    let dst_domain = match kinds.get(dst) {
-                        Some(VRegKind::Ptr) => Domain::Ptr,
-                        _ => Domain::ScalarData,
-                    };
-                    domains.insert(*dst, dst_domain);
-                }
-                VmInstr::ScalarStore { base, .. } => {
-                    let base_domain = domains.get(base).copied().unwrap_or(Domain::Unknown);
-                    if !matches!(base_domain, Domain::Ptr | Domain::Unknown) {
-                        return Err(format!(
-                            "instr[{i}] ScalarStore: base v{} has domain {:?}, expected Ptr",
-                            base.0, base_domain));
-                    }
-                }
-                VmInstr::VecScalarStore { base, .. } => {
-                    let base_domain = domains.get(base).copied().unwrap_or(Domain::Unknown);
-                    if !matches!(base_domain, Domain::Ptr | Domain::Unknown) {
-                        return Err(format!(
-                            "instr[{i}] VecScalarStore: base v{} has domain {:?}, expected Ptr",
-                            base.0, base_domain));
-                    }
-                }
-                VmInstr::ScalarByteLoad { dst, base, .. } => {
-                    let base_domain = domains.get(base).copied().unwrap_or(Domain::Unknown);
-                    if !matches!(base_domain, Domain::Ptr | Domain::Unknown) {
-                        return Err(format!(
-                            "instr[{i}] ScalarByteLoad: base v{} has domain {:?}, expected Ptr",
-                            base.0, base_domain));
-                    }
-                    domains.insert(*dst, Domain::ScalarData);
-                }
-                // IntMulStride: produces byte offset
-                VmInstr::IntMulStride { dst, .. } => {
-                    domains.insert(*dst, Domain::ByteOff);
-                }
-                VmInstr::ScalarToIndex { dst, .. } => {
-                    domains.insert(*dst, Domain::ByteOff);
-                }
-                VmInstr::IndexToScalar { dst, .. } => {
-                    domains.insert(*dst, Domain::ScalarData);
-                }
-                // GPR operations
-                VmInstr::GprBinOp { dst, a, b, op } => {
-                    let da = domains.get(a).copied().unwrap_or(Domain::Unknown);
-                    let db = b.vreg().and_then(|v| domains.get(&v).copied()).unwrap_or(Domain::Unknown);
-                    if matches!(op, GprOp::Mul) {
-                        domains.insert(*dst, da);
-                    } else if da == Domain::Ptr || db == Domain::Ptr {
-                        domains.insert(*dst, Domain::Ptr);
-                    } else if matches!(op, GprOp::Sub) && da == Domain::Unknown {
-                        // Preserve existing domain for counter decrement
-                    } else {
-                        domains.insert(*dst, Domain::ScalarData);
-                    }
-                }
-                VmInstr::GprUnaryOp { dst, .. } => {
-                    domains.insert(*dst, Domain::ScalarData);
-                }
-                VmInstr::GprLoadImm { dst, .. } => {
-                    domains.insert(*dst, Domain::ScalarData);
-                }
-                VmInstr::LoadCallbackEntry { table_ptr, fn_ptr_out, ctx_out, .. } => {
-                    let tbl_domain = domains.get(table_ptr).copied().unwrap_or(Domain::Unknown);
-                    if !matches!(tbl_domain, Domain::Ptr | Domain::Unknown) {
-                        return Err(format!(
-                            "instr[{i}] LoadCallbackEntry: table_ptr v{} has domain {:?}, expected Ptr",
-                            table_ptr.0, tbl_domain));
-                    }
-                    domains.insert(*fn_ptr_out, Domain::Ptr);
-                    domains.insert(*ctx_out, Domain::Ptr);
-                }
-                VmInstr::NativeCall { ret_val, fn_ptr, ctx_ptr } => {
-                    for (&vreg, label) in [(fn_ptr, "fn_ptr"), (ctx_ptr, "ctx_ptr")] {
-                        let d = domains.get(&vreg).copied().unwrap_or(Domain::Unknown);
-                        if !matches!(d, Domain::Ptr | Domain::Unknown) {
-                            return Err(format!(
-                                "instr[{i}] NativeCall: {} v{} has domain {:?}, expected Ptr",
-                                label, vreg.0, d));
-                        }
-                    }
-                    domains.insert(*ret_val, Domain::ScalarData);
-                }
-                // Sampling operations
-                VmInstr::Argmax { dst, logits_ptr, .. } => {
-                    let ptr_domain = domains.get(logits_ptr).copied().unwrap_or(Domain::Unknown);
-                    if !matches!(ptr_domain, Domain::Ptr | Domain::Unknown) {
-                        return Err(format!(
-                            "instr[{i}] Argmax: logits_ptr v{} has domain {:?}, expected Ptr",
-                            logits_ptr.0, ptr_domain));
-                    }
-                    domains.insert(*dst, Domain::ScalarData);
-                }
-                VmInstr::StoreToken { output_buf, input_ids_ptr, .. } => {
-                    for (&vreg, label) in [(output_buf, "output_buf"), (input_ids_ptr, "input_ids_ptr")] {
-                        let d = domains.get(&vreg).copied().unwrap_or(Domain::Unknown);
-                        if !matches!(d, Domain::Ptr | Domain::Unknown) {
-                            return Err(format!(
-                                "instr[{i}] StoreToken: {} v{} has domain {:?}, expected Ptr",
-                                label, vreg.0, d));
-                        }
-                    }
-                }
-                VmInstr::CheckStopCondition { eos_ptr, max_tokens_ptr, .. } => {
-                    for (&vreg, label) in [(eos_ptr, "eos_ptr"), (max_tokens_ptr, "max_tokens_ptr")] {
-                        let d = domains.get(&vreg).copied().unwrap_or(Domain::Unknown);
-                        if !matches!(d, Domain::Ptr | Domain::Unknown) {
-                            return Err(format!(
-                                "instr[{i}] CheckStopCondition: {} v{} has domain {:?}, expected Ptr",
-                                label, vreg.0, d));
-                        }
-                    }
-                }
-                VmInstr::TemperatureScale { logits_ptr, temp_ptr, .. } => {
-                    for (&vreg, label) in [(logits_ptr, "logits_ptr"), (temp_ptr, "temp_ptr")] {
-                        let d = domains.get(&vreg).copied().unwrap_or(Domain::Unknown);
-                        if !matches!(d, Domain::Ptr | Domain::Unknown) {
-                            return Err(format!(
-                                "instr[{i}] TemperatureScale: {} v{} has domain {:?}, expected Ptr",
-                                label, vreg.0, d));
-                        }
-                    }
-                }
-                VmInstr::AtomicAdd { base, .. } => {
-                    let d = domains.get(base).copied().unwrap_or(Domain::Unknown);
-                    if !matches!(d, Domain::Ptr | Domain::Unknown) {
-                        return Err(format!(
-                            "instr[{i}] AtomicAdd: base v{} has domain {:?}, expected Ptr",
-                            base.0, d));
-                    }
-                }
-                VmInstr::Prefetch { base, .. } => {
-                    let d = domains.get(base).copied().unwrap_or(Domain::Unknown);
-                    if !matches!(d, Domain::Ptr | Domain::Unknown) {
-                        return Err(format!(
-                            "instr[{i}] Prefetch: base v{} has domain {:?}, expected Ptr",
-                            base.0, d));
-                    }
-                }
-                // GatherLoad: base must be Ptr, dst becomes VecData
-                VmInstr::GatherLoad { dst, base, indices, .. } => {
-                    let base_domain = domains.get(base).copied().unwrap_or(Domain::Unknown);
-                    if !matches!(base_domain, Domain::Ptr | Domain::Unknown) {
-                        return Err(format!(
-                            "instr[{i}] GatherLoad: base v{} has domain {:?}, expected Ptr",
-                            base.0, base_domain));
-                    }
-                    let idx_domain = domains.get(indices).copied().unwrap_or(Domain::Unknown);
-                    if !matches!(idx_domain, Domain::Ptr | Domain::ScalarData | Domain::Unknown) {
-                        return Err(format!(
-                            "instr[{i}] GatherLoad: indices v{} has domain {:?}, expected Ptr or ScalarData",
-                            indices.0, idx_domain));
-                    }
-                    domains.insert(*dst, Domain::VecData);
-                }
-                // ScatterStore: base must be Ptr
-                VmInstr::ScatterStore { base, indices, .. } => {
-                    let base_domain = domains.get(base).copied().unwrap_or(Domain::Unknown);
-                    if !matches!(base_domain, Domain::Ptr | Domain::Unknown) {
-                        return Err(format!(
-                            "instr[{i}] ScatterStore: base v{} has domain {:?}, expected Ptr",
-                            base.0, base_domain));
-                    }
-                    let idx_domain = domains.get(indices).copied().unwrap_or(Domain::Unknown);
-                    if !matches!(idx_domain, Domain::Ptr | Domain::ScalarData | Domain::Unknown) {
-                        return Err(format!(
-                            "instr[{i}] ScatterStore: indices v{} has domain {:?}, expected Ptr or ScalarData",
-                            indices.0, idx_domain));
-                    }
-                }
-                // TableLookup: base must be Ptr, row_index must be GPR, dst becomes VecData
-                VmInstr::TableLookup { dst, base, row_index, .. } => {
-                    let base_domain = domains.get(base).copied().unwrap_or(Domain::Unknown);
-                    if !matches!(base_domain, Domain::Ptr | Domain::Unknown) {
-                        return Err(format!(
-                            "instr[{i}] TableLookup: base v{} has domain {:?}, expected Ptr",
-                            base.0, base_domain));
-                    }
-                    let idx_domain = domains.get(row_index).copied().unwrap_or(Domain::Unknown);
-                    if !matches!(idx_domain, Domain::Ptr | Domain::ScalarData | Domain::ByteOff | Domain::Unknown) {
-                        return Err(format!(
-                            "instr[{i}] TableLookup: row_index v{} has domain {:?}, expected Ptr/ScalarData/ByteOff",
-                            row_index.0, idx_domain));
-                    }
-                    domains.insert(*dst, Domain::VecData);
-                }
-                // LoopBegin: counter and byte_offset domains set by DeclareVReg
-                VmInstr::LoopBegin { .. } | VmInstr::LoopEnd => {}
-                // Meta instructions: no domain changes
-                VmInstr::DeclareVReg { .. } | VmInstr::ReleaseVReg { .. }
-                | VmInstr::MarkLabel { .. } | VmInstr::Comment(_)
-                | VmInstr::ScopeBegin { .. } | VmInstr::ScopeEnd { .. }
-                | VmInstr::MemFence { .. } | VmInstr::StoreConstToStack { .. }
-                | VmInstr::BreakLoop { .. } | VmInstr::ConditionalSkip { .. }
-                | VmInstr::GprCondAction { .. }
-                | VmInstr::WarpSync | VmInstr::AsyncCopy { .. } | VmInstr::AsyncWait { .. }
-                | VmInstr::TileConfig { .. } | VmInstr::TileLoad { .. } | VmInstr::TileMma { .. }
-                | VmInstr::TileStore { .. } | VmInstr::TileRelease
-                | VmInstr::SparseMaskIntersect { .. } | VmInstr::HotpatchSlot { .. }
-                | VmInstr::IndirectJump { .. } | VmInstr::ConditionalExit { .. }
-                | VmInstr::BranchIfPtrNonNull { .. }
-                | VmInstr::BranchIfGprZero { .. }
-                | VmInstr::BranchIfGprLtU { .. }
-                | VmInstr::UnconditionalBranch { .. }
-                | VmInstr::BatchSeqIdLookup { .. } | VmInstr::BatchPerSeqArgmax { .. }
-                | VmInstr::BatchPerSeqStopCheck { .. }
-                | VmInstr::ActivationSwap { .. }
-                | VmInstr::PageTableAddr { .. }
-                | VmInstr::PageTableKVWrite { .. }
-                | VmInstr::PageTableKVWriteQuant { .. }
-                | VmInstr::KiviQuantChannel { .. }
-                | VmInstr::KiviQuantToken { .. }
-                | VmInstr::KiviDequantLoad { .. }
-                | VmInstr::SharedMemAlloc { .. }
-                | VmInstr::SharedMemStore { .. }
-                | VmInstr::SharedMemLoad { .. }
-                | VmInstr::SharedMemAsyncStore { .. }
-                | VmInstr::SharedMemAsyncWaitGroup { .. }
-                | VmInstr::TmemAlloc { .. }
-                | VmInstr::TmemStore { .. }
-                | VmInstr::TmemDealloc { .. }
-                | VmInstr::ClusterBarrierInit { .. }
-                | VmInstr::ClusterStore { .. }
-                | VmInstr::WeightPrefetchAsync { .. }
-                | VmInstr::WeightPrefetchWait { .. }
-                | VmInstr::WarpRoleDeclare { .. }
-                | VmInstr::WarpBarrierArrive { .. }
-                | VmInstr::WarpBarrierWait { .. }
-                | VmInstr::TmaDescriptorInit { .. } | VmInstr::Tma2DCopy { .. } | VmInstr::BarrierInit { .. }
-                | VmInstr::BlockSync
-                | VmInstr::WarpReduce { .. }
-                | VmInstr::Lz4Decode { .. }
-                | VmInstr::BitPackRleDecode { .. }
-                | VmInstr::DebugBreakpoint { .. }
-                | VmInstr::DebugMarker { .. }
-                | VmInstr::DebugProbe { .. }
-                | VmInstr::DebugBreakIf { .. } => {}
-                VmInstr::GgufSubScaleLoad { dst, scales_base, sub_block_idx, .. } => {
-                    let sb_domain = domains.get(scales_base).copied().unwrap_or(Domain::Unknown);
-                    if !matches!(sb_domain, Domain::Ptr | Domain::Unknown) {
-                        return Err(format!(
-                            "instr[{i}] GGUF SubScale load: scales_base v{} has domain {:?}, expected Ptr",
-                            scales_base.0, sb_domain));
-                    }
-                    let idx_domain = domains.get(sub_block_idx).copied().unwrap_or(Domain::Unknown);
-                    if idx_domain == Domain::VecData {
-                        return Err(format!(
-                            "instr[{i}] GGUF SubScale load: sub_block_idx v{} has domain VecData, expected Ptr/Scalar/Unknown",
-                            sub_block_idx.0));
-                    }
-                    domains.insert(*dst, Domain::VecData);
-                }
-                VmInstr::GgufKQuantScaleLoad { dst, scales_base, sub_block_idx, .. } => {
-                    let sb_domain = domains.get(scales_base).copied().unwrap_or(Domain::Unknown);
-                    if !matches!(sb_domain, Domain::Ptr | Domain::Unknown) {
-                        return Err(format!(
-                            "instr[{i}] GGUF KQuant scale load: scales_base v{} has domain {:?}, expected Ptr",
-                            scales_base.0, sb_domain));
-                    }
-                    let idx_domain = domains.get(sub_block_idx).copied().unwrap_or(Domain::Unknown);
-                    if idx_domain == Domain::VecData {
-                        return Err(format!(
-                            "instr[{i}] GGUF KQuant scale load: sub_block_idx v{} has domain VecData, expected Ptr/Scalar/Unknown",
-                            sub_block_idx.0));
-                    }
-                    domains.insert(*dst, Domain::VecData);
-                }
-                // Quant* decode instrs: produce VecData
-                VmInstr::QuantBroadcastInt { dst, .. }
-                | VmInstr::QuantScalarCvtLoad { dst, .. }
-                | VmInstr::QuantBlockLoad { dst, .. }
-                | VmInstr::QuantBiPlaneLoad { dst, .. }
-                | VmInstr::QuantLoadBytesVec { dst, .. }
-                | VmInstr::QuantCodebookLookup { dst, .. }
-                | VmInstr::QuantExtractBits { dst, .. }
-                | VmInstr::QuantDequantFma { dst, .. }
-                | VmInstr::QuantInterleave { dst, .. }
-                | VmInstr::QuantConcatSeq { dst, .. }
-                | VmInstr::Q3KDecodeStep { dst, .. }
-                | VmInstr::DotProduct { acc: dst, .. }
-                | VmInstr::ScaleApply { dst, .. }
-                | VmInstr::BitwiseGemm { dst, .. }
-                | VmInstr::SparseGemm { acc: dst, .. }
-                | VmInstr::SparseFp8Gemm { acc: dst, .. }
-                | VmInstr::NativeFp4Gemm { acc: dst, .. }
-                | VmInstr::NativeFp8Gemm { acc: dst, .. }
-                | VmInstr::HwQuantDequant { dst, .. }
-                | VmInstr::TmemLoad { dst, .. }
-                | VmInstr::ClusterLoad { dst, .. } => {
-                    domains.insert(*dst, Domain::VecData);
-                }
-                VmInstr::MemCopy { dst, src, .. } => {
-                    let src_domain = domains.get(src).copied().unwrap_or(Domain::Ptr);
-                    domains.insert(*dst, src_domain);
-                }
-                // GPU sampling: SoftmaxReduceMax — logits_ptr must be Ptr, dst → ScalarData
-                VmInstr::SoftmaxReduceMax { dst, logits_ptr, .. } => {
-                    let ptr_domain = domains.get(logits_ptr).copied().unwrap_or(Domain::Unknown);
-                    if !matches!(ptr_domain, Domain::Ptr | Domain::Unknown) {
-                        return Err(format!(
-                            "instr[{i}] SoftmaxReduceMax: logits_ptr v{} has domain {:?}, expected Ptr",
-                            logits_ptr.0, ptr_domain));
-                    }
-                    domains.insert(*dst, Domain::ScalarData);
-                }
-                // GPU sampling: SoftmaxExpSum — logits_ptr Ptr, max_val ScalarData, sum_dst → ScalarData
-                VmInstr::SoftmaxExpSum { sum_dst, logits_ptr, max_val, .. } => {
-                    let ptr_domain = domains.get(logits_ptr).copied().unwrap_or(Domain::Unknown);
-                    if !matches!(ptr_domain, Domain::Ptr | Domain::Unknown) {
-                        return Err(format!(
-                            "instr[{i}] SoftmaxExpSum: logits_ptr v{} has domain {:?}, expected Ptr",
-                            logits_ptr.0, ptr_domain));
-                    }
-                    let mv_domain = domains.get(max_val).copied().unwrap_or(Domain::Unknown);
-                    if !matches!(mv_domain, Domain::ScalarData | Domain::Unknown) {
-                        return Err(format!(
-                            "instr[{i}] SoftmaxExpSum: max_val v{} has domain {:?}, expected ScalarData",
-                            max_val.0, mv_domain));
-                    }
-                    domains.insert(*sum_dst, Domain::ScalarData);
-                }
-                // GPU sampling: SoftmaxNormalize — logits_ptr Ptr, sum_val ScalarData (in-place)
-                VmInstr::SoftmaxNormalize { logits_ptr, sum_val, .. } => {
-                    let ptr_domain = domains.get(logits_ptr).copied().unwrap_or(Domain::Unknown);
-                    if !matches!(ptr_domain, Domain::Ptr | Domain::Unknown) {
-                        return Err(format!(
-                            "instr[{i}] SoftmaxNormalize: logits_ptr v{} has domain {:?}, expected Ptr",
-                            logits_ptr.0, ptr_domain));
-                    }
-                    let sv_domain = domains.get(sum_val).copied().unwrap_or(Domain::Unknown);
-                    if !matches!(sv_domain, Domain::ScalarData | Domain::Unknown) {
-                        return Err(format!(
-                            "instr[{i}] SoftmaxNormalize: sum_val v{} has domain {:?}, expected ScalarData",
-                            sum_val.0, sv_domain));
-                    }
-                }
-                // GPU sampling: SampleTopKFilter — all Ptr (in-place filtering)
-                VmInstr::SampleTopKFilter { probs_ptr, indices_ptr, k_ptr, .. } => {
-                    for (&vreg, label) in [(probs_ptr, "probs_ptr"), (indices_ptr, "indices_ptr"), (k_ptr, "k_ptr")] {
-                        let d = domains.get(&vreg).copied().unwrap_or(Domain::Unknown);
-                        if !matches!(d, Domain::Ptr | Domain::Unknown) {
-                            return Err(format!(
-                                "instr[{i}] SampleTopKFilter: {} v{} has domain {:?}, expected Ptr",
-                                label, vreg.0, d));
-                        }
-                    }
-                }
-                // GPU sampling: SampleTopPFilter — all Ptr (in-place filtering)
-                VmInstr::SampleTopPFilter { probs_ptr, p_ptr, .. } => {
-                    for (&vreg, label) in [(probs_ptr, "probs_ptr"), (p_ptr, "p_ptr")] {
-                        let d = domains.get(&vreg).copied().unwrap_or(Domain::Unknown);
-                        if !matches!(d, Domain::Ptr | Domain::Unknown) {
-                            return Err(format!(
-                                "instr[{i}] SampleTopPFilter: {} v{} has domain {:?}, expected Ptr",
-                                label, vreg.0, d));
-                        }
-                    }
-                }
-                // GPU sampling: SampleMultinomial — probs_ptr/rng_state_ptr Ptr, dst → ScalarData
-                VmInstr::SampleMultinomial { dst, probs_ptr, rng_state_ptr, .. } => {
-                    for (&vreg, label) in [(probs_ptr, "probs_ptr"), (rng_state_ptr, "rng_state_ptr")] {
-                        let d = domains.get(&vreg).copied().unwrap_or(Domain::Unknown);
-                        if !matches!(d, Domain::Ptr | Domain::Unknown) {
-                            return Err(format!(
-                                "instr[{i}] SampleMultinomial: {} v{} has domain {:?}, expected Ptr",
-                                label, vreg.0, d));
-                        }
-                    }
-                    domains.insert(*dst, Domain::ScalarData);
-                }
-                // GPU sampling: WarpPRNG — rng_state_ptr Ptr, dst → ScalarData
-                VmInstr::WarpPRNG { dst, rng_state_ptr } => {
-                    let ptr_domain = domains.get(rng_state_ptr).copied().unwrap_or(Domain::Unknown);
-                    if !matches!(ptr_domain, Domain::Ptr | Domain::Unknown) {
-                        return Err(format!(
-                            "instr[{i}] WarpPRNG: rng_state_ptr v{} has domain {:?}, expected Ptr",
-                            rng_state_ptr.0, ptr_domain));
-                    }
-                    domains.insert(*dst, Domain::ScalarData);
-                }
-                // SharedMemSwizzle — raw_addr input (Ptr/ByteOffset), dst → Ptr
-                VmInstr::SharedMemSwizzle { dst, raw_addr, .. } => {
-                    let src_domain = domains.get(raw_addr).copied().unwrap_or(Domain::Unknown);
-                    if !matches!(src_domain, Domain::Ptr | Domain::ByteOff | Domain::LoopByteOffset | Domain::Unknown) {
-                        return Err(format!(
-                            "instr[{i}] SharedMemSwizzle: raw_addr v{} has domain {:?}, expected Ptr/ByteOffset",
-                            raw_addr.0, src_domain));
-                    }
-                    domains.insert(*dst, Domain::Ptr);
-                }
-                // VecShuffle — src (Vec), dst → Vec (lane rearrangement)
-                VmInstr::VecShuffle { dst, src, .. } => {
-                    let src_domain = domains.get(src).copied().unwrap_or(Domain::Unknown);
-                    if !matches!(src_domain, Domain::ScalarData | Domain::Unknown) {
-                        return Err(format!(
-                            "instr[{i}] VecShuffle: src v{} has domain {:?}, expected ScalarData (Vec)",
-                            src.0, src_domain));
-                    }
-                    domains.insert(*dst, Domain::ScalarData);
-                }
-                // VecExtractLane — src (Vec), dst → ScalarData
-                VmInstr::VecExtractLane { dst, src, .. } => {
-                    let src_domain = domains.get(src).copied().unwrap_or(Domain::Unknown);
-                    if !matches!(src_domain, Domain::ScalarData | Domain::Unknown) {
-                        return Err(format!(
-                            "instr[{i}] VecExtractLane: src v{} has domain {:?}, expected ScalarData (Vec)",
-                            src.0, src_domain));
-                    }
-                    domains.insert(*dst, Domain::ScalarData);
-                }
-                // VecInsertLane — src_vec (Vec) + src_scalar (ScalarData), dst → Vec
-                VmInstr::VecInsertLane { dst, src_vec, src_scalar, .. } => {
-                    let vec_domain = domains.get(src_vec).copied().unwrap_or(Domain::Unknown);
-                    let scalar_domain = domains.get(src_scalar).copied().unwrap_or(Domain::Unknown);
-                    if !matches!(vec_domain, Domain::ScalarData | Domain::Unknown) {
-                        return Err(format!(
-                            "instr[{i}] VecInsertLane: src_vec v{} has domain {:?}, expected ScalarData (Vec)",
-                            src_vec.0, vec_domain));
-                    }
-                    if !matches!(scalar_domain, Domain::ScalarData | Domain::Unknown) {
-                        return Err(format!(
-                            "instr[{i}] VecInsertLane: src_scalar v{} has domain {:?}, expected ScalarData",
-                            src_scalar.0, scalar_domain));
-                    }
-                    domains.insert(*dst, Domain::ScalarData);
-                }
-                // VecLoadConst — dst → Vec (no src vregs)
-                VmInstr::VecLoadConst { dst, .. } => {
-                    domains.insert(*dst, Domain::ScalarData);
-                }
-                // AtomicCAS — ptr (Ptr), expected/desired (ScalarData), dst → ScalarData
-                VmInstr::AtomicCAS { dst, ptr, expected, desired, .. } => {
-                    let ptr_domain = domains.get(ptr).copied().unwrap_or(Domain::Unknown);
-                    if !matches!(ptr_domain, Domain::Ptr | Domain::Unknown) {
-                        return Err(format!(
-                            "instr[{i}] AtomicCAS: ptr v{} has domain {:?}, expected Ptr",
-                            ptr.0, ptr_domain));
-                    }
-                    let exp_domain = domains.get(expected).copied().unwrap_or(Domain::Unknown);
-                    if !matches!(exp_domain, Domain::ScalarData | Domain::Unknown) {
-                        return Err(format!(
-                            "instr[{i}] AtomicCAS: expected v{} has domain {:?}, expected ScalarData",
-                            expected.0, exp_domain));
-                    }
-                    let des_domain = domains.get(desired).copied().unwrap_or(Domain::Unknown);
-                    if !matches!(des_domain, Domain::ScalarData | Domain::Unknown) {
-                        return Err(format!(
-                            "instr[{i}] AtomicCAS: desired v{} has domain {:?}, expected ScalarData",
-                            desired.0, des_domain));
-                    }
-                    domains.insert(*dst, Domain::ScalarData);
-                }
-                // SeqIdLookup — token_index (Counter), seq_meta_base (Ptr), num_seqs (ScalarData), dst → ScalarData
-                VmInstr::SeqIdLookup { dst, token_index, seq_meta_base, num_seqs, .. } => {
-                    let idx_domain = domains.get(token_index).copied().unwrap_or(Domain::Unknown);
-                    if !matches!(idx_domain, Domain::Counter | Domain::ScalarData | Domain::Unknown) {
-                        return Err(format!(
-                            "instr[{i}] SeqIdLookup: token_index v{} has domain {:?}, expected Counter",
-                            token_index.0, idx_domain));
-                    }
-                    let base_domain = domains.get(seq_meta_base).copied().unwrap_or(Domain::Unknown);
-                    if !matches!(base_domain, Domain::Ptr | Domain::ScalarData | Domain::Unknown) {
-                        return Err(format!(
-                            "instr[{i}] SeqIdLookup: seq_meta_base v{} has domain {:?}, expected Ptr",
-                            seq_meta_base.0, base_domain));
-                    }
-                    let ns_domain = domains.get(num_seqs).copied().unwrap_or(Domain::Unknown);
-                    if !matches!(ns_domain, Domain::ScalarData | Domain::Unknown) {
-                        return Err(format!(
-                            "instr[{i}] SeqIdLookup: num_seqs v{} has domain {:?}, expected ScalarData",
-                            num_seqs.0, ns_domain));
-                    }
-                    domains.insert(*dst, Domain::ScalarData);
-                }
-                // AllReduceChunk: sendbuf/recvbuf are Ptr, count/rank/world_size/chunk_idx are ScalarData
-                #[cfg(feature = "nccl")]
-                VmInstr::AllReduceChunk { sendbuf, recvbuf, count, rank, world_size, chunk_idx, .. } => {
-                    for &ptr_vreg in &[sendbuf, recvbuf] {
-                        let d = domains.get(ptr_vreg).copied().unwrap_or(Domain::Unknown);
-                        if !matches!(d, Domain::Ptr | Domain::ScalarData | Domain::Unknown) {
-                            return Err(format!(
-                                "instr[{i}] AllReduceChunk: buf v{} has domain {:?}, expected Ptr",
-                                ptr_vreg.0, d));
-                        }
-                    }
-                    for &scalar_vreg in &[count, rank, world_size, chunk_idx] {
-                        let d = domains.get(scalar_vreg).copied().unwrap_or(Domain::Unknown);
-                        if !matches!(d, Domain::ScalarData | Domain::Counter | Domain::Unknown) {
-                            return Err(format!(
-                                "instr[{i}] AllReduceChunk: param v{} has domain {:?}, expected ScalarData",
-                                scalar_vreg.0, d));
-                        }
-                    }
-                }
-                // CommBarrier: thread_count is ScalarData
-                #[cfg(feature = "nccl")]
-                VmInstr::CommBarrier { thread_count, .. } => {
-                    let tc_domain = domains.get(thread_count).copied().unwrap_or(Domain::Unknown);
-                    if !matches!(tc_domain, Domain::ScalarData | Domain::Counter | Domain::Unknown) {
-                        return Err(format!(
-                            "instr[{i}] CommBarrier: thread_count v{} has domain {:?}, expected ScalarData",
-                            thread_count.0, tc_domain));
-                    }
-                }
-                // NvlinkAsyncCopy: dst/src are Ptr, len is ScalarData
-                #[cfg(feature = "nccl")]
-                VmInstr::NvlinkAsyncCopy { dst, src, len, .. } => {
-                    for &ptr_vreg in &[dst, src] {
-                        let d = domains.get(ptr_vreg).copied().unwrap_or(Domain::Unknown);
-                        if !matches!(d, Domain::Ptr | Domain::ScalarData | Domain::Unknown) {
-                            return Err(format!(
-                                "instr[{i}] NvlinkAsyncCopy: ptr v{} has domain {:?}, expected Ptr",
-                                ptr_vreg.0, d));
-                        }
-                    }
-                    let len_domain = domains.get(len).copied().unwrap_or(Domain::Unknown);
-                    if !matches!(len_domain, Domain::ScalarData | Domain::Counter | Domain::Unknown) {
-                        return Err(format!(
-                            "instr[{i}] NvlinkAsyncCopy: len v{} has domain {:?}, expected ScalarData",
-                            len.0, len_domain));
-                    }
-                }
-                // ── Distributed paging VmInstr (nccl) ──
-                #[cfg(feature = "nccl")]
-                VmInstr::RemotePageLookup { dst, seq_id, page_index, routing_table_base, .. } => {
-                    for &ptr_vreg in &[routing_table_base] {
-                        let d = domains.get(ptr_vreg).copied().unwrap_or(Domain::Unknown);
-                        if !matches!(d, Domain::Ptr | Domain::Unknown) {
-                            return Err(format!("instr[{i}] RemotePageLookup: ptr v{} has domain {:?}, expected Ptr", ptr_vreg.0, d));
-                        }
-                    }
-                    domains.insert(*dst, Domain::Ptr);
-                    let _ = (seq_id, page_index);
-                }
-                #[cfg(feature = "nccl")]
-                VmInstr::P2pPageFetch { local_buf, peer_buf, page_size, barrier } => {
-                    for &ptr_vreg in &[local_buf, peer_buf, barrier] {
-                        let d = domains.get(ptr_vreg).copied().unwrap_or(Domain::Unknown);
-                        if !matches!(d, Domain::Ptr | Domain::Unknown) {
-                            return Err(format!("instr[{i}] P2pPageFetch: ptr v{} has domain {:?}, expected Ptr", ptr_vreg.0, d));
-                        }
-                    }
-                    let _ = page_size;
-                }
-                #[cfg(feature = "nccl")]
-                VmInstr::RdmaPageFetch { local_buf, remote_addr, rkey, page_size, sq_desc, doorbell, cq_addr } => {
-                    for &ptr_vreg in &[local_buf, remote_addr, rkey, sq_desc, doorbell, cq_addr] {
-                        let d = domains.get(ptr_vreg).copied().unwrap_or(Domain::Unknown);
-                        if !matches!(d, Domain::Ptr | Domain::Unknown) {
-                            return Err(format!("instr[{i}] RdmaPageFetch: ptr v{} has domain {:?}, expected Ptr", ptr_vreg.0, d));
-                        }
-                    }
-                    let _ = page_size;
-                }
-                #[cfg(feature = "nccl")]
-                VmInstr::RdmaPageFetchCompressed { local_buf, scratch_buf, remote_addr, rkey, sq_desc, doorbell, cq_addr, .. } => {
-                    for &ptr_vreg in &[local_buf, scratch_buf, remote_addr, rkey, sq_desc, doorbell, cq_addr] {
-                        let d = domains.get(ptr_vreg).copied().unwrap_or(Domain::Unknown);
-                        if !matches!(d, Domain::Ptr | Domain::Unknown) {
-                            return Err(format!("instr[{i}] RdmaPageFetchCompressed: ptr v{} has domain {:?}, expected Ptr", ptr_vreg.0, d));
-                        }
-                    }
-                }
-                #[cfg(feature = "nccl")]
-                VmInstr::RemotePageAttn { q_buf, k_remote_buf, v_remote_buf, output_buf, shared_buf, barrier, tile_bytes } => {
-                    for &ptr_vreg in &[q_buf, k_remote_buf, v_remote_buf, output_buf, shared_buf, barrier] {
-                        let d = domains.get(ptr_vreg).copied().unwrap_or(Domain::Unknown);
-                        if !matches!(d, Domain::Ptr | Domain::Unknown) {
-                            return Err(format!("instr[{i}] RemotePageAttn: ptr v{} has domain {:?}, expected Ptr", ptr_vreg.0, d));
-                        }
-                    }
-                    let _ = tile_bytes;
-                }
-                #[cfg(feature = "nccl")]
-                VmInstr::PageMigrationLock { dst, entry_addr } => {
-                    let d = domains.get(entry_addr).copied().unwrap_or(Domain::Unknown);
-                    if !matches!(d, Domain::Ptr | Domain::Unknown) {
-                        return Err(format!("instr[{i}] PageMigrationLock: entry_addr v{} has domain {:?}, expected Ptr", entry_addr.0, d));
-                    }
-                    domains.insert(*dst, Domain::ScalarData);
-                }
-                #[cfg(feature = "nccl")]
-                VmInstr::PageMigrationUnlock { entry_addr } => {
-                    let d = domains.get(entry_addr).copied().unwrap_or(Domain::Unknown);
-                    if !matches!(d, Domain::Ptr | Domain::Unknown) {
-                        return Err(format!("instr[{i}] PageMigrationUnlock: entry_addr v{} has domain {:?}, expected Ptr", entry_addr.0, d));
-                    }
-                }
-                #[cfg(feature = "nccl")]
-                VmInstr::PageLocationUpdate { entry_addr, new_location, .. } => {
-                    for &ptr_vreg in &[entry_addr, new_location] {
-                        let d = domains.get(ptr_vreg).copied().unwrap_or(Domain::Unknown);
-                        if !matches!(d, Domain::Ptr | Domain::Unknown) {
-                            return Err(format!("instr[{i}] PageLocationUpdate: ptr v{} has domain {:?}, expected Ptr", ptr_vreg.0, d));
-                        }
-                    }
-                }
-                VmInstr::VecShiftImm { dst, a, .. } => {
-                    let a_domain = domains.get(a).copied().unwrap_or(Domain::Unknown);
-                    domains.insert(*dst, a_domain);
-                }
+                        match instr.category() {
+                super::vm_instr_category::InstrCategory::Memory => Self::validate_value_domains_memorya(instr, i, &kinds, &mut domains)?,
+                super::vm_instr_category::InstrCategory::Arith => Self::validate_value_domains_aritha(instr, i, &kinds, &mut domains)?,
+                super::vm_instr_category::InstrCategory::Control => Self::validate_value_domains_controla(instr, i, &kinds, &mut domains)?,
+                super::vm_instr_category::InstrCategory::Tile => Self::validate_value_domains_tilea(instr, i, &kinds, &mut domains)?,
+                super::vm_instr_category::InstrCategory::Quant => Self::validate_value_domains_quanta(instr, i, &kinds, &mut domains)?,
+                super::vm_instr_category::InstrCategory::GpuComm => Self::validate_value_domains_gpucomma(instr, i, &kinds, &mut domains)?,
+                super::vm_instr_category::InstrCategory::Sampling => Self::validate_value_domains_samplinga(instr, i, &kinds, &mut domains)?,
+                super::vm_instr_category::InstrCategory::Misc => Self::validate_value_domains_misca(instr, i, &kinds, &mut domains)?,
             }
         }
         Ok(())
     }
+
+    fn validate_value_domains_memorya(instr: &VmInstr, i: usize, kinds: &std::collections::HashMap<VRegId, VRegKind>, domains: &mut std::collections::HashMap<VRegId, Domain>) -> Result<(), String> {
+        // Memory cluster a (8 arms) — ARCH-LOWER-DISPATCH-LAYERING P3 (机械抽取)
+        match instr {
+            // LoadPtr: dst becomes Ptr domain
+            VmInstr::LoadPtr { dst, src } => { 
+                                    domains.insert(*dst, Domain::Ptr); Ok(()) },
+            // AddPtr: dst = base + offset → if base is Ptr, dst is Ptr
+            VmInstr::AddPtr { dst, base, .. } => { 
+                                    let base_domain = domains.get(base).copied().unwrap_or(Domain::Unknown);
+                                    if base_domain == Domain::Ptr {
+                                        domains.insert(*dst, Domain::Ptr);
+                                    } else {
+                                        // Adding offset to non-pointer: result is still non-pointer
+                                        domains.insert(*dst, base_domain);
+                                    }
+                 Ok(()) },
+            // VecLoad: verify base is Ptr/ByteOffset domain
+            VmInstr::VecLoad { dst, base, .. } => { 
+                                    let base_domain = domains.get(base).copied().unwrap_or(Domain::Unknown);
+                                    match base_domain {
+                                        Domain::Ptr | Domain::Unknown => {} // Ptr is correct, Unknown may become Ptr later
+                                        Domain::ByteOff | Domain::LoopByteOffset | Domain::Counter => {
+                                            return Err(format!(
+                                                "instr[{i}] VecLoad: base v{} has domain {:?}, \
+                                                 expected Ptr. ByteOffset/Counter used as memory base → SIGSEGV",
+                                                base.0, base_domain));
+                                        }
+                                        Domain::VecData | Domain::ScalarData => {
+                                            return Err(format!(
+                                                "instr[{i}] VecLoad: base v{} has domain {:?}, \
+                                                 expected Ptr. Data value used as memory base → SIGSEGV",
+                                                base.0, base_domain));
+                                        }
+                                    }
+                                    domains.insert(*dst, Domain::VecData); Ok(()) },
+            // VecStore: verify base is Ptr domain
+            VmInstr::VecStore { base, .. } => { 
+                                    let base_domain = domains.get(base).copied().unwrap_or(Domain::Unknown);
+                                    match base_domain {
+                                        Domain::Ptr | Domain::Unknown => {}
+                                        Domain::ByteOff | Domain::LoopByteOffset | Domain::Counter => {
+                                            return Err(format!(
+                                                "instr[{i}] VecStore: base v{} has domain {:?}, \
+                                                 expected Ptr. ByteOffset/Counter used as memory base → SIGSEGV",
+                                                base.0, base_domain));
+                                        }
+                                        Domain::VecData | Domain::ScalarData => {
+                                            return Err(format!(
+                                                "instr[{i}] VecStore: base v{} has domain {:?}, \
+                                                 expected Ptr. Data value used as memory base → SIGSEGV",
+                                                base.0, base_domain));
+                                        }
+                                    }
+                 Ok(()) },
+            // Vec operations: propagate VecData domain
+            VmInstr::Broadcast { dst, .. } => { 
+                                    domains.insert(*dst, Domain::VecData); Ok(()) },
+            VmInstr::VecNarrow { dst, .. } => { 
+                                    domains.insert(*dst, Domain::VecData); Ok(()) },
+            VmInstr::VecWiden { dst, .. } => { 
+                                    domains.insert(*dst, Domain::VecData); Ok(()) },
+            VmInstr::Mov { dst, .. } => { 
+                                    domains.insert(*dst, Domain::VecData); Ok(()) },
+            _ => Self::validate_value_domains_memoryb(instr, i, &kinds, domains),
+        }
+    }
+
+    fn validate_value_domains_memoryb(instr: &VmInstr, i: usize, kinds: &std::collections::HashMap<VRegId, VRegKind>, domains: &mut std::collections::HashMap<VRegId, Domain>) -> Result<(), String> {
+        // Memory cluster b (8 arms) — ARCH-LOWER-DISPATCH-LAYERING P3 (机械抽取)
+        match instr {
+            // Scalar operations
+            VmInstr::ScalarLoad { dst, base, .. } => { 
+                                    let base_domain = domains.get(base).copied().unwrap_or(Domain::Unknown);
+                                    if !matches!(base_domain, Domain::Ptr | Domain::Unknown) {
+                                        return Err(format!(
+                                            "instr[{i}] ScalarLoad: base v{} has domain {:?}, expected Ptr",
+                                            base.0, base_domain));
+                                    }
+                                    // If dst VReg is registered as Ptr kind, propagate Ptr domain;
+                                    // otherwise the loaded value is a plain scalar.
+                                    let dst_domain = match kinds.get(dst) {
+                                        Some(VRegKind::Ptr) => Domain::Ptr,
+                                        _ => Domain::ScalarData,
+                                    };
+                                    domains.insert(*dst, dst_domain); Ok(()) },
+            VmInstr::ScalarStore { base, .. } => { 
+                                    let base_domain = domains.get(base).copied().unwrap_or(Domain::Unknown);
+                                    if !matches!(base_domain, Domain::Ptr | Domain::Unknown) {
+                                        return Err(format!(
+                                            "instr[{i}] ScalarStore: base v{} has domain {:?}, expected Ptr",
+                                            base.0, base_domain));
+                                    }
+                 Ok(()) },
+            VmInstr::VecScalarStore { base, .. } => { 
+                                    let base_domain = domains.get(base).copied().unwrap_or(Domain::Unknown);
+                                    if !matches!(base_domain, Domain::Ptr | Domain::Unknown) {
+                                        return Err(format!(
+                                            "instr[{i}] VecScalarStore: base v{} has domain {:?}, expected Ptr",
+                                            base.0, base_domain));
+                                    }
+                 Ok(()) },
+            VmInstr::ScalarByteLoad { dst, base, .. } => { 
+                                    let base_domain = domains.get(base).copied().unwrap_or(Domain::Unknown);
+                                    if !matches!(base_domain, Domain::Ptr | Domain::Unknown) {
+                                        return Err(format!(
+                                            "instr[{i}] ScalarByteLoad: base v{} has domain {:?}, expected Ptr",
+                                            base.0, base_domain));
+                                    }
+                                    domains.insert(*dst, Domain::ScalarData); Ok(()) },
+            // IntMulStride: produces byte offset
+            VmInstr::IntMulStride { dst, .. } => { 
+                                    domains.insert(*dst, Domain::ByteOff); Ok(()) },
+            VmInstr::ScalarToIndex { dst, .. } => { 
+                                    domains.insert(*dst, Domain::ByteOff); Ok(()) },
+            VmInstr::IndexToScalar { dst, .. } => { 
+                                    domains.insert(*dst, Domain::ScalarData); Ok(()) },
+            VmInstr::AtomicAdd { base, .. } => { 
+                                    let d = domains.get(base).copied().unwrap_or(Domain::Unknown);
+                                    if !matches!(d, Domain::Ptr | Domain::Unknown) {
+                                        return Err(format!(
+                                            "instr[{i}] AtomicAdd: base v{} has domain {:?}, expected Ptr",
+                                            base.0, d));
+                                    }
+                 Ok(()) },
+            _ => Self::validate_value_domains_memoryc(instr, i, &kinds, domains),
+        }
+    }
+
+    fn validate_value_domains_memoryc(instr: &VmInstr, i: usize, kinds: &std::collections::HashMap<VRegId, VRegKind>, domains: &mut std::collections::HashMap<VRegId, Domain>) -> Result<(), String> {
+        // Memory cluster c (8 arms) — ARCH-LOWER-DISPATCH-LAYERING P3 (机械抽取)
+        match instr {
+            VmInstr::Prefetch { base, .. } => { 
+                                    let d = domains.get(base).copied().unwrap_or(Domain::Unknown);
+                                    if !matches!(d, Domain::Ptr | Domain::Unknown) {
+                                        return Err(format!(
+                                            "instr[{i}] Prefetch: base v{} has domain {:?}, expected Ptr",
+                                            base.0, d));
+                                    }
+                 Ok(()) },
+            // GatherLoad: base must be Ptr, dst becomes VecData
+            VmInstr::GatherLoad { dst, base, indices, .. } => { 
+                                    let base_domain = domains.get(base).copied().unwrap_or(Domain::Unknown);
+                                    if !matches!(base_domain, Domain::Ptr | Domain::Unknown) {
+                                        return Err(format!(
+                                            "instr[{i}] GatherLoad: base v{} has domain {:?}, expected Ptr",
+                                            base.0, base_domain));
+                                    }
+                                    let idx_domain = domains.get(indices).copied().unwrap_or(Domain::Unknown);
+                                    if !matches!(idx_domain, Domain::Ptr | Domain::ScalarData | Domain::Unknown) {
+                                        return Err(format!(
+                                            "instr[{i}] GatherLoad: indices v{} has domain {:?}, expected Ptr or ScalarData",
+                                            indices.0, idx_domain));
+                                    }
+                                    domains.insert(*dst, Domain::VecData); Ok(()) },
+            // ScatterStore: base must be Ptr
+            VmInstr::ScatterStore { base, indices, .. } => { 
+                                    let base_domain = domains.get(base).copied().unwrap_or(Domain::Unknown);
+                                    if !matches!(base_domain, Domain::Ptr | Domain::Unknown) {
+                                        return Err(format!(
+                                            "instr[{i}] ScatterStore: base v{} has domain {:?}, expected Ptr",
+                                            base.0, base_domain));
+                                    }
+                                    let idx_domain = domains.get(indices).copied().unwrap_or(Domain::Unknown);
+                                    if !matches!(idx_domain, Domain::Ptr | Domain::ScalarData | Domain::Unknown) {
+                                        return Err(format!(
+                                            "instr[{i}] ScatterStore: indices v{} has domain {:?}, expected Ptr or ScalarData",
+                                            indices.0, idx_domain));
+                                    }
+                 Ok(()) },
+            // TableLookup: base must be Ptr, row_index must be GPR, dst becomes VecData
+            VmInstr::TableLookup { dst, base, row_index, .. } => { 
+                                    let base_domain = domains.get(base).copied().unwrap_or(Domain::Unknown);
+                                    if !matches!(base_domain, Domain::Ptr | Domain::Unknown) {
+                                        return Err(format!(
+                                            "instr[{i}] TableLookup: base v{} has domain {:?}, expected Ptr",
+                                            base.0, base_domain));
+                                    }
+                                    let idx_domain = domains.get(row_index).copied().unwrap_or(Domain::Unknown);
+                                    if !matches!(idx_domain, Domain::Ptr | Domain::ScalarData | Domain::ByteOff | Domain::Unknown) {
+                                        return Err(format!(
+                                            "instr[{i}] TableLookup: row_index v{} has domain {:?}, expected Ptr/ScalarData/ByteOff",
+                                            row_index.0, idx_domain));
+                                    }
+                                    domains.insert(*dst, Domain::VecData); Ok(()) },
+            // Meta instructions: no domain changes
+            VmInstr::MemFence { .. } => { 
+                 Ok(()) },
+            // Meta instructions: no domain changes
+            VmInstr::StoreConstToStack { .. } => { 
+                 Ok(()) },
+            // Meta instructions: no domain changes
+            VmInstr::ActivationSwap { .. } => { 
+                 Ok(()) },
+            VmInstr::MemCopy { dst, src, .. } => { 
+                                    let src_domain = domains.get(src).copied().unwrap_or(Domain::Ptr);
+                                    domains.insert(*dst, src_domain); Ok(()) },
+            _ => Self::validate_value_domains_memoryd(instr, i, &kinds, domains),
+        }
+    }
+
+    fn validate_value_domains_memoryd(instr: &VmInstr, i: usize, kinds: &std::collections::HashMap<VRegId, VRegKind>, domains: &mut std::collections::HashMap<VRegId, Domain>) -> Result<(), String> {
+        // Memory cluster d (1 arms) — ARCH-LOWER-DISPATCH-LAYERING P3 (机械抽取)
+        match instr {
+            // AtomicCAS — ptr (Ptr), expected/desired (ScalarData), dst → ScalarData
+            VmInstr::AtomicCAS { dst, ptr, expected, desired, .. } => { 
+                                    let ptr_domain = domains.get(ptr).copied().unwrap_or(Domain::Unknown);
+                                    if !matches!(ptr_domain, Domain::Ptr | Domain::Unknown) {
+                                        return Err(format!(
+                                            "instr[{i}] AtomicCAS: ptr v{} has domain {:?}, expected Ptr",
+                                            ptr.0, ptr_domain));
+                                    }
+                                    let exp_domain = domains.get(expected).copied().unwrap_or(Domain::Unknown);
+                                    if !matches!(exp_domain, Domain::ScalarData | Domain::Unknown) {
+                                        return Err(format!(
+                                            "instr[{i}] AtomicCAS: expected v{} has domain {:?}, expected ScalarData",
+                                            expected.0, exp_domain));
+                                    }
+                                    let des_domain = domains.get(desired).copied().unwrap_or(Domain::Unknown);
+                                    if !matches!(des_domain, Domain::ScalarData | Domain::Unknown) {
+                                        return Err(format!(
+                                            "instr[{i}] AtomicCAS: desired v{} has domain {:?}, expected ScalarData",
+                                            desired.0, des_domain));
+                                    }
+                                    domains.insert(*dst, Domain::ScalarData); Ok(()) },
+            _ => Ok(()),
+        }
+    }
+
+    fn validate_value_domains_aritha(instr: &VmInstr, i: usize, kinds: &std::collections::HashMap<VRegId, VRegKind>, domains: &mut std::collections::HashMap<VRegId, Domain>) -> Result<(), String> {
+        // Arith cluster a (8 arms) — ARCH-LOWER-DISPATCH-LAYERING P3 (机械抽取)
+        match instr {
+            VmInstr::VecBinOp { dst, .. } => { 
+                                    domains.insert(*dst, Domain::VecData); Ok(()) },
+            VmInstr::VecUnaryOp { dst, .. } => { 
+                                    domains.insert(*dst, Domain::VecData); Ok(()) },
+            VmInstr::VecCmp { dst, .. } => { 
+                                    domains.insert(*dst, Domain::VecData); Ok(()) },
+            VmInstr::VecCast { dst, .. } => { 
+                                    domains.insert(*dst, Domain::VecData); Ok(()) },
+            VmInstr::ConditionalSelect { dst, .. } => { 
+                                    domains.insert(*dst, Domain::VecData); Ok(()) },
+            VmInstr::Fma { dst, .. } => { 
+                                    domains.insert(*dst, Domain::VecData); Ok(()) },
+            VmInstr::HReduce { dst, .. } => { 
+                                    domains.insert(*dst, Domain::VecData); Ok(()) },
+            VmInstr::Accumulate { .. } => { 
+                                    // acc domain stays the same
+                 Ok(()) },
+            _ => Self::validate_value_domains_arithb(instr, i, &kinds, domains),
+        }
+    }
+
+    fn validate_value_domains_arithb(instr: &VmInstr, i: usize, kinds: &std::collections::HashMap<VRegId, VRegKind>, domains: &mut std::collections::HashMap<VRegId, Domain>) -> Result<(), String> {
+        // Arith cluster b (8 arms) — ARCH-LOWER-DISPATCH-LAYERING P3 (机械抽取)
+        match instr {
+            VmInstr::Transcendental { dst, .. } => { 
+                                    domains.insert(*dst, Domain::VecData); Ok(()) },
+            // GPR operations
+            VmInstr::GprBinOp { dst, a, b, op } => { 
+                                    let da = domains.get(a).copied().unwrap_or(Domain::Unknown);
+                                    let db = b.vreg().and_then(|v| domains.get(&v).copied()).unwrap_or(Domain::Unknown);
+                                    if matches!(op, GprOp::Mul) {
+                                        domains.insert(*dst, da);
+                                    } else if da == Domain::Ptr || db == Domain::Ptr {
+                                        domains.insert(*dst, Domain::Ptr);
+                                    } else if matches!(op, GprOp::Sub) && da == Domain::Unknown {
+                                        // Preserve existing domain for counter decrement
+                                    } else {
+                                        domains.insert(*dst, Domain::ScalarData);
+                                    }
+                 Ok(()) },
+            VmInstr::GprUnaryOp { dst, .. } => { 
+                                    domains.insert(*dst, Domain::ScalarData); Ok(()) },
+            VmInstr::GprLoadImm { dst, .. } => { 
+                                    domains.insert(*dst, Domain::ScalarData); Ok(()) },
+            // Quant* decode instrs: produce VecData
+            VmInstr::DotProduct { acc: dst, .. } => { 
+                                    domains.insert(*dst, Domain::VecData); Ok(()) },
+            // Quant* decode instrs: produce VecData
+            VmInstr::ScaleApply { dst, .. } => { 
+                                    domains.insert(*dst, Domain::VecData); Ok(()) },
+            // VecShuffle — src (Vec), dst → Vec (lane rearrangement)
+            VmInstr::VecShuffle { dst, src, .. } => { 
+                                    let src_domain = domains.get(src).copied().unwrap_or(Domain::Unknown);
+                                    if !matches!(src_domain, Domain::ScalarData | Domain::Unknown) {
+                                        return Err(format!(
+                                            "instr[{i}] VecShuffle: src v{} has domain {:?}, expected ScalarData (Vec)",
+                                            src.0, src_domain));
+                                    }
+                                    domains.insert(*dst, Domain::ScalarData); Ok(()) },
+            // VecExtractLane — src (Vec), dst → ScalarData
+            VmInstr::VecExtractLane { dst, src, .. } => { 
+                                    let src_domain = domains.get(src).copied().unwrap_or(Domain::Unknown);
+                                    if !matches!(src_domain, Domain::ScalarData | Domain::Unknown) {
+                                        return Err(format!(
+                                            "instr[{i}] VecExtractLane: src v{} has domain {:?}, expected ScalarData (Vec)",
+                                            src.0, src_domain));
+                                    }
+                                    domains.insert(*dst, Domain::ScalarData); Ok(()) },
+            _ => Self::validate_value_domains_arithc(instr, i, &kinds, domains),
+        }
+    }
+
+    fn validate_value_domains_arithc(instr: &VmInstr, i: usize, kinds: &std::collections::HashMap<VRegId, VRegKind>, domains: &mut std::collections::HashMap<VRegId, Domain>) -> Result<(), String> {
+        // Arith cluster c (3 arms) — ARCH-LOWER-DISPATCH-LAYERING P3 (机械抽取)
+        match instr {
+            // VecInsertLane — src_vec (Vec) + src_scalar (ScalarData), dst → Vec
+            VmInstr::VecInsertLane { dst, src_vec, src_scalar, .. } => { 
+                                    let vec_domain = domains.get(src_vec).copied().unwrap_or(Domain::Unknown);
+                                    let scalar_domain = domains.get(src_scalar).copied().unwrap_or(Domain::Unknown);
+                                    if !matches!(vec_domain, Domain::ScalarData | Domain::Unknown) {
+                                        return Err(format!(
+                                            "instr[{i}] VecInsertLane: src_vec v{} has domain {:?}, expected ScalarData (Vec)",
+                                            src_vec.0, vec_domain));
+                                    }
+                                    if !matches!(scalar_domain, Domain::ScalarData | Domain::Unknown) {
+                                        return Err(format!(
+                                            "instr[{i}] VecInsertLane: src_scalar v{} has domain {:?}, expected ScalarData",
+                                            src_scalar.0, scalar_domain));
+                                    }
+                                    domains.insert(*dst, Domain::ScalarData); Ok(()) },
+            // VecLoadConst — dst → Vec (no src vregs)
+            VmInstr::VecLoadConst { dst, .. } => { 
+                                    domains.insert(*dst, Domain::ScalarData); Ok(()) },
+            VmInstr::VecShiftImm { dst, a, .. } => { 
+                                    let a_domain = domains.get(a).copied().unwrap_or(Domain::Unknown);
+                                    domains.insert(*dst, a_domain); Ok(()) },
+            _ => Ok(()),
+        }
+    }
+
+    fn validate_value_domains_controla(instr: &VmInstr, i: usize, kinds: &std::collections::HashMap<VRegId, VRegKind>, domains: &mut std::collections::HashMap<VRegId, Domain>) -> Result<(), String> {
+        // Control cluster a (8 arms) — ARCH-LOWER-DISPATCH-LAYERING P3 (机械抽取)
+        match instr {
+            // LoopBegin: counter and byte_offset domains set by DeclareVReg
+            VmInstr::LoopBegin { .. } => { 
+                 Ok(()) },
+            // LoopBegin: counter and byte_offset domains set by DeclareVReg
+            VmInstr::LoopEnd => { 
+                 Ok(()) },
+            // Meta instructions: no domain changes
+            VmInstr::MarkLabel { .. } => { 
+                 Ok(()) },
+            // Meta instructions: no domain changes
+            VmInstr::ScopeBegin { .. } => { 
+                 Ok(()) },
+            // Meta instructions: no domain changes
+            VmInstr::ScopeEnd { .. } => { 
+                 Ok(()) },
+            // Meta instructions: no domain changes
+            VmInstr::BreakLoop { .. } => { 
+                 Ok(()) },
+            // Meta instructions: no domain changes
+            VmInstr::ConditionalSkip { .. } => { 
+                 Ok(()) },
+            // Meta instructions: no domain changes
+            VmInstr::GprCondAction { .. } => { 
+                 Ok(()) },
+            _ => Self::validate_value_domains_controlb(instr, i, &kinds, domains),
+        }
+    }
+
+    fn validate_value_domains_controlb(instr: &VmInstr, i: usize, kinds: &std::collections::HashMap<VRegId, VRegKind>, domains: &mut std::collections::HashMap<VRegId, Domain>) -> Result<(), String> {
+        // Control cluster b (6 arms) — ARCH-LOWER-DISPATCH-LAYERING P3 (机械抽取)
+        match instr {
+            // Meta instructions: no domain changes
+            VmInstr::IndirectJump { .. } => { 
+                 Ok(()) },
+            // Meta instructions: no domain changes
+            VmInstr::ConditionalExit { .. } => { 
+                 Ok(()) },
+            // Meta instructions: no domain changes
+            VmInstr::BranchIfPtrNonNull { .. } => { 
+                 Ok(()) },
+            // Meta instructions: no domain changes
+            VmInstr::BranchIfGprZero { .. } => { 
+                 Ok(()) },
+            // Meta instructions: no domain changes
+            VmInstr::BranchIfGprLtU { .. } => { 
+                 Ok(()) },
+            // Meta instructions: no domain changes
+            VmInstr::UnconditionalBranch { .. } => { 
+                 Ok(()) },
+            _ => Ok(()),
+        }
+    }
+
+    fn validate_value_domains_tilea(instr: &VmInstr, i: usize, kinds: &std::collections::HashMap<VRegId, VRegKind>, domains: &mut std::collections::HashMap<VRegId, Domain>) -> Result<(), String> {
+        // Tile cluster a (8 arms) — ARCH-LOWER-DISPATCH-LAYERING P3 (机械抽取)
+        match instr {
+            // Meta instructions: no domain changes
+            VmInstr::TileConfig { .. } => { 
+                 Ok(()) },
+            // Meta instructions: no domain changes
+            VmInstr::TileLoad { .. } => { 
+                 Ok(()) },
+            // Meta instructions: no domain changes
+            VmInstr::TileMma { .. } => { 
+                 Ok(()) },
+            // Meta instructions: no domain changes
+            VmInstr::TileStore { .. } => { 
+                 Ok(()) },
+            // Meta instructions: no domain changes
+            VmInstr::TileRelease => { 
+                 Ok(()) },
+            // Meta instructions: no domain changes
+            VmInstr::TmemAlloc { .. } => { 
+                 Ok(()) },
+            // Meta instructions: no domain changes
+            VmInstr::TmemStore { .. } => { 
+                 Ok(()) },
+            // Meta instructions: no domain changes
+            VmInstr::TmemDealloc { .. } => { 
+                 Ok(()) },
+            _ => Self::validate_value_domains_tileb(instr, i, &kinds, domains),
+        }
+    }
+
+    fn validate_value_domains_tileb(instr: &VmInstr, i: usize, kinds: &std::collections::HashMap<VRegId, VRegKind>, domains: &mut std::collections::HashMap<VRegId, Domain>) -> Result<(), String> {
+        // Tile cluster b (1 arms) — ARCH-LOWER-DISPATCH-LAYERING P3 (机械抽取)
+        match instr {
+            // Quant* decode instrs: produce VecData
+            VmInstr::TmemLoad { dst, .. } => { 
+                                    domains.insert(*dst, Domain::VecData); Ok(()) },
+            _ => Ok(()),
+        }
+    }
+
+    fn validate_value_domains_quanta(instr: &VmInstr, i: usize, kinds: &std::collections::HashMap<VRegId, VRegKind>, domains: &mut std::collections::HashMap<VRegId, Domain>) -> Result<(), String> {
+        // Quant cluster a (8 arms) — ARCH-LOWER-DISPATCH-LAYERING P3 (机械抽取)
+        match instr {
+            // Meta instructions: no domain changes
+            VmInstr::SparseMaskIntersect { .. } => { 
+                 Ok(()) },
+            // Meta instructions: no domain changes
+            VmInstr::KiviQuantChannel { .. } => { 
+                 Ok(()) },
+            // Meta instructions: no domain changes
+            VmInstr::KiviQuantToken { .. } => { 
+                 Ok(()) },
+            // Meta instructions: no domain changes
+            VmInstr::KiviDequantLoad { .. } => { 
+                 Ok(()) },
+            VmInstr::GgufSubScaleLoad { dst, scales_base, sub_block_idx, .. } => { 
+                                    let sb_domain = domains.get(scales_base).copied().unwrap_or(Domain::Unknown);
+                                    if !matches!(sb_domain, Domain::Ptr | Domain::Unknown) {
+                                        return Err(format!(
+                                            "instr[{i}] GGUF SubScale load: scales_base v{} has domain {:?}, expected Ptr",
+                                            scales_base.0, sb_domain));
+                                    }
+                                    let idx_domain = domains.get(sub_block_idx).copied().unwrap_or(Domain::Unknown);
+                                    if idx_domain == Domain::VecData {
+                                        return Err(format!(
+                                            "instr[{i}] GGUF SubScale load: sub_block_idx v{} has domain VecData, expected Ptr/Scalar/Unknown",
+                                            sub_block_idx.0));
+                                    }
+                                    domains.insert(*dst, Domain::VecData); Ok(()) },
+            VmInstr::GgufKQuantScaleLoad { dst, scales_base, sub_block_idx, .. } => { 
+                                    let sb_domain = domains.get(scales_base).copied().unwrap_or(Domain::Unknown);
+                                    if !matches!(sb_domain, Domain::Ptr | Domain::Unknown) {
+                                        return Err(format!(
+                                            "instr[{i}] GGUF KQuant scale load: scales_base v{} has domain {:?}, expected Ptr",
+                                            scales_base.0, sb_domain));
+                                    }
+                                    let idx_domain = domains.get(sub_block_idx).copied().unwrap_or(Domain::Unknown);
+                                    if idx_domain == Domain::VecData {
+                                        return Err(format!(
+                                            "instr[{i}] GGUF KQuant scale load: sub_block_idx v{} has domain VecData, expected Ptr/Scalar/Unknown",
+                                            sub_block_idx.0));
+                                    }
+                                    domains.insert(*dst, Domain::VecData); Ok(()) },
+            // Quant* decode instrs: produce VecData
+            VmInstr::QuantBroadcastInt { dst, .. } => { 
+                                    domains.insert(*dst, Domain::VecData); Ok(()) },
+            // Quant* decode instrs: produce VecData
+            VmInstr::QuantScalarCvtLoad { dst, .. } => { 
+                                    domains.insert(*dst, Domain::VecData); Ok(()) },
+            _ => Self::validate_value_domains_quantb(instr, i, &kinds, domains),
+        }
+    }
+
+    fn validate_value_domains_quantb(instr: &VmInstr, i: usize, kinds: &std::collections::HashMap<VRegId, VRegKind>, domains: &mut std::collections::HashMap<VRegId, Domain>) -> Result<(), String> {
+        // Quant cluster b (8 arms) — ARCH-LOWER-DISPATCH-LAYERING P3 (机械抽取)
+        match instr {
+            // Quant* decode instrs: produce VecData
+            VmInstr::QuantBlockLoad { dst, .. } => { 
+                                    domains.insert(*dst, Domain::VecData); Ok(()) },
+            // Quant* decode instrs: produce VecData
+            VmInstr::QuantBiPlaneLoad { dst, .. } => { 
+                                    domains.insert(*dst, Domain::VecData); Ok(()) },
+            // Quant* decode instrs: produce VecData
+            VmInstr::QuantLoadBytesVec { dst, .. } => { 
+                                    domains.insert(*dst, Domain::VecData); Ok(()) },
+            // Quant* decode instrs: produce VecData
+            VmInstr::QuantCodebookLookup { dst, .. } => { 
+                                    domains.insert(*dst, Domain::VecData); Ok(()) },
+            // Quant* decode instrs: produce VecData
+            VmInstr::QuantExtractBits { dst, .. } => { 
+                                    domains.insert(*dst, Domain::VecData); Ok(()) },
+            // Quant* decode instrs: produce VecData
+            VmInstr::QuantDequantFma { dst, .. } => { 
+                                    domains.insert(*dst, Domain::VecData); Ok(()) },
+            // Quant* decode instrs: produce VecData
+            VmInstr::QuantInterleave { dst, .. } => { 
+                                    domains.insert(*dst, Domain::VecData); Ok(()) },
+            // Quant* decode instrs: produce VecData
+            VmInstr::QuantConcatSeq { dst, .. } => { 
+                                    domains.insert(*dst, Domain::VecData); Ok(()) },
+            _ => Self::validate_value_domains_quantc(instr, i, &kinds, domains),
+        }
+    }
+
+    fn validate_value_domains_quantc(instr: &VmInstr, i: usize, kinds: &std::collections::HashMap<VRegId, VRegKind>, domains: &mut std::collections::HashMap<VRegId, Domain>) -> Result<(), String> {
+        // Quant cluster c (7 arms) — ARCH-LOWER-DISPATCH-LAYERING P3 (机械抽取)
+        match instr {
+            // Quant* decode instrs: produce VecData
+            VmInstr::Q3KDecodeStep { dst, .. } => { 
+                                    domains.insert(*dst, Domain::VecData); Ok(()) },
+            // Quant* decode instrs: produce VecData
+            VmInstr::BitwiseGemm { dst, .. } => { 
+                                    domains.insert(*dst, Domain::VecData); Ok(()) },
+            // Quant* decode instrs: produce VecData
+            VmInstr::SparseGemm { acc: dst, .. } => { 
+                                    domains.insert(*dst, Domain::VecData); Ok(()) },
+            // Quant* decode instrs: produce VecData
+            VmInstr::SparseFp8Gemm { acc: dst, .. } => { 
+                                    domains.insert(*dst, Domain::VecData); Ok(()) },
+            // Quant* decode instrs: produce VecData
+            VmInstr::NativeFp4Gemm { acc: dst, .. } => { 
+                                    domains.insert(*dst, Domain::VecData); Ok(()) },
+            // Quant* decode instrs: produce VecData
+            VmInstr::NativeFp8Gemm { acc: dst, .. } => { 
+                                    domains.insert(*dst, Domain::VecData); Ok(()) },
+            // Quant* decode instrs: produce VecData
+            VmInstr::HwQuantDequant { dst, .. } => { 
+                                    domains.insert(*dst, Domain::VecData); Ok(()) },
+            _ => Ok(()),
+        }
+    }
+
+    fn validate_value_domains_gpucomma(instr: &VmInstr, i: usize, kinds: &std::collections::HashMap<VRegId, VRegKind>, domains: &mut std::collections::HashMap<VRegId, Domain>) -> Result<(), String> {
+        // GpuComm cluster a (8 arms) — ARCH-LOWER-DISPATCH-LAYERING P3 (机械抽取)
+        match instr {
+            // Meta instructions: no domain changes
+            VmInstr::WarpSync => { 
+                 Ok(()) },
+            // Meta instructions: no domain changes
+            VmInstr::AsyncCopy { .. } => { 
+                 Ok(()) },
+            // Meta instructions: no domain changes
+            VmInstr::AsyncWait { .. } => { 
+                 Ok(()) },
+            // Meta instructions: no domain changes
+            VmInstr::PageTableAddr { .. } => { 
+                 Ok(()) },
+            // Meta instructions: no domain changes
+            VmInstr::PageTableKVWrite { .. } => { 
+                 Ok(()) },
+            // Meta instructions: no domain changes
+            VmInstr::PageTableKVWriteQuant { .. } => { 
+                 Ok(()) },
+            // Meta instructions: no domain changes
+            VmInstr::SharedMemAlloc { .. } => { 
+                 Ok(()) },
+            // Meta instructions: no domain changes
+            VmInstr::SharedMemStore { .. } => { 
+                 Ok(()) },
+            _ => Self::validate_value_domains_gpucommb(instr, i, &kinds, domains),
+        }
+    }
+
+    fn validate_value_domains_gpucommb(instr: &VmInstr, i: usize, kinds: &std::collections::HashMap<VRegId, VRegKind>, domains: &mut std::collections::HashMap<VRegId, Domain>) -> Result<(), String> {
+        // GpuComm cluster b (8 arms) — ARCH-LOWER-DISPATCH-LAYERING P3 (机械抽取)
+        match instr {
+            // Meta instructions: no domain changes
+            VmInstr::SharedMemLoad { .. } => { 
+                 Ok(()) },
+            // Meta instructions: no domain changes
+            VmInstr::SharedMemAsyncStore { .. } => { 
+                 Ok(()) },
+            // Meta instructions: no domain changes
+            VmInstr::SharedMemAsyncWaitGroup { .. } => { 
+                 Ok(()) },
+            // Meta instructions: no domain changes
+            VmInstr::ClusterBarrierInit { .. } => { 
+                 Ok(()) },
+            // Meta instructions: no domain changes
+            VmInstr::ClusterStore { .. } => { 
+                 Ok(()) },
+            // Meta instructions: no domain changes
+            VmInstr::WeightPrefetchAsync { .. } => { 
+                 Ok(()) },
+            // Meta instructions: no domain changes
+            VmInstr::WeightPrefetchWait { .. } => { 
+                 Ok(()) },
+            // Meta instructions: no domain changes
+            VmInstr::WarpRoleDeclare { .. } => { 
+                 Ok(()) },
+            _ => Self::validate_value_domains_gpucommc(instr, i, &kinds, domains),
+        }
+    }
+
+    fn validate_value_domains_gpucommc(instr: &VmInstr, i: usize, kinds: &std::collections::HashMap<VRegId, VRegKind>, domains: &mut std::collections::HashMap<VRegId, Domain>) -> Result<(), String> {
+        // GpuComm cluster c (8 arms) — ARCH-LOWER-DISPATCH-LAYERING P3 (机械抽取)
+        match instr {
+            // Meta instructions: no domain changes
+            VmInstr::WarpBarrierArrive { .. } => { 
+                 Ok(()) },
+            // Meta instructions: no domain changes
+            VmInstr::WarpBarrierWait { .. } => { 
+                 Ok(()) },
+            // Meta instructions: no domain changes
+            VmInstr::TmaDescriptorInit { .. } => { 
+                 Ok(()) },
+            // Meta instructions: no domain changes
+            VmInstr::Tma2DCopy { .. } => { 
+                 Ok(()) },
+            // Meta instructions: no domain changes
+            VmInstr::BarrierInit { .. } => { 
+                 Ok(()) },
+            // Meta instructions: no domain changes
+            VmInstr::BlockSync => { 
+                 Ok(()) },
+            // Meta instructions: no domain changes
+            VmInstr::WarpReduce { .. } => { 
+                 Ok(()) },
+            // Quant* decode instrs: produce VecData
+            VmInstr::ClusterLoad { dst, .. } => { 
+                                    domains.insert(*dst, Domain::VecData); Ok(()) },
+            _ => Self::validate_value_domains_gpucommd(instr, i, &kinds, domains),
+        }
+    }
+
+    fn validate_value_domains_gpucommd(instr: &VmInstr, i: usize, kinds: &std::collections::HashMap<VRegId, VRegKind>, domains: &mut std::collections::HashMap<VRegId, Domain>) -> Result<(), String> {
+        // GpuComm cluster d (8 arms) — ARCH-LOWER-DISPATCH-LAYERING P3 (机械抽取)
+        match instr {
+            // SharedMemSwizzle — raw_addr input (Ptr/ByteOffset), dst → Ptr
+            VmInstr::SharedMemSwizzle { dst, raw_addr, .. } => { 
+                                    let src_domain = domains.get(raw_addr).copied().unwrap_or(Domain::Unknown);
+                                    if !matches!(src_domain, Domain::Ptr | Domain::ByteOff | Domain::LoopByteOffset | Domain::Unknown) {
+                                        return Err(format!(
+                                            "instr[{i}] SharedMemSwizzle: raw_addr v{} has domain {:?}, expected Ptr/ByteOffset",
+                                            raw_addr.0, src_domain));
+                                    }
+                                    domains.insert(*dst, Domain::Ptr); Ok(()) },
+            // AllReduceChunk: sendbuf/recvbuf are Ptr, count/rank/world_size/chunk_idx are ScalarData
+            #[cfg(feature = "nccl")]
+            VmInstr::AllReduceChunk { sendbuf, recvbuf, count, rank, world_size, chunk_idx, .. } => { 
+                                    for &ptr_vreg in &[sendbuf, recvbuf] {
+                                        let d = domains.get(ptr_vreg).copied().unwrap_or(Domain::Unknown);
+                                        if !matches!(d, Domain::Ptr | Domain::ScalarData | Domain::Unknown) {
+                                            return Err(format!(
+                                                "instr[{i}] AllReduceChunk: buf v{} has domain {:?}, expected Ptr",
+                                                ptr_vreg.0, d));
+                                        }
+                                    }
+                                    for &scalar_vreg in &[count, rank, world_size, chunk_idx] {
+                                        let d = domains.get(scalar_vreg).copied().unwrap_or(Domain::Unknown);
+                                        if !matches!(d, Domain::ScalarData | Domain::Counter | Domain::Unknown) {
+                                            return Err(format!(
+                                                "instr[{i}] AllReduceChunk: param v{} has domain {:?}, expected ScalarData",
+                                                scalar_vreg.0, d));
+                                        }
+                                    }
+                 Ok(()) },
+            // CommBarrier: thread_count is ScalarData
+            #[cfg(feature = "nccl")]
+            VmInstr::CommBarrier { thread_count, .. } => { 
+                                    let tc_domain = domains.get(thread_count).copied().unwrap_or(Domain::Unknown);
+                                    if !matches!(tc_domain, Domain::ScalarData | Domain::Counter | Domain::Unknown) {
+                                        return Err(format!(
+                                            "instr[{i}] CommBarrier: thread_count v{} has domain {:?}, expected ScalarData",
+                                            thread_count.0, tc_domain));
+                                    }
+                 Ok(()) },
+            // NvlinkAsyncCopy: dst/src are Ptr, len is ScalarData
+            #[cfg(feature = "nccl")]
+            VmInstr::NvlinkAsyncCopy { dst, src, len, .. } => { 
+                                    for &ptr_vreg in &[dst, src] {
+                                        let d = domains.get(ptr_vreg).copied().unwrap_or(Domain::Unknown);
+                                        if !matches!(d, Domain::Ptr | Domain::ScalarData | Domain::Unknown) {
+                                            return Err(format!(
+                                                "instr[{i}] NvlinkAsyncCopy: ptr v{} has domain {:?}, expected Ptr",
+                                                ptr_vreg.0, d));
+                                        }
+                                    }
+                                    let len_domain = domains.get(len).copied().unwrap_or(Domain::Unknown);
+                                    if !matches!(len_domain, Domain::ScalarData | Domain::Counter | Domain::Unknown) {
+                                        return Err(format!(
+                                            "instr[{i}] NvlinkAsyncCopy: len v{} has domain {:?}, expected ScalarData",
+                                            len.0, len_domain));
+                                    }
+                 Ok(()) },
+            // ── Distributed paging VmInstr (nccl) ──
+            #[cfg(feature = "nccl")]
+            VmInstr::RemotePageLookup { dst, seq_id, page_index, routing_table_base, .. } => { 
+                                    for &ptr_vreg in &[routing_table_base] {
+                                        let d = domains.get(ptr_vreg).copied().unwrap_or(Domain::Unknown);
+                                        if !matches!(d, Domain::Ptr | Domain::Unknown) {
+                                            return Err(format!("instr[{i}] RemotePageLookup: ptr v{} has domain {:?}, expected Ptr", ptr_vreg.0, d));
+                                        }
+                                    }
+                                    domains.insert(*dst, Domain::Ptr);
+                                    let _ = (seq_id, page_index); Ok(()) },
+            #[cfg(feature = "nccl")]
+            VmInstr::P2pPageFetch { local_buf, peer_buf, page_size, barrier } => { 
+                                    for &ptr_vreg in &[local_buf, peer_buf, barrier] {
+                                        let d = domains.get(ptr_vreg).copied().unwrap_or(Domain::Unknown);
+                                        if !matches!(d, Domain::Ptr | Domain::Unknown) {
+                                            return Err(format!("instr[{i}] P2pPageFetch: ptr v{} has domain {:?}, expected Ptr", ptr_vreg.0, d));
+                                        }
+                                    }
+                                    let _ = page_size; Ok(()) },
+            #[cfg(feature = "nccl")]
+            VmInstr::RdmaPageFetch { local_buf, remote_addr, rkey, page_size, sq_desc, doorbell, cq_addr } => { 
+                                    for &ptr_vreg in &[local_buf, remote_addr, rkey, sq_desc, doorbell, cq_addr] {
+                                        let d = domains.get(ptr_vreg).copied().unwrap_or(Domain::Unknown);
+                                        if !matches!(d, Domain::Ptr | Domain::Unknown) {
+                                            return Err(format!("instr[{i}] RdmaPageFetch: ptr v{} has domain {:?}, expected Ptr", ptr_vreg.0, d));
+                                        }
+                                    }
+                                    let _ = page_size; Ok(()) },
+            #[cfg(feature = "nccl")]
+            VmInstr::RdmaPageFetchCompressed { local_buf, scratch_buf, remote_addr, rkey, sq_desc, doorbell, cq_addr, .. } => { 
+                                    for &ptr_vreg in &[local_buf, scratch_buf, remote_addr, rkey, sq_desc, doorbell, cq_addr] {
+                                        let d = domains.get(ptr_vreg).copied().unwrap_or(Domain::Unknown);
+                                        if !matches!(d, Domain::Ptr | Domain::Unknown) {
+                                            return Err(format!("instr[{i}] RdmaPageFetchCompressed: ptr v{} has domain {:?}, expected Ptr", ptr_vreg.0, d));
+                                        }
+                                    }
+                 Ok(()) },
+            _ => Self::validate_value_domains_gpucomme(instr, i, &kinds, domains),
+        }
+    }
+
+    fn validate_value_domains_gpucomme(instr: &VmInstr, i: usize, kinds: &std::collections::HashMap<VRegId, VRegKind>, domains: &mut std::collections::HashMap<VRegId, Domain>) -> Result<(), String> {
+        // GpuComm cluster e (4 arms) — ARCH-LOWER-DISPATCH-LAYERING P3 (机械抽取)
+        match instr {
+            #[cfg(feature = "nccl")]
+            VmInstr::RemotePageAttn { q_buf, k_remote_buf, v_remote_buf, output_buf, shared_buf, barrier, tile_bytes } => { 
+                                    for &ptr_vreg in &[q_buf, k_remote_buf, v_remote_buf, output_buf, shared_buf, barrier] {
+                                        let d = domains.get(ptr_vreg).copied().unwrap_or(Domain::Unknown);
+                                        if !matches!(d, Domain::Ptr | Domain::Unknown) {
+                                            return Err(format!("instr[{i}] RemotePageAttn: ptr v{} has domain {:?}, expected Ptr", ptr_vreg.0, d));
+                                        }
+                                    }
+                                    let _ = tile_bytes; Ok(()) },
+            #[cfg(feature = "nccl")]
+            VmInstr::PageMigrationLock { dst, entry_addr } => { 
+                                    let d = domains.get(entry_addr).copied().unwrap_or(Domain::Unknown);
+                                    if !matches!(d, Domain::Ptr | Domain::Unknown) {
+                                        return Err(format!("instr[{i}] PageMigrationLock: entry_addr v{} has domain {:?}, expected Ptr", entry_addr.0, d));
+                                    }
+                                    domains.insert(*dst, Domain::ScalarData); Ok(()) },
+            #[cfg(feature = "nccl")]
+            VmInstr::PageMigrationUnlock { entry_addr } => { 
+                                    let d = domains.get(entry_addr).copied().unwrap_or(Domain::Unknown);
+                                    if !matches!(d, Domain::Ptr | Domain::Unknown) {
+                                        return Err(format!("instr[{i}] PageMigrationUnlock: entry_addr v{} has domain {:?}, expected Ptr", entry_addr.0, d));
+                                    }
+                 Ok(()) },
+            #[cfg(feature = "nccl")]
+            VmInstr::PageLocationUpdate { entry_addr, new_location, .. } => { 
+                                    for &ptr_vreg in &[entry_addr, new_location] {
+                                        let d = domains.get(ptr_vreg).copied().unwrap_or(Domain::Unknown);
+                                        if !matches!(d, Domain::Ptr | Domain::Unknown) {
+                                            return Err(format!("instr[{i}] PageLocationUpdate: ptr v{} has domain {:?}, expected Ptr", ptr_vreg.0, d));
+                                        }
+                                    }
+                 Ok(()) },
+            _ => Ok(()),
+        }
+    }
+
+    fn validate_value_domains_samplinga(instr: &VmInstr, i: usize, kinds: &std::collections::HashMap<VRegId, VRegKind>, domains: &mut std::collections::HashMap<VRegId, Domain>) -> Result<(), String> {
+        // Sampling cluster a (8 arms) — ARCH-LOWER-DISPATCH-LAYERING P3 (机械抽取)
+        match instr {
+            // Sampling operations
+            VmInstr::Argmax { dst, logits_ptr, .. } => { 
+                                    let ptr_domain = domains.get(logits_ptr).copied().unwrap_or(Domain::Unknown);
+                                    if !matches!(ptr_domain, Domain::Ptr | Domain::Unknown) {
+                                        return Err(format!(
+                                            "instr[{i}] Argmax: logits_ptr v{} has domain {:?}, expected Ptr",
+                                            logits_ptr.0, ptr_domain));
+                                    }
+                                    domains.insert(*dst, Domain::ScalarData); Ok(()) },
+            VmInstr::StoreToken { output_buf, input_ids_ptr, .. } => { 
+                                    for (&vreg, label) in [(output_buf, "output_buf"), (input_ids_ptr, "input_ids_ptr")] {
+                                        let d = domains.get(&vreg).copied().unwrap_or(Domain::Unknown);
+                                        if !matches!(d, Domain::Ptr | Domain::Unknown) {
+                                            return Err(format!(
+                                                "instr[{i}] StoreToken: {} v{} has domain {:?}, expected Ptr",
+                                                label, vreg.0, d));
+                                        }
+                                    }
+                 Ok(()) },
+            VmInstr::CheckStopCondition { eos_ptr, max_tokens_ptr, .. } => { 
+                                    for (&vreg, label) in [(eos_ptr, "eos_ptr"), (max_tokens_ptr, "max_tokens_ptr")] {
+                                        let d = domains.get(&vreg).copied().unwrap_or(Domain::Unknown);
+                                        if !matches!(d, Domain::Ptr | Domain::Unknown) {
+                                            return Err(format!(
+                                                "instr[{i}] CheckStopCondition: {} v{} has domain {:?}, expected Ptr",
+                                                label, vreg.0, d));
+                                        }
+                                    }
+                 Ok(()) },
+            VmInstr::TemperatureScale { logits_ptr, temp_ptr, .. } => { 
+                                    for (&vreg, label) in [(logits_ptr, "logits_ptr"), (temp_ptr, "temp_ptr")] {
+                                        let d = domains.get(&vreg).copied().unwrap_or(Domain::Unknown);
+                                        if !matches!(d, Domain::Ptr | Domain::Unknown) {
+                                            return Err(format!(
+                                                "instr[{i}] TemperatureScale: {} v{} has domain {:?}, expected Ptr",
+                                                label, vreg.0, d));
+                                        }
+                                    }
+                 Ok(()) },
+            // Meta instructions: no domain changes
+            VmInstr::BatchSeqIdLookup { .. } => { 
+                 Ok(()) },
+            // Meta instructions: no domain changes
+            VmInstr::BatchPerSeqArgmax { .. } => { 
+                 Ok(()) },
+            // Meta instructions: no domain changes
+            VmInstr::BatchPerSeqStopCheck { .. } => { 
+                 Ok(()) },
+            // GPU sampling: SoftmaxReduceMax — logits_ptr must be Ptr, dst → ScalarData
+            VmInstr::SoftmaxReduceMax { dst, logits_ptr, .. } => { 
+                                    let ptr_domain = domains.get(logits_ptr).copied().unwrap_or(Domain::Unknown);
+                                    if !matches!(ptr_domain, Domain::Ptr | Domain::Unknown) {
+                                        return Err(format!(
+                                            "instr[{i}] SoftmaxReduceMax: logits_ptr v{} has domain {:?}, expected Ptr",
+                                            logits_ptr.0, ptr_domain));
+                                    }
+                                    domains.insert(*dst, Domain::ScalarData); Ok(()) },
+            _ => Self::validate_value_domains_samplingb(instr, i, &kinds, domains),
+        }
+    }
+
+    fn validate_value_domains_samplingb(instr: &VmInstr, i: usize, kinds: &std::collections::HashMap<VRegId, VRegKind>, domains: &mut std::collections::HashMap<VRegId, Domain>) -> Result<(), String> {
+        // Sampling cluster b (7 arms) — ARCH-LOWER-DISPATCH-LAYERING P3 (机械抽取)
+        match instr {
+            // GPU sampling: SoftmaxExpSum — logits_ptr Ptr, max_val ScalarData, sum_dst → ScalarData
+            VmInstr::SoftmaxExpSum { sum_dst, logits_ptr, max_val, .. } => { 
+                                    let ptr_domain = domains.get(logits_ptr).copied().unwrap_or(Domain::Unknown);
+                                    if !matches!(ptr_domain, Domain::Ptr | Domain::Unknown) {
+                                        return Err(format!(
+                                            "instr[{i}] SoftmaxExpSum: logits_ptr v{} has domain {:?}, expected Ptr",
+                                            logits_ptr.0, ptr_domain));
+                                    }
+                                    let mv_domain = domains.get(max_val).copied().unwrap_or(Domain::Unknown);
+                                    if !matches!(mv_domain, Domain::ScalarData | Domain::Unknown) {
+                                        return Err(format!(
+                                            "instr[{i}] SoftmaxExpSum: max_val v{} has domain {:?}, expected ScalarData",
+                                            max_val.0, mv_domain));
+                                    }
+                                    domains.insert(*sum_dst, Domain::ScalarData); Ok(()) },
+            // GPU sampling: SoftmaxNormalize — logits_ptr Ptr, sum_val ScalarData (in-place)
+            VmInstr::SoftmaxNormalize { logits_ptr, sum_val, .. } => { 
+                                    let ptr_domain = domains.get(logits_ptr).copied().unwrap_or(Domain::Unknown);
+                                    if !matches!(ptr_domain, Domain::Ptr | Domain::Unknown) {
+                                        return Err(format!(
+                                            "instr[{i}] SoftmaxNormalize: logits_ptr v{} has domain {:?}, expected Ptr",
+                                            logits_ptr.0, ptr_domain));
+                                    }
+                                    let sv_domain = domains.get(sum_val).copied().unwrap_or(Domain::Unknown);
+                                    if !matches!(sv_domain, Domain::ScalarData | Domain::Unknown) {
+                                        return Err(format!(
+                                            "instr[{i}] SoftmaxNormalize: sum_val v{} has domain {:?}, expected ScalarData",
+                                            sum_val.0, sv_domain));
+                                    }
+                 Ok(()) },
+            // GPU sampling: SampleTopKFilter — all Ptr (in-place filtering)
+            VmInstr::SampleTopKFilter { probs_ptr, indices_ptr, k_ptr, .. } => { 
+                                    for (&vreg, label) in [(probs_ptr, "probs_ptr"), (indices_ptr, "indices_ptr"), (k_ptr, "k_ptr")] {
+                                        let d = domains.get(&vreg).copied().unwrap_or(Domain::Unknown);
+                                        if !matches!(d, Domain::Ptr | Domain::Unknown) {
+                                            return Err(format!(
+                                                "instr[{i}] SampleTopKFilter: {} v{} has domain {:?}, expected Ptr",
+                                                label, vreg.0, d));
+                                        }
+                                    }
+                 Ok(()) },
+            // GPU sampling: SampleTopPFilter — all Ptr (in-place filtering)
+            VmInstr::SampleTopPFilter { probs_ptr, p_ptr, .. } => { 
+                                    for (&vreg, label) in [(probs_ptr, "probs_ptr"), (p_ptr, "p_ptr")] {
+                                        let d = domains.get(&vreg).copied().unwrap_or(Domain::Unknown);
+                                        if !matches!(d, Domain::Ptr | Domain::Unknown) {
+                                            return Err(format!(
+                                                "instr[{i}] SampleTopPFilter: {} v{} has domain {:?}, expected Ptr",
+                                                label, vreg.0, d));
+                                        }
+                                    }
+                 Ok(()) },
+            // GPU sampling: SampleMultinomial — probs_ptr/rng_state_ptr Ptr, dst → ScalarData
+            VmInstr::SampleMultinomial { dst, probs_ptr, rng_state_ptr, .. } => { 
+                                    for (&vreg, label) in [(probs_ptr, "probs_ptr"), (rng_state_ptr, "rng_state_ptr")] {
+                                        let d = domains.get(&vreg).copied().unwrap_or(Domain::Unknown);
+                                        if !matches!(d, Domain::Ptr | Domain::Unknown) {
+                                            return Err(format!(
+                                                "instr[{i}] SampleMultinomial: {} v{} has domain {:?}, expected Ptr",
+                                                label, vreg.0, d));
+                                        }
+                                    }
+                                    domains.insert(*dst, Domain::ScalarData); Ok(()) },
+            // GPU sampling: WarpPRNG — rng_state_ptr Ptr, dst → ScalarData
+            VmInstr::WarpPRNG { dst, rng_state_ptr } => { 
+                                    let ptr_domain = domains.get(rng_state_ptr).copied().unwrap_or(Domain::Unknown);
+                                    if !matches!(ptr_domain, Domain::Ptr | Domain::Unknown) {
+                                        return Err(format!(
+                                            "instr[{i}] WarpPRNG: rng_state_ptr v{} has domain {:?}, expected Ptr",
+                                            rng_state_ptr.0, ptr_domain));
+                                    }
+                                    domains.insert(*dst, Domain::ScalarData); Ok(()) },
+            // SeqIdLookup — token_index (Counter), seq_meta_base (Ptr), num_seqs (ScalarData), dst → ScalarData
+            VmInstr::SeqIdLookup { dst, token_index, seq_meta_base, num_seqs, .. } => { 
+                                    let idx_domain = domains.get(token_index).copied().unwrap_or(Domain::Unknown);
+                                    if !matches!(idx_domain, Domain::Counter | Domain::ScalarData | Domain::Unknown) {
+                                        return Err(format!(
+                                            "instr[{i}] SeqIdLookup: token_index v{} has domain {:?}, expected Counter",
+                                            token_index.0, idx_domain));
+                                    }
+                                    let base_domain = domains.get(seq_meta_base).copied().unwrap_or(Domain::Unknown);
+                                    if !matches!(base_domain, Domain::Ptr | Domain::ScalarData | Domain::Unknown) {
+                                        return Err(format!(
+                                            "instr[{i}] SeqIdLookup: seq_meta_base v{} has domain {:?}, expected Ptr",
+                                            seq_meta_base.0, base_domain));
+                                    }
+                                    let ns_domain = domains.get(num_seqs).copied().unwrap_or(Domain::Unknown);
+                                    if !matches!(ns_domain, Domain::ScalarData | Domain::Unknown) {
+                                        return Err(format!(
+                                            "instr[{i}] SeqIdLookup: num_seqs v{} has domain {:?}, expected ScalarData",
+                                            num_seqs.0, ns_domain));
+                                    }
+                                    domains.insert(*dst, Domain::ScalarData); Ok(()) },
+            _ => Ok(()),
+        }
+    }
+
+    fn validate_value_domains_misca(instr: &VmInstr, i: usize, kinds: &std::collections::HashMap<VRegId, VRegKind>, domains: &mut std::collections::HashMap<VRegId, Domain>) -> Result<(), String> {
+        // Misc cluster a (8 arms) — ARCH-LOWER-DISPATCH-LAYERING P3 (机械抽取)
+        match instr {
+            VmInstr::LoadCallbackEntry { table_ptr, fn_ptr_out, ctx_out, .. } => { 
+                                    let tbl_domain = domains.get(table_ptr).copied().unwrap_or(Domain::Unknown);
+                                    if !matches!(tbl_domain, Domain::Ptr | Domain::Unknown) {
+                                        return Err(format!(
+                                            "instr[{i}] LoadCallbackEntry: table_ptr v{} has domain {:?}, expected Ptr",
+                                            table_ptr.0, tbl_domain));
+                                    }
+                                    domains.insert(*fn_ptr_out, Domain::Ptr);
+                                    domains.insert(*ctx_out, Domain::Ptr); Ok(()) },
+            VmInstr::NativeCall { ret_val, fn_ptr, ctx_ptr } => { 
+                                    for (&vreg, label) in [(fn_ptr, "fn_ptr"), (ctx_ptr, "ctx_ptr")] {
+                                        let d = domains.get(&vreg).copied().unwrap_or(Domain::Unknown);
+                                        if !matches!(d, Domain::Ptr | Domain::Unknown) {
+                                            return Err(format!(
+                                                "instr[{i}] NativeCall: {} v{} has domain {:?}, expected Ptr",
+                                                label, vreg.0, d));
+                                        }
+                                    }
+                                    domains.insert(*ret_val, Domain::ScalarData); Ok(()) },
+            // Meta instructions: no domain changes
+            VmInstr::DeclareVReg { .. } => { 
+                 Ok(()) },
+            // Meta instructions: no domain changes
+            VmInstr::ReleaseVReg { .. } => { 
+                 Ok(()) },
+            // Meta instructions: no domain changes
+            VmInstr::Comment(_) => { 
+                 Ok(()) },
+            // Meta instructions: no domain changes
+            VmInstr::HotpatchSlot { .. } => { 
+                 Ok(()) },
+            // Meta instructions: no domain changes
+            VmInstr::Lz4Decode { .. } => { 
+                 Ok(()) },
+            // Meta instructions: no domain changes
+            VmInstr::BitPackRleDecode { .. } => { 
+                 Ok(()) },
+            _ => Self::validate_value_domains_miscb(instr, i, &kinds, domains),
+        }
+    }
+
+    fn validate_value_domains_miscb(instr: &VmInstr, i: usize, kinds: &std::collections::HashMap<VRegId, VRegKind>, domains: &mut std::collections::HashMap<VRegId, Domain>) -> Result<(), String> {
+        // Misc cluster b (4 arms) — ARCH-LOWER-DISPATCH-LAYERING P3 (机械抽取)
+        match instr {
+            // Meta instructions: no domain changes
+            VmInstr::DebugBreakpoint { .. } => { 
+                 Ok(()) },
+            // Meta instructions: no domain changes
+            VmInstr::DebugMarker { .. } => { 
+                 Ok(()) },
+            // Meta instructions: no domain changes
+            VmInstr::DebugProbe { .. } => { 
+                 Ok(()) },
+            // Meta instructions: no domain changes
+            VmInstr::DebugBreakIf { .. } => { 
+                 Ok(()) },
+            _ => Ok(()),
+        }
+    }
+
 }
 
