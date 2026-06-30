@@ -1154,7 +1154,7 @@ mod tests {
         let a_ptr = prog.alloc_vreg(VRegKind::Ptr, SimdWidth::Scalar);
         let b_ptr = prog.alloc_vreg(VRegKind::Ptr, SimdWidth::Scalar);
         let c_ptr = prog.alloc_vreg(VRegKind::Ptr, SimdWidth::Scalar);
-        emit_gemm_blis_inline(&mut prog, m, n, k, SimdWidth::W256, a_ptr, b_ptr, c_ptr, 4, 2, None, 4, QuantPrecision::F32, false).unwrap();
+        emit_gemm_blis_inline(&mut prog, m, n, k, SimdWidth::W256, a_ptr, b_ptr, c_ptr, 4, 2, None, 4, QuantPrecision::F32, QuantPrecision::F32, QuantPrecision::F32, false).unwrap();
 
         let total = prog.instrs.len();
         let mut fma_count = 0;
@@ -1197,7 +1197,7 @@ mod tests {
         let a_ptr = prog.alloc_vreg(VRegKind::Ptr, SimdWidth::Scalar);
         let b_ptr = prog.alloc_vreg(VRegKind::Ptr, SimdWidth::Scalar);
         let c_ptr = prog.alloc_vreg(VRegKind::Ptr, SimdWidth::Scalar);
-        emit_gemm_blis_inline(&mut prog, m, n, k, SimdWidth::W256, a_ptr, b_ptr, c_ptr, 4, 2, None, 1, QuantPrecision::F32, false).unwrap();
+        emit_gemm_blis_inline(&mut prog, m, n, k, SimdWidth::W256, a_ptr, b_ptr, c_ptr, 4, 2, None, 1, QuantPrecision::F32, QuantPrecision::F32, QuantPrecision::F32, false).unwrap();
 
         let mut fma_count = 0;
         for instr in &prog.instrs {

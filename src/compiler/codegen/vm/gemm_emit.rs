@@ -1538,7 +1538,7 @@ mod template_tests {
         let sym_map = SymDimSlotMap::mega_kernel_abi();
 
         let result = emit_gemm_inline_with_epilogue(
-            &mut prog, &SymDim::Concrete(0), 4, 4, width, a, b, c, &[], &sym_map, false, None, dtype, false, crate::compiler::codegen::vm::isa_hook::EpiloguePlace::OnAccumulators,
+            &mut prog, &SymDim::Concrete(0), 4, 4, width, a, b, c, &[], &sym_map, false, None, dtype, dtype, dtype, false, crate::compiler::codegen::vm::isa_hook::EpiloguePlace::OnAccumulators,
         );
         assert!(result.is_err(), "zero M should be rejected");
     }
@@ -1554,7 +1554,7 @@ mod template_tests {
         let sym_map = SymDimSlotMap::mega_kernel_abi();
 
         let result = emit_gemm_inline_with_epilogue(
-            &mut prog, &SymDim::Concrete(4), 0, 4, width, a, b, c, &[], &sym_map, false, None, dtype, false, crate::compiler::codegen::vm::isa_hook::EpiloguePlace::OnAccumulators,
+            &mut prog, &SymDim::Concrete(4), 0, 4, width, a, b, c, &[], &sym_map, false, None, dtype, dtype, dtype, false, crate::compiler::codegen::vm::isa_hook::EpiloguePlace::OnAccumulators,
         );
         assert!(result.is_err(), "zero N should be rejected");
     }
@@ -1570,7 +1570,7 @@ mod template_tests {
         let sym_map = SymDimSlotMap::mega_kernel_abi();
 
         let result = emit_gemm_inline_with_epilogue(
-            &mut prog, &SymDim::Concrete(4), 4, 0, width, a, b, c, &[], &sym_map, false, None, dtype, false, crate::compiler::codegen::vm::isa_hook::EpiloguePlace::OnAccumulators,
+            &mut prog, &SymDim::Concrete(4), 4, 0, width, a, b, c, &[], &sym_map, false, None, dtype, dtype, dtype, false, crate::compiler::codegen::vm::isa_hook::EpiloguePlace::OnAccumulators,
         );
         assert!(result.is_err(), "zero K should be rejected");
     }
@@ -1585,7 +1585,7 @@ mod template_tests {
         let c = prog.alloc_vreg(VRegKind::Ptr, width);
 
         let result = emit_gemm_blis_inline(
-            &mut prog, 4, 8, 16, width, a, b, c, 4, 2, None, 1, dtype, false,
+            &mut prog, 4, 8, 16, width, a, b, c, 4, 2, None, 1, dtype, dtype, dtype, false,
         );
         assert!(result.is_ok(), "BLIS GEMM should succeed: {:?}", result.err());
         assert!(!prog.instrs.is_empty(), "BLIS GEMM should produce instructions");
@@ -1602,7 +1602,7 @@ mod template_tests {
 
         let result = emit_gemm_gpu_tiled_inline(
             &mut prog, 16, 16, 16, width, a, b, c,
-            16, 16, 16, 16, 16, 16, dtype, false,
+            16, 16, 16, 16, 16, 16, dtype, dtype, dtype, false,
         );
         assert!(result.is_ok(), "GPU tiled GEMM should succeed: {:?}", result.err());
         assert!(!prog.instrs.is_empty(), "GPU tiled GEMM should produce instructions");
@@ -1619,7 +1619,7 @@ mod template_tests {
         let sym_map = SymDimSlotMap::mega_kernel_abi();
 
         let result = emit_gemm_inline_with_epilogue(
-            &mut prog, &SymDim::Concrete(2), 8, 8, width, a, b, c, &[], &sym_map, false, None, dtype, false, crate::compiler::codegen::vm::isa_hook::EpiloguePlace::OnAccumulators,
+            &mut prog, &SymDim::Concrete(2), 8, 8, width, a, b, c, &[], &sym_map, false, None, dtype, dtype, dtype, false, crate::compiler::codegen::vm::isa_hook::EpiloguePlace::OnAccumulators,
         );
         assert!(result.is_ok(), "small concrete GEMM should succeed: {:?}", result.err());
         assert!(!prog.instrs.is_empty());
@@ -1934,8 +1934,7 @@ mod template_tests {
         let sym_map = SymDimSlotMap::mega_kernel_abi();
 
         let result = emit_gemm_trans_b_inline(
-            &mut prog, &SymDim::Concrete(4), 8, 0, width, a, b, c, &[], &sym_map, None, QuantPrecision::F32,
-        );
+            &mut prog, &SymDim::Concrete(4), 8, 0, width, a, b, c, &[], &sym_map, None, QuantPrecision::F32, QuantPrecision::F32, QuantPrecision::F32, );
         assert!(result.is_err(), "trans_b GEMM with zero K should be rejected");
     }
 
@@ -1950,7 +1949,7 @@ mod template_tests {
 
         let result = emit_gemm_gpu_pipelined(
             &mut prog, 16, 16, 16, width, a, b, c,
-            16, 16, 16, 16, 16, 16, 2, dtype, false, false,
+            16, 16, 16, 16, 16, 16, 2, dtype, dtype, dtype, false, false,
         );
 
         assert!(result.is_ok(), "pipelined GPU GEMM with single K tile should succeed: {:?}", result.err());
@@ -1968,7 +1967,7 @@ mod template_tests {
         let c = prog.alloc_vreg(VRegKind::Ptr, width);
 
         let result = emit_gemm_blis_inline(
-            &mut prog, 4, 8, 16, width, a, b, c, 4, 2, None, 1, dtype, true,
+            &mut prog, 4, 8, 16, width, a, b, c, 4, 2, None, 1, dtype, dtype, dtype, true,
         );
         assert!(result.is_ok(), "BLIS GEMM with trans_b should succeed: {:?}", result.err());
         assert!(!prog.instrs.is_empty());
@@ -2011,8 +2010,7 @@ mod template_tests {
 
         // Act
         let result = emit_gemm_trans_b_inline(
-            &mut prog, &SymDim::Concrete(0), 8, 16, width, a, b, c, &[], &sym_map, None, QuantPrecision::F32,
-        );
+            &mut prog, &SymDim::Concrete(0), 8, 16, width, a, b, c, &[], &sym_map, None, QuantPrecision::F32, QuantPrecision::F32, QuantPrecision::F32, );
 
         // Assert: zero M is a CodegenViolation
         assert!(result.is_err(), "trans_b GEMM with zero M should be rejected");
@@ -2030,8 +2028,7 @@ mod template_tests {
 
         // Act
         let result = emit_gemm_trans_b_inline(
-            &mut prog, &SymDim::Concrete(4), 0, 16, width, a, b, c, &[], &sym_map, None, QuantPrecision::F32,
-        );
+            &mut prog, &SymDim::Concrete(4), 0, 16, width, a, b, c, &[], &sym_map, None, QuantPrecision::F32, QuantPrecision::F32, QuantPrecision::F32, );
 
         // Assert: zero N is a CodegenViolation
         assert!(result.is_err(), "trans_b GEMM with zero N should be rejected");
@@ -2049,8 +2046,7 @@ mod template_tests {
 
         // Act: M=2, N=8, K=16 with trans_b path
         let result = emit_gemm_trans_b_inline(
-            &mut prog, &SymDim::Concrete(2), 8, 16, width, a, b, c, &[], &sym_map, None, QuantPrecision::F32,
-        );
+            &mut prog, &SymDim::Concrete(2), 8, 16, width, a, b, c, &[], &sym_map, None, QuantPrecision::F32, QuantPrecision::F32, QuantPrecision::F32, );
 
         // Assert: succeeds and produces instructions (VecStore at minimum)
         assert!(result.is_ok(), "trans_b GEMM with valid dims should succeed: {:?}", result.err());
@@ -2071,7 +2067,7 @@ mod template_tests {
         // Act
         let result = emit_gemm_gpu_tiled_inline(
             &mut prog, 16, 16, 16, width, a, b, c,
-            16, 16, 16, 16, 16, 16, dtype, false,
+            16, 16, 16, 16, 16, 16, dtype, dtype, dtype, false,
         );
 
         // Assert: BF16 should produce VecNarrow to convert F32 accumulator back to BF16
@@ -2093,8 +2089,7 @@ mod template_tests {
 
         // Act: symbolic M with concrete N=8, K=16
         let result = emit_gemm_inline_with_epilogue(
-            &mut prog, &m_dim, 8, 16, width, a, b, c, &[], &sym_map, false, None,
-            QuantPrecision::F32, false,
+            &mut prog, &m_dim, 8, 16, width, a, b, c, &[], &sym_map, false, None, QuantPrecision::F32, QuantPrecision::F32, QuantPrecision::F32, false,
             crate::compiler::codegen::vm::isa_hook::EpiloguePlace::OnAccumulators,
         );
 
@@ -2179,7 +2174,7 @@ mod template_tests {
 
         // Act: M=2, mr=4 — mr_actual should clamp to 2, not panic
         let result = emit_gemm_blis_inline(
-            &mut prog, 2, 16, 16, width, a, b, c, 4, 2, None, 1, QuantPrecision::F32, false,
+            &mut prog, 2, 16, 16, width, a, b, c, 4, 2, None, 1, QuantPrecision::F32, QuantPrecision::F32, QuantPrecision::F32, false,
         );
 
         // Assert: should succeed despite M < mr
@@ -2229,7 +2224,7 @@ mod template_tests {
         // Act: use_tma=true triggers TmaDescriptorInit + BarrierInit
         let result = emit_gemm_gpu_pipelined(
             &mut prog, 16, 16, 32, width, a, b, c,
-            16, 16, 16, 16, 16, 16, 2, QuantPrecision::F32, false, true,
+            16, 16, 16, 16, 16, 16, 2, QuantPrecision::F32, QuantPrecision::F32, QuantPrecision::F32, false, true,
         );
 
         // Assert
@@ -2304,7 +2299,7 @@ mod template_tests {
 
         // Act: K=32 with unroll_factor=4 -> 8 k iterations instead of 32
         let result = emit_gemm_blis_inline(
-            &mut prog, 4, 8, 32, width, a, b, c, 4, 2, None, 4, QuantPrecision::F32, false,
+            &mut prog, 4, 8, 32, width, a, b, c, 4, 2, None, 4, QuantPrecision::F32, QuantPrecision::F32, QuantPrecision::F32, false,
         );
 
         // Assert: should succeed with fewer loop iterations due to unrolling
@@ -2324,7 +2319,7 @@ mod template_tests {
         // Act: M=20 with cta_m=16 -> last tile has mi=4 (partial)
         let result = emit_gemm_gpu_tiled_inline(
             &mut prog, 20, 20, 20, width, a, b, c,
-            16, 16, 16, 16, 16, 16, QuantPrecision::F32, false,
+            16, 16, 16, 16, 16, 16, QuantPrecision::F32, QuantPrecision::F32, QuantPrecision::F32, false,
         );
 
         // Assert: partial tiles should be handled correctly (clamped mi/nj)
@@ -2426,7 +2421,7 @@ mod template_tests {
         let result = emit_gemm_inline_with_epilogue(
             &mut prog, &SymDim::Concrete(2), 8, 8, width, a, b, c, &[], &sym_map,
             true, // enable_row_stats = true
-            None, QuantPrecision::F32, false,
+            None, QuantPrecision::F32, QuantPrecision::F32, QuantPrecision::F32, false,
             crate::compiler::codegen::vm::isa_hook::EpiloguePlace::OnAccumulators,
         );
 
@@ -2449,8 +2444,7 @@ mod template_tests {
 
         // Act
         let result = emit_gemm_trans_b_inline(
-            &mut prog, &m_dim, 8, 16, width, a, b, c, &[], &sym_map, None, QuantPrecision::F32,
-        );
+            &mut prog, &m_dim, 8, 16, width, a, b, c, &[], &sym_map, None, QuantPrecision::F32, QuantPrecision::F32, QuantPrecision::F32, );
 
         // Assert: symbolic M should work for trans-B path too
         assert!(result.is_ok(), "trans-B GEMM with symbolic M should succeed: {:?}", result.err());
@@ -2477,8 +2471,7 @@ mod template_tests {
         // to reproduce the SIGSEGV: m_bound should NOT degrade to max_value.
         let m_dim = SymDim::Symbolic { name: "seq_len".into(), max_value: Some(8192) };
         let result = emit_gemm_trans_b_inline(
-            &mut prog, &m_dim, 49152, 576, width, a, b, c, &[], &sym_map, None, QuantPrecision::BF16,
-        );
+            &mut prog, &m_dim, 49152, 576, width, a, b, c, &[], &sym_map, None, QuantPrecision::BF16, QuantPrecision::BF16, QuantPrecision::BF16, );
         assert!(result.is_ok(), "{:?}", result.err());
         for (i, instr) in prog.instrs.iter().enumerate() {
             match instr {
@@ -2510,8 +2503,7 @@ mod template_tests {
 
         // Act: K=13 not divisible by lanes=8, so k_tail=5
         let result = emit_gemm_trans_b_inline(
-            &mut prog, &SymDim::Concrete(1), 4, 13, width, a, b, c, &[], &sym_map, None, QuantPrecision::F32,
-        );
+            &mut prog, &SymDim::Concrete(1), 4, 13, width, a, b, c, &[], &sym_map, None, QuantPrecision::F32, QuantPrecision::F32, QuantPrecision::F32, );
 
         // Assert: k_tail path should emit HReduce to collapse vector accumulator
         assert!(result.is_ok(), "trans-B GEMM with K-tail should succeed: {:?}", result.err());
@@ -2536,8 +2528,7 @@ mod template_tests {
 
         // Act
         let result = emit_gemm_trans_b_inline(
-            &mut prog, &SymDim::Concrete(1), 4, 16, width, a, b, c, &epilogue, &sym_map, None, QuantPrecision::F32,
-        );
+            &mut prog, &SymDim::Concrete(1), 4, 16, width, a, b, c, &epilogue, &sym_map, None, QuantPrecision::F32, QuantPrecision::F32, QuantPrecision::F32, );
 
         // Assert: epilogue should be lowered without error
         assert!(result.is_ok(), "trans-B GEMM with epilogue should succeed: {:?}", result.err());
@@ -2556,7 +2547,7 @@ mod template_tests {
         // Act: BF16 with 2-stage pipeline, single K-tile (K=cta_k=16)
         let result = emit_gemm_gpu_pipelined(
             &mut prog, 16, 16, 16, width, a, b, c,
-            16, 16, 16, 16, 16, 16, 2, QuantPrecision::BF16, false, false,
+            16, 16, 16, 16, 16, 16, 2, QuantPrecision::BF16, QuantPrecision::BF16, QuantPrecision::BF16, false, false,
         );
 
         // Assert: BF16 writeback should emit VecNarrow (F32 acc -> BF16 store)
@@ -2578,8 +2569,7 @@ mod template_tests {
 
         // Act: trans_b=true triggers the trans-B routing path
         let result = emit_gemm_inline_with_epilogue(
-            &mut prog, &SymDim::Concrete(2), 8, 16, width, a, b, c, &[], &sym_map, false, None,
-            QuantPrecision::F32, true, // trans_b = true
+            &mut prog, &SymDim::Concrete(2), 8, 16, width, a, b, c, &[], &sym_map, false, None, QuantPrecision::F32, QuantPrecision::F32, QuantPrecision::F32, true, // trans_b = true
             crate::compiler::codegen::vm::isa_hook::EpiloguePlace::OnAccumulators,
         );
 
@@ -2601,8 +2591,7 @@ mod template_tests {
 
         // Act: N=3 < lanes=8, only scalar tail path runs
         let result = emit_gemm_inline_with_epilogue(
-            &mut prog, &SymDim::Concrete(1), 3, 4, width, a, b, c, &[], &sym_map, false, None,
-            QuantPrecision::F32, false,
+            &mut prog, &SymDim::Concrete(1), 3, 4, width, a, b, c, &[], &sym_map, false, None, QuantPrecision::F32, QuantPrecision::F32, QuantPrecision::F32, false,
             crate::compiler::codegen::vm::isa_hook::EpiloguePlace::OnAccumulators,
         );
 
@@ -2624,7 +2613,7 @@ mod template_tests {
 
         // Act: BLIS with PackMap (non-None) — should use pack_map.blis_k_stride_bytes
         let result = emit_gemm_blis_inline(
-            &mut prog, 4, 8, 16, width, a, b, c, 4, 2, Some(&pack_map), 1, QuantPrecision::F32, false,
+            &mut prog, 4, 8, 16, width, a, b, c, 4, 2, Some(&pack_map), 1, QuantPrecision::F32, QuantPrecision::F32, QuantPrecision::F32, false,
         );
 
         // Assert: should succeed; PackMap path is exercised
@@ -2644,7 +2633,7 @@ mod template_tests {
         // Act: K=32 > cta_k=16, triggers multi-K-tile steady-state loop
         let result = emit_gemm_gpu_pipelined(
             &mut prog, 16, 16, 32, width, a, b, c,
-            16, 16, 16, 16, 16, 16, 2, QuantPrecision::F32, false, false,
+            16, 16, 16, 16, 16, 16, 2, QuantPrecision::F32, QuantPrecision::F32, QuantPrecision::F32, false, false,
         );
 
         // Assert: multi-tile pipeline should succeed with AsyncWait for overlap
@@ -2670,8 +2659,7 @@ mod template_tests {
 
         // Act: AfterStore — do_epilogue_inline is false
         let result = emit_gemm_inline_with_epilogue(
-            &mut prog, &SymDim::Concrete(2), 8, 8, width, a, b, c, &epilogue, &sym_map, false, None,
-            QuantPrecision::F32, false,
+            &mut prog, &SymDim::Concrete(2), 8, 8, width, a, b, c, &epilogue, &sym_map, false, None, QuantPrecision::F32, QuantPrecision::F32, QuantPrecision::F32, false,
             crate::compiler::codegen::vm::isa_hook::EpiloguePlace::AfterStore,
         );
 
@@ -2722,7 +2710,7 @@ mod template_tests {
         // Act: M=10 with cta_m=8 -> last tile has mi=2; BF16 needs narrowing
         let result = emit_gemm_gpu_tiled_inline(
             &mut prog, 10, 10, 16, width, a, b, c,
-            8, 8, 16, 4, 4, 16, QuantPrecision::BF16, false,
+            8, 8, 16, 4, 4, 16, QuantPrecision::BF16, QuantPrecision::BF16, QuantPrecision::BF16, false,
         );
 
         // Assert: partial tiles with BF16 should produce VecNarrow on writeback
@@ -2749,7 +2737,7 @@ mod template_tests {
 
         // Act: N=4 < nr*lanes=16 -> nr_actual clamped down
         let result = emit_gemm_blis_inline(
-            &mut prog, 4, 4, 16, width, a, b, c, 4, 2, None, 1, QuantPrecision::F32, false,
+            &mut prog, 4, 4, 16, width, a, b, c, 4, 2, None, 1, QuantPrecision::F32, QuantPrecision::F32, QuantPrecision::F32, false,
         );
 
         // Assert: should succeed with clamped nr_actual, no out-of-bounds access
@@ -2770,8 +2758,7 @@ mod template_tests {
 
         // Act: K=16 / lanes=8 = 2 exactly, no k_tail
         let result = emit_gemm_trans_b_inline(
-            &mut prog, &SymDim::Concrete(1), 4, 16, width, a, b, c, &[], &sym_map, None, QuantPrecision::F32,
-        );
+            &mut prog, &SymDim::Concrete(1), 4, 16, width, a, b, c, &[], &sym_map, None, QuantPrecision::F32, QuantPrecision::F32, QuantPrecision::F32, );
 
         // Assert: vector-only path should emit VecLoad (not scalar Broadcast for tail)
         assert!(result.is_ok(), "trans-B GEMM with exact K/lanes should succeed: {:?}", result.err());
@@ -2795,8 +2782,7 @@ mod template_tests {
 
         // Act: M=1 single-row decode GEMM
         let result = emit_gemm_inline_with_epilogue(
-            &mut prog, &SymDim::Concrete(1), 16, 32, width, a, b, c, &[], &sym_map, false, None,
-            QuantPrecision::F32, false,
+            &mut prog, &SymDim::Concrete(1), 16, 32, width, a, b, c, &[], &sym_map, false, None, QuantPrecision::F32, QuantPrecision::F32, QuantPrecision::F32, false,
             crate::compiler::codegen::vm::isa_hook::EpiloguePlace::OnAccumulators,
         );
 
@@ -2819,7 +2805,7 @@ mod template_tests {
         // Act: M=32, cta_m=16, warp_m=8, mma_k=16 — all divide evenly
         let result = emit_gemm_gpu_tiled_inline(
             &mut prog, 32, 32, 32, width, a, b, c,
-            16, 16, 16, 8, 8, 16, QuantPrecision::F32, false,
+            16, 16, 16, 8, 8, 16, QuantPrecision::F32, QuantPrecision::F32, QuantPrecision::F32, false,
         );
 
         // Assert: exact division means mi/wi/wj always equal full tile size
@@ -2930,7 +2916,7 @@ mod template_tests {
         // Act: pipeline_depth=3 with K=48, cta_k=16 -> 3 K-tiles across 3 stages
         let result = emit_gemm_gpu_pipelined(
             &mut prog, 16, 16, 48, width, a, b, c,
-            16, 16, 16, 16, 16, 16, 3, QuantPrecision::F32, false, false,
+            16, 16, 16, 16, 16, 16, 3, QuantPrecision::F32, QuantPrecision::F32, QuantPrecision::F32, false, false,
         );
 
         // Assert: 3 stages should allocate 6 SharedMemAlloc (3 for A + 3 for B)
@@ -2951,8 +2937,7 @@ mod template_tests {
 
         // Act: BF16 with N=16 -> n_vecs=2, n_tail=0; BF16 accumulator widens to F32
         let result = emit_gemm_inline_with_epilogue(
-            &mut prog, &SymDim::Concrete(2), 16, 8, width, a, b, c, &[], &sym_map, false, None,
-            QuantPrecision::BF16, false,
+            &mut prog, &SymDim::Concrete(2), 16, 8, width, a, b, c, &[], &sym_map, false, None, QuantPrecision::BF16, QuantPrecision::BF16, QuantPrecision::BF16, false,
             crate::compiler::codegen::vm::isa_hook::EpiloguePlace::OnAccumulators,
         );
 
@@ -2974,7 +2959,7 @@ mod template_tests {
 
         // Act: K=3 with unroll_factor=8 -> k_unroll clamped to min(8,3)=3
         let result = emit_gemm_blis_inline(
-            &mut prog, 4, 8, 3, width, a, b, c, 4, 2, None, 8, QuantPrecision::F32, false,
+            &mut prog, 4, 8, 3, width, a, b, c, 4, 2, None, 8, QuantPrecision::F32, QuantPrecision::F32, QuantPrecision::F32, false,
         );
 
         // Assert: K < unroll_factor should not panic; single K iteration with 3 micro-steps
@@ -3032,7 +3017,7 @@ mod template_tests {
 
         // Act: mr=1 means each M-block processes exactly 1 row
         let result = emit_gemm_blis_inline(
-            &mut prog, 4, 16, 8, width, a, b, c, 1, 2, None, 1, QuantPrecision::F32, false,
+            &mut prog, 4, 16, 8, width, a, b, c, 1, 2, None, 1, QuantPrecision::F32, QuantPrecision::F32, QuantPrecision::F32, false,
         );
 
         // Assert: mr=1 should succeed with 1×nr accumulators per block
@@ -3052,8 +3037,7 @@ mod template_tests {
 
         // Act: BF16 with N=12 produces both vectorized + scalar tail paths
         let result = emit_gemm_inline_with_epilogue(
-            &mut prog, &SymDim::Concrete(2), 12, 8, width, a, b, c, &[], &sym_map, false, None,
-            QuantPrecision::BF16, false,
+            &mut prog, &SymDim::Concrete(2), 12, 8, width, a, b, c, &[], &sym_map, false, None, QuantPrecision::BF16, QuantPrecision::BF16, QuantPrecision::BF16, false,
             crate::compiler::codegen::vm::isa_hook::EpiloguePlace::OnAccumulators,
         );
 
@@ -3076,7 +3060,7 @@ mod template_tests {
         // Act: TMA + multi-K-tile triggers steady-state compute/load overlap
         let result = emit_gemm_gpu_pipelined(
             &mut prog, 16, 16, 32, width, a, b, c,
-            16, 16, 16, 16, 16, 16, 2, QuantPrecision::F32, false, true,
+            16, 16, 16, 16, 16, 16, 2, QuantPrecision::F32, QuantPrecision::F32, QuantPrecision::F32, false, true,
         );
 
         // Assert: TMA steady-state should emit WarpBarrierWait for synchronization
@@ -3147,8 +3131,7 @@ mod template_tests {
 
         // Act: 1×1×1 GEMV (single dot product)
         let result = emit_gemm_trans_b_inline(
-            &mut prog, &SymDim::Concrete(1), 1, 1, width, a, b, c, &[], &sym_map, None, QuantPrecision::F32,
-        );
+            &mut prog, &SymDim::Concrete(1), 1, 1, width, a, b, c, &[], &sym_map, None, QuantPrecision::F32, QuantPrecision::F32, QuantPrecision::F32, );
 
         // Assert: minimal GEMV should succeed with at least a store
         assert!(result.is_ok(), "1×1×1 trans-B GEMV should succeed: {:?}", result.err());
@@ -3168,7 +3151,7 @@ mod template_tests {
         // Act: M=16, cta_m=16, N=16, cta_n=16 — single CTA covers entire output
         let result = emit_gemm_gpu_tiled_inline(
             &mut prog, 16, 16, 32, width, a, b, c,
-            16, 16, 16, 8, 8, 16, QuantPrecision::F32, false,
+            16, 16, 16, 8, 8, 16, QuantPrecision::F32, QuantPrecision::F32, QuantPrecision::F32, false,
         );
 
         // Assert: single-CTA should succeed with no partial CTA tiles
@@ -3222,13 +3205,11 @@ mod template_tests {
 
         // Act: M=2, N=16, K=8 with both widths
         let r128 = emit_gemm_inline_with_epilogue(
-            &mut prog_w128, &SymDim::Concrete(2), 16, 8, width_128, a1, b1, c1, &[], &sym_map, false, None,
-            QuantPrecision::F32, false,
+            &mut prog_w128, &SymDim::Concrete(2), 16, 8, width_128, a1, b1, c1, &[], &sym_map, false, None, QuantPrecision::F32, QuantPrecision::F32, QuantPrecision::F32, false,
             crate::compiler::codegen::vm::isa_hook::EpiloguePlace::OnAccumulators,
         );
         let r256 = emit_gemm_inline_with_epilogue(
-            &mut prog_w256, &SymDim::Concrete(2), 16, 8, width_256, a2, b2, c2, &[], &sym_map, false, None,
-            QuantPrecision::F32, false,
+            &mut prog_w256, &SymDim::Concrete(2), 16, 8, width_256, a2, b2, c2, &[], &sym_map, false, None, QuantPrecision::F32, QuantPrecision::F32, QuantPrecision::F32, false,
             crate::compiler::codegen::vm::isa_hook::EpiloguePlace::OnAccumulators,
         );
 
@@ -3270,13 +3251,11 @@ mod template_tests {
 
         // Act: M=2, N=8, K=8
         let r_f32 = emit_gemm_inline_with_epilogue(
-            &mut prog_f32, &SymDim::Concrete(2), 8, 8, width, a1, b1, c1, &[], &sym_map, false, None,
-            QuantPrecision::F32, false,
+            &mut prog_f32, &SymDim::Concrete(2), 8, 8, width, a1, b1, c1, &[], &sym_map, false, None, QuantPrecision::F32, QuantPrecision::F32, QuantPrecision::F32, false,
             crate::compiler::codegen::vm::isa_hook::EpiloguePlace::OnAccumulators,
         );
         let r_bf16 = emit_gemm_inline_with_epilogue(
-            &mut prog_bf16, &SymDim::Concrete(2), 8, 8, width, a2, b2, c2, &[], &sym_map, false, None,
-            QuantPrecision::BF16, false,
+            &mut prog_bf16, &SymDim::Concrete(2), 8, 8, width, a2, b2, c2, &[], &sym_map, false, None, QuantPrecision::BF16, QuantPrecision::BF16, QuantPrecision::BF16, false,
             crate::compiler::codegen::vm::isa_hook::EpiloguePlace::OnAccumulators,
         );
 
@@ -3334,7 +3313,7 @@ mod template_tests {
 
         // Act: trans_b=true with BF16
         let result = emit_gemm_blis_inline(
-            &mut prog, 4, 8, 16, width, a, b, c, 4, 2, None, 1, QuantPrecision::BF16, true,
+            &mut prog, 4, 8, 16, width, a, b, c, 4, 2, None, 1, QuantPrecision::BF16, QuantPrecision::BF16, QuantPrecision::BF16, true,
         );
 
         // Assert: should succeed and emit VecNarrow for BF16 writeback
@@ -3358,8 +3337,7 @@ mod template_tests {
         // Act: symbolic M with explicit override (e.g., batch scheduler knows actual seq_len=64)
         let result = emit_gemm_inline_with_epilogue(
             &mut prog, &m_dim, 8, 16, width, a, b, c, &[], &sym_map, false,
-            Some(&override_bound),
-            QuantPrecision::F32, false,
+            Some(&override_bound), QuantPrecision::F32, QuantPrecision::F32, QuantPrecision::F32, false,
             crate::compiler::codegen::vm::isa_hook::EpiloguePlace::OnAccumulators,
         );
 
@@ -3401,7 +3379,7 @@ mod template_tests {
         // Act: M=1 with cta_m=16 -> mi=1 (partial first CTA tile)
         let result = emit_gemm_gpu_tiled_inline(
             &mut prog, 1, 16, 32, width, a, b, c,
-            16, 16, 16, 1, 1, 16, QuantPrecision::F32, false,
+            16, 16, 16, 1, 1, 16, QuantPrecision::F32, QuantPrecision::F32, QuantPrecision::F32, false,
         );
 
         // Assert: M=1 GPU GEMV should succeed with partial tile handling
@@ -3423,8 +3401,7 @@ mod template_tests {
 
         // Act: N=8 = lanes=8 -> n_vecs=1, n_tail=0
         let result = emit_gemm_inline_with_epilogue(
-            &mut prog, &SymDim::Concrete(2), 8, 8, width, a, b, c, &[], &sym_map, false, None,
-            QuantPrecision::F32, false,
+            &mut prog, &SymDim::Concrete(2), 8, 8, width, a, b, c, &[], &sym_map, false, None, QuantPrecision::F32, QuantPrecision::F32, QuantPrecision::F32, false,
             crate::compiler::codegen::vm::isa_hook::EpiloguePlace::OnAccumulators,
         );
 
@@ -3450,7 +3427,7 @@ mod template_tests {
 
         // Act: M=16, mr=4 -> 4 M-blocks (0..4, 4..8, 8..12, 12..16)
         let result = emit_gemm_blis_inline(
-            &mut prog, 16, 16, 16, width, a, b, c, 4, 2, None, 1, QuantPrecision::F32, false,
+            &mut prog, 16, 16, 16, width, a, b, c, 4, 2, None, 1, QuantPrecision::F32, QuantPrecision::F32, QuantPrecision::F32, false,
         );
 
         // Assert: should succeed with multiple M-blocks
@@ -3479,7 +3456,7 @@ mod template_tests {
 
         // Act: nr=1 means each J-block processes 1*lanes=8 columns per iteration
         let result = emit_gemm_blis_inline(
-            &mut prog, 4, 16, 8, width, a, b, c, 4, 1, None, 1, QuantPrecision::F32, false,
+            &mut prog, 4, 16, 8, width, a, b, c, 4, 1, None, 1, QuantPrecision::F32, QuantPrecision::F32, QuantPrecision::F32, false,
         );
 
         // Assert: nr=1 should succeed with 1-column accumulator per microkernel
@@ -3507,9 +3484,7 @@ mod template_tests {
 
         // Act: BF16, K=10 (k_vecs=1, k_tail=2), with epilogue
         let result = emit_gemm_trans_b_inline(
-            &mut prog, &SymDim::Concrete(1), 4, 10, width, a, b, c, &epilogue, &sym_map, None,
-            QuantPrecision::BF16,
-        );
+            &mut prog, &SymDim::Concrete(1), 4, 10, width, a, b, c, &epilogue, &sym_map, None, QuantPrecision::BF16, QuantPrecision::BF16, QuantPrecision::BF16, );
 
         // Assert: BF16 trans-B with k_tail + epilogue should succeed
         assert!(result.is_ok(), "trans-B BF16 with k_tail+epilogue should succeed: {:?}", result.err());
@@ -3532,7 +3507,7 @@ mod template_tests {
         // Act: K=24, mma_k=16 -> partial last inner K step
         let result = emit_gemm_gpu_tiled_inline(
             &mut prog, 16, 16, 24, width, a, b, c,
-            16, 16, 24, 4, 4, 16, QuantPrecision::F32, false,
+            16, 16, 24, 4, 4, 16, QuantPrecision::F32, QuantPrecision::F32, QuantPrecision::F32, false,
         );
 
         // Assert: partial K steps should be handled correctly
@@ -3553,7 +3528,7 @@ mod template_tests {
 
         // Act: M=4, mr=4 -> exactly one M-block, mr_actual=mr=4
         let result = emit_gemm_blis_inline(
-            &mut prog, 4, 16, 16, width, a, b, c, 4, 2, None, 1, QuantPrecision::F32, false,
+            &mut prog, 4, 16, 16, width, a, b, c, 4, 2, None, 1, QuantPrecision::F32, QuantPrecision::F32, QuantPrecision::F32, false,
         );
 
         // Assert: exact boundary should succeed without clamping
@@ -3576,8 +3551,7 @@ mod template_tests {
 
         // Act: no seq_bound_override — must use sym_map.to_bound()
         let result = emit_gemm_inline_with_epilogue(
-            &mut prog, &m_dim, 8, 16, width, a, b, c, &[], &sym_map, false, None,
-            QuantPrecision::F32, false,
+            &mut prog, &m_dim, 8, 16, width, a, b, c, &[], &sym_map, false, None, QuantPrecision::F32, QuantPrecision::F32, QuantPrecision::F32, false,
             crate::compiler::codegen::vm::isa_hook::EpiloguePlace::OnAccumulators,
         );
 
@@ -3603,7 +3577,7 @@ mod template_tests {
         // First CTA tile: mi=8, nj=8 (full). Second CTA tile: mi=2, nj=2 (partial)
         let result = emit_gemm_gpu_tiled_inline(
             &mut prog, 10, 10, 16, width, a, b, c,
-            8, 8, 16, 4, 4, 16, QuantPrecision::BF16, false,
+            8, 8, 16, 4, 4, 16, QuantPrecision::BF16, QuantPrecision::BF16, QuantPrecision::BF16, false,
         );
 
         // Assert: partial tiles with BF16 should produce VecNarrow on writeback
@@ -3668,7 +3642,7 @@ mod template_tests {
         // Act: N=32, nr=2, lanes=8 -> nr*lanes=16 -> 2 J-blocks per M-block
         // Each J-block must zero its mr*nr_actual accumulator registers
         let result = emit_gemm_blis_inline(
-            &mut prog, 4, 32, 8, width, a, b, c, 4, 2, None, 1, QuantPrecision::F32, false,
+            &mut prog, 4, 32, 8, width, a, b, c, 4, 2, None, 1, QuantPrecision::F32, QuantPrecision::F32, QuantPrecision::F32, false,
         );
 
         // Assert: accumulator zero-init Broadcast(0.0) should appear multiple times
@@ -3722,8 +3696,7 @@ mod template_tests {
         // Act: symbolic M with override=1 for trans-B path
         let result = emit_gemm_trans_b_inline(
             &mut prog, &m_dim, 8, 16, width, a, b, c, &[], &sym_map,
-            Some(&override_bound), QuantPrecision::F32,
-        );
+            Some(&override_bound), QuantPrecision::F32, QuantPrecision::F32, QuantPrecision::F32, );
 
         // Assert: override should work for trans-B path just like normal path
         assert!(result.is_ok(), "trans-B symbolic M with override should succeed: {:?}", result.err());

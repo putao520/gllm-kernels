@@ -382,6 +382,7 @@ mod tests {
             m, n, k,
             m_bound: BoundExpr::Const(m),
             dtype,
+            a_dtype: dtype, b_dtype: dtype, c_dtype: dtype,
             trans_b: false,
             mr: 4, nr: 2,
             a_ptr, b_ptr, c_ptr,
@@ -537,6 +538,7 @@ mod tests {
             m: 8, n: 8, k: 4,
             m_bound: BoundExpr::Const(8),
             dtype: QuantPrecision::F32,
+            a_dtype: QuantPrecision::F32, b_dtype: QuantPrecision::F32, c_dtype: QuantPrecision::F32,
             trans_b: false, mr: 4, nr: 2,
             a_ptr, b_ptr, c_ptr,
             epilogue: super::super::isa_hook::EpiloguePlace::OnAccumulators,
@@ -818,7 +820,7 @@ mod tests {
             prog: &mut prog, width, pack_map: None, k_unroll: 1, debug_jit: false,
         };
         let lo = GemmOpLayout {
-            m, n, k, m_bound: BoundExpr::Const(m), dtype, trans_b: false, mr: 4, nr: 2,
+            m, n, k, m_bound: BoundExpr::Const(m), dtype, a_dtype: dtype, b_dtype: dtype, c_dtype: dtype, trans_b: false, mr: 4, nr: 2,
             a_ptr, b_ptr, c_ptr,
             epilogue: super::super::isa_hook::EpiloguePlace::OnAccumulators,
             tile: None,

@@ -631,8 +631,7 @@ mod tests {
         let result = emit_normlike_inline(
             &mut prog, &pattern, 64, 1, false, NormKind::RmsNorm,
             SimdWidth::W256, BoundExpr::Const(1),
-            input_ptr, weight_ptr, output_ptr, QuantPrecision::F32,
-        );
+            input_ptr, weight_ptr, output_ptr, QuantPrecision::F32, QuantPrecision::F32,);
 
         // Assert
         assert!(result.is_err(), "Should reject Elementwise pattern");
@@ -656,8 +655,7 @@ mod tests {
         let result = emit_normlike_inline(
             &mut prog, &pattern, 64, 1, false, NormKind::RmsNorm,
             SimdWidth::Scalable, BoundExpr::Const(1),
-            input_ptr, weight_ptr, output_ptr, QuantPrecision::F32,
-        );
+            input_ptr, weight_ptr, output_ptr, QuantPrecision::F32, QuantPrecision::F32,);
 
         // Assert
         assert!(result.is_err(), "Should reject zero lanes (Scalable)");
@@ -680,8 +678,7 @@ mod tests {
         let result = emit_normlike_inline(
             &mut prog, &pattern, 0, 1, false, NormKind::RmsNorm,
             SimdWidth::W256, BoundExpr::Const(1),
-            input_ptr, weight_ptr, output_ptr, QuantPrecision::F32,
-        );
+            input_ptr, weight_ptr, output_ptr, QuantPrecision::F32, QuantPrecision::F32,);
 
         // Assert
         assert!(result.is_err(), "Should reject zero feature_dim");
@@ -704,8 +701,7 @@ mod tests {
         let result = emit_normlike_inline(
             &mut prog, &pattern, 64, 0, false, NormKind::RmsNorm,
             SimdWidth::W256, BoundExpr::Const(1),
-            input_ptr, weight_ptr, output_ptr, QuantPrecision::F32,
-        );
+            input_ptr, weight_ptr, output_ptr, QuantPrecision::F32, QuantPrecision::F32,);
 
         // Assert
         assert!(result.is_err(), "Should reject groups_per_row == 0");
@@ -729,8 +725,7 @@ mod tests {
         let result = emit_normlike_inline(
             &mut prog, &pattern, 64, 1, false, NormKind::RmsNorm,
             SimdWidth::W256, BoundExpr::Const(2),
-            input_ptr, weight_ptr, output_ptr, QuantPrecision::F32,
-        );
+            input_ptr, weight_ptr, output_ptr, QuantPrecision::F32, QuantPrecision::F32,);
 
         // Assert
         assert!(result.is_ok(), "Should succeed with valid parameters");
@@ -755,8 +750,7 @@ mod tests {
         let result = emit_normlike_inline(
             &mut prog, &pattern, 64, 4, false, NormKind::ValueNorm,
             SimdWidth::W256, BoundExpr::Const(1),
-            input_ptr, weight_ptr, output_ptr, QuantPrecision::F32,
-        );
+            input_ptr, weight_ptr, output_ptr, QuantPrecision::F32, QuantPrecision::F32,);
 
         // Assert
         assert!(result.is_ok(), "Should succeed with groups_per_row > 1");
@@ -841,8 +835,7 @@ mod tests {
         let result = emit_layernorm_auto(
             &mut prog, 64, 1e-5,
             SimdWidth::Scalable, BoundExpr::Const(1),
-            input_ptr, weight_ptr, output_ptr, QuantPrecision::F32,
-        );
+            input_ptr, weight_ptr, output_ptr, QuantPrecision::F32, QuantPrecision::F32,);
 
         // Assert
         assert!(result.is_err(), "Should reject zero lanes");
@@ -864,8 +857,7 @@ mod tests {
         let result = emit_layernorm_auto(
             &mut prog, 0, 1e-5,
             SimdWidth::W256, BoundExpr::Const(1),
-            input_ptr, weight_ptr, output_ptr, QuantPrecision::F32,
-        );
+            input_ptr, weight_ptr, output_ptr, QuantPrecision::F32, QuantPrecision::F32,);
 
         // Assert
         assert!(result.is_err(), "Should reject zero feature_dim");
@@ -888,8 +880,7 @@ mod tests {
         let result = emit_layernorm_auto(
             &mut prog, 32, 1e-5,
             SimdWidth::W256, BoundExpr::Const(2),
-            input_ptr, weight_ptr, output_ptr, QuantPrecision::F32,
-        );
+            input_ptr, weight_ptr, output_ptr, QuantPrecision::F32, QuantPrecision::F32,);
 
         // Assert
         assert!(result.is_ok(), "Should succeed with valid parameters");
@@ -935,8 +926,7 @@ mod tests {
         let result = emit_normlike_inline(
             &mut prog, &pattern, 32, 4, true, NormKind::HeadRmsNorm,
             SimdWidth::W256, BoundExpr::Const(1),
-            input_ptr, weight_ptr, output_ptr, QuantPrecision::F32,
-        );
+            input_ptr, weight_ptr, output_ptr, QuantPrecision::F32, QuantPrecision::F32,);
 
         // Assert
         assert!(result.is_ok(), "Should succeed with broadcast_weight=true");
@@ -960,8 +950,7 @@ mod tests {
         let result = emit_normlike_inline(
             &mut prog, &pattern, 64, 1, false, NormKind::ValueNorm,
             SimdWidth::W256, BoundExpr::Const(1),
-            input_ptr, weight_ptr, output_ptr, QuantPrecision::F32,
-        );
+            input_ptr, weight_ptr, output_ptr, QuantPrecision::F32, QuantPrecision::F32,);
 
         // Assert
         assert!(result.is_ok(), "Should succeed without weight (ValueNorm semantics)");
@@ -985,8 +974,7 @@ mod tests {
         let result = emit_normlike_inline(
             &mut prog, &pattern, 3, 1, false, NormKind::RmsNorm,
             SimdWidth::W256, BoundExpr::Const(1),
-            input_ptr, weight_ptr, output_ptr, QuantPrecision::F32,
-        );
+            input_ptr, weight_ptr, output_ptr, QuantPrecision::F32, QuantPrecision::F32,);
 
         // Assert
         assert!(result.is_ok(), "Should succeed with feature_dim < lanes");
@@ -1009,8 +997,7 @@ mod tests {
         let result = emit_normlike_inline(
             &mut prog, &pattern, 10, 1, false, NormKind::RmsNorm,
             SimdWidth::W128, BoundExpr::Const(1),
-            input_ptr, weight_ptr, output_ptr, QuantPrecision::F32,
-        );
+            input_ptr, weight_ptr, output_ptr, QuantPrecision::F32, QuantPrecision::F32,);
 
         // Assert
         assert!(result.is_ok(), "Should succeed with W128 width");
@@ -1052,8 +1039,7 @@ mod tests {
             &mut prog, &reduce, &finalize, &transform,
             feature_dim, vec_count, step_bytes, elem, lanes, width,
             NormKind::RmsNorm, acc, temp, scale, dim_bc,
-            row_input, weight_ptr, row_output, dtype,
-        );
+            row_input, weight_ptr, row_output, dtype, dtype,);
 
         // Assert: should have emitted instructions for reduce + finalize + transform phases
         assert!(prog.instrs.len() > initial_count, "Should emit instructions for all 3 phases");
@@ -1094,8 +1080,7 @@ mod tests {
             &mut prog, &reduce, &finalize, &transform,
             feature_dim, vec_count, step_bytes, elem, lanes, width,
             NormKind::ValueNorm, acc, temp, scale, dim_bc,
-            row_input, weight_ptr, row_output, dtype,
-        );
+            row_input, weight_ptr, row_output, dtype, dtype,);
 
         // Assert: should emit instructions even without weight
         assert!(prog.instrs.len() > initial_count, "Should emit instructions without weight");
@@ -1138,8 +1123,7 @@ mod tests {
         let result = emit_layernorm_auto(
             &mut prog, 10, 1e-5,
             SimdWidth::W256, BoundExpr::Const(1),
-            input_ptr, weight_ptr, output_ptr, QuantPrecision::F32,
-        );
+            input_ptr, weight_ptr, output_ptr, QuantPrecision::F32, QuantPrecision::F32,);
 
         // Assert
         assert!(result.is_ok(), "Should succeed with non-aligned feature_dim");
@@ -1162,8 +1146,7 @@ mod tests {
         let result = emit_layernorm_auto(
             &mut prog, 32, 1e-5,
             SimdWidth::W256, BoundExpr::Const(1),
-            input_ptr, weight_ptr, output_ptr, QuantPrecision::BF16,
-        );
+            input_ptr, weight_ptr, output_ptr, QuantPrecision::BF16, QuantPrecision::BF16,);
 
         // Assert
         assert!(result.is_ok(), "Should succeed with BF16 dtype");
@@ -1185,8 +1168,7 @@ mod tests {
         let result = emit_layernorm_auto(
             &mut prog, 12, 1e-5,
             SimdWidth::W128, BoundExpr::Const(2),
-            input_ptr, weight_ptr, output_ptr, QuantPrecision::F32,
-        );
+            input_ptr, weight_ptr, output_ptr, QuantPrecision::F32, QuantPrecision::F32,);
 
         // Assert
         assert!(result.is_ok(), "Should succeed with W128 width");
@@ -1238,8 +1220,7 @@ mod tests {
         let result = emit_normlike_inline(
             &mut prog, &pattern, 64, 1, false, NormKind::RmsNorm,
             SimdWidth::W256, sym_bound,
-            input_ptr, weight_ptr, output_ptr, QuantPrecision::F32,
-        );
+            input_ptr, weight_ptr, output_ptr, QuantPrecision::F32, QuantPrecision::F32,);
 
         // Assert
         assert!(result.is_ok(), "Should succeed with Symbolic bound");
@@ -1287,8 +1268,7 @@ mod tests {
         let result = emit_normlike_inline(
             &mut prog, &pattern, 12, 1, false, NormKind::RmsNorm,
             SimdWidth::W256, BoundExpr::Const(1),
-            input_ptr, weight_ptr, output_ptr, QuantPrecision::BF16,
-        );
+            input_ptr, weight_ptr, output_ptr, QuantPrecision::BF16, QuantPrecision::BF16,);
 
         // Assert
         assert!(result.is_ok(), "Should succeed with BF16 dtype");
@@ -1316,8 +1296,7 @@ mod tests {
         let result = emit_layernorm_auto(
             &mut prog, 32, 1e-5,
             SimdWidth::W256, sym_bound,
-            input_ptr, weight_ptr, output_ptr, QuantPrecision::F32,
-        );
+            input_ptr, weight_ptr, output_ptr, QuantPrecision::F32, QuantPrecision::F32,);
 
         // Assert
         assert!(result.is_ok(), "Should succeed with Symbolic seq bound");
@@ -1339,8 +1318,7 @@ mod tests {
         let result = emit_layernorm_auto(
             &mut prog, 8, 1e-5,
             SimdWidth::W256, BoundExpr::Const(1),
-            input_ptr, weight_ptr, output_ptr, QuantPrecision::F32,
-        );
+            input_ptr, weight_ptr, output_ptr, QuantPrecision::F32, QuantPrecision::F32,);
 
         // Assert: no tail means fewer instructions than a non-aligned case
         assert!(result.is_ok(), "Should succeed with perfectly aligned feature_dim");
@@ -1381,8 +1359,7 @@ mod tests {
             &mut prog, &reduce, &finalize, &transform,
             feature_dim, vec_count, step_bytes, elem, lanes, width,
             NormKind::RmsNorm, acc, temp, scale, dim_bc,
-            row_input, weight_ptr, row_output, QuantPrecision::F32,
-        );
+            row_input, weight_ptr, row_output, QuantPrecision::F32, QuantPrecision::F32,);
 
         // Assert: should emit instructions for vec loop only, no scalar tail
         assert!(prog.instrs.len() > initial_count, "Should emit instructions for aligned feature_dim");
@@ -1428,8 +1405,7 @@ mod tests {
         let result = emit_normlike_inline(
             &mut prog, &pattern, 24, 3, false, NormKind::RmsNorm,
             SimdWidth::W256, BoundExpr::Const(2),
-            input_ptr, weight_ptr, output_ptr, QuantPrecision::F32,
-        );
+            input_ptr, weight_ptr, output_ptr, QuantPrecision::F32, QuantPrecision::F32,);
 
         // Assert: non-broadcast weight loads per-group pointer via VRegPlusVReg
         assert!(result.is_ok(), "Should succeed with non-broadcast weight and multiple groups");
@@ -1474,8 +1450,7 @@ mod tests {
         let result = emit_layernorm_auto(
             &mut prog, 7, 1e-5,
             SimdWidth::W128, BoundExpr::Const(1),
-            input_ptr, weight_ptr, output_ptr, QuantPrecision::F32,
-        );
+            input_ptr, weight_ptr, output_ptr, QuantPrecision::F32, QuantPrecision::F32,);
 
         // Assert
         assert!(result.is_ok(), "Should succeed with W128 and non-aligned feature_dim=7");
@@ -1520,8 +1495,7 @@ mod tests {
         let result = emit_normlike_inline(
             &mut prog, &pattern, 1, 1, false, NormKind::RmsNorm,
             SimdWidth::W256, BoundExpr::Const(1),
-            input_ptr, weight_ptr, output_ptr, QuantPrecision::F32,
-        );
+            input_ptr, weight_ptr, output_ptr, QuantPrecision::F32, QuantPrecision::F32,);
 
         // Assert
         assert!(result.is_ok(), "Should succeed with feature_dim=1");
@@ -1563,8 +1537,7 @@ mod tests {
             &mut prog, &reduce, &finalize, &transform,
             feature_dim, vec_count, step_bytes, elem, lanes, width,
             NormKind::RmsNorm, acc, temp, scale, dim_bc,
-            row_input, weight_ptr, row_output, dtype,
-        );
+            row_input, weight_ptr, row_output, dtype, dtype,);
 
         // Assert: should emit instructions with BF16 dtype affecting VecLoad/VecStore
         assert!(prog.instrs.len() > initial_count, "Should emit instructions with BF16 dtype");
@@ -1607,8 +1580,7 @@ mod tests {
         let result = emit_layernorm_auto(
             &mut prog, 1, 1e-5,
             SimdWidth::W256, BoundExpr::Const(1),
-            input_ptr, weight_ptr, output_ptr, QuantPrecision::F32,
-        );
+            input_ptr, weight_ptr, output_ptr, QuantPrecision::F32, QuantPrecision::F32,);
 
         // Assert
         assert!(result.is_ok(), "Should succeed with feature_dim=1");
@@ -1675,8 +1647,7 @@ mod tests {
             &mut prog, &reduce, &finalize, &transform,
             feature_dim, vec_count, step_bytes, elem, lanes, width,
             NormKind::ValueNorm, acc, temp, scale, dim_bc,
-            row_input, weight_ptr, row_output, QuantPrecision::F32,
-        );
+            row_input, weight_ptr, row_output, QuantPrecision::F32, QuantPrecision::F32,);
 
         // Assert: should emit instructions for tail-only phases without weight loads
         assert!(prog.instrs.len() > initial_count, "Should emit instructions for tail-only no-weight path");
@@ -1697,8 +1668,7 @@ mod tests {
         let result = emit_layernorm_auto(
             &mut prog, 24, 1e-5,
             SimdWidth::W512, BoundExpr::Const(1),
-            input_ptr, weight_ptr, output_ptr, QuantPrecision::F32,
-        );
+            input_ptr, weight_ptr, output_ptr, QuantPrecision::F32, QuantPrecision::F32,);
 
         // Assert
         assert!(result.is_ok(), "Should succeed with W512 width");
@@ -1723,8 +1693,7 @@ mod tests {
         let result = emit_normlike_inline(
             &mut prog, &pattern, 64, 1, false, NormKind::ValueNorm,
             SimdWidth::W256, BoundExpr::Const(3),
-            input_ptr, weight_ptr, output_ptr, QuantPrecision::F32,
-        );
+            input_ptr, weight_ptr, output_ptr, QuantPrecision::F32, QuantPrecision::F32,);
 
         // Assert
         assert!(result.is_ok(), "Should succeed with groups=1, no weight, direct path");
@@ -1793,8 +1762,7 @@ mod tests {
         let result = emit_layernorm_auto(
             &mut prog, 10, 1e-5,
             SimdWidth::W256, BoundExpr::Const(1),
-            input_ptr, weight_ptr, output_ptr, QuantPrecision::BF16,
-        );
+            input_ptr, weight_ptr, output_ptr, QuantPrecision::BF16, QuantPrecision::BF16,);
 
         // Assert
         assert!(result.is_ok(), "Should succeed with BF16 and non-aligned feature_dim");
@@ -1823,8 +1791,7 @@ mod tests {
         let result = emit_normlike_inline(
             &mut prog, &pattern, 16, 2, false, NormKind::ValueNorm,
             SimdWidth::W256, sym_bound,
-            input_ptr, weight_ptr, output_ptr, QuantPrecision::F32,
-        );
+            input_ptr, weight_ptr, output_ptr, QuantPrecision::F32, QuantPrecision::F32,);
 
         // Assert
         assert!(result.is_ok(), "Should succeed with Symbolic bound and multiple groups");
@@ -1849,8 +1816,7 @@ mod tests {
         let result = emit_normlike_inline(
             &mut prog, &pattern, 32, 1, true, NormKind::HeadRmsNorm,
             SimdWidth::W256, BoundExpr::Const(2),
-            input_ptr, weight_ptr, output_ptr, QuantPrecision::F32,
-        );
+            input_ptr, weight_ptr, output_ptr, QuantPrecision::F32, QuantPrecision::F32,);
 
         // Assert
         assert!(result.is_ok(), "Should succeed with broadcast weight and single group");
@@ -1891,8 +1857,7 @@ mod tests {
             &mut prog, &reduce, &finalize, &transform,
             feature_dim, vec_count, step_bytes, elem, lanes, width,
             NormKind::RmsNorm, acc, temp, scale, dim_bc,
-            row_input, weight_ptr, row_output, QuantPrecision::F32,
-        );
+            row_input, weight_ptr, row_output, QuantPrecision::F32, QuantPrecision::F32,);
 
         // Assert
         assert!(prog.instrs.len() > initial_count, "Should emit instructions with W128 width");
@@ -1986,8 +1951,7 @@ mod tests {
         let result = emit_layernorm_auto(
             &mut prog, 256, 1e-5,
             SimdWidth::W256, BoundExpr::Const(1),
-            input_ptr, weight_ptr, output_ptr, QuantPrecision::F32,
-        );
+            input_ptr, weight_ptr, output_ptr, QuantPrecision::F32, QuantPrecision::F32,);
 
         // Assert
         assert!(result.is_ok(), "Should succeed with large feature_dim=256");
@@ -2011,8 +1975,7 @@ mod tests {
         let result = emit_layernorm_auto(
             &mut prog, 6, 1e-5,
             SimdWidth::W128, BoundExpr::Const(1),
-            input_ptr, weight_ptr, output_ptr, QuantPrecision::BF16,
-        );
+            input_ptr, weight_ptr, output_ptr, QuantPrecision::BF16, QuantPrecision::BF16,);
 
         // Assert
         assert!(result.is_ok(), "Should succeed with BF16 and W128");
@@ -2036,8 +1999,7 @@ mod tests {
         let result = emit_normlike_inline(
             &mut prog, &pattern, 24, 1, false, NormKind::RmsNorm,
             SimdWidth::W512, BoundExpr::Const(2),
-            input_ptr, weight_ptr, output_ptr, QuantPrecision::F32,
-        );
+            input_ptr, weight_ptr, output_ptr, QuantPrecision::F32, QuantPrecision::F32,);
 
         // Assert
         assert!(result.is_ok(), "Should succeed with W512 width");
@@ -2062,8 +2024,7 @@ mod tests {
         let result = emit_normlike_inline(
             &mut prog, &pattern, 16, 1, true, NormKind::ValueNorm,
             SimdWidth::W256, BoundExpr::Const(1),
-            input_ptr, weight_ptr, output_ptr, QuantPrecision::F32,
-        );
+            input_ptr, weight_ptr, output_ptr, QuantPrecision::F32, QuantPrecision::F32,);
 
         // Assert: should succeed and emit instructions without any weight loads
         assert!(result.is_ok(), "Should succeed when broadcast_weight is ignored (has_weight=false)");
@@ -2087,8 +2048,7 @@ mod tests {
         emit_normlike_inline(
             &mut prog, &pattern, 3, 1, false, NormKind::RmsNorm,
             SimdWidth::W256, BoundExpr::Const(1),
-            input_ptr, weight_ptr, output_ptr, QuantPrecision::F32,
-        ).unwrap();
+            input_ptr, weight_ptr, output_ptr, QuantPrecision::F32, QuantPrecision::F32,).unwrap();
 
         // Assert: should have exactly 1 LoopBegin (outer seq loop only, no inner vec loop)
         let loop_begin_count = prog.instrs.iter().filter(|i| matches!(i, VmInstr::LoopBegin { .. })).count();
@@ -2112,8 +2072,7 @@ mod tests {
         emit_normlike_inline(
             &mut prog_256, &pattern, feature_dim, 1, false, NormKind::RmsNorm,
             SimdWidth::W256, BoundExpr::Const(1),
-            i256, w256, o256, QuantPrecision::F32,
-        ).unwrap();
+            i256, w256, o256, QuantPrecision::F32, QuantPrecision::F32,).unwrap();
 
         let mut prog_512 = VmProgram::new();
         let i512 = prog_512.alloc_vreg(VRegKind::Ptr, SimdWidth::Scalar);
@@ -2122,8 +2081,7 @@ mod tests {
         emit_normlike_inline(
             &mut prog_512, &pattern, feature_dim, 1, false, NormKind::RmsNorm,
             SimdWidth::W512, BoundExpr::Const(1),
-            i512, w512, o512, QuantPrecision::F32,
-        ).unwrap();
+            i512, w512, o512, QuantPrecision::F32, QuantPrecision::F32,).unwrap();
 
         // Assert: W512 should produce inner vec LoopBegin with step_bytes=64 (16 lanes * 4 bytes)
         // and W256 should produce inner vec LoopBegin with step_bytes=32 (8 lanes * 4 bytes).
@@ -2163,8 +2121,7 @@ mod tests {
         emit_normlike_inline(
             &mut prog, &pattern, 64, 1, false, NormKind::RmsNorm,
             SimdWidth::W256, BoundExpr::Const(2),
-            input_ptr, weight_ptr, output_ptr, QuantPrecision::F32,
-        ).unwrap();
+            input_ptr, weight_ptr, output_ptr, QuantPrecision::F32, QuantPrecision::F32,).unwrap();
 
         // Assert: should contain LoopBegin/LoopEnd pairs
         let has_loop_begin = prog.instrs.iter().any(|i| matches!(i, VmInstr::LoopBegin { .. }));
@@ -2210,8 +2167,7 @@ mod tests {
         emit_normlike_inline(
             &mut prog, &pattern, 32, 1, false, NormKind::RmsNorm,
             SimdWidth::W256, BoundExpr::Const(1),
-            input_ptr, weight_ptr, output_ptr, QuantPrecision::F32,
-        ).unwrap();
+            input_ptr, weight_ptr, output_ptr, QuantPrecision::F32, QuantPrecision::F32,).unwrap();
 
         // Assert: should contain Broadcast instructions (for acc=0 init, dim_bc, scale)
         let broadcast_count = prog.instrs.iter().filter(|i| matches!(i, VmInstr::Broadcast { .. })).count();
@@ -2234,8 +2190,7 @@ mod tests {
         emit_normlike_inline(
             &mut prog, &pattern, 16, 1, false, NormKind::RmsNorm,
             SimdWidth::W256, BoundExpr::Const(1),
-            input_ptr, weight_ptr, output_ptr, QuantPrecision::BF16,
-        ).unwrap();
+            input_ptr, weight_ptr, output_ptr, QuantPrecision::BF16, QuantPrecision::BF16,).unwrap();
 
         // Assert: should contain VecLoad/VecStore with dtype=BF16
         let has_bf16_load = prog.instrs.iter().any(|i| matches!(
@@ -2291,8 +2246,7 @@ mod tests {
         emit_layernorm_auto(
             &mut prog, 32, 1e-5,
             SimdWidth::W256, sym_bound,
-            input_ptr, weight_ptr, output_ptr, QuantPrecision::F32,
-        ).unwrap();
+            input_ptr, weight_ptr, output_ptr, QuantPrecision::F32, QuantPrecision::F32,).unwrap();
 
         // Assert: should contain at least one LoopBegin with Symbolic bound
         let has_symbolic_loop = prog.instrs.iter().any(|i| matches!(
@@ -2317,8 +2271,7 @@ mod tests {
         emit_normlike_inline(
             &mut prog, &pattern, 24, 3, false, NormKind::RmsNorm,
             SimdWidth::W256, BoundExpr::Const(1),
-            input_ptr, weight_ptr, output_ptr, QuantPrecision::F32,
-        ).unwrap();
+            input_ptr, weight_ptr, output_ptr, QuantPrecision::F32, QuantPrecision::F32,).unwrap();
 
         // Assert: should have more LoopBegin instructions than groups=1 (outer loop + inner group loop)
         let loop_begin_count = prog.instrs.iter().filter(|i| matches!(i, VmInstr::LoopBegin { .. })).count();
@@ -2331,8 +2284,7 @@ mod tests {
         emit_normlike_inline(
             &mut prog_g1, &pattern, 24, 1, false, NormKind::RmsNorm,
             SimdWidth::W256, BoundExpr::Const(1),
-            i1, w1, o1, QuantPrecision::F32,
-        ).unwrap();
+            i1, w1, o1, QuantPrecision::F32, QuantPrecision::F32,).unwrap();
         let loop_begin_count_g1 = prog_g1.instrs.iter().filter(|i| matches!(i, VmInstr::LoopBegin { .. })).count();
 
         assert!(loop_begin_count > loop_begin_count_g1,
@@ -2382,8 +2334,7 @@ mod tests {
         emit_normlike_inline(
             &mut prog, &pattern, 32, 1, false, NormKind::RmsNorm,
             SimdWidth::W256, BoundExpr::Const(1),
-            input_ptr, weight_ptr, output_ptr, QuantPrecision::F32,
-        ).unwrap();
+            input_ptr, weight_ptr, output_ptr, QuantPrecision::F32, QuantPrecision::F32,).unwrap();
 
         // Assert: should contain at least 1 Accumulate instruction from reduce phase
         let accumulate_count = prog.instrs.iter().filter(|i| matches!(i, VmInstr::Accumulate { .. })).count();
@@ -2407,8 +2358,7 @@ mod tests {
         emit_layernorm_auto(
             &mut prog, 16, 1e-5,
             SimdWidth::W256, BoundExpr::Const(1),
-            input_ptr, weight_ptr, output_ptr, QuantPrecision::F32,
-        ).unwrap();
+            input_ptr, weight_ptr, output_ptr, QuantPrecision::F32, QuantPrecision::F32,).unwrap();
 
         // Assert: LayerNorm has 2 Accumulate in the vec loop body (acc_sum + acc_sq)
         let accumulate_count = prog.instrs.iter().filter(|i| matches!(i, VmInstr::Accumulate { .. })).count();
@@ -2500,8 +2450,7 @@ mod tests {
             &mut prog, &reduce, &finalize, &transform,
             feature_dim, vec_count, step_bytes, elem, lanes, width,
             NormKind::RmsNorm, acc, temp, scale, dim_bc,
-            row_input, weight_ptr, row_output, QuantPrecision::F32,
-        );
+            row_input, weight_ptr, row_output, QuantPrecision::F32, QuantPrecision::F32,);
 
         // Assert
         assert!(prog.instrs.len() > initial_count, "Should emit instructions with W512 width");
@@ -2523,8 +2472,7 @@ mod tests {
         let result = emit_layernorm_auto(
             &mut prog, 20, 1e-5,
             SimdWidth::W512, BoundExpr::Const(1),
-            input_ptr, weight_ptr, output_ptr, QuantPrecision::BF16,
-        );
+            input_ptr, weight_ptr, output_ptr, QuantPrecision::BF16, QuantPrecision::BF16,);
 
         // Assert
         assert!(result.is_ok(), "Should succeed with BF16 + W512 combined");
@@ -2569,8 +2517,7 @@ mod tests {
         emit_normlike_inline(
             &mut prog, &pattern, 64, 8, false, NormKind::RmsNorm,
             SimdWidth::W256, BoundExpr::Const(1),
-            input_ptr, weight_ptr, output_ptr, QuantPrecision::F32,
-        ).unwrap();
+            input_ptr, weight_ptr, output_ptr, QuantPrecision::F32, QuantPrecision::F32,).unwrap();
 
         // Assert: should contain LoadPtr instructions for per-group pointer resolution
         let loadptr_count = prog.instrs.iter().filter(|i| matches!(i, VmInstr::LoadPtr { .. })).count();
@@ -2592,8 +2539,7 @@ mod tests {
         emit_layernorm_auto(
             &mut prog, 16, 1e-5,
             SimdWidth::W256, BoundExpr::Const(1),
-            input_ptr, weight_ptr, output_ptr, QuantPrecision::F32,
-        ).unwrap();
+            input_ptr, weight_ptr, output_ptr, QuantPrecision::F32, QuantPrecision::F32,).unwrap();
 
         // Assert: count LoopBegin with row_bytes step (16 * 4 = 64 bytes)
         let row_bytes = 16usize * 4;

@@ -1249,6 +1249,7 @@ mod tests {
             total_scratchpad_bytes: 1024,
             logits_scratch_offset: 512,
             hetero_layout: None,
+            tensor_sources: std::collections::HashMap::new(),
             source_map: None,
         };
 
@@ -1674,6 +1675,7 @@ mod tests {
             total_scratchpad_bytes: 256,
             logits_scratch_offset: 128,
             hetero_layout: None,
+            tensor_sources: std::collections::HashMap::new(),
             source_map: None,
         };
         // Verify field access works
