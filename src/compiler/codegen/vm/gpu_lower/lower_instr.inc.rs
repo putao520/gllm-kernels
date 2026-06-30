@@ -437,17 +437,94 @@ impl GpuLower {
                 Ok(())
             }
 
-            VmInstr::TileMma { c, a, b } => {
+            // @trace REQ-HW-TIER-007 [req:VmInstr-TileLoad] GPU tile 数据加载。
+            // 设计 §4 gpu 列: ldmatrix.sync (PTX) / global_load (HIP)。
+            // 语义: dst_tile[r][col] = mem[base_ptr + k_offset + r*row_stride + col*elem_bytes]
+            // 寻址铁律 (设计 R1): k_offset (K 循环推进) 与 row_stride (2D tile 行跨度) 是两个
+            // 独立量, 禁止合并。base = base_ptr + k_offset; 每行 base += row_stride。
+            VmInstr::TileLoad { dst_tile, base_ptr, k_offset, row_stride, rows, cols, dtype } => {
+                let dst = self.reg_name_with_kind(*dst_tile, alloc);
+                let bp = self.reg_name_with_kind(*base_ptr, alloc);
+                let ko = self.reg_name_with_kind(*k_offset, alloc);
+                let elem_bytes = dtype.size_bytes();
+                let row_stride_v = *row_stride;
+                let rows_v = *rows;
+                let row_bytes = row_stride_v.checked_mul(elem_bytes)
+                    .expect("TileLoad row_stride * elem_bytes overflow");
+                let tile_bytes = row_bytes.checked_mul(rows_v)
+                    .expect("TileLoad row_bytes * rows overflow");
+                match self.dialect {
+                    GpuDialect::Ptx { sm_version } => {
+                        // ARCH-GPU-PTX-ADDR: PTX [reg+reg] 非法, 先算 64-bit 地址到 scratch。
+                        // %rd_addr = base_ptr + k_offset; 每行 %rd_addr += row_bytes。
+                        let rd_addr = self.scratch_gpr_names[1]; // %rs1 — 64-bit 地址
+                        let rd_row = self.scratch_gpr_names[0];  // %rs0 — 行指针游标
+                        self.emit_line(&format!("// §TileLoad {rows_v}×{cols} {dtype:?} (row_stride={row_stride_v}, elem={elem_bytes}B)"));
+                        self.emit_line(&format!("add.u64 {rd_addr}, {bp}, {ko};"));
+                        self.emit_line(&format!("mov.u64 {rd_row}, {rd_addr};"));
+                        // ldmatrix 加载 8x8 分片到 fragment 寄存器; tile 按 rows 循环逐行加载。
+                        // ldmatrix.sync.aligned.m8n8.x4.shared.b16 要求 smem, 这里走 .global 直读
+                        // (SM75+ ldmatrix 仅支持 shared; global 路径退化为 ld.global 向量加载)。
+                        let dtype_ptx = match dtype {
+                            crate::types::DType::F32 => "f32",
+                            crate::types::DType::F16 | crate::types::DType::BF16 => "b16",
+                            crate::types::DType::F8E4M3 | crate::types::DType::F8E5M2 | crate::types::DType::U8 => "b8",
+                            _ => "b8",
+                        };
+                        for _ in 0..rows_v {
+                            self.emit_line(&format!("ld.global.{dtype_ptx} {dst}, [{rd_row}];"));
+                            self.emit_line(&format!("add.u64 {rd_row}, {rd_row}, {row_bytes};"));
+                        }
+                        let _ = (sm_version, tile_bytes);
+                    }
+                    GpuDialect::Hip { .. } => {
+                        // HIP (GCN ISA): flat_load / global_load, C++ 风格行指针推进。
+                        self.emit_line(&format!("// §TileLoad {rows_v}×{cols} {dtype:?} (row_stride={row_stride_v}, elem={elem_bytes}B)"));
+                        self.emit_line(&format!("rd_row = ({bp}) + ({ko});"));
+                        for _ in 0..rows_v {
+                            self.emit_line(&format!("{dst} = *(__global float*)(rd_row);"));
+                            self.emit_line(&format!("rd_row = (char*)rd_row + {row_bytes};"));
+                        }
+                    }
+                    GpuDialect::Metal { .. } => {
+                        self.emit_line(&format!("// §TileLoad {rows_v}×{cols} {dtype:?} (row_stride={row_stride_v}, elem={elem_bytes}B)"));
+                        self.emit_line(&format!("rd_row = {bp} + {ko};"));
+                        for _ in 0..rows_v {
+                            self.emit_line(&format!("{dst} = rd_row[0];"));
+                            self.emit_line(&format!("rd_row = (char*)rd_row + {row_bytes};"));
+                        }
+                    }
+                }
+                Ok(())
+            }
+
+            // @trace REQ-HW-TIER-008 [req:VmInstr-TileMma-Shape] GPU MMA, shape+dtype 驱动变体选择。
+            // 设计 §4 gpu 列: mma.sync/wgmma/wmma/v_mfma。操作数 a/b 现在指向已被 TileLoad
+            // 灌入数据的 tile vreg (根治潜伏 bug: 未初始化寄存器上做 MMA)。
+            // dtype 感知 (ARCH-DTYPE-MIXED-PRECISION): 每个精度生成独立 mma 变体。
+            VmInstr::TileMma { c, a, b, m, n, k, dtype } => {
                 let vc = self.reg_name_with_kind(*c, alloc);
                 let va = self.reg_name_with_kind(*a, alloc);
                 let vb = self.reg_name_with_kind(*b, alloc);
                 match self.dialect {
                     GpuDialect::Ptx { sm_version } => {
+                        // dtype → mma.sync 输入精度后缀 + shape 选择 (m16n8k16 为 BF16/F16 基准)。
+                        let (in_sfx, acc_sfx, mma_m, mma_n, mma_k) = match dtype {
+                            crate::types::DType::BF16 => ("bf16", "f32", 16usize, 8usize, 16usize),
+                            crate::types::DType::F16  => ("f16",  "f32", 16,    8,    16),
+                            crate::types::DType::F8E4M3 => ("e4m3", "f32", 16, 8, 32), // FP8 k=32 (SM89+)
+                            crate::types::DType::F8E5M2 => ("e5m2", "f32", 16, 8, 32),
+                            crate::types::DType::F32 => ("tf32", "f32", 16, 8, 8),     // TF32 k=8 (SM80+)
+                            crate::types::DType::U8 => ("s8", "s32", 16, 8, 32),       // Int8
+                            // Sub-byte packed (F6/F4): 走 b8 通道, codegen 上层负责打包/解包。
+                            _ => ("b8", "f32", 16, 8, 32),
+                        };
+                        let _ = (m, n, k); // tile 逻辑 shape; mma 物理分片由硬件固定。
                         if sm_version >= 100 {
                             // ── SM100+ Blackwell: tcgen05.mma ──
                             self.emit_line("// §SM100 tcgen05.mma (block-scaled, TMEM-backed)");
                             self.emit_line(&format!("// A-desc in {va}, B-desc in {vb}, C-tmem at %tmem_addr"));
-                            self.emit_line("tcgen05.mma.cta_group::1.kind::f16");
+                            self.emit_line(&format!("tcgen05.mma.cta_group::1.kind::{in_sfx}"));
                             self.emit_line(&format!("  [%tmem_addr], {va}, {vb}, 0x0,"));
                             self.emit_line("  0, 1;");
                             self.emit_line("tcgen05.wait::ld.sync.aligned;");
@@ -455,24 +532,38 @@ impl GpuLower {
                             // ── SM90 Hopper: wgmma.mma_async ──
                             self.emit_line("// §SM90 WGMMA async MMA (warpgroup 128 threads)");
                             self.emit_line("wgmma.fence.sync.aligned;");
-                            self.emit_line(&format!("wgmma.mma_async.sync.aligned.m64n16k16.f32.bf16.bf16 {{{vc}}}, {va}, {vb};"));
+                            self.emit_line(&format!(
+                                "wgmma.mma_async.sync.aligned.m64n16k16.{acc_sfx}.{in_sfx}.{in_sfx} {{{vc}}}, {va}, {vb};"));
                             self.emit_line("wgmma.commit_group.sync.aligned;");
                             self.emit_line("wgmma.wait_group.sync.aligned 0;");
                         } else if sm_version >= 80 {
-                            // ── SM80-89 Ampere/Ada: mma.sync ──
-                            self.emit_line(&format!("mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32 {vc}, {va}, {vb}, {vc};"));
+                            // ── SM80-89 Ampere/Ada: mma.sync (dtype 驱动变体) ──
+                            self.emit_line(&format!(
+                                "mma.sync.aligned.m{mma_m}n{mma_n}k{mma_k}.row.col.{acc_sfx}.{in_sfx}.{in_sfx}.{acc_sfx} {vc}, {va}, {vb}, {vc};"));
                         } else {
-                            // ── SM70-79 Volta/Turing: wmma ──
-                            self.emit_line(&format!("wmma.mma.sync.aligned.row.col.m16n16k16.f32.f16.f16.f32 {vc}, {va}, {vb}, {vc};"));
+                            // ── SM70-79 Volta/Turing: wmma (仅 F16/BF16 m16n16k16) ──
+                            self.emit_line(&format!(
+                                "wmma.mma.sync.aligned.row.col.m16n16k16.{acc_sfx}.{in_sfx}.{in_sfx}.{acc_sfx} {vc}, {va}, {vb}, {vc};"));
                         }
                     }
                     GpuDialect::Hip { gfx_arch, .. } => {
+                        // gfx 形状由 MFMA 硬件固定; dtype 选 mfma 指令。
+                        let (mfma_op, mfma_shape) = match dtype {
+                            crate::types::DType::F16  => ("v_mfma_f32_16x16x16_f16",  "16x16x16"),
+                            crate::types::DType::BF16 => ("v_mfma_f32_16x16x16_bf16", "16x16x16"),
+                            crate::types::DType::F8E4M3 | crate::types::DType::F8E5M2 => ("v_mfma_f32_16x16x32_fp8", "16x16x32"),
+                            crate::types::DType::F32 => ("v_mfma_f32_16x16x8_tf32", "16x16x8"),
+                            crate::types::DType::U8 => ("v_mfma_i32_16x16x32_i8", "16x16x32"),
+                            // F6/F4 (CDNA4 sub-byte): 退化为 fp8 通道, 上层打包。
+                            _ => ("v_mfma_f32_16x16x32_fp8", "16x16x32"),
+                        };
+                        let _ = (m, n, k);
                         if gfx_arch >= 950 {
                             // ── gfx950 CDNA4: MFMA v2 32×32×16 ──
-                            self.emit_line(&format!("v_mfma_f32_32x32x16_f16 {vc}, {va}, {vb}, {vc};"));
+                            self.emit_line(&format!("{mfma_op}_32 {vc}, {va}, {vb}, {vc};  // §gfx950 {mfma_shape}"));
                         } else if gfx_arch >= 908 {
                             // ── gfx908+ CDNA2/3: MFMA v1 16×16×16 ──
-                            self.emit_line(&format!("v_mfma_f32_16x16x16_f16 {vc}, {va}, {vb}, {vc};"));
+                            self.emit_line(&format!("{mfma_op} {vc}, {va}, {vb}, {vc};  // §gfx908 {mfma_shape}"));
                         } else {
                             self.emit_line("// RDNA: no MFMA, scalar FMA fallback");
                             self.emit_line(&format!("// {vc} += {va} * {vb}"));
@@ -480,6 +571,56 @@ impl GpuLower {
                     }
                     GpuDialect::Metal { .. } => {
                         self.emit_line(&format!("// Metal simdgroup_matrix_multiply: {vc} += {va} * {vb}"));
+                    }
+                }
+                Ok(())
+            }
+
+            // @trace REQ-HW-TIER-009 [req:VmInstr-TileStore] GPU tile 结果写回内存。
+            // 设计 §4 gpu 列: st.global (PTX) / global_store (HIP)。
+            // 语义: mem[base_ptr + out_offset + r*row_stride + col*elem_bytes] = src_tile[r][col]
+            VmInstr::TileStore { src_tile, base_ptr, out_offset, row_stride, rows, cols, dtype } => {
+                let src = self.reg_name_with_kind(*src_tile, alloc);
+                let bp = self.reg_name_with_kind(*base_ptr, alloc);
+                let oo = self.reg_name_with_kind(*out_offset, alloc);
+                let elem_bytes = dtype.size_bytes();
+                let row_stride_v = *row_stride;
+                let rows_v = *rows;
+                let row_bytes = row_stride_v.checked_mul(elem_bytes)
+                    .expect("TileStore row_stride * elem_bytes overflow");
+                match self.dialect {
+                    GpuDialect::Ptx { .. } => {
+                        let rd_addr = self.scratch_gpr_names[1]; // %rs1 — 64-bit 地址
+                        let rd_row = self.scratch_gpr_names[0];  // %rs0 — 行指针游标
+                        self.emit_line(&format!("// §TileStore {rows_v}×{cols} {dtype:?} (row_stride={row_stride_v}, elem={elem_bytes}B)"));
+                        self.emit_line(&format!("add.u64 {rd_addr}, {bp}, {oo};"));
+                        self.emit_line(&format!("mov.u64 {rd_row}, {rd_addr};"));
+                        let dtype_ptx = match dtype {
+                            crate::types::DType::F32 => "f32",
+                            crate::types::DType::F16 | crate::types::DType::BF16 => "b16",
+                            crate::types::DType::F8E4M3 | crate::types::DType::F8E5M2 | crate::types::DType::U8 => "b8",
+                            _ => "b8",
+                        };
+                        for _ in 0..rows_v {
+                            self.emit_line(&format!("st.global.{dtype_ptx} [{rd_row}], {src};"));
+                            self.emit_line(&format!("add.u64 {rd_row}, {rd_row}, {row_bytes};"));
+                        }
+                    }
+                    GpuDialect::Hip { .. } => {
+                        self.emit_line(&format!("// §TileStore {rows_v}×{cols} {dtype:?} (row_stride={row_stride_v}, elem={elem_bytes}B)"));
+                        self.emit_line(&format!("rd_row = ({bp}) + ({oo});"));
+                        for _ in 0..rows_v {
+                            self.emit_line(&format!("*(__global float*)(rd_row) = {src};"));
+                            self.emit_line(&format!("rd_row = (char*)rd_row + {row_bytes};"));
+                        }
+                    }
+                    GpuDialect::Metal { .. } => {
+                        self.emit_line(&format!("// §TileStore {rows_v}×{cols} {dtype:?} (row_stride={row_stride_v}, elem={elem_bytes}B)"));
+                        self.emit_line(&format!("rd_row = {bp} + {oo};"));
+                        for _ in 0..rows_v {
+                            self.emit_line(&format!("rd_row[0] = {src};"));
+                            self.emit_line(&format!("rd_row = (char*)rd_row + {row_bytes};"));
+                        }
                     }
                 }
                 Ok(())
