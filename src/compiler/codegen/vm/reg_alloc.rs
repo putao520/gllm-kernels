@@ -680,30 +680,99 @@ impl<'a> RegAllocator<'a> {
 
     /// 提取一条 VmInstr 引用的所有 VRegId (含嵌套表达式中的 VReg)。
     pub fn referenced_vregs(instr: &VmInstr) -> Vec<VRegId> {
+                match instr.category() {
+            super::vm_instr_category::InstrCategory::Memory => Self::referenced_vregs_memorya(instr),
+            super::vm_instr_category::InstrCategory::Arith => Self::referenced_vregs_aritha(instr),
+            super::vm_instr_category::InstrCategory::Control => Self::referenced_vregs_controla(instr),
+            super::vm_instr_category::InstrCategory::Tile => Self::referenced_vregs_tilea(instr),
+            super::vm_instr_category::InstrCategory::Quant => Self::referenced_vregs_quanta(instr),
+            super::vm_instr_category::InstrCategory::GpuComm => Self::referenced_vregs_gpucomma(instr),
+            super::vm_instr_category::InstrCategory::Sampling => Self::referenced_vregs_samplinga(instr),
+            super::vm_instr_category::InstrCategory::Misc => Self::referenced_vregs_misca(instr),
+            _ => unreachable!("uncovered category in referenced_vregs"),
+        }
+    }
+
+    fn referenced_vregs_memorya(instr: &VmInstr) -> Vec<VRegId> {
+        // Memory cluster a (8 arms) — ARCH-LOWER-DISPATCH-LAYERING P3 (机械抽取)
         match instr {
             VmInstr::VecLoad { dst, base, offset, .. } => {
-                let mut v = vec![*dst, *base];
-                v.extend(Self::offset_vregs(offset));
-                v
-            }
+                                let mut v = vec![*dst, *base];
+                                v.extend(Self::offset_vregs(offset));
+                                v
+                            },
             VmInstr::VecStore { base, offset, src, .. } => {
-                let mut v = vec![*base, *src];
-                v.extend(Self::offset_vregs(offset));
-                v
-            }
+                                let mut v = vec![*base, *src];
+                                v.extend(Self::offset_vregs(offset));
+                                v
+                            },
             VmInstr::VecNarrow { dst, src, .. } => vec![*dst, *src],
             VmInstr::VecWiden { dst, src, .. } => vec![*dst, *src],
             VmInstr::Mov { dst, src, .. } => vec![*dst, *src],
             VmInstr::Broadcast { dst, src, .. } => {
-                let mut v = vec![*dst];
-                v.extend(Self::scalar_expr_vregs(src));
-                v
-            }
+                                let mut v = vec![*dst];
+                                v.extend(Self::scalar_expr_vregs(src));
+                                v
+                            },
             VmInstr::LoadPtr { dst, src } => {
-                let mut v = vec![*dst];
-                v.extend(Self::ptr_vregs(src));
-                v
-            }
+                                let mut v = vec![*dst];
+                                v.extend(Self::ptr_vregs(src));
+                                v
+                            },
+            VmInstr::ScalarLoad { dst, base, offset } => {
+                                let mut v = vec![*dst, *base];
+                                v.extend(Self::offset_vregs(offset));
+                                v
+                            },
+            _ => Self::referenced_vregs_memoryb(instr),
+        }
+    }
+
+    fn referenced_vregs_memoryb(instr: &VmInstr) -> Vec<VRegId> {
+        // Memory cluster b (8 arms) — ARCH-LOWER-DISPATCH-LAYERING P3 (机械抽取)
+        match instr {
+            VmInstr::ScalarToIndex { dst, src, .. } => vec![*dst, *src],
+            VmInstr::IndexToScalar { dst, src } => vec![*dst, *src],
+            VmInstr::ScalarByteLoad { dst, base, offset } => {
+                                let mut v = vec![*dst, *base];
+                                v.extend(Self::offset_vregs(offset));
+                                v
+                            },
+            VmInstr::AtomicAdd { base, .. } => vec![*base],
+            VmInstr::MemFence { .. } => vec![],
+            VmInstr::AddPtr { dst, base, .. } => vec![*dst, *base],
+            VmInstr::StoreConstToStack { .. } => vec![],
+            VmInstr::MemCopy { dst, src, .. } => vec![*dst, *src],
+            _ => Self::referenced_vregs_memoryc(instr),
+        }
+    }
+
+    fn referenced_vregs_memoryc(instr: &VmInstr) -> Vec<VRegId> {
+        // Memory cluster c (8 arms) — ARCH-LOWER-DISPATCH-LAYERING P3 (机械抽取)
+        match instr {
+            VmInstr::ScalarStore { base, src, .. } => vec![*base, *src],
+            VmInstr::VecScalarStore { base, src, .. } => vec![*base, *src],
+            VmInstr::IntMulStride { dst, src, .. } => vec![*dst, *src],
+            VmInstr::Prefetch { base, .. } => vec![*base],
+            VmInstr::ActivationSwap { ptr_a, ptr_b } => vec![*ptr_a, *ptr_b],
+            VmInstr::GatherLoad { dst, base, indices, .. } => vec![*dst, *base, *indices],
+            VmInstr::ScatterStore { base, indices, src, .. } => vec![*base, *indices, *src],
+            VmInstr::TableLookup { dst, base, row_index, .. } => vec![*dst, *base, *row_index],
+            _ => Self::referenced_vregs_memoryd(instr),
+        }
+    }
+
+    fn referenced_vregs_memoryd(instr: &VmInstr) -> Vec<VRegId> {
+        // Memory cluster d (1 arms) — ARCH-LOWER-DISPATCH-LAYERING P3 (机械抽取)
+        match instr {
+            VmInstr::AtomicCAS { dst, ptr, expected, desired, .. } => vec![*dst, *ptr, *expected, *desired],
+            _ => unreachable!("Memory category mismatch in referenced_vregs"),
+        }
+    }
+
+    fn referenced_vregs_aritha(instr: &VmInstr) -> Vec<VRegId> {
+        // Arith cluster a (8 arms) — ARCH-LOWER-DISPATCH-LAYERING P3 (机械抽取)
+        match instr {
             VmInstr::VecBinOp { dst, a, b, .. } => vec![*dst, *a, *b],
             VmInstr::VecShiftImm { dst, a, .. } => vec![*dst, *a],
             VmInstr::VecUnaryOp { dst, a, .. } => vec![*dst, *a],
@@ -712,19 +781,85 @@ impl<'a> RegAllocator<'a> {
             VmInstr::ConditionalSelect { dst, mask, true_val, false_val, .. } => vec![*dst, *mask, *true_val, *false_val],
             VmInstr::Fma { dst, acc, a, b, .. } => vec![*dst, *acc, *a, *b],
             VmInstr::HReduce { dst, src, .. } => vec![*dst, *src],
+            _ => Self::referenced_vregs_arithb(instr),
+        }
+    }
+
+    fn referenced_vregs_arithb(instr: &VmInstr) -> Vec<VRegId> {
+        // Arith cluster b (8 arms) — ARCH-LOWER-DISPATCH-LAYERING P3 (机械抽取)
+        match instr {
             VmInstr::Accumulate { acc, src } => vec![*acc, *src],
-            VmInstr::LoopBegin { counter, byte_offset, bound, .. } => {
-                let mut v = vec![*counter, *byte_offset];
-                v.extend(Self::bound_vregs(bound));
-                v
-            }
             VmInstr::Transcendental { dst, src, .. } => vec![*dst, *src],
+            VmInstr::GprBinOp { dst, a, b, .. } => {
+                                let mut v = vec![*dst, *a];
+                                if let Some(vr) = b.vreg() { v.push(vr); }
+                                v
+                            },
+            VmInstr::GprUnaryOp { dst, src, .. } => vec![*dst, *src],
+            VmInstr::GprLoadImm { dst, .. } => vec![*dst],
+            VmInstr::DotProduct { acc, a, b, .. } => vec![*acc, *a, *b],
+            VmInstr::ScaleApply { dst, acc, scale, zero, .. } => vec![*dst, *acc, *scale, *zero],
+            VmInstr::VecShuffle { dst, src, mask, .. } => {
+                                let mut v = vec![*dst, *src];
+                                if let super::instr::VecShuffleMask::Dynamic { ctrl } = mask { v.push(*ctrl); }
+                                v
+                            },
+            _ => Self::referenced_vregs_arithc(instr),
+        }
+    }
+
+    fn referenced_vregs_arithc(instr: &VmInstr) -> Vec<VRegId> {
+        // Arith cluster c (3 arms) — ARCH-LOWER-DISPATCH-LAYERING P3 (机械抽取)
+        match instr {
+            VmInstr::VecExtractLane { dst, src, .. } => vec![*dst, *src],
+            VmInstr::VecInsertLane { dst, src_vec, src_scalar, .. } => vec![*dst, *src_vec, *src_scalar],
+            VmInstr::VecLoadConst { dst, .. } => vec![*dst],
+            _ => unreachable!("Arith category mismatch in referenced_vregs"),
+        }
+    }
+
+    fn referenced_vregs_controla(instr: &VmInstr) -> Vec<VRegId> {
+        // Control cluster a (8 arms) — ARCH-LOWER-DISPATCH-LAYERING P3 (机械抽取)
+        match instr {
+            VmInstr::LoopBegin { counter, byte_offset, bound, .. } => {
+                                let mut v = vec![*counter, *byte_offset];
+                                v.extend(Self::bound_vregs(bound));
+                                v
+                            },
             VmInstr::ConditionalSkip { mask, .. } => vec![*mask],
             VmInstr::GprCondAction { cond, action } => {
-                let mut v = cond.vregs();
-                v.extend(action.vregs());
-                v
-            }
+                                let mut v = cond.vregs();
+                                v.extend(action.vregs());
+                                v
+                            },
+            VmInstr::IndirectJump { index, .. } => vec![*index],
+            VmInstr::ConditionalExit { condition, output } => vec![*condition, *output],
+            VmInstr::BranchIfPtrNonNull { ptr, .. } => vec![*ptr],
+            VmInstr::BranchIfGprZero { value, .. } => vec![*value],
+            VmInstr::BranchIfGprLtU { a, b, .. } => vec![*a, *b],
+            _ => Self::referenced_vregs_controlb(instr),
+        }
+    }
+
+    fn referenced_vregs_controlb(instr: &VmInstr) -> Vec<VRegId> {
+        // Control cluster b (6 arms) — ARCH-LOWER-DISPATCH-LAYERING P3 (机械抽取)
+        match instr {
+            VmInstr::UnconditionalBranch { .. } => vec![],
+            VmInstr::BreakLoop { return_value } => match return_value {
+                                ReturnValue::Const(_) => vec![],
+                                ReturnValue::VReg(v) => vec![*v],
+                            },
+            VmInstr::MarkLabel { .. } => vec![],
+            VmInstr::ScopeBegin { .. } => vec![],
+            VmInstr::ScopeEnd { .. } => vec![],
+            VmInstr::LoopEnd => vec![],
+            _ => unreachable!("Control category mismatch in referenced_vregs"),
+        }
+    }
+
+    fn referenced_vregs_tilea(instr: &VmInstr) -> Vec<VRegId> {
+        // Tile cluster a (8 arms) — ARCH-LOWER-DISPATCH-LAYERING P3 (机械抽取)
+        match instr {
             // HW-TIER TASK-D §4/§6.2: Tile 数据流 IR vreg 操作数。
             //   TileLoad  { dst_tile, base_ptr, k_offset, row_stride, rows, cols, dtype }
             //   TileMma   { c, a, b, m, n, k, dtype }
@@ -737,188 +872,167 @@ impl<'a> RegAllocator<'a> {
             VmInstr::TileLoad { dst_tile, base_ptr, k_offset, .. } => vec![*dst_tile, *base_ptr, *k_offset],
             VmInstr::TileMma { c, a, b, .. } => vec![*c, *a, *b],
             VmInstr::TileStore { src_tile, base_ptr, out_offset, .. } => vec![*src_tile, *base_ptr, *out_offset],
-            VmInstr::SparseMaskIntersect { dst_k0, dst_k1, a, b } => vec![*dst_k0, *dst_k1, *a, *b],
-            VmInstr::ScalarLoad { dst, base, offset } => {
-                let mut v = vec![*dst, *base];
-                v.extend(Self::offset_vregs(offset));
-                v
-            }
-            VmInstr::ScalarToIndex { dst, src, .. } => vec![*dst, *src],
-            VmInstr::IndexToScalar { dst, src } => vec![*dst, *src],
-            VmInstr::ScalarByteLoad { dst, base, offset } => {
-                let mut v = vec![*dst, *base];
-                v.extend(Self::offset_vregs(offset));
-                v
-            }
-            VmInstr::AsyncCopy { dst, src, .. } => vec![*dst, *src],
-            VmInstr::IndirectJump { index, .. } => vec![*index],
-            VmInstr::ConditionalExit { condition, output } => vec![*condition, *output],
-            VmInstr::BranchIfPtrNonNull { ptr, .. } => vec![*ptr],
-            VmInstr::BranchIfGprZero { value, .. } => vec![*value],
-            VmInstr::BranchIfGprLtU { a, b, .. } => vec![*a, *b],
-            VmInstr::UnconditionalBranch { .. } => vec![],
-            VmInstr::BatchSeqIdLookup { dst, pt_offset_out, token_index, batch_ctx_ptr } => vec![*dst, *pt_offset_out, *token_index, *batch_ctx_ptr],
-            VmInstr::BatchPerSeqArgmax { dst, seq_id, logits_flat_ptr, .. } => vec![*dst, *seq_id, *logits_flat_ptr],
-            VmInstr::BatchPerSeqStopCheck { seq_id, token_id, batch_ctx_ptr } => vec![*seq_id, *token_id, *batch_ctx_ptr],
-            VmInstr::AtomicAdd { base, .. } => vec![*base],
-            VmInstr::MemFence { .. } => vec![],
-            VmInstr::DeclareVReg { id, .. } => vec![*id],
-            VmInstr::ReleaseVReg { id } => vec![*id],
-            // Mega-kernel instructions — must reference all VReg operands
-            // to keep their live intervals correct across Argmax/StoreToken/etc.
-            VmInstr::Argmax { dst, logits_ptr, .. } => vec![*dst, *logits_ptr],
-            VmInstr::TemperatureScale { logits_ptr, temp_ptr, .. } => vec![*logits_ptr, *temp_ptr],
-            VmInstr::StoreToken { token_id, output_buf, counter, input_ids_ptr, prompt_len_bytes } => vec![*token_id, *output_buf, *counter, *input_ids_ptr, *prompt_len_bytes],
-            VmInstr::CheckStopCondition { token_id, counter, eos_ptr, max_tokens_ptr } => vec![*token_id, *counter, *eos_ptr, *max_tokens_ptr],
-            VmInstr::AddPtr { dst, base, .. } => vec![*dst, *base],
-            VmInstr::StoreConstToStack { .. } => vec![],
-            VmInstr::BreakLoop { return_value } => match return_value {
-                ReturnValue::Const(_) => vec![],
-                ReturnValue::VReg(v) => vec![*v],
-            },
-            VmInstr::MarkLabel { .. } => vec![],
-            VmInstr::GprBinOp { dst, a, b, .. } => {
-                let mut v = vec![*dst, *a];
-                if let Some(vr) = b.vreg() { v.push(vr); }
-                v
-            }
-            VmInstr::GprUnaryOp { dst, src, .. } => vec![*dst, *src],
-            VmInstr::GprLoadImm { dst, .. } => vec![*dst],
-            VmInstr::MemCopy { dst, src, .. } => vec![*dst, *src],
-            VmInstr::LoadCallbackEntry { table_ptr, fn_ptr_out, ctx_out, .. } => vec![*table_ptr, *fn_ptr_out, *ctx_out],
-            VmInstr::NativeCall { ret_val, fn_ptr, ctx_ptr } => vec![*ret_val, *fn_ptr, *ctx_ptr],
-            VmInstr::ScalarStore { base, src, .. } => vec![*base, *src],
-            VmInstr::VecScalarStore { base, src, .. } => vec![*base, *src],
-            VmInstr::IntMulStride { dst, src, .. } => vec![*dst, *src],
-            VmInstr::Prefetch { base, .. } => vec![*base],
-            VmInstr::GgufSubScaleLoad { dst, scales_base, sub_block_idx, .. } => vec![*dst, *scales_base, *sub_block_idx],
-            VmInstr::GgufKQuantScaleLoad { dst, scales_base, sub_block_idx, .. } => vec![*dst, *scales_base, *sub_block_idx],
-            VmInstr::ActivationSwap { ptr_a, ptr_b } => vec![*ptr_a, *ptr_b],
-            VmInstr::Comment(_) | VmInstr::PageTableAddr { .. } | VmInstr::PageTableKVWrite { .. } | VmInstr::PageTableKVWriteQuant { .. } | VmInstr::KiviQuantChannel { .. } | VmInstr::KiviQuantToken { .. } | VmInstr::KiviDequantLoad { .. } => vec![],
-            VmInstr::HotpatchSlot { .. } => vec![],
             VmInstr::TileConfig { .. } => vec![],
             VmInstr::TileRelease => vec![],
-            VmInstr::WarpSync => vec![],
-            VmInstr::AsyncWait { .. } => vec![],
-            VmInstr::ScopeBegin { .. } | VmInstr::ScopeEnd { .. } | VmInstr::LoopEnd => vec![],
-            VmInstr::GatherLoad { dst, base, indices, .. } => vec![*dst, *base, *indices],
-            VmInstr::ScatterStore { base, indices, src, .. } => vec![*base, *indices, *src],
-            VmInstr::TableLookup { dst, base, row_index, .. } => vec![*dst, *base, *row_index],
-            VmInstr::SharedMemAlloc { .. } => vec![],
-            VmInstr::SharedMemStore { src, .. } => {
-                let mut v = vec![*src];
-                // Extract VReg from offset if needed
-                if let VmInstr::SharedMemStore { dst_offset, .. } = instr {
-                    v.extend(Self::offset_vregs(dst_offset));
-                }
-                v
-            }
-            VmInstr::SharedMemLoad { dst, .. } => {
-                let mut v = vec![*dst];
-                // Extract VReg from offset if needed
-                if let VmInstr::SharedMemLoad { src_offset, .. } = instr {
-                    v.extend(Self::offset_vregs(src_offset));
-                }
-                v
-            }
-            VmInstr::SharedMemAsyncStore { src, .. } => {
-                let mut v = vec![*src];
-                if let VmInstr::SharedMemAsyncStore { dst_offset, .. } = instr {
-                    v.extend(Self::offset_vregs(dst_offset));
-                }
-                v
-            }
-            VmInstr::SharedMemAsyncWaitGroup { .. } => vec![],
-            VmInstr::WeightPrefetchAsync { weight_base, .. } => vec![*weight_base],
-            VmInstr::WeightPrefetchWait { .. } => vec![],
-            VmInstr::BlockSync => vec![],
-            VmInstr::WarpReduce { src, dst, .. } => vec![*src, *dst],
+            VmInstr::TmemAlloc { .. } => vec![],
+            VmInstr::TmemLoad { dst, .. } => {
+                                let mut v = vec![*dst];
+                                if let VmInstr::TmemLoad { offset, .. } = instr {
+                                    v.extend(Self::offset_vregs(offset));
+                                }
+                                v
+                            },
+            VmInstr::TmemStore { src, .. } => {
+                                let mut v = vec![*src];
+                                if let VmInstr::TmemStore { offset, .. } = instr {
+                                    v.extend(Self::offset_vregs(offset));
+                                }
+                                v
+                            },
+            _ => Self::referenced_vregs_tileb(instr),
+        }
+    }
+
+    fn referenced_vregs_tileb(instr: &VmInstr) -> Vec<VRegId> {
+        // Tile cluster b (1 arms) — ARCH-LOWER-DISPATCH-LAYERING P3 (机械抽取)
+        match instr {
+            VmInstr::TmemDealloc { .. } => vec![],
+            _ => unreachable!("Tile category mismatch in referenced_vregs"),
+        }
+    }
+
+    fn referenced_vregs_quanta(instr: &VmInstr) -> Vec<VRegId> {
+        // Quant cluster a (8 arms) — ARCH-LOWER-DISPATCH-LAYERING P3 (机械抽取)
+        match instr {
+            VmInstr::SparseMaskIntersect { dst_k0, dst_k1, a, b } => vec![*dst_k0, *dst_k1, *a, *b],
+            VmInstr::GgufSubScaleLoad { dst, scales_base, sub_block_idx, .. } => vec![*dst, *scales_base, *sub_block_idx],
+            VmInstr::GgufKQuantScaleLoad { dst, scales_base, sub_block_idx, .. } => vec![*dst, *scales_base, *sub_block_idx],
+            VmInstr::KiviQuantChannel { .. } => vec![],
+            VmInstr::KiviQuantToken { .. } => vec![],
+            VmInstr::KiviDequantLoad { .. } => vec![],
             // Quant* decode instrs
             VmInstr::QuantBroadcastInt { dst, .. } => vec![*dst],
             VmInstr::QuantLoadBytesVec { dst, base, .. } => vec![*dst, *base],
+            _ => Self::referenced_vregs_quantb(instr),
+        }
+    }
+
+    fn referenced_vregs_quantb(instr: &VmInstr) -> Vec<VRegId> {
+        // Quant cluster b (8 arms) — ARCH-LOWER-DISPATCH-LAYERING P3 (机械抽取)
+        match instr {
             VmInstr::QuantCodebookLookup { dst, indices, .. } => vec![*dst, *indices],
             VmInstr::QuantExtractBits { dst, src, .. } => vec![*dst, *src],
             VmInstr::QuantDequantFma { dst, weight, activation, scale, zero_point, .. } => vec![*dst, *weight, *activation, *scale, *zero_point],
             VmInstr::QuantInterleave { dst, lo, hi, .. } => vec![*dst, *lo, *hi],
             VmInstr::QuantConcatSeq { dst, lo, hi, .. } => vec![*dst, *lo, *hi],
             VmInstr::Q3KDecodeStep { dst, block_base, lane_offset, d_vreg, .. } => vec![*dst, *block_base, *lane_offset, *d_vreg],
-            VmInstr::DotProduct { acc, a, b, .. } => vec![*acc, *a, *b],
-            VmInstr::ScaleApply { dst, acc, scale, zero, .. } => vec![*dst, *acc, *scale, *zero],
             VmInstr::BitwiseGemm { dst, sign_bits, input_sign_bits, scale, .. } => vec![*dst, *sign_bits, *input_sign_bits, *scale],
             VmInstr::SparseGemm { acc, a_sparse, b_dense, sparse_mask_ptr, .. } => vec![*acc, *a_sparse, *b_dense, *sparse_mask_ptr],
+            _ => Self::referenced_vregs_quantc(instr),
+        }
+    }
+
+    fn referenced_vregs_quantc(instr: &VmInstr) -> Vec<VRegId> {
+        // Quant cluster c (7 arms) — ARCH-LOWER-DISPATCH-LAYERING P3 (机械抽取)
+        match instr {
             VmInstr::SparseFp8Gemm { acc, a_sparse, b_dense, sparse_mask_ptr, .. } => vec![*acc, *a_sparse, *b_dense, *sparse_mask_ptr],
             VmInstr::NativeFp4Gemm { acc, a, b, scale_a, scale_b, .. } => vec![*acc, *a, *b, *scale_a, *scale_b],
             VmInstr::NativeFp8Gemm { acc, a, b, .. } => vec![*acc, *a, *b],
             VmInstr::HwQuantDequant { dst, packed_weight, block_scale, global_scale, .. } => vec![*dst, *packed_weight, *block_scale, *global_scale],
-            VmInstr::TmemAlloc { .. } => vec![],
-            VmInstr::TmemLoad { dst, .. } => {
-                let mut v = vec![*dst];
-                if let VmInstr::TmemLoad { offset, .. } = instr {
-                    v.extend(Self::offset_vregs(offset));
-                }
-                v
-            }
-            VmInstr::TmemStore { src, .. } => {
-                let mut v = vec![*src];
-                if let VmInstr::TmemStore { offset, .. } = instr {
-                    v.extend(Self::offset_vregs(offset));
-                }
-                v
-            }
-            VmInstr::TmemDealloc { .. } => vec![],
-            VmInstr::ClusterBarrierInit { .. } => vec![],
-            VmInstr::ClusterStore { src, .. } => {
-                let mut v = vec![*src];
-                if let VmInstr::ClusterStore { offset, .. } = instr {
-                    v.extend(Self::offset_vregs(offset));
-                }
-                v
-            }
-            VmInstr::ClusterLoad { dst, .. } => {
-                let mut v = vec![*dst];
-                if let VmInstr::ClusterLoad { offset, .. } = instr {
-                    v.extend(Self::offset_vregs(offset));
-                }
-                v
-            }
-            VmInstr::Lz4Decode { src_ptr, dst_ptr, compressed_size, .. } => vec![*src_ptr, *dst_ptr, *compressed_size],
-            VmInstr::BitPackRleDecode { src_ptr, dst_ptr, compressed_size, .. } => vec![*src_ptr, *dst_ptr, *compressed_size],
-
-            // ── Sampling instructions ──
-            VmInstr::SoftmaxReduceMax { dst, logits_ptr, .. } => vec![*dst, *logits_ptr],
-            VmInstr::SoftmaxExpSum { sum_dst, logits_ptr, max_val, .. } => vec![*sum_dst, *logits_ptr, *max_val],
-            VmInstr::SoftmaxNormalize { logits_ptr, sum_val, .. } => vec![*logits_ptr, *sum_val],
-            VmInstr::SampleTopKFilter { probs_ptr, indices_ptr, k_ptr, .. } => vec![*probs_ptr, *indices_ptr, *k_ptr],
-            VmInstr::SampleTopPFilter { probs_ptr, p_ptr, .. } => vec![*probs_ptr, *p_ptr],
-            VmInstr::SampleMultinomial { dst, probs_ptr, rng_state_ptr, .. } => vec![*dst, *probs_ptr, *rng_state_ptr],
-            VmInstr::WarpPRNG { dst, rng_state_ptr } => vec![*dst, *rng_state_ptr],
-            VmInstr::SharedMemSwizzle { dst, raw_addr, .. } => vec![*dst, *raw_addr],
-            VmInstr::WarpRoleDeclare { .. } | VmInstr::WarpBarrierArrive { .. } | VmInstr::WarpBarrierWait { .. } => vec![],
-            VmInstr::DebugBreakpoint { .. } | VmInstr::DebugMarker { .. } => vec![],
-            VmInstr::DebugProbe { vreg, .. } => vec![*vreg],
-            VmInstr::DebugBreakIf { cond_gpr, .. } => vec![*cond_gpr],
             VmInstr::QuantScalarCvtLoad { base, .. } => vec![*base],
             VmInstr::QuantBlockLoad { dst, base, offset, unpack, .. } => {
-                let mut v = vec![*dst, *base];
-                v.extend(Self::offset_vregs(offset));
-                v.extend(unpack.vregs());
-                v
-            }
+                                let mut v = vec![*dst, *base];
+                                v.extend(Self::offset_vregs(offset));
+                                v.extend(unpack.vregs());
+                                v
+                            },
             VmInstr::QuantBiPlaneLoad { dst, qs_base, extra_base, .. } => vec![*dst, *qs_base, *extra_base],
-            VmInstr::VecShuffle { dst, src, mask, .. } => {
-                let mut v = vec![*dst, *src];
-                if let super::instr::VecShuffleMask::Dynamic { ctrl } = mask { v.push(*ctrl); }
-                v
-            }
-            VmInstr::VecExtractLane { dst, src, .. } => vec![*dst, *src],
-            VmInstr::VecInsertLane { dst, src_vec, src_scalar, .. } => vec![*dst, *src_vec, *src_scalar],
-            VmInstr::VecLoadConst { dst, .. } => vec![*dst],
-            VmInstr::AtomicCAS { dst, ptr, expected, desired, .. } => vec![*dst, *ptr, *expected, *desired],
-            VmInstr::SeqIdLookup { dst, token_index, seq_meta_base, num_seqs, .. } => vec![*dst, *token_index, *seq_meta_base, *num_seqs],
+            _ => unreachable!("Quant category mismatch in referenced_vregs"),
+        }
+    }
+
+    fn referenced_vregs_gpucomma(instr: &VmInstr) -> Vec<VRegId> {
+        // GpuComm cluster a (8 arms) — ARCH-LOWER-DISPATCH-LAYERING P3 (机械抽取)
+        match instr {
+            VmInstr::AsyncCopy { dst, src, .. } => vec![*dst, *src],
+            VmInstr::PageTableAddr { .. } => vec![],
+            VmInstr::PageTableKVWrite { .. } => vec![],
+            VmInstr::PageTableKVWriteQuant { .. } => vec![],
+            VmInstr::WarpSync => vec![],
+            VmInstr::AsyncWait { .. } => vec![],
+            VmInstr::SharedMemAlloc { .. } => vec![],
+            VmInstr::SharedMemStore { src, .. } => {
+                                let mut v = vec![*src];
+                                // Extract VReg from offset if needed
+                                if let VmInstr::SharedMemStore { dst_offset, .. } = instr {
+                                    v.extend(Self::offset_vregs(dst_offset));
+                                }
+                                v
+                            },
+            _ => Self::referenced_vregs_gpucommb(instr),
+        }
+    }
+
+    fn referenced_vregs_gpucommb(instr: &VmInstr) -> Vec<VRegId> {
+        // GpuComm cluster b (8 arms) — ARCH-LOWER-DISPATCH-LAYERING P3 (机械抽取)
+        match instr {
+            VmInstr::SharedMemLoad { dst, .. } => {
+                                let mut v = vec![*dst];
+                                // Extract VReg from offset if needed
+                                if let VmInstr::SharedMemLoad { src_offset, .. } = instr {
+                                    v.extend(Self::offset_vregs(src_offset));
+                                }
+                                v
+                            },
+            VmInstr::SharedMemAsyncStore { src, .. } => {
+                                let mut v = vec![*src];
+                                if let VmInstr::SharedMemAsyncStore { dst_offset, .. } = instr {
+                                    v.extend(Self::offset_vregs(dst_offset));
+                                }
+                                v
+                            },
+            VmInstr::SharedMemAsyncWaitGroup { .. } => vec![],
+            VmInstr::WeightPrefetchAsync { weight_base, .. } => vec![*weight_base],
+            VmInstr::WeightPrefetchWait { .. } => vec![],
+            VmInstr::BlockSync => vec![],
+            VmInstr::WarpReduce { src, dst, .. } => vec![*src, *dst],
+            VmInstr::ClusterBarrierInit { .. } => vec![],
+            _ => Self::referenced_vregs_gpucommc(instr),
+        }
+    }
+
+    fn referenced_vregs_gpucommc(instr: &VmInstr) -> Vec<VRegId> {
+        // GpuComm cluster c (8 arms) — ARCH-LOWER-DISPATCH-LAYERING P3 (机械抽取)
+        match instr {
+            VmInstr::ClusterStore { src, .. } => {
+                                let mut v = vec![*src];
+                                if let VmInstr::ClusterStore { offset, .. } = instr {
+                                    v.extend(Self::offset_vregs(offset));
+                                }
+                                v
+                            },
+            VmInstr::ClusterLoad { dst, .. } => {
+                                let mut v = vec![*dst];
+                                if let VmInstr::ClusterLoad { offset, .. } = instr {
+                                    v.extend(Self::offset_vregs(offset));
+                                }
+                                v
+                            },
+            VmInstr::SharedMemSwizzle { dst, raw_addr, .. } => vec![*dst, *raw_addr],
+            VmInstr::WarpRoleDeclare { .. } => vec![],
+            VmInstr::WarpBarrierArrive { .. } => vec![],
+            VmInstr::WarpBarrierWait { .. } => vec![],
             #[cfg(feature = "nccl")]
             VmInstr::AllReduceChunk { sendbuf, recvbuf, count, rank, world_size, chunk_idx, .. } => vec![*sendbuf, *recvbuf, *count, *rank, *world_size, *chunk_idx],
             #[cfg(feature = "nccl")]
             VmInstr::CommBarrier { thread_count, .. } => vec![*thread_count],
+            _ => Self::referenced_vregs_gpucommd(instr),
+        }
+    }
+
+    fn referenced_vregs_gpucommd(instr: &VmInstr) -> Vec<VRegId> {
+        // GpuComm cluster d (8 arms) — ARCH-LOWER-DISPATCH-LAYERING P3 (机械抽取)
+        match instr {
             #[cfg(feature = "nccl")]
             VmInstr::NvlinkAsyncCopy { dst, src, len, .. } => vec![*dst, *src, *len],
             #[cfg(feature = "nccl")]
@@ -935,13 +1049,80 @@ impl<'a> RegAllocator<'a> {
             VmInstr::PageMigrationLock { dst, entry_addr } => vec![*dst, *entry_addr],
             #[cfg(feature = "nccl")]
             VmInstr::PageMigrationUnlock { entry_addr } => vec![*entry_addr],
+            _ => Self::referenced_vregs_gpucomme(instr),
+        }
+    }
+
+    fn referenced_vregs_gpucomme(instr: &VmInstr) -> Vec<VRegId> {
+        // GpuComm cluster e (4 arms) — ARCH-LOWER-DISPATCH-LAYERING P3 (机械抽取)
+        match instr {
             #[cfg(feature = "nccl")]
             VmInstr::PageLocationUpdate { entry_addr, new_location, .. } => vec![*entry_addr, *new_location],
             VmInstr::TmaDescriptorInit { .. } => vec![],
             VmInstr::Tma2DCopy { coord_x, coord_y, .. } => vec![*coord_x, *coord_y],
             VmInstr::BarrierInit { .. } => vec![],
+            _ => unreachable!("GpuComm category mismatch in referenced_vregs"),
         }
     }
+
+    fn referenced_vregs_samplinga(instr: &VmInstr) -> Vec<VRegId> {
+        // Sampling cluster a (8 arms) — ARCH-LOWER-DISPATCH-LAYERING P3 (机械抽取)
+        match instr {
+            VmInstr::BatchSeqIdLookup { dst, pt_offset_out, token_index, batch_ctx_ptr } => vec![*dst, *pt_offset_out, *token_index, *batch_ctx_ptr],
+            VmInstr::BatchPerSeqArgmax { dst, seq_id, logits_flat_ptr, .. } => vec![*dst, *seq_id, *logits_flat_ptr],
+            VmInstr::BatchPerSeqStopCheck { seq_id, token_id, batch_ctx_ptr } => vec![*seq_id, *token_id, *batch_ctx_ptr],
+            // Mega-kernel instructions — must reference all VReg operands
+            // to keep their live intervals correct across Argmax/StoreToken/etc.
+            VmInstr::Argmax { dst, logits_ptr, .. } => vec![*dst, *logits_ptr],
+            VmInstr::TemperatureScale { logits_ptr, temp_ptr, .. } => vec![*logits_ptr, *temp_ptr],
+            VmInstr::StoreToken { token_id, output_buf, counter, input_ids_ptr, prompt_len_bytes } => vec![*token_id, *output_buf, *counter, *input_ids_ptr, *prompt_len_bytes],
+            VmInstr::CheckStopCondition { token_id, counter, eos_ptr, max_tokens_ptr } => vec![*token_id, *counter, *eos_ptr, *max_tokens_ptr],
+            // ── Sampling instructions ──
+            VmInstr::SoftmaxReduceMax { dst, logits_ptr, .. } => vec![*dst, *logits_ptr],
+            _ => Self::referenced_vregs_samplingb(instr),
+        }
+    }
+
+    fn referenced_vregs_samplingb(instr: &VmInstr) -> Vec<VRegId> {
+        // Sampling cluster b (7 arms) — ARCH-LOWER-DISPATCH-LAYERING P3 (机械抽取)
+        match instr {
+            VmInstr::SoftmaxExpSum { sum_dst, logits_ptr, max_val, .. } => vec![*sum_dst, *logits_ptr, *max_val],
+            VmInstr::SoftmaxNormalize { logits_ptr, sum_val, .. } => vec![*logits_ptr, *sum_val],
+            VmInstr::SampleTopKFilter { probs_ptr, indices_ptr, k_ptr, .. } => vec![*probs_ptr, *indices_ptr, *k_ptr],
+            VmInstr::SampleTopPFilter { probs_ptr, p_ptr, .. } => vec![*probs_ptr, *p_ptr],
+            VmInstr::SampleMultinomial { dst, probs_ptr, rng_state_ptr, .. } => vec![*dst, *probs_ptr, *rng_state_ptr],
+            VmInstr::WarpPRNG { dst, rng_state_ptr } => vec![*dst, *rng_state_ptr],
+            VmInstr::SeqIdLookup { dst, token_index, seq_meta_base, num_seqs, .. } => vec![*dst, *token_index, *seq_meta_base, *num_seqs],
+            _ => unreachable!("Sampling category mismatch in referenced_vregs"),
+        }
+    }
+
+    fn referenced_vregs_misca(instr: &VmInstr) -> Vec<VRegId> {
+        // Misc cluster a (8 arms) — ARCH-LOWER-DISPATCH-LAYERING P3 (机械抽取)
+        match instr {
+            VmInstr::DeclareVReg { id, .. } => vec![*id],
+            VmInstr::ReleaseVReg { id } => vec![*id],
+            VmInstr::LoadCallbackEntry { table_ptr, fn_ptr_out, ctx_out, .. } => vec![*table_ptr, *fn_ptr_out, *ctx_out],
+            VmInstr::NativeCall { ret_val, fn_ptr, ctx_ptr } => vec![*ret_val, *fn_ptr, *ctx_ptr],
+            VmInstr::Comment(_) => vec![],
+            VmInstr::HotpatchSlot { .. } => vec![],
+            VmInstr::Lz4Decode { src_ptr, dst_ptr, compressed_size, .. } => vec![*src_ptr, *dst_ptr, *compressed_size],
+            VmInstr::BitPackRleDecode { src_ptr, dst_ptr, compressed_size, .. } => vec![*src_ptr, *dst_ptr, *compressed_size],
+            _ => Self::referenced_vregs_miscb(instr),
+        }
+    }
+
+    fn referenced_vregs_miscb(instr: &VmInstr) -> Vec<VRegId> {
+        // Misc cluster b (4 arms) — ARCH-LOWER-DISPATCH-LAYERING P3 (机械抽取)
+        match instr {
+            VmInstr::DebugBreakpoint { .. } => vec![],
+            VmInstr::DebugMarker { .. } => vec![],
+            VmInstr::DebugProbe { vreg, .. } => vec![*vreg],
+            VmInstr::DebugBreakIf { cond_gpr, .. } => vec![*cond_gpr],
+            _ => unreachable!("Misc category mismatch in referenced_vregs"),
+        }
+    }
+
 
     /// 线性扫描分配。
     pub fn allocate(&self, program: &VmProgram) -> Result<RegAllocation, String> {
@@ -1376,8 +1557,23 @@ impl<'a> RegAllocator<'a> {
 
     /// Brief description of an instruction for diagnostics
     fn instr_brief(instr: &VmInstr) -> &'static str {
+                match instr.category() {
+            super::vm_instr_category::InstrCategory::Memory => Self::instr_brief_memorya(instr),
+            super::vm_instr_category::InstrCategory::Arith => Self::instr_brief_aritha(instr),
+            super::vm_instr_category::InstrCategory::Control => Self::instr_brief_controla(instr),
+            super::vm_instr_category::InstrCategory::Quant => Self::instr_brief_quanta(instr),
+            super::vm_instr_category::InstrCategory::Sampling => Self::instr_brief_samplinga(instr),
+            super::vm_instr_category::InstrCategory::Misc => Self::instr_brief_misca(instr),
+            _ => std::any::type_name::<VmInstr>()
+                                .split("::")
+                                .last()
+                                .unwrap_or("VmInstr"),
+        }
+    }
+
+    fn instr_brief_memorya(instr: &VmInstr) -> &'static str {
+        // Memory cluster a (8 arms) — ARCH-LOWER-DISPATCH-LAYERING P3 (机械抽取)
         match instr {
-            VmInstr::DeclareVReg { .. } => "DeclareVReg",
             VmInstr::VecLoad { .. } => "VecLoad",
             VmInstr::VecStore { .. } => "VecStore",
             VmInstr::VecNarrow { .. } => "VecNarrow",
@@ -1385,32 +1581,91 @@ impl<'a> RegAllocator<'a> {
             VmInstr::Mov { .. } => "Mov",
             VmInstr::Broadcast { .. } => "Broadcast",
             VmInstr::LoadPtr { .. } => "LoadPtr",
+            VmInstr::ScalarLoad { .. } => "ScalarLoad",
+            _ => Self::instr_brief_memoryb(instr),
+        }
+    }
+
+    fn instr_brief_memoryb(instr: &VmInstr) -> &'static str {
+        // Memory cluster b (4 arms) — ARCH-LOWER-DISPATCH-LAYERING P3 (机械抽取)
+        match instr {
+            VmInstr::ScalarStore { .. } => "ScalarStore",
+            VmInstr::VecScalarStore { .. } => "VecScalarStore",
+            VmInstr::AddPtr { .. } => "AddPtr",
+            VmInstr::IntMulStride { .. } => "IntMulStride",
+            _ => std::any::type_name::<VmInstr>()
+                                .split("::")
+                                .last()
+                                .unwrap_or("VmInstr"),
+        }
+    }
+
+    fn instr_brief_aritha(instr: &VmInstr) -> &'static str {
+        // Arith cluster a (6 arms) — ARCH-LOWER-DISPATCH-LAYERING P3 (机械抽取)
+        match instr {
             VmInstr::VecBinOp { .. } => "VecBinOp",
             VmInstr::VecUnaryOp { .. } => "VecUnaryOp",
             VmInstr::Fma { .. } => "Fma",
             VmInstr::HReduce { .. } => "HReduce",
             VmInstr::Accumulate { .. } => "Accumulate",
+            VmInstr::GprBinOp { .. } => "GprBinOp",
+            _ => std::any::type_name::<VmInstr>()
+                                .split("::")
+                                .last()
+                                .unwrap_or("VmInstr"),
+        }
+    }
+
+    fn instr_brief_controla(instr: &VmInstr) -> &'static str {
+        // Control cluster a (2 arms) — ARCH-LOWER-DISPATCH-LAYERING P3 (机械抽取)
+        match instr {
             VmInstr::LoopBegin { .. } => "LoopBegin",
             VmInstr::LoopEnd => "LoopEnd",
-            VmInstr::ScalarLoad { .. } => "ScalarLoad",
-            VmInstr::ScalarStore { .. } => "ScalarStore",
-            VmInstr::VecScalarStore { .. } => "VecScalarStore",
+            _ => std::any::type_name::<VmInstr>()
+                                .split("::")
+                                .last()
+                                .unwrap_or("VmInstr"),
+        }
+    }
+
+    fn instr_brief_quanta(instr: &VmInstr) -> &'static str {
+        // Quant cluster a (2 arms) — ARCH-LOWER-DISPATCH-LAYERING P3 (机械抽取)
+        match instr {
+            VmInstr::GgufSubScaleLoad { .. } => "GgufSubScaleLoad",
+            VmInstr::GgufKQuantScaleLoad { .. } => "GgufKQuantScaleLoad",
+            _ => std::any::type_name::<VmInstr>()
+                                .split("::")
+                                .last()
+                                .unwrap_or("VmInstr"),
+        }
+    }
+
+    fn instr_brief_samplinga(instr: &VmInstr) -> &'static str {
+        // Sampling cluster a (4 arms) — ARCH-LOWER-DISPATCH-LAYERING P3 (机械抽取)
+        match instr {
             VmInstr::Argmax { .. } => "Argmax",
             VmInstr::StoreToken { .. } => "StoreToken",
             VmInstr::CheckStopCondition { .. } => "CheckStopCondition",
-            VmInstr::AddPtr { .. } => "AddPtr",
-            VmInstr::GprBinOp { .. } => "GprBinOp",
-            VmInstr::GgufSubScaleLoad { .. } => "GgufSubScaleLoad",
-            VmInstr::GgufKQuantScaleLoad { .. } => "GgufKQuantScaleLoad",
-            VmInstr::IntMulStride { .. } => "IntMulStride",
             VmInstr::TemperatureScale { .. } => "TemperatureScale",
-            VmInstr::Comment(_) => "Comment",
             _ => std::any::type_name::<VmInstr>()
-                .split("::")
-                .last()
-                .unwrap_or("VmInstr"),
+                                .split("::")
+                                .last()
+                                .unwrap_or("VmInstr"),
         }
     }
+
+    fn instr_brief_misca(instr: &VmInstr) -> &'static str {
+        // Misc cluster a (2 arms) — ARCH-LOWER-DISPATCH-LAYERING P3 (机械抽取)
+        match instr {
+            VmInstr::DeclareVReg { .. } => "DeclareVReg",
+            VmInstr::Comment(_) => "Comment",
+            _ => std::any::type_name::<VmInstr>()
+                                .split("::")
+                                .last()
+                                .unwrap_or("VmInstr"),
+        }
+    }
+
 
     /// D6: Spill layout consistency validation (ARCH-VM-SPILL-LAYOUT)。
     ///
