@@ -25,3 +25,6 @@ include!("e2e_tests_fragments/p05_dtype_matrix_tests.inc.rs");
 
 #[cfg(test)]
 include!("e2e_tests_fragments/p05_dtype_matrix_norm_tests.inc.rs");
+
+#[cfg(test)]
+include!("e2e_tests_fragments/p05_dtype_matrix_attention_tests.inc.rs");
