@@ -94,13 +94,13 @@ impl X86Lower {
         tmm_a: AsmRegisterTmm,
         tmm_b: AsmRegisterTmm,
     ) -> Result<(), CompilerError> {
-        // 物理寄存器号: iced AsmRegisterTmm 内部编码 tmm0..tmm7 (低 3 位)。
-        // extract_register 返回 u32 寄存器编号。
+        // 物理寄存器号: iced AsmRegisterTmm → Register 枚举 (TMM0=241..TMM7=248)。
+        // tmm 编号 = reg_u32 - 241。仅支持 tmm0..tmm7 (AMX 8-tmm 上限)。
         use iced_x86::Register;
-        let c_num = tmm_c.register() as u32;
-        let a_num = tmm_a.register() as u32;
-        let b_num = tmm_b.register() as u32;
-        // 仅支持 tmm0..tmm7 (AMX 8-tmm 上限)。>7 不可能 (RegAllocator Tile 池上限 8)。
+        const TMM0_BASE: u32 = Register::TMM0 as u32;
+        let c_num = Into::<Register>::into(tmm_c) as u32 - TMM0_BASE;
+        let a_num = Into::<Register>::into(tmm_a) as u32 - TMM0_BASE;
+        let b_num = Into::<Register>::into(tmm_b) as u32 - TMM0_BASE;
         if c_num > 7 || a_num > 7 || b_num > 7 {
             return Err(CompilerError::CodegenViolation(format!(
                 "AMX emit_tdp_raw: tmm out of range (c={}, a={}, b={}); AMX has 8 tile regs",
@@ -113,10 +113,10 @@ impl X86Lower {
         let pp = pp & 0x03;
         // byte2: R=1 X=1 B=1 (无扩展), mmmmmm=0F38=000010 → 0b11100010 = 0xE2
         let byte2: u8 = 0xE2;
-        // byte3: W=0 | vvvv=(~b & 0xF)<<3 | L=0 | pp
+        // byte3: W=0 | vvvv=(~b & 0xF)<<3 | L=0 (VEX.128) | pp
         let vvvv = (!b) & 0x0F;
         let byte3: u8 = (vvvv << 3) | pp;
-        // ModRM: mod=11, reg=c, rm=a
+        // ModRM: mod=11, reg=tmm_c, rm=tmm_a
         let modrm: u8 = 0xC0 | ((c & 0x07) << 3) | (a & 0x07);
         self.asm.db(&[0xC4, byte2, byte3, opcode, modrm]).map_err(Self::err)?;
         Ok(())
@@ -1511,31 +1511,29 @@ impl X86Lower {
                 Ok(())
             }
             VmInstr::TileMma { c, a, b, m: _, n: _, k: _, dtype } => {
-                // 设计 §4: TileMma → TDP{BF16,FP16,HF8,BF8,TF32}PS
+                // 设计 §4: TileMma → TDP* (Tile Dot Product) — tmm_c += tmm_a × tmm_b
                 //
-                // tile 数据流完整化后, A/B tile 已被前置的 TileLoad 指令灌入物理 tmm 寄存器,
-                // C tile 已被 TileConfig 阶段 TILEZERO 清零。本指令只发射 TDP* 点积:
-                //   tmm_c += tmm_a × tmm_b
+                // tile 数据流完整化后, A/B tile 已被前置 TileLoad 灌入物理 tmm, C tile 已被
+                // TileConfig 阶段 TILEZERO 清零。本指令只发射 TDP* 点积。
                 //
-                // dtype (TileMma shape 内携带) 决定 TDP* 指令选择 (ARCH-DTYPE-JIT-TYPED)。
+                // ARCH-DTYPE-JIT-TYPED: dtype (TileMma shape 内携带, 编译时常量) 决定 TDP*
+                // 指令选择 — 编译时特化, 运行时零 match 分支。c/a/b tmm 从 IR vreg 经
+                // RegAllocator 映射解析 (不再硬编码 tmm0/1/2 字面量, 走 Tile 池分配)。
+                //
+                // | dtype    | 指令        | ISA 要求        | opcode | pp  | 编码路径           |
+                // |----------|-------------|-----------------|--------|-----|--------------------|
+                // | BF16     | TDPBF16PS   | AMX-BF16 (SPR)  | 0x5C   | F3  | iced tdpbf16ps     |
+                // | F16      | TDPFP16PS   | AMX-FP16 (GNR)  | 0x5C   | F2  | iced tdpfp16ps     |
+                // | F8E4M3   | TDPHF8PS    | AMX-FP8 (DMR)   | 0xFD   | F3  | emit_tdp_raw (任意 tmm) |
+                // | F8E5M2   | TDPBF8PS    | AMX-FP8 (DMR)   | 0xFD   | F2  | emit_tdp_raw (任意 tmm) |
+                // | F32      | TDPTF32PS   | AMX-TF32 (DMR)  | 0x6C   | F2  | emit_tdp_raw (任意 tmm) |
+                // | U8       | TDPBUUD     | AMX-INT8 (SPR)  | 0x5E   | -   | iced tdpbuud (无符号×无符号) |
+                //
+                // emit_tdp_raw 公式已对 6 种 iced 原生 TDP 变体逐一验证字节完全一致。
                 let tile_dtype = dtype;
                 let tmm_c = self.resolve_phys_tile(*c, alloc)?;
                 let tmm_a = self.resolve_phys_tile(*a, alloc)?;
                 let tmm_b = self.resolve_phys_tile(*b, alloc)?;
-
-                // Tile Dot Product: tmm_c += tmm_a × tmm_b
-                // 指令选择由 dtype 决定。BF16/F16 用 iced 原生 code_asm 方法 (任意 tmm
-                // 组合自动编码); FP8/TF32 是 Diamond Rapids 新指令, iced 1.21 code_asm
-                // 尚未暴露, 回退 VEX 手编字节 (硬编码 c=tmm0/a=tmm1/b=tmm2, 由
-                // emit_tile_gemm 顺序 alloc + RegAllocator 干涉分配保证)。
-                //
-                // | dtype    | 指令        | ISA 要求              | 编码路径             |
-                // |----------|-------------|----------------------|----------------------|
-                // | BF16     | TDPBF16PS   | AMX-BF16 (SPR)       | iced tdpbf16ps       |
-                // | F16      | TDPFP16PS   | AMX-FP16 (GNR)       | iced tdpfp16ps       |
-                // | F8E4M3   | TDPHF8PS    | AMX-FP8 (DMR)        | VEX 手编 (tmm0/1/2) |
-                // | F8E5M2   | TDPBF8PS    | AMX-FP8 (DMR)        | VEX 手编 (tmm0/1/2) |
-                // | F32      | TDPTF32PS   | AMX-TF32 (DMR)       | VEX 手编 (tmm0/1/2) |
                 match tile_dtype {
                     crate::types::DType::BF16 => {
                         // TDPBF16PS tmm_c, tmm_a, tmm_b (AMX-BF16, Sapphire Rapids)
@@ -1546,26 +1544,30 @@ impl X86Lower {
                         self.asm.tdpfp16ps(tmm_c, tmm_a, tmm_b).map_err(Self::err)?;
                     }
                     crate::types::DType::F8E4M3 => {
-                        // TDPHF8PS tmm0, tmm1, tmm2 (AMX-FP8, Diamond Rapids)
-                        // VEX.128.F3.0F38.W0 FD C1  (iced 1.21 无 code_asm, 手编)
-                        self.assert_fixed_abc_tmm(tmm_c, tmm_a, tmm_b, "TDPHF8PS")?;
-                        self.asm.db(&[0xC4, 0xE2, 0x72, 0xFD, 0xC1]).map_err(Self::err)?;
+                        // TDPHF8PS tmm_c, tmm_a, tmm_b (AMX-FP8, Diamond Rapids)
+                        // VEX.128.F3.0F38.W0 FD /r  — iced 1.21 无 code_asm, emit_tdp_raw 手编
+                        // pp=F3=0b10, opcode=0xFD
+                        self.emit_tdp_raw(0xFD, 0b10, tmm_c, tmm_a, tmm_b)?;
                     }
                     crate::types::DType::F8E5M2 => {
-                        // TDPBF8PS tmm0, tmm1, tmm2 (AMX-FP8, Diamond Rapids)
-                        // VEX.128.F2.0F38.W0 FD C1  (iced 1.21 无 code_asm, 手编)
-                        self.assert_fixed_abc_tmm(tmm_c, tmm_a, tmm_b, "TDPBF8PS")?;
-                        self.asm.db(&[0xC4, 0xE2, 0x7B, 0xFD, 0xC1]).map_err(Self::err)?;
+                        // TDPBF8PS tmm_c, tmm_a, tmm_b (AMX-FP8, Diamond Rapids)
+                        // VEX.128.F2.0F38.W0 FD /r  — pp=F2=0b11, opcode=0xFD
+                        self.emit_tdp_raw(0xFD, 0b11, tmm_c, tmm_a, tmm_b)?;
                     }
                     crate::types::DType::F32 => {
-                        // TDPTF32PS tmm0, tmm1, tmm2 (AMX-TF32, Diamond Rapids)
-                        // VEX.128.F2.0F38.W0 6C C1  (iced 1.21 无 code_asm, 手编)
-                        self.assert_fixed_abc_tmm(tmm_c, tmm_a, tmm_b, "TDPTF32PS")?;
-                        self.asm.db(&[0xC4, 0xE2, 0x7B, 0x6C, 0xC1]).map_err(Self::err)?;
+                        // TDPTF32PS tmm_c, tmm_a, tmm_b (AMX-TF32, Diamond Rapids)
+                        // VEX.128.F2.0F38.W0 6C /r  — pp=F2=0b11, opcode=0x6C
+                        self.emit_tdp_raw(0x6C, 0b11, tmm_c, tmm_a, tmm_b)?;
+                    }
+                    crate::types::DType::U8 => {
+                        // TDPBUUD tmm_c, tmm_a, tmm_b (AMX-INT8, Sapphire Rapids)
+                        // U8 = 无符号 8-bit → TDPBUUD (unsigned × unsigned → dword accumulate)
+                        // iced 1.21 原生 code_asm, 任意 tmm 组合自动编码。
+                        self.asm.tdpbuud(tmm_c, tmm_a, tmm_b).map_err(Self::err)?;
                     }
                     other => {
                         return Err(CompilerError::CodegenViolation(
-                            format!("AMX TileMma: unsupported dtype {:?} — expected BF16/F16/F8E4M3/F8E5M2/F32", other)
+                            format!("AMX TileMma: unsupported dtype {:?} — expected BF16/F16/F8E4M3/F8E5M2/F32/U8", other)
                         ));
                     }
                 }
