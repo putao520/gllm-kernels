@@ -14,9 +14,10 @@
 //! | gfx908+ | v_mfma_f32_16x16x16 | LDS | CDNA MFMA v1 |
 //! | gfx950 | v_mfma_f32_32x32x16 | LDS 160KB | CDNA4 MFMA v2, FP8/FP4 |
 //!
-//! 代码组织 (include! 模式 — 编译为单模块，物理分散到 5 个片段):
+//! 代码组织 (include! 模式 — 编译为单模块，物理分散到 6 个片段):
 //! - `gpu_lower/prologue.inc.rs`     — GpuLower struct + 构造 + prologue/epilogue
-//! - `gpu_lower/lower_instr.inc.rs`  — lower_instr 巨型 match (PTX/HIP/MSL 分发)
+//! - `gpu_lower/lower_instr.inc.rs`  — lower_instr L0 分类 dispatch (ARCH-LOWER-DISPATCH-LAYERING)
+//! - `gpu_lower/lower_instr_dispatch.inc.rs` — L1 变体路由 + L2 叶子 emit (PTX/HIP/MSL 分发)
 //! - `gpu_lower/lower_gpu.inc.rs`    — GPU 特化解码 (LZ4/BitPackRle/MXFP4/NVFP4/KIVI) + finalize
 //! - `gpu_lower/quant_load.inc.rs`   — 量化 block/biplane load lowering
 //! - `gpu_lower/tests.inc.rs`        — 测试模块
@@ -75,6 +76,7 @@ pub struct GpuLower {
 
 include!("gpu_lower/prologue.inc.rs");
 include!("gpu_lower/lower_instr.inc.rs");
+include!("gpu_lower/lower_instr_dispatch.inc.rs");
 include!("gpu_lower/lower_gpu.inc.rs");
 include!("gpu_lower/quant_load.inc.rs");
 

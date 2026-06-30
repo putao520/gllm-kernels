@@ -8,10 +8,11 @@
 //!   2. SVE2 — 可伸缩谓词循环 WHILELT+LD1W/ST1W/FADD predicated, 自动 tail 处理
 //!   3. SME2 — ZA tile outer-product FMOPA + multi-vec FMLA + MOVA slice 读取
 //!
-//! 代码组织 (include! 模式 — 编译为单模块，物理分散到 5 个片段):
+//! 代码组织 (include! 模式 — 编译为单模块，物理分散到 6 个片段):
 //! - `aarch64_lower/helpers.inc.rs`       — 构造器 + resolve + emit helpers
 //! - `aarch64_lower/emit_math.inc.rs`     — emit_f32_broadcast + exp + fp8 + quant 数学
-//! - `aarch64_lower/lower_instr.inc.rs`   — lower_instr mega-match
+//! - `aarch64_lower/lower_instr.inc.rs`   — lower_instr L0 分类 dispatch (ARCH-LOWER-DISPATCH-LAYERING)
+//! - `aarch64_lower/lower_instr_dispatch.inc.rs` — L1 变体路由 + L2 叶子 emit
 //! - `aarch64_lower/finalize_quant.inc.rs` — finalize + quant_load + biplane_load
 //! - `aarch64_lower/tests.inc.rs`         — 测试模块
 
@@ -107,6 +108,7 @@ fn dot_dtype_is_fp4(dt: DotDtype) -> bool {
 include!("aarch64_lower/helpers.inc.rs");
 include!("aarch64_lower/emit_math.inc.rs");
 include!("aarch64_lower/lower_instr.inc.rs");
+include!("aarch64_lower/lower_instr_dispatch.inc.rs");
 include!("aarch64_lower/finalize_quant.inc.rs");
 
 #[cfg(test)]
