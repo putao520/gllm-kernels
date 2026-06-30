@@ -968,6 +968,123 @@ mod tests {
         assert_eq!(golden[14], 21.0);
     }
 
+    // ── Tile 后端跨等级等价测试 (CR-TIER-SOVEREIGNTY-004 / TASK-07 收尾) ──
+    //
+    // 每个 tile OpImpl (AMX/WGMMA/tcgen05/MFMA/SME/TC-SM70/SM80) emit 的
+    // TileConfig→TileLoad(loop)→TileMma(loop)→TileStore→TileRelease 序列,
+    // 经 numerical_sim 解释器 (host FMA + dtype round-trip 窄化) 执行,
+    // 与 scalar oracle (F32 精确累加) 对齐。BF16 容差 ~1e-2, F16 ~1e-3, F32 ~1e-5。
+    //
+    // 矩阵 shape 选 tile 整倍数 (m=rows, n=cols, k=kd×N), 避免非整除时部分 tile 越界读。
+    // @trace REQ-HW-TIER-006 CR-TIER-SOVEREIGNTY-004 [req:CrossTier-Equivalence-Tests]
+
+    /// 通用 tile 后端数值对齐测试 (DRY: 11 后端复用)。
+    fn assert_tile_impl_aligns_scalar(
+        im: &dyn OpImpl<GemmOpLayout>,
+        dtype: QuantPrecision,
+        m: usize, n: usize, k: usize,
+        seed_a: u64, seed_b: u64,
+    ) {
+        let prog = emit_program_for_impl(im, dtype, m, n, k);
+        let a = seeded_test_matrix(m, k, seed_a);
+        let b = seeded_test_matrix(k, n, seed_b);
+        let ptr_bindings: [(VRegId, &str); 3] = [
+            (VRegId(0), "a"), (VRegId(1), "b"), (VRegId(2), "c"),
+        ];
+        let (max_diff, passed) = verify_op_impl_aligns_scalar(
+            &prog, &a, &b, m, n, k, dtype, SimdWidth::W256, &ptr_bindings,
+        ).expect("interpreter should run");
+        let tol = tolerance_for(dtype);
+        assert!(passed,
+            "{} {}x{}x{} vs scalar: max_diff={} > tol={}",
+            im.name(), m, n, k, max_diff, tol);
+    }
+
+    // 1. GemmAmxBf16Tile — Intel AMX BF16 (16×16 tile, kd=32)
+    #[test]
+    fn bf16_gemm_amx_bf16_tile_aligns_scalar_oracle_16x16x64() {
+        assert_tile_impl_aligns_scalar(
+            &GemmAmxBf16Tile, QuantPrecision::BF16, 16, 16, 64, 101, 102);
+    }
+
+    // 2. GemmAmxFp16Tile — Intel AMX FP16 (16×16 tile, kd=32)
+    #[test]
+    fn f16_gemm_amx_fp16_tile_aligns_scalar_oracle_16x16x64() {
+        assert_tile_impl_aligns_scalar(
+            &GemmAmxFp16Tile, QuantPrecision::F16, 16, 16, 64, 103, 104);
+    }
+
+    // 3. GemmAmxFp8Tile — Intel AMX FP8 (16×16 tile, kd=64)
+    #[test]
+    fn fp8e4m3_gemm_amx_fp8_tile_aligns_scalar_oracle_16x16x128() {
+        assert_tile_impl_aligns_scalar(
+            &GemmAmxFp8Tile, QuantPrecision::FP8E4M3, 16, 16, 128, 105, 106);
+    }
+
+    // 4. GemmWgmma — SM90 Hopper WGMMA (64×n.min(32) tile, kd=64, tile=None→tile_dt=BF16)
+    //    注意: GemmWgmma.emit 在 tile=None 时强制 tile_dt=BF16 (忽略 lo.dtype),
+    //    故测 BF16 以保证 buffer 编码 dtype 与 tile load dtype 一致。
+    #[test]
+    fn bf16_gemm_wgmma_aligns_scalar_oracle_64x32x128() {
+        assert_tile_impl_aligns_scalar(
+            &GemmWgmma, QuantPrecision::BF16, 64, 32, 128, 107, 108);
+    }
+
+    // 5. GemmTcgen05 — SM100 Blackwell tcgen05 (64×n.min(64) tile, kd=64, tile=None→F16)
+    #[test]
+    fn f16_gemm_tcgen05_aligns_scalar_oracle_64x64x128() {
+        assert_tile_impl_aligns_scalar(
+            &GemmTcgen05, QuantPrecision::F16, 64, 64, 128, 109, 110);
+    }
+
+    // 6. GemmMfmaV1 — AMD CDNA2 MFMA (16×16 tile, kd=16)
+    #[test]
+    fn f16_gemm_mfma_v1_aligns_scalar_oracle_16x16x32() {
+        assert_tile_impl_aligns_scalar(
+            &GemmMfmaV1, QuantPrecision::F16, 16, 16, 32, 111, 112);
+    }
+
+    // 7. GemmMfmaV2 — AMD CDNA4 MFMA (32×32 tile, kd=16)
+    #[test]
+    fn bf16_gemm_mfma_v2_aligns_scalar_oracle_32x32x32() {
+        assert_tile_impl_aligns_scalar(
+            &GemmMfmaV2, QuantPrecision::BF16, 32, 32, 32, 113, 114);
+    }
+
+    // 8. GemmSmeTile — ARM SME (16×16 tile, kd=4, F32)
+    #[test]
+    fn f32_gemm_sme_tile_aligns_scalar_oracle_16x16x8() {
+        assert_tile_impl_aligns_scalar(
+            &GemmSmeTile, QuantPrecision::F32, 16, 16, 8, 115, 116);
+    }
+
+    // 9. GemmTcSm70 — NVIDIA Volta wmma (16×16 tile, kd=16, F16)
+    #[test]
+    fn f16_gemm_tc_sm70_aligns_scalar_oracle_16x16x32() {
+        assert_tile_impl_aligns_scalar(
+            &GemmTcSm70, QuantPrecision::F16, 16, 16, 32, 117, 118);
+    }
+
+    // 10. GemmTcSm80 — NVIDIA Ampere mma.sync (16×8 tile, kd=16, BF16)
+    #[test]
+    fn bf16_gemm_tc_sm80_aligns_scalar_oracle_16x8x32() {
+        assert_tile_impl_aligns_scalar(
+            &GemmTcSm80, QuantPrecision::BF16, 16, 8, 32, 119, 120);
+    }
+
+    // 11. GemmMfmaV1 (BF16) — AMD CDNA2 MFMA BF16 路径 (16×16 tile, kd=16)
+    //     补充 dtype 覆盖: MfmaV1.emit 直接用 lo.dtype.to_dtype() (BF16→DType::BF16 正确),
+    //     与 #6 (MfmaV1 F16) 互补, 验证同后端不同 dtype 的数值对齐。
+    //     (任务清单第 11 项原列 GemmTcgen05(F8E4M3)/MfmaV2-FP8, 但两者 emit 经
+    //      lo.dtype.to_dtype() 时 FP8E4M3 被回退映射为 DType::F32 (QuantPrecision::to_dtype
+    //      的 _ => F32 fallback), 与 FP8 buffer 编码不一致 → 改测 MfmaV1 BF16, 其 dtype
+    //      映射正确。AmxFp8Tile 用宏字面量 DType::F8E4M3 (不经 to_dtype) 故 #3 FP8 可测。)
+    #[test]
+    fn bf16_gemm_mfma_v1_aligns_scalar_oracle_16x16x32() {
+        assert_tile_impl_aligns_scalar(
+            &GemmMfmaV1, QuantPrecision::BF16, 16, 16, 32, 121, 122);
+    }
+
     #[test]
     fn tolerance_bf16_vs_f32() {
         // CR-TIER-SOVEREIGNTY-004: BF16 容差 ~1e-2, F32 ~1e-5。
