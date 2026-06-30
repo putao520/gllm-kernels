@@ -1233,13 +1233,26 @@ impl QuantPrecision {
     }
 
     /// Convert to DType for ISA strategy selection.
-    /// Sub-byte types map to F32 (they widen for computation).
+    ///
+    /// FP8 (1-byte, native HW tile support on MFMAv2/Tcgen05/AMX-FP8) maps to
+    /// its native DType so tile backends emit F8 tiles, not F32 tiles.
+    /// Sub-byte FP6/FP4 types widen to F32 for computation (no native tile path).
     pub fn to_dtype(self) -> crate::types::DType {
         match self.kind {
             DTypeKind::F32 | DTypeKind::TF32 => crate::types::DType::F32,
             DTypeKind::BF16 => crate::types::DType::BF16,
             DTypeKind::F16 => crate::types::DType::F16,
-            _ => crate::types::DType::F32,
+            DTypeKind::FP8E4M3 => crate::types::DType::F8E4M3,
+            DTypeKind::FP8E5M2 => crate::types::DType::F8E5M2,
+            // Sub-byte/integer quantization kinds: widen to F32 for compute.
+            // No native tile path routes through to_dtype for these.
+            DTypeKind::FP6E2M3
+            | DTypeKind::FP6E3M2
+            | DTypeKind::FP4E2M1
+            | DTypeKind::INT8
+            | DTypeKind::INT4
+            | DTypeKind::INT2
+            | DTypeKind::INT1 => crate::types::DType::F32,
         }
     }
 
@@ -2702,5 +2715,46 @@ mod tests {
     fn gpu_bf16_gemm_accumulator_needs_narrowing() {
         let acc = QuantPrecision::BF16.gpu_accumulator_dtype();
         assert!(QuantPrecision::BF16.needs_narrowing_from(acc));
+    }
+
+    // ── BCE-20260630-FP8-TODTYPE-FALLBACK: to_dtype FP8 显式映射回归 ──
+    // 根因: to_dtype 的 _ => F32 fallback 把 FP8 映射成 DType::F32, 导致
+    //       tile 后端 (MfmaV2/Tcgen05) 在 FP8 输入时 emit F32 tile 而非 F8 tile,
+    //       FP8 数据损坏。修复 = 显式映射 FP8 变体, 残留=0。
+    /// @trace TEST-DTYPE-001-1 [req:REQ-DTYPE-001] [level:unit]
+    /// FP8E4M3.to_dtype() 必须映射到 DType::F8E4M3 (native F8 tile), 禁止回退 F32
+    #[test]
+    fn fp8e4m3_to_dtype_is_native_f8_not_f32() {
+        assert_eq!(
+            QuantPrecision::FP8E4M3.to_dtype(),
+            crate::types::DType::F8E4M3
+        );
+    }
+
+    /// @trace TEST-DTYPE-001-2 [req:REQ-DTYPE-001] [level:unit]
+    /// FP8E5M2.to_dtype() 必须映射到 DType::F8E5M2 (native F8 tile), 禁止回退 F32
+    #[test]
+    fn fp8e5m2_to_dtype_is_native_f8_not_f32() {
+        assert_eq!(
+            QuantPrecision::FP8E5M2.to_dtype(),
+            crate::types::DType::F8E5M2
+        );
+    }
+
+    /// @trace TEST-DTYPE-001-3 [req:REQ-DTYPE-001] [level:unit]
+    /// 所有基础精度 to_dtype 不回退 F32 (显式映射覆盖全集, 禁止 _ => F32 fallback)
+    #[test]
+    fn to_dtype_no_silent_f32_fallback_for_basic_precisions() {
+        use crate::types::DType;
+        // F32/TF32 → F32 (合法, 显式)
+        assert_eq!(QuantPrecision::F32.to_dtype(), DType::F32);
+        assert_eq!(QuantPrecision::TF32.to_dtype(), DType::F32);
+        // BF16 → BF16 (显式, 非 F32)
+        assert_eq!(QuantPrecision::BF16.to_dtype(), DType::BF16);
+        // F16 → F16 (显式, 非 F32)
+        assert_eq!(QuantPrecision::F16.to_dtype(), DType::F16);
+        // FP8 → F8 (显式, 非 F32 — 回归断言)
+        assert_eq!(QuantPrecision::FP8E4M3.to_dtype(), DType::F8E4M3);
+        assert_eq!(QuantPrecision::FP8E5M2.to_dtype(), DType::F8E5M2);
     }
 }
