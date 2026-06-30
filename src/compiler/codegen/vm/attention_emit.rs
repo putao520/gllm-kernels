@@ -310,13 +310,17 @@ fn emit_softmax_update(
     running_sum: VRegId, softmax_body: &[TraceOp], sum_body: &[TraceOp],
     width: SimdWidth,
 ) -> (VRegId, VRegId, VRegId) {
-    let ss = super::auto_select::auto_lower_trace_raw(prog, softmax_body, &[running_max, score], width, QuantPrecision::F32)
+    // BCE-20260630-MIXED-P3: online softmax 的 running_max/running_sum/correction 是
+    // accumulate 位置，恒 F32（数值稳定性，与激活 dtype 无关）。accumulator_dtype() 显式
+    // 标注「这是累加精度非硬编码」，防 P4 grep 清理误删（三段式 accumulate 合法 F32）。
+    let acc_dtype = QuantPrecision::F32.accumulator_dtype();
+    let ss = super::auto_select::auto_lower_trace_raw(prog, softmax_body, &[running_max, score], width, acc_dtype)
         .expect("softmax auto_lower failed");
     let (new_max, correction, weight) = (ss[2], ss[4], ss[6]);
-    super::auto_select::auto_lower_trace_into(prog, sum_body, &[running_sum, correction, weight], running_sum, width, QuantPrecision::F32)
+    super::auto_select::auto_lower_trace_into(prog, sum_body, &[running_sum, correction, weight], running_sum, width, acc_dtype)
         .expect("sum update auto_lower failed");
     let identity = vec![TraceOp::Input(0)];
-    super::auto_select::auto_lower_trace_into(prog, &identity, &[new_max], running_max, width, QuantPrecision::F32)
+    super::auto_select::auto_lower_trace_into(prog, &identity, &[new_max], running_max, width, acc_dtype)
         .expect("max identity auto_lower failed");
     (new_max, correction, weight)
 }
@@ -432,7 +436,11 @@ fn emit_score_dot_cpu(
     page_header_ptr: Option<VRegId>,
 ) -> VRegId {
     let dot_acc = prog.alloc_vreg(VRegKind::Vec, width);
-    prog.emit(VmInstr::Broadcast { dst: dot_acc, src: ScalarExpr::Const(0.0), width, dtype });
+    // BCE-20260630-MIXED-P3: dot_acc/HReduce/scale 是 accumulate 位置，用 dtype.accumulator_dtype()
+    // 显式标注（三段式 accumulate 合法 F32，防 P4 grep 误删）。
+    // @trace ATTN-ACCUMULATOR-DTYPE [req:REQ-DTYPE-006] [level:unit]
+    let acc_dtype = dtype.accumulator_dtype();
+    prog.emit(VmInstr::Broadcast { dst: dot_acc, src: ScalarExpr::Const(0.0), width, dtype: acc_dtype });
     if hd_vecs > 0 {
         let dot_body = vec![TraceOp::Input(0), TraceOp::Input(1), TraceOp::Input(2), TraceOp::Fma(ValueId(0), ValueId(1), ValueId(2))];
         // Sparse/Auto modes: use Rust-level for loop to get compile-time channel_group index
@@ -447,7 +455,7 @@ fn emit_score_dot_cpu(
                     prog, k_vec, k_row, OffsetExpr::Const(d_off),
                     sparse_bitmap_val, d, width, dtype,
                 );
-                super::auto_select::auto_lower_trace_into(prog, &dot_body, &[q_vec, k_vec, dot_acc], dot_acc, width, QuantPrecision::F32)
+                super::auto_select::auto_lower_trace_into(prog, &dot_body, &[q_vec, k_vec, dot_acc], dot_acc, width, acc_dtype)
                     .expect("MHA dot FMA auto_lower failed");
             }
         } else if kv_load_mode == KvLoadMode::Auto && page_header_ptr.is_some() {
@@ -461,7 +469,7 @@ fn emit_score_dot_cpu(
                     prog, k_vec, k_row, OffsetExpr::Const(d_off),
                     width, dtype, lanes, sparse_bitmap_val, d, ph,
                 );
-                super::auto_select::auto_lower_trace_into(prog, &dot_body, &[q_vec, k_vec, dot_acc], dot_acc, width, QuantPrecision::F32)
+                super::auto_select::auto_lower_trace_into(prog, &dot_body, &[q_vec, k_vec, dot_acc], dot_acc, width, acc_dtype)
                     .expect("MHA dot FMA auto_lower failed");
             }
         } else {
@@ -479,18 +487,18 @@ fn emit_score_dot_cpu(
                         prog.emit(VmInstr::VecLoad { dst: k_vec, base: k_row, offset: OffsetExpr::LoopOffset(d_off), width, dtype , predicate: None });
                     }
                 }
-                super::auto_select::auto_lower_trace_into(prog, &dot_body, &[q_vec, k_vec, dot_acc], dot_acc, width, QuantPrecision::F32)
+                super::auto_select::auto_lower_trace_into(prog, &dot_body, &[q_vec, k_vec, dot_acc], dot_acc, width, acc_dtype)
                     .expect("MHA dot FMA auto_lower failed");
             });
         }
     }
     // HReduce + scale
     let hreduce_body = vec![TraceOp::Input(0), TraceOp::HReduce { src: ValueId(0), op: ReduceKind::Sum }];
-    let hr_slots = super::auto_select::auto_lower_trace_raw(prog, &hreduce_body, &[dot_acc], width, QuantPrecision::F32)
+    let hr_slots = super::auto_select::auto_lower_trace_raw(prog, &hreduce_body, &[dot_acc], width, acc_dtype)
         .expect("MHA HReduce auto_lower failed");
     prog.emit(VmInstr::Broadcast { dst: dot_acc, src: ScalarExpr::ExtractLane0(hr_slots[1]), width, dtype });
     let scale_body = vec![TraceOp::Input(0), TraceOp::Input(1), TraceOp::Mul(ValueId(0), ValueId(1))];
-    super::auto_select::auto_lower_trace_into(prog, &scale_body, &[dot_acc, scale_vec], dot_acc, width, QuantPrecision::F32)
+    super::auto_select::auto_lower_trace_into(prog, &scale_body, &[dot_acc, scale_vec], dot_acc, width, acc_dtype)
         .expect("MHA scale auto_lower failed");
     dot_acc
 }
@@ -506,6 +514,8 @@ fn emit_v_accumulate_cpu(
     sparse_bitmap_val: Option<VRegId>,
     page_header_ptr: Option<VRegId>,
 ) {
+    // BCE-20260630-MIXED-P3: o_acc 是 accumulate 位置，dtype.accumulator_dtype() 显式标注。
+    let acc_dtype = dtype.accumulator_dtype();
     for d in 0..hd_vecs {
         let d_off = d * vec_step;
         let v_vec = prog.alloc_vreg(VRegKind::Vec, width);
@@ -536,7 +546,7 @@ fn emit_v_accumulate_cpu(
             }
         }
         super::auto_select::auto_lower_trace_into(
-            prog, accumulate_body, &[o_acc[d], correction, weight, v_vec], o_acc[d], width, QuantPrecision::F32,
+            prog, accumulate_body, &[o_acc[d], correction, weight, v_vec], o_acc[d], width, acc_dtype,
         ).expect("V accumulate auto_lower failed");
     }
 }
@@ -546,12 +556,14 @@ fn emit_normalize_store(
     prog: &mut VmProgram, o_row: VRegId, o_acc: &[VRegId], running_sum: VRegId,
     hd_vecs: usize, vec_step: usize, width: SimdWidth, dtype: QuantPrecision,
 ) {
+    // BCE-20260630-MIXED-P3: running_sum/o_acc 是 accumulate 位置，dtype.accumulator_dtype() 标注。
+    let acc_dtype = dtype.accumulator_dtype();
     let recip_body = vec![TraceOp::Input(0), TraceOp::Recip(ValueId(0))];
-    super::auto_select::auto_lower_trace_into(prog, &recip_body, &[running_sum], running_sum, width, QuantPrecision::F32)
+    super::auto_select::auto_lower_trace_into(prog, &recip_body, &[running_sum], running_sum, width, acc_dtype)
         .expect("MHA recip auto_lower failed");
     let norm_body = vec![TraceOp::Input(0), TraceOp::Input(1), TraceOp::Mul(ValueId(0), ValueId(1))];
     for d in 0..hd_vecs {
-        let norm_slots = super::auto_select::auto_lower_trace_raw(prog, &norm_body, &[o_acc[d], running_sum], width, QuantPrecision::F32)
+        let norm_slots = super::auto_select::auto_lower_trace_raw(prog, &norm_body, &[o_acc[d], running_sum], width, acc_dtype)
             .expect("MHA norm auto_lower failed");
         prog.emit(VmInstr::VecStore { base: o_row, offset: OffsetExpr::Const(d * vec_step), src: norm_slots[2], width, dtype , predicate: None });
     }
@@ -703,6 +715,9 @@ pub(crate) fn emit_tiled_attention_inline(
 
     let lanes = width.f32_lanes().max(1);
     let elem = dtype.elem_bytes();
+    // BCE-20260630-MIXED-P3: dot_acc/running_max/running_sum/o_acc/HReduce 是 accumulate 位置，
+    // 用 dtype.accumulator_dtype() 显式标注（三段式 accumulate 合法 F32，防 P4 grep 误删）。
+    let acc_dtype = dtype.accumulator_dtype();
     let scale = 1.0f32 / (head_dim as f32).sqrt();
     let hd_vecs = head_dim / lanes;
     let scale_vec = prog.alloc_vreg(VRegKind::Vec, width);
@@ -813,7 +828,7 @@ pub(crate) fn emit_tiled_attention_inline(
             let (running_max, running_sum) = (prog.alloc_vreg(VRegKind::Vec, width), prog.alloc_vreg(VRegKind::Vec, width));
             if let Some(ref sv) = sink_init {
                 let identity = vec![TraceOp::Input(0)];
-                super::auto_select::auto_lower_trace_into(prog, &identity, &[*sv], running_max, width, QuantPrecision::F32).expect("sink init failed");
+                super::auto_select::auto_lower_trace_into(prog, &identity, &[*sv], running_max, width, acc_dtype).expect("sink init failed");
                 prog.emit(VmInstr::Broadcast { dst: running_sum, src: ScalarExpr::Const(1.0), width, dtype });
             } else {
                 prog.emit(VmInstr::Broadcast { dst: running_max, src: ScalarExpr::Const(f32::NEG_INFINITY), width, dtype });
@@ -850,7 +865,7 @@ pub(crate) fn emit_tiled_attention_inline(
                 let global_max = prog.alloc_vreg(VRegKind::Vec, width);
                 prog.emit(VmInstr::WarpReduce { op: ReduceOp::Max, src: running_max, dst: global_max, width });
                 let exp_body = vec![TraceOp::Input(0), TraceOp::Input(1), TraceOp::Sub(ValueId(0), ValueId(1)), TraceOp::Exp(ValueId(2))];
-                let exp_out = super::auto_select::auto_lower_trace_raw(prog, &exp_body, &[running_max, global_max], width, QuantPrecision::F32).expect("exp failed");
+                let exp_out = super::auto_select::auto_lower_trace_raw(prog, &exp_body, &[running_max, global_max], width, acc_dtype).expect("exp failed");
                 let correction = exp_out[3];
                 for &d in &o_acc { prog.emit(VmInstr::VecBinOp { dst: d, a: d, b: correction, op: VecOp::Mul, dtype }); }
                 let corrected_sum = prog.alloc_vreg(VRegKind::Vec, width);
@@ -929,14 +944,14 @@ pub(crate) fn emit_tiled_attention_inline(
                                 let (q_vec, k_vec) = (prog.alloc_vreg(VRegKind::Vec, width), prog.alloc_vreg(VRegKind::Vec, width));
                                 prog.emit(VmInstr::VecLoad { dst: q_vec, base: q_row, offset: OffsetExpr::LoopOffset(d_off), width, dtype , predicate: None });
                                 prog.emit(VmInstr::SharedMemLoad { dst: k_vec, name: smem_k.clone(), src_offset: smem_kv_off(read_buf, ki_inner_off, head_bytes, k_stride, d_off.0 as usize * vec_step / lanes * lanes * elem), width, dtype });
-                                super::auto_select::auto_lower_trace_into(prog, &dot_body, &[q_vec, k_vec, dot_acc], dot_acc, width, QuantPrecision::F32).expect("dot FMA failed");
+                                super::auto_select::auto_lower_trace_into(prog, &dot_body, &[q_vec, k_vec, dot_acc], dot_acc, width, acc_dtype).expect("dot FMA failed");
                             });
                         }
                         let hreduce_body = vec![TraceOp::Input(0), TraceOp::HReduce { src: ValueId(0), op: ReduceKind::Sum }];
-                        let hr_slots = super::auto_select::auto_lower_trace_raw(prog, &hreduce_body, &[dot_acc], width, QuantPrecision::F32).expect("HReduce failed");
+                        let hr_slots = super::auto_select::auto_lower_trace_raw(prog, &hreduce_body, &[dot_acc], width, acc_dtype).expect("HReduce failed");
                         prog.emit(VmInstr::Broadcast { dst: dot_acc, src: ScalarExpr::ExtractLane0(hr_slots[1]), width, dtype });
                         let scale_trace = vec![TraceOp::Input(0), TraceOp::Input(1), TraceOp::Mul(ValueId(0), ValueId(1))];
-                        super::auto_select::auto_lower_trace_into(prog, &scale_trace, &[dot_acc, scale_vec], dot_acc, width, QuantPrecision::F32).expect("scale failed");
+                        super::auto_select::auto_lower_trace_into(prog, &scale_trace, &[dot_acc, scale_vec], dot_acc, width, acc_dtype).expect("scale failed");
 
                         // TMEM staging (SM100+): write scaled attention score to TMEM,
                         // then read back for softmax. This reduces shared memory pressure
@@ -975,7 +990,7 @@ pub(crate) fn emit_tiled_attention_inline(
                         for d in 0..hd_vecs {
                             let v_vec = prog.alloc_vreg(VRegKind::Vec, width);
                             prog.emit(VmInstr::SharedMemLoad { dst: v_vec, name: smem_v.clone(), src_offset: smem_kv_off(read_buf, ki_inner_off, head_bytes, k_stride, d * vec_step), width, dtype });
-                            super::auto_select::auto_lower_trace_into(prog, &accumulate_body, &[o_acc[d], correction, weight, v_vec], o_acc[d], width, QuantPrecision::F32).expect("V accumulate failed");
+                            super::auto_select::auto_lower_trace_into(prog, &accumulate_body, &[o_acc[d], correction, weight, v_vec], o_acc[d], width, acc_dtype).expect("V accumulate failed");
                         }
                     }); // end inner ki
                     if use_tma {
