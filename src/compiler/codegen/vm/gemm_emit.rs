@@ -217,14 +217,18 @@ pub(crate) fn emit_gemm_blis_inline(
     trans_b: bool,
 ) -> Result<(), CompilerError> {
     let lanes = width.f32_lanes().max(1);
-    // BCE-20260629-003 (Pattern c): per-matrix dtype. BLIS 路径暂用 a_dtype 作 fallback
-    // (BLIS 在 SmolLM2 CPU 路径不走 naive emit，混合精度 BLIS 需要单独处理 b_elem stride)。
-    // SmolLM2 实际走 emit_gemm_inline_with_epilogue / trans_b，不走 BLIS。
-    let dtype = a_dtype;
-    let elem = dtype.elem_bytes();
-    let acc_dtype = dtype.accumulator_dtype();
-    let needs_narrow = dtype.needs_narrowing_from(acc_dtype);
-    let _ = (a_dtype, b_dtype, c_dtype);
+    // BCE-20260630-MIXED-P0.5: per-matrix dtype (ARCH-DTYPE-MIXED-PRECISION).
+    // @trace GEMM-BLIS-MIXED-DTYPE [req:REQ-DTYPE-006] [level:unit]
+    // 三段式 dtype 感知（mirror canonical trans_b path）：
+    //   A-load dtype=a_dtype (激活), B-load dtype=b_dtype (权重), C-store dtype=c_dtype
+    //   acc = c_dtype.accumulator_dtype() (三段式 accumulate 位置合法 F32)
+    //   VecNarrow 当 c_dtype != acc_dtype (BF16 输出窄化)
+    // 消除旧 `let dtype = a_dtype; let _ = (b_dtype, c_dtype);` 丢弃模式。
+    let a_elem = a_dtype.elem_bytes();
+    let b_elem = b_dtype.elem_bytes();
+    let c_elem = c_dtype.elem_bytes();
+    let acc_dtype = c_dtype.accumulator_dtype();
+    let needs_narrow = c_dtype.needs_narrowing_from(acc_dtype);
 
     // mr×nr 累加器
     let num_acc = mr * nr;
@@ -245,24 +249,25 @@ pub(crate) fn emit_gemm_blis_inline(
             }
 
             let k_unroll = unroll_factor.max(1).min(k);
-            let k_step = elem * k_unroll;
+            // A is row-major with inner dim k → A's K-step in bytes uses a_elem.
+            let k_step = a_elem * k_unroll;
             let k_iters = (k + k_unroll - 1) / k_unroll;
-            // B-matrix row stride in bytes. Row-major: n * elem_bytes.
-            // pack_map stride (e.g. PanelPack nr*elem) applies only when B has been
-            // physically repacked — which no runtime step currently does.
-            // Until a QuantGather-style repack is implemented, always use n * elem.
-            let b_row_stride: usize = if trans_b { elem } else { n * elem };
-            let b_col_stride: usize = if trans_b { k * elem } else { elem };
+            // B-matrix row/col stride in bytes — uses B's own elem (b_elem), independent
+            // of A's elem. pack_map stride applies only when B has been physically
+            // repacked — which no runtime step currently does. Until a QuantGather-style
+            // repack is implemented, always use b_elem.
+            let b_row_stride: usize = if trans_b { b_elem } else { n * b_elem };
+            let b_col_stride: usize = if trans_b { k * b_elem } else { b_elem };
             prog.emit_loop(BoundExpr::Const(k_iters), k_step, |prog, k_ctr, k_off| {
                 for u in 0..k_unroll {
-                    let u_byte_off = u * elem;
-                    let b_k_off = u * b_row_stride;
+                    let u_byte_off = u * a_elem; // A advances by a_elem per K element
+                    let b_k_off = u * b_row_stride; // B advances by b_row_stride per K element
                     for r in 0..mr_actual {
-                        let a_off = (i_block + r) * k * dtype.elem_bytes() + u_byte_off;
+                        let a_off = (i_block + r) * k * a_elem + u_byte_off;
                         prog.emit(VmInstr::Broadcast {
                             dst: a_broadcast,
                             src: ScalarExpr::MemLoad(a_ptr, OffsetExpr::loop_plus_const(k_off, a_off)),
-                            width, dtype,
+                            width, dtype: a_dtype,
                         });
                         for c in 0..nr_actual {
                             let b_off = j_block * b_col_stride + c * lanes * b_col_stride;
@@ -277,15 +282,15 @@ pub(crate) fn emit_gemm_blis_inline(
                                         )),
                                         Box::new(OffsetExpr::Const(b_off)),
                                     ),
-                                    width, dtype, predicate: None,
+                                    width, dtype: b_dtype, predicate: None,
                                 });
-                                // Direct FMA: dst = acc + a * b (in-place accumulate)
+                                // Direct FMA: dst = acc + a * b (in-place accumulate, F32 accumulator)
                                 prog.emit(VmInstr::Fma {
                                     dst: accs[acc_idx],
                                     acc: accs[acc_idx],
                                     a: a_broadcast,
                                     b: b_vec,
-                                    dtype,
+                                    dtype: acc_dtype,
                                 });
                             }
                         }
@@ -293,22 +298,22 @@ pub(crate) fn emit_gemm_blis_inline(
                 }
             });
 
-            // Store C (REQ-DTYPE-006: 窄化写回如果 acc_dtype != dtype)
+            // Store C (REQ-DTYPE-006: 窄化写回如果 acc_dtype != c_dtype)
             for r in 0..mr_actual {
                 for c in 0..nr_actual {
                     let acc_idx = r * nr_actual + c;
                     if acc_idx < accs.len() {
-                        let c_off = (i_block + r) * n * dtype.elem_bytes() + (j_block + c * lanes) * dtype.elem_bytes();
+                        let c_off = (i_block + r) * n * c_elem + (j_block + c * lanes) * c_elem;
                         let store_src = if needs_narrow {
                             let narrowed = prog.alloc_vreg(VRegKind::Vec, width);
-                            prog.emit(VmInstr::VecNarrow { dst: narrowed, src: accs[acc_idx], dst_dtype: dtype, src_dtype: acc_dtype, width });
+                            prog.emit(VmInstr::VecNarrow { dst: narrowed, src: accs[acc_idx], dst_dtype: c_dtype, src_dtype: acc_dtype, width });
                             narrowed
                         } else {
                             accs[acc_idx]
                         };
                         prog.emit(VmInstr::VecStore {
                             base: c_ptr, offset: OffsetExpr::Const(c_off), src: store_src, width,
-                            dtype, predicate: None,
+                            dtype: c_dtype, predicate: None,
                         });
                     }
                 }
@@ -332,10 +337,15 @@ pub(crate) fn emit_gemm_gpu_tiled_inline(
     a_dtype: QuantPrecision, b_dtype: QuantPrecision, c_dtype: QuantPrecision,
     _trans_b: bool,
 ) -> Result<(), CompilerError> {
-    let dtype = a_dtype;
-    let _ = (b_dtype, c_dtype);
-    let elem = dtype.elem_bytes();
-    let acc_dtype = dtype.gpu_accumulator_dtype(); // REQ-DTYPE-005: GPU path
+    // BCE-20260630-MIXED-P0.5: per-matrix dtype (ARCH-DTYPE-MIXED-PRECISION).
+    // 三段式 dtype 感知：A-load=a_dtype, B-load=b_dtype, C-store=c_dtype;
+    // acc=c_dtype.gpu_accumulator_dtype() (三段式 accumulate 位置合法 F32, GPU tensor core);
+    // VecNarrow 当 c_dtype != acc_dtype (BF16 输出窄化). 消除旧 `let _ = (b_dtype, c_dtype)` 丢弃。
+    let a_elem = a_dtype.elem_bytes();
+    let b_elem = b_dtype.elem_bytes();
+    let c_elem = c_dtype.elem_bytes();
+    let acc_dtype = c_dtype.gpu_accumulator_dtype(); // REQ-DTYPE-005: GPU path
+    let needs_narrow = c_dtype.needs_narrowing_from(acc_dtype);
     let mma_k = mma_k.max(16);
 
     // GPU GEMM 三级分块:
@@ -372,30 +382,31 @@ pub(crate) fn emit_gemm_gpu_tiled_inline(
 
                         // MMA 内层 K 循环: 加载 A/B tile → FMA → 累加
                         for k_inner in (0..kk).step_by(mma_k) {
-                            // Load A tile: a_ptr + (i_cta + i_warp) * k * elem + (k_tile + k_inner) * elem
-                            let a_off = ((i_cta + i_warp) * k + k_tile + k_inner) * elem;
-                            // Load B tile: b_ptr + (k_tile + k_inner) * n * elem + (j_cta + j_warp) * elem
-                            let b_off = ((k_tile + k_inner) * n + j_cta + j_warp) * elem;
+                            // A is row-major (m×k) with a_elem; B is row-major (k×n) with b_elem.
+                            // Load A tile: a_ptr + ((i_cta+i_warp)*k + k_tile+k_inner) * a_elem
+                            let a_off = ((i_cta + i_warp) * k + k_tile + k_inner) * a_elem;
+                            // Load B tile: b_ptr + ((k_tile+k_inner)*n + j_cta+j_warp) * b_elem
+                            let b_off = ((k_tile + k_inner) * n + j_cta + j_warp) * b_elem;
 
                             for row in 0..wi {
-                                let a_row_off = a_off + row * k * elem;
+                                let a_row_off = a_off + row * k * a_elem;
                                 let a_vec = prog.alloc_vreg(VRegKind::Vec, width);
                                 prog.emit(VmInstr::VecLoad {
                                     dst: a_vec, base: a_ptr,
                                     offset: OffsetExpr::Const(a_row_off),
-                                    width, dtype, predicate: None,
+                                    width, dtype: a_dtype, predicate: None,
                                 });
 
                                 for col in 0..wj {
-                                    let b_col_off = b_off + col * elem;
+                                    let b_col_off = b_off + col * b_elem;
                                     let b_vec = prog.alloc_vreg(VRegKind::Vec, width);
                                     prog.emit(VmInstr::VecLoad {
                                         dst: b_vec, base: b_ptr,
                                         offset: OffsetExpr::Const(b_col_off),
-                                        width, dtype, predicate: None,
+                                        width, dtype: b_dtype, predicate: None,
                                     });
 
-                                    // FMA: acc[row * wj + col] += a_vec * b_vec
+                                    // FMA: acc[row * wj + col] += a_vec * b_vec (F32 accumulator)
                                     let acc_idx = row * wj + col;
                                     if acc_idx < accs.len() {
                                         prog.emit(VmInstr::Fma {
@@ -413,15 +424,15 @@ pub(crate) fn emit_gemm_gpu_tiled_inline(
                 }
             }
 
-            // 写回 C tile: c_ptr + (i_cta) * n * elem + (j_cta) * elem
+            // 写回 C tile: c_ptr + ((i_cta+row)*n + j_cta+col) * c_elem
             for row in 0..mi.min(warp_m) {
                 for col in 0..nj.min(warp_n) {
                     let acc_idx = row * nj.min(warp_n) + col;
                     if acc_idx < accs.len() {
-                        let c_off = ((i_cta + row) * n + j_cta + col) * elem;
-                        let store_src = if dtype.needs_narrowing_from(acc_dtype) {
+                        let c_off = ((i_cta + row) * n + j_cta + col) * c_elem;
+                        let store_src = if needs_narrow {
                             let narrowed = prog.alloc_vreg(VRegKind::Vec, width);
-                            prog.emit(VmInstr::VecNarrow { dst: narrowed, src: accs[acc_idx], dst_dtype: dtype, src_dtype: acc_dtype, width });
+                            prog.emit(VmInstr::VecNarrow { dst: narrowed, src: accs[acc_idx], dst_dtype: c_dtype, src_dtype: acc_dtype, width });
                             narrowed
                         } else {
                             accs[acc_idx]
@@ -431,7 +442,7 @@ pub(crate) fn emit_gemm_gpu_tiled_inline(
                             offset: OffsetExpr::Const(c_off),
                             src: store_src,
                             width,
-                            dtype, predicate: None,
+                            dtype: c_dtype, predicate: None,
                         });
                     }
                 }
@@ -468,10 +479,15 @@ pub(crate) fn emit_gemm_gpu_pipelined(
     _trans_b: bool,
     use_tma: bool,
 ) -> Result<(), CompilerError> {
-    let dtype = a_dtype;
-    let _ = (b_dtype, c_dtype);
-    let elem = dtype.elem_bytes();
-    let acc_dtype = dtype.gpu_accumulator_dtype(); // REQ-DTYPE-005: GPU path
+    // BCE-20260630-MIXED-P0.5: per-matrix dtype (ARCH-DTYPE-MIXED-PRECISION).
+    // 三段式 dtype 感知：A-tile load=a_dtype, B-tile load=b_dtype, C-store=c_dtype;
+    // acc=c_dtype.gpu_accumulator_dtype() (三段式 accumulate 位置合法 F32, GPU tensor core).
+    // 消除旧 `let dtype = a_dtype; let _ = (b_dtype, c_dtype);` 丢弃。
+    let a_elem = a_dtype.elem_bytes();
+    let b_elem = b_dtype.elem_bytes();
+    let c_elem = c_dtype.elem_bytes();
+    let acc_dtype = c_dtype.gpu_accumulator_dtype(); // REQ-DTYPE-005: GPU path
+    let needs_narrow = c_dtype.needs_narrowing_from(acc_dtype);
     let mma_k = mma_k.max(16);
     let num_stages = pipeline_depth.min(3);
 
@@ -479,11 +495,11 @@ pub(crate) fn emit_gemm_gpu_pipelined(
     let smem_a_names: Vec<String> = (0..num_stages).map(|s| format!("smem_a_{}", s)).collect();
     let smem_b_names: Vec<String> = (0..num_stages).map(|s| format!("smem_b_{}", s)).collect();
 
-    // Each smem tile: A = cta_m × cta_k elements, B = cta_k × cta_n elements
+    // Each smem tile: A = cta_m × cta_k elements (a_elem), B = cta_k × cta_n elements (b_elem).
     // Pad rows to 128B alignment (32 banks × 4B) to eliminate bank conflicts.
     // Swizzle-free approach: pad each row to next multiple of 128 bytes.
-    let smem_a_row_bytes = ((cta_k * elem + 127) / 128) * 128;
-    let smem_b_row_bytes = ((cta_n * elem + 127) / 128) * 128;
+    let smem_a_row_bytes = ((cta_k * a_elem + 127) / 128) * 128;
+    let smem_b_row_bytes = ((cta_n * b_elem + 127) / 128) * 128;
     let smem_a_bytes = cta_m * smem_a_row_bytes;
     let smem_b_bytes = cta_k * smem_b_row_bytes;
 
@@ -501,23 +517,23 @@ pub(crate) fn emit_gemm_gpu_pipelined(
 
     // TMA prologue: initialize tensor descriptors and barrier (SM90+ only)
     if use_tma {
-        // TMA descriptor for A matrix: shape (m, k), tile (cta_m, cta_k)
+        // TMA descriptor for A matrix: shape (m, k), tile (cta_m, cta_k), dtype=a_dtype
         prog.emit(VmInstr::TmaDescriptorInit {
             desc_name: "tma_desc_a".to_string(),
             global_dim: [m, k],
-            global_stride: [k * elem, elem],
+            global_stride: [k * a_elem, a_elem],
             box_dim: [cta_m, cta_k],
             swizzle: TmaSwizzle::Swizzle128,
-            dtype,
+            dtype: a_dtype,
         });
-        // TMA descriptor for B matrix: shape (k, n), tile (cta_k, cta_n)
+        // TMA descriptor for B matrix: shape (k, n), tile (cta_k, cta_n), dtype=b_dtype
         prog.emit(VmInstr::TmaDescriptorInit {
             desc_name: "tma_desc_b".to_string(),
             global_dim: [k, n],
-            global_stride: [n * elem, elem],
+            global_stride: [n * b_elem, b_elem],
             box_dim: [cta_k, cta_n],
             swizzle: TmaSwizzle::Swizzle128,
-            dtype,
+            dtype: b_dtype,
         });
         // mbarrier for TMA completion signal
         prog.emit(VmInstr::BarrierInit {
@@ -555,7 +571,7 @@ pub(crate) fn emit_gemm_gpu_pipelined(
                 let kk0 = cta_k.min(k - k0);
                 emit_async_load_tile(prog, &smem_a_names[0], &smem_b_names[0],
                     a_ptr, b_ptr, i_cta, j_cta, k0, mi, nj, kk0,
-                    cta_m, cta_n, cta_k, n, k, elem, dtype, width,
+                    cta_m, cta_n, cta_k, n, k, a_elem, a_dtype, b_elem, b_dtype, width,
                     smem_a_row_bytes, smem_b_row_bytes, use_tma);
 
                 if num_k_tiles == 1 {
@@ -571,7 +587,7 @@ pub(crate) fn emit_gemm_gpu_pipelined(
                     emit_mma_on_smem(prog, &accs, &smem_a_names[0], &smem_b_names[0],
                         i_cta, j_cta, k0, mi, nj, kk0.min(cta_k),
                         cta_m, cta_n, cta_k, warp_m, warp_n, mma_k,
-                        n, k, elem, dtype, acc_dtype, width,
+                        n, k, a_elem, b_elem, acc_dtype, width,
                         smem_a_row_bytes, smem_b_row_bytes);
                 } else {
                     // ─── Steady state: compute tile[i] ‖ async load tile[i+1] ───
@@ -601,7 +617,7 @@ pub(crate) fn emit_gemm_gpu_pipelined(
                             emit_mma_on_smem(prog, &accs, &smem_a_names[cur_stage], &smem_b_names[cur_stage],
                                 i_cta, j_cta, ki, mi, nj, kki,
                                 cta_m, cta_n, cta_k, warp_m, warp_n, mma_k,
-                                n, k, elem, dtype, acc_dtype, width,
+                                n, k, a_elem, b_elem, acc_dtype, width,
                                 smem_a_row_bytes, smem_b_row_bytes);
 
                             // Async load next K tile
@@ -609,14 +625,14 @@ pub(crate) fn emit_gemm_gpu_pipelined(
                             let kki_next = cta_k.min(k - ki_next);
                             emit_async_load_tile(prog, &smem_a_names[next_stage], &smem_b_names[next_stage],
                                 a_ptr, b_ptr, i_cta, j_cta, ki_next, mi, nj, kki_next,
-                                cta_m, cta_n, cta_k, n, k, elem, dtype, width,
+                                cta_m, cta_n, cta_k, n, k, a_elem, a_dtype, b_elem, b_dtype, width,
                                 smem_a_row_bytes, smem_b_row_bytes, use_tma);
                         } else {
                             // Epilogue: compute last tile (no more async loads)
                             emit_mma_on_smem(prog, &accs, &smem_a_names[cur_stage], &smem_b_names[cur_stage],
                                 i_cta, j_cta, ki, mi, nj, kki,
                                 cta_m, cta_n, cta_k, warp_m, warp_n, mma_k,
-                                n, k, elem, dtype, acc_dtype, width,
+                                n, k, a_elem, b_elem, acc_dtype, width,
                                 smem_a_row_bytes, smem_b_row_bytes);
                         }
 
@@ -631,10 +647,10 @@ pub(crate) fn emit_gemm_gpu_pipelined(
                 for col in 0..nj.min(warp_n) {
                     let acc_idx = row * nj.min(warp_n) + col;
                     if acc_idx < accs.len() {
-                        let c_off = ((i_cta + row) * n + j_cta + col) * elem;
-                        let store_src = if dtype.needs_narrowing_from(acc_dtype) {
+                        let c_off = ((i_cta + row) * n + j_cta + col) * c_elem;
+                        let store_src = if needs_narrow {
                             let narrowed = prog.alloc_vreg(VRegKind::Vec, width);
-                            prog.emit(VmInstr::VecNarrow { dst: narrowed, src: accs[acc_idx], dst_dtype: dtype, src_dtype: acc_dtype, width });
+                            prog.emit(VmInstr::VecNarrow { dst: narrowed, src: accs[acc_idx], dst_dtype: c_dtype, src_dtype: acc_dtype, width });
                             narrowed
                         } else {
                             accs[acc_idx]
@@ -644,7 +660,7 @@ pub(crate) fn emit_gemm_gpu_pipelined(
                             offset: OffsetExpr::Const(c_off),
                             src: store_src,
                             width,
-                            dtype, predicate: None,
+                            dtype: c_dtype, predicate: None,
                         });
                     }
                 }
@@ -680,8 +696,12 @@ pub(crate) fn emit_async_load_tile(
     cta_k: usize,
     n: usize,
     k: usize,
-    elem: usize,
-    dtype: QuantPrecision,
+    // BCE-20260630-MIXED-P0.5: per-matrix dtype — A tile 按 a_dtype/a_elem，
+    // B tile 按 b_dtype/b_elem（ARCH-DTYPE-MIXED-PRECISION 三段式 load 位置）。
+    a_elem: usize,
+    a_dtype: QuantPrecision,
+    b_elem: usize,
+    b_dtype: QuantPrecision,
     width: SimdWidth,
     smem_a_row_stride: usize,
     smem_b_row_stride: usize,
@@ -719,9 +739,9 @@ pub(crate) fn emit_async_load_tile(
         // SM80 fallback path: per-row VecLoad + SharedMemAsyncStore
 
         // Load A tile (row-major): cta_m rows × cta_k cols from global → smem_a
-        // Each row uses padded row stride for bank conflict elimination.
+        // A stored at a_elem width; dtype=a_dtype (load 位置, BF16→F32 widen in register).
         for row in 0..mi {
-            let global_offset = ((i_cta + row) * k + k_off) * elem;
+            let global_offset = ((i_cta + row) * k + k_off) * a_elem;
             let smem_offset = row * smem_a_row_stride;
             let tmp = prog.alloc_vreg(VRegKind::Vec, width);
             prog.emit(VmInstr::VecLoad {
@@ -729,20 +749,21 @@ pub(crate) fn emit_async_load_tile(
                 base: _a_ptr,
                 offset: OffsetExpr::Const(global_offset),
                 width,
-                dtype, predicate: None,
+                dtype: a_dtype, predicate: None,
             });
             prog.emit(VmInstr::SharedMemAsyncStore {
                 name: smem_a_name.to_string(),
                 dst_offset: OffsetExpr::Const(smem_offset),
                 src: tmp,
                 width,
-                dtype,
+                dtype: a_dtype,
             });
         }
 
         // Load B tile (row-major): cta_k rows × cta_n cols from global → smem_b
+        // B stored at b_elem width; dtype=b_dtype (load 位置, BF16→F32 widen in register).
         for row in 0..kk {
-            let global_offset = ((k_off + row) * n + j_cta) * elem;
+            let global_offset = ((k_off + row) * n + j_cta) * b_elem;
             let smem_offset = row * smem_b_row_stride;
             let tmp = prog.alloc_vreg(VRegKind::Vec, width);
             prog.emit(VmInstr::VecLoad {
@@ -750,14 +771,14 @@ pub(crate) fn emit_async_load_tile(
                 base: _b_ptr,
                 offset: OffsetExpr::Const(global_offset),
                 width,
-                dtype, predicate: None,
+                dtype: b_dtype, predicate: None,
             });
             prog.emit(VmInstr::SharedMemAsyncStore {
                 name: smem_b_name.to_string(),
                 dst_offset: OffsetExpr::Const(smem_offset),
                 src: tmp,
                 width,
-                dtype,
+                dtype: b_dtype,
             });
         }
     }
@@ -785,16 +806,18 @@ pub(crate) fn emit_mma_on_smem(
     mma_k: usize,
     _n: usize,
     _k: usize,
-    _elem: usize,
-    _dtype: QuantPrecision,
+    // BCE-20260630-MIXED-P0.5: per-matrix elem — smem tiles store A at a_elem,
+    // B at b_elem (ARCH-DTYPE-MIXED-PRECISION). smem→register load widens to acc_dtype.
+    a_elem: usize,
+    b_elem: usize,
     acc_dtype: QuantPrecision,
     width: SimdWidth,
     smem_a_row_stride: usize,
     smem_b_row_stride: usize,
 ) {
-    // Padded row stride in f32 elements (divide byte stride by 4)
-    let smem_a_row_elems = smem_a_row_stride / 4;
-    let smem_b_row_elems = smem_b_row_stride / 4;
+    // Padded row stride in matrix-native elements (divide byte stride by per-matrix elem).
+    let smem_a_row_elems = if a_elem > 0 { smem_a_row_stride / a_elem } else { 0 };
+    let smem_b_row_elems = if b_elem > 0 { smem_b_row_stride / b_elem } else { 0 };
 
     // Warp-level loop within CTA tile
     for i_warp in (0..mi).step_by(warp_m) {
@@ -811,7 +834,7 @@ pub(crate) fn emit_mma_on_smem(
                     prog.emit(VmInstr::SharedMemLoad {
                         dst: a_vec,
                         name: smem_a_name.to_string(),
-                        src_offset: OffsetExpr::Const(smem_a_off * 4), // f32 bytes
+                        src_offset: OffsetExpr::Const(smem_a_off * a_elem), // A native bytes
                         width,
                         dtype: acc_dtype,
                     });
@@ -822,7 +845,7 @@ pub(crate) fn emit_mma_on_smem(
                         prog.emit(VmInstr::SharedMemLoad {
                             dst: b_vec,
                             name: smem_b_name.to_string(),
-                            src_offset: OffsetExpr::Const(smem_b_off * 4),
+                            src_offset: OffsetExpr::Const(smem_b_off * b_elem), // B native bytes
                             width,
                             dtype: acc_dtype,
                         });
@@ -2229,7 +2252,7 @@ mod template_tests {
             &mut prog, &accs, "smem_a", "smem_b",
             0, 0, 0, 2, 2, 16,
             16, 16, 16, 2, 2, 16,
-            16, 16, 4, QuantPrecision::F32, QuantPrecision::F32, width,
+            16, 16, 4, 4, QuantPrecision::F32, width,
             128, 128,
         );
 
@@ -2255,8 +2278,10 @@ mod template_tests {
             0, 0, 0, // i_cta, j_cta, k_off
             2, 2, 2, // mi, nj, kk
             4, 4, 4, // cta_m, cta_n, cta_k
-            8, 8, 4, // n, k, elem
-            QuantPrecision::F32, width,
+            8, 8, // n, k
+            4, QuantPrecision::F32, // a_elem, a_dtype
+            4, QuantPrecision::F32, // b_elem, b_dtype
+            width,
             32, 32, // smem_a_row_stride, smem_b_row_stride
             false, // use_tma=false -> SM80 path
         );
@@ -2670,8 +2695,10 @@ mod template_tests {
             0, 0, 0, // i_cta, j_cta, k_off
             2, 2, 2, // mi, nj, kk
             4, 4, 4, // cta_m, cta_n, cta_k
-            8, 8, 4, // n, k, elem
-            QuantPrecision::F32, width,
+            8, 8, // n, k
+            4, QuantPrecision::F32, // a_elem, a_dtype
+            4, QuantPrecision::F32, // b_elem, b_dtype
+            width,
             32, 32, // smem_a_row_stride, smem_b_row_stride
             true, // use_tma=true -> TMA path
         );
@@ -2816,7 +2843,7 @@ mod template_tests {
             &mut prog, &accs, "smem_a", "smem_b",
             0, 0, 0, 3, 3, 16,
             4, 4, 16, 4, 4, 16,
-            4, 16, 4, QuantPrecision::F32, QuantPrecision::F32, width,
+            4, 16, 4, 4, QuantPrecision::F32, width,
             64, 64,
         );
 
@@ -2844,8 +2871,10 @@ mod template_tests {
             0, 0, 0, // i_cta, j_cta, k_off
             0, 2, 2, // mi=0, nj=2, kk=2
             4, 4, 4, // cta_m, cta_n, cta_k
-            8, 8, 4, // n, k, elem
-            QuantPrecision::F32, width,
+            8, 8, // n, k
+            4, QuantPrecision::F32, // a_elem, a_dtype
+            4, QuantPrecision::F32, // b_elem, b_dtype
+            width,
             32, 32,
             false, // use_tma=false
         );
@@ -3068,7 +3097,7 @@ mod template_tests {
             &mut prog, &accs, "smem_a", "smem_b",
             0, 0, 0, 2, 2, 16,
             2, 2, 16, 2, 2, 16,
-            2, 16, 4, QuantPrecision::F32, QuantPrecision::F32, width,
+            2, 16, 4, 4, QuantPrecision::F32, width,
             64, 64,
         );
 
@@ -3093,8 +3122,10 @@ mod template_tests {
             4, 8, 16, // i_cta=4, j_cta=8, k_off=16
             2, 2, 2, // mi=2, nj=2, kk=2
             8, 8, 8, // cta_m, cta_n, cta_k
-            16, 32, 4, // n, k, elem
-            QuantPrecision::F32, width,
+            16, 32, // n, k
+            4, QuantPrecision::F32, // a_elem, a_dtype
+            4, QuantPrecision::F32, // b_elem, b_dtype
+            width,
             128, 128,
             false, // SM80 path
         );
@@ -3662,7 +3693,7 @@ mod template_tests {
             &mut prog, &accs, "smem_a", "smem_b",
             0, 0, 0, 2, 2, 8, // kk=8 < mma_k=16
             2, 2, 16, 2, 2, 16,
-            16, 16, 4, QuantPrecision::F32, QuantPrecision::F32, width,
+            16, 16, 4, 4, QuantPrecision::F32, width,
             64, 64,
         );
 
