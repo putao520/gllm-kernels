@@ -1198,7 +1198,6 @@ fn collect_src_vregs(instr: &VmInstr) -> Vec<VRegId> {
         | VmInstr::ScopeEnd { .. }
         | VmInstr::TileConfig { .. }
         | VmInstr::TileRelease
-        | VmInstr::TileMma { .. }
         | VmInstr::SparseMaskIntersect { .. }
         | VmInstr::WarpSync
         | VmInstr::AsyncCopy { .. }
@@ -1214,6 +1213,12 @@ fn collect_src_vregs(instr: &VmInstr) -> Vec<VRegId> {
         | VmInstr::KiviQuantChannel { .. } | VmInstr::KiviQuantToken { .. } | VmInstr::KiviDequantLoad { .. }
         | VmInstr::GgufSubScaleLoad { .. } | VmInstr::GgufKQuantScaleLoad { .. }
         | VmInstr::VecScalarStore { .. } => vec![],
+        // TileLoad: base_ptr (memory base) + k_offset (K-loop offset reg) are read.
+        VmInstr::TileLoad { base_ptr, k_offset, .. } => vec![*base_ptr, *k_offset],
+        // TileMma: a, b read; c is accumulator dst (def, tracked separately).
+        VmInstr::TileMma { a, b, .. } => vec![*a, *b],
+        // TileStore: src_tile (read) + base_ptr + out_offset (memory addressing, read).
+        VmInstr::TileStore { src_tile, base_ptr, out_offset, .. } => vec![*src_tile, *base_ptr, *out_offset],
         VmInstr::Lz4Decode { src_ptr, dst_ptr, compressed_size, .. } => vec![*src_ptr, *dst_ptr, *compressed_size],
         VmInstr::BitPackRleDecode { src_ptr, dst_ptr, compressed_size, .. } => vec![*src_ptr, *dst_ptr, *compressed_size],
         VmInstr::GatherLoad { dst, base, indices, .. } => vec![*dst, *base, *indices],

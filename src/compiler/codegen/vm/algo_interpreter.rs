@@ -286,7 +286,12 @@ impl TemplateInterpreter {
                 let c = env.get("panel_c");
                 let a = env.get("panel_a");
                 let b = env.get("panel_b");
-                ops.push(TraceOp::TileMma { c, a, b });
+                // tile shape (m,n,k) 从 params 推断 (设计 §6.1): m/n/k 是 GEMM 标准维度名,
+                // 调用方 (gemm 模板) 已 set("m"/"n"/"k", ..)。resolve 默认 1 兼容零 slot 回退。
+                let m = self.params.resolve("m");
+                let n = self.params.resolve("n");
+                let k = self.params.resolve("k");
+                ops.push(TraceOp::TileMma { c, a, b, m, n, k });
             }
 
             AlgoStep::TileRelease => {
@@ -523,7 +528,10 @@ impl TemplateInterpreter {
                 let c = env.get("panel_c");
                 let a = env.get("panel_a");
                 let b = env.get("panel_b");
-                body_ops.push(TraceOp::TileMma { c, a, b });
+                let m = self.params.resolve("m");
+                let n = self.params.resolve("n");
+                let k = self.params.resolve("k");
+                body_ops.push(TraceOp::TileMma { c, a, b, m, n, k });
             }
 
             AlgoStep::TileRelease => {

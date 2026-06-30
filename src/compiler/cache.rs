@@ -529,7 +529,13 @@ impl SerializedTraceOp {
             TraceOp::AsyncWaitGroup { n } => Self { tag: 86, operands: [*n, 0, 0, 0], float_val: 0.0 },
             TraceOp::SyncBarrier { .. } => Self { tag: 87, operands: [0, 0, 0, 0], float_val: 0.0 },
             TraceOp::TileConfig { rows, cols } => Self { tag: 88, operands: [*rows as u32, *cols as u32, 0, 0], float_val: 0.0 },
-            TraceOp::TileMma { c, a, b } => Self { tag: 89, operands: [c.0, a.0, b.0, 0], float_val: 0.0 },
+            TraceOp::TileMma { c, a, b, m, n, k } => {
+                // operands 装不下 6 个值 (c,a,b,m,n,k): [c, a, b, m] 进 operands,
+                // (n, k) 进 float_val 位 reinterpret 为两个 u32 (低32=n, 高32=k)。
+                // tile 维度通常 ≤ u16, u32 容纳无溢出; 解码侧 to_trace_op tag 89 还原。
+                let nk: u64 = (*n as u64) | ((*k as u64) << 32);
+                Self { tag: 89, operands: [c.0, a.0, b.0, *m as u32], float_val: f64::from_bits(nk) }
+            },
             TraceOp::TileRelease => Self { tag: 90, operands: [0, 0, 0, 0], float_val: 0.0 },
             TraceOp::Softmax { src, dst } => Self { tag: 91, operands: [src.0, dst.0, 0, 0], float_val: 0.0 },
             TraceOp::EpilogueChain { .. } => Self { tag: 92, operands: [0, 0, 0, 0], float_val: 0.0 },
@@ -600,6 +606,20 @@ impl SerializedTraceOp {
             95 => Some(TraceOp::MtpDraft { depth: 1, hidden_size: 1, vocab_size: 1 }),
             96 => Some(TraceOp::MlaAttnScore { num_heads: 1, head_dim: 1, d_c: 1, d_rope: 1 }),
             97 => Some(TraceOp::MlaRopeMerge { d_c: 1, d_rope: 1 }),
+            88 => Some(TraceOp::TileConfig { rows: o[0] as usize, cols: o[1] as usize }),
+            89 => {
+                // TileMma round-trip: operands=[c, a, b, m], float_val bits=(n | k<<32)。
+                let nk = self.float_val.to_bits();
+                Some(TraceOp::TileMma {
+                    c: ValueId(o[0]),
+                    a: ValueId(o[1]),
+                    b: ValueId(o[2]),
+                    m: o[3] as usize,
+                    n: (nk & 0xFFFF_FFFF) as usize,
+                    k: (nk >> 32) as usize,
+                })
+            }
+            90 => Some(TraceOp::TileRelease),
             98 => Some(TraceOp::QuantCastFp8toF32 { src: ValueId(o[0]), format: Fp8Format::E4M3 }),
             99 => Some(TraceOp::QuantCastFp8toF32 { src: ValueId(o[0]), format: Fp8Format::E5M2 }),
             128 => Some(TraceOp::Tma2DCopy { desc: String::new(), coord_x: ValueId(0), coord_y: ValueId(0), bytes: 0 }),

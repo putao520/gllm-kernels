@@ -1493,12 +1493,19 @@ fn dispatch_trace_op(
             Ok(r)
         }
 
-        TraceOp::TileMma { c, a, b } => {
+        TraceOp::TileMma { c, a, b, m, n, k } => {
             let r = prog.alloc_vreg(VRegKind::Vec, width);
+            // dtype 从 graph tensor 推断注入 (设计 §6.1): default_dtype 是调用方
+            // (auto_lower_trace_raw ← op_input_dtype) 传入的计算精度, 非零 slot 回退。
+            // ACC 累加器恒为 F32 (QuantPrecision::accumulator_precision), 输入按 dtype 窄化。
             prog.emit(VmInstr::TileMma {
                 c: slots[c.0 as usize],
                 a: slots[a.0 as usize],
                 b: slots[b.0 as usize],
+                m: *m,
+                n: *n,
+                k: *k,
+                dtype: default_dtype.to_dtype(),
             });
             Ok(r)
         }

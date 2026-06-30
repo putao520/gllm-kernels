@@ -309,7 +309,9 @@ impl VmProgram {
                 },
             },
             VmInstr::TileConfig { rows, cols, dtype } => VmInstr::TileConfig { rows, cols, dtype },
-            VmInstr::TileMma { c, a, b } => VmInstr::TileMma { c: r(c, map, next_vreg), a: r(a, map, next_vreg), b: r(b, map, next_vreg) },
+            VmInstr::TileLoad { dst_tile, base_ptr, k_offset, row_stride, rows, cols, dtype } => VmInstr::TileLoad { dst_tile: r(dst_tile, map, next_vreg), base_ptr: r(base_ptr, map, next_vreg), k_offset: r(k_offset, map, next_vreg), row_stride, rows, cols, dtype },
+            VmInstr::TileMma { c, a, b, m, n, k, dtype } => VmInstr::TileMma { c: r(c, map, next_vreg), a: r(a, map, next_vreg), b: r(b, map, next_vreg), m, n, k, dtype },
+            VmInstr::TileStore { src_tile, base_ptr, out_offset, row_stride, rows, cols, dtype } => VmInstr::TileStore { src_tile: r(src_tile, map, next_vreg), base_ptr: r(base_ptr, map, next_vreg), out_offset: r(out_offset, map, next_vreg), row_stride, rows, cols, dtype },
             VmInstr::TileRelease => VmInstr::TileRelease,
             VmInstr::SparseMaskIntersect { dst_k0, dst_k1, a, b } => VmInstr::SparseMaskIntersect { dst_k0: r(dst_k0, map, next_vreg), dst_k1: r(dst_k1, map, next_vreg), a: r(a, map, next_vreg), b: r(b, map, next_vreg) },
             VmInstr::WarpSync => VmInstr::WarpSync,
@@ -540,7 +542,9 @@ impl VmProgram {
                 action: action.remap(r),
             },
             VmInstr::TileConfig { rows, cols, dtype } => VmInstr::TileConfig { rows, cols, dtype },
-            VmInstr::TileMma { c, a, b } => VmInstr::TileMma { c: r(c), a: r(a), b: r(b) },
+            VmInstr::TileLoad { dst_tile, base_ptr, k_offset, row_stride, rows, cols, dtype } => VmInstr::TileLoad { dst_tile: r(dst_tile), base_ptr: r(base_ptr), k_offset: r(k_offset), row_stride, rows, cols, dtype },
+            VmInstr::TileMma { c, a, b, m, n, k, dtype } => VmInstr::TileMma { c: r(c), a: r(a), b: r(b), m, n, k, dtype },
+            VmInstr::TileStore { src_tile, base_ptr, out_offset, row_stride, rows, cols, dtype } => VmInstr::TileStore { src_tile: r(src_tile), base_ptr: r(base_ptr), out_offset: r(out_offset), row_stride, rows, cols, dtype },
             VmInstr::TileRelease => VmInstr::TileRelease,
             VmInstr::SparseMaskIntersect { dst_k0, dst_k1, a, b } => VmInstr::SparseMaskIntersect { dst_k0: r(dst_k0), dst_k1: r(dst_k1), a: r(a), b: r(b) },
             VmInstr::WarpSync => VmInstr::WarpSync,
@@ -1671,7 +1675,8 @@ impl VmProgram {
                 | VmInstr::BreakLoop { .. } | VmInstr::ConditionalSkip { .. }
                 | VmInstr::GprCondAction { .. }
                 | VmInstr::WarpSync | VmInstr::AsyncCopy { .. } | VmInstr::AsyncWait { .. }
-                | VmInstr::TileConfig { .. } | VmInstr::TileMma { .. } | VmInstr::TileRelease
+                | VmInstr::TileConfig { .. } | VmInstr::TileLoad { .. } | VmInstr::TileMma { .. }
+                | VmInstr::TileStore { .. } | VmInstr::TileRelease
                 | VmInstr::SparseMaskIntersect { .. } | VmInstr::HotpatchSlot { .. }
                 | VmInstr::IndirectJump { .. } | VmInstr::ConditionalExit { .. }
                 | VmInstr::BranchIfPtrNonNull { .. }
