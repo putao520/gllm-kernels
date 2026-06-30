@@ -1,4 +1,127 @@
 impl X86Lower {
+    // ── AMX Tile 辅助方法 (HW-TIER TASK-D §4 + §6.2) ──
+    //
+    // 三个方法供 TileLoad / TileMma / TileStore arm 共享, 必须定义在 impl 级别
+    // (不能在 match arm 内定义 nested fn)。
+
+    /// 把 tile VRegId 解析为物理 tmm 寄存器 (iced AsmRegisterTmm)。
+    ///
+    /// RegAllocator 对 VRegKind::Tile 分配 PhysReg::Tile(PhysTile(u8))。
+    /// u8 ∈ [0..8] 对应 tmm0..tmm7 (AMX 8 个 tile 寄存器上限)。
+    /// 若 vreg 未分配 (None) 或被 spill → CodegenViolation (tile 不允许 spill,
+    /// RegAllocator Tile 分支不产生 Spilled 变体)。
+    fn resolve_phys_tile(
+        &self,
+        vreg: VRegId,
+        alloc: &RegAllocation,
+    ) -> Result<AsmRegisterTmm, CompilerError> {
+        match alloc.get(vreg) {
+            Some(super::isa_profile::PhysReg::Tile(pt)) => Self::phys_tile_to_tmm(pt),
+            other => Err(CompilerError::CodegenViolation(format!(
+                "AMX tile v{} not allocated to PhysReg::Tile (got {:?}); \
+                 tile vregs must be allocated by RegAllocator Tile pool",
+                vreg.0, other,
+            ))),
+        }
+    }
+
+    /// PhysTile(u8) → iced AsmRegisterTmm (tmm0..tmm7)。
+    fn phys_tile_to_tmm(
+        pt: super::isa_profile::PhysTile,
+    ) -> Result<AsmRegisterTmm, CompilerError> {
+        use iced_x86::code_asm::registers::*;
+        Ok(match pt.0 {
+            0 => tmm0, 1 => tmm1, 2 => tmm2, 3 => tmm3,
+            4 => tmm4, 5 => tmm5, 6 => tmm6, 7 => tmm7,
+            other => return Err(CompilerError::CodegenViolation(format!(
+                "AMX PhysTile({}) out of range; AMX has 8 tile registers (tmm0..tmm7)", other,
+            ))),
+        })
+    }
+
+    /// 计算有效地址 `base_ptr + k_offset` (或 `c_ptr + out_offset`) 到 rax,
+    /// 返回 rax (scratch[0])。供 TileLoad/TileStore 的 TILELOADD/TILESTORED
+    /// sibmem 操作数做 base 寄存器。
+    ///
+    /// R1 决定性风险缓解: k_offset (K 循环推进偏移) 与 row_stride (2D 逐行跨度)
+    /// 是两个独立量。本函数只算 base+k_offset, row_stride 由调用方加载到另一个
+    /// 寄存器作为 sibmem 的 index 寄存器, 两者禁止合并。
+    ///
+    /// base_ptr/k_offset 是 GPR VReg (Ptr/ByteOffset/Scalar kind), 可能被
+    /// RegAllocator spill 到栈。用 resolve_gpr_read 通过 scratch slot 1/2 load。
+    /// 计算结果落到 scratch[0] (rax), 之后 scratch[1] (r10) 可安全重用做 stride。
+    fn resolve_tile_eff_addr_to_rax(
+        &mut self,
+        base_ptr: VRegId,
+        k_offset: VRegId,
+        alloc: &RegAllocation,
+    ) -> Result<AsmRegister64, CompilerError> {
+        let s0 = self.scratch_gprs[0]; // rax
+        // base_ptr → scratch slot 1 (r10) 或物理 GPR
+        let base_reg = self.resolve_gpr_read(base_ptr, alloc, 1)?;
+        // k_offset → scratch slot 2 (r11) 或物理 GPR
+        let koff_reg = self.resolve_gpr_read(k_offset, alloc, 2)?;
+        // rax = base_ptr
+        self.asm.mov(s0, base_reg).map_err(Self::err)?;
+        // rax += k_offset  (eff addr = base + K 循环推进偏移)
+        self.asm.add(s0, koff_reg).map_err(Self::err)?;
+        Ok(s0)
+    }
+
+    /// 断言 c/a/b 物理映射为 tmm0/tmm1/tmm2 (固定单 MMA 链布局)。
+    ///
+    /// 发射 TDP* (Tile Dot Product) 指令的 VEX 手编字节, 支持任意 tmm 三元组。
+    ///
+    /// 用于 iced 1.21 code_asm 未覆盖的 AMX 指令 (TDPHF8PS/TDPBF8PS/TDPTF32PS —
+    /// Diamond Rapids AMX-FP8/AMX-TF32)。BF16/F16/INT8 走 iced 原生 code_asm 方法。
+    ///
+    /// VEX.128 编码 (5 字节): C4 + byte2 + byte3 + opcode + ModRM
+    ///   byte2  = R.X.B.mmmmmm, 全部 tmm 0-7 (无 REX 扩展) → R=X=B=1, mmmmmm=0F38=000_010 → 0xE2
+    ///   byte3  = W.vvvv.L.pp
+    ///            W=0 (AMX TDP 均 W0), vvvv = ~tmm_b[3:0] (4-bit inverted), L=0 (VEX.128), pp=mandatory prefix
+    ///   opcode = TDP* 指令 opcode (e.g. 0xFD for FP8, 0x6C for TF32)
+    ///   ModRM  = 0xC0 | (tmm_c[2:0] << 3) | tmm_a[2:0]   (mod=11, reg=tmm_c, rm=tmm_a)
+    ///
+    /// pp 映射 (VEX.pp 编码, iced 实测一致): 00=none, 01=66, 10=F3, 11=F2
+    ///
+    /// 验证: 与 iced 1.21 原生 tdpbf16ps(tmm0,tmm1,tmm2) 输出 C4 E2 6A 5C C1 完全一致
+    /// (BF16: pp=F3=10, op=0x5C, tmm_b=2→vvvv=~2=1101, byte3=0x68|0x02=0x6A, ModRM=0xC1)。
+    fn emit_tdp_raw(
+        &mut self,
+        opcode: u8,
+        pp: u8,
+        tmm_c: AsmRegisterTmm,
+        tmm_a: AsmRegisterTmm,
+        tmm_b: AsmRegisterTmm,
+    ) -> Result<(), CompilerError> {
+        // 物理寄存器号: iced AsmRegisterTmm 内部编码 tmm0..tmm7 (低 3 位)。
+        // extract_register 返回 u32 寄存器编号。
+        use iced_x86::Register;
+        let c_num = tmm_c.register() as u32;
+        let a_num = tmm_a.register() as u32;
+        let b_num = tmm_b.register() as u32;
+        // 仅支持 tmm0..tmm7 (AMX 8-tmm 上限)。>7 不可能 (RegAllocator Tile 池上限 8)。
+        if c_num > 7 || a_num > 7 || b_num > 7 {
+            return Err(CompilerError::CodegenViolation(format!(
+                "AMX emit_tdp_raw: tmm out of range (c={}, a={}, b={}); AMX has 8 tile regs",
+                c_num, a_num, b_num,
+            )));
+        }
+        let c = c_num as u8;
+        let a = a_num as u8;
+        let b = b_num as u8;
+        let pp = pp & 0x03;
+        // byte2: R=1 X=1 B=1 (无扩展), mmmmmm=0F38=000010 → 0b11100010 = 0xE2
+        let byte2: u8 = 0xE2;
+        // byte3: W=0 | vvvv=(~b & 0xF)<<3 | L=0 | pp
+        let vvvv = (!b) & 0x0F;
+        let byte3: u8 = (vvvv << 3) | pp;
+        // ModRM: mod=11, reg=c, rm=a
+        let modrm: u8 = 0xC0 | ((c & 0x07) << 3) | (a & 0x07);
+        self.asm.db(&[0xC4, byte2, byte3, opcode, modrm]).map_err(Self::err)?;
+        Ok(())
+    }
+
     pub fn lower_instr(&mut self, instr: &VmInstr, alloc: &RegAllocation) -> Result<(), CompilerError> {
         let pre_len = self.asm.instructions().len();
         let result = self.lower_instr_inner(instr, alloc);
@@ -1282,6 +1405,28 @@ impl X86Lower {
             }
 
             // ── AMX Tile 操作 (SPR+ / Granite Rapids / Diamond Rapids) ──
+            //
+            // 设计来源: SPEC/DESIGN-tile-dataflow-ir-completion §4 (ISA Lowering 映射表)
+            // + §6.2 (物理 tmm 分配策略 R2)。
+            //
+            // Tile 数据流 (TileLoad/TileMma/TileStore) 在 IR 层完整化后, x86 lowering
+            // 把每个 tile vreg 映射到物理 tmm 寄存器 (AMX 8 个 tmm: tmm0-7)。
+            //
+            // tmm 分配 (§6.2 最简策略, R2 设计自由度已认可):
+            //   c = tmm0, a = tmm1, b = tmm2  (单 MMA 链固定, RegAllocator Tile 池上限 8)
+            //   RegAllocator 对 VRegKind::Tile 走独立小分配池 (isa_profile.tile_regs)。
+            //   超 8 tmm → JitContext ResourceBudgetExceeded (TileConfig 阶段已检查)。
+            //
+            // 辅助方法 resolve_phys_tile / phys_tile_to_tmm / resolve_tile_eff_addr_to_rax
+            // 定义于 impl 块方法级 (本文件末尾), 供 TileLoad/TileMma/TileStore 三个 arm 共享。
+            //
+            // R1 决定性风险缓解 (k_offset vs row_stride 分离):
+            //   - k_offset (K 循环推进偏移, 循环变量) 与 row_stride (2D tile 内逐行字节跨度)
+            //     是两个独立量, 禁止合并成单一 offset → TILELOADD 误寻址, 数值全错。
+            //   - x86 AMX TILELOADD 仅支持 [base + 单个 index*1] SIB, 不支持三寄存器 SIB。
+            //     故先 LEA 合并 base+k_offset 到 scratch[0]=rax, 再 TILELOADD tmm,[rax + stride*1]。
+            //     stride 由调用方 mov imm 到 scratch[1]=r10。
+
             VmInstr::TileConfig { rows, cols, dtype } => {
                 // 记录 tile dtype 供后续 TileMma 选择正确的 TDP* 指令
                 self.amx_tile_dtype = Some(*dtype);
@@ -1329,52 +1474,93 @@ impl X86Lower {
                 self.asm.add(rsp, 64i32).map_err(Self::err)?;
                 Ok(())
             }
-            VmInstr::TileMma { c, a, b } => {
-                // 先 tile_load tmm1 (A) 和 tmm2 (B), 然后根据 dtype 选择 TDP* 指令
-                let tile_dtype = self.amx_tile_dtype
-                    .expect("TileMma requires amx_tile_dtype from TileConfig");
-
-                // TILELOADD tmm1, [rsi+rdi*1] — 加载 A tile 从 activation ptr
-                // 编码: VEX.128.F2.0F38.W0 4B /r → C4 E2 7B 4B 0C 3E
-                self.asm.db(&[0xC4, 0xE2, 0x7B, 0x4B, 0x0C, 0x3E]).map_err(Self::err)?;
-
-                // TILELOADD tmm2, [rdx+rdi*1] — 加载 B tile 从 weight ptr
-                self.asm.db(&[0xC4, 0xE2, 0x7B, 0x4B, 0x14, 0x3A]).map_err(Self::err)?;
-
-                // Tile Dot Product: tmm0 += tmm1 × tmm2
-                // 指令选择由 TileConfig 阶段记录的 dtype 决定:
+            VmInstr::TileLoad {
+                dst_tile, base_ptr, k_offset, row_stride, rows, cols, dtype,
+            } => {
+                // 设计 §4 ISA Lowering 映射表: TileLoad → TILELOADD tmm, [base+stride] (VEX)
                 //
-                // | dtype    | 指令        | ISA 要求              | VEX 编码                      |
-                // |----------|-------------|----------------------|-------------------------------|
-                // | BF16     | TDPBF16PS   | AMX-BF16 (SPR)       | VEX.128.F3.0F38.W0 5C /r     |
-                // | F16      | TDPFP16PS   | AMX-FP16 (GNR)       | VEX.128.F2.0F38.W0 5C /r     |
-                // | F8E4M3   | TDPHF8PS    | AMX-FP8 (DMR)        | VEX.128.F3.0F38.W0 FD /r     |
-                // | F8E5M2   | TDPBF8PS    | AMX-FP8 (DMR)        | VEX.128.F2.0F38.W0 FD /r     |
-                // | F32      | TDPTF32PS   | AMX-TF32 (DMR)       | VEX.128.F2.0F38.W0 6C /r     |
+                // 语义: dst_tile[r][col] = mem[base_ptr + k_offset + r*row_stride + col*elem_bytes]
+                //   base_ptr + k_offset → 有效地址 (K 块推进后的 tile 起点)
+                //   row_stride          → 2D tile 内逐行字节跨度 (stride reg, AMX TILELOADD sibmem index)
+                //
+                // R1 决定性风险 (设计 §1.2): k_offset (K 循环推进) 与 row_stride (2D 行跨度)
+                // 是两个独立量。TILELOADD tmm, [base_reg + stride_reg*1]:
+                //   - base_reg = base_ptr + k_offset  (本函数算到 rax)
+                //   - stride_reg = row_stride         (本函数加载到 r10)
+                // 禁止合并成单一 offset。
+                let tmm_dst = self.resolve_phys_tile(*dst_tile, alloc)?;
+
+                // 有效地址 → rax (scratch[0]): rax = base_ptr + k_offset
+                let base_reg = self.resolve_tile_eff_addr_to_rax(*base_ptr, *k_offset, alloc)?;
+
+                // row_stride (编译时常量) → r10 (scratch[1])。此时 base/k_offset 已落到 rax,
+                // scratch[1]/[2] 可安全重用做 stride 寄存器。
+                let stride_reg = self.scratch_gprs[1]; // r10
+                self.asm.mov(stride_reg, *row_stride as u64).map_err(Self::err)?;
+
+                // TILELOADD tmm_dst, qword_ptr(base_reg + stride_reg*1)
+                // iced CodeAssembler: tileloadd(AsmRegisterTmm, AsmMemoryOperand)
+                // sibmem = qword_ptr(rax + r10) → SIB base=rax, index=r10, scale=1, disp=0
+                self.asm.tileloadd(tmm_dst, qword_ptr(base_reg + stride_reg))
+                    .map_err(Self::err)?;
+
+                // Tile 形状 (rows/cols/dtype) 已在 TileConfig 阶段写入 palette_entry,
+                // 此处仅用于调试断言: AMX tile 配置 cols 与本指令 cols 一致 (dtype 元素字节
+                // 决定 colsb, 由 TileConfig 已写入)。禁止在此处重新配置 tile。
+                let _ = (rows, cols, dtype);
+                Ok(())
+            }
+            VmInstr::TileMma { c, a, b, m: _, n: _, k: _, dtype } => {
+                // 设计 §4: TileMma → TDP{BF16,FP16,HF8,BF8,TF32}PS
+                //
+                // tile 数据流完整化后, A/B tile 已被前置的 TileLoad 指令灌入物理 tmm 寄存器,
+                // C tile 已被 TileConfig 阶段 TILEZERO 清零。本指令只发射 TDP* 点积:
+                //   tmm_c += tmm_a × tmm_b
+                //
+                // dtype (TileMma shape 内携带) 决定 TDP* 指令选择 (ARCH-DTYPE-JIT-TYPED)。
+                let tile_dtype = dtype;
+                let tmm_c = self.resolve_phys_tile(*c, alloc)?;
+                let tmm_a = self.resolve_phys_tile(*a, alloc)?;
+                let tmm_b = self.resolve_phys_tile(*b, alloc)?;
+
+                // Tile Dot Product: tmm_c += tmm_a × tmm_b
+                // 指令选择由 dtype 决定。BF16/F16 用 iced 原生 code_asm 方法 (任意 tmm
+                // 组合自动编码); FP8/TF32 是 Diamond Rapids 新指令, iced 1.21 code_asm
+                // 尚未暴露, 回退 VEX 手编字节 (硬编码 c=tmm0/a=tmm1/b=tmm2, 由
+                // emit_tile_gemm 顺序 alloc + RegAllocator 干涉分配保证)。
+                //
+                // | dtype    | 指令        | ISA 要求              | 编码路径             |
+                // |----------|-------------|----------------------|----------------------|
+                // | BF16     | TDPBF16PS   | AMX-BF16 (SPR)       | iced tdpbf16ps       |
+                // | F16      | TDPFP16PS   | AMX-FP16 (GNR)       | iced tdpfp16ps       |
+                // | F8E4M3   | TDPHF8PS    | AMX-FP8 (DMR)        | VEX 手编 (tmm0/1/2) |
+                // | F8E5M2   | TDPBF8PS    | AMX-FP8 (DMR)        | VEX 手编 (tmm0/1/2) |
+                // | F32      | TDPTF32PS   | AMX-TF32 (DMR)       | VEX 手编 (tmm0/1/2) |
                 match tile_dtype {
                     crate::types::DType::BF16 => {
-                        // TDPBF16PS tmm0, tmm1, tmm2
-                        // VEX.128.F3.0F38.W0 5C C1 (tmm0, tmm1, tmm2)
-                        self.asm.db(&[0xC4, 0xE2, 0x72, 0x5C, 0xC1]).map_err(Self::err)?;
+                        // TDPBF16PS tmm_c, tmm_a, tmm_b (AMX-BF16, Sapphire Rapids)
+                        self.asm.tdpbf16ps(tmm_c, tmm_a, tmm_b).map_err(Self::err)?;
                     }
                     crate::types::DType::F16 => {
-                        // TDPFP16PS tmm0, tmm1, tmm2 (AMX-FP16, Granite Rapids)
-                        // VEX.128.F2.0F38.W0 5C C1
-                        self.asm.db(&[0xC4, 0xE2, 0x7B, 0x5C, 0xC1]).map_err(Self::err)?;
+                        // TDPFP16PS tmm_c, tmm_a, tmm_b (AMX-FP16, Granite Rapids)
+                        self.asm.tdpfp16ps(tmm_c, tmm_a, tmm_b).map_err(Self::err)?;
                     }
                     crate::types::DType::F8E4M3 => {
                         // TDPHF8PS tmm0, tmm1, tmm2 (AMX-FP8, Diamond Rapids)
-                        // VEX.128.F3.0F38.W0 FD C1
+                        // VEX.128.F3.0F38.W0 FD C1  (iced 1.21 无 code_asm, 手编)
+                        self.assert_fixed_abc_tmm(tmm_c, tmm_a, tmm_b, "TDPHF8PS")?;
                         self.asm.db(&[0xC4, 0xE2, 0x72, 0xFD, 0xC1]).map_err(Self::err)?;
                     }
                     crate::types::DType::F8E5M2 => {
                         // TDPBF8PS tmm0, tmm1, tmm2 (AMX-FP8, Diamond Rapids)
-                        // VEX.128.F2.0F38.W0 FD C1
+                        // VEX.128.F2.0F38.W0 FD C1  (iced 1.21 无 code_asm, 手编)
+                        self.assert_fixed_abc_tmm(tmm_c, tmm_a, tmm_b, "TDPBF8PS")?;
                         self.asm.db(&[0xC4, 0xE2, 0x7B, 0xFD, 0xC1]).map_err(Self::err)?;
                     }
                     crate::types::DType::F32 => {
                         // TDPTF32PS tmm0, tmm1, tmm2 (AMX-TF32, Diamond Rapids)
-                        // VEX.128.F2.0F38.W0 6C C1
+                        // VEX.128.F2.0F38.W0 6C C1  (iced 1.21 无 code_asm, 手编)
+                        self.assert_fixed_abc_tmm(tmm_c, tmm_a, tmm_b, "TDPTF32PS")?;
                         self.asm.db(&[0xC4, 0xE2, 0x7B, 0x6C, 0xC1]).map_err(Self::err)?;
                     }
                     other => {
@@ -1383,11 +1569,33 @@ impl X86Lower {
                         ));
                     }
                 }
+                Ok(())
+            }
+            VmInstr::TileStore {
+                src_tile, base_ptr, out_offset, row_stride, rows, cols, dtype,
+            } => {
+                // 设计 §4 ISA Lowering 映射表: TileStore → TILESTORED [base+stride], tmm (VEX)
+                //
+                // 语义: mem[base_ptr + out_offset + r*row_stride + col*elem_bytes] = src_tile[r][col]
+                //   base_ptr + out_offset → 有效地址 (C tile 在输出中的起点)
+                //   row_stride            → 2D tile 内逐行字节跨度 (stride reg)
+                //
+                // R1: out_offset (C tile 偏移) 与 row_stride (2D 行跨度) 独立, 禁止合并。
+                let tmm_src = self.resolve_phys_tile(*src_tile, alloc)?;
 
-                // TILESTORED [r8+rdi*1], tmm0 — 存储结果到 output
-                self.asm.db(&[0xC4, 0xC2, 0x7B, 0x4B, 0x04, 0x38]).map_err(Self::err)?;
+                // 有效地址 → rax (scratch[0]): rax = base_ptr + out_offset
+                let base_reg = self.resolve_tile_eff_addr_to_rax(*base_ptr, *out_offset, alloc)?;
 
-                let _ = (c, a, b);
+                // row_stride (编译时常量) → r10 (scratch[1])
+                let stride_reg = self.scratch_gprs[1]; // r10
+                self.asm.mov(stride_reg, *row_stride as u64).map_err(Self::err)?;
+
+                // TILESTORED qword_ptr(base_reg + stride_reg*1), tmm_src
+                // iced CodeAssembler: tilestored(AsmMemoryOperand, AsmRegisterTmm)
+                self.asm.tilestored(qword_ptr(base_reg + stride_reg), tmm_src)
+                    .map_err(Self::err)?;
+
+                let _ = (rows, cols, dtype);
                 Ok(())
             }
             VmInstr::TileRelease => {

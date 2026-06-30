@@ -725,7 +725,18 @@ impl<'a> RegAllocator<'a> {
                 v.extend(action.vregs());
                 v
             }
-            VmInstr::TileMma { c, a, b } => vec![*c, *a, *b],
+            // HW-TIER TASK-D §4/§6.2: Tile 数据流 IR vreg 操作数。
+            //   TileLoad  { dst_tile, base_ptr, k_offset, row_stride, rows, cols, dtype }
+            //   TileMma   { c, a, b, m, n, k, dtype }
+            //   TileStore { src_tile, base_ptr, out_offset, row_stride, rows, cols, dtype }
+            // 所有 vreg 操作数 (tile + base_ptr + k_offset/out_offset) 必须列出, 否则
+            // RegAllocator 漏掉 base_ptr/k_offset 的活性区间 → ISA Lower 阶段 resolve 报错。
+            // row_stride/rows/cols/dtype 是编译时常量, 非 vreg。
+            // tmm 分配 (§6.2): RegAllocator 对 VRegKind::Tile 走独立 Tile 池
+            // (isa_profile.tile_regs, AMX 上限 8 个 tmm0..tmm7), 映射 PhysReg::Tile。
+            VmInstr::TileLoad { dst_tile, base_ptr, k_offset, .. } => vec![*dst_tile, *base_ptr, *k_offset],
+            VmInstr::TileMma { c, a, b, .. } => vec![*c, *a, *b],
+            VmInstr::TileStore { src_tile, base_ptr, out_offset, .. } => vec![*src_tile, *base_ptr, *out_offset],
             VmInstr::SparseMaskIntersect { dst_k0, dst_k1, a, b } => vec![*dst_k0, *dst_k1, *a, *b],
             VmInstr::ScalarLoad { dst, base, offset } => {
                 let mut v = vec![*dst, *base];
@@ -987,6 +998,9 @@ impl<'a> RegAllocator<'a> {
         let mut mapping: HashMap<VRegId, PhysReg> = HashMap::new();
         let mut gpr_used: HashSet<PhysGpr> = HashSet::new();
         let mut vec_used: HashSet<PhysVec> = HashSet::new();
+        // HW-TIER TASK-D §6.2: 独立 Tile 池 (AMX 8 上限 tmm0..tmm7)。
+        // 每个 tile vreg 独占一个 PhysTile, 禁止全部映射到 .first() (旧 bug)。
+        let mut tile_used: HashSet<PhysTile> = HashSet::new();
         let mut scoped_alloc = super::stack_frame::ScopedSpillAllocator::new();
 
         // 两阶段排序 (ARCH-REGALLOC-COUNTER-PRIORITY + REQ-LC-003):
@@ -1013,6 +1027,11 @@ impl<'a> RegAllocator<'a> {
             let occupied_vec: HashSet<PhysVec> = interference.neighbors(iv.vreg)
                 .filter_map(|n| mapping.get(n))
                 .filter_map(|p| match p { PhysReg::Vec(v) => Some(*v), _ => None })
+                .collect();
+            // HW-TIER TASK-D §6.2: Tile 干涉邻居占用集 (避免两个 live tile vreg 复用同一 tmm)
+            let occupied_tile: HashSet<PhysTile> = interference.neighbors(iv.vreg)
+                .filter_map(|n| mapping.get(n))
+                .filter_map(|p| match p { PhysReg::Tile(t) => Some(*t), _ => None })
                 .collect();
 
             match iv.kind {
@@ -1062,8 +1081,19 @@ impl<'a> RegAllocator<'a> {
                     }
                 }
                 VRegKind::Tile => {
-                    if let Some(reg) = self.profile.tile_regs.first() {
+                    // HW-TIER TASK-D §6.2: 独立 Tile 池分配 — 每个 tile vreg 独占一个
+                    // PhysTile (tmm0..tmm7), 避开干涉邻居已占用的 tmm。超出 8 上限 → Err。
+                    // 物理 tmm 分配由 reg_alloc 统一管理; tile-vreg→tmm 映射存于 mapping。
+                    if let Some(reg) = self.profile.tile_regs.iter()
+                        .find(|r| !occupied_tile.contains(r) && !tile_used.contains(r))
+                    {
                         mapping.insert(iv.vreg, PhysReg::Tile(*reg));
+                        tile_used.insert(*reg);
+                    } else {
+                        return Err(format!(
+                            "RegAllocator: Tile pool exhausted (AMX 8-tmm limit) — cannot allocate v{} ({:?})",
+                            iv.vreg.0, iv.kind
+                        ));
                     }
                 }
                 VRegKind::Mask => {
