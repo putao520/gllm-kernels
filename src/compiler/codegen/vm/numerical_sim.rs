@@ -1709,6 +1709,22 @@ fn load_elem_from_buffer(
             let bytes = [buf[byte_off], buf[byte_off + 1]];
             Ok(half::f16::from_le_bytes(bytes).to_f32())
         }
+        QuantPrecision::FP8E4M3 => {
+            if byte_off + 1 > buf.len() {
+                return Err(CompilerError::CodegenViolation(format!(
+                    "VmInterp: VecLoad FP8E4M3 OOB in '{}': off {} (len {})", buf_name, byte_off, buf.len()
+                )));
+            }
+            Ok(e4m3_to_f32(buf[byte_off]))
+        }
+        QuantPrecision::FP8E5M2 => {
+            if byte_off + 1 > buf.len() {
+                return Err(CompilerError::CodegenViolation(format!(
+                    "VmInterp: VecLoad FP8E5M2 OOB in '{}': off {} (len {})", buf_name, byte_off, buf.len()
+                )));
+            }
+            Ok(e5m2_to_f32(buf[byte_off]))
+        }
         _ => Err(CompilerError::CodegenViolation(format!(
             "VmInterp: VecLoad dtype {:?} not supported by interpreter", dtype
         ))),
@@ -1757,6 +1773,24 @@ fn store_elem_to_buffer(
             let f = half::f16::from_f32(val);
             let b = f.to_le_bytes();
             buf[byte_off..byte_off + 2].copy_from_slice(&b);
+            Ok(())
+        }
+        QuantPrecision::FP8E4M3 => {
+            if byte_off + 1 > buf.len() {
+                return Err(CompilerError::CodegenViolation(format!(
+                    "VmInterp: VecStore FP8E4M3 OOB in '{}': off {} (len {})", buf_name, byte_off, buf.len()
+                )));
+            }
+            buf[byte_off] = f32_to_e4m3(val);
+            Ok(())
+        }
+        QuantPrecision::FP8E5M2 => {
+            if byte_off + 1 > buf.len() {
+                return Err(CompilerError::CodegenViolation(format!(
+                    "VmInterp: VecStore FP8E5M2 OOB in '{}': off {} (len {})", buf_name, byte_off, buf.len()
+                )));
+            }
+            buf[byte_off] = f32_to_e5m2(val);
             Ok(())
         }
         _ => Err(CompilerError::CodegenViolation(format!(
@@ -1898,6 +1932,39 @@ fn exec_vm_instr(
         // 输入按 dtype round-trip 窄化 (R4), 累加器始终 F32 (AMX/TC 累加器为 F32)。
         VmInstr::TileConfig { .. } | VmInstr::TileRelease => Ok(()),
 
+        // GprLoadImm: 灌立即数到 GPR (emit_tile_gemm 写 c_off=0 用), 解释器存 lane 0。
+        // @trace REQ-HW-TIER-007 [req:VmInstr-TileLoad] tile 路径 GPR 立即数支持
+        VmInstr::GprLoadImm { dst, value } => {
+            state.set_reg(*dst, vec![*value as f32]);
+            Ok(())
+        }
+
+        // GprBinOp: GPR 二元运算 (emit_tile_gemm 派生 B 的 K 偏移用, op=Mul)。
+        // a 操作数可为 loop counter / byte_offset / 普通 GPR; 结果存 dst lane 0。
+        // @trace REQ-HW-TIER-007 [req:VmInstr-TileLoad] tile 路径 GPR 算术支持
+        VmInstr::GprBinOp { dst, a, b, op } => {
+            let av = state.resolve_byte_offset(*a)? as i64;
+            let bv = match b {
+                super::instr::GprOperand::VReg(v) => state.resolve_byte_offset(*v)? as i64,
+                super::instr::GprOperand::Imm(v) => *v,
+            };
+            let rv = match op {
+                super::instr::GprOp::Add => av + bv,
+                super::instr::GprOp::Sub => av - bv,
+                super::instr::GprOp::Mul => av * bv,
+                super::instr::GprOp::Div => if bv == 0 { return Err(CompilerError::CodegenViolation(
+                    "VmInterp: GprBinOp Div by zero".into())); } else { av / bv },
+                super::instr::GprOp::Shl => av << bv,
+                super::instr::GprOp::Shr => av >> bv,
+                super::instr::GprOp::And => av & bv,
+                super::instr::GprOp::Or => av | bv,
+                super::instr::GprOp::Xor => av ^ bv,
+                super::instr::GprOp::BitTest => if (av & bv) != 0 { 1 } else { 0 },
+            };
+            state.set_reg(*dst, vec![rv as f32]);
+            Ok(())
+        }
+
         VmInstr::TileLoad { dst_tile, base_ptr, k_offset, row_stride, rows, cols, dtype } => {
             // 语义: dst_tile[r][c] = mem[base_ptr + k_offset + r*row_stride + c*elem_bytes]
             let buf_name = state.ptr_names.get(base_ptr).cloned().ok_or_else(|| {
@@ -2009,14 +2076,7 @@ fn exec_vm_instr(
     }
 }
 
-/// F32 → dst_dtype round-trip (模拟窄化的精度损失)。
-fn narrow_to_dtype(val: f32, dst_dtype: QuantPrecision) -> f32 {
-    match dst_dtype {
-        QuantPrecision::BF16 => half::bf16::from_f32(val).to_f32(),
-        QuantPrecision::F16 => half::f16::from_f32(val).to_f32(),
-        _ => val, // F32/其他: 无损
-    }
-}
+/// F32 → dst_dtype round-trip (模拟窄化的精度损失)。定义见 §B.2 (FP8 E4M3/E5M2 支持)。
 
 /// 解释 VmProgram: 执行指令序列, LoopBegin/LoopEnd 用迭代展开。
 ///
@@ -2101,6 +2161,144 @@ fn find_matching_loop_end(instrs: &[VmInstr], loop_begin_pc: usize) -> Option<us
 // §B.2 scalar GEMM reference oracle (CR-TIER-SOVEREIGNTY-004 标尺)
 // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
+/// FP8 E4M3 编码: 1 符号 + 4 指数 + 3 尾数, bias=7, 无 inf (max=448), NaN=0x7F。
+/// 参考 OCP FP8 E4M3 规范。round-to-nearest-even。
+fn f32_to_e4m3(v: f32) -> u8 {
+    if v.is_nan() { return 0x7F; }
+    let bits = v.to_bits();
+    let sign = (bits >> 31) & 1;
+    let abs = f32::from_bits(bits & 0x7FFF_FFFF);
+    // E4M3: bias=7; 指数域 0..=15 (15 全 1 仍为有限 max, 非 inf)
+    // 最大正规数 = 1.111b × 2^(15-7) = 1.75 × 256 = 448
+    let abs = if abs > 448.0 { 448.0 } else { abs };
+    // 提取 f32 的指数/尾数, 转换到 E4M3 表示
+    let e = (abs.to_bits() >> 23) as i32;
+    let f32_bias: i32 = 127;
+    let m23 = abs.to_bits() & 0x7F_FFFF;
+    if abs == 0.0 {
+        return (sign as u8) << 7;
+    }
+    let exp = e - f32_bias; // 真实指数
+    // E4M3 指数域 E ∈ [0,15], 真实指数 = E - 7 ∈ [-7, 8]
+    // 非正规: E=0, 真实指数 = 1-7 = -6 (隐含位=0)
+    // 规范: E∈[1,15], 真实指数 = E-7 ∈ [-6, 8]
+    // 把 f32 的 (exp, m23) round 到 3 位尾数 + 4 位指数
+    // 先求 E4M3 的 E: 真实指数 + 7, 但要处理非正规/规范边界
+    // 用 round-to-nearest: 把 f32 值量化到 E4M3 网格
+    let mut e4 = exp + 7;
+    // 尾数: f32 23 位 → E4M3 规范 3 位 (隐含 1) 或非规范 3 位
+    let m3 = if e4 <= 0 {
+        // 非规范: 真实值 = m3_bits × 2^(-9), m3 ∈ [0,7]
+        e4 = 0;
+        // abs × 2^9 round 到整数 (0..8)
+        let scaled = abs * (1u64 << 9) as f32;
+        scaled.round() as i32
+    } else {
+        // 规范: 尾数 = m23 的 top 3 位 + round
+        // f32 尾数 23 位, 取 top 3, round 剩余 20 位
+        let top3 = (m23 >> 20) as i32; // 0..7
+        let rem = m23 & 0xF_FFFF; // 20 位余数
+        let half = 0x80_000u32; // 0.5 in 20-bit fixed
+        let mut m = top3;
+        if rem > half || (rem == half && (top3 & 1) == 1) {
+            m += 1; // round to nearest even
+            if m > 7 {
+                m = 0; // 尾数溢出 → 指数进位
+                e4 += 1;
+            }
+        }
+        if e4 > 15 {
+            // 上溢 → max (E=15, M=7) = 1.75 × 2^8 = 448
+            e4 = 15;
+            7
+        } else {
+            m
+        }
+    };
+    let e4 = e4.clamp(0, 15);
+    let m3 = m3.clamp(0, 7);
+    ((sign as u8) << 7) | ((e4 as u8) << 3) | (m3 as u8)
+}
+
+/// FP8 E4M3 解码 → f32。
+fn e4m3_to_f32(b: u8) -> f32 {
+    let sign = (b >> 7) & 1;
+    let e = (b >> 3) & 0x0F;
+    let m = b & 0x07;
+    let abs = if e == 0 {
+        // 非规范: 0 或 m × 2^(-9)
+        if m == 0 { 0.0f32 } else { (m as f32) * (1.0f32 / 512.0f32) }
+    } else if e == 15 && m == 7 {
+        // NaN
+        return f32::NAN;
+    } else {
+        // 规范: (1 + m/8) × 2^(e-7)
+        let mant = 1.0f32 + (m as f32) / 8.0f32;
+        mant * (2.0f32).powi(e as i32 - 7)
+    };
+    if sign == 1 { -abs } else { abs }
+}
+
+/// FP8 E5M2 编码: 1 符号 + 5 指数 + 2 尾数, bias=15, inf=0x7C, NaN=0x7E/0x7F。
+fn f32_to_e5m2(v: f32) -> u8 {
+    if v.is_nan() { return 0x7F; }
+    if v.is_infinite() { return if v > 0.0 { 0x7C } else { 0xFC }; }
+    let bits = v.to_bits();
+    let sign = (bits >> 31) & 1;
+    let abs = f32::from_bits(bits & 0x7FFF_FFFF);
+    if abs == 0.0 { return (sign as u8) << 7; }
+    // E5M2 最大正规数 = 1.75 × 2^(30-15) = 57344
+    let abs = if abs > 57344.0 { 57344.0 } else { abs };
+    let e = (abs.to_bits() >> 23) as i32 - 127; // 真实指数
+    let m23 = abs.to_bits() & 0x7F_FFFF;
+    let mut e5 = e + 15;
+    let m2 = if e5 <= 0 {
+        e5 = 0;
+        let scaled = abs * (1u64 << 10) as f32;
+        scaled.round() as i32
+    } else {
+        let top2 = (m23 >> 21) as i32;
+        let rem = m23 & 0x1F_FFFF;
+        let half = 0x10_0000u32;
+        let mut m = top2;
+        if rem > half || (rem == half && (top2 & 1) == 1) {
+            m += 1;
+            if m > 3 { m = 0; e5 += 1; }
+        }
+        if e5 > 30 { e5 = 30; 3 } else { m }
+    };
+    let e5 = e5.clamp(0, 30);
+    let m2 = m2.clamp(0, 3);
+    ((sign as u8) << 7) | ((e5 as u8) << 2) | (m2 as u8)
+}
+
+/// FP8 E5M2 解码 → f32。
+fn e5m2_to_f32(b: u8) -> f32 {
+    let sign = (b >> 7) & 1;
+    let e = (b >> 2) & 0x1F;
+    let m = b & 0x03;
+    let abs = if e == 0 {
+        if m == 0 { 0.0f32 } else { (m as f32) * (1.0f32 / 1024.0f32) }
+    } else if e == 31 {
+        if m == 0 { return f32::INFINITY; } else { return f32::NAN; }
+    } else {
+        let mant = 1.0f32 + (m as f32) / 4.0f32;
+        mant * (2.0f32).powi(e as i32 - 15)
+    };
+    if sign == 1 { -abs } else { abs }
+}
+
+/// f32 → dst_dtype round-trip (模拟窄化的精度损失)。
+fn narrow_to_dtype(val: f32, dst_dtype: QuantPrecision) -> f32 {
+    match dst_dtype {
+        QuantPrecision::BF16 => half::bf16::from_f32(val).to_f32(),
+        QuantPrecision::F16 => half::f16::from_f32(val).to_f32(),
+        QuantPrecision::FP8E4M3 => e4m3_to_f32(f32_to_e4m3(val)),
+        QuantPrecision::FP8E5M2 => e5m2_to_f32(f32_to_e5m2(val)),
+        _ => val, // F32/其他: 无损
+    }
+}
+
 /// Scalar GEMM reference: C[m][n] = Σ_p A[m][p] × B[p][n]。
 ///
 /// 这是跨等级验证的**正确性 oracle** (标尺), 不是 native benchmark。所有 OpImpl
@@ -2142,8 +2340,14 @@ fn encode_matrix_bytes(data: &[f32], dtype: QuantPrecision) -> Vec<u8> {
                 let f = half::f16::from_f32(v);
                 buf[off..off + 2].copy_from_slice(&f.to_le_bytes());
             }
+            QuantPrecision::FP8E4M3 => {
+                buf[off] = f32_to_e4m3(v);
+            }
+            QuantPrecision::FP8E5M2 => {
+                buf[off] = f32_to_e5m2(v);
+            }
             _ => {
-                // 解释器仅支持 F32/BF16/F16 GEMM; 其他 dtype 在调用前应被过滤。
+                // 解释器仅支持 F32/BF16/F16/FP8 GEMM; 其他 dtype 在调用前应被过滤。
                 buf[off..off + 4].copy_from_slice(&v.to_le_bytes());
             }
         }
@@ -2167,6 +2371,12 @@ fn decode_matrix_bytes(buf: &[u8], count: usize, dtype: QuantPrecision) -> Vec<f
             QuantPrecision::F16 => {
                 out.push(half::f16::from_le_bytes([buf[off], buf[off+1]]).to_f32());
             }
+            QuantPrecision::FP8E4M3 => {
+                out.push(e4m3_to_f32(buf[off]));
+            }
+            QuantPrecision::FP8E5M2 => {
+                out.push(e5m2_to_f32(buf[off]));
+            }
             _ => {
                 out.push(f32::from_le_bytes([buf[off], buf[off+1], buf[off+2], buf[off+3]]));
             }
@@ -2178,9 +2388,11 @@ fn decode_matrix_bytes(buf: &[u8], count: usize, dtype: QuantPrecision) -> Vec<f
 /// 按 dtype 返回跨等级验证容差 (CR-TIER-SOVEREIGNTY-004: BF16 ~1e-2, F32 ~1e-5)。
 pub fn tolerance_for(dtype: QuantPrecision) -> f32 {
     match dtype {
-        QuantPrecision::F32 => 1e-5,
-        QuantPrecision::BF16 => 1e-2,  // BF16: 7 mantissa bits → ~0.008 relative
-        QuantPrecision::F16 => 1e-3,   // F16: 10 mantissa bits → ~0.001 relative
+        QuantPrecision::F32 => 1e-5,  // F32: 23 mantissa bits → ~1.2e-7
+        QuantPrecision::BF16 => 1e-2, // BF16: 7 mantissa bits → ~0.008 relative
+        QuantPrecision::F16 => 1e-3,  // F16: 10 mantissa bits → ~0.001 relative
+        QuantPrecision::FP8E4M3 => 1.0, // FP8 E4M3: 3 mantissa bits → ~0.06 rel; abs 1.0 (累加噪声)
+        QuantPrecision::FP8E5M2 => 2.0, // FP8 E5M2: 2 mantissa bits → ~0.12 rel; abs 2.0 (累加噪声)
         _ => 1e-2,
     }
 }
@@ -2243,6 +2455,8 @@ pub fn verify_op_impl_aligns_scalar(
         QuantPrecision::F32 => 1e-5,
         QuantPrecision::BF16 => 2e-2,
         QuantPrecision::F16 => 2e-3,
+        QuantPrecision::FP8E4M3 => 1e-1,  // FP8 E4M3: ~6% 相对, 累加噪声留 10%
+        QuantPrecision::FP8E5M2 => 2e-1,  // FP8 E5M2: ~12% 相对, 累加噪声留 20%
         _ => 2e-2,
     };
     let tol = abs_tol.max(rel_eps * max_abs);

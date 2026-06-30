@@ -43,26 +43,40 @@ pub(crate) fn emit_tile_gemm(
     let tile_b = prog.alloc_vreg(VRegKind::Tile, width);
 
     // 行跨度 = 列数 × 元素字节宽 (2D tile 内逐行字节跨度, 与 K 循环偏移独立)。
-    let a_row_stride = kd * dt.size_bytes();   // A: rows×kd, 行跨 = kd*elem
-    let b_row_stride = cols * dt.size_bytes(); // B: kd×cols, 行跨 = cols*elem
-    let c_row_stride = cols * dt.size_bytes(); // C: rows×cols, 行跨 = cols*elem
+    // A/B/C 均为标准 row-major (顺应 scalar oracle 数据布局, ARCH-JIT-DATA-YIELDS):
+    //   A: rows×k  → 行跨 = k*elem (非 kd*elem; tile 是 rows×kd 的子块, 行跨沿用全 K 行跨)
+    //   B: k×cols  → 行跨 = cols*elem
+    //   C: rows×cols → 行跨 = cols*elem
+    let a_row_stride = k * dt.size_bytes();      // A: rows×k, 行跨 = k*elem
+    let b_row_stride = cols * dt.size_bytes();   // B: kd×cols 子块, 行跨 = cols*elem
+    let c_row_stride = cols * dt.size_bytes();   // C: rows×cols, 行跨 = cols*elem
 
     prog.emit(VmInstr::TileConfig { rows, cols, dtype: dt });
 
     let k_tiles = (k + kd - 1) / kd;
-    // off = 当前 K 块字节偏移 (循环变量推进 base, 每次 += kd*elem_bytes)。
+    // K 循环: byte_offset (a_off) 按 kd*elem 推进 (A 的 K 维连续, 因 A 行优先 K 在尾维)。
+    // B 的 K 维沿行推进 (行跨 cols*elem), 故 B 的字节偏移 = a_off * cols。
     prog.emit_loop(
         BoundExpr::Const(k_tiles),
         kd * dt.size_bytes(),
-        |prog, _ctr, off| {
-            // A tile: rows×kd, 从 a_ptr + off 加载 (K 维推进)。
+        |prog, ctr, a_off| {
+            // b_off = ctr × (kd × cols × elem) = a_off × cols (B 行跨 cols*elem × kd 行 per K-tile)。
+            // 用 GprBinOp(Mul) 从循环计数器派生, 解释器侧 resolve_byte_offset 经 get_scalar 读取。
+            let b_off = prog.alloc_vreg(VRegKind::Scalar, SimdWidth::Scalar);
+            prog.emit(VmInstr::GprBinOp {
+                dst: b_off,
+                a: ctr,
+                b: GprOperand::Imm((kd * cols * dt.size_bytes()) as i64),
+                op: GprOp::Mul,
+            });
+            // A tile: rows×kd, 从 a_ptr + a_off 加载 (K 维推进, 行跨 = k*elem)。
             prog.emit(VmInstr::TileLoad {
-                dst_tile: tile_a, base_ptr: a_ptr, k_offset: off,
+                dst_tile: tile_a, base_ptr: a_ptr, k_offset: a_off,
                 row_stride: a_row_stride, rows, cols: kd, dtype: dt,
             });
-            // B tile: kd×cols, 从 b_ptr + off 加载 (K 维推进)。
+            // B tile: kd×cols, 从 b_ptr + b_off 加载 (K 维推进, 行跨 = cols*elem)。
             prog.emit(VmInstr::TileLoad {
-                dst_tile: tile_b, base_ptr: b_ptr, k_offset: off,
+                dst_tile: tile_b, base_ptr: b_ptr, k_offset: b_off,
                 row_stride: b_row_stride, rows: kd, cols, dtype: dt,
             });
             // c += a × b  (a: rows×kd, b: kd×cols, c: rows×cols)
