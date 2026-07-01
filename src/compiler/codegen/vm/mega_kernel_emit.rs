@@ -749,6 +749,17 @@ pub fn prefill_fusion_params(profile: &crate::compiler::hardware_profile::Hardwa
             use_ld_nc: true,
             use_tensor_core_gemv: true,
         },
+        HardwareProfile::CudaSM120 => FusionParams {
+            // Blackwell consumer (RTX 5070 Ti): same tcgen05 ISA as SM100, but
+            // 128KB SMEM constrains tile → 128×128×32 keeps triple-buffer in budget.
+            gemm_tile: TileSize(128, 128, 32),
+            attention: AttentionMode::FlashAttention,
+            kv_mode: KvMode::WriteFull,
+            kv_pipeline_stages: 3,
+            use_dsmem_kv_share: false,
+            use_ld_nc: true,
+            use_tensor_core_gemv: true,
+        },
         HardwareProfile::CudaSM90 => FusionParams {
             gemm_tile: TileSize(128, 256, 64),
             attention: AttentionMode::FlashAttention,
@@ -832,6 +843,16 @@ pub fn decode_fusion_params(profile: &crate::compiler::hardware_profile::Hardwar
             attention: AttentionMode::IncrementalKvAttention,
             kv_mode: KvMode::ReadHistoryWriteOne,
             kv_pipeline_stages: 4,
+            use_dsmem_kv_share: true,
+            use_ld_nc: true,
+            use_tensor_core_gemv: true,
+        },
+        HardwareProfile::CudaSM120 => FusionParams {
+            // Blackwell consumer decode: tcgen05 GEMV, narrower SMEM → 3 stages.
+            gemm_tile: TileSize(1, 128, 32),
+            attention: AttentionMode::IncrementalKvAttention,
+            kv_mode: KvMode::ReadHistoryWriteOne,
+            kv_pipeline_stages: 3,
             use_dsmem_kv_share: true,
             use_ld_nc: true,
             use_tensor_core_gemv: true,

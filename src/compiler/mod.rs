@@ -843,7 +843,7 @@ impl InferenceCompiler {
 
         let registry = ScalarOpRegistry::with_defaults();
         let semantic_dag = SemanticDAG::from_graph(&graph, &registry);
-        let mut fusion_plan = fusion::fuse_with_dag_prebuilt(&graph, &semantic_dag, &exec_plan, Some(bottleneck_map));
+        let mut fusion_plan = fusion::fuse_with_dag_prebuilt(&graph, &semantic_dag, &exec_plan, Some(bottleneck_map), None);
         hw_constraints::enforce_constraints(&mut fusion_plan.groups, &graph, &exec_plan);
 
         let accel_registry = accel_registry::AccelerationRegistry::new();

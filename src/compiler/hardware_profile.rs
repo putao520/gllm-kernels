@@ -7,13 +7,14 @@
 use crate::dispatch::DeviceProfile;
 use crate::compiler::codegen::vm::isa_profile::Platform;
 
-/// 12 hardware profiles for topology-driven fusion.
+/// 13 hardware profiles for topology-driven fusion.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum HardwareProfile {
     // NVIDIA CUDA
     CudaSM80,      // Ampere (A100) — aggressive fusion, tensor cores
     CudaSM90,      // Hopper (H100) — max fusion, TMA, FP8
-    CudaSM100,     // Blackwell (B100+) — ultra-aggressive, FP4/FP6
+    CudaSM100,     // Blackwell Datacenter (B100/B200) — ultra-aggressive, FP4/FP6, TMEM, tcgen05.mma
+    CudaSM120,     // Blackwell Consumer (RTX 5070 Ti / 5090) — SM 12.0, tcgen05.mma, NVFP4, no NVLink
 
     // AMD ROCm
     RocmMI200,     // CDNA2 (MI200) — matrix cores, 64-wide wavefront
@@ -37,11 +38,12 @@ pub enum HardwareProfile {
 }
 
 impl HardwareProfile {
-    /// All 12 hardware profile variants (excluding Generic fallback).
-    pub const ALL: [HardwareProfile; 12] = [
+    /// All 13 hardware profile variants (excluding Generic fallback).
+    pub const ALL: [HardwareProfile; 13] = [
         HardwareProfile::CudaSM80,
         HardwareProfile::CudaSM90,
         HardwareProfile::CudaSM100,
+        HardwareProfile::CudaSM120,
         HardwareProfile::RocmMI200,
         HardwareProfile::RocmMI300,
         HardwareProfile::CpuAvx2,
@@ -151,6 +153,27 @@ impl HardwareProfile {
                 has_2cta_mma: true,
                 tmem_size_kb: 256,
             },
+            Self::CudaSM120 => Platform::Cuda {
+                // Blackwell Consumer (RTX 5070 Ti / 5090), SM 12.0.
+                // Same ISA class as SM100 (tcgen05.mma, NVFP4, TMEM, cluster) but
+                // consumer memory hierarchy: 128KB SMEM/SM (vs 228KB on B100).
+                sm_version: 120,
+                warp_size: 32,
+                shared_mem_kb: 128,
+                reg_file_per_sm: 65536,
+                max_regs_per_thread: 255,
+                has_wgmma: true,
+                has_tma: true,
+                has_warp_spec: true,
+                has_fp8: true,
+                has_tmem: true,
+                has_block_scaled: true,
+                has_native_fp4: true,
+                has_native_fp6: true,
+                has_cluster: true,
+                has_2cta_mma: true,
+                tmem_size_kb: 256,
+            },
             Self::RocmMI200 => Platform::Hip {
                 gfx_arch: 908,
                 wave_size: 64,
@@ -197,9 +220,10 @@ impl HardwareProfile {
         {
             if let Some(sm) = detect_cuda_sm() {
                 return match sm {
-                    80..=89 => Self::CudaSM80,
+                    120.. => Self::CudaSM120,
+                    100..=119 => Self::CudaSM100,
                     90..=99 => Self::CudaSM90,
-                    100.. => Self::CudaSM100,
+                    80..=89 => Self::CudaSM80,
                     _ => Self::Generic,
                 };
             }
@@ -259,7 +283,7 @@ impl HardwareProfile {
     /// Fusion aggressiveness score (0.0 = conservative, 1.0 = max fusion).
     pub fn fusion_aggressiveness(self) -> f32 {
         match self {
-            Self::CudaSM100 => 1.0,
+            Self::CudaSM100 | Self::CudaSM120 => 1.0,
             Self::CudaSM90 => 0.95,
             Self::RocmMI300 => 0.9,
             Self::CudaSM80 | Self::RocmMI200 => 0.85,
@@ -277,7 +301,7 @@ impl HardwareProfile {
     /// Minimum fusion benefit threshold (speedup multiplier).
     pub fn min_fusion_benefit(self) -> f32 {
         match self {
-            Self::CudaSM100 | Self::CudaSM90 => 1.15, // GPU: 15% speedup
+            Self::CudaSM100 | Self::CudaSM120 | Self::CudaSM90 => 1.15, // GPU: 15% speedup
             Self::RocmMI300 | Self::CudaSM80 | Self::RocmMI200 => 1.2,
             Self::AppleM3 | Self::AppleM2 | Self::AppleM1 => 1.25,
             Self::CpuAvx10_2 | Self::CpuAvx512 => 1.3,
@@ -290,7 +314,7 @@ impl HardwareProfile {
     /// Max ops per fusion group (avoid register spills).
     pub fn max_fusion_depth(self) -> usize {
         match self {
-            Self::CudaSM100 | Self::CudaSM90 => 8,
+            Self::CudaSM100 | Self::CudaSM120 | Self::CudaSM90 => 8,
             Self::RocmMI300 | Self::CudaSM80 | Self::RocmMI200 => 7,
             Self::AppleM3 | Self::AppleM2 => 6,
             Self::CpuAvx512 | Self::CpuAvx10_2 => 5,
@@ -303,7 +327,7 @@ impl HardwareProfile {
     /// Whether to prefer large GEMM fusion (vs small elementwise fusion).
     pub fn prefer_gemm_fusion(self) -> bool {
         matches!(self,
-            Self::CudaSM100 | Self::CudaSM90 | Self::CudaSM80 |
+            Self::CudaSM100 | Self::CudaSM120 | Self::CudaSM90 | Self::CudaSM80 |
             Self::RocmMI300 | Self::RocmMI200 |
             Self::AppleM3 | Self::AppleM2 | Self::AppleM1
         )
@@ -312,6 +336,7 @@ impl HardwareProfile {
     /// GPU tensor core generation (0 = no tensor cores).
     pub fn tensor_core_gen(self) -> u32 {
         match self {
+            Self::CudaSM120 => 120,
             Self::CudaSM100 => 100,
             Self::CudaSM90 => 90,
             Self::CudaSM80 => 80,
@@ -323,19 +348,19 @@ impl HardwareProfile {
 
     /// Whether this GPU supports TMA (Tensor Memory Accelerator).
     pub fn has_tma(self) -> bool {
-        matches!(self, Self::CudaSM90 | Self::CudaSM100)
+        matches!(self, Self::CudaSM90 | Self::CudaSM100 | Self::CudaSM120)
     }
 
     /// Whether this GPU supports TMEM (Tensor Memory, ~256KB/SM on Blackwell).
     /// TMEM is independent of shared memory and provides low-latency (<1ns)
     /// scratch space for attention score staging, MoE weight caching, etc.
     pub fn has_tmem(self) -> bool {
-        matches!(self, Self::CudaSM100)
+        matches!(self, Self::CudaSM100 | Self::CudaSM120)
     }
 
     /// Whether this GPU supports native FP4/F6 MMA.
     pub fn has_native_fp4(self) -> bool {
-        matches!(self, Self::CudaSM100)
+        matches!(self, Self::CudaSM100 | Self::CudaSM120)
     }
 
     /// Whether this CPU has AMX (Advanced Matrix Extensions).
@@ -364,7 +389,7 @@ impl HardwareProfile {
             Self::CpuAvx512 | Self::CpuAvx10_2 => 32,
             Self::CpuAvx2 => 16,
             Self::ArmNeoverse => 32,
-            Self::CudaSM100 => 256,
+            Self::CudaSM100 | Self::CudaSM120 => 256,
             Self::CudaSM90 | Self::CudaSM80 => 255,
             Self::RocmMI300 | Self::RocmMI200 => 256,
             _ => 16,
@@ -380,6 +405,8 @@ impl HardwareProfile {
     pub fn shared_memory_bytes(self) -> usize {
         match self {
             Self::CudaSM100 => 228 * 1024,
+            // Blackwell consumer SM12.0: 128KB SMEM/SM (vs 228KB on B100 datacenter).
+            Self::CudaSM120 => 128 * 1024,
             Self::CudaSM90 => 227 * 1024,
             Self::CudaSM80 => 163 * 1024,
             Self::RocmMI300 => 64 * 1024,
@@ -391,7 +418,7 @@ impl HardwareProfile {
     /// Max threads per block (GPU only).
     pub fn max_threads_per_block(self) -> usize {
         match self {
-            Self::CudaSM100 | Self::CudaSM90 | Self::CudaSM80 => 1024,
+            Self::CudaSM100 | Self::CudaSM120 | Self::CudaSM90 | Self::CudaSM80 => 1024,
             Self::RocmMI300 | Self::RocmMI200 => 1024,
             _ => 0,
         }
@@ -439,7 +466,7 @@ impl HardwareProfile {
     /// (fusion may increase compute overhead).
     pub fn compute_roi_weight(self) -> f64 {
         match self {
-            Self::CudaSM100 | Self::CudaSM90 => 0.3,
+            Self::CudaSM100 | Self::CudaSM120 | Self::CudaSM90 => 0.3,
             Self::CudaSM80 | Self::RocmMI300 | Self::RocmMI200 => 0.4,
             Self::CpuAvx512 | Self::CpuAvx10_2 => 0.8,
             Self::AppleM3 | Self::AppleM2 | Self::AppleM1 => 0.7,
@@ -466,8 +493,13 @@ impl HardwareProfile {
     /// 非 GPU profile返回 (0,0,0,0,0,0) 表示 CPU 路径，不使用 GPU 分块.
     pub fn gpu_gemm_tiles(self) -> (usize, usize, usize, usize, usize, usize) {
         match self {
-            // SM100 Blackwell: 128×256×64 CTA, 64×32 tcgen05, K=16
+            // SM100 Blackwell Datacenter: 128×256×64 CTA, 64×32 tcgen05, K=16
             Self::CudaSM100 => (128, 256, 64, 64, 32, 16),
+            // SM120 Blackwell Consumer: same tcgen05 ISA as SM100; narrower SMEM
+            // budget (128KB) constrains K-dim tile → cta_k=32 keeps double-buffer
+            // fit (2×128×64×4B + 2×64×256×4B = 256KB > 128KB; with cta_k=32:
+            // 2×128×32×4B + 2×32×256×4B = 96KB ✓).
+            Self::CudaSM120 => (128, 128, 32, 64, 32, 16),
             // SM90 Hopper: 128×128×64 CTA, 64×16 wgmma, K=16
             Self::CudaSM90 => (128, 128, 64, 64, 16, 16),
             // SM80 Ampere: 128×128×32 CTA, 64×16 mma.sync, K=16
@@ -489,6 +521,9 @@ impl HardwareProfile {
             // SM100 Blackwell: 228KB SMEM, 三缓冲 (3 × 128×64×4B + 3 × 64×256×4B = 281KB > 228KB)
             // 实际: 三缓冲 tile 需 ~187KB → fit in 228KB ✓
             Self::CudaSM100 => 3,
+            // SM120 Blackwell Consumer: 128KB SMEM → double buffer
+            // (2 × 128×32×4B + 2 × 32×128×4B = 64KB, fits in 128KB ✓)
+            Self::CudaSM120 => 2,
             // SM90 Hopper: 227KB SMEM, 三缓冲
             Self::CudaSM90 => 3,
             // SM80 Ampere: 164KB SMEM, 双缓冲 (2 × 128×32×4B + 2 × 32×128×4B = 64KB)
@@ -746,11 +781,12 @@ mod tests {
         assert_eq!(HardwareProfile::CpuAvx2.max_threads_per_block(), 0);
     }
 
-    fn all_variants() -> [HardwareProfile; 13] {
+    fn all_variants() -> [HardwareProfile; 14] {
         [
             HardwareProfile::CudaSM80,
             HardwareProfile::CudaSM90,
             HardwareProfile::CudaSM100,
+            HardwareProfile::CudaSM120,
             HardwareProfile::RocmMI200,
             HardwareProfile::RocmMI300,
             HardwareProfile::CpuAvx2,
@@ -761,7 +797,6 @@ mod tests {
             HardwareProfile::AppleM3,
             HardwareProfile::ArmNeoverse,
             HardwareProfile::Generic,
-            // Note: 14th would need another variant; we have 13 defined + Generic = 14
         ]
     }
 }

@@ -1599,6 +1599,7 @@ mod tests {
             HardwareProfile::CudaSM80 => make_cuda_profile(80),
             HardwareProfile::CudaSM90 => make_cuda_profile(90),
             HardwareProfile::CudaSM100 => make_cuda_profile(100),
+            HardwareProfile::CudaSM120 => make_cuda_profile(120),
             HardwareProfile::RocmMI200 => make_hip_profile(908),
             HardwareProfile::RocmMI300 => make_hip_profile(942),
             HardwareProfile::CpuAvx2 | HardwareProfile::CpuAvx512 | HardwareProfile::CpuAvx10_2 => {
@@ -1923,7 +1924,7 @@ mod tests {
     #[test]
     fn test_hardware_profile_all_count() {
         use super::super::hardware_profile::HardwareProfile;
-        assert_eq!(HardwareProfile::ALL.len(), 12);
+        assert_eq!(HardwareProfile::ALL.len(), 13);
     }
 
     #[test]
@@ -1934,7 +1935,7 @@ mod tests {
             let platform = hw.platform();
             // GPU profiles should map to GPU platforms
             match hw {
-                HardwareProfile::CudaSM80 | HardwareProfile::CudaSM90 | HardwareProfile::CudaSM100 => {
+                HardwareProfile::CudaSM80 | HardwareProfile::CudaSM90 | HardwareProfile::CudaSM100 | HardwareProfile::CudaSM120 => {
                     assert!(matches!(platform, Platform::Cuda { .. }), "{hw:?} should map to Cuda");
                 }
                 HardwareProfile::RocmMI200 | HardwareProfile::RocmMI300 => {

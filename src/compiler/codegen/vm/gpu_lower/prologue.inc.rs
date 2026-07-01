@@ -218,7 +218,7 @@ impl GpuLower {
     ) -> Result<(), CompilerError> {
         match self.dialect {
             GpuDialect::Ptx { sm_version } => {
-                let ptx_ver = if sm_version >= 100 { "8.7" } else if sm_version >= 90 { "8.3" } else if sm_version >= 70 { "8.0" } else if sm_version >= 60 { "6.5" } else { "5.0" };
+                let ptx_ver = if sm_version >= 120 { "8.8" } else if sm_version >= 100 { "8.7" } else if sm_version >= 90 { "8.3" } else if sm_version >= 70 { "8.0" } else if sm_version >= 60 { "6.5" } else { "5.0" };
                 self.emit_line(&format!(".version {ptx_ver}"));
                 self.emit_line(&format!(".target sm_{sm_version}"));
                 self.emit_line(".address_size 64");
@@ -286,7 +286,7 @@ impl GpuLower {
     ) -> Result<(), CompilerError> {
         match self.dialect {
             GpuDialect::Ptx { sm_version } => {
-                let ptx_ver = if sm_version >= 100 { "8.7" } else if sm_version >= 90 { "8.3" } else if sm_version >= 70 { "8.0" } else if sm_version >= 60 { "6.5" } else { "5.0" };
+                let ptx_ver = if sm_version >= 120 { "8.8" } else if sm_version >= 100 { "8.7" } else if sm_version >= 90 { "8.3" } else if sm_version >= 70 { "8.0" } else if sm_version >= 60 { "6.5" } else { "5.0" };
                 self.emit_line(&format!(".version {ptx_ver}"));
                 self.emit_line(&format!(".target sm_{sm_version}"));
                 self.emit_line(".address_size 64");
