@@ -124,3 +124,58 @@
   根治时间: 2026-06-30
   status: 根治 ✅ | residual: 0
 ```
+
+---
+
+## BCE-MEGA-KERNEL-EMIT-CTX-REFACTOR — 过程式 emit 长序列(B类, 待激活)
+
+### smellClass: LONG-METHOD-PROCEDURAL-EMIT-SEQ（过程式 emit 长序列 + 游离编排状态，非 god-match dispatch）
+
+**宪法依据**: P-2 复杂度限制(函数≤500行/圈复杂度≤10/参数≤5) + ARCH-JIT-GENERATOR 状态机架构(CodeGenerator{ctx,...}) + DEC-MKEMIT-001 A/B分层根治策略。
+
+**分层根治策略(A类 vs B类，手法不可混用)**:
+- **A类 — god-match dispatch**(lower_instr/auto_select/numerical_sim): 圈复杂度来自 match arm 数量。根治=瘦arm委托helper + 同语义arm查表自动化(auto_select 须遵 ARCH-AUTO-INSTR-SELECT 走 auto_lower_trace, 禁手写 TraceOp→VmInstr 映射) + category分组。`plan_lower/lower_op.inc.rs lower_op`(1577行)是**已根治范本**——瘦arm委托 lower_norm_v2/lower_*, arm多≠long_method, 不动。
+- **B类 — 过程式长序列**(本条目 mega_kernel_emit): 圈复杂度来自线性emit序列+游离状态, match拆不动。根治=补编排层ctx + 阶段切method借用。
+
+**模式签名(B类)**: 单函数内大量 `prog.emit(VmInstr)` 线性序列(197次/单函数, 占文件62%) + 大量游离编排级局部变量(25个), extract_function 抽出后 helper 需 15-25 参数 → 违反 P-2 并产生 long_parameter_list。入口本身已 long_parameter_list(15参数)。
+
+```yaml
+- patternId: BCE-MEGA-KERNEL-EMIT-CTX-REFACTOR
+  title: compile_mega_kernel_vm 过程式 emit 长序列 + 入口 15 参数(B类长序列)
+  layer: 范式缺陷
+  smellClass: LONG-METHOD-PROCEDURAL-EMIT-SEQ
+  decision: DEC-MKEMIT-001
+  status: 待激活 ⏸ (P3 JIT codegen + aarch64 循环结构完成 + 回归基线稳定后激活)
+  blockReason: "JIT codegen 正确性是 P0 铁律(NO_SILENT_FALLBACK/AUTO-INSTR-SELECT); 197 emit 序列重构期间寄存器/偏移/栈布局错误风险高且静默(产生错误结果无法常规测试发现); 须功能完整后做"
+  codePattern:
+    - "单函数内 197 次 prog.emit(VmInstr) 线性序列(占文件 316 次的 62%)"
+    - "25 个游离编排级局部变量(scratchpad_batch/batch_ctx_ptr/vocab_bytes/width/topology/...)穿透 prologue/batch_mode/sampling 三阶段"
+    - "入口函数 15 参数(plan/graph/alloc/registry/profile/hook/buffer_layout/bottleneck_map/virtual_activation/virtual_tensor_map/layout/debug_jit/.../resource_plan/topology)"
+  triggerCondition:
+    - "JIT emit 函数承载完整编排(prologue+batch_mode+sampling)而非委托分解"
+    - "编排级状态以游离局部变量穿透多阶段, 无 ctx 收编"
+  detectionSignatures:
+    structural: "Function with >100 prog.emit() calls AND >15 local variables referenced across >2 logical phases"
+    literal: "fn compile_mega_kernel_vm 单函数 prog.emit 计数 > 100"
+    antipattern: "long_method + long_parameter_list 共现于 emit 入口"
+  sameClassCriterion:
+    - "JIT emit 入口函数 > 500 行且 prog.emit 密度高 + 游离编排状态 > 5 个 → 同类(B类)"
+    - "区分 A类: 若长度来自 match arm 数量且 arm 已瘦委托 → 是 god-match(A类), 不归本条目"
+  fixTemplate:
+    - "补编排层 ctx(建议名 MegaKernelOrchestrator<'a>{ prog:&mut VmProgram, session:&CompileSession<'a>, abi:AbiPtrs, topology/sym_map/layout/vocab_size/width/... })"
+    - "prologue/batch_mode/sampling 阶段切为 &mut self method, 零参数穿透"
+    - "复用既有 CompileSession/LoweringContext(plan_lower/context.inc.rs L12/L47), 禁新建平行大杂烩 MegaKernelEmitCtx"
+    - "入口只读编译上下文参数收进 CompileSession, 砍至 ≤6 参数"
+  scope:
+    - "仅 src/compiler/codegen/vm/mega_kernel_emit.rs"
+    - "不波及 fusion_group_emit(1953行/13 emit)/attention_emit(5469行/146 emit/363 fn)/gemm_emit(3788行/69 emit) — 实测已高度分解"
+  regressionAssertion:
+    - "emit 序列快照测试: 重构前后 VmProgram 指令序列字节级等价"
+    - "numerical_sim 等价验证: 重构前后 interpret_vm_program 输出数值一致"
+    - "重构后 compile_mega_kernel_vm 入口参数 ≤6, 单 method 行数 ≤500, 圈复杂度 ≤10"
+  locations:
+    - "src/compiler/codegen/vm/mega_kernel_emit.rs L924-2427 (compile_mega_kernel_vm)"
+  rootCause: "JIT emit 入口承载完整编排(prologue+batch_mode+sampling)的过程式 emit 长序列, 25 个编排级状态以游离局部变量穿透三阶段, 无编排层 ctx 收编 → long_method(1503行/CC~88) + long_parameter_list(15参数)"
+  归因时间: 2026-07-01
+  status: 待激活 ⏸ | residual: N/A(未根治, blocked on P3)
+```
