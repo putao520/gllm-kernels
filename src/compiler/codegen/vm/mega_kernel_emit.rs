@@ -5,6 +5,7 @@ use super::isa_profile::IsaProfile;
 use super::vm_state::AbiPtrs;
 use super::plan_lower::{
     CompileSession, LoweringContext, SymDimSlotMap, TensorPtrResolver,
+    FusionEmitCtx,
     emit_fusion_groups, compute_rope_requirement, compute_ple_requirement,
     compute_dwc_requirement, graph_dtype, kv_cache_elem_bytes, maybe_debug_bp,
 };
@@ -1354,10 +1355,17 @@ pub fn compile_mega_kernel_vm(
     };
 
 
+    let fctx = FusionEmitCtx {
+        plan,
+        graph,
+        alloc,
+        ctx: &ctx,
+        topology: &topology,
+        rope_cache_offset: rope_req.as_ref().map(|r| r.cache_offset),
+        original_weight_vreg,
+    };
     emit_fusion_groups(
-        &mut prog, plan, graph, alloc, &ctx,
-        rope_req.as_ref().map(|r| r.cache_offset),
-        &mut current_abi, original_weight_vreg, &resolver, &topology,
+        &fctx, &mut prog, &mut current_abi, &resolver,
     )?;
 
     // ARCH-REGALLOC-POST-FORWARD-RELOAD: Reload scratchpad_ptr from ABI stack slot
@@ -1947,10 +1955,17 @@ fn emit_batch_mode_path(
         // with M = total_prefill_tokens (via mega_decode_seq_len = batch_m).
         // GEMM/FFN/Norm are M-uniform — they just see a larger batch dimension.
         // Attention uses BatchSeqIdLookup for per-token seq_id → KV cache lookup.
+        let fctx = FusionEmitCtx {
+            plan: mk.plan,
+            graph: mk.graph,
+            alloc: mk.alloc,
+            ctx: &batch_ctx,
+            topology: &mk.topology,
+            rope_cache_offset: mk.rope_req.as_ref().map(|r| r.cache_offset),
+            original_weight_vreg: Some(regs.weight_ptr),
+        };
         emit_fusion_groups(
-            prog, mk.plan, mk.graph, mk.alloc, &batch_ctx,
-            mk.rope_req.as_ref().map(|r| r.cache_offset),
-            &mut batch_current_abi, Some(regs.weight_ptr), &batch_resolver, &mk.topology,
+            &fctx, prog, &mut batch_current_abi, &batch_resolver,
         )?;
 
         // ARCH-REGALLOC-POST-FORWARD-RELOAD: Reload scratchpad_batch after
@@ -2635,10 +2650,17 @@ fn emit_batch_decode_step_loop(
             activation_pong_ptr: None,
         };
 
+        let fctx = FusionEmitCtx {
+            plan: mk.plan,
+            graph: mk.graph,
+            alloc: mk.alloc,
+            ctx: &batch_ctx,
+            topology: &mk.topology,
+            rope_cache_offset: mk.rope_req.as_ref().map(|r| r.cache_offset),
+            original_weight_vreg: Some(regs.weight_ptr),
+        };
         emit_fusion_groups(
-            prog, mk.plan, mk.graph, mk.alloc, &batch_ctx,
-            mk.rope_req.as_ref().map(|r| r.cache_offset),
-            &mut decode_abi, Some(regs.weight_ptr), &batch_resolver, &mk.topology,
+            &fctx, prog, &mut decode_abi, &batch_resolver,
         )?;
 
         // ARCH-REGALLOC-POST-FORWARD-RELOAD: Reload scratchpad_batch after
