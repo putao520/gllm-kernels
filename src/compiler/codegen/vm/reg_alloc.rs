@@ -1756,26 +1756,21 @@ fn validate_spill_is_pure_write_memoryb(instr: &VmInstr, vreg: VRegId) -> bool {
 
 fn validate_spill_is_pure_write_aritha(instr: &VmInstr, vreg: VRegId) -> bool {
     // Arith cluster a (8 arms) — ARCH-LOWER-DISPATCH-LAYERING P3 (机械抽取)
+    // BCE-20260630-L2-BODY: arm body 决策链 extract_function → VmProgram::pure_write_check
+    //   (GprBinOp arm 保留原样 — b 是 GprOperand 需 b.vreg() Option 比较，无法用 &[])
     match instr {
         VmInstr::GprBinOp { dst, a, b, .. } => {
                         let other_inputs_ok = *a != vreg && (b.vreg() != Some(vreg));
                         *dst == vreg && other_inputs_ok
                     },
-        VmInstr::GprUnaryOp { dst, src, .. } => *dst == vreg && *src != vreg,
+        VmInstr::GprUnaryOp { dst, src, .. } => VmProgram::pure_write_check(*dst, vreg, &[*src]),
         VmInstr::GprLoadImm { dst, .. } => *dst == vreg,
-        VmInstr::VecUnaryOp { dst, a, .. } => *dst == vreg && *a != vreg,
-        VmInstr::VecBinOp { dst, a, b, .. } => {
-                        *dst == vreg && *a != vreg && *b != vreg
-                    },
-        VmInstr::VecCmp { dst, a, b, .. } => {
-                        *dst == vreg && *a != vreg && *b != vreg
-                    },
-        VmInstr::VecCast { dst, src, .. } => {
-                        *dst == vreg && *src != vreg
-                    },
-        VmInstr::ConditionalSelect { dst, mask, true_val, false_val, .. } => {
-                        *dst == vreg && *mask != vreg && *true_val != vreg && *false_val != vreg
-                    },
+        VmInstr::VecUnaryOp { dst, a, .. } => VmProgram::pure_write_check(*dst, vreg, &[*a]),
+        VmInstr::VecBinOp { dst, a, b, .. } => VmProgram::pure_write_check(*dst, vreg, &[*a, *b]),
+        VmInstr::VecCmp { dst, a, b, .. } => VmProgram::pure_write_check(*dst, vreg, &[*a, *b]),
+        VmInstr::VecCast { dst, src, .. } => VmProgram::pure_write_check(*dst, vreg, &[*src]),
+        VmInstr::ConditionalSelect { dst, mask, true_val, false_val, .. } =>
+            VmProgram::pure_write_check(*dst, vreg, &[*mask, *true_val, *false_val]),
         _ => validate_spill_is_pure_write_arithb(instr, vreg),
     }
 }
@@ -1842,29 +1837,23 @@ fn validate_spill_is_pure_write_quantb(instr: &VmInstr, vreg: VRegId) -> bool {
 
 fn validate_spill_is_pure_write_samplinga(instr: &VmInstr, vreg: VRegId) -> bool {
     // Sampling cluster a (8 arms) — ARCH-LOWER-DISPATCH-LAYERING P3 (机械抽取)
+    // BCE-20260630-L2-BODY: arm body 决策链 extract_function → VmProgram::pure_write_check
     match instr {
         // Sampling/softmax instructions that write dst
-        VmInstr::SoftmaxReduceMax { dst, logits_ptr, .. } => *dst == vreg && *logits_ptr != vreg,
-        VmInstr::SoftmaxExpSum { sum_dst, logits_ptr, max_val, .. } => {
-                        *sum_dst == vreg && *logits_ptr != vreg && *max_val != vreg
-                    },
-        VmInstr::SampleMultinomial { dst, probs_ptr, rng_state_ptr, .. } => {
-                        *dst == vreg && *probs_ptr != vreg && *rng_state_ptr != vreg
-                    },
-        VmInstr::WarpPRNG { dst, rng_state_ptr } => {
-                        *dst == vreg && *rng_state_ptr != vreg
-                    },
-        VmInstr::Argmax { dst, logits_ptr, .. } => *dst == vreg && *logits_ptr != vreg,
-        VmInstr::BatchPerSeqArgmax { dst, seq_id, logits_flat_ptr, .. } => {
-                        *dst == vreg && *seq_id != vreg && *logits_flat_ptr != vreg
-                    },
+        VmInstr::SoftmaxReduceMax { dst, logits_ptr, .. } => VmProgram::pure_write_check(*dst, vreg, &[*logits_ptr]),
+        VmInstr::SoftmaxExpSum { sum_dst, logits_ptr, max_val, .. } =>
+            VmProgram::pure_write_check(*sum_dst, vreg, &[*logits_ptr, *max_val]),
+        VmInstr::SampleMultinomial { dst, probs_ptr, rng_state_ptr, .. } =>
+            VmProgram::pure_write_check(*dst, vreg, &[*probs_ptr, *rng_state_ptr]),
+        VmInstr::WarpPRNG { dst, rng_state_ptr } => VmProgram::pure_write_check(*dst, vreg, &[*rng_state_ptr]),
+        VmInstr::Argmax { dst, logits_ptr, .. } => VmProgram::pure_write_check(*dst, vreg, &[*logits_ptr]),
+        VmInstr::BatchPerSeqArgmax { dst, seq_id, logits_flat_ptr, .. } =>
+            VmProgram::pure_write_check(*dst, vreg, &[*seq_id, *logits_flat_ptr]),
         // §20 BCI cumsum search: dst is pure write (seq_id lookup result).
-        VmInstr::SeqIdLookup { dst, token_index, seq_meta_base, num_seqs, .. } => {
-                        *dst == vreg && *token_index != vreg && *seq_meta_base != vreg && *num_seqs != vreg
-                    },
-        VmInstr::BatchSeqIdLookup { dst, pt_offset_out, token_index, batch_ctx_ptr } => {
-                        *dst == vreg && *pt_offset_out != vreg && *token_index != vreg && *batch_ctx_ptr != vreg
-                    },
+        VmInstr::SeqIdLookup { dst, token_index, seq_meta_base, num_seqs, .. } =>
+            VmProgram::pure_write_check(*dst, vreg, &[*token_index, *seq_meta_base, *num_seqs]),
+        VmInstr::BatchSeqIdLookup { dst, pt_offset_out, token_index, batch_ctx_ptr } =>
+            VmProgram::pure_write_check(*dst, vreg, &[*pt_offset_out, *token_index, *batch_ctx_ptr]),
         _ => validate_spill_is_pure_write_samplingb(instr, vreg),
     }
 }

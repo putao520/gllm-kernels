@@ -1437,73 +1437,97 @@ impl VmProgram {
         Ok(())
     }
 
+    /// BCE-20260630-L2-BODY: L2 叶子 fn 决策链 extract_function helper.
+    ///
+    /// 把每个 arm body 里的 `if let Some(e) = check(*x, gpr, label) { return Err(e); }` 链
+    /// 收敛成单次调用，降低圈复杂度 (CC)。`vregs` 为 (vreg, expect_gpr, label) 三元组切片。
+    /// 行为等价：顺序调用 `check`，第一个返回 `Some(err)` 即 `Err(err)`，否则 `Ok(())`。
+    fn check_vreg_chain(
+        check: &impl Fn(VRegId, bool, &str) -> Option<String>,
+        vregs: &[(VRegId, bool, &str)],
+    ) -> Result<(), String> {
+        for &(vreg, expect_gpr, label) in vregs {
+            if let Some(e) = check(vreg, expect_gpr, label) {
+                return Err(e);
+            }
+        }
+        Ok(())
+    }
+
+    /// BCE-20260630-L2-BODY: 同 check_vreg_chain，但每个输入是 Option<VRegId>
+    /// (用于 GprBinOp.b 这种 `b.vreg() -> Option<VRegId>` 的可选操作数)。
+    /// None 操作数跳过 (无 vreg 可校验)。
+    fn check_vreg_chain_opt(
+        check: &impl Fn(VRegId, bool, &str) -> Option<String>,
+        vregs: &[(Option<VRegId>, bool, &str)],
+    ) -> Result<(), String> {
+        for &(vreg, expect_gpr, label) in vregs {
+            if let Some(v) = vreg {
+                if let Some(e) = check(v, expect_gpr, label) {
+                    return Err(e);
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// BCE-20260630-L2-BODY: bool 叶子 fn 决策链 extract_function helper.
+    ///
+    /// 把 `is_pure_write_*` / `validate_spill_is_pure_write_*` arm body 里的
+    /// `*dst == vreg && *a != vreg && *b != vreg` 决策链收敛：dst 等值 + 所有输入均不等值。
+    /// 行为等价：`*dst == vreg && inputs.iter().all(|x| *x != vreg)`。
+    pub(crate) fn pure_write_check(dst: VRegId, vreg: VRegId, inputs: &[VRegId]) -> bool {
+        dst == vreg && inputs.iter().all(|x| *x != vreg)
+    }
+
     fn validate_type_consistency_memorya(instr: &VmInstr, i: usize, kinds: &std::collections::HashMap<VRegId, VRegKind>, check: &impl Fn(VRegId, bool, &str) -> Option<String>) -> Result<(), String> {
         // Memory cluster a (8 arms) — ARCH-LOWER-DISPATCH-LAYERING P3 (机械抽取)
+        // BCE-20260630-L2-BODY: arm body 决策链 extract_function → check_vreg_chain
+        let _ = i;
+        let _ = &kinds;
         match instr {
-            VmInstr::VecLoad { dst, base, .. } => { 
-                                    if let Some(e) = check(*dst, false, "dst") { return Err(e); }
-                                    if let Some(e) = check(*base, true, "base") { return Err(e); }
-                 Ok(()) },
-            VmInstr::VecStore { base, src, .. } => { 
-                                    if let Some(e) = check(*base, true, "base") { return Err(e); }
-                                    if let Some(e) = check(*src, false, "src") { return Err(e); }
-                 Ok(()) },
-            VmInstr::VecNarrow { dst, src, .. } => { 
-                                    if let Some(e) = check(*dst, false, "dst") { return Err(e); }
-                                    if let Some(e) = check(*src, false, "src") { return Err(e); }
-                 Ok(()) },
-            VmInstr::VecWiden { dst, src, .. } => { 
-                                    if let Some(e) = check(*dst, false, "dst") { return Err(e); }
-                                    if let Some(e) = check(*src, false, "src") { return Err(e); }
-                 Ok(()) },
-            VmInstr::Mov { dst, src, .. } => { 
-                                    if let Some(e) = check(*dst, false, "dst") { return Err(e); }
-                                    if let Some(e) = check(*src, false, "src") { return Err(e); }
-                 Ok(()) },
-            VmInstr::LoadPtr { dst, .. } => { 
-                                    if let Some(e) = check(*dst, true, "dst") { return Err(e); }
-                 Ok(()) },
-            VmInstr::AddPtr { dst, base, .. } => { 
-                                    if let Some(e) = check(*dst, true, "dst") { return Err(e); }
-                                    if let Some(e) = check(*base, true, "base") { return Err(e); }
-                 Ok(()) },
-            VmInstr::ScalarLoad { dst, base, .. } => { 
-                                    if let Some(e) = check(*dst, true, "dst") { return Err(e); }
-                                    if let Some(e) = check(*base, true, "base") { return Err(e); }
-                 Ok(()) },
+            VmInstr::VecLoad { dst, base, .. } =>
+                Self::check_vreg_chain(check, &[(*dst, false, "dst"), (*base, true, "base")]),
+            VmInstr::VecStore { base, src, .. } =>
+                Self::check_vreg_chain(check, &[(*base, true, "base"), (*src, false, "src")]),
+            VmInstr::VecNarrow { dst, src, .. } =>
+                Self::check_vreg_chain(check, &[(*dst, false, "dst"), (*src, false, "src")]),
+            VmInstr::VecWiden { dst, src, .. } =>
+                Self::check_vreg_chain(check, &[(*dst, false, "dst"), (*src, false, "src")]),
+            VmInstr::Mov { dst, src, .. } =>
+                Self::check_vreg_chain(check, &[(*dst, false, "dst"), (*src, false, "src")]),
+            VmInstr::LoadPtr { dst, .. } =>
+                Self::check_vreg_chain(check, &[(*dst, true, "dst")]),
+            VmInstr::AddPtr { dst, base, .. } =>
+                Self::check_vreg_chain(check, &[(*dst, true, "dst"), (*base, true, "base")]),
+            VmInstr::ScalarLoad { dst, base, .. } =>
+                Self::check_vreg_chain(check, &[(*dst, true, "dst"), (*base, true, "base")]),
             _ => Self::validate_type_consistency_memoryb(instr, i, &kinds, &check),
         }
     }
 
     fn validate_type_consistency_memoryb(instr: &VmInstr, i: usize, kinds: &std::collections::HashMap<VRegId, VRegKind>, check: &impl Fn(VRegId, bool, &str) -> Option<String>) -> Result<(), String> {
         // Memory cluster b (8 arms) — ARCH-LOWER-DISPATCH-LAYERING P3 (机械抽取)
+        // BCE-20260630-L2-BODY: arm body 决策链 extract_function → check_vreg_chain
+        //   (Broadcast arm 保留原样 — 嵌套 ScalarExpr 分支无法扁平化为三元组)
+        let _ = i;
+        let _ = &kinds;
         match instr {
-            VmInstr::ScalarStore { base, src, .. } => { 
-                                    if let Some(e) = check(*base, true, "base") { return Err(e); }
-                                    if let Some(e) = check(*src, true, "src") { return Err(e); }
-                 Ok(()) },
-            VmInstr::VecScalarStore { base, src, .. } => { 
-                                    if let Some(e) = check(*base, true, "base") { return Err(e); }
-                                    if let Some(e) = check(*src, false, "src") { return Err(e); }
-                 Ok(()) },
-            VmInstr::IntMulStride { dst, src, .. } => { 
-                                    if let Some(e) = check(*dst, true, "dst") { return Err(e); }
-                                    if let Some(e) = check(*src, true, "src") { return Err(e); }
-                 Ok(()) },
-            VmInstr::ScalarToIndex { dst, src, .. } => { 
-                                    if let Some(e) = check(*dst, true, "dst") { return Err(e); }
-                                    if let Some(e) = check(*src, true, "src") { return Err(e); }
-                 Ok(()) },
-            VmInstr::IndexToScalar { dst, src } => { 
-                                    // dst holds f32 result (XMM register), src is GPR integer
-                                    if let Some(e) = check(*dst, false, "dst") { return Err(e); }
-                                    if let Some(e) = check(*src, true, "src") { return Err(e); }
-                 Ok(()) },
-            VmInstr::ScalarByteLoad { dst, base, .. } => { 
-                                    if let Some(e) = check(*dst, true, "dst") { return Err(e); }
-                                    if let Some(e) = check(*base, true, "base") { return Err(e); }
-                 Ok(()) },
-            VmInstr::Broadcast { dst, src, .. } => { 
+            VmInstr::ScalarStore { base, src, .. } =>
+                Self::check_vreg_chain(check, &[(*base, true, "base"), (*src, true, "src")]),
+            VmInstr::VecScalarStore { base, src, .. } =>
+                Self::check_vreg_chain(check, &[(*base, true, "base"), (*src, false, "src")]),
+            VmInstr::IntMulStride { dst, src, .. } =>
+                Self::check_vreg_chain(check, &[(*dst, true, "dst"), (*src, true, "src")]),
+            VmInstr::ScalarToIndex { dst, src, .. } =>
+                Self::check_vreg_chain(check, &[(*dst, true, "dst"), (*src, true, "src")]),
+            VmInstr::IndexToScalar { dst, src } => {
+                // dst holds f32 result (XMM register), src is GPR integer
+                Self::check_vreg_chain(check, &[(*dst, false, "dst"), (*src, true, "src")])
+            }
+            VmInstr::ScalarByteLoad { dst, base, .. } =>
+                Self::check_vreg_chain(check, &[(*dst, true, "dst"), (*base, true, "base")]),
+            VmInstr::Broadcast { dst, src, .. } => {
                                     if let Some(e) = check(*dst, false, "dst") { return Err(e); }
                                     if let ScalarExpr::MemLoad(b, _) = src {
                                         if let Some(e) = check(*b, true, "Broadcast.MemLoad.base") { return Err(e); }
@@ -1517,90 +1541,67 @@ impl VmProgram {
                                         let _ = s;
                                     }
                  Ok(()) },
-            VmInstr::AtomicAdd { base, .. } => { 
-                                    if let Some(e) = check(*base, true, "base") { return Err(e); }
-                 Ok(()) },
+            VmInstr::AtomicAdd { base, .. } =>
+                Self::check_vreg_chain(check, &[(*base, true, "base")]),
             _ => Self::validate_type_consistency_memoryc(instr, i, &kinds, &check),
         }
     }
 
     fn validate_type_consistency_memoryc(instr: &VmInstr, i: usize, kinds: &std::collections::HashMap<VRegId, VRegKind>, check: &impl Fn(VRegId, bool, &str) -> Option<String>) -> Result<(), String> {
         // Memory cluster c (3 arms) — ARCH-LOWER-DISPATCH-LAYERING P3 (机械抽取)
+        // BCE-20260630-L2-BODY: arm body 决策链 extract_function → check_vreg_chain
+        let _ = i;
+        let _ = &kinds;
         match instr {
-            VmInstr::GatherLoad { dst, base, indices, .. } => { 
-                                    if let Some(e) = check(*dst, false, "dst") { return Err(e); }
-                                    if let Some(e) = check(*base, true, "base") { return Err(e); }
-                                    if let Some(e) = check(*indices, true, "indices") { return Err(e); }
-                 Ok(()) },
-            VmInstr::ScatterStore { base, indices, src, .. } => { 
-                                    if let Some(e) = check(*base, true, "base") { return Err(e); }
-                                    if let Some(e) = check(*indices, true, "indices") { return Err(e); }
-                                    if let Some(e) = check(*src, false, "src") { return Err(e); }
-                 Ok(()) },
-            VmInstr::TableLookup { dst, base, row_index, .. } => { 
-                                    if let Some(e) = check(*dst, false, "dst") { return Err(e); }
-                                    if let Some(e) = check(*base, true, "base") { return Err(e); }
-                                    if let Some(e) = check(*row_index, true, "row_index") { return Err(e); }
-                 Ok(()) },
+            VmInstr::GatherLoad { dst, base, indices, .. } =>
+                Self::check_vreg_chain(check, &[(*dst, false, "dst"), (*base, true, "base"), (*indices, true, "indices")]),
+            VmInstr::ScatterStore { base, indices, src, .. } =>
+                Self::check_vreg_chain(check, &[(*base, true, "base"), (*indices, true, "indices"), (*src, false, "src")]),
+            VmInstr::TableLookup { dst, base, row_index, .. } =>
+                Self::check_vreg_chain(check, &[(*dst, false, "dst"), (*base, true, "base"), (*row_index, true, "row_index")]),
             _ => Ok(()),
         }
     }
 
     fn validate_type_consistency_aritha(instr: &VmInstr, i: usize, kinds: &std::collections::HashMap<VRegId, VRegKind>, check: &impl Fn(VRegId, bool, &str) -> Option<String>) -> Result<(), String> {
         // Arith cluster a (8 arms) — ARCH-LOWER-DISPATCH-LAYERING P3 (机械抽取)
+        // BCE-20260630-L2-BODY: arm body 决策链 extract_function → check_vreg_chain
+        let _ = i; // 历史保留参数；check 闭包内已捕获 i
+        let _ = &kinds; // 历史保留参数；check 闭包内已捕获 kinds
         match instr {
-            VmInstr::VecBinOp { dst, a, b, .. } => { 
-                                    if let Some(e) = check(*dst, false, "dst") { return Err(e); }
-                                    if let Some(e) = check(*a, false, "a") { return Err(e); }
-                                    if let Some(e) = check(*b, false, "b") { return Err(e); }
-                 Ok(()) },
-            VmInstr::VecShiftImm { dst, a, .. } => { 
-                                    if let Some(e) = check(*dst, false, "dst") { return Err(e); }
-                                    if let Some(e) = check(*a, false, "a") { return Err(e); }
-                 Ok(()) },
-            VmInstr::VecUnaryOp { dst, a, .. } => { 
-                                    if let Some(e) = check(*dst, false, "dst") { return Err(e); }
-                                    if let Some(e) = check(*a, false, "a") { return Err(e); }
-                 Ok(()) },
-            VmInstr::Fma { dst, acc, a, b, ..} => { 
-                                    if let Some(e) = check(*dst, false, "dst") { return Err(e); }
-                                    if let Some(e) = check(*acc, false, "acc") { return Err(e); }
-                                    if let Some(e) = check(*a, false, "a") { return Err(e); }
-                                    if let Some(e) = check(*b, false, "b") { return Err(e); }
-                 Ok(()) },
-            VmInstr::HReduce { dst, src, .. } => { 
-                                    if let Some(e) = check(*dst, false, "dst") { return Err(e); }
-                                    if let Some(e) = check(*src, false, "src") { return Err(e); }
-                 Ok(()) },
-            VmInstr::Accumulate { acc, src } => { 
-                                    if let Some(e) = check(*acc, false, "acc") { return Err(e); }
-                                    if let Some(e) = check(*src, false, "src") { return Err(e); }
-                 Ok(()) },
-            VmInstr::Transcendental { dst, src, .. } => { 
-                                    if let Some(e) = check(*dst, false, "dst") { return Err(e); }
-                                    if let Some(e) = check(*src, false, "src") { return Err(e); }
-                 Ok(()) },
-            VmInstr::GprBinOp { dst, a, b, .. } => { 
-                                    if let Some(e) = check(*dst, true, "dst") { return Err(e); }
-                                    if let Some(e) = check(*a, true, "a") { return Err(e); }
-                                    if let Some(v) = b.vreg() {
-                                        if let Some(e) = check(v, true, "b") { return Err(e); }
-                                    }
-                 Ok(()) },
+            VmInstr::VecBinOp { dst, a, b, .. } =>
+                Self::check_vreg_chain(check, &[(*dst, false, "dst"), (*a, false, "a"), (*b, false, "b")]),
+            VmInstr::VecShiftImm { dst, a, .. } =>
+                Self::check_vreg_chain(check, &[(*dst, false, "dst"), (*a, false, "a")]),
+            VmInstr::VecUnaryOp { dst, a, .. } =>
+                Self::check_vreg_chain(check, &[(*dst, false, "dst"), (*a, false, "a")]),
+            VmInstr::Fma { dst, acc, a, b, .. } =>
+                Self::check_vreg_chain(check, &[(*dst, false, "dst"), (*acc, false, "acc"), (*a, false, "a"), (*b, false, "b")]),
+            VmInstr::HReduce { dst, src, .. } =>
+                Self::check_vreg_chain(check, &[(*dst, false, "dst"), (*src, false, "src")]),
+            VmInstr::Accumulate { acc, src } =>
+                Self::check_vreg_chain(check, &[(*acc, false, "acc"), (*src, false, "src")]),
+            VmInstr::Transcendental { dst, src, .. } =>
+                Self::check_vreg_chain(check, &[(*dst, false, "dst"), (*src, false, "src")]),
+            VmInstr::GprBinOp { dst, a, b, .. } => {
+                // b 是 GprOperand，b.vreg() 返回 Option<VRegId> (imm 操作数无 vreg)
+                Self::check_vreg_chain(check, &[(*dst, true, "dst"), (*a, true, "a")])?;
+                Self::check_vreg_chain_opt(check, &[(b.vreg(), true, "b")])
+            }
             _ => Self::validate_type_consistency_arithb(instr, i, &kinds, &check),
         }
     }
 
     fn validate_type_consistency_arithb(instr: &VmInstr, i: usize, kinds: &std::collections::HashMap<VRegId, VRegKind>, check: &impl Fn(VRegId, bool, &str) -> Option<String>) -> Result<(), String> {
         // Arith cluster b (2 arms) — ARCH-LOWER-DISPATCH-LAYERING P3 (机械抽取)
+        // BCE-20260630-L2-BODY: arm body 决策链 extract_function → check_vreg_chain
+        let _ = i;
+        let _ = &kinds;
         match instr {
-            VmInstr::GprUnaryOp { dst, src, .. } => { 
-                                    if let Some(e) = check(*dst, true, "dst") { return Err(e); }
-                                    if let Some(e) = check(*src, true, "src") { return Err(e); }
-                 Ok(()) },
-            VmInstr::GprLoadImm { dst, .. } => { 
-                                    if let Some(e) = check(*dst, true, "dst") { return Err(e); }
-                 Ok(()) },
+            VmInstr::GprUnaryOp { dst, src, .. } =>
+                Self::check_vreg_chain(check, &[(*dst, true, "dst"), (*src, true, "src")]),
+            VmInstr::GprLoadImm { dst, .. } =>
+                Self::check_vreg_chain(check, &[(*dst, true, "dst")]),
             _ => Ok(()),
         }
     }
@@ -1630,28 +1631,24 @@ impl VmProgram {
 
     fn validate_type_consistency_samplinga(instr: &VmInstr, i: usize, kinds: &std::collections::HashMap<VRegId, VRegKind>, check: &impl Fn(VRegId, bool, &str) -> Option<String>) -> Result<(), String> {
         // Sampling cluster a (4 arms) — ARCH-LOWER-DISPATCH-LAYERING P3 (机械抽取)
+        // BCE-20260630-L2-BODY: arm body 决策链 extract_function → check_vreg_chain
+        let _ = i;
+        let _ = &kinds;
         match instr {
-            VmInstr::Argmax { dst, logits_ptr, .. } => { 
-                                    if let Some(e) = check(*dst, true, "dst") { return Err(e); }
-                                    if let Some(e) = check(*logits_ptr, true, "logits_ptr") { return Err(e); }
-                 Ok(()) },
-            VmInstr::TemperatureScale { logits_ptr, temp_ptr, .. } => { 
-                                    if let Some(e) = check(*logits_ptr, true, "logits_ptr") { return Err(e); }
-                                    if let Some(e) = check(*temp_ptr, true, "temp_ptr") { return Err(e); }
-                 Ok(()) },
-            VmInstr::StoreToken { token_id, output_buf, counter, input_ids_ptr, prompt_len_bytes } => { 
-                                    if let Some(e) = check(*token_id, true, "token_id") { return Err(e); }
-                                    if let Some(e) = check(*output_buf, true, "output_buf") { return Err(e); }
-                                    if let Some(e) = check(*counter, true, "counter") { return Err(e); }
-                                    if let Some(e) = check(*input_ids_ptr, true, "input_ids_ptr") { return Err(e); }
-                                    if let Some(e) = check(*prompt_len_bytes, true, "prompt_len_bytes") { return Err(e); }
-                 Ok(()) },
-            VmInstr::CheckStopCondition { token_id, counter, eos_ptr, max_tokens_ptr } => { 
-                                    if let Some(e) = check(*token_id, true, "token_id") { return Err(e); }
-                                    if let Some(e) = check(*counter, true, "counter") { return Err(e); }
-                                    if let Some(e) = check(*eos_ptr, true, "eos_ptr") { return Err(e); }
-                                    if let Some(e) = check(*max_tokens_ptr, true, "max_tokens_ptr") { return Err(e); }
-                 Ok(()) },
+            VmInstr::Argmax { dst, logits_ptr, .. } =>
+                Self::check_vreg_chain(check, &[(*dst, true, "dst"), (*logits_ptr, true, "logits_ptr")]),
+            VmInstr::TemperatureScale { logits_ptr, temp_ptr, .. } =>
+                Self::check_vreg_chain(check, &[(*logits_ptr, true, "logits_ptr"), (*temp_ptr, true, "temp_ptr")]),
+            VmInstr::StoreToken { token_id, output_buf, counter, input_ids_ptr, prompt_len_bytes } =>
+                Self::check_vreg_chain(check, &[
+                    (*token_id, true, "token_id"), (*output_buf, true, "output_buf"), (*counter, true, "counter"),
+                    (*input_ids_ptr, true, "input_ids_ptr"), (*prompt_len_bytes, true, "prompt_len_bytes"),
+                ]),
+            VmInstr::CheckStopCondition { token_id, counter, eos_ptr, max_tokens_ptr } =>
+                Self::check_vreg_chain(check, &[
+                    (*token_id, true, "token_id"), (*counter, true, "counter"),
+                    (*eos_ptr, true, "eos_ptr"), (*max_tokens_ptr, true, "max_tokens_ptr"),
+                ]),
             _ => Ok(()),
         }
     }

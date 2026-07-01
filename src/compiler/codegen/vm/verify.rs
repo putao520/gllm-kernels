@@ -624,15 +624,17 @@ fn is_pure_write_to_tilea(instr: &VmInstr, vreg: VRegId) -> bool {
 
 fn is_pure_write_to_quanta(instr: &VmInstr, vreg: VRegId) -> bool {
     // Quant cluster a (8 arms) — ARCH-LOWER-DISPATCH-LAYERING P3 (机械抽取)
+    // BCE-20260630-L2-BODY: arm body 决策链 extract_function → VmProgram::pure_write_check
     match instr {
-        VmInstr::QuantLoadBytesVec { dst, base, .. } => *dst == vreg && *base != vreg,
+        VmInstr::QuantLoadBytesVec { dst, base, .. } => VmProgram::pure_write_check(*dst, vreg, &[*base]),
         VmInstr::QuantBroadcastInt { dst, .. } => *dst == vreg,
-        VmInstr::QuantExtractBits { dst, src, .. } => *dst == vreg && *src != vreg,
-        VmInstr::QuantCodebookLookup { dst, indices, .. } => *dst == vreg && *indices != vreg,
-        VmInstr::QuantInterleave { dst, lo, hi, .. } => *dst == vreg && *lo != vreg && *hi != vreg,
-        VmInstr::QuantConcatSeq { dst, lo, hi, .. } => *dst == vreg && *lo != vreg && *hi != vreg,
-        VmInstr::Q3KDecodeStep { dst, block_base, lane_offset, d_vreg, .. } => *dst == vreg && *block_base != vreg && *lane_offset != vreg && *d_vreg != vreg,
-        VmInstr::QuantScalarCvtLoad { dst, base, .. } => *dst == vreg && *base != vreg,
+        VmInstr::QuantExtractBits { dst, src, .. } => VmProgram::pure_write_check(*dst, vreg, &[*src]),
+        VmInstr::QuantCodebookLookup { dst, indices, .. } => VmProgram::pure_write_check(*dst, vreg, &[*indices]),
+        VmInstr::QuantInterleave { dst, lo, hi, .. } => VmProgram::pure_write_check(*dst, vreg, &[*lo, *hi]),
+        VmInstr::QuantConcatSeq { dst, lo, hi, .. } => VmProgram::pure_write_check(*dst, vreg, &[*lo, *hi]),
+        VmInstr::Q3KDecodeStep { dst, block_base, lane_offset, d_vreg, .. } =>
+            VmProgram::pure_write_check(*dst, vreg, &[*block_base, *lane_offset, *d_vreg]),
+        VmInstr::QuantScalarCvtLoad { dst, base, .. } => VmProgram::pure_write_check(*dst, vreg, &[*base]),
         _ => is_pure_write_to_quantb(instr, vreg),
     }
 }
