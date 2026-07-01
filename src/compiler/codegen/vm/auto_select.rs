@@ -1610,160 +1610,11 @@ fn dispatch_quant_decode(
         // T2 将完善为完整的 auto_select 映射，此处先确保编译通过。
 
         TraceOp::QuantScaleLoad { source, offset, dtype } => {
-            let r = prog.alloc_vreg(VRegKind::Vec, width);
-            let base = slots[source.0 as usize];
-            let offset_val = *offset;
-            // SPEC 24-QUANT-PIPELINE-JIT §4.1: dispatch by quant_type
-            match dtype {
-                // f16 scale: load f16 scalar → convert to f32 → broadcast
-                // (GgufF16ScaleLoad equivalent: vmovd + vcvtph2ps + vbroadcastss)
-                QuantType::Q4_0 | QuantType::Q4_1
-                | QuantType::Q5_0 | QuantType::Q5_1
-                | QuantType::Q8_0 | QuantType::Q8_1 => {
-                    prog.emit(VmInstr::QuantScalarCvtLoad {
-                        dst: r,
-                        base,
-                        offset: offset_val as i64,
-                        src_dtype: ScalarCvtSource::F16,
-                        width,
-                    });
-                    Ok(r)
-                }
-                // K-Quant formats use dedicated QuantKQuantPackedScaleLookup / QuantSubScaleLoad
-                QuantType::Q2K | QuantType::Q3K | QuantType::Q4K
-                | QuantType::Q5K | QuantType::Q6K | QuantType::Q8K => {
-                    Err(CompilerError::CodegenViolation(
-                        "QuantScaleLoad: K-Quant formats use QuantKQuantPackedScaleLookup TraceOp".into()
-                    ))
-                }
-                // MXFP/NVFP use dedicated QuantE2m1LutDecode path
-                QuantType::Mxfp4 { .. } | QuantType::Nvfp4 => {
-                    Err(CompilerError::CodegenViolation(
-                        "QuantScaleLoad: MXFP/NVFP formats use QuantE2m1LutDecode path".into()
-                    ))
-                }
-                // IQ formats use codebook-based dequant path
-                qt @ (QuantType::IQ1S | QuantType::IQ1M | QuantType::IQ2XXS
-                     | QuantType::IQ2XS | QuantType::IQ2S
-                     | QuantType::IQ3XXS | QuantType::IQ3S
-                     | QuantType::IQ4NL | QuantType::IQ4XS) => {
-                    Err(CompilerError::CodegenViolation(format!(
-                        "QuantScaleLoad: IQ format {:?} uses codebook dequant path", qt
-                    )))
-                }
-                // Native float types should not reach QuantScaleLoad
-                QuantType::F32 | QuantType::F16 | QuantType::Bf16 => {
-                    Err(CompilerError::CodegenViolation(format!(
-                        "QuantScaleLoad: native float type {:?} has no scale to load", dtype
-                    )))
-                }
-                // External quantization formats
-                QuantType::AWQ4 | QuantType::GPTQ4 | QuantType::Squeeze => {
-                    Err(CompilerError::CodegenViolation(format!(
-                        "QuantScaleLoad: external format {:?} not yet supported", dtype
-                    )))
-                }
-                QuantType::TQ1_0 | QuantType::TQ2_0 => {
-                    Err(CompilerError::CodegenViolation(format!(
-                        "QuantScaleLoad: ternary format {:?} not yet supported", dtype
-                    )))
-                }
-                QuantType::Fp8E4M3 | QuantType::Fp8E5M2 => {
-                    Err(CompilerError::CodegenViolation(format!(
-                        "QuantScaleLoad: FP8 {:?} has no scale (native float)", dtype
-                    )))
-                }
-            }
+            emit_quant_scale_load(prog, slots[source.0 as usize], *offset as i64, dtype, width)
         }
 
         TraceOp::QuantDataLoad { source, offset, quant_type, block_size } => {
-            let r = prog.alloc_vreg(VRegKind::Vec, width);
-            let base = slots[source.0 as usize];
-            let offset_val = *offset;
-            let desc = crate::quant_format::QuantFormatDescriptor::for_type(*quant_type);
-            // SPEC 24-QUANT-PIPELINE-JIT §4.1: dispatch by data_kind
-            match desc.data_kind {
-                QuantDataKind::SignedPackedInt4 => {
-                    // LowNibble + HighNibble: interleave into signed F32 values
-                    let r_lo = prog.alloc_vreg(VRegKind::Vec, width);
-                    prog.emit(VmInstr::QuantBlockLoad { dst: r_lo, base, offset: OffsetExpr::Const(offset_val), unpack: BlockUnpackMode::SignedNibbleLow, width });
-                    let r_hi = prog.alloc_vreg(VRegKind::Vec, width);
-                    prog.emit(VmInstr::QuantBlockLoad { dst: r_hi, base, offset: OffsetExpr::Const(offset_val), unpack: BlockUnpackMode::SignedNibbleHigh, width });
-                    prog.emit(VmInstr::QuantInterleave { dst: r, lo: r_lo, hi: r_hi, width });
-                }
-                QuantDataKind::PackedInt4 => {
-                    // LowNibble + HighNibble: interleave into unsigned F32 values
-                    let r_lo = prog.alloc_vreg(VRegKind::Vec, width);
-                    prog.emit(VmInstr::QuantBlockLoad { dst: r_lo, base, offset: OffsetExpr::Const(offset_val), unpack: BlockUnpackMode::UnsignedNibbleLow, width });
-                    let r_hi = prog.alloc_vreg(VRegKind::Vec, width);
-                    prog.emit(VmInstr::QuantBlockLoad { dst: r_hi, base, offset: OffsetExpr::Const(offset_val), unpack: BlockUnpackMode::UnsignedNibbleHigh, width });
-                    prog.emit(VmInstr::QuantInterleave { dst: r, lo: r_lo, hi: r_hi, width });
-                }
-                QuantDataKind::Int8 => {
-                    // Single pass: load i8, sign-extend to i32, convert to f32
-                    prog.emit(VmInstr::QuantBlockLoad { dst: r, base, offset: OffsetExpr::Const(offset_val), unpack: BlockUnpackMode::Int8, width });
-                }
-                QuantDataKind::PackedInt5 => {
-                    // INT5 unpack (single pass): each byte contains one 5-bit value
-                    let bytes = prog.alloc_vreg(VRegKind::Vec, width);
-                    let count = width.f32_lanes().min(32);
-                    prog.emit(VmInstr::QuantLoadBytesVec { dst: bytes, base, offset: offset_val as i64, count, signed: false, width });
-                    // Mask with 0x1F to extract low 5 bits
-                    let mask = prog.alloc_vreg(VRegKind::Vec, width);
-                    prog.emit(VmInstr::QuantBroadcastInt { dst: mask, value: 0x1F, width });
-                    let extracted = prog.alloc_vreg(VRegKind::Vec, width);
-                    prog.emit(VmInstr::VecBinOp { dst: extracted, a: bytes, b: mask, op: VecOp::And, dtype: QuantPrecision::F32 });
-                    // Convert i32 → f32
-                    prog.emit(VmInstr::VecUnaryOp { dst: r, a: extracted, op: VecUnaryOp::IntToFloat });
-                }
-                QuantDataKind::PackedInt6 => {
-                    // INT6 unpack (single pass): each byte contains one 6-bit value
-                    let bytes = prog.alloc_vreg(VRegKind::Vec, width);
-                    let count = width.f32_lanes().min(32);
-                    prog.emit(VmInstr::QuantLoadBytesVec { dst: bytes, base, offset: offset_val as i64, count, signed: false, width });
-                    // Mask with 0x3F to extract low 6 bits
-                    let mask = prog.alloc_vreg(VRegKind::Vec, width);
-                    prog.emit(VmInstr::QuantBroadcastInt { dst: mask, value: 0x3F, width });
-                    let extracted = prog.alloc_vreg(VRegKind::Vec, width);
-                    prog.emit(VmInstr::VecBinOp { dst: extracted, a: bytes, b: mask, op: VecOp::And, dtype: QuantPrecision::F32 });
-                    // Convert i32 → f32
-                    prog.emit(VmInstr::VecUnaryOp { dst: r, a: extracted, op: VecUnaryOp::IntToFloat });
-                }
-                QuantDataKind::SuperLowBit => {
-                    // Codebook lookup: load packed indices, then decode via codebook
-                    let bytes = prog.alloc_vreg(VRegKind::Vec, width);
-                    let count = width.f32_lanes().min(32);
-                    prog.emit(VmInstr::QuantLoadBytesVec { dst: bytes, base, offset: offset_val as i64, count, signed: false, width });
-                    let codebook_data = desc.codebook.as_ref().map(|cb| cb.codebook_data).unwrap_or(&[]);
-                    prog.emit(VmInstr::QuantCodebookLookup {
-                        dst: r,
-                        indices: bytes,
-                        codebook_data,
-                        vector_size: *block_size,
-                        bits_per_entry: desc.bits_per_element,
-                        width,
-                    });
-                }
-                QuantDataKind::Float4 | QuantDataKind::Nvfp4 => {
-                    // E2M1 decode: use QuantBlockLoad with MXFP/NVFP unpack
-                    // scale_src = source pointer (scale byte is at base offset within block)
-                    let scale_src = prog.alloc_vreg(VRegKind::Vec, width);
-                    prog.emit(VmInstr::QuantScalarCvtLoad { dst: scale_src, base, offset: offset_val as i64, src_dtype: ScalarCvtSource::U8, width });
-                    let unpack = if matches!(desc.data_kind, QuantDataKind::Nvfp4) {
-                        BlockUnpackMode::Nvfp4 { scale_src }
-                    } else {
-                        BlockUnpackMode::Mxfp4 { scale_src }
-                    };
-                    prog.emit(VmInstr::QuantBlockLoad { dst: r, base, offset: OffsetExpr::Const(offset_val), unpack, width });
-                }
-                other => {
-                    return Err(CompilerError::CodegenViolation(format!(
-                        "QuantDataLoad: unsupported data_kind={:?} for quant_type={:?}",
-                        other, quant_type
-                    )));
-                }
-            }
-            Ok(r)
+            emit_quant_data_load(prog, slots[source.0 as usize], *offset as i64, *quant_type, *block_size, width)
         }
 
         TraceOp::QuantZeroLoad { source, offset, zp_type } => {
@@ -1922,6 +1773,159 @@ fn unreachable_pattern(op: &TraceOp) -> Result<VRegId, CompilerError> {
     Err(CompilerError::CodegenViolation(format!(
         "dispatch_trace_op: 未分类的 TraceOp 变体 {:?} (ComputePattern 分类缺失)", op
     )))
+}
+
+
+/// QuantScaleLoad emit helper (SPEC 24-QUANT-PIPELINE-JIT §4.1)。
+/// 从 quant block 加载 scale，按 QuantType 分派解码路径。
+fn emit_quant_scale_load(
+    prog: &mut VmProgram,
+    base: VRegId,
+    offset: i64,
+    dtype: &QuantType,
+    width: SimdWidth,
+) -> Result<VRegId, CompilerError> {
+    let r = prog.alloc_vreg(VRegKind::Vec, width);
+    let offset_val = offset;
+    match dtype {
+        // f16 scale: load f16 scalar → convert to f32 → broadcast
+        QuantType::Q4_0 | QuantType::Q4_1
+        | QuantType::Q5_0 | QuantType::Q5_1
+        | QuantType::Q8_0 | QuantType::Q8_1 => {
+            prog.emit(VmInstr::QuantScalarCvtLoad {
+                dst: r,
+                base,
+                offset: offset_val,
+                src_dtype: ScalarCvtSource::F16,
+                width,
+            });
+            Ok(r)
+        }
+        QuantType::Q2K | QuantType::Q3K | QuantType::Q4K
+        | QuantType::Q5K | QuantType::Q6K | QuantType::Q8K => {
+            Err(CompilerError::CodegenViolation(
+                "QuantScaleLoad: K-Quant formats use QuantKQuantPackedScaleLookup TraceOp".into()
+            ))
+        }
+        QuantType::Mxfp4 { .. } | QuantType::Nvfp4 => {
+            Err(CompilerError::CodegenViolation(
+                "QuantScaleLoad: MXFP/NVFP formats use QuantE2m1LutDecode path".into()
+            ))
+        }
+        qt @ (QuantType::IQ1S | QuantType::IQ1M | QuantType::IQ2XXS
+             | QuantType::IQ2XS | QuantType::IQ2S
+             | QuantType::IQ3XXS | QuantType::IQ3S
+             | QuantType::IQ4NL | QuantType::IQ4XS) => {
+            Err(CompilerError::CodegenViolation(format!(
+                "QuantScaleLoad: IQ format {:?} uses codebook dequant path", qt
+            )))
+        }
+        QuantType::F32 | QuantType::F16 | QuantType::Bf16 => {
+            Err(CompilerError::CodegenViolation(format!(
+                "QuantScaleLoad: native float type {:?} has no scale to load", dtype
+            )))
+        }
+        QuantType::AWQ4 | QuantType::GPTQ4 | QuantType::Squeeze => {
+            Err(CompilerError::CodegenViolation(format!(
+                "QuantScaleLoad: external format {:?} not yet supported", dtype
+            )))
+        }
+        QuantType::TQ1_0 | QuantType::TQ2_0 => {
+            Err(CompilerError::CodegenViolation(format!(
+                "QuantScaleLoad: ternary format {:?} not yet supported", dtype
+            )))
+        }
+        QuantType::Fp8E4M3 | QuantType::Fp8E5M2 => {
+            Err(CompilerError::CodegenViolation(format!(
+                "QuantScaleLoad: FP8 {:?} has no scale (native float)", dtype
+            )))
+        }
+    }
+}
+
+/// QuantDataLoad emit helper (SPEC 24-QUANT-PIPELINE-JIT §4.1)。
+/// 从 quant block 加载权重数据，按 QuantDataKind 分派解包路径。
+fn emit_quant_data_load(
+    prog: &mut VmProgram,
+    base: VRegId,
+    offset: i64,
+    quant_type: QuantType,
+    block_size: usize,
+    width: SimdWidth,
+) -> Result<VRegId, CompilerError> {
+    let r = prog.alloc_vreg(VRegKind::Vec, width);
+    let offset_val = offset;
+    let desc = crate::quant_format::QuantFormatDescriptor::for_type(quant_type);
+    match desc.data_kind {
+        QuantDataKind::SignedPackedInt4 => {
+            let r_lo = prog.alloc_vreg(VRegKind::Vec, width);
+            prog.emit(VmInstr::QuantBlockLoad { dst: r_lo, base, offset: OffsetExpr::Const(offset_val), unpack: BlockUnpackMode::SignedNibbleLow, width });
+            let r_hi = prog.alloc_vreg(VRegKind::Vec, width);
+            prog.emit(VmInstr::QuantBlockLoad { dst: r_hi, base, offset: OffsetExpr::Const(offset_val), unpack: BlockUnpackMode::SignedNibbleHigh, width });
+            prog.emit(VmInstr::QuantInterleave { dst: r, lo: r_lo, hi: r_hi, width });
+        }
+        QuantDataKind::PackedInt4 => {
+            let r_lo = prog.alloc_vreg(VRegKind::Vec, width);
+            prog.emit(VmInstr::QuantBlockLoad { dst: r_lo, base, offset: OffsetExpr::Const(offset_val), unpack: BlockUnpackMode::UnsignedNibbleLow, width });
+            let r_hi = prog.alloc_vreg(VRegKind::Vec, width);
+            prog.emit(VmInstr::QuantBlockLoad { dst: r_hi, base, offset: OffsetExpr::Const(offset_val), unpack: BlockUnpackMode::UnsignedNibbleHigh, width });
+            prog.emit(VmInstr::QuantInterleave { dst: r, lo: r_lo, hi: r_hi, width });
+        }
+        QuantDataKind::Int8 => {
+            prog.emit(VmInstr::QuantBlockLoad { dst: r, base, offset: OffsetExpr::Const(offset_val), unpack: BlockUnpackMode::Int8, width });
+        }
+        QuantDataKind::PackedInt5 => {
+            let bytes = prog.alloc_vreg(VRegKind::Vec, width);
+            let count = width.f32_lanes().min(32);
+            prog.emit(VmInstr::QuantLoadBytesVec { dst: bytes, base, offset: offset_val, count, signed: false, width });
+            let mask = prog.alloc_vreg(VRegKind::Vec, width);
+            prog.emit(VmInstr::QuantBroadcastInt { dst: mask, value: 0x1F, width });
+            let extracted = prog.alloc_vreg(VRegKind::Vec, width);
+            prog.emit(VmInstr::VecBinOp { dst: extracted, a: bytes, b: mask, op: VecOp::And, dtype: QuantPrecision::F32 });
+            prog.emit(VmInstr::VecUnaryOp { dst: r, a: extracted, op: VecUnaryOp::IntToFloat });
+        }
+        QuantDataKind::PackedInt6 => {
+            let bytes = prog.alloc_vreg(VRegKind::Vec, width);
+            let count = width.f32_lanes().min(32);
+            prog.emit(VmInstr::QuantLoadBytesVec { dst: bytes, base, offset: offset_val, count, signed: false, width });
+            let mask = prog.alloc_vreg(VRegKind::Vec, width);
+            prog.emit(VmInstr::QuantBroadcastInt { dst: mask, value: 0x3F, width });
+            let extracted = prog.alloc_vreg(VRegKind::Vec, width);
+            prog.emit(VmInstr::VecBinOp { dst: extracted, a: bytes, b: mask, op: VecOp::And, dtype: QuantPrecision::F32 });
+            prog.emit(VmInstr::VecUnaryOp { dst: r, a: extracted, op: VecUnaryOp::IntToFloat });
+        }
+        QuantDataKind::SuperLowBit => {
+            let bytes = prog.alloc_vreg(VRegKind::Vec, width);
+            let count = width.f32_lanes().min(32);
+            prog.emit(VmInstr::QuantLoadBytesVec { dst: bytes, base, offset: offset_val, count, signed: false, width });
+            let codebook_data = desc.codebook.as_ref().map(|cb| cb.codebook_data).unwrap_or(&[]);
+            prog.emit(VmInstr::QuantCodebookLookup {
+                dst: r,
+                indices: bytes,
+                codebook_data,
+                vector_size: block_size,
+                bits_per_entry: desc.bits_per_element,
+                width,
+            });
+        }
+        QuantDataKind::Float4 | QuantDataKind::Nvfp4 => {
+            let scale_src = prog.alloc_vreg(VRegKind::Vec, width);
+            prog.emit(VmInstr::QuantScalarCvtLoad { dst: scale_src, base, offset: offset_val, src_dtype: ScalarCvtSource::U8, width });
+            let unpack = if matches!(desc.data_kind, QuantDataKind::Nvfp4) {
+                BlockUnpackMode::Nvfp4 { scale_src }
+            } else {
+                BlockUnpackMode::Mxfp4 { scale_src }
+            };
+            prog.emit(VmInstr::QuantBlockLoad { dst: r, base, offset: OffsetExpr::Const(offset_val), unpack, width });
+        }
+        other => {
+            return Err(CompilerError::CodegenViolation(format!(
+                "QuantDataLoad: unsupported data_kind={:?} for quant_type={:?}",
+                other, quant_type
+            )));
+        }
+    }
+    Ok(r)
 }
 
 
