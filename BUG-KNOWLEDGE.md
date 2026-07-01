@@ -179,3 +179,37 @@
   归因时间: 2026-07-01
   status: 待激活 ⏸ | residual: N/A(未根治, blocked on P3)
 ```
+
+---
+
+## BCE-20260630-LOWER-INSTR-GOD-MATCH — lower_instr 巨型 match god-match 根治 (A类, 已闭环)
+
+### smellClass: GOD-MATCH-DISPATCH (巨型 match VmInstr/TraceOp lowering dispatch, 单函数 3000-5000 行)
+
+**宪法依据**: P-2 复杂度限制 (圈复杂度 ≤10) + ARCH-AUTO-INSTR-SELECT (ComputePattern 通用处理器, 禁 per-OpKind 手写) + NO-SILENT-FALLBACK (catch-all 返回 Err 非 NOP)。
+
+**模式签名 (A类)**: 单函数 `match instr { VmInstr::Variant1 => ..., ... 153 arm }` 巨型 dispatch, 每新增 VmInstr arm 膨胀。三 ISA lower_instr (x86 3908行/gpu 5087行/aarch64 3340行) + program/verify/reg_alloc 的 match (renumber/validate/liveness) + auto_select dispatch_trace_op (1213行)。
+
+**根治策略 (A类, architect 裁决 sessionId 2b51725c)**:
+- L0 分类 dispatch: `match instr.category() { Memory => lower_memory(), ... 8 类全枚举无 catch-all }`
+- L1 变体路由: 8 个 lower_<cat>_<isa> 方法
+- L2 叶子 emit: 每变体独立 fn (Python 脚本机械抽取, refactor_code 在 .inc.rs 失效)
+- catch-all 返回 Err (NO_SILENT_FALLBACK)
+- 共享分类器: `vm_instr_category.rs` VmInstr::category() 跨三 ISA + TraceOp::category()
+
+**根治范围 (5 commit, 已闭环)**:
+- P1 (548cbc85): x86 lower_instr 3908→30 行 + vm_instr_category.rs + dispatch.inc.rs (8 L1 + 145 L2)
+- P2 (f5e284c4): aarch64 3340→410 + gpu 5090→20 + dispatch.inc.rs (8 L1 + 145/146 L2)
+- P3 (2622a221): program.inc.rs 6 函数 + verify.rs 4 函数 + reg_alloc.rs 3 函数 (11 god-match 清零)
+- P3b (afa8218b): validate/spill god-match split
+- P3c (4ba9958d): auto_select TraceOp category dispatch (过渡, auto_lower_trace 查表化为后续 BCE)
+
+**验证**: golden test 6972 passed 0 failed (diff=0, 行为保持) + arch_insight long_method 9→4 (5 god-match 清零)。
+
+**残留 (后续 BCE, 不搁置)**:
+- B类 long_method 4 处: mega_kernel_emit (1493行, BCE-MEGA-KERNEL-EMIT-CTX-REFACTOR blocked) + lower_op (1180行, 已根治范本不动) + numerical_sim exec_op_with_pos (987行) + pipeline emit_fusion_groups (758行) — 过程式长序列, 需 ctx 重构/extract_function
+- L2 body 二次抽取: high_cyclomatic L2 叶子 fn body 决策点 (if/return 链), 需进一步细分
+- auto_select auto_lower_trace 查表化根治 (ARCH-AUTO-INSTR-SELECT, architect 裁决)
+
+**防复发**: SPEC criterion ARCH-LOWER-DISPATCH-LAYERING (dispatch CC 允许 OCP 扩展点, logic CC ≤10) 待写入 SPEC/02-ARCHITECTURE.md §8。
+
