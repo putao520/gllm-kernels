@@ -293,12 +293,9 @@ pub(super) fn emit_fusion_groups(
             // 设置到 current_abi 供 resolver materialize 使用
             current_abi.activation_ping_ptr = Some(ping_ptr);
             current_abi.activation_pong_ptr = Some(pong_ptr);
-            eprintln!("[PING-PONG] enabled: ping_ptr=v{} (off={}), pong_ptr=v{} (off={})",
-                ping_ptr.0, ping_off, pong_ptr.0, pong_off);
             Some((ping_ptr, pong_ptr))
         } else {
             // No sentinel slots allocated (e.g. no layer_loop_config.activation_alias)
-            eprintln!("[PING-PONG] skipped: no sentinel slots found in buffer allocation");
             None
         }
     } else {
@@ -313,22 +310,6 @@ pub(super) fn emit_fusion_groups(
         seq_bound_override,
         activation_swap_vregs,
     };
-
-    // DEBUG: dump fusion plan groups for e5-small-v2 debugging
-    for (gi, group) in fctx.plan.groups.iter().enumerate() {
-        let op_names: Vec<String> = group.ops.iter()
-            .filter_map(|&oid| fctx.graph.op(oid).map(|op| {
-                let in_names: Vec<String> = op.inputs.iter()
-                    .filter_map(|&tid| fctx.graph.tensor(tid).map(|t| t.name.clone()))
-                    .collect();
-                let out_names: Vec<String> = op.outputs.iter()
-                    .filter_map(|&tid| fctx.graph.tensor(tid).map(|t| t.name.clone()))
-                    .collect();
-                format!("{:?} in=[{}] out=[{}]", op.op, in_names.join(","), out_names.join(","))
-            }))
-            .collect();
-        eprintln!("[FUSION-GROUP] gi={} mode={:?} is_layer={} ops=[{}]", gi, group.mode, group.is_layer_group, op_names.join("; "));
-    }
 
     for group in fctx.plan.groups.iter() {
         emit_one_fusion_group(
@@ -437,11 +418,6 @@ fn emit_one_fusion_group(
     if is_sampling_op {
         return Ok(());
     }
-
-    let group_op_labels: Vec<String> = group.ops.iter()
-        .filter_map(|&oid| fctx.graph.op(oid).map(|o| o.label.clone()))
-        .collect();
-    eprintln!("[LAYER-DETECT] anchor={} label='{}' is_layer={} ops=[{}] mode={:?}", group.anchor.0, anchor_op.label, group.is_layer_group, group_op_labels.join(", "), group.mode);
 
     // ── Heterogeneous or standard layer loop handling ──
     if fctx.graph.hetero_layer_loop_config.is_some() {
@@ -743,13 +719,11 @@ fn handle_standard_layer_loop(
             let topology_num_layers = topology.layer_num_layers.unwrap_or(cfg.num_layers);
             let layer_bound = if let Ok(n) = std::env::var("GLLM_DEBUG_LAYERS") {
                 if let Ok(count) = n.parse::<usize>() {
-                    eprintln!("[DEBUG-LAYERS] Overriding num_layers {} -> {}", topology_num_layers, count);
                     BoundExpr::Const(count)
                 } else {
                     BoundExpr::Const(topology_num_layers)
                 }
             } else if std::env::var("GLLM_SINGLE_LAYER").is_ok() {
-                eprintln!("[SINGLE-LAYER] Overriding num_layers {} -> 1", topology_num_layers);
                 BoundExpr::Const(1)
             } else {
                 BoundExpr::Const(topology_num_layers)
