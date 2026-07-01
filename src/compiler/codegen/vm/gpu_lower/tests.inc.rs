@@ -1146,6 +1146,24 @@ mod tests {
     }
 
     #[test]
+    fn test_ptx_prologue_sm120_version() {
+        // Arrange: SM120 (Blackwell consumer, RTX 5070 Ti) should use PTX 8.8
+        // and target sm_120 (CUDA 13.x driver JIT-compiles sm_120 PTX to native).
+        let mut l = GpuLower::new(GpuDialect::Ptx { sm_version: 120 });
+        let frame = empty_frame();
+        let alloc = empty_alloc();
+        // Act
+        l.emit_prologue(&frame, &alloc, Default::default()).unwrap();
+        l.emit_epilogue(&frame, &alloc).unwrap();
+        let ir = l.finalize().unwrap();
+        // Assert
+        assert!(ir.contains(".version 8.8"), "SM120 should use PTX 8.8: {ir}");
+        assert!(ir.contains(".target sm_120"), "SM120 should target sm_120: {ir}");
+        // SM120+ inherits SM90+ mbarrier declaration
+        assert!(ir.contains(".shared .align 8 .b64 mbar[4];"), "SM120 should declare mbarrier: {ir}");
+    }
+
+    #[test]
     fn test_ptx_prologue_sm90_mbarrier_declared() {
         // Arrange: SM90+ prologue should declare mbarrier array
         let mut l = GpuLower::new(GpuDialect::Ptx { sm_version: 90 });
