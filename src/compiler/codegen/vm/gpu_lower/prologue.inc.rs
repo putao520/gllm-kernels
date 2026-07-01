@@ -292,7 +292,10 @@ impl GpuLower {
                 self.emit_line(".address_size 64");
                 self.emit_line("");
                 self.emit_line(".visible .entry mega_kernel(");
-                // 20 ABI parameters matching the mega-kernel ABI
+                // 22 ABI parameters matching the CPU MegaKernelFn 22-param SSOT
+                // (gllm-kernels mega_kernel_abi.rs:159). REQ-UMK-27: CPU/GPU share
+                // the same ABI; only ISA lowering (ld.param here vs reg/stack on x86)
+                // differs. BCE-20260702-GPU-ABI: 三层 arity 漂移根治 (PTX 20→22).
                 self.emit_line("  .param .u64 input_ids_ptr,");
                 self.emit_line("  .param .u64 weight_blob_ptr,");
                 self.emit_line("  .param .u64 kv_cache_ptr,");
@@ -312,7 +315,9 @@ impl GpuLower {
                 self.emit_line("  .param .u32 session_position,");
                 self.emit_line("  .param .u64 fused_hidden_ptr,");
                 self.emit_line("  .param .u32 num_mm_tokens,");
-                self.emit_line("  .param .u64 callback_table_ptr");
+                self.emit_line("  .param .u64 callback_table_ptr,");
+                self.emit_line("  .param .u64 page_table_ptr,");
+                self.emit_line("  .param .u64 batch_ctx_ptr");
                 self.emit_line(") {");
                 self.indent += 1;
                 // Load parameters into registers
@@ -336,6 +341,8 @@ impl GpuLower {
                 self.emit_line("ld.param.u64 %rd_fused, [fused_hidden_ptr];");
                 self.emit_line("ld.param.u32 %r_nmm, [num_mm_tokens];");
                 self.emit_line("ld.param.u64 %rd_cb, [callback_table_ptr];");
+                self.emit_line("ld.param.u64 %rd_pagetable, [page_table_ptr];");
+                self.emit_line("ld.param.u64 %rd_batchctx, [batch_ctx_ptr];");
                 self.emit_reg_decl(vreg_counts);
                 if frame.scratchpad_area > 0 {
                     self.emit_shared_mem_decl(frame.scratchpad_area);
@@ -366,7 +373,9 @@ impl GpuLower {
                 self.emit_line("  unsigned int session_position,");
                 self.emit_line("  unsigned char* __restrict__ fused_hidden_ptr,");
                 self.emit_line("  unsigned int num_mm_tokens,");
-                self.emit_line("  unsigned char* __restrict__ callback_table_ptr");
+                self.emit_line("  unsigned char* __restrict__ callback_table_ptr,");
+                self.emit_line("  unsigned char* __restrict__ page_table_ptr,");
+                self.emit_line("  unsigned char* __restrict__ batch_ctx_ptr");
                 self.emit_line(") {");
                 self.indent += 1;
                 self.emit_hip_cxx_var_decls(vreg_counts);
@@ -375,7 +384,7 @@ impl GpuLower {
                 }
             }
             GpuDialect::Metal { .. } => {
-                // Metal mega-kernel with full ABI
+                // Metal mega-kernel with full ABI (22 params, aligned to CPU MegaKernelFn)
                 self.emit_line("kernel void mega_kernel(");
                 self.emit_line("  device unsigned int* input_ids_ptr [[buffer(0)]],");
                 self.emit_line("  device unsigned char* weight_blob_ptr [[buffer(1)]],");
@@ -396,7 +405,9 @@ impl GpuLower {
                 self.emit_line("  constant unsigned int& session_position [[buffer(16)]],");
                 self.emit_line("  device unsigned char* fused_hidden_ptr [[buffer(17)]],");
                 self.emit_line("  constant unsigned int& num_mm_tokens [[buffer(18)]],");
-                self.emit_line("  device unsigned char* callback_table_ptr [[buffer(19)]]");
+                self.emit_line("  device unsigned char* callback_table_ptr [[buffer(19)]],");
+                self.emit_line("  device unsigned char* page_table_ptr [[buffer(20)]],");
+                self.emit_line("  device unsigned char* batch_ctx_ptr [[buffer(21)]]");
                 self.emit_line(") {");
                 self.indent += 1;
                 self.emit_hip_cxx_var_decls(vreg_counts);
@@ -405,13 +416,15 @@ impl GpuLower {
                 }
             }
         }
-        // Update abi_param_names for mega-kernel ABI
+        // Update abi_param_names for mega-kernel ABI (22 params, aligned to CPU
+        // MegaKernelFn SSOT — mega_kernel_abi.rs:159). BCE-20260702-GPU-ABI.
         self.abi_param_names = vec![
             "input_ids_ptr", "weight_blob_ptr", "kv_cache_ptr", "positions_ptr",
             "aux_ptr", "batch_size", "seq_len", "scratchpad_ptr", "output_tokens_ptr",
             "temperature_bits", "top_k", "top_p_bits", "max_new_tokens", "eos_token_id",
             "hook_ctx_ptr", "telemetry_ptr", "session_position",
             "fused_hidden_ptr", "num_mm_tokens", "callback_table_ptr",
+            "page_table_ptr", "batch_ctx_ptr",
         ];
         Ok(())
     }
