@@ -497,17 +497,122 @@ fn copy_vreg(prog: &mut VmProgram, target: VRegId, src: VRegId, dtype: QuantPrec
     }
 }
 
-/// 单个 TraceOp → VmInstr 分发。
+/// 单个 TraceOp → VmInstr 分发 (REQ-AIS-001 ComputePattern 查表化)。
 ///
-/// 分类处理：
-/// - Input/Const → 特殊处理
-/// - 二元操作 → emit_binop (6 个变体共享)
-/// - 一元操作 → emit_unary (5 个变体共享)
-/// - Fma → 专用 VmInstr
-/// - 超越函数 → emit_transcendental (3 个变体共享)
-/// - 未实现 → Error (NO_SILENT_FALLBACK)
+/// 顶层为纯 dispatch：按 ComputePattern 7 类路由到对应 per-pattern handler。
+/// 每个 handler 集中处理同一 ComputePattern 的 TraceOp 变体，消除 long_method
+/// 与高圈复杂度 (BCE-20260630-AUTO-SELECT 根治)。
 // @trace REQ-AIS-001 [entity:ENT-AUTO-INSTR-SELECT] [api:POST /compile/dispatch]
 fn dispatch_trace_op(
+    prog: &mut VmProgram,
+    op_ref: &TraceOp,
+    slots: &[VRegId],
+    inputs: &[VRegId],
+    width: SimdWidth,
+    default_dtype: QuantPrecision,
+) -> Result<VRegId, CompilerError> {
+    match op_ref {
+        TraceOp::Input(..) => dispatch_elementwise(prog, op_ref, slots, inputs, width, default_dtype),
+        TraceOp::Const(..) => dispatch_elementwise(prog, op_ref, slots, inputs, width, default_dtype),
+        TraceOp::Add(..) => dispatch_binary_elementwise(prog, op_ref, slots, inputs, width, default_dtype),
+        TraceOp::Sub(..) => dispatch_binary_elementwise(prog, op_ref, slots, inputs, width, default_dtype),
+        TraceOp::Mul(..) => dispatch_binary_elementwise(prog, op_ref, slots, inputs, width, default_dtype),
+        TraceOp::Div(..) => dispatch_binary_elementwise(prog, op_ref, slots, inputs, width, default_dtype),
+        TraceOp::Pow(..) => dispatch_binary_elementwise(prog, op_ref, slots, inputs, width, default_dtype),
+        TraceOp::Max(..) => dispatch_binary_elementwise(prog, op_ref, slots, inputs, width, default_dtype),
+        TraceOp::Min(..) => dispatch_binary_elementwise(prog, op_ref, slots, inputs, width, default_dtype),
+        TraceOp::Fma(..) => dispatch_binary_elementwise(prog, op_ref, slots, inputs, width, default_dtype),
+        TraceOp::Neg(..) => dispatch_elementwise(prog, op_ref, slots, inputs, width, default_dtype),
+        TraceOp::Abs(..) => dispatch_elementwise(prog, op_ref, slots, inputs, width, default_dtype),
+        TraceOp::Sqrt(..) => dispatch_elementwise(prog, op_ref, slots, inputs, width, default_dtype),
+        TraceOp::Rsqrt(..) => dispatch_elementwise(prog, op_ref, slots, inputs, width, default_dtype),
+        TraceOp::Recip(..) => dispatch_elementwise(prog, op_ref, slots, inputs, width, default_dtype),
+        TraceOp::Exp(..) => dispatch_elementwise(prog, op_ref, slots, inputs, width, default_dtype),
+        TraceOp::Tanh(..) => dispatch_elementwise(prog, op_ref, slots, inputs, width, default_dtype),
+        TraceOp::Log(..) => dispatch_elementwise(prog, op_ref, slots, inputs, width, default_dtype),
+        TraceOp::Sigmoid(..) => dispatch_elementwise(prog, op_ref, slots, inputs, width, default_dtype),
+        TraceOp::Compare { .. } => dispatch_elementwise(prog, op_ref, slots, inputs, width, default_dtype),
+        TraceOp::Cast { .. } => dispatch_elementwise(prog, op_ref, slots, inputs, width, default_dtype),
+        TraceOp::ConditionalBranch(..) => dispatch_elementwise(prog, op_ref, slots, inputs, width, default_dtype),
+        TraceOp::HReduce { .. } => dispatch_reduction(prog, op_ref, slots, inputs, width, default_dtype),
+        TraceOp::ScalarLoad { .. } => dispatch_injective(prog, op_ref, slots, inputs, width, default_dtype),
+        TraceOp::StrideMul { .. } => dispatch_injective(prog, op_ref, slots, inputs, width, default_dtype),
+        TraceOp::PtrAdd { .. } => dispatch_injective(prog, op_ref, slots, inputs, width, default_dtype),
+        TraceOp::VecLoadIndexed { .. } => dispatch_injective(prog, op_ref, slots, inputs, width, default_dtype),
+        TraceOp::VecStoreIndexed { .. } => dispatch_injective(prog, op_ref, slots, inputs, width, default_dtype),
+        TraceOp::QuantFma { .. } => dispatch_binary_elementwise(prog, op_ref, slots, inputs, width, default_dtype),
+        TraceOp::BlockScale { .. } => dispatch_binary_elementwise(prog, op_ref, slots, inputs, width, default_dtype),
+        TraceOp::Prefetch { .. } => dispatch_elementwise(prog, op_ref, slots, inputs, width, default_dtype),
+        TraceOp::NonTemporalStore => dispatch_elementwise(prog, op_ref, slots, inputs, width, default_dtype),
+        TraceOp::BitExtract { .. } => dispatch_binary_elementwise(prog, op_ref, slots, inputs, width, default_dtype),
+        TraceOp::Permute { .. } => dispatch_binary_elementwise(prog, op_ref, slots, inputs, width, default_dtype),
+        TraceOp::MaskedOp { .. } => dispatch_binary_elementwise(prog, op_ref, slots, inputs, width, default_dtype),
+        TraceOp::AtomicAdd { .. } => dispatch_binary_elementwise(prog, op_ref, slots, inputs, width, default_dtype),
+        TraceOp::BroadcastScalar { .. } => dispatch_elementwise(prog, op_ref, slots, inputs, width, default_dtype),
+        TraceOp::BroadcastLoad { .. } => dispatch_injective(prog, op_ref, slots, inputs, width, default_dtype),
+        TraceOp::GatherLoad { .. } => dispatch_injective(prog, op_ref, slots, inputs, width, default_dtype),
+        TraceOp::ScatterStore { .. } => dispatch_injective(prog, op_ref, slots, inputs, width, default_dtype),
+        TraceOp::TableLookup { .. } => dispatch_injective(prog, op_ref, slots, inputs, width, default_dtype),
+        TraceOp::Mxfp4Dequant { .. } => dispatch_injective(prog, op_ref, slots, inputs, width, default_dtype),
+        TraceOp::BitAnd(..) => dispatch_binary_elementwise(prog, op_ref, slots, inputs, width, default_dtype),
+        TraceOp::FWHT { .. } => dispatch_injective(prog, op_ref, slots, inputs, width, default_dtype),
+        TraceOp::QuantBitAnd { .. } => dispatch_quant_decode(prog, op_ref, slots, inputs, width, default_dtype),
+        TraceOp::QuantBitOr { .. } => dispatch_quant_decode(prog, op_ref, slots, inputs, width, default_dtype),
+        TraceOp::QuantBroadcast { .. } => dispatch_quant_decode(prog, op_ref, slots, inputs, width, default_dtype),
+        TraceOp::QuantCastF16toF32 { .. } => dispatch_quant_decode(prog, op_ref, slots, inputs, width, default_dtype),
+        TraceOp::QuantCastI8toF32 { .. } => dispatch_quant_decode(prog, op_ref, slots, inputs, width, default_dtype),
+        TraceOp::QuantCastFp8toF32 { .. } => dispatch_quant_decode(prog, op_ref, slots, inputs, width, default_dtype),
+        TraceOp::QuantCodebookLookup { .. } => dispatch_quant_decode(prog, op_ref, slots, inputs, width, default_dtype),
+        TraceOp::QuantExtractBits { .. } => dispatch_quant_decode(prog, op_ref, slots, inputs, width, default_dtype),
+        TraceOp::QuantDequantFma { .. } => dispatch_quant_decode(prog, op_ref, slots, inputs, width, default_dtype),
+        TraceOp::QuantIntDivConst { .. } => dispatch_quant_decode(prog, op_ref, slots, inputs, width, default_dtype),
+        TraceOp::QuantIntMul { .. } => dispatch_quant_decode(prog, op_ref, slots, inputs, width, default_dtype),
+        TraceOp::QuantInterleave { .. } => dispatch_quant_decode(prog, op_ref, slots, inputs, width, default_dtype),
+        TraceOp::QuantConcatSeq { .. } => dispatch_quant_decode(prog, op_ref, slots, inputs, width, default_dtype),
+        TraceOp::QuantQ3KDecode { .. } => dispatch_quant_decode(prog, op_ref, slots, inputs, width, default_dtype),
+        TraceOp::QuantPtrAddOffset { .. } => dispatch_quant_decode(prog, op_ref, slots, inputs, width, default_dtype),
+        TraceOp::QuantPtrAddDynamic { .. } => dispatch_quant_decode(prog, op_ref, slots, inputs, width, default_dtype),
+        TraceOp::QuantScalarLoad { .. } => dispatch_quant_decode(prog, op_ref, slots, inputs, width, default_dtype),
+        TraceOp::QuantAndMask { .. } => dispatch_quant_decode(prog, op_ref, slots, inputs, width, default_dtype),
+        TraceOp::QuantKQuantPackedScaleLookup { .. } => dispatch_quant_decode(prog, op_ref, slots, inputs, width, default_dtype),
+        TraceOp::QuantLoadF16toF32 { .. } => dispatch_quant_decode(prog, op_ref, slots, inputs, width, default_dtype),
+        TraceOp::QuantLoadI8toF32 { .. } => dispatch_quant_decode(prog, op_ref, slots, inputs, width, default_dtype),
+        TraceOp::QuantLoadBytesVec { .. } => dispatch_quant_decode(prog, op_ref, slots, inputs, width, default_dtype),
+        TraceOp::QuantShiftLeft { .. } => dispatch_quant_decode(prog, op_ref, slots, inputs, width, default_dtype),
+        TraceOp::QuantShiftRight { .. } => dispatch_quant_decode(prog, op_ref, slots, inputs, width, default_dtype),
+        TraceOp::QuantE2m1LutDecode { .. } => dispatch_quant_decode(prog, op_ref, slots, inputs, width, default_dtype),
+        TraceOp::QuantScaleLoad { .. } => dispatch_quant_decode(prog, op_ref, slots, inputs, width, default_dtype),
+        TraceOp::QuantDataLoad { .. } => dispatch_quant_decode(prog, op_ref, slots, inputs, width, default_dtype),
+        TraceOp::QuantZeroLoad { .. } => dispatch_quant_decode(prog, op_ref, slots, inputs, width, default_dtype),
+        TraceOp::QuantSubScaleLoad { .. } => dispatch_quant_decode(prog, op_ref, slots, inputs, width, default_dtype),
+        TraceOp::QuantHighBitsLoad { .. } => dispatch_quant_decode(prog, op_ref, slots, inputs, width, default_dtype),
+        TraceOp::QuantCodebookDequant { .. } => dispatch_quant_decode(prog, op_ref, slots, inputs, width, default_dtype),
+        TraceOp::Loop { .. } => dispatch_injective(prog, op_ref, slots, inputs, width, default_dtype),
+        TraceOp::PanelLoad { .. } => dispatch_injective(prog, op_ref, slots, inputs, width, default_dtype),
+        TraceOp::PanelStore { .. } => dispatch_injective(prog, op_ref, slots, inputs, width, default_dtype),
+        TraceOp::PackBuffer { .. } => dispatch_injective(prog, op_ref, slots, inputs, width, default_dtype),
+        TraceOp::SharedMemDeclare { .. } => dispatch_injective(prog, op_ref, slots, inputs, width, default_dtype),
+        TraceOp::AsyncCopyToShared { .. } => dispatch_injective(prog, op_ref, slots, inputs, width, default_dtype),
+        TraceOp::Tma2DCopy { .. } => dispatch_injective(prog, op_ref, slots, inputs, width, default_dtype),
+        TraceOp::AsyncWaitGroup { .. } => dispatch_injective(prog, op_ref, slots, inputs, width, default_dtype),
+        TraceOp::SyncBarrier { .. } => dispatch_injective(prog, op_ref, slots, inputs, width, default_dtype),
+        TraceOp::TileConfig { .. } => dispatch_injective(prog, op_ref, slots, inputs, width, default_dtype),
+        TraceOp::TileMma { .. } => dispatch_gemm(prog, op_ref, slots, inputs, width, default_dtype),
+        TraceOp::TileRelease => dispatch_injective(prog, op_ref, slots, inputs, width, default_dtype),
+        TraceOp::Softmax { .. } => dispatch_normlike(prog, op_ref, slots, inputs, width, default_dtype),
+        TraceOp::EpilogueChain { .. } => dispatch_injective(prog, op_ref, slots, inputs, width, default_dtype),
+        TraceOp::QuantGather { .. } => dispatch_quant_decode(prog, op_ref, slots, inputs, width, default_dtype),
+        TraceOp::QuantGemm { .. } => dispatch_gemm(prog, op_ref, slots, inputs, width, default_dtype),
+        TraceOp::MtpDraft { .. } => dispatch_quant_decode(prog, op_ref, slots, inputs, width, default_dtype),
+        TraceOp::MlaAttnScore { .. } => dispatch_quant_decode(prog, op_ref, slots, inputs, width, default_dtype),
+        TraceOp::MlaRopeMerge { .. } => dispatch_quant_decode(prog, op_ref, slots, inputs, width, default_dtype),
+        TraceOp::DynamicPrecisionSelect { .. } => dispatch_binary_elementwise(prog, op_ref, slots, inputs, width, default_dtype),
+    }
+}
+
+/// ComputePattern::elementwise 路由 handler (REQ-AIS-001 查表化)。
+/// 集中处理 17 个同 ComputePattern 的 TraceOp 变体。
+fn dispatch_elementwise(
     prog: &mut VmProgram,
     op: &TraceOp,
     slots: &[VRegId],
@@ -539,37 +644,6 @@ fn dispatch_trace_op(
         }
 
         // ── 二元操作 → VecBinOp ──
-        TraceOp::Add(a, b) => emit_binop(prog, slots, *a, *b, VecOp::Add, width, default_dtype),
-        TraceOp::Sub(a, b) => emit_binop(prog, slots, *a, *b, VecOp::Sub, width, default_dtype),
-        TraceOp::Mul(a, b) => emit_binop(prog, slots, *a, *b, VecOp::Mul, width, default_dtype),
-        TraceOp::Div(a, b) => emit_binop(prog, slots, *a, *b, VecOp::Div, width, default_dtype),
-        TraceOp::Pow(a, b) => {
-            // pow(base, exp) = exp(log(base) * exp)
-            let log_base = prog.alloc_vreg(VRegKind::Vec, width);
-            prog.emit(VmInstr::Transcendental { dst: log_base, src: slots[a.0 as usize], func: TranscendentalFn::Log });
-            let mul_result = prog.alloc_vreg(VRegKind::Vec, width);
-            prog.emit(VmInstr::VecBinOp { dst: mul_result, a: log_base, b: slots[b.0 as usize], op: VecOp::Mul, dtype: default_dtype });
-            let r = prog.alloc_vreg(VRegKind::Vec, width);
-            prog.emit(VmInstr::Transcendental { dst: r, src: mul_result, func: TranscendentalFn::Exp });
-            Ok(r)
-        }
-        TraceOp::Max(a, b) => emit_binop(prog, slots, *a, *b, VecOp::Max, width, default_dtype),
-        TraceOp::Min(a, b) => emit_binop(prog, slots, *a, *b, VecOp::Min, width, default_dtype),
-
-        // ── FMA → 专用 VmInstr ──
-        TraceOp::Fma(a, b, c) => {
-            let r = prog.alloc_vreg(VRegKind::Vec, width);
-            prog.emit(VmInstr::Fma {
-                dst: r,
-                acc: slots[c.0 as usize],
-                a: slots[a.0 as usize],
-                b: slots[b.0 as usize],
-                dtype: default_dtype,
-            });
-            Ok(r)
-        }
-
-        // ── 一元操作 → VecUnaryOp ──
         TraceOp::Neg(a) => emit_unary(prog, slots, *a, VecUnaryOp::Neg, width),
         TraceOp::Abs(a) => emit_unary(prog, slots, *a, VecUnaryOp::Abs, width),
         TraceOp::Sqrt(a) => emit_unary(prog, slots, *a, VecUnaryOp::Sqrt, width),
@@ -622,115 +696,6 @@ fn dispatch_trace_op(
             Ok(r)
         }
         // @trace REQ-AIS-004 [entity:ENT-AUTO-INSTR-SELECT] [api:POST /compile/hreduce]
-        TraceOp::HReduce { src, op } => {
-            let reduce_op = match op {
-                ReduceKind::Sum => ReduceOp::Sum,
-                ReduceKind::Max => ReduceOp::Max,
-                ReduceKind::Min => ReduceOp::Min,
-                ReduceKind::Prod => ReduceOp::Prod,
-                ReduceKind::LogSum => ReduceOp::LogSum,
-                other => {
-                    return Err(CompilerError::CodegenViolation(format!(
-                        "auto_lower_trace: HReduce op {:?} 尚未实现 (Count/ArgMax need dedicated lowering)",
-                        other
-                    )));
-                }
-            };
-            // HReduce output is scalar-width (single value), input is vector-width.
-            let r = prog.alloc_vreg(VRegKind::Vec, SimdWidth::Scalar);
-            prog.emit(VmInstr::HReduce {
-                dst: r,
-                src: slots[src.0 as usize],
-                op: reduce_op,
-            });
-            Ok(r)
-        }
-
-        // ── 结构型内存操作 (ARCH-AUTO-INSTR-SELECT structural) ──
-
-        TraceOp::ScalarLoad { base, offset } => {
-            let r = prog.alloc_vreg(VRegKind::Scalar, SimdWidth::Scalar);
-            prog.emit(VmInstr::ScalarLoad {
-                dst: r,
-                base: slots[base.0 as usize],
-                offset: OffsetExpr::LoopOffset(slots[offset.0 as usize]),
-            });
-            Ok(r)
-        }
-
-        TraceOp::StrideMul { value, stride } => {
-            let r = prog.alloc_vreg(VRegKind::Ptr, SimdWidth::Scalar);
-            prog.emit(VmInstr::IntMulStride {
-                dst: r,
-                src: slots[value.0 as usize],
-                stride: *stride,
-            });
-            Ok(r)
-        }
-
-        TraceOp::PtrAdd { base, offset } => {
-            let r = prog.alloc_vreg(VRegKind::Ptr, SimdWidth::Scalar);
-            prog.emit(VmInstr::LoadPtr {
-                dst: r,
-                src: PtrExpr::VRegPlusVReg(slots[base.0 as usize], slots[offset.0 as usize]),
-            });
-            Ok(r)
-        }
-
-        TraceOp::VecLoadIndexed { base, offset } => {
-            let r = prog.alloc_vreg(VRegKind::Vec, width);
-            prog.emit(VmInstr::VecLoad {
-                dst: r,
-                base: slots[base.0 as usize],
-                offset: OffsetExpr::LoopOffset(slots[offset.0 as usize]),
-                width,
-                dtype: default_dtype, predicate: None,
-            });
-            Ok(r)
-        }
-
-        TraceOp::VecStoreIndexed { base, offset, value } => {
-            prog.emit(VmInstr::VecStore {
-                base: slots[base.0 as usize],
-                offset: OffsetExpr::LoopOffset(slots[offset.0 as usize]),
-                src: slots[value.0 as usize],
-                width,
-                dtype: default_dtype, predicate: None,
-            });
-            // Store doesn't produce a new value; return the value slot.
-            Ok(slots[value.0 as usize])
-        }
-
-        // ── 量化混合精度 (§11 TurboQuant / §13.12 硬件拓扑) ──
-
-        // QuantFma: 混合精度 FMA — 简化为标准 FMA (acc + act * weight)。
-        // 当 act/weight 为非 F32 精度时，上层 Cast 已完成反量化。
-        // 后端 gfx950 mfma_scale / SM100 tcgen05 / AMX-FP8 路径
-        // 在 ISA Lowering 阶段根据 DeviceProfile 生成专用指令。
-        TraceOp::QuantFma { acc, act, weight, .. } => {
-            let r = prog.alloc_vreg(VRegKind::Vec, width);
-            prog.emit(VmInstr::Fma {
-                dst: r,
-                acc: slots[acc.0 as usize],
-                a: slots[act.0 as usize],
-                b: slots[weight.0 as usize],
-                dtype: default_dtype,
-            });
-            Ok(r)
-        }
-
-        // BlockScale: 逐元素 Mul — data[i] * scale[i/block_size]。
-        // f32 SIMD 路径下 scale 已广播到每个 SIMD 通道（上层处理 block 展开）。
-        // CDNA4 gfx950 mfma_scale 原生路径在 ISA Lowering 阶段特化。
-        TraceOp::BlockScale { data, scale, .. } => {
-            emit_binop(prog, slots, *data, *scale, VecOp::Mul, width, default_dtype)
-        }
-
-        // ── 内存层级控制 ──
-
-        // Prefetch: 性能提示，不影响正确性。
-        // Prefetch 没有数据输出，返回一个 dummy slot（不产生新值）。
-        // ISA Lowering 根据 CacheLevel 映射: prefetcht0/t1/nta / prfm / prefetch.global.L2。
         TraceOp::Prefetch { level: _ } => {
             // Prefetch 不产生新值，调用方不消费返回的 slot。
             // 返回 inputs[0] 作为占位（语义：无输出）。
@@ -757,6 +722,89 @@ fn dispatch_trace_op(
         // f32 SIMD 管线中没有等价的浮点向量指令。
         // 量化场景的位提取应在反量化前通过专用路径处理（如 QuantBlockLoad），
         // 不应出现在 f32 trace body 中。
+        TraceOp::BroadcastScalar { src } => {
+            let r = prog.alloc_vreg(VRegKind::Vec, width);
+            prog.emit(VmInstr::Broadcast {
+                dst: r,
+                src: ScalarExpr::ExtractLane0(slots[src.0 as usize]),
+                width,
+                dtype: default_dtype,
+            });
+            Ok(r)
+        }
+
+        // BroadcastLoad: 从内存加载标量并广播到向量所有 lane。
+        // 映射到 VmInstr::Broadcast { src: MemLoad(base, offset) }。
+        _ => unreachable_pattern(op),
+    }
+}
+
+/// ComputePattern::binary_elementwise 路由 handler (REQ-AIS-001 查表化)。
+/// 集中处理 16 个同 ComputePattern 的 TraceOp 变体。
+fn dispatch_binary_elementwise(
+    prog: &mut VmProgram,
+    op: &TraceOp,
+    slots: &[VRegId],
+    inputs: &[VRegId],
+    width: SimdWidth,
+    default_dtype: QuantPrecision,
+) -> Result<VRegId, CompilerError> {
+    match op {
+        TraceOp::Add(a, b) => emit_binop(prog, slots, *a, *b, VecOp::Add, width, default_dtype),
+        TraceOp::Sub(a, b) => emit_binop(prog, slots, *a, *b, VecOp::Sub, width, default_dtype),
+        TraceOp::Mul(a, b) => emit_binop(prog, slots, *a, *b, VecOp::Mul, width, default_dtype),
+        TraceOp::Div(a, b) => emit_binop(prog, slots, *a, *b, VecOp::Div, width, default_dtype),
+        TraceOp::Pow(a, b) => {
+            // pow(base, exp) = exp(log(base) * exp)
+            let log_base = prog.alloc_vreg(VRegKind::Vec, width);
+            prog.emit(VmInstr::Transcendental { dst: log_base, src: slots[a.0 as usize], func: TranscendentalFn::Log });
+            let mul_result = prog.alloc_vreg(VRegKind::Vec, width);
+            prog.emit(VmInstr::VecBinOp { dst: mul_result, a: log_base, b: slots[b.0 as usize], op: VecOp::Mul, dtype: default_dtype });
+            let r = prog.alloc_vreg(VRegKind::Vec, width);
+            prog.emit(VmInstr::Transcendental { dst: r, src: mul_result, func: TranscendentalFn::Exp });
+            Ok(r)
+        }
+        TraceOp::Max(a, b) => emit_binop(prog, slots, *a, *b, VecOp::Max, width, default_dtype),
+        TraceOp::Min(a, b) => emit_binop(prog, slots, *a, *b, VecOp::Min, width, default_dtype),
+
+        // ── FMA → 专用 VmInstr ──
+        TraceOp::Fma(a, b, c) => {
+            let r = prog.alloc_vreg(VRegKind::Vec, width);
+            prog.emit(VmInstr::Fma {
+                dst: r,
+                acc: slots[c.0 as usize],
+                a: slots[a.0 as usize],
+                b: slots[b.0 as usize],
+                dtype: default_dtype,
+            });
+            Ok(r)
+        }
+
+        // ── 一元操作 → VecUnaryOp ──
+        TraceOp::QuantFma { acc, act, weight, .. } => {
+            let r = prog.alloc_vreg(VRegKind::Vec, width);
+            prog.emit(VmInstr::Fma {
+                dst: r,
+                acc: slots[acc.0 as usize],
+                a: slots[act.0 as usize],
+                b: slots[weight.0 as usize],
+                dtype: default_dtype,
+            });
+            Ok(r)
+        }
+
+        // BlockScale: 逐元素 Mul — data[i] * scale[i/block_size]。
+        // f32 SIMD 路径下 scale 已广播到每个 SIMD 通道（上层处理 block 展开）。
+        // CDNA4 gfx950 mfma_scale 原生路径在 ISA Lowering 阶段特化。
+        TraceOp::BlockScale { data, scale, .. } => {
+            emit_binop(prog, slots, *data, *scale, VecOp::Mul, width, default_dtype)
+        }
+
+        // ── 内存层级控制 ──
+
+        // Prefetch: 性能提示，不影响正确性。
+        // Prefetch 没有数据输出，返回一个 dummy slot（不产生新值）。
+        // ISA Lowering 根据 CacheLevel 映射: prefetcht0/t1/nta / prfm / prefetch.global.L2。
         TraceOp::BitExtract { offset, width, .. } => {
             Err(CompilerError::CodegenViolation(format!(
                 "BitExtract: 需要 shift+mask 整数操作，f32 SIMD 管线不支持 \
@@ -825,19 +873,183 @@ fn dispatch_trace_op(
 
         // BroadcastScalar: 将 src 的 lane 0 广播到向量所有 lane。
         // 映射到 VmInstr::Broadcast { src: ExtractLane0(src_vreg) }。
-        TraceOp::BroadcastScalar { src } => {
+        TraceOp::BitAnd(a, b) => {
             let r = prog.alloc_vreg(VRegKind::Vec, width);
+            prog.emit(VmInstr::VecBinOp { dst: r, a: slots[a.0 as usize], b: slots[b.0 as usize], op: VecOp::And, dtype: default_dtype, });
+            Ok(r)
+        }
+
+        // ── 信号处理 (§11.1 TurboQuant FWHT) ──
+
+        // FWHT: Fast Walsh-Hadamard Transform。
+        // butterfly 网络: 逐级加减。
+        // 展开为 log2(dim) 级，每级 dim/2 对 Add/Sub。
+        // dim 必须是 2 的幂。
+        TraceOp::DynamicPrecisionSelect { tensor, candidates, thresholds } => {
+            if candidates.len() != thresholds.len() {
+                return Err(CompilerError::CodegenViolation(format!(
+                    "DynamicPrecisionSelect: candidates({}) 与 thresholds({}) 长度不匹配",
+                    candidates.len(), thresholds.len()
+                )));
+            }
+            if candidates.is_empty() {
+                return Err(CompilerError::CodegenViolation(
+                    "DynamicPrecisionSelect: candidates 不能为空".into()
+                ));
+            }
+
+            // Step 1: HReduce(Max) — 从 tensor 中提取最大绝对值
+            let max_val = prog.alloc_vreg(VRegKind::Vec, SimdWidth::Scalar);
+            prog.emit(VmInstr::HReduce {
+                dst: max_val,
+                src: slots[tensor.0 as usize],
+                op: ReduceOp::Max,
+            });
+
+            // Step 2: 广播 max_val 到向量宽度以便比较
+            let max_broadcast = prog.alloc_vreg(VRegKind::Vec, width);
             prog.emit(VmInstr::Broadcast {
-                dst: r,
-                src: ScalarExpr::ExtractLane0(slots[src.0 as usize]),
+                dst: max_broadcast,
+                src: ScalarExpr::ExtractLane0(max_val),
                 width,
                 dtype: default_dtype,
+            });
+
+            // Step 3: 对每个阈值生成比较 + ConditionalSelect
+            // 策略: 从最高精度（索引 0）开始，逐级检查是否可以降精度
+            // result_idx 初始 = 0（最高精度）
+            // if max_val < thresholds[1]: result_idx = 1 (第一个低精度)
+            // if max_val < thresholds[2]: result_idx = 2 (更低精度)
+            // ...
+            // 最终 result_idx 作为 GPR 整数结果
+
+            // 广播当前索引值（初始 = 0，即 candidates[0] 最高精度）
+            let mut idx_val = prog.alloc_vreg(VRegKind::Vec, width);
+            prog.emit(VmInstr::Broadcast {
+                dst: idx_val,
+                src: ScalarExpr::Const(0.0),
+                width,
+                dtype: default_dtype,
+            });
+
+            // 从索引 1 开始逐阈值比较（candidates[0] 是默认，不需要比较）
+            for (i, threshold) in thresholds.iter().enumerate().skip(1) {
+                // 广播阈值常量
+                let thresh_val = prog.alloc_vreg(VRegKind::Vec, width);
+                prog.emit(VmInstr::Broadcast {
+                    dst: thresh_val,
+                    src: ScalarExpr::Const(*threshold as f32),
+                    width,
+                    dtype: default_dtype,
+                });
+
+                // 比较: max_val < threshold → mask
+                let cmp_mask = prog.alloc_vreg(VRegKind::Vec, width);
+                prog.emit(VmInstr::VecCmp {
+                    dst: cmp_mask,
+                    a: max_broadcast,
+                    b: thresh_val,
+                    pred: CmpPredicate::Lt,
+                });
+
+                // 广播新索引值 (i as f32)
+                let new_idx = prog.alloc_vreg(VRegKind::Vec, width);
+                prog.emit(VmInstr::Broadcast {
+                    dst: new_idx,
+                    src: ScalarExpr::Const(i as f32),
+                    width,
+                    dtype: default_dtype,
+                });
+
+                // ConditionalSelect: mask ? new_idx : idx_val
+                let selected = prog.alloc_vreg(VRegKind::Vec, width);
+                prog.emit(VmInstr::ConditionalSelect {
+                    dst: selected,
+                    mask: cmp_mask,
+                    true_val: new_idx,
+                    false_val: idx_val,
+                });
+
+                idx_val = selected;
+            }
+
+            // 结果是向量形式的精度索引，返回它
+            Ok(idx_val)
+        }
+        _ => unreachable_pattern(op),
+    }
+}
+
+/// ComputePattern::injective 路由 handler (REQ-AIS-001 查表化)。
+/// 集中处理 23 个同 ComputePattern 的 TraceOp 变体。
+fn dispatch_injective(
+    prog: &mut VmProgram,
+    op: &TraceOp,
+    slots: &[VRegId],
+    inputs: &[VRegId],
+    width: SimdWidth,
+    default_dtype: QuantPrecision,
+) -> Result<VRegId, CompilerError> {
+    match op {
+        TraceOp::ScalarLoad { base, offset } => {
+            let r = prog.alloc_vreg(VRegKind::Scalar, SimdWidth::Scalar);
+            prog.emit(VmInstr::ScalarLoad {
+                dst: r,
+                base: slots[base.0 as usize],
+                offset: OffsetExpr::LoopOffset(slots[offset.0 as usize]),
             });
             Ok(r)
         }
 
-        // BroadcastLoad: 从内存加载标量并广播到向量所有 lane。
-        // 映射到 VmInstr::Broadcast { src: MemLoad(base, offset) }。
+        TraceOp::StrideMul { value, stride } => {
+            let r = prog.alloc_vreg(VRegKind::Ptr, SimdWidth::Scalar);
+            prog.emit(VmInstr::IntMulStride {
+                dst: r,
+                src: slots[value.0 as usize],
+                stride: *stride,
+            });
+            Ok(r)
+        }
+
+        TraceOp::PtrAdd { base, offset } => {
+            let r = prog.alloc_vreg(VRegKind::Ptr, SimdWidth::Scalar);
+            prog.emit(VmInstr::LoadPtr {
+                dst: r,
+                src: PtrExpr::VRegPlusVReg(slots[base.0 as usize], slots[offset.0 as usize]),
+            });
+            Ok(r)
+        }
+
+        TraceOp::VecLoadIndexed { base, offset } => {
+            let r = prog.alloc_vreg(VRegKind::Vec, width);
+            prog.emit(VmInstr::VecLoad {
+                dst: r,
+                base: slots[base.0 as usize],
+                offset: OffsetExpr::LoopOffset(slots[offset.0 as usize]),
+                width,
+                dtype: default_dtype, predicate: None,
+            });
+            Ok(r)
+        }
+
+        TraceOp::VecStoreIndexed { base, offset, value } => {
+            prog.emit(VmInstr::VecStore {
+                base: slots[base.0 as usize],
+                offset: OffsetExpr::LoopOffset(slots[offset.0 as usize]),
+                src: slots[value.0 as usize],
+                width,
+                dtype: default_dtype, predicate: None,
+            });
+            // Store doesn't produce a new value; return the value slot.
+            Ok(slots[value.0 as usize])
+        }
+
+        // ── 量化混合精度 (§11 TurboQuant / §13.12 硬件拓扑) ──
+
+        // QuantFma: 混合精度 FMA — 简化为标准 FMA (acc + act * weight)。
+        // 当 act/weight 为非 F32 精度时，上层 Cast 已完成反量化。
+        // 后端 gfx950 mfma_scale / SM100 tcgen05 / AMX-FP8 路径
+        // 在 ISA Lowering 阶段根据 DeviceProfile 生成专用指令。
         TraceOp::BroadcastLoad { base, offset } => {
             let r = prog.alloc_vreg(VRegKind::Vec, width);
             prog.emit(VmInstr::Broadcast {
@@ -923,24 +1135,278 @@ fn dispatch_trace_op(
 
         // BitAnd: 逐位与运算 (低位掩码等)。
         // 映射到 VmInstr::VecBinOp { op: VecOp::And }。
-        TraceOp::BitAnd(a, b) => {
-            let r = prog.alloc_vreg(VRegKind::Vec, width);
-            prog.emit(VmInstr::VecBinOp { dst: r, a: slots[a.0 as usize], b: slots[b.0 as usize], op: VecOp::And, dtype: default_dtype, });
-            Ok(r)
-        }
-
-        // ── 信号处理 (§11.1 TurboQuant FWHT) ──
-
-        // FWHT: Fast Walsh-Hadamard Transform。
-        // butterfly 网络: 逐级加减。
-        // 展开为 log2(dim) 级，每级 dim/2 对 Add/Sub。
-        // dim 必须是 2 的幂。
         TraceOp::FWHT { src, dim } => {
             emit_fwht(prog, slots, *src, *dim, width, default_dtype)
         }
 
         // ── SPEC 23-QUANT-CODEGEN-ALGO §3: Quant* 解码 TraceOp 分派 ──
 
+        TraceOp::Loop { bound, step_bytes, body } => {
+            let counter = prog.alloc_vreg(VRegKind::Counter, SimdWidth::Scalar);
+            let byte_off = prog.alloc_vreg(VRegKind::ByteOffset, SimdWidth::Scalar);
+            prog.emit(VmInstr::LoopBegin {
+                counter,
+                byte_offset: byte_off,
+                bound: bound.clone(),
+                step_bytes: *step_bytes,
+            });
+            // 递归处理 Loop body — body 内的 TraceOp 走同样的 dispatch
+            for body_op in body.iter() {
+                let _body_result = dispatch_trace_op(prog, body_op, slots, inputs, width, default_dtype)?;
+                // body 内的结果不 push 到外层 slots — 它们是循环局部值
+            }
+            prog.emit(VmInstr::LoopEnd);
+            Ok(counter)
+        }
+
+        TraceOp::PanelLoad { base, offset, rows: _, cols: _ } => {
+            let r = prog.alloc_vreg(VRegKind::Vec, width);
+            prog.emit(VmInstr::VecLoad {
+                dst: r,
+                base: slots[base.0 as usize],
+                offset: OffsetExpr::ScalarVReg(slots[offset.0 as usize]),
+                width,
+                dtype: default_dtype, predicate: None,
+            });
+            Ok(r)
+        }
+
+        TraceOp::PanelStore { base, offset, rows: _, cols: _ } => {
+            let r = prog.alloc_vreg(VRegKind::Vec, width);
+            prog.emit(VmInstr::VecStore {
+                base: slots[base.0 as usize],
+                offset: OffsetExpr::ScalarVReg(slots[offset.0 as usize]),
+                src: r,
+                width,
+                dtype: default_dtype, predicate: None,
+            });
+            Ok(r)
+        }
+
+        TraceOp::PackBuffer { src, dst: _, rows: _, cols: _, layout: _ } => {
+            let tmp = prog.alloc_vreg(VRegKind::Vec, width);
+            let _ = src;
+            Ok(tmp)
+        }
+
+        TraceOp::SharedMemDeclare { name, bytes } => {
+            prog.emit(VmInstr::SharedMemAlloc {
+                name: name.clone(),
+                bytes: *bytes,
+            });
+            let r = prog.alloc_vreg(VRegKind::Ptr, SimdWidth::Scalar);
+            Ok(r)
+        }
+
+        TraceOp::AsyncCopyToShared { name, src_offset, bytes } => {
+            prog.emit(VmInstr::SharedMemAsyncStore {
+                name: name.clone(),
+                dst_offset: OffsetExpr::ScalarVReg(slots[src_offset.0 as usize]),
+                src: slots[src_offset.0 as usize],
+                width,
+                dtype: default_dtype,
+            });
+            let _ = bytes;
+            let r = prog.alloc_vreg(VRegKind::Vec, width);
+            Ok(r)
+        }
+
+        TraceOp::Tma2DCopy { desc, coord_x, coord_y, bytes: _ } => {
+            prog.emit(VmInstr::Tma2DCopy {
+                desc_name: desc.clone(),
+                smem_name: format!("tma_{}", desc),
+                coord_x: slots[coord_x.0 as usize],
+                coord_y: slots[coord_y.0 as usize],
+                barrier_name: format!("tma_bar_{}", desc),
+            });
+            let r = prog.alloc_vreg(VRegKind::Vec, width);
+            Ok(r)
+        }
+
+        TraceOp::AsyncWaitGroup { n } => {
+            prog.emit(VmInstr::SharedMemAsyncWaitGroup {
+                n: *n,
+            });
+            let r = prog.alloc_vreg(VRegKind::Scalar, SimdWidth::Scalar);
+            Ok(r)
+        }
+
+        TraceOp::SyncBarrier { name: _ } => {
+            let r = prog.alloc_vreg(VRegKind::Scalar, SimdWidth::Scalar);
+            Ok(r)
+        }
+
+        TraceOp::TileConfig { rows, cols } => {
+            prog.emit(VmInstr::TileConfig {
+                rows: *rows,
+                cols: *cols,
+                dtype: crate::types::DType::F32,
+            });
+            let r = prog.alloc_vreg(VRegKind::Tile, SimdWidth::Scalar);
+            Ok(r)
+        }
+
+        TraceOp::TileRelease => {
+            prog.emit(VmInstr::TileRelease);
+            let r = prog.alloc_vreg(VRegKind::Scalar, SimdWidth::Scalar);
+            Ok(r)
+        }
+
+        TraceOp::EpilogueChain { ops } => {
+            let r = prog.alloc_vreg(VRegKind::Vec, width);
+            let _ = ops;
+            Ok(r)
+        }
+
+        // ── SPEC 24-QUANT-PIPELINE-JIT §1.3: QuantGather/QuantGemm structural ──
+        // These structural ops expand to full loop nests with block decode.
+        // The 3 preceding Input ops in the trace provide the pointer VRegIds.
+
+        _ => unreachable_pattern(op),
+    }
+}
+
+/// ComputePattern::reduction 路由 handler (REQ-AIS-001 查表化)。
+/// 集中处理 1 个同 ComputePattern 的 TraceOp 变体。
+fn dispatch_reduction(
+    prog: &mut VmProgram,
+    op: &TraceOp,
+    slots: &[VRegId],
+    inputs: &[VRegId],
+    width: SimdWidth,
+    default_dtype: QuantPrecision,
+) -> Result<VRegId, CompilerError> {
+    match op {
+        TraceOp::HReduce { src, op } => {
+            let reduce_op = match op {
+                ReduceKind::Sum => ReduceOp::Sum,
+                ReduceKind::Max => ReduceOp::Max,
+                ReduceKind::Min => ReduceOp::Min,
+                ReduceKind::Prod => ReduceOp::Prod,
+                ReduceKind::LogSum => ReduceOp::LogSum,
+                other => {
+                    return Err(CompilerError::CodegenViolation(format!(
+                        "auto_lower_trace: HReduce op {:?} 尚未实现 (Count/ArgMax need dedicated lowering)",
+                        other
+                    )));
+                }
+            };
+            // HReduce output is scalar-width (single value), input is vector-width.
+            let r = prog.alloc_vreg(VRegKind::Vec, SimdWidth::Scalar);
+            prog.emit(VmInstr::HReduce {
+                dst: r,
+                src: slots[src.0 as usize],
+                op: reduce_op,
+            });
+            Ok(r)
+        }
+
+        // ── 结构型内存操作 (ARCH-AUTO-INSTR-SELECT structural) ──
+
+        _ => unreachable_pattern(op),
+    }
+}
+
+/// ComputePattern::normlike 路由 handler (REQ-AIS-001 查表化)。
+/// 集中处理 1 个同 ComputePattern 的 TraceOp 变体。
+fn dispatch_normlike(
+    prog: &mut VmProgram,
+    op: &TraceOp,
+    slots: &[VRegId],
+    inputs: &[VRegId],
+    width: SimdWidth,
+    default_dtype: QuantPrecision,
+) -> Result<VRegId, CompilerError> {
+    match op {
+        TraceOp::Softmax { src, dst: _ } => {
+            let max_r = prog.alloc_vreg(VRegKind::Scalar, SimdWidth::Scalar);
+            prog.emit(VmInstr::SoftmaxReduceMax {
+                dst: max_r,
+                logits_ptr: slots[src.0 as usize],
+                vocab_bytes: width.f32_lanes() * 4,
+                width,
+            });
+            let sum_r = prog.alloc_vreg(VRegKind::Scalar, SimdWidth::Scalar);
+            prog.emit(VmInstr::SoftmaxExpSum {
+                sum_dst: sum_r,
+                logits_ptr: slots[src.0 as usize],
+                max_val: max_r,
+                vocab_bytes: width.f32_lanes() * 4,
+                width,
+            });
+            let norm_r = prog.alloc_vreg(VRegKind::Vec, width);
+            prog.emit(VmInstr::SoftmaxNormalize {
+                logits_ptr: slots[src.0 as usize],
+                sum_val: sum_r,
+                vocab_bytes: width.f32_lanes() * 4,
+                width,
+            });
+            Ok(norm_r)
+        }
+
+        _ => unreachable_pattern(op),
+    }
+}
+
+/// ComputePattern::gemm 路由 handler (REQ-AIS-001 查表化)。
+/// 集中处理 2 个同 ComputePattern 的 TraceOp 变体。
+fn dispatch_gemm(
+    prog: &mut VmProgram,
+    op: &TraceOp,
+    slots: &[VRegId],
+    inputs: &[VRegId],
+    width: SimdWidth,
+    default_dtype: QuantPrecision,
+) -> Result<VRegId, CompilerError> {
+    match op {
+        TraceOp::TileMma { c, a, b, m, n, k } => {
+            let r = prog.alloc_vreg(VRegKind::Vec, width);
+            // dtype 从 graph tensor 推断注入 (设计 §6.1): default_dtype 是调用方
+            // (auto_lower_trace_raw ← op_input_dtype) 传入的计算精度, 非零 slot 回退。
+            // ACC 累加器恒为 F32 (QuantPrecision::accumulator_precision), 输入按 dtype 窄化。
+            prog.emit(VmInstr::TileMma {
+                c: slots[c.0 as usize],
+                a: slots[a.0 as usize],
+                b: slots[b.0 as usize],
+                m: *m,
+                n: *n,
+                k: *k,
+                dtype: default_dtype.to_dtype(),
+            });
+            Ok(r)
+        }
+
+        TraceOp::QuantGemm { quant_type, m, n, k } => {
+            // Trace structure: [Input(0):input_ptr, Input(1):weight_ptr, Input(2):output_ptr, QuantGemm]
+            let input_ptr = slots[0];
+            let weight_ptr = slots[1];
+            let output_ptr = slots[2];
+            let m_bound = BoundExpr::Const(*m);
+            super::moe_quant_emit::emit_quant_gemm_inline(
+                prog, m_bound, *n, *k, *quant_type,
+                width, input_ptr, weight_ptr, output_ptr, default_dtype,
+                crate::dispatch::device_profile::DotProductCap::SimdAssisted,
+            )?;
+            Ok(output_ptr)
+        }
+
+        // ── MTP Draft (MTP-001): structural GEMV + argmax loop nest ──
+        // Trace structure: [Input(0):hidden_ptr, Input(1):weight_ptr, Input(2):output_tokens_ptr, MtpDraft]
+        _ => unreachable_pattern(op),
+    }
+}
+
+/// ComputePattern::quant_decode 路由 handler (REQ-AIS-001 查表化)。
+/// 集中处理 35 个同 ComputePattern 的 TraceOp 变体。
+fn dispatch_quant_decode(
+    prog: &mut VmProgram,
+    op: &TraceOp,
+    slots: &[VRegId],
+    inputs: &[VRegId],
+    width: SimdWidth,
+    default_dtype: QuantPrecision,
+) -> Result<VRegId, CompilerError> {
+    match op {
         TraceOp::QuantBitAnd { lhs, rhs } => {
             let r = prog.alloc_vreg(VRegKind::Vec, width);
             prog.emit(VmInstr::VecBinOp { dst: r, a: slots[lhs.0 as usize], b: slots[rhs.0 as usize], op: VecOp::And, dtype: default_dtype });
@@ -1388,170 +1854,6 @@ fn dispatch_trace_op(
 
         // ── SPEC 27 AT-003: 结构型 TraceOp → VmInstr 映射 ──
 
-        TraceOp::Loop { bound, step_bytes, body } => {
-            let counter = prog.alloc_vreg(VRegKind::Counter, SimdWidth::Scalar);
-            let byte_off = prog.alloc_vreg(VRegKind::ByteOffset, SimdWidth::Scalar);
-            prog.emit(VmInstr::LoopBegin {
-                counter,
-                byte_offset: byte_off,
-                bound: bound.clone(),
-                step_bytes: *step_bytes,
-            });
-            // 递归处理 Loop body — body 内的 TraceOp 走同样的 dispatch
-            for body_op in body.iter() {
-                let _body_result = dispatch_trace_op(prog, body_op, slots, inputs, width, default_dtype)?;
-                // body 内的结果不 push 到外层 slots — 它们是循环局部值
-            }
-            prog.emit(VmInstr::LoopEnd);
-            Ok(counter)
-        }
-
-        TraceOp::PanelLoad { base, offset, rows: _, cols: _ } => {
-            let r = prog.alloc_vreg(VRegKind::Vec, width);
-            prog.emit(VmInstr::VecLoad {
-                dst: r,
-                base: slots[base.0 as usize],
-                offset: OffsetExpr::ScalarVReg(slots[offset.0 as usize]),
-                width,
-                dtype: default_dtype, predicate: None,
-            });
-            Ok(r)
-        }
-
-        TraceOp::PanelStore { base, offset, rows: _, cols: _ } => {
-            let r = prog.alloc_vreg(VRegKind::Vec, width);
-            prog.emit(VmInstr::VecStore {
-                base: slots[base.0 as usize],
-                offset: OffsetExpr::ScalarVReg(slots[offset.0 as usize]),
-                src: r,
-                width,
-                dtype: default_dtype, predicate: None,
-            });
-            Ok(r)
-        }
-
-        TraceOp::PackBuffer { src, dst: _, rows: _, cols: _, layout: _ } => {
-            let tmp = prog.alloc_vreg(VRegKind::Vec, width);
-            let _ = src;
-            Ok(tmp)
-        }
-
-        TraceOp::SharedMemDeclare { name, bytes } => {
-            prog.emit(VmInstr::SharedMemAlloc {
-                name: name.clone(),
-                bytes: *bytes,
-            });
-            let r = prog.alloc_vreg(VRegKind::Ptr, SimdWidth::Scalar);
-            Ok(r)
-        }
-
-        TraceOp::AsyncCopyToShared { name, src_offset, bytes } => {
-            prog.emit(VmInstr::SharedMemAsyncStore {
-                name: name.clone(),
-                dst_offset: OffsetExpr::ScalarVReg(slots[src_offset.0 as usize]),
-                src: slots[src_offset.0 as usize],
-                width,
-                dtype: default_dtype,
-            });
-            let _ = bytes;
-            let r = prog.alloc_vreg(VRegKind::Vec, width);
-            Ok(r)
-        }
-
-        TraceOp::Tma2DCopy { desc, coord_x, coord_y, bytes: _ } => {
-            prog.emit(VmInstr::Tma2DCopy {
-                desc_name: desc.clone(),
-                smem_name: format!("tma_{}", desc),
-                coord_x: slots[coord_x.0 as usize],
-                coord_y: slots[coord_y.0 as usize],
-                barrier_name: format!("tma_bar_{}", desc),
-            });
-            let r = prog.alloc_vreg(VRegKind::Vec, width);
-            Ok(r)
-        }
-
-        TraceOp::AsyncWaitGroup { n } => {
-            prog.emit(VmInstr::SharedMemAsyncWaitGroup {
-                n: *n,
-            });
-            let r = prog.alloc_vreg(VRegKind::Scalar, SimdWidth::Scalar);
-            Ok(r)
-        }
-
-        TraceOp::SyncBarrier { name: _ } => {
-            let r = prog.alloc_vreg(VRegKind::Scalar, SimdWidth::Scalar);
-            Ok(r)
-        }
-
-        TraceOp::TileConfig { rows, cols } => {
-            prog.emit(VmInstr::TileConfig {
-                rows: *rows,
-                cols: *cols,
-                dtype: crate::types::DType::F32,
-            });
-            let r = prog.alloc_vreg(VRegKind::Tile, SimdWidth::Scalar);
-            Ok(r)
-        }
-
-        TraceOp::TileMma { c, a, b, m, n, k } => {
-            let r = prog.alloc_vreg(VRegKind::Vec, width);
-            // dtype 从 graph tensor 推断注入 (设计 §6.1): default_dtype 是调用方
-            // (auto_lower_trace_raw ← op_input_dtype) 传入的计算精度, 非零 slot 回退。
-            // ACC 累加器恒为 F32 (QuantPrecision::accumulator_precision), 输入按 dtype 窄化。
-            prog.emit(VmInstr::TileMma {
-                c: slots[c.0 as usize],
-                a: slots[a.0 as usize],
-                b: slots[b.0 as usize],
-                m: *m,
-                n: *n,
-                k: *k,
-                dtype: default_dtype.to_dtype(),
-            });
-            Ok(r)
-        }
-
-        TraceOp::TileRelease => {
-            prog.emit(VmInstr::TileRelease);
-            let r = prog.alloc_vreg(VRegKind::Scalar, SimdWidth::Scalar);
-            Ok(r)
-        }
-
-        TraceOp::Softmax { src, dst: _ } => {
-            let max_r = prog.alloc_vreg(VRegKind::Scalar, SimdWidth::Scalar);
-            prog.emit(VmInstr::SoftmaxReduceMax {
-                dst: max_r,
-                logits_ptr: slots[src.0 as usize],
-                vocab_bytes: width.f32_lanes() * 4,
-                width,
-            });
-            let sum_r = prog.alloc_vreg(VRegKind::Scalar, SimdWidth::Scalar);
-            prog.emit(VmInstr::SoftmaxExpSum {
-                sum_dst: sum_r,
-                logits_ptr: slots[src.0 as usize],
-                max_val: max_r,
-                vocab_bytes: width.f32_lanes() * 4,
-                width,
-            });
-            let norm_r = prog.alloc_vreg(VRegKind::Vec, width);
-            prog.emit(VmInstr::SoftmaxNormalize {
-                logits_ptr: slots[src.0 as usize],
-                sum_val: sum_r,
-                vocab_bytes: width.f32_lanes() * 4,
-                width,
-            });
-            Ok(norm_r)
-        }
-
-        TraceOp::EpilogueChain { ops } => {
-            let r = prog.alloc_vreg(VRegKind::Vec, width);
-            let _ = ops;
-            Ok(r)
-        }
-
-        // ── SPEC 24-QUANT-PIPELINE-JIT §1.3: QuantGather/QuantGemm structural ──
-        // These structural ops expand to full loop nests with block decode.
-        // The 3 preceding Input ops in the trace provide the pointer VRegIds.
-
         TraceOp::QuantGather { quant_type, vocab_size, hidden_dim } => {
             // Trace structure: [Input(0):indices_ptr, Input(1):embed_ptr, Input(2):output_ptr, QuantGather]
             // After processing 3 Input ops, slots = [indices_ptr, embed_ptr, output_ptr]
@@ -1570,22 +1872,6 @@ fn dispatch_trace_op(
             Ok(output_ptr)
         }
 
-        TraceOp::QuantGemm { quant_type, m, n, k } => {
-            // Trace structure: [Input(0):input_ptr, Input(1):weight_ptr, Input(2):output_ptr, QuantGemm]
-            let input_ptr = slots[0];
-            let weight_ptr = slots[1];
-            let output_ptr = slots[2];
-            let m_bound = BoundExpr::Const(*m);
-            super::moe_quant_emit::emit_quant_gemm_inline(
-                prog, m_bound, *n, *k, *quant_type,
-                width, input_ptr, weight_ptr, output_ptr, default_dtype,
-                crate::dispatch::device_profile::DotProductCap::SimdAssisted,
-            )?;
-            Ok(output_ptr)
-        }
-
-        // ── MTP Draft (MTP-001): structural GEMV + argmax loop nest ──
-        // Trace structure: [Input(0):hidden_ptr, Input(1):weight_ptr, Input(2):output_tokens_ptr, MtpDraft]
         TraceOp::MtpDraft { depth, hidden_size, vocab_size } => {
             let hidden_ptr = slots[0];
             let weight_ptr = slots[1];
@@ -1627,100 +1913,17 @@ fn dispatch_trace_op(
         //   3. 逐阈值比较: Const(threshold[i]) + Compare(Lt)
         //   4. ConditionalSelect 链选择精度索引
         // 结果: 标量 i32 精度索引（0 = candidates[0] = 最高精度）
-        TraceOp::DynamicPrecisionSelect { tensor, candidates, thresholds } => {
-            if candidates.len() != thresholds.len() {
-                return Err(CompilerError::CodegenViolation(format!(
-                    "DynamicPrecisionSelect: candidates({}) 与 thresholds({}) 长度不匹配",
-                    candidates.len(), thresholds.len()
-                )));
-            }
-            if candidates.is_empty() {
-                return Err(CompilerError::CodegenViolation(
-                    "DynamicPrecisionSelect: candidates 不能为空".into()
-                ));
-            }
-
-            // Step 1: HReduce(Max) — 从 tensor 中提取最大绝对值
-            let max_val = prog.alloc_vreg(VRegKind::Vec, SimdWidth::Scalar);
-            prog.emit(VmInstr::HReduce {
-                dst: max_val,
-                src: slots[tensor.0 as usize],
-                op: ReduceOp::Max,
-            });
-
-            // Step 2: 广播 max_val 到向量宽度以便比较
-            let max_broadcast = prog.alloc_vreg(VRegKind::Vec, width);
-            prog.emit(VmInstr::Broadcast {
-                dst: max_broadcast,
-                src: ScalarExpr::ExtractLane0(max_val),
-                width,
-                dtype: default_dtype,
-            });
-
-            // Step 3: 对每个阈值生成比较 + ConditionalSelect
-            // 策略: 从最高精度（索引 0）开始，逐级检查是否可以降精度
-            // result_idx 初始 = 0（最高精度）
-            // if max_val < thresholds[1]: result_idx = 1 (第一个低精度)
-            // if max_val < thresholds[2]: result_idx = 2 (更低精度)
-            // ...
-            // 最终 result_idx 作为 GPR 整数结果
-
-            // 广播当前索引值（初始 = 0，即 candidates[0] 最高精度）
-            let mut idx_val = prog.alloc_vreg(VRegKind::Vec, width);
-            prog.emit(VmInstr::Broadcast {
-                dst: idx_val,
-                src: ScalarExpr::Const(0.0),
-                width,
-                dtype: default_dtype,
-            });
-
-            // 从索引 1 开始逐阈值比较（candidates[0] 是默认，不需要比较）
-            for (i, threshold) in thresholds.iter().enumerate().skip(1) {
-                // 广播阈值常量
-                let thresh_val = prog.alloc_vreg(VRegKind::Vec, width);
-                prog.emit(VmInstr::Broadcast {
-                    dst: thresh_val,
-                    src: ScalarExpr::Const(*threshold as f32),
-                    width,
-                    dtype: default_dtype,
-                });
-
-                // 比较: max_val < threshold → mask
-                let cmp_mask = prog.alloc_vreg(VRegKind::Vec, width);
-                prog.emit(VmInstr::VecCmp {
-                    dst: cmp_mask,
-                    a: max_broadcast,
-                    b: thresh_val,
-                    pred: CmpPredicate::Lt,
-                });
-
-                // 广播新索引值 (i as f32)
-                let new_idx = prog.alloc_vreg(VRegKind::Vec, width);
-                prog.emit(VmInstr::Broadcast {
-                    dst: new_idx,
-                    src: ScalarExpr::Const(i as f32),
-                    width,
-                    dtype: default_dtype,
-                });
-
-                // ConditionalSelect: mask ? new_idx : idx_val
-                let selected = prog.alloc_vreg(VRegKind::Vec, width);
-                prog.emit(VmInstr::ConditionalSelect {
-                    dst: selected,
-                    mask: cmp_mask,
-                    true_val: new_idx,
-                    false_val: idx_val,
-                });
-
-                idx_val = selected;
-            }
-
-            // 结果是向量形式的精度索引，返回它
-            Ok(idx_val)
-        }
-
+        _ => unreachable_pattern(op),
     }
 }
+
+/// ComputePattern handler 兜底：理论上不可达 (顶层 dispatch 已覆盖所有变体)。
+fn unreachable_pattern(op: &TraceOp) -> Result<VRegId, CompilerError> {
+    Err(CompilerError::CodegenViolation(format!(
+        "dispatch_trace_op: 未分类的 TraceOp 变体 {:?} (ComputePattern 分类缺失)", op
+    )))
+}
+
 
 // ────────────────────────────────────────────────────────────────────────────
 // 辅助函数：消除 match arm 中的 alloc_vreg + emit 重复代码
