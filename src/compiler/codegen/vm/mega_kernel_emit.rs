@@ -921,6 +921,73 @@ pub fn decode_fusion_params(profile: &crate::compiler::hardware_profile::Hardwar
 ///
 /// The returned VmProgram goes through the standard RegAlloc → StackFrame →
 /// X86Lower pipeline to produce a single contiguous machine code function.
+
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+// DEC-MKEMIT-001: MegaKernelOrchestrator — 编排层
+// 复用已有 CompileSession/LoweringContext（仍按原方式在 emit 序列内构造）。
+// Orchestrator 仅承载 15 入口参数 + 缓变派生状态 + 游离 VRegId 局部，消除
+// batch_mode_path/sampling pipeline 抽取时的 25 参数穿透（P-2 ≤5 参数）。
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+/// 缓变派生状态：从入口参数推导一次，贯穿整个 emit 序列。
+/// 不含自引用（sym_map/rope_req/ple_req/dwc_req 均独立构造，非从其他字段借）。
+pub(super) struct MkEmitCtx<'a> {
+    // ── 15 入口参数（原 long_parameter_list）──
+    pub plan: &'a FusionPlan,
+    pub graph: &'a CompilerGraph,
+    pub alloc: &'a BufferAllocation,
+    pub registry: Option<&'a ScalarOpRegistry>,
+    pub profile: &'a IsaProfile,
+    pub hook: Option<&'a dyn super::isa_hook::IsaHook>,
+    pub buffer_layout: &'a crate::compiler::mega_kernel_abi::BufferLayout,
+    pub bottleneck_map: Option<&'a OpBottleneckMap>,
+    pub virtual_activation: Option<&'a VirtualActivationMap>,
+    pub virtual_tensor_map: Option<&'a VirtualTensorMap>,
+    pub layout: Option<&'a crate::compiler::layout_negotiator::LayoutAssignment>,
+    pub debug_jit: bool,
+    pub resource_plan: Option<&'a GraphResourcePlan>,
+    pub topology: super::topology::GraphTopologyAnalysis,
+    // ── 缓变派生状态（引用：从函数局部借用，零拷贝）──
+    pub vocab_size: usize,
+    pub width: super::instr::SimdWidth,
+    pub sym_map: &'a SymDimSlotMap,
+    pub rope_req: &'a Option<RopeCacheRequirement>,
+    pub ple_req: &'a Option<crate::compiler::codegen::PleScratchRequirement>,
+    pub dwc_req: &'a Option<crate::compiler::codegen::DwcScratchRequirement>,
+    pub logits_scratch_offset: usize,
+    pub needs_scratch: bool,
+    pub sg_detect_scratch_offset: Option<usize>,
+    pub sg_knowledge_scratch_offset: Option<usize>,
+}
+
+/// 序贯 VRegId 局部：在 prologue/loop-setup 阶段按序创建，被 sampling pipeline
+/// 与 batch_mode_path 复用。收入结构体消除 25 游离变量穿透。
+pub(super) struct MkRegs {
+    pub input_ids_ptr: VRegId,
+    pub weight_ptr: VRegId,
+    pub scratchpad_ptr: VRegId,
+    pub prompt_len_vreg: VRegId,
+    pub output_tokens_ptr: VRegId,
+    pub batch_ctx_ptr: VRegId,
+    pub prompt_len_bytes: VRegId,
+    pub input_base: VRegId,
+    pub gen_counter: VRegId,
+    pub gen_byte_offset: VRegId,
+    pub max_new_tokens_vreg: VRegId,
+    pub one_imm: VRegId,
+    pub prompt_minus_1: VRegId,
+    pub total_iters: VRegId,
+    pub decode_counter: VRegId,
+    pub scratchpad_reloaded: VRegId,
+    pub output_reloaded: VRegId,
+    pub weight_reloaded: VRegId,
+    pub input_ids_reloaded: VRegId,
+    pub gen_input_ptr: VRegId,
+    pub decode_seq_len: VRegId,
+    pub output_ptr: VRegId,
+    pub scratchpad_post_forward: VRegId,
+}
+
 pub fn compile_mega_kernel_vm(
     plan: &FusionPlan,
     graph: &CompilerGraph,
@@ -1598,13 +1665,82 @@ pub fn compile_mega_kernel_vm(
     }
 
     // ── .batch_mode_path: Batch mode entry (SPEC/20 BCI-003) ──
-    // BranchIfPtrNonNull jumps here when batch_ctx_ptr != NULL.
+    // DEC-MKEMIT-001: 抽取为 emit_batch_mode_path (零参数穿透, 25 游离变量收 ctx/regs 字段)。
+    let mk = MkEmitCtx {
+        plan, graph, alloc, registry, profile, hook, buffer_layout,
+        bottleneck_map, virtual_activation, virtual_tensor_map, layout,
+        debug_jit, resource_plan: None, topology: topology.clone(),
+        vocab_size, width, sym_map: &sym_map,
+        rope_req: &rope_req, ple_req: &ple_req, dwc_req: &dwc_req,
+        logits_scratch_offset, needs_scratch,
+        sg_detect_scratch_offset: current_abi.sg_detect_scratch_offset,
+        sg_knowledge_scratch_offset: current_abi.sg_knowledge_scratch_offset,
+    };
+    let regs = MkRegs {
+        input_ids_ptr, weight_ptr, scratchpad_ptr, prompt_len_vreg,
+        output_tokens_ptr, batch_ctx_ptr, prompt_len_bytes, input_base,
+        gen_counter, gen_byte_offset, max_new_tokens_vreg, one_imm,
+        prompt_minus_1, total_iters, decode_counter, scratchpad_reloaded,
+        output_reloaded, weight_reloaded, input_ids_reloaded, gen_input_ptr,
+        decode_seq_len, output_ptr, scratchpad_post_forward,
+    };
+    emit_batch_mode_path(&mk, &mut prog, &regs, BATCH_MODE_LABEL)?;
+
+
+
+    // Stage 1.5: 符号验证 — 与 compile_layer 对齐
+    // mega-kernel 路径之前跳过此验证，导致 VmInstr 错误静默传播到 ISA lowering
+    super::verify::verify_vm_program(&prog)?;
+    prog.validate_provenance()
+        .map_err(|e| CompilerError::CodegenViolation(format!("mega-kernel provenance: {e}")))?;
+    prog.validate_structure()
+        .map_err(|e| CompilerError::CodegenViolation(format!("mega-kernel structure: {e}")))?;
+    if let Err(e) = prog.validate_type_consistency() {
+        return Err(CompilerError::CodegenViolation(format!("mega-kernel type-check: {e}")));
+    }
+    if let Err(e) = prog.validate_width_consistency() {
+        return Err(CompilerError::CodegenViolation(format!("mega-kernel width-check: {e}")));
+    }
+    if let Err(e) = prog.validate_value_domains() {
+        return Err(CompilerError::CodegenViolation(format!("mega-kernel value-domain: {e}")));
+    }
+
+    // DEBUG: dump mega-kernel VmProgram
+    if let Ok(dir) = std::env::var("GLLM_DUMP_MEGA") {
+        use std::io::Write;
+        let _ = std::fs::create_dir_all(&dir);
+        let path = format!("{}/mega_kernel_vm.txt", dir);
+        if let Ok(mut f) = std::fs::File::create(&path) {
+            writeln!(f, "=== Mega-Kernel VmProgram ({} instrs) ===", prog.instrs.len()).ok();
+            for (i, instr) in prog.instrs.iter().enumerate() {
+                writeln!(f, "{:4}: {:?}", i, instr).ok();
+            }
+        }
+    }
+    Ok((prog, rope_req, logits_scratch_offset))
+}
+
+/// DEC-MKEMIT-001: Batch mode path — extracted from compile_mega_kernel_vm.
+///
+/// Emits the batch-mode entry (MarkLabel) + batch prefill forward pass +
+/// per-seq argmax + decode step loop. All shared state via &MkEmitCtx / &MkRegs
+/// (zero 25-param thread-through). Behavior byte-identical to pre-extract inline.
+fn emit_batch_mode_path(
+    mk: &MkEmitCtx,
+    prog: &mut VmProgram,
+    regs: &MkRegs,
+    batch_label: usize,
+) -> Result<(), CompilerError> {
+    use crate::compiler::mega_kernel_abi::MEGA_KERNEL_STACK_OFFSETS;
+
+    // ── .batch_mode_path: Batch mode entry (SPEC/20 BCI-003) ──
+    // BranchIfPtrNonNull jumps here when regs.batch_ctx_ptr != NULL.
     //
     // Batch Prefill: read total_prefill_tokens from batch_ctx[8],
     // set input_ptr to input_ids_flat_ptr from batch_ctx[16],
     // run full forward pass (embed → N layers → logits producer) with M = total_prefill_tokens,
     // then return total_prefill_tokens to signal "prefill done, Rust handles decode."
-    prog.emit(VmInstr::MarkLabel { label_id: BATCH_MODE_LABEL });
+    prog.emit(VmInstr::MarkLabel { label_id: batch_label });
 
     // ARCH-REGALLOC-POST-FORWARD-RELOAD: Load scratchpad_batch for batch mode.
     // When entering batch mode from prologue (BranchIfPtrNonNull), the original
@@ -1621,7 +1757,7 @@ pub fn compile_mega_kernel_vm(
         let batch_m = prog.alloc_vreg(VRegKind::Scalar, SimdWidth::Scalar);
         prog.emit(VmInstr::ScalarLoad {
             dst: batch_m,
-            base: batch_ctx_ptr,
+            base: regs.batch_ctx_ptr,
             offset: OffsetExpr::Const(8),
         });
 
@@ -1659,7 +1795,7 @@ pub fn compile_mega_kernel_vm(
         let _batch_num_seqs = prog.alloc_vreg(VRegKind::Scalar, SimdWidth::Scalar);
         prog.emit(VmInstr::ScalarLoad {
             dst: _batch_num_seqs,
-            base: batch_ctx_ptr,
+            base: regs.batch_ctx_ptr,
             offset: OffsetExpr::Const(0),
         });
 
@@ -1667,23 +1803,23 @@ pub fn compile_mega_kernel_vm(
         let batch_input_ptr = prog.alloc_vreg(VRegKind::Ptr, SimdWidth::Scalar);
         prog.emit(VmInstr::LoadPtr {
             dst: batch_input_ptr,
-            src: PtrExpr::VRegPlusConst(batch_ctx_ptr, 16),
+            src: PtrExpr::VRegPlusConst(regs.batch_ctx_ptr, 16),
         });
 
         // Build batch prefill AbiPtrs — same weight/scratch/output as legacy path,
         // but input points to flat batch input_ids and seq_len = total_prefill_tokens.
-        // output always from scratchpad + logits_scratch_offset (same for generate and non-generate).
+        // output always from scratchpad + mk.logits_scratch_offset (same for generate and non-generate).
         let batch_output_ptr = prog.alloc_vreg(VRegKind::Ptr, SimdWidth::Scalar);
-        prog.emit(VmInstr::LoadPtr { dst: batch_output_ptr, src: PtrExpr::VRegPlusConst(scratchpad_batch, logits_scratch_offset) });
+        prog.emit(VmInstr::LoadPtr { dst: batch_output_ptr, src: PtrExpr::VRegPlusConst(scratchpad_batch, mk.logits_scratch_offset) });
 
         // page_table_flat_ptr from batch_ctx + 40
         let batch_pt_ptr = {
-            let needs_page_table = topology.kv_cache_source != KvCacheSource::NoCache;
+            let needs_page_table = mk.topology.kv_cache_source != KvCacheSource::NoCache;
             if needs_page_table {
                 let pt = prog.alloc_vreg(VRegKind::Ptr, SimdWidth::Scalar);
                 prog.emit(VmInstr::LoadPtr {
                     dst: pt,
-                    src: PtrExpr::VRegPlusConst(batch_ctx_ptr, 40),
+                    src: PtrExpr::VRegPlusConst(regs.batch_ctx_ptr, 40),
                 });
                 Some(pt)
             } else {
@@ -1696,11 +1832,11 @@ pub fn compile_mega_kernel_vm(
         // using it after LoopEnd causes BodyLocalEscape violation.
         // Reload from the same ABI source as the original kv_cache_ptr.
         let batch_kv_ptr = {
-            if topology.kv_cache_source != KvCacheSource::NoCache {
+            if mk.topology.kv_cache_source != KvCacheSource::NoCache {
                 let kv = prog.alloc_vreg(VRegKind::Ptr, SimdWidth::Scalar);
                 prog.emit(VmInstr::LoadPtr {
                     dst: kv,
-                    src: sym_map.resolve("kv_cache_ptr").cloned().unwrap_or(PtrExpr::AbiArg(2)),
+                    src: mk.sym_map.resolve("kv_cache_ptr").cloned().unwrap_or(PtrExpr::AbiArg(2)),
                 });
                 Some(kv)
             } else {
@@ -1714,16 +1850,16 @@ pub fn compile_mega_kernel_vm(
             let hook_ptr = prog.alloc_vreg(VRegKind::Ptr, SimdWidth::Scalar);
             prog.emit(VmInstr::LoadPtr {
                 dst: hook_ptr,
-                src: sym_map.resolve("hook_ctx_ptr").cloned().expect("ABI: hook_ctx_ptr"),
+                src: mk.sym_map.resolve("hook_ctx_ptr").cloned().expect("ABI: hook_ctx_ptr"),
             });
             Some(hook_ptr)
         };
         let batch_cb_ptr = {
-            if topology.sg_ops == super::topology::SgOpsPresence::Present {
+            if mk.topology.sg_ops == super::topology::SgOpsPresence::Present {
                 let cb_ptr = prog.alloc_vreg(VRegKind::Ptr, SimdWidth::Scalar);
                 prog.emit(VmInstr::LoadPtr {
                     dst: cb_ptr,
-                    src: sym_map.resolve("callback_table_ptr").cloned().expect("ABI: callback_table_ptr"),
+                    src: mk.sym_map.resolve("callback_table_ptr").cloned().expect("ABI: callback_table_ptr"),
                 });
                 Some(cb_ptr)
             } else {
@@ -1733,57 +1869,57 @@ pub fn compile_mega_kernel_vm(
 
         let mut batch_current_abi = AbiPtrs {
             input_ptr: batch_input_ptr,
-            weight_ptr: Some(weight_ptr),
+            weight_ptr: Some(regs.weight_ptr),
             output_ptr: batch_output_ptr,
-            scratch_ptr: if needs_scratch { Some(scratchpad_batch) } else { None },
+            scratch_ptr: if mk.needs_scratch { Some(scratchpad_batch) } else { None },
             gen_loop_counter: None, // no generate loop in prefill
             layer_loop_counter: None,
             mega_decode_seq_len: Some(batch_m), // M = total_prefill_tokens
             hook_ctx_ptr: batch_hook_ctx,
-            sg_detect_scratch_offset: current_abi.sg_detect_scratch_offset,
-            sg_knowledge_scratch_offset: current_abi.sg_knowledge_scratch_offset,
+            sg_detect_scratch_offset: mk.sg_detect_scratch_offset,
+            sg_knowledge_scratch_offset: mk.sg_knowledge_scratch_offset,
             callback_table_ptr: batch_cb_ptr,
             page_table_ptr: batch_pt_ptr,
-            kv_load_mode: graph.kv_load_mode,
+            kv_load_mode: mk.graph.kv_load_mode,
         kv_cache_ptr: batch_kv_ptr,
         activation_ping_ptr: None,
         activation_pong_ptr: None,
         };
 
-        let mut batch_resolver = TensorPtrResolver::build(graph, alloc, &topology);
-        // Redirect logits output for batch — topology-driven
-        if let Some(logits_tid) = topology.logits_output_tid {
+        let mut batch_resolver = TensorPtrResolver::build(mk.graph, mk.alloc, &mk.topology);
+        // Redirect logits output for batch — mk.topology-driven
+        if let Some(logits_tid) = mk.topology.logits_output_tid {
             batch_resolver.override_source(logits_tid, TensorPtrSource::Output { offset: 0 });
         }
 
         let batch_session = CompileSession {
-            width,
-            sym_map: &sym_map,
-            registry,
-            hook,
-            feature_set: profile.feature_set(),
+            width: mk.width,
+            sym_map: &mk.sym_map,
+            registry: mk.registry,
+            hook: mk.hook,
+            feature_set: mk.profile.feature_set(),
             budget: None,
             page_size: 0,
-            dot_cap: profile.dot_cap,
-            debug_jit,
-            kv_elem_bytes: kv_cache_elem_bytes(graph),
-            virtual_activation,
-            virtual_tensor_map,
-            layout,
-            batch_ctx_ptr: Some(batch_ctx_ptr),
+            dot_cap: mk.profile.dot_cap,
+            debug_jit: mk.debug_jit,
+            kv_elem_bytes: kv_cache_elem_bytes(mk.graph),
+            virtual_activation: mk.virtual_activation,
+            virtual_tensor_map: mk.virtual_tensor_map,
+            layout: mk.layout,
+            batch_ctx_ptr: Some(regs.batch_ctx_ptr),
         };
 
         let batch_ctx = LoweringContext {
             session: &batch_session,
-            dtype: graph_dtype(graph),
-            rope_req: rope_req.as_ref(),
-            ple_req: ple_req.as_ref(),
-            dwc_req: dwc_req.as_ref(),
+            dtype: graph_dtype(mk.graph),
+            rope_req: mk.rope_req.as_ref(),
+            ple_req: mk.ple_req.as_ref(),
+            dwc_req: mk.dwc_req.as_ref(),
             exec_pattern: None,
-            bottleneck_map,
+            bottleneck_map: mk.bottleneck_map,
             parallelism: Some(ParallelismDesc::SimdVectorize {
-                element_width: width.f32_lanes().max(1),
-                unroll_factor: profile.k_unroll_factor,
+                element_width: mk.width.f32_lanes().max(1),
+                unroll_factor: mk.profile.k_unroll_factor,
             }),
         };
 
@@ -1792,9 +1928,9 @@ pub fn compile_mega_kernel_vm(
         // GEMM/FFN/Norm are M-uniform — they just see a larger batch dimension.
         // Attention uses BatchSeqIdLookup for per-token seq_id → KV cache lookup.
         emit_fusion_groups(
-            &mut prog, plan, graph, alloc, &batch_ctx,
-            rope_req.as_ref().map(|r| r.cache_offset),
-            &mut batch_current_abi, Some(weight_ptr), &batch_resolver, &topology,
+            prog, mk.plan, mk.graph, mk.alloc, &batch_ctx,
+            mk.rope_req.as_ref().map(|r| r.cache_offset),
+            &mut batch_current_abi, Some(regs.weight_ptr), &batch_resolver, &mk.topology,
         )?;
 
         // ARCH-REGALLOC-POST-FORWARD-RELOAD: Reload scratchpad_batch after
@@ -1805,32 +1941,32 @@ pub fn compile_mega_kernel_vm(
         });
 
         // ── iteration setup post: Per-seq argmax on last token of each prompt (BCI-006) ──
-        // Logits layout: [total_prefill_tokens, vocab_size] in row-major.
+        // Logits layout: [total_prefill_tokens, mk.vocab_size] in row-major.
         // For seq s, last token row index = cumsum(prompt_lens)[s] - 1.
         // cumsum_acc tracks running sum of prompt_lens[0..seq).
-        // Only emit when vocab_size > 0 — no Argmax ops means no logits to sample from.
-        if vocab_size > 0 {
-            let vocab_bytes = vocab_size * ctx.dtype.elem_bytes();
+        // Only emit when mk.vocab_size > 0 — no Argmax ops means no logits to sample from.
+        if mk.vocab_size > 0 {
+            let vocab_bytes = mk.vocab_size * batch_ctx.dtype.elem_bytes();
 
             // Read num_seqs from batch_ctx+0
             let num_seqs_gpr = prog.alloc_vreg(VRegKind::Scalar, SimdWidth::Scalar);
-            prog.emit(VmInstr::ScalarLoad { dst: num_seqs_gpr, base: batch_ctx_ptr, offset: OffsetExpr::Const(0) });
+            prog.emit(VmInstr::ScalarLoad { dst: num_seqs_gpr, base: regs.batch_ctx_ptr, offset: OffsetExpr::Const(0) });
 
             // Read seq_meta_base from batch_ctx+88 (absolute pointer to per-seq array)
             let seq_meta_base = prog.alloc_vreg(VRegKind::Ptr, SimdWidth::Scalar);
-            prog.emit(VmInstr::ScalarLoad { dst: seq_meta_base, base: batch_ctx_ptr, offset: OffsetExpr::Const(88) });
+            prog.emit(VmInstr::ScalarLoad { dst: seq_meta_base, base: regs.batch_ctx_ptr, offset: OffsetExpr::Const(88) });
 
-            // logits_base = scratchpad + logits_scratch_offset
+            // logits_base = scratchpad + mk.logits_scratch_offset
             let logits_base_arg = prog.alloc_vreg(VRegKind::Ptr, SimdWidth::Scalar);
-            prog.emit(VmInstr::LoadPtr { dst: logits_base_arg, src: PtrExpr::VRegPlusConst(scratchpad_batch, logits_scratch_offset) });
+            prog.emit(VmInstr::LoadPtr { dst: logits_base_arg, src: PtrExpr::VRegPlusConst(scratchpad_batch, mk.logits_scratch_offset) });
 
             // Read output_tokens_flat_ptr from batch_ctx+24
             let out_tokens_ptr = prog.alloc_vreg(VRegKind::Ptr, SimdWidth::Scalar);
-            prog.emit(VmInstr::LoadPtr { dst: out_tokens_ptr, src: PtrExpr::VRegPlusConst(batch_ctx_ptr, 24) });
+            prog.emit(VmInstr::LoadPtr { dst: out_tokens_ptr, src: PtrExpr::VRegPlusConst(regs.batch_ctx_ptr, 24) });
 
             // Read sampling_params_ptr from batch_ctx+56 (for prefill temperature check)
             let sampling_params_ptr = prog.alloc_vreg(VRegKind::Ptr, SimdWidth::Scalar);
-            prog.emit(VmInstr::LoadPtr { dst: sampling_params_ptr, src: PtrExpr::VRegPlusConst(batch_ctx_ptr, 56) });
+            prog.emit(VmInstr::LoadPtr { dst: sampling_params_ptr, src: PtrExpr::VRegPlusConst(regs.batch_ctx_ptr, 56) });
 
             // cumsum accumulator: tracks sum of prompt_lens[0..seq) across iterations
             let cumsum_acc = prog.alloc_vreg(VRegKind::Scalar, SimdWidth::Scalar);
@@ -1865,7 +2001,7 @@ pub fn compile_mega_kernel_vm(
 
                 // Argmax this row
                 let sampled = prog.alloc_vreg(VRegKind::Scalar, SimdWidth::Scalar);
-                prog.emit(VmInstr::Argmax { dst: sampled, logits_ptr, vocab_bytes, width });
+                prog.emit(VmInstr::Argmax { dst: sampled, logits_ptr, vocab_bytes, width:  mk.width});
 
                 // Write last_sampled_token[seq] at seq_meta + seq*stride + 48
                 let tok_off = prog.alloc_vreg(VRegKind::ByteOffset, SimdWidth::Scalar);
@@ -1910,34 +2046,34 @@ pub fn compile_mega_kernel_vm(
                     *n = skip_count;
                 }
             });
-        } // end if vocab_size > 0 (per-seq argmax)
+        } // end if mk.vocab_size > 0 (per-seq argmax)
 
         // ── input pointer computation: Batch Decode Step Loop (SPEC/20 REQ-BCI-003) ──
         // After prefill + per-seq argmax, enter decode step loop.
-        // Only emit when vocab_size > 0 (has Argmax ops). Without Argmax, no decode/sampling needed.
-        if vocab_size > 0 {
+        // Only emit when mk.vocab_size > 0 (has Argmax ops). Without Argmax, no decode/sampling needed.
+        if mk.vocab_size > 0 {
             // ── ForwardPhaseDispatch decode entry: jump target when total_prefill_tokens == 0 (SPEC 32 REQ-MKO-001) ──
             prog.emit(VmInstr::MarkLabel { label_id: DECODE_ENTRY_LABEL });
-            let vb = vocab_size * ctx.dtype.elem_bytes();
+            let vb = mk.vocab_size * batch_ctx.dtype.elem_bytes();
             let stride: usize = 64; // SEQ_META_STRIDE
 
             // Read max_decode_steps from batch_ctx+4
             let max_steps = prog.alloc_vreg(VRegKind::Scalar, SimdWidth::Scalar);
-            prog.emit(VmInstr::ScalarLoad { dst: max_steps, base: batch_ctx_ptr, offset: OffsetExpr::Const(4) });
+            prog.emit(VmInstr::ScalarLoad { dst: max_steps, base: regs.batch_ctx_ptr, offset: OffsetExpr::Const(4) });
 
             // Decode input buffer: scratchpad region after all existing allocations.
             let decode_input_offset = {
-                let sampling_end = logits_scratch_offset + vb * 5;
-                let sg_end = current_abi.sg_detect_scratch_offset
+                let sampling_end = mk.logits_scratch_offset + vb * 5;
+                let sg_end = mk.sg_detect_scratch_offset
                     .map(|off| {
-                        let hdim = topology.sg_detect_hidden_dim.unwrap_or(0);
-                        (off + hdim * ctx.dtype.elem_bytes() + 63) & !63
+                        let hdim = mk.topology.sg_detect_hidden_dim.unwrap_or(0);
+                        (off + hdim * batch_ctx.dtype.elem_bytes() + 63) & !63
                     })
                     .unwrap_or(0);
-                let sgk_end = current_abi.sg_knowledge_scratch_offset
+                let sgk_end = mk.sg_knowledge_scratch_offset
                     .map(|off| {
-                        let hdim = topology.sg_inject_hidden_dim.unwrap_or(0);
-                        (off + hdim * ctx.dtype.elem_bytes() + 63) & !63
+                        let hdim = mk.topology.sg_inject_hidden_dim.unwrap_or(0);
+                        (off + hdim * batch_ctx.dtype.elem_bytes() + 63) & !63
                     })
                     .unwrap_or(0);
                 let base = sampling_end.max(sg_end).max(sgk_end);
@@ -1948,9 +2084,9 @@ pub fn compile_mega_kernel_vm(
 
             // Re-read shared batch metadata (defined in per-seq argmax block above, not in scope)
             let num_seqs_gpr = prog.alloc_vreg(VRegKind::Scalar, SimdWidth::Scalar);
-            prog.emit(VmInstr::ScalarLoad { dst: num_seqs_gpr, base: batch_ctx_ptr, offset: OffsetExpr::Const(0) });
+            prog.emit(VmInstr::ScalarLoad { dst: num_seqs_gpr, base: regs.batch_ctx_ptr, offset: OffsetExpr::Const(0) });
             let seq_meta_base = prog.alloc_vreg(VRegKind::Ptr, SimdWidth::Scalar);
-            prog.emit(VmInstr::ScalarLoad { dst: seq_meta_base, base: batch_ctx_ptr, offset: OffsetExpr::Const(88) });
+            prog.emit(VmInstr::ScalarLoad { dst: seq_meta_base, base: regs.batch_ctx_ptr, offset: OffsetExpr::Const(88) });
 
             // Persistent GPRs across decode steps
             let num_active = prog.alloc_vreg(VRegKind::Scalar, SimdWidth::Scalar);
@@ -2021,33 +2157,33 @@ pub fn compile_mega_kernel_vm(
 
             // ── Step 3d: Forward pass with M = num_active ──
             // Build decode AbiPtrs: same weights/scratch/output, but input = decode_input, M = num_active.
-            // output always from scratchpad + logits_scratch_offset.
+            // output always from scratchpad + mk.logits_scratch_offset.
             let decode_output_ptr = prog.alloc_vreg(VRegKind::Ptr, SimdWidth::Scalar);
-            prog.emit(VmInstr::LoadPtr { dst: decode_output_ptr, src: PtrExpr::VRegPlusConst(scratchpad_batch, logits_scratch_offset) });
+            prog.emit(VmInstr::LoadPtr { dst: decode_output_ptr, src: PtrExpr::VRegPlusConst(scratchpad_batch, mk.logits_scratch_offset) });
 
             let mut decode_abi = AbiPtrs {
                 input_ptr: decode_input_ptr,
-                weight_ptr: Some(weight_ptr),
+                weight_ptr: Some(regs.weight_ptr),
                 output_ptr: decode_output_ptr,
-                scratch_ptr: if needs_scratch { Some(scratchpad_batch) } else { None },
+                scratch_ptr: if mk.needs_scratch { Some(scratchpad_batch) } else { None },
                 gen_loop_counter: None,
                 layer_loop_counter: None,
                 mega_decode_seq_len: Some(num_active), // M = num_active
                 hook_ctx_ptr: batch_hook_ctx,
-                sg_detect_scratch_offset: current_abi.sg_detect_scratch_offset,
-                sg_knowledge_scratch_offset: current_abi.sg_knowledge_scratch_offset,
+                sg_detect_scratch_offset: mk.sg_detect_scratch_offset,
+                sg_knowledge_scratch_offset: mk.sg_knowledge_scratch_offset,
                 callback_table_ptr: batch_cb_ptr,
                 page_table_ptr: batch_pt_ptr,
-                kv_load_mode: graph.kv_load_mode,
+                kv_load_mode: mk.graph.kv_load_mode,
                 kv_cache_ptr: batch_kv_ptr,
                 activation_ping_ptr: None,
                 activation_pong_ptr: None,
             };
 
             emit_fusion_groups(
-                &mut prog, plan, graph, alloc, &batch_ctx,
-                rope_req.as_ref().map(|r| r.cache_offset),
-                &mut decode_abi, Some(weight_ptr), &batch_resolver, &topology,
+                prog, mk.plan, mk.graph, mk.alloc, &batch_ctx,
+                mk.rope_req.as_ref().map(|r| r.cache_offset),
+                &mut decode_abi, Some(regs.weight_ptr), &batch_resolver, &mk.topology,
             )?;
 
             // ARCH-REGALLOC-POST-FORWARD-RELOAD: Reload scratchpad_batch after
@@ -2058,7 +2194,7 @@ pub fn compile_mega_kernel_vm(
             });
 
             // ── Step 3e: Per-seq argmax + stop condition ──
-            // Logits layout: [num_active, vocab_size]. Active seqs are compacted.
+            // Logits layout: [num_active, mk.vocab_size]. Active seqs are compacted.
             // We iterate seqs again, maintaining a compact_row counter for active seqs.
             let compact_row = prog.alloc_vreg(VRegKind::Scalar, SimdWidth::Scalar);
             prog.emit(VmInstr::GprLoadImm { dst: compact_row, value: 0 });
@@ -2087,13 +2223,13 @@ pub fn compile_mega_kernel_vm(
                 let row_off = prog.alloc_vreg(VRegKind::ByteOffset, SimdWidth::Scalar);
                 prog.emit(VmInstr::GprBinOp { dst: row_off, a: compact_row, b: GprOperand::Imm(vb as i64), op: GprOp::Mul });
                 let logits_row_ptr = prog.alloc_vreg(VRegKind::Ptr, SimdWidth::Scalar);
-                prog.emit(VmInstr::LoadPtr { dst: logits_row_ptr, src: PtrExpr::VRegPlusConst(scratchpad_batch, logits_scratch_offset) });
+                prog.emit(VmInstr::LoadPtr { dst: logits_row_ptr, src: PtrExpr::VRegPlusConst(scratchpad_batch, mk.logits_scratch_offset) });
                 prog.emit(VmInstr::GprBinOp { dst: logits_row_ptr, a: logits_row_ptr, b: GprOperand::VReg(row_off), op: GprOp::Add });
 
                 // ── Per-seq sampling: read temperature from sampling_params_ptr + seq * 16 + 0 ──
                 // sampling_params layout: [temp_f32_bits, top_k_u32, top_p_f32_bits, eos_u32] × N
                 let sp_ptr_gpr = prog.alloc_vreg(VRegKind::Ptr, SimdWidth::Scalar);
-                prog.emit(VmInstr::LoadPtr { dst: sp_ptr_gpr, src: PtrExpr::VRegPlusConst(batch_ctx_ptr, 56) });
+                prog.emit(VmInstr::LoadPtr { dst: sp_ptr_gpr, src: PtrExpr::VRegPlusConst(regs.batch_ctx_ptr, 56) });
                 let seq_sp_off = prog.alloc_vreg(VRegKind::ByteOffset, SimdWidth::Scalar);
                 prog.emit(VmInstr::GprBinOp { dst: seq_sp_off, a: seq_ctr, b: GprOperand::Imm(16), op: GprOp::Mul });
                 // Read temperature (sp_ptr + seq_sp_off + 0)
@@ -2113,7 +2249,7 @@ pub fn compile_mega_kernel_vm(
                 });
 
                 // Argmax path (temperature == 0)
-                prog.emit(VmInstr::Argmax { dst: sampled, logits_ptr: logits_row_ptr, vocab_bytes: vb, width });
+                prog.emit(VmInstr::Argmax { dst: sampled, logits_ptr: logits_row_ptr, vocab_bytes: vb, width:  mk.width});
 
                 // After Argmax, skip the entire stochastic section
                 prog.emit(VmInstr::GprCondAction {
@@ -2131,7 +2267,7 @@ pub fn compile_mega_kernel_vm(
                     logits_ptr: logits_row_ptr,
                     temp_ptr: temp_store_ptr,
                     vocab_bytes: vb,
-                    width,
+                    width: mk.width,
                 });
 
                 // Softmax: reduce-max → exp-sum → normalize
@@ -2140,7 +2276,7 @@ pub fn compile_mega_kernel_vm(
                     dst: max_val,
                     logits_ptr: logits_row_ptr,
                     vocab_bytes: vb,
-                    width,
+                    width: mk.width,
                 });
                 let sum_val = prog.alloc_vreg(VRegKind::Scalar, SimdWidth::Scalar);
                 prog.emit(VmInstr::SoftmaxExpSum {
@@ -2148,13 +2284,13 @@ pub fn compile_mega_kernel_vm(
                     logits_ptr: logits_row_ptr,
                     max_val,
                     vocab_bytes: vb,
-                    width,
+                    width: mk.width,
                 });
                 prog.emit(VmInstr::SoftmaxNormalize {
                     logits_ptr: logits_row_ptr,
                     sum_val,
                     vocab_bytes: vb,
-                    width,
+                    width: mk.width,
                 });
 
                 // Top-K: read top_k from sampling_params + seq_sp_off + 4
@@ -2164,7 +2300,7 @@ pub fn compile_mega_kernel_vm(
                 prog.emit(VmInstr::ScalarLoad { dst: top_k_val, base: sp_ptr_gpr, offset: OffsetExpr::ScalarVReg(seq_sp_off_k) });
                 // TopK filter needs a ptr to k value — store k to scratch temp, use ptr
                 let k_store_ptr = prog.alloc_vreg(VRegKind::Ptr, SimdWidth::Scalar);
-                let indices_region = logits_scratch_offset + vb;
+                let indices_region = mk.logits_scratch_offset + vb;
                 prog.emit(VmInstr::LoadPtr { dst: k_store_ptr, src: PtrExpr::VRegPlusConst(scratchpad_batch, indices_region + vb) });
                 prog.emit(VmInstr::ScalarStore { base: scratchpad_batch, offset: OffsetExpr::Const(indices_region + vb), src: top_k_val });
                 let indices_ptr = prog.alloc_vreg(VRegKind::Ptr, SimdWidth::Scalar);
@@ -2174,7 +2310,7 @@ pub fn compile_mega_kernel_vm(
                     indices_ptr,
                     k_ptr: k_store_ptr,
                     vocab_bytes: vb,
-                    width,
+                    width: mk.width,
                 });
 
                 // Top-P: read top_p from sampling_params + seq_sp_off + 8
@@ -2190,7 +2326,7 @@ pub fn compile_mega_kernel_vm(
                     probs_ptr: logits_row_ptr,
                     p_ptr: p_store_ptr,
                     vocab_bytes: vb,
-                    width,
+                    width: mk.width,
                 });
 
                 // Multinomial sampling
@@ -2201,7 +2337,7 @@ pub fn compile_mega_kernel_vm(
                     probs_ptr: logits_row_ptr,
                     rng_state_ptr,
                     vocab_bytes: vb,
-                    width,
+                    width: mk.width,
                 });
 
                 // Patch stochastic_skip to jump over entire stochastic section
@@ -2232,7 +2368,7 @@ pub fn compile_mega_kernel_vm(
 
                 // Read output_tokens_flat_ptr from batch_ctx+24
                 let out_flat_ptr = prog.alloc_vreg(VRegKind::Ptr, SimdWidth::Scalar);
-                prog.emit(VmInstr::LoadPtr { dst: out_flat_ptr, src: PtrExpr::VRegPlusConst(batch_ctx_ptr, 24) });
+                prog.emit(VmInstr::LoadPtr { dst: out_flat_ptr, src: PtrExpr::VRegPlusConst(regs.batch_ctx_ptr, 24) });
                 prog.emit(VmInstr::ScalarStore { base: out_flat_ptr, offset: OffsetExpr::ScalarVReg(flat_byte), src: sampled });
 
                 // ── Increment gen_count[seq] at offset +44 ──
@@ -2280,7 +2416,7 @@ pub fn compile_mega_kernel_vm(
                 // Stop condition 2: sampled == eos (from sampling_params_ptr + seq * 16 + 12)
                 // Read sampling_params_ptr from batch_ctx+56
                 let sp_ptr = prog.alloc_vreg(VRegKind::Ptr, SimdWidth::Scalar);
-                prog.emit(VmInstr::LoadPtr { dst: sp_ptr, src: PtrExpr::VRegPlusConst(batch_ctx_ptr, 56) });
+                prog.emit(VmInstr::LoadPtr { dst: sp_ptr, src: PtrExpr::VRegPlusConst(regs.batch_ctx_ptr, 56) });
                 // eos for seq = sp_ptr + seq * 16 + 12 (packed: temp,top_k,top_p,eos per seq)
                 let seq_sp_off = prog.alloc_vreg(VRegKind::ByteOffset, SimdWidth::Scalar);
                 prog.emit(VmInstr::GprBinOp { dst: seq_sp_off, a: seq_ctr, b: GprOperand::Imm(16), op: GprOp::Mul });
@@ -2381,40 +2517,15 @@ pub fn compile_mega_kernel_vm(
 
             // Return total number of decode steps completed
             prog.emit(VmInstr::BreakLoop { return_value: ReturnValue::VReg(total_gen) });
-        } // end if vocab_size > 0
+        } // end if mk.vocab_size > 0
     }
 
-    // Stage 1.5: 符号验证 — 与 compile_layer 对齐
-    // mega-kernel 路径之前跳过此验证，导致 VmInstr 错误静默传播到 ISA lowering
-    super::verify::verify_vm_program(&prog)?;
-    prog.validate_provenance()
-        .map_err(|e| CompilerError::CodegenViolation(format!("mega-kernel provenance: {e}")))?;
-    prog.validate_structure()
-        .map_err(|e| CompilerError::CodegenViolation(format!("mega-kernel structure: {e}")))?;
-    if let Err(e) = prog.validate_type_consistency() {
-        return Err(CompilerError::CodegenViolation(format!("mega-kernel type-check: {e}")));
-    }
-    if let Err(e) = prog.validate_width_consistency() {
-        return Err(CompilerError::CodegenViolation(format!("mega-kernel width-check: {e}")));
-    }
-    if let Err(e) = prog.validate_value_domains() {
-        return Err(CompilerError::CodegenViolation(format!("mega-kernel value-domain: {e}")));
-    }
 
-    // DEBUG: dump mega-kernel VmProgram
-    if let Ok(dir) = std::env::var("GLLM_DUMP_MEGA") {
-        use std::io::Write;
-        let _ = std::fs::create_dir_all(&dir);
-        let path = format!("{}/mega_kernel_vm.txt", dir);
-        if let Ok(mut f) = std::fs::File::create(&path) {
-            writeln!(f, "=== Mega-Kernel VmProgram ({} instrs) ===", prog.instrs.len()).ok();
-            for (i, instr) in prog.instrs.iter().enumerate() {
-                writeln!(f, "{:4}: {:?}", i, instr).ok();
-            }
-        }
-    }
-    Ok((prog, rope_req, logits_scratch_offset))
+    Ok(())
 }
+
+
+
 
 /// Emit MTP candidate token generation (采样管线内).
 ///
