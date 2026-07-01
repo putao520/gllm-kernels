@@ -1382,290 +1382,7 @@ pub fn compile_mega_kernel_vm(
 
 
     // ── .generate_path: 采样管线 ──
-    if has_generate_loop {
-
-    // ── Prefill/Generate branch ──
-    // During prefill (gen_counter < prompt_len - 1), skip sampling and StoreToken.
-    // The forward pass (embed + layers) already ran; KV cache is being populated.
-    // Only the generate phase (gen_counter >= prompt_len - 1) needs sampling.
-    const SKIP_SAMPLING_LABEL: usize = 300;
-    prog.emit(VmInstr::BranchIfGprLtU {
-        a: gen_counter,
-        b: prompt_minus_1, // prompt_len - 1 (computed during loop setup)
-        target_label: SKIP_SAMPLING_LABEL,
-    });
-
-    // ── 采样: Argmax / Stochastic ──
-    // GPU-Resident 采样管线: temperature==0 → argmax, temperature>0 → stochastic
-    maybe_debug_bp(&mut prog, &ctx, "pre_sample");
-    let vocab_bytes = vocab_size * ctx.dtype.elem_bytes(); // f32 logits
-
-    // Argmax reads from row 0 of the logits region.
-    // The logits producer GEMV (M=1 decode) always writes its output to row 0
-    // (Output { offset: 0 }), so sampling must read from the same row.
-    let row_byte_offset = {
-        let z = prog.alloc_vreg(VRegKind::Scalar, SimdWidth::Scalar);
-        prog.emit(VmInstr::GprLoadImm { dst: z, value: 0 });
-        z
-    };
-
-    // logits_ptr = scratchpad_post_forward + logits_scratch_offset + row_byte_offset
-    let logits_base = prog.alloc_vreg(VRegKind::Ptr, SimdWidth::Scalar);
-    prog.emit(VmInstr::LoadPtr { dst: logits_base, src: PtrExpr::VRegPlusConst(scratchpad_post_forward, logits_scratch_offset) });
-    let fresh_logits_ptr = prog.alloc_vreg(VRegKind::Ptr, SimdWidth::Scalar);
-    prog.emit(VmInstr::GprBinOp { dst: fresh_logits_ptr, a: logits_base, b: GprOperand::VReg(row_byte_offset ), op: GprOp::Add });
-
-    // ── 采样: Argmax（temperature == 0 时）──
-    const ARGMAX_LABEL: usize = 200;
-    const SAMPLING_DONE_LABEL: usize = 201;
-
-    let temp_u32 = prog.alloc_vreg(VRegKind::Scalar, SimdWidth::Scalar);
-    prog.emit(VmInstr::LoadPtr {
-        dst: temp_u32,
-        src: PtrExpr::StackArg(MEGA_KERNEL_STACK_OFFSETS[3]), // temperature_u32
-    });
-    prog.emit(VmInstr::BranchIfGprZero { value: temp_u32, target_label: ARGMAX_LABEL });
-
-    // ── 采样: Stochastic（temperature > 0）──
-    // TemperatureScale: logits[i] /= temperature
-    let temp_ptr = prog.alloc_vreg(VRegKind::Ptr, SimdWidth::Scalar);
-    prog.emit(VmInstr::LoadPtr { dst: temp_ptr, src: PtrExpr::StackArg(MEGA_KERNEL_STACK_OFFSETS[3]) });
-    prog.emit(VmInstr::TemperatureScale {
-        logits_ptr: fresh_logits_ptr,
-        temp_ptr,
-        vocab_bytes,
-        width,
-    });
-
-    // Softmax: reduce-max → exp-sum → normalize
-    let max_val = prog.alloc_vreg(VRegKind::Scalar, SimdWidth::Scalar);
-    prog.emit(VmInstr::SoftmaxReduceMax {
-        dst: max_val,
-        logits_ptr: fresh_logits_ptr,
-        vocab_bytes,
-        width,
-    });
-    let sum_val = prog.alloc_vreg(VRegKind::Scalar, SimdWidth::Scalar);
-    prog.emit(VmInstr::SoftmaxExpSum {
-        sum_dst: sum_val,
-        logits_ptr: fresh_logits_ptr,
-        max_val,
-        vocab_bytes,
-        width,
-    });
-    prog.emit(VmInstr::SoftmaxNormalize {
-        logits_ptr: fresh_logits_ptr,
-        sum_val,
-        vocab_bytes,
-        width,
-    });
-
-    // Top-K filter (if top_k > 0)
-    // Allocate indices buffer in scratchpad after logits
-    let indices_ptr = prog.alloc_vreg(VRegKind::Ptr, SimdWidth::Scalar);
-    prog.emit(VmInstr::LoadPtr {
-        dst: indices_ptr,
-        src: PtrExpr::VRegPlusConst(scratchpad_post_forward, logits_scratch_offset + vocab_bytes),
-    });
-    let top_k_ptr = prog.alloc_vreg(VRegKind::Ptr, SimdWidth::Scalar);
-    prog.emit(VmInstr::LoadPtr { dst: top_k_ptr, src: PtrExpr::StackArg(MEGA_KERNEL_STACK_OFFSETS[4]) });
-    prog.emit(VmInstr::SampleTopKFilter {
-        probs_ptr: fresh_logits_ptr,
-        indices_ptr,
-        k_ptr: top_k_ptr,
-        vocab_bytes,
-        width,
-    });
-
-    // Top-P filter (if top_p > 0)
-    let top_p_ptr = prog.alloc_vreg(VRegKind::Ptr, SimdWidth::Scalar);
-    prog.emit(VmInstr::LoadPtr { dst: top_p_ptr, src: PtrExpr::StackArg(MEGA_KERNEL_STACK_OFFSETS[5]) });
-    prog.emit(VmInstr::SampleTopPFilter {
-        probs_ptr: fresh_logits_ptr,
-        p_ptr: top_p_ptr,
-        vocab_bytes,
-        width,
-    });
-
-    // Multinomial sampling: PRNG + cumulative search
-    // Allocate PRNG state (8 bytes) in scratchpad after indices
-    let rng_state_ptr = prog.alloc_vreg(VRegKind::Ptr, SimdWidth::Scalar);
-    prog.emit(VmInstr::LoadPtr {
-        dst: rng_state_ptr,
-        src: PtrExpr::VRegPlusConst(scratchpad_post_forward, logits_scratch_offset + vocab_bytes + vocab_bytes),
-    });
-    let sampled_token = prog.alloc_vreg(VRegKind::Scalar, SimdWidth::Scalar);
-    prog.emit(VmInstr::SampleMultinomial {
-        dst: sampled_token,
-        probs_ptr: fresh_logits_ptr,
-        rng_state_ptr,
-        vocab_bytes,
-        width,
-    });
-    prog.emit(VmInstr::UnconditionalBranch { target_label: SAMPLING_DONE_LABEL });
-
-    // ── 采样: Argmax 路径（T == 0）──
-    prog.emit(VmInstr::MarkLabel { label_id: ARGMAX_LABEL });
-    prog.emit(VmInstr::Argmax {
-        dst: sampled_token, // reuse sampled_token for unified path
-        logits_ptr: fresh_logits_ptr,
-        vocab_bytes,
-        width,
-    });
-
-    prog.emit(VmInstr::MarkLabel { label_id: SAMPLING_DONE_LABEL });
-
-    // ── 采样: Store token ──
-    // decode_counter = gen_counter - (prompt_len - 1) = actual generated token index
-    prog.emit(VmInstr::GprBinOp { dst: decode_counter, a: gen_counter, b: GprOperand::VReg(prompt_minus_1 ), op: GprOp::Sub });
-    prog.emit(VmInstr::StoreToken {
-        token_id: sampled_token,
-        output_buf: output_tokens_ptr,
-        counter: decode_counter,
-        input_ids_ptr,
-        prompt_len_bytes,
-    });
-
-    // ── 采样: MTP（Multi-Token Prediction）候选 token 生成 ──
-    // Route through TraceOp::MtpDraft → auto_select pipeline (MTP-001).
-    if let Some(ref mtp) = topology.mtp_config {
-        let MtpKernelConfig { depth, hidden_size, vocab_size: _mtp_vocab } = *mtp;
-        let elem_bytes = ctx.dtype.elem_bytes();
-        // logits_producer_bytes 使用函数级 vocab_size（从拓扑推导）和 MTP hidden_size
-        let logits_producer_bytes = vocab_size * hidden_size * elem_bytes;
-
-        // Resolve MTP weight base: logits producer weight offset + logits producer size
-        // 拓扑驱动：从 topology.logits_producer_op_idx 获取 logits producer op，
-        // 替代旧代码中的 `find(|op| op.label == "lm_head")` label 约定搜索。
-        let logits_producer_idx = topology.logits_producer_op_idx
-            .ok_or_else(|| CompilerError::CodegenViolation(
-                "MTP: cannot find logits producer op (no Argmax in graph)".into()
-            ))?;
-        let logits_producer_op = graph.ops.get(logits_producer_idx)
-            .ok_or_else(|| CompilerError::CodegenViolation(
-                "MTP: logits producer op index out of bounds".into()
-            ))?;
-
-        let logits_producer_blob_offset = logits_producer_op.inputs.get(1)
-            .and_then(|&wid| resolver.source(wid))
-            .and_then(|src| match src {
-                TensorPtrSource::Weight { offset } => Some(offset),
-                _ => None,
-            })
-            .ok_or_else(|| CompilerError::CodegenViolation(
-                "MTP: cannot find logits producer weight offset in resolver".into()
-            ))?;
-        let mtp_weights_base_offset = logits_producer_blob_offset + logits_producer_bytes;
-        let mtp_weight_ptr = prog.alloc_vreg(VRegKind::Ptr, SimdWidth::Scalar);
-        prog.emit(VmInstr::GprBinOp {
-            dst: mtp_weight_ptr,
-            a: weight_reloaded,
-            b: GprOperand::Imm(mtp_weights_base_offset as i64),
-            op: GprOp::Add,
-        });
-
-        // Resolve hidden pointer (logits producer's first input)
-        let (hidden_ptr_base, hidden_offset) = {
-            let fn_tid = logits_producer_op.inputs[0];
-            let src = resolver.source(fn_tid)
-                .ok_or_else(|| CompilerError::CodegenViolation(
-                    "MTP: final_normed tensor source not found".into()
-                ))?;
-            match src {
-                TensorPtrSource::ActivationPing => {
-                    let ping = prog.alloc_vreg(VRegKind::Ptr, SimdWidth::Scalar);
-                    let ping_off = alloc.slots.iter()
-                        .find(|s| s.tensor_id.0 == 0xFFFF_FF00)
-                        .map(|s| s.offset)
-                        .unwrap_or(0);
-                    prog.emit(VmInstr::AddPtr { dst: ping, base: scratchpad_reloaded, offset: ping_off });
-                    (ping, 0usize)
-                }
-                TensorPtrSource::ActivationPong => {
-                    let pong = prog.alloc_vreg(VRegKind::Ptr, SimdWidth::Scalar);
-                    let pong_off = alloc.slots.iter()
-                        .find(|s| s.tensor_id.0 == 0xFFFF_FF01)
-                        .map(|s| s.offset)
-                        .unwrap_or(0);
-                    prog.emit(VmInstr::AddPtr { dst: pong, base: scratchpad_reloaded, offset: pong_off });
-                    (pong, 0usize)
-                }
-                TensorPtrSource::Intermediate { offset } => {
-                    (scratchpad_reloaded, offset)
-                }
-                _ => {
-                    return Err(CompilerError::CodegenViolation(
-                        format!("MTP: unexpected final_normed source: {:?}", src)
-                    ));
-                }
-            }
-        };
-        let hidden_ptr = if hidden_offset > 0 {
-            let hp = prog.alloc_vreg(VRegKind::Ptr, SimdWidth::Scalar);
-            prog.emit(VmInstr::AddPtr { dst: hp, base: hidden_ptr_base, offset: hidden_offset });
-            hp
-        } else {
-            hidden_ptr_base
-        };
-
-        // Route through auto_select via TraceOp::MtpDraft
-        use crate::compiler::trace::TraceOp;
-        use crate::compiler::codegen::vm::auto_select::auto_lower_trace_raw;
-        auto_lower_trace_raw(
-            &mut prog,
-            &[
-                TraceOp::Input(0),
-                TraceOp::Input(1),
-                TraceOp::Input(2),
-                TraceOp::MtpDraft { depth, hidden_size, vocab_size },
-            ],
-            &[hidden_ptr, mtp_weight_ptr, output_tokens_ptr],
-            width,
-            ctx.dtype,
-        )?;
-    }
-
-    // ── 采样: 检查停止条件 ──
-    // Symbolic ABI refs: eos_token_id (arg 13), max_new_tokens (arg 12)
-    let eos_value = prog.alloc_vreg(VRegKind::Scalar, SimdWidth::Scalar);
-    prog.emit(VmInstr::LoadPtr {
-        dst: eos_value,
-        src: sym_map.resolve("eos_token_id").cloned().unwrap(),
-    });
-    let max_tokens_value = prog.alloc_vreg(VRegKind::Scalar, SimdWidth::Scalar);
-    prog.emit(VmInstr::LoadPtr {
-        dst: max_tokens_value,
-        src: sym_map.resolve("max_new_tokens").cloned().unwrap(),
-    });
-
-    prog.emit(VmInstr::CheckStopCondition {
-        token_id: sampled_token,
-        counter: decode_counter,
-        eos_ptr: eos_value,
-        max_tokens_ptr: max_tokens_value,
-    });
-
-    // ── SKIP_SAMPLING: prefill iterations land here (no sampling, no store) ──
-    prog.emit(VmInstr::MarkLabel { label_id: SKIP_SAMPLING_LABEL });
-
-    // ── 生成循环结束 ──
-    prog.emit(VmInstr::LoopEnd);
-    // Return decode_counter + 1 as generated count (decode_counter is 0-indexed)
-    let ret_count = prog.alloc_vreg(VRegKind::Scalar, SimdWidth::Scalar);
-    prog.emit(VmInstr::GprBinOp { dst: ret_count, a: decode_counter, b: GprOperand::VReg(one_imm ), op: GprOp::Add });
-    prog.emit(VmInstr::BreakLoop { return_value: ReturnValue::VReg(ret_count) });
-
-    } // end if has_generate_loop
-
-    // 无 generate loop 的图: forward pass done → LoopEnd + BreakLoop(0)
-    // Const(1) 循环仅执行一次，LoopEnd 配对 LoopBegin 后 BreakLoop 返回。
-    if !has_generate_loop {
-        prog.emit(VmInstr::LoopEnd);
-        prog.emit(VmInstr::BreakLoop { return_value: ReturnValue::Const(0) });
-    }
-
-    // ── .batch_mode_path: Batch mode entry (SPEC/20 BCI-003) ──
-    // DEC-MKEMIT-001: 抽取为 emit_batch_mode_path (零参数穿透, 25 游离变量收 ctx/regs 字段)。
+    // DEC-MKEMIT-001: build orchestrator ctx + regs (shared by sampling & batch paths).
     let mk = MkEmitCtx {
         plan, graph, alloc, registry, profile, hook, buffer_layout,
         bottleneck_map, virtual_activation, virtual_tensor_map, layout,
@@ -1684,6 +1401,19 @@ pub fn compile_mega_kernel_vm(
         output_reloaded, weight_reloaded, input_ids_reloaded, gen_input_ptr,
         decode_seq_len, output_ptr, scratchpad_post_forward,
     };
+    if has_generate_loop {
+        emit_sampling_pipeline(&mk, &mut prog, &regs, &ctx, &mut resolver)?;
+    }
+
+    // 无 generate loop 的图: forward pass done → LoopEnd + BreakLoop(0)
+    // Const(1) 循环仅执行一次，LoopEnd 配对 LoopBegin 后 BreakLoop 返回。
+    if !has_generate_loop {
+        prog.emit(VmInstr::LoopEnd);
+        prog.emit(VmInstr::BreakLoop { return_value: ReturnValue::Const(0) });
+    }
+
+    // ── .batch_mode_path: Batch mode entry (SPEC/20 BCI-003) ──
+    // DEC-MKEMIT-001: mk/regs built above (before sampling); reuse here.
     emit_batch_mode_path(&mk, &mut prog, &regs, BATCH_MODE_LABEL)?;
 
 
@@ -1719,6 +1449,296 @@ pub fn compile_mega_kernel_vm(
     }
     Ok((prog, rope_req, logits_scratch_offset))
 }
+
+/// DEC-MKEMIT-001: Sampling pipeline — extracted from compile_mega_kernel_vm.
+///
+/// Emits the generate-path sampling pipeline (BranchIfGprLtU prefill/generate split,
+/// TemperatureScale → Softmax → TopK/TopP → Multinomial/Argmax → StoreToken → MTP →
+/// CheckStopCondition → LoopEnd). Shared state via &MkEmitCtx / &MkRegs; ctx & resolver
+/// thread through (built in caller). Behavior byte-identical to pre-extract inline.
+fn emit_sampling_pipeline(
+    mk: &MkEmitCtx,
+    prog: &mut VmProgram,
+    regs: &MkRegs,
+    ctx: &LoweringContext,
+    resolver: &mut TensorPtrResolver,
+) -> Result<(), CompilerError> {
+    use crate::compiler::mega_kernel_abi::MEGA_KERNEL_STACK_OFFSETS;
+
+
+    // ── Prefill/Generate branch ──
+    // During prefill (regs.gen_counter < prompt_len - 1), skip sampling and StoreToken.
+    // The forward pass (embed + layers) already ran; KV cache is being populated.
+    // Only the generate phase (regs.gen_counter >= prompt_len - 1) needs sampling.
+    const SKIP_SAMPLING_LABEL: usize = 300;
+    prog.emit(VmInstr::BranchIfGprLtU {
+        a: regs.gen_counter,
+        b: regs.prompt_minus_1, // prompt_len - 1 (computed during loop setup)
+        target_label: SKIP_SAMPLING_LABEL,
+    });
+
+    // ── 采样: Argmax / Stochastic ──
+    // GPU-Resident 采样管线: temperature==0 → argmax, temperature>0 → stochastic
+    maybe_debug_bp(prog, &ctx, "pre_sample");
+    let vocab_bytes = mk.vocab_size * ctx.dtype.elem_bytes(); // f32 logits
+
+    // Argmax reads from row 0 of the logits region.
+    // The logits producer GEMV (M=1 decode) always writes its output to row 0
+    // (Output { offset: 0 }), so sampling must read from the same row.
+    let row_byte_offset = {
+        let z = prog.alloc_vreg(VRegKind::Scalar, SimdWidth::Scalar);
+        prog.emit(VmInstr::GprLoadImm { dst: z, value: 0 });
+        z
+    };
+
+    // logits_ptr = regs.scratchpad_post_forward + mk.logits_scratch_offset + row_byte_offset
+    let logits_base = prog.alloc_vreg(VRegKind::Ptr, SimdWidth::Scalar);
+    prog.emit(VmInstr::LoadPtr { dst: logits_base, src: PtrExpr::VRegPlusConst(regs.scratchpad_post_forward, mk.logits_scratch_offset) });
+    let fresh_logits_ptr = prog.alloc_vreg(VRegKind::Ptr, SimdWidth::Scalar);
+    prog.emit(VmInstr::GprBinOp { dst: fresh_logits_ptr, a: logits_base, b: GprOperand::VReg(row_byte_offset ), op: GprOp::Add });
+
+    // ── 采样: Argmax（temperature == 0 时）──
+    const ARGMAX_LABEL: usize = 200;
+    const SAMPLING_DONE_LABEL: usize = 201;
+
+    let temp_u32 = prog.alloc_vreg(VRegKind::Scalar, SimdWidth::Scalar);
+    prog.emit(VmInstr::LoadPtr {
+        dst: temp_u32,
+        src: PtrExpr::StackArg(MEGA_KERNEL_STACK_OFFSETS[3]), // temperature_u32
+    });
+    prog.emit(VmInstr::BranchIfGprZero { value: temp_u32, target_label: ARGMAX_LABEL });
+
+    // ── 采样: Stochastic（temperature > 0）──
+    // TemperatureScale: logits[i] /= temperature
+    let temp_ptr = prog.alloc_vreg(VRegKind::Ptr, SimdWidth::Scalar);
+    prog.emit(VmInstr::LoadPtr { dst: temp_ptr, src: PtrExpr::StackArg(MEGA_KERNEL_STACK_OFFSETS[3]) });
+    prog.emit(VmInstr::TemperatureScale {
+        logits_ptr: fresh_logits_ptr,
+        temp_ptr,
+        vocab_bytes,
+        width: mk.width,
+    });
+
+    // Softmax: reduce-max → exp-sum → normalize
+    let max_val = prog.alloc_vreg(VRegKind::Scalar, SimdWidth::Scalar);
+    prog.emit(VmInstr::SoftmaxReduceMax {
+        dst: max_val,
+        logits_ptr: fresh_logits_ptr,
+        vocab_bytes,
+        width: mk.width,
+    });
+    let sum_val = prog.alloc_vreg(VRegKind::Scalar, SimdWidth::Scalar);
+    prog.emit(VmInstr::SoftmaxExpSum {
+        sum_dst: sum_val,
+        logits_ptr: fresh_logits_ptr,
+        max_val,
+        vocab_bytes,
+        width: mk.width,
+    });
+    prog.emit(VmInstr::SoftmaxNormalize {
+        logits_ptr: fresh_logits_ptr,
+        sum_val,
+        vocab_bytes,
+        width: mk.width,
+    });
+
+    // Top-K filter (if top_k > 0)
+    // Allocate indices buffer in scratchpad after logits
+    let indices_ptr = prog.alloc_vreg(VRegKind::Ptr, SimdWidth::Scalar);
+    prog.emit(VmInstr::LoadPtr {
+        dst: indices_ptr,
+        src: PtrExpr::VRegPlusConst(regs.scratchpad_post_forward, mk.logits_scratch_offset + vocab_bytes),
+    });
+    let top_k_ptr = prog.alloc_vreg(VRegKind::Ptr, SimdWidth::Scalar);
+    prog.emit(VmInstr::LoadPtr { dst: top_k_ptr, src: PtrExpr::StackArg(MEGA_KERNEL_STACK_OFFSETS[4]) });
+    prog.emit(VmInstr::SampleTopKFilter {
+        probs_ptr: fresh_logits_ptr,
+        indices_ptr,
+        k_ptr: top_k_ptr,
+        vocab_bytes,
+        width: mk.width,
+    });
+
+    // Top-P filter (if top_p > 0)
+    let top_p_ptr = prog.alloc_vreg(VRegKind::Ptr, SimdWidth::Scalar);
+    prog.emit(VmInstr::LoadPtr { dst: top_p_ptr, src: PtrExpr::StackArg(MEGA_KERNEL_STACK_OFFSETS[5]) });
+    prog.emit(VmInstr::SampleTopPFilter {
+        probs_ptr: fresh_logits_ptr,
+        p_ptr: top_p_ptr,
+        vocab_bytes,
+        width: mk.width,
+    });
+
+    // Multinomial sampling: PRNG + cumulative search
+    // Allocate PRNG state (8 bytes) in scratchpad after indices
+    let rng_state_ptr = prog.alloc_vreg(VRegKind::Ptr, SimdWidth::Scalar);
+    prog.emit(VmInstr::LoadPtr {
+        dst: rng_state_ptr,
+        src: PtrExpr::VRegPlusConst(regs.scratchpad_post_forward, mk.logits_scratch_offset + vocab_bytes + vocab_bytes),
+    });
+    let sampled_token = prog.alloc_vreg(VRegKind::Scalar, SimdWidth::Scalar);
+    prog.emit(VmInstr::SampleMultinomial {
+        dst: sampled_token,
+        probs_ptr: fresh_logits_ptr,
+        rng_state_ptr,
+        vocab_bytes,
+        width: mk.width,
+    });
+    prog.emit(VmInstr::UnconditionalBranch { target_label: SAMPLING_DONE_LABEL });
+
+    // ── 采样: Argmax 路径（T == 0）──
+    prog.emit(VmInstr::MarkLabel { label_id: ARGMAX_LABEL });
+    prog.emit(VmInstr::Argmax {
+        dst: sampled_token, // reuse sampled_token for unified path
+        logits_ptr: fresh_logits_ptr,
+        vocab_bytes,
+        width: mk.width,
+    });
+
+    prog.emit(VmInstr::MarkLabel { label_id: SAMPLING_DONE_LABEL });
+
+    // ── 采样: Store token ──
+    // regs.decode_counter = regs.gen_counter - (prompt_len - 1) = actual generated token index
+    prog.emit(VmInstr::GprBinOp { dst: regs.decode_counter, a: regs.gen_counter, b: GprOperand::VReg(regs.prompt_minus_1 ), op: GprOp::Sub });
+    prog.emit(VmInstr::StoreToken {
+        token_id: sampled_token,
+        output_buf: regs.output_tokens_ptr,
+        counter: regs.decode_counter,
+        input_ids_ptr: regs.input_ids_ptr,
+        prompt_len_bytes: regs.prompt_len_bytes,
+    });
+
+    // ── 采样: MTP（Multi-Token Prediction）候选 token 生成 ──
+    // Route through TraceOp::MtpDraft → auto_select pipeline (MTP-001).
+    if let Some(ref mtp) = mk.topology.mtp_config {
+        let MtpKernelConfig { depth, hidden_size, vocab_size: _mtp_vocab } = *mtp;
+        let elem_bytes = ctx.dtype.elem_bytes();
+        // logits_producer_bytes 使用函数级 mk.vocab_size（从拓扑推导）和 MTP hidden_size
+        let logits_producer_bytes = mk.vocab_size * hidden_size * elem_bytes;
+
+        // Resolve MTP weight base: logits producer weight offset + logits producer size
+        // 拓扑驱动：从 mk.topology.logits_producer_op_idx 获取 logits producer op，
+        // 替代旧代码中的 `find(|op| op.label == "lm_head")` label 约定搜索。
+        let logits_producer_idx = mk.topology.logits_producer_op_idx
+            .ok_or_else(|| CompilerError::CodegenViolation(
+                "MTP: cannot find logits producer op (no Argmax in mk.graph)".into()
+            ))?;
+        let logits_producer_op = mk.graph.ops.get(logits_producer_idx)
+            .ok_or_else(|| CompilerError::CodegenViolation(
+                "MTP: logits producer op index out of bounds".into()
+            ))?;
+
+        let logits_producer_blob_offset = logits_producer_op.inputs.get(1)
+            .and_then(|&wid| resolver.source(wid))
+            .and_then(|src| match src {
+                TensorPtrSource::Weight { offset } => Some(offset),
+                _ => None,
+            })
+            .ok_or_else(|| CompilerError::CodegenViolation(
+                "MTP: cannot find logits producer weight offset in resolver".into()
+            ))?;
+        let mtp_weights_base_offset = logits_producer_blob_offset + logits_producer_bytes;
+        let mtp_weight_ptr = prog.alloc_vreg(VRegKind::Ptr, SimdWidth::Scalar);
+        prog.emit(VmInstr::GprBinOp {
+            dst: mtp_weight_ptr,
+            a: regs.weight_reloaded,
+            b: GprOperand::Imm(mtp_weights_base_offset as i64),
+            op: GprOp::Add,
+        });
+
+        // Resolve hidden pointer (logits producer's first input)
+        let (hidden_ptr_base, hidden_offset) = {
+            let fn_tid = logits_producer_op.inputs[0];
+            let src = resolver.source(fn_tid)
+                .ok_or_else(|| CompilerError::CodegenViolation(
+                    "MTP: final_normed tensor source not found".into()
+                ))?;
+            match src {
+                TensorPtrSource::ActivationPing => {
+                    let ping = prog.alloc_vreg(VRegKind::Ptr, SimdWidth::Scalar);
+                    let ping_off = mk.alloc.slots.iter()
+                        .find(|s| s.tensor_id.0 == 0xFFFF_FF00)
+                        .map(|s| s.offset)
+                        .unwrap_or(0);
+                    prog.emit(VmInstr::AddPtr { dst: ping, base: regs.scratchpad_reloaded, offset: ping_off });
+                    (ping, 0usize)
+                }
+                TensorPtrSource::ActivationPong => {
+                    let pong = prog.alloc_vreg(VRegKind::Ptr, SimdWidth::Scalar);
+                    let pong_off = mk.alloc.slots.iter()
+                        .find(|s| s.tensor_id.0 == 0xFFFF_FF01)
+                        .map(|s| s.offset)
+                        .unwrap_or(0);
+                    prog.emit(VmInstr::AddPtr { dst: pong, base: regs.scratchpad_reloaded, offset: pong_off });
+                    (pong, 0usize)
+                }
+                TensorPtrSource::Intermediate { offset } => {
+                    (regs.scratchpad_reloaded, offset)
+                }
+                _ => {
+                    return Err(CompilerError::CodegenViolation(
+                        format!("MTP: unexpected final_normed source: {:?}", src)
+                    ));
+                }
+            }
+        };
+        let hidden_ptr = if hidden_offset > 0 {
+            let hp = prog.alloc_vreg(VRegKind::Ptr, SimdWidth::Scalar);
+            prog.emit(VmInstr::AddPtr { dst: hp, base: hidden_ptr_base, offset: hidden_offset });
+            hp
+        } else {
+            hidden_ptr_base
+        };
+
+        // Route through auto_select via TraceOp::MtpDraft
+        use crate::compiler::trace::TraceOp;
+        use crate::compiler::codegen::vm::auto_select::auto_lower_trace_raw;
+        auto_lower_trace_raw(
+            prog,
+            &[
+                TraceOp::Input(0),
+                TraceOp::Input(1),
+                TraceOp::Input(2),
+                TraceOp::MtpDraft { depth, hidden_size, vocab_size: mk.vocab_size },
+            ],
+            &[hidden_ptr, mtp_weight_ptr, regs.output_tokens_ptr],
+            mk.width,
+            ctx.dtype,
+        )?;
+    }
+
+    // ── 采样: 检查停止条件 ──
+    // Symbolic ABI refs: eos_token_id (arg 13), max_new_tokens (arg 12)
+    let eos_value = prog.alloc_vreg(VRegKind::Scalar, SimdWidth::Scalar);
+    prog.emit(VmInstr::LoadPtr {
+        dst: eos_value,
+        src: mk.sym_map.resolve("eos_token_id").cloned().unwrap(),
+    });
+    let max_tokens_value = prog.alloc_vreg(VRegKind::Scalar, SimdWidth::Scalar);
+    prog.emit(VmInstr::LoadPtr {
+        dst: max_tokens_value,
+        src: mk.sym_map.resolve("max_new_tokens").cloned().unwrap(),
+    });
+
+    prog.emit(VmInstr::CheckStopCondition {
+        token_id: sampled_token,
+        counter: regs.decode_counter,
+        eos_ptr: eos_value,
+        max_tokens_ptr: max_tokens_value,
+    });
+
+    // ── SKIP_SAMPLING: prefill iterations land here (no sampling, no store) ──
+    prog.emit(VmInstr::MarkLabel { label_id: SKIP_SAMPLING_LABEL });
+
+    // ── 生成循环结束 ──
+    prog.emit(VmInstr::LoopEnd);
+    // Return regs.decode_counter + 1 as generated count (regs.decode_counter is 0-indexed)
+    let ret_count = prog.alloc_vreg(VRegKind::Scalar, SimdWidth::Scalar);
+    prog.emit(VmInstr::GprBinOp { dst: ret_count, a: regs.decode_counter, b: GprOperand::VReg(regs.one_imm ), op: GprOp::Add });
+    prog.emit(VmInstr::BreakLoop { return_value: ReturnValue::VReg(ret_count) });
+    Ok(())
+}
+
 
 /// DEC-MKEMIT-001: Batch mode path — extracted from compile_mega_kernel_vm.
 ///
