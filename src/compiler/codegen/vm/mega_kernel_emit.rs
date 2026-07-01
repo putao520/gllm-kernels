@@ -1965,579 +1965,23 @@ fn emit_batch_mode_path(
         // For seq s, last token row index = cumsum(prompt_lens)[s] - 1.
         // cumsum_acc tracks running sum of prompt_lens[0..seq).
         // Only emit when mk.vocab_size > 0 — no Argmax ops means no logits to sample from.
-        if mk.vocab_size > 0 {
-            let vocab_bytes = mk.vocab_size * batch_ctx.dtype.elem_bytes();
-
-            // Read num_seqs from batch_ctx+0
-            let num_seqs_gpr = prog.alloc_vreg(VRegKind::Scalar, SimdWidth::Scalar);
-            prog.emit(VmInstr::ScalarLoad { dst: num_seqs_gpr, base: regs.batch_ctx_ptr, offset: OffsetExpr::Const(0) });
-
-            // Read seq_meta_base from batch_ctx+88 (absolute pointer to per-seq array)
-            let seq_meta_base = prog.alloc_vreg(VRegKind::Ptr, SimdWidth::Scalar);
-            prog.emit(VmInstr::ScalarLoad { dst: seq_meta_base, base: regs.batch_ctx_ptr, offset: OffsetExpr::Const(88) });
-
-            // logits_base = scratchpad + mk.logits_scratch_offset
-            let logits_base_arg = prog.alloc_vreg(VRegKind::Ptr, SimdWidth::Scalar);
-            prog.emit(VmInstr::LoadPtr { dst: logits_base_arg, src: PtrExpr::VRegPlusConst(scratchpad_batch, mk.logits_scratch_offset) });
-
-            // Read output_tokens_flat_ptr from batch_ctx+24
-            let out_tokens_ptr = prog.alloc_vreg(VRegKind::Ptr, SimdWidth::Scalar);
-            prog.emit(VmInstr::LoadPtr { dst: out_tokens_ptr, src: PtrExpr::VRegPlusConst(regs.batch_ctx_ptr, 24) });
-
-            // Read sampling_params_ptr from batch_ctx+56 (for prefill temperature check)
-            let sampling_params_ptr = prog.alloc_vreg(VRegKind::Ptr, SimdWidth::Scalar);
-            prog.emit(VmInstr::LoadPtr { dst: sampling_params_ptr, src: PtrExpr::VRegPlusConst(regs.batch_ctx_ptr, 56) });
-
-            // cumsum accumulator: tracks sum of prompt_lens[0..seq) across iterations
-            let cumsum_acc = prog.alloc_vreg(VRegKind::Scalar, SimdWidth::Scalar);
-            prog.emit(VmInstr::GprLoadImm { dst: cumsum_acc, value: 0 });
-
-            let seq_stride: usize = 64;
-            prog.emit_loop(BoundExpr::DynamicVReg(num_seqs_gpr), 1, |prog, seq_ctr, _seq_off| {
-                // Read prompt_len[seq] = seq_meta_base + seq * stride + 0
-                let prompt_len_gpr = prog.alloc_vreg(VRegKind::Scalar, SimdWidth::Scalar);
-                let seq_byte_off = prog.alloc_vreg(VRegKind::ByteOffset, SimdWidth::Scalar);
-                prog.emit(VmInstr::GprBinOp { dst: seq_byte_off, a: seq_ctr, b: GprOperand::Imm(seq_stride as i64), op: GprOp::Mul });
-                prog.emit(VmInstr::ScalarLoad { dst: prompt_len_gpr, base: seq_meta_base, offset: OffsetExpr::Add(Box::new(OffsetExpr::ScalarVReg(seq_byte_off)), Box::new(OffsetExpr::Const(0))) });
-
-                // Skip if prompt_len == 0 (pure decode, no prefill for this seq)
-                prog.emit(VmInstr::GprCondAction {
-                    cond: GprCondition::CmpEq(prompt_len_gpr, 0),
-                    action: GprBranchAction::Skip(0), // placeholder, patched below
-                });
-                let skip_patch = prog.instrs.len() - 1;
-
-                // Compute last token row index = cumsum_acc + prompt_len - 1
-                let last_row_idx = prog.alloc_vreg(VRegKind::Scalar, SimdWidth::Scalar);
-                let pl_minus_1 = prog.alloc_vreg(VRegKind::Scalar, SimdWidth::Scalar);
-                prog.emit(VmInstr::GprBinOp { dst: pl_minus_1, a: prompt_len_gpr, b: GprOperand::Imm(1), op: GprOp::Sub });
-                prog.emit(VmInstr::GprBinOp { dst: last_row_idx, a: cumsum_acc, b: GprOperand::VReg(pl_minus_1), op: GprOp::Add });
-
-                // logits_ptr = logits_base + last_row_idx * vocab_bytes
-                let row_byte_off = prog.alloc_vreg(VRegKind::ByteOffset, SimdWidth::Scalar);
-                prog.emit(VmInstr::GprBinOp { dst: row_byte_off, a: last_row_idx, b: GprOperand::Imm(vocab_bytes as i64), op: GprOp::Mul });
-                let logits_ptr = prog.alloc_vreg(VRegKind::Ptr, SimdWidth::Scalar);
-                prog.emit(VmInstr::GprBinOp { dst: logits_ptr, a: logits_base_arg, b: GprOperand::VReg(row_byte_off), op: GprOp::Add });
-
-                // Argmax this row
-                let sampled = prog.alloc_vreg(VRegKind::Scalar, SimdWidth::Scalar);
-                prog.emit(VmInstr::Argmax { dst: sampled, logits_ptr, vocab_bytes, width:  mk.width});
-
-                // Write last_sampled_token[seq] at seq_meta + seq*stride + 48
-                let tok_off = prog.alloc_vreg(VRegKind::ByteOffset, SimdWidth::Scalar);
-                prog.emit(VmInstr::GprBinOp { dst: tok_off, a: seq_ctr, b: GprOperand::Imm(seq_stride as i64), op: GprOp::Mul });
-                prog.emit(VmInstr::GprBinOp { dst: tok_off, a: tok_off, b: GprOperand::Imm(48), op: GprOp::Add });
-                prog.emit(VmInstr::ScalarStore { base: seq_meta_base, offset: OffsetExpr::ScalarVReg(tok_off), src: sampled });
-
-                // Update gen_count[seq] = 1 at offset +44
-                let one_gpr = prog.alloc_vreg(VRegKind::Scalar, SimdWidth::Scalar);
-                prog.emit(VmInstr::GprLoadImm { dst: one_gpr, value: 1 });
-                let gc_off = prog.alloc_vreg(VRegKind::ByteOffset, SimdWidth::Scalar);
-                prog.emit(VmInstr::GprBinOp { dst: gc_off, a: seq_ctr, b: GprOperand::Imm(seq_stride as i64), op: GprOp::Mul });
-                prog.emit(VmInstr::GprBinOp { dst: gc_off, a: gc_off, b: GprOperand::Imm(44), op: GprOp::Add });
-                prog.emit(VmInstr::ScalarStore { base: seq_meta_base, offset: OffsetExpr::ScalarVReg(gc_off), src: one_gpr });
-
-                // Update seq_position[seq] = prompt_len[seq] at offset +40
-                let sp_off = prog.alloc_vreg(VRegKind::ByteOffset, SimdWidth::Scalar);
-                prog.emit(VmInstr::GprBinOp { dst: sp_off, a: seq_ctr, b: GprOperand::Imm(seq_stride as i64), op: GprOp::Mul });
-                prog.emit(VmInstr::GprBinOp { dst: sp_off, a: sp_off, b: GprOperand::Imm(40), op: GprOp::Add });
-                prog.emit(VmInstr::ScalarStore { base: seq_meta_base, offset: OffsetExpr::ScalarVReg(sp_off), src: prompt_len_gpr });
-
-                // Write first generated token to output_tokens_flat[output_offset + prompt_len]
-                // output_offset[seq] at seq_meta +52, write position = output_offset + prompt_len
-                let out_off_gpr = prog.alloc_vreg(VRegKind::Scalar, SimdWidth::Scalar);
-                let oo_byte_off = prog.alloc_vreg(VRegKind::ByteOffset, SimdWidth::Scalar);
-                prog.emit(VmInstr::GprBinOp { dst: oo_byte_off, a: seq_ctr, b: GprOperand::Imm(seq_stride as i64), op: GprOp::Mul });
-                prog.emit(VmInstr::ScalarLoad { dst: out_off_gpr, base: seq_meta_base, offset: OffsetExpr::Add(Box::new(OffsetExpr::ScalarVReg(oo_byte_off)), Box::new(OffsetExpr::Const(52))) });
-                // flat_index = output_offset + prompt_len
-                let flat_idx = prog.alloc_vreg(VRegKind::Scalar, SimdWidth::Scalar);
-                prog.emit(VmInstr::GprBinOp { dst: flat_idx, a: out_off_gpr, b: GprOperand::VReg(prompt_len_gpr), op: GprOp::Add });
-                // byte_offset = flat_idx * 4
-                let flat_byte_off = prog.alloc_vreg(VRegKind::ByteOffset, SimdWidth::Scalar);
-                prog.emit(VmInstr::GprBinOp { dst: flat_byte_off, a: flat_idx, b: GprOperand::Imm(4), op: GprOp::Mul });
-                prog.emit(VmInstr::ScalarStore { base: out_tokens_ptr, offset: OffsetExpr::ScalarVReg(flat_byte_off), src: sampled });
-
-                // Update cumsum_acc += prompt_len for next iteration
-                prog.emit(VmInstr::GprBinOp { dst: cumsum_acc, a: cumsum_acc, b: GprOperand::VReg(prompt_len_gpr), op: GprOp::Add });
-
-                // Patch skip target for prompt_len == 0
-                let skip_count = prog.instrs.len() - skip_patch - 1;
-                if let VmInstr::GprCondAction { action: GprBranchAction::Skip(ref mut n), .. } = prog.instrs[skip_patch] {
-                    *n = skip_count;
-                }
-            });
-        } // end if mk.vocab_size > 0 (per-seq argmax)
+        let _dtype = graph_dtype(mk.graph);
+        emit_batch_prefill_argmax(mk, prog, regs, scratchpad_batch, _dtype)?;
 
         // ── input pointer computation: Batch Decode Step Loop (SPEC/20 REQ-BCI-003) ──
         // After prefill + per-seq argmax, enter decode step loop.
         // Only emit when mk.vocab_size > 0 (has Argmax ops). Without Argmax, no decode/sampling needed.
-        if mk.vocab_size > 0 {
-            // ── ForwardPhaseDispatch decode entry: jump target when total_prefill_tokens == 0 (SPEC 32 REQ-MKO-001) ──
-            prog.emit(VmInstr::MarkLabel { label_id: DECODE_ENTRY_LABEL });
-            let vb = mk.vocab_size * batch_ctx.dtype.elem_bytes();
-            let stride: usize = 64; // SEQ_META_STRIDE
-
-            // Read max_decode_steps from batch_ctx+4
-            let max_steps = prog.alloc_vreg(VRegKind::Scalar, SimdWidth::Scalar);
-            prog.emit(VmInstr::ScalarLoad { dst: max_steps, base: regs.batch_ctx_ptr, offset: OffsetExpr::Const(4) });
-
-            // Decode input buffer: scratchpad region after all existing allocations.
-            let decode_input_offset = {
-                let sampling_end = mk.logits_scratch_offset + vb * 5;
-                let sg_end = mk.sg_detect_scratch_offset
-                    .map(|off| {
-                        let hdim = mk.topology.sg_detect_hidden_dim.unwrap_or(0);
-                        (off + hdim * batch_ctx.dtype.elem_bytes() + 63) & !63
-                    })
-                    .unwrap_or(0);
-                let sgk_end = mk.sg_knowledge_scratch_offset
-                    .map(|off| {
-                        let hdim = mk.topology.sg_inject_hidden_dim.unwrap_or(0);
-                        (off + hdim * batch_ctx.dtype.elem_bytes() + 63) & !63
-                    })
-                    .unwrap_or(0);
-                let base = sampling_end.max(sg_end).max(sgk_end);
-                (base + 63) & !63
-            };
-            let decode_input_ptr = prog.alloc_vreg(VRegKind::Ptr, SimdWidth::Scalar);
-            prog.emit(VmInstr::AddPtr { dst: decode_input_ptr, base: scratchpad_batch, offset: decode_input_offset });
-
-            // Re-read shared batch metadata (defined in per-seq argmax block above, not in scope)
-            let num_seqs_gpr = prog.alloc_vreg(VRegKind::Scalar, SimdWidth::Scalar);
-            prog.emit(VmInstr::ScalarLoad { dst: num_seqs_gpr, base: regs.batch_ctx_ptr, offset: OffsetExpr::Const(0) });
-            let seq_meta_base = prog.alloc_vreg(VRegKind::Ptr, SimdWidth::Scalar);
-            prog.emit(VmInstr::ScalarLoad { dst: seq_meta_base, base: regs.batch_ctx_ptr, offset: OffsetExpr::Const(88) });
-
-            // Persistent GPRs across decode steps
-            let num_active = prog.alloc_vreg(VRegKind::Scalar, SimdWidth::Scalar);
-            let total_gen = prog.alloc_vreg(VRegKind::Scalar, SimdWidth::Scalar);
-            let compact_idx = prog.alloc_vreg(VRegKind::Scalar, SimdWidth::Scalar);
-            prog.emit(VmInstr::GprLoadImm { dst: total_gen, value: 0 });
-
-            // ── Outer decode step loop ──
-            let step_ctr = prog.alloc_vreg(VRegKind::Counter, SimdWidth::Scalar);
-            let step_off = prog.alloc_vreg(VRegKind::ByteOffset, SimdWidth::Scalar);
-            prog.emit(VmInstr::LoopBegin { counter: step_ctr, byte_offset: step_off, bound: BoundExpr::DynamicVReg(max_steps), step_bytes: 4 });
-
-            // ── Step 3a: Count num_active — active_flag is 0 or 1, just accumulate ──
-            prog.emit(VmInstr::GprLoadImm { dst: num_active, value: 0 });
-            prog.emit_loop(BoundExpr::DynamicVReg(num_seqs_gpr), 1, |prog, seq_ctr, _off| {
-                let byte_off = prog.alloc_vreg(VRegKind::ByteOffset, SimdWidth::Scalar);
-                prog.emit(VmInstr::GprBinOp { dst: byte_off, a: seq_ctr, b: GprOperand::Imm(stride as i64), op: GprOp::Mul });
-                let flag = prog.alloc_vreg(VRegKind::Scalar, SimdWidth::Scalar);
-                prog.emit(VmInstr::ScalarLoad { dst: flag, base: seq_meta_base, offset: OffsetExpr::Add(Box::new(OffsetExpr::ScalarVReg(byte_off)), Box::new(OffsetExpr::Const(36))) });
-                // active_flag is 0 or 1 — just add it to num_active (no branch needed)
-                prog.emit(VmInstr::GprBinOp { dst: num_active, a: num_active, b: GprOperand::VReg(flag), op: GprOp::Add });
-            });
-
-            // ── Step 3b: Break if num_active == 0 (IsNonNull → skip BreakLoop when active) ──
-            prog.emit(VmInstr::GprCondAction {
-                cond: GprCondition::IsNonNull(num_active),
-                action: GprBranchAction::Skip(1),
-            });
-            prog.emit(VmInstr::BreakLoop { return_value: ReturnValue::VReg(total_gen) });
-
-            // ── Step 3c: Build compact decode input from last_sampled_token[active seqs] ──
-            prog.emit(VmInstr::GprLoadImm { dst: compact_idx, value: 0 });
-            prog.emit_loop(BoundExpr::DynamicVReg(num_seqs_gpr), 1, |prog, seq_ctr, _off| {
-                let byte_off = prog.alloc_vreg(VRegKind::ByteOffset, SimdWidth::Scalar);
-                prog.emit(VmInstr::GprBinOp { dst: byte_off, a: seq_ctr, b: GprOperand::Imm(stride as i64), op: GprOp::Mul });
-
-                // Read active_flag[seq]
-                let flag = prog.alloc_vreg(VRegKind::Scalar, SimdWidth::Scalar);
-                prog.emit(VmInstr::ScalarLoad { dst: flag, base: seq_meta_base, offset: OffsetExpr::Add(Box::new(OffsetExpr::ScalarVReg(byte_off)), Box::new(OffsetExpr::Const(36))) });
-
-                // If inactive (flag == 0), skip the copy + increment (3 instructions)
-                prog.emit(VmInstr::GprCondAction {
-                    cond: GprCondition::CmpEq(flag, 0),
-                    action: GprBranchAction::Skip(3),
-                });
-                let skip_patch = prog.instrs.len() - 1;
-
-                // Read last_sampled_token[seq] at offset +48
-                let token = prog.alloc_vreg(VRegKind::Scalar, SimdWidth::Scalar);
-                prog.emit(VmInstr::ScalarLoad { dst: token, base: seq_meta_base, offset: OffsetExpr::Add(Box::new(OffsetExpr::ScalarVReg(byte_off)), Box::new(OffsetExpr::Const(48))) });
-
-                // Store to decode_input[compact_idx]
-                let dst_off = prog.alloc_vreg(VRegKind::ByteOffset, SimdWidth::Scalar);
-                prog.emit(VmInstr::GprBinOp { dst: dst_off, a: compact_idx, b: GprOperand::Imm(4), op: GprOp::Mul });
-                prog.emit(VmInstr::ScalarStore { base: decode_input_ptr, offset: OffsetExpr::ScalarVReg(dst_off), src: token });
-
-                // compact_idx += 1
-                prog.emit(VmInstr::GprBinOp { dst: compact_idx, a: compact_idx, b: GprOperand::Imm(1), op: GprOp::Add });
-
-                // Patch: the Skip count should be 4 (token load + store offset + store + increment)
-                // But wait: GprCondAction is already counted. Instructions AFTER GprCondAction that
-                // should be skipped = token load(1) + dst_off(2) + store(3) + increment(4) = 4.
-                let actual_skip = prog.instrs.len() - skip_patch - 1;
-                if let VmInstr::GprCondAction { action: GprBranchAction::Skip(ref mut n), .. } = prog.instrs[skip_patch] {
-                    *n = actual_skip;
-                }
-            });
-
-            // ── Step 3d: Forward pass with M = num_active ──
-            // Build decode AbiPtrs: same weights/scratch/output, but input = decode_input, M = num_active.
-            // output always from scratchpad + mk.logits_scratch_offset.
-            let decode_output_ptr = prog.alloc_vreg(VRegKind::Ptr, SimdWidth::Scalar);
-            prog.emit(VmInstr::LoadPtr { dst: decode_output_ptr, src: PtrExpr::VRegPlusConst(scratchpad_batch, mk.logits_scratch_offset) });
-
-            let mut decode_abi = AbiPtrs {
-                input_ptr: decode_input_ptr,
-                weight_ptr: Some(regs.weight_ptr),
-                output_ptr: decode_output_ptr,
-                scratch_ptr: if mk.needs_scratch { Some(scratchpad_batch) } else { None },
-                gen_loop_counter: None,
-                layer_loop_counter: None,
-                mega_decode_seq_len: Some(num_active), // M = num_active
-                hook_ctx_ptr: batch_hook_ctx,
-                sg_detect_scratch_offset: mk.sg_detect_scratch_offset,
-                sg_knowledge_scratch_offset: mk.sg_knowledge_scratch_offset,
-                callback_table_ptr: batch_cb_ptr,
+        emit_batch_decode_step_loop(
+            mk, prog, regs,
+            &BatchAbiRegs {
+                scratchpad_batch,
+                hook_ctx: batch_hook_ctx,
+                cb_ptr: batch_cb_ptr,
                 page_table_ptr: batch_pt_ptr,
-                kv_load_mode: mk.graph.kv_load_mode,
                 kv_cache_ptr: batch_kv_ptr,
-                activation_ping_ptr: None,
-                activation_pong_ptr: None,
-            };
-
-            emit_fusion_groups(
-                prog, mk.plan, mk.graph, mk.alloc, &batch_ctx,
-                mk.rope_req.as_ref().map(|r| r.cache_offset),
-                &mut decode_abi, Some(regs.weight_ptr), &batch_resolver, &mk.topology,
-            )?;
-
-            // ARCH-REGALLOC-POST-FORWARD-RELOAD: Reload scratchpad_batch after
-            // batch decode emit_fusion_groups — same reason as the generate loop reload.
-            prog.emit(VmInstr::LoadPtr {
-                dst: scratchpad_batch,
-                src: PtrExpr::StackArg(MEGA_KERNEL_STACK_OFFSETS[1]),
-            });
-
-            // ── Step 3e: Per-seq argmax + stop condition ──
-            // Logits layout: [num_active, mk.vocab_size]. Active seqs are compacted.
-            // We iterate seqs again, maintaining a compact_row counter for active seqs.
-            let compact_row = prog.alloc_vreg(VRegKind::Scalar, SimdWidth::Scalar);
-            prog.emit(VmInstr::GprLoadImm { dst: compact_row, value: 0 });
-            prog.emit_loop(BoundExpr::DynamicVReg(num_seqs_gpr), 1, |prog, seq_ctr, _off| {
-                // ARCH-REGALLOC-POST-FORWARD-RELOAD: Reload scratchpad_batch inside
-                // per-seq sampling loop so the verifier sees a write (LoopCarried pattern).
-                prog.emit(VmInstr::LoadPtr {
-                    dst: scratchpad_batch,
-                    src: PtrExpr::StackArg(MEGA_KERNEL_STACK_OFFSETS[1]),
-                });
-                let byte_off = prog.alloc_vreg(VRegKind::ByteOffset, SimdWidth::Scalar);
-                prog.emit(VmInstr::GprBinOp { dst: byte_off, a: seq_ctr, b: GprOperand::Imm(stride as i64), op: GprOp::Mul });
-
-                // Read active_flag[seq]
-                let flag = prog.alloc_vreg(VRegKind::Scalar, SimdWidth::Scalar);
-                prog.emit(VmInstr::ScalarLoad { dst: flag, base: seq_meta_base, offset: OffsetExpr::Add(Box::new(OffsetExpr::ScalarVReg(byte_off)), Box::new(OffsetExpr::Const(36))) });
-
-                // If inactive, skip all argmax + stop logic
-                prog.emit(VmInstr::GprCondAction {
-                    cond: GprCondition::CmpEq(flag, 0),
-                    action: GprBranchAction::Skip(0), // placeholder — patch after
-                });
-                let skip_start = prog.instrs.len() - 1;
-
-                // ── Per-seq logits row: [compact_row * vocab_bytes] ──
-                let row_off = prog.alloc_vreg(VRegKind::ByteOffset, SimdWidth::Scalar);
-                prog.emit(VmInstr::GprBinOp { dst: row_off, a: compact_row, b: GprOperand::Imm(vb as i64), op: GprOp::Mul });
-                let logits_row_ptr = prog.alloc_vreg(VRegKind::Ptr, SimdWidth::Scalar);
-                prog.emit(VmInstr::LoadPtr { dst: logits_row_ptr, src: PtrExpr::VRegPlusConst(scratchpad_batch, mk.logits_scratch_offset) });
-                prog.emit(VmInstr::GprBinOp { dst: logits_row_ptr, a: logits_row_ptr, b: GprOperand::VReg(row_off), op: GprOp::Add });
-
-                // ── Per-seq sampling: read temperature from sampling_params_ptr + seq * 16 + 0 ──
-                // sampling_params layout: [temp_f32_bits, top_k_u32, top_p_f32_bits, eos_u32] × N
-                let sp_ptr_gpr = prog.alloc_vreg(VRegKind::Ptr, SimdWidth::Scalar);
-                prog.emit(VmInstr::LoadPtr { dst: sp_ptr_gpr, src: PtrExpr::VRegPlusConst(regs.batch_ctx_ptr, 56) });
-                let seq_sp_off = prog.alloc_vreg(VRegKind::ByteOffset, SimdWidth::Scalar);
-                prog.emit(VmInstr::GprBinOp { dst: seq_sp_off, a: seq_ctr, b: GprOperand::Imm(16), op: GprOp::Mul });
-                // Read temperature (sp_ptr + seq_sp_off + 0)
-                let temp_val = prog.alloc_vreg(VRegKind::Scalar, SimdWidth::Scalar);
-                prog.emit(VmInstr::ScalarLoad { dst: temp_val, base: sp_ptr_gpr, offset: OffsetExpr::ScalarVReg(seq_sp_off) });
-
-                // Branch: temperature == 0 → Argmax, temperature > 0 → stochastic
-                // We use Skip-based branching: if temp != 0, skip the Argmax and go to stochastic.
-                // First emit Argmax (greedy path), then stochastic path that overwrites `sampled`.
-
-                let sampled = prog.alloc_vreg(VRegKind::Scalar, SimdWidth::Scalar);
-
-                // If temperature != 0 → skip Argmax, go to stochastic path
-                prog.emit(VmInstr::GprCondAction {
-                    cond: GprCondition::IsNonNull(temp_val),
-                    action: GprBranchAction::Skip(1), // skip the Argmax instruction
-                });
-
-                // Argmax path (temperature == 0)
-                prog.emit(VmInstr::Argmax { dst: sampled, logits_ptr: logits_row_ptr, vocab_bytes: vb, width:  mk.width});
-
-                // After Argmax, skip the entire stochastic section
-                prog.emit(VmInstr::GprCondAction {
-                    cond: GprCondition::IsNonNull(temp_val), // temp != 0 means we came from stochastic, skip this skip
-                    action: GprBranchAction::Skip(0), // placeholder — patched below
-                });
-                let stochastic_skip_patch = prog.instrs.len() - 1;
-
-                // ── Stochastic sampling path (temperature > 0) ──
-                // TemperatureScale: logits[i] /= temperature
-                // temp_val is f32 bits — need a pointer for TemperatureScale
-                let temp_store_ptr = prog.alloc_vreg(VRegKind::Ptr, SimdWidth::Scalar);
-                prog.emit(VmInstr::AddPtr { dst: temp_store_ptr, base: sp_ptr_gpr, offset: 0 }); // point to seq's temp
-                prog.emit(VmInstr::TemperatureScale {
-                    logits_ptr: logits_row_ptr,
-                    temp_ptr: temp_store_ptr,
-                    vocab_bytes: vb,
-                    width: mk.width,
-                });
-
-                // Softmax: reduce-max → exp-sum → normalize
-                let max_val = prog.alloc_vreg(VRegKind::Scalar, SimdWidth::Scalar);
-                prog.emit(VmInstr::SoftmaxReduceMax {
-                    dst: max_val,
-                    logits_ptr: logits_row_ptr,
-                    vocab_bytes: vb,
-                    width: mk.width,
-                });
-                let sum_val = prog.alloc_vreg(VRegKind::Scalar, SimdWidth::Scalar);
-                prog.emit(VmInstr::SoftmaxExpSum {
-                    sum_dst: sum_val,
-                    logits_ptr: logits_row_ptr,
-                    max_val,
-                    vocab_bytes: vb,
-                    width: mk.width,
-                });
-                prog.emit(VmInstr::SoftmaxNormalize {
-                    logits_ptr: logits_row_ptr,
-                    sum_val,
-                    vocab_bytes: vb,
-                    width: mk.width,
-                });
-
-                // Top-K: read top_k from sampling_params + seq_sp_off + 4
-                let top_k_val = prog.alloc_vreg(VRegKind::Scalar, SimdWidth::Scalar);
-                let seq_sp_off_k = prog.alloc_vreg(VRegKind::ByteOffset, SimdWidth::Scalar);
-                prog.emit(VmInstr::GprBinOp { dst: seq_sp_off_k, a: seq_sp_off, b: GprOperand::Imm(4), op: GprOp::Add });
-                prog.emit(VmInstr::ScalarLoad { dst: top_k_val, base: sp_ptr_gpr, offset: OffsetExpr::ScalarVReg(seq_sp_off_k) });
-                // TopK filter needs a ptr to k value — store k to scratch temp, use ptr
-                let k_store_ptr = prog.alloc_vreg(VRegKind::Ptr, SimdWidth::Scalar);
-                let indices_region = mk.logits_scratch_offset + vb;
-                prog.emit(VmInstr::LoadPtr { dst: k_store_ptr, src: PtrExpr::VRegPlusConst(scratchpad_batch, indices_region + vb) });
-                prog.emit(VmInstr::ScalarStore { base: scratchpad_batch, offset: OffsetExpr::Const(indices_region + vb), src: top_k_val });
-                let indices_ptr = prog.alloc_vreg(VRegKind::Ptr, SimdWidth::Scalar);
-                prog.emit(VmInstr::LoadPtr { dst: indices_ptr, src: PtrExpr::VRegPlusConst(scratchpad_batch, indices_region) });
-                prog.emit(VmInstr::SampleTopKFilter {
-                    probs_ptr: logits_row_ptr,
-                    indices_ptr,
-                    k_ptr: k_store_ptr,
-                    vocab_bytes: vb,
-                    width: mk.width,
-                });
-
-                // Top-P: read top_p from sampling_params + seq_sp_off + 8
-                let top_p_val = prog.alloc_vreg(VRegKind::Scalar, SimdWidth::Scalar);
-                let seq_sp_off_p = prog.alloc_vreg(VRegKind::ByteOffset, SimdWidth::Scalar);
-                prog.emit(VmInstr::GprBinOp { dst: seq_sp_off_p, a: seq_sp_off, b: GprOperand::Imm(8), op: GprOp::Add });
-                prog.emit(VmInstr::ScalarLoad { dst: top_p_val, base: sp_ptr_gpr, offset: OffsetExpr::ScalarVReg(seq_sp_off_p) });
-                // Store p to scratch temp, use ptr
-                let p_store_ptr = prog.alloc_vreg(VRegKind::Ptr, SimdWidth::Scalar);
-                prog.emit(VmInstr::LoadPtr { dst: p_store_ptr, src: PtrExpr::VRegPlusConst(scratchpad_batch, indices_region + vb + 4) });
-                prog.emit(VmInstr::ScalarStore { base: scratchpad_batch, offset: OffsetExpr::Const(indices_region + vb + 4), src: top_p_val });
-                prog.emit(VmInstr::SampleTopPFilter {
-                    probs_ptr: logits_row_ptr,
-                    p_ptr: p_store_ptr,
-                    vocab_bytes: vb,
-                    width: mk.width,
-                });
-
-                // Multinomial sampling
-                let rng_state_ptr = prog.alloc_vreg(VRegKind::Ptr, SimdWidth::Scalar);
-                prog.emit(VmInstr::LoadPtr { dst: rng_state_ptr, src: PtrExpr::VRegPlusConst(scratchpad_batch, indices_region + vb + vb) });
-                prog.emit(VmInstr::SampleMultinomial {
-                    dst: sampled,
-                    probs_ptr: logits_row_ptr,
-                    rng_state_ptr,
-                    vocab_bytes: vb,
-                    width: mk.width,
-                });
-
-                // Patch stochastic_skip to jump over entire stochastic section
-                let stochastic_end = prog.instrs.len();
-                let stochastic_instr_count = stochastic_end - stochastic_skip_patch - 1;
-                if let VmInstr::GprCondAction { cond: _, action: GprBranchAction::Skip(ref mut n) } = prog.instrs[stochastic_skip_patch] {
-                    *n = stochastic_instr_count;
-                }
-
-                // ── Write last_sampled_token[seq] = sampled at offset +48 ──
-                prog.emit(VmInstr::ScalarStore { base: seq_meta_base, offset: OffsetExpr::Add(Box::new(OffsetExpr::ScalarVReg(byte_off)), Box::new(OffsetExpr::Const(48))), src: sampled });
-
-                // ── Write sampled token to output_tokens_flat[output_offset + gc] ──
-                // Read output_offset[seq] at offset +52
-                let out_off_val = prog.alloc_vreg(VRegKind::Scalar, SimdWidth::Scalar);
-                prog.emit(VmInstr::ScalarLoad { dst: out_off_val, base: seq_meta_base, offset: OffsetExpr::Add(Box::new(OffsetExpr::ScalarVReg(byte_off)), Box::new(OffsetExpr::Const(52))) });
-
-                // Read gen_count[seq] at offset +44 (BEFORE increment)
-                let gc = prog.alloc_vreg(VRegKind::Scalar, SimdWidth::Scalar);
-                prog.emit(VmInstr::ScalarLoad { dst: gc, base: seq_meta_base, offset: OffsetExpr::Add(Box::new(OffsetExpr::ScalarVReg(byte_off)), Box::new(OffsetExpr::Const(44))) });
-
-                // flat_index = output_offset + gen_count
-                let flat_idx = prog.alloc_vreg(VRegKind::Scalar, SimdWidth::Scalar);
-                prog.emit(VmInstr::GprBinOp { dst: flat_idx, a: out_off_val, b: GprOperand::VReg(gc), op: GprOp::Add });
-                // byte_offset = flat_index * 4
-                let flat_byte = prog.alloc_vreg(VRegKind::ByteOffset, SimdWidth::Scalar);
-                prog.emit(VmInstr::GprBinOp { dst: flat_byte, a: flat_idx, b: GprOperand::Imm(4), op: GprOp::Mul });
-
-                // Read output_tokens_flat_ptr from batch_ctx+24
-                let out_flat_ptr = prog.alloc_vreg(VRegKind::Ptr, SimdWidth::Scalar);
-                prog.emit(VmInstr::LoadPtr { dst: out_flat_ptr, src: PtrExpr::VRegPlusConst(regs.batch_ctx_ptr, 24) });
-                prog.emit(VmInstr::ScalarStore { base: out_flat_ptr, offset: OffsetExpr::ScalarVReg(flat_byte), src: sampled });
-
-                // ── Increment gen_count[seq] at offset +44 ──
-                let gc_plus1 = prog.alloc_vreg(VRegKind::Scalar, SimdWidth::Scalar);
-                prog.emit(VmInstr::GprBinOp { dst: gc_plus1, a: gc, b: GprOperand::Imm(1), op: GprOp::Add });
-                prog.emit(VmInstr::ScalarStore { base: seq_meta_base, offset: OffsetExpr::Add(Box::new(OffsetExpr::ScalarVReg(byte_off)), Box::new(OffsetExpr::Const(44))), src: gc_plus1 });
-
-                // Increment seq_position[seq] at offset +40
-                let sp = prog.alloc_vreg(VRegKind::Scalar, SimdWidth::Scalar);
-                prog.emit(VmInstr::ScalarLoad { dst: sp, base: seq_meta_base, offset: OffsetExpr::Add(Box::new(OffsetExpr::ScalarVReg(byte_off)), Box::new(OffsetExpr::Const(40))) });
-                let sp_plus1 = prog.alloc_vreg(VRegKind::Scalar, SimdWidth::Scalar);
-                prog.emit(VmInstr::GprBinOp { dst: sp_plus1, a: sp, b: GprOperand::Imm(1), op: GprOp::Add });
-                prog.emit(VmInstr::ScalarStore { base: seq_meta_base, offset: OffsetExpr::Add(Box::new(OffsetExpr::ScalarVReg(byte_off)), Box::new(OffsetExpr::Const(40))), src: sp_plus1 });
-
-                // Check stop: gen_count >= max_new_tokens OR sampled == eos
-                // Read max_new_tokens[seq] at offset +12
-                let max_new = prog.alloc_vreg(VRegKind::Scalar, SimdWidth::Scalar);
-                prog.emit(VmInstr::ScalarLoad { dst: max_new, base: seq_meta_base, offset: OffsetExpr::Add(Box::new(OffsetExpr::ScalarVReg(byte_off)), Box::new(OffsetExpr::Const(12))) });
-
-                // Stop condition 1: max_new_tokens > 0 AND gen_count >= max_new_tokens
-                // (max_new_tokens == 0 means no limit)
-                let at_max = prog.alloc_vreg(VRegKind::Scalar, SimdWidth::Scalar);
-                prog.emit(VmInstr::GprBinOp { dst: at_max, a: gc_plus1, b: GprOperand::VReg(max_new), op: GprOp::Sub });
-                // at_max >= 0 means gen_count >= max_new_tokens (unsigned cmp: CmpLtU would check <)
-                // If max_new == 0, skip this check
-                prog.emit(VmInstr::GprCondAction {
-                    cond: GprCondition::IsNonNull(max_new),
-                    action: GprBranchAction::Skip(1),
-                });
-                let _max_skip = prog.instrs.len() - 1;
-                // If gen_count >= max_new_tokens, deactivate. Use: at_max < 0 → still active
-                // at_max is gc_plus1 - max_new. If gc_plus1 >= max_new, at_max >= 0 → stop.
-                // CmpLtU checks at_max < 0, which is always false for unsigned. Hmm.
-                // Use a simpler approach: compare gc_plus1 with max_new directly.
-                // If gc_plus1 >= max_new → CmpLtU(gc_plus1, max_new) is false → skip not taken.
-                // We want: if gc_plus1 >= max_new → deactivate.
-                // We use: skip(deactivate) when gc_plus1 < max_new (still has room)
-                prog.emit(VmInstr::GprCondAction {
-                    cond: GprCondition::CmpLtU(gc_plus1, 0), // placeholder — will patch
-                    action: GprBranchAction::Skip(1),
-                });
-                let max_check_patch = prog.instrs.len() - 1;
-                // We'll handle EOS check first, then patch both stops together.
-
-                // Stop condition 2: sampled == eos (from sampling_params_ptr + seq * 16 + 12)
-                // Read sampling_params_ptr from batch_ctx+56
-                let sp_ptr = prog.alloc_vreg(VRegKind::Ptr, SimdWidth::Scalar);
-                prog.emit(VmInstr::LoadPtr { dst: sp_ptr, src: PtrExpr::VRegPlusConst(regs.batch_ctx_ptr, 56) });
-                // eos for seq = sp_ptr + seq * 16 + 12 (packed: temp,top_k,top_p,eos per seq)
-                let seq_sp_off = prog.alloc_vreg(VRegKind::ByteOffset, SimdWidth::Scalar);
-                prog.emit(VmInstr::GprBinOp { dst: seq_sp_off, a: seq_ctr, b: GprOperand::Imm(16), op: GprOp::Mul });
-                prog.emit(VmInstr::GprBinOp { dst: seq_sp_off, a: seq_sp_off, b: GprOperand::Imm(12), op: GprOp::Add });
-                let eos_val = prog.alloc_vreg(VRegKind::Scalar, SimdWidth::Scalar);
-                prog.emit(VmInstr::ScalarLoad { dst: eos_val, base: sp_ptr, offset: OffsetExpr::ScalarVReg(seq_sp_off) });
-
-                // Compute eos_match = (sampled == eos_val). Use CmpEq for zero comparison.
-                // sampled - eos_val == 0 means match.
-                let eos_diff = prog.alloc_vreg(VRegKind::Scalar, SimdWidth::Scalar);
-                prog.emit(VmInstr::GprBinOp { dst: eos_diff, a: sampled, b: GprOperand::VReg(eos_val), op: GprOp::Sub });
-
-                // Deactivate if: (max_new > 0 AND gen_count >= max_new) OR (sampled == eos)
-                // We write active_flag = 0 for both conditions.
-                // The max_new_tokens stop:
-                //   at_max = gc_plus1 - max_new. If at_max >= 0 (gen >= max) → set flag=0.
-                //   Unsigned: at_max < 0 only possible if at_max is very large (underflow).
-                //   Since both are u32, gc_plus1 >= max_new means no underflow → at_max >= 0.
-                //   So: deactivate when NOT (gc_plus1 < max_new), i.e., when CmpLtU(gc_plus1, max_new) is false.
-                // Patch the max_check placeholder: skip deactivate when gc_plus1 < max_new
-                if let VmInstr::GprCondAction { cond: GprCondition::CmpLtU(ref mut v, _), .. } = prog.instrs[max_check_patch] {
-                    *v = gc_plus1;
-                    // Also need the immediate to be max_new. But CmpLtU takes (VRegId, u64).
-                    // We can't compare two VRegs with CmpLtU. Need a different approach.
-                    // Use the subtraction: at_max = gc_plus1 - max_new.
-                    // at_max >= 0 → gen_count >= max_new → stop.
-                    // Use: BitClear(at_max, 31) — bit 31 clear means non-negative in signed,
-                    // but unsigned doesn't have sign. Hmm.
-                    // Alternative: just use GprCondAction::CmpEq for exact match on a flag.
-                }
-                // Simpler stop: use a combined approach.
-                // Zero the active_flag, then conditionally restore it if both stop conditions are false.
-                let zero_gpr = prog.alloc_vreg(VRegKind::Scalar, SimdWidth::Scalar);
-                prog.emit(VmInstr::GprLoadImm { dst: zero_gpr, value: 0 });
-                let one_gpr = prog.alloc_vreg(VRegKind::Scalar, SimdWidth::Scalar);
-                prog.emit(VmInstr::GprLoadImm { dst: one_gpr, value: 1 });
-
-                // Start by assuming we stop: write flag = 0
-                prog.emit(VmInstr::ScalarStore { base: seq_meta_base, offset: OffsetExpr::Add(Box::new(OffsetExpr::ScalarVReg(byte_off)), Box::new(OffsetExpr::Const(36))), src: zero_gpr });
-
-                // If should continue (gen_count < max_new AND sampled != eos), restore flag = 1.
-                // Condition to continue: at_max >= 0 (gen_count < max_new when max_new > 0) AND eos_diff != 0
-                // Simplification: continue when (max_new == 0 OR gen_count < max_new) AND eos_diff != 0
-                // This is complex with VmInstr. Use two sequential Skip checks:
-                //   If gen_count >= max_new AND max_new > 0 → keep flag=0, skip restore
-                //   If sampled == eos → keep flag=0, skip restore
-                //   Otherwise → restore flag=1
-
-                // Check 1: max_new > 0 AND gen_count >= max_new → keep flag=0
-                // at_max = gc_plus1 - max_new. If max_new == 0, skip this check.
-                // We already emitted at_max above. CmpLtU checks for at_max < huge (unsigned).
-                // For simplicity: if max_new == 0 → skip the max check (max_new=0 means unlimited)
-                prog.emit(VmInstr::GprCondAction {
-                    cond: GprCondition::CmpEq(max_new, 0), // max_new == 0 → unlimited → skip max stop
-                    action: GprBranchAction::Skip(1),
-                });
-                // at_max >= 0 → gen >= max → flag stays 0 → skip the eos check and restore
-                // We need "if at_max < max_new, don't stop". But CmpLtU takes (vreg, imm).
-                // at_max = gc_plus1 - max_new. If at_max is very large (underflow), gen < max.
-                // CmpLtU(at_max, 0x80000000) — if at_max < 2^31, it's positive → gen >= max.
-                // Hmm this is getting too hacky. Let me use a direct comparison.
-                // Actually: we can rewrite as CmpLtU(gc_plus1, max_new_value).
-                // But max_new is in a VReg, not an immediate. CmpLtU takes (VRegId, u64).
-                // We need VReg vs VReg comparison which isn't directly available.
-                // Unsigned-subtraction underflow check: compute stop = 1 if gc_plus1 >= max_new.
-                // at_max = gc_plus1.wrapping_sub(max_new). If no underflow → stop.
-                // In u32: at_max >= 0x80000000 means underflow → gen < max → continue.
-                // CmpLtU(at_max, 0x80000000) = true means no underflow → gen >= max → stop.
-                prog.emit(VmInstr::GprCondAction {
-                    cond: GprCondition::CmpLtU(at_max, 0x8000_0000), // no underflow → gen >= max → stop
-                    action: GprBranchAction::Skip(3), // skip eos check + restore → flag stays 0
-                });
-
-                // Check 2: sampled == eos → flag stays 0
-                prog.emit(VmInstr::GprCondAction {
-                    cond: GprCondition::CmpEq(eos_diff, 0), // sampled == eos
-                    action: GprBranchAction::Skip(1), // skip restore → flag stays 0
-                });
-
-                // Neither stop condition met → restore active_flag = 1
-                prog.emit(VmInstr::ScalarStore { base: seq_meta_base, offset: OffsetExpr::Add(Box::new(OffsetExpr::ScalarVReg(byte_off)), Box::new(OffsetExpr::Const(36))), src: one_gpr });
-
-                // compact_row += 1 (only for active seqs — already past the inactive skip)
-                prog.emit(VmInstr::GprBinOp { dst: compact_row, a: compact_row, b: GprOperand::Imm(1), op: GprOp::Add });
-
-                // Patch the inactive skip count
-                let skip_count = prog.instrs.len() - skip_start - 1;
-                if let VmInstr::GprCondAction { action: GprBranchAction::Skip(ref mut n), .. } = prog.instrs[skip_start] {
-                    *n = skip_count;
-                }
-            });
-
-            // ── Step 3f: Increment total_gen ──
-            prog.emit(VmInstr::GprBinOp { dst: total_gen, a: total_gen, b: GprOperand::Imm(1), op: GprOp::Add });
-
-            // ── Outer decode step loop end ──
-            prog.emit(VmInstr::LoopEnd);
-
-            // Return total number of decode steps completed
-            prog.emit(VmInstr::BreakLoop { return_value: ReturnValue::VReg(total_gen) });
-        } // end if mk.vocab_size > 0
+            },
+            &batch_resolver,
+        )?;
     }
 
 
@@ -2546,6 +1990,688 @@ fn emit_batch_mode_path(
 
 
 
+
+/// ABI register bundle for batch decode step loop (BCE-20260630-MEGA-KERNEL-EMIT-CTX).
+/// Packs VRegIds allocated during batch setup so they cross fn boundaries without >6 params.
+#[derive(Clone, Copy)]
+struct BatchAbiRegs {
+    scratchpad_batch: VRegId,
+    hook_ctx: Option<VRegId>,
+    cb_ptr: Option<VRegId>,
+    page_table_ptr: Option<VRegId>,
+    kv_cache_ptr: Option<VRegId>,
+}
+
+/// Capture bundle for per-seq sampling closure (BCE-20260630-MEGA-KERNEL-EMIT-CTX).
+/// Lifts the emit_loop closure body to a free fn without >6 params.
+struct SeqSamplingCaps<'a> {
+    mk: &'a MkEmitCtx<'a>,
+    regs: &'a MkRegs,
+    scratchpad_batch: VRegId,
+    seq_meta_base: VRegId,
+    compact_row: VRegId,
+    num_seqs_gpr: VRegId,
+    stride: usize,
+    vb: usize,
+}
+
+fn emit_batch_prefill_argmax(
+    mk: &MkEmitCtx,
+    prog: &mut VmProgram,
+    regs: &MkRegs,
+    scratchpad_batch: VRegId,
+    dtype: QuantPrecision,
+) -> Result<(), CompilerError> {
+    // ── iteration setup post: Per-seq argmax on last token of each prompt (BCI-006) ──
+    // Extracted from emit_batch_mode_path (BCE-20260630-MEGA-KERNEL-EMIT-CTX).
+    // Only emit when mk.vocab_size > 0 — no Argmax ops means no logits to sample from.
+    if mk.vocab_size > 0 {
+        let vocab_bytes = mk.vocab_size * dtype.elem_bytes();
+
+        // Read num_seqs from batch_ctx+0
+        let num_seqs_gpr = prog.alloc_vreg(VRegKind::Scalar, SimdWidth::Scalar);
+        prog.emit(VmInstr::ScalarLoad { dst: num_seqs_gpr, base: regs.batch_ctx_ptr, offset: OffsetExpr::Const(0) });
+
+        // Read seq_meta_base from batch_ctx+88 (absolute pointer to per-seq array)
+        let seq_meta_base = prog.alloc_vreg(VRegKind::Ptr, SimdWidth::Scalar);
+        prog.emit(VmInstr::ScalarLoad { dst: seq_meta_base, base: regs.batch_ctx_ptr, offset: OffsetExpr::Const(88) });
+
+        // logits_base = scratchpad + mk.logits_scratch_offset
+        let logits_base_arg = prog.alloc_vreg(VRegKind::Ptr, SimdWidth::Scalar);
+        prog.emit(VmInstr::LoadPtr { dst: logits_base_arg, src: PtrExpr::VRegPlusConst(scratchpad_batch, mk.logits_scratch_offset) });
+
+        // Read output_tokens_flat_ptr from batch_ctx+24
+        let out_tokens_ptr = prog.alloc_vreg(VRegKind::Ptr, SimdWidth::Scalar);
+        prog.emit(VmInstr::LoadPtr { dst: out_tokens_ptr, src: PtrExpr::VRegPlusConst(regs.batch_ctx_ptr, 24) });
+
+        // Read sampling_params_ptr from batch_ctx+56 (for prefill temperature check)
+        let sampling_params_ptr = prog.alloc_vreg(VRegKind::Ptr, SimdWidth::Scalar);
+        prog.emit(VmInstr::LoadPtr { dst: sampling_params_ptr, src: PtrExpr::VRegPlusConst(regs.batch_ctx_ptr, 56) });
+
+        // cumsum accumulator: tracks sum of prompt_lens[0..seq) across iterations
+        let cumsum_acc = prog.alloc_vreg(VRegKind::Scalar, SimdWidth::Scalar);
+        prog.emit(VmInstr::GprLoadImm { dst: cumsum_acc, value: 0 });
+
+        let seq_stride: usize = 64;
+        prog.emit_loop(BoundExpr::DynamicVReg(num_seqs_gpr), 1, |prog, seq_ctr, _seq_off| {
+            // Read prompt_len[seq] = seq_meta_base + seq * stride + 0
+            let prompt_len_gpr = prog.alloc_vreg(VRegKind::Scalar, SimdWidth::Scalar);
+            let seq_byte_off = prog.alloc_vreg(VRegKind::ByteOffset, SimdWidth::Scalar);
+            prog.emit(VmInstr::GprBinOp { dst: seq_byte_off, a: seq_ctr, b: GprOperand::Imm(seq_stride as i64), op: GprOp::Mul });
+            prog.emit(VmInstr::ScalarLoad { dst: prompt_len_gpr, base: seq_meta_base, offset: OffsetExpr::Add(Box::new(OffsetExpr::ScalarVReg(seq_byte_off)), Box::new(OffsetExpr::Const(0))) });
+
+            // Skip if prompt_len == 0 (pure decode, no prefill for this seq)
+            prog.emit(VmInstr::GprCondAction {
+                cond: GprCondition::CmpEq(prompt_len_gpr, 0),
+                action: GprBranchAction::Skip(0), // placeholder, patched below
+            });
+            let skip_patch = prog.instrs.len() - 1;
+
+            // Compute last token row index = cumsum_acc + prompt_len - 1
+            let last_row_idx = prog.alloc_vreg(VRegKind::Scalar, SimdWidth::Scalar);
+            let pl_minus_1 = prog.alloc_vreg(VRegKind::Scalar, SimdWidth::Scalar);
+            prog.emit(VmInstr::GprBinOp { dst: pl_minus_1, a: prompt_len_gpr, b: GprOperand::Imm(1), op: GprOp::Sub });
+            prog.emit(VmInstr::GprBinOp { dst: last_row_idx, a: cumsum_acc, b: GprOperand::VReg(pl_minus_1), op: GprOp::Add });
+
+            // logits_ptr = logits_base + last_row_idx * vocab_bytes
+            let row_byte_off = prog.alloc_vreg(VRegKind::ByteOffset, SimdWidth::Scalar);
+            prog.emit(VmInstr::GprBinOp { dst: row_byte_off, a: last_row_idx, b: GprOperand::Imm(vocab_bytes as i64), op: GprOp::Mul });
+            let logits_ptr = prog.alloc_vreg(VRegKind::Ptr, SimdWidth::Scalar);
+            prog.emit(VmInstr::GprBinOp { dst: logits_ptr, a: logits_base_arg, b: GprOperand::VReg(row_byte_off), op: GprOp::Add });
+
+            // Argmax this row
+            let sampled = prog.alloc_vreg(VRegKind::Scalar, SimdWidth::Scalar);
+            prog.emit(VmInstr::Argmax { dst: sampled, logits_ptr, vocab_bytes, width:  mk.width});
+
+            // Write last_sampled_token[seq] at seq_meta + seq*stride + 48
+            let tok_off = prog.alloc_vreg(VRegKind::ByteOffset, SimdWidth::Scalar);
+            prog.emit(VmInstr::GprBinOp { dst: tok_off, a: seq_ctr, b: GprOperand::Imm(seq_stride as i64), op: GprOp::Mul });
+            prog.emit(VmInstr::GprBinOp { dst: tok_off, a: tok_off, b: GprOperand::Imm(48), op: GprOp::Add });
+            prog.emit(VmInstr::ScalarStore { base: seq_meta_base, offset: OffsetExpr::ScalarVReg(tok_off), src: sampled });
+
+            // Update gen_count[seq] = 1 at offset +44
+            let one_gpr = prog.alloc_vreg(VRegKind::Scalar, SimdWidth::Scalar);
+            prog.emit(VmInstr::GprLoadImm { dst: one_gpr, value: 1 });
+            let gc_off = prog.alloc_vreg(VRegKind::ByteOffset, SimdWidth::Scalar);
+            prog.emit(VmInstr::GprBinOp { dst: gc_off, a: seq_ctr, b: GprOperand::Imm(seq_stride as i64), op: GprOp::Mul });
+            prog.emit(VmInstr::GprBinOp { dst: gc_off, a: gc_off, b: GprOperand::Imm(44), op: GprOp::Add });
+            prog.emit(VmInstr::ScalarStore { base: seq_meta_base, offset: OffsetExpr::ScalarVReg(gc_off), src: one_gpr });
+
+            // Update seq_position[seq] = prompt_len[seq] at offset +40
+            let sp_off = prog.alloc_vreg(VRegKind::ByteOffset, SimdWidth::Scalar);
+            prog.emit(VmInstr::GprBinOp { dst: sp_off, a: seq_ctr, b: GprOperand::Imm(seq_stride as i64), op: GprOp::Mul });
+            prog.emit(VmInstr::GprBinOp { dst: sp_off, a: sp_off, b: GprOperand::Imm(40), op: GprOp::Add });
+            prog.emit(VmInstr::ScalarStore { base: seq_meta_base, offset: OffsetExpr::ScalarVReg(sp_off), src: prompt_len_gpr });
+
+            // Write first generated token to output_tokens_flat[output_offset + prompt_len]
+            // output_offset[seq] at seq_meta +52, write position = output_offset + prompt_len
+            let out_off_gpr = prog.alloc_vreg(VRegKind::Scalar, SimdWidth::Scalar);
+            let oo_byte_off = prog.alloc_vreg(VRegKind::ByteOffset, SimdWidth::Scalar);
+            prog.emit(VmInstr::GprBinOp { dst: oo_byte_off, a: seq_ctr, b: GprOperand::Imm(seq_stride as i64), op: GprOp::Mul });
+            prog.emit(VmInstr::ScalarLoad { dst: out_off_gpr, base: seq_meta_base, offset: OffsetExpr::Add(Box::new(OffsetExpr::ScalarVReg(oo_byte_off)), Box::new(OffsetExpr::Const(52))) });
+            // flat_index = output_offset + prompt_len
+            let flat_idx = prog.alloc_vreg(VRegKind::Scalar, SimdWidth::Scalar);
+            prog.emit(VmInstr::GprBinOp { dst: flat_idx, a: out_off_gpr, b: GprOperand::VReg(prompt_len_gpr), op: GprOp::Add });
+            // byte_offset = flat_idx * 4
+            let flat_byte_off = prog.alloc_vreg(VRegKind::ByteOffset, SimdWidth::Scalar);
+            prog.emit(VmInstr::GprBinOp { dst: flat_byte_off, a: flat_idx, b: GprOperand::Imm(4), op: GprOp::Mul });
+            prog.emit(VmInstr::ScalarStore { base: out_tokens_ptr, offset: OffsetExpr::ScalarVReg(flat_byte_off), src: sampled });
+
+            // Update cumsum_acc += prompt_len for next iteration
+            prog.emit(VmInstr::GprBinOp { dst: cumsum_acc, a: cumsum_acc, b: GprOperand::VReg(prompt_len_gpr), op: GprOp::Add });
+
+            // Patch skip target for prompt_len == 0
+            let skip_count = prog.instrs.len() - skip_patch - 1;
+            if let VmInstr::GprCondAction { action: GprBranchAction::Skip(ref mut n), .. } = prog.instrs[skip_patch] {
+                *n = skip_count;
+            }
+        });
+    } // end if mk.vocab_size > 0 (per-seq argmax)
+    Ok(())
+}
+
+fn emit_batch_per_seq_sampling(
+    prog: &mut VmProgram,
+    seq_ctr: VRegId,
+    _off: VRegId,
+    caps: &SeqSamplingCaps,
+) {
+    use crate::compiler::mega_kernel_abi::MEGA_KERNEL_STACK_OFFSETS;
+    // ── Step 3e: Per-seq argmax + stop condition (extracted from emit_batch_decode_step_loop) ──
+    // BCE-20260630-MEGA-KERNEL-EMIT-CTX: closure body lifted to free fn for long_method compliance.
+    let mk = caps.mk;
+    let regs = caps.regs;
+    let scratchpad_batch = caps.scratchpad_batch;
+    let seq_meta_base = caps.seq_meta_base;
+    let compact_row = caps.compact_row;
+    let num_seqs_gpr = caps.num_seqs_gpr;
+    let stride = caps.stride;
+    let vb = caps.vb;
+    // ARCH-REGALLOC-POST-FORWARD-RELOAD: Reload scratchpad_batch inside
+    // per-seq sampling loop so the verifier sees a write (LoopCarried pattern).
+    prog.emit(VmInstr::LoadPtr {
+        dst: scratchpad_batch,
+        src: PtrExpr::StackArg(MEGA_KERNEL_STACK_OFFSETS[1]),
+    });
+    let byte_off = prog.alloc_vreg(VRegKind::ByteOffset, SimdWidth::Scalar);
+    prog.emit(VmInstr::GprBinOp { dst: byte_off, a: seq_ctr, b: GprOperand::Imm(stride as i64), op: GprOp::Mul });
+
+    // Read active_flag[seq]
+    let flag = prog.alloc_vreg(VRegKind::Scalar, SimdWidth::Scalar);
+    prog.emit(VmInstr::ScalarLoad { dst: flag, base: seq_meta_base, offset: OffsetExpr::Add(Box::new(OffsetExpr::ScalarVReg(byte_off)), Box::new(OffsetExpr::Const(36))) });
+
+    // If inactive, skip all argmax + stop logic
+    prog.emit(VmInstr::GprCondAction {
+        cond: GprCondition::CmpEq(flag, 0),
+        action: GprBranchAction::Skip(0), // placeholder — patch after
+    });
+    let skip_start = prog.instrs.len() - 1;
+
+    // ── Per-seq logits row: [compact_row * vocab_bytes] ──
+    let row_off = prog.alloc_vreg(VRegKind::ByteOffset, SimdWidth::Scalar);
+    prog.emit(VmInstr::GprBinOp { dst: row_off, a: compact_row, b: GprOperand::Imm(vb as i64), op: GprOp::Mul });
+    let logits_row_ptr = prog.alloc_vreg(VRegKind::Ptr, SimdWidth::Scalar);
+    prog.emit(VmInstr::LoadPtr { dst: logits_row_ptr, src: PtrExpr::VRegPlusConst(scratchpad_batch, mk.logits_scratch_offset) });
+    prog.emit(VmInstr::GprBinOp { dst: logits_row_ptr, a: logits_row_ptr, b: GprOperand::VReg(row_off), op: GprOp::Add });
+
+    // ── Per-seq sampling: read temperature from sampling_params_ptr + seq * 16 + 0 ──
+    // sampling_params layout: [temp_f32_bits, top_k_u32, top_p_f32_bits, eos_u32] × N
+    let sp_ptr_gpr = prog.alloc_vreg(VRegKind::Ptr, SimdWidth::Scalar);
+    prog.emit(VmInstr::LoadPtr { dst: sp_ptr_gpr, src: PtrExpr::VRegPlusConst(regs.batch_ctx_ptr, 56) });
+    let seq_sp_off = prog.alloc_vreg(VRegKind::ByteOffset, SimdWidth::Scalar);
+    prog.emit(VmInstr::GprBinOp { dst: seq_sp_off, a: seq_ctr, b: GprOperand::Imm(16), op: GprOp::Mul });
+    // Read temperature (sp_ptr + seq_sp_off + 0)
+    let temp_val = prog.alloc_vreg(VRegKind::Scalar, SimdWidth::Scalar);
+    prog.emit(VmInstr::ScalarLoad { dst: temp_val, base: sp_ptr_gpr, offset: OffsetExpr::ScalarVReg(seq_sp_off) });
+
+    // Branch: temperature == 0 → Argmax, temperature > 0 → stochastic
+    // We use Skip-based branching: if temp != 0, skip the Argmax and go to stochastic.
+    // First emit Argmax (greedy path), then stochastic path that overwrites `sampled`.
+
+    let sampled = prog.alloc_vreg(VRegKind::Scalar, SimdWidth::Scalar);
+
+    // If temperature != 0 → skip Argmax, go to stochastic path
+    prog.emit(VmInstr::GprCondAction {
+        cond: GprCondition::IsNonNull(temp_val),
+        action: GprBranchAction::Skip(1), // skip the Argmax instruction
+    });
+
+    // Argmax path (temperature == 0)
+    prog.emit(VmInstr::Argmax { dst: sampled, logits_ptr: logits_row_ptr, vocab_bytes: vb, width:  mk.width});
+
+    // After Argmax, skip the entire stochastic section
+    prog.emit(VmInstr::GprCondAction {
+        cond: GprCondition::IsNonNull(temp_val), // temp != 0 means we came from stochastic, skip this skip
+        action: GprBranchAction::Skip(0), // placeholder — patched below
+    });
+    let stochastic_skip_patch = prog.instrs.len() - 1;
+
+    // ── Stochastic sampling path (temperature > 0) ──
+    // TemperatureScale: logits[i] /= temperature
+    // temp_val is f32 bits — need a pointer for TemperatureScale
+    let temp_store_ptr = prog.alloc_vreg(VRegKind::Ptr, SimdWidth::Scalar);
+    prog.emit(VmInstr::AddPtr { dst: temp_store_ptr, base: sp_ptr_gpr, offset: 0 }); // point to seq's temp
+    prog.emit(VmInstr::TemperatureScale {
+        logits_ptr: logits_row_ptr,
+        temp_ptr: temp_store_ptr,
+        vocab_bytes: vb,
+        width: mk.width,
+    });
+
+    // Softmax: reduce-max → exp-sum → normalize
+    let max_val = prog.alloc_vreg(VRegKind::Scalar, SimdWidth::Scalar);
+    prog.emit(VmInstr::SoftmaxReduceMax {
+        dst: max_val,
+        logits_ptr: logits_row_ptr,
+        vocab_bytes: vb,
+        width: mk.width,
+    });
+    let sum_val = prog.alloc_vreg(VRegKind::Scalar, SimdWidth::Scalar);
+    prog.emit(VmInstr::SoftmaxExpSum {
+        sum_dst: sum_val,
+        logits_ptr: logits_row_ptr,
+        max_val,
+        vocab_bytes: vb,
+        width: mk.width,
+    });
+    prog.emit(VmInstr::SoftmaxNormalize {
+        logits_ptr: logits_row_ptr,
+        sum_val,
+        vocab_bytes: vb,
+        width: mk.width,
+    });
+
+    // Top-K: read top_k from sampling_params + seq_sp_off + 4
+    let top_k_val = prog.alloc_vreg(VRegKind::Scalar, SimdWidth::Scalar);
+    let seq_sp_off_k = prog.alloc_vreg(VRegKind::ByteOffset, SimdWidth::Scalar);
+    prog.emit(VmInstr::GprBinOp { dst: seq_sp_off_k, a: seq_sp_off, b: GprOperand::Imm(4), op: GprOp::Add });
+    prog.emit(VmInstr::ScalarLoad { dst: top_k_val, base: sp_ptr_gpr, offset: OffsetExpr::ScalarVReg(seq_sp_off_k) });
+    // TopK filter needs a ptr to k value — store k to scratch temp, use ptr
+    let k_store_ptr = prog.alloc_vreg(VRegKind::Ptr, SimdWidth::Scalar);
+    let indices_region = mk.logits_scratch_offset + vb;
+    prog.emit(VmInstr::LoadPtr { dst: k_store_ptr, src: PtrExpr::VRegPlusConst(scratchpad_batch, indices_region + vb) });
+    prog.emit(VmInstr::ScalarStore { base: scratchpad_batch, offset: OffsetExpr::Const(indices_region + vb), src: top_k_val });
+    let indices_ptr = prog.alloc_vreg(VRegKind::Ptr, SimdWidth::Scalar);
+    prog.emit(VmInstr::LoadPtr { dst: indices_ptr, src: PtrExpr::VRegPlusConst(scratchpad_batch, indices_region) });
+    prog.emit(VmInstr::SampleTopKFilter {
+        probs_ptr: logits_row_ptr,
+        indices_ptr,
+        k_ptr: k_store_ptr,
+        vocab_bytes: vb,
+        width: mk.width,
+    });
+
+    // Top-P: read top_p from sampling_params + seq_sp_off + 8
+    let top_p_val = prog.alloc_vreg(VRegKind::Scalar, SimdWidth::Scalar);
+    let seq_sp_off_p = prog.alloc_vreg(VRegKind::ByteOffset, SimdWidth::Scalar);
+    prog.emit(VmInstr::GprBinOp { dst: seq_sp_off_p, a: seq_sp_off, b: GprOperand::Imm(8), op: GprOp::Add });
+    prog.emit(VmInstr::ScalarLoad { dst: top_p_val, base: sp_ptr_gpr, offset: OffsetExpr::ScalarVReg(seq_sp_off_p) });
+    // Store p to scratch temp, use ptr
+    let p_store_ptr = prog.alloc_vreg(VRegKind::Ptr, SimdWidth::Scalar);
+    prog.emit(VmInstr::LoadPtr { dst: p_store_ptr, src: PtrExpr::VRegPlusConst(scratchpad_batch, indices_region + vb + 4) });
+    prog.emit(VmInstr::ScalarStore { base: scratchpad_batch, offset: OffsetExpr::Const(indices_region + vb + 4), src: top_p_val });
+    prog.emit(VmInstr::SampleTopPFilter {
+        probs_ptr: logits_row_ptr,
+        p_ptr: p_store_ptr,
+        vocab_bytes: vb,
+        width: mk.width,
+    });
+
+    // Multinomial sampling
+    let rng_state_ptr = prog.alloc_vreg(VRegKind::Ptr, SimdWidth::Scalar);
+    prog.emit(VmInstr::LoadPtr { dst: rng_state_ptr, src: PtrExpr::VRegPlusConst(scratchpad_batch, indices_region + vb + vb) });
+    prog.emit(VmInstr::SampleMultinomial {
+        dst: sampled,
+        probs_ptr: logits_row_ptr,
+        rng_state_ptr,
+        vocab_bytes: vb,
+        width: mk.width,
+    });
+
+    // Patch stochastic_skip to jump over entire stochastic section
+    let stochastic_end = prog.instrs.len();
+    let stochastic_instr_count = stochastic_end - stochastic_skip_patch - 1;
+    if let VmInstr::GprCondAction { cond: _, action: GprBranchAction::Skip(ref mut n) } = prog.instrs[stochastic_skip_patch] {
+        *n = stochastic_instr_count;
+    }
+
+    // ── Write last_sampled_token[seq] = sampled at offset +48 ──
+    prog.emit(VmInstr::ScalarStore { base: seq_meta_base, offset: OffsetExpr::Add(Box::new(OffsetExpr::ScalarVReg(byte_off)), Box::new(OffsetExpr::Const(48))), src: sampled });
+
+    // ── Write sampled token to output_tokens_flat[output_offset + gc] ──
+    // Read output_offset[seq] at offset +52
+    let out_off_val = prog.alloc_vreg(VRegKind::Scalar, SimdWidth::Scalar);
+    prog.emit(VmInstr::ScalarLoad { dst: out_off_val, base: seq_meta_base, offset: OffsetExpr::Add(Box::new(OffsetExpr::ScalarVReg(byte_off)), Box::new(OffsetExpr::Const(52))) });
+
+    // Read gen_count[seq] at offset +44 (BEFORE increment)
+    let gc = prog.alloc_vreg(VRegKind::Scalar, SimdWidth::Scalar);
+    prog.emit(VmInstr::ScalarLoad { dst: gc, base: seq_meta_base, offset: OffsetExpr::Add(Box::new(OffsetExpr::ScalarVReg(byte_off)), Box::new(OffsetExpr::Const(44))) });
+
+    // flat_index = output_offset + gen_count
+    let flat_idx = prog.alloc_vreg(VRegKind::Scalar, SimdWidth::Scalar);
+    prog.emit(VmInstr::GprBinOp { dst: flat_idx, a: out_off_val, b: GprOperand::VReg(gc), op: GprOp::Add });
+    // byte_offset = flat_index * 4
+    let flat_byte = prog.alloc_vreg(VRegKind::ByteOffset, SimdWidth::Scalar);
+    prog.emit(VmInstr::GprBinOp { dst: flat_byte, a: flat_idx, b: GprOperand::Imm(4), op: GprOp::Mul });
+
+    // Read output_tokens_flat_ptr from batch_ctx+24
+    let out_flat_ptr = prog.alloc_vreg(VRegKind::Ptr, SimdWidth::Scalar);
+    prog.emit(VmInstr::LoadPtr { dst: out_flat_ptr, src: PtrExpr::VRegPlusConst(regs.batch_ctx_ptr, 24) });
+    prog.emit(VmInstr::ScalarStore { base: out_flat_ptr, offset: OffsetExpr::ScalarVReg(flat_byte), src: sampled });
+
+    // ── Increment gen_count[seq] at offset +44 ──
+    let gc_plus1 = prog.alloc_vreg(VRegKind::Scalar, SimdWidth::Scalar);
+    prog.emit(VmInstr::GprBinOp { dst: gc_plus1, a: gc, b: GprOperand::Imm(1), op: GprOp::Add });
+    prog.emit(VmInstr::ScalarStore { base: seq_meta_base, offset: OffsetExpr::Add(Box::new(OffsetExpr::ScalarVReg(byte_off)), Box::new(OffsetExpr::Const(44))), src: gc_plus1 });
+
+    // Increment seq_position[seq] at offset +40
+    let sp = prog.alloc_vreg(VRegKind::Scalar, SimdWidth::Scalar);
+    prog.emit(VmInstr::ScalarLoad { dst: sp, base: seq_meta_base, offset: OffsetExpr::Add(Box::new(OffsetExpr::ScalarVReg(byte_off)), Box::new(OffsetExpr::Const(40))) });
+    let sp_plus1 = prog.alloc_vreg(VRegKind::Scalar, SimdWidth::Scalar);
+    prog.emit(VmInstr::GprBinOp { dst: sp_plus1, a: sp, b: GprOperand::Imm(1), op: GprOp::Add });
+    prog.emit(VmInstr::ScalarStore { base: seq_meta_base, offset: OffsetExpr::Add(Box::new(OffsetExpr::ScalarVReg(byte_off)), Box::new(OffsetExpr::Const(40))), src: sp_plus1 });
+
+    // Check stop: gen_count >= max_new_tokens OR sampled == eos
+    // Read max_new_tokens[seq] at offset +12
+    let max_new = prog.alloc_vreg(VRegKind::Scalar, SimdWidth::Scalar);
+    prog.emit(VmInstr::ScalarLoad { dst: max_new, base: seq_meta_base, offset: OffsetExpr::Add(Box::new(OffsetExpr::ScalarVReg(byte_off)), Box::new(OffsetExpr::Const(12))) });
+
+    // Stop condition 1: max_new_tokens > 0 AND gen_count >= max_new_tokens
+    // (max_new_tokens == 0 means no limit)
+    let at_max = prog.alloc_vreg(VRegKind::Scalar, SimdWidth::Scalar);
+    prog.emit(VmInstr::GprBinOp { dst: at_max, a: gc_plus1, b: GprOperand::VReg(max_new), op: GprOp::Sub });
+    // at_max >= 0 means gen_count >= max_new_tokens (unsigned cmp: CmpLtU would check <)
+    // If max_new == 0, skip this check
+    prog.emit(VmInstr::GprCondAction {
+        cond: GprCondition::IsNonNull(max_new),
+        action: GprBranchAction::Skip(1),
+    });
+    let _max_skip = prog.instrs.len() - 1;
+    // If gen_count >= max_new_tokens, deactivate. Use: at_max < 0 → still active
+    // at_max is gc_plus1 - max_new. If gc_plus1 >= max_new, at_max >= 0 → stop.
+    // CmpLtU checks at_max < 0, which is always false for unsigned. Hmm.
+    // Use a simpler approach: compare gc_plus1 with max_new directly.
+    // If gc_plus1 >= max_new → CmpLtU(gc_plus1, max_new) is false → skip not taken.
+    // We want: if gc_plus1 >= max_new → deactivate.
+    // We use: skip(deactivate) when gc_plus1 < max_new (still has room)
+    prog.emit(VmInstr::GprCondAction {
+        cond: GprCondition::CmpLtU(gc_plus1, 0), // placeholder — will patch
+        action: GprBranchAction::Skip(1),
+    });
+    let max_check_patch = prog.instrs.len() - 1;
+    // We'll handle EOS check first, then patch both stops together.
+
+    // Stop condition 2: sampled == eos (from sampling_params_ptr + seq * 16 + 12)
+    // Read sampling_params_ptr from batch_ctx+56
+    let sp_ptr = prog.alloc_vreg(VRegKind::Ptr, SimdWidth::Scalar);
+    prog.emit(VmInstr::LoadPtr { dst: sp_ptr, src: PtrExpr::VRegPlusConst(regs.batch_ctx_ptr, 56) });
+    // eos for seq = sp_ptr + seq * 16 + 12 (packed: temp,top_k,top_p,eos per seq)
+    let seq_sp_off = prog.alloc_vreg(VRegKind::ByteOffset, SimdWidth::Scalar);
+    prog.emit(VmInstr::GprBinOp { dst: seq_sp_off, a: seq_ctr, b: GprOperand::Imm(16), op: GprOp::Mul });
+    prog.emit(VmInstr::GprBinOp { dst: seq_sp_off, a: seq_sp_off, b: GprOperand::Imm(12), op: GprOp::Add });
+    let eos_val = prog.alloc_vreg(VRegKind::Scalar, SimdWidth::Scalar);
+    prog.emit(VmInstr::ScalarLoad { dst: eos_val, base: sp_ptr, offset: OffsetExpr::ScalarVReg(seq_sp_off) });
+
+    // Compute eos_match = (sampled == eos_val). Use CmpEq for zero comparison.
+    // sampled - eos_val == 0 means match.
+    let eos_diff = prog.alloc_vreg(VRegKind::Scalar, SimdWidth::Scalar);
+    prog.emit(VmInstr::GprBinOp { dst: eos_diff, a: sampled, b: GprOperand::VReg(eos_val), op: GprOp::Sub });
+
+    // Deactivate if: (max_new > 0 AND gen_count >= max_new) OR (sampled == eos)
+    // We write active_flag = 0 for both conditions.
+    // The max_new_tokens stop:
+    //   at_max = gc_plus1 - max_new. If at_max >= 0 (gen >= max) → set flag=0.
+    //   Unsigned: at_max < 0 only possible if at_max is very large (underflow).
+    //   Since both are u32, gc_plus1 >= max_new means no underflow → at_max >= 0.
+    //   So: deactivate when NOT (gc_plus1 < max_new), i.e., when CmpLtU(gc_plus1, max_new) is false.
+    // Patch the max_check placeholder: skip deactivate when gc_plus1 < max_new
+    if let VmInstr::GprCondAction { cond: GprCondition::CmpLtU(ref mut v, _), .. } = prog.instrs[max_check_patch] {
+        *v = gc_plus1;
+        // Also need the immediate to be max_new. But CmpLtU takes (VRegId, u64).
+        // We can't compare two VRegs with CmpLtU. Need a different approach.
+        // Use the subtraction: at_max = gc_plus1 - max_new.
+        // at_max >= 0 → gen_count >= max_new → stop.
+        // Use: BitClear(at_max, 31) — bit 31 clear means non-negative in signed,
+        // but unsigned doesn't have sign. Hmm.
+        // Alternative: just use GprCondAction::CmpEq for exact match on a flag.
+    }
+    // Simpler stop: use a combined approach.
+    // Zero the active_flag, then conditionally restore it if both stop conditions are false.
+    let zero_gpr = prog.alloc_vreg(VRegKind::Scalar, SimdWidth::Scalar);
+    prog.emit(VmInstr::GprLoadImm { dst: zero_gpr, value: 0 });
+    let one_gpr = prog.alloc_vreg(VRegKind::Scalar, SimdWidth::Scalar);
+    prog.emit(VmInstr::GprLoadImm { dst: one_gpr, value: 1 });
+
+    // Start by assuming we stop: write flag = 0
+    prog.emit(VmInstr::ScalarStore { base: seq_meta_base, offset: OffsetExpr::Add(Box::new(OffsetExpr::ScalarVReg(byte_off)), Box::new(OffsetExpr::Const(36))), src: zero_gpr });
+
+    // If should continue (gen_count < max_new AND sampled != eos), restore flag = 1.
+    // Condition to continue: at_max >= 0 (gen_count < max_new when max_new > 0) AND eos_diff != 0
+    // Simplification: continue when (max_new == 0 OR gen_count < max_new) AND eos_diff != 0
+    // This is complex with VmInstr. Use two sequential Skip checks:
+    //   If gen_count >= max_new AND max_new > 0 → keep flag=0, skip restore
+    //   If sampled == eos → keep flag=0, skip restore
+    //   Otherwise → restore flag=1
+
+    // Check 1: max_new > 0 AND gen_count >= max_new → keep flag=0
+    // at_max = gc_plus1 - max_new. If max_new == 0, skip this check.
+    // We already emitted at_max above. CmpLtU checks for at_max < huge (unsigned).
+    // For simplicity: if max_new == 0 → skip the max check (max_new=0 means unlimited)
+    prog.emit(VmInstr::GprCondAction {
+        cond: GprCondition::CmpEq(max_new, 0), // max_new == 0 → unlimited → skip max stop
+        action: GprBranchAction::Skip(1),
+    });
+    // at_max >= 0 → gen >= max → flag stays 0 → skip the eos check and restore
+    // We need "if at_max < max_new, don't stop". But CmpLtU takes (vreg, imm).
+    // at_max = gc_plus1 - max_new. If at_max is very large (underflow), gen < max.
+    // CmpLtU(at_max, 0x80000000) — if at_max < 2^31, it's positive → gen >= max.
+    // Hmm this is getting too hacky. Let me use a direct comparison.
+    // Actually: we can rewrite as CmpLtU(gc_plus1, max_new_value).
+    // But max_new is in a VReg, not an immediate. CmpLtU takes (VRegId, u64).
+    // We need VReg vs VReg comparison which isn't directly available.
+    // Unsigned-subtraction underflow check: compute stop = 1 if gc_plus1 >= max_new.
+    // at_max = gc_plus1.wrapping_sub(max_new). If no underflow → stop.
+    // In u32: at_max >= 0x80000000 means underflow → gen < max → continue.
+    // CmpLtU(at_max, 0x80000000) = true means no underflow → gen >= max → stop.
+    prog.emit(VmInstr::GprCondAction {
+        cond: GprCondition::CmpLtU(at_max, 0x8000_0000), // no underflow → gen >= max → stop
+        action: GprBranchAction::Skip(3), // skip eos check + restore → flag stays 0
+    });
+
+    // Check 2: sampled == eos → flag stays 0
+    prog.emit(VmInstr::GprCondAction {
+        cond: GprCondition::CmpEq(eos_diff, 0), // sampled == eos
+        action: GprBranchAction::Skip(1), // skip restore → flag stays 0
+    });
+
+    // Neither stop condition met → restore active_flag = 1
+    prog.emit(VmInstr::ScalarStore { base: seq_meta_base, offset: OffsetExpr::Add(Box::new(OffsetExpr::ScalarVReg(byte_off)), Box::new(OffsetExpr::Const(36))), src: one_gpr });
+
+    // compact_row += 1 (only for active seqs — already past the inactive skip)
+    prog.emit(VmInstr::GprBinOp { dst: compact_row, a: compact_row, b: GprOperand::Imm(1), op: GprOp::Add });
+
+    // Patch the inactive skip count
+    let skip_count = prog.instrs.len() - skip_start - 1;
+    if let VmInstr::GprCondAction { action: GprBranchAction::Skip(ref mut n), .. } = prog.instrs[skip_start] {
+        *n = skip_count;
+    }
+}
+
+fn emit_batch_decode_step_loop(
+    mk: &MkEmitCtx,
+    prog: &mut VmProgram,
+    regs: &MkRegs,
+    abi_regs: &BatchAbiRegs,
+    resolver: &TensorPtrResolver,
+) -> Result<(), CompilerError> {
+    use crate::compiler::mega_kernel_abi::MEGA_KERNEL_STACK_OFFSETS;
+    // ── input pointer computation: Batch Decode Step Loop (SPEC/20 REQ-BCI-003) ──
+    // Extracted from emit_batch_mode_path (BCE-20260630-MEGA-KERNEL-EMIT-CTX).
+    // Only emit when mk.vocab_size > 0 (has Argmax ops). Without Argmax, no decode/sampling needed.
+    let scratchpad_batch = abi_regs.scratchpad_batch;
+    let batch_hook_ctx = abi_regs.hook_ctx;
+    let batch_cb_ptr = abi_regs.cb_ptr;
+    let batch_pt_ptr = abi_regs.page_table_ptr;
+    let batch_kv_ptr = abi_regs.kv_cache_ptr;
+    let batch_resolver = resolver;
+    // Build batch lowering context (pure struct, no side effects) — mirrors emit_batch_mode_path setup.
+    let batch_session = CompileSession {
+        width: mk.width,
+        sym_map: &mk.sym_map,
+        registry: mk.registry,
+        hook: mk.hook,
+        feature_set: mk.profile.feature_set(),
+        budget: None,
+        page_size: 0,
+        dot_cap: mk.profile.dot_cap,
+        debug_jit: mk.debug_jit,
+        kv_elem_bytes: kv_cache_elem_bytes(mk.graph),
+        virtual_activation: mk.virtual_activation,
+        virtual_tensor_map: mk.virtual_tensor_map,
+        layout: mk.layout,
+        batch_ctx_ptr: Some(regs.batch_ctx_ptr),
+    };
+    let batch_ctx = LoweringContext {
+        session: &batch_session,
+        dtype: graph_dtype(mk.graph),
+        rope_req: mk.rope_req.as_ref(),
+        ple_req: mk.ple_req.as_ref(),
+        dwc_req: mk.dwc_req.as_ref(),
+        exec_pattern: None,
+        bottleneck_map: mk.bottleneck_map,
+        parallelism: Some(ParallelismDesc::SimdVectorize {
+            element_width: mk.width.f32_lanes().max(1),
+            unroll_factor: mk.profile.k_unroll_factor,
+        }),
+    };
+    // ForwardPhaseDispatch decode entry label (must match emit_batch_mode_path dispatch).
+    const DECODE_ENTRY_LABEL: usize = 101;
+    if mk.vocab_size > 0 {
+        // ── ForwardPhaseDispatch decode entry: jump target when total_prefill_tokens == 0 (SPEC 32 REQ-MKO-001) ──
+        prog.emit(VmInstr::MarkLabel { label_id: DECODE_ENTRY_LABEL });
+        let vb = mk.vocab_size * batch_ctx.dtype.elem_bytes();
+        let stride: usize = 64; // SEQ_META_STRIDE
+
+        // Read max_decode_steps from batch_ctx+4
+        let max_steps = prog.alloc_vreg(VRegKind::Scalar, SimdWidth::Scalar);
+        prog.emit(VmInstr::ScalarLoad { dst: max_steps, base: regs.batch_ctx_ptr, offset: OffsetExpr::Const(4) });
+
+        // Decode input buffer: scratchpad region after all existing allocations.
+        let decode_input_offset = {
+            let sampling_end = mk.logits_scratch_offset + vb * 5;
+            let sg_end = mk.sg_detect_scratch_offset
+                .map(|off| {
+                    let hdim = mk.topology.sg_detect_hidden_dim.unwrap_or(0);
+                    (off + hdim * batch_ctx.dtype.elem_bytes() + 63) & !63
+                })
+                .unwrap_or(0);
+            let sgk_end = mk.sg_knowledge_scratch_offset
+                .map(|off| {
+                    let hdim = mk.topology.sg_inject_hidden_dim.unwrap_or(0);
+                    (off + hdim * batch_ctx.dtype.elem_bytes() + 63) & !63
+                })
+                .unwrap_or(0);
+            let base = sampling_end.max(sg_end).max(sgk_end);
+            (base + 63) & !63
+        };
+        let decode_input_ptr = prog.alloc_vreg(VRegKind::Ptr, SimdWidth::Scalar);
+        prog.emit(VmInstr::AddPtr { dst: decode_input_ptr, base: scratchpad_batch, offset: decode_input_offset });
+
+        // Re-read shared batch metadata (defined in per-seq argmax block above, not in scope)
+        let num_seqs_gpr = prog.alloc_vreg(VRegKind::Scalar, SimdWidth::Scalar);
+        prog.emit(VmInstr::ScalarLoad { dst: num_seqs_gpr, base: regs.batch_ctx_ptr, offset: OffsetExpr::Const(0) });
+        let seq_meta_base = prog.alloc_vreg(VRegKind::Ptr, SimdWidth::Scalar);
+        prog.emit(VmInstr::ScalarLoad { dst: seq_meta_base, base: regs.batch_ctx_ptr, offset: OffsetExpr::Const(88) });
+
+        // Persistent GPRs across decode steps
+        let num_active = prog.alloc_vreg(VRegKind::Scalar, SimdWidth::Scalar);
+        let total_gen = prog.alloc_vreg(VRegKind::Scalar, SimdWidth::Scalar);
+        let compact_idx = prog.alloc_vreg(VRegKind::Scalar, SimdWidth::Scalar);
+        prog.emit(VmInstr::GprLoadImm { dst: total_gen, value: 0 });
+
+        // ── Outer decode step loop ──
+        let step_ctr = prog.alloc_vreg(VRegKind::Counter, SimdWidth::Scalar);
+        let step_off = prog.alloc_vreg(VRegKind::ByteOffset, SimdWidth::Scalar);
+        prog.emit(VmInstr::LoopBegin { counter: step_ctr, byte_offset: step_off, bound: BoundExpr::DynamicVReg(max_steps), step_bytes: 4 });
+
+        // ── Step 3a: Count num_active — active_flag is 0 or 1, just accumulate ──
+        prog.emit(VmInstr::GprLoadImm { dst: num_active, value: 0 });
+        prog.emit_loop(BoundExpr::DynamicVReg(num_seqs_gpr), 1, |prog, seq_ctr, _off| {
+            let byte_off = prog.alloc_vreg(VRegKind::ByteOffset, SimdWidth::Scalar);
+            prog.emit(VmInstr::GprBinOp { dst: byte_off, a: seq_ctr, b: GprOperand::Imm(stride as i64), op: GprOp::Mul });
+            let flag = prog.alloc_vreg(VRegKind::Scalar, SimdWidth::Scalar);
+            prog.emit(VmInstr::ScalarLoad { dst: flag, base: seq_meta_base, offset: OffsetExpr::Add(Box::new(OffsetExpr::ScalarVReg(byte_off)), Box::new(OffsetExpr::Const(36))) });
+            // active_flag is 0 or 1 — just add it to num_active (no branch needed)
+            prog.emit(VmInstr::GprBinOp { dst: num_active, a: num_active, b: GprOperand::VReg(flag), op: GprOp::Add });
+        });
+
+        // ── Step 3b: Break if num_active == 0 (IsNonNull → skip BreakLoop when active) ──
+        prog.emit(VmInstr::GprCondAction {
+            cond: GprCondition::IsNonNull(num_active),
+            action: GprBranchAction::Skip(1),
+        });
+        prog.emit(VmInstr::BreakLoop { return_value: ReturnValue::VReg(total_gen) });
+
+        // ── Step 3c: Build compact decode input from last_sampled_token[active seqs] ──
+        prog.emit(VmInstr::GprLoadImm { dst: compact_idx, value: 0 });
+        prog.emit_loop(BoundExpr::DynamicVReg(num_seqs_gpr), 1, |prog, seq_ctr, _off| {
+            let byte_off = prog.alloc_vreg(VRegKind::ByteOffset, SimdWidth::Scalar);
+            prog.emit(VmInstr::GprBinOp { dst: byte_off, a: seq_ctr, b: GprOperand::Imm(stride as i64), op: GprOp::Mul });
+
+            // Read active_flag[seq]
+            let flag = prog.alloc_vreg(VRegKind::Scalar, SimdWidth::Scalar);
+            prog.emit(VmInstr::ScalarLoad { dst: flag, base: seq_meta_base, offset: OffsetExpr::Add(Box::new(OffsetExpr::ScalarVReg(byte_off)), Box::new(OffsetExpr::Const(36))) });
+
+            // If inactive (flag == 0), skip the copy + increment (3 instructions)
+            prog.emit(VmInstr::GprCondAction {
+                cond: GprCondition::CmpEq(flag, 0),
+                action: GprBranchAction::Skip(3),
+            });
+            let skip_patch = prog.instrs.len() - 1;
+
+            // Read last_sampled_token[seq] at offset +48
+            let token = prog.alloc_vreg(VRegKind::Scalar, SimdWidth::Scalar);
+            prog.emit(VmInstr::ScalarLoad { dst: token, base: seq_meta_base, offset: OffsetExpr::Add(Box::new(OffsetExpr::ScalarVReg(byte_off)), Box::new(OffsetExpr::Const(48))) });
+
+            // Store to decode_input[compact_idx]
+            let dst_off = prog.alloc_vreg(VRegKind::ByteOffset, SimdWidth::Scalar);
+            prog.emit(VmInstr::GprBinOp { dst: dst_off, a: compact_idx, b: GprOperand::Imm(4), op: GprOp::Mul });
+            prog.emit(VmInstr::ScalarStore { base: decode_input_ptr, offset: OffsetExpr::ScalarVReg(dst_off), src: token });
+
+            // compact_idx += 1
+            prog.emit(VmInstr::GprBinOp { dst: compact_idx, a: compact_idx, b: GprOperand::Imm(1), op: GprOp::Add });
+
+            // Patch: the Skip count should be 4 (token load + store offset + store + increment)
+            // But wait: GprCondAction is already counted. Instructions AFTER GprCondAction that
+            // should be skipped = token load(1) + dst_off(2) + store(3) + increment(4) = 4.
+            let actual_skip = prog.instrs.len() - skip_patch - 1;
+            if let VmInstr::GprCondAction { action: GprBranchAction::Skip(ref mut n), .. } = prog.instrs[skip_patch] {
+                *n = actual_skip;
+            }
+        });
+
+        // ── Step 3d: Forward pass with M = num_active ──
+        // Build decode AbiPtrs: same weights/scratch/output, but input = decode_input, M = num_active.
+        // output always from scratchpad + mk.logits_scratch_offset.
+        let decode_output_ptr = prog.alloc_vreg(VRegKind::Ptr, SimdWidth::Scalar);
+        prog.emit(VmInstr::LoadPtr { dst: decode_output_ptr, src: PtrExpr::VRegPlusConst(scratchpad_batch, mk.logits_scratch_offset) });
+
+        let mut decode_abi = AbiPtrs {
+            input_ptr: decode_input_ptr,
+            weight_ptr: Some(regs.weight_ptr),
+            output_ptr: decode_output_ptr,
+            scratch_ptr: if mk.needs_scratch { Some(scratchpad_batch) } else { None },
+            gen_loop_counter: None,
+            layer_loop_counter: None,
+            mega_decode_seq_len: Some(num_active), // M = num_active
+            hook_ctx_ptr: batch_hook_ctx,
+            sg_detect_scratch_offset: mk.sg_detect_scratch_offset,
+            sg_knowledge_scratch_offset: mk.sg_knowledge_scratch_offset,
+            callback_table_ptr: batch_cb_ptr,
+            page_table_ptr: batch_pt_ptr,
+            kv_load_mode: mk.graph.kv_load_mode,
+            kv_cache_ptr: batch_kv_ptr,
+            activation_ping_ptr: None,
+            activation_pong_ptr: None,
+        };
+
+        emit_fusion_groups(
+            prog, mk.plan, mk.graph, mk.alloc, &batch_ctx,
+            mk.rope_req.as_ref().map(|r| r.cache_offset),
+            &mut decode_abi, Some(regs.weight_ptr), &batch_resolver, &mk.topology,
+        )?;
+
+        // ARCH-REGALLOC-POST-FORWARD-RELOAD: Reload scratchpad_batch after
+        // batch decode emit_fusion_groups — same reason as the generate loop reload.
+        prog.emit(VmInstr::LoadPtr {
+            dst: scratchpad_batch,
+            src: PtrExpr::StackArg(MEGA_KERNEL_STACK_OFFSETS[1]),
+        });
+
+        // ── Step 3e: Per-seq argmax + stop condition ──
+        // Logits layout: [num_active, mk.vocab_size]. Active seqs are compacted.
+        // We iterate seqs again, maintaining a compact_row counter for active seqs.
+        let compact_row = prog.alloc_vreg(VRegKind::Scalar, SimdWidth::Scalar);
+        prog.emit(VmInstr::GprLoadImm { dst: compact_row, value: 0 });
+        let _sampling_caps = SeqSamplingCaps {
+            mk, regs, scratchpad_batch, seq_meta_base,
+            compact_row, num_seqs_gpr, stride, vb,
+        };
+        prog.emit_loop(BoundExpr::DynamicVReg(num_seqs_gpr), 1, |prog, seq_ctr, _off| {
+            emit_batch_per_seq_sampling(prog, seq_ctr, _off, &_sampling_caps);
+        });
+
+        // ── Step 3f: Increment total_gen ──
+        prog.emit(VmInstr::GprBinOp { dst: total_gen, a: total_gen, b: GprOperand::Imm(1), op: GprOp::Add });
+
+        // ── Outer decode step loop end ──
+        prog.emit(VmInstr::LoopEnd);
+
+        // Return total number of decode steps completed
+        prog.emit(VmInstr::BreakLoop { return_value: ReturnValue::VReg(total_gen) });
+    } // end if mk.vocab_size > 0
+    Ok(())
+}
 
 /// Emit MTP candidate token generation (采样管线内).
 ///
