@@ -30,14 +30,140 @@ pub(crate) fn lower_op(
     abi: &AbiPtrs,
 ) -> Result<bool, CompilerError> {
     // Op 必填，直接读缓存（add_op 时已翻译）。clone 保持原 match-by-value 模式。
+    // Op 必填，直接读缓存（add_op 时已翻译）。clone 保持原 match-by-value 模式。
     let op_resolved = op.op.clone();
 
+    // ── BCE-20260630-LOWER-OP: 按 Op 族查表化分派（每个 handler ≤500 行，圈复杂度 ≤10）
+    if let Some(r) = lower_op_normlike(prog, op, graph, ctx, resolver, abi, &op_resolved)? { return Ok(r); }
+    if let Some(r) = lower_op_gemm(prog, op, graph, ctx, resolver, abi, &op_resolved)? { return Ok(r); }
+    if let Some(r) = lower_op_attention(prog, op, graph, ctx, resolver, abi, &op_resolved)? { return Ok(r); }
+    if let Some(r) = lower_op_rope(prog, op, graph, ctx, resolver, abi, &op_resolved)? { return Ok(r); }
+    if let Some(r) = lower_op_moe(prog, op, graph, ctx, resolver, abi, &op_resolved)? { return Ok(r); }
+    if let Some(r) = lower_op_altup(prog, op, graph, ctx, resolver, abi, &op_resolved)? { return Ok(r); }
+    if let Some(r) = lower_op_gather(prog, op, graph, ctx, resolver, abi, &op_resolved)? { return Ok(r); }
+    if let Some(r) = lower_op_generation(prog, op, graph, ctx, resolver, abi, &op_resolved)? { return Ok(r); }
+    if let Some(r) = lower_op_hook(prog, op, graph, ctx, resolver, abi, &op_resolved)? { return Ok(r); }
+    if let Some(r) = lower_op_vision(prog, op, graph, ctx, resolver, abi, &op_resolved)? { return Ok(r); }
+    if let Some(r) = lower_op_meta(prog, op, graph, ctx, resolver, abi, &op_resolved)? { return Ok(r); }
+    Ok(false) // 无需 lower_op 的 ops（trace-lookup 最优）
+}
+
+
+fn lower_op_normlike(prog: &mut VmProgram, op: &CompilerOp, graph: &CompilerGraph, ctx: &LoweringContext, resolver: &TensorPtrResolver, abi: &AbiPtrs, op_resolved: &Op) -> Result<Option<bool>, CompilerError> {
+    // Clone to preserve by-value match semantics (struct fields bind by value, matching original lower_op).
+    let op_resolved = op_resolved.clone();
     match op_resolved {
-        Op::RmsNorm(ref spec) => lower_norm_v2(prog, op, graph, ctx, resolver, abi, spec, NormKind::RmsNorm),
-        Op::LayerNorm(ref spec) => lower_norm_v2(prog, op, graph, ctx, resolver, abi, spec, NormKind::LayerNorm),
-        Op::ValueNorm(ref spec) => lower_norm_v2(prog, op, graph, ctx, resolver, abi, spec, NormKind::ValueNorm),
+        Op::RmsNorm(ref spec) => Ok(Some(lower_norm_v2(prog, op, graph, ctx, resolver, abi, spec, NormKind::RmsNorm)?)),
+        Op::LayerNorm(ref spec) => Ok(Some(lower_norm_v2(prog, op, graph, ctx, resolver, abi, spec, NormKind::LayerNorm)?)),
+        Op::ValueNorm(ref spec) => Ok(Some(lower_norm_v2(prog, op, graph, ctx, resolver, abi, spec, NormKind::ValueNorm)?)),
+        Op::HeadRmsNorm { head_dim, eps, dtype } => {
+            let spec = NormSpec { feature_dim: head_dim, eps, dtype, has_weight: true };
+            Ok(Some(lower_norm_v2(prog, op, graph, ctx, resolver, abi, &spec, NormKind::HeadRmsNorm)?))
+        }
+        Op::QkNorm { head_dim, eps } => {
+            if head_dim == 0 {
+                return Err(CompilerError::CodegenViolation("QkNorm: head_dim must be > 0".into()));
+            }
+            let out_tid = op.outputs.first().copied().ok_or_else(|| CompilerError::CodegenViolation(
+                format!("QkNorm op {:?}: 无输出张量", op.id)))?;
+            let out_tensor = graph.tensor(out_tid).ok_or_else(|| CompilerError::CodegenViolation(
+                format!("QkNorm op {:?}: 输出张量不存在", op.id)))?;
+            let total_concrete: usize = out_tensor.shape.iter()
+                .filter(|d| !d.is_symbolic()).map(|d| d.as_concrete().unwrap_or(1)).product();
+            if total_concrete % head_dim != 0 {
+                return Err(CompilerError::CodegenViolation(format!(
+                    "QkNorm op {:?}: total concrete elems {} not divisible by head_dim {}",
+                    op.id, total_concrete, head_dim)));
+            }
+            let num_heads = total_concrete / head_dim;
+            let outer_seq = out_tensor.shape.first().cloned().unwrap_or(SymDim::Concrete(1));
+            let width = ctx.session.width;
+            let sym_map = ctx.session.sym_map;
+            let seq_bound = if abi.mega_decode_seq_len.is_some() {
+                BoundExpr::Const(1)
+            } else {
+                resolve_sym_dim(&outer_seq, abi, sym_map)
+            };
+            let input_ptr = resolver.materialize(prog, op.inputs[0], abi).unwrap_or_else(|| prog.alloc_vreg(VRegKind::Ptr, width));
+            let weight_ptr = resolver.materialize(prog, op.inputs[1], abi).unwrap_or_else(|| prog.alloc_vreg(VRegKind::Ptr, width));
+            let weight_dtype = graph.tensor(op.inputs[1]).map(|t| t.dtype.to_quant_precision()).unwrap_or(ctx.dtype);
+            let output_ptr = resolver.materialize(prog, op.outputs[0], abi)
+                .ok_or_else(|| CompilerError::CodegenViolation(format!("QkNorm op {:?}: 无输出指针", op.id)))?;
+            let pattern = build_norm_pattern_qk(eps, head_dim)?;
+            emit_normlike_inline(
+                prog, &pattern, head_dim, num_heads,
+                /*broadcast_weight=*/false, NormKind::ValueNorm,
+                width, seq_bound, input_ptr, weight_ptr, output_ptr,
+                ctx.dtype, weight_dtype,
+            )?;
+            Ok(Some(true))
+        }
+        Op::L2Normalize { hidden } => {
+            let width = ctx.session.width;
+            let sym_map = ctx.session.sym_map;
+            let seq_bound = abi.mega_decode_seq_len.map(BoundExpr::DynamicVReg)
+                .unwrap_or(BoundExpr::Const(1));
+            let input_ptr = resolver.materialize(prog, op.inputs[0], abi).unwrap_or_else(|| prog.alloc_vreg(VRegKind::Ptr, width));
+            let weight_ptr = resolver.materialize(prog, op.inputs[1], abi).unwrap_or_else(|| prog.alloc_vreg(VRegKind::Ptr, width));
+            let weight_dtype = graph.tensor(op.inputs[1]).map(|t| t.dtype.to_quant_precision()).unwrap_or(ctx.dtype);
+            let output_ptr = resolver.materialize(prog, op.outputs[0], abi)
+                .ok_or_else(|| CompilerError::CodegenViolation(format!("L2Normalize op {:?}: 无输出指针", op.id)))?;
+            let key = ScalarOpRegistry::key_from_op(&op.op);
+            let op_trace = ctx.session.registry.and_then(|r| r.get_trace(&key));
+            let pattern = op_trace.map(|t| t.pattern.clone())
+                .ok_or_else(|| CompilerError::CodegenViolation("L2Normalize: 无 registry trace".into()))?;
+            emit_normlike_inline(
+                prog, &pattern, hidden, 1, false, NormKind::ValueNorm,
+                width, seq_bound, input_ptr, weight_ptr, output_ptr,
+                ctx.dtype, weight_dtype,
+            )?;
+            Ok(Some(true))
+        }
+        Op::Softmax => {
+            let width = ctx.session.width;
+            let (_out_shape, feature_dim) = infer_output_shape_sym(op, graph)?;
+            let input_ptr = resolver.materialize(prog, op.inputs[0], abi).unwrap_or_else(|| prog.alloc_vreg(VRegKind::Ptr, width));
+            let output_ptr = resolver.materialize(prog, op.outputs[0], abi)
+                .ok_or_else(|| CompilerError::CodegenViolation(format!("Softmax op {:?}: 无输出指针", op.id)))?;
+            let (max_val, sum_val) = emit_softmax_inline(
+                prog, feature_dim, width, input_ptr, output_ptr, ctx.dtype,
+            )?;
+            if graph.telemetry.softmax_sharpness {
+                if let Some(expr) = ctx.session.sym_map.resolve("telemetry") {
+                    let tel_ptr = prog.alloc_vreg(VRegKind::Ptr, SimdWidth::Scalar);
+                    prog.emit(VmInstr::LoadPtr { dst: tel_ptr, src: expr.clone() });
+                    emit_softmax_telemetry(prog, max_val, sum_val, tel_ptr, width, ctx.dtype);
+                }
+            }
+            Ok(Some(true))
+        }
+        Op::MeanPool { seq_len: _, hidden: _, cls_mode: _ } => {
+            let width = ctx.session.width;
+            let sym_map = ctx.session.sym_map;
+            let seq_bound_override: Option<BoundExpr> = abi.mega_decode_seq_len.map(BoundExpr::DynamicVReg);
+            let input_ptr = resolver.materialize(prog, op.inputs[0], abi).unwrap_or_else(|| prog.alloc_vreg(VRegKind::Ptr, width));
+            let output_ptr = resolver.materialize(prog, op.outputs[0], abi)
+                .ok_or_else(|| CompilerError::CodegenViolation(format!("MeanPool op {:?}: 无输出指针", op.id)))?;
+            let key = ScalarOpRegistry::key_from_op(&op.op);
+            let op_trace = ctx.session.registry.and_then(|r| r.get_trace(&key));
+            let trace = op_trace
+                .ok_or_else(|| CompilerError::CodegenViolation("MeanPool: 无 registry trace".into()))?;
+            try_dispatch_reduction(
+                prog, op, graph, &trace.pattern, ctx,
+                input_ptr, output_ptr, seq_bound_override.as_ref(),
+            )?;
+            Ok(Some(true))
+        }
+        _ => Ok(None),
+    }
+}
+
+fn lower_op_gemm(prog: &mut VmProgram, op: &CompilerOp, graph: &CompilerGraph, ctx: &LoweringContext, resolver: &TensorPtrResolver, abi: &AbiPtrs, op_resolved: &Op) -> Result<Option<bool>, CompilerError> {
+    // Clone to preserve by-value match semantics (struct fields bind by value, matching original lower_op).
+    let op_resolved = op_resolved.clone();
+    match op_resolved {
         Op::Gemm(ref spec) | Op::GemmBias(ref spec) => {
-            lower_gemm_v2(prog, op, graph, ctx, resolver, abi, spec)
+            Ok(Some(lower_gemm_v2(prog, op, graph, ctx, resolver, abi, spec)?))
         }
         Op::QuantGemm(ref spec) => {
             let m_bound = if abi.mega_decode_seq_len.is_some() {
@@ -56,278 +182,121 @@ pub(crate) fn lower_op(
             })?;
             super::moe_quant_emit::emit_quant_gemm_inline(prog, m_bound, spec.n, spec.k, spec.quant_type,
                 ctx.session.width, a_ptr, b_ptr, c_ptr, ctx.dtype, ctx.session.dot_cap)?;
-            Ok(true)
+            Ok(Some(true))
         }
-        Op::Residual => {
-            let (out_shape, feature_dim) = infer_output_shape_sym(op, graph)?;
-            let in_ptr = resolver.materialize(prog, op.inputs[0], abi).ok_or_else(|| {
-                CompilerError::CodegenViolation(format!("Residual op {:?}: input 无法 materialize", op.id))
+        Op::MlaKvCompress { ref m, d_c, hidden } => {
+            let input_ptr = resolver.materialize(prog, op.inputs[0], abi).ok_or_else(|| {
+                CompilerError::CodegenViolation(format!("MlaKvCompress op {:?}: input 无法 materialize", op.id))
             })?;
-            let w_ptr = op.inputs.get(1).copied()
+            let weight_ptr = op.inputs.get(1).copied()
                 .and_then(|tid| resolver.materialize(prog, tid, abi))
-                .unwrap_or(in_ptr);
-            let out_ptr = resolver.materialize(prog, op.outputs[0], abi).ok_or_else(|| {
-                CompilerError::CodegenViolation(format!("Residual op {:?}: output 无法 materialize", op.id))
-            })?;
-            let telemetry_ptr = if graph.telemetry.residual_cosine_sim {
-                ctx.session.sym_map.resolve("telemetry").map(|expr| {
-                    let ptr_vreg = prog.alloc_vreg(VRegKind::Ptr, SimdWidth::Scalar);
-                    prog.emit(VmInstr::LoadPtr { dst: ptr_vreg, src: expr.clone() });
-                    ptr_vreg
-                })
-            } else {
-                None
-            };
-            super::telemetry_emit::emit_residual_with_telemetry(
-                prog, &out_shape, feature_dim, ctx.session.width,
-                in_ptr, w_ptr, out_ptr, ctx.session.sym_map, telemetry_ptr,
-                None, ctx.dtype,
-            )?;
-            Ok(true)
-        }
-        Op::Argmax { vocab_size } => {
-            let logits_ptr = resolver.materialize(prog, op.inputs[0], abi).ok_or_else(|| {
-                CompilerError::CodegenViolation(format!("Argmax op {:?}: logits 无法 materialize", op.id))
-            })?;
-            let argmax_dst = prog.alloc_vreg(VRegKind::Scalar, SimdWidth::Scalar);
-            let vocab_bytes = vocab_size * ctx.dtype.elem_bytes();
-            prog.emit(VmInstr::Argmax {
-                dst: argmax_dst, logits_ptr, vocab_bytes, width: ctx.session.width,
-            });
-            let out_ptr = resolver.materialize(prog, op.outputs[0], abi).ok_or_else(|| {
-                CompilerError::CodegenViolation(format!("Argmax op {:?}: output 无法 materialize", op.id))
-            })?;
-            prog.emit(VmInstr::ScalarStore {
-                base: out_ptr, src: argmax_dst, offset: OffsetExpr::Const(0),
-            });
-            Ok(true)
-        }
-        Op::GuardrailCheck { probe_offset } => {
-            let scratch = match abi.scratch_ptr {
-                Some(v) => v, None => return Ok(true),
-            };
-            let input_ptr = resolver.materialize(prog, op.inputs[0], abi).ok_or_else(|| {
-                CompilerError::CodegenViolation(format!("GuardrailCheck op {:?}: input 无法 materialize", op.id))
-            })?;
-            super::structural_builder::StructuralOpBuilder::emit_conditional_guard(
-                prog, scratch, probe_offset, input_ptr,
-            )?;
-            Ok(true)
-        }
-        Op::CotStepCheck { shared_mem_offset } => {
-            let scratch = match abi.scratch_ptr {
-                Some(v) => v, None => return Ok(true),
-            };
-            let input_ptr = resolver.materialize(prog, op.inputs[0], abi).ok_or_else(|| {
-                CompilerError::CodegenViolation(format!("CotStepCheck op {:?}: input 无法 materialize", op.id))
-            })?;
-            super::structural_builder::StructuralOpBuilder::emit_conditional_guard(
-                prog, scratch, shared_mem_offset, input_ptr,
-            )?;
-            Ok(true)
-        }
-        Op::WriteLogits { ref target_indices } => {
-            let input_ptr = resolver.materialize(prog, op.inputs[0], abi).ok_or_else(|| {
-                CompilerError::CodegenViolation(format!("WriteLogits op {:?}: input 无法 materialize", op.id))
-            })?;
+                .ok_or_else(|| CompilerError::CodegenViolation(
+                    format!("MlaKvCompress op {:?}: weight 无法 materialize", op.id)))?;
             let output_ptr = resolver.materialize(prog, op.outputs[0], abi).ok_or_else(|| {
-                CompilerError::CodegenViolation(format!("WriteLogits op {:?}: output 无法 materialize", op.id))
+                CompilerError::CodegenViolation(format!("MlaKvCompress op {:?}: output 无法 materialize", op.id))
             })?;
-            super::structural_builder::StructuralOpBuilder::emit_scalar_writeback(
-                prog, input_ptr, output_ptr, target_indices,
-            )?;
-            Ok(true)
-        }
-        Op::EarlyExit { anchor_layer } => {
-            let layer_ctr = abi.layer_loop_counter.ok_or_else(|| CompilerError::CodegenViolation(
-                "EarlyExit: layer_loop_counter is None".into()))?;
-            let input_ptr = resolver.materialize(prog, op.inputs[0], abi).ok_or_else(|| {
-                CompilerError::CodegenViolation(format!("EarlyExit op {:?}: input 无法 materialize", op.id))
-            })?;
-            prog.emit(VmInstr::GprCondAction {
-                cond: GprCondition::CmpEq(layer_ctr, anchor_layer as u64),
-                action: GprBranchAction::Exit(input_ptr),
-            });
-            Ok(true)
-        }
-        Op::ScaleConst { value } => {
-            let input_ptr = resolver.materialize(prog, op.inputs[0], abi).ok_or_else(|| {
-                CompilerError::CodegenViolation(format!("ScaleConst op {:?}: input 无法 materialize", op.id))
-            })?;
-            let output_ptr = resolver.materialize(prog, op.outputs[0], abi).ok_or_else(|| {
-                CompilerError::CodegenViolation(format!("ScaleConst op {:?}: output 无法 materialize", op.id))
-            })?;
-            let out_tid = op.outputs[0];
-            let out_tensor = graph.tensor(out_tid)
-                .ok_or_else(|| CompilerError::CodegenViolation("ScaleConst: no output tensor".into()))?;
-            let seq_dim = out_tensor.shape.iter().find(|d| d.is_symbolic()).cloned();
-            let feature_dim: usize = out_tensor.shape.iter()
-                .filter(|d| !d.is_symbolic())
-                .map(|d| d.as_concrete().unwrap_or(1))
-                .product::<usize>()
-                .max(1);
-            let width = ctx.session.width.f32_lanes();
-            let elem_bytes = ctx.dtype.elem_bytes();
-            let num_vec = (feature_dim + width - 1) / width;
-            let row_bytes = feature_dim * elem_bytes;
-            let const_bc = prog.alloc_vreg(VRegKind::Vec, ctx.session.width);
-            prog.emit(VmInstr::Broadcast {
-                dst: const_bc,
-                src: ScalarExpr::Const(value),
-                width: ctx.session.width,
-                dtype: ctx.dtype,
-            });
-            if let Some(sym_dim) = seq_dim {
-                let seq_bound = ctx.session.sym_map.to_bound(&sym_dim);
-                prog.emit_loop_try(seq_bound, row_bytes, |prog, _ctr, seq_off| {
-                    for v in 0..num_vec {
-                        let off = v * width * elem_bytes;
-                        let off_expr = OffsetExpr::Add(
-                            Box::new(OffsetExpr::LoopOffset(seq_off)),
-                            Box::new(OffsetExpr::Const(off)),
-                        );
-                        let data = prog.alloc_vreg(VRegKind::Vec, ctx.session.width);
-                        prog.emit(VmInstr::VecLoad {
-                            dst: data, base: input_ptr, offset: off_expr.clone(),
-                            width: ctx.session.width, dtype: ctx.dtype, predicate: None,
-                        });
-                        let scaled = prog.alloc_vreg(VRegKind::Vec, ctx.session.width);
-                        prog.emit(VmInstr::VecBinOp {
-                            dst: scaled, a: data, b: const_bc,
-                            op: VecOp::Mul, dtype: ctx.dtype,
-                        });
-                        prog.emit(VmInstr::VecStore {
-                            base: output_ptr, offset: off_expr, src: scaled,
-                            width: ctx.session.width, dtype: ctx.dtype, predicate: None,
-                        });
-                    }
-                    Ok::<_, CompilerError>(())
-                })?;
+            let m_bound = if abi.mega_decode_seq_len.is_some() {
+                BoundExpr::Const(1)
             } else {
-                for v in 0..num_vec {
-                    let off = v * width * elem_bytes;
-                    let off_expr = OffsetExpr::Const(off);
-                    let data = prog.alloc_vreg(VRegKind::Vec, ctx.session.width);
-                    prog.emit(VmInstr::VecLoad {
-                        dst: data, base: input_ptr, offset: off_expr.clone(),
-                        width: ctx.session.width, dtype: ctx.dtype, predicate: None,
-                    });
-                    let scaled = prog.alloc_vreg(VRegKind::Vec, ctx.session.width);
-                    prog.emit(VmInstr::VecBinOp {
-                        dst: scaled, a: data, b: const_bc,
-                        op: VecOp::Mul, dtype: ctx.dtype,
-                    });
-                    prog.emit(VmInstr::VecStore {
-                        base: output_ptr, offset: off_expr, src: scaled,
-                        width: ctx.session.width, dtype: ctx.dtype, predicate: None,
-                    });
+                resolve_sym_dim(m, abi, ctx.session.sym_map)
+            };
+            emit_gemm_inline_with_hook(prog, m, d_c, hidden, ctx,
+                input_ptr, weight_ptr, output_ptr,
+                Some(&m_bound), Some(op.id), None, false,
+                ctx.dtype, ctx.dtype, ctx.dtype)?;
+            Ok(Some(true))
+        }
+        Op::MlaQAbsorb { ref seq_len, num_heads, head_dim, d_c } => {
+            let input_ptr = resolver.materialize(prog, op.inputs[0], abi).ok_or_else(|| {
+                CompilerError::CodegenViolation(format!("MlaQAbsorb op {:?}: input 无法 materialize", op.id))
+            })?;
+            let weight_ptr = op.inputs.get(1).copied()
+                .and_then(|tid| resolver.materialize(prog, tid, abi))
+                .ok_or_else(|| CompilerError::CodegenViolation(
+                    format!("MlaQAbsorb op {:?}: weight 无法 materialize", op.id)))?;
+            let output_ptr = resolver.materialize(prog, op.outputs[0], abi).ok_or_else(|| {
+                CompilerError::CodegenViolation(format!("MlaQAbsorb op {:?}: output 无法 materialize", op.id))
+            })?;
+            let m_for_gemm = if abi.mega_decode_seq_len.is_some() {
+                SymDim::Concrete(num_heads)
+            } else { seq_len.clone() };
+            emit_gemm_inline_with_hook(prog, &m_for_gemm, d_c, head_dim, ctx,
+                input_ptr, weight_ptr, output_ptr, None, Some(op.id), None, true,
+                ctx.dtype, ctx.dtype, ctx.dtype)?;
+            Ok(Some(true))
+        }
+        Op::MlaVRestore { ref seq_len, num_heads, head_dim, d_c } => {
+            let input_ptr = resolver.materialize(prog, op.inputs[0], abi).ok_or_else(|| {
+                CompilerError::CodegenViolation(format!("MlaVRestore op {:?}: input 无法 materialize", op.id))
+            })?;
+            let weight_ptr = op.inputs.get(1).copied()
+                .and_then(|tid| resolver.materialize(prog, tid, abi))
+                .ok_or_else(|| CompilerError::CodegenViolation(
+                    format!("MlaVRestore op {:?}: weight 无法 materialize", op.id)))?;
+            let output_ptr = resolver.materialize(prog, op.outputs[0], abi).ok_or_else(|| {
+                CompilerError::CodegenViolation(format!("MlaVRestore op {:?}: output 无法 materialize", op.id))
+            })?;
+            let m_for_gemm = if abi.mega_decode_seq_len.is_some() {
+                SymDim::Concrete(num_heads)
+            } else { seq_len.clone() };
+            emit_gemm_inline_with_hook(prog, &m_for_gemm, head_dim, d_c, ctx,
+                input_ptr, weight_ptr, output_ptr, None, Some(op.id), None, false,
+                ctx.dtype, ctx.dtype, ctx.dtype)?;
+            Ok(Some(true))
+        }
+        _ => Ok(None),
+    }
+}
+
+fn lower_op_attention(prog: &mut VmProgram, op: &CompilerOp, graph: &CompilerGraph, ctx: &LoweringContext, resolver: &TensorPtrResolver, abi: &AbiPtrs, op_resolved: &Op) -> Result<Option<bool>, CompilerError> {
+    // Clone to preserve by-value match semantics (struct fields bind by value, matching original lower_op).
+    let op_resolved = op_resolved.clone();
+    match op_resolved {
+        Op::MultiHeadAttention(ref spec) => Ok(Some(lower_attention_v2(prog, op, graph, ctx, resolver, abi, spec)?)),
+        // NOP variants — 元数据 op，不生成 VmInstr
+        Op::MlaAttention(ref spec) => {
+            let q_absorbed_ptr = resolver.materialize(prog, op.inputs[0], abi).ok_or_else(|| {
+                CompilerError::CodegenViolation(format!("MlaAttention op {:?}: q_absorbed 无法 materialize", op.id))
+            })?;
+            let kv_cache_ptr = op.inputs.get(1).copied()
+                .and_then(|tid| resolver.materialize(prog, tid, abi))
+                .ok_or_else(|| CompilerError::CodegenViolation(
+                    format!("MlaAttention op {:?}: kv_cache 无法 materialize", op.id)))?;
+            let w_uv_ptr = op.inputs.get(2).copied()
+                .and_then(|tid| resolver.materialize(prog, tid, abi))
+                .ok_or_else(|| CompilerError::CodegenViolation(
+                    format!("MlaAttention op {:?}: w_uv 无法 materialize", op.id)))?;
+            let output_ptr = resolver.materialize(prog, op.outputs[0], abi).ok_or_else(|| {
+                CompilerError::CodegenViolation(format!("MlaAttention op {:?}: output 无法 materialize", op.id))
+            })?;
+            let kv_len_vreg = prog.alloc_vreg(VRegKind::Scalar, SimdWidth::Scalar);
+            if let Some(gen_ctr) = abi.gen_loop_counter {
+                prog.emit(VmInstr::GprBinOp { dst: kv_len_vreg, a: gen_ctr, b: GprOperand::Imm(1), op: GprOp::Add });
+            } else {
+                let seq_val = resolve_sym_dim(&spec.seq_len, abi, ctx.session.sym_map);
+                match seq_val {
+                    BoundExpr::Const(c) => { prog.emit(VmInstr::GprLoadImm { dst: kv_len_vreg, value: c }); },
+                    BoundExpr::DynamicVReg(vr) => {
+                        prog.emit(VmInstr::GprBinOp { dst: kv_len_vreg, a: vr, b: GprOperand::Imm(1), op: GprOp::Add });
+                    },
+                    _ => return Err(CompilerError::CodegenViolation("MlaAttention: unsupported seq_len bound".into())),
                 }
             }
-            Ok(true)
-        }
-        Op::SessionKvRestore => {
-            let out_tid = op.outputs.first().ok_or_else(|| CompilerError::CodegenViolation(
-                "SessionKvRestore: no output tensor".into()))?;
-            let out_shape = &graph.tensor(*out_tid).unwrap().shape;
-            let feature_dim: usize = out_shape.iter().filter_map(|d| d.as_concrete()).sum();
-            let elem_b = ctx.dtype.elem_bytes();
-            let width = ctx.session.width;
-            let step = width.f32_lanes() * elem_b;
-            let iters = (feature_dim * elem_b + step - 1) / step;
-            let input_ptr = resolver.materialize(prog, op.inputs[0], abi).ok_or_else(|| {
-                CompilerError::CodegenViolation(format!("SessionKvRestore op {:?}: input 无法 materialize", op.id))
-            })?;
-            let output_ptr = resolver.materialize(prog, *out_tid, abi).ok_or_else(|| {
-                CompilerError::CodegenViolation(format!("SessionKvRestore op {:?}: output 无法 materialize", op.id))
-            })?;
-            let ctr = prog.alloc_vreg(VRegKind::Counter, SimdWidth::Scalar);
-            let byte_off = prog.alloc_vreg(VRegKind::ByteOffset, SimdWidth::Scalar);
-            prog.emit(VmInstr::LoopBegin {
-                counter: ctr, byte_offset: byte_off,
-                bound: BoundExpr::Const(iters), step_bytes: step,
-            });
-            let vec = prog.alloc_vreg(VRegKind::Vec, width);
-            prog.emit(VmInstr::VecLoad {
-                dst: vec, base: input_ptr,
-                offset: OffsetExpr::LoopOffset(byte_off), width, dtype: ctx.dtype, predicate: None,
-            });
-            prog.emit(VmInstr::VecStore {
-                base: output_ptr, src: vec,
-                offset: OffsetExpr::LoopOffset(byte_off), width, dtype: ctx.dtype, predicate: None,
-            });
-            prog.emit(VmInstr::LoopEnd);
-            Ok(true)
-        }
-        Op::ColumnSlice { seq_len, input_inner, start, slice_dim } => {
-            let input_ptr = resolver.materialize(prog, op.inputs[0], abi).ok_or_else(|| {
-                CompilerError::CodegenViolation(format!("ColumnSlice op {:?}: input 无法 materialize", op.id))
-            })?;
-            let output_ptr = resolver.materialize(prog, op.outputs[0], abi).ok_or_else(|| {
-                CompilerError::CodegenViolation(format!("ColumnSlice op {:?}: output 无法 materialize", op.id))
-            })?;
-            let seq_bound = resolve_sym_dim(&seq_len, abi, ctx.session.sym_map);
-            super::structural_emit::emit_column_slice_inline(
-                prog, seq_bound, input_inner, start, slice_dim,
-                ctx.session.width, input_ptr, output_ptr, ctx.dtype,
+            super::mla_emit::emit_mla_attn_score_inline(
+                prog, spec.num_heads, spec.head_dim, spec.d_c, spec.d_rope,
+                &[q_absorbed_ptr, kv_cache_ptr, w_uv_ptr, output_ptr],
+                kv_len_vreg, ctx.session.width, ctx.dtype,
             )?;
-            Ok(true)
+            Ok(Some(true))
         }
-        Op::Gather { table_rows: _, embed_dim, ref index_dim, ref indices_kind, scale } => {
-            let input_ptr = resolver.materialize(prog, op.inputs[0], abi).ok_or_else(|| {
-                CompilerError::CodegenViolation(format!("Gather op {:?}: input 无法 materialize", op.id))
-            })?;
-            let weight_src = op.inputs.get(1).copied().and_then(|tid| resolver.source(tid));
-            let weight_ptr = op.inputs.get(1).copied()
-                .and_then(|tid| resolver.materialize(prog, tid, abi))
-                .unwrap_or(input_ptr);
-            let output_ptr = resolver.materialize(prog, op.outputs[0], abi).ok_or_else(|| {
-                CompilerError::CodegenViolation(format!("Gather op {:?}: output 无法 materialize", op.id))
-            })?;
-            let seq_bound = if abi.mega_decode_seq_len.is_some() {
-                BoundExpr::Const(1)
-            } else {
-                resolve_sym_dim(index_dim, abi, ctx.session.sym_map)
-            };
-            let telemetry_ptr = if graph.telemetry.embed_l2_norm {
-                ctx.session.sym_map.resolve("telemetry").map(|expr| {
-                    let ptr_vreg = prog.alloc_vreg(VRegKind::Ptr, SimdWidth::Scalar);
-                    prog.emit(VmInstr::LoadPtr { dst: ptr_vreg, src: expr.clone() });
-                    ptr_vreg
-                })
-            } else { None };
-            let weight_dtype = op.inputs.get(1)
-                .and_then(|&tid| graph.tensor(tid))
-                .map(|t| t.dtype.to_quant_precision())
-                .unwrap_or(ctx.dtype);
-            super::structural_emit::emit_gather_inline(
-                prog, seq_bound, embed_dim, ctx.session.width,
-                input_ptr, weight_ptr, output_ptr, telemetry_ptr, scale,
-                indices_kind.clone(), ctx.dtype, weight_dtype,
-            )?;
-            Ok(true)
-        }
-        Op::QuantGather { vocab_size, hidden_dim, ref index_dim, quant_type, scale } => {
-            let input_ptr = resolver.materialize(prog, op.inputs[0], abi).ok_or_else(|| {
-                CompilerError::CodegenViolation(format!("QuantGather op {:?}: input 无法 materialize", op.id))
-            })?;
-            let weight_ptr = op.inputs.get(1).copied()
-                .and_then(|tid| resolver.materialize(prog, tid, abi))
-                .unwrap_or(input_ptr);
-            let output_ptr = resolver.materialize(prog, op.outputs[0], abi).ok_or_else(|| {
-                CompilerError::CodegenViolation(format!("QuantGather op {:?}: output 无法 materialize", op.id))
-            })?;
-            let seq_bound = if abi.mega_decode_seq_len.is_some() {
-                BoundExpr::Const(1)
-            } else {
-                resolve_sym_dim(index_dim, abi, ctx.session.sym_map)
-            };
-            super::quant_gather_emit::emit_quant_gather_inline(
-                prog, seq_bound, vocab_size, hidden_dim, quant_type,
-                ctx.session.width, input_ptr, weight_ptr, output_ptr,
-                ctx.dtype, scale,
-            )?;
-            Ok(true)
-        }
+        _ => Ok(None),
+    }
+}
+
+fn lower_op_rope(prog: &mut VmProgram, op: &CompilerOp, graph: &CompilerGraph, ctx: &LoweringContext, resolver: &TensorPtrResolver, abi: &AbiPtrs, op_resolved: &Op) -> Result<Option<bool>, CompilerError> {
+    // Clone to preserve by-value match semantics (struct fields bind by value, matching original lower_op).
+    let op_resolved = op_resolved.clone();
+    match op_resolved {
         Op::RoPE(ref spec) => {
             // rope_cache_offset 从 ctx.rope_req 获取（op-level 自描述替代外部参数）
             let rope_req = ctx.rope_req.ok_or_else(|| CompilerError::CodegenViolation(
@@ -364,171 +333,66 @@ pub(crate) fn lower_op(
                 input_ptr, output_ptr, cos_sin_offset, ctx.session.sym_map,
                 ctx.dtype, rope_pos_offset,
             )?;
-            Ok(true)
+            Ok(Some(true))
         }
-        Op::MultiHeadAttention(ref spec) => lower_attention_v2(prog, op, graph, ctx, resolver, abi, spec),
-        // NOP variants — 元数据 op，不生成 VmInstr
-        Op::Transpose { .. } | Op::Reshape { .. } | Op::SliceView { .. } => Ok(true),
-
-        // Generation control flow — 从 Op 路由，逻辑等价（unit 变体，无 Spec 参数）
-        Op::StoreToken => {
-            let token_ptr = resolver.materialize(prog, op.inputs[0], abi).ok_or_else(|| {
-                CompilerError::CodegenViolation(format!(
-                    "StoreToken op {:?}: token tensor 无法 materialize", op.id))
-            })?;
-            let counter = abi.gen_loop_counter.ok_or_else(|| {
-                CompilerError::CodegenViolation("StoreToken: gen_loop_counter is None".into())
-            })?;
-            let output_tokens_ptr = prog.alloc_vreg(VRegKind::Ptr, SimdWidth::Scalar);
-            prog.emit(VmInstr::LoadPtr {
-                dst: output_tokens_ptr,
-                src: ctx.session.sym_map.resolve("output_tokens_ptr").cloned().unwrap(),
-            });
-            let input_ids_ptr = prog.alloc_vreg(VRegKind::Ptr, SimdWidth::Scalar);
-            prog.emit(VmInstr::LoadPtr {
-                dst: input_ids_ptr,
-                src: ctx.session.sym_map.resolve("prompt_len").cloned().unwrap(),
-            });
-            let prompt_len_bytes = prog.alloc_vreg(VRegKind::Ptr, SimdWidth::Scalar);
-            prog.emit(VmInstr::LoadPtr {
-                dst: prompt_len_bytes,
-                src: ctx.session.sym_map.resolve("scratchpad").cloned().unwrap(),
-            });
-            prog.emit(VmInstr::StoreToken {
-                token_id: token_ptr, output_buf: output_tokens_ptr,
-                counter, input_ids_ptr, prompt_len_bytes,
-            });
-            Ok(true)
-        }
-        Op::CheckStopCondition => {
-            let token_ptr = resolver.materialize(prog, op.inputs[0], abi).ok_or_else(|| {
-                CompilerError::CodegenViolation(format!(
-                    "CheckStopCondition op {:?}: token tensor 无法 materialize", op.id))
-            })?;
-            let counter = abi.gen_loop_counter.ok_or_else(|| {
-                CompilerError::CodegenViolation("CheckStopCondition: gen_loop_counter is None".into())
-            })?;
-            let eos_ptr = prog.alloc_vreg(VRegKind::Ptr, SimdWidth::Scalar);
-            prog.emit(VmInstr::LoadPtr {
-                dst: eos_ptr,
-                src: ctx.session.sym_map.resolve("eos_token_id").cloned().unwrap(),
-            });
-            let max_tokens_ptr = prog.alloc_vreg(VRegKind::Ptr, SimdWidth::Scalar);
-            prog.emit(VmInstr::LoadPtr {
-                dst: max_tokens_ptr,
-                src: ctx.session.sym_map.resolve("max_new_tokens").cloned().unwrap(),
-            });
-            prog.emit(VmInstr::CheckStopCondition {
-                token_id: token_ptr, counter, eos_ptr, max_tokens_ptr,
-            });
-            Ok(true)
-        }
-        Op::SgInject { knowledge_offset: _, dim } => {
-            let sg_base = abi.hook_ctx_ptr.ok_or_else(|| CompilerError::CodegenViolation(
-                "SgInject: hook_ctx_ptr is None".into()))?;
-            let input_ptr = resolver.materialize(prog, op.inputs[0], abi).ok_or_else(|| {
-                CompilerError::CodegenViolation(format!("SgInject op {:?}: input 无法 materialize", op.id))
-            })?;
-            super::structural_builder::StructuralOpBuilder::emit_simd_injection(
-                prog, input_ptr, sg_base,
-                12, 16 + dim * 4, dim, ctx.session.width, ctx.dtype,
-            )?;
-            Ok(true)
-        }
-        Op::SgDetect { detect_offset: _, hidden_dim } => {
-            let sg_base = abi.hook_ctx_ptr.ok_or_else(|| CompilerError::CodegenViolation(
-                "SgDetect: hook_ctx_ptr is None".into()))?;
-            let input_ptr = resolver.materialize(prog, op.inputs[0], abi).ok_or_else(|| {
-                CompilerError::CodegenViolation(format!("SgDetect op {:?}: input 无法 materialize", op.id))
-            })?;
-            let detect_ptr = prog.alloc_vreg(VRegKind::Ptr, SimdWidth::Scalar);
-            prog.emit(VmInstr::LoadPtr {
-                dst: detect_ptr, src: PtrExpr::VRegPlusConst(sg_base, 16),
-            });
-            super::structural_builder::StructuralOpBuilder::emit_side_channel_copy(
-                prog, input_ptr, detect_ptr, 0, hidden_dim, ctx.session.width, ctx.dtype,
-            )?;
-            if abi.callback_table_ptr.is_some() {
-                let cb_table = prog.alloc_vreg(VRegKind::Ptr, SimdWidth::Scalar);
-                prog.emit(VmInstr::LoadPtr {
-                    dst: cb_table,
-                    src: ctx.session.sym_map.resolve("callback_table_ptr").cloned().expect("ABI: callback_table_ptr"),
-                });
-                prog.emit(VmInstr::GprCondAction { cond: GprCondition::IsNull(cb_table), action: GprBranchAction::Skip(4) });
-                let fn_ptr = prog.alloc_vreg(VRegKind::Ptr, SimdWidth::Scalar);
-                let ctx_ptr = prog.alloc_vreg(VRegKind::Ptr, SimdWidth::Scalar);
-                prog.emit(VmInstr::LoadCallbackEntry { table_ptr: cb_table, slot_id: 0, fn_ptr_out: fn_ptr, ctx_out: ctx_ptr });
-                prog.emit(VmInstr::MemFence { order: crate::compiler::codegen::vm::instr::MemFenceOrder::Release });
-                let ret_val = prog.alloc_vreg(VRegKind::Scalar, SimdWidth::Scalar);
-                prog.emit(VmInstr::NativeCall { ret_val, fn_ptr, ctx_ptr });
-                prog.emit(VmInstr::MemFence { order: crate::compiler::codegen::vm::instr::MemFenceOrder::Acquire });
-            }
-            Ok(true)
-        }
-        Op::QTapSTG { sink_ptr, step_index_ptr, dtype, ref q_dim, position, num_slots } => {
-            let q_ptr = resolver.materialize(prog, op.inputs[0], abi).ok_or_else(|| {
-                CompilerError::CodegenViolation(format!("QTapSTG op {:?}: Q tensor 无法 materialize", op.id))
-            })?;
-            let q_dim_concrete = match q_dim {
-                SymDim::Concrete(v) => *v,
-                SymDim::Symbolic { max_value, .. } => max_value.ok_or_else(|| {
-                    CompilerError::CodegenViolation(format!("QTapSTG op {:?}: q_dim Symbolic 无 max_value", op.id))
-                })?,
+        Op::DualRoPE(ref spec) => {
+            let rope_req = ctx.rope_req.ok_or_else(|| CompilerError::CodegenViolation(
+                format!("DualRoPE op {:?}: ctx.rope_req 未配置", op.id)))?;
+            let base_offset = rope_req.cache_offset;
+            let (sliding_cos_offset, global_cos_offset) = if let Some(ref sec) = rope_req.secondary_cache {
+                (base_offset, sec.cache_offset)
+            } else {
+                return Err(CompilerError::CodegenViolation(
+                    "DualRoPE: requires RopeCacheRequirement with secondary_cache".into()));
             };
-            let q_tensor = graph.tensor(op.inputs[0]).ok_or_else(|| CompilerError::CodegenViolation(
-                format!("QTapSTG op {:?}: Q tensor 不存在", op.id)))?;
-            let seq_dim = q_tensor.shape.iter().find(|d| d.is_symbolic()).cloned()
-                .or_else(|| q_tensor.shape.first().cloned())
-                .ok_or_else(|| CompilerError::CodegenViolation(format!("QTapSTG op {:?}: Q shape 为空", op.id)))?;
+            let out_tid = op.outputs.first().copied().ok_or_else(|| CompilerError::CodegenViolation(
+                format!("DualRoPE op {:?}: 无输出张量", op.id)))?;
+            let out_tensor = graph.tensor(out_tid).ok_or_else(|| CompilerError::CodegenViolation(
+                format!("DualRoPE op {:?}: 输出张量不存在", op.id)))?;
+            let seq_dim = out_tensor.shape.iter().find(|d| d.is_symbolic()).cloned()
+                .or_else(|| out_tensor.shape.first().cloned())
+                .ok_or_else(|| CompilerError::CodegenViolation(format!("DualRoPE op {:?}: shape 为空", op.id)))?;
             let seq_bound = resolve_sym_dim(&seq_dim, abi, ctx.session.sym_map);
-            super::lower::lower_qtap_stg(
-                prog, sink_ptr, step_index_ptr, dtype,
-                q_dim_concrete, seq_bound, position, num_slots, ctx.session.width, q_ptr,
-            )?;
-            Ok(true)
-        }
-        Op::DepthwiseConv1D { channels, kernel_size, causal } => {
-            let req = ctx.dwc_req.ok_or_else(|| CompilerError::CodegenViolation(
-                format!("DepthwiseConv1D op {:?}: ctx.dwc_req 未配置", op.id)))?;
-            if req.channels != channels || req.kernel_size != kernel_size || req.causal != causal {
-                return Err(CompilerError::CodegenViolation(format!(
-                    "DepthwiseConv1D: 签名与 dwc_req 不一致")));
-            }
-            // BCE-20260630-MIXED-P5 (三段式 dtype): input=x(激活)→op_input_dtype, weight=conv kernel→inputs[1].dtype
-            let input_dtype = op_input_dtype(op, graph);
-            let weight_dtype = op.inputs.get(1)
-                .and_then(|&tid| graph.tensor(tid))
-                .map(|t| t.dtype.to_quant_precision())
-                .unwrap_or(input_dtype);
-            super::vision_audio_emit::lower_depthwise_conv1d(
-                prog, op, graph, ctx.session.width, channels, kernel_size, causal,
-                ctx.session.sym_map, resolver, abi, req, input_dtype, weight_dtype,
-            )?;
-            Ok(true)
-        }
-        Op::PatchEmbed { patch_size, embed_dim, in_channels, image_size } => {
-            let image_ptr = resolver.materialize(prog, op.inputs[0], abi).ok_or_else(|| {
-                CompilerError::CodegenViolation(format!("PatchEmbed op {:?}: image 无法 materialize", op.id))
+            let input_ptr = resolver.materialize(prog, op.inputs[0], abi).ok_or_else(|| {
+                CompilerError::CodegenViolation(format!("DualRoPE op {:?}: input 无法 materialize", op.id))
             })?;
-            let kernel_ptr = op.inputs.get(1).copied()
-                .and_then(|tid| resolver.materialize(prog, tid, abi))
-                .ok_or_else(|| CompilerError::CodegenViolation(
-                    format!("PatchEmbed op {:?}: kernel 无法 materialize", op.id)))?;
-            let patches_ptr = resolver.materialize(prog, op.outputs[0], abi).ok_or_else(|| {
-                CompilerError::CodegenViolation(format!("PatchEmbed op {:?}: output 无法 materialize", op.id))
+            let output_ptr = resolver.materialize(prog, out_tid, abi).ok_or_else(|| {
+                CompilerError::CodegenViolation(format!("DualRoPE op {:?}: output 无法 materialize", op.id))
             })?;
-            // BCE-20260630-MIXED-P5 (三段式 dtype): input=image(激活)→op_input_dtype, weight=vision kernel→inputs[1].dtype
-            let input_dtype = op_input_dtype(op, graph);
-            let weight_dtype = op.inputs.get(1)
-                .and_then(|&tid| graph.tensor(tid))
-                .map(|t| t.dtype.to_quant_precision())
-                .unwrap_or(input_dtype);
-            super::vision_audio_emit::lower_patch_embed(
-                prog, patch_size, embed_dim, in_channels, image_size,
-                image_ptr, kernel_ptr, patches_ptr, input_dtype, weight_dtype,
-            )?;
-            Ok(true)
+            let width = ctx.session.width;
+            let (rope_seq_bound, rope_pos_offset) = if let Some(gen_ctr) = abi.gen_loop_counter {
+                (BoundExpr::Const(1), Some(gen_ctr))
+            } else { (seq_bound, None) };
+            let layer_ctr = abi.layer_loop_counter.ok_or_else(|| CompilerError::CodegenViolation(
+                "DualRoPE: layer_loop_counter is None".into()))?;
+            let label_global = prog.alloc_label();
+            let label_end = prog.alloc_label();
+            let temp_add = prog.alloc_vreg(VRegKind::Scalar, SimdWidth::Scalar);
+            prog.emit(VmInstr::GprBinOp { dst: temp_add, a: layer_ctr, b: GprOperand::Imm(spec.layer_offset as i64), op: GprOp::Add });
+            let quotient = prog.alloc_vreg(VRegKind::Scalar, SimdWidth::Scalar);
+            prog.emit(VmInstr::GprBinOp { dst: quotient, a: temp_add, b: GprOperand::Imm(spec.layer_divisor as i64), op: GprOp::Div });
+            let product = prog.alloc_vreg(VRegKind::Scalar, SimdWidth::Scalar);
+            prog.emit(VmInstr::GprBinOp { dst: product, a: quotient, b: GprOperand::Imm(spec.layer_divisor as i64), op: GprOp::Mul });
+            let remainder = prog.alloc_vreg(VRegKind::Scalar, SimdWidth::Scalar);
+            prog.emit(VmInstr::GprBinOp { dst: remainder, a: temp_add, b: GprOperand::VReg(product), op: GprOp::Sub });
+            prog.emit(VmInstr::GprCondAction { cond: GprCondition::CmpEq(remainder, spec.layer_remainder as u64), action: GprBranchAction::JumpToLabel(label_global) });
+            super::structural_emit::emit_rope_inline(prog, rope_seq_bound.clone(), spec.num_heads, spec.head_dim,
+                spec.sliding_partial, width, input_ptr, output_ptr, sliding_cos_offset, ctx.session.sym_map, ctx.dtype, rope_pos_offset)?;
+            prog.emit(VmInstr::GprCondAction { cond: GprCondition::IsNonNull(layer_ctr), action: GprBranchAction::JumpToLabel(label_end) });
+            prog.emit(VmInstr::MarkLabel { label_id: label_global });
+            super::structural_emit::emit_rope_inline(prog, rope_seq_bound, spec.num_heads, spec.head_dim,
+                spec.global_partial, width, input_ptr, output_ptr, global_cos_offset, ctx.session.sym_map, ctx.dtype, rope_pos_offset)?;
+            prog.emit(VmInstr::MarkLabel { label_id: label_end });
+            Ok(Some(true))
         }
+        _ => Ok(None),
+    }
+}
+
+fn lower_op_moe(prog: &mut VmProgram, op: &CompilerOp, graph: &CompilerGraph, ctx: &LoweringContext, resolver: &TensorPtrResolver, abi: &AbiPtrs, op_resolved: &Op) -> Result<Option<bool>, CompilerError> {
+    // Clone to preserve by-value match semantics (struct fields bind by value, matching original lower_op).
+    let op_resolved = op_resolved.clone();
+    match op_resolved {
         Op::MoEGate { seq_len: _, num_experts, hidden: _, top_k } => {
             let input_ptr = resolver.materialize(prog, op.inputs[0], abi).ok_or_else(|| {
                 CompilerError::CodegenViolation(format!("MoEGate op {:?}: input 无法 materialize", op.id))
@@ -550,8 +414,74 @@ pub(crate) fn lower_op(
                 prog, num_experts, top_k, ctx.session.width,
                 input_ptr, output_ptr, ctx.session.hook, telemetry_ptr, ctx.dtype,
             )?;
-            Ok(true)
+            Ok(Some(true))
         }
+        Op::MoERouter { num_experts, top_k, hidden, seq_len: _ } => {
+            let input_ptr = resolver.materialize(prog, op.inputs[0], abi).ok_or_else(|| {
+                CompilerError::CodegenViolation(format!("MoERouter op {:?}: input 无法 materialize", op.id))
+            })?;
+            let weight_vreg = op.inputs.get(1).copied()
+                .and_then(|tid| resolver.materialize(prog, tid, abi))
+                .ok_or_else(|| CompilerError::CodegenViolation(
+                    format!("MoERouter op {:?}: weight 无法 materialize", op.id)))?;
+            let output_ptr = resolver.materialize(prog, op.outputs[0], abi).ok_or_else(|| {
+                CompilerError::CodegenViolation(format!("MoERouter op {:?}: output 无法 materialize", op.id))
+            })?;
+            let logits_off = top_k * 2 * ctx.dtype.elem_bytes();
+            let logits_ptr = prog.alloc_vreg(VRegKind::Ptr, SimdWidth::Scalar);
+            prog.emit(VmInstr::LoadPtr { dst: logits_ptr, src: PtrExpr::VRegPlusConst(output_ptr, logits_off) });
+            super::moe_quant_emit::emit_moe_router_gemv_inline(
+                prog, num_experts, hidden, ctx.session.width,
+                input_ptr, weight_vreg, logits_ptr, ctx.dtype,
+            )?;
+            super::norm_softmax_emit::emit_softmax_inline(
+                prog, num_experts, ctx.session.width, logits_ptr, logits_ptr, ctx.dtype,
+            )?;
+            super::moe_quant_emit::emit_moe_topk_dispatch_inline(
+                prog, num_experts, top_k, ctx.session.width,
+                logits_ptr, output_ptr, ctx.session.hook, None, ctx.dtype,
+            )?;
+            Ok(Some(true))
+        }
+        Op::MoEDispatchPacked { ref seq_len, num_experts, top_k, mxfp4_block_size, swiglu_limit, hidden, intermediate_size } => {
+            let hidden_input_ptr = resolver.materialize(prog, op.inputs[0], abi).ok_or_else(|| CompilerError::CodegenViolation(format!("MoEDispatchPacked op {:?}: input[0]", op.id)))?;
+            let router_weight_ptr = resolver.materialize(prog, op.inputs[1], abi).ok_or_else(|| CompilerError::CodegenViolation(format!("MoEDispatchPacked op {:?}: input[1]", op.id)))?;
+            let router_bias_ptr = resolver.materialize(prog, op.inputs[2], abi).ok_or_else(|| CompilerError::CodegenViolation(format!("MoEDispatchPacked op {:?}: input[2]", op.id)))?;
+            let gate_up_blocks_ptr = resolver.materialize(prog, op.inputs[3], abi).ok_or_else(|| CompilerError::CodegenViolation(format!("MoEDispatchPacked op {:?}: input[3]", op.id)))?;
+            let gate_up_scales_ptr = resolver.materialize(prog, op.inputs[4], abi).ok_or_else(|| CompilerError::CodegenViolation(format!("MoEDispatchPacked op {:?}: input[4]", op.id)))?;
+            let gate_up_bias_ptr = resolver.materialize(prog, op.inputs[5], abi).ok_or_else(|| CompilerError::CodegenViolation(format!("MoEDispatchPacked op {:?}: input[5]", op.id)))?;
+            let down_blocks_ptr = resolver.materialize(prog, op.inputs[6], abi).ok_or_else(|| CompilerError::CodegenViolation(format!("MoEDispatchPacked op {:?}: input[6]", op.id)))?;
+            let down_scales_ptr = resolver.materialize(prog, op.inputs[7], abi).ok_or_else(|| CompilerError::CodegenViolation(format!("MoEDispatchPacked op {:?}: input[7]", op.id)))?;
+            let down_bias_ptr = resolver.materialize(prog, op.inputs[8], abi).ok_or_else(|| CompilerError::CodegenViolation(format!("MoEDispatchPacked op {:?}: input[8]", op.id)))?;
+            let output_ptr = resolver.materialize(prog, op.outputs[0], abi).ok_or_else(|| CompilerError::CodegenViolation(format!("MoEDispatchPacked op {:?}: output", op.id)))?;
+            let seq_bound = if abi.mega_decode_seq_len.is_some() {
+                BoundExpr::Const(1)
+            } else {
+                resolve_sym_dim(seq_len, abi, ctx.session.sym_map)
+            };
+            let scratchpad_vreg = prog.alloc_vreg(VRegKind::Ptr, SimdWidth::Scalar);
+            prog.emit(VmInstr::LoadPtr {
+                dst: scratchpad_vreg,
+                src: ctx.session.sym_map.resolve("scratchpad").cloned().expect("ABI: scratchpad"),
+            });
+            super::moe_quant_emit::emit_moe_packed_inline(
+                prog, seq_bound, num_experts, top_k, mxfp4_block_size, swiglu_limit,
+                intermediate_size, hidden, ctx.session.width,
+                hidden_input_ptr, router_weight_ptr, router_bias_ptr,
+                gate_up_blocks_ptr, gate_up_scales_ptr, gate_up_bias_ptr,
+                down_blocks_ptr, down_scales_ptr, down_bias_ptr,
+                output_ptr, scratchpad_vreg, ctx.dtype,
+            )?;
+            Ok(Some(true))
+        }
+        _ => Ok(None),
+    }
+}
+
+fn lower_op_altup(prog: &mut VmProgram, op: &CompilerOp, graph: &CompilerGraph, ctx: &LoweringContext, resolver: &TensorPtrResolver, abi: &AbiPtrs, op_resolved: &Op) -> Result<Option<bool>, CompilerError> {
+    // Clone to preserve by-value match semantics (struct fields bind by value, matching original lower_op).
+    let op_resolved = op_resolved.clone();
+    match op_resolved {
         Op::AltUpPredict { ref seq_len, num_preds, hidden } => {
             let input_ptr = resolver.materialize(prog, op.inputs[0], abi).ok_or_else(|| {
                 CompilerError::CodegenViolation(format!("AltUpPredict op {:?}: input 无法 materialize", op.id))
@@ -637,7 +567,7 @@ pub(crate) fn lower_op(
                 }
                 Ok::<_, CompilerError>(())
             })?;
-            Ok(true)
+            Ok(Some(true))
         }
         Op::AltUpCorrect { ref seq_len, num_preds, hidden } => {
             let input_ptr = resolver.materialize(prog, op.inputs[0], abi).ok_or_else(|| {
@@ -736,7 +666,7 @@ pub(crate) fn lower_op(
                 }
                 Ok::<_, CompilerError>(())
             })?;
-            Ok(true)
+            Ok(Some(true))
         }
         Op::AltUpInject { ref seq_len, num_preds, hidden } => {
             let input_ptr = resolver.materialize(prog, op.inputs[0], abi).ok_or_else(|| {
@@ -805,123 +735,417 @@ pub(crate) fn lower_op(
                 }
                 Ok::<_, CompilerError>(())
             })?;
-            Ok(true)
+            Ok(Some(true))
         }
-        Op::MoERouter { num_experts, top_k, hidden, seq_len: _ } => {
+        _ => Ok(None),
+    }
+}
+
+fn lower_op_gather(prog: &mut VmProgram, op: &CompilerOp, graph: &CompilerGraph, ctx: &LoweringContext, resolver: &TensorPtrResolver, abi: &AbiPtrs, op_resolved: &Op) -> Result<Option<bool>, CompilerError> {
+    // Clone to preserve by-value match semantics (struct fields bind by value, matching original lower_op).
+    let op_resolved = op_resolved.clone();
+    match op_resolved {
+        Op::ColumnSlice { seq_len, input_inner, start, slice_dim } => {
             let input_ptr = resolver.materialize(prog, op.inputs[0], abi).ok_or_else(|| {
-                CompilerError::CodegenViolation(format!("MoERouter op {:?}: input 无法 materialize", op.id))
+                CompilerError::CodegenViolation(format!("ColumnSlice op {:?}: input 无法 materialize", op.id))
             })?;
-            let weight_vreg = op.inputs.get(1).copied()
-                .and_then(|tid| resolver.materialize(prog, tid, abi))
-                .ok_or_else(|| CompilerError::CodegenViolation(
-                    format!("MoERouter op {:?}: weight 无法 materialize", op.id)))?;
             let output_ptr = resolver.materialize(prog, op.outputs[0], abi).ok_or_else(|| {
-                CompilerError::CodegenViolation(format!("MoERouter op {:?}: output 无法 materialize", op.id))
+                CompilerError::CodegenViolation(format!("ColumnSlice op {:?}: output 无法 materialize", op.id))
             })?;
-            let logits_off = top_k * 2 * ctx.dtype.elem_bytes();
-            let logits_ptr = prog.alloc_vreg(VRegKind::Ptr, SimdWidth::Scalar);
-            prog.emit(VmInstr::LoadPtr { dst: logits_ptr, src: PtrExpr::VRegPlusConst(output_ptr, logits_off) });
-            super::moe_quant_emit::emit_moe_router_gemv_inline(
-                prog, num_experts, hidden, ctx.session.width,
-                input_ptr, weight_vreg, logits_ptr, ctx.dtype,
+            let seq_bound = resolve_sym_dim(&seq_len, abi, ctx.session.sym_map);
+            super::structural_emit::emit_column_slice_inline(
+                prog, seq_bound, input_inner, start, slice_dim,
+                ctx.session.width, input_ptr, output_ptr, ctx.dtype,
             )?;
-            super::norm_softmax_emit::emit_softmax_inline(
-                prog, num_experts, ctx.session.width, logits_ptr, logits_ptr, ctx.dtype,
-            )?;
-            super::moe_quant_emit::emit_moe_topk_dispatch_inline(
-                prog, num_experts, top_k, ctx.session.width,
-                logits_ptr, output_ptr, ctx.session.hook, None, ctx.dtype,
-            )?;
-            Ok(true)
+            Ok(Some(true))
         }
-        Op::MlaKvCompress { ref m, d_c, hidden } => {
+        Op::Gather { table_rows: _, embed_dim, ref index_dim, ref indices_kind, scale } => {
             let input_ptr = resolver.materialize(prog, op.inputs[0], abi).ok_or_else(|| {
-                CompilerError::CodegenViolation(format!("MlaKvCompress op {:?}: input 无法 materialize", op.id))
+                CompilerError::CodegenViolation(format!("Gather op {:?}: input 无法 materialize", op.id))
             })?;
+            let weight_src = op.inputs.get(1).copied().and_then(|tid| resolver.source(tid));
             let weight_ptr = op.inputs.get(1).copied()
                 .and_then(|tid| resolver.materialize(prog, tid, abi))
-                .ok_or_else(|| CompilerError::CodegenViolation(
-                    format!("MlaKvCompress op {:?}: weight 无法 materialize", op.id)))?;
+                .unwrap_or(input_ptr);
             let output_ptr = resolver.materialize(prog, op.outputs[0], abi).ok_or_else(|| {
-                CompilerError::CodegenViolation(format!("MlaKvCompress op {:?}: output 无法 materialize", op.id))
+                CompilerError::CodegenViolation(format!("Gather op {:?}: output 无法 materialize", op.id))
             })?;
-            let m_bound = if abi.mega_decode_seq_len.is_some() {
+            let seq_bound = if abi.mega_decode_seq_len.is_some() {
                 BoundExpr::Const(1)
             } else {
-                resolve_sym_dim(m, abi, ctx.session.sym_map)
+                resolve_sym_dim(index_dim, abi, ctx.session.sym_map)
             };
-            emit_gemm_inline_with_hook(prog, m, d_c, hidden, ctx,
-                input_ptr, weight_ptr, output_ptr,
-                Some(&m_bound), Some(op.id), None, false,
-                ctx.dtype, ctx.dtype, ctx.dtype)?;
-            Ok(true)
-        }
-        Op::MlaQAbsorb { ref seq_len, num_heads, head_dim, d_c } => {
-            let input_ptr = resolver.materialize(prog, op.inputs[0], abi).ok_or_else(|| {
-                CompilerError::CodegenViolation(format!("MlaQAbsorb op {:?}: input 无法 materialize", op.id))
-            })?;
-            let weight_ptr = op.inputs.get(1).copied()
-                .and_then(|tid| resolver.materialize(prog, tid, abi))
-                .ok_or_else(|| CompilerError::CodegenViolation(
-                    format!("MlaQAbsorb op {:?}: weight 无法 materialize", op.id)))?;
-            let output_ptr = resolver.materialize(prog, op.outputs[0], abi).ok_or_else(|| {
-                CompilerError::CodegenViolation(format!("MlaQAbsorb op {:?}: output 无法 materialize", op.id))
-            })?;
-            let m_for_gemm = if abi.mega_decode_seq_len.is_some() {
-                SymDim::Concrete(num_heads)
-            } else { seq_len.clone() };
-            emit_gemm_inline_with_hook(prog, &m_for_gemm, d_c, head_dim, ctx,
-                input_ptr, weight_ptr, output_ptr, None, Some(op.id), None, true,
-                ctx.dtype, ctx.dtype, ctx.dtype)?;
-            Ok(true)
-        }
-        Op::MlaVRestore { ref seq_len, num_heads, head_dim, d_c } => {
-            let input_ptr = resolver.materialize(prog, op.inputs[0], abi).ok_or_else(|| {
-                CompilerError::CodegenViolation(format!("MlaVRestore op {:?}: input 无法 materialize", op.id))
-            })?;
-            let weight_ptr = op.inputs.get(1).copied()
-                .and_then(|tid| resolver.materialize(prog, tid, abi))
-                .ok_or_else(|| CompilerError::CodegenViolation(
-                    format!("MlaVRestore op {:?}: weight 无法 materialize", op.id)))?;
-            let output_ptr = resolver.materialize(prog, op.outputs[0], abi).ok_or_else(|| {
-                CompilerError::CodegenViolation(format!("MlaVRestore op {:?}: output 无法 materialize", op.id))
-            })?;
-            let m_for_gemm = if abi.mega_decode_seq_len.is_some() {
-                SymDim::Concrete(num_heads)
-            } else { seq_len.clone() };
-            emit_gemm_inline_with_hook(prog, &m_for_gemm, head_dim, d_c, ctx,
-                input_ptr, weight_ptr, output_ptr, None, Some(op.id), None, false,
-                ctx.dtype, ctx.dtype, ctx.dtype)?;
-            Ok(true)
-        }
-        Op::MlaRopeMerge { ref seq_len, d_c, d_rope } => {
-            let c_kv_ptr = resolver.materialize(prog, op.inputs[0], abi).ok_or_else(|| {
-                CompilerError::CodegenViolation(format!("MlaRopeMerge op {:?}: c_kv 无法 materialize", op.id))
-            })?;
-            let k_pe_ptr = op.inputs.get(1).copied()
-                .and_then(|tid| resolver.materialize(prog, tid, abi))
-                .ok_or_else(|| CompilerError::CodegenViolation(
-                    format!("MlaRopeMerge op {:?}: k_pe 无法 materialize", op.id)))?;
-            let output_ptr = resolver.materialize(prog, op.outputs[0], abi).ok_or_else(|| {
-                CompilerError::CodegenViolation(format!("MlaRopeMerge op {:?}: output 无法 materialize", op.id))
-            })?;
-            let _ = seq_len;
-            let cos_ptr = prog.alloc_vreg(VRegKind::Ptr, SimdWidth::Scalar);
-            prog.emit(VmInstr::LoadPtr {
-                dst: cos_ptr,
-                src: ctx.session.sym_map.resolve("rope_cos_sin_table").cloned().ok_or_else(|| CompilerError::CodegenViolation(
-                    "MlaRopeMerge: rope_cos_sin_table not in sym_map".into()))?,
-            });
-            let sin_ptr = cos_ptr;
-            let position = abi.gen_loop_counter.unwrap_or_else(|| {
-                prog.alloc_vreg(VRegKind::Scalar, SimdWidth::Scalar)
-            });
-            super::mla_emit::emit_mla_rope_merge_inline(
-                prog, d_c, d_rope,
-                &[c_kv_ptr, k_pe_ptr, output_ptr, cos_ptr, sin_ptr, position],
-                ctx.session.width, ctx.dtype,
+            let telemetry_ptr = if graph.telemetry.embed_l2_norm {
+                ctx.session.sym_map.resolve("telemetry").map(|expr| {
+                    let ptr_vreg = prog.alloc_vreg(VRegKind::Ptr, SimdWidth::Scalar);
+                    prog.emit(VmInstr::LoadPtr { dst: ptr_vreg, src: expr.clone() });
+                    ptr_vreg
+                })
+            } else { None };
+            let weight_dtype = op.inputs.get(1)
+                .and_then(|&tid| graph.tensor(tid))
+                .map(|t| t.dtype.to_quant_precision())
+                .unwrap_or(ctx.dtype);
+            super::structural_emit::emit_gather_inline(
+                prog, seq_bound, embed_dim, ctx.session.width,
+                input_ptr, weight_ptr, output_ptr, telemetry_ptr, scale,
+                indices_kind.clone(), ctx.dtype, weight_dtype,
             )?;
-            Ok(true)
+            Ok(Some(true))
+        }
+        Op::QuantGather { vocab_size, hidden_dim, ref index_dim, quant_type, scale } => {
+            let input_ptr = resolver.materialize(prog, op.inputs[0], abi).ok_or_else(|| {
+                CompilerError::CodegenViolation(format!("QuantGather op {:?}: input 无法 materialize", op.id))
+            })?;
+            let weight_ptr = op.inputs.get(1).copied()
+                .and_then(|tid| resolver.materialize(prog, tid, abi))
+                .unwrap_or(input_ptr);
+            let output_ptr = resolver.materialize(prog, op.outputs[0], abi).ok_or_else(|| {
+                CompilerError::CodegenViolation(format!("QuantGather op {:?}: output 无法 materialize", op.id))
+            })?;
+            let seq_bound = if abi.mega_decode_seq_len.is_some() {
+                BoundExpr::Const(1)
+            } else {
+                resolve_sym_dim(index_dim, abi, ctx.session.sym_map)
+            };
+            super::quant_gather_emit::emit_quant_gather_inline(
+                prog, seq_bound, vocab_size, hidden_dim, quant_type,
+                ctx.session.width, input_ptr, weight_ptr, output_ptr,
+                ctx.dtype, scale,
+            )?;
+            Ok(Some(true))
+        }
+        _ => Ok(None),
+    }
+}
+
+fn lower_op_generation(prog: &mut VmProgram, op: &CompilerOp, graph: &CompilerGraph, ctx: &LoweringContext, resolver: &TensorPtrResolver, abi: &AbiPtrs, op_resolved: &Op) -> Result<Option<bool>, CompilerError> {
+    // Clone to preserve by-value match semantics (struct fields bind by value, matching original lower_op).
+    let op_resolved = op_resolved.clone();
+    match op_resolved {
+        Op::Residual => {
+            let (out_shape, feature_dim) = infer_output_shape_sym(op, graph)?;
+            let in_ptr = resolver.materialize(prog, op.inputs[0], abi).ok_or_else(|| {
+                CompilerError::CodegenViolation(format!("Residual op {:?}: input 无法 materialize", op.id))
+            })?;
+            let w_ptr = op.inputs.get(1).copied()
+                .and_then(|tid| resolver.materialize(prog, tid, abi))
+                .unwrap_or(in_ptr);
+            let out_ptr = resolver.materialize(prog, op.outputs[0], abi).ok_or_else(|| {
+                CompilerError::CodegenViolation(format!("Residual op {:?}: output 无法 materialize", op.id))
+            })?;
+            let telemetry_ptr = if graph.telemetry.residual_cosine_sim {
+                ctx.session.sym_map.resolve("telemetry").map(|expr| {
+                    let ptr_vreg = prog.alloc_vreg(VRegKind::Ptr, SimdWidth::Scalar);
+                    prog.emit(VmInstr::LoadPtr { dst: ptr_vreg, src: expr.clone() });
+                    ptr_vreg
+                })
+            } else {
+                None
+            };
+            super::telemetry_emit::emit_residual_with_telemetry(
+                prog, &out_shape, feature_dim, ctx.session.width,
+                in_ptr, w_ptr, out_ptr, ctx.session.sym_map, telemetry_ptr,
+                None, ctx.dtype,
+            )?;
+            Ok(Some(true))
+        }
+        Op::Argmax { vocab_size } => {
+            let logits_ptr = resolver.materialize(prog, op.inputs[0], abi).ok_or_else(|| {
+                CompilerError::CodegenViolation(format!("Argmax op {:?}: logits 无法 materialize", op.id))
+            })?;
+            let argmax_dst = prog.alloc_vreg(VRegKind::Scalar, SimdWidth::Scalar);
+            let vocab_bytes = vocab_size * ctx.dtype.elem_bytes();
+            prog.emit(VmInstr::Argmax {
+                dst: argmax_dst, logits_ptr, vocab_bytes, width: ctx.session.width,
+            });
+            let out_ptr = resolver.materialize(prog, op.outputs[0], abi).ok_or_else(|| {
+                CompilerError::CodegenViolation(format!("Argmax op {:?}: output 无法 materialize", op.id))
+            })?;
+            prog.emit(VmInstr::ScalarStore {
+                base: out_ptr, src: argmax_dst, offset: OffsetExpr::Const(0),
+            });
+            Ok(Some(true))
+        }
+        Op::WriteLogits { ref target_indices } => {
+            let input_ptr = resolver.materialize(prog, op.inputs[0], abi).ok_or_else(|| {
+                CompilerError::CodegenViolation(format!("WriteLogits op {:?}: input 无法 materialize", op.id))
+            })?;
+            let output_ptr = resolver.materialize(prog, op.outputs[0], abi).ok_or_else(|| {
+                CompilerError::CodegenViolation(format!("WriteLogits op {:?}: output 无法 materialize", op.id))
+            })?;
+            super::structural_builder::StructuralOpBuilder::emit_scalar_writeback(
+                prog, input_ptr, output_ptr, target_indices,
+            )?;
+            Ok(Some(true))
+        }
+        Op::EarlyExit { anchor_layer } => {
+            let layer_ctr = abi.layer_loop_counter.ok_or_else(|| CompilerError::CodegenViolation(
+                "EarlyExit: layer_loop_counter is None".into()))?;
+            let input_ptr = resolver.materialize(prog, op.inputs[0], abi).ok_or_else(|| {
+                CompilerError::CodegenViolation(format!("EarlyExit op {:?}: input 无法 materialize", op.id))
+            })?;
+            prog.emit(VmInstr::GprCondAction {
+                cond: GprCondition::CmpEq(layer_ctr, anchor_layer as u64),
+                action: GprBranchAction::Exit(input_ptr),
+            });
+            Ok(Some(true))
+        }
+        Op::ScaleConst { value } => {
+            let input_ptr = resolver.materialize(prog, op.inputs[0], abi).ok_or_else(|| {
+                CompilerError::CodegenViolation(format!("ScaleConst op {:?}: input 无法 materialize", op.id))
+            })?;
+            let output_ptr = resolver.materialize(prog, op.outputs[0], abi).ok_or_else(|| {
+                CompilerError::CodegenViolation(format!("ScaleConst op {:?}: output 无法 materialize", op.id))
+            })?;
+            let out_tid = op.outputs[0];
+            let out_tensor = graph.tensor(out_tid)
+                .ok_or_else(|| CompilerError::CodegenViolation("ScaleConst: no output tensor".into()))?;
+            let seq_dim = out_tensor.shape.iter().find(|d| d.is_symbolic()).cloned();
+            let feature_dim: usize = out_tensor.shape.iter()
+                .filter(|d| !d.is_symbolic())
+                .map(|d| d.as_concrete().unwrap_or(1))
+                .product::<usize>()
+                .max(1);
+            let width = ctx.session.width.f32_lanes();
+            let elem_bytes = ctx.dtype.elem_bytes();
+            let num_vec = (feature_dim + width - 1) / width;
+            let row_bytes = feature_dim * elem_bytes;
+            let const_bc = prog.alloc_vreg(VRegKind::Vec, ctx.session.width);
+            prog.emit(VmInstr::Broadcast {
+                dst: const_bc,
+                src: ScalarExpr::Const(value),
+                width: ctx.session.width,
+                dtype: ctx.dtype,
+            });
+            if let Some(sym_dim) = seq_dim {
+                let seq_bound = ctx.session.sym_map.to_bound(&sym_dim);
+                prog.emit_loop_try(seq_bound, row_bytes, |prog, _ctr, seq_off| {
+                    for v in 0..num_vec {
+                        let off = v * width * elem_bytes;
+                        let off_expr = OffsetExpr::Add(
+                            Box::new(OffsetExpr::LoopOffset(seq_off)),
+                            Box::new(OffsetExpr::Const(off)),
+                        );
+                        let data = prog.alloc_vreg(VRegKind::Vec, ctx.session.width);
+                        prog.emit(VmInstr::VecLoad {
+                            dst: data, base: input_ptr, offset: off_expr.clone(),
+                            width: ctx.session.width, dtype: ctx.dtype, predicate: None,
+                        });
+                        let scaled = prog.alloc_vreg(VRegKind::Vec, ctx.session.width);
+                        prog.emit(VmInstr::VecBinOp {
+                            dst: scaled, a: data, b: const_bc,
+                            op: VecOp::Mul, dtype: ctx.dtype,
+                        });
+                        prog.emit(VmInstr::VecStore {
+                            base: output_ptr, offset: off_expr, src: scaled,
+                            width: ctx.session.width, dtype: ctx.dtype, predicate: None,
+                        });
+                    }
+                    Ok::<_, CompilerError>(())
+                })?;
+            } else {
+                for v in 0..num_vec {
+                    let off = v * width * elem_bytes;
+                    let off_expr = OffsetExpr::Const(off);
+                    let data = prog.alloc_vreg(VRegKind::Vec, ctx.session.width);
+                    prog.emit(VmInstr::VecLoad {
+                        dst: data, base: input_ptr, offset: off_expr.clone(),
+                        width: ctx.session.width, dtype: ctx.dtype, predicate: None,
+                    });
+                    let scaled = prog.alloc_vreg(VRegKind::Vec, ctx.session.width);
+                    prog.emit(VmInstr::VecBinOp {
+                        dst: scaled, a: data, b: const_bc,
+                        op: VecOp::Mul, dtype: ctx.dtype,
+                    });
+                    prog.emit(VmInstr::VecStore {
+                        base: output_ptr, offset: off_expr, src: scaled,
+                        width: ctx.session.width, dtype: ctx.dtype, predicate: None,
+                    });
+                }
+            }
+            Ok(Some(true))
+        }
+        Op::SessionKvRestore => {
+            let out_tid = op.outputs.first().ok_or_else(|| CompilerError::CodegenViolation(
+                "SessionKvRestore: no output tensor".into()))?;
+            let out_shape = &graph.tensor(*out_tid).unwrap().shape;
+            let feature_dim: usize = out_shape.iter().filter_map(|d| d.as_concrete()).sum();
+            let elem_b = ctx.dtype.elem_bytes();
+            let width = ctx.session.width;
+            let step = width.f32_lanes() * elem_b;
+            let iters = (feature_dim * elem_b + step - 1) / step;
+            let input_ptr = resolver.materialize(prog, op.inputs[0], abi).ok_or_else(|| {
+                CompilerError::CodegenViolation(format!("SessionKvRestore op {:?}: input 无法 materialize", op.id))
+            })?;
+            let output_ptr = resolver.materialize(prog, *out_tid, abi).ok_or_else(|| {
+                CompilerError::CodegenViolation(format!("SessionKvRestore op {:?}: output 无法 materialize", op.id))
+            })?;
+            let ctr = prog.alloc_vreg(VRegKind::Counter, SimdWidth::Scalar);
+            let byte_off = prog.alloc_vreg(VRegKind::ByteOffset, SimdWidth::Scalar);
+            prog.emit(VmInstr::LoopBegin {
+                counter: ctr, byte_offset: byte_off,
+                bound: BoundExpr::Const(iters), step_bytes: step,
+            });
+            let vec = prog.alloc_vreg(VRegKind::Vec, width);
+            prog.emit(VmInstr::VecLoad {
+                dst: vec, base: input_ptr,
+                offset: OffsetExpr::LoopOffset(byte_off), width, dtype: ctx.dtype, predicate: None,
+            });
+            prog.emit(VmInstr::VecStore {
+                base: output_ptr, src: vec,
+                offset: OffsetExpr::LoopOffset(byte_off), width, dtype: ctx.dtype, predicate: None,
+            });
+            prog.emit(VmInstr::LoopEnd);
+            Ok(Some(true))
+        }
+        Op::StoreToken => {
+            let token_ptr = resolver.materialize(prog, op.inputs[0], abi).ok_or_else(|| {
+                CompilerError::CodegenViolation(format!(
+                    "StoreToken op {:?}: token tensor 无法 materialize", op.id))
+            })?;
+            let counter = abi.gen_loop_counter.ok_or_else(|| {
+                CompilerError::CodegenViolation("StoreToken: gen_loop_counter is None".into())
+            })?;
+            let output_tokens_ptr = prog.alloc_vreg(VRegKind::Ptr, SimdWidth::Scalar);
+            prog.emit(VmInstr::LoadPtr {
+                dst: output_tokens_ptr,
+                src: ctx.session.sym_map.resolve("output_tokens_ptr").cloned().unwrap(),
+            });
+            let input_ids_ptr = prog.alloc_vreg(VRegKind::Ptr, SimdWidth::Scalar);
+            prog.emit(VmInstr::LoadPtr {
+                dst: input_ids_ptr,
+                src: ctx.session.sym_map.resolve("prompt_len").cloned().unwrap(),
+            });
+            let prompt_len_bytes = prog.alloc_vreg(VRegKind::Ptr, SimdWidth::Scalar);
+            prog.emit(VmInstr::LoadPtr {
+                dst: prompt_len_bytes,
+                src: ctx.session.sym_map.resolve("scratchpad").cloned().unwrap(),
+            });
+            prog.emit(VmInstr::StoreToken {
+                token_id: token_ptr, output_buf: output_tokens_ptr,
+                counter, input_ids_ptr, prompt_len_bytes,
+            });
+            Ok(Some(true))
+        }
+        Op::CheckStopCondition => {
+            let token_ptr = resolver.materialize(prog, op.inputs[0], abi).ok_or_else(|| {
+                CompilerError::CodegenViolation(format!(
+                    "CheckStopCondition op {:?}: token tensor 无法 materialize", op.id))
+            })?;
+            let counter = abi.gen_loop_counter.ok_or_else(|| {
+                CompilerError::CodegenViolation("CheckStopCondition: gen_loop_counter is None".into())
+            })?;
+            let eos_ptr = prog.alloc_vreg(VRegKind::Ptr, SimdWidth::Scalar);
+            prog.emit(VmInstr::LoadPtr {
+                dst: eos_ptr,
+                src: ctx.session.sym_map.resolve("eos_token_id").cloned().unwrap(),
+            });
+            let max_tokens_ptr = prog.alloc_vreg(VRegKind::Ptr, SimdWidth::Scalar);
+            prog.emit(VmInstr::LoadPtr {
+                dst: max_tokens_ptr,
+                src: ctx.session.sym_map.resolve("max_new_tokens").cloned().unwrap(),
+            });
+            prog.emit(VmInstr::CheckStopCondition {
+                token_id: token_ptr, counter, eos_ptr, max_tokens_ptr,
+            });
+            Ok(Some(true))
+        }
+        _ => Ok(None),
+    }
+}
+
+fn lower_op_hook(prog: &mut VmProgram, op: &CompilerOp, graph: &CompilerGraph, ctx: &LoweringContext, resolver: &TensorPtrResolver, abi: &AbiPtrs, op_resolved: &Op) -> Result<Option<bool>, CompilerError> {
+    // Clone to preserve by-value match semantics (struct fields bind by value, matching original lower_op).
+    let op_resolved = op_resolved.clone();
+    match op_resolved {
+        Op::GuardrailCheck { probe_offset } => {
+            let scratch = match abi.scratch_ptr {
+                Some(v) => v, None => return Ok(Some(true)),
+            };
+            let input_ptr = resolver.materialize(prog, op.inputs[0], abi).ok_or_else(|| {
+                CompilerError::CodegenViolation(format!("GuardrailCheck op {:?}: input 无法 materialize", op.id))
+            })?;
+            super::structural_builder::StructuralOpBuilder::emit_conditional_guard(
+                prog, scratch, probe_offset, input_ptr,
+            )?;
+            Ok(Some(true))
+        }
+        Op::CotStepCheck { shared_mem_offset } => {
+            let scratch = match abi.scratch_ptr {
+                Some(v) => v, None => return Ok(Some(true)),
+            };
+            let input_ptr = resolver.materialize(prog, op.inputs[0], abi).ok_or_else(|| {
+                CompilerError::CodegenViolation(format!("CotStepCheck op {:?}: input 无法 materialize", op.id))
+            })?;
+            super::structural_builder::StructuralOpBuilder::emit_conditional_guard(
+                prog, scratch, shared_mem_offset, input_ptr,
+            )?;
+            Ok(Some(true))
+        }
+        Op::SgInject { knowledge_offset: _, dim } => {
+            let sg_base = abi.hook_ctx_ptr.ok_or_else(|| CompilerError::CodegenViolation(
+                "SgInject: hook_ctx_ptr is None".into()))?;
+            let input_ptr = resolver.materialize(prog, op.inputs[0], abi).ok_or_else(|| {
+                CompilerError::CodegenViolation(format!("SgInject op {:?}: input 无法 materialize", op.id))
+            })?;
+            super::structural_builder::StructuralOpBuilder::emit_simd_injection(
+                prog, input_ptr, sg_base,
+                12, 16 + dim * 4, dim, ctx.session.width, ctx.dtype,
+            )?;
+            Ok(Some(true))
+        }
+        Op::SgDetect { detect_offset: _, hidden_dim } => {
+            let sg_base = abi.hook_ctx_ptr.ok_or_else(|| CompilerError::CodegenViolation(
+                "SgDetect: hook_ctx_ptr is None".into()))?;
+            let input_ptr = resolver.materialize(prog, op.inputs[0], abi).ok_or_else(|| {
+                CompilerError::CodegenViolation(format!("SgDetect op {:?}: input 无法 materialize", op.id))
+            })?;
+            let detect_ptr = prog.alloc_vreg(VRegKind::Ptr, SimdWidth::Scalar);
+            prog.emit(VmInstr::LoadPtr {
+                dst: detect_ptr, src: PtrExpr::VRegPlusConst(sg_base, 16),
+            });
+            super::structural_builder::StructuralOpBuilder::emit_side_channel_copy(
+                prog, input_ptr, detect_ptr, 0, hidden_dim, ctx.session.width, ctx.dtype,
+            )?;
+            if abi.callback_table_ptr.is_some() {
+                let cb_table = prog.alloc_vreg(VRegKind::Ptr, SimdWidth::Scalar);
+                prog.emit(VmInstr::LoadPtr {
+                    dst: cb_table,
+                    src: ctx.session.sym_map.resolve("callback_table_ptr").cloned().expect("ABI: callback_table_ptr"),
+                });
+                prog.emit(VmInstr::GprCondAction { cond: GprCondition::IsNull(cb_table), action: GprBranchAction::Skip(4) });
+                let fn_ptr = prog.alloc_vreg(VRegKind::Ptr, SimdWidth::Scalar);
+                let ctx_ptr = prog.alloc_vreg(VRegKind::Ptr, SimdWidth::Scalar);
+                prog.emit(VmInstr::LoadCallbackEntry { table_ptr: cb_table, slot_id: 0, fn_ptr_out: fn_ptr, ctx_out: ctx_ptr });
+                prog.emit(VmInstr::MemFence { order: crate::compiler::codegen::vm::instr::MemFenceOrder::Release });
+                let ret_val = prog.alloc_vreg(VRegKind::Scalar, SimdWidth::Scalar);
+                prog.emit(VmInstr::NativeCall { ret_val, fn_ptr, ctx_ptr });
+                prog.emit(VmInstr::MemFence { order: crate::compiler::codegen::vm::instr::MemFenceOrder::Acquire });
+            }
+            Ok(Some(true))
+        }
+        Op::QTapSTG { sink_ptr, step_index_ptr, dtype, ref q_dim, position, num_slots } => {
+            let q_ptr = resolver.materialize(prog, op.inputs[0], abi).ok_or_else(|| {
+                CompilerError::CodegenViolation(format!("QTapSTG op {:?}: Q tensor 无法 materialize", op.id))
+            })?;
+            let q_dim_concrete = match q_dim {
+                SymDim::Concrete(v) => *v,
+                SymDim::Symbolic { max_value, .. } => max_value.ok_or_else(|| {
+                    CompilerError::CodegenViolation(format!("QTapSTG op {:?}: q_dim Symbolic 无 max_value", op.id))
+                })?,
+            };
+            let q_tensor = graph.tensor(op.inputs[0]).ok_or_else(|| CompilerError::CodegenViolation(
+                format!("QTapSTG op {:?}: Q tensor 不存在", op.id)))?;
+            let seq_dim = q_tensor.shape.iter().find(|d| d.is_symbolic()).cloned()
+                .or_else(|| q_tensor.shape.first().cloned())
+                .ok_or_else(|| CompilerError::CodegenViolation(format!("QTapSTG op {:?}: Q shape 为空", op.id)))?;
+            let seq_bound = resolve_sym_dim(&seq_dim, abi, ctx.session.sym_map);
+            super::lower::lower_qtap_stg(
+                prog, sink_ptr, step_index_ptr, dtype,
+                q_dim_concrete, seq_bound, position, num_slots, ctx.session.width, q_ptr,
+            )?;
+            Ok(Some(true))
         }
         Op::MmHiddenInject { hidden_dim } => {
             let input_ptr = resolver.materialize(prog, op.inputs[0], abi).ok_or_else(|| {
@@ -950,127 +1174,7 @@ pub(crate) fn lower_op(
                 .map_err(|e| CompilerError::CodegenViolation(format!("MmHiddenInject auto_lower: {e}")))?;
             prog.emit(VmInstr::VecStore { base: output_ptr, src: result, offset: OffsetExpr::LoopOffset(byte_off), width, dtype: ctx.dtype , predicate: None,});
             prog.emit(VmInstr::LoopEnd);
-            Ok(true)
-        }
-        Op::MoEDispatchPacked { ref seq_len, num_experts, top_k, mxfp4_block_size, swiglu_limit, hidden, intermediate_size } => {
-            let hidden_input_ptr = resolver.materialize(prog, op.inputs[0], abi).ok_or_else(|| CompilerError::CodegenViolation(format!("MoEDispatchPacked op {:?}: input[0]", op.id)))?;
-            let router_weight_ptr = resolver.materialize(prog, op.inputs[1], abi).ok_or_else(|| CompilerError::CodegenViolation(format!("MoEDispatchPacked op {:?}: input[1]", op.id)))?;
-            let router_bias_ptr = resolver.materialize(prog, op.inputs[2], abi).ok_or_else(|| CompilerError::CodegenViolation(format!("MoEDispatchPacked op {:?}: input[2]", op.id)))?;
-            let gate_up_blocks_ptr = resolver.materialize(prog, op.inputs[3], abi).ok_or_else(|| CompilerError::CodegenViolation(format!("MoEDispatchPacked op {:?}: input[3]", op.id)))?;
-            let gate_up_scales_ptr = resolver.materialize(prog, op.inputs[4], abi).ok_or_else(|| CompilerError::CodegenViolation(format!("MoEDispatchPacked op {:?}: input[4]", op.id)))?;
-            let gate_up_bias_ptr = resolver.materialize(prog, op.inputs[5], abi).ok_or_else(|| CompilerError::CodegenViolation(format!("MoEDispatchPacked op {:?}: input[5]", op.id)))?;
-            let down_blocks_ptr = resolver.materialize(prog, op.inputs[6], abi).ok_or_else(|| CompilerError::CodegenViolation(format!("MoEDispatchPacked op {:?}: input[6]", op.id)))?;
-            let down_scales_ptr = resolver.materialize(prog, op.inputs[7], abi).ok_or_else(|| CompilerError::CodegenViolation(format!("MoEDispatchPacked op {:?}: input[7]", op.id)))?;
-            let down_bias_ptr = resolver.materialize(prog, op.inputs[8], abi).ok_or_else(|| CompilerError::CodegenViolation(format!("MoEDispatchPacked op {:?}: input[8]", op.id)))?;
-            let output_ptr = resolver.materialize(prog, op.outputs[0], abi).ok_or_else(|| CompilerError::CodegenViolation(format!("MoEDispatchPacked op {:?}: output", op.id)))?;
-            let seq_bound = if abi.mega_decode_seq_len.is_some() {
-                BoundExpr::Const(1)
-            } else {
-                resolve_sym_dim(seq_len, abi, ctx.session.sym_map)
-            };
-            let scratchpad_vreg = prog.alloc_vreg(VRegKind::Ptr, SimdWidth::Scalar);
-            prog.emit(VmInstr::LoadPtr {
-                dst: scratchpad_vreg,
-                src: ctx.session.sym_map.resolve("scratchpad").cloned().expect("ABI: scratchpad"),
-            });
-            super::moe_quant_emit::emit_moe_packed_inline(
-                prog, seq_bound, num_experts, top_k, mxfp4_block_size, swiglu_limit,
-                intermediate_size, hidden, ctx.session.width,
-                hidden_input_ptr, router_weight_ptr, router_bias_ptr,
-                gate_up_blocks_ptr, gate_up_scales_ptr, gate_up_bias_ptr,
-                down_blocks_ptr, down_scales_ptr, down_bias_ptr,
-                output_ptr, scratchpad_vreg, ctx.dtype,
-            )?;
-            Ok(true)
-        }
-        Op::MlaAttention(ref spec) => {
-            let q_absorbed_ptr = resolver.materialize(prog, op.inputs[0], abi).ok_or_else(|| {
-                CompilerError::CodegenViolation(format!("MlaAttention op {:?}: q_absorbed 无法 materialize", op.id))
-            })?;
-            let kv_cache_ptr = op.inputs.get(1).copied()
-                .and_then(|tid| resolver.materialize(prog, tid, abi))
-                .ok_or_else(|| CompilerError::CodegenViolation(
-                    format!("MlaAttention op {:?}: kv_cache 无法 materialize", op.id)))?;
-            let w_uv_ptr = op.inputs.get(2).copied()
-                .and_then(|tid| resolver.materialize(prog, tid, abi))
-                .ok_or_else(|| CompilerError::CodegenViolation(
-                    format!("MlaAttention op {:?}: w_uv 无法 materialize", op.id)))?;
-            let output_ptr = resolver.materialize(prog, op.outputs[0], abi).ok_or_else(|| {
-                CompilerError::CodegenViolation(format!("MlaAttention op {:?}: output 无法 materialize", op.id))
-            })?;
-            let kv_len_vreg = prog.alloc_vreg(VRegKind::Scalar, SimdWidth::Scalar);
-            if let Some(gen_ctr) = abi.gen_loop_counter {
-                prog.emit(VmInstr::GprBinOp { dst: kv_len_vreg, a: gen_ctr, b: GprOperand::Imm(1), op: GprOp::Add });
-            } else {
-                let seq_val = resolve_sym_dim(&spec.seq_len, abi, ctx.session.sym_map);
-                match seq_val {
-                    BoundExpr::Const(c) => { prog.emit(VmInstr::GprLoadImm { dst: kv_len_vreg, value: c }); },
-                    BoundExpr::DynamicVReg(vr) => {
-                        prog.emit(VmInstr::GprBinOp { dst: kv_len_vreg, a: vr, b: GprOperand::Imm(1), op: GprOp::Add });
-                    },
-                    _ => return Err(CompilerError::CodegenViolation("MlaAttention: unsupported seq_len bound".into())),
-                }
-            }
-            super::mla_emit::emit_mla_attn_score_inline(
-                prog, spec.num_heads, spec.head_dim, spec.d_c, spec.d_rope,
-                &[q_absorbed_ptr, kv_cache_ptr, w_uv_ptr, output_ptr],
-                kv_len_vreg, ctx.session.width, ctx.dtype,
-            )?;
-            Ok(true)
-        }
-        Op::DualRoPE(ref spec) => {
-            let rope_req = ctx.rope_req.ok_or_else(|| CompilerError::CodegenViolation(
-                format!("DualRoPE op {:?}: ctx.rope_req 未配置", op.id)))?;
-            let base_offset = rope_req.cache_offset;
-            let (sliding_cos_offset, global_cos_offset) = if let Some(ref sec) = rope_req.secondary_cache {
-                (base_offset, sec.cache_offset)
-            } else {
-                return Err(CompilerError::CodegenViolation(
-                    "DualRoPE: requires RopeCacheRequirement with secondary_cache".into()));
-            };
-            let out_tid = op.outputs.first().copied().ok_or_else(|| CompilerError::CodegenViolation(
-                format!("DualRoPE op {:?}: 无输出张量", op.id)))?;
-            let out_tensor = graph.tensor(out_tid).ok_or_else(|| CompilerError::CodegenViolation(
-                format!("DualRoPE op {:?}: 输出张量不存在", op.id)))?;
-            let seq_dim = out_tensor.shape.iter().find(|d| d.is_symbolic()).cloned()
-                .or_else(|| out_tensor.shape.first().cloned())
-                .ok_or_else(|| CompilerError::CodegenViolation(format!("DualRoPE op {:?}: shape 为空", op.id)))?;
-            let seq_bound = resolve_sym_dim(&seq_dim, abi, ctx.session.sym_map);
-            let input_ptr = resolver.materialize(prog, op.inputs[0], abi).ok_or_else(|| {
-                CompilerError::CodegenViolation(format!("DualRoPE op {:?}: input 无法 materialize", op.id))
-            })?;
-            let output_ptr = resolver.materialize(prog, out_tid, abi).ok_or_else(|| {
-                CompilerError::CodegenViolation(format!("DualRoPE op {:?}: output 无法 materialize", op.id))
-            })?;
-            let width = ctx.session.width;
-            let (rope_seq_bound, rope_pos_offset) = if let Some(gen_ctr) = abi.gen_loop_counter {
-                (BoundExpr::Const(1), Some(gen_ctr))
-            } else { (seq_bound, None) };
-            let layer_ctr = abi.layer_loop_counter.ok_or_else(|| CompilerError::CodegenViolation(
-                "DualRoPE: layer_loop_counter is None".into()))?;
-            let label_global = prog.alloc_label();
-            let label_end = prog.alloc_label();
-            let temp_add = prog.alloc_vreg(VRegKind::Scalar, SimdWidth::Scalar);
-            prog.emit(VmInstr::GprBinOp { dst: temp_add, a: layer_ctr, b: GprOperand::Imm(spec.layer_offset as i64), op: GprOp::Add });
-            let quotient = prog.alloc_vreg(VRegKind::Scalar, SimdWidth::Scalar);
-            prog.emit(VmInstr::GprBinOp { dst: quotient, a: temp_add, b: GprOperand::Imm(spec.layer_divisor as i64), op: GprOp::Div });
-            let product = prog.alloc_vreg(VRegKind::Scalar, SimdWidth::Scalar);
-            prog.emit(VmInstr::GprBinOp { dst: product, a: quotient, b: GprOperand::Imm(spec.layer_divisor as i64), op: GprOp::Mul });
-            let remainder = prog.alloc_vreg(VRegKind::Scalar, SimdWidth::Scalar);
-            prog.emit(VmInstr::GprBinOp { dst: remainder, a: temp_add, b: GprOperand::VReg(product), op: GprOp::Sub });
-            prog.emit(VmInstr::GprCondAction { cond: GprCondition::CmpEq(remainder, spec.layer_remainder as u64), action: GprBranchAction::JumpToLabel(label_global) });
-            super::structural_emit::emit_rope_inline(prog, rope_seq_bound.clone(), spec.num_heads, spec.head_dim,
-                spec.sliding_partial, width, input_ptr, output_ptr, sliding_cos_offset, ctx.session.sym_map, ctx.dtype, rope_pos_offset)?;
-            prog.emit(VmInstr::GprCondAction { cond: GprCondition::IsNonNull(layer_ctr), action: GprBranchAction::JumpToLabel(label_end) });
-            prog.emit(VmInstr::MarkLabel { label_id: label_global });
-            super::structural_emit::emit_rope_inline(prog, rope_seq_bound, spec.num_heads, spec.head_dim,
-                spec.global_partial, width, input_ptr, output_ptr, global_cos_offset, ctx.session.sym_map, ctx.dtype, rope_pos_offset)?;
-            prog.emit(VmInstr::MarkLabel { label_id: label_end });
-            Ok(true)
-        }
-        Op::HeadRmsNorm { head_dim, eps, dtype } => {
-            let spec = NormSpec { feature_dim: head_dim, eps, dtype, has_weight: true };
-            lower_norm_v2(prog, op, graph, ctx, resolver, abi, &spec, NormKind::HeadRmsNorm)
+            Ok(Some(true))
         }
         Op::MegaKernelDispatch { prefill_fn: _, decode_fn: _, chunked_fn: _, .. } => {
             let mode_reg = prog.alloc_vreg(VRegKind::Scalar, SimdWidth::Scalar);
@@ -1083,101 +1187,57 @@ pub(crate) fn lower_op(
                     super::instr::JumpTarget { expert_id: 2, instr_index: 0 },
                 ],
             });
-            Ok(true)
+            Ok(Some(true))
         }
-        Op::QkNorm { head_dim, eps } => {
-            if head_dim == 0 {
-                return Err(CompilerError::CodegenViolation("QkNorm: head_dim must be > 0".into()));
-            }
-            let out_tid = op.outputs.first().copied().ok_or_else(|| CompilerError::CodegenViolation(
-                format!("QkNorm op {:?}: 无输出张量", op.id)))?;
-            let out_tensor = graph.tensor(out_tid).ok_or_else(|| CompilerError::CodegenViolation(
-                format!("QkNorm op {:?}: 输出张量不存在", op.id)))?;
-            let total_concrete: usize = out_tensor.shape.iter()
-                .filter(|d| !d.is_symbolic()).map(|d| d.as_concrete().unwrap_or(1)).product();
-            if total_concrete % head_dim != 0 {
+        _ => Ok(None),
+    }
+}
+
+fn lower_op_vision(prog: &mut VmProgram, op: &CompilerOp, graph: &CompilerGraph, ctx: &LoweringContext, resolver: &TensorPtrResolver, abi: &AbiPtrs, op_resolved: &Op) -> Result<Option<bool>, CompilerError> {
+    // Clone to preserve by-value match semantics (struct fields bind by value, matching original lower_op).
+    let op_resolved = op_resolved.clone();
+    match op_resolved {
+        Op::DepthwiseConv1D { channels, kernel_size, causal } => {
+            let req = ctx.dwc_req.ok_or_else(|| CompilerError::CodegenViolation(
+                format!("DepthwiseConv1D op {:?}: ctx.dwc_req 未配置", op.id)))?;
+            if req.channels != channels || req.kernel_size != kernel_size || req.causal != causal {
                 return Err(CompilerError::CodegenViolation(format!(
-                    "QkNorm op {:?}: total concrete elems {} not divisible by head_dim {}",
-                    op.id, total_concrete, head_dim)));
+                    "DepthwiseConv1D: 签名与 dwc_req 不一致")));
             }
-            let num_heads = total_concrete / head_dim;
-            let outer_seq = out_tensor.shape.first().cloned().unwrap_or(SymDim::Concrete(1));
-            let width = ctx.session.width;
-            let sym_map = ctx.session.sym_map;
-            let seq_bound = if abi.mega_decode_seq_len.is_some() {
-                BoundExpr::Const(1)
-            } else {
-                resolve_sym_dim(&outer_seq, abi, sym_map)
-            };
-            let input_ptr = resolver.materialize(prog, op.inputs[0], abi).unwrap_or_else(|| prog.alloc_vreg(VRegKind::Ptr, width));
-            let weight_ptr = resolver.materialize(prog, op.inputs[1], abi).unwrap_or_else(|| prog.alloc_vreg(VRegKind::Ptr, width));
-            let weight_dtype = graph.tensor(op.inputs[1]).map(|t| t.dtype.to_quant_precision()).unwrap_or(ctx.dtype);
-            let output_ptr = resolver.materialize(prog, op.outputs[0], abi)
-                .ok_or_else(|| CompilerError::CodegenViolation(format!("QkNorm op {:?}: 无输出指针", op.id)))?;
-            let pattern = build_norm_pattern_qk(eps, head_dim)?;
-            emit_normlike_inline(
-                prog, &pattern, head_dim, num_heads,
-                /*broadcast_weight=*/false, NormKind::ValueNorm,
-                width, seq_bound, input_ptr, weight_ptr, output_ptr,
-                ctx.dtype, weight_dtype,
+            // BCE-20260630-MIXED-P5 (三段式 dtype): input=x(激活)→op_input_dtype, weight=conv kernel→inputs[1].dtype
+            let input_dtype = op_input_dtype(op, graph);
+            let weight_dtype = op.inputs.get(1)
+                .and_then(|&tid| graph.tensor(tid))
+                .map(|t| t.dtype.to_quant_precision())
+                .unwrap_or(input_dtype);
+            super::vision_audio_emit::lower_depthwise_conv1d(
+                prog, op, graph, ctx.session.width, channels, kernel_size, causal,
+                ctx.session.sym_map, resolver, abi, req, input_dtype, weight_dtype,
             )?;
-            Ok(true)
+            Ok(Some(true))
         }
-        Op::L2Normalize { hidden } => {
-            let width = ctx.session.width;
-            let sym_map = ctx.session.sym_map;
-            let seq_bound = abi.mega_decode_seq_len.map(BoundExpr::DynamicVReg)
-                .unwrap_or(BoundExpr::Const(1));
-            let input_ptr = resolver.materialize(prog, op.inputs[0], abi).unwrap_or_else(|| prog.alloc_vreg(VRegKind::Ptr, width));
-            let weight_ptr = resolver.materialize(prog, op.inputs[1], abi).unwrap_or_else(|| prog.alloc_vreg(VRegKind::Ptr, width));
-            let weight_dtype = graph.tensor(op.inputs[1]).map(|t| t.dtype.to_quant_precision()).unwrap_or(ctx.dtype);
-            let output_ptr = resolver.materialize(prog, op.outputs[0], abi)
-                .ok_or_else(|| CompilerError::CodegenViolation(format!("L2Normalize op {:?}: 无输出指针", op.id)))?;
-            let key = ScalarOpRegistry::key_from_op(&op.op);
-            let op_trace = ctx.session.registry.and_then(|r| r.get_trace(&key));
-            let pattern = op_trace.map(|t| t.pattern.clone())
-                .ok_or_else(|| CompilerError::CodegenViolation("L2Normalize: 无 registry trace".into()))?;
-            emit_normlike_inline(
-                prog, &pattern, hidden, 1, false, NormKind::ValueNorm,
-                width, seq_bound, input_ptr, weight_ptr, output_ptr,
-                ctx.dtype, weight_dtype,
+        Op::PatchEmbed { patch_size, embed_dim, in_channels, image_size } => {
+            let image_ptr = resolver.materialize(prog, op.inputs[0], abi).ok_or_else(|| {
+                CompilerError::CodegenViolation(format!("PatchEmbed op {:?}: image 无法 materialize", op.id))
+            })?;
+            let kernel_ptr = op.inputs.get(1).copied()
+                .and_then(|tid| resolver.materialize(prog, tid, abi))
+                .ok_or_else(|| CompilerError::CodegenViolation(
+                    format!("PatchEmbed op {:?}: kernel 无法 materialize", op.id)))?;
+            let patches_ptr = resolver.materialize(prog, op.outputs[0], abi).ok_or_else(|| {
+                CompilerError::CodegenViolation(format!("PatchEmbed op {:?}: output 无法 materialize", op.id))
+            })?;
+            // BCE-20260630-MIXED-P5 (三段式 dtype): input=image(激活)→op_input_dtype, weight=vision kernel→inputs[1].dtype
+            let input_dtype = op_input_dtype(op, graph);
+            let weight_dtype = op.inputs.get(1)
+                .and_then(|&tid| graph.tensor(tid))
+                .map(|t| t.dtype.to_quant_precision())
+                .unwrap_or(input_dtype);
+            super::vision_audio_emit::lower_patch_embed(
+                prog, patch_size, embed_dim, in_channels, image_size,
+                image_ptr, kernel_ptr, patches_ptr, input_dtype, weight_dtype,
             )?;
-            Ok(true)
-        }
-        Op::Softmax => {
-            let width = ctx.session.width;
-            let (_out_shape, feature_dim) = infer_output_shape_sym(op, graph)?;
-            let input_ptr = resolver.materialize(prog, op.inputs[0], abi).unwrap_or_else(|| prog.alloc_vreg(VRegKind::Ptr, width));
-            let output_ptr = resolver.materialize(prog, op.outputs[0], abi)
-                .ok_or_else(|| CompilerError::CodegenViolation(format!("Softmax op {:?}: 无输出指针", op.id)))?;
-            let (max_val, sum_val) = emit_softmax_inline(
-                prog, feature_dim, width, input_ptr, output_ptr, ctx.dtype,
-            )?;
-            if graph.telemetry.softmax_sharpness {
-                if let Some(expr) = ctx.session.sym_map.resolve("telemetry") {
-                    let tel_ptr = prog.alloc_vreg(VRegKind::Ptr, SimdWidth::Scalar);
-                    prog.emit(VmInstr::LoadPtr { dst: tel_ptr, src: expr.clone() });
-                    emit_softmax_telemetry(prog, max_val, sum_val, tel_ptr, width, ctx.dtype);
-                }
-            }
-            Ok(true)
-        }
-        Op::MeanPool { seq_len: _, hidden: _, cls_mode: _ } => {
-            let width = ctx.session.width;
-            let sym_map = ctx.session.sym_map;
-            let seq_bound_override: Option<BoundExpr> = abi.mega_decode_seq_len.map(BoundExpr::DynamicVReg);
-            let input_ptr = resolver.materialize(prog, op.inputs[0], abi).unwrap_or_else(|| prog.alloc_vreg(VRegKind::Ptr, width));
-            let output_ptr = resolver.materialize(prog, op.outputs[0], abi)
-                .ok_or_else(|| CompilerError::CodegenViolation(format!("MeanPool op {:?}: 无输出指针", op.id)))?;
-            let key = ScalarOpRegistry::key_from_op(&op.op);
-            let op_trace = ctx.session.registry.and_then(|r| r.get_trace(&key));
-            let trace = op_trace
-                .ok_or_else(|| CompilerError::CodegenViolation("MeanPool: 无 registry trace".into()))?;
-            try_dispatch_reduction(
-                prog, op, graph, &trace.pattern, ctx,
-                input_ptr, output_ptr, seq_bound_override.as_ref(),
-            )?;
-            Ok(true)
+            Ok(Some(true))
         }
         Op::LearnedPos2D { num_patches, embed_dim } => {
             let width = ctx.session.width;
@@ -1197,11 +1257,52 @@ pub(crate) fn lower_op(
             let _acc = emit_elementwise_inline(prog, &trace_body, &out_shape, width,
                 /*is_binary=*/true, /*weight_is_broadcast=*/false,
                 input_ptr, weight_ptr, output_ptr, sym_map, seq_bound_override.as_ref(), ctx.dtype)?;
-            Ok(true)
+            Ok(Some(true))
         }
-        _ => Ok(false) // 无需 lower_op 的 ops（trace-lookup 最优）
+        _ => Ok(None),
     }
 }
+
+fn lower_op_meta(prog: &mut VmProgram, op: &CompilerOp, graph: &CompilerGraph, ctx: &LoweringContext, resolver: &TensorPtrResolver, abi: &AbiPtrs, op_resolved: &Op) -> Result<Option<bool>, CompilerError> {
+    // Clone to preserve by-value match semantics (struct fields bind by value, matching original lower_op).
+    let op_resolved = op_resolved.clone();
+    match op_resolved {
+        Op::Transpose { .. } | Op::Reshape { .. } | Op::SliceView { .. } => Ok(Some(true)),
+
+        // Generation control flow — 从 Op 路由，逻辑等价（unit 变体，无 Spec 参数）
+        Op::MlaRopeMerge { ref seq_len, d_c, d_rope } => {
+            let c_kv_ptr = resolver.materialize(prog, op.inputs[0], abi).ok_or_else(|| {
+                CompilerError::CodegenViolation(format!("MlaRopeMerge op {:?}: c_kv 无法 materialize", op.id))
+            })?;
+            let k_pe_ptr = op.inputs.get(1).copied()
+                .and_then(|tid| resolver.materialize(prog, tid, abi))
+                .ok_or_else(|| CompilerError::CodegenViolation(
+                    format!("MlaRopeMerge op {:?}: k_pe 无法 materialize", op.id)))?;
+            let output_ptr = resolver.materialize(prog, op.outputs[0], abi).ok_or_else(|| {
+                CompilerError::CodegenViolation(format!("MlaRopeMerge op {:?}: output 无法 materialize", op.id))
+            })?;
+            let _ = seq_len;
+            let cos_ptr = prog.alloc_vreg(VRegKind::Ptr, SimdWidth::Scalar);
+            prog.emit(VmInstr::LoadPtr {
+                dst: cos_ptr,
+                src: ctx.session.sym_map.resolve("rope_cos_sin_table").cloned().ok_or_else(|| CompilerError::CodegenViolation(
+                    "MlaRopeMerge: rope_cos_sin_table not in sym_map".into()))?,
+            });
+            let sin_ptr = cos_ptr;
+            let position = abi.gen_loop_counter.unwrap_or_else(|| {
+                prog.alloc_vreg(VRegKind::Scalar, SimdWidth::Scalar)
+            });
+            super::mla_emit::emit_mla_rope_merge_inline(
+                prog, d_c, d_rope,
+                &[c_kv_ptr, k_pe_ptr, output_ptr, cos_ptr, sin_ptr, position],
+                ctx.session.width, ctx.dtype,
+            )?;
+            Ok(Some(true))
+        }
+        _ => Ok(None),
+    }
+}
+
 
 /// Gemm lowering（Op 驱动）。
 ///
