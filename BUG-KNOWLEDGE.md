@@ -213,3 +213,43 @@
 
 **防复发**: SPEC criterion ARCH-LOWER-DISPATCH-LAYERING (dispatch CC 允许 OCP 扩展点, logic CC ≤10) 待写入 SPEC/02-ARCHITECTURE.md §8。
 
+---
+
+## BCE-20260630-LONG-METHOD-ERADICATION — long_method 全量根治 (已闭环)
+
+**日期**: 2026-07-01
+**范围**: gllm-kernels/src/compiler/codegen/vm/
+**根治病灶**: arch_insight CS-LONG-METHOD 5处 → 0处 (承接 BCE-20260630-LOWER-INSTR-GOD-MATCH 残留 B类4处 + auto_select 查表化)
+
+### 根治模式签名
+- patternId: BCE-20260630-LONG-METHOD-ERADICATION
+- title: JIT codegen god-function long_method (>500行)
+- layer: 范式缺陷 (单 match/单 fn 承载全量逻辑, 违反 OCP)
+- codePattern: 单 fn >500行, 圈复杂度>10, 承载完整编排或全量 dispatch
+- fixTemplate (按类型分):
+  - **A类 god-match dispatch** (dispatch_trace_op/lower_op/exec_op_with_pos): 按 ComputePattern/Op族查表化, 顶层纯 dispatch (arm 单表达式委托) + per-pattern handler (≤500行)
+  - **B类过程式长序列** (emit_batch_mode_path/emit_fusion_groups): 按职责抽子 fn + ctx 结构打包只读引用 (&mut 独立保留避 borrow 冲突)
+  - **C类单 handler 超长** (dispatch_quant_decode): 抽 per-arm emit helper
+- regressionAssertion: arch_insight(quality) CS-LONG-METHOD=0 + cargo test --lib 6972 passed
+
+### 已根治 6 处 (7 commit)
+| commit | 函数 | 行数变化 | 方法 |
+|---|---|---|---|
+| 02d836df | dispatch_trace_op (auto_select.rs) | 1219→109 | ComputePattern 7类查表化 |
+| e0fee8e7 | lower_op (lower_op.inc.rs) | 1186→28 | Op族11类查表化 |
+| d069324f | dispatch_quant_decode (auto_select.rs) | 518→369 | 抽 emit helper |
+| 2da0dd74 | emit_batch_mode_path (mega_kernel_emit.rs) | 811→270 | 按职责抽3子fn + BatchAbiRegs |
+| 4e9e5d6d | exec_op_with_pos (numerical_sim.rs) | 1019→106 | ComputePattern 8类查表化 (镜像 dispatch_trace_op) |
+| ee414d72 | emit_fusion_groups (pipeline.inc.rs) | 758→123 | FusionEmitCtx 化 + 5子fn |
+| 8f5bcdeb | P-1 eprintln 清除 | — | 6处调试输出清除 |
+
+### 防复发铁律
+1. 新增 TraceOp/OpKind/VmInstr 变体 = 1行 dispatch + 1个 handler arm, 禁在 dispatch/handler 内联逻辑
+2. fn >500行必须拆分 (P-2), 参数 >6 必须 ctx 化 (prog/&mut 独立保留)
+3. 禁 eprintln/println/dbg! 调试输出 (P-1), 用 tracing 或删除
+
+### 防复发沉淀
+- SPEC criterion: `REQ-ARCH-001-CODEGEN-DISCIPLINE` (写入 gllm SPEC/02-ARCHITECTURE.html, 关联 REQ-ARCH-001 JIT 编译器四阶段管线)
+- 本条目: BUG-KNOWLEDGE.md 沉淀
+- 状态: ✅ 已闭环 (residual=0)
+
