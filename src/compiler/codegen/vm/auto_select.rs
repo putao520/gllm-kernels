@@ -1610,11 +1610,11 @@ fn dispatch_quant_decode(
         // T2 将完善为完整的 auto_select 映射，此处先确保编译通过。
 
         TraceOp::QuantScaleLoad { source, offset, dtype } => {
-            emit_quant_scale_load(prog, slots[source.0 as usize], *offset as i64, dtype, width)
+            emit_quant_scale_load(prog, slots[source.0 as usize], *offset, dtype, width)
         }
 
         TraceOp::QuantDataLoad { source, offset, quant_type, block_size } => {
-            emit_quant_data_load(prog, slots[source.0 as usize], *offset as i64, *quant_type, *block_size, width)
+            emit_quant_data_load(prog, slots[source.0 as usize], *offset, *quant_type, *block_size, width)
         }
 
         TraceOp::QuantZeroLoad { source, offset, zp_type } => {
@@ -1781,7 +1781,7 @@ fn unreachable_pattern(op: &TraceOp) -> Result<VRegId, CompilerError> {
 fn emit_quant_scale_load(
     prog: &mut VmProgram,
     base: VRegId,
-    offset: i64,
+    offset: usize,
     dtype: &QuantType,
     width: SimdWidth,
 ) -> Result<VRegId, CompilerError> {
@@ -1795,7 +1795,7 @@ fn emit_quant_scale_load(
             prog.emit(VmInstr::QuantScalarCvtLoad {
                 dst: r,
                 base,
-                offset: offset_val,
+                offset: offset_val as i64,
                 src_dtype: ScalarCvtSource::F16,
                 width,
             });
@@ -1848,7 +1848,7 @@ fn emit_quant_scale_load(
 fn emit_quant_data_load(
     prog: &mut VmProgram,
     base: VRegId,
-    offset: i64,
+    offset: usize,
     quant_type: QuantType,
     block_size: usize,
     width: SimdWidth,
@@ -1877,7 +1877,7 @@ fn emit_quant_data_load(
         QuantDataKind::PackedInt5 => {
             let bytes = prog.alloc_vreg(VRegKind::Vec, width);
             let count = width.f32_lanes().min(32);
-            prog.emit(VmInstr::QuantLoadBytesVec { dst: bytes, base, offset: offset_val, count, signed: false, width });
+            prog.emit(VmInstr::QuantLoadBytesVec { dst: bytes, base, offset: offset_val as i64, count, signed: false, width });
             let mask = prog.alloc_vreg(VRegKind::Vec, width);
             prog.emit(VmInstr::QuantBroadcastInt { dst: mask, value: 0x1F, width });
             let extracted = prog.alloc_vreg(VRegKind::Vec, width);
@@ -1887,7 +1887,7 @@ fn emit_quant_data_load(
         QuantDataKind::PackedInt6 => {
             let bytes = prog.alloc_vreg(VRegKind::Vec, width);
             let count = width.f32_lanes().min(32);
-            prog.emit(VmInstr::QuantLoadBytesVec { dst: bytes, base, offset: offset_val, count, signed: false, width });
+            prog.emit(VmInstr::QuantLoadBytesVec { dst: bytes, base, offset: offset_val as i64, count, signed: false, width });
             let mask = prog.alloc_vreg(VRegKind::Vec, width);
             prog.emit(VmInstr::QuantBroadcastInt { dst: mask, value: 0x3F, width });
             let extracted = prog.alloc_vreg(VRegKind::Vec, width);
@@ -1897,7 +1897,7 @@ fn emit_quant_data_load(
         QuantDataKind::SuperLowBit => {
             let bytes = prog.alloc_vreg(VRegKind::Vec, width);
             let count = width.f32_lanes().min(32);
-            prog.emit(VmInstr::QuantLoadBytesVec { dst: bytes, base, offset: offset_val, count, signed: false, width });
+            prog.emit(VmInstr::QuantLoadBytesVec { dst: bytes, base, offset: offset_val as i64, count, signed: false, width });
             let codebook_data = desc.codebook.as_ref().map(|cb| cb.codebook_data).unwrap_or(&[]);
             prog.emit(VmInstr::QuantCodebookLookup {
                 dst: r,
@@ -1910,7 +1910,7 @@ fn emit_quant_data_load(
         }
         QuantDataKind::Float4 | QuantDataKind::Nvfp4 => {
             let scale_src = prog.alloc_vreg(VRegKind::Vec, width);
-            prog.emit(VmInstr::QuantScalarCvtLoad { dst: scale_src, base, offset: offset_val, src_dtype: ScalarCvtSource::U8, width });
+            prog.emit(VmInstr::QuantScalarCvtLoad { dst: scale_src, base, offset: offset_val as i64, src_dtype: ScalarCvtSource::U8, width });
             let unpack = if matches!(desc.data_kind, QuantDataKind::Nvfp4) {
                 BlockUnpackMode::Nvfp4 { scale_src }
             } else {
