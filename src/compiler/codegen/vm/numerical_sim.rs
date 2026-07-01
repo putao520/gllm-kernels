@@ -453,7 +453,116 @@ impl NumericalSimulator {
 
     /// 执行单个 TraceOp，结果存储在 ValueId(trace_pos)。
     /// trace_pos 对应 trace 数组索引，与 push_op 分配的 ValueId 一致。
+    ///
+    /// 顶层为纯 dispatch：按 ComputePattern 7 类路由到对应 per-pattern handler
+    /// (BCE-20260630-NUMERICAL-SIM 根治, 镜像 auto_select::dispatch_trace_op)。
     fn exec_op_with_pos(
+        &self,
+        op: &TraceOp,
+        trace_pos: u32,
+        state: &mut SimState,
+        desc: &QuantFormatDescriptor,
+    ) -> Result<Option<ValueId>, CompilerError> {
+        match op {
+                        TraceOp::Input(_) => self.exec_elementwise(op, trace_pos, state, desc),
+                        TraceOp::Const(_) => self.exec_elementwise(op, trace_pos, state, desc),
+                        TraceOp::Add(_, _) => self.exec_binary(op, trace_pos, state, desc),
+                        TraceOp::Sub(_, _) => self.exec_binary(op, trace_pos, state, desc),
+                        TraceOp::Mul(_, _) => self.exec_binary(op, trace_pos, state, desc),
+                        TraceOp::Div(_, _) => self.exec_binary(op, trace_pos, state, desc),
+                        TraceOp::Pow(_, _) => self.exec_binary(op, trace_pos, state, desc),
+                        TraceOp::Fma(_, _, _) => self.exec_binary(op, trace_pos, state, desc),
+                        TraceOp::Neg(_) => self.exec_elementwise(op, trace_pos, state, desc),
+                        TraceOp::Abs(_) => self.exec_elementwise(op, trace_pos, state, desc),
+                        TraceOp::Sqrt(_) => self.exec_elementwise(op, trace_pos, state, desc),
+                        TraceOp::Rsqrt(_) => self.exec_elementwise(op, trace_pos, state, desc),
+                        TraceOp::Max(_, _) => self.exec_binary(op, trace_pos, state, desc),
+                        TraceOp::Min(_, _) => self.exec_binary(op, trace_pos, state, desc),
+                        TraceOp::QuantBitAnd { .. } => self.exec_quant_decode(op, trace_pos, state, desc),
+                        TraceOp::QuantBitOr { .. } => self.exec_quant_decode(op, trace_pos, state, desc),
+                        TraceOp::QuantBroadcast { .. } => self.exec_quant_decode(op, trace_pos, state, desc),
+                        TraceOp::QuantCastF16toF32 { .. } => self.exec_quant_decode(op, trace_pos, state, desc),
+                        TraceOp::QuantCastI8toF32 { .. } => self.exec_quant_decode(op, trace_pos, state, desc),
+                        TraceOp::QuantCastFp8toF32 { .. } => self.exec_quant_decode(op, trace_pos, state, desc),
+                        TraceOp::QuantExtractBits { .. } => self.exec_quant_decode(op, trace_pos, state, desc),
+                        TraceOp::QuantIntDivConst { .. } => self.exec_quant_decode(op, trace_pos, state, desc),
+                        TraceOp::QuantPtrAddOffset { .. } => self.exec_quant_decode(op, trace_pos, state, desc),
+                        TraceOp::QuantPtrAddDynamic { .. } => self.exec_quant_decode(op, trace_pos, state, desc),
+                        TraceOp::QuantScalarLoad { .. } => self.exec_quant_decode(op, trace_pos, state, desc),
+                        TraceOp::QuantDequantFma { .. } => self.exec_quant_decode(op, trace_pos, state, desc),
+                        TraceOp::QuantIntMul { .. } => self.exec_quant_decode(op, trace_pos, state, desc),
+                        TraceOp::QuantInterleave { .. } => self.exec_quant_decode(op, trace_pos, state, desc),
+                        TraceOp::QuantConcatSeq { .. } => self.exec_quant_decode(op, trace_pos, state, desc),
+                        TraceOp::QuantAndMask { .. } => self.exec_quant_decode(op, trace_pos, state, desc),
+                        TraceOp::QuantLoadF16toF32 { .. } => self.exec_quant_decode(op, trace_pos, state, desc),
+                        TraceOp::QuantLoadI8toF32 { .. } => self.exec_quant_decode(op, trace_pos, state, desc),
+                        TraceOp::QuantLoadBytesVec { .. } => self.exec_quant_decode(op, trace_pos, state, desc),
+                        TraceOp::QuantShiftLeft { .. } => self.exec_quant_decode(op, trace_pos, state, desc),
+                        TraceOp::QuantShiftRight { .. } => self.exec_quant_decode(op, trace_pos, state, desc),
+                        TraceOp::Exp(_) => self.exec_elementwise(op, trace_pos, state, desc),
+                        TraceOp::Tanh(_) => self.exec_elementwise(op, trace_pos, state, desc),
+                        TraceOp::Recip(_) => self.exec_elementwise(op, trace_pos, state, desc),
+                        TraceOp::Log(_) => self.exec_elementwise(op, trace_pos, state, desc),
+                        TraceOp::Sigmoid(_) => self.exec_elementwise(op, trace_pos, state, desc),
+                        TraceOp::ConditionalBranch(_, _, _) => self.exec_elementwise(op, trace_pos, state, desc),
+                        TraceOp::QuantFma { .. } => self.exec_binary(op, trace_pos, state, desc),
+                        TraceOp::BlockScale { .. } => self.exec_binary(op, trace_pos, state, desc),
+                        TraceOp::Cast { .. } => self.exec_elementwise(op, trace_pos, state, desc),
+                        TraceOp::HReduce { .. } => self.exec_reduction(op, trace_pos, state, desc),
+                        TraceOp::Prefetch { .. } => self.exec_elementwise(op, trace_pos, state, desc),
+                        TraceOp::NonTemporalStore => self.exec_elementwise(op, trace_pos, state, desc),
+                        TraceOp::BitExtract { .. } => self.exec_binary(op, trace_pos, state, desc),
+                        TraceOp::Permute { .. } => self.exec_binary(op, trace_pos, state, desc),
+                        TraceOp::Compare { .. } => self.exec_elementwise(op, trace_pos, state, desc),
+                        TraceOp::MaskedOp { .. } => self.exec_binary(op, trace_pos, state, desc),
+                        TraceOp::AtomicAdd { .. } => self.exec_binary(op, trace_pos, state, desc),
+                        TraceOp::FWHT { .. } => self.exec_injective(op, trace_pos, state, desc),
+                        TraceOp::ScalarLoad { .. } => self.exec_injective(op, trace_pos, state, desc),
+                        TraceOp::StrideMul { .. } => self.exec_injective(op, trace_pos, state, desc),
+                        TraceOp::PtrAdd { .. } => self.exec_injective(op, trace_pos, state, desc),
+                        TraceOp::VecLoadIndexed { .. } => self.exec_injective(op, trace_pos, state, desc),
+                        TraceOp::VecStoreIndexed { .. } => self.exec_injective(op, trace_pos, state, desc),
+                        TraceOp::BroadcastScalar { .. } => self.exec_elementwise(op, trace_pos, state, desc),
+                        TraceOp::BroadcastLoad { .. } => self.exec_injective(op, trace_pos, state, desc),
+                        TraceOp::GatherLoad { .. } => self.exec_injective(op, trace_pos, state, desc),
+                        TraceOp::ScatterStore { .. } => self.exec_injective(op, trace_pos, state, desc),
+                        TraceOp::TableLookup { .. } => self.exec_injective(op, trace_pos, state, desc),
+                        TraceOp::Mxfp4Dequant { .. } => self.exec_injective(op, trace_pos, state, desc),
+                        TraceOp::BitAnd(_, _) => self.exec_binary(op, trace_pos, state, desc),
+                        TraceOp::QuantCodebookLookup { .. } => self.exec_quant_decode(op, trace_pos, state, desc),
+                        TraceOp::QuantE2m1LutDecode { .. } => self.exec_quant_decode(op, trace_pos, state, desc),
+                        TraceOp::QuantKQuantPackedScaleLookup { .. } => self.exec_quant_decode(op, trace_pos, state, desc),
+                        TraceOp::QuantScaleLoad { .. } => self.exec_quant_decode(op, trace_pos, state, desc),
+                        TraceOp::QuantDataLoad { .. } => self.exec_quant_decode(op, trace_pos, state, desc),
+                        TraceOp::QuantZeroLoad { .. } => self.exec_quant_decode(op, trace_pos, state, desc),
+                        TraceOp::QuantSubScaleLoad { .. } => self.exec_quant_decode(op, trace_pos, state, desc),
+                        TraceOp::QuantHighBitsLoad { .. } => self.exec_quant_decode(op, trace_pos, state, desc),
+                        TraceOp::QuantCodebookDequant { .. } => self.exec_quant_decode(op, trace_pos, state, desc),
+                        TraceOp::Loop { .. } => self.exec_injective(op, trace_pos, state, desc),
+                        TraceOp::PanelLoad { .. } => self.exec_injective(op, trace_pos, state, desc),
+                        TraceOp::PanelStore { .. } => self.exec_injective(op, trace_pos, state, desc),
+                        TraceOp::PackBuffer { .. } => self.exec_injective(op, trace_pos, state, desc),
+                        TraceOp::SharedMemDeclare { .. } => self.exec_injective(op, trace_pos, state, desc),
+                        TraceOp::AsyncCopyToShared { .. } => self.exec_injective(op, trace_pos, state, desc),
+                        TraceOp::Tma2DCopy { .. } => self.exec_injective(op, trace_pos, state, desc),
+                        TraceOp::AsyncWaitGroup { .. } => self.exec_injective(op, trace_pos, state, desc),
+                        TraceOp::SyncBarrier { .. } => self.exec_injective(op, trace_pos, state, desc),
+                        TraceOp::TileConfig { .. } => self.exec_injective(op, trace_pos, state, desc),
+                        TraceOp::TileMma { .. } => self.exec_gemm(op, trace_pos, state, desc),
+                        TraceOp::TileRelease => self.exec_injective(op, trace_pos, state, desc),
+                        TraceOp::Softmax { .. } => self.exec_normlike(op, trace_pos, state, desc),
+                        TraceOp::EpilogueChain { .. } => self.exec_injective(op, trace_pos, state, desc),
+                        TraceOp::QuantGather { .. } | TraceOp::QuantGemm { .. }
+            | TraceOp::MtpDraft { .. }
+            | TraceOp::MlaAttnScore { .. }
+            | TraceOp::MlaRopeMerge { .. }
+            | TraceOp::DynamicPrecisionSelect { .. }
+            | TraceOp::QuantQ3KDecode { .. } => self.exec_quant_decode(op, trace_pos, state, desc),
+        }
+    }
+    /// ComputePattern::elementwise 仿真 handler (REQ-LC-011 查表化).
+    /// 集中处理 17 个同 ComputePattern 的 TraceOp 变体。
+    fn exec_elementwise(
         &self,
         op: &TraceOp,
         trace_pos: u32,
@@ -476,6 +585,188 @@ impl NumericalSimulator {
             }
 
             // 算术运算
+            TraceOp::Neg(a) => {
+                let a_val = state.get(*a).as_float()?;
+                let result = -a_val;
+                let id = ValueId(trace_pos);
+                state.set(id, SimValue::Float(result));
+                Ok(Some(id))
+            }
+
+            TraceOp::Abs(a) => {
+                let a_val = state.get(*a).as_float()?;
+                let result = a_val.abs();
+                let id = ValueId(trace_pos);
+                state.set(id, SimValue::Float(result));
+                Ok(Some(id))
+            }
+
+            TraceOp::Sqrt(a) => {
+                let a_val = state.get(*a).as_float()?;
+                if a_val < 0.0 {
+                    return Err(CompilerError::CodegenViolation(
+                        format!("Simulation error: sqrt of negative value {}", a_val)
+                    ));
+                }
+                let result = a_val.sqrt();
+                let id = ValueId(trace_pos);
+                state.set(id, SimValue::Float(result));
+                Ok(Some(id))
+            }
+
+            TraceOp::Rsqrt(a) => {
+                let a_val = state.get(*a).as_float()?;
+                if a_val <= 0.0 {
+                    return Err(CompilerError::CodegenViolation(
+                        format!("Simulation error: rsqrt of non-positive value {}", a_val)
+                    ));
+                }
+                let result = 1.0 / a_val.sqrt();
+                let id = ValueId(trace_pos);
+                state.set(id, SimValue::Float(result));
+                Ok(Some(id))
+            }
+
+            TraceOp::Exp(a) => {
+                let a_val = state.get(*a).as_float()?;
+                let result = a_val.exp();
+                let id = ValueId(trace_pos);
+                state.set(id, SimValue::Float(result));
+                Ok(Some(id))
+            }
+
+            // ── Tanh ──
+            TraceOp::Tanh(a) => {
+                let a_val = state.get(*a).as_float()?;
+                let result = a_val.tanh();
+                let id = ValueId(trace_pos);
+                state.set(id, SimValue::Float(result));
+                Ok(Some(id))
+            }
+
+            // ── Recip (倒数) ──
+            TraceOp::Recip(a) => {
+                let a_val = state.get(*a).as_float()?;
+                if a_val == 0.0 {
+                    return Err(CompilerError::CodegenViolation(
+                        "Simulation error: reciprocal of zero".to_string()
+                    ));
+                }
+                let result = 1.0 / a_val;
+                let id = ValueId(trace_pos);
+                state.set(id, SimValue::Float(result));
+                Ok(Some(id))
+            }
+
+            // ── Log ──
+            TraceOp::Log(a) => {
+                let a_val = state.get(*a).as_float()?;
+                if a_val <= 0.0 {
+                    return Err(CompilerError::CodegenViolation(
+                        format!("Simulation error: log of non-positive value {}", a_val)
+                    ));
+                }
+                let result = a_val.ln();
+                let id = ValueId(trace_pos);
+                state.set(id, SimValue::Float(result));
+                Ok(Some(id))
+            }
+
+            // ── Sigmoid ──
+            TraceOp::Sigmoid(a) => {
+                let a_val = state.get(*a).as_float()?;
+                let result = 1.0 / (1.0 + (-a_val).exp());
+                let id = ValueId(trace_pos);
+                state.set(id, SimValue::Float(result));
+                Ok(Some(id))
+            }
+
+            // ── ConditionalBranch ──
+            TraceOp::ConditionalBranch(mask_val, true_val, false_val) => {
+                let m = state.get(*mask_val).as_float()?;
+                let t = state.get(*true_val).as_float()?;
+                let f = state.get(*false_val).as_float()?;
+                let result = if m != 0.0 { t } else { f };
+                let id = ValueId(trace_pos);
+                state.set(id, SimValue::Float(result));
+                Ok(Some(id))
+            }
+
+            // ── QuantFma (混合精度 FMA) ──
+            TraceOp::Cast { src, from: _, to: _ } => {
+                let val = state.get(*src);
+                match val {
+                    SimValue::Float(_) => {
+                        let id = ValueId(trace_pos);
+                        state.set(id, val);
+                        Ok(Some(id))
+                    }
+                    SimValue::Integer(i) => {
+                        let id = ValueId(trace_pos);
+                        state.set(id, SimValue::Float(i as f32));
+                        Ok(Some(id))
+                    }
+                    SimValue::Invalid => Err(CompilerError::CodegenViolation(
+                        "Simulation error: Cast on invalid value".to_string()
+                    )),
+                }
+            }
+
+            // ── HReduce (标量模拟: 直接取源值作为标量结果) ──
+            TraceOp::Prefetch { level: _ } => {
+                // Prefetch 是内存层级提示，标量模拟不需要执行
+                // 返回一个虚值以保持 SSA 连续性
+                let id = ValueId(trace_pos);
+                state.set(id, SimValue::Float(0.0));
+                Ok(Some(id))
+            }
+
+            // ── NonTemporalStore (标量模拟: NOP) ──
+            TraceOp::NonTemporalStore => {
+                let id = ValueId(trace_pos);
+                state.set(id, SimValue::Float(0.0));
+                Ok(Some(id))
+            }
+
+            // ── BitExtract ──
+            TraceOp::Compare { a, b, op } => {
+                let a_val = state.get(*a).as_float()?;
+                let b_val = state.get(*b).as_float()?;
+                let result = match op {
+                    CmpOp::Eq => if a_val == b_val { 1.0 } else { 0.0 },
+                    CmpOp::Ne => if a_val != b_val { 1.0 } else { 0.0 },
+                    CmpOp::Lt => if a_val < b_val { 1.0 } else { 0.0 },
+                    CmpOp::Le => if a_val <= b_val { 1.0 } else { 0.0 },
+                    CmpOp::Gt => if a_val > b_val { 1.0 } else { 0.0 },
+                    CmpOp::Ge => if a_val >= b_val { 1.0 } else { 0.0 },
+                };
+                let id = ValueId(trace_pos);
+                state.set(id, SimValue::Float(result));
+                Ok(Some(id))
+            }
+
+            // ── MaskedOp (标量模拟: mask 为 true 则执行 op) ──
+            TraceOp::BroadcastScalar { src } => {
+                let val = state.get(*src);
+                let id = ValueId(trace_pos);
+                state.set(id, val);
+                Ok(Some(id))
+            }
+
+            // ── BroadcastLoad ──
+            _ => self.unreachable_pattern(op),
+        }
+    }
+    /// ComputePattern::binary 仿真 handler (REQ-LC-011 查表化).
+    /// 集中处理 15 个同 ComputePattern 的 TraceOp 变体。
+    fn exec_binary(
+        &self,
+        op: &TraceOp,
+        trace_pos: u32,
+        state: &mut SimState,
+        desc: &QuantFormatDescriptor,
+    ) -> Result<Option<ValueId>, CompilerError> {
+        match op {
             TraceOp::Add(a, b) => {
                 let a_val = state.get(*a).as_float()?;
                 let b_val = state.get(*b).as_float()?;
@@ -542,48 +833,6 @@ impl NumericalSimulator {
             }
 
             // 一元运算
-            TraceOp::Neg(a) => {
-                let a_val = state.get(*a).as_float()?;
-                let result = -a_val;
-                let id = ValueId(trace_pos);
-                state.set(id, SimValue::Float(result));
-                Ok(Some(id))
-            }
-
-            TraceOp::Abs(a) => {
-                let a_val = state.get(*a).as_float()?;
-                let result = a_val.abs();
-                let id = ValueId(trace_pos);
-                state.set(id, SimValue::Float(result));
-                Ok(Some(id))
-            }
-
-            TraceOp::Sqrt(a) => {
-                let a_val = state.get(*a).as_float()?;
-                if a_val < 0.0 {
-                    return Err(CompilerError::CodegenViolation(
-                        format!("Simulation error: sqrt of negative value {}", a_val)
-                    ));
-                }
-                let result = a_val.sqrt();
-                let id = ValueId(trace_pos);
-                state.set(id, SimValue::Float(result));
-                Ok(Some(id))
-            }
-
-            TraceOp::Rsqrt(a) => {
-                let a_val = state.get(*a).as_float()?;
-                if a_val <= 0.0 {
-                    return Err(CompilerError::CodegenViolation(
-                        format!("Simulation error: rsqrt of non-positive value {}", a_val)
-                    ));
-                }
-                let result = 1.0 / a_val.sqrt();
-                let id = ValueId(trace_pos);
-                state.set(id, SimValue::Float(result));
-                Ok(Some(id))
-            }
-
             TraceOp::Max(a, b) => {
                 let a_val = state.get(*a).as_float()?;
                 let b_val = state.get(*b).as_float()?;
@@ -603,6 +852,409 @@ impl NumericalSimulator {
             }
 
             // 量化操作
+            TraceOp::QuantFma { acc, act, weight, act_dtype: _, weight_dtype: _ } => {
+                let acc_val = state.get(*acc).as_float()?;
+                let act_val = state.get(*act).as_float()?;
+                let weight_val = state.get(*weight).as_float()?;
+                let result = acc_val + act_val * weight_val;
+                let id = ValueId(trace_pos);
+                state.set(id, SimValue::Float(result));
+                Ok(Some(id))
+            }
+
+            // ── BlockScale ──
+            TraceOp::BlockScale { data, scale, block_size: _ } => {
+                let data_val = state.get(*data).as_float()?;
+                let scale_val = state.get(*scale).as_float()?;
+                let result = data_val * scale_val;
+                let id = ValueId(trace_pos);
+                state.set(id, SimValue::Float(result));
+                Ok(Some(id))
+            }
+
+            // ── Cast (类型转换, 标量模拟直接传递) ──
+            TraceOp::BitExtract { src, offset, width } => {
+                let src_val = state.get(*src).as_integer()?;
+                let mask = (1i64 << width) - 1;
+                let result = (src_val >> offset) & mask;
+                let id = ValueId(trace_pos);
+                state.set(id, SimValue::Integer(result));
+                Ok(Some(id))
+            }
+
+            // ── Permute (标量模拟: 传递源值) ──
+            TraceOp::Permute { src, indices: _ } => {
+                let val = state.get(*src);
+                let id = ValueId(trace_pos);
+                state.set(id, val);
+                Ok(Some(id))
+            }
+
+            // ── Compare ──
+            TraceOp::MaskedOp { op, mask } => {
+                let mask_val = state.get(*mask).as_float()?;
+                if mask_val != 0.0 {
+                    self.exec_op_with_pos(op, trace_pos, state, desc)
+                } else {
+                    let id = ValueId(trace_pos);
+                    state.set(id, SimValue::Float(0.0));
+                    Ok(Some(id))
+                }
+            }
+
+            // ── AtomicAdd (标量模拟: 对 value 求和) ──
+            TraceOp::AtomicAdd { addr: _, val } => {
+                let val_val = state.get(*val).as_float()?;
+                let id = ValueId(trace_pos);
+                state.set(id, SimValue::Float(val_val));
+                Ok(Some(id))
+            }
+
+            // ── FWHT (Fast Walsh-Hadamard Transform, 标量模拟: 传递源值) ──
+            TraceOp::BitAnd(a, b) => {
+                let a_val = state.get(*a).as_integer()?;
+                let b_val = state.get(*b).as_integer()?;
+                let result = a_val & b_val;
+                let id = ValueId(trace_pos);
+                state.set(id, SimValue::Integer(result));
+                Ok(Some(id))
+            }
+
+            // ── QuantCodebookLookup ──
+            _ => self.unreachable_pattern(op),
+        }
+    }
+    /// ComputePattern::injective 仿真 handler (REQ-LC-011 查表化).
+    /// 集中处理 23 个同 ComputePattern 的 TraceOp 变体。
+    fn exec_injective(
+        &self,
+        op: &TraceOp,
+        trace_pos: u32,
+        state: &mut SimState,
+        desc: &QuantFormatDescriptor,
+    ) -> Result<Option<ValueId>, CompilerError> {
+        match op {
+            TraceOp::FWHT { src, dim: _ } => {
+                let val = state.get(*src);
+                let id = ValueId(trace_pos);
+                state.set(id, val);
+                Ok(Some(id))
+            }
+
+            // ── ScalarLoad ──
+            TraceOp::ScalarLoad { base, offset } => {
+                let base_val = state.get(*base).as_integer()?;
+                let offset_val = state.get(*offset).as_integer()?;
+                let addr = base_val + offset_val;
+                let byte_val = state.load_u8(addr)?;
+                let id = ValueId(trace_pos);
+                state.set(id, SimValue::Integer(byte_val as i64));
+                Ok(Some(id))
+            }
+
+            // ── StrideMul ──
+            TraceOp::StrideMul { value, stride } => {
+                let value_val = state.get(*value).as_integer()?;
+                let result = value_val * (*stride as i64);
+                let id = ValueId(trace_pos);
+                state.set(id, SimValue::Integer(result));
+                Ok(Some(id))
+            }
+
+            // ── PtrAdd ──
+            TraceOp::PtrAdd { base, offset } => {
+                let base_val = state.get(*base).as_integer()?;
+                let offset_val = state.get(*offset).as_integer()?;
+                let addr = base_val + offset_val;
+                let id = ValueId(trace_pos);
+                state.set(id, SimValue::Integer(addr));
+                Ok(Some(id))
+            }
+
+            // ── VecLoadIndexed (标量模拟: 加载一个字节) ──
+            TraceOp::VecLoadIndexed { base, offset } => {
+                let base_val = state.get(*base).as_integer()?;
+                let offset_val = state.get(*offset).as_integer()?;
+                let addr = base_val + offset_val;
+                let byte_val = state.load_u8(addr)?;
+                let id = ValueId(trace_pos);
+                state.set(id, SimValue::Float(byte_val as f32));
+                Ok(Some(id))
+            }
+
+            // ── VecStoreIndexed (标量模拟: 存储一个字节) ──
+            TraceOp::VecStoreIndexed { base, offset, value } => {
+                let base_val = state.get(*base).as_integer()?;
+                let offset_val = state.get(*offset).as_integer()?;
+                let value_val = state.get(*value).as_float()?;
+                let addr = base_val + offset_val;
+                state.store_u8(addr, value_val as u8)?;
+                let id = ValueId(trace_pos);
+                state.set(id, SimValue::Float(value_val));
+                Ok(Some(id))
+            }
+
+            // ── BroadcastScalar ──
+            TraceOp::BroadcastLoad { base, offset } => {
+                let base_val = state.get(*base).as_integer()?;
+                let offset_val = state.get(*offset).as_integer()?;
+                let addr = base_val + offset_val;
+                let byte_val = state.load_u8(addr)?;
+                let id = ValueId(trace_pos);
+                state.set(id, SimValue::Float(byte_val as f32));
+                Ok(Some(id))
+            }
+
+            // ── GatherLoad (标量模拟: 加载一个元素) ──
+            TraceOp::GatherLoad { base, indices, stride } => {
+                let base_val = state.get(*base).as_integer()?;
+                let idx_val = state.get(*indices).as_integer()?;
+                let addr = base_val + idx_val * (*stride as i64);
+                let byte_val = state.load_u8(addr)?;
+                let id = ValueId(trace_pos);
+                state.set(id, SimValue::Float(byte_val as f32));
+                Ok(Some(id))
+            }
+
+            // ── ScatterStore (标量模拟: 存储一个元素) ──
+            TraceOp::ScatterStore { base, indices, value, stride } => {
+                let base_val = state.get(*base).as_integer()?;
+                let idx_val = state.get(*indices).as_integer()?;
+                let value_val = state.get(*value).as_float()?;
+                let addr = base_val + idx_val * (*stride as i64);
+                state.store_u8(addr, value_val as u8)?;
+                let id = ValueId(trace_pos);
+                state.set(id, SimValue::Float(value_val));
+                Ok(Some(id))
+            }
+
+            // ── TableLookup ──
+            TraceOp::TableLookup { base, row_index, row_bytes } => {
+                let base_val = state.get(*base).as_integer()?;
+                let row_idx = state.get(*row_index).as_integer()?;
+                let addr = base_val + row_idx * (*row_bytes as i64);
+                let byte_val = state.load_u8(addr)?;
+                let id = ValueId(trace_pos);
+                state.set(id, SimValue::Float(byte_val as f32));
+                Ok(Some(id))
+            }
+
+            // ── Mxfp4Dequant (标量模拟: 加载并反量化一个 MXFP4 元素) ──
+            TraceOp::Mxfp4Dequant { data, scales, off_a: _, stride_a: _, off_b: _, stride_b: _, off_c: _, const_off: _, block_size: _ } => {
+                let data_val = state.get(*data).as_integer()?;
+                let scales_val = state.get(*scales).as_integer()?;
+                // MXFP4: data 是 packed nibble 地址, scales 是 scale 地址
+                let nibble = state.load_u8(data_val)?;
+                let scale_byte = state.load_u8(scales_val)?;
+                // E2M1 解码
+                let e2m1_val = decode_e2m1_scalar(nibble & 0x0F);
+                // E8M0 反量化: scale = 2^(scale_byte - 15)
+                let scale = (2.0_f32).powi((scale_byte as i32) - 15);
+                let result = e2m1_val * scale;
+                let id = ValueId(trace_pos);
+                state.set(id, SimValue::Float(result));
+                Ok(Some(id))
+            }
+
+            // ── BitAnd ──
+            TraceOp::Loop { bound: _, step_bytes: _, body } => {
+                // 标量模拟: 仅执行 body 一次。
+                // body 内的 op 共享外层 trace_pos 空间，使用 alloc_id 避免碰撞。
+                let mut last_id = None;
+                for inner_op in body {
+                    let inner_pos = state.next_id;
+                    state.next_id += 1;
+                    match inner_op {
+                        TraceOp::Input(idx) => {
+                            // Loop body 内的 Input 引用外层输入
+                            let val = state.get(ValueId(*idx));
+                            let id = ValueId(inner_pos);
+                            state.set(id, val);
+                            last_id = Some(id);
+                        }
+                        _ => {
+                            if let Ok(Some(id)) = self.exec_op_with_pos(inner_op, inner_pos, state, desc) {
+                                last_id = Some(id);
+                            }
+                        }
+                    }
+                }
+                Ok(last_id)
+            }
+
+            // ── PanelLoad (标量模拟: 加载 row 0, col 0 的一个元素) ──
+            TraceOp::PanelLoad { base, offset, rows: _, cols: _ } => {
+                let base_val = state.get(*base).as_integer()?;
+                let offset_val = state.get(*offset).as_integer()?;
+                let addr = base_val + offset_val;
+                let byte = state.load_u8(addr)?;
+                let id = ValueId(trace_pos);
+                state.set(id, SimValue::Float(byte as f32));
+                Ok(Some(id))
+            }
+
+            // ── PanelStore (标量模拟: 存储一个字节) ──
+            TraceOp::PanelStore { base, offset, rows: _, cols: _ } => {
+                let base_val = state.get(*base).as_integer()?;
+                let offset_val = state.get(*offset).as_integer()?;
+                // 标量模拟中，存储源的最后一个浮点值
+                let id = ValueId(trace_pos);
+                state.set(id, SimValue::Float(0.0));
+                Ok(Some(id))
+            }
+
+            // ── PackBuffer (标量模拟: NOP) ──
+            TraceOp::PackBuffer { src, dst: _, rows: _, cols: _, layout: _ } => {
+                let val = state.get(*src);
+                let id = ValueId(trace_pos);
+                state.set(id, val);
+                Ok(Some(id))
+            }
+
+            // ── SharedMemDeclare (标量模拟: NOP) ──
+            TraceOp::SharedMemDeclare { name: _, bytes: _ } => {
+                let id = ValueId(trace_pos);
+                state.set(id, SimValue::Float(0.0));
+                Ok(Some(id))
+            }
+
+            // ── AsyncCopyToShared (标量模拟: NOP) ──
+            TraceOp::AsyncCopyToShared { name: _, src_offset: _, bytes: _ } => {
+                let id = ValueId(trace_pos);
+                state.set(id, SimValue::Float(0.0));
+                Ok(Some(id))
+            }
+
+            // ── Tma2DCopy (标量模拟: NOP) ──
+            TraceOp::Tma2DCopy { desc: _, coord_x: _, coord_y: _, bytes: _ } => {
+                let id = ValueId(trace_pos);
+                state.set(id, SimValue::Float(0.0));
+                Ok(Some(id))
+            }
+
+            // ── AsyncWaitGroup (标量模拟: NOP) ──
+            TraceOp::AsyncWaitGroup { n: _ } => {
+                let id = ValueId(trace_pos);
+                state.set(id, SimValue::Float(0.0));
+                Ok(Some(id))
+            }
+
+            // ── SyncBarrier (标量模拟: NOP) ──
+            TraceOp::SyncBarrier { name: _ } => {
+                let id = ValueId(trace_pos);
+                state.set(id, SimValue::Float(0.0));
+                Ok(Some(id))
+            }
+
+            // ── TileConfig (标量模拟: NOP) ──
+            TraceOp::TileConfig { rows: _, cols: _ } => {
+                let id = ValueId(trace_pos);
+                state.set(id, SimValue::Float(0.0));
+                Ok(Some(id))
+            }
+
+            // ── TileMma (标量模拟: 标量 FMA; shape m/n/k 仅用于 VmInstr 透传, 标量模拟忽略) ──
+            TraceOp::TileRelease => {
+                let id = ValueId(trace_pos);
+                state.set(id, SimValue::Float(0.0));
+                Ok(Some(id))
+            }
+
+            // ── Softmax (标量模拟: 标量恒等映射) ──
+            TraceOp::EpilogueChain { ops: _ } => {
+                let id = ValueId(trace_pos);
+                state.set(id, SimValue::Float(0.0));
+                Ok(Some(id))
+            }
+
+            // ── SPEC 24-QUANT-PIPELINE-JIT: QuantGather/QuantGemm structural ops ──
+            // These are structural ops expanded by auto_select; numerical sim treats them as no-ops.
+            _ => self.unreachable_pattern(op),
+        }
+    }
+    /// ComputePattern::reduction 仿真 handler (REQ-LC-011 查表化).
+    /// 集中处理 1 个同 ComputePattern 的 TraceOp 变体。
+    fn exec_reduction(
+        &self,
+        op: &TraceOp,
+        trace_pos: u32,
+        state: &mut SimState,
+        desc: &QuantFormatDescriptor,
+    ) -> Result<Option<ValueId>, CompilerError> {
+        match op {
+            TraceOp::HReduce { src, op } => {
+                let val = state.get(*src).as_float()?;
+                let result = match op {
+                    ReduceKind::Sum | ReduceKind::Prod | ReduceKind::Max
+                    | ReduceKind::Min | ReduceKind::LogSum => val,
+                    ReduceKind::Count => 1.0,
+                    ReduceKind::ArgMax => 0.0,
+                };
+                let id = ValueId(trace_pos);
+                state.set(id, SimValue::Float(result));
+                Ok(Some(id))
+            }
+
+            // ── Prefetch (标量模拟: NOP) ──
+            _ => self.unreachable_pattern(op),
+        }
+    }
+    /// ComputePattern::normlike 仿真 handler (REQ-LC-011 查表化).
+    /// 集中处理 1 个同 ComputePattern 的 TraceOp 变体。
+    fn exec_normlike(
+        &self,
+        op: &TraceOp,
+        trace_pos: u32,
+        state: &mut SimState,
+        desc: &QuantFormatDescriptor,
+    ) -> Result<Option<ValueId>, CompilerError> {
+        match op {
+            TraceOp::Softmax { src, dst: _ } => {
+                let s = state.get(*src).as_float()?;
+                // 标量模拟: softmax(标量) = 1.0 (单个元素的 softmax 总是 1.0)
+                let id = ValueId(trace_pos);
+                state.set(id, SimValue::Float(1.0));
+                Ok(Some(id))
+            }
+
+            // ── EpilogueChain (标量模拟: 传递源值) ──
+            _ => self.unreachable_pattern(op),
+        }
+    }
+    /// ComputePattern::gemm 仿真 handler (REQ-LC-011 查表化).
+    /// 集中处理 1 个同 ComputePattern 的 TraceOp 变体。
+    fn exec_gemm(
+        &self,
+        op: &TraceOp,
+        trace_pos: u32,
+        state: &mut SimState,
+        desc: &QuantFormatDescriptor,
+    ) -> Result<Option<ValueId>, CompilerError> {
+        match op {
+            TraceOp::TileMma { c, a, b, m: _, n: _, k: _ } => {
+                let c_val = state.get(*c).as_float()?;
+                let a_val = state.get(*a).as_float()?;
+                let b_val = state.get(*b).as_float()?;
+                let result = c_val + a_val * b_val;
+                let id = ValueId(trace_pos);
+                state.set(id, SimValue::Float(result));
+                Ok(Some(id))
+            }
+
+            // ── TileRelease (标量模拟: NOP) ──
+            _ => self.unreachable_pattern(op),
+        }
+    }
+    /// ComputePattern::quant_decode 仿真 handler (REQ-LC-011 查表化).
+    /// 集中处理 31 个同 ComputePattern 的 TraceOp 变体。
+    fn exec_quant_decode(
+        &self,
+        op: &TraceOp,
+        trace_pos: u32,
+        state: &mut SimState,
+        desc: &QuantFormatDescriptor,
+    ) -> Result<Option<ValueId>, CompilerError> {
+        match op {
             TraceOp::QuantBitAnd { lhs, rhs } => {
                 let lhs_val = state.get(*lhs).as_integer()?;
                 let rhs_val = state.get(*rhs).as_integer()?;
@@ -799,339 +1451,6 @@ impl NumericalSimulator {
             }
 
             // ── Exp ──
-            TraceOp::Exp(a) => {
-                let a_val = state.get(*a).as_float()?;
-                let result = a_val.exp();
-                let id = ValueId(trace_pos);
-                state.set(id, SimValue::Float(result));
-                Ok(Some(id))
-            }
-
-            // ── Tanh ──
-            TraceOp::Tanh(a) => {
-                let a_val = state.get(*a).as_float()?;
-                let result = a_val.tanh();
-                let id = ValueId(trace_pos);
-                state.set(id, SimValue::Float(result));
-                Ok(Some(id))
-            }
-
-            // ── Recip (倒数) ──
-            TraceOp::Recip(a) => {
-                let a_val = state.get(*a).as_float()?;
-                if a_val == 0.0 {
-                    return Err(CompilerError::CodegenViolation(
-                        "Simulation error: reciprocal of zero".to_string()
-                    ));
-                }
-                let result = 1.0 / a_val;
-                let id = ValueId(trace_pos);
-                state.set(id, SimValue::Float(result));
-                Ok(Some(id))
-            }
-
-            // ── Log ──
-            TraceOp::Log(a) => {
-                let a_val = state.get(*a).as_float()?;
-                if a_val <= 0.0 {
-                    return Err(CompilerError::CodegenViolation(
-                        format!("Simulation error: log of non-positive value {}", a_val)
-                    ));
-                }
-                let result = a_val.ln();
-                let id = ValueId(trace_pos);
-                state.set(id, SimValue::Float(result));
-                Ok(Some(id))
-            }
-
-            // ── Sigmoid ──
-            TraceOp::Sigmoid(a) => {
-                let a_val = state.get(*a).as_float()?;
-                let result = 1.0 / (1.0 + (-a_val).exp());
-                let id = ValueId(trace_pos);
-                state.set(id, SimValue::Float(result));
-                Ok(Some(id))
-            }
-
-            // ── ConditionalBranch ──
-            TraceOp::ConditionalBranch(mask_val, true_val, false_val) => {
-                let m = state.get(*mask_val).as_float()?;
-                let t = state.get(*true_val).as_float()?;
-                let f = state.get(*false_val).as_float()?;
-                let result = if m != 0.0 { t } else { f };
-                let id = ValueId(trace_pos);
-                state.set(id, SimValue::Float(result));
-                Ok(Some(id))
-            }
-
-            // ── QuantFma (混合精度 FMA) ──
-            TraceOp::QuantFma { acc, act, weight, act_dtype: _, weight_dtype: _ } => {
-                let acc_val = state.get(*acc).as_float()?;
-                let act_val = state.get(*act).as_float()?;
-                let weight_val = state.get(*weight).as_float()?;
-                let result = acc_val + act_val * weight_val;
-                let id = ValueId(trace_pos);
-                state.set(id, SimValue::Float(result));
-                Ok(Some(id))
-            }
-
-            // ── BlockScale ──
-            TraceOp::BlockScale { data, scale, block_size: _ } => {
-                let data_val = state.get(*data).as_float()?;
-                let scale_val = state.get(*scale).as_float()?;
-                let result = data_val * scale_val;
-                let id = ValueId(trace_pos);
-                state.set(id, SimValue::Float(result));
-                Ok(Some(id))
-            }
-
-            // ── Cast (类型转换, 标量模拟直接传递) ──
-            TraceOp::Cast { src, from: _, to: _ } => {
-                let val = state.get(*src);
-                match val {
-                    SimValue::Float(_) => {
-                        let id = ValueId(trace_pos);
-                        state.set(id, val);
-                        Ok(Some(id))
-                    }
-                    SimValue::Integer(i) => {
-                        let id = ValueId(trace_pos);
-                        state.set(id, SimValue::Float(i as f32));
-                        Ok(Some(id))
-                    }
-                    SimValue::Invalid => Err(CompilerError::CodegenViolation(
-                        "Simulation error: Cast on invalid value".to_string()
-                    )),
-                }
-            }
-
-            // ── HReduce (标量模拟: 直接取源值作为标量结果) ──
-            TraceOp::HReduce { src, op } => {
-                let val = state.get(*src).as_float()?;
-                let result = match op {
-                    ReduceKind::Sum | ReduceKind::Prod | ReduceKind::Max
-                    | ReduceKind::Min | ReduceKind::LogSum => val,
-                    ReduceKind::Count => 1.0,
-                    ReduceKind::ArgMax => 0.0,
-                };
-                let id = ValueId(trace_pos);
-                state.set(id, SimValue::Float(result));
-                Ok(Some(id))
-            }
-
-            // ── Prefetch (标量模拟: NOP) ──
-            TraceOp::Prefetch { level: _ } => {
-                // Prefetch 是内存层级提示，标量模拟不需要执行
-                // 返回一个虚值以保持 SSA 连续性
-                let id = ValueId(trace_pos);
-                state.set(id, SimValue::Float(0.0));
-                Ok(Some(id))
-            }
-
-            // ── NonTemporalStore (标量模拟: NOP) ──
-            TraceOp::NonTemporalStore => {
-                let id = ValueId(trace_pos);
-                state.set(id, SimValue::Float(0.0));
-                Ok(Some(id))
-            }
-
-            // ── BitExtract ──
-            TraceOp::BitExtract { src, offset, width } => {
-                let src_val = state.get(*src).as_integer()?;
-                let mask = (1i64 << width) - 1;
-                let result = (src_val >> offset) & mask;
-                let id = ValueId(trace_pos);
-                state.set(id, SimValue::Integer(result));
-                Ok(Some(id))
-            }
-
-            // ── Permute (标量模拟: 传递源值) ──
-            TraceOp::Permute { src, indices: _ } => {
-                let val = state.get(*src);
-                let id = ValueId(trace_pos);
-                state.set(id, val);
-                Ok(Some(id))
-            }
-
-            // ── Compare ──
-            TraceOp::Compare { a, b, op } => {
-                let a_val = state.get(*a).as_float()?;
-                let b_val = state.get(*b).as_float()?;
-                let result = match op {
-                    CmpOp::Eq => if a_val == b_val { 1.0 } else { 0.0 },
-                    CmpOp::Ne => if a_val != b_val { 1.0 } else { 0.0 },
-                    CmpOp::Lt => if a_val < b_val { 1.0 } else { 0.0 },
-                    CmpOp::Le => if a_val <= b_val { 1.0 } else { 0.0 },
-                    CmpOp::Gt => if a_val > b_val { 1.0 } else { 0.0 },
-                    CmpOp::Ge => if a_val >= b_val { 1.0 } else { 0.0 },
-                };
-                let id = ValueId(trace_pos);
-                state.set(id, SimValue::Float(result));
-                Ok(Some(id))
-            }
-
-            // ── MaskedOp (标量模拟: mask 为 true 则执行 op) ──
-            TraceOp::MaskedOp { op, mask } => {
-                let mask_val = state.get(*mask).as_float()?;
-                if mask_val != 0.0 {
-                    self.exec_op_with_pos(op, trace_pos, state, desc)
-                } else {
-                    let id = ValueId(trace_pos);
-                    state.set(id, SimValue::Float(0.0));
-                    Ok(Some(id))
-                }
-            }
-
-            // ── AtomicAdd (标量模拟: 对 value 求和) ──
-            TraceOp::AtomicAdd { addr: _, val } => {
-                let val_val = state.get(*val).as_float()?;
-                let id = ValueId(trace_pos);
-                state.set(id, SimValue::Float(val_val));
-                Ok(Some(id))
-            }
-
-            // ── FWHT (Fast Walsh-Hadamard Transform, 标量模拟: 传递源值) ──
-            TraceOp::FWHT { src, dim: _ } => {
-                let val = state.get(*src);
-                let id = ValueId(trace_pos);
-                state.set(id, val);
-                Ok(Some(id))
-            }
-
-            // ── ScalarLoad ──
-            TraceOp::ScalarLoad { base, offset } => {
-                let base_val = state.get(*base).as_integer()?;
-                let offset_val = state.get(*offset).as_integer()?;
-                let addr = base_val + offset_val;
-                let byte_val = state.load_u8(addr)?;
-                let id = ValueId(trace_pos);
-                state.set(id, SimValue::Integer(byte_val as i64));
-                Ok(Some(id))
-            }
-
-            // ── StrideMul ──
-            TraceOp::StrideMul { value, stride } => {
-                let value_val = state.get(*value).as_integer()?;
-                let result = value_val * (*stride as i64);
-                let id = ValueId(trace_pos);
-                state.set(id, SimValue::Integer(result));
-                Ok(Some(id))
-            }
-
-            // ── PtrAdd ──
-            TraceOp::PtrAdd { base, offset } => {
-                let base_val = state.get(*base).as_integer()?;
-                let offset_val = state.get(*offset).as_integer()?;
-                let addr = base_val + offset_val;
-                let id = ValueId(trace_pos);
-                state.set(id, SimValue::Integer(addr));
-                Ok(Some(id))
-            }
-
-            // ── VecLoadIndexed (标量模拟: 加载一个字节) ──
-            TraceOp::VecLoadIndexed { base, offset } => {
-                let base_val = state.get(*base).as_integer()?;
-                let offset_val = state.get(*offset).as_integer()?;
-                let addr = base_val + offset_val;
-                let byte_val = state.load_u8(addr)?;
-                let id = ValueId(trace_pos);
-                state.set(id, SimValue::Float(byte_val as f32));
-                Ok(Some(id))
-            }
-
-            // ── VecStoreIndexed (标量模拟: 存储一个字节) ──
-            TraceOp::VecStoreIndexed { base, offset, value } => {
-                let base_val = state.get(*base).as_integer()?;
-                let offset_val = state.get(*offset).as_integer()?;
-                let value_val = state.get(*value).as_float()?;
-                let addr = base_val + offset_val;
-                state.store_u8(addr, value_val as u8)?;
-                let id = ValueId(trace_pos);
-                state.set(id, SimValue::Float(value_val));
-                Ok(Some(id))
-            }
-
-            // ── BroadcastScalar ──
-            TraceOp::BroadcastScalar { src } => {
-                let val = state.get(*src);
-                let id = ValueId(trace_pos);
-                state.set(id, val);
-                Ok(Some(id))
-            }
-
-            // ── BroadcastLoad ──
-            TraceOp::BroadcastLoad { base, offset } => {
-                let base_val = state.get(*base).as_integer()?;
-                let offset_val = state.get(*offset).as_integer()?;
-                let addr = base_val + offset_val;
-                let byte_val = state.load_u8(addr)?;
-                let id = ValueId(trace_pos);
-                state.set(id, SimValue::Float(byte_val as f32));
-                Ok(Some(id))
-            }
-
-            // ── GatherLoad (标量模拟: 加载一个元素) ──
-            TraceOp::GatherLoad { base, indices, stride } => {
-                let base_val = state.get(*base).as_integer()?;
-                let idx_val = state.get(*indices).as_integer()?;
-                let addr = base_val + idx_val * (*stride as i64);
-                let byte_val = state.load_u8(addr)?;
-                let id = ValueId(trace_pos);
-                state.set(id, SimValue::Float(byte_val as f32));
-                Ok(Some(id))
-            }
-
-            // ── ScatterStore (标量模拟: 存储一个元素) ──
-            TraceOp::ScatterStore { base, indices, value, stride } => {
-                let base_val = state.get(*base).as_integer()?;
-                let idx_val = state.get(*indices).as_integer()?;
-                let value_val = state.get(*value).as_float()?;
-                let addr = base_val + idx_val * (*stride as i64);
-                state.store_u8(addr, value_val as u8)?;
-                let id = ValueId(trace_pos);
-                state.set(id, SimValue::Float(value_val));
-                Ok(Some(id))
-            }
-
-            // ── TableLookup ──
-            TraceOp::TableLookup { base, row_index, row_bytes } => {
-                let base_val = state.get(*base).as_integer()?;
-                let row_idx = state.get(*row_index).as_integer()?;
-                let addr = base_val + row_idx * (*row_bytes as i64);
-                let byte_val = state.load_u8(addr)?;
-                let id = ValueId(trace_pos);
-                state.set(id, SimValue::Float(byte_val as f32));
-                Ok(Some(id))
-            }
-
-            // ── Mxfp4Dequant (标量模拟: 加载并反量化一个 MXFP4 元素) ──
-            TraceOp::Mxfp4Dequant { data, scales, off_a: _, stride_a: _, off_b: _, stride_b: _, off_c: _, const_off: _, block_size: _ } => {
-                let data_val = state.get(*data).as_integer()?;
-                let scales_val = state.get(*scales).as_integer()?;
-                // MXFP4: data 是 packed nibble 地址, scales 是 scale 地址
-                let nibble = state.load_u8(data_val)?;
-                let scale_byte = state.load_u8(scales_val)?;
-                // E2M1 解码
-                let e2m1_val = decode_e2m1_scalar(nibble & 0x0F);
-                // E8M0 反量化: scale = 2^(scale_byte - 15)
-                let scale = (2.0_f32).powi((scale_byte as i32) - 15);
-                let result = e2m1_val * scale;
-                let id = ValueId(trace_pos);
-                state.set(id, SimValue::Float(result));
-                Ok(Some(id))
-            }
-
-            // ── BitAnd ──
-            TraceOp::BitAnd(a, b) => {
-                let a_val = state.get(*a).as_integer()?;
-                let b_val = state.get(*b).as_integer()?;
-                let result = a_val & b_val;
-                let id = ValueId(trace_pos);
-                state.set(id, SimValue::Integer(result));
-                Ok(Some(id))
-            }
-
-            // ── QuantCodebookLookup ──
             TraceOp::QuantCodebookLookup { indices, codebook_data, vector_size: _, bits_per_entry: _ } => {
                 let idx = state.get(*indices).as_integer()?;
                 let codebook = *codebook_data;
@@ -1297,138 +1616,6 @@ impl NumericalSimulator {
             }
 
             // ── Loop (标量模拟: 展开一次迭代) ──
-            TraceOp::Loop { bound: _, step_bytes: _, body } => {
-                // 标量模拟: 仅执行 body 一次。
-                // body 内的 op 共享外层 trace_pos 空间，使用 alloc_id 避免碰撞。
-                let mut last_id = None;
-                for inner_op in body {
-                    let inner_pos = state.next_id;
-                    state.next_id += 1;
-                    match inner_op {
-                        TraceOp::Input(idx) => {
-                            // Loop body 内的 Input 引用外层输入
-                            let val = state.get(ValueId(*idx));
-                            let id = ValueId(inner_pos);
-                            state.set(id, val);
-                            last_id = Some(id);
-                        }
-                        _ => {
-                            if let Ok(Some(id)) = self.exec_op_with_pos(inner_op, inner_pos, state, desc) {
-                                last_id = Some(id);
-                            }
-                        }
-                    }
-                }
-                Ok(last_id)
-            }
-
-            // ── PanelLoad (标量模拟: 加载 row 0, col 0 的一个元素) ──
-            TraceOp::PanelLoad { base, offset, rows: _, cols: _ } => {
-                let base_val = state.get(*base).as_integer()?;
-                let offset_val = state.get(*offset).as_integer()?;
-                let addr = base_val + offset_val;
-                let byte = state.load_u8(addr)?;
-                let id = ValueId(trace_pos);
-                state.set(id, SimValue::Float(byte as f32));
-                Ok(Some(id))
-            }
-
-            // ── PanelStore (标量模拟: 存储一个字节) ──
-            TraceOp::PanelStore { base, offset, rows: _, cols: _ } => {
-                let base_val = state.get(*base).as_integer()?;
-                let offset_val = state.get(*offset).as_integer()?;
-                // 标量模拟中，存储源的最后一个浮点值
-                let id = ValueId(trace_pos);
-                state.set(id, SimValue::Float(0.0));
-                Ok(Some(id))
-            }
-
-            // ── PackBuffer (标量模拟: NOP) ──
-            TraceOp::PackBuffer { src, dst: _, rows: _, cols: _, layout: _ } => {
-                let val = state.get(*src);
-                let id = ValueId(trace_pos);
-                state.set(id, val);
-                Ok(Some(id))
-            }
-
-            // ── SharedMemDeclare (标量模拟: NOP) ──
-            TraceOp::SharedMemDeclare { name: _, bytes: _ } => {
-                let id = ValueId(trace_pos);
-                state.set(id, SimValue::Float(0.0));
-                Ok(Some(id))
-            }
-
-            // ── AsyncCopyToShared (标量模拟: NOP) ──
-            TraceOp::AsyncCopyToShared { name: _, src_offset: _, bytes: _ } => {
-                let id = ValueId(trace_pos);
-                state.set(id, SimValue::Float(0.0));
-                Ok(Some(id))
-            }
-
-            // ── Tma2DCopy (标量模拟: NOP) ──
-            TraceOp::Tma2DCopy { desc: _, coord_x: _, coord_y: _, bytes: _ } => {
-                let id = ValueId(trace_pos);
-                state.set(id, SimValue::Float(0.0));
-                Ok(Some(id))
-            }
-
-            // ── AsyncWaitGroup (标量模拟: NOP) ──
-            TraceOp::AsyncWaitGroup { n: _ } => {
-                let id = ValueId(trace_pos);
-                state.set(id, SimValue::Float(0.0));
-                Ok(Some(id))
-            }
-
-            // ── SyncBarrier (标量模拟: NOP) ──
-            TraceOp::SyncBarrier { name: _ } => {
-                let id = ValueId(trace_pos);
-                state.set(id, SimValue::Float(0.0));
-                Ok(Some(id))
-            }
-
-            // ── TileConfig (标量模拟: NOP) ──
-            TraceOp::TileConfig { rows: _, cols: _ } => {
-                let id = ValueId(trace_pos);
-                state.set(id, SimValue::Float(0.0));
-                Ok(Some(id))
-            }
-
-            // ── TileMma (标量模拟: 标量 FMA; shape m/n/k 仅用于 VmInstr 透传, 标量模拟忽略) ──
-            TraceOp::TileMma { c, a, b, m: _, n: _, k: _ } => {
-                let c_val = state.get(*c).as_float()?;
-                let a_val = state.get(*a).as_float()?;
-                let b_val = state.get(*b).as_float()?;
-                let result = c_val + a_val * b_val;
-                let id = ValueId(trace_pos);
-                state.set(id, SimValue::Float(result));
-                Ok(Some(id))
-            }
-
-            // ── TileRelease (标量模拟: NOP) ──
-            TraceOp::TileRelease => {
-                let id = ValueId(trace_pos);
-                state.set(id, SimValue::Float(0.0));
-                Ok(Some(id))
-            }
-
-            // ── Softmax (标量模拟: 标量恒等映射) ──
-            TraceOp::Softmax { src, dst: _ } => {
-                let s = state.get(*src).as_float()?;
-                // 标量模拟: softmax(标量) = 1.0 (单个元素的 softmax 总是 1.0)
-                let id = ValueId(trace_pos);
-                state.set(id, SimValue::Float(1.0));
-                Ok(Some(id))
-            }
-
-            // ── EpilogueChain (标量模拟: 传递源值) ──
-            TraceOp::EpilogueChain { ops: _ } => {
-                let id = ValueId(trace_pos);
-                state.set(id, SimValue::Float(0.0));
-                Ok(Some(id))
-            }
-
-            // ── SPEC 24-QUANT-PIPELINE-JIT: QuantGather/QuantGemm structural ops ──
-            // These are structural ops expanded by auto_select; numerical sim treats them as no-ops.
             TraceOp::QuantGather { .. } | TraceOp::QuantGemm { .. }
             | TraceOp::MtpDraft { .. }
             | TraceOp::MlaAttnScore { .. }
@@ -1439,8 +1626,10 @@ impl NumericalSimulator {
                 state.set(id, SimValue::Float(0.0));
                 Ok(Some(id))
             }
+            _ => self.unreachable_pattern(op),
         }
     }
+
 
     /// 验证模拟结果 (REQ-LC-011).
     ///
@@ -1468,6 +1657,13 @@ impl NumericalSimulator {
         }
 
         Ok(())
+    }
+
+    /// 未分类 TraceOp 变体兜底 (镜像 auto_select::unreachable_pattern)。
+    fn unreachable_pattern(&self, op: &TraceOp) -> Result<Option<ValueId>, CompilerError> {
+        Err(CompilerError::CodegenViolation(format!(
+            "exec_op_with_pos: 未分类的 TraceOp 变体 {:?} (ComputePattern 分类缺失)", op
+        )))
     }
 }
 
