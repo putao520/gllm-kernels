@@ -311,7 +311,31 @@ pub(super) fn emit_fusion_groups(
         activation_swap_vregs,
     };
 
-    for group in fctx.plan.groups.iter() {
+    // BCE-20260702-GPU-OOM: per-group RSS probe to locate the exact fusion group
+    // that triggers the 993MB → 23.5GB RSS explosion on the GPU codegen path.
+    // CPU path peak is ~680MB; GPU path explodes during emit_fusion_groups.
+    let _group_total = fctx.plan.groups.len();
+    for (gi, group) in fctx.plan.groups.iter().enumerate() {
+        if gi % 1 == 0 {
+            let rss = (|| -> usize {
+                if let Ok(s) = std::fs::read_to_string("/proc/self/status") {
+                    for line in s.lines() {
+                        if let Some(rest) = line.strip_prefix("VmRSS:") {
+                            if let Some(kb) = rest.trim().split_whitespace().next() {
+                                if let Ok(n) = kb.parse::<usize>() {
+                                    return n / 1024;
+                                }
+                            }
+                        }
+                    }
+                }
+                0
+            })();
+            eprintln!("[OOMPROBE-GROUP] group {}/{} RSS={}MB instrs={}",
+                gi, _group_total, rss, prog.len());
+            use std::io::Write;
+            std::io::stderr().flush().ok();
+        }
         emit_one_fusion_group(
             fctx, prog, current_abi, resolver, &mut state, group, &locals,
         )?;
