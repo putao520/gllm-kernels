@@ -821,6 +821,14 @@ impl X86Lower {
 
     // ── 辅助 ──
 
+    /// Map a YMM register to its low-128-bit XMM view.
+    ///
+    /// Valid range 0..31. Under AVX-512, ymm16..ymm31 alias the low 256 bits
+    /// of zmm16..zmm31, and xmm16..xmm31 alias their low 128 bits. The 16..31
+    /// range must be mapped explicitly — silently falling back to `xmm0` for
+    /// ymm16..ymm31 would corrupt scalar reductions that use `scratch_xmm`
+    /// (which derives from `scratch_vec_ids` that AVX-512 fills with
+    /// PhysVec 26..31).
     fn ymm_to_xmm(ymm: AsmRegisterYmm) -> AsmRegisterXmm {
         match ymm {
             _ if ymm == ymm0 => xmm0, _ if ymm == ymm1 => xmm1,
@@ -831,6 +839,15 @@ impl X86Lower {
             _ if ymm == ymm10 => xmm10, _ if ymm == ymm11 => xmm11,
             _ if ymm == ymm12 => xmm12, _ if ymm == ymm13 => xmm13,
             _ if ymm == ymm14 => xmm14, _ if ymm == ymm15 => xmm15,
+            // AVX-512 extended XMM views (alias low 128 bits of zmm16..zmm31)
+            _ if ymm == ymm16 => xmm16, _ if ymm == ymm17 => xmm17,
+            _ if ymm == ymm18 => xmm18, _ if ymm == ymm19 => xmm19,
+            _ if ymm == ymm20 => xmm20, _ if ymm == ymm21 => xmm21,
+            _ if ymm == ymm22 => xmm22, _ if ymm == ymm23 => xmm23,
+            _ if ymm == ymm24 => xmm24, _ if ymm == ymm25 => xmm25,
+            _ if ymm == ymm26 => xmm26, _ if ymm == ymm27 => xmm27,
+            _ if ymm == ymm28 => xmm28, _ if ymm == ymm29 => xmm29,
+            _ if ymm == ymm30 => xmm30, _ if ymm == ymm31 => xmm31,
             _ => xmm0,
         }
     }

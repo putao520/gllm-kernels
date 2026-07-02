@@ -708,4 +708,38 @@ mod tests {
         // NaN 的 BF16: exp=0xFF, mant != 0
         assert_eq!(bf16_nan & 0x7F80, 0x7F80, "NaN BF16 exp must be all-1s");
     }
+
+    /// BCE-20260702-REGALLOC-AVX2-OOB regression: AVX-512 `IsaProfile` fills
+    /// `scratch_vec_regs` from the top of the 32-wide file (PhysVec 26..31),
+    /// and `RegAllocator` may hand any PhysVec 0..31 to the YMM/XMM path
+    /// (`resolve_ymm_or_spill` / `scratch_ymm` / `scratch_xmm`).
+    ///
+    /// Before the fix, `ymm()` only matched 0..15 and panicked with
+    /// `PhysVec(29) for YMM; AVX2 range [0..15]` on AVX-512 hardware (5070Ti).
+    /// `ymm_to_xmm()` silently fell back to `xmm0` for ymm16..ymm31, corrupting
+    /// scalar reductions. iced-x86 1.21 exposes `ymm16..ymm31` and
+    /// `xmm16..xmm31` as the low 256/128-bit views of zmm16..zmm31, so the
+    /// 0..31 range is fully valid. This test pins the mapping directly so the
+    /// panic path can never regress.
+    #[test]
+    fn avx512_ymm_ymm_to_xmm_cover_full_0_31_range() {
+        // Direct mapping checks — the panic was at ymm(29).
+        let y29 = X86Lower::ymm(PhysVec(29));
+        assert_eq!(y29, ymm29, "ymm(29) must return the AVX-512 YMM view of zmm29");
+        let y31 = X86Lower::ymm(PhysVec(31));
+        assert_eq!(y31, ymm31, "ymm(31) must return the AVX-512 YMM view of zmm31");
+        let y16 = X86Lower::ymm(PhysVec(16));
+        assert_eq!(y16, ymm16, "ymm(16) must return the AVX-512 YMM view of zmm16");
+
+        // ymm_to_xmm must NOT silently fall back to xmm0 for 16..31.
+        assert_eq!(X86Lower::ymm_to_xmm(ymm29), xmm29, "ymm_to_xmm(ymm29) must be xmm29, not silent xmm0 fallback");
+        assert_eq!(X86Lower::ymm_to_xmm(ymm31), xmm31, "ymm_to_xmm(ymm31) must be xmm31, not silent xmm0 fallback");
+        assert_eq!(X86Lower::ymm_to_xmm(ymm16), xmm16, "ymm_to_xmm(ymm16) must be xmm16");
+
+        // AVX2 range still intact.
+        assert_eq!(X86Lower::ymm(PhysVec(0)), ymm0);
+        assert_eq!(X86Lower::ymm(PhysVec(15)), ymm15);
+        assert_eq!(X86Lower::ymm_to_xmm(ymm0), xmm0);
+        assert_eq!(X86Lower::ymm_to_xmm(ymm15), xmm15);
+    }
 }

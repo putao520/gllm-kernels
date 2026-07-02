@@ -127,13 +127,27 @@ impl X86Lower {
         }
     }
 
+    /// Map a PhysVec to a YMM register.
+    ///
+    /// Valid range 0..31. Under AVX-512, PhysVec 16..31 corresponds to the
+    /// low 256-bit YMM view of zmm16..zmm31 (iced_x86 exposes these as
+    /// `ymm16..ymm31`). ymm0..ymm15 alias the low 256 bits of zmm0..zmm15.
+    /// The 16..31 range is required because AVX-512 `IsaProfile` allocates
+    /// scratch_vec_regs from the top of the 32-wide file (PhysVec 26..31),
+    /// and RegAllocator may hand any PhysVec 0..31 to the YMM path
+    /// (`resolve_ymm_or_spill` / `scratch_ymm` / `spill_scratch_ymm`).
     fn ymm(phys: PhysVec) -> AsmRegisterYmm {
         match phys.0 {
             0 => ymm0, 1 => ymm1, 2 => ymm2, 3 => ymm3,
             4 => ymm4, 5 => ymm5, 6 => ymm6, 7 => ymm7,
             8 => ymm8, 9 => ymm9, 10 => ymm10, 11 => ymm11,
             12 => ymm12, 13 => ymm13, 14 => ymm14, 15 => ymm15,
-            other => unreachable!("RegAllocator produced invalid PhysVec({}) for YMM; AVX2 range [0..15]", other),
+            // AVX-512 extended YMM views (alias low 256 bits of zmm16..zmm31)
+            16 => ymm16, 17 => ymm17, 18 => ymm18, 19 => ymm19,
+            20 => ymm20, 21 => ymm21, 22 => ymm22, 23 => ymm23,
+            24 => ymm24, 25 => ymm25, 26 => ymm26, 27 => ymm27,
+            28 => ymm28, 29 => ymm29, 30 => ymm30, 31 => ymm31,
+            other => unreachable!("RegAllocator produced invalid PhysVec({}) for YMM; AVX2/AVX-512 range [0..31]", other),
         }
     }
 
