@@ -1238,15 +1238,42 @@ Ok(())
 
                 let d = self.reg_name_with_kind(*dst, alloc);
                 let s = self.reg_name_with_kind(*src, alloc);
-                let fn_str = match func {
-                    TranscendentalFn::Exp => "ex2.approx",
-                    TranscendentalFn::Log => "lg2.approx",
-                    TranscendentalFn::Tanh => "tanh.approx",
-                    _ => "mov",
-                };
+                // NO-SILENT-FALLBACK: Sigmoid (ex2+rcp 组合) / Fwht (trace 级 butterfly 分解)
+                // 不是单条 transcendental 指令，禁止静默降级为 "mov" NOP。
+                // NO-HW-DEGRADATION: PTX/HIP/Metal 各自正确语法，禁止 HIP/Metal 用 PTX 语法。
                 match self.dialect {
-                    GpuDialect::Ptx { .. } => self.emit_line(&format!("{fn_str}.f32 {d}, {s};")),
-                    _ => self.emit_line(&format!("{d} = {fn_str}({s});")),
+                    GpuDialect::Ptx { .. } => {
+                        let ptx_fn = match func {
+                            TranscendentalFn::Exp => "ex2.approx",
+                            TranscendentalFn::Log => "lg2.approx",
+                            TranscendentalFn::Tanh => "tanh.approx",
+                            _ => return Err(CompilerError::CodegenViolation(
+                                format!("lower_transcendental_gpu PTX: TranscendentalFn {:?} is not a single-instruction transcendental; Sigmoid uses ex2.approx+rcp.approx combo, Fwht must be decomposed at trace level", func))),
+                        };
+                        self.emit_line(&format!("{ptx_fn}.f32 {d}, {s};"));
+                    }
+                    GpuDialect::Hip { .. } => {
+                        // HIP mirrors CUDA device math (Context7 /rocm/hip): C99 单精度后缀
+                        let hip_fn = match func {
+                            TranscendentalFn::Exp => "exp2f",
+                            TranscendentalFn::Log => "log2f",
+                            TranscendentalFn::Tanh => "tanhf",
+                            _ => return Err(CompilerError::CodegenViolation(
+                                format!("lower_transcendental_gpu HIP: TranscendentalFn {:?} is not a single-instruction transcendental; Sigmoid uses exp2f+1.0f+rcp combo, Fwht must be decomposed at trace level", func))),
+                        };
+                        self.emit_line(&format!("{d} = {hip_fn}({s});"));
+                    }
+                    GpuDialect::Metal { .. } => {
+                        // Metal Shading Language: C++14 重载数学函数 (exp2/log2/tanh)
+                        let metal_fn = match func {
+                            TranscendentalFn::Exp => "exp2",
+                            TranscendentalFn::Log => "log2",
+                            TranscendentalFn::Tanh => "tanh",
+                            _ => return Err(CompilerError::CodegenViolation(
+                                format!("lower_transcendental_gpu Metal: TranscendentalFn {:?} is not a single-instruction transcendental; Sigmoid uses exp2+1.0f+rcp combo, Fwht must be decomposed at trace level", func))),
+                        };
+                        self.emit_line(&format!("{d} = {metal_fn}({s});"));
+                    }
                 }
                 Ok(())
             }
