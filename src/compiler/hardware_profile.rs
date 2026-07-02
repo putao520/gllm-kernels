@@ -58,21 +58,31 @@ impl HardwareProfile {
     /// Map to IsaProfile Platform (many-to-one).
     pub fn platform(&self) -> Platform {
         match self {
-            Self::CpuAvx2 | Self::CpuAvx512 | Self::CpuAvx10_2 => Platform::X86_64 {
-                has_avx512: matches!(self, Self::CpuAvx512),
-                has_bf16: matches!(self, Self::CpuAvx512 | Self::CpuAvx10_2),
-                has_vnni: matches!(self, Self::CpuAvx512 | Self::CpuAvx10_2),
-                has_avx512fp16: false,
-                has_f16c: true,
-                has_amx: matches!(self, Self::CpuAvx512),
-                has_amx_fp16: false,
-                has_amx_complex: false,
-                has_amx_transpose: false,
-                has_amx_fp8: false,
-                has_avx10_2: matches!(self, Self::CpuAvx10_2),
-                has_apx: matches!(self, Self::CpuAvx10_2),
-                has_sparse_mask_intersect: false,
-            },
+            Self::CpuAvx2 | Self::CpuAvx512 | Self::CpuAvx10_2 => {
+                // ARCH-JIT-YIELDS / NO-HW-DEGRADATION: 探测真实 CPUID 而非硬编码。
+                // CpuAvx2 = AVX2 基线 (无 AVX512/BF16/VNNI/AMX/FP16);
+                // CpuAvx512 / CpuAvx10_2 = AVX-512 级, 从 MicroArch 真实探测所有
+                // AVX-512 系列扩展 (FP16/BF16/VNNI/AMX/AMX+/AVX10/APX)。
+                // 之前 has_avx512fp16 硬编码 false 屏蔽了 SPR/GNR 的 FP16 dot 能力
+                // (BCE-20260703-X86-AVX512FP16-BF16DOT-MISSING)。
+                let arch = crate::microarch::detect();
+                let is_avx512_class = matches!(self, Self::CpuAvx512 | Self::CpuAvx10_2);
+                Platform::X86_64 {
+                    has_avx512: is_avx512_class,
+                    has_bf16: if is_avx512_class { arch.has_bf16() } else { false },
+                    has_vnni: if is_avx512_class { arch.has_vnni() } else { false },
+                    has_avx512fp16: if is_avx512_class { arch.has_avx512fp16() } else { false },
+                    has_f16c: arch.has_f16c(),
+                    has_amx: if is_avx512_class { arch.has_amx() } else { false },
+                    has_amx_fp16: arch.has_amx_fp16(),
+                    has_amx_complex: arch.has_amx_complex(),
+                    has_amx_transpose: arch.has_amx_transpose(),
+                    has_amx_fp8: arch.has_amx_fp8(),
+                    has_avx10_2: matches!(self, Self::CpuAvx10_2) && arch.has_avx10_2(),
+                    has_apx: arch.has_apx(),
+                    has_sparse_mask_intersect: arch.has_sparse_mask_intersect(),
+                }
+            }
             Self::ArmNeoverse => Platform::AArch64 {
                 has_bf16: true,
                 has_dotprod: true,
