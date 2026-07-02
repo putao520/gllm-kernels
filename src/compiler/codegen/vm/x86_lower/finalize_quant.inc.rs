@@ -196,6 +196,8 @@ impl X86Lower {
         self.asm.xor(ecx, ecx).map_err(Self::err)?;
         self.asm.mov(rdx, dst_gpr).map_err(Self::err)?;
         self.asm.mov(rsi, scale_gpr).map_err(Self::err)?;
+        // r11 = rbp + src_offset (循环不变的 src 基址; BCE-20260703 根治: src 读地址随迭代推进)
+        self.asm.lea(r11, qword_ptr(rbp + src_offset)).map_err(Self::err)?;
 
         let mut loop_label = self.asm.create_label();
         let mut end_label = self.asm.create_label();
@@ -204,12 +206,12 @@ impl X86Lower {
         self.asm.cmp(ecx, num_pairs as u32).map_err(Self::err)?;
         self.asm.jae(end_label).map_err(Self::err)?;
 
-        // scale = max(|val_2i|, |val_2i+1|)
-        self.asm.mov(eax, dword_ptr(rbp + src_offset)).map_err(Self::err)?;
+        // scale = max(|val_2i|, |val_2i+1|) — src[2i]=val_2i, src[2i+1]=val_2i+1
+        self.asm.mov(eax, dword_ptr(r11 + rcx * 8)).map_err(Self::err)?;
         self.asm.and(eax, 0x7FFF_FFFFu32).map_err(Self::err)?;
         self.asm.mov(r8d, eax).map_err(Self::err)?;
 
-        self.asm.mov(eax, dword_ptr(rbp + (src_offset + 4))).map_err(Self::err)?;
+        self.asm.mov(eax, dword_ptr(r11 + rcx * 8 + 4)).map_err(Self::err)?;
         self.asm.and(eax, 0x7FFF_FFFFu32).map_err(Self::err)?;
         self.asm.cmp(r8d, eax).map_err(Self::err)?;
         self.asm.cmovb(r8d, eax).map_err(Self::err)?;
@@ -219,13 +221,13 @@ impl X86Lower {
         self.asm.add(rsi, 4i32).map_err(Self::err)?;
 
         // nibble_0 = (val_2i >> 20) & 0xF
-        self.asm.mov(eax, dword_ptr(rbp + src_offset)).map_err(Self::err)?;
+        self.asm.mov(eax, dword_ptr(r11 + rcx * 8)).map_err(Self::err)?;
         self.asm.shr(eax, 20).map_err(Self::err)?;
         self.asm.and(eax, 0xFu32).map_err(Self::err)?;
         self.asm.mov(r9d, eax).map_err(Self::err)?;
 
         // nibble_1 = (val_2i+1 >> 20) & 0xF
-        self.asm.mov(eax, dword_ptr(rbp + (src_offset + 4))).map_err(Self::err)?;
+        self.asm.mov(eax, dword_ptr(r11 + rcx * 8 + 4)).map_err(Self::err)?;
         self.asm.shr(eax, 20).map_err(Self::err)?;
         self.asm.and(eax, 0xFu32).map_err(Self::err)?;
         self.asm.shl(eax, 4).map_err(Self::err)?;
@@ -258,6 +260,9 @@ impl X86Lower {
                 format!("KiviQuantToken: src v{} not spilled", src.0)
             ))?;
 
+        // r11 = rbp + src_offset (循环不变的 src 基址; BCE-20260703 根治: src 读地址随迭代推进)
+        self.asm.lea(r11, qword_ptr(rbp + src_offset)).map_err(Self::err)?;
+
         // Pass 1: find max(|elem[i]|)
         self.asm.xor(ecx, ecx).map_err(Self::err)?;
         self.asm.xor(r8d, r8d).map_err(Self::err)?;
@@ -269,7 +274,8 @@ impl X86Lower {
         self.asm.cmp(ecx, num_elems as u32).map_err(Self::err)?;
         self.asm.jae(max_done).map_err(Self::err)?;
 
-        self.asm.mov(eax, dword_ptr(rbp + src_offset)).map_err(Self::err)?;
+        // src[i] = [r11 + rcx*4] (逐元素扫描)
+        self.asm.mov(eax, dword_ptr(r11 + rcx * 4)).map_err(Self::err)?;
         self.asm.and(eax, 0x7FFF_FFFFu32).map_err(Self::err)?;
         self.asm.cmp(r8d, eax).map_err(Self::err)?;
         self.asm.cmovb(r8d, eax).map_err(Self::err)?;
@@ -292,12 +298,13 @@ impl X86Lower {
         self.asm.cmp(ecx, num_pairs as u32).map_err(Self::err)?;
         self.asm.jae(pack_done).map_err(Self::err)?;
 
-        self.asm.mov(eax, dword_ptr(rbp + src_offset)).map_err(Self::err)?;
+        // src[2i] = [r11 + rcx*8], src[2i+1] = [r11 + rcx*8 + 4] (逐对处理)
+        self.asm.mov(eax, dword_ptr(r11 + rcx * 8)).map_err(Self::err)?;
         self.asm.shr(eax, 20).map_err(Self::err)?;
         self.asm.and(eax, 0xFu32).map_err(Self::err)?;
         self.asm.mov(r9d, eax).map_err(Self::err)?;
 
-        self.asm.mov(eax, dword_ptr(rbp + (src_offset + 4))).map_err(Self::err)?;
+        self.asm.mov(eax, dword_ptr(r11 + rcx * 8 + 4)).map_err(Self::err)?;
         self.asm.shr(eax, 20).map_err(Self::err)?;
         self.asm.and(eax, 0xFu32).map_err(Self::err)?;
         self.asm.shl(eax, 4).map_err(Self::err)?;
@@ -313,6 +320,24 @@ impl X86Lower {
     }
 
     /// KIVI 4-bit 反量化 load: packed 4-bit + f32 scale → f32 向量
+    ///
+    /// 算法 (BCE-20260703-KIVI-DEQUANT-NUMERICAL 根治):
+    ///   for i in 0..num_pairs:
+    ///     byte = src_ptr[i]
+    ///     nibble_0 = byte & 0xF
+    ///     nibble_1 = (byte >> 4) & 0xF
+    ///     dst[2i]   = reconstruct(nibble_0, scale)   // 写入 dst_offset + i*8
+    ///     dst[2i+1] = reconstruct(nibble_1, scale)   // 写入 dst_offset + i*8 + 4
+    ///
+    /// 寄存器分配:
+    ///   rax (s0): 临时 (nibble / mantissa)
+    ///   rcx (s0): 循环计数器 (i)
+    ///   rdx (s0): src 指针 (每迭代 +1)
+    ///   r8  (s0): scale (f32 bits, 全程不变)
+    ///   r9  (s0): nibble_1 保存 (供 elem[1] 重读)
+    ///   r11 (s1): dst 基址 = rbp + dst_offset (循环不变)
+    ///
+    /// 根治点: dst 写地址随迭代推进 (dst_offset + i*8 / +4), 禁止覆盖同一栈槽
     fn lower_kivi_dequant_load(
         &mut self,
         dst: &VRegId,
@@ -329,8 +354,11 @@ impl X86Lower {
                 format!("KiviDequantLoad: dst v{} not spilled", dst.0)
             ))?;
 
-        // Load scale (f32 bits)
+        // Load scale (f32 bits), 全程不变
         self.asm.mov(r8d, dword_ptr(scale_gpr)).map_err(Self::err)?;
+
+        // r11 = rbp + dst_offset (循环不变的 dst 基址)
+        self.asm.lea(r11, qword_ptr(rbp + dst_offset)).map_err(Self::err)?;
 
         // Loop over pairs, unpack nibbles
         self.asm.xor(ecx, ecx).map_err(Self::err)?;
@@ -347,24 +375,26 @@ impl X86Lower {
         // Load packed byte
         self.asm.movzx(eax, byte_ptr(rdx)).map_err(Self::err)?;
 
-        // nibble_0 = eax & 0xF
+        // nibble_1 = (eax >> 4) & 0xF → 先存 r9d (后续 elem[1] 用)
         self.asm.mov(r9d, eax).map_err(Self::err)?;
+        self.asm.shr(r9d, 4).map_err(Self::err)?;
         self.asm.and(r9d, 0xFu32).map_err(Self::err)?;
 
-        // nibble_1 = (eax >> 4) & 0xF
-        self.asm.shr(eax, 4).map_err(Self::err)?;
+        // nibble_0 = eax & 0xF (eax 仍保存原 byte)
         self.asm.and(eax, 0xFu32).map_err(Self::err)?;
 
-        // elem[0] = reconstruct(nibble_0, scale): approximate f32 via mantissa injection
-        self.asm.mov(r10d, r9d).map_err(Self::err)?;
-        self.asm.shl(r10d, 20).map_err(Self::err)?;
-        self.asm.or(r10d, r8d).map_err(Self::err)?;
-        self.asm.mov(dword_ptr(rbp + dst_offset), r10d).map_err(Self::err)?;
-
-        // elem[1] = reconstruct(nibble_1, scale)
+        // elem[0] = reconstruct(nibble_0, scale): mantissa 注入 (nibble<<20 | scale_bits)
+        // 写入 dst[2i] = [r11 + rcx*8]
         self.asm.shl(eax, 20).map_err(Self::err)?;
         self.asm.or(eax, r8d).map_err(Self::err)?;
-        self.asm.mov(dword_ptr(rbp + (dst_offset + 4)), eax).map_err(Self::err)?;
+        self.asm.mov(dword_ptr(r11 + rcx * 8), eax).map_err(Self::err)?;
+
+        // elem[1] = reconstruct(nibble_1, scale)
+        // 写入 dst[2i+1] = [r11 + rcx*8 + 4]
+        self.asm.mov(eax, r9d).map_err(Self::err)?;
+        self.asm.shl(eax, 20).map_err(Self::err)?;
+        self.asm.or(eax, r8d).map_err(Self::err)?;
+        self.asm.mov(dword_ptr(r11 + rcx * 8 + 4), eax).map_err(Self::err)?;
 
         self.asm.inc(rdx).map_err(Self::err)?;
         self.asm.inc(ecx).map_err(Self::err)?;
@@ -404,6 +434,9 @@ impl X86Lower {
         let s0 = packed_addr;
         let s1 = scale_addr;
 
+        // r11 = rbp + src_offset (循环不变的 src 基址; BCE-20260703 根治: src 读地址随迭代推进)
+        self.asm.lea(r11, qword_ptr(rbp + src_offset)).map_err(Self::err)?;
+
         match kivi_mode {
             KvLoadMode::Kivi4 => {
                 // Per-channel 4-bit: each element pair gets its own scale.
@@ -423,12 +456,12 @@ impl X86Lower {
                 self.asm.cmp(ecx, num_pairs as u32).map_err(Self::err)?;
                 self.asm.jae(end_label).map_err(Self::err)?;
 
-                // scale = max(|val_2i|, |val_2i+1|)
-                self.asm.mov(eax, dword_ptr(rbp + src_offset)).map_err(Self::err)?;
+                // scale = max(|val_2i|, |val_2i+1|) — src[2i], src[2i+1]
+                self.asm.mov(eax, dword_ptr(r11 + rcx * 8)).map_err(Self::err)?;
                 self.asm.and(eax, 0x7FFF_FFFFu32).map_err(Self::err)?;
                 self.asm.mov(r8d, eax).map_err(Self::err)?;
 
-                self.asm.mov(eax, dword_ptr(rbp + (src_offset + 4))).map_err(Self::err)?;
+                self.asm.mov(eax, dword_ptr(r11 + rcx * 8 + 4)).map_err(Self::err)?;
                 self.asm.and(eax, 0x7FFF_FFFFu32).map_err(Self::err)?;
                 self.asm.cmp(r8d, eax).map_err(Self::err)?;
                 self.asm.cmovb(r8d, eax).map_err(Self::err)?;
@@ -438,13 +471,13 @@ impl X86Lower {
                 self.asm.add(rsi, 4i32).map_err(Self::err)?;
 
                 // nibble_0 = (val_2i >> 20) & 0xF
-                self.asm.mov(eax, dword_ptr(rbp + src_offset)).map_err(Self::err)?;
+                self.asm.mov(eax, dword_ptr(r11 + rcx * 8)).map_err(Self::err)?;
                 self.asm.shr(eax, 20).map_err(Self::err)?;
                 self.asm.and(eax, 0xFu32).map_err(Self::err)?;
                 self.asm.mov(r9d, eax).map_err(Self::err)?;
 
                 // nibble_1 = (val_2i+1 >> 20) & 0xF
-                self.asm.mov(eax, dword_ptr(rbp + (src_offset + 4))).map_err(Self::err)?;
+                self.asm.mov(eax, dword_ptr(r11 + rcx * 8 + 4)).map_err(Self::err)?;
                 self.asm.shr(eax, 20).map_err(Self::err)?;
                 self.asm.and(eax, 0xFu32).map_err(Self::err)?;
                 self.asm.shl(eax, 4).map_err(Self::err)?;
@@ -471,7 +504,8 @@ impl X86Lower {
                 self.asm.cmp(ecx, num_elems as u32).map_err(Self::err)?;
                 self.asm.jae(max_done).map_err(Self::err)?;
 
-                self.asm.mov(eax, dword_ptr(rbp + src_offset)).map_err(Self::err)?;
+                // src[i] = [r11 + rcx*4] (逐元素扫描)
+                self.asm.mov(eax, dword_ptr(r11 + rcx * 4)).map_err(Self::err)?;
                 self.asm.and(eax, 0x7FFF_FFFFu32).map_err(Self::err)?;
                 self.asm.cmp(r8d, eax).map_err(Self::err)?;
                 self.asm.cmovb(r8d, eax).map_err(Self::err)?;
@@ -495,12 +529,13 @@ impl X86Lower {
                 self.asm.cmp(ecx, num_pairs as u32).map_err(Self::err)?;
                 self.asm.jae(pack_done).map_err(Self::err)?;
 
-                self.asm.mov(eax, dword_ptr(rbp + src_offset)).map_err(Self::err)?;
+                // src[2i] = [r11 + rcx*8], src[2i+1] = [r11 + rcx*8 + 4] (逐对处理)
+                self.asm.mov(eax, dword_ptr(r11 + rcx * 8)).map_err(Self::err)?;
                 self.asm.shr(eax, 20).map_err(Self::err)?;
                 self.asm.and(eax, 0xFu32).map_err(Self::err)?;
                 self.asm.mov(r9d, eax).map_err(Self::err)?;
 
-                self.asm.mov(eax, dword_ptr(rbp + (src_offset + 4))).map_err(Self::err)?;
+                self.asm.mov(eax, dword_ptr(r11 + rcx * 8 + 4)).map_err(Self::err)?;
                 self.asm.shr(eax, 20).map_err(Self::err)?;
                 self.asm.and(eax, 0xFu32).map_err(Self::err)?;
                 self.asm.shl(eax, 4).map_err(Self::err)?;

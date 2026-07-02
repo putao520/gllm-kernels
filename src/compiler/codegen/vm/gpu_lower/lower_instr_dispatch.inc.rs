@@ -3159,70 +3159,105 @@ Ok(())
         match instr {
             VmInstr::KiviDequantLoad { dst, src_ptr, scale_ptr, num_elems, width: _ } => {
 
-                // KIVI 4-bit dequant: packed byte → 2 × (nibble - 8) × scale → f32
+                // KIVI 4-bit dequant (BCE-20260703-KIVI-DEQUANT-NUMERICAL 根治):
+                //
+                // GPU SIMT 模型: 每个线程持有一个 f32 (与 VecLoad 一致, 见 lower_vec_load_gpu
+                // 只写单个 f32 到 {d})。lanes 维度通过 warp 内线程分布表达: lane index = %tid.x。
+                //
+                // 每个线程 t 解码单个元素 t:
+                //   byte_idx = t / 2          (pair 索引)
+                //   is_high  = t & 1          (低/高 nibble)
+                //   byte     = src_ptr[byte_idx]
+                //   nibble   = is_high ? (byte >> 4) & 0xF : byte & 0xF
+                //   scale    = scale_ptr[byte_idx]   (per-pair scale, f32)
+                //   result   = (nibble - 8) * scale → 写入 {d} (单个 f32, 不覆盖)
+                //
+                // 旧实现的 bug: for pair 循环里反复写同一 {d}, 高 nibble 覆盖低 nibble,
+                //   后续 pair 覆盖前一个 → {d} 只剩最后一个元素值。根治: 改为按线程解码单元素。
+                //
+                // 边界: 当 t >= num_elems 时 (warp 线程数 > num_elems), 写 0.0 避免 OOB 读。
                 let d = self.reg_name_with_kind(*dst, alloc);
                 let sp = self.reg_name_with_kind(*src_ptr, alloc);
                 let sptr = self.reg_name_with_kind(*scale_ptr, alloc);
                 let rs0 = self.scratch_gpr_names[0];
                 let rs1 = self.scratch_gpr_names[1];
-                let num_pairs = (*num_elems + 1) / 2;
+                let fs0 = self.scratch_vec_names[0];
+                let num_elems = *num_elems;
                 match self.dialect {
                     GpuDialect::Ptx { .. } => {
-                        for pair in 0..num_pairs {
-                            // Load packed byte
-                            self.emit_line(&format!("ld.global.u8 {rs0}, [{sp}+{pair}];"));
-                            // Unpack low nibble
-                            self.emit_line(&format!("mov.u32 {rs1}, {rs0};"));
-                            self.emit_line(&format!("and.b32 {rs1}, {rs1}, 0xF;"));
-                            // (nibble - 8) → f32 → × scale
-                            self.emit_line(&format!("sub.s32 {rs1}, {rs1}, 8;"));
-                            self.emit_line(&format!("cvt.rn.f32.s32 {rs0}, {rs1};"));
-                            self.emit_line(&format!("ld.global.f32 {rs1}, [{sptr}+{}];", pair * 4));
-                            self.emit_line(&format!("mul.rn.f32 {d}, {rs0}, {rs1};"));
-                            if pair * 2 + 1 < *num_elems {
-                                // High nibble
-                                self.emit_line(&format!("ld.global.u8 {rs0}, [{sp}+{pair}];"));
-                                self.emit_line(&format!("shr.b32 {rs0}, {rs0}, 4;"));
-                                self.emit_line(&format!("and.b32 {rs0}, {rs0}, 0xF;"));
-                                self.emit_line(&format!("sub.s32 {rs0}, {rs0}, 8;"));
-                                self.emit_line(&format!("cvt.rn.f32.s32 {rs1}, {rs0};"));
-                                self.emit_line(&format!("ld.global.f32 {rs0}, [{sptr}+{}];", pair * 4));
-                                self.emit_line(&format!("mul.rn.f32 {d}, {rs1}, {rs0};"));
-                            }
-                        }
+                        // 作用域块内声明所有局部寄存器 (PTX 要求 .reg 声明)
+                        self.emit_line("{");
+                        self.emit_line("  .reg .u32 %r_byte, %r_n0, %r_bi, %r_hi;");
+                        self.emit_line("  .reg .u64 %rd_addr, %rd_saddr;");
+                        self.emit_line("  .reg .pred %p_oob, %p_hi;");
+                        // rs0 = %tid.x (线程索引 = lane index)
+                        self.emit_line(&format!("  mov.u32 {rs0}, %tid.x;"));
+                        // 边界守卫: tid >= num_elems → {d} = 0.0, 跳过解码
+                        let oob_skip = self.next_skip_label();
+                        let done_label = self.next_skip_label();
+                        self.emit_line(&format!("  setp.ge.u32 %p_oob, {rs0}, {num_elems};"));
+                        self.emit_line(&format!("  @%p_oob bra OOB_{oob_skip};"));
+                        // byte_idx = tid >> 1
+                        self.emit_line(&format!("  shr.u32 %r_bi, {rs0}, 1;"));
+                        // is_high = tid & 1 → 控制 nibble 提取
+                        self.emit_line(&format!("  and.b32 %r_hi, {rs0}, 1;"));
+                        // 加载 packed byte: ld.global.u8 %r_byte, [sp + byte_idx]
+                        // PTX [reg+reg] 非法, 用 %rd_addr 计算 64-bit 地址
+                        self.emit_line(&format!("  cvt.u64.u32 %rd_addr, %r_bi;"));
+                        self.emit_line(&format!("  add.u64 %rd_addr, %rd_addr, {sp};"));
+                        self.emit_line("  ld.global.u8 %r_byte, [%rd_addr];");
+                        // 提取 nibble: is_high ? (byte>>4)&0xF : byte&0xF
+                        self.emit_line("  setp.eq.u32 %p_hi, %r_hi, 1;");
+                        self.emit_line("  @%p_hi shr.u32 %r_byte, %r_byte, 4;");
+                        self.emit_line("  and.b32 %r_byte, %r_byte, 0xF;");
+                        // nibble - 8 → f32 (Q4 对称零点)
+                        self.emit_line("  sub.s32 %r_n0, %r_byte, 8;");
+                        self.emit_line(&format!("  cvt.rn.f32.s32 {fs0}, %r_n0;"));
+                        // 加载 per-pair scale: scale_ptr[byte_idx] (byte_idx = pair 索引, f32 步长 4 字节)
+                        self.emit_line(&format!("  cvt.u64.u32 %rd_saddr, %r_bi;"));
+                        self.emit_line(&format!("  mad.u64 %rd_saddr, %rd_saddr, 4, {sptr};"));
+                        self.emit_line(&format!("  ld.global.f32 {d}, [%rd_saddr];"));
+                        // result = (nibble-8) * scale → {d}
+                        self.emit_line(&format!("  mul.rn.f32 {d}, {fs0}, {d};"));
+                        self.emit_line(&format!("  bra DONE_{done_label};"));
+                        // OOB: 写 0.0
+                        self.emit_line(&format!("OOB_{oob_skip}:"));
+                        self.emit_line(&format!("  mov.f32 {d}, 0f00000000;"));
+                        self.emit_line(&format!("DONE_{done_label}:"));
+                        self.emit_line("}");
                     }
                     GpuDialect::Hip { .. } => {
                         self.emit_line("{");
                         self.emit_line(&format!("  unsigned char* _sp = (unsigned char*)({sp});"));
                         self.emit_line(&format!("  float* _scp = (float*)({sptr});"));
-                        for pair in 0..num_pairs {
-                            self.emit_line("  {");
-                            self.emit_line(&format!("    unsigned char _byte = _sp[{pair}];"));
-                            self.emit_line("    int _lo = (_byte & 0xF) - 8;");
-                            self.emit_line(&format!("    {d} = (float)_lo * _scp[{pair}];"));
-                            if pair * 2 + 1 < *num_elems {
-                                self.emit_line("    int _hi = ((_byte >> 4) & 0xF) - 8;");
-                                self.emit_line(&format!("    {d} = (float)_hi * _scp[{pair}];"));
-                            }
-                            self.emit_line("  }");
-                        }
+                        self.emit_line(&format!("  unsigned int _t = (unsigned int)threadIdx.x;"));
+                        self.emit_line(&format!("  if (_t < {num_elems}) {{"));
+                        self.emit_line("    unsigned int _bi = _t >> 1;");
+                        self.emit_line("    unsigned int _hi = _t & 1u;");
+                        self.emit_line("    unsigned char _byte = _sp[_bi];");
+                        self.emit_line("    int _nib = (int)(_hi ? ((_byte >> 4) & 0xF) : (_byte & 0xF));");
+                        self.emit_line("    float _v = (float)(_nib - 8) * _scp[_bi];");
+                        self.emit_line(&format!("    {d} = _v;"));
+                        self.emit_line("  } else {");
+                        self.emit_line(&format!("    {d} = 0.0f;"));
+                        self.emit_line("  }");
                         self.emit_line("}");
                     }
                     GpuDialect::Metal { .. } => {
                         self.emit_line("{");
                         self.emit_line(&format!("  device unsigned char* _sp = (device unsigned char*)({sp});"));
                         self.emit_line(&format!("  device float* _scp = (device float*)({sptr});"));
-                        for pair in 0..num_pairs {
-                            self.emit_line("  {");
-                            self.emit_line(&format!("    unsigned char _byte = _sp[{pair}];"));
-                            self.emit_line("    int _lo = (_byte & 0xF) - 8;");
-                            self.emit_line(&format!("    {d} = (float)_lo * _scp[{pair}];"));
-                            if pair * 2 + 1 < *num_elems {
-                                self.emit_line("    int _hi = ((_byte >> 4) & 0xF) - 8;");
-                                self.emit_line(&format!("    {d} = (float)_hi * _scp[{pair}];"));
-                            }
-                            self.emit_line("  }");
-                        }
+                        self.emit_line("  unsigned int _t = (unsigned int)thread_position_in_threadgroup.x;");
+                        self.emit_line(&format!("  if (_t < {num_elems}) {{"));
+                        self.emit_line("    unsigned int _bi = _t >> 1;");
+                        self.emit_line("    unsigned int _hi = _t & 1u;");
+                        self.emit_line("    unsigned char _byte = _sp[_bi];");
+                        self.emit_line("    int _nib = (int)(_hi ? ((_byte >> 4) & 0xF) : (_byte & 0xF));");
+                        self.emit_line("    float _v = (float)(_nib - 8) * _scp[_bi];");
+                        self.emit_line(&format!("    {d} = _v;"));
+                        self.emit_line("  } else {");
+                        self.emit_line(&format!("    {d} = 0.0f;"));
+                        self.emit_line("  }");
                         self.emit_line("}");
                     }
                 }
