@@ -2898,12 +2898,22 @@ Ok(())
                             // ── gfx908+ CDNA2/3: MFMA v1 16×16×16 ──
                             self.emit_line(&format!("{mfma_op} {vc}, {va}, {vb}, {vc};  // §gfx908 {mfma_shape}"));
                         } else {
-                            self.emit_line("// RDNA: no MFMA, scalar FMA fallback");
-                            self.emit_line(&format!("// {vc} += {va} * {vb}"));
+                            // RDNA (gfx<908) 无 MFMA: TileMma 未实现该后端
+                            // NO-SILENT-FALLBACK: 禁止 emit_line 注释占位 (acc 未初始化 → 数值错误)
+                            // NO-HW-DEGRADATION: 禁止 fallback 到 scalar FMA (硬件降级)
+                            return Err(CompilerError::CodegenViolation(format!(
+                                "lower_tile_mma_gpu: RDNA (gfx_arch={gfx_arch}) TileMma GEMM not yet implemented; \
+                                 MFMA requires gfx908+ (CDNA). NO-SILENT-FALLBACK/NO-HW-DEGRADATION."
+                            )));
                         }
                     }
                     GpuDialect::Metal { .. } => {
-                        self.emit_line(&format!("// Metal simdgroup_matrix_multiply: {vc} += {va} * {vb}"));
+                        // Metal TileMma 未实现 simdgroup_matrix_multiply 编码
+                        // NO-SILENT-FALLBACK: 禁止 emit_line 注释占位 (acc 未初始化 → 数值错误)
+                        return Err(CompilerError::CodegenViolation(format!(
+                            "lower_tile_mma_gpu: Metal TileMma GEMM not yet implemented; \
+                             simdgroup_matrix_multiply encoding pending. NO-SILENT-FALLBACK."
+                        )));
                     }
                 }
                 Ok(())
