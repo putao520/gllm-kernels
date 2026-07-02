@@ -905,4 +905,122 @@ mod tests {
         assert_eq!(instr & 0xFFE0_FC00, 0x04603000, "Should be SVE ORR (mov)");
     }
 
+    // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+    //  BCE-20260703-AARCH64-SVE2-I8MM regression:
+    //  INT8 dot 必须优先 SMMLA (FEAT_I8MM) > SDOT (FEAT_DotProd); SDOT 编码必须正确。
+    //  编码经 aarch64-linux-gnu-as/objdump 实测核对 (smmla v0,v1,v2 = 0x4E82A420,
+    //  sdot v0,v1,v2 = 0x4E829420)。原 SDOT 字面量 0x4E409C00 反汇编为 0x4E429C20 = UNDEF。
+    // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+    fn make_lower_with(features: AArch64Features) -> AArch64Lower {
+        AArch64Lower {
+            code: Vec::new(),
+            const_pool: Vec::new(),
+            loop_stack: Vec::new(),
+            labels: std::collections::HashMap::new(),
+            platform: features,
+            jit_ctx: make_test_jit_ctx(),
+        }
+    }
+
+    #[test]
+    fn test_int8_dot_emits_smmla_when_i8mm_present() {
+        // Arrange: AArch64 with FEAT_I8MM (has_i8mm=true). has_dotprod also true
+        // (典型 i8mm CPU 两者都有, 但 i8mm 优先).
+        let mut lower = make_lower_with(AArch64Features {
+            has_sve: false, has_sve2: true, has_sme2: false,
+            has_bf16: false, has_dotprod: true, has_i8mm: true, sve_vl: 16,
+        });
+
+        // Act: lower INT8 dot-product with vd=0, vn=1, vm=2
+        lower.lower_dot_product_native(0, 1, 2, DotDtype::Int8).unwrap();
+        let code = lower.finalize().unwrap();
+
+        // Assert: exactly one 32-bit instruction, equals SMMLA v0.4s, v1.16b, v2.16b
+        assert_eq!(code.len(), 4, "SMMLA should emit one 32-bit instruction");
+        let instr = u32::from_le_bytes([code[0], code[1], code[2], code[3]]);
+        assert_eq!(
+            instr, 0x4E82A420,
+            "i8mm=true must emit SMMLA (0x4E82A420 for v0,v1,v2), got {:#010X}",
+            instr
+        );
+    }
+
+    #[test]
+    fn test_int8_dot_falls_back_to_sdot_without_i8mm() {
+        // Arrange: AArch64 with FEAT_DotProd but no FEAT_I8MM.
+        let mut lower = make_lower_with(AArch64Features {
+            has_sve: false, has_sve2: false, has_sme2: false,
+            has_bf16: false, has_dotprod: true, has_i8mm: false, sve_vl: 16,
+        });
+
+        // Act
+        lower.lower_dot_product_native(0, 1, 2, DotDtype::Int8).unwrap();
+        let code = lower.finalize().unwrap();
+
+        // Assert: SDOT v0.4s, v1.16b, v2.16b = 0x4E829420 (corrected encoding)
+        assert_eq!(code.len(), 4);
+        let instr = u32::from_le_bytes([code[0], code[1], code[2], code[3]]);
+        assert_eq!(
+            instr, 0x4E829420,
+            "i8mm=false + has_dotprod=true must emit SDOT (0x4E829420 for v0,v1,v2), got {:#010X}",
+            instr
+        );
+    }
+
+    #[test]
+    fn test_int8_dot_errors_without_i8mm_or_dotprod() {
+        // Arrange: AArch64 with neither FEAT_I8MM nor FEAT_DotProd.
+        let mut lower = make_lower_with(AArch64Features {
+            has_sve: false, has_sve2: false, has_sme2: false,
+            has_bf16: false, has_dotprod: false, has_i8mm: false, sve_vl: 16,
+        });
+
+        // Act & Assert: NO-SILENT-FALLBACK — must return Err, not emit a SIGILL-inducing instr
+        let result = lower.lower_dot_product_native(0, 1, 2, DotDtype::Int8);
+        assert!(result.is_err(), "INT8 dot without i8mm/dotprod must Err (NO-SILENT-FALLBACK)");
+        assert!(lower.code.is_empty(), "No instruction should be emitted on Err");
+    }
+
+    #[test]
+    fn test_int8_dot_smmla_register_fields() {
+        // Arrange: i8mm CPU — verify register fields land in correct bit positions.
+        let mut lower = make_lower_with(AArch64Features {
+            has_sve: false, has_sve2: true, has_sme2: false,
+            has_bf16: false, has_dotprod: false, has_i8mm: true, sve_vl: 16,
+        });
+
+        // Act: vd=5, vn=6, vm=7
+        lower.lower_dot_product_native(5, 6, 7, DotDtype::Int8).unwrap();
+        let code = lower.finalize().unwrap();
+        let instr = u32::from_le_bytes([code[0], code[1], code[2], code[3]]);
+
+        // Assert: SMMLA base 0x4E80A400 | (Rm<<16) | (Rn<<5) | Rd
+        assert_eq!(instr & 0x1F, 5, "Rd field (bits 4-0) must be 5");
+        assert_eq!((instr >> 5) & 0x1F, 6, "Rn field (bits 9-5) must be 6");
+        assert_eq!((instr >> 16) & 0x1F, 7, "Rm field (bits 20-16) must be 7");
+        assert_eq!(instr & 0xFFE0FC00, 0x4E80A400, "SMMLA base opcode bits must match (mask Rm/Rn/Rd)");
+    }
+
+    #[test]
+    fn test_int4x8_dot_widen_uses_corrected_sdot_encoding() {
+        // Arrange: WidenCompute path (INT4x8 unpacked → SDOT). has_dotprod=true, no i8mm.
+        let mut lower = make_lower_with(AArch64Features {
+            has_sve: false, has_sve2: false, has_sme2: false,
+            has_bf16: false, has_dotprod: true, has_i8mm: false, sve_vl: 16,
+        });
+
+        // Act
+        lower.lower_dot_product_widen(0, 1, 2, DotDtype::Int4x8).unwrap();
+        let code = lower.finalize().unwrap();
+        let instr = u32::from_le_bytes([code[0], code[1], code[2], code[3]]);
+
+        // Assert: corrected SDOT encoding 0x4E829420 (was buggy 0x4E429C20)
+        assert_eq!(
+            instr, 0x4E829420,
+            "INT4x8 WidenCompute SDOT must use corrected encoding (0x4E829420), got {:#010X}",
+            instr
+        );
+    }
+
 }

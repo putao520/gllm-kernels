@@ -62,13 +62,35 @@ impl AArch64Lower {
             self.emit32(0x0E218800 | ((vm as u32 & 0x1F) << 5) | s2 as u32);
             self.emit32(self.enc_fmla_4s(vd, s1, s2));
         } else if dot_dtype_is_int8(dt) {
-            // SDOT Vd.4S, Vn.16B, Vm.16B (ARMv8.4-A DotProd) — requires FEAT_DotProd
-            if !self.platform.has_dotprod {
+            // INT8 dot-product: 硬件信息驱动指令选择 (ARCH-JIT-YIELDS)。
+            //
+            // 优先级 (NO-HW-DEGRADATION: 有 i8mm 不用只发 SDOT = 降级, 禁止):
+            //   1. FEAT_I8MM → SMMLA Vd.4S, Vn.16B, Vm.16B (i8mm 矩阵乘, 8×8 INT8 → 4×INT32 累加)
+            //   2. FEAT_DotProd → SDOT Vd.4S, Vn.16B, Vm.16B (4×4 INT8 → 4×INT32 累加)
+            //   3. 都无 → Err (NO-SILENT-FALLBACK; 发出会 SIGILL)
+            //
+            // 指令编码 (BCE-20260703-AARCH64-SVE2-I8MM, 经 aarch64-linux-gnu-as/objdump
+            // + LLVM AArch64InstrFormats.td `SIMDThreeSameVectorMatMul` 三向核对):
+            //   SMMLA base = 0x4E80A400 (Q=1,U=0,size=0b100,opcode=0b10100,B=0)
+            //     寄存器: Rm{20-16} | Rn{9-5} | Rd{4-0}
+            //     实测: smmla v0.4s,v1.16b,v2.16b → 0x4E82A420 ✓
+            //   SDOT  base = 0x4E809400 (Q=1,U=0,size=0b100,opcode=0b10010)
+            //     实测: sdot  v0.4s,v1.16b,v2.16b → 0x4E829420 ✓
+            //
+            // 注: 原 SDOT 字面量 0x4E409C00 经反汇编为 0x4E429C20 (v0,v1,v2) → .word
+            //     (UNDEF, 非法指令) — 同类编码 BUG, 一并根治 (BCE 铁律: 修一个=根除一类)。
+            if self.platform.has_i8mm {
+                // SMMLA — FEAT_I8MM 优先 (8×8 矩阵乘, 吞吐高于 SDOT 4×4)
+                self.emit32(0x4E80A400 | ((vm as u32 & 0x1F) << 16) | ((vn as u32 & 0x1F) << 5) | (vd as u32 & 0x1F));
+            } else if self.platform.has_dotprod {
+                // SDOT — FEAT_DotProd fallback (无 i8mm 时)
+                self.emit32(0x4E809400 | ((vm as u32 & 0x1F) << 16) | ((vn as u32 & 0x1F) << 5) | (vd as u32 & 0x1F));
+            } else {
                 return Err(CompilerError::CodegenViolation(
-                    "SDOT requires FEAT_DotProd (has_dotprod=false on target AArch64)".into()
+                    "INT8 dot requires FEAT_I8MM (SMMLA) or FEAT_DotProd (SDOT); \
+                     both false on target AArch64".into()
                 ));
             }
-            self.emit32(0x4E409C00 | ((vm as u32 & 0x1F) << 16) | ((vn as u32 & 0x1F) << 5) | (vd as u32 & 0x1F));
         } else {
             return Err(CompilerError::CodegenViolation(
                 "DotProduct Native: unsupported DotDtype variant".into()
@@ -88,12 +110,13 @@ impl AArch64Lower {
     ) -> Result<(), CompilerError> {
         if dot_dtype_is_int4x8(dt) {
             // INT4×INT8: nibble unpack done by preceding ops, emit SDOT on unpacked INT8.
+            // SDOT base = 0x4E809400 (见 lower_dot_product_native INT8 分支核对依据)
             if !self.platform.has_dotprod {
                 return Err(CompilerError::CodegenViolation(
                     "INT4x8 SDOT requires FEAT_DotProd (has_dotprod=false on target AArch64)".into()
                 ));
             }
-            self.emit32(0x4E409C00 | ((vm as u32 & 0x1F) << 16) | ((vn as u32 & 0x1F) << 5) | (vd as u32 & 0x1F));
+            self.emit32(0x4E809400 | ((vm as u32 & 0x1F) << 16) | ((vn as u32 & 0x1F) << 5) | (vd as u32 & 0x1F));
         } else if dot_dtype_is_fp4(dt) {
             // FP4 (E2M1): pre-decoded to F32 by caller, emit FMLA.
             self.emit32(self.enc_fmla_4s(vd, vn, vm));
