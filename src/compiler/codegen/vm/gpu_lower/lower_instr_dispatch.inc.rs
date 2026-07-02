@@ -2829,6 +2829,27 @@ Ok(())
                 let vb = self.reg_name_with_kind(*b, alloc);
                 match self.dialect {
                     GpuDialect::Ptx { sm_version } => {
+                        // BCE-20260703-GPU-BLACKWELL-BLOCKSCALED 根治:
+                        // block-scaled dtype (NVFP4=F4E2M1 / NVFP6=F6E2M3,F6E3M2) 在通用 TileMma
+                        // 路径上无法表达 scale factor 操作数, tcgen05.mma.block-scaled 需专用 scale_a/scale_b
+                        // 寄存器 + TMEM-backed 累加器, 由 VmInstr::NativeFp4Gemm 专用路径 (lower_native_fp4_gemm_gpu)
+                        // 正确 emit `tcgen05.mma.synched.cta_group::1.mMnNkK.f4.f4.f32 {acc,a,b,scale_a,scale_b}`。
+                        // 通用 TileMma 走到这里 = 上层 lowering 未走专用算子, 禁止静默占位 (NO-SILENT-FALLBACK)。
+                        match dtype {
+                            crate::types::DType::F4E2M1 => {
+                                return Err(CompilerError::CodegenViolation(
+                                    "block-scaled FP4 (NVFP4) GEMM must go through VmInstr::NativeFp4Gemm \
+                                     (lower_native_fp4_gemm_gpu) which emits tcgen05.mma with scale_a/scale_b; \
+                                     generic TileMma cannot express block-scaled scale factor".into()));
+                            }
+                            crate::types::DType::F6E2M3 | crate::types::DType::F6E3M2 => {
+                                return Err(CompilerError::CodegenViolation(
+                                    "block-scaled FP6 (NVFP6) GEMM: NativeFp6Gemm not yet implemented; \
+                                     FP4 path use VmInstr::NativeFp4Gemm. Generic TileMma cannot express \
+                                     block-scaled scale factor (NO-SILENT-FALLBACK)".into()));
+                            }
+                            _ => {}
+                        }
                         // dtype → mma.sync 输入精度后缀 + shape 选择 (m16n8k16 为 BF16/F16 基准)。
                         let (in_sfx, acc_sfx, mma_m, mma_n, mma_k) = match dtype {
                             crate::types::DType::BF16 => ("bf16", "f32", 16usize, 8usize, 16usize),
@@ -2842,8 +2863,9 @@ Ok(())
                         };
                         let _ = (m, n, k); // tile 逻辑 shape; mma 物理分片由硬件固定。
                         if sm_version >= 100 {
-                            // ── SM100+ Blackwell: tcgen05.mma ──
-                            self.emit_line("// §SM100 tcgen05.mma (block-scaled, TMEM-backed)");
+                            // ── SM100+ Blackwell: tcgen05.mma (non-block-scaled, TMEM-backed) ──
+                            // 注: block-scaled dtype (F4E2M1/F6*) 已在分支入口返回 Err, 引导走 NativeFp4Gemm。
+                            self.emit_line("// §SM100 tcgen05.mma (non-block-scaled, TMEM-backed)");
                             self.emit_line(&format!("// A-desc in {va}, B-desc in {vb}, C-tmem at %tmem_addr"));
                             self.emit_line(&format!("tcgen05.mma.cta_group::1.kind::{in_sfx}"));
                             self.emit_line(&format!("  [%tmem_addr], {va}, {vb}, 0x0,"));
