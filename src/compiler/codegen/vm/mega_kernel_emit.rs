@@ -1010,6 +1010,38 @@ pub(super) struct MkRegs {
     pub scratchpad_post_forward: VRegId,
 }
 
+/// OOM-PROBE diagnostic: mirrors compiler/mod.rs `_gk_oom_log` (RSS + stderr flush)
+/// but localized to mega_kernel_emit so we can instrument compile_mega_kernel_vm
+/// internals without exposing the private helper across modules.
+fn _gk_oom_probe(tag: &str, extra: &str, prog: &VmProgram) {
+    use std::io::Write;
+    let rss_mb = (|| -> usize {
+        if let Ok(s) = std::fs::read_to_string("/proc/self/status") {
+            for line in s.lines() {
+                if let Some(rest) = line.strip_prefix("VmRSS:") {
+                    if let Some(kb) = rest.trim().split_whitespace().next() {
+                        if let Ok(n) = kb.parse::<usize>() {
+                            return n / 1024;
+                        }
+                    }
+                }
+            }
+        }
+        0
+    })();
+    let vregs = prog.vreg_counts_by_kind();
+    let line = format!(
+        "{:>30} | RSS={} MB | instrs={} vregs={:?} | {}",
+        tag, rss_mb, prog.instrs.len(), vregs, extra
+    );
+    eprintln!("[OOMPROBE-CMKE] {}", line);
+    std::io::stderr().flush().ok();
+    let _ = std::fs::OpenOptions::new()
+        .create(true).append(true)
+        .open("/tmp/oomprobe_cmke.log")
+        .and_then(|mut f| writeln!(f, "{}", line));
+}
+
 pub fn compile_mega_kernel_vm(
     plan: &FusionPlan,
     graph: &CompilerGraph,
@@ -1041,6 +1073,7 @@ pub fn compile_mega_kernel_vm(
     let sym_map = SymDimSlotMap::mega_kernel_abi();
     let mut prog = VmProgram::new();
 
+    _gk_oom_probe("cmke-vm-entry", &format!("groups={} ops={}", plan.groups.len(), graph.ops.len()), &mut prog);
     // ── ABI prologue: Load MegaKernelFn ABI parameters ──
     let input_ids_ptr = prog.alloc_vreg(VRegKind::Ptr, SimdWidth::Scalar);
     let weight_ptr = prog.alloc_vreg(VRegKind::Ptr, SimdWidth::Scalar);
@@ -1385,9 +1418,11 @@ pub fn compile_mega_kernel_vm(
         rope_cache_offset: rope_req.as_ref().map(|r| r.cache_offset),
         original_weight_vreg,
     };
+    _gk_oom_probe("cmke-vm-pre-fusion-groups", &format!("groups={}", plan.groups.len()), &mut prog);
     emit_fusion_groups(
         &fctx, &mut prog, &mut current_abi, &resolver,
     )?;
+    _gk_oom_probe("cmke-vm-post-fusion-groups", "fwd-pass-done", &mut prog);
 
     // ARCH-REGALLOC-POST-FORWARD-RELOAD: Reload scratchpad_ptr from ABI stack slot
     // after emit_fusion_groups. scratchpad_ptr / scratchpad_reloaded may have been
@@ -1431,7 +1466,9 @@ pub fn compile_mega_kernel_vm(
         decode_seq_len, output_ptr, scratchpad_post_forward,
     };
     if has_generate_loop {
+        _gk_oom_probe("cmke-vm-pre-sampling", "pre-sampling", &mut prog);
         emit_sampling_pipeline(&mk, &mut prog, &regs, &ctx, &mut resolver)?;
+        _gk_oom_probe("cmke-vm-post-sampling", "post-sampling", &mut prog);
     }
 
     // 无 generate loop 的图: forward pass done → LoopEnd + BreakLoop(0)
@@ -1445,7 +1482,7 @@ pub fn compile_mega_kernel_vm(
     // DEC-MKEMIT-001: mk/regs built above (before sampling); reuse here.
     emit_batch_mode_path(&mk, &mut prog, &regs, BATCH_MODE_LABEL)?;
 
-
+    _gk_oom_probe("cmke-vm-pre-verify", "pre-verify", &mut prog);
 
     // Stage 1.5: 符号验证 — 与 compile_layer 对齐
     // mega-kernel 路径之前跳过此验证，导致 VmInstr 错误静默传播到 ISA lowering
@@ -1476,6 +1513,7 @@ pub fn compile_mega_kernel_vm(
             }
         }
     }
+    _gk_oom_probe("cmke-vm-pre-return", "final", &mut prog);
     Ok((prog, rope_req, logits_scratch_offset))
 }
 
