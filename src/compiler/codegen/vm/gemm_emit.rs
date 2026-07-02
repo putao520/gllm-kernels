@@ -538,6 +538,11 @@ pub(crate) fn emit_gemm_gpu_tiled_inline(
                                     )),
                                 );
 
+                                // row/col 循环: warp_m/warp_n > UNROLL_THRESHOLD → 理想应 emit_loop,
+                                // 但 accs[] 数组需编译时索引 (acc_idx=row*wj+col), emit_loop 的 counter
+                                // 是运行时 VReg 无法做编译时索引。保留 Rust for 展开 (与 Concrete 路径
+                                // 一致), acc_idx<accs.len() 守卫保证只填前 16 个 acc (Concrete 路径同行为)。
+                                // 卡点: warp_m*warp_n=2048>16 时大部分输出单元无 acc (预存设计缺陷, 非本 TASK)。
                                 for row in 0..wi {
                                     let a_row_off = OffsetExpr::Add(
                                         Box::new(a_off.clone()),
