@@ -229,25 +229,146 @@ impl AArch64Lower {
                 Ok(())
             }
             BlockUnpackMode::SignedNibbleHigh => {
-                // GGUF PackedNibbles high-nibble extract: NEON not yet implemented.
-                let _ = (dst, base, offset, alloc);
+                // GGUF PackedNibbles high-nibble extract (split layout, x86-equivalent):
+                // each byte → one value = (byte >> 4) & 0x0F, then subtract 8.0 (signed zero-point).
+                // NEON: load N bytes → N × i32 (USHLL chain) → USHR 4 → AND 0x0F → SCVTF → FSUB 8.0.
+                let vd = self.resolve_vreg(dst, alloc)?;
+                let xn = self.resolve_gpr(base, alloc)?;
                 let lanes = width.f32_lanes().max(1);
-                Err(CompilerError::CodegenViolation(
-                    format!("GgufInt4HighLoad: AArch64 NEON not yet implemented ({} lanes)", lanes)))
+
+                // x16 = base + offset
+                self.eval_offset_to_tmp(offset, alloc, 16)?;
+                self.emit32(self.enc_add_reg(16, xn, 16));
+
+                let s1: u8 = 16; // scratch NEON 1
+                let s2: u8 = 17; // scratch NEON 2
+
+                // Build 0x0F byte mask in v17: MOV W8, #0x0F; FMOV S17, W8; DUP V17.16B, V17.B[0]
+                self.emit32(self.enc_movz_w(8, 0x0F));
+                self.emit32(0x1E270000 | ((8u32) << 5) | s2 as u32); // FMOV S17, W8
+                self.emit32(0x4E000400 | (0b00001u32 << 16) | ((s2 as u32) << 5) | s2 as u32); // DUP V17.16B, V17.B[0]
+
+                if lanes <= 4 {
+                    // Load 4 bytes → 4 × i32
+                    self.emit32(0xBD400000 | ((16u32) << 5) | vd as u32); // LDR Sd, [X16]
+                    self.emit32(self.enc_neon_mov(s2, vd));
+                    self.emit32(0x2F00A400 | ((s2 as u32) << 5) | vd as u32); // USHLL Vd.8H, Vn.8B, #0
+                    self.emit32(0x0F00A400 | ((vd as u32) << 5) | vd as u32); // USHLL Vd.4S, Vn.4H, #0
+                    // vd = [b0, b1, b2, b3] as i32
+
+                    // High nibble: USHR 4 then AND 0x0F
+                    self.emit32(self.enc_ushr_4s(vd, vd, 4));
+                    self.emit32(0x4E201C00 | ((s2 as u32) << 16) | ((vd as u32) << 5) | vd as u32); // AND Vd.16B, Vn, Vm
+
+                    // SCVTF i32 → f32
+                    self.emit32(self.enc_scvtf_4s(vd, vd));
+
+                    // Subtract 8.0 (Q4_0 signed zero-point)
+                    let eight_bits = 8.0f32.to_bits();
+                    let lo16 = eight_bits & 0xFFFF;
+                    let hi16 = (eight_bits >> 16) & 0xFFFF;
+                    self.emit32(0x52800000 | (lo16 << 5) | 8u32); // MOVZ W8, #lo16
+                    self.emit32(0x72A00000 | (hi16 << 5) | 8u32); // MOVK W8, #hi16, LSL 16
+                    self.emit32(0x1E270000 | ((8u32) << 5) | s1 as u32); // FMOV S16, W8
+                    let imm5: u32 = 0b00100;
+                    self.emit32(0x4E000400 | (imm5 << 16) | ((s1 as u32) << 5) | s1 as u32); // DUP V16.4S, V16.S[0]
+                    self.emit32(self.enc_fsub_4s(vd, vd, s1));
+                } else {
+                    // 8 lanes: load 4 bytes → 4 × i32 (low 4 lanes; high 4 follow Int8 8-lane convention)
+                    self.emit32(0xBD400000 | ((16u32) << 5) | vd as u32); // LDR Sd, [X16]
+                    self.emit32(self.enc_neon_mov(s2, vd));
+                    self.emit32(0x2F00A400 | ((s2 as u32) << 5) | vd as u32); // USHLL Vd.8H, Vn.8B, #0
+                    self.emit32(0x0F00A400 | ((vd as u32) << 5) | vd as u32); // USHLL Vd.4S, Vn.4H, #0
+
+                    self.emit32(self.enc_ushr_4s(vd, vd, 4));
+                    self.emit32(0x4E201C00 | ((s2 as u32) << 16) | ((vd as u32) << 5) | vd as u32); // AND 0x0F
+                    self.emit32(self.enc_scvtf_4s(vd, vd));
+
+                    let eight_bits = 8.0f32.to_bits();
+                    let lo16 = eight_bits & 0xFFFF;
+                    let hi16 = (eight_bits >> 16) & 0xFFFF;
+                    self.emit32(0x52800000 | (lo16 << 5) | 8u32);
+                    self.emit32(0x72A00000 | (hi16 << 5) | 8u32);
+                    self.emit32(0x1E270000 | ((8u32) << 5) | s1 as u32);
+                    let imm5: u32 = 0b00100;
+                    self.emit32(0x4E000400 | (imm5 << 16) | ((s1 as u32) << 5) | s1 as u32);
+                    self.emit32(self.enc_fsub_4s(vd, vd, s1));
+                }
+                Ok(())
             }
             BlockUnpackMode::UnsignedNibbleLow => {
-                // Unsigned 4-bit low-nibble load (Q4_1): NEON not yet implemented.
-                let _ = (dst, base, offset, alloc);
+                // Unsigned 4-bit low-nibble load (Q4_1, Q5_0 nibble plane — split layout, x86-equivalent):
+                // each byte → one value = byte & 0x0F, range [0..15], no zero-point subtraction.
+                // NEON: load N bytes → N × i32 (USHLL chain) → AND 0x0F → SCVTF (no FSUB).
+                let vd = self.resolve_vreg(dst, alloc)?;
+                let xn = self.resolve_gpr(base, alloc)?;
                 let lanes = width.f32_lanes().max(1);
-                Err(CompilerError::CodegenViolation(
-                    format!("GgufUInt4Load: AArch64 NEON not yet implemented ({} lanes)", lanes)))
+
+                self.eval_offset_to_tmp(offset, alloc, 16)?;
+                self.emit32(self.enc_add_reg(16, xn, 16));
+
+                let s2: u8 = 17; // scratch NEON (0x0F mask)
+
+                // Build 0x0F byte mask in v17
+                self.emit32(self.enc_movz_w(8, 0x0F));
+                self.emit32(0x1E270000 | ((8u32) << 5) | s2 as u32); // FMOV S17, W8
+                self.emit32(0x4E000400 | (0b00001u32 << 16) | ((s2 as u32) << 5) | s2 as u32); // DUP V17.16B, V17.B[0]
+
+                if lanes <= 4 {
+                    self.emit32(0xBD400000 | ((16u32) << 5) | vd as u32); // LDR Sd, [X16]
+                    self.emit32(self.enc_neon_mov(s2, vd));
+                    self.emit32(0x2F00A400 | ((s2 as u32) << 5) | vd as u32); // USHLL Vd.8H, Vn.8B, #0
+                    self.emit32(0x0F00A400 | ((vd as u32) << 5) | vd as u32); // USHLL Vd.4S, Vn.4H, #0
+                    // AND 0x0F → low nibbles
+                    self.emit32(0x4E201C00 | ((s2 as u32) << 16) | ((vd as u32) << 5) | vd as u32);
+                    self.emit32(self.enc_scvtf_4s(vd, vd));
+                } else {
+                    self.emit32(0xBD400000 | ((16u32) << 5) | vd as u32); // LDR Sd, [X16]
+                    self.emit32(self.enc_neon_mov(s2, vd));
+                    self.emit32(0x2F00A400 | ((s2 as u32) << 5) | vd as u32); // USHLL Vd.8H, Vn.8B, #0
+                    self.emit32(0x0F00A400 | ((vd as u32) << 5) | vd as u32); // USHLL Vd.4S, Vn.4H, #0
+                    self.emit32(0x4E201C00 | ((s2 as u32) << 16) | ((vd as u32) << 5) | vd as u32); // AND 0x0F
+                    self.emit32(self.enc_scvtf_4s(vd, vd));
+                }
+                Ok(())
             }
             BlockUnpackMode::UnsignedNibbleHigh => {
-                // Unsigned 4-bit high-nibble load (Q4_1): NEON not yet implemented.
-                let _ = (dst, base, offset, alloc);
+                // Unsigned 4-bit high-nibble load (Q4_1, Q5_0 nibble plane — split layout, x86-equivalent):
+                // each byte → one value = (byte >> 4) & 0x0F, range [0..15], no zero-point subtraction.
+                // NEON: load N bytes → N × i32 (USHLL chain) → USHR 4 → AND 0x0F → SCVTF (no FSUB).
+                let vd = self.resolve_vreg(dst, alloc)?;
+                let xn = self.resolve_gpr(base, alloc)?;
                 let lanes = width.f32_lanes().max(1);
-                Err(CompilerError::CodegenViolation(
-                    format!("GgufUInt4HighLoad: AArch64 NEON not yet implemented ({} lanes)", lanes)))
+
+                self.eval_offset_to_tmp(offset, alloc, 16)?;
+                self.emit32(self.enc_add_reg(16, xn, 16));
+
+                let s2: u8 = 17; // scratch NEON (0x0F mask)
+
+                // Build 0x0F byte mask in v17
+                self.emit32(self.enc_movz_w(8, 0x0F));
+                self.emit32(0x1E270000 | ((8u32) << 5) | s2 as u32); // FMOV S17, W8
+                self.emit32(0x4E000400 | (0b00001u32 << 16) | ((s2 as u32) << 5) | s2 as u32); // DUP V17.16B, V17.B[0]
+
+                if lanes <= 4 {
+                    self.emit32(0xBD400000 | ((16u32) << 5) | vd as u32); // LDR Sd, [X16]
+                    self.emit32(self.enc_neon_mov(s2, vd));
+                    self.emit32(0x2F00A400 | ((s2 as u32) << 5) | vd as u32); // USHLL Vd.8H, Vn.8B, #0
+                    self.emit32(0x0F00A400 | ((vd as u32) << 5) | vd as u32); // USHLL Vd.4S, Vn.4H, #0
+                    // High nibble: USHR 4 then AND 0x0F
+                    self.emit32(self.enc_ushr_4s(vd, vd, 4));
+                    self.emit32(0x4E201C00 | ((s2 as u32) << 16) | ((vd as u32) << 5) | vd as u32);
+                    self.emit32(self.enc_scvtf_4s(vd, vd));
+                } else {
+                    self.emit32(0xBD400000 | ((16u32) << 5) | vd as u32); // LDR Sd, [X16]
+                    self.emit32(self.enc_neon_mov(s2, vd));
+                    self.emit32(0x2F00A400 | ((s2 as u32) << 5) | vd as u32); // USHLL Vd.8H, Vn.8B, #0
+                    self.emit32(0x0F00A400 | ((vd as u32) << 5) | vd as u32); // USHLL Vd.4S, Vn.4H, #0
+                    self.emit32(self.enc_ushr_4s(vd, vd, 4));
+                    self.emit32(0x4E201C00 | ((s2 as u32) << 16) | ((vd as u32) << 5) | vd as u32); // AND 0x0F
+                    self.emit32(self.enc_scvtf_4s(vd, vd));
+                }
+                Ok(())
             }
             BlockUnpackMode::Bitpack2 { bias } => {
                 // Q2K 2-bit packed → i32 → f32, subtract bias.
@@ -311,8 +432,93 @@ impl AArch64Lower {
             BlockUnpackMode::Nvfp4 { scale_src } => {
                 self.emit_nvfp4_sub_block_dequant(dst, base, offset, *scale_src, width, alloc)
             }
-            BlockUnpackMode::QhBitExpand { .. } => {
-                Err(CompilerError::CodegenViolation("QhBitExpand: AArch64 not yet implemented".into()))
+            BlockUnpackMode::QhBitExpand { bit_value } => {
+                // Q5_0/Q5_1 high-bit plane expand (x86-equivalent semantics):
+                // load 1 qh byte from base+offset; for each of N bit positions, produce
+                // `bit_value` if the bit is set, else 0.0 — output N × f32.
+                // NEON scalar path (mirrors Bitpack2): per-lane LDRB + UBFX(1-bit) + MUL by
+                // (bit_value as i32) + SCVTF + INS. bit=0 → 0.0; bit=1 → bit_value.
+                let lanes = width.f32_lanes().max(1);
+                let vd = self.resolve_vreg(dst, alloc)?;
+                let xn = self.resolve_gpr(base, alloc)?;
+
+                // x16 = base + offset
+                self.eval_offset_to_tmp(offset, alloc, 16)?;
+                self.emit32(self.enc_add_reg(16, xn, 16));
+
+                if lanes == 4 {
+                    let w_byte: u8 = 8;   // qh byte
+                    let w_bit: u8 = 9;    // extracted bit (0/1)
+                    let w_bv: u8 = 10;    // bit_value as i32
+                    let s_tmp: u8 = 16;   // NEON scalar scratch
+
+                    // Load qh byte: LDRB W8, [X16]
+                    self.emit32(self.enc_ldrb_imm(w_byte, 16, 0));
+
+                    // bit_value as i32 (e.g., 16.0 → 16, 32.0 → 32, 256.0 → 256)
+                    let bv_int = *bit_value as i32;
+                    let bv_bits = bv_int as u32;
+                    let lo16 = bv_bits & 0xFFFF;
+                    let hi16 = (bv_bits >> 16) & 0xFFFF;
+                    self.emit32(self.enc_movz_w(w_bv, lo16 as u16));
+                    if hi16 != 0 {
+                        self.emit32(self.enc_movk_w_lsl16(w_bv, hi16 as u16));
+                    }
+
+                    for i in 0..4 {
+                        // UBFX W9, W8, #i, #1 — extract bit i
+                        let lsb = i as u32;
+                        let imms = i as u32; // lsb + width(1) - 1
+                        let ubfx = (0b100u32 << 28) | (0b100110u32 << 22)
+                            | (lsb << 16) | (imms << 10)
+                            | ((w_byte as u32) << 5) | (w_bit as u32);
+                        self.emit32(ubfx);
+                        // W9 = bit * bit_value (0 or bv_int)
+                        self.emit32(self.enc_mul_w(w_bit, w_bit, w_bv));
+                        // SCVTF S16, W9
+                        self.emit32(self.enc_scvtf_s_w(s_tmp, w_bit));
+                        // INS Vd.S[i], V16.S[0]
+                        let imm5: u32 = 0b00100 | ((i as u32) << 1);
+                        self.emit32(0x4E181C00 | (imm5 << 16) | ((s_tmp as u32) << 5) | (vd as u32));
+                    }
+                    Ok(())
+                } else if lanes == 8 {
+                    // 8 lanes: 1 qh byte → 8 bits → 8 × f32. NEON is 128-bit (4 × f32) per register;
+                    // produce low 4 lanes here (high 4 follow Int8 8-lane convention — caller issues
+                    // a second QhBitExpand with byte offset +1 for bits 4..7 if needed).
+                    let w_byte: u8 = 8;
+                    let w_bit: u8 = 9;
+                    let w_bv: u8 = 10;
+                    let s_tmp: u8 = 16;
+
+                    self.emit32(self.enc_ldrb_imm(w_byte, 16, 0));
+
+                    let bv_int = *bit_value as i32;
+                    let bv_bits = bv_int as u32;
+                    let lo16 = bv_bits & 0xFFFF;
+                    let hi16 = (bv_bits >> 16) & 0xFFFF;
+                    self.emit32(self.enc_movz_w(w_bv, lo16 as u16));
+                    if hi16 != 0 {
+                        self.emit32(self.enc_movk_w_lsl16(w_bv, hi16 as u16));
+                    }
+
+                    for i in 0..4 {
+                        let lsb = i as u32;
+                        let imms = i as u32;
+                        let ubfx = (0b100u32 << 28) | (0b100110u32 << 22)
+                            | (lsb << 16) | (imms << 10)
+                            | ((w_byte as u32) << 5) | (w_bit as u32);
+                        self.emit32(ubfx);
+                        self.emit32(self.enc_mul_w(w_bit, w_bit, w_bv));
+                        self.emit32(self.enc_scvtf_s_w(s_tmp, w_bit));
+                        let imm5: u32 = 0b00100 | ((i as u32) << 1);
+                        self.emit32(0x4E181C00 | (imm5 << 16) | ((s_tmp as u32) << 5) | (vd as u32));
+                    }
+                    Ok(())
+                } else {
+                    Err(CompilerError::CodegenViolation(
+                        format!("QhBitExpand: AArch64 NEON supports 4 or 8 lanes, got {}", lanes)))
+                }
             }
         }
     }
