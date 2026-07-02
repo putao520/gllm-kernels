@@ -178,8 +178,9 @@ pub fn compile_layer_with_sym_map(
     // Stage 5: ISA Lower — 根据 profile.platform 分派到对应 backend
     // ARCH-CODEGEN-DISPATCH: X86_64 → X86Lower, AArch64 → AArch64Lower, GPU → GpuLower
     let (code, format) = match &profile.platform {
-        super::isa_profile::Platform::X86_64 { has_avx512, .. } => {
+        super::isa_profile::Platform::X86_64 { has_avx512, has_avx512fp16, .. } => {
             let mut lowerer = X86Lower::with_sym_map(*has_avx512, sym_map.clone());
+            lowerer.set_has_avx512fp16(*has_avx512fp16);
             lowerer.set_scratch_gprs(&profile.scratch_gprs)?;
             lowerer.set_scratch_vec_regs(&profile.scratch_vec_regs)?;
             lowerer.precompute_zero_vregs(&program);

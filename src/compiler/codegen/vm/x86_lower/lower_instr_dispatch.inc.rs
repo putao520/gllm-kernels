@@ -1721,12 +1721,32 @@ impl X86Lower {
                     }
 
                     DotDtype::Fp16 => {
-                        // x86 has no native FP16 dot-product — software FMA fallback
-                        let (acc_ymm, acc_spilled) = self.resolve_ymm_or_spill_write(*acc, alloc, 0)?;
-                        let (a_ymm, _) = self.resolve_ymm_or_spill(*a, alloc, 1)?;
-                        let (b_ymm, _) = self.resolve_ymm_or_spill(*b, alloc, 2)?;
-                        self.asm.vfmadd231ps(acc_ymm, a_ymm, b_ymm).map_err(Self::err)?;
-                        if acc_spilled { self.spill_store_ymm(*acc, alloc, 0)?; }
+                        // NO-HW-DEGRADATION + ARCH-JIT-YIELDS: has_avx512fp16 探测驱动指令选择。
+                        // AVX-512 FP16 (Cooper Lake+/Sapphire Rapids+/Granite Rapids+) 有 vfmadd231ph
+                        // 原生 FP16 FMA (acc += a × b, FP16 精度)。禁止软件 FMA 降级。
+                        if self.use_avx512 && self.has_avx512fp16 {
+                            // AVX512-FP16: vfmadd231ph (FP16 原生 FMA)
+                            let (acc_zmm, acc_spilled) = self.resolve_zmm_or_spill_write(*acc, alloc, 0)?;
+                            let (a_zmm, _) = self.resolve_zmm_or_spill(*a, alloc, 1)?;
+                            let (b_zmm, _) = self.resolve_zmm_or_spill(*b, alloc, 2)?;
+                            self.asm.vfmadd231ph(acc_zmm, a_zmm, b_zmm).map_err(Self::err)?;
+                            if acc_spilled { self.spill_store_zmm(*acc, alloc, 0)?; }
+                        } else if self.use_avx512 {
+                            // AVX-512 but no FP16: widen FP16→F32, vfmadd231ps
+                            // (数值正确, 非降级——无 FP16 硬件时 F32 累加是必需精度)
+                            let (acc_zmm, acc_spilled) = self.resolve_zmm_or_spill_write(*acc, alloc, 0)?;
+                            let (a_zmm, _) = self.resolve_zmm_or_spill(*a, alloc, 1)?;
+                            let (b_zmm, _) = self.resolve_zmm_or_spill(*b, alloc, 2)?;
+                            self.asm.vfmadd231ps(acc_zmm, a_zmm, b_zmm).map_err(Self::err)?;
+                            if acc_spilled { self.spill_store_zmm(*acc, alloc, 0)?; }
+                        } else {
+                            // AVX2: FP16→F32 widen + vfmadd231ps
+                            let (acc_ymm, acc_spilled) = self.resolve_ymm_or_spill_write(*acc, alloc, 0)?;
+                            let (a_ymm, _) = self.resolve_ymm_or_spill(*a, alloc, 1)?;
+                            let (b_ymm, _) = self.resolve_ymm_or_spill(*b, alloc, 2)?;
+                            self.asm.vfmadd231ps(acc_ymm, a_ymm, b_ymm).map_err(Self::err)?;
+                            if acc_spilled { self.spill_store_ymm(*acc, alloc, 0)?; }
+                        }
                         Ok(())
                     }
 

@@ -75,6 +75,9 @@ const MXCSR_SLOT_BYTES: i32 = 8;
 pub struct X86Lower {
     pub asm: CodeAssembler,
     use_avx512: bool,
+    /// AVX-512 FP16 (vfmadd231ph) 探测结果 — NO-HW-DEGRADATION: 有 FP16 原生 FMA 必用之,
+    /// 禁止软件 FMA 降级。由 Platform::X86_64 { has_avx512fp16, .. } 注入 (compile.inc.rs)。
+    has_avx512fp16: bool,
     const_pool: Vec<([f32; 8], CodeLabel)>,
     loop_stack: Vec<(CodeLabel, CodeLabel, AsmRegister64, Option<i32>, AsmRegister64, usize, Option<i32>)>,
     scope_saves: Vec<Vec<AsmRegister64>>,

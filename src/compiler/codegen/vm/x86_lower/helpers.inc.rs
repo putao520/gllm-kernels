@@ -5,10 +5,17 @@ impl X86Lower {
 
     pub fn with_avx512(use_avx512: bool) -> Self {
         use crate::dispatch::device_profile::DeviceProfile;
-        let jit_ctx = crate::compiler::jit_context::JitContext::from_device_profile(&DeviceProfile::detect());
+        let dp = DeviceProfile::detect();
+        // NO-HW-DEGRADATION: 探测 AVX-512 FP16 (vfmadd231ph) 能力,供 FP16 dot 原生指令选择。
+        let has_avx512fp16 = matches!(
+            crate::compiler::hardware_profile::HardwareProfile::detect(&dp).platform(),
+            crate::compiler::codegen::vm::isa_profile::Platform::X86_64 { has_avx512fp16: true, .. }
+        );
+        let jit_ctx = crate::compiler::jit_context::JitContext::from_device_profile(&dp);
         Self {
             asm: CodeAssembler::new(64).expect("64-bit"),
             use_avx512,
+            has_avx512fp16,
             const_pool: Vec::new(),
             loop_stack: Vec::new(),
             scope_saves: Vec::new(),
@@ -79,6 +86,13 @@ impl X86Lower {
         }
         self.scratch_vec_ids = scratch_phys.to_vec();
         Ok(())
+    }
+
+    /// 从 Platform::X86_64 { has_avx512fp16, .. } 注入 AVX-512 FP16 探测结果。
+    /// NO-HW-DEGRADATION: has_avx512fp16=true 时 FP16 dot 必走 vfmadd231ph 原生 FMA,
+    /// 禁止软件 FMA 降级。compile.inc.rs 在构造时调用,覆写 with_avx512 的运行时探测默认值。
+    pub fn set_has_avx512fp16(&mut self, has_avx512fp16: bool) {
+        self.has_avx512fp16 = has_avx512fp16;
     }
 
     /// 返回指定索引的 scratch YMM 寄存器。
