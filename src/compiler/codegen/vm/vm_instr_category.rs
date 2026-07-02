@@ -263,6 +263,7 @@ impl VmInstr {
 mod tests {
     #![allow(unused_imports)]
     use super::*;
+    use crate::compiler::codegen::vm::instr::{VRegId, SimdWidth};
 
     /// 穷举验证: 每个 VmInstr 变体必须命中且仅命中一个类别 (ARCH-LOWER-DISPATCH-LAYERING §4)。
     /// 此测试保证 category() 无 `_ =>` 通配,新增变体时若忘记补全会编译失败。
@@ -277,5 +278,25 @@ mod tests {
             VmInstr::MarkLabel { label_id: 0 }.category(),
             InstrCategory::Control
         );
+    }
+
+    /// BCE-20260703-GPU-BLACKWELL-2CTA 回归测试:
+    /// TwoCtaFp4Gemm 必须归类为 Quant category。
+    /// 防止 cta_group::2 指令被误归类导致调度链断裂 (NO-HW-DEGRADATION)。
+    /// referenced_vregs 的 5 寄存器集合由 reg_alloc.rs 的 match 穷尽性编译保证。
+    #[test]
+    fn test_two_cta_fp4_gemm_category() {
+        let instr = VmInstr::TwoCtaFp4Gemm {
+            acc: VRegId(0),
+            a: VRegId(1),
+            b: VRegId(2),
+            scale_a: VRegId(3),
+            scale_b: VRegId(4),
+            m: 128,
+            n: 256,
+            k: 32,
+            width: SimdWidth::Warp(32),
+        };
+        assert_eq!(instr.category(), InstrCategory::Quant);
     }
 }
