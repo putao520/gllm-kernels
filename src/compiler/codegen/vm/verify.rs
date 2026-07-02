@@ -1411,6 +1411,8 @@ fn collect_src_vregs_quantc(instr: &VmInstr) -> Vec<VRegId> {
         VmInstr::SparseGemm { acc, a_sparse, b_dense, sparse_mask_ptr, .. } => vec![*acc, *a_sparse, *b_dense, *sparse_mask_ptr],
         VmInstr::SparseFp8Gemm { acc, a_sparse, b_dense, sparse_mask_ptr, .. } => vec![*acc, *a_sparse, *b_dense, *sparse_mask_ptr],
         VmInstr::NativeFp4Gemm { acc, a, b, scale_a, scale_b, .. } => vec![*acc, *a, *b, *scale_a, *scale_b],
+        VmInstr::NativeFp6Gemm { acc, a, b, scale_a, scale_b, .. } => vec![*acc, *a, *b, *scale_a, *scale_b],
+        VmInstr::TwoCtaFp4Gemm { acc, a, b, scale_a, scale_b, .. } => vec![*acc, *a, *b, *scale_a, *scale_b],
         VmInstr::NativeFp8Gemm { acc, a, b, .. } => vec![*acc, *a, *b],
         VmInstr::HwQuantDequant { dst, packed_weight, block_scale, global_scale, .. } => vec![*dst, *packed_weight, *block_scale, *global_scale],
         _ => unreachable!("Quant category mismatch in collect_src_vregs"),
@@ -1668,7 +1670,9 @@ fn collect_dst_vreg(instr: &VmInstr) -> Option<VRegId> {
         | VmInstr::SparseGemm { acc: dst, .. }
         | VmInstr::SparseFp8Gemm { acc: dst, .. }
         | VmInstr::NativeFp4Gemm { acc: dst, .. }
+        | VmInstr::NativeFp6Gemm { acc: dst, .. }
         | VmInstr::NativeFp8Gemm { acc: dst, .. }
+        | VmInstr::TwoCtaFp4Gemm { acc: dst, .. }
         | VmInstr::HwQuantDequant { dst, .. }
         | VmInstr::TmemLoad { dst, .. }
         | VmInstr::ClusterLoad { dst, .. } => Some(*dst),

@@ -1488,6 +1488,72 @@ pub enum VmInstr {
         width: SimdWidth,
     },
 
+    /// SM100+ 原生 FP6 block-scaled 矩阵乘法 (tcgen05.mma .kind::mxf8f6f4 .block_scale)
+    ///
+    /// 硬件级 E3M2 6-bit 计算 + E8M0 块缩放，零解量化，结果 F32 累加。
+    /// 仅 SM100+ (DeviceProfile tensor_cores_gen >= 100, has_native_fp6)。
+    /// PTX (PTX ISA 9.3 §9.7.17.10.9.1 syntax #2):
+    ///   tcgen05.mma.cta_group::1.kind::mxf8f6f4.block_scale.scale_vec::1X
+    ///       [d-tmem], a-desc, b-desc, idesc, [scale-A-tmem], [scale-B-tmem], enable-input-d;
+    /// CPU/ARM/x86: 返回 Error
+    /// SM80/SM90: 返回 Error (仅 SM100+)
+    NativeFp6Gemm {
+        /// 累加器 (F32, 输入/输出)
+        acc: VRegId,
+        /// A 矩阵 (FP6 E3M2 packed, 4 elements per 24-bit / byte-packed)
+        a: VRegId,
+        /// B 矩阵 (FP6 E3M2 packed)
+        b: VRegId,
+        /// A 块缩放因子 (E8M0 per 32-element block)
+        scale_a: VRegId,
+        /// B 块缩放因子 (E8M0 per 32-element block)
+        scale_b: VRegId,
+        /// M 维度
+        m: usize,
+        /// N 维度
+        n: usize,
+        /// K 维度 (必须是 32 的倍数)
+        k: usize,
+        /// SIMD 宽度
+        width: SimdWidth,
+    },
+
+    /// SM100+ Blackwell 2-CTA 协同 block-scaled FP4 矩阵乘法 (tcgen05.mma .cta_group::2)
+    ///
+    /// 双 CTA cluster 协作 MMA: CTA Pair (%cluster_ctarank 末位差 1 的两个 CTA)
+    /// 共享 Tensor Memory, 2× tmem 容量, 用于大 tile GEMM (M=128 Layout B/C)。
+    /// cta_group::2 要求 peer CTA active, 前后需 cluster barrier 同步
+    /// (PTX ISA 9.3 §9.7.17.5 Issue Granularity 表 49/50)。
+    /// 仅 SM100+ (DeviceProfile tensor_cores_gen >= 100, IsaFeature::TwoCta)。
+    /// PTX (PTX ISA 9.3 §9.7.17.10.9.1):
+    ///   barrier.cluster.arrive;
+    ///   barrier.cluster.wait;
+    ///   tcgen05.mma.synched.cta_group::2.mMnNkK.f4.f4.f32 {acc}, {a}, {b}, {scale_a}, {scale_b};
+    ///   tcgen05.wait::ld.sync.aligned;
+    /// CPU/ARM/x86: 返回 Error
+    /// SM80/SM90: 返回 Error (仅 SM100+ 2-CTA 硬件)
+    /// @trace REQ-HWACC-012 Blackwell 2-CTA cooperative MMA (NO-HW-DEGRADATION)
+    TwoCtaFp4Gemm {
+        /// 累加器 (F32, 输入/输出, TMEM-backed)
+        acc: VRegId,
+        /// A 矩阵 (FP4 E2M1 packed, 2 elements per byte)
+        a: VRegId,
+        /// B 矩阵 (FP4 E2M1 packed, 2 elements per byte)
+        b: VRegId,
+        /// A 块缩放因子 (E8M0 per 32-element block)
+        scale_a: VRegId,
+        /// B 块缩放因子 (E8M0 per 32-element block)
+        scale_b: VRegId,
+        /// M 维度 (大 tile, 通常 128 配合 cta_group::2)
+        m: usize,
+        /// N 维度
+        n: usize,
+        /// K 维度 (必须是 32 的倍数, FP4 天然 2x throughput)
+        k: usize,
+        /// SIMD 宽度
+        width: SimdWidth,
+    },
+
     /// SM100+ Sparse FP8 Tensor Core GEMM (2:4 结构化稀疏 + FP8 同时生效)。
     ///
     /// 2:4 稀疏 + FP8 (E4M3/E5M2) 双重加速，相比 FP16 dense 4x 吞吐量。

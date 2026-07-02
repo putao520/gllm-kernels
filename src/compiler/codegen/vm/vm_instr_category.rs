@@ -49,7 +49,7 @@ pub enum InstrCategory {
     /// QuantBiPlaneLoad / QuantLoadBytesVec / QuantCodebookLookup / QuantExtractBits /
     /// QuantDequantFma / QuantInterleave / QuantConcatSeq / Q3KDecodeStep /
     /// HwQuantDequant / BitwiseGemm / SparseGemm / SparseFp8Gemm / NativeFp4Gemm /
-    /// NativeFp8Gemm / SparseMaskIntersect
+    /// NativeFp6Gemm / NativeFp8Gemm / TwoCtaFp4Gemm / SparseMaskIntersect
     Quant,
     /// GPU 专属: warp/shared-mem/async-copy/TMA/cluster/distributed-paging 通信类。
     /// WarpSync / AsyncCopy / AsyncWait / SharedMem* / WeightPrefetch* /
@@ -179,7 +179,9 @@ impl VmInstr {
             | VmInstr::SparseGemm { .. }
             | VmInstr::SparseFp8Gemm { .. }
             | VmInstr::NativeFp4Gemm { .. }
+            | VmInstr::NativeFp6Gemm { .. }
             | VmInstr::NativeFp8Gemm { .. }
+            | VmInstr::TwoCtaFp4Gemm { .. }
             | VmInstr::SparseMaskIntersect { .. } => InstrCategory::Quant,
 
             // ── GpuComm (无条件部分) ──

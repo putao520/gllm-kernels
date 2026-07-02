@@ -139,6 +139,8 @@ impl AArch64Lower {
             VmInstr::SparseGemm { .. } => self.lower_sparse_gemm_aarch64(instr, alloc),
             VmInstr::SparseFp8Gemm { .. } => self.lower_sparse_fp8_gemm_aarch64(instr, alloc),
             VmInstr::NativeFp4Gemm { .. } => self.lower_native_fp4_gemm_aarch64(instr, alloc),
+            VmInstr::NativeFp6Gemm { .. } => self.lower_native_fp6_gemm_aarch64(instr, alloc),
+            VmInstr::TwoCtaFp4Gemm { .. } => self.lower_two_cta_fp4_gemm_aarch64(instr, alloc),
             VmInstr::NativeFp8Gemm { .. } => self.lower_native_fp8_gemm_aarch64(instr, alloc),
             VmInstr::HwQuantDequant { .. } => self.lower_hw_quant_dequant_aarch64(instr, alloc),
             _ => Err(CompilerError::CodegenViolation(
@@ -3346,6 +3348,28 @@ Ok(())
             }
             _ => Err(CompilerError::CodegenViolation(
                 format!("lower_native_fp4_gemm_aarch64: expected VmInstr::NativeFp4Gemm, got {:?}", instr))),
+        }
+    }
+
+    fn lower_native_fp6_gemm_aarch64(&mut self, instr: &VmInstr, alloc: &RegAllocation) -> Result<(), CompilerError> {
+        match instr {
+            VmInstr::NativeFp6Gemm { .. } => {
+                Err(CompilerError::CodegenViolation(
+                    "NativeFp6Gemm requires SM100+ tcgen05 hardware (GPU-only)".into()))
+            }
+            _ => Err(CompilerError::CodegenViolation(
+                format!("lower_native_fp6_gemm_aarch64: expected VmInstr::NativeFp6Gemm, got {:?}", instr))),
+        }
+    }
+
+    fn lower_two_cta_fp4_gemm_aarch64(&mut self, instr: &VmInstr, alloc: &RegAllocation) -> Result<(), CompilerError> {
+        match instr {
+            VmInstr::TwoCtaFp4Gemm { .. } => {
+                Err(CompilerError::CodegenViolation(
+                    "TwoCtaFp4Gemm requires SM100+ 2-CTA tcgen05 hardware (GPU-only)".into()))
+            }
+            _ => Err(CompilerError::CodegenViolation(
+                format!("lower_two_cta_fp4_gemm_aarch64: expected VmInstr::TwoCtaFp4Gemm, got {:?}", instr))),
         }
     }
 

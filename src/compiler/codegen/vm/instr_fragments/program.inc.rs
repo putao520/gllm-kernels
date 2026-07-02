@@ -505,6 +505,8 @@ impl VmProgram {
         match instr {
             VmInstr::SparseGemm { acc, a_sparse, b_dense, sparse_mask_ptr, m, n, k, width, dtype } => VmInstr::SparseGemm { acc: r(acc, map, next_vreg), a_sparse: r(a_sparse, map, next_vreg), b_dense: r(b_dense, map, next_vreg), sparse_mask_ptr: r(sparse_mask_ptr, map, next_vreg), m, n, k, width, dtype },
             VmInstr::NativeFp4Gemm { acc, a, b, scale_a, scale_b, m, n, k, width } => VmInstr::NativeFp4Gemm { acc: r(acc, map, next_vreg), a: r(a, map, next_vreg), b: r(b, map, next_vreg), scale_a: r(scale_a, map, next_vreg), scale_b: r(scale_b, map, next_vreg), m, n, k, width },
+            VmInstr::NativeFp6Gemm { acc, a, b, scale_a, scale_b, m, n, k, width } => VmInstr::NativeFp6Gemm { acc: r(acc, map, next_vreg), a: r(a, map, next_vreg), b: r(b, map, next_vreg), scale_a: r(scale_a, map, next_vreg), scale_b: r(scale_b, map, next_vreg), m, n, k, width },
+            VmInstr::TwoCtaFp4Gemm { acc, a, b, scale_a, scale_b, m, n, k, width } => VmInstr::TwoCtaFp4Gemm { acc: r(acc, map, next_vreg), a: r(a, map, next_vreg), b: r(b, map, next_vreg), scale_a: r(scale_a, map, next_vreg), scale_b: r(scale_b, map, next_vreg), m, n, k, width },
             VmInstr::SparseFp8Gemm { acc, a_sparse, b_dense, sparse_mask_ptr, m, n, k, width, fp8_kind } => VmInstr::SparseFp8Gemm { acc: r(acc, map, next_vreg), a_sparse: r(a_sparse, map, next_vreg), b_dense: r(b_dense, map, next_vreg), sparse_mask_ptr: r(sparse_mask_ptr, map, next_vreg), m, n, k, width, fp8_kind },
             VmInstr::NativeFp8Gemm { acc, a, b, m, n, k, width, fp8_kind } => VmInstr::NativeFp8Gemm { acc: r(acc, map, next_vreg), a: r(a, map, next_vreg), b: r(b, map, next_vreg), m, n, k, width, fp8_kind },
             VmInstr::HwQuantDequant { dst, packed_weight, block_scale, global_scale, quant_kind, count, width } => VmInstr::HwQuantDequant { dst: r(dst, map, next_vreg), packed_weight: r(packed_weight, map, next_vreg), block_scale: r(block_scale, map, next_vreg), global_scale: r(global_scale, map, next_vreg), quant_kind, count, width },
@@ -905,6 +907,8 @@ impl VmProgram {
         match instr {
             VmInstr::SparseGemm { acc, a_sparse, b_dense, sparse_mask_ptr, m, n, k, width, dtype } => VmInstr::SparseGemm { acc: r(acc), a_sparse: r(a_sparse), b_dense: r(b_dense), sparse_mask_ptr: r(sparse_mask_ptr), m, n, k, width, dtype },
             VmInstr::NativeFp4Gemm { acc, a, b, scale_a, scale_b, m, n, k, width } => VmInstr::NativeFp4Gemm { acc: r(acc), a: r(a), b: r(b), scale_a: r(scale_a), scale_b: r(scale_b), m, n, k, width },
+            VmInstr::NativeFp6Gemm { acc, a, b, scale_a, scale_b, m, n, k, width } => VmInstr::NativeFp6Gemm { acc: r(acc), a: r(a), b: r(b), scale_a: r(scale_a), scale_b: r(scale_b), m, n, k, width },
+            VmInstr::TwoCtaFp4Gemm { acc, a, b, scale_a, scale_b, m, n, k, width } => VmInstr::TwoCtaFp4Gemm { acc: r(acc), a: r(a), b: r(b), scale_a: r(scale_a), scale_b: r(scale_b), m, n, k, width },
             VmInstr::SparseFp8Gemm { acc, a_sparse, b_dense, sparse_mask_ptr, m, n, k, width, fp8_kind } => VmInstr::SparseFp8Gemm { acc: r(acc), a_sparse: r(a_sparse), b_dense: r(b_dense), sparse_mask_ptr: r(sparse_mask_ptr), m, n, k, width, fp8_kind },
             VmInstr::NativeFp8Gemm { acc, a, b, m, n, k, width, fp8_kind } => VmInstr::NativeFp8Gemm { acc: r(acc), a: r(a), b: r(b), m, n, k, width, fp8_kind },
             VmInstr::HwQuantDequant { dst, packed_weight, block_scale, global_scale, quant_kind, count, width } => VmInstr::HwQuantDequant { dst: r(dst), packed_weight: r(packed_weight), block_scale: r(block_scale), global_scale: r(global_scale), quant_kind, count, width },
@@ -1245,6 +1249,8 @@ impl VmProgram {
         // Quant cluster b (3 arms) — ARCH-LOWER-DISPATCH-LAYERING P3 (机械抽取)
         match instr {
             VmInstr::NativeFp4Gemm { acc, a, b, scale_a, scale_b, .. } => vec![*acc, *a, *b, *scale_a, *scale_b],
+            VmInstr::NativeFp6Gemm { acc, a, b, scale_a, scale_b, .. } => vec![*acc, *a, *b, *scale_a, *scale_b],
+            VmInstr::TwoCtaFp4Gemm { acc, a, b, scale_a, scale_b, .. } => vec![*acc, *a, *b, *scale_a, *scale_b],
             VmInstr::NativeFp8Gemm { acc, a, b, .. } => vec![*acc, *a, *b],
             VmInstr::HwQuantDequant { dst, packed_weight, block_scale, global_scale, .. } => vec![*dst, *packed_weight, *block_scale, *global_scale],
             _ => vec![],
@@ -2434,7 +2440,13 @@ impl VmProgram {
             VmInstr::SparseFp8Gemm { acc: dst, .. } => { 
                                     domains.insert(*dst, Domain::VecData); Ok(()) },
             // Quant* decode instrs: produce VecData
-            VmInstr::NativeFp4Gemm { acc: dst, .. } => { 
+            VmInstr::NativeFp4Gemm { acc: dst, .. } => {
+                                    domains.insert(*dst, Domain::VecData); Ok(()) },
+            // Quant* decode instrs: produce VecData
+            VmInstr::NativeFp6Gemm { acc: dst, .. } => {
+                                    domains.insert(*dst, Domain::VecData); Ok(()) },
+            // Quant* decode instrs: produce VecData
+            VmInstr::TwoCtaFp4Gemm { acc: dst, .. } => {
                                     domains.insert(*dst, Domain::VecData); Ok(()) },
             // Quant* decode instrs: produce VecData
             VmInstr::NativeFp8Gemm { acc: dst, .. } => { 

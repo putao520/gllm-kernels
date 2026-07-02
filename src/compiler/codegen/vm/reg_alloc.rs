@@ -939,6 +939,8 @@ impl<'a> RegAllocator<'a> {
         match instr {
             VmInstr::SparseFp8Gemm { acc, a_sparse, b_dense, sparse_mask_ptr, .. } => vec![*acc, *a_sparse, *b_dense, *sparse_mask_ptr],
             VmInstr::NativeFp4Gemm { acc, a, b, scale_a, scale_b, .. } => vec![*acc, *a, *b, *scale_a, *scale_b],
+            VmInstr::NativeFp6Gemm { acc, a, b, scale_a, scale_b, .. } => vec![*acc, *a, *b, *scale_a, *scale_b],
+            VmInstr::TwoCtaFp4Gemm { acc, a, b, scale_a, scale_b, .. } => vec![*acc, *a, *b, *scale_a, *scale_b],
             VmInstr::NativeFp8Gemm { acc, a, b, .. } => vec![*acc, *a, *b],
             VmInstr::HwQuantDequant { dst, packed_weight, block_scale, global_scale, .. } => vec![*dst, *packed_weight, *block_scale, *global_scale],
             VmInstr::QuantScalarCvtLoad { base, .. } => vec![*base],

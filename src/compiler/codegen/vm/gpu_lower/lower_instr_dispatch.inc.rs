@@ -133,6 +133,8 @@ impl GpuLower {
             VmInstr::BitwiseGemm { dst, sign_bits, input_sign_bits, scale, .. } => self.lower_bitwise_gemm_gpu(instr, alloc),
             VmInstr::SparseGemm { acc, a_sparse, b_dense, sparse_mask_ptr, m, n, k, .. } => self.lower_sparse_gemm_gpu(instr, alloc),
             VmInstr::NativeFp4Gemm { acc, a, b, scale_a, scale_b, m, n, k, .. } => self.lower_native_fp4_gemm_gpu(instr, alloc),
+            VmInstr::NativeFp6Gemm { acc, a, b, scale_a, scale_b, m, n, k, .. } => self.lower_native_fp6_gemm_gpu(instr, alloc),
+            VmInstr::TwoCtaFp4Gemm { acc, a, b, scale_a, scale_b, m, n, k, .. } => self.lower_two_cta_fp4_gemm_gpu(instr, alloc),
             VmInstr::SparseFp8Gemm { acc, a_sparse, b_dense, sparse_mask_ptr, m, n, k, fp8_kind, .. } => self.lower_sparse_fp8_gemm_gpu(instr, alloc),
             VmInstr::NativeFp8Gemm { acc, a, b, m, n, k, fp8_kind, .. } => self.lower_native_fp8_gemm_gpu(instr, alloc),
             VmInstr::HwQuantDequant { dst, packed_weight, block_scale, global_scale, quant_kind, count, .. } => self.lower_hw_quant_dequant_gpu(instr, alloc),
@@ -3799,6 +3801,89 @@ Ok(())
             }
             _ => Err(CompilerError::CodegenViolation(
                 format!("lower_native_fp4_gemm_gpu: expected VmInstr::NativeFp4Gemm, got {:?}", instr))),
+        }
+    }
+
+    fn lower_native_fp6_gemm_gpu(&mut self, instr: &VmInstr, alloc: &RegAllocation) -> Result<(), CompilerError> {
+        match instr {
+            VmInstr::NativeFp6Gemm { acc, a, b, scale_a, scale_b, m, n, k, .. } => {
+
+                if self.sm_version().is_some_and(|sm| sm >= 100) {
+                    let acc_r = self.reg_name_with_kind(*acc, alloc);
+                    let a_r = self.reg_name_with_kind(*a, alloc);
+                    let b_r = self.reg_name_with_kind(*b, alloc);
+                    let sa_r = self.reg_name_with_kind(*scale_a, alloc);
+                    let sb_r = self.reg_name_with_kind(*scale_b, alloc);
+                    match self.dialect {
+                        GpuDialect::Ptx { .. } => {
+                            // tcgen05.mma block-scaled FP6 (PTX ISA 9.3 §9.7.17.10.9.1 syntax #2)
+                            // .kind::mxf8f6f4 covers FP6 E3M2/E2M3 + FP4/FP8 with E8M0 block scaling.
+                            // .scale_vec::1X is the mxf8f6f4 default (PTX ISA §9.7.17.10.4 table 39).
+                            // Operands: [d-tmem], a-desc, b-desc, idesc, [scale-A-tmem], [scale-B-tmem], enable-input-d.
+                            self.emit_line(&format!(
+                                "tcgen05.mma.cta_group::1.kind::mxf8f6f4.block_scale.scale_vec::1X \
+                                 m{}n{}k{} {{{}, {}, {}, {}, {}, enable-input-d}};",
+                                m, n, k, acc_r, a_r, b_r, sa_r, sb_r
+                            ));
+                        }
+                        _ => {
+                            return Err(CompilerError::CodegenViolation(
+                                "NativeFp6Gemm: only PTX SM100+ tcgen05 supported".into()
+                            ));
+                        }
+                    }
+                    Ok(())
+                } else {
+                    Err(CompilerError::CodegenViolation(
+                        "NativeFp6Gemm requires SM100+ tcgen05 hardware (has_native_fp6)".into()))
+                }
+            }
+            _ => Err(CompilerError::CodegenViolation(
+                format!("lower_native_fp6_gemm_gpu: expected VmInstr::NativeFp6Gemm, got {:?}", instr))),
+        }
+    }
+
+    fn lower_two_cta_fp4_gemm_gpu(&mut self, instr: &VmInstr, alloc: &RegAllocation) -> Result<(), CompilerError> {
+        match instr {
+            VmInstr::TwoCtaFp4Gemm { acc, a, b, scale_a, scale_b, m, n, k, .. } => {
+
+                if self.sm_version().is_some_and(|sm| sm >= 100) {
+                    let acc_r = self.reg_name_with_kind(*acc, alloc);
+                    let a_r = self.reg_name_with_kind(*a, alloc);
+                    let b_r = self.reg_name_with_kind(*b, alloc);
+                    let sa_r = self.reg_name_with_kind(*scale_a, alloc);
+                    let sb_r = self.reg_name_with_kind(*scale_b, alloc);
+                    match self.dialect {
+                        GpuDialect::Ptx { .. } => {
+                            // 2-CTA 协同 MMA: cta_group::2 要求 peer CTA active。
+                            // PTX ISA 9.3 §9.7.17.5 Issue Granularity 表 49/50:
+                            //   cta_group::2 操作前后需 cluster barrier 同步
+                            //   (确保 CTA Pair 双方就绪后再发起 mma)。
+                            self.emit_line("barrier.cluster.arrive;");
+                            self.emit_line("barrier.cluster.wait;");
+                            // tcgen05.mma.synched.cta_group::2.mMnNkK.f4.f4.f32
+                            // {:acc}, {:a}, {:b}, {:scale_a}, {:scale_b}
+                            self.emit_line(&format!(
+                                "tcgen05.mma.synched.cta_group::2.m{}n{}k{}.f4.f4.f32 {{{}, {}, {}, {}, {}}};",
+                                m, n, k, acc_r, a_r, b_r, sa_r, sb_r
+                            ));
+                            // 等待 mma 完成 (2-CTA 协同, 双 CTA tmem 写入)
+                            self.emit_line("tcgen05.wait::ld.sync.aligned;");
+                        }
+                        _ => {
+                            return Err(CompilerError::CodegenViolation(
+                                "TwoCtaFp4Gemm: only PTX SM100+ 2-CTA tcgen05 supported".into()
+                            ));
+                        }
+                    }
+                    Ok(())
+                } else {
+                    Err(CompilerError::CodegenViolation(
+                        "TwoCtaFp4Gemm requires SM100+ 2-CTA hardware (IsaFeature::TwoCta)".into()))
+                }
+            }
+            _ => Err(CompilerError::CodegenViolation(
+                format!("lower_two_cta_fp4_gemm_gpu: expected VmInstr::TwoCtaFp4Gemm, got {:?}", instr))),
         }
     }
 
