@@ -382,8 +382,30 @@ impl AArch64Lower {
                         ));
                     }
                 }
-                let _ = width;
-                Ok(())
+                // Width 驱动加载完整性 (ARCH-JIT-YIELDS + NO-SILENT-FALLBACK +
+                // NO-HW-DEGRADATION)。
+                //
+                // SimdWidth 在 AArch64 平台只会是 W128 (NEON) 或 Scalable (SVE, 运行时 VL) —
+                // isa_profile 不产生 W256/W512。上方 SVE 分支用 LD1W Zt.S 加载完整 Z 寄存器
+                // (单条指令覆盖整个 VL, 最高 256 bytes), NEON 分支用 LD1 {Vt.4S} 加载完整 128-bit
+                // — 这两个 width 的加载已正确发射, 无 lane 丢失。
+                //
+                // W256/W512 在 AArch64 上是架构异常 (单个 PhysVec 仅 128-bit, 且 reg_alloc
+                // 不为单 VRegId 分配连续物理寄存器对 → 无法安全发射 LD1 {Vd,Vd+1} 多寄存器加载)。
+                // 禁止静默丢弃剩余 lane (原 `let _ = width; Ok(())` 是 NO-SILENT-FALLBACK 违宪)。
+                // 返回 Err 是合法的 NO-SILENT-FALLBACK: 让上游通过正确的 AArch64 width
+                // (W128/Scalable) 重新规划, 而非生成数值错误代码。
+                match width {
+                    SimdWidth::W128 | SimdWidth::Scalar | SimdWidth::Scalable => Ok(()),
+                    SimdWidth::W256 | SimdWidth::W512 | SimdWidth::Warp(_) => Err(
+                        CompilerError::CodegenViolation(format!(
+                            "VecLoad on AArch64: width {:?} not natively supported \
+                             (PhysVec=128-bit, no contiguous multi-register guarantee); \
+                             use W128/Scalable via isa_profile",
+                            width
+                        ))
+                    ),
+                }
             }
             _ => Err(CompilerError::CodegenViolation(
                 format!("lower_vec_load_aarch64: expected VmInstr::VecLoad, got {:?}", instr))),
@@ -392,7 +414,7 @@ impl AArch64Lower {
 
     fn lower_vec_store_aarch64(&mut self, instr: &VmInstr, alloc: &RegAllocation) -> Result<(), CompilerError> {
         match instr {
-            VmInstr::VecStore { base, src, offset, dtype, .. } => {
+            VmInstr::VecStore { base, src, offset, width, dtype, .. } => {
 
                 let vs = self.resolve_vreg(*src, alloc)?;
                 let xn = self.resolve_gpr(*base, alloc)?;
@@ -461,7 +483,30 @@ impl AArch64Lower {
                         ));
                     }
                 }
-                Ok(())
+                // Width 驱动存储完整性 (ARCH-JIT-YIELDS + NO-SILENT-FALLBACK +
+                // NO-HW-DEGRADATION) — 与 VecLoad/TableLookup 同类违宪根治。
+                //
+                // SimdWidth 在 AArch64 平台只会是 W128 (NEON) 或 Scalable (SVE, 运行时 VL) —
+                // isa_profile 不产生 W256/W512。上方 SVE 分支用 ST1W Zt.S 存储完整 Z 寄存器
+                // (单条指令覆盖整个 VL), NEON 分支用 ST1 {Vt.4S} 存储完整 128-bit —
+                // 这两个 width 的存储已正确发射, 无 lane 丢失。
+                //
+                // W256/W512 在 AArch64 上是架构异常 (单个 PhysVec 仅 128-bit, 且 reg_alloc
+                // 不为单 VRegId 分配连续物理寄存器对 → 无法安全发射 ST1 {Vs,Vs+1} 多寄存器存储)。
+                // 禁止静默丢弃剩余 lane (原 `.. ` 忽略 width 是 NO-SILENT-FALLBACK 违宪)。
+                // 返回 Err 是合法的 NO-SILENT-FALLBACK: 让上游通过正确的 AArch64 width
+                // (W128/Scalable) 重新规划, 而非生成数值错误代码。
+                match width {
+                    SimdWidth::W128 | SimdWidth::Scalar | SimdWidth::Scalable => Ok(()),
+                    SimdWidth::W256 | SimdWidth::W512 | SimdWidth::Warp(_) => Err(
+                        CompilerError::CodegenViolation(format!(
+                            "VecStore on AArch64: width {:?} not natively supported \
+                             (PhysVec=128-bit, no contiguous multi-register guarantee); \
+                             use W128/Scalable via isa_profile",
+                            width
+                        ))
+                    ),
+                }
             }
             _ => Err(CompilerError::CodegenViolation(
                 format!("lower_vec_store_aarch64: expected VmInstr::VecStore, got {:?}", instr))),
@@ -1136,11 +1181,30 @@ impl AArch64Lower {
                     }
                 }
 
-                // For widths > 128-bit (W256, W512), load additional vectors.
-                // NEON only supports 128-bit registers, so W256/W512 are not natively
-                // available. For now, we load 128-bit which covers W128/Scalar cases.
-                let _ = width;
-                Ok(())
+                // Width 驱动加载完整性 (ARCH-JIT-YIELDS + NO-SILENT-FALLBACK +
+                // NO-HW-DEGRADATION)。
+                //
+                // SimdWidth 在 AArch64 平台只会是 W128 (NEON) 或 Scalable (SVE, 运行时 VL) —
+                // isa_profile 不产生 W256/W512。上方 SVE 分支用 LD1W Zt.S 加载完整 Z 寄存器
+                // (单条指令覆盖整个 VL, 最高 256 bytes), NEON 分支用 LD1 {Vt.4S} 加载完整 128-bit
+                // — 这两个 width 的加载已正确发射, 无 lane 丢失。
+                //
+                // W256/W512 在 AArch64 上是架构异常 (单个 PhysVec 仅 128-bit, 且 reg_alloc
+                // 不为单 VRegId 分配连续物理寄存器对 → 无法安全发射 LD1 {Vd,Vd+1} 多寄存器加载)。
+                // 禁止静默丢弃剩余 lane (原 `let _ = width; Ok(())` 是 NO-SILENT-FALLBACK 违宪)。
+                // 返回 Err 是合法的 NO-SILENT-FALLBACK: 让上游 (gemm/auto_select) 通过正确的
+                // AArch64 width (W128/Scalable) 重新规划, 而非生成数值错误代码。
+                match width {
+                    SimdWidth::W128 | SimdWidth::Scalar | SimdWidth::Scalable => Ok(()),
+                    SimdWidth::W256 | SimdWidth::W512 | SimdWidth::Warp(_) => Err(
+                        CompilerError::CodegenViolation(format!(
+                            "TableLookup on AArch64: width {:?} not natively supported \
+                             (PhysVec=128-bit, no contiguous multi-register guarantee); \
+                             use W128/Scalable via isa_profile",
+                            width
+                        ))
+                    ),
+                }
             }
             _ => Err(CompilerError::CodegenViolation(
                 format!("lower_table_lookup_aarch64: expected VmInstr::TableLookup, got {:?}", instr))),
