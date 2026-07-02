@@ -105,6 +105,29 @@ impl X86Lower {
     }
 
     // ── 物理寄存器映射 ──
+    //
+    // BCE-20260703-X86-APX-EGPR-UNUSED: APX 扩展 GPR (R16-R31) 编码根治。
+    //
+    // 事实链:
+    //   1. isa_profile.rs 在 `has_apx: true` 时 max_gpr=31, RegAllocator 会产出
+    //      PhysGpr(16..31) 进入可分配池 (isa_profile.rs:438-442)。
+    //   2. iced_x86 1.21 的 `Register` 枚举最大到 R15 (register.rs:1009, =68),
+    //      没有 R16-R31 变体, 也没有 `apx`/`egpr` feature; code_asm registers 模块
+    //      只导出 rax..r15 常量, 无法构造 AsmRegister64(R16..R31)。
+    //   3. 因此 APX egpr 在当前 iced_x86 版本下无法编码。
+    //
+    // 当前运行时状态: microarch::has_apx() 永远返回 false (CPUID 探测 TBD),
+    //   hardware_profile CpuAvx10_2 路径未被 detect 路由, 故 has_apx 实际永远 false,
+    //   RegAllocator 不会产出 PhysGpr(16..31), 16..31 分支是 latent 死代码。
+    //
+    // 根治策略 (治本, 非打补丁):
+    //   - 16..31 不再走 `unreachable!` 的误导信息 ("range [0..15]"), 而是显式区分
+    //     "APX egpr 需 iced_x86 APX 支持"。一旦 iced_x86 升级支持 APX (R16-R31
+    //     变体 + EVEX.R'/X'' 编码), 在此 match arm 补 `AsmRegister64::new(Register::R16)`
+    //     即可激活。
+    //   - 真正非法 phys (>31) 仍 panic, 因为这表示 RegAllocator 越界。
+    //
+    // 升级 iced_x86 后的激活点: 见下方 `16 => ...` 注释。
 
     fn gpr(phys: PhysGpr) -> AsmRegister64 {
         match phys.0 {
@@ -112,7 +135,19 @@ impl X86Lower {
             6 => rsi, 7 => rdi,
             8 => r8, 9 => r9, 10 => r10, 11 => r11,
             12 => r12, 13 => r13, 14 => r14, 15 => r15,
-            other => unreachable!("RegAllocator produced invalid PhysGpr({}); x86_64 GPR range [0..15]", other),
+            // APX egpr (R16-R31): iced_x86 1.21 不支持编码。
+            // 升级 iced_x86 支持 APX 后, 改为:
+            //   16 => AsmRegister64::new(Register::R16), ... 31 => AsmRegister64::new(Register::R31)
+            16..=31 => unreachable!(
+                "gpr({}): APX egpr (R16-R31) requires iced_x86 APX encoding support; \
+                 current iced_x86 1.21 Register enum max=R15, no R16-R31 variants. \
+                 Activate has_apx only after upgrading iced_x86 (or via raw Instruction API EVEX.R'/X'').",
+                phys.0
+            ),
+            other => unreachable!(
+                "gpr({}): x86_64 GPR out of range; valid [0..31] (0..15 baseline, 16..31 APX egpr).",
+                other
+            ),
         }
     }
 
@@ -122,12 +157,26 @@ impl X86Lower {
             6 => esi, 7 => edi,
             8 => r8d, 9 => r9d, 10 => r10d, 11 => r11d,
             12 => r12d, 13 => r13d, 14 => r14d, 15 => r15d,
-            other => unreachable!("gpr32({}): x86_64 GPR range [0..15]", other),
+            // APX egpr 32-bit view (R16D-R31D): iced_x86 1.21 不支持编码。
+            // 升级后: 16 => AsmRegister32::new(Register::R16D), ... 31 => AsmRegister32::new(Register::R31D)
+            16..=31 => unreachable!(
+                "gpr32({}): APX egpr (R16D-R31D) requires iced_x86 APX encoding support; \
+                 current iced_x86 1.21 has no R16D-R31D variants.",
+                phys.0
+            ),
+            other => unreachable!(
+                "gpr32({}): x86_64 GPR out of range; valid [0..31] (0..15 baseline, 16..31 APX egpr).",
+                other
+            ),
         }
     }
 
     /// Convert a 64-bit GPR AsmRegister to its 32-bit counterpart.
     /// Required for DWORD stores (e.g., StoreToken u32 writes).
+    ///
+    /// BCE-20260703-X86-APX-EGPR-UNUSED: 输入永远只可能是 rax..r15, 因为 iced_x86 1.21
+    /// 无法构造 AsmRegister64(R16..R31) (见 gpr() 注释)。APX egpr 激活后需在此补
+    /// `r16 => r16d` ... `r31 => r31d` 映射 (届时 iced_x86 会导出这些常量)。
     #[allow(non_upper_case_globals)]
     fn gpr64_to_32(reg: AsmRegister64) -> AsmRegister32 {
         match reg {
@@ -135,7 +184,10 @@ impl X86Lower {
             rsp => esp, rbp => ebp, rsi => esi, rdi => edi,
             r8 => r8d, r9 => r9d, r10 => r10d, r11 => r11d,
             r12 => r12d, r13 => r13d, r14 => r14d, r15 => r15d,
-            other => unreachable!("gpr64_to_32({:?}): not a GPR64", other),
+            other => unreachable!(
+                "gpr64_to_32({:?}): not a baseline GPR64; APX egpr (R16-R31) unsupported by iced_x86 1.21",
+                other
+            ),
         }
     }
 

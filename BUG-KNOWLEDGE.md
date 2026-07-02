@@ -9,10 +9,55 @@
 |------|--------|------|------|------|
 | BCE-MIXED 算子级混合精度（BCE-20260630-MIXED） | 1 | 1 ✅ | 0 | emit_gemm_* 三段式 dtype（a/b/c）+ ctx.dtype per-op + accumulator_dtype() 标注 |
 | BCE-OPTPASS 指令重写 dtype 丢失（BCE-20260630-OPTPASS） | 1 | 1 ✅ | 0 | substitute_loop_offset/forwarding match 绑定保留原 dtype，禁 `..` 丢弃 |
+| BCE-X86-APX-EGPR iced_x86 APX egpr 编码缺失（BCE-20260703-X86-APX-EGPR-UNUSED） | 1 | 1 ✅ | 0 | gpr/gpr32/gpr64_to_32 对 16..31 显式报错；iced_x86 1.21 无 R16-R31 变体，APX 激活前须升级 iced_x86 |
 
 **全库残留总计**: 0
 
 ---
+
+## BCE-X86-APX-EGPR — iced_x86 APX egpr (R16-R31) 编码缺失根治
+
+### smellClass: AP-UNREACHABLE-MISLEADING-RANGE（Pattern — unreachable 报错信息掩盖 latent 编码缺失）
+
+**宪法依据**: NO-SILENT-FALLBACK（CLAUDE.md 铁律，JIT codegen 遇不支持 OpKind 必须 Err 而非静默）+ ARCH-ROOT-CAUSE（治本不治标，不掩盖架构缺口）+ NO-HW-DEGRADATION（硬件能力差异体现在 codegen 指令选择，非掩盖）。
+
+**模式签名**: lowering 层的物理寄存器映射函数（gpr/gpr32/gpr64_to_32）用 `unreachable!("range [0..15]")` 掩盖 APX egpr (R16-R31) 编码缺失。isa_profile 在 `has_apx: true` 时 max_gpr=31 会产出 PhysGpr(16..31)，但 iced_x86 1.21 的 `Register` 枚举最大到 R15（无 R16-R31 变体、无 apx feature），lowering 无法编码。`unreachable` 信息暗示 "RegAllocator 越界"，实则是 lowering 编码能力缺口，误导归因。
+
+```yaml
+- patternId: BCE-20260703-X86-APX-EGPR-UNUSED
+  title: gpr/gpr32 16..31 unreachable 掩盖 iced_x86 APX egpr 编码缺失
+  layer: 范式缺陷
+  smellClass: AP-UNREACHABLE-MISLEADING-RANGE
+  codePattern:
+    - "gpr(phys) match phys.0 { 0..=15 => ..., other => unreachable!(\"range [0..15]\") }"
+    - "isa_profile has_apx=true 时 max_gpr=31 产出 PhysGpr(16..31) 但 lowering 无对应编码分支"
+  triggerCondition:
+    - "has_apx=true（CPUID 探测启用 APX）+ RegAllocator 分配到 PhysGpr(16..31)"
+    - "当前 latent：microarch::has_apx() 永远 false，16..31 分支死代码"
+  detectionSignatures:
+    structural: "fn gpr(phys: PhysGpr) -> AsmRegister64 { match phys.0 { .., other => unreachable!(\"range \\[0\\.\\.15\\]\") } }"
+    literal: "unreachable!.*x86_64 GPR range \\[0\\.\\.15\\]"
+  sameClassCriterion:
+    - "任何物理寄存器映射函数对 isa_profile 声称支持的扩展范围（APX 16..31 / AVX-512 高位等）用 unreachable 掩盖编码缺失，而非显式报错"
+  fixTemplate:
+    - "对扩展范围 16..31 单独 match arm，unreachable 带准确信息：APX egpr 需 iced_x86 APX 编码支持，当前 iced_x86 1.21 无 R16-R31 变体"
+    - "区分 'APX 未激活的编码缺口' vs '真正越界 phys'，前者是 latent 死代码待激活，后者是 RegAllocator bug"
+  regressionAssertion:
+    - "has_apx=false 时 gpr(PhysGpr(0..15)) 正常返回 rax..r15"
+    - "has_apx=true 时 gpr(PhysGpr(16..31)) panic 带清晰信息（非误导性 'range [0..15]'）"
+```
+
+**根因**: iced_x86 1.21 不支持 APX egpr 编码（Register 枚举 max=R15，无 R16-R31 变体），isa_profile 的 APX 31-GPR 声明与 lowering 实际编码能力脱节，lowering 用误导性 unreachable 掩盖。
+
+**根治**: gpr()/gpr32()/gpr64_to_32() 对 16..31 单独 match arm，unreachable 带准确信息（APX egpr 需 iced_x86 APX 编码支持），并标注升级 iced_x86 后的激活点（`AsmRegister64::new(Register::R16)` 等）。真正越界 phys (>31) 仍 panic 但信息区分。运行时 has_apx 永远 false，16..31 分支 latent，待 iced_x86 升级 + CPUID 探测实现后激活。
+
+**横扫确认**: 三层搜索（structural `fn gpr.*match phys.0` / literal `range \[0\.\.15\]` / isa_profile APX 引用）命中 3 处（gpr/gpr32/gpr64_to_32），全部根治，残留=0。
+
+### 防复发沉淀
+- 代码内注释: helpers.inc.rs gpr()/gpr32()/gpr64_to_32() 顶部 BCE-20260703-X86-APX-EGPR-UNUSED 根治说明 + iced_x86 升级激活点
+- 本条目: BUG-KNOWLEDGE.md 沉淀
+- 状态: ✅ 已闭环 (residual=0)
+- 激活路径: iced_x86 升级支持 APX 后，在 gpr() 的 `16..=31` arm 改为 `AsmRegister64::new(Register::R16)` 等；同时实现 microarch::has_apx() CPUID 探测
 
 ## BCE-MIXED — 算子级混合精度 dtype 感知
 
