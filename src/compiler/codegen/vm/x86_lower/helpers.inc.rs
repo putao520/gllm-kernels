@@ -84,7 +84,19 @@ impl X86Lower {
     /// 返回指定索引的 scratch YMM 寄存器。
     fn scratch_ymm(&self, idx: usize) -> AsmRegisterYmm { Self::ymm(self.scratch_vec_ids[idx]) }
     /// 返回指定索引的 scratch XMM 寄存器。
-    fn scratch_xmm(&self, idx: usize) -> AsmRegisterXmm { Self::ymm_to_xmm(Self::ymm(self.scratch_vec_ids[idx])) }
+    fn scratch_xmm(&self, idx: usize) -> AsmRegisterXmm {
+        // BCE-20260702-REGALLOC-AVX2-OOB: S 类 scratch (idx 0..3) 走 SSE scalar 指令
+        // (vmovss/vmovsd/vmovd — lower_scalar_load_x86 / xmm_const_i32)。iced_x86 的
+        // code_asm SSE scalar 编码只支持 xmm0..15 (VEX 编码, EVEX 前缀需底层 Instruction
+        // API), 故内部 scratch 物理号必须 ≤15。spill scratch (idx 3..6) 是 V 类 (vmovups
+        // ymm/zmm, 支持 16..31), 不经此函数。
+        debug_assert!(
+            self.scratch_vec_ids[idx].0 <= 15,
+            "S 类 scratch_xmm({}) 物理 {:?} 必须 ≤15 (SSE scalar 编码约束), 详见 isa_profile.rs BCE-20260702",
+            idx, self.scratch_vec_ids[idx]
+        );
+        Self::ymm_to_xmm(Self::ymm(self.scratch_vec_ids[idx]))
+    }
     /// 返回指定索引的 scratch ZMM 寄存器。
     fn scratch_zmm(&self, idx: usize) -> AsmRegisterZmm { Self::zmm(self.scratch_vec_ids[idx]) }
 

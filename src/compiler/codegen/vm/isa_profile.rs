@@ -2487,6 +2487,17 @@ mod tests {
         let max_scratch = *scratch_ids.iter().max().unwrap();
         let vec_count = if matches!(&profile.platform, Platform::X86_64 { has_avx512: true, .. }) { 32 } else { 16 };
         assert_eq!(max_scratch + 1, vec_count, "highest scratch reg should be vec_count - 1");
+
+        // BCE-20260702-REGALLOC-AVX2-OOB: S 类 / V 类 scratch 分区不变量。
+        // 内部 scratch [0..3] (HReduce/FWHT/broadcast/ScalarLoad — 走 SSE scalar 指令
+        // vmovss/vmovsd, iced_x86 编码只支持 xmm0..15) 必须 ≤15; spill scratch [3..6]
+        // (vmovups ymm/zmm, AVX-512 支持 16..31) AVX-512 下应 ≥16 (把低位让给 RegAllocator)。
+        assert!(profile.scratch_vec_regs[0..3].iter().all(|p| p.0 <= 15),
+            "S 类内部 scratch 必须 ≤15 (SSE scalar 编码约束), got {:?}", &profile.scratch_vec_regs[0..3]);
+        if matches!(&profile.platform, Platform::X86_64 { has_avx512: true, .. }) {
+            assert!(profile.scratch_vec_regs[3..6].iter().all(|p| p.0 >= 16),
+                "V 类 spill scratch AVX-512 下应 ≥16, got {:?}", &profile.scratch_vec_regs[3..6]);
+        }
     }
 
     #[test]
