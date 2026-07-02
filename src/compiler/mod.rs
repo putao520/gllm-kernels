@@ -250,6 +250,8 @@ fn _gk_oom_log(tag: &str, extra: &str) {
     let _ = std::fs::OpenOptions::new().create(true).append(true)
         .open("/tmp/oomprobe_gk.log").and_then(|mut f| writeln!(f, "{:>30} | RSS={} MB | {}", tag, _gk_oom_rss_mb(), extra));
     eprintln!("[OOMPROBE-GK] {:>30} | RSS={} MB | {}", tag, _gk_oom_rss_mb(), extra);
+    // 强制刷新 stderr: cargo test harness 会缓冲 stdout/stderr, OOM kill 前未 flush 则探针丢失
+    std::io::stderr().flush().ok();
 }
 impl InferenceCompiler {
     /// Create a new compiler with the detected hardware profile.
