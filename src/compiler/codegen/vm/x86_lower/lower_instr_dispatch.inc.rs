@@ -1290,24 +1290,58 @@ impl X86Lower {
     fn lower_vec_shift_imm_x86(&mut self, instr: &VmInstr, alloc: &RegAllocation) -> Result<(), CompilerError> {
         match instr {
             VmInstr::VecShiftImm { dst, a, amount, op, width } => {
-                let _ = width;
+                // Width 驱动寄存器宽度选择 (ARCH-JIT-YIELDS + NO-SILENT-FALLBACK +
+                // NO-HW-DEGRADATION)。原 `let _ = width` 按 use_avx512 硬选 zmm/ymm,
+                // 请求 W128+use_avx512 会用 zmm (多算 12 lane) — 静默降级违宪。
+                //
+                // 正确实现: 按 width 分流到 xmm/ymm/zmm:
+                //   W128/Scalar → xmm (4 lane, vpslld xmm)
+                //   W256        → ymm (8 lane, vpslld ymm)
+                //   W512        → zmm (16 lane, vpslld zmm, 需 use_avx512)
+                //   Warp/Scalable → x86 不支持, Err
                 let imm = *amount as u32;
-                if self.use_avx512 {
-                    let (va, _) = self.resolve_zmm_or_spill(*a, alloc, 0)?;
-                    let (d, dst_spilled) = self.resolve_zmm_or_spill_write(*dst, alloc, 1)?;
-                    match op {
-                        VecShiftDir::Left => self.asm.vpslld(d, va, imm).map_err(Self::err)?,
-                        VecShiftDir::Right => self.asm.vpsrld(d, va, imm).map_err(Self::err)?,
+                match width {
+                    SimdWidth::Scalar | SimdWidth::W128 => {
+                        let (va, _) = self.resolve_ymm_or_spill(*a, alloc, 0)?;
+                        let va_x = Self::ymm_to_xmm(va);
+                        let (d, dst_spilled) = self.resolve_ymm_or_spill_write(*dst, alloc, 1)?;
+                        let dst_x = Self::ymm_to_xmm(d);
+                        match op {
+                            VecShiftDir::Left => self.asm.vpslld(dst_x, va_x, imm).map_err(Self::err)?,
+                            VecShiftDir::Right => self.asm.vpsrld(dst_x, va_x, imm).map_err(Self::err)?,
+                        }
+                        if dst_spilled { self.spill_store_ymm(*dst, alloc, 1)?; }
                     }
-                    if dst_spilled { self.spill_store_zmm(*dst, alloc, 1)?; }
-                } else {
-                    let (va, _) = self.resolve_ymm_or_spill(*a, alloc, 0)?;
-                    let (d, dst_spilled) = self.resolve_ymm_or_spill_write(*dst, alloc, 1)?;
-                    match op {
-                        VecShiftDir::Left => self.asm.vpslld(d, va, imm).map_err(Self::err)?,
-                        VecShiftDir::Right => self.asm.vpsrld(d, va, imm).map_err(Self::err)?,
+                    SimdWidth::W256 => {
+                        let (va, _) = self.resolve_ymm_or_spill(*a, alloc, 0)?;
+                        let (d, dst_spilled) = self.resolve_ymm_or_spill_write(*dst, alloc, 1)?;
+                        match op {
+                            VecShiftDir::Left => self.asm.vpslld(d, va, imm).map_err(Self::err)?,
+                            VecShiftDir::Right => self.asm.vpsrld(d, va, imm).map_err(Self::err)?,
+                        }
+                        if dst_spilled { self.spill_store_ymm(*dst, alloc, 1)?; }
                     }
-                    if dst_spilled { self.spill_store_ymm(*dst, alloc, 1)?; }
+                    SimdWidth::W512 => {
+                        if !self.use_avx512 {
+                            return Err(CompilerError::CodegenViolation(format!(
+                                "VecShiftImm W512 on x86 without AVX-512 (use_avx512=false); \
+                                 isa_profile 不应产生 W512 在无 AVX-512 平台"
+                            )));
+                        }
+                        let (va, _) = self.resolve_zmm_or_spill(*a, alloc, 0)?;
+                        let (d, dst_spilled) = self.resolve_zmm_or_spill_write(*dst, alloc, 1)?;
+                        match op {
+                            VecShiftDir::Left => self.asm.vpslld(d, va, imm).map_err(Self::err)?,
+                            VecShiftDir::Right => self.asm.vpsrld(d, va, imm).map_err(Self::err)?,
+                        }
+                        if dst_spilled { self.spill_store_zmm(*dst, alloc, 1)?; }
+                    }
+                    SimdWidth::Warp(_) | SimdWidth::Scalable => {
+                        return Err(CompilerError::CodegenViolation(format!(
+                            "VecShiftImm on x86: width {:?} not supported (x86 只支持 W128/W256/W512/Scalar)",
+                            width
+                        )));
+                    }
                 }
                 Ok(())
             }
@@ -3145,20 +3179,61 @@ impl X86Lower {
         match instr {
             VmInstr::GgufSubScaleLoad { dst, scales_base, sub_block_idx, width } => {
                 // Q6_K: load i8 from scales_base + sub_block_idx, sign-extend to i32,
-                // convert to f32, broadcast to all YMM lanes.
-                let _ = width.f32_lanes();
-                let (dst_ymm, dst_spilled) = self.resolve_ymm_or_spill_write(*dst, alloc, 2)?;
+                // convert to f32, broadcast to all lanes.
+                //
+                // Width 驱动 broadcast 目标寄存器宽度 (ARCH-JIT-YIELDS + NO-SILENT-FALLBACK +
+                // NO-HW-DEGRADATION)。原 `let _ = width.f32_lanes()` 硬编码 YMM (W256),
+                // W512 请求只填 YMM (8 lane) 丢 8 lane — 静默降级违宪。
+                //
+                // 正确实现: 按 width 分流 broadcast 目标:
+                //   W128/Scalar → xmm (4 lane)
+                //   W256        → ymm (8 lane)
+                //   W512        → zmm (16 lane, 需 use_avx512)
+                //   Warp/Scalable → x86 不支持, Err
                 let scales_reg = self.resolve_gpr_read(*scales_base, alloc, 2)?;
                 let idx_reg = self.resolve_gpr_read(*sub_block_idx, alloc, 0)?;
 
                 let addr_reg = self.scratch_gprs[1]; // scratch[0]=rax, scratch[1]=r10
                 self.asm.lea(addr_reg, qword_ptr(scales_reg + idx_reg)).map_err(Self::err)?;
                 self.asm.movsx(rax, byte_ptr(addr_reg)).map_err(Self::err)?;
-                let dst_xmm = Self::ymm_to_xmm(dst_ymm);
-                self.asm.vmovd(dst_xmm, eax).map_err(Self::err)?;
-                self.asm.vpbroadcastd(dst_ymm, dst_xmm).map_err(Self::err)?;
-                self.asm.vcvtdq2ps(dst_ymm, dst_ymm).map_err(Self::err)?;
-                if dst_spilled { self.spill_store_ymm(*dst, alloc, 2)?; }
+
+                // 用 scratch_xmm(0) 暂存 i32 (vmovd eax → xmm), 再 vpbroadcastd 到目标宽度。
+                let src_xmm = self.scratch_xmm(0);
+                self.asm.vmovd(src_xmm, eax).map_err(Self::err)?;
+
+                match width {
+                    SimdWidth::Scalar | SimdWidth::W128 => {
+                        let (dst_ymm, dst_spilled) = self.resolve_ymm_or_spill_write(*dst, alloc, 2)?;
+                        let dst_xmm = Self::ymm_to_xmm(dst_ymm);
+                        self.asm.vpbroadcastd(dst_xmm, src_xmm).map_err(Self::err)?;
+                        self.asm.vcvtdq2ps(dst_xmm, dst_xmm).map_err(Self::err)?;
+                        if dst_spilled { self.spill_store_ymm(*dst, alloc, 2)?; }
+                    }
+                    SimdWidth::W256 => {
+                        let (dst_ymm, dst_spilled) = self.resolve_ymm_or_spill_write(*dst, alloc, 2)?;
+                        self.asm.vpbroadcastd(dst_ymm, src_xmm).map_err(Self::err)?;
+                        self.asm.vcvtdq2ps(dst_ymm, dst_ymm).map_err(Self::err)?;
+                        if dst_spilled { self.spill_store_ymm(*dst, alloc, 2)?; }
+                    }
+                    SimdWidth::W512 => {
+                        if !self.use_avx512 {
+                            return Err(CompilerError::CodegenViolation(format!(
+                                "GgufSubScaleLoad W512 on x86 without AVX-512 (use_avx512=false); \
+                                 isa_profile 不应产生 W512 在无 AVX-512 平台"
+                            )));
+                        }
+                        let (dst_zmm, dst_spilled) = self.resolve_zmm_or_spill_write(*dst, alloc, 2)?;
+                        self.asm.vpbroadcastd(dst_zmm, src_xmm).map_err(Self::err)?;
+                        self.asm.vcvtdq2ps(dst_zmm, dst_zmm).map_err(Self::err)?;
+                        if dst_spilled { self.spill_store_zmm(*dst, alloc, 2)?; }
+                    }
+                    SimdWidth::Warp(_) | SimdWidth::Scalable => {
+                        return Err(CompilerError::CodegenViolation(format!(
+                            "GgufSubScaleLoad on x86: width {:?} not supported (x86 只支持 W128/W256/W512/Scalar)",
+                            width
+                        )));
+                    }
+                }
                 Ok(())
             }
             _ => Err(CompilerError::CodegenViolation(
