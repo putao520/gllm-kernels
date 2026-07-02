@@ -897,17 +897,23 @@ impl InferenceCompiler {
         } else {
             0
         };
+        // BCE-20260702-GPU-SILENT-FALLBACK: select hook BEFORE compile_mega_kernel_vm so the
+        // GPU GEMM IsaHook is available to lowering (mirrors compile_cpu:591-592). Previously
+        // hook was selected AFTER compile_mega_kernel_vm, which received None and triggered
+        // `IsaHook is mandatory (ARCH-ISA-HOOK-MANDATORY)` in gemm_emit.rs.
+        let hook = codegen::vm::isa_hook::select_hook(&profile);
+        let hook_ref: Option<&dyn codegen::vm::isa_hook::IsaHook> = Some(&*hook);
+
         let (mut program, rope_cache, logits_scratch_offset) =
             codegen::vm::mega_kernel_emit::compile_mega_kernel_vm(
                 &fusion_plan, &graph, &alloc, Some(&registry), &profile,
-                None, &buffer_layout, Some(bottleneck_map),
+                hook_ref, &buffer_layout, Some(bottleneck_map),
                 Some(&virtual_activation), Some(&virtual_tensor_map), Some(&layout_assignment),
                 false, None, Some(&resource_plan),
                 topology,
             ).map_err(|e| InferenceError::CompileError(e.into()))?;
 
         let pass_registry = PassRegistry::with_defaults();
-        let hook = codegen::vm::isa_hook::select_hook(&profile);
         pass_registry.run_all(&mut program, &profile, &*hook);
 
         let alloc_result = RegAllocator::new(&profile).allocate(&program)
