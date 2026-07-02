@@ -1428,14 +1428,18 @@ impl AArch64Lower {
                             self.emit32(self.enc_sve_dup_s(vd, vd));
                         }
                         ReduceOp::Prod => {
-                            // SVE has no FMULV; emulate via NEON pairwise on extracted lanes
-                            // For now produce error — product reduction is extremely rare
-                            if vd != vs { self.emit32(self.enc_sve_mov(vd, vs)); }
+                            // SVE 无 FMULV 指令; product reduction 需多步 pairwise 乘序列或 trace 层分解
+                            // NO-SILENT-FALLBACK: 未实现返回 Err, 静默 mov 是违宪 NOP
+                            return Err(CompilerError::CodegenViolation(
+                                "SVE ReduceOp::Prod: no FMULV instruction; decompose into pairwise mul at trace level".into()
+                            ));
                         }
                         ReduceOp::LogSum => {
-                            // LogSum = log(sum(exp(x))) — requires multi-instruction sequence
-                            // Should be decomposed into Exp + HReduce(Sum) + Log at trace level
-                            if vd != vs { self.emit32(self.enc_sve_mov(vd, vs)); }
+                            // LogSum = log(sum(exp(x))) — 需 Exp + HReduce(Sum) + Log 多指令序列
+                            // NO-SILENT-FALLBACK: 未实现返回 Err, 静默 mov 是违宪 NOP
+                            return Err(CompilerError::CodegenViolation(
+                                "SVE ReduceOp::LogSum: requires Exp+Sum+Log decomposition at trace level".into()
+                            ));
                         }
                     }
                 } else {
@@ -1456,8 +1460,19 @@ impl AArch64Lower {
                             self.emit32(0x6EA0F400 | ((vs as u32) << 16) | ((vs as u32) << 5) | vd as u32);
                             self.emit32(0x6EA0F400 | ((vd as u32) << 16) | ((vd as u32) << 5) | vd as u32);
                         }
-                        _ => {
-                            if vd != vs { self.emit32(self.enc_neon_mov(vd, vs)); }
+                        ReduceOp::Prod => {
+                            // NEON 无 pairwise 乘 reduction 指令; product reduction 需多步序列或 trace 层分解
+                            // NO-SILENT-FALLBACK: 未实现返回 Err, 静默 mov 是违宪 NOP
+                            return Err(CompilerError::CodegenViolation(
+                                "NEON ReduceOp::Prod: no pairwise mul reduction instruction; decompose at trace level".into()
+                            ));
+                        }
+                        ReduceOp::LogSum => {
+                            // LogSum = log(sum(exp(x))) — 需 Exp + HReduce(Sum) + Log 多指令序列
+                            // NO-SILENT-FALLBACK: 未实现返回 Err, 静默 mov 是违宪 NOP
+                            return Err(CompilerError::CodegenViolation(
+                                "NEON ReduceOp::LogSum: requires Exp+Sum+Log decomposition at trace level".into()
+                            ));
                         }
                     }
                 }
