@@ -370,7 +370,7 @@ mod tests {
         let alloc = empty_alloc();
         l.lower_instr(&VmInstr::Argmax {
             dst: VRegId(0), logits_ptr: VRegId(1), vocab_bytes: 32000 * 4,
-            width: SimdWidth::Warp(32),
+            width: SimdWidth::Warp(32), dtype: QuantPrecision::F32,
         }, &alloc).unwrap();
         let ir = l.finalize().unwrap();
         assert!(ir.contains("ARGMAX_LOOP"), "PTX Argmax should have loop label: {ir}");
@@ -385,7 +385,7 @@ mod tests {
         let alloc = empty_alloc();
         l.lower_instr(&VmInstr::Argmax {
             dst: VRegId(0), logits_ptr: VRegId(1), vocab_bytes: 1000 * 4,
-            width: SimdWidth::Warp(32),
+            width: SimdWidth::Warp(32), dtype: QuantPrecision::F32,
         }, &alloc).unwrap();
         let ir = l.finalize().unwrap();
         assert!(ir.contains("for"), "HIP Argmax should use for loop: {ir}");

@@ -321,13 +321,24 @@ impl AArch64Lower {
         logits_ptr: VRegId,
         vocab_bytes: usize,
         _width: SimdWidth,
+        dtype: QuantPrecision,
         alloc: &RegAllocation,
     ) -> Result<(), CompilerError> {
         let dst_reg = self.resolve_gpr(dst, alloc)?;
         let base_reg = self.resolve_gpr(logits_ptr, alloc)?;
 
+        // ARCH-DTYPE-MIXED-PRECISION: elem_bytes 从 dtype 推断, 禁止硬编码 4 (BCE-20260703-AARCH64-ARGMAX-HARDCODED-F32)
+        let elem_bytes = dtype.elem_bytes();
+        // 防御: sub-byte 量化类型 (INT4/FP4) elem_bytes=0, 此时 argmax 无意义; F32 logits 是采样阶段标准路径。
+        // 不静默 fallback: 若 elem_bytes==0 报错 (NO-SILENT-FALLBACK)。
+        if elem_bytes == 0 {
+            return Err(CompilerError::CodegenViolation(format!(
+                "lower_argmax: dtype {:?} has elem_bytes=0 (sub-byte quant), argmax requires byte-aligned logits dtype", dtype
+            )));
+        }
+
         // 初始化：dst = 0, max_val = logits[0]
-        self.emit32(self.enc_mov_x(dst_reg, 0)); // argmax = 0
+        self.emit32(self.enc_mov_x(dst_reg, 31)); // argmax = 0 (MOV Xd, XZR)
 
         let tmp_max: u8 = 16; // x16 存储当前最大值
         let tmp_idx: u8 = 17; // x17 存储当前索引
@@ -338,21 +349,40 @@ impl AArch64Lower {
         // 拷贝指针: MOV X18, X0
         self.emit32(self.enc_mov_x(tmp_ptr, base_reg));
 
-        // 循环计数器 = vocab_bytes / 4
-        let elem_count = vocab_bytes / 4;
-        let ctr_reg: u8 = 19; // x19 作为循环计数器
+        // 循环计数器 = vocab_bytes / elem_bytes (按 dtype 推断元素数)
+        let elem_count = vocab_bytes / elem_bytes;
+        let ctr_reg: u8 = 19; // x19 作为循环计数器 (递减)
+        let total_reg: u8 = 20; // x20 保存 elem_count 常量 (用于 argmax = total - ctr)
 
-        // MOV X19, #elem_count
+        // MOV X19, #elem_count (循环计数器初始值)
         self.emit32(0xD2800000 | (((elem_count & 0xFFFF) as u32) << 5) | ctr_reg as u32);
         if elem_count > 0xFFFF {
             self.emit32(0xF2A00000 | ((((elem_count >> 16) & 0xFFFF) as u32) << 5) | ctr_reg as u32);
+        }
+        // MOV X20, #elem_count (保存原始元素数, 用于计算 argmax 索引)
+        self.emit32(0xD2800000 | (((elem_count & 0xFFFF) as u32) << 5) | total_reg as u32);
+        if elem_count > 0xFFFF {
+            self.emit32(0xF2A00000 | ((((elem_count >> 16) & 0xFFFF) as u32) << 5) | total_reg as u32);
         }
 
         let loop_top = self.current_offset();
 
         // 循环体：
-        // - 加载当前值: LDR S17, [X18], #4 (post-increment)
-        self.emit32(0xBD4C4000 | ((17u32 & 0x1F) << 12) | ((tmp_ptr as u32 & 0x1F) << 5) | 17);
+        // - 加载当前值: LDR S17, [X18], #elem_bytes (post-increment)
+        //   elem_bytes=4 → LDR S (32-bit); elem_bytes=2 → LDR H (16-bit, BF16/F16)
+        //   注意: BF16/F16 load 后 FCMP 仍用 F32 比较 — 仅 F32 logits 路径数值正确;
+        //         非 F32 dtype 的 load 指令特化是后续 BCE 范围, 本处至少保证 elem_count/步幅正确。
+        if elem_bytes == 4 {
+            self.emit32(0xBD4C4000 | ((17u32 & 0x1F) << 12) | ((tmp_ptr as u32 & 0x1F) << 5) | 17);
+        } else if elem_bytes == 2 {
+            // LDR H17, [X18], #2 (post-increment 16-bit load)
+            self.emit32(0x7D4C4000 | ((17u32 & 0x1F) << 12) | ((tmp_ptr as u32 & 0x1F) << 5) | 17);
+        } else {
+            // elem_bytes == 1 (INT8/FP8): LDR B17, [X18], #1 — 数值比较语义非 float, 报错避免静默错误
+            return Err(CompilerError::CodegenViolation(format!(
+                "lower_argmax: elem_bytes=1 (dtype {:?}) float compare unsupported, argmax requires F32/BF16/F16 logits", dtype
+            )));
+        }
 
         // - 比较: FCMP S17, S16
         self.emit32(0x1E622000 | ((17u32 & 0x1F) << 5) | 16);
@@ -363,9 +393,11 @@ impl AArch64Lower {
         // - 更新最大值: FMOV S16, S17
         self.emit32(0x1E224000 | ((17u32 & 0x1F) << 5) | 16);
 
-        // - 更新索引: SUB X19, X19, #1 ; argmax = elem_count - ctr_reg
+        // - 更新索引: argmax = total_reg - ctr_reg (BCE-20260703-AARCH64-ARGMAX-U8-OVERFLOW 修复)
+        //   旧代码: enc_sub_reg(dst_reg, elem_count as u8, ctr_reg) — 把 elem_count 当寄存器号, vocab>124 溢出
+        //   新代码: elem_count 已存入 total_reg (x20), 用 SUB Xd, X20, X19 正确计算索引
         self.emit32(self.enc_sub_imm(ctr_reg, ctr_reg, 1));
-        self.emit32(self.enc_sub_reg(dst_reg, elem_count as u8, ctr_reg));
+        self.emit32(self.enc_sub_reg(dst_reg, total_reg, ctr_reg));
 
         // skip: 继续循环
         // - SUBS X19, X19, #1

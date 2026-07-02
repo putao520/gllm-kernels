@@ -646,6 +646,8 @@ pub enum VmInstr {
         vocab_size: usize,
         /// SIMD 宽度
         width: SimdWidth,
+        /// logits 元素精度 (ARCH-DTYPE-MIXED-PRECISION: 决定 elem_bytes/行步幅/load 指令, 禁止硬编码 F32)
+        dtype: QuantPrecision,
     },
 
     /// §20 BCI-006: Per-sequence 停止条件检查 + active_flag 更新。
@@ -711,6 +713,8 @@ pub enum VmInstr {
         vocab_bytes: usize,
         /// SIMD 宽度
         width: SimdWidth,
+        /// logits 元素精度 (ARCH-DTYPE-MIXED-PRECISION: 决定 elem_bytes/load 指令, 禁止硬编码 F32)
+        dtype: QuantPrecision,
     },
 
     /// Temperature scaling: logits /= temperature。

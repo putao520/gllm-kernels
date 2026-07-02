@@ -26,6 +26,7 @@ use super::instr::*;
 use super::isa_profile::*;
 use super::reg_alloc::RegAllocation;
 use super::stack_frame::StackFrame;
+use crate::compiler::trace::QuantPrecision;
 use crate::types::CompilerError;
 
 /// GPU 方言——决定输出格式。

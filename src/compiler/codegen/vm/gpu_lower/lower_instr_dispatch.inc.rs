@@ -202,9 +202,9 @@ impl GpuLower {
     fn lower_sampling_gpu(&mut self, instr: &VmInstr, alloc: &RegAllocation) -> Result<(), CompilerError> {
         match instr {
             VmInstr::BatchSeqIdLookup { dst, pt_offset_out, token_index, batch_ctx_ptr } => self.lower_batch_seq_id_lookup_gpu(instr, alloc),
-            VmInstr::BatchPerSeqArgmax { dst, seq_id, logits_flat_ptr, vocab_size, width: _ } => self.lower_batch_per_seq_argmax_gpu(instr, alloc),
-            VmInstr::BatchPerSeqStopCheck { seq_id, token_id, batch_ctx_ptr } => self.lower_batch_per_seq_stop_check_gpu(instr, alloc),
-            VmInstr::Argmax { dst, logits_ptr, vocab_bytes, width: _ } => self.lower_argmax_gpu(instr, alloc),
+            VmInstr::BatchPerSeqArgmax { dst: _, seq_id: _, logits_flat_ptr: _, vocab_size: _, width: _, dtype: _ } => self.lower_batch_per_seq_argmax_gpu(instr, alloc),
+            VmInstr::BatchPerSeqStopCheck { seq_id: _, token_id: _, batch_ctx_ptr: _ } => self.lower_batch_per_seq_stop_check_gpu(instr, alloc),
+            VmInstr::Argmax { dst: _, logits_ptr: _, vocab_bytes: _, width: _, dtype: _ } => self.lower_argmax_gpu(instr, alloc),
             VmInstr::TemperatureScale { logits_ptr, temp_ptr, vocab_bytes, width: _ } => self.lower_temperature_scale_gpu(instr, alloc),
             VmInstr::StoreToken { token_id, output_buf, counter, input_ids_ptr, prompt_len_bytes } => self.lower_store_token_gpu(instr, alloc),
             VmInstr::CheckStopCondition { token_id, counter, eos_ptr, max_tokens_ptr } => self.lower_check_stop_condition_gpu(instr, alloc),
@@ -5289,15 +5289,28 @@ Ok(())
 
     fn lower_batch_per_seq_argmax_gpu(&mut self, instr: &VmInstr, alloc: &RegAllocation) -> Result<(), CompilerError> {
         match instr {
-            VmInstr::BatchPerSeqArgmax { dst, seq_id, logits_flat_ptr, vocab_size, width: _ } => {
+            VmInstr::BatchPerSeqArgmax { dst, seq_id, logits_flat_ptr, vocab_size, width: _, dtype } => {
 
                 let dst_name = self.reg_name_with_kind(*dst, alloc);
                 let seq_name = self.reg_name_with_kind(*seq_id, alloc);
                 let base_name = self.reg_name_with_kind(*logits_flat_ptr, alloc);
 
+                // ARCH-DTYPE-MIXED-PRECISION: elem_bytes 从 dtype 推断 (BCE-20260703-AARCH64-ARGMAX-HARDCODED-F32)
+                let elem_bytes = dtype.elem_bytes();
+                if elem_bytes == 0 {
+                    return Err(CompilerError::CodegenViolation(format!(
+                        "lower_batch_per_seq_argmax_gpu: dtype {:?} has elem_bytes=0 (sub-byte quant), requires byte-aligned logits dtype", dtype
+                    )));
+                }
+                if *dtype != QuantPrecision::F32 {
+                    return Err(CompilerError::CodegenViolation(format!(
+                        "lower_batch_per_seq_argmax_gpu: dtype {:?} unsupported (F32-only PTX/HIP path); BF16/F16 argmax not yet implemented", dtype
+                    )));
+                }
+
                 match self.dialect {
                     GpuDialect::Ptx { .. } => {
-                        let row_bytes = *vocab_size * 4;
+                        let row_bytes = *vocab_size * elem_bytes;
                         self.emit_line("{");
                         self.emit_line("  .reg .u64 _row;");
                         self.emit_line(&format!("  mad.lo.u64 _row, {}, {}, {};", seq_name, row_bytes, base_name));
@@ -5327,7 +5340,8 @@ Ok(())
                         self.emit_line("}");
                     }
                     GpuDialect::Hip { .. } | GpuDialect::Metal { .. } => {
-                        let row_bytes = *vocab_size * 4;
+                        // row_bytes = *vocab_size * elem_bytes (dtype-aware); HIP/Metal 用指针算术 (float*) + vocab_size 索引
+                        let _ = *vocab_size * elem_bytes;
                         self.emit_line("{");
                         self.emit_line(&format!("  float* _row = (float*){} + (size_t){} * {};", base_name, seq_name, *vocab_size));
                         self.emit_line("  float _max = _row[0];");
@@ -5395,12 +5409,25 @@ Ok(())
 
     fn lower_argmax_gpu(&mut self, instr: &VmInstr, alloc: &RegAllocation) -> Result<(), CompilerError> {
         match instr {
-            VmInstr::Argmax { dst, logits_ptr, vocab_bytes, width: _ } => {
+            VmInstr::Argmax { dst, logits_ptr, vocab_bytes, width: _, dtype } => {
 
                 let d = self.reg_name_with_kind(*dst, alloc);
                 let base = self.reg_name_with_kind(*logits_ptr, alloc);
                 let label_id = self.next_loop_label();
-                let elem_count = *vocab_bytes / 4; // f32 elements
+                // ARCH-DTYPE-MIXED-PRECISION: elem_bytes 从 dtype 推断 (BCE-20260703-AARCH64-ARGMAX-HARDCODED-F32)
+                // GPU PTX/HIP/Metal 路径当前特化 F32 (ld.global.f32 / float*); 非 F32 显式报错 (NO-SILENT-FALLBACK)。
+                let elem_bytes = dtype.elem_bytes();
+                if elem_bytes == 0 {
+                    return Err(CompilerError::CodegenViolation(format!(
+                        "lower_argmax_gpu: dtype {:?} has elem_bytes=0 (sub-byte quant), requires byte-aligned logits dtype", dtype
+                    )));
+                }
+                if *dtype != QuantPrecision::F32 {
+                    return Err(CompilerError::CodegenViolation(format!(
+                        "lower_argmax_gpu: dtype {:?} unsupported (F32-only PTX/HIP path); BF16/F16 argmax not yet implemented", dtype
+                    )));
+                }
+                let elem_count = *vocab_bytes / elem_bytes; // f32 elements
                 let rs0 = self.scratch_gpr_names[0]; // index counter
                 let fs0 = self.scratch_vec_names[0]; // current max value
                 let fs1 = self.scratch_vec_names[1]; // loaded value

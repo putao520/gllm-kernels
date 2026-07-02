@@ -600,9 +600,9 @@ impl VmProgram {
         // Sampling cluster a (8 arms) — ARCH-LOWER-DISPATCH-LAYERING P3 (机械抽取)
         match instr {
             VmInstr::BatchSeqIdLookup { dst, pt_offset_out, token_index, batch_ctx_ptr } => VmInstr::BatchSeqIdLookup { dst: r(dst, map, next_vreg), pt_offset_out: r(pt_offset_out, map, next_vreg), token_index: r(token_index, map, next_vreg), batch_ctx_ptr: r(batch_ctx_ptr, map, next_vreg) },
-            VmInstr::BatchPerSeqArgmax { dst, seq_id, logits_flat_ptr, vocab_size, width } => VmInstr::BatchPerSeqArgmax { dst: r(dst, map, next_vreg), seq_id: r(seq_id, map, next_vreg), logits_flat_ptr: r(logits_flat_ptr, map, next_vreg), vocab_size, width },
+            VmInstr::BatchPerSeqArgmax { dst, seq_id, logits_flat_ptr, vocab_size, width, dtype } => VmInstr::BatchPerSeqArgmax { dst: r(dst, map, next_vreg), seq_id: r(seq_id, map, next_vreg), logits_flat_ptr: r(logits_flat_ptr, map, next_vreg), vocab_size, width, dtype },
             VmInstr::BatchPerSeqStopCheck { seq_id, token_id, batch_ctx_ptr } => VmInstr::BatchPerSeqStopCheck { seq_id: r(seq_id, map, next_vreg), token_id: r(token_id, map, next_vreg), batch_ctx_ptr: r(batch_ctx_ptr, map, next_vreg) },
-            VmInstr::Argmax { dst, logits_ptr, vocab_bytes, width } => VmInstr::Argmax { dst: r(dst, map, next_vreg), logits_ptr: r(logits_ptr, map, next_vreg), vocab_bytes, width },
+            VmInstr::Argmax { dst, logits_ptr, vocab_bytes, width, dtype } => VmInstr::Argmax { dst: r(dst, map, next_vreg), logits_ptr: r(logits_ptr, map, next_vreg), vocab_bytes, width, dtype },
             VmInstr::TemperatureScale { logits_ptr, temp_ptr, vocab_bytes, width } => VmInstr::TemperatureScale { logits_ptr: r(logits_ptr, map, next_vreg), temp_ptr: r(temp_ptr, map, next_vreg), vocab_bytes, width },
             VmInstr::StoreToken { token_id, output_buf, counter, input_ids_ptr, prompt_len_bytes } => VmInstr::StoreToken { token_id: r(token_id, map, next_vreg), output_buf: r(output_buf, map, next_vreg), counter: r(counter, map, next_vreg), input_ids_ptr: r(input_ids_ptr, map, next_vreg), prompt_len_bytes: r(prompt_len_bytes, map, next_vreg) },
             VmInstr::CheckStopCondition { token_id, counter, eos_ptr, max_tokens_ptr } => VmInstr::CheckStopCondition { token_id: r(token_id, map, next_vreg), counter: r(counter, map, next_vreg), eos_ptr: r(eos_ptr, map, next_vreg), max_tokens_ptr: r(max_tokens_ptr, map, next_vreg) },
@@ -1000,9 +1000,9 @@ impl VmProgram {
         // Sampling cluster a (8 arms) — ARCH-LOWER-DISPATCH-LAYERING P3 (机械抽取)
         match instr {
             VmInstr::BatchSeqIdLookup { dst, pt_offset_out, token_index, batch_ctx_ptr } => VmInstr::BatchSeqIdLookup { dst: r(dst), pt_offset_out: r(pt_offset_out), token_index: r(token_index), batch_ctx_ptr: r(batch_ctx_ptr) },
-            VmInstr::BatchPerSeqArgmax { dst, seq_id, logits_flat_ptr, vocab_size, width } => VmInstr::BatchPerSeqArgmax { dst: r(dst), seq_id: r(seq_id), logits_flat_ptr: r(logits_flat_ptr), vocab_size, width },
+            VmInstr::BatchPerSeqArgmax { dst, seq_id, logits_flat_ptr, vocab_size, width, dtype } => VmInstr::BatchPerSeqArgmax { dst: r(dst), seq_id: r(seq_id), logits_flat_ptr: r(logits_flat_ptr), vocab_size, width, dtype },
             VmInstr::BatchPerSeqStopCheck { seq_id, token_id, batch_ctx_ptr } => VmInstr::BatchPerSeqStopCheck { seq_id: r(seq_id), token_id: r(token_id), batch_ctx_ptr: r(batch_ctx_ptr) },
-            VmInstr::Argmax { dst, logits_ptr, vocab_bytes, width } => VmInstr::Argmax { dst: r(dst), logits_ptr: r(logits_ptr), vocab_bytes, width },
+            VmInstr::Argmax { dst, logits_ptr, vocab_bytes, width, dtype } => VmInstr::Argmax { dst: r(dst), logits_ptr: r(logits_ptr), vocab_bytes, width, dtype },
             VmInstr::TemperatureScale { logits_ptr, temp_ptr, vocab_bytes, width } => VmInstr::TemperatureScale { logits_ptr: r(logits_ptr), temp_ptr: r(temp_ptr), vocab_bytes, width },
             VmInstr::StoreToken { token_id, output_buf, counter, input_ids_ptr, prompt_len_bytes } => VmInstr::StoreToken { token_id: r(token_id), output_buf: r(output_buf), counter: r(counter), input_ids_ptr: r(input_ids_ptr), prompt_len_bytes: r(prompt_len_bytes) },
             VmInstr::CheckStopCondition { token_id, counter, eos_ptr, max_tokens_ptr } => VmInstr::CheckStopCondition { token_id: r(token_id), counter: r(counter), eos_ptr: r(eos_ptr), max_tokens_ptr: r(max_tokens_ptr) },

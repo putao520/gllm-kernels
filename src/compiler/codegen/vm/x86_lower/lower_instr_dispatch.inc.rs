@@ -205,9 +205,9 @@ impl X86Lower {
     fn lower_sampling_x86(&mut self, instr: &VmInstr, alloc: &RegAllocation) -> Result<(), CompilerError> {
         match instr {
             VmInstr::BatchSeqIdLookup { dst, pt_offset_out, token_index, batch_ctx_ptr } => self.lower_batch_seq_id_lookup_x86(instr, alloc),
-            VmInstr::BatchPerSeqArgmax { dst, seq_id, logits_flat_ptr, vocab_size, width: _ } => self.lower_batch_per_seq_argmax_x86(instr, alloc),
+            VmInstr::BatchPerSeqArgmax { dst: _, seq_id: _, logits_flat_ptr: _, vocab_size: _, width: _, dtype: _ } => self.lower_batch_per_seq_argmax_x86(instr, alloc),
             VmInstr::BatchPerSeqStopCheck { seq_id, token_id, batch_ctx_ptr } => self.lower_batch_per_seq_stop_check_x86(instr, alloc),
-            VmInstr::Argmax { dst, logits_ptr, vocab_bytes, width } => self.lower_argmax_x86(instr, alloc),
+            VmInstr::Argmax { dst: _, logits_ptr: _, vocab_bytes: _, width: _, dtype: _ } => self.lower_argmax_x86(instr, alloc),
             VmInstr::TemperatureScale { logits_ptr, temp_ptr, vocab_bytes, width } => self.lower_temperature_scale_x86(instr, alloc),
             VmInstr::StoreToken { token_id, output_buf, counter, input_ids_ptr, prompt_len_bytes } => self.lower_store_token_x86(instr, alloc),
             VmInstr::CheckStopCondition { token_id, counter, eos_ptr, max_tokens_ptr } => self.lower_check_stop_condition_x86(instr, alloc),
@@ -4437,13 +4437,21 @@ impl X86Lower {
     // Scalar linear scan: for each f32 in row, track (max_val, max_idx).
     fn lower_batch_per_seq_argmax_x86(&mut self, instr: &VmInstr, alloc: &RegAllocation) -> Result<(), CompilerError> {
         match instr {
-            VmInstr::BatchPerSeqArgmax { dst, seq_id, logits_flat_ptr, vocab_size, width: _ } => {
+            VmInstr::BatchPerSeqArgmax { dst, seq_id, logits_flat_ptr, vocab_size, width: _, dtype } => {
                 let seq_reg = self.resolve_gpr_read(*seq_id, alloc, 1)?;
                 let base_reg = self.resolve_gpr_read(*logits_flat_ptr, alloc, 2)?;
                 let dst_reg = self.resolve_gpr_write(*dst, alloc, 3)?;
 
-                // rax = logits_flat_ptr + seq_id * vocab_size * 4
-                let row_bytes = *vocab_size * 4;
+                // ARCH-DTYPE-MIXED-PRECISION: elem_bytes 从 dtype 推断, 禁止硬编码 4 (BCE-20260703-AARCH64-ARGMAX-HARDCODED-F32)
+                let elem_bytes = dtype.elem_bytes();
+                if elem_bytes == 0 {
+                    return Err(CompilerError::CodegenViolation(format!(
+                        "lower_batch_per_seq_argmax_x86: dtype {:?} has elem_bytes=0 (sub-byte quant), requires byte-aligned logits dtype", dtype
+                    )));
+                }
+
+                // rax = logits_flat_ptr + seq_id * vocab_size * elem_bytes
+                let row_bytes = *vocab_size * elem_bytes;
                 self.asm.mov(rax, seq_reg).map_err(Self::err)?;
                 self.asm.imul_3(rax, rax, row_bytes as i32).map_err(Self::err)?;
                 self.asm.add(rax, base_reg).map_err(Self::err)?;
@@ -4528,8 +4536,8 @@ impl X86Lower {
 
     fn lower_argmax_x86(&mut self, instr: &VmInstr, alloc: &RegAllocation) -> Result<(), CompilerError> {
         match instr {
-            VmInstr::Argmax { dst, logits_ptr, vocab_bytes, width } => {
-                self.lower_argmax(*dst, *logits_ptr, *vocab_bytes, *width, alloc)?;
+            VmInstr::Argmax { dst, logits_ptr, vocab_bytes, width, dtype } => {
+                self.lower_argmax(*dst, *logits_ptr, *vocab_bytes, *width, *dtype, alloc)?;
                 self.commit_gpr_write(*dst, alloc, 0)?;
                 Ok(())
             }

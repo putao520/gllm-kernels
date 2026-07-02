@@ -1664,6 +1664,7 @@ fn emit_sampling_pipeline(
         logits_ptr: fresh_logits_ptr,
         vocab_bytes,
         width: mk.width,
+        dtype: ctx.dtype,
     });
 
     prog.emit(VmInstr::MarkLabel { label_id: SAMPLING_DONE_LABEL });
@@ -2158,7 +2159,7 @@ fn emit_batch_prefill_argmax(
 
             // Argmax this row
             let sampled = prog.alloc_vreg(VRegKind::Scalar, SimdWidth::Scalar);
-            prog.emit(VmInstr::Argmax { dst: sampled, logits_ptr, vocab_bytes, width:  mk.width});
+            prog.emit(VmInstr::Argmax { dst: sampled, logits_ptr, vocab_bytes, width:  mk.width, dtype });
 
             // Write last_sampled_token[seq] at seq_meta + seq*stride + 48
             let tok_off = prog.alloc_vreg(VRegKind::ByteOffset, SimdWidth::Scalar);
@@ -2273,7 +2274,7 @@ fn emit_batch_per_seq_sampling(
     });
 
     // Argmax path (temperature == 0)
-    prog.emit(VmInstr::Argmax { dst: sampled, logits_ptr: logits_row_ptr, vocab_bytes: vb, width:  mk.width});
+    prog.emit(VmInstr::Argmax { dst: sampled, logits_ptr: logits_row_ptr, vocab_bytes: vb, width:  mk.width, dtype: graph_dtype(caps.mk.graph) });
 
     // After Argmax, skip the entire stochastic section
     prog.emit(VmInstr::GprCondAction {
@@ -2925,6 +2926,7 @@ fn emit_mtp_candidates(
             logits_ptr: mtp_logits_ptr,
             vocab_bytes,
             width,
+            dtype: ctx.dtype,
         });
 
         // ── Store MTP candidate to output buffer ──
@@ -3122,6 +3124,7 @@ pub fn emit_mtp_draft_inline(
             logits_ptr,
             vocab_bytes,
             width,
+            dtype,
         });
 
         // Store candidate: output_tokens[depth_offset + k]

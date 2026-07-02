@@ -1834,7 +1834,7 @@ mod tests {
         let dst = prog.alloc_vreg(VRegKind::Scalar, SimdWidth::Scalar);
 
         prog.emit(VmInstr::Argmax {
-            dst, logits_ptr, vocab_bytes: 32000 * 4, width: SimdWidth::W256,
+            dst, logits_ptr, vocab_bytes: 32000 * 4, width: SimdWidth::W256, dtype: QuantPrecision::F32,
         });
 
         // Act
@@ -1854,7 +1854,7 @@ mod tests {
         let dst = prog.alloc_vreg(VRegKind::Scalar, SimdWidth::Scalar);
 
         prog.emit(VmInstr::Argmax {
-            dst, logits_ptr: bad_logits_ptr, vocab_bytes: 256, width: SimdWidth::W256,
+            dst, logits_ptr: bad_logits_ptr, vocab_bytes: 256, width: SimdWidth::W256, dtype: QuantPrecision::F32,
         });
 
         // Act

@@ -1550,6 +1550,7 @@ fn collect_src_vregs_samplinga(instr: &VmInstr) -> Vec<VRegId> {
             logits_ptr,
             vocab_bytes: _,
             width: _,
+            dtype: _,
         } => vec![*logits_ptr],
         VmInstr::TemperatureScale {
             logits_ptr,

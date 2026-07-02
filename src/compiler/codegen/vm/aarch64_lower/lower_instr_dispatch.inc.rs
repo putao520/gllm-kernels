@@ -201,9 +201,9 @@ impl AArch64Lower {
     fn lower_sampling_aarch64(&mut self, instr: &VmInstr, alloc: &RegAllocation) -> Result<(), CompilerError> {
         match instr {
             VmInstr::BatchSeqIdLookup { dst, pt_offset_out, token_index, batch_ctx_ptr } => self.lower_batch_seq_id_lookup_aarch64(instr, alloc),
-            VmInstr::BatchPerSeqArgmax { dst, seq_id, logits_flat_ptr, vocab_size, width: _ } => self.lower_batch_per_seq_argmax_aarch64(instr, alloc),
-            VmInstr::BatchPerSeqStopCheck { seq_id, token_id, batch_ctx_ptr } => self.lower_batch_per_seq_stop_check_aarch64(instr, alloc),
-            VmInstr::Argmax { dst, logits_ptr, vocab_bytes, width } => self.lower_argmax_aarch64(instr, alloc),
+            VmInstr::BatchPerSeqArgmax { dst: _, seq_id: _, logits_flat_ptr: _, vocab_size: _, width: _, dtype: _ } => self.lower_batch_per_seq_argmax_aarch64(instr, alloc),
+            VmInstr::BatchPerSeqStopCheck { seq_id: _, token_id: _, batch_ctx_ptr: _ } => self.lower_batch_per_seq_stop_check_aarch64(instr, alloc),
+            VmInstr::Argmax { dst: _, logits_ptr: _, vocab_bytes: _, width: _, dtype: _ } => self.lower_argmax_aarch64(instr, alloc),
             VmInstr::TemperatureScale { logits_ptr, temp_ptr, vocab_bytes, width } => self.lower_temperature_scale_aarch64(instr, alloc),
             VmInstr::StoreToken { token_id, output_buf, counter, input_ids_ptr, prompt_len_bytes } => self.lower_store_token_aarch64(instr, alloc),
             VmInstr::CheckStopCondition { token_id, counter, eos_ptr, max_tokens_ptr } => self.lower_check_stop_condition_aarch64(instr, alloc),
@@ -4087,13 +4087,28 @@ Ok(())
 
     fn lower_batch_per_seq_argmax_aarch64(&mut self, instr: &VmInstr, alloc: &RegAllocation) -> Result<(), CompilerError> {
         match instr {
-            VmInstr::BatchPerSeqArgmax { dst, seq_id, logits_flat_ptr, vocab_size, width: _ } => {
+            VmInstr::BatchPerSeqArgmax { dst, seq_id, logits_flat_ptr, vocab_size, width: _, dtype } => {
 
                 let seq_reg = self.resolve_gpr(*seq_id, alloc)?;
                 let base_reg = self.resolve_gpr(*logits_flat_ptr, alloc)?;
                 let dst_reg = self.resolve_gpr(*dst, alloc)?;
 
-                let row_bytes = *vocab_size * 4;
+                // ARCH-DTYPE-MIXED-PRECISION: elem_bytes 从 dtype 推断, 禁止硬编码 4 (BCE-20260703-AARCH64-ARGMAX-HARDCODED-F32)
+                let elem_bytes = dtype.elem_bytes();
+                if elem_bytes == 0 {
+                    return Err(CompilerError::CodegenViolation(format!(
+                        "lower_batch_per_seq_argmax: dtype {:?} has elem_bytes=0 (sub-byte quant), requires byte-aligned logits dtype", dtype
+                    )));
+                }
+                if elem_bytes == 1 {
+                    return Err(CompilerError::CodegenViolation(format!(
+                        "lower_batch_per_seq_argmax: elem_bytes=1 (dtype {:?}) float compare unsupported, requires F32/BF16/F16 logits", dtype
+                    )));
+                }
+                // LDR 元素 load 的 LSL 位移: elem_bytes=4 → LSL #2, elem_bytes=2 → LSL #1
+                // (load 指令 opcode 按 elem_bytes 分支选择 S/H)
+
+                let row_bytes = *vocab_size * elem_bytes;
                 // x16 = logits_flat_ptr + seq_id * row_bytes
                 self.emit32(self.enc_movz_w(17, row_bytes as u16));
                 // MADD x16, x_seq, x17, x_base → x16 = seq_id * row_bytes + base
@@ -4114,12 +4129,16 @@ Ok(())
                 self.emit32(0xBD400000 | (16_u32 << 5) ); // LDR s0, [x16]
 
                 let loop_start = self.code.len();
-                // Load current: LDR s1, [x16, x10, LSL #2]
-                // Use ADD + LDR pattern
-                self.emit32(self.enc_add_reg(11, 16, 10)); // x11 = base + i (byte offset later)
-                // Actually need byte offset: x11 = x16 + i*4. Use LSL #2 in load.
-                // LDR s1, [x16, x10, LSL #2]
-                self.emit32(0xBF400000 | ((10_u32 & 0x1F) << 16) | ((16_u32 & 0x1F) << 5) | 1);
+                // Load current: LDR s1, [x16, x10, LSL #lsl_bits] (按 elem_bytes 位移)
+                // LDR (immediate) register-offset: 0xBF400000 base for LDR S32 with LSL option
+                //   size=10 (S32) | opc=00 | imm5={b12:option, b10:s, b:0..4:Rm} encoded as LSL
+                // elem_bytes=4 (S32, LSL #2): 0xBF400000; elem_bytes=2 (H, LSL #1): 0x7D400000
+                if elem_bytes == 4 {
+                    self.emit32(0xBF400000 | ((10_u32 & 0x1F) << 16) | ((16_u32 & 0x1F) << 5) | 1);
+                } else {
+                    // elem_bytes == 2: LDR H17, [x16, x10, LSL #1]
+                    self.emit32(0x7D400000 | ((10_u32 & 0x1F) << 16) | ((16_u32 & 0x1F) << 5) | 1);
+                }
                 // FMAX s2, s0, s1 → if s1 > s0, result = s1
                 self.emit32((0x1E204820 | (1_u32 << 16)) | 2);
                 // FCMP s0, s2 → check if changed
@@ -4219,9 +4238,9 @@ Ok(())
 
     fn lower_argmax_aarch64(&mut self, instr: &VmInstr, alloc: &RegAllocation) -> Result<(), CompilerError> {
         match instr {
-            VmInstr::Argmax { dst, logits_ptr, vocab_bytes, width } => {
+            VmInstr::Argmax { dst, logits_ptr, vocab_bytes, width, dtype } => {
 
-                self.lower_argmax(*dst, *logits_ptr, *vocab_bytes, *width, alloc)
+                self.lower_argmax(*dst, *logits_ptr, *vocab_bytes, *width, *dtype, alloc)
             }
             _ => Err(CompilerError::CodegenViolation(
                 format!("lower_argmax_aarch64: expected VmInstr::Argmax, got {:?}", instr))),

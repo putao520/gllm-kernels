@@ -925,13 +925,29 @@ impl X86Lower {
         logits_ptr: VRegId,
         vocab_bytes: usize,
         width: SimdWidth,
+        dtype: QuantPrecision,
         alloc: &RegAllocation,
     ) -> Result<(), CompilerError> {
         let dst_reg = self.resolve_gpr_write(dst, alloc, 0)?;
         let base_reg = self.resolve_gpr_read(logits_ptr, alloc, 1)?;
 
+        // ARCH-DTYPE-MIXED-PRECISION: elem_bytes 从 dtype 推断 (BCE-20260703-AARCH64-ARGMAX-HARDCODED-F32)
+        // x86 向量化路径当前特化 F32 (vmaxps/vmovss); 非 F32 dtype 显式报错 (NO-SILENT-FALLBACK),
+        // 禁止生成错误代码。BF16/F16 向量化 argmax 是后续 BCE 范围。
+        let elem_bytes = dtype.elem_bytes();
+        if elem_bytes == 0 {
+            return Err(CompilerError::CodegenViolation(format!(
+                "lower_argmax_x86: dtype {:?} has elem_bytes=0 (sub-byte quant), requires byte-aligned logits dtype", dtype
+            )));
+        }
+        if dtype != QuantPrecision::F32 {
+            return Err(CompilerError::CodegenViolation(format!(
+                "lower_argmax_x86: dtype {:?} unsupported (F32-only vectorized path); BF16/F16 argmax not yet implemented", dtype
+            )));
+        }
+
         let lanes = width.f32_lanes();
-        let step = lanes * 4;
+        let step = lanes * elem_bytes;
         let num_vecs = vocab_bytes / step;
         let total_bytes = num_vecs * step;
 

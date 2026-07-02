@@ -857,7 +857,7 @@ fn lower_op_generation(prog: &mut VmProgram, op: &CompilerOp, graph: &CompilerGr
             let argmax_dst = prog.alloc_vreg(VRegKind::Scalar, SimdWidth::Scalar);
             let vocab_bytes = vocab_size * ctx.dtype.elem_bytes();
             prog.emit(VmInstr::Argmax {
-                dst: argmax_dst, logits_ptr, vocab_bytes, width: ctx.session.width,
+                dst: argmax_dst, logits_ptr, vocab_bytes, width: ctx.session.width, dtype: ctx.dtype,
             });
             let out_ptr = resolver.materialize(prog, op.outputs[0], abi).ok_or_else(|| {
                 CompilerError::CodegenViolation(format!("Argmax op {:?}: output 无法 materialize", op.id))
