@@ -508,7 +508,9 @@ impl GpuLower {
                         };
                         self.emit_line(&format!("prefetch.global{hint_str} [{d}];"));
                     }
-                    _ => {} // GPU prefetch 由 texture cache 自动管理
+                    _ => return Err(CompilerError::CodegenViolation(
+                        "Prefetch: HIP/Metal prefetch not yet implemented (PTX SM80+ only); \
+                         use PTX or remove prefetch hint (NO-SILENT-FALLBACK)".into())),
                 }
                 Ok(())
             }
@@ -2844,9 +2846,9 @@ Ok(())
                             }
                             crate::types::DType::F6E2M3 | crate::types::DType::F6E3M2 => {
                                 return Err(CompilerError::CodegenViolation(
-                                    "block-scaled FP6 (NVFP6) GEMM: NativeFp6Gemm not yet implemented; \
-                                     FP4 path use VmInstr::NativeFp4Gemm. Generic TileMma cannot express \
-                                     block-scaled scale factor (NO-SILENT-FALLBACK)".into()));
+                                    "block-scaled FP6 (NVFP6) GEMM must go through VmInstr::NativeFp6Gemm \
+                                     (lower_native_fp6_gemm_gpu) which emits tcgen05.mma kind::mxf8f6f4 with \
+                                     scale_a/scale_b; generic TileMma cannot express block-scaled scale factor".into()));
                             }
                             _ => {}
                         }
