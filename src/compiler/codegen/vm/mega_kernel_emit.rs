@@ -1059,7 +1059,6 @@ pub fn compile_mega_kernel_vm(
     resource_plan: Option<&GraphResourcePlan>,
     topology: super::topology::GraphTopologyAnalysis,
 ) -> Result<(VmProgram, Option<RopeCacheRequirement>, usize), CompilerError> {
-    use crate::compiler::mega_kernel_abi::MEGA_KERNEL_STACK_OFFSETS;
 
     /// Sampling workspace needs 4x vocab_bytes: softmax + top-k + top-p + multinomial buffers.
     const SAMPLING_WORKSPACE_MULTIPLIER: usize = 4;
@@ -1070,7 +1069,10 @@ pub fn compile_mega_kernel_vm(
 
     let _ = resource_plan;
     let width = profile.optimal_simd_width();
-    let sym_map = SymDimSlotMap::mega_kernel_abi();
+    // BCE-20260703-GPU-MEGA-KERNEL-ABI: 按 compile target 选 ABI SymDimSlotMap.
+    // GPU (Cuda/Hip/Metal) 全部 22 参数走 `.param` (AbiArg), x86 保持 6 reg + 16 stack.
+    // 防止 GPU codegen 收到 StackArg(N) 被拒 (gpu_lower/lower_instr_dispatch.inc.rs:421).
+    let sym_map = SymDimSlotMap::mega_kernel_abi_for_target(&profile.platform);
     let mut prog = VmProgram::new();
 
     _gk_oom_probe("cmke-vm-entry", &format!("groups={} ops={}", plan.groups.len(), graph.ops.len()), &mut prog);
@@ -1087,12 +1089,14 @@ pub fn compile_mega_kernel_vm(
     let prompt_len_vreg = prog.alloc_vreg(VRegKind::Scalar, SimdWidth::Scalar);
     let output_tokens_ptr = prog.alloc_vreg(VRegKind::Ptr, SimdWidth::Scalar);
 
-    prog.emit(VmInstr::LoadPtr { dst: scratchpad_ptr, src: PtrExpr::StackArg(MEGA_KERNEL_STACK_OFFSETS[1]) }); // scratchpad_ptr → [rbp+24]
-    prog.emit(VmInstr::LoadPtr { dst: prompt_len_vreg, src: PtrExpr::StackArg(MEGA_KERNEL_STACK_OFFSETS[0]) }); // prompt_len → [rbp+16]
+    // BCE-20260703-GPU-MEGA-KERNEL-ABI: 参数物理位置由 sym_map 决定 (x86=StackArg, GPU=AbiArg).
+    // 禁止硬编码 MEGA_KERNEL_STACK_OFFSETS — GPU 无栈参数概念, 会触发 StackArg 拒绝.
+    prog.emit(VmInstr::LoadPtr { dst: scratchpad_ptr, src: sym_map.resolve("scratchpad_ptr").cloned().expect("ABI: scratchpad_ptr") });
+    prog.emit(VmInstr::LoadPtr { dst: prompt_len_vreg, src: sym_map.resolve("prompt_len").cloned().expect("ABI: prompt_len") });
 
     // ── ForwardPhaseDispatch: Load batch_ctx_ptr (ABI arg 16) + branch to batch mode if non-NULL (SPEC/20 BCI-002/003) ──
     let batch_ctx_ptr = prog.alloc_vreg(VRegKind::Ptr, SimdWidth::Scalar);
-    prog.emit(VmInstr::LoadPtr { dst: batch_ctx_ptr, src: PtrExpr::StackArg(MEGA_KERNEL_STACK_OFFSETS[15]) });
+    prog.emit(VmInstr::LoadPtr { dst: batch_ctx_ptr, src: sym_map.resolve("batch_ctx_ptr").cloned().expect("ABI: batch_ctx_ptr") });
     // If batch_ctx_ptr != NULL → jump to BATCH_MODE label (iteration setup/seq_len derivation batch logic, to be implemented)
     // NULL → fall through to outer loop setup.Legacy (current single-seq behavior, zero overhead)
     const BATCH_MODE_LABEL: usize = 100; // label ID for batch mode entry
@@ -1109,7 +1113,7 @@ pub fn compile_mega_kernel_vm(
     prog.emit(VmInstr::GprBinOp { dst: prompt_len_bytes, a: prompt_len_vreg, b: GprOperand::Imm(2_i64), op: GprOp::Shl });
 
     // Now safe to load output_tokens — prompt_len has been consumed
-    prog.emit(VmInstr::LoadPtr { dst: output_tokens_ptr, src: PtrExpr::StackArg(MEGA_KERNEL_STACK_OFFSETS[2]) }); // output_tokens → [rbp+32]
+    prog.emit(VmInstr::LoadPtr { dst: output_tokens_ptr, src: sym_map.resolve("output_tokens_ptr").cloned().expect("ABI: output_tokens_ptr") });
 
     // input_base = input_ids_ptr (start from first token for prefill)
     // The unified loop processes tokens 0..prompt_len-2 (prefill) then
@@ -1213,7 +1217,7 @@ pub fn compile_mega_kernel_vm(
     let scratchpad_reloaded = prog.alloc_vreg(VRegKind::Ptr, SimdWidth::Scalar);
     prog.emit(VmInstr::LoadPtr {
         dst: scratchpad_reloaded,
-        src: PtrExpr::StackArg(MEGA_KERNEL_STACK_OFFSETS[1]),
+        src: sym_map.resolve("scratchpad_ptr").cloned().expect("ABI: scratchpad_ptr"),
     });
     // Also reload output_ptr: always from scratchpad + logits_scratch_offset
     // (same for both generate and non-generate graphs; see output_ptr setup above).
@@ -1432,7 +1436,7 @@ pub fn compile_mega_kernel_vm(
     let scratchpad_post_forward = prog.alloc_vreg(VRegKind::Ptr, SimdWidth::Scalar);
     prog.emit(VmInstr::LoadPtr {
         dst: scratchpad_post_forward,
-        src: PtrExpr::StackArg(MEGA_KERNEL_STACK_OFFSETS[1]),
+        src: sym_map.resolve("scratchpad_ptr").cloned().expect("ABI: scratchpad_ptr"),
     });
 
     // L6 debug: embed + all layers done, before sampling pipeline
@@ -1530,7 +1534,6 @@ fn emit_sampling_pipeline(
     ctx: &LoweringContext,
     resolver: &mut TensorPtrResolver,
 ) -> Result<(), CompilerError> {
-    use crate::compiler::mega_kernel_abi::MEGA_KERNEL_STACK_OFFSETS;
 
 
     // ── Prefill/Generate branch ──
@@ -1571,14 +1574,15 @@ fn emit_sampling_pipeline(
     let temp_u32 = prog.alloc_vreg(VRegKind::Scalar, SimdWidth::Scalar);
     prog.emit(VmInstr::LoadPtr {
         dst: temp_u32,
-        src: PtrExpr::StackArg(MEGA_KERNEL_STACK_OFFSETS[3]), // temperature_u32
+        // BCE-20260703-GPU-MEGA-KERNEL-ABI: sym_map 决定物理位置 (x86=StackArg(40), GPU=AbiArg(9))
+        src: mk.sym_map.resolve("temperature_u32").cloned().expect("ABI: temperature_u32"),
     });
     prog.emit(VmInstr::BranchIfGprZero { value: temp_u32, target_label: ARGMAX_LABEL });
 
     // ── 采样: Stochastic（temperature > 0）──
     // TemperatureScale: logits[i] /= temperature
     let temp_ptr = prog.alloc_vreg(VRegKind::Ptr, SimdWidth::Scalar);
-    prog.emit(VmInstr::LoadPtr { dst: temp_ptr, src: PtrExpr::StackArg(MEGA_KERNEL_STACK_OFFSETS[3]) });
+    prog.emit(VmInstr::LoadPtr { dst: temp_ptr, src: mk.sym_map.resolve("temperature_u32").cloned().expect("ABI: temperature_u32") });
     prog.emit(VmInstr::TemperatureScale {
         logits_ptr: fresh_logits_ptr,
         temp_ptr,
@@ -1617,7 +1621,7 @@ fn emit_sampling_pipeline(
         src: PtrExpr::VRegPlusConst(regs.scratchpad_post_forward, mk.logits_scratch_offset + vocab_bytes),
     });
     let top_k_ptr = prog.alloc_vreg(VRegKind::Ptr, SimdWidth::Scalar);
-    prog.emit(VmInstr::LoadPtr { dst: top_k_ptr, src: PtrExpr::StackArg(MEGA_KERNEL_STACK_OFFSETS[4]) });
+    prog.emit(VmInstr::LoadPtr { dst: top_k_ptr, src: mk.sym_map.resolve("top_k").cloned().expect("ABI: top_k") });
     prog.emit(VmInstr::SampleTopKFilter {
         probs_ptr: fresh_logits_ptr,
         indices_ptr,
@@ -1628,7 +1632,7 @@ fn emit_sampling_pipeline(
 
     // Top-P filter (if top_p > 0)
     let top_p_ptr = prog.alloc_vreg(VRegKind::Ptr, SimdWidth::Scalar);
-    prog.emit(VmInstr::LoadPtr { dst: top_p_ptr, src: PtrExpr::StackArg(MEGA_KERNEL_STACK_OFFSETS[5]) });
+    prog.emit(VmInstr::LoadPtr { dst: top_p_ptr, src: mk.sym_map.resolve("top_p_u32").cloned().expect("ABI: top_p_u32") });
     prog.emit(VmInstr::SampleTopPFilter {
         probs_ptr: fresh_logits_ptr,
         p_ptr: top_p_ptr,
@@ -1818,7 +1822,6 @@ fn emit_batch_mode_path(
     regs: &MkRegs,
     batch_label: usize,
 ) -> Result<(), CompilerError> {
-    use crate::compiler::mega_kernel_abi::MEGA_KERNEL_STACK_OFFSETS;
 
     // ── .batch_mode_path: Batch mode entry (SPEC/20 BCI-003) ──
     // BranchIfPtrNonNull jumps here when regs.batch_ctx_ptr != NULL.
@@ -1836,7 +1839,7 @@ fn emit_batch_mode_path(
     let scratchpad_batch = prog.alloc_vreg(VRegKind::Ptr, SimdWidth::Scalar);
     prog.emit(VmInstr::LoadPtr {
         dst: scratchpad_batch,
-        src: PtrExpr::StackArg(MEGA_KERNEL_STACK_OFFSETS[1]),
+        src: mk.sym_map.resolve("scratchpad_ptr").cloned().expect("ABI: scratchpad_ptr"),
     });
 
     {
@@ -2031,7 +2034,7 @@ fn emit_batch_mode_path(
         // batch prefill emit_fusion_groups — same reason as the generate loop reload.
         prog.emit(VmInstr::LoadPtr {
             dst: scratchpad_batch,
-            src: PtrExpr::StackArg(MEGA_KERNEL_STACK_OFFSETS[1]),
+            src: mk.sym_map.resolve("scratchpad_ptr").cloned().expect("ABI: scratchpad_ptr"),
         });
 
         // ── iteration setup post: Per-seq argmax on last token of each prompt (BCI-006) ──
@@ -2210,7 +2213,6 @@ fn emit_batch_per_seq_sampling(
     _off: VRegId,
     caps: &SeqSamplingCaps,
 ) {
-    use crate::compiler::mega_kernel_abi::MEGA_KERNEL_STACK_OFFSETS;
     // ── Step 3e: Per-seq argmax + stop condition (extracted from emit_batch_decode_step_loop) ──
     // BCE-20260630-MEGA-KERNEL-EMIT-CTX: closure body lifted to free fn for long_method compliance.
     let mk = caps.mk;
@@ -2225,7 +2227,7 @@ fn emit_batch_per_seq_sampling(
     // per-seq sampling loop so the verifier sees a write (LoopCarried pattern).
     prog.emit(VmInstr::LoadPtr {
         dst: scratchpad_batch,
-        src: PtrExpr::StackArg(MEGA_KERNEL_STACK_OFFSETS[1]),
+        src: mk.sym_map.resolve("scratchpad_ptr").cloned().expect("ABI: scratchpad_ptr"),
     });
     let byte_off = prog.alloc_vreg(VRegKind::ByteOffset, SimdWidth::Scalar);
     prog.emit(VmInstr::GprBinOp { dst: byte_off, a: seq_ctr, b: GprOperand::Imm(stride as i64), op: GprOp::Mul });
@@ -2538,7 +2540,6 @@ fn emit_batch_decode_step_loop(
     abi_regs: &BatchAbiRegs,
     resolver: &TensorPtrResolver,
 ) -> Result<(), CompilerError> {
-    use crate::compiler::mega_kernel_abi::MEGA_KERNEL_STACK_OFFSETS;
     // ── input pointer computation: Batch Decode Step Loop (SPEC/20 REQ-BCI-003) ──
     // Extracted from emit_batch_mode_path (BCE-20260630-MEGA-KERNEL-EMIT-CTX).
     // Only emit when mk.vocab_size > 0 (has Argmax ops). Without Argmax, no decode/sampling needed.
@@ -2726,7 +2727,7 @@ fn emit_batch_decode_step_loop(
         // batch decode emit_fusion_groups — same reason as the generate loop reload.
         prog.emit(VmInstr::LoadPtr {
             dst: scratchpad_batch,
-            src: PtrExpr::StackArg(MEGA_KERNEL_STACK_OFFSETS[1]),
+            src: mk.sym_map.resolve("scratchpad_ptr").cloned().expect("ABI: scratchpad_ptr"),
         });
 
         // ── Step 3e: Per-seq argmax + stop condition ──

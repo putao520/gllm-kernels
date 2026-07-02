@@ -791,25 +791,31 @@ impl SymDimSlotMap {
         slots.insert("input".into(), state.arg_ptr_expr("input_ids_ptr").unwrap());
         slots.insert("weights".into(), state.arg_ptr_expr("weight_blob_ptr").unwrap());
         slots.insert("kv_cache".into(), state.arg_ptr_expr("kv_cache_ptr").unwrap());
+        slots.insert("kv_cache_ptr".into(), state.arg_ptr_expr("kv_cache_ptr").unwrap());
         slots.insert("positions".into(), state.arg_ptr_expr("positions_ptr").unwrap());
         slots.insert("seq_lens".into(), state.arg_ptr_expr("aux_ptr").unwrap());
         slots.insert("batch_size".into(), state.arg_ptr_expr("batch_size").unwrap());
 
         // scratchpad — MegaKernelFn 的 scratchpad_ptr 在 StackArg(24)
         slots.insert("scratchpad".into(), state.arg_ptr_expr("scratchpad_ptr").unwrap());
+        slots.insert("scratchpad_ptr".into(), state.arg_ptr_expr("scratchpad_ptr").unwrap());
 
         // output — MegaKernelFn 的 output_tokens_ptr (arg 8).
         // For simple graphs compiled via compile_layer_with_sym_map, the output
         // buffer is passed via this ABI parameter.
         slots.insert("output".into(), state.arg_ptr_expr("output_tokens_ptr").unwrap());
+        slots.insert("output_tokens_ptr".into(), state.arg_ptr_expr("output_tokens_ptr").unwrap());
 
         // telemetry — MegaKernelFn 的 telemetry_ptr 在 StackArg(96)
         slots.insert("telemetry".into(), state.arg_ptr_expr("telemetry_ptr").unwrap());
+        slots.insert("telemetry_ptr".into(), state.arg_ptr_expr("telemetry_ptr").unwrap());
 
         // ABI stack args — resolved from MEGA_KERNEL_PARAMS via VmState.
         // Single source of truth: arg positions defined in mega_kernel_abi.rs.
         // Fall back to known offsets for ABIs without these params (small graphs).
         slots.insert("seq_len".into(),
+            state.arg_ptr_expr("prompt_len").unwrap_or(PtrExpr::StackArg(16)));
+        slots.insert("prompt_len".into(),
             state.arg_ptr_expr("prompt_len").unwrap_or(PtrExpr::StackArg(16)));
         slots.insert("hook_ctx_ptr".into(),
             state.arg_ptr_expr("hook_ctx_ptr").unwrap_or(PtrExpr::StackArg(88)));
@@ -819,7 +825,17 @@ impl SymDimSlotMap {
         // Remaining ABI args from MEGA_KERNEL_PARAMS — added symbolically so
         // lower_op arms can use sym_map.resolve("name") instead of
         // hardcoded StackArg(N).  Eliminates fragile manual offset calculation.
-        for name in ["output_tokens_ptr", "max_new_tokens", "eos_token_id", "prompt_len", "page_table_ptr"] {
+        // BCE-20260703-GPU-MEGA-KERNEL-ABI: 添加全量规范名 (scratchpad_ptr/output_tokens_ptr/
+        // prompt_len/batch_ctx_ptr/...) 供 mega_kernel_emit 通过 sym_map.resolve 查询,
+        // 与 mega_kernel_abi_gpu() 保持键集对齐 (CPU=StackArg, GPU=AbiArg).
+        for name in [
+            "output_tokens_ptr", "max_new_tokens", "eos_token_id", "prompt_len",
+            "page_table_ptr", "batch_ctx_ptr", "input_ids_ptr", "weight_blob_ptr",
+            "kv_cache_ptr", "positions_ptr", "aux_ptr", "batch_size",
+            "scratchpad_ptr", "telemetry_ptr", "hook_ctx_ptr", "callback_table_ptr",
+            "temperature_u32", "top_k", "top_p_u32", "session_position",
+            "fused_hidden_ptr", "num_mm_tokens",
+        ] {
             if let Ok(expr) = state.arg_ptr_expr(name) {
                 slots.insert(name.into(), expr);
             }
@@ -833,6 +849,79 @@ impl SymDimSlotMap {
         }
 
         Self { slots }
+    }
+
+    /// MegaKernelFn GPU ABI SymDimSlotMap（22 `.param` 槽位）。
+    ///
+    /// ARCH-GPU-ABI (BCE-20260703-GPU-MEGA-KERNEL-ABI): GPU mega-kernel 与 CPU MegaKernelFn
+    /// 共享同一 22-param 语义顺序, 但物理位置全部为 `AbiArg(0..21)` (对应 PTX `.param` /
+    /// HIP `__global__` arg / Metal `[[buffer(N)]]`), 无 x86 SysV 的栈参数划分。
+    ///
+    /// 用途: `compile_mega_kernel_vm` 在 `IsaProfile.platform` 为 Cuda/Hip/Metal 时选用,
+    /// 替代 `mega_kernel_abi()` (x86 版), 使 `sym_map.resolve("scratchpad_ptr")` 在 GPU
+    /// 返回 `AbiArg(7)` 而非 `StackArg(24)` — GPU codegen `ld.param.u64 dst,[scratchpad_ptr]`。
+    pub fn mega_kernel_abi_gpu() -> Self {
+        let state = super::vm_state::VmState::init_mega_kernel_gpu();
+        let mut slots = HashMap::new();
+
+        // 22 个 `.param` 参数 — 全部从 GPU VmState 解析为 AbiArg(N)
+        slots.insert("input".into(), state.arg_ptr_expr("input_ids_ptr").unwrap());
+        slots.insert("weights".into(), state.arg_ptr_expr("weight_blob_ptr").unwrap());
+        slots.insert("kv_cache".into(), state.arg_ptr_expr("kv_cache_ptr").unwrap());
+        slots.insert("kv_cache_ptr".into(), state.arg_ptr_expr("kv_cache_ptr").unwrap());
+        slots.insert("positions".into(), state.arg_ptr_expr("positions_ptr").unwrap());
+        slots.insert("seq_lens".into(), state.arg_ptr_expr("aux_ptr").unwrap());
+        slots.insert("batch_size".into(), state.arg_ptr_expr("batch_size").unwrap());
+
+        slots.insert("scratchpad".into(), state.arg_ptr_expr("scratchpad_ptr").unwrap());
+        slots.insert("scratchpad_ptr".into(), state.arg_ptr_expr("scratchpad_ptr").unwrap());
+
+        slots.insert("output".into(), state.arg_ptr_expr("output_tokens_ptr").unwrap());
+        slots.insert("output_tokens_ptr".into(), state.arg_ptr_expr("output_tokens_ptr").unwrap());
+
+        slots.insert("telemetry".into(), state.arg_ptr_expr("telemetry_ptr").unwrap());
+        slots.insert("telemetry_ptr".into(), state.arg_ptr_expr("telemetry_ptr").unwrap());
+
+        slots.insert("seq_len".into(), state.arg_ptr_expr("prompt_len").unwrap());
+        slots.insert("prompt_len".into(), state.arg_ptr_expr("prompt_len").unwrap());
+        slots.insert("hook_ctx_ptr".into(), state.arg_ptr_expr("hook_ctx_ptr").unwrap());
+        slots.insert("callback_table_ptr".into(), state.arg_ptr_expr("callback_table_ptr").unwrap());
+
+        // Remaining ABI args — 全部从 GPU VmState 解析 (AbiArg(N))
+        for name in [
+            "input_ids_ptr", "weight_blob_ptr", "positions_ptr", "aux_ptr",
+            "temperature_u32", "top_k", "top_p_u32", "max_new_tokens", "eos_token_id",
+            "session_position", "fused_hidden_ptr", "num_mm_tokens",
+            "page_table_ptr", "batch_ctx_ptr",
+        ] {
+            if let Ok(expr) = state.arg_ptr_expr(name) {
+                slots.insert(name.into(), expr);
+            }
+        }
+
+        // 别名
+        for (alias, target) in super::vm_state::VmState::sym_dim_aliases() {
+            if slots.contains_key(target) {
+                slots.insert(alias.into(), slots[target].clone());
+            }
+        }
+
+        Self { slots }
+    }
+
+    /// MegaKernelFn ABI SymDimSlotMap — 按 compile target 分支。
+    ///
+    /// BCE-20260703-GPU-MEGA-KERNEL-ABI: GPU (Cuda/Hip/Metal) 全部参数走 `.param` 槽位
+    /// (`AbiArg(0..21)`), CPU (x86/AArch64) 保持 6 寄存器 + 16 栈参数 (`init_mega_kernel_x86`).
+    /// 防止 GPU codegen 收到 `StackArg(24)` 被拒 (gpu_lower/lower_instr_dispatch.inc.rs:421).
+    pub fn mega_kernel_abi_for_target(platform: &super::isa_profile::Platform) -> Self {
+        match platform {
+            super::isa_profile::Platform::Cuda { .. }
+            | super::isa_profile::Platform::Hip { .. }
+            | super::isa_profile::Platform::Metal { .. } => Self::mega_kernel_abi_gpu(),
+            // x86_64 / AArch64 / 其他: 保留 x86 SysV ABI (6 reg + 16 stack)
+            _ => Self::mega_kernel_abi(),
+        }
     }
 
     /// SymDim → BoundExpr（ARCH-SYMDIM-NO-UNWRAP）。

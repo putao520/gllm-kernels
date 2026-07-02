@@ -810,6 +810,43 @@ mod tests {
         assert!(map.resolve("seq_len").is_some(), "GPU ABI must resolve 'seq_len'");
     }
 
+    /// BCE-20260703-GPU-MEGA-KERNEL-ABI: mega_kernel_abi_for_target must dispatch by platform.
+    /// CPU → StackArg (x86 SysV), GPU → AbiArg (.param). scratchpad_ptr 是触发 bug 的关键参数
+    /// (x86=StackArg(24), GPU=AbiArg(7)); 必须保证 GPU 路径永不返回 StackArg.
+    #[test]
+    fn test_mega_kernel_abi_for_target_dispatches_by_platform() {
+        use crate::compiler::codegen::vm::instr::PtrExpr;
+        use crate::compiler::codegen::vm::isa_profile::Platform;
+
+        // CPU: scratchpad_ptr → StackArg(24) (x86 SysV ABI)
+        let cpu_map = SymDimSlotMap::mega_kernel_abi_for_target(&Platform::X86_64 {
+            has_avx512: false, has_bf16: false, has_vnni: false, has_avx512fp16: false,
+            has_f16c: true, has_amx: false, has_amx_fp16: false, has_amx_complex: false,
+            has_amx_transpose: false, has_amx_fp8: false, has_avx10_2: false,
+            has_apx: false, has_sparse_mask_intersect: false,
+        });
+        match cpu_map.resolve("scratchpad_ptr").expect("CPU ABI must resolve scratchpad_ptr") {
+            PtrExpr::StackArg(24) => {}
+            other => panic!("CPU scratchpad_ptr must be StackArg(24), got {:?}", other),
+        }
+
+        // GPU Cuda: scratchpad_ptr → AbiArg(7) (.param 槽位)
+        let gpu_platform = crate::compiler::codegen::vm::isa_profile::IsaProfile::cuda(120).platform;
+        let gpu_map = SymDimSlotMap::mega_kernel_abi_for_target(&gpu_platform);
+        match gpu_map.resolve("scratchpad_ptr").expect("GPU ABI must resolve scratchpad_ptr") {
+            PtrExpr::AbiArg(7) => {}
+            other => panic!("GPU scratchpad_ptr must be AbiArg(7), got {:?}", other),
+        }
+        // GPU 全部 22 参数必须为 AbiArg, 禁止 StackArg
+        for name in ["scratchpad_ptr", "prompt_len", "output_tokens_ptr",
+            "batch_ctx_ptr", "temperature_u32", "hook_ctx_ptr", "page_table_ptr"] {
+            match gpu_map.resolve(name).expect("GPU ABI must resolve param") {
+                PtrExpr::AbiArg(_) => {}
+                other => panic!("GPU param '{}' must be AbiArg, got {:?}", name, other),
+            }
+        }
+    }
+
     /// SymDimSlotMap::to_bound() must map Concrete -> BoundExpr::Const
     /// and Symbolic -> BoundExpr::Symbolic.
     #[test]

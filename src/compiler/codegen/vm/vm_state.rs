@@ -175,6 +175,55 @@ impl VmState {
         }
     }
 
+    /// 从 MegaKernelFn GPU ABI 初始化 (22 参数全部通过 `.param` 传递, 无栈参数).
+    ///
+    /// ARCH-GPU-ABI: GPU (PTX/HIP/Metal) mega-kernel 与 CPU MegaKernelFn 共享同一 22-param
+    /// 语义顺序 (mega_kernel_abi.rs:MEGA_KERNEL_PARAMS), 但物理传递方式不同: GPU 全部走
+    /// `.param`/`__global__` arg/`[[buffer(N)]]` 槽位, 无 x86 SysV 的寄存器+栈划分.
+    ///
+    /// BCE-20260703-GPU-MEGA-KERNEL-ABI: 22 个参数按声明顺序映射到 `Register(0..21)`,
+    /// 对应 GpuLower prologue 的 `abi_param_names` (prologue.inc.rs:485-492).
+    /// `arg_ptr_expr()` 返回 `AbiArg(N)`, GPU LoadPtr 降低为 `ld.param.u64 dst,[param_name];`.
+    pub fn init_mega_kernel_gpu() -> Self {
+        let param_names: &[&str] = &[
+            "input_ids_ptr",        // .param 0  → AbiArg(0)
+            "weight_blob_ptr",      // .param 1  → AbiArg(1)
+            "kv_cache_ptr",         // .param 2  → AbiArg(2)
+            "positions_ptr",        // .param 3  → AbiArg(3)
+            "aux_ptr",              // .param 4  → AbiArg(4)
+            "batch_size",           // .param 5  → AbiArg(5)
+            "prompt_len",           // .param 6  → AbiArg(6)
+            "scratchpad_ptr",       // .param 7  → AbiArg(7)
+            "output_tokens_ptr",    // .param 8  → AbiArg(8)
+            "temperature_u32",      // .param 9  → AbiArg(9)
+            "top_k",                // .param 10 → AbiArg(10)
+            "top_p_u32",            // .param 11 → AbiArg(11)
+            "max_new_tokens",       // .param 12 → AbiArg(12)
+            "eos_token_id",         // .param 13 → AbiArg(13)
+            "hook_ctx_ptr",         // .param 14 → AbiArg(14)
+            "telemetry_ptr",        // .param 15 → AbiArg(15)
+            "session_position",     // .param 16 → AbiArg(16)
+            "fused_hidden_ptr",     // .param 17 → AbiArg(17)
+            "num_mm_tokens",        // .param 18 → AbiArg(18)
+            "callback_table_ptr",   // .param 19 → AbiArg(19)
+            "page_table_ptr",       // .param 20 → AbiArg(20)
+            "batch_ctx_ptr",        // .param 21 → AbiArg(21)
+        ];
+
+        let mut arg_locations = HashMap::new();
+        for (i, &name) in param_names.iter().enumerate() {
+            // GPU: 全部 Register(i) → AbiArg(i), 无栈参数划分
+            arg_locations.insert(name.to_string(), ArgLocation::Register(i as u8));
+        }
+
+        Self {
+            arg_locations,
+            rsp_offset: 0,
+            callee_save_locations: Vec::new(),
+            spill_base: 0,
+        }
+    }
+
     /// 查询参数的物理位置 (ARCH-VM-QUERY-NOT-ASSUME)。
     ///
     /// 返回 PtrExpr 供 VmInstr::LoadPtr 使用。
@@ -464,6 +513,35 @@ mod tests {
         assert_eq!(state.arg_ptr_expr("callback_table_ptr").unwrap(), PtrExpr::StackArg(120));
         assert_eq!(state.arg_ptr_expr("page_table_ptr").unwrap(), PtrExpr::StackArg(128));
         assert_eq!(state.arg_ptr_expr("batch_ctx_ptr").unwrap(), PtrExpr::StackArg(136));
+    }
+
+    /// @trace TEST-VMS-GPU-MEGA-KERNEL-ABI [req:REQ-UMK-27] [level:unit]
+    /// BCE-20260703-GPU-MEGA-KERNEL-ABI 回归测试: GPU mega-kernel ABI 必须把全部 22 个
+    /// 参数映射到 `AbiArg(0..21)`, 禁止出现 `StackArg` (GPU 无栈参数概念, 会被
+    /// gpu_lower/lower_instr_dispatch.inc.rs 拒绝). 与 CPU `init_mega_kernel_x86` 的
+    /// 6 reg + 16 stack 划分形成对照 — 同一语义名, 不同物理位置.
+    #[test]
+    fn test_init_mega_kernel_gpu_all_params_are_abi_arg() {
+        let state = VmState::init_mega_kernel_gpu();
+
+        // 全部 22 个参数必须解析为 AbiArg(N), 顺序与 GPU prologue abi_param_names 一致
+        let expected: &[(&str, u8)] = &[
+            ("input_ids_ptr", 0), ("weight_blob_ptr", 1), ("kv_cache_ptr", 2),
+            ("positions_ptr", 3), ("aux_ptr", 4), ("batch_size", 5),
+            ("prompt_len", 6), ("scratchpad_ptr", 7), ("output_tokens_ptr", 8),
+            ("temperature_u32", 9), ("top_k", 10), ("top_p_u32", 11),
+            ("max_new_tokens", 12), ("eos_token_id", 13), ("hook_ctx_ptr", 14),
+            ("telemetry_ptr", 15), ("session_position", 16), ("fused_hidden_ptr", 17),
+            ("num_mm_tokens", 18), ("callback_table_ptr", 19),
+            ("page_table_ptr", 20), ("batch_ctx_ptr", 21),
+        ];
+        for &(name, idx) in expected {
+            match state.arg_ptr_expr(name).unwrap() {
+                PtrExpr::AbiArg(n) => assert_eq!(n, idx,
+                    "GPU ABI param '{}' expected AbiArg({}) got AbiArg({})", name, idx, n),
+                other => panic!("GPU ABI param '{}' must be AbiArg, got {:?}", name, other),
+            }
+        }
     }
 
     /// @trace TEST-VMS-10 [req:REQ-VR] [level:unit]
