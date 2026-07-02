@@ -268,4 +268,18 @@ mod tests {
             }
         }
     }
+
+    #[test]
+    fn test_thread_tile_warp_gt16_output_complete() {
+        // BCE 回归测试: warp_m*warp_n > 16 时输出完整 (accs 全量, 无 .min(16) 截断)。
+        // 旧实现 warp_m=64*warp_n=32=2048 → .min(16) → 只 16 acc, 2032 单元静默丢弃。
+        // 新实现: acc_count = tm*tn ≤ 64, 32 lane 协同覆盖 2048, 输出完整。
+        let tile = GpuThreadTile::for_warp(64, 32, 64);
+        assert!(tile.warp_m * tile.warp_n > 16, "warp tile > 16");
+        assert!(tile.acc_count() <= 64, "thread acc ≤ 64 (register budget)");
+        // 32 lane × tm*tn = warp_m*warp_n (协同覆盖完整)
+        assert_eq!(GPU_WARP_SIZE * tile.acc_count(), tile.warp_m * tile.warp_n,
+            "32 lane × tm*tn must cover full warp_m*warp_n output");
+        tile.validate().expect("valid single/dual-axis split");
+    }
 }
