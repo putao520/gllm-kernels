@@ -233,6 +233,24 @@ pub struct InferenceCompiler {
     cache: CompilationCache,
 }
 
+
+fn _gk_oom_rss_mb() -> usize {
+    if let Ok(s) = std::fs::read_to_string("/proc/self/status") {
+        for line in s.lines() {
+            if line.starts_with("VmRSS:") {
+                let kb: usize = line[6..].trim().split_whitespace().next().unwrap_or("0").parse().unwrap_or(0);
+                return kb/1024;
+            }
+        }
+    }
+    0
+}
+fn _gk_oom_log(tag: &str, extra: &str) {
+    use std::io::Write;
+    let _ = std::fs::OpenOptions::new().create(true).append(true)
+        .open("/tmp/oomprobe_gk.log").and_then(|mut f| writeln!(f, "{:>30} | RSS={} MB | {}", tag, _gk_oom_rss_mb(), extra));
+    eprintln!("[OOMPROBE-GK] {:>30} | RSS={} MB | {}", tag, _gk_oom_rss_mb(), extra);
+}
 impl InferenceCompiler {
     /// Create a new compiler with the detected hardware profile.
     pub fn new() -> Self {
@@ -913,6 +931,7 @@ impl InferenceCompiler {
         let hook = codegen::vm::isa_hook::select_hook(&profile);
         let hook_ref: Option<&dyn codegen::vm::isa_hook::IsaHook> = Some(&*hook);
 
+        _gk_oom_log("gpu-pre-vm-emit", &format!("max_seq_len={} hidden={}", config.max_seq_len, geometry.hidden));
         let (mut program, rope_cache, logits_scratch_offset) =
             codegen::vm::mega_kernel_emit::compile_mega_kernel_vm(
                 &fusion_plan, &graph, &alloc, Some(&registry), &profile,
@@ -921,12 +940,14 @@ impl InferenceCompiler {
                 false, None, Some(&resource_plan),
                 topology,
             ).map_err(|e| InferenceError::CompileError(e.into()))?;
+        _gk_oom_log("gpu-post-vm-emit", &format!("instrs={} vregs={:?}", program.instrs.len(), program.vreg_counts_by_kind()));
 
         let pass_registry = PassRegistry::with_defaults();
         pass_registry.run_all(&mut program, &profile, &*hook);
 
         let alloc_result = RegAllocator::new(&profile).allocate(&program)
             .map_err(|e| InferenceError::CompileError(format!("RegAlloc: {}", e).into()))?;
+        _gk_oom_log("gpu-post-regalloc", &format!("spills={} mapping_entries={}", alloc_result.spills.len(), alloc_result.mapping.len()));
         let frame = StackFrame::compute(&alloc_result, &profile, 0);
 
         let dialect = if cfg!(feature = "jit-cuda") {
@@ -940,14 +961,22 @@ impl InferenceCompiler {
             .map_err(|e| InferenceError::CompileError(e.into()))?;
         lowerer.set_vreg_kind_map(&program);
 
+        _gk_oom_log("gpu-pre-lower-instrs", &format!("instrs_to_lower={}", program.instrs.len()));
+        let mut _gk_lowered = 0usize;
         for instr in &program.instrs {
             lowerer.lower_instr(instr, &alloc_result)
                 .map_err(|e| InferenceError::CompileError(e.into()))?;
+            _gk_lowered += 1;
+            if _gk_lowered % 2000 == 0 {
+                _gk_oom_log("gpu-lower-progress", &format!("lowered={}/{}", _gk_lowered, program.instrs.len()));
+            }
         }
+        _gk_oom_log("gpu-post-lower-instrs", &format!("lowered_total={}", _gk_lowered));
         lowerer.emit_epilogue(&frame, &alloc_result)
             .map_err(|e| InferenceError::CompileError(e.into()))?;
         let gpu_code = lowerer.finalize()
             .map_err(|e| InferenceError::CompileError(e.into()))?;
+        _gk_oom_log("gpu-post-finalize", &format!("gpu_code_bytes={}", gpu_code.len()));
 
         let elem_bytes = geometry.compute_dtype.size_bytes();
         let vocab_bytes = geometry.vocab_size * elem_bytes;
