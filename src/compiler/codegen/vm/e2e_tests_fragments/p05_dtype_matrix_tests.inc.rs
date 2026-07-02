@@ -16,7 +16,7 @@
 
 #[cfg(test)]
 mod p05_dtype_matrix {
-use crate::compiler::codegen::vm::instr::{SimdWidth, VRegKind, VmInstr, VmProgram};
+use crate::compiler::codegen::vm::instr::{SimdWidth, VRegKind, VmInstr, VmProgram, BoundExpr};
 use crate::compiler::codegen::vm::gemm_emit::{
     emit_gemm_blis_inline, emit_gemm_gpu_tiled_inline,
 };
@@ -99,6 +99,7 @@ fn p05_dtype_matrix_gpu_tiled_transb_false_b_load_uses_b_dtype() {
         &mut prog, 16, 16, 16, width, a, b, c,
         16, 16, 16, 16, 16, 16,
         QuantPrecision::F32, QuantPrecision::BF16, QuantPrecision::F32, false,
+        false, &BoundExpr::Const(16),
     ).expect("gpu tiled GEMM mixed-precision emit");
     assert!(!prog.instrs.is_empty(), "gpu tiled GEMM should emit instructions");
     assert_has_vecload_with_dtype(&prog, QuantPrecision::BF16, "gpu_tiled/transb=false");
@@ -115,6 +116,7 @@ fn p05_dtype_matrix_gpu_tiled_transb_true_b_load_uses_b_dtype() {
         &mut prog, 16, 16, 16, width, a, b, c,
         16, 16, 16, 16, 16, 16,
         QuantPrecision::F32, QuantPrecision::BF16, QuantPrecision::F32, true,
+        false, &BoundExpr::Const(16),
     ).expect("gpu tiled GEMM mixed-precision trans_b emit");
     assert!(!prog.instrs.is_empty(), "gpu tiled GEMM trans_b should emit instructions");
     assert_has_vecload_with_dtype(&prog, QuantPrecision::BF16, "gpu_tiled/transb=true");

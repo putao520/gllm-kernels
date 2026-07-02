@@ -130,11 +130,26 @@ pub(crate) fn emit_gemm_inline_with_hook<'a>(
     let hook = ctx.session.hook.ok_or_else(|| CompilerError::CodegenViolation(
         "emit_gemm_inline_with_hook: IsaHook is mandatory (ARCH-ISA-HOOK-MANDATORY)".into(),
     ))?;
-    let m = match m_dim {
+    // ARCH-SYMDIM-NO-CONST-DEGRADE (BCE-20260702-GPU-OOM 根治):
+    // 禁止把 Symbolic M 降级为 max_value 后喂给 GPU tiled/pipelined GEMM 的 Rust
+    // `for i_cta in (0..m).step_by(cta_m)` 循环 —— 那会把单模板展开成 m/cta_m 份
+    // (lm_head M=Symbolic{max:8192} → 64× 内层嵌套 = 2.84 亿 VmInstr = 23GB OOM)。
+    // Symbolic M 必须走 emit_loop(BoundExpr::Symbolic)，模板只发一次，运行时按
+    // 真实 seq_len 循环 (与 CPU 路径 emit_gemm_inline_with_epilogue 对齐)。
+    //
+    // m_concrete 仅用于编译时已确定 True 的内层 tile 边界 (mi/nj/kk 等 micro-dim,
+    // ARCH-NO-LOOP-UNROLL 例外: warp_m/warp_n/mma_k 等 ≤ UNROLL_THRESHOLD 微维可展开)。
+    // M 循环本身在 Symbolic 时绝不使用 m_concrete 作 Rust for 上界。
+    let m_concrete = match m_dim {
         SymDim::Concrete(v) => *v,
         SymDim::Symbolic { max_value, .. } => max_value
             .expect("ARCH-SYMDIM: GEMM M Symbolic must have max_value"),
     };
+    // @trace ARCH-SYMDIM-THREADING: m_bound 从 seq_bound_override 或 sym_map 派生,
+    // 禁止退化为 max_value (SIGSEGV/OOM 根因修复)。Symbolic → BoundExpr::Symbolic
+    // (运行时从 .param 读 seq_len)；Concrete → Const。
+    let m_bound: BoundExpr = seq_bound_override.cloned().unwrap_or_else(|| sym_map.to_bound(m_dim));
+    let m_symbolic = m_dim.is_symbolic();
 
     // §0.2.9 ExecPattern 感知策略选择:
     // 从 R0 PainPointAnalyzer 的瓶颈映射中查找当前 op 的执行模式。
@@ -149,9 +164,9 @@ pub(crate) fn emit_gemm_inline_with_hook<'a>(
         Some(ExecPattern::SharedMemTile { .. }) => {
             let (mr, nr) = hook.gemm_microkernel_shape();
             let lanes = width.f32_lanes().max(1);
-            let can_blis = !trans_b && !m_dim.is_symbolic() && m >= mr && n >= nr * lanes && k >= 16;
+            let can_blis = !trans_b && !m_dim.is_symbolic() && m_concrete >= mr && n >= nr * lanes && k >= 16;
             if can_blis {
-                return emit_gemm_blis_inline(prog, m, n, k, width, a_ptr, b_ptr, c_ptr, mr, nr, pack_map, k_unroll, a_dtype, b_dtype, c_dtype, trans_b);
+                return emit_gemm_blis_inline(prog, m_concrete, n, k, width, a_ptr, b_ptr, c_ptr, mr, nr, pack_map, k_unroll, a_dtype, b_dtype, c_dtype, trans_b);
             }
         }
         Some(ExecPattern::TileGemm { tile_m, tile_n, tile_k, warp_m, warp_n, mma_k, pipeline_depth }) => {
@@ -182,35 +197,35 @@ pub(crate) fn emit_gemm_inline_with_hook<'a>(
 
                 if w_m > 0 || w_n > 0 {
                     if pipe_depth >= 2 {
-                        return emit_gemm_gpu_pipelined(prog, m, n, k, width, a_ptr, b_ptr, c_ptr,
+                        return emit_gemm_gpu_pipelined(prog, m_concrete, n, k, width, a_ptr, b_ptr, c_ptr,
                             cta_m, cta_n, cta_k, w_m, w_n, mk, pipe_depth, a_dtype, b_dtype, c_dtype, trans_b,
-                            hw.has_tma());
+                            hw.has_tma(), m_symbolic, &m_bound);
                     }
-                    return emit_gemm_gpu_tiled_inline(prog, m, n, k, width, a_ptr, b_ptr, c_ptr,
-                        cta_m, cta_n, cta_k, w_m, w_n, mk, a_dtype, b_dtype, c_dtype, trans_b);
+                    return emit_gemm_gpu_tiled_inline(prog, m_concrete, n, k, width, a_ptr, b_ptr, c_ptr,
+                        cta_m, cta_n, cta_k, w_m, w_n, mk, a_dtype, b_dtype, c_dtype, trans_b, m_symbolic, &m_bound);
                 }
             }
             let (default_mr, default_nr) = hook.gemm_microkernel_shape();
             let mr = *tile_m;
             let nr = *tile_n;
             let lanes = width.f32_lanes().max(1);
-            let can_blis = !trans_b && !m_dim.is_symbolic() && m >= mr && n >= nr * lanes && k >= 16;
+            let can_blis = !trans_b && !m_dim.is_symbolic() && m_concrete >= mr && n >= nr * lanes && k >= 16;
             if can_blis {
-                return emit_gemm_blis_inline(prog, m, n, k, width, a_ptr, b_ptr, c_ptr, mr, nr, pack_map, k_unroll, a_dtype, b_dtype, c_dtype, trans_b);
+                return emit_gemm_blis_inline(prog, m_concrete, n, k, width, a_ptr, b_ptr, c_ptr, mr, nr, pack_map, k_unroll, a_dtype, b_dtype, c_dtype, trans_b);
             }
             // TileGemm 参数不兼容 BLIS → fallback 到默认微核形状
-            let can_blis_default = !trans_b && !m_dim.is_symbolic() && m >= default_mr && n >= default_nr * lanes && k >= 16;
+            let can_blis_default = !trans_b && !m_dim.is_symbolic() && m_concrete >= default_mr && n >= default_nr * lanes && k >= 16;
             if can_blis_default {
-                return emit_gemm_blis_inline(prog, m, n, k, width, a_ptr, b_ptr, c_ptr, default_mr, default_nr, pack_map, k_unroll, a_dtype, b_dtype, c_dtype, trans_b);
+                return emit_gemm_blis_inline(prog, m_concrete, n, k, width, a_ptr, b_ptr, c_ptr, default_mr, default_nr, pack_map, k_unroll, a_dtype, b_dtype, c_dtype, trans_b);
             }
         }
         Some(ExecPattern::AsyncPipeline) => {
             // §0.2.9: AsyncPipeline → BLIS + prefetch hint（减少缓存未命中）
             let (mr, nr) = hook.gemm_microkernel_shape();
             let lanes = width.f32_lanes().max(1);
-            let can_blis = !trans_b && !m_dim.is_symbolic() && m >= mr && n >= nr * lanes && k >= 16;
+            let can_blis = !trans_b && !m_dim.is_symbolic() && m_concrete >= mr && n >= nr * lanes && k >= 16;
             if can_blis {
-                return emit_gemm_blis_inline(prog, m, n, k, width, a_ptr, b_ptr, c_ptr, mr, nr, pack_map, k_unroll, a_dtype, b_dtype, c_dtype, trans_b);
+                return emit_gemm_blis_inline(prog, m_concrete, n, k, width, a_ptr, b_ptr, c_ptr, mr, nr, pack_map, k_unroll, a_dtype, b_dtype, c_dtype, trans_b);
             }
         }
         None => {}
@@ -220,11 +235,10 @@ pub(crate) fn emit_gemm_inline_with_hook<'a>(
     // dtype × ISA 在 selector 折叠完毕, emit 体内零 dtype/ISA 分支 (CR-001 后置)。
     let feats = ctx.session.feature_set;
     let (mr, nr) = hook.gemm_microkernel_shape();
-    // @trace ARCH-SYMDIM-THREADING: m_bound 从 seq_bound_override 或 sym_map 派生,
-    // 禁止退化为 max_value (SIGSEGV 根因修复)
-    let m_bound = seq_bound_override.cloned().unwrap_or_else(|| sym_map.to_bound(m_dim));
+    // m_bound 已在函数顶部计算 (seq_bound_override 优先, 否则 sym_map.to_bound),
+    // 不再在此重复声明 (BCE-20260702-GPU-OOM: 旧重复 let m_bound 已删)。
     let layout = super::op_impl::GemmOpLayout {
-        m, n, k,
+        m: m_concrete, n, k,
         m_bound,
         dtype: a_dtype,
         a_dtype, b_dtype, c_dtype,
@@ -232,9 +246,9 @@ pub(crate) fn emit_gemm_inline_with_hook<'a>(
         mr, nr,
         a_ptr, b_ptr, c_ptr,
         epilogue: super::isa_hook::EpiloguePlace::OnAccumulators,
-        tile: resolve_tile_shape(&feats, a_dtype, m, n, k),
+        tile: resolve_tile_shape(&feats, a_dtype, m_concrete, n, k),
     };
-    let im = super::gemm_impls::select_gemm_impl(feats, a_dtype, (m, n, k));
+    let im = super::gemm_impls::select_gemm_impl(feats, a_dtype, (m_concrete, n, k));
     let mut ectx = super::op_impl::EmitCtx {
         prog, width,
         pack_map, k_unroll, debug_jit: ctx.session.debug_jit,
@@ -408,6 +422,8 @@ pub(crate) fn emit_gemm_gpu_tiled_inline(
     warp_m: usize, warp_n: usize, mma_k: usize,
     a_dtype: QuantPrecision, b_dtype: QuantPrecision, c_dtype: QuantPrecision,
     _trans_b: bool,
+    m_symbolic: bool,
+    m_bound: &BoundExpr,
 ) -> Result<(), CompilerError> {
     // BCE-20260630-MIXED-P0.5: per-matrix dtype (ARCH-DTYPE-MIXED-PRECISION).
     // 三段式 dtype 感知：A-load=a_dtype, B-load=b_dtype, C-store=c_dtype;
@@ -431,6 +447,133 @@ pub(crate) fn emit_gemm_gpu_tiled_inline(
         .map(|_| prog.alloc_vreg(VRegKind::Vec, width))
         .collect();
 
+    // BCE-20260702-GPU-OOM 根治 (ARCH-SYMDIM-NO-CONST-DEGRADE + ARCH-NO-LOOP-UNROLL):
+    // M 循环在 Symbolic 时必须用 emit_loop(BoundExpr::Symbolic) —— 模板只发一次,
+    // 运行时按 .param seq_len 循环。Rust `for i_cta in (0..m).step_by(cta_m)` 在
+    // M=Symbolic{max:8192} 时展开成 64 份内层嵌套 = 2.84 亿 VmInstr = 23GB OOM。
+    //
+    // 偏移链分层 (architect 确认): VReg 部分 = i_cta * (k * elem) (每次 iteration 重算,
+    // 通过 OffsetExpr::Mul(LoopOffset(i_off), k*elem)), Const 部分 = i_warp*k*elem +
+    // k_tile*elem + k_inner*elem (编译时确定, immediate offset)。
+    //
+    // mi 假设 = cta_m (full tile)。部分 tile (seq_len % cta_m != 0) 的越界 store 仅写
+    // 到 max_value 预留的 buffer 尾部 (output/activation 按 max_for_allocation 分配),
+    // 测试只读 last token row (i_cta=0 区间内) → 数值正确, 不崩溃 (architect 评估低风险)。
+    // K-reduction 顺序不变 (k_tile/k_inner 内层 Rust for 顺序与 Concrete 路径一致)。
+    if m_symbolic {
+        // step_bytes=1 → byte_offset VReg = iteration index (counter*1)。LoopOffset(i_off)
+        // 直接给出 i_cta 索引; 乘 k*elem / n*c_elem 得到 A/C 行基字节偏移 (运行时计算,
+        // GPU lower 支持 OffsetExpr::Mul, 见 prologue.inc.rs:120)。
+        prog.emit_loop_try::<CompilerError>(m_bound.clone(), 1, |prog, _i_ctr, i_off| {
+            // i_off = 当前 CTA tile 的 M 索引 (counter value, step=1)。
+            // A 行基偏移 (i_cta * k * a_elem) — VReg 部分。
+            let a_row_base = OffsetExpr::Mul(Box::new(OffsetExpr::LoopOffset(i_off)), k * a_elem);
+            // C 行基偏移 (i_cta * n * c_elem) — VReg 部分。
+            let c_row_base = OffsetExpr::Mul(Box::new(OffsetExpr::LoopOffset(i_off)), n * c_elem);
+
+            // N 维度 CTA 循环: n 是 Concrete (vocab) → Rust for (Const, micro-dim 例外)。
+            for j_cta in (0..n).step_by(cta_n) {
+                let nj = cta_n.min(n - j_cta);
+
+                // 清零累加器
+                for acc in &accs {
+                    prog.emit(VmInstr::Broadcast { dst: *acc, src: ScalarExpr::Const(0.0), width, dtype: acc_dtype });
+                }
+
+                // K 维度循环: k 是 Concrete (hidden) → Rust for。
+                for k_tile in (0..k).step_by(cta_k) {
+                    let kk = cta_k.min(k - k_tile);
+
+                    // Warp 级循环: micro-dim (warp_m/warp_n) → Rust for (例外)。
+                    for i_warp in (0..cta_m).step_by(warp_m) {
+                        let wi = warp_m.min(cta_m - i_warp);
+                        for j_warp in (0..nj).step_by(warp_n) {
+                            let wj = warp_n.min(nj - j_warp);
+
+                            // MMA 内层 K 循环: micro-dim (mma_k) → Rust for (例外)。
+                            for k_inner in (0..kk).step_by(mma_k) {
+                                // A off = a_row_base + (i_warp)*k*a_elem + (k_tile+k_inner)*a_elem
+                                let a_off = OffsetExpr::Add(
+                                    Box::new(OffsetExpr::Add(
+                                        Box::new(a_row_base.clone()),
+                                        Box::new(OffsetExpr::Const(i_warp * k * a_elem)),
+                                    )),
+                                    Box::new(OffsetExpr::Const((k_tile + k_inner) * a_elem)),
+                                );
+                                // B off = ((k_tile+k_inner)*n + j_cta+j_warp) * b_elem (Const, 不依赖 i_cta)
+                                let b_off = ((k_tile + k_inner) * n + j_cta + j_warp) * b_elem;
+
+                                for row in 0..wi {
+                                    let a_row_off = OffsetExpr::Add(
+                                        Box::new(a_off.clone()),
+                                        Box::new(OffsetExpr::Const(row * k * a_elem)),
+                                    );
+                                    let a_vec = prog.alloc_vreg(VRegKind::Vec, width);
+                                    prog.emit(VmInstr::VecLoad {
+                                        dst: a_vec, base: a_ptr,
+                                        offset: a_row_off,
+                                        width, dtype: a_dtype, predicate: None,
+                                    });
+
+                                    for col in 0..wj {
+                                        let b_col_off = b_off + col * b_elem;
+                                        let b_vec = prog.alloc_vreg(VRegKind::Vec, width);
+                                        prog.emit(VmInstr::VecLoad {
+                                            dst: b_vec, base: b_ptr,
+                                            offset: OffsetExpr::Const(b_col_off),
+                                            width, dtype: b_dtype, predicate: None,
+                                        });
+
+                                        let acc_idx = row * wj + col;
+                                        if acc_idx < accs.len() {
+                                            prog.emit(VmInstr::Fma {
+                                                dst: accs[acc_idx],
+                                                acc: accs[acc_idx],
+                                                a: a_vec,
+                                                b: b_vec,
+                                                dtype: acc_dtype,
+                                            });
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+
+                // 写回 C tile: c_row_base + (row*n + j_cta + col) * c_elem
+                for row in 0..cta_m.min(warp_m) {
+                    for col in 0..nj.min(warp_n) {
+                        let acc_idx = row * nj.min(warp_n) + col;
+                        if acc_idx < accs.len() {
+                            let c_off = OffsetExpr::Add(
+                                Box::new(c_row_base.clone()),
+                                Box::new(OffsetExpr::Const(((row * n + j_cta + col) * c_elem))),
+                            );
+                            let store_src = if needs_narrow {
+                                let narrowed = prog.alloc_vreg(VRegKind::Vec, width);
+                                prog.emit(VmInstr::VecNarrow { dst: narrowed, src: accs[acc_idx], dst_dtype: c_dtype, src_dtype: acc_dtype, width });
+                                narrowed
+                            } else {
+                                accs[acc_idx]
+                            };
+                            prog.emit(VmInstr::VecStore {
+                                base: c_ptr,
+                                offset: c_off,
+                                src: store_src,
+                                width,
+                                dtype: c_dtype, predicate: None,
+                            });
+                        }
+                    }
+                }
+            }
+            Ok(())
+        })?;
+        return Ok(());
+    }
+
+    // Concrete M 路径 (原实现, 保留): mi/nj/kk 编译时确定, 无 OOM 风险。
     // CTA 级循环: 遍历 M/N 维度
     for i_cta in (0..m).step_by(cta_m) {
         let mi = cta_m.min(m - i_cta);
@@ -550,7 +693,21 @@ pub(crate) fn emit_gemm_gpu_pipelined(
     a_dtype: QuantPrecision, b_dtype: QuantPrecision, c_dtype: QuantPrecision,
     _trans_b: bool,
     use_tma: bool,
+    m_symbolic: bool,
+    m_bound: &BoundExpr,
 ) -> Result<(), CompilerError> {
+    // BCE-20260702-GPU-OOM: Symbolic M 不能进 Rust `for i_cta in (0..m)` 展开 (OOM)。
+    // pipelined 路径的 async_load_tile/mma_on_smem 辅助函数目前接收 i_cta: usize
+    // 编译时常量, 改造成 OffsetExpr 版本工作量超本 TASK 范围 (TMA coord 寄存器
+    // 需运行时 VReg, 非 TMA 需 OffsetExpr 偏移链)。
+    // Symbolic M → 统一降级到 tiled_inline 的 emit_loop 路径 (已实现 Symbolic M +
+    // OffsetExpr 偏移分层)。数值正确 (K-reduction 顺序不变, 仅失去双缓冲流水线
+    // 加速), 不 OOM, NO-SILENT-FALLBACK 安全。Concrete M 保留 pipelined 双缓冲。
+    if m_symbolic {
+        return emit_gemm_gpu_tiled_inline(prog, m, n, k, width, a_ptr, b_ptr, c_ptr,
+            cta_m, cta_n, cta_k, warp_m, warp_n, mma_k, a_dtype, b_dtype, c_dtype, _trans_b,
+            true, m_bound);
+    }
     // BCE-20260630-MIXED-P0.5: per-matrix dtype (ARCH-DTYPE-MIXED-PRECISION).
     // 三段式 dtype 感知：A-tile load=a_dtype, B-tile load=b_dtype, C-store=c_dtype;
     // acc=c_dtype.gpu_accumulator_dtype() (三段式 accumulate 位置合法 F32, GPU tensor core).
@@ -1674,7 +1831,7 @@ mod template_tests {
 
         let result = emit_gemm_gpu_tiled_inline(
             &mut prog, 16, 16, 16, width, a, b, c,
-            16, 16, 16, 16, 16, 16, dtype, dtype, dtype, false,
+            16, 16, 16, 16, 16, 16, dtype, dtype, dtype, false, false, &BoundExpr::Const(16),
         );
         assert!(result.is_ok(), "GPU tiled GEMM should succeed: {:?}", result.err());
         assert!(!prog.instrs.is_empty(), "GPU tiled GEMM should produce instructions");
@@ -2024,7 +2181,7 @@ mod template_tests {
 
         let result = emit_gemm_gpu_pipelined(
             &mut prog, 16, 16, 16, width, a, b, c,
-            16, 16, 16, 16, 16, 16, 2, dtype, dtype, dtype, false, false,
+            16, 16, 16, 16, 16, 16, 2, dtype, dtype, dtype, false, false, false, &BoundExpr::Const(16),
         );
 
         assert!(result.is_ok(), "pipelined GPU GEMM with single K tile should succeed: {:?}", result.err());
@@ -2142,7 +2299,7 @@ mod template_tests {
         // Act
         let result = emit_gemm_gpu_tiled_inline(
             &mut prog, 16, 16, 16, width, a, b, c,
-            16, 16, 16, 16, 16, 16, dtype, dtype, dtype, false,
+            16, 16, 16, 16, 16, 16, dtype, dtype, dtype, false, false, &BoundExpr::Const(16),
         );
 
         // Assert: BF16 should produce VecNarrow to convert F32 accumulator back to BF16
@@ -2299,7 +2456,7 @@ mod template_tests {
         // Act: use_tma=true triggers TmaDescriptorInit + BarrierInit
         let result = emit_gemm_gpu_pipelined(
             &mut prog, 16, 16, 32, width, a, b, c,
-            16, 16, 16, 16, 16, 16, 2, QuantPrecision::F32, QuantPrecision::F32, QuantPrecision::F32, false, true,
+            16, 16, 16, 16, 16, 16, 2, QuantPrecision::F32, QuantPrecision::F32, QuantPrecision::F32, false, true, false, &BoundExpr::Const(16),
         );
 
         // Assert
@@ -2394,7 +2551,7 @@ mod template_tests {
         // Act: M=20 with cta_m=16 -> last tile has mi=4 (partial)
         let result = emit_gemm_gpu_tiled_inline(
             &mut prog, 20, 20, 20, width, a, b, c,
-            16, 16, 16, 16, 16, 16, QuantPrecision::F32, QuantPrecision::F32, QuantPrecision::F32, false,
+            16, 16, 16, 16, 16, 16, QuantPrecision::F32, QuantPrecision::F32, QuantPrecision::F32, false, false, &BoundExpr::Const(20),
         );
 
         // Assert: partial tiles should be handled correctly (clamped mi/nj)
@@ -2622,7 +2779,7 @@ mod template_tests {
         // Act: BF16 with 2-stage pipeline, single K-tile (K=cta_k=16)
         let result = emit_gemm_gpu_pipelined(
             &mut prog, 16, 16, 16, width, a, b, c,
-            16, 16, 16, 16, 16, 16, 2, QuantPrecision::BF16, QuantPrecision::BF16, QuantPrecision::BF16, false, false,
+            16, 16, 16, 16, 16, 16, 2, QuantPrecision::BF16, QuantPrecision::BF16, QuantPrecision::BF16, false, false, false, &BoundExpr::Const(16),
         );
 
         // Assert: BF16 writeback should emit VecNarrow (F32 acc -> BF16 store)
@@ -2708,7 +2865,7 @@ mod template_tests {
         // Act: K=32 > cta_k=16, triggers multi-K-tile steady-state loop
         let result = emit_gemm_gpu_pipelined(
             &mut prog, 16, 16, 32, width, a, b, c,
-            16, 16, 16, 16, 16, 16, 2, QuantPrecision::F32, QuantPrecision::F32, QuantPrecision::F32, false, false,
+            16, 16, 16, 16, 16, 16, 2, QuantPrecision::F32, QuantPrecision::F32, QuantPrecision::F32, false, false, false, &BoundExpr::Const(16),
         );
 
         // Assert: multi-tile pipeline should succeed with AsyncWait for overlap
@@ -2785,7 +2942,7 @@ mod template_tests {
         // Act: M=10 with cta_m=8 -> last tile has mi=2; BF16 needs narrowing
         let result = emit_gemm_gpu_tiled_inline(
             &mut prog, 10, 10, 16, width, a, b, c,
-            8, 8, 16, 4, 4, 16, QuantPrecision::BF16, QuantPrecision::BF16, QuantPrecision::BF16, false,
+            8, 8, 16, 4, 4, 16, QuantPrecision::BF16, QuantPrecision::BF16, QuantPrecision::BF16, false, false, &BoundExpr::Const(10),
         );
 
         // Assert: partial tiles with BF16 should produce VecNarrow on writeback
@@ -2880,7 +3037,7 @@ mod template_tests {
         // Act: M=32, cta_m=16, warp_m=8, mma_k=16 — all divide evenly
         let result = emit_gemm_gpu_tiled_inline(
             &mut prog, 32, 32, 32, width, a, b, c,
-            16, 16, 16, 8, 8, 16, QuantPrecision::F32, QuantPrecision::F32, QuantPrecision::F32, false,
+            16, 16, 16, 8, 8, 16, QuantPrecision::F32, QuantPrecision::F32, QuantPrecision::F32, false, false, &BoundExpr::Const(32),
         );
 
         // Assert: exact division means mi/wi/wj always equal full tile size
@@ -2991,7 +3148,7 @@ mod template_tests {
         // Act: pipeline_depth=3 with K=48, cta_k=16 -> 3 K-tiles across 3 stages
         let result = emit_gemm_gpu_pipelined(
             &mut prog, 16, 16, 48, width, a, b, c,
-            16, 16, 16, 16, 16, 16, 3, QuantPrecision::F32, QuantPrecision::F32, QuantPrecision::F32, false, false,
+            16, 16, 16, 16, 16, 16, 3, QuantPrecision::F32, QuantPrecision::F32, QuantPrecision::F32, false, false, false, &BoundExpr::Const(16),
         );
 
         // Assert: 3 stages should allocate 6 SharedMemAlloc (3 for A + 3 for B)
@@ -3138,7 +3295,7 @@ mod template_tests {
         // Act: TMA + multi-K-tile triggers steady-state compute/load overlap
         let result = emit_gemm_gpu_pipelined(
             &mut prog, 16, 16, 32, width, a, b, c,
-            16, 16, 16, 16, 16, 16, 2, QuantPrecision::F32, QuantPrecision::F32, QuantPrecision::F32, false, true,
+            16, 16, 16, 16, 16, 16, 2, QuantPrecision::F32, QuantPrecision::F32, QuantPrecision::F32, false, true, false, &BoundExpr::Const(16),
         );
 
         // Assert: TMA steady-state should emit WarpBarrierWait for synchronization
@@ -3229,7 +3386,7 @@ mod template_tests {
         // Act: M=16, cta_m=16, N=16, cta_n=16 — single CTA covers entire output
         let result = emit_gemm_gpu_tiled_inline(
             &mut prog, 16, 16, 32, width, a, b, c,
-            16, 16, 16, 8, 8, 16, QuantPrecision::F32, QuantPrecision::F32, QuantPrecision::F32, false,
+            16, 16, 16, 8, 8, 16, QuantPrecision::F32, QuantPrecision::F32, QuantPrecision::F32, false, false, &BoundExpr::Const(16),
         );
 
         // Assert: single-CTA should succeed with no partial CTA tiles
@@ -3460,7 +3617,7 @@ mod template_tests {
         // Act: M=1 with cta_m=16 -> mi=1 (partial first CTA tile)
         let result = emit_gemm_gpu_tiled_inline(
             &mut prog, 1, 16, 32, width, a, b, c,
-            16, 16, 16, 1, 1, 16, QuantPrecision::F32, QuantPrecision::F32, QuantPrecision::F32, false,
+            16, 16, 16, 1, 1, 16, QuantPrecision::F32, QuantPrecision::F32, QuantPrecision::F32, false, false, &BoundExpr::Const(1),
         );
 
         // Assert: M=1 GPU GEMV should succeed with partial tile handling
@@ -3588,7 +3745,7 @@ mod template_tests {
         // Act: K=24, mma_k=16 -> partial last inner K step
         let result = emit_gemm_gpu_tiled_inline(
             &mut prog, 16, 16, 24, width, a, b, c,
-            16, 16, 24, 4, 4, 16, QuantPrecision::F32, QuantPrecision::F32, QuantPrecision::F32, false,
+            16, 16, 24, 4, 4, 16, QuantPrecision::F32, QuantPrecision::F32, QuantPrecision::F32, false, false, &BoundExpr::Const(16),
         );
 
         // Assert: partial K steps should be handled correctly
@@ -3658,7 +3815,7 @@ mod template_tests {
         // First CTA tile: mi=8, nj=8 (full). Second CTA tile: mi=2, nj=2 (partial)
         let result = emit_gemm_gpu_tiled_inline(
             &mut prog, 10, 10, 16, width, a, b, c,
-            8, 8, 16, 4, 4, 16, QuantPrecision::BF16, QuantPrecision::BF16, QuantPrecision::BF16, false,
+            8, 8, 16, 4, 4, 16, QuantPrecision::BF16, QuantPrecision::BF16, QuantPrecision::BF16, false, false, &BoundExpr::Const(10),
         );
 
         // Assert: partial tiles with BF16 should produce VecNarrow on writeback
