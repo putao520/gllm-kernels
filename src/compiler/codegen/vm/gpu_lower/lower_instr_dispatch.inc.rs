@@ -3678,12 +3678,279 @@ Ok(())
     }
 
     fn lower_q3_k_decode_step_gpu(&mut self, instr: &VmInstr, alloc: &RegAllocation) -> Result<(), CompilerError> {
+        // GPU SIMT per-thread decode of one Q3_K element.
+        //
+        // Q3_K 3-bit decode (matches x86 q3k_decode_step_native helper in
+        // src/asm/x86_64/quant_gemv.rs:1909). Each thread decodes element
+        //   global_elem = lane_offset + tid
+        // and writes one f32 to dst (per-thread scalar; GPU SIMT model).
+        //
+        // Layout (per 256-element super-block):
+        //   hmask[32] @ block_base + hmask_offset  (1 bit / elem, packed 32 bytes → 256 bits)
+        //   qs[64]    @ block_base + qs_offset      (2 bits / elem, packed 64 bytes)
+        //   scales    @ block_base + 96             (12 bytes Q3KExtended packed 6-bit)
+        //   d (f16)   @ block_base + 108            (super-block scale, pre-loaded into d_vreg)
+        //
+        // Index decomposition (helper lines 1953-1956):
+        //   seg = global_elem / 128        (0..1 for 256-elem block)
+        //   j   = (global_elem % 128) / 32 (0..3)
+        //   run = (global_elem % 32) / 16  (0..1)
+        //   l   = global_elem % 16         (0..15)
+        //
+        // qs_val     = (qs[seg*32 + run*16 + l] >> (j*2)) & 3
+        // hmask_bit  = (hm[run*16 + l] & (1 << (seg*4 + j))) != 0
+        // bias       = hmask_bit ? 0 : 4
+        // scale_idx  = seg*8 + j*2 + run   (0..15)
+        // scale      = Q3KExtended_unpack(scale_idx)   (unsigned 6-bit, 0..63)
+        // dl         = d * (scale - 32.0)
+        // out        = (qs_val - bias) * dl
+        //
+        // Q3KExtended scale unpack (helper lines 1927-1946):
+        //   bp = block_base + 96
+        //   a0 = bp[0..4], a1 = bp[4..8], tmp = bp[8..12]  (each a u32)
+        //   aux_0 = (a0 & 0x0f0f0f0f) | (((tmp >> 0) & 0x03030303) << 4)
+        //   aux_1 = (a1 & 0x0f0f0f0f) | (((tmp >> 2) & 0x03030303) << 4)
+        //   aux_2 = ((a0 >> 4) & 0x0f0f0f0f) | (((tmp >> 4) & 0x03030303) << 4)
+        //   aux_3 = ((a1 >> 4) & 0x0f0f0f0f) | (((tmp >> 6) & 0x03030303) << 4)
+        //   scales_arr[s] = byte k of aux_b, where b = s>>2, k = s&3   (each byte is 0..63 unsigned)
+        //
+        // Per-thread: we only need scales_arr[scale_idx] = byte k of aux_b.
+        // Pull just the two source bytes (a_b's byte k + tmp's byte k) for this thread's b.
         match instr {
-            VmInstr::Q3KDecodeStep { .. } => {
+            VmInstr::Q3KDecodeStep { dst, block_base, lane_offset, d_vreg, qs_offset, hmask_offset, lanes: _, width } => {
+                let _ = width;
+                let d_out = self.reg_name_with_kind(*dst, alloc);
+                let bb = self.reg_name_with_kind(*block_base, alloc);
+                let lo = self.reg_name_with_kind(*lane_offset, alloc);
+                let dv = self.reg_name_with_kind(*d_vreg, alloc);
+                let qs_off = *qs_offset as i64;
+                let hm_off = *hmask_offset as i64;
 
-                Err(CompilerError::CodegenViolation(
-                    "Q3KDecodeStep GPU: not yet implemented".into()
-                ))
+                match self.dialect {
+                    GpuDialect::Ptx { .. } => {
+                        // Branch labels for the b∈{0,1,2,3} scale-extract switch.
+                        let b1 = self.next_skip_label();
+                        let b2 = self.next_skip_label();
+                        let b3 = self.next_skip_label();
+                        let bdone = self.next_skip_label();
+                        self.emit_line("{");
+                        // ── Registers ──
+                        self.emit_line("  .reg .u32 %r_tid, %r_ge, %r_rem128, %r_rem32;");
+                        self.emit_line("  .reg .u32 %r_seg, %r_j, %r_run, %r_l, %r_sh, %r_m, %r_sidx, %r_b, %r_k;");
+                        self.emit_line("  .reg .u32 %r_qs, %r_hm, %r_ab, %r_tb, %r_aux, %r_sc;");
+                        self.emit_line("  .reg .u32 %r_bias, %r_qsv;");
+                        self.emit_line("  .reg .u64 %rd_q, %rd_h, %rd_abp, %rd_tbp;");
+                        self.emit_line("  .reg .pred %p_hm, %p_b1, %p_b2, %p_b3;");
+                        self.emit_line("  .reg .f32 %f_dl, %f_sc, %f_qsv, %f_bias;");
+
+                        // global_elem = lane_offset + tid
+                        self.emit_line("  mov.u32 %r_tid, %tid.x;");
+                        self.emit_line(&format!("  add.u32 %r_ge, {lo}, %r_tid;"));
+                        // seg = ge >> 7 ; rem128 = ge & 0x7F
+                        self.emit_line("  shr.u32 %r_seg, %r_ge, 7;");
+                        self.emit_line("  and.b32 %r_rem128, %r_ge, 0x7F;");
+                        // j = rem128 >> 5 ; rem32 = rem128 & 0x1F
+                        self.emit_line("  shr.u32 %r_j, %r_rem128, 5;");
+                        self.emit_line("  and.b32 %r_rem32, %r_rem128, 0x1F;");
+                        // run = rem32 >> 4 ; l = rem32 & 0xF
+                        self.emit_line("  shr.u32 %r_run, %r_rem32, 4;");
+                        self.emit_line("  and.b32 %r_l, %r_rem32, 0xF;");
+
+                        // ── qs_val = (qs[seg*32 + run*16 + l] >> (j*2)) & 3 ──
+                        // addr = bb + qs_off + seg*32 + run*16 + l
+                        //   = bb + qs_off + (seg<<5) + (run<<4) + l
+                        self.emit_line("  shl.b32 %r_qsv, %r_seg, 5;");
+                        self.emit_line("  add.u32 %r_qsv, %r_qsv, %r_run;");
+                        self.emit_line("  shl.b32 %r_qsv, %r_qsv, 4;");
+                        self.emit_line("  add.u32 %r_qsv, %r_qsv, %r_l;");
+                        self.emit_line(&format!("  cvt.u64.u32 %rd_q, %r_qsv;"));
+                        self.emit_line(&format!("  add.u64 %rd_q, %rd_q, {bb};"));
+                        if qs_off != 0 {
+                            self.emit_line(&format!("  add.u64 %rd_q, %rd_q, {};", qs_off));
+                        }
+                        self.emit_line("  ld.global.u8 %r_qs, [%rd_q];");
+                        // shift = j*2 ; qs_val = (byte >> shift) & 3
+                        self.emit_line("  shl.b32 %r_sh, %r_j, 1;");
+                        self.emit_line("  shr.u32 %r_qs, %r_qs, %r_sh;");
+                        self.emit_line("  and.b32 %r_qs, %r_qs, 3;");
+
+                        // ── hmask_bit = (hm[run*16 + l] & (1 << (seg*4 + j))) != 0 ──
+                        // hm addr = bb + hm_off + run*16 + l
+                        self.emit_line("  shl.b32 %r_hm, %r_run, 4;");
+                        self.emit_line("  add.u32 %r_hm, %r_hm, %r_l;");
+                        self.emit_line(&format!("  cvt.u64.u32 %rd_h, %r_hm;"));
+                        self.emit_line(&format!("  add.u64 %rd_h, %rd_h, {bb};"));
+                        if hm_off != 0 {
+                            self.emit_line(&format!("  add.u64 %rd_h, %rd_h, {};", hm_off));
+                        }
+                        self.emit_line("  ld.global.u8 %r_hm, [%rd_h];");
+                        // m = 1 << (seg*4 + j) = 1 << ((seg<<2) + j)
+                        self.emit_line("  shl.b32 %r_m, %r_seg, 2;");
+                        self.emit_line("  add.u32 %r_m, %r_m, %r_j;");
+                        self.emit_line("  mov.u32 %r_aux, 1;");
+                        self.emit_line("  shl.b32 %r_m, %r_aux, %r_m;");
+                        self.emit_line("  and.b32 %r_aux, %r_hm, %r_m;");
+                        self.emit_line("  setp.ne.u32 %p_hm, %r_aux, 0;");
+                        // bias = hmask_bit ? 0 : 4  (helper: bias = hmask_bit ? 0i8 : 4i8)
+                        self.emit_line("  selp.u32 %r_bias, 0, 4, %p_hm;");
+
+                        // ── scale_idx = seg*8 + j*2 + run ; b = sidx>>2 ; k = sidx&3 ──
+                        self.emit_line("  shl.b32 %r_sidx, %r_seg, 3;");
+                        self.emit_line("  shl.b32 %r_aux, %r_j, 1;");
+                        self.emit_line("  add.u32 %r_sidx, %r_sidx, %r_aux;");
+                        self.emit_line("  add.u32 %r_sidx, %r_sidx, %r_run;");
+                        self.emit_line("  shr.u32 %r_b, %r_sidx, 2;");
+                        self.emit_line("  and.b32 %r_k, %r_sidx, 3;");
+
+                        // Load the two source bytes for this thread's (b, k):
+                        //   a_byte : bp[0+k] if b∈{0,2},  bp[4+k] if b∈{1,3}
+                        //   tmp_byte : bp[8+k] (all b)
+                        // Compute byte addresses via 64-bit base + offset.
+                        // %rd_abp = bb + 96 + (b∈{1,3} ? 4 : 0) + k
+                        // %rd_tbp = bb + 96 + 8 + k
+                        self.emit_line("  cvt.u64.u32 %rd_abp, %r_k;");
+                        self.emit_line(&format!("  add.u64 %rd_abp, %rd_abp, {bb};"));
+                        self.emit_line("  add.u64 %rd_abp, %rd_abp, 96;");
+                        // a-base offset: b==1 or b==3 → +4
+                        self.emit_line("  setp.eq.u32 %p_b1, %r_b, 1;");
+                        self.emit_line("  setp.eq.u32 %p_b2, %r_b, 3;");
+                        self.emit_line("  or.pred %p_b3, %p_b1, %p_b2;");
+                        self.emit_line("  @%p_b3 add.u64 %rd_abp, %rd_abp, 4;");
+                        self.emit_line("  ld.global.u8 %r_ab, [%rd_abp];");
+                        // tmp byte: bp[8+k]
+                        self.emit_line("  cvt.u64.u32 %rd_tbp, %r_k;");
+                        self.emit_line(&format!("  add.u64 %rd_tbp, %rd_tbp, {bb};"));
+                        self.emit_line("  add.u64 %rd_tbp, %rd_tbp, 104;"); // 96 + 8
+                        self.emit_line("  ld.global.u8 %r_tb, [%rd_tbp];");
+
+                        // ── Assemble aux byte per b (shift on tmp depends on b) ──
+                        //   b=0: aux = (a0_k & 0x0F) | ((tmp_k & 0x03) << 4)
+                        //   b=1: aux = (a1_k & 0x0F) | (((tmp_k >> 2) & 0x03) << 4)
+                        //   b=2: aux = ((a0_k >> 4) & 0x0F) | (((tmp_k >> 4) & 0x03) << 4)
+                        //   b=3: aux = ((a1_k >> 4) & 0x0F) | (((tmp_k >> 6) & 0x03) << 4)
+                        // Branch to the matching case.
+                        self.emit_line(&format!("  setp.eq.u32 %p_b1, %r_b, 1; @%p_b1 bra B1_{b1};"));
+                        self.emit_line(&format!("  setp.eq.u32 %p_b2, %r_b, 2; @%p_b2 bra B2_{b2};"));
+                        self.emit_line(&format!("  setp.eq.u32 %p_b3, %r_b, 3; @%p_b3 bra B3_{b3};"));
+                        // b==0 (fallthrough)
+                        self.emit_line("  and.b32 %r_aux, %r_ab, 0xF;");
+                        self.emit_line("  and.b32 %r_tb, %r_tb, 0x3;");
+                        self.emit_line("  shl.b32 %r_tb, %r_tb, 4;");
+                        self.emit_line("  or.b32 %r_aux, %r_aux, %r_tb;");
+                        self.emit_line(&format!("  bra BDONE_{bdone};"));
+                        // b==1
+                        self.emit_line(&format!("B1_{b1}:"));
+                        self.emit_line("  and.b32 %r_aux, %r_ab, 0xF;");
+                        self.emit_line("  shr.u32 %r_tb, %r_tb, 2;");
+                        self.emit_line("  and.b32 %r_tb, %r_tb, 0x3;");
+                        self.emit_line("  shl.b32 %r_tb, %r_tb, 4;");
+                        self.emit_line("  or.b32 %r_aux, %r_aux, %r_tb;");
+                        self.emit_line(&format!("  bra BDONE_{bdone};"));
+                        // b==2
+                        self.emit_line(&format!("B2_{b2}:"));
+                        self.emit_line("  shr.u32 %r_aux, %r_ab, 4;");
+                        self.emit_line("  and.b32 %r_aux, %r_aux, 0xF;");
+                        self.emit_line("  shr.u32 %r_tb, %r_tb, 4;");
+                        self.emit_line("  and.b32 %r_tb, %r_tb, 0x3;");
+                        self.emit_line("  shl.b32 %r_tb, %r_tb, 4;");
+                        self.emit_line("  or.b32 %r_aux, %r_aux, %r_tb;");
+                        self.emit_line(&format!("  bra BDONE_{bdone};"));
+                        // b==3
+                        self.emit_line(&format!("B3_{b3}:"));
+                        self.emit_line("  shr.u32 %r_aux, %r_ab, 4;");
+                        self.emit_line("  and.b32 %r_aux, %r_aux, 0xF;");
+                        self.emit_line("  shr.u32 %r_tb, %r_tb, 6;");
+                        self.emit_line("  and.b32 %r_tb, %r_tb, 0x3;");
+                        self.emit_line("  shl.b32 %r_tb, %r_tb, 4;");
+                        self.emit_line("  or.b32 %r_aux, %r_aux, %r_tb;");
+                        self.emit_line(&format!("BDONE_{bdone}:"));
+                        // scale = aux & 0x3F  (unsigned 6-bit)
+                        self.emit_line("  and.b32 %r_sc, %r_aux, 0x3F;");
+
+                        // ── dl = d * (scale - 32.0) ──
+                        // 0x42000000 = 32.0f (IEEE-754 single)
+                        self.emit_line(&format!("  cvt.rn.f32.s32 %f_sc, %r_sc;"));
+                        self.emit_line("  mov.f32 %f_dl, 0x42000000;");
+                        self.emit_line("  sub.f32 %f_sc, %f_sc, %f_dl;"); // scale - 32.0
+                        self.emit_line(&format!("  mul.f32 %f_dl, {dv}, %f_sc;")); // d * (scale - 32)
+
+                        // ── out = (qs_val - bias) * dl ──
+                        // (qs_val - bias) as f32: bias ∈ {0, 4}
+                        self.emit_line(&format!("  cvt.rn.f32.s32 %f_qsv, %r_qs;"));
+                        self.emit_line(&format!("  cvt.rn.f32.s32 %f_bias, %r_bias;"));
+                        self.emit_line("  sub.f32 %f_qsv, %f_qsv, %f_bias;");
+                        self.emit_line(&format!("  mul.f32 {d_out}, %f_qsv, %f_dl;"));
+                        self.emit_line("}");
+                    }
+                    GpuDialect::Hip { .. } => {
+                        // HIP: per-thread scalar decode mirroring the PTX / helper logic.
+                        self.emit_line("{");
+                        self.emit_line(&format!("  const unsigned char* _bb = (const unsigned char*)({bb});"));
+                        self.emit_line(&format!("  unsigned _ge = (unsigned)({lo}) + (unsigned)threadIdx.x;"));
+                        self.emit_line("  unsigned _seg = _ge >> 7;");
+                        self.emit_line("  unsigned _rem128 = _ge & 0x7F;");
+                        self.emit_line("  unsigned _j = _rem128 >> 5;");
+                        self.emit_line("  unsigned _rem32 = _rem128 & 0x1F;");
+                        self.emit_line("  unsigned _run = _rem32 >> 4;");
+                        self.emit_line("  unsigned _l = _rem32 & 0xF;");
+                        // qs_val
+                        self.emit_line(&format!("  unsigned _qbyte = (unsigned)_bb[{qs_off} + (_seg<<5) + (_run<<4) + _l];"));
+                        self.emit_line("  unsigned _qs = (_qbyte >> (_j*2)) & 3u;");
+                        // hmask_bit
+                        self.emit_line(&format!("  unsigned _hbyte = (unsigned)_bb[{hm_off} + (_run<<4) + _l];"));
+                        self.emit_line("  unsigned _m = 1u << (_seg*4 + _j);");
+                        self.emit_line("  int _bias = (_hbyte & _m) ? 0 : 4;");
+                        // scale_idx → b,k
+                        self.emit_line("  unsigned _sidx = _seg*8 + _j*2 + _run;");
+                        self.emit_line("  unsigned _b = _sidx >> 2;");
+                        self.emit_line("  unsigned _k = _sidx & 3u;");
+                        // a byte + tmp byte
+                        self.emit_line("  unsigned _abase_off = (_b == 1 || _b == 3) ? (4u + _k) : (0u + _k);");
+                        self.emit_line("  unsigned _a = (unsigned)_bb[96 + _abase_off];");
+                        self.emit_line("  unsigned _t = (unsigned)_bb[96 + 8 + _k];");
+                        self.emit_line("  unsigned _aux;");
+                        self.emit_line("  if (_b == 0) { _aux = (_a & 0xFu) | ((_t & 0x3u) << 4); }");
+                        self.emit_line("  else if (_b == 1) { _aux = (_a & 0xFu) | (((_t >> 2) & 0x3u) << 4); }");
+                        self.emit_line("  else if (_b == 2) { _aux = ((_a >> 4) & 0xFu) | (((_t >> 4) & 0x3u) << 4); }");
+                        self.emit_line("  else { _aux = ((_a >> 4) & 0xFu) | (((_t >> 6) & 0x3u) << 4); }");
+                        self.emit_line("  unsigned _sc = _aux & 0x3Fu;");
+                        self.emit_line(&format!("  float _dl = (float)({dv}) * ((float)_sc - 32.0f);"));
+                        self.emit_line(&format!("  {d_out} = ((float)_qs - (float)_bias) * _dl;"));
+                        self.emit_line("}");
+                    }
+                    GpuDialect::Metal { .. } => {
+                        self.emit_line("{");
+                        self.emit_line(&format!("  const device unsigned char* _bb = (const device unsigned char*)({bb});"));
+                        self.emit_line(&format!("  unsigned _ge = (unsigned)({lo}) + (unsigned)thread_position_in_threadgroup.x;"));
+                        self.emit_line("  unsigned _seg = _ge >> 7;");
+                        self.emit_line("  unsigned _rem128 = _ge & 0x7F;");
+                        self.emit_line("  unsigned _j = _rem128 >> 5;");
+                        self.emit_line("  unsigned _rem32 = _rem128 & 0x1F;");
+                        self.emit_line("  unsigned _run = _rem32 >> 4;");
+                        self.emit_line("  unsigned _l = _rem32 & 0xF;");
+                        self.emit_line(&format!("  unsigned _qbyte = (unsigned)_bb[{qs_off} + (_seg<<5) + (_run<<4) + _l];"));
+                        self.emit_line("  unsigned _qs = (_qbyte >> (_j*2)) & 3u;");
+                        self.emit_line(&format!("  unsigned _hbyte = (unsigned)_bb[{hm_off} + (_run<<4) + _l];"));
+                        self.emit_line("  unsigned _m = 1u << (_seg*4 + _j);");
+                        self.emit_line("  int _bias = (_hbyte & _m) ? 0 : 4;");
+                        self.emit_line("  unsigned _sidx = _seg*8 + _j*2 + _run;");
+                        self.emit_line("  unsigned _b = _sidx >> 2;");
+                        self.emit_line("  unsigned _k = _sidx & 3u;");
+                        self.emit_line("  unsigned _abase_off = (_b == 1 || _b == 3) ? (4u + _k) : (0u + _k);");
+                        self.emit_line("  unsigned _a = (unsigned)_bb[96 + _abase_off];");
+                        self.emit_line("  unsigned _t = (unsigned)_bb[96 + 8 + _k];");
+                        self.emit_line("  unsigned _aux;");
+                        self.emit_line("  if (_b == 0) { _aux = (_a & 0xFu) | ((_t & 0x3u) << 4); }");
+                        self.emit_line("  else if (_b == 1) { _aux = (_a & 0xFu) | (((_t >> 2) & 0x3u) << 4); }");
+                        self.emit_line("  else if (_b == 2) { _aux = ((_a >> 4) & 0xFu) | (((_t >> 4) & 0x3u) << 4); }");
+                        self.emit_line("  else { _aux = ((_a >> 4) & 0xFu) | (((_t >> 6) & 0x3u) << 4); }");
+                        self.emit_line("  unsigned _sc = _aux & 0x3Fu;");
+                        self.emit_line(&format!("  float _dl = (float)({dv}) * ((float)_sc - 32.0f);"));
+                        self.emit_line(&format!("  {d_out} = ((float)_qs - (float)_bias) * _dl;"));
+                        self.emit_line("}");
+                    }
+                }
+                Ok(())
             }
             _ => Err(CompilerError::CodegenViolation(
                 format!("lower_q3_k_decode_step_gpu: expected VmInstr::Q3KDecodeStep, got {:?}", instr))),
@@ -3691,10 +3958,136 @@ Ok(())
     }
 
     fn lower_gguf_sub_scale_load_gpu(&mut self, instr: &VmInstr, alloc: &RegAllocation) -> Result<(), CompilerError> {
+        // GPU SIMT per-thread model: dst is a single f32 register per thread.
+        // "Broadcast" collapses to writing the scalar — each thread already holds one value.
+        //
+        // GgufSubScaleLoad (Q6_K): load i8 from scales_base + sub_block_idx, sign-extend →
+        //   i32 → f32. NO-HW-DEGRADATION: GPU can do ld.global.s8 (PTX) / signed char cast
+        //   (HIP/Metal). ARCH-JIT-YIELDS: per-thread scalar, PTX instruction sequence.
+        //
+        // GgufKQuantScaleLoad (Q4_K/Q5_K packed 6-bit scale/min): decode packed 6-bit value
+        //   indexed by sub_block_idx (j). Two branches (j<4 / j>=4) × scale/min. x86 reference
+        //   at lower_gguf_k_quant_scale_load_x86. GPU per-thread: compute the one scale this
+        //   thread needs via byte loads + bit ops.
         match instr {
-            VmInstr::GgufSubScaleLoad { .. } | VmInstr::GgufKQuantScaleLoad { .. } => {
-
-                Err(CompilerError::Internal("GgufSubScaleLoad/GgufKQuantScaleLoad: x86-only, not yet implemented for GPU".into()))
+            VmInstr::GgufSubScaleLoad { dst, scales_base, sub_block_idx, width } => {
+                let _ = width; // GPU scalar-per-thread: width 无 broadcast 语义
+                let d = self.reg_name_with_kind(*dst, alloc);
+                let sb = self.reg_name_with_kind(*scales_base, alloc);
+                let idx = self.reg_name_with_kind(*sub_block_idx, alloc);
+                match self.dialect {
+                    GpuDialect::Ptx { .. } => {
+                        // PTX: [reg+reg] 非法 → 计算 64-bit 地址到 %rd_addr, ld.global.s8 符号扩展到 s32
+                        self.emit_line("{");
+                        self.emit_line("  .reg .u64 %rd_scaddr;");
+                        self.emit_line(&format!("  cvt.u64.u32 %rd_scaddr, {idx};"));
+                        self.emit_line(&format!("  add.u64 %rd_scaddr, %rd_scaddr, {sb};"));
+                        self.emit_line(&format!("  ld.global.s8 %rs0, [%rd_scaddr];"));
+                        self.emit_line(&format!("  cvt.rn.f32.s32 {d}, %rs0;"));
+                        self.emit_line("}");
+                    }
+                    GpuDialect::Hip { .. } => {
+                        self.emit_line(&format!("{d} = (float)(*((signed char*)({sb} + ({idx})));"));
+                    }
+                    GpuDialect::Metal { .. } => {
+                        self.emit_line(&format!("{d} = (float)(*((device signed char*)({sb} + ({idx})));"));
+                    }
+                }
+                Ok(())
+            }
+            VmInstr::GgufKQuantScaleLoad { dst, scales_base, sub_block_idx, scales_count: _, is_q3k_extended: _, is_min, width } => {
+                let _ = width; // GPU scalar-per-thread
+                let d = self.reg_name_with_kind(*dst, alloc);
+                let sb = self.reg_name_with_kind(*scales_base, alloc);
+                let idx = self.reg_name_with_kind(*sub_block_idx, alloc);
+                // Packed 6-bit decode (x86 ref: lower_gguf_k_quant_scale_load_x86):
+                //   scale (is_min=false): j<4  → sc = scales[j] & 0x3F
+                //                         j>=4 → sc = (scales[j+4] & 0x0F) | ((scales[j-4] >> 6) << 4)
+                //   min   (is_min=true):  j<4  → m  = scales[j+4] & 0x3F
+                //                         j>=4 → m  = (scales[j+4] >> 4) | ((scales[j] >> 6) << 4)
+                // Result is unsigned 6-bit (0..63) → f32 (no sign, no -32 offset here).
+                let lt4_skip = self.next_skip_label();
+                let done_label = self.next_skip_label();
+                match self.dialect {
+                    GpuDialect::Ptx { .. } => {
+                        // Registers: %rd_a = scales_base + idx; %rd_b = scales_base + idx±4
+                        // %r_b0/%r_b1 = two loaded bytes; %r_lo/%r_hi/%r_val = assembled 6-bit
+                        self.emit_line("{");
+                        self.emit_line("  .reg .u64 %rd_a, %rd_b;");
+                        self.emit_line("  .reg .u32 %r_b0, %r_b1, %r_lo, %r_hi, %r_val;");
+                        self.emit_line("  .reg .pred %p_lt4;");
+                        // %rd_a = sb + idx
+                        self.emit_line(&format!("  cvt.u64.u32 %rd_a, {idx};"));
+                        self.emit_line(&format!("  add.u64 %rd_a, %rd_a, {sb};"));
+                        // branch on idx < 4
+                        self.emit_line(&format!("  setp.lt.u32 %p_lt4, {idx}, 4;"));
+                        self.emit_line(&format!("  @%p_lt4 bra LT4_{lt4_skip};"));
+                        // ── idx >= 4 path ──
+                        if *is_min {
+                            // m = (scales[j+4] >> 4) | ((scales[j] >> 6) << 4)
+                            // b0 = scales[idx+4] (>>4 &0xF), b1 = scales[idx] (>>6 &0x3 <<4)
+                            self.emit_line("  add.u64 %rd_b, %rd_a, 4;");
+                            self.emit_line("  ld.global.u8 %r_b0, [%rd_b];");
+                            self.emit_line("  shr.u32 %r_lo, %r_b0, 4;");
+                            self.emit_line("  and.b32 %r_lo, %r_lo, 0xF;");
+                            self.emit_line("  ld.global.u8 %r_b1, [%rd_a];");
+                            self.emit_line("  shr.u32 %r_hi, %r_b1, 6;");
+                            self.emit_line("  and.b32 %r_hi, %r_hi, 0x3;");
+                            self.emit_line("  shl.b32 %r_hi, %r_hi, 4;");
+                            self.emit_line("  or.b32 %r_val, %r_lo, %r_hi;");
+                        } else {
+                            // sc = (scales[j+4] & 0x0F) | ((scales[j-4] >> 6) << 4)
+                            self.emit_line("  add.u64 %rd_b, %rd_a, 4;");
+                            self.emit_line("  ld.global.u8 %r_b0, [%rd_b];");
+                            self.emit_line("  and.b32 %r_lo, %r_b0, 0xF;");
+                            self.emit_line("  sub.u64 %rd_b, %rd_a, 4;");
+                            self.emit_line("  ld.global.u8 %r_b1, [%rd_b];");
+                            self.emit_line("  shr.u32 %r_hi, %r_b1, 6;");
+                            self.emit_line("  and.b32 %r_hi, %r_hi, 0x3;");
+                            self.emit_line("  shl.b32 %r_hi, %r_hi, 4;");
+                            self.emit_line("  or.b32 %r_val, %r_lo, %r_hi;");
+                        }
+                        self.emit_line(&format!("  bra DONE_{done_label};"));
+                        // ── idx < 4 path ──
+                        self.emit_line(&format!("LT4_{lt4_skip}:"));
+                        if *is_min {
+                            // m = scales[j+4] & 0x3F
+                            self.emit_line("  add.u64 %rd_b, %rd_a, 4;");
+                            self.emit_line("  ld.global.u8 %r_val, [%rd_b];");
+                            self.emit_line("  and.b32 %r_val, %r_val, 0x3F;");
+                        } else {
+                            // sc = scales[j] & 0x3F
+                            self.emit_line("  ld.global.u8 %r_val, [%rd_a];");
+                            self.emit_line("  and.b32 %r_val, %r_val, 0x3F;");
+                        }
+                        self.emit_line(&format!("DONE_{done_label}:"));
+                        self.emit_line(&format!("  cvt.rn.f32.s32 {d}, %r_val;"));
+                        self.emit_line("}");
+                    }
+                    GpuDialect::Hip { .. } => {
+                        let (ge4, lt4) = if *is_min {
+                            (format!("(((unsigned)(((signed char*)({sb}))[{idx}+4]) >> 4) & 0xF) | ((((unsigned)(((signed char*)({sb}))[{idx}]) >> 6) & 0x3) << 4)"),
+                             format!("((unsigned)(((signed char*)({sb}))[{idx}+4]) & 0x3F)"))
+                        } else {
+                            (format!("(((unsigned)(((signed char*)({sb}))[{idx}+4]) & 0xF) | ((((unsigned)(((signed char*)({sb}))[{idx}-4]) >> 6) & 0x3) << 4)"),
+                             format!("((unsigned)(((signed char*)({sb}))[{idx}]) & 0x3F)"))
+                        };
+                        self.emit_line(&format!("{{ unsigned _j = (unsigned)({idx}); unsigned _v = (_j < 4) ? ({lt4}) : ({ge4}); {d} = (float)_v; }}",
+                            idx = idx, lt4 = lt4, ge4 = ge4, d = d));
+                    }
+                    GpuDialect::Metal { .. } => {
+                        let (ge4, lt4) = if *is_min {
+                            (format!("(((unsigned)(((device signed char*)({sb}))[{idx}+4]) >> 4) & 0xF) | ((((unsigned)(((device signed char*)({sb}))[{idx}]) >> 6) & 0x3) << 4)"),
+                             format!("((unsigned)(((device signed char*)({sb}))[{idx}+4]) & 0x3F)"))
+                        } else {
+                            (format!("(((unsigned)(((device signed char*)({sb}))[{idx}+4]) & 0xF) | ((((unsigned)(((device signed char*)({sb}))[{idx}-4]) >> 6) & 0x3) << 4)"),
+                             format!("((unsigned)(((device signed char*)({sb}))[{idx}]) & 0x3F)"))
+                        };
+                        self.emit_line(&format!("{{ unsigned _j = (unsigned)({idx}); unsigned _v = (_j < 4) ? ({lt4}) : ({ge4}); {d} = (float)_v; }}",
+                            idx = idx, lt4 = lt4, ge4 = ge4, d = d));
+                    }
+                }
+                Ok(())
             }
             _ => Err(CompilerError::CodegenViolation(
                 format!("lower_gguf_sub_scale_load_gpu: expected VmInstr::GgufSubScaleLoad, got {:?}", instr))),

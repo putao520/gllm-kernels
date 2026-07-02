@@ -1604,4 +1604,132 @@ mod tests {
         assert!(!ir.contains("wmma") && !ir.contains("mma"), "SM61 should not emit wmma/mma: {ir}");
         assert!(!ir.contains("cp.async"), "SM61 should not emit cp.async: {ir}");
     }
+
+    // ── BCE-20260703-GPU-Q3K-SUBSCALE: GPU PTX regression tests ──
+    // These instrs previously returned Err ("not yet implemented"); they must now
+    // lower to real PTX/HIP/Metal code (NO-SILENT-FALLBACK + NO-HW-DEGRADATION).
+
+    /// Build a RegAllocation with mixed Gpr (Ptr/Scalar VRegs) and Vec (Vec VRegs).
+    fn gpu_mixed_alloc(gprs: &[u32], vecs: &[u32]) -> RegAllocation {
+        use super::super::isa_profile::{PhysReg, PhysGpr, PhysVec};
+        let mut mapping = std::collections::HashMap::new();
+        for (i, id) in gprs.iter().enumerate() {
+            mapping.insert(VRegId(*id), PhysReg::Gpr(PhysGpr(i as u8)));
+        }
+        for (i, id) in vecs.iter().enumerate() {
+            mapping.insert(VRegId(*id), PhysReg::Vec(PhysVec(i as u8)));
+        }
+        RegAllocation { mapping, spills: vec![], callee_saved_used: vec![] }
+    }
+
+    #[test]
+    fn test_ptx_q3k_decode_step_lowers() {
+        // Q3KDecodeStep must lower to PTX (was Err before). Verify the key PTX
+        // instructions for the 3-bit decode (qs extract, hmask bias, Q3KExtended
+        // scale unpack, dl = d*(scale-32), out = (qs-bias)*dl).
+        let mut l = GpuLower::new(GpuDialect::Ptx { sm_version: 80 });
+        let mut prog = VmProgram::new();
+        let block_base = prog.alloc_vreg(VRegKind::Ptr, SimdWidth::Scalar);
+        let lane_offset = prog.alloc_vreg(VRegKind::Scalar, SimdWidth::Scalar);
+        let d_vreg = prog.alloc_vreg(VRegKind::Vec, SimdWidth::Scalar);
+        let dst = prog.alloc_vreg(VRegKind::Vec, SimdWidth::Scalar);
+        l.set_vreg_kind_map(&prog);
+        l.emit_prologue(&empty_frame(), &empty_alloc(), prog.vreg_counts_by_kind()).unwrap();
+        let alloc = gpu_mixed_alloc(&[block_base.0, lane_offset.0], &[d_vreg.0, dst.0]);
+        let result = l.lower_instr(&VmInstr::Q3KDecodeStep {
+            dst,
+            block_base,
+            lane_offset,
+            d_vreg,
+            qs_offset: 32,
+            hmask_offset: 0,
+            lanes: 8,
+            width: SimdWidth::Scalar,
+        }, &alloc);
+        assert!(result.is_ok(), "Q3KDecodeStep GPU PTX must lower (was Err): {:?}", result);
+        l.emit_epilogue(&empty_frame(), &alloc).unwrap();
+        let ir = l.finalize().unwrap();
+        // qs byte load + 2-bit extract
+        assert!(ir.contains("ld.global.u8"), "Q3K PTX must load qs/hmask/scale bytes: {ir}");
+        assert!(ir.contains("shr.u32"), "Q3K PTX must shift for qs bit extract: {ir}");
+        // hmask bias via selp
+        assert!(ir.contains("selp.u32"), "Q3K PTX must select bias via selp: {ir}");
+        // scale - 32.0 (0x42000000 = 32.0f)
+        assert!(ir.contains("0x42000000"), "Q3K PTX must use 32.0f constant: {ir}");
+        assert!(ir.contains("sub.f32"), "Q3K PTX must subtract 32.0 from scale: {ir}");
+        // final mul: out = (qs-bias) * dl
+        assert!(ir.contains("mul.f32"), "Q3K PTX must multiply to produce output: {ir}");
+        // Q3KExtended scale branch labels present
+        assert!(ir.contains("B1_") && ir.contains("B2_") && ir.contains("B3_"),
+            "Q3K PTX must have b∈{{1,2,3}} scale-extract branches: {ir}");
+    }
+
+    #[test]
+    fn test_ptx_gguf_sub_scale_load_lowers() {
+        // GgufSubScaleLoad (Q6_K i8 scale) must lower to PTX ld.global.s8 + cvt.
+        let mut l = GpuLower::new(GpuDialect::Ptx { sm_version: 80 });
+        let mut prog = VmProgram::new();
+        let scales_base = prog.alloc_vreg(VRegKind::Ptr, SimdWidth::Scalar);
+        let sub_block_idx = prog.alloc_vreg(VRegKind::Scalar, SimdWidth::Scalar);
+        let dst = prog.alloc_vreg(VRegKind::Vec, SimdWidth::Scalar);
+        l.set_vreg_kind_map(&prog);
+        l.emit_prologue(&empty_frame(), &empty_alloc(), prog.vreg_counts_by_kind()).unwrap();
+        let alloc = gpu_mixed_alloc(&[scales_base.0, sub_block_idx.0], &[dst.0]);
+        let result = l.lower_instr(&VmInstr::GgufSubScaleLoad {
+            dst, scales_base, sub_block_idx, width: SimdWidth::Scalar,
+        }, &alloc);
+        assert!(result.is_ok(), "GgufSubScaleLoad GPU PTX must lower (was Err): {:?}", result);
+        l.emit_epilogue(&empty_frame(), &alloc).unwrap();
+        let ir = l.finalize().unwrap();
+        assert!(ir.contains("ld.global.s8"), "GgufSubScaleLoad PTX must sign-extend via ld.global.s8: {ir}");
+        assert!(ir.contains("cvt.rn.f32.s32"), "GgufSubScaleLoad PTX must cvt s8→f32: {ir}");
+    }
+
+    #[test]
+    fn test_ptx_gguf_k_quant_scale_load_lowers() {
+        // GgufKQuantScaleLoad (Q4_K/Q5_K packed 6-bit) must lower to PTX.
+        let mut l = GpuLower::new(GpuDialect::Ptx { sm_version: 80 });
+        let mut prog = VmProgram::new();
+        let scales_base = prog.alloc_vreg(VRegKind::Ptr, SimdWidth::Scalar);
+        let sub_block_idx = prog.alloc_vreg(VRegKind::Scalar, SimdWidth::Scalar);
+        let dst = prog.alloc_vreg(VRegKind::Vec, SimdWidth::Scalar);
+        l.set_vreg_kind_map(&prog);
+        l.emit_prologue(&empty_frame(), &empty_alloc(), prog.vreg_counts_by_kind()).unwrap();
+        let alloc = gpu_mixed_alloc(&[scales_base.0, sub_block_idx.0], &[dst.0]);
+        let result = l.lower_instr(&VmInstr::GgufKQuantScaleLoad {
+            dst, scales_base, sub_block_idx,
+            scales_count: 8, is_q3k_extended: false, is_min: false,
+            width: SimdWidth::Scalar,
+        }, &alloc);
+        assert!(result.is_ok(), "GgufKQuantScaleLoad GPU PTX must lower (was Err): {:?}", result);
+        l.emit_epilogue(&empty_frame(), &alloc).unwrap();
+        let ir = l.finalize().unwrap();
+        // j<4 / j>=4 branch
+        assert!(ir.contains("setp.lt.u32"), "GgufKQuantScaleLoad PTX must branch on idx<4: {ir}");
+        assert!(ir.contains("bra LT4_"), "GgufKQuantScaleLoad PTX must have idx<4 path: {ir}");
+        assert!(ir.contains("bra DONE_"), "GgufKQuantScaleLoad PTX must have done label: {ir}");
+        // 6-bit mask
+        assert!(ir.contains("0x3F"), "GgufKQuantScaleLoad PTX must mask 6-bit value: {ir}");
+        assert!(ir.contains("cvt.rn.f32.s32"), "GgufKQuantScaleLoad PTX must cvt to f32: {ir}");
+    }
+
+    #[test]
+    fn test_hip_gguf_sub_scale_load_lowers() {
+        // HIP C++ path for GgufSubScaleLoad.
+        let mut l = GpuLower::new(GpuDialect::Hip { gfx_arch: 908, wave_size: 64 });
+        let mut prog = VmProgram::new();
+        let scales_base = prog.alloc_vreg(VRegKind::Ptr, SimdWidth::Scalar);
+        let sub_block_idx = prog.alloc_vreg(VRegKind::Scalar, SimdWidth::Scalar);
+        let dst = prog.alloc_vreg(VRegKind::Vec, SimdWidth::Scalar);
+        l.set_vreg_kind_map(&prog);
+        l.emit_prologue(&empty_frame(), &empty_alloc(), prog.vreg_counts_by_kind()).unwrap();
+        let alloc = gpu_mixed_alloc(&[scales_base.0, sub_block_idx.0], &[dst.0]);
+        let result = l.lower_instr(&VmInstr::GgufSubScaleLoad {
+            dst, scales_base, sub_block_idx, width: SimdWidth::Scalar,
+        }, &alloc);
+        assert!(result.is_ok(), "GgufSubScaleLoad GPU HIP must lower (was Err): {:?}", result);
+        l.emit_epilogue(&empty_frame(), &alloc).unwrap();
+        let ir = l.finalize().unwrap();
+        assert!(ir.contains("signed char"), "GgufSubScaleLoad HIP must cast via signed char: {ir}");
+    }
 }
