@@ -337,7 +337,16 @@ impl AArch64Lower {
                                     self.emit32(self.enc_add_reg(tmp, xn, off_reg));
                                     self.emit32(self.enc_ld1w_imm(vd, active_pred, tmp));
                                 }
-                                _ => {}
+                                // BCE-20260703-AARCH64-VECLEAK-SILENT: Add/Mul/ScalarVReg 走
+                                // eval_offset_to_tmp 递归求值 (NO-SILENT-FALLBACK, 禁止 _ => {}
+                                // 静默丢弃导致 load 不发射 = 数据损坏)。
+                                // ThreadOffset/ThreadCoord 在 eval_offset_to_tmp 内部返回 Err (GPU-only)。
+                                other => {
+                                    let tmp = 16u8;
+                                    self.eval_offset_to_tmp(other, alloc, tmp)?;
+                                    self.emit32(self.enc_add_reg(tmp, xn, tmp));
+                                    self.emit32(self.enc_ld1w_imm(vd, active_pred, tmp));
+                                }
                             }
                         } else {
                             // NEON path
@@ -356,7 +365,14 @@ impl AArch64Lower {
                                     self.emit32(self.enc_add_reg(tmp, xn, off_reg));
                                     self.emit32(self.enc_ld1_4s(vd, tmp));
                                 }
-                                _ => {}
+                                // BCE-20260703-AARCH64-VECLEAK-SILENT: Add/Mul/ScalarVReg 走
+                                // eval_offset_to_tmp 递归求值 (同 SVE 分支理由)。
+                                other => {
+                                    let tmp = 16u8;
+                                    self.eval_offset_to_tmp(other, alloc, tmp)?;
+                                    self.emit32(self.enc_add_reg(tmp, xn, tmp));
+                                    self.emit32(self.enc_ld1_4s(vd, tmp));
+                                }
                             }
                         }
                     }
@@ -401,7 +417,16 @@ impl AArch64Lower {
                                     self.emit32(self.enc_add_reg(tmp, xn, off_reg));
                                     self.emit32(self.enc_st1w_imm(vs, active_pred, tmp));
                                 }
-                                _ => {}
+                                // BCE-20260703-AARCH64-VECLEAK-SILENT: Add/Mul/ScalarVReg 走
+                                // eval_offset_to_tmp 递归求值 (NO-SILENT-FALLBACK, 禁止 _ => {}
+                                // 静默丢弃导致 store 不发射 = 数据损坏)。
+                                // ThreadOffset/ThreadCoord 在 eval_offset_to_tmp 内部返回 Err (GPU-only)。
+                                other => {
+                                    let tmp = 16u8;
+                                    self.eval_offset_to_tmp(other, alloc, tmp)?;
+                                    self.emit32(self.enc_add_reg(tmp, xn, tmp));
+                                    self.emit32(self.enc_st1w_imm(vs, active_pred, tmp));
+                                }
                             }
                         } else {
                             match offset {
@@ -419,7 +444,14 @@ impl AArch64Lower {
                                     self.emit32(self.enc_add_reg(tmp, xn, off_reg));
                                     self.emit32(self.enc_st1_4s(vs, tmp));
                                 }
-                                _ => {}
+                                // BCE-20260703-AARCH64-VECLEAK-SILENT: Add/Mul/ScalarVReg 走
+                                // eval_offset_to_tmp 递归求值 (同 SVE 分支理由)。
+                                other => {
+                                    let tmp = 16u8;
+                                    self.eval_offset_to_tmp(other, alloc, tmp)?;
+                                    self.emit32(self.enc_add_reg(tmp, xn, tmp));
+                                    self.emit32(self.enc_st1_4s(vs, tmp));
+                                }
                             }
                         }
                     }
@@ -563,7 +595,15 @@ impl AArch64Lower {
                             self.emit32(0x4E040400 | ((vs as u32) << 5) | vd as u32);
                         }
                     }
-                    _ => {}
+                    // BCE-20260703-AARCH64-VECLEAK-SILENT: ScalarExpr 仅 4 变体 (Const/
+                    // MemLoad/ExtractLane0/VReg), 上述分支已全覆盖。`_ => {}` 静默 NOP 会使
+                    // broadcast 不发射 = 目标寄存器未初始化 = 数据损坏。改为显式 Err
+                    // (NO-SILENT-FALLBACK); 若未来 ScalarExpr 扩展新变体, 此处会立刻暴露。
+                    other => {
+                        return Err(CompilerError::CodegenViolation(
+                            format!("aarch64 Broadcast: unsupported ScalarExpr {:?}", other)
+                        ));
+                    }
                 }
                 Ok(())
             }
