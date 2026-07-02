@@ -728,8 +728,8 @@ impl AArch64Lower {
         // mov x29, sp
         self.emit32(self.enc_mov_x(29, 31));
 
-        // SVE2: initialize p7 as all-true predicate for scratch operations
-        if self.platform.has_sve2 {
+        // SVE: initialize p7 as all-true predicate for scratch operations (PTRUE is SVE1)
+        if self.platform.has_sve {
             self.emit32(self.enc_ptrue_s(7)); // PTRUE P7.S
         }
         Ok(())

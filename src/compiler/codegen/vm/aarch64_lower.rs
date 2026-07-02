@@ -27,7 +27,7 @@ use crate::types::DType;
 /// AArch64 ISA Lower。
 ///
 /// 直接输出机器码字节 (encoding)，不依赖外部汇编器库。
-/// 根据 `Platform::AArch64` 的 SVE2/SME2 特性标志选择最优路径。
+/// 根据 `Platform::AArch64` 的 SVE/SVE2/SME2/BF16/DotProd/I8MM 特性标志选择最优路径。
 pub struct AArch64Lower {
     code: Vec<u8>,
     const_pool: Vec<(f32, usize)>, // (value, offset_in_code)
@@ -42,11 +42,20 @@ pub struct AArch64Lower {
 }
 
 /// 从 `Platform::AArch64` 提取的特性快照。
+///
+/// 保留 Platform::AArch64 的全部特性字段 (BCE-20260703-AARCH64-FEATURES-DROPPED):
+/// 原实现只用 `..` 丢弃了 has_bf16/has_dotprod/has_i8mm/has_sve, 导致 lower 层无法
+/// 感知这些特性 → BFDOT/SDOT 无条件发出 (无该特性的 CPU SIGILL) + SVE1-only CPU
+/// 被降级为 NEON。扩展后 lower 层可按特性门控指令选择 (NO-SILENT-FALLBACK: 不支持返回 Err)。
 #[derive(Debug, Clone)]
 #[derive(Default)]
 struct AArch64Features {
-    has_sve2: bool,
-    has_sme2: bool,
+    has_sve: bool,       // SVE 基础 (LD1W/FADD Z/WHILELT/PTRUE — SVE1 指令, has_sve 即可用)
+    has_sve2: bool,      // SVE2 (SMMLA/USDOT/BFDOT-Z 等 SVE2 专属指令)
+    has_sme2: bool,      // SME2 (multi-vec FMLA, ZA tile)
+    has_bf16: bool,      // FEAT_BF16 (BFDOT/BFMMLA — NEON dot 指令)
+    has_dotprod: bool,   // FEAT_DotProd (SDOT/UDOT — NEON dot 指令)
+    has_i8mm: bool,      // FEAT_I8MM (SMMLA/UMMLA — i8mm 矩阵乘指令)
     sve_vl: usize, // bytes, 0 if no SVE
 }
 

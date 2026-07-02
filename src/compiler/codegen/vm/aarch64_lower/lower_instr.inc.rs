@@ -38,13 +38,21 @@ impl AArch64Lower {
     }
 
     /// Native dot-product lowering (REQ-VR10): 硬件原生 dot 指令。
+    ///
+    /// 特性门控 (BCE-20260703-AARCH64-FEATURES-DROPPED): BFDOT 需 FEAT_BF16,
+    /// SDOT 需 FEAT_DotProd。无该特性的 CPU 上发出生成 SIGILL — 必须 Err (NO-SILENT-FALLBACK)。
     fn lower_dot_product_native(
         &mut self,
         vd: u8, vn: u8, vm: u8,
         dt: DotDtype,
     ) -> Result<(), CompilerError> {
         if dot_dtype_is_bf16(dt) {
-            // BFDOT Vd.4S, Vn.8H, Vm.8H (ARMv8.6-A BF16)
+            // BFDOT Vd.4S, Vn.8H, Vm.8H (ARMv8.6-A BF16) — requires FEAT_BF16
+            if !self.platform.has_bf16 {
+                return Err(CompilerError::CodegenViolation(
+                    "BFDOT requires FEAT_BF16 (has_bf16=false on target AArch64)".into()
+                ));
+            }
             self.emit32(0x6E40FC00 | ((vm as u32 & 0x1F) << 16) | ((vn as u32 & 0x1F) << 5) | (vd as u32 & 0x1F));
         } else if dot_dtype_is_fp16(dt) {
             // FCVTL + FMLA: convert F16 halves to F32, then FMA accumulate.
@@ -54,7 +62,12 @@ impl AArch64Lower {
             self.emit32(0x0E218800 | ((vm as u32 & 0x1F) << 5) | s2 as u32);
             self.emit32(self.enc_fmla_4s(vd, s1, s2));
         } else if dot_dtype_is_int8(dt) {
-            // SDOT Vd.4S, Vn.16B, Vm.16B (ARMv8.4-A DotProd)
+            // SDOT Vd.4S, Vn.16B, Vm.16B (ARMv8.4-A DotProd) — requires FEAT_DotProd
+            if !self.platform.has_dotprod {
+                return Err(CompilerError::CodegenViolation(
+                    "SDOT requires FEAT_DotProd (has_dotprod=false on target AArch64)".into()
+                ));
+            }
             self.emit32(0x4E409C00 | ((vm as u32 & 0x1F) << 16) | ((vn as u32 & 0x1F) << 5) | (vd as u32 & 0x1F));
         } else {
             return Err(CompilerError::CodegenViolation(
@@ -65,6 +78,9 @@ impl AArch64Lower {
     }
 
     /// WidenCompute dot-product lowering (REQ-VR10): 子字节类型先解包再计算。
+    ///
+    /// 特性门控 (BCE-20260703-AARCH64-FEATURES-DROPPED): INT4×INT8 路径发 SDOT,
+    /// 需 FEAT_DotProd。无该特性 → Err (NO-SILENT-FALLBACK)。
     fn lower_dot_product_widen(
         &mut self,
         vd: u8, vn: u8, vm: u8,
@@ -72,6 +88,11 @@ impl AArch64Lower {
     ) -> Result<(), CompilerError> {
         if dot_dtype_is_int4x8(dt) {
             // INT4×INT8: nibble unpack done by preceding ops, emit SDOT on unpacked INT8.
+            if !self.platform.has_dotprod {
+                return Err(CompilerError::CodegenViolation(
+                    "INT4x8 SDOT requires FEAT_DotProd (has_dotprod=false on target AArch64)".into()
+                ));
+            }
             self.emit32(0x4E409C00 | ((vm as u32 & 0x1F) << 16) | ((vn as u32 & 0x1F) << 5) | (vd as u32 & 0x1F));
         } else if dot_dtype_is_fp4(dt) {
             // FP4 (E2M1): pre-decoded to F32 by caller, emit FMLA.

@@ -12,12 +12,18 @@ impl AArch64Lower {
         }
     }
 
-    /// 从 IsaProfile 构造 — 使 SVE2/SME2 路径可用。
+    /// 从 IsaProfile 构造 — 使 SVE/SVE2/SME2/BF16/DotProd/I8MM 特性感知路径可用。
     pub fn with_profile(profile: &IsaProfile) -> Self {
         let platform = match &profile.platform {
-            Platform::AArch64 { has_sve2, has_sme2, sve_vl, .. } => AArch64Features {
+            Platform::AArch64 {
+                has_sve, has_sve2, has_sme2, has_bf16, has_dotprod, has_i8mm, sve_vl, ..
+            } => AArch64Features {
+                has_sve: *has_sve,
                 has_sve2: *has_sve2,
                 has_sme2: *has_sme2,
+                has_bf16: *has_bf16,
+                has_dotprod: *has_dotprod,
+                has_i8mm: *has_i8mm,
                 sve_vl: *sve_vl,
             },
             _ => AArch64Features::default(),

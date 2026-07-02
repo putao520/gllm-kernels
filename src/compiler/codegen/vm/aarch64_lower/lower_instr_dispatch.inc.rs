@@ -319,8 +319,8 @@ impl AArch64Lower {
                 // DequantCompute: 应使用 QuantBlockLoad, 此处报错。
                 match dtype.aarch64_elem_strategy() {
                     AArch64ElemStrategy::Native | AArch64ElemStrategy::WidenCompute => {
-                        if self.platform.has_sve2 {
-                            // SVE2 predicated load: LD1W Zt.S, P0/Z, [Xn, Xoffset, LSL #2]
+                        if self.platform.has_sve {
+                            // SVE predicated load (SVE1): LD1W Zt.S, P0/Z, [Xn, Xoffset, LSL #2]
                             let active_pred = if self.loop_stack.last().is_some_and(|l| l.is_sve) { 0u8 } else { 7u8 };
                             match offset {
                                 OffsetExpr::Const(0) => {
@@ -384,7 +384,7 @@ impl AArch64Lower {
                 // dtype.aarch64_elem_strategy() 驱动指令选择 (REQ-VR10).
                 match dtype.aarch64_elem_strategy() {
                     AArch64ElemStrategy::Native | AArch64ElemStrategy::WidenCompute => {
-                        if self.platform.has_sve2 {
+                        if self.platform.has_sve {
                             let active_pred = if self.loop_stack.last().is_some_and(|l| l.is_sve) { 0u8 } else { 7u8 };
                             match offset {
                                 OffsetExpr::Const(0) => {
@@ -500,7 +500,7 @@ impl AArch64Lower {
                 let vd = self.resolve_vreg(*dst, alloc)?;
                 let vn = self.resolve_vreg(*src, alloc)?;
                 if vd != vn {
-                    if self.platform.has_sve2 {
+                    if self.platform.has_sve {
                         self.emit32(self.enc_sve_mov(vd, vn));
                     } else {
                         self.emit32(self.enc_neon_mov(vd, vn));
@@ -521,7 +521,7 @@ impl AArch64Lower {
                 let vd = self.resolve_vreg(*dst, alloc)?;
                 match src {
                     ScalarExpr::Const(val) => {
-                        if self.platform.has_sve2 {
+                        if self.platform.has_sve {
                             self.emit_sve_f32_broadcast(vd, *val);
                         } else {
                             let bits = val.to_bits();
@@ -535,7 +535,7 @@ impl AArch64Lower {
                         let xn = self.resolve_gpr(*base, alloc)?;
                         let tmp = 16u8;
                         self.emit32(self.enc_add_imm(tmp, xn, *off as u32));
-                        if self.platform.has_sve2 {
+                        if self.platform.has_sve {
                             // LDR S16, [x16]; DUP Zd.S, S16
                             self.emit32(0xBD400000 | ((tmp as u32) << 5) | 16u32); // LDR S16, [x16]
                             self.emit32(self.enc_sve_dup_s(vd, 16));
@@ -546,7 +546,7 @@ impl AArch64Lower {
                     }
                     ScalarExpr::ExtractLane0(src_vreg) => {
                         let vs = self.resolve_vreg(*src_vreg, alloc)?;
-                        if self.platform.has_sve2 {
+                        if self.platform.has_sve {
                             self.emit32(self.enc_sve_dup_s(vd, vs)); // DUP Zd.S, Zn.S[0]
                         } else {
                             // DUP Vd.4S, Vn.S[0]
@@ -557,7 +557,7 @@ impl AArch64Lower {
                         // src 是 Scalar VReg (S register lane 0), broadcast to dst Vec
                         // Same as ExtractLane0: DUP Zd.S, Zn.S[0] / DUP Vd.4S, Vn.S[0]
                         let vs = self.resolve_vreg(*src_vreg, alloc)?;
-                        if self.platform.has_sve2 {
+                        if self.platform.has_sve {
                             self.emit32(self.enc_sve_dup_s(vd, vs));
                         } else {
                             self.emit32(0x4E040400 | ((vs as u32) << 5) | vd as u32);
@@ -1057,7 +1057,7 @@ impl AArch64Lower {
 
                 if *row_bytes == 0 {
                     // Zero stride — address = base directly
-                    if self.platform.has_sve2 {
+                    if self.platform.has_sve {
                         let active_pred = if self.loop_stack.last().is_some_and(|l| l.is_sve) { 0u8 } else { 7u8 };
                         self.emit32(self.enc_ld1w_imm(vd, active_pred, base_reg));
                     } else {
@@ -1088,7 +1088,7 @@ impl AArch64Lower {
                     //   where Xd=addr_tmp, Xn=idx_reg, Xm=rb_tmp, Ra=base_reg
                     self.emit32(0x1B000000 | ((rb_tmp as u32 & 0x1F) << 16) | ((base_reg as u32 & 0x1F) << 10) | ((idx_reg as u32 & 0x1F) << 5) | (addr_tmp as u32 & 0x1F));
 
-                    if self.platform.has_sve2 {
+                    if self.platform.has_sve {
                         let active_pred = if self.loop_stack.last().is_some_and(|l| l.is_sve) { 0u8 } else { 7u8 };
                         self.emit32(self.enc_ld1w_imm(vd, active_pred, addr_tmp));
                     } else {
@@ -1203,8 +1203,8 @@ impl AArch64Lower {
                 let vn = self.resolve_vreg(*a, alloc)?;
                 let vm = self.resolve_vreg(*b, alloc)?;
 
-                if self.platform.has_sve2 {
-                    // SVE2 predicated binary ops (destructive: zdn = zdn op zm)
+                if self.platform.has_sve {
+                    // SVE predicated binary ops (SVE1, destructive: zdn = zdn op zm)
                     let pg = 7u8; // p7 = all-true
                     // Ensure dst = a for destructive form
                     if vd != vn {
@@ -1258,7 +1258,7 @@ impl AArch64Lower {
                 let vd = self.resolve_vreg(*dst, alloc)?;
                 let vn = self.resolve_vreg(*a, alloc)?;
 
-                if self.platform.has_sve2 {
+                if self.platform.has_sve {
                     let pg = 7u8;
                     match op {
                         VecUnaryOp::Neg   => self.emit32(self.enc_sve_fneg_s(vd, pg, vn)),
@@ -1343,7 +1343,7 @@ impl AArch64Lower {
                 let vb = self.resolve_vreg(*b, alloc)?;
                 let vacc = self.resolve_vreg(*acc, alloc)?;
 
-                if self.platform.has_sve2 {
+                if self.platform.has_sve {
                     // SVE FMLA Zda, Pg/M, Zn, Zm: Zda += Zn * Zm
                     let pg = 7u8;
                     if vd != vacc {
@@ -1371,7 +1371,7 @@ impl AArch64Lower {
                 let vd = self.resolve_vreg(*dst, alloc)?;
                 let vs = self.resolve_vreg(*src, alloc)?;
 
-                if self.platform.has_sve2 {
+                if self.platform.has_sve {
                     let pg = 7u8; // p7 = all-true
                     match op {
                         ReduceOp::Sum => {
@@ -1434,7 +1434,7 @@ impl AArch64Lower {
 
                 let va = self.resolve_vreg(*acc, alloc)?;
                 let vs = self.resolve_vreg(*src, alloc)?;
-                if self.platform.has_sve2 {
+                if self.platform.has_sve {
                     self.emit32(self.enc_sve_fadd_s(va, 7, vs)); // FADD za, p7/M, za, zs
                 } else {
                     self.emit32(self.enc_fadd_4s(va, va, vs));
@@ -1455,7 +1455,7 @@ impl AArch64Lower {
 
                 match func {
                     TranscendentalFn::Exp => {
-                        if self.platform.has_sve2 {
+                        if self.platform.has_sve {
                             self.emit_sve_exp(vd, vs);
                         } else {
                             self.emit_neon_exp(vd, vs);
@@ -1463,7 +1463,7 @@ impl AArch64Lower {
                     }
                     TranscendentalFn::Sigmoid => {
                         // Sigmoid(x) = 1/(1 + exp(-x))
-                        if self.platform.has_sve2 {
+                        if self.platform.has_sve {
                             let pg = 7u8;
                             self.emit32(self.enc_sve_fneg_s(vd, pg, vs)); // vd = -x
                             self.emit_sve_exp(vd, vd);                   // vd = exp(-x)
@@ -1485,7 +1485,7 @@ impl AArch64Lower {
                     }
                     TranscendentalFn::Tanh => {
                         // Tanh(x) = 2*sigmoid(2x) - 1
-                        if self.platform.has_sve2 {
+                        if self.platform.has_sve {
                             let pg = 7u8;
                             self.emit_sve_f32_broadcast(24, 2.0f32);
                             if vd != vs { self.emit32(self.enc_sve_mov(vd, vs)); }
@@ -1516,7 +1516,7 @@ impl AArch64Lower {
                         }
                     }
                     TranscendentalFn::Log => {
-                        if self.platform.has_sve2 {
+                        if self.platform.has_sve {
                             self.emit_sve_log(vd, vs);
                         } else {
                             self.emit_neon_log(vd, vs);
@@ -1525,7 +1525,7 @@ impl AArch64Lower {
                     TranscendentalFn::Fwht => {
                         // FWHT: Fast Walsh-Hadamard Transform
                         // AArch64: REV64 + ZIP1/ZIP2 butterfly
-                        if self.platform.has_sve2 {
+                        if self.platform.has_sve {
                             if vd != vs { self.emit32(self.enc_sve_mov(vd, vs)); }
                         } else {
                             if vd != vs {
@@ -2058,8 +2058,8 @@ impl AArch64Lower {
                 // MOV Xoff, XZR (=0)
                 self.emit32(self.enc_mov_x(xoff, 31));
 
-                if self.platform.has_sve2 {
-                    // ── SVE2 predicated loop ──
+                if self.platform.has_sve {
+                    // ── SVE predicated loop (SVE1: WHILELT/INCW/PTRUE) ──
                     //
                     // Structure:
                     //   MOV counter=0, offset=0
@@ -2175,7 +2175,7 @@ impl AArch64Lower {
 
                 if let Some(ctx) = self.loop_stack.pop() {
                     if ctx.is_sve {
-                        // SVE2 loop end:
+                        // SVE loop end:
                         //   INCW counter (counter += VL_elements)
                         //   CNTW x16 (x16 = VL_elements)
                         //   LSL x16, x16, #2 (x16 = VL_bytes = VL_elements * 4)

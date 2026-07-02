@@ -51,7 +51,7 @@ mod tests {
             const_pool: Vec::new(),
             loop_stack: Vec::new(),
             labels: std::collections::HashMap::new(),
-            platform: AArch64Features { has_sve2: true, has_sme2: false, sve_vl: 32 },
+            platform: AArch64Features { has_sve: true, has_sve2: true, has_sme2: false, has_bf16: false, has_dotprod: false, has_i8mm: false, sve_vl: 32 },
             jit_ctx: make_test_jit_ctx(),
         };
         let frame = StackFrame {
@@ -133,7 +133,7 @@ mod tests {
             const_pool: Vec::new(),
             loop_stack: Vec::new(),
             labels: std::collections::HashMap::new(),
-            platform: AArch64Features { has_sve2: true, has_sme2: false, sve_vl: 32 },
+            platform: AArch64Features { has_sve: true, has_sve2: true, has_sme2: false, has_bf16: false, has_dotprod: false, has_i8mm: false, sve_vl: 32 },
             jit_ctx: make_test_jit_ctx(),
         };
         let mut mapping = std::collections::HashMap::new();
@@ -189,7 +189,7 @@ mod tests {
             const_pool: Vec::new(),
             loop_stack: Vec::new(),
             labels: std::collections::HashMap::new(),
-            platform: AArch64Features { has_sve2: true, has_sme2: true, sve_vl: 32 },
+            platform: AArch64Features { has_sve: true, has_sve2: true, has_sme2: true, has_bf16: false, has_dotprod: false, has_i8mm: false, sve_vl: 32 },
             jit_ctx: make_test_jit_ctx(),
         };
         let mut mapping = std::collections::HashMap::new();
@@ -232,7 +232,7 @@ mod tests {
             const_pool: Vec::new(),
             loop_stack: Vec::new(),
             labels: std::collections::HashMap::new(),
-            platform: AArch64Features { has_sve2: false, has_sme2: false, sve_vl: 16 },
+            platform: AArch64Features { has_sve: false, has_sve2: false, has_sme2: false, has_bf16: false, has_dotprod: false, has_i8mm: false, sve_vl: 16 },
             jit_ctx: make_test_jit_ctx(),
         };
         let mut mapping = std::collections::HashMap::new();
@@ -271,7 +271,7 @@ mod tests {
             const_pool: Vec::new(),
             loop_stack: Vec::new(),
             labels: std::collections::HashMap::new(),
-            platform: AArch64Features { has_sve2: true, has_sme2: false, sve_vl: 32 },
+            platform: AArch64Features { has_sve: true, has_sve2: true, has_sme2: false, has_bf16: false, has_dotprod: false, has_i8mm: false, sve_vl: 32 },
             jit_ctx: make_test_jit_ctx(),
         };
         let mut mapping = std::collections::HashMap::new();
@@ -308,7 +308,7 @@ mod tests {
             const_pool: Vec::new(),
             loop_stack: Vec::new(),
             labels: std::collections::HashMap::new(),
-            platform: AArch64Features { has_sve2: false, has_sme2: false, sve_vl: 16 },
+            platform: AArch64Features { has_sve: false, has_sve2: false, has_sme2: false, has_bf16: false, has_dotprod: false, has_i8mm: false, sve_vl: 16 },
             jit_ctx: make_test_jit_ctx(),
         };
         let mut mapping = std::collections::HashMap::new();
@@ -345,7 +345,7 @@ mod tests {
             const_pool: Vec::new(),
             loop_stack: Vec::new(),
             labels: std::collections::HashMap::new(),
-            platform: AArch64Features { has_sve2: false, has_sme2: false, sve_vl: 16 },
+            platform: AArch64Features { has_sve: false, has_sve2: false, has_sme2: false, has_bf16: false, has_dotprod: false, has_i8mm: false, sve_vl: 16 },
             jit_ctx: make_test_jit_ctx(),
         };
         let mut mapping = std::collections::HashMap::new();
@@ -385,7 +385,7 @@ mod tests {
             const_pool: Vec::new(),
             loop_stack: Vec::new(),
             labels: std::collections::HashMap::new(),
-            platform: AArch64Features { has_sve2: false, has_sme2: false, sve_vl: 16 },
+            platform: AArch64Features { has_sve: false, has_sve2: false, has_sme2: false, has_bf16: false, has_dotprod: false, has_i8mm: false, sve_vl: 16 },
             jit_ctx: make_test_jit_ctx(),
         };
         let mut mapping = std::collections::HashMap::new();
@@ -418,7 +418,7 @@ mod tests {
             const_pool: Vec::new(),
             loop_stack: Vec::new(),
             labels: std::collections::HashMap::new(),
-            platform: AArch64Features { has_sve2: false, has_sme2: false, sve_vl: 16 },
+            platform: AArch64Features { has_sve: false, has_sve2: false, has_sme2: false, has_bf16: false, has_dotprod: false, has_i8mm: false, sve_vl: 16 },
             jit_ctx: make_test_jit_ctx(),
         };
         let mut mapping = std::collections::HashMap::new();
@@ -451,7 +451,7 @@ mod tests {
             const_pool: Vec::new(),
             loop_stack: Vec::new(),
             labels: std::collections::HashMap::new(),
-            platform: AArch64Features { has_sve2: false, has_sme2: false, sve_vl: 16 },
+            platform: AArch64Features { has_sve: false, has_sve2: false, has_sme2: false, has_bf16: false, has_dotprod: false, has_i8mm: false, sve_vl: 16 },
             jit_ctx: make_test_jit_ctx(),
         };
         let mut mapping = std::collections::HashMap::new();
@@ -483,7 +483,7 @@ mod tests {
             const_pool: Vec::new(),
             loop_stack: Vec::new(),
             labels: std::collections::HashMap::new(),
-            platform: AArch64Features { has_sve2: false, has_sme2: false, sve_vl: 16 },
+            platform: AArch64Features { has_sve: false, has_sve2: false, has_sme2: false, has_bf16: false, has_dotprod: false, has_i8mm: false, sve_vl: 16 },
             jit_ctx: make_test_jit_ctx(),
         };
         let mut mapping = std::collections::HashMap::new();
@@ -516,7 +516,7 @@ mod tests {
             const_pool: Vec::new(),
             loop_stack: Vec::new(),
             labels: std::collections::HashMap::new(),
-            platform: AArch64Features { has_sve2: false, has_sme2: false, sve_vl: 16 },
+            platform: AArch64Features { has_sve: false, has_sve2: false, has_sme2: false, has_bf16: false, has_dotprod: false, has_i8mm: false, sve_vl: 16 },
             jit_ctx: make_test_jit_ctx(),
         };
         let mut mapping = std::collections::HashMap::new();
@@ -548,7 +548,7 @@ mod tests {
             const_pool: Vec::new(),
             loop_stack: Vec::new(),
             labels: std::collections::HashMap::new(),
-            platform: AArch64Features { has_sve2: false, has_sme2: false, sve_vl: 16 },
+            platform: AArch64Features { has_sve: false, has_sve2: false, has_sme2: false, has_bf16: false, has_dotprod: false, has_i8mm: false, sve_vl: 16 },
             jit_ctx: make_test_jit_ctx(),
         };
         let mut mapping = std::collections::HashMap::new();
@@ -608,10 +608,43 @@ mod tests {
         // Arrange: construct default AArch64Features
         let features = AArch64Features::default();
 
-        // Assert: default should be NEON baseline (no SVE2, no SME2, zero VL)
+        // Assert: default should be NEON baseline (no SVE/SVE2/SME2/BF16/DotProd/I8MM, zero VL)
+        assert!(!features.has_sve, "Default should not have SVE");
         assert!(!features.has_sve2, "Default should not have SVE2");
         assert!(!features.has_sme2, "Default should not have SME2");
+        assert!(!features.has_bf16, "Default should not have BF16");
+        assert!(!features.has_dotprod, "Default should not have DotProd");
+        assert!(!features.has_i8mm, "Default should not have I8MM");
         assert_eq!(features.sve_vl, 0, "Default SVE VL should be 0");
+    }
+
+    #[test]
+    fn test_with_profile_extracts_all_aarch64_features() {
+        // Regression for BCE-20260703-AARCH64-FEATURES-DROPPED:
+        // with_profile 必须从 Platform::AArch64 提取全部特性字段, 不能用 `..` 丢弃
+        // has_bf16/has_dotprod/has_i8mm/has_sve (原 bug 导致 lower 层无法感知这些特性,
+        // BFDOT/SDOT 无条件发出 → 无该特性的 CPU SIGILL; SVE1-only CPU 被降级为 NEON)。
+        //
+        // SVE1-only CPU (has_sve=true, has_sve2=false, e.g. A64FX):
+        //   has_dotprod=true (constructor sets), has_i8mm=has_sve2=false, has_bf16=true (arg)
+        let profile = IsaProfile::aarch64(
+            /* has_sve   */ true,
+            /* has_sve2  */ false,   // SVE1-only
+            /* sve_vl    */ 32,
+            /* has_sme   */ false,
+            /* has_sme2  */ false,
+            /* has_bf16  */ true,
+        );
+
+        let lower = AArch64Lower::with_profile(&profile);
+
+        // Assert: all features extracted (no field dropped via `..`)
+        assert!(lower.platform.has_sve, "has_sve must be extracted (SVE1-only CPU needs SVE1 path, not NEON)");
+        assert!(!lower.platform.has_sve2, "has_sve2 must be extracted");
+        assert!(lower.platform.has_bf16, "has_bf16 must be extracted (FEAT_BF16 for BFDOT)");
+        assert!(lower.platform.has_dotprod, "has_dotprod must be extracted (FEAT_DotProd for SDOT)");
+        assert!(!lower.platform.has_i8mm, "has_i8mm must be extracted (= has_sve2 on this constructor)");
+        assert_eq!(lower.platform.sve_vl, 32, "sve_vl must be extracted");
     }
 
     #[test]
@@ -647,7 +680,7 @@ mod tests {
             const_pool: Vec::new(),
             loop_stack: Vec::new(),
             labels: std::collections::HashMap::new(),
-            platform: AArch64Features { has_sve2: false, has_sme2: false, sve_vl: 16 },
+            platform: AArch64Features { has_sve: false, has_sve2: false, has_sme2: false, has_bf16: false, has_dotprod: false, has_i8mm: false, sve_vl: 16 },
             jit_ctx: make_test_jit_ctx(),
         };
         let mut mapping = std::collections::HashMap::new();
@@ -688,7 +721,7 @@ mod tests {
             const_pool: Vec::new(),
             loop_stack: Vec::new(),
             labels: std::collections::HashMap::new(),
-            platform: AArch64Features { has_sve2: false, has_sme2: false, sve_vl: 16 },
+            platform: AArch64Features { has_sve: false, has_sve2: false, has_sme2: false, has_bf16: false, has_dotprod: false, has_i8mm: false, sve_vl: 16 },
             jit_ctx: make_test_jit_ctx(),
         };
         let mut mapping = std::collections::HashMap::new();
@@ -725,7 +758,7 @@ mod tests {
             const_pool: Vec::new(),
             loop_stack: Vec::new(),
             labels: std::collections::HashMap::new(),
-            platform: AArch64Features { has_sve2: false, has_sme2: false, sve_vl: 16 },
+            platform: AArch64Features { has_sve: false, has_sve2: false, has_sme2: false, has_bf16: false, has_dotprod: false, has_i8mm: false, sve_vl: 16 },
             jit_ctx: make_test_jit_ctx(),
         };
         let mut mapping = std::collections::HashMap::new();
@@ -760,7 +793,7 @@ mod tests {
             const_pool: Vec::new(),
             loop_stack: Vec::new(),
             labels: std::collections::HashMap::new(),
-            platform: AArch64Features { has_sve2: false, has_sme2: false, sve_vl: 16 },
+            platform: AArch64Features { has_sve: false, has_sve2: false, has_sme2: false, has_bf16: false, has_dotprod: false, has_i8mm: false, sve_vl: 16 },
             jit_ctx: make_test_jit_ctx(),
         };
         let mut mapping = std::collections::HashMap::new();
@@ -844,7 +877,7 @@ mod tests {
             const_pool: Vec::new(),
             loop_stack: Vec::new(),
             labels: std::collections::HashMap::new(),
-            platform: AArch64Features { has_sve2: true, has_sme2: false, sve_vl: 32 },
+            platform: AArch64Features { has_sve: true, has_sve2: true, has_sme2: false, has_bf16: false, has_dotprod: false, has_i8mm: false, sve_vl: 32 },
             jit_ctx: make_test_jit_ctx(),
         };
         let mut mapping = std::collections::HashMap::new();
