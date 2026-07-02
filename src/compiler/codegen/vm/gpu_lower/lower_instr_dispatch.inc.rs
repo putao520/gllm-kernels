@@ -3214,8 +3214,10 @@ Ok(())
                         self.emit_line("  sub.s32 %r_n0, %r_byte, 8;");
                         self.emit_line(&format!("  cvt.rn.f32.s32 {fs0}, %r_n0;"));
                         // 加载 per-pair scale: scale_ptr[byte_idx] (byte_idx = pair 索引, f32 步长 4 字节)
+                        // %rd_saddr = %r_bi (u64) → ×4 (shl.b64 2) → + sptr
                         self.emit_line(&format!("  cvt.u64.u32 %rd_saddr, %r_bi;"));
-                        self.emit_line(&format!("  mad.u64 %rd_saddr, %rd_saddr, 4, {sptr};"));
+                        self.emit_line("  shl.b64 %rd_saddr, %rd_saddr, 2;");
+                        self.emit_line(&format!("  add.u64 %rd_saddr, %rd_saddr, {sptr};"));
                         self.emit_line(&format!("  ld.global.f32 {d}, [%rd_saddr];"));
                         // result = (nibble-8) * scale → {d}
                         self.emit_line(&format!("  mul.rn.f32 {d}, {fs0}, {d};"));
