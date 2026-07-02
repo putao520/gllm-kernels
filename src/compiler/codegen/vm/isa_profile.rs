@@ -444,14 +444,34 @@ impl IsaProfile {
         // 向量寄存器 (ARCH-ISA-SCRATCH-VEC: 末六个保留为 Lower scratch)
         // 见 IsaProfile.scratch_vec_regs 文档说明拆分原因。
         let vec_count: u8 = if kc.use_avx512 { 32 } else { 16 };
-        let scratch_vec_regs: Vec<PhysVec> = vec![
-            PhysVec(vec_count - 1), // ymm/zmm 15 or 31 — 内部 scratch 0 (HReduce/FWHT)
-            PhysVec(vec_count - 2), // ymm/zmm 14 or 30 — 内部 scratch 1 (FWHT)
-            PhysVec(vec_count - 3), // ymm/zmm 13 or 29 — 内部 scratch 2 (broadcast/Sigmoid)
-            PhysVec(vec_count - 4), // ymm/zmm 12 or 28 — spill scratch A (输入 a)
-            PhysVec(vec_count - 5), // ymm/zmm 11 or 27 — spill scratch B (输入 b)
-            PhysVec(vec_count - 6), // ymm/zmm 10 or 26 — spill scratch C (acc/dst 中转)
-        ];
+        // BCE-20260702-REGALLOC-AVX2-OOB: 内部 scratch (0..3) 用于 SSE scalar 指令
+        // (vmovss/vmovsd/vmovd — scratch_xmm → lower_scalar_load_x86 / xmm_const_i32)
+        // 以及 HReduce/broadcast。iced_x86 的 code_asm vmovss 仅接受 xmm0..15 (VEX
+        // 编码, EVEX 前缀需底层 Instruction API), 故内部 scratch 在 AVX-512 下也
+        // 必须 ≤15。spill scratch (3..6) 仅用于 vmovups/vmovupd ymm/zmm (支持 0..31),
+        // 可放在 AVX-512 高位 (29..31) 把更多低位寄存器让给 RegAllocator。
+        //
+        // AVX2  (vec_count=16): [15,14,13, 12,11,10]   (全部 ≤15, 与原设计一致)
+        // AVX512(vec_count=32): [15,14,13, 31,30,29]   (内部 ≤15, spill 高位)
+        let scratch_vec_regs: Vec<PhysVec> = if kc.use_avx512 {
+            vec![
+                PhysVec(15), // zmm15 — 内部 scratch 0 (HReduce/FWHT, SSE scalar 安全)
+                PhysVec(14), // zmm14 — 内部 scratch 1 (FWHT, SSE scalar 安全)
+                PhysVec(13), // zmm13 — 内部 scratch 2 (broadcast/Sigmoid/ScalarLoad, SSE scalar 安全)
+                PhysVec(31), // zmm31 — spill scratch A (vmovups, 支持 16..31)
+                PhysVec(30), // zmm30 — spill scratch B (vmovups, 支持 16..31)
+                PhysVec(29), // zmm29 — spill scratch C (vmovups, 支持 16..31)
+            ]
+        } else {
+            vec![
+                PhysVec(vec_count - 1), // ymm15 — 内部 scratch 0 (HReduce/FWHT)
+                PhysVec(vec_count - 2), // ymm14 — 内部 scratch 1 (FWHT)
+                PhysVec(vec_count - 3), // ymm13 — 内部 scratch 2 (broadcast/Sigmoid)
+                PhysVec(vec_count - 4), // ymm12 — spill scratch A (输入 a)
+                PhysVec(vec_count - 5), // ymm11 — spill scratch B (输入 b)
+                PhysVec(vec_count - 6), // ymm10 — spill scratch C (acc/dst 中转)
+            ]
+        };
         let vec_regs: Vec<PhysVec> = (0..vec_count)
             .filter(|&r| !scratch_vec_regs.iter().any(|s| s.0 == r))
             .map(PhysVec)

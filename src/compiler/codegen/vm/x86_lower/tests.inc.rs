@@ -742,4 +742,43 @@ mod tests {
         assert_eq!(X86Lower::ymm_to_xmm(ymm0), xmm0);
         assert_eq!(X86Lower::ymm_to_xmm(ymm15), xmm15);
     }
+
+    /// BCE-20260702-REGALLOC-AVX2-OOB (自愈第 1 轮): SSE scalar 指令
+    /// (vmovss/vmovsd/vmovd — iced_x86 code_asm 仅接受 xmm0..15, VEX 编码)
+    /// 经 scratch_xmm → lower_scalar_load_x86 / xmm_const_i32 路径使用
+    /// 内部 scratch (idx 0..3)。AVX-512 下若内部 scratch 分配到 26..31,
+    /// scratch_xmm → ymm_to_xmm → xmm29 → vmovss 被 assembler 拒绝:
+    ///   "Register XMM29 is not between XMM0 and XMM15 (inclusive)"
+    /// 根治: AVX-512 下内部 scratch (idx 0..3) 强制 ≤15 (zmm13/14/15),
+    /// spill scratch (idx 3..6) 放高位 (zmm29/30/31, 仅 vmovups 支持 16..31).
+    #[test]
+    fn avx512_internal_scratch_vec_regs_are_sse_scalar_safe() {
+        let dp = DeviceProfile::detect();
+        let profile = IsaProfile::from_device_profile(&dp);
+        // 仅当本机为 AVX-512 时校验 AVX-512 不变量; AVX2 主机跳过 (无可达性).
+        let is_avx512 = matches!(
+            profile.platform,
+            super::super::isa_profile::Platform::X86_64 { has_avx512: true, .. }
+        );
+        if !is_avx512 {
+            eprintln!("skip: host not AVX-512, scratch invariant unchecked");
+            return;
+        }
+        // 内部 scratch (idx 0..3) 必须 ≤15 (SSE scalar 指令安全).
+        for (i, p) in profile.scratch_vec_regs.iter().take(3).enumerate() {
+            assert!(
+                p.0 <= 15,
+                "AVX-512 internal scratch[{}] = PhysVec({}) 必须 ≤15 (SSE scalar vmovss 安全), 否则 xmm16..31 被 assembler 拒绝",
+                i, p.0
+            );
+        }
+        // spill scratch (idx 3..6) 仅用于 vmovups (支持 16..31), 可放高位.
+        assert_eq!(profile.scratch_vec_regs.len(), 6);
+        // 守恒: allocatable + scratch = vec_count (32 for AVX-512).
+        assert_eq!(
+            profile.vec_regs.len() + profile.scratch_vec_regs.len(),
+            32,
+            "AVX-512 vec 守恒: allocatable + scratch = 32"
+        );
+    }
 }
