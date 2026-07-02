@@ -871,16 +871,59 @@ impl InferenceCompiler {
         let virtual_tensor_map = virtual_tensor::DataFlowOptimizer::eliminate(
             &graph, &fusion_plan, Some(&layout_assignment), &self.profile,
         );
+        // [OOM-PROBE Stage 9] virtual_tensor map — GPU 空 mapping 疑点: 若 virtual_map 为空
+        // 而 physical_set 接近全量 → DataFlowOptimizer 对 GPU 未消除反而全物化 (architect 疑点)。
+        _gk_oom_log("gpu-stage9-virtual-tensor", &format!(
+            "virtual_map={} physical_set={} pack_maps={} bytes_saved={} graph_tensors={}",
+            virtual_tensor_map.virtual_map.len(),
+            virtual_tensor_map.physical_set.len(),
+            virtual_tensor_map.pack_maps.len(),
+            virtual_tensor_map.bytes_saved,
+            graph.tensors.len(),
+        ));
         let virtual_activation = virtual_activation::VirtualActivationMap::analyze(&graph, &fusion_plan);
         let lifetimes = buffer_alloc::analyze_lifetimes(
             &graph, &fusion_plan, Some(&virtual_tensor_map), Some(&virtual_activation),
         );
+        // [OOM-PROBE Stage 11] lifetimes — empty virtual mapping 导致全活跃疑点 (architect 疑点 E)。
+        // max_live_set = 单步并发活跃 tensor 数 (峰值); sum_size_bytes = 全 lifetime 字节和 (无复用)。
+        {
+            let n = lifetimes.len();
+            let sum_size: usize = lifetimes.iter().map(|l| l.size_bytes).sum();
+            let max_live: usize = {
+                let mut events: Vec<(usize, i32)> = Vec::with_capacity(2 * n);
+                for l in &lifetimes {
+                    events.push((l.first_use, 1));
+                    events.push((l.last_use + 1, -1));
+                }
+                events.sort_by_key(|e| (e.0, e.1));
+                let mut cur = 0i32; let mut peak = 0i32;
+                for (_, d) in events { cur += d; if cur > peak { peak = cur; } }
+                peak as usize
+            };
+            let max_single: usize = lifetimes.iter().map(|l| l.size_bytes).max().unwrap_or(0);
+            _gk_oom_log("gpu-stage11-lifetimes", &format!(
+                "lifetimes={} max_live_set={} sum_size_bytes={} max_single_buffer_bytes={}",
+                n, max_live, sum_size, max_single,
+            ));
+        }
         let alloc = buffer_alloc::allocate_buffers_aligned(
             &lifetimes, self.profile.hw_info.cacheline_bytes,
             Some(&virtual_tensor_map), Some(&virtual_activation), &graph,
             Some(&layout_assignment),
         );
-
+        // [OOM-PROBE Stage 12] buffer_alloc — 全 VReg 物化疑点 (architect 主因)。
+        // total_bytes = scratchpad 总字节; max_slot_size = 单 buffer 最大 (logits 级 ~ vocab*seq*4); num_slots = 物化 buffer 数。
+        {
+            let num_slots = alloc.slots.len();
+            let max_slot_size: usize = alloc.slots.iter().map(|s| s.size_bytes).max().unwrap_or(0);
+            let sum_slot_size: usize = alloc.slots.iter().map(|s| s.size_bytes).sum();
+            _gk_oom_log("gpu-stage12-buffer-alloc", &format!(
+                "slots={} total_bytes={} max_slot_bytes={} sum_slot_bytes={} skipped_virtual={} num_tensors={}",
+                num_slots, alloc.total_bytes, max_slot_size, sum_slot_size,
+                alloc.skipped_virtual.len(), alloc.num_tensors,
+            ));
+        }
         // BCE-20260702-GPU-REGALLOC-SPILL: GPU 编译必须用 GPU IsaProfile,
         // 不能调 `from_device_profile` (后者只产 x86 profile, vec_count=16/32)。
         // x86 预算下 SmolLM2 VReg 数超 32 → RegAllocator spill v0 → GpuLower
