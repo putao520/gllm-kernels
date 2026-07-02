@@ -1,7 +1,14 @@
 impl GpuLower {
+    /// GPU 寄存器预算 (PTX 声明式逻辑寄存器, 硬件自动映射)。
+    ///
+    /// BCE-20260702-GPU-REGALLOC-SPILL: GPU 后端 RegAllocator 不复用 x86 的
+    /// vec_count=16/32 预算。PTX `.reg` 是声明式逻辑寄存器 (.reg .f32 %f<N>),
+    /// 单 thread 可声明 ~255 个 (Ampere+), 硬件自动映射到物理寄存器。让
+    /// RegAllocator 在 x86 预算 (32) 下运行 SmolLM2 会立刻 spill v0, 触发
+    /// prologue panic。GPU IsaProfile 必须从 dialect 派生, 不调
+    /// `from_device_profile` (后者只产 x86 profile)。
     pub fn new(dialect: GpuDialect) -> Self {
-        use crate::dispatch::device_profile::DeviceProfile;
-        let isa_profile = super::isa_profile::IsaProfile::from_device_profile(&DeviceProfile::detect());
+        let isa_profile = super::isa_profile::IsaProfile::for_dialect(dialect);
         Self {
             dialect,
             ir: String::new(),

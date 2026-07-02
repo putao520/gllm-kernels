@@ -863,7 +863,16 @@ impl InferenceCompiler {
             Some(&layout_assignment),
         );
 
-        let profile = IsaProfile::from_device_profile(&self.profile);
+        // BCE-20260702-GPU-REGALLOC-SPILL: GPU 编译必须用 GPU IsaProfile,
+        // 不能调 `from_device_profile` (后者只产 x86 profile, vec_count=16/32)。
+        // x86 预算下 SmolLM2 VReg 数超 32 → RegAllocator spill v0 → GpuLower
+        // prologue panic。PTX/HIP/MSL 寄存器是声明式逻辑寄存器, GPU profile
+        // 触发 RegAllocator 短路 (ARCH-GPU-NO-LINEAR-SCAN, 返回空 mapping 无 spill),
+        // 由 GpuLower reg_name_with_kind fallback 按 VRegKind 直接命名。
+        #[cfg(feature = "jit-cuda")]
+        let profile = IsaProfile::cuda(sm_version);
+        #[cfg(not(feature = "jit-cuda"))]
+        let profile = IsaProfile::hip(942); // MI300 default (jit-hip path)
         let elem_bytes = geometry.compute_dtype.size_bytes();
         // [LEGAL-PSC28] elem_bytes comes from geometry.compute_dtype.size_bytes() (dtype-inferred),
         // not hardcoded F32. compute_dtype is derived from (storage_dtype, DeviceProfile) per

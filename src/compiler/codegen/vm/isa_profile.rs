@@ -662,7 +662,23 @@ impl IsaProfile {
         }
     }
 
-    /// 从 gfx arch 构造 AMD HIP IsaProfile。
+    /// 从 GPU 方言派生 IsaProfile (BCE-20260702-GPU-REGALLOC-SPILL)。
+    ///
+    /// GPU 后端必须用 GPU 自己的寄存器预算, 不能复用 x86 `from_device_profile`
+    /// (后者只产 x86 profile, vec_count=16/32)。PTX/HIP/MSL 寄存器是声明式
+    /// 逻辑寄存器, 由 GpuLower 按 VRegKind 直接映射命名空间, RegAllocator
+    /// 对 GPU profile 走短路 (返回空 mapping, 无 spill)。
+    ///
+    /// 详见 `reg_alloc.rs::allocate_impl` 的 ARCH-GPU-NO-LINEAR-SCAN 分支。
+    pub fn for_dialect(dialect: super::gpu_lower::GpuDialect) -> Self {
+        match dialect {
+            super::gpu_lower::GpuDialect::Ptx { sm_version } => Self::cuda(sm_version),
+            super::gpu_lower::GpuDialect::Hip { gfx_arch, .. } => Self::hip(gfx_arch),
+            super::gpu_lower::GpuDialect::Metal { gpu_family } => Self::metal(gpu_family),
+        }
+    }
+
+
     pub fn hip(gfx_arch: u32) -> Self {
         let is_cdna = gfx_arch < 1100;
         let wave_size = if is_cdna { 64 } else { 32 };
@@ -736,6 +752,63 @@ impl IsaProfile {
             features,
             k_unroll_factor: if gfx_arch >= 940 { 8 } else { 4 },
             dot_cap: crate::dispatch::device_profile::DotProductCap::NativeBf16,
+        }
+    }
+
+    /// 从 Apple GPU family 构造 Metal IsaProfile (BCE-20260702-GPU-REGALLOC-SPILL)。
+    ///
+    /// Metal 着色器寄存器同样是声明式 (thread 级 threadgroup/register), 不走 x86
+    /// RegAllocator 线性扫描。vec_regs/gpr_regs 留空, 由 GpuLower fallback 按
+    /// VRegKind 直接命名。
+    pub fn metal(gpu_family: u32) -> Self {
+        let simd_width = 32; // Apple GPU SIMD width
+        let threadgroup_kb: usize = match gpu_family {
+            10 => 64,  // M4
+            9 => 32,   // M3
+            8 => 32,   // M2
+            7 => 32,   // M1
+            _ => 32,
+        };
+        let mut features = vec![IsaFeature::Fma, IsaFeature::WarpShuffle];
+        if gpu_family >= 7 {
+            features.push(IsaFeature::SiMDGroupMatrix);
+            features.push(IsaFeature::TileGemm { m: 16, n: 16, k: 16 });
+        }
+        Self {
+            platform: Platform::Metal {
+                simd_width,
+                gpu_family,
+                has_simdgroup_matrix: gpu_family >= 7,
+                threadgroup_mem_kb: threadgroup_kb,
+            },
+            gpr_regs: vec![],
+            scratch_gprs: vec![],
+            vec_regs: vec![],
+            scratch_vec_regs: vec![],
+            tile_regs: vec![],
+            mask_regs: vec![],
+            abi: AbiConvention {
+                arg_regs: vec![],
+                stack_arg_offset: 0,
+                callee_saved: vec![],
+                caller_saved: vec![],
+                callee_saved_vec: vec![],
+                stack_alignment: 0,
+                red_zone_bytes: 0,
+            },
+            cache: CacheHierarchy {
+                l1d_bytes: 0,
+                l1i_bytes: 0,
+                l2_bytes: 0,
+                l3_bytes: 0,
+                cacheline_bytes: 64,
+                tmem_bytes: 0,
+                smem_bytes: threadgroup_kb * 1024,
+                lds_bytes: 0,
+            },
+            features,
+            k_unroll_factor: 4,
+            dot_cap: crate::dispatch::device_profile::DotProductCap::SimdAssisted,
         }
     }
 
