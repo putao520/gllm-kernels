@@ -2428,9 +2428,8 @@ Ok(())
                             GpuDialect::Hip { .. } | GpuDialect::Metal { .. } => {
                                 match action {
                                     GprBranchAction::Skip(count) => {
-                                        self.emit_line(&format!("if (({bm} & {mask}u) == 0u) {{"));
-                                        for _ in 0..*count { self.emit_line("// skip"); }
-                                        self.emit_line("}");
+                                        return Err(CompilerError::CodegenViolation(
+                                            format!("GprBranchAction::Skip({count}): HIP/Metal conditional skip count not yet implemented (PTX uses bra label; HIP/Metal if-block cannot skip not-yet-emitted downstream instructions)")));
                                     }
                                     GprBranchAction::Exit(_) => {
                                         self.emit_line(&format!("if (({bm} & {mask}u) == 0u) goto {};", self.epilogue_label));
@@ -2471,9 +2470,8 @@ Ok(())
                             GpuDialect::Hip { .. } | GpuDialect::Metal { .. } => {
                                 match action {
                                     GprBranchAction::Skip(count) => {
-                                        self.emit_line(&format!("if (({bm} & {mask}u) != 0u) {{"));
-                                        for _ in 0..*count { self.emit_line("// skip"); }
-                                        self.emit_line("}");
+                                        return Err(CompilerError::CodegenViolation(
+                                            format!("GprBranchAction::Skip({count}): HIP/Metal conditional skip count not yet implemented (PTX uses bra label; HIP/Metal if-block cannot skip not-yet-emitted downstream instructions)")));
                                     }
                                     GprBranchAction::Exit(_) => {
                                         self.emit_line(&format!("if (({bm} & {mask}u) != 0u) goto {};", self.epilogue_label));
@@ -4368,15 +4366,18 @@ Ok(())
                                 self.emit_line(&format!("min.f32 {}, %tmp8, %tmp9;", dst_reg));
                             }
                             _ => {
-                                self.emit_line("// unsupported warp reduction op");
+                                return Err(CompilerError::CodegenViolation(
+                                    format!("WarpReduce: unsupported ReduceOp variant {:?}", op)));
                             }
                         }
                     }
                     GpuDialect::Hip { .. } => {
-                        self.emit_line("// hip warp reduction");
+                        return Err(CompilerError::CodegenViolation(
+                            "WarpReduce: HIP warp shuffle not yet implemented (use __shfl_down)".into()));
                     }
                     GpuDialect::Metal { .. } => {
-                        self.emit_line("// metal warp reduction");
+                        return Err(CompilerError::CodegenViolation(
+                            "WarpReduce: Metal simd_shuffle not yet implemented".into()));
                     }
                 }
                 Ok(())
