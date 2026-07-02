@@ -452,13 +452,18 @@ pub(crate) fn emit_gemm_gpu_tiled_inline(
     // 运行时按 .param seq_len 循环。Rust `for i_cta in (0..m).step_by(cta_m)` 在
     // M=Symbolic{max:8192} 时展开成 64 份内层嵌套 = 2.84 亿 VmInstr = 23GB OOM。
     //
-    // 偏移链分层 (architect 确认): VReg 部分 = i_cta * (k * elem) (每次 iteration 重算,
-    // 通过 OffsetExpr::Mul(LoopOffset(i_off), k*elem)), Const 部分 = i_warp*k*elem +
+    // N 循环同理: 即使 n 是 Concrete (vocab=49152), `for j_cta in (0..n).step_by(cta_n)`
+    // 展开成 n/cta_n=384 份内层嵌套 (每份 k_tile*i_warp*j_warp*k_inner*row*col ~ 数百
+    // 万 instr) → 仍 OOM。Concrete 但巨大的维度也必须 emit_loop (Const bound 但模板只
+    // 发一次)。micro-dim (cta_m/cta_n/warp_m/warp_n/mma_k) 是 NO-LOOP-UNROLL 例外。
+    //
+    // 偏移链分层 (architect 确认): VReg 部分 = i_cta*(k*elem) + j_cta*elem via
+    // OffsetExpr::Mul(LoopOffset(i_off/j_off), stride); Const 部分 = i_warp*k*elem +
     // k_tile*elem + k_inner*elem (编译时确定, immediate offset)。
     //
-    // mi 假设 = cta_m (full tile)。部分 tile (seq_len % cta_m != 0) 的越界 store 仅写
-    // 到 max_value 预留的 buffer 尾部 (output/activation 按 max_for_allocation 分配),
-    // 测试只读 last token row (i_cta=0 区间内) → 数值正确, 不崩溃 (architect 评估低风险)。
+    // mi/nj 假设 = cta_m/cta_n (full tile)。部分 tile 越界 store 仅写到 max_value 预留
+    // buffer 尾部 (output/activation 按 max_for_allocation 分配), 测试只读 last token
+    // row (i_cta=0 区间) → 数值正确不崩溃 (architect 评估低风险)。
     // K-reduction 顺序不变 (k_tile/k_inner 内层 Rust for 顺序与 Concrete 路径一致)。
     if m_symbolic {
         // step_bytes=1 → byte_offset VReg = iteration index (counter*1)。LoopOffset(i_off)
@@ -471,18 +476,25 @@ pub(crate) fn emit_gemm_gpu_tiled_inline(
             // C 行基偏移 (i_cta * n * c_elem) — VReg 部分。
             let c_row_base = OffsetExpr::Mul(Box::new(OffsetExpr::LoopOffset(i_off)), n * c_elem);
 
-            // N 维度 CTA 循环: n 是 Concrete (vocab) → Rust for (Const, micro-dim 例外)。
-            for j_cta in (0..n).step_by(cta_n) {
-                let nj = cta_n.min(n - j_cta);
+            // N 维度 CTA 循环: n=49152 (Concrete 但巨大) → 必须 emit_loop, 禁止 Rust for 展开。
+            // step=1, bound = n/cta_n (CTA tile 数, e.g. 49152/128=384)。j_off = CTA tile 索引 (0..384)。
+            // j_cta = j_off * cta_n; j_cta 字节偏移 = j_off * cta_n * elem (via OffsetExpr::Mul)。
+            let n_tiles = (n + cta_n - 1) / cta_n; // 向上取整 (full tile 假设下 == n/cta_n)
+            prog.emit_loop_try::<CompilerError>(BoundExpr::Const(n_tiles), 1, |prog, _j_ctr, j_off| {
+                // j_off = 当前 CTA tile 的 N tile 索引 (counter, step=1)。
+                let nj = cta_n; // full tile 假设 (部分 tile 见上方注释)
 
                 // 清零累加器
                 for acc in &accs {
                     prog.emit(VmInstr::Broadcast { dst: *acc, src: ScalarExpr::Const(0.0), width, dtype: acc_dtype });
                 }
 
-                // K 维度循环: k 是 Concrete (hidden) → Rust for。
-                for k_tile in (0..k).step_by(cta_k) {
-                    let kk = cta_k.min(k - k_tile);
+                // K 维度循环: k=576 (Concrete 但中等) → emit_loop 避免 18 份展开。
+                // step=1, bound = k/cta_k (K tile 数, e.g. 576/32=18)。k_ctr = K tile 索引 (0..18)。
+                let k_tiles = (k + cta_k - 1) / cta_k;
+                prog.emit_loop_try::<CompilerError>(BoundExpr::Const(k_tiles), 1, |prog, k_ctr, _k_off| {
+                    // k_ctr = 当前 K tile 索引 (counter, step=1)。k_tile = k_ctr * cta_k。
+                    // kk = cta_k (full tile 假设)。
 
                     // Warp 级循环: micro-dim (warp_m/warp_n) → Rust for (例外)。
                     for i_warp in (0..cta_m).step_by(warp_m) {
@@ -490,18 +502,41 @@ pub(crate) fn emit_gemm_gpu_tiled_inline(
                         for j_warp in (0..nj).step_by(warp_n) {
                             let wj = warp_n.min(nj - j_warp);
 
-                            // MMA 内层 K 循环: micro-dim (mma_k) → Rust for (例外)。
-                            for k_inner in (0..kk).step_by(mma_k) {
-                                // A off = a_row_base + (i_warp)*k*a_elem + (k_tile+k_inner)*a_elem
+                            // MMA 内层 K 循环: micro-dim (mma_k) → Rust for (例外)。kk=cta_k (full)。
+                            for k_inner in (0..cta_k).step_by(mma_k) {
+                                // A off = a_row_base + i_warp*k*a_elem + k_tile*a_elem + k_inner*a_elem
+                                //   k_tile VReg 部分: Mul(LoopOffset(k_ctr), cta_k*a_elem) (k_tile=k_ctr*cta_k)
+                                //   i_warp/k_inner: Const
+                                let k_tile_byte = OffsetExpr::Mul(
+                                    Box::new(OffsetExpr::LoopOffset(k_ctr)), cta_k * a_elem);
                                 let a_off = OffsetExpr::Add(
                                     Box::new(OffsetExpr::Add(
-                                        Box::new(a_row_base.clone()),
-                                        Box::new(OffsetExpr::Const(i_warp * k * a_elem)),
+                                        Box::new(OffsetExpr::Add(
+                                            Box::new(a_row_base.clone()),
+                                            Box::new(OffsetExpr::Const(i_warp * k * a_elem)),
+                                        )),
+                                        Box::new(k_tile_byte),
                                     )),
-                                    Box::new(OffsetExpr::Const((k_tile + k_inner) * a_elem)),
+                                    Box::new(OffsetExpr::Const(k_inner * a_elem)),
                                 );
-                                // B off = ((k_tile+k_inner)*n + j_cta+j_warp) * b_elem (Const, 不依赖 i_cta)
-                                let b_off = ((k_tile + k_inner) * n + j_cta + j_warp) * b_elem;
+                                // B off = ((k_tile+k_inner)*n + j_cta+j_warp) * b_elem
+                                //   k_tile VReg: Mul(LoopOffset(k_ctr), cta_k*n*b_elem)
+                                //   j_cta VReg: Mul(LoopOffset(j_off), cta_n*b_elem) (j_cta=j_off*cta_n)
+                                //   k_inner/j_warp: Const
+                                let j_cta_byte_b = OffsetExpr::Mul(
+                                    Box::new(OffsetExpr::LoopOffset(j_off)), cta_n * b_elem);
+                                let k_tile_byte_b = OffsetExpr::Mul(
+                                    Box::new(OffsetExpr::LoopOffset(k_ctr)), cta_k * n * b_elem);
+                                let b_off = OffsetExpr::Add(
+                                    Box::new(OffsetExpr::Add(
+                                        Box::new(k_tile_byte_b),
+                                        Box::new(OffsetExpr::Const(k_inner * n * b_elem)),
+                                    )),
+                                    Box::new(OffsetExpr::Add(
+                                        Box::new(j_cta_byte_b),
+                                        Box::new(OffsetExpr::Const(j_warp * b_elem)),
+                                    )),
+                                );
 
                                 for row in 0..wi {
                                     let a_row_off = OffsetExpr::Add(
@@ -516,11 +551,14 @@ pub(crate) fn emit_gemm_gpu_tiled_inline(
                                     });
 
                                     for col in 0..wj {
-                                        let b_col_off = b_off + col * b_elem;
+                                        let b_col_off = OffsetExpr::Add(
+                                            Box::new(b_off.clone()),
+                                            Box::new(OffsetExpr::Const(col * b_elem)),
+                                        );
                                         let b_vec = prog.alloc_vreg(VRegKind::Vec, width);
                                         prog.emit(VmInstr::VecLoad {
                                             dst: b_vec, base: b_ptr,
-                                            offset: OffsetExpr::Const(b_col_off),
+                                            offset: b_col_off,
                                             width, dtype: b_dtype, predicate: None,
                                         });
 
@@ -539,16 +577,27 @@ pub(crate) fn emit_gemm_gpu_tiled_inline(
                             }
                         }
                     }
-                }
+                    Ok(())
+                })?;
 
                 // 写回 C tile: c_row_base + (row*n + j_cta + col) * c_elem
+                //   = c_row_base + row*n*c_elem + j_cta*c_elem + col*c_elem
+                //   j_cta VReg 部分: Mul(LoopOffset(j_off), cta_n*c_elem)
+                let j_cta_byte_c_wb = OffsetExpr::Mul(
+                    Box::new(OffsetExpr::LoopOffset(j_off)), cta_n * c_elem);
                 for row in 0..cta_m.min(warp_m) {
                     for col in 0..nj.min(warp_n) {
                         let acc_idx = row * nj.min(warp_n) + col;
                         if acc_idx < accs.len() {
                             let c_off = OffsetExpr::Add(
-                                Box::new(c_row_base.clone()),
-                                Box::new(OffsetExpr::Const(((row * n + j_cta + col) * c_elem))),
+                                Box::new(OffsetExpr::Add(
+                                    Box::new(c_row_base.clone()),
+                                    Box::new(OffsetExpr::Const(row * n * c_elem)),
+                                )),
+                                Box::new(OffsetExpr::Add(
+                                    Box::new(j_cta_byte_c_wb.clone()),
+                                    Box::new(OffsetExpr::Const(col * c_elem)),
+                                )),
                             );
                             let store_src = if needs_narrow {
                                 let narrowed = prog.alloc_vreg(VRegKind::Vec, width);
@@ -567,7 +616,8 @@ pub(crate) fn emit_gemm_gpu_tiled_inline(
                         }
                     }
                 }
-            }
+                Ok(())
+            })?;
             Ok(())
         })?;
         return Ok(());
