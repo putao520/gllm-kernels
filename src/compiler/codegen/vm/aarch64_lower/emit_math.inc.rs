@@ -474,6 +474,13 @@ impl AArch64Lower {
                 }
                 Ok(tmp)
             }
+            // ThreadOffset/ThreadCoord 是 GPU SIMT 线程坐标, AArch64 后端无对应硬件变量 → codegen 路径错配
+            OffsetExpr::ThreadOffset(dim, _) => Err(CompilerError::CodegenViolation(format!(
+                "aarch64_lower: ThreadOffset({:?}) is GPU-only, cannot resolve on AArch64 backend", dim
+            ))),
+            OffsetExpr::ThreadCoord(coord, _) => Err(CompilerError::CodegenViolation(format!(
+                "aarch64_lower: ThreadCoord({:?}) is GPU-only, cannot resolve on AArch64 backend", coord
+            ))),
         }
     }
 

@@ -30,6 +30,8 @@ pub mod vm_state;
 pub mod x86_lower;
 pub mod aarch64_lower;
 pub mod gpu_lower;
+/// GPU SIMT 线程分区原语 (thread tile 抽象, ARCH-GPU-SIMT-THREAD-MODEL)。
+pub mod gpu_thread_tile;
 pub mod plan_lower;
 pub mod attention_emit;
 pub mod gemm_emit;

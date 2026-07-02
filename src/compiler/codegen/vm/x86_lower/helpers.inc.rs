@@ -270,6 +270,13 @@ impl X86Lower {
                 if val != scratch { self.asm.mov(scratch, val).map_err(Self::err)?; }
                 Ok(scratch)
             }
+            // ThreadOffset 是 GPU SIMT 线程坐标, x86 后端无对应硬件变量 → codegen 路径错配
+            OffsetExpr::ThreadOffset(dim, _) => Err(CompilerError::CodegenViolation(format!(
+                "x86_lower: ThreadOffset({:?}) is GPU-only, cannot resolve on x86 backend", dim
+            ))),
+            OffsetExpr::ThreadCoord(coord, _) => Err(CompilerError::CodegenViolation(format!(
+                "x86_lower: ThreadCoord({:?}) is GPU-only, cannot resolve on x86 backend", coord
+            ))),
         }
     }
 
@@ -684,6 +691,13 @@ impl X86Lower {
                     ));
                 }
             }
+            // ThreadOffset 是 GPU SIMT 线程坐标, x86 后端无对应硬件变量 → codegen 路径错配
+            OffsetExpr::ThreadOffset(dim, _) => return Err(CompilerError::CodegenViolation(format!(
+                "x86_lower eval_offset_to_rax: ThreadOffset({:?}) is GPU-only, cannot evaluate on x86", dim
+            ))),
+            OffsetExpr::ThreadCoord(coord, _) => return Err(CompilerError::CodegenViolation(format!(
+                "x86_lower eval_offset_to_rax: ThreadCoord({:?}) is GPU-only, cannot evaluate on x86", coord
+            ))),
         }
         Ok(())
     }

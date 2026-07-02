@@ -119,6 +119,63 @@ impl GpuLower {
             OffsetExpr::Add(a, b) => format!("({}+{})", self.offset_to_string(a, alloc), self.offset_to_string(b, alloc)),
             OffsetExpr::Mul(inner, scale) => format!("({}*{scale})", self.offset_to_string(inner, alloc)),
             OffsetExpr::ScalarVReg(v) => self.reg_name_with_kind(*v, alloc),
+            // ARCH-GPU-SIMT-THREAD-MODEL: ThreadOffset 映射到各 dialect 的 SIMT 硬件内置变量。
+            // 值 = thread_dim_runtime × scale (字节偏移由线程坐标驱动)。
+            OffsetExpr::ThreadOffset(dim, scale) => {
+                let var = self.thread_dim_var(*dim);
+                if *scale == 1 {
+                    var
+                } else {
+                    format!("({var}*{scale})")
+                }
+            }
+            // ARCH-GPU-SIMT-THREAD-MODEL: ThreadCoord 支持双轴 lane 切分 (div/mod on lane_id)。
+            OffsetExpr::ThreadCoord(coord, scale) => {
+                let coord_str = self.thread_coord_to_string(*coord);
+                if *scale == 1 {
+                    coord_str
+                } else {
+                    format!("({coord_str}*{scale})")
+                }
+            }
+        }
+    }
+
+    /// 返回某 SIMT 线程维度的硬件运行时变量名 (gpu_ir 线程分区原语, 各 dialect 映射)。
+    fn thread_dim_var(&self, dim: ThreadDim) -> String {
+        match (self.dialect, dim) {
+            (GpuDialect::Ptx { .. }, ThreadDim::X) => "%tid.x".to_string(),
+            (GpuDialect::Ptx { .. }, ThreadDim::Y) => "%tid.y".to_string(),
+            (GpuDialect::Ptx { .. }, ThreadDim::Lane) => "%laneid".to_string(),
+            (GpuDialect::Hip { .. }, ThreadDim::X) => "threadIdx.x".to_string(),
+            (GpuDialect::Hip { .. }, ThreadDim::Y) => "threadIdx.y".to_string(),
+            (GpuDialect::Hip { .. }, ThreadDim::Lane) => "__lane_id()".to_string(),
+            (GpuDialect::Metal { .. }, ThreadDim::X) => "thread_position_in_grid.x".to_string(),
+            (GpuDialect::Metal { .. }, ThreadDim::Y) => "thread_position_in_grid.y".to_string(),
+            (GpuDialect::Metal { .. }, ThreadDim::Lane) => "thread_index_in_simdgroup".to_string(),
+        }
+    }
+
+    /// 返回 SIMT 线程坐标运算表达式字符串 (支持 div/mod on lane_id, 双轴切分)。
+    fn thread_coord_to_string(&self, coord: ThreadCoordExpr) -> String {
+        use ThreadCoordExpr::*;
+        let (dim, op, divisor) = match coord {
+            Identity(dim) => return self.thread_dim_var(dim),
+            Div(dim, d) => (dim, '/', d),
+            Mod(dim, d) => (dim, '%', d),
+        };
+        let var = self.thread_dim_var(dim);
+        // divisor 须 2 的幂 (PTX shr.u32); rem.u32 支持任意模数
+        match self.dialect {
+            GpuDialect::Ptx { .. } => {
+                // PTX: 用寄存器暂存, div→shr (2的幂), mod→rem
+                if op == '/' {
+                    format!("({var} >> {divisor:.0})", divisor = (divisor as f64).log2() as u32)
+                } else {
+                    format!("({var} % {divisor})")
+                }
+            }
+            _ => format!("({var} {op} {divisor})"),
         }
     }
 

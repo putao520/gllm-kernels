@@ -90,6 +90,41 @@ pub enum TmaSwizzle {
 // §2 表达式类型 (编译时推导，不允许硬编码)
 // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
+/// GPU SIMT 线程维度标识 (gpu_ir 层线程分区原语, ARCH-GPU-SIMT-THREAD-MODEL)。
+///
+/// GPU 运行时并行来自 threadIdx/blockIdx/laneId, 不是 Rust unroll。本枚举让 VmInstr
+/// 偏移表达式引用 SIMT 硬件线程坐标, lower 时各 dialect 映射到对应的 PTX/HIP/Metal
+/// 内置变量:
+/// - X → PTX `%tid.x` / HIP `threadIdx.x` / Metal `thread_position_in_grid.x`
+/// - Y → PTX `%tid.y` / HIP `threadIdx.y` / Metal `thread_position_in_grid.y`
+/// - Lane → PTX `%laneid` / HIP `__lane_id()` / Metal `thread_index_in_simdgroup`
+///
+/// 用于 GPU GEMM thread-tile 映射: 每个 lane 持有 TM×TN 寄存器 accumulator, 输出元素
+/// 的全局位置 = tile_base + lane_id * stride + thread_row/col * elem。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ThreadDim {
+    /// threadIdx.x (block 内 x 维线程索引)
+    X,
+    /// threadIdx.y (block 内 y 维线程索引)
+    Y,
+    /// lane id (warp 内 0..31, 来自 `%laneid`/`__lane_id`)
+    Lane,
+}
+
+/// GPU SIMT 线程坐标运算 (gpu_ir 层, 支持双轴 lane 切分)。
+///
+/// `ThreadOffset(dim, scale)` 只能表达 `thread_dim * scale` (单轴切分)。双轴切分
+/// (lane 同时切行+列) 需 `lane_id / divisor` 和 `lane_id % divisor`, 用本枚举表达。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ThreadCoordExpr {
+    /// thread_dim 的原始值 (e.g. lane_id)
+    Identity(ThreadDim),
+    /// thread_dim 的值整除 divisor (lane_id / divisor), PTX `shr.u32` (divisor 须 2 的幂)
+    Div(ThreadDim, usize),
+    /// thread_dim 的值取模 divisor (lane_id % divisor), PTX `rem.u32`
+    Mod(ThreadDim, usize),
+}
+
 /// 偏移表达式——从布局参数推导，ISA Lower 时计算。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum OffsetExpr {
@@ -103,6 +138,12 @@ pub enum OffsetExpr {
     Mul(Box<OffsetExpr>, usize),
     /// 运行时标量 VReg 作为字节偏移 (Gather 间接寻址)
     ScalarVReg(VRegId),
+    /// GPU SIMT 线程坐标的单轴字节贡献: thread_dim_value × scale。
+    /// 双轴切分用 ThreadCoord (支持 div/mod)。
+    ThreadOffset(ThreadDim, usize),
+    /// GPU SIMT 线程坐标运算的字节贡献: coord_value × scale。
+    /// 支持双轴 lane 切分 (lane_id/divisor, lane_id%divisor)。
+    ThreadCoord(ThreadCoordExpr, usize),
 }
 
 impl OffsetExpr {
@@ -118,7 +159,7 @@ impl OffsetExpr {
                 Box::new(inner.substitute_loop_offset(vreg, value)),
                 *scale,
             ),
-            // ScalarVReg is a runtime value, not a loop offset — pass through
+            // ScalarVReg / ThreadOffset 是运行时值, 非循环 offset — 透传
             other => other.clone(),
         }
     }

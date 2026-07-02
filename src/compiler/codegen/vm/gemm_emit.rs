@@ -358,27 +358,27 @@ pub(crate) fn emit_gemm_blis_inline(
                         for c in 0..nr_actual {
                             let b_off = j_block * b_col_stride + c * lanes * b_col_stride;
                             let acc_idx = r * nr_actual + c;
-                            if acc_idx < accs.len() {
-                                prog.emit(VmInstr::VecLoad {
-                                    dst: b_vec, base: b_ptr,
-                                    offset: OffsetExpr::Add(
-                                        Box::new(OffsetExpr::Add(
-                                            Box::new(OffsetExpr::Mul(Box::new(OffsetExpr::LoopOffset(k_ctr)), b_row_stride * k_unroll)),
-                                            Box::new(OffsetExpr::Const(b_k_off)),
-                                        )),
-                                        Box::new(OffsetExpr::Const(b_off)),
-                                    ),
-                                    width, dtype: b_dtype, predicate: None,
-                                });
-                                // Direct FMA: dst = acc + a * b (in-place accumulate, F32 accumulator)
-                                prog.emit(VmInstr::Fma {
-                                    dst: accs[acc_idx],
-                                    acc: accs[acc_idx],
-                                    a: a_broadcast,
-                                    b: b_vec,
-                                    dtype: acc_dtype,
-                                });
-                            }
+                            // BCE-20260702-GPU-ACC-GUARD: acc_idx ∈ 0..(mr_actual*nr_actual) ≤ mr*nr == accs.len()
+                            // (r < mr_actual, c < nr_actual), 守卫恒真 → 删除 (NO_SILENT_FALLBACK 根治)
+                            prog.emit(VmInstr::VecLoad {
+                                dst: b_vec, base: b_ptr,
+                                offset: OffsetExpr::Add(
+                                    Box::new(OffsetExpr::Add(
+                                        Box::new(OffsetExpr::Mul(Box::new(OffsetExpr::LoopOffset(k_ctr)), b_row_stride * k_unroll)),
+                                        Box::new(OffsetExpr::Const(b_k_off)),
+                                    )),
+                                    Box::new(OffsetExpr::Const(b_off)),
+                                ),
+                                width, dtype: b_dtype, predicate: None,
+                            });
+                            // Direct FMA: dst = acc + a * b (in-place accumulate, F32 accumulator)
+                            prog.emit(VmInstr::Fma {
+                                dst: accs[acc_idx],
+                                acc: accs[acc_idx],
+                                a: a_broadcast,
+                                b: b_vec,
+                                dtype: acc_dtype,
+                            });
                         }
                     }
                 }
@@ -388,20 +388,19 @@ pub(crate) fn emit_gemm_blis_inline(
             for r in 0..mr_actual {
                 for c in 0..nr_actual {
                     let acc_idx = r * nr_actual + c;
-                    if acc_idx < accs.len() {
-                        let c_off = (i_block + r) * n * c_elem + (j_block + c * lanes) * c_elem;
-                        let store_src = if needs_narrow {
-                            let narrowed = prog.alloc_vreg(VRegKind::Vec, width);
-                            prog.emit(VmInstr::VecNarrow { dst: narrowed, src: accs[acc_idx], dst_dtype: c_dtype, src_dtype: acc_dtype, width });
-                            narrowed
-                        } else {
-                            accs[acc_idx]
-                        };
-                        prog.emit(VmInstr::VecStore {
-                            base: c_ptr, offset: OffsetExpr::Const(c_off), src: store_src, width,
-                            dtype: c_dtype, predicate: None,
-                        });
-                    }
+                    // BCE-20260702-GPU-ACC-GUARD: acc_idx < accs.len() 恒真 → 删除 (NO_SILENT_FALLBACK 根治)
+                    let c_off = (i_block + r) * n * c_elem + (j_block + c * lanes) * c_elem;
+                    let store_src = if needs_narrow {
+                        let narrowed = prog.alloc_vreg(VRegKind::Vec, width);
+                        prog.emit(VmInstr::VecNarrow { dst: narrowed, src: accs[acc_idx], dst_dtype: c_dtype, src_dtype: acc_dtype, width });
+                        narrowed
+                    } else {
+                        accs[acc_idx]
+                    };
+                    prog.emit(VmInstr::VecStore {
+                        base: c_ptr, offset: OffsetExpr::Const(c_off), src: store_src, width,
+                        dtype: c_dtype, predicate: None,
+                    });
                 }
             }
         }
@@ -441,11 +440,16 @@ pub(crate) fn emit_gemm_gpu_tiled_inline(
     // Level 2: Warp 循环 — CTA 内每个 warp 处理 warp_m × warp_n
     // Level 3: MMA 微核 — warp 内 MMA 指令处理 mma_k 深度
 
-    // 累加器: warp_m × warp_n f32 寄存器
-    let acc_count = warp_m * warp_n;
-    let accs: Vec<VRegId> = (0..acc_count.min(16))
-        .map(|_| prog.alloc_vreg(VRegKind::Vec, width))
-        .collect();
+    // ARCH-GPU-SIMT-THREAD-MODEL (architect 决策 DECISION-gpu-gemm-accs-warp-model 选项 B):
+    // accumulator 尺寸 = thread tile (tm×tn, 小编译期常量), 不是 warp tile (warp_m×warp_n)。
+    // 旧实现 `accs = (0..warp_m*warp_n).min(16)` + `if acc_idx < accs.len()` 守卫是 NO_SILENT_FALLBACK
+    // 违规 (warp_m*warp_n=2048 → 只填前 16 acc, 2032 输出单元静默丢弃)。改用 GpuThreadTile
+    // 切分: 一个 warp (32 lane) 协同覆盖 warp_m×warp_n, 每 lane 持有 tm×tn 寄存器 accumulator
+    // (≤64, 远低于 PTX ~255 f32 上限), 运行时并行来自 lane_id (OffsetExpr::ThreadOffset(Lane, scale))。
+    let thread_tile = super::gpu_thread_tile::GpuThreadTile::for_warp(warp_m, warp_n, 64);
+    thread_tile.validate()?;
+    let accs: Vec<VRegId> = thread_tile.alloc_accs(prog, width);
+    let (tm, tn) = (thread_tile.tm, thread_tile.tn);
 
     // BCE-20260702-GPU-OOM 根治 (ARCH-SYMDIM-NO-CONST-DEGRADE + ARCH-NO-LOOP-UNROLL):
     // M 循环在 Symbolic 时必须用 emit_loop(BoundExpr::Symbolic) —— 模板只发一次,
@@ -538,14 +542,18 @@ pub(crate) fn emit_gemm_gpu_tiled_inline(
                                     )),
                                 );
 
-                                // row/col 循环: warp_m/warp_n > UNROLL_THRESHOLD → 理想应 emit_loop,
-                                // 但 accs[] 数组需编译时索引 (acc_idx=row*wj+col), emit_loop 的 counter
-                                // 是运行时 VReg 无法做编译时索引。保留 Rust for 展开 (与 Concrete 路径
-                                // 一致), acc_idx<accs.len() 守卫保证只填前 16 个 acc (Concrete 路径同行为)。
-                                // 卡点: warp_m*warp_n=2048>16 时大部分输出单元无 acc (预存设计缺陷, 非本 TASK)。
-                                for row in 0..wi {
+                                // row/col 循环: thread tile (tm×tn, micro-dim ≤64) → Rust for (NO-LOOP-UNROLL 例外)。
+                                // accs 尺寸 = tm*tn, acc_idx = row*tn + col ∈ 0..(tm*tn) == accs.len()，
+                                // 守卫天然恒真 → 删除 `if acc_idx < accs.len()` (NO_SILENT_FALLBACK 根治)。
+                                // 每 lane 的输出行/列基偏移由 ThreadOffset(Lane, scale) 注入 (SIMT 并行)。
+                                // A 行偏移: lane_row_byte_offset(k*a_elem) + thread_row*k*a_elem
+                                let lane_a_row = thread_tile.lane_row_byte_offset(k * a_elem);
+                                for row in 0..tm {
                                     let a_row_off = OffsetExpr::Add(
-                                        Box::new(a_off.clone()),
+                                        Box::new(OffsetExpr::Add(
+                                            Box::new(a_off.clone()),
+                                            Box::new(lane_a_row.clone()),
+                                        )),
                                         Box::new(OffsetExpr::Const(row * k * a_elem)),
                                     );
                                     let a_vec = prog.alloc_vreg(VRegKind::Vec, width);
@@ -555,9 +563,14 @@ pub(crate) fn emit_gemm_gpu_tiled_inline(
                                         width, dtype: a_dtype, predicate: None,
                                     });
 
-                                    for col in 0..wj {
+                                    for col in 0..tn {
+                                        // B 列偏移: lane_col_byte_offset(b_elem) + thread_col*b_elem
+                                        let lane_b_col = thread_tile.lane_col_byte_offset(b_elem);
                                         let b_col_off = OffsetExpr::Add(
-                                            Box::new(b_off.clone()),
+                                            Box::new(OffsetExpr::Add(
+                                                Box::new(b_off.clone()),
+                                                Box::new(lane_b_col.clone()),
+                                            )),
                                             Box::new(OffsetExpr::Const(col * b_elem)),
                                         );
                                         let b_vec = prog.alloc_vreg(VRegKind::Vec, width);
@@ -567,16 +580,15 @@ pub(crate) fn emit_gemm_gpu_tiled_inline(
                                             width, dtype: b_dtype, predicate: None,
                                         });
 
-                                        let acc_idx = row * wj + col;
-                                        if acc_idx < accs.len() {
-                                            prog.emit(VmInstr::Fma {
-                                                dst: accs[acc_idx],
-                                                acc: accs[acc_idx],
-                                                a: a_vec,
-                                                b: b_vec,
-                                                dtype: acc_dtype,
-                                            });
-                                        }
+                                        let acc_idx = row * tn + col;
+                                        // acc_idx < accs.len() 恒真 (tm*tn == accs.len()) → 守卫删除
+                                        prog.emit(VmInstr::Fma {
+                                            dst: accs[acc_idx],
+                                            acc: accs[acc_idx],
+                                            a: a_vec,
+                                            b: b_vec,
+                                            dtype: acc_dtype,
+                                        });
                                     }
                                 }
                             }
@@ -585,40 +597,47 @@ pub(crate) fn emit_gemm_gpu_tiled_inline(
                     Ok(())
                 })?;
 
-                // 写回 C tile: c_row_base + (row*n + j_cta + col) * c_elem
-                //   = c_row_base + row*n*c_elem + j_cta*c_elem + col*c_elem
+                // 写回 C tile: c_row_base + lane_row_byte_offset(n*c_elem) + row*n*c_elem
+                //                + j_cta_byte_c_wb + lane_col_byte_offset(c_elem) + col*c_elem
                 //   j_cta VReg 部分: Mul(LoopOffset(j_off), cta_n*c_elem)
                 let j_cta_byte_c_wb = OffsetExpr::Mul(
                     Box::new(OffsetExpr::LoopOffset(j_off)), cta_n * c_elem);
-                for row in 0..cta_m.min(warp_m) {
-                    for col in 0..nj.min(warp_n) {
-                        let acc_idx = row * nj.min(warp_n) + col;
-                        if acc_idx < accs.len() {
-                            let c_off = OffsetExpr::Add(
+                let lane_c_row = thread_tile.lane_row_byte_offset(n * c_elem);
+                let lane_c_col = thread_tile.lane_col_byte_offset(c_elem);
+                for row in 0..tm {
+                    for col in 0..tn {
+                        let acc_idx = row * tn + col;
+                        // acc_idx < accs.len() 恒真 → 守卫删除 (NO_SILENT_FALLBACK 根治)
+                        let c_off = OffsetExpr::Add(
+                            Box::new(OffsetExpr::Add(
                                 Box::new(OffsetExpr::Add(
                                     Box::new(c_row_base.clone()),
-                                    Box::new(OffsetExpr::Const(row * n * c_elem)),
+                                    Box::new(lane_c_row.clone()),
                                 )),
+                                Box::new(OffsetExpr::Const(row * n * c_elem)),
+                            )),
+                            Box::new(OffsetExpr::Add(
                                 Box::new(OffsetExpr::Add(
                                     Box::new(j_cta_byte_c_wb.clone()),
-                                    Box::new(OffsetExpr::Const(col * c_elem)),
+                                    Box::new(lane_c_col.clone()),
                                 )),
-                            );
-                            let store_src = if needs_narrow {
-                                let narrowed = prog.alloc_vreg(VRegKind::Vec, width);
-                                prog.emit(VmInstr::VecNarrow { dst: narrowed, src: accs[acc_idx], dst_dtype: c_dtype, src_dtype: acc_dtype, width });
-                                narrowed
-                            } else {
-                                accs[acc_idx]
-                            };
-                            prog.emit(VmInstr::VecStore {
-                                base: c_ptr,
-                                offset: c_off,
-                                src: store_src,
-                                width,
-                                dtype: c_dtype, predicate: None,
-                            });
-                        }
+                                Box::new(OffsetExpr::Const(col * c_elem)),
+                            )),
+                        );
+                        let store_src = if needs_narrow {
+                            let narrowed = prog.alloc_vreg(VRegKind::Vec, width);
+                            prog.emit(VmInstr::VecNarrow { dst: narrowed, src: accs[acc_idx], dst_dtype: c_dtype, src_dtype: acc_dtype, width });
+                            narrowed
+                        } else {
+                            accs[acc_idx]
+                        };
+                        prog.emit(VmInstr::VecStore {
+                            base: c_ptr,
+                            offset: c_off,
+                            src: store_src,
+                            width,
+                            dtype: c_dtype, predicate: None,
+                        });
                     }
                 }
                 Ok(())
@@ -629,6 +648,8 @@ pub(crate) fn emit_gemm_gpu_tiled_inline(
     }
 
     // Concrete M 路径 (原实现, 保留): mi/nj/kk 编译时确定, 无 OOM 风险。
+    // ARCH-GPU-SIMT-THREAD-MODEL: 同样用 thread tile (tm×tn) accumulator + lane offset 注入,
+    // 删除 `if acc_idx < accs.len()` 守卫 (Concrete 路径同样命中 NO_SILENT_FALLBACK 违规)。
     // CTA 级循环: 遍历 M/N 维度
     for i_cta in (0..m).step_by(cta_m) {
         let mi = cta_m.min(m - i_cta);
@@ -653,40 +674,56 @@ pub(crate) fn emit_gemm_gpu_tiled_inline(
                         // MMA 内层 K 循环: 加载 A/B tile → FMA → 累加
                         for k_inner in (0..kk).step_by(mma_k) {
                             // A is row-major (m×k) with a_elem; B is row-major (k×n) with b_elem.
-                            // Load A tile: a_ptr + ((i_cta+i_warp)*k + k_tile+k_inner) * a_elem
+                            // Load A tile base: a_ptr + ((i_cta+i_warp)*k + k_tile+k_inner) * a_elem
                             let a_off = ((i_cta + i_warp) * k + k_tile + k_inner) * a_elem;
-                            // Load B tile: b_ptr + ((k_tile+k_inner)*n + j_cta+j_warp) * b_elem
+                            // Load B tile base: b_ptr + ((k_tile+k_inner)*n + j_cta+j_warp) * b_elem
                             let b_off = ((k_tile + k_inner) * n + j_cta + j_warp) * b_elem;
 
-                            for row in 0..wi {
-                                let a_row_off = a_off + row * k * a_elem;
+                            // thread tile (tm×tn) row/col: acc_idx = row*tn+col ∈ 0..(tm*tn) == accs.len()
+                            // lane 输出行/列基偏移由 ThreadOffset(Lane, scale) 注入 (SIMT 并行)
+                            let lane_a_row = thread_tile.lane_row_byte_offset(k * a_elem);
+                            let lane_b_col = thread_tile.lane_col_byte_offset(b_elem);
+                            for row in 0..tm {
+                                // a_row_off = a_off (Const) + lane_a_row + row*k*a_elem
+                                let a_row_off = OffsetExpr::Add(
+                                    Box::new(OffsetExpr::Add(
+                                        Box::new(OffsetExpr::Const(a_off)),
+                                        Box::new(lane_a_row.clone()),
+                                    )),
+                                    Box::new(OffsetExpr::Const(row * k * a_elem)),
+                                );
                                 let a_vec = prog.alloc_vreg(VRegKind::Vec, width);
                                 prog.emit(VmInstr::VecLoad {
                                     dst: a_vec, base: a_ptr,
-                                    offset: OffsetExpr::Const(a_row_off),
+                                    offset: a_row_off,
                                     width, dtype: a_dtype, predicate: None,
                                 });
 
-                                for col in 0..wj {
-                                    let b_col_off = b_off + col * b_elem;
+                                for col in 0..tn {
+                                    let b_col_off = OffsetExpr::Add(
+                                        Box::new(OffsetExpr::Add(
+                                            Box::new(OffsetExpr::Const(b_off)),
+                                            Box::new(lane_b_col.clone()),
+                                        )),
+                                        Box::new(OffsetExpr::Const(col * b_elem)),
+                                    );
                                     let b_vec = prog.alloc_vreg(VRegKind::Vec, width);
                                     prog.emit(VmInstr::VecLoad {
                                         dst: b_vec, base: b_ptr,
-                                        offset: OffsetExpr::Const(b_col_off),
+                                        offset: b_col_off,
                                         width, dtype: b_dtype, predicate: None,
                                     });
 
-                                    // FMA: acc[row * wj + col] += a_vec * b_vec (F32 accumulator)
-                                    let acc_idx = row * wj + col;
-                                    if acc_idx < accs.len() {
-                                        prog.emit(VmInstr::Fma {
-                                            dst: accs[acc_idx],
-                                            acc: accs[acc_idx],
-                                            a: a_vec,
-                                            b: b_vec,
-                                            dtype: acc_dtype,
-                                        });
-                                    }
+                                    // FMA: acc[row * tn + col] += a_vec * b_vec (F32 accumulator)
+                                    let acc_idx = row * tn + col;
+                                    // acc_idx < accs.len() 恒真 → 守卫删除 (NO_SILENT_FALLBACK 根治)
+                                    prog.emit(VmInstr::Fma {
+                                        dst: accs[acc_idx],
+                                        acc: accs[acc_idx],
+                                        a: a_vec,
+                                        b: b_vec,
+                                        dtype: acc_dtype,
+                                    });
                                 }
                             }
                         }
@@ -694,27 +731,42 @@ pub(crate) fn emit_gemm_gpu_tiled_inline(
                 }
             }
 
-            // 写回 C tile: c_ptr + ((i_cta+row)*n + j_cta+col) * c_elem
-            for row in 0..mi.min(warp_m) {
-                for col in 0..nj.min(warp_n) {
-                    let acc_idx = row * nj.min(warp_n) + col;
-                    if acc_idx < accs.len() {
-                        let c_off = ((i_cta + row) * n + j_cta + col) * c_elem;
-                        let store_src = if needs_narrow {
-                            let narrowed = prog.alloc_vreg(VRegKind::Vec, width);
-                            prog.emit(VmInstr::VecNarrow { dst: narrowed, src: accs[acc_idx], dst_dtype: c_dtype, src_dtype: acc_dtype, width });
-                            narrowed
-                        } else {
-                            accs[acc_idx]
-                        };
-                        prog.emit(VmInstr::VecStore {
-                            base: c_ptr,
-                            offset: OffsetExpr::Const(c_off),
-                            src: store_src,
-                            width,
-                            dtype: c_dtype, predicate: None,
-                        });
-                    }
+            // 写回 C tile: c_ptr + (i_cta*n + j_cta)*c_elem + lane_row(n*c_elem) + row*n*c_elem
+            //                + lane_col(c_elem) + col*c_elem
+            let c_base = (i_cta * n + j_cta) * c_elem;
+            let lane_c_row = thread_tile.lane_row_byte_offset(n * c_elem);
+            let lane_c_col = thread_tile.lane_col_byte_offset(c_elem);
+            for row in 0..tm {
+                for col in 0..tn {
+                    let acc_idx = row * tn + col;
+                    // acc_idx < accs.len() 恒真 → 守卫删除 (NO_SILENT_FALLBACK 根治)
+                    let c_off = OffsetExpr::Add(
+                        Box::new(OffsetExpr::Add(
+                            Box::new(OffsetExpr::Add(
+                                Box::new(OffsetExpr::Const(c_base)),
+                                Box::new(lane_c_row.clone()),
+                            )),
+                            Box::new(OffsetExpr::Const(row * n * c_elem)),
+                        )),
+                        Box::new(OffsetExpr::Add(
+                            Box::new(lane_c_col.clone()),
+                            Box::new(OffsetExpr::Const(col * c_elem)),
+                        )),
+                    );
+                    let store_src = if needs_narrow {
+                        let narrowed = prog.alloc_vreg(VRegKind::Vec, width);
+                        prog.emit(VmInstr::VecNarrow { dst: narrowed, src: accs[acc_idx], dst_dtype: c_dtype, src_dtype: acc_dtype, width });
+                        narrowed
+                    } else {
+                        accs[acc_idx]
+                    };
+                    prog.emit(VmInstr::VecStore {
+                        base: c_ptr,
+                        offset: c_off,
+                        src: store_src,
+                        width,
+                        dtype: c_dtype, predicate: None,
+                    });
                 }
             }
         }
@@ -762,6 +814,16 @@ pub(crate) fn emit_gemm_gpu_pipelined(
         return emit_gemm_gpu_tiled_inline(prog, m, n, k, width, a_ptr, b_ptr, c_ptr,
             cta_m, cta_n, cta_k, warp_m, warp_n, mma_k, a_dtype, b_dtype, c_dtype, _trans_b,
             true, m_bound);
+    }
+    // BCE-20260702-GPU-ACC-GUARD (NO_SILENT_FALLBACK 根治): pipelined 路径的
+    // emit_mma_on_smem 尚未引入 thread-tile 模型 (accs 用 .min(16) + 守卫)。
+    // warp_m*warp_n > 64 时降级到 tiled_inline (已用 GpuThreadTile 正确切分),
+    // 禁止 pipelined 路径静默跳过输出单元。pipelined 双缓冲加速仅对 small
+    // warp tile (acc_count ≤ 64) 保留, 数值正确不损。
+    if warp_m * warp_n > 64 {
+        return emit_gemm_gpu_tiled_inline(prog, m, n, k, width, a_ptr, b_ptr, c_ptr,
+            cta_m, cta_n, cta_k, warp_m, warp_n, mma_k, a_dtype, b_dtype, c_dtype, _trans_b,
+            false, m_bound);
     }
     // BCE-20260630-MIXED-P0.5: per-matrix dtype (ARCH-DTYPE-MIXED-PRECISION).
     // 三段式 dtype 感知：A-tile load=a_dtype, B-tile load=b_dtype, C-store=c_dtype;
@@ -826,9 +888,10 @@ pub(crate) fn emit_gemm_gpu_pipelined(
         });
     }
 
-    // Accumulator registers: warp_m × warp_n
+    // Accumulator registers: warp_m × warp_n (BCE-20260702-GPU-ACC-GUARD: 删除 .min(16) 截断;
+    // 上方 warp_m*warp_n > 64 已降级到 tiled_inline, 此处 acc_count ≤ 64, 全量分配无 VReg 爆炸)。
     let acc_count = warp_m * warp_n;
-    let accs: Vec<VRegId> = (0..acc_count.min(16))
+    let accs: Vec<VRegId> = (0..acc_count)
         .map(|_| prog.alloc_vreg(VRegKind::Vec, width))
         .collect();
 
@@ -930,23 +993,23 @@ pub(crate) fn emit_gemm_gpu_pipelined(
             for row in 0..mi.min(warp_m) {
                 for col in 0..nj.min(warp_n) {
                     let acc_idx = row * nj.min(warp_n) + col;
-                    if acc_idx < accs.len() {
-                        let c_off = ((i_cta + row) * n + j_cta + col) * c_elem;
-                        let store_src = if needs_narrow {
-                            let narrowed = prog.alloc_vreg(VRegKind::Vec, width);
-                            prog.emit(VmInstr::VecNarrow { dst: narrowed, src: accs[acc_idx], dst_dtype: c_dtype, src_dtype: acc_dtype, width });
-                            narrowed
-                        } else {
-                            accs[acc_idx]
-                        };
-                        prog.emit(VmInstr::VecStore {
-                            base: c_ptr,
-                            offset: OffsetExpr::Const(c_off),
-                            src: store_src,
-                            width,
-                            dtype: c_dtype, predicate: None,
-                        });
-                    }
+                    // BCE-20260702-GPU-ACC-GUARD: acc_idx < accs.len() 恒真 (上方 acc_count=warp_m*warp_n
+                    // 全量分配, row<warp_m, col<warp_n → acc_idx < warp_m*warp_n == accs.len()) → 守卫删除
+                    let c_off = ((i_cta + row) * n + j_cta + col) * c_elem;
+                    let store_src = if needs_narrow {
+                        let narrowed = prog.alloc_vreg(VRegKind::Vec, width);
+                        prog.emit(VmInstr::VecNarrow { dst: narrowed, src: accs[acc_idx], dst_dtype: c_dtype, src_dtype: acc_dtype, width });
+                        narrowed
+                    } else {
+                        accs[acc_idx]
+                    };
+                    prog.emit(VmInstr::VecStore {
+                        base: c_ptr,
+                        offset: OffsetExpr::Const(c_off),
+                        src: store_src,
+                        width,
+                        dtype: c_dtype, predicate: None,
+                    });
                 }
             }
         }
@@ -1135,15 +1198,15 @@ pub(crate) fn emit_mma_on_smem(
                         });
 
                         let acc_idx = row * wj + col;
-                        if acc_idx < accs.len() {
-                            prog.emit(VmInstr::Fma {
-                                dst: accs[acc_idx],
-                                acc: accs[acc_idx],
-                                a: a_vec,
-                                b: b_vec,
-                                dtype: acc_dtype,
-                            });
-                        }
+                        // BCE-20260702-GPU-ACC-GUARD: acc_idx < accs.len() 恒真 (acc_count=warp_m*warp_n
+                        // 全量分配, row<wi≤warp_m, col<wj≤warp_n) → 守卫删除 (NO_SILENT_FALLBACK 根治)
+                        prog.emit(VmInstr::Fma {
+                            dst: accs[acc_idx],
+                            acc: accs[acc_idx],
+                            a: a_vec,
+                            b: b_vec,
+                            dtype: acc_dtype,
+                        });
                     }
                 }
             }
@@ -2236,7 +2299,7 @@ mod template_tests {
 
         let result = emit_gemm_gpu_pipelined(
             &mut prog, 16, 16, 16, width, a, b, c,
-            16, 16, 16, 16, 16, 16, 2, dtype, dtype, dtype, false, false, false, &BoundExpr::Const(16),
+            16, 16, 16, 8, 8, 16, 2, dtype, dtype, dtype, false, false, false, &BoundExpr::Const(16),
         );
 
         assert!(result.is_ok(), "pipelined GPU GEMM with single K tile should succeed: {:?}", result.err());
@@ -2511,7 +2574,7 @@ mod template_tests {
         // Act: use_tma=true triggers TmaDescriptorInit + BarrierInit
         let result = emit_gemm_gpu_pipelined(
             &mut prog, 16, 16, 32, width, a, b, c,
-            16, 16, 16, 16, 16, 16, 2, QuantPrecision::F32, QuantPrecision::F32, QuantPrecision::F32, false, true, false, &BoundExpr::Const(16),
+            16, 16, 16, 8, 8, 16, 2, QuantPrecision::F32, QuantPrecision::F32, QuantPrecision::F32, false, true, false, &BoundExpr::Const(16),
         );
 
         // Assert
@@ -2834,7 +2897,7 @@ mod template_tests {
         // Act: BF16 with 2-stage pipeline, single K-tile (K=cta_k=16)
         let result = emit_gemm_gpu_pipelined(
             &mut prog, 16, 16, 16, width, a, b, c,
-            16, 16, 16, 16, 16, 16, 2, QuantPrecision::BF16, QuantPrecision::BF16, QuantPrecision::BF16, false, false, false, &BoundExpr::Const(16),
+            16, 16, 16, 8, 8, 16, 2, QuantPrecision::BF16, QuantPrecision::BF16, QuantPrecision::BF16, false, false, false, &BoundExpr::Const(16),
         );
 
         // Assert: BF16 writeback should emit VecNarrow (F32 acc -> BF16 store)
@@ -2920,7 +2983,7 @@ mod template_tests {
         // Act: K=32 > cta_k=16, triggers multi-K-tile steady-state loop
         let result = emit_gemm_gpu_pipelined(
             &mut prog, 16, 16, 32, width, a, b, c,
-            16, 16, 16, 16, 16, 16, 2, QuantPrecision::F32, QuantPrecision::F32, QuantPrecision::F32, false, false, false, &BoundExpr::Const(16),
+            16, 16, 16, 8, 8, 16, 2, QuantPrecision::F32, QuantPrecision::F32, QuantPrecision::F32, false, false, false, &BoundExpr::Const(16),
         );
 
         // Assert: multi-tile pipeline should succeed with AsyncWait for overlap
@@ -3203,7 +3266,7 @@ mod template_tests {
         // Act: pipeline_depth=3 with K=48, cta_k=16 -> 3 K-tiles across 3 stages
         let result = emit_gemm_gpu_pipelined(
             &mut prog, 16, 16, 48, width, a, b, c,
-            16, 16, 16, 16, 16, 16, 3, QuantPrecision::F32, QuantPrecision::F32, QuantPrecision::F32, false, false, false, &BoundExpr::Const(16),
+            16, 16, 16, 8, 8, 16, 3, QuantPrecision::F32, QuantPrecision::F32, QuantPrecision::F32, false, false, false, &BoundExpr::Const(16),
         );
 
         // Assert: 3 stages should allocate 6 SharedMemAlloc (3 for A + 3 for B)
@@ -3350,7 +3413,7 @@ mod template_tests {
         // Act: TMA + multi-K-tile triggers steady-state compute/load overlap
         let result = emit_gemm_gpu_pipelined(
             &mut prog, 16, 16, 32, width, a, b, c,
-            16, 16, 16, 16, 16, 16, 2, QuantPrecision::F32, QuantPrecision::F32, QuantPrecision::F32, false, true, false, &BoundExpr::Const(16),
+            16, 16, 16, 8, 8, 16, 2, QuantPrecision::F32, QuantPrecision::F32, QuantPrecision::F32, false, true, false, &BoundExpr::Const(16),
         );
 
         // Assert: TMA steady-state should emit WarpBarrierWait for synchronization

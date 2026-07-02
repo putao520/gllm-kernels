@@ -639,6 +639,8 @@ impl<'a> RegAllocator<'a> {
                 out
             }
             OffsetExpr::Mul(inner, _) => Self::offset_vregs(inner),
+            // ThreadOffset/ThreadCoord 引用 GPU SIMT 硬件变量 (非 VReg) → 无 VReg 引用
+            OffsetExpr::ThreadOffset(_, _) | OffsetExpr::ThreadCoord(_, _) => vec![],
         }
     }
 

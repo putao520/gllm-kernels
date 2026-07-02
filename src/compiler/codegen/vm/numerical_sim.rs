@@ -1823,6 +1823,14 @@ fn eval_offset(off: &OffsetExpr, state: &VmInterpState) -> Result<i64, CompilerE
                 "VmInterp: ScalarVReg v{} not a loop counter", v.0
             ))
         }),
+        // ThreadOffset/ThreadCoord 引用 GPU SIMT 硬件变量 (%tid.x/%laneid), CPU 解释器无法求值。
+        // GPU 路径不走 numerical_sim (走真实 PTX 执行); 命中此处 = codegen 路径错配。
+        OffsetExpr::ThreadOffset(dim, _) => Err(CompilerError::CodegenViolation(format!(
+            "VmInterp: ThreadOffset({:?}) is GPU-only, cannot evaluate on CPU interpreter", dim
+        ))),
+        OffsetExpr::ThreadCoord(coord, _) => Err(CompilerError::CodegenViolation(format!(
+            "VmInterp: ThreadCoord({:?}) is GPU-only, cannot evaluate on CPU interpreter", coord
+        ))),
     }
 }
 

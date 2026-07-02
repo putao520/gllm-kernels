@@ -777,7 +777,7 @@ fn verify_offset_alignment(
                 verify_offset_alignment(inner, alignment, instr_idx, instr_name)?;
             }
         }
-        OffsetExpr::LoopOffset(_) | OffsetExpr::ScalarVReg(_) => {
+        OffsetExpr::LoopOffset(_) | OffsetExpr::ScalarVReg(_) | OffsetExpr::ThreadOffset(_, _) | OffsetExpr::ThreadCoord(_, _) => {
             // Dynamic offsets can't be verified at compile time
         }
     }
@@ -1687,6 +1687,8 @@ fn offset_vregs(expr: &OffsetExpr) -> Vec<VRegId> {
         }
         OffsetExpr::Mul(a, _) => offset_vregs(a),
         OffsetExpr::ScalarVReg(v) => vec![*v],
+        // ThreadOffset/ThreadCoord 引用 GPU SIMT 硬件变量 (非 VReg) → 无 VReg 引用
+        OffsetExpr::ThreadOffset(_, _) | OffsetExpr::ThreadCoord(_, _) => vec![],
     }
 }
 
