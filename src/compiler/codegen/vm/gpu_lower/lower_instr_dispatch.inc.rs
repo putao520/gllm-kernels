@@ -6099,10 +6099,75 @@ Ok(())
     fn lower_seq_id_lookup_gpu(&mut self, instr: &VmInstr, alloc: &RegAllocation) -> Result<(), CompilerError> {
         match instr {
             VmInstr::SeqIdLookup { dst, token_index, seq_meta_base, num_seqs, seq_meta_stride } => {
+                // §20 BCI-004 GPU: cumsum search — seq_id = min s where cumsum(prompt_lens)[s] > token_index
+                // 单线程线性搜索 (正确性优先, 性能后续 warp 并行化)。语义对齐 CPU
+                // lower_seq_id_lookup_x86: 从 prompt_lens[0] 起累加, 比较 token_index 与
+                // cumulative, 命中即写 dst; safety bound = seq_id >= num_seqs。
+                //
+                // seq_meta_base → 每 seq_meta_stride 字节一个条目, prompt_len 为 u32
+                // 位于条目内偏移 0 (与 CPU dword_ptr(base_reg + s*stride) 对齐)。
+                let dst_name = self.reg_name_with_kind(*dst, alloc);
+                let tok_name = self.reg_name_with_kind(*token_index, alloc);
+                let base_name = self.reg_name_with_kind(*seq_meta_base, alloc);
+                let ns_name = self.reg_name_with_kind(*num_seqs, alloc);
+                let stride = *seq_meta_stride;
 
-                let _ = (dst, token_index, seq_meta_base, num_seqs, seq_meta_stride);
-                Err(CompilerError::CodegenViolation(
-                    "SeqIdLookup: GPU cumsum search not yet implemented".into()))
+                match self.dialect {
+                    GpuDialect::Ptx { .. } => {
+                        self.emit_line("{");
+                        self.emit_line("  .reg .u64 _base, _meta;");
+                        self.emit_line(&format!("  mov.u64 _base, {};", base_name));
+                        self.emit_line("  .reg .u32 _cum, _seq_id, _pl, _off, _ns;");
+                        self.emit_line(&format!("  mov.u32 _ns, {};", ns_name));
+                        self.emit_line("  .reg .pred _found, _notfound, _inbound, _cont;");
+                        // seq_id = 0; cumsum = prompt_lens[0] = [base + 0]
+                        self.emit_line("  mov.u32 _seq_id, 0;");
+                        self.emit_line("  ld.global.u32 _cum, [_base];");
+                        self.emit_line("  setp.eq.u32 _found, 1, 0; // false");
+                        let label = self.next_loop_label();
+                        self.emit_line(&format!("$L_seq_scan_{}:", label));
+                        // if cum > token_index → found
+                        self.emit_line(&format!("  setp.gt.u32 _found, _cum, {};", tok_name));
+                        // notfound = !_found
+                        self.emit_line("  not.pred _notfound, _found;");
+                        // inbound = (_seq_id < _num_seqs)
+                        self.emit_line("  setp.lt.u32 _inbound, _seq_id, _ns;");
+                        // cont = notfound && inbound
+                        self.emit_line("  and.pred _cont, _notfound, _inbound;");
+                        // 已命中或越界 → 退出循环
+                        self.emit_line(&format!("  @!_cont bra $L_seq_scan_END_{};", label));
+                        // 未命中: seq_id++, cumsum += prompt_lens[seq_id]
+                        self.emit_line("  add.u32 _seq_id, _seq_id, 1;");
+                        self.emit_line(&format!("  mad.lo.u32 _off, _seq_id, {stride}, 0;"));
+                        self.emit_line("  add.u64 _meta, _base, _off;");
+                        self.emit_line("  ld.global.u32 _pl, [_meta];");
+                        self.emit_line("  add.u32 _cum, _cum, _pl;");
+                        self.emit_line(&format!("  bra $L_seq_scan_{};", label));
+                        self.emit_line(&format!("$L_seq_scan_END_{}:", label));
+                        // dst = _seq_id (命中时为真实 seq_id; 越界时 CPU 同样写 _seq_id 作 safety bound)
+                        self.emit_line(&format!("  selp.u32 {}, _seq_id, 0, _found;", dst_name));
+                        self.emit_line("}");
+                    }
+                    GpuDialect::Hip { .. } | GpuDialect::Metal { .. } => {
+                        self.emit_line("{");
+                        self.emit_line(&format!("  uint32_t _tok = {};", tok_name));
+                        self.emit_line(&format!("  auto _base = (uint8_t*){};", base_name));
+                        self.emit_line(&format!("  uint32_t _ns = {};", ns_name));
+                        self.emit_line("  uint32_t _seq_id = 0;");
+                        self.emit_line("  uint32_t _cum = *(uint32_t*)_base;");
+                        self.emit_line(&format!("  uint32_t {} = 0;", dst_name));
+                        self.emit_line("  bool _found = false;");
+                        self.emit_line("  while (!_found && _seq_id < _ns) {");
+                        self.emit_line("    if (_cum > _tok) { _found = true; break; }");
+                        self.emit_line("    _seq_id++;");
+                        self.emit_line(&format!("    uint32_t _pl = *(uint32_t*)(_base + (size_t)_seq_id * {stride});"));
+                        self.emit_line("    _cum += _pl;");
+                        self.emit_line("  }");
+                        self.emit_line(&format!("  {} = _found ? _seq_id : 0;", dst_name));
+                        self.emit_line("}");
+                    }
+                }
+                Ok(())
             }
             _ => Err(CompilerError::CodegenViolation(
                 format!("lower_seq_id_lookup_gpu: expected VmInstr::SeqIdLookup, got {:?}", instr))),
