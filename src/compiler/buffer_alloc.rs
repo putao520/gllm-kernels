@@ -357,6 +357,41 @@ pub fn allocate_buffers(lifetimes: &[Lifetime]) -> BufferAllocation {
     }
 }
 
+/// BCE-20260702-GPU-OOM: GPU buffer 物化预算门控 (NO-SILENT-FALLBACK)。
+///
+/// GPU RegAllocator 走空 mapping 快速路径 (ARCH-GPU-NO-LINEAR-SCAN, 11db587d),
+/// PTX 寄存器是声明式逻辑寄存器, 不像 x86 那样能把 VReg 缓存进物理寄存器。
+/// 这本身正确, 但副作用是 GPU buffer_alloc 路径下所有中间 VReg 都需物化到
+/// host scratchpad — 含 logits 级大 buffer ([max_seq_len, vocab])。当 max_seq_len
+/// 过大 (如 SmolLM2 默认 8192) + vocab 49152 时, naive 总和可达数 GB → OOM kill。
+///
+/// 本函数在真正 `allocate_buffers_aligned` 之前估算「naive 总物化字节」
+/// (sum of all lifetime size_bytes, 即无复用上限), 若超过阈值返回该总量,
+/// 让 caller 编译成显式 `CompileError` 而非让分配静默 OOM kill。
+///
+/// 阈值语义: `device_budget_bytes` 为 GPU device memory 预算; 取
+/// `min(device_budget_bytes, host_hard_cap)` 作为门控上限。host_hard_cap
+/// 默认 4 GiB (足够覆盖正常 GPU 推理的中间 buffer; 超出几乎一定是
+/// max_seq_len 配置错误或图未做虚拟 tensor 消除)。
+///
+/// 返回 `Some(total)` = 超预算 (caller 须 Err); `None` = 在预算内 (放行)。
+///
+/// 不动 CPU 路径: CPU 的 `allocate_buffers_aligned` 调用点 (mod.rs:382/594)
+/// 不经过本门控, 仅 GPU 路径 (mod.rs compile_gpu) 调用。
+pub fn gpu_buffer_budget_exceeds(
+    lifetimes: &[Lifetime],
+    device_budget_bytes: usize,
+    host_hard_cap_bytes: usize,
+) -> Option<usize> {
+    let naive_total: usize = lifetimes.iter().map(|l| l.size_bytes).sum();
+    let threshold = device_budget_bytes.min(host_hard_cap_bytes);
+    if naive_total > threshold {
+        Some(naive_total)
+    } else {
+        None
+    }
+}
+
 /// Greedy interval graph coloring with explicit cache-line alignment.
 ///
 /// `cacheline_bytes` is the hardware cache line size (typically 64 or 128).

@@ -907,6 +907,28 @@ impl InferenceCompiler {
                 n, max_live, sum_size, max_single,
             ));
         }
+        // BCE-20260702-GPU-OOM: GPU buffer 物化预算门控 (NO-SILENT-FALLBACK)。
+        // GPU RegAllocator 走空 mapping 快速路径 (ARCH-GPU-NO-LINEAR-SCAN, 11db587d) 是正确的
+        // (PTX 寄存器声明式), 但副作用是所有中间 VReg 都物化到 host scratchpad。当 max_seq_len
+        // 过大 (如 SmolLM2 默认 8192) + vocab 49152 时, naive 总和可达数 GB → OOM kill (5070Ti
+        // RSS 23.5GB 被 SIGKILL)。在真正 allocate_buffers_aligned 之前估算 naive 总量, 超阈值
+        // → 显式 CompileError (而非静默 OOM kill)。门控仅作用于 GPU 路径 (CPU 的
+        // allocate_buffers_aligned 调用点 mod.rs:382/594 不经此)。
+        // device_budget = GPU device memory 量级 (16GiB); host_hard_cap = host 物化上限 (4GiB)。
+        const GPU_BUFFER_HOST_HARD_CAP_BYTES: usize = 4 * 1024 * 1024 * 1024; // 4 GiB
+        const GPU_BUFFER_DEVICE_BUDGET_BYTES: usize = 16 * 1024 * 1024 * 1024; // 16 GiB
+        if let Some(total) = buffer_alloc::gpu_buffer_budget_exceeds(
+            &lifetimes, GPU_BUFFER_DEVICE_BUDGET_BYTES, GPU_BUFFER_HOST_HARD_CAP_BYTES,
+        ) {
+            return Err(InferenceError::CompileError(format!(
+                "GPU buffer budget exceeded: naive total {total} bytes > host hard cap \
+                 {GPU_BUFFER_HOST_HARD_CAP_BYTES} bytes. \
+                 GPU RegAllocator uses empty-mapping fast path (ARCH-GPU-NO-LINEAR-SCAN), \
+                 so all intermediate VRegs materialize to host scratchpad. \
+                 Reduce max_seq_len (current={}) or enable virtual_tensor elimination for GPU.",
+                config.max_seq_len,
+            ).into()));
+        }
         let alloc = buffer_alloc::allocate_buffers_aligned(
             &lifetimes, self.profile.hw_info.cacheline_bytes,
             Some(&virtual_tensor_map), Some(&virtual_activation), &graph,
