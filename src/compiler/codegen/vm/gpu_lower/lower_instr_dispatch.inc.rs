@@ -245,25 +245,89 @@ impl GpuLower {
     // ── Memory ──
     fn lower_vec_load_gpu(&mut self, instr: &VmInstr, alloc: &RegAllocation) -> Result<(), CompilerError> {
         match instr {
-            VmInstr::VecLoad { dst, base, offset, .. } => {
-
+            VmInstr::VecLoad { dst, base, offset, dtype, .. } => {
+                // GPU-003 根治 (BCE-20260704-GPU-VIOLATIONS):
+                //   旧实现 `..` 忽略 dtype 字段, 硬编码 ld.global.f32 + /4 (F32 elem_bytes)。
+                //   ARCH-JIT-YIELDS / ARCH-DTYPE-JIT-TYPED: dtype 从 instr 取, 按 dtype 分流。
+                //   BF16 → ld.global.b16 /2 + cvt.f32.bf16; F16 → ld.global.b16 /2 + cvt.f32.f16;
+                //   F32 → ld.global.f32 /4; INT8 → ld.global.s8 (sign-extend) + cvt.f32.s32。
+                //   (参照 x86 lower_vec_load_x86 的 dtype.x86_elem_strategy() 分流模式,
+                //    GPU 用 dtype.gpu_elem_strategy()。)
                 let d = self.reg_name_with_kind(*dst, alloc);
                 let b = self.reg_name_with_kind(*base, alloc);
                 let off = self.offset_to_string(offset, alloc);
                 match self.dialect {
                     GpuDialect::Ptx { .. } => {
-                        // ARCH-GPU-PTX-ADDR: PTX `[reg+reg]` 语法非法，必须先算出 64-bit 地址。
-                        // offset 是 32-bit 整数，base 是 64-bit 指针。流程：
-                        //   cvt.u64.u32 addr_scratch, off;  addr_scratch += b;  ld.global.f32 d, [addr_scratch]
-                        let addr = self.scratch_gpr_names[0]; // %rs0 — 复用为 b64 临时（PTX 允许）
-                        let addr64 = self.scratch_gpr_names[1]; // %rs1 — 实际 64-bit 存放
-                        self.emit_line(&format!("cvt.u64.u32 %rd_addr, {off};"));
-                        self.emit_line(&format!("add.u64 %rd_addr, %rd_addr, {b};"));
-                        self.emit_line(&format!("ld.global.f32 {d}, [%rd_addr];"));
-                        let _ = (addr, addr64);
+                        // ARCH-GPU-PTX-ADDR: PTX `[reg+reg]` 非法, 先算 64-bit 地址。
+                        let fs0 = self.scratch_vec_names[0]; // widen temp
+                        use crate::compiler::trace::DTypeKind;
+                        match dtype.kind {
+                            DTypeKind::F32 | DTypeKind::TF32 => {
+                                self.emit_line(&format!("cvt.u64.u32 %rd_addr, {off};"));
+                                self.emit_line(&format!("add.u64 %rd_addr, %rd_addr, {b};"));
+                                self.emit_line(&format!("ld.global.f32 {d}, [%rd_addr];"));
+                            }
+                            DTypeKind::BF16 => {
+                                self.emit_line(&format!("cvt.u64.u32 %rd_addr, {off};"));
+                                self.emit_line(&format!("add.u64 %rd_addr, %rd_addr, {b};"));
+                                self.emit_line(&format!("ld.global.b16 {fs0}, [%rd_addr];"));
+                                self.emit_line(&format!("cvt.rn.f32.bf16 {d}, {fs0};  // VecLoad BF16→F32"));
+                            }
+                            DTypeKind::F16 => {
+                                self.emit_line(&format!("cvt.u64.u32 %rd_addr, {off};"));
+                                self.emit_line(&format!("add.u64 %rd_addr, %rd_addr, {b};"));
+                                self.emit_line(&format!("ld.global.b16 {fs0}, [%rd_addr];"));
+                                self.emit_line(&format!("cvt.rn.f32.f16 {d}, {fs0};  // VecLoad F16→F32"));
+                            }
+                            DTypeKind::INT8 => {
+                                // INT8: ld.global.s8 sign-extends to s32; cvt to f32.
+                                let rs0 = self.scratch_gpr_names[0];
+                                self.emit_line(&format!("cvt.u64.u32 %rd_addr, {off};"));
+                                self.emit_line(&format!("add.u64 %rd_addr, %rd_addr, {b};"));
+                                self.emit_line(&format!("ld.global.s8 {rs0}, [%rd_addr];"));
+                                self.emit_line(&format!("cvt.rn.f32.s32 {d}, {rs0};  // VecLoad INT8→F32"));
+                            }
+                            _ => {
+                                // Sub-byte / packed quant types should not reach VecLoad
+                                // (they use quant-specific VmInstrs). NO-SILENT-FALLBACK.
+                                return Err(CompilerError::CodegenViolation(format!(
+                                    "VecLoad GPU: dtype {:?} (elem_bytes={}) unsupported — \
+                                     packed/sub-byte types use quant-specific VmInstrs",
+                                    dtype, dtype.elem_bytes()
+                                )));
+                            }
+                        }
                     }
-                    GpuDialect::Hip { .. } => self.emit_line(&format!("{d} = *(({b}) + ({off})/4);")),
-                    GpuDialect::Metal { .. } => self.emit_line(&format!("{d} = {b}[({off})/4];")),
+                    GpuDialect::Hip { .. } => {
+                        use crate::compiler::trace::DTypeKind;
+                        match dtype.kind {
+                            DTypeKind::F32 | DTypeKind::TF32 =>
+                                self.emit_line(&format!("{d} = *(({b}) + ({off})/4);")),
+                            DTypeKind::BF16 =>
+                                self.emit_line(&format!("{d} = __bfloat162float(*((__hip_bfloat16*)(({b}) + ({off})/2)));")),
+                            DTypeKind::F16 =>
+                                self.emit_line(&format!("{d} = __half2float(*((__half*)(({b}) + ({off})/2)));")),
+                            DTypeKind::INT8 =>
+                                self.emit_line(&format!("{d} = (float)(*((signed char*)(({b}) + ({off}))));")),
+                            _ => return Err(CompilerError::CodegenViolation(format!(
+                                "VecLoad GPU HIP: dtype {:?} unsupported", dtype))),
+                        }
+                    }
+                    GpuDialect::Metal { .. } => {
+                        use crate::compiler::trace::DTypeKind;
+                        match dtype.kind {
+                            DTypeKind::F32 | DTypeKind::TF32 =>
+                                self.emit_line(&format!("{d} = {b}[({off})/4];")),
+                            DTypeKind::BF16 =>
+                                self.emit_line(&format!("{d} = (float)(*((device half*)(({b}) + ({off})/2)));")),
+                            DTypeKind::F16 =>
+                                self.emit_line(&format!("{d} = (float)(*((device half*)(({b}) + ({off})/2)));")),
+                            DTypeKind::INT8 =>
+                                self.emit_line(&format!("{d} = (float)(*((device signed char*)(({b}) + ({off}))));")),
+                            _ => return Err(CompilerError::CodegenViolation(format!(
+                                "VecLoad GPU Metal: dtype {:?} unsupported", dtype))),
+                        }
+                    }
                 }
                 Ok(())
             }
@@ -338,19 +402,76 @@ impl GpuLower {
 
     fn lower_vec_store_gpu(&mut self, instr: &VmInstr, alloc: &RegAllocation) -> Result<(), CompilerError> {
         match instr {
-            VmInstr::VecStore { base, src, offset, .. } => {
-
+            VmInstr::VecStore { base, src, offset, dtype, .. } => {
+                // GPU-003 根治 (BCE-20260704-GPU-VIOLATIONS):
+                //   旧实现 `..` 忽略 dtype, 硬编码 st.global.f32 + /4。
+                //   按 dtype 分流: F32 → st.global.f32 /4; BF16 → cvt.bf16.f32 + st.global.b16 /2;
+                //   F16 → cvt.f16.f32 + st.global.b16 /2; INT8 → cvt.s32.f32 + st.global.s8。
                 let s = self.reg_name_with_kind(*src, alloc);
                 let b = self.reg_name_with_kind(*base, alloc);
                 let off = self.offset_to_string(offset, alloc);
                 match self.dialect {
                     GpuDialect::Ptx { .. } => {
-                        self.emit_line(&format!("cvt.u64.u32 %rd_addr, {off};"));
-                        self.emit_line(&format!("add.u64 %rd_addr, %rd_addr, {b};"));
-                        self.emit_line(&format!("st.global.f32 [%rd_addr], {s};"));
+                        let fs0 = self.scratch_vec_names[0]; // narrow temp
+                        let rs0 = self.scratch_gpr_names[0]; // s8 temp
+                        use crate::compiler::trace::DTypeKind;
+                        match dtype.kind {
+                            DTypeKind::F32 | DTypeKind::TF32 => {
+                                self.emit_line(&format!("cvt.u64.u32 %rd_addr, {off};"));
+                                self.emit_line(&format!("add.u64 %rd_addr, %rd_addr, {b};"));
+                                self.emit_line(&format!("st.global.f32 [%rd_addr], {s};"));
+                            }
+                            DTypeKind::BF16 => {
+                                self.emit_line(&format!("cvt.u64.u32 %rd_addr, {off};"));
+                                self.emit_line(&format!("add.u64 %rd_addr, %rd_addr, {b};"));
+                                self.emit_line(&format!("cvt.rn.bf16.f32 {fs0}, {s};  // VecStore F32→BF16"));
+                                self.emit_line(&format!("st.global.b16 [%rd_addr], {fs0};"));
+                            }
+                            DTypeKind::F16 => {
+                                self.emit_line(&format!("cvt.u64.u32 %rd_addr, {off};"));
+                                self.emit_line(&format!("add.u64 %rd_addr, %rd_addr, {b};"));
+                                self.emit_line(&format!("cvt.rn.f16.f32 {fs0}, {s};  // VecStore F32→F16"));
+                                self.emit_line(&format!("st.global.b16 [%rd_addr], {fs0};"));
+                            }
+                            DTypeKind::INT8 => {
+                                self.emit_line(&format!("cvt.u64.u32 %rd_addr, {off};"));
+                                self.emit_line(&format!("add.u64 %rd_addr, %rd_addr, {b};"));
+                                self.emit_line(&format!("cvt.rni.s32.f32 {rs0}, {s};  // VecStore F32→INT8"));
+                                self.emit_line(&format!("st.global.s8 [%rd_addr], {rs0};"));
+                            }
+                            _ => return Err(CompilerError::CodegenViolation(format!(
+                                "VecStore GPU: dtype {:?} unsupported — packed/sub-byte types use quant-specific VmInstrs",
+                                dtype))),
+                        }
                     }
-                    GpuDialect::Hip { .. } => self.emit_line(&format!("*(({b}) + ({off})/4) = {s};")),
-                    GpuDialect::Metal { .. } => self.emit_line(&format!("{b}[({off})/4] = {s};")),
+                    GpuDialect::Hip { .. } => {
+                        use crate::compiler::trace::DTypeKind;
+                        match dtype.kind {
+                            DTypeKind::F32 | DTypeKind::TF32 =>
+                                self.emit_line(&format!("*(({b}) + ({off})/4) = {s};")),
+                            DTypeKind::BF16 =>
+                                self.emit_line(&format!("*((__hip_bfloat16*)(({b}) + ({off})/2)) = __float2bfloat16({s});")),
+                            DTypeKind::F16 =>
+                                self.emit_line(&format!("*((__half*)(({b}) + ({off})/2)) = __float2half({s});")),
+                            DTypeKind::INT8 =>
+                                self.emit_line(&format!("*((signed char*)(({b}) + ({off}))) = (signed char)({s});")),
+                            _ => return Err(CompilerError::CodegenViolation(format!(
+                                "VecStore GPU HIP: dtype {:?} unsupported", dtype))),
+                        }
+                    }
+                    GpuDialect::Metal { .. } => {
+                        use crate::compiler::trace::DTypeKind;
+                        match dtype.kind {
+                            DTypeKind::F32 | DTypeKind::TF32 =>
+                                self.emit_line(&format!("{b}[({off})/4] = {s};")),
+                            DTypeKind::BF16 | DTypeKind::F16 =>
+                                self.emit_line(&format!("*((device half*)(({b}) + ({off})/2)) = (half)({s});")),
+                            DTypeKind::INT8 =>
+                                self.emit_line(&format!("*((device signed char*)(({b}) + ({off}))) = (signed char)({s});")),
+                            _ => return Err(CompilerError::CodegenViolation(format!(
+                                "VecStore GPU Metal: dtype {:?} unsupported", dtype))),
+                        }
+                    }
                 }
                 Ok(())
             }
@@ -1334,44 +1455,31 @@ Ok(())
                 match input_dtype {
                     DotDtype::Bf16 => {
                         // BF16 dot-product: fp32_acc += bf16_a · bf16_b (per-element).
-                        // PTX: mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 (SM80+)
-                        //      wgmma.mma_async (SM90+), tcgen05 (SM100+)
-                        //      For SIMT scalar path: cvt bf16→f32 then fma.rn.f32
-                        // HIP: v_mfma_f32_16x16x16_bf16 (CDNA) or scalar __half2float + fma
-                        // Metal: simdgroup_matrix_multiply or scalar fma
+                        // DotProduct 是 SIMT 标量逐元素点积, 不是 Tile 级张量核 mma。
+                        // GPU-001 根治 (BCE-20260704-GPU-VIOLATIONS):
+                        //   旧实现 SM100+ 用 tcgen05.mma (Tile 级) 是违宪 — tcgen05 要求
+                        //   累加器在 TMEM + 操作数为张量描述符 + [%tmem_addr] 在 DotProduct
+                        //   上下文未初始化。标量寄存器喂给 tile 指令 = 非法 PTX / 错误结果。
+                        //   SM90+ wgmma.mma_async 同理是 Tile 级, 不该用于 SIMT 标量点积。
+                        // 正解: 所有 SM 版本统一走 SIMT 标量路径 — cvt bf16→f32 + fma.rn.f32。
+                        //   (mma.sync.aligned 是 warp 级 tile mma, 也非 SIMT 标量, 不用。)
+                        //   x86 DotProduct(Int8) 用 vpdpbusd (SIMT 向量点积) 是对应参考。
+                        // PTX: cvt.rn.f32.bf16 + fma.rn.f32 (SM>=80 可用, 更低版本同样可用)
+                        // HIP: v_cvt_f32_bf16 + fma; Metal: convert + fma
                         match self.dialect {
-                            GpuDialect::Ptx { sm_version } => {
-                                if sm_version >= 100 {
-                                    self.emit_line("// §SM100 DotProduct<Bf16> tcgen05");
-                                    self.emit_line(&format!("tcgen05.mma.cta_group::1.kind::bf16 [%tmem_addr], {va}, {vb}, 0x0, 0, 1;"));
-                                    self.emit_line("tcgen05.wait::ld.sync.aligned;");
-                                } else if sm_version >= 90 {
-                                    self.emit_line("wgmma.fence.sync.aligned;");
-                                    self.emit_line(&format!("wgmma.mma_async.sync.aligned.m64n16k16.f32.bf16.bf16 {{{vc}}}, {va}, {vb};"));
-                                    self.emit_line("wgmma.commit_group.sync.aligned;");
-                                    self.emit_line("wgmma.wait_group.sync.aligned 0;");
-                                } else if sm_version >= 80 {
-                                    self.emit_line(&format!("mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 {{{vc}}}, {{{va}}}, {{{vb}}}, {{{vc}}};"));
-                                } else {
-                                    let fs0 = self.scratch_vec_names[0];
-                                    let fs1 = self.scratch_vec_names[1];
-                                    self.emit_line(&format!("cvt.rn.f32.bf16 {fs0}, {va};"));
-                                    self.emit_line(&format!("cvt.rn.f32.bf16 {fs1}, {vb};"));
-                                    self.emit_line(&format!("fma.rn.f32 {vc}, {fs0}, {fs1}, {vc};"));
-                                }
+                            GpuDialect::Ptx { .. } => {
+                                let fs0 = self.scratch_vec_names[0];
+                                let fs1 = self.scratch_vec_names[1];
+                                self.emit_line(&format!("cvt.rn.f32.bf16 {fs0}, {va};"));
+                                self.emit_line(&format!("cvt.rn.f32.bf16 {fs1}, {vb};"));
+                                self.emit_line(&format!("fma.rn.f32 {vc}, {fs0}, {fs1}, {vc};"));
                             }
-                            GpuDialect::Hip { gfx_arch, .. } => {
-                                if gfx_arch >= 950 {
-                                    self.emit_line(&format!("v_mfma_f32_32x32x16_bf16 {vc}, {va}, {vb}, {vc};"));
-                                } else if gfx_arch >= 908 {
-                                    self.emit_line(&format!("v_mfma_f32_16x16x16_bf16 {vc}, {va}, {vb}, {vc};"));
-                                } else {
-                                    let fs0 = self.scratch_vec_names[0];
-                                    let fs1 = self.scratch_vec_names[1];
-                                    self.emit_line(&format!("cvt.rn.f32.bf16 {fs0}, {va};  // HIP bf16->f32"));
-                                    self.emit_line(&format!("cvt.rn.f32.bf16 {fs1}, {vb};  // HIP bf16->f32"));
-                                    self.emit_line(&format!("fma.rn.f32 {vc}, {fs0}, {fs1}, {vc};"));
-                                }
+                            GpuDialect::Hip { .. } => {
+                                let fs0 = self.scratch_vec_names[0];
+                                let fs1 = self.scratch_vec_names[1];
+                                self.emit_line(&format!("v_cvt_f32_bf16 {fs0}, {va};  // HIP bf16->f32"));
+                                self.emit_line(&format!("v_cvt_f32_bf16 {fs1}, {vb};  // HIP bf16->f32"));
+                                self.emit_line(&format!("fma.rn.f32 {vc}, {fs0}, {fs1}, {vc};"));
                             }
                             GpuDialect::Metal { .. } => {
                                 self.emit_line(&format!("{vc} = fma((float){va}, (float){vb}, {vc});"));
@@ -1380,37 +1488,24 @@ Ok(())
                     }
                     DotDtype::Fp16 => {
                         // FP16 dot-product: fp32_acc += fp16_a · fp16_b (per-element).
+                        // GPU-001 根治 (BCE-20260704-GPU-VIOLATIONS):
+                        //   旧实现 SM100+ 用 tcgen05.mma.kind::f16 (Tile 级) 违宪, 同 Bf16 分支理由。
+                        //   SM90+ wgmma / SM80+ mma.sync / SM70+ wmma 同为 tile 级, 不用于 SIMT 标量。
+                        // 正解: 所有 SM 统一 SIMT 标量路径 — cvt f16→f32 + fma.rn.f32。
                         match self.dialect {
-                            GpuDialect::Ptx { sm_version } => {
-                                if sm_version >= 100 {
-                                    self.emit_line("// §SM100 DotProduct<Fp16> tcgen05");
-                                    self.emit_line(&format!("tcgen05.mma.cta_group::1.kind::f16 [%tmem_addr], {va}, {vb}, 0x0, 0, 1;"));
-                                    self.emit_line("tcgen05.wait::ld.sync.aligned;");
-                                } else if sm_version >= 90 {
-                                    self.emit_line("wgmma.fence.sync.aligned;");
-                                    self.emit_line(&format!("wgmma.mma_async.sync.aligned.m64n16k16.f32.f16.f16 {{{vc}}}, {va}, {vb};"));
-                                    self.emit_line("wgmma.commit_group.sync.aligned;");
-                                    self.emit_line("wgmma.wait_group.sync.aligned 0;");
-                                } else if sm_version >= 80 {
-                                    self.emit_line(&format!("mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32 {{{vc}}}, {{{va}}}, {{{vb}}}, {{{vc}}};"));
-                                } else if sm_version >= 70 {
-                                    self.emit_line(&format!("wmma.mma.sync.aligned.row.col.m16n16k16.f32.f16.f16.f32 {{{vc}}}, {{{va}}}, {{{vb}}}, {{{vc}}};"));
-                                } else {
-                                    let fs0 = self.scratch_vec_names[0];
-                                    let fs1 = self.scratch_vec_names[1];
-                                    self.emit_line(&format!("cvt.rn.f32.f16 {fs0}, {va};"));
-                                    self.emit_line(&format!("cvt.rn.f32.f16 {fs1}, {vb};"));
-                                    self.emit_line(&format!("fma.rn.f32 {vc}, {fs0}, {fs1}, {vc};"));
-                                }
+                            GpuDialect::Ptx { .. } => {
+                                let fs0 = self.scratch_vec_names[0];
+                                let fs1 = self.scratch_vec_names[1];
+                                self.emit_line(&format!("cvt.rn.f32.f16 {fs0}, {va};"));
+                                self.emit_line(&format!("cvt.rn.f32.f16 {fs1}, {vb};"));
+                                self.emit_line(&format!("fma.rn.f32 {vc}, {fs0}, {fs1}, {vc};"));
                             }
-                            GpuDialect::Hip { gfx_arch, .. } => {
-                                if gfx_arch >= 950 {
-                                    self.emit_line(&format!("v_mfma_f32_32x32x16_f16 {vc}, {va}, {vb}, {vc};"));
-                                } else if gfx_arch >= 908 {
-                                    self.emit_line(&format!("v_mfma_f32_16x16x16_f16 {vc}, {va}, {vb}, {vc};"));
-                                } else {
-                                    self.emit_line(&format!("{vc} = fma((float){va}, (float){vb}, {vc});"));
-                                }
+                            GpuDialect::Hip { .. } => {
+                                let fs0 = self.scratch_vec_names[0];
+                                let fs1 = self.scratch_vec_names[1];
+                                self.emit_line(&format!("{fs0} = __half2float({va});"));
+                                self.emit_line(&format!("{fs1} = __half2float({vb});"));
+                                self.emit_line(&format!("fma.rn.f32 {vc}, {fs0}, {fs1}, {vc};"));
                             }
                             GpuDialect::Metal { .. } => {
                                 self.emit_line(&format!("{vc} = fma((float){va}, (float){vb}, {vc});"));
@@ -1419,28 +1514,19 @@ Ok(())
                     }
                     DotDtype::Int8 => {
                         // INT8 dot-product: int32_acc += int8_a · int8_b (per-element).
-                        // PTX SM80+: mma.sync.aligned.m16n8k32.row.col.s32.u8.u8.s32 (IMMA)
-                        // PTX SM<80: software mul.s32 + add.s32
+                        // GPU-001 根治 (BCE-20260704-GPU-VIOLATIONS):
+                        //   旧实现 SM80+ 用 mma.sync.aligned.m16n8k32 (warp 级 tile mma) 违宪 —
+                        //   DotProduct 是 SIMT 标量逐元素点积, 非 warp 级 tile mma。
+                        //   x86 DotProduct(Int8) 用 vpdpbusd (SIMT 向量点积) 是对应参考。
+                        // 正解: 所有 SM 统一走 SIMT 标量路径 — mul.s32 + add.s32。
                         match self.dialect {
-                            GpuDialect::Ptx { sm_version } => {
-                                if sm_version >= 90 {
-                                    self.emit_line(&format!("mma.sync.aligned.m16n8k32.row.col.s32.u8.u8.s32 {{{vc}}}, {{{va}}}, {{{vb}}}, {{{vc}}};"));
-                                } else if sm_version >= 80 {
-                                    self.emit_line(&format!("mma.sync.aligned.m16n8k32.row.col.s32.u8.u8.s32 {{{vc}}}, {{{va}}}, {{{vb}}}, {{{vc}}};"));
-                                } else {
-                                    let rs0 = self.scratch_gpr_names[0];
-                                    self.emit_line(&format!("mul.lo.s32 {rs0}, {va}, {vb};"));
-                                    self.emit_line(&format!("add.s32 {vc}, {vc}, {rs0};"));
-                                }
+                            GpuDialect::Ptx { .. } => {
+                                let rs0 = self.scratch_gpr_names[0];
+                                self.emit_line(&format!("mul.lo.s32 {rs0}, {va}, {vb};"));
+                                self.emit_line(&format!("add.s32 {vc}, {vc}, {rs0};"));
                             }
-                            GpuDialect::Hip { gfx_arch, .. } => {
-                                if gfx_arch >= 950 {
-                                    self.emit_line(&format!("v_mfma_i32_32x32x16_i8 {vc}, {va}, {vb}, {vc};"));
-                                } else if gfx_arch >= 908 {
-                                    self.emit_line(&format!("v_mfma_i32_16x16x16_i8 {vc}, {va}, {vb}, {vc};"));
-                                } else {
-                                    self.emit_line(&format!("{vc} += (int)({va}) * (int)({vb});"));
-                                }
+                            GpuDialect::Hip { .. } => {
+                                self.emit_line(&format!("{vc} += (int)({va}) * (int)({vb});"));
                             }
                             GpuDialect::Metal { .. } => {
                                 self.emit_line(&format!("{vc} += (int)({va}) * (int)({vb});"));
@@ -1488,8 +1574,10 @@ Ok(())
                     }
                     DotDtype::Fp4 => {
                         // FP4 dot-product: fp32_acc += e2m1_a · e2m1_b.
-                        // SM100+: tcgen05 FP4 tensor core native instruction.
-                        // SM<100 / other GPUs: software e2m1 decode (16-entry LUT) → F32 → FMA.
+                        // GPU-001 根治 (BCE-20260704-GPU-VIOLATIONS):
+                        //   旧 SM100+ 用 tcgen05.mma.kind::fp4 (Tile 级) 违宪 — DotProduct 是
+                        //   SIMT 标量点积, 非 tile mma (tcgen05 要求 TMEM 累加器+张量描述符)。
+                        //   统一所有 SM 版本走软件 e2m1 解码 → F32 → FMA (SIMT 标量路径)。
                         //
                         // E2M1 format (4 bits per value):
                         //   sign = bit 3
@@ -1498,69 +1586,66 @@ Ok(())
                         //   value = (-1)^sign × (1 + mant×0.5) × 2^(exp - 1)
                         //   Special: nibble 0 → 0.0
                         match self.dialect {
-                            GpuDialect::Ptx { sm_version } => {
-                                if sm_version >= 100 {
-                                    self.emit_line("// §SM100 DotProduct<Fp4> tcgen05 FP4");
-                                    self.emit_line(&format!("tcgen05.mma.cta_group::1.kind::fp4 [%tmem_addr], {va}, {vb}, 0x0, 0, 1;"));
-                                    self.emit_line("tcgen05.wait::ld.sync.aligned;");
-                                } else {
-                                    // SM<100: software e2m1 decode → F32 → FMA
-                                    let rs0 = self.scratch_gpr_names[0];
-                                    let rs1 = self.scratch_gpr_names[1];
-                                    let fs0 = self.scratch_vec_names[0]; // decoded a
-                                    let fs1 = self.scratch_vec_names[1]; // decoded b
-                                    let fs2 = self.scratch_vec_names[2]; // magnitude temp
-                                    let ps0 = self.scratch_pred_names[0]; // zero predicate
-                                    let ps1 = self.scratch_pred_names[1]; // sign predicate
+                            GpuDialect::Ptx { .. } => {
+                                // GPU-001 根治 (BCE-20260704-GPU-VIOLATIONS):
+                                //   旧 SM100+ 用 tcgen05.mma.kind::fp4 (Tile 级) 违宪, 同 Bf16/Fp16 理由。
+                                //   DotProduct 是 SIMT 标量点积, 非 tile mma。
+                                // 正解: 所有 SM 统一走软件 e2m1 解码 → F32 → FMA (SIMT 标量路径)。
+                                let rs0 = self.scratch_gpr_names[0];
+                                let rs1 = self.scratch_gpr_names[1];
+                                let fs0 = self.scratch_vec_names[0]; // decoded a
+                                let fs1 = self.scratch_vec_names[1]; // decoded b
+                                let fs2 = self.scratch_vec_names[2]; // magnitude temp
+                                let ps0 = self.scratch_pred_names[0]; // zero predicate
+                                let ps1 = self.scratch_pred_names[1]; // sign predicate
 
-                                    // ── Decode va (e2m1 → f32) ──
-                                    self.emit_line(&format!("// Decode FP4 e2m1: {va}"));
-                                    self.emit_line(&format!("setp.eq.u32 {ps0}, {va}, 0;"));
-                                    let skip_a = self.next_skip_label();
-                                    self.emit_line(&format!("@{ps0} bra Lskip_a_{skip_a};"));
-                                    self.emit_line(&format!("and.b32 {rs0}, {va}, 1;"));         // mant
-                                    self.emit_line(&format!("cvt.rn.f32.u32 {fs2}, {rs0};"));    // mant as f32
-                                    self.emit_line(&format!("mul.rn.f32 {fs2}, {fs2}, 0f3F000000;")); // mant * 0.5
-                                    self.emit_line(&format!("add.rn.f32 {fs2}, {fs2}, 0f3F800000;")); // 1.0 + mant*0.5
-                                    self.emit_line(&format!("shr.b32 {rs0}, {va}, 1;"));
-                                    self.emit_line(&format!("and.b32 {rs0}, {rs0}, 3;"));         // exp_field
-                                    self.emit_line(&format!("cvt.rn.f32.u32 {fs0}, {rs0};"));     // exp as f32
-                                    self.emit_line(&format!("sub.rn.f32 {fs0}, {fs0}, 0f3F800000;")); // exp - 1.0
-                                    self.emit_line(&format!("ex2.approx.ftz.f32 {fs0}, {fs0};")); // 2^(exp-1)
-                                    self.emit_line(&format!("mul.rn.f32 {fs0}, {fs2}, {fs0};"));  // magnitude
-                                    // Apply sign
-                                    self.emit_line(&format!("shr.b32 {rs0}, {va}, 3;"));
-                                    self.emit_line(&format!("and.b32 {rs0}, {rs0}, 1;"));
-                                    self.emit_line(&format!("setp.ne.u32 {ps1}, {rs0}, 0;"));
-                                    self.emit_line(&format!("@{ps1} neg.f32 {fs0}, {fs0};"));
-                                    self.emit_line(&format!("Lskip_a_{skip_a}:"));
-                                    self.emit_line(&format!("@{ps0} mov.f32 {fs0}, 0f00000000;"));
+                                // ── Decode va (e2m1 → f32) ──
+                                self.emit_line(&format!("// Decode FP4 e2m1: {va}"));
+                                self.emit_line(&format!("setp.eq.u32 {ps0}, {va}, 0;"));
+                                let skip_a = self.next_skip_label();
+                                self.emit_line(&format!("@{ps0} bra Lskip_a_{skip_a};"));
+                                self.emit_line(&format!("and.b32 {rs0}, {va}, 1;"));         // mant
+                                self.emit_line(&format!("cvt.rn.f32.u32 {fs2}, {rs0};"));    // mant as f32
+                                self.emit_line(&format!("mul.rn.f32 {fs2}, {fs2}, 0f3F000000;")); // mant * 0.5
+                                self.emit_line(&format!("add.rn.f32 {fs2}, {fs2}, 0f3F800000;")); // 1.0 + mant*0.5
+                                self.emit_line(&format!("shr.b32 {rs0}, {va}, 1;"));
+                                self.emit_line(&format!("and.b32 {rs0}, {rs0}, 3;"));         // exp_field
+                                self.emit_line(&format!("cvt.rn.f32.u32 {fs0}, {rs0};"));     // exp as f32
+                                self.emit_line(&format!("sub.rn.f32 {fs0}, {fs0}, 0f3F800000;")); // exp - 1.0
+                                self.emit_line(&format!("ex2.approx.ftz.f32 {fs0}, {fs0};")); // 2^(exp-1)
+                                self.emit_line(&format!("mul.rn.f32 {fs0}, {fs2}, {fs0};"));  // magnitude
+                                // Apply sign
+                                self.emit_line(&format!("shr.b32 {rs0}, {va}, 3;"));
+                                self.emit_line(&format!("and.b32 {rs0}, {rs0}, 1;"));
+                                self.emit_line(&format!("setp.ne.u32 {ps1}, {rs0}, 0;"));
+                                self.emit_line(&format!("@{ps1} neg.f32 {fs0}, {fs0};"));
+                                self.emit_line(&format!("Lskip_a_{skip_a}:"));
+                                self.emit_line(&format!("@{ps0} mov.f32 {fs0}, 0f00000000;"));
 
-                                    // ── Decode vb (e2m1 → f32) ──
-                                    self.emit_line(&format!("// Decode FP4 e2m1: {vb}"));
-                                    self.emit_line(&format!("setp.eq.u32 {ps0}, {vb}, 0;"));
-                                    let skip_b = self.next_skip_label();
-                                    self.emit_line(&format!("@{ps0} bra Lskip_b_{skip_b};"));
-                                    self.emit_line(&format!("and.b32 {rs1}, {vb}, 1;"));
-                                    self.emit_line(&format!("cvt.rn.f32.u32 {fs2}, {rs1};"));
-                                    self.emit_line(&format!("mul.rn.f32 {fs2}, {fs2}, 0f3F000000;"));
-                                    self.emit_line(&format!("add.rn.f32 {fs2}, {fs2}, 0f3F800000;"));
-                                    self.emit_line(&format!("shr.b32 {rs1}, {vb}, 1;"));
-                                    self.emit_line(&format!("and.b32 {rs1}, {rs1}, 3;"));
-                                    self.emit_line(&format!("cvt.rn.f32.u32 {fs1}, {rs1};"));
-                                    self.emit_line(&format!("sub.rn.f32 {fs1}, {fs1}, 0f3F800000;"));
-                                    self.emit_line(&format!("ex2.approx.ftz.f32 {fs1}, {fs1};"));
-                                    self.emit_line(&format!("mul.rn.f32 {fs1}, {fs2}, {fs1};"));
-                                    self.emit_line(&format!("shr.b32 {rs1}, {vb}, 3;"));
-                                    self.emit_line(&format!("and.b32 {rs1}, {rs1}, 1;"));
-                                    self.emit_line(&format!("setp.ne.u32 {ps1}, {rs1}, 0;"));
-                                    self.emit_line(&format!("@{ps1} neg.f32 {fs1}, {fs1};"));
-                                    self.emit_line(&format!("Lskip_b_{skip_b}:"));
-                                    self.emit_line(&format!("@{ps0} mov.f32 {fs1}, 0f00000000;"));
+                                // ── Decode vb (e2m1 → f32) ──
+                                self.emit_line(&format!("// Decode FP4 e2m1: {vb}"));
+                                self.emit_line(&format!("setp.eq.u32 {ps0}, {vb}, 0;"));
+                                let skip_b = self.next_skip_label();
+                                self.emit_line(&format!("@{ps0} bra Lskip_b_{skip_b};"));
+                                self.emit_line(&format!("and.b32 {rs1}, {vb}, 1;"));
+                                self.emit_line(&format!("cvt.rn.f32.u32 {fs2}, {rs1};"));
+                                self.emit_line(&format!("mul.rn.f32 {fs2}, {fs2}, 0f3F000000;"));
+                                self.emit_line(&format!("add.rn.f32 {fs2}, {fs2}, 0f3F800000;"));
+                                self.emit_line(&format!("shr.b32 {rs1}, {vb}, 1;"));
+                                self.emit_line(&format!("and.b32 {rs1}, {rs1}, 3;"));
+                                self.emit_line(&format!("cvt.rn.f32.u32 {fs1}, {rs1};"));
+                                self.emit_line(&format!("sub.rn.f32 {fs1}, {fs1}, 0f3F800000;"));
+                                self.emit_line(&format!("ex2.approx.ftz.f32 {fs1}, {fs1};"));
+                                self.emit_line(&format!("mul.rn.f32 {fs1}, {fs2}, {fs1};"));
+                                self.emit_line(&format!("shr.b32 {rs1}, {vb}, 3;"));
+                                self.emit_line(&format!("and.b32 {rs1}, {rs1}, 1;"));
+                                self.emit_line(&format!("setp.ne.u32 {ps1}, {rs1}, 0;"));
+                                self.emit_line(&format!("@{ps1} neg.f32 {fs1}, {fs1};"));
+                                self.emit_line(&format!("Lskip_b_{skip_b}:"));
+                                self.emit_line(&format!("@{ps0} mov.f32 {fs1}, 0f00000000;"));
 
-                                    // ── Accumulate: acc += decoded_a * decoded_b ──
-                                    self.emit_line(&format!("fma.rn.f32 {vc}, {fs0}, {fs1}, {vc};"));
-                                }
+                                // ── Accumulate: acc += decoded_a * decoded_b ──
+                                self.emit_line(&format!("fma.rn.f32 {vc}, {fs0}, {fs1}, {vc};"));
                             }
                             GpuDialect::Hip { .. } => {
                                 self.emit_line("{");
@@ -3498,7 +3583,8 @@ Ok(())
                 let act = self.reg_name_with_kind(*activation, alloc);
                 let sc = self.reg_name_with_kind(*scale, alloc);
                 let zp = self.reg_name_with_kind(*zero_point, alloc);
-                let sm = self.sm_version().unwrap_or(0);
+                // sm 不再驱动 Nvfp4 分支 (GPU-005 改为软件 E2M1 解码, 所有 SM 统一路径)
+                let _sm = self.sm_version().unwrap_or(0);
 
                 match quant_kind {
                     // PackedInt4 (AWQ/GPTQ): AND+shift unpack 4-bit -> sub zp -> mul scale -> FMA
@@ -3581,27 +3667,67 @@ Ok(())
                         Ok(())
                     }
 
-                    // Nvfp4: tcgen05 hardware native (SM100+ only)
+                    // Nvfp4: GPU-005 根治 (BCE-20260704-GPU-VIOLATIONS)
+                    //   旧实现把 4-bit nibble 当原始整数 (0-15) cvt→f32 乘 scale, 这是错的 —
+                    //   NVFP4=E2M1 (1 sign + 2 exp + 1 mant), 应解码为浮点
+                    //   (-1)^sign × 2^(exp-1) × (1+mant×0.5) 再乘 scale 做 FMA。
+                    //   tcgen05 原生 NVFP4 指令是 Tile 级 (非 QuantDequantFma 的 SIMT 标量上下文),
+                    //   不可用 (同 GPU-001 理由)。统一软件 E2M1 解码 → F32 → FMA。
                     DK::Nvfp4 => {
                         match self.dialect {
                             GpuDialect::Ptx { .. } => {
-                                if sm >= 100 {
-                                    self.emit_line("{");
-                                    self.emit_line("  .reg .f32 %qdf_e2m1_v;");
-                                    self.emit_line("  .reg .s32 %qdf_idx;");
-                                    self.emit_line(&format!("  and.b32 %qdf_idx, {w}, 0xF;"));
-                                    self.emit_line("  cvt.rn.f32.s32 %qdf_e2m1_v, %qdf_idx;");
-                                    self.emit_line(&format!("  mul.f32 %qdf_e2m1_v, %qdf_e2m1_v, {sc};"));
-                                    self.emit_line(&format!("  fma.rn.f32 {d}, %qdf_e2m1_v, {act}, {d};"));
-                                    self.emit_line("}");
-                                } else {
-                                    return Err(CompilerError::CodegenViolation(
-                                        "QuantDequantFma Nvfp4: requires SM100+ for tcgen05 FP4 native".into()));
-                                }
+                                // E2M1 decode: nibble → f32 magnitude × scale, then FMA with act.
+                                //   sign = (nibble >> 3) & 1
+                                //   exp  = (nibble >> 1) & 3
+                                //   mant = nibble & 1
+                                //   value = nibble==0 ? 0.0 : (-1)^sign × 2^(exp-1) × (1 + mant×0.5)
+                                //   result = value × scale, then fma: d += result × act
+                                let rs0 = self.scratch_gpr_names[0];
+                                let rs1 = self.scratch_gpr_names[1];
+                                let fs0 = self.scratch_vec_names[0]; // magnitude / decoded value
+                                let fs1 = self.scratch_vec_names[1]; // two_pow / temp
+                                let ps0 = self.scratch_pred_names[0]; // zero predicate
+                                let ps1 = self.scratch_pred_names[1]; // sign predicate
+
+                                self.emit_line("{");
+                                self.emit_line("  .reg .u32 %nib;");
+                                self.emit_line(&format!("  and.b32 %nib, {w}, 0xF;"));
+                                // Zero check: nibble == 0 → decoded = 0.0
+                                self.emit_line(&format!("  setp.eq.u32 {ps0}, %nib, 0;"));
+                                let zero_skip = self.next_skip_label();
+                                self.emit_line(&format!("  @{ps0} bra ZERO_NFP4_{zero_skip};"));
+                                // Extract mant (bit 0) → f32, compute (1 + mant*0.5)
+                                self.emit_line(&format!("  and.b32 {rs0}, %nib, 1;"));
+                                self.emit_line(&format!("  cvt.rn.f32.u32 {fs0}, {rs0};"));
+                                self.emit_line("  mul.rn.f32 {fs0}, {fs0}, 0f3F000000;"); // mant * 0.5
+                                self.emit_line("  add.rn.f32 {fs0}, {fs0}, 0f3F800000;"); // 1.0 + mant*0.5
+                                // Extract exp (bits 2:1) → f32, compute 2^(exp-1)
+                                self.emit_line(&format!("  shr.b32 {rs1}, %nib, 1;"));
+                                self.emit_line(&format!("  and.b32 {rs1}, {rs1}, 3;"));
+                                self.emit_line(&format!("  cvt.rn.f32.u32 {fs1}, {rs1};"));
+                                self.emit_line("  sub.rn.f32 {fs1}, {fs1}, 0f3F800000;"); // exp - 1.0
+                                self.emit_line("  ex2.approx.f32 {fs1}, {fs1};");        // 2^(exp-1)
+                                // magnitude = (1 + mant*0.5) * 2^(exp-1)
+                                self.emit_line("  mul.rn.f32 {fs0}, {fs0}, {fs1};");
+                                // Apply sign
+                                self.emit_line(&format!("  shr.b32 {rs1}, %nib, 3;"));
+                                self.emit_line(&format!("  and.b32 {rs1}, {rs1}, 1;"));
+                                self.emit_line(&format!("  setp.ne.u32 {ps1}, {rs1}, 0;"));
+                                self.emit_line(&format!("  @{ps1} neg.f32 {fs0}, {fs0};"));
+                                // Multiply by scale, then FMA: d += (decoded × scale) × act
+                                self.emit_line(&format!("  mul.f32 {fs0}, {fs0}, {sc};"));
+                                self.emit_line(&format!("  fma.rn.f32 {d}, {fs0}, {act}, {d};"));
+                                self.emit_line(&format!("  bra END_NFP4_{zero_skip};"));
+                                self.emit_line(&format!("ZERO_NFP4_{zero_skip}:"));
+                                // nibble == 0 → decoded = 0.0 → d += 0 (no-op, but emit for clarity)
+                                self.emit_line(&format!("  fma.rn.f32 {d}, 0f00000000, {act}, {d};"));
+                                self.emit_line(&format!("END_NFP4_{zero_skip}:"));
+                                let _ = (rs0, rs1, fs1, ps0, ps1);
+                                self.emit_line("}");
                             }
                             _ => {
                                 return Err(CompilerError::CodegenViolation(
-                                    "QuantDequantFma Nvfp4: only supported on PTX SM100+".into()));
+                                    "QuantDequantFma Nvfp4: only supported on PTX (SIMT E2M1 decode)".into()));
                             }
                         }
                         Ok(())
@@ -5106,127 +5232,285 @@ Ok(())
 
                 match self.dialect {
                     GpuDialect::Ptx { .. } => {
-                        let rs0 = self.scratch_gpr_names[0]; // %rs0 — packed_data_addr
-                        let rs1 = self.scratch_gpr_names[1]; // %rs1 — temp
-                        let rs2 = self.scratch_gpr_names[2]; // %rs_bound — temp
+                        // GPU-004 根治 (BCE-20260704-GPU-VIOLATIONS): SIMT per-thread, 消除
+                        //   for pair in 0..num_pairs / for i in 0..num_elems Rust 循环展开 PTX。
+                        //   每线程处理 1 个 pair (pair = tid.x), OOB 守卫。
+                        let rs0 = self.scratch_gpr_names[0]; // %rs0 — tid/pair/lo byte
+                        let rs1 = self.scratch_gpr_names[1]; // %rs1 — offset/hi byte
+                        let rs2 = self.scratch_gpr_names[2]; // %rs2 — hi nibble/temp
+                        let num_pairs = (*num_elems + 1) / 2;
 
-                        // Load u32 page_id → rs0
-                        self.emit_line(&format!("ld.global.u32 {}, [{} + {}];", rs0, pt_name, pt_byte_offset));
-                        // packed_addr = pool_base + page_id * page_stride + tip_offset → rs0
-                        self.emit_line(&format!("mad.lo.u32 {}, {}, {}, {};", rs0, rs0, *page_stride, pool_name));
+                        self.emit_line("{");
+                        self.emit_line("  .reg .u64 %rd_packed;  // packed_data_addr (shared by all threads)");
+                        self.emit_line("  .reg .u64 %rd_scale;  // scale store addr");
+                        self.emit_line("  .reg .u64 %rd_dst;    // packed byte store addr");
+                        self.emit_line("  .reg .u64 %rd_pair;   // pair index (u64)");
+                        self.emit_line("  .reg .pred %p_oob;");
+
+                        // Compute packed_data_addr (all threads compute same value — broadcast, no race).
+                        // page_id = pt[pt_byte_offset/4]; packed = pool + page_id*page_stride + tip_offset
+                        self.emit_line(&format!("  ld.global.u32 {rs0}, [{pt_name} + {pt_byte_offset}];"));
+                        self.emit_line(&format!("  mad.lo.u32 {rs0}, {rs0}, {page_stride}, {pool_name};"));
                         if tip_offset > 0 {
-                            self.emit_line(&format!("add.u32 {}, {}, {};", rs0, rs0, tip_offset));
+                            self.emit_line(&format!("  add.u32 {rs0}, {rs0}, {tip_offset};"));
                         }
-                        // rs0 = packed_data_addr
+                        self.emit_line(&format!("  cvt.u64.u32 %rd_packed, {rs0};"));
 
                         match kivi_mode {
                             KvLoadMode::Kivi4 => {
-                                // Per-channel: each pair gets its own scale
-                                let num_pairs = (*num_elems + 1) / 2;
-                                for pair in 0..num_pairs {
-                                    let lo_off = pair * 2;
-                                    let hi_off = pair * 2 + 1;
-                                    // scale = max(|src[lo]|, |src[hi]|)
-                                    self.emit_line(&format!("ld.global.f32 {rs1}, [{src_name}+{}];", lo_off * 4));
-                                    self.emit_line(&format!("abs.f32 {rs1}, {rs1};"));
-                                    if hi_off < *num_elems {
-                                        self.emit_line(&format!("ld.global.f32 {rs2}, [{src_name}+{}];", hi_off * 4));
-                                        self.emit_line(&format!("abs.f32 {rs2}, {rs2};"));
-                                        self.emit_line(&format!("max.f32 {rs1}, {rs1}, {rs2};"));
-                                    }
-                                    // store scale at rs0 + scale_offset + pair*4
-                                    let scale_byte_off = *scale_offset + pair * 4;
-                                    self.emit_line(&format!("st.global.f32 [{rs0}+{}], {rs1};", scale_byte_off));
-                                    // Reload lo for quantization
-                                    self.emit_line(&format!("ld.global.f32 {rs1}, [{src_name}+{}];", lo_off * 4));
-                                    self.emit_line(&format!("mov.b32 {rs1}, {rs1};"));
-                                    self.emit_line(&format!("shr.b32 {rs1}, {rs1}, 20;"));
-                                    self.emit_line(&format!("and.b32 {rs1}, {rs1}, 0xF;"));
-                                    if hi_off < *num_elems {
-                                        self.emit_line(&format!("ld.global.f32 {rs2}, [{src_name}+{}];", hi_off * 4));
-                                        self.emit_line(&format!("mov.b32 {rs2}, {rs2};"));
-                                        self.emit_line(&format!("shr.b32 {rs2}, {rs2}, 20;"));
-                                        self.emit_line(&format!("and.b32 {rs2}, {rs2}, 0xF;"));
-                                        self.emit_line(&format!("shl.b32 {rs2}, {rs2}, 4;"));
-                                        self.emit_line(&format!("or.b32 {rs1}, {rs1}, {rs2};"));
-                                    }
-                                    self.emit_line(&format!("st.global.u8 [{rs0}+{pair}], {rs1};"));
+                                // Per-channel SIMT: pair = tid.x; OOB guard tid >= num_pairs → skip.
+                                let oob = self.next_skip_label();
+                                let done = self.next_skip_label();
+                                self.emit_line(&format!("  mov.u32 {rs0}, %tid.x;"));
+                                self.emit_line(&format!("  setp.ge.u32 %p_oob, {rs0}, {num_pairs};"));
+                                self.emit_line(&format!("  @%p_oob bra OOB_{oob};"));
+                                // Compute store addresses up-front (loads will clobber rs0)
+                                self.emit_line(&format!("  cvt.u64.u32 %rd_pair, {rs0};"));
+                                // rd_scale = packed + scale_offset + pair*4
+                                self.emit_line(&format!("  add.u64 %rd_scale, %rd_packed, {scale_offset};"));
+                                self.emit_line("  shl.u64 %rd_pair, %rd_pair, 2;");  // pair*4
+                                self.emit_line("  add.u64 %rd_scale, %rd_scale, %rd_pair;");
+                                // rd_dst = packed + pair (restore pair)
+                                self.emit_line(&format!("  cvt.u64.u32 %rd_pair, {rs0};"));  // re-cvt (rs0 still tid)
+                                self.emit_line("  add.u64 %rd_dst, %rd_packed, %rd_pair;");
+
+                                // lo_off = pair*8; load lo → rs0 (clobbers tid, addrs already computed)
+                                self.emit_line(&format!("  mad.lo.u32 {rs1}, {rs0}, 8, 0;"));  // lo_off_bytes
+                                self.emit_line(&format!("  ld.global.f32 {rs0}, [{src_name}+{rs1}];")); // lo
+                                self.emit_line(&format!("  abs.f32 {rs0}, {rs0};"));
+                                // hi_off = pair*8 + 4
+                                self.emit_line(&format!("  mad.lo.u32 {rs1}, %tid.x, 8, 4;"));
+
+                                if *num_elems % 2 == 1 {
+                                    let last_pair = num_pairs - 1;
+                                    self.emit_line(&format!("  setp.eq.u32 %p_oob, %tid.x, {last_pair};"));
+                                    self.emit_line(&format!("  @%p_oob bra LAST_{oob};"));
+                                    // even pair: load hi, scale=max, pack both
+                                    self.emit_line(&format!("  ld.global.f32 {rs2}, [{src_name}+{rs1}];"));
+                                    self.emit_line(&format!("  abs.f32 {rs2}, {rs2};"));
+                                    self.emit_line(&format!("  max.f32 {rs0}, {rs0}, {rs2};"));
+                                    self.emit_line("  st.global.f32 [%rd_scale], {rs0};");
+                                    // reload lo & hi for quant
+                                    self.emit_line(&format!("  mad.lo.u32 {rs1}, %tid.x, 8, 0;"));
+                                    self.emit_line(&format!("  ld.global.f32 {rs0}, [{src_name}+{rs1}];"));
+                                    self.emit_line(&format!("  mov.b32 {rs1}, {rs0};"));
+                                    self.emit_line(&format!("  shr.b32 {rs1}, {rs1}, 20;"));
+                                    self.emit_line(&format!("  and.b32 {rs1}, {rs1}, 0xF;"));  // lo nibble
+                                    self.emit_line(&format!("  mad.lo.u32 {rs2}, %tid.x, 8, 4;"));
+                                    self.emit_line(&format!("  ld.global.f32 {rs0}, [{src_name}+{rs2}];"));
+                                    self.emit_line(&format!("  mov.b32 {rs2}, {rs0};"));
+                                    self.emit_line(&format!("  shr.b32 {rs2}, {rs2}, 20;"));
+                                    self.emit_line(&format!("  and.b32 {rs2}, {rs2}, 0xF;"));  // hi nibble
+                                    self.emit_line(&format!("  shl.b32 {rs2}, {rs2}, 4;"));
+                                    self.emit_line(&format!("  or.b32 {rs1}, {rs1}, {rs2};"));
+                                    self.emit_line("  st.global.u8 [%rd_dst], {rs1};");
+                                    self.emit_line(&format!("  bra END_{done};"));
+                                    self.emit_line(&format!("LAST_{oob}:"));
+                                    // odd last pair: only lo, scale=|lo|, byte=lo nibble
+                                    self.emit_line("  st.global.f32 [%rd_scale], {rs0};");
+                                    self.emit_line(&format!("  mad.lo.u32 {rs1}, %tid.x, 8, 0;"));
+                                    self.emit_line(&format!("  ld.global.f32 {rs0}, [{src_name}+{rs1}];"));
+                                    self.emit_line(&format!("  mov.b32 {rs1}, {rs0};"));
+                                    self.emit_line(&format!("  shr.b32 {rs1}, {rs1}, 20;"));
+                                    self.emit_line(&format!("  and.b32 {rs1}, {rs1}, 0xF;"));
+                                    self.emit_line("  st.global.u8 [%rd_dst], {rs1};");
+                                    self.emit_line(&format!("  bra END_{done};"));
+                                } else {
+                                    self.emit_line(&format!("  ld.global.f32 {rs2}, [{src_name}+{rs1}];"));
+                                    self.emit_line(&format!("  abs.f32 {rs2}, {rs2};"));
+                                    self.emit_line(&format!("  max.f32 {rs0}, {rs0}, {rs2};"));
+                                    self.emit_line("  st.global.f32 [%rd_scale], {rs0};");
+                                    // reload lo & hi for quant
+                                    self.emit_line(&format!("  mad.lo.u32 {rs1}, %tid.x, 8, 0;"));
+                                    self.emit_line(&format!("  ld.global.f32 {rs0}, [{src_name}+{rs1}];"));
+                                    self.emit_line(&format!("  mov.b32 {rs1}, {rs0};"));
+                                    self.emit_line(&format!("  shr.b32 {rs1}, {rs1}, 20;"));
+                                    self.emit_line(&format!("  and.b32 {rs1}, {rs1}, 0xF;"));  // lo nibble
+                                    self.emit_line(&format!("  mad.lo.u32 {rs2}, %tid.x, 8, 4;"));
+                                    self.emit_line(&format!("  ld.global.f32 {rs0}, [{src_name}+{rs2}];"));
+                                    self.emit_line(&format!("  mov.b32 {rs2}, {rs0};"));
+                                    self.emit_line(&format!("  shr.b32 {rs2}, {rs2}, 20;"));
+                                    self.emit_line(&format!("  and.b32 {rs2}, {rs2}, 0xF;"));  // hi nibble
+                                    self.emit_line(&format!("  shl.b32 {rs2}, {rs2}, 4;"));
+                                    self.emit_line(&format!("  or.b32 {rs1}, {rs1}, {rs2};"));
+                                    self.emit_line("  st.global.u8 [%rd_dst], {rs1};");
+                                    self.emit_line(&format!("  bra END_{done};"));
                                 }
+                                self.emit_line(&format!("OOB_{oob}:"));
+                                self.emit_line(&format!("END_{done}:"));
                             }
                             KvLoadMode::Kivi2 => {
-                                // Per-token: single scale for all elements
-                                // Pass 1: find max
-                                self.emit_line(&format!("mov.f32 {rs1}, 0F00000000;")); // 0.0f
-                                for i in 0..*num_elems {
-                                    self.emit_line(&format!("ld.global.f32 {rs2}, [{src_name}+{}];", i * 4));
-                                    self.emit_line(&format!("abs.f32 {rs2}, {rs2};"));
-                                    self.emit_line(&format!("max.f32 {rs1}, {rs1}, {rs2};"));
+                                // Per-token SIMT: warp-shuffle max-reduce (num_elems <= warp=32).
+                                if *num_elems > 32 {
+                                    self.emit_line("}");  // close block before Err
+                                    return Err(CompilerError::CodegenViolation(format!(
+                                        "PageTableKVWriteQuant Kivi2 GPU PTX: num_elems={} > 32 (warp size) — \
+                                         multi-warp max-reduce needs shared mem (not yet supported in SIMT path)",
+                                        num_elems
+                                    )));
                                 }
-                                // store scale
-                                self.emit_line(&format!("st.global.f32 [{rs0}+{}], {rs1};", *scale_offset));
-                                // Pass 2: pack nibbles
-                                let num_pairs = (*num_elems + 1) / 2;
-                                for pair in 0..num_pairs {
-                                    let lo_off = pair * 2;
-                                    let hi_off = pair * 2 + 1;
-                                    self.emit_line(&format!("ld.global.f32 {rs1}, [{src_name}+{}];", lo_off * 4));
-                                    self.emit_line(&format!("mov.b32 {rs1}, {rs1};"));
-                                    self.emit_line(&format!("shr.b32 {rs1}, {rs1}, 20;"));
-                                    self.emit_line(&format!("and.b32 {rs1}, {rs1}, 0xF;"));
-                                    if hi_off < *num_elems {
-                                        self.emit_line(&format!("ld.global.f32 {rs2}, [{src_name}+{}];", hi_off * 4));
-                                        self.emit_line(&format!("mov.b32 {rs2}, {rs2};"));
-                                        self.emit_line(&format!("shr.b32 {rs2}, {rs2}, 20;"));
-                                        self.emit_line(&format!("and.b32 {rs2}, {rs2}, 0xF;"));
-                                        self.emit_line(&format!("shl.b32 {rs2}, {rs2}, 4;"));
-                                        self.emit_line(&format!("or.b32 {rs1}, {rs1}, {rs2};"));
-                                    }
-                                    self.emit_line(&format!("st.global.u8 [{rs0}+{pair}], {rs1};"));
+                                let done = self.next_skip_label();
+                                // Pass 1: each thread loads src[tid] (if tid<num_elems), abs, warp-reduce max.
+                                self.emit_line(&format!("  mov.u32 {rs0}, %tid.x;"));
+                                self.emit_line(&format!("  setp.ge.u32 %p_oob, {rs0}, {num_elems};"));
+                                // load src[tid] or 0.0
+                                self.emit_line(&format!("  mad.lo.u32 {rs1}, {rs0}, 4, 0;"));  // tid*4 byte offset
+                                self.emit_line(&format!("  @!%p_oob ld.global.f32 {rs0}, [{src_name}+{rs1}];"));
+                                self.emit_line("  @%p_oob mov.f32 {rs0}, 0f00000000;");
+                                self.emit_line(&format!("  abs.f32 {rs0}, {rs0};"));
+                                // Warp shuffle max-reduce: for offset 16,8,4,2,1: shfl.bfly → max with shuffled
+                                self.emit_line(&format!("  mov.u32 {rs0}, %tid.x;"));
+                                self.emit_line(&format!("  setp.ge.u32 %p_oob, {rs0}, {num_elems};"));
+                                self.emit_line(&format!("  mad.lo.u32 {rs1}, {rs0}, 4, 0;"));
+                                self.emit_line(&format!("  @!%p_oob ld.global.f32 {rs0}, [{src_name}+{rs1}];"));
+                                self.emit_line("  @%p_oob mov.f32 {rs0}, 0f00000000;");
+                                self.emit_line(&format!("  abs.f32 {rs0}, {rs0};"));
+                                for &off in &[16, 8, 4, 2, 1] {
+                                    self.emit_line(&format!("  shfl.sync.bfly.b32 {rs2}, {rs0}, {off}, 0x1F, 0xFFFFFFFF;"));
+                                    self.emit_line(&format!("  max.f32 {rs0}, {rs0}, {rs2};"));
                                 }
+                                // Thread 0 writes scale
+                                self.emit_line("  .reg .pred %p_t0;");
+                                self.emit_line("  setp.eq.u32 %p_t0, %tid.x, 0;");
+                                self.emit_line(&format!("  @%p_t0 st.global.f32 [%rd_packed+{scale_offset}], {rs0};"));
+                                // Pass 2: pack nibbles — pair = tid.x; OOB guard tid >= num_pairs
+                                let oob = self.next_skip_label();
+                                self.emit_line(&format!("  mov.u32 {rs0}, %tid.x;"));
+                                self.emit_line(&format!("  setp.ge.u32 %p_oob, {rs0}, {num_pairs};"));
+                                self.emit_line(&format!("  @%p_oob bra OOB2_{oob};"));
+                                // rd_dst = packed + pair
+                                self.emit_line(&format!("  cvt.u64.u32 %rd_pair, {rs0};"));
+                                self.emit_line("  add.u64 %rd_dst, %rd_packed, %rd_pair;");
+                                // lo nibble
+                                self.emit_line(&format!("  mad.lo.u32 {rs1}, {rs0}, 8, 0;"));  // lo_off
+                                self.emit_line(&format!("  ld.global.f32 {rs0}, [{src_name}+{rs1}];"));
+                                self.emit_line(&format!("  mov.b32 {rs1}, {rs0};"));
+                                self.emit_line(&format!("  shr.b32 {rs1}, {rs1}, 20;"));
+                                self.emit_line(&format!("  and.b32 {rs1}, {rs1}, 0xF;"));  // lo nibble
+                                if *num_elems % 2 == 1 {
+                                    let last_pair = num_pairs - 1;
+                                    self.emit_line(&format!("  setp.eq.u32 %p_oob, %tid.x, {last_pair};"));
+                                    self.emit_line(&format!("  @%p_oob bra LAST2_{oob};"));
+                                    self.emit_line(&format!("  mad.lo.u32 {rs2}, %tid.x, 8, 4;"));  // hi_off
+                                    self.emit_line(&format!("  ld.global.f32 {rs0}, [{src_name}+{rs2}];"));
+                                    self.emit_line(&format!("  mov.b32 {rs2}, {rs0};"));
+                                    self.emit_line(&format!("  shr.b32 {rs2}, {rs2}, 20;"));
+                                    self.emit_line(&format!("  and.b32 {rs2}, {rs2}, 0xF;"));
+                                    self.emit_line(&format!("  shl.b32 {rs2}, {rs2}, 4;"));
+                                    self.emit_line(&format!("  or.b32 {rs1}, {rs1}, {rs2};"));
+                                    self.emit_line("  st.global.u8 [%rd_dst], {rs1};");
+                                    self.emit_line(&format!("  bra END_{done};"));
+                                    self.emit_line(&format!("LAST2_{oob}:"));
+                                    self.emit_line("  st.global.u8 [%rd_dst], {rs1};");
+                                    self.emit_line(&format!("  bra END_{done};"));
+                                } else {
+                                    self.emit_line(&format!("  mad.lo.u32 {rs2}, %tid.x, 8, 4;"));  // hi_off
+                                    self.emit_line(&format!("  ld.global.f32 {rs0}, [{src_name}+{rs2}];"));
+                                    self.emit_line(&format!("  mov.b32 {rs2}, {rs0};"));
+                                    self.emit_line(&format!("  shr.b32 {rs2}, {rs2}, 20;"));
+                                    self.emit_line(&format!("  and.b32 {rs2}, {rs2}, 0xF;"));
+                                    self.emit_line(&format!("  shl.b32 {rs2}, {rs2}, 4;"));
+                                    self.emit_line(&format!("  or.b32 {rs1}, {rs1}, {rs2};"));
+                                    self.emit_line("  st.global.u8 [%rd_dst], {rs1};");
+                                    self.emit_line(&format!("  bra END_{done};"));
+                                }
+                                self.emit_line(&format!("OOB2_{oob}:"));
+                                self.emit_line(&format!("END_{done}:"));
                             }
                             _ => {
+                                self.emit_line("}");  // close block before Err
                                 return Err(CompilerError::CodegenViolation(
                                     format!("PageTableKVWriteQuant: invalid kivi_mode {:?}", kivi_mode)
                                 ));
                             }
                         }
+                        self.emit_line("}");
                         Ok(())
                     }
                     GpuDialect::Hip { .. } | GpuDialect::Metal { .. } => {
+                        // GPU-004 根治: SIMT per-thread, 消除 for 循环展开。
+                        let tid = if matches!(self.dialect, GpuDialect::Hip { .. }) { "threadIdx.x" } else { "thread_position_in_threadgroup.x" };
+                        let num_pairs = (*num_elems + 1) / 2;
                         self.emit_line("{");
                         self.emit_line(&format!("  uint32_t _ppid = ((uint32_t*){})[{}];", pt_name, page_idx));
                         self.emit_line(&format!("  auto _packed_addr = (uint8_t*){} + (size_t)_ppid * {} + {};", pool_name, *page_stride, tip_offset));
                         self.emit_line(&format!("  auto _scale_addr = (float*)(_packed_addr + {});", *scale_offset));
                         match kivi_mode {
                             KvLoadMode::Kivi4 => {
-                                let num_pairs = (*num_elems + 1) / 2;
-                                for pair in 0..num_pairs {
-                                    let lo_off = pair * 2;
-                                    let hi_off = pair * 2 + 1;
-                                    self.emit_line(&format!("  {{ float _lo = ((float*){})[{}];", src_name, lo_off));
-                                    self.emit_line(&format!("    float _hi = ((float*){})[{}];", src_name, hi_off));
-                                    self.emit_line("    float _sc = fmax(fabs(_lo), fabs(_hi));");
-                                    self.emit_line(&format!("    _scale_addr[{}] = _sc;", pair));
-                                    self.emit_line("    uint32_t _nlo = ((*((uint32_t*)&_lo)) >> 20) & 0xF;");
-                                    self.emit_line("    uint32_t _nhi = ((*((uint32_t*)&_hi)) >> 20) & 0xF;");
-                                    self.emit_line(&format!("    _packed_addr[{}] = (uint8_t)((_nhi << 4) | _nlo); }}", pair));
+                                // Per-channel SIMT: pair = tid.x; OOB guard.
+                                self.emit_line(&format!("  unsigned int _pair = (unsigned int){tid};"));
+                                self.emit_line(&format!("  if (_pair < {num_pairs}) {{"));
+                                self.emit_line("    unsigned int _lo = _pair * 2;");
+                                self.emit_line("    unsigned int _hi = _pair * 2 + 1;");
+                                self.emit_line(&format!("    float _a = fabs(((float*){})[_lo]);", src_name));
+                                if *num_elems % 2 == 1 {
+                                    self.emit_line(&format!("    if (_hi < {num_elems}) {{"));
+                                    self.emit_line(&format!("      float _b = fabs(((float*){})[_hi]);", src_name));
+                                    self.emit_line("      _scale_addr[_pair] = fmax(_a, _b);");
+                                    self.emit_line(&format!("      uint32_t _nlo = ((*((uint32_t*)&((float*){})[_lo])) >> 20) & 0xF;", src_name));
+                                    self.emit_line(&format!("      uint32_t _nhi = ((*((uint32_t*)&((float*){})[_hi])) >> 20) & 0xF;", src_name));
+                                    self.emit_line("      _packed_addr[_pair] = (uint8_t)((_nhi << 4) | _nlo);");
+                                    self.emit_line("    } else {");
+                                    self.emit_line("      _scale_addr[_pair] = _a;");
+                                    self.emit_line(&format!("      uint32_t _nlo = ((*((uint32_t*)&((float*){})[_lo])) >> 20) & 0xF;", src_name));
+                                    self.emit_line("      _packed_addr[_pair] = (uint8_t)_nlo;");
+                                    self.emit_line("    }");
+                                } else {
+                                    self.emit_line(&format!("    float _b = fabs(((float*){})[_hi]);", src_name));
+                                    self.emit_line("    _scale_addr[_pair] = fmax(_a, _b);");
+                                    self.emit_line(&format!("    uint32_t _nlo = ((*((uint32_t*)&((float*){})[_lo])) >> 20) & 0xF;", src_name));
+                                    self.emit_line(&format!("    uint32_t _nhi = ((*((uint32_t*)&((float*){})[_hi])) >> 20) & 0xF;", src_name));
+                                    self.emit_line("    _packed_addr[_pair] = (uint8_t)((_nhi << 4) | _nlo);");
                                 }
+                                self.emit_line("  }");
                             }
                             KvLoadMode::Kivi2 => {
-                                self.emit_line("  float _maxv = 0.0f;");
-                                self.emit_line(&format!("  for (int _i = 0; _i < {}; _i++) {{", num_elems));
-                                self.emit_line(&format!("    float _v = fabs(((float*){})[_i]);", src_name));
-                                self.emit_line("    _maxv = fmax(_maxv, _v);");
-                                self.emit_line("  }");
-                                self.emit_line("  _scale_addr[0] = _maxv;");
-                                let num_pairs = (*num_elems + 1) / 2;
-                                for pair in 0..num_pairs {
-                                    let lo_off = pair * 2;
-                                    let hi_off = pair * 2 + 1;
-                                    self.emit_line(&format!("  {{ uint32_t _nlo = ((*((uint32_t*)&((float*){})[{}])) >> 20) & 0xF;", src_name, lo_off));
-                                    self.emit_line(&format!("    uint32_t _nhi = ((*((uint32_t*)&((float*){})[{}])) >> 20) & 0xF;", src_name, hi_off));
-                                    self.emit_line(&format!("    _packed_addr[{}] = (uint8_t)((_nhi << 4) | _nlo); }}", pair));
+                                // Per-token SIMT: 2-pass with warp-shuffle max-reduce.
+                                // Pass 1: each thread loads src[tid] (if tid<num_elems), abs, warp-reduce max.
+                                //   Thread 0 writes scale. ( Assumes warp covers num_elems; if num_elems > warp
+                                //   size, multi-warp reduce needs shared mem — out of scope, return Err. )
+                                if *num_elems > 32 {
+                                    return Err(CompilerError::CodegenViolation(format!(
+                                        "PageTableKVWriteQuant Kivi2 GPU: num_elems={} > 32 (warp size) — \
+                                         multi-warp max-reduce needs shared mem (not yet supported in SIMT path)",
+                                        num_elems
+                                    )));
                                 }
+                                self.emit_line(&format!("  unsigned int _t = (unsigned int){tid};"));
+                                self.emit_line(&format!("  float _myv = 0.0f;"));
+                                self.emit_line(&format!("  if (_t < {num_elems}) {{"));
+                                self.emit_line(&format!("    _myv = fabs(((float*){})[_t]);", src_name));
+                                self.emit_line("  }");
+                                // Warp shuffle max-reduce (PTX-style but HIP/Metal intrinsics)
+                                if matches!(self.dialect, GpuDialect::Hip { .. }) {
+                                    self.emit_line("  for (int _o = 16; _o > 0; _o >>= 1) {");
+                                    self.emit_line("    _myv = fmax(_myv, __shfl_xor(_myv, _o));");
+                                    self.emit_line("  }");
+                                } else {
+                                    // Metal: simd_shuffle_xor (simd-group)
+                                    self.emit_line("  for (int _o = 16; _o > 0; _o >>= 1) {");
+                                    self.emit_line("    _myv = max(_myv, simd_shuffle_xor(_myv, _o));");
+                                    self.emit_line("  }");
+                                }
+                                self.emit_line("  if (_t == 0) { _scale_addr[0] = _myv; }");
+                                // Pass 2: each thread packs 1 pair (pair = tid.x), OOB guard.
+                                self.emit_line(&format!("  unsigned int _pair = (unsigned int){tid};"));
+                                self.emit_line(&format!("  if (_pair < {num_pairs}) {{"));
+                                self.emit_line("    unsigned int _lo = _pair * 2;");
+                                self.emit_line("    unsigned int _hi = _pair * 2 + 1;");
+                                self.emit_line(&format!("    uint32_t _nlo = ((*((uint32_t*)&((float*){})[_lo])) >> 20) & 0xF;", src_name));
+                                if *num_elems % 2 == 1 {
+                                    self.emit_line(&format!("    if (_hi < {num_elems}) {{"));
+                                    self.emit_line(&format!("      uint32_t _nhi = ((*((uint32_t*)&((float*){})[_hi])) >> 20) & 0xF;", src_name));
+                                    self.emit_line("      _packed_addr[_pair] = (uint8_t)((_nhi << 4) | _nlo);");
+                                    self.emit_line("    } else {");
+                                    self.emit_line("      _packed_addr[_pair] = (uint8_t)_nlo;");
+                                    self.emit_line("    }");
+                                } else {
+                                    self.emit_line(&format!("    uint32_t _nhi = ((*((uint32_t*)&((float*){})[_hi])) >> 20) & 0xF;", src_name));
+                                    self.emit_line("    _packed_addr[_pair] = (uint8_t)((_nhi << 4) | _nlo);");
+                                }
+                                self.emit_line("  }");
                             }
                             _ => {
                                 return Err(CompilerError::CodegenViolation(

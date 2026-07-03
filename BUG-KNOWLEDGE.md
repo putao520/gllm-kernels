@@ -11,6 +11,7 @@
 | BCE-OPTPASS 指令重写 dtype 丢失（BCE-20260630-OPTPASS） | 1 | 1 ✅ | 0 | substitute_loop_offset/forwarding match 绑定保留原 dtype，禁 `..` 丢弃 |
 | BCE-X86-APX-EGPR iced_x86 APX egpr 编码缺失（BCE-20260703-X86-APX-EGPR-UNUSED） | 1 | 1 ✅ | 0 | gpr/gpr32/gpr64_to_32 对 16..31 显式报错；iced_x86 1.21 无 R16-R31 变体，APX 激活前须升级 iced_x86 |
 | BCE-AVX512-HALF-LANES AVX-512 codegen 半 lanes（BCE-20260703-AVX512-HALF-LANES） | 1 | 1 ✅ | 0 | 7 处 reduction/scan 按 use_avx512 分流 ZMM 16-lane（argmax/softmax_reduce_max/HReduce/Accumulate/softmax_normalize/temperature/Transcendental） |
+| BCE-GPU-VIOLATIONS GPU codegen 6 处违宪（BCE-20260704-GPU-VIOLATIONS） | 1 | 1 ✅ | 0 | DotProduct SIMT非tcgen05/MxFP4多lane SIMT解码/VecLoad dtype分流/KIVI SIMT per-thread/NVFP4 E2M1解码 (GPU-009 P3 留后续) |
 
 **全库残留总计**: 0
 
@@ -418,3 +419,62 @@ fixTemplate:
 - 回归测试: 7 个 (写入 tests.inc.rs)
 - BUG-KNOWLEDGE.md: 本条目
 - 状态: ✅ 已闭环 (residual=0)
+
+---
+
+## BCE-20260704-GPU-VIOLATIONS — GPU codegen 6 处违宪 (tcgen05 误用/SIMT lane 丢弃/dtype 硬编码/循环展开/E2M1 整数解码)
+
+**patternId**: BCE-20260704-GPU-VIOLATIONS
+**归因时间**: 2026-07-04
+**缺陷分层**: 范式缺陷 + 设计缺陷 (架构层: SIMT 线程模型 + dtype 传播 + tile-vs-SIMT 边界)
+
+### 6 处 BUG
+
+| ID | 优先级 | 文件 | BUG | 根治 |
+|----|--------|------|-----|------|
+| GPU-001 | P0 | lower_instr_dispatch.inc.rs:1326-1603 (lower_dot_product_gpu) | DotProduct (SIMT 标量点积) SM100+ 用 tcgen05.mma / SM90+ wgmma / SM80+ mma.sync — 全是 Tile 级张量核指令, 非法用于 SIMT 标量 (标量寄存器喂 tile 指令 = 非法 PTX)。Int8 同违宪 (mma.sync IMMA)。 | 所有 SM 统一 SIMT 标量路径: BF16→cvt.f32.bf16+fma; F16→cvt.f32.f16+fma; Int8→mul.lo.s32+add.s32; Fp4→软件 e2m1 解码+fma。删除全部 tcgen05/wgmma/mma.sync/wmma。 |
+| GPU-002 | P0 | lower_gpu.inc.rs:293-551 (emit_mxfp4_dequant_gpu) | 多 lane 路径 (lanes>2) 仅解码 lane 0 并 mov.f32 {d},{fs2}, 注释自认 "only store lane 0" — W512(16)/W256(8) 高 lanes 静默丢弃。 | SIMT per-thread (lane=tid.x, byte_idx=tid>>1, is_high=tid&1), OOB 守卫 tid>=lanes→0.0。参照 Q4_0 修复 1c1f1a40。HIP/Metal 同步 per-thread。 |
+| GPU-003 | P1 | lower_instr_dispatch.inc.rs:246-360 (lower_vec_load/store_gpu) | `..` 忽略 VecLoad/VecStore.dtype, 硬编码 ld/st.global.f32 + /4。BF16/F16/INT8 权重用错 dtype load。 | 按 instr.dtype.kind 分流: F32→f32/4; BF16→b16/2+cvt.f32.bf16; F16→b16/2+cvt.f32.f16; INT8→s8+cvt.f32.s32。参照 x86 dtype.x86_elem_strategy()。ARCH-JIT-YIELDS。 |
+| GPU-004 | P1 | lower_gpu.inc.rs:771-878 (emit_kivi_quant) + lower_instr_dispatch.inc.rs:5220 (lower_page_table_k_v_write_quant_gpu) | `for pair in 0..num_pairs` (num_pairs=32-64) Rust 循环展开 PTX/HIP/Metal。Kivi2 `for i in 0..num_elems` 同违宪。 | SIMT per-thread (pair=tid.x), OOB 守卫。Kivi2 max-reduce 用 warp shuffle (shfl.sync.bfly / __shfl_xor / simd_shuffle_xor), num_elems>32 返回 Err (多 warp 需 shared mem 留后续)。 |
+| GPU-005 | P1 | lower_instr_dispatch.inc.rs:3585-3608 (QuantDequantFma Nvfp4) | 把 4-bit nibble 当原始整数 cvt.rn.f32.s32 + mul.f32 (整数 0-15 解码), 而非 E2M1 浮点解码。NVFP4=E2M1 (1 sign+2 exp+1 mant), 应解码为 (-1)^sign×2^(exp-1)×(1+mant×0.5)。 | E2M1 浮点解码: 提取 sign/exp/mant 位, ex2.approx(2^(exp-1)), (1+mant×0.5)×two_pow, neg 应用 sign, mul scale, fma.rn.f32。 |
+| GPU-009 | P3 | lower_gpr_cond_action_gpu (L2265, 圈复杂度81) / lower_quant_block_load (L2,441行) 等 | God Function 复杂度超 P-2 (≤500行/圈复杂度≤10)。 | 留后续 (P3 低优先级, P0-P1 已根治)。报告注明。 |
+
+### BUG 模式签名
+
+```yaml
+detectionSignatures:
+  structural:
+    - "DotProduct GPU 路径出现 tcgen05.mma / wgmma.mma_async / mma.sync.aligned / wmma (tile 级指令用于 SIMT 标量点积)"
+    - "GPU 多 lane dequant 路径出现 'only store lane 0' / 'subsequent lanes would need separate dst' 注释 (静默丢弃高 lanes)"
+    - "lower_vec_load/store_gpu 用 `..` 忽略 dtype 字段 + 硬编码 ld/st.global.f32"
+    - "GPU quant 路径出现 `for pair in 0..num_pairs` / `for lane in 0..lanes` Rust 循环展开 PTX (NO-LOOP-UNROLL 违反)"
+    - "NVFP4/E2M1 路径出现 cvt.rn.f32.s32 + mul.f32 (整数解码 E2M1 浮点)"
+  antipattern:
+    - "tile-vs-SIMT 边界混淆: tile 级张量核指令 (tcgen05/wgmma/mma.sync) 误用于 SIMT 标量上下文"
+    - "for-lane Rust 循环展开 PTX (应用 SIMT per-thread, tid.x 驱动)"
+    - "dtype 字段被 `..` 忽略 (应用 dtype.gpu_elem_strategy() / dtype.kind 分流)"
+sameClassCriterion:
+  - "任何 DotProduct (SIMT 标量点积) 路径禁用 tile 级张量核指令 (tcgen05/wgmma/mma.sync/wmma)"
+  - "任何多 lane GPU 解码路径必须 SIMT per-thread (tid.x 驱动), 禁止 for-lane 循环展开 + 单 {d} 覆盖"
+  - "任何 VecLoad/VecStore 必须按 instr.dtype 分流, 禁止硬编码 f32"
+  - "任何 E2M1/E2M3/E4M3 等 FP nibble 解码必须浮点解码 (sign/exp/mant 提取), 禁止整数 cvt"
+fixTemplate:
+  - "DotProduct: 所有 SM 统一 SIMT 标量路径 (cvt+fma / mul+add), 删除全部 tile 级指令"
+  - "多 lane dequant: SIMT per-thread (lane=tid.x, byte_idx=tid>>1), OOB 守卫 tid>=lanes→0.0"
+  - "VecLoad/Store: match dtype.kind 分流 (F32/BF16/F16/INT8), sub-byte 返回 Err"
+  - "quant for-pair: SIMT per-thread (pair=tid.x), Kivi2 max-reduce 用 warp shuffle"
+  - "E2M1 解码: ex2.approx(2^(exp-1)) × (1+mant×0.5) × (-1)^sign × scale, fma 累加"
+```
+
+### 全量确认 (residual=0)
+
+- 重扫 gpu_lower/lower_instr_dispatch.inc.rs + lower_gpu.inc.rs: 5 处 P0-P1 全部根治 (GPU-009 P3 留后续)
+- cargo check --lib: 0 errors (gpu_lower 无 error/warning)
+- cargo test --lib: 7023 passed / 0 failed (含 9 新 GPU 回归测试)
+- 9 回归测试: test_ptx_dot_product_bf16_no_tcgen05 / test_ptx_dot_product_fp16_no_tcgen05 / test_ptx_dot_product_int8_no_mma_sync / test_ptx_dot_product_fp4_no_tcgen05_software_e2m1 / test_ptx_vec_load_bf16_dtype_dispatch / test_ptx_vec_load_f16_dtype_dispatch / test_ptx_vec_load_int8_dtype_dispatch / test_ptx_vec_store_bf16_dtype_dispatch / test_ptx_quant_dequant_fma_nvfp4_e2m1_decode
+- (另有 7 处 MXFP4 测试增强 SIMT per-thread 断言)
+
+### 防复发沉淀
+- 回归测试: 9 新增 + 7 增强 (写入 tests.inc.rs)
+- BUG-KNOWLEDGE.md: 本条目
+- 状态: ✅ P0-P1 已闭环 (residual=0); GPU-009 P3 God Function 重构留后续

@@ -223,6 +223,11 @@ mod tests {
         assert!(ir.contains("ex2.approx.f32"), "PTX MXFP4 should use ex2.approx for 2^(exp-1): {ir}");
         assert!(ir.contains("ld.global.u8"), "PTX MXFP4 should load packed byte: {ir}");
         assert!(ir.contains("mul.f32"), "PTX MXFP4 should multiply by scale: {ir}");
+        // GPU-002 回归 (BCE-20260704-GPU-VIOLATIONS): SIMT per-thread, 必须用 %tid.x 驱动 byte_idx
+        //   且消除 "only store lane 0" 的静默丢弃 (Warp 32 lanes 全解码)。
+        assert!(ir.contains("%tid.x"), "PTX MXFP4 SIMT per-thread must use %tid.x: {ir}");
+        assert!(ir.contains("OOB_"), "PTX MXFP4 SIMT must emit OOB guard (tid>=lanes): {ir}");
+        assert!(!ir.contains("only store lane 0"), "PTX MXFP4 must not have lane-0-only stub: {ir}");
     }
 
     #[test]
@@ -251,6 +256,10 @@ mod tests {
         assert!(ir.contains("exp2f"), "HIP MXFP4 should use exp2f for 2^(exp-1): {ir}");
         assert!(ir.contains("sign_bit"), "HIP MXFP4 should extract sign bit: {ir}");
         assert!(ir.contains("scale_f"), "HIP MXFP4 should multiply by e8m0 scale: {ir}");
+        // GPU-002 回归: SIMT per-thread, threadIdx.x 驱动 lane 索引, OOB 守卫
+        assert!(ir.contains("threadIdx.x"), "HIP MXFP4 SIMT per-thread must use threadIdx.x: {ir}");
+        assert!(ir.contains("byte_idx = _t >> 1"), "HIP MXFP4 SIMT must compute byte_idx from tid: {ir}");
+        assert!(!ir.contains("only lane 0"), "HIP MXFP4 must not have lane-0-only stub: {ir}");
     }
 
     #[test]
@@ -277,6 +286,158 @@ mod tests {
         assert!(ir.contains("scale_bits"), "Metal MXFP4 should decode e8m0 scale: {ir}");
         assert!(ir.contains("exp2f"), "Metal MXFP4 should use exp2f: {ir}");
         assert!(ir.contains("magnitude"), "Metal MXFP4 should compute magnitude: {ir}");
+        // GPU-002 回归: SIMT per-thread, thread_position_in_threadgroup.x 驱动
+        assert!(ir.contains("thread_position_in_threadgroup.x"), "Metal MXFP4 SIMT must use thread_position: {ir}");
+    }
+
+    // ── GPU-001 回归 (BCE-20260704-GPU-VIOLATIONS): DotProduct 是 SIMT 标量点积, 非 tile mma ──
+    //   旧实现 SM100+ 用 tcgen05.mma (Tile 级), SM90+ 用 wgmma, SM80+ 用 mma.sync — 全是 tile 级,
+    //   非法用于 SIMT 标量。根治: 所有 SM 统一 SIMT 标量路径 (cvt + fma.rn.f32 / mul+add)。
+
+    #[test]
+    fn test_ptx_dot_product_bf16_no_tcgen05() {
+        // SM100 (Blackwell) DotProduct<Bf16> 必须用 SIMT cvt+fma, 禁止 tcgen05.mma
+        let mut l = GpuLower::new(GpuDialect::Ptx { sm_version: 100 });
+        let alloc = empty_alloc();
+        l.lower_instr(&VmInstr::DotProduct {
+            acc: VRegId(0), a: VRegId(1), b: VRegId(2),
+            input_dtype: DotDtype::Bf16, width: SimdWidth::Scalar,
+        }, &alloc).unwrap();
+        let ir = l.finalize().unwrap();
+        assert!(!ir.contains("tcgen05.mma"), "DotProduct<Bf16> SM100 must NOT use tcgen05.mma (Tile-level): {ir}");
+        assert!(!ir.contains("wgmma.mma_async"), "DotProduct<Bf16> must NOT use wgmma (Tile-level): {ir}");
+        assert!(!ir.contains("mma.sync.aligned"), "DotProduct<Bf16> must NOT use mma.sync (warp-tile): {ir}");
+        assert!(ir.contains("cvt.rn.f32.bf16"), "DotProduct<Bf16> must use SIMT cvt.rn.f32.bf16: {ir}");
+        assert!(ir.contains("fma.rn.f32"), "DotProduct<Bf16> must use SIMT fma.rn.f32: {ir}");
+    }
+
+    #[test]
+    fn test_ptx_dot_product_fp16_no_tcgen05() {
+        let mut l = GpuLower::new(GpuDialect::Ptx { sm_version: 100 });
+        let alloc = empty_alloc();
+        l.lower_instr(&VmInstr::DotProduct {
+            acc: VRegId(0), a: VRegId(1), b: VRegId(2),
+            input_dtype: DotDtype::Fp16, width: SimdWidth::Scalar,
+        }, &alloc).unwrap();
+        let ir = l.finalize().unwrap();
+        assert!(!ir.contains("tcgen05.mma"), "DotProduct<Fp16> SM100 must NOT use tcgen05.mma: {ir}");
+        assert!(ir.contains("cvt.rn.f32.f16"), "DotProduct<Fp16> must use SIMT cvt.rn.f32.f16: {ir}");
+        assert!(ir.contains("fma.rn.f32"), "DotProduct<Fp16> must use SIMT fma.rn.f32: {ir}");
+    }
+
+    #[test]
+    fn test_ptx_dot_product_int8_no_mma_sync() {
+        // Int8 DotProduct 必须用 SIMT mul+add, 禁止 mma.sync (warp-tile IMMA)
+        let mut l = GpuLower::new(GpuDialect::Ptx { sm_version: 80 });
+        let alloc = empty_alloc();
+        l.lower_instr(&VmInstr::DotProduct {
+            acc: VRegId(0), a: VRegId(1), b: VRegId(2),
+            input_dtype: DotDtype::Int8, width: SimdWidth::Scalar,
+        }, &alloc).unwrap();
+        let ir = l.finalize().unwrap();
+        assert!(!ir.contains("mma.sync"), "DotProduct<Int8> must NOT use mma.sync (warp-tile IMMA): {ir}");
+        assert!(ir.contains("mul.lo.s32"), "DotProduct<Int8> must use SIMT mul.lo.s32: {ir}");
+        assert!(ir.contains("add.s32"), "DotProduct<Int8> must use SIMT add.s32: {ir}");
+    }
+
+    #[test]
+    fn test_ptx_dot_product_fp4_no_tcgen05_software_e2m1() {
+        // Fp4 DotProduct SM100 必须用软件 e2m1 解码, 禁止 tcgen05.mma.kind::fp4
+        let mut l = GpuLower::new(GpuDialect::Ptx { sm_version: 100 });
+        let alloc = empty_alloc();
+        l.lower_instr(&VmInstr::DotProduct {
+            acc: VRegId(0), a: VRegId(1), b: VRegId(2),
+            input_dtype: DotDtype::Fp4, width: SimdWidth::Scalar,
+        }, &alloc).unwrap();
+        let ir = l.finalize().unwrap();
+        assert!(!ir.contains("tcgen05.mma"), "DotProduct<Fp4> SM100 must NOT use tcgen05.mma: {ir}");
+        // E2M1 decode markers
+        assert!(ir.contains("ex2.approx"), "DotProduct<Fp4> must use software E2M1 decode (ex2.approx): {ir}");
+        assert!(ir.contains("fma.rn.f32"), "DotProduct<Fp4> must accumulate via fma.rn.f32: {ir}");
+    }
+
+    // ── GPU-003 回归 (BCE-20260704-GPU-VIOLATIONS): VecLoad/VecStore 按 dtype 分流 ──
+
+    #[test]
+    fn test_ptx_vec_load_bf16_dtype_dispatch() {
+        let mut l = GpuLower::new(GpuDialect::Ptx { sm_version: 80 });
+        let alloc = empty_alloc();
+        l.lower_instr(&VmInstr::VecLoad {
+            dst: VRegId(0), base: VRegId(1), offset: OffsetExpr::Const(0),
+            width: SimdWidth::Scalar, dtype: crate::compiler::trace::QuantPrecision::BF16,
+            predicate: None,
+        }, &alloc).unwrap();
+        let ir = l.finalize().unwrap();
+        assert!(ir.contains("ld.global.b16"), "VecLoad<BF16> must emit ld.global.b16 (not hardcoded f32): {ir}");
+        assert!(ir.contains("cvt.rn.f32.bf16"), "VecLoad<BF16> must cvt to f32: {ir}");
+        assert!(!ir.contains("ld.global.f32"), "VecLoad<BF16> must NOT use hardcoded ld.global.f32: {ir}");
+    }
+
+    #[test]
+    fn test_ptx_vec_load_f16_dtype_dispatch() {
+        let mut l = GpuLower::new(GpuDialect::Ptx { sm_version: 80 });
+        let alloc = empty_alloc();
+        l.lower_instr(&VmInstr::VecLoad {
+            dst: VRegId(0), base: VRegId(1), offset: OffsetExpr::Const(0),
+            width: SimdWidth::Scalar, dtype: crate::compiler::trace::QuantPrecision::F16,
+            predicate: None,
+        }, &alloc).unwrap();
+        let ir = l.finalize().unwrap();
+        assert!(ir.contains("ld.global.b16"), "VecLoad<F16> must emit ld.global.b16: {ir}");
+        assert!(ir.contains("cvt.rn.f32.f16"), "VecLoad<F16> must cvt to f32: {ir}");
+    }
+
+    #[test]
+    fn test_ptx_vec_load_int8_dtype_dispatch() {
+        let mut l = GpuLower::new(GpuDialect::Ptx { sm_version: 80 });
+        let alloc = empty_alloc();
+        l.lower_instr(&VmInstr::VecLoad {
+            dst: VRegId(0), base: VRegId(1), offset: OffsetExpr::Const(0),
+            width: SimdWidth::Scalar, dtype: crate::compiler::trace::QuantPrecision::INT8,
+            predicate: None,
+        }, &alloc).unwrap();
+        let ir = l.finalize().unwrap();
+        assert!(ir.contains("ld.global.s8"), "VecLoad<INT8> must emit ld.global.s8: {ir}");
+        assert!(ir.contains("cvt.rn.f32.s32"), "VecLoad<INT8> must cvt to f32: {ir}");
+    }
+
+    #[test]
+    fn test_ptx_vec_store_bf16_dtype_dispatch() {
+        let mut l = GpuLower::new(GpuDialect::Ptx { sm_version: 80 });
+        let alloc = empty_alloc();
+        l.lower_instr(&VmInstr::VecStore {
+            base: VRegId(1), src: VRegId(0), offset: OffsetExpr::Const(0),
+            width: SimdWidth::Scalar, dtype: crate::compiler::trace::QuantPrecision::BF16,
+            predicate: None,
+        }, &alloc).unwrap();
+        let ir = l.finalize().unwrap();
+        assert!(ir.contains("cvt.rn.bf16.f32"), "VecStore<BF16> must cvt f32→bf16: {ir}");
+        assert!(ir.contains("st.global.b16"), "VecStore<BF16> must emit st.global.b16: {ir}");
+        assert!(!ir.contains("st.global.f32"), "VecStore<BF16> must NOT use hardcoded st.global.f32: {ir}");
+    }
+
+    // ── GPU-005 回归 (BCE-20260704-GPU-VIOLATIONS): NVFP4 E2M1 浮点解码 (非整数) ──
+
+    #[test]
+    fn test_ptx_quant_dequant_fma_nvfp4_e2m1_decode() {
+        // NVFP4 QuantDequantFma 必须做 E2M1 浮点解码, 禁止整数 cvt+mul
+        use crate::quant_format::QuantDataKind;
+        let mut l = GpuLower::new(GpuDialect::Ptx { sm_version: 100 });
+        let alloc = empty_alloc();
+        l.lower_instr(&VmInstr::QuantDequantFma {
+            dst: VRegId(0), weight: VRegId(1), activation: VRegId(2),
+            scale: VRegId(3), zero_point: VRegId(4),
+            quant_kind: QuantDataKind::Nvfp4,
+            dtype: crate::compiler::trace::QuantPrecision::F32,
+            width: SimdWidth::Scalar,
+        }, &alloc).unwrap();
+        let ir = l.finalize().unwrap();
+        // 旧 bug: cvt.rn.f32.s32 + mul.f32 (整数解码) — 必须不存在
+        assert!(!ir.contains("cvt.rn.f32.s32 %qdf_e2m1_v"), "NVFP4 must NOT use integer cvt (E2M1 is float): {ir}");
+        // 正解: E2M1 浮点解码 — ex2.approx (2^(exp-1)) + sign + mant
+        assert!(ir.contains("ex2.approx"), "NVFP4 must use E2M1 float decode (ex2.approx): {ir}");
+        assert!(ir.contains("neg.f32"), "NVFP4 must apply sign via neg.f32: {ir}");
+        assert!(ir.contains("fma.rn.f32"), "NVFP4 must accumulate via fma.rn.f32: {ir}");
     }
 
     // ── REQ-CG-010: VecCast/VecCmp/ConditionalSelect tests ──

@@ -315,189 +315,124 @@ impl GpuLower {
 
         match self.dialect {
             GpuDialect::Ptx { .. } => {
-                // ── PTX: emit scalar decode using PTX float arithmetic ──
+                // ── PTX: SIMT per-thread e2m1 decode (GPU-002 根治 BCE-20260704-GPU-VIOLATIONS) ──
+                //
+                // 旧 bug: 多 lane 路径 (lanes>2) 仅解码 lane 0 并 `mov.f32 {d}, {fs2}`,
+                //   注释自认 "decode all lanes but only store lane 0" — 高 lanes 静默丢弃。
+                //   W512 (16 lanes) / W256 (8 lanes) 时 15/7 lanes 未解码 = 数据损坏。
+                //
+                // 根治 (参照 Q4_0 修复 1c1f1a40 SIMT per-thread 模式):
+                //   每线程解码 1 个 nibble (lane = tid.x), 写单个 f32 到 {d} (无覆盖)。
+                //   byte_idx = tid >> 1; is_high = tid & 1
+                //   nibble = is_high ? (byte >> 4) & 0xF : byte & 0xF
+                //   result = e2m1_decode(nibble) × scale → {d}
+                //   边界: tid >= lanes → {d} = 0.0 (OOB 守卫)
                 //
                 // Algorithm (per nibble, no LUT needed):
-                //   1. e8m0 scale: mov.u32 tmp, scale_gpr; and tmp, 0xFF;
-                //      shl tmp, 23; mov.f32 scale_f32, tmp  (IEEE 754 reinterpret)
-                //   2. Load packed byte: ld.global.u8 byte, [addr]
-                //   3. Extract low/high nibble
-                //   4. E2M1 decode via float math:
-                //      exp_field = (nibble >> 1) & 3
-                //      mant_field = nibble & 1
-                //      two_pow = ex2.approx(exp_field - 1.0)   // PTX native exp2
-                //      magnitude = (1.0 + mant_field) * two_pow
-                //      if nibble == 0: result = 0.0
-                //      apply sign via neg.f32 under predicate
-                //      result *= scale
-                //
-                // We emit a series of per-lane operations. Each lane reads one nibble
-                // from packed bytes: lane i uses byte[i/2], nibble i%2 (low=0, high=1).
-                // Since PTX is scalar-per-thread, each "lane" is a separate block of
-                // instructions writing to consecutive f32 output slots.
-                //
-                // For efficiency with many lanes we use a loop approach when lanes > 2.
+                //   1. e8m0 scale: mov.u32 tmp, scale_gpr; and tmp, 0xFF; shl tmp, 23;
+                //      mov.f32 scale_f32, tmp (IEEE 754 reinterpret)
+                //   2. Load packed byte: ld.global.u8 byte, [base + off + byte_idx]
+                //   3. Extract low/high nibble (per is_high)
+                //   4. E2M1 decode: nibble==0 → 0.0; else magnitude=(1+mant*0.5)*2^(exp-1), apply sign
+                //   5. result = magnitude × scale → {d}
 
-                let rs0 = self.scratch_gpr_names[0]; // %rs0 — byte / nibble / u32 temp
-                let rs1 = self.scratch_gpr_names[1]; // %rs1 — address / u32 temp
+                let rs0 = self.scratch_gpr_names[0]; // %rs0 — tid / byte / nibble / u32 temp
+                let rs1 = self.scratch_gpr_names[1]; // %rs1 — is_high / u32 temp
                 let fs0 = self.scratch_vec_names[0]; // %fs0 — f32 scale
-                let fs1 = self.scratch_vec_names[1]; // %fs1 — f32 magnitude temp
-                let fs2 = self.scratch_vec_names[2]; // %fs2 — f32 result temp
+                let fs1 = self.scratch_vec_names[1]; // %fs1 — f32 exp / two_pow temp
+                let fs2 = self.scratch_vec_names[2]; // %fs2 — f32 result / magnitude temp
                 let ps0 = self.scratch_pred_names[0]; // %ps0 — sign predicate
-                let ps1 = self.scratch_pred_names[1]; // %ps1 — zero predicate
+                let ps1 = self.scratch_pred_names[1]; // %ps1 — zero/OOB predicate
+
+                let oob = self.next_skip_label();
+                let done = self.next_skip_label();
 
                 // Step 1: Decode e8m0 scale byte → f32 via IEEE 754 bit reinterpret
                 // scale_f32 = f32::from_bits((scale_byte & 0xFF) << 23)
-                self.emit_line(&format!("and.b32 {rs0}, {scale_gpr}, 0xFF;"));
-                self.emit_line(&format!("shl.b32 {rs0}, {rs0}, 23;"));
-                self.emit_line(&format!("mov.f32 {fs0}, {rs0};"));
+                self.emit_line("{");
+                self.emit_line("  .reg .u64 %rd_addr;");
+                self.emit_line("  .reg .pred %p_oob;");
+                self.emit_line(&format!("  and.b32 {rs0}, {scale_gpr}, 0xFF;"));
+                self.emit_line(&format!("  shl.b32 {rs0}, {rs0}, 23;"));
+                self.emit_line(&format!("  mov.f32 {fs0}, {rs0};"));
 
-                if lanes <= 2 {
-                    // ── Unrolled path for 1-2 lanes (common for per-thread decode) ──
-                    for lane in 0..lanes {
-                        let byte_idx = lane / 2;
-                        let is_high_nibble = lane % 2 == 1;
-                        let nibble_shift = if is_high_nibble { 4 } else { 0 };
+                // tid.x → lane index; OOB guard: tid >= lanes → {d} = 0.0
+                self.emit_line(&format!("  mov.u32 {rs0}, %tid.x;"));
+                self.emit_line(&format!("  setp.ge.u32 %p_oob, {rs0}, {lanes};"));
+                self.emit_line(&format!("  @%p_oob bra OOB_{oob};"));
 
-                        // Load packed byte
-                        self.emit_line(&format!("cvt.u64.u32 %rd_addr, {off};"));
-                        self.emit_line(&format!("add.u64 %rd_addr, %rd_addr, {base};"));
-                        if byte_idx > 0 {
-                            self.emit_line(&format!("add.u64 %rd_addr, %rd_addr, {byte_idx};"));
-                        }
-                        self.emit_line(&format!("ld.global.u8 {rs0}, [%rd_addr];"));
+                // byte_idx = tid >> 1; is_high = tid & 1
+                self.emit_line(&format!("  shr.u32 {rs1}, {rs0}, 1;"));   // byte_idx
+                self.emit_line(&format!("  and.b32 {rs0}, {rs0}, 1;"));    // is_high (reuse rs0)
+                // addr = base + off + byte_idx (64-bit)
+                self.emit_line(&format!("  cvt.u64.u32 %rd_addr, {rs1};"));
+                self.emit_line(&format!("  add.u64 %rd_addr, %rd_addr, {base};"));
+                self.emit_line(&format!("  add.u64 %rd_addr, %rd_addr, {off};"));
+                self.emit_line(&format!("  ld.global.u8 {rs1}, [%rd_addr];")); // byte (reuse rs1)
 
-                        // Extract nibble
-                        if is_high_nibble {
-                            self.emit_line(&format!("shr.b32 {rs0}, {rs0}, {nibble_shift};"));
-                        }
-                        self.emit_line(&format!("and.b32 {rs0}, {rs0}, 0xF;"));
+                // nibble = is_high ? (byte >> 4) & 0xF : byte & 0xF
+                // Use predicate on rs0 (is_high) to select shift
+                self.emit_line(&format!("  setp.ne.u32 {ps0}, {rs0}, 0;")); // ps0 = is_high
+                // Always mask low nibble first
+                self.emit_line(&format!("  and.b32 {rs1}, {rs1}, 0xF;"));   // low nibble
+                // If is_high: nibble = (byte >> 4) & 0xF — recompute via shift on a temp
+                // Simpler: compute high nibble separately and select via predicate
+                // Reload byte for high path (PTX L1 caches the line)
+                self.emit_line(&format!("  @!{ps0} bra LOW_NIB_{oob};"));
+                // High path: re-read byte, shift right 4, mask
+                self.emit_line(&format!("  ld.global.u8 {rs0}, [%rd_addr];")); // byte again (reuse rs0)
+                self.emit_line(&format!("  shr.b32 {rs1}, {rs0}, 4;"));
+                self.emit_line(&format!("  and.b32 {rs1}, {rs1}, 0xF;"));
+                self.emit_line(&format!("LOW_NIB_{oob}:"));
+                // Now rs1 = nibble (0-15)
 
-                        // Zero check: nibble == 0 → output 0.0
-                        let zero_skip = self.next_skip_label();
-                        self.emit_line(&format!("setp.eq.u32 {ps1}, {rs0}, 0;"));
-                        self.emit_line(&format!("@{ps1} bra ZERO_{zero_skip};"));
+                // Zero check: nibble == 0 → result = 0.0
+                self.emit_line(&format!("  setp.eq.u32 {ps1}, {rs1}, 0;"));
+                self.emit_line(&format!("  @{ps1} bra ZERO_{oob};"));
 
-                        // Extract sign (bit 3)
-                        self.emit_line(&format!("and.b32 {rs1}, {rs0}, 0x8;"));
-                        self.emit_line(&format!("setp.ne.u32 {ps0}, {rs1}, 0;"));
+                // Extract sign (bit 3)
+                self.emit_line(&format!("  and.b32 {rs0}, {rs1}, 0x8;"));
+                self.emit_line(&format!("  setp.ne.u32 {ps0}, {rs0}, 0;")); // ps0 = sign
 
-                        // Extract exp (bits 2:1) → integer
-                        self.emit_line(&format!("shr.b32 {rs1}, {rs0}, 1;"));
-                        self.emit_line(&format!("and.b32 {rs1}, {rs1}, 0x3;"));
-                        // exp_f = (float)exp_int
-                        self.emit_line(&format!("cvt.rn.f32.u32 {fs1}, {rs1};"));
+                // Extract exp (bits 2:1) → f32
+                self.emit_line(&format!("  shr.b32 {rs0}, {rs1}, 1;"));
+                self.emit_line(&format!("  and.b32 {rs0}, {rs0}, 0x3;"));
+                self.emit_line(&format!("  cvt.rn.f32.u32 {fs1}, {rs0};"));
+                // 2^(exp-1)
+                self.emit_line(&format!("  sub.f32 {fs1}, {fs1}, 1.0;"));
+                self.emit_line(&format!("  ex2.approx.f32 {fs1}, {fs1};"));
 
-                        // Extract mant (bit 0) → integer
-                        self.emit_line(&format!("and.b32 {rs1}, {rs0}, 0x1;"));
-                        self.emit_line(&format!("cvt.rn.f32.u32 {fs2}, {rs1};"));
+                // Extract mant (bit 0) → f32, magnitude = (1 + mant*0.5) * 2^(exp-1)
+                self.emit_line(&format!("  and.b32 {rs0}, {rs1}, 0x1;"));
+                self.emit_line(&format!("  cvt.rn.f32.u32 {fs2}, {rs0};"));
+                self.emit_line(&format!("  mul.f32 {fs2}, {fs2}, 0f3F000000;")); // mant * 0.5
+                self.emit_line(&format!("  add.f32 {fs2}, {fs2}, 0f3F800000;")); // 1.0 + mant*0.5
+                self.emit_line(&format!("  mul.f32 {fs2}, {fs2}, {fs1};"));     // magnitude
 
-                        // two_pow = ex2.approx(exp_f - 1.0)
-                        // PTX ex2.approx = 2^x, so 2^(exp-1) = ex2(exp - 1)
-                        self.emit_line(&format!("sub.f32 {fs1}, {fs1}, 1.0;"));
-                        self.emit_line(&format!("ex2.approx.f32 {fs1}, {fs1};"));
+                // Apply sign
+                self.emit_line(&format!("  @{ps0} neg.f32 {fs2}, {fs2};"));
+                // Multiply by e8m0 scale
+                self.emit_line(&format!("  mul.f32 {fs2}, {fs2}, {fs0};"));
+                self.emit_line(&format!("  mov.f32 {d}, {fs2};"));
+                self.emit_line(&format!("  bra DONE_{done};"));
 
-                        // magnitude = (1.0 + mant) * two_pow
-                        self.emit_line(&format!("add.f32 {fs2}, 1.0, {fs2};"));
-                        self.emit_line(&format!("mul.f32 {fs2}, {fs2}, {fs1};"));
+                // Zero path (nibble == 0)
+                self.emit_line(&format!("ZERO_{oob}:"));
+                self.emit_line(&format!("  mov.f32 {d}, 0f00000000;"));
+                self.emit_line(&format!("  bra DONE_{done};"));
 
-                        // Apply sign: if sign_bit, negate
-                        // PTX conditional: @!ps0 is positive (no action), @ps0 neg
-                        self.emit_line(&format!("@{ps0} neg.f32 {fs2}, {fs2};"));
+                // OOB path (tid >= lanes)
+                self.emit_line(&format!("OOB_{oob}:"));
+                self.emit_line(&format!("  mov.f32 {d}, 0f00000000;"));
 
-                        // Multiply by e8m0 scale
-                        self.emit_line(&format!("mul.f32 {fs2}, {fs2}, {fs0};"));
-
-                        // Move to output register (each lane is a separate f32 VReg slot;
-                        // in GPU SIMT model, dst is per-thread f32 scalar)
-                        if lane == 0 {
-                            self.emit_line(&format!("mov.f32 {d}, {fs2};"));
-                        }
-                        // For multi-lane: subsequent lanes would need separate dst VRegs.
-                        // The current VM design maps each QuantBlockLoad to one dst VReg,
-                        // so for Warp mode we only produce lane 0 result in the dst VReg.
-                        // The caller should emit multiple QuantBlockLoad instructions if
-                        // multiple output slots are needed.
-
-                        // Zero path joins here
-                        self.emit_line(&format!("bra ZERO_END_{zero_skip};"));
-                        self.emit_line(&format!("ZERO_{zero_skip}:"));
-                        if lane == 0 {
-                            self.emit_line(&format!("mov.f32 {d}, 0f00000000;"));
-                        }
-                        self.emit_line(&format!("ZERO_END_{zero_skip}:"));
-                    }
-                } else {
-                    // ── Multi-lane path (lanes > 2): emit sequential per-nibble decode ──
-                    // Each iteration decodes one nibble. The first nibble result goes to dst,
-                    // subsequent nibbles would need separate dst VRegs (not currently modeled).
-                    // For now, decode all lanes but only store lane 0 to dst.
-                    // Real multi-output would require a VReg range (future enhancement).
-
-                    // Load all needed packed bytes (ceil(lanes/2) bytes) using a helper
-                    // For simplicity, decode lane-by-lane re-reading bytes (PTX L1 cache
-                    // will coalesce the repeated reads to the same cache line).
-
-                    // Decode lane 0 → dst
-                    let byte_idx = 0;
-                    self.emit_line(&format!("cvt.u64.u32 %rd_addr, {off};"));
-                    self.emit_line(&format!("add.u64 %rd_addr, %rd_addr, {base};"));
-                    self.emit_line(&format!("ld.global.u8 {rs0}, [%rd_addr];"));
-
-                    // Low nibble of byte 0
-                    self.emit_line(&format!("and.b32 {rs0}, {rs0}, 0xF;"));
-
-                    // Zero check
-                    let zero_skip = self.next_skip_label();
-                    self.emit_line(&format!("setp.eq.u32 {ps1}, {rs0}, 0;"));
-                    self.emit_line(&format!("@{ps1} bra ZERO_{zero_skip};"));
-
-                    // Sign
-                    self.emit_line(&format!("and.b32 {rs1}, {rs0}, 0x8;"));
-                    self.emit_line(&format!("setp.ne.u32 {ps0}, {rs1}, 0;"));
-
-                    // Exp
-                    self.emit_line(&format!("shr.b32 {rs1}, {rs0}, 1;"));
-                    self.emit_line(&format!("and.b32 {rs1}, {rs1}, 0x3;"));
-                    self.emit_line(&format!("cvt.rn.f32.u32 {fs1}, {rs1};"));
-
-                    // Mant
-                    self.emit_line(&format!("and.b32 {rs1}, {rs0}, 0x1;"));
-                    self.emit_line(&format!("cvt.rn.f32.u32 {fs2}, {rs1};"));
-
-                    // 2^(exp-1)
-                    self.emit_line(&format!("sub.f32 {fs1}, {fs1}, 1.0;"));
-                    self.emit_line(&format!("ex2.approx.f32 {fs1}, {fs1};"));
-
-                    // (1+mant) * 2^(exp-1)
-                    self.emit_line(&format!("add.f32 {fs2}, 1.0, {fs2};"));
-                    self.emit_line(&format!("mul.f32 {fs2}, {fs2}, {fs1};"));
-
-                    // Sign
-                    self.emit_line(&format!("@{ps0} neg.f32 {fs2}, {fs2};"));
-
-                    // Scale
-                    self.emit_line(&format!("mul.f32 {fs2}, {fs2}, {fs0};"));
-
-                    // Store lane 0
-                    self.emit_line(&format!("mov.f32 {d}, {fs2};"));
-
-                    // Zero path
-                    self.emit_line(&format!("bra ZERO_END_{zero_skip};"));
-                    self.emit_line(&format!("ZERO_{zero_skip}:"));
-                    self.emit_line(&format!("mov.f32 {d}, 0f00000000;"));
-                    self.emit_line(&format!("ZERO_END_{zero_skip}:"));
-                }
+                self.emit_line(&format!("DONE_{done}:"));
+                self.emit_line("}");
             }
 
             GpuDialect::Hip { .. } | GpuDialect::Metal { .. } => {
-                // ── HIP/Metal (C++ syntax): emit inline C++ decode ──
-                //
-                // e8m0 scale: f32::from_bits((byte & 0xFF) << 23) = exp2(byte - 127)
-                // We use IEEE 754 bit reinterpret via union or pointer cast.
-
-                // Step 1: Decode e8m0 scale byte → f32
-                // In C++: reinterpret the bit pattern
+                // ── HIP/Metal (C++ syntax): SIMT per-thread decode (GPU-002 根治) ──
+                // 旧 bug: 仅解码 lane 0 → dst, 高 lanes 静默丢弃。
+                // 根治: 每线程解码 1 个 nibble (lane = threadIdx.x), OOB 守卫 → 0.0。
                 self.emit_line("{");
                 self.indent += 1;
                 self.emit_line(&format!("unsigned int scale_bits = ((unsigned int){scale_gpr} & 0xFFu) << 23;"));
@@ -505,12 +440,15 @@ impl GpuLower {
                 self.emit_line("memcpy(&scale_f, &scale_bits, sizeof(float));");
                 self.emit_line(&format!("unsigned char* packed_base = (unsigned char*){base};"));
                 self.emit_line(&format!("unsigned int packed_off = (unsigned int)({off});"));
-
-                // Step 2: Load packed byte for lane 0, extract nibble, decode
-                self.emit_line("{");
+                // SIMT per-thread: each thread decodes one nibble
+                let tid = if matches!(self.dialect, GpuDialect::Hip { .. }) { "threadIdx.x" } else { "thread_position_in_threadgroup.x" };
+                self.emit_line(&format!("unsigned int _t = (unsigned int){tid};"));
+                self.emit_line(&format!("if (_t < {lanes}) {{"));
                 self.indent += 1;
-                self.emit_line("unsigned char raw_byte = packed_base[packed_off];");
-                self.emit_line("unsigned int nibble = (unsigned int)(raw_byte & 0xF);");
+                self.emit_line("unsigned int byte_idx = _t >> 1;");
+                self.emit_line("unsigned int is_high = _t & 1u;");
+                self.emit_line("unsigned char raw_byte = packed_base[packed_off + byte_idx];");
+                self.emit_line("unsigned int nibble = is_high ? ((raw_byte >> 4) & 0xF) : (raw_byte & 0xF);");
                 self.emit_line("float result;");
                 self.emit_line("if (nibble == 0) {");
                 self.indent += 1;
@@ -518,27 +456,20 @@ impl GpuLower {
                 self.indent = self.indent.saturating_sub(1);
                 self.emit_line("} else {");
                 self.indent += 1;
-                self.emit_line("unsigned int sign_bit = (nibble >> 3) & 1;");
-                self.emit_line("unsigned int exp_field = (nibble >> 1) & 3;");
-                self.emit_line("unsigned int mant_field = nibble & 1;");
-                // 2^(exp_field - 1): exp2() is available in HIP/Metal
+                self.emit_line("unsigned int sign_bit = (nibble >> 3) & 1u;");
+                self.emit_line("unsigned int exp_field = (nibble >> 1) & 3u;");
+                self.emit_line("unsigned int mant_field = nibble & 1u;");
                 self.emit_line("float two_pow = exp2f((float)exp_field - 1.0f);");
                 self.emit_line("float magnitude = (1.0f + (float)mant_field) * two_pow;");
                 self.emit_line("result = (sign_bit ? -magnitude : magnitude);");
                 self.emit_line("result *= scale_f;");
                 self.indent = self.indent.saturating_sub(1);
                 self.emit_line("}");
-
-                if lanes > 1 {
-                    // For multi-lane, subsequent lanes would write to additional output VRegs.
-                    // Current design: only lane 0 → dst. Caller emits multiple instructions
-                    // for multi-lane output.
-                    // We still decode lane 0 → dst, ignoring extra lanes.
-                    self.emit_line(&format!("{d} = result;"));
-                } else {
-                    self.emit_line(&format!("{d} = result;"));
-                }
-
+                self.emit_line(&format!("{d} = result;"));
+                self.indent = self.indent.saturating_sub(1);
+                self.emit_line("} else {");
+                self.indent += 1;
+                self.emit_line(&format!("{d} = 0.0f;  // OOB guard"));
                 self.indent = self.indent.saturating_sub(1);
                 self.emit_line("}");
 
@@ -546,7 +477,7 @@ impl GpuLower {
                 self.emit_line("}");
             }
         }
-        let _ = lanes; // lanes used in PTX branch above
+        let _ = lanes; // lanes used in PTX/HIP/Metal branches above
         Ok(())
     }
 
@@ -777,6 +708,11 @@ impl GpuLower {
         alloc: &RegAllocation,
         _label: &str,
     ) -> Result<(), CompilerError> {
+        // GPU-004 根治 (BCE-20260704-GPU-VIOLATIONS):
+        //   旧实现 `for pair in 0..num_pairs` (num_pairs=(num_elements+1)/2, 通常 32-64)
+        //   Rust 循环展开 PTX/HIP/Metal 行, 违反 NO-LOOP-UNROLL。
+        //   根治: SIMT per-thread (参照 Q4_0 修复 1c1f1a40), 每个 thread 处理 1 个 pair,
+        //   pair = tid.x; OOB 守卫: tid >= num_pairs → 不写。
         let s = self.reg_name_with_kind(*src, alloc);
         let dp = self.reg_name_with_kind(*dst_ptr, alloc);
         let sp = self.reg_name_with_kind(*scale_ptr, alloc);
@@ -786,91 +722,168 @@ impl GpuLower {
 
         match self.dialect {
             GpuDialect::Ptx { .. } => {
-                // PTX: iterate pairs, compute max(|a|,|b|) as scale, pack nibbles.
-                for pair in 0..num_pairs {
-                    let lo_off = pair * 2;
-                    let hi_off = pair * 2 + 1;
-                    // scale = max(|src[lo]|, |src[hi]|)
-                    self.emit_line(&format!("ld.global.f32 {rs0}, [{s}+{}];", lo_off * 4));
-                    self.emit_line(&format!("abs.f32 {rs0}, {rs0};"));
-                    if hi_off < num_elements {
-                        self.emit_line(&format!("ld.global.f32 {rs1}, [{s}+{}];", hi_off * 4));
-                        self.emit_line(&format!("abs.f32 {rs1}, {rs1};"));
-                        self.emit_line(&format!("max.f32 {rs0}, {rs0}, {rs1};"));
-                    }
-                    self.emit_line(&format!("st.global.f32 [{sp}+{}], {rs0};", pair * 4));
-                    // Reload originals for quantization
-                    self.emit_line(&format!("ld.global.f32 {rs0}, [{s}+{}];", lo_off * 4));
-                    // Approximate nibble: extract top 4 mantissa bits via bit manipulation.
-                    // reinterpret f32 as u32, extract bits [23:26] >> 19 → 4-bit value
-                    self.emit_line(&format!("mov.b32 {rs1}, {rs0};"));
-                    self.emit_line(&format!("shr.b32 {rs1}, {rs1}, 20;"));
-                    self.emit_line(&format!("and.b32 {rs1}, {rs1}, 0xF;"));
-                    // Pack: byte = (hi_nibble << 4) | lo_nibble
-                    if hi_off < num_elements {
-                        self.emit_line(&format!("ld.global.f32 {rs0}, [{s}+{}];", hi_off * 4));
-                        self.emit_line(&format!("mov.b32 {rs0}, {rs0};"));
-                        self.emit_line(&format!("shr.b32 {rs0}, {rs0}, 20;"));
-                        self.emit_line(&format!("and.b32 {rs0}, {rs0}, 0xF;"));
-                        self.emit_line(&format!("shl.b32 {rs0}, {rs0}, 4;"));
-                        self.emit_line(&format!("or.b32 {rs1}, {rs1}, {rs0};"));
-                    }
-                    self.emit_line(&format!("st.global.u8 [{dp}+{pair}], {rs1};"));
+                // PTX SIMT per-thread: pair = tid.x; OOB guard tid >= num_pairs → skip.
+                // Each thread: load lo/hi f32, scale=max(|lo|,|hi|), pack nibbles, store.
+                // Layout: scratch_gpr[0]=rs0 (tid/pair), [1]=rs1 (offsets/lo byte),
+                //         [2]=rs2 (hi byte/nibble), [3]=rs3 (scale_addr/dst_addr temp).
+                let rs2 = self.scratch_gpr_names[2];
+                let oob = self.next_skip_label();
+
+                self.emit_line("{");
+                self.emit_line("  .reg .u64 %rd_pair;   // pair index (u64 for addressing)");
+                self.emit_line("  .reg .u64 %rd_scale;  // scale store addr = sp + pair*4");
+                self.emit_line("  .reg .u64 %rd_dst;    // dst store addr  = dp + pair");
+                self.emit_line("  .reg .pred %p_oob;");
+                self.emit_line("  .reg .pred %p_last;");
+
+                // pair = tid.x; OOB guard
+                self.emit_line(&format!("  mov.u32 {rs0}, %tid.x;"));
+                self.emit_line(&format!("  setp.ge.u32 %p_oob, {rs0}, {num_pairs};"));
+                self.emit_line(&format!("  @%p_oob bra OOB_{oob};"));
+
+                // Compute addresses up-front (before loads clobber rs0)
+                // rd_pair = (u64)pair
+                self.emit_line(&format!("  cvt.u64.u32 %rd_pair, {rs0};"));
+                // rd_scale = sp + pair*4
+                self.emit_line(&format!("  shl.u64 %rd_scale, %rd_pair, 2;"));
+                self.emit_line(&format!("  add.u64 %rd_scale, %rd_scale, {sp};"));
+                // rd_dst = dp + pair
+                self.emit_line(&format!("  add.u64 %rd_dst, %rd_pair, {dp};"));
+
+                // lo_off_bytes = pair*8; load lo → rs0 (clobbers tid, but addrs already computed)
+                self.emit_line(&format!("  mad.lo.u32 {rs1}, {rs0}, 8, 0;"));  // lo_off = pair*8
+                self.emit_line(&format!("  ld.global.f32 {rs0}, [{s}+{rs1}];")); // lo
+                self.emit_line(&format!("  abs.f32 {rs0}, {rs0};"));             // |lo|
+
+                // hi_off_bytes = pair*8 + 4
+                self.emit_line(&format!("  add.u32 {rs1}, {rs1}, 4;"));
+
+                if num_elements % 2 == 1 {
+                    // Odd num_elements: last pair has no hi element.
+                    let last_pair = num_pairs - 1;
+                    self.emit_line(&format!("  setp.eq.u32 %p_last, %tid.x, {last_pair};"));
+                    self.emit_line("  @%p_last bra LAST_PAIR_{oob};");
+                    // Even pair: load hi, scale=max(|lo|,|hi|), pack both nibbles
+                    self.emit_line(&format!("  ld.global.f32 {rs2}, [{s}+{rs1}];")); // hi
+                    self.emit_line(&format!("  abs.f32 {rs2}, {rs2};"));
+                    self.emit_line(&format!("  max.f32 {rs0}, {rs0}, {rs2};"));       // scale
+                    self.emit_line(&format!("  st.global.f32 [%rd_scale], {rs0};"));
+                    // Reload lo & hi for quantization
+                    self.emit_line(&format!("  mad.lo.u32 {rs1}, %tid.x, 8, 0;"));
+                    self.emit_line(&format!("  ld.global.f32 {rs0}, [{s}+{rs1}];"));   // lo
+                    self.emit_line(&format!("  mov.b32 {rs1}, {rs0};"));
+                    self.emit_line(&format!("  shr.b32 {rs1}, {rs1}, 20;"));
+                    self.emit_line(&format!("  and.b32 {rs1}, {rs1}, 0xF;"));          // lo nibble
+                    // Recompute hi_off properly: hi_off_bytes = pair*8 + 4
+                    self.emit_line(&format!("  mad.lo.u32 {rs2}, %tid.x, 8, 4;"));
+                    self.emit_line(&format!("  ld.global.f32 {rs0}, [{s}+{rs2}];"));   // hi
+                    self.emit_line(&format!("  mov.b32 {rs2}, {rs0};"));
+                    self.emit_line(&format!("  shr.b32 {rs2}, {rs2}, 20;"));
+                    self.emit_line(&format!("  and.b32 {rs2}, {rs2}, 0xF;"));          // hi nibble
+                    self.emit_line(&format!("  shl.b32 {rs2}, {rs2}, 4;"));
+                    self.emit_line(&format!("  or.b32 {rs1}, {rs1}, {rs2};"));          // packed byte
+                    self.emit_line(&format!("  st.global.u8 [%rd_dst], {rs1};"));
+                    self.emit_line(&format!("  bra END_{oob};"));
+                    self.emit_line(&format!("LAST_PAIR_{oob}:"));
+                    // Odd last pair: only lo, scale = |lo|, byte = lo nibble (hi=0)
+                    self.emit_line(&format!("  st.global.f32 [%rd_scale], {rs0};"));
+                    self.emit_line(&format!("  mad.lo.u32 {rs1}, %tid.x, 8, 0;"));
+                    self.emit_line(&format!("  ld.global.f32 {rs0}, [{s}+{rs1}];"));   // lo
+                    self.emit_line(&format!("  mov.b32 {rs1}, {rs0};"));
+                    self.emit_line(&format!("  shr.b32 {rs1}, {rs1}, 20;"));
+                    self.emit_line(&format!("  and.b32 {rs1}, {rs1}, 0xF;"));
+                    self.emit_line(&format!("  st.global.u8 [%rd_dst], {rs1};"));
+                    self.emit_line(&format!("  bra END_{oob};"));
+                } else {
+                    // Even num_elements: all pairs have lo & hi
+                    self.emit_line(&format!("  ld.global.f32 {rs2}, [{s}+{rs1}];")); // hi
+                    self.emit_line(&format!("  abs.f32 {rs2}, {rs2};"));
+                    self.emit_line(&format!("  max.f32 {rs0}, {rs0}, {rs2};"));       // scale
+                    self.emit_line(&format!("  st.global.f32 [%rd_scale], {rs0};"));
+                    // Reload lo & hi for quantization
+                    self.emit_line(&format!("  mad.lo.u32 {rs1}, %tid.x, 8, 0;"));   // lo_off
+                    self.emit_line(&format!("  ld.global.f32 {rs0}, [{s}+{rs1}];"));  // lo
+                    self.emit_line(&format!("  mov.b32 {rs1}, {rs0};"));
+                    self.emit_line(&format!("  shr.b32 {rs1}, {rs1}, 20;"));
+                    self.emit_line(&format!("  and.b32 {rs1}, {rs1}, 0xF;"));         // lo nibble
+                    self.emit_line(&format!("  mad.lo.u32 {rs2}, %tid.x, 8, 4;"));   // hi_off
+                    self.emit_line(&format!("  ld.global.f32 {rs0}, [{s}+{rs2}];"));  // hi
+                    self.emit_line(&format!("  mov.b32 {rs2}, {rs0};"));
+                    self.emit_line(&format!("  shr.b32 {rs2}, {rs2}, 20;"));
+                    self.emit_line(&format!("  and.b32 {rs2}, {rs2}, 0xF;"));         // hi nibble
+                    self.emit_line(&format!("  shl.b32 {rs2}, {rs2}, 4;"));
+                    self.emit_line(&format!("  or.b32 {rs1}, {rs1}, {rs2};"));         // packed byte
+                    self.emit_line(&format!("  st.global.u8 [%rd_dst], {rs1};"));
+                    self.emit_line(&format!("  bra END_{oob};"));
                 }
+                self.emit_line(&format!("OOB_{oob}:"));
+                self.emit_line(&format!("END_{oob}:"));
+                self.emit_line("}");
             }
             GpuDialect::Hip { .. } => {
+                // HIP SIMT per-thread: pair = threadIdx.x; OOB guard.
                 self.emit_line("{");
                 self.emit_line(&format!("  float* _src = (float*)({s});"));
                 self.emit_line(&format!("  unsigned char* _dst = (unsigned char*)({dp});"));
                 self.emit_line(&format!("  float* _scp = (float*)({sp});"));
-                for pair in 0..num_pairs {
-                    let lo = pair * 2;
-                    let hi = pair * 2 + 1;
-                    self.emit_line("  {");
-                    self.emit_line(&format!("    float _a = fabsf(_src[{lo}]);"));
-                    if hi < num_elements {
-                        self.emit_line(&format!("    float _b = fabsf(_src[{hi}]);"));
-                        self.emit_line(&format!("    _scp[{pair}] = fmaxf(_a, _b);"));
-                    } else {
-                        self.emit_line(&format!("    _scp[{pair}] = _a;"));
-                    }
-                    // Quantize lo nibble
-                    self.emit_line(&format!("    unsigned _lo = (__float_as_uint(_src[{lo}]) >> 20) & 0xF;"));
-                    if hi < num_elements {
-                        self.emit_line(&format!("    unsigned _hi = (__float_as_uint(_src[{hi}]) >> 20) & 0xF;"));
-                        self.emit_line(&format!("    _dst[{pair}] = (unsigned char)(_lo | (_hi << 4));"));
-                    } else {
-                        self.emit_line(&format!("    _dst[{pair}] = (unsigned char)_lo;"));
-                    }
-                    self.emit_line("  }");
+                self.emit_line("  unsigned int _pair = (unsigned int)threadIdx.x;");
+                self.emit_line(&format!("  if (_pair < {num_pairs}) {{"));
+                self.emit_line("    unsigned int _lo = _pair * 2;");
+                self.emit_line("    unsigned int _hi = _pair * 2 + 1;");
+                self.emit_line("    float _a = fabsf(_src[_lo]);");
+                if num_elements % 2 == 1 {
+                    self.emit_line(&format!("    if (_hi < {num_elements}) {{"));
+                    self.emit_line("      float _b = fabsf(_src[_hi]);");
+                    self.emit_line("      _scp[_pair] = fmaxf(_a, _b);");
+                    self.emit_line("      unsigned _nlo = (__float_as_uint(_src[_lo]) >> 20) & 0xF;");
+                    self.emit_line("      unsigned _nhi = (__float_as_uint(_src[_hi]) >> 20) & 0xF;");
+                    self.emit_line("      _dst[_pair] = (unsigned char)(_nlo | (_nhi << 4));");
+                    self.emit_line("    } else {");
+                    self.emit_line("      _scp[_pair] = _a;");
+                    self.emit_line("      unsigned _nlo = (__float_as_uint(_src[_lo]) >> 20) & 0xF;");
+                    self.emit_line("      _dst[_pair] = (unsigned char)_nlo;");
+                    self.emit_line("    }");
+                } else {
+                    self.emit_line("    float _b = fabsf(_src[_hi]);");
+                    self.emit_line("    _scp[_pair] = fmaxf(_a, _b);");
+                    self.emit_line("    unsigned _nlo = (__float_as_uint(_src[_lo]) >> 20) & 0xF;");
+                    self.emit_line("    unsigned _nhi = (__float_as_uint(_src[_hi]) >> 20) & 0xF;");
+                    self.emit_line("    _dst[_pair] = (unsigned char)(_nlo | (_nhi << 4));");
                 }
+                self.emit_line("  }");
                 self.emit_line("}");
             }
             GpuDialect::Metal { .. } => {
+                // Metal SIMT per-thread: pair = thread_position_in_threadgroup.x; OOB guard.
                 self.emit_line("{");
                 self.emit_line(&format!("  device float* _src = (device float*)({s});"));
                 self.emit_line(&format!("  device unsigned char* _dst = (device unsigned char*)({dp});"));
                 self.emit_line(&format!("  device float* _scp = (device float*)({sp});"));
-                for pair in 0..num_pairs {
-                    let lo = pair * 2;
-                    let hi = pair * 2 + 1;
-                    self.emit_line("  {");
-                    self.emit_line(&format!("    float _a = fabs(_src[{lo}]);"));
-                    if hi < num_elements {
-                        self.emit_line(&format!("    float _b = fabs(_src[{hi}]);"));
-                        self.emit_line(&format!("    _scp[{pair}] = max(_a, _b);"));
-                    } else {
-                        self.emit_line(&format!("    _scp[{pair}] = _a;"));
-                    }
-                    self.emit_line(&format!("    uint _lo = (as_type<uint>(_src[{lo}]) >> 20) & 0xFu;"));
-                    if hi < num_elements {
-                        self.emit_line(&format!("    uint _hi = (as_type<uint>(_src[{hi}]) >> 20) & 0xFu;"));
-                        self.emit_line(&format!("    _dst[{pair}] = (unsigned char)(_lo | (_hi << 4));"));
-                    } else {
-                        self.emit_line(&format!("    _dst[{pair}] = (unsigned char)_lo;"));
-                    }
-                    self.emit_line("  }");
+                self.emit_line("  unsigned int _pair = (unsigned int)thread_position_in_threadgroup.x;");
+                self.emit_line(&format!("  if (_pair < {num_pairs}) {{"));
+                self.emit_line("    unsigned int _lo = _pair * 2;");
+                self.emit_line("    unsigned int _hi = _pair * 2 + 1;");
+                self.emit_line("    float _a = fabs(_src[_lo]);");
+                if num_elements % 2 == 1 {
+                    self.emit_line(&format!("    if (_hi < {num_elements}) {{"));
+                    self.emit_line("      float _b = fabs(_src[_hi]);");
+                    self.emit_line("      _scp[_pair] = max(_a, _b);");
+                    self.emit_line("      uint _nlo = (as_type<uint>(_src[_lo]) >> 20) & 0xFu;");
+                    self.emit_line("      uint _nhi = (as_type<uint>(_src[_hi]) >> 20) & 0xFu;");
+                    self.emit_line("      _dst[_pair] = (unsigned char)(_nlo | (_nhi << 4));");
+                    self.emit_line("    } else {");
+                    self.emit_line("      _scp[_pair] = _a;");
+                    self.emit_line("      uint _nlo = (as_type<uint>(_src[_lo]) >> 20) & 0xFu;");
+                    self.emit_line("      _dst[_pair] = (unsigned char)_nlo;");
+                    self.emit_line("    }");
+                } else {
+                    self.emit_line("    float _b = fabs(_src[_hi]);");
+                    self.emit_line("    _scp[_pair] = max(_a, _b);");
+                    self.emit_line("    uint _nlo = (as_type<uint>(_src[_lo]) >> 20) & 0xFu;");
+                    self.emit_line("    uint _nhi = (as_type<uint>(_src[_hi]) >> 20) & 0xFu;");
+                    self.emit_line("    _dst[_pair] = (unsigned char)(_nlo | (_nhi << 4));");
                 }
+                self.emit_line("  }");
                 self.emit_line("}");
             }
         }
