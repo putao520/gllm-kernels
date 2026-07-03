@@ -10,8 +10,80 @@
 | BCE-MIXED 算子级混合精度（BCE-20260630-MIXED） | 1 | 1 ✅ | 0 | emit_gemm_* 三段式 dtype（a/b/c）+ ctx.dtype per-op + accumulator_dtype() 标注 |
 | BCE-OPTPASS 指令重写 dtype 丢失（BCE-20260630-OPTPASS） | 1 | 1 ✅ | 0 | substitute_loop_offset/forwarding match 绑定保留原 dtype，禁 `..` 丢弃 |
 | BCE-X86-APX-EGPR iced_x86 APX egpr 编码缺失（BCE-20260703-X86-APX-EGPR-UNUSED） | 1 | 1 ✅ | 0 | gpr/gpr32/gpr64_to_32 对 16..31 显式报错；iced_x86 1.21 无 R16-R31 变体，APX 激活前须升级 iced_x86 |
+| BCE-AVX512-HALF-LANES AVX-512 codegen 半 lanes（BCE-20260703-AVX512-HALF-LANES） | 1 | 1 ✅ | 0 | 7 处 reduction/scan 按 use_avx512 分流 ZMM 16-lane（argmax/softmax_reduce_max/HReduce/Accumulate/softmax_normalize/temperature/Transcendental） |
 
 **全库残留总计**: 0
+
+---
+
+## BCE-20260703-AVX512-HALF-LANES — AVX-512 codegen 按 width 算 step 但用 YMM load → 高 8 lanes 跳过
+
+### smellClass: AP-WIDTH-STEP-YMM-LOAD-MISMATCH（Pattern — AVX-512 路径 step 按 16 算但 load/reduce 固定 YMM 8 lanes，高 8 lanes 数据丢弃）
+
+**宪法依据**: NO-HW-DEGRADATION（硬件差异体现在 codegen 指令选择，非降级到 AVX2）+ ARCH-JIT-YIELDS（代码顺从硬件/输入/配置，AVX-512 下必须用 ZMM 16-lane 指令）+ ARCH-DTYPE-JIT-TYPED（width 与 load 宽度贯穿一致，禁止 width=16 但 load=8 的断裂）。同源族：BCE-20260703-AVX512-BROADCAST-NAN（broadcast 只填低 8 lanes → NaN），本次是 reduction/scan 只处理低 8 lanes → 精度偏差。
+
+**模式签名**: x86 codegen 的 reduction/scan 函数按 `width.f32_lanes()`（AVX-512=16）计算遍历步长 `step=lanes*4=64`，但 load/reduce 实际只用 `scratch_ymm` + `ymmword_ptr`（32 字节/8 lanes）。步长按 16 跳、实际只处理低 8 lanes，每 64 字节块的高 8 lanes（lanes 8-15）完全跳过。AVX2 下 `step=32` 与 `ymmword_ptr=32B` 匹配故正确（A/B 铁证：本地 i9 AVX2 argmax=253 正确，5070Ti AVX-512 argmax=6 错）。
+
+```yaml
+- patternId: BCE-20260703-AVX512-HALF-LANES
+  title: AVX-512 codegen 按 width 算 step 但用 YMM load/reduce → 高 8 lanes 跳过
+  layer: 设计缺陷（width 与 load 宽度系统性不一致）
+  smellClass: AP-WIDTH-STEP-YMM-LOAD-MISMATCH
+  codePattern:
+    - "fn.*width: SimdWidth.*{ let lanes = width.f32_lanes(); let step = lanes * 4; ... scratch_ymm ... ymmword_ptr ... }  # step=64 但 load=32B"
+    - "HReduce 无 use_avx512 分支, 无条件 resolve_ymm_or_spill 读 ZMM 上游 vreg → 只看低 8 lanes"
+    - "Accumulate vaddps ymm 只累加低 8 lanes, 高 8 lanes 始终保持初始 0"
+    - "Transcendental emit_exp_cephes/emit_log_minimax YMM-only 参数, 高 8 lanes 输出垃圾"
+  triggerCondition:
+    - "use_avx512=true（DeviceProfile AVX-512, W512 width）"
+    - "函数同时含: width 参数算 step + scratch_ymm/ymmword_ptr load + 跨 lanes reduction"
+    - "或: HReduce/Accumulate/Transcendental 无 use_avx512 分支（无条件 YMM）"
+  detectionSignatures:
+    structural: "fn.*width: SimdWidth.*\\{.*let lanes = width.f32_lanes\\(\\).*let step = lanes \\*.*scratch_ymm.*ymmword_ptr"
+    literal: "scratch_ymm.*\n.*ymmword_ptr  # YMM load 在 width 驱动函数中"
+    literal: "fn lower_h_reduce_x86.*\n.*resolve_ymm_or_spill  # 无 use_avx512 分支"
+    antipattern: "width-step-ymm-load-mismatch / no-avx512-branch-in-reduction"
+  sameClassCriterion:
+    - "任何按 SimdWidth 计算遍历步长但用固定 YMM(32B) load/reduce 的 codegen 函数"
+    - "任何无 use_avx512 分支的 reduction/h-reduce/accumulate/transcendental 算子（无条件 YMM）"
+  fixTemplate:
+    - "按 use_avx512 分流: true→scratch_zmm + zmmword_ptr + 16-lane reduce（vextractf64x4 拆 ZMM→2×YMM 再复用 xmm reduce 链）; false→保持 YMM 现状"
+    - "HReduce 加 use_avx512 分支: src/dst 用 resolve_zmm_or_spill, 16-lane reduce 到标量, vbroadcastss zmm 广播回 16 lanes"
+    - "Accumulate 加 use_avx512 分支: resolve_zmm_or_spill + vaddps zmm（16 lanes 全加）"
+    - "Transcendental: emit_exp_cephes_zmm/emit_log_minimax_zmm（dst/src: AsmRegisterZmm）, lower_transcendental 加 use_avx512 分流; vroundps→vrndscaleps（ZMM 不支持 vroundps）, vrcpps→vrcp14ps（ZMM 不支持 vrcpps）"
+    - "argmax lane 查找: vcmpeqps k1, zmm, zmm + kmovd gpr + bsf（替代 AVX2 vmovmskps, 覆盖 16 lanes）"
+  regressionAssertion:
+    - "静态: use_avx512=true 输出 vextractf64x4 + zmm 寄存器（bce_avx512_half_lanes_*_avx512_uses_zmm 测试）"
+    - "静态: use_avx512=false 不含 zmm/vextractf64x4（bce_avx512_half_lanes_argmax_avx2_uses_ymm 测试）"
+    - "真机: 5070Ti AVX-512 SmolLM2 greedy next_token == 黄金值 253（E2E test_e2e_generator 覆盖）"
+    - "AVX2 不回归: 本地 i9-10900KF 同 E2E 仍 argmax=253"
+  regressionTests:
+    - "src/compiler/codegen/vm/x86_lower/tests.inc.rs（bce_avx512_half_lanes_* 模块, 9 测试: argmax_avx512/avx2, softmax_reduce_max, h_reduce, accumulate, softmax_normalize, temperature, transcendental_exp/sigmoid）"
+  locations:
+    - "src/compiler/codegen/vm/x86_lower/lower_instr.inc.rs（zmm_hreduce_to_xmm 辅助 + lower_argmax/lower_softmax_reduce_max/lower_softmax_normalize/lower_temperature_scale 加 use_avx512 分流）"
+    - "src/compiler/codegen/vm/x86_lower/lower_instr_dispatch.inc.rs（lower_h_reduce_x86/lower_accumulate_x86/lower_transcendental_x86 加 use_avx512 分流）"
+    - "src/compiler/codegen/vm/x86_lower/emit_helpers.inc.rs（emit_exp_cephes_zmm/emit_log_minimax_zmm ZMM 16-lane 版）"
+  rootCause: "x86 codegen 7 个 reduction/scan 函数（argmax/softmax_reduce_max/HReduce/Accumulate/softmax_normalize/temperature/Transcendental）在 AVX-512 模式下按 width.f32_lanes()=16 算步长 step=64，但 load/reduce 用 scratch_ymm+ymmword_ptr（32B/8 lanes）。每 64B 块的高 8 lanes 被完全跳过。AVX2 下 step=32 与 load=32B 匹配故正确。HReduce/Accumulate/Transcendental 更深一层：无 use_avx512 分支（无条件 YMM），即使上游 ZMM 产出 16 lanes 数据也只处理低 8。"
+  fixCommitted:
+    - "<本 commit> fix(BCE-20260703-AVX512-HALF-LANES): 7处 AVX-512 半lanes BUG 根治 — argmax/softmax_reduce_max/HReduce/Accumulate/softmax_normalize/temperature/Transcendental 按 use_avx512 分流 ZMM 16-lane"
+  归因时间: 2026-06-30
+  根治时间: 2026-07-04
+  status: 根治 ✅ | residual: 0
+  sessionId: gsc-arch-avx512-precision
+```
+
+**根因**: x86 codegen 7 个 reduction/scan 函数在 AVX-512 模式下按 `width.f32_lanes()=16` 算步长 `step=64`，但 load/reduce 用 `scratch_ymm`+`ymmword_ptr`（32B/8 lanes）。每 64B 块的高 8 lanes（lanes 8-15）被完全跳过，从未参与计算。AVX2 下 `step=32` 与 `ymmword_ptr=32B` 匹配故正确。HReduce/Accumulate/Transcendental 无 use_avx512 分支，无条件 YMM，是比"无 use_avx512 分支"更深的根因。
+
+**根治**: 7 处统一加 `use_avx512` 分流，ZMM 路径用 `scratch_zmm`+`zmmword_ptr`+16-lane reduce（`vextractf64x4` 拆 ZMM→2×YMM 再复用 xmm reduce 链，封装为 `zmm_hreduce_to_xmm` 辅助函数）。复用现有 ZMM 基础设施（resolve_zmm_or_spill/scratch_zmm/zmmword_ptr/spill_store_zmm）。Transcendental 新增 `emit_exp_cephes_zmm`/`emit_log_minimax_zmm` ZMM 版本（`vrndscaleps` 替代 `vroundps`，`vrcp14ps` 替代 `vrcpps` — iced_x86 1.21 这两指令不支持 ZMM 操作数）。禁止降级（NO-HW-DEGRADATION）。
+
+**横扫确认**: 三层搜索（structural/literal/antipattern）命中 7 处，全部根治，残留=0。已逐一核对未受影响函数（lower_softmax_exp_sum/lower_batch_per_seq_argmax 标量循环正确；VecLoad/VecStore/Broadcast/FMA/DotProduct/VecBinOp/VecCmp/ConditionalSelect/VecConvert/VecWiden/VecNarrow 均有 use_avx512 分支）。
+
+### 防复发沉淀
+- 代码内注释: lower_instr.inc.rs zmm_hreduce_to_xmm() + 7 处 use_avx512 分流顶部 BCE-20260703-AVX512-HALF-LANES 根治说明
+- 回归测试: src/compiler/codegen/vm/x86_lower/tests.inc.rs bce_avx512_half_lanes_* 模块（9 测试，反汇编断言 ZMM 指令存在）
+- 本条目: BUG-KNOWLEDGE.md 沉淀
+- 状态: ✅ 已闭环 (residual=0)
+- 5070Ti 真机验证: 待 E2E test_e2e_generator (SmolLM2-135M-Q4_0) argmax==253 确认（任务 #38）
 
 ---
 

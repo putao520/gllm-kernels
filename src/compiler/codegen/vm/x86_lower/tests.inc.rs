@@ -807,4 +807,277 @@ mod tests {
         let code = lower.finalize().unwrap();
         assert!(code.len() > 10, "code too short: {} bytes", code.len());
     }
+
+    // ── BCE-20260703-AVX512-HALF-LANES 回归测试 ──
+    //
+    // 静态回归: 验证 7 处 AVX-512 "半 lanes" BUG 修复后, use_avx512=true 走 ZMM 16-lane
+    // 路径 (输出 vextractf64x4 / vrcp14ps 等 ZMM-only 指令), use_avx512=false 保持 YMM
+    // (无 ZMM 指令)。5070Ti 真机数值验证 (argmax==253) 由 E2E test_e2e_generator 覆盖。
+    //
+    // 反汇编用 iced_x86::Decoder + NasmFormatter, 搜 ZMM 指令助记符/寄存器名。
+
+    fn disasm_lower(code: &[u8]) -> String {
+        use iced_x86::{Decoder, DecoderOptions, Formatter, NasmFormatter};
+        let mut decoder = Decoder::new(64, code, DecoderOptions::NONE);
+        let mut formatter = NasmFormatter::new();
+        let mut out = String::new();
+        let mut buf = String::new();
+        while decoder.can_decode() {
+            let instr = decoder.decode();
+            buf.clear();
+            formatter.format(&instr, &mut buf);
+            out.push_str(&buf);
+            out.push('\n');
+        }
+        out
+    }
+
+    fn build_argmax_prog(width: SimdWidth, vocab_bytes: usize) -> VmProgram {
+        let mut prog = VmProgram::new();
+        let logits_ptr = prog.alloc_vreg(VRegKind::Ptr, SimdWidth::Scalar);
+        let dst = prog.alloc_vreg(VRegKind::Scalar, SimdWidth::Scalar);
+        prog.emit(VmInstr::Argmax {
+            dst, logits_ptr, vocab_bytes, width,
+            dtype: QuantPrecision::F32,
+        });
+        prog
+    }
+
+    #[test]
+    fn bce_avx512_half_lanes_argmax_avx512_uses_zmm() {
+        // 16-lane ZMM argmax: 高 8 lanes 必须参与。AVX-512 路径输出 vextractf64x4
+        // (ZMM→YMM 拆分 16→8) + vbroadcastss zmm + vcmpeqps k-mask (16-lane lane 查找)。
+        let prog = build_argmax_prog(SimdWidth::W512, 64 * 4); // 4 vectors × 16 lanes
+        let dp = DeviceProfile::detect();
+        let profile = IsaProfile::from_device_profile(&dp);
+        let alloc = RegAllocator::new(&profile).allocate(&prog).unwrap();
+        let frame = super::super::stack_frame::StackFrame::compute(&alloc, &profile, 0);
+        let mut lower = X86Lower::with_avx512(true);
+        lower.emit_prologue(&frame, &alloc).unwrap();
+        for instr in &prog.instrs {
+            lower.lower_instr(instr, &alloc).unwrap();
+        }
+        lower.emit_epilogue(&frame, &alloc).unwrap();
+        let code = lower.finalize().unwrap();
+        let disasm = disasm_lower(&code);
+        // ZMM 路径必有 vextractf64x4 (16→8 lane 拆分) 与 zmm 寄存器。
+        assert!(disasm.contains("vextractf64x4"),
+            "AVX-512 argmax must use ZMM 16-lane reduce (vextractf64x4); got:\n{}", disasm);
+        assert!(disasm.contains("zmm"),
+            "AVX-512 argmax must reference zmm registers; got:\n{}", disasm);
+        // kmovd 证明用 k-mask 16-lane 精确 lane 查找 (替代 AVX2 vmovmskps)。
+        assert!(disasm.contains("kmovd") || disasm.contains("kmov"),
+            "AVX-512 argmax must use k-mask for lane lookup; got:\n{}", disasm);
+    }
+
+    #[test]
+    fn bce_avx512_half_lanes_argmax_avx2_uses_ymm() {
+        // AVX2 路径 (use_avx512=false) 保持 YMM: 无 vextractf64x4 / zmm。
+        let prog = build_argmax_prog(SimdWidth::W256, 32 * 4); // 4 vectors × 8 lanes
+        let dp = DeviceProfile::detect();
+        let profile = IsaProfile::from_device_profile(&dp);
+        let alloc = RegAllocator::new(&profile).allocate(&prog).unwrap();
+        let frame = super::super::stack_frame::StackFrame::compute(&alloc, &profile, 0);
+        let mut lower = X86Lower::with_avx512(false);
+        lower.emit_prologue(&frame, &alloc).unwrap();
+        for instr in &prog.instrs {
+            lower.lower_instr(instr, &alloc).unwrap();
+        }
+        lower.emit_epilogue(&frame, &alloc).unwrap();
+        let code = lower.finalize().unwrap();
+        let disasm = disasm_lower(&code);
+        assert!(!disasm.contains("zmm"),
+            "AVX2 argmax must NOT use zmm registers; got:\n{}", disasm);
+        assert!(!disasm.contains("vextractf64x4"),
+            "AVX2 argmax must NOT use vextractf64x4; got:\n{}", disasm);
+    }
+
+    #[test]
+    fn bce_avx512_half_lanes_softmax_reduce_max_avx512_uses_zmm() {
+        // softmax max: AVX-512 走 ZMM 16-lane reduce。
+        let mut prog = VmProgram::new();
+        let logits_ptr = prog.alloc_vreg(VRegKind::Ptr, SimdWidth::Scalar);
+        let dst = prog.alloc_vreg(VRegKind::Scalar, SimdWidth::Scalar);
+        prog.emit(VmInstr::SoftmaxReduceMax {
+            dst, logits_ptr, vocab_bytes: 64 * 4, width: SimdWidth::W512,
+        });
+        let dp = DeviceProfile::detect();
+        let profile = IsaProfile::from_device_profile(&dp);
+        let alloc = RegAllocator::new(&profile).allocate(&prog).unwrap();
+        let frame = super::super::stack_frame::StackFrame::compute(&alloc, &profile, 0);
+        let mut lower = X86Lower::with_avx512(true);
+        lower.emit_prologue(&frame, &alloc).unwrap();
+        for instr in &prog.instrs {
+            lower.lower_instr(instr, &alloc).unwrap();
+        }
+        lower.emit_epilogue(&frame, &alloc).unwrap();
+        let code = lower.finalize().unwrap();
+        let disasm = disasm_lower(&code);
+        assert!(disasm.contains("vextractf64x4") && disasm.contains("zmm"),
+            "AVX-512 softmax_reduce_max must use ZMM 16-lane reduce; got:\n{}", disasm);
+    }
+
+    #[test]
+    fn bce_avx512_half_lanes_h_reduce_avx512_uses_zmm() {
+        // HReduce: AVX-512 走 ZMM (resolve_zmm_or_spill + 16-lane reduce + broadcast 回 ZMM)。
+        let mut prog = VmProgram::new();
+        let src = prog.alloc_vreg(VRegKind::Vec, SimdWidth::W512);
+        let dst = prog.alloc_vreg(VRegKind::Vec, SimdWidth::W512);
+        prog.emit(VmInstr::HReduce { dst, src, op: super::super::instr::ReduceOp::Sum });
+        let dp = DeviceProfile::detect();
+        let profile = IsaProfile::from_device_profile(&dp);
+        let alloc = RegAllocator::new(&profile).allocate(&prog).unwrap();
+        let frame = super::super::stack_frame::StackFrame::compute(&alloc, &profile, 0);
+        let mut lower = X86Lower::with_avx512(true);
+        lower.emit_prologue(&frame, &alloc).unwrap();
+        for instr in &prog.instrs {
+            lower.lower_instr(instr, &alloc).unwrap();
+        }
+        lower.emit_epilogue(&frame, &alloc).unwrap();
+        let code = lower.finalize().unwrap();
+        let disasm = disasm_lower(&code);
+        assert!(disasm.contains("vextractf64x4") && disasm.contains("zmm"),
+            "AVX-512 HReduce must use ZMM 16-lane reduce; got:\n{}", disasm);
+    }
+
+    #[test]
+    fn bce_avx512_half_lanes_accumulate_avx512_uses_zmm() {
+        // Accumulate: AVX-512 走 vaddps zmm (16-lane 累加), AVX2 走 vaddps ymm。
+        let mut prog = VmProgram::new();
+        let acc = prog.alloc_vreg(VRegKind::Vec, SimdWidth::W512);
+        let src = prog.alloc_vreg(VRegKind::Vec, SimdWidth::W512);
+        prog.emit(VmInstr::Accumulate { acc, src });
+        let dp = DeviceProfile::detect();
+        let profile = IsaProfile::from_device_profile(&dp);
+        let alloc = RegAllocator::new(&profile).allocate(&prog).unwrap();
+        let frame = super::super::stack_frame::StackFrame::compute(&alloc, &profile, 0);
+
+        // AVX-512: vaddps zmm
+        let mut lower = X86Lower::with_avx512(true);
+        lower.emit_prologue(&frame, &alloc).unwrap();
+        for instr in &prog.instrs {
+            lower.lower_instr(instr, &alloc).unwrap();
+        }
+        lower.emit_epilogue(&frame, &alloc).unwrap();
+        let code = lower.finalize().unwrap();
+        let disasm = disasm_lower(&code);
+        assert!(disasm.contains("vaddps") && disasm.contains("zmm"),
+            "AVX-512 Accumulate must use vaddps zmm; got:\n{}", disasm);
+
+        // AVX2: vaddps ymm (no zmm)
+        let mut lower = X86Lower::with_avx512(false);
+        lower.emit_prologue(&frame, &alloc).unwrap();
+        for instr in &prog.instrs {
+            lower.lower_instr(instr, &alloc).unwrap();
+        }
+        lower.emit_epilogue(&frame, &alloc).unwrap();
+        let code = lower.finalize().unwrap();
+        let disasm = disasm_lower(&code);
+        assert!(disasm.contains("vaddps") && !disasm.contains("zmm"),
+            "AVX2 Accumulate must use vaddps ymm (no zmm); got:\n{}", disasm);
+    }
+
+    #[test]
+    fn bce_avx512_half_lanes_softmax_normalize_avx512_uses_zmm() {
+        // softmax normalize: AVX-512 走 vdivps zmm + zmmword load/store。
+        let mut prog = VmProgram::new();
+        let logits_ptr = prog.alloc_vreg(VRegKind::Ptr, SimdWidth::Scalar);
+        let sum_val = prog.alloc_vreg(VRegKind::Scalar, SimdWidth::Scalar);
+        prog.emit(VmInstr::SoftmaxNormalize {
+            logits_ptr, sum_val, vocab_bytes: 64 * 2, width: SimdWidth::W512,
+        });
+        let dp = DeviceProfile::detect();
+        let profile = IsaProfile::from_device_profile(&dp);
+        let alloc = RegAllocator::new(&profile).allocate(&prog).unwrap();
+        let frame = super::super::stack_frame::StackFrame::compute(&alloc, &profile, 0);
+        let mut lower = X86Lower::with_avx512(true);
+        lower.emit_prologue(&frame, &alloc).unwrap();
+        for instr in &prog.instrs {
+            lower.lower_instr(instr, &alloc).unwrap();
+        }
+        lower.emit_epilogue(&frame, &alloc).unwrap();
+        let code = lower.finalize().unwrap();
+        let disasm = disasm_lower(&code);
+        assert!(disasm.contains("vdivps") && disasm.contains("zmm"),
+            "AVX-512 softmax_normalize must use vdivps zmm; got:\n{}", disasm);
+    }
+
+    #[test]
+    fn bce_avx512_half_lanes_temperature_scale_avx512_uses_zmm() {
+        // temperature scale: AVX-512 走 vdivps zmm + vbroadcastss zmm。
+        let mut prog = VmProgram::new();
+        let logits_ptr = prog.alloc_vreg(VRegKind::Ptr, SimdWidth::Scalar);
+        let temp_ptr = prog.alloc_vreg(VRegKind::Ptr, SimdWidth::Scalar);
+        prog.emit(VmInstr::TemperatureScale {
+            logits_ptr, temp_ptr, vocab_bytes: 64 * 2, width: SimdWidth::W512,
+        });
+        let dp = DeviceProfile::detect();
+        let profile = IsaProfile::from_device_profile(&dp);
+        let alloc = RegAllocator::new(&profile).allocate(&prog).unwrap();
+        let frame = super::super::stack_frame::StackFrame::compute(&alloc, &profile, 0);
+        let mut lower = X86Lower::with_avx512(true);
+        lower.emit_prologue(&frame, &alloc).unwrap();
+        for instr in &prog.instrs {
+            lower.lower_instr(instr, &alloc).unwrap();
+        }
+        lower.emit_epilogue(&frame, &alloc).unwrap();
+        let code = lower.finalize().unwrap();
+        let disasm = disasm_lower(&code);
+        assert!(disasm.contains("vdivps") && disasm.contains("zmm"),
+            "AVX-512 temperature_scale must use vdivps zmm; got:\n{}", disasm);
+    }
+
+    #[test]
+    fn bce_avx512_half_lanes_transcendental_exp_avx512_uses_zmm() {
+        // Transcendental Exp (Cephes): AVX-512 走 emit_exp_cephes_zmm (vrndscaleps zmm 替代 vroundps)。
+        let mut prog = VmProgram::new();
+        let src = prog.alloc_vreg(VRegKind::Vec, SimdWidth::W512);
+        let dst = prog.alloc_vreg(VRegKind::Vec, SimdWidth::W512);
+        prog.emit(VmInstr::Transcendental {
+            dst, src,
+            func: super::super::instr::TranscendentalFn::Exp,
+        });
+        let dp = DeviceProfile::detect();
+        let profile = IsaProfile::from_device_profile(&dp);
+        let alloc = RegAllocator::new(&profile).allocate(&prog).unwrap();
+        let frame = super::super::stack_frame::StackFrame::compute(&alloc, &profile, 0);
+        let mut lower = X86Lower::with_avx512(true);
+        lower.emit_prologue(&frame, &alloc).unwrap();
+        for instr in &prog.instrs {
+            lower.lower_instr(instr, &alloc).unwrap();
+        }
+        lower.emit_epilogue(&frame, &alloc).unwrap();
+        let code = lower.finalize().unwrap();
+        let disasm = disasm_lower(&code);
+        // vrndscaleps 是 ZMM 路径特有 (vroundps 不支持 ZMM, AVX2 路径用 vroundps ymm)。
+        assert!(disasm.contains("vrndscaleps") && disasm.contains("zmm"),
+            "AVX-512 Transcendental Exp must use vrndscaleps zmm; got:\n{}", disasm);
+    }
+
+    #[test]
+    fn bce_avx512_half_lanes_transcendental_sigmoid_avx512_uses_zmm() {
+        // Transcendental Sigmoid: AVX-512 走 ZMM (内部调 emit_exp_cephes_zmm + vrcp14ps)。
+        let mut prog = VmProgram::new();
+        let src = prog.alloc_vreg(VRegKind::Vec, SimdWidth::W512);
+        let dst = prog.alloc_vreg(VRegKind::Vec, SimdWidth::W512);
+        prog.emit(VmInstr::Transcendental {
+            dst, src,
+            func: super::super::instr::TranscendentalFn::Sigmoid,
+        });
+        let dp = DeviceProfile::detect();
+        let profile = IsaProfile::from_device_profile(&dp);
+        let alloc = RegAllocator::new(&profile).allocate(&prog).unwrap();
+        let frame = super::super::stack_frame::StackFrame::compute(&alloc, &profile, 0);
+        let mut lower = X86Lower::with_avx512(true);
+        lower.emit_prologue(&frame, &alloc).unwrap();
+        for instr in &prog.instrs {
+            lower.lower_instr(instr, &alloc).unwrap();
+        }
+        lower.emit_epilogue(&frame, &alloc).unwrap();
+        let code = lower.finalize().unwrap();
+        let disasm = disasm_lower(&code);
+        // vrcp14ps 是 AVX-512 路径特有 (AVX2 用 vrcpps)。
+        assert!(disasm.contains("vrcp14ps"),
+            "AVX-512 Sigmoid must use vrcp14ps zmm; got:\n{}", disasm);
+    }
 }
