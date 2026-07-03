@@ -687,13 +687,18 @@ pub(crate) fn try_dispatch_reduction(
 
     // MeanPool with Symbolic seq_len: convert to Runtime BEFORE scale computation
     // so that 1/N uses the actual runtime seq_len, not 1/max_alloc.
+    //
+    // ARCH-SYMDIM-NO-CONST-DEGRADE + NO-SILENT-FALLBACK:
+    // When seq_bound is Symbolic and sym_map has no seq_len entry, return Err
+    // rather than approximating 1/N with 1/max_alloc (max_alloc is the allocation
+    // upper bound, not the real N — would corrupt MeanPool numerics). Normal
+    // setups register seq_len in sym_map (taking the Runtime branch below).
     let seq_bound = match &seq_bound {
-        BoundExpr::Symbolic(_sb) => {
-            let resolved = ctx.session.sym_map.resolve("seq_len").cloned();
-            eprintln!("[MEANPOOL-SYMDIM] Symbolic seq_bound, sym_map.resolve('seq_len') = {:?}", resolved);
-            resolved
-                .map(BoundExpr::Runtime)
-                .unwrap_or_else(|| { eprintln!("[MEANPOOL-SYMDIM] WARNING: no seq_len in sym_map, falling back to Symbolic"); seq_bound.clone() })
+        BoundExpr::Symbolic(_) => {
+            match ctx.session.sym_map.resolve("seq_len").cloned() {
+                Some(ptr) => BoundExpr::Runtime(ptr),
+                None => seq_bound.clone(), // remains Symbolic → Symbolic arm below returns Err
+            }
         }
         other => other.clone(),
     };
@@ -712,9 +717,18 @@ pub(crate) fn try_dispatch_reduction(
             prog.emit(VmInstr::Broadcast { dst: scale, src: ScalarExpr::Const(1.0), width, dtype: ctx.dtype, });
         }
         BoundExpr::Symbolic(sb) => {
-            // Fallback: no sym_map entry — use 1/max_alloc approximation
-            let inv_n = 1.0f32 / sb.max_alloc as f32;
-            prog.emit(VmInstr::Broadcast { dst: scale, src: ScalarExpr::Const(inv_n), width, dtype: ctx.dtype, });
+            // NO-SILENT-FALLBACK + ARCH-SYMDIM-NO-CONST-DEGRADE:
+            // Symbolic seq_len with no sym_map entry is an abnormal setup (normal
+            // setups register seq_len in sym_map and take the Runtime branch above).
+            // Reject rather than approximating 1/N with 1/max_alloc — max_alloc is
+            // the allocation upper bound, not the real N, and would corrupt MeanPool
+            // numerics. Caller must register seq_len in sym_map to use the Runtime path.
+            return Err(CompilerError::CodegenViolation(
+                format!(
+                    "MeanPool Symbolic seq_len has no sym_map entry; register seq_len in sym_map to use Runtime path (max_alloc={} is allocation upper bound, not real N)",
+                    sb.max_alloc
+                )
+            ));
         }
         BoundExpr::Runtime(ptr_expr) => {
             // Runtime: load seq_len from stack/ABI, convert to float, compute 1/N.
