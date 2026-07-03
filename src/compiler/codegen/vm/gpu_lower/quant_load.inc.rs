@@ -2,63 +2,67 @@ impl GpuLower {
     fn lower_quant_block_load(&mut self, dst: VRegId, base: VRegId, offset: &OffsetExpr, unpack: &BlockUnpackMode, width: SimdWidth, alloc: &RegAllocation) -> Result<(), CompilerError> {
         match unpack {
             BlockUnpackMode::Int8 => {
-                // Load `lanes` INT8 bytes, sign-extend to F32.
-                // PTX: ld.global.s8 + cvt.rn.f32.s32 per lane.
-                // HIP/Metal: (float)(signed char) cast.
+                // Load INT8 bytes, sign-extend to F32.
+                // GPU SIMT per-thread model (与 VecLoad/KiviDequantLoad 一致):
+                //   每个线程解码 1 个元素 (lane = tid.x), 写单个 f32 到 {d} (无覆盖)。
+                //   tid → byte_idx = tid; byte = base[off + tid]; result = (float)(s8)byte → {d}
+                //   边界: tid >= lanes → {d} = 0.0 (OOB 守卫, 避免越界读)
                 let d = self.reg_name_with_kind(dst, alloc);
                 let b = self.reg_name_with_kind(base, alloc);
                 let off = self.offset_to_string(offset, alloc);
                 let lanes = width.f32_lanes().max(1);
                 match self.dialect {
                     GpuDialect::Ptx { .. } => {
-                        // PTX scalar-per-thread: emit per-lane load + sign-extend + cvt.
-                        // Each lane loads one s8 from base + offset + lane.
-                        let rs0 = self.scratch_gpr_names[0]; // %rs0 — byte/s32 temp
-                        for lane in 0..lanes {
-                            let byte_off = if lane > 0 { format!("+{}", lane) } else { String::new() };
-                            // Load s8 (PTX sign-extends s8 → s32 in .s32 register)
-                            self.emit_line(&format!("ld.global.s8 {rs0}, [{b}+{off}{byte_off}];"));
-                            // Convert s32 → f32
-                            if lane == 0 {
-                                self.emit_line(&format!("cvt.rn.f32.s32 {d}, {rs0};"));
-                            } else {
-                                // Subsequent lanes need separate naming —
-                                // GPU SIMT: each thread holds one f32 per VReg.
-                                // For >1 lane the compiler emits per-thread f32 values.
-                                // Use array indexing notation: dst is conceptually a register array.
-                                self.emit_line(&format!("cvt.rn.f32.s32 {d}, {rs0};  // lane {lane}"));
-                            }
-                        }
-                        if lanes == 0 {
-                            // Single element fallback
-                            self.emit_line(&format!("ld.global.s8 {rs0}, [{b}+{off}];"));
-                            self.emit_line(&format!("cvt.rn.f32.s32 {d}, {rs0};"));
-                        }
+                        let rs0 = self.scratch_gpr_names[0]; // %rs0 — tid / byte_idx
+                        let rs1 = self.scratch_gpr_names[1]; // %rs1 — s32 byte
+                        let oob = self.next_skip_label();
+                        let done = self.next_skip_label();
+                        self.emit_line("{");
+                        self.emit_line("  .reg .u64 %rd_addr;");
+                        self.emit_line("  .reg .pred %p_oob;");
+                        self.emit_line(&format!("  mov.u32 {rs0}, %tid.x;"));
+                        self.emit_line(&format!("  setp.ge.u32 %p_oob, {rs0}, {lanes};"));
+                        self.emit_line(&format!("  @%p_oob bra OOB_{oob};"));
+                        // addr = base + off + tid (64-bit; PTX [reg+imm] 合法, off 作为 imm 加到 u64)
+                        self.emit_line(&format!("  cvt.u64.u32 %rd_addr, {rs0};"));
+                        self.emit_line(&format!("  add.u64 %rd_addr, %rd_addr, {b};"));
+                        self.emit_line(&format!("  add.u64 %rd_addr, %rd_addr, {off};"));
+                        self.emit_line(&format!("  ld.global.s8 {rs1}, [%rd_addr];"));
+                        self.emit_line(&format!("  cvt.rn.f32.s32 {d}, {rs1};"));
+                        self.emit_line(&format!("  bra DONE_{done};"));
+                        self.emit_line(&format!("OOB_{oob}:"));
+                        self.emit_line(&format!("  mov.f32 {d}, 0f00000000;"));
+                        self.emit_line(&format!("DONE_{done}:"));
+                        self.emit_line("}");
                     }
                     GpuDialect::Hip { .. } => {
-                        // HIP: each thread loads lanes bytes, converts to float.
-                        if lanes == 1 {
-                            self.emit_line(&format!("{d} = (float)(*((signed char*)({b}+({off})));"));
-                        } else {
-                            self.emit_line(&format!("for (int _li = 0; _li < {lanes}; ++_li) {{"));
-                            self.emit_line(&format!("  {d} = (float)(((signed char*)({b}+({off})))[_li]);"));
-                            self.emit_line("}");
-                        }
+                        self.emit_line("{");
+                        self.emit_line(&format!("  const signed char* _bp = (const signed char*)({b}) + ({off});"));
+                        self.emit_line("  unsigned int _t = (unsigned int)threadIdx.x;");
+                        self.emit_line(&format!("  if (_t < {lanes}) {{"));
+                        self.emit_line(&format!("    {d} = (float)(_bp[_t]);"));
+                        self.emit_line("  } else {");
+                        self.emit_line(&format!("    {d} = 0.0f;"));
+                        self.emit_line("  }");
+                        self.emit_line("}");
                     }
                     GpuDialect::Metal { .. } => {
-                        if lanes == 1 {
-                            self.emit_line(&format!("{d} = (float)(*((device signed char*)({b}+({off})));"));
-                        } else {
-                            self.emit_line(&format!("for (int _li = 0; _li < {lanes}; ++_li) {{"));
-                            self.emit_line(&format!("  {d} = (float)(((device signed char*)({b}+({off})))[_li]);"));
-                            self.emit_line("}");
-                        }
+                        self.emit_line("{");
+                        self.emit_line(&format!("  const device signed char* _bp = (const device signed char*)({b}) + ({off});"));
+                        self.emit_line("  unsigned int _t = (unsigned int)thread_position_in_threadgroup.x;");
+                        self.emit_line(&format!("  if (_t < {lanes}) {{"));
+                        self.emit_line(&format!("    {d} = (float)(_bp[_t]);"));
+                        self.emit_line("  } else {");
+                        self.emit_line(&format!("    {d} = 0.0f;"));
+                        self.emit_line("  }");
+                        self.emit_line("}");
                     }
                 }
                 Ok(())
             }
             BlockUnpackMode::F16Broadcast => {
                 // Load one F16 from base+offset, convert to F32, broadcast to all lanes.
+                // 单元素加载, 不涉及 lanes 维度, 保持原实现 (无 for 循环, 无覆盖问题)。
                 let d = self.reg_name_with_kind(dst, alloc);
                 let b = self.reg_name_with_kind(base, alloc);
                 let off = self.offset_to_string(offset, alloc);
@@ -70,228 +74,283 @@ impl GpuLower {
                         let _ = rs0;
                     }
                     GpuDialect::Hip { .. } => {
-                        self.emit_line(&format!("{d} = __half2float(*((__half*)({b}+({off}))));"));
+                        self.emit_line(&format!("{d} = __half2float(*((__half*)({b}+({off})));"));
                     }
                     GpuDialect::Metal { .. } => {
-                        self.emit_line(&format!("{d} = (float)(*((device half*)({b}+({off}))));"));
+                        self.emit_line(&format!("{d} = (float)(*((device half*)({b}+({off})));"));
                     }
                 }
                 Ok(())
             }
             BlockUnpackMode::SignedNibbleLow => {
-                // Load packed 4-bit values, unpack nibbles, subtract 8, convert to F32.
-                // Each byte has 2 nibbles: low = byte & 0xF, high = (byte >> 4).
-                // Output value = (nibble - 8.0) per Q4_0 symmetric zero-point.
+                // Q4_0 4-bit packed dequant (symmetric zero-point = 8.0).
+                // GPU SIMT per-thread model (BCE-20260711-GPU-REG-OVERWRITE 根治):
+                //   每个线程解码 1 个 nibble (lane = tid.x), 写单个 f32 到 {d} (无覆盖)。
+                //   byte_idx = tid >> 1; is_high = tid & 1
+                //   nibble = is_high ? (byte >> 4) & 0xF : byte & 0xF
+                //   result = (float)(nibble) - 8.0 → {d}
+                //   边界: tid >= lanes → {d} = 0.0
+                //
+                // 旧 bug: for lane in 0..lanes 循环展开 PTX, 每个 lane 的 cvt+sub 写同一 {d},
+                //   后覆盖前 → 只剩 lane[lanes-1] 值。根治: per-thread SIMT, 单线程单 {d}。
                 let d = self.reg_name_with_kind(dst, alloc);
                 let b = self.reg_name_with_kind(base, alloc);
                 let off = self.offset_to_string(offset, alloc);
                 let lanes = width.f32_lanes().max(1);
                 match self.dialect {
                     GpuDialect::Ptx { .. } => {
-                        // PTX scalar-per-thread: emit per-nibble decode.
-                        // lanes/2 bytes produce lanes nibbles.
-                        // lane i → byte[i/2], nibble = i%2 (low=0, high=1)
-                        let rs0 = self.scratch_gpr_names[0]; // %rs0 — byte / nibble temp
-                        let fs0 = self.scratch_vec_names[0]; // %fs0 — f32 bias (8.0)
-                        // Emit the -8.0 constant once
-                        // 8.0f32 = 0x41000000
-                        self.emit_line("{ .reg .u32 %tmp_bias_u32;");
-                        self.emit_line("mov.u32 %tmp_bias_u32, 0x41000000;");
-                        self.emit_line(&format!("mov.f32 {fs0}, %tmp_bias_u32;"));
-                        for lane in 0..lanes {
-                            let byte_idx = lane / 2;
-                            let is_high = lane % 2 == 1;
-                            // Load byte
-                            let byte_off = if byte_idx > 0 { format!("+{}", byte_idx) } else { String::new() };
-                            self.emit_line(&format!("ld.global.u8 {rs0}, [{b}+{off}{byte_off}];"));
-                            // Extract nibble
-                            if is_high {
-                                self.emit_line(&format!("shr.b32 {rs0}, {rs0}, 4;"));
-                            }
-                            self.emit_line(&format!("and.b32 {rs0}, {rs0}, 0xF;"));
-                            // Convert u32 nibble to f32, subtract 8.0
-                            if lane == 0 {
-                                self.emit_line(&format!("cvt.rn.f32.u32 {d}, {rs0};"));
-                                self.emit_line(&format!("sub.rn.f32 {d}, {d}, {fs0};"));
-                            } else {
-                                self.emit_line(&format!("cvt.rn.f32.u32 {d}, {rs0};  // nibble lane {lane}"));
-                                self.emit_line(&format!("sub.rn.f32 {d}, {d}, {fs0};"));
-                            }
-                        }
+                        let rs0 = self.scratch_gpr_names[0]; // %rs0 — tid / byte_idx / byte
+                        let rs1 = self.scratch_gpr_names[1]; // %rs1 — is_high
+                        let fs0 = self.scratch_vec_names[0]; // %fs0 — bias 8.0
+                        let oob = self.next_skip_label();
+                        let done = self.next_skip_label();
+                        self.emit_line("{");
+                        self.emit_line("  .reg .u64 %rd_addr;");
+                        self.emit_line("  .reg .pred %p_oob, %p_hi;");
+                        self.emit_line(&format!("  mov.u32 {rs0}, %tid.x;"));
+                        self.emit_line(&format!("  setp.ge.u32 %p_oob, {rs0}, {lanes};"));
+                        self.emit_line(&format!("  @%p_oob bra OOB_{oob};"));
+                        // byte_idx = tid >> 1
+                        self.emit_line(&format!("  shr.u32 {rs0}, {rs0}, 1;"));
+                        // addr = base + off + byte_idx (64-bit)
+                        self.emit_line(&format!("  cvt.u64.u32 %rd_addr, {rs0};"));
+                        self.emit_line(&format!("  add.u64 %rd_addr, %rd_addr, {b};"));
+                        self.emit_line(&format!("  add.u64 %rd_addr, %rd_addr, {off};"));
+                        self.emit_line(&format!("  ld.global.u8 {rs0}, [%rd_addr];")); // byte (rs0 不再是 byte_idx)
+                        // is_high = tid & 1 (rs0 已被 byte 占用, 用 rs1 重新读 tid)
+                        self.emit_line(&format!("  mov.u32 {rs1}, %tid.x;"));
+                        self.emit_line(&format!("  and.b32 {rs1}, {rs1}, 1;"));
+                        self.emit_line(&format!("  setp.eq.u32 %p_hi, {rs1}, 1;"));
+                        self.emit_line(&format!("  @%p_hi shr.u32 {rs0}, {rs0}, 4;"));
+                        self.emit_line(&format!("  and.b32 {rs0}, {rs0}, 0xF;"));
+                        // cvt + sub 8.0 (单线程单 {d}, 无覆盖)
+                        self.emit_line(&format!("  cvt.rn.f32.u32 {d}, {rs0};"));
+                        self.emit_line("  mov.u32 %r_bias, 0x41000000;"); // 8.0f
+                        self.emit_line(&format!("  mov.f32 {fs0}, %r_bias;"));
+                        self.emit_line(&format!("  sub.rn.f32 {d}, {d}, {fs0};"));
+                        self.emit_line(&format!("  bra DONE_{done};"));
+                        self.emit_line(&format!("OOB_{oob}:"));
+                        self.emit_line(&format!("  mov.f32 {d}, 0f00000000;"));
+                        self.emit_line(&format!("DONE_{done}:"));
                         self.emit_line("}");
                     }
                     GpuDialect::Hip { .. } => {
                         self.emit_line("{");
                         self.emit_line("  const float _bias = 8.0f;");
-                        self.emit_line(&format!("  unsigned char* _bp = (unsigned char*)({b}+({off}));"));
-                        for lane in 0..lanes {
-                            let byte_idx = lane / 2;
-                            let is_high = lane % 2 == 1;
-                            let nibble_expr = if is_high {
-                                format!("(_bp[{byte_idx}] >> 4) & 0xF")
-                            } else {
-                                format!("_bp[{byte_idx}] & 0xF")
-                            };
-                            self.emit_line(&format!("  {d} = (float)({nibble_expr}) - _bias;  // lane {lane}"));
-                        }
+                        self.emit_line(&format!("  const unsigned char* _bp = (const unsigned char*)({b}) + ({off});"));
+                        self.emit_line("  unsigned int _t = (unsigned int)threadIdx.x;");
+                        self.emit_line(&format!("  if (_t < {lanes}) {{"));
+                        self.emit_line("    unsigned int _bi = _t >> 1;");
+                        self.emit_line("    unsigned int _hi = _t & 1u;");
+                        self.emit_line("    unsigned char _byte = _bp[_bi];");
+                        self.emit_line("    int _nib = (int)(_hi ? ((_byte >> 4) & 0xF) : (_byte & 0xF));");
+                        self.emit_line(&format!("    {d} = (float)_nib - _bias;"));
+                        self.emit_line("  } else {");
+                        self.emit_line(&format!("    {d} = 0.0f;"));
+                        self.emit_line("  }");
                         self.emit_line("}");
                     }
                     GpuDialect::Metal { .. } => {
                         self.emit_line("{");
                         self.emit_line("  constant float _bias = 8.0f;");
-                        self.emit_line(&format!("  device unsigned char* _bp = (device unsigned char*)({b}+({off}));"));
-                        for lane in 0..lanes {
-                            let byte_idx = lane / 2;
-                            let is_high = lane % 2 == 1;
-                            let nibble_expr = if is_high {
-                                format!("(_bp[{byte_idx}] >> 4) & 0xF")
-                            } else {
-                                format!("_bp[{byte_idx}] & 0xF")
-                            };
-                            self.emit_line(&format!("  {d} = (float)({nibble_expr}) - _bias;  // lane {lane}"));
-                        }
+                        self.emit_line(&format!("  const device unsigned char* _bp = (const device unsigned char*)({b}) + ({off});"));
+                        self.emit_line("  unsigned int _t = (unsigned int)thread_position_in_threadgroup.x;");
+                        self.emit_line(&format!("  if (_t < {lanes}) {{"));
+                        self.emit_line("    unsigned int _bi = _t >> 1;");
+                        self.emit_line("    unsigned int _hi = _t & 1u;");
+                        self.emit_line("    unsigned char _byte = _bp[_bi];");
+                        self.emit_line("    int _nib = (int)(_hi ? ((_byte >> 4) & 0xF) : (_byte & 0xF));");
+                        self.emit_line(&format!("    {d} = (float)_nib - _bias;"));
+                        self.emit_line("  } else {");
+                        self.emit_line(&format!("    {d} = 0.0f;"));
+                        self.emit_line("  }");
                         self.emit_line("}");
                     }
                 }
                 Ok(())
             }
             BlockUnpackMode::SignedNibbleHigh => {
-                // GGUF PackedNibbles high-nibble load: extract (byte >> 4), subtract 8, convert to F32.
+                // GGUF PackedNibbles high-nibble: extract (byte >> 4), subtract 8, convert to F32.
+                // GPU SIMT per-thread (BCE-20260711 根治): lane = tid.x, 1 byte/thread → 1 nibble → {d}。
+                //   byte_idx = tid; nibble = (byte[tid] >> 4) & 0xF; result = (float)nibble - 8.0
                 let d = self.reg_name_with_kind(dst, alloc);
                 let b = self.reg_name_with_kind(base, alloc);
                 let off = self.offset_to_string(offset, alloc);
                 let lanes = width.f32_lanes().max(1);
                 match self.dialect {
                     GpuDialect::Ptx { .. } => {
-                        let rs0 = self.scratch_gpr_names[0];
-                        let fs0 = self.scratch_vec_names[0];
-                        self.emit_line("{ .reg .u32 %tmp_bias_u32;");
-                        self.emit_line("mov.u32 %tmp_bias_u32, 0x41000000;");
-                        self.emit_line(&format!("mov.f32 {fs0}, %tmp_bias_u32;"));
-                        for lane in 0..lanes {
-                            self.emit_line(&format!("ld.u8 {rs0}, [{b}+{off}+{lane}];"));
-                            self.emit_line(&format!("shr.u32 {rs0}, {rs0}, 4;"));
-                            self.emit_line(&format!("cvt.rn.f32.u32 {d}<{}>, {rs0};", lane));
-                            self.emit_line(&format!("sub.f32 {d}<{}>, {d}<{}>, {fs0};", lane, lane));
-                        }
+                        let rs0 = self.scratch_gpr_names[0]; // tid / byte
+                        let fs0 = self.scratch_vec_names[0]; // bias 8.0
+                        let oob = self.next_skip_label();
+                        let done = self.next_skip_label();
+                        self.emit_line("{");
+                        self.emit_line("  .reg .u64 %rd_addr;");
+                        self.emit_line("  .reg .pred %p_oob;");
+                        self.emit_line(&format!("  mov.u32 {rs0}, %tid.x;"));
+                        self.emit_line(&format!("  setp.ge.u32 %p_oob, {rs0}, {lanes};"));
+                        self.emit_line(&format!("  @%p_oob bra OOB_{oob};"));
+                        self.emit_line(&format!("  cvt.u64.u32 %rd_addr, {rs0};"));
+                        self.emit_line(&format!("  add.u64 %rd_addr, %rd_addr, {b};"));
+                        self.emit_line(&format!("  add.u64 %rd_addr, %rd_addr, {off};"));
+                        self.emit_line(&format!("  ld.global.u8 {rs0}, [%rd_addr];"));
+                        self.emit_line(&format!("  shr.u32 {rs0}, {rs0}, 4;"));
+                        self.emit_line(&format!("  and.b32 {rs0}, {rs0}, 0xF;"));
+                        self.emit_line(&format!("  cvt.rn.f32.u32 {d}, {rs0};"));
+                        self.emit_line("  mov.u32 %r_bias, 0x41000000;");
+                        self.emit_line(&format!("  mov.f32 {fs0}, %r_bias;"));
+                        self.emit_line(&format!("  sub.rn.f32 {d}, {d}, {fs0};"));
+                        self.emit_line(&format!("  bra DONE_{done};"));
+                        self.emit_line(&format!("OOB_{oob}:"));
+                        self.emit_line(&format!("  mov.f32 {d}, 0f00000000;"));
+                        self.emit_line(&format!("DONE_{done}:"));
                         self.emit_line("}");
                     }
                     GpuDialect::Hip { .. } => {
                         self.emit_line("{");
                         self.emit_line("  const float _bias = 8.0f;");
-                        self.emit_line(&format!("  unsigned char* _bp = (unsigned char*)({b}+({off}));"));
-                        for lane in 0..lanes {
-                            self.emit_line(&format!(
-                                "  {d} = (float)(_bp[{lane}] >> 4) - _bias;  // lane {lane}"
-                            ));
-                        }
+                        self.emit_line(&format!("  const unsigned char* _bp = (const unsigned char*)({b}) + ({off});"));
+                        self.emit_line("  unsigned int _t = (unsigned int)threadIdx.x;");
+                        self.emit_line(&format!("  if (_t < {lanes}) {{"));
+                        self.emit_line(&format!("    {d} = (float)(_bp[_t] >> 4) - _bias;"));
+                        self.emit_line("  } else {");
+                        self.emit_line(&format!("    {d} = 0.0f;"));
+                        self.emit_line("  }");
                         self.emit_line("}");
                     }
                     GpuDialect::Metal { .. } => {
                         self.emit_line("{");
                         self.emit_line("  constant float _bias = 8.0f;");
-                        self.emit_line(&format!("  device unsigned char* _bp = (device unsigned char*)({b}+({off}));"));
-                        for lane in 0..lanes {
-                            self.emit_line(&format!(
-                                "  {d} = (float)(_bp[{lane}] >> 4) - _bias;  // lane {lane}"
-                            ));
-                        }
+                        self.emit_line(&format!("  const device unsigned char* _bp = (const device unsigned char*)({b}) + ({off});"));
+                        self.emit_line("  unsigned int _t = (unsigned int)thread_position_in_threadgroup.x;");
+                        self.emit_line(&format!("  if (_t < {lanes}) {{"));
+                        self.emit_line(&format!("    {d} = (float)(_bp[_t] >> 4) - _bias;"));
+                        self.emit_line("  } else {");
+                        self.emit_line(&format!("    {d} = 0.0f;"));
+                        self.emit_line("  }");
                         self.emit_line("}");
                     }
                 }
                 Ok(())
             }
             BlockUnpackMode::UnsignedNibbleLow => {
-                // Unsigned 4-bit low-nibble load (Q4_1): extract (& 0x0F) or (>>4), NO subtract-8.
+                // Unsigned 4-bit low-nibble (Q4_1): extract (& 0x0F), NO subtract-8.
+                // GPU SIMT per-thread (BCE-20260711 根治): lane = tid.x, byte_idx = tid>>1, is_high = tid&1。
                 let d = self.reg_name_with_kind(dst, alloc);
                 let b = self.reg_name_with_kind(base, alloc);
                 let off = self.offset_to_string(offset, alloc);
                 let lanes = width.f32_lanes().max(1);
                 match self.dialect {
                     GpuDialect::Ptx { .. } => {
-                        let rs0 = self.scratch_gpr_names[0];
-                        for lane in 0..lanes {
-                            let byte_idx = lane / 2;
-                            let is_high = lane % 2 == 1;
-                            let byte_off = if byte_idx > 0 { format!("+{}", byte_idx) } else { String::new() };
-                            self.emit_line(&format!("ld.global.u8 {rs0}, [{b}+{off}{byte_off}];"));
-                            if is_high {
-                                self.emit_line(&format!("shr.b32 {rs0}, {rs0}, 4;"));
-                            }
-                            self.emit_line(&format!("and.b32 {rs0}, {rs0}, 0xF;"));
-                            self.emit_line(&format!("cvt.rn.f32.u32 {d}<{}>, {rs0};", lane));
-                        }
+                        let rs0 = self.scratch_gpr_names[0]; // tid / byte_idx / byte
+                        let rs1 = self.scratch_gpr_names[1]; // is_high
+                        let oob = self.next_skip_label();
+                        let done = self.next_skip_label();
+                        self.emit_line("{");
+                        self.emit_line("  .reg .u64 %rd_addr;");
+                        self.emit_line("  .reg .pred %p_oob, %p_hi;");
+                        self.emit_line(&format!("  mov.u32 {rs0}, %tid.x;"));
+                        self.emit_line(&format!("  setp.ge.u32 %p_oob, {rs0}, {lanes};"));
+                        self.emit_line(&format!("  @%p_oob bra OOB_{oob};"));
+                        self.emit_line(&format!("  shr.u32 {rs0}, {rs0}, 1;")); // byte_idx
+                        self.emit_line(&format!("  cvt.u64.u32 %rd_addr, {rs0};"));
+                        self.emit_line(&format!("  add.u64 %rd_addr, %rd_addr, {b};"));
+                        self.emit_line(&format!("  add.u64 %rd_addr, %rd_addr, {off};"));
+                        self.emit_line(&format!("  ld.global.u8 {rs0}, [%rd_addr];"));
+                        self.emit_line(&format!("  mov.u32 {rs1}, %tid.x;"));
+                        self.emit_line(&format!("  and.b32 {rs1}, {rs1}, 1;"));
+                        self.emit_line(&format!("  setp.eq.u32 %p_hi, {rs1}, 1;"));
+                        self.emit_line(&format!("  @%p_hi shr.u32 {rs0}, {rs0}, 4;"));
+                        self.emit_line(&format!("  and.b32 {rs0}, {rs0}, 0xF;"));
+                        self.emit_line(&format!("  cvt.rn.f32.u32 {d}, {rs0};"));
+                        self.emit_line(&format!("  bra DONE_{done};"));
+                        self.emit_line(&format!("OOB_{oob}:"));
+                        self.emit_line(&format!("  mov.f32 {d}, 0f00000000;"));
+                        self.emit_line(&format!("DONE_{done}:"));
+                        self.emit_line("}");
                     }
                     GpuDialect::Hip { .. } => {
                         self.emit_line("{");
-                        self.emit_line(&format!("  unsigned char* _bp = (unsigned char*)({b}+({off}));"));
-                        for lane in 0..lanes {
-                            let byte_idx = lane / 2;
-                            let is_high = lane % 2 == 1;
-                            let nibble_expr = if is_high {
-                                format!("_bp[{byte_idx}] >> 4")
-                            } else {
-                                format!("_bp[{byte_idx}] & 0xF")
-                            };
-                            self.emit_line(&format!("  {d} = (float)({nibble_expr});  // lane {lane}"));
-                        }
+                        self.emit_line(&format!("  const unsigned char* _bp = (const unsigned char*)({b}) + ({off});"));
+                        self.emit_line("  unsigned int _t = (unsigned int)threadIdx.x;");
+                        self.emit_line(&format!("  if (_t < {lanes}) {{"));
+                        self.emit_line("    unsigned int _bi = _t >> 1;");
+                        self.emit_line("    unsigned int _hi = _t & 1u;");
+                        self.emit_line("    unsigned char _byte = _bp[_bi];");
+                        self.emit_line("    int _nib = (int)(_hi ? ((_byte >> 4) & 0xF) : (_byte & 0xF));");
+                        self.emit_line(&format!("    {d} = (float)_nib;"));
+                        self.emit_line("  } else {");
+                        self.emit_line(&format!("    {d} = 0.0f;"));
+                        self.emit_line("  }");
                         self.emit_line("}");
                     }
                     GpuDialect::Metal { .. } => {
                         self.emit_line("{");
-                        self.emit_line(&format!("  device unsigned char* _bp = (device unsigned char*)({b}+({off}));"));
-                        for lane in 0..lanes {
-                            let byte_idx = lane / 2;
-                            let is_high = lane % 2 == 1;
-                            let nibble_expr = if is_high {
-                                format!("_bp[{byte_idx}] >> 4")
-                            } else {
-                                format!("_bp[{byte_idx}] & 0xF")
-                            };
-                            self.emit_line(&format!("  {d} = (float)({nibble_expr});  // lane {lane}"));
-                        }
+                        self.emit_line(&format!("  const device unsigned char* _bp = (const device unsigned char*)({b}) + ({off});"));
+                        self.emit_line("  unsigned int _t = (unsigned int)thread_position_in_threadgroup.x;");
+                        self.emit_line(&format!("  if (_t < {lanes}) {{"));
+                        self.emit_line("    unsigned int _bi = _t >> 1;");
+                        self.emit_line("    unsigned int _hi = _t & 1u;");
+                        self.emit_line("    unsigned char _byte = _bp[_bi];");
+                        self.emit_line("    int _nib = (int)(_hi ? ((_byte >> 4) & 0xF) : (_byte & 0xF));");
+                        self.emit_line(&format!("    {d} = (float)_nib;"));
+                        self.emit_line("  } else {");
+                        self.emit_line(&format!("    {d} = 0.0f;"));
+                        self.emit_line("  }");
                         self.emit_line("}");
                     }
                 }
                 Ok(())
             }
             BlockUnpackMode::UnsignedNibbleHigh => {
-                // Unsigned 4-bit high-nibble load (Q4_1): extract (>>4), NO subtract-8.
+                // Unsigned 4-bit high-nibble (Q4_1): extract (>>4), NO subtract-8.
+                // GPU SIMT per-thread (BCE-20260711 根治): lane = tid.x, 1 byte/thread。
                 let d = self.reg_name_with_kind(dst, alloc);
                 let b = self.reg_name_with_kind(base, alloc);
                 let off = self.offset_to_string(offset, alloc);
                 let lanes = width.f32_lanes().max(1);
                 match self.dialect {
                     GpuDialect::Ptx { .. } => {
-                        let rs0 = self.scratch_gpr_names[0];
-                        for lane in 0..lanes {
-                            let byte_idx = lane / 2;
-                            let byte_off = if byte_idx > 0 { format!("+{}", byte_idx) } else { String::new() };
-                            self.emit_line(&format!("ld.global.u8 {rs0}, [{b}+{off}{byte_off}];"));
-                            self.emit_line(&format!("shr.b32 {rs0}, {rs0}, 4;"));
-                            self.emit_line(&format!("cvt.rn.f32.u32 {d}<{}>, {rs0};", lane));
-                        }
+                        let rs0 = self.scratch_gpr_names[0]; // tid / byte
+                        let oob = self.next_skip_label();
+                        let done = self.next_skip_label();
+                        self.emit_line("{");
+                        self.emit_line("  .reg .u64 %rd_addr;");
+                        self.emit_line("  .reg .pred %p_oob;");
+                        self.emit_line(&format!("  mov.u32 {rs0}, %tid.x;"));
+                        self.emit_line(&format!("  setp.ge.u32 %p_oob, {rs0}, {lanes};"));
+                        self.emit_line(&format!("  @%p_oob bra OOB_{oob};"));
+                        self.emit_line(&format!("  cvt.u64.u32 %rd_addr, {rs0};"));
+                        self.emit_line(&format!("  add.u64 %rd_addr, %rd_addr, {b};"));
+                        self.emit_line(&format!("  add.u64 %rd_addr, %rd_addr, {off};"));
+                        self.emit_line(&format!("  ld.global.u8 {rs0}, [%rd_addr];"));
+                        self.emit_line(&format!("  shr.u32 {rs0}, {rs0}, 4;"));
+                        self.emit_line(&format!("  cvt.rn.f32.u32 {d}, {rs0};"));
+                        self.emit_line(&format!("  bra DONE_{done};"));
+                        self.emit_line(&format!("OOB_{oob}:"));
+                        self.emit_line(&format!("  mov.f32 {d}, 0f00000000;"));
+                        self.emit_line(&format!("DONE_{done}:"));
+                        self.emit_line("}");
                     }
                     GpuDialect::Hip { .. } => {
                         self.emit_line("{");
-                        self.emit_line(&format!("  unsigned char* _bp = (unsigned char*)({b}+({off}));"));
-                        for lane in 0..lanes {
-                            let byte_idx = lane / 2;
-                            self.emit_line(&format!(
-                                "  {d} = (float)(_bp[{byte_idx}] >> 4);  // lane {lane}"
-                            ));
-                        }
+                        self.emit_line(&format!("  const unsigned char* _bp = (const unsigned char*)({b}) + ({off});"));
+                        self.emit_line("  unsigned int _t = (unsigned int)threadIdx.x;");
+                        self.emit_line(&format!("  if (_t < {lanes}) {{"));
+                        self.emit_line(&format!("    {d} = (float)(_bp[_t] >> 4);"));
+                        self.emit_line("  } else {");
+                        self.emit_line(&format!("    {d} = 0.0f;"));
+                        self.emit_line("  }");
                         self.emit_line("}");
                     }
                     GpuDialect::Metal { .. } => {
                         self.emit_line("{");
-                        self.emit_line(&format!("  device unsigned char* _bp = (device unsigned char*)({b}+({off}));"));
-                        for lane in 0..lanes {
-                            let byte_idx = lane / 2;
-                            self.emit_line(&format!(
-                                "  {d} = (float)(_bp[{byte_idx}] >> 4);  // lane {lane}"
-                            ));
-                        }
+                        self.emit_line(&format!("  const device unsigned char* _bp = (const device unsigned char*)({b}) + ({off});"));
+                        self.emit_line("  unsigned int _t = (unsigned int)thread_position_in_threadgroup.x;");
+                        self.emit_line(&format!("  if (_t < {lanes}) {{"));
+                        self.emit_line(&format!("    {d} = (float)(_bp[_t] >> 4);"));
+                        self.emit_line("  } else {");
+                        self.emit_line(&format!("    {d} = 0.0f;"));
+                        self.emit_line("  }");
                         self.emit_line("}");
                     }
                 }
@@ -299,47 +358,73 @@ impl GpuLower {
             }
             BlockUnpackMode::Bitpack2 { bias } => {
                 // Q2K 2-bit packed: each byte has 4 × 2-bit values.
-                // Extract: (byte >> (2*(i%4) + 8*(i/4))) & 3
+                // GPU SIMT per-thread (BCE-20260711 根治): lane = tid.x,
+                //   byte_idx = tid >> 2; bit_shift = (tid & 3) * 2
+                //   val = (byte >> bit_shift) & 3; result = (float)val - bias → {d}
                 let d = self.reg_name_with_kind(dst, alloc);
                 let qs_b = self.reg_name_with_kind(base, alloc);
+                let off = self.offset_to_string(offset, alloc);
                 let lanes = width.f32_lanes().max(1);
                 let bias_bits = f32::to_bits(*bias);
                 match self.dialect {
                     GpuDialect::Ptx { .. } => {
-                        let rs0 = self.scratch_gpr_names[0];
-                        let fs0 = self.scratch_vec_names[0];
-                        // Load bias constant once
-                        self.emit_line(&format!("mov.u32 {rs0}, {bias_bits};"));
-                        self.emit_line(&format!("mov.f32 {fs0}, {rs0};"));
-                        for lane in 0..lanes {
-                            let byte_idx = lane / 4;
-                            let bit_shift = (lane % 4) * 2;
-                            let byte_off = if byte_idx > 0 { format!("+{}", byte_idx) } else { String::new() };
-                            self.emit_line(&format!("ld.global.u8 {rs0}, [{qs_b}{byte_off}];"));
-                            self.emit_line(&format!("shr.b32 {rs0}, {rs0}, {bit_shift};"));
-                            self.emit_line(&format!("and.b32 {rs0}, {rs0}, 3;"));
-                            self.emit_line(&format!("cvt.rn.f32.u32 {d}, {rs0};  // lane {lane}"));
-                            self.emit_line(&format!("sub.rn.f32 {d}, {d}, {fs0};"));
-                        }
+                        let rs0 = self.scratch_gpr_names[0]; // tid / byte_idx / byte
+                        let rs1 = self.scratch_gpr_names[1]; // bit_shift
+                        let fs0 = self.scratch_vec_names[0]; // bias
+                        let oob = self.next_skip_label();
+                        let done = self.next_skip_label();
+                        self.emit_line("{");
+                        self.emit_line("  .reg .u64 %rd_addr;");
+                        self.emit_line("  .reg .pred %p_oob;");
+                        self.emit_line(&format!("  mov.u32 {rs0}, %tid.x;"));
+                        self.emit_line(&format!("  setp.ge.u32 %p_oob, {rs0}, {lanes};"));
+                        self.emit_line(&format!("  @%p_oob bra OOB_{oob};"));
+                        // byte_idx = tid >> 2; bit_shift = (tid & 3) * 2
+                        self.emit_line(&format!("  shr.u32 {rs0}, {rs0}, 2;")); // byte_idx
+                        self.emit_line(&format!("  cvt.u64.u32 %rd_addr, {rs0};"));
+                        self.emit_line(&format!("  add.u64 %rd_addr, %rd_addr, {qs_b};"));
+                        self.emit_line(&format!("  add.u64 %rd_addr, %rd_addr, {off};"));
+                        self.emit_line(&format!("  ld.global.u8 {rs0}, [%rd_addr];")); // byte
+                        // bit_shift = (tid & 3) * 2 — 重新读 tid
+                        self.emit_line(&format!("  mov.u32 {rs1}, %tid.x;"));
+                        self.emit_line(&format!("  and.b32 {rs1}, {rs1}, 3;"));
+                        self.emit_line(&format!("  shl.u32 {rs1}, {rs1}, 1;")); // ×2
+                        self.emit_line(&format!("  shr.b32 {rs0}, {rs0}, {rs1};"));
+                        self.emit_line(&format!("  and.b32 {rs0}, {rs0}, 3;"));
+                        self.emit_line(&format!("  cvt.rn.f32.u32 {d}, {rs0};"));
+                        self.emit_line(&format!("  mov.u32 {rs0}, {bias_bits};"));
+                        self.emit_line(&format!("  mov.f32 {fs0}, {rs0};"));
+                        self.emit_line(&format!("  sub.rn.f32 {d}, {d}, {fs0};"));
+                        self.emit_line(&format!("  bra DONE_{done};"));
+                        self.emit_line(&format!("OOB_{oob}:"));
+                        self.emit_line(&format!("  mov.f32 {d}, 0f00000000;"));
+                        self.emit_line(&format!("DONE_{done}:"));
+                        self.emit_line("}");
                     }
                     GpuDialect::Hip { .. } => {
                         self.emit_line("{");
-                        for lane in 0..lanes {
-                            let byte_idx = lane / 4;
-                            let bit_shift = (lane % 4) * 2;
-                            let expr = format!("((((unsigned char*)({qs_b}))[{byte_idx}]) >> {bit_shift}) & 3");
-                            self.emit_line(&format!("  {d} = (float)({expr}) - {bias_bits}_f32;  // lane {lane}"));
-                        }
+                        self.emit_line(&format!("  const unsigned char* _bp = (const unsigned char*)({qs_b}) + ({off});"));
+                        self.emit_line("  unsigned int _t = (unsigned int)threadIdx.x;");
+                        self.emit_line(&format!("  if (_t < {lanes}) {{"));
+                        self.emit_line("    unsigned int _bi = _t >> 2;");
+                        self.emit_line("    unsigned int _sh = (_t & 3u) * 2u;");
+                        self.emit_line(&format!("    {d} = (float)((_bp[_bi] >> _sh) & 3u) - {bias_bits}_f32;"));
+                        self.emit_line("  } else {");
+                        self.emit_line(&format!("    {d} = 0.0f;"));
+                        self.emit_line("  }");
                         self.emit_line("}");
                     }
                     GpuDialect::Metal { .. } => {
                         self.emit_line("{");
-                        for lane in 0..lanes {
-                            let byte_idx = lane / 4;
-                            let bit_shift = (lane % 4) * 2;
-                            let expr = format!("((((device unsigned char*)({qs_b}))[{byte_idx}]) >> {bit_shift}) & 3");
-                            self.emit_line(&format!("  {d} = (float)({expr}) - {bias_bits}_f32;  // lane {lane}"));
-                        }
+                        self.emit_line(&format!("  const device unsigned char* _bp = (const device unsigned char*)({qs_b}) + ({off});"));
+                        self.emit_line("  unsigned int _t = (unsigned int)thread_position_in_threadgroup.x;");
+                        self.emit_line(&format!("  if (_t < {lanes}) {{"));
+                        self.emit_line("    unsigned int _bi = _t >> 2;");
+                        self.emit_line("    unsigned int _sh = (_t & 3u) * 2u;");
+                        self.emit_line(&format!("    {d} = (float)((_bp[_bi] >> _sh) & 3u) - {bias_bits}_f32;"));
+                        self.emit_line("  } else {");
+                        self.emit_line(&format!("    {d} = 0.0f;"));
+                        self.emit_line("  }");
                         self.emit_line("}");
                     }
                 }
@@ -360,89 +445,120 @@ impl GpuLower {
     fn lower_quant_biplane_load(&mut self, dst: VRegId, qs_base: VRegId, extra_base: VRegId, bias: f32, mode: &BiPlaneMode, width: SimdWidth, alloc: &RegAllocation) -> Result<(), CompilerError> {
         match mode {
             BiPlaneMode::Low5 => {
-                // GGUF Q5_0/Q5_1: load qs (4-bit low nibbles) from qs_base + qh (1-bit high plane) from qh_base,
-                // merge: value = (nibble | (qh_bit << 4)) - bias, convert to F32.
+                // GGUF Q5_0/Q5_1: qs (4-bit low nibbles) + qh (1-bit high plane).
+                // GPU SIMT per-thread (BCE-20260711 根治): lane = tid.x,
+                //   qs_byte_idx = tid >> 1; is_high = tid & 1
+                //   qh_byte_idx = tid >> 8; qh_bit = tid & 7
+                //   value = (nibble | (qh_bit << 4)) - bias → {d}
                 let d = self.reg_name_with_kind(dst, alloc);
                 let qs_b = self.reg_name_with_kind(qs_base, alloc);
                 let qh_b = self.reg_name_with_kind(extra_base, alloc);
                 let lanes = width.f32_lanes().max(1);
                 let bias_bits = f32::to_bits(bias);
+                let qs_off_str = String::new(); // BiPlane offset 内嵌在 base 计算 (无独立 offset 参数)
+                let _ = qs_off_str;
                 match self.dialect {
                     GpuDialect::Ptx { .. } => {
-                        let rs0 = self.scratch_gpr_names[0]; // qs nibble
-                        let rs1 = self.scratch_gpr_names[1]; // qh byte
-                        let fs0 = self.scratch_vec_names[0]; // bias f32
-                        // Load bias constant once
-                        self.emit_line(&format!("mov.u32 {rs0}, {bias_bits};"));
-                        self.emit_line(&format!("mov.f32 {fs0}, {rs0};"));
-                        for lane in 0..lanes {
-                            let qs_byte_idx = lane / 2;
-                            let is_high = lane % 2 == 1;
-                            // Load qs byte
-                            let qs_byte_off = if qs_byte_idx > 0 { format!("+{}", qs_byte_idx) } else { String::new() };
-                            self.emit_line(&format!("ld.global.u8 {rs0}, [{qs_b}{qs_byte_off}];"));
-                            if is_high {
-                                self.emit_line(&format!("shr.b32 {rs0}, {rs0}, 4;"));
-                            }
-                            self.emit_line(&format!("and.b32 {rs0}, {rs0}, 0xF;"));
-                            // Load qh bit: qh byte index = lane/8, bit position = lane%8
-                            let qh_byte_idx = lane / 8;
-                            let qh_bit = lane % 8;
-                            let qh_byte_off = if qh_byte_idx > 0 { format!("+{}", qh_byte_idx) } else { String::new() };
-                            self.emit_line(&format!("ld.global.u8 {rs1}, [{qh_b}{qh_byte_off}];"));
-                            self.emit_line(&format!("shr.b32 {rs1}, {rs1}, {qh_bit};"));
-                            self.emit_line(&format!("and.b32 {rs1}, {rs1}, 1;"));
-                            // Merge: nibble | (qh_bit << 4)
-                            self.emit_line(&format!("shl.b32 {rs1}, {rs1}, 4;"));
-                            self.emit_line(&format!("or.b32 {rs0}, {rs0}, {rs1};"));
-                            // Convert to f32 and subtract bias
-                            self.emit_line(&format!("cvt.rn.f32.u32 {d}, {rs0};  // lane {lane}"));
-                            self.emit_line(&format!("sub.rn.f32 {d}, {d}, {fs0};"));
-                        }
+                        let rs0 = self.scratch_gpr_names[0]; // qs byte_idx / qs byte / merged
+                        let rs1 = self.scratch_gpr_names[1]; // tid / is_high / qh byte
+                        let fs0 = self.scratch_vec_names[0]; // bias
+                        let oob = self.next_skip_label();
+                        let done = self.next_skip_label();
+                        self.emit_line("{");
+                        self.emit_line("  .reg .u64 %rd_q, %rd_h;");
+                        self.emit_line("  .reg .pred %p_oob, %p_hi;");
+                        self.emit_line(&format!("  mov.u32 {rs0}, %tid.x;"));
+                        self.emit_line(&format!("  setp.ge.u32 %p_oob, {rs0}, {lanes};"));
+                        self.emit_line(&format!("  @%p_oob bra OOB_{oob};"));
+                        // qs_byte_idx = tid >> 1
+                        self.emit_line(&format!("  shr.u32 {rs0}, {rs0}, 1;"));
+                        // load qs byte
+                        self.emit_line(&format!("  cvt.u64.u32 %rd_q, {rs0};"));
+                        self.emit_line(&format!("  add.u64 %rd_q, %rd_q, {qs_b};"));
+                        self.emit_line(&format!("  ld.global.u8 {rs0}, [%rd_q];"));
+                        // is_high = tid & 1
+                        self.emit_line(&format!("  mov.u32 {rs1}, %tid.x;"));
+                        self.emit_line(&format!("  and.b32 {rs1}, {rs1}, 1;"));
+                        self.emit_line(&format!("  setp.eq.u32 %p_hi, {rs1}, 1;"));
+                        self.emit_line(&format!("  @%p_hi shr.u32 {rs0}, {rs0}, 4;"));
+                        self.emit_line(&format!("  and.b32 {rs0}, {rs0}, 0xF;"));
+                        // qh_byte_idx = tid >> 8; qh_bit = tid & 7
+                        self.emit_line(&format!("  mov.u32 {rs1}, %tid.x;"));
+                        self.emit_line(&format!("  shr.u32 {rs1}, {rs1}, 8;")); // qh_byte_idx
+                        self.emit_line(&format!("  cvt.u64.u32 %rd_h, {rs1};"));
+                        self.emit_line(&format!("  add.u64 %rd_h, %rd_h, {qh_b};"));
+                        self.emit_line(&format!("  ld.global.u8 {rs1}, [%rd_h];")); // qh byte
+                        // qh_bit = tid & 7
+                        self.emit_line(&format!("  mov.u32 {fs0}, %tid.x;"));
+                        // 借用 fs0 的 u32 位作临时 (PTX 允许 .b32 重解释 mov.u32)
+                        // 为避免污染 f32 bias, 用 rs1 的位先存 qh_bit: 改用 %r_tmp
+                        self.emit_line("  .reg .u32 %r_qhbit, %r_qhval;");
+                        self.emit_line("  mov.u32 %r_qhbit, %tid.x;");
+                        self.emit_line("  and.b32 %r_qhbit, %r_qhbit, 7;");
+                        self.emit_line("  shr.u32 {rs1}, {rs1}, %r_qhbit;");
+                        self.emit_line("  and.b32 %r_qhval, {rs1}, 1;");
+                        // merge: nibble | (qh_bit << 4)
+                        self.emit_line("  shl.b32 %r_qhval, %r_qhval, 4;");
+                        self.emit_line(&format!("  or.b32 {rs0}, {rs0}, %r_qhval;"));
+                        self.emit_line(&format!("  cvt.rn.f32.u32 {d}, {rs0};"));
+                        self.emit_line(&format!("  mov.u32 {rs0}, {bias_bits};"));
+                        self.emit_line(&format!("  mov.f32 {fs0}, {rs0};"));
+                        self.emit_line(&format!("  sub.rn.f32 {d}, {d}, {fs0};"));
+                        self.emit_line(&format!("  bra DONE_{done};"));
+                        self.emit_line(&format!("OOB_{oob}:"));
+                        self.emit_line(&format!("  mov.f32 {d}, 0f00000000;"));
+                        self.emit_line(&format!("DONE_{done}:"));
+                        self.emit_line("}");
                     }
                     GpuDialect::Hip { .. } => {
                         self.emit_line("{");
                         self.emit_line(&format!("  const float _bias = {bias_bits}_f32;"));
-                        for lane in 0..lanes {
-                            let qs_byte_idx = lane / 2;
-                            let is_high = lane % 2 == 1;
-                            let qh_byte_idx = lane / 8;
-                            let qh_bit = lane % 8;
-                            let nibble_expr = if is_high {
-                                format!("(((unsigned char*)({qs_b}))[{qs_byte_idx}]) >> 4")
-                            } else {
-                                format!("(((unsigned char*)({qs_b}))[{qs_byte_idx}]) & 0xF")
-                            };
-                            let qh_expr = format!("((((unsigned char*)({qh_b}))[{qh_byte_idx}]) >> {qh_bit}) & 1");
-                            self.emit_line(&format!("  {d} = (float)({nibble_expr} | ({qh_expr} << 4)) - _bias;  // lane {lane}"));
-                        }
+                        self.emit_line(&format!("  const unsigned char* _qs = (const unsigned char*)({qs_b});"));
+                        self.emit_line(&format!("  const unsigned char* _qh = (const unsigned char*)({qh_b});"));
+                        self.emit_line("  unsigned int _t = (unsigned int)threadIdx.x;");
+                        self.emit_line(&format!("  if (_t < {lanes}) {{"));
+                        self.emit_line("    unsigned int _qbi = _t >> 1;");
+                        self.emit_line("    unsigned int _hi = _t & 1u;");
+                        self.emit_line("    unsigned char _qb = _qs[_qbi];");
+                        self.emit_line("    int _nib = (int)(_hi ? ((_qb >> 4) & 0xF) : (_qb & 0xF));");
+                        self.emit_line("    unsigned int _hbi = _t >> 8;");
+                        self.emit_line("    unsigned int _hbit = _t & 7u;");
+                        self.emit_line("    int _qhv = (int)((_qh[_hbi] >> _hbit) & 1u);");
+                        self.emit_line(&format!("    {d} = (float)(_nib | (_qhv << 4)) - _bias;"));
+                        self.emit_line("  } else {");
+                        self.emit_line(&format!("    {d} = 0.0f;"));
+                        self.emit_line("  }");
                         self.emit_line("}");
                     }
                     GpuDialect::Metal { .. } => {
                         self.emit_line("{");
                         self.emit_line(&format!("  constant float _bias = {bias_bits}_f32;"));
-                        for lane in 0..lanes {
-                            let qs_byte_idx = lane / 2;
-                            let is_high = lane % 2 == 1;
-                            let qh_byte_idx = lane / 8;
-                            let qh_bit = lane % 8;
-                            let nibble_expr = if is_high {
-                                format!("(((device unsigned char*)({qs_b}))[{qs_byte_idx}]) >> 4")
-                            } else {
-                                format!("(((device unsigned char*)({qs_b}))[{qs_byte_idx}]) & 0xF")
-                            };
-                            let qh_expr = format!("((((device unsigned char*)({qh_b}))[{qh_byte_idx}]) >> {qh_bit}) & 1");
-                            self.emit_line(&format!("  {d} = (float)({nibble_expr} | ({qh_expr} << 4)) - _bias;  // lane {lane}"));
-                        }
+                        self.emit_line(&format!("  const device unsigned char* _qs = (const device unsigned char*)({qs_b});"));
+                        self.emit_line(&format!("  const device unsigned char* _qh = (const device unsigned char*)({qh_b});"));
+                        self.emit_line("  unsigned int _t = (unsigned int)thread_position_in_threadgroup.x;");
+                        self.emit_line(&format!("  if (_t < {lanes}) {{"));
+                        self.emit_line("    unsigned int _qbi = _t >> 1;");
+                        self.emit_line("    unsigned int _hi = _t & 1u;");
+                        self.emit_line("    unsigned char _qb = _qs[_qbi];");
+                        self.emit_line("    int _nib = (int)(_hi ? ((_qb >> 4) & 0xF) : (_qb & 0xF));");
+                        self.emit_line("    unsigned int _hbi = _t >> 8;");
+                        self.emit_line("    unsigned int _hbit = _t & 7u;");
+                        self.emit_line("    int _qhv = (int)((_qh[_hbi] >> _hbit) & 1u);");
+                        self.emit_line(&format!("    {d} = (float)(_nib | (_qhv << 4)) - _bias;"));
+                        self.emit_line("  } else {");
+                        self.emit_line(&format!("    {d} = 0.0f;"));
+                        self.emit_line("  }");
                         self.emit_line("}");
                     }
                 }
                 Ok(())
             }
             BiPlaneMode::Low6 => {
-                // GGUF Q6K: load qs (4-bit low) from qs_base + qh (2-bit high plane) from qh_base,
-                // merge: value = (nibble | (qh_2bit << 4)) - bias, convert to F32.
-                // Each qs byte has 2 nibbles, each qh byte has 4 x 2-bit values.
+                // GGUF Q6K: qs (4-bit low) + qh (2-bit high plane).
+                // GPU SIMT per-thread (BCE-20260711 根治): lane = tid.x,
+                //   qs_byte_idx = tid >> 1; is_high = tid & 1
+                //   qh_byte_idx = tid >> 2; qh_bit_shift = (tid & 3) * 2
+                //   value = (nibble | (qh_2bit << 4)) - bias → {d}
                 let d = self.reg_name_with_kind(dst, alloc);
                 let qs_b = self.reg_name_with_kind(qs_base, alloc);
                 let qh_b = self.reg_name_with_kind(extra_base, alloc);
@@ -450,69 +566,86 @@ impl GpuLower {
                 let bias_bits = f32::to_bits(bias);
                 match self.dialect {
                     GpuDialect::Ptx { .. } => {
-                        let rs0 = self.scratch_gpr_names[0]; // qs nibble
-                        let rs1 = self.scratch_gpr_names[1]; // qh 2-bit
-                        let fs0 = self.scratch_vec_names[0]; // bias f32
-                        // Load bias constant once
-                        self.emit_line(&format!("mov.u32 {rs0}, {bias_bits};"));
-                        self.emit_line(&format!("mov.f32 {fs0}, {rs0};"));
-                        for lane in 0..lanes {
-                            let qs_byte_idx = lane / 2;
-                            let is_high = lane % 2 == 1;
-                            // Load qs nibble
-                            let qs_byte_off = if qs_byte_idx > 0 { format!("+{}", qs_byte_idx) } else { String::new() };
-                            self.emit_line(&format!("ld.global.u8 {rs0}, [{qs_b}{qs_byte_off}];"));
-                            if is_high {
-                                self.emit_line(&format!("shr.b32 {rs0}, {rs0}, 4;"));
-                            }
-                            self.emit_line(&format!("and.b32 {rs0}, {rs0}, 0xF;"));
-                            // Load qh 2-bit: qh byte index = lane/4, bit position = (lane%4)*2
-                            let qh_byte_idx = lane / 4;
-                            let qh_bit_shift = (lane % 4) * 2;
-                            let qh_byte_off = if qh_byte_idx > 0 { format!("+{}", qh_byte_idx) } else { String::new() };
-                            self.emit_line(&format!("ld.global.u8 {rs1}, [{qh_b}{qh_byte_off}];"));
-                            self.emit_line(&format!("shr.b32 {rs1}, {rs1}, {qh_bit_shift};"));
-                            self.emit_line(&format!("and.b32 {rs1}, {rs1}, 3;"));
-                            // Merge: nibble | (qh_2bit << 4)
-                            self.emit_line(&format!("shl.b32 {rs1}, {rs1}, 4;"));
-                            self.emit_line(&format!("or.b32 {rs0}, {rs0}, {rs1};"));
-                            // Convert to f32 and subtract bias
-                            self.emit_line(&format!("cvt.rn.f32.u32 {d}, {rs0};  // lane {lane}"));
-                            self.emit_line(&format!("sub.rn.f32 {d}, {d}, {fs0};"));
-                        }
+                        let rs0 = self.scratch_gpr_names[0]; // qs byte_idx / qs byte / merged
+                        let rs1 = self.scratch_gpr_names[1]; // tid / qh byte / qh_2bit
+                        let fs0 = self.scratch_vec_names[0]; // bias
+                        let oob = self.next_skip_label();
+                        let done = self.next_skip_label();
+                        self.emit_line("{");
+                        self.emit_line("  .reg .u64 %rd_q, %rd_h;");
+                        self.emit_line("  .reg .pred %p_oob, %p_hi;");
+                        self.emit_line(&format!("  mov.u32 {rs0}, %tid.x;"));
+                        self.emit_line(&format!("  setp.ge.u32 %p_oob, {rs0}, {lanes};"));
+                        self.emit_line(&format!("  @%p_oob bra OOB_{oob};"));
+                        self.emit_line(&format!("  shr.u32 {rs0}, {rs0}, 1;")); // qs_byte_idx
+                        self.emit_line(&format!("  cvt.u64.u32 %rd_q, {rs0};"));
+                        self.emit_line(&format!("  add.u64 %rd_q, %rd_q, {qs_b};"));
+                        self.emit_line(&format!("  ld.global.u8 {rs0}, [%rd_q];"));
+                        self.emit_line(&format!("  mov.u32 {rs1}, %tid.x;"));
+                        self.emit_line(&format!("  and.b32 {rs1}, {rs1}, 1;"));
+                        self.emit_line(&format!("  setp.eq.u32 %p_hi, {rs1}, 1;"));
+                        self.emit_line(&format!("  @%p_hi shr.u32 {rs0}, {rs0}, 4;"));
+                        self.emit_line(&format!("  and.b32 {rs0}, {rs0}, 0xF;"));
+                        // qh_byte_idx = tid >> 2; qh_bit_shift = (tid & 3) * 2
+                        self.emit_line(&format!("  mov.u32 {rs1}, %tid.x;"));
+                        self.emit_line(&format!("  shr.u32 {rs1}, {rs1}, 2;")); // qh_byte_idx
+                        self.emit_line(&format!("  cvt.u64.u32 %rd_h, {rs1};"));
+                        self.emit_line(&format!("  add.u64 %rd_h, %rd_h, {qh_b};"));
+                        self.emit_line(&format!("  ld.global.u8 {rs1}, [%rd_h];")); // qh byte
+                        self.emit_line("  .reg .u32 %r_sh, %r_qhv;");
+                        self.emit_line("  mov.u32 %r_sh, %tid.x;");
+                        self.emit_line("  and.b32 %r_sh, %r_sh, 3;");
+                        self.emit_line("  shl.b32 %r_sh, %r_sh, 1;"); // ×2
+                        self.emit_line(&format!("  shr.u32 {rs1}, {rs1}, %r_sh;"));
+                        self.emit_line(&format!("  and.b32 %r_qhv, {rs1}, 3;"));
+                        self.emit_line("  shl.b32 %r_qhv, %r_qhv, 4;");
+                        self.emit_line(&format!("  or.b32 {rs0}, {rs0}, %r_qhv;"));
+                        self.emit_line(&format!("  cvt.rn.f32.u32 {d}, {rs0};"));
+                        self.emit_line(&format!("  mov.u32 {rs0}, {bias_bits};"));
+                        self.emit_line(&format!("  mov.f32 {fs0}, {rs0};"));
+                        self.emit_line(&format!("  sub.rn.f32 {d}, {d}, {fs0};"));
+                        self.emit_line(&format!("  bra DONE_{done};"));
+                        self.emit_line(&format!("OOB_{oob}:"));
+                        self.emit_line(&format!("  mov.f32 {d}, 0f00000000;"));
+                        self.emit_line(&format!("DONE_{done}:"));
+                        self.emit_line("}");
                     }
                     GpuDialect::Hip { .. } => {
                         self.emit_line("{");
-                        for lane in 0..lanes {
-                            let qs_byte_idx = lane / 2;
-                            let is_high = lane % 2 == 1;
-                            let qh_byte_idx = lane / 4;
-                            let qh_bit_shift = (lane % 4) * 2;
-                            let nibble_expr = if is_high {
-                                format!("(((unsigned char*)({qs_b}))[{qs_byte_idx}]) >> 4")
-                            } else {
-                                format!("(((unsigned char*)({qs_b}))[{qs_byte_idx}]) & 0xF")
-                            };
-                            let qh_expr = format!("((((unsigned char*)({qh_b}))[{qh_byte_idx}]) >> {qh_bit_shift}) & 3");
-                            self.emit_line(&format!("  {d} = (float)({nibble_expr} | ({qh_expr} << 4)) - {bias_bits}_f32;  // lane {lane}"));
-                        }
+                        self.emit_line(&format!("  const unsigned char* _qs = (const unsigned char*)({qs_b});"));
+                        self.emit_line(&format!("  const unsigned char* _qh = (const unsigned char*)({qh_b});"));
+                        self.emit_line("  unsigned int _t = (unsigned int)threadIdx.x;");
+                        self.emit_line(&format!("  if (_t < {lanes}) {{"));
+                        self.emit_line("    unsigned int _qbi = _t >> 1;");
+                        self.emit_line("    unsigned int _hi = _t & 1u;");
+                        self.emit_line("    unsigned char _qb = _qs[_qbi];");
+                        self.emit_line("    int _nib = (int)(_hi ? ((_qb >> 4) & 0xF) : (_qb & 0xF));");
+                        self.emit_line("    unsigned int _hbi = _t >> 2;");
+                        self.emit_line("    unsigned int _hsh = (_t & 3u) * 2u;");
+                        self.emit_line("    int _qh2 = (int)((_qh[_hbi] >> _hsh) & 3u);");
+                        self.emit_line(&format!("    {d} = (float)(_nib | (_qh2 << 4)) - {bias_bits}_f32;"));
+                        self.emit_line("  } else {");
+                        self.emit_line(&format!("    {d} = 0.0f;"));
+                        self.emit_line("  }");
                         self.emit_line("}");
                     }
                     GpuDialect::Metal { .. } => {
                         self.emit_line("{");
-                        for lane in 0..lanes {
-                            let qs_byte_idx = lane / 2;
-                            let is_high = lane % 2 == 1;
-                            let qh_byte_idx = lane / 4;
-                            let qh_bit_shift = (lane % 4) * 2;
-                            let nibble_expr = if is_high {
-                                format!("(((device unsigned char*)({qs_b}))[{qs_byte_idx}]) >> 4")
-                            } else {
-                                format!("(((device unsigned char*)({qs_b}))[{qs_byte_idx}]) & 0xF")
-                            };
-                            let qh_expr = format!("((((device unsigned char*)({qh_b}))[{qh_byte_idx}]) >> {qh_bit_shift}) & 3");
-                            self.emit_line(&format!("  {d} = (float)({nibble_expr} | ({qh_expr} << 4)) - {bias_bits}_f32;  // lane {lane}"));
-                        }
+                        self.emit_line(&format!("  const device unsigned char* _qs = (const device unsigned char*)({qs_b});"));
+                        self.emit_line(&format!("  const device unsigned char* _qh = (const device unsigned char*)({qh_b});"));
+                        self.emit_line("  unsigned int _t = (unsigned int)thread_position_in_threadgroup.x;");
+                        self.emit_line(&format!("  if (_t < {lanes}) {{"));
+                        self.emit_line("    unsigned int _qbi = _t >> 1;");
+                        self.emit_line("    unsigned int _hi = _t & 1u;");
+                        self.emit_line("    unsigned char _qb = _qs[_qbi];");
+                        self.emit_line("    int _nib = (int)(_hi ? ((_qb >> 4) & 0xF) : (_qb & 0xF));");
+                        self.emit_line("    unsigned int _hbi = _t >> 2;");
+                        self.emit_line("    unsigned int _hsh = (_t & 3u) * 2u;");
+                        self.emit_line("    int _qh2 = (int)((_qh[_hbi] >> _hsh) & 3u);");
+                        self.emit_line(&format!("    {d} = (float)(_nib | (_qh2 << 4)) - {bias_bits}_f32;"));
+                        self.emit_line("  } else {");
+                        self.emit_line(&format!("    {d} = 0.0f;"));
+                        self.emit_line("  }");
                         self.emit_line("}");
                     }
                 }
@@ -520,8 +653,10 @@ impl GpuLower {
             }
             BiPlaneMode::Q3Merge => {
                 // Q3K 3-bit: qs(2-bit) + hmask(1-bit) merge.
-                // Each byte has 4 × 2-bit qs values, each byte has 8 × 1-bit hmask values.
-                // Merged value = qs_2bit | (hmask_bit << 2)
+                // GPU SIMT per-thread (BCE-20260711 根治): lane = tid.x,
+                //   qs_byte_idx = tid >> 2; qs_bit_shift = (tid & 3) * 2
+                //   hmask_byte_idx = tid >> 8; hmask_bit = tid & 7
+                //   value = (qs_2bit | (hmask_bit << 2)) - bias → {d}
                 let d = self.reg_name_with_kind(dst, alloc);
                 let qs_b = self.reg_name_with_kind(qs_base, alloc);
                 let hmask_b = self.reg_name_with_kind(extra_base, alloc);
@@ -529,59 +664,85 @@ impl GpuLower {
                 let bias_bits = f32::to_bits(bias);
                 match self.dialect {
                     GpuDialect::Ptx { .. } => {
-                        let rs0 = self.scratch_gpr_names[0]; // qs 2-bit
-                        let rs1 = self.scratch_gpr_names[1]; // hmask bit
-                        let fs0 = self.scratch_vec_names[0]; // bias f32
-                        // Load bias constant once
-                        self.emit_line(&format!("mov.u32 {rs0}, {bias_bits};"));
-                        self.emit_line(&format!("mov.f32 {fs0}, {rs0};"));
-                        for lane in 0..lanes {
-                            // qs 2-bit: byte[lane/4], shift = (lane%4)*2
-                            let qs_byte_idx = lane / 4;
-                            let qs_bit_shift = (lane % 4) * 2;
-                            let qs_byte_off = if qs_byte_idx > 0 { format!("+{}", qs_byte_idx) } else { String::new() };
-                            self.emit_line(&format!("ld.global.u8 {rs0}, [{qs_b}{qs_byte_off}];"));
-                            self.emit_line(&format!("shr.b32 {rs0}, {rs0}, {qs_bit_shift};"));
-                            self.emit_line(&format!("and.b32 {rs0}, {rs0}, 3;"));
-                            // hmask bit: byte[lane/8], shift = lane%8
-                            let hmask_byte_idx = lane / 8;
-                            let hmask_bit = lane % 8;
-                            let hmask_byte_off = if hmask_byte_idx > 0 { format!("+{}", hmask_byte_idx) } else { String::new() };
-                            self.emit_line(&format!("ld.global.u8 {rs1}, [{hmask_b}{hmask_byte_off}];"));
-                            self.emit_line(&format!("shr.b32 {rs1}, {rs1}, {hmask_bit};"));
-                            self.emit_line(&format!("and.b32 {rs1}, {rs1}, 1;"));
-                            // Merge: qs_2bit | (hmask_bit << 2)
-                            self.emit_line(&format!("shl.b32 {rs1}, {rs1}, 2;"));
-                            self.emit_line(&format!("or.b32 {rs0}, {rs0}, {rs1};"));
-                            // Convert and subtract bias
-                            self.emit_line(&format!("cvt.rn.f32.u32 {d}, {rs0};  // lane {lane}"));
-                            self.emit_line(&format!("sub.rn.f32 {d}, {d}, {fs0};"));
-                        }
+                        let rs0 = self.scratch_gpr_names[0]; // qs byte_idx / qs byte / merged
+                        let rs1 = self.scratch_gpr_names[1]; // tid / hmask byte / hmask_bit
+                        let fs0 = self.scratch_vec_names[0]; // bias
+                        let oob = self.next_skip_label();
+                        let done = self.next_skip_label();
+                        self.emit_line("{");
+                        self.emit_line("  .reg .u64 %rd_q, %rd_h;");
+                        self.emit_line("  .reg .pred %p_oob;");
+                        self.emit_line(&format!("  mov.u32 {rs0}, %tid.x;"));
+                        self.emit_line(&format!("  setp.ge.u32 %p_oob, {rs0}, {lanes};"));
+                        self.emit_line(&format!("  @%p_oob bra OOB_{oob};"));
+                        self.emit_line(&format!("  shr.u32 {rs0}, {rs0}, 2;")); // qs_byte_idx
+                        self.emit_line(&format!("  cvt.u64.u32 %rd_q, {rs0};"));
+                        self.emit_line(&format!("  add.u64 %rd_q, %rd_q, {qs_b};"));
+                        self.emit_line(&format!("  ld.global.u8 {rs0}, [%rd_q];"));
+                        // qs_bit_shift = (tid & 3) * 2
+                        self.emit_line("  .reg .u32 %r_sh;");
+                        self.emit_line("  mov.u32 %r_sh, %tid.x;");
+                        self.emit_line("  and.b32 %r_sh, %r_sh, 3;");
+                        self.emit_line("  shl.b32 %r_sh, %r_sh, 1;");
+                        self.emit_line(&format!("  shr.u32 {rs0}, {rs0}, %r_sh;"));
+                        self.emit_line(&format!("  and.b32 {rs0}, {rs0}, 3;"));
+                        // hmask_byte_idx = tid >> 8; hmask_bit = tid & 7
+                        self.emit_line(&format!("  mov.u32 {rs1}, %tid.x;"));
+                        self.emit_line(&format!("  shr.u32 {rs1}, {rs1}, 8;"));
+                        self.emit_line(&format!("  cvt.u64.u32 %rd_h, {rs1};"));
+                        self.emit_line(&format!("  add.u64 %rd_h, %rd_h, {hmask_b};"));
+                        self.emit_line(&format!("  ld.global.u8 {rs1}, [%rd_h];"));
+                        self.emit_line("  mov.u32 %r_sh, %tid.x;");
+                        self.emit_line("  and.b32 %r_sh, %r_sh, 7;");
+                        self.emit_line(&format!("  shr.u32 {rs1}, {rs1}, %r_sh;"));
+                        self.emit_line("  .reg .u32 %r_hv;");
+                        self.emit_line("  and.b32 %r_hv, {rs1}, 1;");
+                        self.emit_line("  shl.b32 %r_hv, %r_hv, 2;");
+                        self.emit_line(&format!("  or.b32 {rs0}, {rs0}, %r_hv;"));
+                        self.emit_line(&format!("  cvt.rn.f32.u32 {d}, {rs0};"));
+                        self.emit_line(&format!("  mov.u32 {rs0}, {bias_bits};"));
+                        self.emit_line(&format!("  mov.f32 {fs0}, {rs0};"));
+                        self.emit_line(&format!("  sub.rn.f32 {d}, {d}, {fs0};"));
+                        self.emit_line(&format!("  bra DONE_{done};"));
+                        self.emit_line(&format!("OOB_{oob}:"));
+                        self.emit_line(&format!("  mov.f32 {d}, 0f00000000;"));
+                        self.emit_line(&format!("DONE_{done}:"));
+                        self.emit_line("}");
                     }
                     GpuDialect::Hip { .. } => {
                         self.emit_line("{");
-                        for lane in 0..lanes {
-                            let qs_byte_idx = lane / 4;
-                            let qs_bit_shift = (lane % 4) * 2;
-                            let hmask_byte_idx = lane / 8;
-                            let hmask_bit = lane % 8;
-                            let qs_expr = format!("((((unsigned char*)({qs_b}))[{qs_byte_idx}]) >> {qs_bit_shift}) & 3");
-                            let hmask_expr = format!("((((unsigned char*)({hmask_b}))[{hmask_byte_idx}]) >> {hmask_bit}) & 1");
-                            self.emit_line(&format!("  {d} = (float)({qs_expr} | ({hmask_expr} << 2)) - {bias_bits}_f32;  // lane {lane}"));
-                        }
+                        self.emit_line(&format!("  const unsigned char* _qs = (const unsigned char*)({qs_b});"));
+                        self.emit_line(&format!("  const unsigned char* _hm = (const unsigned char*)({hmask_b});"));
+                        self.emit_line("  unsigned int _t = (unsigned int)threadIdx.x;");
+                        self.emit_line(&format!("  if (_t < {lanes}) {{"));
+                        self.emit_line("    unsigned int _qbi = _t >> 2;");
+                        self.emit_line("    unsigned int _qsh = (_t & 3u) * 2u;");
+                        self.emit_line("    int _qs2 = (int)((_qs[_qbi] >> _qsh) & 3u);");
+                        self.emit_line("    unsigned int _hbi = _t >> 8;");
+                        self.emit_line("    unsigned int _hbit = _t & 7u;");
+                        self.emit_line("    int _hv = (int)((_hm[_hbi] >> _hbit) & 1u);");
+                        self.emit_line(&format!("    {d} = (float)(_qs2 | (_hv << 2)) - {bias_bits}_f32;"));
+                        self.emit_line("  } else {");
+                        self.emit_line(&format!("    {d} = 0.0f;"));
+                        self.emit_line("  }");
                         self.emit_line("}");
                     }
                     GpuDialect::Metal { .. } => {
                         self.emit_line("{");
-                        for lane in 0..lanes {
-                            let qs_byte_idx = lane / 4;
-                            let qs_bit_shift = (lane % 4) * 2;
-                            let hmask_byte_idx = lane / 8;
-                            let hmask_bit = lane % 8;
-                            let qs_expr = format!("((((device unsigned char*)({qs_b}))[{qs_byte_idx}]) >> {qs_bit_shift}) & 3");
-                            let hmask_expr = format!("((((device unsigned char*)({hmask_b}))[{hmask_byte_idx}]) >> {hmask_bit}) & 1");
-                            self.emit_line(&format!("  {d} = (float)({qs_expr} | ({hmask_expr} << 2)) - {bias_bits}_f32;  // lane {lane}"));
-                        }
+                        self.emit_line(&format!("  const device unsigned char* _qs = (const device unsigned char*)({qs_b});"));
+                        self.emit_line(&format!("  const device unsigned char* _hm = (const device unsigned char*)({hmask_b});"));
+                        self.emit_line("  unsigned int _t = (unsigned int)thread_position_in_threadgroup.x;");
+                        self.emit_line(&format!("  if (_t < {lanes}) {{"));
+                        self.emit_line("    unsigned int _qbi = _t >> 2;");
+                        self.emit_line("    unsigned int _qsh = (_t & 3u) * 2u;");
+                        self.emit_line("    int _qs2 = (int)((_qs[_qbi] >> _qsh) & 3u);");
+                        self.emit_line("    unsigned int _hbi = _t >> 8;");
+                        self.emit_line("    unsigned int _hbit = _t & 7u;");
+                        self.emit_line("    int _hv = (int)((_hm[_hbi] >> _hbit) & 1u);");
+                        self.emit_line(&format!("    {d} = (float)(_qs2 | (_hv << 2)) - {bias_bits}_f32;"));
+                        self.emit_line("  } else {");
+                        self.emit_line(&format!("    {d} = 0.0f;"));
+                        self.emit_line("  }");
                         self.emit_line("}");
                     }
                 }
@@ -590,4 +751,3 @@ impl GpuLower {
         }
     }
 }
-
