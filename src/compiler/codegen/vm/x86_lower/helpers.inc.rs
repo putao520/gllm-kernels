@@ -6,16 +6,23 @@ impl X86Lower {
     pub fn with_avx512(use_avx512: bool) -> Self {
         use crate::dispatch::device_profile::DeviceProfile;
         let dp = DeviceProfile::detect();
-        // NO-HW-DEGRADATION: 探测 AVX-512 FP16 (vfmadd231ph) 能力,供 FP16 dot 原生指令选择。
-        let has_avx512fp16 = matches!(
-            crate::compiler::hardware_profile::HardwareProfile::detect(&dp).platform(),
-            crate::compiler::codegen::vm::isa_profile::Platform::X86_64 { has_avx512fp16: true, .. }
-        );
+        // NO-HW-DEGRADATION / NO-SILENT-FALLBACK: 探测 AVX-512 独立特性子集
+        // (BF16 / VNNI / FP16),这些是独立硬件特性,非 AVX-512 子集,须各自独立探测。
+        // Ice Lake / Tiger Lake 有 AVX-512 但无 BF16/VNNI → 必须 fallback/Err。
+        let platform = crate::compiler::hardware_profile::HardwareProfile::detect(&dp).platform();
+        let (has_avx512fp16, has_bf16, has_vnni) = match platform {
+            crate::compiler::codegen::vm::isa_profile::Platform::X86_64 {
+                has_avx512fp16, has_bf16, has_vnni, ..
+            } => (has_avx512fp16, has_bf16, has_vnni),
+            _ => (false, false, false),
+        };
         let jit_ctx = crate::compiler::jit_context::JitContext::from_device_profile(&dp);
         Self {
             asm: CodeAssembler::new(64).expect("64-bit"),
             use_avx512,
             has_avx512fp16,
+            has_bf16,
+            has_vnni,
             const_pool: Vec::new(),
             loop_stack: Vec::new(),
             scope_saves: Vec::new(),
@@ -93,6 +100,23 @@ impl X86Lower {
     /// 禁止软件 FMA 降级。compile.inc.rs 在构造时调用,覆写 with_avx512 的运行时探测默认值。
     pub fn set_has_avx512fp16(&mut self, has_avx512fp16: bool) {
         self.has_avx512fp16 = has_avx512fp16;
+    }
+
+    /// 从 Platform::X86_64 { has_bf16, .. } 注入 AVX-512 BF16 探测结果。
+    /// NO-SILENT-FALLBACK + NO-HW-DEGRADATION: has_bf16=true 时 BF16 store/narrow 必走
+    /// vcvtneps2bf16 原生指令; has_bf16=false (Ice Lake/Tiger Lake 等) 时降级到 AVX2 软件序列,
+    /// 禁止 emit vcvtneps2bf16 (会 SIGILL)。compile.inc.rs 在构造时调用,
+    /// 覆写 with_avx512 的运行时探测默认值。
+    pub fn set_has_bf16(&mut self, has_bf16: bool) {
+        self.has_bf16 = has_bf16;
+    }
+
+    /// 从 Platform::X86_64 { has_vnni, .. } 注入 AVX-512 VNNI 探测结果。
+    /// NO-SILENT-FALLBACK: has_vnni=true 时 INT8/Int4x8 dot 必走 vpdpbusd 原生指令;
+    /// has_vnni=false 时返回 Err (无 VNNI 不能做 INT8 dot, 无替代路径)。
+    /// compile.inc.rs 在构造时调用,覆写 with_avx512 的运行时探测默认值。
+    pub fn set_has_vnni(&mut self, has_vnni: bool) {
+        self.has_vnni = has_vnni;
     }
 
     /// 返回指定索引的 scratch YMM 寄存器。

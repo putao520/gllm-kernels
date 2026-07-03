@@ -460,8 +460,11 @@ impl X86Lower {
                         // AVX-512 BF16 (Cooper Lake / Sapphire Rapids+): vcvtneps2bf16 原生指令。
                         // AVX2 (i9-10900KF / CometLake 等，无原生 BF16 指令): 向量化软件序列。
                         //   两条路径都是各自硬件上的最优实现，无"降级"语义 (CR-TIER-SOVEREIGNTY-002)。
+                        // BCE-20260704-X86-BF16-VNNI-GUARD: BF16 是独立硬件特性,非 AVX-512 子集。
+                        //   Ice Lake / Tiger Lake 有 AVX-512 但无 BF16 → 必须走 AVX2 软件序列,
+                        //   emit vcvtneps2bf16 会 SIGILL。守卫条件 use_avx512 && has_bf16。
                         // @trace REQ-HW-TIER-004 [req:BF16-Store-HardwareAware] BF16 store 按硬件能力路由: AVX-512 原生 / AVX2 软件
-                        if self.use_avx512 {
+                        if self.use_avx512 && self.has_bf16 {
                             match width {
                                 SimdWidth::W512 => {
                                     // zmm(16×F32) → vcvtneps2bf16 → ymm(16×BF16) → store 32 bytes
@@ -584,7 +587,8 @@ impl X86Lower {
                             }
                         }
                         crate::compiler::trace::DTypeKind::BF16 => {
-                            if self.use_avx512 {
+                            // BCE-20260704-X86-BF16-VNNI-GUARD: BF16 独立特性,守卫 use_avx512 && has_bf16。
+                            if self.use_avx512 && self.has_bf16 {
                                 match width {
                                     SimdWidth::W512 => {
                                         let (s, _) = self.resolve_zmm_or_spill(*src, alloc, 0)?;
@@ -1998,32 +2002,40 @@ impl X86Lower {
 
                     DotDtype::Int8 => {
                         // VPDPBUSD acc, a, b (VNNI: int32 += u8_a · s8_b)
-                        if self.use_avx512 {
+                        // BCE-20260704-X86-BF16-VNNI-GUARD: VNNI 是独立特性,非 AVX-512 子集。
+                        //   Ice Lake/Tiger Lake 有 AVX-512 但无 VNNI → emit vpdpbusd 会 SIGILL。
+                        //   无 VNNI 时 INT8 dot 无替代路径 → Err (NO-SILENT-FALLBACK)。
+                        if self.use_avx512 && self.has_vnni {
                             let (acc_zmm, acc_spilled) = self.resolve_zmm_or_spill_write(*acc, alloc, 0)?;
                             let (a_zmm, _) = self.resolve_zmm_or_spill(*a, alloc, 1)?;
                             let (b_zmm, _) = self.resolve_zmm_or_spill(*b, alloc, 2)?;
                             self.asm.vpdpbusd(acc_zmm, a_zmm, b_zmm).map_err(Self::err)?;
                             if acc_spilled { self.spill_store_zmm(*acc, alloc, 0)?; }
                         } else {
-                            return Err(CompilerError::CodegenViolation(
-                                "DotProduct(Int8) requires AVX-512 VNNI (VPDPBUSD) support".into()
-                            ));
+                            return Err(CompilerError::CodegenViolation(format!(
+                                "DotProduct(Int8) requires AVX-512 VNNI (VPDPBUSD) support; \
+                                 use_avx512={}, has_vnni={} — platform lacks VNNI, no fallback path",
+                                self.use_avx512, self.has_vnni,
+                            )));
                         }
                         Ok(())
                     }
 
                     DotDtype::Int4x8 => {
                         // Nibble unpack done by emit_unpack_weight; here VPDPBUSD on unpacked int8
-                        if self.use_avx512 {
+                        // BCE-20260704-X86-BF16-VNNI-GUARD: 同 Int8,守卫 use_avx512 && has_vnni。
+                        if self.use_avx512 && self.has_vnni {
                             let (acc_zmm, acc_spilled) = self.resolve_zmm_or_spill_write(*acc, alloc, 0)?;
                             let (a_zmm, _) = self.resolve_zmm_or_spill(*a, alloc, 1)?;
                             let (b_zmm, _) = self.resolve_zmm_or_spill(*b, alloc, 2)?;
                             self.asm.vpdpbusd(acc_zmm, a_zmm, b_zmm).map_err(Self::err)?;
                             if acc_spilled { self.spill_store_zmm(*acc, alloc, 0)?; }
                         } else {
-                            return Err(CompilerError::CodegenViolation(
-                                "DotProduct(Int4x8) requires AVX-512 VNNI (VPDPBUSD) support".into()
-                            ));
+                            return Err(CompilerError::CodegenViolation(format!(
+                                "DotProduct(Int4x8) requires AVX-512 VNNI (VPDPBUSD) support; \
+                                 use_avx512={}, has_vnni={} — platform lacks VNNI, no fallback path",
+                                self.use_avx512, self.has_vnni,
+                            )));
                         }
                         Ok(())
                     }

@@ -78,6 +78,15 @@ pub struct X86Lower {
     /// AVX-512 FP16 (vfmadd231ph) 探测结果 — NO-HW-DEGRADATION: 有 FP16 原生 FMA 必用之,
     /// 禁止软件 FMA 降级。由 Platform::X86_64 { has_avx512fp16, .. } 注入 (compile.inc.rs)。
     has_avx512fp16: bool,
+    /// AVX-512 BF16 (VDPBF16PS / VCVTNEPS2BF16) 探测结果 — NO-SILENT-FALLBACK + NO-HW-DEGRADATION:
+    /// BF16 是独立硬件特性 (Cooper Lake / Sapphire Rapids+), 非 AVX-512 子集。
+    /// Ice Lake / Tiger Lake 客户端 CPU 有 AVX-512 但无 BF16 → 必须降级到 AVX2 软件序列,
+    /// 禁止 emit vcvtneps2bf16/vdpbf16ps (会 SIGILL)。由 Platform::X86_64 { has_bf16, .. } 注入。
+    has_bf16: bool,
+    /// AVX-512 VNNI (VPDPBUSD) 探测结果 — NO-SILENT-FALLBACK: VNNI 是独立硬件特性,
+    /// 非 AVX-512 子集。无 VNNI 时 INT8 dot product 无替代路径 → 必须 Err (NO-SILENT-FALLBACK)。
+    /// 由 Platform::X86_64 { has_vnni, .. } 注入 (compile.inc.rs)。
+    has_vnni: bool,
     const_pool: Vec<([f32; 8], CodeLabel)>,
     loop_stack: Vec<(CodeLabel, CodeLabel, AsmRegister64, Option<i32>, AsmRegister64, usize, Option<i32>)>,
     scope_saves: Vec<Vec<AsmRegister64>>,

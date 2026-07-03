@@ -178,9 +178,14 @@ pub fn compile_layer_with_sym_map(
     // Stage 5: ISA Lower — 根据 profile.platform 分派到对应 backend
     // ARCH-CODEGEN-DISPATCH: X86_64 → X86Lower, AArch64 → AArch64Lower, GPU → GpuLower
     let (code, format) = match &profile.platform {
-        super::isa_profile::Platform::X86_64 { has_avx512, has_avx512fp16, .. } => {
+        super::isa_profile::Platform::X86_64 { has_avx512, has_avx512fp16, has_bf16, has_vnni, .. } => {
             let mut lowerer = X86Lower::with_sym_map(*has_avx512, sym_map.clone());
             lowerer.set_has_avx512fp16(*has_avx512fp16);
+            // NO-SILENT-FALLBACK + NO-HW-DEGRADATION: BF16/VNNI 是独立硬件特性,非 AVX-512 子集。
+            // 注入 has_bf16/has_vnni 供 codegen 守卫 vcvtneps2bf16/vpdpbusd (Ice Lake/Tiger Lake
+            // 有 AVX-512 但无 BF16/VNNI,emit 这些指令会 SIGILL)。
+            lowerer.set_has_bf16(*has_bf16);
+            lowerer.set_has_vnni(*has_vnni);
             lowerer.set_scratch_gprs(&profile.scratch_gprs)?;
             lowerer.set_scratch_vec_regs(&profile.scratch_vec_regs)?;
             lowerer.precompute_zero_vregs(&program);

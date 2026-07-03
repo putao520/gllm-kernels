@@ -708,6 +708,13 @@ impl InferenceCompiler {
                 _ => false,
             };
             let mut lowerer = X86Lower::with_sym_map(has_avx512, sym_slot_map);
+            // NO-SILENT-FALLBACK + NO-HW-DEGRADATION: 注入 BF16/VNNI 独立特性标志,
+            // 供 codegen 守卫 vcvtneps2bf16/vpdpbusd (非 AVX-512 子集,缺失会 SIGILL)。
+            if let codegen::vm::isa_profile::Platform::X86_64 { has_avx512fp16, has_bf16, has_vnni, .. } = &profile.platform {
+                lowerer.set_has_avx512fp16(*has_avx512fp16);
+                lowerer.set_has_bf16(*has_bf16);
+                lowerer.set_has_vnni(*has_vnni);
+            }
             lowerer.set_scratch_gprs(&profile.scratch_gprs)
                 .map_err(InferenceError::CompileError)?;
             lowerer.set_scratch_vec_regs(&profile.scratch_vec_regs)

@@ -1021,7 +1021,10 @@ impl HwOptEngine {
         if kc.use_avx512 && profile.isa == crate::dispatch::device_profile::IsaLevel::Avx512 {
             candidates.push(GemmMicrokernelStrategy::BlisAvx512);
         }
-        if kc.use_avx512 {
+        // BCE-20260704-X86-BF16-VNNI-GUARD: BF16 是独立硬件特性,非 AVX-512 子集。
+        // Ice Lake/Tiger Lake 有 AVX-512 但无 BF16 → 选 Avx512NativeBf16 会 emit
+        // vcvtneps2bf16/vdpbf16ps → SIGILL。守卫 use_avx512 && has_bf16。
+        if kc.use_avx512 && kc.has_bf16 {
             candidates.push(GemmMicrokernelStrategy::Avx512NativeBf16);
         }
         candidates.push(GemmMicrokernelStrategy::BlisAvx2);

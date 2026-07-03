@@ -627,8 +627,11 @@ mod tests {
 
     #[test]
     fn bf16_avx512_store_emits_native_vcvtneps2bf16() {
-        // CR-TIER-SOVEREIGNTY-004: AVX-512 路径必须 emit vcvtneps2bf16 (原生指令)，
+        // CR-TIER-SOVEREIGNTY-004: AVX-512 BF16 路径必须 emit vcvtneps2bf16 (原生指令)，
         // 而非 vpsrld+vpackusdw (那是 AVX2 软件序列)。
+        // BCE-20260704-X86-BF16-VNNI-GUARD: 显式 set_has_bf16(true) 模拟 Cooper Lake/SPR+
+        // (有 AVX-512 + BF16)。本机无 BF16 时, has_bf16=false 会走 AVX2 软件路径, 本测试
+        // 不再适用 — 改测 has_bf16=false 走软件路径 (bf16_avx512_without_bf16_emits_software_path)。
         let prog = build_bf16_store_prog();
         let dp = DeviceProfile::detect();
         let profile = IsaProfile::from_device_profile(&dp);
@@ -636,6 +639,7 @@ mod tests {
         let frame = super::super::stack_frame::StackFrame::compute(&alloc, &profile, 0);
 
         let mut lower = X86Lower::with_avx512(true);
+        lower.set_has_bf16(true);
         lower.emit_prologue(&frame, &alloc).unwrap();
         for instr in &prog.instrs {
             lower.lower_instr(instr, &alloc).unwrap();
@@ -646,6 +650,34 @@ mod tests {
         let mnemonics = disasm_mnemonics(&code);
         assert!(mnemonics.contains(&"vcvtneps2bf16"),
             "AVX-512 BF16 store must emit vcvtneps2bf16, got: {:?}", mnemonics);
+    }
+
+    #[test]
+    fn bf16_avx512_without_bf16_emits_software_path() {
+        // BCE-20260704-X86-BF16-VNNI-GUARD: AVX-512 但无 BF16 (Ice Lake/Tiger Lake) 必须
+        // fallback 到 AVX2 软件序列, 禁止 emit vcvtneps2bf16 (会 SIGILL)。
+        let prog = build_bf16_store_prog();
+        let dp = DeviceProfile::detect();
+        let profile = IsaProfile::from_device_profile(&dp);
+        let alloc = RegAllocator::new(&profile).allocate(&prog).unwrap();
+        let frame = super::super::stack_frame::StackFrame::compute(&alloc, &profile, 0);
+
+        let mut lower = X86Lower::with_avx512(true);
+        lower.set_has_bf16(false); // 模拟 Ice Lake/Tiger Lake (AVX-512 但无 BF16)
+        lower.emit_prologue(&frame, &alloc).unwrap();
+        for instr in &prog.instrs {
+            lower.lower_instr(instr, &alloc).unwrap();
+        }
+        lower.emit_epilogue(&frame, &alloc).unwrap();
+        let code = lower.finalize().unwrap();
+
+        let mnemonics = disasm_mnemonics(&code);
+        assert!(!mnemonics.contains(&"vcvtneps2bf16"),
+            "AVX-512 without BF16 must NOT emit vcvtneps2bf16 (SIGILL on Ice Lake/Tiger Lake), got: {:?}",
+            mnemonics);
+        assert!(mnemonics.contains(&"vpsrld") || mnemonics.contains(&"vpackusdw"),
+            "AVX-512 without BF16 must emit AVX2 software sequence (vpsrld/vpackusdw), got: {:?}",
+            mnemonics);
     }
 
     /// F32→BF16 RNE (round-to-nearest-even) 标量参考实现。
