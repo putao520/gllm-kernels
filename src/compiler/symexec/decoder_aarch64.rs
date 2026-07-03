@@ -986,7 +986,7 @@ pub fn analyze_scalar_fn_structured(
     sig: &ScalarFnSignature,
 ) -> Result<Option<super::loop_analyzer::MultiPassAnalysis>, SymExecError> {
     use super::cfg::find_loops;
-    use super::loop_analyzer::{analyze_single_loop, analyze_nested_loops, combine_passes};
+    use super::loop_analyzer::{analyze_single_loop, analyze_nested_loops, combine_passes_with_sig};
 
     if fn_ptr.is_null() {
         return Err(SymExecError::DisassemblyFailed("null function pointer".into()));
@@ -1032,7 +1032,9 @@ pub fn analyze_scalar_fn_structured(
         return Ok(None);
     }
 
-    let pattern = match combine_passes(&traces) {
+    // BCE-20260704-STRUCTURED-SYMEXEC-LOOP-MISCLASSIFY: forward `sig` so the
+    // LayerNorm classifier can reject bias-less NormLike misclassifications.
+    let pattern = match combine_passes_with_sig(&traces, Some(sig)) {
         Ok(p) => p,
         Err(_) => return Ok(None),
     };

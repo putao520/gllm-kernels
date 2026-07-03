@@ -7,7 +7,9 @@
 use super::cfg::{BasicBlock, BlockId, ControlFlowGraph, LoopForest, NaturalLoop};
 use super::engine::SymbolicExecutor;
 use super::sym_value::SymValue;
-use crate::compiler::trace::{ComputePattern, ReductionSecondPass, TraceOp, ValueId};
+use crate::compiler::trace::{
+    ComputePattern, ReductionSecondPass, ScalarFnSignature, ScalarParam, TraceOp, ValueId,
+};
 use crate::types::CompilerError;
 
 // ---------------------------------------------------------------------------
@@ -177,7 +179,29 @@ pub struct MultiPassAnalysis {
 /// - 2 loops (reduce + transform) → `NormLike` (e.g., RmsNorm, L2Normalize)
 /// - 3 loops (max → exp-sum → normalize) → `Reduction` with second_pass + normalize (Softmax)
 /// - 3 loops (mean → var → normalize) → `NormLike` (LayerNorm)
+///
+/// This entry point passes no function signature to the combine stage. It exists
+/// for tests that synthesize `LoopTrace`s without a signature. Production callers
+/// (decoder) should use `combine_passes_with_sig` so the LayerNorm classifier can
+/// verify the function actually has `weight + bias` pointer parameters.
 pub fn combine_passes(traces: &[LoopTrace]) -> Result<ComputePattern, CompilerError> {
+    combine_passes_with_sig(traces, None)
+}
+
+/// Same as `combine_passes`, but forwards the scalar function signature so the
+/// LayerNorm classifier can validate that the function genuinely has the
+/// `weight + bias` pointer parameters a true LayerNorm requires.
+///
+/// BCE-20260704-STRUCTURED-SYMEXEC-LOOP-MISCLASSIFY: `combine_layer_norm`
+/// generates a transform referencing `Input(3)` (weight) and `Input(4)` (bias).
+/// A 2-logical-loop NormLike without bias (e.g. RmsNorm) can be misdetected as
+/// 3 physical loops and routed here; without signature validation it would
+/// produce a LayerNorm pattern the caller cannot satisfy. Passing the signature
+/// lets us reject such misclassifications and fall back to manual trace.
+pub fn combine_passes_with_sig(
+    traces: &[LoopTrace],
+    fn_sig: Option<&ScalarFnSignature>,
+) -> Result<ComputePattern, CompilerError> {
     if traces.is_empty() {
         return Err("no loops found — use linear symexec instead".into());
     }
@@ -204,7 +228,7 @@ pub fn combine_passes(traces: &[LoopTrace]) -> Result<ComputePattern, CompilerEr
         0 => Err("no meaningful loops after coalescing".into()),
         1 => combine_single_loop(logical[0]),
         2 => combine_two_loops(logical[0], logical[1]),
-        3 => combine_three_loops(logical[0], logical[1], logical[2]),
+        3 => combine_three_loops(logical[0], logical[1], logical[2], fn_sig),
         n => Err(format!("unsupported: {n} logical passes (expected 1-3)").into()),
     }
 }
@@ -294,6 +318,7 @@ fn combine_three_loops(
     loop1: &LoopTrace,
     loop2: &LoopTrace,
     loop3: &LoopTrace,
+    fn_sig: Option<&ScalarFnSignature>,
 ) -> Result<ComputePattern, CompilerError> {
     let r1 = loop1.reductions.first()
         .ok_or("loop 1 has no reductions")?;
@@ -307,7 +332,7 @@ fn combine_three_loops(
 
     // LayerNorm pattern: Sum (mean) → Sum (variance) → normalize
     if r1.kind == ReductionKind::Sum && r2.kind == ReductionKind::Sum {
-        return combine_layer_norm(r1, r2, loop3);
+        return combine_layer_norm(r1, r2, loop3, fn_sig);
     }
 
     Err(format!(
@@ -363,11 +388,40 @@ fn combine_softmax(
 }
 
 /// Build LayerNorm ComputePattern from 3 loop traces.
+///
+/// BCE-20260704-STRUCTURED-SYMEXEC-LOOP-MISCLASSIFY: a true LayerNorm scalar
+/// function has `weight + bias` — i.e. at least 2 `WeightPtr` parameters. A
+/// 2-logical-loop NormLike without bias (e.g. RmsNorm: `x, weight, out, n, eps`,
+/// only 1 `WeightPtr`) can be misdetected by the CFG loop analyzer as 3 physical
+/// loops (loop1 transform misreported as a reduction blocks coalescing), which
+/// routes it into this LayerNorm classifier. The resulting transform references
+/// `Input(3)` (weight) and `Input(4)` (bias); the RmsNorm caller only supplies
+/// 3 input VRegs, so `Input(3)` is out of bounds → panic.
+///
+/// Defense: when `fn_sig` is available, require ≥2 `WeightPtr` parameters
+/// (weight + bias). Otherwise reject the LayerNorm classification so the caller
+/// falls back to manual trace. When `fn_sig` is `None` (legacy/test entry),
+/// preserve prior behavior.
 fn combine_layer_norm(
     _mean_reduction: &ReductionDetected,
     _var_reduction: &ReductionDetected,
     _normalize_loop: &LoopTrace,
+    fn_sig: Option<&ScalarFnSignature>,
 ) -> Result<ComputePattern, CompilerError> {
+    if let Some(sig) = fn_sig {
+        let n_weight = sig.params.iter()
+            .filter(|p| matches!(p, ScalarParam::WeightPtr))
+            .count();
+        if n_weight < 2 {
+            return Err(format!(
+                "combine_layer_norm: function signature has {} WeightPtr, \
+                 but a true LayerNorm requires weight + bias (≥2 WeightPtr); \
+                 rejecting misclassification of a bias-less NormLike",
+                n_weight
+            ).into());
+        }
+    }
+
     // Loop 1: sum(x) → mean = sum / n
     let reduce = vec![
         TraceOp::Input(0), // [0] x (used for both mean and variance)

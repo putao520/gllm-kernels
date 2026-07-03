@@ -411,4 +411,197 @@ mod tests {
         let msg = format!("{err}");
         assert!(msg.contains("no return value"));
     }
+
+    // -----------------------------------------------------------------------
+    // BCE-20260704-STRUCTURED-SYMEXEC-LOOP-MISCLASSIFY regression tests
+    // -----------------------------------------------------------------------
+    //
+    // `scalar_rms_norm` (2 logical loops, signature: x, weight, out, n, eps —
+    // only 1 WeightPtr, no bias) was misclassified by structured CFG analysis
+    // as a 3-loop LayerNorm whose transform references Input(3) (weight) +
+    // Input(4) (bias). emit_normlike_inline only supplies 3 inputs for RmsNorm,
+    // so Input(3) was out of bounds → panic (blocked all BERT/XLM-R encoder E2E).
+    //
+    // The fix has two layers:
+    //   A. `register_with_symexec_fallback` validates the structured pattern's
+    //      max Input arity ≤ the signature's pointer-parameter count.
+    //   B. `combine_layer_norm` rejects functions lacking weight+bias (≥2
+    //      WeightPtr).
+    //
+    // These tests guard both layers.
+
+    #[test]
+    fn max_input_arity_counts_transform_inputs() {
+        // LayerNorm-style pattern: transform references Input(0..4) → arity 5.
+        let pattern = ComputePattern::NormLike {
+            reduce: vec![TraceOp::Input(0)],
+            finalize: vec![TraceOp::Input(0), TraceOp::Input(1)],
+            transform: vec![
+                TraceOp::Input(0),
+                TraceOp::Input(1),
+                TraceOp::Input(2),
+                TraceOp::Input(3),
+                TraceOp::Input(4),
+                TraceOp::Const(1e-5),
+            ],
+        };
+        assert_eq!(ScalarOpRegistry::max_input_arity(&pattern), 5);
+    }
+
+    #[test]
+    fn max_input_arity_rms_norm_pattern_within_two() {
+        // Correct RmsNorm manual-trace transform: x, scale, weight → Input(0..2),
+        // arity 3. With signature (x InputPtr, weight WeightPtr, out OutputPtr,
+        // n Dim, eps Scalar) → 3 pointer params. arity 3 ≤ 3 → accepted.
+        let pattern = ComputePattern::NormLike {
+            reduce: vec![TraceOp::Input(0)],
+            finalize: vec![TraceOp::Input(0), TraceOp::Input(1)],
+            transform: vec![
+                TraceOp::Input(0),
+                TraceOp::Input(1),
+                TraceOp::Input(2),
+                TraceOp::Mul(ValueId(0), ValueId(1)),
+                TraceOp::Mul(ValueId(2), ValueId(3)),
+            ],
+        };
+        assert_eq!(ScalarOpRegistry::max_input_arity(&pattern), 3);
+    }
+
+    #[test]
+    fn combine_layer_norm_rejects_bias_less_signature() {
+        // RmsNorm signature: x, weight, out, n, eps — only 1 WeightPtr (no bias).
+        // combine_layer_norm must reject it so the caller falls back to manual
+        // trace instead of generating a LayerNorm pattern with Input(3)/Input(4).
+        use crate::compiler::symexec::loop_analyzer::{
+            combine_passes_with_sig, AccumulatorInit, LoopTrace, ReductionDetected,
+            ReductionKind,
+        };
+        use crate::compiler::symexec::sym_value::SymValue;
+
+        let rms_sig = ScalarFnSignature {
+            fn_ptr: std::ptr::null(),
+            params: vec![
+                ScalarParam::InputPtr,
+                ScalarParam::WeightPtr,
+                ScalarParam::OutputPtr,
+                ScalarParam::Dim(0),
+                ScalarParam::Scalar(1e-5),
+            ],
+        };
+
+        let loop1 = LoopTrace {
+            loop_header: crate::compiler::symexec::cfg::BlockId(0),
+            reductions: vec![ReductionDetected {
+                register: "xmm0".into(),
+                kind: ReductionKind::Sum,
+                init: AccumulatorInit::Const(0.0),
+                body_expr: SymValue::Param(0),
+            }],
+            unknown_mutations: vec![],
+            body_block_count: 1,
+        };
+        let loop2 = LoopTrace {
+            loop_header: crate::compiler::symexec::cfg::BlockId(1),
+            reductions: vec![ReductionDetected {
+                register: "xmm1".into(),
+                kind: ReductionKind::Sum,
+                init: AccumulatorInit::Const(0.0),
+                body_expr: SymValue::Param(0),
+            }],
+            unknown_mutations: vec![],
+            body_block_count: 1,
+        };
+        let loop3 = LoopTrace {
+            loop_header: crate::compiler::symexec::cfg::BlockId(2),
+            reductions: vec![],
+            unknown_mutations: vec![],
+            body_block_count: 1,
+        };
+
+        let result = combine_passes_with_sig(&[loop1, loop2, loop3], Some(&rms_sig));
+        assert!(
+            result.is_err(),
+            "combine_layer_norm must reject a bias-less signature (RmsNorm), got {:?}",
+            result
+        );
+    }
+
+    #[test]
+    fn combine_layer_norm_accepts_true_layer_norm_signature() {
+        // LayerNorm signature: x, weight, bias, out, n, eps — 2 WeightPtr.
+        use crate::compiler::symexec::loop_analyzer::{
+            combine_passes_with_sig, AccumulatorInit, LoopTrace, ReductionDetected,
+            ReductionKind,
+        };
+        use crate::compiler::symexec::sym_value::SymValue;
+
+        let ln_sig = ScalarFnSignature {
+            fn_ptr: std::ptr::null(),
+            params: vec![
+                ScalarParam::InputPtr,
+                ScalarParam::WeightPtr,
+                ScalarParam::WeightPtr,
+                ScalarParam::OutputPtr,
+                ScalarParam::Dim(0),
+                ScalarParam::Scalar(1e-5),
+            ],
+        };
+
+        let loop1 = LoopTrace {
+            loop_header: crate::compiler::symexec::cfg::BlockId(0),
+            reductions: vec![ReductionDetected {
+                register: "xmm0".into(),
+                kind: ReductionKind::Sum,
+                init: AccumulatorInit::Const(0.0),
+                body_expr: SymValue::Param(0),
+            }],
+            unknown_mutations: vec![],
+            body_block_count: 1,
+        };
+        let loop2 = LoopTrace {
+            loop_header: crate::compiler::symexec::cfg::BlockId(1),
+            reductions: vec![ReductionDetected {
+                register: "xmm1".into(),
+                kind: ReductionKind::Sum,
+                init: AccumulatorInit::Const(0.0),
+                body_expr: SymValue::Param(0),
+            }],
+            unknown_mutations: vec![],
+            body_block_count: 1,
+        };
+        let loop3 = LoopTrace {
+            loop_header: crate::compiler::symexec::cfg::BlockId(2),
+            reductions: vec![],
+            unknown_mutations: vec![],
+            body_block_count: 1,
+        };
+
+        let pattern = combine_passes_with_sig(&[loop1, loop2, loop3], Some(&ln_sig))
+            .expect("true LayerNorm signature should be accepted");
+        assert!(
+            matches!(pattern, ComputePattern::NormLike { .. }),
+            "expected NormLike (LayerNorm), got {pattern:?}"
+        );
+    }
+
+    /// Full-path regression: after `with_defaults()`, the cached RmsNorm pattern
+    /// must not reference Input slots beyond the signature's 3 pointer params
+    /// (x InputPtr + weight WeightPtr + out OutputPtr). This catches the
+    /// release-mode misclassification where structured CFG analysis produced a
+    /// LayerNorm transform referencing Input(3)/Input(4).
+    #[test]
+    fn rms_norm_cached_pattern_input_arity_within_signature() {
+        let reg = ScalarOpRegistry::with_defaults();
+        let trace = reg.get_trace(&OpKindKey::RmsNorm)
+            .expect("RmsNorm should be registered in with_defaults");
+        let n_ptr_params = 3; // x, weight, out
+        let arity = ScalarOpRegistry::max_input_arity(&trace.pattern);
+        assert!(
+            arity <= n_ptr_params,
+            "RmsNorm cached pattern references Input({}) but signature only has {} ptr params; \
+             structured analysis likely misclassified as LayerNorm (BCE-20260704)",
+            arity.saturating_sub(1),
+            n_ptr_params
+        );
+    }
 }

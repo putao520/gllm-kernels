@@ -478,3 +478,26 @@ fixTemplate:
 - 回归测试: 9 新增 + 7 增强 (写入 tests.inc.rs)
 - BUG-KNOWLEDGE.md: 本条目
 - 状态: ✅ P0-P1 已闭环 (residual=0); GPU-009 P3 God Function 重构留后续
+
+---
+
+## BCE-20260704-STRUCTURED-SYMEXEC-LOOP-MISCLASSIFY
+
+- **patternId**: BCE-20260704-STRUCTURED-SYMEXEC-LOOP-MISCLASSIFY
+- **title**: 结构化 symexec 误分类循环数导致 NormLike pattern 错配 (RmsNorm 被分类为 LayerNorm)
+- **layer**: 范式
+- **归因时间**: 2026-07-04
+- **现象**: `e2e_embedding_safetensors` (release) 在 `norm_softmax_emit.rs:224` panic: `TraceOp::Input(3) 越界: 调用方仅提供 3 个输入 VReg`。阻塞所有 BERT/XLM-R encoder E2E。
+- **根因**: `scalar_rms_norm` (2 逻辑循环, 无 bias) 经编译器向量化后 CFG 检测到 3 物理循环 (loop1 transform 误报 reduction 阻止 coalesce), 进入 `combine_three_loops` 的 Sum→Sum 分支, 被 `combine_layer_norm` 无条件生成含 `Input(3)`/`Input(4)` (weight+bias) 的 LayerNorm pattern, 覆盖了 RmsNorm 正确的 manual trace; `emit_normlike_inline` 按 RmsNorm 只传 3 输入, transform 引用 `Input(3)` 越界 panic。
+- **根治 (A+B 组合)**:
+  - A (防御性校验): `register_with_symexec_fallback` Level 1 成功后, 校验生成 pattern 的 `max_input_arity` ≤ sig 的 ptr 参数数, 否则降级到 Level 2/3 (manual trace)。新增 helper `ScalarOpRegistry::max_input_arity(&pattern)`。
+  - B (combine 层根治): 新增 `combine_passes_with_sig(traces, Option<&ScalarFnSignature>)`, `combine_layer_norm` 接收 `Option<&ScalarFnSignature>`, 校验 sig 含 ≥2 个 `WeightPtr` (weight+bias) 才生成 LayerNorm pattern, 否则返回 Err 降级。`combine_passes(traces)` 委托 `combine_passes_with_sig(traces, None)` 保持测试兼容。decoder x86/aarch64 调用点改用 `combine_passes_with_sig(..., Some(sig))`。
+- **同类横扫**: `scalar_value_norm` / `scalar_l2_normalize` / `scalar_qk_norm` (均为 2-逻辑-循环 NormLike, 无 bias) 均受 A 防御覆盖 — structured 误分类时 pattern arity 超过 sig ptr 数 → 自动降级 manual trace。
+- **回归测试** (registry_fragments/tests.inc.rs):
+  - `max_input_arity_counts_transform_inputs` (LayerNorm arity=5)
+  - `max_input_arity_rms_norm_pattern_within_two` (RmsNorm arity=3)
+  - `combine_layer_norm_rejects_bias_less_signature` (RmsNorm sig 被拒)
+  - `combine_layer_norm_accepts_true_layer_norm_signature` (LayerNorm sig 通过)
+  - `rms_norm_cached_pattern_input_arity_within_signature` (全路径: with_defaults 后 RmsNorm cached pattern arity ≤ 3, debug+release 均通过)
+- **确认**: cargo test --lib 全过 (7029 passed, 0 failed); release 模式 RmsNorm structured 返回 None (降级 manual trace, 不再 panic)。residual=0。
+- **SPEC criterion**: REQ-AIS-007 (ScalarOpRegistry) + REQ-AIS-002 (ComputePattern) — structured symexec 生成的 pattern Input arity 不得超过 scalar fn signature 的 ptr 参数数; combine_layer_norm 必须校验 fn_sig 含 weight+bias。

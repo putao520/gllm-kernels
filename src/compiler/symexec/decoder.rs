@@ -734,7 +734,7 @@ pub unsafe fn analyze_scalar_fn_structured(
     sig: &ScalarFnSignature,
 ) -> Result<Option<super::loop_analyzer::MultiPassAnalysis>, SymExecError> {
     use super::cfg::{build_cfg_from_fn, find_loops};
-    use super::loop_analyzer::{analyze_single_loop, analyze_nested_loops, combine_passes, MultiPassAnalysis};
+    use super::loop_analyzer::{analyze_single_loop, analyze_nested_loops, combine_passes_with_sig, MultiPassAnalysis};
 
     if fn_ptr.is_null() {
         return Err(SymExecError::DisassemblyFailed("null function pointer".into()));
@@ -813,7 +813,9 @@ pub unsafe fn analyze_scalar_fn_structured(
     }
 
     // Combine loop traces into a ComputePattern.
-    match combine_passes(&loop_traces) {
+    // BCE-20260704-STRUCTURED-SYMEXEC-LOOP-MISCLASSIFY: forward `sig` so the
+    // LayerNorm classifier can reject bias-less NormLike misclassifications.
+    match combine_passes_with_sig(&loop_traces, Some(sig)) {
         Ok(pattern) => Ok(Some(MultiPassAnalysis {
             loop_traces,
             pattern,

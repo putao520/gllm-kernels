@@ -47,10 +47,31 @@ impl ScalarOpRegistry {
         manual_trace: OpTrace,
     ) {
         // Level 1: structured CFG analysis (handles NormLike, Reduction with multiple loops)
-        if let Ok(Some(_)) = self.auto_register_structured(
+        //
+        // BCE-20260704-STRUCTURED-SYMEXEC-LOOP-MISCLASSIFY: structured CFG analysis
+        // can misclassify a 2-logical-loop NormLike (e.g. RmsNorm, which has only
+        // `x` + `weight` ptr params and no bias) as a 3-loop LayerNorm pattern whose
+        // transform references `Input(3)` (weight) + `Input(4)` (bias). When the
+        // caller later emits the op as RmsNorm it only supplies 3 input VRegs, so
+        // `Input(3)` is out of bounds → panic.
+        //
+        // Defense: verify the generated pattern's transform/reduce/finalize
+        // `Input(n)` arity does not exceed the function signature's pointer-parameter
+        // count. If the pattern references Input slots the function does not have,
+        // discard the structured result and fall through to Level 2/3 (manual trace).
+        if let Ok(Some(pattern)) = self.auto_register_structured(
             key.clone(), sig.clone(),
         ) {
-            return;
+            let max_input = Self::max_input_arity(&pattern);
+            let n_ptr_params = sig.params.iter()
+                .filter(|p| matches!(p, ScalarParam::InputPtr | ScalarParam::WeightPtr | ScalarParam::OutputPtr))
+                .count();
+            if max_input <= n_ptr_params {
+                return; // Level 1 succeeded with a pattern consistent with the signature.
+            }
+            // Pattern references Input(n) beyond what the signature provides →
+            // structured analysis misclassified (e.g. RmsNorm → LayerNorm). Fall
+            // through to Level 2/3 so the correct manual trace is used.
         }
 
         // Determine if manual trace has precision that Level 2 symexec may lose:
@@ -189,6 +210,53 @@ impl ScalarOpRegistry {
     // @trace REQ-BACKEND-CAP-002 [entity:ENT-BACKEND-CAP-MATRIX]
     pub fn registered_keys(&self) -> Vec<OpKindKey> {
         self.entries.keys().cloned().collect()
+    }
+
+    /// Maximum `TraceOp::Input(n)` index referenced across every TraceOp slice
+    /// embedded in `pattern`, plus one (i.e. the Input arity the pattern demands).
+    ///
+    /// Returns `0` when the pattern references no `TraceOp::Input` at all.
+    ///
+    /// BCE-20260704-STRUCTURED-SYMEXEC-LOOP-MISCLASSIFY: used by
+    /// `register_with_symexec_fallback` to verify a structured-analysis pattern
+    /// does not reference Input slots the scalar function signature lacks
+    /// (e.g. an RmsNorm pattern misclassified as LayerNorm referencing
+    /// `Input(3)`/`Input(4)` for weight/bias that RmsNorm does not have).
+    fn max_input_arity(pattern: &ComputePattern) -> usize {
+        let mut max: Option<u32> = None;
+        let mut consider = |ops: &[TraceOp]| {
+            for op in ops {
+                if let TraceOp::Input(n) = op {
+                    if *n + 1 > max.unwrap_or(0) {
+                        max = Some(*n + 1);
+                    }
+                }
+            }
+        };
+
+        match pattern {
+            ComputePattern::Elementwise { body }
+            | ComputePattern::BinaryElementwise { body } => consider(body),
+            ComputePattern::Injective { body, .. } => consider(body),
+            ComputePattern::Reduction { combine, second_pass, normalize, .. } => {
+                consider(combine);
+                if let Some(sp) = second_pass {
+                    consider(&sp.element_transform);
+                    consider(&sp.combine);
+                }
+                if let Some(norm) = normalize {
+                    consider(norm);
+                }
+            }
+            ComputePattern::NormLike { reduce, finalize, transform } => {
+                consider(reduce);
+                consider(finalize);
+                consider(transform);
+            }
+            ComputePattern::QuantDecode { decode, .. } => consider(decode),
+            ComputePattern::Gemm => {}
+        }
+        max.unwrap_or(0) as usize
     }
 
 }
