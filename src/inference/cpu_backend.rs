@@ -198,10 +198,203 @@ impl InferenceBackend for CpuInferenceBackend {
         &self,
         input: &DeviceTensor,
         _positions: &DeviceTensor,
+        _attention_mask: &DeviceTensor,
+        _weights: &ModelWeights,
+        output: &mut DeviceTensor,
+    ) -> Result<(), InferenceError> {
+        // ARCH-RUST-IS-CODEGEN + NO-FALLBACK: production path delegates to JIT compiled
+        // MegaKernelFn (encoder prefill, seq_len > 1). 与 decoder_forward (250dd001) 对称:
+        // 无 Rust operator fallback。无 `CompiledLayer` + weight blob 时返回 `Err` (NO-FALLBACK)。
+        //
+        // Integration seam (NO-ISLAND-MODULE): 上游 (gllm Executor / FFI host) 从
+        // `ModelConfig` → `CompilerGraph` 经 `InferenceCompiler::compile` 构建 `CompiledLayer`
+        // 并经 `with_compiled_layer` 附加。`CpuInferenceBackend` 自身不做 ModelConfig→graph
+        // 构建 (gllm Executor 职责)。
+        //
+        // attention_mask: JIT MegaKernel 的 mask 处理在 JIT 内部 (GraphTopologyAnalysis
+        // 推导), delegate 时无需单独传 mask (JIT 从 input/weights 推导)。Rust operator
+        // reference (含 mask 使用) 保留于 `#[cfg(test)] encoder_forward_reference_impl`。
+        //
+        // Encoder prefill: batch_size=1, seq_len = input.num_elements() / hidden_size (>1)。
+        // MegaKernelFn ABI: arg0 input, arg1 weight_blob, arg5 batch_size, arg6 seq_len。
+        if let (Some(layer), weights_addr) =
+            (self.compiled_layer.as_ref(), self.weight_blob_addr)
+        {
+            if weights_addr != 0 {
+                let h = self.config.hidden_size;
+                let seq_len = input.num_elements() / h; // encoder prefill seq_len > 1
+                let batch_size = 1usize;
+                if seq_len == 0 {
+                    return Ok(());
+                }
+                let weights_ptr = weights_addr as *const u8;
+                let input_ptr = input.as_ptr();
+                let output_ptr = output.as_mut_ptr();
+                // Scratchpad sized by the compiled layer's requirement.
+                let mut scratchpad = vec![0u8; layer.scratchpad_bytes];
+                // SAFETY: the attached CompiledLayer was emitted by the JIT pipeline
+                // and follows the MegaKernelFn 22-param ABI. Pointer validity + weight
+                // blob layout are the caller's (gllm Executor / FFI host) responsibility.
+                unsafe {
+                    layer.execute_as_mega_kernel(
+                        input_ptr,
+                        weights_ptr,
+                        batch_size,
+                        seq_len,
+                        output_ptr,
+                        scratchpad.as_mut_ptr(),
+                    );
+                }
+                return Ok(());
+            }
+        }
+        // NO-FALLBACK: no JIT compiled layer + weight blob attached.
+        Err(InferenceError::RuntimeError(
+            "encoder_forward: JIT compiled layer + weight blob required; no Rust operator fallback (NO-FALLBACK + ARCH-RUST-IS-CODEGEN). Attach via with_compiled_layer + with_weight_blob, or use the gllm Executor mega-kernel path (execute_encode).".into()
+        ))
+    }
+
+    /// Sample token IDs from logits.
+    ///
+    /// Current implementation: greedy argmax only. When temperature > 0,
+    /// logits are temperature-scaled but selection is still argmax.
+    /// `top_k` and `top_p` parameters are accepted but not yet implemented.
+    fn sample(
+        &self,
+        logits: &DeviceTensor,
+        temperature: f32,
+        _top_k: usize,
+        _top_p: f32,
+        output_ids: &mut [u32],
+    ) -> Result<(), InferenceError> {
+        // Simple argmax sampling (temperature=0) or greedy
+        let logits_slice: &[f32] = unsafe { logits.as_slice() };
+        let vocab_size = self.config.vocab_size;
+
+        for (batch_idx, out_id) in output_ids.iter_mut().enumerate() {
+            let start = batch_idx * vocab_size;
+            let end = start + vocab_size;
+            if end > logits_slice.len() {
+                return Err(InferenceError::ShapeMismatch {
+                    expected: format!("logits for batch {batch_idx}"),
+                    got: "insufficient logits".into(),
+                });
+            }
+            let batch_logits = &logits_slice[start..end];
+
+            if temperature <= 0.0 || temperature < 1e-6 {
+                // Argmax
+                let mut max_val = f32::NEG_INFINITY;
+                let mut max_idx = 0u32;
+                for (i, &v) in batch_logits.iter().enumerate() {
+                    if v > max_val {
+                        max_val = v;
+                        max_idx = i as u32;
+                    }
+                }
+                *out_id = max_idx;
+            } else {
+                // Temperature-scaled argmax (full sampling requires RNG)
+                let mut max_val = f32::NEG_INFINITY;
+                let mut max_idx = 0u32;
+                for (i, &v) in batch_logits.iter().enumerate() {
+                    let scaled = v / temperature;
+                    if scaled > max_val {
+                        max_val = scaled;
+                        max_idx = i as u32;
+                    }
+                }
+                *out_id = max_idx;
+            }
+        }
+
+        Ok(())
+    }
+
+    fn sync(&self) -> Result<(), InferenceError> {
+        // CPU is synchronous — no-op
+        Ok(())
+    }
+}
+
+impl CpuInferenceBackend {
+    /// Device profile driving this backend (exposed for upstream JIT wiring).
+    pub fn device_profile(&self) -> &DeviceProfile {
+        &self.profile
+    }
+
+    /// Attach a JIT-compiled MegaKernel layer (NO-ISLAND-MODULE integration seam).
+    ///
+    /// When attached (together with `with_weight_blob`), `decoder_forward`
+    /// delegates to `CompiledLayer::execute_as_mega_kernel` (MegaKernelFn 22-param
+    /// ABI). When absent, production inference paths return `Err` (NO-FALLBACK)
+    /// rather than executing Rust operator composition.
+    ///
+    /// The caller (gllm Executor / FFI host) is responsible for building the
+    /// `CompiledLayer` from `ModelConfig` → `CompilerGraph` via
+    /// `InferenceCompiler::compile`, and for providing the contiguous weight
+    /// blob the MegaKernelFn ABI expects.
+    pub fn with_compiled_layer(mut self, layer: CompiledLayer) -> Self {
+        self.compiled_layer = Some(layer);
+        self
+    }
+
+    /// Attach the contiguous weight blob matching the compiled layer's layout.
+    ///
+    /// # Safety
+    /// `ptr` must point to a contiguous allocation of at least `bytes` bytes that
+    /// remains valid for the lifetime of this backend, laid out exactly as the
+    /// attached `CompiledLayer` expects (the gllm Executor's weight-packing
+    /// contract). `ModelWeights`' per-layer `DeviceTensor`s are NOT a valid blob.
+    pub unsafe fn with_weight_blob(mut self, ptr: *const u8, bytes: usize) -> Self {
+        self.weight_blob_addr = ptr as usize;
+        self.weight_blob_bytes = bytes;
+        self
+    }
+
+    /// Mutable access to the JIT compiler (for upstream `compile()` calls).
+    pub fn compiler_mut(&mut self) -> Option<&mut InferenceCompiler> {
+        self.compiler.as_mut()
+    }
+
+    /// Greedy text generation: embed prompt tokens → decoder_forward loop → sample.
+    ///
+    /// Processes prompt tokens one by one through the decoder, then generates
+    /// `max_new_tokens` new tokens via greedy (or temperature-scaled) sampling.
+    /// Returns the generated token IDs (not including the prompt).
+    /// ARCH-RUST-IS-CODEGEN + NO-FALLBACK: production `generate` requires the JIT
+    /// MegaKernel path. Without an attached `CompiledLayer` + weight blob, returns
+    /// `Err`. The Rust operator reference loop is preserved under `#[cfg(test)]`
+    /// as `generate_reference` (numerical ground-truth, never in release builds).
+    pub fn generate(
+        &self,
+        _weights: &ModelWeights,
+        _prompt_tokens: &[u32],
+        _max_new_tokens: usize,
+        _temperature: f32,
+    ) -> Result<Vec<u32>, InferenceError> {
+        Err(InferenceError::RuntimeError(
+            "generate: JIT compiled layer + weight blob required; no Rust operator fallback (NO-FALLBACK + ARCH-RUST-IS-CODEGEN). Attach via with_compiled_layer + with_weight_blob, or use the gllm Executor mega-kernel path.".into()
+        ))
+    }
+
+    // ── Reference implementations (test-only, numerical ground-truth) ──
+    // The following methods compose Layer 1 operators to produce a numerical
+    // reference. They are compiled ONLY under `cfg(test)` and are never part of
+    // release inference paths (NO-SCALAR / ARCH-RUST-IS-CODEGEN).
+    #[cfg(test)]
+    pub(crate) fn encoder_forward_reference_impl(
+        &self,
+        input: &DeviceTensor,
+        _positions: &DeviceTensor,
         attention_mask: &DeviceTensor,
         weights: &ModelWeights,
         output: &mut DeviceTensor,
     ) -> Result<(), InferenceError> {
+        // Reference path: operator-by-operator execution (test ground-truth only).
+        // Encoder prefill (seq_len > 1), mean-pool + L2-normalize. Multi-head
+        // attention with attention mask, no RoPE, no KV cache. Never compiled
+        // into release inference paths (production delegates to JIT MegaKernelFn).
         let h = self.config.hidden_size;
         let num_heads = self.config.num_heads;
         let num_kv_heads = self.config.num_kv_heads;
@@ -361,134 +554,6 @@ impl InferenceBackend for CpuInferenceBackend {
         Ok(())
     }
 
-    /// Sample token IDs from logits.
-    ///
-    /// Current implementation: greedy argmax only. When temperature > 0,
-    /// logits are temperature-scaled but selection is still argmax.
-    /// `top_k` and `top_p` parameters are accepted but not yet implemented.
-    fn sample(
-        &self,
-        logits: &DeviceTensor,
-        temperature: f32,
-        _top_k: usize,
-        _top_p: f32,
-        output_ids: &mut [u32],
-    ) -> Result<(), InferenceError> {
-        // Simple argmax sampling (temperature=0) or greedy
-        let logits_slice: &[f32] = unsafe { logits.as_slice() };
-        let vocab_size = self.config.vocab_size;
-
-        for (batch_idx, out_id) in output_ids.iter_mut().enumerate() {
-            let start = batch_idx * vocab_size;
-            let end = start + vocab_size;
-            if end > logits_slice.len() {
-                return Err(InferenceError::ShapeMismatch {
-                    expected: format!("logits for batch {batch_idx}"),
-                    got: "insufficient logits".into(),
-                });
-            }
-            let batch_logits = &logits_slice[start..end];
-
-            if temperature <= 0.0 || temperature < 1e-6 {
-                // Argmax
-                let mut max_val = f32::NEG_INFINITY;
-                let mut max_idx = 0u32;
-                for (i, &v) in batch_logits.iter().enumerate() {
-                    if v > max_val {
-                        max_val = v;
-                        max_idx = i as u32;
-                    }
-                }
-                *out_id = max_idx;
-            } else {
-                // Temperature-scaled argmax (full sampling requires RNG)
-                let mut max_val = f32::NEG_INFINITY;
-                let mut max_idx = 0u32;
-                for (i, &v) in batch_logits.iter().enumerate() {
-                    let scaled = v / temperature;
-                    if scaled > max_val {
-                        max_val = scaled;
-                        max_idx = i as u32;
-                    }
-                }
-                *out_id = max_idx;
-            }
-        }
-
-        Ok(())
-    }
-
-    fn sync(&self) -> Result<(), InferenceError> {
-        // CPU is synchronous — no-op
-        Ok(())
-    }
-}
-
-impl CpuInferenceBackend {
-    /// Device profile driving this backend (exposed for upstream JIT wiring).
-    pub fn device_profile(&self) -> &DeviceProfile {
-        &self.profile
-    }
-
-    /// Attach a JIT-compiled MegaKernel layer (NO-ISLAND-MODULE integration seam).
-    ///
-    /// When attached (together with `with_weight_blob`), `decoder_forward`
-    /// delegates to `CompiledLayer::execute_as_mega_kernel` (MegaKernelFn 22-param
-    /// ABI). When absent, production inference paths return `Err` (NO-FALLBACK)
-    /// rather than executing Rust operator composition.
-    ///
-    /// The caller (gllm Executor / FFI host) is responsible for building the
-    /// `CompiledLayer` from `ModelConfig` → `CompilerGraph` via
-    /// `InferenceCompiler::compile`, and for providing the contiguous weight
-    /// blob the MegaKernelFn ABI expects.
-    pub fn with_compiled_layer(mut self, layer: CompiledLayer) -> Self {
-        self.compiled_layer = Some(layer);
-        self
-    }
-
-    /// Attach the contiguous weight blob matching the compiled layer's layout.
-    ///
-    /// # Safety
-    /// `ptr` must point to a contiguous allocation of at least `bytes` bytes that
-    /// remains valid for the lifetime of this backend, laid out exactly as the
-    /// attached `CompiledLayer` expects (the gllm Executor's weight-packing
-    /// contract). `ModelWeights`' per-layer `DeviceTensor`s are NOT a valid blob.
-    pub unsafe fn with_weight_blob(mut self, ptr: *const u8, bytes: usize) -> Self {
-        self.weight_blob_addr = ptr as usize;
-        self.weight_blob_bytes = bytes;
-        self
-    }
-
-    /// Mutable access to the JIT compiler (for upstream `compile()` calls).
-    pub fn compiler_mut(&mut self) -> Option<&mut InferenceCompiler> {
-        self.compiler.as_mut()
-    }
-
-    /// Greedy text generation: embed prompt tokens → decoder_forward loop → sample.
-    ///
-    /// Processes prompt tokens one by one through the decoder, then generates
-    /// `max_new_tokens` new tokens via greedy (or temperature-scaled) sampling.
-    /// Returns the generated token IDs (not including the prompt).
-    /// ARCH-RUST-IS-CODEGEN + NO-FALLBACK: production `generate` requires the JIT
-    /// MegaKernel path. Without an attached `CompiledLayer` + weight blob, returns
-    /// `Err`. The Rust operator reference loop is preserved under `#[cfg(test)]`
-    /// as `generate_reference` (numerical ground-truth, never in release builds).
-    pub fn generate(
-        &self,
-        _weights: &ModelWeights,
-        _prompt_tokens: &[u32],
-        _max_new_tokens: usize,
-        _temperature: f32,
-    ) -> Result<Vec<u32>, InferenceError> {
-        Err(InferenceError::RuntimeError(
-            "generate: JIT compiled layer + weight blob required; no Rust operator fallback (NO-FALLBACK + ARCH-RUST-IS-CODEGEN). Attach via with_compiled_layer + with_weight_blob, or use the gllm Executor mega-kernel path.".into()
-        ))
-    }
-
-    // ── Reference implementations (test-only, numerical ground-truth) ──
-    // The following methods compose Layer 1 operators to produce a numerical
-    // reference. They are compiled ONLY under `cfg(test)` and are never part of
-    // release inference paths (NO-SCALAR / ARCH-RUST-IS-CODEGEN).
     #[cfg(test)]
     pub(crate) fn decoder_forward_reference_impl(
         &self,
@@ -1384,7 +1449,7 @@ mod tests {
         let mut output = DeviceTensor::alloc_cpu(seq_len * h, DType::F32).unwrap();
 
         backend
-            .encoder_forward(&input, &positions, &mask, &weights, &mut output)
+            .encoder_forward_reference_impl(&input, &positions, &mask, &weights, &mut output)
             .unwrap();
 
         let out_slice: &[f32] = unsafe { output.as_slice() };
@@ -1437,7 +1502,7 @@ mod tests {
         let mask_full = unsafe { DeviceTensor::from_slice(&full_mask) };
         let mut out_full = DeviceTensor::alloc_cpu(seq_len * h, DType::F32).unwrap();
         backend
-            .encoder_forward(&input, &positions, &mask_full, &weights, &mut out_full)
+            .encoder_forward_reference_impl(&input, &positions, &mask_full, &weights, &mut out_full)
             .unwrap();
 
         // Partial mask: block position 2 from attending to position 0
@@ -1446,7 +1511,7 @@ mod tests {
         let mask_partial = unsafe { DeviceTensor::from_slice(&partial_mask) };
         let mut out_partial = DeviceTensor::alloc_cpu(seq_len * h, DType::F32).unwrap();
         backend
-            .encoder_forward(&input, &positions, &mask_partial, &weights, &mut out_partial)
+            .encoder_forward_reference_impl(&input, &positions, &mask_partial, &weights, &mut out_partial)
             .unwrap();
 
         let s_full: &[f32] = unsafe { out_full.as_slice() };
@@ -2004,7 +2069,7 @@ mod tests {
         let mask_data = vec![0.0f32; 0];
         let mask = unsafe { DeviceTensor::from_slice(&mask_data) };
         let mut output = DeviceTensor::alloc_cpu(1, DType::F32).unwrap();
-        let result = backend.encoder_forward(&input, &positions, &mask, &weights, &mut output);
+        let result = backend.encoder_forward_reference_impl(&input, &positions, &mask, &weights, &mut output);
         assert!(result.is_ok());
     }
 
@@ -2790,7 +2855,7 @@ mod tests {
 
         // Act
         backend
-            .encoder_forward(&input, &positions, &mask, &weights, &mut output)
+            .encoder_forward_reference_impl(&input, &positions, &mask, &weights, &mut output)
             .unwrap();
 
         // Assert — output should be L2 normalized (norm ~= 1.0)
@@ -3013,7 +3078,7 @@ mod tests {
 
         // Act
         backend
-            .encoder_forward(&input, &positions, &mask, &weights, &mut output)
+            .encoder_forward_reference_impl(&input, &positions, &mask, &weights, &mut output)
             .unwrap();
 
         // Assert — single token produces a valid L2-normalized embedding
