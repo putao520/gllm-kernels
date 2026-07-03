@@ -168,6 +168,27 @@ impl AArch64Lower {
         0x4E218800 | ((vn as u32 & 0x1F) << 5) | (vd as u32 & 0x1F)
     }
 
+    /// FCVTN Vd.4H, Vn.4S — NEON F32→F16 narrow (低半部分, 高半部分置零)。
+    /// BCE-20260704-AARCH64-007: VecNarrow F32→F16 硬件转换。
+    /// 编码: 0E21 6800 | (Vn<<5) | Vd
+    fn enc_fcvtn_f32_to_f16(&self, vd: u8, vn: u8) -> u32 {
+        0x0E216800 | ((vn as u32 & 0x1F) << 5) | (vd as u32 & 0x1F)
+    }
+
+    /// FCVTL Vd.4S, Vn.4H — NEON F16→F32 widen (低半部分扩展)。
+    /// BCE-20260704-AARCH64-007: VecWiden F16→F32 硬件转换。
+    /// 编码: 0E61 7800 | (Vn<<5) | Vd
+    fn enc_fcvtl_f16_to_f32(&self, vd: u8, vn: u8) -> u32 {
+        0x0E617800 | ((vn as u32 & 0x1F) << 5) | (vd as u32 & 0x1F)
+    }
+
+    /// BFCVTN Vd.4H, Vn.4S — NEON F32→BF16 narrow (FEAT_BF16, 低半部分)。
+    /// BCE-20260704-AARCH64-007: VecNarrow F32→BF16 硬件转换 (需 has_bf16)。
+    /// 编码: 0E65 6800 | (Vn<<5) | Vd
+    fn enc_bfcvtn_f32_to_bf16(&self, vd: u8, vn: u8) -> u32 {
+        0x0E656800 | ((vn as u32 & 0x1F) << 5) | (vd as u32 & 0x1F)
+    }
+
     /// FCVTZS Vd.4S, Vn.4S (float → signed int)
     fn enc_fcvtzs_4s(&self, vd: u8, vn: u8) -> u32 {
         0x4EA1B800 | ((vn as u32 & 0x1F) << 5) | (vd as u32 & 0x1F)

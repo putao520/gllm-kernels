@@ -527,13 +527,28 @@ impl AArch64Lower {
                     let vd = self.resolve_vreg(*dst, alloc)?;
                     if vd != vs { self.emit32(self.enc_orr_vv(vd, vs, vs)); }
                 } else {
-                    // Different dtype: narrowing needed. Strategy guides the conversion.
-                    let src_strategy = src_dtype.aarch64_elem_strategy();
-                    let _dst_strategy = dst_dtype.aarch64_elem_strategy();
-                    return Err(crate::types::CompilerError::CodegenViolation(
-                        format!("VecNarrow: {:?}→{:?} (strategy {src_strategy:?}) not yet implemented in AArch64 ISA lowering",
-                            src_dtype.kind, dst_dtype.kind)
-                    ));
+                    // BCE-20260704-AARCH64-007: 不同 dtype 窄化, 实现硬件转换 (NO-FALLBACK)。
+                    let vs = self.resolve_vreg(*src, alloc)?;
+                    let vd = self.resolve_vreg(*dst, alloc)?;
+                    match (src_dtype.kind, dst_dtype.kind) {
+                        // F32 → F16: FCVTN Vd.4H, Vn.4S (NEON 原生, 无特性门控)
+                        (DTypeKind::F32, DTypeKind::F16) => {
+                            self.emit32(self.enc_fcvtn_f32_to_f16(vd, vs));
+                        }
+                        // F32 → BF16: BFCVTN Vd.4H, Vn.4S (FEAT_BF16, 需 has_bf16)
+                        (DTypeKind::F32, DTypeKind::BF16) => {
+                            if !self.platform.has_bf16 {
+                                return Err(CompilerError::CodegenViolation(
+                                    "VecNarrow F32→BF16 requires FEAT_BF16 (BFCVTN); platform lacks has_bf16".into()
+                                ));
+                            }
+                            self.emit32(self.enc_bfcvtn_f32_to_bf16(vd, vs));
+                        }
+                        (s, d) => return Err(CompilerError::CodegenViolation(
+                            format!("VecNarrow: {:?}→{:?} has no direct AArch64 hardware narrow instruction \
+                                     (supported: F32→F16 via FCVTN, F32→BF16 via BFCVTN)", s, d)
+                        )),
+                    }
                 }
                 Ok(())
             }
@@ -553,12 +568,28 @@ impl AArch64Lower {
                     let vd = self.resolve_vreg(*dst, alloc)?;
                     if vd != vs { self.emit32(self.enc_orr_vv(vd, vs, vs)); }
                 } else if dst_dtype.elem_bytes() > src_dtype.elem_bytes() {
-                    // Widen: narrow → wide. AArch64: fcvtl (F16→F32) or bf16 → f32 via bfcvt.
-                    let src_strategy = src_dtype.aarch64_elem_strategy();
-                    return Err(crate::types::CompilerError::CodegenViolation(
-                        format!("VecWiden: {:?}→{:?} (strategy {src_strategy:?}) not yet implemented in AArch64 ISA lowering",
-                            src_dtype.kind, dst_dtype.kind)
-                    ));
+                    // BCE-20260704-AARCH64-007: 不同 dtype 宽化, 实现硬件转换 (NO-FALLBACK)。
+                    let vs = self.resolve_vreg(*src, alloc)?;
+                    let vd = self.resolve_vreg(*dst, alloc)?;
+                    match (src_dtype.kind, dst_dtype.kind) {
+                        // F16 → F32: FCVTL Vd.4S, Vn.4H (NEON 原生, 无特性门控)
+                        (DTypeKind::F16, DTypeKind::F32) => {
+                            self.emit32(self.enc_fcvtl_f16_to_f32(vd, vs));
+                        }
+                        // BF16 → F32: NEON 无原生向量宽化指令 (FEAT_BF16 仅提供标量 BFCVT + F32→BF16 BFCVTN,
+                        // 无 BFCVTL)。需 SVE BFCVT Zdn.S, Pg/M, Zdn.H (has_sve+has_bf16) 或标量循环。
+                        // 当前 lower 层无标量 BFCVT 编码辅助 — 返回 Err 注明原因 (NO-SILENT-FALLBACK)。
+                        (DTypeKind::BF16, DTypeKind::F32) => {
+                            return Err(CompilerError::CodegenViolation(
+                                "VecWiden BF16→F32 has no NEON vector instruction (FEAT_BF16 lacks BFCVTL); \
+                                 requires SVE BFCVT (has_sve+has_bf16) or scalar BFCVT loop — not yet encoded".into()
+                            ));
+                        }
+                        (s, d) => return Err(CompilerError::CodegenViolation(
+                            format!("VecWiden: {:?}→{:?} has no direct AArch64 hardware widen instruction \
+                                     (supported: F16→F32 via FCVTL)", s, d)
+                        )),
+                    }
                 } else {
                     return Err(crate::types::CompilerError::CodegenViolation(
                         format!("VecWiden: {:?}→{:?} is not a widening conversion", src_dtype.kind, dst_dtype.kind)
@@ -1015,58 +1046,99 @@ impl AArch64Lower {
         match instr {
             VmInstr::GatherLoad { dst, base, indices, stride, width , dtype: _dtype, predicate: _predicate, } => {
 
-                let lanes = width.f32_lanes();
+                // BCE-20260704-AARCH64-005: Scalable (SVE) width 的 f32_lanes() 返回 0,
+                // 原 for-lane 循环 = for i in 0..0 = 零条 gather 指令 = dst 未初始化 (数据损坏)。
+                // SVE 有原生 gather: LD1W Zt.S, Pg/Z, [Xn, Zm.S, SXTW #2]。
+                // NEON (W128/W256) 无原生 gather, 保持标量 for-lane 路径。
                 let base_reg = self.resolve_gpr(*base, alloc)?;
                 let idx_base = self.resolve_gpr(*indices, alloc)?;
                 let vd = self.resolve_vreg(*dst, alloc)?;
-                let addr_tmp: u8 = 16;  // x16 = computed address
-                let idx_tmp: u8 = 17;   // x17 = index value
 
-                for i in 0..lanes {
-                    // LDR W17, [idx_base, #(i*4)] — load u32 index
-                    let idx_off = (i * 4) as u32;
-                    if idx_off <= 0xFFF {
-                        self.emit32(0xB9400000 | ((idx_off & 0xFFF) << 10) | ((idx_base as u32 & 0x1F) << 5) | (idx_tmp as u32 & 0x1F));
-                    } else {
-                        // Large offset: ADD + LDR
-                        let hi = idx_off & !0xFFFu32;
-                        let lo = idx_off & 0xFFFu32;
-                        self.emit32(self.enc_add_imm(addr_tmp, idx_base, hi));
-                        self.emit32(0xB9400000 | ((lo & 0xFFF) << 10) | ((addr_tmp as u32 & 0x1F) << 5) | (idx_tmp as u32 & 0x1F));
-                    }
-
-                    // Compute addr = base + idx * stride * sizeof(f32)
-                    if *stride == 1 {
-                        // X16 = X17 << 2  (idx * 4)
-                        self.emit32(self.enc_lsl_x_imm(addr_tmp, idx_tmp, 2));
-                        // X16 = base + X16
-                        self.emit32(self.enc_add_reg(addr_tmp, base_reg, addr_tmp));
-                    } else {
-                        // X16 = idx * stride * 4
-                        let stride_val = *stride as u32;
-                        if stride_val <= 0xFFFF {
-                            self.emit32(self.enc_movz_w(addr_tmp, stride_val as u16));
-                        } else {
-                            self.emit32(self.enc_movz_w(addr_tmp, (stride_val & 0xFFFF) as u16));
-                            self.emit32(self.enc_movk_w_lsl16(addr_tmp, ((stride_val >> 16) & 0xFFFF) as u16));
+                match width {
+                    SimdWidth::Scalable => {
+                        // NO-SILENT-FALLBACK: SVE gather 需要 has_sve
+                        if !self.platform.has_sve {
+                            return Err(CompilerError::CodegenViolation(
+                                "GatherLoad SVE gather requires FEAT_SVE (Scalable width on non-SVE CPU is invalid)".into()
+                            ));
                         }
-                        // MADD X16, X17, X16, XZR  (X16 = idx * stride)
-                        // Encoding: 0x1B007C00 | (Xm << 16) | (Ra=31 << 10) | (Xn << 5) | Xd
-                        self.emit32(0x1B007C00 | ((addr_tmp as u32 & 0x1F) << 16) | (31u32 << 10) | ((idx_tmp as u32 & 0x1F) << 5) | (addr_tmp as u32 & 0x1F));
-                        // X16 = X16 << 2  (* sizeof(f32))
-                        self.emit32(self.enc_lsl_x_imm(addr_tmp, addr_tmp, 2));
-                        // X16 = base + X16
-                        self.emit32(self.enc_add_reg(addr_tmp, base_reg, addr_tmp));
+                        let pg = 7u8; // PTRUE P7.S (全谓词, 由 emit 路径惯例维护)
+                        self.emit32(self.enc_ptrue_s(pg));
+                        // Z_idx = 从 [idx_base] 连续加载 VL 个 u32 索引
+                        let z_idx: u8 = 16;
+                        self.emit32(self.enc_ld1w_imm(z_idx, pg, idx_base));
+                        // stride != 1: Z_idx *= stride (字节偏移 = idx*stride*4, gather #2 自动 ×4)
+                        if *stride != 1 {
+                            // DUP Z_stride.S, S(stride) — stride 先放入标量 W 寄存器再 broadcast
+                            let z_stride: u8 = 17;
+                            // MOV W17, #stride (32-bit MOVZ)
+                            let sv = *stride as u32;
+                            if sv <= 0xFFFF {
+                                self.emit32(self.enc_movz_w(17, sv as u16));
+                            } else {
+                                self.emit32(self.enc_movz_w(17, (sv & 0xFFFF) as u16));
+                                self.emit32(self.enc_movk_w_lsl16(17, ((sv >> 16) & 0xFFFF) as u16));
+                            }
+                            self.emit32(self.enc_sve_dup_s(z_stride, 17));
+                            // MUL Z_idx.S, Pg/M, Z_idx.S, Z_stride.S (整数乘, 缩放索引)
+                            self.emit32(self.enc_sve_mul_int_s(z_idx, pg, z_stride));
+                        }
+                        // LD1W Zd.S, Pg/Z, [base, Z_idx, SXTW #2]
+                        self.emit32(self.enc_ld1w_gather_sxtw(vd, pg, base_reg, z_idx));
                     }
+                    _ => {
+                        // NEON for-lane 路径 (W128=4, W256=8 f32 lanes)
+                        let lanes = width.f32_lanes();
+                        let addr_tmp: u8 = 18;  // x18 = computed address
+                        let idx_tmp: u8 = 19;   // x19 = index value
 
-                    // LDR S0, [X16] — load f32 from computed address
-                    self.emit32(0xBD400000 | ((addr_tmp as u32 & 0x1F) << 5) );
-                    // INS Vd.S[i], V0.S[0] — insert scalar S0 into lane i of Vd
-                    // Encoding: 0x6E040C00 | (imm5 << 16) | (imm4 << 12) | (Vn << 5) | Vd
-                    //   imm5[4:1] = dst_lane_index, imm5[0] = 0 (size=00 for .S)
-                    //   imm4[3:1] = src_lane_index,  imm4[0] = 0
-                    let imm5 = ((i as u32 & 0xF) << 1) & 0x1F;
-                    self.emit32((0x6E040C00 | (imm5 << 16)) | (vd as u32 & 0x1F));
+                        for i in 0..lanes {
+                            // LDR W19, [idx_base, #(i*4)] — load u32 index
+                            let idx_off = (i * 4) as u32;
+                            if idx_off <= 0xFFF {
+                                self.emit32(0xB9400000 | ((idx_off & 0xFFF) << 10) | ((idx_base as u32 & 0x1F) << 5) | (idx_tmp as u32 & 0x1F));
+                            } else {
+                                // Large offset: ADD + LDR
+                                let hi = idx_off & !0xFFFu32;
+                                let lo = idx_off & 0xFFFu32;
+                                self.emit32(self.enc_add_imm(addr_tmp, idx_base, hi));
+                                self.emit32(0xB9400000 | ((lo & 0xFFF) << 10) | ((addr_tmp as u32 & 0x1F) << 5) | (idx_tmp as u32 & 0x1F));
+                            }
+
+                            // Compute addr = base + idx * stride * sizeof(f32)
+                            if *stride == 1 {
+                                // X18 = X19 << 2  (idx * 4)
+                                self.emit32(self.enc_lsl_x_imm(addr_tmp, idx_tmp, 2));
+                                // X18 = base + X18
+                                self.emit32(self.enc_add_reg(addr_tmp, base_reg, addr_tmp));
+                            } else {
+                                // X18 = idx * stride * 4
+                                let stride_val = *stride as u32;
+                                if stride_val <= 0xFFFF {
+                                    self.emit32(self.enc_movz_w(addr_tmp, stride_val as u16));
+                                } else {
+                                    self.emit32(self.enc_movz_w(addr_tmp, (stride_val & 0xFFFF) as u16));
+                                    self.emit32(self.enc_movk_w_lsl16(addr_tmp, ((stride_val >> 16) & 0xFFFF) as u16));
+                                }
+                                // MADD X18, X19, X18, XZR  (X18 = idx * stride)
+                                // Encoding: 0x1B007C00 | (Xm << 16) | (Ra=31 << 10) | (Xn << 5) | Xd
+                                self.emit32(0x1B007C00 | ((addr_tmp as u32 & 0x1F) << 16) | (31u32 << 10) | ((idx_tmp as u32 & 0x1F) << 5) | (addr_tmp as u32 & 0x1F));
+                                // X18 = X18 << 2  (* sizeof(f32))
+                                self.emit32(self.enc_lsl_x_imm(addr_tmp, addr_tmp, 2));
+                                // X18 = base + X18
+                                self.emit32(self.enc_add_reg(addr_tmp, base_reg, addr_tmp));
+                            }
+
+                            // LDR S0, [X18] — load f32 from computed address
+                            self.emit32(0xBD400000 | ((addr_tmp as u32 & 0x1F) << 5) );
+                            // INS Vd.S[i], V0.S[0] — insert scalar S0 into lane i of Vd
+                            // Encoding: 0x6E040C00 | (imm5 << 16) | (imm4 << 12) | (Vn << 5) | Vd
+                            //   imm5[4:1] = dst_lane_index, imm5[0] = 0 (size=00 for .S)
+                            //   imm4[3:1] = src_lane_index,  imm4[0] = 0
+                            let imm5 = ((i as u32 & 0xF) << 1) & 0x1F;
+                            self.emit32((0x6E040C00 | (imm5 << 16)) | (vd as u32 & 0x1F));
+                        }
+                    }
                 }
                 Ok(())
             }
@@ -1079,51 +1151,89 @@ impl AArch64Lower {
         match instr {
             VmInstr::ScatterStore { base, indices, src, stride, width , dtype: _dtype, predicate: _predicate, } => {
 
-                let lanes = width.f32_lanes();
+                // BCE-20260704-AARCH64-005: Scalable (SVE) width 的 f32_lanes() 返回 0,
+                // 原 for-lane 循环 = for i in 0..0 = 零条 scatter 指令 = src 数据丢失。
+                // SVE 有原生 scatter: ST1W Zt.S, Pg, [Xn, Zm.S, SXTW #2]。
+                // NEON (W128/W256) 无原生 scatter, 保持标量 for-lane 路径。
                 let base_reg = self.resolve_gpr(*base, alloc)?;
                 let idx_base = self.resolve_gpr(*indices, alloc)?;
                 let vs = self.resolve_vreg(*src, alloc)?;
-                let addr_tmp: u8 = 16;
-                let idx_tmp: u8 = 17;
 
-                for i in 0..lanes {
-                    // LDR W17, [idx_base, #(i*4)]
-                    let idx_off = (i * 4) as u32;
-                    if idx_off <= 0xFFF {
-                        self.emit32(0xB9400000 | ((idx_off & 0xFFF) << 10) | ((idx_base as u32 & 0x1F) << 5) | (idx_tmp as u32 & 0x1F));
-                    } else {
-                        let hi = idx_off & !0xFFFu32;
-                        let lo = idx_off & 0xFFFu32;
-                        self.emit32(self.enc_add_imm(addr_tmp, idx_base, hi));
-                        self.emit32(0xB9400000 | ((lo & 0xFFF) << 10) | ((addr_tmp as u32 & 0x1F) << 5) | (idx_tmp as u32 & 0x1F));
-                    }
-
-                    // Compute addr = base + idx * stride * sizeof(f32)
-                    if *stride == 1 {
-                        self.emit32(self.enc_lsl_x_imm(addr_tmp, idx_tmp, 2));
-                        self.emit32(self.enc_add_reg(addr_tmp, base_reg, addr_tmp));
-                    } else {
-                        let stride_val = *stride as u32;
-                        if stride_val <= 0xFFFF {
-                            self.emit32(self.enc_movz_w(addr_tmp, stride_val as u16));
-                        } else {
-                            self.emit32(self.enc_movz_w(addr_tmp, (stride_val & 0xFFFF) as u16));
-                            self.emit32(self.enc_movk_w_lsl16(addr_tmp, ((stride_val >> 16) & 0xFFFF) as u16));
+                match width {
+                    SimdWidth::Scalable => {
+                        // NO-SILENT-FALLBACK: SVE scatter 需要 has_sve
+                        if !self.platform.has_sve {
+                            return Err(CompilerError::CodegenViolation(
+                                "ScatterStore SVE scatter requires FEAT_SVE (Scalable width on non-SVE CPU is invalid)".into()
+                            ));
                         }
-                        // MADD X16, X17, X16, XZR
-                        self.emit32(0x1B007C00 | ((addr_tmp as u32 & 0x1F) << 16) | (31u32 << 10) | ((idx_tmp as u32 & 0x1F) << 5) | (addr_tmp as u32 & 0x1F));
-                        self.emit32(self.enc_lsl_x_imm(addr_tmp, addr_tmp, 2));
-                        self.emit32(self.enc_add_reg(addr_tmp, base_reg, addr_tmp));
+                        let pg = 7u8;
+                        self.emit32(self.enc_ptrue_s(pg));
+                        // Z_idx = 从 [idx_base] 连续加载 VL 个 u32 索引
+                        let z_idx: u8 = 16;
+                        self.emit32(self.enc_ld1w_imm(z_idx, pg, idx_base));
+                        // stride != 1: Z_idx *= stride (字节偏移 = idx*stride*4, scatter #2 自动 ×4)
+                        if *stride != 1 {
+                            let z_stride: u8 = 17;
+                            let sv = *stride as u32;
+                            if sv <= 0xFFFF {
+                                self.emit32(self.enc_movz_w(17, sv as u16));
+                            } else {
+                                self.emit32(self.enc_movz_w(17, (sv & 0xFFFF) as u16));
+                                self.emit32(self.enc_movk_w_lsl16(17, ((sv >> 16) & 0xFFFF) as u16));
+                            }
+                            self.emit32(self.enc_sve_dup_s(z_stride, 17));
+                            self.emit32(self.enc_sve_mul_int_s(z_idx, pg, z_stride));
+                        }
+                        // ST1W Zs.S, Pg, [base, Z_idx, SXTW #2]
+                        self.emit32(self.enc_st1w_scatter_sxtw(vs, pg, base_reg, z_idx));
                     }
+                    _ => {
+                        // NEON for-lane 路径 (W128=4, W256=8 f32 lanes)
+                        let lanes = width.f32_lanes();
+                        let addr_tmp: u8 = 18;
+                        let idx_tmp: u8 = 19;
 
-                    // DUP S0, Vs.S[i] — extract scalar lane i from Vs into S0
-                    // MOV V0.S[0], Vs.S[i]
-                    // Encoding: 0x5E040C00 | (imm5 << 16) | (imm4 << 12) | (Vn << 5) | Vd
-                    let imm5_src = ((i as u32 & 0xF) << 1) & 0x1F;
-                    self.emit32((0x5E040C00 | (imm5_src << 16)) | ((vs as u32 & 0x1F) << 5) );
+                        for i in 0..lanes {
+                            // LDR W19, [idx_base, #(i*4)]
+                            let idx_off = (i * 4) as u32;
+                            if idx_off <= 0xFFF {
+                                self.emit32(0xB9400000 | ((idx_off & 0xFFF) << 10) | ((idx_base as u32 & 0x1F) << 5) | (idx_tmp as u32 & 0x1F));
+                            } else {
+                                let hi = idx_off & !0xFFFu32;
+                                let lo = idx_off & 0xFFFu32;
+                                self.emit32(self.enc_add_imm(addr_tmp, idx_base, hi));
+                                self.emit32(0xB9400000 | ((lo & 0xFFF) << 10) | ((addr_tmp as u32 & 0x1F) << 5) | (idx_tmp as u32 & 0x1F));
+                            }
 
-                    // STR S0, [X16] — store f32 scalar to computed address
-                    self.emit32(0xBD000000 | ((addr_tmp as u32 & 0x1F) << 5) );
+                            // Compute addr = base + idx * stride * sizeof(f32)
+                            if *stride == 1 {
+                                self.emit32(self.enc_lsl_x_imm(addr_tmp, idx_tmp, 2));
+                                self.emit32(self.enc_add_reg(addr_tmp, base_reg, addr_tmp));
+                            } else {
+                                let stride_val = *stride as u32;
+                                if stride_val <= 0xFFFF {
+                                    self.emit32(self.enc_movz_w(addr_tmp, stride_val as u16));
+                                } else {
+                                    self.emit32(self.enc_movz_w(addr_tmp, (stride_val & 0xFFFF) as u16));
+                                    self.emit32(self.enc_movk_w_lsl16(addr_tmp, ((stride_val >> 16) & 0xFFFF) as u16));
+                                }
+                                // MADD X18, X19, X18, XZR
+                                self.emit32(0x1B007C00 | ((addr_tmp as u32 & 0x1F) << 16) | (31u32 << 10) | ((idx_tmp as u32 & 0x1F) << 5) | (addr_tmp as u32 & 0x1F));
+                                self.emit32(self.enc_lsl_x_imm(addr_tmp, addr_tmp, 2));
+                                self.emit32(self.enc_add_reg(addr_tmp, base_reg, addr_tmp));
+                            }
+
+                            // DUP S0, Vs.S[i] — extract scalar lane i from Vs into S0
+                            // MOV V0.S[0], Vs.S[i]
+                            // Encoding: 0x5E040C00 | (imm5 << 16) | (imm4 << 12) | (Vn << 5) | Vd
+                            let imm5_src = ((i as u32 & 0xF) << 1) & 0x1F;
+                            self.emit32((0x5E040C00 | (imm5_src << 16)) | ((vs as u32 & 0x1F) << 5) );
+
+                            // STR S0, [X18] — store f32 scalar to computed address
+                            self.emit32(0xBD000000 | ((addr_tmp as u32 & 0x1F) << 5) );
+                        }
+                    }
                 }
                 Ok(())
             }
@@ -1377,8 +1487,17 @@ impl AArch64Lower {
                         VecUnaryOp::Ceil  => self.emit32(self.enc_sve_frintp_s(vd, pg, vn)),
                         VecUnaryOp::IntToFloat => self.emit32(0x4E21B800 | ((vn as u32) << 5) | vd as u32),
                         VecUnaryOp::Fp8E4M3ToFloat | VecUnaryOp::Fp8E5M2ToFloat => {
+                            // BCE-20260704-AARCH64-011: AArch64Features 当前无 has_fp8 标志
+                            // (FEAT_FP8 需 SVE2-AES+FP8 扩展, platform 未暴露)。SVE2 硬件指令
+                            // FCVTLN/FCVTLT (SVE2-AES+FP8) 与 NEON F1CVT/FCVTLT2 (FEAT_FP8)
+                            // 需先扩展 AArch64Features.has_fp8 + Platform 提取 + emit 编码辅助
+                            // 才能安全使用 (编码未验证前发布会 SIGILL)。软件转换 (逐字节位运算)
+                            // 需 JIT 循环生成, 当前 lower 层无该能力。NO-SILENT-FALLBACK: 返回 Err
+                            // 注明真实限制, 不静默 NOP (dst 未初始化 = 数据损坏)。
                             return Err(CompilerError::CodegenViolation(
-                                "FP8 to F32: software conversion not yet implemented on AArch64".into()
+                                "FP8→F32 requires FEAT_FP8 (has_fp8 flag not in AArch64Features yet) \
+                                 or JIT software conversion loop (not implemented); \
+                                 add has_fp8 to platform + emit FCVTLN/F1CVT encoding to enable".into()
                             ));
                         }
                     }
@@ -1394,8 +1513,12 @@ impl AArch64Lower {
                         VecUnaryOp::Ceil  => self.emit32(0x4EA19800 | ((vn as u32) << 5) | vd as u32),
                         VecUnaryOp::IntToFloat => self.emit32(0x4E21B800 | ((vn as u32) << 5) | vd as u32), // scvtf v.4s
                         VecUnaryOp::Fp8E4M3ToFloat | VecUnaryOp::Fp8E5M2ToFloat => {
+                            // BCE-20260704-AARCH64-011: 同 SVE 路径 — AArch64Features 无 has_fp8 标志,
+                            // NEON FEAT_FP8 (F1CVT/FCVTLT2) 需先扩展 platform 字段 + emit 编码辅助。
+                            // NO-SILENT-FALLBACK: 返回 Err 注明限制, 不静默 NOP。
                             return Err(CompilerError::CodegenViolation(
-                                "FP8 to F32: software conversion not yet implemented on AArch64".into()
+                                "FP8→F32 requires FEAT_FP8 (has_fp8 flag not in AArch64Features yet) \
+                                 or JIT software conversion loop (not implemented)".into()
                             ));
                         }
                     }
@@ -2756,6 +2879,15 @@ Ok(())
     fn lower_tile_mma_aarch64(&mut self, instr: &VmInstr, alloc: &RegAllocation) -> Result<(), CompilerError> {
         match instr {
             VmInstr::TileMma { c, a, b, m, n, k, dtype } => {
+
+                // NO-SILENT-FALLBACK (BCE-20260704-AARCH64-002): FMOPA 是 SME 指令 (FEAT_SME),
+                // 无 SME 的 CPU 发射会 SIGILL。与 TileLoad/TileStore 入口守卫一致:
+                // 无 SME2 返回 Err,绝不静默 NOP (dst 未初始化 = 数据损坏)。
+                if !self.platform.has_sme2 {
+                    return Err(CompilerError::CodegenViolation(
+                        "TileMma requires FEAT_SME/SME2 (FMOPA is an SME instruction); platform lacks SME2".into()
+                    ));
+                }
 
                 // 操作数 a/b 现指向已被 TileLoad 灌入数据的 Z 寄存器 (根治潜伏 bug)。
                 // FMOPA ZA0.S, P0/M, P0/M, Zn.S, Zm.S — outer product accumulate

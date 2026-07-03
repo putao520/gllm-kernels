@@ -71,6 +71,14 @@ impl AArch64Lower {
         0xA540A000 | ((pg as u32 & 0x07) << 10) | ((xn as u32 & 0x1F) << 5) | (zt as u32 & 0x1F)
     }
 
+    /// LD1W {Zt.S}, Pg/Z, [Xn, Zm.S, SXTW #2] — SVE vector+vector gather (32-bit index,
+    /// sign-extended to 64-bit, scaled by #2 = sizeof(f32))。BCE-20260704-AARCH64-005:
+    /// SVE 原生 gather 指令, 替代 NEON for-lane (Scalable width 的 f32_lanes()=0 静默 NOP)。
+    /// 编码: 1000 0101 10 1 Zm 011 Pg Xn Zt
+    fn enc_ld1w_gather_sxtw(&self, zt: u8, pg: u8, xn: u8, zm: u8) -> u32 {
+        0x85206000 | ((zm as u32 & 0x1F) << 16) | ((pg as u32 & 0x07) << 10) | ((xn as u32 & 0x1F) << 5) | (zt as u32 & 0x1F)
+    }
+
     /// ST1W {Zt.S}, Pg, [Xn, Xm, LSL #2] — SVE predicated 32-bit store (scalar+scalar)。
     /// 编码: 1110 0101 01 0 Xm 010 Pg Xn Zt
     fn enc_st1w_ss(&self, zt: u8, pg: u8, xn: u8, xm: u8) -> u32 {
@@ -80,6 +88,14 @@ impl AArch64Lower {
     /// ST1W {Zt.S}, Pg, [Xn] — SVE predicated 32-bit store (zero offset)。
     fn enc_st1w_imm(&self, zt: u8, pg: u8, xn: u8) -> u32 {
         0xE540E000 | ((pg as u32 & 0x07) << 10) | ((xn as u32 & 0x1F) << 5) | (zt as u32 & 0x1F)
+    }
+
+    /// ST1W {Zt.S}, Pg, [Xn, Zm.S, SXTW #2] — SVE vector+vector scatter (32-bit index,
+    /// sign-extended to 64-bit, scaled by #2 = sizeof(f32))。BCE-20260704-AARCH64-005:
+    /// SVE 原生 scatter 指令, 替代 NEON for-lane。
+    /// 编码: 1110 0101 10 1 Zm 011 Pg Xn Zt
+    fn enc_st1w_scatter_sxtw(&self, zt: u8, pg: u8, xn: u8, zm: u8) -> u32 {
+        0xE5206000 | ((zm as u32 & 0x1F) << 16) | ((pg as u32 & 0x07) << 10) | ((xn as u32 & 0x1F) << 5) | (zt as u32 & 0x1F)
     }
 
     /// FADD Zd.S, Pg/M, Zd.S, Zm.S — SVE predicated f32 add (destructive: Zd = Zn op Zm, Zdn=Zd)。
@@ -96,6 +112,13 @@ impl AArch64Lower {
     /// FMUL Zdn.S, Pg/M, Zdn.S, Zm.S
     fn enc_sve_fmul_s(&self, zdn: u8, pg: u8, zm: u8) -> u32 {
         0x65828000 | ((pg as u32 & 0x07) << 10) | ((zm as u32 & 0x1F) << 5) | (zdn as u32 & 0x1F)
+    }
+
+    /// MUL Zdn.S, Pg/M, Zdn.S, Zm.S — SVE 整数 32-bit 乘法 (破坏性: Zdn = Zdn * Zm)。
+    /// 用于 gather/scatter 索引缩放 (stride != 1)。BCE-20260704-AARCH64-005。
+    /// 编码: 0000 0100 10 10 0 00 Zm 00 Pg Zdn Zdn
+    fn enc_sve_mul_int_s(&self, zdn: u8, pg: u8, zm: u8) -> u32 {
+        0x04A00000 | ((zm as u32 & 0x1F) << 16) | ((pg as u32 & 0x07) << 10) | ((zdn as u32 & 0x1F) << 5) | (zdn as u32 & 0x1F)
     }
 
     /// FDIV Zdn.S, Pg/M, Zdn.S, Zm.S

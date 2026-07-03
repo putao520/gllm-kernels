@@ -1023,4 +1023,191 @@ mod tests {
         );
     }
 
+    // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+    //  BCE-20260704-AARCH64 违宪根治回归测试
+    // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+    /// AARCH64-002: TileMma FMOPA 在无 SME2 的 CPU 必须返回 Err (NO-SILENT-FALLBACK),
+    /// 而非无条件发射 FMOPA 导致 SIGILL。
+    #[test]
+    fn test_tile_mma_no_sme2_returns_err() {
+        let mut lower = AArch64Lower {
+            code: Vec::new(),
+            const_pool: Vec::new(),
+            loop_stack: Vec::new(),
+            labels: std::collections::HashMap::new(),
+            platform: AArch64Features { has_sve: true, has_sve2: true, has_sme2: false, has_bf16: false, has_dotprod: false, has_i8mm: false, sve_vl: 32 },
+            jit_ctx: make_test_jit_ctx(),
+        };
+        let alloc = RegAllocation {
+            mapping: std::collections::HashMap::new(),
+            spills: vec![],
+            callee_saved_used: vec![],
+        };
+        let result = lower.lower_instr(&VmInstr::TileMma {
+            c: VRegId(0), a: VRegId(1), b: VRegId(2),
+            m: 1, n: 1, k: 1, dtype: DType::F32,
+        }, &alloc);
+        assert!(result.is_err(), "TileMma on non-SME2 platform must return Err (NO-SILENT-FALLBACK), got Ok");
+        let err_msg = format!("{}", result.unwrap_err());
+        assert!(err_msg.contains("SME2") || err_msg.contains("SME"),
+            "Err must mention SME/SME2 requirement, got: {}", err_msg);
+    }
+
+    /// AARCH64-005: GatherLoad 在 Scalable (SVE) width 必须发射 SVE gather 指令
+    /// (LD1W ...SXTW #2), 不能静默 NOP (原 f32_lanes()=0 → for i in 0..0)。
+    #[test]
+    fn test_gather_load_sve_emits_gather_not_nop() {
+        let mut lower = AArch64Lower {
+            code: Vec::new(),
+            const_pool: Vec::new(),
+            loop_stack: Vec::new(),
+            labels: std::collections::HashMap::new(),
+            platform: AArch64Features { has_sve: true, has_sve2: true, has_sme2: false, has_bf16: false, has_dotprod: false, has_i8mm: false, sve_vl: 32 },
+            jit_ctx: make_test_jit_ctx(),
+        };
+        let mut mapping = std::collections::HashMap::new();
+        mapping.insert(VRegId(0), PhysReg::Vec(PhysVec(0)));  // dst
+        mapping.insert(VRegId(1), PhysReg::Gpr(PhysGpr(1))); // base
+        mapping.insert(VRegId(2), PhysReg::Gpr(PhysGpr(2))); // indices
+        let alloc = RegAllocation { mapping, spills: vec![], callee_saved_used: vec![] };
+
+        lower.lower_instr(&VmInstr::GatherLoad {
+            dst: VRegId(0), base: VRegId(1), indices: VRegId(2),
+            stride: 1, width: SimdWidth::Scalable,
+            dtype: QuantPrecision::F32, predicate: None,
+        }, &alloc).unwrap();
+
+        let code = lower.finalize().unwrap();
+        // Must emit ≥3 instructions: PTRUE + LD1W(idx load) + LD1W gather (stride==1)
+        assert!(code.len() >= 12, "SVE gather must emit instructions (not NOP), got {} bytes", code.len());
+        // Verify the SVE gather LD1W Zt.S, Pg/Z, [Xn, Zm, SXTW #2] base 0x85206000 is present.
+        // Mask out variable fields (Zm[20:16], Pg[12:10], Xn[9:5], Zt[4:0]) → fixed bits 0xFFE0E000.
+        let mut found_gather = false;
+        for chunk in code.chunks_exact(4) {
+            let instr = u32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]);
+            if instr & 0xFFE0E000 == 0x85206000 {
+                found_gather = true;
+                break;
+            }
+        }
+        assert!(found_gather, "SVE gather must emit LD1W [Xn,Zm,SXTW#2] (0x85206xxx), got code: {:08X?}", {
+            let mut v = Vec::new();
+            for c in code.chunks_exact(4) { v.push(u32::from_le_bytes([c[0],c[1],c[2],c[3]])); }
+            v
+        });
+    }
+
+    /// AARCH64-005: ScatterStore 在 Scalable (SVE) width 必须发射 SVE scatter 指令。
+    #[test]
+    fn test_scatter_store_sve_emits_scatter() {
+        let mut lower = AArch64Lower {
+            code: Vec::new(),
+            const_pool: Vec::new(),
+            loop_stack: Vec::new(),
+            labels: std::collections::HashMap::new(),
+            platform: AArch64Features { has_sve: true, has_sve2: true, has_sme2: false, has_bf16: false, has_dotprod: false, has_i8mm: false, sve_vl: 32 },
+            jit_ctx: make_test_jit_ctx(),
+        };
+        let mut mapping = std::collections::HashMap::new();
+        mapping.insert(VRegId(0), PhysReg::Vec(PhysVec(0)));  // src
+        mapping.insert(VRegId(1), PhysReg::Gpr(PhysGpr(1))); // base
+        mapping.insert(VRegId(2), PhysReg::Gpr(PhysGpr(2))); // indices
+        let alloc = RegAllocation { mapping, spills: vec![], callee_saved_used: vec![] };
+
+        lower.lower_instr(&VmInstr::ScatterStore {
+            base: VRegId(1), indices: VRegId(2), src: VRegId(0),
+            stride: 1, width: SimdWidth::Scalable,
+            dtype: QuantPrecision::F32, predicate: None,
+        }, &alloc).unwrap();
+
+        let code = lower.finalize().unwrap();
+        assert!(code.len() >= 12, "SVE scatter must emit instructions (not NOP), got {} bytes", code.len());
+        let mut found_scatter = false;
+        for chunk in code.chunks_exact(4) {
+            let instr = u32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]);
+            if instr & 0xFFE0E000 == 0xE5206000 {
+                found_scatter = true;
+                break;
+            }
+        }
+        assert!(found_scatter, "SVE scatter must emit ST1W [Xn,Zm,SXTW#2] (0xE5206xxx)");
+    }
+
+    /// AARCH64-007: VecNarrow F32→F16 必须发射 FCVTN (非 Err)。
+    #[test]
+    fn test_vec_narrow_f32_to_f16_emits_fcvtn() {
+        let mut lower = AArch64Lower::new();
+        let mut mapping = std::collections::HashMap::new();
+        mapping.insert(VRegId(0), PhysReg::Vec(PhysVec(0)));
+        mapping.insert(VRegId(1), PhysReg::Vec(PhysVec(1)));
+        let alloc = RegAllocation { mapping, spills: vec![], callee_saved_used: vec![] };
+        lower.lower_instr(&VmInstr::VecNarrow {
+            dst: VRegId(0), src: VRegId(1),
+            dst_dtype: QuantPrecision::F16, src_dtype: QuantPrecision::F32,
+            width: SimdWidth::W128,
+        }, &alloc).unwrap();
+        let code = lower.finalize().unwrap();
+        let instr = u32::from_le_bytes([code[0], code[1], code[2], code[3]]);
+        assert_eq!(instr & 0xFFFFFC00, 0x0E216800, "F32→F16 must emit FCVTN (0x0E216800), got {:#010X}", instr);
+    }
+
+    /// AARCH64-007: VecNarrow F32→BF16 需 has_bf16 (BFCVTN), 无 has_bf16 返回 Err。
+    #[test]
+    fn test_vec_narrow_f32_to_bf16_requires_has_bf16() {
+        let mut lower = AArch64Lower {
+            code: Vec::new(), const_pool: Vec::new(), loop_stack: Vec::new(),
+            labels: std::collections::HashMap::new(),
+            platform: AArch64Features { has_sve: false, has_sve2: false, has_sme2: false, has_bf16: false, has_dotprod: false, has_i8mm: false, sve_vl: 16 },
+            jit_ctx: make_test_jit_ctx(),
+        };
+        let mut mapping = std::collections::HashMap::new();
+        mapping.insert(VRegId(0), PhysReg::Vec(PhysVec(0)));
+        mapping.insert(VRegId(1), PhysReg::Vec(PhysVec(1)));
+        let alloc = RegAllocation { mapping, spills: vec![], callee_saved_used: vec![] };
+        let result = lower.lower_instr(&VmInstr::VecNarrow {
+            dst: VRegId(0), src: VRegId(1),
+            dst_dtype: QuantPrecision::BF16, src_dtype: QuantPrecision::F32,
+            width: SimdWidth::W128,
+        }, &alloc);
+        assert!(result.is_err(), "F32→BF16 without has_bf16 must Err (NO-SILENT-FALLBACK)");
+    }
+
+    /// AARCH64-007: VecWiden F16→F32 必须发射 FCVTL (非 Err)。
+    #[test]
+    fn test_vec_widen_f16_to_f32_emits_fcvtl() {
+        let mut lower = AArch64Lower::new();
+        let mut mapping = std::collections::HashMap::new();
+        mapping.insert(VRegId(0), PhysReg::Vec(PhysVec(0)));
+        mapping.insert(VRegId(1), PhysReg::Vec(PhysVec(1)));
+        let alloc = RegAllocation { mapping, spills: vec![], callee_saved_used: vec![] };
+        lower.lower_instr(&VmInstr::VecWiden {
+            dst: VRegId(0), src: VRegId(1),
+            dst_dtype: QuantPrecision::F32, src_dtype: QuantPrecision::F16,
+            width: SimdWidth::W128,
+        }, &alloc).unwrap();
+        let code = lower.finalize().unwrap();
+        let instr = u32::from_le_bytes([code[0], code[1], code[2], code[3]]);
+        assert_eq!(instr & 0xFFFFFC00, 0x0E617800, "F16→F32 must emit FCVTL (0x0E617800), got {:#010X}", instr);
+    }
+
+    /// AARCH64-011: FP8→F32 必须返回 Err (注明 FEAT_FP8 限制), 不静默 NOP。
+    #[test]
+    fn test_fp8_to_float_returns_err_no_silent_nop() {
+        let mut lower = AArch64Lower::new();
+        let mut mapping = std::collections::HashMap::new();
+        mapping.insert(VRegId(0), PhysReg::Vec(PhysVec(0)));
+        mapping.insert(VRegId(1), PhysReg::Vec(PhysVec(1)));
+        let alloc = RegAllocation { mapping, spills: vec![], callee_saved_used: vec![] };
+        let result = lower.lower_instr(&VmInstr::VecUnaryOp {
+            dst: VRegId(0), a: VRegId(1), op: VecUnaryOp::Fp8E4M3ToFloat,
+        }, &alloc);
+        assert!(result.is_err(), "FP8→F32 must Err (no has_fp8 + no software cvt), not silent NOP");
+        let err_msg = format!("{}", result.unwrap_err());
+        assert!(err_msg.contains("FP8") || err_msg.contains("fp8") || err_msg.contains("FEAT_FP8"),
+            "Err must mention FP8/FEAT_FP8 limitation, got: {}", err_msg);
+        // 确保未发射任何指令 (静默 NOP 的反面: Err 时不写入 code)
+        assert!(lower.finalize().unwrap().is_empty(), "Err path must not emit code bytes (no silent NOP)");
+    }
+
 }

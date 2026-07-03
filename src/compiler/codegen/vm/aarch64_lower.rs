@@ -22,6 +22,7 @@ use super::reg_alloc::RegAllocation;
 use super::stack_frame::StackFrame;
 use crate::compiler::trace::AArch64ElemStrategy;
 use crate::compiler::trace::QuantPrecision;
+use crate::compiler::trace::DTypeKind;
 use crate::types::CompilerError;
 use crate::types::DType;
 

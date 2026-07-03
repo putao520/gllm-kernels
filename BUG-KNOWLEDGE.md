@@ -370,3 +370,51 @@
 - 本条目: BUG-KNOWLEDGE.md 沉淀
 - 状态: ✅ 已闭环 (residual=0)
 
+
+---
+
+## BCE-20260704-AARCH64-VIOLATIONS (Workflow 全设备审计 aarch64 4处违宪)
+
+**patternId**: BCE-20260704-AARCH64-VIOLATIONS
+**title**: aarch64 codegen 4 处违宪 (TileMma FMOPA 无 SME 守卫 / GatherLoad SVE 静默 NOP / VecNarrow/VecWiden dtype 转换未实现 / FP8 转换未实现)
+**layer**: 设计缺陷 + 范式缺陷 (NO-SILENT-FALLBACK 违反)
+**归因时间**: 2026-07-04
+
+### 4 处 confirmed REAL findings
+
+| ID | P级 | 位置 | BUG | 根治 |
+|----|-----|------|-----|------|
+| AARCH64-002 | P0致命 | lower_tile_mma_aarch64 | FMOPA 无条件发射 (SME 指令), 无 has_sme2 守卫 → 无 SME CPU SIGILL | 入口加 `if !has_sme2 return Err` (与 TileLoad/TileStore 一致) |
+| AARCH64-005 | P0致命 | lower_gather_load/scatter_store_aarch64 | Scalable width 的 `f32_lanes()=0` → `for i in 0..0` = 零条 gather 指令 = dst 未初始化 (数据损坏) | SVE 路径用原生 gather LD1W/ST1W `[Xn,Zm,SXTW#2]`; NEON 路径保持 for-lane |
+| AARCH64-007 | P2 | lower_vec_narrow/widen_aarch64 | 不同 dtype 转换 `return Err('not yet implemented')` | F32→F16 FCVTN / F32→BF16 BFCVTN (需 has_bf16) / F16→F32 FCVTL; BF16→F32 保留 Err 注明 NEON 无 BFCVTL |
+| AARCH64-011 | P2 | lower_vec_unary_op_aarch64 (FP8) | FP8→F32 `return Err` 无实现注明 | 保留 Err 但注明 FEAT_FP8 限制 (platform 无 has_fp8 字段, 软件转换未编码) |
+
+### BUG 模式签名
+
+```yaml
+detectionSignatures:
+  antipattern:
+    - "无条件发射 SME/SVE2 专属指令而无 has_* 守卫 (NO-SILENT-FALLBACK 违反)"
+    - "Scalable SimdWidth 的 f32_lanes()=0 静默导致 for-lane 循环体不执行"
+    - "dtype 转换 return Err('not yet implemented') 而非实现硬件指令"
+sameClassCriterion:
+  - "任何 SME/SVE2/SVE/FEAT_* 专属指令发射点必须有对应 has_* 守卫"
+  - "任何 Scalable width 路径不能用 f32_lanes() 控制 for-lane (必须用 SVE 原生向量指令)"
+  - "dtype 转换必须有硬件指令实现或明确 Err 注明架构限制"
+fixTemplate:
+  - "入口守卫: if !self.platform.has_X { return Err(...) }"
+  - "SVE gather/scatter: LD1W/ST1W Zt.S, Pg, [Xn, Zm, SXTW #2] + 索引 stride 缩放 (MUL Zdn.S, Pg/M, Zdn.S, Zm.S)"
+  - "dtype 转换: 实现 FCVTN/BFCVTN/FCVTL 编码 + match (src_kind, dst_kind) dispatch"
+```
+
+### 全量确认 (residual=0)
+
+- 重扫 aarch64_lower/lower_instr_dispatch.inc.rs: 4 处全部根治
+- cargo check --lib: 0 errors
+- cargo test --lib: 7014 passed / 0 failed (含 7 新回归测试)
+- 7 回归测试: test_tile_mma_no_sme2 / test_gather_load_sve / test_scatter_store_sve / test_vec_narrow_f32_to_f16 / test_vec_narrow_f32_to_bf16_requires_has_bf16 / test_vec_widen_f16_to_f32 / test_fp8_to_float_returns_err_no_silent_nop
+
+### 防复发沉淀
+- 回归测试: 7 个 (写入 tests.inc.rs)
+- BUG-KNOWLEDGE.md: 本条目
+- 状态: ✅ 已闭环 (residual=0)
