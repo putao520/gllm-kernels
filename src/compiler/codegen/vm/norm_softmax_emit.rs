@@ -656,6 +656,16 @@ mod tests {
         }
     }
 
+    /// Helper (BCE-20260703-NORM-MIXED-PRECISION-STEPBYTES): 递归检测 OffsetExpr 是否含
+    /// `Mul(inner, scale)` 且 scale 匹配。用于断言 weight VecLoad 用独立 weight 步长。
+    fn offset_contains_mul_const(off: &OffsetExpr, scale: usize) -> bool {
+        match off {
+            OffsetExpr::Mul(_, s) => *s == scale,
+            OffsetExpr::Add(a, b) => offset_contains_mul_const(a, scale) || offset_contains_mul_const(b, scale),
+            _ => false,
+        }
+    }
+
     // ── Test 1: emit_normlike_inline rejects non-NormLike patterns ──
 
     #[test]
@@ -2613,5 +2623,185 @@ mod tests {
             i, VmInstr::VecLoad { width: SimdWidth::W128, .. }
         ));
         assert!(has_w128_load, "Should contain VecLoad with W128 width");
+    }
+
+    // ── Test 77: BCE-20260703-NORM-MIXED-PRECISION-STEPBYTES regression —
+    // emit_normlike_one_group with mixed precision (input F32 + weight BF16) must use
+    // independent weight step_bytes for weight VecLoad, NOT reuse input byte_off.
+    // @trace BCE-20260703-NORM-MIXED-PRECISION-STEPBYTES [req:REQ-DTYPE-006] [level:unit]
+
+    #[test]
+    fn normlike_one_group_mixed_precision_weight_independent_step() {
+        // Arrange: input F32 (elem=4) + weight BF16 (elem=2), W256 (8 lanes)
+        // step_bytes (input) = 8×4 = 32; weight_step_bytes = 8×2 = 16
+        // 若复用 input byte_off (按 32 推进), BF16 weight 只读一半元素 → NaN
+        let mut prog = VmProgram::new();
+        let width = SimdWidth::W256;
+        let lanes = width.f32_lanes();
+        let feature_dim = 16usize; // vec_count=2, tail=0
+        let vec_count = feature_dim / lanes;
+        let step_bytes = width.bytes();
+        let elem = QuantPrecision::F32.elem_bytes();
+        let dtype = QuantPrecision::F32;
+        let weight_dtype = QuantPrecision::BF16;
+        let weight_step_bytes = lanes * weight_dtype.elem_bytes();
+        let s1 = SimdWidth::Scalar;
+
+        let acc = prog.alloc_vreg(VRegKind::Vec, width);
+        let temp = prog.alloc_vreg(VRegKind::Vec, width);
+        let scale = prog.alloc_vreg(VRegKind::Vec, width);
+        let dim_bc = prog.alloc_vreg(VRegKind::Vec, width);
+        let row_input = prog.alloc_vreg(VRegKind::Ptr, s1);
+        let weight_ptr = prog.alloc_vreg(VRegKind::Ptr, s1);
+        let row_output = prog.alloc_vreg(VRegKind::Ptr, s1);
+
+        let reduce = vec![TraceOp::Input(0), TraceOp::Input(1), TraceOp::Mul(ValueId(0), ValueId(1))];
+        let finalize = vec![TraceOp::Input(0), TraceOp::Rsqrt(ValueId(0))];
+        let transform = vec![TraceOp::Input(0), TraceOp::Input(1), TraceOp::Mul(ValueId(0), ValueId(1))];
+
+        // Act: mixed precision — weight_dtype (BF16) != dtype (F32)
+        emit_normlike_one_group(
+            &mut prog, &reduce, &finalize, &transform,
+            feature_dim, vec_count, step_bytes, elem, lanes, width,
+            NormKind::RmsNorm, acc, temp, scale, dim_bc,
+            row_input, weight_ptr, row_output, dtype, weight_dtype,
+        );
+
+        // Assert: weight VecLoad (dtype=BF16) must use OffsetExpr::Mul(LoopOffset(counter), weight_step_bytes),
+        // NOT LoopOffset(byte_off) which advances by input step_bytes (32, wrong for BF16).
+        let weight_loads: Vec<_> = prog.instrs.iter().filter_map(|i| match i {
+            VmInstr::VecLoad { dtype, offset, .. } if *dtype == weight_dtype => Some(offset),
+            _ => None,
+        }).collect();
+        assert!(!weight_loads.is_empty(), "Should emit weight VecLoad with BF16 dtype");
+
+        // 每一个 weight VecLoad 的 offset 必须含 Mul(.., weight_step_bytes=16), 不能是 LoopOffset(byte_off)
+        // (byte_off 关联 input step_bytes=32, BF16 weight 必须按 16 推进)
+        for off in &weight_loads {
+            let uses_independent_step = offset_contains_mul_const(off, weight_step_bytes);
+            let uses_loop_offset_only = matches!(off, OffsetExpr::LoopOffset(_));
+            assert!(
+                uses_independent_step && !uses_loop_offset_only,
+                "weight VecLoad offset {:?} must use independent weight_step_bytes={}, \
+                 not reuse input byte_off (step_bytes={})",
+                off, weight_step_bytes, step_bytes
+            );
+        }
+    }
+
+    // ── Test 78: BCE-20260703-NORM-MIXED-PRECISION-STEPBYTES regression —
+    // emit_normlike_one_group mixed precision with TAIL: weight tail offset must use
+    // weight_elem, NOT input elem.
+    // @trace BCE-20260703-NORM-MIXED-PRECISION-STEPBYTES [req:REQ-DTYPE-006] [level:unit]
+
+    #[test]
+    fn normlike_one_group_mixed_precision_tail_weight_offset() {
+        // Arrange: input F32 (elem=4) + weight BF16 (elem=2), feature_dim=10, W256 (8 lanes)
+        // vec_count=1, tail=2; input tail_off=32; weight tail_off=16
+        // input tail off = 32 + t*4; weight tail off = 16 + t*2
+        let mut prog = VmProgram::new();
+        let width = SimdWidth::W256;
+        let lanes = width.f32_lanes();
+        let feature_dim = 10usize;
+        let vec_count = feature_dim / lanes;
+        let step_bytes = width.bytes();
+        let elem = QuantPrecision::F32.elem_bytes();
+        let dtype = QuantPrecision::F32;
+        let weight_dtype = QuantPrecision::BF16;
+        let weight_elem = weight_dtype.elem_bytes();
+        let weight_tail_off = vec_count * (lanes * weight_elem);
+        let s1 = SimdWidth::Scalar;
+
+        let acc = prog.alloc_vreg(VRegKind::Vec, width);
+        let temp = prog.alloc_vreg(VRegKind::Vec, width);
+        let scale = prog.alloc_vreg(VRegKind::Vec, width);
+        let dim_bc = prog.alloc_vreg(VRegKind::Vec, width);
+        let row_input = prog.alloc_vreg(VRegKind::Ptr, s1);
+        let weight_ptr = prog.alloc_vreg(VRegKind::Ptr, s1);
+        let row_output = prog.alloc_vreg(VRegKind::Ptr, s1);
+
+        let reduce = vec![TraceOp::Input(0), TraceOp::Input(1), TraceOp::Mul(ValueId(0), ValueId(1))];
+        let finalize = vec![TraceOp::Input(0), TraceOp::Rsqrt(ValueId(0))];
+        let transform = vec![TraceOp::Input(0), TraceOp::Input(1), TraceOp::Mul(ValueId(0), ValueId(1))];
+
+        emit_normlike_one_group(
+            &mut prog, &reduce, &finalize, &transform,
+            feature_dim, vec_count, step_bytes, elem, lanes, width,
+            NormKind::RmsNorm, acc, temp, scale, dim_bc,
+            row_input, weight_ptr, row_output, dtype, weight_dtype,
+        );
+
+        // Assert: tail weight VecLoad 应使用 Const(weight_tail_off + t*weight_elem)
+        // 对 t=0: weight_tail_off + 0 = 16; 对 t=1: 16 + 2 = 18
+        // 错误版本会复用 input off (32 + t*4 = 32, 36)
+        let tail_weight_loads: Vec<_> = prog.instrs.iter().filter_map(|i| match i {
+            VmInstr::VecLoad { dtype, offset, width: SimdWidth::Scalar, .. } if *dtype == weight_dtype => {
+                match offset { OffsetExpr::Const(c) => Some(*c), _ => None }
+            }
+            _ => None,
+        }).collect();
+        assert!(!tail_weight_loads.is_empty(), "Should emit scalar tail weight VecLoad");
+        // t=0 weight off = 16
+        assert!(
+            tail_weight_loads.iter().any(|&c| c == weight_tail_off),
+            "tail weight offset t=0 should be {} (weight_tail_off), got {:?}",
+            weight_tail_off, tail_weight_loads
+        );
+        // t=1 weight off = 18
+        let t1_off = weight_tail_off + weight_elem;
+        assert!(
+            tail_weight_loads.iter().any(|&c| c == t1_off),
+            "tail weight offset t=1 should be {} (weight_tail_off + weight_elem), got {:?}",
+            t1_off, tail_weight_loads
+        );
+    }
+
+    // ── Test 79: BCE-20260703-NORM-MIXED-PRECISION-STEPBYTES regression —
+    // emit_layernorm_auto mixed precision: weight+bias VecLoad use independent weight step;
+    // bias_offset uses weight_elem (not input elem).
+    // @trace BCE-20260703-NORM-MIXED-PRECISION-STEPBYTES [req:REQ-DTYPE-006] [level:unit]
+
+    #[test]
+    fn layernorm_auto_mixed_precision_weight_bias_independent_step() {
+        // Arrange: input F32 (elem=4) + weight/bias BF16 (elem=2), feature_dim=16, W256
+        let mut prog = VmProgram::new();
+        let input_ptr = prog.alloc_vreg(VRegKind::Ptr, SimdWidth::Scalar);
+        let weight_ptr = prog.alloc_vreg(VRegKind::Ptr, SimdWidth::Scalar);
+        let output_ptr = prog.alloc_vreg(VRegKind::Ptr, SimdWidth::Scalar);
+
+        let result = emit_layernorm_auto(
+            &mut prog, 16, 1e-5,
+            SimdWidth::W256, BoundExpr::Const(1),
+            input_ptr, weight_ptr, output_ptr,
+            QuantPrecision::F32, QuantPrecision::BF16,
+        );
+
+        assert!(result.is_ok(), "layernorm mixed precision should succeed: {:?}", result);
+
+        // Assert: bias_offset = feature_dim × weight_elem = 16×2 = 32 (NOT 16×4=64)
+        // weight VecLoad offset must use Mul(.., weight_step_bytes=16)
+        let weight_dtype = QuantPrecision::BF16;
+        let lanes = SimdWidth::W256.f32_lanes();
+        let weight_step_bytes = lanes * weight_dtype.elem_bytes();
+        let expected_bias_offset = 16 * weight_dtype.elem_bytes(); // 32
+
+        // 找 bias VecLoad: offset = Add(Const(bias_offset), Mul(...))
+        let has_correct_bias = prog.instrs.iter().any(|i| match i {
+            VmInstr::VecLoad { dtype, offset, .. } if *dtype == weight_dtype => {
+                matches!(offset,
+                    OffsetExpr::Add(a, _)
+                    if matches!(a.as_ref(), OffsetExpr::Const(c) if *c == expected_bias_offset))
+            }
+            _ => false,
+        });
+        assert!(has_correct_bias, "bias VecLoad should start at weight_elem-based offset {}", expected_bias_offset);
+
+        // weight VecLoad (非 bias) offset 必须含 Mul(.., weight_step_bytes)
+        let weight_loads: Vec<_> = prog.instrs.iter().filter_map(|i| match i {
+            VmInstr::VecLoad { dtype, offset, .. } if *dtype == weight_dtype => Some(offset.clone()),
+            _ => None,
+        }).collect();
+        let has_independent_step = weight_loads.iter().any(|off| offset_contains_mul_const(off, weight_step_bytes));
+        assert!(has_independent_step, "weight/bias VecLoad should use Mul(.., {})", weight_step_bytes);
     }
 }
