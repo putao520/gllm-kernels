@@ -326,8 +326,14 @@ impl X86Lower {
     ///     byte = src_ptr[i]
     ///     nibble_0 = byte & 0xF
     ///     nibble_1 = (byte >> 4) & 0xF
-    ///     dst[2i]   = reconstruct(nibble_0, scale)   // 写入 dst_offset + i*8
-    ///     dst[2i+1] = reconstruct(nibble_1, scale)   // 写入 dst_offset + i*8 + 4
+    ///     tmp[2i]   = reconstruct(nibble_0, scale)   // 写栈 tmp 区 + i*8
+    ///     tmp[2i+1] = reconstruct(nibble_1, scale)   // 写栈 tmp 区 + i*8 + 4
+    ///   最后 vmovups dst_ymm, [rbp + tmp_rbp] 加载到 dst (寄存器或 spilled)
+    ///
+    /// 根治点 1: dst 写地址随迭代推进 (tmp_rbp + i*8 / +4), 禁止覆盖同一栈槽。
+    /// 根治点 2: dst 不强制 spilled — 用 emit_gather_load 同款模式: dst 已 spill
+    ///   则用其栈槽, 否则用专用 scratch 栈区, 解码后 vmovups 加载到 dst YMM 并按需
+    ///   spill_store_ymm 写回。RegAllocator 给 dst 分配物理 YMM 时不再 panic。
     ///
     /// 寄存器分配:
     ///   rax (s0): 临时 (nibble / mantissa)
@@ -335,30 +341,34 @@ impl X86Lower {
     ///   rdx (s0): src 指针 (每迭代 +1)
     ///   r8  (s0): scale (f32 bits, 全程不变)
     ///   r9  (s0): nibble_1 保存 (供 elem[1] 重读)
-    ///   r11 (s1): dst 基址 = rbp + dst_offset (循环不变)
-    ///
-    /// 根治点: dst 写地址随迭代推进 (dst_offset + i*8 / +4), 禁止覆盖同一栈槽
+    ///   r11 (s1): tmp 基址 = rbp + tmp_rbp (循环不变)
+    ///   xmm0    : 临时 f32 (写栈前中转)
     fn lower_kivi_dequant_load(
         &mut self,
         dst: &VRegId,
         src_ptr: &VRegId,
         scale_ptr: &VRegId,
         num_elems: usize,
-        _width: &SimdWidth,
+        width: &SimdWidth,
         alloc: &RegAllocation,
     ) -> Result<(), CompilerError> {
         let src_gpr = self.resolve_gpr_read(*src_ptr, alloc, 0)?;
         let scale_gpr = self.resolve_gpr_read(*scale_ptr, alloc, 1)?;
-        let dst_offset = self.spill_offset(*dst, alloc)
-            .ok_or_else(|| CompilerError::CodegenViolation(
-                format!("KiviDequantLoad: dst v{} not spilled", dst.0)
-            ))?;
+
+        // tmp 栈区: dst 已 spill 则用其栈槽, 否则用专用 scratch 栈区 (跟 emit_gather_load 同款)
+        let tmp_rbp: i32 = match self.spill_offset(*dst, alloc) {
+            Some(off) => off,
+            None => {
+                let scratch_stack_size = ((num_elems).max(8) * 4) as usize; // num_elems × f32, 至少 32B
+                self.stack_layout.spill_rbp_offset(0, scratch_stack_size)
+            }
+        };
 
         // Load scale (f32 bits), 全程不变
         self.asm.mov(r8d, dword_ptr(scale_gpr)).map_err(Self::err)?;
 
-        // r11 = rbp + dst_offset (循环不变的 dst 基址)
-        self.asm.lea(r11, qword_ptr(rbp + dst_offset)).map_err(Self::err)?;
+        // r11 = rbp + tmp_rbp (循环不变的 tmp 基址)
+        self.asm.lea(r11, qword_ptr(rbp + tmp_rbp)).map_err(Self::err)?;
 
         // Loop over pairs, unpack nibbles
         self.asm.xor(ecx, ecx).map_err(Self::err)?;
@@ -384,23 +394,67 @@ impl X86Lower {
         self.asm.and(eax, 0xFu32).map_err(Self::err)?;
 
         // elem[0] = reconstruct(nibble_0, scale): mantissa 注入 (nibble<<20 | scale_bits)
-        // 写入 dst[2i] = [r11 + rcx*8]
+        // 写入 tmp[2i] = [r11 + rcx*8], 经 xmm0 中转后 vmovss 存栈
         self.asm.shl(eax, 20).map_err(Self::err)?;
         self.asm.or(eax, r8d).map_err(Self::err)?;
-        self.asm.mov(dword_ptr(r11 + rcx * 8), eax).map_err(Self::err)?;
+        self.asm.vmovd(xmm0, eax).map_err(Self::err)?;
+        self.asm.vmovss(dword_ptr(r11 + rcx * 8), xmm0).map_err(Self::err)?;
 
         // elem[1] = reconstruct(nibble_1, scale)
-        // 写入 dst[2i+1] = [r11 + rcx*8 + 4]
+        // 写入 tmp[2i+1] = [r11 + rcx*8 + 4]
+        if (2 * (num_pairs - 1) + 1) < num_elems || num_pairs == 0 || (num_elems % 2 == 0) {
+            // 只在 num_elems 为偶数 或 当前 pair 的 high 元素有效时才写 elem[1]
+            // (num_elems 奇数时最后一 pair 无 high; 但循环条件 cmp ecx,num_pairs 已涵盖,
+            //  这里判 num_elems%2==0 简化: 偶数时所有 pair 都有 high)
+        }
         self.asm.mov(eax, r9d).map_err(Self::err)?;
         self.asm.shl(eax, 20).map_err(Self::err)?;
         self.asm.or(eax, r8d).map_err(Self::err)?;
-        self.asm.mov(dword_ptr(r11 + rcx * 8 + 4), eax).map_err(Self::err)?;
+        self.asm.vmovd(xmm0, eax).map_err(Self::err)?;
+        // 仅当 2i+1 < num_elems 才写 (奇数 num_elems 最后一 pair 跳过 high)
+        // 用编译时判断: 当前 pair ecx, 2*ecx+1 < num_elems
+        // 简化: 若 num_elems 偶数则恒写; 奇数且 ecx==num_pairs-1 时跳过
+        let last_pair = num_pairs.saturating_sub(1);
+        let need_high = |pair: usize| 2 * pair + 1 < num_elems;
+        // 编译时展开判断 (循环已 unroll 在 Rust 层, 但这里是 JIT emit 循环, 无法在 emit 时知道 ecx)
+        // 正解: 用运行时 cmp + 条件跳转, 但为简化, 当 num_elems 偶数时无条件写;
+        //       奇数时跳过最后一 pair 的 high (在循环外用 cmp 处理)。
+        if num_elems % 2 == 0 {
+            self.asm.vmovss(dword_ptr(r11 + rcx * 8 + 4), xmm0).map_err(Self::err)?;
+        } else {
+            // 奇数 num_elems: 最后一 pair (ecx == last_pair) 跳过 high
+            let mut skip_high = self.asm.create_label();
+            self.asm.cmp(ecx, last_pair as u32).map_err(Self::err)?;
+            self.asm.je(skip_high.clone()).map_err(Self::err)?;
+            self.asm.vmovss(dword_ptr(r11 + rcx * 8 + 4), xmm0).map_err(Self::err)?;
+            self.asm.set_label(&mut skip_high).map_err(Self::err)?;
+        }
+        let _ = (last_pair, need_high);
 
         self.asm.inc(rdx).map_err(Self::err)?;
         self.asm.inc(ecx).map_err(Self::err)?;
         self.asm.jmp(unpack_loop).map_err(Self::err)?;
 
         self.asm.set_label(&mut unpack_done).map_err(Self::err)?;
+
+        // 加载 tmp 区到 dst YMM (寄存器或 spilled), 跟 emit_gather_load 同款
+        let (dst_ymm, dst_spilled) = self.resolve_ymm_or_spill_write(*dst, alloc, 0)?;
+        match width {
+            SimdWidth::W512 => {
+                let (dst_zmm, _) = self.resolve_zmm_or_spill_write(*dst, alloc, 0)?;
+                self.asm.vmovups(dst_zmm, zmmword_ptr(rbp + tmp_rbp)).map_err(Self::err)?;
+            }
+            SimdWidth::W256 => {
+                self.asm.vmovups(dst_ymm, ymmword_ptr(rbp + tmp_rbp)).map_err(Self::err)?;
+            }
+            SimdWidth::Scalar => {
+                self.asm.vmovss(Self::ymm_to_xmm(dst_ymm), dword_ptr(rbp + tmp_rbp)).map_err(Self::err)?;
+            }
+            _ => {
+                self.asm.vmovups(dst_ymm, ymmword_ptr(rbp + tmp_rbp)).map_err(Self::err)?;
+            }
+        }
+        if dst_spilled { self.spill_store_ymm(*dst, alloc, 0)?; }
         Ok(())
     }
 

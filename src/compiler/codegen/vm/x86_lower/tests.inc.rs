@@ -781,4 +781,30 @@ mod tests {
             "AVX-512 vec 守恒: allocatable + scratch = 32"
         );
     }
+
+    #[test]
+    fn test_kivi_dequant_load_assembles_repro() {
+        // BCE-20260703-KIVI repro: assemble KiviDequantLoad end-to-end to catch iced-x86 encoding errors
+        let mut prog = VmProgram::new();
+        let src_ptr = prog.alloc_vreg(VRegKind::Ptr, SimdWidth::Scalar);
+        let scale_ptr = prog.alloc_vreg(VRegKind::Ptr, SimdWidth::Scalar);
+        let dst = prog.alloc_vreg(VRegKind::Vec, SimdWidth::W256);
+        prog.emit(VmInstr::KiviDequantLoad {
+            dst, src_ptr, scale_ptr, num_elems: 8, width: SimdWidth::W256,
+        });
+        let dp = DeviceProfile::detect();
+        let profile = IsaProfile::from_device_profile(&dp);
+        let alloc = RegAllocator::new(&profile).allocate(&prog).unwrap();
+        let frame = super::super::stack_frame::StackFrame::compute(&alloc, &profile, 0);
+        let mut lower = X86Lower::new();
+        lower.emit_prologue(&frame, &alloc).unwrap();
+        for instr in &prog.instrs {
+            if let Err(e) = lower.lower_instr(instr, &alloc) {
+                panic!("lower_instr failed for {:?}: {e:?}", instr);
+            }
+        }
+        lower.emit_epilogue(&frame, &alloc).unwrap();
+        let code = lower.finalize().unwrap();
+        assert!(code.len() > 10, "code too short: {} bytes", code.len());
+    }
 }
