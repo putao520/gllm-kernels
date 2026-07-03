@@ -85,8 +85,14 @@ fn lower_op_normlike(prog: &mut VmProgram, op: &CompilerOp, graph: &CompilerGrap
                 resolve_sym_dim(&outer_seq, abi, sym_map)
             };
             let input_ptr = resolver.materialize(prog, op.inputs[0], abi).unwrap_or_else(|| prog.alloc_vreg(VRegKind::Ptr, width));
-            let weight_ptr = resolver.materialize(prog, op.inputs[1], abi).unwrap_or_else(|| prog.alloc_vreg(VRegKind::Ptr, width));
-            let weight_dtype = graph.tensor(op.inputs[1]).map(|t| t.dtype.to_quant_precision()).unwrap_or(ctx.dtype);
+            // QkNorm (L2 + √head_dim rescale, 无 learned weight): NormKind::ValueNorm has_weight()=false,
+            // emit_normlike_inline 不 emit weight VecLoad (norm_softmax_emit.rs 的 if norm_kind.has_weight() 守卫)。
+            // weight_ptr 复用 input_ptr (占位, 不被使用), weight_dtype 用 ctx.dtype (无独立 weight dtype)。
+            // 禁止访问 op.inputs[1] — QkNorm 构造时只传 1 个 input (fusion/pass.rs:3160 / fusion/helpers.rs:2260),
+            // 访问 inputs[1] 会 panic (index out of bounds)。
+            // @trace BCE-20260703-L2NORMALIZE-INPUTS-OOB [level:unit]
+            let weight_ptr = input_ptr;
+            let weight_dtype = ctx.dtype;
             let output_ptr = resolver.materialize(prog, op.outputs[0], abi)
                 .ok_or_else(|| CompilerError::CodegenViolation(format!("QkNorm op {:?}: 无输出指针", op.id)))?;
             let pattern = build_norm_pattern_qk(eps, head_dim)?;
@@ -104,8 +110,14 @@ fn lower_op_normlike(prog: &mut VmProgram, op: &CompilerOp, graph: &CompilerGrap
             let seq_bound = abi.mega_decode_seq_len.map(BoundExpr::DynamicVReg)
                 .unwrap_or(BoundExpr::Const(1));
             let input_ptr = resolver.materialize(prog, op.inputs[0], abi).unwrap_or_else(|| prog.alloc_vreg(VRegKind::Ptr, width));
-            let weight_ptr = resolver.materialize(prog, op.inputs[1], abi).unwrap_or_else(|| prog.alloc_vreg(VRegKind::Ptr, width));
-            let weight_dtype = graph.tensor(op.inputs[1]).map(|t| t.dtype.to_quant_precision()).unwrap_or(ctx.dtype);
+            // L2Normalize (x/||x||) 无 weight: NormKind::ValueNorm has_weight()=false,
+            // emit_normlike_inline 不 emit weight VecLoad (norm_softmax_emit.rs 的 if norm_kind.has_weight() 守卫)。
+            // weight_ptr 复用 input_ptr (占位, 不被使用), weight_dtype 用 ctx.dtype (无独立 weight dtype)。
+            // 禁止访问 op.inputs[1] — L2Normalize 构造时只传 1 个 input (graph_impl.inc.rs:685 / fusion/pass.rs:2092),
+            // 访问 inputs[1] 会 panic (index out of bounds)。
+            // @trace BCE-20260703-L2NORMALIZE-INPUTS-OOB [level:unit]
+            let weight_ptr = input_ptr;
+            let weight_dtype = ctx.dtype;
             let output_ptr = resolver.materialize(prog, op.outputs[0], abi)
                 .ok_or_else(|| CompilerError::CodegenViolation(format!("L2Normalize op {:?}: 无输出指针", op.id)))?;
             let key = ScalarOpRegistry::key_from_op(&op.op);
