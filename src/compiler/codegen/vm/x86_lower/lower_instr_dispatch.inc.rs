@@ -747,6 +747,69 @@ impl X86Lower {
                 //   WidenCompute (BF16/F16) → load 2-byte, vcvtph2ps to widen
                 let strategy = dtype.x86_elem_strategy();
                 // dst 纯写: spilled 用 spill scratch slot 2,内容生成后写回。
+
+                // BCE-20260703-AVX512-BROADCAST-NAN:
+                // AVX-512 模式下 dst 是 ZMM(512-bit/16 floats),下游消费者(FMA/VecStore)
+                // 用 resolve_zmm + vfmadd231ps/vmovups zmm 读完整 16 lanes。
+                // 旧实现无视 use_avx512,总用 resolve_ymm + vbroadcastss ymm(256-bit/8 floats),
+                // 只填低 8 lanes,高 8 lanes 留**未初始化**。FMA 读 ZMM 高 8 lanes = 垃圾
+                // → garbage + garbage*b = NaN/inf 传播到输出(5070Ti AMD 9950X3D logits 全 NaN
+                // 的真因)。根治:use_avx512=true 时走 ZMM 路径,vbroadcastss zmm 填满全部 16 lanes。
+                if self.use_avx512 {
+                    // ZMM 路径: 所有输出按 512-bit 广播,匹配下游 ZMM 消费者。
+                    let (dst_zmm, dst_spilled) = self.resolve_zmm_or_spill_write(*dst, alloc, 2)?;
+                    match strategy {
+                        X86ElemStrategy::WidenCompute => {
+                            match src {
+                                ScalarExpr::Const(val) => {
+                                    let label = self.const_f32(*val);
+                                    self.asm.vbroadcastss(dst_zmm, dword_ptr(label)).map_err(Self::err)?;
+                                }
+                                ScalarExpr::MemLoad(base, ref offset) => {
+                                    let base_reg = self.resolve_gpr_read(*base, alloc, 2)?;
+                                    self.eval_offset_to_rax(offset, alloc)?;
+                                    self.asm.add(rax, base_reg).map_err(Self::err)?;
+                                    let tmp_xmm = self.scratch_xmm(0);
+                                    self.asm.vmovd(tmp_xmm, dword_ptr(rax)).map_err(Self::err)?;
+                                    // vcvtph2ps zmm,xmm 不在 iced code_asm; 经 ymm 转换后
+                                    // 广播低 F32 (ymm lane0) 到完整 zmm。
+                                    let tmp_ymm = self.scratch_ymm(0);
+                                    self.asm.vcvtph2ps(tmp_ymm, tmp_xmm).map_err(Self::err)?;
+                                    self.asm.vbroadcastss(dst_zmm, dword_ptr(Self::ymm_to_xmm(tmp_ymm))).map_err(Self::err)?;
+                                }
+                                ScalarExpr::ExtractLane0(src_vreg) | ScalarExpr::VReg(src_vreg) => {
+                                    // Source already F32 (ZMM). vpermilps zmm,zmm,0 broadcasts
+                                    // lane0 within each 128-bit block → all 16 lanes = lane0.
+                                    let (src_zmm, _) = self.resolve_zmm_or_spill(*src_vreg, alloc, 0)?;
+                                    self.asm.vpermilps(dst_zmm, src_zmm, 0i32).map_err(Self::err)?;
+                                }
+                            }
+                        }
+                        _ => {
+                            // Native / DequantCompute: standard F32 broadcast to ZMM
+                            match src {
+                                ScalarExpr::Const(val) => {
+                                    let label = self.const_f32(*val);
+                                    self.asm.vbroadcastss(dst_zmm, dword_ptr(label)).map_err(Self::err)?;
+                                }
+                                ScalarExpr::MemLoad(base, ref offset) => {
+                                    let base_reg = self.resolve_gpr_read(*base, alloc, 2)?;
+                                    self.eval_offset_to_rax(offset, alloc)?;
+                                    self.asm.add(rax, base_reg).map_err(Self::err)?;
+                                    self.asm.vbroadcastss(dst_zmm, dword_ptr(rax)).map_err(Self::err)?;
+                                }
+                                ScalarExpr::ExtractLane0(src_vreg) | ScalarExpr::VReg(src_vreg) => {
+                                    let (src_zmm, _) = self.resolve_zmm_or_spill(*src_vreg, alloc, 0)?;
+                                    self.asm.vpermilps(dst_zmm, src_zmm, 0i32).map_err(Self::err)?;
+                                }
+                            }
+                        }
+                    }
+                    if dst_spilled { self.spill_store_zmm(*dst, alloc, 2)?; }
+                    return Ok(());
+                }
+
+                // AVX2 / SSE 路径 (use_avx512=false): 保持原 YMM 实现
                 match strategy {
                     X86ElemStrategy::WidenCompute => {
                         // Broadcast with widen: load BF16 scalar → vcvtph2ps → broadcast F32
