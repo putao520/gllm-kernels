@@ -1319,11 +1319,22 @@ fn dispatch_normlike(
 ) -> Result<VRegId, CompilerError> {
     match op {
         TraceOp::Softmax { src, dst: _ } => {
+            // BCE-20260704-STEP-DTYPE-MISMATCH: 死路径标注。
+            // 生产 JIT 的 Op::Softmax 走 emit_softmax_inline (lower_op.inc.rs:134, 用
+            // feature_dim + ctx.dtype 正确计算 vocab_bytes), 不经此路径。此 dispatch
+            // 仅 algo_interpreter 测试/SamplingSoftmax 模板实例化时可达, 且
+            // SAMPLING_SOFTMAX 模板未在生产 select_template callsite 挂载 (生产仅
+            // Gemm/Rope/Norm 模板)。原 vocab_bytes = width.f32_lanes()*4 硬编码 F32 单
+            // 寄存器宽 (32B for W256), 既非完整 vocab 字节数也忽略 dtype。
+            // 安全降级: 用 default_dtype.elem_bytes() 保持 dtype 一致 (F32=lanes*4,
+            // BF16=lanes*2)。若未来接入生产, 须改为从 graph 推导完整 vocab_bytes =
+            // vocab_size * elem_bytes (参考 emit_softmax_inline)。
+            let vocab_bytes = width.f32_lanes() * default_dtype.elem_bytes();
             let max_r = prog.alloc_vreg(VRegKind::Scalar, SimdWidth::Scalar);
             prog.emit(VmInstr::SoftmaxReduceMax {
                 dst: max_r,
                 logits_ptr: slots[src.0 as usize],
-                vocab_bytes: width.f32_lanes() * 4,
+                vocab_bytes,
                 width,
             });
             let sum_r = prog.alloc_vreg(VRegKind::Scalar, SimdWidth::Scalar);
@@ -1331,14 +1342,14 @@ fn dispatch_normlike(
                 sum_dst: sum_r,
                 logits_ptr: slots[src.0 as usize],
                 max_val: max_r,
-                vocab_bytes: width.f32_lanes() * 4,
+                vocab_bytes,
                 width,
             });
             let norm_r = prog.alloc_vreg(VRegKind::Vec, width);
             prog.emit(VmInstr::SoftmaxNormalize {
                 logits_ptr: slots[src.0 as usize],
                 sum_val: sum_r,
-                vocab_bytes: width.f32_lanes() * 4,
+                vocab_bytes,
                 width,
             });
             Ok(norm_r)

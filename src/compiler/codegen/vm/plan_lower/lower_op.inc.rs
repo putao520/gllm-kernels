@@ -1168,7 +1168,11 @@ fn lower_op_hook(prog: &mut VmProgram, op: &CompilerOp, graph: &CompilerGraph, c
             })?;
             let width = ctx.session.width;
             let total_bytes = hidden_dim * ctx.dtype.elem_bytes();
-            let step = width.f32_lanes() * 4;
+            // BCE-20260704-STEP-DTYPE-MISMATCH: step 必须按 ctx.dtype 计算字节数,
+            // 与下方 VecLoad/VecStore 的 dtype 一致。BF16 时 step = lanes*2 (8 BF16 元素),
+            // F32 时 step = lanes*4 = width.bytes()。原硬编码 lanes*4 在 BF16 下让循环
+            // 跳 32B=16 BF16 元素而 VecLoad 只读 8 → 跳过一半元素 (与 e24a2e49 同类)。
+            let step = width.f32_lanes() * ctx.dtype.elem_bytes();
             let iters = (total_bytes + step - 1) / step;
             let ctr = prog.alloc_vreg(VRegKind::Counter, SimdWidth::Scalar);
             let byte_off = prog.alloc_vreg(VRegKind::ByteOffset, SimdWidth::Scalar);
