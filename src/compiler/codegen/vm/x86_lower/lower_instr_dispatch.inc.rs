@@ -1419,6 +1419,43 @@ impl X86Lower {
         match instr {
             VmInstr::VecUnaryOp { dst, a, op } => {
                 // a→spill slot 0, dst→slot 2
+                //
+                // BCE-20260703-AVX512-HALF-LANES-2: VecUnaryOp 无 width 字段, 输入宽度由
+                // use_avx512 推断 (与 HReduce/Transcendental 同源)。AVX-512 下上游 VecLoad/
+                // VecArith 产出 ZMM 16 lanes, 旧实现 resolve_ymm_or_spill + v?ps ymm 只处理
+                // 低 8 lanes, 高 8 lanes 输出垃圾 → Neg/Abs/Sqrt/Rsqrt/Recip/Round/Floor/Ceil/
+                // IntToFloat/Fp8ToFloat 在 16-lane 上下文下数值错。根治: use_avx512 时走 ZMM
+                // 路径 (resolve_zmm_or_spill + 16-lane 指令 + spill_store_zmm), AVX2 保持原 YMM。
+                // AVX-512 替代指令: vrsqrtps→vrsqrt14ps, vrcpps→vrcp14ps, vroundps→vrndscaleps
+                // (iced 1.21 code_asm 无 zmm 变体的 vrsqrtps/vrcpps/vroundps)。
+                if self.use_avx512 {
+                    let (va, _) = self.resolve_zmm_or_spill(*a, alloc, 0)?;
+                    let (d, dst_spilled) = self.resolve_zmm_or_spill_write(*dst, alloc, 2)?;
+                    match op {
+                        VecUnaryOp::Neg => {
+                            self.asm.vxorps(d, d, d).map_err(Self::err)?;
+                            self.asm.vsubps(d, d, va).map_err(Self::err)?;
+                        }
+                        VecUnaryOp::Abs => {
+                            let mask_label = self.const_f32(f32::from_bits(0x7FFF_FFFF));
+                            let bscratch = self.scratch_zmm(2);
+                            self.asm.vbroadcastss(bscratch, dword_ptr(mask_label)).map_err(Self::err)?;
+                            self.asm.vandps(d, va, bscratch).map_err(Self::err)?;
+                        }
+                        VecUnaryOp::Sqrt => self.asm.vsqrtps(d, va).map_err(Self::err)?,
+                        VecUnaryOp::Rsqrt => self.asm.vrsqrt14ps(d, va).map_err(Self::err)?,
+                        VecUnaryOp::Recip => self.asm.vrcp14ps(d, va).map_err(Self::err)?,
+                        VecUnaryOp::Round => self.asm.vrndscaleps(d, va, 0i32).map_err(Self::err)?,
+                        VecUnaryOp::Floor => self.asm.vrndscaleps(d, va, 1i32).map_err(Self::err)?,
+                        VecUnaryOp::Ceil => self.asm.vrndscaleps(d, va, 2i32).map_err(Self::err)?,
+                        VecUnaryOp::IntToFloat => self.asm.vcvtdq2ps(d, va).map_err(Self::err)?,
+                        VecUnaryOp::Fp8E4M3ToFloat => self.emit_fp8_e4m3_to_f32_zmm(d, va)?,
+                        VecUnaryOp::Fp8E5M2ToFloat => self.emit_fp8_e5m2_to_f32_zmm(d, va)?,
+                    }
+                    if dst_spilled { self.spill_store_zmm(*dst, alloc, 2)?; }
+                    return Ok(());
+                }
+                // AVX2 / SSE 路径 (use_avx512=false): 保持原 YMM 实现
                 let (va, _) = self.resolve_ymm_or_spill(*a, alloc, 0)?;
                 let (d, dst_spilled) = self.resolve_ymm_or_spill_write(*dst, alloc, 2)?;
                 match op {
@@ -1453,20 +1490,19 @@ impl X86Lower {
     fn lower_vec_cmp_x86(&mut self, instr: &VmInstr, alloc: &RegAllocation) -> Result<(), CompilerError> {
         match instr {
             VmInstr::VecCmp { dst, a, b, pred } => {
-                let (va, _) = self.resolve_ymm_or_spill(*a, alloc, 0)?;
-                let (vb, _) = self.resolve_ymm_or_spill(*b, alloc, 1)?;
-                let (d, dst_spilled) = self.resolve_ymm_or_spill_write(*dst, alloc, 2)?;
                 // vcmpps: dst = (a pred b) ? all_ones : all_zeros
-                let imm: i32 = match pred {
-                    CmpPredicate::Eq => 0,
-                    CmpPredicate::Lt => 1,
-                    CmpPredicate::Le => 2,
-                    CmpPredicate::Gt => 6,  // AVX swapped: gt=14 for avx512, 6 for avx
-                    CmpPredicate::Ge => 5,
-                    CmpPredicate::Ne => 4,
-                };
+                //
+                // BCE-20260703-AVX512-HALF-LANES-2: 旧 use_avx512 分支只改 imm 编码, dst/va/vb
+                // 仍 resolve_ymm_or_spill + vcmpps ymm → AVX-512 下只比较低 8 lanes, 高 8 lanes
+                // 未比较 → 下游 ConditionalSelect/VecBinOp::And 拿到的掩码高 8 lanes 错。
+                // 根治: use_avx512 时走 ZMM 路径。下游 ConditionalSelect AVX-512 用
+                // vpmovd2m k1, mask 把向量掩码转 k 寄存器消费, 故 VecCmp 须输出向量掩码
+                // (zmm 全 1/全 0), 不能只留 k 寄存器 → vcmpps k,zmm,zmm,imm + vpmovm2d zmm,k。
                 if self.use_avx512 {
-                    // vcmpps with AVX-512 uses different immediate encoding
+                    let (va, _) = self.resolve_zmm_or_spill(*a, alloc, 0)?;
+                    let (vb, _) = self.resolve_zmm_or_spill(*b, alloc, 1)?;
+                    let (d, dst_spilled) = self.resolve_zmm_or_spill_write(*dst, alloc, 2)?;
+                    // AVX-512 vcmpps immediate encoding (opmask dest)
                     let imm512: i32 = match pred {
                         CmpPredicate::Eq => 0,
                         CmpPredicate::Lt => 1,
@@ -1475,10 +1511,27 @@ impl X86Lower {
                         CmpPredicate::Ge => 13,
                         CmpPredicate::Ne => 4,
                     };
-                    self.asm.vcmpps(d, va, vb, imm512).map_err(Self::err)?;
-                } else {
-                    self.asm.vcmpps(d, va, vb, imm).map_err(Self::err)?;
+                    let mask_k = iced_x86::code_asm::registers::k1;
+                    self.asm.vcmpps(mask_k, va, vb, imm512).map_err(Self::err)?;
+                    // 把 opmask 转为向量掩码 (全 1/全 0) 供下游 vpmovd2m 消费, 与
+                    // ConditionalSelect AVX-512 路径的 vpmovd2m(k1, vmask) 对齐。
+                    self.asm.vpmovm2d(d, mask_k).map_err(Self::err)?;
+                    if dst_spilled { self.spill_store_zmm(*dst, alloc, 2)?; }
+                    return Ok(());
                 }
+                // AVX2 / SSE 路径 (use_avx512=false): vcmpps ymm 直接产向量掩码
+                let (va, _) = self.resolve_ymm_or_spill(*a, alloc, 0)?;
+                let (vb, _) = self.resolve_ymm_or_spill(*b, alloc, 1)?;
+                let (d, dst_spilled) = self.resolve_ymm_or_spill_write(*dst, alloc, 2)?;
+                let imm: i32 = match pred {
+                    CmpPredicate::Eq => 0,
+                    CmpPredicate::Lt => 1,
+                    CmpPredicate::Le => 2,
+                    CmpPredicate::Gt => 6,  // AVX swapped: gt=14 for avx512, 6 for avx
+                    CmpPredicate::Ge => 5,
+                    CmpPredicate::Ne => 4,
+                };
+                self.asm.vcmpps(d, va, vb, imm).map_err(Self::err)?;
                 if dst_spilled { self.spill_store_ymm(*dst, alloc, 2)?; }
                 Ok(())
             }
@@ -1996,35 +2049,82 @@ impl X86Lower {
 
     fn lower_scale_apply_x86(&mut self, instr: &VmInstr, alloc: &RegAllocation) -> Result<(), CompilerError> {
         match instr {
-            VmInstr::ScaleApply { dst, acc, scale, zero, input_dtype, .. } => {
+            VmInstr::ScaleApply { dst, acc, scale, zero, input_dtype, width } => {
                 // vcvtdq2ps dst, acc → vmulps dst, dst, scale [+ vaddps dst, dst, zero]
-                let (dst_ymm, dst_spilled) = self.resolve_ymm_or_spill_write(*dst, alloc, 0)?;
-                let (acc_ymm, _) = self.resolve_ymm_or_spill(*acc, alloc, 1)?;
-                let (scale_ymm, _) = self.resolve_ymm_or_spill(*scale, alloc, 2)?;
-
-                // Convert accumulator from input_dtype to FP32
-                match input_dtype.kind {
-                    // Float accumulators: already FP32, just copy the data
-                    DTypeKind::F32 | DTypeKind::F16 | DTypeKind::BF16
-                    | DTypeKind::TF32 | DTypeKind::FP8E4M3 | DTypeKind::FP8E5M2
-                    | DTypeKind::FP6E2M3 | DTypeKind::FP6E3M2 | DTypeKind::FP4E2M1 => {
-                        self.asm.vmovaps(dst_ymm, acc_ymm).map_err(Self::err)?;
+                //
+                // BCE-20260703-AVX512-HALF-LANES-2: ScaleApply 携带 width 字段, 旧实现无视
+                // width 一律走 YMM (8 lanes)。W512 上 DotProduct 走 ZMM 16-lane vpdpbusd 累加,
+                // 紧接 ScaleApply 却读 YMM → acc 高 8 lanes 累加结果被丢弃 → 量化 GEMM 输出错。
+                // 根治: 按 width 分流 — W512 (需 use_avx512) 走 ZMM 16-lane; W256 走原 YMM;
+                // 其他宽度 Err (与 lower_quant_block_load 同款守卫)。仿 lower_fma_x86 /
+                // lower_accumulate_x86 已修 ZMM 模式。
+                match width {
+                    SimdWidth::W512 => {
+                        if !self.use_avx512 {
+                            return Err(CompilerError::CodegenViolation(
+                                "ScaleApply W512 requires use_avx512".into()));
+                        }
+                        let (dst_zmm, dst_spilled) = self.resolve_zmm_or_spill_write(*dst, alloc, 0)?;
+                        let (acc_zmm, _) = self.resolve_zmm_or_spill(*acc, alloc, 1)?;
+                        let (scale_zmm, _) = self.resolve_zmm_or_spill(*scale, alloc, 2)?;
+                        // Convert accumulator from input_dtype to FP32
+                        match input_dtype.kind {
+                            // Float accumulators: already FP32, just copy the data
+                            DTypeKind::F32 | DTypeKind::F16 | DTypeKind::BF16
+                            | DTypeKind::TF32 | DTypeKind::FP8E4M3 | DTypeKind::FP8E5M2
+                            | DTypeKind::FP6E2M3 | DTypeKind::FP6E3M2 | DTypeKind::FP4E2M1 => {
+                                self.asm.vmovaps(dst_zmm, acc_zmm).map_err(Self::err)?;
+                            }
+                            // Integer accumulators (INT32/INT8/INT4/INT2/INT1):
+                            // stored as INT32 in registers, convert to FP32 via vcvtdq2ps
+                            _ => {
+                                self.asm.vcvtdq2ps(dst_zmm, acc_zmm).map_err(Self::err)?;
+                            }
+                        }
+                        // × scale
+                        self.asm.vmulps(dst_zmm, dst_zmm, scale_zmm).map_err(Self::err)?;
+                        // + zero (if not NONE_VREG)
+                        if *zero != VRegId(0) {
+                            let (zero_zmm, _) = self.resolve_zmm_or_spill(*zero, alloc, 3)?;
+                            self.asm.vaddps(dst_zmm, dst_zmm, zero_zmm).map_err(Self::err)?;
+                        }
+                        if dst_spilled { self.spill_store_zmm(*dst, alloc, 0)?; }
                     }
-                    // Integer accumulators (INT32/INT8/INT4/INT2/INT1):
-                    // stored as INT32 in registers, convert to FP32 via vcvtdq2ps
-                    _ => {
-                        self.asm.vcvtdq2ps(dst_ymm, acc_ymm).map_err(Self::err)?;
+                    SimdWidth::W256 => {
+                        let (dst_ymm, dst_spilled) = self.resolve_ymm_or_spill_write(*dst, alloc, 0)?;
+                        let (acc_ymm, _) = self.resolve_ymm_or_spill(*acc, alloc, 1)?;
+                        let (scale_ymm, _) = self.resolve_ymm_or_spill(*scale, alloc, 2)?;
+
+                        // Convert accumulator from input_dtype to FP32
+                        match input_dtype.kind {
+                            // Float accumulators: already FP32, just copy the data
+                            DTypeKind::F32 | DTypeKind::F16 | DTypeKind::BF16
+                            | DTypeKind::TF32 | DTypeKind::FP8E4M3 | DTypeKind::FP8E5M2
+                            | DTypeKind::FP6E2M3 | DTypeKind::FP6E3M2 | DTypeKind::FP4E2M1 => {
+                                self.asm.vmovaps(dst_ymm, acc_ymm).map_err(Self::err)?;
+                            }
+                            // Integer accumulators (INT32/INT8/INT4/INT2/INT1):
+                            // stored as INT32 in registers, convert to FP32 via vcvtdq2ps
+                            _ => {
+                                self.asm.vcvtdq2ps(dst_ymm, acc_ymm).map_err(Self::err)?;
+                            }
+                        }
+                        // × scale
+                        self.asm.vmulps(dst_ymm, dst_ymm, scale_ymm).map_err(Self::err)?;
+
+                        // + zero (if not NONE_VREG)
+                        if *zero != VRegId(0) {
+                            let (zero_ymm, _) = self.resolve_ymm_or_spill(*zero, alloc, 3)?;
+                            self.asm.vaddps(dst_ymm, dst_ymm, zero_ymm).map_err(Self::err)?;
+                        }
+                        if dst_spilled { self.spill_store_ymm(*dst, alloc, 0)?; }
+                    }
+                    other => {
+                        return Err(CompilerError::CodegenViolation(format!(
+                            "ScaleApply: unsupported width {:?} (W512/W256 only)", other
+                        )));
                     }
                 }
-                // × scale
-                self.asm.vmulps(dst_ymm, dst_ymm, scale_ymm).map_err(Self::err)?;
-
-                // + zero (if not NONE_VREG)
-                if *zero != VRegId(0) {
-                    let (zero_ymm, _) = self.resolve_ymm_or_spill(*zero, alloc, 3)?;
-                    self.asm.vaddps(dst_ymm, dst_ymm, zero_ymm).map_err(Self::err)?;
-                }
-                if dst_spilled { self.spill_store_ymm(*dst, alloc, 0)?; }
                 Ok(())
             }
             _ => Err(CompilerError::CodegenViolation(
@@ -5231,6 +5331,182 @@ impl X86Lower {
             _ => Err(CompilerError::CodegenViolation(
                 format!("lower_debug_break_if_x86: expected VmInstr::DebugBreakIf, got {:?}", instr))),
         }
+    }
+
+    // ── BCE-20260703-AVX512-HALF-LANES-2: FP8 → F32 ZMM (16-lane) 转换 ──
+    // VecUnaryOp::Fp8E4M3ToFloat/E5M2ToFloat 在 use_avx512 时调用。逻辑镜像
+    // emit_fp8_e4m3_to_f32_ymm / emit_fp8_e5m2_to_f32_ymm (emit_helpers.inc.rs),
+    // 但用 AVX-512 opmask 语义: vpcmpeqd 产 k 寄存器, vmovdqa32{k} 做合并 (替代
+    // vblendvps)。iced 1.21 code_asm 的 vpxor/vpor/vpand/vpandn/vpcmpeqd 无 zmm
+    // 变体 → 用 vpxord/vpord/vpandd/vpandnd + vpcmpeqd k,zmm,zmm + vpmovm2d 替代。
+    // 寄存器预算: s0=sign, s1=exp, s2=mant, d=result, va=temp (与 ymm 版一致)。
+    // scratch_zmm(0..2) + spill_scratch_zmm(0..1) 复用 ymm 版的 slot 划分。
+    fn emit_fp8_e4m3_to_f32_zmm(
+        &mut self,
+        d: AsmRegisterZmm,
+        va: AsmRegisterZmm,
+    ) -> Result<(), CompilerError> {
+        let s0 = self.scratch_zmm(0);
+        let s1 = self.scratch_zmm(1);
+        let s2 = self.scratch_zmm(2);
+
+        // ── Phase 1: Extract sign/exp/mant, spill exp and mant ──
+        // sign = (x >> 7) << 31
+        self.asm.vmovdqa64(s0, va).map_err(Self::err)?;
+        self.asm.vpsrld(s0, s0, 7).map_err(Self::err)?;
+        self.asm.vpslld(s0, s0, 31).map_err(Self::err)?;
+
+        // exp = (x >> 3) & 0xF
+        self.asm.vmovdqa64(s1, va).map_err(Self::err)?;
+        self.asm.vpsrld(s1, s1, 3).map_err(Self::err)?;
+        self.asm.vpslld(s2, s1, 28).map_err(Self::err)?;
+        self.asm.vpsrld(s1, s2, 28).map_err(Self::err)?;
+
+        // mant = x & 0x7
+        self.asm.vmovdqa64(s2, va).map_err(Self::err)?;
+        self.asm.vpslld(s2, s2, 29).map_err(Self::err)?;
+        self.asm.vpsrld(s2, s2, 29).map_err(Self::err)?;
+
+        let exp_spill = self.spill_scratch_zmm(0)?;
+        self.asm.vmovdqa64(exp_spill, s1).map_err(Self::err)?;
+        let mant_spill = self.spill_scratch_zmm(1)?;
+        self.asm.vmovdqa64(mant_spill, s2).map_err(Self::err)?;
+
+        // ── Phase 2: Build "as-if-normal" F32 bits ──
+        // d = sign | ((exp + 120) << 23) | (mant << 20)
+        let bias_120 = self.const_f32(f32::from_bits(120u32 << 23));
+        self.asm.vbroadcastss(d, dword_ptr(bias_120)).map_err(Self::err)?;
+        self.asm.vpaddd(d, s1, d).map_err(Self::err)?;
+        self.asm.vpslld(d, d, 23).map_err(Self::err)?;
+        self.asm.vpord(d, d, s0).map_err(Self::err)?;
+        self.asm.vpslld(va, s2, 20).map_err(Self::err)?;
+        self.asm.vpord(d, d, va).map_err(Self::err)?;
+        // d correct for normal range (1 ≤ exp ≤ 14)
+
+        // ── Phase 3: Fix zero (exp==0 & mant==0 → sign << 31) ──
+        // k_zero = (exp==0) & (mant==0)
+        let k_exp0 = iced_x86::code_asm::registers::k1;
+        let k_mant0 = iced_x86::code_asm::registers::k2;
+        let k_zero = iced_x86::code_asm::registers::k3;
+        self.asm.vpxord(va, va, va).map_err(Self::err)?; // zero const
+        self.asm.vpcmpeqd(k_exp0, exp_spill, va).map_err(Self::err)?;
+        self.asm.vpcmpeqd(k_mant0, mant_spill, va).map_err(Self::err)?;
+        self.asm.kandd(k_zero, k_exp0, k_mant0).map_err(Self::err)?;
+        // where k_zero=1, d[i] = s0[i] (sign<<31); else d stays. 用 vmovdqa32{k} merge.
+        // 注意 merge 要求 dest 已含 "else" 值 (d 已是 normal bits), 源是 s0。
+        self.asm.vmovdqa32(d.k3(), s0).map_err(Self::err)?;
+
+        // ── Phase 4: Fix subnormal (exp==0 & mant!=0 → mant × 2^(-9)) ──
+        self.asm.vmovdqa64(s2, mant_spill).map_err(Self::err)?;
+        self.asm.vcvtdq2ps(s2, s2).map_err(Self::err)?;
+        let two_neg9 = self.const_f32(1.953125e-3); // 2^(-9)
+        self.asm.vbroadcastss(s1, dword_ptr(two_neg9)).map_err(Self::err)?;
+        self.asm.vmulps(s2, s2, s1).map_err(Self::err)?;
+        // Apply sign via XOR
+        self.asm.vxorps(s2, s2, s0).map_err(Self::err)?;
+        // k_sub = (exp==0) & NOT(mant==0)
+        let k_sub = iced_x86::code_asm::registers::k4;
+        self.asm.kandnd(k_sub, k_mant0, k_exp0).map_err(Self::err)?;
+        self.asm.vmovdqa32(d.k4(), s2).map_err(Self::err)?;
+
+        // ── Phase 5: Fix Inf/NaN (exp==15 → F32 Inf/NaN) ──
+        // Normal bits: (15+120)<<23 = 135<<23. Need 255<<23.
+        // Add (255-135)<<23 = 120<<23 to bump exp to 255.
+        let delta_120 = self.const_f32(f32::from_bits(120u32 << 23));
+        self.asm.vbroadcastss(va, dword_ptr(delta_120)).map_err(Self::err)?;
+        self.asm.vpaddd(s2, d, va).map_err(Self::err)?;
+        // s2 = Inf/NaN bits (exp=255). For mant==0 → Inf, mant!=0 → NaN.
+        // Force quiet NaN: OR bit 22 (0x00400000)
+        let quiet_nan = self.const_f32(f32::from_bits(0x00400000u32));
+        self.asm.vbroadcastss(s1, dword_ptr(quiet_nan)).map_err(Self::err)?;
+        self.asm.vpord(s2, s2, s1).map_err(Self::err)?;
+        // k_special = (exp==15)
+        let const_15 = self.const_f32(f32::from_bits(15u32));
+        self.asm.vbroadcastss(va, dword_ptr(const_15)).map_err(Self::err)?;
+        let k_special = iced_x86::code_asm::registers::k5;
+        self.asm.vpcmpeqd(k_special, exp_spill, va).map_err(Self::err)?;
+        self.asm.vmovdqa32(d.k5(), s2).map_err(Self::err)?;
+
+        Ok(())
+    }
+
+    fn emit_fp8_e5m2_to_f32_zmm(
+        &mut self,
+        d: AsmRegisterZmm,
+        va: AsmRegisterZmm,
+    ) -> Result<(), CompilerError> {
+        let s0 = self.scratch_zmm(0);
+        let s1 = self.scratch_zmm(1);
+        let s2 = self.scratch_zmm(2);
+
+        // ── Phase 1: Extract sign/exp/mant, spill exp and mant ──
+        // sign = (x >> 7) << 31
+        self.asm.vmovdqa64(s0, va).map_err(Self::err)?;
+        self.asm.vpsrld(s0, s0, 7).map_err(Self::err)?;
+        self.asm.vpslld(s0, s0, 31).map_err(Self::err)?;
+
+        // exp = (x >> 2) & 0x1F  (5 bits)
+        self.asm.vmovdqa64(s1, va).map_err(Self::err)?;
+        self.asm.vpsrld(s1, s1, 2).map_err(Self::err)?;
+        self.asm.vpslld(s2, s1, 27).map_err(Self::err)?;
+        self.asm.vpsrld(s1, s2, 27).map_err(Self::err)?;
+
+        // mant = x & 0x3  (2 bits)
+        self.asm.vmovdqa64(s2, va).map_err(Self::err)?;
+        self.asm.vpslld(s2, s2, 30).map_err(Self::err)?;
+        self.asm.vpsrld(s2, s2, 30).map_err(Self::err)?;
+
+        let exp_spill = self.spill_scratch_zmm(0)?;
+        self.asm.vmovdqa64(exp_spill, s1).map_err(Self::err)?;
+        let mant_spill = self.spill_scratch_zmm(1)?;
+        self.asm.vmovdqa64(mant_spill, s2).map_err(Self::err)?;
+
+        // ── Phase 2: Build "as-if-normal" F32 bits ──
+        // d = sign | ((exp + 112) << 23) | (mant << 21)
+        let bias_112 = self.const_f32(f32::from_bits(112u32 << 23));
+        self.asm.vbroadcastss(d, dword_ptr(bias_112)).map_err(Self::err)?;
+        self.asm.vpaddd(d, s1, d).map_err(Self::err)?;
+        self.asm.vpslld(d, d, 23).map_err(Self::err)?;
+        self.asm.vpord(d, d, s0).map_err(Self::err)?;
+        self.asm.vpslld(va, s2, 21).map_err(Self::err)?;
+        self.asm.vpord(d, d, va).map_err(Self::err)?;
+
+        // ── Phase 3: Fix zero ──
+        let k_exp0 = iced_x86::code_asm::registers::k1;
+        let k_mant0 = iced_x86::code_asm::registers::k2;
+        let k_zero = iced_x86::code_asm::registers::k3;
+        self.asm.vpxord(va, va, va).map_err(Self::err)?;
+        self.asm.vpcmpeqd(k_exp0, exp_spill, va).map_err(Self::err)?;
+        self.asm.vpcmpeqd(k_mant0, mant_spill, va).map_err(Self::err)?;
+        self.asm.kandd(k_zero, k_exp0, k_mant0).map_err(Self::err)?;
+        self.asm.vmovdqa32(d.k3(), s0).map_err(Self::err)?;
+
+        // ── Phase 4: Fix subnormal (mant × 2^(-16)) ──
+        self.asm.vmovdqa64(s2, mant_spill).map_err(Self::err)?;
+        self.asm.vcvtdq2ps(s2, s2).map_err(Self::err)?;
+        let two_neg16 = self.const_f32(1.5258789e-5); // 2^(-16)
+        self.asm.vbroadcastss(s1, dword_ptr(two_neg16)).map_err(Self::err)?;
+        self.asm.vmulps(s2, s2, s1).map_err(Self::err)?;
+        self.asm.vxorps(s2, s2, s0).map_err(Self::err)?;
+        let k_sub = iced_x86::code_asm::registers::k4;
+        self.asm.kandnd(k_sub, k_mant0, k_exp0).map_err(Self::err)?;
+        self.asm.vmovdqa32(d.k4(), s2).map_err(Self::err)?;
+
+        // ── Phase 5: Fix Inf/NaN (exp==31) ──
+        // Normal: (31+112)<<23 = 143<<23. Need 255<<23. Delta = 112<<23.
+        let delta_112 = self.const_f32(f32::from_bits(112u32 << 23));
+        self.asm.vbroadcastss(va, dword_ptr(delta_112)).map_err(Self::err)?;
+        self.asm.vpaddd(s2, d, va).map_err(Self::err)?;
+        let quiet_nan = self.const_f32(f32::from_bits(0x00400000u32));
+        self.asm.vbroadcastss(s1, dword_ptr(quiet_nan)).map_err(Self::err)?;
+        self.asm.vpord(s2, s2, s1).map_err(Self::err)?;
+        let const_31 = self.const_f32(f32::from_bits(31u32));
+        self.asm.vbroadcastss(va, dword_ptr(const_31)).map_err(Self::err)?;
+        let k_special = iced_x86::code_asm::registers::k5;
+        self.asm.vpcmpeqd(k_special, exp_spill, va).map_err(Self::err)?;
+        self.asm.vmovdqa32(d.k5(), s2).map_err(Self::err)?;
+
+        Ok(())
     }
 
 }

@@ -624,15 +624,45 @@ impl X86Lower {
             BlockUnpackMode::Int8 => {                // ARCH-ISA-SCRATCH: base 走 scratch slot 2 (r11), 避开
                 // eval_offset_to_rax 使用的 slot 0/1 (rax/r10)。否则
                 // offset 是嵌套 Add 时 `mov s1, s0` 会覆盖 base 值。
-                let (dst_ymm, dst_spilled) = self.resolve_ymm_or_spill_write(dst, alloc, 2)?;
+                //
+                // BCE-20260703-AVX512-HALF-LANES-2: 旧实现无视传入 width, 直接
+                // resolve_ymm_or_spill_write + vpmovsxbd ymm, m64 (8 i8→8 i32) + vcvtdq2ps ymm,
+                // 完全忽略 width。W512 上 DotProduct(Int8) 走 ZMM 16-lane, 但 QuantBlockLoad
+                // 只填 dst 低 YMM 8 lanes, 高 8 lanes 垃圾 → 喂给 DotProduct 产生错误累加。
+                // 同文件 SignedNibbleLow/Bitpack2 路径对 lanes!=8 显式 Err, Int8 路径却静默
+                // 走 YMM。根治: match width 分流 — W512 (需 use_avx512) → vpmovsxbd zmm, m128
+                // (16 i8→16 i32) + vcvtdq2ps zmm; W256 → 原 YMM; 其他 → Err。
+                // 与同文件 lower_quant_* 函数 (line 80/154/444) 正确处理 W512 的先例一致。
                 let base_reg = self.resolve_gpr_read(base, alloc, 2)?;
                 self.eval_offset_to_rax(offset, alloc)?;
                 self.asm.add(rax, base_reg).map_err(Self::err)?;
-                // vpmovsxbd ymm, m64: sign-extend 8 x i8 → 8 x i32
-                self.asm.vpmovsxbd(dst_ymm, qword_ptr(rax)).map_err(Self::err)?;
-                // vcvtdq2ps ymm, ymm: convert i32 → f32
-                self.asm.vcvtdq2ps(dst_ymm, dst_ymm).map_err(Self::err)?;
-                if dst_spilled { self.spill_store_ymm(dst, alloc, 2)?; }
+                match width {
+                    SimdWidth::W512 => {
+                        if !self.use_avx512 {
+                            return Err(CompilerError::CodegenViolation(
+                                "QuantBlockLoad Int8 W512 requires use_avx512".into()));
+                        }
+                        let (dst_zmm, dst_spilled) = self.resolve_zmm_or_spill_write(dst, alloc, 2)?;
+                        // vpmovsxbd zmm, m128: sign-extend 16 x i8 → 16 x i32
+                        self.asm.vpmovsxbd(dst_zmm, xmmword_ptr(rax)).map_err(Self::err)?;
+                        // vcvtdq2ps zmm, zmm: convert i32 → f32
+                        self.asm.vcvtdq2ps(dst_zmm, dst_zmm).map_err(Self::err)?;
+                        if dst_spilled { self.spill_store_zmm(dst, alloc, 2)?; }
+                    }
+                    SimdWidth::W256 => {
+                        let (dst_ymm, dst_spilled) = self.resolve_ymm_or_spill_write(dst, alloc, 2)?;
+                        // vpmovsxbd ymm, m64: sign-extend 8 x i8 → 8 x i32
+                        self.asm.vpmovsxbd(dst_ymm, qword_ptr(rax)).map_err(Self::err)?;
+                        // vcvtdq2ps ymm, ymm: convert i32 → f32
+                        self.asm.vcvtdq2ps(dst_ymm, dst_ymm).map_err(Self::err)?;
+                        if dst_spilled { self.spill_store_ymm(dst, alloc, 2)?; }
+                    }
+                    other => {
+                        return Err(CompilerError::CodegenViolation(format!(
+                            "QuantBlockLoad Int8: unsupported width {:?} (W512/W256 only)", other
+                        )));
+                    }
+                }
                 Ok(())
             }
 
