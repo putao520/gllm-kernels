@@ -3191,9 +3191,16 @@ impl X86Lower {
                 // | F8E4M3   | TDPHF8PS    | AMX-FP8 (DMR)   | 0xFD   | F3  | emit_tdp_raw (任意 tmm) |
                 // | F8E5M2   | TDPBF8PS    | AMX-FP8 (DMR)   | 0xFD   | F2  | emit_tdp_raw (任意 tmm) |
                 // | F32      | TDPTF32PS   | AMX-TF32 (DMR)  | 0x6C   | F2  | emit_tdp_raw (任意 tmm) |
-                // | U8       | TDPBUUD     | AMX-INT8 (SPR)  | 0x5E   | -   | iced tdpbuud (无符号×无符号) |
+                // | U8       | TDPBUSD     | AMX-INT8 (SPR)  | 0x5E   | 66  | iced tdpbusd (u8×i8, Q8 权重 signed) |
                 //
                 // emit_tdp_raw 公式已对 6 种 iced 原生 TDP 变体逐一验证字节完全一致。
+                //
+                // BCE-20260704-AMX-SIGNED-INT8: U8 路径用 TDPBUSD (u8×i8 → i32) 而非 TDPBUUD
+                // (u8×u8)。GGUF Q8 权重是 signed i8 (quant.rs BlockQ8_0 qs: [i8; QK_K],
+                // quant_format.rs "Q8_0/Q8_K/Q8_1 signed")。量化 GEMM 标准数据约定
+                // (对齐 asm 路径 matmul_x86_amx_int8.rs:179 _tile_dpbusd): A=激活 u8
+                // (s8 偏移+128 无符号化), B=权重 i8 (signed)。TDPBUSD (A=u8, B=i8) 数值
+                // 正确; TDPBUUD 会把 i8 负数当 u8 解码 (负数变 128-255) → 数值错。
                 let tile_dtype = dtype;
                 let tmm_c = self.resolve_phys_tile(*c, alloc)?;
                 let tmm_a = self.resolve_phys_tile(*a, alloc)?;
@@ -3224,10 +3231,11 @@ impl X86Lower {
                         self.emit_tdp_raw(0x6C, 0b11, tmm_c, tmm_a, tmm_b)?;
                     }
                     crate::types::DType::U8 => {
-                        // TDPBUUD tmm_c, tmm_a, tmm_b (AMX-INT8, Sapphire Rapids)
-                        // U8 = 无符号 8-bit → TDPBUUD (unsigned × unsigned → dword accumulate)
+                        // TDPBUSD tmm_c, tmm_a, tmm_b (AMX-INT8, Sapphire Rapids)
+                        // U8 = 激活无符号 8-bit (s8 偏移+128), B tile = 权重 signed i8 (Q8 quant)。
+                        // TDPBUSD: u8 × i8 → i32 dword accumulate (对齐 asm 路径 _tile_dpbusd)。
                         // iced 1.21 原生 code_asm, 任意 tmm 组合自动编码。
-                        self.asm.tdpbuud(tmm_c, tmm_a, tmm_b).map_err(Self::err)?;
+                        self.asm.tdpbusd(tmm_c, tmm_a, tmm_b).map_err(Self::err)?;
                     }
                     other => {
                         return Err(CompilerError::CodegenViolation(

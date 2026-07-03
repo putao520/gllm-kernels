@@ -1112,4 +1112,66 @@ mod tests {
         assert!(disasm.contains("vrcp14ps"),
             "AVX-512 Sigmoid must use vrcp14ps zmm; got:\n{}", disasm);
     }
+
+    /// BCE-20260704-AMX-SIGNED-INT8: JIT AMX TileMma U8 路径必须 emit TDPBUSD (u8×i8 → i32)
+    /// 而非 TDPBUUD (u8×u8)。GGUF Q8 权重是 signed i8, TDPBUUD 会把 i8 负数当 u8 解码
+    /// (负数变 128-255) → 数值错。TDPBUSD 对齐 asm 路径 (matmul_x86_amx_int8.rs:179
+    /// _tile_dpbusd) 的 A=u8/B=i8 数据约定。
+    ///
+    /// 回归断言: Instruction 序列含 Code::VEX_Tdpbusd_tmm_tmm_tmm, 不含 Tdpbuud;
+    /// 且机器码字节匹配 TDPBUSD 编码 (VEX.128.66.0F38.W0 5E)。
+    #[test]
+    fn bce_amx_signed_int8_tile_mma_u8_uses_tdpbusd_not_tdpbuud() {
+        use crate::compiler::codegen::vm::isa_profile::{PhysReg, PhysTile};
+        use crate::types::DType;
+        use iced_x86::Code;
+
+        // 构造 TileMma { c, a, b, m, n, k, dtype: U8 } — 3 个 tile vreg。
+        let mut prog = VmProgram::new();
+        let c_tile = prog.alloc_vreg(VRegKind::Tile, SimdWidth::Scalar);
+        let a_tile = prog.alloc_vreg(VRegKind::Tile, SimdWidth::Scalar);
+        let b_tile = prog.alloc_vreg(VRegKind::Tile, SimdWidth::Scalar);
+        prog.emit(VmInstr::TileMma {
+            c: c_tile, a: a_tile, b: b_tile,
+            m: 16, n: 16, k: 16,
+            dtype: DType::U8,
+        });
+
+        // 伪造 RegAllocation: 3 个 tile vreg → PhysTile(0/1/2) (绕过 AMX 硬件探测,
+        // 本机无 AMX 也能测 lowering 的指令选择)。
+        let mut mapping = std::collections::HashMap::new();
+        mapping.insert(c_tile, PhysReg::Tile(PhysTile(0)));
+        mapping.insert(a_tile, PhysReg::Tile(PhysTile(1)));
+        mapping.insert(b_tile, PhysReg::Tile(PhysTile(2)));
+        let alloc = RegAllocation { mapping, spills: Vec::new(), callee_saved_used: Vec::new() };
+
+        let mut lower = X86Lower::new();
+        // prog.instrs = [DeclareVReg, DeclareVReg, DeclareVReg, TileMma]; lower 最后一条。
+        let tile_mma_instr = &prog.instrs[3];
+        lower.lower_instr(tile_mma_instr, &alloc).unwrap();
+
+        // 断言 1: 指令序列含 TDPBUSD, 不含 TDPBUUD。
+        let codes: Vec<Code> = lower.asm.instructions().iter().map(|i| i.code()).collect();
+        let has_tdpbusd = codes.iter().any(|&c| c == Code::VEX_Tdpbusd_tmm_tmm_tmm);
+        let has_tdpbuud = codes.iter().any(|&c| c == Code::VEX_Tdpbuud_tmm_tmm_tmm);
+        assert!(has_tdpbusd,
+            "BCE-20260704-AMX-SIGNED-INT8: U8 TileMma must emit TDPBUSD (u8×i8), got codes: {:?}", codes);
+        assert!(!has_tdpbuud,
+            "BCE-20260704-AMX-SIGNED-INT8: U8 TileMma must NOT emit TDPBUUD (u8×u8) — Q8 权重是 signed i8");
+
+        // 断言 2: 机器码字节匹配 TDPBUSD 编码 (VEX.128.66.0F38.W0 5E /r)。
+        // TDPBUSD: C4 E2 [byte3=W.vvvv.L.pp, pp=01 for 66] 5E [ModRM]。
+        // TDPBUUD (错误): pp=00 (无 mandatory prefix)。
+        // 取最后 5 字节 (VEX.128 TDP* = 5 字节: C4 byte2 byte3 opcode ModRM)。
+        let code = lower.asm.assemble(0).unwrap();
+        assert!(code.len() >= 5, "TDPBUSD code too short: {} bytes", code.len());
+        let tail = &code[code.len() - 5..];
+        assert_eq!(tail[0], 0xC4, "VEX prefix byte 0 must be C4; got {:#x}", tail[0]);
+        assert_eq!(tail[3], 0x5E, "TDPB* opcode must be 0x5E; got {:#x}", tail[3]);
+        // byte3.pp (低 2 位): TDPBUSD=01 (66), TDPBUUD=00 (none)。
+        let pp = tail[2] & 0x03;
+        assert_eq!(pp, 0b01,
+            "BCE-20260704-AMX-SIGNED-INT8: TDPBUSD pp must be 01 (66 prefix); got pp={:#b} (00=TDPBUUD, 01=TDPBUSD, 10=TDPBSUD, 11=TDPBSSD). bytes: {:02x?}",
+            pp, tail);
+    }
 }
