@@ -369,6 +369,117 @@ impl X86Lower {
         Ok(())
     }
 
+    /// Cephes degree-5 exp(x) ZMM 版本 (AVX-512, 16 lanes)。
+    ///
+    /// BCE-20260703-AVX512-HALF-LANES: SwiGLU exp/sigmoid 的 emit_exp_cephes 原本 YMM-only
+    /// (8 lanes), 高 8 lanes 输出垃圾 → FFN 中间层精度错。本函数是 ZMM 16-lane 版本,
+    /// 与 YMM 版数学等价 (相同 Cephes 系数 + Horner), 仅指令宽度扩到 512-bit。
+    ///
+    /// iced_x86 1.21 差异:
+    ///   - vroundps 不支持 ZMM 操作数 → 用 vrndscaleps zmm, src, 0 (round mode 0 = nearest-even,
+    ///     与 vroundps 的 imm8[1:0]=0 语义完全一致)。
+    ///   - vbroadcastss/vmaxps/vminps/vmulps/vfmadd213ps/vfmadd231ps/vaddps/vcvtps2dq/vpaddd/
+    ///     vpslld/vpsrld/vcvtdq2ps/vandps/vorps 全部支持 ZMM 操作数 (已逐一验证 code_asm trait)。
+    fn emit_exp_cephes_zmm(&mut self, dst: AsmRegisterZmm, src: AsmRegisterZmm) -> Result<(), CompilerError> {
+        use crate::compiler::codegen::math_approx::*;
+        // Cephes scratch: zmm13/zmm14/zmm15 (与 YMM 版同物理号, ZMM 视图)。
+        let s0 = zmm14;
+        let s1 = zmm15;
+
+        // Clamp
+        let lo = self.const_f32(EXP_CLAMP_LO);
+        self.asm.vbroadcastss(s0, dword_ptr(lo)).map_err(Self::err)?;
+        self.asm.vmaxps(dst, src, s0).map_err(Self::err)?;
+        let hi = self.const_f32(EXP_CLAMP_HI);
+        self.asm.vbroadcastss(s0, dword_ptr(hi)).map_err(Self::err)?;
+        self.asm.vminps(dst, dst, s0).map_err(Self::err)?;
+
+        // k = round(x * log2e)  — vrndscaleps 替代 vroundps (ZMM 不支持 vroundps)
+        let log2e = self.const_f32(EXP_LOG2E);
+        self.asm.vbroadcastss(s0, dword_ptr(log2e)).map_err(Self::err)?;
+        self.asm.vmulps(s0, dst, s0).map_err(Self::err)?;
+        self.asm.vrndscaleps(s1, s0, 0i32).map_err(Self::err)?; // s1 = k (round-to-nearest-even)
+
+        // Range reduction
+        let c1 = self.const_f32(EXP_C1);
+        self.asm.vbroadcastss(s0, dword_ptr(c1)).map_err(Self::err)?;
+        self.asm.vfmadd231ps(dst, s1, s0).map_err(Self::err)?;
+        let c2 = self.const_f32(EXP_C2);
+        self.asm.vbroadcastss(s0, dword_ptr(c2)).map_err(Self::err)?;
+        self.asm.vfmadd231ps(dst, s1, s0).map_err(Self::err)?;
+
+        // Horner polynomial
+        let p0 = self.const_f32(EXP_P0);
+        self.asm.vbroadcastss(s0, dword_ptr(p0)).map_err(Self::err)?;
+        for coeff in [EXP_P1, EXP_P2, EXP_P3, EXP_P4, EXP_P5] {
+            let c = self.const_f32(coeff);
+            self.asm.vbroadcastss(zmm13, dword_ptr(c)).map_err(Self::err)?;
+            self.asm.vfmadd213ps(s0, dst, zmm13).map_err(Self::err)?;
+        }
+        // result = poly*r^2 + r + 1
+        self.asm.vmulps(s0, s0, dst).map_err(Self::err)?;
+        self.asm.vmulps(s0, s0, dst).map_err(Self::err)?;
+        self.asm.vaddps(s0, s0, dst).map_err(Self::err)?;
+        let one = self.const_f32(1.0);
+        self.asm.vbroadcastss(zmm13, dword_ptr(one)).map_err(Self::err)?;
+        self.asm.vaddps(s0, s0, zmm13).map_err(Self::err)?;
+
+        // 2^k
+        self.asm.vcvtps2dq(zmm13, s1).map_err(Self::err)?;
+        let m127 = self.const_f32(127.0);
+        self.asm.vbroadcastss(dst, dword_ptr(m127)).map_err(Self::err)?;
+        self.asm.vcvtps2dq(dst, dst).map_err(Self::err)?;
+        self.asm.vpaddd(zmm13, zmm13, dst).map_err(Self::err)?;
+        self.asm.vpslld(zmm13, zmm13, 23i32).map_err(Self::err)?;
+
+        self.asm.vmulps(dst, s0, zmm13).map_err(Self::err)?;
+        Ok(())
+    }
+
+    /// Log(x) degree-4 minimax polynomial ZMM 版本 (AVX-512, 16 lanes)。
+    ///
+    /// BCE-20260703-AVX512-HALF-LANES: emit_log_minimax 原本 YMM-only, 本函数是 ZMM 16-lane 版,
+    /// 与 YMM 版数学等价。所有指令 (vpsrld/vcvtdq2ps/vbroadcastss/vsubps/vandps/vorps/
+    /// vfmadd213ps/vfmadd231ps/vmulps) 均支持 ZMM 操作数。
+    fn emit_log_minimax_zmm(&mut self, dst: AsmRegisterZmm, src: AsmRegisterZmm) -> Result<(), CompilerError> {
+        use crate::compiler::codegen::math_approx::*;
+        // Extract exponent: e = float(x >> 23) - 127
+        self.asm.vpsrld(zmm13, src, 23i32).map_err(Self::err)?;
+        self.asm.vcvtdq2ps(zmm13, zmm13).map_err(Self::err)?;
+        let m127 = self.const_f32(127.0);
+        self.asm.vbroadcastss(zmm14, dword_ptr(m127)).map_err(Self::err)?;
+        self.asm.vsubps(zmm13, zmm13, zmm14).map_err(Self::err)?;
+
+        // Extract mantissa: m = (x & 0x007FFFFF) | 0x3F800000
+        let mask = self.const_f32(LOG_MANTISSA_MASK);
+        self.asm.vbroadcastss(zmm14, dword_ptr(mask)).map_err(Self::err)?;
+        self.asm.vandps(zmm15, src, zmm14).map_err(Self::err)?;
+        let one = self.const_f32(1.0);
+        self.asm.vbroadcastss(zmm14, dword_ptr(one)).map_err(Self::err)?;
+        self.asm.vorps(zmm15, zmm15, zmm14).map_err(Self::err)?;
+        self.asm.vsubps(zmm15, zmm15, zmm14).map_err(Self::err)?; // t = m - 1
+
+        // Horner: p = ((C4*t + C3)*t + C2)*t + C1
+        let c4 = self.const_f32(LOG_C4);
+        self.asm.vbroadcastss(dst, dword_ptr(c4)).map_err(Self::err)?;
+        let c3 = self.const_f32(LOG_C3);
+        self.asm.vbroadcastss(zmm14, dword_ptr(c3)).map_err(Self::err)?;
+        self.asm.vfmadd213ps(dst, zmm15, zmm14).map_err(Self::err)?;
+        let c2 = self.const_f32(LOG_C2);
+        self.asm.vbroadcastss(zmm14, dword_ptr(c2)).map_err(Self::err)?;
+        self.asm.vfmadd213ps(dst, zmm15, zmm14).map_err(Self::err)?;
+        let c1 = self.const_f32(LOG_C1);
+        self.asm.vbroadcastss(zmm14, dword_ptr(c1)).map_err(Self::err)?;
+        self.asm.vfmadd213ps(dst, zmm15, zmm14).map_err(Self::err)?;
+        self.asm.vmulps(dst, dst, zmm15).map_err(Self::err)?;
+
+        // result = e * ln(2) + p
+        let ln2 = self.const_f32(LOG_LN2);
+        self.asm.vbroadcastss(zmm14, dword_ptr(ln2)).map_err(Self::err)?;
+        self.asm.vfmadd231ps(dst, zmm13, zmm14).map_err(Self::err)?;
+        Ok(())
+    }
+
     // ── FP8 → F32 conversion (software AVX2 path) ──
 
     /// FP8 E4M3 → F32 vector conversion (AVX2 software path).

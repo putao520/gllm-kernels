@@ -1643,10 +1643,40 @@ impl X86Lower {
         match instr {
             VmInstr::HReduce { dst, src, op } => {
                 // ARCH-ISA-SCRATCH-VEC: 使用 scratch_vec_ids[0] 作为 reduce 交换 scratch (ymm15)
-                let xmm_scratch = self.scratch_xmm(0);
                 // src 读 → spill slot 0 (ymm12); dst 写 → spill slot 2 (ymm10)。
                 // 内部 vextractf128 写 xmm15 (内部 scratch[0]),与 spill scratches (ymm12/11/10)
                 // 互不冲突。
+                //
+                // BCE-20260703-AVX512-HALF-LANES: HReduce 无 width 字段, src 宽度由
+                // use_avx512 推断 (auto_select.rs:1294 注释: input is vector-width)。
+                // AVX-512 下上游 VecLoad/VecArith 用 ZMM 产出 16 lanes 数据, 旧实现
+                // resolve_ymm_or_spill 读 src → 只看低 8 lanes (物理别名) 或只 load 32B (spill)
+                // → NormLike mean/var 只基于 8/16 数据 → 归一化数值错 → 误差逐层累积。
+                // 根治: use_avx512 时走 ZMM 路径 (resolve_zmm_or_spill 读 16 lanes + 16-lane
+                // reduce 到标量 + 广播回 ZMM 填满 16 lanes, 与 lower_broadcast_x86 一致)。
+                if self.use_avx512 {
+                    let (s, _) = self.resolve_zmm_or_spill(*src, alloc, 0)?;
+                    let (d, dst_spilled) = self.resolve_zmm_or_spill_write(*dst, alloc, 2)?;
+                    if d != s {
+                        self.asm.vmovups(d, s).map_err(Self::err)?;
+                    }
+                    // 16-lane reduce → 标量 (留在 d 的 xmm 视图)。
+                    // zmm_hreduce_to_xmm 内部用 scratch_ymm(1); d 必须不与 scratch_ymm(1) 别名
+                    // (d 来自 resolve_zmm_or_spill_write slot 2 = spill_scratch_zmm(2) 或物理 dst,
+                    //  scratch_ymm(1) = scratch_vec_ids[1], 互不重叠)。
+                    let d_xmm = Self::ymm_to_xmm(Self::zmm_to_ymm(d));
+                    self.zmm_hreduce_to_xmm(*op, d, d_xmm)?;
+                    // 标量在 d 的 xmm 视图 (lane0); 广播到完整 ZMM (16 lanes)。
+                    // vpermilps zmm,zmm,0 广播 lane0 到每个 128-bit 块内 4 lanes;
+                    // 但跨 128-bit 块需 vpermd/vbroadcastss 填满 16 lanes。用 vbroadcastss zmm,xmm 最简。
+                    let bcast_scratch = self.scratch_zmm(2);
+                    self.asm.vbroadcastss(bcast_scratch, d_xmm).map_err(Self::err)?;
+                    self.asm.vmovups(d, bcast_scratch).map_err(Self::err)?;
+                    if dst_spilled { self.spill_store_zmm(*dst, alloc, 2)?; }
+                    return Ok(());
+                }
+                // AVX2 / SSE 路径 (use_avx512=false): 保持原 YMM 实现
+                let xmm_scratch = self.scratch_xmm(0);
                 let (s, _) = self.resolve_ymm_or_spill(*src, alloc, 0)?;
                 let (d, dst_spilled) = self.resolve_ymm_or_spill_write(*dst, alloc, 2)?;
                 if d != s {
@@ -1677,6 +1707,19 @@ impl X86Lower {
         match instr {
             VmInstr::Accumulate { acc, src } => {
                 // acc 既读又写,src 读。acc→spill slot 2 (read+write 同一 slot),src→slot 0
+                //
+                // BCE-20260703-AVX512-HALF-LANES: AVX-512 下 acc 是 ZMM(16 lanes), 旧实现
+                // resolve_ymm_or_spill + vaddps ymm 只累加低 8 lanes → 高 8 lanes 始终保持
+                // 初始 0, 最终 acc 高 8 lanes=0 → 即使 HReduce 修对也只得到低 8 的和。
+                // 根治: use_avx512 时走 ZMM 路径 (vaddps zmm 累加 16 lanes), 与 HReduce 同修。
+                if self.use_avx512 {
+                    let (s, _) = self.resolve_zmm_or_spill(*src, alloc, 0)?;
+                    let (a, acc_spilled) = self.resolve_zmm_or_spill(*acc, alloc, 2)?;
+                    self.asm.vaddps(a, a, s).map_err(Self::err)?;
+                    if acc_spilled { self.spill_store_zmm(*acc, alloc, 2)?; }
+                    return Ok(());
+                }
+                // AVX2 / SSE 路径 (use_avx512=false): 保持原 YMM 实现
                 let (s, _) = self.resolve_ymm_or_spill(*src, alloc, 0)?;
                 let (a, acc_spilled) = self.resolve_ymm_or_spill(*acc, alloc, 2)?;
                 self.asm.vaddps(a, a, s).map_err(Self::err)?;
@@ -1693,6 +1736,57 @@ impl X86Lower {
             VmInstr::Transcendental { dst, src, func } => {
                 // Cephes/Sigmoid/Tanh/Log 内部使用 ymm13/14/15 (内部 scratch[0..2])。
                 // src→spill slot 0 (ymm12), dst→spill slot 2 (ymm10), 与内部 scratch 互不冲突。
+                //
+                // BCE-20260703-AVX512-HALF-LANES: SwiGLU exp/sigmoid/tanh 的 Transcendental 原本
+                // YMM-only (8 lanes), 高 8 lanes 输出垃圾 → FFN 中间层精度错。根治: use_avx512
+                // 时走 ZMM 路径 (emit_exp_cephes_zmm/emit_log_minimax_zmm + vrcp14ps zmm),
+                // AVX2 保持原 YMM 实现。Sigmoid/Tanh 内部用 exp, 改 exp 即间接覆盖。
+                // FWHT 不在本次 BCE 范围 (其 16-lane 化需 vblendvps zmm 替代, 独立 BCE 跟踪),
+                // 仍走下方原 YMM 路径。
+                if self.use_avx512 && !matches!(func, TranscendentalFn::Fwht) {
+                    let (s, _) = self.resolve_zmm_or_spill(*src, alloc, 0)?;
+                    let (d, dst_spilled) = self.resolve_zmm_or_spill_write(*dst, alloc, 2)?;
+                    match func {
+                        TranscendentalFn::Exp => self.emit_exp_cephes_zmm(d, s)?,
+                        TranscendentalFn::Sigmoid => {
+                            // ARCH-ISA-SCRATCH-VEC: scratch_vec_ids[2] = broadcast scratch (zmm 视图)
+                            let bscratch = self.scratch_zmm(2);
+                            self.asm.vxorps(d, d, d).map_err(Self::err)?;
+                            self.asm.vsubps(d, d, s).map_err(Self::err)?; // d = -x
+                            self.emit_exp_cephes_zmm(d, d)?; // d = exp(-x)
+                            let one = self.const_f32(1.0);
+                            self.asm.vbroadcastss(bscratch, dword_ptr(one)).map_err(Self::err)?;
+                            self.asm.vaddps(d, d, bscratch).map_err(Self::err)?;
+                            // vrcpps 不支持 ZMM; AVX-512 用 vrcp14ps (14-bit 近似倒数, ≥ vrcpps 11-bit 精度)
+                            self.asm.vrcp14ps(d, d).map_err(Self::err)?;
+                        }
+                        TranscendentalFn::Tanh => {
+                            let bscratch = self.scratch_zmm(2);
+                            let two = self.const_f32(2.0);
+                            self.asm.vbroadcastss(d, dword_ptr(two)).map_err(Self::err)?;
+                            self.asm.vmulps(d, d, s).map_err(Self::err)?; // d = 2x
+                            self.asm.vxorps(bscratch, bscratch, bscratch).map_err(Self::err)?;
+                            self.asm.vsubps(d, bscratch, d).map_err(Self::err)?; // d = -2x
+                            self.emit_exp_cephes_zmm(d, d)?;
+                            let one = self.const_f32(1.0);
+                            self.asm.vbroadcastss(bscratch, dword_ptr(one)).map_err(Self::err)?;
+                            self.asm.vaddps(d, d, bscratch).map_err(Self::err)?;
+                            self.asm.vrcp14ps(d, d).map_err(Self::err)?;
+                            self.asm.vbroadcastss(bscratch, dword_ptr(two)).map_err(Self::err)?;
+                            self.asm.vmulps(d, d, bscratch).map_err(Self::err)?;
+                            let one2 = self.const_f32(1.0);
+                            self.asm.vbroadcastss(bscratch, dword_ptr(one2)).map_err(Self::err)?;
+                            self.asm.vsubps(d, d, bscratch).map_err(Self::err)?;
+                        }
+                        TranscendentalFn::Log => {
+                            self.emit_log_minimax_zmm(d, s)?;
+                        }
+                        TranscendentalFn::Fwht => unreachable!("Fwht excluded by outer guard"),
+                    }
+                    if dst_spilled { self.spill_store_zmm(*dst, alloc, 2)?; }
+                    return Ok(());
+                }
+                // AVX2 / SSE 路径 (use_avx512=false) 或 Fwht: 保持原 YMM 实现
                 let (s, _) = self.resolve_ymm_or_spill(*src, alloc, 0)?;
                 let (d, dst_spilled) = self.resolve_ymm_or_spill_write(*dst, alloc, 2)?;
                 match func {

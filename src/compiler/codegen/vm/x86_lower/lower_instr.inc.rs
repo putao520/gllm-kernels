@@ -192,14 +192,54 @@ impl X86Lower {
         let lanes = width.f32_lanes();
         let step = lanes * 4;
         let num_vecs = vocab_bytes / step;
+        let base_saved = self.scratch_gprs[1];
+        self.asm.mov(base_saved, base_reg).map_err(Self::err)?;
 
+        // BCE-20260703-AVX512-HALF-LANES: AVX-512 下 step=64 (16 lanes), 但旧实现用
+        // scratch_ymm + ymmword_ptr (32B) load → 只处理低 8 lanes, 高 8 lanes 跳过
+        // → softmax max 偏小 → exp(logits-max) 偏大 → 采样概率失真。根治: use_avx512
+        // 时走 ZMM 路径 (scratch_zmm + zmmword_ptr + 16-lane reduce), AVX2 保持原 YMM。
+        if self.use_avx512 {
+            let tmp_zmm = self.scratch_zmm(0);
+            // zmm_hreduce_to_xmm 内部占用 scratch_ymm(1) 作 ymm_hi/reduce-scratch;
+            // max_xmm=val_xmm 都可用 (避开了 scratch_xmm(1)=ymm_hi 的 xmm 视图)。
+            let max_xmm = self.scratch_xmm(2);
+            let val_xmm = self.scratch_xmm(0);
+
+            // Load first vector, horizontal max (16 lanes) → max_xmm
+            self.asm.vmovups(tmp_zmm, zmmword_ptr(base_saved)).map_err(Self::err)?;
+            self.zmm_hreduce_to_xmm(ReduceOp::Max, tmp_zmm, max_xmm)?;
+
+            // Scan remaining vectors
+            let offset_reg = self.scratch_gprs[2];
+            self.asm.mov(offset_reg, step as u64).map_err(Self::err)?;
+            let mut scan_label = self.asm.create_label();
+            let mut skip_label = self.asm.create_label();
+
+            self.asm.set_label(&mut scan_label).map_err(Self::err)?;
+            self.asm.vmovups(tmp_zmm, zmmword_ptr(base_saved + offset_reg)).map_err(Self::err)?;
+            // reduce 本向量 max → val_xmm (max_xmm 全局 max 不被破坏)
+            self.zmm_hreduce_to_xmm(ReduceOp::Max, tmp_zmm, val_xmm)?;
+            self.asm.vcomiss(val_xmm, max_xmm).map_err(Self::err)?;
+            self.asm.jbe(skip_label).map_err(Self::err)?;
+            self.asm.vmaxss(max_xmm, max_xmm, val_xmm).map_err(Self::err)?;
+
+            self.asm.set_label(&mut skip_label).map_err(Self::err)?;
+            self.asm.add(offset_reg, step as i32).map_err(Self::err)?;
+            self.asm.cmp(offset_reg, (num_vecs * step) as i32).map_err(Self::err)?;
+            self.asm.jb(scan_label).map_err(Self::err)?;
+
+            self.asm.vmovd(eax, max_xmm).map_err(Self::err)?;
+            self.asm.mov(dst_reg, rax).map_err(Self::err)?;
+            self.commit_gpr_write(dst, alloc, 0)?;
+            return Ok(());
+        }
+
+        // AVX2 / SSE 路径 (use_avx512=false): 保持原 YMM 实现 (step=32 匹配 ymmword=32B)
         let tmp = self.scratch_ymm(0);
         let tmp_xmm = self.scratch_xmm(0);
         let val_xmm = self.scratch_xmm(1);
         let max_xmm = self.scratch_xmm(2);
-        let base_saved = self.scratch_gprs[1];
-
-        self.asm.mov(base_saved, base_reg).map_err(Self::err)?;
 
         // Load first vector, horizontal max → max_xmm
         self.asm.vmovups(tmp, ymmword_ptr(base_saved)).map_err(Self::err)?;
@@ -339,6 +379,30 @@ impl X86Lower {
         let step = lanes * 4;
         let num_vecs = vocab_bytes / step;
 
+        let base_saved = self.scratch_gprs[1];
+        self.asm.mov(base_saved, base_reg).map_err(Self::err)?;
+
+        // BCE-20260703-AVX512-HALF-LANES: AVX-512 下 step=64 但旧实现 vdivps 只除低 8 lanes
+        // → 高 8 lanes 概率未除 sum, 概率分布不归一。根治: use_avx512 时走 ZMM 路径
+        // (vbroadcastss zmm + vdivps zmm + zmmword_ptr load/store), AVX2 保持原 YMM。
+        if self.use_avx512 {
+            // 广播 sum 到 zmm (16 lanes)
+            let sum_zmm = self.scratch_zmm(0);
+            let sum_xmm = self.scratch_xmm(0);
+            self.asm.vmovd(sum_xmm, Self::gpr64_to_32(sum_gpr)).map_err(Self::err)?;
+            self.asm.vbroadcastss(sum_zmm, sum_xmm).map_err(Self::err)?;
+
+            let tmp = self.scratch_zmm(1);
+            for vec_idx in 0..num_vecs {
+                let byte_off = vec_idx * step;
+                self.asm.vmovups(tmp, zmmword_ptr(base_saved + byte_off as i32)).map_err(Self::err)?;
+                self.asm.vdivps(tmp, tmp, sum_zmm).map_err(Self::err)?;
+                self.asm.vmovups(zmmword_ptr(base_saved + byte_off as i32), tmp).map_err(Self::err)?;
+            }
+            return Ok(());
+        }
+
+        // AVX2 / SSE 路径 (use_avx512=false): 保持原 YMM 实现
         // Broadcast sum to ymm
         let sum_ymm = self.scratch_ymm(0);
         let sum_xmm = self.scratch_xmm(0);
@@ -346,8 +410,6 @@ impl X86Lower {
         self.asm.vbroadcastss(sum_ymm, sum_xmm).map_err(Self::err)?;
 
         let tmp = self.scratch_ymm(1);
-        let base_saved = self.scratch_gprs[1];
-        self.asm.mov(base_saved, base_reg).map_err(Self::err)?;
 
         for vec_idx in 0..num_vecs {
             let byte_off = vec_idx * step;
@@ -898,6 +960,50 @@ impl X86Lower {
         }
     }
 
+    /// AVX-512 16-lane 水平归约辅助: 把 ZMM(16 f32) 归约到 xmm 标量 (lane0)。
+    ///
+    /// BCE-20260703-AVX512-HALF-LANES: AVX-512 路径下 width.f32_lanes()=16, 旧实现用
+    /// `scratch_ymm` + `ymmword_ptr` (32B/8 lanes) load/reduce, 步长按 16 跳但只处理低 8
+    /// lanes → 高 8 lanes 被跳过 (argmax=6 真因)。此辅助函数处理完整 16 lanes:
+    ///
+    ///   1. vextractf64x4(ymm_hi, zmm, 1) — 提取高 256 位 (lanes 8-15) 到 ymm_hi
+    ///   2. ymm_lo = zmm 低 256 位别名 (Self::zmm_to_ymm)
+    ///   3. vmaxps/vaddps(ymm_lo, ymm_lo, ymm_hi) → 8 lanes (lanes 0-7 与 8-15 对位归约)
+    ///      此时 ymm_hi 不再需要,其 xmm 视图复用为后续 reduce scratch (避免占用额外 xmm)。
+    ///   4. 复用现有 8→4→2→1 xmm reduce 链 (vextractf128 / vmovhlps / vshufps),scratch 用 ymm_hi 的 xmm 视图。
+    ///
+    /// 输入 zmm_reg 被破坏 (步骤 3 写其低 YMM 视图)。标量结果留在 xmm_dst。
+    /// 仅占用 scratch_ymm(1) (ymm_hi, 内部); 不占用额外 scratch_xmm。
+    fn zmm_hreduce_to_xmm(
+        &mut self,
+        op: ReduceOp,
+        zmm_reg: AsmRegisterZmm,
+        xmm_dst: AsmRegisterXmm,
+    ) -> Result<(), CompilerError> {
+        let ymm_lo = Self::zmm_to_ymm(zmm_reg);
+        let ymm_hi = self.scratch_ymm(1);
+        let xm_lo = Self::ymm_to_xmm(ymm_lo);
+        let xm_hi = Self::ymm_to_xmm(ymm_hi); // reduce scratch (复用 ymm_hi 的 xmm 视图)
+        // ymm_hi = zmm 高 256 位 (lanes 8-15)
+        self.asm.vextractf64x4(ymm_hi, zmm_reg, 1i32).map_err(Self::err)?;
+        // 16→8: ymm_lo = op(ymm_lo, ymm_hi) (lanes 0-7 ← op(lanes 0-7, lanes 8-15))
+        Self::xmm_reduce_op(&mut self.asm, op, xm_lo, xm_hi)?;
+        // 8→4: vextractf128 + op
+        self.asm.vextractf128(xm_hi, ymm_lo, 1i32).map_err(Self::err)?;
+        Self::xmm_reduce_op(&mut self.asm, op, xm_lo, xm_hi)?;
+        // 4→2
+        self.asm.vmovhlps(xm_hi, xm_lo, xm_lo).map_err(Self::err)?;
+        Self::xmm_reduce_op(&mut self.asm, op, xm_lo, xm_hi)?;
+        // 2→1
+        self.asm.vshufps(xm_hi, xm_lo, xm_lo, 0x55i32).map_err(Self::err)?;
+        Self::xmm_ss_reduce_op(&mut self.asm, op, xm_lo, xm_hi)?;
+        // 标量在 xm_lo; 搬到 xmm_dst (若不同)
+        if xmm_dst != xm_lo {
+            self.asm.vmovaps(xmm_dst, xm_lo).map_err(Self::err)?;
+        }
+        Ok(())
+    }
+
     /// mxfp4 SIMD 反量化: decode packed 4-bit data → f32 SIMD vector.
     ///
     /// Mathematical E2M1 decode (no LUT needed):
@@ -951,6 +1057,74 @@ impl X86Lower {
         let num_vecs = vocab_bytes / step;
         let total_bytes = num_vecs * step;
 
+        let offset_reg = self.scratch_gprs[2];
+        let base_saved = self.scratch_gprs[1];
+        self.asm.mov(base_saved, base_reg).map_err(Self::err)?;
+
+        // BCE-20260703-AVX512-HALF-LANES: AVX-512 下 step=64 (16 lanes), 但旧实现用
+        // scratch_ymm + ymmword_ptr (32B) load/reduce → 只处理低 8 lanes, 高 8 lanes
+        // (lanes 8-15) 被完全跳过。vocab=49152 每 64B 块的高 8 floats 从未被 argmax
+        // 考虑, 真正全局 max (id=253) 落高 lanes 被跳过 → 报局部 max=21.53 的 lane 索引 6
+        // (argmax=6 真因)。根治: use_avx512 时走 ZMM 路径 (scratch_zmm + zmmword_ptr +
+        // 16-lane reduce + k-mask lane 查找), AVX2 保持原 YMM 实现 (step=32 匹配)。
+        if self.use_avx512 {
+            let tmp_zmm = self.scratch_zmm(0);
+            // zmm_hreduce_to_xmm 内部占用 scratch_ymm(1); 用 scratch_xmm(0/2) (避开 1)。
+            let max_xmm = self.scratch_xmm(2);
+            let val_xmm = self.scratch_xmm(0);
+            // k1 掩码寄存器用于 16-lane 精确 lane 查找 (vcmpeqps zmm → k1, kmovd gpr, bsf)。
+            let kmask = k1;
+
+            // Initialize: load first vector as initial max, argmax=0
+            self.asm.xor(offset_reg, offset_reg).map_err(Self::err)?;
+            self.asm.vmovups(tmp_zmm, zmmword_ptr(base_saved)).map_err(Self::err)?;
+            self.zmm_hreduce_to_xmm(ReduceOp::Max, tmp_zmm, max_xmm)?;
+            // argmax = 0 (first element of first vector)
+            self.asm.xor(dst_reg, dst_reg).map_err(Self::err)?;
+            // Start scan from second vector (offset = step)
+            self.asm.mov(offset_reg, step as u64).map_err(Self::err)?;
+
+            let scan_body = self.asm.create_label();
+            let skip_update = self.asm.create_label();
+            let scan_done = self.asm.create_label();
+
+            self.asm.set_label(&mut scan_body.clone()).map_err(Self::err)?;
+            self.asm.vmovups(tmp_zmm, zmmword_ptr(base_saved + offset_reg)).map_err(Self::err)?;
+            // reduce 本向量 max → val_xmm (max_xmm 全局 max 不被破坏)
+            self.zmm_hreduce_to_xmm(ReduceOp::Max, tmp_zmm, val_xmm)?;
+            // Compare: val_xmm (new vec max) vs max_xmm (global max)
+            self.asm.vcomiss(val_xmm, max_xmm).map_err(Self::err)?;
+            self.asm.jbe(skip_update).map_err(Self::err)?;
+            // New max found: update max_xmm (val_xmm > max_xmm)
+            self.asm.vmaxss(max_xmm, max_xmm, val_xmm).map_err(Self::err)?;
+            // Find exact lane within this 16-lane vector:
+            //   reload vector (zmm_hreduce_to_xmm 破坏了 tmp_zmm 低 YMM),
+            //   broadcast scalar max → zmm, vcmpeqps k1, tmp_zmm, broadcast,
+            //   kmovd dst_reg, k1; bsf dst_reg → lane index (0..15).
+            self.asm.vmovups(tmp_zmm, zmmword_ptr(base_saved + offset_reg)).map_err(Self::err)?;
+            // 广播 max_xmm 标量到 zmm (vbroadcastss zmm, xmm)
+            let bcast_zmm = self.scratch_zmm(2);
+            self.asm.vbroadcastss(bcast_zmm, max_xmm).map_err(Self::err)?;
+            // k1 = (tmp_zmm == bcast_zmm) per-lane (16-bit mask = 16 lanes)
+            self.asm.vcmpeqps(kmask, tmp_zmm, bcast_zmm).map_err(Self::err)?;
+            self.asm.kmovd(Self::gpr64_to_32(dst_reg), kmask).map_err(Self::err)?;
+            self.asm.bsf(dst_reg, dst_reg).map_err(Self::err)?;
+            // argmax = (offset_reg / 4) + bsf(mask)
+            // offset_reg 是 step 的倍数 (lanes*4, lanes>=4), shr 2 / shl 2 往返无损。
+            self.asm.shr(offset_reg, 2).map_err(Self::err)?;
+            self.asm.add(dst_reg, offset_reg).map_err(Self::err)?;
+            self.asm.shl(offset_reg, 2).map_err(Self::err)?;
+
+            self.asm.set_label(&mut skip_update.clone()).map_err(Self::err)?;
+            self.asm.add(offset_reg, step as i32).map_err(Self::err)?;
+            self.asm.cmp(offset_reg, total_bytes as i32).map_err(Self::err)?;
+            self.asm.jb(scan_body).map_err(Self::err)?;
+
+            self.asm.set_label(&mut scan_done.clone()).map_err(Self::err)?;
+            self.commit_gpr_write(dst, alloc, 0)?;
+            return Ok(());
+        }
+
         // Registers: tmp_ymm=scratch(0) for loading, val_ymm=scratch(1) for horizontal reduce
         // max_xmm=scratch(2) for current global max
         let tmp_ymm = self.scratch_ymm(0);
@@ -958,10 +1132,6 @@ impl X86Lower {
         let max_xmm = self.scratch_xmm(2);
         let val_xmm = self.scratch_xmm(1);
         let tmp_xmm = self.scratch_xmm(0);
-        let offset_reg = self.scratch_gprs[2];
-        let base_saved = self.scratch_gprs[1];
-
-        self.asm.mov(base_saved, base_reg).map_err(Self::err)?;
 
         // Initialize: load first vector as initial max, argmax=0
         self.asm.xor(offset_reg, offset_reg).map_err(Self::err)?;
@@ -1043,6 +1213,26 @@ impl X86Lower {
         let step = lanes * 4;
         let num_vecs = vocab_bytes / step;
 
+        // BCE-20260703-AVX512-HALF-LANES: AVX-512 下 step=64 但旧实现 vdivps 只除低 8 lanes
+        // → 高 8 lanes logits 未缩放。根治: use_avx512 时走 ZMM 路径 (vbroadcastss zmm +
+        // vdivps zmm + zmmword_ptr load/store), AVX2 保持原 YMM。
+        if self.use_avx512 {
+            // 广播 temperature 到 zmm (16 lanes)
+            let temp_vec = self.scratch_zmm(0);
+            self.asm.vbroadcastss(temp_vec, dword_ptr(temp_base)).map_err(Self::err)?;
+
+            let tmp = self.scratch_zmm(1);
+            // 向量化除法 (保留原 num_vecs.min(8) 上界, 不在本次 BCE 范围内调整)
+            for vec_idx in 0..num_vecs.min(8) {
+                let byte_off = vec_idx * step;
+                self.asm.vmovups(tmp, zmmword_ptr(base_reg + byte_off as i32)).map_err(Self::err)?;
+                self.asm.vdivps(tmp, tmp, temp_vec).map_err(Self::err)?;
+                self.asm.vmovups(zmmword_ptr(base_reg + byte_off as i32), tmp).map_err(Self::err)?;
+            }
+            return Ok(());
+        }
+
+        // AVX2 / SSE 路径 (use_avx512=false): 保持原 YMM 实现
         // 广播 temperature 到向量
         let temp_vec = self.scratch_ymm(0);
         self.asm.vbroadcastss(temp_vec, dword_ptr(temp_base)).map_err(Self::err)?;
