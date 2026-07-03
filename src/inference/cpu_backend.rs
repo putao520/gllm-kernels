@@ -1,33 +1,60 @@
-//! CPU inference backend — fallback path using Layer 1 atomic operators.
+//! CPU inference backend.
 //!
-//! This is the reference implementation of `InferenceBackend`. It composes
-//! the existing `Kernels<E>` operators to implement full transformer layers.
+//! ## Constitution (NO-FALLBACK + ARCH-RUST-IS-CODEGEN)
 //!
-//! When the JIT compiler is available, `decoder_forward` delegates to the
-//! compiled layer function. Otherwise it falls back to operator-by-operator
-//! execution through this module.
+//! The production `decoder_forward` / `encoder_forward` / `generate` paths
+//! **must not** execute Rust operator-by-operator composition. Rust is a code
+//! generator; inference-time compute belongs to the JIT-compiled MegaKernelFn.
+//!
+//! Consequently, the production trait methods return `InferenceError::RuntimeError`
+//! ("JIT compiled layer required; no Rust operator fallback") unless a
+//! `CompiledLayer` has been attached via `with_compiled_layer`. Wiring a
+//! `CompiledLayer` (built from `ModelConfig` → `CompilerGraph` via the gllm
+//! Executor / `InferenceCompiler::compile`) is the integration seam —
+//! `CpuInferenceBackend` intentionally does not perform `ModelConfig` → graph
+//! construction (that is the gllm Executor's responsibility; NO-ISLAND-MODULE:
+//! the seam exists so upstream can attach a compiled layer).
+//!
+//! The original Rust operator composition is preserved exclusively under
+//! `#[cfg(test)]` as `decoder_forward_reference_impl` / `generate_reference` —
+//! the numerical ground-truth for unit tests, never compiled into release builds.
 
-use crate::compiler::InferenceCompiler;
+use crate::compiler::{CompiledLayer, InferenceCompiler};
 use crate::cpu_kernels::CpuKernels;
 use crate::dispatch::{DeviceProfile, device_profile};
 use crate::types::{DType, InferenceError, ModelConfig};
 use crate::inference::tensor::{DeviceKind, DeviceTensor};
 use crate::inference::weights::ModelWeights;
+#[allow(unused_imports)]
 use crate::inference::kv_cache::{KvCache, PAGE_SIZE};
 use crate::inference::InferenceBackend;
 use crate::traits::Kernels;
 
-/// CPU inference backend with fallback operator composition.
+/// CPU inference backend.
 ///
-/// When the JIT compiler is available, `decoder_forward` attempts to use
-/// compiled fused layers. Falls back to operator-by-operator execution
-/// through Layer 1 kernels when JIT is unavailable or compilation fails.
+/// Production inference paths delegate to an attached JIT `CompiledLayer`
+/// (`with_compiled_layer`). Without one, they return `Err` (NO-FALLBACK).
+/// The Rust operator path survives only under `#[cfg(test)]` as the reference
+/// ground-truth.
 pub struct CpuInferenceBackend {
     config: ModelConfig,
     profile: DeviceProfile,
     kernels: CpuKernels<f32>,
-    /// Optional JIT compiler for fused layer execution
+    /// JIT compiler (drives `CompiledLayer` construction upstream).
     compiler: Option<InferenceCompiler>,
+    /// Attached JIT-compiled MegaKernel layer. When `Some`, `decoder_forward`
+    /// delegates to `CompiledLayer::execute_as_mega_kernel` (MegaKernelFn 22-param
+    /// ABI, batch_size=1 single-token). When `None`, production paths return `Err`
+    /// (NO-FALLBACK). Populated by upstream via `with_compiled_layer`.
+    compiled_layer: Option<CompiledLayer>,
+    /// Contiguous weight-blob base address matching the attached `CompiledLayer`'s
+    /// expected layout (MegaKernelFn arg 1). Stored as a raw address (`usize`) so
+    /// the backend remains `Send`+`Sync`. The gllm Executor / FFI host owns this
+    /// blob; `ModelWeights`' per-layer `DeviceTensor`s are NOT the blob.
+    /// Required for delegation alongside `compiled_layer`. `0` = unattached.
+    weight_blob_addr: usize,
+    /// Length in bytes of the weight blob (for validation).
+    weight_blob_bytes: usize,
 }
 
 impl InferenceBackend for CpuInferenceBackend {
@@ -41,6 +68,9 @@ impl InferenceBackend for CpuInferenceBackend {
             profile,
             kernels: CpuKernels::new(),
             compiler,
+            compiled_layer: None,
+            weight_blob_addr: 0,
+            weight_blob_bytes: 0,
         })
     }
 
@@ -107,6 +137,360 @@ impl InferenceBackend for CpuInferenceBackend {
     }
 
     fn decoder_forward(
+        &self,
+        input: &DeviceTensor,
+        _positions: &DeviceTensor,
+        _kv_cache: &mut KvCache,
+        _weights: &ModelWeights,
+        _seq_lens: &[usize],
+        output: &mut DeviceTensor,
+    ) -> Result<(), InferenceError> {
+// ARCH-RUST-IS-CODEGEN + NO-FALLBACK: production path delegates to JIT compiled
+        // MegaKernelFn (22-param ABI, batch_size=1 single-token). No Rust operator
+        // fallback. When no `CompiledLayer` is attached, return `Err` (NO-FALLBACK).
+        //
+        // Integration seam (NO-ISLAND-MODULE): upstream (gllm Executor / FFI host)
+        // builds the `CompiledLayer` from `ModelConfig` → `CompilerGraph` via
+        // `InferenceCompiler::compile` and attaches it via `with_compiled_layer`.
+        // `CpuInferenceBackend` intentionally does not perform ModelConfig→graph
+        // construction; that is the gllm Executor's responsibility.
+        //
+        // MegaKernelFn ABI expects a contiguous weight blob (arg 1) and a packed
+        // input_ids buffer (arg 0). `ModelWeights` here stores per-layer
+        // `DeviceTensor`s — it is NOT the MegaKernel weight blob. Therefore the
+        // delegation requires the upstream caller to attach a precompiled layer
+        // + contiguous weight blob (`with_weight_blob`).
+        if let (Some(layer), weights_addr) =
+            (self.compiled_layer.as_ref(), self.weight_blob_addr)
+        {
+            if weights_addr != 0 {
+                // Single-token, single-batch decode (batch_size=1, seq_len=1).
+                let batch_size = 1usize;
+                let seq_len = 1usize;
+                let weights_ptr = weights_addr as *const u8;
+                let input_ptr = input.as_ptr();
+                let output_ptr = output.as_mut_ptr();
+                // Scratchpad sized by the compiled layer's requirement.
+                let mut scratchpad = vec![0u8; layer.scratchpad_bytes];
+                // SAFETY: the attached CompiledLayer was emitted by the JIT pipeline
+                // and follows the MegaKernelFn 22-param ABI. Pointer validity + weight
+                // blob layout are the caller's (gllm Executor / FFI host) responsibility.
+                unsafe {
+                    layer.execute_as_mega_kernel(
+                        input_ptr,
+                        weights_ptr,
+                        batch_size,
+                        seq_len,
+                        output_ptr,
+                        scratchpad.as_mut_ptr(),
+                    );
+                }
+                return Ok(());
+            }
+        }
+        // NO-FALLBACK: no JIT compiled layer + weight blob attached.
+        Err(InferenceError::RuntimeError(
+            "decoder_forward: JIT compiled layer + weight blob required; no Rust operator fallback (NO-FALLBACK + ARCH-RUST-IS-CODEGEN). Attach via with_compiled_layer + with_weight_blob, or use the gllm Executor mega-kernel path.".into()
+        ))
+    }
+
+    fn encoder_forward(
+        &self,
+        input: &DeviceTensor,
+        _positions: &DeviceTensor,
+        attention_mask: &DeviceTensor,
+        weights: &ModelWeights,
+        output: &mut DeviceTensor,
+    ) -> Result<(), InferenceError> {
+        let h = self.config.hidden_size;
+        let num_heads = self.config.num_heads;
+        let num_kv_heads = self.config.num_kv_heads;
+        let head_dim = self.config.head_dim;
+        let q_dim = num_heads * head_dim;
+        let kv_dim = num_kv_heads * head_dim;
+        let inter = self.config.intermediate_size;
+        let eps = self.config.norm_eps;
+        let seq_len = input.num_elements() / h;
+
+        if seq_len == 0 {
+            return Ok(());
+        }
+
+        let input_slice: &[f32] = unsafe { input.as_slice() };
+        let mask_slice: &[f32] = unsafe { attention_mask.as_slice() };
+
+        // Working buffers
+        let mut hidden = input_slice.to_vec();
+        let mut normed = vec![0.0f32; seq_len * h];
+        let mut q = vec![0.0f32; seq_len * q_dim];
+        let mut k = vec![0.0f32; seq_len * kv_dim];
+        let mut v = vec![0.0f32; seq_len * kv_dim];
+        let mut attn_out = vec![0.0f32; seq_len * q_dim];
+        let mut proj = vec![0.0f32; seq_len * h];
+        let mut up_buf = vec![0.0f32; seq_len * inter];
+        let mut gelu_buf = vec![0.0f32; seq_len * inter];
+        let mut down_buf = vec![0.0f32; seq_len * h];
+        let mut residual = vec![0.0f32; seq_len * h];
+
+        // Per-head attention scratch
+        let mut scores = vec![0.0f32; seq_len * seq_len];
+        let mut attn_w = vec![0.0f32; seq_len * seq_len];
+
+        let scale = 1.0 / (head_dim as f32).sqrt();
+        let kv_group_size = num_heads / num_kv_heads;
+
+        for layer_idx in 0..self.config.num_layers {
+            let lw = &weights.layers[layer_idx];
+
+            // --- 1. Pre-attention LayerNorm ---
+            let gamma: &[f32] = unsafe { lw.attn_norm.as_slice() };
+            let beta: &[f32] = unsafe { lw.attn_norm_bias.as_slice() };
+            for s in 0..seq_len {
+                let src = &hidden[s * h..(s + 1) * h];
+                let dst = &mut normed[s * h..(s + 1) * h];
+                self.kernels.layer_norm(src, gamma, beta, dst, eps);
+            }
+
+            // --- 2. QKV projections: [seq_len, h] @ W → [seq_len, dim] ---
+            let wq: &[f32] = unsafe { lw.wq.as_slice() };
+            let wk: &[f32] = unsafe { lw.wk.as_slice() };
+            let wv: &[f32] = unsafe { lw.wv.as_slice() };
+            self.kernels.gemm(&normed, wq, &mut q, seq_len, q_dim, h);
+            self.kernels.gemm(&normed, wk, &mut k, seq_len, kv_dim, h);
+            self.kernels.gemm(&normed, wv, &mut v, seq_len, kv_dim, h);
+
+            // --- 3. Multi-head attention (no RoPE, no KV cache) ---
+            for head in 0..num_heads {
+                let kv_head = head / kv_group_size;
+                let q_off = head * head_dim;
+                let kv_off = kv_head * head_dim;
+
+                // scores[si, sj] = sum_d Q_h[si,d] * K_h[sj,d] * scale
+                for si in 0..seq_len {
+                    for sj in 0..seq_len {
+                        let mut dot = 0.0f32;
+                        for d in 0..head_dim {
+                            dot += q[si * q_dim + q_off + d]
+                                 * k[sj * kv_dim + kv_off + d];
+                        }
+                        scores[si * seq_len + sj] = dot * scale;
+                    }
+                }
+
+                // Apply attention mask: 0.0 → -inf
+                for i in 0..seq_len * seq_len {
+                    if mask_slice[i] == 0.0 {
+                        scores[i] = f32::NEG_INFINITY;
+                    }
+                }
+
+                // Softmax per query position
+                for si in 0..seq_len {
+                    let row = &scores[si * seq_len..(si + 1) * seq_len];
+                    let out = &mut attn_w[si * seq_len..(si + 1) * seq_len];
+                    self.kernels.softmax(row, out);
+                }
+
+                // attn_out_h[si, d] = sum_sj attn_w[si, sj] * V_h[sj, d]
+                for si in 0..seq_len {
+                    for d in 0..head_dim {
+                        let mut sum = 0.0f32;
+                        for sj in 0..seq_len {
+                            sum += attn_w[si * seq_len + sj]
+                                 * v[sj * kv_dim + kv_off + d];
+                        }
+                        attn_out[si * q_dim + q_off + d] = sum;
+                    }
+                }
+            }
+
+            // --- 4. Output projection + residual ---
+            let wo: &[f32] = unsafe { lw.wo.as_slice() };
+            self.kernels.gemm(&attn_out, wo, &mut proj, seq_len, h, q_dim);
+            self.kernels.vec_add(&hidden, &proj, &mut residual);
+            hidden.copy_from_slice(&residual);
+
+            // --- 5. Pre-FFN LayerNorm ---
+            let ffn_gamma: &[f32] = unsafe { lw.ffn_norm.as_slice() };
+            let ffn_beta: &[f32] = unsafe { lw.ffn_norm_bias.as_slice() };
+            for s in 0..seq_len {
+                let src = &hidden[s * h..(s + 1) * h];
+                let dst = &mut normed[s * h..(s + 1) * h];
+                self.kernels.layer_norm(src, ffn_gamma, ffn_beta, dst, eps);
+            }
+
+            // --- 6. FFN: up → GELU → down + residual ---
+            let wu: &[f32] = unsafe { lw.w_up.as_slice() };
+            let wd: &[f32] = unsafe { lw.w_down.as_slice() };
+            self.kernels.gemm(&normed, wu, &mut up_buf, seq_len, inter, h);
+            self.kernels.gelu(&up_buf, &mut gelu_buf);
+            self.kernels.gemm(&gelu_buf, wd, &mut down_buf, seq_len, h, inter);
+            self.kernels.vec_add(&hidden, &down_buf, &mut residual);
+            hidden.copy_from_slice(&residual);
+        }
+
+        // --- Mean pooling: average across sequence dimension ---
+        let mut pooled = vec![0.0f32; h];
+        for d in 0..h {
+            let mut sum = 0.0f32;
+            for s in 0..seq_len {
+                sum += hidden[s * h + d];
+            }
+            pooled[d] = sum / seq_len as f32;
+        }
+
+        // --- L2 normalize the pooled embedding ---
+        let mut sum_sq = 0.0f32;
+        for d in 0..h {
+            sum_sq += pooled[d] * pooled[d];
+        }
+        let inv_norm = 1.0 / (sum_sq + 1e-12_f32).sqrt();
+        for d in 0..h {
+            pooled[d] *= inv_norm;
+        }
+
+        // Copy pooled result to output tensor
+        unsafe {
+            std::ptr::copy_nonoverlapping(
+                pooled.as_ptr() as *const u8,
+                output.as_mut_ptr(),
+                h * std::mem::size_of::<f32>(),
+            );
+        }
+
+        Ok(())
+    }
+
+    /// Sample token IDs from logits.
+    ///
+    /// Current implementation: greedy argmax only. When temperature > 0,
+    /// logits are temperature-scaled but selection is still argmax.
+    /// `top_k` and `top_p` parameters are accepted but not yet implemented.
+    fn sample(
+        &self,
+        logits: &DeviceTensor,
+        temperature: f32,
+        _top_k: usize,
+        _top_p: f32,
+        output_ids: &mut [u32],
+    ) -> Result<(), InferenceError> {
+        // Simple argmax sampling (temperature=0) or greedy
+        let logits_slice: &[f32] = unsafe { logits.as_slice() };
+        let vocab_size = self.config.vocab_size;
+
+        for (batch_idx, out_id) in output_ids.iter_mut().enumerate() {
+            let start = batch_idx * vocab_size;
+            let end = start + vocab_size;
+            if end > logits_slice.len() {
+                return Err(InferenceError::ShapeMismatch {
+                    expected: format!("logits for batch {batch_idx}"),
+                    got: "insufficient logits".into(),
+                });
+            }
+            let batch_logits = &logits_slice[start..end];
+
+            if temperature <= 0.0 || temperature < 1e-6 {
+                // Argmax
+                let mut max_val = f32::NEG_INFINITY;
+                let mut max_idx = 0u32;
+                for (i, &v) in batch_logits.iter().enumerate() {
+                    if v > max_val {
+                        max_val = v;
+                        max_idx = i as u32;
+                    }
+                }
+                *out_id = max_idx;
+            } else {
+                // Temperature-scaled argmax (full sampling requires RNG)
+                let mut max_val = f32::NEG_INFINITY;
+                let mut max_idx = 0u32;
+                for (i, &v) in batch_logits.iter().enumerate() {
+                    let scaled = v / temperature;
+                    if scaled > max_val {
+                        max_val = scaled;
+                        max_idx = i as u32;
+                    }
+                }
+                *out_id = max_idx;
+            }
+        }
+
+        Ok(())
+    }
+
+    fn sync(&self) -> Result<(), InferenceError> {
+        // CPU is synchronous — no-op
+        Ok(())
+    }
+}
+
+impl CpuInferenceBackend {
+    /// Device profile driving this backend (exposed for upstream JIT wiring).
+    pub fn device_profile(&self) -> &DeviceProfile {
+        &self.profile
+    }
+
+    /// Attach a JIT-compiled MegaKernel layer (NO-ISLAND-MODULE integration seam).
+    ///
+    /// When attached (together with `with_weight_blob`), `decoder_forward`
+    /// delegates to `CompiledLayer::execute_as_mega_kernel` (MegaKernelFn 22-param
+    /// ABI). When absent, production inference paths return `Err` (NO-FALLBACK)
+    /// rather than executing Rust operator composition.
+    ///
+    /// The caller (gllm Executor / FFI host) is responsible for building the
+    /// `CompiledLayer` from `ModelConfig` → `CompilerGraph` via
+    /// `InferenceCompiler::compile`, and for providing the contiguous weight
+    /// blob the MegaKernelFn ABI expects.
+    pub fn with_compiled_layer(mut self, layer: CompiledLayer) -> Self {
+        self.compiled_layer = Some(layer);
+        self
+    }
+
+    /// Attach the contiguous weight blob matching the compiled layer's layout.
+    ///
+    /// # Safety
+    /// `ptr` must point to a contiguous allocation of at least `bytes` bytes that
+    /// remains valid for the lifetime of this backend, laid out exactly as the
+    /// attached `CompiledLayer` expects (the gllm Executor's weight-packing
+    /// contract). `ModelWeights`' per-layer `DeviceTensor`s are NOT a valid blob.
+    pub unsafe fn with_weight_blob(mut self, ptr: *const u8, bytes: usize) -> Self {
+        self.weight_blob_addr = ptr as usize;
+        self.weight_blob_bytes = bytes;
+        self
+    }
+
+    /// Mutable access to the JIT compiler (for upstream `compile()` calls).
+    pub fn compiler_mut(&mut self) -> Option<&mut InferenceCompiler> {
+        self.compiler.as_mut()
+    }
+
+    /// Greedy text generation: embed prompt tokens → decoder_forward loop → sample.
+    ///
+    /// Processes prompt tokens one by one through the decoder, then generates
+    /// `max_new_tokens` new tokens via greedy (or temperature-scaled) sampling.
+    /// Returns the generated token IDs (not including the prompt).
+    /// ARCH-RUST-IS-CODEGEN + NO-FALLBACK: production `generate` requires the JIT
+    /// MegaKernel path. Without an attached `CompiledLayer` + weight blob, returns
+    /// `Err`. The Rust operator reference loop is preserved under `#[cfg(test)]`
+    /// as `generate_reference` (numerical ground-truth, never in release builds).
+    pub fn generate(
+        &self,
+        _weights: &ModelWeights,
+        _prompt_tokens: &[u32],
+        _max_new_tokens: usize,
+        _temperature: f32,
+    ) -> Result<Vec<u32>, InferenceError> {
+        Err(InferenceError::RuntimeError(
+            "generate: JIT compiled layer + weight blob required; no Rust operator fallback (NO-FALLBACK + ARCH-RUST-IS-CODEGEN). Attach via with_compiled_layer + with_weight_blob, or use the gllm Executor mega-kernel path.".into()
+        ))
+    }
+
+    // ── Reference implementations (test-only, numerical ground-truth) ──
+    // The following methods compose Layer 1 operators to produce a numerical
+    // reference. They are compiled ONLY under `cfg(test)` and are never part of
+    // release inference paths (NO-SCALAR / ARCH-RUST-IS-CODEGEN).
+    #[cfg(test)]
+    pub(crate) fn decoder_forward_reference_impl(
         &self,
         input: &DeviceTensor,
         positions: &DeviceTensor,
@@ -379,243 +763,9 @@ impl InferenceBackend for CpuInferenceBackend {
         Ok(())
     }
 
-    fn encoder_forward(
-        &self,
-        input: &DeviceTensor,
-        _positions: &DeviceTensor,
-        attention_mask: &DeviceTensor,
-        weights: &ModelWeights,
-        output: &mut DeviceTensor,
-    ) -> Result<(), InferenceError> {
-        let h = self.config.hidden_size;
-        let num_heads = self.config.num_heads;
-        let num_kv_heads = self.config.num_kv_heads;
-        let head_dim = self.config.head_dim;
-        let q_dim = num_heads * head_dim;
-        let kv_dim = num_kv_heads * head_dim;
-        let inter = self.config.intermediate_size;
-        let eps = self.config.norm_eps;
-        let seq_len = input.num_elements() / h;
 
-        if seq_len == 0 {
-            return Ok(());
-        }
-
-        let input_slice: &[f32] = unsafe { input.as_slice() };
-        let mask_slice: &[f32] = unsafe { attention_mask.as_slice() };
-
-        // Working buffers
-        let mut hidden = input_slice.to_vec();
-        let mut normed = vec![0.0f32; seq_len * h];
-        let mut q = vec![0.0f32; seq_len * q_dim];
-        let mut k = vec![0.0f32; seq_len * kv_dim];
-        let mut v = vec![0.0f32; seq_len * kv_dim];
-        let mut attn_out = vec![0.0f32; seq_len * q_dim];
-        let mut proj = vec![0.0f32; seq_len * h];
-        let mut up_buf = vec![0.0f32; seq_len * inter];
-        let mut gelu_buf = vec![0.0f32; seq_len * inter];
-        let mut down_buf = vec![0.0f32; seq_len * h];
-        let mut residual = vec![0.0f32; seq_len * h];
-
-        // Per-head attention scratch
-        let mut scores = vec![0.0f32; seq_len * seq_len];
-        let mut attn_w = vec![0.0f32; seq_len * seq_len];
-
-        let scale = 1.0 / (head_dim as f32).sqrt();
-        let kv_group_size = num_heads / num_kv_heads;
-
-        for layer_idx in 0..self.config.num_layers {
-            let lw = &weights.layers[layer_idx];
-
-            // --- 1. Pre-attention LayerNorm ---
-            let gamma: &[f32] = unsafe { lw.attn_norm.as_slice() };
-            let beta: &[f32] = unsafe { lw.attn_norm_bias.as_slice() };
-            for s in 0..seq_len {
-                let src = &hidden[s * h..(s + 1) * h];
-                let dst = &mut normed[s * h..(s + 1) * h];
-                self.kernels.layer_norm(src, gamma, beta, dst, eps);
-            }
-
-            // --- 2. QKV projections: [seq_len, h] @ W → [seq_len, dim] ---
-            let wq: &[f32] = unsafe { lw.wq.as_slice() };
-            let wk: &[f32] = unsafe { lw.wk.as_slice() };
-            let wv: &[f32] = unsafe { lw.wv.as_slice() };
-            self.kernels.gemm(&normed, wq, &mut q, seq_len, q_dim, h);
-            self.kernels.gemm(&normed, wk, &mut k, seq_len, kv_dim, h);
-            self.kernels.gemm(&normed, wv, &mut v, seq_len, kv_dim, h);
-
-            // --- 3. Multi-head attention (no RoPE, no KV cache) ---
-            for head in 0..num_heads {
-                let kv_head = head / kv_group_size;
-                let q_off = head * head_dim;
-                let kv_off = kv_head * head_dim;
-
-                // scores[si, sj] = sum_d Q_h[si,d] * K_h[sj,d] * scale
-                for si in 0..seq_len {
-                    for sj in 0..seq_len {
-                        let mut dot = 0.0f32;
-                        for d in 0..head_dim {
-                            dot += q[si * q_dim + q_off + d]
-                                 * k[sj * kv_dim + kv_off + d];
-                        }
-                        scores[si * seq_len + sj] = dot * scale;
-                    }
-                }
-
-                // Apply attention mask: 0.0 → -inf
-                for i in 0..seq_len * seq_len {
-                    if mask_slice[i] == 0.0 {
-                        scores[i] = f32::NEG_INFINITY;
-                    }
-                }
-
-                // Softmax per query position
-                for si in 0..seq_len {
-                    let row = &scores[si * seq_len..(si + 1) * seq_len];
-                    let out = &mut attn_w[si * seq_len..(si + 1) * seq_len];
-                    self.kernels.softmax(row, out);
-                }
-
-                // attn_out_h[si, d] = sum_sj attn_w[si, sj] * V_h[sj, d]
-                for si in 0..seq_len {
-                    for d in 0..head_dim {
-                        let mut sum = 0.0f32;
-                        for sj in 0..seq_len {
-                            sum += attn_w[si * seq_len + sj]
-                                 * v[sj * kv_dim + kv_off + d];
-                        }
-                        attn_out[si * q_dim + q_off + d] = sum;
-                    }
-                }
-            }
-
-            // --- 4. Output projection + residual ---
-            let wo: &[f32] = unsafe { lw.wo.as_slice() };
-            self.kernels.gemm(&attn_out, wo, &mut proj, seq_len, h, q_dim);
-            self.kernels.vec_add(&hidden, &proj, &mut residual);
-            hidden.copy_from_slice(&residual);
-
-            // --- 5. Pre-FFN LayerNorm ---
-            let ffn_gamma: &[f32] = unsafe { lw.ffn_norm.as_slice() };
-            let ffn_beta: &[f32] = unsafe { lw.ffn_norm_bias.as_slice() };
-            for s in 0..seq_len {
-                let src = &hidden[s * h..(s + 1) * h];
-                let dst = &mut normed[s * h..(s + 1) * h];
-                self.kernels.layer_norm(src, ffn_gamma, ffn_beta, dst, eps);
-            }
-
-            // --- 6. FFN: up → GELU → down + residual ---
-            let wu: &[f32] = unsafe { lw.w_up.as_slice() };
-            let wd: &[f32] = unsafe { lw.w_down.as_slice() };
-            self.kernels.gemm(&normed, wu, &mut up_buf, seq_len, inter, h);
-            self.kernels.gelu(&up_buf, &mut gelu_buf);
-            self.kernels.gemm(&gelu_buf, wd, &mut down_buf, seq_len, h, inter);
-            self.kernels.vec_add(&hidden, &down_buf, &mut residual);
-            hidden.copy_from_slice(&residual);
-        }
-
-        // --- Mean pooling: average across sequence dimension ---
-        let mut pooled = vec![0.0f32; h];
-        for d in 0..h {
-            let mut sum = 0.0f32;
-            for s in 0..seq_len {
-                sum += hidden[s * h + d];
-            }
-            pooled[d] = sum / seq_len as f32;
-        }
-
-        // --- L2 normalize the pooled embedding ---
-        let mut sum_sq = 0.0f32;
-        for d in 0..h {
-            sum_sq += pooled[d] * pooled[d];
-        }
-        let inv_norm = 1.0 / (sum_sq + 1e-12_f32).sqrt();
-        for d in 0..h {
-            pooled[d] *= inv_norm;
-        }
-
-        // Copy pooled result to output tensor
-        unsafe {
-            std::ptr::copy_nonoverlapping(
-                pooled.as_ptr() as *const u8,
-                output.as_mut_ptr(),
-                h * std::mem::size_of::<f32>(),
-            );
-        }
-
-        Ok(())
-    }
-
-    /// Sample token IDs from logits.
-    ///
-    /// Current implementation: greedy argmax only. When temperature > 0,
-    /// logits are temperature-scaled but selection is still argmax.
-    /// `top_k` and `top_p` parameters are accepted but not yet implemented.
-    fn sample(
-        &self,
-        logits: &DeviceTensor,
-        temperature: f32,
-        _top_k: usize,
-        _top_p: f32,
-        output_ids: &mut [u32],
-    ) -> Result<(), InferenceError> {
-        // Simple argmax sampling (temperature=0) or greedy
-        let logits_slice: &[f32] = unsafe { logits.as_slice() };
-        let vocab_size = self.config.vocab_size;
-
-        for (batch_idx, out_id) in output_ids.iter_mut().enumerate() {
-            let start = batch_idx * vocab_size;
-            let end = start + vocab_size;
-            if end > logits_slice.len() {
-                return Err(InferenceError::ShapeMismatch {
-                    expected: format!("logits for batch {batch_idx}"),
-                    got: "insufficient logits".into(),
-                });
-            }
-            let batch_logits = &logits_slice[start..end];
-
-            if temperature <= 0.0 || temperature < 1e-6 {
-                // Argmax
-                let mut max_val = f32::NEG_INFINITY;
-                let mut max_idx = 0u32;
-                for (i, &v) in batch_logits.iter().enumerate() {
-                    if v > max_val {
-                        max_val = v;
-                        max_idx = i as u32;
-                    }
-                }
-                *out_id = max_idx;
-            } else {
-                // Temperature-scaled argmax (full sampling requires RNG)
-                let mut max_val = f32::NEG_INFINITY;
-                let mut max_idx = 0u32;
-                for (i, &v) in batch_logits.iter().enumerate() {
-                    let scaled = v / temperature;
-                    if scaled > max_val {
-                        max_val = scaled;
-                        max_idx = i as u32;
-                    }
-                }
-                *out_id = max_idx;
-            }
-        }
-
-        Ok(())
-    }
-
-    fn sync(&self) -> Result<(), InferenceError> {
-        // CPU is synchronous — no-op
-        Ok(())
-    }
-}
-
-impl CpuInferenceBackend {
-    /// Greedy text generation: embed prompt tokens → decoder_forward loop → sample.
-    ///
-    /// Processes prompt tokens one by one through the decoder, then generates
-    /// `max_new_tokens` new tokens via greedy (or temperature-scaled) sampling.
-    /// Returns the generated token IDs (not including the prompt).
-    pub fn generate(
+    #[cfg(test)]
+    pub(crate) fn generate_reference(
         &self,
         weights: &ModelWeights,
         prompt_tokens: &[u32],
@@ -652,7 +802,7 @@ impl CpuInferenceBackend {
             let pos_data = [pos as f32];
             let positions = unsafe { DeviceTensor::from_slice(&pos_data) };
 
-            self.decoder_forward(
+            self.decoder_forward_reference_impl(
                 &input, &positions, &mut kv_cache, weights, &[1], &mut logits_tensor,
             )?;
         }
@@ -675,7 +825,7 @@ impl CpuInferenceBackend {
             let pos_data = [pos as f32];
             let positions = unsafe { DeviceTensor::from_slice(&pos_data) };
 
-            self.decoder_forward(
+            self.decoder_forward_reference_impl(
                 &input, &positions, &mut kv_cache, weights, &[1], &mut logits_tensor,
             )?;
             self.sample(&logits_tensor, temperature, 0, 0.0, &mut next_token)?;
@@ -686,7 +836,7 @@ impl CpuInferenceBackend {
     }
 }
 
-/// Apply rotary position embedding in-place.
+/// Apply rotary position embedding in place.
 ///
 /// Supports partial rotary (Phi-style): only the first `rotary_dim` dimensions
 /// of each head are rotated; the rest pass through unchanged.
@@ -856,7 +1006,7 @@ mod tests {
         let mut kv_cache = backend.alloc_kv_cache(1, cfg.max_seq_len).unwrap();
         let mut output = backend.alloc(cfg.vocab_size, DType::F32).unwrap();
 
-        let result = backend.decoder_forward(
+        let result = backend.decoder_forward_reference_impl(
             &input, &positions, &mut kv_cache, &weights, &[1], &mut output,
         );
         assert!(result.is_ok(), "decoder_forward failed: {:?}", result.err());
@@ -1400,7 +1550,7 @@ mod tests {
 
         // Run the kernel path
         backend
-            .decoder_forward(&input, &positions, &mut kv_cache, &weights, &[1], &mut output)
+            .decoder_forward_reference_impl(&input, &positions, &mut kv_cache, &weights, &[1], &mut output)
             .unwrap();
         let kernel_out: Vec<f32> = unsafe { output.as_slice::<f32>() }.to_vec();
 
@@ -1539,7 +1689,7 @@ mod tests {
         let mut output = backend.alloc(cfg.vocab_size, DType::F32).unwrap();
 
         backend
-            .decoder_forward(&input, &positions, &mut kv_cache, &weights, &[1], &mut output)
+            .decoder_forward_reference_impl(&input, &positions, &mut kv_cache, &weights, &[1], &mut output)
             .unwrap();
 
         let logits: &[f32] = unsafe { output.as_slice() };
@@ -1612,7 +1762,7 @@ mod tests {
             let mut output = backend.alloc(cfg.vocab_size, DType::F32).unwrap();
 
             backend
-                .decoder_forward(&input, &positions, &mut kv_cache, &weights, &[1], &mut output)
+                .decoder_forward_reference_impl(&input, &positions, &mut kv_cache, &weights, &[1], &mut output)
                 .unwrap();
 
             unsafe { output.as_slice::<f32>() }.to_vec()
@@ -1684,7 +1834,7 @@ mod tests {
         }
 
         let prompt = vec![1u32, 2, 3];
-        let generated = backend.generate(&weights, &prompt, 5, 0.0).unwrap();
+        let generated = backend.generate_reference(&weights, &prompt, 5, 0.0).unwrap();
 
         assert_eq!(generated.len(), 5, "should generate exactly 5 tokens");
         for &tok in &generated {
@@ -1695,7 +1845,7 @@ mod tests {
             );
         }
 
-        let generated2 = backend.generate(&weights, &prompt, 5, 0.0).unwrap();
+        let generated2 = backend.generate_reference(&weights, &prompt, 5, 0.0).unwrap();
         assert_eq!(generated, generated2, "greedy generation should be deterministic");
     }
 
@@ -1706,7 +1856,7 @@ mod tests {
         let backend = CpuInferenceBackend::init(&cfg).unwrap();
         let weights = ModelWeights::alloc_cpu(&cfg).unwrap();
 
-        let result = backend.generate(&weights, &[0], 0, 0.0).unwrap();
+        let result = backend.generate_reference(&weights, &[0], 0, 0.0).unwrap();
         assert!(result.is_empty());
     }
 
@@ -1717,7 +1867,7 @@ mod tests {
         let backend = CpuInferenceBackend::init(&cfg).unwrap();
         let weights = ModelWeights::alloc_cpu(&cfg).unwrap();
 
-        let result = backend.generate(&weights, &[], 5, 0.0);
+        let result = backend.generate_reference(&weights, &[], 5, 0.0);
         assert!(result.is_err());
     }
 
@@ -1864,7 +2014,7 @@ mod tests {
         let backend = CpuInferenceBackend::init(&cfg).unwrap();
         let weights = ModelWeights::alloc_cpu(&cfg).unwrap();
         let oob_token = cfg.vocab_size as u32 + 10;
-        let result = backend.generate(&weights, &[oob_token], 1, 0.0);
+        let result = backend.generate_reference(&weights, &[oob_token], 1, 0.0);
         assert!(result.is_err());
     }
 
@@ -2520,7 +2670,7 @@ mod tests {
         let mut output = backend.alloc(cfg.vocab_size, DType::F32).unwrap();
 
         // Act
-        let result = backend.decoder_forward(
+        let result = backend.decoder_forward_reference_impl(
             &input, &positions, &mut kv_cache, &weights, &[1], &mut output,
         );
 
@@ -2575,19 +2725,19 @@ mod tests {
 
         let pos0 = unsafe { DeviceTensor::from_slice(&[0.0f32]) };
         backend
-            .decoder_forward(&input, &pos0, &mut kv_cache, &weights, &[1], &mut output)
+            .decoder_forward_reference_impl(&input, &pos0, &mut kv_cache, &weights, &[1], &mut output)
             .unwrap();
         assert_eq!(kv_cache.seq_len(0, 0), 1, "after 1 token, seq_len should be 1");
 
         let pos1 = unsafe { DeviceTensor::from_slice(&[1.0f32]) };
         backend
-            .decoder_forward(&input, &pos1, &mut kv_cache, &weights, &[1], &mut output)
+            .decoder_forward_reference_impl(&input, &pos1, &mut kv_cache, &weights, &[1], &mut output)
             .unwrap();
         assert_eq!(kv_cache.seq_len(0, 0), 2, "after 2 tokens, seq_len should be 2");
 
         let pos2 = unsafe { DeviceTensor::from_slice(&[2.0f32]) };
         backend
-            .decoder_forward(&input, &pos2, &mut kv_cache, &weights, &[1], &mut output)
+            .decoder_forward_reference_impl(&input, &pos2, &mut kv_cache, &weights, &[1], &mut output)
             .unwrap();
 
         // Assert — KV cache grew correctly across layers and positions
@@ -2705,8 +2855,8 @@ mod tests {
         }
 
         // Act
-        let gen_a = backend.generate(&weights, &[1u32, 2], 3, 0.0).unwrap();
-        let gen_b = backend.generate(&weights, &[5u32, 8], 3, 0.0).unwrap();
+        let gen_a = backend.generate_reference(&weights, &[1u32, 2], 3, 0.0).unwrap();
+        let gen_b = backend.generate_reference(&weights, &[5u32, 8], 3, 0.0).unwrap();
 
         // Assert — different prompts should produce at least one different token
         assert_eq!(gen_a.len(), 3);
@@ -2790,7 +2940,7 @@ mod tests {
         for pos in 0u32..6 {
             let pos_tensor = unsafe { DeviceTensor::from_slice(&[pos as f32]) };
             backend
-                .decoder_forward(&input, &pos_tensor, &mut kv_cache, &weights, &[1], &mut output)
+                .decoder_forward_reference_impl(&input, &pos_tensor, &mut kv_cache, &weights, &[1], &mut output)
                 .unwrap();
         }
 
@@ -3325,7 +3475,7 @@ mod tests {
         let oob_token = cfg.vocab_size as u32; // exactly vocab_size, which is OOB
 
         // Act
-        let result = backend.generate(&weights, &[oob_token], 1, 0.0);
+        let result = backend.generate_reference(&weights, &[oob_token], 1, 0.0);
 
         // Assert — should fail because token_id >= vocab_size
         assert!(result.is_err(), "generate should fail for token_id >= vocab_size");

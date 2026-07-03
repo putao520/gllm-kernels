@@ -517,7 +517,16 @@ mod tests {
             let mut output: GllmTensor = std::ptr::null_mut();
             assert_eq!(gllm_tensor_alloc(backend, h, 0, &mut output), GllmStatus::Ok as i32);
 
-            // Run decoder forward
+            // Run decoder forward.
+            //
+            // NO-FALLBACK + ARCH-RUST-IS-CODEGEN: `gllm_decoder_forward` (the C ABI
+            // over `CpuInferenceBackend::decoder_forward`) does NOT execute the
+            // Rust operator fallback. Without an attached JIT `CompiledLayer` +
+            // weight blob it returns `RuntimeError`. Numerical correctness of the
+            // operator reference is covered by `cpu_backend` tests calling
+            // `decoder_forward_reference_impl`. Production callers must attach a
+            // `CompiledLayer` via `with_compiled_layer` + `with_weight_blob`, or
+            // use the gllm Executor mega-kernel path.
             let seq_lens = [1usize];
             let rc = gllm_decoder_forward(
                 backend,
@@ -529,15 +538,8 @@ mod tests {
                 1,
                 output,
             );
-            assert_eq!(rc, GllmStatus::Ok as i32);
-
-            // Download and verify output is finite and non-trivial
-            let mut out_data = vec![0.0f32; h];
-            assert_eq!(
-                gllm_tensor_download_f32(backend, output, out_data.as_mut_ptr(), h),
-                GllmStatus::Ok as i32,
-            );
-            assert!(out_data.iter().all(|v| v.is_finite()), "output has non-finite values");
+            assert_eq!(rc, GllmStatus::RuntimeError as i32,
+                "decoder_forward must NOT fall back to Rust operators (NO-FALLBACK)");
 
             // Cleanup
             gllm_tensor_free(input);
