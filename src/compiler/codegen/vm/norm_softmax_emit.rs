@@ -164,6 +164,15 @@ pub(crate) fn emit_normlike_one_group(
     let tail = feature_dim % lanes;
     let tail_off = vec_count * step_bytes;
     let s1 = SimdWidth::Scalar;
+    // BCE-20260703-NORM-MIXED-PRECISION-STEPBYTES: weight 步长独立于 input 步长。
+    // input VecLoad 按 step_bytes (width.bytes(), F32 lanes×4) 推进；
+    // weight VecLoad 必须按 weight 自身 dtype 的步长推进 (lanes × weight_elem)。
+    // 复用 input byte_off 会让 BF16 weight 只读一半元素 → normed 错 → 后续 NaN。
+    // 参照 GEMM gemm_emit.rs:345 b_elem 独立 stride 模式。
+    // @trace BCE-20260703-NORM-MIXED-PRECISION-STEPBYTES [req:REQ-DTYPE-006] [level:unit]
+    let weight_step_bytes = lanes * weight_dtype.elem_bytes();
+    let weight_elem = weight_dtype.elem_bytes();
+    let weight_tail_off = vec_count * weight_step_bytes;
     // BCE-20260630-MIXED-P3: acc 是 accumulate 位置（reduce/HReduce），BF16 输入应 promote
     // 到 F32 累加（数值稳定性）。dtype.accumulator_dtype() 显式标注（防 P4 grep 误删）。
     // @trace NORM-SOFTMAX-ACC-DTYPE [req:REQ-DTYPE-006] [level:unit]
@@ -199,12 +208,19 @@ pub(crate) fn emit_normlike_one_group(
     // Phase 3: Transform
     prog.emit(VmInstr::Broadcast { dst: scale, src: ScalarExpr::ExtractLane0(acc), width, dtype });
     if vec_count > 0 {
-        prog.emit_loop(BoundExpr::Const(vec_count), step_bytes, |prog, _counter, byte_off| {
+        prog.emit_loop(BoundExpr::Const(vec_count), step_bytes, |prog, counter, byte_off| {
             prog.emit(VmInstr::VecLoad { dst: temp, base: row_input, offset: OffsetExpr::LoopOffset(byte_off), width, dtype , predicate: None });
             if has_weight {
                 let w = prog.alloc_vreg(VRegKind::Vec, width);
                 // BCE-20260629-011: VecLoad weight 用 weight 实际 dtype，而非计算 dtype
-                prog.emit(VmInstr::VecLoad { dst: w, base: weight_ptr, offset: OffsetExpr::LoopOffset(byte_off), width, dtype: weight_dtype, predicate: None });
+                // BCE-20260703-NORM-MIXED-PRECISION-STEPBYTES: weight offset = counter × weight_step_bytes
+                // (counter 是纯索引 VReg; byte_off 已是 counter×step_bytes=input步长, 不能复用)。
+                // 用 OffsetExpr::Mul(LoopOffset(counter), weight_step_bytes) 表达独立步长。
+                let w_off = OffsetExpr::Mul(
+                    Box::new(OffsetExpr::LoopOffset(counter)),
+                    weight_step_bytes,
+                );
+                prog.emit(VmInstr::VecLoad { dst: w, base: weight_ptr, offset: w_off, width, dtype: weight_dtype, predicate: None });
                 auto_select::auto_lower_trace(prog, transform, &[temp, scale, w], width, dtype).expect("normlike transform");
             } else {
                 auto_select::auto_lower_trace(prog, transform, &[temp, scale], width, dtype).expect("normlike transform");
@@ -216,10 +232,12 @@ pub(crate) fn emit_normlike_one_group(
         let s_temp = prog.alloc_vreg(VRegKind::Vec, s1);
         for t in 0..tail {
             let off = tail_off + t * elem;
+            let w_off = weight_tail_off + t * weight_elem;
             prog.emit(VmInstr::VecLoad { dst: s_temp, base: row_input, offset: OffsetExpr::Const(off), width: s1, dtype , predicate: None });
             if has_weight {
                 let s_w = prog.alloc_vreg(VRegKind::Vec, s1);
-                prog.emit(VmInstr::VecLoad { dst: s_w, base: weight_ptr, offset: OffsetExpr::Const(off), width: s1, dtype: weight_dtype, predicate: None });
+                // BCE-20260703-NORM-MIXED-PRECISION-STEPBYTES: tail weight offset 用 weight_elem 推进, 非 input elem
+                prog.emit(VmInstr::VecLoad { dst: s_w, base: weight_ptr, offset: OffsetExpr::Const(w_off), width: s1, dtype: weight_dtype, predicate: None });
                 auto_select::auto_lower_trace(prog, transform, &[s_temp, scale, s_w], s1, dtype).expect("normlike transform tail");
             } else {
                 auto_select::auto_lower_trace(prog, transform, &[s_temp, scale], s1, dtype).expect("normlike transform tail");
@@ -262,9 +280,16 @@ pub(crate) fn emit_layernorm_auto(
     let step_bytes = width.bytes();
     let elem = dtype.elem_bytes();
     let row_bytes = feature_dim * elem;
-    let bias_offset = feature_dim * elem;
+    // BCE-20260703-NORM-MIXED-PRECISION-STEPBYTES: weight/bias 都是 weight_dtype,
+    // offset 必须按 weight_elem 计算。input 用 input elem, weight/bias 用 weight_elem。
+    // 参照 GEMM gemm_emit.rs:345 b_elem 独立 stride 模式。
+    // @trace BCE-20260703-NORM-MIXED-PRECISION-STEPBYTES [req:REQ-DTYPE-006] [level:unit]
+    let weight_elem = weight_dtype.elem_bytes();
+    let weight_step_bytes = lanes * weight_elem;
+    let bias_offset = feature_dim * weight_elem;
     let tail = feature_dim % lanes;
     let tail_off = vec_count * step_bytes;
+    let weight_tail_off = vec_count * weight_step_bytes;
     let s1 = SimdWidth::Scalar;
     // BCE-20260630-MIXED-P3: acc_sum/acc_sq 是 accumulate 位置，accumulator_dtype() 标注。
     let acc_dtype = dtype.accumulator_dtype();
@@ -340,13 +365,20 @@ pub(crate) fn emit_layernorm_auto(
 
         // Phase 3: Transform (x - mean) * inv_std * weight + bias
         if vec_count > 0 {
-            prog.emit_loop(BoundExpr::Const(vec_count), step_bytes, |prog, _ctr, byte_off| {
+            prog.emit_loop(BoundExpr::Const(vec_count), step_bytes, |prog, counter, byte_off| {
                 prog.emit(VmInstr::VecLoad { dst: temp, base: row_input, offset: OffsetExpr::LoopOffset(byte_off), width, dtype , predicate: None });
                 let w = prog.alloc_vreg(VRegKind::Vec, width);
-                prog.emit(VmInstr::VecLoad { dst: w, base: weight_ptr, offset: OffsetExpr::LoopOffset(byte_off), width, dtype: weight_dtype, predicate: None });
+                // BCE-20260703-NORM-MIXED-PRECISION-STEPBYTES: weight offset = counter × weight_step_bytes
+                // (counter 是纯索引 VReg; byte_off 已是 counter×step_bytes=input步长, 不能复用)。
+                let w_off = OffsetExpr::Mul(
+                    Box::new(OffsetExpr::LoopOffset(counter)),
+                    weight_step_bytes,
+                );
+                prog.emit(VmInstr::VecLoad { dst: w, base: weight_ptr, offset: w_off.clone(), width, dtype: weight_dtype, predicate: None });
                 let b = prog.alloc_vreg(VRegKind::Vec, width);
+                // bias 区起始 = bias_offset (按 weight_elem 算); bias 内偏移同 weight (counter × weight_step_bytes)
                 prog.emit(VmInstr::VecLoad { dst: b, base: weight_ptr,
-                    offset: OffsetExpr::Add(Box::new(OffsetExpr::Const(bias_offset)), Box::new(OffsetExpr::LoopOffset(byte_off))),
+                    offset: OffsetExpr::Add(Box::new(OffsetExpr::Const(bias_offset)), Box::new(w_off)),
                     width, dtype: weight_dtype, predicate: None });
                 auto_select::auto_lower_trace(prog, &transform_body, &[temp, scale, mean_bc, w, b], width, dtype).expect("layernorm transform");
                 prog.emit(VmInstr::VecStore { base: row_output, offset: OffsetExpr::LoopOffset(byte_off), src: temp, width, dtype , predicate: None });
@@ -355,11 +387,13 @@ pub(crate) fn emit_layernorm_auto(
         if tail > 0 {
             for t in 0..tail {
                 let off = tail_off + t * elem;
+                let w_off = weight_tail_off + t * weight_elem;
                 prog.emit(VmInstr::VecLoad { dst: temp, base: row_input, offset: OffsetExpr::Const(off), width: s1, dtype , predicate: None });
                 let s_w = prog.alloc_vreg(VRegKind::Vec, s1);
-                prog.emit(VmInstr::VecLoad { dst: s_w, base: weight_ptr, offset: OffsetExpr::Const(off), width: s1, dtype: weight_dtype, predicate: None });
+                // BCE-20260703-NORM-MIXED-PRECISION-STEPBYTES: tail weight offset 用 weight_elem 推进
+                prog.emit(VmInstr::VecLoad { dst: s_w, base: weight_ptr, offset: OffsetExpr::Const(w_off), width: s1, dtype: weight_dtype, predicate: None });
                 let s_b = prog.alloc_vreg(VRegKind::Vec, s1);
-                prog.emit(VmInstr::VecLoad { dst: s_b, base: weight_ptr, offset: OffsetExpr::Const(bias_offset + off), width: s1, dtype: weight_dtype, predicate: None });
+                prog.emit(VmInstr::VecLoad { dst: s_b, base: weight_ptr, offset: OffsetExpr::Const(bias_offset + w_off), width: s1, dtype: weight_dtype, predicate: None });
                 auto_select::auto_lower_trace(prog, &transform_body, &[temp, scale, mean_bc, s_w, s_b], s1, dtype).expect("layernorm transform tail");
                 prog.emit(VmInstr::VecStore { base: row_output, offset: OffsetExpr::Const(off), src: temp, width: s1, dtype , predicate: None });
             }
