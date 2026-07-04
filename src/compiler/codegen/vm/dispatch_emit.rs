@@ -577,9 +577,10 @@ mod tests {
     // ── Test 32: DotDtype all variants distinct ──
 
     #[test]
+    // @trace BCE-X86HW-002-DOTDTYPE-VARIANTS [req:REQ-VR-002] [level:unit]
     fn dot_dtype_all_variants_distinct() {
-        // Arrange
-        let dtypes = [DotDtype::Bf16, DotDtype::Fp16, DotDtype::Int8, DotDtype::Int4x8, DotDtype::Fp4];
+        // BCE-20260704-X86HW-002: 加入 Bf16xF32, Fp16xF32 混合精度变体。
+        let dtypes = [DotDtype::Bf16, DotDtype::Bf16xF32, DotDtype::Fp16, DotDtype::Fp16xF32, DotDtype::Int8, DotDtype::Int4x8, DotDtype::Fp4];
 
         // Act & Assert
         for i in 0..dtypes.len() {

@@ -1948,11 +1948,11 @@ impl X86Lower {
         match instr {
             VmInstr::DotProduct { acc, a, b, input_dtype, width } => {
                 match input_dtype {
-                    DotDtype::Bf16 => {
-                        // REQ-DTYPE-005: BF16 dot product via vfmadd231ps (data widened to F32 at load).
-                        // VDPBF16PS is available via std::arch intrinsics but not yet exposed in iced_x86
-                        // CodeAssembler. When iced_x86 adds VDPBF16PS support, switch to native dot product
-                        // for BF16-packed u32 lane format (two BF16 per u32 lane).
+                    // BCE-20260704-X86HW-002: 混合精度 a=F32 激活, b=BF16 权重 (quant_gemm 实际场景)。
+                    // VecLoad 已把 b 从 BF16 widen 成 F32 (WidenCompute), a 本就是 F32。
+                    // 正确路径 = F32 FMA (vfmadd231ps), 不是 VDPBF16PS (VDPBF16PS 假设双 BF16 packed)。
+                    // 这与 ARCH-DTYPE-MIXED-PRECISION 一致: 混合精度是独立变体, 生成与纯双 BF16 不同的机器码。
+                    DotDtype::Bf16xF32 => {
                         if self.use_avx512 {
                             let (acc_zmm, acc_spilled) = self.resolve_zmm_or_spill_write(*acc, alloc, 0)?;
                             let (a_zmm, _) = self.resolve_zmm_or_spill(*a, alloc, 1)?;
@@ -1960,7 +1960,59 @@ impl X86Lower {
                             self.asm.vfmadd231ps(acc_zmm, a_zmm, b_zmm).map_err(Self::err)?;
                             if acc_spilled { self.spill_store_zmm(*acc, alloc, 0)?; }
                         } else {
-                            // AVX2 path: BF16 treated as F32 pair → vfmadd231ps
+                            let (acc_ymm, acc_spilled) = self.resolve_ymm_or_spill_write(*acc, alloc, 0)?;
+                            let (a_ymm, _) = self.resolve_ymm_or_spill(*a, alloc, 1)?;
+                            let (b_ymm, _) = self.resolve_ymm_or_spill(*b, alloc, 2)?;
+                            self.asm.vfmadd231ps(acc_ymm, a_ymm, b_ymm).map_err(Self::err)?;
+                            if acc_spilled { self.spill_store_ymm(*acc, alloc, 0)?; }
+                        }
+                        Ok(())
+                    }
+
+                    DotDtype::Bf16 => {
+                        // NO-HW-DEGRADATION + BCE-20260704-X86HW-002: 纯双 BF16 dot-product。
+                        // 有 AVX-512 BF16 (has_bf16) → VDPBF16PS 原生指令 (iced_x86 1.21 Code 3082)。
+                        //   VDPBF16PS Zmm, Zmm, Zmm32: acc_f32 += bf16_a · bf16_b (每 u32 lane 2×BF16)。
+                        // 无 has_bf16 → Err (NO-SILENT-FALLBACK; 纯 BF16 无硬件支持, 禁止静默降级到 F32 FMA)。
+                        // 旧实现用 vfmadd231ps 是违宪: 靠 VecLoad 把 BF16 widen 成 F32 再 FMA = 硬件降级
+                        // (NO-HW-DEGRADATION: 有 BF16 硬件不用 VDPBF16PS = 降级)。
+                        if self.use_avx512 && self.has_bf16 {
+                            let (acc_zmm, acc_spilled) = self.resolve_zmm_or_spill_write(*acc, alloc, 0)?;
+                            let (a_zmm, _) = self.resolve_zmm_or_spill(*a, alloc, 1)?;
+                            let (b_zmm, _) = self.resolve_zmm_or_spill(*b, alloc, 2)?;
+                            // iced_x86 1.21: Code::EVEX_Vdpbf16ps_zmm_k1z_zmm_zmmm512b32 (Code 3082)。
+                            // code_asm 无便捷方法, 用 Instruction::with3 + add_instruction (比 db 手编更干净)。
+                            let instr = iced_x86::Instruction::with3(
+                                iced_x86::Code::EVEX_Vdpbf16ps_zmm_k1z_zmm_zmmm512b32,
+                                iced_x86::Register::from(acc_zmm),
+                                iced_x86::Register::from(a_zmm),
+                                iced_x86::Register::from(b_zmm),
+                            ).map_err(|e| CompilerError::CodegenViolation(
+                                format!("VDPBF16PS Instruction::with3 failed: {}", e)
+                            ))?;
+                            self.asm.add_instruction(instr).map_err(Self::err)?;
+                            if acc_spilled { self.spill_store_zmm(*acc, alloc, 0)?; }
+                        } else {
+                            return Err(CompilerError::CodegenViolation(format!(
+                                "DotProduct(Bf16 pure double-BF16) requires AVX-512 BF16 (VDPBF16PS) support; \
+                                 use_avx512={}, has_bf16={} — platform lacks AVX512-BF16, no fallback path \
+                                 (use Bf16xF32 for mixed-precision a=F32+b=BF16 which uses F32 FMA)",
+                                self.use_avx512, self.has_bf16,
+                            )));
+                        }
+                        Ok(())
+                    }
+
+                    // BCE-20260704-X86HW-002: 混合精度 a=F32 激活, b=FP16 权重。
+                    // VecLoad 已把 b 从 FP16 widen 成 F32, a 本就是 F32 → F32 FMA 正确。
+                    DotDtype::Fp16xF32 => {
+                        if self.use_avx512 {
+                            let (acc_zmm, acc_spilled) = self.resolve_zmm_or_spill_write(*acc, alloc, 0)?;
+                            let (a_zmm, _) = self.resolve_zmm_or_spill(*a, alloc, 1)?;
+                            let (b_zmm, _) = self.resolve_zmm_or_spill(*b, alloc, 2)?;
+                            self.asm.vfmadd231ps(acc_zmm, a_zmm, b_zmm).map_err(Self::err)?;
+                            if acc_spilled { self.spill_store_zmm(*acc, alloc, 0)?; }
+                        } else {
                             let (acc_ymm, acc_spilled) = self.resolve_ymm_or_spill_write(*acc, alloc, 0)?;
                             let (a_ymm, _) = self.resolve_ymm_or_spill(*a, alloc, 1)?;
                             let (b_ymm, _) = self.resolve_ymm_or_spill(*b, alloc, 2)?;

@@ -99,10 +99,13 @@ pub(crate) fn emit_gemm_float_from_plan(
 
                 match desc.data_kind {
                     crate::quant_format::QuantDataKind::Bfloat16 => {
-                        prog.emit(VmInstr::DotProduct { acc, a: a_val, b: b_val, input_dtype: DotDtype::Bf16, width });
+                        // BCE-20260704-X86HW-002: a=F32 激活 (line 58-59), b=BF16 权重 → 混合精度
+                        // 必须用 Bf16xF32 (非 Bf16), 否则 aarch64 BFDOT/gpu 双 cvt 错把 F32 a 当 BF16 解析 → 数值错。
+                        prog.emit(VmInstr::DotProduct { acc, a: a_val, b: b_val, input_dtype: DotDtype::Bf16xF32, width });
                     }
                     crate::quant_format::QuantDataKind::Float16 => {
-                        prog.emit(VmInstr::DotProduct { acc, a: a_val, b: b_val, input_dtype: DotDtype::Fp16, width });
+                        // BCE-20260704-X86HW-002: a=F32 激活, b=FP16 权重 → 混合精度 Fp16xF32。
+                        prog.emit(VmInstr::DotProduct { acc, a: a_val, b: b_val, input_dtype: DotDtype::Fp16xF32, width });
                     }
                     _ => {
                         prog.emit(VmInstr::Fma { dst: acc, acc, a: a_val, b: b_val, dtype });

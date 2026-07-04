@@ -581,17 +581,35 @@ mod tests {
     // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
     #[test]
+    // @trace BCE-X86HW-002-AARCH64-DOTDTYPE-PREDICATES [req:REQ-VR-002] [level:unit]
     fn test_dot_dtype_predicates() {
+        // BCE-20260704-X86HW-002: 加入 Bf16xF32, Fp16xF32 混合精度变体谓词断言。
         // Arrange: exercise each DotDtype variant with its predicate function
         // Act & Assert: each predicate should return true only for its target variant
         assert!(dot_dtype_is_bf16(DotDtype::Bf16));
+        assert!(!dot_dtype_is_bf16(DotDtype::Bf16xF32));
         assert!(!dot_dtype_is_bf16(DotDtype::Fp16));
+        assert!(!dot_dtype_is_bf16(DotDtype::Fp16xF32));
         assert!(!dot_dtype_is_bf16(DotDtype::Int8));
         assert!(!dot_dtype_is_bf16(DotDtype::Int4x8));
         assert!(!dot_dtype_is_bf16(DotDtype::Fp4));
 
+        // Bf16xF32 谓词: 只对 Bf16xF32 为 true
+        assert!(dot_dtype_is_bf16xf32(DotDtype::Bf16xF32));
+        assert!(!dot_dtype_is_bf16xf32(DotDtype::Bf16));
+        assert!(!dot_dtype_is_bf16xf32(DotDtype::Fp16));
+        assert!(!dot_dtype_is_bf16xf32(DotDtype::Fp16xF32));
+        assert!(!dot_dtype_is_bf16xf32(DotDtype::Int8));
+
         assert!(dot_dtype_is_fp16(DotDtype::Fp16));
         assert!(!dot_dtype_is_fp16(DotDtype::Bf16));
+        assert!(!dot_dtype_is_fp16(DotDtype::Fp16xF32));
+
+        // Fp16xF32 谓词: 只对 Fp16xF32 为 true
+        assert!(dot_dtype_is_fp16xf32(DotDtype::Fp16xF32));
+        assert!(!dot_dtype_is_fp16xf32(DotDtype::Fp16));
+        assert!(!dot_dtype_is_fp16xf32(DotDtype::Bf16));
+        assert!(!dot_dtype_is_fp16xf32(DotDtype::Bf16xF32));
 
         assert!(dot_dtype_is_int8(DotDtype::Int8));
         assert!(!dot_dtype_is_int8(DotDtype::Bf16));

@@ -1174,4 +1174,154 @@ mod tests {
             "BCE-20260704-AMX-SIGNED-INT8: TDPBUSD pp must be 01 (66 prefix); got pp={:#b} (00=TDPBUUD, 01=TDPBUSD, 10=TDPBSUD, 11=TDPBSSD). bytes: {:02x?}",
             pp, tail);
     }
+
+    // ══════════════════════════════════════════════════════════════════
+    //  BCE-20260704-X86HW-002: BF16 DotProduct 混合精度数值BUG根治 + VDPBF16PS硬件指令
+    // ══════════════════════════════════════════════════════════════════
+    //
+    // 根因: VmInstr::DotProduct { input_dtype: DotDtype::Bf16 } 语义模糊。
+    //   实际调用方 quant_gemm 是混合精度 (a=F32 激活, b=BF16 权重), 但三后端假设不一致:
+    //   - x86: vfmadd231ps (b widen at load) — 数值正确但未用 VDPBF16PS (NO-HW-DEGRADATION 违规)
+    //   - aarch64: BFDOT 假设双 BF16, a 是 F32 被错解析 → P0 数值错
+    //   - gpu: 双 cvt 假设双 BF16, a 是 F32 被错解析 → P0 数值错
+    //
+    // 根治方案 (architect 方案 B): 新增 DotDtype::Bf16xF32 变体 (混合精度 a=F32, b=BF16)。
+    //   - Bf16xF32 x86: vfmadd231ps (b widen at load, F32 FMA — 混合精度正确路径)
+    //   - Bf16 x86: VDPBF16PS (纯双 BF16 原生指令, NO-HW-DEGRADATION)
+    //   - Bf16 x86 无 has_bf16: Err (NO-SILENT-FALLBACK)
+    //
+    // 回归断言:
+    //   1. Bf16xF32 emit vfmadd231ps (Code::EVEX_Vfmadd231ps_zmm_k1z_zmm_zmmm512b32_er), 不 emit VDPBF16PS
+    //   2. Bf16 (has_bf16=true) emit VDPBF16PS (Code::EVEX_Vdpbf16ps_zmm_k1z_zmm_zmmm512b32), 不 emit vfmadd231ps
+    //   3. Bf16 (has_bf16=false) 返回 Err (NO-SILENT-FALLBACK)
+    #[test]
+    // @trace BCE-X86HW-002-BF16XF32 [req:REQ-DTYPE-005,REQ-VR-002] [level:unit]
+    fn bce_x86hw002_bf16xf32_mixed_precision() {
+        use crate::compiler::codegen::vm::isa_profile::{PhysReg, PhysVec};
+        use iced_x86::Code;
+
+        // 构造 DotProduct { input_dtype: Bf16xF32, width: W512 } — 3 个 vec vreg。
+        let mut prog = VmProgram::new();
+        let acc = prog.alloc_vreg(VRegKind::Vec, SimdWidth::W512);
+        let a = prog.alloc_vreg(VRegKind::Vec, SimdWidth::W512);
+        let b = prog.alloc_vreg(VRegKind::Vec, SimdWidth::W512);
+        prog.emit(VmInstr::DotProduct {
+            acc, a, b,
+            input_dtype: DotDtype::Bf16xF32,
+            width: SimdWidth::W512,
+        });
+
+        // 伪造 RegAllocation: 3 个 vec vreg → PhysVec(0/1/2) (绕过硬件探测)。
+        let mut mapping = std::collections::HashMap::new();
+        mapping.insert(acc, PhysReg::Vec(PhysVec(0)));
+        mapping.insert(a, PhysReg::Vec(PhysVec(1)));
+        mapping.insert(b, PhysReg::Vec(PhysVec(2)));
+        let alloc = RegAllocation { mapping, spills: Vec::new(), callee_saved_used: Vec::new() };
+
+        // AVX-512 + has_bf16=true: Bf16xF32 必须仍 emit vfmadd231ps (不是 VDPBF16PS)。
+        // 注: iced 1.21 的 zmm vfmadd231ps 变体是 EVEX_Vfmadd231ps_zmm_k1z_zmm_zmmm512b32_er
+        //     (er = embedded rounding, code_asm 无 rounding 控制时 emit er 变体)。
+        let mut lower = X86Lower::with_avx512(true);
+        lower.set_has_bf16(true);
+        let dot_instr = &prog.instrs[3];
+        lower.lower_instr(dot_instr, &alloc).unwrap();
+
+        let codes: Vec<Code> = lower.asm.instructions().iter().map(|i| i.code()).collect();
+        let has_vfmadd231ps = codes.iter().any(|&c|
+            c == Code::EVEX_Vfmadd231ps_zmm_k1z_zmm_zmmm512b32_er
+        );
+        let has_vdpbf16ps = codes.iter().any(|&c|
+            c == Code::EVEX_Vdpbf16ps_zmm_k1z_zmm_zmmm512b32
+        );
+        assert!(has_vfmadd231ps,
+            "BCE-20260704-X86HW-002: Bf16xF32 (mixed a=F32+b=BF16) must emit vfmadd231ps (F32 FMA after b widen), \
+             not VDPBF16PS. got codes: {:?}", codes);
+        assert!(!has_vdpbf16ps,
+            "BCE-20260704-X86HW-002: Bf16xF32 must NOT emit VDPBF16PS (VDPBF16PS assumes double-BF16 packed, \
+             but a is F32 — would misparse a). got codes: {:?}", codes);
+    }
+
+    #[test]
+    // @trace BCE-X86HW-002-VDPBF16PS [req:REQ-DTYPE-005,REQ-VR-002] [level:unit]
+    fn bce_x86hw002_bf16_pure_double_uses_vdpbf16ps_when_has_bf16() {
+        use crate::compiler::codegen::vm::isa_profile::{PhysReg, PhysVec};
+        use iced_x86::Code;
+
+        // 构造 DotProduct { input_dtype: Bf16, width: W512 } — 纯双 BF16。
+        let mut prog = VmProgram::new();
+        let acc = prog.alloc_vreg(VRegKind::Vec, SimdWidth::W512);
+        let a = prog.alloc_vreg(VRegKind::Vec, SimdWidth::W512);
+        let b = prog.alloc_vreg(VRegKind::Vec, SimdWidth::W512);
+        prog.emit(VmInstr::DotProduct {
+            acc, a, b,
+            input_dtype: DotDtype::Bf16,
+            width: SimdWidth::W512,
+        });
+
+        let mut mapping = std::collections::HashMap::new();
+        mapping.insert(acc, PhysReg::Vec(PhysVec(0)));
+        mapping.insert(a, PhysReg::Vec(PhysVec(1)));
+        mapping.insert(b, PhysReg::Vec(PhysVec(2)));
+        let alloc = RegAllocation { mapping, spills: Vec::new(), callee_saved_used: Vec::new() };
+
+        // AVX-512 + has_bf16=true: 纯双 BF16 必须用 VDPBF16PS (NO-HW-DEGRADATION)。
+        let mut lower = X86Lower::with_avx512(true);
+        lower.set_has_bf16(true);
+        let dot_instr = &prog.instrs[3];
+        lower.lower_instr(dot_instr, &alloc).unwrap();
+
+        let codes: Vec<Code> = lower.asm.instructions().iter().map(|i| i.code()).collect();
+        let has_vdpbf16ps = codes.iter().any(|&c|
+            c == Code::EVEX_Vdpbf16ps_zmm_k1z_zmm_zmmm512b32
+        );
+        let has_vfmadd231ps = codes.iter().any(|&c|
+            c == Code::EVEX_Vfmadd231ps_zmm_k1z_zmm_zmmm512b32_er
+        );
+        assert!(has_vdpbf16ps,
+            "BCE-20260704-X86HW-002: pure double-BF16 DotProduct with has_bf16=true must emit VDPBF16PS \
+             (NO-HW-DEGRADATION: BF16 hardware available → native dot, not F32 FMA degrade). got codes: {:?}", codes);
+        assert!(!has_vfmadd231ps,
+            "BCE-20260704-X86HW-002: pure double-BF16 must NOT emit vfmadd231ps (that's the mixed-precision path). \
+             got codes: {:?}", codes);
+
+        // 验证机器码能 assemble (VDPBF16PS 指令有效, iced 1.21 Code 3082)。
+        let code = lower.asm.assemble(0).unwrap();
+        assert!(!code.is_empty(), "VDPBF16PS assemble must produce non-empty bytes");
+    }
+
+    #[test]
+    // @trace BCE-X86HW-002-NOSILENTFALLBACK [req:REQ-DTYPE-005,REQ-VR-002] [level:unit]
+    fn bce_x86hw002_bf16_pure_double_without_has_bf16_returns_err() {
+        use crate::compiler::codegen::vm::isa_profile::{PhysReg, PhysVec};
+
+        // 纯双 BF16, has_bf16=false → Err (NO-SILENT-FALLBACK, 禁止降级到 F32 FMA)。
+        let mut prog = VmProgram::new();
+        let acc = prog.alloc_vreg(VRegKind::Vec, SimdWidth::W512);
+        let a = prog.alloc_vreg(VRegKind::Vec, SimdWidth::W512);
+        let b = prog.alloc_vreg(VRegKind::Vec, SimdWidth::W512);
+        prog.emit(VmInstr::DotProduct {
+            acc, a, b,
+            input_dtype: DotDtype::Bf16,
+            width: SimdWidth::W512,
+        });
+
+        let mut mapping = std::collections::HashMap::new();
+        mapping.insert(acc, PhysReg::Vec(PhysVec(0)));
+        mapping.insert(a, PhysReg::Vec(PhysVec(1)));
+        mapping.insert(b, PhysReg::Vec(PhysVec(2)));
+        let alloc = RegAllocation { mapping, spills: Vec::new(), callee_saved_used: Vec::new() };
+
+        // AVX-512 + has_bf16=false (Ice Lake/Tiger Lake: AVX-512 但无 BF16)。
+        let mut lower = X86Lower::with_avx512(true);
+        lower.set_has_bf16(false);
+        let dot_instr = &prog.instrs[3];
+        let result = lower.lower_instr(dot_instr, &alloc);
+
+        assert!(result.is_err(),
+            "BCE-20260704-X86HW-002: pure double-BF16 DotProduct with has_bf16=false must return Err \
+             (NO-SILENT-FALLBACK: no BF16 hardware, no fallback to F32 FMA degrade). got Ok");
+        let err_msg = format!("{:?}", result.unwrap_err());
+        assert!(err_msg.contains("VDPBF16PS") || err_msg.contains("AVX512-BF16") || err_msg.contains("has_bf16"),
+            "Err message must mention VDPBF16PS/AVX512-BF16/has_bf16; got: {}", err_msg);
+    }
 }

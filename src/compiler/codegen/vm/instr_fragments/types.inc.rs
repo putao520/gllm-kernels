@@ -544,9 +544,23 @@ impl MemEffect {
 }
 
 /// Dot-product 输入 dtype (REQ-VR-002)。
+///
+/// ARCH-DTYPE-MIXED-PRECISION (BCE-20260704-X86HW-002): 混合精度是一等公民变体，
+/// 不藏在 Bf16/Fp16 标签后。Bf16xF32 = a=F32 激活 + b=BF16 权重 (quant_gemm 实际场景)，
+/// 三后端生成与纯双 BF16 (Bf16) 完全不同的机器码。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DotDtype {
-    Bf16, Fp16, Int8, Int4x8, Fp4,
+    /// 纯双 BF16 点积 (a=BF16, b=BF16) — x86 VDPBF16PS / aarch64 BFDOT / gpu 双 cvt。
+    Bf16,
+    /// 混合精度 a=F32 激活, b=BF16 权重 (quant_gemm 实际场景) —
+    /// x86 vfmadd231ps (b widen at load) / aarch64 USHLL+SHL+FMLA / gpu 单 cvt b。
+    Bf16xF32,
+    /// 纯双 FP16 点积 (a=FP16, b=FP16) — x86 vfmadd231ph (has_avx512fp16) / aarch64 FCVTL+FMLA / gpu 双 cvt。
+    Fp16,
+    /// 混合精度 a=F32 激活, b=FP16 权重 —
+    /// x86 vfmadd231ps (b widen) / aarch64 FCVTL b + FMLA / gpu 单 cvt b。
+    Fp16xF32,
+    Int8, Int4x8, Fp4,
 }
 
 /// GGUF 量化块解包模式 (REQ-VR-001)。

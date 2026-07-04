@@ -28,11 +28,17 @@ impl AArch64Lower {
 
     /// DotDtype → AArch64ElemStrategy 映射 (REQ-VR10)。
     /// 用于策略驱动 dot-product 指令选择，禁止 DotDtype 身份匹配。
+    ///
+    /// BCE-20260704-X86HW-002: Bf16xF32/Fp16xF32 返回 WidenCompute (b 需 widen 成 F32, a 已 F32)。
+    /// Bf16/Fp16 保持 Native (纯双半精度, 走 BFDOT/FCVTL+FMLA)。
     fn dot_dtype_aarch64_strategy(&self, dt: DotDtype) -> AArch64ElemStrategy {
         // 通过 DotDtype 的元素特征决定策略，而非 match 具体变体。
+        // 混合精度 (Bf16xF32/Fp16xF32) = WidenCompute: b 半精度需 widen, a 已 F32。
+        // 纯双半精度 (Bf16/Fp16) = Native: 走硬件 dot 或 FCVTL+FMLA。
         if dot_dtype_is_bf16(dt) || dot_dtype_is_fp16(dt) || dot_dtype_is_int8(dt) {
             AArch64ElemStrategy::Native
         } else {
+            // Bf16xF32 / Fp16xF32 / Int4x8 / Fp4 — b 需 widen, 走 WidenCompute
             AArch64ElemStrategy::WidenCompute
         }
     }
@@ -103,12 +109,39 @@ impl AArch64Lower {
     ///
     /// 特性门控 (BCE-20260703-AARCH64-FEATURES-DROPPED): INT4×INT8 路径发 SDOT,
     /// 需 FEAT_DotProd。无该特性 → Err (NO-SILENT-FALLBACK)。
+    ///
+    /// BCE-20260704-X86HW-002: Bf16xF32/Fp16xF32 混合精度路径 — a=F32 已就绪, b 需 widen 成 F32。
+    ///   - Bf16xF32: b BF16→F32 via USHLL #0 + SHL #16 (NEON 基线, 不需 FEAT_BF16), 然后 FMLA。
+    ///     数值正确: BF16 = F32 高 16 位, USHLL 零扩展 u16→u32 + SHL 16 把 BF16 放到高 16 位 = F32 位模式。
+    ///     不能 BFDOT (BFDOT 假设双 BF16, a 是 F32 会被错解析 → P0 数值 BUG)。
+    ///   - Fp16xF32: b FP16→F32 via FCVTL (NEON 基线), a 已 F32, 然后 FMLA。
     fn lower_dot_product_widen(
         &mut self,
         vd: u8, vn: u8, vm: u8,
         dt: DotDtype,
     ) -> Result<(), CompilerError> {
-        if dot_dtype_is_int4x8(dt) {
+        if dot_dtype_is_bf16xf32(dt) {
+            // 混合精度 a=F32, b=BF16: widen b 到 F32 (USHLL+SHL), 然后 FMLA (a × b_f32 → acc)。
+            // USHLL Vd.4S, Vn.4H, #0 (零扩展 4×u16 → 4×u32, BF16 在低 16 位)
+            // SHL Vd.4S, Vd.4S, #16 (左移 16, BF16 移到高 16 位 = F32 位模式)
+            // FMLA Vd.4S, Va.4S, Vb_f32.4S (acc += a × b_f32)
+            // 寄存器分配: vn=a(F32), vm=b(BF16)。用 v18/v19 做 widen 中间寄存器 (避让 v16/v17 保留)。
+            let s_b: u8 = 18;   // b widen 结果
+            // USHLL Vd.4S, Vn.4H, #0: U=1 Q=1 immh=0010 immb=0000 opcode=100001
+            // 0x6F108400 | (vm << 5) | s_b  (vm 是源 b BF16)
+            self.emit32(0x6F108400 | ((vm as u32 & 0x1F) << 5) | s_b as u32);
+            // SHL Vd.4S, Vn.4S, #16: 0_1_0_111110 immh=0100 immb=0000 010101 Rn Rd
+            // 0x5F205400 | (s_b << 5) | s_b  (源和目标都是 s_b)
+            self.emit32(0x5F205400 | ((s_b as u32 & 0x1F) << 5) | s_b as u32);
+            // FMLA Vd.4S, Va.4S, Vb_f32.4S: acc += a × b_f32
+            self.emit32(self.enc_fmla_4s(vd, vn, s_b));
+        } else if dot_dtype_is_fp16xf32(dt) {
+            // 混合精度 a=F32, b=FP16: widen b 到 F32 (FCVTL), a 已 F32, FMLA。
+            // FCVTL Vd.4S, Vn.4H (F16→F32, NEON 基线无特性门控)
+            let s_b: u8 = 18;
+            self.emit32(0x0E218800 | ((vm as u32 & 0x1F) << 5) | s_b as u32);
+            self.emit32(self.enc_fmla_4s(vd, vn, s_b));
+        } else if dot_dtype_is_int4x8(dt) {
             // INT4×INT8: nibble unpack done by preceding ops, emit SDOT on unpacked INT8.
             // SDOT base = 0x4E809400 (见 lower_dot_product_native INT8 分支核对依据)
             if !self.platform.has_dotprod {

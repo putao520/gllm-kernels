@@ -84,18 +84,34 @@ struct LoopCtx {
 // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 //  DotDtype 特征判定辅助 (REQ-VR10)
 //  禁止 DotDtype 身份匹配，通过谓词函数替代 match 模式。
+//  BCE-20260704-X86HW-002: 新增 Bf16xF32/Fp16xF32 混合精度谓词 (a=F32, b=BF16/FP16)。
 // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
-/// DotDtype 是否为 BF16 (BFDOT 原生指令)。
+/// DotDtype 是否为纯双 BF16 (BFDOT 原生指令, a=BF16 b=BF16)。
 #[inline]
 fn dot_dtype_is_bf16(dt: DotDtype) -> bool {
     matches!(dt, DotDtype::Bf16)
 }
 
-/// DotDtype 是否为 FP16 (FCVTL+FMLA 路径)。
+/// DotDtype 是否为混合精度 BF16xF32 (a=F32 激活, b=BF16 权重)。
+/// 走 WidenCompute 路径: b 需 BF16→F32 widen (USHLL+SHL), a 已 F32, 然后 FMLA。
+/// 不需要 FEAT_BF16 (USHLL/SHL/FMLA 是 NEON 基线指令)。
+#[inline]
+fn dot_dtype_is_bf16xf32(dt: DotDtype) -> bool {
+    matches!(dt, DotDtype::Bf16xF32)
+}
+
+/// DotDtype 是否为纯双 FP16 (FCVTL+FMLA 路径, a=FP16 b=FP16)。
 #[inline]
 fn dot_dtype_is_fp16(dt: DotDtype) -> bool {
     matches!(dt, DotDtype::Fp16)
+}
+
+/// DotDtype 是否为混合精度 Fp16xF32 (a=F32 激活, b=FP16 权重)。
+/// 走 WidenCompute 路径: b 需 FP16→F32 widen (FCVTL), a 已 F32, 然后 FMLA。
+#[inline]
+fn dot_dtype_is_fp16xf32(dt: DotDtype) -> bool {
+    matches!(dt, DotDtype::Fp16xF32)
 }
 
 /// DotDtype 是否为 INT8 (SDOT 原生指令)。

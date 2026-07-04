@@ -1453,8 +1453,28 @@ Ok(())
                 let va = self.reg_name_with_kind(*a, alloc);
                 let vb = self.reg_name_with_kind(*b, alloc);
                 match input_dtype {
+                    // BCE-20260704-X86HW-002: 混合精度 a=F32 激活, b=BF16 权重。
+                    // a 已是 F32, 只 cvt b (BF16→F32), 然后 fma.rn.f32。
+                    // 旧 Bf16 分支双 cvt 错把 F32 a 当 BF16 解析 → P0 数值 BUG。
+                    DotDtype::Bf16xF32 => {
+                        match self.dialect {
+                            GpuDialect::Ptx { .. } => {
+                                let fs1 = self.scratch_vec_names[1];
+                                self.emit_line(&format!("cvt.rn.f32.bf16 {fs1}, {vb};"));
+                                self.emit_line(&format!("fma.rn.f32 {vc}, {va}, {fs1}, {vc};"));
+                            }
+                            GpuDialect::Hip { .. } => {
+                                let fs1 = self.scratch_vec_names[1];
+                                self.emit_line(&format!("v_cvt_f32_bf16 {fs1}, {vb};  // HIP bf16->f32"));
+                                self.emit_line(&format!("fma.rn.f32 {vc}, {va}, {fs1}, {vc};"));
+                            }
+                            GpuDialect::Metal { .. } => {
+                                self.emit_line(&format!("{vc} = fma({va}, (float){vb}, {vc});"));
+                            }
+                        }
+                    }
                     DotDtype::Bf16 => {
-                        // BF16 dot-product: fp32_acc += bf16_a · bf16_b (per-element).
+                        // 纯双 BF16 dot-product: fp32_acc += bf16_a · bf16_b (per-element).
                         // DotProduct 是 SIMT 标量逐元素点积, 不是 Tile 级张量核 mma。
                         // GPU-001 根治 (BCE-20260704-GPU-VIOLATIONS):
                         //   旧实现 SM100+ 用 tcgen05.mma (Tile 级) 是违宪 — tcgen05 要求
@@ -1483,6 +1503,25 @@ Ok(())
                             }
                             GpuDialect::Metal { .. } => {
                                 self.emit_line(&format!("{vc} = fma((float){va}, (float){vb}, {vc});"));
+                            }
+                        }
+                    }
+                    // BCE-20260704-X86HW-002: 混合精度 a=F32 激活, b=FP16 权重。
+                    // a 已是 F32, 只 cvt b (FP16→F32), 然后 fma.rn.f32。
+                    DotDtype::Fp16xF32 => {
+                        match self.dialect {
+                            GpuDialect::Ptx { .. } => {
+                                let fs1 = self.scratch_vec_names[1];
+                                self.emit_line(&format!("cvt.rn.f32.f16 {fs1}, {vb};"));
+                                self.emit_line(&format!("fma.rn.f32 {vc}, {va}, {fs1}, {vc};"));
+                            }
+                            GpuDialect::Hip { .. } => {
+                                let fs1 = self.scratch_vec_names[1];
+                                self.emit_line(&format!("{fs1} = __half2float({vb});"));
+                                self.emit_line(&format!("fma.rn.f32 {vc}, {va}, {fs1}, {vc};"));
+                            }
+                            GpuDialect::Metal { .. } => {
+                                self.emit_line(&format!("{vc} = fma({va}, (float){vb}, {vc});"));
                             }
                         }
                     }
