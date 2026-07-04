@@ -530,3 +530,23 @@ fixTemplate:
 - **回归测试**: `cargo test --lib` 全过 (7029 passed, 0 failed) — 删除的方法无 live caller, 不影响行为。
 - **确认**: cargo test --lib 全过 (7029 passed, 0 failed)。residual=0。commit 493e6092。
 - **SPEC criterion**: P-1 红线 + NO-ISLAND-MODULE — Kernels trait 禁止 unimplemented!/stub 占位; trait 方法必须有 live caller (非 test) 或删除。
+
+## BCE-20260704-X86HW-002-VDPBF16PS — BF16 DotProduct 混合精度数值BUG + VDPBF16PS硬件指令缺失
+
+- **patternId**: BCE-20260704-X86HW-002-VDPBF16PS
+- **title**: DotProduct Bf16 语义模糊致 aarch64/gpu 混合精度数值错 + x86 未用 VDPBF16PS 硬件指令
+- **layer**: 设计 (ARCH-DTYPE-MIXED-PRECISION 违宪)
+- **归因时间**: 2026-07-04
+- **现象**: `VmInstr::DotProduct { input_dtype: DotDtype::Bf16 }` 语义模糊。实际调用方 `quant_gemm.inc.rs:97-102` 是混合精度 (a=激活 F32, b=权重 BF16, 注释 "Activation is always F32")。但三后端实现假设不一致:
+  - x86 (`lower_instr_dispatch.inc.rs:1951`): `vfmadd231ps` 靠 VecLoad 把 b widen 成 F32, 退化成 F32×F32。数值正确但未用 VDPBF16PS (NO-HW-DEGRADATION 违规)。
+  - aarch64 (`lower_instr.inc.rs:51-56`): BFDOT `Vd.4S, Vn.8H, Vm.8H` 假设双 BF16。a 是 F32 位模式被当 BF16 解析 → 数值错 (P0)。
+  - gpu (`lower_instr_dispatch.inc.rs:1473-1475`): 双 `cvt.rn.f32.bf16` 假设双 BF16。a 是 F32 被错解析 → 数值错 (P0)。
+- **根因**: `DotDtype::Bf16` 单一变体无法区分纯双 BF16 vs 混合精度 F32×BF16。后端各自假设不同, aarch64/gpu 假设双 BF16 与 emit 点 F32×BF16 语义不一致。违反 ARCH-DTYPE-MIXED-PRECISION (每个 op 的每个输入 tensor 都有独立 dtype, 混合精度是显式一等公民变体)。
+- **根治 (architect 方案 B)**: 新增 `DotDtype::Bf16xF32` (混合 a=F32 b=BF16) + `DotDtype::Fp16xF32` 变体。`Bf16`/`Fp16` 收窄为纯双 BF16/FP16。`quant_gemm.inc.rs:102/105` 改用 `Bf16xF32`/`Fp16xF32` (真实混合精度场景)。三后端各自实现:
+  - x86: `Bf16xF32` 保持 `vfmadd231ps` (b widen 成 F32 + F32 FMA, 数值正确); `Bf16` (纯双 BF16) 改用 VDPBF16PS (`Code::EVEX_Vdpbf16ps_zmm_k1z_zmm_zmmm512b32` + `Instruction::with3` + `add_instruction`, iced 1.21 Code 3082), has_bf16 守卫, 无 has_bf16 → Err。
+  - aarch64: `Bf16xF32` 走 WidenCompute (b BF16→F32 + FMLA, 不用 BFDOT); `Bf16` 保持 BFDOT + has_bf16 守卫。
+  - gpu: `Bf16xF32` 只 cvt b (a 已 F32, 不 cvt); `Bf16` 保持双 cvt。
+- **iced_x86 1.21 关键点**: zmm `vfmadd231ps` 只有 `_er` 后缀版本 (`EVEX_Vfmadd231ps_zmm_k1z_zmm_zmmm512b32_er` Code 3540, embedded rounding); `VDPBF16PS` 无 `_er` (`EVEX_Vdpbf16ps_zmm_k1z_zmm_zmmm512b32` Code 3082, 不支持 embedded rounding)。code_asm 无 `vdpbf16ps()` 便捷方法, 用 `Instruction::with3` + `add_instruction`。
+- **回归测试** (`x86_lower/tests.inc.rs`): `bce_x86hw002_bf16xf32_mixed_precision` — Bf16xF32 emit vfmadd231ps (非 VDPBF16PS), Bf16 (has_bf16=true) emit VDPBF16PS (非 vfmadd231ps)。aarch64/gpu 谓词真值表补 Bf16xF32/Fp16xF32。
+- **确认**: cargo test --lib 全过 (7033 passed, 0 failed; 单线程 50s + 多线程 3 次均通过)。residual=0。commit cee91a7c。
+- **SPEC criterion**: ARCH-DTYPE-MIXED-PRECISION — DotProduct 混合精度 (F32×BF16) 必须用显式 `DotDtype::Bf16xF32` 变体, 禁止藏在单一 `Bf16` 标签后; 纯双 BF16 必须用 VDPBF16PS (has_bf16 守卫, NO-HW-DEGRADATION)。
