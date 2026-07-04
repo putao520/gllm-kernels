@@ -1893,4 +1893,120 @@ mod tests {
         let ir = l.finalize().unwrap();
         assert!(ir.contains("signed char"), "GgufSubScaleLoad HIP must cast via signed char: {ir}");
     }
+
+    // ── BCE-20260704-GPU-QUANTLOADBYTESVEC-RESIDUAL ──────────────────────────────
+    // 旧实现残缺: PTX 只 cvt %w0 丢弃其余 15 字节 (`// Simplified`), HIP/Metal 所有字节
+    // 写 _v.x 互相覆盖。根治: SIMT per-thread, threadIdx.x 做 lane index, 每线程加载自己字节。
+
+    #[test]
+    fn bce_gpu_quant_load_bytes_vec_uses_per_thread_tid_index() {
+        // PTX 路径: 断言输出含 %tid.x (per-thread index) + ld.global.u8 (字节加载),
+        // 不含残缺单字节 `// Simplified` 或 `cvt.rn.f32.u32 {d}, %w0` (丢弃其余字节)。
+        let mut l = GpuLower::new(GpuDialect::Ptx { sm_version: 80 });
+        let mut prog = VmProgram::new();
+        let base = prog.alloc_vreg(VRegKind::Ptr, SimdWidth::Scalar);
+        let dst = prog.alloc_vreg(VRegKind::Vec, SimdWidth::Scalar);
+        l.set_vreg_kind_map(&prog);
+        l.emit_prologue(&empty_frame(), &empty_alloc(), prog.vreg_counts_by_kind()).unwrap();
+        let alloc = gpu_mixed_alloc(&[base.0], &[dst.0]);
+        let result = l.lower_instr(&VmInstr::QuantLoadBytesVec {
+            dst, base, offset: 2, count: 16, signed: false, width: SimdWidth::Scalar,
+        }, &alloc);
+        assert!(result.is_ok(), "QuantLoadBytesVec GPU PTX must lower: {:?}", result);
+        l.emit_epilogue(&empty_frame(), &alloc).unwrap();
+        let ir = l.finalize().unwrap();
+        // 正确架构: per-thread lane index via %tid.x
+        assert!(ir.contains("%tid.x"),
+            "BCE: QuantLoadBytesVec PTX must use per-thread %tid.x as lane index (ARCH-GPU-SIMT): {ir}");
+        // 字节加载 (zero-extend path: ld.global.u8 + cvt.u32.u8)
+        assert!(ir.contains("ld.global.u8"),
+            "BCE: QuantLoadBytesVec PTX (signed=false) must emit ld.global.u8: {ir}");
+        assert!(ir.contains("cvt.u32.u8"),
+            "BCE: QuantLoadBytesVec PTX (signed=false) must zero-extend via cvt.u32.u8: {ir}");
+        // count 守卫: setp.lt.u32 (tid < count)
+        assert!(ir.contains("setp.lt.u32"),
+            "BCE: QuantLoadBytesVec PTX must guard tid<count via setp.lt.u32: {ir}");
+        // 残缺 stub 必须清除
+        assert!(!ir.contains("// Simplified"),
+            "BCE: QuantLoadBytesVec PTX must not contain residual `// Simplified` stub: {ir}");
+        assert!(!ir.contains("cvt.rn.f32.u32") || !ir.contains("%w0"),
+            "BCE: QuantLoadBytesVec PTX must not contain residual single-byte `cvt.rn.f32.u32 ... %w0`: {ir}");
+        // 不应直接产出 f32 (语义: i32 lane, 下游 IntToFloat 转 f32)
+        assert!(!ir.contains("cvt.rn.f32.u32") && !ir.contains("cvt.rn.f32.s32"),
+            "BCE: QuantLoadBytesVec PTX must produce i32 lane (NOT f32); downstream IntToFloat converts: {ir}");
+    }
+
+    #[test]
+    fn bce_gpu_quant_load_bytes_vec_ptx_signed_uses_s8_sign_extend() {
+        // signed=true 路径: ld.global.s8 + cvt.s32.s8 (sign-extend), 不是 u8 zero-extend。
+        let mut l = GpuLower::new(GpuDialect::Ptx { sm_version: 80 });
+        let mut prog = VmProgram::new();
+        let base = prog.alloc_vreg(VRegKind::Ptr, SimdWidth::Scalar);
+        let dst = prog.alloc_vreg(VRegKind::Vec, SimdWidth::Scalar);
+        l.set_vreg_kind_map(&prog);
+        l.emit_prologue(&empty_frame(), &empty_alloc(), prog.vreg_counts_by_kind()).unwrap();
+        let alloc = gpu_mixed_alloc(&[base.0], &[dst.0]);
+        let result = l.lower_instr(&VmInstr::QuantLoadBytesVec {
+            dst, base, offset: 0, count: 8, signed: true, width: SimdWidth::Scalar,
+        }, &alloc);
+        assert!(result.is_ok(), "QuantLoadBytesVec GPU PTX signed must lower: {:?}", result);
+        l.emit_epilogue(&empty_frame(), &alloc).unwrap();
+        let ir = l.finalize().unwrap();
+        assert!(ir.contains("ld.global.s8"),
+            "BCE: QuantLoadBytesVec PTX signed=true must emit ld.global.s8: {ir}");
+        assert!(ir.contains("cvt.s32.s8"),
+            "BCE: QuantLoadBytesVec PTX signed=true must sign-extend via cvt.s32.s8: {ir}");
+        // 不应出现 zero-extend 路径
+        assert!(!ir.contains("ld.global.u8") || !ir.contains("cvt.u32.u8"),
+            "BCE: QuantLoadBytesVec PTX signed=true must NOT use u8 zero-extend path: {ir}");
+    }
+
+    #[test]
+    fn bce_gpu_quant_load_bytes_vec_hip_uses_threadidx() {
+        // HIP 路径: per-thread threadIdx.x, guard tid<count, 不再用 _v.x 互相覆盖的 for 循环。
+        let mut l = GpuLower::new(GpuDialect::Hip { gfx_arch: 908, wave_size: 64 });
+        let mut prog = VmProgram::new();
+        let base = prog.alloc_vreg(VRegKind::Ptr, SimdWidth::Scalar);
+        let dst = prog.alloc_vreg(VRegKind::Vec, SimdWidth::Scalar);
+        l.set_vreg_kind_map(&prog);
+        l.emit_prologue(&empty_frame(), &empty_alloc(), prog.vreg_counts_by_kind()).unwrap();
+        let alloc = gpu_mixed_alloc(&[base.0], &[dst.0]);
+        let result = l.lower_instr(&VmInstr::QuantLoadBytesVec {
+            dst, base, offset: 4, count: 16, signed: false, width: SimdWidth::Scalar,
+        }, &alloc);
+        assert!(result.is_ok(), "QuantLoadBytesVec GPU HIP must lower: {:?}", result);
+        l.emit_epilogue(&empty_frame(), &alloc).unwrap();
+        let ir = l.finalize().unwrap();
+        assert!(ir.contains("threadIdx.x"),
+            "BCE: QuantLoadBytesVec HIP must use threadIdx.x as lane index: {ir}");
+        // 残缺的 for 循环互相覆盖 _v.x 已删除
+        assert!(!ir.contains("make_float4"),
+            "BCE: QuantLoadBytesVec HIP must not contain residual make_float4 stub: {ir}");
+        // 不应直接产出 float (语义: i32 lane)
+        assert!(!ir.contains("(float)"),
+            "BCE: QuantLoadBytesVec HIP must produce i32 lane (NOT float); downstream IntToFloat converts: {ir}");
+    }
+
+    #[test]
+    fn bce_gpu_quant_load_bytes_vec_metal_uses_thread_position() {
+        // Metal 路径: per-thread thread_position_in_grid.x, guard tid<count。
+        let mut l = GpuLower::new(GpuDialect::Metal { gpu_family: 1 });
+        let mut prog = VmProgram::new();
+        let base = prog.alloc_vreg(VRegKind::Ptr, SimdWidth::Scalar);
+        let dst = prog.alloc_vreg(VRegKind::Vec, SimdWidth::Scalar);
+        l.set_vreg_kind_map(&prog);
+        l.emit_prologue(&empty_frame(), &empty_alloc(), prog.vreg_counts_by_kind()).unwrap();
+        let alloc = gpu_mixed_alloc(&[base.0], &[dst.0]);
+        let result = l.lower_instr(&VmInstr::QuantLoadBytesVec {
+            dst, base, offset: 0, count: 8, signed: true, width: SimdWidth::Scalar,
+        }, &alloc);
+        assert!(result.is_ok(), "QuantLoadBytesVec GPU Metal must lower: {:?}", result);
+        l.emit_epilogue(&empty_frame(), &alloc).unwrap();
+        let ir = l.finalize().unwrap();
+        assert!(ir.contains("thread_position_in_grid"),
+            "BCE: QuantLoadBytesVec Metal must use thread_position_in_grid as lane index: {ir}");
+        // 残缺的 for 循环互相覆盖 _v.x 已删除
+        assert!(!ir.contains("float4 _v(0)"),
+            "BCE: QuantLoadBytesVec Metal must not contain residual float4 _v(0) stub: {ir}");
+    }
 }

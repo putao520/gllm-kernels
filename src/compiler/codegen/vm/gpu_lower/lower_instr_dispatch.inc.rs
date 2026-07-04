@@ -3515,33 +3515,76 @@ Ok(())
 
     fn lower_quant_load_bytes_vec_gpu(&mut self, instr: &VmInstr, alloc: &RegAllocation) -> Result<(), CompilerError> {
         match instr {
-            VmInstr::QuantLoadBytesVec { dst, base, offset, count, .. } => {
+            VmInstr::QuantLoadBytesVec { dst, base, offset, count, signed, .. } => {
 
-                // Load `count` bytes from base+offset, zero-extend each to i32/f32 lane.
-                // GPU: use vector load + type punning.
+                // BCE-20260704-GPU-QUANTLOADBYTESVEC-RESIDUAL 根治:
+                // 旧实现残缺 — PTX 只 cvt %w0 丢弃其余字节 (`// Simplified`),
+                // HIP/Metal 所有字节写 _v.x 互相覆盖。NO-SILENT-FALLBACK + P-1 红线违宪。
+                //
+                // 正确架构 (ARCH-GPU-SIMT, 参照 lower_quant_interleave_gpu:3800 + lower_vec_load_gpu:246):
+                //   GPU SIMT per-thread: 每个线程持有向量的一个 lane, threadIdx.x = lane index。
+                //   线程加载自己 lane 对应的字节 base+offset+tid, sign/zero-extend 到 i32,
+                //   存入 dst (Vec VReg 持有整数 lane, 下游 VecUnaryOp::IntToFloat 做 i32→f32)。
+                //   tid >= count 的线程 dst=0 (pred 守卫, 避免越界 load)。
+                //
+                // 语义对齐 x86 lower_quant_load_bytes_vec_x86:3714 (vpmovsxbd/vpmovzxbd → i32, NO float)。
                 let d = self.reg_name_with_kind(*dst, alloc);
                 let b = self.reg_name_with_kind(*base, alloc);
                 let off = *offset;
                 let cnt = *count;
+                let is_signed = *signed;
                 match self.dialect {
                     GpuDialect::Ptx { .. } => {
-                        self.emit_line("{");
-                        for i in 0..cnt {
-                            self.emit_line(&format!(".reg .u8 %b{i}; .reg .u32 %w{i}; ld.global.u8 %b{i}, [{b}+{off}+{i}]; cvt.u32.u8 %w{i}, %b{i};"));
+                        // ARCH-GPU-PTX-ADDR: PTX `[reg+reg]` 非法, 先算 64-bit 地址 (参照 lower_vec_load_gpu:266)。
+                        // byte_addr = base + offset + tid  (tid = %tid.x, per-thread lane index)
+                        let rs0 = self.scratch_gpr_names[0]; // byte / widened i32 scratch
+                        let rd_addr = self.scratch_gpr_names.get(1).copied()
+                            .unwrap_or_else(|| rs0); // 64-bit addr scratch (fallback to rs0 if unavailable)
+                        let p_byte = self.scratch_pred_names.first().copied().unwrap_or("%p0");
+                        // 1. tid (lane index) → 32-bit
+                        self.emit_line(&format!("mov.u32 {rs0}, %tid.x;"));
+                        // 2. byte_idx < count ? guard : out-of-range (dst=0)
+                        self.emit_line(&format!("setp.lt.u32 {p_byte}, {rs0}, {cnt};"));
+                        // 3. compute 64-bit byte address = base + offset + tid
+                        //    offset is compile-time const i64; tid is u32 → cvt.u64.u32 then add.
+                        self.emit_line(&format!("cvt.u64.u32 {rd_addr}, {rs0};"));
+                        self.emit_line(&format!("add.u64 {rd_addr}, {rd_addr}, {b};"));
+                        if off != 0 {
+                            self.emit_line(&format!("add.u64 {rd_addr}, {rd_addr}, {off};"));
                         }
-                        // Pack into vector register
-                        self.emit_line(".reg .v4.u32 %v4;");
-                        for i in 0..cnt.min(4) {
-                            self.emit_line(&format!("mov.v4.u32.s{}, %w{};", i, i));
+                        // 4. predicated byte load + sign/zero-extend into dst; else dst=0
+                        if is_signed {
+                            // ld.global.s8 sign-extends to s32 directly into rs0; then mov to dst (int lane).
+                            self.emit_line(&format!("@{p_byte} ld.global.s8 {rs0}, [{rd_addr}];"));
+                            self.emit_line(&format!("@{p_byte} cvt.s32.s8 {d}, {rs0};"));
+                            self.emit_line(&format!("@!{p_byte} mov.s32 {d}, 0;"));
+                        } else {
+                            // ld.global.u8 → cvt.u32.u8 zero-extend into dst (int lane).
+                            self.emit_line(&format!("@{p_byte} ld.global.u8 {rs0}, [{rd_addr}];"));
+                            self.emit_line(&format!("@{p_byte} cvt.u32.u8 {d}, {rs0};"));
+                            self.emit_line(&format!("@!{p_byte} mov.u32 {d}, 0;"));
                         }
-                        self.emit_line(&format!("cvt.rn.f32.u32 {d}, %w0;")); // Simplified
-                        self.emit_line("}");
                     }
                     GpuDialect::Hip { .. } => {
-                        self.emit_line(&format!("{{ uint4 _v; for(int _i=0; _i<{cnt}; _i++) {{ _v.x = (unsigned)(*((unsigned char*)({b}+{off}+_i))); }} {d} = make_float4((float)_v.x, (float)_v.y, (float)_v.z, (float)_v.w); }}"));
+                        // HIP C++: per-thread lane = threadIdx.x. Guard tid<count, load byte, sign/zero-extend to i32.
+                        // dst holds integer lane (downstream IntToFloat converts i32→f32).
+                        let sign_cast = if is_signed { "(int8_t)" } else { "(uint8_t)" };
+                        let widen = if is_signed { "(int32_t)" } else { "(uint32_t)" };
+                        self.emit_line(&format!(
+                            "{{ uint32_t _tid = (uint32_t)threadIdx.x; unsigned char* _bp = (unsigned char*)({b}) + {off}; \
+                             {sign_cast} unsigned char _b = (_tid < {cnt}) ? ({sign_cast} unsigned char)_bp[_tid] : ({sign_cast} unsigned char)0; \
+                             {d} = ({widen})_b; }}"
+                        ));
                     }
                     GpuDialect::Metal { .. } => {
-                        self.emit_line(&format!("{{ float4 _v(0); for(int _i=0; _i<{cnt}; _i++) {{ _v.x = float(*((device uchar*)({b}+{off}+_i))); }} {d} = _v; }}"));
+                        // Metal: per-thread lane = thread_position_in_grid.x. Same semantics as HIP.
+                        let sign_cast = if is_signed { "(char)" } else { "(uchar)" };
+                        let widen = if is_signed { "(int32_t)" } else { "(uint32_t)" };
+                        self.emit_line(&format!(
+                            "{{ uint _tid = (uint)thread_position_in_grid.x; device uchar* _bp = (device uchar*)({b}) + {off}; \
+                             {sign_cast} uchar _b = (_tid < {cnt}) ? ({sign_cast} uchar)_bp[_tid] : ({sign_cast} uchar)0; \
+                             {d} = ({widen})_b; }}"
+                        ));
                     }
                 }
                 Ok(())
