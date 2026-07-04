@@ -499,10 +499,22 @@ impl GpuCompiledLayer {
 
         let driver = device.driver();
 
+        // [DEBUG-DUMP-PTX] 临时: dump PTX 源码定位 SmolLM2 GPU 数值 BUG 根因
+        if let Ok(dir) = std::env::var("GLLM_DUMP_PTX") {
+            let _ = std::fs::create_dir_all(&dir);
+            let ts = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH).map(|d| d.as_nanos()).unwrap_or(0);
+            let path = format!("{}/ptx_{}_{}.ptx", dir, config_hash, ts);
+            let _ = std::fs::write(&path, ptx_source);
+            eprintln!("[DEBUG-DUMP-PTX] wrote {} bytes to {}", ptx_source.len(), path);
+        }
+
         // Load PTX module
         let mut module: CUmodule = 0;
         let res = unsafe { (driver.cuModuleLoadData)(&mut module, ptx_source.as_ptr() as *const _) };
         if res != CUDA_SUCCESS {
+            // dump PTX on failure too for debugging
+            let _ = std::fs::write("/tmp/gllm_failed_ptx.ptx", ptx_source);
             return Err(GpuError::ShaderCompilation(format!(
                 "cuModuleLoadData failed with error {res}"
             )));
