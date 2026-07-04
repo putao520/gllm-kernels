@@ -501,3 +501,32 @@ fixTemplate:
   - `rms_norm_cached_pattern_input_arity_within_signature` (全路径: with_defaults 后 RmsNorm cached pattern arity ≤ 3, debug+release 均通过)
 - **确认**: cargo test --lib 全过 (7029 passed, 0 failed); release 模式 RmsNorm structured 返回 None (降级 manual trace, 不再 panic)。residual=0。
 - **SPEC criterion**: REQ-AIS-007 (ScalarOpRegistry) + REQ-AIS-002 (ComputePattern) — structured symexec 生成的 pattern Input arity 不得超过 scalar fn signature 的 ptr 参数数; combine_layer_norm 必须校验 fn_sig 含 weight+bias。
+
+## BCE-20260704-AMX-SIGNED-INT8 — JIT AMX TileMma U8 用 TDPBUUD (u8×u8) 处理 Q8 signed i8 权重致数值错
+
+- **patternId**: BCE-20260704-AMX-SIGNED-INT8
+- **title**: AMX INT8 JIT 路径指令选择与数据符号性不匹配 (TDPBUUD vs TDPBUSD)
+- **layer**: 设计
+- **归因时间**: 2026-07-04
+- **现象**: `lower_tile_mma_x86` 的 `DType::U8` 分支 emit `tdpbuud` (u8×u8 → i32)。但 GGUF Q8 权重是 signed i8 (`quant.rs BlockQ8_0 qs: [i8; QK_K]`, `quant_format.rs` "Q8_0/Q8_K/Q8_1 signed")。TDPBUUD 把 i8 负数当 u8 解码 (负数变 128-255) → 数值错。
+- **根因**: JIT codegen 路径 (`lower_instr_dispatch.inc.rs:3226`) 与直接 asm 路径 (`matmul_x86_amx_int8.rs:179 _tile_dpbusd`) 指令选择不一致。asm 路径正确用 TDPBUSD (u8×i8), JIT 路径误用 TDPBUUD。量化 GEMM 标准数据约定: A=激活 u8 (s8 偏移+128 无符号化), B=权重 i8 (signed)。TDPBUSD (A=u8, B=i8) 数值正确; TDPBUUD (A=u8, B=u8) 把 B 的 i8 负数误解码。
+- **根治**: `lower_tile_mma_x86` U8 分支 `self.asm.tdpbuud(...)` → `self.asm.tdpbusd(...)`。iced 1.21 code_asm 原生支持全 4 AMX INT8 变体 (tdpbuud/tdpbssd/tdpbsud/tdpbusd)。注释表同步更新 (U8 → TDPBUSD, pp=66)。
+- **同类横扫**: AMX-FP8 (TDPHF8PS/TDPBF8PS) + AMX-TF32 (TDPTF32PS) 路径已用 `emit_tdp_raw` 正确分发, 无同类符号性错配。asm 路径 `matmul_x86_amx_int8.rs` 已正确, 不需改。
+- **回归测试** (`x86_lower/tests.inc.rs`):
+  - `bce_amx_signed_int8_tile_mma_u8_uses_tdpbusd_not_tdpbuud` — 断言 U8 TileMma emit `Code::VEX_Tdpbusd_tmm_tmm_tmm` (非 Tdpbuud) + 机器码 pp=01 (66 prefix, TDPBUSD) 非 pp=00 (TDPBUUD)。
+- **确认**: cargo test --lib 全过 (7030 passed, 0 failed; 单线程 49s + 多线程 3 次均通过)。residual=0。commit 53190cc4。
+- **SPEC criterion**: REQ-HWACC (AMX-INT8) — JIT AMX TileMma 指令选择必须顺从权重数据符号性: Q8 signed i8 权重 → TDPBUSD (u8×i8), 禁止 TDPBUUD (u8×u8)。
+
+## BCE-20260704-KERNELS-TRAIT-ISLAND-STUBS — Kernels trait 19 个 unimplemented! 孤岛 stub (NO-PRAGMATIC-HACKS + P-1 红线)
+
+- **patternId**: BCE-20260704-KERNELS-TRAIT-ISLAND-STUBS
+- **title**: Kernels trait 残留 unimplemented! stub 占位 (孤岛模块 + P-1 红线违宪)
+- **layer**: 范式
+- **归因时间**: 2026-07-04
+- **现象**: `src/traits.rs` Kernels trait 有 ~16 个方法 `unimplemented!()` 占位 (vec_dot/vec_sub/vec_scale/vec_axpy/vec_max/vec_sum_squares/gemm_bt/gemm_bias/gemm_prepacked/gemm_bias_prepacked/relu/dequant_q*/gemv_q8/rms_norm/layer_norm/rope/rope_with_pos/tanh/exp 等)。注释 "to allow incremental implementation"。
+- **根因**: 历史增量开发遗留的 trait stub。`arch_insight(quality)` + live caller 扫描确认: 除 `pack_b`/`gelu` 有 live caller (已由 `cpu_kernels/mod.rs` 实现的非 trait 方法覆盖), 其余 stub 全是 0 live caller 的真孤岛。违反 NO-ISLAND-MODULE (编译通过+测试通过≠完成) + NO-PRAGMATIC-HACKS (禁 stub) + P-1 红线 (commit 前清除 unimplemented!/stub)。
+- **根治**: 删除全部 0-live-caller 的 unimplemented! stub 方法 (trait 签名 + 默认实现)。`pack_b`/`gelu` 等 live 方法保留 (由实现模块提供)。trait 只保留真实被调用的方法集。
+- **同类横扫**: 全 `traits.rs` + `cpu_kernels/` 扫描, 确认无其他 unimplemented!/todo!/stub 残留。
+- **回归测试**: `cargo test --lib` 全过 (7029 passed, 0 failed) — 删除的方法无 live caller, 不影响行为。
+- **确认**: cargo test --lib 全过 (7029 passed, 0 failed)。residual=0。commit 493e6092。
+- **SPEC criterion**: P-1 红线 + NO-ISLAND-MODULE — Kernels trait 禁止 unimplemented!/stub 占位; trait 方法必须有 live caller (非 test) 或删除。
