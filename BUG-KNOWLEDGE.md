@@ -620,3 +620,23 @@ fixTemplate:
 - **回归测试** (gpu_lower/tests.inc.rs): `bce_gpu_quant_load_bytes_vec_uses_per_thread_tid_index` — PTX 含 `%tid.x`+`ld.global.u8`, 不含 `// Simplified` 或 `cvt.rn.f32.u32 {d}, %w0`。
 - **确认**: cargo test --lib 全过 (7037 passed, 0 failed)。residual=0。commit 1877b4ee。
 - **SPEC criterion**: P-1 红线 + NO-SILENT-FALLBACK — GPU 量化向量加载必须 SIMT per-thread 完整加载所有 lane, 禁止残缺 stub 只取首字节。
+
+## BCE-20260704-GPU-DOTPRODUCT-INT8-TYPECHAIN — DotProduct(Int8) GPU 类型错配 + ScaleApply 联动 + QuantScalarCvtLoad PTX 合法化
+
+- **patternId**: BCE-20260704-GPU-DOTPRODUCT-INT8-TYPECHAIN
+- **title**: GPU DotProduct(Int8) PTX 用 mul.lo.s32 但输入是 f32 寄存器 (类型错配) + ScaleApply 联动 cvt 错 + QuantScalarCvtLoad PTX 非法 CUDA C 语法
+- **layer**: 设计 (ARCH-DTYPE-MIXED-PRECISION dtype 链断裂 + NO-SILENT-FALLBACK PTX 合法性)
+- **归因时间**: 2026-07-04
+- **现象**: 三处 GPU codegen BUG:
+  1. `lower_dot_product_gpu` DotDtype::Int8 PTX 用 `mul.lo.s32 {rs0}, {va}, {vb}` + `add.s32`, 但 va/vb 是 `%f` (f32 寄存器, VRegKind::Vec) — f32 位模式当 s32 整数乘 → 数值垃圾。
+  2. `lower_scale_apply_gpu` input_dtype=INT8 PTX 用 `cvt.rn.f32.s32 {fs0}, {acc_r}` 把 acc 当 s32→f32, 但 DequantFma 路径 acc 已是 f32 (gpu_accumulator_dtype(INT8)==F32) — f32 位模式当 s32→f32 错。
+  3. `lower_quant_scalar_cvt_load_gpu` PTX 路径生成 CUDA C 语法 (`__half2float`/`device signed char*`), 非合法 PTX (cuModuleLoadData 拒绝)。
+- **根因**: GPU codegen dtype 链断裂。上游 QuantBlockLoad(Int8) 输出 f32 (cvt.rn.f32.s32 到 %f), VecLoad 激活也是 f32, 但 DotProduct(Int8) 假设 s32 操作数。ScaleApply 假设 acc 是 s32 但实际 f32。QuantScalarCvtLoad PTX 路径误用 CUDA C 语法。task #39 (94b49ffc GPU 6处违宪) 把 DotProduct SIMT 化时遗漏 dtype 链检查。
+- **根治**: 
+  - DotProduct(Int8) PTX/HIP/Metal 改 f32 乘加 (`fma.rn.f32 {vc}, {va}, {vb}, {vc}`), 删 `mul.lo.s32`+`add.s32`。
+  - ScaleApply input_dtype=INT8 PTX 删 `cvt.rn.f32.s32`, 直接 `mul.rn.f32 + add.rn.f32` (acc 已 f32)。HIP/Metal (float) cast 对 f32 是 no-op, 保持。
+  - QuantScalarCvtLoad PTX 改合法 PTX: `cvt.u64.s64 %rd_addr, {off}` + `add.u64` + `ld.global.b16/s8/u8` + `cvt.rn.f32.f16/s32/u32` (参照 lower_vec_load_gpu)。HIP/Metal 保持 CUDA C 语法 (nvrtc/clang 编译合法)。
+- **回归测试** (gpu_lower/tests.inc.rs): `bce_gpu_dot_product_int8_uses_f32_fma_not_s32_mul` + `bce_gpu_scale_apply_int8_no_s32_cvt` + `bce_gpu_quant_scalar_cvt_load_ptx_legal` + 更新 `test_ptx_dot_product_int8_no_mma_sync`。
+- **确认**: cargo test --lib 全过 (7040 passed, 0 failed; 3x gpu_lower 无 flaky)。residual=0。commit 10eaa3b1。
+- **重要备注**: 此修复虽正确 (类型错配是真的 BUG), 但**不是 SmolLM2-Q4_0 GPU E2E fail 的根因** — 5070Ti 重验后 logits 完全不变 (sum=273279.8351 一字不差), 说明 SmolLM2-Q4_0 的 GPU 路径未走 DotProduct(Int8) (可能走别的 GEMM 路径或 graph build 选了不同 kernel)。SmolLM2 GPU 真根因待另行排查 (疑似 embedding/attention 层, 非 GEMM)。
+- **SPEC criterion**: ARCH-DTYPE-MIXED-PRECISION — GPU DotProduct 整数变体的操作数寄存器类型必须与上游 QuantBlockLoad/VecLoad 输出 dtype 一致 (f32 累加器用 fma.rn.f32, 非 s32 mul); PTX 路径必须用合法 PTX 指令 (ld.global + cvt), 禁止 CUDA C 语法。
