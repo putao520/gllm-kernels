@@ -550,3 +550,20 @@ fixTemplate:
 - **回归测试** (`x86_lower/tests.inc.rs`): `bce_x86hw002_bf16xf32_mixed_precision` — Bf16xF32 emit vfmadd231ps (非 VDPBF16PS), Bf16 (has_bf16=true) emit VDPBF16PS (非 vfmadd231ps)。aarch64/gpu 谓词真值表补 Bf16xF32/Fp16xF32。
 - **确认**: cargo test --lib 全过 (7033 passed, 0 failed; 单线程 50s + 多线程 3 次均通过)。residual=0。commit cee91a7c。
 - **SPEC criterion**: ARCH-DTYPE-MIXED-PRECISION — DotProduct 混合精度 (F32×BF16) 必须用显式 `DotDtype::Bf16xF32` 变体, 禁止藏在单一 `Bf16` 标签后; 纯双 BF16 必须用 VDPBF16PS (has_bf16 守卫, NO-HW-DEGRADATION)。
+
+## BCE-20260704-GPU-QUANTLOADBYTESVEC-RESIDUAL — GPU QuantLoadBytesVec 残缺 stub (只取%w0丢弃15字节)
+
+- **patternId**: BCE-20260704-GPU-QUANTLOADBYTESVEC-RESIDUAL
+- **title**: GPU QuantLoadBytesVec PTX/HIP/Metal 三路径残缺, 只转换第一个字节丢弃其余
+- **layer**: 设计 (NO-SILENT-FALLBACK + P-1 红线违宪)
+- **归因时间**: 2026-07-04
+- **现象**: `lower_quant_load_bytes_vec_gpu` (lower_instr_dispatch.inc.rs:3516-3552) 三路径全残缺:
+  - PTX: `for i in 0..cnt` 加载所有字节到 `%w{i}`, 但 `cvt.rn.f32.u32 {d}, %w0; // Simplified` 只转第一个字节, 其余 15 字节丢弃。`cnt.min(4)` 还限制只打包 4 字节到 `%v4`。
+  - HIP: `for(int _i=0; _i<{cnt}; _i++) { _v.x = ... }` 所有字节写 `_v.x` 互相覆盖, `_v.y/z/w` 未初始化。
+  - Metal: 同 HIP。
+- **根因**: GPU SIMT 向量模型实现错误。`QuantLoadBytesVec { count }` 应产 `count` 个 f32 lane (每字节扩展), 但残缺实现一个线程加载所有字节只取第一个。参照 `lower_quant_interleave_gpu` 用 `%tid.x` 做 lane index 的 per-thread 模式。
+- **根治**: 重写三路径为 SIMT per-thread 模型 — 每个线程加载自己 lane 对应字节 (`byte_idx = %tid.x`, guard `byte_idx < count`), zero-extend (signed=false) 或 sign-extend (signed=true) 到 i32/f32。超出 count 的线程 dst=0 (pred 守卫)。
+- **注意**: 此残缺 stub 不是 SmolLM2-Q4_0 GPU fail 的根因 (Q4_0 DequantFma 路径走 QuantBlockLoad 不走 QuantLoadBytesVec)。但残缺违宪必须根治 (BCE)。
+- **回归测试** (gpu_lower/tests.inc.rs): `bce_gpu_quant_load_bytes_vec_uses_per_thread_tid_index` — PTX 含 `%tid.x`+`ld.global.u8`, 不含 `// Simplified` 或 `cvt.rn.f32.u32 {d}, %w0`。
+- **确认**: cargo test --lib 全过 (7037 passed, 0 failed)。residual=0。commit 1877b4ee。
+- **SPEC criterion**: P-1 红线 + NO-SILENT-FALLBACK — GPU 量化向量加载必须 SIMT per-thread 完整加载所有 lane, 禁止残缺 stub 只取首字节。
