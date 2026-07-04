@@ -12,10 +12,63 @@
 | BCE-X86-APX-EGPR iced_x86 APX egpr 编码缺失（BCE-20260703-X86-APX-EGPR-UNUSED） | 1 | 1 ✅ | 0 | gpr/gpr32/gpr64_to_32 对 16..31 显式报错；iced_x86 1.21 无 R16-R31 变体，APX 激活前须升级 iced_x86 |
 | BCE-AVX512-HALF-LANES AVX-512 codegen 半 lanes（BCE-20260703-AVX512-HALF-LANES） | 1 | 1 ✅ | 0 | 7 处 reduction/scan 按 use_avx512 分流 ZMM 16-lane（argmax/softmax_reduce_max/HReduce/Accumulate/softmax_normalize/temperature/Transcendental） |
 | BCE-GPU-VIOLATIONS GPU codegen 6 处违宪（BCE-20260704-GPU-VIOLATIONS） | 1 | 1 ✅ | 0 | DotProduct SIMT非tcgen05/MxFP4多lane SIMT解码/VecLoad dtype分流/KIVI SIMT per-thread/NVFP4 E2M1解码 (GPU-009 P3 留后续) |
+| BCE-GPU-DOTPRODUCT-INT8-TYPECHAIN DotProduct(Int8) GPU 类型错配链（BCE-20260704-GPU-DOTPRODUCT-INT8-TYPECHAIN） | 1 | 1 ✅ | 0 | Int8 DequantFma 路径 a/b 上游已 cvt f32, dot 走 fma.rn.f32 非 s32 mul+add; ScaleApply 联动删 cvt.rn.f32.s32; QuantScalarCvtLoad PTX 合法化 (ld.global+cvt) |
 
 **全库残留总计**: 0
 
 ---
+
+## BCE-20260704-GPU-DOTPRODUCT-INT8-TYPECHAIN — DotProduct(Int8) GPU 类型错配链 (SmolLM2-Q4_0 GPU E2E fail 真根因)
+
+### smellClass: GPU-INT8-DOT-S32-MUL-ON-F32-REG（Pattern — GPU DotProduct(Int8) 用 s32 整数指令 (mul.lo.s32/add.s32) 操作 f32 寄存器 (上游 QuantBlockLoad Int8→f32 + VecLoad F32 激活))
+
+**宪法依据**: ARCH-DTYPE-MIXED-PRECISION（dtype 链一致：QuantBlockLoad Int8 输出 f32 → DotProduct Int8 f32 累加 → ScaleApply f32 处理）+ ARCH-JIT-DATA-YIELDS（代码顺从数据：上游已 f32, codegen 必须 f32 fma）+ gpu_accumulator_dtype(INT8)==F32（trace.rs:1120 明确 INT8 GPU 走 F32 累加）。同源族：BCE-20260704-GPU-VIOLATIONS GPU-001（DotProduct SIMT 非 tcgen05），本次是 SIMT 路径内的 dtype 错配。
+
+**模式签名**: GPU DotProduct(Int8) PTX 路径 `mul.lo.s32 {rs0}, {va}, {vb}` + `add.s32 {vc}, {vc}, {rs0}`，但 `{va}`/`{vb}` 是 `%f`（f32 寄存器，VRegKind::Vec → prefix_vec="%f"）。f32 位模式当 s32 整数操作 → 数值垃圾（如 -5.0 的 f32 位 0xC0A00000 当 s32 = -1063256064）。SmolLM2-135M-Q4_0 GPU E2E argmax=38734（golden=253）, logits sum=273279 异常大。
+
+```yaml
+- patternId: BCE-20260704-GPU-DOTPRODUCT-INT8-TYPECHAIN
+  title: GPU DotProduct(Int8) 用 s32 指令操作 f32 寄存器 → 数值错乱
+  layer: 设计缺陷
+  codePattern:
+    - "DotDtype::Int8 PTX 路径 mul.lo.s32 {rs0}, {va}, {vb} 但 va/vb 是 %f (f32 寄存器)"
+    - "ScaleApply input_dtype=INT8 PTX 路径 cvt.rn.f32.s32 {fs0}, {acc_r} 但 acc 已是 f32 (fma.rn.f32 产物)"
+    - "QuantScalarCvtLoad PTX 路径 emit CUDA C 语法 (__half2float/device signed char*) 非合法 PTX"
+  triggerCondition:
+    - "GPU DequantFma 路径 DotProduct(Int8)：a=VecLoad{F32} + b=QuantBlockLoad{Int8→f32}"
+    - "cuModuleLoadData 加载纯 PTX (QuantScalarCvtLoad CUDA C 语法非法)"
+  detectionSignatures:
+    structural:
+      - "DotDtype::Int8 PTX match arm 内 mul.lo.s32 + add.s32 (应为 fma.rn.f32)"
+      - "lower_scale_apply_gpu PTX cvt.rn.f32.s32 (acc 已 f32, 不应 cvt)"
+      - "lower_quant_scalar_cvt_load_gpu PTX 含 __half2float/device half/device signed char (CUDA C 非法 PTX)"
+    literal:
+      - "mul.lo.s32.*%f"
+      - "cvt.rn.f32.s32.*%f"
+      - "__half2float.*device half"
+  sameClassCriterion:
+    - "GPU DotProduct 整数变体 (Int8/Int4x8/Fp4) 上游已 cvt 到 f32, 累加必须 f32 fma"
+    - "ScaleApply input_dtype=INT8 在 GPU (acc 是 f32) 不应 cvt s32→f32"
+    - "PTX 路径禁止 CUDA C 语法 (device/cast), 必须 ld.global+cvt"
+  fixTemplate:
+    - "DotProduct(Int8) PTX: fma.rn.f32 {vc}, {va}, {vb}, {vc}; (删 mul.lo.s32+add.s32)"
+    - "DotProduct(Int8) HIP/Metal: {vc} = fma((float){va}, (float){vb}, {vc});"
+    - "ScaleApply(INT8) PTX: mul.rn.f32 {d}, {acc_r}, {sc}; [+ add.rn.f32 if zero] (删 cvt.rn.f32.s32)"
+    - "QuantScalarCvtLoad PTX: cvt.u64.s64 %rd_addr,{off}; add.u64 %rd_addr,%rd_addr,{b}; ld.global.b16/s8/u8 + cvt.rn.f32.f16/s32/u32"
+  regressionAssertion:
+    - "bce_gpu_dot_product_int8_uses_f32_fma_not_s32_mul: PTX 含 fma.rn.f32, 不含 mul.lo.s32/add.s32"
+    - "bce_gpu_scale_apply_int8_no_s32_cvt: PTX 不含 cvt.rn.f32.s32, 含 mul.rn.f32"
+    - "bce_gpu_quant_scalar_cvt_load_ptx_legal: PTX 含 ld.global.b16+cvt.rn.f32.f16, 不含 __half2float/device half"
+```
+
+**根因**: `lower_dot_product_gpu` DotDtype::Int8 假设 a/b 是 s32 整数 (mul.lo.s32+add.s32)，但 DequantFma 路径上游已 cvt 到 f32（VecLoad F32 激活 + QuantBlockLoad Int8→f32 via `cvt.rn.f32.s32 {d}, {rs1}` at quant_load.inc.rs:31）。f32 位模式当 s32 操作 → 数值垃圾。
+
+**根治**:
+1. `DotProduct(Int8)` PTX/HIP/Metal 改 f32 fma（`fma.rn.f32`），删除 s32 mul+add
+2. `ScaleApply(INT8)` PTX 删 `cvt.rn.f32.s32`，直接 `mul.rn.f32` + `add.rn.f32`（acc 已 f32）
+3. `QuantScalarCvtLoad` PTX 改合法 PTX（`cvt.u64.s64` + `add.u64` + `ld.global.b16/s8/u8` + `cvt.rn.f32.*`），删除 CUDA C 语法
+
+**残留**: 0（重扫 lower_instr_dispatch.inc.rs 无残留 mul.lo.s32 在 Int8 路径 / 无 cvt.rn.f32.s32 在 ScaleApply / 无 __half2float 在 PTX；Int4x8/Fp4 路径保留各自实现，待对应量化模型触发时按 BCE 同类根治）
 
 ## BCE-20260703-AVX512-HALF-LANES — AVX-512 codegen 按 width 算 step 但用 YMM load → 高 8 lanes 跳过
 

@@ -327,7 +327,10 @@ mod tests {
 
     #[test]
     fn test_ptx_dot_product_int8_no_mma_sync() {
-        // Int8 DotProduct 必须用 SIMT mul+add, 禁止 mma.sync (warp-tile IMMA)
+        // Int8 DotProduct 必须用 SIMT 标量路径, 禁止 mma.sync (warp-tile IMMA)
+        // BCE-20260704-GPU-DOTPRODUCT-INT8-TYPE-MISMATCH: Int8 在 GPU DequantFma 路径
+        //   上游已 cvt 到 f32 (VecLoad F32 激活 + QuantBlockLoad Int8→f32), 累加必须 f32 fma,
+        //   不是 s32 mul+add (f32 位模式当 s32 → 数值错, SmolLM2-Q4_0 GPU E2E fail 真根因)。
         let mut l = GpuLower::new(GpuDialect::Ptx { sm_version: 80 });
         let alloc = empty_alloc();
         l.lower_instr(&VmInstr::DotProduct {
@@ -336,8 +339,113 @@ mod tests {
         }, &alloc).unwrap();
         let ir = l.finalize().unwrap();
         assert!(!ir.contains("mma.sync"), "DotProduct<Int8> must NOT use mma.sync (warp-tile IMMA): {ir}");
-        assert!(ir.contains("mul.lo.s32"), "DotProduct<Int8> must use SIMT mul.lo.s32: {ir}");
-        assert!(ir.contains("add.s32"), "DotProduct<Int8> must use SIMT add.s32: {ir}");
+        // BCE: 必须用 f32 fma (a/b 上游已 f32), 禁止 s32 mul+add (类型错配)
+        assert!(ir.contains("fma.rn.f32"), "DotProduct<Int8> must use f32 fma (upstream already f32): {ir}");
+        assert!(!ir.contains("mul.lo.s32"), "DotProduct<Int8> must NOT use mul.lo.s32 (f32 reg as s32 = type mismatch): {ir}");
+        assert!(!ir.contains("add.s32"), "DotProduct<Int8> must NOT use add.s32 (f32 acc as s32 = type mismatch): {ir}");
+    }
+
+    #[test]
+    fn bce_gpu_dot_product_int8_uses_f32_fma_not_s32_mul() {
+        // BCE-20260704-GPU-DOTPRODUCT-INT8-TYPECHAIN 回归:
+        //   DotProduct(Int8) PTX 必须用 fma.rn.f32 (a/b 上游 QuantBlockLoad Int8→f32 + VecLoad F32),
+        //   禁止 mul.lo.s32 + add.s32 (f32 位模式当 s32 → 数值错, SmolLM2 GPU E2E fail)。
+        let mut l = GpuLower::new(GpuDialect::Ptx { sm_version: 80 });
+        let alloc = empty_alloc();
+        l.lower_instr(&VmInstr::DotProduct {
+            acc: VRegId(0), a: VRegId(1), b: VRegId(2),
+            input_dtype: DotDtype::Int8, width: SimdWidth::Scalar,
+        }, &alloc).unwrap();
+        let ir = l.finalize().unwrap();
+        assert!(ir.contains("fma.rn.f32"),
+            "BCE: DotProduct(Int8) PTX must emit fma.rn.f32 (f32 accumulator): {ir}");
+        assert!(!ir.contains("mul.lo.s32"),
+            "BCE: DotProduct(Int8) PTX must NOT emit mul.lo.s32 (f32 reg as s32 = type mismatch): {ir}");
+        assert!(!ir.contains("add.s32"),
+            "BCE: DotProduct(Int8) PTX must NOT emit add.s32 (f32 acc as s32 = type mismatch): {ir}");
+        // HIP/Metal 也走 f32 fma (cast (float) 对 f32 是 no-op, 语义正确)
+        let mut l = GpuLower::new(GpuDialect::Hip { gfx_arch: 1, wave_size: 64 });
+        l.lower_instr(&VmInstr::DotProduct {
+            acc: VRegId(0), a: VRegId(1), b: VRegId(2),
+            input_dtype: DotDtype::Int8, width: SimdWidth::Scalar,
+        }, &empty_alloc()).unwrap();
+        let ir = l.finalize().unwrap();
+        assert!(ir.contains("fma("),
+            "BCE: DotProduct(Int8) HIP must emit fma (f32 accumulator): {ir}");
+        assert!(!ir.contains("(int)"),
+            "BCE: DotProduct(Int8) HIP must NOT cast (int) (f32 as s32 = type mismatch): {ir}");
+    }
+
+    #[test]
+    fn bce_gpu_scale_apply_int8_no_s32_cvt() {
+        // BCE-20260704-GPU-DOTPRODUCT-INT8-TYPECHAIN (ScaleApply 联动):
+        //   GPU DotProduct(Int8) 累加器已是 f32 (fma.rn.f32), gpu_accumulator_dtype(INT8)==F32。
+        //   ScaleApply input_dtype=INT8 应直接 mul.rn.f32 + add.rn.f32, 禁止 cvt.rn.f32.s32
+        //   (把 f32 位模式当 s32→f32 → 数值错)。
+        let mut l = GpuLower::new(GpuDialect::Ptx { sm_version: 80 });
+        let alloc = empty_alloc();
+        l.lower_instr(&VmInstr::ScaleApply {
+            dst: VRegId(0), acc: VRegId(1), scale: VRegId(2), zero: VRegId(3),
+            input_dtype: crate::compiler::trace::QuantPrecision::INT8,
+            width: SimdWidth::Scalar,
+        }, &alloc).unwrap();
+        let ir = l.finalize().unwrap();
+        assert!(!ir.contains("cvt.rn.f32.s32"),
+            "BCE: ScaleApply(INT8) PTX must NOT emit cvt.rn.f32.s32 (acc is already f32): {ir}");
+        assert!(ir.contains("mul.rn.f32"),
+            "BCE: ScaleApply(INT8) PTX must emit mul.rn.f32 (f32 acc × scale): {ir}");
+        // 有 zero 时应 add.rn.f32
+        assert!(ir.contains("add.rn.f32"),
+            "BCE: ScaleApply(INT8) PTX must emit add.rn.f32 (zero-point add): {ir}");
+    }
+
+    #[test]
+    fn bce_gpu_quant_scalar_cvt_load_ptx_legal() {
+        // BCE-20260704-GPU-DOTPRODUCT-INT8-TYPECHAIN (QuantScalarCvtLoad PTX 合法化):
+        //   旧 PTX 路径 emit CUDA C 语法 (__half2float / device signed char*) 非法 PTX,
+        //   cuModuleLoadData 加载失败。正解: ld.global + cvt.rn.f32 (参照 lower_vec_load_gpu)。
+        let mut l = GpuLower::new(GpuDialect::Ptx { sm_version: 80 });
+        let alloc = empty_alloc();
+        // F16
+        l.lower_instr(&VmInstr::QuantScalarCvtLoad {
+            dst: VRegId(0), base: VRegId(1), offset: 0,
+            src_dtype: ScalarCvtSource::F16, width: SimdWidth::Scalar,
+        }, &alloc).unwrap();
+        // I8
+        l.lower_instr(&VmInstr::QuantScalarCvtLoad {
+            dst: VRegId(0), base: VRegId(1), offset: 4,
+            src_dtype: ScalarCvtSource::I8, width: SimdWidth::Scalar,
+        }, &alloc).unwrap();
+        // U8
+        l.lower_instr(&VmInstr::QuantScalarCvtLoad {
+            dst: VRegId(0), base: VRegId(1), offset: 8,
+            src_dtype: ScalarCvtSource::U8, width: SimdWidth::Scalar,
+        }, &alloc).unwrap();
+        let ir = l.finalize().unwrap();
+        // F16: ld.global.b16 + cvt.rn.f32.f16
+        assert!(ir.contains("ld.global.b16"),
+            "BCE: QuantScalarCvtLoad F16 PTX must emit ld.global.b16: {ir}");
+        assert!(ir.contains("cvt.rn.f32.f16"),
+            "BCE: QuantScalarCvtLoad F16 PTX must emit cvt.rn.f32.f16: {ir}");
+        // I8: ld.global.s8 + cvt.rn.f32.s32
+        assert!(ir.contains("ld.global.s8"),
+            "BCE: QuantScalarCvtLoad I8 PTX must emit ld.global.s8: {ir}");
+        assert!(ir.contains("cvt.rn.f32.s32"),
+            "BCE: QuantScalarCvtLoad I8 PTX must emit cvt.rn.f32.s32: {ir}");
+        // U8: ld.global.u8 + cvt.rn.f32.u32
+        assert!(ir.contains("ld.global.u8"),
+            "BCE: QuantScalarCvtLoad U8 PTX must emit ld.global.u8: {ir}");
+        assert!(ir.contains("cvt.rn.f32.u32"),
+            "BCE: QuantScalarCvtLoad U8 PTX must emit cvt.rn.f32.u32: {ir}");
+        // 禁止 CUDA C 语法 (非法 PTX, cuModuleLoadData 拒绝)
+        assert!(!ir.contains("__half2float"),
+            "BCE: QuantScalarCvtLoad PTX must NOT contain CUDA C __half2float: {ir}");
+        assert!(!ir.contains("device half"),
+            "BCE: QuantScalarCvtLoad PTX must NOT contain CUDA C 'device half' cast: {ir}");
+        assert!(!ir.contains("device signed char"),
+            "BCE: QuantScalarCvtLoad PTX must NOT contain CUDA C 'device signed char' cast: {ir}");
+        assert!(!ir.contains("device unsigned char"),
+            "BCE: QuantScalarCvtLoad PTX must NOT contain CUDA C 'device unsigned char' cast: {ir}");
     }
 
     #[test]

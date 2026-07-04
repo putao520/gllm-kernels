@@ -1552,23 +1552,29 @@ Ok(())
                         }
                     }
                     DotDtype::Int8 => {
-                        // INT8 dot-product: int32_acc += int8_a · int8_b (per-element).
-                        // GPU-001 根治 (BCE-20260704-GPU-VIOLATIONS):
-                        //   旧实现 SM80+ 用 mma.sync.aligned.m16n8k32 (warp 级 tile mma) 违宪 —
-                        //   DotProduct 是 SIMT 标量逐元素点积, 非 warp 级 tile mma。
-                        //   x86 DotProduct(Int8) 用 vpdpbusd (SIMT 向量点积) 是对应参考。
-                        // 正解: 所有 SM 统一走 SIMT 标量路径 — mul.s32 + add.s32。
+                        // INT8 dot-product in DequantFma path: f32_acc += f32_a · f32_b.
+                        // BCE-20260704-GPU-DOTPRODUCT-INT8-TYPE-MISMATCH (SmolLM2-Q4_0 GPU E2E 真根因, P0):
+                        //   DequantFma 路径上游 (quant_gemm.inc.rs:217-219):
+                        //     a = VecLoad { dtype: F32 } 激活 → %f (VRegKind::Vec → prefix_vec="%f")
+                        //     b = QuantBlockLoad { unpack: Int8 } (quant_load.inc.rs:31) → cvt.rn.f32.s32
+                        //         输出到 %f (VRegKind::Vec → dst 是 Vec)
+                        //   两者都是 %f (f32 位模式)。旧 PTX 用 mul.lo.s32 {rs0}, {va}, {vb} 把 f32
+                        //   位模式当 s32 整数乘 → 数值垃圾 (如 -5.0 的 f32 位 0xC0A00000 当 s32 =
+                        //   -1063256064) → logits 错乱 (argmax=38734, golden=253)。
+                        // 根因同类: GPU 所有 DotProduct 整数变体 (Int8/Int4x8/Fp4) 上游已 cvt 到 f32,
+                        //   累加必须用 f32 fma, 不是 s32 mul+add (ARCH-DTYPE-MIXED-PRECISION)。
+                        // 正解: gpu_accumulator_dtype(INT8) == F32 (trace.rs:1120), Int8 dot 走 f32 乘加。
+                        //   PTX: fma.rn.f32 {vc}, {va}, {vb}, {vc}; (vc += va*vb, f32)
+                        //   HIP/Metal: f32 fma (cast (float) 对已是 f32 是 no-op, 安全)
                         match self.dialect {
                             GpuDialect::Ptx { .. } => {
-                                let rs0 = self.scratch_gpr_names[0];
-                                self.emit_line(&format!("mul.lo.s32 {rs0}, {va}, {vb};"));
-                                self.emit_line(&format!("add.s32 {vc}, {vc}, {rs0};"));
+                                self.emit_line(&format!("fma.rn.f32 {vc}, {va}, {vb}, {vc};"));
                             }
                             GpuDialect::Hip { .. } => {
-                                self.emit_line(&format!("{vc} += (int)({va}) * (int)({vb});"));
+                                self.emit_line(&format!("{vc} = fma((float)({va}), (float)({vb}), {vc});"));
                             }
                             GpuDialect::Metal { .. } => {
-                                self.emit_line(&format!("{vc} += (int)({va}) * (int)({vb});"));
+                                self.emit_line(&format!("{vc} = fma((float)({va}), (float)({vb}), {vc});"));
                             }
                         }
                     }
@@ -1735,12 +1741,21 @@ Ok(())
                 let acc_r = self.reg_name_with_kind(*acc, alloc);
                 let sc = self.reg_name_with_kind(*scale, alloc);
                 let z = self.reg_name_with_kind(*zero, alloc);
+                // BCE-20260704-GPU-DOTPRODUCT-INT8-TYPE-MISMATCH (ScaleApply 联动):
+                //   GPU DotProduct(Int8) DequantFma 路径累加器已是 f32 (fma.rn.f32, 见
+                //   lower_dot_product_gpu DotDtype::Int8)。gpu_accumulator_dtype(INT8) == F32
+                //   (trace.rs:1120)。ScaleApply input_dtype=INT8 应理解为"INT8 量化路径的累加器"
+                //   (实际 f32), 不再 cvt s32→f32。
+                //   旧 PTX 用 cvt.rn.f32.s32 {fs0}, {acc_r} 把 f32 位模式当 s32 →f32 → 数值错。
+                //   正解: PTX 直接 mul.rn.f32 {d}, {acc_r}, {sc} (+ add.rn.f32 if zero)。
+                //   HIP/Metal (float) cast 对已是 f32 是 no-op, 保持不变 (语义正确)。
+                //   依据: x86 ScaleApply 用 input_dtype.kind 区分 float/int 累加器;
+                //         GPU gpu_accumulator_dtype 表明 INT8 在 GPU 走 F32 累加。
                 match self.dialect {
                     GpuDialect::Ptx { .. } => {
-                        // Convert int32 → f32, multiply by scale
-                        let fs0 = self.scratch_vec_names[0];
-                        self.emit_line(&format!("cvt.rn.f32.s32 {fs0}, {acc_r};"));
-                        self.emit_line(&format!("mul.rn.f32 {d}, {fs0}, {sc};"));
+                        // acc 已是 f32 (DequantFma 路径 DotProduct Int8/Int4x8/Fp4 累加器均为 f32;
+                        //   纯浮点 dtype 累加器亦为 f32)。直接 mul + add, 不 cvt。
+                        self.emit_line(&format!("mul.rn.f32 {d}, {acc_r}, {sc};"));
                         // Add zero-point if not NONE_VREG (VRegId(0))
                         if *zero != VRegId(0) {
                             self.emit_line(&format!("add.rn.f32 {d}, {d}, {z};"));
@@ -3480,19 +3495,39 @@ Ok(())
                 let off = *offset;
                 match self.dialect {
                     GpuDialect::Ptx { .. } => {
+                        // BCE-20260704-GPU-DOTPRODUCT-INT8-TYPECHAIN (QuantScalarCvtLoad PTX 合法化):
+                        //   旧实现 emit CUDA C 语法 (__half2float / (device signed char*)) 非法 PTX。
+                        //   GPU 用 cuModuleLoadData (executable.rs:504) 加载纯 PTX, CUDA C 语法非法。
+                        // 正解 (参照 lower_vec_load_gpu:246 的 ARCH-GPU-PTX-ADDR 模式, %rd_addr 已在
+                        //   prologue.inc.rs:271 声明):
+                        //   cvt.u64.s64 %rd_addr, {off}; add.u64 %rd_addr, %rd_addr, {b};
+                        //   ld.global.b16/b8 + cvt.rn.f32.f16/s8/u8 → {d}
+                        //   (off 是 i64 字节偏移; b 是 64-bit 指针寄存器 %rd)
+                        let fs0 = self.scratch_vec_names[0]; // F16 临时
+                        let rs0 = self.scratch_gpr_names[0]; // I8/U8 临时
                         match src_dtype {
                             ScalarCvtSource::F16 => {
-                                self.emit_line(&format!("  {d} = __half2float(((device half*)({b}))[{}]));", off));
+                                self.emit_line(&format!("cvt.u64.s64 %rd_addr, {off};"));
+                                self.emit_line(&format!("add.u64 %rd_addr, %rd_addr, {b};"));
+                                self.emit_line(&format!("ld.global.b16 {fs0}, [%rd_addr];"));
+                                self.emit_line(&format!("cvt.rn.f32.f16 {d}, {fs0};  // QuantScalarCvtLoad F16→F32"));
                             }
                             ScalarCvtSource::I8 => {
-                                self.emit_line(&format!("  {d} = (float)(((device signed char*)({b}))[{}]);", off));
+                                self.emit_line(&format!("cvt.u64.s64 %rd_addr, {off};"));
+                                self.emit_line(&format!("add.u64 %rd_addr, %rd_addr, {b};"));
+                                self.emit_line(&format!("ld.global.s8 {rs0}, [%rd_addr];"));
+                                self.emit_line(&format!("cvt.rn.f32.s32 {d}, {rs0};  // QuantScalarCvtLoad I8→F32"));
                             }
                             ScalarCvtSource::U8 => {
-                                self.emit_line(&format!("  {d} = (float)(((device unsigned char*)({b}))[{}]);", off));
+                                self.emit_line(&format!("cvt.u64.s64 %rd_addr, {off};"));
+                                self.emit_line(&format!("add.u64 %rd_addr, %rd_addr, {b};"));
+                                self.emit_line(&format!("ld.global.u8 {rs0}, [%rd_addr];"));
+                                self.emit_line(&format!("cvt.rn.f32.u32 {d}, {rs0};  // QuantScalarCvtLoad U8→F32"));
                             }
                         }
                     }
                     _ => {
+                        // HIP/Metal 用 nvrtc/clang 编译, CUDA C 语法合法。
                         match src_dtype {
                             ScalarCvtSource::F16 => {
                                 self.emit_line(&format!("  {d} = float_from_half(((device half*)({b}))[{}]));", off));
