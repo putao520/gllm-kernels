@@ -224,6 +224,21 @@ struct LoopLocals {
     seq_bound_override: Option<BoundExpr>,
     /// §0.2.8 ActivationSwap ping-pong buffer VReg 对 (None = 无层循环 / 无 sentinel slot).
     activation_swap_vregs: Option<(VRegId, VRegId)>,
+    /// §diagnostic-layer-capture: capture region base VReg + per-layer stride.
+    /// None when diagnostic-layer-capture feature is disabled or no capture region allocated.
+    /// When Some, emit_layer_capture_copy is called before ActivationSwap at each
+    /// layer iteration boundary, copying the pong buffer to capture_base + counter×stride.
+    layer_capture: Option<LayerCaptureInfo>,
+}
+
+/// §diagnostic-layer-capture: capture region info for ring-buffer layer capture.
+struct LayerCaptureInfo {
+    /// VReg holding capture_base = scratch_base + layer_capture_offset
+    capture_base: VRegId,
+    /// Per-layer stride in bytes (max_seq_len × hidden × elem_bytes)
+    per_layer_stride: usize,
+    /// Hidden dimension (elements per row)
+    hidden_dim: usize,
 }
 
 pub(super) fn emit_fusion_groups(
@@ -302,6 +317,47 @@ pub(super) fn emit_fusion_groups(
         None
     };
 
+    // §diagnostic-layer-capture: allocate capture_base VReg if capture region exists.
+    // The capture region is allocated in buffer_alloc when the
+    // `diagnostic-layer-capture` feature is enabled. capture_base =
+    // scratch_base + layer_capture_offset. The per-layer side-channel copy
+    // is emitted at each layer iteration boundary (close_layer_loop /
+    // handle_standard_layer_loop exit) BEFORE ActivationSwap.
+    let layer_capture: Option<LayerCaptureInfo> = {
+        #[cfg(not(feature = "diagnostic-layer-capture"))]
+        {
+            None
+        }
+        #[cfg(feature = "diagnostic-layer-capture")]
+        {
+            if fctx.alloc.layer_capture_bytes > 0 && fctx.alloc.layer_capture_stride > 0 {
+                let capture_base = prog.alloc_vreg(VRegKind::Ptr, SimdWidth::Scalar);
+                prog.emit(VmInstr::AddPtr {
+                    dst: capture_base,
+                    base: scratch_base,
+                    offset: fctx.alloc.layer_capture_offset,
+                });
+                // Derive hidden_dim from the per-layer stride.
+                // stride = max_seq_len × hidden × elem_bytes (F32 → 4 bytes)
+                // hidden = stride / (max_seq_len × 4)
+                let max_seq = fctx.graph.max_seq_len.max(1);
+                let elem_bytes = crate::types::DType::F32.size_bytes();
+                let hidden_dim = fctx.alloc.layer_capture_stride / (max_seq * elem_bytes);
+                if hidden_dim > 0 {
+                    Some(LayerCaptureInfo {
+                        capture_base,
+                        per_layer_stride: fctx.alloc.layer_capture_stride,
+                        hidden_dim,
+                    })
+                } else {
+                    None
+                }
+            } else {
+                None
+            }
+        }
+    };
+
     let locals = LoopLocals {
         input_ptr,
         weight_ptr,
@@ -309,6 +365,7 @@ pub(super) fn emit_fusion_groups(
         scratch_base,
         seq_bound_override,
         activation_swap_vregs,
+        layer_capture,
     };
 
     // BCE-20260702-GPU-OOM: per-group RSS probe to locate the exact fusion group
@@ -346,7 +403,7 @@ pub(super) fn emit_fusion_groups(
 
     // Close layer loop if still open (all groups were layer ops)
     if state.in_layer_loop {
-        close_layer_loop(prog, &mut state, &locals, width, layer_loop_cfg, fctx.original_weight_vreg);
+        close_layer_loop(prog, &mut state, &locals, width, layer_loop_cfg, fctx.original_weight_vreg, dtype);
     }
 
     // Write back mutated ABI state to caller.
@@ -379,7 +436,25 @@ fn close_layer_loop(
     width: SimdWidth,
     layer_loop_cfg: Option<&crate::compiler::graph::LayerLoopConfig>,
     original_weight_vreg: Option<VRegId>,
+    dtype: QuantPrecision,
 ) {
+    // §diagnostic-layer-capture: emit counter-scaled side-channel copy BEFORE
+    // ActivationSwap. The pong buffer holds the current layer's output; we
+    // copy it to capture_base + layer_loop_counter × per_layer_stride.
+    // This must happen BEFORE the swap so we capture the just-written buffer.
+    #[cfg(feature = "diagnostic-layer-capture")]
+    {
+        if let Some(ref cap) = locals.layer_capture {
+            if let Some(counter) = state.abi.layer_loop_counter {
+                if let Some((_, pong)) = locals.activation_swap_vregs {
+                    let _ = super::structural_builder::StructuralOpBuilder::emit_layer_capture_copy(
+                        prog, pong, cap.capture_base, counter,
+                        cap.per_layer_stride, cap.hidden_dim, width, dtype,
+                    );
+                }
+            }
+        }
+    }
     // §0.2.8 ActivationSwap: 最终层迭代末尾交换 ping-pong buffer
     if let Some((ping, pong)) = locals.activation_swap_vregs {
         prog.emit(VmInstr::ActivationSwap { ptr_a: ping, ptr_b: pong });
@@ -801,6 +876,21 @@ fn handle_standard_layer_loop(
 
     // ── Layer loop exit: emit ActivationSwap + LoopEnd, adjust weight_ptr for globals ──
     if !group.is_layer_group && state.in_layer_loop {
+        // §diagnostic-layer-capture: emit counter-scaled side-channel copy BEFORE
+        // ActivationSwap. The pong buffer holds the current layer's output.
+        #[cfg(feature = "diagnostic-layer-capture")]
+        {
+            if let Some(ref cap) = locals.layer_capture {
+                if let Some(counter) = state.abi.layer_loop_counter {
+                    if let Some((_, pong)) = locals.activation_swap_vregs {
+                        let _ = super::structural_builder::StructuralOpBuilder::emit_layer_capture_copy(
+                            prog, pong, cap.capture_base, counter,
+                            cap.per_layer_stride, cap.hidden_dim, width, ctx.dtype,
+                        );
+                    }
+                }
+            }
+        }
         // §0.2.8 ActivationSwap: 每层迭代末尾交换 ping-pong buffer 指针
         if let Some((ping, pong)) = locals.activation_swap_vregs {
             prog.emit(VmInstr::ActivationSwap { ptr_a: ping, ptr_b: pong });

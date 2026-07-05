@@ -167,6 +167,59 @@ impl StructuralOpBuilder {
         });
         Ok(())
     }
+
+    /// §diagnostic-layer-capture: Emit a counter-scaled side-channel copy that
+    /// captures the current layer's activation output into a ring buffer.
+    ///
+    /// Computes `dst = capture_base + layer_loop_counter × per_layer_stride`
+    /// using GprBinOp (Mul + Add), then copies `hidden_dim` elements from
+    /// `src_ptr` (typically the pong activation buffer) to the computed dst.
+    ///
+    /// This is inserted at the end of each layer iteration, BEFORE the
+    /// ActivationSwap, so it captures the layer's output while it's still
+    /// in the write buffer. The `layer_loop_counter` VReg provides the
+    /// per-iteration index that scales the destination offset.
+    ///
+    /// Only called when `diagnostic-layer-capture` feature is enabled and
+    /// the capture region is allocated (layer_capture_bytes > 0).
+    pub fn emit_layer_capture_copy(
+        prog: &mut VmProgram,
+        src_ptr: VRegId,
+        capture_base: VRegId,
+        layer_loop_counter: VRegId,
+        per_layer_stride: usize,
+        hidden_dim: usize,
+        width: SimdWidth,
+        dtype: QuantPrecision,
+    ) -> Result<(), CompilerError> {
+        // Compute dst = capture_base + counter × stride
+        // Step 1: stride_val = counter × per_layer_stride (GprBinOp Mul)
+        let stride_gpr = prog.alloc_vreg(VRegKind::ByteOffset, SimdWidth::Scalar);
+        let stride_imm = prog.alloc_vreg(VRegKind::ByteOffset, SimdWidth::Scalar);
+        prog.emit(VmInstr::GprLoadImm {
+            dst: stride_imm,
+            value: per_layer_stride,
+        });
+        prog.emit(VmInstr::GprBinOp {
+            dst: stride_gpr,
+            a: layer_loop_counter,
+            b: GprOperand::VReg(stride_imm),
+            op: GprOp::Mul,
+        });
+        // Step 2: dst_ptr = capture_base + stride_val (GprBinOp Add)
+        let dst_ptr = prog.alloc_vreg(VRegKind::Ptr, SimdWidth::Scalar);
+        prog.emit(VmInstr::GprBinOp {
+            dst: dst_ptr,
+            a: capture_base,
+            b: GprOperand::VReg(stride_gpr),
+            op: GprOp::Add,
+        });
+        // Step 3: side-channel copy src → dst (hidden_dim elements)
+        Self::emit_side_channel_copy(
+            prog, src_ptr, dst_ptr, 0, hidden_dim, width, dtype,
+        )?;
+        Ok(())
+    }
 }
 
 #[cfg(test)]

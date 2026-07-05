@@ -35,6 +35,11 @@ onednn = []
 accelerate = []
 nccl = ["dep:gllm-nccl"]
 experimental = []
+# Diagnostic layer-capture: allocates a per-layer ring buffer in scratchpad
+# and emits side-channel copies at each layer iteration boundary. Enables
+# single-forward bisection for logits divergence root-causing.
+# Zero overhead when disabled (default): no capture region, no extra VmInstrs.
+diagnostic-layer-capture = []
 
 [dev-dependencies]
 criterion = "0.5"

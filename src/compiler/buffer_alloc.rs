@@ -106,6 +106,17 @@ pub struct BufferAllocation {
     /// §0.2.3 R3: Tensor → 物理位置分类 (Activation/Weight/Intermediate/Output)
     /// 在 buffer 分配阶段一次性推导，ISA Lowering codegen 直接消费。
     pub tensor_sources: HashMap<TensorId, TensorPtrSource>,
+    /// §diagnostic-layer-capture: Ring-buffer capture region offset in scratchpad.
+    /// When `diagnostic-layer-capture` feature is enabled, this region holds
+    /// per-layer activation snapshots (num_layers × max_seq_len × hidden × elem_bytes).
+    /// Zero when the feature is disabled (production: zero overhead).
+    pub layer_capture_offset: usize,
+    /// §diagnostic-layer-capture: Total bytes of the ring-buffer capture region.
+    /// Zero when the feature is disabled.
+    pub layer_capture_bytes: usize,
+    /// §diagnostic-layer-capture: Per-layer stride in bytes (= max_seq_len × hidden × elem_bytes).
+    /// Used by codegen to scale layer_loop_counter for the destination offset.
+    pub layer_capture_stride: usize,
 }
 
 impl BufferAllocation {
@@ -354,6 +365,9 @@ pub fn allocate_buffers(lifetimes: &[Lifetime]) -> BufferAllocation {
         activation_slots: HashMap::new(),
         skipped_virtual: HashSet::new(),
         tensor_sources: HashMap::new(),
+        layer_capture_offset: 0,
+        layer_capture_bytes: 0,
+        layer_capture_stride: 0,
     }
 }
 
@@ -548,11 +562,27 @@ pub fn allocate_buffers_aligned(
     // ISA Lowering codegen 直接消费, 无需独立推导。
     let tensor_sources = build_tensor_sources(graph, &slots, &activation_tids, activation_buffer_size, vam);
 
+    // §diagnostic-layer-capture: Ring-buffer capture region allocation.
+    //
+    // When `diagnostic-layer-capture` feature is enabled, allocate a per-layer
+    // capture region in the scratchpad. The region size is:
+    //   num_layers × max_seq_len × hidden × elem_bytes
+    // The capture offset is placed after all intermediate tensors (total_bytes),
+    // aligned to the cache line. The per-layer stride is:
+    //   max_seq_len × hidden × elem_bytes
+    //
+    // When the feature is disabled (default), capture_offset = capture_bytes = 0
+    // → no scratchpad overhead, no VmInstr emission. Zero production overhead.
+    let (layer_capture_offset, layer_capture_bytes, layer_capture_stride) =
+        compute_layer_capture_region(graph, total_bytes, align);
+
+    // When capture region is allocated, extend total_bytes to cover it.
+    let total_bytes_with_capture = total_bytes + layer_capture_bytes;
 
     BufferAllocation {
         num_tensors: slots.len(),
         slots,
-        total_bytes,
+        total_bytes: total_bytes_with_capture,
         bytes_saved: naive_total.saturating_sub(total_bytes)
             + skipped_virtual.iter().filter_map(|tid| graph.tensor(*tid).map(|t| t.concrete_bytes())).sum::<usize>()
             + activation_lifetimes.iter().map(|lt| lt.size_bytes).sum::<usize>().saturating_sub(2 * activation_buffer_size),
@@ -560,7 +590,88 @@ pub fn allocate_buffers_aligned(
         activation_slots,
         skipped_virtual,
         tensor_sources,
+        layer_capture_offset,
+        layer_capture_bytes,
+        layer_capture_stride,
     }
+}
+
+/// §diagnostic-layer-capture: Compute the ring-buffer capture region dimensions.
+///
+/// Returns `(offset, total_bytes, per_layer_stride)`. All zero when the
+/// `diagnostic-layer-capture` feature is disabled (production: zero overhead).
+///
+/// When enabled, allocates `num_layers × max_seq_len × hidden × 4` bytes
+/// after the intermediate tensor region, aligned to `align`.
+fn compute_layer_capture_region(
+    graph: &CompilerGraph,
+    base_offset: usize,
+    align: usize,
+) -> (usize, usize, usize) {
+    #[cfg(not(feature = "diagnostic-layer-capture"))]
+    {
+        // Production: zero overhead. No capture region allocated.
+        let _ = (graph, base_offset, align);
+        (0, 0, 0)
+    }
+    #[cfg(feature = "diagnostic-layer-capture")]
+    {
+        // Only allocate when there's a layer loop (generative model).
+        let num_layers = graph.layer_loop_config.as_ref()
+            .map(|c| c.num_layers)
+            .or_else(|| graph.hetero_layer_loop_config.as_ref().map(|c| {
+                c.num_segments * (c.sliding_per_segment + 1)
+            }));
+        let Some(num_layers) = num_layers else {
+            return (0, 0, 0);
+        };
+        if num_layers == 0 {
+            return (0, 0, 0);
+        }
+        // Derive hidden from the activation input tensor's last concrete dim.
+        // Fallback: scan GEMM ops for K dimension.
+        let hidden = derive_capture_hidden(graph);
+        if hidden == 0 {
+            return (0, 0, 0);
+        }
+        let max_seq_len = graph.max_seq_len.max(1);
+        // Compute dtype is F32 (see graph_dtype in context.inc.rs).
+        let elem_bytes = DType::F32.size_bytes();
+        let per_layer_stride = max_seq_len * hidden * elem_bytes;
+        let total_bytes = num_layers * per_layer_stride;
+        // Align the capture offset.
+        let aligned_offset = (base_offset + align - 1) & !(align - 1);
+        (aligned_offset, total_bytes, per_layer_stride)
+    }
+}
+
+/// §diagnostic-layer-capture: Derive hidden dimension from the graph for capture sizing.
+///
+/// Strategy: find the activation input tensor (first non-weight input) and
+/// return its last concrete dimension. Fallback: scan GEMM ops for K.
+#[cfg(feature = "diagnostic-layer-capture")]
+fn derive_capture_hidden(graph: &CompilerGraph) -> usize {
+    // Look for the activation input tensor (graph.inputs[0] typically).
+    for (i, &tid) in graph.inputs.iter().enumerate() {
+        let Some(tensor) = graph.tensors.get(tid.0 as usize) else { continue };
+        if i == 0 {
+            // Activation input: shape [seq_len, hidden]
+            if tensor.shape.len() == 2 {
+                if let Some(last) = tensor.shape.last() {
+                    if let crate::compiler::graph::SymDim::Concrete(v) = last {
+                        return *v;
+                    }
+                }
+            }
+        }
+    }
+    // Fallback: scan GEMM ops for K dimension.
+    for op in &graph.ops {
+        if let Some((_, _, k)) = op.op_gemm_dims(graph) {
+            return k;
+        }
+    }
+    0
 }
 
 /// R3: 构建 tensor → TensorPtrSource 分类映射
@@ -1253,6 +1364,9 @@ mod tests {
             activation_slots: HashMap::new(),
             skipped_virtual: HashSet::new(),
             tensor_sources: HashMap::new(),
+            layer_capture_offset: 0,
+            layer_capture_bytes: 0,
+            layer_capture_stride: 0,
         };
         assert_eq!(alloc.offset_of(TensorId(0)), Some(0));
         assert_eq!(alloc.offset_of(TensorId(1)), Some(128));
@@ -1272,6 +1386,9 @@ mod tests {
             activation_slots: HashMap::new(),
             skipped_virtual: HashSet::new(),
             tensor_sources: HashMap::new(),
+            layer_capture_offset: 0,
+            layer_capture_bytes: 0,
+            layer_capture_stride: 0,
         };
         assert_eq!(alloc.offset_of(TensorId(999)), None);
     }
@@ -1287,6 +1404,9 @@ mod tests {
             activation_slots: HashMap::new(),
             skipped_virtual: HashSet::new(),
             tensor_sources: HashMap::new(),
+            layer_capture_offset: 0,
+            layer_capture_bytes: 0,
+            layer_capture_stride: 0,
         };
         let cloned = alloc.clone();
         assert_eq!(cloned.num_tensors, 1);
@@ -1710,6 +1830,9 @@ mod tests {
             activation_slots: HashMap::new(),
             skipped_virtual: HashSet::new(),
             tensor_sources: HashMap::new(),
+            layer_capture_offset: 0,
+            layer_capture_bytes: 0,
+            layer_capture_stride: 0,
         };
         // Act
         let result = alloc.offset_of(TensorId(5));
