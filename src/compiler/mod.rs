@@ -533,7 +533,7 @@ impl InferenceCompiler {
             matches!(op.op_resolved(&graph), Some(graph::Op::SgDetect { .. }) | Some(graph::Op::SgInject { .. }))
         });
 
-        let buffer_layout = mega_kernel_abi::BufferLayout::from_graph_geometry(
+        let mut buffer_layout = mega_kernel_abi::BufferLayout::from_graph_geometry(
             &geometry, config.max_seq_len, sg_enabled,
         );
 
@@ -598,6 +598,11 @@ impl InferenceCompiler {
             Some(&virtual_tensor_map), Some(&virtual_activation), &graph,
             Some(&layout_assignment),
         );
+        // Ring-Buffer 逐层捕获: 从 BufferAllocation 复制 capture 区域到 BufferLayout (对外暴露).
+        // diagnostic-layer-capture feature 关时 alloc.layer_capture_bytes=0, 无影响.
+        buffer_layout.layer_capture_offset = alloc.layer_capture_offset;
+        buffer_layout.layer_capture_stride = alloc.layer_capture_stride;
+        buffer_layout.layer_capture_bytes = alloc.layer_capture_bytes;
 
         #[cfg(feature = "jit-x86")]
         {
@@ -860,7 +865,7 @@ impl InferenceCompiler {
             matches!(op.op_resolved(&graph), Some(graph::Op::SgDetect { .. }) | Some(graph::Op::SgInject { .. }))
         });
 
-        let buffer_layout = mega_kernel_abi::BufferLayout::from_graph_geometry(
+        let mut buffer_layout = mega_kernel_abi::BufferLayout::from_graph_geometry(
             &geometry, config.max_seq_len, sg_enabled,
         );
 
@@ -943,6 +948,11 @@ impl InferenceCompiler {
             Some(&virtual_tensor_map), Some(&virtual_activation), &graph,
             Some(&layout_assignment),
         );
+        // Ring-Buffer 逐层捕获: 从 BufferAllocation 复制 capture 区域到 BufferLayout (对外暴露).
+        // diagnostic-layer-capture feature 关时 alloc.layer_capture_bytes=0, 无影响.
+        buffer_layout.layer_capture_offset = alloc.layer_capture_offset;
+        buffer_layout.layer_capture_stride = alloc.layer_capture_stride;
+        buffer_layout.layer_capture_bytes = alloc.layer_capture_bytes;
         // [OOM-PROBE Stage 12] buffer_alloc — 全 VReg 物化疑点 (architect 主因)。
         // total_bytes = scratchpad 总字节; max_slot_size = 单 buffer 最大 (logits 级 ~ vocab*seq*4); num_slots = 物化 buffer 数。
         {
@@ -1354,6 +1364,9 @@ mod tests {
             sampling_workspace_offset: 0, sampling_workspace_bytes: 0,
             sg_detect_offset: 0, sg_knowledge_offset: 0,
             sg_data_bytes: 0,
+            layer_capture_offset: 0,
+            layer_capture_stride: 0,
+            layer_capture_bytes: 0,
             total_scratchpad_bytes: 0,
         };
         let output = MegaKernelCompileOutput {
@@ -1784,6 +1797,9 @@ mod tests {
                 sampling_workspace_offset: 0, sampling_workspace_bytes: 0,
                 sg_detect_offset: 0, sg_knowledge_offset: 0,
                 sg_data_bytes: 0,
+            layer_capture_offset: 0,
+            layer_capture_stride: 0,
+            layer_capture_bytes: 0,
                 total_scratchpad_bytes: 0,
             },
             num_layers: 1,
@@ -1813,6 +1829,9 @@ mod tests {
             sampling_workspace_offset: 0, sampling_workspace_bytes: 0,
             sg_detect_offset: 0, sg_knowledge_offset: 0,
             sg_data_bytes: 0,
+            layer_capture_offset: 0,
+            layer_capture_stride: 0,
+            layer_capture_bytes: 0,
             total_scratchpad_bytes: 0,
         };
         assert_eq!(layout.activation_bytes, 0);

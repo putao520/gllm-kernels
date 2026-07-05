@@ -691,6 +691,12 @@ pub struct BufferLayout {
     pub sg_knowledge_offset: usize,
     /// SG data total bytes (0 when sg disabled)
     pub sg_data_bytes: usize,
+    /// Ring-Buffer 逐层捕获区基址 (diagnostic-layer-capture feature 开启时, 0 生产关闭).
+    pub layer_capture_offset: usize,
+    /// Ring-Buffer 每层 stride (seq_len × hidden × elem_bytes).
+    pub layer_capture_stride: usize,
+    /// Ring-Buffer 总 bytes (num_layers × stride, 0 生产关闭).
+    pub layer_capture_bytes: usize,
     /// Total scratchpad size required.
     pub total_scratchpad_bytes: usize,
 }
@@ -782,6 +788,9 @@ impl BufferLayout {
             sg_detect_offset,
             sg_knowledge_offset,
             sg_data_bytes,
+            layer_capture_offset: 0,
+            layer_capture_stride: 0,
+            layer_capture_bytes: 0,
             total_scratchpad_bytes: off,
         }
     }
