@@ -1343,6 +1343,12 @@ pub(crate) fn emit_gemm_trans_b_inline(
     // SmolLM2: c=F32(4) b=BF16(2), b_row_stride=k*2=1152, c_elem=4 → 1152/4=288 (整除).
     let j_b_stride_ratio = if c_elem > 0 { b_row_stride / c_elem } else { 0 };
     let k_step = lanes * b_elem;
+    // BCE-20260706-MIXED-GEMM-STRIDE: 混合精度 trans_b GEMM (a_elem≠b_elem) 时,
+    // A 和 B 的 K维 byte offset 步长不同. p_off 以 k_step=lanes*b_elem 步进 (对 B 正确),
+    // 但 A (a_elem) 需 p_off * (a_elem/b_elem). a_b_ratio = a_elem/b_elem, 需 b_elem|a_elem.
+    // SmolLM2: a=F32(4) b=BF16(2) → ratio=2. A offset = p_off*2 (补回 F32 比 BF16 宽 2x).
+    // 不整除时回退 ratio=1 (同 dtype 路径, 行为不变).
+    let a_b_ratio = if b_elem > 0 && a_elem >= b_elem && a_elem % b_elem == 0 { a_elem / b_elem } else { 1 };
 
     let acc_vec = prog.alloc_vreg(VRegKind::Vec, width);
     let a_vec = prog.alloc_vreg(VRegKind::Vec, width);
@@ -1366,13 +1372,19 @@ pub(crate) fn emit_gemm_trans_b_inline(
             if k_vecs > 0 {
                 prog.emit_loop(BoundExpr::Const(k_vecs), k_step, |prog, _p_ctr, p_off| {
                     // Load A[i][p*lanes .. (p+1)*lanes] — A 按 a_dtype (F32) 存储
+                    // BCE-20260706-MIXED-GEMM-STRIDE: A 的 K维 byte offset = p*lanes*a_elem,
+                    // 但 p_off 以 k_step=lanes*b_elem 步进. a_elem≠b_elem 时需 p_off * a_b_ratio.
+                    let a_p_off = OffsetExpr::Mul(
+                        Box::new(OffsetExpr::LoopOffset(p_off)),
+                        a_b_ratio,
+                    );
                     prog.emit(VmInstr::VecLoad {
                         dst: a_vec, base: a_ptr,
                         offset: OffsetExpr::Add(
                             Box::new(OffsetExpr::Mul(
                                 Box::new(m_off.clone()), a_row_stride,
                             )),
-                            Box::new(OffsetExpr::LoopOffset(p_off)),
+                            Box::new(a_p_off),
                         ),
                         width, dtype: a_dtype, predicate: None,
                     });
@@ -1394,16 +1406,18 @@ pub(crate) fn emit_gemm_trans_b_inline(
 
             if k_tail > 0 {
                 let tail_base = k_vecs * lanes * b_elem;
+                let tail_base_a = k_vecs * lanes * a_elem; // BCE-20260706: A 的 tail 起始 (a_elem)
                 prog.emit(VmInstr::Broadcast {
                     dst: s_tail, src: ScalarExpr::Const(0.0), width: s_width, dtype: acc_dtype,
                 });
                 for t in 0..k_tail {
-                    let p_byte = tail_base + t * b_elem;
+                    let p_byte = tail_base + t * b_elem;       // B tail offset
+                    let p_byte_a = tail_base_a + t * a_elem;    // A tail offset (BCE-20260706)
                     prog.emit(VmInstr::Broadcast {
                         dst: s_acc,
                         src: ScalarExpr::MemLoad(a_ptr, OffsetExpr::Add(
                             Box::new(OffsetExpr::Mul(Box::new(m_off.clone()), a_row_stride)),
-                            Box::new(OffsetExpr::Const(p_byte)),
+                            Box::new(OffsetExpr::Const(p_byte_a)),
                         )),
                         width: s_width, dtype: a_dtype,
                     });

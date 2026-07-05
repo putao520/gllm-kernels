@@ -6146,6 +6146,9 @@ mod tests {
             sg_knowledge_offset: 0,
             sg_data_bytes: 0,
             total_scratchpad_bytes: 0,
+            layer_capture_offset: 0,
+            layer_capture_stride: 0,
+            layer_capture_bytes: 0,
         };
 
         // Assert: all offsets and sizes must be zero for an empty layout
