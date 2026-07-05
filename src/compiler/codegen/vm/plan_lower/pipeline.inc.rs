@@ -330,6 +330,7 @@ pub(super) fn emit_fusion_groups(
         }
         #[cfg(feature = "diagnostic-layer-capture")]
         {
+            eprintln!("[CAP-ALLOC] alloc.layer_capture_offset={} bytes={} stride={}", fctx.alloc.layer_capture_offset, fctx.alloc.layer_capture_bytes, fctx.alloc.layer_capture_stride);
             if fctx.alloc.layer_capture_bytes > 0 && fctx.alloc.layer_capture_stride > 0 {
                 let capture_base = prog.alloc_vreg(VRegKind::Ptr, SimdWidth::Scalar);
                 prog.emit(VmInstr::AddPtr {
@@ -398,8 +399,37 @@ pub(super) fn emit_fusion_groups(
         )?;
     }
 
+    #[cfg(feature = "diagnostic-layer-capture")]
+    {
+        eprintln!("[CAP-SEQ] VmInstr around capture (instrs 385-415):");
+        for (i, instr) in prog.instrs.iter().enumerate() {
+            if (385..415).contains(&i) {
+                eprintln!("  [{}] {:?}", i, instr);
+            }
+        }
+    }
+
     // Close any pending guard run after all groups processed
     close_pending_guard_run(prog, &mut state);
+
+    // §diagnostic-layer-capture: dump VmInstr sequence around LoopBegin/capture/LoopEnd
+    #[cfg(feature = "diagnostic-layer-capture")]
+    {
+        eprintln!("[CAP-SEQ] VmInstr sequence (LoopBegin/ActivationSwap/capture/LoopEnd):");
+        for (i, instr) in prog.instrs.iter().enumerate() {
+            let mark = match instr {
+                VmInstr::LoopBegin { .. } => Some("LoopBegin"),
+                VmInstr::LoopEnd => Some("LoopEnd"),
+                VmInstr::ActivationSwap { .. } => Some("ActivationSwap"),
+                VmInstr::GprBinOp { op: GprOp::Mul, .. } => Some("GprMul(capture?)"),
+                VmInstr::GprLoadImm { value, .. } if *value > 1000000 => Some("GprLoadImm(big)"),
+                _ => None,
+            };
+            if let Some(m) = mark {
+                eprintln!("  [{}] {} {:?}", i, m, instr);
+            }
+        }
+    }
 
     // Close layer loop if still open (all groups were layer ops)
     if state.in_layer_loop {
@@ -809,6 +839,7 @@ fn handle_standard_layer_loop(
     let width = ctx.session.width;
 
     // ── Layer loop entry: emit LoopBegin + compute layer_weight_base ──
+    eprintln!("[LOOP-DBG] handle_standard: group.is_layer_group={} state.in_layer_loop={} marker={:?}", group.is_layer_group, state.in_layer_loop, group.marker);
     if group.is_layer_group && !state.in_layer_loop {
         if let Some(cfg) = layer_loop_cfg {
             let counter = prog.alloc_vreg(VRegKind::Counter, SimdWidth::Scalar);

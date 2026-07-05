@@ -28,6 +28,7 @@ impl StructuralOpBuilder {
         let step = width.f32_lanes();
         let byte_step = step * elem_bytes;
         let iterations = (hidden_dim + step - 1) / step;
+        eprintln!("[CAP-COPY] emit_side_channel_copy: hidden_dim={} width={:?} step={} byte_step={} iterations={}", hidden_dim, width, step, byte_step, iterations);
         let ctr = prog.alloc_vreg(VRegKind::Counter, SimdWidth::Scalar);
         let byte_off = prog.alloc_vreg(VRegKind::ByteOffset, SimdWidth::Scalar);
         prog.emit(VmInstr::LoopBegin {
@@ -215,6 +216,7 @@ impl StructuralOpBuilder {
             op: GprOp::Add,
         });
         // Step 3: side-channel copy src → dst (hidden_dim elements)
+        eprintln!("[CAP-EMIT] emit_layer_capture_copy: src_ptr={:?} capture_base={:?} counter={:?} stride={} hidden={}", src_ptr, capture_base, layer_loop_counter, per_layer_stride, hidden_dim);
         Self::emit_side_channel_copy(
             prog, src_ptr, dst_ptr, 0, hidden_dim, width, dtype,
         )?;
