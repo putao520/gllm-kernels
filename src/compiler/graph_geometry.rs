@@ -29,6 +29,17 @@ pub struct GraphDerivedGeometry {
     /// Storage dtype — most common weight tensor dtype (BF16/F16/F32).
     /// Used by `WeightLayout` for simplified weight offset calculation.
     pub storage_dtype: DType,
+    /// Whether any weight tensor uses a quantized (INT/low-bit-float) dtype.
+    ///
+    /// SPEC §11 (00-PHILOSOPHY): TurboQuant handles *additional* quantization
+    /// (INT4/FP4/FP6) on top of the model's native precision. Native floating
+    /// weights (F32/BF16/F16) do NOT trigger TurboQuant — only weight tensors
+    /// stored in a quantized format (U8/F8E4M3/F8E5M2/F6E3M2/F6E2M3/F4E2M1) do.
+    ///
+    /// This decouples the TurboQuant trigger from `compute_dtype`, which is an
+    /// accumulator-precision knob (BF16 compute on native-BF16 hardware must NOT
+    /// enable TurboQuant). See KB `derive-compute-dtype-unconstitution.md` §阶段 3.1.
+    pub is_weight_quantized: bool,
     pub rms_eps: f32,
     pub rope_theta: f64,
     pub rope_partial: f32,
@@ -49,6 +60,7 @@ impl GraphDerivedGeometry {
             vocab_size: 0,
             compute_dtype: DType::F32,
             storage_dtype: DType::F32,
+            is_weight_quantized: false,
             rms_eps: 1e-5,
             rope_theta: 10000.0,
             rope_partial: 1.0,
@@ -126,6 +138,12 @@ impl GraphDerivedGeometry {
         // uses per-tensor dtype via graph.weight_layout(), not this field.
         let compute_dtype = derive_compute_dtype(storage_dtype, device);
 
+        // SPEC §11: TurboQuant trigger — whether any weight tensor uses a
+        // quantized (INT/low-bit-float) dtype. Decoupled from compute_dtype so
+        // native BF16 compute on BF16 hardware does NOT spuriously enable
+        // TurboQuant (which is only for *additional* INT4/FP4/FP6 quantization).
+        let is_weight_quantized = derive_is_weight_quantized(graph);
+
         Ok(Self {
             hidden,
             num_layers,
@@ -136,6 +154,7 @@ impl GraphDerivedGeometry {
             vocab_size: vocab_size.unwrap_or(0),
             compute_dtype,
             storage_dtype,
+            is_weight_quantized,
             rms_eps: rms_eps.unwrap_or(1e-5),
             rope_theta: rope_theta.unwrap_or(10000.0),
             rope_partial: rope_partial.unwrap_or(1.0),
@@ -211,6 +230,33 @@ fn derive_storage_dtype(graph: &CompilerGraph) -> DType {
     } else {
         DType::F32
     }
+}
+
+/// Derive whether any weight tensor uses a quantized (INT/low-bit-float) dtype.
+///
+/// Scans weight (input) tensors (skipping the first activation input) for
+/// quantized dtypes: U8, F8E4M3, F8E5M2, F6E3M2, F6E2M3, F4E2M1.
+///
+/// SPEC §11 (00-PHILOSOPHY): TurboQuant handles *additional* quantization
+/// (INT4/FP4/FP6). Native floating weights (F32/BF16/F16) do NOT trigger
+/// TurboQuant. This is distinct from `derive_storage_dtype`, which deliberately
+/// ignores quantized dtypes (it only reports the dominant *float* storage dtype).
+fn derive_is_weight_quantized(graph: &CompilerGraph) -> bool {
+    // Skip first input (activation), scan weight inputs.
+    for &tid in graph.inputs.iter().skip(1) {
+        if let Some(t) = graph.tensors.get(tid.0 as usize) {
+            match t.dtype {
+                DType::U8
+                | DType::F8E4M3
+                | DType::F8E5M2
+                | DType::F6E3M2
+                | DType::F6E2M3
+                | DType::F4E2M1 => return true,
+                _ => {}
+            }
+        }
+    }
+    false
 }
 
 /// Derive intermediate (FFN) dimension from GEMM ops.
@@ -980,6 +1026,137 @@ mod tests {
     }
 
     #[test]
+    fn is_weight_quantized_true_for_u8_weight() {
+        // SPEC §11: U8 is a quantized weight dtype → TurboQuant should trigger.
+        let mut g = CompilerGraph::new();
+        let act = g.add_tensor_concrete("input", &[1, 512], DType::F32);
+        let w1 = g.add_tensor_concrete("w1", &[512, 512], DType::U8);
+        g.inputs = vec![act, w1];
+        let out = g.add_tensor_concrete("out", &[1, 512], DType::F32);
+        g.add_op(Op::Gemm(GemmSpec { m: SymDim::Concrete(1), n: 512, k: 512, dtype: DType::F32, trans_b: false, has_bias: false }), vec![act, w1], vec![out], "gemm1");
+
+        let geo = GraphDerivedGeometry::from_graph(&g, &DeviceProfile::detect()).unwrap();
+
+        assert!(geo.is_weight_quantized, "U8 weight must set is_weight_quantized=true");
+    }
+
+    #[test]
+    fn is_weight_quantized_true_for_f8_e4m3_weight() {
+        // SPEC §11: F8E4M3 is a quantized (low-bit-float) weight dtype.
+        let mut g = CompilerGraph::new();
+        let act = g.add_tensor_concrete("input", &[1, 512], DType::F32);
+        let w1 = g.add_tensor_concrete("w1", &[512, 512], DType::F8E4M3);
+        g.inputs = vec![act, w1];
+        let out = g.add_tensor_concrete("out", &[1, 512], DType::F32);
+        g.add_op(Op::Gemm(GemmSpec { m: SymDim::Concrete(1), n: 512, k: 512, dtype: DType::F32, trans_b: false, has_bias: false }), vec![act, w1], vec![out], "gemm1");
+
+        let geo = GraphDerivedGeometry::from_graph(&g, &DeviceProfile::detect()).unwrap();
+
+        assert!(geo.is_weight_quantized, "F8E4M3 weight must set is_weight_quantized=true");
+    }
+
+    #[test]
+    fn is_weight_quantized_true_for_f4_e2m1_weight() {
+        // SPEC §11: F4E2M1 (NVFP4 element dtype) is quantized.
+        let mut g = CompilerGraph::new();
+        let act = g.add_tensor_concrete("input", &[1, 256], DType::F32);
+        let w1 = g.add_tensor_concrete("w1", &[256, 256], DType::F4E2M1);
+        g.inputs = vec![act, w1];
+        let out = g.add_tensor_concrete("out", &[1, 256], DType::F32);
+        g.add_op(Op::Gemm(GemmSpec { m: SymDim::Concrete(1), n: 256, k: 256, dtype: DType::F32, trans_b: false, has_bias: false }), vec![act, w1], vec![out], "gemm1");
+
+        let geo = GraphDerivedGeometry::from_graph(&g, &DeviceProfile::detect()).unwrap();
+
+        assert!(geo.is_weight_quantized, "F4E2M1 weight must set is_weight_quantized=true");
+    }
+
+    #[test]
+    fn is_weight_quantized_false_for_bf16_native_weights() {
+        // SPEC §11: BF16 is a native floating dtype, NOT TurboQuant quantization.
+        // This is the key behavior-invariant case: SmolLM2 BF16 → TurboQuant stays OFF.
+        let mut g = CompilerGraph::new();
+        let act = g.add_tensor_concrete("input", &[1, 512], DType::F32);
+        let w1 = g.add_tensor_concrete("w1", &[512, 512], DType::BF16);
+        let w2 = g.add_tensor_concrete("w2", &[512, 512], DType::BF16);
+        let w3 = g.add_tensor_concrete("w3", &[512, 2048], DType::BF16);
+        g.inputs = vec![act, w1, w2, w3];
+        let out = g.add_tensor_concrete("out", &[1, 512], DType::F32);
+        g.add_op(Op::Gemm(GemmSpec { m: SymDim::Concrete(1), n: 512, k: 512, dtype: DType::F32, trans_b: false, has_bias: false }), vec![act, w1], vec![out], "gemm1");
+
+        let geo = GraphDerivedGeometry::from_graph(&g, &DeviceProfile::detect()).unwrap();
+
+        assert!(!geo.is_weight_quantized, "BF16 native weights must NOT trigger TurboQuant");
+        // Cross-check: storage_dtype is BF16 (native float), compute_dtype is F32 (widened).
+        assert_eq!(geo.storage_dtype, DType::BF16);
+        assert_eq!(geo.compute_dtype, DType::F32);
+    }
+
+    #[test]
+    fn is_weight_quantized_false_for_f32_weights() {
+        // F32 weights — clearly no quantization.
+        let mut g = CompilerGraph::new();
+        let act = g.add_tensor_concrete("input", &[1, 256], DType::F32);
+        let w = g.add_tensor_concrete("w", &[256, 256], DType::F32);
+        g.inputs = vec![act, w];
+        let out = g.add_tensor_concrete("out", &[1, 256], DType::F32);
+        g.add_op(Op::Gemm(GemmSpec { m: SymDim::Concrete(1), n: 256, k: 256, dtype: DType::F32, trans_b: false, has_bias: false }), vec![act, w], vec![out], "gemm1");
+
+        let geo = GraphDerivedGeometry::from_graph(&g, &DeviceProfile::detect()).unwrap();
+
+        assert!(!geo.is_weight_quantized);
+    }
+
+    #[test]
+    fn is_weight_quantized_true_for_mixed_quantized_and_float_weights() {
+        // Mixed precision: some BF16 + one U8 → is_weight_quantized=true (any quantized triggers).
+        let mut g = CompilerGraph::new();
+        let act = g.add_tensor_concrete("input", &[1, 512], DType::F32);
+        let w_bf16 = g.add_tensor_concrete("w_bf16", &[512, 512], DType::BF16);
+        let w_u8 = g.add_tensor_concrete("w_u8", &[512, 512], DType::U8);
+        g.inputs = vec![act, w_bf16, w_u8];
+        let out = g.add_tensor_concrete("out", &[1, 512], DType::F32);
+        g.add_op(Op::Gemm(GemmSpec { m: SymDim::Concrete(1), n: 512, k: 512, dtype: DType::F32, trans_b: false, has_bias: false }), vec![act, w_bf16], vec![out], "gemm1");
+
+        let geo = GraphDerivedGeometry::from_graph(&g, &DeviceProfile::detect()).unwrap();
+
+        assert!(geo.is_weight_quantized, "any quantized weight (even mixed) must trigger");
+        // storage_dtype still picks BF16 (dominant float), but is_weight_quantized=true.
+        assert_eq!(geo.storage_dtype, DType::BF16);
+    }
+
+    #[test]
+    fn is_weight_quantized_false_when_only_activation_present() {
+        // Only one input (activation), no weight tensors — no quantization.
+        let mut g = CompilerGraph::new();
+        let a = g.add_tensor_concrete("input", &[1, 128], DType::F32);
+        let b = g.add_tensor_concrete("w", &[128, 128], DType::F32);
+        let c = g.add_tensor_concrete("out", &[1, 128], DType::F32);
+        g.add_op(Op::Gemm(GemmSpec { m: SymDim::Concrete(1), n: 128, k: 128, dtype: DType::F32, trans_b: false, has_bias: false }), vec![a, b], vec![c], "gemm");
+        g.inputs = vec![a]; // skip(1) means no weight tensors scanned
+
+        let geo = GraphDerivedGeometry::from_graph(&g, &DeviceProfile::detect()).unwrap();
+
+        assert!(!geo.is_weight_quantized);
+    }
+
+    #[test]
+    fn is_weight_quantized_true_for_f6_and_f8_variants() {
+        // Cover all quantized dtype variants in the match arm.
+        for dt in [DType::F8E5M2, DType::F6E3M2, DType::F6E2M3] {
+            let mut g = CompilerGraph::new();
+            let act = g.add_tensor_concrete("input", &[1, 64], DType::F32);
+            let w = g.add_tensor_concrete("w", &[64, 64], dt);
+            g.inputs = vec![act, w];
+            let out = g.add_tensor_concrete("out", &[1, 64], DType::F32);
+            g.add_op(Op::Gemm(GemmSpec { m: SymDim::Concrete(1), n: 64, k: 64, dtype: DType::F32, trans_b: false, has_bias: false }), vec![act, w], vec![out], "gemm1");
+
+            let geo = GraphDerivedGeometry::from_graph(&g, &DeviceProfile::detect()).unwrap();
+
+            assert!(geo.is_weight_quantized, "{dt:?} weight must set is_weight_quantized=true");
+        }
+    }
+
+    #[test]
     fn intermediate_selects_largest_ffn_gemm_when_multiple() {
         // Arrange: multiple FFN GEMMs with different n — the largest should win.
         let mut g = CompilerGraph::new();
@@ -1023,6 +1200,7 @@ mod tests {
         // Assert: Debug output contains key field names and values.
         assert!(debug_str.contains("hidden"), "Debug output should contain 'hidden'");
         assert!(debug_str.contains("storage_dtype"), "Debug output should contain 'storage_dtype'");
+        assert!(debug_str.contains("is_weight_quantized"), "Debug output should contain 'is_weight_quantized'");
         assert!(debug_str.contains("compute_dtype"), "Debug output should contain 'compute_dtype'");
         assert!(debug_str.contains("rms_eps"), "Debug output should contain 'rms_eps'");
     }
@@ -1053,6 +1231,7 @@ mod tests {
         assert_eq!(geo.vocab_size, cloned.vocab_size);
         assert_eq!(geo.compute_dtype, cloned.compute_dtype);
         assert_eq!(geo.storage_dtype, cloned.storage_dtype);
+        assert_eq!(geo.is_weight_quantized, cloned.is_weight_quantized);
         assert_eq!(geo.rms_eps, cloned.rms_eps);
         assert_eq!(geo.rope_theta, cloned.rope_theta);
         assert_eq!(geo.rope_partial, cloned.rope_partial);
