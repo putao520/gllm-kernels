@@ -255,6 +255,13 @@ impl TensorPtrResolver {
                     }
                 }
             }
+            // BCE-20260706-ACTSWAP-FIX: layer hidden input (activation_alias.input_tid) 必须映射
+            // ActivationPing, 否则 ActivationSwap 无法让 layer1+ 读上一层输出.
+            // 旧: input_tid=embedding(gather输出) → Intermediate{固定offset}, layer1+ 永远读 embedding.
+            // 新: input_tid → ActivationPing, gather 写 ping, layer0 读 ping=embedding, swap后 layer1 读 ping=layer0_out.
+            if let Some((in_tid, _out_tid)) = &topology.layer_activation_alias {
+                m.insert(*in_tid, TensorPtrSource::ActivationPing);
+            }
             m
         } else {
             build_tensor_sources_fallback(graph, alloc, topology)
@@ -435,9 +442,13 @@ fn build_tensor_sources_fallback(
             })
             .collect();
         if let Some((ref input_tid, ref output_tid)) = topology.layer_activation_alias {
-            if !gather_outs.contains(input_tid) {
-                map.entry(*input_tid).or_insert(TensorPtrSource::ActivationPing);
-            }
+            // BCE-20260706-ACTSWAP-FIX: layer hidden input (input_tid) 必须映射 ActivationPing,
+            // 否则 ActivationSwap 无法让 layer1+ 读上一层输出 (layer1 读 embedding 非 layer0 out).
+            // 旧 BCE-20260629-005 排除 gather 输出 → layer input 走 Intermediate{固定offset},
+            // layer1+ 永远读 embedding (input_tid=embedding=gather输出). 现在 input_tid 强制 ActivationPing.
+            // gather 输出 (embedding=input_tid) 写入 ping buffer, layer0 读 ping=embedding,
+            // swap后 layer1 读 ping=layer0_out.
+            map.insert(*input_tid, TensorPtrSource::ActivationPing);
             if !gather_outs.contains(output_tid) {
                 map.entry(*output_tid).or_insert(TensorPtrSource::ActivationPong);
             }
