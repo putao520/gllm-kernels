@@ -724,7 +724,13 @@ fn build_tensor_sources(
     // can read the final layer's output from the correct location.
     if activation_buffer_size > 0 {
         if let Some(vam_ref) = vam {
-            // BCE-20260629-005: 跳过 Gather/QuantGather 输出（如 embedding）
+            // BCE-20260706-ACTSWAP-FIX (根治, 替代 BCE-20260629-005 的跳过逻辑):
+            // layer hidden input (activation_alias.in_tid) 必须映射 ActivationPing,
+            // 无论 in_tid 是否 gather 输出. 否则 in_tid=embedding(gather输出) 走 Intermediate{固定offset},
+            // layer1+ 永远读 embedding (不随 ActivationSwap 切换) → logits 发散.
+            // BCE-005 旧逻辑跳过 gather 输出是错的: gather 在循环前写 ping, layer0 读 ping=embedding,
+            // ActivationSwap 后 layer1 读 ping=layer0_out. NaN 担心不成立 (gather 正确写 ping).
+            // out_tid (layer 输出) 仍跳过 gather 输出 (输出不可能是 gather 输出, 保留防御).
             let gather_outs: HashSet<TensorId> = graph.ops.iter()
                 .filter_map(|op| match &op.op {
                     crate::compiler::graph::Op::Gather { .. } | crate::compiler::graph::Op::QuantGather { .. } => op.outputs.first().copied(),
@@ -733,9 +739,8 @@ fn build_tensor_sources(
                 .collect();
             if let Some(cfg) = &graph.layer_loop_config {
                 if let Some((in_tid, out_tid)) = cfg.activation_alias {
-                    if !gather_outs.contains(&in_tid) {
-                        map.entry(in_tid).or_insert(TensorPtrSource::ActivationPing);
-                    }
+                    // in_tid 强制 ActivationPing (覆盖 Intermediate/gather-out 跳过)
+                    map.insert(in_tid, TensorPtrSource::ActivationPing);
                     if !gather_outs.contains(&out_tid) {
                         map.entry(out_tid).or_insert(TensorPtrSource::ActivationPong);
                     }
@@ -743,20 +748,15 @@ fn build_tensor_sources(
             }
             if let Some(cfg) = &graph.hetero_layer_loop_config {
                 for &(in_tid, out_tid) in &cfg.activation_aliases {
-                    if !gather_outs.contains(&in_tid) {
-                        map.entry(in_tid).or_insert(TensorPtrSource::ActivationPing);
-                    }
+                    map.insert(in_tid, TensorPtrSource::ActivationPing);
                     if !gather_outs.contains(&out_tid) {
                         map.entry(out_tid).or_insert(TensorPtrSource::ActivationPong);
                     }
                 }
             }
-            // BCE-20260629-005: VAM activation_assignments 仍可能包含 Gather 输出
+            // BCE-20260706-ACTSWAP-FIX: VAM activation_assignments 补充非 gather 输出的 ping/pong 映射.
+            // gather 输出 (如 embedding) 已由上文 activation_alias.in_tid 强制 ActivationPing, 此处跳过.
             for (&tid, slot) in &vam_ref.activation_assignments {
-                if gather_outs.contains(&tid) {
-                    eprintln!("[BUILD-TS] VAM skip gather_outs tid={}", tid.0);
-                    continue;
-                }
                 if gather_outs.contains(&tid) {
                     continue;
                 }

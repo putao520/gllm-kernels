@@ -818,16 +818,11 @@ impl InferenceCompiler {
                 hetero_layout,
                 source_map,
                 tensor_sources: {
-                    let mut ts = alloc.tensor_sources.clone();
-                    for op in &graph.ops {
-                        if let crate::compiler::graph::Op::Gather { .. } | crate::compiler::graph::Op::QuantGather { .. } = &op.op {
-                            if let Some(&out_tid) = op.outputs.first() {
-                                let off = alloc.offset_of(out_tid).unwrap_or(0);
-                                ts.insert(out_tid, crate::compiler::buffer_alloc::TensorPtrSource::Intermediate { offset: off });
-                            }
-                        }
-                    }
-                    ts
+                    // BCE-20260706-ACTSWAP-FIX (根治): tensor_sources 由 build_tensor_sources 正确构建.
+                    // 删除旧 BCE-20260629-005 的 gather 强制 Intermediate (会覆盖 in_tid=embedding
+                    // 的 ActivationPing, 导致 layer1+ 读 embedding 非 layer0 输出).
+                    // 非 activation 的 gather 输出已由 build_tensor_sources slots 逻辑映射 Intermediate.
+                    alloc.tensor_sources.clone()
                 },
             })
         }

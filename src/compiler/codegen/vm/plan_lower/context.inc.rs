@@ -242,27 +242,13 @@ impl TensorPtrResolver {
     /// 当 R3 未预计算 tensor_sources（简单 allocate_buffers 路径）时 fallback 到自行构建。
     pub fn build(graph: &CompilerGraph, alloc: &BufferAllocation, topology: &super::topology::GraphTopologyAnalysis) -> Self {
         let map = if !alloc.tensor_sources.is_empty() {
-            let mut m = alloc.tensor_sources.clone();
-            // BCE-20260629-005: 强制 Gather/QuantGather 输出为 Intermediate{offset}
-            // 从 alloc.slots 查找真实 offset，避免和 ping buffer 冲突。
-            eprintln!("[RESOLVER] using alloc.tensor_sources ({} entries)", m.len());
-            for op in &graph.ops {
-                if let crate::compiler::graph::Op::Gather { .. } | crate::compiler::graph::Op::QuantGather { .. } = &op.op {
-                    if let Some(&out_tid) = op.outputs.first() {
-                        let off = alloc.offset_of(out_tid).unwrap_or(0);
-                        eprintln!("[RESOLVER] Gather output tid={} → Intermediate{{offset={}}}", out_tid.0, off);
-                        m.insert(out_tid, TensorPtrSource::Intermediate { offset: off });
-                    }
-                }
-            }
-            // BCE-20260706-ACTSWAP-FIX: layer hidden input (activation_alias.input_tid) 必须映射
-            // ActivationPing, 否则 ActivationSwap 无法让 layer1+ 读上一层输出.
-            // 旧: input_tid=embedding(gather输出) → Intermediate{固定offset}, layer1+ 永远读 embedding.
-            // 新: input_tid → ActivationPing, gather 写 ping, layer0 读 ping=embedding, swap后 layer1 读 ping=layer0_out.
-            if let Some((in_tid, _out_tid)) = &topology.layer_activation_alias {
-                m.insert(*in_tid, TensorPtrSource::ActivationPing);
-            }
-            m
+            // BCE-20260706-ACTSWAP-FIX (根治): tensor_sources 由 build_tensor_sources 正确构建:
+            // - layer hidden input (activation_alias.in_tid) → ActivationPing (含 gather 输出如 embedding)
+            // - 非 activation 的 gather 输出 → Intermediate{offset} (slots 逻辑, buffer_alloc.rs:714-717)
+            // - layer 输出 (out_tid) → ActivationPong
+            // 删除旧 BCE-20260629-005 的运行时 gather 强制 Intermediate (会覆盖 in_tid 的 ActivationPing).
+            // 删除运行时 in_tid 覆盖 (DRY: 已在 build_tensor_sources 根治).
+            alloc.tensor_sources.clone()
         } else {
             build_tensor_sources_fallback(graph, alloc, topology)
         };
