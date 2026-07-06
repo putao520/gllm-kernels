@@ -6,7 +6,7 @@
 
 use crate::types::{CompilerError, DType, InferenceError};
 use crate::compiler::graph::{CompilerGraph, Op, OpId, TensorId, TensorMeta};
-use crate::dispatch::device_profile::DeviceProfile;
+use crate::dispatch::device_profile::{DeviceProfile, DotProductCap};
 
 // ── REQ-DTYPE-CHAIN-001: DType chain end-to-end tracking ─────────────
 
@@ -184,28 +184,31 @@ pub fn select_dequant_path(
 /// This is the dtype used for buffer layout and kernel selection.
 /// It represents the actual computation precision after hardware promotion.
 ///
+/// 宪法 -1 (ARCH-NO-PRECISION-ASSUMPTION) 合规：代码顺从硬件能力 + 权重实际 dtype，
+/// 不预设 "X always => F32" 恒等映射。F32 是兜底分支（无原生累加支持时数值安全 widen），
+/// 非精度预设。
+///
 /// Rules (from SPEC REQ-DTYPE-CHAIN-004):
-/// - BF16 model + AVX-512 VDPBF16PS → F32 (BF16×BF16→F32 accumulation)
-/// - BF16 model + GPU tensor core WGMMA → F32 (BF16×BF16→F32 accumulation)
-/// - BF16 model + AMX TDPBF16PS → F32 (BF16×BF16→F32 accumulation)
+/// - BF16 model + NativeBf16 hardware (VDPBF16PS/BFMMLA/HMMA) → BF16 (native compute)
+/// - BF16 model + SimdAssisted (AVX2/NEON, no native BF16 dot) → F32 (widen accumulation)
+/// - NVFP4 / FP4-class weights + NativeFp4 tensor core → preserve storage dtype (native compute)
+/// - INT8 weights + NativeInt8* hardware → preserve U8 (native compute)
 /// - F32 model + any hardware → F32
-/// - FP16 model + GPU tensor core → F32 (FP16×FP16→F32 accumulation)
-/// - Quantized model → F32 (dequant then F32 accumulation)
-/// - Future: BF16 residual path may keep compute_dtype = BF16
+/// - 量化类型 + 无原生累加支持 → F32 (dequant then F32 accumulation, fallback)
 pub fn derive_compute_dtype(storage_dtype: DType, device: &DeviceProfile) -> DType {
-    match storage_dtype {
-        // BF16/F16 always widen to F32 on current hardware
-        DType::BF16 | DType::F16 => DType::F32,
-        // Quantized types always dequant to F32
-        DType::U8 | DType::F8E4M3 | DType::F8E5M2
-        | DType::F6E3M2 | DType::F6E2M3 | DType::F4E2M1 => DType::F32,
-        // F32 stays F32
-        DType::F32 => DType::F32,
+    // 宪法 -1 合规：device.dot_product_cap() 前置查询硬件能力，按 (硬件能力, storage_dtype)
+    // 组合决定。原生累加支持 → 保留 storage_dtype（代码顺从数据）；否则 → F32 兜底（数值安全 widen）。
+    match device.dot_product_cap() {
+        // 原生 BF16 dot-product（x86 VDPBF16PS / ARM BFMMLA / GPU HMMA bf16，FP32 accumulate）
+        // → 保留 BF16/F16 计算，不在 loader 层降级。
+        DotProductCap::NativeBf16 if matches!(storage_dtype, DType::BF16 | DType::F16) => storage_dtype,
+        // 原生 FP4 tensor core（NVIDIA SM100+ tcgen05）→ 保留 FP4-class 量化 dtype 原生计算
+        DotProductCap::NativeFp4 if matches!(storage_dtype, DType::F8E4M3 | DType::F6E3M2 | DType::F6E2M3 | DType::F4E2M1) => storage_dtype,
+        // 原生 INT8 dot-product（VNNI / ARM SDOT / GPU IMMA / AMX）→ 保留 U8 原生计算
+        DotProductCap::NativeInt8Simd | DotProductCap::NativeInt8Tc | DotProductCap::NativeInt8Tile if matches!(storage_dtype, DType::U8) => storage_dtype,
+        // 兜底：无原生累加支持 → F32 widen（数值安全，非精度预设）
+        _ => DType::F32,
     }
-    // Note: device parameter is reserved for future hardware that supports
-    // native BF16 accumulation (e.g. future GPU architectures). Currently
-    // all paths result in F32, but the function signature allows future
-    // evolution without API break.
 }
 
 /// Kernel selection key derived from (storage_dtype, compute_dtype, DeviceProfile).
