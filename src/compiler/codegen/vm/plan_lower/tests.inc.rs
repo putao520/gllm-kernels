@@ -549,7 +549,7 @@ mod tests {
         };
         let ctx = LoweringContext {
             session: &sess,
-            dtype: graph_dtype(&graph),
+            accum_dtype: graph_dtype(&graph),
             rope_req: None,
             ple_req: None,
             dwc_req: None,
@@ -1941,7 +1941,7 @@ mod tests {
     /// 根因: lower_op.inc.rs 的 L2Normalize 分支曾访问 `op.inputs[1]` 取 weight_ptr/weight_dtype,
     /// 但 L2Normalize (x/||x||) 构造时只传 1 个 input, inputs[1] 越界 panic。
     /// 修复: NormKind::ValueNorm has_weight()=false → emit_normlike_inline 不读 weight_ptr,
-    /// 故 weight_ptr 复用 input_ptr (占位), weight_dtype 用 ctx.dtype。禁止访问 inputs[1]。
+    /// 故 weight_ptr 复用 input_ptr (占位), weight_dtype 用 ctx.accum_dtype。禁止访问 inputs[1]。
     ///
     /// 本测试聚焦 OOB 根治: 修复前是 'index out of bounds: the len is 1 but the index is 1'
     /// panic (进程崩溃), 修复后不再访问 inputs[1] — compile_layer 要么 Ok (产出机器码), 要么

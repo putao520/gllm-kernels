@@ -371,11 +371,11 @@ pub(super) fn emit_fusion_group_by_mode(
                 let b_dt = anchor_op.inputs.get(1)
                     .and_then(|&tid| graph.tensor(tid))
                     .map(|t| t.dtype.to_quant_precision())
-                    .unwrap_or(ctx.dtype);
+                    .unwrap_or(ctx.accum_dtype);
                 // Step 1: GEMM without epilogue → writes unbiased result to gemm_output_ptr
                 emit_gemm_inline_with_epilogue(prog, &m_dim, n, k, width,
                     group_input_ptr, group_weight_ptr, gemm_output_ptr,
-                    &[], sym_map, false, seq_bound_override, ctx.dtype, b_dt, ctx.dtype, gemm_trans_b,
+                    &[], sym_map, false, seq_bound_override, ctx.accum_dtype, b_dt, ctx.accum_dtype, gemm_trans_b,
                     super::isa_hook::EpiloguePlace::OnAccumulators)?;
                 // Step 2: Bias add (broadcast across M rows)
                 if let Some(&bias_tid) = anchor_op.inputs.get(2) {
@@ -385,7 +385,7 @@ pub(super) fn emit_fusion_group_by_mode(
                         ))?;
                     let m_bound = seq_bound_override.cloned()
                         .unwrap_or_else(|| sym_map.to_bound(&m_dim));
-                    emit_bias_add(prog, gemm_output_ptr, bias_ptr, n, m_bound, width, ctx.dtype, sym_map);
+                    emit_bias_add(prog, gemm_output_ptr, bias_ptr, n, m_bound, width, ctx.accum_dtype, sym_map);
                 }
                 // Step 3: Apply epilogue ops as standalone elementwise on biased output
                 for &epi_op_id in &group.epilogue {
@@ -406,10 +406,10 @@ pub(super) fn emit_fusion_group_by_mode(
                 let b_dt = anchor_op.inputs.get(1)
                     .and_then(|&tid| graph.tensor(tid))
                     .map(|t| t.dtype.to_quant_precision())
-                    .unwrap_or(ctx.dtype);
+                    .unwrap_or(ctx.accum_dtype);
                 emit_gemm_inline_with_epilogue(prog, &m_dim, n, k, width,
                     group_input_ptr, group_weight_ptr, gemm_output_ptr,
-                    &epi_trace, sym_map, graph.telemetry.gemm_row_stats, seq_bound_override, ctx.dtype, b_dt, ctx.dtype, gemm_trans_b,
+                    &epi_trace, sym_map, graph.telemetry.gemm_row_stats, seq_bound_override, ctx.accum_dtype, b_dt, ctx.accum_dtype, gemm_trans_b,
                     super::isa_hook::EpiloguePlace::OnAccumulators)?;
             }
         }
@@ -445,17 +445,17 @@ pub(super) fn emit_fusion_group_by_mode(
                 let b_dt = anchor_op.inputs.get(1)
                     .and_then(|&tid| graph.tensor(tid))
                     .map(|t| t.dtype.to_quant_precision())
-                    .unwrap_or(ctx.dtype);
+                    .unwrap_or(ctx.accum_dtype);
                 emit_gemm_inline_with_hook(p, &m_dim, n, k, ctx,
                     scratch_ptr, group_weight_ptr, group_output_ptr, seq_bound_override, Some(anchor_op.id), pm, norm_into_gemm_trans_b,
-                    ctx.dtype, b_dt, ctx.dtype)?;
+                    ctx.accum_dtype, b_dt, ctx.accum_dtype)?;
                 // GemmBias: add bias after GEMM in NormIntoGemm mode
                 if anchor_op.op_is_gemm_with_bias(graph) {
                     if let Some(&bias_tid) = anchor_op.inputs.get(2) {
                         if let Some(bias_ptr) = resolver.materialize(p, bias_tid, abi) {
                             let m_bound = seq_bound_override.cloned()
                                 .unwrap_or_else(|| sym_map.to_bound(&m_dim));
-                            emit_bias_add(p, group_output_ptr, bias_ptr, n, m_bound, ctx.session.width, ctx.dtype, sym_map);
+                            emit_bias_add(p, group_output_ptr, bias_ptr, n, m_bound, ctx.session.width, ctx.accum_dtype, sym_map);
                         }
                     }
                 }
@@ -479,17 +479,17 @@ pub(super) fn emit_fusion_group_by_mode(
                         let qkv_b_dt = op.inputs.get(1)
                             .and_then(|&tid| graph.tensor(tid))
                             .map(|t| t.dtype.to_quant_precision())
-                            .unwrap_or(ctx.dtype);
+                            .unwrap_or(ctx.accum_dtype);
                         prog.emit_scope(|p| -> Result<(), CompilerError> {
                             emit_gemm_inline_with_hook(p, &m_dim, n, k, ctx, gemm_input, gemm_weight, out_ptr, seq_bound_override, Some(op.id), pm, qkv_trans_b,
-                                ctx.dtype, qkv_b_dt, ctx.dtype)?;
+                                ctx.accum_dtype, qkv_b_dt, ctx.accum_dtype)?;
                             // GemmBias: add bias after GEMM in QkvSharedInput mode
                             if op.op_is_gemm_with_bias(graph) {
                                 if let Some(&bias_tid) = op.inputs.get(2) {
                                     if let Some(bias_ptr) = resolver.materialize(p, bias_tid, abi) {
                                         let m_bound = seq_bound_override.cloned()
                                             .unwrap_or_else(|| sym_map.to_bound(&m_dim));
-                                        emit_bias_add(p, out_ptr, bias_ptr, n, m_bound, ctx.session.width, ctx.dtype, sym_map);
+                                        emit_bias_add(p, out_ptr, bias_ptr, n, m_bound, ctx.session.width, ctx.accum_dtype, sym_map);
                                     }
                                 }
                             }
@@ -521,17 +521,17 @@ pub(super) fn emit_fusion_group_by_mode(
             let b_dt = anchor_op.inputs.get(1)
                 .and_then(|&tid| graph.tensor(tid))
                 .map(|t| t.dtype.to_quant_precision())
-                .unwrap_or(ctx.dtype);
+                .unwrap_or(ctx.accum_dtype);
             emit_gemm_inline_with_hook(prog, &m_dim, n, k, ctx,
                 pre_scratch, group_weight_ptr, group_output_ptr, seq_bound_override, Some(anchor_op.id), pm, pre_fusion_trans_b,
-                ctx.dtype, b_dt, ctx.dtype)?;
+                ctx.accum_dtype, b_dt, ctx.accum_dtype)?;
             // GemmBias: add bias after GEMM in TileLevelFusion mode
             if anchor_op.op_is_gemm_with_bias(graph) {
                 if let Some(&bias_tid) = anchor_op.inputs.get(2) {
                     if let Some(bias_ptr) = resolver.materialize(prog, bias_tid, abi) {
                         let m_bound = seq_bound_override.cloned()
                             .unwrap_or_else(|| sym_map.to_bound(&m_dim));
-                        emit_bias_add(prog, group_output_ptr, bias_ptr, n, m_bound, ctx.session.width, ctx.dtype, sym_map);
+                        emit_bias_add(prog, group_output_ptr, bias_ptr, n, m_bound, ctx.session.width, ctx.accum_dtype, sym_map);
                     }
                 }
             }
@@ -561,17 +561,17 @@ pub(super) fn emit_fusion_group_by_mode(
             let cr_b_dt = anchor_op.inputs.get(1)
                 .and_then(|&tid| graph.tensor(tid))
                 .map(|t| t.dtype.to_quant_precision())
-                .unwrap_or(ctx.dtype);
+                .unwrap_or(ctx.accum_dtype);
             emit_gemm_inline_with_hook(prog, &m_dim, n, k, ctx,
                 pre_scratch, group_weight_ptr, group_output_ptr, seq_bound_override, Some(anchor_op.id), pm, pre_fusion_trans_b,
-                ctx.dtype, cr_b_dt, ctx.dtype)?;
+                ctx.accum_dtype, cr_b_dt, ctx.accum_dtype)?;
             // GemmBias: add bias after GEMM in ComputeRoot mode
             if anchor_op.op_is_gemm_with_bias(graph) {
                 if let Some(&bias_tid) = anchor_op.inputs.get(2) {
                     if let Some(bias_ptr) = resolver.materialize(prog, bias_tid, abi) {
                         let m_bound = seq_bound_override.cloned()
                             .unwrap_or_else(|| sym_map.to_bound(&m_dim));
-                        emit_bias_add(prog, group_output_ptr, bias_ptr, n, m_bound, ctx.session.width, ctx.dtype, sym_map);
+                        emit_bias_add(prog, group_output_ptr, bias_ptr, n, m_bound, ctx.session.width, ctx.accum_dtype, sym_map);
                     }
                 }
             }
@@ -597,16 +597,16 @@ pub(super) fn emit_fusion_group_by_mode(
                 let gate_b_dt = gate_op.inputs.get(1)
                     .and_then(|&tid| graph.tensor(tid))
                     .map(|t| t.dtype.to_quant_precision())
-                    .unwrap_or(ctx.dtype);
+                    .unwrap_or(ctx.accum_dtype);
                 prog.emit_scope(|p| -> Result<(), CompilerError> {
                     emit_gemm_inline_with_hook(p, &m_dim, n, k, ctx, gate_input, gate_weight, gate_scratch, seq_bound_override, Some(gate_op.id), pm, gate_trans_b,
-                        ctx.dtype, gate_b_dt, ctx.dtype)?;
+                        ctx.accum_dtype, gate_b_dt, ctx.accum_dtype)?;
                     if gate_op.op_is_gemm_with_bias(graph) {
                         if let Some(&bias_tid) = gate_op.inputs.get(2) {
                             if let Some(bias_ptr) = resolver.materialize(p, bias_tid, abi) {
                                 let m_bound = seq_bound_override.cloned()
                                     .unwrap_or_else(|| sym_map.to_bound(&m_dim));
-                                emit_bias_add(p, gate_scratch, bias_ptr, n, m_bound, ctx.session.width, ctx.dtype, sym_map);
+                                emit_bias_add(p, gate_scratch, bias_ptr, n, m_bound, ctx.session.width, ctx.accum_dtype, sym_map);
                             }
                         }
                     }
@@ -626,16 +626,16 @@ pub(super) fn emit_fusion_group_by_mode(
                 let up_b_dt = up_op.inputs.get(1)
                     .and_then(|&tid| graph.tensor(tid))
                     .map(|t| t.dtype.to_quant_precision())
-                    .unwrap_or(ctx.dtype);
+                    .unwrap_or(ctx.accum_dtype);
                 prog.emit_scope(|p| -> Result<(), CompilerError> {
                     emit_gemm_inline_with_hook(p, &m_dim, n, k, ctx, up_input, up_weight, up_scratch, seq_bound_override, Some(up_op.id), pm, up_trans_b,
-                        ctx.dtype, up_b_dt, ctx.dtype)?;
+                        ctx.accum_dtype, up_b_dt, ctx.accum_dtype)?;
                     if up_op.op_is_gemm_with_bias(graph) {
                         if let Some(&bias_tid) = up_op.inputs.get(2) {
                             if let Some(bias_ptr) = resolver.materialize(p, bias_tid, abi) {
                                 let m_bound = seq_bound_override.cloned()
                                     .unwrap_or_else(|| sym_map.to_bound(&m_dim));
-                                emit_bias_add(p, up_scratch, bias_ptr, n, m_bound, ctx.session.width, ctx.dtype, sym_map);
+                                emit_bias_add(p, up_scratch, bias_ptr, n, m_bound, ctx.session.width, ctx.accum_dtype, sym_map);
                             }
                         }
                     }
@@ -650,7 +650,7 @@ pub(super) fn emit_fusion_group_by_mode(
             let (act_shape, _) = infer_output_shape_sym(act_op, graph)?;
             emit_elementwise_inline(prog, &act_trace, &act_shape, width, false,
                 false,
-                gate_scratch, weight_ptr, act_scratch, sym_map, seq_bound_override, ctx.dtype)?;
+                gate_scratch, weight_ptr, act_scratch, sym_map, seq_bound_override, ctx.accum_dtype)?;
             let combine_op = graph.op(*combine).ok_or_else(|| CompilerError::CodegenViolation(
                 format!("FFNBlock combine op {:?} not found", combine)))?;
             let combine_trace = extract_op_trace(combine_op, registry, graph)?;
@@ -660,7 +660,7 @@ pub(super) fn emit_fusion_group_by_mode(
                 .unwrap_or(output_ptr);
             emit_elementwise_inline(prog, &combine_trace, &combine_shape, width, true,
                 false,
-                act_scratch, up_scratch, combine_output, sym_map, seq_bound_override, ctx.dtype)?;
+                act_scratch, up_scratch, combine_output, sym_map, seq_bound_override, ctx.accum_dtype)?;
         }
 
         FusionMode::CrossLayerResidual { residual, norm } => {
@@ -682,7 +682,7 @@ pub(super) fn emit_fusion_group_by_mode(
             let res_is_binary = res_op.inputs.len() > 1;
             emit_elementwise_inline(prog, &res_trace, &res_shape, width, res_is_binary,
                 false,
-                res_input0, res_input1, res_scratch, sym_map, seq_bound_override, ctx.dtype)?;
+                res_input0, res_input1, res_scratch, sym_map, seq_bound_override, ctx.accum_dtype)?;
 
             let norm_input0 = norm_op.inputs.first().copied()
                 .and_then(|tid| resolver.materialize(prog, tid, abi))
@@ -699,7 +699,7 @@ pub(super) fn emit_fusion_group_by_mode(
             let norm_is_binary = norm_op.inputs.len() > 1;
             emit_elementwise_inline(prog, &norm_trace, &norm_shape, width, norm_is_binary,
                 false,
-                norm_input0, norm_weight, norm_output, sym_map, seq_bound_override, ctx.dtype)?;
+                norm_input0, norm_weight, norm_output, sym_map, seq_bound_override, ctx.accum_dtype)?;
         }
 
         FusionMode::FusedQkvNormRope { gemm_q, gemm_k, gemm_v, .. } => {
@@ -718,10 +718,10 @@ pub(super) fn emit_fusion_group_by_mode(
                         let fqnr_b_dt = op.inputs.get(1)
                             .and_then(|&tid| graph.tensor(tid))
                             .map(|t| t.dtype.to_quant_precision())
-                            .unwrap_or(ctx.dtype);
+                            .unwrap_or(ctx.accum_dtype);
                         prog.emit_scope(|p| -> Result<(), CompilerError> {
                             emit_gemm_inline_with_hook(p, &m_dim, n, k, ctx, gemm_input, gemm_weight, out_ptr, seq_bound_override, Some(op.id), pm, fqnr_trans_b,
-                                ctx.dtype, fqnr_b_dt, ctx.dtype)?;
+                                ctx.accum_dtype, fqnr_b_dt, ctx.accum_dtype)?;
                             Ok(())
                         })?;
                     }
@@ -1936,7 +1936,7 @@ mod tests {
         };
         let ctx = LoweringContext {
             session: &sess,
-            dtype: QuantPrecision::BF16,
+            accum_dtype: QuantPrecision::BF16,
             rope_req: None, ple_req: None, dwc_req: None,
             exec_pattern: None, bottleneck_map: None,
             parallelism: None,

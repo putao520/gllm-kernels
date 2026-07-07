@@ -1400,7 +1400,7 @@ pub fn compile_mega_kernel_vm(
     };
     let ctx = LoweringContext {
         session: &sess,
-        dtype: graph_dtype(graph),
+        accum_dtype: graph_dtype(graph),
         rope_req: rope_req.as_ref(),
         ple_req: ple_req.as_ref(),
         dwc_req: dwc_req.as_ref(),
@@ -1550,7 +1550,7 @@ fn emit_sampling_pipeline(
     // ── 采样: Argmax / Stochastic ──
     // GPU-Resident 采样管线: temperature==0 → argmax, temperature>0 → stochastic
     maybe_debug_bp(prog, &ctx, "pre_sample");
-    let vocab_bytes = mk.vocab_size * ctx.dtype.elem_bytes(); // f32 logits
+    let vocab_bytes = mk.vocab_size * ctx.accum_dtype.elem_bytes(); // f32 logits
 
     // Argmax reads from row 0 of the logits region.
     // The logits producer GEMV (M=1 decode) always writes its output to row 0
@@ -1664,7 +1664,7 @@ fn emit_sampling_pipeline(
         logits_ptr: fresh_logits_ptr,
         vocab_bytes,
         width: mk.width,
-        dtype: ctx.dtype,
+        dtype: ctx.accum_dtype,
     });
 
     prog.emit(VmInstr::MarkLabel { label_id: SAMPLING_DONE_LABEL });
@@ -1684,7 +1684,7 @@ fn emit_sampling_pipeline(
     // Route through TraceOp::MtpDraft → auto_select pipeline (MTP-001).
     if let Some(ref mtp) = mk.topology.mtp_config {
         let MtpKernelConfig { depth, hidden_size, vocab_size: _mtp_vocab } = *mtp;
-        let elem_bytes = ctx.dtype.elem_bytes();
+        let elem_bytes = ctx.accum_dtype.elem_bytes();
         // logits_producer_bytes 使用函数级 mk.vocab_size（从拓扑推导）和 MTP hidden_size
         let logits_producer_bytes = mk.vocab_size * hidden_size * elem_bytes;
 
@@ -1775,7 +1775,7 @@ fn emit_sampling_pipeline(
             ],
             &[hidden_ptr, mtp_weight_ptr, regs.output_tokens_ptr],
             mk.width,
-            ctx.dtype,
+            ctx.accum_dtype,
         )?;
     }
 
@@ -2002,7 +2002,7 @@ fn emit_batch_mode_path(
 
         let batch_ctx = LoweringContext {
             session: &batch_session,
-            dtype: graph_dtype(mk.graph),
+            accum_dtype: graph_dtype(mk.graph),
             rope_req: mk.rope_req.as_ref(),
             ple_req: mk.ple_req.as_ref(),
             dwc_req: mk.dwc_req.as_ref(),
@@ -2569,7 +2569,7 @@ fn emit_batch_decode_step_loop(
     };
     let batch_ctx = LoweringContext {
         session: &batch_session,
-        dtype: graph_dtype(mk.graph),
+        accum_dtype: graph_dtype(mk.graph),
         rope_req: mk.rope_req.as_ref(),
         ple_req: mk.ple_req.as_ref(),
         dwc_req: mk.dwc_req.as_ref(),
@@ -2585,7 +2585,7 @@ fn emit_batch_decode_step_loop(
     if mk.vocab_size > 0 {
         // ── ForwardPhaseDispatch decode entry: jump target when total_prefill_tokens == 0 (SPEC 32 REQ-MKO-001) ──
         prog.emit(VmInstr::MarkLabel { label_id: DECODE_ENTRY_LABEL });
-        let vb = mk.vocab_size * batch_ctx.dtype.elem_bytes();
+        let vb = mk.vocab_size * batch_ctx.accum_dtype.elem_bytes();
         let stride: usize = 64; // SEQ_META_STRIDE
 
         // Read max_decode_steps from batch_ctx+4
@@ -2598,13 +2598,13 @@ fn emit_batch_decode_step_loop(
             let sg_end = mk.sg_detect_scratch_offset
                 .map(|off| {
                     let hdim = mk.topology.sg_detect_hidden_dim.unwrap_or(0);
-                    (off + hdim * batch_ctx.dtype.elem_bytes() + 63) & !63
+                    (off + hdim * batch_ctx.accum_dtype.elem_bytes() + 63) & !63
                 })
                 .unwrap_or(0);
             let sgk_end = mk.sg_knowledge_scratch_offset
                 .map(|off| {
                     let hdim = mk.topology.sg_inject_hidden_dim.unwrap_or(0);
-                    (off + hdim * batch_ctx.dtype.elem_bytes() + 63) & !63
+                    (off + hdim * batch_ctx.accum_dtype.elem_bytes() + 63) & !63
                 })
                 .unwrap_or(0);
             let base = sampling_end.max(sg_end).max(sgk_end);
@@ -2783,7 +2783,7 @@ fn emit_mtp_candidates(
     width: SimdWidth,
 ) -> Result<(), CompilerError> {
     let MtpKernelConfig { depth, hidden_size, vocab_size: mtp_vocab } = *mtp;
-    let elem_bytes = ctx.dtype.elem_bytes();
+    let elem_bytes = ctx.accum_dtype.elem_bytes();
     let vocab_bytes = vocab_size * elem_bytes;
     let hidden_bytes = hidden_size * elem_bytes;
     let proj_bytes = mtp_vocab * hidden_size * elem_bytes;
@@ -2926,7 +2926,7 @@ fn emit_mtp_candidates(
             logits_ptr: mtp_logits_ptr,
             vocab_bytes,
             width,
-            dtype: ctx.dtype,
+            dtype: ctx.accum_dtype,
         });
 
         // ── Store MTP candidate to output buffer ──

@@ -88,7 +88,7 @@ pub(crate) fn lower_fusion_plan_inner_with_sym_map(
     };
     let ctx = LoweringContext {
         session: &sess,
-        dtype: graph_dtype(graph),
+        accum_dtype: graph_dtype(graph),
         rope_req,
         ple_req,
         dwc_req,
@@ -248,7 +248,7 @@ pub(super) fn emit_fusion_groups(
     resolver: &TensorPtrResolver,
 ) -> Result<(), CompilerError> {
     let width = fctx.ctx.session.width;
-    let dtype = fctx.ctx.dtype;
+    let dtype = fctx.ctx.accum_dtype;
     let _sym_map = fctx.ctx.session.sym_map;
     let _registry = fctx.ctx.session.registry;
     let _hook = fctx.ctx.session.hook;
@@ -916,7 +916,7 @@ fn handle_standard_layer_loop(
                     if let Some((_, pong)) = locals.activation_swap_vregs {
                         let _ = super::structural_builder::StructuralOpBuilder::emit_layer_capture_copy(
                             prog, pong, cap.capture_base, counter,
-                            cap.per_layer_stride, cap.hidden_dim, width, ctx.dtype,
+                            cap.per_layer_stride, cap.hidden_dim, width, ctx.accum_dtype,
                         );
                     }
                 }
@@ -1073,11 +1073,11 @@ fn emit_group_guard_and_body(
                     let b_dt = op.inputs.get(1)
                         .and_then(|&tid| graph.tensor(tid))
                         .map(|t| t.dtype.to_quant_precision())
-                        .unwrap_or(ctx.dtype);
+                        .unwrap_or(ctx.accum_dtype);
                     emit_gemm_inline_with_hook(p, &m_dim, n, k, ctx,
                         op_input_ptr, op_weight_ptr, out_ptr,
                         locals.seq_bound_override.as_ref(), Some(op.id), pm, trans_b,
-                        ctx.dtype, b_dt, ctx.dtype)?;
+                        ctx.accum_dtype, b_dt, ctx.accum_dtype)?;
                     Ok(())
                 })?;
             }

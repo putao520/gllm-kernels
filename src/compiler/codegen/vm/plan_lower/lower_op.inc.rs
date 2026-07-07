@@ -87,12 +87,12 @@ fn lower_op_normlike(prog: &mut VmProgram, op: &CompilerOp, graph: &CompilerGrap
             let input_ptr = resolver.materialize(prog, op.inputs[0], abi).unwrap_or_else(|| prog.alloc_vreg(VRegKind::Ptr, width));
             // QkNorm (L2 + √head_dim rescale, 无 learned weight): NormKind::ValueNorm has_weight()=false,
             // emit_normlike_inline 不 emit weight VecLoad (norm_softmax_emit.rs 的 if norm_kind.has_weight() 守卫)。
-            // weight_ptr 复用 input_ptr (占位, 不被使用), weight_dtype 用 ctx.dtype (无独立 weight dtype)。
+            // weight_ptr 复用 input_ptr (占位, 不被使用), weight_dtype 用 ctx.accum_dtype (无独立 weight dtype)。
             // 禁止访问 op.inputs[1] — QkNorm 构造时只传 1 个 input (fusion/pass.rs:3160 / fusion/helpers.rs:2260),
             // 访问 inputs[1] 会 panic (index out of bounds)。
             // @trace BCE-20260703-L2NORMALIZE-INPUTS-OOB [level:unit]
             let weight_ptr = input_ptr;
-            let weight_dtype = ctx.dtype;
+            let weight_dtype = ctx.accum_dtype;
             let output_ptr = resolver.materialize(prog, op.outputs[0], abi)
                 .ok_or_else(|| CompilerError::CodegenViolation(format!("QkNorm op {:?}: 无输出指针", op.id)))?;
             let pattern = build_norm_pattern_qk(eps, head_dim)?;
@@ -100,7 +100,7 @@ fn lower_op_normlike(prog: &mut VmProgram, op: &CompilerOp, graph: &CompilerGrap
                 prog, &pattern, head_dim, num_heads,
                 /*broadcast_weight=*/false, NormKind::ValueNorm,
                 width, seq_bound, input_ptr, weight_ptr, output_ptr,
-                ctx.dtype, weight_dtype,
+                ctx.accum_dtype, weight_dtype,
             )?;
             Ok(Some(true))
         }
@@ -112,12 +112,12 @@ fn lower_op_normlike(prog: &mut VmProgram, op: &CompilerOp, graph: &CompilerGrap
             let input_ptr = resolver.materialize(prog, op.inputs[0], abi).unwrap_or_else(|| prog.alloc_vreg(VRegKind::Ptr, width));
             // L2Normalize (x/||x||) 无 weight: NormKind::ValueNorm has_weight()=false,
             // emit_normlike_inline 不 emit weight VecLoad (norm_softmax_emit.rs 的 if norm_kind.has_weight() 守卫)。
-            // weight_ptr 复用 input_ptr (占位, 不被使用), weight_dtype 用 ctx.dtype (无独立 weight dtype)。
+            // weight_ptr 复用 input_ptr (占位, 不被使用), weight_dtype 用 ctx.accum_dtype (无独立 weight dtype)。
             // 禁止访问 op.inputs[1] — L2Normalize 构造时只传 1 个 input (graph_impl.inc.rs:685 / fusion/pass.rs:2092),
             // 访问 inputs[1] 会 panic (index out of bounds)。
             // @trace BCE-20260703-L2NORMALIZE-INPUTS-OOB [level:unit]
             let weight_ptr = input_ptr;
-            let weight_dtype = ctx.dtype;
+            let weight_dtype = ctx.accum_dtype;
             let output_ptr = resolver.materialize(prog, op.outputs[0], abi)
                 .ok_or_else(|| CompilerError::CodegenViolation(format!("L2Normalize op {:?}: 无输出指针", op.id)))?;
             let key = ScalarOpRegistry::key_from_op(&op.op);
@@ -127,7 +127,7 @@ fn lower_op_normlike(prog: &mut VmProgram, op: &CompilerOp, graph: &CompilerGrap
             emit_normlike_inline(
                 prog, &pattern, hidden, 1, false, NormKind::ValueNorm,
                 width, seq_bound, input_ptr, weight_ptr, output_ptr,
-                ctx.dtype, weight_dtype,
+                ctx.accum_dtype, weight_dtype,
             )?;
             Ok(Some(true))
         }
@@ -138,13 +138,13 @@ fn lower_op_normlike(prog: &mut VmProgram, op: &CompilerOp, graph: &CompilerGrap
             let output_ptr = resolver.materialize(prog, op.outputs[0], abi)
                 .ok_or_else(|| CompilerError::CodegenViolation(format!("Softmax op {:?}: 无输出指针", op.id)))?;
             let (max_val, sum_val) = emit_softmax_inline(
-                prog, feature_dim, width, input_ptr, output_ptr, ctx.dtype,
+                prog, feature_dim, width, input_ptr, output_ptr, ctx.accum_dtype,
             )?;
             if graph.telemetry.softmax_sharpness {
                 if let Some(expr) = ctx.session.sym_map.resolve("telemetry") {
                     let tel_ptr = prog.alloc_vreg(VRegKind::Ptr, SimdWidth::Scalar);
                     prog.emit(VmInstr::LoadPtr { dst: tel_ptr, src: expr.clone() });
-                    emit_softmax_telemetry(prog, max_val, sum_val, tel_ptr, width, ctx.dtype);
+                    emit_softmax_telemetry(prog, max_val, sum_val, tel_ptr, width, ctx.accum_dtype);
                 }
             }
             Ok(Some(true))
@@ -193,7 +193,7 @@ fn lower_op_gemm(prog: &mut VmProgram, op: &CompilerOp, graph: &CompilerGraph, c
                 CompilerError::CodegenViolation(format!("QuantGemm op {:?}: output 无法 materialize", op.id))
             })?;
             super::moe_quant_emit::emit_quant_gemm_inline(prog, m_bound, spec.n, spec.k, spec.quant_type,
-                ctx.session.width, a_ptr, b_ptr, c_ptr, ctx.dtype, ctx.session.dot_cap)?;
+                ctx.session.width, a_ptr, b_ptr, c_ptr, ctx.accum_dtype, ctx.session.dot_cap)?;
             Ok(Some(true))
         }
         Op::MlaKvCompress { ref m, d_c, hidden } => {
@@ -215,7 +215,7 @@ fn lower_op_gemm(prog: &mut VmProgram, op: &CompilerOp, graph: &CompilerGraph, c
             emit_gemm_inline_with_hook(prog, m, d_c, hidden, ctx,
                 input_ptr, weight_ptr, output_ptr,
                 Some(&m_bound), Some(op.id), None, false,
-                ctx.dtype, ctx.dtype, ctx.dtype)?;
+                ctx.accum_dtype, ctx.accum_dtype, ctx.accum_dtype)?;
             Ok(Some(true))
         }
         Op::MlaQAbsorb { ref seq_len, num_heads, head_dim, d_c } => {
@@ -234,7 +234,7 @@ fn lower_op_gemm(prog: &mut VmProgram, op: &CompilerOp, graph: &CompilerGraph, c
             } else { seq_len.clone() };
             emit_gemm_inline_with_hook(prog, &m_for_gemm, d_c, head_dim, ctx,
                 input_ptr, weight_ptr, output_ptr, None, Some(op.id), None, true,
-                ctx.dtype, ctx.dtype, ctx.dtype)?;
+                ctx.accum_dtype, ctx.accum_dtype, ctx.accum_dtype)?;
             Ok(Some(true))
         }
         Op::MlaVRestore { ref seq_len, num_heads, head_dim, d_c } => {
@@ -253,7 +253,7 @@ fn lower_op_gemm(prog: &mut VmProgram, op: &CompilerOp, graph: &CompilerGraph, c
             } else { seq_len.clone() };
             emit_gemm_inline_with_hook(prog, &m_for_gemm, head_dim, d_c, ctx,
                 input_ptr, weight_ptr, output_ptr, None, Some(op.id), None, false,
-                ctx.dtype, ctx.dtype, ctx.dtype)?;
+                ctx.accum_dtype, ctx.accum_dtype, ctx.accum_dtype)?;
             Ok(Some(true))
         }
         _ => Ok(None),
@@ -297,7 +297,7 @@ fn lower_op_attention(prog: &mut VmProgram, op: &CompilerOp, graph: &CompilerGra
             super::mla_emit::emit_mla_attn_score_inline(
                 prog, spec.num_heads, spec.head_dim, spec.d_c, spec.d_rope,
                 &[q_absorbed_ptr, kv_cache_ptr, w_uv_ptr, output_ptr],
-                kv_len_vreg, ctx.session.width, ctx.dtype,
+                kv_len_vreg, ctx.session.width, ctx.accum_dtype,
             )?;
             Ok(Some(true))
         }
@@ -343,7 +343,7 @@ fn lower_op_rope(prog: &mut VmProgram, op: &CompilerOp, graph: &CompilerGraph, c
                 prog, rope_seq_bound, spec.num_heads, spec.head_dim,
                 spec.partial, ctx.session.width,
                 input_ptr, output_ptr, cos_sin_offset, ctx.session.sym_map,
-                ctx.dtype, rope_pos_offset,
+                ctx.accum_dtype, rope_pos_offset,
             )?;
             Ok(Some(true))
         }
@@ -389,11 +389,11 @@ fn lower_op_rope(prog: &mut VmProgram, op: &CompilerOp, graph: &CompilerGraph, c
             prog.emit(VmInstr::GprBinOp { dst: remainder, a: temp_add, b: GprOperand::VReg(product), op: GprOp::Sub });
             prog.emit(VmInstr::GprCondAction { cond: GprCondition::CmpEq(remainder, spec.layer_remainder as u64), action: GprBranchAction::JumpToLabel(label_global) });
             super::structural_emit::emit_rope_inline(prog, rope_seq_bound.clone(), spec.num_heads, spec.head_dim,
-                spec.sliding_partial, width, input_ptr, output_ptr, sliding_cos_offset, ctx.session.sym_map, ctx.dtype, rope_pos_offset)?;
+                spec.sliding_partial, width, input_ptr, output_ptr, sliding_cos_offset, ctx.session.sym_map, ctx.accum_dtype, rope_pos_offset)?;
             prog.emit(VmInstr::GprCondAction { cond: GprCondition::IsNonNull(layer_ctr), action: GprBranchAction::JumpToLabel(label_end) });
             prog.emit(VmInstr::MarkLabel { label_id: label_global });
             super::structural_emit::emit_rope_inline(prog, rope_seq_bound, spec.num_heads, spec.head_dim,
-                spec.global_partial, width, input_ptr, output_ptr, global_cos_offset, ctx.session.sym_map, ctx.dtype, rope_pos_offset)?;
+                spec.global_partial, width, input_ptr, output_ptr, global_cos_offset, ctx.session.sym_map, ctx.accum_dtype, rope_pos_offset)?;
             prog.emit(VmInstr::MarkLabel { label_id: label_end });
             Ok(Some(true))
         }
@@ -420,11 +420,11 @@ fn lower_op_moe(prog: &mut VmProgram, op: &CompilerOp, graph: &CompilerGraph, ct
                 })
             } else { None };
             super::norm_softmax_emit::emit_softmax_inline(
-                prog, num_experts, ctx.session.width, input_ptr, input_ptr, ctx.dtype,
+                prog, num_experts, ctx.session.width, input_ptr, input_ptr, ctx.accum_dtype,
             )?;
             super::moe_quant_emit::emit_moe_topk_dispatch_inline(
                 prog, num_experts, top_k, ctx.session.width,
-                input_ptr, output_ptr, ctx.session.hook, telemetry_ptr, ctx.dtype,
+                input_ptr, output_ptr, ctx.session.hook, telemetry_ptr, ctx.accum_dtype,
             )?;
             Ok(Some(true))
         }
@@ -439,19 +439,19 @@ fn lower_op_moe(prog: &mut VmProgram, op: &CompilerOp, graph: &CompilerGraph, ct
             let output_ptr = resolver.materialize(prog, op.outputs[0], abi).ok_or_else(|| {
                 CompilerError::CodegenViolation(format!("MoERouter op {:?}: output 无法 materialize", op.id))
             })?;
-            let logits_off = top_k * 2 * ctx.dtype.elem_bytes();
+            let logits_off = top_k * 2 * ctx.accum_dtype.elem_bytes();
             let logits_ptr = prog.alloc_vreg(VRegKind::Ptr, SimdWidth::Scalar);
             prog.emit(VmInstr::LoadPtr { dst: logits_ptr, src: PtrExpr::VRegPlusConst(output_ptr, logits_off) });
             super::moe_quant_emit::emit_moe_router_gemv_inline(
                 prog, num_experts, hidden, ctx.session.width,
-                input_ptr, weight_vreg, logits_ptr, ctx.dtype,
+                input_ptr, weight_vreg, logits_ptr, ctx.accum_dtype,
             )?;
             super::norm_softmax_emit::emit_softmax_inline(
-                prog, num_experts, ctx.session.width, logits_ptr, logits_ptr, ctx.dtype,
+                prog, num_experts, ctx.session.width, logits_ptr, logits_ptr, ctx.accum_dtype,
             )?;
             super::moe_quant_emit::emit_moe_topk_dispatch_inline(
                 prog, num_experts, top_k, ctx.session.width,
-                logits_ptr, output_ptr, ctx.session.hook, None, ctx.dtype,
+                logits_ptr, output_ptr, ctx.session.hook, None, ctx.accum_dtype,
             )?;
             Ok(Some(true))
         }
@@ -482,7 +482,7 @@ fn lower_op_moe(prog: &mut VmProgram, op: &CompilerOp, graph: &CompilerGraph, ct
                 hidden_input_ptr, router_weight_ptr, router_bias_ptr,
                 gate_up_blocks_ptr, gate_up_scales_ptr, gate_up_bias_ptr,
                 down_blocks_ptr, down_scales_ptr, down_bias_ptr,
-                output_ptr, scratchpad_vreg, ctx.dtype,
+                output_ptr, scratchpad_vreg, ctx.accum_dtype,
             )?;
             Ok(Some(true))
         }
@@ -506,7 +506,7 @@ fn lower_op_altup(prog: &mut VmProgram, op: &CompilerOp, graph: &CompilerGraph, 
             let seq_bound = ctx.session.sym_map.to_bound(seq_len);
             let width = ctx.session.width.f32_lanes();
             let p = num_preds;
-            let elem_bytes = ctx.dtype.elem_bytes();
+            let elem_bytes = ctx.accum_dtype.elem_bytes();
             let row_bytes = p * hidden * elem_bytes;
             let num_vec = (hidden + width - 1) / width;
             prog.emit_loop_try(seq_bound, row_bytes, |prog, _ctr, seq_off| {
@@ -520,11 +520,11 @@ fn lower_op_altup(prog: &mut VmProgram, op: &CompilerOp, graph: &CompilerGraph, 
                         let data = prog.alloc_vreg(VRegKind::Vec, ctx.session.width);
                         prog.emit(VmInstr::VecLoad {
                             dst: data, base: input_ptr, offset: off_expr.clone(),
-                            width: ctx.session.width, dtype: ctx.dtype, predicate: None,
+                            width: ctx.session.width, dtype: ctx.accum_dtype, predicate: None,
                         });
                         prog.emit(VmInstr::VecStore {
                             base: output_ptr, offset: off_expr, src: data,
-                            width: ctx.session.width, dtype: ctx.dtype, predicate: None,
+                            width: ctx.session.width, dtype: ctx.accum_dtype, predicate: None,
                         });
                     }
                     for q in 0..p {
@@ -537,7 +537,7 @@ fn lower_op_altup(prog: &mut VmProgram, op: &CompilerOp, graph: &CompilerGraph, 
                                 Box::new(OffsetExpr::Const(coef_byte_off)),
                             )),
                             width: ctx.session.width,
-                            dtype: ctx.dtype,
+                            dtype: ctx.accum_dtype,
                         });
                         for v in 0..num_vec {
                             let q_off = q * hidden * elem_bytes + v * width * elem_bytes;
@@ -553,26 +553,26 @@ fn lower_op_altup(prog: &mut VmProgram, op: &CompilerOp, graph: &CompilerGraph, 
                             let h_q = prog.alloc_vreg(VRegKind::Vec, ctx.session.width);
                             prog.emit(VmInstr::VecLoad {
                                 dst: h_q, base: input_ptr, offset: q_off_expr,
-                                width: ctx.session.width, dtype: ctx.dtype, predicate: None,
+                                width: ctx.session.width, dtype: ctx.accum_dtype, predicate: None,
                             });
                             let scaled = prog.alloc_vreg(VRegKind::Vec, ctx.session.width);
                             prog.emit(VmInstr::VecBinOp {
                                 dst: scaled, a: h_q, b: coef_bc,
-                                op: VecOp::Mul, dtype: ctx.dtype,
+                                op: VecOp::Mul, dtype: ctx.accum_dtype,
                             });
                             let acc = prog.alloc_vreg(VRegKind::Vec, ctx.session.width);
                             prog.emit(VmInstr::VecLoad {
                                 dst: acc, base: output_ptr, offset: out_off_expr.clone(),
-                                width: ctx.session.width, dtype: ctx.dtype, predicate: None,
+                                width: ctx.session.width, dtype: ctx.accum_dtype, predicate: None,
                             });
                             let new_acc = prog.alloc_vreg(VRegKind::Vec, ctx.session.width);
                             prog.emit(VmInstr::VecBinOp {
                                 dst: new_acc, a: acc, b: scaled,
-                                op: VecOp::Add, dtype: ctx.dtype,
+                                op: VecOp::Add, dtype: ctx.accum_dtype,
                             });
                             prog.emit(VmInstr::VecStore {
                                 base: output_ptr, offset: out_off_expr, src: new_acc,
-                                width: ctx.session.width, dtype: ctx.dtype, predicate: None,
+                                width: ctx.session.width, dtype: ctx.accum_dtype, predicate: None,
                             });
                         }
                     }
@@ -595,7 +595,7 @@ fn lower_op_altup(prog: &mut VmProgram, op: &CompilerOp, graph: &CompilerGraph, 
             let seq_bound = ctx.session.sym_map.to_bound(seq_len);
             let width = ctx.session.width.f32_lanes();
             let p = num_preds;
-            let elem_bytes = ctx.dtype.elem_bytes();
+            let elem_bytes = ctx.accum_dtype.elem_bytes();
             let row_bytes = p * hidden * elem_bytes;
             let num_vec = (hidden + width - 1) / width;
             prog.emit_loop_try(seq_bound, row_bytes, |prog, _ctr, seq_off| {
@@ -608,11 +608,11 @@ fn lower_op_altup(prog: &mut VmProgram, op: &CompilerOp, graph: &CompilerGraph, 
                     let data = prog.alloc_vreg(VRegKind::Vec, ctx.session.width);
                     prog.emit(VmInstr::VecLoad {
                         dst: data, base: gated_ptr, offset: off_expr.clone(),
-                        width: ctx.session.width, dtype: ctx.dtype, predicate: None,
+                        width: ctx.session.width, dtype: ctx.accum_dtype, predicate: None,
                     });
                     prog.emit(VmInstr::VecStore {
                         base: output_ptr, offset: off_expr, src: data,
-                        width: ctx.session.width, dtype: ctx.dtype, predicate: None,
+                        width: ctx.session.width, dtype: ctx.accum_dtype, predicate: None,
                     });
                 }
                 for p_out in 1..p {
@@ -624,7 +624,7 @@ fn lower_op_altup(prog: &mut VmProgram, op: &CompilerOp, graph: &CompilerGraph, 
                             Box::new(OffsetExpr::Const(p_out * elem_bytes)),
                         )),
                         width: ctx.session.width,
-                        dtype: ctx.dtype,
+                        dtype: ctx.accum_dtype,
                     });
                     for v in 0..num_vec {
                         let chunk_off = v * width * elem_bytes;
@@ -639,32 +639,32 @@ fn lower_op_altup(prog: &mut VmProgram, op: &CompilerOp, graph: &CompilerGraph, 
                         let pred_v = prog.alloc_vreg(VRegKind::Vec, ctx.session.width);
                         prog.emit(VmInstr::VecLoad {
                             dst: pred_v, base: input_ptr, offset: pred_off,
-                            width: ctx.session.width, dtype: ctx.dtype, predicate: None,
+                            width: ctx.session.width, dtype: ctx.accum_dtype, predicate: None,
                         });
                         let gated_v = prog.alloc_vreg(VRegKind::Vec, ctx.session.width);
                         prog.emit(VmInstr::VecLoad {
                             dst: gated_v, base: gated_ptr, offset: base_off.clone(),
-                            width: ctx.session.width, dtype: ctx.dtype, predicate: None,
+                            width: ctx.session.width, dtype: ctx.accum_dtype, predicate: None,
                         });
                         let pred0_v = prog.alloc_vreg(VRegKind::Vec, ctx.session.width);
                         prog.emit(VmInstr::VecLoad {
                             dst: pred0_v, base: input_ptr, offset: base_off,
-                            width: ctx.session.width, dtype: ctx.dtype, predicate: None,
+                            width: ctx.session.width, dtype: ctx.accum_dtype, predicate: None,
                         });
                         let innov = prog.alloc_vreg(VRegKind::Vec, ctx.session.width);
                         prog.emit(VmInstr::VecBinOp {
                             dst: innov, a: gated_v, b: pred0_v,
-                            op: VecOp::Sub, dtype: ctx.dtype,
+                            op: VecOp::Sub, dtype: ctx.accum_dtype,
                         });
                         let scaled = prog.alloc_vreg(VRegKind::Vec, ctx.session.width);
                         prog.emit(VmInstr::VecBinOp {
                             dst: scaled, a: coef_bc, b: innov,
-                            op: VecOp::Mul, dtype: ctx.dtype,
+                            op: VecOp::Mul, dtype: ctx.accum_dtype,
                         });
                         let result = prog.alloc_vreg(VRegKind::Vec, ctx.session.width);
                         prog.emit(VmInstr::VecBinOp {
                             dst: result, a: pred_v, b: scaled,
-                            op: VecOp::Add, dtype: ctx.dtype,
+                            op: VecOp::Add, dtype: ctx.accum_dtype,
                         });
                         let out_off = OffsetExpr::Add(
                             Box::new(OffsetExpr::LoopOffset(seq_off)),
@@ -672,7 +672,7 @@ fn lower_op_altup(prog: &mut VmProgram, op: &CompilerOp, graph: &CompilerGraph, 
                         );
                         prog.emit(VmInstr::VecStore {
                             base: output_ptr, offset: out_off, src: result,
-                            width: ctx.session.width, dtype: ctx.dtype, predicate: None,
+                            width: ctx.session.width, dtype: ctx.accum_dtype, predicate: None,
                         });
                     }
                 }
@@ -692,7 +692,7 @@ fn lower_op_altup(prog: &mut VmProgram, op: &CompilerOp, graph: &CompilerGraph, 
             let seq_bound = ctx.session.sym_map.to_bound(seq_len);
             let width = ctx.session.width.f32_lanes();
             let p = num_preds;
-            let elem_bytes = ctx.dtype.elem_bytes();
+            let elem_bytes = ctx.accum_dtype.elem_bytes();
             let row_bytes = p * hidden * elem_bytes;
             let num_vec = (hidden + width - 1) / width;
             prog.emit_loop_try(seq_bound, row_bytes, |prog, _ctr, seq_off| {
@@ -706,11 +706,11 @@ fn lower_op_altup(prog: &mut VmProgram, op: &CompilerOp, graph: &CompilerGraph, 
                     let data = prog.alloc_vreg(VRegKind::Vec, ctx.session.width);
                     prog.emit(VmInstr::VecLoad {
                         dst: data, base: input_ptr, offset: off_expr.clone(),
-                        width: ctx.session.width, dtype: ctx.dtype, predicate: None,
+                        width: ctx.session.width, dtype: ctx.accum_dtype, predicate: None,
                     });
                     prog.emit(VmInstr::VecStore {
                         base: output_ptr, offset: off_expr, src: data,
-                        width: ctx.session.width, dtype: ctx.dtype, predicate: None,
+                        width: ctx.session.width, dtype: ctx.accum_dtype, predicate: None,
                     });
                 }
                 for p_out in 1..p {
@@ -723,7 +723,7 @@ fn lower_op_altup(prog: &mut VmProgram, op: &CompilerOp, graph: &CompilerGraph, 
                         let norm_v = prog.alloc_vreg(VRegKind::Vec, ctx.session.width);
                         prog.emit(VmInstr::VecLoad {
                             dst: norm_v, base: norm_ptr, offset: norm_off,
-                            width: ctx.session.width, dtype: ctx.dtype, predicate: None,
+                            width: ctx.session.width, dtype: ctx.accum_dtype, predicate: None,
                         });
                         let out_off = OffsetExpr::Add(
                             Box::new(OffsetExpr::LoopOffset(seq_off)),
@@ -732,16 +732,16 @@ fn lower_op_altup(prog: &mut VmProgram, op: &CompilerOp, graph: &CompilerGraph, 
                         let out_v = prog.alloc_vreg(VRegKind::Vec, ctx.session.width);
                         prog.emit(VmInstr::VecLoad {
                             dst: out_v, base: output_ptr, offset: out_off.clone(),
-                            width: ctx.session.width, dtype: ctx.dtype, predicate: None,
+                            width: ctx.session.width, dtype: ctx.accum_dtype, predicate: None,
                         });
                         let sum = prog.alloc_vreg(VRegKind::Vec, ctx.session.width);
                         prog.emit(VmInstr::VecBinOp {
                             dst: sum, a: out_v, b: norm_v,
-                            op: VecOp::Add, dtype: ctx.dtype,
+                            op: VecOp::Add, dtype: ctx.accum_dtype,
                         });
                         prog.emit(VmInstr::VecStore {
                             base: output_ptr, offset: out_off, src: sum,
-                            width: ctx.session.width, dtype: ctx.dtype, predicate: None,
+                            width: ctx.session.width, dtype: ctx.accum_dtype, predicate: None,
                         });
                     }
                 }
@@ -767,7 +767,7 @@ fn lower_op_gather(prog: &mut VmProgram, op: &CompilerOp, graph: &CompilerGraph,
             let seq_bound = resolve_sym_dim(&seq_len, abi, ctx.session.sym_map);
             super::structural_emit::emit_column_slice_inline(
                 prog, seq_bound, input_inner, start, slice_dim,
-                ctx.session.width, input_ptr, output_ptr, ctx.dtype,
+                ctx.session.width, input_ptr, output_ptr, ctx.accum_dtype,
             )?;
             Ok(Some(true))
         }
@@ -797,11 +797,11 @@ fn lower_op_gather(prog: &mut VmProgram, op: &CompilerOp, graph: &CompilerGraph,
             let weight_dtype = op.inputs.get(1)
                 .and_then(|&tid| graph.tensor(tid))
                 .map(|t| t.dtype.to_quant_precision())
-                .unwrap_or(ctx.dtype);
+                .unwrap_or(ctx.accum_dtype);
             super::structural_emit::emit_gather_inline(
                 prog, seq_bound, embed_dim, ctx.session.width,
                 input_ptr, weight_ptr, output_ptr, telemetry_ptr, scale,
-                indices_kind.clone(), ctx.dtype, weight_dtype,
+                indices_kind.clone(), ctx.accum_dtype, weight_dtype,
             )?;
             Ok(Some(true))
         }
@@ -823,7 +823,7 @@ fn lower_op_gather(prog: &mut VmProgram, op: &CompilerOp, graph: &CompilerGraph,
             super::quant_gather_emit::emit_quant_gather_inline(
                 prog, seq_bound, vocab_size, hidden_dim, quant_type,
                 ctx.session.width, input_ptr, weight_ptr, output_ptr,
-                ctx.dtype, scale,
+                ctx.accum_dtype, scale,
             )?;
             Ok(Some(true))
         }
@@ -858,7 +858,7 @@ fn lower_op_generation(prog: &mut VmProgram, op: &CompilerOp, graph: &CompilerGr
             super::telemetry_emit::emit_residual_with_telemetry(
                 prog, &out_shape, feature_dim, ctx.session.width,
                 in_ptr, w_ptr, out_ptr, ctx.session.sym_map, telemetry_ptr,
-                None, ctx.dtype,
+                None, ctx.accum_dtype,
             )?;
             Ok(Some(true))
         }
@@ -867,9 +867,9 @@ fn lower_op_generation(prog: &mut VmProgram, op: &CompilerOp, graph: &CompilerGr
                 CompilerError::CodegenViolation(format!("Argmax op {:?}: logits 无法 materialize", op.id))
             })?;
             let argmax_dst = prog.alloc_vreg(VRegKind::Scalar, SimdWidth::Scalar);
-            let vocab_bytes = vocab_size * ctx.dtype.elem_bytes();
+            let vocab_bytes = vocab_size * ctx.accum_dtype.elem_bytes();
             prog.emit(VmInstr::Argmax {
-                dst: argmax_dst, logits_ptr, vocab_bytes, width: ctx.session.width, dtype: ctx.dtype,
+                dst: argmax_dst, logits_ptr, vocab_bytes, width: ctx.session.width, dtype: ctx.accum_dtype,
             });
             let out_ptr = resolver.materialize(prog, op.outputs[0], abi).ok_or_else(|| {
                 CompilerError::CodegenViolation(format!("Argmax op {:?}: output 无法 materialize", op.id))
@@ -920,7 +920,7 @@ fn lower_op_generation(prog: &mut VmProgram, op: &CompilerOp, graph: &CompilerGr
                 .product::<usize>()
                 .max(1);
             let width = ctx.session.width.f32_lanes();
-            let elem_bytes = ctx.dtype.elem_bytes();
+            let elem_bytes = ctx.accum_dtype.elem_bytes();
             let num_vec = (feature_dim + width - 1) / width;
             let row_bytes = feature_dim * elem_bytes;
             let const_bc = prog.alloc_vreg(VRegKind::Vec, ctx.session.width);
@@ -928,7 +928,7 @@ fn lower_op_generation(prog: &mut VmProgram, op: &CompilerOp, graph: &CompilerGr
                 dst: const_bc,
                 src: ScalarExpr::Const(value),
                 width: ctx.session.width,
-                dtype: ctx.dtype,
+                dtype: ctx.accum_dtype,
             });
             if let Some(sym_dim) = seq_dim {
                 let seq_bound = ctx.session.sym_map.to_bound(&sym_dim);
@@ -942,16 +942,16 @@ fn lower_op_generation(prog: &mut VmProgram, op: &CompilerOp, graph: &CompilerGr
                         let data = prog.alloc_vreg(VRegKind::Vec, ctx.session.width);
                         prog.emit(VmInstr::VecLoad {
                             dst: data, base: input_ptr, offset: off_expr.clone(),
-                            width: ctx.session.width, dtype: ctx.dtype, predicate: None,
+                            width: ctx.session.width, dtype: ctx.accum_dtype, predicate: None,
                         });
                         let scaled = prog.alloc_vreg(VRegKind::Vec, ctx.session.width);
                         prog.emit(VmInstr::VecBinOp {
                             dst: scaled, a: data, b: const_bc,
-                            op: VecOp::Mul, dtype: ctx.dtype,
+                            op: VecOp::Mul, dtype: ctx.accum_dtype,
                         });
                         prog.emit(VmInstr::VecStore {
                             base: output_ptr, offset: off_expr, src: scaled,
-                            width: ctx.session.width, dtype: ctx.dtype, predicate: None,
+                            width: ctx.session.width, dtype: ctx.accum_dtype, predicate: None,
                         });
                     }
                     Ok::<_, CompilerError>(())
@@ -963,16 +963,16 @@ fn lower_op_generation(prog: &mut VmProgram, op: &CompilerOp, graph: &CompilerGr
                     let data = prog.alloc_vreg(VRegKind::Vec, ctx.session.width);
                     prog.emit(VmInstr::VecLoad {
                         dst: data, base: input_ptr, offset: off_expr.clone(),
-                        width: ctx.session.width, dtype: ctx.dtype, predicate: None,
+                        width: ctx.session.width, dtype: ctx.accum_dtype, predicate: None,
                     });
                     let scaled = prog.alloc_vreg(VRegKind::Vec, ctx.session.width);
                     prog.emit(VmInstr::VecBinOp {
                         dst: scaled, a: data, b: const_bc,
-                        op: VecOp::Mul, dtype: ctx.dtype,
+                        op: VecOp::Mul, dtype: ctx.accum_dtype,
                     });
                     prog.emit(VmInstr::VecStore {
                         base: output_ptr, offset: off_expr, src: scaled,
-                        width: ctx.session.width, dtype: ctx.dtype, predicate: None,
+                        width: ctx.session.width, dtype: ctx.accum_dtype, predicate: None,
                     });
                 }
             }
@@ -983,7 +983,7 @@ fn lower_op_generation(prog: &mut VmProgram, op: &CompilerOp, graph: &CompilerGr
                 "SessionKvRestore: no output tensor".into()))?;
             let out_shape = &graph.tensor(*out_tid).unwrap().shape;
             let feature_dim: usize = out_shape.iter().filter_map(|d| d.as_concrete()).sum();
-            let elem_b = ctx.dtype.elem_bytes();
+            let elem_b = ctx.accum_dtype.elem_bytes();
             let width = ctx.session.width;
             let step = width.f32_lanes() * elem_b;
             let iters = (feature_dim * elem_b + step - 1) / step;
@@ -1002,11 +1002,11 @@ fn lower_op_generation(prog: &mut VmProgram, op: &CompilerOp, graph: &CompilerGr
             let vec = prog.alloc_vreg(VRegKind::Vec, width);
             prog.emit(VmInstr::VecLoad {
                 dst: vec, base: input_ptr,
-                offset: OffsetExpr::LoopOffset(byte_off), width, dtype: ctx.dtype, predicate: None,
+                offset: OffsetExpr::LoopOffset(byte_off), width, dtype: ctx.accum_dtype, predicate: None,
             });
             prog.emit(VmInstr::VecStore {
                 base: output_ptr, src: vec,
-                offset: OffsetExpr::LoopOffset(byte_off), width, dtype: ctx.dtype, predicate: None,
+                offset: OffsetExpr::LoopOffset(byte_off), width, dtype: ctx.accum_dtype, predicate: None,
             });
             prog.emit(VmInstr::LoopEnd);
             Ok(Some(true))
@@ -1103,7 +1103,7 @@ fn lower_op_hook(prog: &mut VmProgram, op: &CompilerOp, graph: &CompilerGraph, c
             })?;
             super::structural_builder::StructuralOpBuilder::emit_simd_injection(
                 prog, input_ptr, sg_base,
-                12, 16 + dim * 4, dim, ctx.session.width, ctx.dtype,
+                12, 16 + dim * 4, dim, ctx.session.width, ctx.accum_dtype,
             )?;
             Ok(Some(true))
         }
@@ -1118,7 +1118,7 @@ fn lower_op_hook(prog: &mut VmProgram, op: &CompilerOp, graph: &CompilerGraph, c
                 dst: detect_ptr, src: PtrExpr::VRegPlusConst(sg_base, 16),
             });
             super::structural_builder::StructuralOpBuilder::emit_side_channel_copy(
-                prog, input_ptr, detect_ptr, 0, hidden_dim, ctx.session.width, ctx.dtype,
+                prog, input_ptr, detect_ptr, 0, hidden_dim, ctx.session.width, ctx.accum_dtype,
             )?;
             if abi.callback_table_ptr.is_some() {
                 let cb_table = prog.alloc_vreg(VRegKind::Ptr, SimdWidth::Scalar);
@@ -1167,28 +1167,28 @@ fn lower_op_hook(prog: &mut VmProgram, op: &CompilerOp, graph: &CompilerGraph, c
                 CompilerError::CodegenViolation(format!("MmHiddenInject op {:?}: output 无法 materialize", op.id))
             })?;
             let width = ctx.session.width;
-            let total_bytes = hidden_dim * ctx.dtype.elem_bytes();
-            // BCE-20260704-STEP-DTYPE-MISMATCH: step 必须按 ctx.dtype 计算字节数,
+            let total_bytes = hidden_dim * ctx.accum_dtype.elem_bytes();
+            // BCE-20260704-STEP-DTYPE-MISMATCH: step 必须按 ctx.accum_dtype 计算字节数,
             // 与下方 VecLoad/VecStore 的 dtype 一致。BF16 时 step = lanes*2 (8 BF16 元素),
             // F32 时 step = lanes*4 = width.bytes()。原硬编码 lanes*4 在 BF16 下让循环
             // 跳 32B=16 BF16 元素而 VecLoad 只读 8 → 跳过一半元素 (与 e24a2e49 同类)。
-            let step = width.f32_lanes() * ctx.dtype.elem_bytes();
+            let step = width.f32_lanes() * ctx.accum_dtype.elem_bytes();
             let iters = (total_bytes + step - 1) / step;
             let ctr = prog.alloc_vreg(VRegKind::Counter, SimdWidth::Scalar);
             let byte_off = prog.alloc_vreg(VRegKind::ByteOffset, SimdWidth::Scalar);
             prog.emit(VmInstr::LoopBegin { counter: ctr, byte_offset: byte_off, bound: BoundExpr::Const(iters), step_bytes: step });
             let src_vec = prog.alloc_vreg(VRegKind::Vec, width);
-            prog.emit(VmInstr::VecLoad { dst: src_vec, base: input_ptr, offset: OffsetExpr::LoopOffset(byte_off), width, dtype: ctx.dtype , predicate: None,});
+            prog.emit(VmInstr::VecLoad { dst: src_vec, base: input_ptr, offset: OffsetExpr::LoopOffset(byte_off), width, dtype: ctx.accum_dtype , predicate: None,});
             let mm_vec = prog.alloc_vreg(VRegKind::Vec, width);
-            prog.emit(VmInstr::VecLoad { dst: mm_vec, base: input_ptr, offset: OffsetExpr::LoopOffset(byte_off), width, dtype: ctx.dtype , predicate: None,});
+            prog.emit(VmInstr::VecLoad { dst: mm_vec, base: input_ptr, offset: OffsetExpr::LoopOffset(byte_off), width, dtype: ctx.accum_dtype , predicate: None,});
             let result = prog.alloc_vreg(VRegKind::Vec, width);
             let ple_add_body: Vec<TraceOp> = vec![
                 TraceOp::Input(0), TraceOp::Input(1),
                 TraceOp::Add(ValueId(0), ValueId(1)),
             ];
-            super::auto_select::auto_lower_trace_into(prog, &ple_add_body, &[src_vec, mm_vec], result, width, ctx.dtype)
+            super::auto_select::auto_lower_trace_into(prog, &ple_add_body, &[src_vec, mm_vec], result, width, ctx.accum_dtype)
                 .map_err(|e| CompilerError::CodegenViolation(format!("MmHiddenInject auto_lower: {e}")))?;
-            prog.emit(VmInstr::VecStore { base: output_ptr, src: result, offset: OffsetExpr::LoopOffset(byte_off), width, dtype: ctx.dtype , predicate: None,});
+            prog.emit(VmInstr::VecStore { base: output_ptr, src: result, offset: OffsetExpr::LoopOffset(byte_off), width, dtype: ctx.accum_dtype , predicate: None,});
             prog.emit(VmInstr::LoopEnd);
             Ok(Some(true))
         }
@@ -1272,7 +1272,7 @@ fn lower_op_vision(prog: &mut VmProgram, op: &CompilerOp, graph: &CompilerGraph,
             let out_shape = vec![SymDim::Concrete(num_patches), SymDim::Concrete(embed_dim)];
             let _acc = emit_elementwise_inline(prog, &trace_body, &out_shape, width,
                 /*is_binary=*/true, /*weight_is_broadcast=*/false,
-                input_ptr, weight_ptr, output_ptr, sym_map, seq_bound_override.as_ref(), ctx.dtype)?;
+                input_ptr, weight_ptr, output_ptr, sym_map, seq_bound_override.as_ref(), ctx.accum_dtype)?;
             Ok(Some(true))
         }
         _ => Ok(None),
@@ -1311,7 +1311,7 @@ fn lower_op_meta(prog: &mut VmProgram, op: &CompilerOp, graph: &CompilerGraph, c
             super::mla_emit::emit_mla_rope_merge_inline(
                 prog, d_c, d_rope,
                 &[c_kv_ptr, k_pe_ptr, output_ptr, cos_ptr, sin_ptr, position],
-                ctx.session.width, ctx.dtype,
+                ctx.session.width, ctx.accum_dtype,
             )?;
             Ok(Some(true))
         }
@@ -1352,14 +1352,14 @@ fn lower_gemm_v2(
     let pm = ctx.pack_map_for_gemm(weight_tid);
 
     // BCE-20260629-003 (Pattern c): 推断各矩阵 dtype
-    // a_dtype/c_dtype = ctx.dtype (激活计算精度，通常 F32)
+    // a_dtype/c_dtype = ctx.accum_dtype (激活计算精度，通常 F32)
     // b_dtype = 权重 tensor 的 dtype (BF16/F16/F32)
-    let a_dtype = ctx.dtype;
-    let c_dtype = ctx.dtype;
+    let a_dtype = ctx.accum_dtype;
+    let c_dtype = ctx.accum_dtype;
     let b_dtype = weight_tid
         .and_then(|tid| graph.tensor(tid))
         .map(|t| t.dtype.to_quant_precision())
-        .unwrap_or(ctx.dtype);
+        .unwrap_or(ctx.accum_dtype);
     // CR-DTYPE-SOVEREIGNTY-001: 当 b_dtype≠a_dtype 时，VecLoad(b_ptr, dtype=b_dtype)
     // 会自动 WidenCompute（BF16→F32），VecStore(c_ptr, dtype=c_dtype=F32) 正确。
 

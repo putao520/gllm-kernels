@@ -564,7 +564,7 @@ fn try_auto_dispatch_elementwise(
 
     let _acc = emit_elementwise_inline(prog, &body, &out_shape, ctx.session.width, is_binary,
         weight_is_broadcast,
-        resolved_input, resolved_weight, resolved_output, ctx.session.sym_map, seq_bound_override, ctx.dtype)?;
+        resolved_input, resolved_weight, resolved_output, ctx.session.sym_map, seq_bound_override, ctx.accum_dtype)?;
 
     Ok(true)
 }
@@ -610,12 +610,12 @@ fn try_dispatch_normlike(
     let weight_dtype = op.inputs.get(1)
         .and_then(|&tid| graph.tensor(tid))
         .map(|t| t.dtype.to_quant_precision())
-        .unwrap_or(ctx.dtype);
+        .unwrap_or(ctx.accum_dtype);
     emit_normlike_inline(
         prog, pattern, feature_dim, /*groups_per_row=*/1,
         /*broadcast_weight=*/false, norm_kind,
         ctx.session.width, seq_bound, input_ptr, weight_ptr, output_ptr,
-        ctx.dtype,
+        ctx.accum_dtype,
         weight_dtype, // BCE-20260629-011: 传递 weight dtype
     )?;
     Ok(true)
@@ -678,7 +678,7 @@ pub(crate) fn try_dispatch_reduction(
     }
 
     let width = ctx.session.width;
-    let dtype = ctx.dtype;
+    let dtype = ctx.accum_dtype;
     let lanes = width.f32_lanes().max(1);
     let elem = dtype.elem_bytes();
     let vec_count = feature_dim / lanes;
@@ -711,10 +711,10 @@ pub(crate) fn try_dispatch_reduction(
     match &seq_bound {
         BoundExpr::Const(n) if *n > 0 => {
             let inv_n = 1.0f32 / *n as f32;
-            prog.emit(VmInstr::Broadcast { dst: scale, src: ScalarExpr::Const(inv_n), width, dtype: ctx.dtype, });
+            prog.emit(VmInstr::Broadcast { dst: scale, src: ScalarExpr::Const(inv_n), width, dtype: ctx.accum_dtype, });
         }
         BoundExpr::Const(_) => {
-            prog.emit(VmInstr::Broadcast { dst: scale, src: ScalarExpr::Const(1.0), width, dtype: ctx.dtype, });
+            prog.emit(VmInstr::Broadcast { dst: scale, src: ScalarExpr::Const(1.0), width, dtype: ctx.accum_dtype, });
         }
         BoundExpr::Symbolic(sb) => {
             // NO-SILENT-FALLBACK + ARCH-SYMDIM-NO-CONST-DEGRADE:
@@ -739,10 +739,10 @@ pub(crate) fn try_dispatch_reduction(
             let n_float = prog.alloc_vreg(VRegKind::Vec, SimdWidth::Scalar);
             prog.emit(VmInstr::IndexToScalar { dst: n_float, src: n_gpr });
             let n_vec = prog.alloc_vreg(VRegKind::Vec, width);
-            prog.emit(VmInstr::Broadcast { dst: n_vec, src: ScalarExpr::VReg(n_float), width, dtype: ctx.dtype, });
+            prog.emit(VmInstr::Broadcast { dst: n_vec, src: ScalarExpr::VReg(n_float), width, dtype: ctx.accum_dtype, });
             let ones = prog.alloc_vreg(VRegKind::Vec, width);
-            prog.emit(VmInstr::Broadcast { dst: ones, src: ScalarExpr::Const(1.0), width, dtype: ctx.dtype, });
-            prog.emit(VmInstr::VecBinOp { dst: scale, a: ones, b: n_vec, op: VecOp::Div, dtype: ctx.dtype, });
+            prog.emit(VmInstr::Broadcast { dst: ones, src: ScalarExpr::Const(1.0), width, dtype: ctx.accum_dtype, });
+            prog.emit(VmInstr::VecBinOp { dst: scale, a: ones, b: n_vec, op: VecOp::Div, dtype: ctx.accum_dtype, });
         }
         BoundExpr::DynamicVReg(vreg) => {
             // DynamicVReg: 外层 loop counter 的 GPR 值通过 IndexToScalar 转为 float,
@@ -750,22 +750,22 @@ pub(crate) fn try_dispatch_reduction(
             let n_float = prog.alloc_vreg(VRegKind::Vec, SimdWidth::Scalar);
             prog.emit(VmInstr::IndexToScalar { dst: n_float, src: *vreg });
             let n_vec = prog.alloc_vreg(VRegKind::Vec, width);
-            prog.emit(VmInstr::Broadcast { dst: n_vec, src: ScalarExpr::VReg(n_float), width, dtype: ctx.dtype, });
+            prog.emit(VmInstr::Broadcast { dst: n_vec, src: ScalarExpr::VReg(n_float), width, dtype: ctx.accum_dtype, });
             let ones = prog.alloc_vreg(VRegKind::Vec, width);
-            prog.emit(VmInstr::Broadcast { dst: ones, src: ScalarExpr::Const(1.0), width, dtype: ctx.dtype, });
-            prog.emit(VmInstr::VecBinOp { dst: scale, a: ones, b: n_vec, op: VecOp::Div, dtype: ctx.dtype, });
+            prog.emit(VmInstr::Broadcast { dst: ones, src: ScalarExpr::Const(1.0), width, dtype: ctx.accum_dtype, });
+            prog.emit(VmInstr::VecBinOp { dst: scale, a: ones, b: n_vec, op: VecOp::Div, dtype: ctx.accum_dtype, });
         }
         BoundExpr::DynamicVRegPlusOne(vreg) => {
             // DynamicVRegPlusOne: N = vreg + 1. IndexToScalar + float add 1.0 + div.
             let n_float = prog.alloc_vreg(VRegKind::Vec, SimdWidth::Scalar);
             prog.emit(VmInstr::IndexToScalar { dst: n_float, src: *vreg });
             let n_vec = prog.alloc_vreg(VRegKind::Vec, width);
-            prog.emit(VmInstr::Broadcast { dst: n_vec, src: ScalarExpr::VReg(n_float), width, dtype: ctx.dtype, });
+            prog.emit(VmInstr::Broadcast { dst: n_vec, src: ScalarExpr::VReg(n_float), width, dtype: ctx.accum_dtype, });
             let one = prog.alloc_vreg(VRegKind::Vec, width);
-            prog.emit(VmInstr::Broadcast { dst: one, src: ScalarExpr::Const(1.0), width, dtype: ctx.dtype, });
+            prog.emit(VmInstr::Broadcast { dst: one, src: ScalarExpr::Const(1.0), width, dtype: ctx.accum_dtype, });
             let n_plus_one = prog.alloc_vreg(VRegKind::Vec, width);
-            prog.emit(VmInstr::VecBinOp { dst: n_plus_one, a: n_vec, b: one, op: VecOp::Add, dtype: ctx.dtype, });
-            prog.emit(VmInstr::VecBinOp { dst: scale, a: one, b: n_plus_one, op: VecOp::Div, dtype: ctx.dtype, });
+            prog.emit(VmInstr::VecBinOp { dst: n_plus_one, a: n_vec, b: one, op: VecOp::Add, dtype: ctx.accum_dtype, });
+            prog.emit(VmInstr::VecBinOp { dst: scale, a: one, b: n_plus_one, op: VecOp::Div, dtype: ctx.accum_dtype, });
         }
     }
 
@@ -782,7 +782,7 @@ pub(crate) fn try_dispatch_reduction(
     // 内层: 行循环 — 用 LoadPtr 计算行基地址
     if vec_count > 0 {
         prog.emit_loop(BoundExpr::Const(vec_count), step, |prog, _col_ctr, col_off| {
-            prog.emit(VmInstr::Broadcast { dst: acc, src: ScalarExpr::Const(identity as f32), width, dtype: ctx.dtype, });
+            prog.emit(VmInstr::Broadcast { dst: acc, src: ScalarExpr::Const(identity as f32), width, dtype: ctx.accum_dtype, });
 
             prog.emit_loop(seq_bound.clone(), row_bytes, |prog, _row_ctr, row_off| {
                 prog.emit(VmInstr::LoadPtr {
@@ -791,7 +791,7 @@ pub(crate) fn try_dispatch_reduction(
                 });
                 prog.emit(VmInstr::VecLoad {
                     dst: tmp, base: row_base, offset: OffsetExpr::LoopOffset(col_off), width,
-                    dtype: ctx.dtype, predicate: None,
+                    dtype: ctx.accum_dtype, predicate: None,
                 });
                 if combine_is_simple_add {
                     // Simple Add: Accumulate handles acc += tmp directly
@@ -810,7 +810,7 @@ pub(crate) fn try_dispatch_reduction(
 
             prog.emit(VmInstr::VecStore {
                 base: output_ptr, offset: OffsetExpr::LoopOffset(col_off), src: acc, width,
-                dtype: ctx.dtype, predicate: None,
+                dtype: ctx.accum_dtype, predicate: None,
             });
         });
     }
@@ -865,7 +865,7 @@ pub(super) fn emit_standalone_op(
 ) -> Result<(), CompilerError> {
     // BCE-20260630-MIXED-P1: per-op ctx（杠杆总闸）。
     // @trace CTX-PER-OP-DTYPE [req:REQ-DTYPE-006] [level:unit]
-    // 在派发瓶颈点刷新 ctx.dtype = 当前 op 的激活计算精度（op_input_dtype → accumulator_dtype
+    // 在派发瓶颈点刷新 ctx.accum_dtype = 当前 op 的激活计算精度（op_input_dtype → accumulator_dtype
     // promote），替代旧 graph_dtype(graph) 全图统一 F32。下游 RoPE/elementwise/softmax/
     // attention 调用点经 &op_ctx 自动获 per-op 激活 dtype（B1 下激活 F32 → accumulator_dtype
     // 仍 F32，行为等价；B2-ready）。详见 LoweringContext::for_op。
@@ -891,7 +891,7 @@ pub(super) fn emit_standalone_op(
         // handled by lower_op when graph.telemetry.residual_cosine_sim is true.
         if matches!(op.op_resolved(graph), Some(Op::Silu)) && graph.telemetry.silu_dead_neuron {
             let (out_shape, _) = infer_output_shape_sym(op, graph)?;
-            emit_silu_dead_neuron_telemetry(prog, input_ptr, &out_shape, width, sym_map, ctx.dtype)?;
+            emit_silu_dead_neuron_telemetry(prog, input_ptr, &out_shape, width, sym_map, ctx.accum_dtype)?;
         }
         return Ok(());
     }

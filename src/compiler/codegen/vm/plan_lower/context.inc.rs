@@ -47,8 +47,8 @@ pub struct CompileSession<'a> {
 pub struct LoweringContext<'a> {
     /// 编译会话级共享状态（全局常量）
     pub session: &'a CompileSession<'a>,
-    /// 当前图/融合组的计算 dtype（op-local）
-    pub dtype: QuantPrecision,
+    /// 当前图/融合组的累加精度 (accumulator dtype, op-local). 非存储精度! 存储 dtype 由输出张量 TensorMeta 决定. BCE-PHASE2 v2 D6 rename.
+    pub accum_dtype: QuantPrecision,
     /// §0.2.9 虚拟执行模式: 当前 op 的 ExecPattern (from R0 PainPointAnalyzer)
     pub exec_pattern: Option<ExecPattern>,
     /// §0.2.9 R0 PainPointAnalyzer 输出: per-GEMM 瓶颈分析 (含 ExecPattern)
@@ -72,16 +72,16 @@ impl<'a> LoweringContext<'a> {
 
     /// BCE-20260630-MIXED-P1: 派生 per-op ctx（杠杆总闸，MIXED-PRECISION-OPERATOR-PLAN §2/§3）。
     ///
-    /// 返回一个 ctx.dtype = **当前 op 的激活计算精度** 的新 LoweringContext（结构体其余
+    /// 返回一个 ctx.accum_dtype = **当前 op 的激活计算精度** 的新 LoweringContext（结构体其余
     /// 字段照抄：session/bottleneck_map/rope_req/ple_req/dwc_req/parallelism/exec_pattern）。
     ///
-    /// 三段式语义（ARCH-DTYPE-MIXED-PRECISION）：ctx.dtype 承载**激活/计算精度**（accumulate
+    /// 三段式语义（ARCH-DTYPE-MIXED-PRECISION）：ctx.accum_dtype 承载**激活/计算精度**（accumulate
     /// 位置），不是原始存储 dtype。所以从 op 激活输入取 dtype 后用 `accumulator_dtype()`
     /// promote 到计算精度——BF16/F16 激活 → F32 累加器，F32 激活保持 F32。量化/权重类输入
     /// （DequantCompute/INT8 等）不是激活计算 dtype，promote 到 F32（这些 op 的权重 dtype 经
-    /// inputs[1].tensor.dtype per-weight 传播，见 Norm/GEMM 的 weight_dtype 参数，不进 ctx.dtype）。
+    /// inputs[1].tensor.dtype per-weight 传播，见 Norm/GEMM 的 weight_dtype 参数，不进 ctx.accum_dtype）。
     ///
-    /// 旧实现 ctx.dtype = graph_dtype(graph) 对任何浮点图无条件 F32 → 调用点全焊死 F32。
+    /// 旧实现 ctx.accum_dtype = graph_dtype(graph) 对任何浮点图无条件 F32 → 调用点全焊死 F32。
     /// 本方法让 dtype 链从 per-op 激活推断（B1 下激活 F32，accumulator_dtype 仍 F32，行为
     /// 等价；B2-ready：未来 build_graph 喂 BF16 激活时，accumulator_dtype 自动跟到 F32 累加）。
     pub fn for_op(
@@ -102,7 +102,7 @@ impl<'a> LoweringContext<'a> {
         };
         LoweringContext {
             session: self.session,
-            dtype: compute_dtype,
+            accum_dtype: compute_dtype,
             exec_pattern: self.exec_pattern,
             bottleneck_map: self.bottleneck_map,
             rope_req: self.rope_req,
@@ -175,13 +175,13 @@ pub(super) fn graph_dtype(graph: &CompilerGraph) -> QuantPrecision {
     }
     // 计算精度统一 F32（激活累加）。存储 dtype(BF16/F16) 由 VecLoad WidenCompute
     // 在寄存器内 widen 到 F32，不在 graph_dtype 层混入存储精度。
-    // 这保证 JIT ctx.dtype(F32) == MegaKernelAbi.compute_dtype(F32) 同步。
+    // 这保证 JIT ctx.accum_dtype(F32) == MegaKernelAbi.compute_dtype(F32) 同步。
     QuantPrecision::F32
 }
 
 /// 从 op 的第一个输入 tensor 推断计算 dtype (REQ-DTYPE-001)。
 ///
-/// dtype 传播链: TensorMeta.dtype → op_input_dtype() → ctx.dtype → emit_*(ctx) → VmInstr{dtype}
+/// dtype 传播链: TensorMeta.dtype → op_input_dtype() → ctx.accum_dtype → emit_*(ctx) → VmInstr{dtype}
 ///
 /// 推断方向严格单向：从 op.inputs[0].dtype 推导，禁止反向推断。
 /// 无输入 tensor 时安全回退到 F32 (SPEC §0.8 REQ-DTYPE-001 唯一合法的 F32 默认)。
