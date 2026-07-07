@@ -1485,7 +1485,24 @@ fn lower_attention_v2(
         (bound.clone(), bound)
     };
 
-    let dtype = spec.dtype.to_quant_precision();
+    // BCE-PHASE2 v2 D2a (精度主权归位): kv_row_stride 的 dtype 从 K 张量 TensorMeta.dtype 派生,
+    // 不读 spec.dtype (AttentionSpec.dtype 硬编码 F32 违宪). 复用 GEMM b_dtype 先例 (lower_op:1359).
+    // K/V 同构假设: debug_assert V(op.inputs[2]).dtype == K(op.inputs[1]).dtype, 异构则需拆双 stride.
+    // 当前 K 张量 dtype = act_dt = F32 → elem_bytes=4, SmolLM2 stride=768 不变 (零回归).
+    // @trace REQ-DTYPE-CHAIN-004 [entity:AttentionSpec] kv_row_stride dtype 顺 K 张量 TensorMeta
+    let k_tid = op.inputs.get(1).copied()
+        .ok_or_else(|| CompilerError::CodegenViolation(
+            format!("MHA op {:?}: 无 K 张量 (inputs[1])", op.id)))?;
+    let dtype = graph.tensor(k_tid)
+        .map(|t| t.dtype.to_quant_precision())
+        .unwrap_or(spec.dtype.to_quant_precision());  // fallback 仅防御, 生产路径 K 张量必存在
+    // V==K dtype 同构守卫 (异构 K/V 需拆双 stride, 当前所有模型同构)
+    if let (Some(k_t), Some(v_tid)) = (graph.tensor(k_tid), op.inputs.get(2).copied()) {
+        if let Some(v_t) = graph.tensor(v_tid) {
+            debug_assert_eq!(k_t.dtype, v_t.dtype,
+                "BCE-PHASE2: K/V dtype 异构 (K={:?} V={:?}), 需拆双 stride", k_t.dtype, v_t.dtype);
+        }
+    }
 
     // TMA/TMEM detection (GPU only)
     let use_tma = {
