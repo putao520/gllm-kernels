@@ -8,8 +8,12 @@ use std::fmt;
 use crate::quant::QuantType;
 
 /// Data type for tensor elements.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+///
+/// `Default` impl returns `F32` (first variant) — safe accumulator fallback,
+/// consistent with `derive_compute_dtype`'s F32 fallback for no-native-accum hardware.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
 pub enum DType {
+    #[default]
     F32,
     F16,
     BF16,
