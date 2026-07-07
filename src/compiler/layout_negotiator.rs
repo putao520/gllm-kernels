@@ -914,7 +914,7 @@ mod tests {
         let mut graph = CompilerGraph::new();
         let tin = graph.add_tensor_concrete("q", &[1, 4096], DType::F32);
         let tout = graph.add_tensor_concrete("out", &[1, 4096], DType::F32);
-        let _op_id = graph.add_op(Op::MultiHeadAttention(AttentionSpec { geometry: AttentionGeometry { num_q_heads: 32, num_kv_heads: 32, head_dim: 128 }, mask: if true { AttentionMask::Causal } else { AttentionMask::Full }, kv_source: KvSource::FromTensor, sinks: if false { SinksSpec::Learnable } else { SinksSpec::None }, seq_len: SymDim::Concrete(1), dtype: DType::F32 }),
+        let _op_id = graph.add_op(Op::MultiHeadAttention(AttentionSpec { geometry: AttentionGeometry { num_q_heads: 32, num_kv_heads: 32, head_dim: 128 }, mask: if true { AttentionMask::Causal } else { AttentionMask::Full }, kv_source: KvSource::FromTensor, sinks: if false { SinksSpec::Learnable } else { SinksSpec::None }, seq_len: SymDim::Concrete(1)  }),
             vec![tin],
             vec![tout],
             "mha",
@@ -1167,7 +1167,7 @@ mod tests {
         let mut graph = CompilerGraph::new();
         let tin = graph.add_tensor_concrete("q", &[1, 2048], DType::F32);
         let tout = graph.add_tensor_concrete("out", &[1, 2048], DType::F32);
-        let _op_id = graph.add_op(Op::MultiHeadAttention(AttentionSpec { geometry: AttentionGeometry { num_q_heads: 8, num_kv_heads: 8, head_dim: 256 }, mask: if false { AttentionMask::Causal } else { AttentionMask::Full }, kv_source: KvSource::FromTensor, sinks: if false { SinksSpec::Learnable } else { SinksSpec::None }, seq_len: SymDim::Concrete(1), dtype: DType::F32 }),
+        let _op_id = graph.add_op(Op::MultiHeadAttention(AttentionSpec { geometry: AttentionGeometry { num_q_heads: 8, num_kv_heads: 8, head_dim: 256 }, mask: if false { AttentionMask::Causal } else { AttentionMask::Full }, kv_source: KvSource::FromTensor, sinks: if false { SinksSpec::Learnable } else { SinksSpec::None }, seq_len: SymDim::Concrete(1)  }),
             vec![tin],
             vec![tout],
             "mha",
@@ -1511,7 +1511,7 @@ mod tests {
         let mut graph = CompilerGraph::new();
         let tin = graph.add_tensor_concrete("q", &[1, 4096], DType::F32);
         let tout = graph.add_tensor_concrete("out", &[1, 4096], DType::F32);
-        let _op_id = graph.add_op(Op::MultiHeadAttention(AttentionSpec { geometry: AttentionGeometry { num_q_heads: 32, num_kv_heads: 32, head_dim: 128 }, mask: if true { AttentionMask::Causal } else { AttentionMask::Full }, kv_source: KvSource::FromTensor, sinks: if false { SinksSpec::Learnable } else { SinksSpec::None }, seq_len: SymDim::Concrete(1), dtype: DType::F32 }),
+        let _op_id = graph.add_op(Op::MultiHeadAttention(AttentionSpec { geometry: AttentionGeometry { num_q_heads: 32, num_kv_heads: 32, head_dim: 128 }, mask: if true { AttentionMask::Causal } else { AttentionMask::Full }, kv_source: KvSource::FromTensor, sinks: if false { SinksSpec::Learnable } else { SinksSpec::None }, seq_len: SymDim::Concrete(1)  }),
             vec![tin],
             vec![tout],
             "mha",
@@ -1542,7 +1542,7 @@ mod tests {
         let mut graph = CompilerGraph::new();
         let tin = graph.add_tensor_concrete("q", &[1, 4096], DType::F32);
         let tout = graph.add_tensor_concrete("out", &[1, 4096], DType::F32);
-        graph.add_op(Op::MultiHeadAttention(AttentionSpec { geometry: AttentionGeometry { num_q_heads: 32, num_kv_heads: 8, head_dim: 128 }, mask: if true { AttentionMask::Causal } else { AttentionMask::Full }, kv_source: KvSource::FromTensor, sinks: if false { SinksSpec::Learnable } else { SinksSpec::None }, seq_len: SymDim::Concrete(1), dtype: DType::F32 }),
+        graph.add_op(Op::MultiHeadAttention(AttentionSpec { geometry: AttentionGeometry { num_q_heads: 32, num_kv_heads: 8, head_dim: 128 }, mask: if true { AttentionMask::Causal } else { AttentionMask::Full }, kv_source: KvSource::FromTensor, sinks: if false { SinksSpec::Learnable } else { SinksSpec::None }, seq_len: SymDim::Concrete(1)  }),
             vec![tin],
             vec![tout],
             "mha",
@@ -1606,7 +1606,7 @@ mod tests {
         // MHA provides head_dim=64 for extract_head_dim_from_graph
         let mq = graph.add_tensor_concrete("mq", &[1, 512], DType::F32);
         let mo = graph.add_tensor_concrete("mo", &[1, 512], DType::F32);
-        graph.add_op(Op::MultiHeadAttention(AttentionSpec { geometry: AttentionGeometry { num_q_heads: 8, num_kv_heads: 8, head_dim: 64 }, mask: if true { AttentionMask::Causal } else { AttentionMask::Full }, kv_source: KvSource::FromTensor, sinks: if false { SinksSpec::Learnable } else { SinksSpec::None }, seq_len: SymDim::Concrete(1), dtype: DType::F32 }),
+        graph.add_op(Op::MultiHeadAttention(AttentionSpec { geometry: AttentionGeometry { num_q_heads: 8, num_kv_heads: 8, head_dim: 64 }, mask: if true { AttentionMask::Causal } else { AttentionMask::Full }, kv_source: KvSource::FromTensor, sinks: if false { SinksSpec::Learnable } else { SinksSpec::None }, seq_len: SymDim::Concrete(1)  }),
             vec![mq],
             vec![mo],
             "mha_ref",
@@ -1784,7 +1784,7 @@ mod tests {
         // MHA with head_dim=96
         let mq = graph.add_tensor_concrete("mq", &[1, 768], DType::F32);
         let mo = graph.add_tensor_concrete("mo", &[1, 768], DType::F32);
-        graph.add_op(Op::MultiHeadAttention(AttentionSpec { geometry: AttentionGeometry { num_q_heads: 8, num_kv_heads: 8, head_dim: 96 }, mask: if false { AttentionMask::Causal } else { AttentionMask::Full }, kv_source: KvSource::FromTensor, sinks: if false { SinksSpec::Learnable } else { SinksSpec::None }, seq_len: SymDim::Concrete(1), dtype: DType::F32 }),
+        graph.add_op(Op::MultiHeadAttention(AttentionSpec { geometry: AttentionGeometry { num_q_heads: 8, num_kv_heads: 8, head_dim: 96 }, mask: if false { AttentionMask::Causal } else { AttentionMask::Full }, kv_source: KvSource::FromTensor, sinks: if false { SinksSpec::Learnable } else { SinksSpec::None }, seq_len: SymDim::Concrete(1)  }),
             vec![mq],
             vec![mo],
             "mha_first",
@@ -1894,7 +1894,7 @@ mod tests {
         // MHA provides head_dim=80
         let mq = graph.add_tensor_concrete("mq", &[1, 640], DType::F32);
         let mo = graph.add_tensor_concrete("mo", &[1, 640], DType::F32);
-        graph.add_op(Op::MultiHeadAttention(AttentionSpec { geometry: AttentionGeometry { num_q_heads: 8, num_kv_heads: 8, head_dim: 80 }, mask: if false { AttentionMask::Causal } else { AttentionMask::Full }, kv_source: KvSource::FromTensor, sinks: if false { SinksSpec::Learnable } else { SinksSpec::None }, seq_len: SymDim::Concrete(1), dtype: DType::F32 }),
+        graph.add_op(Op::MultiHeadAttention(AttentionSpec { geometry: AttentionGeometry { num_q_heads: 8, num_kv_heads: 8, head_dim: 80 }, mask: if false { AttentionMask::Causal } else { AttentionMask::Full }, kv_source: KvSource::FromTensor, sinks: if false { SinksSpec::Learnable } else { SinksSpec::None }, seq_len: SymDim::Concrete(1)  }),
             vec![mq],
             vec![mo],
             "mha_for_hd",

@@ -343,7 +343,6 @@ mod tests {
             kv_source: KvSource::FromCache,
             sinks: SinksSpec::None,
             seq_len: SymDim::Concrete(1),
-            dtype: DType::F32,
         });
         assert_eq!(attn.category(), "attention");
     }

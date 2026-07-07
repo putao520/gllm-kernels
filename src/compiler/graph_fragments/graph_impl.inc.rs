@@ -606,7 +606,7 @@ impl CompilerGraph {
 
         // Multi-head attention (no RoPE for encoder, bidirectional)
         let attn_out = g.add_tensor_concrete("attn_out", &[seq, q_dim], dt);
-        g.add_op(Op::MultiHeadAttention(AttentionSpec { geometry: AttentionGeometry { num_q_heads: ir.num_heads, num_kv_heads: ir.num_heads, head_dim: ir.head_dim }, mask: if false { AttentionMask::Causal } else { AttentionMask::Full }, kv_source: crate::compiler::graph::KvSource::FromTensor, sinks: if false { SinksSpec::Learnable } else { SinksSpec::None }, seq_len: SymDim::Concrete(seq), dtype: DType::F32 }),
+        g.add_op(Op::MultiHeadAttention(AttentionSpec { geometry: AttentionGeometry { num_q_heads: ir.num_heads, num_kv_heads: ir.num_heads, head_dim: ir.head_dim }, mask: if false { AttentionMask::Causal } else { AttentionMask::Full }, kv_source: crate::compiler::graph::KvSource::FromTensor, sinks: if false { SinksSpec::Learnable } else { SinksSpec::None }, seq_len: SymDim::Concrete(seq)  }),
             vec![q_out, k_out, v_out],
             vec![attn_out],
             "mha",

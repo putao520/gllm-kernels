@@ -656,7 +656,7 @@ mod tests {
     fn test_classify_attention() {
         use crate::compiler::graph::AttentionStrategy;
         assert_eq!(
-            classify(&Op::MultiHeadAttention(AttentionSpec { geometry: AttentionGeometry { num_q_heads: 32, num_kv_heads: 32, head_dim: 128 }, mask: AttentionMask::Causal, kv_source: KvSource::FromTensor, sinks: SinksSpec::None, seq_len: SymDim::Concrete(32), dtype: DType::F32 })),
+            classify(&Op::MultiHeadAttention(AttentionSpec { geometry: AttentionGeometry { num_q_heads: 32, num_kv_heads: 32, head_dim: 128 }, mask: AttentionMask::Causal, kv_source: KvSource::FromTensor, sinks: SinksSpec::None, seq_len: SymDim::Concrete(32)  })),
             OpSemantics::Attention,
         );
         assert_eq!(

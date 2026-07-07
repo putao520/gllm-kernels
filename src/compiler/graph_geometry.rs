@@ -331,7 +331,7 @@ mod tests {
         let k_out = g.add_tensor_concrete("k_out", &[512, 512], dt);
         let v_out = g.add_tensor_concrete("v_out", &[512, 512], dt);
         let attn_out = g.add_tensor_concrete("attn_out", &[512, 1024], dt);
-        g.add_op(Op::MultiHeadAttention(AttentionSpec { geometry: AttentionGeometry { num_q_heads: 16, num_kv_heads: 8, head_dim: 64 }, mask: if true { AttentionMask::Causal } else { AttentionMask::Full }, kv_source: KvSource::FromTensor, sinks: if false { SinksSpec::Learnable } else { SinksSpec::None }, seq_len: SymDim::Concrete(512), dtype: DType::F32 }), vec![q_out, k_out, v_out], vec![attn_out], "attn");
+        g.add_op(Op::MultiHeadAttention(AttentionSpec { geometry: AttentionGeometry { num_q_heads: 16, num_kv_heads: 8, head_dim: 64 }, mask: if true { AttentionMask::Causal } else { AttentionMask::Full }, kv_source: KvSource::FromTensor, sinks: if false { SinksSpec::Learnable } else { SinksSpec::None }, seq_len: SymDim::Concrete(512)  }), vec![q_out, k_out, v_out], vec![attn_out], "attn");
 
         let rope_out = g.add_tensor_concrete("rope_out", &[512, 1024], dt);
         g.add_op(Op::RoPE(RopeSpec { num_heads: 16, head_dim: 64, theta: 1000000.0, partial: 0.25, rope_scaling: None }), vec![q_out], vec![rope_out], "rope");
@@ -959,7 +959,7 @@ mod tests {
         let k_out = g.add_tensor_concrete("k_out", &[1, 512], dt);
         let v_out = g.add_tensor_concrete("v_out", &[1, 512], dt);
         let attn_out = g.add_tensor_concrete("attn_out", &[1, 512], dt);
-        g.add_op(Op::MultiHeadAttention(AttentionSpec { geometry: AttentionGeometry { num_q_heads: 8, num_kv_heads: 8, head_dim: 64 }, mask: if true { AttentionMask::Causal } else { AttentionMask::Full }, kv_source: KvSource::FromTensor, sinks: if false { SinksSpec::Learnable } else { SinksSpec::None }, seq_len: SymDim::Concrete(1), dtype: DType::F32 }), vec![q_out, k_out, v_out], vec![attn_out], "attn");
+        g.add_op(Op::MultiHeadAttention(AttentionSpec { geometry: AttentionGeometry { num_q_heads: 8, num_kv_heads: 8, head_dim: 64 }, mask: if true { AttentionMask::Causal } else { AttentionMask::Full }, kv_source: KvSource::FromTensor, sinks: if false { SinksSpec::Learnable } else { SinksSpec::None }, seq_len: SymDim::Concrete(1)  }), vec![q_out, k_out, v_out], vec![attn_out], "attn");
 
         // Act
         let geo = GraphDerivedGeometry::from_graph(&g, &DeviceProfile::detect()).unwrap();
@@ -1348,7 +1348,7 @@ mod tests {
         let k_out = g.add_tensor_concrete("k_out", &[1, 256], dt);
         let v_out = g.add_tensor_concrete("v_out", &[1, 256], dt);
         let attn_out = g.add_tensor_concrete("attn_out", &[1, 1024], dt);
-        g.add_op(Op::MultiHeadAttention(AttentionSpec { geometry: AttentionGeometry { num_q_heads: 16, num_kv_heads: 4, head_dim: 64 }, mask: if true { AttentionMask::Causal } else { AttentionMask::Full }, kv_source: KvSource::FromTensor, sinks: if false { SinksSpec::Learnable } else { SinksSpec::None }, seq_len: SymDim::Concrete(1), dtype: DType::F32 }), vec![q_out, k_out, v_out], vec![attn_out], "attn");
+        g.add_op(Op::MultiHeadAttention(AttentionSpec { geometry: AttentionGeometry { num_q_heads: 16, num_kv_heads: 4, head_dim: 64 }, mask: if true { AttentionMask::Causal } else { AttentionMask::Full }, kv_source: KvSource::FromTensor, sinks: if false { SinksSpec::Learnable } else { SinksSpec::None }, seq_len: SymDim::Concrete(1)  }), vec![q_out, k_out, v_out], vec![attn_out], "attn");
 
         // Act
         let geo = GraphDerivedGeometry::from_graph(&g, &DeviceProfile::detect()).unwrap();

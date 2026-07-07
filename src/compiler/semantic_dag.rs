@@ -808,7 +808,7 @@ mod tests {
             OpClass::Reduction
         );
         assert_eq!(
-            invoke_fallback(&Op::HeadRmsNorm { head_dim: 128, eps: 1e-6, dtype: DType::F32 }),
+            invoke_fallback(&Op::HeadRmsNorm { head_dim: 128, eps: 1e-6, dtype: DType::F32 } // TODO BCE-PHASE2 T2.2: HeadRmsNorm.dtype 删字段时消除),
             OpClass::Reduction
         );
         assert_eq!(
@@ -865,7 +865,7 @@ mod tests {
     fn test_fallback_op_class_opaque_variants() {
         // Arrange & Act & Assert — key opaque OpKinds
         assert_eq!(
-            invoke_fallback(&Op::MultiHeadAttention(AttentionSpec { geometry: AttentionGeometry { num_q_heads: 32, num_kv_heads: 8, head_dim: 128 }, mask: if true { AttentionMask::Causal } else { AttentionMask::Full }, kv_source: KvSource::FromTensor, sinks: if false { SinksSpec::Learnable } else { SinksSpec::None }, seq_len: SymDim::Concrete(128), dtype: DType::F32 })),
+            invoke_fallback(&Op::MultiHeadAttention(AttentionSpec { geometry: AttentionGeometry { num_q_heads: 32, num_kv_heads: 8, head_dim: 128 }, mask: if true { AttentionMask::Causal } else { AttentionMask::Full }, kv_source: KvSource::FromTensor, sinks: if false { SinksSpec::Learnable } else { SinksSpec::None }, seq_len: SymDim::Concrete(128)  })),
             OpClass::Opaque
         );
         assert_eq!(

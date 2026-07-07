@@ -62,7 +62,8 @@ pub struct AttentionSpec {
     pub kv_source: KvSource,
     pub sinks: SinksSpec,
     pub seq_len: SymDim,
-    pub dtype: DType,
+    // BCE-PHASE2 v2 D2: dtype 字段已删 (原硬编码 F32 违宪).
+    // kv_row_stride 改从 K 张量 TensorMeta.dtype 派生 (K1, lower_op.inc.rs:1488).
 }
 
 /// CachedGQA spec（GQA + KV cache）。
