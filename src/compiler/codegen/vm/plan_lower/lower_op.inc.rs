@@ -1627,7 +1627,12 @@ fn lower_norm_v2(
 
     // 从 NormSpec 直接获取参数（胖 opcode，不反查 OpKind）
     let feature_dim = spec.feature_dim;
-    let dtype = spec.dtype.to_quant_precision();
+    // @trace REQ-DTYPE-CHAIN-004 [entity:ENT-COMPILER-GRAPH] dtype 从 op.inputs[0].dtype 派生（TensorMeta.dtype 推导），不读 spec.dtype 硬编码
+    // BCE-20260707-SPEC-DTYPE-F32-HARDCODE (精度主权): dtype 从 op.inputs[0].dtype 派生，
+    // 不读 spec.dtype（违宪硬编码 F32）。NormSpec.dtype 语义="归一化这个激活张量"，
+    // dtype 主权属于被归一化的激活张量 (inputs[0])，与 Conv2D/Vision 的 op_input_dtype 先例一致。
+    // ValueNorm (has_weight=false) 不受影响：weight_ptr 有无与激活 dtype 正交，inputs[0] 永远是激活张量。
+    let input_dtype = op_input_dtype(op, graph);
 
     // 输出 tensor 的 seq 维度（用于循环 bound）
     let out_tid = op.outputs.first().copied().ok_or_else(|| CompilerError::CodegenViolation(
@@ -1660,9 +1665,9 @@ fn lower_norm_v2(
         op.inputs.get(1)
             .and_then(|&tid| graph.tensor(tid))
             .map(|t| t.dtype.to_quant_precision())
-            .unwrap_or(dtype)
+            .unwrap_or(input_dtype)
     } else {
-        dtype
+        input_dtype
     };
 
     // LayerNorm 用 emit_layernorm_auto（独立实现，不依赖 trace，避免 Input(3) bias 越界）
@@ -1670,7 +1675,7 @@ fn lower_norm_v2(
     if matches!(norm_kind, NormKind::LayerNorm) {
         super::norm_softmax_emit::emit_layernorm_auto(
             prog, feature_dim, spec.eps, ctx.session.width, seq_bound,
-            input_ptr, weight_ptr, output_ptr, dtype, weight_dtype,
+            input_ptr, weight_ptr, output_ptr, input_dtype, weight_dtype,
         )?;
     } else {
         emit_normlike_inline(
@@ -1685,7 +1690,7 @@ fn lower_norm_v2(
             input_ptr,
             weight_ptr,
             output_ptr,
-            dtype,
+            input_dtype,
             weight_dtype,
         )?;
     }
