@@ -808,7 +808,7 @@ mod tests {
             OpClass::Reduction
         );
         assert_eq!(
-            invoke_fallback(&Op::HeadRmsNorm { head_dim: 128, eps: 1e-6, dtype: DType::F32 } // TODO BCE-PHASE2 T2.2: HeadRmsNorm.dtype 删字段时消除),
+            invoke_fallback(&Op::HeadRmsNorm { head_dim: 128, eps: 1e-6, dtype: DType::F32 }),
             OpClass::Reduction
         );
         assert_eq!(

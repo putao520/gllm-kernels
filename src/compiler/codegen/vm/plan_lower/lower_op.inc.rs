@@ -1506,7 +1506,7 @@ fn lower_attention_v2(
             format!("MHA op {:?}: 无 K 张量 (inputs[1])", op.id)))?;
     let dtype = graph.tensor(k_tid)
         .map(|t| t.dtype.to_quant_precision())
-        .unwrap_or(spec.dtype.to_quant_precision());  // fallback 仅防御, 生产路径 K 张量必存在
+        .unwrap_or(QuantPrecision::F32);  // fallback 仅防御, 生产路径 K 张量必存在
     // V==K dtype 同构守卫 (异构 K/V 需拆双 stride, 当前所有模型同构)
     if let (Some(k_t), Some(v_tid)) = (graph.tensor(k_tid), op.inputs.get(2).copied()) {
         if let Some(v_t) = graph.tensor(v_tid) {
