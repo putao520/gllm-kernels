@@ -115,7 +115,14 @@ pub fn detect_dtype_breakpoints(graph: &CompilerGraph) -> Vec<DtypeBreakpoint> {
 fn op_expected_dtype(op: &crate::compiler::graph::CompilerOp, graph: &CompilerGraph) -> Option<DType> {
     match op.op_resolved(graph) {
         Some(Op::Gemm(_)) | Some(Op::GemmBias(_)) => op.op_gemm_dtype(graph),
-        Some(Op::QuantGemm(_)) => Some(DType::F32), // QuantGemm always outputs F32
+        Some(Op::QuantGemm(_)) => {
+            // BCE-PHASE2 v2 D5a (K4): QuantGemm 输出 dtype 顺输出张量 TensorMeta,
+            // 非硬编码 F32 (违宪). 当前输出张量 dtype = act_dt = F32 → 零回归.
+            // 未来 act_dt 顺配置后, QuantGemm 输出跟随 (如 BF16 量化权重 + BF16 输出).
+            op.outputs.first().copied()
+                .and_then(|tid| graph.tensor(tid))
+                .map(|t| t.dtype)
+        }
         // Norm ops expect the same dtype as their first input
         _ => None,
     }
