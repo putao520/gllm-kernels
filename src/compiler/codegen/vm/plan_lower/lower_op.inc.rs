@@ -1352,16 +1352,27 @@ fn lower_gemm_v2(
     let pm = ctx.pack_map_for_gemm(weight_tid);
 
     // BCE-20260629-003 (Pattern c): 推断各矩阵 dtype
-    // a_dtype/c_dtype = ctx.accum_dtype (激活计算精度，通常 F32)
-    // b_dtype = 权重 tensor 的 dtype (BF16/F16/F32)
+    // a_dtype = ctx.accum_dtype (累加精度 F32, VecLoad WidenCompute 升 BF16→F32)
+    // b_dtype = 权重 tensor 的 dtype (BF16/F16/F32, 从 TensorMeta 派生)
+    // c_dtype = 输出张量存储 dtype (从 op.outputs[0] TensorMeta 派生, BCE-PHASE2 v2 D3)
+    //
+    // BCE-PHASE2 v2 D3 (强制项, v1 missed): c_dtype 原读 ctx.accum_dtype (F32),
+    // 当输出张量是 BF16 (D1 后 act_store_dt=BF16) 时 F32 写进 2B 槽溢出.
+    // 修复: c_dtype 顺输出张量 TensorMeta.dtype, 累加寄存器仍 F32, VecStore(dtype=c_dtype)
+    // 负责 narrow F32→BF16 (gemm_emit.rs:311 VecNarrow 已支持).
+    // 当前输出张量 dtype = act_dt = F32 → c_dtype=F32 不变 (零回归).
+    // @trace REQ-DTYPE-CHAIN-004 [entity:GemmSpec] c_dtype 顺输出张量 TensorMeta (非累加精度)
     let a_dtype = ctx.accum_dtype;
-    let c_dtype = ctx.accum_dtype;
+    let c_dtype = op.outputs.first().copied()
+        .and_then(|tid| graph.tensor(tid))
+        .map(|t| t.dtype.to_quant_precision())
+        .unwrap_or(ctx.accum_dtype);  // fallback 仅防御, 生产路径输出张量必存在
     let b_dtype = weight_tid
         .and_then(|tid| graph.tensor(tid))
         .map(|t| t.dtype.to_quant_precision())
         .unwrap_or(ctx.accum_dtype);
     // CR-DTYPE-SOVEREIGNTY-001: 当 b_dtype≠a_dtype 时，VecLoad(b_ptr, dtype=b_dtype)
-    // 会自动 WidenCompute（BF16→F32），VecStore(c_ptr, dtype=c_dtype=F32) 正确。
+    // 会自动 WidenCompute（BF16→F32），VecStore(c_ptr, dtype=c_dtype) 正确窄化.
 
     // seq_bound_override: mega-kernel decode 时 M=1
     let seq_bound_override = if abi.mega_decode_seq_len.is_some() {
