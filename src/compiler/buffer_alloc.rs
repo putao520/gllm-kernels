@@ -647,31 +647,25 @@ fn compute_layer_capture_region(
 
 /// §diagnostic-layer-capture: Derive hidden dimension from the graph for capture sizing.
 ///
-/// Strategy: find the activation input tensor (first non-weight input) and
-/// return its last concrete dimension. Fallback: scan GEMM ops for K.
+/// Uses the SSOT `GraphDerivedGeometry::derive_hidden` (graph_geometry.rs) which
+/// correctly resolves hidden (Qwen3-0.6B Q4_0 → 1024) from the activation input's
+/// named/2D shape, with Gather/PatchEmbed embed_dim fallbacks. This replaces the
+/// prior local fallback that scanned GEMM ops for the K dimension, which risked
+/// returning weight byte counts instead of the dimension (BCE-20260708-capture).
+///
+/// NOTE: this SSOT fix returns the correct hidden=1024 (verified at runtime via
+/// probe), but alone does NOT restore layer0 cos≈1.0 — the capture stride is still
+/// `max_seq_len × hidden × 4` (uses the allocation cap max_seq_len=40960, not the
+/// runtime seq=5), and `emit_layer_capture_copy` copies only `hidden` elements
+/// (one row) per layer rather than `seq × hidden`. The 8192× stride inflation is
+/// `max_seq_len / runtime_seq = 40960/5`, not a hidden miscalculation. See followup.
 #[cfg(feature = "diagnostic-layer-capture")]
 fn derive_capture_hidden(graph: &CompilerGraph) -> usize {
-    // Look for the activation input tensor (graph.inputs[0] typically).
-    for (i, &tid) in graph.inputs.iter().enumerate() {
-        let Some(tensor) = graph.tensors.get(tid.0 as usize) else { continue };
-        if i == 0 {
-            // Activation input: shape [seq_len, hidden]
-            if tensor.shape.len() == 2 {
-                if let Some(last) = tensor.shape.last() {
-                    if let crate::compiler::graph::SymDim::Concrete(v) = last {
-                        return *v;
-                    }
-                }
-            }
-        }
-    }
-    // Fallback: scan GEMM ops for K dimension.
-    for op in &graph.ops {
-        if let Some((_, _, k)) = op.op_gemm_dims(graph) {
-            return k;
-        }
-    }
-    0
+    use crate::compiler::graph_geometry::GraphDerivedGeometry;
+    use crate::dispatch::DeviceProfile;
+    GraphDerivedGeometry::from_graph(graph, &DeviceProfile::detect())
+        .map(|g| g.hidden)
+        .unwrap_or(0)
 }
 
 /// R3: 构建 tensor → TensorPtrSource 分类映射
