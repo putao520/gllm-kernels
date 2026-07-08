@@ -1706,12 +1706,37 @@ fn lower_norm_v2(
             input_ptr, weight_ptr, output_ptr, input_dtype, weight_dtype,
         )?;
     } else {
+        // BCE-20260708-QWEN3-HEADRMSNORM: HeadRmsNorm 逐 head 归一,
+        // groups_per_row = 输入非seq维乘积 / feature_dim(head_dim)。
+        // Qwen3 q_proj/k_proj 输出 [seq, 2048=16heads×128], groups_per_row = 2048/128 = 16。
+        // RmsNorm/ValueNorm 整体归一 → groups_per_row = 1。
+        // LayerNorm 走 if 分支(emit_layernorm_auto), 不进此 else。
+        let groups_per_row = if matches!(norm_kind, NormKind::HeadRmsNorm) {
+            let total: usize = graph.tensor(input_tid)
+                .map(|t| {
+                    t.shape.iter().skip(1)  // skip seq 维 (shape[0])
+                        .map(|d| d.max_for_allocation(0))
+                        .product()
+                })
+                .unwrap_or(feature_dim);
+            if feature_dim == 0 || total % feature_dim != 0 {
+                return Err(CompilerError::CodegenViolation(format!(
+                    "HeadRmsNorm op {:?}: 输入非seq维乘积 {} 不能被 head_dim(feature_dim={}) 整除",
+                    op.id, total, feature_dim
+                )));
+            }
+            (total / feature_dim).max(1)
+        } else {
+            1
+        };
         emit_normlike_inline(
             prog,
             &pattern,
             feature_dim,
-            1, // groups_per_row
-            spec.has_weight, // broadcast_weight
+            groups_per_row,
+            // broadcast_weight 不动: Qwen3 q_norm weight[128] 被 16 head 共享 = broadcast,
+            // 改 false 会按 group_off 越界读 weight。
+            spec.has_weight,
             norm_kind,
             ctx.session.width,
             seq_bound,
