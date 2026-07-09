@@ -1406,4 +1406,95 @@ mod quant_gemv_tests {
         }
         assert!(pass, "Q4_0 QuantGemm multi-block oracle: got {} want 4.0", out_f32[0]);
     }
+
+    // ─────────────────────────────────────────────────────────────────────
+    // Q6_K 真实执行 oracle (BCE-20260710-Q6K-HIGHBITS)
+    // bug: emit_unpack NibbleWithHighBits 的 qh<<6 & 0x30 丢高 2 bit, Q6_K quarter 结构错位.
+    // 构造已知 Q6_K 块 (d=1.0, sc=1, 全 quarter 有非零高 bit), 手算 dot vs JIT 真实执行.
+    // ─────────────────────────────────────────────────────────────────────
+    #[test]
+    fn test_q6_k_quant_gemm_x86_oracle() {
+        use crate::compiler::codegen::vm::moe_quant_emit::emit_quant_gemm_inline;
+
+        let m: usize = 1;
+        let n: usize = 2; // 2 vocab rows
+        let k: usize = 256; // 1 Q6_K block/row (block_size=256)
+        let block_bytes: usize = 210;
+
+        // Q6_K block: qs[128] + qh[64] + scales[16] + d(f16) = 210B
+        // 构造: d=f16(1.0), scales[0..16]=1 (i8), 每 quarter 设 q1=1,q2=2,q3=3,q4=4 (全高 bit 参与).
+        // 6bit_val=33→lo4=1,hi2=2 (1|32=33), value=1; 34→lo4=2,hi2=2,value=2; 同理 3,4.
+        // 对 n_group=0, l=0: q1(位0)=1,q2(位0)=2,q3(位0)=3,q4(位0)=4 → 输出位 [0,32,64,96]=[1,2,3,4]
+        // 其余元素 0 (6bit=32: lo4=0,hi2=2 → value=0).
+        // 手算: act=[1,1,1,1,0..0]. dot(row0)=1+2+3+4=10. dot(row1)=0.
+        let d_f16 = f16::from_f32(1.0);
+        let d_bits = d_f16.to_bits();
+        let d_lo = (d_bits & 0xFF) as u8;
+        let d_hi = ((d_bits >> 8) & 0xFF) as u8;
+
+        let mut weight = vec![0u8; n * block_bytes];
+        // row 0: q1=1,q2=2,q3=3,q4=4 at l=0 (n_group=0)
+        // qs[0] = lo4(q1) | (lo4(q3)<<4) = 1 | (3<<4) = 0x31
+        // qs[32] = lo4(q2) | (lo4(q4)<<4) = 2 | (4<<4) = 0x42
+        // qh[0]: bit0-1=hi2(q1)=2, bit2-3=hi2(q2)=2, bit4-5=hi2(q3)=2, bit6-7=hi2(q4)=2 = 0xAA
+        {
+            let r0 = &mut weight[0..block_bytes];
+            r0[0] = 0x31;   // qs[0]
+            r0[32] = 0x42;  // qs[32]
+            for j in 0..64 { r0[128 + j] = 0xAA; } // qh all 0xAA (hi2=2)
+            for j in 0..16 { r0[192 + j] = 1; }     // scales=1
+            r0[208] = d_lo; r0[209] = d_hi;
+        }
+        // row 1: 全 0 (lo4=0, hi2=2 → value=0)
+        {
+            let r1 = &mut weight[block_bytes..2*block_bytes];
+            for j in 0..128 { r1[j] = 0x00; }
+            for j in 0..64 { r1[128 + j] = 0xAA; }
+            for j in 0..16 { r1[192 + j] = 1; }
+            r1[208] = d_lo; r1[209] = d_hi;
+        }
+
+        let mut act = vec![0.0f32; m * k];
+        act[0] = 1.0; act[1] = 1.0; act[2] = 1.0; act[3] = 1.0;
+
+        let mut output = vec![0.0f32; m * n];
+
+        let mut prog = VmProgram::new();
+        let input_ptr = prog.alloc_vreg(VRegKind::Ptr, SimdWidth::Scalar);
+        let weight_ptr = prog.alloc_vreg(VRegKind::Ptr, SimdWidth::Scalar);
+        let output_ptr = prog.alloc_vreg(VRegKind::Ptr, SimdWidth::Scalar);
+        prog.emit(VmInstr::LoadPtr { dst: input_ptr, src: PtrExpr::AbiArg(0) });
+        prog.emit(VmInstr::LoadPtr { dst: weight_ptr, src: PtrExpr::AbiArg(1) });
+        prog.emit(VmInstr::LoadPtr { dst: output_ptr, src: PtrExpr::StackArg(24) });
+
+        emit_quant_gemm_inline(
+            &mut prog, BoundExpr::Const(m), n, k,
+            QuantType::Q6K, SimdWidth::W256,
+            input_ptr, weight_ptr, output_ptr,
+            QuantPrecision::F32, DotProductCap::SimdAssisted,
+        ).expect("emit should succeed");
+
+        let code = compile_vm_prog(&prog);
+        eprintln!("[Q6_K-ORACLE] JIT {} bytes, {} instrs", code.len(), prog.instrs.len());
+
+        let (exec_ptr, exec_len) = make_exec_buffer(&code);
+        type GemmFn = unsafe extern "C" fn(*const u8, *const u8, usize, usize, usize, usize, usize, *mut u8) -> usize;
+        let f: GemmFn = unsafe { std::mem::transmute(exec_ptr) };
+        let _ret = unsafe { f(act.as_ptr() as *const u8, weight.as_ptr() as *const u8, 0,0,0,0,0, output.as_mut_ptr() as *mut u8) };
+
+        let out_f32: &[f32] = &output;
+        eprintln!("[Q6_K-ORACLE] out = {:?} (want [10.0, 0.0])", out_f32);
+        eprintln!("[Q6_K-ORACLE] want: out[0]=1+2+3+4=10, out[1]=0");
+
+        unsafe { libc::munmap(exec_ptr as *mut _, exec_len); }
+
+        let pass0 = (out_f32[0] - 10.0).abs() < 1e-2;
+        let pass1 = out_f32[1].abs() < 1e-2;
+        if pass0 && pass1 {
+            eprintln!("[Q6_K-ORACLE] PASS — Q6_K quarter 高 2 bit 解码正确");
+        } else {
+            eprintln!("[Q6_K-ORACLE] FAIL — Q6_K quarter 高 bit 提取错, got [{}, {}] want [10, 0]", out_f32[0], out_f32[1]);
+        }
+        assert!(pass0 && pass1, "Q6_K oracle: got [{}, {}] want [10, 0]", out_f32[0], out_f32[1]);
+    }
 }
