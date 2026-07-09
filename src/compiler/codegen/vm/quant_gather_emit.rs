@@ -113,6 +113,13 @@ fn emit_quant_gather_trace_driven(
     // 结构参数
     let row_blocks = hidden_dim / block_size;
     let sub_blocks = QuantOffsetDsl::sub_block_count(desc, lanes);
+    // 两阶段 SPLIT (BCE-20260709-Q4_0-SPLIT): PackedNibbles 分 lo/hi 两趟, 每趟处理 half.
+    let needs_two_phase = super::quant_decode::DecodeTraceBuilder::new(desc, lanes)
+        .needs_two_phase_split();
+    // 两阶段: 每趟 sub_blocks = (block_size/2)/lanes = sub_blocks/2. 单阶段: sub_blocks.
+    let sub_blocks_per_phase = if needs_two_phase { sub_blocks / 2 } else { sub_blocks };
+    // hi pass 输出偏移: 跳到 block 后半 (block_size/2 个 f32 = block_size/2 * compute_elem_bytes 字节).
+    let half_block_output_bytes = if needs_two_phase { (block_size / 2) * compute_elem_bytes } else { 0 };
 
     prog.emit(VmInstr::Comment(format!(
         "QuantGather(trace): quant_type={:?} hidden={} block_size={} block_stride={} compute_elem_bytes={}",
@@ -150,13 +157,30 @@ fn emit_quant_gather_trace_driven(
         // row_ptr = safe_embed_ptr + row_base
         prog.emit(VmInstr::LoadPtr { dst: row_ptr, src: PtrExpr::VRegPlusVReg(safe_embed_ptr, row_base) });
 
-        // Build decode trace once (format-dependent, not data-dependent)
-        let mut decode_trace = Vec::new();
+        // Build decode trace (format-dependent, not data-dependent)
+        // 两阶段 SPLIT (BCE-20260709-Q4_0-SPLIT): PackedNibbles 需 lo+hi 两趟,
+        // 其他格式单趟. lo_trace 总是构建; hi_trace_opt 仅 PackedNibbles 有.
         let builder = super::quant_decode::DecodeTraceBuilder::new(desc, lanes);
         let needs_lo = builder.needs_lane_offset();
         let needs_high_bits = builder.needs_high_bits_ptr();
         let high_bits_stride_val = builder.high_bits_stride();
-        let _decoded_slot = builder.build(&mut decode_trace);
+
+        let mut decode_trace = Vec::new();
+        let _decoded_slot = if needs_two_phase {
+            super::quant_decode::DecodeTraceBuilder::new(desc, lanes)
+                .with_nibble_phase(super::quant_decode::NibblePhase::Lo)
+                .build(&mut decode_trace)
+        } else {
+            builder.build(&mut decode_trace)
+        };
+
+        let mut hi_decode_trace: Vec<TraceOp> = Vec::new();
+        if needs_two_phase {
+            super::quant_decode::DecodeTraceBuilder::new(desc, lanes)
+                .with_nibble_phase(super::quant_decode::NibblePhase::Hi)
+                .build(&mut hi_decode_trace);
+        }
+        let hi_decode_trace_opt = if needs_two_phase { Some(hi_decode_trace) } else { None };
 
         // Stride GPR for data pointer advance per sub-block iteration
         let data_advance_gpr = prog.alloc_vreg(VRegKind::Ptr, SimdWidth::Scalar);
@@ -214,8 +238,15 @@ fn emit_quant_gather_trace_driven(
 
                 // REQ-LC-009 position 3: sub_block loop step = sub_block_output_step (输出偏移: F32)
                 // REQ-LC-008: 输出行内步进使用 lanes * compute_elem_bytes, 不是 block_bytes
+                //
+                // 两阶段 SPLIT (BCE-20260709-Q4_0-SPLIT): PackedNibbles 分 lo pass + hi pass.
+                // lo pass: store 到 out[blk_off + 0..half], data_ptr 从 block 起点读 lanes 字节/次.
+                // hi pass: data_ptr 重置到 block 起点 (读同一批 byte 取 hi nibble), store 到 out[blk_off + half..block].
+                // 单阶段格式 (非 PackedNibbles): 仅 lo pass, sub_blocks_per_phase = sub_blocks.
+
+                // ── Lo pass (或单阶段全量) ──
                 prog.emit_loop_try(
-                    BoundExpr::Const(sub_blocks),
+                    BoundExpr::Const(sub_blocks_per_phase),
                     sub_block_output_step,
                     |prog, _sub_ctr, sub_off| -> Result<(), CompilerError> {
                         let mut gather_inputs: Vec<VRegId> = if needs_lo {
@@ -228,12 +259,12 @@ fn emit_quant_gather_trace_driven(
                         }
                         let slots = auto_select::auto_lower_trace_raw(
                             prog, &decode_trace, &gather_inputs, width, dtype).map_err(|e| CompilerError::CodegenViolation(
-                            format!("QuantGather: decode auto_lower failed for {:?}: {:?}", quant_type, e)
+                            format!("QuantGather: lo decode auto_lower failed for {:?}: {:?}", quant_type, e)
                         ))?;
 
                         let decoded = slots.last().copied()
                             .ok_or_else(|| CompilerError::CodegenViolation(
-                                format!("QuantGather: decode trace produced no output for {:?}", quant_type)
+                                format!("QuantGather: lo decode trace produced no output for {:?}", quant_type)
                             ))?;
 
                         // Apply embedding_scale (e.g. Gemma 4: sqrt(hidden_size))
@@ -258,8 +289,7 @@ fn emit_quant_gather_trace_driven(
                         };
 
                         // REQ-LC-008/009: 输出偏移 = blk_ctr * block_size * compute_elem_bytes + sub_off
-                        // block_size * compute_elem_bytes 是输出缓冲区的步进 (不是量化数据的 block_bytes)
-                        // derive_output_block_offset 使用 compute_elem_bytes, 不使用 block_bytes
+                        // (lo pass: output_base_offset = 0)
                         let out_offset = OffsetExpr::Add(
                             Box::new(OffsetExpr::Mul(
                                 Box::new(OffsetExpr::ScalarVReg(blk_ctr)),
@@ -286,6 +316,85 @@ fn emit_quant_gather_trace_driven(
                         Ok(())
                     },
                 )?;
+
+                // ── Hi pass (仅 PackedNibbles 两阶段) ──
+                if needs_two_phase {
+                    // data_ptr 重置到 block 起点 (hi 读同一批 byte, 取 hi nibble)
+                    prog.emit(VmInstr::GprBinOp { dst: data_ptr, a: block_ptr, b: GprOperand::VReg(zero_gpr), op: GprOp::Add });
+                    let hi_trace = hi_decode_trace_opt.as_ref().expect("two_phase requires hi_trace");
+                    prog.emit_loop_try(
+                        BoundExpr::Const(sub_blocks_per_phase),
+                        sub_block_output_step,
+                        |prog, _sub_ctr, sub_off| -> Result<(), CompilerError> {
+                            let mut gather_inputs: Vec<VRegId> = if needs_lo {
+                                vec![block_ptr, data_ptr, lane_offset]
+                            } else {
+                                vec![block_ptr, data_ptr]
+                            };
+                            if let Some(hbp) = high_bits_ptr {
+                                gather_inputs.push(hbp);
+                            }
+                            let slots = auto_select::auto_lower_trace_raw(
+                                prog, hi_trace, &gather_inputs, width, dtype).map_err(|e| CompilerError::CodegenViolation(
+                                format!("QuantGather: hi decode auto_lower failed for {:?}: {:?}", quant_type, e)
+                            ))?;
+
+                            let decoded = slots.last().copied()
+                                .ok_or_else(|| CompilerError::CodegenViolation(
+                                    format!("QuantGather: hi decode trace produced no output for {:?}", quant_type)
+                                ))?;
+
+                            let store_src = if let Some(s) = embedding_scale {
+                                let scale_trace = vec![
+                                    TraceOp::Const(s as f64),
+                                    TraceOp::Input(0),
+                                    TraceOp::Mul(ValueId(0), ValueId(1)),
+                                ];
+                                let scale_inputs = vec![decoded];
+                                let scale_slots = auto_select::auto_lower_trace_raw(
+                                    prog, &scale_trace, &scale_inputs, width, dtype,
+                                ).map_err(|e| CompilerError::CodegenViolation(
+                                    format!("QuantGather: embedding_scale auto_lower failed (hi): {:?}", e)
+                                ))?;
+                                scale_slots.last().copied()
+                                    .ok_or_else(|| CompilerError::CodegenViolation(
+                                        "QuantGather: scale trace produced no output (hi)".into()
+                                    ))?
+                            } else {
+                                decoded
+                            };
+
+                            // hi pass 输出偏移: blk_off + half_block_output_bytes + sub_off
+                            let out_offset = OffsetExpr::Add(
+                                Box::new(OffsetExpr::Add(
+                                    Box::new(OffsetExpr::Mul(
+                                        Box::new(OffsetExpr::ScalarVReg(blk_ctr)),
+                                        block_size * compute_elem_bytes,
+                                    )),
+                                    Box::new(OffsetExpr::Const(half_block_output_bytes)),
+                                )),
+                                Box::new(OffsetExpr::LoopOffset(sub_off)),
+                            );
+                            prog.emit(VmInstr::VecStore {
+                                base: out_row,
+                                offset: out_offset,
+                                src: store_src,
+                                width,
+                                dtype, predicate: None,
+                            });
+
+                            // data_ptr 步进 = data_byte_advance (hi pass 同样前进读下一批 byte)
+                            prog.emit(VmInstr::GprBinOp { dst: data_ptr, a: data_ptr, b: GprOperand::VReg(data_advance_gpr), op: GprOp::Add });
+                            if let (Some(lo), Some(ls)) = (Some(lane_offset), lanes_stride) {
+                                prog.emit(VmInstr::GprBinOp { dst: lo, a: lo, b: GprOperand::VReg(ls), op: GprOp::Add });
+                            }
+                            if let (Some(hbp), Some(hbs)) = (high_bits_ptr, high_bits_stride_gpr) {
+                                prog.emit(VmInstr::GprBinOp { dst: hbp, a: hbp, b: GprOperand::VReg(hbs), op: GprOp::Add });
+                            }
+                            Ok(())
+                        },
+                    )?;
+                }
                 Ok(())
             },
         )?;

@@ -80,10 +80,29 @@ enum ZeroResult {
 ///     .build();
 /// // feed `trace` to auto_lower_trace(prog, &trace, width, dtype)
 /// ```
+/// Two-phase SPLIT decode phase for PackedNibbles formats (Q4_0/Q4_1).
+///
+/// GGUF SPLIT layout (llama.cpp 标准): byte j 的 lo nibble → elem[j],
+/// hi nibble → elem[j+block_size/2]. 单次 8-lane YMM 装不下 16 元素,
+/// 故分两阶段: Lo pass 输出 elem[0..half], Hi pass 输出 elem[half..block].
+///
+/// 旧实现用 `QuantConcatSeq{lo,hi}` 在单 YMM 内拼 [lo0..3,hi0..3] (4+4 块交织),
+/// 破坏 SPLIT 顺序 → Q4_0 E2E 乱码 (BCE-20260709-Q4_0-SPLIT).
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum NibblePhase {
+    /// 只产 lo nibble → elem[0..half] (SPLIT 前半)
+    Lo,
+    /// 只产 hi nibble → elem[half..block] (SPLIT 后半)
+    Hi,
+}
+
 pub struct DecodeTraceBuilder<'a> {
     desc: &'a QuantFormatDescriptor,
     /// Number of output f32 elements (= SIMD lane count).
     output_lanes: usize,
+    /// PackedNibbles 两阶段 SPLIT phase (默认 Lo, 兼容旧单趟调用).
+    /// 仅对 PackedNibbles 生效; 其他 layout 忽略.
+    nibble_phase: NibblePhase,
 }
 
 impl<'a> DecodeTraceBuilder<'a> {
@@ -91,7 +110,19 @@ impl<'a> DecodeTraceBuilder<'a> {
         desc: &'a QuantFormatDescriptor,
         output_lanes: usize,
     ) -> Self {
-        Self { desc, output_lanes }
+        Self { desc, output_lanes, nibble_phase: NibblePhase::Lo }
+    }
+
+    /// Set NibblePhase for two-phase SPLIT decode (PackedNibbles only).
+    pub fn with_nibble_phase(mut self, phase: NibblePhase) -> Self {
+        self.nibble_phase = phase;
+        self
+    }
+
+    /// Whether this format uses PackedNibbles and needs two-phase SPLIT
+    /// (lo pass + hi pass instead of single QuantConcatSeq concat).
+    pub fn needs_two_phase_split(&self) -> bool {
+        matches!(&self.desc.data_layout, DataLayout::PackedNibbles { .. })
     }
 
     /// Whether the trace requires a lane_offset input (inputs[2]).
@@ -583,8 +614,9 @@ impl<'a> DecodeTraceBuilder<'a> {
     fn emit_data_load(&self, trace: &mut Vec<TraceOp>, block_ptr_slot: ValueId) -> ValueId {
         match &self.desc.data_layout {
             DataLayout::PackedNibbles { offset, .. } => {
-                // Load lanes/2 packed bytes as integer vector (zero-extended to i32 per byte).
-                let byte_count = self.output_lanes / 2;
+                // 两阶段 SPLIT (BCE-20260709-Q4_0-SPLIT): 每趟读 lanes 字节产 lanes 个
+                // 同类型 nibble (lo 或 hi), 填满 YMM. 不再 lanes/2 字节拼 lo+hi.
+                let byte_count = self.output_lanes;
                 push_op(
                     trace,
                     TraceOp::QuantLoadBytesVec {
@@ -651,29 +683,29 @@ impl<'a> DecodeTraceBuilder<'a> {
     fn emit_unpack(&self, trace: &mut Vec<TraceOp>, raw_data_slot: ValueId, block_ptr_slot: ValueId, high_bits_ptr_slot: ValueId) -> ValueId {
         match &self.desc.data_layout {
             DataLayout::PackedNibbles { low_first, .. } => {
-                // raw_data_slot holds a packed byte.
-                // lo = raw & 0x0F
-                // hi = (raw >> 4) & 0x0F
-                // result = interleave(lo, hi) if low_first else interleave(hi, lo)
-                let lo_slot = push_op(
-                    trace,
-                    TraceOp::QuantAndMask { src: raw_data_slot, mask: 0x0F },
-                );
-                let hi_shifted = push_op(
-                    trace,
-                    TraceOp::QuantShiftRight { src: raw_data_slot, amount: 4 },
-                );
-                let hi_slot = push_op(
-                    trace,
-                    TraceOp::QuantAndMask { src: hi_shifted, mask: 0x0F },
-                );
-                let concatenated = if *low_first {
-                    push_op(trace, TraceOp::QuantConcatSeq { lo: lo_slot, hi: hi_slot })
+                // 两阶段 SPLIT (BCE-20260709-Q4_0-SPLIT): 按 phase 产纯 lo 或纯 hi
+                // (lanes 个填满 YMM), 不再 QuantConcatSeq 拼 [lo0..3,hi0..3].
+                // SPLIT 语义: byte j lo → elem[j], hi → elem[j+half]. 两趟分别填前半/后半.
+                let nibbles = if self.nibble_phase == NibblePhase::Lo {
+                    // lo = raw & 0x0F
+                    push_op(
+                        trace,
+                        TraceOp::QuantAndMask { src: raw_data_slot, mask: 0x0F },
+                    )
                 } else {
-                    push_op(trace, TraceOp::QuantConcatSeq { lo: hi_slot, hi: lo_slot })
+                    // hi = (raw >> 4) & 0x0F
+                    let shifted = push_op(
+                        trace,
+                        TraceOp::QuantShiftRight { src: raw_data_slot, amount: 4 },
+                    );
+                    push_op(
+                        trace,
+                        TraceOp::QuantAndMask { src: shifted, mask: 0x0F },
+                    )
                 };
+                let _ = low_first; // low_first 语义由 phase 表达 (Lo pass 先, Hi pass 后)
                 // Concat output is integer (i32 lanes) — convert to f32 before arithmetic.
-                push_op(trace, TraceOp::QuantCastI8toF32 { src: concatenated })
+                push_op(trace, TraceOp::QuantCastI8toF32 { src: nibbles })
             }
 
             DataLayout::NibbleWithHighBits { high_bits_per_elem, .. } => {
@@ -947,9 +979,12 @@ mod tests {
             .build(&mut trace);
         assert_trace_valid(&trace);
         assert!(final_slot.0 < trace.len() as u32);
-        // Q4_1: PackedNibbles → QuantConcatSeq present
+        // Q4_1: PackedNibbles 两阶段 SPLIT (BCE-20260709-Q4_0-SPLIT) — 不再用 QuantConcatSeq 拼接,
+        // 改为按 phase 产纯 lo/hi. Lo phase (默认) 应有 QuantAndMask(0x0F) 提 lo nibble.
         let has_concat = trace.iter().any(|op| matches!(op, TraceOp::QuantConcatSeq { .. }));
-        assert!(has_concat, "Q4_1 should have QuantConcatSeq for PackedNibbles");
+        assert!(!has_concat, "Q4_1 should NOT have QuantConcatSeq (two-phase SPLIT replaces concat)");
+        let has_lo_mask = trace.iter().any(|op| matches!(op, TraceOp::QuantAndMask { mask, .. } if *mask == 0x0F));
+        assert!(has_lo_mask, "Q4_1 Lo phase should have QuantAndMask(0x0F) for low nibble");
     }
 
     #[test]
@@ -1424,9 +1459,11 @@ mod tests {
         let has_sub = trace.iter().any(|op| matches!(op, TraceOp::Sub(_, _)));
         assert!(has_sub, "Squeeze should have Sub for static bias of 4");
 
-        // Squeeze: PackedNibbles → QuantConcatSeq present
+        // Squeeze: PackedNibbles 两阶段 SPLIT — 不再 QuantConcatSeq, Lo phase 用 QuantAndMask(0x0F)
         let has_concat = trace.iter().any(|op| matches!(op, TraceOp::QuantConcatSeq { .. }));
-        assert!(has_concat, "Squeeze should have QuantConcatSeq for PackedNibbles");
+        assert!(!has_concat, "Squeeze should NOT have QuantConcatSeq (two-phase SPLIT)");
+        let has_lo_mask = trace.iter().any(|op| matches!(op, TraceOp::QuantAndMask { mask, .. } if *mask == 0x0F));
+        assert!(has_lo_mask, "Squeeze Lo phase should have QuantAndMask(0x0F)");
 
         // Squeeze: no post-scale add (only pre-scale sub)
         let has_add = trace.iter().any(|op| matches!(op, TraceOp::Add(_, _)));
@@ -1571,12 +1608,12 @@ mod tests {
         assert_trace_valid(&trace_4);
         assert!(slot_4.0 < trace_4.len() as u32);
 
-        // Q4_0 with 4 lanes: PackedNibbles loads 4/2 = 2 bytes
-        let has_2byte_load = trace_4.iter().any(|op| matches!(
+        // Q4_0 with 4 lanes: 两阶段 SPLIT 每趟读 lanes=4 字节 (产 4 个同类型 nibble)
+        let has_4byte_load = trace_4.iter().any(|op| matches!(
             op,
-            TraceOp::QuantLoadBytesVec { count: 2, .. }
+            TraceOp::QuantLoadBytesVec { count: 4, .. }
         ));
-        assert!(has_2byte_load, "Q4_0 with 4 lanes should load 2 bytes (lanes/2)");
+        assert!(has_4byte_load, "Q4_0 with 4 lanes should load 4 bytes (lanes, two-phase SPLIT)");
 
         // Act: 16 lanes (double the default)
         let mut trace_16 = Vec::new();
@@ -1584,12 +1621,12 @@ mod tests {
         assert_trace_valid(&trace_16);
         assert!(slot_16.0 < trace_16.len() as u32);
 
-        // Q4_0 with 16 lanes: PackedNibbles loads 16/2 = 8 bytes
-        let has_8byte_load = trace_16.iter().any(|op| matches!(
+        // Q4_0 with 16 lanes: 两阶段 SPLIT 每趟读 lanes=16 字节
+        let has_16byte_load = trace_16.iter().any(|op| matches!(
             op,
-            TraceOp::QuantLoadBytesVec { count: 8, .. }
+            TraceOp::QuantLoadBytesVec { count: 16, .. }
         ));
-        assert!(has_8byte_load, "Q4_0 with 16 lanes should load 8 bytes (lanes/2)");
+        assert!(has_16byte_load, "Q4_0 with 16 lanes should load 16 bytes (lanes, two-phase SPLIT)");
 
         // Assert: trace size scales with lane count (more ops for broadcast etc.)
         assert!(
@@ -1859,9 +1896,11 @@ mod tests {
         let has_f16 = trace.iter().any(|op| matches!(op, TraceOp::QuantLoadF16toF32 { .. }));
         assert!(has_f16, "TQ2_0 should load f16 scale");
 
-        // TQ2_0: PackedNibbles → QuantConcatSeq
+        // TQ2_0: PackedNibbles 两阶段 SPLIT — 不再 QuantConcatSeq, Lo phase 用 QuantAndMask(0x0F)
         let has_concat = trace.iter().any(|op| matches!(op, TraceOp::QuantConcatSeq { .. }));
-        assert!(has_concat, "TQ2_0 should have QuantConcatSeq for PackedNibbles");
+        assert!(!has_concat, "TQ2_0 should NOT have QuantConcatSeq (two-phase SPLIT)");
+        let has_lo_mask = trace.iter().any(|op| matches!(op, TraceOp::QuantAndMask { mask, .. } if *mask == 0x0F));
+        assert!(has_lo_mask, "TQ2_0 Lo phase should have QuantAndMask(0x0F)");
 
         // TQ2_0: no high bits pointer needed
         let builder = DecodeTraceBuilder::new(desc, 8);
@@ -2333,9 +2372,11 @@ mod tests {
             .count();
         assert!(f16_count >= 2, "Q4_1 should load 2 f16 values (d + m), got {}", f16_count);
 
-        // Assert: Q4_1 has QuantConcatSeq for PackedNibbles
+        // Assert: Q4_1 两阶段 SPLIT — 不再 QuantConcatSeq, Lo phase 用 QuantAndMask(0x0F)
         let has_concat = trace.iter().any(|op| matches!(op, TraceOp::QuantConcatSeq { .. }));
-        assert!(has_concat, "Q4_1 should have QuantConcatSeq for PackedNibbles");
+        assert!(!has_concat, "Q4_1 should NOT have QuantConcatSeq (two-phase SPLIT)");
+        let has_lo_mask = trace.iter().any(|op| matches!(op, TraceOp::QuantAndMask { mask, .. } if *mask == 0x0F));
+        assert!(has_lo_mask, "Q4_1 Lo phase should have QuantAndMask(0x0F)");
 
         // Assert: Q4_1 has QuantBroadcast for scale
         let has_broadcast = trace.iter().any(|op| matches!(op, TraceOp::QuantBroadcast { .. }));
@@ -2359,17 +2400,25 @@ mod tests {
         let mut trace = Vec::new();
         let _slot = DecodeTraceBuilder::new(desc, 8).build(&mut trace);
 
-        // Assert: PackedNibbles → QuantAndMask for low nibble extraction
+        // Assert: PackedNibbles 两阶段 SPLIT — Lo phase (默认) 用 QuantAndMask 提 lo nibble
         let has_mask = trace.iter().any(|op| matches!(op, TraceOp::QuantAndMask { .. }));
-        assert!(has_mask, "Squeeze should have QuantAndMask for nibble masking");
+        assert!(has_mask, "Squeeze Lo phase should have QuantAndMask for nibble masking");
 
-        // Assert: PackedNibbles → QuantShiftRight for high nibble extraction
+        // Assert: 两阶段 SPLIT — Lo phase 不再 emit QuantShiftRight (hi 在独立 Hi phase)
         let has_shift = trace.iter().any(|op| matches!(op, TraceOp::QuantShiftRight { .. }));
-        assert!(has_shift, "Squeeze should have QuantShiftRight for high nibble");
+        assert!(!has_shift, "Squeeze Lo phase should NOT have QuantShiftRight (hi in separate Hi phase)");
 
-        // Assert: PackedNibbles → QuantConcatSeq
+        // Assert: 两阶段 SPLIT — 不再 QuantConcatSeq
         let has_concat = trace.iter().any(|op| matches!(op, TraceOp::QuantConcatSeq { .. }));
-        assert!(has_concat, "Squeeze should have QuantConcatSeq for lo/hi merge");
+        assert!(!has_concat, "Squeeze should NOT have QuantConcatSeq (two-phase SPLIT)");
+
+        // Assert: Hi phase 有 QuantShiftRight (提 hi nibble)
+        let mut hi_trace = Vec::new();
+        DecodeTraceBuilder::new(desc, 8)
+            .with_nibble_phase(NibblePhase::Hi)
+            .build(&mut hi_trace);
+        let hi_has_shift = hi_trace.iter().any(|op| matches!(op, TraceOp::QuantShiftRight { .. }));
+        assert!(hi_has_shift, "Squeeze Hi phase should have QuantShiftRight for high nibble");
     }
 
     // @trace TEST-QD-33 [req:REQ-QCG] [level:unit]
@@ -2603,13 +2652,21 @@ mod tests {
         let mut trace = Vec::new();
         let _slot = DecodeTraceBuilder::new(desc, 8).build(&mut trace);
 
-        // Assert: PackedNibbles path emits QuantAndMask
+        // Assert: PackedNibbles 两阶段 SPLIT — Lo phase (默认) emit QuantAndMask (lo nibble)
         let has_mask = trace.iter().any(|op| matches!(op, TraceOp::QuantAndMask { .. }));
-        assert!(has_mask, "TQ2_0 should have QuantAndMask for nibble extraction");
+        assert!(has_mask, "TQ2_0 Lo phase should have QuantAndMask for nibble extraction");
 
-        // Assert: PackedNibbles path emits QuantShiftRight
+        // Assert: 两阶段 SPLIT — Lo phase 不 emit QuantShiftRight (hi 在独立 Hi phase)
         let has_shift = trace.iter().any(|op| matches!(op, TraceOp::QuantShiftRight { .. }));
-        assert!(has_shift, "TQ2_0 should have QuantShiftRight for high nibble");
+        assert!(!has_shift, "TQ2_0 Lo phase should NOT have QuantShiftRight (hi in Hi phase)");
+
+        // Assert: Hi phase emit QuantShiftRight
+        let mut hi_trace = Vec::new();
+        DecodeTraceBuilder::new(desc, 8)
+            .with_nibble_phase(NibblePhase::Hi)
+            .build(&mut hi_trace);
+        let hi_has_shift = hi_trace.iter().any(|op| matches!(op, TraceOp::QuantShiftRight { .. }));
+        assert!(hi_has_shift, "TQ2_0 Hi phase should have QuantShiftRight for high nibble");
 
         // Assert: no post-scale Add (only pre-scale Sub)
         let has_add = trace.iter().any(|op| matches!(op, TraceOp::Add(_, _)));

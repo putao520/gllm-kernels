@@ -493,4 +493,722 @@ mod quant_gemv_tests {
         eprintln!("[Q2_K] compiled {} bytes", code.len());
         assert!(code.len() > 0, "Q2_K compiled code should not be empty");
     }
+
+    // ── Q4_0 QuantGather x86 real-execution oracle ────────────────────────
+    //
+    // BCE-20260708-Q4_0 saga 定位：Qwen3 BF16 E2E PASS("Paris") + Q4_0 E2E FAIL(乱码) →
+    // bug 100% Q4_0-quant 特有。QuantGather(embed) 与 QuantGemm(layer weights) 共用同一
+    // DecodeTraceBuilder，但 saga 16+ 轮未能用可信 oracle 验证 JIT 执行数值。
+    // 本测试构造已知 Q4_0 embed weight，emit QuantGather，编译后真实执行，对比手算参考。
+    //
+    // 测试规格：hidden_dim=32 (1 block), vocab=2 (token 0/1), seq_len=1 (查 token 0)。
+    // Q4_0 block = 2 字节 f16 scale d + 16 字节 packed nibbles = 18 字节。
+    // SPLIT 布局 (llama.cpp 权威)：byte j 低 nibble → elem[j]，高 nibble → elem[j+16]。
+    //   token 0 block: d=f16(1.0), qs[0]=0x9A (lo=0xA=10, hi=0x9=9), 其余 qs[i]=0x88 (lo=hi=8=zero)。
+    //   手算：elem[0]=1.0*(10-8)=2.0；elem[16]=1.0*(9-8)=1.0；其余 elem=1.0*(8-8)=0.0。
+    //
+    // ABI (build_q4_0_gemv_prog 同款)：AbiArg(0)=indices_ptr(rdi), AbiArg(1)=embed_ptr(rsi),
+    //   StackArg(24)=output_ptr。StackArg(24) 在 prologue `push rbp; mov rbp,rsp` 后读 [rbp+24]，
+    //   对应 SysV ABI 第 8 个参数 (arg 7, 0-indexed)。故 extern "C" fn 需 8 参数，output 放第 8 位。
+
+    use crate::compiler::codegen::vm::quant_gather_emit::emit_quant_gather_inline;
+
+    /// mmap 一段 RWX 内存并拷贝 JIT 机器码进去 (参考 autotuning/measure.rs ExecutableGemmBuffer::new)。
+    /// 返回 (ptr, len) 用于调用与 munmap。
+    fn make_exec_buffer(code: &[u8]) -> (*mut u8, usize) {
+        assert!(!code.is_empty(), "empty JIT code");
+        let page_size = unsafe { libc::sysconf(libc::_SC_PAGESIZE) as usize };
+        let len = (code.len() + page_size - 1) & !(page_size - 1);
+        let ptr = unsafe {
+            libc::mmap(
+                std::ptr::null_mut(),
+                len,
+                libc::PROT_READ | libc::PROT_WRITE,
+                libc::MAP_PRIVATE | libc::MAP_ANONYMOUS,
+                -1,
+                0,
+            )
+        };
+        assert!(ptr != libc::MAP_FAILED, "mmap failed");
+        let ptr = ptr as *mut u8;
+        unsafe { std::ptr::copy_nonoverlapping(code.as_ptr(), ptr, code.len()) };
+        let ret = unsafe { libc::mprotect(ptr as *mut _, len, libc::PROT_READ | libc::PROT_EXEC) };
+        assert_eq!(ret, 0, "mprotect RX failed");
+        (ptr, len)
+    }
+
+    #[test]
+    fn test_q4_0_quant_gather_x86_oracle() {
+        let hidden_dim: usize = 32; // 1 block (block_size=32)
+        let vocab: usize = 2;
+        // Q4_0 block_bytes = 18, row_stride = (32/32)*18 = 18 字节/token。
+        let block_bytes: usize = 18;
+
+        // ── 构造已知 Q4_0 embed weight buffer ──
+        // token 0 block (18 字节): d=f16(1.0) + qs[0]=0x9A + qs[1..16]=0x88
+        //   SPLIT: elem[0]=1.0*(10-8)=2.0, elem[16]=1.0*(9-8)=1.0, 其余=0.0
+        // token 1 block (18 字节): d=f16(1.0) + qs[*]=0x88 (全 zero point)
+        let d_f16 = f16::from_f32(1.0);
+        let d_bits = d_f16.to_bits(); // little-endian 2 bytes
+        let d_lo = (d_bits & 0xFF) as u8;
+        let d_hi = ((d_bits >> 8) & 0xFF) as u8;
+
+        let mut weight = vec![0u8; vocab * block_bytes];
+        // token 0 at offset 0
+        weight[0] = d_lo;
+        weight[1] = d_hi;
+        weight[2] = 0x9A; // qs[0]: lo=0xA=10, hi=0x9=9
+        for j in 1..16 {
+            weight[2 + j] = 0x88; // qs[1..16]: lo=hi=8 = zero point
+        }
+        // token 1 at offset 18: all zero point + d=1.0
+        weight[18] = d_lo;
+        weight[19] = d_hi;
+        for j in 0..16 {
+            weight[20 + j] = 0x88;
+        }
+
+        // ── 构造 indices: [0u32] (查 token 0, seq_len=1) ──
+        let indices: [u32; 1] = [0u32];
+
+        // ── 输出 buffer: seq_len * hidden_dim * 4 字节 (F32) ──
+        let mut output = vec![0u8; 1 * hidden_dim * std::mem::size_of::<f32>()];
+
+        // ── emit VmProgram (build_q4_0_gemv_prog 同款 ABI) ──
+        let mut prog = VmProgram::new();
+        let input_ptr = prog.alloc_vreg(VRegKind::Ptr, SimdWidth::Scalar);
+        let weight_ptr = prog.alloc_vreg(VRegKind::Ptr, SimdWidth::Scalar);
+        let output_ptr = prog.alloc_vreg(VRegKind::Ptr, SimdWidth::Scalar);
+        prog.emit(VmInstr::LoadPtr { dst: input_ptr, src: PtrExpr::AbiArg(0) });
+        prog.emit(VmInstr::LoadPtr { dst: weight_ptr, src: PtrExpr::AbiArg(1) });
+        prog.emit(VmInstr::LoadPtr { dst: output_ptr, src: PtrExpr::StackArg(24) });
+
+        emit_quant_gather_inline(
+            &mut prog,
+            BoundExpr::Const(1),
+            vocab,
+            hidden_dim,
+            QuantType::Q4_0,
+            SimdWidth::W256,
+            input_ptr, weight_ptr, output_ptr,
+            QuantPrecision::F32,
+            None,
+        ).expect("Q4_0 QuantGather emit should succeed");
+
+        // ── 编译 ──
+        let code = compile_vm_prog(&prog);
+        eprintln!("[Q4_0-ORACLE] JIT code {} bytes, {} instrs", code.len(), prog.instrs.len());
+
+        // ── mmap + 执行 ──
+        // ABI: AbiArg(0)=indices(rdi), AbiArg(1)=embed(rsi), StackArg(24)=output。
+        // StackArg(24) = [rbp+24] = 第 8 个参数 (第 7 个参数在 [rbp+16] 被 skip)。
+        // extern "C" 8 参数: (indices, embed, _p1, _p2, _p3, _p4, _p5, output)
+        let (exec_ptr, exec_len) = make_exec_buffer(&code);
+        type GatherFn = unsafe extern "C" fn(
+            *const u8, *const u8, usize, usize, usize, usize, usize, *mut u8,
+        ) -> usize;
+        let f: GatherFn = unsafe { std::mem::transmute(exec_ptr) };
+        let _ret = unsafe {
+            f(
+                indices.as_ptr() as *const u8,
+                weight.as_ptr() as *const u8,
+                0, 0, 0, 0, 0,            // args 3..7 unused (rdx/rcx/r8/r9/stack[16])
+                output.as_mut_ptr() as *mut u8, // arg 8 = StackArg(24)
+            )
+        };
+        eprintln!("[Q4_0-ORACLE] kernel returned {}", _ret);
+
+        // ── 断言 ──
+        let out_f32: &[f32] = unsafe {
+            std::slice::from_raw_parts(output.as_ptr() as *const f32, hidden_dim)
+        };
+        eprintln!("[Q4_0-ORACLE] out[0..8]   = {:?}", &out_f32[0..8]);
+        eprintln!("[Q4_0-ORACLE] out[8..16]  = {:?}", &out_f32[8..16]);
+        eprintln!("[Q4_0-ORACLE] out[16..24] = {:?}", &out_f32[16..24]);
+        eprintln!("[Q4_0-ORACLE] out[24..32] = {:?}", &out_f32[24..32]);
+        eprintln!("[Q4_0-ORACLE] want: out[0]=2.0, out[16]=1.0, 其余=0.0");
+
+        let mut pass = true;
+        if (out_f32[0] - 2.0).abs() >= 1e-5 {
+            eprintln!("[Q4_0-ORACLE] FAIL elem[0]: got {} want 2.0", out_f32[0]);
+            pass = false;
+        }
+        if (out_f32[16] - 1.0).abs() >= 1e-5 {
+            eprintln!("[Q4_0-ORACLE] FAIL elem[16]: got {} want 1.0", out_f32[16]);
+            pass = false;
+        }
+        for i in 0..hidden_dim {
+            if i != 0 && i != 16 && out_f32[i].abs() >= 1e-5 {
+                eprintln!("[Q4_0-ORACLE] FAIL elem[{}]: got {} want 0.0", i, out_f32[i]);
+                pass = false;
+            }
+        }
+
+        // 释放 exec 内存
+        unsafe { libc::munmap(exec_ptr as *mut _, exec_len); }
+
+        if pass {
+            eprintln!("[Q4_0-ORACLE] PASS — JIT emit+lower 数值正确 → bug 在接线 (caller 喂 ptr/offset)");
+        } else {
+            eprintln!("[Q4_0-ORACLE] FAIL — bug 在 emit/lower (actual vs expected 见上)");
+        }
+        assert!(pass, "Q4_0 QuantGather x86 oracle 数值不匹配 (actual vs expected 见 eprintln)");
+    }
+
+    /// 诊断变体：多字节非平凡 nibble，区分「4-byte 组内 INTERLEAVED」vs 其他模式。
+    ///
+    /// 构造：d=f16(1.0)，byte0=0x90 (lo=0, hi=9)，byte1=0xA0 (lo=0, hi=10)，
+    /// byte2=0xB0 (lo=0, hi=11)，byte3=0xC0 (lo=0, hi=12)，其余 byte=0x88。
+    /// 若是「4-byte 组内 INTERLEAVED」(lo 前 4 + hi 后 4)：out=[0,0,0,0, 9,10,11,12, 0...]
+    /// 若是块级 SPLIT (lo→0..15, hi→16..31)：out[16..20]=[9,10,11,12]，out[0..4]=0
+    #[test]
+    fn test_q4_0_quant_gather_x86_oracle_pattern_diag() {
+        let hidden_dim: usize = 32;
+        let vocab: usize = 2;
+        let block_bytes: usize = 18;
+
+        let d_f16 = f16::from_f32(1.0);
+        let d_bits = d_f16.to_bits();
+        let d_lo = (d_bits & 0xFF) as u8;
+        let d_hi = ((d_bits >> 8) & 0xFF) as u8;
+
+        let mut weight = vec![0u8; vocab * block_bytes];
+        weight[0] = d_lo;
+        weight[1] = d_hi;
+        // byte 0..3 各放一个独特 hi nibble，lo nibble 全 0 (zero point 偏移后 = -8，但为对比模式仍可识别)
+        weight[2] = 0x90; // byte0: lo=0, hi=9
+        weight[3] = 0xA0; // byte1: lo=0, hi=10
+        weight[4] = 0xB0; // byte2: lo=0, hi=11
+        weight[5] = 0xC0; // byte3: lo=0, hi=12
+        for j in 4..16 {
+            weight[2 + j] = 0x88; // byte4..15: lo=hi=8 = zero point
+        }
+        // token 1
+        weight[18] = d_lo;
+        weight[19] = d_hi;
+        for j in 0..16 {
+            weight[20 + j] = 0x88;
+        }
+
+        let indices: [u32; 1] = [0u32];
+        let mut output = vec![0u8; 1 * hidden_dim * std::mem::size_of::<f32>()];
+
+        let mut prog = VmProgram::new();
+        let input_ptr = prog.alloc_vreg(VRegKind::Ptr, SimdWidth::Scalar);
+        let weight_ptr = prog.alloc_vreg(VRegKind::Ptr, SimdWidth::Scalar);
+        let output_ptr = prog.alloc_vreg(VRegKind::Ptr, SimdWidth::Scalar);
+        prog.emit(VmInstr::LoadPtr { dst: input_ptr, src: PtrExpr::AbiArg(0) });
+        prog.emit(VmInstr::LoadPtr { dst: weight_ptr, src: PtrExpr::AbiArg(1) });
+        prog.emit(VmInstr::LoadPtr { dst: output_ptr, src: PtrExpr::StackArg(24) });
+
+        emit_quant_gather_inline(
+            &mut prog, BoundExpr::Const(1), vocab, hidden_dim,
+            QuantType::Q4_0, SimdWidth::W256,
+            input_ptr, weight_ptr, output_ptr,
+            QuantPrecision::F32, None,
+        ).expect("emit should succeed");
+
+        let code = compile_vm_prog(&prog);
+        let (exec_ptr, exec_len) = make_exec_buffer(&code);
+        type GatherFn = unsafe extern "C" fn(
+            *const u8, *const u8, usize, usize, usize, usize, usize, *mut u8,
+        ) -> usize;
+        let f: GatherFn = unsafe { std::mem::transmute(exec_ptr) };
+        let _ = unsafe { f(indices.as_ptr() as *const u8, weight.as_ptr() as *const u8,
+                           0, 0, 0, 0, 0, output.as_mut_ptr() as *mut u8) };
+
+        let out_f32: &[f32] = unsafe {
+            std::slice::from_raw_parts(output.as_ptr() as *const f32, hidden_dim)
+        };
+        eprintln!("[Q4_0-DIAG] out[0..8]   = {:?}", &out_f32[0..8]);
+        eprintln!("[Q4_0-DIAG] out[8..16]  = {:?}", &out_f32[8..16]);
+        eprintln!("[Q4_0-DIAG] out[16..24] = {:?}", &out_f32[16..24]);
+        eprintln!("[Q4_0-DIAG] out[24..32] = {:?}", &out_f32[24..32]);
+        // hi nibbles 9,10,11,12 → 偏移 -8 后 = 1.0, 2.0, 3.0, 4.0
+        eprintln!("[Q4_0-DIAG] 期望(4-byte 组内 INTERLEAVED): out[4..8]=[1,2,3,4], 其余=-8 或 0");
+        eprintln!("[Q4_0-DIAG] 期望(块级 SPLIT): out[16..20]=[1,2,3,4], out[0..4]=-8");
+
+        unsafe { libc::munmap(exec_ptr as *mut _, exec_len); }
+        // 仅诊断，不断言（目的是打印实际模式供根因分析）
+    }
+
+    // ── Q4_0 QuantGemm x86 real-execution oracle ─────────────────────────
+    //
+    // BCE-20260709-Q4_0-SPLIT 序列第 2 步 (architect round 19):
+    // QuantGather SPLIT 修复后 E2E 仍乱码 → QuantGemm (层权重 dequant, 走
+    // QuantDequantFma 微内核, 非 DecodeTraceBuilder) 可能有同样 SPLIT bug.
+    // 本测试喂已知 Q4_0 weight + 已知 activation, GEMV 输出对比手算 SPLIT 参考.
+    //
+    // 测试: m=1 (1 output), n=1, k=32 (1 block).
+    // weight block: d=f16(1.0), qs[0]=0x9A(lo=10,hi=9), 其余 qs=0x88(zero=8).
+    // SPLIT: elem[0]=1.0*(10-8)=2.0, elem[16]=1.0*(9-8)=1.0, 其余=0.
+    // activation[0]=1.0, activation[16]=1.0, 其余=0.
+    // output = act·weight = 1.0*2.0 + 1.0*1.0 = 3.0.
+    #[test]
+    fn test_q4_0_quant_gemm_x86_oracle() {
+        use crate::compiler::codegen::vm::moe_quant_emit::emit_quant_gemm_inline;
+
+        let m: usize = 1; // 1 output row
+        let n: usize = 1; // 1 batch
+        let k: usize = 32; // inner dim (1 block)
+        let block_bytes: usize = 18;
+
+        // ── weight: 1 block (m=1 row) ──
+        // d=f16(1.0), qs[0]=0x9A, 其余 0x88
+        let d_f16 = f16::from_f32(1.0);
+        let d_bits = d_f16.to_bits();
+        let mut weight = vec![0u8; m * block_bytes];
+        weight[0] = (d_bits & 0xFF) as u8;
+        weight[1] = ((d_bits >> 8) & 0xFF) as u8;
+        weight[2] = 0x9A; // qs[0]: lo=10, hi=9
+        for j in 1..16 {
+            weight[2 + j] = 0x88;
+        }
+
+        // ── activation: [k, n] = [32, 1] col-major ──
+        // act[0]=1.0, act[16]=1.0, 其余 0
+        let mut act = vec![0.0f32; k * n];
+        act[0] = 1.0;
+        act[16] = 1.0;
+
+        // ── output: [m, n] = [1, 1] ──
+        let mut output = vec![0.0f32; m * n];
+
+        // ── emit VmProgram (build_q4_0_gemv_prog 同款 ABI) ──
+        let mut prog = VmProgram::new();
+        let input_ptr = prog.alloc_vreg(VRegKind::Ptr, SimdWidth::Scalar);
+        let weight_ptr = prog.alloc_vreg(VRegKind::Ptr, SimdWidth::Scalar);
+        let output_ptr = prog.alloc_vreg(VRegKind::Ptr, SimdWidth::Scalar);
+        prog.emit(VmInstr::LoadPtr { dst: input_ptr, src: PtrExpr::AbiArg(0) });
+        prog.emit(VmInstr::LoadPtr { dst: weight_ptr, src: PtrExpr::AbiArg(1) });
+        prog.emit(VmInstr::LoadPtr { dst: output_ptr, src: PtrExpr::StackArg(24) });
+
+        emit_quant_gemm_inline(
+            &mut prog,
+            BoundExpr::Const(m),
+            n, k,
+            QuantType::Q4_0,
+            SimdWidth::W256,
+            input_ptr, weight_ptr, output_ptr,
+            QuantPrecision::F32,
+            DotProductCap::SimdAssisted,
+        ).expect("Q4_0 QuantGemm emit should succeed");
+
+        let code = compile_vm_prog(&prog);
+        eprintln!("[Q4_0-GEMM-ORACLE] JIT code {} bytes, {} instrs", code.len(), prog.instrs.len());
+
+        // ── mmap + 执行 (同 QuantGather oracle ABI) ──
+        let (exec_ptr, exec_len) = make_exec_buffer(&code);
+        type GemmFn = unsafe extern "C" fn(
+            *const u8, *const u8, usize, usize, usize, usize, usize, *mut u8,
+        ) -> usize;
+        let f: GemmFn = unsafe { std::mem::transmute(exec_ptr) };
+        let _ret = unsafe {
+            f(
+                act.as_ptr() as *const u8,
+                weight.as_ptr() as *const u8,
+                0, 0, 0, 0, 0,
+                output.as_mut_ptr() as *mut u8,
+            )
+        };
+        eprintln!("[Q4_0-GEMM-ORACLE] kernel returned {}", _ret);
+
+        let out_f32: &[f32] = &output;
+        eprintln!("[Q4_0-GEMM-ORACLE] out = {:?}", out_f32);
+        eprintln!("[Q4_0-GEMM-ORACLE] want: out[0] = 3.0 (1.0*2.0 + 1.0*1.0, SPLIT elem[0]=2.0 elem[16]=1.0)");
+
+        unsafe { libc::munmap(exec_ptr as *mut _, exec_len); }
+
+        // 断言: output[0] ≈ 3.0
+        // 若 QuantGemm SPLIT 正确: weight elem[0]=2.0 配 act[0]=1.0, elem[16]=1.0 配 act[16]=1.0 → 3.0
+        // 若 QuantGemm SPLIT 错误 (如 lo/hi 配错 activation): output 会是其他值 (如 2.0 或 1.0 或 0.0)
+        let pass = (out_f32[0] - 3.0).abs() < 1e-3;
+        if pass {
+            eprintln!("[Q4_0-GEMM-ORACLE] PASS — QuantGemm SPLIT 正确, 层 dequant 对 → E2E 乱码另有根因");
+        } else {
+            eprintln!("[Q4_0-GEMM-ORACLE] FAIL — QuantGemm SPLIT bug, actual={} want 3.0", out_f32[0]);
+        }
+        assert!(pass, "Q4_0 QuantGemm x86 oracle: got {} want 3.0 (SPLIT act·weight)", out_f32[0]);
+    }
+
+    // ── Q4_0 QuantGemm x86 oracle — BF16 accum_dtype (真实推理配置) ───────
+    //
+    // 真实 Qwen3 Q4_0: geometry.dtype=BF16, compute_dtype=BF16 → accum_dtype=BF16.
+    // 上面的 oracle 用 F32 accum, 真实推理用 BF16 accum. 本测试验 BF16 accum 下 QuantGemm 是否对.
+    // Q4_0 decode 出 F32 → BF16 accum 累加. 2.0/1.0 等 BF16 可精确表示, 应仍 output=3.0.
+    #[test]
+    fn test_q4_0_quant_gemm_x86_oracle_bf16_accum() {
+        use crate::compiler::codegen::vm::moe_quant_emit::emit_quant_gemm_inline;
+
+        let m: usize = 1;
+        let n: usize = 1;
+        let k: usize = 32;
+        let block_bytes: usize = 18;
+
+        let d_f16 = f16::from_f32(1.0);
+        let d_bits = d_f16.to_bits();
+        let mut weight = vec![0u8; m * block_bytes];
+        weight[0] = (d_bits & 0xFF) as u8;
+        weight[1] = ((d_bits >> 8) & 0xFF) as u8;
+        weight[2] = 0x9A;
+        for j in 1..16 { weight[2 + j] = 0x88; }
+
+        // activation F32 存储 (真实推理 act_dt=F32, 即使 compute_dtype=BF16)
+        // act[0]=1.0, act[16]=1.0, 其余 0
+        let mut act = vec![0.0f32; k * n];
+        act[0] = 1.0;
+        act[16] = 1.0;
+
+        let mut output = vec![0.0f32; m * n];
+
+        let mut prog = VmProgram::new();
+        let input_ptr = prog.alloc_vreg(VRegKind::Ptr, SimdWidth::Scalar);
+        let weight_ptr = prog.alloc_vreg(VRegKind::Ptr, SimdWidth::Scalar);
+        let output_ptr = prog.alloc_vreg(VRegKind::Ptr, SimdWidth::Scalar);
+        prog.emit(VmInstr::LoadPtr { dst: input_ptr, src: PtrExpr::AbiArg(0) });
+        prog.emit(VmInstr::LoadPtr { dst: weight_ptr, src: PtrExpr::AbiArg(1) });
+        prog.emit(VmInstr::LoadPtr { dst: output_ptr, src: PtrExpr::StackArg(24) });
+
+        // BF16 accum_dtype (真实推理配置)
+        emit_quant_gemm_inline(
+            &mut prog,
+            BoundExpr::Const(m),
+            n, k,
+            QuantType::Q4_0,
+            SimdWidth::W256,
+            input_ptr, weight_ptr, output_ptr,
+            QuantPrecision::BF16,
+            DotProductCap::SimdAssisted,
+        ).expect("Q4_0 QuantGemm BF16 emit should succeed");
+
+        let code = compile_vm_prog(&prog);
+        eprintln!("[Q4_0-GEMM-BF16] JIT code {} bytes, {} instrs", code.len(), prog.instrs.len());
+
+        let (exec_ptr, exec_len) = make_exec_buffer(&code);
+        type GemmFn = unsafe extern "C" fn(*const u8, *const u8, usize, usize, usize, usize, usize, *mut u8) -> usize;
+        let f: GemmFn = unsafe { std::mem::transmute(exec_ptr) };
+        let _ret = unsafe {
+            f(act.as_ptr() as *const u8, weight.as_ptr() as *const u8,
+              0, 0, 0, 0, 0, output.as_mut_ptr() as *mut u8)
+        };
+
+        let out_f32: &[f32] = &output;
+        eprintln!("[Q4_0-GEMM-BF16] out = {:?} (want 3.0, BF16 accum + F32 act 真实配置)", out_f32);
+
+        unsafe { libc::munmap(exec_ptr as *mut _, exec_len); }
+
+        // BF16 可精确表示 2.0/1.0/3.0, 容差放宽到 1e-2 (BF16 累加噪声)
+        let pass = (out_f32[0] - 3.0).abs() < 1e-2;
+        if pass {
+            eprintln!("[Q4_0-GEMM-BF16] PASS — BF16 accum 下 QuantGemm 对");
+        } else {
+            eprintln!("[Q4_0-GEMM-BF16] FAIL — BF16 accum bug, actual={} want 3.0", out_f32[0]);
+        }
+        assert!(pass, "Q4_0 QuantGemm BF16 accum oracle: got {} want 3.0", out_f32[0]);
+    }
+
+    // ── Q4_0 QuantGemm real-scale x86 oracle (architect round 23) ────────
+    //
+    // 6 单位 oracle 全过但 E2E 错 → architect round 23: 唯一未执行的 Q4_0 特有面
+    // = 真实规模 in-op (m=5, n=2048, k=1024). BF16 过清共享, bug Q4_0 特有@规模.
+    //
+    // 设计: m=2, n=4, k=1024 (32 block). 每 (m,n) 输出唯一值便于定位错位.
+    // weight[m][n] block0: qs[0] lo=(m+n+8)%16, hi=8(zero). d=1.0.
+    // act[0]=1, act[16]=0 → output[m][n] = act[0]×elem[0] = (lo-8) = m+n (若 lo=m+n+8).
+    //   即 output[i][j] = i+j (唯一, 易验错位).
+    // output 布局 [m, n] row-major: output[m*n + n_idx].
+    #[test]
+    fn test_q4_0_quant_gemm_x86_oracle_realscale() {
+        use crate::compiler::codegen::vm::moe_quant_emit::emit_quant_gemm_inline;
+
+        let m: usize = 2;
+        let n: usize = 4;
+        let k: usize = 1024; // 32 blocks (真实规模)
+        let block_bytes: usize = 18;
+        let blocks_per_row: usize = k / 32; // 32
+
+        let d_f16 = f16::from_f32(1.0);
+        let d_bits = d_f16.to_bits();
+        let d_lo = (d_bits & 0xFF) as u8;
+        let d_hi = ((d_bits >> 8) & 0xFF) as u8;
+
+        // weight: m 行 × n 列 × blocks_per_row blocks/row. layout [m, n, blocks, 18B]
+        // weight_row_stride (n 维) = blocks_per_row * block_bytes = 576
+        let row_bytes = blocks_per_row * block_bytes;
+        let mut weight = vec![0u8; m * n * row_bytes];
+        for mi in 0..m {
+            for ni in 0..n {
+                let base = (mi * n + ni) * row_bytes;
+                // block0: elem[0]=ni (weight 与 mi 无关, 诊断: output[m][n]=n → weight_row_ptr 没随 m 前进)
+                weight[base] = d_lo;
+                weight[base + 1] = d_hi;
+                let lo_val = ((ni + 8) % 16) as u8; // elem[0] = ni
+                weight[base + 2] = lo_val | (0x80);
+                for j in 1..16 { weight[base + 2 + j] = 0x88; }
+                for b in 1..blocks_per_row {
+                    let bs = base + b * block_bytes;
+                    weight[bs] = d_lo;
+                    weight[bs + 1] = d_hi;
+                    for j in 0..16 { weight[bs + 2 + j] = 0x88; }
+                }
+            }
+        }
+
+        // activation [m, k] row-major: act[m_idx][k_idx] at act[m_idx*k + k_idx]
+        // act[0][0]=1, act[1][0]=1 (两个 m 行的 k=0 处). a_row_stride = k*elem = 1024*4.
+        let mut act = vec![0.0f32; m * k];
+        act[0 * k + 0] = 1.0;  // m=0, k=0
+        act[1 * k + 0] = 1.0;  // m=1, k=0
+
+        let mut output = vec![0.0f32; m * n];
+
+        let mut prog = VmProgram::new();
+        let input_ptr = prog.alloc_vreg(VRegKind::Ptr, SimdWidth::Scalar);
+        let weight_ptr = prog.alloc_vreg(VRegKind::Ptr, SimdWidth::Scalar);
+        let output_ptr = prog.alloc_vreg(VRegKind::Ptr, SimdWidth::Scalar);
+        prog.emit(VmInstr::LoadPtr { dst: input_ptr, src: PtrExpr::AbiArg(0) });
+        prog.emit(VmInstr::LoadPtr { dst: weight_ptr, src: PtrExpr::AbiArg(1) });
+        prog.emit(VmInstr::LoadPtr { dst: output_ptr, src: PtrExpr::StackArg(24) });
+
+        emit_quant_gemm_inline(
+            &mut prog,
+            BoundExpr::Const(m),
+            n, k,
+            QuantType::Q4_0,
+            SimdWidth::W256,
+            input_ptr, weight_ptr, output_ptr,
+            QuantPrecision::F32,
+            DotProductCap::SimdAssisted,
+        ).expect("Q4_0 QuantGemm real-scale emit should succeed");
+
+        let code = compile_vm_prog(&prog);
+        eprintln!("[Q4_0-GEMM-RS] JIT code {} bytes, {} instrs", code.len(), prog.instrs.len());
+
+        let (exec_ptr, exec_len) = make_exec_buffer(&code);
+        type GemmFn = unsafe extern "C" fn(*const u8, *const u8, usize, usize, usize, usize, usize, *mut u8) -> usize;
+        let f: GemmFn = unsafe { std::mem::transmute(exec_ptr) };
+        let _ret = unsafe {
+            f(act.as_ptr() as *const u8, weight.as_ptr() as *const u8,
+              0, 0, 0, 0, 0, output.as_mut_ptr() as *mut u8)
+        };
+
+        let out_f32: &[f32] = &output;
+        eprintln!("[Q4_0-GEMM-RS] out = {:?}", out_f32);
+        eprintln!("[Q4_0-GEMM-RS] want: out[i][j] = j (0,1,2,3, 0,1,2,3) [weight 与 mi 无关]");
+
+        unsafe { libc::munmap(exec_ptr as *mut _, exec_len); }
+
+        // output[m*n + n_idx] = n_idx (weight elem[0]=n_idx, act=1)
+        let mut pass = true;
+        for mi in 0..m {
+            for ni in 0..n {
+                let idx = mi * n + ni;
+                let want = ni as f32;
+                if (out_f32[idx] - want).abs() >= 1e-2 {
+                    eprintln!("[Q4_0-GEMM-RS] FAIL out[{}][{}] (idx={}): got {} want {}", mi, ni, idx, out_f32[idx], want);
+                    pass = false;
+                }
+            }
+        }
+        if pass {
+            eprintln!("[Q4_0-GEMM-RS] PASS — 真实规模 QuantGemm 对 (m={},n={},k={})", m, n, k);
+        } else {
+            eprintln!("[Q4_0-GEMM-RS] FAIL — 真实规模 in-op bug (architect round 23 TOP)");
+        }
+        assert!(pass, "Q4_0 QuantGemm real-scale oracle: 真实规模错位 (见 eprintln)");
+    }
+
+    // ── Q4_0 QuantGather multi-block x86 oracle (architect round 20) ──────
+    //
+    // 两个 1-block oracle 都过但 E2E 错 → architect round 20: 多 block 错序嫌疑 TOP.
+    // 真实推理 hidden=1024=32 block. 1-block oracle 漏测 blk_ctr 跨 block 乘子.
+    // 本测试 hidden=64 (2 block), 每 block 不同 nibble, 验证跨 block SPLIT 序.
+    //
+    // block 0 (offset 0): d=1.0, qs[0]=0x9A(lo=10,hi=9) → elem[0]=2.0, elem[16]=1.0
+    // block 1 (offset 18): d=1.0, qs[0]=0xB6(lo=6,hi=11) → elem[32]=-2.0, elem[48]=3.0
+    // 其余 elem=0 (qs=0x88 zero point)
+    #[test]
+    fn test_q4_0_quant_gather_x86_oracle_multiblock() {
+        let hidden_dim: usize = 64; // 2 blocks (block_size=32)
+        let vocab: usize = 2;
+        let block_bytes: usize = 18;
+
+        let d_f16 = f16::from_f32(1.0);
+        let d_bits = d_f16.to_bits();
+        let d_lo = (d_bits & 0xFF) as u8;
+        let d_hi = ((d_bits >> 8) & 0xFF) as u8;
+
+        let mut weight = vec![0u8; vocab * block_bytes * 2 / 2]; // vocab 行, 每行 2 block
+        // 实际行 stride = (hidden/block_size)*block_bytes = 2*18 = 36 字节/token
+        let row_stride = (hidden_dim / 32) * block_bytes; // 36
+        let mut weight = vec![0u8; vocab * row_stride];
+        // token 0: block 0 at offset 0, block 1 at offset 18
+        weight[0] = d_lo; weight[1] = d_hi;
+        weight[2] = 0x9A; // block0 qs[0]: lo=10, hi=9
+        for j in 1..16 { weight[2 + j] = 0x88; }
+        weight[18] = d_lo; weight[19] = d_hi;
+        weight[20] = 0xB6; // block1 qs[0]: lo=6, hi=11
+        for j in 1..16 { weight[20 + j] = 0x88; }
+        // token 1 at offset 36: all zero point
+        weight[36] = d_lo; weight[37] = d_hi;
+        for j in 0..16 { weight[38 + j] = 0x88; }
+        weight[54] = d_lo; weight[55] = d_hi;
+        for j in 0..16 { weight[56 + j] = 0x88; }
+
+        let indices: [u32; 1] = [0u32];
+        let mut output = vec![0u8; 1 * hidden_dim * std::mem::size_of::<f32>()];
+
+        let mut prog = VmProgram::new();
+        let input_ptr = prog.alloc_vreg(VRegKind::Ptr, SimdWidth::Scalar);
+        let weight_ptr = prog.alloc_vreg(VRegKind::Ptr, SimdWidth::Scalar);
+        let output_ptr = prog.alloc_vreg(VRegKind::Ptr, SimdWidth::Scalar);
+        prog.emit(VmInstr::LoadPtr { dst: input_ptr, src: PtrExpr::AbiArg(0) });
+        prog.emit(VmInstr::LoadPtr { dst: weight_ptr, src: PtrExpr::AbiArg(1) });
+        prog.emit(VmInstr::LoadPtr { dst: output_ptr, src: PtrExpr::StackArg(24) });
+
+        emit_quant_gather_inline(
+            &mut prog,
+            BoundExpr::Const(1),
+            vocab,
+            hidden_dim,
+            QuantType::Q4_0,
+            SimdWidth::W256,
+            input_ptr, weight_ptr, output_ptr,
+            QuantPrecision::F32,
+            None,
+        ).expect("Q4_0 QuantGather multi-block emit should succeed");
+
+        let code = compile_vm_prog(&prog);
+        eprintln!("[Q4_0-MB] JIT code {} bytes, {} instrs", code.len(), prog.instrs.len());
+
+        let (exec_ptr, exec_len) = make_exec_buffer(&code);
+        type GatherFn = unsafe extern "C" fn(
+            *const u8, *const u8, usize, usize, usize, usize, usize, *mut u8,
+        ) -> usize;
+        let f: GatherFn = unsafe { std::mem::transmute(exec_ptr) };
+        let _ret = unsafe {
+            f(indices.as_ptr() as *const u8, weight.as_ptr() as *const u8,
+              0, 0, 0, 0, 0, output.as_mut_ptr() as *mut u8)
+        };
+
+        let out_f32: &[f32] = unsafe {
+            std::slice::from_raw_parts(output.as_ptr() as *const f32, hidden_dim)
+        };
+        eprintln!("[Q4_0-MB] out[0..8]   = {:?}", &out_f32[0..8]);
+        eprintln!("[Q4_0-MB] out[16..24] = {:?}", &out_f32[16..24]);
+        eprintln!("[Q4_0-MB] out[32..40] = {:?}", &out_f32[32..40]);
+        eprintln!("[Q4_0-MB] out[48..56] = {:?}", &out_f32[48..56]);
+        eprintln!("[Q4_0-MB] want: out[0]=2.0, out[16]=1.0, out[32]=-2.0, out[48]=3.0, 其余=0.0");
+
+        unsafe { libc::munmap(exec_ptr as *mut _, exec_len); }
+
+        let mut pass = true;
+        let checks = [(0usize, 2.0f32), (16, 1.0), (32, -2.0), (48, 3.0)];
+        for &(idx, want) in &checks {
+            if (out_f32[idx] - want).abs() >= 1e-3 {
+                eprintln!("[Q4_0-MB] FAIL elem[{}]: got {} want {}", idx, out_f32[idx], want);
+                pass = false;
+            }
+        }
+        for i in 0..hidden_dim {
+            if ![0, 16, 32, 48].contains(&i) && out_f32[i].abs() >= 1e-3 {
+                eprintln!("[Q4_0-MB] FAIL elem[{}]: got {} want 0.0", i, out_f32[i]);
+                pass = false;
+            }
+        }
+        if pass {
+            eprintln!("[Q4_0-MB] PASS — 多 block SPLIT 正确 (跨 block blk_ctr 乘子对)");
+        } else {
+            eprintln!("[Q4_0-MB] FAIL — 多 block 错序 (architect round 20 top 嫌疑坐实)");
+        }
+        assert!(pass, "Q4_0 QuantGather multi-block oracle: 跨 block SPLIT 错序 (见 eprintln)");
+    }
+
+    // ── Q4_0 QuantGemm multi-block x86 oracle (architect round 20 step 2) ─
+    //
+    // QuantGather 多 block oracle 过 → 扩 QuantGemm 到多 block 验证层 GEMM 累加.
+    // 真实推理 q_proj K=1024=32 block. 1-block oracle 漏测多 block 累加 + weight_row stride.
+    //
+    // m=1, n=1, k=64 (2 block). weight 2 block, act[0/16/32/48]=1.
+    // block0: elem[0]=2.0, elem[16]=1.0; block1: elem[32]=-2.0, elem[48]=3.0
+    // output = 1*2 + 1*1 + 1*(-2) + 1*3 = 4.0
+    #[test]
+    fn test_q4_0_quant_gemm_x86_oracle_multiblock() {
+        use crate::compiler::codegen::vm::moe_quant_emit::emit_quant_gemm_inline;
+
+        let m: usize = 1;
+        let n: usize = 1;
+        let k: usize = 64; // 2 blocks
+        let block_bytes: usize = 18;
+
+        // weight: 2 blocks (1 row, k=64)
+        let d_f16 = f16::from_f32(1.0);
+        let d_bits = d_f16.to_bits();
+        let mut weight = vec![0u8; m * (k / 32) * block_bytes];
+        // block 0 at offset 0
+        weight[0] = (d_bits & 0xFF) as u8;
+        weight[1] = ((d_bits >> 8) & 0xFF) as u8;
+        weight[2] = 0x9A; // lo=10, hi=9
+        for j in 1..16 { weight[2 + j] = 0x88; }
+        // block 1 at offset 18
+        weight[18] = (d_bits & 0xFF) as u8;
+        weight[19] = ((d_bits >> 8) & 0xFF) as u8;
+        weight[20] = 0xB6; // lo=6, hi=11
+        for j in 1..16 { weight[20 + j] = 0x88; }
+
+        // activation [k, n] = [64, 1] col-major: act[0/16/32/48]=1
+        let mut act = vec![0.0f32; k * n];
+        act[0] = 1.0;
+        act[16] = 1.0;
+        act[32] = 1.0;
+        act[48] = 1.0;
+
+        let mut output = vec![0.0f32; m * n];
+
+        let mut prog = VmProgram::new();
+        let input_ptr = prog.alloc_vreg(VRegKind::Ptr, SimdWidth::Scalar);
+        let weight_ptr = prog.alloc_vreg(VRegKind::Ptr, SimdWidth::Scalar);
+        let output_ptr = prog.alloc_vreg(VRegKind::Ptr, SimdWidth::Scalar);
+        prog.emit(VmInstr::LoadPtr { dst: input_ptr, src: PtrExpr::AbiArg(0) });
+        prog.emit(VmInstr::LoadPtr { dst: weight_ptr, src: PtrExpr::AbiArg(1) });
+        prog.emit(VmInstr::LoadPtr { dst: output_ptr, src: PtrExpr::StackArg(24) });
+
+        emit_quant_gemm_inline(
+            &mut prog,
+            BoundExpr::Const(m),
+            n, k,
+            QuantType::Q4_0,
+            SimdWidth::W256,
+            input_ptr, weight_ptr, output_ptr,
+            QuantPrecision::F32,
+            DotProductCap::SimdAssisted,
+        ).expect("Q4_0 QuantGemm multi-block emit should succeed");
+
+        let code = compile_vm_prog(&prog);
+        eprintln!("[Q4_0-GEMM-MB] JIT code {} bytes, {} instrs", code.len(), prog.instrs.len());
+
+        let (exec_ptr, exec_len) = make_exec_buffer(&code);
+        type GemmFn = unsafe extern "C" fn(
+            *const u8, *const u8, usize, usize, usize, usize, usize, *mut u8,
+        ) -> usize;
+        let f: GemmFn = unsafe { std::mem::transmute(exec_ptr) };
+        let _ret = unsafe {
+            f(act.as_ptr() as *const u8, weight.as_ptr() as *const u8,
+              0, 0, 0, 0, 0, output.as_mut_ptr() as *mut u8)
+        };
+
+        let out_f32: &[f32] = &output;
+        eprintln!("[Q4_0-GEMM-MB] out = {:?}", out_f32);
+        eprintln!("[Q4_0-GEMM-MB] want: out[0] = 4.0 (1*2 + 1*1 + 1*(-2) + 1*3, 多 block SPLIT 累加)");
+
+        unsafe { libc::munmap(exec_ptr as *mut _, exec_len); }
+
+        let pass = (out_f32[0] - 4.0).abs() < 1e-3;
+        if pass {
+            eprintln!("[Q4_0-GEMM-MB] PASS — QuantGemm 多 block SPLIT 累加正确");
+        } else {
+            eprintln!("[Q4_0-GEMM-MB] FAIL — QuantGemm 多 block 错序, actual={} want 4.0", out_f32[0]);
+        }
+        assert!(pass, "Q4_0 QuantGemm multi-block oracle: got {} want 4.0", out_f32[0]);
+    }
 }

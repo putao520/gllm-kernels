@@ -178,7 +178,7 @@ impl QuantOffsetDsl {
     ) -> i64 {
         use crate::quant_format::DataLayout;
         match &desc.data_layout {
-            DataLayout::PackedNibbles { .. } => (lanes / 2) as i64,
+            DataLayout::PackedNibbles { .. } => lanes as i64,
             DataLayout::Bytes { .. } => lanes as i64,
             DataLayout::NibbleWithHighBits { .. } => (lanes / 2) as i64,
             DataLayout::CodebookIndex { index_bits, .. } =>

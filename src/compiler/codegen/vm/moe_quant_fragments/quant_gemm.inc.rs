@@ -276,6 +276,15 @@ pub(crate) fn emit_gemm_assisted_from_plan(
     let quant_row_stride = plan.quant_row_stride;
     let use_signed = matches!(desc.data_kind, crate::quant_format::QuantDataKind::SignedPackedInt4);
 
+    // BCE-20260709-Q4_0-ACTDT: per-role dtype 分离 (architect round 22).
+    // 旧: dtype=accum_dtype(BF16) 塌给所有用途 → A-load 按 BF16 读 F32 激活 + act stride 用 BF16 elem → output=0.
+    // 修: A-load/act-stride 用 act_dt(F32, 激活存储 dtype), B-scale/FMA/acc 用 acc_dtype(dtype.accumulator_dtype()=F32).
+    // CPU 路径 act_dt 恒 F32 (build_graph.inc.rs:94 硬编码 "act_dt=CPU 计算精度派生=F32").
+    // 净结果全 F32 (oracle case 1 验证 output=3.0).
+    let act_dt = QuantPrecision::F32;
+    let acc_dtype = dtype.accumulator_dtype();
+    let act_elem = act_dt.elem_bytes(); // F32 = 4 (激活存储步长, 非 dtype.elem_bytes)
+
     // ARCH-BLOCK-MIN: detect BlockScalarWithMin for PostScaleAdd
     let post_scale_add = matches!(&desc.scale_layout, crate::quant_format::ScaleLayout::BlockScalarWithMin { .. });
     let m_offset = match &desc.scale_layout {
@@ -301,7 +310,7 @@ pub(crate) fn emit_gemm_assisted_from_plan(
     let data_step_reg = prog.alloc_vreg(VRegKind::Ptr, SimdWidth::Scalar);
     prog.emit(VmInstr::GprLoadImm { dst: blk_ptr_stride, value: block_bytes });
     prog.emit(VmInstr::GprLoadImm { dst: j_weight_stride, value: quant_row_stride });
-    prog.emit(VmInstr::GprLoadImm { dst: act_stride_reg, value: block_size * elem });
+    prog.emit(VmInstr::GprLoadImm { dst: act_stride_reg, value: block_size * act_elem }); // BCE-20260709: F32 激活步长
     // Assisted nibble path: each iteration loads `lanes` bytes for lo+hi nibble decode
     prog.emit(VmInstr::GprLoadImm { dst: data_step_reg, value: lanes });
 
@@ -312,8 +321,8 @@ pub(crate) fn emit_gemm_assisted_from_plan(
 
     let do_m_block = |prog: &mut VmProgram, i_cnt, weight_row_ptr| -> Result<(), CompilerError> {
         prog.emit_loop_try(BoundExpr::Const(n), elem, |prog, _j_ctr, j_off| -> Result<(), CompilerError> {
-            prog.emit(VmInstr::Broadcast { dst: acc, src: ScalarExpr::Const(0.0), width, dtype });
-            prog.emit(VmInstr::Broadcast { dst: zero_vec, src: ScalarExpr::Const(0.0), width, dtype });
+            prog.emit(VmInstr::Broadcast { dst: acc, src: ScalarExpr::Const(0.0), width, dtype: acc_dtype }); // BCE-20260709: acc_dtype(F32)
+            prog.emit(VmInstr::Broadcast { dst: zero_vec, src: ScalarExpr::Const(0.0), width, dtype: acc_dtype });
             prog.emit(VmInstr::GprLoadImm { dst: k_act_base, value: 0 });
 
             let blk_ptr = prog.alloc_vreg(VRegKind::Ptr, SimdWidth::Scalar);
@@ -350,8 +359,8 @@ pub(crate) fn emit_gemm_assisted_from_plan(
                     // But SignedNibbleLow loads 8 bytes → 8 values. So we process lanes lo + lanes hi
                     // per iteration = 2*lanes block positions, needing only iters_per_block/2 iterations.
                     let nibble_iters = iters_per_block / 2;
-                    let half_block_elem = block_size / 2 * elem; // offset to hi-nibble activations
-                    prog.emit_loop_try(BoundExpr::Const(nibble_iters), lanes * elem,
+                    let half_block_elem = block_size / 2 * act_elem; // BCE-20260709: F32 激活 hi-half 偏移 (非 dtype elem)
+                    prog.emit_loop_try(BoundExpr::Const(nibble_iters), lanes * act_elem, // F32 激活步进
                         |prog, _ei_ctr, ei_off| -> Result<(), CompilerError> {
                             // --- Low nibble FMA: lo nibbles = block positions [0..7] ---
                             let lo_act_off = OffsetExpr::Add(
@@ -361,7 +370,7 @@ pub(crate) fn emit_gemm_assisted_from_plan(
                                 )),
                                 Box::new(OffsetExpr::LoopOffset(ei_off)),
                             );
-                            prog.emit(VmInstr::VecLoad { dst: a_val, base: input_ptr, offset: lo_act_off, width, dtype , predicate: None });
+                            prog.emit(VmInstr::VecLoad { dst: a_val, base: input_ptr, offset: lo_act_off, width, dtype: act_dt , predicate: None }); // BCE-20260709: A-load 用 act_dt(F32)
 
                             let low_unpack = if use_signed {
                                 BlockUnpackMode::SignedNibbleLow
@@ -372,12 +381,12 @@ pub(crate) fn emit_gemm_assisted_from_plan(
                                 dst: b_lo, base: data_ptr,
                                 offset: OffsetExpr::Const(0), unpack: low_unpack, width,
                             });
-                            prog.emit(VmInstr::VecBinOp { dst: b_lo, a: b_lo, b: scale_vec, op: VecOp::Mul, dtype: dtype });
+                            prog.emit(VmInstr::VecBinOp { dst: b_lo, a: b_lo, b: scale_vec, op: VecOp::Mul, dtype: acc_dtype }); // BCE-20260709: acc_dtype(F32)
                             if post_scale_add {
                                 // ARCH-BLOCK-MIN: value = d * quantized + m
-                                prog.emit(VmInstr::VecBinOp { dst: b_lo, a: b_lo, b: min_vec, op: VecOp::Add, dtype: dtype });
+                                prog.emit(VmInstr::VecBinOp { dst: b_lo, a: b_lo, b: min_vec, op: VecOp::Add, dtype: acc_dtype });
                             }
-                            prog.emit(VmInstr::Fma { dst: acc, acc, a: a_val, b: b_lo, dtype });
+                            prog.emit(VmInstr::Fma { dst: acc, acc, a: a_val, b: b_lo, dtype: acc_dtype });
 
                             // --- High nibble FMA: hi nibbles = block positions [16..23] ---
                             let hi_act_off = OffsetExpr::Add(
@@ -390,7 +399,7 @@ pub(crate) fn emit_gemm_assisted_from_plan(
                                 )),
                                 Box::new(OffsetExpr::LoopOffset(ei_off)),
                             );
-                            prog.emit(VmInstr::VecLoad { dst: a_val, base: input_ptr, offset: hi_act_off, width, dtype , predicate: None });
+                            prog.emit(VmInstr::VecLoad { dst: a_val, base: input_ptr, offset: hi_act_off, width, dtype: act_dt , predicate: None }); // BCE-20260709: A-load 用 act_dt(F32)
 
                             let high_unpack = if use_signed {
                                 BlockUnpackMode::SignedNibbleHigh
@@ -401,12 +410,12 @@ pub(crate) fn emit_gemm_assisted_from_plan(
                                 dst: b_hi, base: data_ptr,
                                 offset: OffsetExpr::Const(0), unpack: high_unpack, width,
                             });
-                            prog.emit(VmInstr::VecBinOp { dst: b_hi, a: b_hi, b: scale_vec, op: VecOp::Mul, dtype: dtype });
+                            prog.emit(VmInstr::VecBinOp { dst: b_hi, a: b_hi, b: scale_vec, op: VecOp::Mul, dtype: acc_dtype }); // BCE-20260709: acc_dtype(F32)
                             if post_scale_add {
                                 // ARCH-BLOCK-MIN: value = d * quantized + m
-                                prog.emit(VmInstr::VecBinOp { dst: b_hi, a: b_hi, b: min_vec, op: VecOp::Add, dtype: dtype });
+                                prog.emit(VmInstr::VecBinOp { dst: b_hi, a: b_hi, b: min_vec, op: VecOp::Add, dtype: acc_dtype });
                             }
-                            prog.emit(VmInstr::Fma { dst: acc, acc, a: a_val, b: b_hi, dtype });
+                            prog.emit(VmInstr::Fma { dst: acc, acc, a: a_val, b: b_hi, dtype: acc_dtype });
 
                             // Advance data_ptr
                             prog.emit(VmInstr::GprBinOp { dst: data_ptr, a: data_ptr, b: GprOperand::VReg(data_step_reg ), op: GprOp::Add });
